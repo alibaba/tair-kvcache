@@ -1,0 +1,5 @@
+# we don't care about leak in bash
+leak:/usr/bin/bash
+# avoid false leak in python3
+leak:PyObject_Malloc
+leak:*libpython3*.so*

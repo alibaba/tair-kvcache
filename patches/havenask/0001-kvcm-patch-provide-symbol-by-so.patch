@@ -1,0 +1,49 @@
+From 0600a4a4adbae146defb06c29fca9dcb19b09e83 Mon Sep 17 00:00:00 2001
+From: "zhaotaonan.ztn" <zhaotaonan.ztn@alibaba-inc.com>
+Date: Mon, 27 Oct 2025 20:05:34 +0800
+Subject: [PATCH] [kvcm patch] provide symbol by so
+
+---
+ aios/alog/BUILD  | 8 ++++++++
+ aios/autil/BUILD | 9 +++++++++
+ 2 files changed, 17 insertions(+)
+
+diff --git aios/alog/BUILD aios/alog/BUILD
+index be305060..1302125e 100644
+--- aios/alog/BUILD
++++ aios/alog/BUILD
+@@ -7,3 +7,11 @@ cc_library(
+     visibility=['//visibility:public'],
+     deps=['@zlib_archive//:zlib']
+ )
++
++cc_library(
++    name='kvcm_client_patch_alog_header',
++    hdrs=glob(['include/alog/*.h']),
++    copts=['-Wformat-truncation=0'],
++    strip_include_prefix='include',
++    visibility=['//visibility:public'],
++)
+diff --git aios/autil/BUILD aios/autil/BUILD
+index ee18c82a..18800ba4 100644
+--- aios/autil/BUILD
++++ aios/autil/BUILD
+@@ -314,6 +314,15 @@ cc_library(
+     deps=['env_util', ':thread'],
+     alwayslink=True
+ )
++
++cc_library(
++    name='kvcm_client_patch_autil_header',
++    hdrs=glob(['autil/*.h']),
++    include_prefix='autil',
++    strip_include_prefix='autil',
++    visibility=['//visibility:public'],
++)
++
+ cc_library(
+     name='block_cache',
+     srcs=[
+-- 
+2.19.1.6.gb485710b
+

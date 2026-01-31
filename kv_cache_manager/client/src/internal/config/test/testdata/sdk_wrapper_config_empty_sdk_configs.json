@@ -1,0 +1,9 @@
+{
+    "thread_num": 8,
+    "queue_size": 2000,
+    "sdk_backend_configs": [],
+    "timeout_config": {
+        "put_timeout_ms": 2000,
+        "get_timeout_ms": 2000
+    }
+}

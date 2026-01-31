@@ -1,0 +1,20 @@
+{
+    "instance_group": "",
+    "instance_id": "instance",
+    "address": [
+        "127.0.0.1:8080"
+    ],
+    "block_size": 128,
+    "sdk_config": {},
+    "model_deployment": {
+        "model_name": "test_model",
+        "dtype": "FP8",
+        "use_mla": false,
+        "tp_size": 1,
+        "dp_size": 1,
+        "pp_size": 1
+    },
+    "location_spec_infos": {
+        "tp0": 1024
+    }
+}

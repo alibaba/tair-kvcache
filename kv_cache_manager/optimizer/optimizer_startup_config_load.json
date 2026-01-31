@@ -1,0 +1,43 @@
+{
+    "trace_file_path" : "/KVCacheManager/kv_cache_manager/optimizer/analysis/result/event_publisher.log",
+    "trace_type": "publisher_log",
+    "output_result_path": "/KVCacheManager/kv_cache_manager/optimizer/analysis/result/event_publsiher",
+    "eviction_params": {
+        "eviction_mode": 1,
+        "eviction_batch_size_per_instance": 100
+    },
+    "instance_groups": [
+        {
+            "group_name": "instance_group_01",
+            "quota_capacity": 12000,
+            "used_percentage": 1.0,
+            "hierarchical_eviction_enabled": false,
+            "storages": [
+                {
+                    "unique_name": "pace_00",
+                    "storage_type": "pace",
+                    "band_width_mbps": 20000,
+                    "priority": 0,
+                    "capacity": 100000
+                },
+                {
+                    "unique_name": "hf3fs_00",
+                    "storage_type": "hf3fs",
+                    "band_width_mbps": 20000,
+                    "priority": 1,
+                    "capacity": 20000
+                }
+            ],
+            "instances": [
+                {
+                    "instance_id": "3780643326877293460",
+                    "block_size": 16,
+                    "eviction_policy_type": "lru",
+                    "eviction_policy_params": {
+                        "sample_rate": 0.1
+                    }
+                }
+            ]
+        }
+    ]
+}

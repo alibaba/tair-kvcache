@@ -1,0 +1,38 @@
+diff --git a/mooncake-store/include/master_client.h b/mooncake-store/include/master_client.h
+index fec6039..bbcd0f9 100644
+--- a/mooncake-store/include/master_client.h
++++ b/mooncake-store/include/master_client.h
+@@ -6,6 +6,7 @@
+ #include <cstdlib>
+ #include <ylt/coro_rpc/coro_rpc_client.hpp>
+ #include <ylt/coro_io/client_pool.hpp>
++#include <ylt/coro_io/ibverbs/ib_socket.hpp>
+
+ #include "client_metric.h"
+ #include "replica.h"
+diff --git a/mooncake-store/src/master_client.cpp b/mooncake-store/src/master_client.cpp
+index 5c058f7..4a38d50 100644
+--- a/mooncake-store/src/master_client.cpp
++++ b/mooncake-store/src/master_client.cpp
+@@ -14,7 +14,7 @@
+ #include "types.h"
+ #include "utils/scoped_vlog_timer.h"
+
+-#include <source_location>
++// #include <source_location>
+
+ namespace mooncake {
+
+@@ -209,9 +209,9 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
+     ScopedVLogTimer timer(1, "MasterClient::Connect");
+     timer.LogRequest("master_addr=", master_addr);
+
+-    auto location = std::source_location::current();
+-    auto name = location.function_name();
+-    LOG(INFO) << "Connecting to master at " << master_addr << " from " << name;
++    // auto location = std::source_location::current();
++    // auto name = location.function_name();
++    // LOG(INFO) << "Connecting to master at " << master_addr << " from " << name;
+
+     MutexLocker lock(&connect_mutex_);
+     if (client_addr_param_ != master_addr) {

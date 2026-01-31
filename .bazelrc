@@ -1,0 +1,151 @@
+# common --experimental_downloader_config=bazel/bazel_downloader.cfg
+# fetch:downloader --experimental_remote_downloader=grpc://com.taobao.search.bazel.server:9092 --remote_cache=grpc://com.taobao.search.bazel.server:9092
+
+build:py3 --python_path=/usr/bin/python3
+build:py3 --python_top=//:python3 --incompatible_use_python_toolchains=false
+build:py3 --action_env PYTHON_BIN_PATH="/usr/bin/python3"
+
+build:py310 --python_path=/opt/conda310/bin/python3
+build:py310 --python_top=//:python310 --incompatible_use_python_toolchains=false # force use /opt/conda310/bin/python3
+build:py310 --action_env PYTHON_BIN_PATH="/opt/conda310/bin/python3"
+
+build:py312 --python_path=/usr/bin/python3.12
+build:py312 --python_top=//:python312 --incompatible_use_python_toolchains=false
+build:py312 --action_env PYTHON_BIN_PATH="/usr/bin/python3.12"
+
+build:py311 --python_path=/usr/bin/python3.11
+build:py311 --python_top=//:python311 --incompatible_use_python_toolchains=false
+build:py311 --action_env PYTHON_BIN_PATH="/usr/bin/python3.11"
+
+# default use system python3
+build --config=py3
+
+build:cuda --copt="-DENABLE_BF16=1"
+build:cuda --copt="-DBUILD_CUTLASS_MIXED_GEMM=ON"
+build:cuda --copt="-DC10_CUDA_NO_CMAKE_CONFIGURE_FILE"
+build:cuda --copt="-DUSING_CUDA=1"
+build:cuda --define=using_cuda=true --define=using_cuda_nvcc=true
+# build:cuda --crosstool_top=@local_config_cuda//crosstool:toolchain
+build:cuda --action_env CUDA_TOOLKIT_PATH="/usr/local/cuda/"
+build:cuda --host_action_env CUDA_TOOLKIT_PATH="/usr/local/cuda/"
+build:cuda --action_env TF_CUDA_PATHS="/usr/local/cuda/"
+build:cuda --host_action_env TF_CUDA_PATHS="/usr/local/cuda/"
+build:cuda --action_env TF_CUDA_CLANG="0"
+build:cuda --host_action_env TF_CUDA_CLANG="0"
+build:cuda --action_env TF_NEED_CUDA="1"
+build:cuda --host_action_env TF_NEED_CUDA="1"
+build:cuda --action_env LD_LIBRARY_PATH="/lib64:/opt/conda310/lib/:/usr/local/cuda/compat/:/usr/local/nvidia/lib64:/usr/lib64:/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs/:/usr/local/cuda/extras/CUPTI/lib64/:$LD_LIBRARY_PATH"
+build:cuda --host_action_env LD_LIBRARY_PATH="/lib64:/opt/conda310/lib/:/usr/local/cuda/compat/:/usr/local/nvidia/lib64:/usr/lib64:/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs/:/usr/local/cuda/extras/CUPTI/lib64/:$LD_LIBRARY_PATH"
+build:cuda --linkopt="-L/usr/local/cuda/lib64/stubs/"
+build:cuda --action_env NCCL_INSTALL_PATH="/usr/local/cuda/"
+build:cuda --action_env NCCL_HDR_PATH="/usr/local/cuda/include"
+build:cuda --action_env TF_NCCL_VERSION="2"
+build:cuda --action_env CUDNN_INSTALL_PATH="/usr/local/cuda/"
+
+# 6.0 = P100, 7.0 = V100, 7.5 = T4, 8.6 = A10, 8.0 = A100 8.9 = L, 9.0 = H800
+build:cuda12 --config=cuda
+build:cuda12 --action_env TF_CUDA_COMPUTE_CAPABILITIES="7.0,7.5,8.0,8.6,8.9,9.0"
+build:cuda12 --host_action_env TF_CUDA_COMPUTE_CAPABILITIES="7.0,7.5,8.0,8.6,8.9,9.0"
+build:cuda12 --action_env TF_CUDA_VERSION="12.4"
+build:cuda12 --host_action_env TF_CUDA_VERSION="12.4"
+build:cuda12 --define=using_cuda12=true
+build:cuda12 --copt="-DUSING_CUDA12=1"
+build:cuda12 --copt="-DUSE_OLD_TRT_FMHA=1"
+build:cuda12 --copt="-DFMHA_SUPPORT_SPLIT=1"
+build:cuda12 --copt="-DENABLE_FP8=1"
+build:cuda12 --jobs=64
+
+build:cuda12_2 --config=cuda12
+build:cuda12_2 --action_env TF_CUDA_VERSION="12.2"
+build:cuda12_2 --host_action_env TF_CUDA_VERSION="12.2"
+
+build:cuda12_6 --config=cuda12
+build:cuda12_6 --action_env TF_CUDA_VERSION="12.6"
+build:cuda12_6 --host_action_env TF_CUDA_VERSION="12.6"
+build:cuda12_6 --copt="-D_GLIBCXX_USE_CXX11_ABI=1"
+
+build --spawn_strategy=local # avoid nvcc conflicts
+build --cxxopt="-std=c++17" --copt="-DGTEST_USE_OWN_TR1_TUPLE=0" --copt="-DEIGEN_MAX_CPP_VER=11"
+build -c opt
+build --copt -O2
+build --copt -g --strip=never
+build --copt -Wall
+build --copt -Werror
+build --copt -Wno-unknown-pragmas # omp
+build --copt -Wno-sign-compare # alog
+build --copt -Wno-attributes # pybind11
+build --copt -Wno-stringop-truncation # grpc
+build --copt -Wno-stringop-overflow # grpc
+build --copt -Wno-tautological-compare # grpc
+build --copt -Wno-maybe-uninitialized # protobuf
+build --copt -Wno-format-overflow # cm2
+build --copt -Wno-nonnull # mooncake gcc11
+build --copt -Wno-array-parameter # BoringSSL gcc11
+build --copt -Wno-unused-result # grpc gcc11
+build --copt="-mno-avx512f"
+build --copt="-mrdrnd"
+build --cxxopt -Wno-class-memaccess # grpc
+build --copt -Wno-deprecated-declarations
+build --experimental_cc_implementation_deps
+build --copt -DOPENSSL_IS_BORINGSSL
+build --experimental_cc_shared_library
+build --linkopt="-lm"
+build --linkopt="-lpthread"
+build --define=grpc_no_ares=true
+build --define=xft_use_icx=true
+build --linkopt -ldl # exception backtrace
+build --define=NVSHMEM_DIR=/
+build --incompatible_strict_action_env
+
+# debug
+build:debug --copt -g --copt -O0
+build:debug --strip=never
+build:debug --copt -U_FORTIFY_SOURCE
+build:debug --copt -UNDEBUG
+
+build:release -c opt
+build:release --copt -g --copt -O2
+build:release --strip=never
+
+# asan
+build:asan --copt -fsanitize=address
+build:asan --copt -DADDRESS_SANITIZER
+build:asan --copt -DFL_ASAN_ENABLED
+build:asan --copt -fno-omit-frame-pointer
+build:asan --copt -fPIC # for "fix relocation truncated to fit: R_X86_64_32 against `.debug_info'" collect2 error
+build:asan --copt -fdebug-types-section # for "fix relocation truncated to fit: R_X86_64_32 against `.debug_info'" collect2 error
+build:asan --linkopt -fsanitize=address
+build:asan --test_env="ASAN_OPTIONS=detect_odr_violation=0:protect_shadow_gap=0" # protect_shadow_gap : conflict with cuda
+
+build:mooncake --config=cuda
+build:mooncake --define MOONCAKE_USE_CUDA=true --define MOONCAKE_USE_HTTP=true --define MOONCAKE_USE_TCP=true
+
+build:tair_mempool --config=cuda
+build:tair_mempool --define TAIR_MEMPOOL_USE_CUDA=true
+
+build:hf3fs --define=ENABLE_HF3FS=true --config=cuda
+
+test --test_env LD_LIBRARY_PATH="/opt/rocm/lib:/opt/conda310/lib/:/usr/local/nvidia/lib64:/usr/lib64:/usr/local/cuda/lib64:/opt/amdgpu/lib64:/usr/local/cuda/extras/CUPTI/lib64:$LD_LIBRARY_PATH"
+test --test_env OMP_NUM_THREADS=8
+test --test_env FT_SERVER_TEST="1"
+test --test_env LOG_LEVEL="INFO"
+test --test_env NCCL_DEBUG="INFO"
+# for dp scatter add stable result
+test --test_env TZ=Asia/Shanghai
+
+build:client --copt=-DENABLE_MOONCAKE
+build:client --copt=-DENABLE_HF3FS
+build:client --copt=-DENABLE_TAIR_MEMPOOL
+build:client --define ENABLE_MOONCAKE=true
+build:client --define ENABLE_HF3FS=true
+build:client --define ENABLE_TAIR_MEMPOOL=true
+build:client --define USER_CLIENT_LOGGER=true
+build:client --define MOONCAKE_USE_HTTP=true
+build:client --define MOONCAKE_USE_TCP=true
+
+build:client_with_cuda --config=client
+build:client_with_cuda --config=cuda
+build:client_with_cuda --define MOONCAKE_USE_CUDA=true
+build:client_with_cuda --define TAIR_MEMPOOL_USE_CUDA=true
+
+build:client_only_header  --define CLIENT_ONLY_HEADER=true

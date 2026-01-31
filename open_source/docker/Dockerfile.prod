@@ -1,0 +1,28 @@
+FROM alibaba-cloud-linux-3-registry.cn-hangzhou.cr.aliyuncs.com/alinux3/alinux3:latest
+
+ARG BINARY_PACKAGE_TAR
+
+LABEL org.opencontainers.image.source=https://github.com/alibaba/tair-kvcache
+LABEL org.opencontainers.image.description="Tair KVCache Manager Production Container"
+LABEL org.opencontainers.image.licenses=Apache-2.0
+
+USER root
+
+RUN sed -i.bak 's|http://mirrors\.cloud\.aliyuncs\.com|http://mirrors.aliyun.com|g' /etc/yum.repos.d/*.repo && \
+    yum install -y --setopt=timeout=3 libibverbs-devel librdmacm-devel numactl-devel libaio-devel \
+    wget procps-ng iproute tar vim python3.11 python3.11-pip && \
+    yum clean all && \
+    rm -rf /var/cache/yum
+
+RUN mkdir -p /home/admin/kv_cache_manager
+
+# 复制二进制包到容器中
+COPY $BINARY_PACKAGE_TAR /home/admin/kv_cache_manager/$BINARY_PACKAGE_TAR
+
+# 解压二进制包
+RUN cd /home/admin/kv_cache_manager && tar -zxvf $BINARY_PACKAGE_TAR
+
+# 设置启动脚本
+ENTRYPOINT ["/home/admin/kv_cache_manager/bin/start_server.sh"]
+
+RUN echo "****** Tair KVCache Manager Production Image Ready ******"

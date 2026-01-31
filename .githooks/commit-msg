@@ -1,0 +1,28 @@
+#!/bin/sh
+
+default_check_msg() {
+    msg=$1
+    if [[ ${#msg} -lt 15 ]]; then
+       echo "错误：提交日志太短了，至少15个字节！"
+       exit -1
+    fi
+    if ! [[ $msg =~ ^(\[) ]]; then
+        echo "错误：提交日志没有包含模块名，应该以[模块名]开头，例如[cicd] xxx"
+        exit -1
+    fi
+}
+
+special_check_msg() {
+    msg=$1
+    if ! [[ $msg =~ ( #[0-9]+ ) ]]; then
+        echo "错误: 部分模块的修改需要关联issue, 先创建一个issue并按以下方法做关联。"
+        echo "示例: [cicd] fix #12345 xxxxx."
+	    echo "#12345 前后需要有空格, xxxx必需填写, 12345是issue id号."
+        exit -1
+    fi
+}
+
+msgContent=$(cat $1)
+echo $msgContent
+
+default_check_msg "$msgContent"

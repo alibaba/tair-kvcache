@@ -1,0 +1,58 @@
+{
+    "storage_config": {
+        "type": "file",
+        "global_unique_name": "nfs_01",
+        "storage_spec": {
+            "root_path": "/mnt/nfs/",
+            "key_count_per_file": 5
+        }
+    },
+    "instance_group": {
+        "name": "default",
+        "storage_candidates": [
+            "nfs_01"
+        ],
+        "global_quota_group_name": "default_quota_group",
+        "max_instance_count": 100,
+        "quota": {
+            "capacity": 10737418240,
+            "quota_config": [
+                {
+                    "capacity": 10737418240,
+                    "storage_type": "file"
+                }
+            ]
+        },
+        "cache_config": {
+            "reclaim_strategy": {
+                "storage_unique_name": "nfs_01",
+                "reclaim_policy": 1,
+                "trigger_strategy": {
+                    "used_size": 1073741824,
+                    "used_percentage": 0.8
+                },
+                "trigger_period_seconds": 60,
+                "reclaim_step_size": 1073741824,
+                "reclaim_step_percentage": 10
+            },
+            "cache_prefer_strategy": 2,
+            "meta_indexer_config": {
+                "max_key_count": 1000000,
+                "mutex_shard_num": 16,
+                "batch_key_size": 16,
+                "meta_storage_backend_config": {
+                    "storage_type": "local",
+                    "storage_uri": ""
+                },
+                "meta_cache_policy_config": {
+                    "type": "LRU",
+                    "capacity": 10000,
+                    "cache_shard_bits": 0,
+                    "high_pri_pool_ratio": 0.0
+                }
+            }
+        },
+        "user_data": "{\"description\": \"Default instance group for KV Cache Manager\"}",
+        "version": 1
+    }
+}

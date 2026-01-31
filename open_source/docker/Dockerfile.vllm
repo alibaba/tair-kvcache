@@ -1,0 +1,20 @@
+ARG BASE_OS_IMAGE=vllm/vllm-openai:v0.11.2
+ARG CONNECTOR_WHEEL_NAME=kvcm_vllm_connector
+
+FROM $BASE_OS_IMAGE
+
+MAINTAINER xiyu.wxy
+
+RUN sed -i 's|mirrors\.cloud\.aliyuncs\.com|mirrors.aliyun.com|g' /etc/apt/sources.list.d/* && \
+    apt-get update && apt-get install -y librdmacm-dev libibverbs-dev libaio-dev && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* && \
+    [ -f /usr/lib/x86_64-linux-gnu/libaio.so.1 ] || ln -s /usr/lib/x86_64-linux-gnu/libaio.so /usr/lib/x86_64-linux-gnu/libaio.so.1 && \
+    echo "set encoding=utf-8" >> ~/.vimrc && \
+    echo "set fileencodings=utf-8,latin1" >> ~/.vimrc
+
+COPY $CONNECTOR_WHEEL_NAME*.whl ./
+COPY kv_cache_manager/py_connector/vllm/requirements.txt ./
+RUN pip3 config set global.index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple && \
+    pip3 install ./$CONNECTOR_WHEEL_NAME*.whl && \
+    pip3 install -r requirements.txt

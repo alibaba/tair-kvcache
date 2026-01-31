@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+message SimpleMessage {
+    int32 int32Value = 1;
+    uint32 uint32Value = 2;
+    int64 int64Value = 3;
+    uint64 uint64Value = 4;
+    double doubleValue = 5;
+    float floatValue = 6;
+    bool boolValue = 7;
+    string stringValue = 8;
+}
+
+enum TestEnum {
+    TEST_NUM_UNSPECIFIED = 0;
+    TEST_ENUM_1 = 1;
+    TEST_ENUM_2 = 2;
+    TEST_ENUM_3 = 3;
+}
+
+message EnumMessage { TestEnum enumValue = 1; }
+
+message OneOfMeaaage {
+    oneof value {
+        int64 v1 = 1;
+        int64 v2 = 2;
+        SimpleMessage v3 = 3;
+    }
+}
+
+message RepeatMessage {
+    repeated int32 int32Vec = 1;
+    repeated SimpleMessage simpleMsgVec = 2;
+    repeated EnumMessage enumMsgVec = 3;
+    repeated OneOfMeaaage oneOfVec = 4;
+}

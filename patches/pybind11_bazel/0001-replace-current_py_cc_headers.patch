@@ -1,0 +1,67 @@
+diff -Naur a/pybind11_bazel/build_defs.bzl b/pybind11_bazel/build_defs.bzl
+--- build_defs.bzl
++++ build_defs.bzl
+@@ -6,9 +6,6 @@
+ """Build rules for pybind11."""
+
+ load("@bazel_skylib//rules:copy_file.bzl", "copy_file")
+-load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+-load("@rules_cc//cc:cc_library.bzl", "cc_library")
+-load("@rules_cc//cc:cc_test.bzl", "cc_test")
+
+ def register_extension_info(**kwargs):
+     pass
+@@ -25,7 +22,7 @@
+
+ PYBIND_DEPS = [
+     Label("@pybind11//:pybind11"),
+-    "@rules_python//python/cc:current_py_cc_headers",
++    "@local_config_python//:python_headers",
+ ]
+
+ def pybind_extension(
+@@ -61,7 +58,7 @@
+     # Mark common dependencies as required for build_cleaner.
+     tags = tags + ["req_dep=%s" % dep for dep in PYBIND_DEPS]
+
+-    cc_binary(
++    native.cc_binary(
+         name = name + ".so",
+         copts = copts + PYBIND_COPTS + select({
+             Label("@pybind11//:msvc_compiler"): [],
+@@ -109,7 +106,7 @@
+     # Mark common dependencies as required for build_cleaner.
+     tags = tags + ["req_dep=%s" % dep for dep in PYBIND_DEPS]
+
+-    cc_library(
++    native.cc_library(
+         name = name,
+         copts = copts + PYBIND_COPTS,
+         features = features + PYBIND_FEATURES,
+@@ -130,7 +127,7 @@
+     # Mark common dependencies as required for build_cleaner.
+     tags = tags + ["req_dep=%s" % dep for dep in PYBIND_DEPS]
+
+-    cc_test(
++    native.cc_test(
+         name = name,
+         copts = copts + PYBIND_COPTS,
+         features = features + PYBIND_FEATURES,
+diff -Naur a/pybind11_bazel/pybind11-BUILD.bazel b/pybind11_bazel/pybind11-BUILD.bazel
+--- pybind11-BUILD.bazel
++++ pybind11-BUILD.bazel
+@@ -1,5 +1,4 @@
+ # pybind11 - Seamless operability between C++11 and Python.
+-load("@rules_cc//cc:cc_library.bzl", "cc_library")
+
+ licenses(["notice"])
+
+@@ -22,7 +21,7 @@
+     }),
+     includes = ["include"],
+     visibility = ["//visibility:public"],
+-    deps = ["@rules_python//python/cc:current_py_cc_headers"],
++    deps = ["@local_config_python//:python_headers"],
+ )
+
+ config_setting(

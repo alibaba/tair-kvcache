@@ -1,0 +1,504 @@
+syntax = "proto3";
+
+package kv_cache_manager.proto.admin;
+
+option cc_generic_services = false;
+
+enum ErrorCode {
+    UNSPECIFIED = 0;
+    OK = 1;
+    UNSUPPORTED = 2;
+    INTERNAL_ERROR = 3;
+    SERVICE_NOT_READY = 4;
+    INVALID_ARGUMENT = 5;
+    DUPLICATE_ENTITY = 6;
+    REACH_MAX_ENTITY_CAPACITY = 7;
+    INSTANCE_NOT_EXIST = 8;
+    SERVER_NOT_LEADER = 9;
+
+    IO_ERROR = 20;
+    UNKNOWN_ERROR = 100;
+    ERROR_MAX = 65535;
+}
+
+message Status {
+    ErrorCode code = 1;
+    string message = 2;
+}
+
+message CommonResponseHeader {
+    Status status = 1;
+    string request_id = 2;
+}
+
+message CommonResponse { CommonResponseHeader header = 1; }
+
+enum StorageType {
+    ST_UNSPECIFIED = 0;
+    ST_3FS = 1;
+    ST_MOONCAKE = 2;
+    ST_TAIRMEMPOOL = 3;
+    ST_NFS = 4;
+    ST_VCNS_3FS = 5;
+}
+
+message LocalStorageSpec {}
+
+// 3fs
+message ThreeFSStorageSpec {
+    string cluster_name = 1;      // 3fs集群名，TODO 未使用，考虑删除
+    string mountpoint = 2;        // 挂载点 eg. /3fs/stage/3fs/
+    string root_dir = 3;          // 根目录,实际的文件目录是 mount_point/root_dir
+    int32 key_count_per_file = 4; // 多少个文件放在
+    bool touch_file_when_create = 5;
+}
+
+// vcns_3fs
+message VcnsThreeFSStorageSpec {
+    string cluster_name = 1;      // 3fs集群名，TODO 未使用，考虑删除
+    string mountpoint = 2;        // 挂载点 eg. /3fs/stage/3fs/
+    string root_dir = 3;          // 根目录,实际的文件目录是 mount_point/root_dir
+    int32 key_count_per_file = 4; // 多少个文件放在
+    bool touch_file_when_create = 5;
+    string remote_host = 6;
+    int32 remote_port = 7;
+    string meta_storage_uri = 8;
+}
+
+// moonCake mooncake-store/include/client.h
+message MooncakeStorageSpec {
+    string local_hostname = 1;       // Local host address (IP:Port)
+    string metadata_connstring = 2;  // Connection string for metadata service
+    string protocol = 3;             // Transfer protocol ("rdma" or "tcp")
+    string rdma_device = 4;          // Protocol-specific arguments
+    string master_service_entry = 5; // The entry of master server
+                                     // (IP:Port of master address for non-HA mode,
+                                     // etcd://IP:Port;IP:Port;...;IP:Port for HA mode)
+}
+
+message TairMemPoolStorageSpec {
+    string domain = 1; // tair mempool的 meta service挂载的域名
+    int32 timeout = 2; // 单位超时时间
+    bool enable_vipserver = 3;
+}
+
+message NfsStorageSpec {
+    string root_path = 1;
+    int32 key_count_per_file = 2;
+}
+
+// 允许一个meta service服务对接多种存储系统
+message StorageConfig {
+    string global_unique_name = 1;
+    oneof storage_spec {
+        LocalStorageSpec local = 2;
+        ThreeFSStorageSpec threefs = 3;
+        MooncakeStorageSpec mooncake = 4;
+        TairMemPoolStorageSpec tair_mem_pool = 5;
+        NfsStorageSpec nfs = 6;
+        VcnsThreeFSStorageSpec vcnsthreefs = 7;
+    }
+    bool check_storage_available_when_open = 8;
+}
+
+// 以下接口默认是instanceGroup之间的storage相互隔离
+message AddStorageRequest {
+    string trace_id = 1;
+    StorageConfig storage = 2;
+}
+
+message EnableStorageRequest {
+    string trace_id = 1;
+    string storage_unique_name = 2;
+}
+
+message DisableStorageRequest {
+    string trace_id = 1;
+    string storage_unique_name = 2;
+}
+
+message RemoveStorageRequest {
+    string trace_id = 1;
+    string storage_unique_name = 2;
+}
+
+// 变更一个storage
+message UpdateStorageRequest {
+    string trace_id = 1;
+    StorageConfig storage = 2;
+    bool force_update = 3;
+}
+
+message ListStorageRequest { string trace_id = 1; }
+
+message ListStorageResponse {
+    CommonResponseHeader header = 1;
+    repeated StorageConfig storage = 2;
+}
+
+message TriggerStrategy {
+    int64 used_size = 1;        // 单位 byte,容量达到阈值触发回收
+    double used_percentage = 2; // 比例达到阈值触发回收
+}
+
+enum ReclaimPolicy {
+    POLICY_UNSPECIFIED = 0;
+    POLICY_LRU = 1;
+    POLICY_LFU = 2;
+    POLICY_TTL = 3;
+}
+
+message QuotaConfig {
+    StorageType storage_type = 1;
+    int64 capacity = 2;
+}
+
+message InstanceGroupQuota {
+    int64 capacity = 1;
+    repeated QuotaConfig quota_config = 2; // TODO 该字段暂且没使用
+}
+
+message CacheReclaimStrategy {
+    string storage_unique_name = 1;
+    ReclaimPolicy reclaim_policy = 2;
+    TriggerStrategy trigger_strategy = 3;
+    int32 trigger_period_seconds = 4;  // 定期触发回收的频率
+    int32 reclaim_step_size = 5;       // 每次回收的步长绝对值,如100GiB
+    int32 reclaim_step_percentage = 6; // 每次回收的步长相对比例,如回收5%的数据量
+    int32 delay_before_delete_ms = 7; // Location设置为Deleting状态后等待多少毫秒再调用Storage删除
+}
+
+enum CachePreferStrategy {
+    CPS_UNSPECIFIED = 0;
+    CPS_ALWAYS_3FS = 1;
+    CPS_PREFER_3FS = 2;
+    CPS_ALWAYS_MOONCAKE = 3;
+    CPS_PREFER_MOONCAKE = 4;
+    CPS_ALWAYS_TAIR_MEMPOOL = 5;
+    CPS_PREFER_TAIR_MEMPOOL = 6;
+    CPS_ALWAYS_VCNS_3FS = 7;
+    CPS_PREFER_VCNS_3FS = 8;
+}
+
+message MetaStorageBackendConfig {
+    string storage_type = 1;
+    string storage_uri = 2;
+}
+
+message MetaCachePolicyConfig {
+    int64 capacity = 1;
+    string type = 2;
+    int32 cache_shard_bits = 3;
+    double high_pri_pool_ratio = 4;
+}
+
+message MetaIndexerConfig {
+    int64 max_key_count = 1;
+    int64 mutex_shard_num = 2;
+    int64 batch_key_size = 3;
+    MetaStorageBackendConfig meta_storage_backend_config = 4;
+    MetaCachePolicyConfig meta_cache_policy_config = 5;
+}
+
+message SystemStorageConfig {
+    string server_addr = 1;
+    string auth_token = 2;
+    string type = 3;
+}
+
+message CacheConfig {
+    CacheReclaimStrategy reclaim_strategy = 1;
+    CachePreferStrategy data_storage_strategy = 2;
+    MetaIndexerConfig meta_indexer_config = 3;
+}
+
+message InstanceGroup {
+    string name = 1;
+    repeated string storage_candidates = 2; // storage unique names
+    string global_quota_group_name = 3;
+    int64 max_instance_count = 4;
+    InstanceGroupQuota quota = 5;
+    CacheConfig cache_config = 6; // 后面改成instance级别的
+    string user_data = 7;
+    int64 version = 8;
+}
+
+message CreateInstanceGroupRequest {
+    string trace_id = 1;
+    InstanceGroup instance_group = 2;
+}
+
+message UpdateInstanceGroupRequest {
+    string trace_id = 1;
+    InstanceGroup instance_group = 2;
+    int64 current_version = 3;
+}
+
+message RemoveInstanceGroupRequest {
+    string trace_id = 1;
+    string name = 2;
+}
+
+message GetInstanceGroupRequest {
+    string trace_id = 1;
+    string name = 2; // instance group name
+}
+
+message GetInstanceGroupResponse {
+    CommonResponseHeader header = 1;
+    InstanceGroup instance_group = 2;
+}
+
+message BoolMasksType { repeated bool values = 1; }
+message BlockMask {
+    oneof info {
+        int32 offset = 1;             // [0, offset) 被mask掉, [offset, +) 是可见的
+        BoolMasksType bool_masks = 2; // 需要和 blockKeys 数量相等
+    }
+}
+
+message GetCacheMetaRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    repeated int64 block_keys = 3;
+    repeated int64 token_ids = 4;
+    BlockMask block_mask = 5; // 按前缀mask或者bool矩阵mask
+    int32 detail_level = 6;   // 返回数据的详细级别,越大获取的信息越多,暂定为数字
+}
+
+// 使用URI统一多种存储表示，由client或者connector负责解析
+// ThreeFSLocation: 3fs://na61_3fs_cluster_01/data_root/dir1/filename?offset=0&size=1024
+// MoonCakeLocation: mooncake://na61_mc_bucket_01/my_key1
+// TairMemPoolLocation: pace://na61_pace_cluster_?offset=0&size=200&node_id=worker.33&media_type=1
+// NfsLocation: file://key(=path)
+message LocationSpec {
+    string name = 1; // 对应LocationSpecInfo中的name
+    string uri = 2;
+}
+
+message CacheLocation {
+    StorageType type = 1;
+    int32 spec_size = 2;
+    repeated LocationSpec location_specs = 3;
+}
+
+message LocationSpecInfo {
+    string name = 1; // 由外部确定，用于描述单个block内的多个分块。举例比如2TP部署，可以是有TP0、TP1。
+    int64 size = 2;
+}
+
+message LocationSpecGroup {
+    string name = 1;
+    repeated string spec_names = 2;
+}
+
+message GetCacheMetaResponse {
+    CommonResponseHeader header = 1;
+    repeated CacheLocation locations = 2; // 多个key的列表
+    repeated string metas = 3;            // 与请求key一一对应
+}
+
+// 删除指定 block_keys
+message RemoveCacheRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    repeated int64 block_keys = 3;
+    repeated int64 token_ids = 4;
+    BlockMask block_mask = 5;
+}
+
+message ModelDeployment {
+    string model_name = 1;
+    string dtype = 2;             // torch的数据类型，比如FP8、BP8，TODO 对齐torch
+    bool use_mla = 3;             // latent attention，开启了之后只需要存两个矩阵
+    int32 tp_size = 4;            // 分多少tp，分partition
+    int32 dp_size = 5;            // 数据并行
+    string lora_name = 6;         // 可以传lora ckpt的hash
+    int32 pp_size = 7;            // Pipeline模式下使用，Pipeline数量
+    string extra = 8;             // 额外字段，用于标识模型，参与判断唯一标识校验
+    string user_data = 9;        // 用户自定义数据，不参与判断唯一标识校验
+}
+
+message InstanceInfo {
+    string quota_group_name = 1;
+    string instance_group_name = 2;
+    string instance_id = 3;
+    int32 block_size = 4;                              // 一个block有多少token
+    repeated LocationSpecInfo location_spec_infos = 5; // 一个location内的所有spec，StartWriteCache时会按照这个进行分配
+    ModelDeployment model_deployment = 6;
+    repeated LocationSpecGroup location_spec_groups = 7; // 一个group包含多个spec name。用于简化StartWriteCache时指定可以提供哪些location spec。
+}
+
+message RegisterInstanceRequest {
+    string trace_id = 1;
+    string instance_group = 2;
+    string instance_id = 3;        // 代表一个模型的具体部署
+    int32 block_size = 4;          // 一个block有多少token
+    repeated LocationSpecInfo location_spec_infos = 5; // 一个location内的所有spec，StartWriteCache时会按照这个进行分配
+    ModelDeployment model_deployment = 6;
+    repeated LocationSpecGroup location_spec_groups = 7; // 一个group包含多个spec name。用于简化StartWriteCache时指定可以提供哪些location spec。
+}
+
+message RemoveInstanceRequest {
+    string trace_id = 1;
+    string instance_group = 2; // 可以不传
+    string instance_id = 3;
+}
+
+message GetInstanceInfoRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+}
+
+message GetInstanceInfoResponse {
+    CommonResponseHeader header = 1;
+    InstanceInfo instance_info = 2;
+}
+
+message ListInstanceInfoRequest {
+    string trace_id = 1;
+    string instance_group_name = 2; // ""表示list all
+}
+
+message ListInstanceInfoResponse {
+    CommonResponseHeader header = 1;
+    repeated InstanceInfo instance_info = 2;
+}
+
+enum AccountRole {
+    ROLE_USER = 0;  // for meta service
+    ROLE_ADMIN = 1; // for all
+}
+
+message Account {
+    string user_name = 1;
+    AccountRole role = 2;
+}
+
+message AddAccountRequest {
+    string trace_id = 1;
+    string user_name = 2;
+    string password = 3;
+    AccountRole role = 4;
+}
+
+message DeleteAccountRequest {
+    string trace_id = 1;
+    string user_name = 2;
+}
+
+message ListAccountRequest { string trace_id = 1; }
+
+message ListAccountResponse {
+    CommonResponseHeader header = 1;
+    repeated Account accounts = 2;
+}
+
+message GenConfigSnapshotRequest { string trace_id = 1; }
+
+message ConfigSnapShotResponse {
+    CommonResponseHeader header = 1;
+    string config_snapshot = 2; // in json
+}
+
+message LoadConfigSnapshotRequest {
+    string trace_id = 1;
+    string config_snapshot = 2; // in json
+}
+
+message GetMetricsRequest { string trace_id = 1; }
+
+message MetricValue {
+    oneof value {
+        int64 int_value = 1;
+        double float_value = 2;
+        string string_value = 3;
+    }
+}
+
+message MetricsTag {
+    string tag_key = 1;
+    string tag_value = 2;
+}
+
+message MetricsData {
+    // 具体内容待完善
+    string metric_name = 1;
+    MetricValue metric_value = 2;
+    repeated MetricsTag metric_tags = 3;
+}
+
+message GetMetricsResponse {
+    CommonResponseHeader header = 1;
+    int64 timestamp = 2;
+    repeated MetricsData metrics = 3;
+    string extra_data = 4;
+}
+
+message CheckHealthRequest { string trace_id = 1; }
+message CheckHealthResponse {
+    CommonResponseHeader header = 1;
+    bool is_leader = 2;
+    bool is_health = 3;
+    int64 elector_last_loop_time_ms = 4;
+}
+message GetManagerClusterInfoRequest { string trace_id = 1; }
+
+message GetManagerClusterInfoResponse {
+    CommonResponseHeader header = 1;
+    int64 info_updated_time = 2;
+    int64 self_leader_expiration_time = 3;
+    string self_node_id = 4;
+    string leader_node_id = 5;
+
+    // TODO: add cluster node infos
+}
+message LeaderDemoteRequest { string trace_id = 1; }
+message GetLeaderElectorConfigRequest { string trace_id = 1; }
+message GetLeaderElectorConfigResponse {
+    CommonResponseHeader header = 1;
+    int64 campaign_delay_time_ms = 2;
+}
+message UpdateLeaderElectorConfigRequest {
+    string trace_id = 1;
+    int64 campaign_delay_time_ms = 2;
+}
+
+service AdminService {
+    // 增删改查 存储集群配置 (Storage)
+    rpc AddStorage(AddStorageRequest) returns (CommonResponse);
+    rpc EnableStorage(EnableStorageRequest) returns (CommonResponse);
+    rpc DisableStorage(DisableStorageRequest) returns (CommonResponse);
+    rpc RemoveStorage(RemoveStorageRequest) returns (CommonResponse);
+    rpc UpdateStorage(UpdateStorageRequest) returns (CommonResponse);
+    rpc ListStorage(ListStorageRequest) returns (ListStorageResponse);
+    // 增删改查 实例组配置 (InstanceGroup)
+    rpc CreateInstanceGroup(CreateInstanceGroupRequest) returns (CommonResponse);
+    rpc UpdateInstanceGroup(UpdateInstanceGroupRequest) returns (CommonResponse);
+    rpc RemoveInstanceGroup(RemoveInstanceGroupRequest) returns (CommonResponse);
+    rpc GetInstanceGroup(GetInstanceGroupRequest) returns (GetInstanceGroupResponse);
+    // 增删改查单条CacheMeta信息,暂时与meta_service保持一致
+    rpc GetCacheMeta(GetCacheMetaRequest) returns (GetCacheMetaResponse);
+    // 删除指定key的cache,用于修复用户反馈的单query异常,暂时与meta_service保持一致
+    rpc RemoveCache(RemoveCacheRequest) returns (CommonResponse);
+    // 增删改查instance信息
+    rpc RegisterInstance(RegisterInstanceRequest) returns (CommonResponse);
+    rpc RemoveInstance(RemoveInstanceRequest) returns (CommonResponse);
+    rpc GetInstanceInfo(GetInstanceInfoRequest) returns (GetInstanceInfoResponse);
+    rpc ListInstanceInfo(ListInstanceInfoRequest) returns (ListInstanceInfoResponse);
+    // 账号
+    rpc AddAccount(AddAccountRequest) returns (CommonResponse);
+    rpc DeleteAccount(DeleteAccountRequest) returns (CommonResponse);
+    rpc ListAccount(ListAccountRequest) returns (ListAccountResponse);
+    // 导入导出全局配置的快照
+    rpc GenConfigSnapshot(GenConfigSnapshotRequest) returns (ConfigSnapShotResponse);
+    rpc LoadConfigSnapshot(LoadConfigSnapshotRequest) returns (CommonResponse);
+    // 监控指标
+    rpc GetMetrics(GetMetricsRequest) returns (GetMetricsResponse);
+    // 高可用
+    rpc CheckHealth(CheckHealthRequest) returns (CheckHealthResponse);
+    rpc GetManagerClusterInfo(GetManagerClusterInfoRequest) returns (GetManagerClusterInfoResponse);
+    rpc LeaderDemote(LeaderDemoteRequest) returns (CommonResponse);
+    rpc GetLeaderElectorConfig(GetLeaderElectorConfigRequest) returns (GetLeaderElectorConfigResponse);
+    rpc UpdateLeaderElectorConfig(UpdateLeaderElectorConfigRequest) returns (CommonResponse);
+}

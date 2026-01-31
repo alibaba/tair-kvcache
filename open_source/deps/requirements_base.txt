@@ -1,0 +1,5 @@
+setuptools==60.5.0
+grpcio==1.62.0
+grpcio-tools==1.57.0
+protobuf==4.25
+requests==2.32.5

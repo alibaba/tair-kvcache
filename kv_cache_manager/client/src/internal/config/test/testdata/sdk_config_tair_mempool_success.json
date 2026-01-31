@@ -1,0 +1,5 @@
+{
+    "type": "pace",
+    "sdk_log_file_path": "logs/pace_client.log",
+    "sdk_log_level": "DEBUG"
+}

@@ -1,0 +1,240 @@
+syntax = "proto3";
+
+package kv_cache_manager.proto.kv_meta;
+
+option cc_generic_services = false;
+
+enum ErrorCode {
+    UNSPECIFIED = 0;
+    OK = 1;
+    UNSUPPORTED = 2;
+    INTERNAL_ERROR = 3;
+    SERVICE_NOT_READY = 4;
+    INVALID_ARGUMENT = 5;
+    REACH_MAX_ENTITY_CAPACITY = 7;
+    INSTANCE_NOT_EXIST = 8;
+
+    IO_ERROR = 20;
+    UNKNOWN_ERROR = 100;
+    ERROR_MAX = 65535;
+}
+
+message Status {
+    ErrorCode code = 1;
+    string message = 2;
+}
+
+message CommonResponseHeader {
+    Status status = 1;
+    string request_id = 2;
+    string tracer_result = 3;
+}
+
+message CommonResponse { CommonResponseHeader header = 1; }
+
+enum StorageType {
+    ST_UNSPECIFIED = 0;
+    ST_3FS = 1;
+    ST_MOONCAKE = 2;
+    ST_TAIRMEMPOOL = 3;
+    ST_NFS = 4;
+    ST_VCNS_3FS = 5;
+}
+
+// 使用URI统一多种存储表示，由client或者connector负责解析
+// ThreeFSLocation: 3fs://na61_3fs_cluster_01/data_root/dir1/filename?offset=0&size=1024
+// MoonCakeLocation: mooncake://na61_mc_bucket_01/my_key1
+// TairMemPoolLocation: pace://na61_pace_cluster_?offset=0&size=200&node_id=worker.33&media_type=1
+// NfsLocation: file://nfs_01/data/dir1/filename?offset=1&size=1024
+message LocationSpec {
+    string name = 1; // 对应LocationSpecInfo中的name
+    string uri = 2;
+}
+
+message ValueLocation {
+    StorageType type = 1;
+    int32 spec_size = 2;
+    repeated LocationSpec location_specs = 3;
+}
+
+message InstanceInfo {
+    string quota_group_name = 1;
+    string instance_group_name = 2;
+    string instance_id = 3;
+    // 补充一些信息
+}
+
+message LocalStorageSpec {}
+
+// 3fs
+message ThreeFSStorageSpec {
+    string cluster_name = 1;      // 3fs集群名
+    string mountpoint = 2;        // 挂载点 eg. /3fs/stage/3fs/
+    string root_dir = 3;          // 根目录,实际的文件目录是 mount_point/root_dir
+    int32 key_count_per_file = 4; // 多少个文件放在
+    bool touch_file_when_create = 5;
+}
+
+// vcns_3fs
+message VcnsThreeFSStorageSpec {
+    string cluster_name = 1;      // 3fs集群名
+    string mountpoint = 2;        // 挂载点 eg. /3fs/stage/3fs/
+    string root_dir = 3;          // 根目录,实际的文件目录是 mount_point/root_dir
+    int32 key_count_per_file = 4; // 多少个文件放在
+    bool touch_file_when_create = 5;
+    string remote_host = 6;
+    int32 remote_port = 7;
+    string meta_storage_uri = 8;
+}
+
+// mooncake mooncake-store/include/client.h
+message MooncakeStorageSpec {
+    string local_hostname = 1;       // Local host address (IP:Port)
+    string metadata_connstring = 2;  // Connection string for metadata service
+    string protocol = 3;             // Transfer protocol ("rdma" or "tcp")
+    string rdma_device = 4;          // Protocol-specific arguments
+    string master_service_entry = 5; // The entry of master server
+                                     // (IP:Port of master address for non-HA mode,
+                                     // etcd://IP:Port;IP:Port;...;IP:Port for HA mode)
+}
+
+message TairMemPoolStorageSpec {
+    string domain = 1; // tair mempool的 meta service挂载的域名
+    int32 timeout = 2; // 单位超时时间
+}
+
+message NfsStorageSpec {
+    string root_path = 1;
+    int32 key_count_per_file = 2;
+}
+
+// 允许一个meta service服务对接多种存储系统
+message StorageConfig {
+    string global_unique_name = 1;
+    oneof storage_spec {
+        LocalStorageSpec local = 2;
+        ThreeFSStorageSpec threefs = 3;
+        MooncakeStorageSpec mooncake = 4;
+        TairMemPoolStorageSpec tair_mem_pool = 5;
+        NfsStorageSpec nfs = 6;
+        ThreeFSStorageSpec vcnsthreefs = 7;
+    }
+    bool check_storage_available_when_open = 8;
+}
+
+message RegisterInstanceRequest {
+    string trace_id = 1;
+    string instance_group = 2;      // 组信息，和具体的quota，淘汰策略等信息关联
+    string instance_id = 3;         // 用户自己设定，全局唯一
+    string user_data = 4;          // 用户自己想存的任意额外信息
+}
+
+message RegisterInstanceResponse {
+    CommonResponseHeader header = 1;
+    string storage_configs = 2;
+}
+
+message GetInstanceInfoRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+}
+
+message GetInstanceInfoResponse {
+    CommonResponseHeader header = 1;
+    string instance_group = 2;
+    InstanceInfo instance_info = 3;
+}
+
+message KeyMask {
+    repeated bool values = 1;
+}
+
+enum QueryType {
+    QT_UNSPECIFIED = 0;
+    QT_BATCH_GET = 1;
+}
+
+message Meta {
+    string key = 1;
+    string value = 2;
+}
+
+message GetRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    QueryType query_type = 3;
+    repeated string keys = 4;
+    repeated Meta metas = 5;
+}
+
+message GetResponse {
+    CommonResponseHeader header = 1;
+    repeated ValueLocation locations = 2; // 多个key的列表
+}
+
+// 在每次写入value前, 需要调用这个接口获得ValueLocation信息
+message PutStartRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    repeated string keys = 3;
+    int32 write_timeout_seconds = 4; // seconds, 要在指定timeout内调用PutFinish，否则服务端会将本次 Request 相关的 Meta 全释放掉
+}
+
+message PutStartResponse {
+    CommonResponseHeader header = 1;
+    string write_session_id = 2;
+    KeyMask key_mask = 3; // 存在相同key已经在写，一般情况下会mask掉这个key不让写
+    repeated ValueLocation locations = 4;
+}
+
+// 写入为简单起见, 先设计为原子性接口, 全成功或全失败
+// 结束对指定 keys 的写入(要保证所有 keys 对应 value 都已完成写入),
+// 若客户端未调用该接口或写入长时间未完成,
+// 服务端会视为写入失败并将本次Request所有meta清除. 客户端调用完这个接口后,
+// 服务端还会对所有 keys 进行检查
+message PutFinishRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    string write_session_id = 3;
+    repeated ValueLocation locations = 4; // 有可能location是在客户端分配的，需要传回来
+}
+
+// 删除指定keys，用于修复线上用户反馈case说某些提示词会胡言乱语的情况
+message RemoveRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    repeated string keys = 3;
+}
+
+enum TrimStrategy {
+    TS_UNSPECIFIED = 0;
+    TS_REMOVE_ALL_CACHE = 1;
+    TS_REMOVE_ALL_META = 2;
+    TS_TIMESTAMP = 3;
+}
+
+// 删除指定时间段的cache，用于处理发布前后错误数据；
+message TrimRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    TrimStrategy strategy = 3;
+    int32 begin_timestamp = 4; // TS_TIMESTAMP : 淘汰掉某个时间戳(写入)前所有数据
+    int32 end_timestamp = 5;   // TS_TIMESTAMP : 淘汰掉某个时间戳(写入)前所有数据
+}
+
+service MetaService {
+    // 注册instance信息，全局唯一，不同instance之间数据不可见，
+    rpc RegisterInstance(RegisterInstanceRequest) returns (RegisterInstanceResponse);
+    // 获取instance信息，用于调试或打印日志
+    rpc GetInstanceInfo(GetInstanceInfoRequest) returns (GetInstanceInfoResponse);
+    // 获取读取所需meta信息
+    rpc Get(GetRequest) returns (GetResponse);
+    // 获取Put所需的meta信息
+    rpc PutStart(PutStartRequest) returns (PutStartResponse);
+    // 标记此次Put完成，不论成功失败都需要调用
+    rpc PutFinish(PutFinishRequest) returns (CommonResponse);
+    // 删除指定key的meta数据，以及对应的value数据（有需要的话）
+    rpc Remove(RemoveRequest) returns (CommonResponse);
+    // 按指定规则范围删除key的meta数据，以及对应的value数据（有需要的话）
+    rpc Trim(TrimRequest) returns (CommonResponse);
+}

@@ -1,0 +1,20 @@
+{
+    "thread_num": 8,
+    "queue_size": 2000,
+    "sdk_backend_configs": [
+        {
+            "type": "hf3fs",
+            "enable_async_write": true,
+            "write_thread_num": 4,
+            "write_queue_size": 1000,
+            "read_iov_block_size": 0,
+            "read_iov_size": 4294967296,
+            "write_iov_block_size": 1048576,
+            "write_iov_size": 4294967296
+        }
+    ],
+    "timeout_config": {
+        "put_timeout_ms": -1,
+        "get_timeout_ms": -1
+    }
+}

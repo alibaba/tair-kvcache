@@ -1,0 +1,17 @@
+.*
+*~
+bazel-*
+build/*
+bin/*
+lib/*
+var/*
+logs/*
+kv_cache_manager/optimizer/analysis/result/*
+kv_cache_manager/optimizer/logs/*
+!.git*
+!.clang-format
+!.bazelrc
+!.bazeliskrc
+!.aoneci
+compile_commands.json
+stub_source

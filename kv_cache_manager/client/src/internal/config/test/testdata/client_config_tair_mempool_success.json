@@ -1,0 +1,37 @@
+{
+    "instance_group": "tair_mem_pool_group",
+    "instance_id": "test_instance_id",
+    "address": [
+        "33.108.39.36:6381"
+    ],
+    "block_size": 8,
+    "location_spec_infos": {
+        "tp0": 4096000
+    },
+    "sdk_config": {
+        "thread_num": 8,
+        "queue_size": 2000,
+        "sdk_backend_configs": [
+            {
+                "type": "pace",
+                "sdk_log_file_path": "logs/pace_client.log",
+                "sdk_log_level": "DEBUG"
+            }
+        ],
+        "timeout_config": {
+            "put_timeout_ms": 2000,
+            "get_timeout_ms": 2000
+        }
+    },
+    "model_deployment": {
+        "model_name": "test",
+        "dtype": "fp16",
+        "use_mla": false,
+        "tp_size": 1,
+        "dp_size": 1,
+        "lora_name": "custom_lora",
+        "pp_size": 1,
+        "extra": "extra",
+        "user_data": "custom_user_data"
+    }
+}

@@ -1,0 +1,27 @@
+#!/bin/sh
+
+format_file() {
+    path="$1"
+    ext="${path##*.}"
+    filename=$(basename $path)
+    if [ x"${ext}" == x"cc" -o x"${ext}" == x"cpp" -o x"${ext}" == x"h" -o x"${ext}" == x"hpp" ]; then
+        # c/c++ source file
+        echo "[clang-format] FORMAT ${path}"
+        clang-format -i ${path}
+    elif [ x"${filename}" == x"BUILD" -o x"${ext}" == x"bzl" ]; then
+	echo "[buildifier] BUILD file ${path}"
+        buildifier ${path}
+    elif [ x"${ext}" == x"py" ]; then
+        # python file
+        echo "[autopep8] FORMAT ${patch}"
+        autopep8 --in-place --aggressive --aggressive --max-line-length=120 --ignore="E402,E721" ${path}
+    else
+        #echo "UNSUPPORT $path"
+        return 0
+    fi
+    git add ${path}
+}
+
+for path in `git diff-index --diff-filter=d --cached --name-only HEAD`; do
+    format_file "${path}"
+done
