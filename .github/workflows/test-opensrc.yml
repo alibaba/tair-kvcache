@@ -1,0 +1,61 @@
+name: test-opensrc
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  unit_test:
+    runs-on: ubuntu-latest
+    container:
+      image: tair-kvcache-opensrc-registry.cn-hangzhou.cr.aliyuncs.com/tair-kvcache-opensrc/kv_cache_manager_dev:latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bazel-contrib/setup-bazel@0.18.0
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ runner.os }}-${{ github.workflow }}-unit_test
+          repository-cache: true
+          cache-save: ${{ github.event_name != 'pull_request' }}
+      - name: bazel_test
+        run:  |
+          set -x
+          set -e
+          bazelisk test //kv_cache_manager/...
+      - name: create_archive
+        if: failure()
+        run: |
+          set -x
+          set -e
+          test -a bazel-out.tar && rm -f bazel-out.tar
+          find bazel-out/k8-opt/bin/ '(' -name 'kv_cache_manager.log' -o -name 'access.log' -o -name 'metrics.log' -o -name 'stdout' -o -name 'stderr' ')' -a -exec 'tar' '-r' '-f' 'bazel-out.tar' '{}' ';'
+          find bazel-out/k8-opt/bin/ -name 'core-*' -a -type f -a -exec 'tar' '-r' '-f' 'bazel-out.tar' '{}' ';'
+          tar -r -f bazel-out.tar bazel-out/k8-opt/testlogs/
+          gzip -f bazel-out.tar
+  integration_test:
+    runs-on: ubuntu-latest
+    container:
+      image: tair-kvcache-opensrc-registry.cn-hangzhou.cr.aliyuncs.com/tair-kvcache-opensrc/kv_cache_manager_dev:latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bazel-contrib/setup-bazel@0.18.0
+        with:
+          disk-cache: ${{ runner.os }}-${{ github.workflow }}-integration_test
+          repository-cache: true
+          cache-save: ${{ github.event_name != 'pull_request' }}
+      - name: bazel_test
+        run: |
+          set -x
+          set -e
+          bazelisk test //integration_test/...
+      - name: create_archive
+        if: failure()
+        run: |
+          set -x
+          set -e
+          test -a bazel-out.tar && rm -f bazel-out.tar
+          find bazel-out/k8-opt/bin/ '(' -name 'kv_cache_manager.log' -o -name 'access.log' -o -name 'metrics.log' -o -name 'stdout' -o -name 'stderr' ')' -a -exec 'tar' '-r' '-f' 'bazel-out.tar' '{}' ';'
+          find bazel-out/k8-opt/bin/ -name 'core-*' -a -type f -a -exec 'tar' '-r' '-f' 'bazel-out.tar' '{}' ';'
+          tar -r -f bazel-out.tar bazel-out/k8-opt/testlogs/
+          gzip -f bazel-out.tar
