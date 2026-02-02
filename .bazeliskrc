@@ -1,2 +1,1 @@
-USE_BAZEL_VERSION=6.4.0-dev_4f82cf83afde5e0f71b76a5611cedac7ac456fef
-BAZELISK_BASE_URL=https://search-cicd.oss-cn-hangzhou-zmf.aliyuncs.com/third_party_archives/bazel_binary
+./stub_source/.bazeliskrc

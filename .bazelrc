@@ -1,6 +1,3 @@
-# common --experimental_downloader_config=bazel/bazel_downloader.cfg
-# fetch:downloader --experimental_remote_downloader=grpc://com.taobao.search.bazel.server:9092 --remote_cache=grpc://com.taobao.search.bazel.server:9092
-
 build:py3 --python_path=/usr/bin/python3
 build:py3 --python_top=//:python3 --incompatible_use_python_toolchains=false
 build:py3 --action_env PYTHON_BIN_PATH="/usr/bin/python3"
