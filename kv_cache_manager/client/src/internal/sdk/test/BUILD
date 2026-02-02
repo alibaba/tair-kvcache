@@ -5,6 +5,11 @@ config_setting(
     values = {"define": "ENABLE_HF3FS=true"},
 )
 
+config_setting(
+    name = "using_cuda",
+    values = {"define": "using_cuda=true"},
+)
+
 cc_test(
     name = "LocalFileSdkTest",
     srcs = [
@@ -106,6 +111,10 @@ cc_test(
         "sdk_buffer_check_util_test.cc",
     ],
     copts = ["-fno-access-control"],
+    target_compatible_with = select({
+        ":using_cuda": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
     deps = [
         "//kv_cache_manager/client/src/internal/sdk:sdk_buffer_check_util",
         "//kv_cache_manager/common:unittest",

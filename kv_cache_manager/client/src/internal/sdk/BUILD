@@ -148,6 +148,10 @@ cuda_library(
         "-std=c++20",
         "--compiler-options=-fPIC",
     ],
+    target_compatible_with = select({
+        ":using_cuda": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
     deps = [
         "//kv_cache_manager/client:common",
         "//kv_cache_manager/common:hash_util",
