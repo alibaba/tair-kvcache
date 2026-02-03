@@ -102,6 +102,9 @@ public:
     grpc::Status UpdateLeaderElectorConfig(grpc::ServerContext *context,
                                            const proto::admin::UpdateLeaderElectorConfigRequest *request,
                                            proto::admin::CommonResponse *response) override;
+    grpc::Status UpdateLogger(grpc::ServerContext *context,
+                              const proto::admin::UpdateLoggerRequest *request,
+                              proto::admin::CommonResponse *response) override;
 
 private:
     std::shared_ptr<MetricsRegistry> metrics_registry_;
@@ -149,6 +152,9 @@ private:
     KVCM_DECLARE_METRICS_COLLECTOR_(LeaderDemote);
     KVCM_DECLARE_METRICS_COLLECTOR_(GetLeaderElectorConfig);
     KVCM_DECLARE_METRICS_COLLECTOR_(UpdateLeaderElectorConfig);
+
+    // for logging control APIs
+    KVCM_DECLARE_METRICS_COLLECTOR_(UpdateLogger);
 };
 
 } // namespace kv_cache_manager

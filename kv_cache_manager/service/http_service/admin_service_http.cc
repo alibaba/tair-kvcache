@@ -60,6 +60,9 @@ void AdminServiceHttp::Init() {
     MAKE_SERVICE_METRICS_COLLECTOR(LeaderDemote);
     MAKE_SERVICE_METRICS_COLLECTOR(GetLeaderElectorConfig);
     MAKE_SERVICE_METRICS_COLLECTOR(UpdateLeaderElectorConfig);
+
+    // for logging control APIs
+    MAKE_SERVICE_METRICS_COLLECTOR(UpdateLogger);
 }
 
 void AdminServiceHttp::RegisterHandler() {
@@ -113,6 +116,9 @@ void AdminServiceHttp::RegisterHandler() {
         Post, getLeaderElectorConfig, GetLeaderElectorConfig, GetLeaderElectorConfig, GetLeaderElectorConfig);
     REGISTER_HTTP_HANDLER_FOR_ADMIN_SERVICE(
         Post, updateLeaderElectorConfig, UpdateLeaderElectorConfig, Common, UpdateLeaderElectorConfig);
+
+    // logging control APIs
+    REGISTER_HTTP_HANDLER_FOR_ADMIN_SERVICE(Post, updateLogger, UpdateLogger, Common, UpdateLogger);
 }
 
 void AdminServiceHttp::AddStorage(coro_http::coro_http_connection *http_conn,
@@ -365,6 +371,14 @@ void AdminServiceHttp::UpdateLeaderElectorConfig(coro_http::coro_http_connection
     API_CONTEXT_INIT_HTTP(UpdateLeaderElectorConfig)
     KVCM_LOG_INFO("[traceId: %s] UpdateLeaderElectorConfig called.", request->trace_id().c_str());
     admin_service_impl_->UpdateLeaderElectorConfig(request_context, request, response);
+}
+
+void AdminServiceHttp::UpdateLogger(coro_http::coro_http_connection *http_conn,
+                                    proto::admin::UpdateLoggerRequest *request,
+                                    proto::admin::CommonResponse *response) {
+    API_CONTEXT_INIT_HTTP(UpdateLogger)
+    KVCM_LOG_INFO("[traceId: %s] UpdateLogger called.", request->trace_id().c_str());
+    admin_service_impl_->UpdateLogger(request_context, request, response);
 }
 
 } // namespace kv_cache_manager

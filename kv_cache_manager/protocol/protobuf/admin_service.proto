@@ -464,6 +464,12 @@ message UpdateLeaderElectorConfigRequest {
     int64 campaign_delay_time_ms = 2;
 }
 
+message UpdateLoggerRequest {
+    string trace_id = 1;
+    string module_name = 2; // 暂无法分模块控制，字段先预留
+    string log_level = 3; // DEBUG INFO WARN ERROR
+}
+
 service AdminService {
     // 增删改查 存储集群配置 (Storage)
     rpc AddStorage(AddStorageRequest) returns (CommonResponse);
@@ -501,4 +507,6 @@ service AdminService {
     rpc LeaderDemote(LeaderDemoteRequest) returns (CommonResponse);
     rpc GetLeaderElectorConfig(GetLeaderElectorConfigRequest) returns (GetLeaderElectorConfigResponse);
     rpc UpdateLeaderElectorConfig(UpdateLeaderElectorConfigRequest) returns (CommonResponse);
+    // 日志行为控制
+    rpc UpdateLogger(UpdateLoggerRequest) returns (CommonResponse);
 }

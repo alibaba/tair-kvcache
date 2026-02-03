@@ -229,3 +229,21 @@ TEST_F(LoggerTest, TestInitLoggerForClientOnce) {
     ASSERT_EQ(Logger::LEVEL_DEBUG, LoggerBroker::base_log_level_);
     LoggerBroker::DestroyLogger();
 }
+
+TEST_F(LoggerTest, TestUpdateLogLevel) {
+    LoggerBroker::InitLogger("");
+    LoggerBroker::SetLogLevel(Logger::LEVEL_DEBUG);
+    std::atomic<bool> stop{false};
+    std::future f = std::async(std::launch::async, [&]() {
+        while (!stop) {
+            KVCM_LOG_DEBUG("test debug, wait log level update");
+        }
+    });
+    ASSERT_EQ(Logger::LEVEL_DEBUG, LoggerBroker::base_log_level_);
+    usleep(1000);
+    LoggerBroker::SetLogLevel(Logger::LEVEL_INFO);
+    KVCM_LOG_DEBUG("test debug, logger info update");
+    KVCM_LOG_INFO("test info, logger info update");
+    stop = true;
+    ASSERT_EQ(Logger::LEVEL_INFO, LoggerBroker::base_log_level_);
+}

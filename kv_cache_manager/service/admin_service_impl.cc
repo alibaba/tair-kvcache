@@ -867,4 +867,24 @@ void AdminServiceImpl::UpdateLeaderElectorConfig(RequestContext *request_context
     KVCM_LOG_INFO("[traceId: %s] UpdateLeaderElectorConfig succeeded", request->trace_id().c_str());
 }
 
+void AdminServiceImpl::UpdateLogger(RequestContext *request_context,
+                                    const proto::admin::UpdateLoggerRequest *request,
+                                    proto::admin::CommonResponse *response) {
+    API_CALL_GUARD("UpdateLogger", false);
+    auto *header = response->mutable_header();
+    auto *status = header->mutable_status();
+    uint32_t log_level = Logger::StringToLevel(request->log_level());
+    if (log_level == Logger::LEVEL_UNSET) {
+        status->set_code(proto::admin::INVALID_ARGUMENT);
+        request_context->set_status_code(status->code());
+        status->set_message("Invalid log level string");
+        return;
+    }
+    LoggerBroker::SetLogLevel(log_level);
+    status->set_code(proto::admin::OK);
+    request_context->set_status_code(status->code());
+    status->set_message("Update logger success");
+    KVCM_LOG_INFO("[traceId: %s] Update logger success", request->trace_id().c_str());
+}
+
 } // namespace kv_cache_manager

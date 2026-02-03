@@ -108,6 +108,9 @@ public:
     void UpdateLeaderElectorConfig(coro_http::coro_http_connection *http_conn,
                                    proto::admin::UpdateLeaderElectorConfigRequest *request,
                                    proto::admin::CommonResponse *response);
+    void UpdateLogger(coro_http::coro_http_connection *http_conn,
+                      proto::admin::UpdateLoggerRequest *request,
+                      proto::admin::CommonResponse *response);
 
 private:
     std::shared_ptr<MetricsRegistry> metrics_registry_;
@@ -155,6 +158,9 @@ private:
     KVCM_DECLARE_METRICS_COLLECTOR_(LeaderDemote);
     KVCM_DECLARE_METRICS_COLLECTOR_(GetLeaderElectorConfig);
     KVCM_DECLARE_METRICS_COLLECTOR_(UpdateLeaderElectorConfig);
+
+    // for logging control APIs
+    KVCM_DECLARE_METRICS_COLLECTOR_(UpdateLogger);
 };
 
 } // namespace kv_cache_manager

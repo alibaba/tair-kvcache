@@ -59,6 +59,9 @@ void AdminServiceGRpc::Init() {
     MAKE_SERVICE_METRICS_COLLECTOR(LeaderDemote);
     MAKE_SERVICE_METRICS_COLLECTOR(GetLeaderElectorConfig);
     MAKE_SERVICE_METRICS_COLLECTOR(UpdateLeaderElectorConfig);
+
+    // for logging control APIs
+    MAKE_SERVICE_METRICS_COLLECTOR(UpdateLogger);
 }
 
 grpc::Status AdminServiceGRpc::AddStorage(grpc::ServerContext *context,
@@ -274,6 +277,14 @@ grpc::Status AdminServiceGRpc::UpdateLeaderElectorConfig(grpc::ServerContext *co
                                                          proto::admin::CommonResponse *response) {
     API_CONTEXT_INIT_GRPC(UpdateLeaderElectorConfig)
     admin_service_impl_->UpdateLeaderElectorConfig(request_context, request, response);
+    return grpc::Status::OK;
+}
+
+grpc::Status AdminServiceGRpc::UpdateLogger(grpc::ServerContext *context,
+                                            const proto::admin::UpdateLoggerRequest *request,
+                                            proto::admin::CommonResponse *response) {
+    API_CONTEXT_INIT_GRPC(UpdateLogger)
+    admin_service_impl_->UpdateLogger(request_context, request, response);
     return grpc::Status::OK;
 }
 

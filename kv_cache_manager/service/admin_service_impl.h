@@ -113,6 +113,10 @@ public:
     void UpdateLeaderElectorConfig(RequestContext *request_context,
                                    const proto::admin::UpdateLeaderElectorConfigRequest *request,
                                    proto::admin::CommonResponse *response);
+    // 日志行为控制相关接口
+    void UpdateLogger(RequestContext *request_context,
+                      const proto::admin::UpdateLoggerRequest *request,
+                      proto::admin::CommonResponse *response);
 
 private:
     std::shared_ptr<CacheManager> cache_manager_;
