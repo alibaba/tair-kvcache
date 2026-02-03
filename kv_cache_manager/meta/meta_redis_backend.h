@@ -5,6 +5,7 @@
 #include <mutex>
 #include <queue>
 
+#include "kv_cache_manager/common/client_pool.h"
 #include "kv_cache_manager/common/redis_client.h"
 #include "kv_cache_manager/meta/meta_storage_backend.h"
 
@@ -53,71 +54,14 @@ public:
     ErrorCode GetMetaData(FieldMap &field_maps) noexcept override;
 
 private:
-    class PoolState {
-    public:
-        std::unique_ptr<RedisClient> AcquireClient(int64_t lock_timeout_ms) {
-            std::chrono::milliseconds timeout(lock_timeout_ms);
-            {
-                std::unique_lock<std::mutex> lock(mtx_);
-                if (!cv_.wait_for(lock, timeout, [this] { return !client_pool_.empty(); })) {
-                    return nullptr;
-                }
-                assert(!client_pool_.empty());
-                std::unique_ptr<RedisClient> client = std::move(client_pool_.front());
-                client_pool_.pop();
-                return client;
-            }
-            return nullptr;
-        }
-        void ReleaseClient(std::unique_ptr<RedisClient> client) {
-            if (client) {
-                std::lock_guard<std::mutex> lock(mtx_);
-                client_pool_.push(std::move(client));
-                cv_.notify_one();
-            }
-        }
-
-    private:
-        std::mutex mtx_;
-        std::condition_variable cv_;
-        std::queue<std::unique_ptr<RedisClient>> client_pool_;
-    };
-
-    class ClientHandle {
-    public:
-        ClientHandle(std::weak_ptr<PoolState> pool_state, std::unique_ptr<RedisClient> client)
-            : pool_state_(std::move(pool_state)), client_(std::move(client)) {}
-        ~ClientHandle() {
-            if (client_) {
-                if (auto pool_state = pool_state_.lock()) {
-                    pool_state->ReleaseClient(std::move(client_));
-                } else {
-                    client_.reset();
-                }
-            }
-        }
-        RedisClient *operator->() { return client_.get(); }
-        RedisClient &operator*() { return *client_; }
-        explicit operator bool() const { return client_ != nullptr; }
-
-    private:
-        std::weak_ptr<PoolState> pool_state_;
-        std::unique_ptr<RedisClient> client_;
-    };
-
-private:
-    std::shared_ptr<PoolState> GetPoolState() const;
-    void SetPoolState(const std::shared_ptr<PoolState> &pool_state);
-    ClientHandle AcquireClientFromPool();
     std::vector<std::string> AppendPrefixToKeys(const KeyTypeVec &keys) const;
     bool StripPrefixInKeys(const std::vector<std::string> &keys_with_prefix, std::vector<KeyType> &out_keys) const;
 
     // virtual for test
-    virtual std::unique_ptr<RedisClient> CreateRedisClient() const;
+    virtual std::shared_ptr<RedisClient> CreateRedisClient() const;
 
 private:
-    mutable std::mutex pool_state_mtx_;
-    std::shared_ptr<PoolState> pool_state_;
+    std::shared_ptr<DynamicClientPool<RedisClient>> client_pool_;
     StandardUri storage_uri_;
     std::string instance_id_;
     std::string cache_key_prefix_;

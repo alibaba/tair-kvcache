@@ -38,10 +38,10 @@ cc_library(
         ":meta_local_backend",
         ":meta_redis_backend",
         ":meta_storage_backend",
-        "//kv_cache_manager/config",
         "//kv_cache_manager/common",
         "//kv_cache_manager/common:lru_cache",
         "//kv_cache_manager/common:utils",
+        "//kv_cache_manager/config",
     ],
 )
 
@@ -55,7 +55,6 @@ cc_library(
     deps = [
     ],
 )
-
 
 cc_library(
     name = "meta_storage_backend",
@@ -96,9 +95,9 @@ cc_library(
         "meta_redis_backend.h",
     ],
     deps = [
-        "//kv_cache_manager/common:redis_client",
         ":common",
         ":meta_storage_backend",
+        "//kv_cache_manager/common:client_pool",
+        "//kv_cache_manager/common:redis_client",
     ],
 )
-

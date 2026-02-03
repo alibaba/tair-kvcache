@@ -7,7 +7,7 @@
 namespace kv_cache_manager {
 
 const std::string kRedisUri = "redis://test_redis_user:test_redis_password@localhost:6379/"
-                              "?timeout_ms=1000&retry_count=3&client_pool_size=2";
+                              "?timeout_ms=1000&retry_count=3&client_max_pool_size=2";
 
 DistributedLockBackendTestConfig redis_backend_config{
     .get_test_uri = [](DistributedLockBackendTest *test_base) { return kRedisUri; },

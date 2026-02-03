@@ -11,30 +11,6 @@ MetaRedisBackend::~MetaRedisBackend() { [[maybe_unused]] ErrorCode _ = Close(); 
 
 std::string MetaRedisBackend::GetStorageType() noexcept { return META_REDIS_BACKEND_TYPE_STR; }
 
-std::shared_ptr<MetaRedisBackend::PoolState> MetaRedisBackend::GetPoolState() const {
-    std::lock_guard<std::mutex> lock(pool_state_mtx_);
-    return pool_state_;
-}
-
-void MetaRedisBackend::SetPoolState(const std::shared_ptr<MetaRedisBackend::PoolState> &pool_state) {
-    std::lock_guard<std::mutex> lock(pool_state_mtx_);
-    pool_state_ = pool_state;
-}
-
-MetaRedisBackend::ClientHandle MetaRedisBackend::AcquireClientFromPool() {
-    std::shared_ptr<PoolState> pool_state = GetPoolState();
-    if (!pool_state) {
-        KVCM_LOG_ERROR("fail to acquire redis client, client pool not inited, instance[%s]", instance_id_.c_str());
-        return ClientHandle({}, nullptr);
-    }
-    std::unique_ptr<RedisClient> client = pool_state->AcquireClient(timeout_ms_);
-    if (!client) {
-        KVCM_INTERVAL_LOG_WARN(10, "fail to acquire redis client from client pool, instance[%s]", instance_id_.c_str());
-        return ClientHandle({}, nullptr);
-    }
-    return ClientHandle(pool_state, std::move(client));
-}
-
 std::vector<std::string> MetaRedisBackend::AppendPrefixToKeys(const KeyTypeVec &keys) const {
     std::vector<std::string> keys_with_prefix;
     keys_with_prefix.reserve(keys.size());
@@ -72,8 +48,8 @@ bool MetaRedisBackend::StripPrefixInKeys(const std::vector<std::string> &keys_wi
     return true;
 }
 
-std::unique_ptr<RedisClient> MetaRedisBackend::CreateRedisClient() const {
-    return std::make_unique<RedisClient>(storage_uri_);
+std::shared_ptr<RedisClient> MetaRedisBackend::CreateRedisClient() const {
+    return std::make_shared<RedisClient>(storage_uri_);
 }
 
 ErrorCode MetaRedisBackend::Init(const std::string &instance_id,
@@ -112,38 +88,50 @@ ErrorCode MetaRedisBackend::Init(const std::string &instance_id,
 }
 
 ErrorCode MetaRedisBackend::Open() noexcept {
-    constexpr int64_t DEFAULT_CLIENT_POOL_SIZE = 16;
-    int32_t client_pool_size = DEFAULT_CLIENT_POOL_SIZE;
-    int64_t tmp_client_pool_size = 0;
-    storage_uri_.GetParamAs("client_pool_size", tmp_client_pool_size);
-    if (tmp_client_pool_size > 0) {
-        client_pool_size = tmp_client_pool_size;
+    constexpr int32_t DEFAULT_CLIENT_MAX_POOL_SIZE = 16;
+    constexpr int32_t DEFAULT_CLIENT_MIN_POOL_SIZE = 0;
+    int32_t client_max_pool_size = DEFAULT_CLIENT_MAX_POOL_SIZE;
+    int32_t client_min_pool_size = DEFAULT_CLIENT_MIN_POOL_SIZE;
+    int64_t tmp_client_max_pool_size = 0;
+    storage_uri_.GetParamAs("client_max_pool_size", tmp_client_max_pool_size);
+    if (tmp_client_max_pool_size > 0) {
+        client_max_pool_size = tmp_client_max_pool_size;
+    }
+    int64_t tmp_client_min_pool_size = 0;
+    storage_uri_.GetParamAs("client_min_pool_size", tmp_client_min_pool_size);
+    if (tmp_client_min_pool_size > 0) {
+        client_min_pool_size = tmp_client_min_pool_size;
     }
 
-    auto pool_state = std::make_shared<PoolState>();
-    for (int32_t i = 0; i < client_pool_size; ++i) {
-        std::unique_ptr<RedisClient> client = CreateRedisClient();
-        if (!client || !client->Open()) {
-            KVCM_LOG_ERROR("fail to open redis client, idx[%d]", i);
-            return EC_ERROR;
-        }
-        pool_state->ReleaseClient(std::move(client));
+    client_pool_ = std::make_shared<DynamicClientPool<RedisClient>>(
+        [this]() -> std::shared_ptr<RedisClient> {
+            auto client = this->CreateRedisClient();
+            if (!client || !client->Open()) {
+                return nullptr;
+            }
+            return client;
+        },
+        client_min_pool_size,
+        client_max_pool_size);
+    if (!client_pool_->Initialize()) {
+        KVCM_LOG_ERROR("meta redis client_pool init faild");
+        return EC_ERROR;
     }
-    SetPoolState(pool_state);
-    KVCM_LOG_INFO("meta redis backend open successfully, redis client pool size[%d], instance[%s]",
-                  client_pool_size,
+    KVCM_LOG_INFO("meta redis backend open successfully, redis client pool size min[%d], max[%d], instance[%s]",
+                  client_min_pool_size,
+                  client_max_pool_size,
                   instance_id_.c_str());
     return EC_OK;
 }
 
 ErrorCode MetaRedisBackend::Close() noexcept {
-    SetPoolState(nullptr);
+    client_pool_.reset();
     KVCM_LOG_INFO("meta redis backend close successfully, instance[%s]", instance_id_.c_str());
     return EC_OK;
 }
 
 std::vector<ErrorCode> MetaRedisBackend::Put(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept {
-    auto handle = AcquireClientFromPool();
+    auto handle = client_pool_->AcquireClient(timeout_ms_);
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(10, "put fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
         return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
@@ -153,7 +141,7 @@ std::vector<ErrorCode> MetaRedisBackend::Put(const KeyTypeVec &keys, const Field
 }
 
 std::vector<ErrorCode> MetaRedisBackend::UpdateFields(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept {
-    auto handle = AcquireClientFromPool();
+    auto handle = client_pool_->AcquireClient(timeout_ms_);
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(10, "update fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
         return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
@@ -163,7 +151,7 @@ std::vector<ErrorCode> MetaRedisBackend::UpdateFields(const KeyTypeVec &keys, co
 }
 
 std::vector<ErrorCode> MetaRedisBackend::Upsert(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept {
-    auto handle = AcquireClientFromPool();
+    auto handle = client_pool_->AcquireClient(timeout_ms_);
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(10, "upsert fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
         return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
@@ -178,7 +166,7 @@ std::vector<ErrorCode> MetaRedisBackend::IncrFields(const KeyTypeVec &keys,
 }
 
 std::vector<ErrorCode> MetaRedisBackend::Delete(const KeyTypeVec &keys) noexcept {
-    auto handle = AcquireClientFromPool();
+    auto handle = client_pool_->AcquireClient(timeout_ms_);
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(10, "delete fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
         return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
@@ -190,7 +178,7 @@ std::vector<ErrorCode> MetaRedisBackend::Delete(const KeyTypeVec &keys) noexcept
 std::vector<ErrorCode> MetaRedisBackend::Get(const KeyTypeVec &keys,
                                              const std::vector<std::string> &field_names,
                                              FieldMapVec &out_field_maps) noexcept {
-    auto handle = AcquireClientFromPool();
+    auto handle = client_pool_->AcquireClient(timeout_ms_);
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(10, "get fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
         return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
@@ -200,7 +188,7 @@ std::vector<ErrorCode> MetaRedisBackend::Get(const KeyTypeVec &keys,
 }
 
 std::vector<ErrorCode> MetaRedisBackend::GetAllFields(const KeyTypeVec &keys, FieldMapVec &out_field_maps) noexcept {
-    auto handle = AcquireClientFromPool();
+    auto handle = client_pool_->AcquireClient(timeout_ms_);
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(
             10, "get all fields fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
@@ -211,7 +199,7 @@ std::vector<ErrorCode> MetaRedisBackend::GetAllFields(const KeyTypeVec &keys, Fi
 }
 
 std::vector<ErrorCode> MetaRedisBackend::Exists(const KeyTypeVec &keys, std::vector<bool> &out_is_exist_vec) noexcept {
-    auto handle = AcquireClientFromPool();
+    auto handle = client_pool_->AcquireClient(timeout_ms_);
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(10, "exists fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
         return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
@@ -226,7 +214,7 @@ ErrorCode MetaRedisBackend::ListKeys(const std::string &cursor,
                                      std::vector<KeyType> &out_keys) noexcept {
     out_keys.clear();
 
-    auto handle = AcquireClientFromPool();
+    auto handle = client_pool_->AcquireClient(timeout_ms_);
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(10, "list keys fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
         return EC_TIMEOUT;
@@ -248,7 +236,7 @@ ErrorCode MetaRedisBackend::ListKeys(const std::string &cursor,
 ErrorCode MetaRedisBackend::RandomSample(const int64_t count, std::vector<KeyType> &out_keys) noexcept {
     out_keys.clear();
 
-    auto handle = AcquireClientFromPool();
+    auto handle = client_pool_->AcquireClient(timeout_ms_);
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(10, "random fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
         return EC_TIMEOUT;
@@ -268,7 +256,7 @@ ErrorCode MetaRedisBackend::RandomSample(const int64_t count, std::vector<KeyTyp
 }
 
 ErrorCode MetaRedisBackend::PutMetaData(const FieldMap &field_map) noexcept {
-    auto handle = AcquireClientFromPool();
+    auto handle = client_pool_->AcquireClient(timeout_ms_);
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(
             10, "put metadata fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
@@ -280,7 +268,7 @@ ErrorCode MetaRedisBackend::PutMetaData(const FieldMap &field_map) noexcept {
 }
 
 ErrorCode MetaRedisBackend::GetMetaData(FieldMap &out_field_map) noexcept {
-    auto handle = AcquireClientFromPool();
+    auto handle = client_pool_->AcquireClient(timeout_ms_);
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(10, "get fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
         return EC_TIMEOUT;

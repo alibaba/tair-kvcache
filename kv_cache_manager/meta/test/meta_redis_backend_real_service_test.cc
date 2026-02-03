@@ -38,43 +38,37 @@ void MetaRedisBackendRealServiceTest::ConstructMetaStorageBackendConfig() {
     meta_storage_backend_config_ = std::make_shared<MetaStorageBackendConfig>();
     meta_storage_backend_config_->SetStorageType(META_REDIS_BACKEND_TYPE_STR);
     meta_storage_backend_config_->SetStorageUri(
-        "redis://test_redis_user:test_redis_password@localhost:6379/?client_pool_size=4");
+        "redis://test_redis_user:test_redis_password@localhost:6379/?client_max_pool_size=4");
 }
 
 TEST_F(MetaRedisBackendRealServiceTest, TestOpenAndClose) {
     meta_storage_backend_config_->SetStorageUri(
-        "redis://test_redis_user:test_redis_password@localhost:6379/?client_pool_size=2");
+        "redis://test_redis_user:test_redis_password@localhost:6379/?client_max_pool_size=2");
     ASSERT_EQ(EC_OK, meta_redis_backend_->Init("test_open_and_close", meta_storage_backend_config_));
     // open first
     ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
     {
-        MetaRedisBackend::ClientHandle handle1 = meta_redis_backend_->AcquireClientFromPool();
+        auto handle1 = meta_redis_backend_->client_pool_->AcquireClient();
         ASSERT_TRUE(handle1);
-        MetaRedisBackend::ClientHandle handle2 = meta_redis_backend_->AcquireClientFromPool();
+        auto handle2 = meta_redis_backend_->client_pool_->AcquireClient();
         ASSERT_TRUE(handle2);
-        MetaRedisBackend::ClientHandle handle3 = meta_redis_backend_->AcquireClientFromPool();
+        auto handle3 = meta_redis_backend_->client_pool_->AcquireClient();
         ASSERT_FALSE(handle3);
     }
     ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
-    {
-        MetaRedisBackend::ClientHandle handle1 = meta_redis_backend_->AcquireClientFromPool();
-        ASSERT_FALSE(handle1);
-    }
+    ASSERT_TRUE(meta_redis_backend_->client_pool_ == nullptr);
     // reopen second
     ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
     {
-        MetaRedisBackend::ClientHandle handle1 = meta_redis_backend_->AcquireClientFromPool();
+        auto handle1 = meta_redis_backend_->client_pool_->AcquireClient();
         ASSERT_TRUE(handle1);
-        MetaRedisBackend::ClientHandle handle2 = meta_redis_backend_->AcquireClientFromPool();
+        auto handle2 = meta_redis_backend_->client_pool_->AcquireClient();
         ASSERT_TRUE(handle2);
-        MetaRedisBackend::ClientHandle handle3 = meta_redis_backend_->AcquireClientFromPool();
+        auto handle3 = meta_redis_backend_->client_pool_->AcquireClient();
         ASSERT_FALSE(handle3);
     }
     ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
-    {
-        MetaRedisBackend::ClientHandle handle1 = meta_redis_backend_->AcquireClientFromPool();
-        ASSERT_FALSE(handle1);
-    }
+    ASSERT_TRUE(meta_redis_backend_->client_pool_ == nullptr);
 }
 
 TEST_F(MetaRedisBackendRealServiceTest, TestMultiThreadSimple) {

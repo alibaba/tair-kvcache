@@ -35,7 +35,7 @@ TEST_F(MetaIndexerRedisTest, TestInit) {
         "mutex_shard_num" : 8,
         "meta_storage_backend_config" : { 
             "storage_type" : "redis",
-            "storage_uri" : "redis://test_redis_user:test_redis_password@localhost:6379/?timeout_ms=1000&retry_count=3&client_pool_size=2"
+            "storage_uri" : "redis://test_redis_user:test_redis_password@localhost:6379/?timeout_ms=1000&retry_count=3&client_max_pool_size=2"
         },
         "meta_cache_policy_config" : {
             "type" : "lru",
@@ -57,7 +57,7 @@ TEST_F(MetaIndexerRedisTest, TestInit) {
     ASSERT_EQ(6379, storage_uri.GetPort());
     ASSERT_EQ("1000", storage_uri.GetParam("timeout_ms"));
     ASSERT_EQ("3", storage_uri.GetParam("retry_count"));
-    ASSERT_EQ("2", storage_uri.GetParam("client_pool_size"));
+    ASSERT_EQ("2", storage_uri.GetParam("client_max_pool_size"));
 }
 
 TEST_F(MetaIndexerRedisTest, TestRedisSimple) {
@@ -66,7 +66,7 @@ TEST_F(MetaIndexerRedisTest, TestRedisSimple) {
         "mutex_shard_num" : 8,
         "meta_storage_backend_config" : { 
             "storage_type" : "redis",
-            "storage_uri" : "redis://test_redis_user:test_redis_password@localhost:6379/?timeout_ms=1000&retry_count=3&client_pool_size=2"
+            "storage_uri" : "redis://test_redis_user:test_redis_password@localhost:6379/?timeout_ms=1000&retry_count=3&client_max_pool_size=2"
         },
         "meta_cache_policy_config" : {
             "type" : "lru",
@@ -111,7 +111,7 @@ TEST_F(MetaIndexerRedisTest, TestMultiThread) {
         "batch_key_size" : 8,
         "meta_storage_backend_config" : { 
             "storage_type" : "redis",
-            "storage_uri" : "redis://test_redis_user:test_redis_password@localhost:6379/?timeout_ms=1000&retry_count=3&client_pool_size=16"
+            "storage_uri" : "redis://test_redis_user:test_redis_password@localhost:6379/?timeout_ms=1000&retry_count=3&client_max_pool_size=16"
         },
         "meta_cache_policy_config" : {
             "type" : "lru",

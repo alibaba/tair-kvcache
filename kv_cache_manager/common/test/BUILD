@@ -86,8 +86,8 @@ cc_test(
     copts = ["-fno-access-control"],
     data = [],
     deps = [
-        "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/common:standard_uri",
+        "//kv_cache_manager/common:unittest",
     ],
 )
 
@@ -101,11 +101,11 @@ cc_library(
         "redis_test_base.h",
     ],
     copts = ["-fno-access-control"],
+    visibility = ["//kv_cache_manager/meta/test:__pkg__"],
     deps = [
         "//kv_cache_manager/common:redis_client",
         "@com_google_googletest//:gtest",
     ],
-    visibility = ["//kv_cache_manager/meta/test:__pkg__"],
 )
 
 cc_test(
@@ -128,12 +128,24 @@ cc_test(
     ],
     copts = ["-fno-access-control"],
     data = [],
+    tags = [
+        "manual",
+        "redis",
+    ],
     deps = [
         "//kv_cache_manager/common:redis_client",
         "//kv_cache_manager/common:unittest",
     ],
-    tags = [
-        "manual",
-        "redis",
+)
+
+cc_test(
+    name = "client_pool_test",
+    srcs = [
+        "client_pool_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:client_pool",
+        "//kv_cache_manager/common:unittest",
     ],
 )

@@ -243,3 +243,10 @@ cc_library(
         ":timestamp_util",
     ],
 )
+
+cc_library(
+    name = "client_pool",
+    hdrs = [
+        "client_pool.h",
+    ],
+)
