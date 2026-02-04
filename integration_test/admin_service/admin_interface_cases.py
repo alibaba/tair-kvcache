@@ -333,7 +333,7 @@ class AdminServiceTestBase(abc.ABC, TestBase, unittest.TestCase):
 
         metrics_req = {"trace_id": self._trace_id}
         metrics_resp = self._client.get_metrics(metrics_req)
-        logging.info(metrics_resp)
+        logging.debug(metrics_resp)
         self.assertIn("header", metrics_resp)
         self.assertEqual(metrics_resp["header"]["status"]["code"], "OK")
         self.assertIn("metrics", metrics_resp)
@@ -342,7 +342,7 @@ class AdminServiceTestBase(abc.ABC, TestBase, unittest.TestCase):
         metric_service_query_rt_us = 0
 
         for metric in metrics_resp["metrics"]:
-            logging.info(metric)
+            logging.debug(metric)
             if metric["metric_name"] == "service.query_counter":
                 for tag in metric["metric_tags"]:
                     if ((tag["tag_key"] == "api_name" and
