@@ -36,6 +36,7 @@ enum [[nodiscard]] ClientErrorCode : int32_t{
     ER_SERVICE_INVALID_ARGUMENT = 53,
     ER_SERVICE_DUPLICATE_ENTITY = 54,
     ER_SERVICE_INSTANCE_NOT_EXIST = 55,
+    ER_SERVICE_NOT_LEADER = 56,
 
     // sdk
     ER_SDK_TIMEOUT = 100,

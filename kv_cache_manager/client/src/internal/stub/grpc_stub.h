@@ -14,6 +14,8 @@ public:
     GrpcStub(uint32_t retry_time, uint32_t call_timeout);
     ClientErrorCode AddConnection(const std::string &address, uint32_t connection_timeout) override;
 
+    void RemoveAllConnections() override;
+
     std::pair<ClientErrorCode, std::string> RegisterInstance(const std::string &trace_id,
                                                              const std::string instance_group,
                                                              const std::string &instance_id,

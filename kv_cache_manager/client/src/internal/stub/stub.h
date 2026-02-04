@@ -18,6 +18,8 @@ public:
 
     virtual ClientErrorCode AddConnection(const std::string &address, uint32_t connection_timeout) = 0;
 
+    virtual void RemoveAllConnections() = 0;
+
     virtual std::pair<ClientErrorCode, std::string>
     RegisterInstance(const std::string &trace_id,
                      const std::string instance_group,

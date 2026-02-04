@@ -34,14 +34,6 @@ MetaClientImpl::MetaClientImpl() {}
 MetaClientImpl::~MetaClientImpl() { Shutdown(); }
 
 ClientErrorCode MetaClientImpl::Init(const std::string &client_config, const InitParams &init_params) {
-    // TODO : only for quick test now
-    {
-        auto client_config = GetClientConfig();
-        if (client_config != nullptr) {
-            KVCM_LOG_INFO("client has been inited by others");
-            return ER_OK;
-        }
-    }
     {
         std::scoped_lock write_guard(config_mutex_);
         // double checkout
@@ -66,29 +58,41 @@ ClientErrorCode MetaClientImpl::Init(const std::string &client_config, const Ini
             client_config_.reset();
             return ec;
         }
-        const auto &meta_channel_config = client_config_->meta_channel_config();
-        stub_ = std::make_unique<GrpcStub>(meta_channel_config.retry_time(), meta_channel_config.call_timeout());
+        const auto &channel_config = client_config_->meta_channel_config();
+        if (!stub_) {
+            stub_ = std::make_unique<GrpcStub>(channel_config.retry_time(), channel_config.call_timeout());
+        }
     }
-    if (client_config_->addresses().size() != 1) {
-        KVCM_LOG_ERROR("not support multi address or empty address");
-        client_config_.reset();
-        stub_.reset();
-        return ER_INVALID_CLIENT_CONFIG;
+    // 主从模式
+    if (client_config_->addresses().size() > 1) {
+        KVCM_LOG_INFO("has multi server address, need find leader");
     }
+    ClientErrorCode ec = ER_OK;
     {
         std::scoped_lock write_guard(config_mutex_);
         for (const auto &address : client_config_->addresses()) {
-            auto ec = Connect(address);
-            if (ec != ER_OK) {
-                KVCM_LOG_ERROR("connect address [%s] failed", address.c_str());
+            ec = Connect(address);
+            if (ec == ER_OK) {
+                KVCM_LOG_INFO("client init with address [%s] success", address.c_str());
+                break;
+            }
+            if (ec == ER_SERVICE_NOT_LEADER) {
+                // 当前节点不是Leader，断开当前连接，寻找下一个可用节点
+                KVCM_LOG_INFO("address [%s] not leader, try next", address.c_str());
+            } else {
+                KVCM_LOG_ERROR("client init with address [%s] failed", address.c_str());
                 client_config_.reset();
                 stub_.reset();
                 return ec;
             }
         }
     }
-    KVCM_LOG_INFO("meta client init success");
-    return ER_OK;
+    if (ec != ER_OK) {
+        KVCM_LOG_ERROR("meta client init fail, last errorcode [%d]", ec);
+    } else {
+        KVCM_LOG_INFO("meta client init success");
+    }
+    return ec;
 }
 
 void MetaClientImpl::Shutdown() {}
@@ -209,21 +213,25 @@ ClientErrorCode MetaClientImpl::Connect(const std::string &address) {
         return ec;
     }
     KVCM_LOG_INFO("meta client connect to %s success", address.c_str());
-    auto [success, storage_config] = stub_->RegisterInstance(GenRandomTraceId("AddStubConnection"),
-                                                             client_config->instance_group(),
-                                                             client_config->instance_id(),
-                                                             client_config->block_size(),
-                                                             client_config->location_spec_infos(),
-                                                             client_config->model_deployment(),
-                                                             client_config->location_spec_groups());
-    if (success == ER_OK) {
+    auto [reg_ec, storage_config] = stub_->RegisterInstance(GenRandomTraceId("AddStubConnection"),
+                                                            client_config->instance_group(),
+                                                            client_config->instance_id(),
+                                                            client_config->block_size(),
+                                                            client_config->location_spec_infos(),
+                                                            client_config->model_deployment(),
+                                                            client_config->location_spec_groups());
+    if (reg_ec == ER_OK) {
         storage_config_ = storage_config;
+    }
+    if (reg_ec == ER_SERVICE_NOT_LEADER) {
+        KVCM_LOG_INFO("address %s is not leader, remove all connections", address.c_str());
+        stub_->RemoveAllConnections();
     }
     KVCM_LOG_INFO("register instance_group [%s] instance [%s] result is [%s]",
                   client_config->instance_group().c_str(),
                   client_config->instance_id().c_str(),
-                  success == ER_OK ? "success" : "failed");
-    return success;
+                  reg_ec == ER_OK ? "success" : "failed");
+    return reg_ec;
 }
 
 const std::string &MetaClientImpl::GetInstanceId() const {
@@ -247,6 +255,7 @@ std::unique_ptr<MetaClient> MetaClient::Create(const std::string &client_config,
     auto client = std::make_unique<MetaClientImpl>();
     auto ec = client->Init(client_config, init_params);
     if (ec == ER_OK) {
+        KVCM_LOG_INFO("create meta client success, @client=%p", client.get());
         return client;
     }
     KVCM_LOG_ERROR("create meta client failed, errorcode: %d", ec);

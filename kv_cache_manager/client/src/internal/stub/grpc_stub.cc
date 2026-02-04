@@ -126,7 +126,8 @@ kv_cache_manager::ClientErrorCode ToClientError(kv_cache_manager::proto::meta::E
         error_map{{proto::meta::UNSUPPORTED, ER_SERVICE_UNSUPPORTED},
                   {proto::meta::INVALID_ARGUMENT, ER_SERVICE_INVALID_ARGUMENT},
                   {proto::meta::DUPLICATE_ENTITY, ER_SERVICE_DUPLICATE_ENTITY},
-                  {proto::meta::INSTANCE_NOT_EXIST, ER_SERVICE_INSTANCE_NOT_EXIST}};
+                  {proto::meta::INSTANCE_NOT_EXIST, ER_SERVICE_INSTANCE_NOT_EXIST},
+                  {proto::meta::SERVER_NOT_LEADER, ER_SERVICE_NOT_LEADER}};
     if (auto iter = error_map.find(service_error); iter != error_map.end()) {
         return iter->second;
     }
@@ -236,6 +237,11 @@ ClientErrorCode GrpcStub::AddConnection(const std::string &address, uint32_t con
         return ER_OK;
     }
     return ER_CONNECT_FAIL;
+}
+
+void GrpcStub::RemoveAllConnections() {
+    std::scoped_lock write_guard(stubs_mutex_);
+    stubs_.clear();
 }
 
 std::pair<ClientErrorCode, std::string> GrpcStub::RegisterInstance(const std::string &trace_id,
