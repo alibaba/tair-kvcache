@@ -1,15 +1,18 @@
 name: test-opensrc
+permissions:
+  contents: read
 on:
   push:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  workflow_dispatch:
 
 jobs:
   unit_test:
     runs-on: ubuntu-latest
     container:
-      image: tair-kvcache-opensrc-registry.cn-hangzhou.cr.aliyuncs.com/tair-kvcache-opensrc/kv_cache_manager_dev:latest
+      image: ghcr.io/alibaba/tair-kvcache-kvcm-dev:2026_02_03_13_26_feea140
     steps:
       - uses: actions/checkout@v4
       - uses: bazel-contrib/setup-bazel@0.18.0
@@ -22,7 +25,7 @@ jobs:
         run:  |
           set -x
           set -e
-          bazelisk test //kv_cache_manager/...
+          bazelisk test //kv_cache_manager/... --cache_test_results=no --test_output=errors
       - name: create_archive
         if: failure()
         run: |
@@ -33,14 +36,21 @@ jobs:
           find bazel-out/k8-opt/bin/ -name 'core-*' -a -type f -a -exec 'tar' '-r' '-f' 'bazel-out.tar' '{}' ';'
           tar -r -f bazel-out.tar bazel-out/k8-opt/testlogs/
           gzip -f bazel-out.tar
+      - uses: actions/upload-artifact@v6
+        if: failure()
+        with:
+          name: unit_test-bazel-out.tar.gz
+          path: ./bazel-out.tar.gz
+          overwrite: true
   integration_test:
     runs-on: ubuntu-latest
     container:
-      image: tair-kvcache-opensrc-registry.cn-hangzhou.cr.aliyuncs.com/tair-kvcache-opensrc/kv_cache_manager_dev:latest
+      image: ghcr.io/alibaba/tair-kvcache-kvcm-dev:2026_02_03_13_26_feea140
     steps:
       - uses: actions/checkout@v4
       - uses: bazel-contrib/setup-bazel@0.18.0
         with:
+          bazelisk-cache: true
           disk-cache: ${{ runner.os }}-${{ github.workflow }}-integration_test
           repository-cache: true
           cache-save: ${{ github.event_name != 'pull_request' }}
@@ -48,7 +58,7 @@ jobs:
         run: |
           set -x
           set -e
-          bazelisk test //integration_test/...
+          bazelisk test //integration_test/... --cache_test_results=no --test_output=errors
       - name: create_archive
         if: failure()
         run: |
@@ -59,3 +69,9 @@ jobs:
           find bazel-out/k8-opt/bin/ -name 'core-*' -a -type f -a -exec 'tar' '-r' '-f' 'bazel-out.tar' '{}' ';'
           tar -r -f bazel-out.tar bazel-out/k8-opt/testlogs/
           gzip -f bazel-out.tar
+      - uses: actions/upload-artifact@v6
+        if: failure()
+        with:
+          name: integration_test-bazel-out.tar.gz
+          path: ./bazel-out.tar.gz
+          overwrite: true
