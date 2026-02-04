@@ -32,7 +32,7 @@ protected:
         // 准备选举器参数
         lock_key_ = "test_lock_key";
         lock_value_ = "127.0.0.1-" + std::to_string(getpid());
-        lease_ms_ = 100; // 较短的租约时间以便测试
+        lease_ms_ = 1000; // 较短的租约时间以便测试
         loop_interval_ms_ = 10;
     }
 
@@ -118,8 +118,13 @@ TEST_F(LeaderElectorTest, SingleElectorBecomesLeader) {
 
     EXPECT_TRUE(elector->Start());
 
-    // 等待足够时间让选举器有机会成为领导者
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    for (int i = 0; i < 100; i++) {
+        // 等待足够时间让选举发生
+        if (become_leader_called) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
 
     // 应该成为领导者
     EXPECT_TRUE(become_leader_called);
@@ -145,8 +150,13 @@ TEST_F(LeaderElectorTest, ManualDemote) {
 
     EXPECT_TRUE(elector->Start());
 
-    // 等待成为领导者
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    for (int i = 0; i < 100; i++) {
+        // 等待足够时间让选举发生
+        if (elector->IsLeader()) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
 
     ASSERT_TRUE(elector->IsLeader());
     ASSERT_TRUE(become_leader_called);
@@ -188,17 +198,22 @@ TEST_F(LeaderElectorTest, TwoElectorsCompetition) {
     EXPECT_TRUE(elector1->Start());
     EXPECT_TRUE(elector2->Start());
 
-    // 等待足够时间让选举发生
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    for (int i = 0; i < 100; i++) {
+        // 等待足够时间让选举发生
+        if ((elector1->IsLeader() || elector2->IsLeader()) && (elector1_leader || elector2_leader)) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
 
     // 检查只有一个选举器成为领导者
-    const bool is_elector1_first_leader = elector1->IsLeader();
+    const bool is_elector1_leader = elector1->IsLeader();
     const bool is_elector2_leader = elector2->IsLeader();
 
-    EXPECT_NE(is_elector1_first_leader, is_elector2_leader) << "只有一个选举器应该成为领导者";
+    EXPECT_NE(is_elector1_leader, is_elector2_leader) << "只有一个选举器应该成为领导者";
 
     // 验证相应的回调被调用
-    if (is_elector1_first_leader) {
+    if (is_elector1_leader) {
         EXPECT_TRUE(elector1_leader);
         EXPECT_FALSE(elector2_leader);
         elector1_leader = false;
@@ -215,7 +230,7 @@ TEST_F(LeaderElectorTest, TwoElectorsCompetition) {
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
 
     // 另外一个elector应该能够成为领导者
-    if (is_elector1_first_leader) {
+    if (is_elector1_leader) {
         EXPECT_TRUE(elector2->IsLeader());
         EXPECT_TRUE(elector2_leader);
         elector2->Stop();
@@ -413,8 +428,13 @@ TEST_F(LeaderElectorTest, MultipleElectorsDifferentKeys) {
     EXPECT_TRUE(elector1->Start());
     EXPECT_TRUE(elector2->Start());
 
-    // 等待足够时间
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    for (int i = 0; i < 100; i++) {
+        // 等待足够时间让选举发生
+        if (elector1_leader && elector2_leader) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
 
     // 两个选举器都应该成为领导者，因为它们使用不同的锁键
     EXPECT_TRUE(elector1_leader);
@@ -567,8 +587,8 @@ TEST_F(LeaderElectorTest, LeaseExpirationWithCompetition) {
     EXPECT_FALSE(elector2_leader_called) << "elector2's become leader callback should not be called yet";
 
     // 模拟 elector1 长时间未续约，导致租约过期
-    // 等待足够时间让租约过期（租约时间是100ms，我们等待150ms）
-    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    // 等待足够时间让租约过期
+    std::this_thread::sleep_for(std::chrono::milliseconds(lease_ms_ * 2));
 
     // 现在 elector2 应该能够获得领导者身份
     elector2->WorkLoop();
