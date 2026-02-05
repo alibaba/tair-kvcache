@@ -27,9 +27,9 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: hf3fs-usrbio-${{ runner.arch }}-rpm
-          path: /tmp/hf3fs-rpm-build/RPMS/x86_64/*.rpm
+          path: /tmp/hf3fs-rpm-build/RPMS/*/*.rpm
           if-no-files-found: error
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@v3
         with:
-          subject-path: /tmp/hf3fs-rpm-build/RPMS/x86_64/*.rpm
+          subject-path: /tmp/hf3fs-rpm-build/RPMS/*/*.rpm

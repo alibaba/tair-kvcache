@@ -26,41 +26,41 @@ install -m 644 /tmp/hf3fs-dependencies/3FS/src/lib/api/hf3fs_usrbio.h \
 install -m 755 /tmp/hf3fs-dependencies/3FS/build/src/lib/api/libhf3fs_api_shared.so \
     $RPM_BUILD_ROOT/usr/lib64/
 
-install -m 755 /usr/lib/x86_64-linux-gnu/libboost_context.so.1.71.0 \
+install -m 755 /usr/lib/*-linux-gnu/libboost_context.so.1.71.0 \
     $RPM_BUILD_ROOT/usr/lib64/
-install -m 755 /usr/lib/x86_64-linux-gnu/libboost_filesystem.so.1.71.0 \
+install -m 755 /usr/lib/*-linux-gnu/libboost_filesystem.so.1.71.0 \
     $RPM_BUILD_ROOT/usr/lib64/
-install -m 755 /usr/lib/x86_64-linux-gnu/libboost_program_options.so.1.71.0 \
+install -m 755 /usr/lib/*-linux-gnu/libboost_program_options.so.1.71.0 \
     $RPM_BUILD_ROOT/usr/lib64/
-install -m 755 /usr/lib/x86_64-linux-gnu/libboost_regex.so.1.71.0 \
+install -m 755 /usr/lib/*-linux-gnu/libboost_regex.so.1.71.0 \
     $RPM_BUILD_ROOT/usr/lib64/
-install -m 755 /usr/lib/x86_64-linux-gnu/libboost_system.so.1.71.0 \
+install -m 755 /usr/lib/*-linux-gnu/libboost_system.so.1.71.0 \
     $RPM_BUILD_ROOT/usr/lib64/
-install -m 755 /usr/lib/x86_64-linux-gnu/libboost_thread.so.1.71.0 \
+install -m 755 /usr/lib/*-linux-gnu/libboost_thread.so.1.71.0 \
     $RPM_BUILD_ROOT/usr/lib64/
-install -m 755 /usr/lib/x86_64-linux-gnu/libboost_atomic.so.1.71.0 \
+install -m 755 /usr/lib/*-linux-gnu/libboost_atomic.so.1.71.0 \
     $RPM_BUILD_ROOT/usr/lib64/
-install -m 755 /usr/lib/x86_64-linux-gnu/libdouble-conversion.so.3 \
+install -m 755 /usr/lib/*-linux-gnu/libdouble-conversion.so.3 \
     $RPM_BUILD_ROOT/usr/lib64/
-install -m 755 /usr/lib/x86_64-linux-gnu/libgflags.so.2.2 \
+install -m 755 /usr/lib/*-linux-gnu/libgflags.so.2.2 \
     $RPM_BUILD_ROOT/usr/lib64/
-install -m 755 /usr/lib/x86_64-linux-gnu/libglog.so.0 \
+install -m 755 /usr/lib/*-linux-gnu/libglog.so.0 \
     $RPM_BUILD_ROOT/usr/lib64/
-install -m 755 /usr/lib/x86_64-linux-gnu/libevent-2.1.so.7 \
+install -m 755 /usr/lib/*-linux-gnu/libevent-2.1.so.7 \
     $RPM_BUILD_ROOT/usr/lib64/
-install -m 755 /usr/lib/x86_64-linux-gnu/libdwarf.so.1 \
+install -m 755 /usr/lib/*-linux-gnu/libdwarf.so.1 \
     $RPM_BUILD_ROOT/usr/lib64/
-install -m 755 /usr/lib/x86_64-linux-gnu/libicui18n.so.66 \
+install -m 755 /usr/lib/*-linux-gnu/libicui18n.so.66 \
     $RPM_BUILD_ROOT/usr/lib64/
-install -m 755 /usr/lib/x86_64-linux-gnu/libicuuc.so.66 \
+install -m 755 /usr/lib/*-linux-gnu/libicuuc.so.66 \
     $RPM_BUILD_ROOT/usr/lib64/
-install -m 755 /usr/lib/x86_64-linux-gnu/libicudata.so.66 \
+install -m 755 /usr/lib/*-linux-gnu/libicudata.so.66 \
     $RPM_BUILD_ROOT/usr/lib64/
-install -m 755 /usr/lib/x86_64-linux-gnu/libunwind.so.8 \
+install -m 755 /usr/lib/*-linux-gnu/libunwind.so.8 \
     $RPM_BUILD_ROOT/usr/lib64/
-install -m 755 /usr/lib/x86_64-linux-gnu/libssl.so.1.1 \
+install -m 755 /usr/lib/*-linux-gnu/libssl.so.1.1 \
     $RPM_BUILD_ROOT/usr/lib64/
-install -m 755 /usr/lib/x86_64-linux-gnu/libcrypto.so.1.1 \
+install -m 755 /usr/lib/*-linux-gnu/libcrypto.so.1.1 \
     $RPM_BUILD_ROOT/usr/lib64/
 
 %files
