@@ -356,31 +356,35 @@ CacheManager::StartWriteCache(RequestContext *request_context,
     std::vector<std::string_view> new_location_spec_group_names;
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, ManagerFilterWriteCache);
     KeyVector query_keys = keys;
+
+    ErrorCode filter_ec;
     if (!keys.empty()) {
         KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, request_key_count, keys.size());
-        ec = FilterWriteCache(request_context,
-                              instance_id,
-                              meta_searcher,
-                              keys,
-                              new_keys,
-                              location_spec_group_names,
-                              new_location_spec_group_names,
-                              block_mask);
+        filter_ec = FilterWriteCache(request_context,
+                                     instance_id,
+                                     meta_searcher,
+                                     keys,
+                                     new_keys,
+                                     location_spec_group_names,
+                                     new_location_spec_group_names,
+                                     block_mask);
     } else {
         auto [ec_temp, block_size] = GetBlockSize(request_context, instance_id);
         RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec_temp, StartWriteCacheInfo, "start write cache failed");
         auto gen_keys = GenKeyVector(tokens, block_size);
         query_keys = gen_keys;
         KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, request_key_count, gen_keys.size());
-        ec = FilterWriteCache(request_context,
-                              instance_id,
-                              meta_searcher,
-                              gen_keys,
-                              new_keys,
-                              location_spec_group_names,
-                              new_location_spec_group_names,
-                              block_mask);
+        filter_ec = FilterWriteCache(request_context,
+                                     instance_id,
+                                     meta_searcher,
+                                     gen_keys,
+                                     new_keys,
+                                     location_spec_group_names,
+                                     new_location_spec_group_names,
+                                     block_mask);
     }
+    RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, filter_ec, StartWriteCacheInfo, "filter write cache failed");
+
     std::vector<std::string> location_ids;
     std::string write_session_id = StringUtil::GenerateRandomString(32);
     if (new_keys.empty()) {
@@ -598,6 +602,9 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
     RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "BatchGetLocation failed");
     assert(keys.size() == location_maps.size());
     auto policy = genSelectLocationPolicy(request_context, instance_id);
+    if (!policy) {
+        return EC_ERROR;
+    }
     auto first_empty = std::find_if(
         location_maps.begin(), location_maps.end(), [&policy](const auto &m) { return !policy->ExistsForWrite(m); });
     bool only_prefix_not_empty =
@@ -1113,7 +1120,7 @@ std::unique_ptr<SelectLocationPolicy> CacheManager::genSelectLocationPolicy(Requ
     if (group_available_storages.size() >= group_storages.size()) {
         return std::make_unique<StaticWeightSLPolicy>();
     }
-    if (group_available_storages.size() == 0) {
+    if (group_available_storages.empty()) {
         request_context->error_tracer()->AddErrorMsg("all storages are unavailable");
         KVCM_INTERVAL_LOG_WARN(10, "all storages are unavailable!");
         return nullptr;
