@@ -41,7 +41,7 @@ public:
 
     std::unique_ptr<CacheManager> createCacheManager() {
         std::shared_ptr<MetricsRegistry> metrics_registry = std::make_shared<MetricsRegistry>();
-        std::shared_ptr<RegistryManager> registry_manager = std::make_shared<RegistryManager>("", metrics_registry);
+        registry_manager_ = std::make_shared<RegistryManager>("", metrics_registry);
         std::shared_ptr<InstanceGroup> instance_group = std::make_shared<InstanceGroup>();
         auto meta_indexer_config = std::make_shared<MetaIndexerConfig>();
         instance_group->cache_config_ = std::make_shared<CacheConfig>();
@@ -55,18 +55,18 @@ public:
 
         std::shared_ptr<InstanceInfo> instance_info = std::make_shared<InstanceInfo>(
             "test_quota_group", "default", "test_instance", 64, createLocationSpecInfos(), createModelDeployment());
-        registry_manager->instance_group_configs_["test_group"] = instance_group;
-        registry_manager->instance_infos_["test_instance"] = instance_info;
-        registry_manager->Init();
+        registry_manager_->instance_group_configs_["test_group"] = instance_group;
+        registry_manager_->instance_infos_["test_instance"] = instance_info;
+        registry_manager_->Init();
         std::unique_ptr<CacheManager> cache_manager =
-            std::make_unique<CacheManager>(metrics_registry, registry_manager);
+            std::make_unique<CacheManager>(metrics_registry, registry_manager_);
 
         EXPECT_TRUE(cache_manager->Init());
 
         // load first because we need default group
         // in real usage, we load startup config after recover
         StartupConfigLoader loader;
-        loader.Init(registry_manager);
+        loader.Init(registry_manager_);
         loader.Load("");
 
         EXPECT_EQ(EC_OK, cache_manager->DoRecover());
@@ -108,6 +108,7 @@ public:
     }
 
     std::unique_ptr<CacheManager> cache_manager_;
+    std::shared_ptr<RegistryManager> registry_manager_;
     std::shared_ptr<RequestContext> request_context_;
 };
 
@@ -1331,6 +1332,26 @@ TEST_F(CacheManagerTest, TestUnavailableStorage) {
     // nfs_test_01 available again
     ASSERT_EQ(EC_OK, registry_manager->EnableStorage(request_context_.get(), "nfs_test_01"));
     test_match_location(10, 4, "nfs_test_01"); // match available location
+}
+
+TEST_F(CacheManagerTest, TestStartWriteCacheWithNoAvailableStorage) {
+    auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    ASSERT_EQ(expected,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               "test_instance",
+                                               64,
+                                               createLocationSpecInfos(),
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>()));
+
+    ASSERT_EQ(EC_OK, registry_manager_->DisableStorage(request_context_.get(), "nfs_01"));
+
+    std::vector<int64_t> keys{1, 2, 3, 4};
+    auto [ec, start_write_cache_info] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 100000000);
+    EXPECT_EQ(EC_ERROR, ec);
+    EXPECT_EQ(0, start_write_cache_info.locations().cache_locations_view().size());
 }
 
 } // namespace kv_cache_manager
