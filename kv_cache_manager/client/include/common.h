@@ -28,6 +28,7 @@ enum [[nodiscard]] ClientErrorCode : int32_t{
     ER_TRANSFERCLIENT_INIT_ERROR = 13,
     ER_MANAGERCLIENT_INIT_ERROR = 14,
     ER_CLIENT_NOT_EXISTS = 15,
+    ER_INIT_CHECK_BUFFER_ERROR = 16,
 
     // service status code
     ER_SERVICE_NO_STATUS = 50,

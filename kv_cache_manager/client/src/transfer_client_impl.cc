@@ -24,15 +24,7 @@ namespace kv_cache_manager {
 
 TransferClientImpl::TransferClientImpl() {}
 
-TransferClientImpl::~TransferClientImpl() {
-#ifdef USING_CUDA
-    if (is_check_buffer_) {
-        CHECK_CUDA_ERROR(cudaFree(d_iovs_), "cuda free d_iovs_ failed");
-        CHECK_CUDA_ERROR(cudaFree(d_crcs_), "cuda free d_crcs_ failed");
-        CHECK_CUDA_ERROR(cudaFreeHost(iovs_h_mem_), "cuda free d_crcs_ failed");
-    }
-#endif
-}
+TransferClientImpl::~TransferClientImpl() {}
 
 ClientErrorCode TransferClientImpl::Init(const std::string &client_config, const InitParams &init_params) {
     {
@@ -88,28 +80,15 @@ ClientErrorCode TransferClientImpl::Init(const std::string &client_config, const
 #ifdef USING_CUDA
         is_check_buffer_ = EnvUtil::GetEnv("KVCM_SDK_CHECK", false);
         if (is_check_buffer_) {
+            size_t sdk_check_cell_num = EnvUtil::GetEnv("KVCM_SDK_CHECK_CELL_NUM", 4);
             max_check_iov_num_ = EnvUtil::GetEnv("KVCM_SDK_MAX_CHECK_IOV_NUM", 500 * 1000);
-            size_t iovs_d_byte_size = max_check_iov_num_ * sizeof(IovDevice);
-            CHECK_CUDA_ERROR_RETURN(cudaMalloc(&d_iovs_, iovs_d_byte_size),
-                                    ER_SDKINIT_ERROR,
-                                    "cuda malloc iovs [%zu] failed",
-                                    iovs_d_byte_size);
-            size_t crcs_d_byte_size = max_check_iov_num_ * sizeof(uint32_t);
-            CHECK_CUDA_ERROR_RETURN(cudaMalloc(&d_crcs_, crcs_d_byte_size),
-                                    ER_SDKINIT_ERROR,
-                                    "cuda malloc crcs [%zu] failed",
-                                    crcs_d_byte_size);
-            CHECK_CUDA_ERROR_RETURN(cudaStreamCreateWithFlags(&put_check_cuda_stream_, cudaStreamNonBlocking),
-                                    ER_SDKINIT_ERROR,
-                                    "cuda put stream create failed");
-            CHECK_CUDA_ERROR_RETURN(cudaStreamCreateWithFlags(&get_check_cuda_stream_, cudaStreamNonBlocking),
-                                    ER_SDKINIT_ERROR,
-                                    "cuda get stream create failed");
-            size_t iov_h_mem_byte_size = max_check_iov_num_ * sizeof(IovDevice);
-            CHECK_CUDA_ERROR_RETURN(cudaMallocHost(&iovs_h_mem_, iov_h_mem_byte_size),
-                                    ER_SDKINIT_ERROR,
-                                    "cudaMallocHost [%zu] failed",
-                                    iov_h_mem_byte_size);
+            sdk_buffer_check_pool_ = std::make_shared<SdkBufferCheckPool>(sdk_check_cell_num);
+            if (!sdk_buffer_check_pool_->Init(max_check_iov_num_)) {
+                KVCM_LOG_ERROR("sdk_buffer_check_pool init faild, sdk_check_cell_num[%lu], max_check_iov_num[%lu]",
+                               sdk_check_cell_num,
+                               max_check_iov_num_);
+                return ER_INIT_CHECK_BUFFER_ERROR;
+            }
         }
 #endif
         KVCM_LOG_INFO("transfer client init success");
@@ -147,8 +126,9 @@ ClientErrorCode TransferClientImpl::LoadKvCaches(const UriStrVec &uri_str_vec, c
     }
 #ifdef USING_CUDA
     if (is_check_buffer_) {
+        auto handle = sdk_buffer_check_pool_->GetCell();
         auto block_hashs = SdkBufferCheckUtil::GetBlocksHash(
-            block_buffers, d_iovs_, d_crcs_, iovs_h_mem_, max_check_iov_num_, get_check_cuda_stream_);
+            block_buffers, handle->d_iovs, handle->d_crcs, handle->h_iovs, max_check_iov_num_, handle->cuda_stream);
         PrintBlockHashAndUri("get_", uri_str_vec, block_hashs);
     }
 #endif
@@ -163,8 +143,9 @@ std::pair<ClientErrorCode, UriStrVec> TransferClientImpl::SaveKvCaches(const Uri
     CHECK_SDK_WITH_TYPE();
 #ifdef USING_CUDA
     if (is_check_buffer_) {
+        auto handle = sdk_buffer_check_pool_->GetCell();
         auto block_hashs = SdkBufferCheckUtil::GetBlocksHash(
-            block_buffers, d_iovs_, d_crcs_, iovs_h_mem_, max_check_iov_num_, put_check_cuda_stream_);
+            block_buffers, handle->d_iovs, handle->d_crcs, handle->h_iovs, max_check_iov_num_, handle->cuda_stream);
         PrintBlockHashAndUri("put_", uri_str_vec, block_hashs);
     }
 #endif
