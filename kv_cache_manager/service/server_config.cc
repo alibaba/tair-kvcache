@@ -118,8 +118,8 @@ bool ServerConfig::Parse(const std::string &config_file, const EnvironMap &envir
 
 void ServerConfig::UpdateDefaultConfig() {
     metrics_report_interval_ms_ = 20000;
-    leader_elector_lease_ms_ = 100;
-    leader_elector_loop_interval_ms_ = 10;
+    leader_elector_lease_ms_ = 10000;
+    leader_elector_loop_interval_ms_ = 100;
 }
 
 bool ServerConfig::ParseFromFile(const std::string &config_file) {

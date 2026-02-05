@@ -87,10 +87,6 @@ class WorkerEnv(ModuleBase):
         logging.info("rpc_port = %s, http_port = %s" % (self.rpc_port, self.http_port))
 
     def update_parameters(self, **kwargs):
-        self.add_env_parameter('rpc_thread_num', 4)
-        self.add_env_parameter('rpc_queue_size', 100)
-        self.add_env_parameter('ip', self.ip)
-        self.add_env_parameter('debug_mode', self.debug_mode)
         for k, v in kwargs.items():
             self.add_env_parameter(k, v)
 
