@@ -472,13 +472,33 @@ class AdminServiceLeaderElectionTest(abc.ABC, TestBase, unittest.TestCase):
     def start_worker(self, **kwargs):
         # 配置文件分布式锁
         kwargs[f'kvcm.distributed_lock.uri'] = self._lock_uri
+        kwargs[f'kvcm.leader_elector.lease_ms'] = 2000
         self.assertTrue(self.worker_manager.start_all(**kwargs))
+
+    def start_worker_by_id(self, worker_id, **kwargs):
+        kwargs[f'kvcm.distributed_lock.uri'] = self._lock_uri
+        kwargs[f'kvcm.leader_elector.lease_ms'] = 2000
+        self.assertTrue(self.worker_manager.start_worker(worker_id, **kwargs))
 
     def clean_test_resource(self):
         pass
 
     def stop_worker(self):
         self.worker_manager.stop_all()
+
+    def _wait_for_healthy(self, client, worker_id, timeout=30, interval=1):
+        """等待指定worker启动完成"""
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                req = {"trace_id": f"trace_wait_{worker_id}_{int(time.time())}"}
+                resp = client.check_health(req, check_response=False)
+                if resp.get("header", {}).get("status", {}).get("code") == "OK" and resp.get("is_health") == True:
+                    return True
+            except Exception as e:
+                logging.warning(f"Worker {worker_id} check health failed: {e}")
+            time.sleep(interval)
+        return False
 
     def _wait_for_leader(self, client, worker_id, timeout=30, interval=1):
         """等待指定worker成为leader"""
@@ -636,13 +656,13 @@ class AdminServiceLeaderElectionTest(abc.ABC, TestBase, unittest.TestCase):
             self.assertEqual(new_cluster_resp["leader_node_id"], new_cluster_resp["self_node_id"], "leader节点ID和leader自身应该一致")
 
             # 重新启动之前停止的worker
-            self.worker_manager.start_worker(leader_id)
+            self.start_worker_by_id(leader_id)
             
             # 等待重新启动的worker完成初始化
             time.sleep(2)
-
-            # 重新创建客户端连接
             restarted_client = self._get_manager_client(leader_id)
+            self._wait_for_healthy(restarted_client, leader_id)
+
             restarted_req = {"trace_id": "trace_restarted_worker"}
             restarted_resp = restarted_client.check_health(restarted_req, check_response=True)
             logging.info(f"重新启动的Worker {leader_id} 状态: {restarted_resp}")
