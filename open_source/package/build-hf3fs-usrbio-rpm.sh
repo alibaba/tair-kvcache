@@ -46,5 +46,5 @@ popd || exit 1
 
 
 pushd /tmp/hf3fs-rpm-build/ || exit 1
-  rpmbuild --define "_topdir /tmp/hf3fs-rpm-build/" -bb /tmp/hf3fs-rpm-build/SPECS/rpm.spec
+  rpmbuild --define "_topdir /tmp/hf3fs-rpm-build/" -bb /tmp/hf3fs-rpm-build/SPECS/hf3fs-usrbio.spec
 popd || exit 1
