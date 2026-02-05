@@ -1,0 +1,28 @@
+name: build-hf3fs-usrbio-rpm
+on:
+  push:
+    branches:
+      - feature/build-hf3fs-lib
+  workflow_dispatch:
+
+jobs:
+  build-rpm:
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:20.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Build
+        run: |
+          bash open_source/package/build-hf3fs-usrbio-rpm.sh
+      - name: Upload
+        uses: actions/upload-artifact@v6
+        with:
+          name: hf3fs-usrbio-rpm
+          path: /tmp/hf3fs-rpm-build/RPMS/x86_64/*.rpm
+          if-no-files-found: error
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: /tmp/hf3fs-rpm-build/RPMS/x86_64/*.rpm
