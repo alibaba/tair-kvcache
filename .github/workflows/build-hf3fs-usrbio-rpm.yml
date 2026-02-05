@@ -9,8 +9,12 @@ jobs:
   build-rpm:
     strategy:
       matrix:
-        os: [ ubuntu-latest ]
+        os: [ ubuntu-latest, ubuntu-24.04-arm ]
     runs-on: ${{ matrix.os }}
+    permissions:
+      id-token: write
+      attestations: write
+      contents: read
     container:
       image: ubuntu:20.04
     steps:
