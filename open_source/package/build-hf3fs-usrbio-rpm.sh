@@ -14,7 +14,7 @@ pushd /tmp/hf3fs-dependencies/ || exit 1
   apt-get install --no-install-recommends -y cmake libuv1-dev liblz4-dev liblzma-dev libdouble-conversion-dev \
   libdwarf-dev libunwind-dev git wget software-properties-common  libaio-dev libgflags-dev \
   libgoogle-glog-dev libgtest-dev libgmock-dev libgoogle-perftools-dev google-perftools libssl-dev \
-  libboost-all-dev meson build-essential
+  libboost-all-dev meson build-essential rpm
 
   wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key |tee /etc/apt/trusted.gpg.d/llvm.asc &&\
   add-apt-repository -y "deb http://apt.llvm.org/focal/ llvm-toolchain-focal-14 main" &&\
