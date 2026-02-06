@@ -66,6 +66,7 @@ public:
     void set_write_session_id(const std::string &id) { write_session_id_ = id; }
 
     const optimizer_event::KeyVector &keys() const { return keys_; }
+    const BlockMask &block_mask() const { return block_mask_; }
     const optimizer_event::TokenIdsVector &tokens() const { return tokens_; }
     const std::vector<std::string> &location_spec_group_names() const { return location_spec_group_names_; }
     int64_t write_timeout_seconds() const { return write_timeout_seconds_; }
@@ -73,10 +74,12 @@ public:
     void SetAddtionalArgs(const std::string &write_session_id,
                           const optimizer_event::KeyVector &keys,
                           const optimizer_event::TokenIdsVector &tokens,
+                          const BlockMask &block_mask,
                           const std::vector<std::string> &location_spec_group_names,
                           int64_t write_timeout_seconds) {
         write_session_id_ = write_session_id;
         keys_ = keys;
+        block_mask_ = block_mask;
         tokens_ = tokens;
         location_spec_group_names_ = location_spec_group_names;
         write_timeout_seconds_ = write_timeout_seconds;
@@ -87,6 +90,7 @@ public:
         Put(writer, "write_session_id", write_session_id_);
         Put(writer, "keys", keys_);
         Put(writer, "tokens", tokens_);
+        PutBlockMask(writer, "block_mask", block_mask_);
         Put(writer, "location_spec_group_names", location_spec_group_names_);
         Put(writer, "write_timeout_seconds", write_timeout_seconds_);
     }
@@ -95,6 +99,7 @@ private:
     std::string write_session_id_;
     optimizer_event::KeyVector keys_;
     optimizer_event::TokenIdsVector tokens_;
+    BlockMask block_mask_;
     std::vector<std::string> location_spec_group_names_;
     int64_t write_timeout_seconds_{0};
 };

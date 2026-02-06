@@ -420,7 +420,7 @@ CacheManager::StartWriteCache(RequestContext *request_context,
     auto start_write_event = std::make_shared<StartWriteCacheEvent>(instance_id);
     start_write_event->SetEventTriggerTime();
     start_write_event->SetAddtionalArgs(
-        write_session_id, query_keys, tokens, location_spec_group_names, write_timeout_seconds);
+        write_session_id, query_keys, tokens, block_mask, location_spec_group_names, write_timeout_seconds);
     if (event_manager_)
         event_manager_->Publish(start_write_event);
     return {EC_OK,
