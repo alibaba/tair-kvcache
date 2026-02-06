@@ -122,6 +122,7 @@ int CommandLine::Run(int argc, const char *argv[]) {
 
     InitLogger(args.GetLogConfigFile());
     UpdateLogLevel(config.GetLogLevel());
+    LoggerBroker::InitLogLevelFromEnv();
 
     RegisterSignal();
 
@@ -168,7 +169,7 @@ void __sign_handler__(int sig) {
     }
 }
 
-void CommandLine::InitLogger(const std::string &log_config_file) { LoggerBroker::InitLogger(log_config_file); }
+void CommandLine::InitLogger(const std::string &log_config_file) { LoggerBroker::InitLogger(log_config_file, false); }
 
 void CommandLine::UpdateLogLevel(uint32_t log_level) {
     if (log_level == 0) {

@@ -76,7 +76,7 @@ std::unique_ptr<Logger> LoggerBroker::access_logger_;
 std::unique_ptr<Logger> LoggerBroker::metrics_logger_;
 std::unique_ptr<Logger> LoggerBroker::publisher_logger_;
 
-bool LoggerBroker::InitLogger(const std::string &log_config_file) {
+bool LoggerBroker::InitLogger(const std::string &log_config_file, bool is_set_from_env) {
     std::lock_guard<std::recursive_mutex> logger_guard(logger_mutex_);
     if (logger_) {
         std::cerr << "Logger already inited, you should call DestroyLogger() first." << std::endl;
@@ -110,7 +110,9 @@ bool LoggerBroker::InitLogger(const std::string &log_config_file) {
         metrics_logger_.reset(new Logger(alog_metrics_logger));
         publisher_logger_.reset(new Logger(alog_publisher_logger));
     }
-    InitLogLevelFromEnv();
+    if (is_set_from_env) {
+        InitLogLevelFromEnv();
+    }
     return true;
 }
 
