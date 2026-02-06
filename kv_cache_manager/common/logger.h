@@ -98,7 +98,7 @@ private:
 class LoggerBroker {
 public:
     LoggerBroker() = delete;
-    static bool InitLogger(const std::string &log_config_file);
+    static bool InitLogger(const std::string &log_config_file, bool is_set_from_env = true);
     static bool InitLoggerForClient();
     static void InitLoggerForClientOnce();
     static void DestroyLogger();
@@ -109,10 +109,9 @@ public:
     static void MetricsLog(int level, const std::string &msg);
     static void PublisherLog(int level, const std::string &msg);
     inline static bool IsLevelEnable(uint32_t level) { return (level <= base_log_level_) ? true : false; }
-
-private:
     static void InitLogLevelFromEnv();
 
+private:
     static uint32_t base_log_level_;
     static std::recursive_mutex logger_mutex_;
     static std::unique_ptr<Logger> logger_;
