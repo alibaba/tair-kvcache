@@ -1,4 +1,6 @@
+#include <atomic>
 #include <string>
+#include <thread>
 #ifdef USING_CUDA
 #include "kv_cache_manager/client/src/internal/sdk/sdk_buffer_check_util.h"
 #endif
@@ -275,5 +277,106 @@ TEST_F(SdkBufferCheckUtilTest, TestGetBlocksHashManuallyMallocAndPinnedMem) {
     ASSERT_EQ(cudaSuccess, cudaFree(iovs_d));
     ASSERT_EQ(cudaSuccess, cudaFree(crcs_d));
     ASSERT_EQ(cudaSuccess, cudaFreeHost(pinned_iovs_ptr));
+#endif
+}
+
+TEST_F(SdkBufferCheckUtilTest, TestSdkBufferCheckPool) {
+#ifdef USING_CUDA
+    SdkBufferCheckPool pool;
+    size_t max_check_iov_num = 10;
+    ASSERT_TRUE(pool.Init(max_check_iov_num));
+    auto byte_size = 4 * 1024;
+    BlockBuffers block_buffers;
+    auto push_buffer = [&block_buffers, byte_size]() {
+        char *buffer = nullptr;
+        ASSERT_EQ(cudaSuccess, cudaMalloc(&buffer, byte_size));
+        std::string init(byte_size, 'a');
+        ASSERT_EQ(cudaSuccess, cudaMemcpy(buffer, init.data(), byte_size, cudaMemcpyHostToDevice));
+        block_buffers.push_back({});
+        auto &iovs = block_buffers.back().iovs;
+        iovs.push_back({MemoryType::GPU, buffer, 1024, false});
+        iovs.push_back({MemoryType::GPU, buffer + 1024, 1024, false});
+        iovs.push_back({MemoryType::GPU, buffer + 2 * 1024, 1024, false});
+        iovs.push_back({MemoryType::GPU, buffer + 3 * 1024, 1024, false});
+    };
+    push_buffer();
+    push_buffer();
+    auto handle = pool.GetCell();
+    auto block_hashs = SdkBufferCheckUtil::GetBlocksHash(
+        block_buffers, handle->d_iovs, handle->d_crcs, handle->h_iovs, max_check_iov_num, handle->cuda_stream);
+    ASSERT_EQ(2, block_hashs.size());
+    ASSERT_EQ(block_hashs[0], block_hashs[1]);
+#endif
+}
+
+TEST_F(SdkBufferCheckUtilTest, TestSdkBufferCheckPoolGetCell) {
+#ifdef USING_CUDA
+    SdkBufferCheckPool pool(2);
+    size_t max_check_iov_num = 10;
+    ASSERT_TRUE(pool.Init(max_check_iov_num));
+    auto handle1 = pool.GetCell();
+    ASSERT_EQ(1, pool.cell_queue_.size());
+    auto handle2 = pool.GetCell();
+    ASSERT_EQ(0, pool.cell_queue_.size());
+#endif
+}
+
+TEST_F(SdkBufferCheckUtilTest, TestSdkBufferCheckPoolMultiThread) {
+#ifdef USING_CUDA
+    SdkBufferCheckPool pool;
+    size_t max_check_iov_num = 10;
+    ASSERT_TRUE(pool.Init(max_check_iov_num));
+    auto byte_size = 4 * 1024;
+    auto push_buffer = [byte_size](BlockBuffers &block_buffers) {
+        char *buffer = nullptr;
+        ASSERT_EQ(cudaSuccess, cudaMalloc(&buffer, byte_size));
+        std::string init(byte_size, 'a');
+        ASSERT_EQ(cudaSuccess, cudaMemcpy(buffer, init.data(), byte_size, cudaMemcpyHostToDevice));
+        block_buffers.push_back({});
+        auto &iovs = block_buffers.back().iovs;
+        iovs.push_back({MemoryType::GPU, buffer, 1024, false});
+        iovs.push_back({MemoryType::GPU, buffer + 1024, 1024, false});
+        iovs.push_back({MemoryType::GPU, buffer + 2 * 1024, 1024, false});
+        iovs.push_back({MemoryType::GPU, buffer + 3 * 1024, 1024, false});
+    };
+    std::vector<BlockBuffers> block_buffers_vec(2);
+    push_buffer(block_buffers_vec[0]);
+    push_buffer(block_buffers_vec[1]);
+    size_t thread_num = 8;
+    std::atomic<bool> go = false;
+    int64_t expect;
+    {
+        auto handle = pool.GetCell();
+        auto block_hashs = SdkBufferCheckUtil::GetBlocksHash(block_buffers_vec[0],
+                                                             handle->d_iovs,
+                                                             handle->d_crcs,
+                                                             handle->h_iovs,
+                                                             max_check_iov_num,
+                                                             handle->cuda_stream);
+        ASSERT_EQ(1, block_hashs.size());
+        expect = block_hashs[0];
+    }
+    auto thread_fcn = [this, &pool, &go, &block_buffers_vec, max_check_iov_num, expect](int i) {
+        while (!go.load(std::memory_order_relaxed)) {}
+        auto handle = pool.GetCell();
+        auto block_hashs = SdkBufferCheckUtil::GetBlocksHash(block_buffers_vec[i % 2],
+                                                             handle->d_iovs,
+                                                             handle->d_crcs,
+                                                             handle->h_iovs,
+                                                             max_check_iov_num,
+                                                             handle->cuda_stream);
+        ASSERT_EQ(std::vector<int64_t>({expect}), block_hashs);
+    };
+    for (int i = 0; i < 20; ++i) {
+        std::vector<std::thread> threads;
+        for (int j = 0; j < thread_num; ++j) {
+            threads.push_back(std::thread(thread_fcn, i));
+        }
+        go.store(true, std::memory_order_relaxed);
+        for (auto &thread : threads) {
+            thread.join();
+        }
+        go.store(false, std::memory_order_relaxed);
+    }
 #endif
 }

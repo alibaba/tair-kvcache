@@ -11,7 +11,7 @@
 namespace kv_cache_manager {
 class ClientConfig;
 class SdkWrapper;
-struct IovDevice;
+class SdkBufferCheckPool;
 
 class TransferClientImpl : public TransferClient {
 public:
@@ -40,13 +40,9 @@ private:
     std::unique_ptr<SdkWrapper> sdk_wrapper_;
     mutable std::shared_mutex config_mutex_;
 #ifdef USING_CUDA
-    cudaStream_t put_check_cuda_stream_ = nullptr;
-    cudaStream_t get_check_cuda_stream_ = nullptr;
-    size_t max_check_iov_num_;
-    IovDevice *iovs_h_mem_ = nullptr;
-    IovDevice *d_iovs_ = nullptr;
-    uint32_t *d_crcs_ = nullptr;
     bool is_check_buffer_ = false;
+    size_t max_check_iov_num_;
+    std::shared_ptr<SdkBufferCheckPool> sdk_buffer_check_pool_;
 #endif
 };
 

@@ -138,6 +138,7 @@ cc_library(
 cuda_library(
     name = "sdk_buffer_check_util",
     srcs = [
+        "sdk_buffer_check_util.cc",
         "sdk_buffer_check_util.cu",
     ],
     hdrs = [
