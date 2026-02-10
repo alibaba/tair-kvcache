@@ -1,0 +1,26 @@
+{
+    "platform": {
+        "accelerator": {
+            "name": "H20"
+        },
+        "disk_read_bandwidth_gb": 4,
+        "disk_write_bandwidth_gb": 4,
+        "memory_read_bandwidth_gb": 64,
+        "memory_write_bandwidth_gb": 64,
+        "num_device_per_node": 8
+    },
+    "predictor": {
+        "name": "aiconfigurator",
+        "database_path": "download_path/Hisim/Data/aic",
+        "device_name": "h20_sxm",
+        "prefill_scale_factor": 1.045,
+        "decode_scale_factor": 1.0,
+        "xgb_model_path": "download_path/Hisim/Data/aic/xgb_models/qwen3_8B"
+    },
+    "scheduler": {
+        "tp_size": 1,
+        "data_type": "FP16",
+        "kv_cache_data_type": "FP16",
+        "backend_version": "0.5.6.post2"
+    }
+}

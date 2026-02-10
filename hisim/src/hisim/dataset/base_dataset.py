@@ -1,0 +1,44 @@
+from typing import Optional, overload
+from dataclasses import dataclass, field
+from transformers.tokenization_utils import PreTrainedTokenizerBase
+
+from hisim.dataset.dataset_args import DatasetArgs
+
+
+@dataclass
+class GenericRequest:
+    prompt: Optional[str] = None
+    token_ids: Optional[list[int]] = None
+    input_length: int = -1
+    output_length: int = -1
+    custom_params: dict = field(default_factory=dict)
+
+    def __post_init__(self):
+        if self.prompt is None and self.token_ids is None:
+            raise ValueError("Invalid Request")
+
+
+class BaseDataset:
+    def __init__(self, tokenizer: PreTrainedTokenizerBase, args: DatasetArgs):
+        self.tokenizer: PreTrainedTokenizerBase = tokenizer
+        self.args = args
+        self._name = ""
+
+    @overload
+    def __getitem__(self, index: int) -> GenericRequest: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> list[GenericRequest]: ...
+
+    def __getitem__(self, index):
+        raise NotImplementedError
+
+    def __len__(self) -> int:
+        raise NotImplementedError
+
+    @property
+    def name(self):
+        if self._name:
+            return self._name
+        else:
+            return self.__class__.__name__

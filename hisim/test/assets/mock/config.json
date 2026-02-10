@@ -1,0 +1,22 @@
+{
+    "platform": {
+        "accelerator": {
+            "name": "H20"
+        },
+        "disk_read_bandwidth_gb": 8,
+        "disk_write_bandwidth_gb": 8,
+        "memory_read_bandwidth_gb": 16,
+        "memory_write_bandwidth_gb": 16,
+        "num_device_per_node": 8
+    },
+    "predictor": {
+        "name": "aiconfigurator",
+        "device_name": "h100_sxm"
+    },
+    "scheduler": {
+        "tp_size": 1,
+        "ep_size": 1,
+        "dp_size": 1,
+        "backend_version": "0.5.6.post2"
+    }
+}
