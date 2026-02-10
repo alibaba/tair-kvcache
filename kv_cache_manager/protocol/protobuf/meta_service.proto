@@ -129,6 +129,7 @@ message TairMemPoolStorageSpec {
     string domain = 1; // tair mempool的 meta service挂载的域名
     int32 timeout = 2; // 单位超时时间
     bool enable_vipserver = 3;
+    string vipserver_domain = 4;
 }
 
 message NfsStorageSpec {

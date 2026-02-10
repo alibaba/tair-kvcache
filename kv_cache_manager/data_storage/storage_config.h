@@ -127,15 +127,18 @@ public:
     std::string ToString() const override;
     const std::string &cluster_name() const { return cluster_name_; }
     const std::string &domain() const { return domain_; }
+    const std::string &vipserver_domain() const { return vipserver_domain_; }
     int64_t timeout() const { return timeout_; }
     const bool enable_vipserver() const { return enable_vipserver_; }
     void set_domain(const std::string &domain) { domain_ = domain; }
+    void set_vipserver_domain(const std::string &vipserver_domain) { vipserver_domain_ = vipserver_domain; }
     void set_cluster_name(const std::string &cluster_name) { cluster_name_ = cluster_name; }
     void set_timeout(int64_t timeout) { timeout_ = timeout; }
     void set_enable_vipserver(bool enable_vipserver) { enable_vipserver_ = enable_vipserver; }
 
 private:
-    std::string domain_;            // metaservice域名
+    std::string domain_;            // 统一接入
+    std::string vipserver_domain_;  // vipserver
     int64_t timeout_{0};            // 目前连接超时、请求超时时间的值一样
     bool enable_vipserver_ = false; // 是否使用vipserver
     std::string cluster_name_;      // TODO proto中没有这个字段并且未使用，考虑删除

@@ -47,6 +47,7 @@ void ProtoConvert::StorageConfigToProto(const StorageConfig &storage_config,
         // proto_storage_config->set_global_unique_name(tair_mem_pool_storage.get_global_unique_name());
         auto *tair_mem_pool = proto_storage_config->mutable_tair_mem_pool();
         tair_mem_pool->set_domain(tair_mem_pool_storage.domain());
+        tair_mem_pool->set_vipserver_domain(tair_mem_pool_storage.vipserver_domain());
         tair_mem_pool->set_timeout(tair_mem_pool_storage.timeout());
         tair_mem_pool->set_enable_vipserver(tair_mem_pool_storage.enable_vipserver());
     } else if (type == DataStorageType::DATA_STORAGE_TYPE_NFS) {
@@ -103,6 +104,7 @@ void ProtoConvert::StorageFromProto(const proto::admin::StorageConfig *proto_sto
     case proto::admin::StorageConfig::kTairMemPool: {
         TairMemPoolStorageSpec spec;
         spec.set_domain(proto_storage_config->tair_mem_pool().domain());
+        spec.set_vipserver_domain(proto_storage_config->tair_mem_pool().vipserver_domain());
         spec.set_timeout(proto_storage_config->tair_mem_pool().timeout());
         spec.set_enable_vipserver(proto_storage_config->tair_mem_pool().enable_vipserver());
         storage_config.set_storage_spec(std::make_shared<TairMemPoolStorageSpec>(spec));
