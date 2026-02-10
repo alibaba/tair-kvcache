@@ -7,13 +7,33 @@ on:
   pull_request:
     branches: [ "main" ]
   workflow_dispatch:
-
+    inputs:
+      rebuildDiskCache:
+        description: "Rebuild disk cache"
+        type: boolean
+        default: false
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   unit_test:
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/alibaba/tair-kvcache-kvcm-dev:2026_02_03_13_26_feea140
+      volumes:
+        - /:/host_root/
     steps:
+      # https://github.com/actions/runner-images/issues/2840
+      # https://github.com/korjavin/haskel-web1/commit/3bd3d2a74c41418ec31a8bec34dcd9c100f4e22d
+      - name: Free up disk space
+        run: |
+          echo "Disk space before cleanup:"
+          df -h
+          sudo rm -rf /host_root/usr/share/dotnet
+          sudo rm -rf /host_root/usr/local/lib/android
+          sudo rm -rf /host_root/opt/ghc
+          echo "Disk space after cleanup:"
+          df -h
       - uses: actions/checkout@v4
       - uses: bazel-contrib/setup-bazel@0.18.0
         with:
@@ -21,6 +41,10 @@ jobs:
           disk-cache: ${{ runner.os }}-${{ github.workflow }}-unit_test
           repository-cache: true
           cache-save: ${{ github.event_name != 'pull_request' }}
+      - name: clean_disk_cache
+        if: ${{ inputs.rebuildDiskCache }}
+        run: |
+          rm -rf ~/.cache/bazel-disk
       - name: bazel_test
         run:  |
           set -x
@@ -46,7 +70,20 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/alibaba/tair-kvcache-kvcm-dev:2026_02_03_13_26_feea140
+      volumes:
+        - /:/host_root/
     steps:
+      # https://github.com/actions/runner-images/issues/2840
+      # https://github.com/korjavin/haskel-web1/commit/3bd3d2a74c41418ec31a8bec34dcd9c100f4e22d
+      - name: Free up disk space
+        run: |
+          echo "Disk space before cleanup:"
+          df -h
+          sudo rm -rf /host_root/usr/share/dotnet
+          sudo rm -rf /host_root/usr/local/lib/android
+          sudo rm -rf /host_root/opt/ghc
+          echo "Disk space after cleanup:"
+          df -h
       - uses: actions/checkout@v4
       - uses: bazel-contrib/setup-bazel@0.18.0
         with:
@@ -54,6 +91,10 @@ jobs:
           disk-cache: ${{ runner.os }}-${{ github.workflow }}-integration_test
           repository-cache: true
           cache-save: ${{ github.event_name != 'pull_request' }}
+      - name: clean_disk_cache
+        if: ${{ inputs.rebuildDiskCache }}
+        run: |
+          rm -rf ~/.cache/bazel-disk
       - name: bazel_test
         run: |
           set -x
