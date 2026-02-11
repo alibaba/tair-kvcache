@@ -1,6 +1,5 @@
-#include "kv_cache_manager/optimizer/trace_converter/trace_util.h"
+#include "kv_cache_manager/optimizer/trace_loader/trace_util.h"
 
-#include "kv_cache_manager/manager/hash_util.h"
 namespace kv_cache_manager {
 
 void TraceTimeSorter::SortTracesByTimestamp(std::vector<std::shared_ptr<OptimizerSchemaTrace>> &traces) {
@@ -42,17 +41,6 @@ std::vector<std::shared_ptr<OptimizerSchemaTrace>> TraceTimeSorter::FilterTraces
 bool TraceTimeSorter::CompareByTimestamp(const std::shared_ptr<OptimizerSchemaTrace> &a,
                                          const std::shared_ptr<OptimizerSchemaTrace> &b) {
     return a->timestamp_us() < b->timestamp_us();
-}
-
-std::vector<int64_t> ApplyPrefixHash(const std::vector<int64_t> &hash_ids) {
-    std::vector<int64_t> block_keys;
-    int64_t hash = 0;
-    std::hash<int64_t> hasher = std::hash<int64_t>();
-    for (int index = 0; index < hash_ids.size(); index++) {
-        hash = hashInt64Func(hasher, hash, hash_ids[index]);
-        block_keys.push_back(hash);
-    }
-    return block_keys;
 }
 
 void AddTraceId(std::vector<std::shared_ptr<OptimizerSchemaTrace>> &traces) {

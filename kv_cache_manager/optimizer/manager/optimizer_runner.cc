@@ -15,55 +15,51 @@ void OptimizerRunner::Run(OptimizerConfig &config) {
     auto traces = OptimizerLoader::LoadTrace(config);
     auto ending_time = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(ending_time - starting_time).count();
-    KVCM_LOG_INFO("Parse from file: %s in %ld ms", config.trace_file_path().c_str(), duration);
+    KVCM_LOG_INFO(
+        "Loaded %zu traces from file: %s in %ld ms", traces.size(), config.trace_file_path().c_str(), duration);
 
-    bool rw_separation = config.rw_separation();
-    KVCM_LOG_INFO("Trace RW separation mode: %s", rw_separation ? "enabled" : "disabled");
     starting_time = std::chrono::high_resolution_clock::now();
-    RunTraces(traces, rw_separation);
+    RunTraces(traces);
     ending_time = std::chrono::high_resolution_clock::now();
     duration = std::chrono::duration_cast<std::chrono::milliseconds>(ending_time - starting_time).count();
     KVCM_LOG_INFO("Playback traces in %ld ms", duration);
 }
 
-void OptimizerRunner::RunTraces(const std::vector<std::shared_ptr<OptimizerSchemaTrace>> &traces, bool rw_separation) {
+void OptimizerRunner::RunTraces(const std::vector<std::shared_ptr<OptimizerSchemaTrace>> &traces) {
     for (const auto &trace : traces) {
-        RunTrace(trace, rw_separation);
+        RunTrace(trace);
     }
 }
-void OptimizerRunner::RunTrace(std::shared_ptr<OptimizerSchemaTrace> trace, bool rw_separation) {
+
+void OptimizerRunner::RunTrace(std::shared_ptr<OptimizerSchemaTrace> trace) {
     if (!trace) {
         return;
     }
-    if (rw_separation) {
-        // 注意：必须先检查 DialogTurnSchemaTrace（最具体的子类），再检查 GetLocationSchemaTrace（父类）
-        // 否则 DialogTurnSchemaTrace 会被错误地当作 GetLocationSchemaTrace 处理
-        if (auto turn_trace = std::dynamic_pointer_cast<DialogTurnSchemaTrace>(trace)) {
-            // DialogTurnSchemaTrace 在 rw_separation 模式下应该被拆分为读和写操作
-            // 这里暂时不处理，因为 rw_separation 模式下应该使用 GetLocationSchemaTrace 和 WriteCacheSchemaTrace
+
+    // 自动识别trace类型并处理
+    // 注意: 必须先检查DialogTurnSchemaTrace(最具体的子类),再检查GetLocationSchemaTrace(父类)
+    if (auto turn_trace = std::dynamic_pointer_cast<DialogTurnSchemaTrace>(trace)) {
+        // DialogTurn: 用于推理引擎模拟器,Optimizer内部会拆分为读写操作
+        if (turn_trace->query_type() != "prefix_match") {
+            KVCM_LOG_WARN("Unsupported query type: %s", turn_trace->query_type().c_str());
             return;
-        } else if (auto get_trace = std::dynamic_pointer_cast<GetLocationSchemaTrace>(trace)) {
-            // 目前只处理prefix_match类型的请求
-            if (get_trace->query_type() != "prefix_match") {
-                KVCM_LOG_WARN("Unsupported query type: %s", get_trace->query_type().c_str());
-                return;
-            }
-            HandleGetLocation(*get_trace);
-            result_map_[get_trace->instance_id()]->counters.total_requests += 1;
-        } else if (auto write_trace = std::dynamic_pointer_cast<WriteCacheSchemaTrace>(trace)) {
-            HandleWriteCache(*write_trace);
-            result_map_[write_trace->instance_id()]->counters.total_requests += 1;
         }
+        HandleDialogTurn(*turn_trace);
+        result_map_[turn_trace->instance_id()]->counters.total_requests += 1;
+    } else if (auto get_trace = std::dynamic_pointer_cast<GetLocationSchemaTrace>(trace)) {
+        // Get: 读操作(prefill阶段)
+        if (get_trace->query_type() != "prefix_match") {
+            KVCM_LOG_WARN("Unsupported query type: %s", get_trace->query_type().c_str());
+            return;
+        }
+        HandleGetLocation(*get_trace);
+        result_map_[get_trace->instance_id()]->counters.total_requests += 1;
+    } else if (auto write_trace = std::dynamic_pointer_cast<WriteCacheSchemaTrace>(trace)) {
+        // Write: 写操作(decode阶段)
+        HandleWriteCache(*write_trace);
+        result_map_[write_trace->instance_id()]->counters.total_requests += 1;
     } else {
-        if (auto turn_trace = std::dynamic_pointer_cast<DialogTurnSchemaTrace>(trace)) {
-            // 目前只处理prefix_match类型的请求
-            if (turn_trace->query_type() != "prefix_match") {
-                KVCM_LOG_WARN("Unsupported query type: %s", turn_trace->query_type().c_str());
-                return;
-            }
-            HandleDialogTurn(*turn_trace);
-            result_map_[turn_trace->instance_id()]->counters.total_requests += 1;
-        }
+        KVCM_LOG_WARN("Unknown trace type, skipping");
     }
 }
 

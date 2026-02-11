@@ -21,7 +21,7 @@ cc_library(
         "//kv_cache_manager/common:logger",
         "//kv_cache_manager/optimizer/config",
         "//kv_cache_manager/optimizer/index",
-        "//kv_cache_manager/optimizer/trace_converter",
+        "//kv_cache_manager/optimizer/trace_loader",
         "//kv_cache_manager/manager:cache_location",
         "//kv_cache_manager/optimizer/analysis",
     ],

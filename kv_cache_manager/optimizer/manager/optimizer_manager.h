@@ -12,7 +12,7 @@
 #include "kv_cache_manager/optimizer/manager/eviction_manager.h"
 #include "kv_cache_manager/optimizer/manager/indexer_manager.h"
 #include "kv_cache_manager/optimizer/manager/optimizer_runner.h"
-#include "kv_cache_manager/optimizer/trace_converter/optimizer_schema_trace.h"
+#include "kv_cache_manager/optimizer/trace_loader/optimizer_schema_trace.h"
 
 namespace kv_cache_manager {
 

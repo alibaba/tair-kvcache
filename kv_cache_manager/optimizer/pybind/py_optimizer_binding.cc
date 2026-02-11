@@ -109,12 +109,6 @@ PYBIND11_MODULE(kvcm_py_optimizer, module) {
         .def("load", &kvcm::OptimizerConfigLoader::Load)
         .def("config", &kvcm::OptimizerConfigLoader::get_config);
 
-    // 绑定OptimizerLoader类
-    py::class_<kvcm::OptimizerLoader>(module, "OptimizerLoader")
-        .def_static("DumpSchemaTracesToFile",
-                    &kvcm::OptimizerLoader::DumpSchemaTracesToFile,
-                    py::call_guard<py::gil_scoped_release>());
-
     py::class_<kvcm::LoggerBroker>(module, "LoggerBroker")
         .def_static("InitLogger", &kvcm::LoggerBroker::InitLogger)
         .def_static("SetLogLevel", &kvcm::LoggerBroker::SetLogLevel)

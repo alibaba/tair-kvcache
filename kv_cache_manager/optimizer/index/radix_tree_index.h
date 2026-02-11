@@ -9,7 +9,7 @@
 #include "kv_cache_manager/optimizer/config/tier_config.h"
 #include "kv_cache_manager/optimizer/config/types.h"
 #include "kv_cache_manager/optimizer/eviction_policy/base.h"
-#include "kv_cache_manager/optimizer/trace_converter/optimizer_schema_trace.h"
+#include "kv_cache_manager/optimizer/trace_loader/optimizer_schema_trace.h"
 
 namespace kv_cache_manager {
 void AppendBlockLocation(BlockEntry *block, const std::string &unique_name, int64_t timestamp);

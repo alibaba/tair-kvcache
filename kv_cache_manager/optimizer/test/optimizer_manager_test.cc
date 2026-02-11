@@ -24,7 +24,6 @@ OptimizerConfig OptimizerManagerTest::CreateTestOptimizerConfig() {
     OptimizerConfig config;
     config.set_trace_file_path("/tmp/test_trace.json");
     config.set_output_result_path("/tmp/test_result.json");
-    config.set_trace_type(TraceType::TRACE_PUBLISHER_LOG);
 
     EvictionConfig eviction_config;
     eviction_config.set_eviction_mode(EvictionMode::EVICTION_MODE_INSTANCE_PRECISE);

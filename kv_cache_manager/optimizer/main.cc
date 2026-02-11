@@ -14,12 +14,15 @@ int main(int argc, char *argv[]) {
     if (argc != 2) {
         std::cerr << "Usage: " << argv[0] << " <optimizer_config.json>" << std::endl;
         std::cerr << std::endl;
-        std::cerr << "Optimizer supports three input formats:" << std::endl;
-        std::cerr << "  - qwen_bailian: Qwen Bailian dataset format" << std::endl;
-        std::cerr << "  - publisher_log: KVCacheManager Event Publisher log format" << std::endl;
-        std::cerr << "  - optimizer_schema: Standard format (from trace_anonymous_tool)" << std::endl;
+        std::cerr << "Optimizer only accepts standard format trace files." << std::endl;
         std::cerr << std::endl;
-        std::cerr << "Specify trace_type in the config file." << std::endl;
+        std::cerr << "To convert your trace to standard format, use:" << std::endl;
+        std::cerr << "  cd tools/trace_converter" << std::endl;
+        std::cerr << "  python trace_converter.py -i input.log -o output.jsonl -f <format> --mode optimizer"
+                  << std::endl;
+        std::cerr << std::endl;
+        std::cerr << "Supported formats: publisher_log, qwen_bailian, text" << std::endl;
+        std::cerr << "See tools/trace_converter/README.md for details." << std::endl;
         kv_cache_manager::LoggerBroker::DestroyLogger();
         return 1;
     }

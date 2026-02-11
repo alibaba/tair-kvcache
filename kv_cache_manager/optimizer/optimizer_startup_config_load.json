@@ -1,7 +1,6 @@
 {
-    "trace_file_path" : "/KVCacheManager/kv_cache_manager/optimizer/analysis/result/event_publisher.log",
-    "trace_type": "publisher_log",
-    "output_result_path": "/KVCacheManager/kv_cache_manager/optimizer/analysis/result/event_publsiher",
+    "trace_file_path" : "/path/to/kv_cache_manager/optimizer/analysis/result/qwen-bailian-usagetraces-anon/qwen_traceA_blksz_16_optimizer.jsonl",
+    "output_result_path": "/path/to/kv_cache_manager/optimizer/analysis/result/bailian_output",
     "eviction_params": {
         "eviction_mode": 1,
         "eviction_batch_size_per_instance": 100
@@ -9,7 +8,7 @@
     "instance_groups": [
         {
             "group_name": "instance_group_01",
-            "quota_capacity": 12000,
+            "quota_capacity": 120000,
             "used_percentage": 1.0,
             "hierarchical_eviction_enabled": false,
             "storages": [
@@ -30,7 +29,7 @@
             ],
             "instances": [
                 {
-                    "instance_id": "3780643326877293460",
+                    "instance_id": "instance",
                     "block_size": 16,
                     "eviction_policy_type": "lru",
                     "eviction_policy_params": {

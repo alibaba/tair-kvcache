@@ -1,9 +1,11 @@
 # KVCacheManager Optimizer
+
 ## 概述
+
 KVCacheManager Optimizer 是一个独立的缓存优化分析模块，通过回放 trace 数据来模拟缓存读写操作，评估不同驱逐策略和配置对缓存命中率的影响，并为 KVCacheManager 主程序提供参数优化能力。
 
 核心功能包括：
-- Trace 数据的解析和回放
+- Trace 数据的回放和模拟
 - 多种驱逐策略的模拟和对比
 - 缓存命中率的实时统计和分析
 - Radix Tree 索引结构的可视化
@@ -70,19 +72,35 @@ OptimizerSchemaTrace (基类)
 
 ## 快速开始
 
-目前 optimizer 模块的编译依赖于kvcm主程序的各种bazel配置
+### 步骤1: 转换trace为标准格式
+
+```bash
+cd tools/trace_converter
+
+# 安装依赖 (首次使用)
+pip install -r requirements.txt
+
+# 转换trace
+python trace_converter.py \
+    -i /path/to/your_trace.jsonl \
+    -o /path/to/optimizer_trace.jsonl \
+    -f qwen_bailian \
+    --mode optimizer
+```
+
+### 步骤2: 编译Optimizer
 
 ```bash
 bazel build //kv_cache_manager/optimizer:optimizer_main
 ```
 
+### 步骤3: 创建配置文件
 
 创建 JSON 配置文件（参考 `optimizer_startup_config_load.json`）：
 
 ```json
 {
-    "trace_file_path": "/path/to/trace_file",
-    "trace_type": "qwen_bailian",
+    "trace_file_path": "/path/to/optimizer_trace.jsonl",
     "output_result_path": "/path/to/output/result/",
     "eviction_params": {
         "eviction_mode": 1,
@@ -119,10 +137,11 @@ bazel build //kv_cache_manager/optimizer:optimizer_main
 ```
 
 
+### 步骤4: 运行Optimizer
+
 ```bash
 bazel run //kv_cache_manager/optimizer:optimizer_main -- /path/to/config.json
 ```
-
 
 运行完成后，会在 `output_result_path` 指定的目录下生成：
 
@@ -135,6 +154,8 @@ Optimizer 模块提供多种可视化分析工具，用于分析缓存性能、�
 #### 命中率随时间变化图表
 
 运行optimizer，分析trace并绘制多实例缓存分析图表，展示所有 instance 的存储容量总和以及各自命中率随时间的变化。
+
+**注意**: 配置文件中的 `trace_file_path` 必须是标准格式trace文件。
 
 ```bash
 bazel run //kv_cache_manager/optimizer/analysis/script:optimizer_run -- \
@@ -246,13 +267,25 @@ optimizer.ClearAllCachesAndResetStats()           # 清空所有实例并重置�
 
 ### 示例
 
-以 [Qwen-Bailian 开源数据集](https://github.com/alibaba-edu/qwen-bailian-usagetraces-anon) 为例，目前qwen-bailian数据集中没有说明instance，所以默认为1个instance，如有需要可自行修改
+以 [Qwen-Bailian 开源数据集](https://github.com/alibaba-edu/qwen-bailian-usagetraces-anon) 为例：
 
-配置文件：
+#### 1. 转换trace
+
+```bash
+cd tools/trace_converter
+python trace_converter.py \
+    -i /path/to/qwen_traceA_blksz_16.jsonl \
+    -o /path/to/qwen_traceA_optimizer.jsonl \
+    -f qwen_bailian \
+    --mode optimizer \
+    --block-size 16
+```
+
+#### 2. 配置文件
+
 ```json
 {
-    "trace_file_path" : "/path/to/qwen-bailian-usagetraces-anon/qwen_traceA_blksz_16.jsonl",
-    "trace_type": "qwen_bailian",
+    "trace_file_path" : "/path/to/qwen_traceA_optimizer.jsonl",
     "output_result_path": "/mnt/baiyi/KVCacheManager/kv_cache_manager/optimizer/analysis/result/qwen_bailian",
     "eviction_params": {
         "eviction_mode": 1,
@@ -343,134 +376,134 @@ bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff_analysis_run_by_
 
 ### 概述
 
-Optimizer 支持三种输入格式，可以直接使用原始格式或预转换的标准格式。
+Optimizer 只接受标准格式的trace文件。使用独立的Python工具将各种trace格式转换为标准格式。
 
-### 三种输入方式
+### 标准格式
 
-#### 方式1：直接使用 Qwen Bailian 格式
+Optimizer支持三种标准trace类型:
 
-适用于 Qwen Bailian 开源数据集。
+- **GetLocationSchemaTrace**: 读操作 (prefill阶段)
+- **WriteCacheSchemaTrace**: 写操作 (decode阶段)
+- **DialogTurnSchemaTrace**: 完整对话轮次 (仅用于推理引擎模拟器)
 
-**配置文件**:
+**推荐**: 所有Optimizer输入统一使用Get+Write格式以保留精确的读写时序。
+
+详细格式规范见: [Standard Trace Format Specification](docs/standard_trace_format.md)
+
+---
+
+### 转换工具
+
+使用独立的Python工具转换各种格式 (无需bazel):
+
+```bash
+# 进入工具目录
+cd tools/trace_converter
+
+# 安装依赖 (首次使用)
+pip install -r requirements.txt
+
+# 转换trace为Optimizer格式
+python trace_converter.py \
+    -i your_trace.log \
+    -o optimizer_trace.jsonl \
+    -f <format> \
+    --mode optimizer
+
+# 转换trace为推理引擎格式
+python trace_converter.py \
+    -i your_trace.log \
+    -o inference_trace.jsonl \
+    -f <format> \
+    --mode inference
+```
+
+**支持的格式**:
+- `publisher_log`: KVCacheManager Event Publisher日志
+- `qwen_bailian`: Qwen Bailian开源数据集
+- `text`: 文本对话 (需要指定--tokenizer-path)
+
+详见: [Trace Converter文档](tools/trace_converter/README.md)
+
+---
+
+### 配置文件
+
+**新版配置** (简化):
 ```json
 {
-    "trace_file_path": "qwen_trace.jsonl",
-    "trace_type": "qwen_bailian",
+    "trace_file_path": "/path/to/optimizer_trace.jsonl",
     "output_result_path": "/path/to/output",
-    "instance_groups": [...]
+    "eviction_params": {
+        "eviction_mode": 1,
+        "eviction_batch_size_per_instance": 100
+    },
+    "instance_groups": [
+        {
+            "group_name": "instance_group_01",
+            "quota_capacity": 12000,
+            "instances": [
+                {
+                    "instance_id": "instance",
+                    "block_size": 16,
+                    "eviction_policy_type": "lru"
+                }
+            ]
+        }
+    ]
 }
 ```
 
-**运行**:
+**注意**: 
+- 不再需要 `trace_type` 字段
+- 不再需要 `rw_separation` 字段
+- `trace_file_path` 必须是标准格式文件
+
+---
+
+### 使用示例
+
+完整流程:
+
 ```bash
-./optimizer_main config.json
+# 步骤1: 转换trace
+cd tools/trace_converter
+python trace_converter.py \
+    -i /path/to/qwen_trace.jsonl \
+    -o /path/to/optimizer_trace.jsonl \
+    -f qwen_bailian \
+    --mode optimizer
+
+# 步骤2: 运行Optimizer
+cd ../..
+bazel run //kv_cache_manager/optimizer:optimizer_main -- /path/to/config.json
 ```
-
-**内部处理**: 使用 `QwenBailianConverter` 自动转换为 `DialogTurnSchemaTrace`，以 `rw_separation=false` 模式运行。
-
----
-
-#### 方式2：直接使用 Publisher Log 格式
-
-适用于 KVCacheManager Event Publisher 日志。
-
-**配置文件**:
-```json
-{
-    "trace_file_path": "publisher.log",
-    "trace_type": "publisher_log",
-    "output_result_path": "/path/to/output",
-    "instance_groups": [...]
-}
-```
-
-**运行**:
-```bash
-./optimizer_main config.json
-```
-
-**内部处理**: 使用 `PublisherLogConverter` 转换为混合类型的 trace（`GetLocationSchemaTrace` + `WriteCacheSchemaTrace` + `DialogTurnSchemaTrace`），以 `rw_separation=true` 模式运行。
-
----
-
-#### 方式3：使用 trace_anonymous_tool 导出的标准格式
-
-适用于使用 Python 工具处理的文本 trace。
-
-**步骤**:
-
-1. **Token 化**:
-   ```bash
-   python tokenizer.py --file_path trace.jsonl --time_field time --content_field text
-   ```
-
-2. **转换为标准格式**:
-   ```bash
-   python optimizer_schema_anonymizer.py --file_path tokenids_trace.jsonl --block_size 16
-   ```
-
-3. **配置文件**:
-   ```json
-   {
-       "trace_file_path": "optimizer_trace_xxx.jsonl",
-       "trace_type": "optimizer_schema",
-       "output_result_path": "/path/to/output",
-       "instance_groups": [...]
-   }
-   ```
-
-4. **运行 Optimizer**:
-   ```bash
-   ./optimizer_main config.json
-   ```
-
-**内部处理**: 使用 `OptimizerSchemaConverter` 直接加载标准格式的 `DialogTurnSchemaTrace`，以 `rw_separation=false` 模式运行。
-
----
-
-### 配置参数说明
-
-| 参数 | 说明 | 可选值 |
-|------|------|--------|
-| trace_file_path | Trace 文件路径 | 任意有效路径 |
-| trace_type | Trace 格式类型 | `qwen_bailian`, `publisher_log`, `optimizer_schema` |
-| output_result_path | 结果输出目录 | 任意有效路径 |
-
-
----
-
-### 导出标准 Trace 文件
-
-如果需要将原始格式的 trace 转换并导出为标准格式（用于分享、调试或其他工具使用），可以使用 `OptimizerLoader::DumpSchemaTracesToFile()` 接口。
-
-生成的文件可以使用 `trace_type: "optimizer_schema"` 重新加载。
 
 ---
 
 ### 添加自定义 Trace Converter
 
-如果需要支持新的 trace 格式，可以自行添加 converter：
+如果需要支持新的 trace 格式,在Python工具中添加新的converter:
 
-1. **创建 Converter 类**：在 `trace_converter/` 目录创建新的 converter 文件，继承 `BaseConverter` 基类
-   ```cpp
-   class MyCustomConverter : public BaseConverter {
-   public:
-       std::vector<std::shared_ptr<OptimizerSchemaTrace>>
-       ConvertLogFileToTraces(const std::string &log_file_path) override;
-       // 实现转换逻辑
-   };
+1. **创建Converter类**: 在 `tools/trace_converter/converters/` 创建新文件
+   ```python
+   from converters.base import BaseConverter
+   
+   class MyCustomConverter(BaseConverter):
+       def convert(self, input_file: str, output_file: str) -> int:
+           # 实现转换逻辑
+           pass
    ```
 
-2. **注册新类型**：在 `config/types.h` 添加新的 `TraceType` 枚举值
+2. **注册Converter**: 在 `trace_converter.py` 中添加新的格式选项
 
-3. **更新工厂**：在 `converter_factory.cc` 的 `CreateConverter()` 中添加新的分支
-
-4. **更新 BUILD**：将新文件添加到 `trace_converter` 库的 srcs 和 hdrs
-
-这样就可以支持自定义格式的 trace 文件了。
+3. **使用**: 
+   ```bash
+   python trace_converter.py -i input.log -o output.jsonl -f my_custom
+   ```
 
 ---
 
 ### 相关文档
 
-- [trace_anonymous_tool文档](./analysis/script/trace_anonymous_tool/README.md) - Python转换工具详细说明
+- [Trace Converter工具文档](tools/trace_converter/README.md) - Python转换工具详细说明

@@ -6,7 +6,7 @@
 #include "kv_cache_manager/optimizer/config/optimizer_config.h"
 #include "kv_cache_manager/optimizer/manager/eviction_manager.h"
 #include "kv_cache_manager/optimizer/manager/indexer_manager.h"
-#include "kv_cache_manager/optimizer/trace_converter/optimizer_schema_trace.h"
+#include "kv_cache_manager/optimizer/trace_loader/optimizer_schema_trace.h"
 
 namespace kv_cache_manager {
 class OptimizerRunner {
@@ -17,8 +17,8 @@ public:
         : indexer_manager_(indexer_manager), eviction_manager_(eviction_manager), result_map_(result_map){};
     ~OptimizerRunner() = default;
     void Run(OptimizerConfig &config);
-    void RunTraces(const std::vector<std::shared_ptr<OptimizerSchemaTrace>> &traces, bool rw_separation);
-    void RunTrace(std::shared_ptr<OptimizerSchemaTrace> trace, bool rw_separation);
+    void RunTraces(const std::vector<std::shared_ptr<OptimizerSchemaTrace>> &traces);
+    void RunTrace(std::shared_ptr<OptimizerSchemaTrace> trace);
 
 public:
     void HandleGetLocation(const GetLocationSchemaTrace &trace);

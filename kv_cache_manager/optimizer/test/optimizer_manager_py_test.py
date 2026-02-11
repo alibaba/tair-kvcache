@@ -35,25 +35,6 @@ class OptimizerManagerPyTest(unittest.TestCase):
         import shutil
         shutil.rmtree(self.temp_dir)
 
-    # 读取外部trace文件，转化为 optimizer 标准trace，并写入log
-    def test_dump_optimizer_schema_trace(self):
-        test_srcdir = os.getenv("TEST_SRCDIR")
-        if test_srcdir:
-            trace_file_path = os.path.join(
-                test_srcdir,
-                "kv_cache_manager/kv_cache_manager/optimizer/test/testdata/event_publisher.log"
-            )
-        else:
-            trace_file_path = "kv_cache_manager/optimizer/test/testdata/event_publisher.log"
-        # 直接修改配置，不需要深拷贝（pybind11 对象无法被 pickle）
-        original_trace_file_path = self.config.trace_file_path()
-        self.config.set_trace_file_path(trace_file_path)
-        try:
-            kvcm_py_optimizer.OptimizerLoader.DumpSchemaTracesToFile(self.config)
-        finally:
-            # 恢复原始配置
-            self.config.set_trace_file_path(original_trace_file_path)
-
     def test_write_cache(self):
         instance_id = "3780643326877293460"
         trace_id = "test_trace_001"

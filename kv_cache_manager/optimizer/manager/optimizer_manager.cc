@@ -10,8 +10,7 @@
 #include "kv_cache_manager/manager/cache_location.h"
 #include "kv_cache_manager/optimizer/config/tier_config.h"
 #include "kv_cache_manager/optimizer/eviction_policy/policy_factory.h"
-#include "kv_cache_manager/optimizer/trace_converter/converter_factory.h"
-#include "kv_cache_manager/optimizer/trace_converter/trace_util.h"
+#include "kv_cache_manager/optimizer/trace_loader/trace_util.h"
 namespace kv_cache_manager {
 
 OptimizerManager::OptimizerManager(const OptimizerConfig &config) : config_(config) {}
