@@ -5,6 +5,7 @@
 
 import argparse
 import sys
+import os
 import numpy as np
 from collections import defaultdict
 from kv_cache_manager.optimizer.pybind import kvcm_py_optimizer
@@ -23,6 +24,14 @@ def main():
     parser.add_argument('--hit-rate-type', default='total',
                         choices=['total', 'internal', 'external', 'all'])
     parser.add_argument('--max-workers', type=int, default=4)
+    parser.add_argument('--save-csv', action='store_true',
+                        help='保留每次运行的 CSV 文件（用于后续画时序图）')
+    parser.add_argument('--csv-output-dir', default=None,
+                        help='CSV 保存目录（默认为 <output_result_path>/csv_results）')
+    parser.add_argument('--plot-timeseries', action='store_true',
+                        help='自动为每个容量点生成时序图（需要 --save-csv）')
+    parser.add_argument('--plot-capacity', type=int, nargs='+', default=None,
+                        help='只为指定的容量点生成时序图（例如：--plot-capacity 5000 10000）')
     
     args = parser.parse_args()
     
@@ -51,6 +60,15 @@ def main():
     print(f"\nGenerated {len(capacities)} capacity points")
     print(f"Range: {capacities[0]} to {capacities[-1]} blocks\n")
     
+    # 确定 CSV 保存目录
+    csv_save_dir = None
+    if args.save_csv:
+        if args.csv_output_dir:
+            csv_save_dir = args.csv_output_dir
+        else:
+            csv_save_dir = os.path.join(config.output_result_path(), 'csv_results')
+        print(f"CSV files will be saved to: {csv_save_dir}\n")
+    
     # 生成所有实验组合
     experiments = [
         (capacity, policy) 
@@ -59,7 +77,7 @@ def main():
     ]
     
     # 并行运行所有实验
-    results = utils.run_experiments_parallel(args.config, experiments, args.max_workers)
+    results = utils.run_experiments_parallel(args.config, experiments, args.max_workers, csv_save_dir)
     
     # 按策略组织结果
     results_by_policy = defaultdict(list)
@@ -160,6 +178,41 @@ def main():
     for policy in args.eviction_policies:
         count = len(results_by_policy[policy]) if policy in results_by_policy else 0
         print(f"{policy}: {count}/{len(capacities)} experiments succeeded")
+    
+    # 如果启用了时序图生成
+    if args.plot_timeseries and args.save_csv:
+        print("\n" + "=" * 60)
+        print("Generating Timeseries Plots")
+        print("=" * 60)
+        
+        from plot_hit_rate_with_storage import plot_multi_instance_analysis
+        
+        # 确定要画图的容量点
+        if args.plot_capacity:
+            target_capacities = args.plot_capacity
+            print(f"Plotting specified capacities: {target_capacities}")
+        else:
+            # 默认：为所有容量点生成图
+            target_capacities = capacities
+            print(f"Plotting all {len(target_capacities)} capacity points...")
+        
+        # 为每个策略和容量点生成时序图
+        total_plots = 0
+        for policy in args.eviction_policies:
+            for capacity in target_capacities:
+                csv_dir = os.path.join(csv_save_dir, f"cap_{capacity}_{policy}")
+                
+                if os.path.exists(csv_dir):
+                    print(f"Plotting {policy} capacity={capacity}...")
+                    try:
+                        plot_multi_instance_analysis(csv_dir)
+                        total_plots += 1
+                    except Exception as e:
+                        print(f"  ✗ Failed: {e}")
+        
+        print(f"\nGenerated {total_plots} timeseries plots!")
+    elif args.plot_timeseries and not args.save_csv:
+        print("\n⚠️  Warning: --plot-timeseries requires --save-csv")
     
     print("\nAnalysis complete!")
 

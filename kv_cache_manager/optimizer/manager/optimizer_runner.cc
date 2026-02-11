@@ -153,7 +153,9 @@ void OptimizerRunner::HandleWriteCache(const WriteCacheSchemaTrace &trace) {
     // TODO 更详细统计信息获取
     WriteRecord write_record;
     write_record.timestamp_us = trace.timestamp_us();
-    write_record.write_blocks = insert_block_keys.size();
+    // 注意：这里统计trace中的block数（含重复），而非实际插入数（insert_block_keys.size()）
+    // 用于分析trace的数据规模，而非缓存的实际变化
+    write_record.write_blocks = trace.keys().size();
     result->write_results.push_back(write_record);
     // 总的写入：减去目前的缓存块数，可以得到驱逐的块数，用于检查前缀树的正确性
     result->counters.total_write_blocks += write_record.write_blocks;
@@ -204,7 +206,8 @@ void OptimizerRunner::HandleDialogTurn(const DialogTurnSchemaTrace &trace) {
     result->counters.total_read_requests += 1;
     WriteRecord write_record;
     write_record.timestamp_us = trace.timestamp_us();
-    write_record.write_blocks = insert_block_keys.size();
+    // 注意：统计trace中的block数，而非实际插入数
+    write_record.write_blocks = trace.total_keys().size() - trace.keys().size();
     result->write_results.push_back(write_record);
     result->counters.total_write_blocks += write_record.write_blocks;
     result->counters.total_blocks = eviction_manager_->GetCurrentInstanceUsage(instance_id);

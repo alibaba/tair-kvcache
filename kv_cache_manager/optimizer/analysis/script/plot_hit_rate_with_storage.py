@@ -130,9 +130,36 @@ def plot_multi_instance_analysis(csv_dir):
         axr.set_ylim(0, 1)
         axr.tick_params(axis='y', labelcolor='#d62728')
         return axr
-    def smooth_nan(y, win=21):
-        s = pd.Series(y)
-        return s.rolling(win, center=True, min_periods=1).mean().to_numpy()
+    
+    def smooth_by_time(timestamps, values, window_seconds=60):
+        """
+        按时间窗口平滑数据
+        
+        Args:
+            timestamps: 时间戳数组（秒）
+            values: 数值数组
+            window_seconds: 时间窗口大小（秒），默认60秒
+        
+        Returns:
+            平滑后的数组
+        """
+        # 创建临时DataFrame
+        df = pd.DataFrame({'t': timestamps, 'v': values})
+        df = df.sort_values('t').reset_index(drop=True)
+        
+        # 转换为时间索引（使用datetime）
+        base_time = pd.Timestamp('2000-01-01')  # 任意基准时间
+        df['t_dt'] = base_time + pd.to_timedelta(df['t'], unit='s')
+        df = df.set_index('t_dt')
+        
+        # 使用rolling按时间窗口平滑
+        smoothed = df['v'].rolling(
+            window=f'{window_seconds}s',
+            center=True,
+            min_periods=1
+        ).mean()
+        
+        return smoothed.values
     setup_left_axis(ax_top)
     ax_top_r = setup_right_axis(ax_top, 'Cumulative Hit Rate')
 
@@ -160,7 +187,7 @@ def plot_multi_instance_analysis(csv_dir):
                     linewidth=1.5, drawstyle='steps-post')
         top_lines += l1
 
-    # 下图：当前trace命中率
+    # 下图：当前trace命中率（按时间平滑）
     for i, name in enumerate(instance_names):
         t0, t1 = all_time_ranges[i]
         valid = (base_timestamps >= t0) & (base_timestamps <= t1)
@@ -168,9 +195,10 @@ def plot_multi_instance_analysis(csv_dir):
         step = 10
         idx = np.flatnonzero(valid)[::step]   # 在valid范围内每隔step取一个点，防止线太密集
 
-        win = 21  # 平滑窗口：越大越平滑（可调 21/51/101）
-        hit_sm = smooth_nan(np.array(all_hit[i]), win)
-        ext_sm = smooth_nan(np.array(all_external_hit[i]), win)
+        # 按时间平滑：60秒窗口（可调整）
+        window_seconds = 2
+        hit_sm = smooth_by_time(base_timestamps, np.array(all_hit[i]), window_seconds)
+        ext_sm = smooth_by_time(base_timestamps, np.array(all_external_hit[i]), window_seconds)
 
         l2 = ax_bot_r.plot(base_timestamps[idx], hit_sm[idx],
                         color=colors[i], label=f'{name} - HitRate',

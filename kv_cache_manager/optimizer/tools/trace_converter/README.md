@@ -152,7 +152,6 @@ python trace_converter.py \
 
 **说明**:
 - 如果指定了`--tokenizer-path`或`--model-name`,所有模型将共享同一个tokenizer
-- 如果未指定,则根据CSV中的`modelName`字段通过映射表自动拉取对应的tokenizer
 
 
 ## 输入格式
@@ -446,7 +445,3 @@ class MyCustomConverter(BaseConverter):
         # 实现转换逻辑
         pass
 ```
-
-## License
-
-Copyright (c) 2024 KVCacheManager Team

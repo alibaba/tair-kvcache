@@ -388,7 +388,6 @@ Optimizer支持三种标准trace类型:
 
 **推荐**: 所有Optimizer输入统一使用Get+Write格式以保留精确的读写时序。
 
-详细格式规范见: [Standard Trace Format Specification](docs/standard_trace_format.md)
 
 ---
 
@@ -429,7 +428,7 @@ python trace_converter.py \
 
 ### 配置文件
 
-**新版配置** (简化):
+**新版配置**:
 ```json
 {
     "trace_file_path": "/path/to/optimizer_trace.jsonl",
@@ -455,8 +454,6 @@ python trace_converter.py \
 ```
 
 **注意**: 
-- 不再需要 `trace_type` 字段
-- 不再需要 `rw_separation` 字段
 - `trace_file_path` 必须是标准格式文件
 
 ---

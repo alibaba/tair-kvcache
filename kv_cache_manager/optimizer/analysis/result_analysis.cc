@@ -96,18 +96,51 @@ void HitAnalysis::ExportHitRates(const std::string &instance_id,
     file << "TimestampUs,CachedBlocksCurrentInstance,CachedBlocksPerInstance,CachedBlocksAllInstance,"
             "InternalReadBlocks,ExternalReadBlocks,TotalReadBlocks,InternalHitBlocks,"
             "InternalHitRate,ExternalHitBlocks,ExternalHitRate,HitRate,AccInternalHitRate,AccExternalHitRate,"
-            "AccHitRate\n";
+            "AccHitRate,AccTotalBlocks\n";
+
+    // 累计处理的总 block 数（读+写）
+    size_t acc_total_blocks = 0;
+    size_t write_index = 0;
+
     for (size_t i = 0; i < result->read_results.size(); ++i) {
         const auto &blocks_per_instance = result->read_results[i].blocks_per_instance;
+
+        // 累加本次读取的 block 数
+        size_t current_read_blocks =
+            result->read_results[i].internal_read_blocks + result->read_results[i].external_read_blocks;
+        acc_total_blocks += current_read_blocks;
+
+        // 累加在本时间点之前的所有写 block
+        while (write_index < result->write_results.size() &&
+               result->write_results[write_index].timestamp_us <= result->read_results[i].timestamp_us) {
+            acc_total_blocks += result->write_results[write_index].write_blocks;
+            write_index++;
+        }
+
         file << result->read_results[i].timestamp_us << ", " << result->read_results[i].current_cache_blocks << ", "
              << JoinVecSizeT(blocks_per_instance) << ", " << SumVecSizeT(blocks_per_instance) << ", "
              << result->read_results[i].internal_read_blocks << ", " << result->read_results[i].external_read_blocks
-             << ", " << (result->read_results[i].internal_read_blocks + result->read_results[i].external_read_blocks)
-             << ", " << result->read_results[i].internal_hit_blocks << ", " << internal_hit_rates[i] << ", "
-             << result->read_results[i].external_hit_blocks << ", " << external_hit_rates[i] << ", "
-             << (internal_hit_rates[i] + external_hit_rates[i]) << ", " << acc_internal_hit_rates[i] << ", "
-             << acc_external_hit_rates[i] << ", " << (acc_internal_hit_rates[i] + acc_external_hit_rates[i]) << "\n";
+             << ", " << current_read_blocks << ", " << result->read_results[i].internal_hit_blocks << ", "
+             << internal_hit_rates[i] << ", " << result->read_results[i].external_hit_blocks << ", "
+             << external_hit_rates[i] << ", " << (internal_hit_rates[i] + external_hit_rates[i]) << ", "
+             << acc_internal_hit_rates[i] << ", " << acc_external_hit_rates[i] << ", "
+             << (acc_internal_hit_rates[i] + acc_external_hit_rates[i]) << ", " << acc_total_blocks << "\n";
     }
+
+    // 处理剩余的写操作（在最后一个读操作之后的写操作）
+    // 这些写操作不会出现在CSV中，但会记录在日志里
+    size_t remaining_write_blocks = 0;
+    while (write_index < result->write_results.size()) {
+        remaining_write_blocks += result->write_results[write_index].write_blocks;
+        write_index++;
+    }
+
+    if (remaining_write_blocks > 0) {
+        KVCM_LOG_INFO("Instance %s: %zu write blocks after last read operation (not shown in CSV)",
+                      instance_id.c_str(),
+                      remaining_write_blocks);
+    }
+
     file.close();
     KVCM_LOG_INFO("Hit rates exported to: %s", filename.c_str());
 }
