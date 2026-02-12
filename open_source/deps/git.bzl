@@ -102,10 +102,10 @@ def git_deps():
         remote = "https://github.com/alibaba/havenask.git",
         commit = "3c973500afbd40933eb0a80cfdfb6592274377fb",
         shallow_since = "1713326599 +0800",
-        patches=[
+        patches = [
             "//patches/havenask:havenask.patch",
             "//patches/havenask:anet.patch",
-            "//patches/havenask:0001-fix-PrometheusSink-need-header.patch"
+            "//patches/havenask:0001-fix-PrometheusSink-need-header.patch",
         ],
         build_file = clean_dep("//3rdparty/kmonitor:kmonitor.BUILD"),
     )
@@ -117,7 +117,7 @@ def git_deps():
         patches = [
             "//patches/nacos_sdk_cpp:nacos-compile.patch",
         ],
-        build_file = clean_dep("//3rdparty/nacos_sdk_cpp:nacos_sdk_cpp.BUILD")
+        build_file = clean_dep("//3rdparty/nacos_sdk_cpp:nacos_sdk_cpp.BUILD"),
     )
 
     new_git_repository(
@@ -125,7 +125,7 @@ def git_deps():
         remote = "https://github.com/jbeder/yaml-cpp.git",
         build_file = clean_dep("//3rdparty/yaml-cpp:BUILD"),
         commit = "9a3624205e8774953ef18f57067b3426c1c5ada6",
-        shallow_since = "1569430560 -0700"
+        shallow_since = "1569430560 -0700",
     )
 
     http_archive(
@@ -148,18 +148,6 @@ def git_deps():
             "https://github.com/google/boringssl/archive/7f634429a04abc48e2eb041c81c5235816c96514.tar.gz",
             "https://mirror.bazel.build/github.com/google/boringssl/archive/7f634429a04abc48e2eb041c81c5235816c96514.tar.gz",
         ],
-    )
-
-    http_file(
-        name = "krb5-devel",
-        urls = ["http://mirrors.aliyun.com/centos/7/os/x86_64/Packages/krb5-devel-1.15.1-50.el7.x86_64.rpm"],
-        sha256 = "75069ac38fed957b70ea1de5e2824e6a77468e9745a3a828d47a02bab727ba11",
-    )
-
-    http_file(
-        name = "libcom_err-devel",
-        urls = ["https://mirrors.aliyun.com/centos/7/os/x86_64/Packages/libcom_err-devel-1.42.9-19.el7.x86_64.rpm"],
-        sha256 = "3a14db2d86490211494bb142139121da838160fb7ba28d46cd01568b0173969c",
     )
 
     # Needed by Protobuf
