@@ -170,4 +170,9 @@ struct ForwardContext {
     int32_t sw_size{-1};
 };
 
+struct TransferTraceInfo {
+    bool need_print = false;
+    std::vector<std::string> block_ids; // block_ids.size() must be equal to block_buffer.size()
+};
+
 } // namespace kv_cache_manager

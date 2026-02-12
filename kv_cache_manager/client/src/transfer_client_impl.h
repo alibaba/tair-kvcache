@@ -18,9 +18,13 @@ public:
     TransferClientImpl();
     ~TransferClientImpl() override;
 
-    ClientErrorCode LoadKvCaches(const UriStrVec &uri_str_vec, const BlockBuffers &block_buffers) override;
-    std::pair<ClientErrorCode, UriStrVec> SaveKvCaches(const UriStrVec &uri_str_vec,
-                                                       const BlockBuffers &block_buffers) override;
+    ClientErrorCode LoadKvCaches(const UriStrVec &uri_str_vec,
+                                 const BlockBuffers &block_buffers,
+                                 std::shared_ptr<TransferTraceInfo> trace_info = nullptr) override;
+    std::pair<ClientErrorCode, UriStrVec>
+    SaveKvCaches(const UriStrVec &uri_str_vec,
+                 const BlockBuffers &block_buffers,
+                 std::shared_ptr<TransferTraceInfo> trace_info = nullptr) override;
 
 protected:
     ClientErrorCode Init(const std::string &client_config, const InitParams &init_params) override;
@@ -31,7 +35,8 @@ private:
     UriStrVec ConstructLocations(const std::vector<DataStorageUri> &uris);
     void PrintBlockHashAndUri(const std::string &prefix,
                               const UriStrVec &uri_str_vec,
-                              const std::vector<int64_t> &block_hashs) const;
+                              const std::vector<int64_t> &block_hashs,
+                              const std::shared_ptr<TransferTraceInfo> &trace_info) const;
 
 private:
     friend class TransferClient;

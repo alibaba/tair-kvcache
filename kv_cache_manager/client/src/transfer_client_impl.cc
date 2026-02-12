@@ -98,23 +98,30 @@ ClientErrorCode TransferClientImpl::Init(const std::string &client_config, const
 
 void TransferClientImpl::PrintBlockHashAndUri(const std::string &prefix,
                                               const UriStrVec &uri_str_vec,
-                                              const std::vector<int64_t> &block_hashs) const {
+                                              const std::vector<int64_t> &block_hashs,
+                                              const std::shared_ptr<TransferTraceInfo> &trace_info) const {
     std::stringstream ss;
     ss << prefix << "; self_location_spec_name : " << init_params_.self_location_spec_name
-       << "; uri size : " << uri_str_vec.size() << "; real size : " << block_hashs.size() << '\n';
-    ss << "{\n";
+       << "; uri size : " << uri_str_vec.size() << "; real size : " << block_hashs.size();
+    ss << "{";
+    bool invalid = (trace_info != nullptr) && (trace_info->block_ids.size() >= block_hashs.size());
     for (size_t i = 0; i < block_hashs.size(); ++i) {
-        ss << "  \"" << prefix << uri_str_vec[i] << "\":" << block_hashs[i];
+        ss << "\"" << prefix;
+        if (invalid) {
+            ss << "_" << trace_info->block_ids[i] << "_";
+        }
+        ss << uri_str_vec[i] << "\":" << block_hashs[i];
         if (i != (block_hashs.size() - 1)) {
             ss << ',';
         }
-        ss << '\n';
     }
     ss << "}";
     KVCM_LOG_INFO("%s", ss.str().c_str());
 }
 
-ClientErrorCode TransferClientImpl::LoadKvCaches(const UriStrVec &uri_str_vec, const BlockBuffers &block_buffers) {
+ClientErrorCode TransferClientImpl::LoadKvCaches(const UriStrVec &uri_str_vec,
+                                                 const BlockBuffers &block_buffers,
+                                                 std::shared_ptr<TransferTraceInfo> trace_info) {
     KVCM_LOG_DEBUG("load kv caches with uri_str_vec %s, block_buffers %s",
                    DebugStringUtil::ToString(uri_str_vec).c_str(),
                    DebugStringUtil::ToString(block_buffers).c_str());
@@ -126,27 +133,36 @@ ClientErrorCode TransferClientImpl::LoadKvCaches(const UriStrVec &uri_str_vec, c
     }
 #ifdef USING_CUDA
     if (is_check_buffer_) {
-        auto handle = sdk_buffer_check_pool_->GetCell();
-        auto block_hashs = SdkBufferCheckUtil::GetBlocksHash(
-            block_buffers, handle->d_iovs, handle->d_crcs, handle->h_iovs, max_check_iov_num_, handle->cuda_stream);
-        PrintBlockHashAndUri("get_", uri_str_vec, block_hashs);
+        bool need_print = (trace_info == nullptr) ? true : trace_info->need_print;
+        std::vector<int64_t> block_hashs;
+        if (need_print) {
+            auto handle = sdk_buffer_check_pool_->GetCell();
+            block_hashs = SdkBufferCheckUtil::GetBlocksHash(
+                block_buffers, handle->d_iovs, handle->d_crcs, handle->h_iovs, max_check_iov_num_, handle->cuda_stream);
+        }
+        PrintBlockHashAndUri("get_", uri_str_vec, block_hashs, trace_info);
     }
 #endif
     return ec;
 }
 
 std::pair<ClientErrorCode, UriStrVec> TransferClientImpl::SaveKvCaches(const UriStrVec &uri_str_vec,
-                                                                       const BlockBuffers &block_buffers) {
+                                                                       const BlockBuffers &block_buffers,
+                                                                       std::shared_ptr<TransferTraceInfo> trace_info) {
     KVCM_LOG_DEBUG("save kv caches with uri_str_vec %s, block_buffers %s",
                    DebugStringUtil::ToString(uri_str_vec).c_str(),
                    DebugStringUtil::ToString(block_buffers).c_str());
     CHECK_SDK_WITH_TYPE();
 #ifdef USING_CUDA
     if (is_check_buffer_) {
-        auto handle = sdk_buffer_check_pool_->GetCell();
-        auto block_hashs = SdkBufferCheckUtil::GetBlocksHash(
-            block_buffers, handle->d_iovs, handle->d_crcs, handle->h_iovs, max_check_iov_num_, handle->cuda_stream);
-        PrintBlockHashAndUri("put_", uri_str_vec, block_hashs);
+        bool need_print = (trace_info == nullptr) ? true : trace_info->need_print;
+        std::vector<int64_t> block_hashs;
+        if (need_print) {
+            auto handle = sdk_buffer_check_pool_->GetCell();
+            block_hashs = SdkBufferCheckUtil::GetBlocksHash(
+                block_buffers, handle->d_iovs, handle->d_crcs, handle->h_iovs, max_check_iov_num_, handle->cuda_stream);
+        }
+        PrintBlockHashAndUri("put_", uri_str_vec, block_hashs, trace_info);
     }
 #endif
     auto remote_uris = ParseLocations(uri_str_vec);

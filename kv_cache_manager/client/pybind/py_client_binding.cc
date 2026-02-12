@@ -112,6 +112,11 @@ PYBIND11_MODULE(kvcm_py_client, module) {
         .def_readwrite("metas", &kvcm::ForwardContext::metas)
         .def_readwrite("sw_size", &kvcm::ForwardContext::sw_size);
 
+    py::class_<kvcm::TransferTraceInfo, py::smart_holder>(module, "TransferTraceInfo")
+        .def(py::init<>())
+        .def_readwrite("need_print", &kvcm::TransferTraceInfo::need_print)
+        .def_readwrite("block_ids", &kvcm::TransferTraceInfo::block_ids);
+
     // 由于pybind11会自动处理std::vector和std::map到Python list/dict的转换，
     // 我们不需要显式绑定这些标准容器类型，直接使用Python的list和dict即可
     // 保留这些类型定义以支持C++接口，但使用Python原生类型进行交互
@@ -119,7 +124,17 @@ PYBIND11_MODULE(kvcm_py_client, module) {
     // 绑定TransferClient类
     py::class_<kvcm::TransferClient, py::smart_holder>(module, "TransferClient")
         .def_static("Create", &kvcm::TransferClient::Create, py::call_guard<py::gil_scoped_release>())
-        .def("LoadKvCaches", &kvcm::TransferClient::LoadKvCaches, py::call_guard<py::gil_scoped_release>())
-        .def("SaveKvCaches", &kvcm::TransferClient::SaveKvCaches, py::call_guard<py::gil_scoped_release>());
+        .def("LoadKvCaches",
+             &kvcm::TransferClient::LoadKvCaches,
+             py::arg("uri_str_vec"),
+             py::arg("block_buffers"),
+             py::arg("trace_info") = nullptr,
+             py::call_guard<py::gil_scoped_release>())
+        .def("SaveKvCaches",
+             &kvcm::TransferClient::SaveKvCaches,
+             py::arg("uri_str_vec"),
+             py::arg("block_buffers"),
+             py::arg("trace_info") = nullptr,
+             py::call_guard<py::gil_scoped_release>());
 
 } // namespace kv_cache_manager

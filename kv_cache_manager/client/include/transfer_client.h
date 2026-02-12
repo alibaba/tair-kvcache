@@ -16,9 +16,13 @@ public:
     virtual ~TransferClient() = default;
     static std::unique_ptr<TransferClient> Create(const std::string &client_config, const InitParams &init_params);
 
-    virtual ClientErrorCode LoadKvCaches(const UriStrVec &uri_str_vec, const BlockBuffers &block_buffers) = 0;
-    virtual std::pair<ClientErrorCode, UriStrVec> SaveKvCaches(const UriStrVec &uri_str_vec,
-                                                               const BlockBuffers &block_buffers) = 0;
+    virtual ClientErrorCode LoadKvCaches(const UriStrVec &uri_str_vec,
+                                         const BlockBuffers &block_buffers,
+                                         std::shared_ptr<TransferTraceInfo> trace_info = nullptr) = 0;
+    virtual std::pair<ClientErrorCode, UriStrVec>
+    SaveKvCaches(const UriStrVec &uri_str_vec,
+                 const BlockBuffers &block_buffers,
+                 std::shared_ptr<TransferTraceInfo> trace_info = nullptr) = 0;
 
 protected:
     TransferClient() = default;

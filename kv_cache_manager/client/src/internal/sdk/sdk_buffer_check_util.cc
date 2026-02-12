@@ -88,7 +88,7 @@ SdkBufferCheckPool::~SdkBufferCheckPool() {
         if (cell.d_iovs) {
             CHECK_CUDA_ERROR(cudaFree(cell.d_iovs), "cuda free d_iovs[%p] failed", cell.d_iovs);
         }
-        if (cell.d_iovs) {
+        if (cell.d_crcs) {
             CHECK_CUDA_ERROR(cudaFree(cell.d_crcs), "cuda free d_crcs[%p] failed", cell.d_crcs);
         }
     }
@@ -108,6 +108,8 @@ bool SdkBufferCheckPool::Init(size_t max_check_iov_num) {
             cudaStreamCreateWithFlags(&cell.cuda_stream, cudaStreamNonBlocking), false, "cuda stream create failed");
         cell_queue_.push(&cell);
     }
+    KVCM_LOG_INFO(
+        "cell_size[%lu], iovs_byte_size[%lu], crcs_byte_size[%lu]", cells_.size(), iovs_byte_size, crcs_byte_size);
     return true;
 }
 
