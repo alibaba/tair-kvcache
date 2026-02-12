@@ -1,6 +1,6 @@
 ARG BASE_OS_IMAGE=alibaba-cloud-linux-3-registry.cn-hangzhou.cr.aliyuncs.com/alinux3/alinux3:latest
-ARG BAZELISK_URL="https://github.com/bazelbuild/bazelisk/releases/download/v1.20.0/bazelisk-linux-amd64"
-ARG BUILDIFER_URL="https://github.com/bazelbuild/buildtools/releases/download/v8.2.1/buildifier-linux-amd64"
+ARG BAZELISK_VERSION=v1.20.0
+ARG BUILDIFIER_VERSION=v8.2.1
 ARG BAZELISK_BASE_URL=https://mirrors.huaweicloud.com/bazel/
 
 FROM $BASE_OS_IMAGE
@@ -8,9 +8,10 @@ LABEL org.opencontainers.image.source=https://github.com/alibaba/tair-kvcache
 LABEL org.opencontainers.image.description="Tair KVCache Manager Dev Container"
 LABEL org.opencontainers.image.licenses=Apache-2.0
 
-ARG BAZELISK_URL
-ARG BUILDIFER_URL
+ARG BAZELISK_VERSION
+ARG BUILDIFIER_VERSION
 ARG BAZELISK_BASE_URL
+ARG TARGETARCH
 
 USER root
 
@@ -27,9 +28,9 @@ RUN sed -i.bak 's|http://mirrors\.cloud\.aliyuncs\.com|http://mirrors.aliyun.com
     rm -rf /var/cache/yum && \
     pip3 config set global.index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple && \
     pip3 install autopep8 && \
-    wget "$BAZELISK_URL" -O /usr/local/bin/bazelisk && chmod a+x /usr/local/bin/bazelisk && \
+    wget "https://github.com/bazelbuild/bazelisk/releases/download/${BAZELISK_VERSION}/bazelisk-linux-${TARGETARCH}" -O /usr/local/bin/bazelisk && chmod a+x /usr/local/bin/bazelisk && \
     BAZELISK_BASE_URL=$BAZELISK_BASE_URL USE_BAZEL_VERSION=6.4.0 bazelisk && \
-    wget "$BUILDIFER_URL" -O /usr/local/bin/buildifier && chmod a+x /usr/local/bin/buildifier
+    wget "https://github.com/bazelbuild/buildtools/releases/download/${BUILDIFIER_VERSION}/buildifier-linux-${TARGETARCH}" -O /usr/local/bin/buildifier && chmod a+x /usr/local/bin/buildifier
 
 
 ENV KV_CACHE_MANAGER_DEV_VERSION __IMAGE_VERSION_PLACEHOLDER__
