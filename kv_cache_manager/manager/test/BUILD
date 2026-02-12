@@ -153,3 +153,18 @@ cc_test(
         "//kv_cache_manager/manager:select_location_policy",
     ],
 )
+
+cc_test(
+    name = "ReclaimerTaskSupervisorTest",
+    srcs = [
+        "reclaimer_task_supervisor_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    data = [],
+    linkstatic = True,
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/manager:reclaimer_task_supervisor",
+        "@cpp_stub",
+    ],
+)

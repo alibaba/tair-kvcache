@@ -2,11 +2,13 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <set>
 #include <string>
 #include <string_view>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 #include "kv_cache_manager/common/env_util.h"
 #include "kv_cache_manager/common/jsonizable.h"
@@ -17,6 +19,7 @@
 #include "kv_cache_manager/config/instance_info.h"
 #include "kv_cache_manager/config/meta_cache_policy_config.h"
 #include "kv_cache_manager/config/registry_manager.h"
+#include "kv_cache_manager/data_storage/data_storage_uri.h"
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/event/spec_events/optimizer_event.h"
 #include "kv_cache_manager/manager/cache_manager_metrics_recorder.h"
@@ -895,7 +898,49 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
 ErrorCode CacheManager::TryCreateMetaSearcher(RequestContext *request_context, const std::string &instance_id) {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
-    MetaSearcher *meta_searcher = meta_searcher_manager_->TryCreateMetaSearcher(request_context, instance_id);
+
+    auto check_loc_data_exist = [this](const CacheLocation &loc) -> bool {
+        if (!registry_manager_ || !registry_manager_->data_storage_manager()) {
+            return true;
+        }
+
+        std::vector<DataStorageUri> storage_uris;
+        for (const auto &spec : loc.location_specs()) {
+            if (const DataStorageUri uri{spec.uri()}; uri.Valid()) {
+                storage_uris.emplace_back(uri);
+            }
+        }
+
+        if (storage_uris.empty()) {
+            // no uri to check
+            return true;
+        }
+
+        // multiple loc_spec in the same location are assumed to be in
+        // the same storage backend
+        const std::string storage_unique_name = storage_uris.front().GetHostName();
+        const auto result = registry_manager_->data_storage_manager()->Exist(storage_unique_name, storage_uris, true);
+        return std::all_of(result.cbegin(), result.cend(), [](const bool v) -> bool { return v; });
+    };
+
+    auto submit_del_req = [this, instance_id](const std::vector<std::int64_t> &blk_keys,
+                                              const std::vector<std::vector<std::string>> &loc_ids) -> void {
+        CacheLocationDelRequest request;
+        request.instance_id = instance_id;
+        request.delay = std::chrono::seconds(0);
+        request.block_keys = blk_keys;
+        request.location_ids = loc_ids;
+        if (schedule_plan_executor_) {
+            if (schedule_plan_executor_->SubmitNonBlocking(request)) {
+                KVCM_LOG_DEBUG("meta data del request submit OK");
+            } else {
+                KVCM_LOG_WARN("meta data del request submit failed");
+            }
+        }
+    };
+
+    MetaSearcher *meta_searcher = meta_searcher_manager_->TryCreateMetaSearcher(
+        request_context, instance_id, check_loc_data_exist, submit_del_req);
     if (!meta_searcher) {
         RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_ERROR, "create meta searcher failed");
     }

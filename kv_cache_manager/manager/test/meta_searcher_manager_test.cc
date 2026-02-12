@@ -14,7 +14,14 @@
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
-namespace kv_cache_manager {
+using namespace kv_cache_manager;
+
+namespace {
+
+CheckLocDataExistFunc dummy_check_loc_data_exist = [](const CacheLocation &) -> bool { return true; };
+SubmitDelReqFunc dummy_submit_del_req = [](const std::vector<std::int64_t> &,
+                                           const std::vector<std::vector<std::string>> &) -> void {};
+} // namespace
 
 class MetaSearcherManagerTest : public TESTBASE {
 public:
@@ -51,8 +58,8 @@ TEST_F(MetaSearcherManagerTest, TestMultiThreadCreate) {
     auto thread_fcn = [this, &searcher, &go]() {
         while (!go.load(std::memory_order_relaxed)) {}
         std::shared_ptr<RequestContext> request_context(new RequestContext("test_trace_id"));
-        MetaSearcher *real =
-            this->meta_searcher_manager_->TryCreateMetaSearcher(request_context.get(), "test_instance");
+        MetaSearcher *real = this->meta_searcher_manager_->TryCreateMetaSearcher(
+            request_context.get(), "test_instance", dummy_check_loc_data_exist, dummy_submit_del_req);
         MetaSearcher *expected = nullptr;
         if (!searcher.compare_exchange_strong(expected, real, std::memory_order_acq_rel)) {
             ASSERT_EQ(searcher.load(std::memory_order_relaxed), real);
@@ -77,7 +84,8 @@ TEST_F(MetaSearcherManagerTest, TestMultiThreadCreate) {
 TEST_F(MetaSearcherManagerTest, TestDoCleanup) {
     // 1. 创建 MetaSearcher
     std::shared_ptr<RequestContext> request_context(new RequestContext("test_trace_id"));
-    MetaSearcher *searcher = meta_searcher_manager_->TryCreateMetaSearcher(request_context.get(), "test_instance");
+    MetaSearcher *searcher = meta_searcher_manager_->TryCreateMetaSearcher(
+        request_context.get(), "test_instance", dummy_check_loc_data_exist, dummy_submit_del_req);
     ASSERT_NE(searcher, nullptr);
 
     // 验证可以获取到创建的 MetaSearcher
@@ -98,12 +106,11 @@ TEST_F(MetaSearcherManagerTest, TestDoCleanup) {
     meta_searcher_manager_->meta_indexer_manager_->DoCleanup();
 
     // 6. 重新创建 MetaSearcher
-    MetaSearcher *new_searcher = meta_searcher_manager_->TryCreateMetaSearcher(request_context.get(), "test_instance");
+    MetaSearcher *new_searcher = meta_searcher_manager_->TryCreateMetaSearcher(
+        request_context.get(), "test_instance", dummy_check_loc_data_exist, dummy_submit_del_req);
     ASSERT_NE(new_searcher, nullptr);
 
     // 7. 验证可以获取到新创建的 MetaSearcher
     retrieved_searcher = meta_searcher_manager_->GetMetaSearcher("test_instance");
     ASSERT_EQ(retrieved_searcher, new_searcher);
 }
-
-} // namespace kv_cache_manager

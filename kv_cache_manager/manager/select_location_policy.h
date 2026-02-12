@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <functional>
 #include <map>
 #include <string>
 
@@ -8,10 +9,14 @@
 
 namespace kv_cache_manager {
 
+using CheckLocDataExistFunc = std::function<bool(const CacheLocation &loc)>;
+
 class SelectLocationPolicy {
 public:
     // for match : select best location
-    virtual CacheLocation *SelectForMatch(CacheLocationMap &location_map) const = 0;
+    virtual CacheLocation *SelectForMatch(CacheLocationMap &location_map,
+                                          CheckLocDataExistFunc check_loc_data_exist,
+                                          std::vector<std::string> &out_prune_loc_ids) const = 0;
     // for write : return true if exists means that not need write again
     virtual bool ExistsForWrite(const CacheLocationMap &location_map) const = 0;
     virtual ~SelectLocationPolicy() = default;
@@ -19,7 +24,9 @@ public:
 
 class WeightSLPolicy : public SelectLocationPolicy {
 public:
-    CacheLocation *SelectForMatch(CacheLocationMap &location_map) const override;
+    CacheLocation *SelectForMatch(CacheLocationMap &location_map,
+                                  CheckLocDataExistFunc check_loc_data_exist,
+                                  std::vector<std::string> &out_prune_loc_ids) const override;
     bool ExistsForWrite(const CacheLocationMap &location_map) const override;
 
 protected:

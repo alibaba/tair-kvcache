@@ -29,13 +29,18 @@ public:
         return {spec};
     }
 };
+
+CheckLocDataExistFunc dummy_check_loc_data_exist = [](const CacheLocation &) -> bool { return true; };
+SubmitDelReqFunc dummy_submit_del_req = [](const std::vector<std::int64_t> &,
+                                           const std::vector<std::vector<std::string>> &) -> void {};
 } // namespace
 
 class MetaSearcherTest : public TESTBASE {
 public:
     void SetUp() override {
         meta_indexer_ = CreateMetaIndexer();
-        meta_searcher_ = std::make_shared<MetaSearcher>(meta_indexer_);
+        meta_searcher_ =
+            std::make_shared<MetaSearcher>(meta_indexer_, dummy_check_loc_data_exist, dummy_submit_del_req);
         request_context_ = std::make_shared<RequestContext>("test_trace_id");
     }
 

@@ -49,6 +49,13 @@ public:
     virtual std::vector<ErrorCode>
     Delete(const std::vector<DataStorageUri> &storage_uris, const std::string &trace_id, std::function<void()> cb) = 0;
     virtual std::vector<bool> Exist(const std::vector<DataStorageUri> &storage_uris) = 0;
+    virtual std::vector<bool> MightExist(const std::vector<DataStorageUri> &storage_uris) {
+        // a low-latency version of Exist()
+        // implementation is required to return ASAP;
+        // or it should rather return false-positive result, e.g.,
+        // all true if low-latency can not be guaranteed
+        return std::vector<bool>(storage_uris.size(), true);
+    }
     virtual std::vector<ErrorCode> Lock(const std::vector<DataStorageUri> &storage_uris) = 0;
     virtual std::vector<ErrorCode> UnLock(const std::vector<DataStorageUri> &storage_uris) = 0;
 

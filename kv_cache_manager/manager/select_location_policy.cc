@@ -1,18 +1,26 @@
 #include "select_location_policy.h"
 
 #include <random>
+#include <string>
 #include <vector>
 
 namespace kv_cache_manager {
 
-CacheLocation *WeightSLPolicy::SelectForMatch(CacheLocationMap &location_map) const {
+CacheLocation *WeightSLPolicy::SelectForMatch(CacheLocationMap &location_map,
+                                              CheckLocDataExistFunc check_loc_data_exist,
+                                              std::vector<std::string> &out_prune_loc_ids) const {
     thread_local std::mt19937 rng(std::random_device{}());
     std::vector<CacheLocation *> serving_locations;
     std::vector<uint32_t> weights;
     serving_locations.reserve(location_map.size());
     weights.reserve(location_map.size());
+    out_prune_loc_ids.clear();
     for (auto &kv : location_map) {
         if (kv.second.status() == CacheLocationStatus::CLS_SERVING) {
+            if (check_loc_data_exist && !check_loc_data_exist(kv.second)) {
+                out_prune_loc_ids.emplace_back(kv.first);
+                continue;
+            }
             if (int32_t weight = GetWeight(kv); weight > 0) {
                 serving_locations.push_back(&kv.second);
                 weights.push_back(weight);

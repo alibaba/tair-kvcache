@@ -16,10 +16,10 @@
 
 namespace kv_cache_manager {
 
-#define DEFINE_METRICS_NAME_FOR_SCHEDULE_PLAN_EXECUTOR(name) \
+#define DEFINE_METRICS_NAME_FOR_SCHEDULE_PLAN_EXECUTOR(name)                                                           \
     DEFINE_METRICS_NAME_(SchedulePlanExecutor, schedule_plan_executor, name)
 
-#define REGISTER_METRICS_FOR_SCHEDULE_PLAN_EXECUTOR(name) \
+#define REGISTER_METRICS_FOR_SCHEDULE_PLAN_EXECUTOR(name)                                                              \
     REGISTER_METRICS_COUNTER_(metrics_registry_, schedule_plan_executor, name)
 
 namespace {
@@ -449,6 +449,14 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::Submit(const CacheLocationD
     }
 
     return future;
+}
+
+bool SchedulePlanExecutor::SubmitNonBlocking(const CacheMetaDelRequest &req) {
+    return SubmitRaw([this, req]() { Submit(req); }, std::chrono::microseconds{0});
+}
+
+bool SchedulePlanExecutor::SubmitNonBlocking(const CacheLocationDelRequest &req) {
+    return SubmitRaw([this, req]() { Submit(req); }, std::chrono::microseconds{0});
 }
 
 } // namespace kv_cache_manager

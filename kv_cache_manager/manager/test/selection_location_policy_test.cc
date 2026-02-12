@@ -11,6 +11,9 @@ using namespace kv_cache_manager;
 #define D_MEMPOOL DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL
 #define D_UNKNOWN DataStorageType::DATA_STORAGE_TYPE_UNKNOWN
 
+static CheckLocDataExistFunc dummy_check_loc_data_exist = [](const CacheLocation &) -> bool { return true; };
+static std::vector<std::string> dummy_loc_ids;
+
 class SelectLocationPolicyTest : public TESTBASE {
 public:
     struct FakeLocationMeta {
@@ -47,7 +50,7 @@ TEST_F(SelectLocationPolicyTest, TestStaticWeightSLPolicySelectForMatch) {
         auto location_map = GenLocationMap(
             {{CLS_SERVING, D_MEMPOOL, "pace_01"}, {CLS_SERVING, D_3FS, "3fs_01"}, {CLS_SERVING, D_NFS, "nfs_01"}});
         for (int i = 0; i < 100; ++i) {
-            CacheLocation *location = policy.SelectForMatch(location_map);
+            CacheLocation *location = policy.SelectForMatch(location_map, dummy_check_loc_data_exist, dummy_loc_ids);
             ASSERT_THAT(location->type(), AnyOf(D_MEMPOOL, D_3FS, D_NFS));
         }
     }
@@ -55,7 +58,7 @@ TEST_F(SelectLocationPolicyTest, TestStaticWeightSLPolicySelectForMatch) {
         auto location_map = GenLocationMap(
             {{CLS_WRITING, D_MEMPOOL, "pace_01"}, {CLS_SERVING, D_3FS, "3fs_01"}, {CLS_SERVING, D_NFS, "nfs_01"}});
         for (int i = 0; i < 100; ++i) {
-            CacheLocation *location = policy.SelectForMatch(location_map);
+            CacheLocation *location = policy.SelectForMatch(location_map, dummy_check_loc_data_exist, dummy_loc_ids);
             ASSERT_THAT(location->type(), AnyOf(D_3FS, D_NFS));
         }
     }
@@ -65,7 +68,7 @@ TEST_F(SelectLocationPolicyTest, TestStaticWeightSLPolicySelectForMatch) {
                                             {CLS_SERVING, D_3FS, "3fs_02"},
                                             {CLS_SERVING, D_NFS, "nfs_01"}});
         for (int i = 0; i < 100; ++i) {
-            CacheLocation *location = policy.SelectForMatch(location_map);
+            CacheLocation *location = policy.SelectForMatch(location_map, dummy_check_loc_data_exist, dummy_loc_ids);
             ASSERT_THAT(location->type(), AnyOf(D_3FS, D_NFS));
             ASSERT_THAT(location->location_specs().front().uri(),
                         AnyOf(HasSubstr("3fs_01"), HasSubstr("3fs_02"), HasSubstr("nfs_01")));
@@ -112,7 +115,7 @@ TEST_F(SelectLocationPolicyTest, TestDynamicWeightSLPolicySelectForMatch) {
         auto location_map = GenLocationMap(
             {{CLS_SERVING, D_MEMPOOL, "pace_01"}, {CLS_SERVING, D_3FS, "3fs_01"}, {CLS_SERVING, D_NFS, "nfs_01"}});
         for (int i = 0; i < 100; ++i) {
-            CacheLocation *location = policy.SelectForMatch(location_map);
+            CacheLocation *location = policy.SelectForMatch(location_map, dummy_check_loc_data_exist, dummy_loc_ids);
             ASSERT_THAT(location->type(), AnyOf(D_MEMPOOL, D_3FS));
         }
     }
@@ -122,7 +125,7 @@ TEST_F(SelectLocationPolicyTest, TestDynamicWeightSLPolicySelectForMatch) {
                                             {CLS_SERVING, D_MOONCAKE, "mooncake_01"},
                                             {CLS_SERVING, D_NFS, "nfs_01"}});
         for (int i = 0; i < 100; ++i) {
-            CacheLocation *location = policy.SelectForMatch(location_map);
+            CacheLocation *location = policy.SelectForMatch(location_map, dummy_check_loc_data_exist, dummy_loc_ids);
             ASSERT_THAT(location->type(), AnyOf(D_3FS, D_MOONCAKE));
         }
     }
@@ -134,7 +137,7 @@ TEST_F(SelectLocationPolicyTest, TestDynamicWeightSLPolicySelectForMatch) {
                                             {CLS_SERVING, D_NFS, "nfs_01"},
                                             {CLS_SERVING, D_NFS, "nfs_02"}});
         for (int i = 0; i < 100; ++i) {
-            CacheLocation *location = policy.SelectForMatch(location_map);
+            CacheLocation *location = policy.SelectForMatch(location_map, dummy_check_loc_data_exist, dummy_loc_ids);
             ASSERT_THAT(location->type(), AnyOf(D_3FS, D_MOONCAKE));
             ASSERT_THAT(location->location_specs().front().uri(),
                         AnyOf(HasSubstr("3fs_01"), HasSubstr("mooncake_01"), HasSubstr("mooncake_02")));
@@ -184,7 +187,7 @@ TEST_F(SelectLocationPolicyTest, TestNamedStorageWeightedSLPolicySelectForMatch)
         auto location_map = GenLocationMap(
             {{CLS_SERVING, D_MEMPOOL, "pace_01"}, {CLS_SERVING, D_3FS, "3fs_01"}, {CLS_SERVING, D_NFS, "nfs_01"}});
         for (int i = 0; i < 100; ++i) {
-            CacheLocation *location = policy.SelectForMatch(location_map);
+            CacheLocation *location = policy.SelectForMatch(location_map, dummy_check_loc_data_exist, dummy_loc_ids);
             ASSERT_THAT(location->type(), AnyOf(D_MEMPOOL, D_3FS, D_NFS));
             ASSERT_THAT(location->location_specs().front().uri(),
                         AnyOf(HasSubstr("pace_01"), HasSubstr("3fs_01"), HasSubstr("nfs_01")));
@@ -194,7 +197,7 @@ TEST_F(SelectLocationPolicyTest, TestNamedStorageWeightedSLPolicySelectForMatch)
         auto location_map = GenLocationMap(
             {{CLS_WRITING, D_MEMPOOL, "pace_01"}, {CLS_SERVING, D_3FS, "3fs_01"}, {CLS_SERVING, D_NFS, "nfs_01"}});
         for (int i = 0; i < 100; ++i) {
-            CacheLocation *location = policy.SelectForMatch(location_map);
+            CacheLocation *location = policy.SelectForMatch(location_map, dummy_check_loc_data_exist, dummy_loc_ids);
             ASSERT_THAT(location->type(), AnyOf(D_3FS, D_NFS));
             ASSERT_THAT(location->location_specs().front().uri(), AnyOf(HasSubstr("3fs_01"), HasSubstr("nfs_01")));
         }
@@ -205,7 +208,7 @@ TEST_F(SelectLocationPolicyTest, TestNamedStorageWeightedSLPolicySelectForMatch)
                                             {CLS_SERVING, D_3FS, "3fs_02"},
                                             {CLS_SERVING, D_NFS, "nfs_01"}});
         for (int i = 0; i < 100; ++i) {
-            CacheLocation *location = policy.SelectForMatch(location_map);
+            CacheLocation *location = policy.SelectForMatch(location_map, dummy_check_loc_data_exist, dummy_loc_ids);
             ASSERT_THAT(location->type(), AnyOf(D_3FS, D_NFS));
             ASSERT_THAT(location->location_specs().front().uri(), AnyOf(HasSubstr("3fs_01"), HasSubstr("nfs_01")));
         }

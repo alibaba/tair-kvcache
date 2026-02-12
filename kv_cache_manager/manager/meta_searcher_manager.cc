@@ -18,7 +18,9 @@ MetaSearcherManager::MetaSearcherManager(std::shared_ptr<RegistryManager> regist
 MetaSearcherManager::~MetaSearcherManager() = default;
 
 MetaSearcher *MetaSearcherManager::TryCreateMetaSearcher(RequestContext *request_context,
-                                                         const std::string &instance_id) {
+                                                         const std::string &instance_id,
+                                                         CheckLocDataExistFunc check_loc_data_exist,
+                                                         SubmitDelReqFunc submit_del_req) {
     MetaSearcher *meta_searcher = GetMetaSearcher(instance_id);
     if (meta_searcher) {
         return meta_searcher;
@@ -47,7 +49,9 @@ MetaSearcher *MetaSearcherManager::TryCreateMetaSearcher(RequestContext *request
         ec = meta_indexer_manager_->CreateMetaIndexer(instance_id, cache_config->meta_indexer_config());
         if (ec == ErrorCode::EC_OK) {
             if (auto pair = meta_searcher_map_.emplace(
-                    instance_id, std::make_unique<MetaSearcher>(meta_indexer_manager_->GetMetaIndexer(instance_id)));
+                    instance_id,
+                    std::make_unique<MetaSearcher>(
+                        meta_indexer_manager_->GetMetaIndexer(instance_id), check_loc_data_exist, submit_del_req));
                 pair.second) {
                 return pair.first->second.get();
             }

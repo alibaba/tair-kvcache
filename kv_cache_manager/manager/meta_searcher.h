@@ -10,6 +10,10 @@
 #include "kv_cache_manager/manager/select_location_policy.h"
 
 namespace kv_cache_manager {
+
+using SubmitDelReqFunc = std::function<void(const std::vector<std::int64_t> &blk_keys,
+                                            const std::vector<std::vector<std::string>> &loc_ids)>;
+
 class MetaIndexer;
 
 class MetaSearcher {
@@ -21,6 +25,9 @@ public:
     static const std::string PROPERTY_PREV_BLOCK_KEY;
 
     explicit MetaSearcher(const std::shared_ptr<MetaIndexer> &meta_manager);
+    MetaSearcher(const std::shared_ptr<MetaIndexer> &meta_indexer,
+                 CheckLocDataExistFunc check_loc_data_exist,
+                 SubmitDelReqFunc submit_del_req);
     ~MetaSearcher();
 
     static std::string BatchErrorCodeToStr(const std::vector<std::vector<ErrorCode>> &batch_results);
@@ -96,6 +103,8 @@ private:
                                           SelectLocationPolicy *policy) const;
 
     std::shared_ptr<MetaIndexer> meta_indexer_;
+    CheckLocDataExistFunc check_loc_data_exist_func_;
+    SubmitDelReqFunc submit_del_req_func_;
 };
 
 } // namespace kv_cache_manager

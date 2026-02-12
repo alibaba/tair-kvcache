@@ -46,7 +46,8 @@ public:
                                   const std::string &unique_name,
                                   const std::vector<DataStorageUri> &storage_uris,
                                   std::function<void()> cb);
-    std::vector<bool> Exist(const std::string &unique_name, const std::vector<DataStorageUri> &storage_uris);
+    std::vector<bool>
+    Exist(const std::string &unique_name, const std::vector<DataStorageUri> &storage_uris, bool fastpath = false);
     std::vector<ErrorCode> Lock(const std::string &unique_name, const std::vector<DataStorageUri> &storage_uris);
     std::vector<ErrorCode> UnLock(const std::string &unique_name, const std::vector<DataStorageUri> &storage_uris);
 

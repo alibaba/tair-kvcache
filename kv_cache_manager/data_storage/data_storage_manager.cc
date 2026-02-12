@@ -225,7 +225,8 @@ std::vector<ErrorCode> DataStorageManager::Delete(RequestContext *request_contex
 }
 
 std::vector<bool> DataStorageManager::Exist(const std::string &unique_name,
-                                            const std::vector<DataStorageUri> &storage_uris) {
+                                            const std::vector<DataStorageUri> &storage_uris,
+                                            bool fastpath) {
     std::shared_lock<std::shared_mutex> lock(rw_lock_);
     auto iter = storage_map_.find(unique_name);
     if (iter == storage_map_.end()) {
@@ -233,7 +234,7 @@ std::vector<bool> DataStorageManager::Exist(const std::string &unique_name,
         return {};
     }
     auto storage_backend = iter->second;
-    return storage_backend->Exist(storage_uris);
+    return fastpath ? storage_backend->MightExist(storage_uris) : storage_backend->Exist(storage_uris);
 }
 
 std::vector<ErrorCode> DataStorageManager::Lock(const std::string &unique_name,

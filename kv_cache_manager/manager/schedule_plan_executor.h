@@ -73,6 +73,9 @@ public:
     std::future<PlanExecuteResult> Submit(const CacheMetaDelRequest &task);
     std::future<PlanExecuteResult> Submit(const CacheLocationDelRequest &task);
 
+    bool SubmitNonBlocking(const CacheMetaDelRequest &req);
+    bool SubmitNonBlocking(const CacheLocationDelRequest &req);
+
 private:
     std::shared_ptr<MetaIndexerManager> meta_manager_;
     std::shared_ptr<DataStorageManager> data_storage_manager_;

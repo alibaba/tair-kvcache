@@ -47,6 +47,13 @@ bool safe_fetch_sub(std::atomic<std::uint64_t> &atom, const std::uint64_t sub_va
 
 MetaSearcher::MetaSearcher(const std::shared_ptr<MetaIndexer> &meta_indexer) : meta_indexer_(meta_indexer) {}
 
+MetaSearcher::MetaSearcher(const std::shared_ptr<MetaIndexer> &meta_indexer,
+                           CheckLocDataExistFunc check_loc_data_exist,
+                           SubmitDelReqFunc submit_del_req)
+    : meta_indexer_(meta_indexer)
+    , check_loc_data_exist_func_(check_loc_data_exist)
+    , submit_del_req_func_(submit_del_req) {}
+
 MetaSearcher::~MetaSearcher() = default;
 
 std::string MetaSearcher::BatchErrorCodeToStr(const std::vector<std::vector<ErrorCode>> &batch_results) {
@@ -84,6 +91,8 @@ ErrorCode MetaSearcher::PrefixMatchBestLocationImpl(RequestContext *request_cont
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerGet);
     int64_t index_deserialize_time_us = 0;
 
+    KeyVector prune_keys;
+    std::vector<std::vector<std::string>> prune_loc_ids_vec;
     for (size_t i = 0; i < keys.size(); ++i) {
         if (result.error_codes[i] != ErrorCode::EC_OK) {
             KVCM_LOG_DEBUG("prefix match end because Get keys[%lu](%lu) return %d", i, keys[i], result.error_codes[i]);
@@ -103,7 +112,13 @@ ErrorCode MetaSearcher::PrefixMatchBestLocationImpl(RequestContext *request_cont
             KVCM_LOG_DEBUG("prefix match end because keys[%lu](%lu) no location", i, keys[i]);
             break;
         }
-        const CacheLocation *best_location = policy->SelectForMatch(location_map);
+        std::vector<std::string> prune_loc_ids;
+        const CacheLocation *best_location =
+            policy->SelectForMatch(location_map, check_loc_data_exist_func_, prune_loc_ids);
+        if (!prune_loc_ids.empty()) {
+            prune_keys.emplace_back(keys[i]);
+            prune_loc_ids_vec.emplace_back(prune_loc_ids);
+        }
         if (best_location == nullptr) {
             KVCM_LOG_DEBUG("prefix match end because keys[%lu] no serving location", i);
             break;
@@ -113,6 +128,10 @@ ErrorCode MetaSearcher::PrefixMatchBestLocationImpl(RequestContext *request_cont
 
     KVCM_METRICS_COLLECTOR_SET_METRICS(
         service_metrics_collector, meta_searcher, index_deserialize_time_us, index_deserialize_time_us);
+
+    if (!prune_keys.empty() && submit_del_req_func_) {
+        submit_del_req_func_(prune_keys, prune_loc_ids_vec);
+    }
 
     return EC_OK;
 }
@@ -158,6 +177,8 @@ ErrorCode MetaSearcher::BatchGetBestLocation(RequestContext *request_context,
     auto result = meta_indexer_->Get(request_context, keys, uris);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerGet);
     int64_t index_deserialize_time_us = 0;
+    KeyVector prune_keys;
+    std::vector<std::vector<std::string>> prune_loc_ids_vec;
     for (size_t i = 0; i < keys.size(); ++i) {
         if (result.error_codes[i] == ErrorCode::EC_NOENT) {
             out_locations.push_back({});
@@ -181,7 +202,13 @@ ErrorCode MetaSearcher::BatchGetBestLocation(RequestContext *request_context,
             out_locations.push_back({});
             continue;
         }
-        const CacheLocation *best_location = policy->SelectForMatch(location_map);
+        std::vector<std::string> prune_loc_ids;
+        const CacheLocation *best_location =
+            policy->SelectForMatch(location_map, check_loc_data_exist_func_, prune_loc_ids);
+        if (!prune_loc_ids.empty()) {
+            prune_keys.emplace_back(keys[i]);
+            prune_loc_ids_vec.emplace_back(prune_loc_ids);
+        }
         if (best_location == nullptr) {
             out_locations.push_back({});
             continue;
@@ -190,6 +217,11 @@ ErrorCode MetaSearcher::BatchGetBestLocation(RequestContext *request_context,
     }
     KVCM_METRICS_COLLECTOR_SET_METRICS(
         service_metrics_collector, meta_searcher, index_deserialize_time_us, index_deserialize_time_us);
+
+    if (!prune_keys.empty() && submit_del_req_func_) {
+        submit_del_req_func_(prune_keys, prune_loc_ids_vec);
+    }
+
     return out_locations.size() == keys.size() ? EC_OK : EC_ERROR;
 }
 
@@ -215,6 +247,8 @@ ErrorCode MetaSearcher::ReverseRollSlideWindowMatch(RequestContext *request_cont
     bool is_match = false;
     std::vector<CacheLocation> temp_sw_locations;
     temp_sw_locations.reserve(sw_size);
+    KeyVector prune_keys;
+    std::vector<std::vector<std::string>> prune_loc_ids_vec;
     for (int base = keys.size() - sw_size; base >= 0;) {
         for (int offset = 0; offset < sw_size; ++offset) {
             if (result.error_codes[base + offset] != ErrorCode::EC_OK) {
@@ -245,7 +279,13 @@ ErrorCode MetaSearcher::ReverseRollSlideWindowMatch(RequestContext *request_cont
                 is_match = false;
                 break;
             }
-            CacheLocation *best_location = policy->SelectForMatch(location_map);
+            std::vector<std::string> prune_loc_ids;
+            CacheLocation *best_location =
+                policy->SelectForMatch(location_map, check_loc_data_exist_func_, prune_loc_ids);
+            if (!prune_loc_ids.empty()) {
+                prune_keys.emplace_back(keys[base + offset]);
+                prune_loc_ids_vec.emplace_back(prune_loc_ids);
+            }
             if (best_location == nullptr) {
                 temp_sw_locations.clear();
                 base -= sw_size - offset;
@@ -261,6 +301,11 @@ ErrorCode MetaSearcher::ReverseRollSlideWindowMatch(RequestContext *request_cont
     }
     KVCM_METRICS_COLLECTOR_SET_METRICS(
         service_metrics_collector, meta_searcher, index_deserialize_time_us, index_deserialize_time_us);
+
+    if (!prune_keys.empty() && submit_del_req_func_) {
+        submit_del_req_func_(prune_keys, prune_loc_ids_vec);
+    }
+
     return EC_OK;
 }
 

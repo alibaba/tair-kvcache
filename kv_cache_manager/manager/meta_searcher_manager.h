@@ -17,7 +17,10 @@ public:
     MetaSearcherManager(std::shared_ptr<RegistryManager> registry_manager,
                         std::shared_ptr<MetaIndexerManager> meta_indexer_manager);
     ~MetaSearcherManager();
-    MetaSearcher *TryCreateMetaSearcher(RequestContext *request_context, const std::string &instance_id);
+    MetaSearcher *TryCreateMetaSearcher(RequestContext *request_context,
+                                        const std::string &instance_id,
+                                        CheckLocDataExistFunc check_loc_data_exist,
+                                        SubmitDelReqFunc submit_del_req);
     MetaSearcher *GetMetaSearcher(const std::string &instance_id) const;
     void DoCleanup();
 
