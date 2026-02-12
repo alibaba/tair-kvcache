@@ -30,12 +30,18 @@ def http_deps():
         urls = ["https://github.com/bazelbuild/rules_closure.git"],
     )
 
-    # 3fs
-    # TODO: provide a document about building this rpm
+    # hf3fs
+    # https://github.com/alibaba/tair-kvcache/releases/tag/__binary-dependency-0.0.2
+    # .github/workflows/build-hf3fs-usrbio-rpm.yml
     http_file(
-        name = "hf3fs_rpm",
-        urls = ["https://github.com/alibaba/tair-kvcache/releases/download/__binary-dependency-0.0.1/pkg_3fs_hf3fs-1.2.0-1.alios7.x86_64.rpm"],
-        sha256 = "d5c9ce8474f6bf2177c11c4dc36acf633b5d4763353cd70156b0a0b2d54b8316",
+        name = "hf3fs_rpm_aarch64",
+        urls = ["https://github.com/alibaba/tair-kvcache/releases/download/__binary-dependency-0.0.2/libhf3fs_api_shared-1.2.1-1.aarch64.rpm"],
+        sha256 = "94c10e4aa3916600b6e2fcb531f137a53ecc38bf7e19662ce09b6bec16ee7462",
+    )
+    http_file(
+        name = "hf3fs_rpm_x86_64",
+        urls = ["https://github.com/alibaba/tair-kvcache/releases/download/__binary-dependency-0.0.2/libhf3fs_api_shared-1.2.1-1.x86_64.rpm"],
+        sha256 = "48e0b91a8851b1b86d779c6c52dc7336bcc902795ac77558941ba1ba09321e50",
     )
 
     # mooncake
@@ -113,17 +119,31 @@ def http_deps():
 
     # numa
     http_file(
-        name = "numactl-libs_rpm",
+        name = "numactl-libs_rpm_x86_64",
         sha256 = "78c84113dcdca65722d33fd53ddf80289ca6768262e61e228ed093425164c135",
         urls = [
             "https://mirrors.aliyun.com/alinux/2.1903/os/x86_64/Packages/numactl-libs-2.0.9-7.1.al7.x86_64.rpm",
         ],
     )
     http_file(
-        name = "numactl-devel_rpm",
+        name = "numactl-devel_rpm_x86_64",
         sha256 = "129093692024261b099092600d35b48ee10ad56dd8d940102b370a59ee80055d",
         urls = [
             "https://mirrors.aliyun.com/alinux/2.1903/os/x86_64/Packages/numactl-devel-2.0.9-7.1.al7.x86_64.rpm",
+        ],
+    )
+    http_file(
+        name = "numactl-libs_rpm_aarch64",
+        sha256 = "7128e98667be7c74353034a9f3e0ea2c49334a1b9633be068c227d281e9b7b35",
+        urls = [
+            "https://mirrors.aliyun.com/alinux/2.1903/os/aarch64/Packages/numactl-libs-2.0.12-3.1.al7.aarch64.rpm",
+        ],
+    )
+    http_file(
+        name = "numactl-devel_rpm_aarch64",
+        sha256 = "5cc78943b328ec96f4e334733f4e783a86b134cb954ce7ebdf129958c3e3be03",
+        urls = [
+            "https://mirrors.aliyun.com/alinux/2.1903/os/aarch64/Packages/numactl-devel-2.0.12-3.1.al7.aarch64.rpm",
         ],
     )
 
