@@ -422,6 +422,19 @@ python trace_converter.py \
 - `qwen_bailian`: Qwen Bailian开源数据集
 - `text`: 文本对话 (需要指定--tokenizer-path)
 
+**自动发现 Converter**:
+
+系统会自动扫描并发现所有可用的 converter：
+
+```bash
+# 使用内置 converter
+python3 trace_converter.py -i input.jsonl -o output.jsonl -f qwen_bailian
+
+# 使用自定义 converter
+python3 trace_converter.py -i input.jsonl -o output.jsonl -f custom \
+    --converter-module /path/to/custom_converter.py
+```
+
 详见: [Trace Converter文档](tools/trace_converter/README.md)
 
 ---
@@ -482,7 +495,7 @@ bazel run //kv_cache_manager/optimizer:optimizer_main -- /path/to/config.json
 
 如果需要支持新的 trace 格式,在Python工具中添加新的converter:
 
-1. **创建Converter类**: 在 `tools/trace_converter/converters/` 创建新文件
+1. **创建Converter类**: 在任意目录创建新文件
    ```python
    from converters.base import BaseConverter
    
@@ -492,12 +505,23 @@ bazel run //kv_cache_manager/optimizer:optimizer_main -- /path/to/config.json
            pass
    ```
 
-2. **注册Converter**: 在 `trace_converter.py` 中添加新的格式选项
-
-3. **使用**: 
+2. **使用 - 方式1 (自动扫描目录)**:
    ```bash
-   python trace_converter.py -i input.log -o output.jsonl -f my_custom
+   # 将converter文件放到指定目录，自动发现所有继承BaseConverter的类
+   python trace_converter.py -i input.log -o output.jsonl -f my_custom \
+       --converter-dir /path/to/your/converters
    ```
+
+3. **使用 - 方式2 (显式注册文件)**:
+   ```bash
+   # 直接指定converter文件和类名
+   python trace_converter.py -i input.log -o output.jsonl -f my_custom \
+       --converter-module /path/to/my_custom_converter.py:MyCustomConverter
+   ```
+
+**无需修改 `trace_converter.py` 源码** Converter会根据类名自动推断format名称：
+- `MyCustomConverter` → `my_custom`
+- `QwenBailianConverter` → `qwen_bailian`
 
 ---
 

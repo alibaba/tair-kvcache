@@ -2,6 +2,26 @@
 
 将各种trace格式转换为Optimizer标准的Get+Write格式或推理引擎的DialogTurn格式。
 
+## ✨ 特性
+
+### 自动发现 Converter
+
+系统会自动扫描并发现所有可用的 converter：
+- **内置 converter**: `converters/` 目录下的标准格式
+- **自动发现**: 通过路径推断自动加载额外的 converter
+- **用户扩展**: 支持通过参数添加自定义 converter
+
+```bash
+# 使用内置 converter
+python3 trace_converter.py -i input.jsonl -o output.jsonl -f qwen_bailian
+
+# 使用自定义 converter
+python3 trace_converter.py -i input.jsonl -o output.jsonl -f custom \
+    --converter-module /path/to/custom_converter.py
+```
+
+---
+
 ## 安装
 
 ```bash
@@ -427,21 +447,93 @@ for hash_id in hash_ids:
 - 如果T或T+1已被使用,自动递增直到找到可用时间戳
 - 确保所有trace的时间戳唯一且有序
 
-## 开发
+## 扩展：添加自定义 Converter
 
-### 添加新的Converter
+### 步骤1: 创建 Converter 类
 
-1. 在`converters/`目录创建新文件
-2. 继承`BaseConverter`类
-3. 实现`convert()`方法
-4. 在`trace_converter.py`中注册
+创建一个继承 `BaseConverter` 的类：
 
-示例:
 ```python
+# my_converter.py
 from converters.base import BaseConverter
+import json
 
-class MyCustomConverter(BaseConverter):
+class MyConverter(BaseConverter):
+    """自定义格式转换器"""
+    
+    def __init__(self, default_instance_id='instance',
+                 instance_block_sizes=None, mode='optimizer', **kwargs):
+        super().__init__(default_instance_id, instance_block_sizes, mode)
+    
     def convert(self, input_file: str, output_file: str) -> int:
-        # 实现转换逻辑
+        """转换逻辑实现"""
         pass
 ```
+
+**命名约定**：
+- 类名以 `Converter` 结尾
+- 系统自动推断 format 名称：`MyConverter` → `my`
+
+### 步骤2: 使用自定义 Converter
+
+```bash
+# 方式A: 显式注册文件
+python3 trace_converter.py -i input.jsonl -o output.jsonl -f my \
+    --converter-module /path/to/my_converter.py
+
+# 方式B: 扫描目录
+python3 trace_converter.py -i input.jsonl -o output.jsonl -f my \
+    --converter-dir /path/to/converters_dir
+
+# 方式C: 放到 converters/ 目录（自动发现）
+cp my_converter.py converters/
+python3 trace_converter.py -i input.jsonl -o output.jsonl -f my
+```
+
+### BaseConverter 提供的辅助方法
+
+```python
+# 创建 Get trace
+self._create_get_trace(
+    timestamp_us=timestamp_us,
+    keys=block_keys,
+    instance_id=instance_id,
+    tokens=token_ids  # 可选
+)
+
+# 创建 Write trace
+self._create_write_trace(
+    timestamp_us=timestamp_us,
+    keys=block_keys,
+    instance_id=instance_id,
+    tokens=token_ids  # 可选
+)
+
+# 创建 DialogTurn trace
+self._create_dialog_trace(
+    timestamp_us=timestamp_us,
+    keys=prefill_keys,
+    input_len=input_token_count,
+    output_len=output_token_count,
+    total_keys=all_keys,
+    instance_id=instance_id,
+    tokens=token_ids  # 可选
+)
+
+# 获取 instance 的 block_size
+block_size = self.get_block_size(instance_id)
+```
+
+### 完整示例
+
+查看现有 converter 的实现：
+- `converters/publisher_log.py` - 日志解析示例
+- `converters/qwen_bailian.py` - 简单数据集转换
+- `converters/text_trace.py` - 复杂的 tokenization 处理
+
+---
+
+## 相关文档
+
+- [Optimizer README](../../README.md) - Optimizer主文档
+- [BaseConverter API](converters/base.py) - 基类接口说明
