@@ -79,8 +79,8 @@ build --copt -Wno-format-overflow # cm2
 build --copt -Wno-nonnull # mooncake gcc11
 build --copt -Wno-array-parameter # BoringSSL gcc11
 build --copt -Wno-unused-result # grpc gcc11
-build --copt="-mno-avx512f"
-build --copt="-mrdrnd"
+# build --copt="-mno-avx512f"
+# build --copt="-mrdrnd"
 build --cxxopt -Wno-class-memaccess # grpc
 build --copt -Wno-deprecated-declarations
 build --experimental_cc_implementation_deps

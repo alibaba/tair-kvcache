@@ -8,18 +8,39 @@ on:
     branches: [ "main" ]
   workflow_dispatch:
     inputs:
+      runs-on:
+        description: "Runner type"
+        type: choice
+        options:
+          - ubuntu-24.04-arm
+          - ubuntu-latest
+        default: ubuntu-latest
       rebuildDiskCache:
         description: "Rebuild disk cache"
         type: boolean
         default: false
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.runs-on || 'ubuntu-latest' }}
   cancel-in-progress: true
 jobs:
-  unit_test:
-    runs-on: ubuntu-latest
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: unit_test
+            test_target: "//kv_cache_manager/..."
+            test_args: ""
+          - name: integration_test
+            test_target: "//integration_test/..."
+            test_args: ""
+          - name: client_test
+            test_target: "//kv_cache_manager/client/..."
+            test_args: "--config=client"
+    name: ${{ matrix.name }}
+    runs-on: ${{ inputs.runs-on || 'ubuntu-latest' }}
     container:
-      image: ghcr.io/alibaba/tair-kvcache-kvcm-dev:2026_02_03_13_26_feea140
+      image: ghcr.io/alibaba/tair-kvcache-kvcm-dev:2026_02_13_12_03_24230b1
       volumes:
         - /:/host_root/
     steps:
@@ -38,81 +59,31 @@ jobs:
       - uses: bazel-contrib/setup-bazel@0.18.0
         with:
           bazelisk-cache: true
-          disk-cache: ${{ runner.os }}-${{ github.workflow }}-unit_test
+          disk-cache: ${{ runner.os }}-${{ github.workflow }}-${{ matrix.name }}
           repository-cache: true
-          cache-save: ${{ github.event_name != 'pull_request' }}
+          cache-save: ${{ inputs.rebuildDiskCache || false }}
       - name: clean_disk_cache
-        if: ${{ inputs.rebuildDiskCache }}
-        run: |
-          rm -rf ~/.cache/bazel-disk
-      - name: bazel_test
-        run:  |
-          set -x
-          set -e
-          bazelisk test //kv_cache_manager/... --cache_test_results=no --test_output=errors
-      - name: create_archive
-        if: failure()
-        run: |
-          set -x
-          set -e
-          test -a bazel-out.tar && rm -f bazel-out.tar
-          find bazel-out/k8-opt/bin/ '(' -name 'kv_cache_manager.log' -o -name 'access.log' -o -name 'metrics.log' -o -name 'stdout' -o -name 'stderr' ')' -a -exec 'tar' '-r' '-f' 'bazel-out.tar' '{}' ';'
-          find bazel-out/k8-opt/bin/ -name 'core-*' -a -type f -a -exec 'tar' '-r' '-f' 'bazel-out.tar' '{}' ';'
-          tar -r -f bazel-out.tar bazel-out/k8-opt/testlogs/
-          gzip -f bazel-out.tar
-      - uses: actions/upload-artifact@v6
-        if: failure()
-        with:
-          name: unit_test-bazel-out.tar.gz
-          path: ./bazel-out.tar.gz
-          overwrite: true
-  integration_test:
-    runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/alibaba/tair-kvcache-kvcm-dev:2026_02_03_13_26_feea140
-      volumes:
-        - /:/host_root/
-    steps:
-      # https://github.com/actions/runner-images/issues/2840
-      # https://github.com/korjavin/haskel-web1/commit/3bd3d2a74c41418ec31a8bec34dcd9c100f4e22d
-      - name: Free up disk space
-        run: |
-          echo "Disk space before cleanup:"
-          df -h
-          sudo rm -rf /host_root/usr/share/dotnet
-          sudo rm -rf /host_root/usr/local/lib/android
-          sudo rm -rf /host_root/opt/ghc
-          echo "Disk space after cleanup:"
-          df -h
-      - uses: actions/checkout@v4
-      - uses: bazel-contrib/setup-bazel@0.18.0
-        with:
-          bazelisk-cache: true
-          disk-cache: ${{ runner.os }}-${{ github.workflow }}-integration_test
-          repository-cache: true
-          cache-save: ${{ github.event_name != 'pull_request' }}
-      - name: clean_disk_cache
-        if: ${{ inputs.rebuildDiskCache }}
+        if: ${{ inputs.rebuildDiskCache || false }}
         run: |
           rm -rf ~/.cache/bazel-disk
       - name: bazel_test
         run: |
           set -x
           set -e
-          bazelisk test //integration_test/... --cache_test_results=no --test_output=errors
+          bazelisk test ${{ matrix.test_target }} ${{ matrix.test_args }} --cache_test_results=no --test_output=errors
       - name: create_archive
         if: failure()
         run: |
           set -x
           set -e
           test -a bazel-out.tar && rm -f bazel-out.tar
-          find bazel-out/k8-opt/bin/ '(' -name 'kv_cache_manager.log' -o -name 'access.log' -o -name 'metrics.log' -o -name 'stdout' -o -name 'stderr' ')' -a -exec 'tar' '-r' '-f' 'bazel-out.tar' '{}' ';'
-          find bazel-out/k8-opt/bin/ -name 'core-*' -a -type f -a -exec 'tar' '-r' '-f' 'bazel-out.tar' '{}' ';'
-          tar -r -f bazel-out.tar bazel-out/k8-opt/testlogs/
+          find bazel-out/*-opt/bin/ '(' -name 'kv_cache_manager.log' -o -name 'access.log' -o -name 'metrics.log' -o -name 'stdout' -o -name 'stderr' ')' -a -exec 'tar' '-r' '-f' 'bazel-out.tar' '{}' ';'
+          find bazel-out/*-opt/bin/ -name 'core-*' -a -type f -a -exec 'tar' '-r' '-f' 'bazel-out.tar' '{}' ';'
+          tar -r -f bazel-out.tar bazel-out/*-opt/testlogs/
           gzip -f bazel-out.tar
       - uses: actions/upload-artifact@v6
         if: failure()
         with:
-          name: integration_test-bazel-out.tar.gz
+          name: ${{ matrix.name }}-bazel-out.tar.gz
           path: ./bazel-out.tar.gz
           overwrite: true
