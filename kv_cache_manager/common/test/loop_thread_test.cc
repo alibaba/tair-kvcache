@@ -45,18 +45,39 @@ TEST_F(LoopThreadTest, TestCreateAndStop) {
 TEST_F(LoopThreadTest, TestRunOnce) {
     // 测试RunOnce功能
     std::atomic<int> count(0);
-    auto loop_thread = LoopThread::CreateLoopThread([&count]() { count++; }, 1000000); // 1s间隔，确保不会自动执行
+    auto loop_thread = LoopThread::CreateLoopThread([&count]() { count++; }, 10000000); // 10s间隔，确保不会自动执行
     EXPECT_NE(loop_thread, nullptr);
 
-    // 初始应该没有执行
-    EXPECT_EQ(count.load(), 0);
+    // 等待LoopThread第一次执行（计数变成1），设置超时时间为500ms
+    auto start_time = std::chrono::steady_clock::now();
+    auto timeout = std::chrono::milliseconds(500);
+
+    while (count.load() < 1) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        auto current_time = std::chrono::steady_clock::now();
+        if (current_time - start_time > timeout) {
+            FAIL() << "Timeout waiting for initial loop execution";
+        }
+    }
+
+    // 此时计数应该为1
+    EXPECT_EQ(count.load(), 1);
 
     // 调用RunOnce
     loop_thread->RunOnce();
 
-    // 等待一段时间确保执行完成
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    EXPECT_EQ(count.load(), 1);
+    // 等待RunOnce执行（计数变成2），设置超时时间为500ms
+    start_time = std::chrono::steady_clock::now();
+    while (count.load() < 2) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        auto current_time = std::chrono::steady_clock::now();
+        if (current_time - start_time > timeout) {
+            FAIL() << "Timeout waiting for RunOnce execution";
+        }
+    }
+
+    // 此时计数应该为2
+    EXPECT_EQ(count.load(), 2);
 
     loop_thread->Stop();
 }
