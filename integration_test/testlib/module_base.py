@@ -68,14 +68,15 @@ class ModuleBase(object):
 
     def _wait_exit(self, module_name, pid):
         while True:
-            if not self._get_pid(module_name, extra=['defunct', '%s' % pid]):
+            if not self._get_pid(module_name, extra='%s' % pid):
                 break
 
     @staticmethod
-    def _stop(pid=None):
+    def _stop(pid=None, force=False):
         if pid is None:
             return
-        os.kill(pid, signal.SIGTERM)
+        stop_signal = signal.SIGKILL if force else signal.SIGTERM
+        os.kill(pid, stop_signal)
 
     @staticmethod
     def _suspend(pid=None):
