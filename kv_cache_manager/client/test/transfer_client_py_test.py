@@ -45,8 +45,8 @@ class TransferClientPyTest(unittest.TestCase):
                 "queue_size": 1000,
                 "sdk_config": [],
                 "timeout_config": {{
-                    "get_timeout_ms": 5000,
-                    "put_timeout_ms": 10000
+                    "get_timeout_ms": 10000,
+                    "put_timeout_ms": 30000
                 }}
             }},
             "location_spec_infos": {{
