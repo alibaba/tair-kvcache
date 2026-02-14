@@ -30,14 +30,14 @@ class WorkerManager(ModuleBase):
             return True
         return False
 
-    def stop_worker(self, idx):
+    def stop_worker(self, idx, force=False):
         if self.pids[idx] is not None:
-            self.workers[idx].stop_worker(self.pids[idx])
+            self.workers[idx].stop_worker(self.pids[idx], force)
             self.pids[idx] = None
 
-    def stop_all(self):
+    def stop_all(self, force=False):
         for i in range(len(self.workers)):
-            self.stop_worker(i)
+            self.stop_worker(i, force)
 
     def suspend_worker(self, idx):
         self.suspend(self.pids[idx])

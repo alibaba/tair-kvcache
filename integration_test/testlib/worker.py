@@ -161,9 +161,9 @@ class Worker(ModuleBase):
     def get_work_dir(self):
         return self.env.workdir
 
-    def stop_worker(self, pid=None):
+    def stop_worker(self, pid=None, force=False):
         logging.info(f"stop worker {self.worker_id}, pid={pid}")
-        self._stop(pid)
+        self._stop(pid, force)
         self._wait_exit('kv_cache_manager_bin', pid)
 
     def get_pid(self):
