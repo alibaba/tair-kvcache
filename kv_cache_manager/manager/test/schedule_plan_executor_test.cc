@@ -287,10 +287,11 @@ TEST_F(SchedulePlanExecutorTest, TestMultipleLocationsPerBlockKey) {
     ASSERT_EQ(1, location_maps.size());    // 应该只有一个block_key
     ASSERT_EQ(3, location_maps[0].size()); // 但包含三个location
 
-    // 提交删除任务
+    // 提交删除任务，设置延迟确保在检查状态时任务还没开始执行
     CacheMetaDelRequest request{
         .instance_id = kTestInstanceName,
         .block_keys = {400},
+        .delay = std::chrono::milliseconds(1000),
     };
 
     // 提交任务
