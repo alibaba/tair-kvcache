@@ -621,8 +621,8 @@ class AdminServiceLeaderElectionTest(abc.ABC, TestBase, unittest.TestCase):
             non_leader_resp = non_leader_client.check_health(non_leader_req)
             self.assertFalse(non_leader_resp.get("is_leader"), f"Worker {non_leader_id} 不应该成为leader")
 
-            # 停止当前的leader worker
-            self.worker_manager.stop_worker(leader_id)
+            # kill掉当前的leader worker
+            self.worker_manager.stop_worker(leader_id, True)
             
             # 等待一段时间，让分布式锁检测到leader失效
             time.sleep(1)  # 等待足够时间让租约过期
