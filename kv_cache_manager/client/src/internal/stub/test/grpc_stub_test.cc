@@ -148,7 +148,7 @@ void GrpcStubTest::StartService(int port) {
 }
 
 void GrpcStubTest::InitStub() {
-    stub_ = std::make_shared<GrpcStub>();
+    stub_ = std::make_shared<GrpcStub>(1, 5000);
     ASSERT_EQ(ER_OK, stub_->AddConnection("0.0.0.0:" + std::to_string(port_), 1000));
     KVCM_LOG_INFO("stub connected");
 }
