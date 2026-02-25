@@ -1,0 +1,25 @@
+name: scheduled-cache-rebuild
+permissions:
+  actions: write
+  contents: read
+on:
+  schedule:
+    # Run at 6:00 AM Beijing Time (UTC+8) = 22:00 UTC (previous day)
+    - cron: '0 22 * * *'
+  # only for testing 
+  # pull_request:
+  #   branches: [ "main" ]
+  workflow_dispatch:
+jobs:
+  trigger-rebuild:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger test-opensrc workflow with cache rebuild
+        run: |
+          gh workflow run test-opensrc.yml \
+            --repo ${{ github.repository }} \
+            --ref main \
+            -f runs-on=ubuntu-latest \
+            -f rebuildDiskCache=true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
