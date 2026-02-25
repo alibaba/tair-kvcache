@@ -630,7 +630,7 @@ TEST_F(MetricsRegistryTest, TestMetricsRegistryGetMetricsData) {
 
 TEST_F(MetricsRegistryTest, TestMetricsRegistryMultiThreads) {
     std::thread t([this]() -> void {
-        for (int i = 0; i < 128; ++i) {
+        for (int i = 0; i < 1024; ++i) {
             auto c = registry_->GetCounter(std::string{"foo"}.append(std::to_string(i)));
             auto g = registry_->GetGauge(std::string{"bar"}.append(std::to_string(i)));
             ++c;
@@ -640,7 +640,7 @@ TEST_F(MetricsRegistryTest, TestMetricsRegistryMultiThreads) {
 
     std::vector<std::string> names;
     std::vector<MetricsRegistry::metrics_tuple_t> all_metrics;
-    while (registry_->GetSize() != 256) {
+    while (registry_->GetSize() != 2048) {
         registry_->GetNames(names);
         if (!names.empty()) {
             auto suffix = std::to_string((names.size() - 1) / 2);
@@ -648,8 +648,12 @@ TEST_F(MetricsRegistryTest, TestMetricsRegistryMultiThreads) {
                 // 1, 3, 5, 7, ...
                 auto d = registry_->GetMetricsData(std::string{"foo"}.append(suffix));
 
+                // GetCounter internally calls GetOrCreateMetricsData then GetOrCreateCounter
+                // under separate locks, so MetricsData may temporarily be empty; spin until ready.
                 auto metrics = d->GetMetricsValues();
-                ASSERT_FALSE(metrics.empty());
+                while (metrics.empty()) {
+                    metrics = d->GetMetricsValues();
+                }
 
                 Counter c;
                 ASSERT_NO_THROW(c = Counter{metrics.front().second});
@@ -668,8 +672,12 @@ TEST_F(MetricsRegistryTest, TestMetricsRegistryMultiThreads) {
                 // 2, 4, 6, 8, ...
                 auto d = registry_->GetMetricsData(std::string{"bar"}.append(suffix));
 
+                // GetGauge internally calls GetOrCreateMetricsData then GetOrCreateGauge
+                // under separate locks, so MetricsData may temporarily be empty; spin until ready.
                 auto metrics = d->GetMetricsValues();
-                ASSERT_FALSE(metrics.empty());
+                while (metrics.empty()) {
+                    metrics = d->GetMetricsValues();
+                }
 
                 Gauge g;
                 ASSERT_NO_THROW(g = Gauge{metrics.front().second});
