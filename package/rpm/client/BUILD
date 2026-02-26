@@ -9,7 +9,11 @@ pkg_rpm(
         ":rpm_client_include",
         ":rpm_client_lib",
     ],
-    architecture = "x86_64",
+    architecture = select({
+        "@platforms//cpu:aarch64": "aarch64",
+        "@platforms//cpu:x86_64": "x86_64",
+        "//conditions:default": "x86_64",
+    }),
     description = """Tair KVCache Manager Client Library provides C++ APIs for interacting with the Tair KVCache Manager service. This library allows applications to load and save KV caches from various storage backends. Key features: - Support for multiple storage backends (Hf3fs, Nfs, Local, Mooncake, TairMempool) - TransferClient API for loading and saving KV caches - MetaClient API for metadata operations - ManagerClient API for cluster management""",
     group = "Development/Libraries",
     license = "Alibaba",
