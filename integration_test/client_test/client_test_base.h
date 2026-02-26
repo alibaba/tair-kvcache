@@ -69,6 +69,9 @@ protected:
     "tp0": 1024,
     "tp1": 1024
 },
+"meta_channel_config": {
+    "call_timeout": 1000
+},
 "sdk_config": {},
 "model_deployment": {
     "model_name": "test_model",
