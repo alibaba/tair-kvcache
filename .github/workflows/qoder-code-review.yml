@@ -2,12 +2,13 @@ name: Qoder Auto Code Review
 
 on:
   pull_request:
-    types: [opened, reopened]
+    types: [opened, reopened, review_requested]
     branches: [ "main" ]
 
 jobs:
   qoder-review:
     runs-on: ubuntu-slim
+    if: ${{ github.event.action != 'review_requested' || github.event.requested_reviewer.login == 'qoderai[bot]' }}
     permissions:
       contents: read
       pull-requests: write
