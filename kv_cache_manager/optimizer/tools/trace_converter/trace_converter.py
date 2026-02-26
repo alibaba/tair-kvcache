@@ -13,6 +13,7 @@ Usage:
 import argparse
 import sys
 import os
+import json
 import importlib.util
 import inspect
 from pathlib import Path
@@ -201,7 +202,8 @@ def main():
         parents=[pre_parser]
     )
 
-    parser.add_argument('-i', '--input', required=True, help='Input trace file path')
+    parser.add_argument('-i', '--input', required=True, nargs='+',
+                        help='Input trace file path(s) (supports multiple files)')
     parser.add_argument('-o', '--output', default=None, 
                         help='Output file path (default: auto-generate based on input filename and mode)')
     parser.add_argument('-f', '--format', required=True, choices=available_formats,
@@ -217,17 +219,29 @@ def main():
     parser.add_argument('--time-field', default='time', help='Time field name for text format')
     parser.add_argument('--content-field', default='prompt_messages', help='Content field name for text format')
     parser.add_argument('--num-workers', type=int, default=4, help='Number of parallel workers')
+    parser.add_argument('--no-sort', action='store_true', 
+                        help='Disable timestamp sorting (faster but unsorted output)')
 
     args = parser.parse_args()
 
-    input_path = Path(args.input)
-    if not input_path.exists():
-        print(f"❌ Error: Input file not found: {args.input}", file=sys.stderr)
-        return 1
+    # 验证所有输入文件是否存在
+    input_files = [Path(f) for f in args.input]
+    for input_path in input_files:
+        if not input_path.exists():
+            print(f"❌ Error: Input file not found: {input_path}", file=sys.stderr)
+            return 1
 
+    # 自动生成输出文件名
     if args.output is None:
-        input_dir = input_path.parent
-        input_stem = input_path.stem
+        if len(input_files) == 1:
+            # 单文件: 使用输入文件名
+            input_dir = input_files[0].parent
+            input_stem = input_files[0].stem
+        else:
+            # 多文件: 使用第一个文件的目录和 "merged" 前缀
+            input_dir = input_files[0].parent
+            input_stem = "merged"
+        
         suffix = '_optimizer' if args.mode == 'optimizer' else '_inference'
         output_filename = f"{input_stem}{suffix}.jsonl"
         output_path = input_dir / output_filename
@@ -276,13 +290,130 @@ def main():
             num_workers=args.num_workers
         )
 
-        print(f"🔄 Converting {args.input} → {output_path}")
-        print(f"   Format: {args.format}, Mode: {args.mode}")
-
-        trace_count = converter.convert(args.input, str(output_path))
-
-        print(f"✅ Success! Converted {trace_count} traces")
-        print(f"   Output: {output_path}")
+        # 判断是单文件还是多文件
+        if len(input_files) == 1:
+            # 单文件: 使用原有逻辑
+            print(f"🔄 Converting {input_files[0]} → {output_path}")
+            print(f"   Format: {args.format}, Mode: {args.mode}")
+            
+            trace_count = converter.convert(str(input_files[0]), str(output_path))
+            
+            print(f"✅ Success! Converted {trace_count} traces")
+            print(f"   Output: {output_path}")
+        else:
+            # 多文件处理：先保存每个CSV的JSONL，再合并
+            print(f"🔄 Converting {len(input_files)} files → {output_path}")
+            print(f"   Format: {args.format}, Mode: {args.mode}")
+            print(f"   Strategy: Save each CSV as JSONL, then merge\n")
+            
+            # 检查converter是否支持convert_to_traces
+            if not hasattr(converter, 'convert_to_traces'):
+                print(f"❌ Error: Converter '{args.format}' does not support multi-file processing", 
+                      file=sys.stderr)
+                return 1
+            
+            converted_files = []
+            total_traces = 0
+            
+            # 阶段1: 转换每个CSV为独立的JSONL
+            for i, input_file in enumerate(input_files, 1):
+                print(f"[{i}/{len(input_files)}] Processing: {input_file}")
+                
+                # 生成输出文件名: input.csv -> input_optimizer.jsonl
+                input_path = Path(input_file)
+                suffix = '_optimizer' if args.mode == 'optimizer' else '_inference'
+                individual_output = input_path.parent / f"{input_path.stem}{suffix}.jsonl"
+                
+                # 断点续传：检查是否已存在
+                if individual_output.exists():
+                    print(f"   ✓ Already exists, skipping conversion: {individual_output}")
+                    
+                    # 统计已有文件的行数
+                    with open(individual_output, 'r') as f:
+                        line_count = sum(1 for _ in f)
+                    converted_files.append(individual_output)
+                    total_traces += line_count
+                    print(f"   Found {line_count} traces (total: {total_traces})\n")
+                else:
+                    # 转换并保存
+                    traces = converter.convert_to_traces(str(input_file))
+                    
+                    if traces:
+                        with open(individual_output, 'w', encoding='utf-8') as f_out:
+                            for trace in traces:
+                                f_out.write(json.dumps(trace, ensure_ascii=False) + '\n')
+                        
+                        converted_files.append(individual_output)
+                        total_traces += len(traces)
+                        print(f"   ✅ Saved {len(traces)} traces to: {individual_output}")
+                        print(f"   Total: {total_traces}\n")
+                    
+                    # 立即释放内存
+                    del traces
+            
+            if total_traces == 0:
+                print("❌ No traces generated from any file", file=sys.stderr)
+                return 1
+            
+            # 阶段2: 合并所有JSONL文件（移除tokens字段）
+            print(f"📦 Merging {len(converted_files)} JSONL files into {output_path}...")
+            print("   Removing 'tokens' field from all traces to reduce file size\n")
+            
+            if args.no_sort:
+                # 无排序：直接拼接
+                print("   Mode: Direct concatenation (no sorting)\n")
+                
+                with open(output_path, 'w', encoding='utf-8') as f_out:
+                    for jsonl_file in converted_files:
+                        with open(jsonl_file, 'r', encoding='utf-8') as f_in:
+                            for line in f_in:
+                                trace = json.loads(line.strip())
+                                # 移除tokens字段
+                                if 'tokens' in trace:
+                                    trace['tokens'] = []
+                                f_out.write(json.dumps(trace, ensure_ascii=False) + '\n')
+                
+                print(f"✅ Merge completed (unsorted)")
+            else:
+                # 需排序：归并排序
+                print("   Mode: Merge sort by timestamp_us\n")
+                
+                import heapq
+                
+                # 打开所有JSONL文件
+                file_handles = []
+                iterators = []
+                
+                for jsonl_file in converted_files:
+                    f = open(jsonl_file, 'r', encoding='utf-8')
+                    file_handles.append(f)
+                    
+                    # 创建迭代器：(timestamp, trace_dict)
+                    def trace_iterator(file_obj):
+                        for line in file_obj:
+                            trace = json.loads(line.strip())
+                            # 移除tokens字段
+                            if 'tokens' in trace:
+                                trace['tokens'] = []
+                            yield (trace.get('timestamp_us', 0), trace)
+                    
+                    iterators.append(trace_iterator(f))
+                
+                # 归并排序写入输出文件
+                with open(output_path, 'w', encoding='utf-8') as f_out:
+                    for timestamp, trace in heapq.merge(*iterators, key=lambda x: x[0]):
+                        f_out.write(json.dumps(trace, ensure_ascii=False) + '\n')
+                
+                # 关闭所有文件
+                for f in file_handles:
+                    f.close()
+                
+                print(f"✅ Merge completed (sorted by timestamp_us)")
+            
+            print(f"\n✅ Success! Merged {len(input_files)} files into {total_traces} traces")
+            print(f"   Individual JSONL files: {input_files[0].parent}")
+            print(f"   Merged output: {output_path}")
+        
         return 0
 
     except Exception as e:

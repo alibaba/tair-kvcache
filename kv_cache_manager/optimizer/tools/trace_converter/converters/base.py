@@ -35,6 +35,20 @@ class BaseConverter(ABC):
         """
         return self.instance_block_sizes.get(instance_id, self.default_block_size)
 
+    def convert_to_traces(self, input_file: str) -> list:
+        """
+        转换trace文件为traces列表（不写入文件）
+        
+        子类可选实现此方法以支持多文件合并和排序
+        
+        Args:
+            input_file: 输入文件路径
+        
+        Returns:
+            traces列表
+        """
+        raise NotImplementedError(f"{self.__class__.__name__} does not support convert_to_traces")
+    
     @abstractmethod
     def convert(self, input_file: str, output_file: str) -> int:
         """

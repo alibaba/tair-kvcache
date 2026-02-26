@@ -357,7 +357,8 @@ def plot_single_policy_curves(
     results: List[dict],
     output_dir: str,
     hit_rate_type: str = 'total',
-    title: str = None
+    title: str = None,
+    axis_limits: dict = None
 ):
     """
     绘制单策略的 Trade-off 曲线（每个 instance 一条曲线）
@@ -367,6 +368,7 @@ def plot_single_policy_curves(
         output_dir: 输出目录
         hit_rate_type: 'total', 'internal', 'external'
         title: 图表标题
+        axis_limits: 坐标轴范围 {'x_min': float, 'x_max': float, 'y_min': float, 'y_max': float}
     """
     if not results:
         print("No data to plot!")
@@ -403,7 +405,22 @@ def plot_single_policy_curves(
 
     plt.legend(loc='lower right', fontsize=10)
     plt.grid(True, alpha=0.3)
-    plt.ylim(0, 1)
+    
+    # 设置坐标轴范围
+    # X轴：有指定就用指定值，否则自动
+    if axis_limits and (axis_limits.get('x_min') is not None or axis_limits.get('x_max') is not None):
+        plt.xlim(axis_limits.get('x_min'), axis_limits.get('x_max'))
+    
+    # Y轴：默认0-1，只有明确指定才改变
+    y_min = 0
+    y_max = 1
+    if axis_limits:
+        if axis_limits.get('y_min') is not None:
+            y_min = axis_limits['y_min']
+        if axis_limits.get('y_max') is not None:
+            y_max = axis_limits['y_max']
+    plt.ylim(y_min, y_max)
+    
     plt.tight_layout()
 
     os.makedirs(output_dir, exist_ok=True)
@@ -509,5 +526,5 @@ def init_kvcm_logger(log_level: int = 4):
     Args:
         log_level: 日志级别（默认 4）
     """
-    kvcm_py_optimizer.LoggerBroker.InitLogger("")
+    kvcm_py_optimizer.LoggerBroker.InitLogger("", False)
     kvcm_py_optimizer.LoggerBroker.SetLogLevel(log_level)
