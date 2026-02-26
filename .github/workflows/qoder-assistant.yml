@@ -9,12 +9,12 @@ on:
 jobs:
   qoder-assistant:
     if: |
-      contains(github.event.comment.body, '@qoder') && 
-      !endsWith(github.event.comment.user.login, '[bot]') &&
+      contains(github.event.comment.body, '@qoder-bot') &&
       (
         github.event.comment.author_association == 'OWNER' ||
         github.event.comment.author_association == 'COLLABORATOR'
-      )
+      ) &&
+      (!endsWith(github.event.comment.user.login, '[bot]'))
     runs-on: ubuntu-latest
     permissions:
       contents: read
