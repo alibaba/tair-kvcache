@@ -1,0 +1,34 @@
+name: Qoder Auto Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [ "main" ]
+
+jobs:
+  qoder-review:
+    runs-on: ubuntu-slim
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Qoder Code Review
+        # uses: QoderAI/qoder-action@v0
+        uses: QoderAI/qoder-action@0881d27d15a7a93778ebc5c942d11da313ee8b7e
+        with:
+          qoder_personal_access_token: ${{ secrets.QODER_PERSONAL_ACCESS_TOKEN }}
+          prompt: |
+            /review-pr
+            REPO:${{ github.repository }} PR_NUMBER:${{ github.event.pull_request.number }}
+            Only generate a summary when you genuinely need to communicate with the author; otherwise, ignore it. 
+            Avoid simply repeating inline comments in the summary. 
+            Even when generating a summary, keep it concise and it doesn't need to completely conform to the summary 
+            template.
+          enable_qoder_github_mcp: true
