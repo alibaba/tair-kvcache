@@ -29,6 +29,8 @@ jobs:
             REPO:${{ github.repository }} PR_NUMBER:${{ github.event.pull_request.number }}
             Only generate a summary when you genuinely need to communicate with the author; otherwise, ignore it. 
             Avoid simply repeating inline comments in the summary. 
-            Even when generating a summary, keep it concise and it doesn't need to completely conform to the summary 
-            template.
+            Even when generating a summary, keep it concise.
+            
+            The Summary Template in the command definition is just an example. 
+            It is not necessary to generate all the content corresponding to the template every time, especially when it is not the first review.
           enable_qoder_github_mcp: true
