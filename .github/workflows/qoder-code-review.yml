@@ -2,12 +2,15 @@ name: Qoder Auto Code Review
 
 on:
   pull_request:
-    types: [opened, reopened]
+    types: [ opened, reopened ]
     branches: [ "main" ]
+  pull_request_review:
+    types: [ dismissed ]
 
 jobs:
   qoder-review:
     runs-on: ubuntu-slim
+    if: ${{ github.event.action != 'pull_request_review' || github.event.review.login == 'qoderai[bot]' }}
     permissions:
       contents: read
       pull-requests: write
@@ -26,5 +29,6 @@ jobs:
           qoder_personal_access_token: ${{ secrets.QODER_PERSONAL_ACCESS_TOKEN }}
           prompt: |
             /review-pr
+            MANDATORY_REQUIREMENT:"only use COMMENT or APPROVE as event when call submit_pending_pull_request_review. Never use REQUEST_CHANGES."
             REPO:${{ github.repository }} PR_NUMBER:${{ github.event.pull_request.number }}
-          enable_qoder_github_mcp: false
+          enable_qoder_github_mcp: true
