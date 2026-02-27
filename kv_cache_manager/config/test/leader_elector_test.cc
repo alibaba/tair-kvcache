@@ -120,7 +120,7 @@ TEST_F(LeaderElectorTest, SingleElectorBecomesLeader) {
 
     for (int i = 0; i < 100; i++) {
         // 等待足够时间让选举发生
-        if (become_leader_called) {
+        if (elector->IsLeader() && become_leader_called) {
             break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -152,7 +152,7 @@ TEST_F(LeaderElectorTest, ManualDemote) {
 
     for (int i = 0; i < 100; i++) {
         // 等待足够时间让选举发生
-        if (elector->IsLeader()) {
+        if (elector->IsLeader() && become_leader_called) {
             break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -166,7 +166,7 @@ TEST_F(LeaderElectorTest, ManualDemote) {
 
     // 等待demote task执行
     for (int i = 0; i < 10; i++) {
-        if (elector->IsLeader() && no_longer_leader_called) {
+        if (!elector->IsLeader() && no_longer_leader_called) {
             break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
