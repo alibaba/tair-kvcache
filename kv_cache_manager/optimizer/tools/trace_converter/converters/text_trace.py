@@ -112,19 +112,20 @@ def _process_chunk_text(
             block_ids = tokens_to_block_ids(token_ids, block_size=block_size)
             
             # 根据模式生成traces
+            # 注意: tokens字段置空以减少数据量 (仅保留block keys)
             if mode == 'optimizer':
                 # Optimizer模式: Get+Write
                 get_trace = converter._create_get_trace(
                     timestamp_us=timestamp_us,
                     keys=block_ids,
                     instance_id=default_instance_id,
-                    tokens=token_ids
+                    tokens=[]  # 置空token IDs
                 )
                 write_trace = converter._create_write_trace(
                     timestamp_us=timestamp_us + 1,
                     keys=block_ids,
                     instance_id=default_instance_id,
-                    tokens=token_ids
+                    tokens=[]  # 置空token IDs
                 )
                 traces.extend([get_trace, write_trace])
             else:
@@ -137,7 +138,7 @@ def _process_chunk_text(
                     output_len=0,
                     total_keys=block_ids,
                     instance_id=default_instance_id,
-                    tokens=token_ids
+                    tokens=[]  # 置空token IDs
                 )
                 traces.append(dialog_trace)
         
@@ -288,13 +289,17 @@ class TextTraceConverter(BaseConverter):
         return smart_tokenize(self.tokenizer, content, use_chat_template=True)
 
     def _generate_optimizer_traces(self, timestamp_us: int, block_ids: list, tokens: list = None) -> list:
-        """生成Optimizer格式的Get+Write traces"""
+        """
+        生成Optimizer格式的Get+Write traces
+        
+        注意: tokens参数已废弃,始终置空以减少数据量
+        """
         # Get trace - 显式使用default_instance_id
         get_trace = self._create_get_trace(
             timestamp_us=timestamp_us,
             keys=block_ids,
             instance_id=self.default_instance_id,
-            tokens=tokens or []
+            tokens=[]  # 始终置空
         )
 
         # Write trace (时间戳+1微秒) - 显式使用default_instance_id
@@ -302,13 +307,17 @@ class TextTraceConverter(BaseConverter):
             timestamp_us=timestamp_us + 1,
             keys=block_ids,
             instance_id=self.default_instance_id,
-            tokens=tokens or []
+            tokens=[]  # 始终置空
         )
 
         return [get_trace, write_trace]
 
     def _generate_inference_trace(self, timestamp_us: int, block_ids: list, tokens: list = None) -> dict:
-        """生成Inference格式的DialogTurn trace"""
+        """
+        生成Inference格式的DialogTurn trace
+        
+        注意: tokens参数已废弃,始终置空以减少数据量
+        """
         input_len = len(block_ids) * self.block_size
 
         # DialogTurn trace - 显式使用default_instance_id
@@ -319,7 +328,7 @@ class TextTraceConverter(BaseConverter):
             output_len=0,  # 文本输入没有输出
             total_keys=block_ids,
             instance_id=self.default_instance_id,
-            tokens=tokens or []
+            tokens=[]  # 始终置空
         )
 
         return dialog_trace

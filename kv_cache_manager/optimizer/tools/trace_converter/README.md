@@ -415,19 +415,41 @@ python trace_converter.py \
 
 ## 前缀哈希算法
 
-本工具使用前缀依赖的block ID生成算法,与C++ Optimizer内部的`hashInt64Func`保持一致:
+本工具使用前缀依赖的block ID生成算法,与C++ Optimizer内部的`HashIntFunc`完全一致 (Jenkins Hash变种):
 
 ```python
-def hash_int64_func(prev_hash: int, current_value: int) -> int:
-    combined = f"{prev_hash}_{current_value}"
-    return hash(combined) & 0x7FFFFFFFFFFFFFFF
+# C++ 原始实现 (hash_util.h):
+# hash ^= hasher(value) + 0x9e3779b97f4a7c15 + (hash << 12) + (hash >> 32);
 
-# 应用前缀哈希
+def hash_int64_func(prev_hash: int, current_value: int) -> int:
+    """Jenkins Hash 变种 - 与C++ HashIntFunc完全一致"""
+    GOLDEN_RATIO = 0x9e3779b97f4a7c15
+    value_hash = current_value  # std::hash<int64_t> 直接返回值
+    
+    hash_value = prev_hash & 0xFFFFFFFFFFFFFFFF
+    left_shift = (hash_value << 12) & 0xFFFFFFFFFFFFFFFF
+    right_shift = (hash_value >> 32) & 0xFFFFFFFFFFFFFFFF
+    rhs = (value_hash + GOLDEN_RATIO + left_shift + right_shift) & 0xFFFFFFFFFFFFFFFF
+    
+    result = prev_hash ^ rhs
+    # 转换为有符号int64
+    result &= 0xFFFFFFFFFFFFFFFF
+    if result >= 0x8000000000000000:
+        result -= 0x10000000000000000
+    return result
+
+# 应用前缀哈希 (直接使用哈希值作为block key)
 hash_value = 0
-for hash_id in hash_ids:
-    hash_value = hash_int64_func(hash_value, hash_id)
-    block_keys.append(hash_value)
+for token in tokens:
+    hash_value = hash_int64_func(hash_value, token)
+    block_keys.append(hash_value)  # 哈希值即为block ID
 ```
+
+**设计要点**:
+- ✅ **无状态设计**: 完全消除ID映射,直接用哈希值作为block key
+- ✅ **幂等性保证**: 相同输入永远产生相同输出
+- ✅ **多进程安全**: 无共享状态,天然支持并行处理
+- ✅ **跨语言一致**: Python与C++生成完全相同的block key
 
 ## 合成时间戳策略
 

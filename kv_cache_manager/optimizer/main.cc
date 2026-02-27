@@ -8,7 +8,7 @@
 
 int main(int argc, char *argv[]) {
     // 初始化KVCM日志系统
-    kv_cache_manager::LoggerBroker::InitLogger(""); // 使用默认配置
+    kv_cache_manager::LoggerBroker::InitLogger("", false);
     kv_cache_manager::LoggerBroker::SetLogLevel(kv_cache_manager::Logger::LEVEL_INFO);
 
     if (argc != 2) {
