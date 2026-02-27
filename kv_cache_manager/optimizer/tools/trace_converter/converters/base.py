@@ -9,17 +9,20 @@ class BaseConverter(ABC):
 
     def __init__(self, default_instance_id: str = 'instance',
                  instance_block_sizes: Dict[str, int] = None,
-                 mode: str = 'optimizer'):
+                 mode: str = 'optimizer',
+                 keep_tokens: bool = False):
         """
         Args:
             default_instance_id: 默认实例ID (当输入格式没有instance信息时使用)
             instance_block_sizes: 每个instance的block_size映射 {instance_id: block_size}
             mode: 输出模式 ('optimizer' 或 'inference')
+            keep_tokens: 是否保留tokens字段（默认False以减少文件大小，调试时可设为True）
         """
         self.default_instance_id = default_instance_id
         self.default_block_size = 16  # 硬编码默认值
         self.instance_block_sizes = instance_block_sizes or {}
         self.mode = mode
+        self.keep_tokens = keep_tokens
         # 按instance分组管理时间戳,避免不同instance间的冲突
         self.used_timestamps: Dict[str, Set[int]] = {}
 
@@ -35,31 +38,18 @@ class BaseConverter(ABC):
         """
         return self.instance_block_sizes.get(instance_id, self.default_block_size)
 
+    @abstractmethod
     def convert_to_traces(self, input_file: str) -> list:
         """
-        转换trace文件为traces列表（不写入文件）
+        转换trace文件为traces列表
         
-        子类可选实现此方法以支持多文件合并和排序
+        文件IO由trace_converter.py和merge_utils.py统一处理
         
         Args:
             input_file: 输入文件路径
         
         Returns:
             traces列表
-        """
-        raise NotImplementedError(f"{self.__class__.__name__} does not support convert_to_traces")
-    
-    @abstractmethod
-    def convert(self, input_file: str, output_file: str) -> int:
-        """
-        转换trace文件为标准格式
-
-        Args:
-            input_file: 输入文件路径
-            output_file: 输出文件路径
-
-        Returns:
-            转换的trace数量
         """
         pass
 
@@ -110,13 +100,16 @@ class BaseConverter(ABC):
         # 分配无冲突的时间戳
         timestamp_us = self._allocate_timestamp(instance_id, timestamp_us)
 
+        # tokens字段处理: 根据keep_tokens决定是否保留
+        tokens = kwargs.get('tokens', []) if self.keep_tokens else []
+        
         trace = {
             'type': 'get',  # 显式标记为Get trace
             # OptimizerSchemaTrace 基础字段
             'instance_id': instance_id,
             'trace_id': f"trace_{instance_id}_{timestamp_us}",
             'timestamp_us': timestamp_us,
-            'tokens': kwargs.get('tokens', []),
+            'tokens': tokens,
             'keys': keys,
 
             # GetLocationSchemaTrace 字段
@@ -154,13 +147,16 @@ class BaseConverter(ABC):
         # 分配无冲突的时间戳
         timestamp_us = self._allocate_timestamp(instance_id, timestamp_us)
 
+        # tokens字段处理: 根据keep_tokens决定是否保留
+        tokens = kwargs.get('tokens', []) if self.keep_tokens else []
+        
         trace = {
             'type': 'write',  # 显式标记为Write trace
             # OptimizerSchemaTrace 基础字段
             'instance_id': instance_id,
             'trace_id': f"trace_{instance_id}_{timestamp_us}",
             'timestamp_us': timestamp_us,
-            'tokens': kwargs.get('tokens', []),
+            'tokens': tokens,
             'keys': keys,
         }
 
@@ -198,13 +194,16 @@ class BaseConverter(ABC):
         # 分配无冲突的时间戳
         timestamp_us = self._allocate_timestamp(instance_id, timestamp_us)
 
+        # tokens字段处理: 根据keep_tokens决定是否保留
+        tokens = kwargs.get('tokens', []) if self.keep_tokens else []
+        
         trace = {
             'type': 'dialog',  # 显式标记为DialogTurn trace
             # OptimizerSchemaTrace 基础字段
             'instance_id': instance_id,
             'trace_id': f"trace_{instance_id}_{timestamp_us}",
             'timestamp_us': timestamp_us,
-            'tokens': kwargs.get('tokens', []),
+            'tokens': tokens,
             'keys': keys,
 
             # GetLocationSchemaTrace 字段

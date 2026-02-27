@@ -27,15 +27,16 @@ class PublisherLogConverter(BaseConverter):
     def __init__(self, default_instance_id: str = 'instance',
                  instance_block_sizes: Dict[str, int] = None,
                  mode: str = 'optimizer',
+                 keep_tokens: bool = False,
                  **kwargs):  # 忽略其他参数
-        super().__init__(default_instance_id, instance_block_sizes, mode)
+        super().__init__(default_instance_id, instance_block_sizes, mode, keep_tokens)
         # 动态发现的instance -> block_size映射
         self.discovered_instances = {}
         self.pending_write_sessions = {}
         self.pending_get_location_traces = []
 
-    def convert(self, input_file: str, output_file: str) -> int:
-        """转换Publisher日志为标准格式"""
+    def convert_to_traces(self, input_file: str) -> list:
+        """转换Publisher日志为traces列表"""
         traces = []
 
         # 第一遍: 解析所有事件
@@ -56,11 +57,8 @@ class PublisherLogConverter(BaseConverter):
         self._check_and_convert_pending_write_event(traces)
         self._convert_pending_get_location_event(traces)
 
-        # 写入输出文件
-        with open(output_file, 'w', encoding='utf-8') as f:
-            for trace in traces:
-                if isinstance(trace, dict):
-                    f.write(json.dumps(trace) + '\n')
+        # 按timestamp排序（保证输出有序）
+        traces.sort(key=lambda t: t.get('timestamp_us', 0))
 
         # 打印统计信息
         if self.discovered_instances:
@@ -69,7 +67,7 @@ class PublisherLogConverter(BaseConverter):
                 inst_traces = sum(1 for t in traces if isinstance(t, dict) and t.get('instance_id') == inst_id)
                 print(f"   - {inst_id}: block_size={blk_size}, traces={inst_traces}")
 
-        return len(traces)
+        return traces
 
     def _parse_log_line(self, line: str):
         """解析单行日志"""
@@ -141,28 +139,36 @@ class PublisherLogConverter(BaseConverter):
 
         write_trace = {
             'instance_id': instance_id,
-            'timestamp_us': data.get('trigger_time_us', 0),  # StartWrite时间戳,后续会被FinishWrite更新
+            'timestamp_us': data.get('trigger_time_us', 0),
             'keys': data.get('keys', []),
             'tokens': data.get('tokens', []),
         }
 
         if write_session_id:
-            self.pending_write_sessions[write_session_id] = write_trace
+            # 使用 (instance_id, session_id) 作为key，避免不同instance的session_id冲突
+            key = (instance_id, write_session_id)
+            self.pending_write_sessions[key] = write_trace
 
-        # ✅ 不再立即匹配,等待FinishWrite事件
         return None
 
     def _convert_finish_write_cache_event(self, data: dict):
         """转换FinishWriteCache事件 - 更新时间戳并匹配Get"""
         write_session_id = data.get('write_session_id', '')
-        if not write_session_id or write_session_id not in self.pending_write_sessions:
+        instance_id = data.get('source', self.default_instance_id)
+        
+        if not write_session_id:
             return None
-
-        write_trace = self.pending_write_sessions.pop(write_session_id)
-        # ✅ 更新为FinishWrite的时间戳
+        
+        # 使用 (instance_id, session_id) 作为key查找
+        key = (instance_id, write_session_id)
+        if key not in self.pending_write_sessions:
+            return None
+        
+        write_trace = self.pending_write_sessions.pop(key)
+        # 更新为FinishWrite的时间戳
         write_trace['timestamp_us'] = data.get('trigger_time_us', 0)
-
-        # ✅ 此时才尝试匹配GetLocation并生成traces
+        
+        # 尝试匹配GetLocation并生成traces
         return self._find_matching_get_location_trace(write_trace)
 
     def _find_matching_get_location_trace(self, write_trace: dict):

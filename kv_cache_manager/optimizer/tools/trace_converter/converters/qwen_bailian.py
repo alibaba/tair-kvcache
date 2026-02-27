@@ -33,67 +33,68 @@ class QwenBailianConverter(BaseConverter):
     def __init__(self, default_instance_id: str = 'instance',
                  instance_block_sizes: Dict[str, int] = None,
                  mode: str = 'optimizer',
+                 keep_tokens: bool = False,
                  **kwargs):  # 忽略其他参数
-        super().__init__(default_instance_id, instance_block_sizes, mode)
+        super().__init__(default_instance_id, instance_block_sizes, mode, keep_tokens)
 
-    def convert(self, input_file: str, output_file: str) -> int:
-        trace_count = 0
+    def convert_to_traces(self, input_file: str) -> list:
+        """转换Qwen Bailian数据为traces列表"""
+        traces = []
 
         with open(input_file, 'r', encoding='utf-8') as f_in:
             # 计算总行数用于进度条
             total_lines = sum(1 for _ in f_in)
             f_in.seek(0)
 
-            with open(output_file, 'w', encoding='utf-8') as f_out:
-                for line in tqdm(f_in, total=total_lines, desc="Converting Qwen Bailian"):
-                    line = line.strip()
-                    if not line:
-                        continue
+            for line in tqdm(f_in, total=total_lines, desc="Converting Qwen Bailian"):
+                line = line.strip()
+                if not line:
+                    continue
 
-                    try:
-                        data = json.loads(line)
+                try:
+                    data = json.loads(line)
 
-                        # 提取字段
-                        timestamp = data.get('timestamp', 0.0)
-                        hash_ids = data.get('hash_ids', [])
-                        input_length = data.get('input_length', 0)
-                        output_length = data.get('output_length', 0)
+                    # 提取字段
+                    timestamp = data.get('timestamp', 0.0)
+                    hash_ids = data.get('hash_ids', [])
+                    input_length = data.get('input_length', 0)
+                    output_length = data.get('output_length', 0)
 
-                        # 应用前缀哈希转换
-                        block_keys = apply_prefix_hash(hash_ids)
+                    # 应用前缀哈希转换
+                    block_keys = apply_prefix_hash(hash_ids)
 
-                        # 根据模式生成不同格式
-                        if self.mode == 'optimizer':
-                            # Optimizer模式: 生成Get+Write
-                            traces = self._generate_optimizer_traces(
-                                timestamp, block_keys, input_length, output_length
-                            )
-                            for trace in traces:
-                                f_out.write(json.dumps(trace) + '\n')
-                                trace_count += 1
-                        else:
-                            # Inference模式: 生成DialogTurn
-                            trace = self._generate_inference_trace(
-                                timestamp, block_keys, input_length, output_length
-                            )
-                            f_out.write(json.dumps(trace) + '\n')
-                            trace_count += 1
+                    # 根据模式生成不同格式
+                    if self.mode == 'optimizer':
+                        # Optimizer模式: 生成Get+Write
+                        batch_traces = self._generate_optimizer_traces(
+                            timestamp, block_keys, input_length, output_length
+                        )
+                        traces.extend(batch_traces)
+                    else:
+                        # Inference模式: 生成DialogTurn
+                        trace = self._generate_inference_trace(
+                            timestamp, block_keys, input_length, output_length
+                        )
+                        traces.append(trace)
 
-                    except json.JSONDecodeError as e:
-                        # 提供更详细的错误诊断
-                        line_preview = line[:100] + '...' if len(line) > 100 else line
-                        print(f"\n⚠️  Warning: JSON parse error at position {e.pos}")
-                        print(f"   Line length: {len(line)} chars")
-                        print(f"   Error: {e.msg}")
-                        print(f"   Preview: {line_preview}")
-                        continue
-                    except Exception as e:
-                        line_preview = line[:100] + '...' if len(line) > 100 else line
-                        print(f"\n⚠️  Warning: Failed to parse line: {e}")
-                        print(f"   Preview: {line_preview}")
-                        continue
+                except json.JSONDecodeError as e:
+                    # 提供更详细的错误诊断
+                    line_preview = line[:100] + '...' if len(line) > 100 else line
+                    print(f"\n⚠️  Warning: JSON parse error at position {e.pos}")
+                    print(f"   Line length: {len(line)} chars")
+                    print(f"   Error: {e.msg}")
+                    print(f"   Preview: {line_preview}")
+                    continue
+                except Exception as e:
+                    line_preview = line[:100] + '...' if len(line) > 100 else line
+                    print(f"\n⚠️  Warning: Failed to parse line: {e}")
+                    print(f"   Preview: {line_preview}")
+                    continue
 
-        return trace_count
+        # 按timestamp排序（保证输出有序）
+        traces.sort(key=lambda t: t.get('timestamp_us', 0))
+
+        return traces
 
     def _generate_optimizer_traces(
         self,
