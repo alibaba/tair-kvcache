@@ -17,7 +17,7 @@ jobs:
   qoder-review:
     runs-on: ubuntu-slim
     # Trigger conditions:
-    # 1. PR opened/reopened
+    # 1. PR opened/reopened (ignore synchronize to reduce duplicate reviews)
     # 2. 'ai reviewed' label removed (re-review)
     # 3. OWNER/COLLABORATOR comments '@tair-ci review'
     # 4. Manual workflow dispatch
@@ -39,11 +39,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: hide old comment
-        # uses: int128/hide-comment-action@
-        uses: int128/hide-comment-action@c0b5ed56339ed2285f922a5da4444b55270c43f3
-        with:
-          authors: "qoderai[bot]"
       - name: Run Qoder Code Review
         # uses: QoderAI/qoder-action@v0
         uses: QoderAI/qoder-action@0881d27d15a7a93778ebc5c942d11da313ee8b7e
@@ -56,7 +51,7 @@ jobs:
             - Only use COMMENT or APPROVE as event when calling submit_pending_pull_request_review. Never use REQUEST_CHANGES.
             - Before reviewing, fetch and read ALL existing comments, reviews, and review comments on this PR.
             - Do NOT generate duplicate inline comments. If an issue has already been mentioned in existing comments/reviews, skip it.
-            - For the Summary sections (Key Risks & Issues, Verification Advice, Thoughts & Suggestions), only include NEW findings not previously mentioned in any existing review or comment. If all issues have been mentioned in prior reviews, acknowledge that and keep each section brief.
+            - If a previous Review Summary already exists and this review has no substantial new findings beyond what was already covered, you may skip the full Summary template entirely. In this case, either omit the summary or provide just 1-2 sentences briefly noting any incremental observations.
           enable_qoder_github_mcp: true
 
       - name: Add ai reviewed label
