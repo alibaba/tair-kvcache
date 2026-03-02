@@ -2,7 +2,7 @@ name: Qoder Auto Code Review
 
 on:
   pull_request:
-    types: [ opened, reopened ]
+    types: [ opened, reopened, unlabeled ]
     branches: [ "main" ]
   issue_comment:
     types: [created]
@@ -17,8 +17,10 @@ jobs:
   qoder-review:
     runs-on: ubuntu-slim
     if: |
-      github.event_name != 'issue_comment' ||
-      (github.event.issue.pull_request && contains(github.event.comment.body, '@tair-ci review'))
+      (github.event_name == 'pull_request' && github.event.action != 'unlabeled') ||
+      (github.event_name == 'pull_request' && github.event.action == 'unlabeled' && github.event.label.name == 'ai reviewed') ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request && contains(github.event.comment.body, '@tair-ci review')) ||
+      github.event_name == 'workflow_dispatch'
     permissions:
       contents: read
       pull-requests: write
@@ -30,6 +32,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: hide old comment
+        # uses: int128/hide-comment-action@
         uses: int128/hide-comment-action@c0b5ed56339ed2285f922a5da4444b55270c43f3
         with:
           authors: "qoderai[bot]"
@@ -43,3 +46,19 @@ jobs:
             MANDATORY_REQUIREMENT:"only use COMMENT or APPROVE as event when call submit_pending_pull_request_review. Never use REQUEST_CHANGES."
             REPO:${{ github.repository }} PR_NUMBER:${{ github.event.pull_request.number || github.event.inputs.pr_number || github.event.issue.number }}
           enable_qoder_github_mcp: true
+
+      - name: Add ai reviewed label
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = context.payload.pull_request?.number || 
+                             context.payload.inputs?.pr_number || 
+                             context.payload.issue?.number;
+            if (prNumber) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: prNumber,
+                labels: ['ai reviewed']
+              });
+            }
