@@ -28,6 +28,11 @@ RedisClient::RedisClient(const StandardUri &storage_uri)
     if (tmp_retry_count > 0) {
         retry_count_ = tmp_retry_count;
     }
+    int64_t tmp_randomkey_batch_num = 0;
+    storage_uri.GetParamAs("randomkey_batch_num", tmp_randomkey_batch_num);
+    if (tmp_randomkey_batch_num > 0) {
+        randomkey_batch_num_ = tmp_randomkey_batch_num;
+    }
 }
 
 RedisClient::~RedisClient() { Close(); }
@@ -632,8 +637,7 @@ ErrorCode
 RedisClient::Rand(const std::string &matching_prefix, const int64_t count, std::vector<std::string> &out_keys) {
     out_keys.clear();
 
-    static constexpr size_t randomkey_batch_num = 20;
-    std::vector<CmdArgs> randomkey_cmds(randomkey_batch_num, CmdArgs{"RANDOMKEY"});
+    std::vector<CmdArgs> randomkey_cmds(randomkey_batch_num_, CmdArgs{"RANDOMKEY"});
     std::unordered_set<std::string> seen;
     size_t consecutive_misses = 0;
     while (out_keys.size() < count && consecutive_misses < 3) {

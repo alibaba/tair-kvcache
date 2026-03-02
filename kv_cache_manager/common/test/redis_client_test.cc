@@ -28,6 +28,7 @@ void RedisClientTest::PrepareMockRedisClient(const std::string &user_info, const
     storage_uri.port_ = port;
     storage_uri.params_["timeout_ms"] = "2000";
     storage_uri.params_["retry_count"] = "2";
+    storage_uri.params_["randomkey_batch_num"] = "20";
 
     redis_client_ = std::make_unique<MockRedisClient>(storage_uri);
     ON_CALL(*redis_client_, IsContextOk()).WillByDefault(Invoke(redis_client_.get(), &RedisClient::IsContextOk));

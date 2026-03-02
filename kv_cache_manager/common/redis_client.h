@@ -67,5 +67,6 @@ private:
     int64_t port_ = 0;
     int64_t timeout_ms_ = 2000;
     int64_t retry_count_ = 2;
+    int64_t randomkey_batch_num_ = 20;
 };
 } // namespace kv_cache_manager
