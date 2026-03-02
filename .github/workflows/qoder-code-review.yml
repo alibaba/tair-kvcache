@@ -51,12 +51,16 @@ jobs:
           qoder_personal_access_token: ${{ secrets.QODER_PERSONAL_ACCESS_TOKEN }}
           prompt: |
             /review-pr
-            MANDATORY_REQUIREMENT:"only use COMMENT or APPROVE as event when call submit_pending_pull_request_review. Never use REQUEST_CHANGES."
             REPO:${{ github.repository }} PR_NUMBER:${{ github.event.pull_request.number || github.event.inputs.pr_number || github.event.issue.number }}
+            MANDATORY_REQUIREMENTS:
+            - Only use COMMENT or APPROVE as event when calling submit_pending_pull_request_review. Never use REQUEST_CHANGES.
+            - Before reviewing, fetch and read ALL existing comments, reviews, and review comments on this PR.
+            - Do NOT generate duplicate inline comments. If an issue has already been mentioned in existing comments/reviews, skip it.
+            - For the Summary sections (Key Risks & Issues, Verification Advice, Thoughts & Suggestions), only include NEW findings not previously mentioned in any existing review or comment. If all issues have been mentioned in prior reviews, acknowledge that and keep each section brief.
           enable_qoder_github_mcp: true
 
       - name: Add ai reviewed label
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const prNumber = context.payload.pull_request?.number || 
