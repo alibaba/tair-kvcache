@@ -21,7 +21,10 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
+      - name: hide old comment
+        uses: int128/hide-comment-action@c0b5ed56339ed2285f922a5da4444b55270c43f3
+        with:
+          authors: "qoderai[bot]"
       - name: Run Qoder Code Review
         # uses: QoderAI/qoder-action@v0
         uses: QoderAI/qoder-action@0881d27d15a7a93778ebc5c942d11da313ee8b7e
