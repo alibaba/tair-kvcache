@@ -48,7 +48,7 @@ jobs:
             /review-pr
             REPO:${{ github.repository }} PR_NUMBER:${{ github.event.pull_request.number || github.event.inputs.pr_number || github.event.issue.number }}
             MANDATORY_REQUIREMENTS:
-            - Only use COMMENT or APPROVE as event when calling submit_pending_pull_request_review. Never use REQUEST_CHANGES.
+            - Only use COMMENT as event when calling submit_pending_pull_request_review. Never use REQUEST_CHANGES or APPROVE.
             - Before reviewing, fetch and read ALL existing comments, reviews, and review comments on this PR.
             - Do NOT generate duplicate inline comments. If an issue has already been mentioned in existing comments/reviews, skip it.
             - If a previous Review Summary already exists and this review has no substantial new findings beyond what was already covered, you may skip the full Summary template entirely. In this case, either omit the summary or provide just 1-2 sentences briefly noting any incremental observations.
