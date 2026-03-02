@@ -132,7 +132,16 @@ CacheManager::CacheManager(std::shared_ptr<MetricsRegistry> metrics_registry,
     , metrics_recorder_(std::make_shared<CacheManagerMetricsRecorder>(
           meta_indexer_manager_, write_location_manager_, registry_manager_)) {}
 
-CacheManager::~CacheManager() {}
+CacheManager::~CacheManager() {
+    if (write_location_manager_) {
+        write_location_manager_->Stop();
+        write_location_manager_.reset();
+    }
+    if (cache_reclaimer_) {
+        cache_reclaimer_->Stop();
+        cache_reclaimer_.reset();
+    }
+}
 
 bool CacheManager::Init(int32_t schedule_plan_executor_thread_count) {
     schedule_plan_executor_ = std::make_shared<SchedulePlanExecutor>(schedule_plan_executor_thread_count,
