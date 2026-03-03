@@ -56,8 +56,6 @@ cc_library(
     ],
     deps = [
         ":cache_location_view",
-        "//kv_cache_manager/common:concurrent_hash_map",
-        "@havenask//aios/autil:lock_free",
     ],
 )
 

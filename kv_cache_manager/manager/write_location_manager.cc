@@ -5,8 +5,84 @@
 namespace kv_cache_manager {
 
 namespace {
-constexpr static int kDefaultExpireLoopSleepTime = 5; // seconds
+constexpr static int kDefaultExpireLoopSleepTime = 5 * 1000 * 1000; // us
 };
+
+size_t WriteLocationManager::SessionIdMap::Size() const {
+    std::unique_lock lock(mux_);
+    return unit_map_.size();
+}
+
+bool WriteLocationManager::SessionIdMap::Empty() const {
+    std::unique_lock lock(mux_);
+    return unit_map_.empty();
+}
+
+int64_t WriteLocationManager::SessionIdMap::DropByExpirePoint(int64_t cur_point) {
+    std::vector<ExpireUnitPtr> prepare_to_expire_units;
+    {
+        std::unique_lock lock(mux_);
+        for (auto it = unit_map_.begin(); (it != unit_map_.end()) && (it->first <= cur_point);) {
+            session_id_map_impl_.erase(it->second->write_session_id);
+            prepare_to_expire_units.push_back(it->second);
+            it = unit_map_.erase(it);
+        }
+        if (prepare_to_expire_units.empty()) {
+            return 0;
+        }
+    }
+    for (auto &unit : prepare_to_expire_units) {
+        KVCM_LOG_DEBUG("Expiring write_session [%s]", unit->write_session_id.c_str());
+        unit->callback();
+    }
+    {
+        std::unique_lock lock(mux_);
+        if (unit_map_.empty()) {
+            return 0;
+        }
+        return unit_map_.begin()->first;
+    }
+}
+
+void WriteLocationManager::SessionIdMap::DropAll() {
+    std::vector<ExpireUnitPtr> prepare_to_expire_units;
+    {
+        std::unique_lock lock(mux_);
+        for (auto it = unit_map_.begin(); it != unit_map_.end();) {
+            session_id_map_impl_.erase(it->second->write_session_id);
+            prepare_to_expire_units.push_back(it->second);
+            it = unit_map_.erase(it);
+        }
+    }
+    for (auto &unit : prepare_to_expire_units) {
+        KVCM_LOG_DEBUG("Expiring write_session [%s]", unit->write_session_id.c_str());
+        unit->callback();
+    }
+}
+
+void WriteLocationManager::SessionIdMap::Put(ExpireUnitPtr unit) {
+    std::unique_lock lock(mux_);
+    while (unit_map_.find(unit->expire_point) != unit_map_.end()) {
+        unit->expire_point++;
+    }
+    unit_map_[unit->expire_point] = unit;
+    session_id_map_impl_[unit->write_session_id] = unit->expire_point;
+}
+
+bool WriteLocationManager::SessionIdMap::GetAndDelete(const std::string &write_session_id,
+                                                      WriteLocationInfo &location_info) {
+    std::unique_lock lock(mux_);
+    auto it_s = session_id_map_impl_.find(write_session_id);
+    if (it_s == session_id_map_impl_.end()) {
+        return false;
+    }
+    auto it_u = unit_map_.find(it_s->second);
+    assert(it_u != unit_map_.end());
+    location_info = std::move(it_u->second->write_location_info);
+    unit_map_.erase(it_u);
+    session_id_map_impl_.erase(it_s);
+    return true;
+}
 
 WriteLocationManager::WriteLocationManager() {
     next_sleep_time_.store(kDefaultExpireLoopSleepTime, std::memory_order_relaxed);
@@ -25,26 +101,11 @@ void WriteLocationManager::Stop() {
         expire_thread_.join();
     }
 }
+
 void WriteLocationManager::DoCleanup() {
     KVCM_LOG_DEBUG("Cleaning up all write sessions");
-    std::vector<ExpireUnitPtr> pending_units;
-    {
-        std::unique_lock<std::mutex> lock(do_expire_mutex_);
-
-        ExpireUnitPtr unit_ptr;
-        while (expire_queue_.Pop(&unit_ptr)) {
-            if (session_id_map_.Contains(unit_ptr->write_session_id)) {
-                pending_units.push_back(unit_ptr);
-            }
-        }
-        next_sleep_time_.store(kDefaultExpireLoopSleepTime, std::memory_order_relaxed);
-        // callback will clean session_id_map_, so we ignore it here.
-    }
-
-    for (const auto &unit : pending_units) {
-        KVCM_LOG_INFO("Cleaning up abandoned write session: %s", unit->write_session_id.c_str());
-        unit->callback();
-    }
+    session_id_map_.DropAll();
+    next_sleep_time_.store(kDefaultExpireLoopSleepTime, std::memory_order_relaxed);
 }
 
 void WriteLocationManager::StoreMinNextSleepTime(int64_t next_sleep_time) {
@@ -60,39 +121,18 @@ void WriteLocationManager::ExpireLoop() {
     while (!stop_.load(std::memory_order_relaxed)) {
         ExpireUnitPtr unit_ptr_to_expire;
         {
-            //
-            std::unique_lock<std::mutex> lock(do_expire_mutex_);
-            cond_.wait_for(lock, std::chrono::seconds(next_sleep_time_));
+            std::this_thread::sleep_for(std::chrono::microseconds(next_sleep_time_));
 
-            if (expire_queue_.Empty()) {
+            if (session_id_map_.Empty()) {
                 KVCM_INTERVAL_LOG_DEBUG(100, "expire queue empty");
                 continue;
             }
-            ExpireUnitPtr unit_ptr;
-            if (expire_queue_.Pop(&unit_ptr)) {
-                if (!session_id_map_.Contains(unit_ptr->write_session_id)) {
-                    KVCM_LOG_DEBUG("write_session_id [%s] has been consumed", unit_ptr->write_session_id.c_str());
-                } else if (int64_t current_point = TimestampUtil::GetSteadyTimeSec();
-                           current_point >= unit_ptr->expire_point) {
-                    unit_ptr_to_expire = unit_ptr;
-                } else {
-                    int64_t next_sleep_time = unit_ptr->expire_point - current_point;
-                    KVCM_LOG_DEBUG("Not expiring session %s, next_sleep_time [%lds]; requeue it",
-                                   unit_ptr->write_session_id.c_str(),
-                                   next_sleep_time);
-                    StoreMinNextSleepTime(next_sleep_time);
-                    expire_queue_.Push(unit_ptr);
-                }
-            }
-            if (expire_queue_.Empty()) {
+            int64_t cur_point = TimestampUtil::GetSteadyTimeUs();
+            if (int64_t next_point = session_id_map_.DropByExpirePoint(cur_point); next_point > 0) {
+                StoreMinNextSleepTime(next_point - cur_point);
+            } else {
                 next_sleep_time_.store(kDefaultExpireLoopSleepTime, std::memory_order_relaxed);
             }
-        }
-
-        if (unit_ptr_to_expire) {
-            KVCM_LOG_DEBUG("Expiring session %s", unit_ptr_to_expire->write_session_id.c_str());
-            // callback will remove the expired write_session_id
-            unit_ptr_to_expire->callback();
         }
     }
 }
@@ -108,28 +148,18 @@ void WriteLocationManager::Put(const std::string &write_session_id,
                    location_ids.size(),
                    write_timeout_seconds);
 
-    session_id_map_[write_session_id] = {std::move(keys), std::move(location_ids)};
     ExpireUnitPtr unit_ptr = std::make_shared<ExpireUnit>();
     unit_ptr->write_session_id = write_session_id;
-    unit_ptr->expire_point = TimestampUtil::GetSteadyTimeSec() + write_timeout_seconds;
+    unit_ptr->expire_point = TimestampUtil::GetSteadyTimeUs() + write_timeout_seconds * 1000 * 1000;
     unit_ptr->callback = std::move(callback);
-    expire_queue_.Push(unit_ptr);
+    unit_ptr->write_location_info.keys = std::move(keys);
+    unit_ptr->write_location_info.location_ids = std::move(location_ids);
+    session_id_map_.Put(unit_ptr);
     StoreMinNextSleepTime(write_timeout_seconds);
-    cond_.notify_one();
 }
 
 bool WriteLocationManager::GetAndDelete(const std::string &write_session_id, WriteLocationInfo &location_info) {
-    if (session_id_map_.Contains(write_session_id)) {
-        location_info = session_id_map_.Find(write_session_id)->second;
-        KVCM_LOG_DEBUG("Retrieved and deleted session %s with %zu keys and %zu location_ids",
-                       write_session_id.c_str(),
-                       location_info.keys.size(),
-                       location_info.location_ids.size());
-
-        SessionIdMap::SizeType erase_count = session_id_map_.Erase(write_session_id);
-        return (erase_count > 0);
-    }
-    return false;
+    return session_id_map_.GetAndDelete(write_session_id, location_info);
 }
 
 } // namespace kv_cache_manager

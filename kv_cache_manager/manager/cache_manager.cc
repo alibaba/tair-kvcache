@@ -417,10 +417,11 @@ CacheManager::StartWriteCache(RequestContext *request_context,
         RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, StartWriteCacheInfo, "start write cache failed");
     }
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, PutWriteLocationManager);
+    constexpr int64_t kMaxWriteTimeoutSeconds = 1800;
     write_location_manager_->Put(write_session_id,
                                  std::move(new_keys),
                                  std::move(location_ids),
-                                 write_timeout_seconds,
+                                 std::min(kMaxWriteTimeoutSeconds, write_timeout_seconds),
                                  [this, trace_id, instance_id, write_session_id] {
                                      RequestContext temp_request_context(trace_id);
                                      BlockMaskOffset failed_mask = 0;

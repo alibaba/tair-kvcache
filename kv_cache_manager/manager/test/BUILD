@@ -168,3 +168,16 @@ cc_test(
         "@cpp_stub",
     ],
 )
+
+cc_test(
+    name = "WriteLocationManagerPerf",
+    srcs = [
+        "write_location_manager_perf.cc",
+    ],
+    copts = ["-fno-access-control"],
+    tags = ["manual"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/manager:write_location_manager",
+    ],
+)
