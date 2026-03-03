@@ -74,6 +74,7 @@ cc_library(
     name = "tair_mempool",
     linkopts = [
         "-L/usr/local/lib64/",
+        "-L/usr/lib64/",
         "-libverbs",
         "-lrdmacm",
     ] + select({
