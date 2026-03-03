@@ -90,15 +90,6 @@ ClientErrorCode MooncakeSdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_b
         return ER_SDKINIT_ERROR;
     }
 
-    ErrorCode_t err2 = mooncake_client_mount_segment(client_, sdk_backend_config_->local_buffer_size());
-
-    if (err2 != MOONCAKE_ERROR_OK) {
-        KVCM_LOG_WARN("failed to mount segment for mooncake client, global size: [%zu], mooncake errorcode: [%d]",
-                      sdk_backend_config_->local_buffer_size(),
-                      err);
-        return ER_SDKINIT_ERROR;
-    }
-
     return ER_OK;
 }
 
