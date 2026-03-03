@@ -174,6 +174,7 @@ cc_library(
         "//conditions:default": [],
     }),
     linkopts = [
+        "-L/usr/lib64/",
         "-L/usr/local/lib64/",
         "-libverbs",
         "-lrdmacm",

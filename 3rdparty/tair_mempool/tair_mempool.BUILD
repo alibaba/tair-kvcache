@@ -73,6 +73,7 @@ cuda_library(
 cc_library(
     name = "tair_mempool",
     linkopts = [
+        "-L/usr/lib64/",
         "-L/usr/local/lib64/",
         "-libverbs",
         "-lrdmacm",
