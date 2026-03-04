@@ -25,27 +25,4 @@ std::string ToString(const EvictionPolicyType &type) {
     }
 }
 
-TraceType ToTraceType(const std::string &str) {
-    if (str == "publisher_log") {
-        return TraceType::TRACE_PUBLISHER_LOG;
-    } else if (str == "qwen_bailian") {
-        return TraceType::TRACE_QWEN_BAILIAN;
-    } else if (str == "optimizer_schema") {
-        return TraceType::TRACE_OPTIMIZER_SCHEMA;
-    } else {
-        return TraceType::TRACE_UNSPECIFIED;
-    }
-}
-std::string ToString(const TraceType &type) {
-    switch (type) {
-    case TraceType::TRACE_PUBLISHER_LOG:
-        return "publisher_log";
-    case TraceType::TRACE_QWEN_BAILIAN:
-        return "qwen_bailian";
-    case TraceType::TRACE_OPTIMIZER_SCHEMA:
-        return "optimizer_schema";
-    default:
-        return "unspecified";
-    }
-}
 } // namespace kv_cache_manager

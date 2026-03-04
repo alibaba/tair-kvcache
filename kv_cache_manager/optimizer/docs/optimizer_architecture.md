@@ -181,7 +181,6 @@ public:
 ```
 OptimizerConfig (顶层配置)
     ├── trace_file_path (Trace 文件路径)
-    ├── trace_type (Trace 类型)
     ├── output_result_path (输出路径)
     ├── eviction_params (驱逐参数)
     │   ├── eviction_mode (驱逐模式)
@@ -204,7 +203,6 @@ OptimizerConfig (顶层配置)
 ```json
 {
     "trace_file_path": "/path/to/trace/file.jsonl",
-    "trace_type": "qwen_bailian",
     "output_result_path": "/path/to/output/result/",
     "eviction_params": {
         "eviction_mode": 1,
@@ -245,7 +243,6 @@ OptimizerConfig (顶层配置)
 | 参数 | 说明 |
 |------|------|
 | trace_file_path | Trace 文件路径 |
-| trace_type | Trace 类型：publisher_log 或 qwen_bailian |
 | output_result_path | 结果输出目录 |
 | eviction_mode | 驱逐模式：1=GROUP_ROUGH, 2=INSTANCE_ROUGH, 3=INSTANCE_PRECISE |
 | eviction_batch_size_per_instance | 粗粒度驱逐时的批量大小 |

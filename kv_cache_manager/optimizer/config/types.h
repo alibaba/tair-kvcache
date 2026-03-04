@@ -12,13 +12,6 @@ enum class EvictionPolicyType {
     POLICY_RANDOM_LRU = 2,
     POLICY_LEAF_AWARE_LRU = 3,
 };
-enum class TraceType {
-    TRACE_UNSPECIFIED = 0,
-    TRACE_PUBLISHER_LOG = 1,
-    TRACE_QWEN_BAILIAN = 2,
-    TRACE_OPTIMIZER_SCHEMA = 3
-};
-
 enum class EvictionMode {
     EVICTION_MODE_UNSPECIFIED = 0,
     EVICTION_MODE_GROUP_ROUGH = 1,
@@ -78,7 +71,5 @@ struct RadixTreeNode {
 };
 
 EvictionPolicyType ToEvictionPolicyType(const std::string &str);
-TraceType ToTraceType(const std::string &str);
 std::string ToString(const EvictionPolicyType &type);
-std::string ToString(const TraceType &type);
 } // namespace kv_cache_manager

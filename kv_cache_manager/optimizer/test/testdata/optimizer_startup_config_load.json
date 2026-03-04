@@ -1,6 +1,5 @@
 {
     "trace_file_path" : "/mnt/baiyi/KVCacheManager/kv_cache_manager/optimizer/analysis/result/event_publisher.log",
-    "trace_type": "publisher_log",
     "output_result_path": "/mnt/baiyi/KVCacheManager/kv_cache_manager/optimizer/analysis/result/event_publisher",
     "eviction_params": {
         "eviction_mode": 1,

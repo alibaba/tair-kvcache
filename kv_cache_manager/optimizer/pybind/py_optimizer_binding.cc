@@ -45,11 +45,6 @@ PYBIND11_MODULE(kvcm_py_optimizer, module) {
         .value("LEAF_AWARE_LRU", kvcm::EvictionPolicyType::POLICY_LEAF_AWARE_LRU)
         .finalize();
 
-    py::native_enum<kvcm::TraceType>(module, "TraceType", "enum.Enum")
-        .value("TRACE_UNSPECIFIED", kvcm::TraceType::TRACE_UNSPECIFIED)
-        .value("TRACE_PUBLISHER_LOG", kvcm::TraceType::TRACE_PUBLISHER_LOG)
-        .value("TRACE_QWEN_BAILIAN", kvcm::TraceType::TRACE_QWEN_BAILIAN)
-        .finalize();
     py::native_enum<kvcm::DataStorageType>(module, "DataStorageType", "enum.Enum")
         .value("DATA_STORAGE_TYPE_UNKNOWN", kvcm::DataStorageType::DATA_STORAGE_TYPE_UNKNOWN)
         .value("DATA_STORAGE_TYPE_HF3FS", kvcm::DataStorageType::DATA_STORAGE_TYPE_HF3FS)

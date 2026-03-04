@@ -30,7 +30,7 @@ public:
     void set_instance_groups(const std::vector<OptInstanceGroupConfig> &groups) { instance_groups_ = groups; }
 
 private:
-    std::string trace_file_path_; // 必须是标准格式trace文件
+    std::string trace_file_path_;
     std::string output_result_path_;
     EvictionConfig eviction_config_;
     std::vector<OptInstanceGroupConfig> instance_groups_;
