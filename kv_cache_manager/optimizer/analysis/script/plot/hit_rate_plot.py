@@ -1,9 +1,24 @@
-import pandas as pd
-import matplotlib.pyplot as plt
-import argparse
-import os
+#!/usr/bin/env python3
+"""
+命中率时序图绘制
+
+职责：
+- 读取多个 instance 的 hit_rates CSV
+- 将各 instance 的命中率对齐到统一时间轴（ZOH 插值）
+- 双子图：累计命中率 + 瞬时命中率（平滑）
+- plot_multi_instance_analysis() 可被其他脚本直接 import
+
+被 run/optimizer_run.py 和 run/tradeoff_by_*.py 调用。
+"""
+
 import glob
+import os
+
+import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
+
+
 
 def read_csv_file(csv_file_path):
     """
@@ -18,7 +33,7 @@ def read_csv_file(csv_file_path):
         return None
 
 def plot_multi_instance_analysis(csv_dir):
-    csv_files = sorted(glob.glob(os.path.join(csv_dir, "*.csv")))
+    csv_files = sorted(glob.glob(os.path.join(csv_dir, "*_hit_rates.csv")))
     if not csv_files:
         print(f"Error: No CSV files found in directory: {csv_dir}")
         return
@@ -222,22 +237,5 @@ def plot_multi_instance_analysis(csv_dir):
     output_file = os.path.join(csv_dir, "multi_instance_cache_analysis.png")
     plt.savefig(output_file, dpi=300, bbox_inches='tight', facecolor='white')
     print(f"Chart saved to: {output_file}")
-    plt.show()
+    plt.close()
 
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description='绘制多instance缓存分析图表，展示所有instance的存储容量总和以及各自命中率随时间的变化'
-    )
-    parser.add_argument(
-        '-i', '--input-csv-dir',
-        type=str,
-        required=True,
-        help='输入的CSV文件目录路径（目录中包含多个instance的CSV文件）'
-    )
-    return parser.parse_args()
-
-
-if __name__ == "__main__":
-    args = parse_args()
-    plot_multi_instance_analysis(args.input_csv_dir)

@@ -5,6 +5,7 @@
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Dict, List, Set, Tuple, Optional
@@ -244,192 +245,86 @@ class RadixTreeVisualizer:
         print(f"Top {top_k} Hot Nodes (by access_count)")
         print(f"{'=' * 80}")
 
-        hot_nodes = self.get_hot_nodes(top_k, 'access_count')
+        for i, node in enumerate(self.get_hot_nodes(top_k, 'access_count'), 1):
+            nid = node.get('node_id', 'unknown')
+            nc = self._get_block_count(node, 'cached_blocks')
+            nt = self._get_block_count(node, 'total_blocks')
+            ratio = nc / max(1, nt)
 
-        for i, node in enumerate(hot_nodes, 1):
-            node_id = node.get('node_id', 'unknown')
-            access_count = node.get('access_count', 0)
-            
-            # 处理新格式：cached_blocks 和 total_blocks 现在是列表
-            cached_blocks_list = node.get('cached_blocks', [])
-            total_blocks_list = node.get('total_blocks', [])
-            
-            # 兼容旧格式（如果是数字）
-            if isinstance(cached_blocks_list, (int, float)):
-                num_cached = int(cached_blocks_list)
-                num_total = int(node.get('total_blocks', 0))
-            else:
-                num_cached = len(cached_blocks_list)
-                num_total = len(total_blocks_list)
-            
-            cache_ratio = num_cached / max(1, num_total)
-            depth = self.get_node_depth(node_id)
+            print(f"\n#{i} Node ID: {nid}")
+            print(f"  Access: {node.get('access_count', 0)}  Depth: {self.get_node_depth(nid)}  Leaf: {node.get('is_leaf', False)}")
+            print(f"  Cached: {nc}/{nt} ({ratio*100:.1f}%)  Last Access: {node.get('last_access_time', 0)}")
 
-            print(f"\n#{i} Node ID: {node_id}")
-            print(f"  Access Count: {access_count}")
-            print(f"  Cached Blocks: {num_cached} / {num_total} ({cache_ratio*100:.1f}%)")
-            print(f"  Depth: {depth}")
-            print(f"  Last Access Time: {node.get('last_access_time', 0)}")
-            print(f"  Is Leaf: {node.get('is_leaf', False)}")
-
-            # 显示 block 序列
-            if total_blocks_list and not isinstance(total_blocks_list, (int, float)):
-                display_blocks = total_blocks_list[:20]
-                block_str = str(display_blocks)
-                if len(total_blocks_list) > 20:
-                    block_str += f" ... (total {len(total_blocks_list)} blocks)"
-                print(f"  Total Block Sequence: {block_str}")
-                
-                if cached_blocks_list:
-                    display_cached = cached_blocks_list[:20]
-                    cached_str = str(display_cached)
-                    if len(cached_blocks_list) > 20:
-                        cached_str += f" ... (total {len(cached_blocks_list)} cached)"
-                    print(f"  Cached Block Sequence: {cached_str}")
+            for key, label in [('total_blocks', 'Total'), ('cached_blocks', 'Cached')]:
+                blocks = self._get_block_list(node, key)
+                if blocks:
+                    preview = str(blocks[:20])
+                    if len(blocks) > 20:
+                        preview += f" ... ({len(blocks)} total)"
+                    print(f"  {label} Blocks: {preview}")
     
+    _NODE_TYPE_LABELS = {
+        "hot": "HOT NODE", "root": "ROOT", "leaf": "LEAF", "internal": "INTERNAL"
+    }
+
     def print_hot_paths_with_blocks(self, top_k=10, max_blocks_per_node=50):
-        """
-        打印热点路径的完整信息，包括每个节点的 block 序列
-        
-        Args:
-            top_k: 显示前 k 个热点节点的路径
-            max_blocks_per_node: 每个节点最多显示多少个 blocks
-        """
-        print(f"\n{'=' * 80}")
-        print(f"Top {top_k} Hot Paths with Block Sequences")
-        print(f"{'=' * 80}")
-        
-        hot_nodes = self.get_hot_nodes(top_k, 'access_count')
-        
-        for i, node in enumerate(hot_nodes, 1):
-            node_id = node.get('node_id', 'unknown')
-            access_count = node.get('access_count', 0)
-            
-            print(f"\n{'─' * 80}")
-            print(f"Hot Path #{i} (Access: {access_count})")
-            print(f"{'─' * 80}")
-            
-            # 获取从根到该热点节点的路径
-            path = self.get_path_to_root(node_id)
-            path.reverse()  # 从根到叶子
-            
-            # 累积的 block 序列（用于显示前缀复用）
-            accumulated_blocks = []
-            
-            for depth, path_node_id in enumerate(path):
-                if path_node_id not in self.node_map:
+        """打印热点路径信息（含每节点 block 序列）"""
+        print(f"\n{'=' * 80}\nTop {top_k} Hot Paths with Block Sequences\n{'=' * 80}")
+
+        for i, node in enumerate(self.get_hot_nodes(top_k, 'access_count'), 1):
+            nid = node.get('node_id', 'unknown')
+            print(f"\n{'─' * 80}\nHot Path #{i} (Access: {node.get('access_count', 0)})\n{'─' * 80}")
+
+            path = self.get_path_to_root(nid)
+            path.reverse()
+            accumulated = []
+
+            for depth, pid in enumerate(path):
+                if pid not in self.node_map:
                     continue
-                    
-                node_data = self.node_map[path_node_id]
-                node_access = node_data.get('access_count', 0)
-                node_cached = self._get_block_count(node_data, 'cached_blocks')
-                node_total = self._get_block_count(node_data, 'total_blocks')
-                # 使用 total_blocks 列表作为完整的 block 序列
-                node_blocks = self._get_block_list(node_data, 'total_blocks')
-                is_leaf = node_data.get('is_leaf', False)
-                
-                # 节点类型标记
-                if path_node_id == node_id:
-                    node_type = "🔥 HOT NODE"
-                elif depth == 0:
-                    node_type = "🌳 ROOT"
-                elif is_leaf:
-                    node_type = "🍃 LEAF"
-                else:
-                    node_type = "📂 INTERNAL"
-                
-                print(f"\n  [{node_type}] Depth {depth}")
-                print(f"  Node ID: {path_node_id}")
-                print(f"  Access: {node_access}, Cached: {node_cached}/{node_total}")
-                
-                if node_blocks:
-                    # 显示这个节点的 blocks
-                    display_blocks = node_blocks[:max_blocks_per_node]
-                    
-                    # 计算新增的 blocks（相对于父节点）
-                    new_blocks = [b for b in display_blocks if b not in accumulated_blocks]
-                    
+                nd = self.node_map[pid]
+                kind = "hot" if pid == nid else ("root" if depth == 0 else ("leaf" if nd.get('is_leaf') else "internal"))
+                blocks = self._get_block_list(nd, 'total_blocks')[:max_blocks_per_node]
+                new_blocks = [b for b in blocks if b not in accumulated]
+
+                print(f"\n  [{self._NODE_TYPE_LABELS[kind]}] Depth {depth}  ID: {pid}")
+                print(f"  Access: {nd.get('access_count', 0)}  Cached: {self._get_block_count(nd, 'cached_blocks')}/{self._get_block_count(nd, 'total_blocks')}")
+
+                if blocks:
                     if depth == 0:
-                        # 根节点
-                        print(f"  Blocks ({len(node_blocks)} total): {display_blocks}")
+                        print(f"  Blocks ({len(self._get_block_list(nd, 'total_blocks'))} total): {blocks}")
                     else:
-                        # 显示新增的和累积的
-                        print(f"  New Blocks: {new_blocks if new_blocks else '(none)'}")
-                        print(f"  Accumulated: {accumulated_blocks + new_blocks}")
-                    
-                    if len(node_blocks) > max_blocks_per_node:
-                        print(f"  ... and {len(node_blocks) - max_blocks_per_node} more blocks")
-                    
-                    # 更新累积序列
-                    accumulated_blocks.extend(new_blocks)
-                else:
-                    print(f"  Blocks: (none)")
-            
-            # 显示完整路径的 block 序列
-            print(f"\n  {'─' * 76}")
-            print(f"  Complete Path Block Sequence ({len(accumulated_blocks)} blocks):")
-            print(f"  {accumulated_blocks}")
-            print(f"  {'─' * 76}")
+                        print(f"  New: {new_blocks or '(none)'}  Accumulated: {accumulated + new_blocks}")
+                    full_len = len(self._get_block_list(nd, 'total_blocks'))
+                    if full_len > max_blocks_per_node:
+                        print(f"  ... and {full_len - max_blocks_per_node} more")
+                    accumulated.extend(new_blocks)
+
+            print(f"\n  {'─' * 76}\n  Path Blocks ({len(accumulated)}): {accumulated}\n  {'─' * 76}")
 
     def _hierarchical_layout_improved(self, graph: nx.DiGraph = None) -> Dict[str, Tuple[float, float]]:
-        """
-        改进的层次化布局算法
-        使用子树宽度计算，避免节点重叠
-        
-        Args:
-            graph: 要布局的图，默认使用 self.graph
-            
-        Returns:
-            节点位置字典 {node_id: (x, y)}
-        """
+        """子树宽度驱动的层次化布局（避免节点重叠）"""
         if graph is None:
             graph = self.graph
-            
-        # 找到根节点
-        root = None
-        for node_id in graph.nodes():
-            if graph.in_degree(node_id) == 0:
-                root = node_id
-                break
-        
-        if not root:
-            root = list(graph.nodes())[0]
-        
-        # 1. 计算每个节点的子树大小（叶子节点数量）
+
+        root = next((n for n in graph.nodes() if graph.in_degree(n) == 0), list(graph.nodes())[0])
+
         subtree_sizes: Dict[str, int] = {}
-        
-        def calculate_subtree_size(node_id: str) -> int:
-            """递归计算子树大小"""
-            if node_id in subtree_sizes:
-                return subtree_sizes[node_id]
-            
-            children = list(graph.successors(node_id))
-            if not children:
-                # 叶子节点
-                subtree_sizes[node_id] = 1
-                return 1
-            
-            # 非叶子节点：子树大小 = 所有子节点的子树大小之和
-            size = sum(calculate_subtree_size(child) for child in children)
-            subtree_sizes[node_id] = size
-            return size
-        
-        calculate_subtree_size(root)
-        
-        # 2. 使用后序遍历分配位置
+        def calc_size(nid: str) -> int:
+            if nid in subtree_sizes:
+                return subtree_sizes[nid]
+            children = list(graph.successors(nid))
+            subtree_sizes[nid] = sum(calc_size(c) for c in children) if children else 1
+            return subtree_sizes[nid]
+        calc_size(root)
+
         pos: Dict[str, Tuple[float, float]] = {}
-        
-        # 增加节点间距，让树更宽松
-        vertical_spacing = 3.0      # 垂直间距（层与层之间）
-        horizontal_spacing = 2.5    # 水平间距（兄弟节点之间）
-        
-        # 用于跟踪下一个可用的x坐标
-        next_x = [0]  # 使用列表以便在闭包中修改
-        
+        vertical_spacing = 3.0
+        horizontal_spacing = 2.5
+        next_x = [0]
+
         def assign_positions(node_id: str, depth: int) -> Tuple[float, float]:
-            """
-            后序遍历分配位置
-            Returns: (left_x, right_x) 子树占用的x范围
+            """后序遍历分配位置, 返回 (left_x, right_x)
             """
             children = list(graph.successors(node_id))
             
@@ -461,46 +356,20 @@ class RadixTreeVisualizer:
         return pos
 
     def _get_best_layout(self) -> str:
-        """选择最佳布局算法"""
-        num_nodes = len(self.graph.nodes())
-        
-        # 如果节点太多（>2000），直接使用自定义布局（graphviz 可能很慢或失败）
-        # if num_nodes > 2000:
-        #     print(f"[INFO] Tree has {num_nodes} nodes (>2000), using custom layout for better performance")
-        #     return "custom_hierarchical"
-        
-        # 优先尝试 pygraphviz
-        try:
-            import pygraphviz
-            # 测试是否真的可用
+        """选择最佳布局算法: pygraphviz > pydot > 自定义"""
+        test_g = nx.DiGraph()
+        test_g.add_edge(1, 2)
+
+        for name, layout_fn in [
+            ("graphviz_agraph", lambda g: nx.nx_agraph.graphviz_layout(g, prog="dot")),
+            ("graphviz_pydot",  lambda g: nx.nx_pydot.graphviz_layout(g, prog="dot")),
+        ]:
             try:
-                test_g = nx.DiGraph()
-                test_g.add_edge(1, 2)
-                nx.nx_agraph.graphviz_layout(test_g, prog='dot')
-                return "graphviz_agraph"
-            except Exception as e:
-                # graphviz 安装了但不能用（版本不匹配等）
-                if 'undefined symbol' in str(e):
-                    print(f"[WARNING] pygraphviz version mismatch with graphviz")
-                    print(f"   Tip: Try 'conda install -c conda-forge pygraphviz' to reinstall")
-        except ImportError:
-            pass
-        
-        # 尝试 pydot 作为备选
-        try:
-            import pydot
-            try:
-                test_g = nx.DiGraph()
-                test_g.add_edge(1, 2)
-                nx.nx_pydot.graphviz_layout(test_g, prog='dot')
-                print("[INFO] Using pydot as graphviz interface")
-                return "graphviz_pydot"
-            except:
+                layout_fn(test_g)
+                return name
+            except Exception:
                 pass
-        except ImportError:
-            pass
-        
-        # 都不行，使用自定义布局
+
         return "custom_hierarchical"
 
     def _compute_layout(self, layout_type: str, graph: nx.DiGraph = None) -> Dict:
@@ -509,113 +378,56 @@ class RadixTreeVisualizer:
             graph = self.graph
         
         num_nodes = len(graph.nodes())
-            
-        if layout_type == "graphviz_agraph":
+
+        layout_fns = {
+            "graphviz_agraph": lambda: nx.nx_agraph.graphviz_layout(
+                graph, prog="dot", args="-Granksep=2.0 -Gnodesep=1.5"),
+            "graphviz_pydot": lambda: nx.nx_pydot.graphviz_layout(graph, prog="dot"),
+        }
+
+        if layout_type in layout_fns:
             try:
-                # 设置 graphviz 参数增加间距
-                # ranksep: 层与层之间的距离
-                # nodesep: 同一层节点之间的距离
-                pos = nx.nx_agraph.graphviz_layout(
-                    graph, 
-                    prog='dot',
-                    args='-Granksep=2.0 -Gnodesep=1.5'
-                )
+                pos = layout_fns[layout_type]()
                 if pos and len(pos) == num_nodes:
-                    print("[INFO] Using graphviz dot layout via pygraphviz (best quality)")
+                    print(f"[INFO] Using {layout_type} layout ({num_nodes} nodes)")
                     return pos
-                else:
-                    print(f"[WARNING] pygraphviz returned invalid layout")
+                print(f"[WARNING] {layout_type} returned invalid layout")
             except Exception as e:
-                print(f"[WARNING] pygraphviz unavailable: {e}")
-                if 'undefined symbol' in str(e):
-                    print(f"   Reason: pygraphviz version mismatch")
-        
-        if layout_type == "graphviz_pydot":
-            try:
-                # 设置 graphviz 参数增加间距
-                pos = nx.nx_pydot.graphviz_layout(
-                    graph, 
-                    prog='dot'
-                )
-                # 验证返回的布局是否有效
-                if pos and len(pos) == num_nodes:
-                    print("[INFO] Using graphviz dot layout via pydot (good quality)")
-                    return pos
-                else:
-                    print(f"[WARNING] pydot returned invalid layout (got {len(pos) if pos else 0} positions for {num_nodes} nodes)")
-            except Exception as e:
-                print(f"[WARNING] pydot failed: {e}")
-        
-        # 使用改进的自定义层次布局
-        print(f"[INFO] Using custom hierarchical layout for {num_nodes} nodes (no extra dependencies)")
+                print(f"[WARNING] {layout_type} failed: {e}")
+
+        print(f"[INFO] Using custom hierarchical layout ({num_nodes} nodes)")
         return self._hierarchical_layout_improved(graph)
 
+    # 热度阈值 -> 颜色映射（降序匹配）
+    _HEAT_COLORS = [(0.7, '#d32f2f'), (0.4, '#f57c00'), (0.2, '#fbc02d'), (0.0, '#1976d2')]
+
     def _prepare_node_styles(self, hot_node_ids: Set[str], base_size: int, graph: nx.DiGraph = None) -> Tuple[List, List, List, List, List]:
-        """
-        准备节点的颜色、大小、透明度、边框颜色和边框宽度
-        
-        设计原则：
-        - 颜色：表示访问热度（红色热，黄色温，蓝色冷）- 热度图
-        - 大小：表示块数量（块越多节点越大）
-        - 边框：Top K 热点节点用粗黑边框标识
-        """
+        """准备节点的颜色/大小/透明度/边框颜色/边框宽度"""
         if graph is None:
             graph = self.graph
-            
-        node_colors = []
-        node_sizes = []
-        node_alphas = []
-        edge_colors = []
-        edge_widths = []
 
-        # 计算访问次数的归一化范围（用于颜色映射）
-        all_access_counts = [
-            graph.nodes[node_id].get('access_count', 0)
-            for node_id in graph.nodes()
-        ]
-        max_access = max(all_access_counts) if all_access_counts else 1
+        max_access = max((graph.nodes[n].get('access_count', 0) for n in graph.nodes()), default=1) or 1
+        node_colors, node_sizes, node_alphas, edge_colors, edge_widths = [], [], [], [], []
 
         for node_id in graph.nodes():
-            node_data = graph.nodes[node_id]
-            access_count = node_data.get('access_count', 0)
-            cached_blocks = self._get_block_count(node_data, 'cached_blocks')
-            total_blocks = self._get_block_count(node_data, 'total_blocks')
+            data = graph.nodes[node_id]
+            acc = data.get('access_count', 0)
+            cached = self._get_block_count(data, 'cached_blocks')
 
-            # 1. 节点大小：基于块数量（缓存的块数）
-            if cached_blocks > 0:
-                # 使用对数缩放，避免差异过大
-                import math
-                size_multiplier = 0.5 + math.log(cached_blocks + 1) / 3
-            else:
-                size_multiplier = 0.3
-            node_sizes.append(base_size * size_multiplier)
+            node_sizes.append(base_size * (0.5 + math.log(cached + 1) / 3 if cached > 0 else 0.3))
 
-            # 2. 节点颜色：基于访问热度（热度图）
-            if access_count > 0:
-                # 归一化访问次数到 0-1
-                heat = access_count / max_access
-                
-                # 热度图颜色映射：蓝色(冷) -> 绿色 -> 黄色 -> 红色(热)
-                if heat > 0.7:
-                    node_colors.append('#d32f2f')  # 深红色 - 非常热
-                elif heat > 0.4:
-                    node_colors.append('#f57c00')  # 橙色 - 热
-                elif heat > 0.2:
-                    node_colors.append('#fbc02d')  # 黄色 - 温
-                else:
-                    node_colors.append('#1976d2')  # 蓝色 - 冷
+            if acc > 0:
+                heat = acc / max_access
+                color = next(c for t, c in self._HEAT_COLORS if heat > t)
+                node_colors.append(color)
                 node_alphas.append(0.9)
             else:
-                node_colors.append('#bdbdbd')  # 灰色 - 无访问
+                node_colors.append('#bdbdbd')
                 node_alphas.append(0.5)
 
-            # 3. 边框：Top K 热点节点用粗金色边框突出显示
-            if node_id in hot_node_ids:
-                edge_colors.append('#FFD700')  # 金色粗边框（醒目但不突兀）
-                edge_widths.append(4)
-            else:
-                edge_colors.append('white')
-                edge_widths.append(2)
+            is_hot = node_id in hot_node_ids
+            edge_colors.append('#FFD700' if is_hot else 'white')
+            edge_widths.append(4 if is_hot else 2)
 
         return node_colors, node_sizes, node_alphas, edge_colors, edge_widths
 
@@ -650,6 +462,34 @@ class RadixTreeVisualizer:
                 labels[node_id] = ""  # 无访问的节点不显示标签
 
         return labels
+
+    def _build_legend(self, ax, graph, top_k, marker_size=12):
+        """构建访问热度图例（full tree 和 hot paths 共用）"""
+        from matplotlib.lines import Line2D
+
+        all_access = [graph.nodes[n].get('access_count', 0) for n in graph.nodes()]
+        max_acc = max(all_access) if all_access else 1
+        ms = marker_size
+
+        elements = [
+            Line2D([0], [0], marker='o', color='w', markerfacecolor='#d32f2f',
+                   markersize=ms, label=f'Very Hot (>{int(max_acc*0.7)} acc, >70%)'),
+            Line2D([0], [0], marker='o', color='w', markerfacecolor='#f57c00',
+                   markersize=ms, label=f'Hot ({int(max_acc*0.4)}-{int(max_acc*0.7)} acc, 40-70%)'),
+            Line2D([0], [0], marker='o', color='w', markerfacecolor='#fbc02d',
+                   markersize=ms, label=f'Warm ({int(max_acc*0.2)}-{int(max_acc*0.4)} acc, 20-40%)'),
+            Line2D([0], [0], marker='o', color='w', markerfacecolor='#1976d2',
+                   markersize=ms, label=f'Cold (<{int(max_acc*0.2)} acc, <20%)'),
+            Line2D([0], [0], marker='o', color='w', markerfacecolor='#bdbdbd',
+                   markersize=ms - 2, label='Inactive (0 access)'),
+            Line2D([0], [0], marker='o', color='w', markerfacecolor='#d32f2f',
+                   markeredgecolor='#FFD700', markeredgewidth=3,
+                   markersize=ms, label=f'Top {top_k} Hot Nodes (Gold Border)'),
+            Line2D([0], [0], marker='o', color='w', markerfacecolor='gray',
+                   markersize=ms + 4, label='Node Size = Cached Blocks'),
+        ]
+        ax.legend(handles=elements, loc='upper left', fontsize=8,
+                  title=f'Legend (Max Access: {max_acc})', title_fontsize=9)
 
     def visualize_tree(self, output_path=None, show_labels=True, node_size=2000,
                        highlight_hot_nodes=True, top_k_hot=10, max_nodes=500, force_layout=None):
@@ -733,35 +573,7 @@ class RadixTreeVisualizer:
 
         ax.set_title(title_text, fontsize=14, fontweight='bold', pad=20)
 
-        # 添加图例
-        from matplotlib.lines import Line2D
-        
-        # 计算实际的访问次数范围用于图例
-        all_access = [self.graph.nodes[n].get('access_count', 0) for n in self.graph.nodes()]
-        max_acc = max(all_access) if all_access else 1
-        
-        legend_elements = [
-            # 颜色表示访问热度（相对于最大访问次数）
-            Line2D([0], [0], marker='o', color='w', markerfacecolor='#d32f2f', 
-                   markersize=12, label=f'Very Hot (>{int(max_acc*0.7)} acc, >70% of max)'),
-            Line2D([0], [0], marker='o', color='w', markerfacecolor='#f57c00', 
-                   markersize=12, label=f'Hot ({int(max_acc*0.4)}-{int(max_acc*0.7)} acc, 40-70%)'),
-            Line2D([0], [0], marker='o', color='w', markerfacecolor='#fbc02d', 
-                   markersize=12, label=f'Warm ({int(max_acc*0.2)}-{int(max_acc*0.4)} acc, 20-40%)'),
-            Line2D([0], [0], marker='o', color='w', markerfacecolor='#1976d2', 
-                   markersize=12, label=f'Cold (<{int(max_acc*0.2)} acc, <20%)'),
-            Line2D([0], [0], marker='o', color='w', markerfacecolor='#bdbdbd', 
-                   markersize=10, label='Inactive (0 access)'),
-            # 边框表示 Top K 热点
-            Line2D([0], [0], marker='o', color='w', markerfacecolor='#d32f2f',
-                   markeredgecolor='#FFD700', markeredgewidth=3,
-                   markersize=12, label=f'Top {top_k_hot} Hot Nodes (Gold Border)'),
-            # 大小表示块数量
-            Line2D([0], [0], marker='o', color='w', markerfacecolor='gray',
-                   markersize=16, label='Node Size = Cached Blocks'),
-        ]
-        ax.legend(handles=legend_elements, loc='upper left', fontsize=8, 
-                 title=f'Legend (Max Access: {max_acc})', title_fontsize=9)
+        self._build_legend(ax, self.graph, top_k_hot, marker_size=12)
 
         ax.axis('off')
         plt.tight_layout()
@@ -836,33 +648,7 @@ class RadixTreeVisualizer:
                               node_size=node_sizes, alpha=node_alphas,
                               edgecolors=edge_colors, linewidths=edge_widths, ax=ax)
 
-        # 标签
-        # 找到根节点
-        root_id = None
-        for node_id in subgraph.nodes():
-            if subgraph.in_degree(node_id) == 0:
-                root_id = node_id
-                break
-        
-        labels = {}
-        for node_id in subgraph.nodes():
-            node_data = subgraph.nodes[node_id]
-            access_count = node_data.get('access_count', 0)
-            cached_blocks = self._get_block_count(node_data, 'cached_blocks')
-            total_blocks = self._get_block_count(node_data, 'total_blocks')
-
-            # 根节点特殊显示
-            if node_id == root_id:
-                labels[node_id] = "ROOT"
-            elif node_id in hot_node_ids:
-                # 热点节点显示访问次数和块信息（金色边框已经标识了，不需要HOT文字）
-                labels[node_id] = (f"Acc:{access_count}\n"
-                                   f"{cached_blocks}/{total_blocks}")
-            else:
-                if access_count > 0:
-                    labels[node_id] = f"{access_count}"
-                else:
-                    labels[node_id] = "."
+        labels = self._generate_node_labels(hot_node_ids, subgraph)
 
         nx.draw_networkx_labels(subgraph, pos, labels, font_size=9,
                                font_weight='bold', font_color='black',
@@ -887,35 +673,7 @@ class RadixTreeVisualizer:
 
         ax.set_title(title_text, fontsize=14, fontweight='bold', pad=20)
 
-        # 添加图例
-        from matplotlib.lines import Line2D
-        
-        # 计算实际的访问次数范围用于图例
-        all_access = [subgraph.nodes[n].get('access_count', 0) for n in subgraph.nodes()]
-        max_acc = max(all_access) if all_access else 1
-        
-        legend_elements = [
-            # 颜色表示访问热度（相对于最大访问次数）
-            Line2D([0], [0], marker='o', color='w', markerfacecolor='#d32f2f', 
-                   markersize=14, label=f'Very Hot (>{int(max_acc*0.7)} acc, >70% of max)'),
-            Line2D([0], [0], marker='o', color='w', markerfacecolor='#f57c00', 
-                   markersize=14, label=f'Hot ({int(max_acc*0.4)}-{int(max_acc*0.7)} acc, 40-70%)'),
-            Line2D([0], [0], marker='o', color='w', markerfacecolor='#fbc02d', 
-                   markersize=14, label=f'Warm ({int(max_acc*0.2)}-{int(max_acc*0.4)} acc, 20-40%)'),
-            Line2D([0], [0], marker='o', color='w', markerfacecolor='#1976d2', 
-                   markersize=14, label=f'Cold (<{int(max_acc*0.2)} acc, <20%)'),
-            Line2D([0], [0], marker='o', color='w', markerfacecolor='#bdbdbd', 
-                   markersize=12, label='Inactive (0 access)'),
-            # 边框表示 Top K 热点
-            Line2D([0], [0], marker='o', color='w', markerfacecolor='#d32f2f',
-                   markeredgecolor='#FFD700', markeredgewidth=3,
-                   markersize=14, label=f'Top {top_k} Hot Nodes (Gold Border)'),
-            # 大小表示块数量
-            Line2D([0], [0], marker='o', color='w', markerfacecolor='gray',
-                   markersize=18, label='Node Size = Cached Blocks'),
-        ]
-        ax.legend(handles=legend_elements, loc='upper left', fontsize=8,
-                 title=f'Legend (Max Access: {max_acc})', title_fontsize=9)
+        self._build_legend(ax, subgraph, top_k, marker_size=14)
 
         ax.axis('off')
         plt.tight_layout()
