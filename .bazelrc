@@ -115,7 +115,10 @@ build:asan --linkopt -fsanitize=address
 build:asan --test_env="ASAN_OPTIONS=detect_odr_violation=0:protect_shadow_gap=0" # protect_shadow_gap : conflict with cuda
 
 build:mooncake --config=cuda
-build:mooncake --define MOONCAKE_USE_CUDA=true --define MOONCAKE_USE_HTTP=true --define MOONCAKE_USE_TCP=true
+build:mooncake --define MOONCAKE_USE_CUDA=true
+
+build:mooncake_common --define MOONCAKE_USE_HTTP=true --define MOONCAKE_USE_TCP=true
+build --config=mooncake_common
 
 build:tair_mempool --config=cuda
 build:tair_mempool --define TAIR_MEMPOOL_USE_CUDA=true
@@ -137,8 +140,6 @@ build:client --define ENABLE_MOONCAKE=true
 build:client --define ENABLE_HF3FS=true
 build:client --define ENABLE_TAIR_MEMPOOL=true
 build:client --define USER_CLIENT_LOGGER=true
-build:client --define MOONCAKE_USE_HTTP=true
-build:client --define MOONCAKE_USE_TCP=true
 
 build:client_with_cuda --config=client
 build:client_with_cuda --config=cuda
