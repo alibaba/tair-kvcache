@@ -52,7 +52,7 @@ void OptIndexerManager::RegisterInstances(const std::unordered_map<std::string, 
     instance_configs_ = instances;
 }
 
-bool OptIndexerManager::CheckAndEvict(const std::string &instance_id) {
+bool OptIndexerManager::CheckAndEvict(const std::string &instance_id, int64_t eviction_timestamp) {
 
     auto instance_it = instance_configs_.find(instance_id);
     if (instance_it == instance_configs_.end()) {
@@ -82,7 +82,7 @@ bool OptIndexerManager::CheckAndEvict(const std::string &instance_id) {
                            evicted_block.second.size(),
                            evicted_block.first.c_str());
             if (indexer) {
-                indexer->CleanEmptyBlocks(evicted_block.second);
+                indexer->CleanEmptyBlocks(evicted_block.second, eviction_timestamp);
             }
         }
     }

@@ -72,9 +72,8 @@ def main():
     print("      Simulation done: {:.2f}s".format(dur_run))
 
     t4 = time.time()
-    lifecycle_label = "enabled" if args.export_lifecycle else "disabled"
-    print("\n[4/4] Analyzing results (lifecycle: {})...".format(lifecycle_label))
-    manager.AnalyzeResults(export_lifecycle=args.export_lifecycle)
+    print("\n[4/4] Analyzing results...")
+    manager.AnalyzeResults()
     dur_analysis = time.time() - t4
     print("      Analysis done: {:.2f}s".format(dur_analysis))
 

@@ -2,7 +2,6 @@
 #include <string>
 
 #include "kv_cache_manager/common/logger.h"
-#include "kv_cache_manager/optimizer/analysis/result_analysis.h"
 #include "kv_cache_manager/optimizer/config/optimizer_config_loader.h"
 #include "kv_cache_manager/optimizer/manager/optimizer_manager.h"
 
@@ -42,9 +41,6 @@ int main(int argc, char *argv[]) {
     const auto &config = config_loader.get_config();
     std::string trace_file_path = config.trace_file_path();
     std::string output_result_path = config.output_result_path();
-
-    // 使用配置文件中指定的 trace_type
-    // 支持三种输入格式：qwen_bailian, publisher_log, optimizer_schema
 
     // 创建优化器管理器
     auto optimizer = std::make_unique<kv_cache_manager::OptimizerManager>(config);

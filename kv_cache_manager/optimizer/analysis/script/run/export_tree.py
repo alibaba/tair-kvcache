@@ -101,7 +101,7 @@ Examples:
 
     print("[INFO] Running optimizer...")
     optimizer.DirectRun()
-    optimizer.AnalyzeResults(export_lifecycle=False)
+    optimizer.AnalyzeResults()
     print("[INFO] Optimizer done\n")
 
     print("[INFO] Exporting radix trees...")

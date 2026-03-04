@@ -28,8 +28,8 @@ public:
     void RegisterInstanceGroups(const std::unordered_map<std::string, OptInstanceGroupConfig> &instance_groups);
     void RegisterInstances(const std::unordered_map<std::string, OptInstanceConfig> &instances);
 
-    // 检查容量并触发驱逐
-    bool CheckAndEvict(const std::string &instance_id);
+    // 检查容量并触发驱逐，eviction_timestamp 用于正确记录 block 的驱逐时刻
+    bool CheckAndEvict(const std::string &instance_id, int64_t eviction_timestamp);
 
     // 获取容量使用情况
     size_t GetCurrentInstanceUsage(const std::string &instance_id) const;

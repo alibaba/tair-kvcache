@@ -24,6 +24,7 @@ cc_library(
         "//kv_cache_manager/optimizer/trace_loader",
         "//kv_cache_manager/manager:cache_location",
         "//kv_cache_manager/optimizer/analysis",
+        "//kv_cache_manager/optimizer/analysis/tracker",
     ],
 )
 

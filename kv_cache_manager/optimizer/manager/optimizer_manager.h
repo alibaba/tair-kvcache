@@ -2,8 +2,8 @@
 #include <memory>
 #include <vector>
 
-#include "kv_cache_manager/optimizer/analysis/result_analysis.h"
-#include "kv_cache_manager/optimizer/analysis/result_structure.h"
+#include "kv_cache_manager/optimizer/analysis/tracker/hit_rate_tracker.h"
+#include "kv_cache_manager/optimizer/analysis/stats_collector.h"
 #include "kv_cache_manager/optimizer/config/insight_simulator_types.h"
 #include "kv_cache_manager/optimizer/config/optimizer_config.h"
 #include "kv_cache_manager/optimizer/config/optimizer_config_loader.h"
@@ -18,7 +18,7 @@ namespace kv_cache_manager {
 
 class OptimizerManager {
 public:
-    OptimizerManager(const OptimizerConfig &config);
+    OptimizerManager(const OptimizerConfig &config, bool enable_lifecycle_tracking = false);
     ~OptimizerManager() = default;
     bool Init();
 
@@ -59,13 +59,17 @@ private:
 
 private:
     OptimizerConfig config_;
-    std::unordered_map<std::string, std::shared_ptr<Result>> result_map_;
     std::unordered_map<std::string, OptInstanceGroupConfig> instance_group_configs_;
     std::unordered_map<std::string, OptInstanceConfig> instance_configs_;
 
     std::shared_ptr<OptEvictionManager> eviction_manager_;
     std::shared_ptr<OptIndexerManager> indexer_manager_;
     std::shared_ptr<OptimizerRunner> optimizer_runner_;
-    std::shared_ptr<HitAnalysis> analyzer_;
+    std::shared_ptr<StatsCollector> stats_collector_;
+
+    // 快速访问指针，所有权归 StatsCollector
+    HitRateTracker *hit_rate_tracker_ = nullptr;
+
+    bool enable_lifecycle_tracking_ = false;
 };
 } // namespace kv_cache_manager

@@ -151,7 +151,7 @@ TEST_F(RadixTreeIndexTest, CleanEmptyBlocks) {
 
     // 创建空的BlockEntry指针列表
     std::vector<BlockEntry *> empty_blocks;
-    index_->CleanEmptyBlocks(empty_blocks);
+    index_->CleanEmptyBlocks(empty_blocks, 2000);
 
     // 不应该崩溃
     SUCCEED();

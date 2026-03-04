@@ -96,7 +96,7 @@ def run_optimizer_with_config_explicit(
     manager = kvcm_py_optimizer.OptimizerManager(config, enable_lifecycle_tracking)
     manager.Init()
     manager.DirectRun()
-    manager.AnalyzeResults(export_lifecycle=export_lifecycle)
+    manager.AnalyzeResults()
 
     if save_csv_to:
         import glob

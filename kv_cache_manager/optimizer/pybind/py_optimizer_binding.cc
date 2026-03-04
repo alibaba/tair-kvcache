@@ -111,10 +111,17 @@ PYBIND11_MODULE(kvcm_py_optimizer, module) {
 
     // 绑定OptimizerManager类
     py::class_<kvcm::OptimizerManager>(module, "OptimizerManager")
-        .def(py::init<const kvcm::OptimizerConfig &>(), py::arg("config"))
+        .def(py::init<const kvcm::OptimizerConfig &, bool>(),
+             py::arg("config"),
+             py::arg("enable_lifecycle_tracking") = false,
+             "Initialize OptimizerManager. Set enable_lifecycle_tracking=True to track block lifecycle (uses ~10GB "
+             "more memory)")
         .def("Init", &kvcm::OptimizerManager::Init, py::call_guard<py::gil_scoped_release>())
         .def("DirectRun", &kvcm::OptimizerManager::DirectRun, py::call_guard<py::gil_scoped_release>())
-        .def("AnalyzeResults", &kvcm::OptimizerManager::AnalyzeResults, py::call_guard<py::gil_scoped_release>())
+        .def("AnalyzeResults",
+             &kvcm::OptimizerManager::AnalyzeResults,
+             py::call_guard<py::gil_scoped_release>(),
+             "Finalize, export and reset all registered trackers")
         .def("ExportRadixTrees", &kvcm::OptimizerManager::ExportRadixTrees, py::call_guard<py::gil_scoped_release>())
         .def("WriteCache",
              &kvcm::OptimizerManager::WriteCache,

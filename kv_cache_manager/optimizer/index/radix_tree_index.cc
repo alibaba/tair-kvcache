@@ -7,6 +7,8 @@
 #include <unordered_set>
 
 #include "kv_cache_manager/manager/cache_location.h"
+#include "kv_cache_manager/optimizer/analysis/stats_collector.h"
+
 namespace kv_cache_manager {
 RadixTreeIndex::RadixTreeIndex(const std::string &instance_id, const std::shared_ptr<EvictionPolicy> &eviction_policy) {
     root_ = std::make_unique<RadixTreeNode>();
@@ -280,12 +282,17 @@ std::vector<int64_t> RadixTreeIndex::InsertQuery(RadixTreeNode *node,
         }
     }
 }
-void RadixTreeIndex::CleanEmptyBlocks(const std::vector<BlockEntry *> &blocks) {
+void RadixTreeIndex::CleanEmptyBlocks(const std::vector<BlockEntry *> &blocks, int64_t eviction_timestamp) {
     std::unordered_set<RadixTreeNode *> nodes_to_check;
 
-    // 步骤 1：收集需要检查的节点
+    // 步骤 1：在删除前记录驱逐信息，收集需要检查的节点
     for (auto *block : blocks) {
         if (block->location_map.empty()) {
+            // 使用真实的驱逐时间戳
+            if (stats_collector_) {
+                stats_collector_->OnBlockEviction(instance_id_, block, eviction_timestamp);
+            }
+
             block->ResetAccess();
             auto owner_node = block->owner_node;
             if (owner_node && owner_node->parent) {
@@ -338,6 +345,10 @@ RadixTreeIndex::AppendNewBlocks(RadixTreeNode *node, const std::vector<int64_t> 
         AppendBlockLocation(entry_ptr, tier_name, timestamp);
         node->blocks.emplace_back(std::move(entry));
         inserted_blocks.push_back(entry_ptr);
+
+        if (stats_collector_) {
+            stats_collector_->OnBlockBirth(instance_id_, entry_ptr, timestamp);
+        }
     }
     return inserted_blocks;
 }
@@ -367,6 +378,10 @@ RadixTreeIndex::WriteModify RadixTreeIndex::AppendEvictBlocks(std::unordered_map
                 block->last_access_time = timestamp;
                 AppendBlockLocation(block, tier_name, timestamp);
                 revived_blocks.push_back(block);
+
+                if (stats_collector_) {
+                    stats_collector_->OnBlockBirth(instance_id_, block, timestamp);
+                }
             }
         }
         return revived_blocks;

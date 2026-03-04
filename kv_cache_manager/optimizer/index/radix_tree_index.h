@@ -12,6 +12,9 @@
 #include "kv_cache_manager/optimizer/trace_loader/optimizer_schema_trace.h"
 
 namespace kv_cache_manager {
+// 前置声明
+class StatsCollector;
+
 void AppendBlockLocation(BlockEntry *block, const std::string &unique_name, int64_t timestamp);
 class RadixTreeIndex {
 public:
@@ -29,10 +32,14 @@ public:
     std::vector<int64_t> InsertWithQuery(const std::vector<int64_t> &block_keys,
                                          const int64_t timestamp,
                                          std::vector<std::vector<int64_t>> &hits);
-    void CleanEmptyBlocks(const std::vector<BlockEntry *> &blocks);
+    void CleanEmptyBlocks(const std::vector<BlockEntry *> &blocks, int64_t eviction_timestamp);
 
     // 清空整个RadixTree的缓存
     void Clear();
+
+    void SetStatsCollector(std::shared_ptr<StatsCollector> collector) {
+        stats_collector_ = collector;
+    }
 
     // 导出前缀树用于可视化
     struct RadixTreeExportNode {
@@ -56,7 +63,8 @@ public:
 private:
     std::unique_ptr<RadixTreeNode> root_;
     std::shared_ptr<EvictionPolicy> eviction_policy_;
-    std::string instance_id_; // 添加实例ID记录
+    std::string instance_id_;
+    std::shared_ptr<StatsCollector> stats_collector_;
 
 private:
     std::vector<BlockEntry *>
