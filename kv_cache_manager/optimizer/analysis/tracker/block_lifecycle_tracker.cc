@@ -1,8 +1,9 @@
+#include "kv_cache_manager/optimizer/analysis/tracker/block_lifecycle_tracker.h"
+
 #include <filesystem>
 #include <fstream>
 
 #include "kv_cache_manager/common/logger.h"
-#include "kv_cache_manager/optimizer/analysis/tracker/block_lifecycle_tracker.h"
 #include "kv_cache_manager/optimizer/config/optimizer_config.h"
 #include "kv_cache_manager/optimizer/config/types.h"
 
@@ -21,13 +22,12 @@ void BlockLifecycleTracker::OnBlockBirth(const std::string &instance_id, BlockEn
 
     auto &data = instance_data_[instance_id];
 
-    auto it = data.alive_blocks.find(block);
+    auto it = data.alive_blocks.find(block->key);
     if (it != data.alive_blocks.end()) {
-        KVCM_LOG_ERROR(
-            "CRITICAL: Block %ld (ptr=%p) already has active lifecycle (birth=%ld), force closing old record",
-            block->key,
-            (void *)block,
-            it->second->birth_time_us);
+        // 同一 key 重新 birth，说明上一轮生命周期未被正确 evict，强制关闭
+        KVCM_LOG_ERROR("CRITICAL: Block %ld already has active lifecycle (birth=%ld), force closing old record",
+                       block->key,
+                       it->second->birth_time_us);
         OnBlockEviction(instance_id, block, timestamp > 0 ? timestamp - 1 : timestamp);
     }
 
@@ -41,7 +41,7 @@ void BlockLifecycleTracker::OnBlockBirth(const std::string &instance_id, BlockEn
         .is_alive = true,
     });
 
-    data.alive_blocks[block] = record;
+    data.alive_blocks[block->key] = record;
     data.records.push_back(std::move(record));
 }
 
@@ -57,7 +57,7 @@ void BlockLifecycleTracker::OnBlockEviction(const std::string &instance_id, Bloc
     }
 
     auto &data = inst_it->second;
-    auto it = data.alive_blocks.find(block);
+    auto it = data.alive_blocks.find(block->key);
     if (it == data.alive_blocks.end()) {
         KVCM_LOG_DEBUG("Evicting untracked block key %ld (instance: %s)", block->key, instance_id.c_str());
         return;
@@ -66,6 +66,7 @@ void BlockLifecycleTracker::OnBlockEviction(const std::string &instance_id, Bloc
     auto &record = it->second;
     record->death_time_us = timestamp;
     record->lifespan_us = timestamp - record->birth_time_us;
+    // block 此时仍存活，可以安全读取其字段
     record->access_count = block->access_count;
     record->last_access_time_us = block->last_access_time;
     record->is_alive = false;
@@ -88,18 +89,17 @@ void BlockLifecycleTracker::Finalize(const std::string &instance_id, int64_t fin
                   final_timestamp,
                   instance_id.c_str());
 
-    for (auto &[block, record] : data.alive_blocks) {
+    // access_count/last_access_time 在 block 存活期间无法获取（block 可能已销毁），
+    // 保留 birth 时记录的初始值，标记为 is_alive=true 表示 trace 结束时仍存活
+    for (auto &[block_key, record] : data.alive_blocks) {
         record->death_time_us = final_timestamp;
         record->lifespan_us = final_timestamp - record->birth_time_us;
-        record->access_count = block->access_count;
-        record->last_access_time_us = block->last_access_time;
     }
 
     data.alive_blocks.clear();
 
-    KVCM_LOG_INFO("Lifecycle tracking complete: %zu total records (instance: %s)",
-                  data.records.size(),
-                  instance_id.c_str());
+    KVCM_LOG_INFO(
+        "Lifecycle tracking complete: %zu total records (instance: %s)", data.records.size(), instance_id.c_str());
 }
 
 void BlockLifecycleTracker::Export(const std::string &instance_id, const OptimizerConfig &config) {

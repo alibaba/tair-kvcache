@@ -58,9 +58,6 @@ void OptimizerRunner::RunTrace(std::shared_ptr<OptimizerSchemaTrace> trace) {
     }
 }
 
-// ============================================================================
-// 构造公共的 ReadRecord（消除 HandleGetLocation / HandleDialogTurn 重复逻辑）
-// ============================================================================
 ReadRecord OptimizerRunner::BuildReadRecord(const std::string &instance_id, int64_t timestamp_us) {
     ReadRecord record{};
     record.timestamp_us = timestamp_us;
@@ -117,13 +114,13 @@ void OptimizerRunner::HandleWriteCache(const WriteCacheSchemaTrace &trace) {
         return;
     }
 
-    indexer->InsertOnly(trace.keys(), trace.timestamp_us());
+    auto inserted_keys = indexer->InsertOnly(trace.keys(), trace.timestamp_us());
     bool evicted = indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_us());
     if (evicted) {
         KVCM_LOG_DEBUG("Eviction in %zu to instance_id: %s", trace.timestamp_us(), instance_id.c_str());
     }
 
-    WriteRecord record{trace.timestamp_us(), trace.keys().size()};
+    WriteRecord record{trace.timestamp_us(), trace.keys().size(), inserted_keys.size()};
     stats_collector_->OnWriteComplete(instance_id, record);
 }
 
@@ -151,7 +148,9 @@ void OptimizerRunner::HandleDialogTurn(const DialogTurnSchemaTrace &trace) {
     stats_collector_->OnReadComplete(instance_id, read_record);
 
     // ---- WriteRecord ----
-    WriteRecord write_record{trace.timestamp_us(), trace.total_keys().size() - trace.keys().size()};
+    // DialogTurn 的写入部分是 decode 新增的 block，全部视为新插入
+    size_t decode_blocks = trace.total_keys().size() - trace.keys().size();
+    WriteRecord write_record{trace.timestamp_us(), decode_blocks, decode_blocks};
     stats_collector_->OnWriteComplete(instance_id, write_record);
 }
 } // namespace kv_cache_manager

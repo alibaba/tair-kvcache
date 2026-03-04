@@ -24,7 +24,7 @@ public:
 private:
     struct InstanceData {
         std::vector<std::shared_ptr<BlockLifecycleRecord>> records;
-        std::unordered_map<BlockEntry *, std::shared_ptr<BlockLifecycleRecord>> alive_blocks;
+        std::unordered_map<int64_t, std::shared_ptr<BlockLifecycleRecord>> alive_blocks;
     };
 
     std::unordered_map<std::string, InstanceData> instance_data_;

@@ -110,19 +110,20 @@ void HitRateTracker::ExportHitRates(const std::string &instance_id,
     file << "TimestampUs,CachedBlocksCurrentInstance,CachedBlocksPerInstance,CachedBlocksAllInstance,"
             "InternalReadBlocks,ExternalReadBlocks,TotalReadBlocks,InternalHitBlocks,"
             "InternalHitRate,ExternalHitBlocks,ExternalHitRate,HitRate,AccInternalHitRate,AccExternalHitRate,"
-            "AccHitRate,AccTotalBlocks\n";
+            "AccHitRate,AccReadBlocks,AccWriteBlocks\n";
 
-    size_t acc_total_blocks = 0;
+    size_t acc_read_blocks = 0;
+    size_t acc_write_blocks = 0;
     size_t write_index = 0;
 
     for (size_t i = 0; i < data.read_records.size(); ++i) {
         const auto &r = data.read_records[i];
         size_t current_read = r.internal_read_blocks + r.external_read_blocks;
-        acc_total_blocks += current_read;
+        acc_read_blocks += current_read;
 
         while (write_index < data.write_records.size() &&
                data.write_records[write_index].timestamp_us <= r.timestamp_us) {
-            acc_total_blocks += data.write_records[write_index].write_blocks;
+            acc_write_blocks += data.write_records[write_index].write_blocks;
             write_index++;
         }
 
@@ -132,19 +133,7 @@ void HitRateTracker::ExportHitRates(const std::string &instance_id,
              << r.external_hit_blocks << "," << external_hit_rates[i] << ","
              << (internal_hit_rates[i] + external_hit_rates[i]) << "," << acc_internal_hit_rates[i] << ","
              << acc_external_hit_rates[i] << "," << (acc_internal_hit_rates[i] + acc_external_hit_rates[i]) << ","
-             << acc_total_blocks << "\n";
-    }
-
-    size_t remaining_write_blocks = 0;
-    while (write_index < data.write_records.size()) {
-        remaining_write_blocks += data.write_records[write_index].write_blocks;
-        write_index++;
-    }
-
-    if (remaining_write_blocks > 0) {
-        KVCM_LOG_INFO("Instance %s: %zu write blocks after last read operation (not shown in CSV)",
-                      instance_id.c_str(),
-                      remaining_write_blocks);
+             << acc_read_blocks << "," << acc_write_blocks << "\n";
     }
 
     file.close();

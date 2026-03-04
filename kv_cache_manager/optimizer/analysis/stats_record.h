@@ -23,7 +23,8 @@ struct ReadRecord {
 
 struct WriteRecord {
     int64_t timestamp_us;
-    size_t write_blocks;
+    size_t write_blocks;          // 请求写入的 block 总数（含已存在的）
+    size_t newly_inserted_blocks; // 实际新插入的 block 数（不含已存在的）
 };
 
 struct BlockLifecycleRecord {

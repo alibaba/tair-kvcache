@@ -144,9 +144,9 @@ def warmup_pass(
         df = pd.read_csv(first_csv)
         max_blocks = int(df["CachedBlocksAllInstance"].max())
 
-        if "AccTotalBlocks" in df.columns:
-            total = int(df["AccTotalBlocks"].iloc[-1])
-            print(f"Warmup done. Max cached: {max_blocks}, Total in trace: {total}")
+        acc_read = int(df["AccReadBlocks"].iloc[-1]) if "AccReadBlocks" in df.columns else 0
+        acc_write = int(df["AccWriteBlocks"].iloc[-1]) if "AccWriteBlocks" in df.columns else 0
+        print(f"Warmup done. Max cached: {max_blocks}, AccReadBlocks: {acc_read}, AccWriteBlocks: {acc_write}")
         else:
             print(f"Warmup done. Max blocks: {max_blocks}")
 
