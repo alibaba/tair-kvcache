@@ -60,7 +60,12 @@ public:
     CacheManager(std::shared_ptr<MetricsRegistry> metrics_registry, std::shared_ptr<RegistryManager> registry_manager);
     ~CacheManager();
 
-    bool Init(int32_t schedule_plan_executor_thread_count = DEFAULT_SCHEDULE_PLAN_EXECUTOR_THREAD_COUNT);
+    bool Init(int32_t schedule_plan_executor_thread_count = DEFAULT_SCHEDULE_PLAN_EXECUTOR_THREAD_COUNT,
+              uint64_t cache_reclaimer_key_sampling_size_total = 1000,
+              uint64_t cache_reclaimer_key_sampling_size_per_task = 100,
+              uint64_t cache_reclaimer_del_batch_size = 100,
+              uint32_t cache_reclaimer_idle_interval_ms = 100,
+              uint32_t cache_reclaimer_worker_size = 16);
     ErrorCode DoRecover();
     ErrorCode DoCleanup();
     std::shared_ptr<RegistryManager> GetRegistryManager() { return registry_manager_; }

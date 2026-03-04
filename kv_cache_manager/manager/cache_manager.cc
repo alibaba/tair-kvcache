@@ -143,7 +143,12 @@ CacheManager::~CacheManager() {
     }
 }
 
-bool CacheManager::Init(int32_t schedule_plan_executor_thread_count) {
+bool CacheManager::Init(int32_t schedule_plan_executor_thread_count,
+                        uint64_t cache_reclaimer_key_sampling_size_total,
+                        uint64_t cache_reclaimer_key_sampling_size_per_task,
+                        uint64_t cache_reclaimer_del_batch_size,
+                        uint32_t cache_reclaimer_idle_interval_ms,
+                        uint32_t cache_reclaimer_worker_size) {
     schedule_plan_executor_ = std::make_shared<SchedulePlanExecutor>(schedule_plan_executor_thread_count,
                                                                      meta_indexer_manager_,
                                                                      registry_manager_->data_storage_manager(),
@@ -156,7 +161,12 @@ bool CacheManager::Init(int32_t schedule_plan_executor_thread_count) {
         KVCM_LOG_ERROR("event_manager init failed");
     }
 
-    cache_reclaimer_ = std::make_shared<CacheReclaimer>(registry_manager_,
+    cache_reclaimer_ = std::make_shared<CacheReclaimer>(cache_reclaimer_key_sampling_size_total,
+                                                        cache_reclaimer_key_sampling_size_per_task,
+                                                        cache_reclaimer_del_batch_size,
+                                                        cache_reclaimer_idle_interval_ms,
+                                                        cache_reclaimer_worker_size,
+                                                        registry_manager_,
                                                         meta_indexer_manager_,
                                                         meta_searcher_manager_,
                                                         schedule_plan_executor_,

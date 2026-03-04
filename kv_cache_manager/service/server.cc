@@ -44,7 +44,12 @@ bool Server::Init(const ServerConfig &config) {
     registry_manager_->Init();
 
     cache_manager_.reset(new CacheManager(metrics_registry_, registry_manager_));
-    cache_manager_->Init(config_.GetSchedulePlanExecutorThreadCount());
+    cache_manager_->Init(config_.GetSchedulePlanExecutorThreadCount(),
+                         config_.GetCacheReclaimerKeySamplingSizeTotal(),
+                         config_.GetCacheReclaimerKeySamplingSizePerTask(),
+                         config_.GetCacheReclaimerDelBatchSize(),
+                         config_.GetCacheReclaimerIdleIntervalMs(),
+                         config_.GetCacheReclaimerWorkerSize());
     cache_manager_->PauseReclaimer(); // Resume after DoRecover
 
     CreateMetricsReporter();

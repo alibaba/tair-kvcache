@@ -201,7 +201,11 @@ MetaIndexer::Result MetaIndexer_GetProperties_stub(void *obj,
                                                    const std::vector<std::string> &p,
                                                    MetaIndexer::PropertyMapVector &out_properties) noexcept {
     if (get_result == ErrorCode::EC_OK) {
-        out_properties = get_out_properties;
+        if (k.size() == get_out_properties.size()) {
+            out_properties = get_out_properties;
+        } else {
+            out_properties = MetaIndexer::PropertyMapVector(k.size());
+        }
     }
     return {get_result};
 }
@@ -213,7 +217,11 @@ MetaIndexer::KeyVector random_sample_keys;
 
 ErrorCode MetaIndexer_RandomSample_stub(void *obj, const std::size_t c, MetaIndexer::KeyVector &out_keys) noexcept {
     if (random_sample_result == ErrorCode::EC_OK) {
-        out_keys = random_sample_keys;
+        if (c == random_sample_keys.size()) {
+            out_keys = random_sample_keys;
+        } else {
+            out_keys = MetaIndexer::KeyVector(c);
+        }
     }
     return random_sample_result;
 }
@@ -300,8 +308,7 @@ public:
         dsm_ = std::make_shared<DataStorageManager>(mr_);
         spe_ = std::make_shared<SchedulePlanExecutor>(0, mim_, dsm_, mr_);
 
-        cache_reclaimer_ = std::make_unique<CacheReclaimer>(rm_, mim_, msm_, spe_, mr_, em_);
-        cache_reclaimer_->SetSleepIntervalMs(request_context_.get(), 10);
+        cache_reclaimer_ = std::make_unique<CacheReclaimer>(10, 100, 1, 10, 16, rm_, mim_, msm_, spe_, mr_, em_);
 
         // avoid nullptr issue when testing methods that involve metrics
         // counter but no need to start the working thread
@@ -417,58 +424,65 @@ TEST_F(CacheReclaimerTest, TestStartStop) {
 
     {
         // test the case that all the dependencies are given as nullptr
-        cache_reclaimer_ = std::make_unique<CacheReclaimer>(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
-        ASSERT_EQ(ErrorCode::EC_ERROR, cache_reclaimer_->Start());
-        ASSERT_FALSE(cache_reclaimer_->IsRunning());
-        ASSERT_FALSE(cache_reclaimer_->reclaimer_.joinable());
+        auto cache_reclaimer = std::make_unique<CacheReclaimer>(
+            1000, 100, 100, 100, 16, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+        ASSERT_EQ(ErrorCode::EC_ERROR, cache_reclaimer->Start());
+        ASSERT_FALSE(cache_reclaimer->IsRunning());
+        ASSERT_FALSE(cache_reclaimer->reclaimer_.joinable());
     }
 
     {
         // test the case that RegisterManager is nullptr
-        cache_reclaimer_ = std::make_unique<CacheReclaimer>(nullptr, mim_, msm_, spe_, mr_, em_);
-        ASSERT_EQ(ErrorCode::EC_ERROR, cache_reclaimer_->Start());
-        ASSERT_FALSE(cache_reclaimer_->IsRunning());
-        ASSERT_FALSE(cache_reclaimer_->reclaimer_.joinable());
+        auto cache_reclaimer =
+            std::make_unique<CacheReclaimer>(1000, 100, 100, 100, 16, nullptr, mim_, msm_, spe_, mr_, em_);
+        ASSERT_EQ(ErrorCode::EC_ERROR, cache_reclaimer->Start());
+        ASSERT_FALSE(cache_reclaimer->IsRunning());
+        ASSERT_FALSE(cache_reclaimer->reclaimer_.joinable());
     }
 
     {
         // test the case that MetaIndexerManager is nullptr
-        cache_reclaimer_ = std::make_unique<CacheReclaimer>(rm_, nullptr, msm_, spe_, mr_, em_);
-        ASSERT_EQ(ErrorCode::EC_ERROR, cache_reclaimer_->Start());
-        ASSERT_FALSE(cache_reclaimer_->IsRunning());
-        ASSERT_FALSE(cache_reclaimer_->reclaimer_.joinable());
+        auto cache_reclaimer =
+            std::make_unique<CacheReclaimer>(1000, 100, 100, 100, 16, rm_, nullptr, msm_, spe_, mr_, em_);
+        ASSERT_EQ(ErrorCode::EC_ERROR, cache_reclaimer->Start());
+        ASSERT_FALSE(cache_reclaimer->IsRunning());
+        ASSERT_FALSE(cache_reclaimer->reclaimer_.joinable());
     }
 
     {
         // test the case that MetaSearcherManager is nullptr
-        cache_reclaimer_ = std::make_unique<CacheReclaimer>(rm_, mim_, nullptr, spe_, mr_, em_);
-        ASSERT_EQ(ErrorCode::EC_ERROR, cache_reclaimer_->Start());
-        ASSERT_FALSE(cache_reclaimer_->IsRunning());
-        ASSERT_FALSE(cache_reclaimer_->reclaimer_.joinable());
+        auto cache_reclaimer =
+            std::make_unique<CacheReclaimer>(1000, 100, 100, 100, 16, rm_, mim_, nullptr, spe_, mr_, em_);
+        ASSERT_EQ(ErrorCode::EC_ERROR, cache_reclaimer->Start());
+        ASSERT_FALSE(cache_reclaimer->IsRunning());
+        ASSERT_FALSE(cache_reclaimer->reclaimer_.joinable());
     }
 
     {
         // test the case that SchedulePlanExecutor is nullptr
-        cache_reclaimer_ = std::make_unique<CacheReclaimer>(rm_, mim_, msm_, nullptr, mr_, em_);
-        ASSERT_EQ(ErrorCode::EC_ERROR, cache_reclaimer_->Start());
-        ASSERT_FALSE(cache_reclaimer_->IsRunning());
-        ASSERT_FALSE(cache_reclaimer_->reclaimer_.joinable());
+        auto cache_reclaimer =
+            std::make_unique<CacheReclaimer>(1000, 100, 100, 100, 16, rm_, mim_, msm_, nullptr, mr_, em_);
+        ASSERT_EQ(ErrorCode::EC_ERROR, cache_reclaimer->Start());
+        ASSERT_FALSE(cache_reclaimer->IsRunning());
+        ASSERT_FALSE(cache_reclaimer->reclaimer_.joinable());
     }
 
     {
         // test the case that MetricsRegistry is nullptr
-        cache_reclaimer_ = std::make_unique<CacheReclaimer>(rm_, mim_, msm_, spe_, nullptr, em_);
-        ASSERT_EQ(ErrorCode::EC_ERROR, cache_reclaimer_->Start());
-        ASSERT_FALSE(cache_reclaimer_->IsRunning());
-        ASSERT_FALSE(cache_reclaimer_->reclaimer_.joinable());
+        auto cache_reclaimer =
+            std::make_unique<CacheReclaimer>(1000, 100, 100, 100, 16, rm_, mim_, msm_, spe_, nullptr, em_);
+        ASSERT_EQ(ErrorCode::EC_ERROR, cache_reclaimer->Start());
+        ASSERT_FALSE(cache_reclaimer->IsRunning());
+        ASSERT_FALSE(cache_reclaimer->reclaimer_.joinable());
     }
 
     {
         // test the case that MetricsRegistry is nullptr
-        cache_reclaimer_ = std::make_unique<CacheReclaimer>(rm_, mim_, msm_, spe_, mr_, nullptr);
-        ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
-        ASSERT_TRUE(cache_reclaimer_->IsRunning());
-        ASSERT_TRUE(cache_reclaimer_->reclaimer_.joinable());
+        auto cache_reclaimer =
+            std::make_unique<CacheReclaimer>(1000, 100, 100, 100, 16, rm_, mim_, msm_, spe_, mr_, nullptr);
+        ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer->Start());
+        ASSERT_TRUE(cache_reclaimer->IsRunning());
+        ASSERT_TRUE(cache_reclaimer->reclaimer_.joinable());
     }
 }
 
@@ -540,6 +554,7 @@ TEST_F(CacheReclaimerTest, TestPauseResume) {
     ins_group->quota_.set_capacity(2048);
     instance_groups.emplace_back(ins_group);
 
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), random_sample_keys.size()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 2));
     batch_get_loc_out_maps =
         std::vector<CacheLocationMap>(cache_reclaimer_->GetBatchingSize(request_context_.get()), CacheLocationMap{});
@@ -615,7 +630,8 @@ TEST_F(CacheReclaimerTest, TestDoubleStops) {
 }
 
 TEST_F(CacheReclaimerTest, TestWorkerConfigValues) {
-    cache_reclaimer_ = std::make_unique<CacheReclaimer>(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    cache_reclaimer_ =
+        std::make_unique<CacheReclaimer>(1000, 100, 100, 100, 16, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
 
     {
         // default values
@@ -1432,6 +1448,8 @@ TEST_F(CacheReclaimerTest, TestInsufficientSampledKeys) {
     instance_groups.emplace_back(ins_group);
 
     // batching_size default to 100 which is larger than the size of sampled keys (10)
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), random_sample_keys.size()));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 100));
     batch_get_loc_out_maps = std::vector<CacheLocationMap>(random_sample_keys.size(), CacheLocationMap{});
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
 
@@ -1501,6 +1519,7 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU00) {
     ins_group->quota_.set_capacity(2048);
     instance_groups.emplace_back(ins_group);
 
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), random_sample_keys.size()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 2));
     batch_get_loc_out_maps =
         std::vector<CacheLocationMap>(cache_reclaimer_->GetBatchingSize(request_context_.get()), CacheLocationMap{});
@@ -1567,6 +1586,7 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU01) {
     ins_group->quota_.set_capacity(2048);
     instance_groups.emplace_back(ins_group);
 
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), random_sample_keys.size()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 3));
     batch_get_loc_out_maps =
         std::vector<CacheLocationMap>(cache_reclaimer_->GetBatchingSize(request_context_.get()), CacheLocationMap{});
@@ -1635,6 +1655,7 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU02) {
     ins_group->quota_.set_capacity(2048);
     instance_groups.emplace_back(ins_group);
 
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), random_sample_keys.size()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 3));
     batch_get_loc_out_maps =
         std::vector<CacheLocationMap>(cache_reclaimer_->GetBatchingSize(request_context_.get()), CacheLocationMap{});
@@ -1703,6 +1724,7 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU03) {
     ins_group->quota_.set_capacity(2048);
     instance_groups.emplace_back(ins_group);
 
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), random_sample_keys.size()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 0));
     batch_get_loc_out_maps = std::vector<CacheLocationMap>(random_sample_keys.size(), CacheLocationMap{});
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
@@ -1764,6 +1786,7 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU04) {
     ins_group->quota_.set_capacity(2048);
     instance_groups.emplace_back(ins_group);
 
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), random_sample_keys.size()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 1));
     batch_get_loc_out_maps =
         std::vector<CacheLocationMap>(cache_reclaimer_->GetBatchingSize(request_context_.get()), CacheLocationMap{});
@@ -2179,6 +2202,7 @@ TEST_F(CacheReclaimerTest, TestMultipleInstanceGroups) {
         },
     };
 
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), random_sample_keys.size()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 5));
     batch_get_loc_out_maps =
         std::vector<CacheLocationMap>(cache_reclaimer_->GetBatchingSize(request_context_.get()), CacheLocationMap{});
@@ -2242,6 +2266,9 @@ TEST_F(CacheReclaimerTest, TestKeyCountEdgeCases) {
             {PROPERTY_LRU_TIME, "9"},
         },
     };
+
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), random_sample_keys.size()));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), random_sample_keys.size()));
 
     {
         // test with zero key count
@@ -2367,6 +2394,7 @@ TEST_F(CacheReclaimerTest, TestCronJobAdaptiveSleepInterval) {
     ins_group->quota_.set_capacity(2048);
     instance_groups.emplace_back(ins_group);
 
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), random_sample_keys.size()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 1));
     batch_get_loc_out_maps =
         std::vector<CacheLocationMap>(cache_reclaimer_->GetBatchingSize(request_context_.get()), CacheLocationMap{});
@@ -2483,6 +2511,7 @@ TEST_F(CacheReclaimerTest, TestCronJobAdaptiveSleepIntervalRecovery) {
         instance_groups.emplace_back(ins_group);
     }
 
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), random_sample_keys.size()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 1));
     batch_get_loc_out_maps =
         std::vector<CacheLocationMap>(cache_reclaimer_->GetBatchingSize(request_context_.get()), CacheLocationMap{});
@@ -2657,4 +2686,113 @@ TEST_F(CacheReclaimerTest, TestHandleDelRes04) {
 
     cache_reclaimer_->HandleDelRes();
     ASSERT_TRUE(cache_reclaimer_->delete_handlers_.empty());
+}
+
+TEST_F(CacheReclaimerTest, TestDoKeySampling) {
+    random_sample_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    get_out_properties = {
+        {
+            {PROPERTY_LRU_TIME, "0"},
+        },
+        {
+            {PROPERTY_LRU_TIME, "1"},
+        },
+        {
+            {PROPERTY_LRU_TIME, "2"},
+        },
+        {
+            {PROPERTY_LRU_TIME, "3"},
+        },
+        {
+            {PROPERTY_LRU_TIME, "4"},
+        },
+        {
+            {PROPERTY_LRU_TIME, "5"},
+        },
+        {
+            {PROPERTY_LRU_TIME, "6"},
+        },
+        {
+            {PROPERTY_LRU_TIME, "7"},
+        },
+        {
+            {PROPERTY_LRU_TIME, "8"},
+        },
+        {
+            {PROPERTY_LRU_TIME, "9"},
+        },
+    };
+
+    {
+        cache_reclaimer_->sampling_size_.store(random_sample_keys.size());
+        cache_reclaimer_->sampling_size_per_task_.store(100);
+
+        std::vector<std::int64_t> keys;
+        std::vector<std::map<std::string, std::string>> maps;
+        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_.get(), instance_infos.front(), keys, maps));
+        ASSERT_EQ(random_sample_keys.size(), keys.size());
+        ASSERT_EQ(get_out_properties.size(), maps.size());
+    }
+
+    {
+        cache_reclaimer_->sampling_size_.store(0);
+        cache_reclaimer_->sampling_size_per_task_.store(100);
+
+        std::vector<std::int64_t> keys;
+        std::vector<std::map<std::string, std::string>> maps;
+        ASSERT_FALSE(cache_reclaimer_->DoKeySampling(request_context_.get(), instance_infos.front(), keys, maps));
+    }
+
+    {
+        cache_reclaimer_->sampling_size_.store(random_sample_keys.size());
+        cache_reclaimer_->sampling_size_per_task_.store(0);
+
+        std::vector<std::int64_t> keys;
+        std::vector<std::map<std::string, std::string>> maps;
+        ASSERT_FALSE(cache_reclaimer_->DoKeySampling(request_context_.get(), instance_infos.front(), keys, maps));
+    }
+
+    {
+        cache_reclaimer_->sampling_size_.store(1000);
+        cache_reclaimer_->sampling_size_per_task_.store(100);
+
+        std::vector<std::int64_t> keys;
+        std::vector<std::map<std::string, std::string>> maps;
+        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_.get(), instance_infos.front(), keys, maps));
+        ASSERT_EQ(1000, keys.size());
+        ASSERT_EQ(1000, maps.size());
+    }
+
+    {
+        cache_reclaimer_->sampling_size_.store(999);
+        cache_reclaimer_->sampling_size_per_task_.store(99);
+
+        std::vector<std::int64_t> keys;
+        std::vector<std::map<std::string, std::string>> maps;
+        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_.get(), instance_infos.front(), keys, maps));
+        ASSERT_EQ(999, keys.size());
+        ASSERT_EQ(999, maps.size());
+    }
+
+    {
+        cache_reclaimer_->sampling_size_.store(1001);
+        cache_reclaimer_->sampling_size_per_task_.store(100);
+
+        std::vector<std::int64_t> keys;
+        std::vector<std::map<std::string, std::string>> maps;
+        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_.get(), instance_infos.front(), keys, maps));
+        ASSERT_EQ(1001, keys.size());
+        ASSERT_EQ(1001, maps.size());
+    }
+
+    {
+        cache_reclaimer_->sampling_size_.store(1);
+        cache_reclaimer_->sampling_size_per_task_.store(999);
+
+        std::vector<std::int64_t> keys;
+        std::vector<std::map<std::string, std::string>> maps;
+        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_.get(), instance_infos.front(), keys, maps));
+        ASSERT_EQ(1, keys.size());
+        ASSERT_EQ(1, maps.size());
+    }
 }

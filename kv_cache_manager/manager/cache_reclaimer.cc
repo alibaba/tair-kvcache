@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <future>
 #include <iomanip>
 #include <memory>
@@ -90,7 +91,12 @@ inline std::string CacheReclaimer::GenTraceID() {
     return ss.str();
 }
 
-CacheReclaimer::CacheReclaimer(std::shared_ptr<RegistryManager> registry_manager,
+CacheReclaimer::CacheReclaimer(const std::size_t sampling_size_total,
+                               const std::size_t sampling_size_per_task,
+                               const std::size_t batching_size,
+                               const std::uint32_t sleep_interval_ms,
+                               std::uint32_t worker_size,
+                               std::shared_ptr<RegistryManager> registry_manager,
                                std::shared_ptr<MetaIndexerManager> meta_indexer_manager,
                                std::shared_ptr<MetaSearcherManager> meta_searcher_manager,
                                std::shared_ptr<SchedulePlanExecutor> sched_plan_executor,
@@ -104,11 +110,33 @@ CacheReclaimer::CacheReclaimer(std::shared_ptr<RegistryManager> registry_manager
     , event_manager_(std::move(event_manager))
     , job_state_flag_(false)
     , pause_flag_(false)
-    , sampling_size_(1000)
-    , batching_size_(100)
-    , sleep_interval_ms_(100) {}
+    , sampling_size_(sampling_size_total)
+    , sampling_size_per_task_(sampling_size_per_task)
+    , batching_size_(batching_size)
+    , sleep_interval_ms_(sleep_interval_ms)
+    , worker_stop_(false) {
+    if (worker_size == 0) {
+        worker_size = 1;
+    }
+    for (std::uint32_t i = 0; i != worker_size; ++i) {
+        workers_.emplace_back([this] { WorkerRoutine(); });
+    }
+    KVCM_LOG_INFO("cache reclaimer initialized with [%u] worker(s)", worker_size);
+}
 
-CacheReclaimer::~CacheReclaimer() { this->Stop(); }
+CacheReclaimer::~CacheReclaimer() {
+    this->Stop();
+
+    // stop workers
+    worker_stop_ = true;
+    cv_task_queue_.notify_all();
+
+    for (auto &worker : workers_) {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+}
 
 ErrorCode CacheReclaimer::Start() noexcept {
     if (registry_manager_ == nullptr) {
@@ -144,7 +172,7 @@ ErrorCode CacheReclaimer::Start() noexcept {
     REGISTER_METRICS_FOR_CACHE_RECLAIMER(location_del_count);
 
     {
-        std::unique_lock<std::mutex> lock(cv_mutex_);
+        std::unique_lock<std::mutex> lock(job_state_mutex_);
         if (job_state_flag_
             // there is no need to check on reclaimer_.joinable(), because
             // under our usage model assumption, there will be no parallel
@@ -166,22 +194,22 @@ ErrorCode CacheReclaimer::Start() noexcept {
 
 void CacheReclaimer::Stop() noexcept {
     {
-        std::unique_lock<std::mutex> lock(cv_mutex_);
-        if (!job_state_flag_) {
-            return;
+        std::unique_lock<std::mutex> lock(job_state_mutex_);
+        if (job_state_flag_) {
+            job_state_flag_ = false;
+            cv_job_state_.notify_one();
         }
-        job_state_flag_ = false;
-        cv_job_state_.notify_one();
     }
 
     if (reclaimer_.joinable()) {
         reclaimer_.join();
     }
+
     KVCM_LOG_DEBUG("cache reclaimer stop OK");
 }
 
 bool CacheReclaimer::IsRunning() noexcept {
-    std::unique_lock<std::mutex> lock(cv_mutex_);
+    std::unique_lock<std::mutex> lock(job_state_mutex_);
     return job_state_flag_;
 }
 
@@ -459,7 +487,7 @@ void CacheReclaimer::ReclaimCron() noexcept {
     std::uint32_t sleep_interval_ms = sleep_interval_ms_.load();
     while (true) {
         {
-            std::unique_lock<std::mutex> lock(cv_mutex_);
+            std::unique_lock<std::mutex> lock(job_state_mutex_);
             if (!job_state_flag_) {
                 // prevent unnecessary sleeping
                 break;
@@ -503,7 +531,7 @@ void CacheReclaimer::ReclaimCron() noexcept {
 bool CacheReclaimer::DoKeySampling(RequestContext *request_context,
                                    const std::shared_ptr<const InstanceInfo> &instance_info,
                                    std::vector<std::int64_t> &out_keys,
-                                   std::vector<std::map<std::string, std::string>> &out_maps) const noexcept {
+                                   std::vector<std::map<std::string, std::string>> &out_maps) noexcept {
     const std::string &ins_id = instance_info->instance_id();
     const std::string &ins_gr = instance_info->instance_group_name();
 
@@ -513,29 +541,97 @@ bool CacheReclaimer::DoKeySampling(RequestContext *request_context,
         return false;
     }
 
-    if (const auto ec = meta_indexer->RandomSample(sampling_size_.load(), out_keys); ec != ErrorCode::EC_OK) {
-        LOG_WITH_ID(WARN, "random sample failed, error code: [%d]", static_cast<std::int32_t>(ec));
+    const std::size_t total_sampling_sz = sampling_size_.load();
+    const std::size_t sampling_sz_per_task = sampling_size_per_task_.load();
+    if (total_sampling_sz == 0 || sampling_sz_per_task == 0) {
+        KVCM_LOG_ERROR("sampling size == 0");
         return false;
     }
 
-    if (out_keys.empty()) {
-        LOG_WITH_ID(DEBUG, "random sample got empty keys");
-        return false;
+    const std::size_t worker_sz = (total_sampling_sz + sampling_sz_per_task - 1) / sampling_sz_per_task;
+    std::size_t start_index = 0;
+    std::size_t sampling_sz_todo = total_sampling_sz;
+
+    out_keys.clear();
+    out_keys.resize(total_sampling_sz);
+    out_maps.clear();
+    out_maps.resize(total_sampling_sz);
+
+    std::vector<std::future<ErrorCode>> futures;
+    for (std::size_t i = 0; i != worker_sz; ++i) {
+        std::size_t sampling_sz;
+        if (i == worker_sz - 1) {           // final task
+            sampling_sz = sampling_sz_todo; // the left keys to be sampled
+        } else {
+            sampling_sz = sampling_sz_per_task;
+        }
+
+        auto promise = std::make_shared<std::promise<ErrorCode>>();
+        futures.emplace_back(promise->get_future());
+
+        SubmitTask([request_context,
+                    &ins_id,
+                    &ins_gr,
+                    meta_indexer,
+                    start_index,
+                    sampling_sz,
+                    promise,
+                    &out_keys,
+                    &out_maps]() {
+            std::vector<std::int64_t> keys;
+            if (const auto ec = meta_indexer->RandomSample(sampling_sz, keys); ec != ErrorCode::EC_OK) {
+                LOG_WITH_ID(WARN, "random sample failed, error code: [%d]", static_cast<std::int32_t>(ec));
+                promise->set_value(ec);
+                return;
+            }
+            if (keys.empty()) {
+                LOG_WITH_ID(DEBUG, "random sample got empty keys");
+                promise->set_value(ErrorCode::EC_NOENT);
+                return;
+            }
+            if (keys.size() != sampling_sz) {
+                LOG_WITH_ID(DEBUG, "random sample key size mismatch");
+                promise->set_value(ErrorCode::EC_ERROR);
+                return;
+            }
+
+            std::vector<std::map<std::string, std::string>> maps;
+            if (const auto res = meta_indexer->GetProperties(request_context, keys, {PROPERTY_LRU_TIME}, maps);
+                res.ec != ErrorCode::EC_OK) {
+                LOG_WITH_ID(WARN, "get properties failed, error code: [%d]", static_cast<std::int32_t>(res.ec));
+                promise->set_value(res.ec);
+                return;
+            }
+
+            if (keys.size() != maps.size()) {
+                LOG_WITH_ID(
+                    WARN, "num of sampled keys [%zu] and property maps [%zu] do not match", keys.size(), maps.size());
+                promise->set_value(ErrorCode::EC_MISMATCH);
+                return;
+            }
+
+            std::copy(keys.begin(), keys.end(), out_keys.begin() + static_cast<long>(start_index));
+            std::copy(maps.begin(), maps.end(), out_maps.begin() + static_cast<long>(start_index));
+
+            promise->set_value(ErrorCode::EC_OK);
+        });
+
+        start_index += sampling_sz;
+        sampling_sz_todo -= sampling_sz;
     }
 
-    if (const auto res = meta_indexer->GetProperties(request_context, out_keys, {PROPERTY_LRU_TIME}, out_maps);
-        res.ec != ErrorCode::EC_OK) {
-        LOG_WITH_ID(WARN, "get properties failed, error code: [%d]", static_cast<std::int32_t>(res.ec));
-        return false;
+    bool result = true;
+    for (auto &fut : futures) {
+        if (fut.valid()) {
+            fut.wait();
+            if (fut.get() != ErrorCode::EC_OK) {
+                result = false;
+            }
+        } else {
+            result = false;
+        }
     }
-
-    if (out_keys.size() != out_maps.size()) {
-        LOG_WITH_ID(
-            WARN, "num of sampled keys [%zu] and property maps [%zu] do not match", out_keys.size(), out_maps.size());
-        return false;
-    }
-
-    return true;
+    return result;
 }
 
 bool CacheReclaimer::MakeBatchByLRU(const RequestContext *request_context,
@@ -941,5 +1037,44 @@ CacheReclaimer::DeleteHandler::DeleteHandler(std::shared_ptr<RequestContext> req
     , blk_count_(blk_count)
     , loc_count_(loc_count)
     , fut_(std::move(fut)) {}
+
+void CacheReclaimer::WorkerRoutine() {
+    while (!worker_stop_) {
+        std::function<void()> task;
+
+        {
+            std::unique_lock<std::mutex> lock(task_queue_mutex_);
+
+            if (!task_queue_.empty()) {
+                task = task_queue_.front();
+                task_queue_.pop_front();
+            }
+
+            if (!task) {
+                if (task_queue_.empty()) {
+                    cv_task_queue_.wait(lock, [this] { return worker_stop_ || (!task_queue_.empty()); });
+                }
+                continue;
+            }
+        }
+
+        if (task) {
+            task();
+        }
+    }
+}
+
+void CacheReclaimer::SubmitTask(const std::function<void()> &task) {
+    if (worker_stop_) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(task_queue_mutex_);
+        task_queue_.emplace_back(task);
+    }
+
+    cv_task_queue_.notify_one();
+}
 
 } // namespace kv_cache_manager

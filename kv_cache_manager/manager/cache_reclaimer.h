@@ -4,7 +4,9 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <forward_list>
+#include <functional>
 #include <future>
 #include <map>
 #include <memory>
@@ -73,6 +75,11 @@ public:
     /**
      * @brief Construct a new CacheReclaimer object
      *
+     * @param sampling_size_total
+     * @param sampling_size_per_task
+     * @param batching_size
+     * @param sleep_interval_ms
+     * @param worker_size
      * @param registry_manager Shared pointer to RegistryManager for
      * retrieving instance groups and instances
      * @param meta_indexer_manager Shared pointer to MetaIndexerManager
@@ -86,7 +93,12 @@ public:
      * @param event_manager Shared pointer to EventManager for event
      * publish
      */
-    CacheReclaimer(std::shared_ptr<RegistryManager> registry_manager,
+    CacheReclaimer(std::size_t sampling_size_total,
+                   std::size_t sampling_size_per_task,
+                   std::size_t batching_size,
+                   std::uint32_t sleep_interval_ms,
+                   std::uint32_t worker_size,
+                   std::shared_ptr<RegistryManager> registry_manager,
                    std::shared_ptr<MetaIndexerManager> meta_indexer_manager,
                    std::shared_ptr<MetaSearcherManager> meta_searcher_manager,
                    std::shared_ptr<SchedulePlanExecutor> sched_plan_executor,
@@ -250,7 +262,7 @@ private:
     std::thread reclaimer_;
 
     // communicates the job status with the working thread
-    std::mutex cv_mutex_; // the mutex to protect the condition
+    std::mutex job_state_mutex_; // the mutex to protect the condition
     std::condition_variable cv_job_state_;
     bool job_state_flag_; // the condition, true: job running, false: job stopped
 
@@ -262,6 +274,7 @@ private:
     // range: [0, kSizeLimit)
     // default to 1000
     std::atomic<std::size_t> sampling_size_;
+    std::atomic<std::size_t> sampling_size_per_task_;
 
     // controls the maximum allowed key size of one del request that
     // would be submitted to the executor
@@ -273,6 +286,14 @@ private:
     // two cron jobs, in milliseconds
     // default to 100
     std::atomic<std::uint32_t> sleep_interval_ms_;
+
+    std::mutex task_queue_mutex_;
+    std::condition_variable cv_task_queue_;
+    std::deque<std::function<void()>> task_queue_;
+    std::atomic<bool> worker_stop_;
+    std::vector<std::thread> workers_;
+    void WorkerRoutine();
+    void SubmitTask(const std::function<void()> &task);
 
     // a singly-linked list to help inspect the deleting result in a
     // non-blocking way
@@ -387,7 +408,7 @@ private:
     bool DoKeySampling(RequestContext *request_context,
                        const std::shared_ptr<const InstanceInfo> &instance_info,
                        std::vector<std::int64_t> &out_keys,
-                       std::vector<std::map<std::string, std::string>> &out_maps) const noexcept;
+                       std::vector<std::map<std::string, std::string>> &out_maps) noexcept;
 
     bool MakeBatchByLRU(const RequestContext *request_context,
                         const std::shared_ptr<const InstanceInfo> &instance_info,

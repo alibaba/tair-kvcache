@@ -80,6 +80,31 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
          config->schedule_plan_executor_thread_count_ = std::stoi(value);
          return true;
      }},
+    {"kvcm.cache_reclaimer.key_sampling_size_total",
+     [](const std::string &value, ServerConfig *config) {
+         config->cache_reclaimer_key_sampling_size_total_ = std::stoull(value);
+         return true;
+     }},
+    {"kvcm.cache_reclaimer.key_sampling_size_per_task",
+     [](const std::string &value, ServerConfig *config) {
+         config->cache_reclaimer_key_sampling_size_per_task_ = std::stoull(value);
+         return true;
+     }},
+    {"kvcm.cache_reclaimer.del_batch_size",
+     [](const std::string &value, ServerConfig *config) {
+         config->cache_reclaimer_del_batch_size_ = std::stoull(value);
+         return true;
+     }},
+    {"kvcm.cache_reclaimer.idle_interval_ms",
+     [](const std::string &value, ServerConfig *config) {
+         config->cache_reclaimer_idle_interval_ms_ = std::stol(value);
+         return true;
+     }},
+    {"kvcm.cache_reclaimer.worker_size",
+     [](const std::string &value, ServerConfig *config) {
+         config->cache_reclaimer_worker_size_ = std::stol(value);
+         return true;
+    }},
     {"kvcm.metrics.reporter_type",
      [](const std::string &value, ServerConfig *config) {
          config->metrics_reporter_type_ = value;
@@ -120,6 +145,11 @@ void ServerConfig::UpdateDefaultConfig() {
     metrics_report_interval_ms_ = 20000;
     leader_elector_lease_ms_ = 10000;
     leader_elector_loop_interval_ms_ = 100;
+    cache_reclaimer_key_sampling_size_total_ = 1000;
+    cache_reclaimer_key_sampling_size_per_task_ = 100;
+    cache_reclaimer_del_batch_size_ = 100;
+    cache_reclaimer_idle_interval_ms_ = 100;
+    cache_reclaimer_worker_size_ = 16;
 }
 
 bool ServerConfig::ParseFromFile(const std::string &config_file) {
