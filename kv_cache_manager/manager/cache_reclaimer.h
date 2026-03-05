@@ -75,11 +75,11 @@ public:
     /**
      * @brief Construct a new CacheReclaimer object
      *
-     * @param sampling_size_total
-     * @param sampling_size_per_task
-     * @param batching_size
-     * @param sleep_interval_ms
-     * @param worker_size
+     * @param sampling_size_total Total key sampling size per round
+     * @param sampling_size_per_task The key sampling size per sub-task per round
+     * @param batching_size The deleting request key size
+     * @param sleep_interval_ms The idling time
+     * @param worker_size The worker thread pool size
      * @param registry_manager Shared pointer to RegistryManager for
      * retrieving instance groups and instances
      * @param meta_indexer_manager Shared pointer to MetaIndexerManager
