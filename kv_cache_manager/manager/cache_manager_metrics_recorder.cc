@@ -17,7 +17,20 @@ constexpr static const char *kTraceId = "CacheManagerMetricsRecorderTraceId";
 
 class SleepHelper {
 public:
-    ~SleepHelper() { std::this_thread::sleep_for(std::chrono::seconds(kDefaultRecorderLoopSleepTime)); }
+    SleepHelper(std::mutex &mutex, std::condition_variable &cv, const std::atomic_bool &stop)
+        : mutex_(mutex), cv_(cv), stop_(stop) {}
+
+    ~SleepHelper() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait_for(lock, std::chrono::seconds(kDefaultRecorderLoopSleepTime), [this]() {
+            return stop_.load(std::memory_order_relaxed);
+        });
+    }
+
+private:
+    std::mutex &mutex_;
+    std::condition_variable &cv_;
+    const std::atomic_bool &stop_;
 };
 
 } // namespace
@@ -36,7 +49,11 @@ void CacheManagerMetricsRecorder::Start() {
 }
 
 void CacheManagerMetricsRecorder::Stop() {
-    stop_.store(true, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(stop_mutex_);
+        stop_.store(true, std::memory_order_relaxed);
+    }
+    stop_cv_.notify_all();
     if (recorder_thread_.joinable()) {
         recorder_thread_.join();
     }
@@ -49,7 +66,7 @@ void CacheManagerMetricsRecorder::DoCleanup() {
 void CacheManagerMetricsRecorder::RecorderLoop() {
     KVCM_LOG_INFO("RecorderLoop started");
     while (!stop_.load(std::memory_order_relaxed)) {
-        SleepHelper sleep_helper;
+        SleepHelper sleep_helper(stop_mutex_, stop_cv_, stop_);
         const auto request_context = std::make_shared<RequestContext>(kTraceId);
         const auto [ec, instance_groups] = registry_manager_->ListInstanceGroup(request_context.get());
         if (ec != ErrorCode::EC_OK) {

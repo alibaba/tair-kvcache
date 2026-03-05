@@ -96,7 +96,12 @@ void WriteLocationManager::Start() {
 }
 
 void WriteLocationManager::Stop() {
-    stop_.store(true, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(stop_mutex_);
+        stop_.store(true, std::memory_order_relaxed);
+    }
+    stop_cond_.notify_all();
+
     if (expire_thread_.joinable()) {
         expire_thread_.join();
     }
@@ -121,7 +126,12 @@ void WriteLocationManager::ExpireLoop() {
     while (!stop_.load(std::memory_order_relaxed)) {
         ExpireUnitPtr unit_ptr_to_expire;
         {
-            std::this_thread::sleep_for(std::chrono::microseconds(next_sleep_time_));
+            {
+                std::unique_lock lock(stop_mutex_);
+                stop_cond_.wait_for(lock, std::chrono::microseconds(next_sleep_time_), [this]() {
+                    return stop_.load(std::memory_order_relaxed);
+                });
+            }
 
             if (session_id_map_.Empty()) {
                 KVCM_INTERVAL_LOG_DEBUG(100, "expire queue empty");

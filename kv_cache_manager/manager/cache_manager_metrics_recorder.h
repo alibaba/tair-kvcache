@@ -1,8 +1,10 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <shared_mutex>
 #include <thread>
 #include <unordered_map>
@@ -45,6 +47,8 @@ private:
 
     std::thread recorder_thread_;
     std::atomic_bool stop_ = false;
+    std::mutex stop_mutex_;
+    std::condition_variable stop_cv_;
     mutable std::shared_mutex mutex_;
 
     std::shared_ptr<MetaIndexerManager> meta_indexer_manager_;

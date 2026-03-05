@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <functional>
 #include <map>
 #include <memory>
@@ -62,6 +63,9 @@ private:
     std::thread expire_thread_;
     std::atomic_bool stop_ = false;
     std::atomic_int64_t next_sleep_time_;
+    std::mutex do_expire_mutex_; // mutex for DoCleanup and ExpireLoop
+    std::mutex stop_mutex_;
+    std::condition_variable stop_cond_;
 };
 
 } // namespace kv_cache_manager
