@@ -62,7 +62,7 @@ private:
     SessionIdMap session_id_map_;
     std::thread expire_thread_;
     std::atomic_bool stop_ = false;
-    std::atomic_int64_t next_sleep_time_;
+    std::atomic_int64_t next_sleep_time_us_;
     std::mutex do_expire_mutex_; // mutex for DoCleanup and ExpireLoop
     std::mutex stop_mutex_;
     std::condition_variable stop_cond_;
