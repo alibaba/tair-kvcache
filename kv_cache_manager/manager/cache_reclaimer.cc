@@ -41,6 +41,16 @@
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
+namespace {
+
+struct KeySamplingResult {
+    kv_cache_manager::ErrorCode ec;
+    std::shared_ptr<std::vector<std::int64_t>> keys;
+    std::shared_ptr<std::vector<std::map<std::string, std::string>>> maps;
+};
+
+} // namespace
+
 namespace kv_cache_manager {
 
 #define LOG_WITH_TRACE(LEVEL, format, args...)                                                                         \
@@ -549,15 +559,14 @@ bool CacheReclaimer::DoKeySampling(RequestContext *request_context,
     }
 
     const std::size_t worker_sz = (total_sampling_sz + sampling_sz_per_task - 1) / sampling_sz_per_task;
-    std::size_t start_index = 0;
     std::size_t sampling_sz_todo = total_sampling_sz;
 
     out_keys.clear();
-    out_keys.resize(total_sampling_sz);
+    out_keys.reserve(total_sampling_sz);
     out_maps.clear();
-    out_maps.resize(total_sampling_sz);
+    out_maps.reserve(total_sampling_sz);
 
-    std::vector<std::future<ErrorCode>> futures;
+    std::vector<std::future<KeySamplingResult>> futures;
     for (std::size_t i = 0; i != worker_sz; ++i) {
         std::size_t sampling_sz;
         if (i == worker_sz - 1) {           // final task
@@ -566,66 +575,68 @@ bool CacheReclaimer::DoKeySampling(RequestContext *request_context,
             sampling_sz = sampling_sz_per_task;
         }
 
-        auto promise = std::make_shared<std::promise<ErrorCode>>();
+        auto promise = std::make_shared<std::promise<KeySamplingResult>>();
         futures.emplace_back(promise->get_future());
 
-        SubmitTask([request_context,
-                    &ins_id,
-                    &ins_gr,
-                    meta_indexer,
-                    start_index,
-                    sampling_sz,
-                    promise,
-                    &out_keys,
-                    &out_maps]() {
-            std::vector<std::int64_t> keys;
-            if (const auto ec = meta_indexer->RandomSample(sampling_sz, keys); ec != ErrorCode::EC_OK) {
+        SubmitTask([request_context, &ins_id, &ins_gr, meta_indexer, sampling_sz, promise]() {
+            const auto keys = std::make_shared<std::vector<std::int64_t>>();
+            if (const auto ec = meta_indexer->RandomSample(sampling_sz, *keys); ec != ErrorCode::EC_OK) {
                 LOG_WITH_ID(WARN, "random sample failed, error code: [%d]", static_cast<std::int32_t>(ec));
-                promise->set_value(ec);
+                promise->set_value({ec, nullptr, nullptr});
                 return;
             }
-            if (keys.empty()) {
+            if (keys->empty()) {
                 LOG_WITH_ID(DEBUG, "random sample got empty keys");
-                promise->set_value(ErrorCode::EC_NOENT);
+                promise->set_value({ErrorCode::EC_NOENT, nullptr, nullptr});
                 return;
             }
-            if (keys.size() != sampling_sz) {
-                LOG_WITH_ID(DEBUG, "random sample key size mismatch");
-                promise->set_value(ErrorCode::EC_ERROR);
-                return;
+            if (keys->size() != sampling_sz) {
+                // it is expected behavior that meta_indexer.RandomSample()
+                // may return less keys than asked
+                LOG_WITH_ID(
+                    DEBUG, "random sample key size mismatch, expect: [%zu], got: [%zu]", keys->size(), sampling_sz);
             }
 
-            std::vector<std::map<std::string, std::string>> maps;
-            if (const auto res = meta_indexer->GetProperties(request_context, keys, {PROPERTY_LRU_TIME}, maps);
+            const auto maps = std::make_shared<std::vector<std::map<std::string, std::string>>>();
+            if (const auto res = meta_indexer->GetProperties(request_context, *keys, {PROPERTY_LRU_TIME}, *maps);
                 res.ec != ErrorCode::EC_OK) {
                 LOG_WITH_ID(WARN, "get properties failed, error code: [%d]", static_cast<std::int32_t>(res.ec));
-                promise->set_value(res.ec);
+                promise->set_value({res.ec, nullptr, nullptr});
                 return;
             }
 
-            if (keys.size() != maps.size()) {
+            if (keys->size() != maps->size()) {
                 LOG_WITH_ID(
-                    WARN, "num of sampled keys [%zu] and property maps [%zu] do not match", keys.size(), maps.size());
-                promise->set_value(ErrorCode::EC_MISMATCH);
+                    WARN, "num of sampled keys [%zu] and property maps [%zu] do not match", keys->size(), maps->size());
+                promise->set_value({ErrorCode::EC_MISMATCH, nullptr, nullptr});
                 return;
             }
 
-            std::copy(keys.begin(), keys.end(), out_keys.begin() + static_cast<long>(start_index));
-            std::copy(maps.begin(), maps.end(), out_maps.begin() + static_cast<long>(start_index));
-
-            promise->set_value(ErrorCode::EC_OK);
+            promise->set_value({ErrorCode::EC_OK, keys, maps});
         });
 
-        start_index += sampling_sz;
         sampling_sz_todo -= sampling_sz;
     }
 
     bool result = true;
     for (auto &fut : futures) {
         if (fut.valid()) {
-            fut.wait();
-            if (fut.get() != ErrorCode::EC_OK) {
+            fut.wait(); // drain all the known futures
+
+            if (!result) {
+                // some tasks already failed, no need to extract data any further
+                continue;
+            }
+
+            if (auto key_sampling_res = fut.get(); key_sampling_res.ec != ErrorCode::EC_OK) {
                 result = false;
+            } else {
+                for (const auto &key : *key_sampling_res.keys) {
+                    out_keys.emplace_back(key);
+                }
+                for (const auto &map : *key_sampling_res.maps) {
+                    out_maps.emplace_back(map);
+                }
             }
         } else {
             result = false;

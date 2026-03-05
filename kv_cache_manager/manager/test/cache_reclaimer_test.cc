@@ -219,6 +219,9 @@ ErrorCode MetaIndexer_RandomSample_stub(void *obj, const std::size_t c, MetaInde
     if (random_sample_result == ErrorCode::EC_OK) {
         if (c == random_sample_keys.size()) {
             out_keys = random_sample_keys;
+        } else if (c == 11) {
+            // special case
+            out_keys = random_sample_keys;
         } else {
             out_keys = MetaIndexer::KeyVector(c);
         }
@@ -2794,5 +2797,21 @@ TEST_F(CacheReclaimerTest, TestDoKeySampling) {
         ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_.get(), instance_infos.front(), keys, maps));
         ASSERT_EQ(1, keys.size());
         ASSERT_EQ(1, maps.size());
+    }
+
+    {
+        // test less sampled keys returnd
+        cache_reclaimer_->sampling_size_.store(100);
+        cache_reclaimer_->sampling_size_per_task_.store(11); // trigger the specially crafted case
+        // 100 = 11 * 9 + 1
+        // 9 + 1 sampling tasks would be despatched
+        // the specially crafted size 11 would cause the mock func return 10 sampled keys
+        // 10 * 9 + 1 = 91
+
+        std::vector<std::int64_t> keys;
+        std::vector<std::map<std::string, std::string>> maps;
+        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_.get(), instance_infos.front(), keys, maps));
+        ASSERT_EQ(91, keys.size());
+        ASSERT_EQ(91, maps.size());
     }
 }
