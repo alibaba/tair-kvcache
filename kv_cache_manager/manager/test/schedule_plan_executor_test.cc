@@ -584,7 +584,7 @@ TEST_F(SchedulePlanExecutorTest, TestSubmitLocationDelRequest) {
         .block_keys = {700},
         .location_ids = {std::vector<std::string>{original_location_ids[0],
                                                   original_location_ids[1]}}, // 删除前两个location
-        .delay = std::chrono::milliseconds(0),                                // 立即执行
+        .delay = std::chrono::milliseconds(1000),                             // 添加延迟方便DELETING检查
     };
 
     // 提交任务
