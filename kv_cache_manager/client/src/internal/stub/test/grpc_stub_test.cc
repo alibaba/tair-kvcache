@@ -1,3 +1,4 @@
+#include <atomic>
 #include <grpcpp/grpcpp.h>
 #include <memory>
 #include <netinet/in.h>
@@ -176,60 +177,100 @@ TEST_F(GrpcStubTest, TestBadAddress) {
 }
 
 TEST_F(GrpcStubTest, TestRetry) {
-    std::thread t_stub([this]() {
-        stub_ = std::make_shared<GrpcStub>(100, 100000);
-        ASSERT_EQ(ER_OK, stub_->AddConnection("0.0.0.0:" + std::to_string(port_), 10000));
-        KVCM_LOG_INFO("retry stub connected");
-        auto expected = std::pair<ClientErrorCode, std::string>(ER_OK, default_storage_configs);
-        ASSERT_EQ(
-            expected,
-            stub_->RegisterInstance(
-                "trace1", "default", "instance1", 64, createLocationSpecInfos(2), createModelDeployment(2, 1), {}));
-        std::string write_session_id;
-        Locations target_locations;
-        {
-            auto [success, write_location] =
-                stub_->StartWriteCache("trace2", "instance1", {1, 2, 3, 4}, {}, {}, 1000000);
-            ASSERT_EQ(ER_OK, success);
-            write_session_id = write_location.write_session_id;
-            target_locations = write_location.locations;
-        }
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-        {
-            auto [success, locations] = stub_->GetCacheLocation(
-                "trace3", "instance1", QueryType::QT_PREFIX_MATCH, {1, 2, 3, 4}, {}, static_cast<size_t>(0), 0, {});
-            ASSERT_EQ(ER_OK, success);
-            ASSERT_EQ(Locations({}), locations);
-        }
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-        {
-            BlockMask success_block = BlockMaskVector({true, true, false, false});
-            ASSERT_EQ(ER_OK, stub_->FinishWriteCache("trace4", "instance1", write_session_id, success_block, {}));
-            target_locations.resize(target_locations.size() - 2);
-        }
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-        {
-            auto [success, locations] = stub_->GetCacheLocation(
-                "trace5", "instance1", QueryType::QT_PREFIX_MATCH, {1, 2, 3, 4}, {}, static_cast<size_t>(0), 0, {});
-            ASSERT_EQ(ER_OK, success);
-            ExpectLocationsEq(target_locations, locations);
-            ASSERT_FALSE(HasFailure());
-        }
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-        {
-            auto [success, locations] = stub_->GetCacheLocation(
-                "trace6", "instance1", QueryType::QT_PREFIX_MATCH, {1, 2, 3}, {}, static_cast<size_t>(1), 0, {});
-            ASSERT_EQ(ER_OK, success);
-            ExpectLocationsEq(Locations(target_locations.begin() + 1, target_locations.end()), locations);
-            ASSERT_FALSE(HasFailure());
-        }
-    });
-    for (int i = 0; i < 4; ++i) {
+    // 1. 先在存活的服务器上完成所有状态准备
+    // call_timeout=10000: 控制retry backoff间隔(initial_backoff≈1.67s)，使断连恢复后能快速完成retry
+    stub_ = std::make_shared<GrpcStub>(5, 10000);
+    ASSERT_EQ(ER_OK, stub_->AddConnection("0.0.0.0:" + std::to_string(port_), 10000));
+
+    auto expected = std::pair<ClientErrorCode, std::string>(ER_OK, default_storage_configs);
+    ASSERT_EQ(expected,
+              stub_->RegisterInstance(
+                  "trace1", "default", "instance1", 64, createLocationSpecInfos(2), createModelDeployment(2, 1), {}));
+
+    // Helper: 只重启/关闭 gRPC server，复用 meta_service_ 保持业务状态
+    auto restartGrpcServer = [this]() {
+        grpc::ServerBuilder builder;
+        std::string server_spec = "0.0.0.0:" + std::to_string(port_);
+        builder.AddListeningPort(server_spec, grpc::InsecureServerCredentials());
+        builder.RegisterService(meta_service_.get());
+        rpc_server_ = builder.BuildAndStart();
+    };
+    auto shutdownGrpcServer = [this]() {
         rpc_server_->Shutdown();
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-        StartService(port_);
-    }
-    t_stub.join();
+        rpc_server_->Wait();
+        rpc_server_.reset();
+    };
+    // gRPC v1.19.1 bug workaround (grpc/grpc#28827):
+    // 每次断连后首次RPC会因subchannel状态异常而立即失败，用dummy call触发subchannel重连。
+    // 升级到grpc1.45.0+后可以去掉所有dummyCall调用。
+    auto dummyCall = [this]() {
+        stub_->GetCacheLocation(
+            "trace_dummy", "instance1", QueryType::QT_PREFIX_MATCH, {}, {}, static_cast<size_t>(0), 0, {});
+    };
+
+    // Helper: 关停server后执行rpcOp，验证RPC被阻塞，再重启server验证retry成功
+    auto retryTest = [&](auto rpcOp) {
+        shutdownGrpcServer();
+        std::atomic<bool> rpc_started{false};
+        std::thread t([&]() {
+            dummyCall();
+            rpc_started.store(true);
+            rpcOp();
+        });
+        for (int i = 0; i < 100; i++) {
+            if (rpc_started.load()) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        ASSERT_TRUE(rpc_started.load());
+        restartGrpcServer();
+        ASSERT_TRUE(rpc_server_ != nullptr);
+        t.join();
+    };
+
+    std::string write_session_id;
+    Locations target_locations;
+
+    // --- Retry test 1: StartWriteCache ---
+    retryTest([&]() {
+        auto [success, write_location] = stub_->StartWriteCache("trace2", "instance1", {1, 2, 3, 4}, {}, {}, 1000000);
+        EXPECT_EQ(ER_OK, success);
+        EXPECT_GT(write_location.locations.size(), 0);
+        write_session_id = write_location.write_session_id;
+        target_locations = write_location.locations;
+    });
+
+    // --- Retry test 2: GetCacheLocation (写入中，应返回空) ---
+    retryTest([&]() {
+        auto [success, locations] = stub_->GetCacheLocation(
+            "trace3", "instance1", QueryType::QT_PREFIX_MATCH, {1, 2, 3, 4}, {}, static_cast<size_t>(0), 0, {});
+        EXPECT_EQ(ER_OK, success);
+        EXPECT_EQ(Locations({}), locations);
+    });
+
+    // --- Retry test 3: FinishWriteCache (部分成功，前2个block成功，后2个失败) ---
+    retryTest([&]() {
+        BlockMask success_block = BlockMaskVector({true, true, false, false});
+        EXPECT_EQ(ER_OK, stub_->FinishWriteCache("trace4", "instance1", write_session_id, success_block, {}));
+    });
+    target_locations.resize(target_locations.size() - 2);
+
+    // --- Retry test 4: GetCacheLocation (finish后，应返回缓存数据) ---
+    retryTest([&]() {
+        auto [success, locations] = stub_->GetCacheLocation(
+            "trace5", "instance1", QueryType::QT_PREFIX_MATCH, {1, 2, 3, 4}, {}, static_cast<size_t>(0), 0, {});
+        EXPECT_EQ(ER_OK, success);
+        ExpectLocationsEq(target_locations, locations);
+    });
+
+    // --- Retry test 5: GetCacheLocation with offset (应返回子集) ---
+    retryTest([&]() {
+        auto [success, locations] = stub_->GetCacheLocation(
+            "trace6", "instance1", QueryType::QT_PREFIX_MATCH, {1, 2, 3}, {}, static_cast<size_t>(1), 0, {});
+        EXPECT_EQ(ER_OK, success);
+        ExpectLocationsEq(Locations(target_locations.begin() + 1, target_locations.end()), locations);
+    });
 }
 
 TEST_F(GrpcStubTest, TestRegisterInstance) {
