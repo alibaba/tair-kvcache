@@ -92,9 +92,6 @@ bool MooncakeStorageSpec::ValidateRequiredFields(std::string &invalid_fields) co
     if (protocol_.empty()) {
         valid = false;
         local_invalid_fields += "{protocol}";
-    } else if (protocol_ == "rdma" && rdma_device_.empty()) {
-        valid = false;
-        local_invalid_fields += "{rdma_device}";
     }
     if (master_server_entry_.empty()) {
         valid = false;
