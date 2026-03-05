@@ -42,7 +42,6 @@ def run_optimizer_with_config(
     capacity: int,
     policy: str = None,
     save_csv_to: str = None,
-    export_lifecycle: bool = False,
     enable_lifecycle_tracking: bool = False,
 ) -> str:
     """
@@ -52,7 +51,7 @@ def run_optimizer_with_config(
     """
     temp_dir, _ = run_optimizer_with_config_explicit(
         config_path, capacity, policy, save_csv_to,
-        export_lifecycle, enable_lifecycle_tracking,
+        enable_lifecycle_tracking,
     )
     return temp_dir
 
@@ -62,7 +61,6 @@ def run_optimizer_with_config_explicit(
     capacity: int,
     policy: str = None,
     save_csv_to: str = None,
-    export_lifecycle: bool = False,
     enable_lifecycle_tracking: bool = False,
 ) -> Tuple[str, object]:
     """
@@ -101,11 +99,9 @@ def run_optimizer_with_config_explicit(
     if save_csv_to:
         import glob
         os.makedirs(save_csv_to, exist_ok=True)
-        pattern = "*.csv" if export_lifecycle else "*_hit_rates.csv"
-        for csv_file in glob.glob(os.path.join(temp_dir, pattern)):
+        for csv_file in glob.glob(os.path.join(temp_dir, "*_hit_rates.csv")):
             shutil.copy(csv_file, save_csv_to)
-        label = "included" if export_lifecycle else "excluded"
-        print(f"  → CSV saved to: {save_csv_to} (lifecycle={label})")
+        print(f"  → CSV saved to: {save_csv_to}")
 
     return temp_dir, manager
 
@@ -131,7 +127,6 @@ def warmup_pass(
     print(f"Running warmup with capacity={warmup_capacity}...")
     temp_dir, manager = run_optimizer_with_config_explicit(
         config_path, warmup_capacity, policy,
-        export_lifecycle=False,
         enable_lifecycle_tracking=enable_lifecycle_tracking,
     )
 
@@ -147,8 +142,6 @@ def warmup_pass(
         acc_read = int(df["AccReadBlocks"].iloc[-1]) if "AccReadBlocks" in df.columns else 0
         acc_write = int(df["AccWriteBlocks"].iloc[-1]) if "AccWriteBlocks" in df.columns else 0
         print(f"Warmup done. Max cached: {max_blocks}, AccReadBlocks: {acc_read}, AccWriteBlocks: {acc_write}")
-        else:
-            print(f"Warmup done. Max blocks: {max_blocks}")
 
         return max_blocks
     finally:
@@ -170,7 +163,6 @@ def run_single_experiment(
     exp_id: int,
     total_exps: int,
     save_csv_to: str = None,
-    export_lifecycle: bool = False,
     enable_lifecycle_tracking: bool = False,
 ) -> dict:
     """
@@ -201,7 +193,7 @@ def run_single_experiment(
 
         temp_dir, manager = run_optimizer_with_config_explicit(
             config_path, capacity, policy, save_csv_to,
-            export_lifecycle, enable_lifecycle_tracking,
+            enable_lifecycle_tracking,
         )
         csv_map = collect_instance_csvs(temp_dir)
         if not csv_map:
@@ -244,7 +236,6 @@ def run_experiments_parallel(
     experiments: List[tuple],
     max_workers: int = 4,
     save_csv_dir: str = None,
-    export_lifecycle: bool = False,
     enable_lifecycle_tracking: bool = False,
 ) -> List[dict]:
     """
@@ -269,7 +260,7 @@ def run_experiments_parallel(
         tasks.append((
             config_path, capacity, policy,
             i + 1, len(experiments),
-            csv_subdir, export_lifecycle, enable_lifecycle_tracking,
+            csv_subdir, enable_lifecycle_tracking,
         ))
 
     results = []

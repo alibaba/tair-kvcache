@@ -158,8 +158,6 @@ def main():
                         help="保留每次运行的 CSV 文件")
     parser.add_argument("--csv-output-dir", default=None,
                         help="CSV 保存目录（默认: <output_result_path>/csv_results）")
-    parser.add_argument("--export-lifecycle", action="store_true",
-                        help="导出 lifecycle CSV（警告：可能生成超大文件）")
     parser.add_argument("--skip-run", action="store_true",
                         help="跳过实验，从已有 CSV 目录加载数据")
     parser.add_argument("--plot-timeseries", action="store_true",
@@ -216,14 +214,12 @@ def main():
 
         if args.save_csv:
             print("CSV files will be saved to: {}\n".format(csv_save_dir))
-        if args.export_lifecycle:
-            print("WARNING: Lifecycle export ENABLED - may generate VERY LARGE files!\n")
 
         experiments = [(cap, pol) for pol in policies for cap in capacities]
         csv_dir_arg = csv_save_dir if args.save_csv else None
         raw = run_experiments_parallel(
             args.config, experiments, args.max_workers,
-            csv_dir_arg, args.export_lifecycle,
+            csv_dir_arg,
         )
         results_by_policy = _group_by_policy(raw)
 

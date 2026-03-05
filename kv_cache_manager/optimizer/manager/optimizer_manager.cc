@@ -164,6 +164,7 @@ WriteCacheRes OptimizerManager::WriteCache(const std::string &instance_id,
     trace.set_keys(block_ids);
     trace.set_tokens(token_ids);
     optimizer_runner_->HandleWriteCache(trace);
+    stats_collector_->UpdateTimestamp(instance_id, timestamp);
 
     WriteCacheRes res;
     res.trace_id = trace_id;
@@ -193,6 +194,7 @@ GetCacheLocationRes OptimizerManager::GetCacheLocation(const std::string &instan
     trace.set_tokens(token_ids);
     trace.set_block_mask(block_mask);
     optimizer_runner_->HandleGetLocation(trace);
+    stats_collector_->UpdateTimestamp(instance_id, timestamp);
 
     GetCacheLocationRes res;
     res.trace_id = trace_id;

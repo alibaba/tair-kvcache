@@ -202,18 +202,30 @@ def plot_multi_instance_analysis(csv_dir):
                     linewidth=1.5, drawstyle='steps-post')
         top_lines += l1
 
-    # 下图：当前trace命中率（按时间平滑）
+    # 下图：当前trace命中率（按时间平滑 + 按时间降采样）
+    downsample_interval_s = 10  # 每隔 10 秒取一个代表点
+    window_seconds = 2
+
     for i, name in enumerate(instance_names):
         t0, t1 = all_time_ranges[i]
         valid = (base_timestamps >= t0) & (base_timestamps <= t1)
 
-        step = 10
-        idx = np.flatnonzero(valid)[::step]   # 在valid范围内每隔step取一个点，防止线太密集
-
-        # 按时间平滑：60秒窗口（可调整）
-        window_seconds = 2
+        # 按时间平滑
         hit_sm = smooth_by_time(base_timestamps, np.array(all_hit[i]), window_seconds)
         ext_sm = smooth_by_time(base_timestamps, np.array(all_external_hit[i]), window_seconds)
+
+        # 按时间降采样：在 valid 范围内，每隔 downsample_interval_s 秒保留最近的一个点
+        valid_idx = np.flatnonzero(valid)
+        if len(valid_idx) == 0:
+            continue
+
+        sampled = [valid_idx[0]]
+        last_t = base_timestamps[valid_idx[0]]
+        for vi in valid_idx[1:]:
+            if base_timestamps[vi] - last_t >= downsample_interval_s:
+                sampled.append(vi)
+                last_t = base_timestamps[vi]
+        idx = np.array(sampled)
 
         l2 = ax_bot_r.plot(base_timestamps[idx], hit_sm[idx],
                         color=colors[i], label=f'{name} - HitRate',
