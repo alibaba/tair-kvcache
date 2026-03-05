@@ -1,6 +1,7 @@
 from typing import List, Union, Optional, Any
 import tempfile
 import time
+from pathlib import Path
 import numpy as np
 import torch
 import psutil
@@ -10,6 +11,9 @@ from functools import wraps
 
 from hisim.utils.logger import get_logger
 from hisim.simulation.manager import StateManager, ConfigManager, Envs
+from sglang.srt.mem_cache.hicache_storage import (
+    HiCacheStorageExtraInfo,
+)
 
 try:
     from kv_cache_manager.optimizer.pybind import kvcm_py_optimizer
@@ -17,6 +21,7 @@ except ImportError:
     kvcm_py_optimizer = None
 
 logger = get_logger("hisim")
+_CURRENT_DIR = Path(__file__).parent.resolve()
 
 
 def alloc_extend_cpu(
@@ -991,20 +996,19 @@ class MockHiCacheStorage:
         # Initialize kvcm based on reference examples
         self.temp_dir = tempfile.mkdtemp()
         logger.info(f"Using temporary directory: {self.temp_dir}")
-        optimizer_config = kvcm_py_optimizer.OptimizerConfig()
-        tier = kvcm_py_optimizer.TierConfig()
-        tier.set_unique_name("tier1")
-        tier.set_storage_type(kvcm_py_optimizer.DataStorageType.DATA_STORAGE_TYPE_HF3FS)
-        tier.set_priority(0)
-        tier.set_eviction_policy_type(kvcm_py_optimizer.EvictionPolicyType.LRU)
-        tier.set_capacity(1000000)
-        tier.set_band_width_mbps(1000)
-        optimizer_config.set_tiers([tier])
-        optimizer_config.set_trace_type(kvcm_py_optimizer.TraceType.TRACE_PUBLISHER_LOG)
-        optimizer_config.set_block_size(1)
 
-        optimizer_config.set_rw_separation(True)
-        self.storage_manager = kvcm_py_optimizer.OptimizerManager(optimizer_config)
+        config_file_path = _CURRENT_DIR / "../../../.." / "kv_cache_manager" / "optimizer" / "optimizer_startup_config_load.json"
+        config_file_path = config_file_path.resolve()
+        self.config_loader = kvcm_py_optimizer.OptimizerConfigLoader()
+
+        if not self.config_loader.load(config_file_path):
+            raise RuntimeError(f"Failed to load optimizer config from {config_file_path}")
+        self.config = self.config_loader.config()
+        self.storage_manager = kvcm_py_optimizer.OptimizerManager(self.config)
+        self.storage_manager.Init()
+
+        # Multi-instance not supported yet; using a single shared instance_id.
+        self.instance_id = "3780643326877293460"
 
     def tearDown(self):
         if hasattr(self, "temp_dir"):
@@ -1034,17 +1038,22 @@ class MockHiCacheStorage:
         self,
         keys: List[str],
         values: Optional[Any] = None,
+        extra_info: HiCacheStorageExtraInfo = None,
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> bool:
         if hasattr(self, "storage_manager"):
-            int_hash_keys = [_pass_str_to_block_ids(key) for key in keys]
+            if extra_info and extra_info.prefix_keys is not None:
+                complete_prefix_hashs = extra_info.prefix_keys + keys
+            else:
+                complete_prefix_hashs = keys
+            int_hash_keys = [_pass_str_to_block_ids(key) for key in complete_prefix_hashs]
             # insert to kvcm
             trace_id = "1"
             write_timestamp = int(time.time() * 1000)
             write_token_ids = [1]
             self.storage_manager.WriteCache(
-                trace_id, write_timestamp, int_hash_keys, write_token_ids
+                self.instance_id, trace_id, write_timestamp, int_hash_keys, write_token_ids
             )
             return True
         else:
@@ -1068,9 +1077,8 @@ class MockHiCacheStorage:
             trace_id = "2"
             read_timestamp = int(time.time() * 1000)
             read_token_ids = [1]
-            mask_offset = 0
             res = self.storage_manager.GetCacheLocation(
-                trace_id, read_timestamp, int_hash_keys, read_token_ids, mask_offset
+                self.instance_id, trace_id, read_timestamp, int_hash_keys, read_token_ids
             )
             logger.debug(f"{res.kvcm_hit_length=}")
             return res.kvcm_hit_length
@@ -1082,10 +1090,8 @@ class MockHiCacheStorage:
 
     def clear(self) -> bool:
         if hasattr(self, "storage_manager"):
-            logger.warning("KVCM has not yet provided an interface to clear the cache.")
-            self.tearDown()
-            self.storage_manager = None
-            self.init_kvcm()
+            logger.info("Clear all storage cache in kvcm.")
+            self.storage_manager.ClearAllCaches()
             return True
         else:
             self.storage.clear()

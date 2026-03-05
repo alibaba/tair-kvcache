@@ -63,6 +63,9 @@ class SGLangBenchmarkRunner(BaseBenchmarkRunner):
     def flush_cache(self):
         self.engine.flush_cache()
 
+    def reset_storage_cache(self):
+        self.engine.clear_hicache_storage()
+
     def get_request(
         self,
         dataset: BaseDataset,

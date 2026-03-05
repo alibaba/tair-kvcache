@@ -54,6 +54,7 @@ class RequestStats:
     input_length: int = 1
     output_length: int = 1
     final_reused_tokens: int = 0
+    prefetch_complete_tokens:int = 0
     queue_start: float = -1
     queue_end: float = -1
     created_time: float = -1
