@@ -168,12 +168,12 @@ TEST_F(LocalMetricsReporterTest, TestReportPerQuery02) {
     ServiceMetricsCollector collector(metrics_registry_);
     collector.Init();
 
-    EXPECT_EQ(3 + 5 + 11 + 5 + 16, metrics_registry_->GetSize());
+    EXPECT_EQ(3 + 5 + 11 + 5 + 17, metrics_registry_->GetSize());
 
     {
         reporter_->ReportPerQuery(&collector);
 
-        EXPECT_EQ(3 + 5 + 11 + 5 + 16, metrics_registry_->GetSize());
+        EXPECT_EQ(3 + 5 + 11 + 5 + 17, metrics_registry_->GetSize());
 
         std::uint64_t v;
         GET_METRICS_(&collector, service, query_counter, v);
@@ -190,7 +190,7 @@ TEST_F(LocalMetricsReporterTest, TestReportPerQuery02) {
 
         reporter_->ReportPerQuery(&collector);
 
-        EXPECT_EQ(3 + 5 + 11 + 5 + 16, metrics_registry_->GetSize());
+        EXPECT_EQ(3 + 5 + 11 + 5 + 17, metrics_registry_->GetSize());
 
         std::uint64_t v;
         GET_METRICS_(&collector, service, query_counter, v);

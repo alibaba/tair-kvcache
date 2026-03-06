@@ -20,14 +20,24 @@
 
 namespace kv_cache_manager {
 
-#ifndef KVCM_METRICS_FOR_CACHE_RECLAIMER
-#define KVCM_METRICS_FOR_CACHE_RECLAIMER(name)                                                                         \
+#ifndef KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER
+#define KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(name)                                                                 \
 public:                                                                                                                \
     DECLARE_METRICS_NAME_(cache_reclaimer, name);                                                                      \
     DEFINE_GET_METRICS_COUNTER_(cache_reclaimer, name)                                                                 \
                                                                                                                        \
 private:                                                                                                               \
     DECLARE_METRICS_COUNTER_(cache_reclaimer, name);
+#endif
+
+#ifndef KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER
+#define KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(name)                                                                   \
+public:                                                                                                                \
+    DECLARE_METRICS_NAME_(cache_reclaimer, name);                                                                      \
+    DEFINE_GET_METRICS_GAUGE_(cache_reclaimer, name)                                                                   \
+                                                                                                                       \
+private:                                                                                                               \
+    DECLARE_METRICS_GAUGE_(cache_reclaimer, name);
 #endif
 
 class CacheReclaimStrategy;
@@ -437,12 +447,22 @@ private:
     GetGroupUsageData(const RequestContext *request_context,
                       const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) const noexcept;
 
-    KVCM_METRICS_FOR_CACHE_RECLAIMER(block_submit_count)
-    KVCM_METRICS_FOR_CACHE_RECLAIMER(location_submit_count)
-    KVCM_METRICS_FOR_CACHE_RECLAIMER(block_del_count)
-    KVCM_METRICS_FOR_CACHE_RECLAIMER(location_del_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(reclaim_cron_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(reclaim_job_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(block_submit_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(location_submit_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(block_del_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(location_del_count)
+
+    KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_cron_duration_us)
+    KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_job_duration_us)
+    KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_lru_sample_duration_us)
+    KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_lru_batch_duration_us)
+    KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_lru_filter_duration_us)
+    KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_lru_submit_duration_us)
 };
 
-#undef KVCM_METRICS_FOR_CACHE_RECLAIMER
+#undef KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER
+#undef KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER
 
 } // namespace kv_cache_manager

@@ -77,12 +77,25 @@ namespace kv_cache_manager {
 
 #define DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(name) DEFINE_METRICS_NAME_(CacheReclaimer, cache_reclaimer, name)
 
-#define REGISTER_METRICS_FOR_CACHE_RECLAIMER(name) REGISTER_METRICS_COUNTER_(metrics_registry_, cache_reclaimer, name)
+#define REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(name)                                                             \
+    REGISTER_METRICS_COUNTER_(metrics_registry_, cache_reclaimer, name)
 
+#define REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(name)                                                               \
+    REGISTER_METRICS_GAUGE_(metrics_registry_, cache_reclaimer, name)
+
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_cron_count);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_job_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(block_submit_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(location_submit_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(block_del_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(location_del_count);
+
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_cron_duration_us);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_job_duration_us);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_lru_sample_duration_us);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_lru_batch_duration_us);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_lru_filter_duration_us);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_lru_submit_duration_us);
 
 const std::string CacheReclaimer::kTraceIDPrefix{"cache_reclaimer_internal_trace_"};
 
@@ -176,10 +189,19 @@ ErrorCode CacheReclaimer::Start() noexcept {
 
     // allow event_manager_ to be nullptr
 
-    REGISTER_METRICS_FOR_CACHE_RECLAIMER(block_submit_count);
-    REGISTER_METRICS_FOR_CACHE_RECLAIMER(location_submit_count);
-    REGISTER_METRICS_FOR_CACHE_RECLAIMER(block_del_count);
-    REGISTER_METRICS_FOR_CACHE_RECLAIMER(location_del_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(reclaim_cron_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(reclaim_job_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(block_submit_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(location_submit_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(block_del_count);
+    REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(location_del_count);
+
+    REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_cron_duration_us);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_job_duration_us);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_lru_sample_duration_us);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_lru_batch_duration_us);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_lru_filter_duration_us);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_lru_submit_duration_us);
 
     {
         std::unique_lock<std::mutex> lock(job_state_mutex_);
@@ -426,10 +448,13 @@ void CacheReclaimer::ReclaimByLRU(const std::shared_ptr<RequestContext> &request
 
     // 1. get the sampled block keys and the LRU timestamp info from
     // the meta indexer
+    const std::int64_t begin_tp_sample = TimestampUtil::GetSteadyTimeUs();
     if (!DoKeySampling(request_context.get(), instance_info, keys, maps)) {
         LOG_WITH_ID(DEBUG, "key sampling failed");
         return;
     }
+    METRICS_(cache_reclaimer, reclaim_lru_sample_duration_us) =
+        static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp_sample);
     LOG_WITH_ID(DEBUG, "[%zu] key(s) sampled", keys.size());
 
     // init the deleting request with content to be filled later
@@ -440,10 +465,13 @@ void CacheReclaimer::ReclaimByLRU(const std::shared_ptr<RequestContext> &request
     request.delay = std::chrono::milliseconds(delay_before_delete_ms);
 
     // 2. constitute the batch based on the LRU timestamp info
+    const std::int64_t begin_tp_batch = TimestampUtil::GetSteadyTimeUs();
     if (!MakeBatchByLRU(request_context.get(), instance_info, keys, maps, request.block_keys)) {
         LOG_WITH_ID(DEBUG, "make batch failed");
         return;
     }
+    METRICS_(cache_reclaimer, reclaim_lru_batch_duration_us) =
+        static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp_batch);
     LOG_WITH_ID(DEBUG, "batch is made with size [%zu]", request.block_keys.size());
     if (request.block_keys.empty()) {
         return;
@@ -452,6 +480,7 @@ void CacheReclaimer::ReclaimByLRU(const std::shared_ptr<RequestContext> &request
     // 3. inspect the cache location status for every blocks so that
     // only the cache locations with the "CLS_SERVING" status are
     // submitted to be deleted
+    const std::int64_t begin_tp_filter = TimestampUtil::GetSteadyTimeUs();
     if (!FilterLocID(request_context.get(),
                      instance_info,
                      request.block_keys,
@@ -460,9 +489,16 @@ void CacheReclaimer::ReclaimByLRU(const std::shared_ptr<RequestContext> &request
         LOG_WITH_ID(DEBUG, "filter location ID failed");
         return;
     }
+    METRICS_(cache_reclaimer, reclaim_lru_filter_duration_us) =
+        static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp_filter);
 
     // 4. submit the final deleting request to the executor
+    const std::int64_t begin_tp_submit = TimestampUtil::GetSteadyTimeUs();
     SubmitDelReq(request_context, instance_info, request);
+    METRICS_(cache_reclaimer, reclaim_lru_submit_duration_us) =
+        static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp_submit);
+
+    METRICS_(cache_reclaimer, reclaim_job_count) += 1;
 }
 
 void CacheReclaimer::ReclaimByLFU(const std::shared_ptr<RequestContext> &request_context,
@@ -496,6 +532,8 @@ void CacheReclaimer::ReclaimByTTL(const std::shared_ptr<RequestContext> &request
 void CacheReclaimer::ReclaimCron() noexcept {
     std::uint32_t sleep_interval_ms = sleep_interval_ms_.load();
     while (true) {
+        const std::int64_t begin_tp = TimestampUtil::GetSteadyTimeUs();
+
         {
             std::unique_lock<std::mutex> lock(job_state_mutex_);
             if (!job_state_flag_) {
@@ -535,6 +573,10 @@ void CacheReclaimer::ReclaimCron() noexcept {
         } else {
             sleep_interval_ms = sleep_interval_ms_.load();
         }
+
+        METRICS_(cache_reclaimer, reclaim_cron_duration_us) =
+            static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp);
+        METRICS_(cache_reclaimer, reclaim_cron_count) += 1;
     }
 }
 
@@ -580,7 +622,8 @@ bool CacheReclaimer::DoKeySampling(RequestContext *request_context,
 
         SubmitTask([request_context, &ins_id, &ins_gr, meta_indexer, sampling_sz, promise]() {
             const auto keys = std::make_shared<std::vector<std::int64_t>>();
-            if (const auto ec = meta_indexer->RandomSample(sampling_sz, *keys); ec != ErrorCode::EC_OK) {
+            if (const auto ec = meta_indexer->RandomSample(request_context, sampling_sz, *keys);
+                ec != ErrorCode::EC_OK) {
                 LOG_WITH_ID(WARN, "random sample failed, error code: [%d]", static_cast<std::int32_t>(ec));
                 promise->set_value({ec, nullptr, nullptr});
                 return;
@@ -1004,21 +1047,30 @@ bool CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &re
     case ReclaimPolicy::POLICY_LRU:
         LOG_WITH_GR(DEBUG, "start to run the LRU reclaim policy");
         for (const auto &instance_info : instance_infos) {
+            const std::int64_t begin_tp = TimestampUtil::GetSteadyTimeUs();
             ReclaimByLRU(request_context, instance_info, water_level_exceed_results, delay_before_delete_ms);
+            METRICS_(cache_reclaimer, reclaim_job_duration_us) =
+                static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp);
         }
         break;
 
     case ReclaimPolicy::POLICY_LFU:
         LOG_WITH_GR(DEBUG, "start to run the LFU reclaim policy");
         for (const auto &instance_info : instance_infos) {
+            const std::int64_t begin_tp = TimestampUtil::GetSteadyTimeUs();
             ReclaimByLFU(request_context, instance_info, water_level_exceed_results, delay_before_delete_ms);
+            METRICS_(cache_reclaimer, reclaim_job_duration_us) =
+                static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp);
         }
         break;
 
     case ReclaimPolicy::POLICY_TTL:
         LOG_WITH_GR(DEBUG, "start to run the TTL reclaim policy");
         for (const auto &instance_info : instance_infos) {
+            const std::int64_t begin_tp = TimestampUtil::GetSteadyTimeUs();
             ReclaimByTTL(request_context, instance_info, water_level_exceed_results, delay_before_delete_ms);
+            METRICS_(cache_reclaimer, reclaim_job_duration_us) =
+                static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp);
         }
         break;
 
@@ -1028,7 +1080,10 @@ bool CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &re
 
     default:
         for (const auto &instance_info : instance_infos) {
+            const std::int64_t begin_tp = TimestampUtil::GetSteadyTimeUs();
             ReclaimByLRU(request_context, instance_info, water_level_exceed_results, delay_before_delete_ms);
+            METRICS_(cache_reclaimer, reclaim_job_duration_us) =
+                static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp);
         }
         break;
     }

@@ -246,6 +246,7 @@ class ServiceMetricsCollector final : public MetricsCollector {
     KVCM_GAUGE_METRICS(meta_indexer, upsert_io_time_us)
     KVCM_GAUGE_METRICS(meta_indexer, delete_io_time_us)
     KVCM_GAUGE_METRICS(meta_indexer, get_io_time_us)
+    KVCM_GAUGE_METRICS(meta_indexer, rand_io_time_us)
     KVCM_GAUGE_METRICS(meta_indexer, read_modify_write_put_key_count)
     KVCM_GAUGE_METRICS(meta_indexer, read_modify_write_update_key_count)
     KVCM_GAUGE_METRICS(meta_indexer, read_modify_write_skip_key_count)

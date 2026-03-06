@@ -83,7 +83,7 @@ public:
 
     ErrorCode
     Scan(const std::string &cursor, const size_t limit, std::string &out_next_cursor, KeyVector &out_keys) noexcept;
-    ErrorCode RandomSample(const size_t count, KeyVector &out_keys) noexcept;
+    ErrorCode RandomSample(RequestContext *request_context, const size_t count, KeyVector &out_keys) const noexcept;
 
     void PersistMetaData() noexcept;
     size_t GetKeyCount() const noexcept;

@@ -95,6 +95,7 @@ DEFINE_METRICS_NAME_FOR_META_INDEXER(update_io_time_us);
 DEFINE_METRICS_NAME_FOR_META_INDEXER(upsert_io_time_us);
 DEFINE_METRICS_NAME_FOR_META_INDEXER(delete_io_time_us);
 DEFINE_METRICS_NAME_FOR_META_INDEXER(get_io_time_us);
+DEFINE_METRICS_NAME_FOR_META_INDEXER(rand_io_time_us);
 DEFINE_METRICS_NAME_FOR_META_INDEXER(read_modify_write_put_key_count);
 DEFINE_METRICS_NAME_FOR_META_INDEXER(read_modify_write_update_key_count);
 DEFINE_METRICS_NAME_FOR_META_INDEXER(read_modify_write_skip_key_count);
@@ -152,6 +153,7 @@ bool ServiceMetricsCollector::Init() {
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER(upsert_io_time_us);
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER(delete_io_time_us);
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER(get_io_time_us);
+    REGISTER_GAUGE_METRICS_FOR_META_INDEXER(rand_io_time_us);
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER(read_modify_write_put_key_count);
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER(read_modify_write_update_key_count);
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER(read_modify_write_skip_key_count);

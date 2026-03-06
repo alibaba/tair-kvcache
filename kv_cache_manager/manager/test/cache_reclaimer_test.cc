@@ -215,7 +215,10 @@ MetaIndexer::Result MetaIndexer_GetProperties_stub(void *obj,
 ErrorCode random_sample_result;
 MetaIndexer::KeyVector random_sample_keys;
 
-ErrorCode MetaIndexer_RandomSample_stub(void *obj, const std::size_t c, MetaIndexer::KeyVector &out_keys) noexcept {
+ErrorCode MetaIndexer_RandomSample_stub(void *obj,
+                                        RequestContext *rc,
+                                        const std::size_t c,
+                                        MetaIndexer::KeyVector &out_keys) noexcept {
     if (random_sample_result == ErrorCode::EC_OK) {
         if (c == random_sample_keys.size()) {
             out_keys = random_sample_keys;

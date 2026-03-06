@@ -82,6 +82,7 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(meta_indexer, upsert_io_time_us);
     DECLARE_METRICS(meta_indexer, delete_io_time_us);
     DECLARE_METRICS(meta_indexer, get_io_time_us);
+    DECLARE_METRICS(meta_indexer, rand_io_time_us);
     DECLARE_METRICS(meta_indexer, read_modify_write_put_key_count);
     DECLARE_METRICS(meta_indexer, read_modify_write_update_key_count);
     DECLARE_METRICS(meta_indexer, read_modify_write_skip_key_count);
@@ -108,10 +109,19 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(scheduler_plan_executor, executing_task_count);
 
     // cache reclaimer metrics
+    DECLARE_METRICS(cache_reclaimer, reclaim_cron_count);
+    DECLARE_METRICS(cache_reclaimer, reclaim_job_count);
     DECLARE_METRICS(cache_reclaimer, block_submit_count);
     DECLARE_METRICS(cache_reclaimer, location_submit_count);
     DECLARE_METRICS(cache_reclaimer, block_del_count);
     DECLARE_METRICS(cache_reclaimer, location_del_count);
+
+    DECLARE_METRICS(cache_reclaimer, reclaim_cron_duration_us);
+    DECLARE_METRICS(cache_reclaimer, reclaim_job_duration_us);
+    DECLARE_METRICS(cache_reclaimer, reclaim_lru_sample_duration_us);
+    DECLARE_METRICS(cache_reclaimer, reclaim_lru_batch_duration_us);
+    DECLARE_METRICS(cache_reclaimer, reclaim_lru_filter_duration_us);
+    DECLARE_METRICS(cache_reclaimer, reclaim_lru_submit_duration_us);
 
     // cache manager
     DECLARE_METRICS(cache_manager, write_location_expire_size);
@@ -288,6 +298,7 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(meta_indexer, upsert_io_time_us);
     REGISTER_GAUGE_METRIC(meta_indexer, delete_io_time_us);
     REGISTER_GAUGE_METRIC(meta_indexer, get_io_time_us);
+    REGISTER_GAUGE_METRIC(meta_indexer, rand_io_time_us);
     REGISTER_GAUGE_METRIC(meta_indexer, read_modify_write_put_key_count);
     REGISTER_GAUGE_METRIC(meta_indexer, read_modify_write_update_key_count);
     REGISTER_GAUGE_METRIC(meta_indexer, read_modify_write_skip_key_count);
@@ -314,10 +325,19 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(scheduler_plan_executor, executing_task_count);
 
     // cache reclaimer metrics
+    REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_cron_count);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_job_count);
     REGISTER_GAUGE_METRIC(cache_reclaimer, block_submit_count);
     REGISTER_GAUGE_METRIC(cache_reclaimer, location_submit_count);
     REGISTER_GAUGE_METRIC(cache_reclaimer, block_del_count);
     REGISTER_GAUGE_METRIC(cache_reclaimer, location_del_count);
+
+    REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_cron_duration_us);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_job_duration_us);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_lru_sample_duration_us);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_lru_batch_duration_us);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_lru_filter_duration_us);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_lru_submit_duration_us);
 
     // cache manager
     REGISTER_GAUGE_METRIC(cache_manager, write_location_expire_size);
@@ -418,6 +438,7 @@ void KmonitorMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
         REPORT_STEAL_METRICS(meta_indexer, upsert_io_time_us);
         REPORT_COLLECTED_METRICS(meta_indexer, delete_io_time_us);
         REPORT_COLLECTED_METRICS(meta_indexer, get_io_time_us);
+        REPORT_COLLECTED_METRICS(meta_indexer, rand_io_time_us);
         REPORT_STEAL_METRICS(meta_indexer, read_modify_write_put_key_count);
         REPORT_COLLECTED_METRICS(meta_indexer, read_modify_write_update_key_count);
         REPORT_COLLECTED_METRICS(meta_indexer, read_modify_write_skip_key_count);
@@ -509,21 +530,48 @@ void KmonitorMetricsReporter::ReportInterval() {
             break;
         }
 
+        std::uint64_t reclaim_cron_count_v;
+        std::uint64_t reclaim_job_count_v;
         std::uint64_t blk_submit_count_v;
         std::uint64_t loc_submit_count_v;
         std::uint64_t blk_del_count_v;
         std::uint64_t loc_del_count_v;
 
+        double reclaim_cron_duration_us_v;
+        double reclaim_job_duration_us_v;
+        double reclaim_lru_sample_duration_us_v;
+        double reclaim_lru_batch_duration_us_v;
+        double reclaim_lru_filter_duration_us_v;
+        double reclaim_lru_submit_duration_us_v;
+
+        GET_METRICS_(cr, cache_reclaimer, reclaim_cron_count, reclaim_cron_count_v);
+        GET_METRICS_(cr, cache_reclaimer, reclaim_job_count, reclaim_job_count_v);
         GET_METRICS_(cr, cache_reclaimer, block_submit_count, blk_submit_count_v);
         GET_METRICS_(cr, cache_reclaimer, location_submit_count, loc_submit_count_v);
         GET_METRICS_(cr, cache_reclaimer, block_del_count, blk_del_count_v);
         GET_METRICS_(cr, cache_reclaimer, location_del_count, loc_del_count_v);
 
+        GET_METRICS_(cr, cache_reclaimer, reclaim_cron_duration_us, reclaim_cron_duration_us_v);
+        GET_METRICS_(cr, cache_reclaimer, reclaim_job_duration_us, reclaim_job_duration_us_v);
+        GET_METRICS_(cr, cache_reclaimer, reclaim_lru_sample_duration_us, reclaim_lru_sample_duration_us_v);
+        GET_METRICS_(cr, cache_reclaimer, reclaim_lru_batch_duration_us, reclaim_lru_batch_duration_us_v);
+        GET_METRICS_(cr, cache_reclaimer, reclaim_lru_filter_duration_us, reclaim_lru_filter_duration_us_v);
+        GET_METRICS_(cr, cache_reclaimer, reclaim_lru_submit_duration_us, reclaim_lru_submit_duration_us_v);
+
         const kmonitor::MetricsTags tags;
+        REPORT_METRICS(cache_reclaimer, reclaim_cron_count, static_cast<double>(reclaim_cron_count_v));
+        REPORT_METRICS(cache_reclaimer, reclaim_job_count, static_cast<double>(reclaim_job_count_v));
         REPORT_METRICS(cache_reclaimer, block_submit_count, static_cast<double>(blk_submit_count_v));
         REPORT_METRICS(cache_reclaimer, location_submit_count, static_cast<double>(loc_submit_count_v));
         REPORT_METRICS(cache_reclaimer, block_del_count, static_cast<double>(blk_del_count_v));
         REPORT_METRICS(cache_reclaimer, location_del_count, static_cast<double>(loc_del_count_v));
+
+        REPORT_METRICS(cache_reclaimer, reclaim_cron_duration_us, reclaim_cron_duration_us_v);
+        REPORT_METRICS(cache_reclaimer, reclaim_job_duration_us, reclaim_job_duration_us_v);
+        REPORT_METRICS(cache_reclaimer, reclaim_lru_sample_duration_us, reclaim_lru_sample_duration_us_v);
+        REPORT_METRICS(cache_reclaimer, reclaim_lru_batch_duration_us, reclaim_lru_batch_duration_us_v);
+        REPORT_METRICS(cache_reclaimer, reclaim_lru_filter_duration_us, reclaim_lru_filter_duration_us_v);
+        REPORT_METRICS(cache_reclaimer, reclaim_lru_submit_duration_us, reclaim_lru_submit_duration_us_v);
     } while (false);
 
     do {

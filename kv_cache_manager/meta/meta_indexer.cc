@@ -522,9 +522,16 @@ ErrorCode MetaIndexer::Scan(const std::string &cursor,
     return ec;
 }
 
-ErrorCode MetaIndexer::RandomSample(const size_t count, KeyVector &out_keys) noexcept {
+ErrorCode
+MetaIndexer::RandomSample(RequestContext *request_context, const size_t count, KeyVector &out_keys) const noexcept {
+    auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     out_keys.reserve(count);
+    int64_t begin_get_io_time = TimestampUtil::GetCurrentTimeUs();
     auto ec = storage_->RandomSample(count, out_keys);
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector,
+                                       meta_indexer,
+                                       rand_io_time_us,
+                                       TimestampUtil::GetCurrentTimeUs() - begin_get_io_time);
     if (ec != EC_OK) {
         KVCM_LOG_ERROR("instance[%s] meta indexer random sample failed, count[%lu] sample key size[%lu]",
                        instance_id_.c_str(),
