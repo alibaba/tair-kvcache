@@ -197,11 +197,13 @@ CacheManager::RegisterInstance(RequestContext *request_context,
     const auto &trace_id = request_context->trace_id();
     auto instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
     if (instance_info) {
-        if (instance_info->block_size() != block_size || instance_info->location_spec_infos() != location_spec_infos ||
-            instance_info->model_deployment() != model_deployment ||
-            instance_info->location_spec_groups() != location_spec_groups) {
-            PREFIX_LOG(WARN, "register instance failed: duplicate instance");
-            request_context->error_tracer()->AddErrorMsg("register instance failed: duplicate instance");
+        auto mismatched = instance_info->MismatchFields(block_size, location_spec_infos, model_deployment, location_spec_groups);
+        if (!mismatched.empty()) {
+            auto mismatched_str = StringUtil::Join(mismatched, ", ");
+            request_context->error_tracer()->AddErrorMsg(
+                "register instance failed: instance_id '" + instance_id +
+                "' already exists with different configuration, mismatched fields: [" + mismatched_str + "]");
+            PREFIX_LOG(WARN, "register instance failed: duplicate instance, mismatched fields: [%s]", mismatched_str.c_str());
             return {EC_DUPLICATE_ENTITY, {}};
         }
         auto ec = TryCreateMetaSearcher(request_context, instance_id);

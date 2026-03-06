@@ -5,6 +5,7 @@
 
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
+#include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/config/account.h"
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/instance_info.h"
@@ -301,17 +302,24 @@ ErrorCode RegistryManager::RegisterInstance(RequestContext *request_context,
     std::unique_lock<std::shared_mutex> lock(mutex_);
     auto instance_group_iter = instance_group_configs_.find(instance_group);
     if (instance_group_iter == instance_group_configs_.end()) {
+        request_context->error_tracer()->AddErrorMsg("register instance failed: instance group '" + instance_group +
+                                                     "' not found");
         RETURN_IF_EC_NOT_OK_WITH_LOG_I(
             WARN, EC_NOENT, "register instance failed: instance group not found: %s", instance_group.c_str());
     }
     auto it = instance_infos_.find(instance_id);
     if (it != instance_infos_.end()) {
-        auto exist_instance_info = it->second;
-        if (exist_instance_info->block_size() != block_size ||
-            exist_instance_info->location_spec_infos() != location_spec_infos ||
-            exist_instance_info->model_deployment() != model_deployment ||
-            exist_instance_info->location_spec_groups() != location_spec_groups) {
-            RETURN_IF_EC_NOT_OK_WITH_LOG_I(WARN, EC_DUPLICATE_ENTITY, "register instance failed: duplicate instance");
+        const auto &existing = it->second;
+        auto mismatched = existing->MismatchFields(block_size, location_spec_infos, model_deployment, location_spec_groups);
+        if (!mismatched.empty()) {
+            auto mismatched_str = StringUtil::Join(mismatched, ", ");
+            request_context->error_tracer()->AddErrorMsg(
+                "register instance failed: instance_id '" + instance_id +
+                "' already exists with different configuration, mismatched fields: [" + mismatched_str + "]");
+            RETURN_IF_EC_NOT_OK_WITH_LOG_I(WARN,
+                                           EC_DUPLICATE_ENTITY,
+                                           "register instance failed: duplicate instance, mismatched fields: [%s]",
+                                           mismatched_str.c_str());
         }
         return EC_OK;
     }
@@ -324,9 +332,17 @@ ErrorCode RegistryManager::RegisterInstance(RequestContext *request_context,
                                                         location_spec_groups);
     // save the instance info to storage backend in such a way that one key corresponds to one instance
     auto ec = LoadAndSave(instance_id, instance_id, instance_info.get());
+    if (ec != EC_OK) {
+        request_context->error_tracer()->AddErrorMsg(
+            "register instance failed: failed to persist instance info to storage backend");
+    }
     RETURN_IF_EC_NOT_OK_WITH_LOG_I(WARN, ec, "load and save instance info failed");
     // save the instance_id as value to instance key for recover
     ec = LoadAndSave(kRegistryInstanceKey, instance_id, nullptr);
+    if (ec != EC_OK) {
+        request_context->error_tracer()->AddErrorMsg(
+            "register instance failed: failed to persist instance id to storage backend");
+    }
     RETURN_IF_EC_NOT_OK_WITH_LOG_I(WARN, ec, "load and save instance id failed");
     // TODO: add quota_group_name
     instance_infos_[instance_id] = instance_info;

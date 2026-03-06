@@ -63,6 +63,12 @@
         return;                                                                                                        \
     } while (0)
 
+namespace {
+kv_cache_manager::proto::admin::ErrorCode ToAdminPbError(kv_cache_manager::ErrorCode ec) {
+    return kv_cache_manager::ToPbError<kv_cache_manager::proto::admin::ErrorCode>(ec);
+}
+} // anonymous namespace
+
 namespace kv_cache_manager {
 
 AdminServiceImpl::AdminServiceImpl(std::shared_ptr<CacheManager> cache_manager,
@@ -466,6 +472,10 @@ void AdminServiceImpl::RegisterInstance(RequestContext *request_context,
     if (request->instance_id().empty()) {
         CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("RegisterInstance", "instance_id", true);
     }
+    if (request->block_size() <= 0) {
+        CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("RegisterInstance", "block_size (must be > 0)", true);
+        return;
+    }
     if (!request->has_model_deployment()) {
         CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("RegisterInstance", "model_deployment", true);
     }
@@ -501,16 +511,25 @@ void AdminServiceImpl::RegisterInstance(RequestContext *request_context,
                                                          model_deployment_req,
                                                          location_spec_groups);
     if (ec_info != EC_OK) {
-        status->set_code(proto::admin::INTERNAL_ERROR);
+        status->set_code(ToAdminPbError(ec_info));
         request_context->set_status_code(status->code());
-        status->set_message("Failed to register instance");
-        KVCM_LOG_ERROR("[traceId: %s] RegisterInstance failed", request->trace_id().c_str());
+        status->set_message("Failed to register instance, instance_group: " + request->instance_group() +
+                            ", instance_id: " + request->instance_id() +
+                            ", error: " + request_context->error_tracer()->ToJsonString());
+        KVCM_LOG_ERROR("[traceId: %s] RegisterInstance failed, instance_group: %s, instance_id: %s, ec: %d",
+                       request->trace_id().c_str(),
+                       request->instance_group().c_str(),
+                       request->instance_id().c_str(),
+                       ec_info);
         return;
     } else {
         status->set_code(proto::admin::OK);
         request_context->set_status_code(status->code());
         status->set_message("Instance registered successfully");
-        KVCM_LOG_INFO("[traceId: %s] RegisterInstance succeeded", request->trace_id().c_str());
+        KVCM_LOG_INFO("[traceId: %s] RegisterInstance succeeded, instance_group: %s, instance_id: %s",
+                      request->trace_id().c_str(),
+                      request->instance_group().c_str(),
+                      request->instance_id().c_str());
     }
 };
 
@@ -527,10 +546,14 @@ void AdminServiceImpl::RemoveInstance(RequestContext *request_context,
     ErrorCode ec_info =
         cache_manager_->RemoveInstance(request_context, request->instance_group(), request->instance_id());
     if (ec_info != EC_OK) {
-        status->set_code(proto::admin::INTERNAL_ERROR);
+        status->set_code(ToAdminPbError(ec_info));
         request_context->set_status_code(status->code());
-        status->set_message("Failed to remove instance");
-        KVCM_LOG_ERROR("[traceId: %s] RemoveInstance failed", request->trace_id().c_str());
+        status->set_message("Failed to remove instance, instance_id: " + request->instance_id() +
+                            ", error: " + request_context->error_tracer()->ToJsonString());
+        KVCM_LOG_ERROR("[traceId: %s] RemoveInstance failed, instance_id: %s, ec: %d",
+                       request->trace_id().c_str(),
+                       request->instance_id().c_str(),
+                       ec_info);
         return;
     } else {
         status->set_code(proto::admin::OK);

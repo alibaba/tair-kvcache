@@ -90,24 +90,13 @@
         }                                                                                                              \
     } while (0)
 
-namespace kv_cache_manager {
-
 namespace {
-
-inline proto::meta::ErrorCode ToPbError(ErrorCode internal_error) {
-    static const std::unordered_map<ErrorCode, proto::meta::ErrorCode> error_map{
-        {EC_UNIMPLEMENTED, proto::meta::UNSUPPORTED},
-        {EC_BADARGS, proto::meta::INVALID_ARGUMENT},
-        {EC_DUPLICATE_ENTITY, proto::meta::DUPLICATE_ENTITY},
-        {EC_INSTANCE_NOT_EXIST, proto::meta::INSTANCE_NOT_EXIST},
-        {EC_SERVICE_NOT_LEADER, proto::meta::SERVER_NOT_LEADER}};
-    if (auto iter = error_map.find(internal_error); iter != error_map.end()) {
-        return iter->second;
-    }
-    return proto::meta::INTERNAL_ERROR;
+kv_cache_manager::proto::meta::ErrorCode ToMetaPbError(kv_cache_manager::ErrorCode ec) {
+    return kv_cache_manager::ToPbError<kv_cache_manager::proto::meta::ErrorCode>(ec);
 }
+} // anonymous namespace
 
-} // namespace
+namespace kv_cache_manager {
 
 MetaServiceImpl::MetaServiceImpl(std::shared_ptr<CacheManager> cache_manager,
                                  std::shared_ptr<MetricsReporter> metrics_reporter)
@@ -120,6 +109,9 @@ void MetaServiceImpl::RegisterInstance(RequestContext *request_context,
     API_CALL_GUARD("RegisterInstance", true);
     auto *header = response->mutable_header();
     auto *status = header->mutable_status();
+    CHECK_FAULT_INJECTION("RegisterInstance");
+
+    // 参数验证
     std::string invalid_fields = "missing or invalid fields: ";
     if (request->instance_group().empty()) {
         CHECK_REQUIRED_FIELDS_VALIDATION("RegisterInstance", "instance_group", true);
@@ -131,7 +123,11 @@ void MetaServiceImpl::RegisterInstance(RequestContext *request_context,
         SET_SPAN_TRACER_STR_IN_HEADER(request_context);
         return;
     }
-    // 参数验证
+    if (request->block_size() <= 0) {
+        CHECK_REQUIRED_FIELDS_VALIDATION("RegisterInstance", "block_size (must be > 0)", true);
+        SET_SPAN_TRACER_STR_IN_HEADER(request_context);
+        return;
+    }
     if (!request->has_model_deployment()) {
         CHECK_REQUIRED_FIELDS_VALIDATION("RegisterInstance", "model_deployment", true);
         SET_SPAN_TRACER_STR_IN_HEADER(request_context);
@@ -146,7 +142,7 @@ void MetaServiceImpl::RegisterInstance(RequestContext *request_context,
         return;
     }
 
-    if (request->location_spec_infos().size() == 0) {
+    if (request->location_spec_infos().empty()) {
         CHECK_REQUIRED_FIELDS_VALIDATION("RegisterInstance", "location_spec_infos", true);
         SET_SPAN_TRACER_STR_IN_HEADER(request_context);
         return;
@@ -178,10 +174,16 @@ void MetaServiceImpl::RegisterInstance(RequestContext *request_context,
                                                                        location_spec_groups);
 
     if (ec_info != EC_OK) {
-        status->set_code(ToPbError(ec_info));
+        status->set_code(ToMetaPbError(ec_info));
         request_context->set_status_code(status->code());
-        status->set_message("Failed to register instance : " + request_context->error_tracer()->ToJsonString());
-        KVCM_LOG_ERROR("[traceId: %s] RegisterInstance failed", request->trace_id().c_str());
+        status->set_message("Failed to register instance, instance_group: " + request->instance_group() +
+                            ", instance_id: " + request->instance_id() +
+                            ", error: " + request_context->error_tracer()->ToJsonString());
+        KVCM_LOG_ERROR("[traceId: %s] RegisterInstance failed, instance_group: %s, instance_id: %s, ec: %d",
+                       request->trace_id().c_str(),
+                       request->instance_group().c_str(),
+                       request->instance_id().c_str(),
+                       ec_info);
     } else {
         status->set_code(proto::meta::OK);
         request_context->set_status_code(status->code());
@@ -212,7 +214,7 @@ void MetaServiceImpl::GetInstanceInfo(RequestContext *request_context,
     std::shared_ptr<const InstanceInfo> instance_info_ptr = get_instance_info.second;
 
     if (ec_info == ErrorCode::EC_INSTANCE_NOT_EXIST) {
-        status->set_code(ToPbError(ec_info));
+        status->set_code(ToMetaPbError(ec_info));
         status->set_message(request_context->error_tracer()->ToJsonString());
         request_context->set_status_code(status->code());
         KVCM_LOG_INFO(
@@ -221,7 +223,7 @@ void MetaServiceImpl::GetInstanceInfo(RequestContext *request_context,
         return;
     }
     if (ec_info != ErrorCode::EC_OK) {
-        status->set_code(ToPbError(ec_info));
+        status->set_code(ToMetaPbError(ec_info));
         status->set_message(request_context->error_tracer()->ToJsonString());
         request_context->set_status_code(status->code());
         KVCM_LOG_ERROR("[traceId: %s] GetInstanceInfo failed", request->trace_id().c_str());
@@ -279,7 +281,7 @@ void MetaServiceImpl::GetCacheLocation(RequestContext *request_context,
     CacheLocationViewVecWrapper cache_location_view_vec_wrapper(std::move(get_cache_meta.second));
     CacheLocationViewVec cache_locations_res = cache_location_view_vec_wrapper.cache_locations_view();
     if (ec_info != EC_OK) {
-        status->set_code(ToPbError(ec_info));
+        status->set_code(ToMetaPbError(ec_info));
         request_context->set_status_code(status->code());
         status->set_message("Failed to get cache locations : " + request_context->error_tracer()->ToJsonString());
         KVCM_LOG_ERROR("[traceId: %s] GetCacheLocation failed, ec: %d", request->trace_id().c_str(), ec_info);
@@ -332,7 +334,7 @@ void MetaServiceImpl::GetCacheMeta(RequestContext *request_context,
     std::vector<std::string> metas_res = cache_meta_vec_wrapper.metas();
 
     if (ec_info != EC_OK) {
-        status->set_code(ToPbError(ec_info));
+        status->set_code(ToMetaPbError(ec_info));
         request_context->set_status_code(status->code());
         status->set_message("Failed to get cache metadata : " + request_context->error_tracer()->ToJsonString());
         KVCM_LOG_ERROR("[traceId: %s] GetCacheMeta failed", request->trace_id().c_str());
@@ -395,7 +397,7 @@ void MetaServiceImpl::StartWriteCache(RequestContext *request_context,
     CacheLocationViewVecWrapper cache_locations_res(std::move(start_write_cache.second.locations_mut()));
 
     if (ec_info != EC_OK) {
-        status->set_code(ToPbError(ec_info));
+        status->set_code(ToMetaPbError(ec_info));
         request_context->set_status_code(status->code());
         status->set_message("Failed to start write cache : " + request_context->error_tracer()->ToJsonString());
         KVCM_LOG_ERROR("[traceId: %s] StartWriteCache failed", request->trace_id().c_str());
@@ -450,7 +452,7 @@ void MetaServiceImpl::FinishWriteCache(RequestContext *request_context,
         request_context, request->instance_id(), request->write_session_id(), success_blocks_req);
 
     if (ec_info != EC_OK) {
-        status->set_code(ToPbError(ec_info));
+        status->set_code(ToMetaPbError(ec_info));
         request_context->set_status_code(status->code());
         status->set_message("Failed to finish write cache : " + request_context->error_tracer()->ToJsonString());
         KVCM_LOG_ERROR("[traceId: %s] FinishWriteCache failed", request->trace_id().c_str());
@@ -493,7 +495,7 @@ void MetaServiceImpl::RemoveCache(RequestContext *request_context,
                                     std::vector<int64_t>(request->token_ids().begin(), request->token_ids().end()),
                                     block_mask_req);
     if (ec_info != EC_OK) {
-        status->set_code(ToPbError(ec_info));
+        status->set_code(ToMetaPbError(ec_info));
         request_context->set_status_code(status->code());
         status->set_message("Failed to remove cache : " + request_context->error_tracer()->ToJsonString());
         KVCM_LOG_ERROR("[traceId: %s] RemoveCache failed", request->trace_id().c_str());
@@ -532,7 +534,7 @@ void MetaServiceImpl::TrimCache(RequestContext *request_context,
                                                   request->begin_timestamp(),
                                                   request->end_timestamp());
     if (ec_info != EC_OK) {
-        status->set_code(ToPbError(ec_info));
+        status->set_code(ToMetaPbError(ec_info));
         request_context->set_status_code(status->code());
         status->set_message("Failed to trim cache : " + request_context->error_tracer()->ToJsonString());
         KVCM_LOG_ERROR("[traceId: %s] TrimCache failed", request->trace_id().c_str());

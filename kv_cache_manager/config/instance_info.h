@@ -159,6 +159,28 @@ public:
         SortLocationSpecGroups();
     }
 
+    // Returns field names that differ from the given values.
+    // Returns empty vector if all fields match.
+    [[nodiscard]] std::vector<std::string> MismatchFields(int32_t block_size,
+                                            const std::vector<LocationSpecInfo> &location_spec_infos,
+                                            const ModelDeployment &model_deployment,
+                                            const std::vector<LocationSpecGroup> &location_spec_groups) const {
+        std::vector<std::string> mismatched;
+        if (block_size_ != block_size) {
+            mismatched.emplace_back("block_size");
+        }
+        if (location_spec_infos_ != location_spec_infos) {
+            mismatched.emplace_back("location_spec_infos");
+        }
+        if (model_deployment_ != model_deployment) {
+            mismatched.emplace_back("model_deployment");
+        }
+        if (location_spec_groups_ != location_spec_groups) {
+            mismatched.emplace_back("location_spec_groups");
+        }
+        return mismatched;
+    }
+
 private:
     void SortLocationSpecGroups();
 
