@@ -113,9 +113,9 @@ void WriteLocationManager::DoCleanup() {
     next_sleep_time_us_.store(kDefaultExpireLoopSleepTimeUs, std::memory_order_relaxed);
 }
 
-void WriteLocationManager::StoreMinNextSleepTime(int64_t next_sleep_time) {
+void WriteLocationManager::StoreMinNextSleepTimeUs(int64_t next_sleep_time_us) {
     int64_t expected = next_sleep_time_us_.load(std::memory_order_relaxed);
-    int64_t desired = std::min(expected, next_sleep_time);
+    int64_t desired = std::min(expected, next_sleep_time_us);
     while (!next_sleep_time_us_.compare_exchange_weak(expected, desired, std::memory_order_relaxed)) {
         desired = std::min(expected, desired);
     }
@@ -139,7 +139,7 @@ void WriteLocationManager::ExpireLoop() {
             }
             int64_t cur_point = TimestampUtil::GetSteadyTimeUs();
             if (int64_t next_point = session_id_map_.DropByExpirePoint(cur_point); next_point > 0) {
-                StoreMinNextSleepTime(next_point - cur_point);
+                StoreMinNextSleepTimeUs(next_point - cur_point);
             } else {
                 next_sleep_time_us_.store(kDefaultExpireLoopSleepTimeUs, std::memory_order_relaxed);
             }
@@ -165,7 +165,7 @@ void WriteLocationManager::Put(const std::string &write_session_id,
     unit_ptr->write_location_info.keys = std::move(keys);
     unit_ptr->write_location_info.location_ids = std::move(location_ids);
     session_id_map_.Put(unit_ptr);
-    StoreMinNextSleepTime(write_timeout_seconds);
+    StoreMinNextSleepTimeUs(write_timeout_seconds * 1000 * 1000);
 }
 
 bool WriteLocationManager::GetAndDelete(const std::string &write_session_id, WriteLocationInfo &location_info) {
