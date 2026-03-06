@@ -418,3 +418,117 @@ class MetaServiceTestBase(abc.ABC, TestBase, unittest.TestCase):
         self.assertIsInstance(locations, list)
         self.assertEqual(0, len(locations))
         # With all blocks masked out, we should get an empty list or locations with no valid specs
+
+    def test_register_instance_error_details(self):
+        """Verify error details for various register instance error scenarios."""
+        # --- Part 1: invalid block_size (zero) ---
+        register_data = {
+            "trace_id": self._trace_id,
+            "instance_group": "default",
+            "instance_id": "instance_bad_block_size",
+            "block_size": 0,
+            "model_deployment": self._get_test_model_deployment(),
+            "location_spec_infos": [
+                {"name": "tp0", "size": 1024},
+            ]
+        }
+        response_data = self._client.register_instance(register_data, check_response=False)
+        status = response_data['header']['status']
+        self.assertEqual(status['code'], "INVALID_ARGUMENT",
+                         f"Expected INVALID_ARGUMENT for block_size=0, got {status['code']}: {status.get('message', '')}")
+        self.assertIn("block_size", status.get('message', '').lower(),
+                       "Error message should mention block_size")
+
+        # --- Part 2: invalid block_size (negative) ---
+        register_data = {
+            "trace_id": self._trace_id,
+            "instance_group": "default",
+            "instance_id": "instance_neg_block_size",
+            "block_size": -1,
+            "model_deployment": self._get_test_model_deployment(),
+            "location_spec_infos": [
+                {"name": "tp0", "size": 1024},
+            ]
+        }
+        response_data = self._client.register_instance(register_data, check_response=False)
+        status = response_data['header']['status']
+        self.assertEqual(status['code'], "INVALID_ARGUMENT",
+                         f"Expected INVALID_ARGUMENT for block_size=-1, got {status['code']}: {status.get('message', '')}")
+
+        # --- Part 3: group not found ---
+        non_existent_group = "absolutely_nonexistent_group_xyz"
+        register_data = {
+            "trace_id": self._trace_id,
+            "instance_group": non_existent_group,
+            "instance_id": "instance_no_group",
+            "block_size": 128,
+            "model_deployment": self._get_test_model_deployment(),
+            "location_spec_infos": [
+                {"name": "tp0", "size": 1024},
+            ]
+        }
+        response_data = self._client.register_instance(register_data, check_response=False)
+        status = response_data['header']['status']
+        self.assertNotEqual(status['code'], "OK",
+                            "Registering with non-existent group should fail")
+        msg = status.get('message', '')
+        self.assertIn(non_existent_group, msg,
+                       f"Error message should contain the group name '{non_existent_group}', got: {msg}")
+
+        # --- Part 4: duplicate with different model_deployment ---
+        register_data = {
+            "trace_id": self._trace_id,
+            "instance_group": "default",
+            "instance_id": "instance_dup_test",
+            "block_size": 128,
+            "model_deployment": self._get_test_model_deployment(),
+            "location_spec_infos": [
+                {"name": "tp0", "size": 1024},
+            ]
+        }
+        self._client.register_instance(register_data)
+
+        modified_deployment = self._get_test_model_deployment()
+        modified_deployment["model_name"] = "completely_different_model"
+        dup_data = {
+            "trace_id": self._trace_id,
+            "instance_group": "default",
+            "instance_id": "instance_dup_test",
+            "block_size": 128,
+            "model_deployment": modified_deployment,
+            "location_spec_infos": [
+                {"name": "tp0", "size": 1024},
+            ]
+        }
+        response_data = self._client.register_instance(dup_data, check_response=False)
+        status = response_data['header']['status']
+        self.assertEqual(status['code'], "DUPLICATE_ENTITY",
+                         f"Expected DUPLICATE_ENTITY, got {status['code']}: {status.get('message', '')}")
+        msg = status.get('message', '')
+        self.assertIn("instance_dup_test", msg,
+                       f"Error message should contain instance_id, got: {msg}")
+        self.assertIn("model_deployment", msg,
+                       f"Error message should mention mismatched field 'model_deployment', got: {msg}")
+
+        # --- Part 5: duplicate with different block_size ---
+        register_data = {
+            "trace_id": self._trace_id,
+            "instance_group": "default",
+            "instance_id": "instance_blk_mismatch",
+            "block_size": 128,
+            "model_deployment": self._get_test_model_deployment(),
+            "location_spec_infos": [
+                {"name": "tp0", "size": 1024},
+            ]
+        }
+        self._client.register_instance(register_data)
+
+        dup_data = register_data.copy()
+        dup_data["block_size"] = 256
+        response_data = self._client.register_instance(dup_data, check_response=False)
+        status = response_data['header']['status']
+        self.assertEqual(status['code'], "DUPLICATE_ENTITY",
+                         f"Expected DUPLICATE_ENTITY, got {status['code']}: {status.get('message', '')}")
+        msg = status.get('message', '')
+        self.assertIn("block_size", msg,
+                       f"Error message should mention mismatched field 'block_size', got: {msg}")

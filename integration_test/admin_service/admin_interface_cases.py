@@ -410,6 +410,77 @@ class AdminServiceTestBase(abc.ABC, TestBase, unittest.TestCase):
         # 如果更新成功，新的延迟应该生效；否则保持原样
         # 我们只是记录而不做硬性断言，因为更新可能需要特定权限
         logging.info(f"Original delay: {original_delay}, current delay: {get_resp2['campaign_delay_time_ms']}")
+    def test_register_and_remove_instance_error_details(self):
+        """Verify error details for various register/remove instance error scenarios."""
+        # --- Part 1: invalid block_size ---
+        ig = self.make_sample_instance_group()
+        create_req = {"trace_id": self._trace_id, "instance_group": ig}
+        self._client.create_instance_group(create_req)
+
+        reg_req = self.make_sample_register_instance_request()
+        reg_req["block_size"] = 0
+        resp = self._client.register_instance(reg_req, check_response=False)
+        status = resp["header"]["status"]
+        self.assertEqual(status["code"], "INVALID_ARGUMENT",
+                         f"Expected INVALID_ARGUMENT for block_size=0, got {status['code']}: {status.get('message', '')}")
+        self.assertIn("block_size", status.get("message", "").lower(),
+                       "Error message should mention block_size")
+
+        # --- Part 2: group not found ---
+        non_existent_group = "totally_nonexistent_admin_group"
+        reg_req = self.make_sample_register_instance_request()
+        reg_req["instance_group"] = non_existent_group
+        reg_req["instance_id"] = "instance_no_group_admin"
+        resp = self._client.register_instance(reg_req, check_response=False)
+        status = resp["header"]["status"]
+        self.assertNotEqual(status["code"], "OK",
+                            "Registering with non-existent group should fail")
+        msg = status.get("message", "")
+        self.assertIn(non_existent_group, msg,
+                       f"Error message should contain group name '{non_existent_group}', got: {msg}")
+
+        # --- Part 3: duplicate with different model_deployment ---
+        reg_req = self.make_sample_register_instance_request()
+        self._client.register_instance(reg_req)
+
+        dup_req = self.make_sample_register_instance_request()
+        dup_req["model_deployment"]["model_name"] = "completely_different_model"
+        resp = self._client.register_instance(dup_req, check_response=False)
+        status = resp["header"]["status"]
+        self.assertEqual(status["code"], "DUPLICATE_ENTITY",
+                         f"Expected DUPLICATE_ENTITY, got {status['code']}: {status.get('message', '')}")
+        msg = status.get("message", "")
+        self.assertIn(reg_req["instance_id"], msg,
+                       f"Error message should contain instance_id, got: {msg}")
+        self.assertIn("model_deployment", msg,
+                       f"Error message should mention mismatched field 'model_deployment', got: {msg}")
+
+        # --- Part 4: duplicate with different block_size ---
+        dup_req = self.make_sample_register_instance_request()
+        dup_req["block_size"] = 256
+        resp = self._client.register_instance(dup_req, check_response=False)
+        status = resp["header"]["status"]
+        self.assertEqual(status["code"], "DUPLICATE_ENTITY",
+                         f"Expected DUPLICATE_ENTITY, got {status['code']}: {status.get('message', '')}")
+        msg = status.get("message", "")
+        self.assertIn("block_size", msg,
+                       f"Error message should mention mismatched field 'block_size', got: {msg}")
+
+        # --- Part 5: remove non-existent instance ---
+        remove_req = {
+            "trace_id": self._trace_id,
+            "instance_id": "nonexistent_instance_for_remove"
+        }
+        resp = self._client.remove_instance(remove_req, check_response=False)
+        status = resp["header"]["status"]
+        self.assertNotEqual(status["code"], "OK",
+                            "Removing non-existent instance should fail")
+        self.assertNotEqual(status["code"], "INTERNAL_ERROR",
+                            f"Expected a specific error code (not INTERNAL_ERROR) for non-existent instance, got: {status}")
+        msg = status.get("message", "")
+        self.assertIn("nonexistent_instance_for_remove", msg,
+                       f"Error message should contain the instance_id, got: {msg}")
+
     def test_leader_demote(self):
         """测试 LeaderDemote 接口"""
         req = {"trace_id": self._trace_id}

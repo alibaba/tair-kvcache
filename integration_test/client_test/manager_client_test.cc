@@ -135,3 +135,38 @@ TEST_F(ManagerClientTest, TestSaveAndLoad) {
         // ASSERT_TRUE(read_result.first);
     }
 }
+
+// --- Error detail tests for the latest commit ---
+
+TEST_F(ManagerClientTest, TestRegisterInstanceErrorDetails) {
+    auto prefix = GetCurrentTestName();
+
+    // Part 1: duplicate instance with different model_deployment
+    {
+        std::string instance_id = prefix + "_dup_instance";
+
+        // First registration with model "test_model"
+        {
+            auto config = createClientConfigWithModel(instance_id, "test_model");
+            auto client = ManagerClient::Create(config, init_params_);
+            ASSERT_NE(nullptr, client.get());
+        }
+
+        // Second registration with a different model name
+        {
+            auto config = createClientConfigWithModel(instance_id, "different_model");
+            auto client = ManagerClient::Create(config, init_params_);
+            EXPECT_EQ(nullptr, client.get())
+                << "Re-registration with different model should fail during client creation";
+        }
+    }
+
+    // Part 2: non-existent instance_group
+    {
+        std::string instance_id = prefix + "_nogroup_instance";
+        auto config = createClientConfigWithGroup(instance_id, "nonexistent_group_xyz");
+        auto client = ManagerClient::Create(config, init_params_);
+        EXPECT_EQ(nullptr, client.get())
+            << "Registration with non-existent group should fail during client creation";
+    }
+}

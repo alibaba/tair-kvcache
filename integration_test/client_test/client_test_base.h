@@ -96,6 +96,86 @@ protected:
         return client;
     }
 
+    // Create a client with a custom instance_group for error-path testing
+    std::string createClientConfigWithGroup(const std::string &instance_id,
+                                            const std::string &instance_group,
+                                            int block_size = 128) const {
+        std::array<char, 2048> buffer;
+        int n = std::snprintf(buffer.data(),
+                              buffer.size(),
+                              R"({
+"instance_group": "%s",
+"instance_id": "%s",
+"address": [
+    "127.0.0.1:%d"
+],
+"block_size": %d,
+"location_spec_infos":{
+    "tp0": 1024,
+    "tp1": 1024
+},
+"meta_channel_config": {
+    "call_timeout": 1000
+},
+"sdk_config": {},
+"model_deployment": {
+    "model_name": "test_model",
+    "dtype": "FP8",
+    "use_mla": false,
+    "tp_size": 2,
+    "dp_size": 1,
+    "pp_size": 1,
+    "pp_infos": [
+        "layer0"
+    ]
+}
+})",
+                              instance_group.c_str(),
+                              instance_id.c_str(),
+                              controller_.rpc_port(),
+                              block_size);
+        return std::string(buffer.data(), n);
+    }
+
+    // Create a client with a different model_name (for duplicate-with-diff-config testing)
+    std::string createClientConfigWithModel(const std::string &instance_id,
+                                            const std::string &model_name) const {
+        std::array<char, 2048> buffer;
+        int n = std::snprintf(buffer.data(),
+                              buffer.size(),
+                              R"({
+"instance_group": "default",
+"instance_id": "%s",
+"address": [
+    "127.0.0.1:%d"
+],
+"block_size": 128,
+"location_spec_infos":{
+    "tp0": 1024,
+    "tp1": 1024
+},
+"meta_channel_config": {
+    "call_timeout": 1000
+},
+"sdk_config": {},
+"model_deployment": {
+    "model_name": "%s",
+    "dtype": "FP8",
+    "use_mla": false,
+    "tp_size": 2,
+    "dp_size": 1,
+    "pp_size": 1,
+    "pp_infos": [
+        "layer0"
+    ]
+}
+})",
+                              instance_id.c_str(),
+                              controller_.rpc_port(),
+                              model_name.c_str());
+        return std::string(buffer.data(), n);
+    }
+
     template <typename ClientType>
     void TestStartWrite(const std::string &prefix, const ClientPtr<ClientType> &client) {
         {
