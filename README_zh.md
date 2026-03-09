@@ -51,7 +51,7 @@ Tair KVCache Manager 是 Tair KVCache 的核心组件之一，旨在为大语言
 
 ## Tair KVCache HiSim
 
-[HiSim](hisim/README.md) 是一个高性能的基于CPU的LLM推理仿真系统。它能够在不依赖实际GPU资源的情况下，通过回放真实推理负载Trace，快速、低成本、高保真地预测不同模型、目标硬件、推理引擎和配置下的关键性能指标（如TTFT、TPOT、吞吐量等）。当前支持SGLang v0.5.6.post2，在H20 GPU上运行Qwen3系列模型，预测误差低于5%。
+[HiSim](hisim/README.md) 是一个高性能的基于CPU的LLM推理仿真系统。它能够在不依赖实际GPU资源的情况下，通过回放真实推理负载Trace，快速、低成本、高保真地预测不同模型、目标硬件、推理引擎和配置下的关键性能指标（如TTFT、TPOT、吞吐量等）。当前支持SGLang v0.5.6.post2，在H20 GPU上运行Qwen3 Dense系列模型，预测误差低于5%。
 
 # 联系我们
 - 如有本项目相关技术问题和功能需求，欢迎提交issue。
