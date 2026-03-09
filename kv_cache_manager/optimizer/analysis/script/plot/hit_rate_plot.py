@@ -44,8 +44,9 @@ def plot_multi_instance_analysis(csv_dir):
         if df is None:
             continue
 
-        # 数值化 + 排序 
-        for c in ['TimestampUs', 'CachedBlocksAllInstance', 'HitRate', 'ExternalHitRate', 'AccHitRate', 'AccExternalHitRate']:
+        # 数值化 + 排序
+        for c in ['TimestampUs', 'CachedBlocksAllInstance',
+                  'AccHitRate', 'AccExternalHitRate', 'AccReadBlocks']:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors='coerce')
         df = df.dropna(subset=['TimestampUs']).sort_values('TimestampUs')
@@ -58,7 +59,7 @@ def plot_multi_instance_analysis(csv_dir):
         print("Error: No valid CSV data could be loaded")
         return
 
-    required_cols = ['TimestampUs', 'CachedBlocksAllInstance', 'HitRate', 'ExternalHitRate', 'AccHitRate', 'AccExternalHitRate']
+    required_cols = ['TimestampUs', 'CachedBlocksAllInstance', 'AccHitRate', 'AccExternalHitRate', 'AccReadBlocks']
     for i, df in enumerate(dataframes):
         missing = [c for c in required_cols if c not in df.columns]
         if missing:
@@ -75,12 +76,18 @@ def plot_multi_instance_analysis(csv_dir):
     base_timestamps = np.unique(np.concatenate(all_t))
     base = pd.DataFrame({'t': base_timestamps})  # 用于merge_asof
 
-    all_hit, all_external_hit, all_acc_hit, all_acc_external_hit, all_time_ranges = [], [], [], [], []
+    all_acc_hit, all_acc_external_hit, all_time_ranges = [], [], []
+    # 用于瞬时命中率计算：累积读块数 / 累积命中块数（反推）
+    all_acc_read_blocks, all_acc_hit_blocks, all_acc_ext_hit_blocks = [], [], []
     global_updates_list = []
     for df in dataframes:
         d = df.copy()
         d['t'] = (d['TimestampUs'] - min_timestamp) / 1e6
         d = d.sort_values('t')
+
+        # 反推累积命中块数：AccHitBlocks = AccHitRate × AccReadBlocks
+        d['AccHitBlocks']    = d['AccHitRate']         * d['AccReadBlocks']
+        d['AccExtHitBlocks'] = d['AccExternalHitRate'] * d['AccReadBlocks']
 
         global_updates_list.append(d[['t', 'CachedBlocksAllInstance']])
         t0, t1 = d['t'].iloc[0], d['t'].iloc[-1]
@@ -89,20 +96,23 @@ def plot_multi_instance_analysis(csv_dir):
         # 真实对齐：取 <=t 的最后一次上报（ZOH），不插值
         aligned = pd.merge_asof(
             base,
-            d[['t', 'HitRate', 'ExternalHitRate', 'AccHitRate', 'AccExternalHitRate']],
+            d[['t', 'AccHitRate', 'AccExternalHitRate',
+               'AccReadBlocks', 'AccHitBlocks', 'AccExtHitBlocks']],
             on='t',
             direction='backward',
             allow_exact_matches=True
         )
 
-
         mask_out = (aligned['t'] < t0)
-        aligned.loc[mask_out, ['HitRate', 'ExternalHitRate', 'AccHitRate', 'AccExternalHitRate']] = np.nan
-        
-        all_hit.append(aligned['HitRate'].to_numpy(float))
-        all_external_hit.append(aligned['ExternalHitRate'].to_numpy(float))
+        acc_cols = ['AccHitRate', 'AccExternalHitRate',
+                    'AccReadBlocks', 'AccHitBlocks', 'AccExtHitBlocks']
+        aligned.loc[mask_out, acc_cols] = np.nan
+
         all_acc_hit.append(aligned['AccHitRate'].to_numpy(float))
         all_acc_external_hit.append(aligned['AccExternalHitRate'].to_numpy(float))
+        all_acc_read_blocks.append(aligned['AccReadBlocks'].to_numpy(float))
+        all_acc_hit_blocks.append(aligned['AccHitBlocks'].to_numpy(float))
+        all_acc_ext_hit_blocks.append(aligned['AccExtHitBlocks'].to_numpy(float))
 
     global_updates = pd.concat(global_updates_list, ignore_index=True)
     global_updates = global_updates.dropna(subset=['t', 'CachedBlocksAllInstance']).sort_values('t')
@@ -146,35 +156,69 @@ def plot_multi_instance_analysis(csv_dir):
         axr.tick_params(axis='y', labelcolor='#d62728')
         return axr
     
-    def smooth_by_time(timestamps, values, window_seconds=60):
+    def window_hit_rate(timestamps, acc_hit_blocks, acc_read_blocks, window_seconds=60):
         """
-        按时间窗口平滑数据
-        
-        Args:
-            timestamps: 时间戳数组（秒）
-            values: 数值数组
-            window_seconds: 时间窗口大小（秒），默认60秒
-        
-        Returns:
-            平滑后的数组
+        基于累积量差值计算时间窗口内的真实命中率。
+
+        对每个采样点 t_i，窗口基准取 [t_i - window_seconds, t_i] 内
+        最早的真实上报点，end 取 t_i 处的累积值：
+            hit_rate = (hit[end] - hit[beg]) / (read[end] - read[beg])
+
+        空缺处理：真实上报点之间若存在间隔 > window_seconds 的空缺，
+        窗口基准不会越过该空缺，自动重置为空缺后的第一个真实上报点。
+        这样空缺前的历史累积量不会污染空缺后的命中率计算。
         """
-        # 创建临时DataFrame
-        df = pd.DataFrame({'t': timestamps, 'v': values})
-        df = df.sort_values('t').reset_index(drop=True)
-        
-        # 转换为时间索引（使用datetime）
-        base_time = pd.Timestamp('2000-01-01')  # 任意基准时间
-        df['t_dt'] = base_time + pd.to_timedelta(df['t'], unit='s')
-        df = df.set_index('t_dt')
-        
-        # 使用rolling按时间窗口平滑
-        smoothed = df['v'].rolling(
-            window=f'{window_seconds}s',
-            center=True,
-            min_periods=1
-        ).mean()
-        
-        return smoothed.values
+        ts       = np.asarray(timestamps,      dtype=float)
+        hit_arr  = np.asarray(acc_hit_blocks,  dtype=float)
+        read_arr = np.asarray(acc_read_blocks, dtype=float)
+
+        # 只保留真实上报点（非 nan）
+        real_mask = ~np.isnan(read_arr)
+        real_idx  = np.flatnonzero(real_mask)
+        if len(real_idx) == 0:
+            return np.full(len(ts), np.nan)
+
+        real_ts   = ts[real_idx]
+        real_hit  = hit_arr[real_idx]
+        real_read = read_arr[real_idx]
+
+        # 每个真实点所属"连续段"的起始索引（在 real_idx 中的位置）
+        # 段边界：相邻真实点时间间隔 > window_seconds
+        gaps = np.diff(real_ts)
+        seg_starts_in_real = np.concatenate(([0], np.flatnonzero(gaps > window_seconds) + 1))
+
+        # real_idx[k] 属于哪个段 → 该段在 real_idx 中的起始位置
+        seg_of_real = np.zeros(len(real_idx), dtype=int)
+        for s in seg_starts_in_real:
+            seg_of_real[s:] = s  # 广播：s 之后的点都属于起始为 s 的段
+
+        rate = np.full(len(ts), np.nan)
+
+        for i in np.flatnonzero(real_mask):
+            # 在 real_idx 中定位当前点
+            k = np.searchsorted(real_idx, i)
+
+            # end：当前点的累积值
+            end_hit  = hit_arr[i]
+            end_read = read_arr[i]
+
+            # 窗口左边界对应的时间
+            t_left = ts[i] - window_seconds
+
+            # 窗口内最早的真实上报点（不越过段边界）
+            seg_beg_in_real = seg_of_real[k]
+            beg_k = max(seg_beg_in_real,
+                        np.searchsorted(real_ts, t_left, side='left'))
+
+            beg_hit  = real_hit[beg_k]
+            beg_read = real_read[beg_k]
+
+            delta_read = end_read - beg_read
+            delta_hit  = end_hit  - beg_hit
+            if delta_read > 0:
+                rate[i] = max(0.0, delta_hit / delta_read)
+
+        return rate
     setup_left_axis(ax_top)
     ax_top_r = setup_right_axis(ax_top, 'Cumulative Hit Rate')
 
@@ -202,17 +246,27 @@ def plot_multi_instance_analysis(csv_dir):
                     linewidth=1.5, drawstyle='steps-post')
         top_lines += l1
 
-    # 下图：当前trace命中率（按时间平滑 + 按时间降采样）
-    downsample_interval_s = 10  # 每隔 10 秒取一个代表点
-    window_seconds = 2
+    # 下图：时间窗口内真实命中率（累积量差值）+ 按时间降采样
+    downsample_interval_s = 10   # 每隔 10 秒取一个代表点
+    window_seconds         = 10  # 窗口内累积命中率的统计时间跨度
 
     for i, name in enumerate(instance_names):
         t0, t1 = all_time_ranges[i]
         valid = (base_timestamps >= t0) & (base_timestamps <= t1)
 
-        # 按时间平滑
-        hit_sm = smooth_by_time(base_timestamps, np.array(all_hit[i]), window_seconds)
-        ext_sm = smooth_by_time(base_timestamps, np.array(all_external_hit[i]), window_seconds)
+        # 基于累积量差值计算窗口命中率（正确权重 = 请求数，而非上报次数）
+        hit_sm = window_hit_rate(
+            base_timestamps,
+            all_acc_hit_blocks[i],
+            all_acc_read_blocks[i],
+            window_seconds,
+        )
+        ext_sm = window_hit_rate(
+            base_timestamps,
+            all_acc_ext_hit_blocks[i],
+            all_acc_read_blocks[i],
+            window_seconds,
+        )
 
         # 按时间降采样：在 valid 范围内，每隔 downsample_interval_s 秒保留最近的一个点
         valid_idx = np.flatnonzero(valid)
