@@ -8,7 +8,7 @@
 --------------------------------------------------------------------------------
 
 [Tair KVCache](https://www.aliyun.com/product/kvcache) is Alibaba Cloud's high-performance KVCache system designed for Large Language Model (LLM) inference scenarios. Through technologies such as distributed memory pooling and dynamic multi-level caching, it achieves acceleration and efficiency improvement while reducing resource costs.
-Currently, the global KVCache management system Tair KVCache Manager has been open-sourced.
+Currently, the global KVCache management system Tair KVCache Manager and the LLM inference simulation system Tair KVCache HiSim have been open-sourced.
 
 ## Tair KVCache Manager
 Tair KVCache Manager is one of the core components of Tair KVCache, designed to provide unified KVCache metadata management services for Large Language Model (LLM) inference scenarios.
@@ -49,6 +49,10 @@ If you want to learn more about the detailed design of Manager, refer to: [Aliba
 **Tair KVCache Manager Client/Connector**
 
 Uses a unified transmission library to support KVCache transmission for multiple inference engines and storage backends. Currently supports engines such as vLLM, SGLang, RTP-LLM, TRT-LLM, etc.
+
+## Tair KVCache HiSim
+
+[HiSim](hisim/README.md) is a high-performance CPU-based simulation system for LLM inference. It enables fast, low-cost, and high-fidelity prediction of key performance metrics (such as TTFT, TPOT, and throughput) across different models, target hardware, inference engines, and configurations—by replaying real-world inference workload traces without requiring actual GPU resources. Currently supports SGLang v0.5.6.post2 with Qwen3-series models on H20 GPUs, achieving prediction errors below 5%.
 
 # Contact Us
 - If you have technical questions or feature requirements related to this project, feel free to submit issues.

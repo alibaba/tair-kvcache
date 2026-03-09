@@ -8,7 +8,7 @@
 --------------------------------------------------------------------------------
 
 [Tair KVCache](https://www.aliyun.com/product/kvcache) 是阿里云为大语言模型（LLM）推理场景设计的高性能 KVCache 缓存系统，通过分布式内存池化、动态多级缓存等技术，实现加速提效的同时降低资源成本。
-目前，其中的全局 KVCache 管理系统 Tair KVCache Manager 已经开源。
+目前，其中的全局 KVCache 管理系统 Tair KVCache Manager 和 LLM 推理仿真系统 Tair KVCache HiSim 已经开源。
 
 ## Tair KVCache Manager
 Tair KVCache Manager 是 Tair KVCache 的核心组件之一，旨在为大语言模型（LLM）推理场景提供统一的KVCache元数据管理服务。
@@ -48,6 +48,10 @@ Tair KVCache Manager 是 Tair KVCache 的核心组件之一，旨在为大语言
 **Tair KVCache Manager Client/Connector**
 
 使用统一的传输库支持多推理引擎和存储后端的KVCache传输。当前支持vLLM、SGLang、RTP-LLM、TRT-LLM等引擎。
+
+## Tair KVCache HiSim
+
+[HiSim](hisim/README.md) 是一个高性能的基于CPU的LLM推理仿真系统。它能够在不依赖实际GPU资源的情况下，通过回放真实推理负载Trace，快速、低成本、高保真地预测不同模型、目标硬件、推理引擎和配置下的关键性能指标（如TTFT、TPOT、吞吐量等）。当前支持SGLang v0.5.6.post2，在H20 GPU上运行Qwen3系列模型，预测误差低于5%。
 
 # 联系我们
 - 如有本项目相关技术问题和功能需求，欢迎提交issue。
