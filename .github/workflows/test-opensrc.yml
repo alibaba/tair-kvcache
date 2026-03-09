@@ -21,7 +21,7 @@ on:
         default: false
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.runs-on || 'ubuntu-latest' }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   test:
     strategy:
