@@ -84,9 +84,11 @@ ClientErrorCode MooncakeSdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_b
                                                             false);
     if (err != MOONCAKE_ERROR_OK) {
         KVCM_LOG_WARN(
-            "failed to register local mem for mooncake client, local_buffer_size: [%zu], mooncake errorcode: [%d]",
-            sdk_backend_config_->local_buffer_size(),
-            err);
+          "failed to register local mem for mooncake client, "
+          "local_mem_ptr: [%p], local_buffer_size: [%zu], mooncache errorcode: [%d]",
+          sdk_backend_config_->local_mem_ptr(),
+          sdk_backend_config_->local_buffer_size(),
+          err);
         return ER_SDKINIT_ERROR;
     }
 

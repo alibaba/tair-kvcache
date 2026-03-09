@@ -144,6 +144,7 @@ build:client --define USER_CLIENT_LOGGER=true
 build:client_with_cuda --config=client
 build:client_with_cuda --config=cuda
 build:client_with_cuda --define MOONCAKE_USE_CUDA=true
+build:client_with_cuda --define MOONCAKE_USE_PEERMEM=true
 build:client_with_cuda --define TAIR_MEMPOOL_USE_CUDA=true
 
 build:client_only_header  --define CLIENT_ONLY_HEADER=true

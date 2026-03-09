@@ -10,6 +10,11 @@ config_setting(
 )
 
 config_setting(
+    name = "enable_peermem",
+    values = {"define": "MOONCAKE_USE_PEERMEM=true"},
+)
+
+config_setting(
     name = "enable_nvmeof",
     values = {"define": "MOONCAKE_USE_NVMEOF=true"},
 )
@@ -91,6 +96,9 @@ mooncake_copts = [
     ":enable_cuda": ["-DUSE_CUDA"],
     "//conditions:default": [],
 }) + select({
+ ":enable_peermem": ["-DWITH_NVIDIA_PEERMEM"],
+    "//conditions:default": [],
+})+ select({
     # metadata service type
     ":enable_http": ["-DUSE_HTTP"],
     "//conditions:default": [],
