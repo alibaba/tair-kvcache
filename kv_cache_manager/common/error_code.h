@@ -29,8 +29,7 @@ enum [[nodiscard]] ErrorCode : int32_t{
     EC_KVCM_MAX,
 };
 
-// Convert internal ErrorCode to protobuf ErrorCode (works with proto::meta::ErrorCode,
-// proto::admin::ErrorCode, etc. since all proto ErrorCode enums share the same enum values).
+// Convert internal ErrorCode to protobuf proto::meta::ErrorCode or proto::admin::ErrorCode.
 template <typename PbErrorCode>
 inline PbErrorCode ToPbError(ErrorCode internal_error) {
     static const std::unordered_map<ErrorCode, PbErrorCode> error_map{
