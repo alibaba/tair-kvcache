@@ -751,7 +751,7 @@ bool CacheReclaimer::MakeBatchByLRU(const RequestContext *request_context,
 
     if (deduped_batch.size() != sampled_keys.size()) {
         // sampled_keys contains duplicated keys, log the event
-        LOG_WITH_ID(WARN,
+        LOG_WITH_ID(DEBUG,
                     "shortened batch size (likely duplicated keys sampled), final batch size: [%zu], "
                     "sampled keys size: [%zu], intended batching size: [%zu]",
                     deduped_batch.size(),
