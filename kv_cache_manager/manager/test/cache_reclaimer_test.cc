@@ -2818,3 +2818,158 @@ TEST_F(CacheReclaimerTest, TestDoKeySampling) {
         ASSERT_EQ(91, maps.size());
     }
 }
+
+TEST_F(CacheReclaimerTest, TestDupKeys) {
+    {
+        random_sample_keys = {0, 0, 2, 3, 4, 5, 6, 7, 8, 9};
+        get_out_properties = {
+            {
+                {PROPERTY_LRU_TIME, "1"},
+            },
+            {
+                {PROPERTY_LRU_TIME, "1"},
+            },
+            {
+                {PROPERTY_LRU_TIME, "2"},
+            },
+            {
+                {PROPERTY_LRU_TIME, "3"},
+            },
+            {
+                {PROPERTY_LRU_TIME, "4"},
+            },
+            {
+                {PROPERTY_LRU_TIME, "5"},
+            },
+            {
+                {PROPERTY_LRU_TIME, "6"},
+            },
+            {
+                {PROPERTY_LRU_TIME, "7"},
+            },
+            {
+                {PROPERTY_LRU_TIME, "8"},
+            },
+            {
+                {PROPERTY_LRU_TIME, "9"},
+            },
+        };
+
+        cache_reclaimer_->sampling_size_.store(random_sample_keys.size());
+        cache_reclaimer_->sampling_size_per_task_.store(100);
+        cache_reclaimer_->batching_size_.store(random_sample_keys.size());
+
+        std::vector<std::int64_t> keys;
+        std::vector<std::map<std::string, std::string>> maps;
+        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_.get(), instance_infos.front(), keys, maps));
+        ASSERT_EQ(random_sample_keys.size(), keys.size());
+        ASSERT_EQ(get_out_properties.size(), maps.size());
+
+        std::vector<std::int64_t> batch;
+        ASSERT_TRUE(
+            cache_reclaimer_->MakeBatchByLRU(request_context_.get(), instance_infos.front(), keys, maps, batch));
+        ASSERT_EQ(9, batch.size());
+    }
+
+    {
+        random_sample_keys = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
+        get_out_properties = {
+            {
+                {PROPERTY_LRU_TIME, "0"},
+            },
+            {
+                {PROPERTY_LRU_TIME, "1"},
+            },
+            {
+                {PROPERTY_LRU_TIME, "2"},
+            },
+            {
+                {PROPERTY_LRU_TIME, "3"},
+            },
+            {
+                {PROPERTY_LRU_TIME, "4"},
+            },
+            {
+                {PROPERTY_LRU_TIME, "5"},
+            },
+            {
+                {PROPERTY_LRU_TIME, "6"},
+            },
+            {
+                {PROPERTY_LRU_TIME, "7"},
+            },
+            {
+                {PROPERTY_LRU_TIME, "8"},
+            },
+            {
+                {PROPERTY_LRU_TIME, "9"},
+            },
+        };
+
+        cache_reclaimer_->sampling_size_.store(random_sample_keys.size());
+        cache_reclaimer_->sampling_size_per_task_.store(100);
+        cache_reclaimer_->batching_size_.store(2);
+
+        std::vector<std::int64_t> keys;
+        std::vector<std::map<std::string, std::string>> maps;
+        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_.get(), instance_infos.front(), keys, maps));
+        ASSERT_EQ(random_sample_keys.size(), keys.size());
+        ASSERT_EQ(get_out_properties.size(), maps.size());
+
+        std::vector<std::int64_t> batch;
+        ASSERT_TRUE(
+            cache_reclaimer_->MakeBatchByLRU(request_context_.get(), instance_infos.front(), keys, maps, batch));
+        ASSERT_EQ(1, batch.size());
+    }
+
+    {
+        random_sample_keys = {1, 1, 1, 1, 1, 1, 1, 2, 1, 1};
+        get_out_properties = {
+            {
+                {PROPERTY_LRU_TIME, "9"},
+            },
+            {
+                {PROPERTY_LRU_TIME, "9"},
+            },
+            {
+                {PROPERTY_LRU_TIME, "9"},
+            },
+            {
+                {PROPERTY_LRU_TIME, "9"},
+            },
+            {
+                {PROPERTY_LRU_TIME, "9"},
+            },
+            {
+                {PROPERTY_LRU_TIME, "9"},
+            },
+            {
+                {PROPERTY_LRU_TIME, "9"},
+            },
+            {
+                {PROPERTY_LRU_TIME, "10"},
+            },
+            {
+                {PROPERTY_LRU_TIME, "9"},
+            },
+            {
+                {PROPERTY_LRU_TIME, "9"},
+            },
+        };
+
+        cache_reclaimer_->sampling_size_.store(random_sample_keys.size());
+        cache_reclaimer_->sampling_size_per_task_.store(100);
+        cache_reclaimer_->batching_size_.store(2);
+
+        std::vector<std::int64_t> keys;
+        std::vector<std::map<std::string, std::string>> maps;
+        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_.get(), instance_infos.front(), keys, maps));
+        ASSERT_EQ(random_sample_keys.size(), keys.size());
+        ASSERT_EQ(get_out_properties.size(), maps.size());
+
+        std::vector<std::int64_t> batch;
+        ASSERT_TRUE(
+            cache_reclaimer_->MakeBatchByLRU(request_context_.get(), instance_infos.front(), keys, maps, batch));
+        ASSERT_EQ(2, batch.size());
+    }
+}

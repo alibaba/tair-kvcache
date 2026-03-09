@@ -16,6 +16,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -693,90 +694,83 @@ bool CacheReclaimer::MakeBatchByLRU(const RequestContext *request_context,
                                     const std::vector<std::int64_t> &sampled_keys,
                                     const std::vector<std::map<std::string, std::string>> &property_maps,
                                     std::vector<std::int64_t> &out_batch) const noexcept {
-    // the sampled_keys' and property_maps' size are guaranteed to be
-    // equal and the content of them are guaranteed to be matched by
+    const std::size_t batching_size = batching_size_.load();
+    if (batching_size == 0) {
+        out_batch.clear();
+        return true;
+    }
+
+    // invariant:
+    // the 2 vectors' size must be guaranteed to be equal, and the
+    // content must be guaranteed to be correlative when iterated by
     // index
+    assert(sampled_keys.size() == property_maps.size());
 
     const std::string &ins_id = instance_info->instance_id();
     const std::string &ins_gr = instance_info->instance_group_name();
 
-    // the PROPERTY_LRU_TIME value is represented as an int64_t type
-    // timepoint string; parse them into integers
-    std::vector<std::int64_t> lru_ts_vec;
-    lru_ts_vec.reserve(sampled_keys.size());
+    std::vector<std::pair<std::int64_t, std::int64_t>> key_tp_vec; // vector of {key, last_access_time}
+    key_tp_vec.reserve(sampled_keys.size());
 
-    for (const auto &m : property_maps) {
+    for (std::size_t i = 0; i != sampled_keys.size(); ++i) {
+        const auto &k = sampled_keys[i];
+        const auto &m = property_maps[i];
         if (const auto it = m.find(PROPERTY_LRU_TIME); it != m.end()) {
+            // the PROPERTY_LRU_TIME value is represented as an int64_t type
+            // timepoint string; parse them into integers
             const auto &lru_ts_str = it->second;
             std::int64_t lru_ts;
             if (!StringUtil::StrToInt64(lru_ts_str.c_str(), lru_ts)) {
                 LOG_WITH_ID(WARN, "lru_time str [%s] to int64 failed", lru_ts_str.c_str());
                 return false;
             }
-            lru_ts_vec.emplace_back(lru_ts);
+            key_tp_vec.emplace_back(k, lru_ts);
         } else {
             LOG_WITH_ID(WARN, "PROPERTY_LRU_TIME not found");
             return false;
         }
     }
 
-    if (lru_ts_vec.size() != sampled_keys.size()) {
-        LOG_WITH_ID(WARN,
-                    "LRU timestamp vec size [%zu] and key sample size [%zu] not match",
-                    lru_ts_vec.size(),
-                    sampled_keys.size());
-        return false;
-    }
-
-    const std::size_t batching_size = batching_size_.load();
-    if (batching_size == 0) {
-        return true;
-    }
-
-    // assume M random keys are sampled every round and
-    // N is the target batching size
-    // the (N - 1)th timestamp should be chosen as the threshold
-    std::int64_t ts_threshold;
-    std::vector<std::int64_t> lru_ts_vec_sorted(lru_ts_vec);
-    std::sort(lru_ts_vec_sorted.begin(), lru_ts_vec_sorted.end());
-    if (lru_ts_vec_sorted.size() < batching_size) {
-        // handle the M < N case: can not constitute a full-sized batch;
-        // select the last one as the threshold so all the timestamps
-        // can get picked
-        ts_threshold = lru_ts_vec_sorted.back();
-    } else {
-        ts_threshold = lru_ts_vec_sorted[batching_size - 1];
-    }
+    std::sort(key_tp_vec.begin(),
+              key_tp_vec.end(),
+              [](const std::pair<std::int64_t, std::int64_t> &a,
+                 const std::pair<std::int64_t, std::int64_t> &b) -> bool { return a.second < b.second; });
 
     // constitute the batch to be submitted for deleting
     // the first N timestamp would be picked out
-    out_batch.reserve(batching_size);
-    for (std::size_t i = 0; i != sampled_keys.size(); ++i) {
-        if (lru_ts_vec[i] <= ts_threshold) {
-            out_batch.emplace_back(sampled_keys[i]);
-        }
-        if (out_batch.size() == batching_size) {
-            // the batch is successfully constituted
-            return true;
+    std::unordered_set<std::int64_t> deduped_batch;
+    for (const auto &[key, tp] : key_tp_vec) {
+        if (auto [_, r] = deduped_batch.insert(key); r) {
+            if (deduped_batch.size() == batching_size) {
+                // the batch is successfully constituted
+                out_batch.assign(deduped_batch.begin(), deduped_batch.end());
+                return true;
+            }
         }
     }
 
-    // the only reason possible to reach here is the M < N case, e.g.,
-    // the number of sampled keys is not enough to constitute a
-    // full-sized batch; the batch size shall be equal to the size of
-    // sampled keys
-    if (out_batch.size() != sampled_keys.size()) {
-        // this is unusual
-        LOG_WITH_ID(
-            WARN,
-            "wrong batch size, final batch size: [%zu], sampled keys size: [%zu], intended batching size: [%zu]",
-            out_batch.size(),
-            sampled_keys.size(),
-            batching_size);
-        return false;
+    if (deduped_batch.size() != sampled_keys.size()) {
+        // sampled_keys contains duplicated keys, log the event
+        LOG_WITH_ID(WARN,
+                    "shortened batch size (likely duplicated keys sampled), final batch size: [%zu], "
+                    "sampled keys size: [%zu], intended batching size: [%zu]",
+                    deduped_batch.size(),
+                    sampled_keys.size(),
+                    batching_size);
+    } else {
+        // the batch size is equal to the size of sampled keys;
+        // * possibility 1: not enough keys sampled
+        // * possibility 2: sampling_size_ < batching_size_
+        LOG_WITH_ID(DEBUG,
+                    "shortened batch size, final batch size: [%zu], "
+                    "sampled keys size: [%zu], intended batching size: [%zu]",
+                    deduped_batch.size(),
+                    sampled_keys.size(),
+                    batching_size);
     }
 
     // permit a no-full-sized batch
+    out_batch.assign(deduped_batch.begin(), deduped_batch.end());
     return true;
 }
 
