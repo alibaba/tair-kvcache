@@ -48,8 +48,10 @@ class C_EngineHook(BaseHook):
     @classmethod
     def hook(cls, target):
         def hook_clear_hicache_storage(self):
-            return self.loop.run_until_complete(self.tokenizer_manager.clear_hicache_storage())
-        
+            return self.loop.run_until_complete(
+                self.tokenizer_manager.clear_hicache_storage()
+            )
+
         target.clear_hicache_storage = hook_clear_hicache_storage
 
 
@@ -365,8 +367,10 @@ class C_HiCacheController(BaseHook):
 
                 except Empty:
                     return
-        
-        def override_generic_page_set(self, hash_values, host_indices, extra_info=None) -> bool:
+
+        def override_generic_page_set(
+            self, hash_values, host_indices, extra_info=None
+        ) -> bool:
             # Always pass extra_info to storage_backend.
             data = [
                 self.mem_pool_host.get_data_page(host_indices[i * self.page_size])

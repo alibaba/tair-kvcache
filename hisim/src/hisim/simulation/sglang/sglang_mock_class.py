@@ -998,7 +998,14 @@ class MockHiCacheStorage:
         logger.info(f"Using temporary directory: {self.temp_dir}")
 
         project_root = _CURRENT_DIR.parents[4]
-        config_path = project_root / "kv_cache_manager" / "optimizer" / "test" / "testdata" / "optimizer_startup_config_load.json"
+        config_path = (
+            project_root
+            / "kv_cache_manager"
+            / "optimizer"
+            / "test"
+            / "testdata"
+            / "optimizer_startup_config_load.json"
+        )
         config_path = config_path.resolve()
         self.config_loader = kvcm_py_optimizer.OptimizerConfigLoader()
 
@@ -1048,13 +1055,19 @@ class MockHiCacheStorage:
                 complete_prefix_hashs = extra_info.prefix_keys + keys
             else:
                 complete_prefix_hashs = keys
-            int_hash_keys = [_pass_str_to_block_ids(key) for key in complete_prefix_hashs]
+            int_hash_keys = [
+                _pass_str_to_block_ids(key) for key in complete_prefix_hashs
+            ]
             # insert to kvcm
             trace_id = "1"
             write_timestamp = int(time.time() * 1000)
             write_token_ids = [1]
             self.storage_manager.WriteCache(
-                self.instance_id, trace_id, write_timestamp, int_hash_keys, write_token_ids
+                self.instance_id,
+                trace_id,
+                write_timestamp,
+                int_hash_keys,
+                write_token_ids,
             )
             return True
         else:
@@ -1080,7 +1093,12 @@ class MockHiCacheStorage:
             read_token_ids = [1]
             mask_offset = 0
             res = self.storage_manager.GetCacheLocation(
-                self.instance_id, trace_id, read_timestamp, int_hash_keys, read_token_ids, mask_offset
+                self.instance_id,
+                trace_id,
+                read_timestamp,
+                int_hash_keys,
+                read_token_ids,
+                mask_offset,
             )
             logger.debug(f"{res.kvcm_hit_length=}")
             return res.kvcm_hit_length
