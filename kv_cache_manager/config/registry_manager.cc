@@ -201,20 +201,15 @@ std::pair<ErrorCode, std::vector<StorageConfig>> RegistryManager::ListStorage(Re
 ErrorCode RegistryManager::CreateInstanceGroup(RequestContext *request_context, const InstanceGroup &instance_group) {
     const auto &trace_id = request_context->request_id();
     const auto &instance_group_name = instance_group.name();
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     if (instance_group_configs_.find(instance_group_name) != instance_group_configs_.end()) {
-        RETURN_IF_EC_NOT_OK_WITH_LOG_G(WARN, EC_EXIST, "create instance group failed: instance group already existed");
+        RETURN_IF_EC_NOT_OK_WITH_LOG_G(
+            WARN, EC_EXIST, "create instance group failed: instance group already existed");
     }
-    {
-        std::unique_lock<std::shared_mutex> lock(mutex_);
-        if (instance_group_configs_.find(instance_group_name) != instance_group_configs_.end()) {
-            RETURN_IF_EC_NOT_OK_WITH_LOG_G(
-                WARN, EC_EXIST, "create instance group failed: instance group already existed");
-        }
-        // save to storage backend
-        auto ec = LoadAndSave(kRegistryGroupKey, instance_group_name, &instance_group);
-        RETURN_IF_EC_NOT_OK_WITH_LOG_G(WARN, ec, "load and save instance group failed");
-        instance_group_configs_[instance_group_name] = std::make_shared<InstanceGroup>(instance_group);
-    }
+    // save to storage backend
+    auto ec = LoadAndSave(kRegistryGroupKey, instance_group_name, &instance_group);
+    RETURN_IF_EC_NOT_OK_WITH_LOG_G(WARN, ec, "load and save instance group failed");
+    instance_group_configs_[instance_group_name] = std::make_shared<InstanceGroup>(instance_group);
     PREFIX_LOG_G(INFO, "create instance group OK");
     return EC_OK;
 }
@@ -224,6 +219,7 @@ ErrorCode RegistryManager::UpdateInstanceGroup(RequestContext *request_context,
                                                int64_t current_version) {
     const auto &trace_id = request_context->request_id();
     const auto &instance_group_name = instance_group.name();
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     auto iter = instance_group_configs_.find(instance_group_name);
     if (iter == instance_group_configs_.end()) {
         RETURN_IF_EC_NOT_OK_WITH_LOG_G(WARN, EC_NOENT, "update instance group failed: instance group not found");
@@ -238,27 +234,10 @@ ErrorCode RegistryManager::UpdateInstanceGroup(RequestContext *request_context,
                                        instance_group.version(),
                                        iter->second->version());
     }
-    {
-        std::unique_lock<std::shared_mutex> lock(mutex_);
-        iter = instance_group_configs_.find(instance_group_name);
-        if (iter == instance_group_configs_.end()) {
-            RETURN_IF_EC_NOT_OK_WITH_LOG_G(WARN, EC_NOENT, "update instance group failed: instance group not found");
-        }
-        if (current_version != iter->second->version() || instance_group.version() <= iter->second->version()) {
-            // TODO: 定义错误码
-            RETURN_IF_EC_NOT_OK_WITH_LOG_G(WARN,
-                                           EC_ERROR,
-                                           "update instance group failed: instance group version not match, current "
-                                           "version in request: %ld, request version: %ld, current version: %ld",
-                                           current_version,
-                                           instance_group.version(),
-                                           iter->second->version());
-        }
-        // save to storage backend
-        auto ec = LoadAndSave(kRegistryGroupKey, instance_group_name, &instance_group);
-        RETURN_IF_EC_NOT_OK_WITH_LOG_G(WARN, ec, "load and save instance group failed");
-        instance_group_configs_[instance_group_name] = std::make_shared<InstanceGroup>(instance_group);
-    }
+    // save to storage backend
+    auto ec = LoadAndSave(kRegistryGroupKey, instance_group_name, &instance_group);
+    RETURN_IF_EC_NOT_OK_WITH_LOG_G(WARN, ec, "load and save instance group failed");
+    instance_group_configs_[instance_group_name] = std::make_shared<InstanceGroup>(instance_group);
     PREFIX_LOG_G(INFO, "update instance group OK");
     return EC_OK;
 }
@@ -266,17 +245,15 @@ ErrorCode RegistryManager::UpdateInstanceGroup(RequestContext *request_context,
 ErrorCode RegistryManager::RemoveInstanceGroup(RequestContext *request_context,
                                                const std::string &instance_group_name) {
     const auto &trace_id = request_context->request_id();
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     const auto iter = instance_group_configs_.find(instance_group_name);
     if (iter == instance_group_configs_.end()) {
         RETURN_IF_EC_NOT_OK_WITH_LOG_G(WARN, EC_NOENT, "remove instance group failed: instance group not found");
     }
-    {
-        std::unique_lock<std::shared_mutex> lock(mutex_);
-        // delete from storage backend
-        auto ec = LoadAndDelete(kRegistryGroupKey, instance_group_name);
-        RETURN_IF_EC_NOT_OK_WITH_LOG_G(WARN, ec, "load and delete instance group failed");
-        instance_group_configs_.erase(iter);
-    }
+    // delete from storage backend
+    auto ec = LoadAndDelete(kRegistryGroupKey, instance_group_name);
+    RETURN_IF_EC_NOT_OK_WITH_LOG_G(WARN, ec, "load and delete instance group failed");
+    instance_group_configs_.erase(iter);
     PREFIX_LOG_G(INFO, "remove instance group OK");
     return EC_OK;
 }
@@ -354,21 +331,19 @@ ErrorCode RegistryManager::RemoveInstance(RequestContext *request_context,
                                           const std::string &instance_group,
                                           const std::string &instance_id) {
     const auto &trace_id = request_context->trace_id();
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     if (instance_infos_.find(instance_id) == instance_infos_.end()) {
         // TODO: 添加错误码
         RETURN_IF_EC_NOT_OK_WITH_LOG_I(
             WARN, EC_NOENT, "remove instance failed: instance not found, group: %s", instance_group.c_str());
     }
-    {
-        std::unique_lock<std::shared_mutex> lock(mutex_);
-        // first, delete instance id from instance key
-        auto ec = LoadAndDelete(kRegistryInstanceKey, instance_id);
-        RETURN_IF_EC_NOT_OK_WITH_LOG_I(WARN, ec, "load and delete instance info failed");
-        // second, delete instance info
-        ec = LoadAndDelete(instance_id, instance_id);
-        RETURN_IF_EC_NOT_OK_WITH_LOG_I(WARN, ec, "load and delete instance id failed");
-        instance_infos_.erase(instance_id);
-    }
+    // first, delete instance id from instance key
+    auto ec = LoadAndDelete(kRegistryInstanceKey, instance_id);
+    RETURN_IF_EC_NOT_OK_WITH_LOG_I(WARN, ec, "load and delete instance info failed");
+    // second, delete instance info
+    ec = LoadAndDelete(instance_id, instance_id);
+    RETURN_IF_EC_NOT_OK_WITH_LOG_I(WARN, ec, "load and delete instance id failed");
+    instance_infos_.erase(instance_id);
     PREFIX_LOG_I(INFO, "remove instance OK");
     return EC_OK;
 }
@@ -414,37 +389,27 @@ ErrorCode RegistryManager::AddAccount(RequestContext *request_context,
                                       const std::string &password,
                                       const AccountRole &role) {
     const auto &trace_id = request_context->request_id();
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     if (accounts_.find(user_name) != accounts_.end()) {
         RETURN_IF_EC_NOT_OK_WITH_LOG_A(WARN, EC_EXIST, "add account failed: account already existed");
     }
-    {
-        std::unique_lock<std::shared_mutex> lock(mutex_);
-        if (accounts_.find(user_name) != accounts_.end()) {
-            RETURN_IF_EC_NOT_OK_WITH_LOG_A(WARN, EC_EXIST, "add account failed: account already existed");
-        }
-        std::shared_ptr<Account> account = std::make_shared<Account>(user_name, password, role);
-        auto ec = LoadAndSave(kRegistryAccountKey, user_name, account.get());
-        RETURN_IF_EC_NOT_OK_WITH_LOG_A(WARN, ec, "load and save account failed");
-        accounts_[user_name] = account;
-    }
+    std::shared_ptr<Account> account = std::make_shared<Account>(user_name, password, role);
+    auto ec = LoadAndSave(kRegistryAccountKey, user_name, account.get());
+    RETURN_IF_EC_NOT_OK_WITH_LOG_A(WARN, ec, "load and save account failed");
+    accounts_[user_name] = account;
     PREFIX_LOG_A(INFO, "add account OK");
     return EC_OK;
 }
 
 ErrorCode RegistryManager::DeleteAccount(RequestContext *request_context, const std::string &user_name) {
     const auto &trace_id = request_context->request_id();
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     if (accounts_.find(user_name) == accounts_.end()) {
         RETURN_IF_EC_NOT_OK_WITH_LOG_A(WARN, EC_NOENT, "delete account failed: account not found");
     }
-    {
-        std::unique_lock<std::shared_mutex> lock(mutex_);
-        if (accounts_.find(user_name) == accounts_.end()) {
-            RETURN_IF_EC_NOT_OK_WITH_LOG_A(WARN, EC_NOENT, "delete account failed: account not found");
-        }
-        auto ec = LoadAndDelete(kRegistryAccountKey, user_name);
-        RETURN_IF_EC_NOT_OK_WITH_LOG_A(WARN, ec, "load and delete account failed");
-        accounts_.erase(user_name);
-    }
+    auto ec = LoadAndDelete(kRegistryAccountKey, user_name);
+    RETURN_IF_EC_NOT_OK_WITH_LOG_A(WARN, ec, "load and delete account failed");
+    accounts_.erase(user_name);
     PREFIX_LOG_A(INFO, "delete account OK");
     return EC_OK;
 }
