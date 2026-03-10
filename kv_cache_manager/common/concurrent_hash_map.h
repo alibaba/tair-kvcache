@@ -171,6 +171,44 @@ public:
         map_.erase(first, last);
     }
 
+    // Atomic upsert: inserts or replaces value under unique_lock.
+    void Upsert(const KeyType &key, const ValueType &value) {
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        map_[key] = value;
+    }
+
+    // Atomic get: copies value to out under shared_lock if key exists.
+    // Returns true if key was found, false otherwise.
+    bool Get(const KeyType &key, ValueType &out) const {
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+        auto iter = map_.find(key);
+        if (iter == map_.end()) return false;
+        out = iter->second;
+        return true;
+    }
+
+    // Atomic find-and-apply: executes func(const Value&) under shared_lock if key exists.
+    // Returns true if key was found, false otherwise.
+    template <typename Func>
+    bool FindAndApply(const KeyType &key, Func func) const {
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+        auto iter = map_.find(key);
+        if (iter == map_.end()) return false;
+        func(iter->second);
+        return true;
+    }
+
+    // Atomic find-and-modify: executes func(Value&) under unique_lock if key exists.
+    // Returns true if key was found, false otherwise.
+    template <typename Func>
+    bool FindAndModify(const KeyType &key, Func func) {
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        auto iter = map_.find(key);
+        if (iter == map_.end()) return false;
+        func(iter->second);
+        return true;
+    }
+
     // Lookup
     SizeType Count(const KeyType &key) const {
         std::shared_lock<std::shared_mutex> lock(mutex_);

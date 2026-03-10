@@ -122,7 +122,7 @@ std::vector<ErrorCode> MetaLocalBackend::Put(const KeyTypeVec &keys, const Field
 ErrorCode MetaLocalBackend::PutForOneKey(const KeyType &key, const FieldMap &field_map) {
     // PersistToPath will traverse all keys, we should lock the mutex when multi-threads put/update/delete one key
     std::lock_guard<std::mutex> guard(mutex_);
-    table_[key] = field_map;
+    table_.Upsert(key, field_map);
     return PersistToPath();
 }
 
@@ -143,13 +143,14 @@ std::vector<ErrorCode> MetaLocalBackend::UpdateFields(const KeyTypeVec &keys, co
 
 ErrorCode MetaLocalBackend::UpdateFieldsForOneKey(const KeyType &key, const FieldMap &field_map) {
     std::lock_guard<std::mutex> guard(mutex_);
-    auto iter = table_.Find(key);
-    if (iter == table_.End()) {
+    bool found = table_.FindAndModify(key, [&](FieldMap &existing_map) {
+        for (const auto &[field_name, field_value] : field_map) {
+            existing_map[field_name] = field_value;
+        }
+    });
+    if (!found) {
         KVCM_LOG_WARN("update fields fail, cannot find key[%ld]", key);
         return EC_NOENT;
-    }
-    for (const auto &[field_name, field_value] : field_map) {
-        (iter->second)[field_name] = field_value;
     }
     return PersistToPath();
 }
@@ -171,15 +172,13 @@ std::vector<ErrorCode> MetaLocalBackend::Upsert(const KeyTypeVec &keys, const Fi
 
 ErrorCode MetaLocalBackend::UpsertForOneKey(const KeyType &key, const FieldMap &field_map) {
     std::lock_guard<std::mutex> guard(mutex_);
-    auto iter = table_.Find(key);
-    if (iter == table_.End()) {
-        // if not exist, then insert
-        table_[key] = field_map;
-        return PersistToPath();
-    }
-    // if exist, then update
-    for (const auto &[field_name, field_value] : field_map) {
-        (iter->second)[field_name] = field_value;
+    bool found = table_.FindAndModify(key, [&](FieldMap &existing_map) {
+        for (const auto &[field_name, field_value] : field_map) {
+            existing_map[field_name] = field_value;
+        }
+    });
+    if (!found) {
+        table_.Upsert(key, field_map);
     }
     return PersistToPath();
 }
@@ -199,34 +198,37 @@ std::vector<ErrorCode> MetaLocalBackend::IncrFields(const KeyTypeVec &keys,
 ErrorCode MetaLocalBackend::IncrFieldsForOneKey(const KeyType &key,
                                                 const std::map<std::string, int64_t> &field_amounts) {
     std::lock_guard<std::mutex> guard(mutex_);
-    const auto iter = table_.Find(key);
-    if (iter == table_.End()) {
+    ErrorCode ec = EC_OK;
+    bool found = table_.FindAndModify(key, [&](FieldMap &field_map) {
+        std::map<std::string, std::string> new_field_map;
+        for (const auto &[field_name, amount] : field_amounts) {
+            const auto field_iter = field_map.find(field_name);
+            if (field_iter == field_map.end()) {
+                KVCM_LOG_ERROR("incr fields fail, cannot find field[%s] for key[%ld]", field_name.c_str(), key);
+                ec = EC_BADARGS;
+                return;
+            }
+            const auto &old_field_value = field_iter->second;
+            int64_t old_field_value_num = 0;
+            if (!StringUtil::StrToInt64(old_field_value.c_str(), old_field_value_num)) {
+                KVCM_LOG_ERROR("incr fields fail, cannot convert field[%s] value[%s] to int64_t for key[%ld]",
+                               field_name.c_str(),
+                               old_field_value.c_str(),
+                               key);
+                ec = EC_BADARGS;
+                return;
+            }
+            new_field_map[field_name] = std::to_string(old_field_value_num + amount);
+        }
+        for (const auto &[field_name, new_field_value] : new_field_map) {
+            field_map[field_name] = new_field_value;
+        }
+    });
+    if (!found) {
         KVCM_LOG_WARN("incr fields fail, cannot find key[%ld]", key);
         return EC_NOENT;
     }
-
-    auto &field_map = iter->second;
-    std::map<std::string, std::string> new_field_map;
-    for (const auto &[field_name, amount] : field_amounts) {
-        const auto field_iter = field_map.find(field_name);
-        if (field_iter == field_map.end()) {
-            KVCM_LOG_ERROR("incr fields fail, cannot find field[%s] for key[%ld]", field_name.c_str(), key);
-            return EC_BADARGS;
-        }
-        const auto &old_field_value = field_iter->second;
-        int64_t old_field_value_num = 0;
-        if (!StringUtil::StrToInt64(old_field_value.c_str(), old_field_value_num)) {
-            KVCM_LOG_ERROR("incr fields fail, cannot convert field[%s] value[%s] to int64_t for key[%ld]",
-                           field_name.c_str(),
-                           old_field_value.c_str(),
-                           key);
-            return EC_BADARGS;
-        }
-        new_field_map[field_name] = std::to_string(old_field_value_num + amount);
-    }
-    for (const auto &[field_name, new_field_value] : new_field_map) {
-        field_map[field_name] = new_field_value;
-    }
+    if (ec != EC_OK) return ec;
     return PersistToPath();
 }
 
@@ -268,17 +270,16 @@ ErrorCode MetaLocalBackend::GetForOneKey(const KeyType &key,
                                          const std::vector<std::string> &field_names,
                                          FieldMap &out_field_map) {
     out_field_map.clear();
-    const auto iter = table_.Find(key);
-    if (iter == table_.End()) {
+    bool found = table_.FindAndApply(key, [&](const FieldMap &field_table) {
+        for (const std::string &field_name : field_names) {
+            const auto field_iter = field_table.find(field_name);
+            out_field_map[field_name] = (field_iter == field_table.end() ? "" : field_iter->second);
+        }
+    });
+    if (!found) {
         for (const std::string &field_name : field_names) {
             out_field_map[field_name] = "";
         }
-        return EC_OK;
-    }
-    const auto &field_table = iter->second;
-    for (const std::string &field_name : field_names) {
-        const auto field_iter = field_table.find(field_name);
-        out_field_map[field_name] = (field_iter == field_table.end() ? "" : field_iter->second);
     }
     return EC_OK;
 }
@@ -297,12 +298,9 @@ std::vector<ErrorCode> MetaLocalBackend::GetAllFields(const KeyTypeVec &keys, Fi
 
 ErrorCode MetaLocalBackend::GetAllFieldsForOneKey(const KeyType &key, FieldMap &out_field_map) {
     out_field_map.clear();
-    const auto iter = table_.Find(key);
-    if (iter == table_.End()) {
+    if (!table_.Get(key, out_field_map)) {
         return EC_NOENT;
     }
-    const auto &field_table = iter->second;
-    out_field_map = field_table;
     return out_field_map.empty() ? EC_NOENT : EC_OK;
 }
 
@@ -333,27 +331,30 @@ ErrorCode MetaLocalBackend::ListKeys(const std::string &cursor,
     out_next_cursor.clear();
     out_keys.clear();
 
-    int64_t current_index = 0;
-    auto iter = table_.Begin();
+    int64_t start_index = 0;
     if (cursor != SCAN_BASE_CURSOR) {
-        if (!StringUtil::StrToInt64(cursor.c_str(), current_index)) {
+        if (!StringUtil::StrToInt64(cursor.c_str(), start_index)) {
             KVCM_LOG_ERROR("list keys fail, cannot convert cursor[%s] to start index", cursor.c_str());
             return EC_BADARGS;
         }
-        std::advance(iter, current_index);
     }
-    int64_t end_index = current_index + limit;
-    while (iter != table_.End()) {
+
+    int64_t current_index = 0;
+    int64_t end_index = start_index + limit;
+    bool reached_limit = false;
+    table_.ForEachKV([&](const KeyType &key, const FieldMap &) {
         if (current_index >= end_index) {
-            out_next_cursor = std::to_string(current_index);
-            return EC_OK;
+            reached_limit = true;
+            return false;
         }
-        const auto &key = iter->first;
-        out_keys.emplace_back(key);
-        ++iter;
+        if (current_index >= start_index) {
+            out_keys.emplace_back(key);
+        }
         ++current_index;
-    }
-    out_next_cursor = SCAN_BASE_CURSOR;
+        return true;
+    });
+
+    out_next_cursor = reached_limit ? std::to_string(current_index) : SCAN_BASE_CURSOR;
     return EC_OK;
 }
 

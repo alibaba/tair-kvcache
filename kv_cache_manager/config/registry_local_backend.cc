@@ -67,7 +67,6 @@ ErrorCode RegistryLocalBackend::PersistToPath() {
     if (!enable_persistence_) {
         return EC_OK;
     }
-    std::lock_guard<std::mutex> guard(mutex_);
     std::map<std::string, std::string> tmp_table;
     table_.ForEachKV([&](const std::string &key, const std::map<std::string, std::string> &field_map) {
         tmp_table[key] = Jsonizable::ToJsonString(field_map);
@@ -84,25 +83,23 @@ ErrorCode RegistryLocalBackend::PersistToPath() {
 }
 
 ErrorCode RegistryLocalBackend::Load(const std::string &key, std::map<std::string, std::string> &out_value) noexcept {
-    auto iter = table_.Find(key);
-    if (iter == table_.End()) {
+    if (!table_.Get(key, out_value)) {
         return EC_NOENT;
     }
-    out_value = iter->second;
     return EC_OK;
 }
 
 ErrorCode RegistryLocalBackend::Save(const std::string &key, const std::map<std::string, std::string> &value) noexcept {
-    table_[key] = value;
+    std::lock_guard<std::mutex> guard(mutex_);
+    table_.Upsert(key, value);
     return PersistToPath();
 }
 
 ErrorCode RegistryLocalBackend::Delete(const std::string &key) noexcept {
-    auto iter = table_.Find(key);
-    if (iter == table_.End()) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (table_.Erase(key) == 0) {
         return EC_NOENT;
     }
-    table_.Erase(iter);
     return PersistToPath();
 }
 
