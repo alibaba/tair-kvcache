@@ -41,6 +41,18 @@ from hisim.simulation.utils import (
 logger = get_logger("hisim")
 
 
+class C_EngineHook(BaseHook):
+    HOOK_CLASS_NAME = "Engine"
+    HOOK_MODULE_NAME = "sglang.srt.entrypoints.engine"
+
+    @classmethod
+    def hook(cls, target):
+        def hook_clear_hicache_storage(self):
+            return self.loop.run_until_complete(self.tokenizer_manager.clear_hicache_storage())
+        
+        target.clear_hicache_storage = hook_clear_hicache_storage
+
+
 class C_TokenizerManagerHook(BaseHook):
     HOOK_CLASS_NAME = "TokenizerManager"
     HOOK_MODULE_NAME = "sglang.srt.managers.tokenizer_manager"
@@ -222,8 +234,6 @@ class C_HiCacheController(BaseHook):
 
     @classmethod
     def hook(cls, target):
-        original_reset = target.reset
-
         def override_backup_thread_func(self, *args, **kwargs):
             # Async thread: perform no action
             # The action will be performed by `handle_backup_operation`
@@ -233,11 +243,6 @@ class C_HiCacheController(BaseHook):
             # Async thread: perform no action
             # The action will be performed by `handle_prefetch_operation`
             pass
-
-        def override_reset(self):
-            if hasattr(self, "storage_backend"):
-                self.storage_backend.clear()
-            original_reset(self)
 
         def handle_backup_operation(self):
             if not self.enable_storage:
@@ -373,7 +378,6 @@ class C_HiCacheController(BaseHook):
         target.backup_thread_func = override_backup_thread_func
         target.handle_backup_operation = handle_backup_operation
         target.handle_prefetch_operation = handle_prefetch_operation
-        target.reset = override_reset
         target._generic_page_set = override_generic_page_set
 
 

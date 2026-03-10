@@ -997,12 +997,13 @@ class MockHiCacheStorage:
         self.temp_dir = tempfile.mkdtemp()
         logger.info(f"Using temporary directory: {self.temp_dir}")
 
-        config_file_path = _CURRENT_DIR / "../../../.." / "kv_cache_manager" / "optimizer" / "optimizer_startup_config_load.json"
-        config_file_path = config_file_path.resolve()
+        project_root = _CURRENT_DIR.parents[4]
+        config_path = project_root / "kv_cache_manager" / "optimizer" / "test" / "testdata" / "optimizer_startup_config_load.json"
+        config_path = config_path.resolve()
         self.config_loader = kvcm_py_optimizer.OptimizerConfigLoader()
 
-        if not self.config_loader.load(config_file_path):
-            raise RuntimeError(f"Failed to load optimizer config from {config_file_path}")
+        if not self.config_loader.load(str(config_path)):
+            raise RuntimeError(f"Failed to load optimizer config from {config_path}")
         self.config = self.config_loader.config()
         self.storage_manager = kvcm_py_optimizer.OptimizerManager(self.config)
         self.storage_manager.Init()
@@ -1077,8 +1078,9 @@ class MockHiCacheStorage:
             trace_id = "2"
             read_timestamp = int(time.time() * 1000)
             read_token_ids = [1]
+            mask_offset = 0
             res = self.storage_manager.GetCacheLocation(
-                self.instance_id, trace_id, read_timestamp, int_hash_keys, read_token_ids
+                self.instance_id, trace_id, read_timestamp, int_hash_keys, read_token_ids, mask_offset
             )
             logger.debug(f"{res.kvcm_hit_length=}")
             return res.kvcm_hit_length
