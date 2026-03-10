@@ -526,7 +526,7 @@ void KmonitorMetricsReporter::ReportInterval() {
         // note these metrics are reported to the local metrics registry
         // in real-time, but for kmonitor they are reported with time interval
         const auto cr = cache_manager_->cache_reclaimer();
-        if (!cr) {
+        if (!cr || cr->IsPaused() || !cr->IsRunning()) {
             break;
         }
 
