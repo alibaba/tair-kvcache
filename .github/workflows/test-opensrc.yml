@@ -140,9 +140,7 @@ jobs:
               tar -r -f bazel-out.tar "$core" 2>/dev/null
               exe_path=$(file "$core" 2>/dev/null | sed -n "s/.*execfn: '\([^']*\)'.*/\1/p")
               if [ -n "$exe_path" ] && [ -f "$exe_path" ]; then
-                # Resolve symlinks (e.g. bazel .runfiles/) to archive the real binary
-                real_path=$(readlink -f "$exe_path")
-                tar -r -f bazel-out.tar "$real_path" 2>/dev/null
+                tar -r -h -f bazel-out.tar "$exe_path" 2>/dev/null
               fi
             fi
           done
