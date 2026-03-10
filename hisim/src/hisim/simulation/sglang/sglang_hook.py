@@ -612,8 +612,15 @@ class C_SchedulerHook(BaseHook):
                                 extra_requests.append(req)
 
                         # Add requests to future queue
-                        for idx, req in enumerate(gen_requests):
-                            sim_params = req.sampling_params.custom_params["simulation"]
+                        for req in gen_requests:
+                            sim_params = None
+                            if req.sampling_params.custom_params is not None:
+                                sim_params = req.sampling_params.custom_params.get("simulation")
+                            if sim_params is None:
+                                # There are some warm-up requests when starting the server without --skip-server-warmup.
+                                extra_requests.append(req)
+                                logger.warning("Failed to extract the simulation parameters required for simulation from the request. Ignore this warning if the request is a warm-up request.")
+                                continue
                             C_SchedulerHook.FUTURE_QUEUE.append(
                                 (
                                     sim_params["created_time"],

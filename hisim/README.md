@@ -70,7 +70,6 @@ python3 -m hisim.simulation.sglang.launch_server \
 > **Notes**:
 > - Parameters prefixed with `--sim-` are simulation-specific; others are passed to the SGLang framework.
 > - Use `--sim-config-path` to specify the simulation configuration file.
-> - `--skip-server-warmup` is required because the simulator only accepts specific request formats.
 > - In pure CPU simulation environments, you may need to install the CPU-compatible version of vLLM (a dependency of SGLang CPU mode) and set the following environment variables:
 >   ```bash
 >   export SGLANG_USE_CPU_ENGINE=1
@@ -80,7 +79,7 @@ python3 -m hisim.simulation.sglang.launch_server \
 
 #### Run the Simulation Benchmark
 
-Open a new terminal and run the benchmark client. **Important**: Use `--bench-mode simulation` and **do not** use `--warmup-request`.
+Open a new terminal and run the benchmark client. **Important**: Use `--bench-mode simulation` and set `--warmup-request=0`.
 
 - **Replay from user dataset** (`user_replay_requests.jsonl`):
   ```bash

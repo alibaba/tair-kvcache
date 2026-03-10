@@ -55,13 +55,12 @@ pip install .
 ``` bash
 python3 -m hisim.simulation.sglang.launch_server \
   --model-path "Qwen/Qwen3-32B-FP8" \
-  --sim-config-path test/assets/mock/config.json \
-  --skip-server-warmup
+  --sim-config-path test/assets/mock/config.json
 ```
 
 > **Notes**:
 > - 详细参数参考[详细参数与环境变量设置说明](#mock-simulation推理仿真)。
-> - 命令行参数中，`sim` 开头的参数为仿真参数，其他参数为服务框架（SGLang）的参数，通过指定 `--sim-config-path` 设置仿真配置，仿真过程中，只能接受特定的请求，因此需要 `--skip-server-warmup` 避免出现异常。
+> - 命令行参数中，`sim` 开头的参数为仿真参数，其他参数为服务框架（SGLang）的参数，通过指定 `--sim-config-path` 设置仿真配置。
 > - 如果在纯CPU仿真环境中，可能需要安装vllm(sglang cpu版本依赖)，同时需要指定环境变量
 >   ``` bash
 >   export SGLANG_USE_CPU_ENGINE=1
@@ -71,7 +70,7 @@ python3 -m hisim.simulation.sglang.launch_server \
 
 #### 劫持仿真压测
 
-压测时需要指定 `--bench-mode simulation`，同时不支持 `--warmup-request`。新建终端作为发送端，运行以下命令
+压测时需要指定 `--bench-mode simulation`，warmup-request 也会当仿真的请求，请设置（`--warmup-request=0`）。新建终端作为发送端，运行以下命令
 
 - **基于用户数据集重放**
 ``` bash
