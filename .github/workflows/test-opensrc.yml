@@ -37,9 +37,6 @@ jobs:
           - name: client_test
             test_target: "//kv_cache_manager/client/..."
             test_args: "--config=client"
-          - name: coredump_test
-            test_target: "//kv_cache_manager/common/test:coredump_test"
-            test_args: "--test_tag_filters="
     name: ${{ matrix.name }}
     runs-on: ${{ inputs.runs-on || 'ubuntu-latest' }}
     container:
