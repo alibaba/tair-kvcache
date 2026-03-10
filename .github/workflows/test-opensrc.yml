@@ -98,6 +98,17 @@ jobs:
           core_count=$(find /tmp/corefile/ -type f 2>/dev/null | wc -l)
           echo "Found $core_count core dump file(s)"
           ls -lah /tmp/corefile/ 2>/dev/null || true
+          # Install gdb and file on-demand if core dumps exist
+          if [ "$core_count" -gt 0 ]; then
+            if ! command -v gdb >/dev/null 2>&1 || ! command -v file >/dev/null 2>&1; then
+              echo "Installing gdb and file..."
+              if command -v yum >/dev/null 2>&1; then
+                yum install -y -q gdb file || true
+              elif command -v apt-get >/dev/null 2>&1; then
+                apt-get update -qq && apt-get install -y -qq gdb file || true
+              fi
+            fi
+          fi
           for core in /tmp/corefile/core.*; do
             if [ -f "$core" ]; then
               echo ""
