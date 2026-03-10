@@ -37,12 +37,16 @@ jobs:
           - name: client_test
             test_target: "//kv_cache_manager/client/..."
             test_args: "--config=client"
+          - name: coredump_test
+            test_target: "//kv_cache_manager/common/test:coredump_test"
+            test_args: "--test_tag_filters="
     name: ${{ matrix.name }}
     runs-on: ${{ inputs.runs-on || 'ubuntu-latest' }}
     container:
       image: ghcr.io/alibaba/tair-kvcache-kvcm-dev:2026_02_13_12_03_24230b1
       volumes:
         - /:/host_root/
+      options: --privileged
     steps:
       # https://github.com/actions/runner-images/issues/2840
       # https://github.com/korjavin/haskel-web1/commit/3bd3d2a74c41418ec31a8bec34dcd9c100f4e22d
@@ -50,9 +54,9 @@ jobs:
         run: |
           echo "Disk space before cleanup:"
           df -h
-          sudo rm -rf /host_root/usr/share/dotnet
-          sudo rm -rf /host_root/usr/local/lib/android
-          sudo rm -rf /host_root/opt/ghc
+          rm -rf /host_root/usr/share/dotnet
+          rm -rf /host_root/usr/local/lib/android
+          rm -rf /host_root/opt/ghc
           echo "Disk space after cleanup:"
           df -h
       - uses: actions/checkout@v4
@@ -66,21 +70,64 @@ jobs:
         if: ${{ inputs.rebuildDiskCache || false }}
         run: |
           rm -rf ~/.cache/bazel-disk
+      - name: setup_coredump
+        run: |
+          set -x
+          # Create directory for core dumps
+          mkdir -p /tmp/corefile
+          chmod 777 /tmp/corefile
+          # Set core pattern to save core dumps with executable name, PID, signal and timestamp
+          echo "/tmp/corefile/core.%e.%p.%s.%t" > /proc/sys/kernel/core_pattern
+          # Verify configuration
+          echo "core_pattern: $(cat /proc/sys/kernel/core_pattern)"
       - name: bazel_test
         run: |
           set -x
           set -e
+          ulimit -c unlimited
           bazelisk test ${{ matrix.test_target }} ${{ matrix.test_args }} --cache_test_results=no --test_output=errors
+      - name: detect_crashes
+        if: failure()
+        run: |
+          set +e
+          set -x
+          echo "=== dmesg crash signals ==="
+          dmesg -T 2>/dev/null | grep -iE 'segfault|killed process|oom-killer|traps:' || echo "No crash signals found in dmesg"
+          echo ""
+          echo "=== Core dump files ==="
+          core_count=$(find /tmp/corefile/ -type f 2>/dev/null | wc -l)
+          echo "Found $core_count core dump file(s)"
+          ls -lah /tmp/corefile/ 2>/dev/null || true
+          for core in /tmp/corefile/core.*; do
+            if [ -f "$core" ]; then
+              echo ""
+              echo "=== Core dump: $core ==="
+              file "$core" || true
+              # Extract executable name from core pattern: core.{exe}.{pid}.{signal}.{time}
+              exe_name=$(basename "$core" | cut -d. -f2)
+              signal=$(basename "$core" | cut -d. -f4)
+              echo "Executable: $exe_name, Signal: $signal"
+              # Try to find the executable binary and print backtrace
+              exe_path=$(find bazel-out/ -name "$exe_name" -type f -executable 2>/dev/null | head -1)
+              if [ -n "$exe_path" ] && command -v gdb >/dev/null 2>&1; then
+                echo "--- Backtrace (from $exe_path) ---"
+                gdb -batch -ex "thread apply all bt" "$exe_path" "$core" 2>/dev/null || true
+              fi
+            fi
+          done
       - name: create_archive
         if: failure()
         run: |
           set -x
-          set -e
-          test -a bazel-out.tar && rm -f bazel-out.tar
-          find bazel-out/*-opt/bin/ '(' -name 'kv_cache_manager.log' -o -name 'access.log' -o -name 'metrics.log' -o -name 'stdout' -o -name 'stderr' ')' -a -exec 'tar' '-r' '-f' 'bazel-out.tar' '{}' ';'
-          find bazel-out/*-opt/bin/ -name 'core-*' -a -type f -a -exec 'tar' '-r' '-f' 'bazel-out.tar' '{}' ';'
-          tar -r -f bazel-out.tar bazel-out/*-opt/testlogs/
-          gzip -f bazel-out.tar
+          set +e
+          rm -f bazel-out.tar
+          find bazel-out/*-opt/bin/ '(' -name 'kv_cache_manager.log' -o -name 'access.log' -o -name 'metrics.log' -o -name 'stdout' -o -name 'stderr' ')' -a -exec 'tar' '-r' '-f' 'bazel-out.tar' '{}' ';' 2>/dev/null
+          # Collect core dump files
+          find /tmp/corefile/ -type f -exec tar -r -f bazel-out.tar {} \; 2>/dev/null
+          tar -r -f bazel-out.tar bazel-out/*-opt/testlogs/ 2>/dev/null
+          if [ -f bazel-out.tar ]; then
+            gzip -f bazel-out.tar
+          fi
       - uses: actions/upload-artifact@v6
         if: failure()
         with:

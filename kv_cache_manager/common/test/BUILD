@@ -163,3 +163,16 @@ cc_test(
         "//kv_cache_manager/common:unittest",
     ],
 )
+
+cc_test(
+    name = "coredump_test",
+    srcs = [
+        "coredump_test.cc",
+    ],
+    tags = [
+        "manual",
+    ],
+    deps = [
+        "@com_google_googletest//:gtest_main",
+    ],
+)
