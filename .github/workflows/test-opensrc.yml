@@ -112,41 +112,18 @@ jobs:
               echo "=== Core dump: $core ==="
               file_output=$(file "$core" || true)
               echo "$file_output"
-              # Extract executable name from core pattern: core.{exe}.{pid}.{signal}.{time}
-              # Note: %e in core_pattern truncates to 15 chars (TASK_COMM_LEN-1)
-              exe_name=$(basename "$core" | cut -d. -f2)
+              # Note: %e in core_pattern truncates exe name to 15 chars (TASK_COMM_LEN-1)
               signal=$(basename "$core" | cut -d. -f4)
-              echo "Executable: $exe_name, Signal: $signal"
               # Extract the real executable path from 'file' output (execfn field, not truncated)
-              real_exe_path=$(echo "$file_output" | sed -n "s/.*execfn: '\([^']*\)'.*/\1/p")
-              real_exe_name=""
-              if [ -n "$real_exe_path" ]; then
-                real_exe_name=$(basename "$real_exe_path")
-                echo "Real executable (from execfn): $real_exe_name"
-              fi
-              # Try to find the executable binary with multiple strategies
-              exe_path=""
-              # Strategy 1: Try the execfn path directly (may exist if not sandboxed)
-              if [ -z "$exe_path" ] && [ -n "$real_exe_path" ] && [ -f "$real_exe_path" ]; then
-                exe_path="$real_exe_path"
-              fi
-              # Strategy 2: Search by real (non-truncated) executable name in bazel-out
-              if [ -z "$exe_path" ] && [ -n "$real_exe_name" ]; then
-                exe_path=$(find bazel-out/ -name "$real_exe_name" -type f -executable 2>/dev/null | head -1)
-              fi
-              # Strategy 3: Fallback to truncated name from core pattern
-              if [ -z "$exe_path" ] && [ "$real_exe_name" != "$exe_name" ]; then
-                exe_path=$(find bazel-out/ -name "$exe_name" -type f -executable 2>/dev/null | head -1)
-              fi
-              # Run gdb backtrace
-              if [ -n "$exe_path" ] && command -v gdb >/dev/null 2>&1; then
-                echo "--- Backtrace (from $exe_path) ---"
+              exe_path=$(echo "$file_output" | sed -n "s/.*execfn: '\([^']*\)'.*/\1/p")
+              if [ -n "$exe_path" ] && [ -f "$exe_path" ]; then
+                echo "Executable: $exe_path, Signal: $signal"
+                echo "--- Backtrace ---"
                 gdb -batch -ex "thread apply all bt" "$exe_path" "$core" 2>/dev/null || true
-              elif command -v gdb >/dev/null 2>&1; then
-                echo "--- Backtrace (exe not found, trying gdb with core only) ---"
-                gdb -batch -ex "thread apply all bt" -c "$core" 2>/dev/null || true
               else
-                echo "WARNING: gdb not available, cannot print backtrace"
+                echo "Signal: $signal, executable not found at: $exe_path"
+                echo "--- Backtrace (core only) ---"
+                gdb -batch -ex "thread apply all bt" -c "$core" 2>/dev/null || true
               fi
             fi
           done
@@ -157,8 +134,16 @@ jobs:
           set +e
           rm -f bazel-out.tar
           find bazel-out/*-opt/bin/ '(' -name 'kv_cache_manager.log' -o -name 'access.log' -o -name 'metrics.log' -o -name 'stdout' -o -name 'stderr' ')' -a -exec 'tar' '-r' '-f' 'bazel-out.tar' '{}' ';' 2>/dev/null
-          # Collect core dump files
-          find /tmp/corefile/ -type f -exec tar -r -f bazel-out.tar {} \; 2>/dev/null
+          # Collect core dump files and their corresponding executables for offline debugging
+          for core in /tmp/corefile/core.*; do
+            if [ -f "$core" ]; then
+              tar -r -f bazel-out.tar "$core" 2>/dev/null
+              exe_path=$(file "$core" 2>/dev/null | sed -n "s/.*execfn: '\([^']*\)'.*/\1/p")
+              if [ -n "$exe_path" ] && [ -f "$exe_path" ]; then
+                tar -r -f bazel-out.tar "$exe_path" 2>/dev/null
+              fi
+            fi
+          done
           tar -r -f bazel-out.tar bazel-out/*-opt/testlogs/ 2>/dev/null
           if [ -f bazel-out.tar ]; then
             gzip -f bazel-out.tar
