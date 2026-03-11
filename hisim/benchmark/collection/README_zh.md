@@ -12,13 +12,14 @@
   2. 利用 PYTHON 的机制(`usercustomize.py`自动加载)，`PYTHONPATH=`pwd`/serving_hook python -m sglang.launch_server --model Qwen/Qwen3-8B`
 * 用户发起若干请求，或通过sglang框架提供的bench_serving打流，例如
 ```python
-python3 -m sglang.launch_server \
+python3 -m sglang.bench_serving \
     --warmup-requests 0 \
     --dataset-name random \
     --request-rate 4 \
     --random-input-len 1024 \
     --random-output-len 1024 \
-    --num-prompts 50 
+    --num-prompts 50
+# 如果要采集请求在 Benchmark Client 上的创建时间，可以使用 `benchmark/collection/sglang_bench_serving.py`，参数与 `sglang.bench_serving` 一致
 ```
 * 采集结束后，向推理服务发送如下收集指令，即可在`HISIM_BENCHMARK_OUT_DIR`环境变量指定的路径下，得到用户请求数据集
 ```shell

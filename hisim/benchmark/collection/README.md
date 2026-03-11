@@ -12,13 +12,14 @@
   2. Utilize Python's mechanism (`usercustomize.py` auto-loading), `PYTHONPATH=`pwd`/serving_hook python -m sglang.launch_server --model Qwen/Qwen3-8B`
 * Users initiate several requests, or use the bench_serving provided by the sglang framework for load testing, for example:
 ```python
-python3 -m sglang.launch_server \
+python3 -m sglang.bench_serving \
     --warmup-requests 0 \
     --dataset-name random \
     --request-rate 4 \
     --random-input-len 1024 \
     --random-output-len 1024 \
-    --num-prompts 50 
+    --num-prompts 50
+# If you need to collect the request creation time on the Benchmark Client, you can use `benchmark/collection/sglang_bench_serving.py`. Its parameters are the same as `sglang.bench_serving`.
 ```
 * After collection is complete, send the following collection command to the inference service, and you will get the user request dataset in the path specified by the `HISIM_BENCHMARK_OUT_DIR` environment variable:
 ```shell

@@ -6,7 +6,8 @@ cd "$SCRIPT_DIR"
 
 HISIM_BENCHMARK_OUT_DIR="$SCRIPT_DIR/tmp/server" \
 python3 $SCRIPT_DIR/serving_hook/sglang_launch_server.py \
-    --model-path="Qwen/Qwen3-8B"
+    --model-path="Qwen/Qwen3-8B" \
+    --load-format=dummy
 
 
 : <<'EOF'

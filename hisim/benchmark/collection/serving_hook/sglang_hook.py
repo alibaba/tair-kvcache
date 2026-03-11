@@ -16,13 +16,22 @@ HISIM_BENCHMARK_OUT_DIR = os.getenv("HISIM_BENCHMARK_OUT_DIR", os.getcwd())
 @dataclass
 class RequestInfos:
     rid: str = ""
-    timestamp: Optional[float] = None  # created time
+    client_created_time: Optional[float] = None  # client created time
+    server_created_time: Optional[float] = None
     output_length: int = 0
     input_length: int = 0
-    input_ids: list[int] = field(default_factory=list)
-    output_ids: list[int] = field(default_factory=list)
     queue_end: float = 0
     final_prefix_cache_len: int = 0
+    input_ids: list[int] = field(default_factory=list)
+    output_ids: list[int] = field(default_factory=list)
+
+    @property
+    def timestamp(self) -> Optional[float]:
+        return (
+            self.client_created_time
+            if self.client_created_time is not None
+            else self.server_created_time
+        )
 
 
 REQUEST_INFOS: dict[str, RequestInfos] = defaultdict(RequestInfos)
@@ -38,7 +47,11 @@ class C_TokenizerManagerHook(hisim_hook.BaseHook):
         original_send_one_request = target._send_one_request
 
         def wrapped_send_one_request(self, obj, tokenized_obj, created_time):
-            setattr(tokenized_obj, "created_time", created_time)
+            if tokenized_obj.sampling_params.custom_params is None:
+                tokenized_obj.sampling_params.custom_params = {}
+            tokenized_obj.sampling_params.custom_params.update(
+                {"server_created_time": created_time}
+            )
             return original_send_one_request(self, obj, tokenized_obj, created_time)
 
         target._send_one_request = wrapped_send_one_request
@@ -71,10 +84,17 @@ class C_SglangSchedulerInfoHook(hisim_hook.BaseHook):
                     req_info.rid = req.rid
                     req_info.queue_start = recv_time
 
-                    if not hasattr(req, "created_time"):
-                        print("The request's created time is missing.")
-                    else:
-                        req_info.timestamp = getattr(req, "created_time")
+                    custom_params = req.sampling_params.custom_params
+                    if "client_created_time" not in custom_params:
+                        print(
+                            "The request's client created time is missing; it should be set by the benchmark client."
+                        )
+                    req_info.server_created_time = custom_params.get(
+                        "server_created_time"
+                    )
+                    req_info.client_created_time = custom_params.get(
+                        "client_created_time"
+                    )
             return reqs
 
         def wrapped_get_new_batch_prefill(self, *args, **kwargs):
@@ -128,7 +148,9 @@ class C_SglangSchedulerInfoHook(hisim_hook.BaseHook):
                 out_file = f"{HISIM_BENCHMARK_OUT_DIR}/{filename_prefix}.requests.jsonl"
                 with open(out_file, "w") as f:
                     for req_infos in REQUEST_INFOS.values():
-                        f.write(json.dumps(asdict(req_infos)) + "\n")
+                        item = asdict(req_infos)
+                        item["timestamp"] = req_infos.timestamp
+                        f.write(json.dumps(item) + "\n")
                 print(f"[Hisim Collection] Request data has been saved to {out_file}")
 
             REQUEST_INFOS.clear()

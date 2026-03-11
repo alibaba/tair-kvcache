@@ -31,7 +31,8 @@ for rate in "${request_rates[@]}"; do
     curl -s "$SERVER_URL/start_profile" > /dev/null
 
     echo "Running benchmark..."
-    python3 -m sglang.bench_serving --backend sglang \
+    # OR python3 -m sglang.bench_serving ...
+    python3 $SCRIPT_DIR/sglang_bench_serving.py --backend sglang \
         --dataset-name random --num-prompts 100 \
         --random-input 2000 --random-output 512 \
         --random-range-ratio 0.5 \
