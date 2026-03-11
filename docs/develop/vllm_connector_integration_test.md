@@ -12,6 +12,8 @@ vLLM Connector 集成测试框架旨在解决以下问题：
 
 - **真实 Manager 服务**：使用 TestBase 框架自动启动/停止 KV Cache Manager 服务
 - **CUDA Mock**：仅 Mock CUDA 操作（Stream/Event），保持其他代码真实执行
+- **Triton Mock**：在无 triton 环境下自动 mock triton 模块，使导入链不中断；有 triton 时使用真实模块
+- **GPU 内核 Mock**：将 `batch_gather_scatter_helper` 中的 GPU 内核函数替换为空操作
 - **vLLM Config Mock**：使用 MagicMock 替代真实的 VllmConfig，避免 HuggingFace 网络请求
 - **Bazel 集成**：通过 Bazel 管理测试依赖和执行
 
@@ -20,64 +22,122 @@ vLLM Connector 集成测试框架旨在解决以下问题：
 ```
 integration_test/vllm_connector/
 ├── BUILD                          # Bazel 构建配置
-├── mock_cuda.py                   # CUDA 操作 Mock
+├── mock_cuda.py                   # CUDA/Triton/GPU 内核 Mock
 ├── vllm_connector_cases.py        # 测试基类和工具方法
-└── connector_lifecycle_test.py    # 生命周期测试用例
+└── connector_lifecycle_test.py    # 生命周期及读写流程测试用例
 ```
 
 ## 核心组件
 
-### 1. mock_cuda.py - CUDA Mock
+### 1. mock_cuda.py - CUDA / Triton / GPU 内核 Mock
 
-提供 CUDA 操作的 Mock 实现，使测试可以在 CPU 环境运行：
+提供多层 Mock 实现，使测试可以在 CPU 环境运行。
+
+**使用方式**：在导入 vLLM **之前**调用 `apply_cuda_patches()`，这已由 `vllm_connector_cases.py` 在模块加载时自动完成。
 
 ```python
-from integration_test.vllm_connector.mock_cuda import apply_cuda_patches
+from mock_cuda import apply_cuda_patches, apply_distributed_patches
 
-# 在测试 setUp 中应用 patches
+# 必须在 import vllm 之前调用
 apply_cuda_patches()
+apply_distributed_patches()
+
+# 之后才能安全 import vllm
+from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 ```
 
-Mock 内容包括：
-- `MockCudaStream`：模拟 CUDA Stream
-- `MockCudaEvent`：模拟 CUDA Event
-- `torch.cuda.current_stream()`
-- `torch.cuda.Stream()`
-- vLLM 分布式函数（`get_tp_group`, `get_world_group` 等）
+#### Mock 层次
+
+| 层次 | 内容 | 说明 |
+|------|------|------|
+| CUDA 基础 | `MockCudaStream`、`MockCudaEvent`、`torch.cuda.*` 函数 | 所有 CUDA 操作变为空操作 |
+| Triton 模块 | `_TritonSubModule` + `_TritonImportFinder` | 仅在 triton 未安装时激活；通过 `sys.meta_path` 拦截所有 `triton.*` 导入 |
+| GPU 内核 | `batch_scatter_kv_caches`、`batch_gather_kv_caches` | 替换为空函数，避免 CPU 环境调用 triton 内核 |
+| 分布式 | `get_tensor_model_parallel_rank` | 固定返回 0，模拟单机环境 |
+
+#### 调用顺序
+
+`apply_cuda_patches()` 内部按严格顺序执行：
+
+1. `_mock_triton()` — 必须最先执行，因为 `import torch` 可能触发 `torch._inductor` 加载 triton
+2. `_mock_batch_gather_scatter()` — 在 `sys.modules` 中预注册空操作模块
+3. `import torch` + 替换 `torch.cuda.*`
 
 ### 2. vllm_connector_cases.py - 测试基类
 
 `VllmConnectorTestBase` 提供：
 
 - **服务生命周期管理**：自动启动/停止 KV Cache Manager
-- **配置生成**：创建测试用的 VllmConfig 和 extra_config
+- **配置生成**：创建测试用的 VllmConfig 和 extra_config，支持多 instance 场景
 - **Mock 对象工厂**：创建 Request、KVCacheBlocks、SchedulerOutput 等
+- **引擎步骤模拟**：`_simulate_engine_step()` 封装完整的 vllm 引擎单步调度
 
-关键配置参数：
+#### 关键配置参数
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `instance_group` | `"default"` | 使用 KVCM 默认创建的 instance group |
-| `instance_id` | `"test_instance"` | 测试实例 ID |
+| `instance_id` | `"test_instance"` | 测试实例 ID，可通过 `_create_test_vllm_config(instance_id=...)` 覆盖 |
 | `block_size` | `16` | KV Cache block 大小 |
+| `num_layers` | `4` | 模型层数 |
+| `num_kv_heads` | `8` | KV head 数量 |
+| `head_size` | `64` | Head 维度 |
 | `async_get_cache_location` | `False` | 同步查询以简化测试 |
 
-### 3. 测试用例结构
+#### 工具方法
 
-测试用例继承 `VllmConnectorTestBase` 和 `unittest.TestCase`：
+| 方法 | 说明 |
+|------|------|
+| `_create_test_vllm_config(instance_id, coordinator_base_port)` | 创建 Mock VllmConfig，支持指定 instance_id 和 coordinator 端口 |
+| `_create_mock_request(request_id, prompt_token_ids)` | 创建 Mock vLLM Request 对象 |
+| `_create_mock_scheduler_output(new_reqs, num_scheduled_tokens)` | 创建 Mock SchedulerOutput |
+| `_create_mock_kv_caches(num_layers, num_blocks, ...)` | 创建 CPU 上的 Mock KV Cache 张量 |
+| `_create_mock_kv_cache_blocks(block_ids)` | 创建 Mock KVCacheBlocks |
+| `_create_mock_scheduled_new_req(req_id, token_ids, block_ids)` | 创建 Mock scheduled_new_req 元素 |
+| `_simulate_engine_step(scheduler, worker, scheduler_output)` | 模拟完整的 vllm 引擎步骤 |
+| `_get_free_port()` | 获取空闲端口用于 coordinator |
 
-```python
-class MyConnectorTest(VllmConnectorTestBase, unittest.TestCase):
-    def _init_connector(self):
-        """初始化 Connector（可覆盖）"""
-        # 创建 scheduler 和 worker connector
-        pass
-    
-    def test_my_feature(self):
-        """测试用例"""
-        # 使用 self.scheduler_connector 和 self.worker_connector
-        pass
+### 3. 测试用例
+
+#### 测试类概览
+
+| 测试类 | 覆盖范围 |
+|--------|----------|
+| `ConnectorSchedulerInitTest` | Scheduler 角色初始化、manager client、缓存查询、元数据构建 |
+| `ConnectorWorkerInitTest` | Worker 角色初始化、transfer client、KV Cache 注册、元数据绑定 |
+| `ConnectorLifecycleTest` | Scheduler-Worker 通信、新请求匹配流程 |
+| `ConnectorKVCacheWriteReadTest` | 完整 KV Cache 读写流程、多 instance 协作、多请求并发生命周期 |
+
+#### ConnectorKVCacheWriteReadTest 详解
+
+该测试类创建两个 vllm instance（A 和 B），各自有独立的 Scheduler + Worker Connector 对，模拟真实的多 instance KV Cache 共享场景。
+
+**test_write_then_read_kvcache — 完整读写流程**：
+
 ```
+Instance A (写入方)                    Instance B (读取方)
+─────────────────                    ─────────────────
+get_num_new_matched_tokens → 0
+update_state_after_alloc
+build_connector_meta
+  └→ start_save_kvcache_async (异步)
+bind_connector_metadata (Worker)
+wait_for_save / get_finished
+                                     get_num_new_matched_tokens → matched > 0
+time.sleep(2) 等待异步保存              update_state_after_alloc
+第二轮 build_connector_meta            build_connector_meta (含 LoadRequest)
+  └→ 收集 SaveRequest                  bind_connector_metadata (Worker)
+                                     start_load_kv / get_finished
+request_finished                     request_finished
+```
+
+**test_single_instance_write_and_query — 单 instance 写后查询**：
+- 同一个 instance 先写入再用新 request_id 查询，验证 getCacheLocation 接口
+
+**test_multiple_requests_lifecycle — 多请求并发**：
+- 3 个请求同时创建、分配、执行引擎步骤
+- 验证 `_alive_requests` 字典的正确管理
+- 关键：需要 `time.sleep` + 额外 `build_connector_meta` 等待异步保存结果回传后再调用 `request_finished`
 
 ## 运行测试
 
@@ -87,11 +147,18 @@ class MyConnectorTest(VllmConnectorTestBase, unittest.TestCase):
 bazel test //integration_test/vllm_connector:connector_lifecycle_test
 ```
 
-### 运行单个测试
+### 运行特定测试类
 
 ```bash
 bazel test //integration_test/vllm_connector:connector_lifecycle_test \
-    --test_filter=test_scheduler_init
+    --test_filter="ConnectorKVCacheWriteReadTest"
+```
+
+### 运行单个测试方法
+
+```bash
+bazel test //integration_test/vllm_connector:connector_lifecycle_test \
+    --test_filter="test_write_then_read_kvcache"
 ```
 
 ### 查看详细输出
@@ -110,52 +177,69 @@ bazel test //integration_test/vllm_connector:connector_lifecycle_test \
 
 ## 添加新测试
 
-### 步骤 1：创建测试文件
+### 步骤 1：创建测试类
 
-在 `integration_test/vllm_connector/` 目录下创建新的测试文件：
+在 `connector_lifecycle_test.py` 中添加新的测试类，或创建新文件：
 
 ```python
-# my_feature_test.py
-import unittest
-from integration_test.vllm_connector.vllm_connector_cases import VllmConnectorTestBase
-
-class MyFeatureTest(VllmConnectorTestBase, unittest.TestCase):
+class MyFeatureTest(VllmConnectorTestBase):
     def _init_connector(self):
-        """初始化测试所需的 Connector"""
-        vllm_config = self._create_test_vllm_config()
-        
-        # 创建 Scheduler Connector
-        self.scheduler_connector = TairKvCacheConnector(
-            vllm_config=vllm_config,
-            role=KVConnectorRole.SCHEDULER,
-        )
-        
-        # 如果需要 Worker Connector
-        self.worker_connector = TairKvCacheConnector(
-            vllm_config=vllm_config,
-            role=KVConnectorRole.WORKER,
-            rank=0,
-        )
-    
+        """初始化 Connector"""
+        from kv_cache_manager.py_connector.vllm.v1_connector import TairKvCacheConnector
+
+        config = self._create_test_vllm_config()
+
+        self.scheduler = TairKvCacheConnector(config, KVConnectorRole.SCHEDULER)
+        self.worker = TairKvCacheConnector(config, KVConnectorRole.WORKER)
+
+        kv_caches = self._create_mock_kv_caches()
+        self.worker.register_kv_caches(kv_caches)
+
+    def _cleanup_connector(self):
+        """清理 Connector"""
+        if hasattr(self, 'worker') and self.worker:
+            self.worker.shutdown()
+        if hasattr(self, 'scheduler') and self.scheduler:
+            self.scheduler.shutdown()
+
     def test_my_feature(self):
         """测试用例"""
-        # 创建测试请求
         request = self._create_mock_request(
             request_id="test_req",
             prompt_token_ids=list(range(1, 65)),
         )
-        
-        # 测试逻辑
-        result = self.scheduler_connector.some_method(request)
-        
-        # 断言
-        self.assertIsNotNone(result)
 
-if __name__ == '__main__':
-    unittest.main()
+        matched, has_match = self.scheduler.get_num_new_matched_tokens(request, 0)
+        self.assertEqual(matched, 0)
 ```
 
-### 步骤 2：更新 BUILD 文件
+**多 instance 测试**：使用 `instance_id` 和 `coordinator_base_port` 参数创建不同的 Connector：
+
+```python
+config_a = self._create_test_vllm_config(
+    instance_id="instance_a",
+    coordinator_base_port=self._get_free_port(),
+)
+config_b = self._create_test_vllm_config(
+    instance_id="instance_b",
+    coordinator_base_port=self._get_free_port(),
+)
+```
+
+**模拟引擎步骤**：使用 `_simulate_engine_step()` 执行完整的引擎调度循环：
+
+```python
+new_req = self._create_mock_scheduled_new_req(req_id, token_ids, block_ids)
+sched_out = self._create_mock_scheduler_output(
+    new_reqs=[new_req],
+    num_scheduled_tokens={req_id: num_tokens},
+)
+meta, finished_saving, finished_loading = self._simulate_engine_step(
+    self.scheduler, self.worker, sched_out,
+)
+```
+
+### 步骤 2：更新 BUILD 文件（如新建文件）
 
 在 `integration_test/vllm_connector/BUILD` 中添加新的测试目标：
 
@@ -179,41 +263,117 @@ py_test(
 bazel test //integration_test/vllm_connector:my_feature_test --test_output=all
 ```
 
+## 异步保存流程与测试要点
+
+Connector 的保存流程是异步的，理解这个流程对编写正确的测试至关重要。
+
+### 异步保存时序
+
+```
+build_connector_meta()
+  ├─ 遍历 alive_requests
+  ├─ 计算 target_save_num
+  ├─ 如果有新的 block 需要保存：
+  │   ├─ scheduled_saving_count += 1
+  │   └─ http_executor.submit(start_save_kvcache_async)  ←── 异步提交
+  ├─ 收集 _waiting_to_save_requests（上一轮异步保存的结果）
+  │   └─ sent_saving_count += 1
+  └─ 返回 meta
+```
+
+### 关键：`scheduled_saving_count` 与 `sent_saving_count` 的关系
+
+`request_finished()` 检查 `scheduled_saving_count == sent_saving_count`：
+- **相等**：所有保存已完成，立即移除请求
+- **不相等**：设置 `need_report_after_saving_finished = True`，延迟移除
+
+因此测试中需要：
+
+1. **等待异步 HTTP 完成**：`time.sleep(2)` 等待 `start_save_kvcache_async`
+2. **额外 build_connector_meta**：收集异步保存结果，同步 `sent_saving_count`
+3. **之后才能 request_finished**：否则请求会留在 `_alive_requests` 中
+
+```python
+# 第一轮：触发保存
+self._simulate_engine_step(scheduler, worker, sched_out)
+
+# 等待异步保存完成
+time.sleep(2)
+
+# 第二轮：收集保存结果
+self._simulate_engine_step(scheduler, worker, empty_sched_out)
+
+# 现在可以安全完成请求
+scheduler.request_finished(request, block_ids)
+```
+
+### Worker 侧清理的局限
+
+在无存储后端的测试环境中，Worker 侧的 `get_finished()` 通过 coordinator server 查询保存完成状态。由于没有真实的数据传输，coordinator 永远不会收到完成事件，因此 Worker 侧的 `_alive_requests` 可能不会被完全清理。测试断言应以 Scheduler 侧为主。
+
 ## 注意事项
 
-### 1. 服务启动等待
+### 1. Mock 初始化顺序
+
+`apply_cuda_patches()` **必须**在 `import vllm` 之前调用。原因链路：
+
+```
+import vllm
+  → vllm.env_override
+    → torch._inductor
+      → import triton.backends.compiler  （需要 triton mock）
+      → triton.__version__               （需要返回版本字符串）
+      → inspect.signature(triton.language.core.view)  （需要可调用）
+```
+
+`vllm_connector_cases.py` 在模块加载时已处理此顺序：
+```python
+apply_cuda_patches()      # 行 37
+apply_distributed_patches()  # 行 38
+# 之后 connector_lifecycle_test.py 才 import vllm
+```
+
+### 2. 服务启动等待
 
 KV Cache Manager 服务启动需要时间，`TestBase` 已处理等待逻辑。如果遇到连接问题，检查：
 - 端口是否被占用
 - 服务是否正常启动（查看 worker 目录下的 `stderr` 和 `kv_cache_manager.log`）
 
-### 2. Instance Group
+### 3. Instance Group
 
 测试默认使用 `"default"` instance group，这是 KVCM 启动时自动创建的。如需使用其他 group，需要先通过 Admin API 创建。
 
-### 3. 异步查询模式
+### 4. 异步查询模式
 
 `async_get_cache_location` 配置控制缓存位置查询模式：
 - `False`（推荐用于测试）：同步查询，`get_num_new_matched_tokens` 立即返回结果
-- `True`：异步查询，需要多次调用等待结果
+- `True`：异步查询，首次调用返回 `(None, False)`，需多次调用等待结果
 
-### 4. Mock VllmConfig
+### 5. Mock VllmConfig
 
-测试使用 MagicMock 创建 VllmConfig，避免访问 HuggingFace。如需修改模型参数，在 `_create_test_vllm_config()` 中调整：
+测试使用 MagicMock 创建 VllmConfig，避免访问 HuggingFace。如需修改模型参数，通过 `_create_test_vllm_config()` 的 `TestConnectorConfig` 调整：
 
 ```python
-vllm_config.model_config.get_num_layers.return_value = 12
-vllm_config.model_config.get_num_kv_heads.return_value = 8
-vllm_config.model_config.get_head_size.return_value = 64
+self._test_config.num_layers = 12
+self._test_config.num_kv_heads = 8
+self._test_config.head_size = 64
 ```
 
-### 5. 端口冲突
+或直接传入参数覆盖：
+```python
+config = self._create_test_vllm_config(
+    instance_id="custom_instance",
+    coordinator_base_port=50001,
+)
+```
 
-测试框架自动分配端口，但并行运行多个测试可能导致端口冲突。`TestBase` 使用端口范围哈希来减少冲突概率。
+### 6. 端口冲突
 
-### 6. 资源清理
+测试框架自动分配端口，但并行运行多个测试可能导致端口冲突。`TestBase` 使用端口范围哈希来减少冲突概率。`_get_free_port()` 使用 bind-then-release 方式获取空闲端口，存在 TOCTOU 窗口。
 
-测试结束后会自动清理资源。测试工作目录位于 bazel runfiles 目录中（`~/.cache/bazel/.../runfiles/kv_cache_manager/integration_test/test_xxx/`），不会污染源代码目录。
+### 7. 资源清理
+
+测试结束后会自动清理资源。测试工作目录位于 bazel runfiles 目录中，不会污染源代码目录。
 
 如果测试异常退出，可能需要手动清理：
 
@@ -225,14 +385,31 @@ pkill -f kv_cache_manager_bin
 bazel clean --expunge
 ```
 
-### 7. CUDA Mock 局限性
+### 8. CUDA Mock 局限性
 
 Mock 仅模拟基本的 Stream/Event 行为，不支持：
 - 真实的 GPU 内存分配
 - CUDA 计算操作
 - 多 GPU 场景
 
-如需测试这些功能，需要在有 GPU 的环境中运行。
+`batch_gather_scatter_helper` 中的 GPU 内核被替换为空操作，因此 Worker 侧的实际数据传输（gather/scatter）不会执行。如需测试这些功能，需要在有 GPU 的环境中运行。
+
+## 已知限制
+
+### 无存储后端时的测试边界
+
+当前测试环境未配置存储后端（`storage_configs` 为空），导致以下流程无法被真正执行：
+
+- `start_write_cache` 返回空 `locations`，保存走 `canceled` 路径
+- `wait_for_save` → `DataTransferManager.save_task` → `batch_gather_kv_caches` → `TransferClient.SaveKvCaches` 链路未执行
+- Worker 侧 coordinator 不会收到 save/load finished 事件
+- `test_write_then_read_kvcache` 中 Instance B 的读取匹配验证包裹在 `if matched_b > 0` 中，如果异步保存未在 sleep 窗口内完成，该验证会被跳过
+
+要进行完整的端到端数据传输测试，需要配置可用的存储后端（如本地文件系统后端）。
+
+### 测试性能
+
+每个测试方法都会重启一次 KV Cache Manager 服务（约 2-3 秒），15 个测试总计约 40 秒。如需优化，可考虑在同一 TestClass 内通过 `setUpClass` 复用 Manager 实例（需解决测试间状态隔离）。
 
 ## 常见问题
 
@@ -250,6 +427,18 @@ bazel test //integration_test/vllm_connector:xxx --test_timeout=300
 ### Q: Bazel 使用旧的测试结果
 
 A: 使用 `--cache_test_results=no` 或删除测试日志后重新运行。
+
+### Q: `request_finished` 后请求仍在 `_alive_requests` 中
+
+A: 异步保存尚未完成（`scheduled_saving_count != sent_saving_count`）。需要等待异步保存并通过额外的 `build_connector_meta` 收集结果后再调用 `request_finished`。参见「异步保存流程与测试要点」章节。
+
+### Q: 导入报错 `ModuleNotFoundError: No module named 'triton.xxx'`
+
+A: 检查 `apply_cuda_patches()` 是否在 `import vllm` **之前**被调用。如果已安装 triton 但版本不兼容，可尝试 `pip install triton>=3.3.0`。
+
+### Q: Worker 侧 `_alive_requests` 未被清理
+
+A: 这是无存储后端测试环境的预期行为。Worker 的 `get_finished()` 依赖 coordinator server 报告保存/加载完成，而无真实数据传输时 coordinator 不会收到完成事件。测试断言应以 Scheduler 侧为主。
 
 ### Q: 如何查看服务端日志
 

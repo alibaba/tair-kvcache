@@ -23,9 +23,10 @@ vLLM Connector 集成测试基类
 """
 
 import abc
+import time
 import unittest
 import torch
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 from dataclasses import dataclass
 
 from testlib.test_base import TestBase
@@ -116,13 +117,22 @@ class VllmConnectorTestBase(abc.ABC, TestBase, unittest.TestCase):
             s.bind(('', 0))
             return s.getsockname()[1]
     
-    def _get_test_extra_config(self) -> Dict[str, Any]:
-        """创建测试用 kv_connector_extra_config"""
+    def _get_test_extra_config(
+        self,
+        instance_id: Optional[str] = None,
+        coordinator_base_port: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """创建测试用 kv_connector_extra_config
+
+        Args:
+            instance_id: 可选覆盖 instance_id，用于多 instance 测试
+            coordinator_base_port: 可选覆盖 coordinator_base_port
+        """
         return {
             "manager_uri": self._test_config.manager_uri,
-            "coordinator_base_port": self._test_config.coordinator_base_port,
+            "coordinator_base_port": coordinator_base_port or self._test_config.coordinator_base_port,
             "instance_group": self._test_config.instance_group,
-            "instance_id": self._test_config.instance_id,
+            "instance_id": instance_id or self._test_config.instance_id,
             "preferred_block_size": self._test_config.preferred_block_size,
             "async_get_cache_location": False,  # 同步查询以简化测试
         }
@@ -138,22 +148,35 @@ class VllmConnectorTestBase(abc.ABC, TestBase, unittest.TestCase):
             "pp_size": 1,
         }
     
-    def _create_test_vllm_config(self):
+    def _create_test_vllm_config(
+        self,
+        instance_id: Optional[str] = None,
+        coordinator_base_port: Optional[int] = None,
+    ):
         """创建测试用 VllmConfig
-        
+
+        Args:
+            instance_id: 可选覆盖 instance_id，用于多 instance 测试
+            coordinator_base_port: 可选覆盖 coordinator_base_port
+
         Returns:
             VllmConfig 对象（mock），配置了测试所需的参数
-            
+
         注意：使用 MagicMock 避免 vLLM 访问 HuggingFace 下载模型配置
         """
         from unittest.mock import MagicMock
         from vllm.config import KVTransferConfig
-        
+
+        extra_config = self._get_test_extra_config(
+            instance_id=instance_id,
+            coordinator_base_port=coordinator_base_port,
+        )
+
         # 创建 KVTransferConfig - 这个是真实的，包含 connector 配置
         kv_transfer_config = KVTransferConfig(
             kv_connector="TairKvCacheConnector",
             kv_role="kv_both",
-            kv_connector_extra_config=self._get_test_extra_config(),
+            kv_connector_extra_config=extra_config,
         )
         
         # 使用 MagicMock 创建 VllmConfig 避免网络请求
@@ -311,15 +334,80 @@ class VllmConnectorTestBase(abc.ABC, TestBase, unittest.TestCase):
     
     def _create_mock_kv_cache_blocks(self, block_ids: list):
         """创建 Mock KVCacheBlocks 对象
-        
+
         Args:
             block_ids: block ID 列表
-        
+
         Returns:
             Mock KVCacheBlocks 对象
         """
         from unittest.mock import MagicMock
-        
+
         blocks = MagicMock()
         blocks.get_block_ids = MagicMock(return_value=[block_ids])
         return blocks
+
+    def _create_mock_scheduled_new_req(
+        self,
+        req_id: str,
+        token_ids: List[int],
+        block_ids: List[int],
+    ):
+        """创建 Mock 的 SchedulerOutput.scheduled_new_reqs 元素
+
+        模拟 vllm 新调度请求的数据结构。
+
+        Args:
+            req_id: 请求 ID
+            token_ids: token ID 列表
+            block_ids: 分配的 block ID 列表
+
+        Returns:
+            Mock scheduled_new_req 对象
+        """
+        from unittest.mock import MagicMock
+
+        scheduled_new_req = MagicMock()
+        scheduled_new_req.req_id = req_id
+        scheduled_new_req.block_ids = [block_ids]  # 外层 list 对应 KV cache groups
+        scheduled_new_req.token_ids = token_ids
+        return scheduled_new_req
+
+    def _simulate_engine_step(
+        self,
+        scheduler_connector,
+        worker_connector,
+        scheduler_output,
+    ):
+        """模拟一个完整的 vllm 引擎步骤
+
+        按照 vllm 引擎的实际调用顺序执行:
+        build_connector_meta → bind → start_load → wait_for_save → get_finished → clear
+
+        Args:
+            scheduler_connector: Scheduler 角色的 Connector
+            worker_connector: Worker 角色的 Connector
+            scheduler_output: Mock SchedulerOutput 对象
+
+        Returns:
+            tuple: (meta, finished_saving, finished_loading)
+        """
+        # 1. Scheduler: build meta
+        meta = scheduler_connector.build_connector_meta(scheduler_output)
+
+        # 2. Worker: bind metadata
+        worker_connector.bind_connector_metadata(meta)
+
+        # 3. Worker: start_load_kv (需要 forward_context，但在测试中可以传 None)
+        from unittest.mock import MagicMock
+        mock_forward_ctx = MagicMock()
+        worker_connector.start_load_kv(mock_forward_ctx)
+
+        # 4. Worker: wait_for_save
+        worker_connector.wait_for_save()
+
+        # 5. Worker: get_finished
+        finished_req_ids = set()
+        finished_saving, finished_loading = worker_connector.get_finished(finished_req_ids)
+
+        return meta, finished_saving, finished_loading
