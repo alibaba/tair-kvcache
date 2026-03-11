@@ -45,13 +45,16 @@ def install_aiohttp_json_hijack(
 
 def main(argv: Sequence[str]) -> int:
     p = argparse.ArgumentParser()
-    _, bench_args = p.parse_known_args(argv)
+    p.add_argument(
+        "--hijack-module", type=str, default="hisim.simulation.bench_serving"
+    )
+    args, bench_args = p.parse_known_args(argv)
 
     install_aiohttp_json_hijack(hijack_url_regex=r"/v1/(chat/)?completions|generate$")
 
     try:
         sys.argv = [sys.argv[0]] + list(bench_args)
-        runpy.run_module("sglang.bench_serving", run_name="__main__")
+        runpy.run_module(args.hijack_module, run_name="__main__")
     finally:
         sys.argv = sys.argv
 
