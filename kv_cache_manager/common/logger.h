@@ -21,6 +21,11 @@
         }                                                                                                              \
     } while (0)
 
+#define KVCM_LOG_ONCE_DEBUG(format, ...) KVCM_LOG_ONCE(kv_cache_manager::Logger::LEVEL_DEBUG, format, ##__VA_ARGS__)
+#define KVCM_LOG_ONCE_INFO(format, ...) KVCM_LOG_ONCE(kv_cache_manager::Logger::LEVEL_INFO, format, ##__VA_ARGS__)
+#define KVCM_LOG_ONCE_WARN(format, ...) KVCM_LOG_ONCE(kv_cache_manager::Logger::LEVEL_WARN, format, ##__VA_ARGS__)
+#define KVCM_LOG_ONCE_ERROR(format, ...) KVCM_LOG_ONCE(kv_cache_manager::Logger::LEVEL_ERROR, format, ##__VA_ARGS__)
+
 #define KVCM_INTERVAL_LOG_DEBUG(interval, format, ...)                                                                 \
     KVCM_INTERVAL_LOG(interval, kv_cache_manager::Logger::LEVEL_DEBUG, format, ##__VA_ARGS__)
 #define KVCM_INTERVAL_LOG_INFO(interval, format, ...)                                                                  \
@@ -38,6 +43,15 @@
     KVCM_PERIOD_LOG(period_s, kv_cache_manager::Logger::LEVEL_WARN, format, ##__VA_ARGS__)
 #define KVCM_PERIOD_LOG_ERROR(period_s, format, ...)                                                                   \
     KVCM_PERIOD_LOG(period_s, kv_cache_manager::Logger::LEVEL_ERROR, format, ##__VA_ARGS__)
+
+#define KVCM_LOG_ONCE(level, format, ...)                                                                               \
+    do {                                                                                                               \
+        static bool logged_ = false;                                                                                   \
+        if (!logged_ && kv_cache_manager::LoggerBroker::IsLevelEnable(level)) {                                        \
+            kv_cache_manager::LoggerBroker::Log(level, __FILE__, __LINE__, __func__, format, ##__VA_ARGS__);           \
+            logged_ = true;                                                                                            \
+        }                                                                                                              \
+    } while (0)
 
 #define KVCM_INTERVAL_LOG(interval, level, format, ...)                                                                \
     do {                                                                                                               \
