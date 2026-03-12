@@ -1,7 +1,11 @@
 # 项目文档
 
+### 设计文档
+- [基本概念](design/basic_concepts.md) - Storage、Instance Group、Instance、Block、CacheLocation 等核心概念
+
 ### 开发文档
 - [开发指南](develop/README.md) - 开发者入门指南和开发环境配置
+- [vLLM Connector 集成测试](develop/vllm_connector_integration_test.md) - 测试框架、用例说明、调试与日志
 - [API 文档](api/) - API 接口说明和使用示例
 
 ### 部署文档

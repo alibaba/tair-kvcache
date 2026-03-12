@@ -384,17 +384,7 @@ config = self._create_test_vllm_config(
 
 ### 7. 资源清理
 
-测试结束后会自动清理资源。测试工作目录位于 bazel runfiles 目录中，不会污染源代码目录。
-
-如果测试异常退出，可能需要手动清理：
-
-```bash
-# 清理残留进程
-pkill -f kv_cache_manager_bin
-
-# 清理 bazel 测试缓存（可选）
-bazel clean --expunge
-```
+测试结束后会自动清理资源。手动清理方法见[开发文档的资源清理章节](README.md#资源清理)。
 
 ### 8. CUDA Mock 局限性
 
@@ -407,47 +397,28 @@ Mock 仅模拟基本的 Stream/Event 行为，不支持：
 
 ## 调试与日志
 
-集成测试涉及三个独立的日志源，排查问题时通常需要交叉对比。
+通用的调试方法（Manager Server 日志、TransferClient 日志、排查流程、资源清理）请参见[开发文档的调试章节](README.md#调试)。以下仅记录 vLLM Connector 集成测试的特定调试技巧。
 
-### 1. Manager Server 日志（C++）
+### vLLM Connector 特定的日志查找
 
-Manager 以独立进程运行，日志写入其工作目录下的文件。
-
-**日志位置**（在 bazel test 的 runfiles 目录中，每个测试方法独立）：
-
-```
-# 结构化日志（包含 HTTP 请求/响应、FinishWriteCache、GetCacheLocation 等）
-<runfiles>/integration_test/<test_method_name>/worker_0/logs/kv_cache_manager.log
-
-# 标准输出/错误（启动信息、signal 处理）
-<runfiles>/integration_test/<test_method_name>/worker_0/stdout
-<runfiles>/integration_test/<test_method_name>/worker_0/stderr
-
-# 其他日志
-<runfiles>/integration_test/<test_method_name>/worker_0/logs/access.log
-<runfiles>/integration_test/<test_method_name>/worker_0/logs/event_publisher.log
-```
-
-**快速查找**：
+**快速查找 Manager 日志**：
 
 ```bash
-# 找到所有 Manager 日志
+# 找到 vllm_connector 测试的所有 Manager 日志
 find ~/.cache/bazel -name "kv_cache_manager.log" -path "*vllm_connector*"
 
 # 查看特定测试的 Manager 日志
 find ~/.cache/bazel -path "*test_write_then_read_kvcache*/kv_cache_manager.log" | xargs cat
 ```
 
-**日志级别控制**：Manager 启动时通过 `--env kvcm.logger.log_level=5` 设置（5=DEBUG），这由 TestBase 框架自动配置。
-
-**关键日志模式**（排查写入/查询问题时）：
+**启用 TransferClient DEBUG 日志**：
 
 ```bash
-# 查看 RegisterInstance、StartWriteCache、FinishWriteCache、GetCacheLocation 关键事件
-grep -E "Register|StartWrite|FinishWrite|GetCacheLocation|error|warn" kv_cache_manager.log
+bazel test //integration_test/vllm_connector:connector_lifecycle_test \
+    --test_env=KVCM_LOG_LEVEL=DEBUG
 ```
 
-### 2. Python Connector 日志
+### Python Connector 日志
 
 Connector 的 Python 日志通过 `kv_cache_manager/py_connector/common/logger.py` 配置，输出到 stderr（被 bazel 捕获到 test.log）。
 
@@ -473,34 +444,9 @@ handler.setLevel(logging.DEBUG)
 grep -E "start transfer|done transfer|finish_write_cache|matched_count|save task failed|ER_" test.log
 ```
 
-### 3. TransferClient 日志（C++ SDK，运行在 Connector 进程内）
+### vLLM Connector 排查流程
 
-TransferClient 是 C++ pybind 模块，日志写入当前工作目录的 `logs/` 子目录。
-
-**日志位置**：
-
-```
-<runfiles>/logs/kv_cache_manager_client.log
-```
-
-**日志级别控制**：通过环境变量 `KVCM_LOG_LEVEL` 设置：
-
-```bash
-# 运行测试时启用 DEBUG 级别
-bazel test //integration_test/vllm_connector:connector_lifecycle_test \
-    --test_env=KVCM_LOG_LEVEL=DEBUG
-```
-
-**关键日志模式**（排查 NFS 读写问题时）：
-
-```bash
-# 查看 SDK 初始化、文件操作、Alloc 错误
-grep -E "DoPut|DoGet|Alloc failed|Init|SdkWrapper" kv_cache_manager_client.log
-```
-
-### 排查流程建议
-
-典型的写入-查询问题排查顺序：
+典型的写入-查询问题排查顺序（通用排查流程见[开发文档](README.md#排查流程建议)）：
 
 1. **Python Connector 日志**：确认 `start_write_cache` 返回了 locations、`save_task` 是否成功（`ER_OK` vs `ER_SDKALLOC_ERROR`）、`finish_write_cache` 是否报 Connection refused
 2. **TransferClient 日志**：如果 `save_task` 失败，查看 `kv_cache_manager_client.log` 中的 `Alloc failed` 或 `DoPut` 错误
@@ -513,22 +459,6 @@ grep -E "DoPut|DoGet|Alloc failed|Init|SdkWrapper" kv_cache_manager_client.log
 每个测试方法都会重启一次 KV Cache Manager 服务（约 2-3 秒），15 个测试总计约 40 秒。如需优化，可考虑在同一 TestClass 内通过 `setUpClass` 复用 Manager 实例（需解决测试间状态隔离）。
 
 ## 常见问题
-
-### Q: 测试显示 "instance group not found"
-
-A: 确保使用 `"default"` 作为 instance_group，或在测试前创建自定义 group。
-
-### Q: 测试超时
-
-A: 增加超时时间：
-```bash
-bazel test //integration_test/vllm_connector:xxx --test_timeout=300
-```
-
-### Q: Bazel 使用旧的测试结果
-
-A: 使用 `--cache_test_results=no` 或删除测试日志后重新运行。
-
 ### Q: `request_finished` 后请求仍未清理
 
 A: 异步保存尚未完成（`scheduled_saving_count != sent_saving_count`）。使用 `_poll_engine_until_save_collected` 轮询引擎步骤直到异步保存结果被收集，然后再调用 `request_finished`。参见「异步保存流程与测试要点」章节。
@@ -540,13 +470,6 @@ A: 检查 `apply_cuda_patches()` 是否在 `import vllm` **之前**被调用。�
 ### Q: Worker 侧请求未被清理
 
 A: 这是无存储后端测试环境的预期行为。Worker 的 `get_finished()` 依赖 coordinator server 报告保存/加载完成，而无真实数据传输时 coordinator 不会收到完成事件。测试断言应以 Scheduler 侧的公开 API 返回值为主。
-
-### Q: 如何查看服务端日志
-
-A: 查看 worker 目录下的日志文件：
-```bash
-find ~/.cache/bazel -name "kv_cache_manager.log" -path "*vllm_connector*" | xargs tail -100
-```
 
 ## 参考资料
 
