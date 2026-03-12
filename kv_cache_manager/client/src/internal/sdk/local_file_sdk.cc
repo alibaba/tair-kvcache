@@ -1,5 +1,6 @@
 #include "kv_cache_manager/client/src/internal/sdk/local_file_sdk.h"
 
+#include <cerrno>
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
@@ -291,9 +292,22 @@ ClientErrorCode LocalFileSdk::DoPut(const std::vector<DataStorageUri> &remote_ur
     }
 
     if (fallocate(fd, 0, 0, required_size) != 0) {
-        KVCM_LOG_ERROR("Put failed, fallocate file %s failed", file_path.c_str());
-        close(fd);
-        return ER_FILE_IO_ERROR;
+        if (errno == EOPNOTSUPP) {
+            KVCM_LOG_ONCE_WARN("fallocate file %s failed with EOPNOTSUPP, falling back to ftruncate. "
+                               "This warning will only be printed once.",
+                               file_path.c_str());
+        } else {
+            KVCM_LOG_WARN("fallocate file %s failed (errno=%d), falling back to ftruncate", file_path.c_str(), errno);
+        }
+        // TODO(xiyu.wxy): ftruncate does not guarantee disk space allocation like fallocate does.
+        // When used together with RegisterCuda (cudaHostRegister), if the underlying pages are not
+        // physically backed (e.g. sparse file), subsequent cuda memcpy may fail. Need to further
+        // handle this corner case.
+        if (ftruncate(fd, required_size) != 0) {
+            KVCM_LOG_ERROR("Put failed, ftruncate file %s also failed (errno=%d)", file_path.c_str(), errno);
+            close(fd);
+            return ER_FILE_IO_ERROR;
+        }
     }
 
     if (0 == required_size) {
