@@ -7,6 +7,7 @@ py_library(
 
 py_library(
     name = "vllm_connector_cases",
+    testonly = True,
     srcs = ["vllm_connector_cases.py"],
     data = [
         "//kv_cache_manager:kv_cache_manager_bin",
@@ -15,6 +16,7 @@ py_library(
     deps = [
         ":mock_cuda",
         "//integration_test/testlib:test_base",
+        "//integration_test/admin_service:http_interface_test",
         "//kv_cache_manager/py_connector/vllm:vllm_connector",
     ],
 )

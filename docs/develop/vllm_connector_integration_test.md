@@ -94,7 +94,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 | `_create_mock_kv_caches(num_layers, num_blocks, ...)` | 创建 CPU 上的 Mock KV Cache 张量 |
 | `_create_mock_kv_cache_blocks(block_ids)` | 创建 Mock KVCacheBlocks |
 | `_create_mock_scheduled_new_req(req_id, token_ids, block_ids)` | 创建 Mock scheduled_new_req 元素 |
-| `_simulate_engine_step(scheduler, worker, scheduler_output)` | 模拟完整的 vllm 引擎步骤 |
+| `_simulate_engine_step(scheduler, worker, scheduler_output)` | 模拟完整的 vllm 引擎步骤（含 `get_block_ids_with_load_errors` 和 `clear_connector_metadata`） |
+| `_poll_engine_until_save_collected(scheduler, worker, expected_count, ...)` | 轮询引擎步骤直到收集到预期数量的 SaveRequest（替代 `time.sleep`） |
+| `_poll_until_cache_queryable(scheduler, request, ...)` | 轮询 `get_num_new_matched_tokens` 直到 Manager 中缓存数据可查询（替代 `time.sleep`） |
 | `_get_free_port()` | 获取空闲端口用于 coordinator |
 
 ### 3. 测试用例
@@ -110,34 +112,40 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 
 #### ConnectorKVCacheWriteReadTest 详解
 
-该测试类创建两个 vllm instance（A 和 B），各自有独立的 Scheduler + Worker Connector 对，模拟真实的多 instance KV Cache 共享场景。
+该测试类创建两套独立的 Scheduler+Worker Connector 对（A 和 B），共享同一个 `instance_id`，使用不同的 coordinator 端口，模拟同一 instance group 内的两个引擎进程。
 
-**test_write_then_read_kvcache — 完整读写流程**：
+> **注意**：MetaIndexer 按 `instance_id` 隔离，不支持跨 instance 查询。写入和读取匹配必须在同一个 `instance_id` 上进行。两套 Connector 对共享 instance_id，因此 Manager 侧使用同一个 MetaSearcher。
+
+**test_write_then_read_kvcache — 两套 Connector 对写入后读取**：
 
 ```
-Instance A (写入方)                    Instance B (读取方)
-─────────────────                    ─────────────────
-get_num_new_matched_tokens → 0
+Connector 对 A (scheduler_a + worker_a)
+─────────────────
+get_num_new_matched_tokens → 0 (首次无缓存)
 update_state_after_alloc
-build_connector_meta
-  └→ start_save_kvcache_async (异步)
-bind_connector_metadata (Worker)
-wait_for_save / get_finished
-                                     get_num_new_matched_tokens → matched > 0
-time.sleep(2) 等待异步保存              update_state_after_alloc
-第二轮 build_connector_meta            build_connector_meta (含 LoadRequest)
-  └→ 收集 SaveRequest                  bind_connector_metadata (Worker)
-                                     start_load_kv / get_finished
-request_finished                     request_finished
+engine_step → start_save_kvcache_async (异步)
+_poll_engine_until_save_collected (轮询收集 SaveRequest)
+第二轮 engine_step (decode token, 处理 cached req)
+request_finished (完成写请求)
+engine_step → 推送 FinishRequest
+
+Connector 对 B (scheduler_b + worker_b, 同一 instance_id):
+_poll_until_cache_queryable → matched > 0 (轮询直到数据可查)
+update_state_after_alloc
+engine_step (含 LoadRequest)
+request_finished
 ```
 
 **test_single_instance_write_and_query — 单 instance 写后查询**：
 - 同一个 instance 先写入再用新 request_id 查询，验证 getCacheLocation 接口
+- 使用 `_poll_engine_until_save_collected` 等待异步保存收集
+- 使用 `_poll_until_cache_queryable` 等待 Manager 数据可查
 
 **test_multiple_requests_lifecycle — 多请求并发**：
 - 3 个请求同时创建、分配、执行引擎步骤
-- 验证 `_alive_requests` 字典的正确管理
-- 关键：需要 `time.sleep` + 额外 `build_connector_meta` 等待异步保存结果回传后再调用 `request_finished`
+- 验证请求生命周期通过公开 API 的正确管理
+- 使用 `_poll_engine_until_save_collected` 等待 3 个异步保存收集完成
+- 通过 `request_finished()` 返回值验证请求清理（而非直接访问内部状态）
 
 ## 运行测试
 
@@ -289,27 +297,30 @@ build_connector_meta()
 
 因此测试中需要：
 
-1. **等待异步 HTTP 完成**：`time.sleep(2)` 等待 `start_save_kvcache_async`
-2. **额外 build_connector_meta**：收集异步保存结果，同步 `sent_saving_count`
-3. **之后才能 request_finished**：否则请求会留在 `_alive_requests` 中
+1. **轮询等待异步 HTTP 完成**：使用 `_poll_engine_until_save_collected` 反复执行引擎步骤，直到 `build_connector_meta` 收集到预期数量的 SaveRequest
+2. **之后才能 request_finished**：此时 `scheduled_saving_count == sent_saving_count`，请求可以被正常清理
 
 ```python
 # 第一轮：触发保存
 self._simulate_engine_step(scheduler, worker, sched_out)
 
-# 等待异步保存完成
-time.sleep(2)
-
-# 第二轮：收集保存结果
-self._simulate_engine_step(scheduler, worker, empty_sched_out)
+# 轮询收集异步保存结果（替代 time.sleep）
+self._poll_engine_until_save_collected(scheduler, worker, expected_count=1)
 
 # 现在可以安全完成请求
 scheduler.request_finished(request, block_ids)
 ```
 
+如果需要等待完整保存管道完成后验证 Manager 数据可查，使用 `_poll_until_cache_queryable`：
+
+```python
+# 轮询直到 Manager 中数据可查（替代 time.sleep(5)）
+matched, has_match = self._poll_until_cache_queryable(scheduler, probe_request)
+```
+
 ### Worker 侧清理的局限
 
-在无存储后端的测试环境中，Worker 侧的 `get_finished()` 通过 coordinator server 查询保存完成状态。由于没有真实的数据传输，coordinator 永远不会收到完成事件，因此 Worker 侧的 `_alive_requests` 可能不会被完全清理。测试断言应以 Scheduler 侧为主。
+在无存储后端的测试环境中，Worker 侧的 `get_finished()` 通过 coordinator server 查询保存完成状态。由于没有真实的数据传输，coordinator 永远不会收到完成事件，因此 Worker 侧的请求可能不会被完全清理。测试断言应以 Scheduler 侧的公开 API 返回值为主，不直接访问内部状态。
 
 ## 注意事项
 
@@ -394,18 +405,108 @@ Mock 仅模拟基本的 Stream/Event 行为，不支持：
 
 `batch_gather_scatter_helper` 中的 GPU 内核被替换为空操作，因此 Worker 侧的实际数据传输（gather/scatter）不会执行。如需测试这些功能，需要在有 GPU 的环境中运行。
 
+## 调试与日志
+
+集成测试涉及三个独立的日志源，排查问题时通常需要交叉对比。
+
+### 1. Manager Server 日志（C++）
+
+Manager 以独立进程运行，日志写入其工作目录下的文件。
+
+**日志位置**（在 bazel test 的 runfiles 目录中，每个测试方法独立）：
+
+```
+# 结构化日志（包含 HTTP 请求/响应、FinishWriteCache、GetCacheLocation 等）
+<runfiles>/integration_test/<test_method_name>/worker_0/logs/kv_cache_manager.log
+
+# 标准输出/错误（启动信息、signal 处理）
+<runfiles>/integration_test/<test_method_name>/worker_0/stdout
+<runfiles>/integration_test/<test_method_name>/worker_0/stderr
+
+# 其他日志
+<runfiles>/integration_test/<test_method_name>/worker_0/logs/access.log
+<runfiles>/integration_test/<test_method_name>/worker_0/logs/event_publisher.log
+```
+
+**快速查找**：
+
+```bash
+# 找到所有 Manager 日志
+find ~/.cache/bazel -name "kv_cache_manager.log" -path "*vllm_connector*"
+
+# 查看特定测试的 Manager 日志
+find ~/.cache/bazel -path "*test_write_then_read_kvcache*/kv_cache_manager.log" | xargs cat
+```
+
+**日志级别控制**：Manager 启动时通过 `--env kvcm.logger.log_level=5` 设置（5=DEBUG），这由 TestBase 框架自动配置。
+
+**关键日志模式**（排查写入/查询问题时）：
+
+```bash
+# 查看 RegisterInstance、StartWriteCache、FinishWriteCache、GetCacheLocation 关键事件
+grep -E "Register|StartWrite|FinishWrite|GetCacheLocation|error|warn" kv_cache_manager.log
+```
+
+### 2. Python Connector 日志
+
+Connector 的 Python 日志通过 `kv_cache_manager/py_connector/common/logger.py` 配置，输出到 stderr（被 bazel 捕获到 test.log）。
+
+**日志位置**：
+
+```bash
+# bazel test 的标准输出，包含所有 [KVCM] 前缀的日志
+cat ~/.cache/bazel/.../testlogs/integration_test/vllm_connector/connector_lifecycle_test/test.log
+```
+
+**日志级别控制**：修改 `kv_cache_manager/py_connector/common/logger.py` 中的 `setLevel()`：
+
+```python
+# 默认 INFO，改为 DEBUG 可看到详细的 save/load 流程
+logger.setLevel(logging.DEBUG)
+handler.setLevel(logging.DEBUG)
+```
+
+**关键日志模式**：
+
+```bash
+# 查看数据传输、finish_write_cache、匹配结果
+grep -E "start transfer|done transfer|finish_write_cache|matched_count|save task failed|ER_" test.log
+```
+
+### 3. TransferClient 日志（C++ SDK，运行在 Connector 进程内）
+
+TransferClient 是 C++ pybind 模块，日志写入当前工作目录的 `logs/` 子目录。
+
+**日志位置**：
+
+```
+<runfiles>/logs/kv_cache_manager_client.log
+```
+
+**日志级别控制**：通过环境变量 `KVCM_LOG_LEVEL` 设置：
+
+```bash
+# 运行测试时启用 DEBUG 级别
+bazel test //integration_test/vllm_connector:connector_lifecycle_test \
+    --test_env=KVCM_LOG_LEVEL=DEBUG
+```
+
+**关键日志模式**（排查 NFS 读写问题时）：
+
+```bash
+# 查看 SDK 初始化、文件操作、Alloc 错误
+grep -E "DoPut|DoGet|Alloc failed|Init|SdkWrapper" kv_cache_manager_client.log
+```
+
+### 排查流程建议
+
+典型的写入-查询问题排查顺序：
+
+1. **Python Connector 日志**：确认 `start_write_cache` 返回了 locations、`save_task` 是否成功（`ER_OK` vs `ER_SDKALLOC_ERROR`）、`finish_write_cache` 是否报 Connection refused
+2. **TransferClient 日志**：如果 `save_task` 失败，查看 `kv_cache_manager_client.log` 中的 `Alloc failed` 或 `DoPut` 错误
+3. **Manager 日志**：确认 `FinishWriteCache` 是否被处理、`GetCacheLocation` 返回了多少 locations、`PrefixMatchBestLocationImpl` 的 return code（2 = key not found）
+
 ## 已知限制
-
-### 无存储后端时的测试边界
-
-当前测试环境未配置存储后端（`storage_configs` 为空），导致以下流程无法被真正执行：
-
-- `start_write_cache` 返回空 `locations`，保存走 `canceled` 路径
-- `wait_for_save` → `DataTransferManager.save_task` → `batch_gather_kv_caches` → `TransferClient.SaveKvCaches` 链路未执行
-- Worker 侧 coordinator 不会收到 save/load finished 事件
-- `test_write_then_read_kvcache` 中 Instance B 的读取匹配验证包裹在 `if matched_b > 0` 中，如果异步保存未在 sleep 窗口内完成，该验证会被跳过
-
-要进行完整的端到端数据传输测试，需要配置可用的存储后端（如本地文件系统后端）。
 
 ### 测试性能
 
@@ -428,17 +529,17 @@ bazel test //integration_test/vllm_connector:xxx --test_timeout=300
 
 A: 使用 `--cache_test_results=no` 或删除测试日志后重新运行。
 
-### Q: `request_finished` 后请求仍在 `_alive_requests` 中
+### Q: `request_finished` 后请求仍未清理
 
-A: 异步保存尚未完成（`scheduled_saving_count != sent_saving_count`）。需要等待异步保存并通过额外的 `build_connector_meta` 收集结果后再调用 `request_finished`。参见「异步保存流程与测试要点」章节。
+A: 异步保存尚未完成（`scheduled_saving_count != sent_saving_count`）。使用 `_poll_engine_until_save_collected` 轮询引擎步骤直到异步保存结果被收集，然后再调用 `request_finished`。参见「异步保存流程与测试要点」章节。
 
 ### Q: 导入报错 `ModuleNotFoundError: No module named 'triton.xxx'`
 
 A: 检查 `apply_cuda_patches()` 是否在 `import vllm` **之前**被调用。如果已安装 triton 但版本不兼容，可尝试 `pip install triton>=3.3.0`。
 
-### Q: Worker 侧 `_alive_requests` 未被清理
+### Q: Worker 侧请求未被清理
 
-A: 这是无存储后端测试环境的预期行为。Worker 的 `get_finished()` 依赖 coordinator server 报告保存/加载完成，而无真实数据传输时 coordinator 不会收到完成事件。测试断言应以 Scheduler 侧为主。
+A: 这是无存储后端测试环境的预期行为。Worker 的 `get_finished()` 依赖 coordinator server 报告保存/加载完成，而无真实数据传输时 coordinator 不会收到完成事件。测试断言应以 Scheduler 侧的公开 API 返回值为主。
 
 ### Q: 如何查看服务端日志
 
