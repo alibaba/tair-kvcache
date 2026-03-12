@@ -65,7 +65,14 @@ class C_TokenizerManagerHook(BaseHook):
 
         # When running with blocking mode, send the created time to schedule.
         def wrapped_send_one_request(self, obj, tokenized_obj, created_time):
-            setattr(tokenized_obj, "created_time", created_time)
+            if obj.__class__.__name__ == "GenerateReqInput":
+                if (
+                    tokenized_obj.sampling_params.custom_params is not None
+                    and "simulation" in tokenized_obj.sampling_params.custom_params
+                ):
+                    tokenized_obj.sampling_params.custom_params["simulation"][
+                        "server_created_time"
+                    ] = created_time
             return original_send_one_request(self, obj, tokenized_obj, created_time)
 
         target._send_one_request = wrapped_send_one_request
@@ -594,73 +601,66 @@ class C_SchedulerHook(BaseHook):
             if C_SchedulerHook.SIM_MODE == MockSimulationMode.BLOCKING:
                 recv_reqs.extend(original_recv_requests(self, *args, **kwargs))
             elif C_SchedulerHook.SIM_MODE == MockSimulationMode.OFFLINE:
-                total_request = -1
-
-                # Initialized
+                # Initializing
                 if not C_SchedulerHook.OFFLINE_RECV_ALL_REQUEST:
-                    while True:
-                        gen_requests = []
-                        extra_requests = []
-                        time.sleep(0.001)  # waiting requests
+                    gen_requests = []
+                    extra_requests = []
+                    time.sleep(0.05)  # waiting requests
 
-                        reqs = original_recv_requests(self, *args, **kwargs)
+                    reqs = original_recv_requests(self, *args, **kwargs)
 
-                        for req in reqs:
-                            if req.__class__.__name__ == "TokenizedGenerateReqInput":
-                                gen_requests.append(req)
-                            else:
-                                extra_requests.append(req)
+                    for req in reqs:
+                        if req.__class__.__name__ == "TokenizedGenerateReqInput":
+                            gen_requests.append(req)
+                        else:
+                            # Such as: /profile_start, /flush_cache, etc.
+                            extra_requests.append(req)
 
-                        # Add requests to future queue
-                        for req in gen_requests:
-                            sim_params = None
-                            if req.sampling_params.custom_params is not None:
-                                sim_params = req.sampling_params.custom_params.get("simulation")
-                            if sim_params is None:
-                                # There are some warm-up requests when starting the server without --skip-server-warmup.
-                                extra_requests.append(req)
-                                logger.warning("Failed to extract the simulation parameters required for simulation from the request. Ignore this warning if the request is a warm-up request.")
-                                continue
-                            C_SchedulerHook.FUTURE_QUEUE.append(
-                                (
-                                    sim_params["created_time"],
-                                    time.time_ns(),  # The request is not comparable, so add the salt to avoid comparison.
-                                    req,
-                                )
-                            )
-
-                        # Update the total number of requests
-                        if (
-                            total_request == -1
-                            and len(C_SchedulerHook.FUTURE_QUEUE) != 0
-                        ):
-                            _, _, gen_req = C_SchedulerHook.FUTURE_QUEUE[-1]
-                            total_request = gen_req.sampling_params.custom_params[
+                    # Add requests to future queue
+                    for req in gen_requests:
+                        sim_params = None
+                        if req.sampling_params.custom_params is not None:
+                            sim_params = req.sampling_params.custom_params.get(
                                 "simulation"
-                            ]["total_request"]
-                            logger.info(
-                                f"Offline simulation mode enabled. {total_request} requests expected."
                             )
+                        if sim_params is None:
+                            # There are some warm-up requests when starting the server without --skip-server-warmup.
+                            extra_requests.append(req)
+                            logger.warning(
+                                "Failed to extract the simulation parameters required for simulation from the request. Ignore this warning if the request is a warm-up request."
+                            )
+                            continue
+                        C_SchedulerHook.FUTURE_QUEUE.append(
+                            (
+                                sim_params["created_time"],
+                                time.time_ns(),  # The request is not comparable, so add the salt to avoid comparison.
+                                req,
+                            )
+                        )
 
-                        if len(extra_requests) != 0:
-                            # Schedule the extra requests immediately.
-                            return extra_requests
+                    if len(C_SchedulerHook.FUTURE_QUEUE) != 0:
+                        _, _, gen_req = C_SchedulerHook.FUTURE_QUEUE[-1]
+                        total_request = gen_req.sampling_params.custom_params[
+                            "simulation"
+                        ]["total_request"]
 
                         if len(C_SchedulerHook.FUTURE_QUEUE) == total_request:
+                            C_SchedulerHook.OFFLINE_RECV_ALL_REQUEST = True
+                            heapq.heapify(C_SchedulerHook.FUTURE_QUEUE)
                             logger.info(
                                 "All requests received. Starting simulation now."
                             )
-                            break
+                        else:
+                            logger.info(
+                                f"Offline simulation mode enabled. {total_request} requests expected in total. Received {len(C_SchedulerHook.FUTURE_QUEUE)} requests so far."
+                            )
+
+                    if len(extra_requests) != 0:
+                        # Schedule the extra requests immediately.
+                        return extra_requests
                 else:
                     # Extra requests include: flush request, abort request, etc.
                     recv_reqs.extend(original_recv_requests(self, *args, **kwargs))
-
-                if (
-                    not C_SchedulerHook.OFFLINE_RECV_ALL_REQUEST
-                    and len(C_SchedulerHook.FUTURE_QUEUE) == total_request
-                ):
-                    C_SchedulerHook.OFFLINE_RECV_ALL_REQUEST = True
-                    heapq.heapify(C_SchedulerHook.FUTURE_QUEUE)
 
                 # Process the arrived requests only after all requests have been added to the future queue
                 current_timestamp = StateManager.get_global_clock()
@@ -684,16 +684,18 @@ class C_SchedulerHook(BaseHook):
                     req_stats.rid = req.rid
                     req_stats.input_length = len(req.input_ids)
                     req_stats.output_length = req.sampling_params.max_new_tokens
+                    simulation_args = req.sampling_params.custom_params["simulation"]
                     if C_SchedulerHook.SIM_MODE == MockSimulationMode.BLOCKING:
-                        if not hasattr(req, "created_time"):
-                            logger.warning("Request's created time is missing.")
-                        req_stats.created_time = getattr(req, "created_time", now)
+                        if "server_created_time" not in simulation_args:
+                            logger.warning(
+                                "The request's creation time is missing, which may cause the TTFT to be inaccurate."
+                            )
+                        req_stats.created_time = simulation_args.get(
+                            "server_created_time", now
+                        )
                         req_stats.last_event_time = req_stats.created_time
                         req_stats.queue_start = now
                     elif C_SchedulerHook.SIM_MODE == MockSimulationMode.OFFLINE:
-                        simulation_args = req.sampling_params.custom_params[
-                            "simulation"
-                        ]
                         req_stats.created_time = simulation_args["created_time"]
                         req_stats.last_event_time = req_stats.created_time
                         req_stats.queue_start = StateManager.get_global_clock()

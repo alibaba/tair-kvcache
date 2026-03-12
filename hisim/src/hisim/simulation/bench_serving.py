@@ -924,6 +924,8 @@ class BenchmarkMetrics:
     concurrency: float
     max_output_tokens_per_s: float = 0.0
     max_concurrent_requests: int = 0
+    mean_queue_ms: float = 0.0
+    prefix_cache_reused_ratio: float = 0.0
 
 
 SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
@@ -1758,6 +1760,7 @@ async def get_request(
     request_rate: float,
     use_trace_timestamps: bool = False,
     slowdown_factor: float = 1.0,
+    timestamp_scale_s: float = 1000,  # 1000: ms -> s
 ) -> AsyncGenerator[DatasetRow, None]:
     if use_trace_timestamps:
         print(
@@ -1767,15 +1770,16 @@ async def get_request(
         input_requests.sort(key=lambda r: r.timestamp)
 
         start_time = time.perf_counter()
-        trace_start_time_ms = input_requests[0].timestamp if input_requests else 0
+        trace_start_time = input_requests[0].timestamp if input_requests else 0
 
         for request in input_requests:
-            trace_time_s = (request.timestamp - trace_start_time_ms) / 1000.0
+            trace_time_s = (request.timestamp - trace_start_time) / timestamp_scale_s
             target_arrival_time = start_time + (trace_time_s * slowdown_factor)
             # Hisim: simulation arguments
             request.simulation.update(
                 {
-                    "created_time": request.timestamp - trace_start_time_ms,
+                    "created_time": (request.timestamp - trace_start_time)
+                    / timestamp_scale_s,
                     "total_request": len(input_requests),
                 }
             )
@@ -2166,7 +2170,9 @@ async def benchmark(
         )
         pbar_total *= args.mooncake_num_rounds
     elif backend == "sglang" and args.dataset_name == "hisim-collection":
-        request_generator = get_request(input_requests, -1, use_trace_timestamps=True)
+        request_generator = get_request(
+            input_requests, -1, use_trace_timestamps=True, timestamp_scale_s=1
+        )
     else:
         request_generator = get_request(input_requests, request_rate)
 
@@ -2408,6 +2414,7 @@ async def benchmark(
             "median_ttft_ms": metrics.median_ttft_ms,
             "std_ttft_ms": metrics.std_ttft_ms,
             "p99_ttft_ms": metrics.p99_ttft_ms,
+            "mean_queue_ms": metrics.mean_queue_ms,
             "mean_tpot_ms": metrics.mean_tpot_ms,
             "median_tpot_ms": metrics.median_tpot_ms,
             "std_tpot_ms": metrics.std_tpot_ms,
@@ -2421,6 +2428,7 @@ async def benchmark(
             "accept_length": accept_length,
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
             "max_concurrent_requests": metrics.max_concurrent_requests,
+            "prefix_cache_reused_ratio": metrics.prefix_cache_reused_ratio,
         }
     else:
         print(f"Error running benchmark for request rate: {request_rate}")
