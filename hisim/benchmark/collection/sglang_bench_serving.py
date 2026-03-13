@@ -30,7 +30,7 @@ def install_aiohttp_json_hijack(
             payload = kwargs.get("json", None)
             if isinstance(payload, dict):
                 if "sampling_params" not in payload:
-                    payload["sample_params"] = {}
+                    payload["sampling_params"] = {}
                 if "custom_params" not in payload["sampling_params"]:
                     payload["sampling_params"]["custom_params"] = {}
                 payload["sampling_params"]["custom_params"]["client_created_time"] = (
@@ -50,7 +50,7 @@ def main(argv: Sequence[str]) -> int:
     )
     args, bench_args = p.parse_known_args(argv)
 
-    install_aiohttp_json_hijack(hijack_url_regex=r"/v1/(chat/)?completions|generate$")
+    install_aiohttp_json_hijack(hijack_url_regex=r"generate$")
 
     try:
         sys.argv = [sys.argv[0]] + list(bench_args)
