@@ -42,3 +42,29 @@ class BaseDataset:
             return self._name
         else:
             return self.__class__.__name__
+
+
+class SimpleDataset(BaseDataset):
+    def __init__(
+        self, tokenizer=None, args=None, reqs: list[GenericRequest] | None = None
+    ):
+        super().__init__(tokenizer, args)
+        self.data: list[GenericRequest] = []
+        if reqs is not None:
+            self.data.extend(reqs)
+
+    def add_request(self, req: GenericRequest):
+        self.data.append(req)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            start, stop, step = index.indices(len(self))
+            return [self[i] for i in range(start, stop, step)]
+
+        if index >= len(self):
+            raise IndexError
+
+        return self.data[index]
+
+    def __len__(self):
+        return len(self.data)

@@ -630,9 +630,15 @@ class C_SchedulerHook(BaseHook):
                                 "Failed to extract the simulation parameters required for simulation from the request. Ignore this warning if the request is a warm-up request."
                             )
                             continue
+                        if sim_params.get("queue_start"):
+                            logger.debug(
+                                "Add request to waiting queue with custom queue start timestamp."
+                            )
+
                         C_SchedulerHook.FUTURE_QUEUE.append(
                             (
-                                sim_params["created_time"],
+                                sim_params.get("queue_start")
+                                or sim_params["created_time"],
                                 time.time_ns(),  # The request is not comparable, so add the salt to avoid comparison.
                                 req,
                             )
@@ -668,8 +674,8 @@ class C_SchedulerHook(BaseHook):
                     C_SchedulerHook.OFFLINE_RECV_ALL_REQUEST
                     and len(C_SchedulerHook.FUTURE_QUEUE) > 0
                 ):
-                    created_time, _, req = C_SchedulerHook.FUTURE_QUEUE[0]
-                    if created_time > current_timestamp:
+                    enqueue_time, _, req = C_SchedulerHook.FUTURE_QUEUE[0]
+                    if enqueue_time > current_timestamp + 6e-3:
                         break
                     recv_reqs.append(req)
                     heapq.heappop(C_SchedulerHook.FUTURE_QUEUE)
@@ -698,6 +704,9 @@ class C_SchedulerHook(BaseHook):
                     elif C_SchedulerHook.SIM_MODE == MockSimulationMode.OFFLINE:
                         req_stats.created_time = simulation_args["created_time"]
                         req_stats.last_event_time = req_stats.created_time
+                        queue_start = simulation_args["queue_start"]
+                        if queue_start is not None:
+                            StateManager.set_global_clock(queue_start)
                         req_stats.queue_start = StateManager.get_global_clock()
 
             if recv_reqs and C_SchedulerHook.LAST_CPU_TS == 0:

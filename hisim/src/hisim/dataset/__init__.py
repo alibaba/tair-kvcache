@@ -1,6 +1,6 @@
 from transformers import PreTrainedTokenizer
 
-from hisim.dataset.base_dataset import BaseDataset, GenericRequest
+from hisim.dataset.base_dataset import BaseDataset, GenericRequest, SimpleDataset
 from hisim.dataset.random import (
     RandomDataset,
     RandomIDsDataset,
@@ -44,6 +44,7 @@ def get_dataset(
 
 __all__ = (
     "BaseDataset",
+    "SimpleDataset",
     "GenericRequest",
     "get_dataset",
 )
