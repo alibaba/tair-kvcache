@@ -659,155 +659,6 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
     return EC_OK;
 }
 
-ErrorCode
-CacheManager::CreateInSingleBatch(RequestContext *request_context,
-                                  const std::string &instance_id,
-                                  const CacheManager::KeyVector &keys,
-                                  const std::vector<std::string_view> &location_spec_group_names,
-                                  const std::shared_ptr<const InstanceInfo> &instance_info,
-                                  const std::shared_ptr<DataStorageManager> &data_storage_manager,
-                                  const std::string &unique_name,
-                                  std::vector<DataStorageUri> &allocated_uris,
-                                  std::vector<std::vector<std::pair<size_t, const LocationSpecInfo *>>> &key_to_uris,
-                                  bool &is_create_success,
-                                  int64_t common_size) {
-    SPAN_TRACER(request_context);
-    const std::string &trace_id = request_context->trace_id();
-    std::vector<std::string> merged_block_keys;
-    std::vector<size_t> merged_keys_idx;
-    std::vector<const LocationSpecInfo *> spec_info_mapping;
-    merged_block_keys.reserve(instance_info->location_spec_infos().size() * keys.size());
-    merged_keys_idx.reserve(instance_info->location_spec_infos().size() * keys.size());
-    spec_info_mapping.reserve(instance_info->location_spec_infos().size() * keys.size());
-
-    for (const auto &spec_info : instance_info->location_spec_infos()) {
-        if (location_spec_group_names.empty()) {
-            for (size_t i = 0; i < keys.size(); i++) {
-                std::string block_key = instance_id + "/" + spec_info.name() + "/" + StringUtil::Uint64ToHex(keys[i]);
-                merged_block_keys.push_back(block_key);
-                merged_keys_idx.push_back(i);
-                spec_info_mapping.push_back(&spec_info);
-            }
-        } else {
-            for (size_t i = 0; i < keys.size(); i++) {
-                auto [ec, found] = IsSpecNameInSpecGroup(trace_id,
-                                                         instance_id,
-                                                         spec_info.name(),
-                                                         location_spec_group_names[i],
-                                                         instance_info->location_spec_groups());
-                RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "IsSpecNameInSpecGroup failed");
-                if (found) {
-                    std::string block_key =
-                        instance_id + "/" + spec_info.name() + "/" + StringUtil::Uint64ToHex(keys[i]);
-                    merged_block_keys.push_back(block_key);
-                    merged_keys_idx.push_back(i);
-                    spec_info_mapping.push_back(&spec_info);
-                }
-            }
-        }
-    }
-
-    std::vector<std::pair<ErrorCode, DataStorageUri>> results = data_storage_manager->Create(
-        request_context, unique_name, merged_block_keys, common_size, []() { /* do nothing */ });
-
-    for (size_t i = 0; i < results.size(); i++) {
-        if (results[i].first == ErrorCode::EC_OK) {
-            allocated_uris.push_back(results[i].second);
-            key_to_uris[merged_keys_idx[i]].push_back({allocated_uris.size() - 1, spec_info_mapping[i]});
-        }
-    }
-    // TODO: move check to another function
-    if (results.size() != merged_block_keys.size()) {
-        is_create_success = false;
-        PREFIX_LOG(WARN,
-                   "create data storage fail, results size:%ld, request size: %ld",
-                   results.size(),
-                   merged_block_keys.size());
-    }
-    for (auto &result : results) {
-        if (result.first != ErrorCode::EC_OK) {
-            is_create_success = false;
-            PREFIX_LOG(WARN, "create data storage fail, ec_code: %d", result.first);
-            break;
-        }
-    }
-    return EC_OK;
-}
-
-ErrorCode CacheManager::CreateBySpec(RequestContext *request_context,
-                                     const std::string &instance_id,
-                                     const CacheManager::KeyVector &keys,
-                                     const std::vector<std::string_view> &location_spec_group_names,
-                                     const std::shared_ptr<const InstanceInfo> &instance_info,
-                                     const std::shared_ptr<DataStorageManager> &data_storage_manager,
-                                     const std::string &unique_name,
-                                     std::vector<DataStorageUri> &allocated_uris,
-                                     std::vector<std::vector<std::pair<size_t, const LocationSpecInfo *>>> &key_to_uris,
-                                     bool &is_create_success) {
-    // avoid use file across tp ranks
-    SPAN_TRACER(request_context);
-    const std::string &trace_id = request_context->trace_id();
-    for (const auto &spec_info : instance_info->location_spec_infos()) {
-        std::vector<std::string> block_keys;
-        std::vector<size_t> keys_idx;
-        block_keys.reserve(keys.size());
-        keys_idx.reserve(keys.size());
-        if (location_spec_group_names.empty()) {
-            for (size_t i = 0; i < keys.size(); i++) {
-                std::string block_key = instance_id + "/" + spec_info.name() + "/" + StringUtil::Uint64ToHex(keys[i]);
-                block_keys.push_back(block_key);
-                keys_idx.push_back(i);
-            }
-        } else {
-            for (size_t i = 0; i < keys.size(); i++) {
-                auto [ec, found] = IsSpecNameInSpecGroup(trace_id,
-                                                         instance_id,
-                                                         spec_info.name(),
-                                                         location_spec_group_names[i],
-                                                         instance_info->location_spec_groups());
-                RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "IsSpecNameInSpecGroup failed");
-                if (found) {
-                    std::string block_key =
-                        instance_id + "/" + spec_info.name() + "/" + StringUtil::Uint64ToHex(keys[i]);
-                    block_keys.push_back(block_key);
-                    keys_idx.push_back(i);
-                }
-            }
-        }
-
-        std::vector<std::pair<ErrorCode, DataStorageUri>> results = data_storage_manager->Create(
-            request_context, unique_name, block_keys, spec_info.size(), []() { /* do nothing */ });
-
-        for (size_t i = 0; i < results.size(); i++) {
-            if (results[i].first == ErrorCode::EC_OK) {
-                allocated_uris.push_back(results[i].second);
-                key_to_uris[keys_idx[i]].push_back({allocated_uris.size() - 1, &spec_info});
-            }
-        }
-
-        // TODO: move check to another function
-        if (results.size() != block_keys.size()) {
-            is_create_success = false;
-            PREFIX_LOG(WARN,
-                       "create data storage fail, results size:%ld, request size: %ld",
-                       results.size(),
-                       block_keys.size());
-        }
-        for (auto &result : results) {
-            if (result.first != ErrorCode::EC_OK) {
-                is_create_success = false;
-                PREFIX_LOG(WARN, "create data storage fail, ec_code: %d", result.first);
-                break;
-            }
-        }
-
-        if (!is_create_success) {
-            break;
-        }
-    }
-    return EC_OK;
-}
-
 ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
                                          const std::string &instance_id,
                                          const CacheManager::KeyVector &keys,
@@ -838,46 +689,103 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
         request_context, instance_info->instance_group_name());
     RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, select_result.ec, "select storage backend failed");
 
+    // Build CreateBlocksRequest - resolve spec matching and group keys by spec
+    CreateBlocksRequest create_request;
+    create_request.instance_id = instance_id;
+    create_request.spec_block_keys.reserve(instance_info->location_spec_infos().size());
+
+    // Build a mapping from spec name to spec info for result processing
+    std::vector<const LocationSpecInfo *> spec_info_mapping;
+    spec_info_mapping.reserve(instance_info->location_spec_infos().size());
+
+    for (const auto &spec_info : instance_info->location_spec_infos()) {
+        SpecBlockKeys spec_block;
+        spec_block.spec_name = spec_info.name();
+        spec_block.spec_size = spec_info.size();
+
+        // Collect keys that belong to this spec
+        if (location_spec_group_names.empty()) {
+            // No group constraints - all keys go to all specs
+            spec_block.block_keys.reserve(keys.size());
+            spec_block.original_key_indices.reserve(keys.size());
+            for (size_t i = 0; i < keys.size(); i++) {
+                spec_block.block_keys.push_back(keys[i]);
+                spec_block.original_key_indices.push_back(i);
+            }
+        } else {
+            // Check each key against group constraints
+            for (size_t i = 0; i < keys.size(); i++) {
+                auto [ec, found] = IsSpecNameInSpecGroup(trace_id,
+                                                         instance_id,
+                                                         spec_info.name(),
+                                                         location_spec_group_names[i],
+                                                         instance_info->location_spec_groups());
+                RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "IsSpecNameInSpecGroup failed");
+                if (found) {
+                    spec_block.block_keys.push_back(keys[i]);
+                    spec_block.original_key_indices.push_back(i);
+                }
+            }
+        }
+
+        // Only add spec if it has keys to create
+        if (!spec_block.block_keys.empty()) {
+            create_request.spec_block_keys.push_back(std::move(spec_block));
+            spec_info_mapping.push_back(&spec_info);
+        }
+    }
+
+    // Call backend with structured request
+    auto create_result =
+        data_storage_manager->Create(request_context, select_result.name, create_request, []() { /* do nothing */ });
+
+    // key_to_uris[i]: all (uri, spec_info) pairs allocated for keys[i], across every spec
+    // allocated_uris: flat list of every uri allocated, used only for rollback on failure
+    using KeyUriEntry = std::pair<DataStorageUri, const LocationSpecInfo *>;
+    std::vector<std::vector<KeyUriEntry>> key_to_uris(keys.size());
     std::vector<DataStorageUri> allocated_uris;
     allocated_uris.reserve(instance_info->location_spec_infos().size() * keys.size());
-    std::vector<std::vector<std::pair<size_t, const LocationSpecInfo *>>> key_to_uris(keys.size());
     bool is_create_success = true;
 
-    bool merge = instance_info->location_spec_infos().empty() ||
-                 std::all_of(instance_info->location_spec_infos().begin() + 1,
-                             instance_info->location_spec_infos().end(),
-                             [&instance_info](const auto &spec) {
-                                 return spec.size() == instance_info->location_spec_infos().front().size();
-                             });
-    int64_t common_size = merge && !instance_info->location_spec_infos().empty()
-                              ? instance_info->location_spec_infos().front().size()
-                              : 0;
-
-    if (merge) {
-        auto ec = CreateInSingleBatch(request_context,
-                                      instance_id,
-                                      keys,
-                                      location_spec_group_names,
-                                      instance_info,
-                                      data_storage_manager,
-                                      select_result.name,
-                                      allocated_uris,
-                                      key_to_uris,
-                                      is_create_success,
-                                      common_size);
-        RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "CreateInSingleBatch failed");
+    // Process results - structured return aligns 1:1 with spec_block_keys
+    if (create_result.size() != create_request.spec_block_keys.size()) {
+        is_create_success = false;
+        PREFIX_LOG(WARN,
+                   "create data storage fail, results size:%ld, expected size: %ld",
+                   create_result.size(),
+                   create_request.spec_block_keys.size());
     } else {
-        auto ec = CreateBySpec(request_context,
-                               instance_id,
-                               keys,
-                               location_spec_group_names,
-                               instance_info,
-                               data_storage_manager,
-                               select_result.name,
-                               allocated_uris,
-                               key_to_uris,
-                               is_create_success);
-        RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "CreateBySpec failed");
+        for (size_t spec_idx = 0; spec_idx < create_request.spec_block_keys.size(); ++spec_idx) {
+            const auto &spec_block = create_request.spec_block_keys[spec_idx];
+            const auto &spec_result = create_result[spec_idx];
+            const LocationSpecInfo *spec_info = spec_info_mapping[spec_idx];
+
+            if (spec_result.size() != spec_block.block_keys.size()) {
+                is_create_success = false;
+                PREFIX_LOG(WARN,
+                           "create data storage fail, spec [%s] results size:%ld, expected size: %ld",
+                           spec_block.spec_name.c_str(),
+                           spec_result.size(),
+                           spec_block.block_keys.size());
+                break;
+            }
+
+            for (size_t key_idx = 0; key_idx < spec_result.size(); ++key_idx) {
+                const auto &[ec, uri] = spec_result[key_idx];
+                if (ec == ErrorCode::EC_OK) {
+                    size_t original_key_idx = spec_block.original_key_indices[key_idx];
+                    key_to_uris[original_key_idx].emplace_back(uri, spec_info);
+                    allocated_uris.push_back(uri);
+                } else {
+                    is_create_success = false;
+                    PREFIX_LOG(WARN, "create data storage fail, ec_code: %d", ec);
+                }
+            }
+
+            if (!is_create_success) {
+                break;
+            }
+        }
     }
 
     if (!is_create_success) {
@@ -905,10 +813,10 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
     for (const auto &uris : key_to_uris) {
         CacheLocation cache_location;
         cache_location.set_type(select_result.type);
-        for (const auto &[data_storage_uri_idx, location_spec_info] : uris) {
+        for (const auto &[uri, location_spec_info] : uris) {
             LocationSpec location_spec;
             location_spec.set_name(location_spec_info->name());
-            location_spec.set_uri(allocated_uris[data_storage_uri_idx].ToUriString());
+            location_spec.set_uri(uri.ToUriString());
             cache_location.push_location_spec(std::move(location_spec));
         }
         cache_location.set_spec_size(uris.size());

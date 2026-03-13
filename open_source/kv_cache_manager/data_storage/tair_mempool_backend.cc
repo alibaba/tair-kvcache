@@ -45,10 +45,9 @@ ErrorCode TairMempoolBackend::Close() {
     return EC_ERROR;
 }
 
-std::vector<std::pair<ErrorCode, DataStorageUri>> TairMempoolBackend::Create(const std::vector<std::string> &keys,
-                                                                             size_t size_per_key,
-                                                                             const std::string &trace_id,
-                                                                             std::function<void()> cb) {
+std::vector<SpecCreateResult> TairMempoolBackend::Create(const CreateBlocksRequest &request,
+                                                         const std::string &trace_id,
+                                                         std::function<void()> cb) {
     KVCM_LOG_ERROR("no implementation for TairMempoolBackend");
     return {};
 }

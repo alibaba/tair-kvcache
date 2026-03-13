@@ -1,10 +1,12 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/data_storage/common_define.h"
@@ -12,6 +14,23 @@
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
 namespace kv_cache_manager {
+
+// Block keys for a single spec
+struct SpecBlockKeys {
+    std::string spec_name;                     // e.g., "tp0", "Linear_TP0"
+    int64_t spec_size;                         // Size per key for this spec
+    std::vector<int64_t> block_keys;           // Raw key values
+    std::vector<size_t> original_key_indices;  // Mapping to caller's keys array indices
+};
+
+// Request object for creating blocks, extensible for future features (e.g., lifecycle groups)
+struct CreateBlocksRequest {
+    std::string instance_id;
+    std::vector<SpecBlockKeys> spec_block_keys;
+};
+
+// Per-spec create result, aligned 1:1 with CreateBlocksRequest::spec_block_keys
+using SpecCreateResult = std::vector<std::pair<ErrorCode, DataStorageUri>>;
 
 class DataStorageBackend {
 public:
@@ -42,10 +61,9 @@ public:
     }
     virtual ErrorCode DoOpen(const StorageConfig &config, const std::string &trace_id) = 0;
     virtual ErrorCode Close() = 0;
-    virtual std::vector<std::pair<ErrorCode, DataStorageUri>> Create(const std::vector<std::string> &keys,
-                                                                     size_t size_per_key,
-                                                                     const std::string &trace_id,
-                                                                     std::function<void()> cb) = 0;
+    virtual std::vector<SpecCreateResult> Create(const CreateBlocksRequest &request,
+                                                 const std::string &trace_id,
+                                                 std::function<void()> cb) = 0;
     virtual std::vector<ErrorCode>
     Delete(const std::vector<DataStorageUri> &storage_uris, const std::string &trace_id, std::function<void()> cb) = 0;
     virtual std::vector<bool> Exist(const std::vector<DataStorageUri> &storage_uris) = 0;

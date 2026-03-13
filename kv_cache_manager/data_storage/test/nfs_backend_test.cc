@@ -24,14 +24,24 @@ TEST_F(NfsBackendTest, TestSimple) {
         spec->set_root_path("/data/");
         StorageConfig storage_config(DataStorageType::DATA_STORAGE_TYPE_NFS, "test", spec);
         ASSERT_EQ(EC_OK, backend.Open(storage_config, "fake_trace_id_1"));
-        std::vector<std::string> keys = {"key1", "key2", "key3", "key4", "key5"};
-        auto results = backend.Create(keys, 128, "fake_trace_id_2", []() {});
-        ASSERT_EQ(results.size(), keys.size());
-        ASSERT_EQ("file:///data/key1?size=128", results[0].second.ToUriString());
-        ASSERT_EQ("file:///data/key2?size=128", results[1].second.ToUriString());
-        ASSERT_EQ("file:///data/key3?size=128", results[2].second.ToUriString());
-        ASSERT_EQ("file:///data/key4?size=128", results[3].second.ToUriString());
-        ASSERT_EQ("file:///data/key5?size=128", results[4].second.ToUriString());
+
+        CreateBlocksRequest request;
+        request.instance_id = "test_instance";
+        SpecBlockKeys spec_block;
+        spec_block.spec_name = "tp0";
+        spec_block.spec_size = 128;
+        spec_block.block_keys = {0x6b657931, 0x6b657932, 0x6b657933, 0x6b657934, 0x6b657935};
+        spec_block.original_key_indices = {0, 1, 2, 3, 4};
+        request.spec_block_keys.push_back(std::move(spec_block));
+
+        auto result = backend.Create(request, "fake_trace_id_2", []() {});
+        ASSERT_EQ(result.size(), 1);
+        ASSERT_EQ(result[0].size(), 5);
+        ASSERT_EQ("file:///data/test_instance/tp0/6b657931?size=128", result[0][0].second.ToUriString());
+        ASSERT_EQ("file:///data/test_instance/tp0/6b657932?size=128", result[0][1].second.ToUriString());
+        ASSERT_EQ("file:///data/test_instance/tp0/6b657933?size=128", result[0][2].second.ToUriString());
+        ASSERT_EQ("file:///data/test_instance/tp0/6b657934?size=128", result[0][3].second.ToUriString());
+        ASSERT_EQ("file:///data/test_instance/tp0/6b657935?size=128", result[0][4].second.ToUriString());
     }
     // 多个key一个文件的形式
     {
@@ -41,14 +51,24 @@ TEST_F(NfsBackendTest, TestSimple) {
         spec->set_root_path("/data/");
         StorageConfig storage_config(DataStorageType::DATA_STORAGE_TYPE_NFS, "test", spec);
         ASSERT_EQ(EC_OK, backend.Open(storage_config, "fake_trace_id_3"));
-        std::vector<std::string> keys = {"key1", "key2", "key3", "key4", "key5"};
-        auto results = backend.Create(keys, 128, "fake_trace_id_4", []() {});
-        ASSERT_EQ(results.size(), keys.size());
-        EXPECT_EQ("file:///data/key1_5a560a3d977cc6f2?blkid=0&size=128", results[0].second.ToUriString());
-        EXPECT_EQ("file:///data/key1_5a560a3d977cc6f2?blkid=1&size=128", results[1].second.ToUriString());
-        EXPECT_EQ("file:///data/key3_1184f2d3fc112241?blkid=0&size=128", results[2].second.ToUriString());
-        EXPECT_EQ("file:///data/key3_1184f2d3fc112241?blkid=1&size=128", results[3].second.ToUriString());
-        EXPECT_EQ("file:///data/key5?blkid=0&size=128", results[4].second.ToUriString());
+
+        CreateBlocksRequest request;
+        request.instance_id = "test_instance";
+        SpecBlockKeys spec_block;
+        spec_block.spec_name = "tp0";
+        spec_block.spec_size = 128;
+        spec_block.block_keys = {0x6b657931, 0x6b657932, 0x6b657933, 0x6b657934, 0x6b657935};
+        spec_block.original_key_indices = {0, 1, 2, 3, 4};
+        request.spec_block_keys.push_back(std::move(spec_block));
+
+        auto result = backend.Create(request, "fake_trace_id_4", []() {});
+        ASSERT_EQ(result.size(), 1);
+        ASSERT_EQ(result[0].size(), 5);
+        EXPECT_EQ("file:///data/test_instance/tp0/6b657931_36fc91bdda6e6263?blkid=0&size=128", result[0][0].second.ToUriString());
+        EXPECT_EQ("file:///data/test_instance/tp0/6b657931_36fc91bdda6e6263?blkid=1&size=128", result[0][1].second.ToUriString());
+        EXPECT_EQ("file:///data/test_instance/tp0/6b657933_d893940787994b17?blkid=0&size=128", result[0][2].second.ToUriString());
+        EXPECT_EQ("file:///data/test_instance/tp0/6b657933_d893940787994b17?blkid=1&size=128", result[0][3].second.ToUriString());
+        EXPECT_EQ("file:///data/test_instance/tp0/6b657935?blkid=0&size=128", result[0][4].second.ToUriString());
     }
 }
 
@@ -72,19 +92,29 @@ TEST_F(NfsBackendTest, TestCreateWithBatchingAndCallbackInvocation) {
     spec->set_root_path("/data/");
     StorageConfig storage_config(DataStorageType::DATA_STORAGE_TYPE_NFS, "test", spec);
     ASSERT_EQ(EC_OK, backend.Open(storage_config, "fake_trace_id_1"));
-    std::vector<std::string> keys = {"key1", "key2", "key3", "key4", "key5"};
+
+    CreateBlocksRequest request;
+    request.instance_id = "test_instance";
+    SpecBlockKeys spec_block;
+    spec_block.spec_name = "tp0";
+    spec_block.spec_size = 100;
+    spec_block.block_keys = {0x6b657931, 0x6b657932, 0x6b657933, 0x6b657934, 0x6b657935};
+    spec_block.original_key_indices = {0, 1, 2, 3, 4};
+    request.spec_block_keys.push_back(std::move(spec_block));
+
     bool callback_called = false;
     auto callback = [&callback_called]() { callback_called = true; };
-    auto results = backend.Create(keys, 100, "fake_trace_id_2", callback);
+    auto result = backend.Create(request, "fake_trace_id_2", callback);
     ASSERT_TRUE(callback_called);
-    ASSERT_EQ(results.size(), keys.size());
-    EXPECT_EQ(results[0].second.ToUriString(), "file:///data/key1_5a560a3d977cc6f2?blkid=0&size=100");
-    EXPECT_EQ(results[1].second.ToUriString(), "file:///data/key1_5a560a3d977cc6f2?blkid=1&size=100");
-    EXPECT_EQ(results[2].second.ToUriString(), "file:///data/key3_1184f2d3fc112241?blkid=0&size=100");
-    EXPECT_EQ(results[3].second.ToUriString(), "file:///data/key3_1184f2d3fc112241?blkid=1&size=100");
-    EXPECT_EQ(results[4].second.ToUriString(), "file:///data/key5?blkid=0&size=100");
-    for (size_t i = 0; i < results.size(); ++i) {
-        ASSERT_EQ(results[i].first, EC_OK);
+    ASSERT_EQ(result.size(), 1);
+    ASSERT_EQ(result[0].size(), 5);
+    EXPECT_EQ("file:///data/test_instance/tp0/6b657931_36fc91bdda6e6263?blkid=0&size=100", result[0][0].second.ToUriString());
+    EXPECT_EQ("file:///data/test_instance/tp0/6b657931_36fc91bdda6e6263?blkid=1&size=100", result[0][1].second.ToUriString());
+    EXPECT_EQ("file:///data/test_instance/tp0/6b657933_d893940787994b17?blkid=0&size=100", result[0][2].second.ToUriString());
+    EXPECT_EQ("file:///data/test_instance/tp0/6b657933_d893940787994b17?blkid=1&size=100", result[0][3].second.ToUriString());
+    EXPECT_EQ("file:///data/test_instance/tp0/6b657935?blkid=0&size=100", result[0][4].second.ToUriString());
+    for (size_t i = 0; i < result[0].size(); ++i) {
+        ASSERT_EQ(result[0][i].first, EC_OK);
     }
 }
 
@@ -95,19 +125,34 @@ TEST_F(NfsBackendTest, TestCreateWithBatchSizeOneAndEmptyKeys) {
     spec->set_root_path("/data/");
     StorageConfig storage_config(DataStorageType::DATA_STORAGE_TYPE_NFS, "test", spec);
     ASSERT_EQ(EC_OK, backend.Open(storage_config, "fake_trace_id_1"));
+
+    // Test empty request
+    CreateBlocksRequest empty_request;
+    empty_request.instance_id = "test_instance";
+    // No spec_block_keys added
     bool callback_called = false;
     auto cb = [&callback_called]() { callback_called = true; };
-    auto results_empty = backend.Create({}, 100, "fake_trace_id_2", cb);
+    auto results_empty = backend.Create(empty_request, "fake_trace_id_2", cb);
     ASSERT_TRUE(callback_called);
     ASSERT_TRUE(results_empty.empty());
 
-    std::vector<std::string> keys = {"a", "b"};
+    // Test with keys
+    CreateBlocksRequest request;
+    request.instance_id = "test_instance";
+    SpecBlockKeys spec_block;
+    spec_block.spec_name = "tp0";
+    spec_block.spec_size = 100;
+    spec_block.block_keys = {0x61, 0x62}; // hex of 'a', 'b'
+    spec_block.original_key_indices = {0, 1};
+    request.spec_block_keys.push_back(std::move(spec_block));
+
     callback_called = false;
-    auto results = backend.Create(keys, 100, "fake_trace_id_3", [&callback_called]() { callback_called = true; });
+    auto result = backend.Create(request, "fake_trace_id_3", [&callback_called]() { callback_called = true; });
     ASSERT_TRUE(callback_called);
-    ASSERT_EQ(results.size(), keys.size());
-    ASSERT_EQ(results[0].second.ToUriString(), "file:///data/a?size=100");
-    ASSERT_EQ(results[1].second.ToUriString(), "file:///data/b?size=100");
+    ASSERT_EQ(result.size(), 1);
+    ASSERT_EQ(result[0].size(), 2);
+    ASSERT_EQ("file:///data/test_instance/tp0/61?size=100", result[0][0].second.ToUriString());
+    ASSERT_EQ("file:///data/test_instance/tp0/62?size=100", result[0][1].second.ToUriString());
 }
 
 TEST_F(NfsBackendTest, TestDeleteReturnsOkAndSameSize) {
@@ -168,13 +213,23 @@ TEST_F(NfsBackendTest, TestCreateHandlesInvalidBatchSize) {
     spec->set_root_path("/root/");
     StorageConfig storage_config(DataStorageType::DATA_STORAGE_TYPE_NFS, "test", spec);
     ASSERT_EQ(EC_OK, backend.Open(storage_config, "fake_trace_id_1"));
-    std::vector<std::string> keys = {"k1", "k2"};
+
+    CreateBlocksRequest request;
+    request.instance_id = "test_instance";
+    SpecBlockKeys spec_block;
+    spec_block.spec_name = "tp0";
+    spec_block.spec_size = 50;
+    spec_block.block_keys = {0x6b31, 0x6b32}; // hex of "k1", "k2"
+    spec_block.original_key_indices = {0, 1};
+    request.spec_block_keys.push_back(std::move(spec_block));
+
     bool cb_called = false;
-    auto results = backend.Create(keys, 50, "fake_trace_id_2", [&cb_called]() { cb_called = true; });
+    auto result = backend.Create(request, "fake_trace_id_2", [&cb_called]() { cb_called = true; });
     ASSERT_TRUE(cb_called);
-    ASSERT_EQ(results.size(), keys.size());
-    ASSERT_EQ(results[0].second.ToUriString(), "file:///root/k1?size=50");
-    ASSERT_EQ(results[1].second.ToUriString(), "file:///root/k2?size=50");
+    ASSERT_EQ(result.size(), 1);
+    ASSERT_EQ(result[0].size(), 2);
+    ASSERT_EQ("file:///root/test_instance/tp0/6b31?size=50", result[0][0].second.ToUriString());
+    ASSERT_EQ("file:///root/test_instance/tp0/6b32?size=50", result[0][1].second.ToUriString());
 }
 
 TEST_F(NfsBackendTest, TestCreateSingleKeyBatch) {
@@ -184,10 +239,59 @@ TEST_F(NfsBackendTest, TestCreateSingleKeyBatch) {
     spec->set_root_path("/root/");
     StorageConfig storage_config(DataStorageType::DATA_STORAGE_TYPE_NFS, "test", spec);
     ASSERT_EQ(EC_OK, backend.Open(storage_config, "fake_trace_id_1"));
-    std::vector<std::string> keys = {"singlekey"};
+
+    CreateBlocksRequest request;
+    request.instance_id = "test_instance";
+    SpecBlockKeys spec_block;
+    spec_block.spec_name = "tp0";
+    spec_block.spec_size = 10;
+    spec_block.block_keys = {0x12345678abcdef00LL}; // a valid int64 key
+    spec_block.original_key_indices = {0};
+    request.spec_block_keys.push_back(std::move(spec_block));
+
     bool cb_called = false;
-    auto results = backend.Create(keys, 10, "fake_trace_id_2", [&cb_called]() { cb_called = true; });
+    auto result = backend.Create(request, "fake_trace_id_2", [&cb_called]() { cb_called = true; });
     ASSERT_TRUE(cb_called);
-    ASSERT_EQ(results.size(), keys.size());
-    ASSERT_EQ(results[0].second.ToUriString(), "file:///root/singlekey?blkid=0&size=10");
+    ASSERT_EQ(result.size(), 1);
+    ASSERT_EQ(result[0].size(), 1);
+    ASSERT_EQ("file:///root/test_instance/tp0/12345678abcdef00?blkid=0&size=10", result[0][0].second.ToUriString());
+}
+
+TEST_F(NfsBackendTest, TestMultipleSpecsNotMixed) {
+    // Test that keys from different specs are never mixed in the same batch
+    NfsBackend backend(metrics_registry_);
+    std::shared_ptr<NfsStorageSpec> spec(new NfsStorageSpec);
+    spec->set_key_count_per_file(3); // Large batch size
+    spec->set_root_path("/data/");
+    StorageConfig storage_config(DataStorageType::DATA_STORAGE_TYPE_NFS, "test", spec);
+    ASSERT_EQ(EC_OK, backend.Open(storage_config, "fake_trace_id_1"));
+
+    CreateBlocksRequest request;
+    request.instance_id = "test_instance";
+
+    // First spec with 2 keys
+    SpecBlockKeys spec_block1;
+    spec_block1.spec_name = "tp0";
+    spec_block1.spec_size = 128;
+    spec_block1.block_keys = {0x6b657931, 0x6b657932};
+    spec_block1.original_key_indices = {0, 1};
+    request.spec_block_keys.push_back(std::move(spec_block1));
+
+    // Second spec with 2 keys
+    SpecBlockKeys spec_block2;
+    spec_block2.spec_name = "tp1";
+    spec_block2.spec_size = 128;
+    spec_block2.block_keys = {0x6b657933, 0x6b657934};
+    spec_block2.original_key_indices = {2, 3};
+    request.spec_block_keys.push_back(std::move(spec_block2));
+
+    auto result = backend.Create(request, "fake_trace_id_2", []() {});
+    ASSERT_EQ(result.size(), 2);
+    ASSERT_EQ(result[0].size(), 2);
+    ASSERT_EQ(result[1].size(), 2);
+
+    EXPECT_EQ("file:///data/test_instance/tp0/6b657931_36fc91bdda6e6263?blkid=0&size=128", result[0][0].second.ToUriString());
+    EXPECT_EQ("file:///data/test_instance/tp0/6b657931_36fc91bdda6e6263?blkid=1&size=128", result[0][1].second.ToUriString());
+    EXPECT_EQ("file:///data/test_instance/tp1/6b657933_3533532bb1ef35e1?blkid=0&size=128", result[1][0].second.ToUriString());
+    EXPECT_EQ("file:///data/test_instance/tp1/6b657933_3533532bb1ef35e1?blkid=1&size=128", result[1][1].second.ToUriString());
 }

@@ -51,16 +51,26 @@ TEST_F(DataStorageManagerTest, TestSimple) {
     ASSERT_EQ(EC_NOENT, data_storage_manager.EnableStorage("storage2"));
 
     // create exist delete
-    DataStorageUri storage_uri1("file://storage1/data/key1?size=128");
-    // ASSERT_FALSE(data_storage_manager.Exist("storage1", {storage_uri1})[0]);
     RequestContext requesst_context("test");
-    auto uris = data_storage_manager.Create(&requesst_context, "storage1", {"key1"}, 128, []() {});
-    ASSERT_EQ(1, uris.size());
-    ASSERT_EQ(EC_OK, uris[0].first);
-    ASSERT_EQ(storage_uri1.ToUriString(), uris[0].second.ToUriString());
+
+    // Build CreateBlocksRequest
+    CreateBlocksRequest create_request;
+    create_request.instance_id = "test_instance";
+    SpecBlockKeys spec_block;
+    spec_block.spec_name = "tp0";
+    spec_block.spec_size = 128;
+    spec_block.block_keys = {0x6b657931}; // hex of "key1"
+    spec_block.original_key_indices = {0};
+    create_request.spec_block_keys.push_back(std::move(spec_block));
+
+    auto result = data_storage_manager.Create(&requesst_context, "storage1", create_request, []() {});
+    ASSERT_EQ(1, result.size());
+    ASSERT_EQ(1, result[0].size());
+    ASSERT_EQ(EC_OK, result[0][0].first);
+    ASSERT_EQ("file://storage1/data/test_instance/tp0/6b657931?size=128", result[0][0].second.ToUriString());
     // unique name not exist
-    uris = data_storage_manager.Create(&requesst_context, "storage2", {"key1"}, 128, []() {});
-    ASSERT_EQ(0, uris.size());
+    result = data_storage_manager.Create(&requesst_context, "storage2", create_request, []() {});
+    ASSERT_EQ(0, result.size());
 
     // unregister storage
     ASSERT_EQ(EC_OK, data_storage_manager.UnRegisterStorage("storage1"));
