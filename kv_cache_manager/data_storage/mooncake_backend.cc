@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "kv_cache_manager/common/logger.h"
+#include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
 namespace kv_cache_manager {
@@ -91,23 +92,32 @@ ErrorCode MooncakeBackend::Close() {
     return EC_OK;
 };
 
-std::vector<std::pair<ErrorCode, DataStorageUri>> MooncakeBackend::Create(const std::vector<std::string> &keys,
-                                                                          size_t size_per_key,
-                                                                          const std::string &trace_id,
-                                                                          std::function<void()> cb) {
-    std::vector<std::pair<ErrorCode, DataStorageUri>> result;
-    for (int i = 0; i < keys.size(); i++) {
-        DataStorageUri storage_uri;
-        storage_uri.SetProtocol(ToString(GetType()));
-        storage_uri.SetPath("/");
-        storage_uri.SetParam("key", keys[i]);
-        storage_uri.SetParam("size", std::to_string(size_per_key));
-        result.push_back({EC_OK, storage_uri});
+std::vector<SpecCreateResult> MooncakeBackend::Create(const CreateBlocksRequest &request,
+                                                      const std::string &trace_id,
+                                                      std::function<void()> cb) {
+    std::vector<SpecCreateResult> result;
+
+    // Process all specs and keys - Mooncake doesn't batch, create one URI per key
+    for (const auto &spec_block : request.spec_block_keys) {
+        SpecCreateResult spec_result;
+        for (size_t i = 0; i < spec_block.block_keys.size(); i++) {
+            // Build the key string: instance_id/spec_name/hex(key)
+            std::string key_str = request.instance_id + "/" + spec_block.spec_name + "/" +
+                                  StringUtil::Uint64ToHex(spec_block.block_keys[i]);
+
+            DataStorageUri storage_uri;
+            storage_uri.SetProtocol(ToString(GetType()));
+            storage_uri.SetPath("/");
+            storage_uri.SetParam("key", key_str);
+            storage_uri.SetParam("size", std::to_string(spec_block.spec_size));
+            spec_result.push_back({EC_OK, storage_uri});
+        }
+        result.push_back(std::move(spec_result));
     }
+
     if (cb) {
         cb();
     }
-    // not supported yet
     return result;
 }
 std::vector<ErrorCode> MooncakeBackend::Delete(const std::vector<DataStorageUri> &storage_uris,

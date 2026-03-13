@@ -154,27 +154,7 @@ private:
                                const CacheManager::KeyVector &keys,
                                const std::vector<std::string_view> &location_spec_group_names,
                                CacheLocationVector &new_locations);
-    ErrorCode CreateInSingleBatch(RequestContext *request_context,
-                                  const std::string &instance_id,
-                                  const CacheManager::KeyVector &keys,
-                                  const std::vector<std::string_view> &location_spec_group_names,
-                                  const std::shared_ptr<const InstanceInfo> &instance_info,
-                                  const std::shared_ptr<DataStorageManager> &data_storage_manager,
-                                  const std::string &unique_name,
-                                  std::vector<DataStorageUri> &allocated_uris,
-                                  std::vector<std::vector<std::pair<size_t, const LocationSpecInfo *>>> &key_to_uris,
-                                  bool &is_create_success,
-                                  int64_t common_size);
-    ErrorCode CreateBySpec(RequestContext *request_context,
-                           const std::string &instance_id,
-                           const CacheManager::KeyVector &keys,
-                           const std::vector<std::string_view> &location_spec_group_names,
-                           const std::shared_ptr<const InstanceInfo> &instance_info,
-                           const std::shared_ptr<DataStorageManager> &data_storage_manager,
-                           const std::string &unique_name,
-                           std::vector<DataStorageUri> &allocated_uris,
-                           std::vector<std::vector<std::pair<size_t, const LocationSpecInfo *>>> &key_to_uris,
-                           bool &is_create_success);
+
 
     ErrorCode TryCreateMetaSearcher(RequestContext *request_context, const std::string &instance_id);
     std::pair<ErrorCode, MetaSearcher *> CheckInputAndGetMetaSearcher(RequestContext *request_context,
