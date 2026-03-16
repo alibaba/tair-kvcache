@@ -675,7 +675,7 @@ class C_SchedulerHook(BaseHook):
                     and len(C_SchedulerHook.FUTURE_QUEUE) > 0
                 ):
                     enqueue_time, _, req = C_SchedulerHook.FUTURE_QUEUE[0]
-                    if enqueue_time > current_timestamp + 6e-3:
+                    if enqueue_time > current_timestamp:
                         break
                     recv_reqs.append(req)
                     heapq.heappop(C_SchedulerHook.FUTURE_QUEUE)
@@ -704,6 +704,7 @@ class C_SchedulerHook(BaseHook):
                     elif C_SchedulerHook.SIM_MODE == MockSimulationMode.OFFLINE:
                         req_stats.created_time = simulation_args["created_time"]
                         req_stats.last_event_time = req_stats.created_time
+                        # Align with the real queue start timestamp if queue_start is not None. For debugging only.
                         queue_start = simulation_args["queue_start"]
                         if queue_start is not None:
                             StateManager.set_global_clock(queue_start)
