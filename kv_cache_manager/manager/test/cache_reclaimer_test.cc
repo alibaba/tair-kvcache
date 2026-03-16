@@ -167,6 +167,8 @@ RegistryManager_ListInstanceInfo_stub(void *obj, RequestContext *rc, const std::
 }
 
 /* ---------------- SchedulePlanExecutor_Submit_stub ---------------- */
+
+std::chrono::milliseconds spe_submit_delay{0};
 PlanExecuteResult del_result;
 std::vector<CacheLocationDelRequest> submitted_del_requests;
 // spe_submit_loc is used to help casting the func addr in the stub def below
@@ -177,6 +179,7 @@ using spe_submit_loc = std::future<PlanExecuteResult> (SchedulePlanExecutor::*)(
 std::future<PlanExecuteResult> SchedulePlanExecutor_Submit_stub(void *obj, const CacheLocationDelRequest &request) {
     const auto promise = std::make_shared<std::promise<PlanExecuteResult>>();
     submitted_del_requests.emplace_back(request);
+    std::this_thread::sleep_for(spe_submit_delay);
     promise->set_value(del_result);
     return promise->get_future();
 }
@@ -192,6 +195,7 @@ std::shared_ptr<MetaIndexer> MetaIndexerManager_GetMetaIndexer_stub(void *obj, c
 
 /* ---------------- MetaIndexer_GetProperties_stub ---------------- */
 
+std::chrono::milliseconds mi_getprop_delay{0};
 ErrorCode get_result;
 MetaIndexer::PropertyMapVector get_out_properties;
 
@@ -207,11 +211,13 @@ MetaIndexer::Result MetaIndexer_GetProperties_stub(void *obj,
             out_properties = MetaIndexer::PropertyMapVector(k.size());
         }
     }
+    std::this_thread::sleep_for(mi_getprop_delay);
     return {get_result};
 }
 
 /* ---------------- MetaIndexer_RandomSample_stub ---------------- */
 
+std::chrono::milliseconds mi_randsample_delay{0};
 ErrorCode random_sample_result;
 MetaIndexer::KeyVector random_sample_keys;
 
@@ -229,6 +235,7 @@ ErrorCode MetaIndexer_RandomSample_stub(void *obj,
             out_keys = MetaIndexer::KeyVector(c);
         }
     }
+    std::this_thread::sleep_for(mi_randsample_delay);
     return random_sample_result;
 }
 
@@ -254,6 +261,7 @@ MetaSearcher *MetaSearcherManager_GetMetaSearcher_stub(void *obj, const std::str
 
 /* ---------------- MetaSearcher_BatchGetLocation_stub ---------------- */
 
+std::chrono::milliseconds ms_batchgetloc_delay{0};
 ErrorCode batch_get_loc_result;
 std::vector<CacheLocationMap> batch_get_loc_out_maps;
 
@@ -265,6 +273,7 @@ ErrorCode MetaSearcher_BatchGetLocation_stub(void *obj,
     if (batch_get_loc_result == ErrorCode::EC_OK) {
         out_loc_maps = batch_get_loc_out_maps;
     }
+    std::this_thread::sleep_for(ms_batchgetloc_delay);
     return batch_get_loc_result;
 }
 
@@ -303,6 +312,11 @@ public:
         key_count = 1;
         max_key_count = 16;
 
+        spe_submit_delay = std::chrono::milliseconds{0};
+        mi_getprop_delay = std::chrono::milliseconds{0};
+        mi_randsample_delay = std::chrono::milliseconds{0};
+        ms_batchgetloc_delay = std::chrono::milliseconds{0};
+
         request_context_ = std::make_shared<RequestContext>("cache_reclaimer_test_trace");
 
         // set up our target being tested
@@ -318,6 +332,10 @@ public:
 
         // avoid nullptr issue when testing methods that involve metrics
         // counter but no need to start the working thread
+        cache_reclaimer_->METRICS_(cache_reclaimer, reclaim_cron_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, reclaim_cron_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, reclaim_job_count) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, reclaim_job_count));
         cache_reclaimer_->METRICS_(cache_reclaimer, block_submit_count) =
             mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, block_submit_count));
         cache_reclaimer_->METRICS_(cache_reclaimer, location_submit_count) =
@@ -326,6 +344,19 @@ public:
             mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, block_del_count));
         cache_reclaimer_->METRICS_(cache_reclaimer, location_del_count) =
             mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, location_del_count));
+
+        cache_reclaimer_->METRICS_(cache_reclaimer, reclaim_cron_duration_us) =
+            mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, reclaim_cron_duration_us));
+        cache_reclaimer_->METRICS_(cache_reclaimer, reclaim_job_duration_us) =
+            mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, reclaim_job_duration_us));
+        cache_reclaimer_->METRICS_(cache_reclaimer, reclaim_lru_sample_duration_us) =
+            mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, reclaim_lru_sample_duration_us));
+        cache_reclaimer_->METRICS_(cache_reclaimer, reclaim_lru_batch_duration_us) =
+            mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, reclaim_lru_batch_duration_us));
+        cache_reclaimer_->METRICS_(cache_reclaimer, reclaim_lru_filter_duration_us) =
+            mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, reclaim_lru_filter_duration_us));
+        cache_reclaimer_->METRICS_(cache_reclaimer, reclaim_lru_submit_duration_us) =
+            mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, reclaim_lru_submit_duration_us));
     }
 
     void TearDown() override {
@@ -2960,4 +2991,93 @@ TEST_F(CacheReclaimerTest, TestDupKeys) {
             cache_reclaimer_->MakeBatchByLRU(request_context_.get(), instance_infos.front(), keys, maps, batch));
         ASSERT_EQ(2, batch.size());
     }
+}
+
+TEST_F(CacheReclaimerTest, TestPerf) {
+    GTEST_SKIP() << "Skipping for generic unit test run"; // delete this line to run this case
+
+    spe_submit_delay = std::chrono::milliseconds{0};
+    mi_getprop_delay = std::chrono::milliseconds{0};
+    mi_randsample_delay = std::chrono::milliseconds{0};
+    ms_batchgetloc_delay = std::chrono::milliseconds{0};
+
+    int sampling_sz = 10000;
+    int batching_sz = 1000;
+    int sampling_sz_per_task = batching_sz;
+
+    cache_reclaimer_->sampling_size_.store(sampling_sz);
+    cache_reclaimer_->sampling_size_per_task_.store(sampling_sz_per_task);
+    cache_reclaimer_->batching_size_.store(batching_sz);
+
+    for (int i = 0; i != sampling_sz_per_task; ++i) {
+        random_sample_keys.emplace_back(i);
+        get_out_properties.emplace_back(MetaIndexer::PropertyMap{{PROPERTY_LRU_TIME, "9"}});
+    }
+
+    batch_get_loc_out_maps = std::vector<CacheLocationMap>(
+        batching_sz,
+        CacheLocationMap{
+            {"foo",
+             CacheLocation{"foo", CacheLocationStatus::CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_NFS, 8, {}}}});
+
+    cache_reclaimer_->job_state_flag_ = true;
+
+    auto start_tp = std::chrono::steady_clock::now();
+    while (true) {
+        cache_reclaimer_->ReclaimByLRU(
+            request_context_, instance_infos.front(), {false, false, false, false, false}, 1000);
+        if (std::chrono::steady_clock::now() - start_tp >= std::chrono::milliseconds(60 * 1000)) {
+            break;
+        }
+    }
+
+    ASSERT_FALSE(submitted_del_requests.empty());
+    const auto &req = submitted_del_requests.back();
+    ASSERT_EQ(batching_sz, req.block_keys.size());
+
+    std::uint64_t reclaim_cron_count_v;
+    std::uint64_t reclaim_job_count_v;
+    std::uint64_t blk_submit_count_v;
+    std::uint64_t loc_submit_count_v;
+    std::uint64_t blk_del_count_v;
+    std::uint64_t loc_del_count_v;
+
+    double reclaim_cron_duration_us_v;
+    double reclaim_job_duration_us_v;
+    double reclaim_lru_sample_duration_us_v;
+    double reclaim_lru_batch_duration_us_v;
+    double reclaim_lru_filter_duration_us_v;
+    double reclaim_lru_submit_duration_us_v;
+
+    GET_METRICS_(cache_reclaimer_, cache_reclaimer, reclaim_cron_count, reclaim_cron_count_v);
+    GET_METRICS_(cache_reclaimer_, cache_reclaimer, reclaim_job_count, reclaim_job_count_v);
+    GET_METRICS_(cache_reclaimer_, cache_reclaimer, block_submit_count, blk_submit_count_v);
+    GET_METRICS_(cache_reclaimer_, cache_reclaimer, location_submit_count, loc_submit_count_v);
+    GET_METRICS_(cache_reclaimer_, cache_reclaimer, block_del_count, blk_del_count_v);
+    GET_METRICS_(cache_reclaimer_, cache_reclaimer, location_del_count, loc_del_count_v);
+
+    GET_METRICS_(cache_reclaimer_, cache_reclaimer, reclaim_cron_duration_us, reclaim_cron_duration_us_v);
+    GET_METRICS_(cache_reclaimer_, cache_reclaimer, reclaim_job_duration_us, reclaim_job_duration_us_v);
+    GET_METRICS_(cache_reclaimer_, cache_reclaimer, reclaim_lru_sample_duration_us, reclaim_lru_sample_duration_us_v);
+    GET_METRICS_(cache_reclaimer_, cache_reclaimer, reclaim_lru_batch_duration_us, reclaim_lru_batch_duration_us_v);
+    GET_METRICS_(cache_reclaimer_, cache_reclaimer, reclaim_lru_filter_duration_us, reclaim_lru_filter_duration_us_v);
+    GET_METRICS_(cache_reclaimer_, cache_reclaimer, reclaim_lru_submit_duration_us, reclaim_lru_submit_duration_us_v);
+
+    KVCM_LOG_INFO("reclaim_cron_count: [%" PRIu64 "]", reclaim_cron_count_v);
+    KVCM_LOG_INFO("reclaim_job_count: [%" PRIu64 "]", reclaim_job_count_v);
+    KVCM_LOG_INFO("blk_submit_count: [%" PRIu64 "]", blk_submit_count_v);
+    KVCM_LOG_INFO("loc_submit_count: [%" PRIu64 "]", loc_submit_count_v);
+    KVCM_LOG_INFO("blk_del_count: [%" PRIu64 "]", blk_del_count_v);
+    KVCM_LOG_INFO("loc_del_count: [%" PRIu64 "]", loc_del_count_v);
+
+    KVCM_LOG_INFO("reclaim_cron_duration_us: [%f]", reclaim_cron_duration_us_v);
+    KVCM_LOG_INFO("reclaim_job_duration_us: [%f]", reclaim_job_duration_us_v);
+    KVCM_LOG_INFO("reclaim_lru_sample_duration_us: [%f]", reclaim_lru_sample_duration_us_v);
+    KVCM_LOG_INFO("reclaim_lru_batch_duration_us: [%f]", reclaim_lru_batch_duration_us_v);
+    KVCM_LOG_INFO("reclaim_lru_filter_duration_us: [%f]", reclaim_lru_filter_duration_us_v);
+    KVCM_LOG_INFO("reclaim_lru_submit_duration_us: [%f]", reclaim_lru_submit_duration_us_v);
+
+    KVCM_LOG_INFO("run time: 60 sec, reclaim job qps: [%f], loc del qps: [%f]",
+                  static_cast<double>(reclaim_job_count_v) / 60.0,
+                  static_cast<double>(loc_submit_count_v) / 60.0);
 }
