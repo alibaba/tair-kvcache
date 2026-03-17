@@ -14,11 +14,14 @@ from hisim.simulation.manager import StateManager, ConfigManager, Envs
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
 )
+from hisim.simulation.sglang.version import VersionDispatcher
 
 try:
     from kv_cache_manager.optimizer.pybind import kvcm_py_optimizer
 except ImportError:
     kvcm_py_optimizer = None
+
+# from sglang.srt.managers.schedule_batch import Req
 
 logger = get_logger("hisim")
 _CURRENT_DIR = Path(__file__).parent.resolve()
@@ -210,13 +213,34 @@ class MockReqToTokenPool:
 
         self.free_slots = list(range(size))
 
+        _version_dispatcher = VersionDispatcher()
+        _version_dispatcher.register_method(
+            "alloc",
+            ["0.5.6", "0.5.6.post1", "0.5.6.post2", "0.5.7", "0.5.8", "0.5.8.post1"],
+            self._alloc_v1,
+        )
+        _version_dispatcher.register_method("alloc", ["0.5.9"], self._alloc_v2)
+
+        _version_dispatcher.register_method(
+            "free",
+            ["0.5.6", "0.5.6.post1", "0.5.6.post2", "0.5.7", "0.5.8", "0.5.8.post1"],
+            self._free_v1,
+        )
+        _version_dispatcher.register_method("free", ["0.5.9"], self._free_v2)
+
+        self._alloc_func = _version_dispatcher.get_compat_method("alloc")
+        self._free_func = _version_dispatcher.get_compat_method("free")
+
     def write(self, indices, values):
         self.req_to_token[indices] = values
 
     def available_size(self):
         return len(self.free_slots)
 
-    def alloc(self, need_size: int) -> List[int]:
+    def alloc(self, *args, **kwargs):
+        return self._alloc_func(*args, **kwargs)
+
+    def _alloc_v1(self, need_size: int) -> List[int]:
         if need_size > len(self.free_slots):
             return None
 
@@ -225,11 +249,41 @@ class MockReqToTokenPool:
 
         return select_index
 
-    def free(self, free_index: Union[int, List[int]]):
+    def _alloc_v2(self, reqs: list) -> Optional[List[int]]:
+        chunked = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
+        if not any(r.is_dllm() for r in reqs):
+            assert len(chunked) <= 1, (
+                "only one chunked request may reuse req_pool_idx in a batch"
+            )
+        assert all(
+            reqs[i].is_chunked > 0 or reqs[i].kv_committed_len > 0 for i in chunked
+        ), "request has req_pool_idx but is not chunked"
+
+        need_size = len(reqs) - len(chunked)
+        if need_size > len(self.free_slots):
+            return None
+        select_index = self.free_slots[:need_size]
+        self.free_slots = self.free_slots[need_size:]
+        offset = 0
+        for r in reqs:
+            if r.req_pool_idx is None:
+                r.req_pool_idx = select_index[offset]
+                offset += 1
+        return [r.req_pool_idx for r in reqs]
+
+    def free(self, *args, **kwargs):
+        return self._free_func(*args, **kwargs)
+
+    def _free_v1(self, free_index: Union[int, List[int]]):
         if isinstance(free_index, (int,)):
             self.free_slots.append(free_index)
         else:
             self.free_slots.extend(free_index)
+
+    def _free_v2(self, req):
+        assert req.req_pool_idx is not None, "request must have req_pool_idx"
+        self.free_slots.append(req.req_pool_idx)
+        req.req_pool_idx = None
 
     def clear(self):
         self.free_slots = list(range(self.size))

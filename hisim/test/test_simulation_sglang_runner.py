@@ -42,13 +42,13 @@ def test_benchmark_sglang():
     )
     benchmark_config = BenchmarkConfig()
 
-    metrics = runner.benchmark(benchmark_config, dataset_args)
+    metrics = runner.benchmark(benchmark_config, dataset_args=dataset_args)
     assert metrics["completed"] == 4
     request_stats = runner.get_request_stats()
     assert request_stats[-1]["created_time"] != 0
 
     benchmark_config.ignore_request_timestamp = True
-    metrics = runner.benchmark(benchmark_config, dataset_args)
+    metrics = runner.benchmark(benchmark_config, dataset_args=dataset_args)
     # This dataset has been used previously.
     assert metrics["prefix_cache_reused_ratio"] > 0.7
     request_stats = runner.get_request_stats()
@@ -66,7 +66,7 @@ def test_benchmark_sglang():
         min_output_len=1,
         max_output_len=2,
     )
-    metrics = runner.benchmark(benchmark_config, dataset_args)
+    metrics = runner.benchmark(benchmark_config, dataset_args=dataset_args)
     assert metrics["completed"] == dataset_args.num_prompts
     request_stats = runner.get_request_stats()
     for idx, req in enumerate(request_stats):

@@ -47,8 +47,18 @@ from sglang.srt.entrypoints.engine import Engine  # noqa
 from sglang.srt.server_args import ServerArgs  # noqa
 from transformers import AutoTokenizer  # noqa
 
+from sglang.version import __version__ as sglang_version  # noqa
+from hisim.simulation.sglang.version import COMPATIBLE_VERSIONS  # noqa
+
 
 logger = get_logger("hisim")
+
+
+if sglang_version not in COMPATIBLE_VERSIONS:
+    logger.warning(
+        f"Current SGLang version {sglang_version} is not in the compatible versions "
+        f"{COMPATIBLE_VERSIONS}, so errors may occur."
+    )
 
 
 class SGLangBenchmarkRunner(BaseBenchmarkRunner):

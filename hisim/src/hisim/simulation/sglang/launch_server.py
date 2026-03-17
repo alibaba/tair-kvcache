@@ -33,6 +33,14 @@ if __name__ == "__main__":
     from sglang.srt.entrypoints.http_server import launch_server
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.utils import kill_process_tree
+    from sglang.version import __version__ as sglang_version
+    from hisim.simulation.sglang.version import COMPATIBLE_VERSIONS
+
+    if sglang_version not in COMPATIBLE_VERSIONS:
+        logger.warning(
+            f"Current SGLang version {sglang_version} is not in the compatible versions "
+            f"{COMPATIBLE_VERSIONS}, so errors may occur."
+        )
 
     parser = argparse.ArgumentParser()
 
