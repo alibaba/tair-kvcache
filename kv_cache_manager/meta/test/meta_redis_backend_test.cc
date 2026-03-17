@@ -216,15 +216,20 @@ TEST_F(MetaRedisBackendTest, TestSimple) {
                                                             StrEq("5")))))
             .WillOnce(Return(ByMove(std::move(list_keys_replies))));
 
-        std::vector<ReplyUPtr> random_replies;
-        for (int i = 0; i < 20; ++i) {
-            random_replies.emplace_back(MakeFakeReply(REDIS_REPLY_STRING, "some_other_key"));
-        }
-        random_replies[0] = MakeFakeReply(REDIS_REPLY_STRING, "kvcache:instance_instance_0:cache_1");
-        random_replies[9] = MakeFakeReply(REDIS_REPLY_STRING, "kvcache:instance_instance_0:cache_2");
-        std::vector<std::vector<std::string>> randomkey_commands(20, {"RANDOMKEY"});
-        EXPECT_CALL(*mock_redis_client, TryExecPipeline(ElementsAreArray(randomkey_commands)))
-            .WillOnce(Return(ByMove(std::move(random_replies))));
+        // test rand: SCRIPT LOAD + EVALSHA pipeline
+        std::vector<ReplyUPtr> script_load_replies;
+        script_load_replies.emplace_back(MakeFakeReply(REDIS_REPLY_STRING, "fake_sha1"));
+        EXPECT_CALL(*mock_redis_client,
+                    TryExecPipeline(ElementsAre(ElementsAre(StrEq("SCRIPT"), StrEq("LOAD"), _))))
+            .WillOnce(Return(ByMove(std::move(script_load_replies))));
+
+        // EVALSHA pipeline: pipeline_size = ceil(min(1000, 2) / 100) = 1
+        std::vector<ReplyUPtr> evalsha_replies;
+        evalsha_replies.emplace_back(MakeFakeReplyArrayString(
+            {"kvcache:instance_instance_0:cache_1", "some_other_key", "kvcache:instance_instance_0:cache_2"}));
+        EXPECT_CALL(*mock_redis_client,
+                    TryExecPipeline(ElementsAre(ElementsAre(StrEq("EVALSHA"), _, _, _, _))))
+            .WillOnce(Return(ByMove(std::move(evalsha_replies))));
 
         // test upsert
         std::vector<ReplyUPtr> upsert_replies;

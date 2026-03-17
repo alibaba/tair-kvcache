@@ -47,6 +47,21 @@ protected:
     using ReplyUPtr = std::unique_ptr<redisReply, void (*)(void *)>;
     using CmdArgs = std::vector<std::string>;
 
+    // Lua script primitives
+    ErrorCode Eval(const std::string &script,
+                   const std::vector<std::string> &keys,
+                   const std::vector<std::string> &args,
+                   std::string &out_result);
+    ErrorCode EvalSha(const std::string &sha1,
+                      const std::vector<std::string> &keys,
+                      const std::vector<std::string> &args,
+                      std::string &out_result);
+    ErrorCode ScriptLoad(const std::string &script, std::string &out_sha1);
+    ErrorCode ScriptExists(const std::string &sha1, bool &out_exists);
+
+    ErrorCode RandByLuaBatch(const std::string &matching_prefix, const int64_t count, std::vector<std::string> &out_keys);
+    ErrorCode RandByBatch(const std::string &matching_prefix, const int64_t count, std::vector<std::string> &out_keys);
+
     bool IsReplyOk(const redisReply *reply) const;
     bool CheckReplyInteger(const redisReply *reply) const;
     bool CheckReplyArray(const redisReply *reply) const;
@@ -61,12 +76,15 @@ protected:
     virtual std::vector<ReplyUPtr> TryExecPipeline(const std::vector<CmdArgs> &cmds);
 
 private:
+    constexpr static int64_t kDefaultRandomKeyBatchNum = 1000;
     redisContext *context_ = nullptr;
     std::string user_info_;
     std::string host_;
     int64_t port_ = 0;
     int64_t timeout_ms_ = 2000;
     int64_t retry_count_ = 2;
-    int64_t randomkey_batch_num_ = 20;
+    int64_t randomkey_batch_num_ = kDefaultRandomKeyBatchNum;
+    int64_t randomkey_key_per_eval_ = 100; // number of RANDOMKEY calls per EVAL
+    std::string randomkey_script_sha_;      // cached Lua script SHA
 };
 } // namespace kv_cache_manager

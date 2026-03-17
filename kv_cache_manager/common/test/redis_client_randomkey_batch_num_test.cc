@@ -29,7 +29,7 @@ TEST_F(RedisClientRandomKeyBatchNumTest, TestDefaultRandomKeyBatchNum) {
     // Test that the default value is 20 when randomkey_batch_num is not specified
     auto redis_client = CreateRedisClientWithParams({});
 
-    EXPECT_EQ(20, redis_client->randomkey_batch_num_);
+    EXPECT_EQ(RedisClient::kDefaultRandomKeyBatchNum, redis_client->randomkey_batch_num_);
 }
 
 TEST_F(RedisClientRandomKeyBatchNumTest, TestRandomKeyBatchNumParsing) {
@@ -43,14 +43,14 @@ TEST_F(RedisClientRandomKeyBatchNumTest, TestRandomKeyBatchNumWithZero) {
     // Test that when randomkey_batch_num is 0, the default value is used
     auto redis_client = CreateRedisClientWithParams({{"randomkey_batch_num", "0"}});
 
-    EXPECT_EQ(20, redis_client->randomkey_batch_num_);
+    EXPECT_EQ(RedisClient::kDefaultRandomKeyBatchNum, redis_client->randomkey_batch_num_);
 }
 
 TEST_F(RedisClientRandomKeyBatchNumTest, TestRandomKeyBatchNumWithNegative) {
     // Test that when randomkey_batch_num is negative, the default value is used
     auto redis_client = CreateRedisClientWithParams({{"randomkey_batch_num", "-10"}});
 
-    EXPECT_EQ(20, redis_client->randomkey_batch_num_);
+    EXPECT_EQ(RedisClient::kDefaultRandomKeyBatchNum, redis_client->randomkey_batch_num_);
 }
 
 TEST_F(RedisClientRandomKeyBatchNumTest, TestRandomKeyBatchNumWithLargeValue) {

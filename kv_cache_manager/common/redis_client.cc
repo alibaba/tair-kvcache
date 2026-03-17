@@ -4,6 +4,7 @@
 #include <unordered_set>
 
 #include "kv_cache_manager/common/logger.h"
+#include "kv_cache_manager/common/string_util.h"
 #include "unistd.h"
 
 namespace kv_cache_manager {
@@ -32,6 +33,11 @@ RedisClient::RedisClient(const StandardUri &storage_uri)
     storage_uri.GetParamAs("randomkey_batch_num", tmp_randomkey_batch_num);
     if (tmp_randomkey_batch_num > 0) {
         randomkey_batch_num_ = tmp_randomkey_batch_num;
+    }
+    int64_t tmp_randomkey_key_per_eval = 0;
+    storage_uri.GetParamAs("randomkey_key_per_eval", tmp_randomkey_key_per_eval);
+    if (tmp_randomkey_key_per_eval > 0) {
+        randomkey_key_per_eval_ = tmp_randomkey_key_per_eval;
     }
 }
 
@@ -633,8 +639,202 @@ ErrorCode RedisClient::Scan(const std::string &matching_prefix,
     return EC_OK;
 }
 
+ErrorCode RedisClient::Eval(const std::string &script,
+                            const std::vector<std::string> &keys,
+                            const std::vector<std::string> &args,
+                            std::string &out_result) {
+    out_result.clear();
+
+    if (!IsContextOk()) {
+        KVCM_REDIS_LOG_ERROR("redis context not ok for EVAL");
+        return EC_IO_ERROR;
+    }
+
+    std::vector<std::string> cmd_args;
+    cmd_args.reserve(3 + keys.size() + args.size());
+    cmd_args.emplace_back("EVAL");
+    cmd_args.emplace_back(script);
+    cmd_args.emplace_back(std::to_string(keys.size()));
+    for (const auto &key : keys) {
+        cmd_args.emplace_back(key);
+    }
+    for (const auto &arg : args) {
+        cmd_args.emplace_back(arg);
+    }
+
+    std::vector<CmdArgs> cmds = {cmd_args};
+    std::vector<ReplyUPtr> replies = CommandPipeline(cmds);
+
+    if (replies.empty()) {
+        KVCM_REDIS_LOG_ERROR("EVAL command failed, no reply");
+        return EC_ERROR;
+    }
+
+    const redisReply *reply = replies[0].get();
+    if (!IsReplyOk(reply)) {
+        KVCM_REDIS_LOG_ERROR("EVAL command failed: %s", reply ? reply->str : "null reply");
+        return EC_ERROR;
+    }
+
+    switch (reply->type) {
+    case REDIS_REPLY_STRING:
+        out_result = std::string(reply->str, reply->len);
+        return EC_OK;
+    case REDIS_REPLY_INTEGER:
+        out_result = std::to_string(reply->integer);
+        return EC_OK;
+    case REDIS_REPLY_NIL:
+        return EC_OK;
+    case REDIS_REPLY_STATUS:
+        out_result = std::string(reply->str, reply->len);
+        return EC_OK;
+    case REDIS_REPLY_ERROR:
+        KVCM_REDIS_LOG_ERROR("EVAL command error: %s", reply->str);
+        return EC_ERROR;
+    default:
+        KVCM_REDIS_LOG_ERROR("EVAL command unexpected reply type: %d", reply->type);
+        return EC_ERROR;
+    }
+}
+
+ErrorCode RedisClient::EvalSha(const std::string &sha1,
+                               const std::vector<std::string> &keys,
+                               const std::vector<std::string> &args,
+                               std::string &out_result) {
+    out_result.clear();
+
+    if (!IsContextOk()) {
+        KVCM_REDIS_LOG_ERROR("redis context not ok for EVALSHA");
+        return EC_IO_ERROR;
+    }
+
+    std::vector<std::string> cmd_args;
+    cmd_args.reserve(3 + keys.size() + args.size());
+    cmd_args.emplace_back("EVALSHA");
+    cmd_args.emplace_back(sha1);
+    cmd_args.emplace_back(std::to_string(keys.size()));
+    for (const auto &key : keys) {
+        cmd_args.emplace_back(key);
+    }
+    for (const auto &arg : args) {
+        cmd_args.emplace_back(arg);
+    }
+
+    std::vector<CmdArgs> cmds = {cmd_args};
+    std::vector<ReplyUPtr> replies = CommandPipeline(cmds);
+
+    if (replies.empty()) {
+        KVCM_REDIS_LOG_ERROR("EVALSHA command failed, no reply");
+        return EC_ERROR;
+    }
+
+    const redisReply *reply = replies[0].get();
+    if (!IsReplyOk(reply)) {
+        KVCM_REDIS_LOG_ERROR("EVALSHA command failed: %s", reply ? reply->str : "null reply");
+        return EC_ERROR;
+    }
+
+    switch (reply->type) {
+    case REDIS_REPLY_STRING:
+        out_result = std::string(reply->str, reply->len);
+        return EC_OK;
+    case REDIS_REPLY_INTEGER:
+        out_result = std::to_string(reply->integer);
+        return EC_OK;
+    case REDIS_REPLY_NIL:
+        return EC_OK;
+    case REDIS_REPLY_STATUS:
+        out_result = std::string(reply->str, reply->len);
+        return EC_OK;
+    case REDIS_REPLY_ERROR:
+        if (reply->str && std::string(reply->str).find("NOSCRIPT") != std::string::npos) {
+            KVCM_REDIS_LOG_WARN("EVALSHA NOSCRIPT error for sha1: %s", sha1.c_str());
+            return EC_NOSCRIPT;
+        }
+        KVCM_REDIS_LOG_ERROR("EVALSHA command error: %s", reply->str);
+        return EC_ERROR;
+    default:
+        KVCM_REDIS_LOG_ERROR("EVALSHA command unexpected reply type: %d", reply->type);
+        return EC_ERROR;
+    }
+}
+
+ErrorCode RedisClient::ScriptLoad(const std::string &script, std::string &out_sha1) {
+    out_sha1.clear();
+
+    if (!IsContextOk()) {
+        KVCM_REDIS_LOG_ERROR("redis context not ok for SCRIPT LOAD");
+        return EC_IO_ERROR;
+    }
+
+    std::vector<CmdArgs> cmds = {{"SCRIPT", "LOAD", script}};
+    std::vector<ReplyUPtr> replies = CommandPipeline(cmds);
+
+    if (replies.empty()) {
+        KVCM_REDIS_LOG_ERROR("SCRIPT LOAD command failed, no reply");
+        return EC_ERROR;
+    }
+
+    const redisReply *reply = replies[0].get();
+    if (!IsReplyOk(reply)) {
+        KVCM_REDIS_LOG_ERROR("SCRIPT LOAD command failed: %s", reply ? reply->str : "null reply");
+        return EC_ERROR;
+    }
+
+    if (reply->type == REDIS_REPLY_STRING) {
+        out_sha1 = std::string(reply->str, reply->len);
+        return EC_OK;
+    }
+
+    KVCM_REDIS_LOG_ERROR("SCRIPT LOAD command unexpected reply type: %d", reply->type);
+    return EC_ERROR;
+}
+
+ErrorCode RedisClient::ScriptExists(const std::string &sha1, bool &out_exists) {
+    out_exists = false;
+
+    if (!IsContextOk()) {
+        KVCM_REDIS_LOG_ERROR("redis context not ok for SCRIPT EXISTS");
+        return EC_IO_ERROR;
+    }
+
+    std::vector<CmdArgs> cmds = {{"SCRIPT", "EXISTS", sha1}};
+    std::vector<ReplyUPtr> replies = CommandPipeline(cmds);
+
+    if (replies.empty()) {
+        KVCM_REDIS_LOG_ERROR("SCRIPT EXISTS command failed, no reply");
+        return EC_ERROR;
+    }
+
+    const redisReply *reply = replies[0].get();
+    if (!IsReplyOk(reply)) {
+        KVCM_REDIS_LOG_ERROR("SCRIPT EXISTS command failed: %s", reply ? reply->str : "null reply");
+        return EC_ERROR;
+    }
+
+    if (reply->type == REDIS_REPLY_ARRAY && reply->elements == 1) {
+        const redisReply *element = reply->element[0];
+        if (element->type == REDIS_REPLY_INTEGER) {
+            out_exists = (element->integer == 1);
+            return EC_OK;
+        }
+    }
+
+    KVCM_REDIS_LOG_ERROR("SCRIPT EXISTS command unexpected reply type: %d", reply->type);
+    return EC_ERROR;
+}
+
 ErrorCode
 RedisClient::Rand(const std::string &matching_prefix, const int64_t count, std::vector<std::string> &out_keys) {
+    if (randomkey_key_per_eval_ > 0) {
+        return RandByLuaBatch(matching_prefix, count, out_keys);
+    } else {
+        return RandByBatch(matching_prefix, count, out_keys);
+    }
+}
+
+ErrorCode
+RedisClient::RandByBatch(const std::string &matching_prefix, const int64_t count, std::vector<std::string> &out_keys) {
     out_keys.clear();
 
     std::vector<CmdArgs> randomkey_cmds(randomkey_batch_num_, CmdArgs{"RANDOMKEY"});
@@ -668,6 +868,123 @@ RedisClient::Rand(const std::string &matching_prefix, const int64_t count, std::
                 }
             }
         }
+        if (found) {
+            consecutive_misses = 0;
+        } else {
+            ++consecutive_misses;
+        }
+    }
+    return EC_OK;
+}
+
+namespace {
+// Lua script: batch RANDOMKEY, filtering nil/false to avoid array truncation.
+// KEYS[1]: routing key (for proxy slot routing, not actually used by the script)
+// ARGV[1]: number of RANDOMKEY calls (M)
+constexpr const char *kRandomKeyLuaScript = "local n = tonumber(ARGV[1]) or 1\n"
+                                            "local results = {}\n"
+                                            "local count = 0\n"
+                                            "for i = 1, n do\n"
+                                            "    local key = redis.call('RANDOMKEY')\n"
+                                            "    if key then\n"
+                                            "        count = count + 1\n"
+                                            "        results[count] = key\n"
+                                            "    end\n"
+                                            "end\n"
+                                            "return results\n";
+} // anonymous namespace
+
+ErrorCode RedisClient::RandByLuaBatch(const std::string &matching_prefix,
+                                      const int64_t count,
+                                      std::vector<std::string> &out_keys) {
+    out_keys.clear();
+
+    // Load Lua script if SHA is not cached
+    if (randomkey_script_sha_.empty()) {
+        ErrorCode ec = ScriptLoad(kRandomKeyLuaScript, randomkey_script_sha_);
+        if (ec != EC_OK) {
+            KVCM_REDIS_LOG_ERROR("redis rand fail, SCRIPT LOAD failed");
+            return EC_ERROR;
+        }
+    }
+
+    std::string randomkey_per_eval = std::to_string(randomkey_key_per_eval_);
+    std::unordered_set<std::string> seen;
+    size_t consecutive_misses = 0;
+
+    while (out_keys.size() < static_cast<size_t>(count) && consecutive_misses < 3) {
+        // Build pipeline_size EVALSHA commands, each with a different routing key
+        std::vector<CmdArgs> eval_cmds;
+        size_t pipeline_size = (std::min(randomkey_batch_num_, count - static_cast<int64_t>(out_keys.size())) +
+                                randomkey_key_per_eval_ - 1) /
+                               randomkey_key_per_eval_;
+        eval_cmds.reserve(pipeline_size);
+        for (int64_t i = 0; i < pipeline_size; ++i) {
+            eval_cmds.push_back(
+                {"EVALSHA", randomkey_script_sha_, "1", StringUtil::GenerateRandomString(8), randomkey_per_eval});
+        }
+
+        std::vector<ReplyUPtr> eval_replies = CommandPipeline(eval_cmds);
+        if (static_cast<int64_t>(eval_replies.size()) != pipeline_size) {
+            KVCM_REDIS_LOG_ERROR("redis rand fail, pipeline eval_cmds.size[%ld] != eval_replies.size[%lu]",
+                                 pipeline_size,
+                                 eval_replies.size());
+            out_keys.clear();
+            return EC_ERROR;
+        }
+
+        // Check for NOSCRIPT error — if so, reload script and retry this iteration
+        bool noscript = false;
+        for (const auto &reply : eval_replies) {
+            if (reply && reply->type == REDIS_REPLY_ERROR && reply->str &&
+                std::string(reply->str).find("NOSCRIPT") != std::string::npos) {
+                noscript = true;
+                break;
+            }
+        }
+        if (noscript) {
+            KVCM_REDIS_LOG_WARN("redis rand NOSCRIPT, reloading script");
+            randomkey_script_sha_.clear();
+            ErrorCode ec = ScriptLoad(kRandomKeyLuaScript, randomkey_script_sha_);
+            if (ec != EC_OK) {
+                KVCM_REDIS_LOG_ERROR("redis rand fail, SCRIPT LOAD retry failed");
+                out_keys.clear();
+                return EC_ERROR;
+            }
+            continue; // Retry this iteration with the new SHA
+        }
+
+        // Parse results
+        bool found = false;
+        for (size_t i = 0; i < eval_replies.size(); ++i) {
+            const ReplyUPtr &reply = eval_replies[i];
+            if (!reply || !IsReplyOk(reply.get())) {
+                KVCM_REDIS_LOG_ERROR("redis rand fail, EVALSHA reply error at index[%lu]", i);
+                out_keys.clear();
+                return EC_ERROR;
+            }
+            if (reply->type == REDIS_REPLY_ARRAY) {
+                for (size_t j = 0; j < reply->elements; ++j) {
+                    const redisReply *elem = reply->element[j];
+                    if (!elem || elem->type != REDIS_REPLY_STRING || !elem->str) {
+                        continue; // skip nil elements
+                    }
+                    std::string key(elem->str, elem->len);
+                    if (key.size() >= matching_prefix.size() &&
+                        key.compare(0, matching_prefix.size(), matching_prefix) == 0) {
+                        if (seen.insert(key).second) {
+                            out_keys.emplace_back(std::move(key));
+                            found = true;
+                            if (out_keys.size() >= static_cast<size_t>(count)) {
+                                return EC_OK;
+                            }
+                        }
+                    }
+                }
+            }
+            // REDIS_REPLY_NIL means empty DB for that EVAL, just skip
+        }
+
         if (found) {
             consecutive_misses = 0;
         } else {

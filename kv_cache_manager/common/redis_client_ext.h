@@ -9,40 +9,10 @@
 
 namespace kv_cache_manager {
 
-// RedisClient的扩展类，添加Lua脚本执行等功能.
+// RedisClient的扩展类，添加便捷脚本编排和简单命令封装.
 class RedisClientExt : public RedisClient {
 public:
     using RedisClient::RedisClient;
-
-    // 执行Lua脚本
-    // script: Lua脚本内容
-    // keys: KEYS数组
-    // args: ARGV数组
-    // out_result: 脚本执行结果
-    ErrorCode Eval(const std::string &script,
-                   const std::vector<std::string> &keys,
-                   const std::vector<std::string> &args,
-                   std::string &out_result);
-
-    // 执行缓存的Lua脚本（使用SHA1）
-    // sha1: 脚本的SHA1哈希值
-    // keys: KEYS数组
-    // args: ARGV数组
-    // out_result: 脚本执行结果
-    ErrorCode EvalSha(const std::string &sha1,
-                      const std::vector<std::string> &keys,
-                      const std::vector<std::string> &args,
-                      std::string &out_result);
-
-    // 加载Lua脚本到Redis并返回SHA1哈希值
-    // script: Lua脚本内容
-    // out_sha1: 输出的SHA1哈希值
-    ErrorCode ScriptLoad(const std::string &script, std::string &out_sha1);
-
-    // 检查脚本是否已加载到Redis
-    // sha1: 脚本的SHA1哈希值
-    // out_exists: 输出是否存在
-    ErrorCode ScriptExists(const std::string &sha1, bool &out_exists);
 
     // 加载脚本到Redis
     // script: 脚本
