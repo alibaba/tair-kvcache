@@ -1,5 +1,6 @@
 #include "kv_cache_manager/meta/meta_local_backend.h"
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 
@@ -331,30 +332,49 @@ ErrorCode MetaLocalBackend::ListKeys(const std::string &cursor,
     out_next_cursor.clear();
     out_keys.clear();
 
-    int64_t start_index = 0;
-    if (cursor != SCAN_BASE_CURSOR) {
-        if (!StringUtil::StrToInt64(cursor.c_str(), start_index)) {
-            KVCM_LOG_ERROR("list keys fail, cannot convert cursor[%s] to start index", cursor.c_str());
-            return EC_BADARGS;
-        }
-    }
-
-    int64_t current_index = 0;
-    int64_t end_index = start_index + limit;
-    bool reached_limit = false;
+    // Collect all keys and sort them for deterministic ordering
+    std::vector<KeyType> all_keys;
     table_.ForEachKV([&](const KeyType &key, const FieldMap &) {
-        if (current_index >= end_index) {
-            reached_limit = true;
-            return false;
-        }
-        if (current_index >= start_index) {
-            out_keys.emplace_back(key);
-        }
-        ++current_index;
+        all_keys.emplace_back(key);
         return true;
     });
+    std::sort(all_keys.begin(), all_keys.end());
 
-    out_next_cursor = reached_limit ? std::to_string(current_index) : SCAN_BASE_CURSOR;
+    if (all_keys.empty() || limit <= 0) {
+        out_next_cursor = SCAN_BASE_CURSOR;
+        return EC_OK;
+    }
+
+    // Parse cursor to find starting position
+    // Cursor format: string representation of the last key returned
+    // SCAN_BASE_CURSOR ("0") means start from beginning
+    size_t start_index = 0;
+    if (cursor != SCAN_BASE_CURSOR) {
+        KeyType cursor_key = 0;
+        if (!StringUtil::StrToInt64(cursor.c_str(), cursor_key)) {
+            KVCM_LOG_ERROR("list keys fail, cannot convert cursor[%s] to key", cursor.c_str());
+            return EC_BADARGS;
+        }
+        // Find the position after the cursor key
+        // Use upper_bound to find the first key greater than cursor_key
+        auto it = std::upper_bound(all_keys.begin(), all_keys.end(), cursor_key);
+        start_index = std::distance(all_keys.begin(), it);
+    }
+
+    // Collect keys starting from start_index
+    size_t end_index = std::min(start_index + static_cast<size_t>(limit), all_keys.size());
+    for (size_t i = start_index; i < end_index; ++i) {
+        out_keys.emplace_back(all_keys[i]);
+    }
+
+    // Set next cursor
+    if (end_index < all_keys.size()) {
+        // More keys to scan, use last returned key as cursor
+        out_next_cursor = std::to_string(all_keys[end_index - 1]);
+    } else {
+        // Reached the end
+        out_next_cursor = SCAN_BASE_CURSOR;
+    }
     return EC_OK;
 }
 

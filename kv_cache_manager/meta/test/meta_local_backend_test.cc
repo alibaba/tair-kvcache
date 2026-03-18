@@ -286,11 +286,23 @@ TEST_F(MetaLocalBackendTest, TestListKeys) {
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->Put({2}, {{{"f1", "v2-1"}, {"f2", "v2-2"}}}));
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->Put({3}, {{{"f1", "v3-1"}, {"f2", "v3-2"}}}));
 
-    // list keys by step
+    // list keys by step with cursor-based scanning
     std::string current_cursor = SCAN_BASE_CURSOR;
-    for (std::string next_cursor; current_cursor != SCAN_BASE_CURSOR; current_cursor = next_cursor) {
-        AssertListKeysByStep(meta_storage_backend_.get(), current_cursor, /*limit*/ 1, EC_OK, {1, 2, 3}, next_cursor);
-    }
+    std::set<KeyType> collected_keys;
+    int loop_count = 0;
+    const int max_loops = 10; // prevent infinite loop
+    do {
+        std::string next_cursor;
+        std::vector<KeyType> keys;
+        ErrorCode ec = meta_storage_backend_->ListKeys(current_cursor, /*limit*/ 1, next_cursor, keys);
+        ASSERT_EQ(EC_OK, ec);
+        for (const auto &key : keys) {
+            collected_keys.insert(key);
+        }
+        current_cursor = next_cursor;
+        ASSERT_LT(++loop_count, max_loops) << "ListKeys loop exceeded maximum iterations";
+    } while (current_cursor != SCAN_BASE_CURSOR);
+    ASSERT_EQ((std::set<KeyType>{1, 2, 3}), collected_keys);
 
     // list all keys
     AssertListKeys(meta_storage_backend_.get(),
