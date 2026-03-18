@@ -1,5 +1,6 @@
 #include <filesystem>
 
+#include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/meta/common.h"
@@ -286,22 +287,39 @@ TEST_F(MetaLocalBackendTest, TestListKeys) {
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->Put({2}, {{{"f1", "v2-1"}, {"f2", "v2-2"}}}));
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->Put({3}, {{{"f1", "v3-1"}, {"f2", "v3-2"}}}));
 
-    // list keys by step with cursor-based scanning
+    // list keys by step with cursor-based scanning, limit=1 over 3 keys
+    // Expected: exactly 3 iterations (one key per page), cursors form a
+    // strictly increasing sequence, and the full key set is covered.
+    const int64_t scan_limit = 1;
+    const int key_count = 3;
+    const int max_loops = key_count + 1; // ceil(key_count / scan_limit) + 1
     std::string current_cursor = SCAN_BASE_CURSOR;
     std::set<KeyType> collected_keys;
     int loop_count = 0;
-    const int max_loops = 10; // prevent infinite loop
+    KeyType prev_cursor_val = std::numeric_limits<KeyType>::min();
     do {
         std::string next_cursor;
         std::vector<KeyType> keys;
-        ErrorCode ec = meta_storage_backend_->ListKeys(current_cursor, /*limit*/ 1, next_cursor, keys);
+        ErrorCode ec = meta_storage_backend_->ListKeys(current_cursor, scan_limit, next_cursor, keys);
         ASSERT_EQ(EC_OK, ec);
+        // Each page must return exactly scan_limit keys (except possibly the last)
+        ASSERT_GE(scan_limit, static_cast<int64_t>(keys.size())) << "page exceeded limit";
+        ASSERT_EQ(scan_limit, static_cast<int64_t>(keys.size())) << "expected exactly one key per page";
         for (const auto &key : keys) {
             collected_keys.insert(key);
+        }
+        // Cursor must advance strictly forward (i.e. new cursor > previous cursor)
+        // when there are more pages remaining.
+        if (next_cursor != SCAN_BASE_CURSOR) {
+            KeyType next_cursor_val = 0;
+            ASSERT_TRUE(StringUtil::StrToInt64(next_cursor.c_str(), next_cursor_val));
+            ASSERT_GT(next_cursor_val, prev_cursor_val) << "cursor did not advance";
+            prev_cursor_val = next_cursor_val;
         }
         current_cursor = next_cursor;
         ASSERT_LT(++loop_count, max_loops) << "ListKeys loop exceeded maximum iterations";
     } while (current_cursor != SCAN_BASE_CURSOR);
+    ASSERT_EQ(key_count, loop_count) << "expected exactly key_count iterations with limit=1";
     ASSERT_EQ((std::set<KeyType>{1, 2, 3}), collected_keys);
 
     // list all keys
