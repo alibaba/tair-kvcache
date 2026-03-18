@@ -117,7 +117,9 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(cache_reclaimer, location_del_count);
 
     DECLARE_METRICS(cache_reclaimer, reclaim_cron_duration_us);
+    DECLARE_METRICS(cache_reclaimer, reclaim_quota_duration_us);
     DECLARE_METRICS(cache_reclaimer, reclaim_job_duration_us);
+    DECLARE_METRICS(cache_reclaimer, reclaim_res_duration_us);
     DECLARE_METRICS(cache_reclaimer, reclaim_lru_sample_duration_us);
     DECLARE_METRICS(cache_reclaimer, reclaim_lru_batch_duration_us);
     DECLARE_METRICS(cache_reclaimer, reclaim_lru_filter_duration_us);
@@ -333,7 +335,9 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(cache_reclaimer, location_del_count);
 
     REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_cron_duration_us);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_quota_duration_us);
     REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_job_duration_us);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_res_duration_us);
     REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_lru_sample_duration_us);
     REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_lru_batch_duration_us);
     REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_lru_filter_duration_us);
@@ -538,7 +542,9 @@ void KmonitorMetricsReporter::ReportInterval() {
         std::uint64_t loc_del_count_v;
 
         double reclaim_cron_duration_us_v;
+        double reclaim_quota_duration_us_v;
         double reclaim_job_duration_us_v;
+        double reclaim_res_duration_us_v;
         double reclaim_lru_sample_duration_us_v;
         double reclaim_lru_batch_duration_us_v;
         double reclaim_lru_filter_duration_us_v;
@@ -552,7 +558,9 @@ void KmonitorMetricsReporter::ReportInterval() {
         GET_METRICS_(cr, cache_reclaimer, location_del_count, loc_del_count_v);
 
         GET_METRICS_(cr, cache_reclaimer, reclaim_cron_duration_us, reclaim_cron_duration_us_v);
+        GET_METRICS_(cr, cache_reclaimer, reclaim_quota_duration_us, reclaim_quota_duration_us_v);
         GET_METRICS_(cr, cache_reclaimer, reclaim_job_duration_us, reclaim_job_duration_us_v);
+        GET_METRICS_(cr, cache_reclaimer, reclaim_res_duration_us, reclaim_res_duration_us_v);
         GET_METRICS_(cr, cache_reclaimer, reclaim_lru_sample_duration_us, reclaim_lru_sample_duration_us_v);
         GET_METRICS_(cr, cache_reclaimer, reclaim_lru_batch_duration_us, reclaim_lru_batch_duration_us_v);
         GET_METRICS_(cr, cache_reclaimer, reclaim_lru_filter_duration_us, reclaim_lru_filter_duration_us_v);
@@ -567,7 +575,9 @@ void KmonitorMetricsReporter::ReportInterval() {
         REPORT_METRICS(cache_reclaimer, location_del_count, static_cast<double>(loc_del_count_v));
 
         REPORT_METRICS(cache_reclaimer, reclaim_cron_duration_us, reclaim_cron_duration_us_v);
+        REPORT_METRICS(cache_reclaimer, reclaim_quota_duration_us, reclaim_quota_duration_us_v);
         REPORT_METRICS(cache_reclaimer, reclaim_job_duration_us, reclaim_job_duration_us_v);
+        REPORT_METRICS(cache_reclaimer, reclaim_res_duration_us, reclaim_res_duration_us_v);
         REPORT_METRICS(cache_reclaimer, reclaim_lru_sample_duration_us, reclaim_lru_sample_duration_us_v);
         REPORT_METRICS(cache_reclaimer, reclaim_lru_batch_duration_us, reclaim_lru_batch_duration_us_v);
         REPORT_METRICS(cache_reclaimer, reclaim_lru_filter_duration_us, reclaim_lru_filter_duration_us_v);

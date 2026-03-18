@@ -92,7 +92,9 @@ DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(block_del_count);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(location_del_count);
 
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_cron_duration_us);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_quota_duration_us);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_job_duration_us);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_res_duration_us);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_lru_sample_duration_us);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_lru_batch_duration_us);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_lru_filter_duration_us);
@@ -198,7 +200,9 @@ ErrorCode CacheReclaimer::Start() noexcept {
     REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(location_del_count);
 
     REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_cron_duration_us);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_quota_duration_us);
     REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_job_duration_us);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_res_duration_us);
     REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_lru_sample_duration_us);
     REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_lru_batch_duration_us);
     REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_lru_filter_duration_us);
@@ -567,7 +571,12 @@ void CacheReclaimer::ReclaimCron() noexcept {
             }
         }
 
-        HandleDelRes();
+        {
+            const std::int64_t res_begin_tp = TimestampUtil::GetSteadyTimeUs();
+            HandleDelRes();
+            METRICS_(cache_reclaimer, reclaim_res_duration_us) =
+                static_cast<double>(TimestampUtil::GetSteadyTimeUs() - res_begin_tp);
+        }
 
         if (triggered) {
             sleep_interval_ms = 0;
@@ -1027,13 +1036,20 @@ bool CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &re
     // do we need to reclaim the storage for this instance group?
     // <total, hf3fs, mooncake, pace, nfs>
     std::array<bool, 5> water_level_exceed_results{false, false, false, false, false};
-    if (!IsTriggerReclaiming(request_context.get(),
-                             ins_gr,
-                             instance_group->quota(), // TODO (rui): validate the quota is valid
-                             reclaim_strategy,
-                             instance_infos,
-                             water_level_exceed_results)) {
-        return false;
+    {
+        const std::int64_t quota_begin_tp = TimestampUtil::GetSteadyTimeUs();
+        if (!IsTriggerReclaiming(request_context.get(),
+                                 ins_gr,
+                                 instance_group->quota(), // TODO (rui): validate the quota is valid
+                                 reclaim_strategy,
+                                 instance_infos,
+                                 water_level_exceed_results)) {
+            METRICS_(cache_reclaimer, reclaim_quota_duration_us) =
+                static_cast<double>(TimestampUtil::GetSteadyTimeUs() - quota_begin_tp);
+            return false;
+        }
+        METRICS_(cache_reclaimer, reclaim_quota_duration_us) =
+            static_cast<double>(TimestampUtil::GetSteadyTimeUs() - quota_begin_tp);
     }
 
     // run the reclaiming algorithm with the chosen policy

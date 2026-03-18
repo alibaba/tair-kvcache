@@ -455,7 +455,9 @@ private:
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(location_del_count)
 
     KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_cron_duration_us)
+    KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_quota_duration_us)
     KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_job_duration_us)
+    KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_res_duration_us)
     KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_lru_sample_duration_us)
     KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_lru_batch_duration_us)
     KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_lru_filter_duration_us)
