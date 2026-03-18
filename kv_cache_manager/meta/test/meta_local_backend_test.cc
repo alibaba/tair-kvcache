@@ -353,6 +353,47 @@ TEST_F(MetaLocalBackendTest, TestRecover) {
     }
 }
 
+TEST_F(MetaLocalBackendTest, TestListKeysCacheBehavior) {
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("test_instance_0", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
+
+    // Add initial keys
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}),
+              meta_storage_backend_->Put({1, 3, 5}, {{{"f1", "v1"}}, {{"f1", "v3"}}, {{"f1", "v5"}}}));
+
+    // First scan should trigger cache rebuild
+    std::string cursor = SCAN_BASE_CURSOR;
+    std::string next_cursor;
+    std::vector<KeyType> keys;
+    ErrorCode ec = meta_storage_backend_->ListKeys(cursor, 2, next_cursor, keys);
+    ASSERT_EQ(EC_OK, ec);
+    ASSERT_EQ(2, keys.size());
+    ASSERT_EQ(1, keys[0]);
+    ASSERT_EQ(3, keys[1]);
+    ASSERT_NE(SCAN_BASE_CURSOR, next_cursor); // Should have continuation
+
+    // Second scan should use cached data
+    cursor = next_cursor;
+    ec = meta_storage_backend_->ListKeys(cursor, 2, next_cursor, keys);
+    ASSERT_EQ(EC_OK, ec);
+    ASSERT_EQ(1, keys.size());
+    ASSERT_EQ(5, keys[0]);
+    ASSERT_EQ(SCAN_BASE_CURSOR, next_cursor); // Should be done
+
+    // Add a new key - should invalidate cache
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->Put({2}, {{{"f1", "v2"}}}));
+
+    // Next scan should see the new key and trigger rebuild
+    cursor = SCAN_BASE_CURSOR;
+    ec = meta_storage_backend_->ListKeys(cursor, 10, next_cursor, keys);
+    ASSERT_EQ(EC_OK, ec);
+    ASSERT_EQ(4, keys.size());
+    ASSERT_EQ((std::vector<KeyType>{1, 2, 3, 5}), keys); // Should be sorted
+    ASSERT_EQ(SCAN_BASE_CURSOR, next_cursor);
+
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
+}
+
 TEST_F(MetaLocalBackendTest, TestRecoverBinarySafe) {
     for (int32_t i = 0; i < 10; ++i) {
         ConstructMetaStorageBackend(); // new meta storage backend

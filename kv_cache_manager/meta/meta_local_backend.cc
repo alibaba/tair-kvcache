@@ -37,12 +37,14 @@ ErrorCode MetaLocalBackend::Init(const std::string &instance_id,
 }
 
 ErrorCode MetaLocalBackend::Open() noexcept {
+    std::lock_guard<std::mutex> guard(mutex_);
     table_.Clear();
+    sorted_keys_cache_.clear();
+    cache_dirty_ = true;
+
     if (!enable_persistence_) {
         return EC_OK;
     }
-
-    std::lock_guard<std::mutex> guard(mutex_);
     std::error_code ec;
     bool exists = std::filesystem::exists(path_, ec);
     if (ec) {
@@ -124,6 +126,7 @@ ErrorCode MetaLocalBackend::PutForOneKey(const KeyType &key, const FieldMap &fie
     // PersistToPath will traverse all keys, we should lock the mutex when multi-threads put/update/delete one key
     std::lock_guard<std::mutex> guard(mutex_);
     table_.Upsert(key, field_map);
+    cache_dirty_ = true;
     return PersistToPath();
 }
 
@@ -153,6 +156,7 @@ ErrorCode MetaLocalBackend::UpdateFieldsForOneKey(const KeyType &key, const Fiel
         KVCM_LOG_WARN("update fields fail, cannot find key[%ld]", key);
         return EC_NOENT;
     }
+    // key set is unchanged; cache_dirty_ stays as-is
     return PersistToPath();
 }
 
@@ -181,6 +185,7 @@ ErrorCode MetaLocalBackend::UpsertForOneKey(const KeyType &key, const FieldMap &
     if (!found) {
         table_.Upsert(key, field_map);
     }
+    cache_dirty_ = true;
     return PersistToPath();
 }
 
@@ -229,7 +234,9 @@ ErrorCode MetaLocalBackend::IncrFieldsForOneKey(const KeyType &key,
         KVCM_LOG_WARN("incr fields fail, cannot find key[%ld]", key);
         return EC_NOENT;
     }
-    if (ec != EC_OK) return ec;
+    if (ec != EC_OK)
+        return ec;
+    // key set is unchanged; cache_dirty_ stays as-is
     return PersistToPath();
 }
 
@@ -250,6 +257,7 @@ ErrorCode MetaLocalBackend::DeleteForOneKey(const KeyType &key) {
         return EC_NOENT;
     }
     table_.Erase(key);
+    cache_dirty_ = true;
     return PersistToPath();
 }
 
@@ -325,6 +333,20 @@ ErrorCode MetaLocalBackend::ExistsForOneKey(const KeyType &key, bool &out_is_exi
     return EC_OK;
 }
 
+void MetaLocalBackend::RebuildSortedCacheUnderLock() {
+    if (!cache_dirty_) {
+        return;
+    }
+
+    sorted_keys_cache_.clear();
+    table_.ForEachKV([&](const KeyType &key, const FieldMap &) {
+        sorted_keys_cache_.emplace_back(key);
+        return true;
+    });
+    std::sort(sorted_keys_cache_.begin(), sorted_keys_cache_.end());
+    cache_dirty_ = false;
+}
+
 ErrorCode MetaLocalBackend::ListKeys(const std::string &cursor,
                                      const int64_t limit,
                                      std::string &out_next_cursor,
@@ -332,21 +354,21 @@ ErrorCode MetaLocalBackend::ListKeys(const std::string &cursor,
     out_next_cursor.clear();
     out_keys.clear();
 
-    // Collect all keys and sort them for deterministic ordering
-    std::vector<KeyType> all_keys;
-    table_.ForEachKV([&](const KeyType &key, const FieldMap &) {
-        all_keys.emplace_back(key);
-        return true;
-    });
-    std::sort(all_keys.begin(), all_keys.end());
-
-    if (all_keys.empty() || limit <= 0) {
+    if (limit <= 0) {
         out_next_cursor = SCAN_BASE_CURSOR;
         return EC_OK;
     }
 
-    // Parse cursor to find starting position
-    // Cursor format: string representation of the last key returned
+    std::lock_guard<std::mutex> guard(mutex_);
+    RebuildSortedCacheUnderLock();
+
+    if (sorted_keys_cache_.empty()) {
+        out_next_cursor = SCAN_BASE_CURSOR;
+        return EC_OK;
+    }
+
+    // parse cursor to find starting position
+    // cursor format: string representation of the last key returned
     // SCAN_BASE_CURSOR ("0") means start from beginning
     size_t start_index = 0;
     if (cursor != SCAN_BASE_CURSOR) {
@@ -355,24 +377,21 @@ ErrorCode MetaLocalBackend::ListKeys(const std::string &cursor,
             KVCM_LOG_ERROR("list keys fail, cannot convert cursor[%s] to key", cursor.c_str());
             return EC_BADARGS;
         }
-        // Find the position after the cursor key
-        // Use upper_bound to find the first key greater than cursor_key
-        auto it = std::upper_bound(all_keys.begin(), all_keys.end(), cursor_key);
-        start_index = std::distance(all_keys.begin(), it);
+        // find the position after the cursor key
+        auto it = std::upper_bound(sorted_keys_cache_.begin(), sorted_keys_cache_.end(), cursor_key);
+        start_index = std::distance(sorted_keys_cache_.begin(), it);
     }
 
-    // Collect keys starting from start_index
-    size_t end_index = std::min(start_index + static_cast<size_t>(limit), all_keys.size());
+    // collect keys starting from start_index
+    size_t end_index = std::min(start_index + static_cast<size_t>(limit), sorted_keys_cache_.size());
     for (size_t i = start_index; i < end_index; ++i) {
-        out_keys.emplace_back(all_keys[i]);
+        out_keys.emplace_back(sorted_keys_cache_[i]);
     }
 
-    // Set next cursor
-    if (end_index < all_keys.size()) {
-        // More keys to scan, use last returned key as cursor
-        out_next_cursor = std::to_string(all_keys[end_index - 1]);
+    // set next cursor: use the last returned key, or base cursor when exhausted
+    if (end_index < sorted_keys_cache_.size()) {
+        out_next_cursor = std::to_string(sorted_keys_cache_[end_index - 1]);
     } else {
-        // Reached the end
         out_next_cursor = SCAN_BASE_CURSOR;
     }
     return EC_OK;

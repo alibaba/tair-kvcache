@@ -54,10 +54,19 @@ private:
     ErrorCode GetAllFieldsForOneKey(const KeyType &key, FieldMap &out_field_map);
     ErrorCode ExistsForOneKey(const KeyType &key, bool &out_is_exist);
 
+    // rebuilds sorted_keys_cache_ from table_
+    // caller must hold mutex_
+    void RebuildSortedCacheUnderLock();
+
 private:
     std::mutex mutex_;
     std::string path_;
     ConcurrentHashMap<KeyType, FieldMap> table_;
     bool enable_persistence_ = false;
+
+    // sorted_keys_cache_ and cache_dirty_ are protected by mutex_
+    std::vector<KeyType> sorted_keys_cache_;
+    bool cache_dirty_ = true;
 };
+
 } // namespace kv_cache_manager
