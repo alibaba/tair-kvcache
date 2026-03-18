@@ -69,3 +69,35 @@ TEST_F(RedisClientRandomKeyBatchNumTest, TestRandomKeyBatchNumInRandMethod) {
     // of this commit.
     EXPECT_EQ(10, redis_client->randomkey_batch_num_);
 }
+
+TEST_F(RedisClientRandomKeyBatchNumTest, TestDefaultRandomKeyEarlyReturnPct) {
+    auto redis_client = CreateRedisClientWithParams({});
+    EXPECT_EQ(RedisClient::kDefaultRandomKeyEarlyReturnPct, redis_client->randomkey_early_return_pct_);
+}
+
+TEST_F(RedisClientRandomKeyBatchNumTest, TestRandomKeyEarlyReturnPctParsing) {
+    auto redis_client = CreateRedisClientWithParams({{"randomkey_early_return_pct", "95"}});
+    EXPECT_EQ(95, redis_client->randomkey_early_return_pct_);
+}
+
+TEST_F(RedisClientRandomKeyBatchNumTest, TestRandomKeyEarlyReturnPctWithZero) {
+    // Zero means disabled, should keep default
+    auto redis_client = CreateRedisClientWithParams({{"randomkey_early_return_pct", "0"}});
+    EXPECT_EQ(RedisClient::kDefaultRandomKeyEarlyReturnPct, redis_client->randomkey_early_return_pct_);
+}
+
+TEST_F(RedisClientRandomKeyBatchNumTest, TestRandomKeyEarlyReturnPctWithNegative) {
+    auto redis_client = CreateRedisClientWithParams({{"randomkey_early_return_pct", "-10"}});
+    EXPECT_EQ(RedisClient::kDefaultRandomKeyEarlyReturnPct, redis_client->randomkey_early_return_pct_);
+}
+
+TEST_F(RedisClientRandomKeyBatchNumTest, TestRandomKeyEarlyReturnPctOver100) {
+    // Over 100 should keep default
+    auto redis_client = CreateRedisClientWithParams({{"randomkey_early_return_pct", "150"}});
+    EXPECT_EQ(RedisClient::kDefaultRandomKeyEarlyReturnPct, redis_client->randomkey_early_return_pct_);
+}
+
+TEST_F(RedisClientRandomKeyBatchNumTest, TestRandomKeyEarlyReturnPctBoundary100) {
+    auto redis_client = CreateRedisClientWithParams({{"randomkey_early_return_pct", "100"}});
+    EXPECT_EQ(100, redis_client->randomkey_early_return_pct_);
+}

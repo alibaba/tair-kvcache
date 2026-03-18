@@ -9,6 +9,9 @@
 
 namespace kv_cache_manager {
 
+#define KVCM_REDIS_LOG_DEBUG(format, ...)                                                                              \
+    KVCM_LOG_DEBUG(                                                                                                    \
+        "redis client addr[%s:%ld] user[%s] " format, host_.c_str(), port_, user_info_.c_str(), ##__VA_ARGS__)
 #define KVCM_REDIS_LOG_INFO(format, ...)                                                                               \
     KVCM_LOG_INFO("redis client addr[%s:%ld] user[%s] " format, host_.c_str(), port_, user_info_.c_str(), ##__VA_ARGS__)
 #define KVCM_REDIS_LOG_WARN(format, ...)                                                                               \
@@ -38,6 +41,11 @@ RedisClient::RedisClient(const StandardUri &storage_uri)
     storage_uri.GetParamAs("randomkey_key_per_eval", tmp_randomkey_key_per_eval);
     if (tmp_randomkey_key_per_eval > 0) {
         randomkey_key_per_eval_ = tmp_randomkey_key_per_eval;
+    }
+    int64_t tmp_randomkey_early_return_pct = 0;
+    storage_uri.GetParamAs("randomkey_early_return_pct", tmp_randomkey_early_return_pct);
+    if (tmp_randomkey_early_return_pct > 0 && tmp_randomkey_early_return_pct <= 100) {
+        randomkey_early_return_pct_ = tmp_randomkey_early_return_pct;
     }
 }
 
@@ -837,6 +845,10 @@ ErrorCode
 RedisClient::RandByBatch(const std::string &matching_prefix, const int64_t count, std::vector<std::string> &out_keys) {
     out_keys.clear();
 
+    const size_t early_return_threshold = (randomkey_early_return_pct_ > 0 && randomkey_early_return_pct_ < 100)
+                                              ? static_cast<size_t>(count) * randomkey_early_return_pct_ / 100
+                                              : static_cast<size_t>(count);
+
     std::vector<CmdArgs> randomkey_cmds(randomkey_batch_num_, CmdArgs{"RANDOMKEY"});
     std::unordered_set<std::string> seen;
     size_t consecutive_misses = 0;
@@ -873,6 +885,14 @@ RedisClient::RandByBatch(const std::string &matching_prefix, const int64_t count
         } else {
             ++consecutive_misses;
         }
+        // Early return when collected keys reach the configured percentage threshold
+        if (out_keys.size() >= early_return_threshold && out_keys.size() < static_cast<size_t>(count)) {
+            KVCM_REDIS_LOG_INFO("redis rand early return, collected[%lu] threshold[%lu] target[%ld]",
+                                out_keys.size(),
+                                early_return_threshold,
+                                count);
+            break;
+        }
     }
     return EC_OK;
 }
@@ -908,7 +928,10 @@ ErrorCode RedisClient::RandByLuaBatch(const std::string &matching_prefix,
         }
     }
 
-    std::string randomkey_per_eval = std::to_string(randomkey_key_per_eval_);
+    const size_t early_return_threshold = (randomkey_early_return_pct_ > 0 && randomkey_early_return_pct_ < 100)
+                                              ? static_cast<size_t>(count) * randomkey_early_return_pct_ / 100
+                                              : static_cast<size_t>(count);
+
     std::unordered_set<std::string> seen;
     size_t consecutive_misses = 0;
 
@@ -919,6 +942,7 @@ ErrorCode RedisClient::RandByLuaBatch(const std::string &matching_prefix,
                                 randomkey_key_per_eval_ - 1) /
                                randomkey_key_per_eval_;
         eval_cmds.reserve(pipeline_size);
+        std::string randomkey_per_eval = std::to_string(pipeline_size == 1 ? count : randomkey_key_per_eval_);
         for (int64_t i = 0; i < pipeline_size; ++i) {
             eval_cmds.push_back(
                 {"EVALSHA", randomkey_script_sha_, "1", StringUtil::GenerateRandomString(8), randomkey_per_eval});
@@ -989,6 +1013,14 @@ ErrorCode RedisClient::RandByLuaBatch(const std::string &matching_prefix,
             consecutive_misses = 0;
         } else {
             ++consecutive_misses;
+        }
+        // Early return when collected keys reach the configured percentage threshold
+        if (out_keys.size() >= early_return_threshold && out_keys.size() < static_cast<size_t>(count)) {
+            KVCM_REDIS_LOG_DEBUG("redis rand early return, collected[%lu] threshold[%lu] target[%ld]",
+                 out_keys.size(),
+                 early_return_threshold,
+                 count);
+            break;
         }
     }
     return EC_OK;

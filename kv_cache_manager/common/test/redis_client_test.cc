@@ -598,6 +598,8 @@ TEST_F(RedisClientTest, TestRand) {
     }
     {
         // Multi-round retry: need 3 keys but only first round has matches.
+        // Disable early return so we can test consecutive-miss termination.
+        redis_client_->randomkey_early_return_pct_ = 100;
         // Round 1 (count=3): pipeline_size = ceil(min(20,3)/10) = 1, finds 2 matching keys.
         // Round 2..4 (remaining=1): pipeline_size = ceil(min(20,1)/10) = 1, no matches each.
         auto make_no_match_reply = [this]() {
@@ -640,6 +642,8 @@ TEST_F(RedisClientTest, TestRand) {
     }
     {
         // Error handling: second pipeline call returns empty -> EC_ERROR
+        // Disable early return so we can test error path on second round.
+        redis_client_->randomkey_early_return_pct_ = 100;
         // Round 1: finds 2 matching keys, need 1 more.
         // Round 2: empty reply -> EC_ERROR.
         std::vector<std::optional<std::string>> eval_result;
@@ -697,6 +701,8 @@ TEST_F(RedisClientTest, TestRandByBatch) {
     }
     {
         // Multi-round retry: need 3 keys but only first round has matches, followed by 3 consecutive misses.
+        // Disable early return so we can test consecutive-miss termination.
+        redis_client_->randomkey_early_return_pct_ = 100;
         std::vector<ReplyUPtr> prepared_replies_0;
         for (int i = 0; i < 20; ++i) {
             prepared_replies_0.emplace_back(MakeFakeReply(REDIS_REPLY_STRING, "some_other_key"));
@@ -731,6 +737,8 @@ TEST_F(RedisClientTest, TestRandByBatch) {
     }
     {
         // Error handling: second pipeline call returns empty -> EC_ERROR
+        // Disable early return so we can test error path on second round.
+        redis_client_->randomkey_early_return_pct_ = 100;
         std::vector<ReplyUPtr> prepared_replies_0;
         for (int i = 0; i < 20; ++i) {
             prepared_replies_0.emplace_back(MakeFakeReply(REDIS_REPLY_STRING, "some_other_key"));
@@ -748,6 +756,58 @@ TEST_F(RedisClientTest, TestRandByBatch) {
         auto ec = redis_client_->Rand(/*matching_prefix*/ "instance1:", /*count*/ 3, keys);
         ASSERT_EQ(EC_ERROR, ec);
         std::vector<std::string> expected_keys{};
+        ASSERT_EQ(expected_keys, keys);
+    }
+}
+
+TEST_F(RedisClientTest, TestRandEarlyReturn) {
+    EXPECT_CALL(*redis_client_, IsContextOk()).WillRepeatedly(Return(true));
+    // Test RandByLuaBatch path with early return enabled
+    redis_client_->randomkey_script_sha_ = "fake_sha_for_test";
+    redis_client_->randomkey_early_return_pct_ = 50; // 50%: for count=4, threshold = 2
+    {
+        // Round 1: finds 2 matching keys out of requested 4. 2 >= threshold(2), early return.
+        // Only 1 TryExecPipeline call expected (no second round).
+        std::vector<std::optional<std::string>> eval_result;
+        eval_result.emplace_back("instance1:key1");
+        for (int i = 1; i < 10; ++i) {
+            if (i == 9) {
+                eval_result.emplace_back("instance1:key2");
+            } else {
+                eval_result.emplace_back("some_other_key");
+            }
+        }
+        std::vector<ReplyUPtr> first_round;
+        first_round.emplace_back(MakeFakeReplyArrayString(eval_result));
+        EXPECT_CALL(*redis_client_, TryExecPipeline(_)).WillOnce(Return(ByMove(std::move(first_round))));
+
+        std::vector<std::string> keys;
+        auto ec = redis_client_->Rand(/*matching_prefix*/ "instance1:", /*count*/ 4, keys);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(2u, keys.size());
+        std::vector<std::string> expected_keys{"instance1:key1", "instance1:key2"};
+        ASSERT_EQ(expected_keys, keys);
+    }
+    // Test RandByBatch path with early return enabled
+    redis_client_->randomkey_key_per_eval_ = 0; // force RandByBatch path
+    redis_client_->randomkey_early_return_pct_ = 50;
+    {
+        // Round 1: finds 2 matching keys out of requested 4. 2 >= threshold(2), early return.
+        std::vector<ReplyUPtr> prepared_replies;
+        for (int i = 0; i < 20; ++i) {
+            prepared_replies.emplace_back(MakeFakeReply(REDIS_REPLY_STRING, "some_other_key"));
+        }
+        prepared_replies[0] = MakeFakeReply(REDIS_REPLY_STRING, "instance1:key1");
+        prepared_replies[19] = MakeFakeReply(REDIS_REPLY_STRING, "instance1:key2");
+        std::vector<CmdArgs> expected_cmds(20, CmdArgs{"RANDOMKEY"});
+        EXPECT_CALL(*redis_client_, TryExecPipeline(ElementsAreArray(expected_cmds)))
+            .WillOnce(Return(ByMove(std::move(prepared_replies))));
+
+        std::vector<std::string> keys;
+        auto ec = redis_client_->Rand(/*matching_prefix*/ "instance1:", /*count*/ 4, keys);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(2u, keys.size());
+        std::vector<std::string> expected_keys{"instance1:key1", "instance1:key2"};
         ASSERT_EQ(expected_keys, keys);
     }
 }

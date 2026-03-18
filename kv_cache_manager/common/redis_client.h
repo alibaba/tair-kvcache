@@ -77,6 +77,7 @@ protected:
 
 private:
     constexpr static int64_t kDefaultRandomKeyBatchNum = 1000;
+    constexpr static int64_t kDefaultRandomKeyEarlyReturnPct = 90; // 0~100, 0 means disabled
     redisContext *context_ = nullptr;
     std::string user_info_;
     std::string host_;
@@ -84,7 +85,8 @@ private:
     int64_t timeout_ms_ = 2000;
     int64_t retry_count_ = 2;
     int64_t randomkey_batch_num_ = kDefaultRandomKeyBatchNum;
-    int64_t randomkey_key_per_eval_ = 100; // number of RANDOMKEY calls per EVAL
-    std::string randomkey_script_sha_;      // cached Lua script SHA
+    int64_t randomkey_key_per_eval_ = 100;                                 // number of RANDOMKEY calls per EVAL
+    int64_t randomkey_early_return_pct_ = kDefaultRandomKeyEarlyReturnPct; // early return when keys reach this pct
+    std::string randomkey_script_sha_;                                     // cached Lua script SHA
 };
 } // namespace kv_cache_manager
