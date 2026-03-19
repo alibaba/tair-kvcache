@@ -355,8 +355,9 @@ ErrorCode MetaLocalBackend::ListKeys(const std::string &cursor,
     out_keys.clear();
 
     if (limit <= 0) {
-        out_next_cursor = SCAN_BASE_CURSOR;
-        return EC_OK;
+        // align to the behavior of Redis SCAN where COUNT must > 0
+        // do not update the out_next_cursor
+        return EC_BADARGS;
     }
 
     std::lock_guard<std::mutex> guard(mutex_);

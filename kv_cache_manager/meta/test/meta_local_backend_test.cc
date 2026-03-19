@@ -333,9 +333,12 @@ TEST_F(MetaLocalBackendTest, TestListKeys) {
     // invalid cursor
     AssertListKeys(meta_storage_backend_.get(), "invalid_cursor", /*limit*/ 1, EC_BADARGS, "", {1, 2, 3});
 
-    // list no key, limit = 0
+    // invalid limit
     std::string next_cursor;
-    AssertListKeysByStep(meta_storage_backend_.get(), SCAN_BASE_CURSOR, /*limit*/ 0, EC_OK, {1, 2, 3}, next_cursor);
+    AssertListKeysByStep(
+        meta_storage_backend_.get(), SCAN_BASE_CURSOR, /*limit*/ 0, EC_BADARGS, {1, 2, 3}, next_cursor);
+    AssertListKeysByStep(
+        meta_storage_backend_.get(), SCAN_BASE_CURSOR, /*limit*/ -1, EC_BADARGS, {1, 2, 3}, next_cursor);
 
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
