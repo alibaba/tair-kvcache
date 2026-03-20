@@ -486,11 +486,21 @@ class TairKvCacheConnector(KVConnectorBase_V1):
     def wait_for_save(self):
         meta = typing.cast(TairKvCacheConnectorMetadata, self._get_connector_metadata())
         # logger.warning("wait_for_save, meta: %r", meta)
+        self._process_save_requests(meta)
 
-        kvcache_ready_event = None
-        if len(meta.to_save_requests) > 0:
-            kvcache_ready_event = torch.cuda.Event()
-            kvcache_ready_event.record(torch.cuda.current_stream())
+    def _process_save_requests(self, meta: TairKvCacheConnectorMetadata):
+        """发起 save 数据传输，幂等（处理后清空 to_save_requests 防止重复执行）
+
+        从 wait_for_save 和 get_finished 都会调用此方法：
+        - 有 forward 时：wait_for_save 在 forward 之后调用，CUDA event 捕获 forward 的工作
+        - 无 forward 时（kv_connector_no_forward 路径）：wait_for_save 被跳过，
+          由 get_finished 兜底调用，此时之前 forward 的数据已稳定在 GPU 上
+        """
+        if len(meta.to_save_requests) == 0:
+            return
+
+        kvcache_ready_event = torch.cuda.Event()
+        kvcache_ready_event.record(torch.cuda.current_stream())
 
         for req_save in meta.to_save_requests:
             req = self._alive_requests[req_save.req_id]
@@ -520,6 +530,8 @@ class TairKvCacheConnector(KVConnectorBase_V1):
             if self._tp_rank == 0:
                 req.scheduled_saving_count += 1
 
+        meta.to_save_requests = []
+
     def get_self_uris(self, locations):
         all_remote_uris = []
         for idx, location in enumerate(locations):
@@ -533,6 +545,11 @@ class TairKvCacheConnector(KVConnectorBase_V1):
             self, finished_req_ids: set[str]
     ) -> Tuple[Optional[set[str]], Optional[set[str]]]:
         meta = typing.cast(TairKvCacheConnectorMetadata, self._get_connector_metadata())
+
+        # 兜底：当 vllm 走 kv_connector_no_forward 路径（wait_for_save 被跳过）时，
+        # 在这里处理未执行的 save 请求。_process_save_requests 是幂等的，
+        # 如果 wait_for_save 已经处理过，to_save_requests 已被清空，这里是 no-op。
+        self._process_save_requests(meta)
 
         if self._tp_rank != 0:
             for finish_req in meta.to_finish_requests:

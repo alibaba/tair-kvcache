@@ -102,7 +102,7 @@ class ConnectorLifecycleTest(VllmConnectorTestBase):
             num_scheduled_tokens={request.request_id: 64}
         )
 
-        meta, _, _ = self._simulate_engine_step(
+        meta, _, _, _ = self._simulate_engine_step(
             self.scheduler_connector, self.worker_connector, scheduler_output)
 
         # 5. 通过 metadata 协议验证请求信息已正确传递
@@ -203,7 +203,7 @@ class ConnectorKVCacheWriteReadTest(VllmConnectorTestBase):
             new_reqs=[scheduled_new_req_a],
             num_scheduled_tokens={write_req_id: num_tokens},
         )
-        meta_a, finished_saving_a, finished_loading_a = self._simulate_engine_step(
+        meta_a, finished_saving_a, finished_loading_a, _ = self._simulate_engine_step(
             self.scheduler_a, self.worker_a, scheduler_output_a,
         )
 
@@ -227,7 +227,7 @@ class ConnectorKVCacheWriteReadTest(VllmConnectorTestBase):
         scheduler_output_a2.scheduled_cached_reqs.resumed_req_ids = set()
         request_a.all_token_ids = prompt_token_ids + [200]
 
-        meta_a2, _, _ = self._simulate_engine_step(
+        meta_a2, _, _, _ = self._simulate_engine_step(
             self.scheduler_a, self.worker_a, scheduler_output_a2,
         )
 
@@ -271,7 +271,7 @@ class ConnectorKVCacheWriteReadTest(VllmConnectorTestBase):
             new_reqs=[scheduled_new_req_read],
             num_scheduled_tokens={read_req_id: num_tokens},
         )
-        meta_read, _, _ = self._simulate_engine_step(
+        meta_read, _, _, _ = self._simulate_engine_step(
             self.scheduler_b, self.worker_b, scheduler_output_read,
         )
 
@@ -386,7 +386,7 @@ class ConnectorKVCacheWriteReadTest(VllmConnectorTestBase):
             new_reqs=scheduled_new_reqs,
             num_scheduled_tokens=num_scheduled_tokens,
         )
-        meta, _, _ = self._simulate_engine_step(
+        meta, _, _, _ = self._simulate_engine_step(
             self.scheduler_a, self.worker_a, sched_out,
         )
 
@@ -414,6 +414,243 @@ class ConnectorKVCacheWriteReadTest(VllmConnectorTestBase):
             self.assertFalse(result,
                              f"Scheduler 中 {req.request_id} 应已清理"
                              f"（request_finished 返回 False）")
+
+
+class ConnectorMaxOutputToken1Test(VllmConnectorTestBase):
+    """测试 max_output_token == 1 场景下的 save 时序问题
+
+    复现问题：当 max_output_token == 1 时，请求在 prefill 后仅生成 1 个 token
+    即完成。此时 Scheduler 异步发起的 save 任务尚未返回，当 SaveRequest 最终
+    被收集到 metadata 并下发给 Worker 时，由于已经没有 forward 工作，vllm 走
+    kv_connector_no_forward 路径（wait_for_save=False），导致 Worker 跳过
+    wait_for_save，save 的数据传输永远不会执行。
+
+    vllm 相关代码参考：
+    - vllm/v1/worker/gpu_model_runner.py:2682-2687 (kv_connector_no_forward 调用)
+    - vllm/v1/worker/kv_connector_model_runner_mixin.py:75-92 (wait_for_save=False)
+    - vllm/v1/core/sched/scheduler.py:1060-1061 (stopped → _free_request)
+    """
+
+    def _init_connector(self):
+        """初始化单对 Scheduler + Worker Connector"""
+        from kv_cache_manager.py_connector.vllm.v1_connector import TairKvCacheConnector
+
+        config = self._create_test_vllm_config()
+
+        self.scheduler_connector = TairKvCacheConnector(
+            config,
+            KVConnectorRole.SCHEDULER
+        )
+
+        self.worker_connector = TairKvCacheConnector(
+            config,
+            KVConnectorRole.WORKER
+        )
+
+        kv_caches = self._create_mock_kv_caches()
+        self.worker_connector.register_kv_caches(kv_caches)
+
+    def _cleanup_connector(self):
+        """清理 Connectors"""
+        if hasattr(self, 'worker_connector') and self.worker_connector:
+            self.worker_connector.shutdown()
+        if hasattr(self, 'scheduler_connector') and self.scheduler_connector:
+            self.scheduler_connector.shutdown()
+
+    def _poll_until_async_save_ready(
+        self, scheduler, timeout_seconds=15, poll_interval=0.3
+    ):
+        """轮询直到异步 start_save_kvcache_async 的 HTTP 结果返回
+
+        直接检查 scheduler._waiting_to_save_requests 是否非空，
+        不触发 engine step，避免提前消费 SaveRequest。
+
+        Args:
+            scheduler: Scheduler 角色的 Connector
+            timeout_seconds: 超时时间
+            poll_interval: 轮询间隔
+        """
+        import time
+        deadline = time.time() + timeout_seconds
+        while True:
+            with scheduler._waiting_to_save_requests_lock:
+                if len(scheduler._waiting_to_save_requests) > 0:
+                    return
+            if time.time() > deadline:
+                self.fail(
+                    f"等待异步 save HTTP 返回超时 ({timeout_seconds}s)")
+            time.sleep(poll_interval)
+
+    def test_max_output_token_1_no_forward_save_via_get_finished(self):
+        """验证修复：no-forward 路径下 save 通过 get_finished 兜底触发
+
+        模拟完整的 vllm 引擎时序：
+        1. Engine Step 1（prefill）：新请求到达，forward 执行，wait_for_save 被调用但无事可做
+        2. update_from_output：request stopped → request_finished
+        3. 异步 save HTTP 完成，SaveRequest 进入 _waiting_to_save_requests
+        4. Engine Step 2（no forward）：build_connector_meta 收集 SaveRequest，
+           走 kv_connector_no_forward 路径（wait_for_save 被跳过），
+           但 get_finished 中兜底调用 _process_save_requests，save 被正确触发
+        """
+        import time
+
+        block_size = self._test_config.block_size  # 16
+        prompt_token_ids = list(range(100, 164))  # 64 tokens → 4 blocks
+        num_tokens = len(prompt_token_ids)
+        num_blocks = num_tokens // block_size
+        block_ids = list(range(num_blocks))
+        req_id = "max_output_1_req"
+
+        # ===== Engine Step 1: Prefill =====
+
+        # Scheduler: get_num_new_matched_tokens（首次无缓存）
+        request = self._create_mock_request(
+            request_id=req_id,
+            prompt_token_ids=prompt_token_ids,
+            max_tokens=1,
+        )
+        matched, has_match = self.scheduler_connector.get_num_new_matched_tokens(
+            request, num_computed_tokens=0
+        )
+        self.assertEqual(matched, 0, "首次查询应无远程缓存匹配")
+
+        # Scheduler: update_state_after_alloc
+        blocks = self._create_mock_kv_cache_blocks(block_ids)
+        self.scheduler_connector.update_state_after_alloc(
+            request, blocks, num_external_tokens=0
+        )
+
+        # Scheduler: build_connector_meta
+        # 内部触发 start_save_kvcache_async（异步 HTTP）
+        scheduled_new_req = self._create_mock_scheduled_new_req(
+            req_id=req_id,
+            token_ids=prompt_token_ids,
+            block_ids=block_ids,
+        )
+        scheduler_output = self._create_mock_scheduler_output(
+            new_reqs=[scheduled_new_req],
+            num_scheduled_tokens={req_id: num_tokens},
+        )
+
+        # 模拟正常的 engine step（有 forward，wait_for_save 正常调用）
+        meta_step1, _, _, _ = self._simulate_engine_step(
+            self.scheduler_connector, self.worker_connector, scheduler_output
+        )
+
+        # 验证 Step 1 的 meta 中没有 SaveRequest（因为异步 HTTP 还没返回）
+        self.assertEqual(len(meta_step1.to_save_requests), 0,
+                         "Step 1: SaveRequest 应为空（异步 HTTP 尚未返回）")
+        self.assertTrue(len(meta_step1.requests) > 0,
+                        "Step 1: meta 应包含新请求的 ReqStateToWorker")
+
+        # ===== update_from_output: 请求完成 =====
+        request.all_token_ids = prompt_token_ids + [999]  # 1 个 output token
+        result, extra_info = self.scheduler_connector.request_finished(request, block_ids)
+        self.assertTrue(result, "request_finished 应返回 True")
+
+        # ===== 等待异步 save HTTP 完成 =====
+        self._poll_until_async_save_ready(
+            self.scheduler_connector, timeout_seconds=15
+        )
+
+        # ===== Engine Step 2: No forward（关键步骤）=====
+        empty_scheduler_output = self._create_mock_scheduler_output()
+
+        # 使用 no_forward 路径（wait_for_save=False），模拟 vllm 的行为
+        # 修复后：get_finished 兜底调用 _process_save_requests，save 仍会被触发
+        meta_step2, finished_saving, _ = self._simulate_engine_step_no_forward(
+            self.scheduler_connector, self.worker_connector, empty_scheduler_output
+        )
+
+        # ===== 验证修复 =====
+        # _process_save_requests 处理后清空了 to_save_requests（幂等保证）
+        self.assertEqual(len(meta_step2.to_save_requests), 0,
+                         "Step 2: to_save_requests 应已被 _process_save_requests 清空")
+
+        # 关键断言：worker 侧 scheduled_saving_count > 0，说明 save 被 get_finished 兜底触发
+        worker_req = self.worker_connector._alive_requests.get(req_id)
+        self.assertIsNotNone(worker_req,
+                             "Worker 侧应有该请求的 alive 状态")
+        self.assertGreater(worker_req.scheduled_saving_count, 0,
+                           "修复验证: Worker 侧 scheduled_saving_count 应 > 0"
+                           "（get_finished 兜底调用了 _process_save_requests）")
+
+        print("\n===== max_output_token==1 修复验证 =====")
+        print(f"Step 2 wait_for_save 是否调用: False (no_forward 路径)")
+        print(f"Step 2 get_finished 兜底处理: True")
+        print(f"Worker scheduled_saving_count: {worker_req.scheduled_saving_count} (预期 > 0)")
+        print(f"结论: no-forward 路径下 save 通过 get_finished 兜底正确触发")
+        print("=" * 50)
+
+    def test_max_output_token_1_with_normal_step_save_works(self):
+        """对照测试：正常 engine step（有 wait_for_save）时 save 正常工作
+
+        同样的 max_output_token==1 场景，但使用正常的 _simulate_engine_step
+        （调用 wait_for_save），验证 save 能正常触发。
+        """
+        import time
+
+        block_size = self._test_config.block_size
+        prompt_token_ids = list(range(100, 164))
+        num_tokens = len(prompt_token_ids)
+        num_blocks = num_tokens // block_size
+        block_ids = list(range(num_blocks))
+        req_id = "max_output_1_normal_req"
+
+        # Step 1: Prefill
+        request = self._create_mock_request(
+            request_id=req_id,
+            prompt_token_ids=prompt_token_ids,
+            max_tokens=1,
+        )
+        matched, _ = self.scheduler_connector.get_num_new_matched_tokens(request, 0)
+        blocks = self._create_mock_kv_cache_blocks(block_ids)
+        self.scheduler_connector.update_state_after_alloc(request, blocks, 0)
+
+        scheduled_new_req = self._create_mock_scheduled_new_req(
+            req_id=req_id,
+            token_ids=prompt_token_ids,
+            block_ids=block_ids,
+        )
+        scheduler_output = self._create_mock_scheduler_output(
+            new_reqs=[scheduled_new_req],
+            num_scheduled_tokens={req_id: num_tokens},
+        )
+        self._simulate_engine_step(
+            self.scheduler_connector, self.worker_connector, scheduler_output
+        )
+
+        # Request finished
+        request.all_token_ids = prompt_token_ids + [999]
+        self.scheduler_connector.request_finished(request, block_ids)
+
+        # 等待异步 save HTTP 完成（直接轮询，不消费）
+        self._poll_until_async_save_ready(
+            self.scheduler_connector, timeout_seconds=15
+        )
+
+        # Step 2: 使用正常的 engine step（有 wait_for_save）
+        empty_scheduler_output = self._create_mock_scheduler_output()
+        meta_step2, _, _, _ = self._simulate_engine_step(
+            self.scheduler_connector, self.worker_connector, empty_scheduler_output
+        )
+
+        # 验证：正常路径下 SaveRequest 被 wait_for_save 处理后清空
+        self.assertEqual(len(meta_step2.to_save_requests), 0,
+                         "正常路径: to_save_requests 应已被 wait_for_save 处理后清空")
+
+        # 验证：worker 侧的 scheduled_saving_count > 0（wait_for_save 已被调用）
+        worker_req = self.worker_connector._alive_requests.get(req_id)
+        self.assertIsNotNone(worker_req,
+                             "Worker 侧应有该请求的 alive 状态")
+        self.assertGreater(worker_req.scheduled_saving_count, 0,
+                           "正常路径: Worker 侧 scheduled_saving_count 应 > 0（wait_for_save 已调用）")
+
+        print("\n===== 对照测试: 正常 engine step =====")
+        print(f"Step 2 wait_for_save 是否调用: True (正常路径)")
+        print(f"Worker scheduled_saving_count: {worker_req.scheduled_saving_count} (预期 > 0)")
+        print(f"结论: 正常路径下 save 被正确触发")
+        print("=" * 50)
 
 
 if __name__ == '__main__':

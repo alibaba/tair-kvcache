@@ -472,7 +472,9 @@ class VllmConnectorTestBase(abc.ABC, TestBase, unittest.TestCase):
             scheduler_output: Mock SchedulerOutput 对象
 
         Returns:
-            tuple: (meta, finished_saving, finished_loading)
+            tuple: (meta, finished_saving, finished_loading, save_request_count)
+                save_request_count 是本步骤中 to_save_requests 的数量，
+                在 wait_for_save 之前读取（处理后会清空）。
         """
         # 1. Scheduler: build meta
         meta = scheduler_connector.build_connector_meta(scheduler_output)
@@ -486,6 +488,8 @@ class VllmConnectorTestBase(abc.ABC, TestBase, unittest.TestCase):
         worker_connector.start_load_kv(mock_forward_ctx)
 
         # 4. Worker: wait_for_save
+        # 提前记录 save 请求数（_process_save_requests 处理后会清空 to_save_requests）
+        save_request_count = len(meta.to_save_requests)
         worker_connector.wait_for_save()
 
         # 5. Worker: get_finished
@@ -498,7 +502,7 @@ class VllmConnectorTestBase(abc.ABC, TestBase, unittest.TestCase):
         # 7. Worker: clear_connector_metadata
         worker_connector.clear_connector_metadata()
 
-        return meta, finished_saving, finished_loading
+        return meta, finished_saving, finished_loading, save_request_count
 
     def _poll_engine_until_save_collected(
         self, scheduler, worker, expected_count=1,
@@ -524,11 +528,60 @@ class VllmConnectorTestBase(abc.ABC, TestBase, unittest.TestCase):
                     f"等待 SaveRequest 收集超时 ({timeout_seconds}s)，"
                     f"已收集 {collected}/{expected_count}")
             empty_out = self._create_mock_scheduler_output()
-            meta, _, _ = self._simulate_engine_step(scheduler, worker, empty_out)
-            collected += len(meta.to_save_requests)
+            _, _, _, save_count = self._simulate_engine_step(scheduler, worker, empty_out)
+            collected += save_count
             if collected < expected_count:
                 time.sleep(poll_interval)
         return collected
+
+    def _simulate_engine_step_no_forward(
+            self,
+            scheduler_connector,
+            worker_connector,
+            scheduler_output,
+    ):
+        """模拟一个无 forward 工作的 vllm 引擎步骤（kv_connector_no_forward 路径）
+
+        当 worker 没有 forward 工作时，vllm 调用 kv_connector_no_forward，
+        内部使用 _get_kv_connector_output(scheduler_output, wait_for_save=False)。
+        这意味着 wait_for_save 不会被调用。
+
+        参考：vllm/v1/worker/kv_connector_model_runner_mixin.py:75-92
+              vllm/v1/worker/gpu_model_runner.py:2682-2687
+
+        Args:
+            scheduler_connector: Scheduler 角色的 Connector
+            worker_connector: Worker 角色的 Connector
+            scheduler_output: Mock SchedulerOutput 对象
+
+        Returns:
+            tuple: (meta, finished_saving, finished_loading)
+        """
+        # 1. Scheduler: build meta
+        meta = scheduler_connector.build_connector_meta(scheduler_output)
+
+        # 2. Worker: bind metadata
+        worker_connector.bind_connector_metadata(meta)
+
+        # 3. Worker: start_load_kv
+        from unittest.mock import MagicMock
+        mock_forward_ctx = MagicMock()
+        worker_connector.start_load_kv(mock_forward_ctx)
+
+        # 4. 关键差异：跳过 wait_for_save（模拟 kv_connector_no_forward 路径）
+        #    vllm 在 _get_kv_connector_output 中传入 wait_for_save=False
+
+        # 5. Worker: get_finished
+        finished_req_ids = set()
+        finished_saving, finished_loading = worker_connector.get_finished(finished_req_ids)
+
+        # 6. Worker: get_block_ids_with_load_errors
+        worker_connector.get_block_ids_with_load_errors()
+
+        # 7. Worker: clear_connector_metadata
+        worker_connector.clear_connector_metadata()
+
+        return meta, finished_saving, finished_loading
 
     def _poll_until_cache_queryable(
         self, scheduler, request, timeout_seconds=30, poll_interval=0.5,

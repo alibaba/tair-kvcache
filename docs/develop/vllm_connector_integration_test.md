@@ -94,7 +94,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
 | `_create_mock_kv_caches(num_layers, num_blocks, ...)` | 创建 CPU 上的 Mock KV Cache 张量 |
 | `_create_mock_kv_cache_blocks(block_ids)` | 创建 Mock KVCacheBlocks |
 | `_create_mock_scheduled_new_req(req_id, token_ids, block_ids)` | 创建 Mock scheduled_new_req 元素 |
-| `_simulate_engine_step(scheduler, worker, scheduler_output)` | 模拟完整的 vllm 引擎步骤（含 `get_block_ids_with_load_errors` 和 `clear_connector_metadata`） |
+| `_simulate_engine_step(scheduler, worker, scheduler_output)` | 模拟完整的 vllm 引擎步骤（含 `get_block_ids_with_load_errors` 和 `clear_connector_metadata`），返回 `(meta, finished_saving, finished_loading, save_request_count)` |
 | `_poll_engine_until_save_collected(scheduler, worker, expected_count, ...)` | 轮询引擎步骤直到收集到预期数量的 SaveRequest（替代 `time.sleep`） |
 | `_poll_until_cache_queryable(scheduler, request, ...)` | 轮询 `get_num_new_matched_tokens` 直到 Manager 中缓存数据可查询（替代 `time.sleep`） |
 | `_get_free_port()` | 获取空闲端口用于 coordinator |
@@ -242,7 +242,7 @@ sched_out = self._create_mock_scheduler_output(
     new_reqs=[new_req],
     num_scheduled_tokens={req_id: num_tokens},
 )
-meta, finished_saving, finished_loading = self._simulate_engine_step(
+meta, finished_saving, finished_loading, save_request_count = self._simulate_engine_step(
     self.scheduler, self.worker, sched_out,
 )
 ```
