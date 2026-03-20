@@ -1,5 +1,8 @@
 # 项目文档
 
+### 设计文档
+- [基本概念](design/basic_concepts.md) - Storage、Instance Group、Instance、Block、CacheLocation 等核心概念
+
 ### 开发文档
 - [开发指南](develop/README.md) - 开发者入门指南和开发环境配置
 - [API 文档](api/) - API 接口说明和使用示例
