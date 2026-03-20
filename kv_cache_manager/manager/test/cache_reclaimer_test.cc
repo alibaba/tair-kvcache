@@ -2595,7 +2595,7 @@ TEST_F(CacheReclaimerTest, TestCronJobAdaptiveSleepIntervalRecovery) {
     //       |
     //       V
     //    [finish]
-    ASSERT_LE(2, list_ins_group_call_counter);
+    ASSERT_GE(2, list_ins_group_call_counter);
 }
 
 TEST_F(CacheReclaimerTest, TestGenTraceID) {
