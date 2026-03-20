@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <map>
 #include <shared_mutex>
-
+#include <string>
 namespace kv_cache_manager {
 
 class Hf3fsMempool final {
