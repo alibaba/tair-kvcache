@@ -36,9 +36,16 @@ struct CacheMetaDelRequest {
     std::chrono::microseconds delay{std::chrono::seconds(0)};
 };
 
+struct PlanExecuteResultFailMeta {
+    int64_t block_key;
+    std::vector<ErrorCode> status_vec;
+    std::vector<std::string> location_ids;
+};
+
 struct PlanExecuteResult {
     ErrorCode status;
     std::string error_message;
+    std::vector<PlanExecuteResultFailMeta> fail_metas;
 };
 
 struct CacheLocationDelRequest {

@@ -32,6 +32,7 @@ void HandleErrorPromise(const std::shared_ptr<std::promise<ResultType>> &promise
     promise->set_value(ResultType{
         .status = error_code,
         .error_message = std::move(error_message),
+        .fail_metas = {},
     });
 }
 } // namespace
@@ -210,16 +211,26 @@ void SchedulePlanExecutor::DoLocationDelTask(const std::shared_ptr<std::promise<
         ErrorCode delete_meta_ec =
             meta_searcher.BatchCADLocationStatus(ctx.get(), block_keys_to_delete, batch_cad_tasks, delete_meta_results);
         (void)delete_meta_ec; // 忽略返回值
+        std::vector<ErrorCode> status_vec;
+        std::vector<std::string> location_ids;
         for (size_t block_key_idx = 0; block_key_idx < delete_meta_results.size(); ++block_key_idx) {
             auto &results = delete_meta_results[block_key_idx];
             for (size_t location_idx = 0; location_idx < results.size(); location_idx++) {
                 if (results[location_idx] != ErrorCode::EC_OK) {
+                    status_vec.push_back(results[location_idx]);
+                    location_ids.push_back(batch_cad_tasks[block_key_idx][location_idx].location_id);
                     result.status = ErrorCode::EC_PARTIAL_OK;
                     KVCM_LOG_WARN("Failed to CAD meta key %ld, location: %s, error_code: %d",
                                   block_keys_to_delete[block_key_idx],
                                   batch_cad_tasks[block_key_idx][location_idx].location_id.c_str(),
                                   results[location_idx]);
                 }
+            }
+            if (!status_vec.empty()) {
+                result.fail_metas.push_back(PlanExecuteResultFailMeta{
+                    block_keys_to_delete[block_key_idx], std::move(status_vec), std::move(location_ids)});
+                status_vec.clear();
+                location_ids.clear();
             }
         }
     }
@@ -292,7 +303,7 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::Submit(const CacheMetaDelRe
     }
 
     if (batch_cas_block_keys.empty()) {
-        promise->set_value({ErrorCode::EC_OK, ""});
+        promise->set_value(PlanExecuteResult{ErrorCode::EC_OK, "", {}});
         return future;
     }
 
@@ -310,7 +321,7 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::Submit(const CacheMetaDelRe
         return future;
     }
     if (actual_task.block_keys.empty()) {
-        promise->set_value(PlanExecuteResult{ErrorCode::EC_OK, ""});
+        promise->set_value(PlanExecuteResult{ErrorCode::EC_OK, "", {}});
         return future;
     }
     KVCM_LOG_DEBUG("Location statuses updated, submitting task to worker pool with delay: %lld microseconds",
@@ -416,7 +427,7 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::Submit(const CacheLocationD
         batch_cas_tasks.emplace_back(std::move(location_cas_tasks));
     }
     if (batch_cas_block_keys.empty()) {
-        promise->set_value(PlanExecuteResult{ErrorCode::EC_OK, ""});
+        promise->set_value(PlanExecuteResult{ErrorCode::EC_OK, "", {}});
         return future;
     }
 
@@ -434,7 +445,7 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::Submit(const CacheLocationD
         return future;
     }
     if (actual_task.block_keys.empty()) {
-        promise->set_value(PlanExecuteResult{ErrorCode::EC_OK, ""});
+        promise->set_value(PlanExecuteResult{ErrorCode::EC_OK, "", {}});
         return future;
     }
 

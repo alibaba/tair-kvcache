@@ -966,7 +966,7 @@ void CacheReclaimer::HandleDelRes() noexcept {
             it = delete_handlers_.erase_after(it_pre);
         } else if (const auto fs = it->fut_.wait_for(std::chrono::seconds::zero()); fs == std::future_status::ready) {
             try {
-                if (const auto [ec, err_msg] = it->fut_.get(); ec != ErrorCode::EC_OK) {
+                if (const auto [ec, err_msg, _] = it->fut_.get(); ec != ErrorCode::EC_OK) {
                     LOG_WITH_ID(WARN,
                                 "reclaim request execute failed, error_code: [%d], error message: [%s]",
                                 static_cast<std::int32_t>(ec),
