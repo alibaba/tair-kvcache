@@ -15,7 +15,7 @@ namespace kv_cache_manager {
 class DebugServiceImpl;
 class AdminServiceImpl;
 class MetaServiceImpl;
-class DistributedLockBackend;
+class CoordinationBackend;
 class LeaderElector;
 class RegistryManager;
 class CacheManager;
@@ -72,7 +72,7 @@ private:
     std::thread admin_http_thread_;
     std::thread debug_http_thread_;
 
-    std::shared_ptr<DistributedLockBackend> distributed_lock_backend_;
+    std::shared_ptr<CoordinationBackend> coordination_backend_;
     std::shared_ptr<LeaderElector> leader_elector_;
     std::shared_ptr<RegistryManager> registry_manager_;
     std::shared_ptr<CacheManager> cache_manager_;

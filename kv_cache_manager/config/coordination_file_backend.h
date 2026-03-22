@@ -10,14 +10,14 @@
 
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/logger.h"
-#include "kv_cache_manager/config/distributed_lock_backend.h"
+#include "kv_cache_manager/config/coordination_backend.h"
 
 namespace kv_cache_manager {
 
-class DistributedLockFileBackend : public DistributedLockBackend {
+class CoordinationFileBackend : public CoordinationBackend {
 public:
-    DistributedLockFileBackend() = default;
-    ~DistributedLockFileBackend() override;
+    CoordinationFileBackend() = default;
+    ~CoordinationFileBackend() override;
 
 public:
     ErrorCode Init(const StandardUri &standard_uri) noexcept override;

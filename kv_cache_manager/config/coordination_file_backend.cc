@@ -1,4 +1,4 @@
-#include "kv_cache_manager/config/distributed_lock_file_backend.h"
+#include "kv_cache_manager/config/coordination_file_backend.h"
 
 #include <algorithm>
 #include <chrono>
@@ -16,9 +16,9 @@
 
 namespace kv_cache_manager {
 
-DistributedLockFileBackend::~DistributedLockFileBackend() {}
+CoordinationFileBackend::~CoordinationFileBackend() {}
 
-ErrorCode DistributedLockFileBackend::Init(const StandardUri &standard_uri) noexcept {
+ErrorCode CoordinationFileBackend::Init(const StandardUri &standard_uri) noexcept {
     lock_dir_path_ = standard_uri.GetPath();
 
     if (lock_dir_path_.empty()) {
@@ -36,11 +36,11 @@ ErrorCode DistributedLockFileBackend::Init(const StandardUri &standard_uri) noex
         }
     }
 
-    KVCM_LOG_INFO("DistributedLockLocalBackend initialized with directory: %s", lock_dir_path_.c_str());
+    KVCM_LOG_INFO("CoordinationFileBackend initialized with directory: %s", lock_dir_path_.c_str());
     return EC_OK;
 }
 
-std::string DistributedLockFileBackend::GetLockFilePath(const std::string &lock_key) const {
+std::string CoordinationFileBackend::GetLockFilePath(const std::string &lock_key) const {
     // 简单实现：直接使用lock_key作为文件名，可能需要处理特殊字符
     // 这里使用简单的方式，如果lock_key包含路径分隔符，会被扁平化
     std::string safe_key = lock_key;
@@ -49,7 +49,7 @@ std::string DistributedLockFileBackend::GetLockFilePath(const std::string &lock_
     return lock_dir_path_ + "/" + safe_key + ".lock";
 }
 
-ErrorCode DistributedLockFileBackend::ReadLockFileContent(int fd, std::string &content) {
+ErrorCode CoordinationFileBackend::ReadLockFileContent(int fd, std::string &content) {
     // 移动到文件开头
     if (lseek(fd, 0, SEEK_SET) < 0) {
         KVCM_LOG_ERROR("lseek failed: %s", strerror(errno));
@@ -70,7 +70,7 @@ ErrorCode DistributedLockFileBackend::ReadLockFileContent(int fd, std::string &c
     return EC_OK;
 }
 
-ErrorCode DistributedLockFileBackend::WriteLockFileContent(int fd, const std::string &content) {
+ErrorCode CoordinationFileBackend::WriteLockFileContent(int fd, const std::string &content) {
     // 清空文件
     if (ftruncate(fd, 0) < 0) {
         KVCM_LOG_ERROR("ftruncate failed: %s", strerror(errno));
@@ -92,7 +92,7 @@ ErrorCode DistributedLockFileBackend::WriteLockFileContent(int fd, const std::st
     return EC_OK;
 }
 
-bool DistributedLockFileBackend::IsLockExpired(const std::string &lock_content, int64_t &expire_time_ms) {
+bool CoordinationFileBackend::IsLockExpired(const std::string &lock_content, int64_t &expire_time_ms) {
     std::string unused_value;
     if (!ParseLockContent(lock_content, unused_value, expire_time_ms)) {
         return true; // 解析失败，视为过期
@@ -102,7 +102,7 @@ bool DistributedLockFileBackend::IsLockExpired(const std::string &lock_content, 
     return now >= expire_time;
 }
 
-std::string DistributedLockFileBackend::SerializeLockContent(const std::string &lock_value,
+std::string CoordinationFileBackend::SerializeLockContent(const std::string &lock_value,
                                                              int64_t expire_time_ms) const {
     rapidjson::StringBuffer sb;
     rapidjson::Writer<rapidjson::StringBuffer> writer(sb);
@@ -117,7 +117,7 @@ std::string DistributedLockFileBackend::SerializeLockContent(const std::string &
     return sb.GetString();
 }
 
-bool DistributedLockFileBackend::ParseLockContent(const std::string &lock_content,
+bool CoordinationFileBackend::ParseLockContent(const std::string &lock_content,
                                                   std::string &out_lock_value,
                                                   int64_t &out_expire_time_ms) const {
     rapidjson::Document doc;
@@ -151,7 +151,7 @@ bool DistributedLockFileBackend::ParseLockContent(const std::string &lock_conten
 }
 
 ErrorCode
-DistributedLockFileBackend::TryLock(const std::string &lock_key, const std::string &lock_value, int64_t ttl_ms) {
+CoordinationFileBackend::TryLock(const std::string &lock_key, const std::string &lock_value, int64_t ttl_ms) {
     if (lock_key.empty() || lock_value.empty() || ttl_ms <= 0) {
         KVCM_LOG_ERROR("Invalid arguments for TryLock: key=%s, ttl_ms=%ld", lock_key.c_str(), ttl_ms);
         return EC_BADARGS;
@@ -198,7 +198,7 @@ DistributedLockFileBackend::TryLock(const std::string &lock_key, const std::stri
 }
 
 ErrorCode
-DistributedLockFileBackend::RenewLock(const std::string &lock_key, const std::string &lock_value, int64_t ttl_ms) {
+CoordinationFileBackend::RenewLock(const std::string &lock_key, const std::string &lock_value, int64_t ttl_ms) {
     std::string lock_file_path = GetLockFilePath(lock_key);
 
     FileLockGuard guard(lock_file_path, false);
@@ -245,7 +245,7 @@ DistributedLockFileBackend::RenewLock(const std::string &lock_key, const std::st
     return ec;
 }
 
-ErrorCode DistributedLockFileBackend::Unlock(const std::string &lock_key, const std::string &lock_value) {
+ErrorCode CoordinationFileBackend::Unlock(const std::string &lock_key, const std::string &lock_value) {
     std::string lock_file_path = GetLockFilePath(lock_key);
 
     FileLockGuard guard(lock_file_path, false);
@@ -281,7 +281,7 @@ ErrorCode DistributedLockFileBackend::Unlock(const std::string &lock_key, const 
     return ec;
 }
 
-ErrorCode DistributedLockFileBackend::GetLockHolder(const std::string &lock_key,
+ErrorCode CoordinationFileBackend::GetLockHolder(const std::string &lock_key,
                                                     std::string &out_current_value,
                                                     int64_t &out_expire_time_ms) {
     std::string lock_file_path = GetLockFilePath(lock_key);

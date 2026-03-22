@@ -8,13 +8,14 @@ namespace kv_cache_manager {
 class StandardUri;
 
 /**
- * @brief Distributed lock backend interface
+ * @brief Coordination backend interface
  *
- * Provides basic operations for distributed locks, supporting multiple backend implementations
- * (e.g., local filesystem, Redis, etc.). All interfaces are thread-safe, and implementations
+ * Provides distributed coordination capabilities including distributed locks and
+ * key-value storage, supporting multiple backend implementations (e.g., local
+ * filesystem, Redis, etc.). All interfaces are thread-safe, and implementations
  * should ensure atomicity of operations.
  */
-class DistributedLockBackend {
+class CoordinationBackend {
 public:
     virtual ~DistributedLockBackend() = default;
 

@@ -8,7 +8,7 @@
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/standard_uri.h"
-#include "kv_cache_manager/config/distributed_lock_backend.h"
+#include "kv_cache_manager/config/coordination_backend.h"
 
 namespace kv_cache_manager {
 
@@ -21,18 +21,18 @@ namespace kv_cache_manager {
  *
  * URI format: memory:// (any path or parameters are ignored)
  */
-class DistributedLockMemoryBackend : public DistributedLockBackend {
+class CoordinationMemoryBackend : public CoordinationBackend {
 public:
-    DistributedLockMemoryBackend();
-    ~DistributedLockMemoryBackend() override;
+    CoordinationMemoryBackend();
+    ~CoordinationMemoryBackend() override;
 
     // 禁止拷贝和赋值
-    DistributedLockMemoryBackend(const DistributedLockMemoryBackend &) = delete;
-    DistributedLockMemoryBackend &operator=(const DistributedLockMemoryBackend &) = delete;
+    CoordinationMemoryBackend(const CoordinationMemoryBackend &) = delete;
+    CoordinationMemoryBackend &operator=(const CoordinationMemoryBackend &) = delete;
 
     // 允许移动
-    DistributedLockMemoryBackend(DistributedLockMemoryBackend &&) = default;
-    DistributedLockMemoryBackend &operator=(DistributedLockMemoryBackend &&) = default;
+    CoordinationMemoryBackend(CoordinationMemoryBackend &&) = default;
+    CoordinationMemoryBackend &operator=(CoordinationMemoryBackend &&) = default;
 
 public:
     ErrorCode Init(const StandardUri &standard_uri) noexcept override;
