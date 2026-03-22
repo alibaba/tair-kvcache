@@ -4,16 +4,16 @@
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/loop_thread.h"
 #include "kv_cache_manager/common/timestamp_util.h"
-#include "kv_cache_manager/config/distributed_lock_backend.h"
+#include "kv_cache_manager/config/coordination_backend.h"
 
 namespace kv_cache_manager {
 
-LeaderElector::LeaderElector(const std::shared_ptr<DistributedLockBackend> &lock_backend,
+LeaderElector::LeaderElector(const std::shared_ptr<CoordinationBackend> &coordination_backend,
                              const std::string &lock_key,
                              const std::string &lock_value,
                              int64_t lease_ms,
                              int64_t loop_interval_ms)
-    : lock_backend_(lock_backend)
+    : coordination_backend_(coordination_backend)
     , lock_key_(lock_key)
     , lock_value_(lock_value)
     , lease_timeout_us_(lease_ms * 1000)
@@ -131,7 +131,7 @@ void LeaderElector::CampaignLeader(int64_t current_time) {
     // 检查当前锁是否被其他实例持有
     std::string current_value;
     int64_t expire_time_ms;
-    ErrorCode ec = lock_backend_->GetLockHolder(lock_key_, current_value, expire_time_ms);
+    ErrorCode ec = coordination_backend_->GetLockHolder(lock_key_, current_value, expire_time_ms);
     if (ec != EC_OK && ec != EC_NOENT) {
         KVCM_LOG_WARN("check lock status failed, error_code=%d", static_cast<int>(ec));
         return;
@@ -154,7 +154,7 @@ void LeaderElector::CampaignLeader(int64_t current_time) {
     }
 
     // 尝试获取锁
-    ec = lock_backend_->TryLock(lock_key_, lock_value_, lease_timeout_us_ / 1000);
+    ec = coordination_backend_->TryLock(lock_key_, lock_value_, lease_timeout_us_ / 1000);
     if (ec == EC_OK) {
         KVCM_LOG_INFO("campaign leader success!");
         UpdateLockStatus(current_time, true, current_time + lease_timeout_us_);
@@ -170,7 +170,7 @@ void LeaderElector::HoldLeader(int64_t current_time) {
         return;
     }
 
-    ErrorCode ec = lock_backend_->RenewLock(lock_key_, lock_value_, lease_timeout_us_ / 1000);
+    ErrorCode ec = coordination_backend_->RenewLock(lock_key_, lock_value_, lease_timeout_us_ / 1000);
     if (ec == EC_OK) {
         UpdateLockStatus(current_time, true, current_time + lease_timeout_us_);
         return;
@@ -225,7 +225,7 @@ void LeaderElector::DoDemote(int64_t current_time) {
     }
 
     // 释放锁
-    ErrorCode ec = lock_backend_->Unlock(lock_key_, lock_value_);
+    ErrorCode ec = coordination_backend_->Unlock(lock_key_, lock_value_);
     if (ec == EC_OK) {
         KVCM_LOG_INFO("release lock success");
     } else {

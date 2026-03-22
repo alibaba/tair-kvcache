@@ -14,9 +14,17 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
          config->registry_storage_uri_ = value;
          return true;
      }},
+    {"kvcm.coordination.uri",
+     [](const std::string &value, ServerConfig *config) {
+         config->coordination_uri_ = value;
+         return true;
+     }},
     {"kvcm.distributed_lock.uri",
      [](const std::string &value, ServerConfig *config) {
-         config->distributed_lock_uri_ = value;
+         // Backward compatibility: only set if not already set by kvcm.coordination.uri
+         if (config->coordination_uri_.empty()) {
+             config->coordination_uri_ = value;
+         }
          return true;
      }},
     {"kvcm.leader_elector.node_id",

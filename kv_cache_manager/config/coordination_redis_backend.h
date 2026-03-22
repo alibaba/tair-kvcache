@@ -6,22 +6,22 @@
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/redis_client_ext.h"
 #include "kv_cache_manager/common/standard_uri.h"
-#include "kv_cache_manager/config/distributed_lock_backend.h"
+#include "kv_cache_manager/config/coordination_backend.h"
 
 namespace kv_cache_manager {
 
-class DistributedLockRedisBackend : public DistributedLockBackend {
+class CoordinationRedisBackend : public CoordinationBackend {
 public:
-    DistributedLockRedisBackend();
-    ~DistributedLockRedisBackend() override;
+    CoordinationRedisBackend();
+    ~CoordinationRedisBackend() override;
 
     // 禁止拷贝和赋值
-    DistributedLockRedisBackend(const DistributedLockRedisBackend &) = delete;
-    DistributedLockRedisBackend &operator=(const DistributedLockRedisBackend &) = delete;
+    CoordinationRedisBackend(const CoordinationRedisBackend &) = delete;
+    CoordinationRedisBackend &operator=(const CoordinationRedisBackend &) = delete;
 
     // 允许移动
-    DistributedLockRedisBackend(DistributedLockRedisBackend &&) = default;
-    DistributedLockRedisBackend &operator=(DistributedLockRedisBackend &&) = default;
+    CoordinationRedisBackend(CoordinationRedisBackend &&) = default;
+    CoordinationRedisBackend &operator=(CoordinationRedisBackend &&) = default;
 
 public:
     ErrorCode Init(const StandardUri &standard_uri) noexcept override;

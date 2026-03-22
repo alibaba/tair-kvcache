@@ -19,7 +19,7 @@ public:
 
 public:
     const std::string &GetRegistryStorageUri() const { return registry_storage_uri_; }
-    const std::string &GetDistributedLockUri() const { return distributed_lock_uri_; }
+    const std::string &GetCoordinationUri() const { return coordination_uri_; }
     const std::string &GetLeaderElectorNodeId() const { return leader_elector_node_id_; }
     int64_t GetLeaderElectorLeaseMs() const { return leader_elector_lease_ms_; }
     int64_t GetLeaderElectorLoopIntervalMs() const { return leader_elector_loop_interval_ms_; }
@@ -50,7 +50,7 @@ private:
 
 private:
     std::string registry_storage_uri_;
-    std::string distributed_lock_uri_;
+    std::string coordination_uri_;
     std::string leader_elector_node_id_;
     int64_t leader_elector_lease_ms_ = 0;
     int64_t leader_elector_loop_interval_ms_ = 0;

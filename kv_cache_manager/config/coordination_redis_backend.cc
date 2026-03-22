@@ -1,4 +1,4 @@
-#include "kv_cache_manager/config/distributed_lock_redis_backend.h"
+#include "kv_cache_manager/config/coordination_redis_backend.h"
 
 #include <memory>
 #include <string>
@@ -10,11 +10,11 @@
 
 namespace kv_cache_manager {
 
-DistributedLockRedisBackend::DistributedLockRedisBackend() = default;
+CoordinationRedisBackend::CoordinationRedisBackend() = default;
 
-DistributedLockRedisBackend::~DistributedLockRedisBackend() = default;
+CoordinationRedisBackend::~CoordinationRedisBackend() = default;
 
-ErrorCode DistributedLockRedisBackend::Init(const StandardUri &standard_uri) noexcept {
+ErrorCode CoordinationRedisBackend::Init(const StandardUri &standard_uri) noexcept {
     // 验证URI协议
     if (standard_uri.GetProtocol() != "redis") {
         KVCM_LOG_ERROR("Invalid protocol for Redis lock backend: %s", standard_uri.GetProtocol().c_str());
@@ -69,12 +69,12 @@ ErrorCode DistributedLockRedisBackend::Init(const StandardUri &standard_uri) noe
     return EC_OK;
 }
 
-std::string DistributedLockRedisBackend::GetRedisKey(const std::string &lock_key) const {
+std::string CoordinationRedisBackend::GetRedisKey(const std::string &lock_key) const {
     return key_prefix_ + lock_key;
 }
 
 ErrorCode
-DistributedLockRedisBackend::TryLock(const std::string &lock_key, const std::string &lock_value, int64_t ttl_ms) {
+CoordinationRedisBackend::TryLock(const std::string &lock_key, const std::string &lock_value, int64_t ttl_ms) {
     if (!initialized_) {
         KVCM_LOG_ERROR("Redis lock backend not initialized");
         return EC_ERROR;
@@ -113,7 +113,7 @@ DistributedLockRedisBackend::TryLock(const std::string &lock_key, const std::str
 }
 
 ErrorCode
-DistributedLockRedisBackend::RenewLock(const std::string &lock_key, const std::string &lock_value, int64_t ttl_ms) {
+CoordinationRedisBackend::RenewLock(const std::string &lock_key, const std::string &lock_value, int64_t ttl_ms) {
     if (!initialized_) {
         KVCM_LOG_ERROR("Redis lock backend not initialized");
         return EC_ERROR;
@@ -154,7 +154,7 @@ DistributedLockRedisBackend::RenewLock(const std::string &lock_key, const std::s
     }
 }
 
-ErrorCode DistributedLockRedisBackend::Unlock(const std::string &lock_key, const std::string &lock_value) {
+ErrorCode CoordinationRedisBackend::Unlock(const std::string &lock_key, const std::string &lock_value) {
     if (!initialized_) {
         KVCM_LOG_ERROR("Redis lock backend not initialized");
         return EC_ERROR;
@@ -195,7 +195,7 @@ ErrorCode DistributedLockRedisBackend::Unlock(const std::string &lock_key, const
     }
 }
 
-ErrorCode DistributedLockRedisBackend::GetLockHolder(const std::string &lock_key,
+ErrorCode CoordinationRedisBackend::GetLockHolder(const std::string &lock_key,
                                                      std::string &out_current_value,
                                                      int64_t &out_expire_time_ms) {
     if (!initialized_) {
