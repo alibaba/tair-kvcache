@@ -116,7 +116,8 @@ private:
 
 private:
     std::unique_ptr<RedisClientExt> redis_client_;
-    std::string key_prefix_;
+    std::string lock_key_prefix_;
+    std::string kv_key_prefix_;
     bool initialized_{false};
 
     // Lua脚本的SHA1缓存

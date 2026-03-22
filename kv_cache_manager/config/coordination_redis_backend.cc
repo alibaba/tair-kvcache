@@ -41,8 +41,10 @@ ErrorCode CoordinationRedisBackend::Init(const StandardUri &standard_uri) noexce
         return EC_IO_ERROR;
     }
 
-    // 设置键前缀
-    key_prefix_ = "kvcm_lock:";
+    // 设置键前缀（从公共前缀 kvcm_ 派生，lock 前缀保持与旧版本一致）
+    std::string base_prefix = "kvcm_";
+    lock_key_prefix_ = base_prefix + "lock:";
+    kv_key_prefix_ = base_prefix + "kv:";
 
     initialized_ = true;
 
@@ -70,7 +72,7 @@ ErrorCode CoordinationRedisBackend::Init(const StandardUri &standard_uri) noexce
 }
 
 std::string CoordinationRedisBackend::GetRedisKey(const std::string &lock_key) const {
-    return key_prefix_ + lock_key;
+    return lock_key_prefix_ + lock_key;
 }
 
 ErrorCode
@@ -240,7 +242,7 @@ ErrorCode CoordinationRedisBackend::GetLockHolder(const std::string &lock_key,
 }
 
 std::string CoordinationRedisBackend::GetRedisKVKey(const std::string &key) const {
-    return "kvcm_kv:" + key;
+    return kv_key_prefix_ + key;
 }
 
 ErrorCode CoordinationRedisBackend::SetValue(const std::string &key, const std::string &value) {

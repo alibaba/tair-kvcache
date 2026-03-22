@@ -847,6 +847,11 @@ void AdminServiceImpl::GetManagerClusterInfo(RequestContext *request_context,
             endpoint->set_meta_http_port(node_info.meta_http_port());
             endpoint->set_admin_rpc_port(node_info.admin_rpc_port());
             endpoint->set_admin_http_port(node_info.admin_http_port());
+        } else {
+            KVCM_LOG_WARN("[traceId: %s] GetManagerClusterInfo: failed to read node info for leader %s, ec=%d",
+                          request->trace_id().c_str(),
+                          leader_node_id.c_str(),
+                          ec);
         }
     }
 

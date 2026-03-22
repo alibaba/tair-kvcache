@@ -1,5 +1,6 @@
 #pragma once
 #include <memory>
+#include <string>
 
 namespace kv_cache_manager {
 class CoordinationBackend;
