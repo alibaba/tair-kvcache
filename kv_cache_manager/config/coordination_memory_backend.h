@@ -41,6 +41,8 @@ public:
     ErrorCode Unlock(const std::string &lock_key, const std::string &lock_value) override;
     ErrorCode
     GetLockHolder(const std::string &lock_key, std::string &out_current_value, int64_t &out_expire_time_ms) override;
+    ErrorCode SetValue(const std::string &key, const std::string &value) override;
+    ErrorCode GetValue(const std::string &key, std::string &out_value) override;
 
 private:
     // 锁信息结构
@@ -81,6 +83,7 @@ private:
 private:
     std::mutex mutex_;
     std::unordered_map<std::string, LockInfo> locks_;
+    std::unordered_map<std::string, std::string> kv_store_;
     bool initialized_{false};
 };
 

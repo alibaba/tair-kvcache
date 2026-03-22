@@ -200,4 +200,36 @@ ErrorCode CoordinationMemoryBackend::GetLockHolder(const std::string &lock_key,
     return EC_OK;
 }
 
+ErrorCode CoordinationMemoryBackend::SetValue(const std::string &key, const std::string &value) {
+    if (!initialized_) {
+        KVCM_LOG_ERROR("Memory coordination backend not initialized");
+        return EC_ERROR;
+    }
+    if (key.empty()) {
+        KVCM_LOG_ERROR("Invalid arguments for SetValue: key is empty");
+        return EC_BADARGS;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    kv_store_[key] = value;
+    return EC_OK;
+}
+
+ErrorCode CoordinationMemoryBackend::GetValue(const std::string &key, std::string &out_value) {
+    if (!initialized_) {
+        KVCM_LOG_ERROR("Memory coordination backend not initialized");
+        return EC_ERROR;
+    }
+    if (key.empty()) {
+        KVCM_LOG_ERROR("Invalid arguments for GetValue: key is empty");
+        return EC_BADARGS;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = kv_store_.find(key);
+    if (it == kv_store_.end()) {
+        return EC_NOENT;
+    }
+    out_value = it->second;
+    return EC_OK;
+}
+
 } // namespace kv_cache_manager

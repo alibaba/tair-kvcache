@@ -321,4 +321,58 @@ ErrorCode CoordinationFileBackend::GetLockHolder(const std::string &lock_key,
     return EC_OK;
 }
 
+std::string CoordinationFileBackend::GetKVFilePath(const std::string &key) const {
+    std::string safe_key = key;
+    std::replace(safe_key.begin(), safe_key.end(), '/', '_');
+    std::replace(safe_key.begin(), safe_key.end(), '\\', '_');
+    return lock_dir_path_ + "/" + safe_key + ".kv";
+}
+
+ErrorCode CoordinationFileBackend::SetValue(const std::string &key, const std::string &value) {
+    if (key.empty()) {
+        KVCM_LOG_ERROR("Invalid arguments for SetValue: key is empty");
+        return EC_BADARGS;
+    }
+
+    std::string kv_file_path = GetKVFilePath(key);
+    FileLockGuard guard(kv_file_path, true);
+
+    ErrorCode ec = guard.Lock();
+    if (ec != EC_OK) {
+        return ec;
+    }
+
+    ec = WriteLockFileContent(guard.fd(), value);
+    return ec;
+}
+
+ErrorCode CoordinationFileBackend::GetValue(const std::string &key, std::string &out_value) {
+    if (key.empty()) {
+        KVCM_LOG_ERROR("Invalid arguments for GetValue: key is empty");
+        return EC_BADARGS;
+    }
+
+    std::string kv_file_path = GetKVFilePath(key);
+    FileLockGuard guard(kv_file_path, false);
+
+    ErrorCode ec = guard.Lock();
+    if (ec == EC_NOENT) {
+        return EC_NOENT;
+    }
+    if (ec != EC_OK) {
+        return ec;
+    }
+
+    ec = ReadLockFileContent(guard.fd(), out_value);
+    if (ec != EC_OK) {
+        return ec;
+    }
+
+    if (out_value.empty()) {
+        return EC_NOENT;
+    }
+
+    return EC_OK;
+}
+
 } // namespace kv_cache_manager

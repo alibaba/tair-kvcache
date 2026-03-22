@@ -30,10 +30,15 @@ public:
     ErrorCode Unlock(const std::string &lock_key, const std::string &lock_value) override;
     ErrorCode
     GetLockHolder(const std::string &lock_key, std::string &out_current_value, int64_t &out_expire_time_ms) override;
+    ErrorCode SetValue(const std::string &key, const std::string &value) override;
+    ErrorCode GetValue(const std::string &key, std::string &out_value) override;
 
 private:
-    // 生成Redis键名
+    // 生成Redis锁键名
     std::string GetRedisKey(const std::string &lock_key) const;
+
+    // 生成Redis KV键名
+    std::string GetRedisKVKey(const std::string &key) const;
 
     // Lua脚本：尝试获取锁（原子操作）
     static constexpr const char *LUA_TRY_LOCK = R"(
