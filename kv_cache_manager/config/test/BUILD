@@ -70,22 +70,22 @@ cc_test(
 )
 
 cc_library(
-    name = "distributed_lock_backend_test_base",
+    name = "coordination_backend_test_base",
     testonly = True,
     srcs = [],
-    hdrs = ["distributed_lock_backend_test_base.h"],
+    hdrs = ["coordination_backend_test_base.h"],
     copts = ["-fno-access-control"],
     data = [],
     deps = [
-        "//kv_cache_manager/config:distributed_lock_backend",
+        "//kv_cache_manager/config:coordination_backend",
         "//kv_cache_manager/common:unittest",
     ],
 )
 
 cc_test(
-    name = "distributed_lock_redis_backend_test",
+    name = "coordination_redis_backend_test",
     srcs = [
-        "distributed_lock_redis_backend_test.cc",
+        "coordination_redis_backend_test.cc",
     ],
     copts = ["-fno-access-control"],
     data = [],
@@ -94,37 +94,37 @@ cc_test(
         "redis",
     ],
     deps = [
-        ":distributed_lock_backend_test_base",
+        ":coordination_backend_test_base",
         "//kv_cache_manager/common:unittest",
-        "//kv_cache_manager/config:distributed_lock_backend",
+        "//kv_cache_manager/config:coordination_backend",
     ],
 )
 
 cc_test(
-    name = "distributed_lock_file_backend_test",
+    name = "coordination_file_backend_test",
     srcs = [
-        "distributed_lock_file_backend_test.cc",
+        "coordination_file_backend_test.cc",
     ],
     copts = ["-fno-access-control"],
     data = [],
     deps = [
-        ":distributed_lock_backend_test_base",
+        ":coordination_backend_test_base",
         "//kv_cache_manager/common:unittest",
-        "//kv_cache_manager/config:distributed_lock_backend",
+        "//kv_cache_manager/config:coordination_backend",
     ],
 )
 
 cc_test(
-    name = "distributed_lock_memory_backend_test",
+    name = "coordination_memory_backend_test",
     srcs = [
-        "distributed_lock_memory_backend_test.cc",
+        "coordination_memory_backend_test.cc",
     ],
     copts = ["-fno-access-control"],
     data = [],
     deps = [
-        ":distributed_lock_backend_test_base",
+        ":coordination_backend_test_base",
         "//kv_cache_manager/common:unittest",
-        "//kv_cache_manager/config:distributed_lock_backend",
+        "//kv_cache_manager/config:coordination_backend",
     ],
 )
 
@@ -137,7 +137,7 @@ cc_test(
     data = [],
     deps = [
         "//kv_cache_manager/common:unittest",
-        "//kv_cache_manager/config:distributed_lock_backend",
+        "//kv_cache_manager/config:coordination_backend",
         "//kv_cache_manager/config:leader_elector_base",
     ],
 )

@@ -314,7 +314,7 @@ bool Server::CreateLeaderElector() {
     coordination_backend_ =
         CoordinationBackendFactory::CreateAndInitCoordinationBackend(coordination_uri);
     if (!coordination_backend_) {
-        KVCM_LOG_ERROR("distributed_lock_backend[%s] init failed", coordination_uri.c_str());
+        KVCM_LOG_ERROR("coordination_backend[%s] init failed", coordination_uri.c_str());
         return false;
     }
 
