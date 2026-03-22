@@ -26,6 +26,10 @@
 #include "kv_cache_manager/service/http_service/meta_service_http.h"
 #include "kv_cache_manager/service/meta_service_impl.h"
 
+#include "rapidjson/document.h"
+#include "rapidjson/stringbuffer.h"
+#include "rapidjson/writer.h"
+
 namespace kv_cache_manager {
 
 bool Server::Init(const ServerConfig &config) {
@@ -55,7 +59,7 @@ bool Server::Init(const ServerConfig &config) {
     CreateMetricsReporter();
     CreateAndRegisterEventPublisher();
 
-    meta_impl_ = std::make_shared<MetaServiceImpl>(cache_manager_, metrics_reporter_);
+    meta_impl_ = std::make_shared<MetaServiceImpl>(cache_manager_, metrics_reporter_, leader_elector_);
     admin_impl_ = std::make_shared<AdminServiceImpl>(
         cache_manager_, metrics_reporter_, metrics_registry_, registry_manager_, leader_elector_);
     debug_impl_ = std::make_shared<DebugServiceImpl>(cache_manager_);
@@ -325,6 +329,32 @@ bool Server::CreateLeaderElector() {
                                                       config_.GetLeaderElectorLoopIntervalMs());
     leader_elector_->SetBecomeLeaderHandler([this]() { OnBecomeLeader(); });
     leader_elector_->SetNoLongerLeaderHandler([this]() { OnNoLongerLeader(); });
+
+    // 写入本节点的连接信息到协调后端
+    {
+        rapidjson::StringBuffer sb;
+        rapidjson::Writer<rapidjson::StringBuffer> writer(sb);
+        writer.StartObject();
+        writer.Key("node_id");
+        writer.String(node_id.c_str(), node_id.size());
+        writer.Key("meta_rpc_port");
+        writer.Int(config_.GetServiceRpcPort());
+        writer.Key("meta_http_port");
+        writer.Int(config_.GetServiceHttpPort());
+        writer.Key("admin_rpc_port");
+        writer.Int(config_.GetServiceAdminRpcPort());
+        writer.Key("admin_http_port");
+        writer.Int(config_.GetServiceAdminHttpPort());
+        writer.EndObject();
+
+        ErrorCode ec = leader_elector_->WriteNodeInfo(node_id, sb.GetString());
+        if (ec != EC_OK) {
+            KVCM_LOG_WARN("failed to write node info for node_id[%s], ec=%d", node_id.c_str(), ec);
+        } else {
+            KVCM_LOG_INFO("node info written for node_id[%s]", node_id.c_str());
+        }
+    }
+
     return true;
 }
 

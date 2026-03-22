@@ -9,6 +9,8 @@
 #include <string>
 #include <thread>
 
+#include "kv_cache_manager/common/error_code.h"
+
 namespace kv_cache_manager {
 
 class LoopThread;
@@ -33,7 +35,7 @@ class LeaderElector {
 public:
     using HandlerFuncType = std::function<void()>;
 
-    LeaderElector(const std::shared_ptr<CoordinationBackend> &lock_backend,
+    LeaderElector(const std::shared_ptr<CoordinationBackend> &coordination_backend,
                   const std::string &lock_key,
                   const std::string &lock_value,
                   int64_t lease_ms = 60,
@@ -68,6 +70,10 @@ public:
     std::string GetLeaderInfo() const;
     std::string GetLeaderNodeID() const;
     std::string GetSelfNodeID() const;
+
+    // 节点连接信息存储（通过 CoordinationBackend KV）
+    ErrorCode WriteNodeInfo(const std::string &node_id, const std::string &node_info_json);
+    ErrorCode ReadNodeInfo(const std::string &node_id, std::string &out_node_info_json);
 
     // 选主控制
     void SetForbidCampaignLeaderTimeMs(int64_t forbid_time);

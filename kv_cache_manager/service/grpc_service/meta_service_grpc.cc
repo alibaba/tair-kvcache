@@ -82,4 +82,12 @@ grpc::Status MetaServiceGRpc::TrimCache(grpc::ServerContext *context,
     return grpc::Status::OK;
 }
 
+grpc::Status MetaServiceGRpc::GetClusterInfo(grpc::ServerContext *context,
+                                             const proto::meta::GetClusterInfoRequest *request,
+                                             proto::meta::GetClusterInfoResponse *response) {
+    API_CONTEXT_GET_COLLECTOR_AND_INIT_GRPC(GetClusterInfo, grpc::Status::OK);
+    meta_service_impl_->GetClusterInfo(request_context, request, response);
+    return grpc::Status::OK;
+}
+
 } // namespace kv_cache_manager

@@ -49,6 +49,7 @@ MetaServiceMetricsBase::MetaServiceMetricsBase(std::shared_ptr<MetricsRegistry> 
 void MetaServiceMetricsBase::InitMetrics() {
     MAKE_SERVICE_METRICS_COLLECTOR(RegisterInstance);
     MAKE_SERVICE_METRICS_COLLECTOR(GetInstanceInfo);
+    MAKE_SERVICE_METRICS_COLLECTOR(GetClusterInfo);
 }
 
 KVCM_DEFINE_METRICS_COLLECTOR_MAP_METHOD_(GetCacheMeta);
