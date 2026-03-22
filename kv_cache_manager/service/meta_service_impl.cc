@@ -19,7 +19,7 @@
 #include "kv_cache_manager/service/util/proto_message_json_util.h"
 #include "kv_cache_manager/service/util/service_call_guard.h"
 
-#include "rapidjson/document.h"
+#include "kv_cache_manager/config/node_endpoint_info.h"
 
 // TODO(rui): move into common.h
 #define API_CALL_GUARD(api_name, is_leader_only)                                                                       \
@@ -622,31 +622,16 @@ void MetaServiceImpl::GetClusterInfo(RequestContext *request_context,
 
     // 尝试读取 leader 的节点连接信息
     if (!leader_node_id.empty()) {
-        std::string node_info_json;
-        ErrorCode ec = leader_elector_->ReadNodeInfo(leader_node_id, node_info_json);
-        if (ec == EC_OK && !node_info_json.empty()) {
-            rapidjson::Document doc;
-            if (!doc.Parse(node_info_json.c_str()).HasParseError() && doc.IsObject()) {
-                auto *endpoint = response->mutable_leader_endpoint();
-                if (doc.HasMember("node_id") && doc["node_id"].IsString()) {
-                    endpoint->set_node_id(doc["node_id"].GetString());
-                }
-                if (doc.HasMember("host") && doc["host"].IsString()) {
-                    endpoint->set_host(doc["host"].GetString());
-                }
-                if (doc.HasMember("meta_rpc_port") && doc["meta_rpc_port"].IsInt()) {
-                    endpoint->set_meta_rpc_port(doc["meta_rpc_port"].GetInt());
-                }
-                if (doc.HasMember("meta_http_port") && doc["meta_http_port"].IsInt()) {
-                    endpoint->set_meta_http_port(doc["meta_http_port"].GetInt());
-                }
-                if (doc.HasMember("admin_rpc_port") && doc["admin_rpc_port"].IsInt()) {
-                    endpoint->set_admin_rpc_port(doc["admin_rpc_port"].GetInt());
-                }
-                if (doc.HasMember("admin_http_port") && doc["admin_http_port"].IsInt()) {
-                    endpoint->set_admin_http_port(doc["admin_http_port"].GetInt());
-                }
-            }
+        NodeEndpointInfo node_info;
+        ErrorCode ec = leader_elector_->ReadNodeInfo(leader_node_id, node_info);
+        if (ec == EC_OK) {
+            auto *endpoint = response->mutable_leader_endpoint();
+            endpoint->set_node_id(node_info.node_id());
+            endpoint->set_host(node_info.host());
+            endpoint->set_meta_rpc_port(node_info.meta_rpc_port());
+            endpoint->set_meta_http_port(node_info.meta_http_port());
+            endpoint->set_admin_rpc_port(node_info.admin_rpc_port());
+            endpoint->set_admin_http_port(node_info.admin_http_port());
         } else {
             KVCM_LOG_WARN("[traceId: %s] GetClusterInfo: failed to read node info for leader %s, ec=%d",
                           request->trace_id().c_str(),

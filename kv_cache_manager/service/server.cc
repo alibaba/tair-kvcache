@@ -25,10 +25,8 @@
 #include "kv_cache_manager/service/http_service/debug_service_http.h"
 #include "kv_cache_manager/service/http_service/meta_service_http.h"
 #include "kv_cache_manager/service/meta_service_impl.h"
+#include "kv_cache_manager/config/node_endpoint_info.h"
 
-#include "rapidjson/document.h"
-#include "rapidjson/stringbuffer.h"
-#include "rapidjson/writer.h"
 
 namespace kv_cache_manager {
 
@@ -332,22 +330,14 @@ bool Server::CreateLeaderElector() {
 
     // 写入本节点的连接信息到协调后端
     {
-        rapidjson::StringBuffer sb;
-        rapidjson::Writer<rapidjson::StringBuffer> writer(sb);
-        writer.StartObject();
-        writer.Key("node_id");
-        writer.String(node_id.c_str(), node_id.size());
-        writer.Key("meta_rpc_port");
-        writer.Int(config_.GetServiceRpcPort());
-        writer.Key("meta_http_port");
-        writer.Int(config_.GetServiceHttpPort());
-        writer.Key("admin_rpc_port");
-        writer.Int(config_.GetServiceAdminRpcPort());
-        writer.Key("admin_http_port");
-        writer.Int(config_.GetServiceAdminHttpPort());
-        writer.EndObject();
+        NodeEndpointInfo node_info(node_id,
+                                   "",  // TODO: fill with real host/IP
+                                   config_.GetServiceRpcPort(),
+                                   config_.GetServiceHttpPort(),
+                                   config_.GetServiceAdminRpcPort(),
+                                   config_.GetServiceAdminHttpPort());
 
-        ErrorCode ec = leader_elector_->WriteNodeInfo(node_id, sb.GetString());
+        ErrorCode ec = leader_elector_->WriteNodeInfo(node_id, node_info);
         if (ec != EC_OK) {
             KVCM_LOG_WARN("failed to write node info for node_id[%s], ec=%d", node_id.c_str(), ec);
         } else {

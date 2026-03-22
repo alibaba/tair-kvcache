@@ -76,7 +76,6 @@ cc_library(
         "//kv_cache_manager/service/util:proto_message_json_util",
         "//kv_cache_manager/service/util:service_access_log",
         "//kv_cache_manager/service/util:service_call_guard",
-        "@rapidjson",
     ],
 )
 
@@ -100,7 +99,6 @@ cc_library(
         "//kv_cache_manager/service/util:proto_message_json_util",
         "//kv_cache_manager/service/util:service_access_log",
         "//kv_cache_manager/service/util:service_call_guard",
-        "@rapidjson",
     ],
 )
 

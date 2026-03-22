@@ -7,6 +7,7 @@ cc_library(
     ],
     hdrs = [
         "leader_elector.h",
+        "node_endpoint_info.h",
     ],
     deps = [
         ":coordination_backend",
