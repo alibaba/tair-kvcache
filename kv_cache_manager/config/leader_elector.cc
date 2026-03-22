@@ -5,6 +5,7 @@
 #include "kv_cache_manager/common/loop_thread.h"
 #include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/config/coordination_backend.h"
+#include "kv_cache_manager/config/node_endpoint_info.h"
 
 namespace kv_cache_manager {
 
@@ -552,14 +553,23 @@ std::string LeaderElector::GetLeaderNodeID() const {
 
 std::string LeaderElector::GetSelfNodeID() const { return lock_value_; }
 
-ErrorCode LeaderElector::WriteNodeInfo(const std::string &node_id, const std::string &node_info_json) {
+ErrorCode LeaderElector::WriteNodeInfo(const std::string &node_id, const NodeEndpointInfo &node_info) {
     std::string key = "_TAIR_KVCM_NODE_INFO_" + node_id;
-    return coordination_backend_->SetValue(key, node_info_json);
+    return coordination_backend_->SetValue(key, node_info.ToJsonString());
 }
 
-ErrorCode LeaderElector::ReadNodeInfo(const std::string &node_id, std::string &out_node_info_json) {
+ErrorCode LeaderElector::ReadNodeInfo(const std::string &node_id, NodeEndpointInfo &out_node_info) {
     std::string key = "_TAIR_KVCM_NODE_INFO_" + node_id;
-    return coordination_backend_->GetValue(key, out_node_info_json);
+    std::string json_str;
+    ErrorCode ec = coordination_backend_->GetValue(key, json_str);
+    if (ec != EC_OK) {
+        return ec;
+    }
+    if (!out_node_info.FromJsonString(json_str)) {
+        KVCM_LOG_ERROR("Failed to parse node info JSON for node_id[%s]", node_id.c_str());
+        return EC_ERROR;
+    }
+    return EC_OK;
 }
 
 } // namespace kv_cache_manager

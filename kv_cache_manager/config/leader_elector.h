@@ -15,6 +15,7 @@ namespace kv_cache_manager {
 
 class LoopThread;
 class CoordinationBackend;
+class NodeEndpointInfo;
 
 // 角色状态枚举
 enum class RoleState {
@@ -72,8 +73,8 @@ public:
     std::string GetSelfNodeID() const;
 
     // 节点连接信息存储（通过 CoordinationBackend KV）
-    ErrorCode WriteNodeInfo(const std::string &node_id, const std::string &node_info_json);
-    ErrorCode ReadNodeInfo(const std::string &node_id, std::string &out_node_info_json);
+    ErrorCode WriteNodeInfo(const std::string &node_id, const NodeEndpointInfo &node_info);
+    ErrorCode ReadNodeInfo(const std::string &node_id, NodeEndpointInfo &out_node_info);
 
     // 选主控制
     void SetForbidCampaignLeaderTimeMs(int64_t forbid_time);
