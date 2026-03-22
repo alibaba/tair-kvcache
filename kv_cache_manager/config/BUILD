@@ -9,7 +9,7 @@ cc_library(
         "leader_elector.h",
     ],
     deps = [
-        ":distributed_lock_backend",
+        ":coordination_backend",
         "//kv_cache_manager/common",
         "//kv_cache_manager/common:loop_thread",
     ],
@@ -74,19 +74,19 @@ cc_library(
 )
 
 cc_library(
-    name = "distributed_lock_backend",
+    name = "coordination_backend",
     srcs = [
-        "distributed_lock_backend_factory.cc",
-        "distributed_lock_file_backend.cc",
-        "distributed_lock_memory_backend.cc",
-        "distributed_lock_redis_backend.cc",
+        "coordination_backend_factory.cc",
+        "coordination_file_backend.cc",
+        "coordination_memory_backend.cc",
+        "coordination_redis_backend.cc",
     ],
     hdrs = [
-        "distributed_lock_backend.h",
-        "distributed_lock_backend_factory.h",
-        "distributed_lock_file_backend.h",
-        "distributed_lock_memory_backend.h",
-        "distributed_lock_redis_backend.h",
+        "coordination_backend.h",
+        "coordination_backend_factory.h",
+        "coordination_file_backend.h",
+        "coordination_memory_backend.h",
+        "coordination_redis_backend.h",
     ],
     deps = [
         "//kv_cache_manager/common",

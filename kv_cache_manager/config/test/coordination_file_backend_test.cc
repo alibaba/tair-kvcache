@@ -10,12 +10,12 @@ namespace kv_cache_manager {
 CoordinationBackendTestConfig file_backend_config{
     .get_test_uri =
         [](CoordinationBackendTest *test_base) {
-            return "file://" + test_base->GetPrivateTestRuntimeDataPath() + "distributed_lock_test";
+            return "file://" + test_base->GetPrivateTestRuntimeDataPath() + "coordination_test";
         },
     .set_up_ =
         [](CoordinationBackendTest *test_base) {
             // 创建测试目录
-            std::string test_dir = test_base->GetPrivateTestRuntimeDataPath() + "distributed_lock_test";
+            std::string test_dir = test_base->GetPrivateTestRuntimeDataPath() + "coordination_test";
             std::error_code ec;
             std::filesystem::create_directories(test_dir, ec);
         },
@@ -23,7 +23,7 @@ CoordinationBackendTestConfig file_backend_config{
         [](CoordinationBackendTest *test_base) {
             // 清理测试目录
             std::error_code ec;
-            std::string test_dir = test_base->GetPrivateTestRuntimeDataPath() + "distributed_lock_test";
+            std::string test_dir = test_base->GetPrivateTestRuntimeDataPath() + "coordination_test";
             std::filesystem::remove_all(test_dir, ec);
         }};
 

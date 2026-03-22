@@ -17,7 +17,7 @@ class StandardUri;
  */
 class CoordinationBackend {
 public:
-    virtual ~DistributedLockBackend() = default;
+    virtual ~CoordinationBackend() = default;
 
     /**
      * @brief Initialize the distributed lock backend
