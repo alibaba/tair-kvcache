@@ -41,8 +41,10 @@ ErrorCode CoordinationRedisBackend::Init(const StandardUri &standard_uri) noexce
         return EC_IO_ERROR;
     }
 
-    // 设置键前缀
-    key_prefix_ = "kvcm_lock:";
+    // 设置键前缀（从公共前缀 kvcm_ 派生，lock 前缀保持与旧版本一致）
+    std::string base_prefix = "kvcm_";
+    lock_key_prefix_ = base_prefix + "lock:";
+    kv_key_prefix_ = base_prefix + "kv:";
 
     initialized_ = true;
 
@@ -70,7 +72,7 @@ ErrorCode CoordinationRedisBackend::Init(const StandardUri &standard_uri) noexce
 }
 
 std::string CoordinationRedisBackend::GetRedisKey(const std::string &lock_key) const {
-    return key_prefix_ + lock_key;
+    return lock_key_prefix_ + lock_key;
 }
 
 ErrorCode
@@ -236,6 +238,51 @@ ErrorCode CoordinationRedisBackend::GetLockHolder(const std::string &lock_key,
         return EC_NOENT;
     }
 
+    return EC_OK;
+}
+
+std::string CoordinationRedisBackend::GetRedisKVKey(const std::string &key) const {
+    return kv_key_prefix_ + key;
+}
+
+ErrorCode CoordinationRedisBackend::SetValue(const std::string &key, const std::string &value) {
+    if (!initialized_) {
+        KVCM_LOG_ERROR("Redis coordination backend not initialized");
+        return EC_ERROR;
+    }
+    if (key.empty()) {
+        KVCM_LOG_ERROR("Invalid arguments for SetValue: key is empty");
+        return EC_BADARGS;
+    }
+
+    std::string redis_key = GetRedisKVKey(key);
+    ErrorCode ec = redis_client_->Set(redis_key, value);
+    if (ec != EC_OK) {
+        KVCM_LOG_ERROR("Failed to set value for key %s: ec=%d", key.c_str(), ec);
+        return ec;
+    }
+    return EC_OK;
+}
+
+ErrorCode CoordinationRedisBackend::GetValue(const std::string &key, std::string &out_value) {
+    if (!initialized_) {
+        KVCM_LOG_ERROR("Redis coordination backend not initialized");
+        return EC_ERROR;
+    }
+    if (key.empty()) {
+        KVCM_LOG_ERROR("Invalid arguments for GetValue: key is empty");
+        return EC_BADARGS;
+    }
+
+    std::string redis_key = GetRedisKVKey(key);
+    ErrorCode ec = redis_client_->Get(redis_key, out_value);
+    if (ec == EC_NOENT) {
+        return EC_NOENT;
+    }
+    if (ec != EC_OK) {
+        KVCM_LOG_ERROR("Failed to get value for key %s: ec=%d", key.c_str(), ec);
+        return ec;
+    }
     return EC_OK;
 }
 

@@ -356,4 +356,78 @@ TEST_P(CoordinationBackendTest, TestInvalidArguments) {
     EXPECT_EQ(EC_BADARGS, ec);
 }
 
+// ---- KV Storage Tests ----
+
+// 测试 SetValue/GetValue 基本功能
+TEST_P(CoordinationBackendTest, TestSetGetBasic) {
+    const std::string key = "test_key";
+    const std::string value = "test_value";
+
+    // 设置值
+    ErrorCode ec = backend_->SetValue(key, value);
+    EXPECT_EQ(EC_OK, ec);
+
+    // 读取值
+    std::string out_value;
+    ec = backend_->GetValue(key, out_value);
+    EXPECT_EQ(EC_OK, ec);
+    EXPECT_EQ(value, out_value);
+}
+
+// 测试 GetValue 不存在的 key
+TEST_P(CoordinationBackendTest, TestGetNonExistentKey) {
+    std::string out_value;
+    ErrorCode ec = backend_->GetValue("nonexistent_key", out_value);
+    EXPECT_EQ(EC_NOENT, ec);
+}
+
+// 测试 SetValue 覆盖写
+TEST_P(CoordinationBackendTest, TestSetOverwrite) {
+    const std::string key = "overwrite_key";
+
+    // 第一次写入
+    ErrorCode ec = backend_->SetValue(key, "value1");
+    EXPECT_EQ(EC_OK, ec);
+
+    // 覆盖写入
+    ec = backend_->SetValue(key, "value2");
+    EXPECT_EQ(EC_OK, ec);
+
+    // 读取应该是最新值
+    std::string out_value;
+    ec = backend_->GetValue(key, out_value);
+    EXPECT_EQ(EC_OK, ec);
+    EXPECT_EQ("value2", out_value);
+}
+
+// 测试 SetValue/GetValue 无效参数
+TEST_P(CoordinationBackendTest, TestSetGetInvalidArgs) {
+    // 空 key
+    ErrorCode ec = backend_->SetValue("", "value");
+    EXPECT_EQ(EC_BADARGS, ec);
+
+    std::string out_value;
+    ec = backend_->GetValue("", out_value);
+    EXPECT_EQ(EC_BADARGS, ec);
+}
+
+// 测试多个不同 key 的 KV 存储
+TEST_P(CoordinationBackendTest, TestSetGetMultipleKeys) {
+    // 写入多个 key
+    EXPECT_EQ(EC_OK, backend_->SetValue("key1", "val1"));
+    EXPECT_EQ(EC_OK, backend_->SetValue("key2", "val2"));
+    EXPECT_EQ(EC_OK, backend_->SetValue("key3", "val3"));
+
+    // 分别读取验证
+    std::string out;
+    EXPECT_EQ(EC_OK, backend_->GetValue("key1", out));
+    EXPECT_EQ("val1", out);
+
+    EXPECT_EQ(EC_OK, backend_->GetValue("key2", out));
+    EXPECT_EQ("val2", out);
+
+    EXPECT_EQ(EC_OK, backend_->GetValue("key3", out));
+    EXPECT_EQ("val3", out);
+}
+
 } // namespace kv_cache_manager

@@ -106,6 +106,38 @@ public:
      */
     virtual ErrorCode
     GetLockHolder(const std::string &lock_key, std::string &out_current_value, int64_t &out_expire_time_ms) = 0;
+
+    // ---- Key-Value Storage ----
+
+    /**
+     * @brief Set a key-value pair
+     *
+     * Stores a string value associated with the given key. If the key already
+     * exists, its value is overwritten. No TTL is applied.
+     *
+     * @param key The key
+     * @param value The value to store
+     * @return ErrorCode error code
+     *         - EC_OK: Set successful
+     *         - EC_BADARGS: Invalid arguments (e.g., key is empty)
+     *         - EC_ERROR: Other errors
+     */
+    virtual ErrorCode SetValue(const std::string &key, const std::string &value) = 0;
+
+    /**
+     * @brief Get the value associated with a key
+     *
+     * Retrieves the string value stored for the given key.
+     *
+     * @param key The key to look up
+     * @param out_value [out] The retrieved value
+     * @return ErrorCode error code
+     *         - EC_OK: Get successful
+     *         - EC_NOENT: Key does not exist
+     *         - EC_BADARGS: Invalid arguments (e.g., key is empty)
+     *         - EC_ERROR: Other errors
+     */
+    virtual ErrorCode GetValue(const std::string &key, std::string &out_value) = 0;
 };
 
 } // namespace kv_cache_manager

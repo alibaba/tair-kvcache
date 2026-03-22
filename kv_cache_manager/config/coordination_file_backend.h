@@ -26,6 +26,8 @@ public:
     ErrorCode Unlock(const std::string &lock_key, const std::string &lock_value) override;
     ErrorCode
     GetLockHolder(const std::string &lock_key, std::string &out_current_value, int64_t &out_expire_time_ms) override;
+    ErrorCode SetValue(const std::string &key, const std::string &value) override;
+    ErrorCode GetValue(const std::string &key, std::string &out_value) override;
 
 private:
     // RAII 类，用于管理文件锁和文件描述符
@@ -194,6 +196,9 @@ private:
     // 解析锁内容，返回是否成功解析出value和expire_time_ms
     bool
     ParseLockContent(const std::string &lock_content, std::string &out_lock_value, int64_t &out_expire_time_ms) const;
+
+    // 获取KV存储文件的完整路径
+    std::string GetKVFilePath(const std::string &key) const;
 
 private:
     std::string lock_dir_path_;
