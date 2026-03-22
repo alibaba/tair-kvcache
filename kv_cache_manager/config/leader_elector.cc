@@ -552,4 +552,14 @@ std::string LeaderElector::GetLeaderNodeID() const {
 
 std::string LeaderElector::GetSelfNodeID() const { return lock_value_; }
 
+ErrorCode LeaderElector::WriteNodeInfo(const std::string &node_id, const std::string &node_info_json) {
+    std::string key = "_TAIR_KVCM_NODE_INFO_" + node_id;
+    return coordination_backend_->SetValue(key, node_info_json);
+}
+
+ErrorCode LeaderElector::ReadNodeInfo(const std::string &node_id, std::string &out_node_info_json) {
+    std::string key = "_TAIR_KVCM_NODE_INFO_" + node_id;
+    return coordination_backend_->GetValue(key, out_node_info_json);
+}
+
 } // namespace kv_cache_manager

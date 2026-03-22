@@ -8,13 +8,16 @@
 namespace kv_cache_manager {
 
 class CacheManager;
+class LeaderElector;
 class MetricsReporter;
 class MetricsRegistry;
 class RequestContext;
 
 class MetaServiceImpl : public ServiceImplBase {
 public:
-    MetaServiceImpl(std::shared_ptr<CacheManager> cache_manager, std::shared_ptr<MetricsReporter> metrics_reporter);
+    MetaServiceImpl(std::shared_ptr<CacheManager> cache_manager,
+                    std::shared_ptr<MetricsReporter> metrics_reporter,
+                    std::shared_ptr<LeaderElector> leader_elector);
     ~MetaServiceImpl() override = default;
 
     // 实现所有MetaService的接口方法
@@ -54,9 +57,14 @@ public:
                    const proto::meta::TrimCacheRequest *request,
                    proto::meta::CommonResponse *response);
 
+    void GetClusterInfo(RequestContext *request_context,
+                        const proto::meta::GetClusterInfoRequest *request,
+                        proto::meta::GetClusterInfoResponse *response);
+
 private:
     std::shared_ptr<CacheManager> cache_manager_;
     std::shared_ptr<MetricsReporter> metrics_reporter_;
+    std::shared_ptr<LeaderElector> leader_elector_;
 };
 
 } // namespace kv_cache_manager

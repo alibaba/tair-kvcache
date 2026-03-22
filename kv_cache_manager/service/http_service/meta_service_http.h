@@ -47,6 +47,9 @@ public:
     void TrimCache(coro_http::coro_http_connection *http_conn,
                    proto::meta::TrimCacheRequest *request,
                    proto::meta::CommonResponse *response);
+    void GetClusterInfo(coro_http::coro_http_connection *http_conn,
+                        proto::meta::GetClusterInfoRequest *request,
+                        proto::meta::GetClusterInfoResponse *response);
 
 private:
     std::shared_ptr<MetaServiceImpl> meta_service_impl_;

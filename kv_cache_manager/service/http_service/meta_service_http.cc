@@ -34,6 +34,7 @@ void MetaServiceHttp::RegisterHandler() {
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, finishWriteCache, FinishWriteCache, Common, FinishWriteCache);
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, removeCache, RemoveCache, Common, RemoveCache);
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, trimCache, TrimCache, Common, TrimCache);
+    REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, getClusterInfo, GetClusterInfo, GetClusterInfo, GetClusterInfo);
 }
 
 void MetaServiceHttp::RegisterInstance(coro_http::coro_http_connection *http_conn,
@@ -132,6 +133,16 @@ void MetaServiceHttp::TrimCache(coro_http::coro_http_connection *http_conn,
                    request->trace_id().c_str(),
                    request->ShortDebugString().c_str());
     meta_service_impl_->TrimCache(request_context, request, response);
+}
+
+void MetaServiceHttp::GetClusterInfo(coro_http::coro_http_connection *http_conn,
+                                     proto::meta::GetClusterInfoRequest *request,
+                                     proto::meta::GetClusterInfoResponse *response) {
+    API_CONTEXT_GET_COLLECTOR_AND_INIT_HTTP(GetClusterInfo, __NOTHING__);
+    KVCM_LOG_DEBUG("[traceId: %s] GetClusterInfo request details: %s",
+                   request->trace_id().c_str(),
+                   request->ShortDebugString().c_str());
+    meta_service_impl_->GetClusterInfo(request_context, request, response);
 }
 
 } // namespace kv_cache_manager

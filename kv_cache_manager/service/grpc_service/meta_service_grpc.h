@@ -51,6 +51,9 @@ public:
     grpc::Status TrimCache(grpc::ServerContext *context,
                            const proto::meta::TrimCacheRequest *request,
                            proto::meta::CommonResponse *response) override;
+    grpc::Status GetClusterInfo(grpc::ServerContext *context,
+                                const proto::meta::GetClusterInfoRequest *request,
+                                proto::meta::GetClusterInfoResponse *response) override;
 
 private:
     std::shared_ptr<MetaServiceImpl> meta_service_impl_;
