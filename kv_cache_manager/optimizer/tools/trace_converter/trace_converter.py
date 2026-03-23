@@ -17,7 +17,7 @@ import json
 import importlib.util
 import inspect
 from pathlib import Path
-from typing import Dict, Type, List, Optional
+from typing import Any, Dict, Type, List, Optional
 
 # 添加模块路径
 SCRIPT_DIR = Path(__file__).parent
@@ -224,6 +224,10 @@ def main():
                         help='Disable timestamp sorting (faster but unsorted output)')
     parser.add_argument('--keep-tokens', action='store_true',
                         help='Keep tokens field in output (for debugging, increases file size significantly)')
+    parser.add_argument('--ignore-response', action='store_true',
+                        help='Ignore response when computing block IDs; write trace covers prompt only (useful when response is unavailable or irrelevant)')
+    parser.add_argument('--no-truncate', action='store_true',
+                        help='Disable truncation of tail tokens that do not fill a complete block (default: truncate enabled, matching engine write behavior)')
 
     args = parser.parse_args()
 
@@ -291,7 +295,9 @@ def main():
             time_field=args.time_field,
             content_field=args.content_field,
             num_workers=args.num_workers,
-            keep_tokens=args.keep_tokens
+            keep_tokens=args.keep_tokens,
+            ignore_response=args.ignore_response,
+            truncate=not args.no_truncate
         )
 
         # ============================================
@@ -301,6 +307,30 @@ def main():
         print(f"   Format: {args.format}, Mode: {args.mode}")
         if args.keep_tokens:
             print(f"   ⚠️  Warning: --keep-tokens enabled, output file will be large!")
+        if args.ignore_response:
+            print(f"   ℹ️  --ignore-response: block IDs computed from prompt only")
+        if args.no_truncate:
+            print(f"   ℹ️  --no-truncate: tail tokens kept even if < block_size")
+
+        # ---- 配置摘要 ----
+        print()
+        print("📐 Configuration:")
+        print(f"   Default instance ID : {args.instance_id}")
+        print(f"   Default block size  : {converter.default_block_size}")
+        print(f"   Truncate tail block : {not args.no_truncate}")
+        if instance_block_sizes:
+            print(f"   Per-instance block sizes:")
+            for inst, bsz in sorted(instance_block_sizes.items()):
+                print(f"     {inst:<40} → block_size={bsz}")
+        else:
+            print(f"   Per-instance block sizes: (none, all use default {converter.default_block_size})")
+
+        # model-mapping 仅对支持该属性的 converter 打印
+        effective_mapping: Any | None = getattr(converter, 'model_mapping', None)
+        if effective_mapping:
+            print(f"   Model mapping ({len(effective_mapping)} entries):")
+            for model_name, hf_id in sorted(effective_mapping.items()):
+                print(f"     {model_name:<40} → {hf_id}")
         print()
         
         # ============================================
