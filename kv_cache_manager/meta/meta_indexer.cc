@@ -226,8 +226,9 @@ ErrorCode MetaIndexer::Init(const std::string &instance_id, const std::shared_pt
     }
 
     instance_id_ = instance_id;
-    storage_ =
-        MetaStorageBackendFactory::CreateAndInitStorageBackend(instance_id, config->GetMetaStorageBackendConfig());
+    auto storage_backend_config = config->GetMetaStorageBackendConfig();
+    storage_backend_config->SetMutexShardNum(mutex_shard_num_);
+    storage_ = MetaStorageBackendFactory::CreateAndInitStorageBackend(instance_id, storage_backend_config);
     if (!storage_) {
         KVCM_LOG_ERROR("instance[%s] create storage backend failed, storage backend type[%s]",
                        instance_id_.c_str(),

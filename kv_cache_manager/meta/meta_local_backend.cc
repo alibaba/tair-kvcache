@@ -1,389 +1,421 @@
 #include "kv_cache_manager/meta/meta_local_backend.h"
 
-#include <filesystem>
-#include <fstream>
-#include <limits>
+#include <utility>
 
-#include "kv_cache_manager/common/jsonizable.h"
 #include "kv_cache_manager/common/logger.h"
-#include "kv_cache_manager/common/standard_uri.h"
-#include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
-#include "kv_cache_manager/meta/common.h"
 
 namespace kv_cache_manager {
 
-std::string MetaLocalBackend::GetStorageType() noexcept { return META_LOCAL_BACKEND_TYPE_STR; }
+std::string MetaLocalBackend::GetStorageType() noexcept { return "local"; }
 
 ErrorCode MetaLocalBackend::Init(const std::string &instance_id,
                                  const std::shared_ptr<MetaStorageBackendConfig> &config) noexcept {
     if (instance_id.empty()) {
-        KVCM_LOG_ERROR("init fail, instance id is empty");
+        KVCM_LOG_ERROR("fail to init meta redis backend, invalid empty instance id");
         return EC_BADARGS;
     }
     if (!config) {
-        KVCM_LOG_ERROR("init fail, config is nullptr");
+        KVCM_LOG_ERROR("fail to init meta local backend, invalid nullptr config");
         return EC_BADARGS;
     }
-    std::string storage_uri_str = config->GetStorageUri();
-    if (storage_uri_str.empty()) {
-        enable_persistence_ = false;
-    } else {
-        StandardUri storage_uri = StandardUri::FromUri(storage_uri_str);
-        enable_persistence_ = true;
-        path_ = storage_uri.GetPath();
-        metadata_key_ = std::numeric_limits<KeyType>::max(); // use max key for metadata
-    }
+    // 创建默认的MetaCachePolicyConfig
+    cache_config_ = std::make_shared<MetaCachePolicyConfig>();
+    // 这里可以根据需要设置特定的配置参数
+    cache_config_->SetCapacity(1 * 1024 * 1024); // 1TB
+    cache_config_->SetCacheShardBits(10);
+    // 初始化cache和key_tracker，使用指定的shard数
+    cache_ = std::make_unique<MetaSearchCache>();
+    key_tracker_ = std::make_unique<KeyTracker>(config->GetMutexShardNum());
+
     return EC_OK;
 }
 
 ErrorCode MetaLocalBackend::Open() noexcept {
-    table_.Clear();
-    if (!enable_persistence_) {
-        return EC_OK;
-    }
-
-    std::lock_guard<std::mutex> guard(mutex_);
-    std::error_code ec;
-    bool exists = std::filesystem::exists(path_, ec);
-    if (ec) {
-        KVCM_LOG_ERROR("file exists error[%s] file[%s]", ec.message().c_str(), path_.c_str());
-        return EC_IO_ERROR;
-    }
-    if (!exists) {
-        return EC_OK;
-    }
-
-    std::ifstream ifs(path_);
-    if (!ifs.is_open()) {
-        KVCM_LOG_ERROR("fail to open file[%s]", path_.c_str());
-        return EC_IO_ERROR;
-    }
-
-    std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
-    std::map<std::string, std::string> tmp_table;
-    if (!Jsonizable::FromJsonString(content, tmp_table)) {
-        KVCM_LOG_ERROR("fail to parse full json from file[%s], content[%s]", path_.c_str(), content.c_str());
+    if (!cache_config_) {
+        KVCM_LOG_ERROR("Config is not initialized");
         return EC_ERROR;
     }
-    for (auto &pair : tmp_table) {
-        FieldMap tmp_field_table;
-        if (!Jsonizable::FromJsonString(pair.second, tmp_field_table)) {
-            KVCM_LOG_ERROR("fail to parse field map json, file[%s] content[%s]", path_.c_str(), pair.second.c_str());
-            return EC_ERROR;
-        }
-        KeyType key;
-        if (!StringUtil::StrToInt64(pair.first.c_str(), key)) {
-            KVCM_LOG_ERROR("fail to parse key, file[%s] content[%s]", path_.c_str(), pair.first.c_str());
-            return EC_ERROR;
-        }
-        table_.Emplace(key, std::move(tmp_field_table));
+
+    ErrorCode ret = cache_->Init(cache_config_);
+    if (ret != EC_OK) {
+        KVCM_LOG_ERROR("Failed to initialize MetaSearchCache: %d", static_cast<int>(ret));
+        return ret;
     }
+
     return EC_OK;
 }
 
 ErrorCode MetaLocalBackend::Close() noexcept {
-    std::lock_guard<std::mutex> guard(mutex_);
-    return EC_OK;
-}
-
-ErrorCode MetaLocalBackend::PersistToPath() {
-    if (!enable_persistence_) {
-        return EC_OK;
-    }
-    std::map<std::string, std::string> tmp_table;
-    table_.ForEachKV([&](const KeyType &key, const FieldMap &field_map) {
-        tmp_table[std::to_string(key)] = Jsonizable::ToJsonString(field_map);
-        return true;
-    });
-    std::string json_content = Jsonizable::ToJsonString(tmp_table);
-    std::ofstream ofs(path_);
-    if (!ofs.is_open()) {
-        KVCM_LOG_ERROR("Cannot open file for write: %s", path_.c_str());
-        return EC_IO_ERROR;
-    }
-    ofs << json_content;
+    cache_.reset();
+    key_tracker_.reset();
     return EC_OK;
 }
 
 std::vector<ErrorCode> MetaLocalBackend::Put(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept {
-    if (keys.size() != field_maps.size()) {
-        KVCM_LOG_ERROR("put fail, keys size[%lu] != field_maps size[%lu]", keys.size(), field_maps.size());
-        return std::vector<ErrorCode>(keys.size(), EC_BADARGS);
-    }
-    std::vector<ErrorCode> ec_vec;
-    for (int32_t i = 0; i < keys.size(); ++i) {
-        ec_vec.emplace_back(PutForOneKey(keys[i], field_maps[i]));
-        if (ec_vec.back() != EC_OK) {
-            KVCM_LOG_WARN("put fail, key[%ld] ec[%d]", keys[i], ec_vec.back());
-        }
-    }
-    return ec_vec;
-}
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
 
-ErrorCode MetaLocalBackend::PutForOneKey(const KeyType &key, const FieldMap &field_map) {
-    // PersistToPath will traverse all keys, we should lock the mutex when multi-threads put/update/delete one key
-    std::lock_guard<std::mutex> guard(mutex_);
-    table_.Upsert(key, field_map);
-    return PersistToPath();
+    for (size_t i = 0; i < keys.size(); ++i) {
+        results[i] = PutForOneKey(keys[i], field_maps[i]);
+    }
+
+    return results;
 }
 
 std::vector<ErrorCode> MetaLocalBackend::UpdateFields(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept {
-    if (keys.size() != field_maps.size()) {
-        KVCM_LOG_ERROR("update fields fail, keys.size[%lu] != field_maps.size[%lu]", keys.size(), field_maps.size());
-        return std::vector<ErrorCode>(keys.size(), EC_BADARGS);
-    }
-    std::vector<ErrorCode> ec_vec;
-    for (int32_t i = 0; i < keys.size(); ++i) {
-        ec_vec.emplace_back(UpdateFieldsForOneKey(keys[i], field_maps[i]));
-        if (ec_vec.back() != EC_OK && ec_vec.back() != EC_NOENT) {
-            KVCM_LOG_WARN("update fields fail, key[%ld] ec[%d]", keys[i], ec_vec.back());
-        }
-    }
-    return ec_vec;
-}
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
 
-ErrorCode MetaLocalBackend::UpdateFieldsForOneKey(const KeyType &key, const FieldMap &field_map) {
-    std::lock_guard<std::mutex> guard(mutex_);
-    bool found = table_.FindAndModify(key, [&](FieldMap &existing_map) {
-        for (const auto &[field_name, field_value] : field_map) {
-            existing_map[field_name] = field_value;
-        }
-    });
-    if (!found) {
-        KVCM_LOG_WARN("update fields fail, cannot find key[%ld]", key);
-        return EC_NOENT;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        results[i] = UpdateFieldsForOneKey(keys[i], field_maps[i]);
     }
-    return PersistToPath();
+
+    return results;
 }
 
 std::vector<ErrorCode> MetaLocalBackend::Upsert(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept {
-    if (keys.size() != field_maps.size()) {
-        KVCM_LOG_ERROR("upsert fail, keys size[%lu] != field_maps size[%lu]", keys.size(), field_maps.size());
-        return std::vector<ErrorCode>(keys.size(), EC_BADARGS);
-    }
-    std::vector<ErrorCode> ec_vec;
-    for (int32_t i = 0; i < keys.size(); ++i) {
-        ec_vec.emplace_back(UpsertForOneKey(keys[i], field_maps[i]));
-        if (ec_vec.back() != EC_OK) {
-            KVCM_LOG_WARN("upsert fail, key[%ld] ec[%d]", keys[i], ec_vec.back());
-        }
-    }
-    return ec_vec;
-}
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
 
-ErrorCode MetaLocalBackend::UpsertForOneKey(const KeyType &key, const FieldMap &field_map) {
-    std::lock_guard<std::mutex> guard(mutex_);
-    bool found = table_.FindAndModify(key, [&](FieldMap &existing_map) {
-        for (const auto &[field_name, field_value] : field_map) {
-            existing_map[field_name] = field_value;
-        }
-    });
-    if (!found) {
-        table_.Upsert(key, field_map);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        results[i] = UpsertForOneKey(keys[i], field_maps[i]);
     }
-    return PersistToPath();
+
+    return results;
 }
 
 std::vector<ErrorCode> MetaLocalBackend::IncrFields(const KeyTypeVec &keys,
                                                     const std::map<std::string, int64_t> &field_amounts) noexcept {
-    std::vector<ErrorCode> ec_vec;
-    for (const KeyType &key : keys) {
-        ec_vec.emplace_back(IncrFieldsForOneKey(key, field_amounts));
-        if (ec_vec.back() != EC_OK) {
-            KVCM_LOG_WARN("incr fields fail, key[%ld] ec[%d]", key, ec_vec.back());
-        }
-    }
-    return ec_vec;
-}
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
 
-ErrorCode MetaLocalBackend::IncrFieldsForOneKey(const KeyType &key,
-                                                const std::map<std::string, int64_t> &field_amounts) {
-    std::lock_guard<std::mutex> guard(mutex_);
-    ErrorCode ec = EC_OK;
-    bool found = table_.FindAndModify(key, [&](FieldMap &field_map) {
-        std::map<std::string, std::string> new_field_map;
-        for (const auto &[field_name, amount] : field_amounts) {
-            const auto field_iter = field_map.find(field_name);
-            if (field_iter == field_map.end()) {
-                KVCM_LOG_ERROR("incr fields fail, cannot find field[%s] for key[%ld]", field_name.c_str(), key);
-                ec = EC_BADARGS;
-                return;
-            }
-            const auto &old_field_value = field_iter->second;
-            int64_t old_field_value_num = 0;
-            if (!StringUtil::StrToInt64(old_field_value.c_str(), old_field_value_num)) {
-                KVCM_LOG_ERROR("incr fields fail, cannot convert field[%s] value[%s] to int64_t for key[%ld]",
-                               field_name.c_str(),
-                               old_field_value.c_str(),
-                               key);
-                ec = EC_BADARGS;
-                return;
-            }
-            new_field_map[field_name] = std::to_string(old_field_value_num + amount);
-        }
-        for (const auto &[field_name, new_field_value] : new_field_map) {
-            field_map[field_name] = new_field_value;
-        }
-    });
-    if (!found) {
-        KVCM_LOG_WARN("incr fields fail, cannot find key[%ld]", key);
-        return EC_NOENT;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        results[i] = IncrFieldsForOneKey(keys[i], field_amounts);
     }
-    if (ec != EC_OK) return ec;
-    return PersistToPath();
+
+    return results;
 }
 
 std::vector<ErrorCode> MetaLocalBackend::Delete(const KeyTypeVec &keys) noexcept {
-    std::vector<ErrorCode> ec_vec;
-    for (const KeyType &key : keys) {
-        ec_vec.emplace_back(DeleteForOneKey(key));
-        if (ec_vec.back() != EC_OK && ec_vec.back() != EC_NOENT) {
-            KVCM_LOG_WARN("delete fail, key[%ld] ec[%d]", key, ec_vec.back());
-        }
-    }
-    return ec_vec;
-}
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
 
-ErrorCode MetaLocalBackend::DeleteForOneKey(const KeyType &key) {
-    std::lock_guard<std::mutex> guard(mutex_);
-    if (!table_.Contains(key)) {
-        return EC_NOENT;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        results[i] = DeleteForOneKey(keys[i]);
     }
-    table_.Erase(key);
-    return PersistToPath();
+
+    return results;
 }
 
 std::vector<ErrorCode> MetaLocalBackend::Get(const KeyTypeVec &keys,
                                              const std::vector<std::string> &field_names,
                                              FieldMapVec &out_field_maps) noexcept {
-    std::vector<ErrorCode> ec_vec;
-    out_field_maps = FieldMapVec(keys.size());
-    for (int32_t i = 0; i < keys.size(); ++i) {
-        ec_vec.emplace_back(GetForOneKey(keys[i], field_names, out_field_maps[i]));
-        if (ec_vec.back() != EC_OK && ec_vec.back() != EC_NOENT) {
-            KVCM_LOG_WARN("get fail, key[%ld] ec[%d]", keys[i], ec_vec.back());
-        }
-    }
-    return ec_vec;
-}
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    out_field_maps.resize(keys.size());
 
-ErrorCode MetaLocalBackend::GetForOneKey(const KeyType &key,
-                                         const std::vector<std::string> &field_names,
-                                         FieldMap &out_field_map) {
-    out_field_map.clear();
-    bool found = table_.FindAndApply(key, [&](const FieldMap &field_table) {
-        for (const std::string &field_name : field_names) {
-            const auto field_iter = field_table.find(field_name);
-            out_field_map[field_name] = (field_iter == field_table.end() ? "" : field_iter->second);
-        }
-    });
-    if (!found) {
-        for (const std::string &field_name : field_names) {
-            out_field_map[field_name] = "";
-        }
+    for (size_t i = 0; i < keys.size(); ++i) {
+        results[i] = GetForOneKey(keys[i], field_names, out_field_maps[i]);
     }
-    return EC_OK;
+
+    return results;
 }
 
 std::vector<ErrorCode> MetaLocalBackend::GetAllFields(const KeyTypeVec &keys, FieldMapVec &out_field_maps) noexcept {
-    std::vector<ErrorCode> ec_vec;
-    out_field_maps = FieldMapVec(keys.size());
-    for (int32_t i = 0; i < keys.size(); ++i) {
-        ec_vec.emplace_back(GetAllFieldsForOneKey(keys[i], out_field_maps[i]));
-        if (ec_vec.back() != EC_OK && ec_vec.back() != EC_NOENT) {
-            KVCM_LOG_WARN("get all fields fail, key[%ld] ec[%d]", keys[i], ec_vec.back());
-        }
-    }
-    return ec_vec;
-}
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    out_field_maps.resize(keys.size());
 
-ErrorCode MetaLocalBackend::GetAllFieldsForOneKey(const KeyType &key, FieldMap &out_field_map) {
-    out_field_map.clear();
-    if (!table_.Get(key, out_field_map)) {
-        return EC_NOENT;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        results[i] = GetAllFieldsForOneKey(keys[i], out_field_maps[i]);
     }
-    return out_field_map.empty() ? EC_NOENT : EC_OK;
+
+    return results;
 }
 
 std::vector<ErrorCode> MetaLocalBackend::Exists(const KeyTypeVec &keys, std::vector<bool> &out_is_exist_vec) noexcept {
-    out_is_exist_vec.clear();
-    out_is_exist_vec.reserve(keys.size());
-    std::vector<ErrorCode> ec_vec;
-    for (int32_t i = 0; i < keys.size(); ++i) {
-        bool is_exist = false;
-        ec_vec.emplace_back(ExistsForOneKey(keys[i], is_exist));
-        if (ec_vec.back() != EC_OK) {
-            KVCM_LOG_WARN("get all fields fail, key[%ld] ec[%d]", keys[i], ec_vec.back());
-        }
-        out_is_exist_vec.emplace_back(is_exist);
-    }
-    return ec_vec;
-}
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    out_is_exist_vec.resize(keys.size());
 
-ErrorCode MetaLocalBackend::ExistsForOneKey(const KeyType &key, bool &out_is_exist) {
-    out_is_exist = (table_.Count(key) > 0);
-    return EC_OK;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        bool is_exist;
+        results[i] = ExistsForOneKey(keys[i], is_exist);
+        out_is_exist_vec[i] = is_exist;
+    }
+
+    return results;
 }
 
 ErrorCode MetaLocalBackend::ListKeys(const std::string &cursor,
                                      const int64_t limit,
                                      std::string &out_next_cursor,
                                      std::vector<KeyType> &out_keys) noexcept {
-    out_next_cursor.clear();
-    out_keys.clear();
-
-    int64_t start_index = 0;
-    if (cursor != SCAN_BASE_CURSOR) {
-        if (!StringUtil::StrToInt64(cursor.c_str(), start_index)) {
-            KVCM_LOG_ERROR("list keys fail, cannot convert cursor[%s] to start index", cursor.c_str());
-            return EC_BADARGS;
-        }
-    }
-
-    int64_t current_index = 0;
-    int64_t end_index = start_index + limit;
-    bool reached_limit = false;
-    table_.ForEachKV([&](const KeyType &key, const FieldMap &) {
-        if (current_index >= end_index) {
-            reached_limit = true;
-            return false;
-        }
-        if (current_index >= start_index) {
-            out_keys.emplace_back(key);
-        }
-        ++current_index;
-        return true;
-    });
-
-    out_next_cursor = reached_limit ? std::to_string(current_index) : SCAN_BASE_CURSOR;
-    return EC_OK;
+    return key_tracker_->Scan(cursor, limit, out_next_cursor, out_keys);
 }
 
 ErrorCode MetaLocalBackend::RandomSample(const int64_t count, std::vector<KeyType> &out_keys) noexcept {
-    out_keys.clear();
-    table_.ForEachKV([&](const KeyType &key, const FieldMap &map) {
-        if (out_keys.size() >= count) {
-            return false;
-        }
-        out_keys.emplace_back(key);
-        return true;
-    });
+    key_tracker_->RandomSample(count, out_keys);
     return EC_OK;
 }
 
-ErrorCode MetaLocalBackend::PutMetaData(const FieldMap &field_map) noexcept {
-    std::lock_guard<std::mutex> guard(mutex_);
-    table_.Upsert(metadata_key_, field_map);
-    return PersistToPath();
+std::vector<ErrorCode> MetaLocalBackend::PutIfAbsent(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept {
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        results[i] = PutIfAbsentForOneKey(keys[i], field_maps[i]);
+    }
+    return results;
 }
 
-ErrorCode MetaLocalBackend::GetMetaData(FieldMap &out_field_map) noexcept {
-    out_field_map.clear();
-    if (!table_.Get(metadata_key_, out_field_map)) {
+// ==================== Conditional write operations ====================
+
+std::vector<ErrorCode> MetaLocalBackend::Put(const KeyTypeVec &keys,
+                                             const FieldMapVec &field_maps,
+                                             const std::vector<ErrorCode> &previous_error_codes) noexcept {
+    std::vector<ErrorCode> results(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (previous_error_codes[i] != EC_OK) {
+            results[i] = previous_error_codes[i];
+            continue;
+        }
+        results[i] = PutForOneKey(keys[i], field_maps[i]);
+    }
+    return results;
+}
+
+std::vector<ErrorCode> MetaLocalBackend::UpdateFields(const KeyTypeVec &keys,
+                                                      const FieldMapVec &field_maps,
+                                                      const std::vector<ErrorCode> &previous_error_codes) noexcept {
+    std::vector<ErrorCode> results(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (previous_error_codes[i] != EC_OK) {
+            results[i] = previous_error_codes[i];
+            continue;
+        }
+        results[i] = UpdateFieldsForOneKey(keys[i], field_maps[i]);
+    }
+    return results;
+}
+
+std::vector<ErrorCode> MetaLocalBackend::Upsert(const KeyTypeVec &keys,
+                                                const FieldMapVec &field_maps,
+                                                const std::vector<ErrorCode> &previous_error_codes) noexcept {
+    std::vector<ErrorCode> results(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (previous_error_codes[i] != EC_OK) {
+            results[i] = previous_error_codes[i];
+            continue;
+        }
+        results[i] = UpsertForOneKey(keys[i], field_maps[i]);
+    }
+    return results;
+}
+
+std::vector<ErrorCode> MetaLocalBackend::IncrFields(const KeyTypeVec &keys,
+                                                    const std::map<std::string, int64_t> &field_amounts,
+                                                    const std::vector<ErrorCode> &previous_error_codes) noexcept {
+    std::vector<ErrorCode> results(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (previous_error_codes[i] != EC_OK) {
+            results[i] = previous_error_codes[i];
+            continue;
+        }
+        results[i] = IncrFieldsForOneKey(keys[i], field_amounts);
+    }
+    return results;
+}
+
+std::vector<ErrorCode> MetaLocalBackend::Delete(const KeyTypeVec &keys,
+                                                const std::vector<ErrorCode> &previous_error_codes) noexcept {
+    std::vector<ErrorCode> results(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (previous_error_codes[i] != EC_OK) {
+            results[i] = previous_error_codes[i];
+            continue;
+        }
+        results[i] = DeleteForOneKey(keys[i]);
+    }
+    return results;
+}
+
+std::vector<ErrorCode> MetaLocalBackend::PutIfAbsent(const KeyTypeVec &keys,
+                                                     const FieldMapVec &field_maps,
+                                                     const std::vector<ErrorCode> &previous_error_codes) noexcept {
+    std::vector<ErrorCode> results(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (previous_error_codes[i] != EC_OK) {
+            results[i] = previous_error_codes[i];
+            continue;
+        }
+        results[i] = PutIfAbsentForOneKey(keys[i], field_maps[i]);
+    }
+    return results;
+}
+
+ErrorCode MetaLocalBackend::PutMetaData(const FieldMap &field_maps) noexcept { return EC_OK; }
+
+ErrorCode MetaLocalBackend::GetMetaData(FieldMap &field_maps) noexcept { return EC_NOENT; }
+
+// 私有方法实现
+ErrorCode MetaLocalBackend::PutIfAbsentForOneKey(const KeyType &key, const FieldMap &field_map) {
+    std::string existing_value;
+    ErrorCode exists_ec = cache_->Get(key, &existing_value);
+    if (exists_ec == EC_OK) {
+        return EC_OK;
+    }
+    return PutForOneKey(key, field_map);
+}
+
+ErrorCode MetaLocalBackend::PutForOneKey(const KeyType &key, const FieldMap &field_map) {
+    // 序列化FieldMap
+    std::string serialized = FieldMapSerializer::Serialize(field_map);
+
+    // 存储到cache
+    ErrorCode ret = cache_->Put(key, serialized);
+    if (ret == EC_OK) {
+        // 更新key tracker
+        key_tracker_->AddKey(key);
+    }
+
+    return ret;
+}
+
+ErrorCode MetaLocalBackend::UpdateFieldsForOneKey(const KeyType &key, const FieldMap &field_map) {
+    // 先获取现有的field map
+    std::string serialized_value;
+    ErrorCode ret = cache_->Get(key, &serialized_value);
+    if (ret != EC_OK) {
+        // 如果不存在，则不进行更新
         return EC_NOENT;
     }
-    return out_field_map.empty() ? EC_NOENT : EC_OK;
+
+    // 反序列化现有值
+    FieldMap existing_map = FieldMapSerializer::Deserialize(serialized_value);
+
+    // 更新字段
+    for (const auto &pair : field_map) {
+        existing_map[pair.first] = pair.second;
+    }
+
+    // 重新序列化并存储
+    std::string new_serialized = FieldMapSerializer::Serialize(existing_map);
+    ret = cache_->Put(key, new_serialized);
+    if (ret == EC_OK) {
+        key_tracker_->AccessKey(key);
+    }
+
+    return ret;
+}
+
+ErrorCode MetaLocalBackend::UpsertForOneKey(const KeyType &key, const FieldMap &field_map) {
+    // 先获取现有的field map
+    std::string serialized_value;
+    ErrorCode ret = cache_->Get(key, &serialized_value);
+    if (ret != EC_OK) {
+        // 如果不存在，则当作新键处理
+        return PutForOneKey(key, field_map);
+    }
+    return UpdateFieldsForOneKey(key, field_map);
+}
+
+ErrorCode MetaLocalBackend::IncrFieldsForOneKey(const KeyType &key,
+                                                const std::map<std::string, int64_t> &field_amounts) {
+    // 先获取现有的field map
+    std::string serialized_value;
+    ErrorCode ret = cache_->Get(key, &serialized_value);
+    if (ret != EC_OK) {
+        return ret;
+    }
+
+    // 反序列化现有值
+    FieldMap existing_map = FieldMapSerializer::Deserialize(serialized_value);
+
+    // 增加指定字段的值
+    for (const auto &[field_name, amount] : field_amounts) {
+        const auto field_iter = existing_map.find(field_name);
+        if (field_iter == existing_map.end()) {
+            KVCM_LOG_ERROR("incr fields fail, cannot find field[%s] for key[%ld]", field_name.c_str(), key);
+            return EC_BADARGS;
+        }
+        const auto &old_field_value = field_iter->second;
+        int64_t old_field_value_num = 0;
+        if (!StringUtil::StrToInt64(old_field_value.c_str(), old_field_value_num)) {
+            KVCM_LOG_ERROR("incr fields fail, cannot convert field[%s] value[%s] to int64_t for key[%ld]",
+                           field_name.c_str(),
+                           old_field_value.c_str(),
+                           key);
+            return EC_BADARGS;
+        }
+        existing_map[field_name] = std::to_string(old_field_value_num + amount);
+    }
+
+    // 重新序列化并存储
+    std::string new_serialized = FieldMapSerializer::Serialize(existing_map);
+    ret = cache_->Put(key, new_serialized);
+    if (ret == EC_OK) {
+        key_tracker_->AccessKey(key);
+    }
+
+    return ret;
+}
+
+ErrorCode MetaLocalBackend::DeleteForOneKey(const KeyType &key) {
+    // 从cache中删除
+    cache_->Delete(key);
+
+    // 从key tracker中删除
+    bool is_delete = key_tracker_->RemoveKey(key);
+
+    return is_delete ? EC_OK : EC_NOENT;
+}
+
+ErrorCode MetaLocalBackend::GetForOneKey(const KeyType &key,
+                                         const std::vector<std::string> &field_names,
+                                         FieldMap &out_field_map) {
+    std::string serialized_value;
+    ErrorCode ret = cache_->Get(key, &serialized_value);
+    if (ret != EC_OK) {
+        return ret;
+    }
+
+    // 反序列化整个field map
+    FieldMap full_map = FieldMapSerializer::Deserialize(serialized_value);
+    for (const auto &field_name : field_names) {
+        auto it = full_map.find(field_name);
+        if (it != full_map.end()) {
+            out_field_map[field_name] = it->second;
+        } else {
+            out_field_map[field_name] = "";
+        }
+    }
+
+    // 更新key的访问时间
+    key_tracker_->AccessKey(key);
+
+    return EC_OK;
+}
+
+ErrorCode MetaLocalBackend::GetAllFieldsForOneKey(const KeyType &key, FieldMap &out_field_map) {
+    std::string serialized_value;
+    ErrorCode ret = cache_->Get(key, &serialized_value);
+    if (ret != EC_OK) {
+        return ret;
+    }
+
+    // 反序列化整个field map
+    out_field_map = FieldMapSerializer::Deserialize(serialized_value);
+
+    // 更新key的访问时间
+    key_tracker_->AccessKey(key);
+
+    return EC_OK;
+}
+
+ErrorCode MetaLocalBackend::ExistsForOneKey(const KeyType &key, bool &out_is_exist) {
+    std::string serialized_value;
+    ErrorCode ret = cache_->Get(key, &serialized_value);
+
+    out_is_exist = (ret == EC_OK);
+
+    if (out_is_exist) {
+        // 更新key的访问时间
+        key_tracker_->AccessKey(key);
+    }
+
+    return EC_OK;
 }
 
 } // namespace kv_cache_manager

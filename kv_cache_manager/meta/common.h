@@ -6,6 +6,7 @@
 namespace kv_cache_manager {
 static const std::string META_LOCAL_BACKEND_TYPE_STR = "local";
 static const std::string META_REDIS_BACKEND_TYPE_STR = "redis";
+static const std::string META_CACHED_BACKEND_TYPE_STR = "cached";
 
 static const std::string PROPERTY_INNER_PREFIX = "__";
 static const std::string PROPERTY_URI = "__uri__";

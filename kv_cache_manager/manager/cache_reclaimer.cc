@@ -734,6 +734,7 @@ bool CacheReclaimer::DoKeySampling(RequestContext *request_context,
         futures.emplace_back(promise->get_future());
 
         SubmitTask([request_context, &ins_id, &ins_gr, meta_indexer, sampling_sz, promise]() {
+            int64_t time1 = TimestampUtil::GetSteadyTimeUs();
             const auto keys = std::make_shared<std::vector<std::int64_t>>();
             if (const auto ec = meta_indexer->RandomSample(request_context, sampling_sz, *keys);
                 ec != ErrorCode::EC_OK) {
@@ -741,6 +742,7 @@ bool CacheReclaimer::DoKeySampling(RequestContext *request_context,
                 promise->set_value({ec, nullptr, nullptr});
                 return;
             }
+            int64_t time2  = TimestampUtil::GetSteadyTimeUs();
             if (keys->empty()) {
                 LOG_WITH_ID(DEBUG, "random sample got empty keys");
                 promise->set_value({ErrorCode::EC_NOENT, nullptr, nullptr});
@@ -760,7 +762,10 @@ bool CacheReclaimer::DoKeySampling(RequestContext *request_context,
                 promise->set_value({res.ec, nullptr, nullptr});
                 return;
             }
-
+            int64_t time3  = TimestampUtil::GetSteadyTimeUs();
+            LOG_WITH_ID(
+                    INFO, "tianran sampled keys num [%zu], RandomSample time [%ld], GetProperties time [%ld], all time [%ld]", 
+                    keys->size(), time2 - time1, time3 - time2, time3 - time1);
             if (keys->size() != maps->size()) {
                 LOG_WITH_ID(
                     WARN, "num of sampled keys [%zu] and property maps [%zu] do not match", keys->size(), maps->size());
@@ -773,7 +778,7 @@ bool CacheReclaimer::DoKeySampling(RequestContext *request_context,
 
         sampling_sz_todo -= sampling_sz;
     }
-
+    int64_t start_time  = TimestampUtil::GetSteadyTimeUs();
     bool result = true;
     for (auto &fut : futures) {
         if (fut.valid()) {
@@ -798,6 +803,7 @@ bool CacheReclaimer::DoKeySampling(RequestContext *request_context,
             result = false;
         }
     }
+    KVCM_LOG_INFO("tianran DoKeySampling all thread time [%ld]", TimestampUtil::GetSteadyTimeUs() - start_time);
     return result;
 }
 

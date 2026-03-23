@@ -165,6 +165,10 @@ std::vector<ErrorCode> MetaRedisBackend::IncrFields(const KeyTypeVec &keys,
     return std::vector<ErrorCode>(keys.size(), EC_UNIMPLEMENTED);
 }
 
+std::vector<ErrorCode> MetaRedisBackend::PutIfAbsent(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept {
+    return std::vector<ErrorCode>(keys.size(), EC_UNIMPLEMENTED);
+}
+
 std::vector<ErrorCode> MetaRedisBackend::Delete(const KeyTypeVec &keys) noexcept {
     auto handle = client_pool_->AcquireClient(timeout_ms_);
     if (!handle) {

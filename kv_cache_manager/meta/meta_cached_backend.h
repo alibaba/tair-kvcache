@@ -1,26 +1,31 @@
 #pragma once
 
-#include <cassert>
-#include <condition_variable>
+#include <atomic>
+#include <memory>
 #include <mutex>
-#include <queue>
+#include <thread>
+#include <unordered_set>
 
-#include "kv_cache_manager/common/client_pool.h"
-#include "kv_cache_manager/common/redis_client.h"
-#include "kv_cache_manager/meta/meta_storage_backend.h"
+#include "kv_cache_manager/meta/meta_local_base_backend.h"
 
 namespace kv_cache_manager {
 
-/*
-[instance_id]:cache_key_set ---> [key1, key2, key3]
-
-[instance_id]:cache_key:[key1] --- > {{f1, v1-1}, {f2, v1-2}}
-[instance_id]:cache_key:[key2] --- > {{f1, v2-1}, {f2, v2-2}}
- */
-class MetaRedisBackend : public MetaStorageBackend {
+// Two-phase composite backend: Recover → Running.
+//
+// Recover: background scans persistent → PutIfAbsent into local.
+//   Read: local first, miss → persistent fallback.
+//   Write: persistent-first, then local. Delete records key for backfill filtering.
+//
+// Running: read local only, write dual-write (persistent-first).
+class MetaCachedBackend : public MetaStorageBackend {
 public:
-    MetaRedisBackend() = default;
-    ~MetaRedisBackend() override;
+    enum class RecoverState {
+        kRecover,
+        kRunning,
+    };
+
+    MetaCachedBackend() = default;
+    ~MetaCachedBackend() override;
 
     std::string GetStorageType() noexcept override;
 
@@ -54,19 +59,34 @@ public:
     ErrorCode PutMetaData(const FieldMap &field_maps) noexcept override;
     ErrorCode GetMetaData(FieldMap &field_maps) noexcept override;
 
-private:
-    std::vector<std::string> AppendPrefixToKeys(const KeyTypeVec &keys) const;
-    bool StripPrefixInKeys(const std::vector<std::string> &keys_with_prefix, std::vector<KeyType> &out_keys) const;
+    RecoverState GetRecoverState() const noexcept { return recover_state_.load(std::memory_order_acquire); }
 
-    // virtual for test
-    virtual std::shared_ptr<RedisClient> CreateRedisClient() const;
+protected:
+    virtual std::unique_ptr<MetaStorageBackend>
+    CreatePersistentBackend(const std::string &instance_id,
+                            const std::shared_ptr<MetaStorageBackendConfig> &config) const;
+    virtual std::unique_ptr<MetaLocalBaseBackend>
+    CreateLocalBackend(const std::string &instance_id, const std::shared_ptr<MetaStorageBackendConfig> &config) const;
 
 private:
-    std::shared_ptr<DynamicClientPool<RedisClient>> client_pool_;
-    StandardUri storage_uri_;
+    void AsyncRecoverTask() noexcept;
+    // Returns the number of keys successfully backfilled.
+    int64_t BackfillKeysToLocal(const KeyTypeVec &keys,
+                                const FieldMapVec &field_maps,
+                                const std::vector<ErrorCode> &get_error_codes) noexcept;
+    void EnsureKeyInLocal(const KeyTypeVec &keys) noexcept;
+
     std::string instance_id_;
-    std::string cache_key_prefix_;
-    std::string metadata_key_;
-    int64_t timeout_ms_ = 1000;
+    std::shared_ptr<MetaStorageBackendConfig> config_;
+    std::unique_ptr<MetaStorageBackend> persistent_backend_;
+    std::unique_ptr<MetaLocalBaseBackend> local_backend_;
+
+    std::atomic<RecoverState> recover_state_{RecoverState::kRecover};
+    std::atomic<bool> is_closed_{false};
+    std::thread recover_thread_;
+
+    mutable std::mutex deleted_keys_mutex_;
+    std::unordered_set<KeyType> deleted_keys_;
 };
+
 } // namespace kv_cache_manager
