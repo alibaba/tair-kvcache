@@ -84,14 +84,15 @@ Examples:
         sys.exit(1)
     config = config_loader.config()
 
-    output_dir = Path(args.output_dir) if args.output_dir else Path(config.output_result_path())
+    root_dir = Path(args.output_dir) if args.output_dir else Path(config.output_result_path())
+    output_dir = root_dir / "radix_tree"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 80)
     print("Radix Tree Export and Visualization")
     print("=" * 80)
     print("Config: {}".format(args.config))
-    print("Output: {}".format(output_dir))
+    print("Output: {}".format(root_dir))
     print()
 
     optimizer = kvcm_py_optimizer.OptimizerManager(config)
@@ -160,7 +161,7 @@ Examples:
             )
 
     print("\n" + "=" * 80)
-    print("Done! Output: {}".format(output_dir))
+    print("Done! Output: {}".format(root_dir))
     print("=" * 80)
 
     kvcm_py_optimizer.LoggerBroker.DestroyLogger()

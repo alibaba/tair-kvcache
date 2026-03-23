@@ -31,7 +31,7 @@ from plot.lifecycle_plot import (
 
 
 def analyze_single(csv_path: str, output_dir: str, stats_only: bool = False):
-    """分析单个 lifecycle CSV"""
+    """分析单个 lifecycle CSV，图表保存至 output_dir/lifecycle/"""
     name = Path(csv_path).stem.replace("_lifecycle", "")
     print(f"\n{'='*60}")
     print(f"分析: {name}")
@@ -48,21 +48,22 @@ def analyze_single(csv_path: str, output_dir: str, stats_only: bool = False):
     if stats_only:
         return
 
-    os.makedirs(output_dir, exist_ok=True)
+    lifecycle_dir = os.path.join(output_dir, "lifecycle")
+    os.makedirs(lifecycle_dir, exist_ok=True)
     plot_data = extract_plot_data(df)
 
     print(f"\n生成图表:")
     plot_physical_lifespan_cdf(
         plot_data["physical_all"], plot_data["physical_evicted"],
-        name, os.path.join(output_dir, f"{name}_physical_lifespan_cdf.png"))
+        name, os.path.join(lifecycle_dir, f"{name}_physical_lifespan_cdf.png"))
 
     plot_active_lifespan_cdf(
         plot_data["active_all"],
-        name, os.path.join(output_dir, f"{name}_active_lifespan_cdf.png"))
+        name, os.path.join(lifecycle_dir, f"{name}_active_lifespan_cdf.png"))
 
     plot_access_count_histogram(
         plot_data["access_counts"],
-        name, os.path.join(output_dir, f"{name}_access_count.png"))
+        name, os.path.join(lifecycle_dir, f"{name}_access_count.png"))
 
 
 def main():

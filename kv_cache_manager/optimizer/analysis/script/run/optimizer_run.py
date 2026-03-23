@@ -80,7 +80,7 @@ def main():
     if args.draw_chart:
         t5 = time.time()
         print("\n[5/5] Generating charts...")
-        plot_multi_instance_analysis(output_path)
+        plot_multi_instance_analysis(output_path, output_path)
         print("      Charts done: {:.2f}s".format(time.time() - t5))
     else:
         print("\n[5/5] Skipping chart generation.")

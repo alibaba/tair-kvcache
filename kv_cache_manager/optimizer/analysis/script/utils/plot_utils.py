@@ -61,7 +61,7 @@ def plot_single_policy_curves(
 
     Args:
         results:       [{"capacity": int, "instances": {...}}, ...]
-        output_dir:    图片输出目录
+        output_dir:    图片根输出目录，图表保存至 output_dir/pareto/
         hit_rate_type: "total" | "internal" | "external"
         title:         图标题（None 则自动生成）
         axis_limits:   {"x_min", "x_max", "y_min", "y_max"}，None 表示不限制
@@ -97,8 +97,9 @@ def plot_single_policy_curves(
     plt.ylim(y_lo, y_hi)
 
     plt.tight_layout()
-    os.makedirs(output_dir, exist_ok=True)
-    out = os.path.join(output_dir, f"pareto_curve_{hit_rate_type}.png")
+    pareto_dir = os.path.join(output_dir, "pareto")
+    os.makedirs(pareto_dir, exist_ok=True)
+    out = os.path.join(pareto_dir, f"pareto_curve_{hit_rate_type}.png")
     plt.savefig(out, dpi=300, bbox_inches="tight")
     print(f"Saved: {out}")
     plt.close()
@@ -118,7 +119,7 @@ def plot_multi_policy_subplots(
 
     Args:
         results_by_policy: {"policy": [{"capacity", "instances"}, ...]}
-        output_dir:        图片输出目录
+        output_dir:        图片根输出目录，图表保存至 output_dir/pareto/
         hit_rate_type:     "total" | "internal" | "external"
     """
     if not results_by_policy:
@@ -181,8 +182,9 @@ def plot_multi_policy_subplots(
     )
     plt.tight_layout()
 
-    os.makedirs(output_dir, exist_ok=True)
-    out = os.path.join(output_dir, f"multi_policy_{hit_rate_type}.png")
+    pareto_dir = os.path.join(output_dir, "pareto")
+    os.makedirs(pareto_dir, exist_ok=True)
+    out = os.path.join(pareto_dir, f"multi_policy_{hit_rate_type}.png")
     plt.savefig(out, dpi=300, bbox_inches="tight")
     print(f"\nSaved: {out}")
     plt.close()

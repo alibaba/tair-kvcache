@@ -99,8 +99,10 @@ def run_optimizer_with_config_explicit(
     if save_csv_to:
         import glob
         os.makedirs(save_csv_to, exist_ok=True)
-        for csv_file in glob.glob(os.path.join(temp_dir, "*_hit_rates.csv")):
-            shutil.copy(csv_file, save_csv_to)
+        patterns = ["*_hit_rates.csv", "*_template_prefix_traces.csv", "*_template_prefix_summary.csv"]
+        for pattern in patterns:
+            for csv_file in glob.glob(os.path.join(temp_dir, pattern)):
+                shutil.copy(csv_file, save_csv_to)
         print(f"  → CSV saved to: {save_csv_to}")
 
     return temp_dir, manager

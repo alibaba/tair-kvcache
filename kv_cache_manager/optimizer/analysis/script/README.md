@@ -35,9 +35,15 @@ bazel run //kv_cache_manager/optimizer/analysis/script:optimizer_run -- -c confi
 
 ### 输出
 
-- `<output_result_path>/*_hit_rates.csv` — 每个 instance 的命中率时序数据
-- `<output_result_path>/multi_instance_cache_analysis.png` — 命中率时序图（需 `--draw-chart`）
-- `<output_result_path>/*_lifecycle.csv` — block 生命周期数据（需 `--export-lifecycle`）
+```
+<output_result_path>/
+├── *_hit_rates.csv                       # 每个 instance 的命中率时序数据
+├── *_template_prefix_traces.csv          # per-trace 模板归属明细
+├── *_template_prefix_summary.csv         # 模板级汇总
+├── *_lifecycle.csv                       # block 生命周期数据（需 --export-lifecycle）
+└── timeseries/
+    └── multi_instance_cache_analysis.png # 命中率时序图（需 --draw-chart）
+```
 
 ---
 
@@ -106,9 +112,19 @@ bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
 
 ### 输出
 
-- `pareto_curve_<type>.png` — 单策略 Pareto 散点图
-- `multi_policy_<type>.png` — 多策略对比子图
-- `csv_results/cap_<capacity>_<policy>/` — 每次运行的 CSV（需 `--save-csv`）
+```
+<output_result_path>/
+├── pareto/
+│   ├── pareto_curve_<type>.png           # 单策略 Pareto 散点图
+│   └── multi_policy_<type>.png           # 多策略对比子图
+├── timeseries/
+│   └── multi_instance_cache_analysis.png # 时序图（需 --plot-timeseries）
+└── csv_results/                          # 需 --save-csv
+    └── cap_<capacity>_<policy>/
+        ├── *_hit_rates.csv
+        ├── *_template_prefix_traces.csv
+        └── *_template_prefix_summary.csv
+```
 
 ---
 
@@ -180,9 +196,13 @@ python kv_cache_manager/optimizer/analysis/script/plot/radix_tree_plot.py \
 
 ### 输出
 
-- `<instance>_radix_tree.json` — 前缀树结构数据
-- `<instance>_radix_tree.png` — 完整树可视化
-- `<instance>_hot_paths.png` — 热点路径可视化
+```
+<output_result_path>/
+└── radix_tree/
+    ├── <instance>_radix_tree.json        # 前缀树结构数据
+    ├── <instance>_radix_tree.png         # 完整树可视化
+    └── <instance>_hot_paths.png          # 热点路径可视化
+```
 
 ---
 
@@ -227,10 +247,15 @@ bazel run //kv_cache_manager/optimizer/analysis/script:analyze_lifecycle -- \
 
 ### 输出
 
-- 控制台统计报告
-- `<instance>_physical_lifespan_cdf.png` — Physical Lifespan CDF（全量 + Evicted）
-- `<instance>_active_lifespan_cdf.png` — Active Lifespan CDF
-- `<instance>_access_count.png` — Access Count 直方图（全量 + 去零两张子图）
+```
+<output_result_path>/
+└── lifecycle/
+    ├── <instance>_physical_lifespan_cdf.png  # Physical Lifespan CDF（全量 + Evicted）
+    ├── <instance>_active_lifespan_cdf.png    # Active Lifespan CDF
+    └── <instance>_access_count.png           # Access Count 直方图（全量 + 去零两张子图）
+```
+
+控制台同步输出统计报告。
 
 ---
 
@@ -285,4 +310,45 @@ script/
     ├── optimizer_runner.py       # optimizer 运行封装
     ├── csv_loader.py             # CSV 加载 + 容量列表
     └── plot_utils.py             # 绘图风格 + Pareto 绘图
+```
+
+---
+
+## 输出目录总览
+
+所有脚本共享同一个根目录 `<output_result_path>`（来自 config.json `output_result_path` 字段）。
+
+```
+<output_result_path>/
+│
+│  # ── C++ optimizer 原始数据输出 ──────────────────────────────
+├── *_hit_rates.csv                           # 命中率时序（每条 trace 上报）
+├── *_template_prefix_traces.csv              # per-trace 模板归属明细
+├── *_template_prefix_summary.csv             # 模板级汇总
+├── *_lifecycle.csv                           # block 生命周期（需 --export-lifecycle）
+│
+│  # ── Python 图表输出 ────────────────────────────────────────
+├── pareto/                                   # tradeoff
+│   ├── pareto_curve_<type>.png
+│   └── multi_policy_<type>.png
+│
+├── timeseries/                               # optimizer_run --draw-chart
+│   └── multi_instance_cache_analysis.png     # tradeoff --plot-timeseries
+│
+├── lifecycle/                                # analyze_lifecycle
+│   ├── *_physical_lifespan_cdf.png
+│   ├── *_active_lifespan_cdf.png
+│   └── *_access_count.png
+│
+├── radix_tree/                               # export_tree
+│   ├── *_radix_tree.json
+│   ├── *_radix_tree.png
+│   └── *_hot_paths.png
+│
+│  # ── tradeoff --save-csv 实验中间数据 ─────────────────────────
+└── csv_results/
+    └── cap_<N>_<policy>/
+        ├── *_hit_rates.csv
+        ├── *_template_prefix_traces.csv
+        └── *_template_prefix_summary.csv
 ```

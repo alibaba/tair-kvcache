@@ -105,8 +105,8 @@ def _print_multi_policy_table(results_by_policy, policies):
 # 时序图
 # ============================================================================
 
-def _plot_timeseries(csv_save_dir, results_by_policy, target_caps=None):
-    """为指定容量点生成命中率时序图"""
+def _plot_timeseries(csv_save_dir, results_by_policy, output_dir, target_caps=None):
+    """为指定容量点生成命中率时序图，图表保存至 output_dir/timeseries/"""
     print("\n" + "=" * 60)
     print("Generating Timeseries Plots")
     print("=" * 60)
@@ -118,7 +118,7 @@ def _plot_timeseries(csv_save_dir, results_by_policy, target_caps=None):
             if os.path.exists(cap_dir):
                 print("Plotting {} capacity={}...".format(pol, cap))
                 try:
-                    plot_multi_instance_analysis(cap_dir)
+                    plot_multi_instance_analysis(cap_dir, output_dir)
                     count += 1
                 except Exception as e:
                     print("  Failed: {}".format(e))
@@ -264,7 +264,7 @@ def main():
     # ----------------------------------------------------------------
     has_csv = args.save_csv or args.skip_run
     if args.plot_timeseries and has_csv:
-        _plot_timeseries(csv_save_dir, results_by_policy, args.plot_capacity)
+        _plot_timeseries(csv_save_dir, results_by_policy, output_dir, args.plot_capacity)
     elif args.plot_timeseries and not has_csv:
         print("\nWarning: --plot-timeseries requires --save-csv or --skip-run")
 

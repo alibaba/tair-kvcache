@@ -66,7 +66,15 @@ def _load_sp_cumulative(csv_dir, instance_name):
     })
 
 
-def plot_multi_instance_analysis(csv_dir):
+def plot_multi_instance_analysis(csv_dir, output_dir: str = None):
+    """
+    读取 csv_dir 下的命中率 CSV，生成时序分析图。
+
+    Args:
+        csv_dir:    CSV 数据目录
+        output_dir: 图表根输出目录，图表保存至 output_dir/timeseries/
+                    默认为 csv_dir（向后兼容）
+    """
     csv_files = sorted(glob.glob(os.path.join(csv_dir, "*_hit_rates.csv")))
     if not csv_files:
         print(f"Error: No CSV files found in directory: {csv_dir}")
@@ -358,7 +366,9 @@ def plot_multi_instance_analysis(csv_dir):
     ax_top.set_title(f'Cache Analysis - {len(instance_names)} Instances', fontsize=15, fontweight='bold', pad=12)
 
     fig.tight_layout()
-    output_file = os.path.join(csv_dir, "multi_instance_cache_analysis.png")
+    timeseries_dir = os.path.join(output_dir or csv_dir, "timeseries")
+    os.makedirs(timeseries_dir, exist_ok=True)
+    output_file = os.path.join(timeseries_dir, "multi_instance_cache_analysis.png")
     plt.savefig(output_file, dpi=300, bbox_inches='tight', facecolor='white')
     print(f"Chart saved to: {output_file}")
     plt.close()
