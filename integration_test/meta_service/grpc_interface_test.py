@@ -11,6 +11,7 @@ from kv_cache_manager.protocol.protobuf.meta_service_pb2 import (
     FinishWriteCacheRequest,
     RemoveCacheRequest,
     TrimCacheRequest,
+    GetClusterInfoRequest,
     ModelDeployment,
     BlockMask,
     BoolMasksType,
@@ -117,6 +118,17 @@ class MetaServiceGrpcClient(cases.MetaServiceClientBase):
             if response_dict['header']['status']['code'] != "OK":
                 raise AssertionError(
                     f"Request to trim_cache failed with error: {response_dict['header']['status']['message']}")
+        return response_dict
+
+    def get_cluster_info(self, data, check_response=True):
+        """Get cluster info (leader discovery)"""
+        request = self._convert_dict_to_proto(GetClusterInfoRequest, data)
+        response = self._stub.GetClusterInfo(request)
+        response_dict = self._convert_proto_to_dict(response)
+        if check_response:
+            if response_dict['header']['status']['code'] != "OK":
+                raise AssertionError(
+                    f"Request to get_cluster_info failed with error: {response_dict['header']['status']['message']}")
         return response_dict
 
     def close(self):

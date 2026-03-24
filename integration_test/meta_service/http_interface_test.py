@@ -68,6 +68,10 @@ class MetaServiceHttpClient(cases.MetaServiceClientBase):
         """Trim cache data based on specified strategy"""
         return self._make_api_request('/api/trimCache', data, check_response)
 
+    def get_cluster_info(self, data, check_response=True):
+        """Get cluster info (leader discovery)"""
+        return self._make_api_request('/api/getClusterInfo', data, check_response)
+
     def close(self):
         """Close the HTTP session"""
         self.session.close()
