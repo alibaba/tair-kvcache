@@ -26,8 +26,8 @@ TEST_F(RadixTreeIndexTest, BasicInitialization) { EXPECT_NE(index_, nullptr); }
 
 TEST_F(RadixTreeIndexTest, InsertOnly) {
     std::vector<int64_t> block_keys = {1, 2, 3, 4, 5};
-    auto inserted = index_->InsertOnly(block_keys, 1000);
-    EXPECT_EQ(inserted.size(), 5);
+    auto result = index_->InsertOnly(block_keys, 1000);
+    EXPECT_EQ(result.inserted_keys.size(), 5);
 }
 
 TEST_F(RadixTreeIndexTest, InsertOnlyDuplicate) {
@@ -35,8 +35,8 @@ TEST_F(RadixTreeIndexTest, InsertOnlyDuplicate) {
     index_->InsertOnly(block_keys, 1000);
 
     // 再次插入相同的块
-    auto inserted = index_->InsertOnly(block_keys, 2000);
-    EXPECT_EQ(inserted.size(), 0); // 应该没有新插入的块
+    auto result = index_->InsertOnly(block_keys, 2000);
+    EXPECT_EQ(result.inserted_keys.size(), 0);
 }
 
 TEST_F(RadixTreeIndexTest, InsertWithQueryNoHit) {
@@ -179,8 +179,8 @@ TEST_F(RadixTreeIndexTest, LargeBlockSequence) {
         block_keys.push_back(i);
     }
 
-    auto inserted = index_->InsertOnly(block_keys, 1000);
-    EXPECT_EQ(inserted.size(), 100);
+    auto result = index_->InsertOnly(block_keys, 1000);
+    EXPECT_EQ(result.inserted_keys.size(), 100);
 
     // 查询前50个
     std::vector<int64_t> query_keys;

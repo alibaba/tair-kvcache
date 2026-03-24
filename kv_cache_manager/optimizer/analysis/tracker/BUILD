@@ -5,10 +5,12 @@ cc_library(
     srcs = [
         "block_lifecycle_tracker.cc",
         "hit_rate_tracker.cc",
+        "template_prefix_tracker.cc",
     ],
     hdrs = [
         "block_lifecycle_tracker.h",
         "hit_rate_tracker.h",
+        "template_prefix_tracker.h",
     ],
     deps = [
         "//kv_cache_manager/common:logger",

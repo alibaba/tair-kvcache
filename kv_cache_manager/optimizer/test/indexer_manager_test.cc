@@ -96,8 +96,8 @@ TEST_F(OptIndexerManagerTest, CreateOptIndexer) {
 
     // 验证索引器可以插入和查询数据
     std::vector<int64_t> block_keys = {1, 2, 3, 4, 5};
-    auto inserted = indexer->InsertOnly(block_keys, 1000);
-    EXPECT_EQ(inserted.size(), 5);
+    auto result = indexer->InsertOnly(block_keys, 1000);
+    EXPECT_EQ(result.inserted_keys.size(), 5);
 
     std::vector<std::vector<int64_t>> hits;
     auto inserted2 = indexer->InsertWithQuery(block_keys, 2000, hits);

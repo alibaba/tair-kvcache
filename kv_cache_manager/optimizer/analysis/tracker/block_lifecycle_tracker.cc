@@ -94,6 +94,16 @@ void BlockLifecycleTracker::Finalize(const std::string &instance_id, int64_t fin
     for (auto &[block_key, record] : data.alive_blocks) {
         record->death_time_us = final_timestamp;
         record->lifespan_us = final_timestamp - record->birth_time_us;
+        if (record->block_ptr) {
+            record->access_count = record->block_ptr->access_count;
+            record->last_access_time_us = record->block_ptr->last_access_time;
+            record->block_ptr = nullptr;
+        } else {
+            KVCM_LOG_WARN("Block %ld still alive at Finalize but block_ptr is null, "
+                          "access_count may be stale (instance: %s)",
+                          block_key,
+                          instance_id.c_str());
+        }
     }
 
     data.alive_blocks.clear();

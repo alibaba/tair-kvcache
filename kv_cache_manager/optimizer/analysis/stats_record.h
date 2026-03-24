@@ -1,6 +1,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace kv_cache_manager {
@@ -19,12 +20,16 @@ struct ReadRecord {
     size_t internal_hit_blocks;
     size_t current_cache_blocks;
     std::vector<size_t> blocks_per_instance;
+    std::string trace_id;
+    const std::vector<int64_t> *keys_ptr = nullptr; // 借用，仅 OnReadComplete 期间有效
 };
 
 struct WriteRecord {
     int64_t timestamp_us;
     size_t write_blocks;          // 请求写入的 block 总数（含已存在的）
     size_t newly_inserted_blocks; // 实际新插入的 block 数（不含已存在的）
+
+    std::string trace_id; // 当前 trace 标识
 };
 
 struct BlockLifecycleRecord {

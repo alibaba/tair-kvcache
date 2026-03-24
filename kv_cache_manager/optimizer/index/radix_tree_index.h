@@ -22,7 +22,11 @@ public:
     RadixTreeIndex();
     ~RadixTreeIndex() = default;
 
-    std::vector<int64_t> InsertOnly(const std::vector<int64_t> &block_keys, const int64_t timestamp);
+    struct InsertResult {
+        std::vector<int64_t> inserted_keys;
+    };
+
+    InsertResult InsertOnly(const std::vector<int64_t> &block_keys, const int64_t timestamp);
     void PrefixQuery(const std::vector<int64_t> &block_keys,
                      const BlockMask &block_mask,
                      const int64_t timestamp,
@@ -37,9 +41,7 @@ public:
     // 清空整个RadixTree的缓存
     void Clear();
 
-    void SetStatsCollector(std::shared_ptr<StatsCollector> collector) {
-        stats_collector_ = collector;
-    }
+    void SetStatsCollector(std::shared_ptr<StatsCollector> collector) { stats_collector_ = collector; }
 
     // 导出前缀树用于可视化
     struct RadixTreeExportNode {
@@ -60,6 +62,8 @@ public:
 
     RadixTreeExport ExportForVisualization() const;
 
+    const RadixTreeNode *GetRoot() const { return root_.get(); }
+
 private:
     std::unique_ptr<RadixTreeNode> root_;
     std::shared_ptr<EvictionPolicy> eviction_policy_;
@@ -70,8 +74,7 @@ private:
     std::vector<BlockEntry *>
     AppendNewBlocks(RadixTreeNode *node, const std::vector<int64_t> &block_keys, const int64_t timestamp);
 
-    std::vector<int64_t>
-    InsertNode(RadixTreeNode *node, const std::vector<int64_t> &block_keys, const int64_t timestamp);
+    InsertResult InsertNode(RadixTreeNode *node, const std::vector<int64_t> &block_keys, const int64_t timestamp);
     void SplitNode(RadixTreeNode *existing_node,
                    size_t split_pos,
                    const std::vector<int64_t> &remaining_keys,

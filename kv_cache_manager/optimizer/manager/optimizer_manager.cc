@@ -33,6 +33,7 @@ bool OptimizerManager::Init() {
     // ---- 初始化 StatsCollector 并注册子 Tracker ----
     stats_collector_ = std::make_shared<StatsCollector>();
     hit_rate_tracker_ = stats_collector_->EmplaceTracker<HitRateTracker>();
+    template_prefix_tracker_ = stats_collector_->EmplaceTracker<TemplatePrefixTracker>();
 
     if (enable_lifecycle_tracking_) {
         stats_collector_->EmplaceTracker<BlockLifecycleTracker>();
@@ -212,6 +213,15 @@ void OptimizerManager::AnalyzeResults() {
         int64_t final_timestamp = stats_collector_->GetLastTimestamp(instance_id);
         KVCM_LOG_INFO("Finalizing stats for instance %s with timestamp: %ld", instance_id.c_str(), final_timestamp);
         stats_collector_->FinalizeAll(instance_id, final_timestamp);
+
+        // 模板前缀分析：Finalize 之后、Export 之前，从 RadixTree 提取模板
+        if (template_prefix_tracker_) {
+            auto indexer = indexer_manager_->GetOptIndexer(instance_id);
+            if (indexer) {
+                template_prefix_tracker_->AnalyzeTemplates(instance_id, indexer->GetRoot());
+            }
+        }
+
         stats_collector_->ExportAll(instance_id, config_);
         stats_collector_->ResetAll(instance_id);
     }

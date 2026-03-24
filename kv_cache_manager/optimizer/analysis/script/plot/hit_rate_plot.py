@@ -32,6 +32,40 @@ def read_csv_file(csv_file_path):
         print(f"Error reading {csv_file_path}: {str(e)}")
         return None
 
+def _load_sp_cumulative(csv_dir, instance_name):
+    """
+    从 template_prefix_traces.csv 计算 system prompt 累积命中率时序。
+
+    返回 DataFrame: [TimestampUs, AccSpHitRate]
+    AccSpHitRate = cumsum(min(hit, template_depth)) / cumsum(total_blocks)
+    """
+    basename = instance_name.replace("_hit_rates", "")
+    sp_path = os.path.join(csv_dir, f"{basename}_template_prefix_traces.csv")
+    if not os.path.exists(sp_path):
+        return None
+
+    df = pd.read_csv(sp_path)
+    # trace_id format: trace_<instance>_<timestamp_us>
+    df['TimestampUs'] = df['TraceId'].str.rsplit('_', n=1).str[-1].astype(np.int64)
+    df = df.sort_values('TimestampUs')
+
+    sp_hits = np.where(
+        (df['TemplateId'] != 'NONE') & (df['TemplateDepth'] > 0),
+        np.minimum(df['HitBlocks'].values, df['TemplateDepth'].values),
+        0
+    )
+
+    cum_sp_hits = np.cumsum(sp_hits)
+    cum_total = np.cumsum(df['TotalBlocks'].values)
+
+    acc_sp_rate = np.where(cum_total > 0, cum_sp_hits / cum_total, 0.0)
+
+    return pd.DataFrame({
+        'TimestampUs': df['TimestampUs'].values,
+        'AccSpHitRate': acc_sp_rate,
+    })
+
+
 def plot_multi_instance_analysis(csv_dir):
     csv_files = sorted(glob.glob(os.path.join(csv_dir, "*_hit_rates.csv")))
     if not csv_files:
@@ -77,8 +111,8 @@ def plot_multi_instance_analysis(csv_dir):
     base = pd.DataFrame({'t': base_timestamps})  # 用于merge_asof
 
     all_acc_hit, all_acc_external_hit, all_time_ranges = [], [], []
-    # 用于瞬时命中率计算：累积读块数 / 累积命中块数（反推）
     all_acc_read_blocks, all_acc_hit_blocks, all_acc_ext_hit_blocks = [], [], []
+    all_acc_sp_hit = []
     global_updates_list = []
     for df in dataframes:
         d = df.copy()
@@ -113,6 +147,22 @@ def plot_multi_instance_analysis(csv_dir):
         all_acc_read_blocks.append(aligned['AccReadBlocks'].to_numpy(float))
         all_acc_hit_blocks.append(aligned['AccHitBlocks'].to_numpy(float))
         all_acc_ext_hit_blocks.append(aligned['AccExtHitBlocks'].to_numpy(float))
+
+    # ---- SP 累积命中率对齐 ----
+    for idx, name in enumerate(instance_names):
+        sp_df = _load_sp_cumulative(csv_dir, name)
+        if sp_df is None:
+            all_acc_sp_hit.append(None)
+            continue
+        sp_df['t'] = (sp_df['TimestampUs'] - min_timestamp) / 1e6
+        sp_df = sp_df.sort_values('t')
+        sp_aligned = pd.merge_asof(
+            base, sp_df[['t', 'AccSpHitRate']], on='t',
+            direction='backward', allow_exact_matches=True
+        )
+        t0, _ = all_time_ranges[idx]
+        sp_aligned.loc[sp_aligned['t'] < t0, 'AccSpHitRate'] = np.nan
+        all_acc_sp_hit.append(sp_aligned['AccSpHitRate'].to_numpy(float))
 
     global_updates = pd.concat(global_updates_list, ignore_index=True)
     global_updates = global_updates.dropna(subset=['t', 'CachedBlocksAllInstance']).sort_values('t')
@@ -233,7 +283,7 @@ def plot_multi_instance_analysis(csv_dir):
     top_lines = [ax_top.lines[0]]
     bot_lines = [ax_bot.lines[0]]
 
-    # 上图：累计命中率
+    # 上图：累计命中率 + system prompt 累积命中率
     for i, name in enumerate(instance_names):
         t0, t1 = all_time_ranges[i]
         valid = (base_timestamps >= t0) & (base_timestamps <= t1)
@@ -245,6 +295,14 @@ def plot_multi_instance_analysis(csv_dir):
                     color=colors[i], linestyle='--', alpha=0.6,
                     linewidth=1.5, drawstyle='steps-post')
         top_lines += l1
+
+        if all_acc_sp_hit[i] is not None:
+            sp_line = ax_top_r.plot(
+                base_timestamps[valid], np.array(all_acc_sp_hit[i])[valid],
+                color=colors[i], linestyle=':', linewidth=2.5, alpha=0.9,
+                label=f'{name} - SP AccHitRate',
+                drawstyle='steps-post')
+            top_lines += sp_line
 
     # 下图：时间窗口内真实命中率（累积量差值）+ 按时间降采样
     downsample_interval_s = 10   # 每隔 10 秒取一个代表点

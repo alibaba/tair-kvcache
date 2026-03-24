@@ -87,6 +87,8 @@ void OptimizerRunner::HandleGetLocation(const GetLocationSchemaTrace &trace) {
 
     // ---- 构造 ReadRecord 并委托给 StatsCollector ----
     ReadRecord record = BuildReadRecord(instance_id, trace.timestamp_us());
+    record.trace_id = trace.trace_id();
+    record.keys_ptr = &trace.keys();
 
     if (std::holds_alternative<BlockMaskVector>(trace.block_mask())) {
         const auto &mask_vector = std::get<BlockMaskVector>(trace.block_mask());
@@ -114,13 +116,17 @@ void OptimizerRunner::HandleWriteCache(const WriteCacheSchemaTrace &trace) {
         return;
     }
 
-    auto inserted_keys = indexer->InsertOnly(trace.keys(), trace.timestamp_us());
+    auto result = indexer->InsertOnly(trace.keys(), trace.timestamp_us());
     bool evicted = indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_us());
     if (evicted) {
         KVCM_LOG_DEBUG("Eviction in %zu to instance_id: %s", trace.timestamp_us(), instance_id.c_str());
     }
 
-    WriteRecord record{trace.timestamp_us(), trace.keys().size(), inserted_keys.size()};
+    WriteRecord record;
+    record.timestamp_us = trace.timestamp_us();
+    record.write_blocks = trace.keys().size();
+    record.newly_inserted_blocks = result.inserted_keys.size();
+    record.trace_id = trace.trace_id();
     stats_collector_->OnWriteComplete(instance_id, record);
 }
 
@@ -138,6 +144,8 @@ void OptimizerRunner::HandleDialogTurn(const DialogTurnSchemaTrace &trace) {
 
     // ---- ReadRecord ----
     ReadRecord read_record = BuildReadRecord(instance_id, trace.timestamp_us());
+    read_record.trace_id = trace.trace_id();
+    read_record.keys_ptr = &trace.keys();
     read_record.external_read_blocks = trace.keys().size();
     read_record.internal_read_blocks = 0;
     for (const auto &hit : hits) {

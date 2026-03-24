@@ -2,8 +2,9 @@
 #include <memory>
 #include <vector>
 
-#include "kv_cache_manager/optimizer/analysis/tracker/hit_rate_tracker.h"
 #include "kv_cache_manager/optimizer/analysis/stats_collector.h"
+#include "kv_cache_manager/optimizer/analysis/tracker/hit_rate_tracker.h"
+#include "kv_cache_manager/optimizer/analysis/tracker/template_prefix_tracker.h"
 #include "kv_cache_manager/optimizer/config/insight_simulator_types.h"
 #include "kv_cache_manager/optimizer/config/optimizer_config.h"
 #include "kv_cache_manager/optimizer/config/optimizer_config_loader.h"
@@ -69,6 +70,7 @@ private:
 
     // 快速访问指针，所有权归 StatsCollector
     HitRateTracker *hit_rate_tracker_ = nullptr;
+    TemplatePrefixTracker *template_prefix_tracker_ = nullptr;
 
     bool enable_lifecycle_tracking_ = false;
 };

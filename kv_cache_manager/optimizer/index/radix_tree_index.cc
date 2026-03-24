@@ -18,28 +18,25 @@ RadixTreeIndex::RadixTreeIndex(const std::string &instance_id, const std::shared
 }
 // TODO 后续改为 记录需要更新信息的node和blockentry，然后统一用一个接口更新
 // 这样可以做到反向更新lru链表，避免同一时间戳下先驱逐前缀
-std::vector<int64_t> RadixTreeIndex::InsertOnly(const std::vector<int64_t> &block_keys, const int64_t timestamp) {
+RadixTreeIndex::InsertResult RadixTreeIndex::InsertOnly(const std::vector<int64_t> &block_keys,
+                                                        const int64_t timestamp) {
     if (block_keys.empty()) {
-        return block_keys;
+        return {block_keys};
     }
-    std::vector<int64_t> insert_block_keys = InsertNode(root_.get(), block_keys, timestamp);
-    // CleanEmptyLeafNodes(root_.get());
-    return insert_block_keys;
+    return InsertNode(root_.get(), block_keys, timestamp);
 }
 // 先返回键值，后续看需要location或是针对block的access信息的需求之后再返回BlockEntry指针
 // 目前还没有热数据fetch的功能
-std::vector<int64_t>
+RadixTreeIndex::InsertResult
 RadixTreeIndex::InsertNode(RadixTreeNode *node, const std::vector<int64_t> &block_keys, const int64_t timestamp) {
     if (block_keys.empty()) {
-        return block_keys;
+        return {block_keys};
     }
-    // 如果当前节点是叶子节点，直接在该节点末尾添加blocks，减少节点生成；
+    // 叶子追加 = 严格前缀包含（树结构保证 B 走完了 A 的全部 blocks）
     if (node->isLeaf() && node->parent != nullptr) {
         WriteToTier(node, block_keys, timestamp, nullptr);
-        return block_keys;
+        return {block_keys};
     }
-    // 如果不是叶子节点，继续向下查找合适的子节点插入blocks
-    // 情况1:找不到对应子节点，创建新节点插入blocks
     int64_t current_key = block_keys.front();
     auto child_it = node->children.find(current_key);
     if (child_it == node->children.end()) {
@@ -47,7 +44,7 @@ RadixTreeIndex::InsertNode(RadixTreeNode *node, const std::vector<int64_t> &bloc
         new_node->parent = node;
         WriteToTier(new_node.get(), block_keys, timestamp, nullptr);
         node->children[current_key] = std::move(new_node);
-        return block_keys;
+        return InsertResult{block_keys};
     } else {
         // 情况2:找到对应子节点，继续匹配插入
         RadixTreeNode *child = child_it->second.get();
@@ -69,21 +66,22 @@ RadixTreeIndex::InsertNode(RadixTreeNode *node, const std::vector<int64_t> &bloc
             WriteToTier(child, insert_keys, timestamp, AppendEvictBlocks(std::move(evicted_blocks)));
         }
         if (match_len == child->blocks.size()) {
-            // 当前子节点完全匹配，继续向下匹配插入
-            auto remain_results =
+            // 完全匹配，递归向下
+            auto remain_result =
                 InsertNode(child, std::vector<int64_t>(block_keys.begin() + match_len, block_keys.end()), timestamp);
-            insert_keys.insert(insert_keys.end(), remain_results.begin(), remain_results.end());
-            return insert_keys;
+            insert_keys.insert(
+                insert_keys.end(), remain_result.inserted_keys.begin(), remain_result.inserted_keys.end());
+            return InsertResult{insert_keys};
         } else if (match_len == block_keys.size()) {
-            // 需要写入的block_keys完全匹配到子节点的部分，直接返回
-            return insert_keys;
+            // keys 完全匹配到子节点的部分前缀
+            return InsertResult{insert_keys};
         } else {
-            // 部分匹配，进行节点拆分
+            // 部分匹配 → SplitNode
             SplitNode(
                 child, match_len, std::vector<int64_t>(block_keys.begin() + match_len, block_keys.end()), timestamp);
             auto remain_results = std::vector<int64_t>(block_keys.begin() + match_len, block_keys.end());
             insert_keys.insert(insert_keys.end(), remain_results.begin(), remain_results.end());
-            return insert_keys;
+            return InsertResult{insert_keys};
         }
     }
 }
@@ -93,11 +91,11 @@ void RadixTreeIndex::SplitNode(RadixTreeNode *existing_node,
                                const std::vector<int64_t> &right_keys,
                                int64_t timestamp) {
     if (split_pos == 0)
-        return; // No split needed
+        return;
 
     RadixTreeNode *original_parent = existing_node->parent;
     if (!original_parent) {
-        return; // Root node, cannot split
+        return;
     }
     int64_t edge_key = existing_node->blocks.front()->key;
     auto existing_uptr = std::move(original_parent->children[edge_key]);
