@@ -101,6 +101,13 @@ public:
                      int32_t sw_size,
                      const std::vector<std::string> &location_spec_names);
 
+    std::pair<ErrorCode, int64_t> GetCacheLocationLen(RequestContext *request_context,
+                                                      const std::string &instance_id,
+                                                      QueryType query_type,
+                                                      const KeyVector &keys,
+                                                      const TokenIdsVector &tokens,
+                                                      int32_t sw_size);
+
     std::pair<ErrorCode, StartWriteCacheInfo> StartWriteCache(RequestContext *request_context,
                                                               const std::string &instance_id,
                                                               const KeyVector &keys,
@@ -184,6 +191,17 @@ private:
                                           const BlockMask &block_mask,
                                           int32_t sw_size,
                                           CacheLocationVector &cache_locations) const;
+    ErrorCode PerformCacheLocationQuery(RequestContext *request_context,
+                                        ServiceMetricsCollector *service_metrics_collector,
+                                        MetaSearcher *meta_searcher,
+                                        const std::string &instance_id,
+                                        QueryType query_type,
+                                        const KeyVector &keys,
+                                        const TokenIdsVector &tokens,
+                                        const BlockMask &block_mask,
+                                        int32_t sw_size,
+                                        KeyVector &query_keys,
+                                        CacheLocationVector &cache_locations) const;
     std::unique_ptr<SelectLocationPolicy> genSelectLocationPolicy(RequestContext *request_context,
                                                                   const std::string &instance_id) const;
 

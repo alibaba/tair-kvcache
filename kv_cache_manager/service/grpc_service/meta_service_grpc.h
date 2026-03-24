@@ -35,6 +35,10 @@ public:
                                   const proto::meta::GetCacheLocationRequest *request,
                                   proto::meta::GetCacheLocationResponse *response) override;
 
+    grpc::Status GetCacheLocationLen(grpc::ServerContext *context,
+                                     const proto::meta::GetCacheLocationLenRequest *request,
+                                     proto::meta::GetCacheLocationLenResponse *response) override;
+
     grpc::Status StartWriteCache(grpc::ServerContext *context,
                                  const proto::meta::StartWriteCacheRequest *request,
                                  proto::meta::StartWriteCacheResponse *response) override;

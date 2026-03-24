@@ -119,6 +119,21 @@ MetaClientImpl::MatchLocation(const std::string &trace_id,
         trace_id, instance_id, query_type, keys, tokens, block_mask, sw_size, location_spec_names);
 }
 
+std::pair<ClientErrorCode, int64_t> MetaClientImpl::MatchLocationLen(const std::string &trace_id,
+                                                                     QueryType query_type,
+                                                                     const std::vector<int64_t> &keys,
+                                                                     const std::vector<int64_t> &tokens,
+                                                                     int32_t sw_size) {
+    KVCM_LOG_DEBUG("match location length with trace_id [%s], query_type [%d], keys %s, tokens %s, sw_size [%d]",
+                   trace_id.c_str(),
+                   static_cast<int>(query_type),
+                   DebugStringUtil::ToString(keys).c_str(),
+                   DebugStringUtil::ToString(tokens).c_str(),
+                   sw_size);
+    const std::string &instance_id = CHECK_INSTANCE_STUB_WITH_TYPE();
+    return stub_->GetCacheLocationLen(trace_id, instance_id, query_type, keys, tokens, sw_size);
+}
+
 std::pair<ClientErrorCode, Metas> MetaClientImpl::MatchMeta(const std::string &trace_id,
                                                             const std::vector<int64_t> &keys,
                                                             const std::vector<int64_t> &tokens,

@@ -1354,4 +1354,58 @@ TEST_F(CacheManagerTest, TestStartWriteCacheWithNoAvailableStorage) {
     EXPECT_EQ(0, start_write_cache_info.locations().cache_locations_view().size());
 }
 
+TEST_F(CacheManagerTest, TestGetCacheLocationLen) {
+    auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    ASSERT_EQ(expected,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               "test_instance",
+                                               64,
+                                               createLocationSpecInfos(),
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>()));
+
+    std::vector<int64_t> keys{1, 2, 3, 4, 5, 6, 7};
+    auto [ec1, start_write_cache_info] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 100000000);
+    ASSERT_EQ(EC_OK, ec1);
+
+    {
+        BlockMask block_mask = static_cast<size_t>(5);
+        auto ec = cache_manager_->FinishWriteCache(
+            request_context_.get(), "test_instance", start_write_cache_info.write_session_id(), block_mask);
+        ASSERT_EQ(EC_OK, ec);
+    }
+
+    // Test QT_PREFIX_MATCH
+    {
+        std::vector<int64_t> keys{1, 2, 8, 4, 5, 6};
+        BlockMask block_mask = static_cast<size_t>(0);
+        auto [ec, cache_location_len] = cache_manager_->GetCacheLocationLen(
+            request_context_.get(), "test_instance", CacheManager::QueryType::QT_PREFIX_MATCH, keys, {}, 0);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(2, cache_location_len);
+    }
+
+    // Test QT_BATCH_GET
+    {
+        std::vector<int64_t> keys{1, 2, 8, 4, 5, 9, 6};
+        BlockMask block_mask = static_cast<size_t>(0);
+        auto [ec, cache_location_len] = cache_manager_->GetCacheLocationLen(
+            request_context_.get(), "test_instance", CacheManager::QueryType::QT_BATCH_GET, keys, {}, 0);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(4, cache_location_len);
+    }
+
+    // Test QT_REVERSE_ROLL_SW_MATCH
+    {
+        std::vector<int64_t> keys{1, 2, 3, 8, 5, 9, 6};
+        BlockMask block_mask = static_cast<size_t>(0);
+        auto [ec, cache_location_len] = cache_manager_->GetCacheLocationLen(
+            request_context_.get(), "test_instance", CacheManager::QueryType::QT_REVERSE_ROLL_SW_MATCH, keys, {}, 2);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(2, cache_location_len);
+    }
+}
+
 } // namespace kv_cache_manager

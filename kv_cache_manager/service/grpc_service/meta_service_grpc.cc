@@ -53,6 +53,14 @@ grpc::Status MetaServiceGRpc::GetCacheLocation(grpc::ServerContext *context,
     return grpc::Status::OK;
 }
 
+grpc::Status MetaServiceGRpc::GetCacheLocationLen(grpc::ServerContext *context,
+                                                  const proto::meta::GetCacheLocationLenRequest *request,
+                                                  proto::meta::GetCacheLocationLenResponse *response) {
+    API_CONTEXT_GET_COLLECTOR_AND_INIT_GRPC(GetCacheLocationLen, grpc::Status::OK);
+    meta_service_impl_->GetCacheLocationLen(request_context, request, response);
+    return grpc::Status::OK;
+}
+
 grpc::Status MetaServiceGRpc::StartWriteCache(grpc::ServerContext *context,
                                               const proto::meta::StartWriteCacheRequest *request,
                                               proto::meta::StartWriteCacheResponse *response) {

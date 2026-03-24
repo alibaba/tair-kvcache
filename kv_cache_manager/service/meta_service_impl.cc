@@ -300,6 +300,51 @@ void MetaServiceImpl::GetCacheLocation(RequestContext *request_context,
     SET_SPAN_TRACER_STR_IN_HEADER(request_context);
 }
 
+void MetaServiceImpl::GetCacheLocationLen(RequestContext *request_context,
+                                          const proto::meta::GetCacheLocationLenRequest *request,
+                                          proto::meta::GetCacheLocationLenResponse *response) {
+    SPAN_TRACER(request_context);
+    API_CALL_GUARD("GetCacheLocationLen", true);
+    auto *header = response->mutable_header();
+    auto *status = header->mutable_status();
+    CHECK_FAULT_INJECTION("GetCacheLocationLen");
+    std::string invalid_fields = "missing or invalid fields: ";
+    if (request->instance_id().empty()) {
+        CHECK_REQUIRED_FIELDS_VALIDATION("GetCacheLocationLen", "instance_id", true);
+        SET_SPAN_TRACER_STR_IN_HEADER(request_context);
+        return;
+    }
+    if (request->block_keys().empty() && request->token_ids().empty()) {
+        CHECK_REQUIRED_FIELDS_VALIDATION("GetCacheLocationLen", "block_keys and token_ids", true);
+        SET_SPAN_TRACER_STR_IN_HEADER(request_context);
+        return;
+    }
+    std::pair<ErrorCode, int64_t> get_cache_location_len_result = cache_manager_->GetCacheLocationLen(
+        request_context,
+        request->instance_id(),
+        static_cast<CacheManager::QueryType>(request->query_type()),
+        std::vector<int64_t>(request->block_keys().begin(), request->block_keys().end()),
+        std::vector<int64_t>(request->token_ids().begin(), request->token_ids().end()),
+        request->sw_size());
+    ErrorCode ec_info = get_cache_location_len_result.first;
+    int64_t cache_location_len = get_cache_location_len_result.second;
+    if (ec_info != EC_OK) {
+        status->set_code(ToMetaPbError(ec_info));
+        request_context->set_status_code(status->code());
+        status->set_message("Failed to get cache location length : " + request_context->error_tracer()->ToJsonString());
+        KVCM_LOG_ERROR("[traceId: %s] GetCacheLocationLen failed, ec: %d", request->trace_id().c_str(), ec_info);
+    } else {
+        response->set_cache_location_len(cache_location_len);
+        status->set_code(proto::meta::OK);
+        request_context->set_status_code(status->code());
+        status->set_message("Cache location length retrieved successfully");
+        KVCM_LOG_INFO("[traceId: %s] GetCacheLocationLen succeeded, returned length %ld",
+                      request->trace_id().c_str(),
+                      cache_location_len);
+    }
+    SET_SPAN_TRACER_STR_IN_HEADER(request_context);
+}
+
 void MetaServiceImpl::GetCacheMeta(RequestContext *request_context,
                                    const proto::meta::GetCacheMetaRequest *request,
                                    proto::meta::GetCacheMetaResponse *response) {

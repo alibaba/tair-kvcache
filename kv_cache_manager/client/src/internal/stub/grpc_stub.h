@@ -44,6 +44,13 @@ public:
                      int32_t sw_size,
                      const std::vector<std::string> &location_spec_names) override;
 
+    std::pair<ClientErrorCode, int64_t> GetCacheLocationLen(const std::string &trace_id,
+                                                            const std::string &instance_id,
+                                                            QueryType query_type,
+                                                            const KeyVector &keys,
+                                                            const TokenIdsVector &tokens,
+                                                            int32_t sw_size) override;
+
     std::pair<ClientErrorCode, WriteLocation> StartWriteCache(const std::string &trace_id,
                                                               const std::string &instance_id,
                                                               const KeyVector &keys,

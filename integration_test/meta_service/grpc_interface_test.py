@@ -6,7 +6,7 @@ from google.protobuf.json_format import ParseDict
 from kv_cache_manager.protocol.protobuf.meta_service_pb2 import (
     RegisterInstanceRequest,
     GetInstanceInfoRequest,
-    GetCacheLocationRequest,
+    GetCacheLocationRequest, 
     StartWriteCacheRequest,
     FinishWriteCacheRequest,
     RemoveCacheRequest,
@@ -16,7 +16,7 @@ from kv_cache_manager.protocol.protobuf.meta_service_pb2 import (
     BoolMasksType,
     CommonResponse,
     GetInstanceInfoResponse,
-    GetCacheLocationResponse,
+    GetCacheLocationResponse, 
     StartWriteCacheResponse,
 )
 from kv_cache_manager.protocol.protobuf.meta_service_pb2_grpc import MetaServiceStub

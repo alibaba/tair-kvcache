@@ -197,13 +197,15 @@ CacheManager::RegisterInstance(RequestContext *request_context,
     const auto &trace_id = request_context->trace_id();
     auto instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
     if (instance_info) {
-        auto mismatched = instance_info->MismatchFields(block_size, location_spec_infos, model_deployment, location_spec_groups);
+        auto mismatched =
+            instance_info->MismatchFields(block_size, location_spec_infos, model_deployment, location_spec_groups);
         if (!mismatched.empty()) {
             auto mismatched_str = StringUtil::Join(mismatched, ", ");
             request_context->error_tracer()->AddErrorMsg(
                 "register instance failed: instance_id '" + instance_id +
                 "' already exists with different configuration, mismatched fields: [" + mismatched_str + "]");
-            PREFIX_LOG(WARN, "register instance failed: duplicate instance, mismatched fields: [%s]", mismatched_str.c_str());
+            PREFIX_LOG(
+                WARN, "register instance failed: duplicate instance, mismatched fields: [%s]", mismatched_str.c_str());
             return {EC_DUPLICATE_ENTITY, {}};
         }
         auto ec = TryCreateMetaSearcher(request_context, instance_id);
@@ -307,6 +309,36 @@ std::pair<ErrorCode, CacheMetaVecWrapper> CacheManager::GetCacheMeta(RequestCont
     return {ec, CacheMetaVecWrapper(std::move(metas), std::move(cache_locations))};
 }
 
+ErrorCode CacheManager::PerformCacheLocationQuery(RequestContext *request_context,
+                                                  ServiceMetricsCollector *service_metrics_collector,
+                                                  MetaSearcher *meta_searcher,
+                                                  const std::string &instance_id,
+                                                  QueryType query_type,
+                                                  const KeyVector &keys,
+                                                  const TokenIdsVector &tokens,
+                                                  const BlockMask &block_mask,
+                                                  int32_t sw_size,
+                                                  KeyVector &query_keys,
+                                                  CacheLocationVector &cache_locations) const {
+    SPAN_TRACER(request_context);
+    const std::string &trace_id = request_context->trace_id();
+    ErrorCode ec = EC_ERROR;
+    if (!keys.empty()) {
+        KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, request_key_count, keys.size());
+        ec = GetCacheLocationByQueryType(
+            meta_searcher, request_context, instance_id, query_type, keys, block_mask, sw_size, cache_locations);
+    } else {
+        auto [ec_temp, block_size] = GetBlockSize(request_context, instance_id);
+        RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec_temp, "get block_size failed");
+        auto gen_keys = GenKeyVector(tokens, block_size);
+        KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, request_key_count, gen_keys.size());
+        query_keys = gen_keys;
+        ec = GetCacheLocationByQueryType(
+            meta_searcher, request_context, instance_id, query_type, gen_keys, block_mask, sw_size, cache_locations);
+    }
+    return ec;
+}
+
 std::pair<ErrorCode, CacheLocationViewVecWrapper>
 CacheManager::GetCacheLocation(RequestContext *request_context,
                                const std::string &instance_id,
@@ -327,19 +359,17 @@ CacheManager::GetCacheLocation(RequestContext *request_context,
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, ManagerPrefixMatch);
     CacheLocationVector cache_locations;
     KeyVector query_keys = keys;
-    if (!keys.empty()) {
-        KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, request_key_count, keys.size());
-        ec = GetCacheLocationByQueryType(
-            meta_searcher, request_context, instance_id, query_type, keys, block_mask, sw_size, cache_locations);
-    } else {
-        auto [ec_temp, block_size] = GetBlockSize(request_context, instance_id);
-        RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec_temp, CacheLocationViewVecWrapper, "get block_size failed");
-        auto gen_keys = GenKeyVector(tokens, block_size);
-        KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, request_key_count, gen_keys.size());
-        query_keys = gen_keys;
-        ec = GetCacheLocationByQueryType(
-            meta_searcher, request_context, instance_id, query_type, gen_keys, block_mask, sw_size, cache_locations);
-    }
+    ec = PerformCacheLocationQuery(request_context,
+                                   service_metrics_collector,
+                                   meta_searcher,
+                                   instance_id,
+                                   query_type,
+                                   keys,
+                                   tokens,
+                                   block_mask,
+                                   sw_size,
+                                   query_keys,
+                                   cache_locations);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, ManagerPrefixMatch);
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, prefix_match_len, cache_locations.size());
     RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, CacheLocationViewVecWrapper, "get cache location failed");
@@ -352,6 +382,67 @@ CacheManager::GetCacheLocation(RequestContext *request_context,
     if (event_manager_)
         event_manager_->Publish(cache_get_event);
     return {ec, CacheLocationViewVecWrapper(std::move(cache_locations))};
+}
+
+std::pair<ErrorCode, int64_t> CacheManager::GetCacheLocationLen(RequestContext *request_context,
+                                                                const std::string &instance_id,
+                                                                QueryType query_type,
+                                                                const KeyVector &keys,
+                                                                const TokenIdsVector &tokens,
+                                                                int32_t sw_size) {
+    SPAN_TRACER(request_context);
+    const std::string &trace_id = request_context->trace_id();
+    auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+    auto [ec, meta_searcher] = CheckInputAndGetMetaSearcher(request_context, instance_id, keys, tokens);
+    RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, int64_t, "check input or get meta searcher failed");
+    if (query_type == QueryType::QT_UNSPECIFIED) {
+        RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, EC_ERROR, int64_t, "unknown query type");
+    }
+    CacheLocationVector cache_locations;
+    KeyVector query_keys = keys;
+    ec = PerformCacheLocationQuery(request_context,
+                                   service_metrics_collector,
+                                   meta_searcher,
+                                   instance_id,
+                                   query_type,
+                                   keys,
+                                   tokens,
+                                   BlockMask(),
+                                   sw_size,
+                                   query_keys,
+                                   cache_locations);
+    RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, int64_t, "get cache location length failed");
+    int64_t cache_location_len = 0;
+    switch (query_type) {
+    case QueryType::QT_BATCH_GET:
+    case QueryType::QT_REVERSE_ROLL_SW_MATCH: {
+        for (const auto &location : cache_locations) {
+            bool has_valid_uri = false;
+            for (const auto &spec : location.location_specs()) {
+                if (!spec.uri().empty()) {
+                    has_valid_uri = true;
+                    break;
+                }
+            }
+            if (has_valid_uri) {
+                cache_location_len++;
+            }
+        }
+        break;
+    }
+    case QueryType::QT_PREFIX_MATCH: {
+        cache_location_len = static_cast<int64_t>(cache_locations.size());
+        break;
+    }
+    default:
+        break;
+    }
+    auto cache_get_event = std::make_shared<CacheGetEvent>(instance_id);
+    cache_get_event->SetEventTriggerTime();
+    cache_get_event->SetAddtionalArgs(QueryTypeToString(query_type), query_keys, tokens, BlockMask(), sw_size, {});
+    if (event_manager_)
+        event_manager_->Publish(cache_get_event);
+    return {ec, cache_location_len};
 }
 
 std::pair<ErrorCode, StartWriteCacheInfo>
@@ -1216,5 +1307,4 @@ std::unique_ptr<SelectLocationPolicy> CacheManager::genSelectLocationPolicy(Requ
     }
     return std::make_unique<NamedStorageWeightedSLPolicy>(std::move(weight_map));
 }
-
 } // namespace kv_cache_manager

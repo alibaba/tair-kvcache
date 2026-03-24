@@ -349,6 +349,27 @@ std::pair<ClientErrorCode, Locations> GrpcStub::GetCacheLocation(const std::stri
     return {ER_OK, locations};
 }
 
+std::pair<ClientErrorCode, int64_t> GrpcStub::GetCacheLocationLen(const std::string &trace_id,
+                                                                  const std::string &instance_id,
+                                                                  QueryType query_type,
+                                                                  const KeyVector &keys,
+                                                                  const TokenIdsVector &tokens,
+                                                                  int32_t sw_size) {
+    auto stub = GET_AND_CHECK_STUB_WITH_TYPE();
+    proto::meta::GetCacheLocationLenRequest request;
+    request.set_query_type(static_cast<proto::meta::QueryType>(query_type));
+    request.set_sw_size(sw_size);
+    SetKeysAndTokens(request, trace_id, instance_id, keys, tokens);
+    grpc::ClientContext context;
+    proto::meta::GetCacheLocationLenResponse response;
+    auto grpc_status = stub->GetCacheLocationLen(&context, request, &response);
+    CHECK_GRPC_STATUS_WITH_TYPE(grpc_status);
+    CHECK_COMMON_HEADER_WITH_TYPE(response);
+    int64_t cache_location_len = response.cache_location_len();
+    KVCM_LOG_DEBUG("get cache location length success, length: %ld", cache_location_len);
+    return {ER_OK, cache_location_len};
+}
+
 std::pair<ClientErrorCode, WriteLocation>
 GrpcStub::StartWriteCache(const std::string &trace_id,
                           const std::string &instance_id,

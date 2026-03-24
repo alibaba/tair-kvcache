@@ -203,9 +203,23 @@ message GetCacheLocationRequest {
     repeated string location_spec_names = 8; // 用于仅返回部分spec。不传则全返回。
 }
 
+message GetCacheLocationLenRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    QueryType query_type = 3;
+    repeated int64 block_keys = 4;
+    repeated int64 token_ids = 5;
+    int32 sw_size = 6;        // slide window size, for QT_REVERSE_ROLL_SW_MATCH
+}
+
 message GetCacheLocationResponse {
     CommonResponseHeader header = 1;
     repeated CacheLocation locations = 2; // 多个key的列表
+}
+
+message GetCacheLocationLenResponse {
+    CommonResponseHeader header = 1;
+    int64 cache_location_len = 2; // 命中的key的数量
 }
 
 message GetCacheMetaRequest {
@@ -295,6 +309,8 @@ service MetaService {
     rpc GetCacheMeta(GetCacheMetaRequest) returns (GetCacheMetaResponse);
     // 返回Cache的位置，由PD节点调用
     rpc GetCacheLocation(GetCacheLocationRequest) returns (GetCacheLocationResponse);
+    // 返回命中的key的数量
+    rpc GetCacheLocationLen(GetCacheLocationLenRequest) returns (GetCacheLocationLenResponse);
     // 准备开始写Cache，尝试获取写的位置，如果返回空，则代表不需要写Cache
     rpc StartWriteCache(StartWriteCacheRequest) returns (StartWriteCacheResponse);
     // 不论写Cache成功与否，都调用这个

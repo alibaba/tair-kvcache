@@ -22,6 +22,12 @@ public:
                                                         int32_t sw_size,
                                                         const std::vector<std::string> &location_spec_names) override;
 
+    std::pair<ClientErrorCode, int64_t> MatchLocationLen(const std::string &trace_id,
+                                                         QueryType query_type,
+                                                         const std::vector<int64_t> &keys,
+                                                         const std::vector<int64_t> &tokens,
+                                                         int32_t sw_size) override;
+
     std::pair<ClientErrorCode, WriteLocation> StartWrite(const std::string &trace_id,
                                                          const std::vector<int64_t> &keys,
                                                          const std::vector<int64_t> &tokens,

@@ -670,6 +670,30 @@ TEST_F(GrpcStubTest, TestGetCacheLocationReverseRollSlideWindowMatch) {
     }
 }
 
+TEST_F(GrpcStubTest, TestGetCacheLocationLen) {
+    auto expected = std::pair<ClientErrorCode, std::string>(ER_OK, default_storage_configs);
+    ASSERT_EQ(expected,
+              stub_->RegisterInstance(
+                  "trace1", "default", "instance1", 64, createLocationSpecInfos(2), createModelDeployment(2, 1), {}));
+    std::string write_session_id;
+    {
+        auto [success, write_location] = stub_->StartWriteCache("trace2", "instance1", {1, 2, 3, 4}, {}, {}, 1000000);
+        ASSERT_EQ(ER_OK, success);
+        write_session_id = write_location.write_session_id;
+    }
+    {
+        BlockMask success_block = BlockMaskVector({true, true, false, false});
+        ASSERT_EQ(ER_OK, stub_->FinishWriteCache("trace4", "instance1", write_session_id, success_block, {}));
+    }
+    {
+        // After finish, should return 2 (number of successful blocks)
+        auto [success, len] =
+            stub_->GetCacheLocationLen("trace5", "instance1", QueryType::QT_PREFIX_MATCH, {1, 2, 3, 4}, {}, 0);
+        ASSERT_EQ(ER_OK, success);
+        ASSERT_EQ(2, len);
+    }
+}
+
 TEST_F(GrpcStubTest, TestGetCacheMeta) {
     auto expected = std::pair<ClientErrorCode, std::string>(ER_OK, default_storage_configs);
     ASSERT_EQ(expected,

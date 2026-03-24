@@ -99,6 +99,16 @@ public:
                  const std::vector<std::string> &location_spec_names),
                 (override));
 
+    MOCK_METHOD((std::pair<ClientErrorCode, int64_t>),
+                GetCacheLocationLen,
+                (const std::string &trace_id,
+                 const std::string &instance_id,
+                 QueryType query_type,
+                 const KeyVector &keys,
+                 const TokenIdsVector &tokens,
+                 int32_t sw_size),
+                (override));
+
     MOCK_METHOD((std::pair<ClientErrorCode, WriteLocation>),
                 StartWriteCache,
                 (const std::string &trace_id,
@@ -272,4 +282,46 @@ TEST_F(MetaClientTest, TestCreateSingleAddress) {
 
     auto ec = client->Init(client_config_, init_params_);
     ASSERT_EQ(ec, ER_OK);
+}
+
+TEST_F(MetaClientTest, TestMatchLocationLen) {
+    auto mock_stub = new MockStub();
+    auto client = std::make_unique<MetaClientImpl>();
+    client->stub_.reset(mock_stub);
+
+    EXPECT_CALL(*mock_stub, AddConnection("127.0.0.1:8080", ::testing::_)).Times(1).WillOnce(::testing::Return(ER_OK));
+    EXPECT_CALL(*mock_stub,
+                RegisterInstance(
+                    ::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_, ::testing::_))
+        .Times(1)
+        .WillOnce(::testing::Return(std::make_pair(ER_OK, std::string("{fake_storage_config}"))));
+
+    auto ec = client->Init(client_config_, init_params_);
+    ASSERT_EQ(ec, ER_OK);
+
+    // Test successful MatchLocationLen call
+    const std::string trace_id = "test_trace_id";
+    const QueryType query_type = QueryType::QT_PREFIX_MATCH;
+    const std::vector<int64_t> keys = {1, 2, 3};
+    const std::vector<int64_t> tokens = {4, 5, 6};
+    const int32_t sw_size = 0;
+    const int64_t expected_len = 2;
+
+    EXPECT_CALL(*mock_stub, GetCacheLocationLen(trace_id, "test_instance", query_type, keys, tokens, sw_size))
+        .Times(1)
+        .WillOnce(::testing::Return(std::make_pair(ER_OK, expected_len)));
+
+    auto [result_ec, len] = client->MatchLocationLen(trace_id, query_type, keys, tokens, sw_size);
+    ASSERT_EQ(result_ec, ER_OK);
+    ASSERT_EQ(len, expected_len);
+
+    // Test failed MatchLocationLen call
+    const ClientErrorCode expected_error = ER_SERVICE_INTERNAL_ERROR;
+    EXPECT_CALL(*mock_stub, GetCacheLocationLen(trace_id + "_fail", "test_instance", query_type, keys, tokens, sw_size))
+        .Times(1)
+        .WillOnce(::testing::Return(std::make_pair(expected_error, int64_t{0})));
+
+    auto [fail_result_ec, fail_len] = client->MatchLocationLen(trace_id + "_fail", query_type, keys, tokens, sw_size);
+    ASSERT_EQ(fail_result_ec, expected_error);
+    // The value of 'len' is not checked when error code is not ER_OK
 }
