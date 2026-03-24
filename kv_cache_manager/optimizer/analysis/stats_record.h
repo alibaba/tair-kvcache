@@ -6,6 +6,8 @@
 
 namespace kv_cache_manager {
 
+struct BlockEntry;
+
 // ============================================================================
 // 统计记录数据定义
 //
@@ -39,7 +41,8 @@ struct BlockLifecycleRecord {
     int64_t lifespan_us;
     size_t access_count;
     int64_t last_access_time_us;
-    bool is_alive; // true表示trace结束时仍存活, false表示被驱逐
+    bool is_alive;                   // true表示trace结束时仍存活, false表示被驱逐
+    BlockEntry *block_ptr = nullptr; // 存活期间持有指针，Finalize 时读取最终统计值
 };
 
 } // namespace kv_cache_manager

@@ -33,15 +33,18 @@ def _annotate_percentiles(ax, sorted_data, percentiles, x_max):
 
 
 def plot_physical_lifespan_cdf(all_sorted, evicted_sorted, instance_name, output_path):
-    """Physical Lifespan CDF: 全量 + Evicted"""
+    """Physical Lifespan CDF: 全量 + Evicted，统计标注基于 Evicted Only"""
     n_all, n_ev = len(all_sorted), len(evicted_sorted)
     if n_all == 0:
         print("  跳过 Physical Lifespan CDF: 无数据")
         return
 
+    # 统计标注优先用 evicted_sorted（真实驱逐分布），无驱逐数据时 fallback 到 all
+    stat_data = evicted_sorted if n_ev > 0 else all_sorted
+
     cdf_all = np.arange(1, n_all + 1) / n_all * 100
-    p99 = float(np.percentile(all_sorted, 99))
-    x_max = min(p99 * 1.5, float(all_sorted[-1])) if all_sorted[-1] > 0 else 1.0
+    p99 = float(np.percentile(stat_data, 99))
+    x_max = min(p99 * 1.5, float(stat_data[-1])) if stat_data[-1] > 0 else 1.0
 
     fig, ax = plt.subplots(figsize=(14, 8))
 
@@ -55,14 +58,15 @@ def plot_physical_lifespan_cdf(all_sorted, evicted_sorted, instance_name, output
                 label=f"Evicted Only (n={n_ev:,})", alpha=0.8)
         ax.fill_between(evicted_sorted, cdf_ev, alpha=0.1, color="red")
 
-    _annotate_percentiles(ax, all_sorted, [50, 75, 90, 95, 99], x_max)
+    _annotate_percentiles(ax, stat_data, [50, 75, 90, 95, 99], x_max)
 
-    mean_val = float(np.mean(all_sorted))
-    median_val = float(np.median(all_sorted))
+    mean_val = float(np.mean(stat_data))
+    median_val = float(np.median(stat_data))
+    stat_label = "Evicted" if n_ev > 0 else "All"
     ax.axvline(mean_val, color="blue", linestyle="--", linewidth=2,
-               label=f"Mean: {mean_val:.1f}s", alpha=0.7)
+               label=f"Mean ({stat_label}): {mean_val:.1f}s", alpha=0.7)
     ax.axvline(median_val, color="orange", linestyle="--", linewidth=2,
-               label=f"Median: {median_val:.1f}s", alpha=0.7)
+               label=f"Median ({stat_label}): {median_val:.1f}s", alpha=0.7)
 
     ax.set_xlim([0, x_max])
     ax.set_ylim([0, 105])

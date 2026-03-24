@@ -39,6 +39,7 @@ void BlockLifecycleTracker::OnBlockBirth(const std::string &instance_id, BlockEn
         .access_count = 0,
         .last_access_time_us = timestamp,
         .is_alive = true,
+        .block_ptr = block,
     });
 
     data.alive_blocks[block->key] = record;
@@ -66,10 +67,10 @@ void BlockLifecycleTracker::OnBlockEviction(const std::string &instance_id, Bloc
     auto &record = it->second;
     record->death_time_us = timestamp;
     record->lifespan_us = timestamp - record->birth_time_us;
-    // block 此时仍存活，可以安全读取其字段
     record->access_count = block->access_count;
     record->last_access_time_us = block->last_access_time;
     record->is_alive = false;
+    record->block_ptr = nullptr; // block 即将销毁，清除指针
 
     data.alive_blocks.erase(it);
 }
@@ -89,8 +90,7 @@ void BlockLifecycleTracker::Finalize(const std::string &instance_id, int64_t fin
                   final_timestamp,
                   instance_id.c_str());
 
-    // access_count/last_access_time 在 block 存活期间无法获取（block 可能已销毁），
-    // 保留 birth 时记录的初始值，标记为 is_alive=true 表示 trace 结束时仍存活
+    // trace 结束时仍存活的 block：从持有的指针直接读取最终统计值
     for (auto &[block_key, record] : data.alive_blocks) {
         record->death_time_us = final_timestamp;
         record->lifespan_us = final_timestamp - record->birth_time_us;
