@@ -12,6 +12,8 @@ cc_test(
         "//kv_cache_manager/common:logger",
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/config",
+        "//kv_cache_manager/config:coordination_backend",
+        "//kv_cache_manager/config:leader_elector_base",
         "//kv_cache_manager/manager:cache_manager",
         "//kv_cache_manager/metrics:metrics_registry",
         "//kv_cache_manager/metrics:metrics_reporter_factory",

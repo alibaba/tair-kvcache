@@ -138,6 +138,11 @@ public:
                 (override));
 
     MOCK_METHOD(bool, TrimCache, (), (override));
+
+    MOCK_METHOD((std::pair<ClientErrorCode, ClusterInfo>),
+                GetClusterInfo,
+                (const std::string &trace_id, const std::string &instance_id),
+                (override));
 };
 
 TEST_F(MetaClientTest, TestCreateSimple) {
