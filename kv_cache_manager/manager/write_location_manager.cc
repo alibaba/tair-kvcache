@@ -33,7 +33,9 @@ int64_t WriteLocationManager::SessionIdMap::DropByExpirePoint(int64_t cur_point)
     }
     for (auto &unit : prepare_to_expire_units) {
         KVCM_LOG_DEBUG("Expiring write_session [%s]", unit->write_session_id.c_str());
-        unit->callback();
+        std::unique_ptr<WriteLocationInfo> write_location_info = std::make_unique<WriteLocationInfo>();
+        *write_location_info = std::move(unit->write_location_info);
+        unit->callback(std::move(write_location_info));
     }
     {
         std::unique_lock lock(mux_);
@@ -56,7 +58,9 @@ void WriteLocationManager::SessionIdMap::DropAll() {
     }
     for (auto &unit : prepare_to_expire_units) {
         KVCM_LOG_DEBUG("Expiring write_session [%s]", unit->write_session_id.c_str());
-        unit->callback();
+        std::unique_ptr<WriteLocationInfo> write_location_info = std::make_unique<WriteLocationInfo>();
+        *write_location_info = std::move(unit->write_location_info);
+        unit->callback(std::move(write_location_info));
     }
 }
 
@@ -151,7 +155,7 @@ void WriteLocationManager::Put(const std::string &write_session_id,
                                std::vector<int64_t> &&keys,
                                std::vector<std::string> &&location_ids,
                                int64_t write_timeout_seconds,
-                               std::function<void()> callback) {
+                               CallBack callback) {
     KVCM_LOG_DEBUG("Putting session %s with %zu keys and %zu location_ids, timeout: %ld seconds",
                    write_session_id.c_str(),
                    keys.size(),
