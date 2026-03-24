@@ -2,6 +2,7 @@
 
 ### 设计文档
 - [基本概念](design/basic_concepts.md) - Storage、Instance Group、Instance、Block、CacheLocation 等核心概念
+- [高可用与选主机制](design/ha_leader_elector.md) - HA 架构、LeaderElector 状态机、CoordinationBackend、Leader 发现
 
 ### 开发文档
 - [开发指南](develop/README.md) - 开发者入门指南和开发环境配置
