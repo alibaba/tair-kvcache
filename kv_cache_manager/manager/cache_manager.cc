@@ -521,17 +521,19 @@ CacheManager::StartWriteCache(RequestContext *request_context,
     }
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, PutWriteLocationManager);
     constexpr int64_t kMaxWriteTimeoutSeconds = 1800;
-    write_location_manager_->Put(write_session_id,
-                                 std::move(new_keys),
-                                 std::move(location_ids),
-                                 std::min(kMaxWriteTimeoutSeconds, write_timeout_seconds),
-                                 [this, trace_id, instance_id, write_session_id] {
-                                     RequestContext temp_request_context(trace_id);
-                                     BlockMaskOffset failed_mask = 0;
-                                     auto ec = this->FinishWriteCache(
-                                         &temp_request_context, instance_id, write_session_id, failed_mask);
-                                     static_cast<void>(ec);
-                                 });
+    write_location_manager_->Put(
+        write_session_id,
+        std::move(new_keys),
+        std::move(location_ids),
+        std::min(kMaxWriteTimeoutSeconds, write_timeout_seconds),
+        [this, trace_id, instance_id, write_session_id](
+            std::unique_ptr<WriteLocationManager::WriteLocationInfo> write_location_info) {
+            RequestContext temp_request_context(trace_id + "_timeout_callback");
+            BlockMaskOffset succeed_block = 0;
+            auto ec = this->FinishWriteCache(
+                &temp_request_context, instance_id, write_session_id, succeed_block, std::move(write_location_info));
+            static_cast<void>(ec);
+        });
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, PutWriteLocationManager);
     auto start_write_event = std::make_shared<StartWriteCacheEvent>(instance_id);
     start_write_event->SetEventTriggerTime();
@@ -545,20 +547,23 @@ CacheManager::StartWriteCache(RequestContext *request_context,
                                 CacheLocationViewVecWrapper(std::move(new_locations)))};
 }
 
-ErrorCode CacheManager::FinishWriteCache(RequestContext *request_context,
-                                         const std::string &instance_id,
-                                         const std::string &write_session_id,
-                                         const BlockMask &success_block_mask) {
+ErrorCode
+CacheManager::FinishWriteCache(RequestContext *request_context,
+                               const std::string &instance_id,
+                               const std::string &write_session_id,
+                               const BlockMask &success_block_mask,
+                               std::unique_ptr<WriteLocationManager::WriteLocationInfo> write_location_info_internal) {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     WriteLocationManager::WriteLocationInfo location_info;
-    if (!write_location_manager_->GetAndDelete(write_session_id, location_info)) {
+    if (write_location_info_internal != nullptr) {
+        location_info = std::move(*write_location_info_internal);
+    } else if (!write_location_manager_->GetAndDelete(write_session_id, location_info)) {
         request_context->error_tracer()->AddErrorMsg("write_session_id has been deleted");
         RETURN_IF_EC_NOT_OK_WITH_LOG(
             WARN, EC_ERROR, "finish write cache failed: write_session_id not found: %s", write_session_id.c_str());
     }
-
     if (!IsBlockMaskValid(success_block_mask, location_info.keys.size())) {
         RETURN_IF_EC_NOT_OK_WITH_LOG(WARN,
                                      EC_BADARGS,

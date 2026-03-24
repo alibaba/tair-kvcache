@@ -37,6 +37,10 @@ void ReclaimerTaskSupervisor::Submit(const std::string &trace_id, CacheMetaDelRe
     cell->result = schedule_plan_executor_->Submit(request);
     if (cell->result.valid()) {
         cell_queue_.Push(cell);
+    } else {
+        KVCM_LOG_ERROR("Submit CacheMetaDelRequest instance_id[%s] trace_id[%s] failed",
+                       request.instance_id.c_str(),
+                       trace_id.c_str());
     }
 }
 
@@ -47,6 +51,10 @@ void ReclaimerTaskSupervisor::Submit(const std::string &trace_id, CacheLocationD
     cell->result = schedule_plan_executor_->Submit(request);
     if (cell->result.valid()) {
         cell_queue_.Push(cell);
+    } else {
+        KVCM_LOG_ERROR("Submit CacheLocationDelRequest instance_id[%s] trace_id[%s] failed",
+                       request.instance_id.c_str(),
+                       trace_id.c_str());
     }
 }
 

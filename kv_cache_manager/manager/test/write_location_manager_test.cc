@@ -5,6 +5,8 @@ namespace kv_cache_manager {
 
 class WriteLocationManagerTest : public TESTBASE {
 public:
+    using WriteLocationInfoPtr = std::unique_ptr<WriteLocationManager::WriteLocationInfo>;
+
     void SetUp() override {}
     void TearDown() override {}
 
@@ -13,14 +15,18 @@ private:
 };
 
 TEST_F(WriteLocationManagerTest, NoExpireLoopTest) {
-    manager_.Put("session_1", {1, 2, 3}, {"id1", "id2", "id3"}, 1000, [this]() {
-        WriteLocationManager::WriteLocationInfo info;
-        this->manager_.GetAndDelete("session_1", info);
+    manager_.Put("session_1", {1, 2, 3}, {"id1", "id2", "id3"}, 1000, [this](WriteLocationInfoPtr info) {
+        WriteLocationManager::WriteLocationInfo dummy;
+        ASSERT_FALSE(this->manager_.GetAndDelete("session_1", dummy));
+        ASSERT_EQ(std::vector<int64_t>({1, 2, 3}), info->keys);
+        ASSERT_EQ(std::vector<std::string>({"id1", "id2", "id3"}), info->location_ids);
     });
     ASSERT_EQ(1, manager_.ExpireSize());
-    manager_.Put("session_2", {11, 22, 33}, {"id11", "id22", "id33"}, 1000, [this]() {
-        WriteLocationManager::WriteLocationInfo info;
-        this->manager_.GetAndDelete("session_2", info);
+    manager_.Put("session_2", {11, 22, 33}, {"id11", "id22", "id33"}, 1000, [this](WriteLocationInfoPtr info) {
+        WriteLocationManager::WriteLocationInfo dummy;
+        ASSERT_FALSE(this->manager_.GetAndDelete("session_2", dummy));
+        ASSERT_EQ(std::vector<int64_t>({11, 22, 33}), info->keys);
+        ASSERT_EQ(std::vector<std::string>({"id11", "id22", "id33"}), info->location_ids);
     });
     ASSERT_EQ(2, manager_.ExpireSize());
     WriteLocationManager::WriteLocationInfo info;
@@ -32,9 +38,11 @@ TEST_F(WriteLocationManagerTest, NoExpireLoopTest) {
 
 TEST_F(WriteLocationManagerTest, ExpireLoopTest) {
     manager_.Start();
-    manager_.Put("session_1", {1, 2, 3}, {"id1", "id2", "id3"}, 1, [this]() {
-        WriteLocationManager::WriteLocationInfo info;
-        this->manager_.GetAndDelete("session_1", info);
+    manager_.Put("session_1", {1, 2, 3}, {"id1", "id2", "id3"}, 1, [this](WriteLocationInfoPtr info) {
+        WriteLocationManager::WriteLocationInfo dummy;
+        ASSERT_FALSE(this->manager_.GetAndDelete("session_1", dummy));
+        ASSERT_EQ(std::vector<int64_t>({1, 2, 3}), info->keys);
+        ASSERT_EQ(std::vector<std::string>({"id1", "id2", "id3"}), info->location_ids);
     });
     ASSERT_EQ(1, manager_.ExpireSize());
     std::this_thread::sleep_for(std::chrono::seconds(6));
@@ -60,10 +68,16 @@ TEST_F(WriteLocationManagerTest, MultiThreadTest) {
                     ids.push_back("id_" + std::to_string(base + j));
                 }
                 std::string session_id = "session" + std::to_string(worker_id);
-                this->manager_.Put(session_id, std::move(keys), std::move(ids), 2, [this, session_id]() {
-                    WriteLocationManager::WriteLocationInfo info;
-                    this->manager_.GetAndDelete(session_id, info);
-                });
+                this->manager_.Put(session_id,
+                                   std::move(keys),
+                                   std::move(ids),
+                                   2,
+                                   [this, keys, ids, session_id](WriteLocationInfoPtr info) {
+                                       WriteLocationManager::WriteLocationInfo dummy;
+                                       ASSERT_FALSE(this->manager_.GetAndDelete("session_1", dummy));
+                                       ASSERT_EQ(keys, info->keys);
+                                       ASSERT_EQ(ids, info->location_ids);
+                                   });
                 count.fetch_add(1, std::memory_order_relaxed);
                 ASSERT_LE(1, this->manager_.ExpireSize());
                 ASSERT_GE(4, this->manager_.ExpireSize());
@@ -91,23 +105,32 @@ TEST_F(WriteLocationManagerTest, DoCleanupTest) {
     // 添加几个会话
     int cleanup_called_count = 0;
 
-    manager_.Put("session_1", {1, 2, 3}, {"id1", "id2", "id3"}, 1000, [&cleanup_called_count, this]() {
-        cleanup_called_count++;
-        WriteLocationManager::WriteLocationInfo info;
-        this->manager_.GetAndDelete("session_1", info);
-    });
+    manager_.Put(
+        "session_1", {1, 2, 3}, {"id1", "id2", "id3"}, 1000, [&cleanup_called_count, this](WriteLocationInfoPtr info) {
+            cleanup_called_count++;
+            WriteLocationManager::WriteLocationInfo dummy;
+            ASSERT_FALSE(this->manager_.GetAndDelete("session_1", dummy));
+            ASSERT_EQ(std::vector<int64_t>({1, 2, 3}), info->keys);
+            ASSERT_EQ(std::vector<std::string>({"id1", "id2", "id3"}), info->location_ids);
+        });
 
-    manager_.Put("session_2", {4, 5, 6}, {"id4", "id5", "id6"}, 1000, [&cleanup_called_count, this]() {
-        cleanup_called_count++;
-        WriteLocationManager::WriteLocationInfo info;
-        this->manager_.GetAndDelete("session_2", info);
-    });
+    manager_.Put(
+        "session_2", {4, 5, 6}, {"id4", "id5", "id6"}, 1000, [&cleanup_called_count, this](WriteLocationInfoPtr info) {
+            cleanup_called_count++;
+            WriteLocationManager::WriteLocationInfo dummy;
+            ASSERT_FALSE(this->manager_.GetAndDelete("session_2", dummy));
+            ASSERT_EQ(std::vector<int64_t>({4, 5, 6}), info->keys);
+            ASSERT_EQ(std::vector<std::string>({"id4", "id5", "id6"}), info->location_ids);
+        });
 
-    manager_.Put("session_3", {7, 8, 9}, {"id7", "id8", "id9"}, 1000, [&cleanup_called_count, this]() {
-        cleanup_called_count++;
-        WriteLocationManager::WriteLocationInfo info;
-        this->manager_.GetAndDelete("session_3", info);
-    });
+    manager_.Put(
+        "session_3", {7, 8, 9}, {"id7", "id8", "id9"}, 1000, [&cleanup_called_count, this](WriteLocationInfoPtr info) {
+            cleanup_called_count++;
+            WriteLocationManager::WriteLocationInfo dummy;
+            ASSERT_FALSE(this->manager_.GetAndDelete("session_3", dummy));
+            ASSERT_EQ(std::vector<int64_t>({7, 8, 9}), info->keys);
+            ASSERT_EQ(std::vector<std::string>({"id7", "id8", "id9"}), info->location_ids);
+        });
 
     // 验证初始状态
     ASSERT_EQ(3, manager_.ExpireSize());
@@ -146,18 +169,24 @@ TEST_F(WriteLocationManagerTest, DoCleanupWithExpiredSessionsTest) {
     int cleanup_called_count = 0;
 
     // 添加一个很快过期的会话
-    manager_.Put("session_short", {10, 11}, {"id10", "id11"}, 1, [&cleanup_called_count, this]() {
-        cleanup_called_count++;
-        WriteLocationManager::WriteLocationInfo info;
-        this->manager_.GetAndDelete("session_short", info);
-    });
+    manager_.Put(
+        "session_short", {10, 11}, {"id10", "id11"}, 1, [&cleanup_called_count, this](WriteLocationInfoPtr info) {
+            cleanup_called_count++;
+            WriteLocationManager::WriteLocationInfo dummy;
+            ASSERT_FALSE(this->manager_.GetAndDelete("session_short", dummy));
+            ASSERT_EQ(std::vector<int64_t>({10, 11}), info->keys);
+            ASSERT_EQ(std::vector<std::string>({"id10", "id11"}), info->location_ids);
+        });
 
     // 添加一个长时间过期的会话
-    manager_.Put("session_long", {20, 21}, {"id20", "id21"}, 1000, [&cleanup_called_count, this]() {
-        cleanup_called_count++;
-        WriteLocationManager::WriteLocationInfo info;
-        this->manager_.GetAndDelete("session_long", info);
-    });
+    manager_.Put(
+        "session_long", {20, 21}, {"id20", "id21"}, 1000, [&cleanup_called_count, this](WriteLocationInfoPtr info) {
+            cleanup_called_count++;
+            WriteLocationManager::WriteLocationInfo dummy;
+            ASSERT_FALSE(this->manager_.GetAndDelete("session_long", dummy));
+            ASSERT_EQ(std::vector<int64_t>({20, 21}), info->keys);
+            ASSERT_EQ(std::vector<std::string>({"id20", "id21"}), info->location_ids);
+        });
 
     ASSERT_EQ(2, manager_.ExpireSize());
 

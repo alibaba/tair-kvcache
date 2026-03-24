@@ -436,6 +436,7 @@ TEST_F(CacheManagerTest, TestStartWriteCacheWithLocationSpecGroup) {
 }
 
 TEST_F(CacheManagerTest, TestWriteCacheTimeout) {
+    cache_manager_->reclaimer_task_supervisor_->Stop();
     auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
     ASSERT_EQ(expected,
               cache_manager_->RegisterInstance(request_context_.get(),
@@ -459,6 +460,7 @@ TEST_F(CacheManagerTest, TestWriteCacheTimeout) {
             request_context_.get(), "test_instance", start_write_cache_info.write_session_id(), block_mask);
         ASSERT_EQ(EC_ERROR, ec);
     }
+    ASSERT_EQ(1, cache_manager_->reclaimer_task_supervisor_->cell_queue_.Size());
 }
 
 TEST_F(CacheManagerTest, TestGetCacheLocationPrefixMatch) {

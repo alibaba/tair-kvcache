@@ -22,6 +22,7 @@ public:
         std::vector<int64_t> keys;
         std::vector<std::string> location_ids;
     };
+    using CallBack = std::function<void(std::unique_ptr<WriteLocationInfo>)>;
     void Start();
     void Stop();
     void DoCleanup();
@@ -29,7 +30,7 @@ public:
              std::vector<int64_t> &&keys,
              std::vector<std::string> &&location_ids,
              int64_t write_timeout_seconds,
-             std::function<void()> callback);
+             CallBack callback);
     bool GetAndDelete(const std::string &write_session_id, WriteLocationInfo &location_info);
     size_t ExpireSize() const { return session_id_map_.Size(); }
 
@@ -39,7 +40,7 @@ private:
     struct ExpireUnit {
         int64_t expire_point;
         std::string write_session_id;
-        std::function<void()> callback; // call CacheManager::FinishWriteCache -> WriteLocationManager::GetAndDelete
+        CallBack callback;
         WriteLocationInfo write_location_info;
     };
     using ExpireUnitPtr = std::shared_ptr<ExpireUnit>;
