@@ -55,6 +55,7 @@ jobs:
         # uses: QoderAI/qoder-action@v0
         uses: QoderAI/qoder-action@0881d27d15a7a93778ebc5c942d11da313ee8b7e
         with:
+          qodercli_version: '0.1.34'
           qoder_personal_access_token: ${{ secrets.QODER_PERSONAL_ACCESS_TOKEN }}
           prompt: |
             /review-pr
