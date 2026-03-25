@@ -325,7 +325,50 @@ class TestBatchSetReturnValue(unittest.TestCase):
         self.assertEqual(len(result), len(keys))
         self.assertEqual(result, [False, False, False])
 
-    # ── Case 11: batch_set_v1 exception returns all False ─────────────
+    # ── Case 11: incomplete bool_masks (shorter than expected) → all False
+    def test_incomplete_bool_masks_returns_all_false(self):
+        """When bool_masks is shorter than len_prefix + len_new → all False."""
+        keys = ["k0", "k1", "k2"]
+
+        # 3 keys, no prefix → expected bool_masks length = 3, but only 1 given
+        result_from_manager = {
+            "locations": [],
+            "write_session_id": "ws-11",
+            "block_mask": {
+                "bool_masks": {
+                    "values": [True]
+                }
+            },
+        }
+        c = self._setup_connector(start_write_result=result_from_manager)
+
+        result = c._batch_set(keys, torch.zeros(3), trace_id="t11")
+
+        self.assertEqual(len(result), len(keys))
+        self.assertEqual(result, [False, False, False])
+
+    # ── Case 12: empty bool_masks → all False ────────────────────────
+    def test_empty_bool_masks_returns_all_false(self):
+        """When bool_masks is empty → all False (all([]) would be True)."""
+        keys = ["k0", "k1"]
+
+        result_from_manager = {
+            "locations": [],
+            "write_session_id": "ws-12",
+            "block_mask": {
+                "bool_masks": {
+                    "values": []
+                }
+            },
+        }
+        c = self._setup_connector(start_write_result=result_from_manager)
+
+        result = c._batch_set(keys, torch.zeros(2), trace_id="t12")
+
+        self.assertEqual(len(result), len(keys))
+        self.assertEqual(result, [False, False])
+
+    # ── Case 13: batch_set_v1 exception returns all False ─────────────
     def test_batch_set_v1_exception(self):
         """batch_set_v1 catches exceptions and returns all False."""
         c = _build_connector()

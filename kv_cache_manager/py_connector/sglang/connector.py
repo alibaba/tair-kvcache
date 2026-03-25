@@ -295,12 +295,13 @@ class HiCacheKVCM(HiCacheStorage):
             logger.warning(f"_batch_set: inconsistent block_mask from manager, "
                            f"aborting write session {write_session_id}")
             if self.tp_rank == 0:
+                # Mark all locations as failed so manager cleans them up.
                 self._manager_client.finish_write_cache(
                     {
                         "trace_id": finish_trace_id,
                         "instance_id": self.instance_id,
                         "write_session_id": write_session_id,
-                        "success_blocks": {"bool_masks": {"values": []}},
+                        "success_blocks": {"bool_masks": {"values": [False] * len(locations)}},
                     }
                 )
             return [False] * len_new
@@ -315,7 +316,7 @@ class HiCacheKVCM(HiCacheStorage):
                         "trace_id": finish_trace_id,
                         "instance_id": self.instance_id,
                         "write_session_id": write_session_id,
-                        "success_blocks": {"bool_masks": {"values": []}},
+                        "success_blocks": {"bool_masks": {"values": [False] * len(locations)}},
                     }
                 )
             return [True] * len_new
@@ -504,6 +505,11 @@ class HiCacheKVCM(HiCacheStorage):
         else:
             # False: need to store
             bool_masks = block_mask.get("bool_masks", {}).get("values", [])
+            if len(bool_masks) < len_prefix + len_new:
+                # Incomplete mask data from manager.
+                logger.warning(f"_parse_block_mask: bool_masks length {len(bool_masks)} < "
+                               f"expected {len_prefix + len_new}, treating as inconsistent state")
+                return None
             if not all(bool_masks[:len_prefix]):
                 # Inconsistent: prefix blocks not fully cached.
                 logger.warning("_parse_block_mask: prefix blocks not fully cached in bool_masks, "
