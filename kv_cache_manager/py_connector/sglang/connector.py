@@ -287,10 +287,27 @@ class HiCacheKVCM(HiCacheStorage):
         write_session_id = result["write_session_id"]
         block_mask = result["block_mask"]
         save_indices = self._parse_block_mask(block_mask, len_prefix, len_new)
-        unmatched = len(save_indices)
 
         finish_trace_id = f"finish-{trace_id}"
-        # Early return if no locations need writing
+
+        # None means inconsistent manager state — treat as write failure.
+        if save_indices is None:
+            logger.warning(f"_batch_set: inconsistent block_mask from manager, "
+                           f"aborting write session {write_session_id}")
+            if self.tp_rank == 0:
+                self._manager_client.finish_write_cache(
+                    {
+                        "trace_id": finish_trace_id,
+                        "instance_id": self.instance_id,
+                        "write_session_id": write_session_id,
+                        "success_blocks": {"bool_masks": {"values": []}},
+                    }
+                )
+            return [False] * len_new
+
+        unmatched = len(save_indices)
+
+        # Early return if all new blocks are already cached.
         if unmatched == 0:
             if self.tp_rank == 0:
                 self._manager_client.finish_write_cache(
@@ -466,18 +483,34 @@ class HiCacheKVCM(HiCacheStorage):
             buffers.append(buffer)
         return buffers
 
-    def _parse_block_mask(self, block_mask: dict, len_prefix: int, len_new: int) -> int:
+    def _parse_block_mask(self, block_mask: dict, len_prefix: int, len_new: int) -> Optional[List[int]]:
+        """Parse block_mask from manager to determine which new-block indices need writing.
+
+        Returns:
+            List[int]: indices (relative to new blocks) that need writing.
+                       Empty list means all new blocks are already cached.
+            None: manager returned an inconsistent state; caller should treat
+                  as a write failure (safe fallback).
+        """
         save_indices = []
         if "offset" in block_mask:
             offset = block_mask["offset"]
-            if offset >= len_prefix:
-                save_indices.extend(range(offset, len_prefix + len_new))
+            if offset < len_prefix:
+                # Inconsistent: offset behind prefix boundary.
+                logger.warning(f"_parse_block_mask: offset {offset} < len_prefix {len_prefix}, "
+                               "treating as inconsistent state")
+                return None
+            save_indices.extend(range(offset, len_prefix + len_new))
         else:
             # False: need to store
             bool_masks = block_mask.get("bool_masks", {}).get("values", [])
-            if all(bool_masks[:len_prefix]):
-                max_index = max([i for i, x in enumerate(bool_masks) if not x], default=-1)
-                save_indices.extend([i for i in range(len_prefix, max_index + 1) if not bool_masks[i]])
+            if not all(bool_masks[:len_prefix]):
+                # Inconsistent: prefix blocks not fully cached.
+                logger.warning("_parse_block_mask: prefix blocks not fully cached in bool_masks, "
+                               "treating as inconsistent state")
+                return None
+            max_index = max([i for i, x in enumerate(bool_masks) if not x], default=-1)
+            save_indices.extend([i for i in range(len_prefix, max_index + 1) if not bool_masks[i]])
         save_indices = [(i - len_prefix) for i in save_indices if i >= len_prefix]
         return save_indices
 

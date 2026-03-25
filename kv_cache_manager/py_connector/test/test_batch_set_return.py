@@ -275,7 +275,57 @@ class TestBatchSetReturnValue(unittest.TestCase):
         # index 4 → write failed (False)
         self.assertEqual(result, [False, True, False, True, False])
 
-    # ── Case 9: batch_set_v1 exception returns all False ─────────────
+    # ── Case 9: inconsistent offset (offset < len_prefix) → all False ─
+    def test_inconsistent_offset_returns_all_false(self):
+        """When offset < len_prefix, manager state is inconsistent → all False."""
+        keys = ["k3", "k4", "k5"]
+
+        # prefix_keys = ["p0", "p1", "p2"], len_prefix=3
+        # offset=1 < len_prefix=3 → inconsistent
+        result_from_manager = {
+            "locations": [],
+            "write_session_id": "ws-9",
+            "block_mask": {"offset": 1},
+        }
+        c = self._setup_connector(start_write_result=result_from_manager)
+
+        extra_info = MagicMock()
+        extra_info.prefix_keys = ["p0", "p1", "p2"]
+
+        result = c._batch_set(keys, torch.zeros(3), trace_id="t9",
+                              extra_info=extra_info)
+
+        self.assertEqual(len(result), len(keys))
+        self.assertEqual(result, [False, False, False])
+
+    # ── Case 10: inconsistent bool_masks (prefix not cached) → all False
+    def test_inconsistent_bool_masks_returns_all_false(self):
+        """When prefix blocks not fully cached in bool_masks → all False."""
+        keys = ["k2", "k3", "k4"]
+
+        # prefix_keys = ["p0", "p1"], len_prefix=2
+        # bool_masks[:2] = [True, False] → not all True → inconsistent
+        result_from_manager = {
+            "locations": [],
+            "write_session_id": "ws-10",
+            "block_mask": {
+                "bool_masks": {
+                    "values": [True, False, False, True, False]
+                }
+            },
+        }
+        c = self._setup_connector(start_write_result=result_from_manager)
+
+        extra_info = MagicMock()
+        extra_info.prefix_keys = ["p0", "p1"]
+
+        result = c._batch_set(keys, torch.zeros(3), trace_id="t10",
+                              extra_info=extra_info)
+
+        self.assertEqual(len(result), len(keys))
+        self.assertEqual(result, [False, False, False])
+
+    # ── Case 11: batch_set_v1 exception returns all False ─────────────
     def test_batch_set_v1_exception(self):
         """batch_set_v1 catches exceptions and returns all False."""
         c = _build_connector()
