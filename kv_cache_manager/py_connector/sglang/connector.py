@@ -56,6 +56,12 @@ class HiCacheKVCM(HiCacheStorage):
         self.prefetch_bandwidth = []
         self.backup_bandwidth = []
 
+        # Declare v1 interface support so that sglang's cache_controller uses
+        # batch_set_v1/batch_get_v1 (zero-copy path) instead of the legacy
+        # batch_set/batch_get. This avoids requiring users to manually add
+        # "interface_v1": 1 in --hicache-storage-backend-extra-config.
+        self.extra_config.setdefault("interface_v1", 1)
+
     def _init_kvcm_client(self):
         # parallelism
         self.tp_rank = self.storage_config.tp_rank
