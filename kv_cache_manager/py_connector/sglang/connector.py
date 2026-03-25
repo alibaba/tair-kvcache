@@ -267,12 +267,10 @@ class HiCacheKVCM(HiCacheStorage):
         write_session_id = result["write_session_id"]
         block_mask = result["block_mask"]
         save_indices = self._parse_block_mask(block_mask, len_prefix, len_new)
-        len_save = max(save_indices, default=-1) + 1
-
         unmatched = len(save_indices)
 
         finish_trace_id = f"finish-{trace_id}"
-        # Early return if no locations
+        # Early return if no locations need writing
         if unmatched == 0:
             if self.tp_rank == 0:
                 self._manager_client.finish_write_cache(
@@ -280,10 +278,10 @@ class HiCacheKVCM(HiCacheStorage):
                         "trace_id": finish_trace_id,
                         "instance_id": self.instance_id,
                         "write_session_id": write_session_id,
-                        "success_blocks": {"bool_masks": {"values": [False] * len(locations)}},
+                        "success_blocks": {"bool_masks": {"values": []}},
                     }
                 )
-            return [False] * len(keys)
+            return [True] * len_new
 
         assert unmatched == len(locations)
 
@@ -317,7 +315,6 @@ class HiCacheKVCM(HiCacheStorage):
             flag = bool(flag_tensor.item())
 
         finish_mask = [flag] * unmatched
-        success_mask = finish_mask + [False] * (len_new - len_save)
         if self.tp_rank == 0:
             self._manager_client.finish_write_cache(
                 {
@@ -327,7 +324,16 @@ class HiCacheKVCM(HiCacheStorage):
                     "success_blocks": {"bool_masks": {"values": finish_mask}},
                 }
             )
-        return success_mask
+
+        # Build result list: 1:1 positional mapping with input keys
+        # - keys not in save_indices → True
+        # - keys in save_indices → flag (True if save succeeded)
+        save_indices_set = set(save_indices)
+        result_list = [
+            flag if i in save_indices_set else True
+            for i in range(len_new)
+        ]
+        return result_list
 
     def batch_set_v1(
         self,
