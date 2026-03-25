@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
@@ -328,6 +330,33 @@ std::string CoordinationFileBackend::GetKVFilePath(const std::string &key) const
     return lock_dir_path_ + "/" + safe_key + ".kv";
 }
 
+ErrorCode CoordinationFileBackend::WriteFileAtomic(const std::string &file_path, const std::string &content) {
+    std::string tmp_path = file_path + ".tmp.XXXXXX";
+    int fd = mkstemp(&tmp_path[0]);
+    if (fd < 0) {
+        KVCM_LOG_ERROR("mkstemp failed for %s: %s", file_path.c_str(), strerror(errno));
+        return EC_IO_ERROR;
+    }
+
+    ssize_t bytes_written = write(fd, content.c_str(), content.size());
+    if (bytes_written < 0 || static_cast<size_t>(bytes_written) != content.size()) {
+        KVCM_LOG_ERROR("write failed: %s", strerror(errno));
+        close(fd);
+        unlink(tmp_path.c_str());
+        return EC_IO_ERROR;
+    }
+
+    close(fd);
+
+    if (std::rename(tmp_path.c_str(), file_path.c_str()) != 0) {
+        KVCM_LOG_ERROR("rename failed from %s to %s: %s", tmp_path.c_str(), file_path.c_str(), strerror(errno));
+        unlink(tmp_path.c_str());
+        return EC_IO_ERROR;
+    }
+
+    return EC_OK;
+}
+
 ErrorCode CoordinationFileBackend::SetValue(const std::string &key, const std::string &value) {
     if (key.empty()) {
         KVCM_LOG_ERROR("Invalid arguments for SetValue: key is empty");
@@ -335,15 +364,7 @@ ErrorCode CoordinationFileBackend::SetValue(const std::string &key, const std::s
     }
 
     std::string kv_file_path = GetKVFilePath(key);
-    FileLockGuard guard(kv_file_path, true);
-
-    ErrorCode ec = guard.Lock();
-    if (ec != EC_OK) {
-        return ec;
-    }
-
-    ec = WriteLockFileContent(guard.fd(), value);
-    return ec;
+    return WriteFileAtomic(kv_file_path, value);
 }
 
 ErrorCode CoordinationFileBackend::GetValue(const std::string &key, std::string &out_value) {
@@ -353,26 +374,19 @@ ErrorCode CoordinationFileBackend::GetValue(const std::string &key, std::string 
     }
 
     std::string kv_file_path = GetKVFilePath(key);
-    FileLockGuard guard(kv_file_path, false);
 
-    ErrorCode ec = guard.Lock();
-    if (ec == EC_NOENT) {
-        return EC_NOENT;
-    }
-    if (ec != EC_OK) {
-        return ec;
-    }
-
-    ec = ReadLockFileContent(guard.fd(), out_value);
-    if (ec != EC_OK) {
-        return ec;
+    int fd = open(kv_file_path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        if (errno == ENOENT) {
+            return EC_NOENT;
+        }
+        KVCM_LOG_ERROR("failed to open file: %s, error: %s", kv_file_path.c_str(), strerror(errno));
+        return EC_IO_ERROR;
     }
 
-    if (out_value.empty()) {
-        return EC_NOENT;
-    }
-
-    return EC_OK;
+    ErrorCode ec = ReadLockFileContent(fd, out_value);
+    close(fd);
+    return ec;
 }
 
 } // namespace kv_cache_manager

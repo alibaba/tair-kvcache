@@ -197,6 +197,9 @@ private:
     bool
     ParseLockContent(const std::string &lock_content, std::string &out_lock_value, int64_t &out_expire_time_ms) const;
 
+    // 原子写入文件（write-to-temp + rename）
+    ErrorCode WriteFileAtomic(const std::string &file_path, const std::string &content);
+
     // 获取KV存储文件的完整路径
     std::string GetKVFilePath(const std::string &key) const;
 

@@ -430,4 +430,30 @@ TEST_P(CoordinationBackendTest, TestSetGetMultipleKeys) {
     EXPECT_EQ("val3", out);
 }
 
+// 测试 SetValue 空值
+TEST_P(CoordinationBackendTest, TestSetGetEmptyValue) {
+    const std::string key = "empty_value_key";
+
+    // 设置空值
+    ErrorCode ec = backend_->SetValue(key, "");
+    EXPECT_EQ(EC_OK, ec);
+
+    // 读取应返回 EC_OK 和空字符串
+    std::string out_value;
+    ec = backend_->GetValue(key, out_value);
+    EXPECT_EQ(EC_OK, ec);
+    EXPECT_EQ("", out_value);
+
+    // 覆盖为非空值后再改回空值
+    ec = backend_->SetValue(key, "non_empty");
+    EXPECT_EQ(EC_OK, ec);
+
+    ec = backend_->SetValue(key, "");
+    EXPECT_EQ(EC_OK, ec);
+
+    ec = backend_->GetValue(key, out_value);
+    EXPECT_EQ(EC_OK, ec);
+    EXPECT_EQ("", out_value);
+}
+
 } // namespace kv_cache_manager
