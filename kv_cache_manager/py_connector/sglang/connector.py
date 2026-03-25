@@ -13,7 +13,21 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
 )
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
-from sglang.srt.metrics.collector import StorageMetrics
+StorageMetrics = None
+try:
+    from sglang.srt.observability.metrics_collector import StorageMetrics
+except ImportError:
+    pass
+if StorageMetrics is None:
+    try:
+        from sglang.srt.metrics.collector import StorageMetrics
+    except ImportError:
+        raise ImportError(
+            "Cannot import StorageMetrics from sglang. "
+            "Tried sglang.srt.observability.metrics_collector and "
+            "sglang.srt.metrics.collector. "
+            "Please check your sglang version is compatible."
+        )
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.dp_attention import get_attention_tp_group, is_dp_attention_enabled
 
