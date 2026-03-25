@@ -99,8 +99,8 @@ bool CoordinationFileBackend::IsLockExpired(const std::string &lock_content, int
     if (!ParseLockContent(lock_content, unused_value, expire_time_ms)) {
         return true; // 解析失败，视为过期
     }
-    auto expire_time = std::chrono::steady_clock::time_point(std::chrono::milliseconds(expire_time_ms));
-    auto now = std::chrono::steady_clock::now();
+    auto expire_time = std::chrono::system_clock::time_point(std::chrono::milliseconds(expire_time_ms));
+    auto now = std::chrono::system_clock::now();
     return now >= expire_time;
 }
 
@@ -187,7 +187,7 @@ CoordinationFileBackend::TryLock(const std::string &lock_key, const std::string 
     }
 
     // 写入新的锁内容
-    auto expire_time = std::chrono::steady_clock::now() + std::chrono::milliseconds(ttl_ms);
+    auto expire_time = std::chrono::system_clock::now() + std::chrono::milliseconds(ttl_ms);
     int64_t expire_time_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(expire_time.time_since_epoch()).count();
     std::string new_content = SerializeLockContent(lock_value, expire_time_ms);
@@ -237,7 +237,7 @@ CoordinationFileBackend::RenewLock(const std::string &lock_key, const std::strin
     }
 
     // 更新过期时间
-    auto expire_time = std::chrono::steady_clock::now() + std::chrono::milliseconds(ttl_ms);
+    auto expire_time = std::chrono::system_clock::now() + std::chrono::milliseconds(ttl_ms);
     int64_t expire_time_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(expire_time.time_since_epoch()).count();
     std::string new_content = SerializeLockContent(lock_value, expire_time_ms);

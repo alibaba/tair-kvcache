@@ -1,5 +1,6 @@
 #include "kv_cache_manager/config/coordination_redis_backend.h"
 
+#include <chrono>
 #include <memory>
 #include <string>
 
@@ -225,18 +226,24 @@ ErrorCode CoordinationRedisBackend::GetLockHolder(const std::string &lock_key,
     }
 
     // 获取锁的剩余过期时间
-    ec = redis_client_->Pttl(redis_key, out_expire_time_ms);
+    int64_t remaining_ttl_ms = 0;
+    ec = redis_client_->Pttl(redis_key, remaining_ttl_ms);
     if (ec != EC_OK) {
         KVCM_LOG_ERROR("Failed to get lock TTL: ec=%d", ec);
         return ec;
     }
 
     // 如果锁已过期，返回不存在
-    if (out_expire_time_ms <= 0) {
+    if (remaining_ttl_ms <= 0) {
         out_current_value.clear();
         out_expire_time_ms = 0;
         return EC_NOENT;
     }
+
+    // 将剩余 TTL 转换为 system_clock 绝对时间戳
+    out_expire_time_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count() + remaining_ttl_ms;
 
     return EC_OK;
 }

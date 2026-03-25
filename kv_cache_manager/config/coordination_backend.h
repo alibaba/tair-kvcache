@@ -92,12 +92,13 @@ public:
      * @brief Get current lock holder information
      *
      * Queries the current status of the specified lock, including holder identifier
-     * and remaining expiration time. If the lock does not exist or has expired,
+     * and expiration time. If the lock does not exist or has expired,
      * returns EC_NOENT.
      *
      * @param lock_key The lock key
      * @param out_current_value [out] Current lock value (holder identifier)
-     * @param out_expire_time_ms [out] Lock expiration time (milliseconds timestamp)
+     * @param out_expire_time_ms [out] Lock expiration time as a Unix timestamp in
+     *        milliseconds (milliseconds since 1970-01-01 00:00:00 UTC).
      * @return ErrorCode error code
      *         - EC_OK: Query successful, lock exists and is not expired
      *         - EC_NOENT: Lock does not exist or has expired

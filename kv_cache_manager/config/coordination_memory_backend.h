@@ -48,21 +48,21 @@ private:
     // 锁信息结构
     struct LockInfo {
         std::string value;                                 // 锁持有者标识
-        std::chrono::steady_clock::time_point expire_time; // 过期时间点
+        std::chrono::system_clock::time_point expire_time; // 过期时间点
 
         // 检查锁是否过期
-        bool IsExpired() const { return std::chrono::steady_clock::now() >= expire_time; }
+        bool IsExpired() const { return std::chrono::system_clock::now() >= expire_time; }
 
         // 获取剩余过期时间（毫秒）
         int64_t GetRemainingTTLMs() const {
-            auto now = std::chrono::steady_clock::now();
+            auto now = std::chrono::system_clock::now();
             if (now >= expire_time) {
                 return 0;
             }
             return std::chrono::duration_cast<std::chrono::milliseconds>(expire_time - now).count();
         }
 
-        // 获取过期时间戳（毫秒）
+        // 获取过期时间戳（毫秒，Unix 时间戳）
         int64_t GetExpireTimeMs() const {
             return std::chrono::duration_cast<std::chrono::milliseconds>(expire_time.time_since_epoch()).count();
         }
@@ -73,11 +73,11 @@ private:
     void CleanupExpiredLocks();
 
     // 获取当前时间点
-    static std::chrono::steady_clock::time_point Now() { return std::chrono::steady_clock::now(); }
+    static std::chrono::system_clock::time_point Now() { return std::chrono::system_clock::now(); }
 
     // 从毫秒时间戳转换为时间点
-    static std::chrono::steady_clock::time_point FromMsTimestamp(int64_t ms_timestamp) {
-        return std::chrono::steady_clock::time_point(std::chrono::milliseconds(ms_timestamp));
+    static std::chrono::system_clock::time_point FromMsTimestamp(int64_t ms_timestamp) {
+        return std::chrono::system_clock::time_point(std::chrono::milliseconds(ms_timestamp));
     }
 
 private:
