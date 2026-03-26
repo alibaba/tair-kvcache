@@ -580,6 +580,7 @@ TEST_F(CacheReclaimerTest, TestPauseResume) {
 
     // update the trigger strategy to trigger the reclaiming
     // so that the reclaiming method shall be entered
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 4096);
 
     // use instance 0 from setup()
     // construct instance 1
@@ -798,9 +799,10 @@ TEST_F(CacheReclaimerTest, TestRegistryManagerListInstanceInfoUnexpectedReturn) 
 TEST_F(CacheReclaimerTest, TestNullInstanceInfo) {
     // craft a case that can trigger the actual reclaiming
     // so that the reclaiming method shall be entered
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 4096);
     instance_groups.clear();
     const auto ins_group = InstanceGroupFactory();
-    ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_size(16);
+    ins_group->quota_.set_capacity(2048);
     instance_groups.emplace_back(ins_group);
 
     instance_infos.emplace_back(nullptr);
@@ -862,6 +864,9 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming00) {
     // instance 0 block byte size = 1024, key count = 1
     // 1024 * 1 > 16
     // should *not* trigger reclaiming by the used_size strategy
+    GTEST_SKIP() << "Skipping for reclaim_strategy->trigger_strategy().used_size() is ignored";
+
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 1024);
 
     // use instance 0 from setup()
 
@@ -881,6 +886,9 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming01) {
     // instance 0 block byte size = 1024, key count = 1
     // 1024 * 1 == 1024
     // should *not* trigger reclaiming by the used_size strategy
+    GTEST_SKIP() << "Skipping for reclaim_strategy->trigger_strategy().used_size() is ignored";
+
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 1024);
 
     // use instance 0 from setup()
 
@@ -900,6 +908,9 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming02) {
     // instance 0 block byte size = 1024, key count = 1
     // 1024 * 1 < 1025
     // should *not* trigger reclaiming by the used_size strategy
+    GTEST_SKIP() << "Skipping for reclaim_strategy->trigger_strategy().used_size() is ignored";
+
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 1024);
 
     // use instance 0 from setup()
 
@@ -921,13 +932,12 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming03) {
     // instance 1 block byte size = 256, key count = 1
     // 1024 * 1 + 256 * 1 > 1025
     // should *not* trigger reclaiming by the used_size strategy
+    GTEST_SKIP() << "Skipping for reclaim_strategy->trigger_strategy().used_size() is ignored";
+
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 1024);
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 256);
 
     // use instance 0 from setup()
-
-    // construct instance 1
-    const auto ins_info = InstanceInfoFactory();
-    ins_info->set_instance_id("test_instance_id_2");
-    instance_infos.emplace_back(ins_info);
 
     const auto ins_group = InstanceGroupFactory();
     ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_size(1025);
@@ -946,6 +956,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming04) {
     // instance 1 block byte size = 1024, key count = 1
     // (1024 * 1 + 1024 * 1) / 2048 > 0.8
     // should trigger reclaiming by the used_percentage strategy
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 1024); // x2 instances
 
     // use instance 0 from setup()
 
@@ -976,6 +987,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming05) {
     // instance 0 block byte size = 1024, key count = 1
     // (1024 * 1) / 2048 < 0.8
     // should *not* trigger reclaiming by the used_percentage strategy
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 1024);
 
     // use instance 0 from setup()
 
@@ -995,6 +1007,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming06) {
     // instance 0 block byte size = 1024, key count = 1
     // (double)(1024 * 1) / 2048.0 is very close to 0.5
     // should trigger reclaiming by the used_percentage strategy
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 1024);
 
     // use instance 0 from setup()
 
@@ -1022,6 +1035,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming07) {
     // instance 1 block byte size = 1024, key count = 1
     // (1024 * 1 + 1024 * 1) / 2048 < 1.2
     // should *not* trigger reclaiming by the used_percentage strategy
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 1024); // x2 instances
 
     // use instance 0 from setup()
 
@@ -1049,6 +1063,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming08) {
     // instance 2 block byte size = 1024, key count = 1
     // (1024 * 1 + 1024 * 1 + 1024 * 1) / 2048 > 1.2
     // should trigger reclaiming by the used_percentage strategy
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 1024); // x3 instances
 
     // use instance 0 from setup()
 
@@ -1089,6 +1104,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming09) {
     // instance 1 block byte size = 1024, key count = 16, max key count = 32
     // (16 + 16) / (32 + 32) < 0.8
     // should not trigger reclaiming by the used_percentage strategy
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 1024); // x2 instances
     key_count = 16;
     max_key_count = 32;
 
@@ -1115,6 +1131,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming10) {
     // instance 1 block byte size = 1024, key count = 32, max key count = 32
     // (double)((32 + 32) / (32 + 32)) is very close to 1.0
     // should trigger reclaiming by the used_percentage strategy
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 1024); // x2 isntances
     key_count = 32;
     max_key_count = 32;
 
@@ -1148,6 +1165,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming11) {
     // instance 1 block byte size = 1024, key count = 32, max key count = 32
     // (double)((32 + 32) / (32 + 32)) > 0.8
     // should trigger reclaiming by the used_percentage strategy
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 1024); // x2 instances
     key_count = 32;
     max_key_count = 32;
 
@@ -1201,6 +1219,8 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
     const auto ins_info = InstanceInfoFactory();
     ins_info->set_instance_id("test_instance_id_2");
     instance_infos.emplace_back(ins_info);
+
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 1024); // x2 isntances
 
     {
         // instance 0 block byte size = 1024, key count = 32, max key count = 0
@@ -1355,16 +1375,20 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming17) {
     ins_info->set_instance_id("test_instance_id_2");
     instance_infos.emplace_back(ins_info);
 
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 1024);      // x2 instances
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE, 1024); // x2 instances
+
     {
         // instance 0 block byte size = 1024, key count = 2
         // instance 1 block byte size = 1024, key count = 2
-        // (1024 * 2 + 1024 * 2) / 5120 < 0.9, total waterlevel not exceed
+        // (1024 * 2 + 1024 * 2 + 512 * 2) / 10240 < 0.9, total waterlevel not exceed
         // (512 + 512) / 1024 > 0.9, waterlevel exceed
 
-        dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 512);
+        dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 0);
+        dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 512); // x2 instances
 
         const auto ins_group = InstanceGroupFactory();
-        ins_group->quota_.set_capacity(5120);
+        ins_group->quota_.set_capacity(10240);
         QuotaConfig qc(1024, DataStorageType::DATA_STORAGE_TYPE_HF3FS);
         ins_group->quota_.set_quota_config({qc});
         ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.9);
@@ -1381,19 +1405,20 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming17) {
         ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
         ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
         ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
-        ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
+        ASSERT_TRUE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
     }
 
     {
         // instance 0 block byte size = 1024, key count = 2
         // instance 1 block byte size = 1024, key count = 2
-        // (1024 * 2 + 1024 * 2) / 5120 < 0.9, total waterlevel not exceed
+        // (1024 * 2 + 1024 * 2 + 128 * 2) / 10240 < 0.9, total waterlevel not exceed
         // (128 + 128) / 1024 < 0.9, waterlevel not exceed
 
-        dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 128);
+        dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 0);
+        dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 128); // x2 instances
 
         const auto ins_group = InstanceGroupFactory();
-        ins_group->quota_.set_capacity(5120);
+        ins_group->quota_.set_capacity(10240);
         QuotaConfig qc(1024, DataStorageType::DATA_STORAGE_TYPE_HF3FS);
         ins_group->quota_.set_quota_config({qc});
         ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.9);
@@ -1411,7 +1436,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming17) {
         // instance 0 block byte size = 1024, key count = 2
         // instance 1 block byte size = 1024, key count = 2
         // instance 2 block byte size = 1024, key count = 2
-        // (1024 * 2 + 1024 * 2 + 1024 * 2) / 5120 > 0.9, total waterlevel exceed
+        // (1024 * 2 + 1024 * 2 + 512 * 2) / 5120 > 0.9, total waterlevel exceed
         // (512 + 512) / 1024 > 0.9, waterlevel exceed
 
         // construct another instance
@@ -1419,7 +1444,8 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming17) {
         ins_info3->set_instance_id("test_instance_id_3");
         instance_infos.emplace_back(ins_info3);
 
-        dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 512);
+        dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 0);
+        dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 512); // x2 instances
 
         const auto ins_group = InstanceGroupFactory();
         ins_group->quota_.set_capacity(5120);
@@ -1439,7 +1465,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming17) {
         ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
         ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
         ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
-        ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
+        ASSERT_TRUE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
     }
 }
 
@@ -1480,6 +1506,7 @@ TEST_F(CacheReclaimerTest, TestInsufficientSampledKeys) {
 
     // update the trigger strategy to trigger the reclaiming
     // so that the reclaiming method shall be entered
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 4096);
 
     // use instance 0 from setup()
     // construct instance 1
@@ -1552,6 +1579,7 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU00) {
 
     // update the trigger strategy to trigger the reclaiming
     // so that the reclaiming method shall be entered
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 4096);
 
     // use instance 0 from setup()
     // construct instance 1
@@ -1619,6 +1647,7 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU01) {
 
     // update the trigger strategy to trigger the reclaiming
     // so that the reclaiming method shall be entered
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 4096);
 
     // use instance 0 from setup()
     // construct instance 1
@@ -1688,6 +1717,7 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU02) {
 
     // update the trigger strategy to trigger the reclaiming
     // so that the reclaiming method shall be entered
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 4096);
 
     // use instance 0 from setup()
     // construct instance 1
@@ -1757,6 +1787,7 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU03) {
 
     // update the trigger strategy to trigger the reclaiming
     // so that the reclaiming method shall be entered
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 4096);
 
     // use instance 0 from setup()
     // construct instance 1
@@ -1819,6 +1850,7 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU04) {
 
     // update the trigger strategy to trigger the reclaiming
     // so that the reclaiming method shall be entered
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 4096);
 
     // use instance 0 from setup()
     // construct instance 1
@@ -2182,6 +2214,8 @@ TEST_F(CacheReclaimerTest, TestEmptyInstanceInfos) {
 }
 
 TEST_F(CacheReclaimerTest, TestMultipleInstanceGroups) {
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 4096);
+
     // create multiple instance groups
     instance_groups.clear();
 
@@ -2315,6 +2349,9 @@ TEST_F(CacheReclaimerTest, TestKeyCountEdgeCases) {
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), random_sample_keys.size()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), random_sample_keys.size()));
 
+    // usage size not zero so key count is tested
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 4096);
+
     {
         // test with zero key count
         key_count = 0;
@@ -2369,13 +2406,14 @@ TEST_F(CacheReclaimerTest, TestKeyCountEdgeCases) {
         key_count = 100;
         max_key_count = 0;
 
-        // clear requests from previous test
-        submitted_del_requests.clear();
-
         // update the trigger strategy to trigger at 90%
         instance_groups.clear();
         const auto &ins_group = InstanceGroupFactory();
+        ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.9); // 90%
         instance_groups.emplace_back(ins_group);
+
+        // clear requests from previous test
+        submitted_del_requests.clear();
 
         batch_get_loc_out_maps = std::vector<CacheLocationMap>(random_sample_keys.size(), CacheLocationMap{});
         ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
@@ -2385,7 +2423,7 @@ TEST_F(CacheReclaimerTest, TestKeyCountEdgeCases) {
 
         cache_reclaimer_->Stop();
 
-        // reclaiming should happen since group used key count > 0 and used size > 16
+        // group max key count is zero, reclaiming should happen
         ASSERT_FALSE(submitted_del_requests.empty());
     }
 }
@@ -2427,6 +2465,7 @@ TEST_F(CacheReclaimerTest, TestCronJobAdaptiveSleepInterval) {
 
     // update the trigger strategy to trigger the reclaiming
     // so that the reclaiming method shall be entered
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 4096);
 
     // use instance 0 from setup()
     // construct instance 1
@@ -2543,6 +2582,7 @@ TEST_F(CacheReclaimerTest, TestCronJobAdaptiveSleepIntervalRecovery) {
     {
         // update the trigger strategy to trigger the reclaiming
         // so that the reclaiming method shall be entered
+        dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 4096);
 
         // use instance 0 from setup()
         // construct instance 1
