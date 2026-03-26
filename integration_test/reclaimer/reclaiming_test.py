@@ -313,7 +313,7 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
                     "mutex_shard_num": 16,
                     "meta_storage_backend_config": {
                         "storage_type": "local",
-                        "storage_uri": f"file://{self.get_workdir()}/meta_storage",
+                        "storage_uri": "",  # disable persistence
                     },
                     "meta_cache_policy_config": {
                         "capacity": 1024 * 1024 * 1024,
