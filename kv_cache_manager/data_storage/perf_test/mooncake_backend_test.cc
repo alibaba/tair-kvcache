@@ -52,7 +52,7 @@ void MooncakeBackendTest::InitSegmentProviderClient() {
     segment_provider_buffer_ =
         mooncake_client_create("localhost:17813", "http://localhost:8080/metadata", "tcp", "", "localhost:50051");
     ASSERT_NE(nullptr, segment_provider_buffer_);
-    ErrorCode_t err = mooncake_client_mount_segment(segment_provider_buffer_, 512 * 1024 * 1024);
+    ErrorCode_t err = mooncake_client_mount_segment(segment_provider_buffer_, 512 * 1024 * 1024, "tcp");
     ASSERT_EQ(MOONCAKE_ERROR_OK, err);
 }
 

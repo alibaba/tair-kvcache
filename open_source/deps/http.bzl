@@ -47,12 +47,10 @@ def http_deps():
     # mooncake
     http_archive(
         name = "mooncake",
-        urls = ["https://github.com/kvcache-ai/Mooncake/archive/refs/tags/v0.3.6.tar.gz"],
+        urls = ["https://github.com/kvcache-ai/Mooncake/archive/refs/tags/v0.3.10.tar.gz"],
         build_file = clean_dep("//3rdparty/mooncake:mooncake.BUILD"),
-        patches = ["//patches/mooncake:mooncake.patch"],
-        patch_args = ["-p1"],
-        strip_prefix = "Mooncake-0.3.6",
-        sha256 = "97d8c17dcc0d588d99361e7e2d7a8b994117038ccc5e08f00f39bdda90379ef3",
+        strip_prefix = "Mooncake-0.3.10",
+        sha256 = "0555a5256e6f4a4e97d990553d2aec931cd60e81dde93fb7ae3725fe69fb5306",
     )
 
     http_archive(

@@ -206,6 +206,7 @@ cc_library(
     hdrs = glob(
         [
             "mooncake-store/include/**/*.h",
+            "mooncake-store/include/**/*.hpp",
             "mooncake-common/include/default_config.h",
         ],
         exclude = ["mooncake-store/src/hf3fs/*.h"],
@@ -217,6 +218,8 @@ cc_library(
         "mooncake-store/include/utils",
         "mooncake-store/include/cachelib_memory_allocator/include",
         "mooncake-store/include/cachelib_memory_allocator/fake_include",
+        "mooncake-store/include/offset_allocator",
+        "mooncake-store/include/serialize",
     ],
     deps = [
         ":mooncake_transfer_engine",
