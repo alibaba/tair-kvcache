@@ -72,7 +72,7 @@ ErrorCode CoordinationRedisBackend::Init(const StandardUri &standard_uri) noexce
     return EC_OK;
 }
 
-std::string CoordinationRedisBackend::GetRedisKey(const std::string &lock_key) const {
+std::string CoordinationRedisBackend::GetRedisLockKey(const std::string &lock_key) const {
     return lock_key_prefix_ + lock_key;
 }
 
@@ -88,7 +88,7 @@ CoordinationRedisBackend::TryLock(const std::string &lock_key, const std::string
         return EC_BADARGS;
     }
 
-    std::string redis_key = GetRedisKey(lock_key);
+    std::string redis_key = GetRedisLockKey(lock_key);
 
     // 使用Lua脚本原子性地获取锁
     std::string result;
@@ -127,7 +127,7 @@ CoordinationRedisBackend::RenewLock(const std::string &lock_key, const std::stri
         return EC_BADARGS;
     }
 
-    std::string redis_key = GetRedisKey(lock_key);
+    std::string redis_key = GetRedisLockKey(lock_key);
 
     // 使用Lua脚本原子性地续约锁
     std::string result;
@@ -168,7 +168,7 @@ ErrorCode CoordinationRedisBackend::Unlock(const std::string &lock_key, const st
         return EC_BADARGS;
     }
 
-    std::string redis_key = GetRedisKey(lock_key);
+    std::string redis_key = GetRedisLockKey(lock_key);
 
     // 使用Lua脚本原子性地释放锁
     std::string result;
@@ -211,7 +211,7 @@ ErrorCode CoordinationRedisBackend::GetLockHolder(const std::string &lock_key,
         return EC_BADARGS;
     }
 
-    std::string redis_key = GetRedisKey(lock_key);
+    std::string redis_key = GetRedisLockKey(lock_key);
 
     // 获取当前锁的值
     ErrorCode ec = redis_client_->Get(redis_key, out_current_value);

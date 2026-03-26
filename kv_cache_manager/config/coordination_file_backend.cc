@@ -42,16 +42,18 @@ ErrorCode CoordinationFileBackend::Init(const StandardUri &standard_uri) noexcep
     return EC_OK;
 }
 
-std::string CoordinationFileBackend::GetLockFilePath(const std::string &lock_key) const {
-    // 简单实现：直接使用lock_key作为文件名，可能需要处理特殊字符
-    // 这里使用简单的方式，如果lock_key包含路径分隔符，会被扁平化
-    std::string safe_key = lock_key;
+std::string CoordinationFileBackend::SanitizeKey(const std::string &key) {
+    std::string safe_key = key;
     std::replace(safe_key.begin(), safe_key.end(), '/', '_');
     std::replace(safe_key.begin(), safe_key.end(), '\\', '_');
-    return lock_dir_path_ + "/" + safe_key + ".lock";
+    return safe_key;
 }
 
-ErrorCode CoordinationFileBackend::ReadLockFileContent(int fd, std::string &content) {
+std::string CoordinationFileBackend::GetLockFilePath(const std::string &lock_key) const {
+    return lock_dir_path_ + "/" + SanitizeKey(lock_key) + ".lock";
+}
+
+ErrorCode CoordinationFileBackend::ReadFileContent(int fd, std::string &content) {
     // 移动到文件开头
     if (lseek(fd, 0, SEEK_SET) < 0) {
         KVCM_LOG_ERROR("lseek failed: %s", strerror(errno));
@@ -72,7 +74,7 @@ ErrorCode CoordinationFileBackend::ReadLockFileContent(int fd, std::string &cont
     return EC_OK;
 }
 
-ErrorCode CoordinationFileBackend::WriteLockFileContent(int fd, const std::string &content) {
+ErrorCode CoordinationFileBackend::WriteFileContent(int fd, const std::string &content) {
     // 清空文件
     if (ftruncate(fd, 0) < 0) {
         KVCM_LOG_ERROR("ftruncate failed: %s", strerror(errno));
@@ -170,7 +172,7 @@ CoordinationFileBackend::TryLock(const std::string &lock_key, const std::string 
 
     // 检查锁是否过期（如果已有内容）
     std::string current_content;
-    ec = ReadLockFileContent(guard.fd(), current_content);
+    ec = ReadFileContent(guard.fd(), current_content);
     if (ec == EC_OK && !current_content.empty()) {
         int64_t expire_time_ms;
         if (!IsLockExpired(current_content, expire_time_ms)) {
@@ -192,7 +194,7 @@ CoordinationFileBackend::TryLock(const std::string &lock_key, const std::string 
         std::chrono::duration_cast<std::chrono::milliseconds>(expire_time.time_since_epoch()).count();
     std::string new_content = SerializeLockContent(lock_value, expire_time_ms);
 
-    ec = WriteLockFileContent(guard.fd(), new_content);
+    ec = WriteFileContent(guard.fd(), new_content);
     if (ec != EC_OK) {
         return ec;
     }
@@ -212,7 +214,7 @@ CoordinationFileBackend::RenewLock(const std::string &lock_key, const std::strin
 
     // 我们持有了锁，检查内容是否匹配
     std::string current_content;
-    ec = ReadLockFileContent(guard.fd(), current_content);
+    ec = ReadFileContent(guard.fd(), current_content);
     if (ec != EC_OK) {
         return ec;
     }
@@ -242,7 +244,7 @@ CoordinationFileBackend::RenewLock(const std::string &lock_key, const std::strin
         std::chrono::duration_cast<std::chrono::milliseconds>(expire_time.time_since_epoch()).count();
     std::string new_content = SerializeLockContent(lock_value, expire_time_ms);
 
-    ec = WriteLockFileContent(guard.fd(), new_content);
+    ec = WriteFileContent(guard.fd(), new_content);
 
     return ec;
 }
@@ -259,7 +261,7 @@ ErrorCode CoordinationFileBackend::Unlock(const std::string &lock_key, const std
 
     // 我们持有了锁，检查内容是否匹配
     std::string current_content;
-    ec = ReadLockFileContent(guard.fd(), current_content);
+    ec = ReadFileContent(guard.fd(), current_content);
     if (ec != EC_OK) {
         return ec;
     }
@@ -279,7 +281,7 @@ ErrorCode CoordinationFileBackend::Unlock(const std::string &lock_key, const std
     }
 
     // 清空文件内容（表示锁已释放）
-    ec = WriteLockFileContent(guard.fd(), "");
+    ec = WriteFileContent(guard.fd(), "");
     return ec;
 }
 
@@ -297,7 +299,7 @@ ErrorCode CoordinationFileBackend::GetLockHolder(const std::string &lock_key,
 
     // 读取文件内容
     std::string current_content;
-    ec = ReadLockFileContent(guard.fd(), current_content);
+    ec = ReadFileContent(guard.fd(), current_content);
     if (ec != EC_OK) {
         return ec;
     }
@@ -324,10 +326,7 @@ ErrorCode CoordinationFileBackend::GetLockHolder(const std::string &lock_key,
 }
 
 std::string CoordinationFileBackend::GetKVFilePath(const std::string &key) const {
-    std::string safe_key = key;
-    std::replace(safe_key.begin(), safe_key.end(), '/', '_');
-    std::replace(safe_key.begin(), safe_key.end(), '\\', '_');
-    return lock_dir_path_ + "/" + safe_key + ".kv";
+    return lock_dir_path_ + "/" + SanitizeKey(key) + ".kv";
 }
 
 ErrorCode CoordinationFileBackend::WriteFileAtomic(const std::string &file_path, const std::string &content) {
@@ -384,7 +383,7 @@ ErrorCode CoordinationFileBackend::GetValue(const std::string &key, std::string 
         return EC_IO_ERROR;
     }
 
-    ErrorCode ec = ReadLockFileContent(fd, out_value);
+    ErrorCode ec = ReadFileContent(fd, out_value);
     close(fd);
     return ec;
 }

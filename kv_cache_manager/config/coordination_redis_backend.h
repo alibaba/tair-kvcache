@@ -35,7 +35,7 @@ public:
 
 private:
     // 生成Redis锁键名
-    std::string GetRedisKey(const std::string &lock_key) const;
+    std::string GetRedisLockKey(const std::string &lock_key) const;
 
     // 生成Redis KV键名
     std::string GetRedisKVKey(const std::string &key) const;

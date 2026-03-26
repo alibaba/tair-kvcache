@@ -178,14 +178,17 @@ private:
     };
 
 private:
+    // 将 key 中的路径分隔符替换为下划线，生成安全的文件名
+    static std::string SanitizeKey(const std::string &key);
+
     // 获取锁文件的完整路径
     std::string GetLockFilePath(const std::string &lock_key) const;
 
-    // 读取锁文件内容
-    ErrorCode ReadLockFileContent(int fd, std::string &content);
+    // 读取文件内容
+    ErrorCode ReadFileContent(int fd, std::string &content);
 
-    // 写入锁文件内容
-    ErrorCode WriteLockFileContent(int fd, const std::string &content);
+    // 写入文件内容
+    ErrorCode WriteFileContent(int fd, const std::string &content);
 
     // 检查锁是否过期
     bool IsLockExpired(const std::string &lock_content, int64_t &expire_time_ms);
