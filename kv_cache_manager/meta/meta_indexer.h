@@ -97,7 +97,7 @@ public:
     // storage usage interfaces
     [[nodiscard]] std::uint64_t GetStorageUsage() const noexcept;
     [[nodiscard]] std::uint64_t GetStorageUsageByType(const DataStorageType &type) const noexcept;
-    void SetStorageUsageByType(const DataStorageType &type, std::uint64_t value) noexcept; // TODO (rui): remove it
+    void SetStorageUsageByType(const DataStorageType &type, std::uint64_t value) noexcept;
     std::uint64_t AddStorageUsageByType(const DataStorageType &type, std::uint64_t value) noexcept;
     std::uint64_t SubStorageUsageByType(const DataStorageType &type, std::uint64_t value) noexcept;
 
