@@ -86,6 +86,13 @@ mooncake_copts = [
     "-Wall",
     "-Wextra",
     "-Wno-unused-parameter",
+    "-Wno-narrowing",            # Suppress narrowing conversions warning -> error
+    "-Wno-parentheses",          # Mooncake src: && within || without explicit parentheses
+    "-Wno-array-parameter",      # Not recognized on GCC < 11, suppress gracefully
+    "-Wno-error=parentheses",    # Don't treat this as error even with global -Werror
+    "-Wno-reorder",              # Warning for member initialization out of order
+    "-Wno-error=reorder",        # Don't treat reorder warning as error
+    "-Wno-array-parameter",
     "-fcoroutines",
     "-fPIC",
     "-DCONFIG_ERDMA",
@@ -134,6 +141,29 @@ mooncake_copts = [
     ":use_lru_master": ["-DUSE_LRU_MASTER", "-DLRU_MAX_CAPACITY=100"],  # option for using LRU in master service
     "//conditions:default": [],
 })
+
+# Generate version.h (replaces CMake's configure_file step)
+# NOTE: Version is hardcoded to "2.0.0" to match the internal Docker image version
+# (hub.docker.alibaba-inc.com/ac2/mooncake:0.3.10-*) which reports version 2.0.0
+# despite being tagged as 0.3.10. This is a necessary compatibility fix.
+# The version cannot be extracted from pyproject.toml (which has "0.3.10") as that
+# would cause version mismatch errors with the Docker image's server.
+genrule(
+    name = "mooncake_version_h",
+    outs = ["mooncake-store/include/version.h"],
+    cmd = """cat > $@ << 'EOF'
+#pragma once
+#include <string>
+namespace mooncake {
+constexpr const char* MOONCAKE_STORE_VERSION = "2.0.0";
+inline const std::string& GetMooncakeStoreVersion() {
+    static const std::string version(MOONCAKE_STORE_VERSION);
+    return version;
+}
+}  // namespace mooncake
+EOF
+""",
+)
 
 cc_library(
     name = "mooncake_transfer_engine",
@@ -201,15 +231,23 @@ cc_library(
             "mooncake-store/src/**/*.cpp",
             "mooncake-common/src/default_config.cpp",
         ],
-        exclude = ["mooncake-store/src/hf3fs/*.cpp"],
-    ),  # exclude hf3fs
+        exclude = [
+            "mooncake-store/src/hf3fs/*.cpp",        # exclude hf3fs
+            "mooncake-store/src/utils/s3_helper.cpp", # exclude AWS S3, not needed
+            "mooncake-store/src/master.cpp",          # standalone executable
+            "mooncake-store/src/real_client_main.cpp",# standalone executable
+        ],
+    ) + [":mooncake_version_h"],  # generated version.h
     hdrs = glob(
         [
             "mooncake-store/include/**/*.h",
             "mooncake-store/include/**/*.hpp",
             "mooncake-common/include/default_config.h",
         ],
-        exclude = ["mooncake-store/src/hf3fs/*.h"],
+        exclude = [
+            "mooncake-store/src/hf3fs/*.h",
+            "mooncake-store/include/utils/s3_helper.h", # exclude AWS S3, not needed
+        ],
     ),
     includes = [
         "mooncake-common/include",
@@ -229,6 +267,10 @@ cc_library(
         "@boost//:date_time",
         "@boost//:property_tree",
         "@yaml-cpp//:yaml_cpp",
+        "@msgpack_cxx//:msgpack",
+        "@xxhash//:xxhash",
+        "@zstd_lib//:zstd",
+        "@com_github_gflags_gflags//:gflags",
     ],
     copts = mooncake_copts,
     visibility = ["//visibility:public"],

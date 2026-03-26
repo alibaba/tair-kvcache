@@ -4,6 +4,7 @@ rpm_library(
     name = "libnuma",
     hdrs = [
         "numa.h",
+        "numaif.h",
     ],
     include_path = "usr/include",
     lib_path = "usr/lib64",

@@ -30,7 +30,7 @@ cc_test(
     ],
     copts = ["-fno-access-control"],
     data = [],
-    tags = ["manual"],
+    tags = [],
     deps = [
         "//kv_cache_manager/client/src/internal/sdk",
         "//kv_cache_manager/common:unittest",
