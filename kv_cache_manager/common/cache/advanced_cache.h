@@ -415,6 +415,41 @@ public: // functions
             void(const std::string_view &key, ObjectPtr obj, size_t charge, const CacheItemHelper *helper)> &callback,
         const ApplyToAllEntriesOptions &opts) = 0;
 
+    // Returns up to `count` oldest (least recently used) keys from the
+    // specified shard. Returns the number of keys actually collected.
+    // Default implementation returns 0 (not supported).
+    virtual size_t GetOldestKeysInShard(uint32_t /*shard_id*/,
+                                        size_t /*count*/,
+                                        std::vector<std::string> & /*out_keys*/) {
+        return 0;
+    }
+
+    // Apply a callback to every entry in the specified shard. The callback
+    // receives the key, object pointer, charge, and helper of each entry.
+    // This allows callers to iterate over a single shard without touching
+    // the rest of the cache.
+    // Default implementation is a no-op (not supported).
+    virtual void ApplyToSingleShard(
+        uint32_t /*shard_id*/,
+        const std::function<
+            void(const std::string_view &key, ObjectPtr obj, size_t charge, const CacheItemHelper *helper)>
+            & /*callback*/) {}
+
+    // Insert a mapping from key->object only if the key does not already exist.
+    // Returns EC_OK on successful insertion, EC_EXIST if the key is already
+    // present, or other error codes on failure (e.g. EC_NOSPC).
+    // On success, takes ownership of `obj`. On non-OK return, the caller
+    // retains ownership of `obj`.
+    // Default implementation returns EC_UNIMPLEMENTED.
+    virtual ErrorCode InsertIfAbsent(const std::string_view & /*key*/,
+                                     ObjectPtr /*obj*/,
+                                     const CacheItemHelper * /*helper*/,
+                                     size_t /*charge*/,
+                                     Handle ** /*handle*/ = nullptr,
+                                     Priority /*priority*/ = Priority::LOW) {
+        return EC_UNIMPLEMENTED;
+    }
+
     // Apply a callback to a cache handle. The Cache must ensure the lifetime
     // of the key passed to the callback is valid for the duration of the
     // callback. The handle may not belong to the cache, but is guaranteed to
@@ -641,6 +676,14 @@ public:
     }
 
     void EraseUnRefEntries() override { target_->EraseUnRefEntries(); }
+
+    void ApplyToSingleShard(
+        uint32_t shard_id,
+        const std::function<
+            void(const std::string_view &key, ObjectPtr value, size_t charge, const CacheItemHelper *helper)>
+            &callback) override {
+        target_->ApplyToSingleShard(shard_id, callback);
+    }
 
     void StartAsyncLookup(AsyncLookupHandle &async_handle) override { target_->StartAsyncLookup(async_handle); }
 

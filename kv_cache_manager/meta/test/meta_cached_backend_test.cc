@@ -4,6 +4,7 @@
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_cached_backend.h"
+#include "kv_cache_manager/meta/meta_local_backend.h"
 #include "kv_cache_manager/meta/meta_redis_backend.h"
 #include "kv_cache_manager/meta/test/meta_storage_backend_test_base.h"
 
@@ -178,8 +179,6 @@ void MetaCachedBackendTest::ConstructBackend() {
 void MetaCachedBackendTest::ConstructConfig() {
     config_ = std::make_shared<MetaStorageBackendConfig>();
     config_->SetStorageType(META_CACHED_BACKEND_TYPE_STR);
-    config_->SetCacheType(META_LOCAL_BACKEND_TYPE_STR);
-    config_->SetPersistentType(META_REDIS_BACKEND_TYPE_STR);
     config_->SetStorageUri("redis://test_redis_user:test_redis_password@test_redis_host:0/?client_max_pool_size=1");
 }
 
@@ -354,6 +353,66 @@ TEST_F(MetaCachedBackendTest, RunningWriteDualWrite) {
     AssertExists(backend_.get(), {1}, {EC_OK}, {false});
 
     ASSERT_EQ(EC_OK, backend_->Close());
+}
+
+// ==================== storage_uri parsing tests ====================
+
+TEST_F(MetaCachedBackendTest, TestParseStorageUriDefaultTypes) {
+    // Default URI without persistent_type/cache_type params should use defaults (redis/local)
+    auto config = std::make_shared<MetaStorageBackendConfig>();
+    config->SetStorageType(META_CACHED_BACKEND_TYPE_STR);
+    config->SetStorageUri("redis://test_redis_user:test_redis_password@test_redis_host:0/?client_max_pool_size=1");
+    auto backend = std::make_shared<MetaCachedBackend>();
+    ASSERT_EQ(EC_OK, backend->Init(instance_id_, config));
+
+    auto local_backend = dynamic_cast<MetaLocalBackend *>(backend->local_backend_.get());
+    ASSERT_TRUE(local_backend);
+    ASSERT_EQ(META_REDIS_BACKEND_TYPE_STR, backend->persistent_backend_->GetStorageType());
+    ASSERT_EQ(META_LOCAL_BACKEND_TYPE_STR, local_backend->GetStorageType());
+    ASSERT_EQ(META_LOCAL_BACKEND_DEFAULT_CAPACITY * 1024 * 1024, local_backend->cache_->GetCapacity());
+    uint32_t expected_shard_mask = (1 << META_LOCAL_BACKEND_DEFAULT_NUM_SHARD_BITS) - 1;
+    ASSERT_EQ(expected_shard_mask, local_backend->shard_mask_);
+    ASSERT_EQ(META_LOCAL_BACKEND_DEFAULT_SAMPLE_TIMES, local_backend->sample_times_);
+}
+
+TEST_F(MetaCachedBackendTest, TestParseStorageUriWithExplicitTypes) {
+    // URI with explicit persistent_type and cache_type params
+    auto config = std::make_shared<MetaStorageBackendConfig>();
+    config->SetStorageType(META_CACHED_BACKEND_TYPE_STR);
+    config->SetStorageUri("redis://test_redis_user:test_redis_password@test_redis_host:0/"
+                          "?client_max_pool_size=1&persistent_type=redis&cache_type=local");
+    auto backend = std::make_shared<MetaCachedBackend>();
+    ASSERT_EQ(EC_OK, backend->Init(instance_id_, config));
+    ASSERT_EQ(META_REDIS_BACKEND_TYPE_STR, backend->persistent_backend_->GetStorageType());
+    auto local_backend = dynamic_cast<MetaLocalBackend *>(backend->local_backend_.get());
+    ASSERT_TRUE(local_backend);
+    ASSERT_EQ(META_LOCAL_BACKEND_TYPE_STR, local_backend->GetStorageType());
+
+    config->SetStorageUri("redis://test_redis_user:test_redis_password@test_redis_host:0/"
+                          "?client_max_pool_size=1&persistent_type=invalid&cache_type=local");
+    ASSERT_EQ(EC_ERROR, backend->Init(instance_id_, config));
+
+    config->SetStorageUri("redis://test_redis_user:test_redis_password@test_redis_host:0/"
+                          "?client_max_pool_size=1&persistent_type=redis&cache_type=invalid");
+    ASSERT_EQ(EC_ERROR, backend->Init(instance_id_, config));
+}
+
+TEST_F(MetaCachedBackendTest, TestParseStorageUriWithLocalParams) {
+    // URI with local backend params (capacity, num_shard_bits, sample_times)
+    // These are parsed by MetaLocalBackend::Init, not MetaCachedBackend::Init,
+    // but the URI is forwarded to the local backend via cache_config->SetStorageUri.
+    auto config = std::make_shared<MetaStorageBackendConfig>();
+    config->SetStorageType(META_CACHED_BACKEND_TYPE_STR);
+    config->SetStorageUri("redis://test_redis_user:test_redis_password@test_redis_host:0/"
+                          "?client_max_pool_size=1&capacity=1024&num_shard_bits=4&sample_times=50");
+    auto backend = std::make_shared<MetaCachedBackend>();
+    ASSERT_EQ(EC_OK, backend->Init(instance_id_, config));
+    auto local_backend = dynamic_cast<MetaLocalBackend *>(backend->local_backend_.get());
+    ASSERT_TRUE(local_backend);
+    ASSERT_EQ(1024 * 1024 * 1024, local_backend->cache_->GetCapacity());
+    uint32_t expected_shard_mask = (1 << 4) - 1;
+    ASSERT_EQ(expected_shard_mask, local_backend->shard_mask_);
+    ASSERT_EQ(50, local_backend->sample_times_);
 }
 
 } // namespace kv_cache_manager

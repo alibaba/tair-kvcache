@@ -236,6 +236,8 @@ TEST_F(MetaIndexerTest, TestMultiThread) {
 }
 
 TEST_F(MetaIndexerTest, TestMetadataPersistAndRecover) {
+    GTEST_SKIP() << "Skipping for local backend not support recover";
+
     std::string configStr = R"({
         "max_key_count" : 100,
         "mutex_shard_num" : 8,

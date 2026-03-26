@@ -35,7 +35,6 @@ public:
     virtual std::vector<ErrorCode> IncrFields(const KeyTypeVec &keys,
                                               const std::map<std::string, int64_t> &field_amounts) noexcept = 0;
     virtual std::vector<ErrorCode> Delete(const KeyTypeVec &keys) noexcept = 0;
-    virtual std::vector<ErrorCode> PutIfAbsent(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept = 0;
 
     // read
     virtual std::vector<ErrorCode>
@@ -47,6 +46,7 @@ public:
                                std::string &out_next_cursor,
                                KeyTypeVec &out_keys) noexcept = 0;
     virtual ErrorCode RandomSample(const int64_t count, KeyTypeVec &out_keys) noexcept = 0;
+    virtual ErrorCode SampleReclaimKeys(const int64_t count, KeyTypeVec &out_keys) noexcept = 0;
 
     // meta data
     virtual ErrorCode PutMetaData(const FieldMap &field_maps) noexcept = 0;

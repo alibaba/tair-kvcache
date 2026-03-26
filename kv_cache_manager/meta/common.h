@@ -19,4 +19,9 @@ static const std::string METADATA_PROPERTY_STORAGE_USAGE_DATA = "__storage_usage
 
 static const std::string SCAN_BASE_CURSOR = "0";
 
+// MetaLocalBackend default constants
+static const size_t META_LOCAL_BACKEND_DEFAULT_CAPACITY = 32ULL * 1024;
+static const int32_t META_LOCAL_BACKEND_DEFAULT_NUM_SHARD_BITS = 10;
+static const int32_t META_LOCAL_BACKEND_DEFAULT_SAMPLE_TIMES = 10;
+
 } // namespace kv_cache_manager

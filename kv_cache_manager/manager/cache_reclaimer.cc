@@ -707,83 +707,85 @@ bool CacheReclaimer::DoKeySampling(RequestContext *request_context,
     }
 
     const std::size_t total_sampling_sz = sampling_size_.load();
-    const std::size_t sampling_sz_per_task = sampling_size_per_task_.load();
-    if (total_sampling_sz == 0 || sampling_sz_per_task == 0) {
+    std::size_t sampling_sz_per_task = sampling_size_per_task_.load();
+    if (total_sampling_sz == 0) {
         KVCM_LOG_ERROR("sampling size == 0");
         return false;
     }
+    if (sampling_sz_per_task == 0 || sampling_sz_per_task > total_sampling_sz) {
+        sampling_sz_per_task = total_sampling_sz;
+    }
 
-    const std::size_t worker_sz = (total_sampling_sz + sampling_sz_per_task - 1) / sampling_sz_per_task;
-    std::size_t sampling_sz_todo = total_sampling_sz;
+    const std::size_t batching_size = batching_size_.load();
+    bool need_get_properties = total_sampling_sz > batching_size;
+    auto sample = [request_context, &ins_id, &ins_gr, &meta_indexer, &need_get_properties](
+                      std::size_t sampling_sz,
+                      std::vector<std::int64_t> &keys,
+                      std::vector<std::map<std::string, std::string>> &maps) -> ErrorCode {
+        if (const auto ec = meta_indexer->SampleReclaimKeys(request_context, sampling_sz, keys); ec != ErrorCode::EC_OK) {
+            LOG_WITH_ID(WARN, "random sample failed, error code: [%d]", static_cast<std::int32_t>(ec));
+            return ec;
+        }
+        if (keys.empty()) {
+            LOG_WITH_ID(DEBUG, "random sample got empty keys");
+            return ErrorCode::EC_NOENT;
+        }
+        if (keys.size() != sampling_sz) {
+            LOG_WITH_ID(DEBUG, "random sample key size mismatch, expect: [%zu], got: [%zu]", sampling_sz, keys.size());
+        }
+        if (!need_get_properties) {
+            return ErrorCode::EC_OK;
+        }
+
+        if (const auto res = meta_indexer->GetProperties(request_context, keys, {PROPERTY_LRU_TIME}, maps);
+            res.ec != ErrorCode::EC_OK) {
+            LOG_WITH_ID(WARN, "get properties failed, error code: [%d]", static_cast<std::int32_t>(res.ec));
+            return res.ec;
+        }
+        if (keys.size() != maps.size()) {
+            LOG_WITH_ID(
+                WARN, "num of sampled keys [%zu] and property maps [%zu] do not match", keys.size(), maps.size());
+            return ErrorCode::EC_MISMATCH;
+        }
+        return ErrorCode::EC_OK;
+    };
 
     out_keys.clear();
     out_keys.reserve(total_sampling_sz);
     out_maps.clear();
     out_maps.reserve(total_sampling_sz);
+    const std::size_t worker_sz = (total_sampling_sz + sampling_sz_per_task - 1) / sampling_sz_per_task;
+    if (worker_sz == 1) {
+        return sample(total_sampling_sz, out_keys, out_maps) == ErrorCode::EC_OK;
+    }
 
+    std::size_t sampling_sz_todo = total_sampling_sz;
     std::vector<std::future<KeySamplingResult>> futures;
     for (std::size_t i = 0; i != worker_sz; ++i) {
-        std::size_t sampling_sz;
-        if (i == worker_sz - 1) {           // final task
-            sampling_sz = sampling_sz_todo; // the left keys to be sampled
-        } else {
-            sampling_sz = sampling_sz_per_task;
-        }
-
         auto promise = std::make_shared<std::promise<KeySamplingResult>>();
         futures.emplace_back(promise->get_future());
 
-        SubmitTask([request_context, &ins_id, &ins_gr, meta_indexer, sampling_sz, promise]() {
-            int64_t time1 = TimestampUtil::GetSteadyTimeUs();
-            const auto keys = std::make_shared<std::vector<std::int64_t>>();
-            if (const auto ec = meta_indexer->RandomSample(request_context, sampling_sz, *keys);
-                ec != ErrorCode::EC_OK) {
-                LOG_WITH_ID(WARN, "random sample failed, error code: [%d]", static_cast<std::int32_t>(ec));
+        // final task do sample with left key size
+        std::size_t sampling_sz = (i == worker_sz - 1) ? sampling_sz_todo : sampling_sz_per_task;
+        SubmitTask([sample, sampling_sz, promise]() {
+            std::vector<std::int64_t> keys;
+            std::vector<std::map<std::string, std::string>> maps;
+            const auto ec = sample(sampling_sz, keys, maps);
+            if (ec != ErrorCode::EC_OK) {
                 promise->set_value({ec, nullptr, nullptr});
                 return;
             }
-            int64_t time2  = TimestampUtil::GetSteadyTimeUs();
-            if (keys->empty()) {
-                LOG_WITH_ID(DEBUG, "random sample got empty keys");
-                promise->set_value({ErrorCode::EC_NOENT, nullptr, nullptr});
-                return;
-            }
-            if (keys->size() != sampling_sz) {
-                // it is expected behavior that meta_indexer.RandomSample()
-                // may return less keys than asked
-                LOG_WITH_ID(
-                    DEBUG, "random sample key size mismatch, expect: [%zu], got: [%zu]", keys->size(), sampling_sz);
-            }
-
-            const auto maps = std::make_shared<std::vector<std::map<std::string, std::string>>>();
-            if (const auto res = meta_indexer->GetProperties(request_context, *keys, {PROPERTY_LRU_TIME}, *maps);
-                res.ec != ErrorCode::EC_OK) {
-                LOG_WITH_ID(WARN, "get properties failed, error code: [%d]", static_cast<std::int32_t>(res.ec));
-                promise->set_value({res.ec, nullptr, nullptr});
-                return;
-            }
-            int64_t time3  = TimestampUtil::GetSteadyTimeUs();
-            LOG_WITH_ID(
-                    INFO, "tianran sampled keys num [%zu], RandomSample time [%ld], GetProperties time [%ld], all time [%ld]", 
-                    keys->size(), time2 - time1, time3 - time2, time3 - time1);
-            if (keys->size() != maps->size()) {
-                LOG_WITH_ID(
-                    WARN, "num of sampled keys [%zu] and property maps [%zu] do not match", keys->size(), maps->size());
-                promise->set_value({ErrorCode::EC_MISMATCH, nullptr, nullptr});
-                return;
-            }
-
-            promise->set_value({ErrorCode::EC_OK, keys, maps});
+            promise->set_value({ErrorCode::EC_OK,
+                                std::make_shared<std::vector<std::int64_t>>(std::move(keys)),
+                                std::make_shared<std::vector<std::map<std::string, std::string>>>(std::move(maps))});
         });
-
         sampling_sz_todo -= sampling_sz;
     }
-    int64_t start_time  = TimestampUtil::GetSteadyTimeUs();
+
     bool result = true;
     for (auto &fut : futures) {
         if (fut.valid()) {
             fut.wait(); // drain all the known futures
-
             if (!result) {
                 // some tasks already failed, no need to extract data any further
                 continue;
@@ -792,18 +794,17 @@ bool CacheReclaimer::DoKeySampling(RequestContext *request_context,
             if (auto key_sampling_res = fut.get(); key_sampling_res.ec != ErrorCode::EC_OK) {
                 result = false;
             } else {
-                for (const auto &key : *key_sampling_res.keys) {
-                    out_keys.emplace_back(key);
-                }
-                for (const auto &map : *key_sampling_res.maps) {
-                    out_maps.emplace_back(map);
-                }
+                out_keys.insert(out_keys.end(),
+                                std::make_move_iterator(key_sampling_res.keys->begin()),
+                                std::make_move_iterator(key_sampling_res.keys->end()));
+                out_maps.insert(out_maps.end(),
+                                std::make_move_iterator(key_sampling_res.maps->begin()),
+                                std::make_move_iterator(key_sampling_res.maps->end()));
             }
         } else {
             result = false;
         }
     }
-    KVCM_LOG_INFO("tianran DoKeySampling all thread time [%ld]", TimestampUtil::GetSteadyTimeUs() - start_time);
     return result;
 }
 
@@ -815,6 +816,11 @@ bool CacheReclaimer::MakeBatchByLRU(const RequestContext *request_context,
     const std::size_t batching_size = batching_size_.load();
     if (batching_size == 0) {
         out_batch.clear();
+        return true;
+    }
+    if (sampled_keys.size() <= batching_size) {
+        std::unordered_set<std::int64_t> deduped_batch(sampled_keys.begin(), sampled_keys.end());
+        out_batch.assign(deduped_batch.begin(), deduped_batch.end());
         return true;
     }
 

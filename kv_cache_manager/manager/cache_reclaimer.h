@@ -287,6 +287,8 @@ private:
     // range: [0, kSizeLimit)
     // default to 1000
     std::atomic<std::size_t> sampling_size_;
+    // sampling_size_per_task_ == 0 || sampling_size_per_task_ >= sampling_size_ means single thread key sampling
+    // else use multi thread key sampling
     std::atomic<std::size_t> sampling_size_per_task_;
 
     // controls the maximum allowed key size of one del request that

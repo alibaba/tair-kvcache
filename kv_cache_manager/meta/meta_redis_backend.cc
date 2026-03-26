@@ -165,10 +165,6 @@ std::vector<ErrorCode> MetaRedisBackend::IncrFields(const KeyTypeVec &keys,
     return std::vector<ErrorCode>(keys.size(), EC_UNIMPLEMENTED);
 }
 
-std::vector<ErrorCode> MetaRedisBackend::PutIfAbsent(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept {
-    return std::vector<ErrorCode>(keys.size(), EC_UNIMPLEMENTED);
-}
-
 std::vector<ErrorCode> MetaRedisBackend::Delete(const KeyTypeVec &keys) noexcept {
     auto handle = client_pool_->AcquireClient(timeout_ms_);
     if (!handle) {
@@ -257,6 +253,11 @@ ErrorCode MetaRedisBackend::RandomSample(const int64_t count, std::vector<KeyTyp
         return EC_ERROR;
     }
     return EC_OK;
+}
+
+ErrorCode MetaRedisBackend::SampleReclaimKeys(const int64_t count, std::vector<KeyType> &out_keys) noexcept {
+    // For Redis backend, RandomSample already uses Redis RAND command which is efficient
+    return RandomSample(count, out_keys);
 }
 
 ErrorCode MetaRedisBackend::PutMetaData(const FieldMap &field_map) noexcept {

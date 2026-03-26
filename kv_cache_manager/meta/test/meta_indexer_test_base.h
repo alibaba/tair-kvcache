@@ -36,14 +36,14 @@ protected:
     void AssertReadModifyWrite(const KeyVector &keys,
                                const MetaIndexer::ModifierFunc &modifier,
                                const Result &expect_result);
-    void DoSimpleTest();
+    void DoSimpleTest(bool is_redis_test = false);
     void DoMultiThreadTest();
 
 private:
     void DoPutTest();
     void DoUpdateTest();
-    void DoDeleteAndExistTest();
-    void DoScanAndRandomSampleTest();
+    void DoDeleteAndExistTest(bool is_redis_test);
+    void DoScanAndSampleReclaimKeysTest();
     void DoReadModifyWriteTest();
 
 protected:

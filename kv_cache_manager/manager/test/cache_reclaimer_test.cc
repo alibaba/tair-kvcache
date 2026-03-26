@@ -240,6 +240,30 @@ ErrorCode MetaIndexer_RandomSample_stub(void *obj,
     return random_sample_result;
 }
 
+/* ---------------- MetaIndexer_SampleReclaimKeys_stub ---------------- */
+
+std::chrono::milliseconds mi_sample_reclaim_delay{0};
+ErrorCode sample_reclaim_result;
+MetaIndexer::KeyVector sample_reclaim_keys;
+
+ErrorCode MetaIndexer_SampleReclaimKeys_stub(void *obj,
+                                             RequestContext *rc,
+                                             const std::int64_t c,
+                                             MetaIndexer::KeyVector &out_keys) noexcept {
+    if (sample_reclaim_result == ErrorCode::EC_OK) {
+        if (c == static_cast<std::int64_t>(sample_reclaim_keys.size())) {
+            out_keys = sample_reclaim_keys;
+        } else if (c == 11) {
+            // special case
+            out_keys = sample_reclaim_keys;
+        } else {
+            out_keys = MetaIndexer::KeyVector(c);
+        }
+    }
+    std::this_thread::sleep_for(mi_sample_reclaim_delay);
+    return sample_reclaim_result;
+}
+
 /* ---------------- MetaIndexer KeyCount stubs ---------------- */
 
 std::size_t key_count;
@@ -288,6 +312,7 @@ public:
         stub_.set(ADDR(MetaIndexerManager, GetMetaIndexer), MetaIndexerManager_GetMetaIndexer_stub);
         stub_.set(ADDR(MetaIndexer, GetProperties), MetaIndexer_GetProperties_stub);
         stub_.set(ADDR(MetaIndexer, RandomSample), MetaIndexer_RandomSample_stub);
+        stub_.set(ADDR(MetaIndexer, SampleReclaimKeys), MetaIndexer_SampleReclaimKeys_stub);
         stub_.set(ADDR(MetaIndexer, GetKeyCount), MetaIndexer_GetKeyCount_stub);
         stub_.set(ADDR(MetaIndexer, GetMaxKeyCount), MetaIndexer_GetMaxKeyCount_stub);
         stub_.set(ADDR(MetaIndexer, PersistMetaData), MetaIndexer_PersistMetaData_stub);
@@ -308,6 +333,7 @@ public:
         del_result = {ErrorCode::EC_OK, ""};
         get_result = ErrorCode::EC_OK;
         random_sample_result = ErrorCode::EC_OK;
+        sample_reclaim_result = ErrorCode::EC_OK;
         batch_get_loc_result = ErrorCode::EC_OK;
 
         key_count = 1;
@@ -316,6 +342,7 @@ public:
         spe_submit_delay = std::chrono::milliseconds{0};
         mi_getprop_delay = std::chrono::milliseconds{0};
         mi_randsample_delay = std::chrono::milliseconds{0};
+        mi_sample_reclaim_delay = std::chrono::milliseconds{0};
         ms_batchgetloc_delay = std::chrono::milliseconds{0};
 
         request_context_ = std::make_shared<RequestContext>("cache_reclaimer_test_trace");
@@ -373,6 +400,7 @@ public:
 
         get_out_properties.clear();
         random_sample_keys.clear();
+        sample_reclaim_keys.clear();
         batch_get_loc_out_maps.clear();
 
         stub_.reset(ADDR(RegistryManager, ListInstanceGroup));
@@ -381,6 +409,7 @@ public:
         stub_.reset(ADDR(MetaIndexerManager, GetMetaIndexer));
         stub_.reset(ADDR(MetaIndexer, GetProperties));
         stub_.reset(ADDR(MetaIndexer, RandomSample));
+        stub_.reset(ADDR(MetaIndexer, SampleReclaimKeys));
         stub_.reset(ADDR(MetaIndexer, GetKeyCount));
         stub_.reset(ADDR(MetaIndexer, GetMaxKeyCount));
         stub_.reset(ADDR(MetaIndexer, PersistMetaData));
@@ -407,6 +436,7 @@ TEST_F(CacheReclaimerTest, TestStartStop) {
     stub_.reset(ADDR(MetaIndexerManager, GetMetaIndexer));
     stub_.reset(ADDR(MetaIndexer, GetProperties));
     stub_.reset(ADDR(MetaIndexer, RandomSample));
+    stub_.reset(ADDR(MetaIndexer, SampleReclaimKeys));
     stub_.reset(ADDR(MetaIndexer, GetKeyCount));
     stub_.reset(ADDR(MetaIndexer, GetMaxKeyCount));
     stub_.reset(ADDR(MetaIndexer, PersistMetaData));
@@ -544,7 +574,7 @@ TEST_F(CacheReclaimerTest, TestFastExiting) {
 }
 
 TEST_F(CacheReclaimerTest, TestPauseResume) {
-    random_sample_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
     get_out_properties = {
         {
             {PROPERTY_LRU_TIME, "0"},
@@ -593,7 +623,7 @@ TEST_F(CacheReclaimerTest, TestPauseResume) {
     ins_group->quota_.set_capacity(2048);
     instance_groups.emplace_back(ins_group);
 
-    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), random_sample_keys.size()));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), sample_reclaim_keys.size()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 2));
     batch_get_loc_out_maps =
         std::vector<CacheLocationMap>(cache_reclaimer_->GetBatchingSize(request_context_.get()), CacheLocationMap{});
@@ -1478,7 +1508,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming17) {
 }
 
 TEST_F(CacheReclaimerTest, TestInsufficientSampledKeys) {
-    random_sample_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
     get_out_properties = {
         {
             {PROPERTY_LRU_TIME, "0"},
@@ -1528,9 +1558,9 @@ TEST_F(CacheReclaimerTest, TestInsufficientSampledKeys) {
     instance_groups.emplace_back(ins_group);
 
     // batching_size default to 100 which is larger than the size of sampled keys (10)
-    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), random_sample_keys.size()));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), sample_reclaim_keys.size()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 100));
-    batch_get_loc_out_maps = std::vector<CacheLocationMap>(random_sample_keys.size(), CacheLocationMap{});
+    batch_get_loc_out_maps = std::vector<CacheLocationMap>(sample_reclaim_keys.size(), CacheLocationMap{});
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
 
     // main thread sleeps for 10ms to ensure the worker thread do
@@ -1551,7 +1581,7 @@ TEST_F(CacheReclaimerTest, TestInsufficientSampledKeys) {
 }
 
 TEST_F(CacheReclaimerTest, TestReclaimByLRU00) {
-    random_sample_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
     get_out_properties = {
         {
             {PROPERTY_LRU_TIME, "0"},
@@ -1600,7 +1630,7 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU00) {
     ins_group->quota_.set_capacity(2048);
     instance_groups.emplace_back(ins_group);
 
-    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), random_sample_keys.size()));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), sample_reclaim_keys.size()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 2));
     batch_get_loc_out_maps =
         std::vector<CacheLocationMap>(cache_reclaimer_->GetBatchingSize(request_context_.get()), CacheLocationMap{});
@@ -1619,7 +1649,7 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU00) {
 }
 
 TEST_F(CacheReclaimerTest, TestReclaimByLRU01) {
-    random_sample_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
     get_out_properties = {
         {
             {PROPERTY_LRU_TIME, "9"}, // block key id -> 0
@@ -1668,7 +1698,7 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU01) {
     ins_group->quota_.set_capacity(2048);
     instance_groups.emplace_back(ins_group);
 
-    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), random_sample_keys.size()));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), sample_reclaim_keys.size()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 3));
     batch_get_loc_out_maps =
         std::vector<CacheLocationMap>(cache_reclaimer_->GetBatchingSize(request_context_.get()), CacheLocationMap{});
@@ -1689,7 +1719,7 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU01) {
 }
 
 TEST_F(CacheReclaimerTest, TestReclaimByLRU02) {
-    random_sample_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
     get_out_properties = {
         {
             {PROPERTY_LRU_TIME, "9"}, // block key id -> 0
@@ -1738,7 +1768,7 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU02) {
     ins_group->quota_.set_capacity(2048);
     instance_groups.emplace_back(ins_group);
 
-    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), random_sample_keys.size()));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), sample_reclaim_keys.size()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 3));
     batch_get_loc_out_maps =
         std::vector<CacheLocationMap>(cache_reclaimer_->GetBatchingSize(request_context_.get()), CacheLocationMap{});
@@ -1759,7 +1789,7 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU02) {
 }
 
 TEST_F(CacheReclaimerTest, TestReclaimByLRU03) {
-    random_sample_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
     get_out_properties = {
         {
             {PROPERTY_LRU_TIME, "2"}, // block key id -> 0
@@ -1808,9 +1838,9 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU03) {
     ins_group->quota_.set_capacity(2048);
     instance_groups.emplace_back(ins_group);
 
-    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), random_sample_keys.size()));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), sample_reclaim_keys.size()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 0));
-    batch_get_loc_out_maps = std::vector<CacheLocationMap>(random_sample_keys.size(), CacheLocationMap{});
+    batch_get_loc_out_maps = std::vector<CacheLocationMap>(sample_reclaim_keys.size(), CacheLocationMap{});
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
 
     std::this_thread::sleep_for(std::chrono::milliseconds(16));
@@ -1822,7 +1852,7 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU03) {
 }
 
 TEST_F(CacheReclaimerTest, TestReclaimByLRU04) {
-    random_sample_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
     get_out_properties = {
         {
             {PROPERTY_LRU_TIME, "9"}, // block key id -> 0
@@ -1871,7 +1901,7 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU04) {
     ins_group->quota_.set_capacity(2048);
     instance_groups.emplace_back(ins_group);
 
-    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), random_sample_keys.size()));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), sample_reclaim_keys.size()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 1));
     batch_get_loc_out_maps =
         std::vector<CacheLocationMap>(cache_reclaimer_->GetBatchingSize(request_context_.get()), CacheLocationMap{});
@@ -1891,7 +1921,7 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU04) {
 
 TEST_F(CacheReclaimerTest, TestMetaIndexerGetPropertiesFailure) {
     // set up test data
-    random_sample_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
 
     // configure the GetProperties stub to return an error
     get_result = ErrorCode::EC_ERROR;
@@ -1909,7 +1939,7 @@ TEST_F(CacheReclaimerTest, TestMetaIndexerGetPropertiesFailure) {
     ins_group->quota_.set_capacity(2048);
     instance_groups.emplace_back(ins_group);
 
-    batch_get_loc_out_maps = std::vector<CacheLocationMap>(random_sample_keys.size(), CacheLocationMap{});
+    batch_get_loc_out_maps = std::vector<CacheLocationMap>(sample_reclaim_keys.size(), CacheLocationMap{});
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
 
     std::this_thread::sleep_for(std::chrono::milliseconds(16));
@@ -1921,9 +1951,9 @@ TEST_F(CacheReclaimerTest, TestMetaIndexerGetPropertiesFailure) {
     ASSERT_TRUE(submitted_del_requests.empty());
 }
 
-TEST_F(CacheReclaimerTest, TestMetaIndexerRandomSampleFailure) {
-    // configure the RandomSample stub to return an error
-    random_sample_result = ErrorCode::EC_ERROR;
+TEST_F(CacheReclaimerTest, TestMetaIndexerSampleReclaimFailure) {
+    // configure the SampleReclaim stub to return an error
+    sample_reclaim_result = ErrorCode::EC_ERROR;
 
     // update the trigger strategy to trigger the reclaiming
 
@@ -1938,7 +1968,7 @@ TEST_F(CacheReclaimerTest, TestMetaIndexerRandomSampleFailure) {
     ins_group->quota_.set_capacity(2048);
     instance_groups.emplace_back(ins_group);
 
-    batch_get_loc_out_maps = std::vector<CacheLocationMap>(random_sample_keys.size(), CacheLocationMap{});
+    batch_get_loc_out_maps = std::vector<CacheLocationMap>(sample_reclaim_keys.size(), CacheLocationMap{});
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
 
     std::this_thread::sleep_for(std::chrono::milliseconds(16));
@@ -1946,13 +1976,13 @@ TEST_F(CacheReclaimerTest, TestMetaIndexerRandomSampleFailure) {
 
     cache_reclaimer_->Stop();
 
-    // no deletion requests should be submitted when RandomSample fails
+    // no deletion requests should be submitted when SampleReclaim fails
     ASSERT_TRUE(submitted_del_requests.empty());
 }
 
 TEST_F(CacheReclaimerTest, TestMetaIndexerSampleKeys00) {
     // test case that sampled keys size and properties size not match
-    random_sample_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}; // size is 10
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}; // size is 10
     get_out_properties = {
         {
             {PROPERTY_LRU_TIME, "9"}, // size is 1
@@ -1972,7 +2002,7 @@ TEST_F(CacheReclaimerTest, TestMetaIndexerSampleKeys00) {
     ins_group->quota_.set_capacity(2048);
     instance_groups.emplace_back(ins_group);
 
-    batch_get_loc_out_maps = std::vector<CacheLocationMap>(random_sample_keys.size(), CacheLocationMap{});
+    batch_get_loc_out_maps = std::vector<CacheLocationMap>(sample_reclaim_keys.size(), CacheLocationMap{});
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
 
     std::this_thread::sleep_for(std::chrono::milliseconds(16));
@@ -1986,7 +2016,7 @@ TEST_F(CacheReclaimerTest, TestMetaIndexerSampleKeys00) {
 
 TEST_F(CacheReclaimerTest, TestMetaIndexerSampleKeys01) {
     // test case that properties size match but has wrong field
-    random_sample_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}; // size is 10
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}; // size is 10
     get_out_properties = {
         {
             {PROPERTY_HIT_COUNT, "0"}, // wrong field
@@ -2033,7 +2063,7 @@ TEST_F(CacheReclaimerTest, TestMetaIndexerSampleKeys01) {
     ins_group->quota_.set_capacity(2048);
     instance_groups.emplace_back(ins_group);
 
-    batch_get_loc_out_maps = std::vector<CacheLocationMap>(random_sample_keys.size(), CacheLocationMap{});
+    batch_get_loc_out_maps = std::vector<CacheLocationMap>(sample_reclaim_keys.size(), CacheLocationMap{});
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
 
     std::this_thread::sleep_for(std::chrono::milliseconds(16));
@@ -2047,7 +2077,7 @@ TEST_F(CacheReclaimerTest, TestMetaIndexerSampleKeys01) {
 
 TEST_F(CacheReclaimerTest, TestSchedulePlanExecutorDelFailure) {
     // set up test data
-    random_sample_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
     get_out_properties = {
         {
             {PROPERTY_LRU_TIME, "0"},
@@ -2097,7 +2127,7 @@ TEST_F(CacheReclaimerTest, TestSchedulePlanExecutorDelFailure) {
     ins_group->quota_.set_capacity(2048);
     instance_groups.emplace_back(ins_group);
 
-    batch_get_loc_out_maps = std::vector<CacheLocationMap>(random_sample_keys.size(), CacheLocationMap{});
+    batch_get_loc_out_maps = std::vector<CacheLocationMap>(sample_reclaim_keys.size(), CacheLocationMap{});
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
 
     std::this_thread::sleep_for(std::chrono::milliseconds(16));
@@ -2111,7 +2141,7 @@ TEST_F(CacheReclaimerTest, TestEmptyInstanceGroups) {
     instance_groups.clear();
 
     // the mocking sample keys are set but should never be accessed
-    random_sample_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
     get_out_properties = {
         {
             {PROPERTY_LRU_TIME, "0"},
@@ -2145,7 +2175,7 @@ TEST_F(CacheReclaimerTest, TestEmptyInstanceGroups) {
         },
     };
 
-    batch_get_loc_out_maps = std::vector<CacheLocationMap>(random_sample_keys.size(), CacheLocationMap{});
+    batch_get_loc_out_maps = std::vector<CacheLocationMap>(sample_reclaim_keys.size(), CacheLocationMap{});
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
 
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -2162,7 +2192,7 @@ TEST_F(CacheReclaimerTest, TestEmptyInstanceInfos) {
     instance_infos.clear();
 
     // the mocking sample keys are set but should never be accessed
-    random_sample_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
     get_out_properties = {
         {
             {PROPERTY_LRU_TIME, "0"},
@@ -2209,7 +2239,7 @@ TEST_F(CacheReclaimerTest, TestEmptyInstanceInfos) {
     ins_group->quota_.set_capacity(2048);
     instance_groups.emplace_back(ins_group);
 
-    batch_get_loc_out_maps = std::vector<CacheLocationMap>(random_sample_keys.size(), CacheLocationMap{});
+    batch_get_loc_out_maps = std::vector<CacheLocationMap>(sample_reclaim_keys.size(), CacheLocationMap{});
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
 
     std::this_thread::sleep_for(std::chrono::milliseconds(16));
@@ -2255,7 +2285,7 @@ TEST_F(CacheReclaimerTest, TestMultipleInstanceGroups) {
     instance_infos.emplace_back(ins_info2);
 
     // set up test data
-    random_sample_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
     get_out_properties = {
         {
             {PROPERTY_LRU_TIME, "0"},
@@ -2289,7 +2319,7 @@ TEST_F(CacheReclaimerTest, TestMultipleInstanceGroups) {
         },
     };
 
-    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), random_sample_keys.size()));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), sample_reclaim_keys.size()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 5));
     batch_get_loc_out_maps =
         std::vector<CacheLocationMap>(cache_reclaimer_->GetBatchingSize(request_context_.get()), CacheLocationMap{});
@@ -2320,7 +2350,7 @@ TEST_F(CacheReclaimerTest, TestMultipleInstanceGroups) {
 }
 
 TEST_F(CacheReclaimerTest, TestKeyCountEdgeCases) {
-    random_sample_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
     get_out_properties = {
         {
             {PROPERTY_LRU_TIME, "0"},
@@ -2354,8 +2384,8 @@ TEST_F(CacheReclaimerTest, TestKeyCountEdgeCases) {
         },
     };
 
-    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), random_sample_keys.size()));
-    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), random_sample_keys.size()));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), sample_reclaim_keys.size()));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), sample_reclaim_keys.size()));
 
     // usage size not zero so key count is tested
     dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 4096);
@@ -2371,7 +2401,7 @@ TEST_F(CacheReclaimerTest, TestKeyCountEdgeCases) {
         ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.01); // 1%
         instance_groups.emplace_back(ins_group);
 
-        batch_get_loc_out_maps = std::vector<CacheLocationMap>(random_sample_keys.size(), CacheLocationMap{});
+        batch_get_loc_out_maps = std::vector<CacheLocationMap>(sample_reclaim_keys.size(), CacheLocationMap{});
         ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
 
         std::this_thread::sleep_for(std::chrono::milliseconds(16));
@@ -2397,7 +2427,7 @@ TEST_F(CacheReclaimerTest, TestKeyCountEdgeCases) {
         // clear requests from previous test
         submitted_del_requests.clear();
 
-        batch_get_loc_out_maps = std::vector<CacheLocationMap>(random_sample_keys.size(), CacheLocationMap{});
+        batch_get_loc_out_maps = std::vector<CacheLocationMap>(sample_reclaim_keys.size(), CacheLocationMap{});
         ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
 
         std::this_thread::sleep_for(std::chrono::milliseconds(16));
@@ -2423,7 +2453,7 @@ TEST_F(CacheReclaimerTest, TestKeyCountEdgeCases) {
         // clear requests from previous test
         submitted_del_requests.clear();
 
-        batch_get_loc_out_maps = std::vector<CacheLocationMap>(random_sample_keys.size(), CacheLocationMap{});
+        batch_get_loc_out_maps = std::vector<CacheLocationMap>(sample_reclaim_keys.size(), CacheLocationMap{});
         ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
 
         std::this_thread::sleep_for(std::chrono::milliseconds(16));
@@ -2437,7 +2467,7 @@ TEST_F(CacheReclaimerTest, TestKeyCountEdgeCases) {
 }
 
 TEST_F(CacheReclaimerTest, TestCronJobAdaptiveSleepInterval) {
-    random_sample_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
     get_out_properties = {
         {
             {PROPERTY_LRU_TIME, "0"},
@@ -2486,7 +2516,7 @@ TEST_F(CacheReclaimerTest, TestCronJobAdaptiveSleepInterval) {
     ins_group->quota_.set_capacity(2048);
     instance_groups.emplace_back(ins_group);
 
-    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), random_sample_keys.size()));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), sample_reclaim_keys.size()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 1));
     batch_get_loc_out_maps =
         std::vector<CacheLocationMap>(cache_reclaimer_->GetBatchingSize(request_context_.get()), CacheLocationMap{});
@@ -2553,7 +2583,7 @@ TEST_F(CacheReclaimerTest, TestCronJobAdaptiveSleepInterval) {
 }
 
 TEST_F(CacheReclaimerTest, TestCronJobAdaptiveSleepIntervalRecovery) {
-    random_sample_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
     get_out_properties = {
         {
             {PROPERTY_LRU_TIME, "0"},
@@ -2604,7 +2634,7 @@ TEST_F(CacheReclaimerTest, TestCronJobAdaptiveSleepIntervalRecovery) {
         instance_groups.emplace_back(ins_group);
     }
 
-    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), random_sample_keys.size()));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), sample_reclaim_keys.size()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 1));
     batch_get_loc_out_maps =
         std::vector<CacheLocationMap>(cache_reclaimer_->GetBatchingSize(request_context_.get()), CacheLocationMap{});
@@ -2757,9 +2787,7 @@ TEST_F(CacheReclaimerTest, TestHandleDelRes03) {
 
     try {
         throw std::runtime_error("test exception");
-    } catch (...) {
-        promise->set_exception(std::current_exception());
-    }
+    } catch (...) { promise->set_exception(std::current_exception()); }
 
     cache_reclaimer_->HandleDelRes();
     ASSERT_TRUE(cache_reclaimer_->delete_handlers_.empty());
@@ -2782,7 +2810,7 @@ TEST_F(CacheReclaimerTest, TestHandleDelRes04) {
 }
 
 TEST_F(CacheReclaimerTest, TestDoKeySampling) {
-    random_sample_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
     get_out_properties = {
         {
             {PROPERTY_LRU_TIME, "0"},
@@ -2817,13 +2845,13 @@ TEST_F(CacheReclaimerTest, TestDoKeySampling) {
     };
 
     {
-        cache_reclaimer_->sampling_size_.store(random_sample_keys.size());
+        cache_reclaimer_->sampling_size_.store(sample_reclaim_keys.size());
         cache_reclaimer_->sampling_size_per_task_.store(100);
 
         std::vector<std::int64_t> keys;
         std::vector<std::map<std::string, std::string>> maps;
         ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_.get(), instance_infos.front(), keys, maps));
-        ASSERT_EQ(random_sample_keys.size(), keys.size());
+        ASSERT_EQ(sample_reclaim_keys.size(), keys.size());
         ASSERT_EQ(get_out_properties.size(), maps.size());
     }
 
@@ -2837,12 +2865,25 @@ TEST_F(CacheReclaimerTest, TestDoKeySampling) {
     }
 
     {
-        cache_reclaimer_->sampling_size_.store(random_sample_keys.size());
-        cache_reclaimer_->sampling_size_per_task_.store(0);
+        cache_reclaimer_->sampling_size_.store(sample_reclaim_keys.size());
+        cache_reclaimer_->sampling_size_per_task_.store(0); // 0 means single thread key sampling
 
         std::vector<std::int64_t> keys;
         std::vector<std::map<std::string, std::string>> maps;
-        ASSERT_FALSE(cache_reclaimer_->DoKeySampling(request_context_.get(), instance_infos.front(), keys, maps));
+        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_.get(), instance_infos.front(), keys, maps));
+        ASSERT_EQ(sample_reclaim_keys.size(), keys.size());
+        ASSERT_EQ(get_out_properties.size(), maps.size());
+    }
+    {
+        // sampling_size <= sampling_size_per_task means single thread key sampling
+        cache_reclaimer_->sampling_size_.store(1000);
+        cache_reclaimer_->sampling_size_per_task_.store(1000);
+
+        std::vector<std::int64_t> keys;
+        std::vector<std::map<std::string, std::string>> maps;
+        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_.get(), instance_infos.front(), keys, maps));
+        ASSERT_EQ(1000, keys.size());
+        ASSERT_EQ(1000, maps.size());
     }
 
     {
@@ -2886,7 +2927,8 @@ TEST_F(CacheReclaimerTest, TestDoKeySampling) {
         std::vector<std::map<std::string, std::string>> maps;
         ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_.get(), instance_infos.front(), keys, maps));
         ASSERT_EQ(1, keys.size());
-        ASSERT_EQ(1, maps.size());
+        // sampling_size_ <= delete_batch_size, will not get properties
+        ASSERT_EQ(0, maps.size());
     }
 
     {
@@ -2908,7 +2950,7 @@ TEST_F(CacheReclaimerTest, TestDoKeySampling) {
 
 TEST_F(CacheReclaimerTest, TestDupKeys) {
     {
-        random_sample_keys = {0, 0, 2, 3, 4, 5, 6, 7, 8, 9};
+        sample_reclaim_keys = {0, 0, 2, 3, 4, 5, 6, 7, 8, 9};
         get_out_properties = {
             {
                 {PROPERTY_LRU_TIME, "1"},
@@ -2942,11 +2984,11 @@ TEST_F(CacheReclaimerTest, TestDupKeys) {
             },
         };
 
-        cache_reclaimer_->sampling_size_.store(random_sample_keys.size());
+        cache_reclaimer_->sampling_size_.store(sample_reclaim_keys.size());
         cache_reclaimer_->sampling_size_per_task_.store(100);
-        cache_reclaimer_->batching_size_.store(random_sample_keys.size());
+        cache_reclaimer_->batching_size_.store(sample_reclaim_keys.size());
 
-        std::vector<std::int64_t> keys(random_sample_keys);
+        std::vector<std::int64_t> keys(sample_reclaim_keys);
         std::vector<std::map<std::string, std::string>> maps(get_out_properties);
         std::vector<std::int64_t> batch;
         ASSERT_TRUE(
@@ -2955,7 +2997,7 @@ TEST_F(CacheReclaimerTest, TestDupKeys) {
     }
 
     {
-        random_sample_keys = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
+        sample_reclaim_keys = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
         get_out_properties = {
             {
                 {PROPERTY_LRU_TIME, "0"},
@@ -2989,11 +3031,11 @@ TEST_F(CacheReclaimerTest, TestDupKeys) {
             },
         };
 
-        cache_reclaimer_->sampling_size_.store(random_sample_keys.size());
+        cache_reclaimer_->sampling_size_.store(sample_reclaim_keys.size());
         cache_reclaimer_->sampling_size_per_task_.store(100);
         cache_reclaimer_->batching_size_.store(2);
 
-        std::vector<std::int64_t> keys(random_sample_keys);
+        std::vector<std::int64_t> keys(sample_reclaim_keys);
         std::vector<std::map<std::string, std::string>> maps(get_out_properties);
         std::vector<std::int64_t> batch;
         ASSERT_TRUE(
@@ -3002,7 +3044,7 @@ TEST_F(CacheReclaimerTest, TestDupKeys) {
     }
 
     {
-        random_sample_keys = {1, 1, 1, 1, 1, 1, 1, 2, 1, 1};
+        sample_reclaim_keys = {1, 1, 1, 1, 1, 1, 1, 2, 1, 1};
         get_out_properties = {
             {
                 {PROPERTY_LRU_TIME, "9"},
@@ -3036,11 +3078,11 @@ TEST_F(CacheReclaimerTest, TestDupKeys) {
             },
         };
 
-        cache_reclaimer_->sampling_size_.store(random_sample_keys.size());
+        cache_reclaimer_->sampling_size_.store(sample_reclaim_keys.size());
         cache_reclaimer_->sampling_size_per_task_.store(100);
         cache_reclaimer_->batching_size_.store(2);
 
-        std::vector<std::int64_t> keys(random_sample_keys);
+        std::vector<std::int64_t> keys(sample_reclaim_keys);
         std::vector<std::map<std::string, std::string>> maps(get_out_properties);
         std::vector<std::int64_t> batch;
         ASSERT_TRUE(
@@ -3066,7 +3108,7 @@ TEST_F(CacheReclaimerTest, TestPerf) {
     cache_reclaimer_->batching_size_.store(batching_sz);
 
     for (int i = 0; i != sampling_sz_per_task; ++i) {
-        random_sample_keys.emplace_back(i);
+        sample_reclaim_keys.emplace_back(i);
         get_out_properties.emplace_back(MetaIndexer::PropertyMap{{PROPERTY_LRU_TIME, "9"}});
     }
 

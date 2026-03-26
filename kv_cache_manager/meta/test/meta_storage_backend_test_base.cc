@@ -1,5 +1,6 @@
 #include "kv_cache_manager/meta/test/meta_storage_backend_test_base.h"
 
+#include "kv_cache_manager/meta/meta_redis_backend.h"
 namespace kv_cache_manager {
 void MetaStorageBackendTestBase::AssertGet(MetaStorageBackend *meta_storage_backend,
                                            const KeyTypeVec &keys,
@@ -115,18 +116,18 @@ void MetaStorageBackendTestBase::AssertListKeysByStep(MetaStorageBackend *meta_s
     }
 }
 
-void MetaStorageBackendTestBase::AssertRandomSample(MetaStorageBackend *meta_storage_backend,
-                                                    const int64_t count,
-                                                    const ErrorCode expected_ec,
-                                                    const std::set<KeyType> &expected_keys) {
+void MetaStorageBackendTestBase::AssertSampleReclaimKeys(MetaStorageBackend *meta_storage_backend,
+                                                         const int64_t count,
+                                                         const ErrorCode expected_ec,
+                                                         const std::set<KeyType> &expected_keys) {
     ASSERT_TRUE(meta_storage_backend);
     std::vector<KeyType> keys;
-    bool ec = meta_storage_backend->RandomSample(count, keys);
+    ErrorCode ec = meta_storage_backend->SampleReclaimKeys(count, keys);
     ASSERT_EQ(expected_ec, ec);
-    ASSERT_EQ(std::min((size_t)count, expected_keys.size()), keys.size());
     for (const auto &key : keys) {
         const auto iter = expected_keys.find(key);
         ASSERT_TRUE(iter != expected_keys.end()) << key;
     }
 }
+
 } // namespace kv_cache_manager

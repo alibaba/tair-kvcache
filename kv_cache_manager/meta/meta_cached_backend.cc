@@ -68,9 +68,30 @@ ErrorCode MetaCachedBackend::Init(const std::string &instance_id,
     instance_id_ = instance_id;
     config_ = config;
 
+    // Parse persistent_type and cache_type from storage_uri, falling back to defaults.
+    std::string persistent_type = META_REDIS_BACKEND_TYPE_STR;
+    std::string cache_type = META_LOCAL_BACKEND_TYPE_STR;
+    const std::string &storage_uri = config->GetStorageUri();
+    if (!storage_uri.empty()) {
+        StandardUri uri = StandardUri::FromUri(storage_uri);
+        if (uri.Valid()) {
+            std::string persistent_type_param = uri.GetParam("persistent_type");
+            if (!persistent_type_param.empty()) {
+                persistent_type = persistent_type_param;
+            }
+            std::string cache_type_param = uri.GetParam("cache_type");
+            if (!cache_type_param.empty()) {
+                cache_type = cache_type_param;
+            }
+        } else {
+            KVCM_LOG_ERROR("invalid storage uri[%s]", storage_uri.c_str());
+            return EC_BADARGS;
+        }
+    }
+
     // create persistent backend
-    auto persistent_config = std::make_shared<MetaStorageBackendConfig>(config->GetPersistentType());
-    persistent_config->SetStorageUri(config->GetStorageUri());
+    auto persistent_config = std::make_shared<MetaStorageBackendConfig>(persistent_type);
+    persistent_config->SetStorageUri(storage_uri);
     persistent_backend_ = CreatePersistentBackend(instance_id, persistent_config);
     if (!persistent_backend_) {
         KVCM_LOG_ERROR("init persistent backend failed, instance[%s]", instance_id.c_str());
@@ -78,8 +99,8 @@ ErrorCode MetaCachedBackend::Init(const std::string &instance_id,
     }
 
     // create local backend
-    auto cache_config = std::make_shared<MetaStorageBackendConfig>(config->GetCacheType());
-    cache_config->SetMutexShardNum(config->GetMutexShardNum());
+    auto cache_config = std::make_shared<MetaStorageBackendConfig>(cache_type);
+    cache_config->SetStorageUri(storage_uri);
     local_backend_ = CreateLocalBackend(instance_id, cache_config);
     if (!local_backend_) {
         KVCM_LOG_ERROR("init cache backend failed, instance[%s]", instance_id.c_str());
@@ -88,8 +109,8 @@ ErrorCode MetaCachedBackend::Init(const std::string &instance_id,
 
     KVCM_LOG_INFO("cached backend init ok, instance[%s] cache[%s] persistent[%s]",
                   instance_id_.c_str(),
-                  config->GetCacheType().c_str(),
-                  config->GetPersistentType().c_str());
+                  cache_type.c_str(),
+                  persistent_type.c_str());
     return EC_OK;
 }
 
@@ -309,10 +330,6 @@ std::vector<ErrorCode> MetaCachedBackend::Delete(const KeyTypeVec &keys) noexcep
     return local_backend_->Delete(keys, persistent_results);
 }
 
-std::vector<ErrorCode> MetaCachedBackend::PutIfAbsent(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept {
-    return std::vector<ErrorCode>(keys.size(), EC_UNIMPLEMENTED);
-}
-
 std::vector<ErrorCode> MetaCachedBackend::Get(const KeyTypeVec &keys,
                                               const std::vector<std::string> &field_names,
                                               FieldMapVec &out_field_maps) noexcept {
@@ -415,6 +432,22 @@ ErrorCode MetaCachedBackend::RandomSample(const int64_t count, std::vector<KeyTy
         return local_backend_->RandomSample(count, out_keys);
     }
     return persistent_backend_->RandomSample(count, out_keys);
+}
+
+ErrorCode MetaCachedBackend::SampleReclaimKeys(const int64_t count, std::vector<KeyType> &out_keys) noexcept {
+    // Validate input parameters
+    if (count <= 0) {
+        return EC_OK;
+    }
+
+    // Route to appropriate backend based on recover state:
+    // - If recover is complete (kRunning), use local backend for better performance
+    // - If still recovering, use persistent backend (Redis) to ensure data consistency
+    if (recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning) {
+        return local_backend_->SampleReclaimKeys(count, out_keys);
+    } else {
+        return persistent_backend_->SampleReclaimKeys(count, out_keys);
+    }
 }
 
 ErrorCode MetaCachedBackend::PutMetaData(const FieldMap &field_maps) noexcept {

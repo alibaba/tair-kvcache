@@ -36,7 +36,6 @@ public:
     std::vector<ErrorCode> IncrFields(const KeyTypeVec &keys,
                                       const std::map<std::string, int64_t> &field_amounts) noexcept override;
     std::vector<ErrorCode> Delete(const KeyTypeVec &keys) noexcept override;
-    std::vector<ErrorCode> PutIfAbsent(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept override;
 
     // read
     std::vector<ErrorCode> Get(const KeyTypeVec &keys,
@@ -49,6 +48,7 @@ public:
                        std::string &out_next_cursor,
                        std::vector<KeyType> &out_keys) noexcept override;
     ErrorCode RandomSample(const int64_t count, std::vector<KeyType> &out_keys) noexcept override;
+    ErrorCode SampleReclaimKeys(const int64_t count, std::vector<KeyType> &out_keys) noexcept override;
 
     // meta data
     ErrorCode PutMetaData(const FieldMap &field_maps) noexcept override;

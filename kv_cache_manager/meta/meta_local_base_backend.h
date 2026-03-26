@@ -12,11 +12,9 @@ class MetaLocalBaseBackend : public MetaStorageBackend {
 public:
     ~MetaLocalBaseBackend() override = default;
 
-    // Bring base class unconditional write methods into scope to avoid name hiding.
     using MetaStorageBackend::Delete;
     using MetaStorageBackend::IncrFields;
     using MetaStorageBackend::Put;
-    using MetaStorageBackend::PutIfAbsent;
     using MetaStorageBackend::UpdateFields;
     using MetaStorageBackend::Upsert;
 

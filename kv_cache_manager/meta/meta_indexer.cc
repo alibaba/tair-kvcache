@@ -227,7 +227,6 @@ ErrorCode MetaIndexer::Init(const std::string &instance_id, const std::shared_pt
 
     instance_id_ = instance_id;
     auto storage_backend_config = config->GetMetaStorageBackendConfig();
-    storage_backend_config->SetMutexShardNum(mutex_shard_num_);
     storage_ = MetaStorageBackendFactory::CreateAndInitStorageBackend(instance_id, storage_backend_config);
     if (!storage_) {
         KVCM_LOG_ERROR("instance[%s] create storage backend failed, storage backend type[%s]",
@@ -691,6 +690,19 @@ MetaIndexer::RandomSample(RequestContext *request_context, const size_t count, K
                                        TimestampUtil::GetCurrentTimeUs() - begin_get_io_time);
     if (ec != EC_OK) {
         KVCM_LOG_ERROR("instance[%s] meta indexer random sample failed, count[%lu] sample key size[%lu]",
+                       instance_id_.c_str(),
+                       count,
+                       out_keys.size());
+    }
+    return ec;
+}
+
+ErrorCode
+MetaIndexer::SampleReclaimKeys(RequestContext *request_context, const int64_t count, KeyVector &out_keys) const noexcept {
+    out_keys.reserve(count);
+    auto ec = storage_->SampleReclaimKeys(count, out_keys);
+    if (ec != EC_OK) {
+        KVCM_LOG_ERROR("instance[%s] meta indexer sample reclaim keys failed, count[%lu] sample key size[%lu]",
                        instance_id_.c_str(),
                        count,
                        out_keys.size());
