@@ -97,7 +97,9 @@ jobs:
           curl -sL "https://github.com/cli/cli/releases/download/v${GH_VER}/gh_${GH_VER}_linux_${ARCH}.tar.gz" | tar xz --strip-components=1 -C /usr/local
           # Delete old disk cache so setup-bazel post action can save the new one.
           # GitHub Actions cache is immutable - same key cannot be overwritten.
-          gh cache list --repo ${{ github.repository }} --key "setup-bazel-1-linux-x64-disk-${{ runner.os }}-${{ github.workflow }}-${{ matrix.name }}" --json id,key | \
+          RUNNER_ARCH_LOWER=$(echo "${{ runner.arch }}" | tr '[:upper:]' '[:lower:]')
+          CACHE_KEY="setup-bazel-1-linux-${RUNNER_ARCH_LOWER}-disk-${{ runner.os }}-${{ github.workflow }}-${{ matrix.name }}"
+          gh cache list --repo ${{ github.repository }} --key "${CACHE_KEY}" --json id,key | \
             jq -r '.[].key' | \
             xargs -I {} gh cache delete "{}" --repo ${{ github.repository }} || true
       - name: detect_crashes
