@@ -17,11 +17,13 @@ typedef int32_t ErrorCode_t;
 #define MOONCAKE_ERROR_SHARD_INDEX_OUT_OF_RANGE ((ErrorCode_t)-100)
 #define MOONCAKE_ERROR_SEGMENT_NOT_FOUND ((ErrorCode_t)-101)
 #define MOONCAKE_ERROR_SEGMENT_ALREADY_EXISTS ((ErrorCode_t)-102)
+#define MOONCAKE_ERROR_CLIENT_NOT_FOUND ((ErrorCode_t)-103)
 #define MOONCAKE_ERROR_NO_AVAILABLE_HANDLE ((ErrorCode_t)-200)
 #define MOONCAKE_ERROR_INVALID_VERSION ((ErrorCode_t)-300)
 #define MOONCAKE_ERROR_INVALID_KEY ((ErrorCode_t)-400)
 #define MOONCAKE_ERROR_WRITE_FAIL ((ErrorCode_t)-500)
 #define MOONCAKE_ERROR_INVALID_PARAMS ((ErrorCode_t)-600)
+#define MOONCAKE_ERROR_ILLEGAL_CLIENT ((ErrorCode_t)-601)
 #define MOONCAKE_ERROR_INVALID_WRITE ((ErrorCode_t)-700)
 #define MOONCAKE_ERROR_INVALID_READ ((ErrorCode_t)-701)
 #define MOONCAKE_ERROR_INVALID_REPLICA ((ErrorCode_t)-702)
@@ -29,6 +31,13 @@ typedef int32_t ErrorCode_t;
 #define MOONCAKE_ERROR_OBJECT_NOT_FOUND ((ErrorCode_t)-704)
 #define MOONCAKE_ERROR_OBJECT_ALREADY_EXISTS ((ErrorCode_t)-705)
 #define MOONCAKE_ERROR_OBJECT_HAS_LEASE ((ErrorCode_t)-706)
+#define MOONCAKE_ERROR_LEASE_EXPIRED ((ErrorCode_t)-707)
+#define MOONCAKE_ERROR_OBJECT_HAS_REPLICATION_TASK ((ErrorCode_t)-708)
+#define MOONCAKE_ERROR_OBJECT_NO_REPLICATION_TASK ((ErrorCode_t)-709)
+#define MOONCAKE_ERROR_REPLICA_NOT_FOUND ((ErrorCode_t)-710)
+#define MOONCAKE_ERROR_REPLICA_ALREADY_EXISTS ((ErrorCode_t)-711)
+#define MOONCAKE_ERROR_REPLICA_IS_GONE ((ErrorCode_t)-712)
+#define MOONCAKE_ERROR_REPLICA_NOT_IN_LOCAL_MEMORY ((ErrorCode_t)-713)
 #define MOONCAKE_ERROR_TRANSFER_FAIL ((ErrorCode_t)-800)
 #define MOONCAKE_ERROR_RPC_FAIL ((ErrorCode_t)-900)
 #define MOONCAKE_ERROR_ETCD_OPERATION_ERROR ((ErrorCode_t)-1000)
@@ -44,6 +53,18 @@ typedef int32_t ErrorCode_t;
 #define MOONCAKE_ERROR_FILE_INVALID_BUFFER ((ErrorCode_t)-1104)
 #define MOONCAKE_ERROR_FILE_LOCK_FAIL ((ErrorCode_t)-1105)
 #define MOONCAKE_ERROR_FILE_INVALID_HANDLE ((ErrorCode_t)-1106)
+#define MOONCAKE_ERROR_BUCKET_NOT_FOUND ((ErrorCode_t)-1200)
+#define MOONCAKE_ERROR_BUCKET_ALREADY_EXISTS ((ErrorCode_t)-1201)
+#define MOONCAKE_ERROR_KEYS_EXCEED_BUCKET_LIMIT ((ErrorCode_t)-1202)
+#define MOONCAKE_ERROR_KEYS_ULTRA_LIMIT ((ErrorCode_t)-1203)
+#define MOONCAKE_ERROR_UNABLE_OFFLOAD ((ErrorCode_t)-1300)
+#define MOONCAKE_ERROR_UNABLE_OFFLOADING ((ErrorCode_t)-1301)
+#define MOONCAKE_ERROR_TASK_NOT_FOUND ((ErrorCode_t)-1400)
+#define MOONCAKE_ERROR_TASK_PENDING_LIMIT_EXCEEDED ((ErrorCode_t)-1401)
+#define MOONCAKE_ERROR_SERIALIZE_UNSUPPORTED ((ErrorCode_t)-1500)
+#define MOONCAKE_ERROR_SERIALIZE_FAIL ((ErrorCode_t)-1501)
+#define MOONCAKE_ERROR_DESERIALIZE_FAIL ((ErrorCode_t)-1502)
+#define MOONCAKE_ERROR_PERSISTENT_FAIL ((ErrorCode_t)-1503)
 
 typedef struct {
     void *ptr = NULL;
@@ -68,7 +89,7 @@ ErrorCode_t mooncake_client_register_local_memory(
 
 ErrorCode_t mooncake_client_unregister_local_memory(client_t client, void *addr, bool update_metadata);
 
-ErrorCode_t mooncake_client_mount_segment(client_t client, size_t size);
+ErrorCode_t mooncake_client_mount_segment(client_t client, size_t size, const char *protocol);
 
 ErrorCode_t mooncake_client_get(client_t client, const char *key, Slice_t *slices, size_t slices_count);
 

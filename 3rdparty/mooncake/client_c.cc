@@ -1,6 +1,6 @@
 #include "client_c.h"
 
-#include "client.h"
+#include "client_service.h"
 #include "utils.h"
 
 using namespace mooncake;
@@ -64,9 +64,12 @@ ErrorCode_t mooncake_client_unregister_local_memory(client_t client, void *addr,
     }
 }
 
-ErrorCode_t mooncake_client_mount_segment(client_t client, size_t size) {
+ErrorCode_t mooncake_client_mount_segment(client_t client, size_t size, const char *protocol) {
     Client *native_client = (Client *)get_raw(client);
     if (native_client == nullptr) {
+        return MOONCAKE_ERROR_INVALID_PARAMS;
+    }
+    if (protocol == nullptr) {
         return MOONCAKE_ERROR_INVALID_PARAMS;
     }
     // Skip mount segment if global_segment_size is 0
@@ -78,7 +81,7 @@ ErrorCode_t mooncake_client_mount_segment(client_t client, size_t size) {
         LOG(ERROR) << "Failed to allocate segment memory";
         return 1;
     }
-    auto result = native_client->MountSegment(segment_ptr, size);
+    auto result = native_client->MountSegment(segment_ptr, size, protocol);
     if (result) {
         return MOONCAKE_ERROR_OK;
     } else {

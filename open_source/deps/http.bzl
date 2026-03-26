@@ -47,12 +47,44 @@ def http_deps():
     # mooncake
     http_archive(
         name = "mooncake",
-        urls = ["https://github.com/kvcache-ai/Mooncake/archive/refs/tags/v0.3.6.tar.gz"],
+        urls = ["https://github.com/kvcache-ai/Mooncake/archive/refs/tags/v0.3.10.tar.gz"],
         build_file = clean_dep("//3rdparty/mooncake:mooncake.BUILD"),
-        patches = ["//patches/mooncake:mooncake.patch"],
+        strip_prefix = "Mooncake-0.3.10",
+        sha256 = "0555a5256e6f4a4e97d990553d2aec931cd60e81dde93fb7ae3725fe69fb5306",
+        patches = [
+            clean_dep("//patches/mooncake:0001-fix-spinlock-gcc10-compat.patch"),
+            clean_dep("//patches/mooncake:0002-fix-missing-gflags-include.patch"),
+            clean_dep("//patches/mooncake:0003-fix-linux-memfd-header-compat.patch"),
+        ],
         patch_args = ["-p1"],
-        strip_prefix = "Mooncake-0.3.6",
-        sha256 = "97d8c17dcc0d588d99361e7e2d7a8b994117038ccc5e08f00f39bdda90379ef3",
+    )
+
+    # msgpack-cxx (header-only, required by mooncake-store)
+    http_archive(
+        name = "msgpack_cxx",
+        urls = ["https://github.com/msgpack/msgpack-c/releases/download/cpp-3.3.0/msgpack-3.3.0.tar.gz"],
+        build_file = clean_dep("//3rdparty/msgpack:msgpack.BUILD"),
+        strip_prefix = "msgpack-3.3.0",
+        sha256 = "6e114d12a5ddb8cb11f669f83f32246e484a8addd0ce93f274996f1941c1f07b",
+    )
+
+    # xxhash (header-only, required by mooncake-store oplog_manager)
+    http_archive(
+        name = "xxhash",
+        urls = ["https://github.com/Cyan4973/xxHash/archive/refs/tags/v0.8.2.tar.gz"],
+        build_file = clean_dep("//3rdparty/xxhash:xxhash.BUILD"),
+        strip_prefix = "xxHash-0.8.2",
+        sha256 = "baee0c6afd4f03165de7a4e67988d16f0f2b257b51d0e3cb91909302a26a79c4",
+    )
+
+    # zstd: named "zstd_lib" to avoid conflict with Mooncake's internal 3rdparty/zstd dir.
+    # Using @zstd_lib//:zstd in mooncake.BUILD instead of @zstd to prevent label resolution issues.
+    http_archive(
+        name = "zstd_lib",
+        urls = ["https://github.com/facebook/zstd/releases/download/v1.5.5/zstd-1.5.5.tar.gz"],
+        build_file = clean_dep("//3rdparty/zstd:zstd.BUILD"),
+        strip_prefix = "zstd-1.5.5",
+        sha256 = "9c4396cc829cfae319a6e2615202e82aad41372073482fce286fac78646d3ee4",
     )
 
     http_archive(

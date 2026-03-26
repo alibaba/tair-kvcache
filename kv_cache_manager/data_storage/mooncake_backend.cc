@@ -123,12 +123,14 @@ std::vector<bool> MooncakeBackend::Exist(const std::vector<DataStorageUri> &stor
     for (int i = 0; i < storage_uris.size(); i++) {
         MooncakeDataStorageItem item = MooncakeDataStorageItem::FromUri(storage_uris[i]);
         ErrorCode_t err = mooncake_client_query(client_, item.key.c_str());
-        // TODO 失败和不存在要区分下呀
-        if (err != MOONCAKE_ERROR_OK) {
-            KVCM_LOG_WARN("mooncake lookup item failed, key: [%s], error: [%d]", item.key.c_str(), err);
+        if (err == MOONCAKE_ERROR_OK) {
+            result.push_back(true);
+        } else if (err == MOONCAKE_ERROR_OBJECT_NOT_FOUND) {
+            KVCM_LOG_WARN("mooncake lookup item not found, key: [%s]", item.key.c_str());
             result.push_back(false);
         } else {
-            result.push_back(true);
+            KVCM_LOG_WARN("mooncake lookup item failed, key: [%s], error: [%d]", item.key.c_str(), err);
+            result.push_back(false);
         }
     }
     return result;

@@ -86,6 +86,12 @@ mooncake_copts = [
     "-Wall",
     "-Wextra",
     "-Wno-unused-parameter",
+    "-Wno-narrowing",            # Suppress narrowing conversions warning -> error
+    "-Wno-parentheses",          # Mooncake src: && within || without explicit parentheses
+    "-Wno-array-parameter",      # Not recognized on GCC < 11, suppress gracefully
+    "-Wno-error=parentheses",    # Don't treat this as error even with global -Werror
+    "-Wno-reorder",              # Warning for member initialization out of order
+    "-Wno-error=reorder",        # Don't treat reorder warning as error
     "-fcoroutines",
     "-fPIC",
     "-DCONFIG_ERDMA",
@@ -134,6 +140,23 @@ mooncake_copts = [
     ":use_lru_master": ["-DUSE_LRU_MASTER", "-DLRU_MAX_CAPACITY=100"],  # option for using LRU in master service
     "//conditions:default": [],
 })
+
+genrule(
+    name = "mooncake_version_h",
+    outs = ["mooncake-store/include/version.h"],
+    cmd = """cat > $@ << 'EOF'
+#pragma once
+#include <string>
+namespace mooncake {
+constexpr const char* MOONCAKE_STORE_VERSION = "2.0.0";
+inline const std::string& GetMooncakeStoreVersion() {
+    static const std::string version(MOONCAKE_STORE_VERSION);
+    return version;
+}
+}  // namespace mooncake
+EOF
+""",
+)
 
 cc_library(
     name = "mooncake_transfer_engine",
@@ -201,14 +224,23 @@ cc_library(
             "mooncake-store/src/**/*.cpp",
             "mooncake-common/src/default_config.cpp",
         ],
-        exclude = ["mooncake-store/src/hf3fs/*.cpp"],
-    ),  # exclude hf3fs
+        exclude = [
+            "mooncake-store/src/hf3fs/*.cpp",       
+            "mooncake-store/src/utils/s3_helper.cpp", 
+            "mooncake-store/src/master.cpp",          
+            "mooncake-store/src/real_client_main.cpp",
+        ],
+    ) + [":mooncake_version_h"],  
     hdrs = glob(
         [
             "mooncake-store/include/**/*.h",
+            "mooncake-store/include/**/*.hpp",
             "mooncake-common/include/default_config.h",
         ],
-        exclude = ["mooncake-store/src/hf3fs/*.h"],
+        exclude = [
+            "mooncake-store/src/hf3fs/*.h",
+            "mooncake-store/include/utils/s3_helper.h", 
+        ],
     ),
     includes = [
         "mooncake-common/include",
@@ -217,6 +249,8 @@ cc_library(
         "mooncake-store/include/utils",
         "mooncake-store/include/cachelib_memory_allocator/include",
         "mooncake-store/include/cachelib_memory_allocator/fake_include",
+        "mooncake-store/include/offset_allocator",
+        "mooncake-store/include/serialize",
     ],
     deps = [
         ":mooncake_transfer_engine",
@@ -226,6 +260,10 @@ cc_library(
         "@boost//:date_time",
         "@boost//:property_tree",
         "@yaml-cpp//:yaml_cpp",
+        "@msgpack_cxx//:msgpack",
+        "@xxhash//:xxhash",
+        "@zstd_lib//:zstd",
+        "@com_github_gflags_gflags//:gflags",
     ],
     copts = mooncake_copts,
     visibility = ["//visibility:public"],
