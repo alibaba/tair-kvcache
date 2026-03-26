@@ -1,6 +1,7 @@
 #include "kv_cache_manager/manager/cache_reclaimer.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <chrono>
 #include <cinttypes>
@@ -31,6 +32,7 @@
 #include "kv_cache_manager/config/instance_group_quota.h"
 #include "kv_cache_manager/config/instance_info.h"
 #include "kv_cache_manager/config/registry_manager.h"
+#include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/event/spec_events/cache_reclaim_event.h"
 #include "kv_cache_manager/manager/cache_location.h"
@@ -115,6 +117,101 @@ inline std::string CacheReclaimer::GenTraceID() {
     ss << kTraceIDPrefix << std::right << std::setfill('0') << std::setw(16) << std::hex << std::noshowbase << rand_val;
 
     return ss.str();
+}
+
+struct CacheReclaimer::GroupUsageData {
+    std::size_t grp_used_key_cnt_;
+    std::size_t grp_max_key_cnt_;
+    std::size_t grp_used_byte_sz_;
+
+    GroupUsageData();
+    ~GroupUsageData() = default;
+
+    [[nodiscard]] std::size_t GetGroupUsageByType(const DataStorageType &type) const noexcept;
+    void AddGroupUsageByType(const DataStorageType &type, std::size_t value) noexcept;
+
+private:
+    std::array<std::size_t, static_cast<std::size_t>(DataStorageType::COUNT)> grp_storage_usage_array_;
+};
+
+CacheReclaimer::GroupUsageData::GroupUsageData()
+    : grp_used_key_cnt_(0), grp_max_key_cnt_(0), grp_used_byte_sz_(0), grp_storage_usage_array_{0, 0, 0, 0, 0, 0} {}
+
+std::size_t CacheReclaimer::GroupUsageData::GetGroupUsageByType(const DataStorageType &type) const noexcept {
+    try {
+        return grp_storage_usage_array_.at(ToIndex(MapType(type)));
+    } catch (const std::out_of_range &e) {
+        KVCM_LOG_WARN("data storage type out of range, msg: [%s], array size: [%zu], type as index: [%zu]",
+                      e.what(),
+                      grp_storage_usage_array_.size(),
+                      ToIndex(MapType(type)));
+        return false;
+    }
+}
+
+void CacheReclaimer::GroupUsageData::AddGroupUsageByType(const DataStorageType &type,
+                                                         const std::size_t value) noexcept {
+    try {
+        grp_storage_usage_array_.at(ToIndex(MapType(type))) += value;
+    } catch (const std::out_of_range &e) {
+        KVCM_LOG_WARN("data storage type out of range, msg: [%s], array size: [%zu], type as index: [%zu]",
+                      e.what(),
+                      grp_storage_usage_array_.size(),
+                      ToIndex(MapType(type)));
+    }
+}
+
+CacheReclaimer::WaterLevelExceed::WaterLevelExceed()
+    : water_level_exceed_array_{false, /* DATA_STORAGE_TYPE_UNKNOWN used as ALL */
+                                false, /* DATA_STORAGE_TYPE_HF3FS */
+                                false, /* DATA_STORAGE_TYPE_MOONCAKE */
+                                false, /* DATA_STORAGE_TYPE_TAIR_MEMPOOL */
+                                false, /* DATA_STORAGE_TYPE_NFS */
+                                false  /* DATA_STORAGE_TYPE_VCNS_HF3FS not used */} {}
+
+bool CacheReclaimer::WaterLevelExceed::GetWaterLevelExceedByType(const DataStorageType &type) const noexcept {
+    try {
+        return water_level_exceed_array_.at(ToIndex(MapType(type)));
+    } catch (const std::out_of_range &e) {
+        KVCM_LOG_WARN("data storage type out of range, msg: [%s], array size: [%zu], type as index: [%zu]",
+                      e.what(),
+                      water_level_exceed_array_.size(),
+                      ToIndex(MapType(type)));
+        return false;
+    }
+}
+
+bool CacheReclaimer::WaterLevelExceed::AnyOfWaterLevelExceed() const noexcept {
+    if (std::any_of(water_level_exceed_array_.cbegin(), water_level_exceed_array_.cend(), [](const bool v) -> bool {
+            return v;
+        })) {
+        return true;
+    }
+    return false;
+}
+
+bool CacheReclaimer::WaterLevelExceed::AnyButTotalWaterLevelExceed() const noexcept {
+    for (std::size_t i = 1 /* skip DATA_STORAGE_TYPE_UNKNOWN */; i != water_level_exceed_array_.size(); ++i) {
+        if (i == static_cast<std::size_t>(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS)) {
+            continue;
+        }
+        if (water_level_exceed_array_.at(i)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void CacheReclaimer::WaterLevelExceed::SetWaterLevelExceedByType(const DataStorageType &type,
+                                                                 const bool value) noexcept {
+    try {
+        water_level_exceed_array_.at(ToIndex(MapType(type))) = value;
+    } catch (const std::out_of_range &e) {
+        KVCM_LOG_WARN("data storage type out of range, msg: [%s], array size: [%zu], type as index: [%zu]",
+                      e.what(),
+                      water_level_exceed_array_.size(),
+                      ToIndex(MapType(type)));
+    }
 }
 
 CacheReclaimer::CacheReclaimer(const std::size_t sampling_size_total,
@@ -309,7 +406,7 @@ bool CacheReclaimer::IsTriggerReclaiming(const RequestContext *request_context,
                                          const InstanceGroupQuota &instance_group_quota,
                                          const std::shared_ptr<CacheReclaimStrategy> &reclaim_strategy,
                                          const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos,
-                                         std::array<bool, 5> &out_water_level_exceed_results) noexcept {
+                                         WaterLevelExceed &out_water_level_exceed) noexcept {
     if (!IsRunning() || IsPaused()) {
         // fast exiting in the middle of one job round
         return false;
@@ -325,10 +422,8 @@ bool CacheReclaimer::IsTriggerReclaiming(const RequestContext *request_context,
     //       1. the entire instance group usage and capacity quota
     //       2. storage type usage and capacity quota for this group
 
-    auto get_trigger_result = [&request_context, &ins_gr, &out_water_level_exceed_results]() -> bool {
-        if (std::any_of(out_water_level_exceed_results.cbegin(),
-                        out_water_level_exceed_results.cend(),
-                        [](const bool v) -> bool { return v; })) {
+    auto get_trigger_result = [&request_context, &ins_gr, &out_water_level_exceed]() -> bool {
+        if (out_water_level_exceed.AnyOfWaterLevelExceed()) {
             LOG_WITH_GR(DEBUG, "instance group trigger reclaiming");
             return true;
         }
@@ -350,36 +445,32 @@ bool CacheReclaimer::IsTriggerReclaiming(const RequestContext *request_context,
             continue;
         }
 
-        try {
-            if (storage_quota.capacity() <= 0) {
-                LOG_WITH_GR(DEBUG,
-                            "instance group storage type [%d] capacity quota used percentage [inf] "
-                            "has reached or exceeded the threshold percentage [%f]",
-                            static_cast<std::uint8_t>(type),
-                            threshold_used_percentage);
-                out_water_level_exceed_results.at(static_cast<std::uint8_t>(type)) = true;
-                continue;
-            }
-            if (const double storage_type_wl =
-                    static_cast<double>(data.grp_storage_usage_array_.at(static_cast<std::uint8_t>(type))) /
-                    static_cast<double>(storage_quota.capacity());
-                storage_type_wl + kEpsilon > threshold_used_percentage) {
-                LOG_WITH_GR(DEBUG,
-                            "instance group storage type [%d] capacity quota used percentage [%f] "
-                            "has reached or exceeded the threshold percentage [%f]",
-                            static_cast<std::uint8_t>(type),
-                            storage_type_wl,
-                            threshold_used_percentage);
-                out_water_level_exceed_results.at(static_cast<std::uint8_t>(type)) = true;
-            }
-        } catch (const std::out_of_range &e) {
-            LOG_WITH_GR(WARN, "data storage type out of range: %d", static_cast<std::uint8_t>(type));
+        if (storage_quota.capacity() <= 0) {
+            LOG_WITH_GR(DEBUG,
+                        "instance group storage type [%d] capacity quota used percentage [inf] "
+                        "has reached or exceeded the threshold percentage [%f]",
+                        static_cast<std::uint8_t>(type),
+                        threshold_used_percentage);
+            out_water_level_exceed.SetWaterLevelExceedByType(type, true);
+            continue;
+        }
+        if (const double storage_type_wl =
+                static_cast<double>(data.GetGroupUsageByType(type)) / static_cast<double>(storage_quota.capacity());
+            storage_type_wl + kEpsilon > threshold_used_percentage) {
+            LOG_WITH_GR(DEBUG,
+                        "instance group storage type [%d] capacity quota used percentage [%f] "
+                        "has reached or exceeded the threshold percentage [%f]",
+                        static_cast<std::uint8_t>(type),
+                        storage_type_wl,
+                        threshold_used_percentage);
+            out_water_level_exceed.SetWaterLevelExceedByType(type, true);
         }
     }
 
     // 2.2. result for the entire instance group
     if (data.grp_used_key_cnt_ == 0 || data.grp_used_byte_sz_ == 0) {
-        out_water_level_exceed_results[0] = false;
+        // DATA_STORAGE_TYPE_UNKNOWN be the entire group
+        out_water_level_exceed.SetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, false);
         return get_trigger_result();
     }
 
@@ -390,7 +481,8 @@ bool CacheReclaimer::IsTriggerReclaiming(const RequestContext *request_context,
                     "instance group capacity quota used percentage [inf] "
                     "has reached or exceeded the threshold percentage [%f]",
                     threshold_used_percentage);
-        out_water_level_exceed_results[0] = true;
+        // DATA_STORAGE_TYPE_UNKNOWN be the entire group
+        out_water_level_exceed.SetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, true);
         return get_trigger_result();
     }
     if (const double group_used_percentage =
@@ -401,7 +493,8 @@ bool CacheReclaimer::IsTriggerReclaiming(const RequestContext *request_context,
                     "has reached or exceeded the threshold percentage [%f]",
                     group_used_percentage,
                     threshold_used_percentage);
-        out_water_level_exceed_results[0] = true;
+        // DATA_STORAGE_TYPE_UNKNOWN be the entire group
+        out_water_level_exceed.SetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, true);
         return get_trigger_result();
     }
 
@@ -411,7 +504,8 @@ bool CacheReclaimer::IsTriggerReclaiming(const RequestContext *request_context,
                     "instance group total key count used percentage [inf] "
                     "has reached or exceeded the threshold percentage [%f]",
                     threshold_used_percentage);
-        out_water_level_exceed_results[0] = true;
+        // DATA_STORAGE_TYPE_UNKNOWN be the entire group
+        out_water_level_exceed.SetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, true);
         return get_trigger_result();
     }
     if (const double group_used_percentage =
@@ -422,18 +516,20 @@ bool CacheReclaimer::IsTriggerReclaiming(const RequestContext *request_context,
                     "has reached or exceeded the threshold percentage [%f]",
                     group_used_percentage,
                     threshold_used_percentage);
-        out_water_level_exceed_results[0] = true;
+        // DATA_STORAGE_TYPE_UNKNOWN be the entire group
+        out_water_level_exceed.SetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, true);
         return get_trigger_result();
     }
 
     // 2.2.3. instance group do not trigger reclaiming
-    out_water_level_exceed_results[0] = false;
+    // DATA_STORAGE_TYPE_UNKNOWN be the entire group
+    out_water_level_exceed.SetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, false);
     return get_trigger_result();
 }
 
 void CacheReclaimer::ReclaimByLRU(const std::shared_ptr<RequestContext> &request_context,
                                   const InstanceInfoConstPtr &instance_info,
-                                  const std::array<bool, 5> &water_level_exceed_results,
+                                  const WaterLevelExceed &water_level_exceed,
                                   const std::int32_t delay_before_delete_ms) noexcept {
     if (!IsRunning() || IsPaused()) {
         // fast exiting in the middle of one job round
@@ -486,11 +582,8 @@ void CacheReclaimer::ReclaimByLRU(const std::shared_ptr<RequestContext> &request
     // only the cache locations with the "CLS_SERVING" status are
     // submitted to be deleted
     const std::int64_t begin_tp_filter = TimestampUtil::GetSteadyTimeUs();
-    if (!FilterLocID(request_context.get(),
-                     instance_info,
-                     request.block_keys,
-                     water_level_exceed_results,
-                     request.location_ids)) {
+    if (!FilterLocID(
+            request_context.get(), instance_info, request.block_keys, water_level_exceed, request.location_ids)) {
         LOG_WITH_ID(DEBUG, "filter location ID failed");
         return;
     }
@@ -508,7 +601,7 @@ void CacheReclaimer::ReclaimByLRU(const std::shared_ptr<RequestContext> &request
 
 void CacheReclaimer::ReclaimByLFU(const std::shared_ptr<RequestContext> &request_context,
                                   const InstanceInfoConstPtr &instance_info,
-                                  const std::array<bool, 5> &water_level_exceed_results,
+                                  const WaterLevelExceed &water_level_exceed,
                                   const std::int32_t delay_before_delete_ms) noexcept {
     if (!IsRunning() || IsPaused()) {
         // fast exiting in the middle of one job round
@@ -517,12 +610,12 @@ void CacheReclaimer::ReclaimByLFU(const std::shared_ptr<RequestContext> &request
 
     // TODO: impl LFU policy
     LOG_WITH_TRACE(WARN, "LFU reclaim policy not supported yet; fall back to LRU policy");
-    ReclaimByLRU(request_context, instance_info, water_level_exceed_results, delay_before_delete_ms);
+    ReclaimByLRU(request_context, instance_info, water_level_exceed, delay_before_delete_ms);
 }
 
 void CacheReclaimer::ReclaimByTTL(const std::shared_ptr<RequestContext> &request_context,
                                   const InstanceInfoConstPtr &instance_info,
-                                  const std::array<bool, 5> &water_level_exceed_results,
+                                  const WaterLevelExceed &water_level_exceed,
                                   const std::int32_t delay_before_delete_ms) noexcept {
     if (!IsRunning() || IsPaused()) {
         // fast exiting in the middle of one job round
@@ -531,7 +624,7 @@ void CacheReclaimer::ReclaimByTTL(const std::shared_ptr<RequestContext> &request
 
     // TODO: impl TTL policy
     LOG_WITH_TRACE(WARN, "TTL reclaim policy not supported yet; fall back to LRU policy");
-    ReclaimByLRU(request_context, instance_info, water_level_exceed_results, delay_before_delete_ms);
+    ReclaimByLRU(request_context, instance_info, water_level_exceed, delay_before_delete_ms);
 }
 
 void CacheReclaimer::ReclaimCron() noexcept {
@@ -786,7 +879,7 @@ bool CacheReclaimer::MakeBatchByLRU(const RequestContext *request_context,
 bool CacheReclaimer::FilterLocID(RequestContext *request_context,
                                  const std::shared_ptr<const InstanceInfo> &instance_info,
                                  const std::vector<std::int64_t> &batch,
-                                 const std::array<bool, 5> &water_level_exceed_results,
+                                 const WaterLevelExceed &water_level_exceed,
                                  std::vector<std::vector<std::string>> &out_loc_ids) const noexcept {
     const std::string &ins_id = instance_info->instance_id();
     const std::string &ins_gr = instance_info->instance_group_name();
@@ -815,11 +908,6 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
         return false;
     }
 
-    // detect if any storage type water level exceeded
-    const bool any_st_wl_exceeded = std::any_of(water_level_exceed_results.cbegin() + 1,
-                                                water_level_exceed_results.cend(),
-                                                [](const bool v) -> bool { return v; });
-
     // inspect the cache location status of each block and get the
     // filtered location ID vecs
     out_loc_ids.reserve(loc_maps.size());
@@ -828,22 +916,13 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
         for (const auto &[_, loc] : loc_map) {
             // pick out only the cache location with "serving" status
             if (loc.status() == CacheLocationStatus::CLS_SERVING) {
-                if (any_st_wl_exceeded) {
+                if (water_level_exceed.AnyButTotalWaterLevelExceed()) {
                     // some storage type water level exceeded; only
                     // collect the location with matched type but
                     // fairness is ignored
                     // TODO (rui): implement the fair eviction
-                    auto type = loc.type();
-                    if (type == DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS) {
-                        // treat vcns_hf3fs as hf3fs
-                        type = DataStorageType::DATA_STORAGE_TYPE_HF3FS;
-                    }
-                    if (const auto t = static_cast<std::uint8_t>(type); t > 0 && t < 5) {
-                        if (water_level_exceed_results[t]) {
-                            loc_id_vec.emplace_back(loc.id());
-                        }
-                    } else {
-                        LOG_WITH_ID(WARN, "invalid storage type: [%d]", t);
+                    if (water_level_exceed.GetWaterLevelExceedByType(loc.type())) {
+                        loc_id_vec.emplace_back(loc.id());
                     }
                 } else {
                     // there's no storage type water level exceeded
@@ -923,26 +1002,16 @@ CacheReclaimer::GroupUsageData CacheReclaimer::GetGroupUsageData(
         meta_indexer->PersistMetaData();
         const std::size_t ins_used_key_cnt = meta_indexer->GetKeyCount();
         const std::size_t ins_max_key_cnt = meta_indexer->GetMaxKeyCount();
-
-        // calc the total usage of this group
-        std::size_t byte_size_per_key = 0;
-        for (auto &location_spec_info : instance_info->location_spec_infos()) {
-            byte_size_per_key += location_spec_info.size();
-        }
-        const std::size_t ins_used_byte_size = byte_size_per_key * ins_used_key_cnt;
+        const std::size_t ins_used_byte_size = meta_indexer->GetStorageUsage();
 
         data.grp_used_key_cnt_ += ins_used_key_cnt;
         data.grp_max_key_cnt_ += ins_max_key_cnt;
         data.grp_used_byte_sz_ += ins_used_byte_size;
 
-        // calc the usage size of each storage type of this group
-        auto calc_sz = [&request_context, &ins_gr, &ins_id, &meta_indexer, &data](const DataStorageType &type) -> void {
-            try {
-                const std::uint64_t sz = meta_indexer->storage_usage_array_.at(static_cast<std::uint8_t>(type)).load();
-                data.grp_storage_usage_array_.at(static_cast<std::uint8_t>(type)) += sz;
-            } catch (const std::out_of_range &e) {
-                LOG_WITH_ID(WARN, "data storage type out of range: %d", static_cast<std::uint8_t>(type));
-            }
+        // calc the usage size of each storage type of this instance
+        auto calc_sz = [&meta_indexer, &data](const DataStorageType &type) -> void {
+            const std::uint64_t sz = meta_indexer->GetStorageUsageByType(type);
+            data.AddGroupUsageByType(type, sz);
         };
         calc_sz(DataStorageType::DATA_STORAGE_TYPE_HF3FS);
         calc_sz(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE);
@@ -1034,8 +1103,7 @@ bool CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &re
     }
 
     // do we need to reclaim the storage for this instance group?
-    // <total, hf3fs, mooncake, pace, nfs>
-    std::array<bool, 5> water_level_exceed_results{false, false, false, false, false};
+    WaterLevelExceed water_level_exceed;
     {
         const std::int64_t quota_begin_tp = TimestampUtil::GetSteadyTimeUs();
         if (!IsTriggerReclaiming(request_context.get(),
@@ -1043,7 +1111,7 @@ bool CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &re
                                  instance_group->quota(), // TODO (rui): validate the quota is valid
                                  reclaim_strategy,
                                  instance_infos,
-                                 water_level_exceed_results)) {
+                                 water_level_exceed)) {
             METRICS_(cache_reclaimer, reclaim_quota_duration_us) =
                 static_cast<double>(TimestampUtil::GetSteadyTimeUs() - quota_begin_tp);
             return false;
@@ -1058,7 +1126,7 @@ bool CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &re
         LOG_WITH_GR(DEBUG, "start to run the LRU reclaim policy");
         for (const auto &instance_info : instance_infos) {
             const std::int64_t begin_tp = TimestampUtil::GetSteadyTimeUs();
-            ReclaimByLRU(request_context, instance_info, water_level_exceed_results, delay_before_delete_ms);
+            ReclaimByLRU(request_context, instance_info, water_level_exceed, delay_before_delete_ms);
             METRICS_(cache_reclaimer, reclaim_job_duration_us) =
                 static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp);
         }
@@ -1068,7 +1136,7 @@ bool CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &re
         LOG_WITH_GR(DEBUG, "start to run the LFU reclaim policy");
         for (const auto &instance_info : instance_infos) {
             const std::int64_t begin_tp = TimestampUtil::GetSteadyTimeUs();
-            ReclaimByLFU(request_context, instance_info, water_level_exceed_results, delay_before_delete_ms);
+            ReclaimByLFU(request_context, instance_info, water_level_exceed, delay_before_delete_ms);
             METRICS_(cache_reclaimer, reclaim_job_duration_us) =
                 static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp);
         }
@@ -1078,7 +1146,7 @@ bool CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &re
         LOG_WITH_GR(DEBUG, "start to run the TTL reclaim policy");
         for (const auto &instance_info : instance_infos) {
             const std::int64_t begin_tp = TimestampUtil::GetSteadyTimeUs();
-            ReclaimByTTL(request_context, instance_info, water_level_exceed_results, delay_before_delete_ms);
+            ReclaimByTTL(request_context, instance_info, water_level_exceed, delay_before_delete_ms);
             METRICS_(cache_reclaimer, reclaim_job_duration_us) =
                 static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp);
         }
@@ -1091,7 +1159,7 @@ bool CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &re
     default:
         for (const auto &instance_info : instance_infos) {
             const std::int64_t begin_tp = TimestampUtil::GetSteadyTimeUs();
-            ReclaimByLRU(request_context, instance_info, water_level_exceed_results, delay_before_delete_ms);
+            ReclaimByLRU(request_context, instance_info, water_level_exceed, delay_before_delete_ms);
             METRICS_(cache_reclaimer, reclaim_job_duration_us) =
                 static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp);
         }

@@ -59,5 +59,6 @@ private:
     std::string path_;
     ConcurrentHashMap<KeyType, FieldMap> table_;
     bool enable_persistence_ = false;
+    KeyType metadata_key_ = 0;
 };
 } // namespace kv_cache_manager

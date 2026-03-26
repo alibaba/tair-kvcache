@@ -1,7 +1,12 @@
 #include "kv_cache_manager/meta/meta_indexer.h"
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <set>
+#include <sstream>
+#include <string>
+#include <vector>
 
 #include "kv_cache_manager/common/common.h"
 #include "kv_cache_manager/common/error_code.h"
@@ -10,6 +15,7 @@
 #include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/config/meta_indexer_config.h"
+#include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/meta/meta_search_cache.h"
 #include "kv_cache_manager/meta/meta_storage_backend_factory.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
@@ -49,6 +55,8 @@ private:
     MetaIndexer &indexer_;
     std::vector<int32_t> shard_indexs_;
 };
+
+MetaIndexer::MetaIndexer() : storage_usage_array_{0, 0, 0, 0, 0, 0} {}
 
 ErrorCode MetaIndexer::Init(const std::string &instance_id, const std::shared_ptr<MetaIndexerConfig> &config) noexcept {
     if (!config || !config->GetMetaStorageBackendConfig()) {
@@ -95,6 +103,13 @@ ErrorCode MetaIndexer::Init(const std::string &instance_id, const std::shared_pt
             KVCM_LOG_ERROR("instance[%s] init search cache failed, ec[%d]", instance_id_.c_str(), ec);
             return ec;
         }
+    }
+
+    // storage_usage_array_.fill(0) won't work here due to the deleted
+    // operator= of the std::atomic type
+    // explicitly assign 0 to all elements in the array instead
+    for (auto &v : storage_usage_array_) {
+        v.store(0);
     }
     ec = RecoverMetaData();
     if (ec != EC_OK && ec != EC_NOENT) {
@@ -552,6 +567,66 @@ size_t MetaIndexer::GetCacheUsage() const noexcept {
     return 0;
 }
 
+std::uint64_t MetaIndexer::GetStorageUsage() const noexcept {
+    std::uint64_t storage_usage = 0;
+    for (const auto &v : storage_usage_array_) {
+        storage_usage += v.load();
+    }
+    return storage_usage;
+}
+
+std::uint64_t MetaIndexer::GetStorageUsageByType(const DataStorageType &type) const noexcept {
+    try {
+        return storage_usage_array_.at(ToIndex(MapType(type))).load();
+    } catch (const std::out_of_range &e) {
+        KVCM_LOG_WARN("data storage type out of range, msg: [%s], array size: [%zu], type as index: [%zu]",
+                      e.what(),
+                      storage_usage_array_.size(),
+                      ToIndex(MapType(type)));
+        return 0;
+    }
+}
+
+void MetaIndexer::SetStorageUsageByType(const DataStorageType &type, const std::uint64_t value) noexcept {
+    try {
+        storage_usage_array_.at(ToIndex(MapType(type))).store(value);
+    } catch (const std::out_of_range &e) {
+        KVCM_LOG_WARN("data storage type out of range, msg: [%s], array size: [%zu], type as index: [%zu]",
+                      e.what(),
+                      storage_usage_array_.size(),
+                      ToIndex(MapType(type)));
+    }
+}
+
+std::uint64_t MetaIndexer::AddStorageUsageByType(const DataStorageType &type, const std::uint64_t value) noexcept {
+    try {
+        return storage_usage_array_.at(ToIndex(MapType(type))).fetch_add(value);
+    } catch (const std::out_of_range &e) {
+        KVCM_LOG_WARN("data storage type out of range, msg: [%s], array size: [%zu], type as index: [%zu]",
+                      e.what(),
+                      storage_usage_array_.size(),
+                      ToIndex(MapType(type)));
+        return 0;
+    }
+}
+
+std::uint64_t MetaIndexer::SubStorageUsageByType(const DataStorageType &type, const std::uint64_t value) noexcept {
+    try {
+        auto &ref = storage_usage_array_.at(ToIndex(MapType(type)));
+        std::uint64_t expected = ref.load(), desired = 0;
+        do {
+            desired = expected < value ? 0 : expected - value;
+        } while (!ref.compare_exchange_weak(expected, desired));
+        return desired;
+    } catch (const std::out_of_range &e) {
+        KVCM_LOG_WARN("data storage type out of range, msg: [%s], array size: [%zu], type as index: [%zu]",
+                      e.what(),
+                      storage_usage_array_.size(),
+                      ToIndex(MapType(type)));
+        return 0;
+    }
+}
+
 // Combining batch size and lock granularity size to assemble batch data
 void MetaIndexer::MakeBatches(const KeyVector &keys,
                               PropertyMapVector &properties,
@@ -619,6 +694,25 @@ ErrorCode MetaIndexer::RecoverMetaData() noexcept {
         return EC_ERROR;
     }
     key_count_ = key_count;
+
+    // deserialize storage_usage_array_
+    if (const auto it = metadata_map.find(METADATA_PROPERTY_STORAGE_USAGE_ARRAY); it != metadata_map.end()) {
+        const std::string storage_usage_array_str = it->second;
+        KVCM_LOG_DEBUG("deserializing storage usage data: [%s]", storage_usage_array_str.c_str());
+        std::stringstream ss(storage_usage_array_str);
+        std::string item;
+        std::size_t index = 0;
+        while (std::getline(ss, item, ',') && index != storage_usage_array_.size()) {
+            try {
+                storage_usage_array_[index].store(std::stoull(item));
+            } catch (...) {
+                KVCM_LOG_ERROR("interpret [%s] to unsigned integer failed", item.c_str());
+                return EC_ERROR;
+            }
+            ++index;
+        }
+    }
+
     return EC_OK;
 }
 
@@ -628,6 +722,17 @@ void MetaIndexer::PersistMetaData() noexcept {
     if (current_time >= last_persist_metadata_time_ + persist_metadata_interval_time_ms_) {
         std::map<std::string, std::string> metadata_map;
         metadata_map[METADATA_PROPERTY_KEY_COUNT] = std::to_string(key_count_);
+
+        // serialize storage_usage_array_
+        std::string storage_usage_array_str;
+        for (size_t i = 0; i < storage_usage_array_.size(); ++i) {
+            if (i > 0) {
+                storage_usage_array_str += ",";
+            }
+            storage_usage_array_str += std::to_string(storage_usage_array_[i].load());
+        }
+        metadata_map[METADATA_PROPERTY_STORAGE_USAGE_ARRAY] = storage_usage_array_str;
+
         auto ec = storage_->PutMetaData(metadata_map);
         if (ec != EC_OK) {
             KVCM_LOG_ERROR("meta indexer persist metadata failed, ec[%d]", ec);

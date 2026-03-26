@@ -601,7 +601,7 @@ TEST_F(DataStorageSelectorTest, TestSelectCacheWriteStorageBackendQuota01) {
     instance_group_g->cache_config_->set_cache_prefer_strategy(CachePreferStrategy::CPS_PREFER_3FS);
 
     {
-        meta_indexer_g->storage_usage_array_[static_cast<std::uint8_t>(DataStorageType::DATA_STORAGE_TYPE_HF3FS)] = 512;
+        meta_indexer_g->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 512);
 
         InstanceGroupQuota quota;
         quota.set_capacity(1025); // quota_capacity > group_used_size

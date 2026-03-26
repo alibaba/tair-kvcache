@@ -14,6 +14,7 @@ static const std::string PROPERTY_HIT_COUNT = "__hit_count__";
 static const std::string PROPERTY_LRU_TIME = "__lru_time__";
 
 static const std::string METADATA_PROPERTY_KEY_COUNT = "__key_count__";
+static const std::string METADATA_PROPERTY_STORAGE_USAGE_ARRAY = "__storage_usage_array__";
 
 static const std::string SCAN_BASE_CURSOR = "0";
 

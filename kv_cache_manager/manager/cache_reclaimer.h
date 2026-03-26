@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
+#include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
 namespace kv_cache_manager {
@@ -324,6 +325,20 @@ private:
     };
     std::forward_list<DeleteHandler> delete_handlers_;
 
+    class WaterLevelExceed {
+    public:
+        WaterLevelExceed();
+        ~WaterLevelExceed() = default;
+
+        [[nodiscard]] bool GetWaterLevelExceedByType(const DataStorageType &type) const noexcept;
+        [[nodiscard]] bool AnyOfWaterLevelExceed() const noexcept;
+        [[nodiscard]] bool AnyButTotalWaterLevelExceed() const noexcept;
+        void SetWaterLevelExceedByType(const DataStorageType &type, bool value) noexcept;
+
+    private:
+        std::array<bool, static_cast<std::size_t>(DataStorageType::COUNT)> water_level_exceed_array_;
+    };
+
     /**
      * @brief Determine if a reclamation should be triggered for an
      * instance group
@@ -338,7 +353,7 @@ private:
      * @param instance_group_quota Quota info for the instance group
      * @param reclaim_strategy Strategy to use for reclamation decisions
      * @param instance_infos Vector of instance information
-     * @param out_water_level_exceed_results the detailed trigger result
+     * @param out_water_level_exceed the detailed trigger result
      * @return true if reclamation should be triggered
      * @return false if reclamation should not be triggered
      */
@@ -347,7 +362,7 @@ private:
                                            const InstanceGroupQuota &instance_group_quota,
                                            const std::shared_ptr<CacheReclaimStrategy> &reclaim_strategy,
                                            const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos,
-                                           std::array<bool, 5> &out_water_level_exceed_results) noexcept;
+                                           WaterLevelExceed &out_water_level_exceed) noexcept;
 
     /**
      * @brief Reclaim cache entries using LRU (Least Recently Used)
@@ -360,11 +375,12 @@ private:
      * @param request_context A shared_ptr that holds the context of the
      * request
      * @param instance_info Instance information to process
+     * @param water_level_exceed the detailed trigger result
      * @param delay_before_delete_ms delay milliseconds for executor
      */
     void ReclaimByLRU(const std::shared_ptr<RequestContext> &request_context,
                       const std::shared_ptr<const InstanceInfo> &instance_info,
-                      const std::array<bool, 5> &water_level_exceed_results,
+                      const WaterLevelExceed &water_level_exceed,
                       std::int32_t delay_before_delete_ms) noexcept;
 
     /**
@@ -376,11 +392,12 @@ private:
      * @param request_context A shared_ptr that holds the context of the
      * request
      * @param instance_info Instance information to process
+     * @param water_level_exceed the detailed trigger result
      * @param delay_before_delete_ms delay milliseconds for executor
      */
     void ReclaimByLFU(const std::shared_ptr<RequestContext> &request_context,
                       const std::shared_ptr<const InstanceInfo> &instance_info,
-                      const std::array<bool, 5> &water_level_exceed_results,
+                      const WaterLevelExceed &water_level_exceed,
                       std::int32_t delay_before_delete_ms) noexcept;
 
     /**
@@ -391,11 +408,12 @@ private:
      * @param request_context A shared_ptr that holds the context of the
      * request
      * @param instance_info Instance information to process
+     * @param water_level_exceed the detailed trigger result
      * @param delay_before_delete_ms delay milliseconds for executor
      */
     void ReclaimByTTL(const std::shared_ptr<RequestContext> &request_context,
                       const std::shared_ptr<const InstanceInfo> &instance_info,
-                      const std::array<bool, 5> &water_level_exceed_results,
+                      const WaterLevelExceed &water_level_exceed,
                       std::int32_t delay_before_delete_ms) noexcept;
 
     bool TryReclaimOnGroup(const std::shared_ptr<RequestContext> &request_context,
@@ -429,19 +447,14 @@ private:
     bool FilterLocID(RequestContext *request_context,
                      const std::shared_ptr<const InstanceInfo> &instance_info,
                      const std::vector<std::int64_t> &batch,
-                     const std::array<bool, 5> &water_level_exceed_results,
+                     const WaterLevelExceed &water_level_exceed,
                      std::vector<std::vector<std::string>> &out_loc_ids) const noexcept;
 
     void SubmitDelReq(const std::shared_ptr<RequestContext> &request_context,
                       const std::shared_ptr<const InstanceInfo> &instance_info,
                       const CacheLocationDelRequest &req) noexcept;
 
-    struct GroupUsageData {
-        std::size_t grp_used_key_cnt_ = 0;
-        std::size_t grp_max_key_cnt_ = 0;
-        std::size_t grp_used_byte_sz_ = 0;
-        std::array<std::uint64_t, 5> grp_storage_usage_array_{0, 0, 0, 0, 0};
-    };
+    struct GroupUsageData;
 
     [[nodiscard]] GroupUsageData
     GetGroupUsageData(const RequestContext *request_context,

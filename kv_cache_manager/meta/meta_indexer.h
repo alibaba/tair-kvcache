@@ -1,6 +1,9 @@
 #pragma once
 
+#include <array>
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
@@ -9,6 +12,7 @@
 #include <vector>
 
 #include "kv_cache_manager/config/meta_indexer_config.h"
+#include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_storage_backend.h"
 
@@ -50,7 +54,7 @@ public:
 
 public:
     /// @brief Initialize the meta indexer.
-    MetaIndexer() = default;
+    MetaIndexer();
     ~MetaIndexer() = default;
 
     ErrorCode Init(const std::string &instance_id, const std::shared_ptr<MetaIndexerConfig> &config) noexcept;
@@ -89,6 +93,13 @@ public:
     size_t GetKeyCount() const noexcept;
     size_t GetMaxKeyCount() const noexcept;
     size_t GetCacheUsage() const noexcept;
+
+    // storage usage interfaces
+    [[nodiscard]] std::uint64_t GetStorageUsage() const noexcept;
+    [[nodiscard]] std::uint64_t GetStorageUsageByType(const DataStorageType &type) const noexcept;
+    void SetStorageUsageByType(const DataStorageType &type, std::uint64_t value) noexcept; // TODO (rui): remove it
+    std::uint64_t AddStorageUsageByType(const DataStorageType &type, std::uint64_t value) noexcept;
+    std::uint64_t SubStorageUsageByType(const DataStorageType &type, std::uint64_t value) noexcept;
 
 private:
     class ScopedBatchLock;
@@ -130,9 +141,7 @@ private:
     size_t mutex_shard_num_ = MetaIndexerConfig::kDefaultMutexShardNum;
     size_t batch_key_size_ = MetaIndexerConfig::kDefaultBatchKeySize;
     std::string instance_id_;
-
-public:
-    std::array<std::atomic<std::uint64_t>, 5> storage_usage_array_ = {0, 0, 0, 0, 0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DataStorageType::COUNT)> storage_usage_array_;
 };
 
 } // namespace kv_cache_manager

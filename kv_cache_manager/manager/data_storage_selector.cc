@@ -33,6 +33,50 @@ DataStorageSelector::DataStorageSelector(std::shared_ptr<MetaIndexerManager> met
                                          std::shared_ptr<RegistryManager> registry_manager)
     : meta_indexer_manager_(std::move(meta_indexer_manager)), registry_manager_(std::move(registry_manager)) {}
 
+class DataStorageSelector::StorageQuotaAvail {
+public:
+    StorageQuotaAvail();
+    ~StorageQuotaAvail() = default;
+
+    [[nodiscard]] bool GetStorageQuotaAvailByType(const DataStorageType &type) const noexcept;
+    void SetStorageQuotaAvailByType(const DataStorageType &type, bool value) noexcept;
+
+private:
+    std::array<bool, static_cast<std::size_t>(DataStorageType::COUNT)> storage_quota_avail_array_;
+};
+
+DataStorageSelector::StorageQuotaAvail::StorageQuotaAvail()
+    : storage_quota_avail_array_{false, /* DATA_STORAGE_TYPE_UNKNOWN */
+                                 true,  /* DATA_STORAGE_TYPE_HF3FS */
+                                 true,  /* DATA_STORAGE_TYPE_MOONCAKE */
+                                 true,  /* DATA_STORAGE_TYPE_TAIR_MEMPOOL */
+                                 true,  /* DATA_STORAGE_TYPE_NFS */
+                                 false  /* DATA_STORAGE_TYPE_VCNS_HF3FS */ } {}
+
+bool DataStorageSelector::StorageQuotaAvail::GetStorageQuotaAvailByType(const DataStorageType &type) const noexcept {
+    try {
+        return storage_quota_avail_array_.at(ToIndex(MapType(type)));
+    } catch (const std::out_of_range &e) {
+        KVCM_LOG_WARN("data storage type out of range, msg: [%s], array size: [%zu], type as index: [%zu]",
+                      e.what(),
+                      storage_quota_avail_array_.size(),
+                      ToIndex(MapType(type)));
+        return false;
+    }
+}
+
+void DataStorageSelector::StorageQuotaAvail::SetStorageQuotaAvailByType(const DataStorageType &type,
+                                                                        const bool value) noexcept {
+    try {
+        storage_quota_avail_array_.at(ToIndex(MapType(type))) = value;
+    } catch (const std::out_of_range &e) {
+        KVCM_LOG_WARN("data storage type out of range, msg: [%s], array size: [%zu], type as index: [%zu]",
+                      e.what(),
+                      storage_quota_avail_array_.size(),
+                      ToIndex(MapType(type)));
+    }
+}
+
 /**
  * @brief Calculate the intersection of available backends and
  * configured candidates
@@ -48,16 +92,16 @@ DataStorageSelector::DataStorageSelector(std::shared_ptr<MetaIndexerManager> met
  * backends
  * @param configured_candidates Vector of backend names configured as
  * candidates for this instance group
- * @param storage_quota_avail_array Store quota capacity availability
+ * @param storage_quota_avail_table Store quota capacity availability
  * result, only true can be counted as final candidate
  * @param candidates_out Output vector to store the filtered list of
  * candidate backends
  */
-void GetCandidates(RequestContext const *request_context,
-                   const std::vector<std::shared_ptr<DataStorageBackend>> &avail_backends,
-                   const std::vector<std::string> &configured_candidates,
-                   const std::array<bool, 5> &storage_quota_avail_array,
-                   std::vector<std::shared_ptr<DataStorageBackend>> &candidates_out) {
+void DataStorageSelector::GetCandidates(RequestContext const *request_context,
+                                        const std::vector<std::shared_ptr<DataStorageBackend>> &avail_backends,
+                                        const std::vector<std::string> &configured_candidates,
+                                        const StorageQuotaAvail &storage_quota_avail_table,
+                                        std::vector<std::shared_ptr<DataStorageBackend>> &candidates_out) noexcept {
     const auto &trace_id = request_context->trace_id();
     for (const std::string &candidate : configured_candidates) {
         for (const std::shared_ptr<DataStorageBackend> &backend : avail_backends) {
@@ -76,20 +120,8 @@ void GetCandidates(RequestContext const *request_context,
                     PREFIX_LOG(WARN, "data storage backend is not available: %s", candidate.c_str());
                     continue;
                 }
-                auto type = backend->GetType();
-                if (type == DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS) {
-                    // treat vcns_hf3fs as hf3fs
-                    type = DataStorageType::DATA_STORAGE_TYPE_HF3FS;
-                }
-                try {
-                    if (!storage_quota_avail_array.at(static_cast<std::uint8_t>(type))) {
-                        PREFIX_LOG(WARN,
-                                   "data storage type [%d] quota is reached or exceeded",
-                                   static_cast<std::uint8_t>(type));
-                        continue;
-                    }
-                } catch (const std::out_of_range &e) {
-                    PREFIX_LOG(WARN, "data storage type out of range: %d", static_cast<std::uint8_t>(type));
+                if (const auto type = backend->GetType(); !storage_quota_avail_table.GetStorageQuotaAvailByType(type)) {
+                    PREFIX_LOG(WARN, "data storage type [%zu] quota is reached or exceeded", ToIndex(MapType(type)));
                     continue;
                 }
                 candidates_out.emplace_back(backend);
@@ -113,10 +145,11 @@ void GetCandidates(RequestContext const *request_context,
  * @return Shared pointer to the selected DataStorageBackend, or nullptr
  * if none found
  */
-std::shared_ptr<DataStorageBackend> SelectByType(RequestContext const *request_context,
-                                                 const std::vector<std::shared_ptr<DataStorageBackend>> &candidates,
-                                                 const DataStorageType &target_type,
-                                                 const bool can_fallback) noexcept {
+std::shared_ptr<DataStorageBackend>
+DataStorageSelector::SelectByType(RequestContext const *request_context,
+                                  const std::vector<std::shared_ptr<DataStorageBackend>> &candidates,
+                                  const DataStorageType &target_type,
+                                  const bool can_fallback) noexcept {
     const auto &trace_id = request_context->trace_id();
     if (candidates.empty()) {
         PREFIX_LOG(WARN, "storage candidate list is empty");
@@ -153,9 +186,10 @@ std::shared_ptr<DataStorageBackend> SelectByType(RequestContext const *request_c
  * @return Shared pointer to the selected DataStorageBackend, or nullptr
  * if none found
  */
-std::shared_ptr<DataStorageBackend> Select(RequestContext const *request_context,
-                                           const std::vector<std::shared_ptr<DataStorageBackend>> &candidates,
-                                           const CachePreferStrategy &preference) {
+std::shared_ptr<DataStorageBackend>
+DataStorageSelector::Select(RequestContext const *request_context,
+                            const std::vector<std::shared_ptr<DataStorageBackend>> &candidates,
+                            const CachePreferStrategy &preference) noexcept {
     switch (preference) {
     case CachePreferStrategy::CPS_ALWAYS_3FS:
         return SelectByType(request_context, candidates, DataStorageType::DATA_STORAGE_TYPE_HF3FS, false);
@@ -251,8 +285,8 @@ DataStorageSelector::SelectCacheWriteDataStorageBackend(RequestContext *request_
 
     // construct the availability table of each storage type in this
     // instance group
-    std::array<bool, 5> storage_quota_avail_array = {true, true, true, true, true};
-    GenStorageQuotaAvailTable(request_context, quota, instance_infos, storage_quota_avail_array);
+    StorageQuotaAvail storage_quota_avail_table;
+    GenStorageQuotaAvailTable(request_context, quota, instance_infos, storage_quota_avail_table);
 
     // get the configured data storage candidate list of this instance group
     const std::vector<std::string> &configured_candidates = ig->storage_candidates();
@@ -278,7 +312,7 @@ DataStorageSelector::SelectCacheWriteDataStorageBackend(RequestContext *request_
 
     // 0. calculate the candidate list
     std::vector<std::shared_ptr<DataStorageBackend>> candidates;
-    GetCandidates(request_context, avail_backends, configured_candidates, storage_quota_avail_array, candidates);
+    GetCandidates(request_context, avail_backends, configured_candidates, storage_quota_avail_table, candidates);
 
     // 1. select backend according to the specified preference
     const auto chosen_backend = Select(request_context, candidates, preference);
@@ -338,15 +372,11 @@ void DataStorageSelector::GenStorageQuotaAvailTable(
     RequestContext const *request_context,
     const InstanceGroupQuota &quota,
     const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos,
-    std::array<bool, 5> &storage_quota_avail_array) const noexcept {
+    StorageQuotaAvail &storage_quota_avail_table) const noexcept {
     const auto &trace_id = request_context->trace_id();
 
     for (const auto &storage_quota : quota.quota_config()) {
         auto type = storage_quota.storage_spec();
-        if (type == DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS) {
-            // treat vcns_hf3fs as hf3fs
-            type = DataStorageType::DATA_STORAGE_TYPE_HF3FS;
-        }
         std::uint64_t total_sz = 0;
 
         for (const auto &ins : instance_infos) {
@@ -360,22 +390,13 @@ void DataStorageSelector::GenStorageQuotaAvailTable(
                 PREFIX_LOG(WARN, "meta indexer is nullptr");
                 continue;
             }
-            // TODO(rui): persist the storage stat data
-            // meta_indexer->PersistMetaData();
-            try {
-                const std::uint64_t sz = meta_indexer->storage_usage_array_.at(static_cast<std::uint8_t>(type)).load();
-                total_sz += sz;
-            } catch (const std::out_of_range &e) {
-                KVCM_LOG_WARN("data storage type out of range: %d", static_cast<std::uint8_t>(type));
-            }
+            meta_indexer->PersistMetaData();
+            const std::uint64_t sz = meta_indexer->GetStorageUsageByType(type);
+            total_sz += sz;
         }
 
         if (storage_quota.capacity() <= total_sz) {
-            try {
-                storage_quota_avail_array.at(static_cast<std::uint8_t>(type)) = false;
-            } catch (const std::out_of_range &e) {
-                KVCM_LOG_WARN("data storage type out of range: %d", static_cast<std::uint8_t>(type));
-            }
+            storage_quota_avail_table.SetStorageQuotaAvailByType(type, false);
         }
     }
 }

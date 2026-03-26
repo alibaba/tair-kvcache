@@ -1,6 +1,5 @@
 #pragma once
 
-#include <array>
 #include <cstddef>
 #include <memory>
 #include <string>
@@ -17,6 +16,8 @@ class InstanceInfo;
 class MetaIndexerManager;
 class RegistryManager;
 class RequestContext;
+
+enum class CachePreferStrategy;
 
 /**
  * @brief Result structure containing the outcome of a data storage
@@ -132,13 +133,34 @@ public:
                                        const std::string &instance_group) const noexcept;
 
 private:
+    class StorageQuotaAvail;
+
     std::size_t
     CalcGroupUsedSize(RequestContext const *request_context,
                       const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) const noexcept;
+
     void GenStorageQuotaAvailTable(RequestContext const *request_context,
                                    const InstanceGroupQuota &quota,
                                    const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos,
-                                   std::array<bool, 5> &storage_quota_avail_array) const noexcept;
+                                   StorageQuotaAvail &storage_quota_avail_table) const noexcept;
+
+    static void GetCandidates(RequestContext const *request_context,
+                              const std::vector<std::shared_ptr<DataStorageBackend>> &avail_backends,
+                              const std::vector<std::string> &configured_candidates,
+                              const StorageQuotaAvail &storage_quota_avail_table,
+                              std::vector<std::shared_ptr<DataStorageBackend>> &candidates_out) noexcept;
+
+    static std::shared_ptr<DataStorageBackend>
+    SelectByType(RequestContext const *request_context,
+                 const std::vector<std::shared_ptr<DataStorageBackend>> &candidates,
+                 const DataStorageType &target_type,
+                 bool can_fallback) noexcept;
+
+    static std::shared_ptr<DataStorageBackend>
+    Select(RequestContext const *request_context,
+           const std::vector<std::shared_ptr<DataStorageBackend>> &candidates,
+           const CachePreferStrategy &preference) noexcept;
+
     std::shared_ptr<MetaIndexerManager> meta_indexer_manager_;
     std::shared_ptr<RegistryManager> registry_manager_;
 };

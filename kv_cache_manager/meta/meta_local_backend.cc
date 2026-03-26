@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <limits>
 
 #include "kv_cache_manager/common/jsonizable.h"
 #include "kv_cache_manager/common/logger.h"
@@ -31,6 +32,7 @@ ErrorCode MetaLocalBackend::Init(const std::string &instance_id,
         StandardUri storage_uri = StandardUri::FromUri(storage_uri_str);
         enable_persistence_ = true;
         path_ = storage_uri.GetPath();
+        metadata_key_ = std::numeric_limits<KeyType>::max(); // use max key for metadata
     }
     return EC_OK;
 }
@@ -370,8 +372,18 @@ ErrorCode MetaLocalBackend::RandomSample(const int64_t count, std::vector<KeyTyp
     return EC_OK;
 }
 
-ErrorCode MetaLocalBackend::PutMetaData(const FieldMap &field_map) noexcept { return EC_OK; }
+ErrorCode MetaLocalBackend::PutMetaData(const FieldMap &field_map) noexcept {
+    std::lock_guard<std::mutex> guard(mutex_);
+    table_.Upsert(metadata_key_, field_map);
+    return PersistToPath();
+}
 
-ErrorCode MetaLocalBackend::GetMetaData(FieldMap &field_map) noexcept { return EC_NOENT; }
+ErrorCode MetaLocalBackend::GetMetaData(FieldMap &out_field_map) noexcept {
+    out_field_map.clear();
+    if (!table_.Get(metadata_key_, out_field_map)) {
+        return EC_NOENT;
+    }
+    return out_field_map.empty() ? EC_NOENT : EC_OK;
+}
 
 } // namespace kv_cache_manager
