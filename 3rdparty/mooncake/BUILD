@@ -18,9 +18,19 @@ cc_library(
 cc_test(
     name = "mooncake_client_c_test",
     srcs = ["client_c_test.cc"],
+    copts = [
+        "-std=c++20",
+        "-g",
+        "-Wall",
+        "-Wextra",
+        "-Wno-unused-parameter",
+        "-fcoroutines",
+        "-fPIC",
+    ],
     deps = [
         ":mooncake_client_c",
         "//kv_cache_manager/common:unittest",
         "@mooncake//:mooncake_store",
+        "@com_google_googletest//:gtest_main",
     ],
 )

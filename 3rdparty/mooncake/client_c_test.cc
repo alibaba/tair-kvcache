@@ -11,8 +11,6 @@
 #include <thread>
 #include <unistd.h>
 
-#include "ha/ha_types.h"
-#include "ha/leader_coordinator.h"
 #include <ylt/coro_http/coro_http_server.hpp>
 
 namespace mooncake {
@@ -21,56 +19,37 @@ class Client;
 
 namespace {
 
+using ResolveMetricsHostFn = ErrorCode_t (*)(void *, std::string *);
+using DestroyMetricsResolverStateFn = void (*)(void *);
+
+struct MetricsResolverVTable {
+    ResolveMetricsHostFn resolve_host = nullptr;
+    DestroyMetricsResolverStateFn destroy_state = nullptr;
+};
+
+struct FakeMetricsResolverState {
+    std::string host;
+    ErrorCode_t error_code = MOONCAKE_ERROR_OK;
+};
+
+ErrorCode_t ResolveFakeMetricsHost(void *opaque, std::string *host) {
+    auto *state = reinterpret_cast<FakeMetricsResolverState *>(opaque);
+    if (state == nullptr || host == nullptr) {
+        return MOONCAKE_ERROR_INVALID_PARAMS;
+    }
+    if (state->error_code != MOONCAKE_ERROR_OK) {
+        return state->error_code;
+    }
+    *host = state->host;
+    return MOONCAKE_ERROR_OK;
+}
+
 struct FakeClientSession {
     std::shared_ptr<mooncake::Client> client;
     coro_http::coro_http_client http_client;
     uint16_t metrics_port = 9003;
-    std::string direct_master_host;
-    std::optional<mooncake::ha::HABackendSpec> ha_backend_spec;
-    std::unique_ptr<mooncake::ha::LeaderCoordinator> leader_coordinator;
-};
-
-class FakeLeaderCoordinator : public mooncake::ha::LeaderCoordinator {
-public:
-    explicit FakeLeaderCoordinator(
-        std::optional<mooncake::ha::MasterView> current_view)
-        : current_view_(std::move(current_view)) {}
-
-    tl::expected<std::optional<mooncake::ha::MasterView>, mooncake::ErrorCode>
-    ReadCurrentView() override {
-        return current_view_;
-    }
-
-    tl::expected<mooncake::ha::AcquireLeadershipResult, mooncake::ErrorCode>
-    TryAcquireLeadership(const std::string &) override {
-        return tl::make_unexpected(mooncake::ErrorCode::INVALID_PARAMS);
-    }
-
-    tl::expected<bool, mooncake::ErrorCode> RenewLeadership(
-        const mooncake::ha::LeadershipSession &) override {
-        return tl::make_unexpected(mooncake::ErrorCode::INVALID_PARAMS);
-    }
-
-    tl::expected<mooncake::ha::ViewChangeResult, mooncake::ErrorCode>
-    WaitForViewChange(std::optional<mooncake::ViewVersionId>,
-                      std::chrono::milliseconds) override {
-        return tl::make_unexpected(mooncake::ErrorCode::INVALID_PARAMS);
-    }
-
-    tl::expected<std::unique_ptr<mooncake::ha::LeadershipMonitorHandle>,
-                 mooncake::ErrorCode>
-    StartLeadershipMonitor(const mooncake::ha::LeadershipSession &,
-                           mooncake::ha::LeadershipLostCallback) override {
-        return tl::make_unexpected(mooncake::ErrorCode::INVALID_PARAMS);
-    }
-
-    mooncake::ErrorCode
-    ReleaseLeadership(const mooncake::ha::LeadershipSession &) override {
-        return mooncake::ErrorCode::INVALID_PARAMS;
-    }
-
-private:
-    std::optional<mooncake::ha::MasterView> current_view_;
+    void *resolver_state = nullptr;
+    MetricsResolverVTable resolver_vtable{};
 };
 
 int GetFreeTcpPort() {
@@ -121,16 +100,20 @@ public:
         server_->set_http_handler<GET>(
             "/health",
             [this](coro_http::coro_http_request &,
-                   coro_http::coro_http_response &resp) {
+                   coro_http::coro_http_response &resp)
+                -> async_simple::coro::Lazy<void> {
                 resp.set_status_and_content(ToStatusType(health_status_code_),
                                             health_body_);
+                co_return;
             });
         server_->set_http_handler<GET>(
             "/metrics",
             [this](coro_http::coro_http_request &,
-                   coro_http::coro_http_response &resp) {
+                   coro_http::coro_http_response &resp)
+                -> async_simple::coro::Lazy<void> {
                 resp.set_status_and_content(ToStatusType(metrics_status_code_),
                                             metrics_body_);
+                co_return;
             });
 
         auto ec = server_->async_start();
@@ -165,6 +148,12 @@ public:
         server_ = std::make_unique<TestHttpServer>(port_);
         session_ = std::make_unique<FakeClientSession>();
         session_->metrics_port = static_cast<uint16_t>(port_);
+        resolver_state_ = std::make_unique<FakeMetricsResolverState>();
+        session_->resolver_state = resolver_state_.get();
+        session_->resolver_vtable = MetricsResolverVTable{
+            .resolve_host = ResolveFakeMetricsHost,
+            .destroy_state = nullptr,
+        };
         client_ = reinterpret_cast<client_t>(session_.get());
     }
 
@@ -178,11 +167,12 @@ protected:
     int port_ = -1;
     client_t client_ = nullptr;
     std::unique_ptr<FakeClientSession> session_;
+    std::unique_ptr<FakeMetricsResolverState> resolver_state_;
     std::unique_ptr<TestHttpServer> server_;
 };
 
 TEST_F(MooncakeClientCTest, GetStoreStatusParsesHealthAndWaterLevel) {
-    session_->direct_master_host = "127.0.0.1";
+    resolver_state_->host = "127.0.0.1";
     server_->SetHealthResponse(200, "OK");
     server_->SetMetricsResponse(
         200,
@@ -204,7 +194,7 @@ TEST_F(MooncakeClientCTest, GetStoreStatusParsesHealthAndWaterLevel) {
 }
 
 TEST_F(MooncakeClientCTest, GetStoreStatusTreatsNon200HealthAsUnhealthy) {
-    session_->direct_master_host = "127.0.0.1";
+    resolver_state_->host = "127.0.0.1";
     server_->SetHealthResponse(503, "NOT_OK");
     server_->SetMetricsResponse(200,
                                 "master_allocated_bytes 128\n"
@@ -223,7 +213,7 @@ TEST_F(MooncakeClientCTest, GetStoreStatusTreatsNon200HealthAsUnhealthy) {
 }
 
 TEST_F(MooncakeClientCTest, GetStoreStatusFailsWhenMetricsAreIncomplete) {
-    session_->direct_master_host = "127.0.0.1";
+    resolver_state_->host = "127.0.0.1";
     server_->SetHealthResponse(200, "OK");
     server_->SetMetricsResponse(200, "master_allocated_bytes 256\n");
     server_->Start();
@@ -234,17 +224,8 @@ TEST_F(MooncakeClientCTest, GetStoreStatusFailsWhenMetricsAreIncomplete) {
     EXPECT_EQ(MOONCAKE_ERROR_INTERNAL_ERROR, ec);
 }
 
-TEST_F(MooncakeClientCTest, GetStoreStatusResolvesHostFromHaLeader) {
-    session_->ha_backend_spec = mooncake::ha::HABackendSpec{
-        .type = mooncake::ha::HABackendType::ETCD,
-        .connstring = "127.0.0.1:2379",
-        .cluster_namespace = "",
-    };
-    session_->leader_coordinator = std::make_unique<FakeLeaderCoordinator>(
-        mooncake::ha::MasterView{
-            .leader_address = "127.0.0.1:50051",
-            .view_version = 1,
-        });
+TEST_F(MooncakeClientCTest, GetStoreStatusUsesResolvedHostFromSession) {
+    resolver_state_->host = "127.0.0.1";
     server_->SetHealthResponse(200, "OK");
     server_->SetMetricsResponse(
         200,
@@ -260,6 +241,15 @@ TEST_F(MooncakeClientCTest, GetStoreStatusResolvesHostFromHaLeader) {
     EXPECT_EQ(64u, status.allocated_bytes);
     EXPECT_EQ(256u, status.total_capacity_bytes);
     EXPECT_DOUBLE_EQ(0.25, status.used_ratio);
+}
+
+TEST_F(MooncakeClientCTest, GetStoreStatusFailsWhenHostResolutionFails) {
+    resolver_state_->error_code = MOONCAKE_ERROR_UNAVAILABLE_IN_CURRENT_STATUS;
+
+    MooncakeStoreStatus_t status{};
+    const auto ec = mooncake_client_get_store_status(client_, &status);
+
+    EXPECT_EQ(MOONCAKE_ERROR_UNAVAILABLE_IN_CURRENT_STATUS, ec);
 }
 
 } // namespace

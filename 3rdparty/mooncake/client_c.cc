@@ -11,10 +11,20 @@
 #include <utility>
 
 #include "client_service.h"
-#include "ha/ha_backend_factory.h"
-#include "ha/ha_types.h"
 #include "utils.h"
 #include <ylt/coro_http/coro_http_client.hpp>
+
+#if __has_include("ha/ha_backend_factory.h") && \
+    __has_include("ha/ha_types.h") &&            \
+    __has_include("ha/leader_coordinator.h")
+#define MOONCAKE_CLIENT_C_HAS_NEW_HA 1
+#include "ha/ha_backend_factory.h"
+#include "ha/ha_types.h"
+#include "ha/leader_coordinator.h"
+#elif __has_include("ha_helper.h")
+#define MOONCAKE_CLIENT_C_HAS_LEGACY_HA 1
+#include "ha_helper.h"
+#endif
 
 using namespace mooncake;
 
@@ -22,25 +32,32 @@ namespace {
 
 constexpr uint16_t kDefaultMasterMetricsPort = 9003;
 
-struct SessionRoute {
-    std::string direct_master_host;
-    std::optional<ha::HABackendSpec> ha_backend_spec;
+using ResolveMetricsHostFn = ErrorCode_t (*)(void *, std::string *);
+using DestroyMetricsResolverStateFn = void (*)(void *);
+
+struct MetricsResolverVTable {
+    ResolveMetricsHostFn resolve_host = nullptr;
+    DestroyMetricsResolverStateFn destroy_state = nullptr;
+};
+
+struct MetricsResolver {
+    void *state = nullptr;
+    MetricsResolverVTable vtable{};
 };
 
 struct ClientSession {
     ClientSession(std::shared_ptr<Client> native_client, uint16_t metrics_port,
-                  SessionRoute route)
+                  MetricsResolver resolver)
         : client(std::move(native_client)),
           metrics_port(metrics_port),
-          direct_master_host(std::move(route.direct_master_host)),
-          ha_backend_spec(std::move(route.ha_backend_spec)) {}
+          resolver_state(resolver.state),
+          resolver_vtable(resolver.vtable) {}
 
     std::shared_ptr<Client> client;
     coro_http::coro_http_client http_client;
     uint16_t metrics_port = kDefaultMasterMetricsPort;
-    std::string direct_master_host;
-    std::optional<ha::HABackendSpec> ha_backend_spec;
-    std::unique_ptr<ha::LeaderCoordinator> leader_coordinator;
+    void *resolver_state = nullptr;
+    MetricsResolverVTable resolver_vtable{};
 };
 
 struct HttpResponse {
@@ -82,26 +99,6 @@ uint16_t ResolveMetricsPortFromEnv() {
     return static_cast<uint16_t>(parsed);
 }
 
-tl::expected<std::optional<ha::HABackendSpec>, ErrorCode> ParseHABackendSpec(
-    std::string_view master_server_entry) {
-    const size_t delimiter_pos = master_server_entry.find("://");
-    if (delimiter_pos == std::string_view::npos) {
-        return std::optional<ha::HABackendSpec>{std::nullopt};
-    }
-
-    auto backend_type =
-        ha::ParseHABackendType(master_server_entry.substr(0, delimiter_pos));
-    if (!backend_type.has_value()) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    return std::optional<ha::HABackendSpec>{ha::HABackendSpec{
-        .type = backend_type.value(),
-        .connstring = std::string(master_server_entry.substr(delimiter_pos + 3)),
-        .cluster_namespace = "",
-    }};
-}
-
 std::string ExtractHostFromAddress(std::string_view address) {
     if (address.empty()) {
         return {};
@@ -134,28 +131,24 @@ std::string ExtractHostFromAddress(std::string_view address) {
     return std::string(address.substr(0, first_colon));
 }
 
-tl::expected<SessionRoute, ErrorCode> BuildSessionRoute(
-    std::string_view master_server_entry) {
-    auto ha_backend_spec = ParseHABackendSpec(master_server_entry);
-    if (!ha_backend_spec) {
-        return tl::make_unexpected(ha_backend_spec.error());
-    }
+struct DirectMetricsResolverState {
+    std::string host;
+};
 
-    if (ha_backend_spec.value().has_value()) {
-        return SessionRoute{
-            .direct_master_host = "",
-            .ha_backend_spec = std::move(ha_backend_spec.value()),
-        };
+ErrorCode_t ResolveDirectMetricsHost(void *opaque, std::string *host) {
+    if (opaque == nullptr || host == nullptr) {
+        return MOONCAKE_ERROR_INVALID_PARAMS;
     }
+    auto *state = reinterpret_cast<DirectMetricsResolverState *>(opaque);
+    if (state->host.empty()) {
+        return MOONCAKE_ERROR_INVALID_PARAMS;
+    }
+    *host = state->host;
+    return MOONCAKE_ERROR_OK;
+}
 
-    std::string direct_master_host = ExtractHostFromAddress(master_server_entry);
-    if (direct_master_host.empty()) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    return SessionRoute{
-        .direct_master_host = std::move(direct_master_host),
-        .ha_backend_spec = std::nullopt,
-    };
+void DestroyDirectMetricsResolverState(void *opaque) {
+    delete reinterpret_cast<DirectMetricsResolverState *>(opaque);
 }
 
 std::optional<HttpResponse> FetchHttpResponse(ClientSession &session,
@@ -202,46 +195,187 @@ bool ParseUint64Metric(const std::string &payload,
     return false;
 }
 
-tl::expected<ha::LeaderCoordinator *, ErrorCode> EnsureLeaderCoordinator(
-    ClientSession &session) {
-    if (!session.ha_backend_spec.has_value()) {
+#if defined(MOONCAKE_CLIENT_C_HAS_NEW_HA)
+
+struct NewHaMetricsResolverState {
+    std::optional<ha::HABackendSpec> ha_backend_spec;
+    std::unique_ptr<ha::LeaderCoordinator> leader_coordinator;
+};
+
+tl::expected<std::optional<ha::HABackendSpec>, ErrorCode> ParseHABackendSpec(
+    std::string_view master_server_entry) {
+    const size_t delimiter_pos = master_server_entry.find("://");
+    if (delimiter_pos == std::string_view::npos) {
+        return std::optional<ha::HABackendSpec>{std::nullopt};
+    }
+
+    auto backend_type =
+        ha::ParseHABackendType(master_server_entry.substr(0, delimiter_pos));
+    if (!backend_type.has_value()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    if (session.leader_coordinator == nullptr) {
-        auto coordinator =
-            ha::CreateLeaderCoordinator(session.ha_backend_spec.value());
-        if (!coordinator) {
-            return tl::make_unexpected(coordinator.error());
-        }
-        session.leader_coordinator = std::move(coordinator.value());
-    }
-    return session.leader_coordinator.get();
+
+    return std::optional<ha::HABackendSpec>{ha::HABackendSpec{
+        .type = backend_type.value(),
+        .connstring = std::string(master_server_entry.substr(delimiter_pos + 3)),
+        .cluster_namespace = "",
+    }};
 }
 
-tl::expected<std::string, ErrorCode> ResolveMetricsHost(ClientSession &session) {
-    if (!session.direct_master_host.empty()) {
-        return session.direct_master_host;
+ErrorCode_t ResolveNewHaMetricsHost(void *opaque, std::string *host) {
+    if (opaque == nullptr || host == nullptr) {
+        return MOONCAKE_ERROR_INVALID_PARAMS;
     }
 
-    auto coordinator = EnsureLeaderCoordinator(session);
-    if (!coordinator) {
-        return tl::make_unexpected(coordinator.error());
+    auto *state = reinterpret_cast<NewHaMetricsResolverState *>(opaque);
+    if (!state->ha_backend_spec.has_value()) {
+        return MOONCAKE_ERROR_INVALID_PARAMS;
     }
 
-    auto current_view = coordinator.value()->ReadCurrentView();
+    if (state->leader_coordinator == nullptr) {
+        auto coordinator =
+            ha::CreateLeaderCoordinator(state->ha_backend_spec.value());
+        if (!coordinator) {
+            return ToCErrorCode(coordinator.error());
+        }
+        state->leader_coordinator = std::move(coordinator.value());
+    }
+
+    auto current_view = state->leader_coordinator->ReadCurrentView();
     if (!current_view) {
-        return tl::make_unexpected(current_view.error());
+        return ToCErrorCode(current_view.error());
     }
     if (!current_view.value().has_value()) {
-        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        return MOONCAKE_ERROR_UNAVAILABLE_IN_CURRENT_STATUS;
     }
 
-    std::string host =
+    std::string resolved_host =
         ExtractHostFromAddress(current_view.value()->leader_address);
-    if (host.empty()) {
+    if (resolved_host.empty()) {
+        return MOONCAKE_ERROR_INVALID_PARAMS;
+    }
+    *host = std::move(resolved_host);
+    return MOONCAKE_ERROR_OK;
+}
+
+void DestroyNewHaMetricsResolverState(void *opaque) {
+    delete reinterpret_cast<NewHaMetricsResolverState *>(opaque);
+}
+
+#elif defined(MOONCAKE_CLIENT_C_HAS_LEGACY_HA)
+
+struct LegacyEtcdMetricsResolverState {
+    std::string etcd_entry;
+    std::unique_ptr<MasterViewHelper> master_view_helper;
+    bool connected = false;
+};
+
+ErrorCode_t ResolveLegacyEtcdMetricsHost(void *opaque, std::string *host) {
+    if (opaque == nullptr || host == nullptr) {
+        return MOONCAKE_ERROR_INVALID_PARAMS;
+    }
+
+    auto *state = reinterpret_cast<LegacyEtcdMetricsResolverState *>(opaque);
+    if (state->etcd_entry.empty()) {
+        return MOONCAKE_ERROR_INVALID_PARAMS;
+    }
+
+    if (state->master_view_helper == nullptr) {
+        state->master_view_helper = std::make_unique<MasterViewHelper>();
+    }
+    if (!state->connected) {
+        auto err = state->master_view_helper->ConnectToEtcd(state->etcd_entry);
+        if (err != ErrorCode::OK) {
+            return ToCErrorCode(err);
+        }
+        state->connected = true;
+    }
+
+    std::string master_address;
+    ViewVersionId master_version = 0;
+    auto err = state->master_view_helper->GetMasterView(master_address,
+                                                        master_version);
+    if (err != ErrorCode::OK) {
+        return ToCErrorCode(err);
+    }
+
+    std::string resolved_host = ExtractHostFromAddress(master_address);
+    if (resolved_host.empty()) {
+        return MOONCAKE_ERROR_INVALID_PARAMS;
+    }
+    *host = std::move(resolved_host);
+    return MOONCAKE_ERROR_OK;
+}
+
+void DestroyLegacyEtcdMetricsResolverState(void *opaque) {
+    delete reinterpret_cast<LegacyEtcdMetricsResolverState *>(opaque);
+}
+
+#endif
+
+tl::expected<MetricsResolver, ErrorCode> BuildMetricsResolver(
+    std::string_view master_server_entry) {
+#if defined(MOONCAKE_CLIENT_C_HAS_NEW_HA)
+    auto ha_backend_spec = ParseHABackendSpec(master_server_entry);
+    if (!ha_backend_spec) {
+        return tl::make_unexpected(ha_backend_spec.error());
+    }
+    if (ha_backend_spec.value().has_value()) {
+        auto *state = new NewHaMetricsResolverState{
+            .ha_backend_spec = std::move(ha_backend_spec.value()),
+            .leader_coordinator = nullptr,
+        };
+        return MetricsResolver{
+            .state = state,
+            .vtable =
+                MetricsResolverVTable{
+                    .resolve_host = ResolveNewHaMetricsHost,
+                    .destroy_state = DestroyNewHaMetricsResolverState,
+                },
+        };
+    }
+#elif defined(MOONCAKE_CLIENT_C_HAS_LEGACY_HA)
+    constexpr std::string_view kEtcdScheme = "etcd://";
+    if (master_server_entry.substr(0, kEtcdScheme.size()) == kEtcdScheme) {
+        auto *state = new LegacyEtcdMetricsResolverState{
+            .etcd_entry = std::string(master_server_entry.substr(kEtcdScheme.size())),
+            .master_view_helper = nullptr,
+            .connected = false,
+        };
+        return MetricsResolver{
+            .state = state,
+            .vtable =
+                MetricsResolverVTable{
+                    .resolve_host = ResolveLegacyEtcdMetricsHost,
+                    .destroy_state = DestroyLegacyEtcdMetricsResolverState,
+                },
+        };
+    }
+#endif
+
+    std::string direct_master_host = ExtractHostFromAddress(master_server_entry);
+    if (direct_master_host.empty()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return host;
+
+    auto *state = new DirectMetricsResolverState{
+        .host = std::move(direct_master_host),
+    };
+    return MetricsResolver{
+        .state = state,
+        .vtable =
+            MetricsResolverVTable{
+                .resolve_host = ResolveDirectMetricsHost,
+                .destroy_state = DestroyDirectMetricsResolverState,
+            },
+    };
+}
+
+ErrorCode_t ResolveMetricsHost(ClientSession &session, std::string *host) {
+    if (session.resolver_vtable.resolve_host == nullptr) {
+        return MOONCAKE_ERROR_INVALID_PARAMS;
+    }
+    return session.resolver_vtable.resolve_host(session.resolver_state, host);
 }
 
 std::string FormatHttpHost(std::string_view host) {
@@ -260,11 +394,21 @@ std::string BuildMetricsBaseUrl(std::string_view host, uint16_t port) {
 
 // Manage client object lifetime through a session that also owns HTTP context.
 void *create_obj(std::shared_ptr<Client> client, uint16_t metrics_port,
-                 SessionRoute route) {
-    return new ClientSession(std::move(client), metrics_port, std::move(route));
+                 MetricsResolver resolver) {
+    return new ClientSession(std::move(client), metrics_port,
+                             std::move(resolver));
 }
 
-void destroy_obj(void *handle) { delete GetSession(handle); }
+void destroy_obj(void *handle) {
+    ClientSession *session = GetSession(handle);
+    if (session == nullptr) {
+        return;
+    }
+    if (session->resolver_vtable.destroy_state != nullptr) {
+        session->resolver_vtable.destroy_state(session->resolver_state);
+    }
+    delete session;
+}
 
 client_t mooncake_client_create(const char *local_hostname,
                                 const char *metadata_connstring,
@@ -287,15 +431,15 @@ client_t mooncake_client_create(const char *local_hostname,
         return nullptr;
     }
 
-    auto route = BuildSessionRoute(resolved_master_server_entry);
-    if (!route) {
-        LOG(ERROR) << "Failed to build Mooncake client session route: "
-                   << toString(route.error());
+    auto resolver = BuildMetricsResolver(resolved_master_server_entry);
+    if (!resolver) {
+        LOG(ERROR) << "Failed to build Mooncake client metrics resolver: "
+                   << toString(resolver.error());
         return nullptr;
     }
 
     return create_obj(native.value(), ResolveMetricsPortFromEnv(),
-                      std::move(route.value()));
+                      std::move(resolver.value()));
 }
 
 ErrorCode_t mooncake_client_register_local_memory(
@@ -450,15 +594,16 @@ ErrorCode_t mooncake_client_get_store_status(client_t client,
 
     *status = {};
 
-    auto metrics_host = ResolveMetricsHost(*session);
-    if (!metrics_host) {
+    std::string metrics_host;
+    ErrorCode_t resolve_ec = ResolveMetricsHost(*session, &metrics_host);
+    if (resolve_ec != MOONCAKE_ERROR_OK) {
         LOG(ERROR) << "Failed to resolve Mooncake store metrics host: "
-                   << toString(metrics_host.error());
-        return ToCErrorCode(metrics_host.error());
+                   << resolve_ec;
+        return resolve_ec;
     }
 
     const std::string base_url =
-        BuildMetricsBaseUrl(metrics_host.value(), session->metrics_port);
+        BuildMetricsBaseUrl(metrics_host, session->metrics_port);
 
     auto health_response = FetchHttpResponse(*session, base_url + "/health");
     if (!health_response.has_value()) {
