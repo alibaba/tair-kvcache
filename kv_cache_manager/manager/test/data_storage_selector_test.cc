@@ -542,6 +542,7 @@ TEST_F(DataStorageSelectorTest, TestSelectCacheWriteStorageBackendNormal02) {
 TEST_F(DataStorageSelectorTest, TestSelectCacheWriteStorageBackendQuota00) {
     instance_group_g->set_storage_candidates({"nfs_storage_00", "3fs_storage_01"});
     instance_group_g->cache_config_->set_cache_prefer_strategy(CachePreferStrategy::CPS_PREFER_3FS);
+    meta_indexer_g->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 1024);
 
     {
         // test quota_capacity = 0
