@@ -54,7 +54,9 @@ bundle_files(
 
 bundle_files(
     name = "inner_package",
-    srcs = [],
+    srcs = [
+        "//package/kvcm_ops:kvcm_ops_wheel",
+    ],
     deps = [
         ":pkg_bin",
         ":pkg_etc",
