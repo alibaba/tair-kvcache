@@ -69,12 +69,9 @@ public:
 
     class CellHandle {
     public:
-        CellHandle(SdkBufferCheckPool *pool, Cell *cell) : pool_(pool), cell_(cell) {}
+        CellHandle(SdkBufferCheckPool *pool, Cell *cell, int device_id);
         CellHandle(const CellHandle &) = delete;
-        CellHandle(CellHandle &&other) : pool_(std::move(other.pool_)), cell_(std::move(other.cell_)) {
-            other.pool_ = nullptr;
-            other.cell_ = nullptr;
-        }
+        CellHandle(CellHandle &&other) = delete;
         ~CellHandle();
         Cell *operator->() { return cell_; }
         Cell &operator*() { return *cell_; }
@@ -83,10 +80,13 @@ public:
     private:
         SdkBufferCheckPool *pool_;
         Cell *cell_;
+        int prev_device_id_;
+        bool changed_device_ = false;
     };
 
     bool Init(size_t max_check_iov_num);
     CellHandle GetCell();
+    bool WarmUp();
 
 private:
     friend class CellHandle;
@@ -96,6 +96,7 @@ private:
     std::condition_variable cv_;
     std::queue<Cell *> cell_queue_;
     std::vector<Cell> cells_;
+    int device_id_ = -1;
 };
 
 }; // namespace kv_cache_manager

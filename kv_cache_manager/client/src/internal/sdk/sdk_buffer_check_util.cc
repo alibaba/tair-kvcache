@@ -97,6 +97,7 @@ SdkBufferCheckPool::~SdkBufferCheckPool() {
 bool SdkBufferCheckPool::Init(size_t max_check_iov_num) {
     size_t iovs_byte_size = max_check_iov_num * sizeof(IovDevice);
     size_t crcs_byte_size = max_check_iov_num * sizeof(uint32_t);
+    CHECK_CUDA_ERROR_RETURN(cudaGetDevice(&device_id_), false, "cudaGetDevice failed");
     for (auto &cell : cells_) {
         CHECK_CUDA_ERROR_RETURN(
             cudaMallocHost(&cell.h_iovs, iovs_byte_size), false, "cudaMallocHost [%zu] bytes failed", iovs_byte_size);
@@ -108,14 +109,61 @@ bool SdkBufferCheckPool::Init(size_t max_check_iov_num) {
             cudaStreamCreateWithFlags(&cell.gpu_stream, cudaStreamNonBlocking), false, "cuda stream create failed");
         cell_queue_.push(&cell);
     }
-    KVCM_LOG_INFO(
-        "cell_size[%lu], iovs_byte_size[%lu], crcs_byte_size[%lu]", cells_.size(), iovs_byte_size, crcs_byte_size);
+    if (!WarmUp()) {
+        return false;
+    }
+    KVCM_LOG_INFO("cell_size[%lu], iovs_byte_size[%lu], crcs_byte_size[%lu], device_id[%d]",
+                  cells_.size(),
+                  iovs_byte_size,
+                  crcs_byte_size,
+                  device_id_);
     return true;
+}
+
+bool SdkBufferCheckPool::WarmUp() {
+    const std::string warmup_str("12345678");
+    // crc32("12345678") == 9AE0DAAF
+    auto byte_size = warmup_str.size();
+    char *buffer = nullptr;
+    CHECK_CUDA_ERROR_RETURN(cudaMalloc(&buffer, byte_size), false, "cudaMalloc [%lu] bytes failed", byte_size);
+    CHECK_CUDA_ERROR_RETURN(cudaMemcpy(buffer, warmup_str.data(), byte_size, cudaMemcpyHostToDevice),
+                            false,
+                            "cudaMemcpy from host[%p] to device[%p] failed",
+                            warmup_str.data(),
+                            buffer);
+    std::vector<IovDevice> iovs_h{{buffer, byte_size}};
+    const std::vector<uint32_t> ecpected_crcs({0x9AE0DAAF});
+    for (auto &cell : cells_) {
+        auto real_crcs = SdkBufferCheckUtil::GetIovsCrc(iovs_h, cell.d_iovs, cell.d_crcs, cell.cuda_stream);
+        if (ecpected_crcs != real_crcs) {
+            KVCM_LOG_ERROR("warm up failed");
+            return false;
+        }
+    }
+
+    if (buffer != nullptr) {
+        CHECK_CUDA_ERROR_RETURN(cudaFree(buffer), false, "cudaFree [%p] failed", buffer);
+    }
+    return true;
+}
+
+SdkBufferCheckPool::CellHandle::CellHandle(SdkBufferCheckPool *pool, Cell *cell, int device_id)
+    : pool_(pool), cell_(cell) {
+    cudaError_t err = cudaGetDevice(&prev_device_id_);
+    if (err != cudaSuccess) {
+        KVCM_LOG_WARN("cuda error [%d] [%s] | cudaGetDevice failed", err, cudaGetErrorString(err));
+    } else if (prev_device_id_ != device_id) {
+        CHECK_CUDA_ERROR(cudaSetDevice(device_id), "cudaSetDevice [%d] failed", device_id);
+        changed_device_ = true;
+    }
 }
 
 SdkBufferCheckPool::CellHandle::~CellHandle() {
     if (pool_) {
         pool_->PutCell(cell_);
+    }
+    if (changed_device_) {
+        CHECK_CUDA_ERROR(cudaSetDevice(prev_device_id_), "cudaSetDevice prev [%d] failed", prev_device_id_);
     }
 }
 
@@ -124,7 +172,7 @@ SdkBufferCheckPool::CellHandle SdkBufferCheckPool::GetCell() {
     cv_.wait(lock, [this] { return !cell_queue_.empty(); });
     Cell *cell = cell_queue_.front();
     cell_queue_.pop();
-    return CellHandle(this, cell);
+    return CellHandle(this, cell, device_id_);
 }
 
 void SdkBufferCheckPool::PutCell(Cell *cell) {
