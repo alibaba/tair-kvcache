@@ -892,7 +892,7 @@ TEST_F(GrpcStubTest, TestGetClusterInfoWithLeaderElector) {
 
     // Write node endpoint info so GetClusterInfo can read it.
     NodeEndpointInfo node_info("node1", "127.0.0.1", 9001, 9002, 9003, 9004);
-    ASSERT_EQ(EC_OK, leader_elector->WriteNodeInfo(leader_elector->GetLeaderNodeID(), node_info));
+    ASSERT_EQ(EC_OK, leader_elector->SetSelfNodeInfo(node_info));
 
     // Recreate MetaServiceImpl with the leader elector.
     meta_service_impl_ = std::make_shared<MetaServiceImpl>(cache_manager_, metrics_reporter_, leader_elector);

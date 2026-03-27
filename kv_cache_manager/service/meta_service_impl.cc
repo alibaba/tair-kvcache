@@ -623,7 +623,7 @@ void MetaServiceImpl::GetClusterInfo(RequestContext *request_context,
     // 尝试读取 leader 的节点连接信息
     if (!leader_node_id.empty()) {
         NodeEndpointInfo node_info;
-        ErrorCode ec = leader_elector_->ReadNodeInfo(leader_node_id, node_info);
+        ErrorCode ec = leader_elector_->GetLeaderNodeInfo(node_info);
         if (ec == EC_OK) {
             auto *endpoint = response->mutable_leader_endpoint();
             endpoint->set_node_id(node_info.node_id());
@@ -637,6 +637,11 @@ void MetaServiceImpl::GetClusterInfo(RequestContext *request_context,
                           request->trace_id().c_str(),
                           leader_node_id.c_str(),
                           ec);
+            status->set_code(proto::meta::INTERNAL_ERROR);
+            status->set_message("Leader endpoint unavailable: leader exists but node info lookup failed");
+            request_context->set_status_code(status->code());
+            SET_SPAN_TRACER_STR_IN_HEADER(request_context);
+            return;
         }
     }
 

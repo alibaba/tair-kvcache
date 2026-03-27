@@ -536,16 +536,6 @@ int64_t LeaderElector::GetForbidCampaignLeaderTimeMs() const { return forbid_cam
 
 int64_t LeaderElector::GetLastLoopTimeUs() const { return last_loop_time_; }
 
-void LeaderElector::SetLeaderInfo(const std::string &leader_info) {
-    std::unique_lock<std::mutex> lock(leader_info_mutex_);
-    leader_info_ = leader_info;
-}
-
-std::string LeaderElector::GetLeaderInfo() const {
-    std::unique_lock<std::mutex> lock(leader_info_mutex_);
-    return leader_info_;
-}
-
 std::string LeaderElector::GetLeaderNodeID() const {
     std::unique_lock guard(current_lock_holder_mutex_);
     return current_lock_holder_;
@@ -553,12 +543,29 @@ std::string LeaderElector::GetLeaderNodeID() const {
 
 std::string LeaderElector::GetSelfNodeID() const { return lock_value_; }
 
-ErrorCode LeaderElector::WriteNodeInfo(const std::string &node_id, const NodeEndpointInfo &node_info) {
+ErrorCode LeaderElector::SetNodeInfo(const std::string &node_id, const NodeEndpointInfo &node_info) {
     std::string key = "_TAIR_KVCM_NODE_INFO_" + node_id;
     return coordination_backend_->SetValue(key, node_info.ToJsonString());
 }
 
-ErrorCode LeaderElector::ReadNodeInfo(const std::string &node_id, NodeEndpointInfo &out_node_info) {
+ErrorCode LeaderElector::SetSelfNodeInfo(const NodeEndpointInfo &node_info) {
+    {
+        std::lock_guard<std::mutex> guard(self_node_info_mutex_);
+        self_node_info_cache_ = std::make_unique<NodeEndpointInfo>(node_info);
+    }
+    return SetNodeInfo(GetSelfNodeID(), node_info);
+}
+
+ErrorCode LeaderElector::GetSelfNodeInfo(NodeEndpointInfo &out_node_info) const {
+    std::lock_guard<std::mutex> guard(self_node_info_mutex_);
+    if (!self_node_info_cache_) {
+        return EC_NOENT;
+    }
+    out_node_info = *self_node_info_cache_;
+    return EC_OK;
+}
+
+ErrorCode LeaderElector::GetNodeInfo(const std::string &node_id, NodeEndpointInfo &out_node_info) {
     std::string key = "_TAIR_KVCM_NODE_INFO_" + node_id;
     std::string json_str;
     ErrorCode ec = coordination_backend_->GetValue(key, json_str);
@@ -570,6 +577,18 @@ ErrorCode LeaderElector::ReadNodeInfo(const std::string &node_id, NodeEndpointIn
         return EC_ERROR;
     }
     return EC_OK;
+}
+
+ErrorCode LeaderElector::GetLeaderNodeInfo(NodeEndpointInfo &out_node_info) {
+    std::string leader_node_id = GetLeaderNodeID();
+    if (leader_node_id.empty()) {
+        return EC_NOENT;
+    }
+    // 自身是 leader 时直接使用本地缓存，避免 coordination backend 的远程调用
+    if (leader_node_id == GetSelfNodeID()) {
+        return GetSelfNodeInfo(out_node_info);
+    }
+    return GetNodeInfo(leader_node_id, out_node_info);
 }
 
 } // namespace kv_cache_manager

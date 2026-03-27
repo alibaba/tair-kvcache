@@ -279,22 +279,6 @@ TEST_F(LeaderElectorTest, LeaderLosesLock) {
     elector->Stop();
 }
 
-// 测试设置和获取领导者信息
-TEST_F(LeaderElectorTest, LeaderInfo) {
-    auto elector = CreateElector();
-
-    std::string test_info = "test leader information";
-    elector->SetLeaderInfo(test_info);
-
-    EXPECT_EQ(elector->GetLeaderInfo(), test_info);
-
-    // 更新领导者信息
-    std::string new_info = "updated leader information";
-    elector->SetLeaderInfo(new_info);
-
-    EXPECT_EQ(elector->GetLeaderInfo(), new_info);
-}
-
 // 测试禁止竞选时间
 TEST_F(LeaderElectorTest, ForbidCampaignTime) {
     auto elector = CreateElector();
@@ -404,10 +388,6 @@ TEST_F(LeaderElectorTest, MethodsWhenStopped) {
     EXPECT_FALSE(elector->IsLeader());
     EXPECT_EQ(elector->GetLeaseExpirationTime(), -1);
 
-    // 设置领导者信息
-    elector->SetLeaderInfo("test info");
-    EXPECT_EQ(elector->GetLeaderInfo(), "test info");
-
     // 调用 Demote（应该没有效果）
     EXPECT_NO_THROW(elector->Demote());
 }
@@ -496,60 +476,6 @@ TEST_F(LeaderElectorTest, ThreadSafeIsLeader) {
     elector->Stop();
 }
 
-// 测试领导者信息在多线程环境下的安全性
-TEST_F(LeaderElectorTest, ThreadSafeLeaderInfo) {
-    auto elector = CreateElector();
-
-    // 设置初始领导者信息
-    elector->SetLeaderInfo("initial");
-
-    // 创建读写线程
-    std::vector<std::thread> writers;
-    std::vector<std::thread> readers;
-    std::atomic<bool> stop{false};
-    std::atomic<int> write_count{0};
-    std::atomic<int> read_count{0};
-
-    // 启动写线程
-    for (int i = 0; i < 3; ++i) {
-        writers.emplace_back([&elector, &stop, &write_count, i]() {
-            while (!stop.load()) {
-                std::string info = "writer_" + std::to_string(i) + "_" + std::to_string(write_count.load());
-                elector->SetLeaderInfo(info);
-                write_count++;
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
-        });
-    }
-
-    // 启动读线程
-    for (int i = 0; i < 5; ++i) {
-        readers.emplace_back([&elector, &stop, &read_count]() {
-            while (!stop.load()) {
-                elector->GetLeaderInfo();
-                read_count++;
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            }
-        });
-    }
-
-    // 运行一段时间
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    stop = true;
-
-    // 等待所有线程结束
-    for (auto &t : writers) {
-        t.join();
-    }
-    for (auto &t : readers) {
-        t.join();
-    }
-
-    // 验证没有崩溃
-    EXPECT_GT(write_count.load(), 0);
-    EXPECT_GT(read_count.load(), 0);
-}
-
 // 测试两个选举器竞争时，原领导者长期未续约，另一个选举器能正常获得租约
 TEST_F(LeaderElectorTest, LeaseExpirationWithCompetition) {
     // 创建两个选举器，使用不同的锁值
@@ -607,22 +533,24 @@ TEST_F(LeaderElectorTest, LeaseExpirationWithCompetition) {
     EXPECT_TRUE(elector1_no_longer_leader_called) << "elector1's no longer leader callback should be called";
 }
 
-// 测试 WriteNodeInfo / ReadNodeInfo 基本功能
-TEST_F(LeaderElectorTest, WriteAndReadNodeInfo) {
+// 测试 SetSelfNodeInfo / GetNodeInfo 基本功能
+TEST_F(LeaderElectorTest, SetSelfNodeInfoAndGetNodeInfo) {
     auto elector = CreateElector();
 
+    std::string self_node_id = elector->GetSelfNodeID();
+
     // 写入节点信息
-    NodeEndpointInfo write_info("node_1", "192.168.1.100", 8001, 8002, 9001, 9002);
-    ErrorCode ec = elector->WriteNodeInfo("node_1", write_info);
+    NodeEndpointInfo write_info(self_node_id, "192.168.1.100", 8001, 8002, 9001, 9002);
+    ErrorCode ec = elector->SetSelfNodeInfo(write_info);
     EXPECT_EQ(EC_OK, ec);
 
     // 读取节点信息
     NodeEndpointInfo read_info;
-    ec = elector->ReadNodeInfo("node_1", read_info);
+    ec = elector->GetNodeInfo(self_node_id, read_info);
     EXPECT_EQ(EC_OK, ec);
 
     // 验证所有字段
-    EXPECT_EQ("node_1", read_info.node_id());
+    EXPECT_EQ(self_node_id, read_info.node_id());
     EXPECT_EQ("192.168.1.100", read_info.host());
     EXPECT_EQ(8001, read_info.meta_rpc_port());
     EXPECT_EQ(8002, read_info.meta_http_port());
@@ -635,11 +563,11 @@ TEST_F(LeaderElectorTest, ReadNonExistentNodeInfo) {
     auto elector = CreateElector();
 
     NodeEndpointInfo read_info;
-    ErrorCode ec = elector->ReadNodeInfo("nonexistent_node", read_info);
+    ErrorCode ec = elector->GetNodeInfo("nonexistent_node", read_info);
     EXPECT_NE(EC_OK, ec);
 }
 
-// 测试 Leader 写入节点信息后，通过 GetLeaderNodeID + ReadNodeInfo 可查到 Leader 连接方式
+// 测试 Leader 写入节点信息后，通过 GetLeaderNodeInfo 可查到 Leader 连接方式
 TEST_F(LeaderElectorTest, LeaderDiscoveryEndToEnd) {
     const std::string advertised_host = "10.0.0.42";
     const int32_t meta_rpc_port = 50051;
@@ -665,7 +593,7 @@ TEST_F(LeaderElectorTest, LeaderDiscoveryEndToEnd) {
     NodeEndpointInfo node_info(self_node_id, advertised_host,
                                meta_rpc_port, meta_http_port,
                                admin_rpc_port, admin_http_port);
-    ErrorCode ec = elector->WriteNodeInfo(self_node_id, node_info);
+    ErrorCode ec = elector->SetSelfNodeInfo(node_info);
     ASSERT_EQ(EC_OK, ec);
 
     // 模拟客户端发现 leader 的流程：
@@ -674,9 +602,9 @@ TEST_F(LeaderElectorTest, LeaderDiscoveryEndToEnd) {
     EXPECT_FALSE(leader_node_id.empty());
     EXPECT_EQ(self_node_id, leader_node_id);
 
-    // 2. 通过 ReadNodeInfo 读取 leader 的连接信息
+    // 2. 通过 GetLeaderNodeInfo 读取 leader 的连接信息
     NodeEndpointInfo leader_info;
-    ec = elector->ReadNodeInfo(leader_node_id, leader_info);
+    ec = elector->GetLeaderNodeInfo(leader_info);
     ASSERT_EQ(EC_OK, ec);
 
     // 3. 验证返回的连接信息完全正确（使用 advertised_host 保证确定性）
@@ -709,8 +637,8 @@ TEST_F(LeaderElectorTest, LeaderDiscoveryTwoNodes) {
     // 两个节点都写入自己的连接信息
     NodeEndpointInfo info1("instance1", host1, 8001, 8002, 9001, 9002);
     NodeEndpointInfo info2("instance2", host2, 8003, 8004, 9003, 9004);
-    ASSERT_EQ(EC_OK, elector1->WriteNodeInfo("instance1", info1));
-    ASSERT_EQ(EC_OK, elector2->WriteNodeInfo("instance2", info2));
+    ASSERT_EQ(EC_OK, elector1->SetSelfNodeInfo(info1));
+    ASSERT_EQ(EC_OK, elector2->SetSelfNodeInfo(info2));
 
     // 启动竞争
     EXPECT_TRUE(elector1->Start());
@@ -732,7 +660,7 @@ TEST_F(LeaderElectorTest, LeaderDiscoveryTwoNodes) {
     // 用非 leader 的 elector 读取 leader 的节点信息（模拟从 follower 查询 leader）
     LeaderElector *follower = elector1->IsLeader() ? elector2.get() : elector1.get();
     NodeEndpointInfo leader_info;
-    ErrorCode ec = follower->ReadNodeInfo(leader_id, leader_info);
+    ErrorCode ec = follower->GetNodeInfo(leader_id, leader_info);
     ASSERT_EQ(EC_OK, ec);
 
     // 验证读取到的信息和 leader 的注册信息一致
@@ -759,17 +687,19 @@ TEST_F(LeaderElectorTest, LeaderDiscoveryTwoNodes) {
 TEST_F(LeaderElectorTest, NodeInfoOverwrite) {
     auto elector = CreateElector();
 
+    std::string self_node_id = elector->GetSelfNodeID();
+
     // 第一次写入
-    NodeEndpointInfo info1("node_1", "10.0.0.1", 8001, 8002, 9001, 9002);
-    ASSERT_EQ(EC_OK, elector->WriteNodeInfo("node_1", info1));
+    NodeEndpointInfo info1(self_node_id, "10.0.0.1", 8001, 8002, 9001, 9002);
+    ASSERT_EQ(EC_OK, elector->SetSelfNodeInfo(info1));
 
     // 覆盖写入（模拟端口变更）
-    NodeEndpointInfo info2("node_1", "10.0.0.1", 9999, 9998, 9997, 9996);
-    ASSERT_EQ(EC_OK, elector->WriteNodeInfo("node_1", info2));
+    NodeEndpointInfo info2(self_node_id, "10.0.0.1", 9999, 9998, 9997, 9996);
+    ASSERT_EQ(EC_OK, elector->SetSelfNodeInfo(info2));
 
     // 读取应该是最新的值
     NodeEndpointInfo read_info;
-    ASSERT_EQ(EC_OK, elector->ReadNodeInfo("node_1", read_info));
+    ASSERT_EQ(EC_OK, elector->GetNodeInfo(self_node_id, read_info));
     EXPECT_EQ("10.0.0.1", read_info.host());
     EXPECT_EQ(9999, read_info.meta_rpc_port());
     EXPECT_EQ(9998, read_info.meta_http_port());

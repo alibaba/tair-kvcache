@@ -67,14 +67,14 @@ public:
     void SetBecomeLeaderHandler(const HandlerFuncType &handler);
 
     // Leader 信息
-    void SetLeaderInfo(const std::string &leader_info);
-    std::string GetLeaderInfo() const;
     std::string GetLeaderNodeID() const;
     std::string GetSelfNodeID() const;
 
     // 节点连接信息存储（通过 CoordinationBackend KV）
-    ErrorCode WriteNodeInfo(const std::string &node_id, const NodeEndpointInfo &node_info);
-    ErrorCode ReadNodeInfo(const std::string &node_id, NodeEndpointInfo &out_node_info);
+    ErrorCode SetSelfNodeInfo(const NodeEndpointInfo &node_info);
+    ErrorCode GetSelfNodeInfo(NodeEndpointInfo &out_node_info) const;
+    ErrorCode GetNodeInfo(const std::string &node_id, NodeEndpointInfo &out_node_info);
+    ErrorCode GetLeaderNodeInfo(NodeEndpointInfo &out_node_info);
 
     // 选主控制
     void SetForbidCampaignLeaderTimeMs(int64_t forbid_time);
@@ -99,6 +99,9 @@ private:
     void RequestPromoteToLeader();
     void RequestDemoteToFollower();
     void ProcessStateTransitionsForTest();
+
+    // 节点信息存储（内部实现）
+    ErrorCode SetNodeInfo(const std::string &node_id, const NodeEndpointInfo &node_info);
 
     // 锁状态更新
     void UpdateLockStatus(int64_t current_time, bool acquired, int64_t lease_expiration_time);
@@ -142,11 +145,12 @@ private:
     mutable std::mutex callback_mutex_;
 
     // === 其他配置 ===
-    std::string leader_info_;
-    mutable std::mutex leader_info_mutex_;
-
     std::atomic<int64_t> next_can_campaign_time_us_{0};
     int64_t forbid_campaign_time_ms_ = 0;
+
+    // === 自身节点信息缓存 ===
+    std::unique_ptr<NodeEndpointInfo> self_node_info_cache_;
+    mutable std::mutex self_node_info_mutex_;
 };
 
 typedef std::shared_ptr<LeaderElector> LeaderElectorPtr;

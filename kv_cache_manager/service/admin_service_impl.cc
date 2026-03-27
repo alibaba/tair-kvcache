@@ -830,15 +830,16 @@ void AdminServiceImpl::GetManagerClusterInfo(RequestContext *request_context,
 
     response->set_self_leader_expiration_time(leader_elector_->GetLeaseExpirationTime());
     std::string leader_node_id = leader_elector_->GetLeaderNodeID();
+    std::string self_node_id = leader_elector_->GetSelfNodeID();
     response->set_leader_node_id(leader_node_id);
-    response->set_self_node_id(leader_elector_->GetSelfNodeID());
+    response->set_self_node_id(self_node_id);
     // TODO: 实现实际的集群信息获取逻辑
     response->set_info_updated_time(0);
 
     // 获取 leader 的节点连接信息
     if (!leader_node_id.empty()) {
         NodeEndpointInfo node_info;
-        ErrorCode ec = leader_elector_->ReadNodeInfo(leader_node_id, node_info);
+        ErrorCode ec = leader_elector_->GetLeaderNodeInfo(node_info);
         if (ec == EC_OK) {
             auto *endpoint = response->mutable_leader_endpoint();
             endpoint->set_node_id(node_info.node_id());
@@ -852,6 +853,10 @@ void AdminServiceImpl::GetManagerClusterInfo(RequestContext *request_context,
                           request->trace_id().c_str(),
                           leader_node_id.c_str(),
                           ec);
+            status->set_code(proto::admin::INTERNAL_ERROR);
+            status->set_message("Leader endpoint unavailable: leader exists but node info lookup failed");
+            request_context->set_status_code(status->code());
+            return;
         }
     }
 

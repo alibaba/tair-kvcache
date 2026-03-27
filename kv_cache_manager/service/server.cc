@@ -340,7 +340,7 @@ bool Server::CreateLeaderElector() {
                                    config_.GetServiceAdminRpcPort(),
                                    config_.GetServiceAdminHttpPort());
 
-        ErrorCode ec = leader_elector_->WriteNodeInfo(node_id, node_info);
+        ErrorCode ec = leader_elector_->SetSelfNodeInfo(node_info);
         if (ec != EC_OK) {
             KVCM_LOG_WARN("failed to write node info for node_id[%s], ec=%d", node_id.c_str(), ec);
         } else {
