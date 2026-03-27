@@ -358,29 +358,35 @@ private:
     };
 
     /**
-     * @brief Determine if a reclamation should be triggered for an
-     * instance group
-     *
-     * A reclamation is triggered based on multiple criteria:
-     * 1. Group total used percentage exceeds quota threshold
-     * 2. Group total used percentage of key count exceeds threshold
-     * 3. A storage type used percentage exceeds it's quota threshold
+     * @brief Calculate the group's WaterLevelExceed data
      *
      * @param request_context The context of the request
      * @param instance_group_name Name of the instance group to check
      * @param instance_group_quota Quota info for the instance group
      * @param reclaim_strategy Strategy to use for reclamation decisions
      * @param instance_infos Vector of instance information
-     * @param out_water_level_exceed the detailed trigger result
-     * @return true if reclamation should be triggered
-     * @return false if reclamation should not be triggered
+     * @return shared pointer to the result WaterLevelExceed data
      */
-    [[nodiscard]] bool IsTriggerReclaiming(const RequestContext *request_context,
-                                           const std::string &instance_group_name,
-                                           const InstanceGroupQuota &instance_group_quota,
-                                           const std::shared_ptr<CacheReclaimStrategy> &reclaim_strategy,
-                                           const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos,
-                                           WaterLevelExceed &out_water_level_exceed) noexcept;
+    [[nodiscard]] std::shared_ptr<WaterLevelExceed>
+    GetWaterLevelExceed(const RequestContext *request_context,
+                        const std::string &instance_group_name,
+                        const InstanceGroupQuota &instance_group_quota,
+                        const std::shared_ptr<CacheReclaimStrategy> &reclaim_strategy,
+                        const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) noexcept;
+
+    /**
+     * @brief Determine if a reclamation should be triggered for an
+     * instance group based on the passed-in WaterLevelExceed instance
+     *
+     * A reclamation is triggered based on multiple criteria:
+     * 1. Group total used percentage exceeds quota threshold
+     * 2. Group total used percentage of key count exceeds threshold
+     * 3. A storage type used percentage exceeds it's quota threshold
+     *
+     * @param water_level_exceed shared pointer to WaterLevelExceed
+     * @return true for trigger and verse visa
+     */
+    static bool IsTriggerReclaiming(const std::shared_ptr<WaterLevelExceed> &water_level_exceed);
 
     /**
      * @brief Reclaim cache entries using LRU (Least Recently Used)
@@ -474,7 +480,7 @@ private:
 
     struct GroupUsageData;
 
-    [[nodiscard]] GroupUsageData
+    [[nodiscard]] std::shared_ptr<GroupUsageData>
     GetGroupUsageData(const RequestContext *request_context,
                       const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) const noexcept;
 

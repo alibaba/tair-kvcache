@@ -872,14 +872,13 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming00) {
 
     const auto ins_group = InstanceGroupFactory();
     ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_size(16);
-    CacheReclaimer::WaterLevelExceed water_level_exceed;
     cache_reclaimer_->job_state_flag_ = true;
-    ASSERT_FALSE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                       ins_group->name(),
-                                                       ins_group->quota(),
-                                                       ins_group->cache_config()->reclaim_strategy(),
-                                                       instance_infos,
-                                                       water_level_exceed));
+    auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                     ins_group->name(),
+                                                     ins_group->quota(),
+                                                     ins_group->cache_config()->reclaim_strategy(),
+                                                     instance_infos);
+    ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
 }
 
 TEST_F(CacheReclaimerTest, TestTriggerReclaiming01) {
@@ -894,14 +893,13 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming01) {
 
     const auto ins_group = InstanceGroupFactory();
     ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_size(1024);
-    CacheReclaimer::WaterLevelExceed water_level_exceed;
     cache_reclaimer_->job_state_flag_ = true;
-    ASSERT_FALSE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                       ins_group->name(),
-                                                       ins_group->quota(),
-                                                       ins_group->cache_config()->reclaim_strategy(),
-                                                       instance_infos,
-                                                       water_level_exceed));
+    auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                     ins_group->name(),
+                                                     ins_group->quota(),
+                                                     ins_group->cache_config()->reclaim_strategy(),
+                                                     instance_infos);
+    ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
 }
 
 TEST_F(CacheReclaimerTest, TestTriggerReclaiming02) {
@@ -916,14 +914,13 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming02) {
 
     const auto ins_group = InstanceGroupFactory();
     ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_size(1025);
-    CacheReclaimer::WaterLevelExceed water_level_exceed;
     cache_reclaimer_->job_state_flag_ = true;
-    ASSERT_FALSE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                       ins_group->name(),
-                                                       ins_group->quota(),
-                                                       ins_group->cache_config()->reclaim_strategy(),
-                                                       instance_infos,
-                                                       water_level_exceed));
+    auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                     ins_group->name(),
+                                                     ins_group->quota(),
+                                                     ins_group->cache_config()->reclaim_strategy(),
+                                                     instance_infos);
+    ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
 }
 
 TEST_F(CacheReclaimerTest, TestTriggerReclaiming03) {
@@ -941,14 +938,13 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming03) {
 
     const auto ins_group = InstanceGroupFactory();
     ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_size(1025);
-    CacheReclaimer::WaterLevelExceed water_level_exceed;
     cache_reclaimer_->job_state_flag_ = true;
-    ASSERT_FALSE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                       ins_group->name(),
-                                                       ins_group->quota(),
-                                                       ins_group->cache_config()->reclaim_strategy(),
-                                                       instance_infos,
-                                                       water_level_exceed));
+    auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                     ins_group->name(),
+                                                     ins_group->quota(),
+                                                     ins_group->cache_config()->reclaim_strategy(),
+                                                     instance_infos);
+    ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
 }
 
 TEST_F(CacheReclaimerTest, TestTriggerReclaiming04) {
@@ -967,23 +963,22 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming04) {
 
     const auto ins_group = InstanceGroupFactory();
     ins_group->quota_.set_capacity(2048);
-    CacheReclaimer::WaterLevelExceed water_level_exceed;
     cache_reclaimer_->job_state_flag_ = true;
-    ASSERT_TRUE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                      ins_group->name(),
-                                                      ins_group->quota(),
-                                                      ins_group->cache_config()->reclaim_strategy(),
-                                                      instance_infos,
-                                                      water_level_exceed));
-    ASSERT_TRUE(water_level_exceed.CheckGroupWaterLevelExceed());
-    ASSERT_FALSE(water_level_exceed.CheckStorageTypeWaterLevelExceed());
-    ASSERT_TRUE(water_level_exceed.GetGeneralWaterLevelExceed());
-    ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
-    ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
-    ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
-    ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
-    ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
-    ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
+    auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                     ins_group->name(),
+                                                     ins_group->quota(),
+                                                     ins_group->cache_config()->reclaim_strategy(),
+                                                     instance_infos);
+    ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
+    ASSERT_TRUE(wle->CheckGroupWaterLevelExceed());
+    ASSERT_FALSE(wle->CheckStorageTypeWaterLevelExceed());
+    ASSERT_TRUE(wle->GetGeneralWaterLevelExceed());
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
 }
 
 TEST_F(CacheReclaimerTest, TestTriggerReclaiming05) {
@@ -996,14 +991,13 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming05) {
 
     const auto ins_group = InstanceGroupFactory();
     ins_group->quota_.set_capacity(2048);
-    CacheReclaimer::WaterLevelExceed water_level_exceed;
     cache_reclaimer_->job_state_flag_ = true;
-    ASSERT_FALSE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                       ins_group->name(),
-                                                       ins_group->quota(),
-                                                       ins_group->cache_config()->reclaim_strategy(),
-                                                       instance_infos,
-                                                       water_level_exceed));
+    auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                     ins_group->name(),
+                                                     ins_group->quota(),
+                                                     ins_group->cache_config()->reclaim_strategy(),
+                                                     instance_infos);
+    ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
 }
 
 TEST_F(CacheReclaimerTest, TestTriggerReclaiming06) {
@@ -1017,23 +1011,22 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming06) {
     const auto ins_group = InstanceGroupFactory();
     ins_group->quota_.set_capacity(2048);
     ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.5);
-    CacheReclaimer::WaterLevelExceed water_level_exceed;
     cache_reclaimer_->job_state_flag_ = true;
-    ASSERT_TRUE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                      ins_group->name(),
-                                                      ins_group->quota(),
-                                                      ins_group->cache_config()->reclaim_strategy(),
-                                                      instance_infos,
-                                                      water_level_exceed));
-    ASSERT_TRUE(water_level_exceed.CheckGroupWaterLevelExceed());
-    ASSERT_FALSE(water_level_exceed.CheckStorageTypeWaterLevelExceed());
-    ASSERT_TRUE(water_level_exceed.GetGeneralWaterLevelExceed());
-    ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
-    ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
-    ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
-    ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
-    ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
-    ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
+    auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                     ins_group->name(),
+                                                     ins_group->quota(),
+                                                     ins_group->cache_config()->reclaim_strategy(),
+                                                     instance_infos);
+    ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
+    ASSERT_TRUE(wle->CheckGroupWaterLevelExceed());
+    ASSERT_FALSE(wle->CheckStorageTypeWaterLevelExceed());
+    ASSERT_TRUE(wle->GetGeneralWaterLevelExceed());
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
 }
 
 TEST_F(CacheReclaimerTest, TestTriggerReclaiming07) {
@@ -1053,14 +1046,13 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming07) {
     const auto ins_group = InstanceGroupFactory();
     ins_group->quota_.set_capacity(2048);
     ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(1.2);
-    CacheReclaimer::WaterLevelExceed water_level_exceed;
     cache_reclaimer_->job_state_flag_ = true;
-    ASSERT_FALSE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                       ins_group->name(),
-                                                       ins_group->quota(),
-                                                       ins_group->cache_config()->reclaim_strategy(),
-                                                       instance_infos,
-                                                       water_level_exceed));
+    auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                     ins_group->name(),
+                                                     ins_group->quota(),
+                                                     ins_group->cache_config()->reclaim_strategy(),
+                                                     instance_infos);
+    ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
 }
 
 TEST_F(CacheReclaimerTest, TestTriggerReclaiming08) {
@@ -1089,23 +1081,22 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming08) {
     const auto ins_group = InstanceGroupFactory();
     ins_group->quota_.set_capacity(2048);
     ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(1.2);
-    CacheReclaimer::WaterLevelExceed water_level_exceed;
     cache_reclaimer_->job_state_flag_ = true;
-    ASSERT_TRUE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                      ins_group->name(),
-                                                      ins_group->quota(),
-                                                      ins_group->cache_config()->reclaim_strategy(),
-                                                      instance_infos,
-                                                      water_level_exceed));
-    ASSERT_TRUE(water_level_exceed.CheckGroupWaterLevelExceed());
-    ASSERT_FALSE(water_level_exceed.CheckStorageTypeWaterLevelExceed());
-    ASSERT_TRUE(water_level_exceed.GetGeneralWaterLevelExceed());
-    ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
-    ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
-    ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
-    ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
-    ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
-    ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
+    auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                     ins_group->name(),
+                                                     ins_group->quota(),
+                                                     ins_group->cache_config()->reclaim_strategy(),
+                                                     instance_infos);
+    ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
+    ASSERT_TRUE(wle->CheckGroupWaterLevelExceed());
+    ASSERT_FALSE(wle->CheckStorageTypeWaterLevelExceed());
+    ASSERT_TRUE(wle->GetGeneralWaterLevelExceed());
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
 }
 
 TEST_F(CacheReclaimerTest, TestTriggerReclaiming09) {
@@ -1125,14 +1116,13 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming09) {
     instance_infos.emplace_back(ins_info);
 
     const auto &ins_group = instance_groups.at(0);
-    CacheReclaimer::WaterLevelExceed water_level_exceed;
     cache_reclaimer_->job_state_flag_ = true;
-    ASSERT_FALSE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                       ins_group->name(),
-                                                       ins_group->quota(),
-                                                       ins_group->cache_config()->reclaim_strategy(),
-                                                       instance_infos,
-                                                       water_level_exceed));
+    auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                     ins_group->name(),
+                                                     ins_group->quota(),
+                                                     ins_group->cache_config()->reclaim_strategy(),
+                                                     instance_infos);
+    ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
 }
 
 TEST_F(CacheReclaimerTest, TestTriggerReclaiming10) {
@@ -1153,23 +1143,22 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming10) {
 
     const auto ins_group = InstanceGroupFactory();
     ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(1.0);
-    CacheReclaimer::WaterLevelExceed water_level_exceed;
     cache_reclaimer_->job_state_flag_ = true;
-    ASSERT_TRUE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                      ins_group->name(),
-                                                      ins_group->quota(),
-                                                      ins_group->cache_config()->reclaim_strategy(),
-                                                      instance_infos,
-                                                      water_level_exceed));
-    ASSERT_TRUE(water_level_exceed.CheckGroupWaterLevelExceed());
-    ASSERT_FALSE(water_level_exceed.CheckStorageTypeWaterLevelExceed());
-    ASSERT_TRUE(water_level_exceed.GetGeneralWaterLevelExceed());
-    ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
-    ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
-    ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
-    ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
-    ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
-    ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
+    auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                     ins_group->name(),
+                                                     ins_group->quota(),
+                                                     ins_group->cache_config()->reclaim_strategy(),
+                                                     instance_infos);
+    ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
+    ASSERT_TRUE(wle->CheckGroupWaterLevelExceed());
+    ASSERT_FALSE(wle->CheckStorageTypeWaterLevelExceed());
+    ASSERT_TRUE(wle->GetGeneralWaterLevelExceed());
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
 }
 
 TEST_F(CacheReclaimerTest, TestTriggerReclaiming11) {
@@ -1189,23 +1178,22 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming11) {
     instance_infos.emplace_back(ins_info);
 
     const auto &ins_group = instance_groups.at(0);
-    CacheReclaimer::WaterLevelExceed water_level_exceed;
     cache_reclaimer_->job_state_flag_ = true;
-    ASSERT_TRUE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                      ins_group->name(),
-                                                      ins_group->quota(),
-                                                      ins_group->cache_config()->reclaim_strategy(),
-                                                      instance_infos,
-                                                      water_level_exceed));
-    ASSERT_TRUE(water_level_exceed.CheckGroupWaterLevelExceed());
-    ASSERT_FALSE(water_level_exceed.CheckStorageTypeWaterLevelExceed());
-    ASSERT_TRUE(water_level_exceed.GetGeneralWaterLevelExceed());
-    ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
-    ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
-    ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
-    ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
-    ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
-    ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
+    auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                     ins_group->name(),
+                                                     ins_group->quota(),
+                                                     ins_group->cache_config()->reclaim_strategy(),
+                                                     instance_infos);
+    ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
+    ASSERT_TRUE(wle->CheckGroupWaterLevelExceed());
+    ASSERT_FALSE(wle->CheckStorageTypeWaterLevelExceed());
+    ASSERT_TRUE(wle->GetGeneralWaterLevelExceed());
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
 }
 
 TEST_F(CacheReclaimerTest, TestTriggerReclaiming15) {
@@ -1215,14 +1203,13 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming15) {
     const auto ins_group = InstanceGroupFactory();
     ins_group->quota_.set_capacity(2048);
     instance_infos.clear();
-    CacheReclaimer::WaterLevelExceed water_level_exceed;
     cache_reclaimer_->job_state_flag_ = true;
-    ASSERT_FALSE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                       ins_group->name(),
-                                                       ins_group->quota(),
-                                                       ins_group->cache_config()->reclaim_strategy(),
-                                                       instance_infos,
-                                                       water_level_exceed));
+    auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                     ins_group->name(),
+                                                     ins_group->quota(),
+                                                     ins_group->cache_config()->reclaim_strategy(),
+                                                     instance_infos);
+    ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
 }
 
 TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
@@ -1247,23 +1234,22 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
         max_key_count = 0;
 
         const auto &ins_group = instance_groups.at(0);
-        CacheReclaimer::WaterLevelExceed water_level_exceed;
         cache_reclaimer_->job_state_flag_ = true;
-        ASSERT_TRUE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                          ins_group->name(),
-                                                          ins_group->quota(),
-                                                          ins_group->cache_config()->reclaim_strategy(),
-                                                          instance_infos,
-                                                          water_level_exceed));
-        ASSERT_TRUE(water_level_exceed.CheckGroupWaterLevelExceed());
-        ASSERT_FALSE(water_level_exceed.CheckStorageTypeWaterLevelExceed());
-        ASSERT_TRUE(water_level_exceed.GetGeneralWaterLevelExceed());
-        ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
-        ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
-        ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
-        ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
-        ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
-        ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
+        auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                         ins_group->name(),
+                                                         ins_group->quota(),
+                                                         ins_group->cache_config()->reclaim_strategy(),
+                                                         instance_infos);
+        ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
+        ASSERT_TRUE(wle->CheckGroupWaterLevelExceed());
+        ASSERT_FALSE(wle->CheckStorageTypeWaterLevelExceed());
+        ASSERT_TRUE(wle->GetGeneralWaterLevelExceed());
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
     }
 
     {
@@ -1276,14 +1262,13 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
         max_key_count = 0;
 
         const auto &ins_group = instance_groups.at(0);
-        CacheReclaimer::WaterLevelExceed water_level_exceed;
         cache_reclaimer_->job_state_flag_ = true;
-        ASSERT_FALSE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                           ins_group->name(),
-                                                           ins_group->quota(),
-                                                           ins_group->cache_config()->reclaim_strategy(),
-                                                           instance_infos,
-                                                           water_level_exceed));
+        auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                         ins_group->name(),
+                                                         ins_group->quota(),
+                                                         ins_group->cache_config()->reclaim_strategy(),
+                                                         instance_infos);
+        ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
     }
 
     {
@@ -1297,23 +1282,22 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
 
         const auto ins_group = InstanceGroupFactory();
         ins_group->quota_.set_capacity(0);
-        CacheReclaimer::WaterLevelExceed water_level_exceed;
         cache_reclaimer_->job_state_flag_ = true;
-        ASSERT_TRUE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                          ins_group->name(),
-                                                          ins_group->quota(),
-                                                          ins_group->cache_config()->reclaim_strategy(),
-                                                          instance_infos,
-                                                          water_level_exceed));
-        ASSERT_TRUE(water_level_exceed.CheckGroupWaterLevelExceed());
-        ASSERT_FALSE(water_level_exceed.CheckStorageTypeWaterLevelExceed());
-        ASSERT_TRUE(water_level_exceed.GetGeneralWaterLevelExceed());
-        ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
-        ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
-        ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
-        ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
-        ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
-        ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
+        auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                         ins_group->name(),
+                                                         ins_group->quota(),
+                                                         ins_group->cache_config()->reclaim_strategy(),
+                                                         instance_infos);
+        ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
+        ASSERT_TRUE(wle->CheckGroupWaterLevelExceed());
+        ASSERT_FALSE(wle->CheckStorageTypeWaterLevelExceed());
+        ASSERT_TRUE(wle->GetGeneralWaterLevelExceed());
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
     }
 
     {
@@ -1327,14 +1311,13 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
 
         const auto ins_group = InstanceGroupFactory();
         ins_group->quota_.set_capacity(0);
-        CacheReclaimer::WaterLevelExceed water_level_exceed;
         cache_reclaimer_->job_state_flag_ = true;
-        ASSERT_FALSE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                           ins_group->name(),
-                                                           ins_group->quota(),
-                                                           ins_group->cache_config()->reclaim_strategy(),
-                                                           instance_infos,
-                                                           water_level_exceed));
+        auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                         ins_group->name(),
+                                                         ins_group->quota(),
+                                                         ins_group->cache_config()->reclaim_strategy(),
+                                                         instance_infos);
+        ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
     }
 
     {
@@ -1348,23 +1331,22 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
 
         const auto ins_group = InstanceGroupFactory();
         ins_group->quota_.set_capacity(-1); // means no capacity, same as 0
-        CacheReclaimer::WaterLevelExceed water_level_exceed;
         cache_reclaimer_->job_state_flag_ = true;
-        ASSERT_TRUE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                          ins_group->name(),
-                                                          ins_group->quota(),
-                                                          ins_group->cache_config()->reclaim_strategy(),
-                                                          instance_infos,
-                                                          water_level_exceed));
-        ASSERT_TRUE(water_level_exceed.CheckGroupWaterLevelExceed());
-        ASSERT_FALSE(water_level_exceed.CheckStorageTypeWaterLevelExceed());
-        ASSERT_TRUE(water_level_exceed.GetGeneralWaterLevelExceed());
-        ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
-        ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
-        ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
-        ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
-        ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
-        ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
+        auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                         ins_group->name(),
+                                                         ins_group->quota(),
+                                                         ins_group->cache_config()->reclaim_strategy(),
+                                                         instance_infos);
+        ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
+        ASSERT_TRUE(wle->CheckGroupWaterLevelExceed());
+        ASSERT_FALSE(wle->CheckStorageTypeWaterLevelExceed());
+        ASSERT_TRUE(wle->GetGeneralWaterLevelExceed());
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
     }
 
     {
@@ -1378,14 +1360,13 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
 
         const auto ins_group = InstanceGroupFactory();
         ins_group->quota_.set_capacity(-1); // means no capacity, same as 0
-        CacheReclaimer::WaterLevelExceed water_level_exceed;
         cache_reclaimer_->job_state_flag_ = true;
-        ASSERT_FALSE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                           ins_group->name(),
-                                                           ins_group->quota(),
-                                                           ins_group->cache_config()->reclaim_strategy(),
-                                                           instance_infos,
-                                                           water_level_exceed));
+        auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                         ins_group->name(),
+                                                         ins_group->quota(),
+                                                         ins_group->cache_config()->reclaim_strategy(),
+                                                         instance_infos);
+        ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
     }
 }
 
@@ -1416,23 +1397,22 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming17) {
         QuotaConfig qc(1024, DataStorageType::DATA_STORAGE_TYPE_HF3FS);
         ins_group->quota_.set_quota_config({qc});
         ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.9);
-        CacheReclaimer::WaterLevelExceed water_level_exceed;
         cache_reclaimer_->job_state_flag_ = true;
-        ASSERT_TRUE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                          ins_group->name(),
-                                                          ins_group->quota(),
-                                                          ins_group->cache_config()->reclaim_strategy(),
-                                                          instance_infos,
-                                                          water_level_exceed));
-        ASSERT_TRUE(water_level_exceed.CheckGroupWaterLevelExceed());
-        ASSERT_TRUE(water_level_exceed.CheckStorageTypeWaterLevelExceed());
-        ASSERT_FALSE(water_level_exceed.GetGeneralWaterLevelExceed());
-        ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
-        ASSERT_TRUE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
-        ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
-        ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
-        ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
-        ASSERT_TRUE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
+        auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                         ins_group->name(),
+                                                         ins_group->quota(),
+                                                         ins_group->cache_config()->reclaim_strategy(),
+                                                         instance_infos);
+        ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
+        ASSERT_TRUE(wle->CheckGroupWaterLevelExceed());
+        ASSERT_TRUE(wle->CheckStorageTypeWaterLevelExceed());
+        ASSERT_FALSE(wle->GetGeneralWaterLevelExceed());
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
+        ASSERT_TRUE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
+        ASSERT_TRUE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
     }
 
     {
@@ -1449,14 +1429,13 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming17) {
         QuotaConfig qc(1024, DataStorageType::DATA_STORAGE_TYPE_HF3FS);
         ins_group->quota_.set_quota_config({qc});
         ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.9);
-        CacheReclaimer::WaterLevelExceed water_level_exceed;
         cache_reclaimer_->job_state_flag_ = true;
-        ASSERT_FALSE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                           ins_group->name(),
-                                                           ins_group->quota(),
-                                                           ins_group->cache_config()->reclaim_strategy(),
-                                                           instance_infos,
-                                                           water_level_exceed));
+        auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                         ins_group->name(),
+                                                         ins_group->quota(),
+                                                         ins_group->cache_config()->reclaim_strategy(),
+                                                         instance_infos);
+        ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
     }
 
     {
@@ -1479,23 +1458,22 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming17) {
         QuotaConfig qc(1024, DataStorageType::DATA_STORAGE_TYPE_HF3FS);
         ins_group->quota_.set_quota_config({qc});
         ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.9);
-        CacheReclaimer::WaterLevelExceed water_level_exceed;
         cache_reclaimer_->job_state_flag_ = true;
-        ASSERT_TRUE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                          ins_group->name(),
-                                                          ins_group->quota(),
-                                                          ins_group->cache_config()->reclaim_strategy(),
-                                                          instance_infos,
-                                                          water_level_exceed));
-        ASSERT_TRUE(water_level_exceed.CheckGroupWaterLevelExceed());
-        ASSERT_TRUE(water_level_exceed.CheckStorageTypeWaterLevelExceed());
-        ASSERT_TRUE(water_level_exceed.GetGeneralWaterLevelExceed());
-        ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
-        ASSERT_TRUE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
-        ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
-        ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
-        ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
-        ASSERT_TRUE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
+        auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                         ins_group->name(),
+                                                         ins_group->quota(),
+                                                         ins_group->cache_config()->reclaim_strategy(),
+                                                         instance_infos);
+        ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
+        ASSERT_TRUE(wle->CheckGroupWaterLevelExceed());
+        ASSERT_TRUE(wle->CheckStorageTypeWaterLevelExceed());
+        ASSERT_TRUE(wle->GetGeneralWaterLevelExceed());
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
+        ASSERT_TRUE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
+        ASSERT_TRUE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
     }
 }
 

@@ -423,15 +423,15 @@ void CacheReclaimer::SetSleepIntervalMs(const RequestContext *request_context,
     LOG_WITH_TRACE(DEBUG, "set sleep interval to [%u] ms", sleep_interval_ms);
 }
 
-bool CacheReclaimer::IsTriggerReclaiming(const RequestContext *request_context,
-                                         const std::string &ins_gr,
-                                         const InstanceGroupQuota &instance_group_quota,
-                                         const std::shared_ptr<CacheReclaimStrategy> &reclaim_strategy,
-                                         const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos,
-                                         WaterLevelExceed &out_water_level_exceed) noexcept {
+std::shared_ptr<CacheReclaimer::WaterLevelExceed>
+CacheReclaimer::GetWaterLevelExceed(const RequestContext *request_context,
+                                    const std::string &ins_gr,
+                                    const InstanceGroupQuota &instance_group_quota,
+                                    const std::shared_ptr<CacheReclaimStrategy> &reclaim_strategy,
+                                    const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) noexcept {
     if (!IsRunning() || IsPaused()) {
         // fast exiting in the middle of one job round
-        return false;
+        return nullptr;
     }
 
     // TODO (rui): per storage backend reclaiming is not supported due
@@ -444,17 +444,14 @@ bool CacheReclaimer::IsTriggerReclaiming(const RequestContext *request_context,
     //       1. the entire instance group usage and capacity quota
     //       2. storage type usage and capacity quota for this group
 
-    auto get_trigger_result = [&request_context, &ins_gr, &out_water_level_exceed]() -> bool {
-        if (out_water_level_exceed.CheckGroupWaterLevelExceed()) {
-            LOG_WITH_GR(DEBUG, "instance group trigger reclaiming");
-            return true;
-        }
-        LOG_WITH_GR(DEBUG, "instance group does not trigger reclaiming");
-        return false;
-    };
+    const auto water_level_exceed = std::make_shared<WaterLevelExceed>();
 
     // 1. calculate the key count and used byte size of this group
-    const GroupUsageData data = GetGroupUsageData(request_context, instance_infos);
+    const auto data = GetGroupUsageData(request_context, instance_infos);
+    if (data == nullptr) {
+        LOG_WITH_GR(ERROR, "group usage data is nullptr");
+        return nullptr;
+    }
 
     // 2. generate the result water level exceeding array
     const double threshold_used_percentage = reclaim_strategy->trigger_strategy().used_percentage();
@@ -473,11 +470,11 @@ bool CacheReclaimer::IsTriggerReclaiming(const RequestContext *request_context,
                         "has reached or exceeded the threshold percentage [%f]",
                         static_cast<std::uint8_t>(type),
                         threshold_used_percentage);
-            out_water_level_exceed.SetWaterLevelExceedByType(type, true);
+            water_level_exceed->SetWaterLevelExceedByType(type, true);
             continue;
         }
         if (const double storage_type_wl =
-                static_cast<double>(data.GetGroupUsageByType(type)) / static_cast<double>(storage_quota.capacity());
+                static_cast<double>(data->GetGroupUsageByType(type)) / static_cast<double>(storage_quota.capacity());
             storage_type_wl + kEpsilon > threshold_used_percentage) {
             LOG_WITH_GR(DEBUG,
                         "instance group storage type [%d] capacity quota used percentage [%f] "
@@ -485,14 +482,14 @@ bool CacheReclaimer::IsTriggerReclaiming(const RequestContext *request_context,
                         static_cast<std::uint8_t>(type),
                         storage_type_wl,
                         threshold_used_percentage);
-            out_water_level_exceed.SetWaterLevelExceedByType(type, true);
+            water_level_exceed->SetWaterLevelExceedByType(type, true);
         }
     }
 
     // 2.2. result for the entire instance group
-    if (data.grp_used_key_cnt_ == 0 || data.grp_used_byte_sz_ == 0) {
-        out_water_level_exceed.SetGeneralWaterLevelExceed(false);
-        return get_trigger_result();
+    if (data->grp_used_key_cnt_ == 0 || data->grp_used_byte_sz_ == 0) {
+        water_level_exceed->SetGeneralWaterLevelExceed(false);
+        return water_level_exceed;
     }
 
     // 2.2.1. trigger_strategy:used_percent for instance group quota capacity
@@ -502,45 +499,52 @@ bool CacheReclaimer::IsTriggerReclaiming(const RequestContext *request_context,
                     "instance group capacity quota used percentage [inf] "
                     "has reached or exceeded the threshold percentage [%f]",
                     threshold_used_percentage);
-        out_water_level_exceed.SetGeneralWaterLevelExceed(true);
-        return get_trigger_result();
+        water_level_exceed->SetGeneralWaterLevelExceed(true);
+        return water_level_exceed;
     }
     if (const double group_used_percentage =
-            static_cast<double>(data.grp_used_byte_sz_) / static_cast<double>(instance_group_quota.capacity());
+            static_cast<double>(data->grp_used_byte_sz_) / static_cast<double>(instance_group_quota.capacity());
         group_used_percentage + kEpsilon > threshold_used_percentage) {
         LOG_WITH_GR(DEBUG,
                     "instance group capacity quota used percentage [%f] "
                     "has reached or exceeded the threshold percentage [%f]",
                     group_used_percentage,
                     threshold_used_percentage);
-        out_water_level_exceed.SetGeneralWaterLevelExceed(true);
-        return get_trigger_result();
+        water_level_exceed->SetGeneralWaterLevelExceed(true);
+        return water_level_exceed;
     }
 
     // 2.2.2. trigger_strategy:used_percent for group key count
-    if (data.grp_max_key_cnt_ == 0) {
+    if (data->grp_max_key_cnt_ == 0) {
         LOG_WITH_GR(DEBUG,
                     "instance group total key count used percentage [inf] "
                     "has reached or exceeded the threshold percentage [%f]",
                     threshold_used_percentage);
-        out_water_level_exceed.SetGeneralWaterLevelExceed(true);
-        return get_trigger_result();
+        water_level_exceed->SetGeneralWaterLevelExceed(true);
+        return water_level_exceed;
     }
     if (const double group_used_percentage =
-            static_cast<double>(data.grp_used_key_cnt_) / static_cast<double>(data.grp_max_key_cnt_);
+            static_cast<double>(data->grp_used_key_cnt_) / static_cast<double>(data->grp_max_key_cnt_);
         group_used_percentage + kEpsilon > threshold_used_percentage) {
         LOG_WITH_GR(DEBUG,
                     "instance group total key count used percentage [%f] "
                     "has reached or exceeded the threshold percentage [%f]",
                     group_used_percentage,
                     threshold_used_percentage);
-        out_water_level_exceed.SetGeneralWaterLevelExceed(true);
-        return get_trigger_result();
+        water_level_exceed->SetGeneralWaterLevelExceed(true);
+        return water_level_exceed;
     }
 
     // 2.2.3. instance group do not trigger reclaiming
-    out_water_level_exceed.SetGeneralWaterLevelExceed(false);
-    return get_trigger_result();
+    water_level_exceed->SetGeneralWaterLevelExceed(false);
+    return water_level_exceed;
+}
+
+bool CacheReclaimer::IsTriggerReclaiming(const std::shared_ptr<WaterLevelExceed> &water_level_exceed) {
+    if (water_level_exceed == nullptr || !water_level_exceed->CheckGroupWaterLevelExceed()) {
+        return false;
+    }
+    return true;
 }
 
 void CacheReclaimer::ReclaimByLRU(const std::shared_ptr<RequestContext> &request_context,
@@ -997,10 +1001,10 @@ void CacheReclaimer::SubmitDelReq(const std::shared_ptr<RequestContext> &request
                 loc_count);
 }
 
-CacheReclaimer::GroupUsageData CacheReclaimer::GetGroupUsageData(
+std::shared_ptr<CacheReclaimer::GroupUsageData> CacheReclaimer::GetGroupUsageData(
     const RequestContext *request_context,
     const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) const noexcept {
-    GroupUsageData data;
+    const auto data = std::make_shared<GroupUsageData>();
     for (const auto &instance_info : instance_infos) {
         if (instance_info == nullptr) {
             LOG_WITH_TRACE(WARN, "instance is nullptr");
@@ -1020,14 +1024,14 @@ CacheReclaimer::GroupUsageData CacheReclaimer::GetGroupUsageData(
         const std::size_t ins_max_key_cnt = meta_indexer->GetMaxKeyCount();
         const std::size_t ins_used_byte_size = meta_indexer->GetStorageUsage();
 
-        data.grp_used_key_cnt_ += ins_used_key_cnt;
-        data.grp_max_key_cnt_ += ins_max_key_cnt;
-        data.grp_used_byte_sz_ += ins_used_byte_size;
+        data->grp_used_key_cnt_ += ins_used_key_cnt;
+        data->grp_max_key_cnt_ += ins_max_key_cnt;
+        data->grp_used_byte_sz_ += ins_used_byte_size;
 
         // calc the usage size of each storage type of this instance
         auto calc_sz = [&meta_indexer, &data](const DataStorageType &type) -> void {
             const std::uint64_t sz = meta_indexer->GetStorageUsageByType(type);
-            data.AddGroupUsageByType(type, sz);
+            data->AddGroupUsageByType(type, sz);
         };
         calc_sz(DataStorageType::DATA_STORAGE_TYPE_HF3FS);
         calc_sz(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE);
@@ -1119,22 +1123,22 @@ bool CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &re
     }
 
     // do we need to reclaim the storage for this instance group?
-    WaterLevelExceed water_level_exceed;
-    {
-        const std::int64_t quota_begin_tp = TimestampUtil::GetSteadyTimeUs();
-        if (!IsTriggerReclaiming(request_context.get(),
-                                 ins_gr,
-                                 instance_group->quota(), // TODO (rui): validate the quota is valid
-                                 reclaim_strategy,
-                                 instance_infos,
-                                 water_level_exceed)) {
-            METRICS_(cache_reclaimer, reclaim_quota_duration_us) =
-                static_cast<double>(TimestampUtil::GetSteadyTimeUs() - quota_begin_tp);
-            return false;
-        }
-        METRICS_(cache_reclaimer, reclaim_quota_duration_us) =
-            static_cast<double>(TimestampUtil::GetSteadyTimeUs() - quota_begin_tp);
+    const std::int64_t quota_begin_tp = TimestampUtil::GetSteadyTimeUs();
+    const auto water_level_exceed =
+        GetWaterLevelExceed(request_context.get(),
+                            ins_gr,
+                            instance_group->quota(), // TODO (rui): validate the quota is valid
+                            reclaim_strategy,
+                            instance_infos);
+    METRICS_(cache_reclaimer, reclaim_quota_duration_us) =
+        static_cast<double>(TimestampUtil::GetSteadyTimeUs() - quota_begin_tp);
+
+    if (!IsTriggerReclaiming(water_level_exceed)) {
+        LOG_WITH_GR(DEBUG, "instance group does not trigger reclaiming");
+        return false;
     }
+
+    LOG_WITH_GR(DEBUG, "instance group trigger reclaiming");
 
     // run the reclaiming algorithm with the chosen policy
     switch (reclaim_strategy->reclaim_policy()) {
@@ -1142,7 +1146,7 @@ bool CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &re
         LOG_WITH_GR(DEBUG, "start to run the LRU reclaim policy");
         for (const auto &instance_info : instance_infos) {
             const std::int64_t begin_tp = TimestampUtil::GetSteadyTimeUs();
-            ReclaimByLRU(request_context, instance_info, water_level_exceed, delay_before_delete_ms);
+            ReclaimByLRU(request_context, instance_info, *water_level_exceed, delay_before_delete_ms);
             METRICS_(cache_reclaimer, reclaim_job_duration_us) =
                 static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp);
         }
@@ -1152,7 +1156,7 @@ bool CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &re
         LOG_WITH_GR(DEBUG, "start to run the LFU reclaim policy");
         for (const auto &instance_info : instance_infos) {
             const std::int64_t begin_tp = TimestampUtil::GetSteadyTimeUs();
-            ReclaimByLFU(request_context, instance_info, water_level_exceed, delay_before_delete_ms);
+            ReclaimByLFU(request_context, instance_info, *water_level_exceed, delay_before_delete_ms);
             METRICS_(cache_reclaimer, reclaim_job_duration_us) =
                 static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp);
         }
@@ -1162,7 +1166,7 @@ bool CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &re
         LOG_WITH_GR(DEBUG, "start to run the TTL reclaim policy");
         for (const auto &instance_info : instance_infos) {
             const std::int64_t begin_tp = TimestampUtil::GetSteadyTimeUs();
-            ReclaimByTTL(request_context, instance_info, water_level_exceed, delay_before_delete_ms);
+            ReclaimByTTL(request_context, instance_info, *water_level_exceed, delay_before_delete_ms);
             METRICS_(cache_reclaimer, reclaim_job_duration_us) =
                 static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp);
         }
@@ -1175,7 +1179,7 @@ bool CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &re
     default:
         for (const auto &instance_info : instance_infos) {
             const std::int64_t begin_tp = TimestampUtil::GetSteadyTimeUs();
-            ReclaimByLRU(request_context, instance_info, water_level_exceed, delay_before_delete_ms);
+            ReclaimByLRU(request_context, instance_info, *water_level_exceed, delay_before_delete_ms);
             METRICS_(cache_reclaimer, reclaim_job_duration_us) =
                 static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp);
         }
