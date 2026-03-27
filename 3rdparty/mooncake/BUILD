@@ -14,3 +14,13 @@ cc_library(
         "-fPIC"],
     visibility = ["//visibility:public"],
 )
+
+cc_test(
+    name = "mooncake_client_c_test",
+    srcs = ["client_c_test.cc"],
+    deps = [
+        ":mooncake_client_c",
+        "//kv_cache_manager/common:unittest",
+        "@mooncake//:mooncake_store",
+    ],
+)

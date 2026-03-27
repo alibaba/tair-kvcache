@@ -76,6 +76,14 @@ typedef struct {
     const char *preferred_segment = NULL;
 } ReplicateConfig_t;
 
+typedef struct {
+    bool healthy = false;
+    int32_t health_status_code = 0;
+    uint64_t allocated_bytes = 0;
+    uint64_t total_capacity_bytes = 0;
+    double used_ratio = 0.0;
+} MooncakeStoreStatus_t;
+
 typedef void *client_t;
 
 client_t mooncake_client_create(const char *local_hostname,
@@ -101,6 +109,9 @@ ErrorCode_t mooncake_client_query(client_t client, const char *key);
 ErrorCode_t mooncake_client_remove(client_t client, const char *key);
 
 ErrorCode_t mooncake_client_remove_all(client_t client);
+
+ErrorCode_t mooncake_client_get_store_status(client_t client,
+                                             MooncakeStoreStatus_t *status);
 
 void mooncake_client_destroy(client_t client);
 
