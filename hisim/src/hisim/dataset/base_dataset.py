@@ -1,6 +1,6 @@
 from typing import Optional, overload
 from dataclasses import dataclass, field
-from transformers.tokenization_utils import PreTrainedTokenizerBase
+from transformers import PreTrainedTokenizerBase
 
 from hisim.dataset.dataset_args import DatasetArgs
 
