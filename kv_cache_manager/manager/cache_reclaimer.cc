@@ -157,7 +157,7 @@ CacheReclaimer::GroupUsageData::GroupUsageData()
                                  0 /** DATA_STORAGE_TYPE_VCNS_HF3FS **UNUSED** (merged into HF3FS) */} {}
 
 std::size_t CacheReclaimer::GroupUsageData::GetGroupUsageByType(const DataStorageType &type) const noexcept {
-    const size_t_ idx = ToIndex(MapType(type));
+    const size_t_ idx = ToIndex(ToBaseType(type));
     if (idx >= grp_storage_usage_by_type_.size()) {
         KVCM_LOG_WARN("data storage type to index out of range, array size: [%zu], type as index: [%zu]",
                       grp_storage_usage_by_type_.size(),
@@ -169,7 +169,7 @@ std::size_t CacheReclaimer::GroupUsageData::GetGroupUsageByType(const DataStorag
 
 void CacheReclaimer::GroupUsageData::AddGroupUsageByType(const DataStorageType &type,
                                                          const std::size_t value) noexcept {
-    const size_t_ idx = ToIndex(MapType(type));
+    const size_t_ idx = ToIndex(ToBaseType(type));
     if (idx >= grp_storage_usage_by_type_.size()) {
         KVCM_LOG_WARN("data storage type to index out of range, array size: [%zu], type as index: [%zu]",
                       grp_storage_usage_by_type_.size(),
@@ -193,7 +193,7 @@ bool CacheReclaimer::WaterLevelExceed::GetGeneralWaterLevelExceed() const noexce
 }
 
 bool CacheReclaimer::WaterLevelExceed::GetWaterLevelExceedByType(const DataStorageType &type) const noexcept {
-    const size_t_ idx = ToIndex(MapType(type));
+    const size_t_ idx = ToIndex(ToBaseType(type));
     if (idx >= water_level_exceed_by_type_.size()) {
         KVCM_LOG_WARN("data storage type to index out of range, array size: [%zu], type as index: [%zu]",
                       water_level_exceed_by_type_.size(),
@@ -209,7 +209,7 @@ void CacheReclaimer::WaterLevelExceed::SetGeneralWaterLevelExceed(const bool val
 
 void CacheReclaimer::WaterLevelExceed::SetWaterLevelExceedByType(const DataStorageType &type,
                                                                  const bool value) noexcept {
-    const size_t_ idx = ToIndex(MapType(type));
+    const size_t_ idx = ToIndex(ToBaseType(type));
     if (idx >= water_level_exceed_by_type_.size()) {
         KVCM_LOG_WARN("data storage type to index out of range, array size: [%zu], type as index: [%zu]",
                       water_level_exceed_by_type_.size(),

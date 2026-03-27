@@ -14,7 +14,7 @@ enum class DataStorageType : uint8_t {
     DATA_STORAGE_TYPE_TAIR_MEMPOOL = 3,
     DATA_STORAGE_TYPE_NFS = 4,
     DATA_STORAGE_TYPE_VCNS_HF3FS = 5,
-    COUNT, // as sentinel TODO(rui) add document for adding types
+    COUNT, // as sentinel
 };
 
 std::string ToString(const DataStorageType &type);
@@ -23,10 +23,11 @@ DataStorageType ToDataStorageType(const std::string &type);
 
 constexpr std::size_t ToIndex(const DataStorageType &type) noexcept { return static_cast<std::size_t>(type); }
 
-// help mapping VCNS_HF3FS to HF3FS when do storage related statistics
-constexpr DataStorageType MapType(const DataStorageType &type) noexcept {
-    return type == DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS ? DataStorageType::DATA_STORAGE_TYPE_HF3FS : type;
-}
+// help mapping sub storage type to base storage type
+// e.g., VCNS_HF3FS (sub) --> HF3FS (base)
+// useful in scenarios like storage usage calculating where subtype
+// must be treated the same as the base type
+DataStorageType ToBaseType(const DataStorageType &type) noexcept;
 
 class StorageSpec : public Jsonizable {
 public:

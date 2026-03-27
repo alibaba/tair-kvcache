@@ -181,6 +181,13 @@ DataStorageType ToDataStorageType(const std::string &type) {
     }
 }
 
+DataStorageType ToBaseType(const DataStorageType &type) noexcept {
+    if (type == DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS) {
+        return DataStorageType::DATA_STORAGE_TYPE_HF3FS;
+    }
+    return type;
+}
+
 // ThreeFSStorageSpec
 bool ThreeFSStorageSpec::FromRapidValue(const rapidjson::Value &rapid_value) {
     KVCM_JSON_GET_MACRO(rapid_value, "cluster_name", cluster_name_);

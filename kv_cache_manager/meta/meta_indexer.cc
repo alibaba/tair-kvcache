@@ -577,42 +577,42 @@ std::uint64_t MetaIndexer::GetStorageUsage() const noexcept {
 
 std::uint64_t MetaIndexer::GetStorageUsageByType(const DataStorageType &type) const noexcept {
     try {
-        return storage_usage_array_.at(ToIndex(MapType(type))).load();
+        return storage_usage_array_.at(ToIndex(ToBaseType(type))).load();
     } catch (const std::out_of_range &e) {
         KVCM_LOG_WARN("data storage type out of range, msg: [%s], array size: [%zu], type as index: [%zu]",
                       e.what(),
                       storage_usage_array_.size(),
-                      ToIndex(MapType(type)));
+                      ToIndex(ToBaseType(type)));
         return 0;
     }
 }
 
 void MetaIndexer::SetStorageUsageByType(const DataStorageType &type, const std::uint64_t value) noexcept {
     try {
-        storage_usage_array_.at(ToIndex(MapType(type))).store(value);
+        storage_usage_array_.at(ToIndex(ToBaseType(type))).store(value);
     } catch (const std::out_of_range &e) {
         KVCM_LOG_WARN("data storage type out of range, msg: [%s], array size: [%zu], type as index: [%zu]",
                       e.what(),
                       storage_usage_array_.size(),
-                      ToIndex(MapType(type)));
+                      ToIndex(ToBaseType(type)));
     }
 }
 
 std::uint64_t MetaIndexer::AddStorageUsageByType(const DataStorageType &type, const std::uint64_t value) noexcept {
     try {
-        return storage_usage_array_.at(ToIndex(MapType(type))).fetch_add(value);
+        return storage_usage_array_.at(ToIndex(ToBaseType(type))).fetch_add(value);
     } catch (const std::out_of_range &e) {
         KVCM_LOG_WARN("data storage type out of range, msg: [%s], array size: [%zu], type as index: [%zu]",
                       e.what(),
                       storage_usage_array_.size(),
-                      ToIndex(MapType(type)));
+                      ToIndex(ToBaseType(type)));
         return 0;
     }
 }
 
 std::uint64_t MetaIndexer::SubStorageUsageByType(const DataStorageType &type, const std::uint64_t value) noexcept {
     try {
-        auto &ref = storage_usage_array_.at(ToIndex(MapType(type)));
+        auto &ref = storage_usage_array_.at(ToIndex(ToBaseType(type)));
         std::uint64_t expected = ref.load(), desired = 0;
         do {
             desired = expected < value ? 0 : expected - value;
@@ -622,7 +622,7 @@ std::uint64_t MetaIndexer::SubStorageUsageByType(const DataStorageType &type, co
         KVCM_LOG_WARN("data storage type out of range, msg: [%s], array size: [%zu], type as index: [%zu]",
                       e.what(),
                       storage_usage_array_.size(),
-                      ToIndex(MapType(type)));
+                      ToIndex(ToBaseType(type)));
         return 0;
     }
 }

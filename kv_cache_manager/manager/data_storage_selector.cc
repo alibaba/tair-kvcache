@@ -62,7 +62,7 @@ DataStorageSelector::StorageQuotaAvail::StorageQuotaAvail()
                                    false /** DATA_STORAGE_TYPE_VCNS_HF3FS **UNUSED** (merged into HF3FS) */} {}
 
 bool DataStorageSelector::StorageQuotaAvail::GetStorageQuotaAvailByType(const DataStorageType &type) const noexcept {
-    const size_t_ idx = ToIndex(MapType(type));
+    const size_t_ idx = ToIndex(ToBaseType(type));
     if (idx >= storage_quota_avail_by_type_.size()) {
         KVCM_LOG_WARN("data storage type to index out of range, array size: [%zu], type as index: [%zu]",
                       storage_quota_avail_by_type_.size(),
@@ -74,7 +74,7 @@ bool DataStorageSelector::StorageQuotaAvail::GetStorageQuotaAvailByType(const Da
 
 void DataStorageSelector::StorageQuotaAvail::SetStorageQuotaAvailByType(const DataStorageType &type,
                                                                         const bool value) noexcept {
-    const size_t_ idx = ToIndex(MapType(type));
+    const size_t_ idx = ToIndex(ToBaseType(type));
     if (idx >= storage_quota_avail_by_type_.size()) {
         KVCM_LOG_WARN("data storage type to index out of range, array size: [%zu], type as index: [%zu]",
                       storage_quota_avail_by_type_.size(),
@@ -132,7 +132,7 @@ void DataStorageSelector::GetCandidates(RequestContext const *request_context,
                     continue;
                 }
                 if (const auto type = backend->GetType(); !storage_quota_avail_table.GetStorageQuotaAvailByType(type)) {
-                    PREFIX_LOG(WARN, "data storage type [%zu] quota is reached or exceeded", ToIndex(MapType(type)));
+                    PREFIX_LOG(WARN, "data storage type [%zu] quota is reached or exceeded", ToIndex(ToBaseType(type)));
                     continue;
                 }
                 candidates_out.emplace_back(backend);
