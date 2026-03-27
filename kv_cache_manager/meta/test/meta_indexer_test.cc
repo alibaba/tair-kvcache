@@ -249,9 +249,9 @@ TEST_F(MetaIndexerTest, TestMetadataPersistAndRecover) {
     meta_indexer_->key_count_.store(3);
 
     const std::vector<std::uint64_t> expected_usage_vec{0, 100, 200, 300, 400, 500};
-    ASSERT_EQ(expected_usage_vec.size(), meta_indexer_->storage_usage_array_.size());
-    for (std::size_t i = 0; i != meta_indexer_->storage_usage_array_.size(); ++i) {
-        meta_indexer_->storage_usage_array_.at(i).store(expected_usage_vec.at(i));
+    ASSERT_EQ(expected_usage_vec.size(), meta_indexer_->storage_usage_data_.storage_usage_by_type_.size());
+    for (std::size_t i = 0; i != meta_indexer_->storage_usage_data_.storage_usage_by_type_.size(); ++i) {
+        meta_indexer_->storage_usage_data_.storage_usage_by_type_.at(i).store(expected_usage_vec.at(i));
     }
 
     meta_indexer_->PersistMetaData();
@@ -259,8 +259,8 @@ TEST_F(MetaIndexerTest, TestMetadataPersistAndRecover) {
     meta_indexer_ = std::make_shared<MetaIndexer>();
     ASSERT_EQ(EC_OK, InitIndexer(configStr));
     ASSERT_EQ(3, meta_indexer_->GetKeyCount());
-    for (std::size_t i = 0; i != meta_indexer_->storage_usage_array_.size(); ++i) {
-        ASSERT_EQ(expected_usage_vec.at(i), meta_indexer_->storage_usage_array_.at(i).load());
+    for (std::size_t i = 0; i != meta_indexer_->storage_usage_data_.storage_usage_by_type_.size(); ++i) {
+        ASSERT_EQ(expected_usage_vec.at(i), meta_indexer_->storage_usage_data_.storage_usage_by_type_.at(i).load());
     }
 }
 
@@ -277,10 +277,7 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataManipulation) {
 
     // test get/set
     {
-        // reset the array
-        for (auto &v : meta_indexer_->storage_usage_array_) {
-            v.store(0);
-        }
+        meta_indexer_->storage_usage_data_.Reset();
         ASSERT_EQ(0, meta_indexer_->GetStorageUsage());
 
         auto type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
@@ -298,8 +295,8 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataManipulation) {
         type = DataStorageType::DATA_STORAGE_TYPE_NFS;
         meta_indexer_->SetStorageUsageByType(type, expected_usage_vec.at(static_cast<std::size_t>(type)));
 
-        for (std::size_t i = 0; i != meta_indexer_->storage_usage_array_.size(); ++i) {
-            ASSERT_EQ(expected_usage_vec.at(i), meta_indexer_->storage_usage_array_.at(i).load());
+        for (std::size_t i = 0; i != meta_indexer_->storage_usage_data_.storage_usage_by_type_.size(); ++i) {
+            ASSERT_EQ(expected_usage_vec.at(i), meta_indexer_->storage_usage_data_.storage_usage_by_type_.at(i).load());
         }
 
         type = DataStorageType::DATA_STORAGE_TYPE_HF3FS;
@@ -323,10 +320,7 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataManipulation) {
 
     // test add/sub
     {
-        // reset the array
-        for (auto &v : meta_indexer_->storage_usage_array_) {
-            v.store(0);
-        }
+        meta_indexer_->storage_usage_data_.Reset();
         auto type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
         std::vector<std::uint64_t> expected_usage_vec{0, 100, 200, 300, 400, 0};
 
@@ -373,18 +367,14 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataManipulation) {
 
     // test special case: DATA_STORAGE_TYPE_VCNS_HF3FS behavior as DATA_STORAGE_TYPE_HF3FS
     {
-        // reset the array
-        for (auto &v : meta_indexer_->storage_usage_array_) {
-            v.store(0);
-        }
-
+        meta_indexer_->storage_usage_data_.Reset();
         std::vector<std::uint64_t> expected_usage_vec{0, 128, 0, 0, 0, 0};
 
         meta_indexer_->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS, 128);
         ASSERT_EQ(128, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
         ASSERT_EQ(128, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
-        for (std::size_t i = 0; i != meta_indexer_->storage_usage_array_.size(); ++i) {
-            ASSERT_EQ(expected_usage_vec.at(i), meta_indexer_->storage_usage_array_.at(i).load());
+        for (std::size_t i = 0; i != meta_indexer_->storage_usage_data_.storage_usage_by_type_.size(); ++i) {
+            ASSERT_EQ(expected_usage_vec.at(i), meta_indexer_->storage_usage_data_.storage_usage_by_type_.at(i).load());
         }
 
         meta_indexer_->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS, 16);
@@ -394,16 +384,16 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataManipulation) {
         meta_indexer_->SubStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS, 16);
         ASSERT_EQ(128, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
         ASSERT_EQ(128, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
-        for (std::size_t i = 0; i != meta_indexer_->storage_usage_array_.size(); ++i) {
-            ASSERT_EQ(expected_usage_vec.at(i), meta_indexer_->storage_usage_array_.at(i).load());
+        for (std::size_t i = 0; i != meta_indexer_->storage_usage_data_.storage_usage_by_type_.size(); ++i) {
+            ASSERT_EQ(expected_usage_vec.at(i), meta_indexer_->storage_usage_data_.storage_usage_by_type_.at(i).load());
         }
 
         meta_indexer_->SubStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS, 1024); // would underflow
         ASSERT_EQ(0, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
         ASSERT_EQ(0, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
         expected_usage_vec[1] = 0;
-        for (std::size_t i = 0; i != meta_indexer_->storage_usage_array_.size(); ++i) {
-            ASSERT_EQ(expected_usage_vec.at(i), meta_indexer_->storage_usage_array_.at(i).load());
+        for (std::size_t i = 0; i != meta_indexer_->storage_usage_data_.storage_usage_by_type_.size(); ++i) {
+            ASSERT_EQ(expected_usage_vec.at(i), meta_indexer_->storage_usage_data_.storage_usage_by_type_.at(i).load());
         }
     }
 }

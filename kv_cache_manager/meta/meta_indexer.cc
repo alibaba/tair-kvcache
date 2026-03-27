@@ -56,7 +56,116 @@ private:
     std::vector<int32_t> shard_indexs_;
 };
 
-MetaIndexer::MetaIndexer() : storage_usage_array_{0, 0, 0, 0, 0, 0} {}
+MetaIndexer::StorageUsageData::StorageUsageData()
+    : storage_usage_by_type_{0, /* DATA_STORAGE_TYPE_UNKNOWN **UNUSED** */
+                             0, /* DATA_STORAGE_TYPE_HF3FS */
+                             0, /* DATA_STORAGE_TYPE_MOONCAKE */
+                             0, /* DATA_STORAGE_TYPE_TAIR_MEMPOOL */
+                             0, /* DATA_STORAGE_TYPE_NFS */
+                             0 /** DATA_STORAGE_TYPE_VCNS_HF3FS **UNUSED** (merged into HF3FS) */} {}
+
+std::uint64_t MetaIndexer::StorageUsageData::GetStorageUsage() const noexcept {
+    std::uint64_t storage_usage = 0;
+    for (size_t_ i = 0; i != storage_usage_by_type_.size(); ++i) {
+        if (i == static_cast<size_t_>(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN) ||
+            i == static_cast<size_t_>(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS)) {
+            continue;
+        }
+        storage_usage += storage_usage_by_type_.at(i).load();
+    }
+    return storage_usage;
+}
+
+std::uint64_t MetaIndexer::StorageUsageData::GetStorageUsageByType(const DataStorageType &type) const noexcept {
+    const size_t_ idx = ToIndex(ToBaseType(type));
+    if (idx >= storage_usage_by_type_.size()) {
+        KVCM_LOG_WARN("data storage type to index out of range, array size: [%zu], type as index: [%zu]",
+                      storage_usage_by_type_.size(),
+                      idx);
+        return 0;
+    }
+    return storage_usage_by_type_.at(idx).load();
+}
+
+void MetaIndexer::StorageUsageData::Reset() noexcept {
+    // array.fill(0) won't work here due to the deleted operator= of the
+    // std::atomic type, explicitly assign 0 to all elements in the
+    // array instead
+    for (auto &v : storage_usage_by_type_) {
+        v.store(0);
+    }
+}
+
+void MetaIndexer::StorageUsageData::SetStorageUsageByType(const DataStorageType &type,
+                                                          const std::uint64_t value) noexcept {
+    const size_t_ idx = ToIndex(ToBaseType(type));
+    if (idx >= storage_usage_by_type_.size()) {
+        KVCM_LOG_WARN("data storage type to index out of range, array size: [%zu], type as index: [%zu]",
+                      storage_usage_by_type_.size(),
+                      idx);
+        return;
+    }
+    storage_usage_by_type_.at(idx).store(value);
+}
+
+std::uint64_t MetaIndexer::StorageUsageData::AddStorageUsageByType(const DataStorageType &type,
+                                                                   const std::uint64_t value) noexcept {
+    const size_t_ idx = ToIndex(ToBaseType(type));
+    if (idx >= storage_usage_by_type_.size()) {
+        KVCM_LOG_WARN("data storage type to index out of range, array size: [%zu], type as index: [%zu]",
+                      storage_usage_by_type_.size(),
+                      idx);
+        return 0;
+    }
+    return storage_usage_by_type_.at(idx).fetch_add(value);
+}
+
+std::uint64_t MetaIndexer::StorageUsageData::SubStorageUsageByType(const DataStorageType &type,
+                                                                   const std::uint64_t value) noexcept {
+    const size_t_ idx = ToIndex(ToBaseType(type));
+    if (idx >= storage_usage_by_type_.size()) {
+        KVCM_LOG_WARN("data storage type to index out of range, array size: [%zu], type as index: [%zu]",
+                      storage_usage_by_type_.size(),
+                      idx);
+        return 0;
+    }
+
+    auto &ref = storage_usage_by_type_.at(idx);
+    std::uint64_t expected = ref.load(), desired = 0;
+    do {
+        desired = expected < value ? 0 : expected - value;
+    } while (!ref.compare_exchange_weak(expected, desired));
+    return desired;
+}
+
+std::string MetaIndexer::StorageUsageData::Serialize() const noexcept {
+    std::string str;
+    for (size_t_ i = 0; i != storage_usage_by_type_.size(); ++i) {
+        if (i > 0) {
+            str += ",";
+        }
+        str += std::to_string(storage_usage_by_type_.at(i).load());
+    }
+    KVCM_LOG_DEBUG("serializing storage usage data into: [%s]", str.c_str());
+    return str;
+}
+
+ErrorCode MetaIndexer::StorageUsageData::Deserialize(const std::string &str) noexcept {
+    KVCM_LOG_DEBUG("deserializing storage usage data: [%s]", str.c_str());
+    std::stringstream ss(str);
+    std::string v;
+    size_t_ idx = 0;
+    while (std::getline(ss, v, ',') && idx != storage_usage_by_type_.size()) {
+        try {
+            storage_usage_by_type_.at(idx).store(std::stoull(v));
+        } catch (...) {
+            KVCM_LOG_ERROR("interpret [%s] to unsigned integer failed", v.c_str());
+            return ErrorCode::EC_ERROR;
+        }
+        ++idx;
+    }
+    return ErrorCode::EC_OK;
+}
 
 ErrorCode MetaIndexer::Init(const std::string &instance_id, const std::shared_ptr<MetaIndexerConfig> &config) noexcept {
     if (!config || !config->GetMetaStorageBackendConfig()) {
@@ -105,12 +214,7 @@ ErrorCode MetaIndexer::Init(const std::string &instance_id, const std::shared_pt
         }
     }
 
-    // storage_usage_array_.fill(0) won't work here due to the deleted
-    // operator= of the std::atomic type
-    // explicitly assign 0 to all elements in the array instead
-    for (auto &v : storage_usage_array_) {
-        v.store(0);
-    }
+    storage_usage_data_.Reset();
     ec = RecoverMetaData();
     if (ec != EC_OK && ec != EC_NOENT) {
         KVCM_LOG_ERROR("instance[%s] recover metadata failed, ec[%d]", instance_id_.c_str(), ec);
@@ -567,64 +671,22 @@ size_t MetaIndexer::GetCacheUsage() const noexcept {
     return 0;
 }
 
-std::uint64_t MetaIndexer::GetStorageUsage() const noexcept {
-    std::uint64_t storage_usage = 0;
-    for (const auto &v : storage_usage_array_) {
-        storage_usage += v.load();
-    }
-    return storage_usage;
-}
+std::uint64_t MetaIndexer::GetStorageUsage() const noexcept { return storage_usage_data_.GetStorageUsage(); }
 
 std::uint64_t MetaIndexer::GetStorageUsageByType(const DataStorageType &type) const noexcept {
-    try {
-        return storage_usage_array_.at(ToIndex(ToBaseType(type))).load();
-    } catch (const std::out_of_range &e) {
-        KVCM_LOG_WARN("data storage type out of range, msg: [%s], array size: [%zu], type as index: [%zu]",
-                      e.what(),
-                      storage_usage_array_.size(),
-                      ToIndex(ToBaseType(type)));
-        return 0;
-    }
+    return storage_usage_data_.GetStorageUsageByType(type);
 }
 
 void MetaIndexer::SetStorageUsageByType(const DataStorageType &type, const std::uint64_t value) noexcept {
-    try {
-        storage_usage_array_.at(ToIndex(ToBaseType(type))).store(value);
-    } catch (const std::out_of_range &e) {
-        KVCM_LOG_WARN("data storage type out of range, msg: [%s], array size: [%zu], type as index: [%zu]",
-                      e.what(),
-                      storage_usage_array_.size(),
-                      ToIndex(ToBaseType(type)));
-    }
+    storage_usage_data_.SetStorageUsageByType(type, value);
 }
 
 std::uint64_t MetaIndexer::AddStorageUsageByType(const DataStorageType &type, const std::uint64_t value) noexcept {
-    try {
-        return storage_usage_array_.at(ToIndex(ToBaseType(type))).fetch_add(value);
-    } catch (const std::out_of_range &e) {
-        KVCM_LOG_WARN("data storage type out of range, msg: [%s], array size: [%zu], type as index: [%zu]",
-                      e.what(),
-                      storage_usage_array_.size(),
-                      ToIndex(ToBaseType(type)));
-        return 0;
-    }
+    return storage_usage_data_.AddStorageUsageByType(type, value);
 }
 
 std::uint64_t MetaIndexer::SubStorageUsageByType(const DataStorageType &type, const std::uint64_t value) noexcept {
-    try {
-        auto &ref = storage_usage_array_.at(ToIndex(ToBaseType(type)));
-        std::uint64_t expected = ref.load(), desired = 0;
-        do {
-            desired = expected < value ? 0 : expected - value;
-        } while (!ref.compare_exchange_weak(expected, desired));
-        return desired;
-    } catch (const std::out_of_range &e) {
-        KVCM_LOG_WARN("data storage type out of range, msg: [%s], array size: [%zu], type as index: [%zu]",
-                      e.what(),
-                      storage_usage_array_.size(),
-                      ToIndex(ToBaseType(type)));
-        return 0;
-    }
+    return storage_usage_data_.SubStorageUsageByType(type, value);
 }
 
 // Combining batch size and lock granularity size to assemble batch data
@@ -695,21 +757,10 @@ ErrorCode MetaIndexer::RecoverMetaData() noexcept {
     }
     key_count_ = key_count;
 
-    // deserialize storage_usage_array_
     if (const auto it = metadata_map.find(METADATA_PROPERTY_STORAGE_USAGE_ARRAY); it != metadata_map.end()) {
-        const std::string storage_usage_array_str = it->second;
-        KVCM_LOG_DEBUG("deserializing storage usage data: [%s]", storage_usage_array_str.c_str());
-        std::stringstream ss(storage_usage_array_str);
-        std::string item;
-        std::size_t index = 0;
-        while (std::getline(ss, item, ',') && index != storage_usage_array_.size()) {
-            try {
-                storage_usage_array_[index].store(std::stoull(item));
-            } catch (...) {
-                KVCM_LOG_ERROR("interpret [%s] to unsigned integer failed", item.c_str());
-                return EC_ERROR;
-            }
-            ++index;
+        if (ec = storage_usage_data_.Deserialize(it->second); ec != EC_OK) {
+            KVCM_LOG_ERROR("meta indexer deserialize storage usage data str failed, str: [%s]", it->second.c_str());
+            return ec;
         }
     }
 
@@ -722,17 +773,7 @@ void MetaIndexer::PersistMetaData() noexcept {
     if (current_time >= last_persist_metadata_time_ + persist_metadata_interval_time_ms_) {
         std::map<std::string, std::string> metadata_map;
         metadata_map[METADATA_PROPERTY_KEY_COUNT] = std::to_string(key_count_);
-
-        // serialize storage_usage_array_
-        std::string storage_usage_array_str;
-        for (size_t i = 0; i < storage_usage_array_.size(); ++i) {
-            if (i > 0) {
-                storage_usage_array_str += ",";
-            }
-            storage_usage_array_str += std::to_string(storage_usage_array_[i].load());
-        }
-        metadata_map[METADATA_PROPERTY_STORAGE_USAGE_ARRAY] = storage_usage_array_str;
-
+        metadata_map[METADATA_PROPERTY_STORAGE_USAGE_ARRAY] = storage_usage_data_.Serialize();
         auto ec = storage_->PutMetaData(metadata_map);
         if (ec != EC_OK) {
             KVCM_LOG_ERROR("meta indexer persist metadata failed, ec[%d]", ec);
