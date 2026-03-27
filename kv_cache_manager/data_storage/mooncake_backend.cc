@@ -31,7 +31,15 @@ DataStorageType MooncakeBackend::GetType() { return DataStorageType::DATA_STORAG
 
 bool MooncakeBackend::Available() { return IsOpen() && IsAvailable(); }
 
-double MooncakeBackend::GetStorageUsageRatio(const std::string &trace_id) const { return 0.0; }
+double MooncakeBackend::GetStorageUsageRatio(const std::string &trace_id) const {
+    MooncakeStoreStatus_t status;
+    auto ec = mooncake_client_get_store_status(client_, &status);
+    if (ec != MOONCAKE_ERROR_OK) {
+        KVCM_LOG_WARN("get store status failed, error: [%d]", ec);
+        return 0.0;
+    }
+    return status.used_ratio;
+}
 
 ErrorCode MooncakeBackend::DoOpen(const StorageConfig &storage_config, const std::string &trace_id) {
     if (auto cfg = std::dynamic_pointer_cast<MooncakeStorageSpec>(storage_config.storage_spec())) {
@@ -65,7 +73,7 @@ ErrorCode MooncakeBackend::DoOpen(const StorageConfig &storage_config, const std
     }
 
     SetOpen(true);
-    SetAvailable(true);
+    available_thread_ = std::thread([this, trace_id]() { this->DetectAvailableLoop(trace_id); });
     KVCM_LOG_INFO("open mooncake backend success, config: [%s]", spec_.ToString().c_str());
     return EC_OK;
 };
@@ -73,6 +81,9 @@ ErrorCode MooncakeBackend::DoOpen(const StorageConfig &storage_config, const std
 ErrorCode MooncakeBackend::Close() {
     SetOpen(false);
     SetAvailable(false);
+    if (available_thread_.joinable()) {
+        available_thread_.join();
+    }
     KVCM_LOG_INFO("close mooncake backend");
     if (client_) {
         mooncake_client_destroy(client_);
@@ -135,6 +146,30 @@ std::vector<bool> MooncakeBackend::Exist(const std::vector<DataStorageUri> &stor
     }
     return result;
 }
+
+void MooncakeBackend::DetectAvailableLoop(const std::string &trace_id) {
+    MooncakeStoreStatus_t status;
+    while (IsOpen()) {
+        constexpr int detect_retry_count = 10;
+        bool healthy = false;
+        for (int i = 0; i < detect_retry_count; i++) {
+            if (!IsOpen()) {
+                return;
+            }
+            auto ec = mooncake_client_get_store_status(client_, &status);
+            if (ec != MOONCAKE_ERROR_OK) {
+                KVCM_LOG_WARN("get store status failed, error: [%d]", ec);
+            } else if (status.healthy) {
+                healthy = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        SetAvailable(healthy);
+        std::this_thread::sleep_for(std::chrono::seconds(10));
+    }
+}
+
 std::vector<ErrorCode> MooncakeBackend::Lock(const std::vector<DataStorageUri> &storage_uris) {
     std::vector<ErrorCode> result(storage_uris.size(), EC_OK);
     // not supported yet
