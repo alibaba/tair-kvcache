@@ -975,7 +975,10 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming04) {
                                                       ins_group->cache_config()->reclaim_strategy(),
                                                       instance_infos,
                                                       water_level_exceed));
-    ASSERT_TRUE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
+    ASSERT_TRUE(water_level_exceed.CheckGroupWaterLevelExceed());
+    ASSERT_FALSE(water_level_exceed.CheckStorageTypeWaterLevelExceed());
+    ASSERT_TRUE(water_level_exceed.GetGeneralWaterLevelExceed());
+    ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
     ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
     ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
     ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
@@ -1022,7 +1025,10 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming06) {
                                                       ins_group->cache_config()->reclaim_strategy(),
                                                       instance_infos,
                                                       water_level_exceed));
-    ASSERT_TRUE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
+    ASSERT_TRUE(water_level_exceed.CheckGroupWaterLevelExceed());
+    ASSERT_FALSE(water_level_exceed.CheckStorageTypeWaterLevelExceed());
+    ASSERT_TRUE(water_level_exceed.GetGeneralWaterLevelExceed());
+    ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
     ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
     ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
     ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
@@ -1091,7 +1097,10 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming08) {
                                                       ins_group->cache_config()->reclaim_strategy(),
                                                       instance_infos,
                                                       water_level_exceed));
-    ASSERT_TRUE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
+    ASSERT_TRUE(water_level_exceed.CheckGroupWaterLevelExceed());
+    ASSERT_FALSE(water_level_exceed.CheckStorageTypeWaterLevelExceed());
+    ASSERT_TRUE(water_level_exceed.GetGeneralWaterLevelExceed());
+    ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
     ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
     ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
     ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
@@ -1152,7 +1161,10 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming10) {
                                                       ins_group->cache_config()->reclaim_strategy(),
                                                       instance_infos,
                                                       water_level_exceed));
-    ASSERT_TRUE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
+    ASSERT_TRUE(water_level_exceed.CheckGroupWaterLevelExceed());
+    ASSERT_FALSE(water_level_exceed.CheckStorageTypeWaterLevelExceed());
+    ASSERT_TRUE(water_level_exceed.GetGeneralWaterLevelExceed());
+    ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
     ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
     ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
     ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
@@ -1185,7 +1197,10 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming11) {
                                                       ins_group->cache_config()->reclaim_strategy(),
                                                       instance_infos,
                                                       water_level_exceed));
-    ASSERT_TRUE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
+    ASSERT_TRUE(water_level_exceed.CheckGroupWaterLevelExceed());
+    ASSERT_FALSE(water_level_exceed.CheckStorageTypeWaterLevelExceed());
+    ASSERT_TRUE(water_level_exceed.GetGeneralWaterLevelExceed());
+    ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
     ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
     ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
     ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
@@ -1240,7 +1255,10 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
                                                           ins_group->cache_config()->reclaim_strategy(),
                                                           instance_infos,
                                                           water_level_exceed));
-        ASSERT_TRUE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
+        ASSERT_TRUE(water_level_exceed.CheckGroupWaterLevelExceed());
+        ASSERT_FALSE(water_level_exceed.CheckStorageTypeWaterLevelExceed());
+        ASSERT_TRUE(water_level_exceed.GetGeneralWaterLevelExceed());
+        ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
         ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
         ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
         ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
@@ -1287,7 +1305,10 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
                                                           ins_group->cache_config()->reclaim_strategy(),
                                                           instance_infos,
                                                           water_level_exceed));
-        ASSERT_TRUE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
+        ASSERT_TRUE(water_level_exceed.CheckGroupWaterLevelExceed());
+        ASSERT_FALSE(water_level_exceed.CheckStorageTypeWaterLevelExceed());
+        ASSERT_TRUE(water_level_exceed.GetGeneralWaterLevelExceed());
+        ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
         ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
         ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
         ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
@@ -1335,7 +1356,10 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
                                                           ins_group->cache_config()->reclaim_strategy(),
                                                           instance_infos,
                                                           water_level_exceed));
-        ASSERT_TRUE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
+        ASSERT_TRUE(water_level_exceed.CheckGroupWaterLevelExceed());
+        ASSERT_FALSE(water_level_exceed.CheckStorageTypeWaterLevelExceed());
+        ASSERT_TRUE(water_level_exceed.GetGeneralWaterLevelExceed());
+        ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
         ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
         ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
         ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
@@ -1400,6 +1424,9 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming17) {
                                                           ins_group->cache_config()->reclaim_strategy(),
                                                           instance_infos,
                                                           water_level_exceed));
+        ASSERT_TRUE(water_level_exceed.CheckGroupWaterLevelExceed());
+        ASSERT_TRUE(water_level_exceed.CheckStorageTypeWaterLevelExceed());
+        ASSERT_FALSE(water_level_exceed.GetGeneralWaterLevelExceed());
         ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
         ASSERT_TRUE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
         ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
@@ -1460,7 +1487,10 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming17) {
                                                           ins_group->cache_config()->reclaim_strategy(),
                                                           instance_infos,
                                                           water_level_exceed));
-        ASSERT_TRUE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
+        ASSERT_TRUE(water_level_exceed.CheckGroupWaterLevelExceed());
+        ASSERT_TRUE(water_level_exceed.CheckStorageTypeWaterLevelExceed());
+        ASSERT_TRUE(water_level_exceed.GetGeneralWaterLevelExceed());
+        ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
         ASSERT_TRUE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
         ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
         ASSERT_FALSE(water_level_exceed.GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));

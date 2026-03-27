@@ -14,7 +14,7 @@ enum class DataStorageType : uint8_t {
     DATA_STORAGE_TYPE_TAIR_MEMPOOL = 3,
     DATA_STORAGE_TYPE_NFS = 4,
     DATA_STORAGE_TYPE_VCNS_HF3FS = 5,
-    COUNT, // as sentinel
+    COUNT, // as sentinel TODO(rui) add document for adding types
 };
 
 std::string ToString(const DataStorageType &type);

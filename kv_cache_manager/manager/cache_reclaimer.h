@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
@@ -325,18 +326,35 @@ private:
     };
     std::forward_list<DeleteHandler> delete_handlers_;
 
+    // record instance group water level exceed flags
     class WaterLevelExceed {
     public:
         WaterLevelExceed();
         ~WaterLevelExceed() = default;
 
+        [[nodiscard]] bool GetGeneralWaterLevelExceed() const noexcept;
         [[nodiscard]] bool GetWaterLevelExceedByType(const DataStorageType &type) const noexcept;
-        [[nodiscard]] bool AnyOfWaterLevelExceed() const noexcept;
-        [[nodiscard]] bool AnyButTotalWaterLevelExceed() const noexcept;
+        void SetGeneralWaterLevelExceed(bool value) noexcept;
         void SetWaterLevelExceedByType(const DataStorageType &type, bool value) noexcept;
 
+        [[nodiscard]] bool CheckGroupWaterLevelExceed() const noexcept;       // general or any storage type exceed
+        [[nodiscard]] bool CheckStorageTypeWaterLevelExceed() const noexcept; // any single storage type exceed
+
     private:
-        std::array<bool, static_cast<std::size_t>(DataStorageType::COUNT)> water_level_exceed_array_;
+        // group general water level exceed flag
+        bool general_water_level_exceed_;
+
+        using array_t_ = std::array<bool, static_cast<std::size_t>(DataStorageType::COUNT)>;
+        using size_t_ = array_t_::size_type;
+
+        // group water level exceed flag array by storage type
+        // slot 0: DATA_STORAGE_TYPE_UNKNOWN **UNUSED**
+        // slot 1: DATA_STORAGE_TYPE_HF3FS exceed flag
+        // slot 2: DATA_STORAGE_TYPE_MOONCAKE exceed flag
+        // slot 3: DATA_STORAGE_TYPE_TAIR_MEMPOOL exceed flag
+        // slot 4: DATA_STORAGE_TYPE_NFS exceed flag
+        // slot 5: DATA_STORAGE_TYPE_VCNS_HF3FS **UNUSED** (merged into HF3FS)
+        array_t_ water_level_exceed_by_type_;
     };
 
     /**

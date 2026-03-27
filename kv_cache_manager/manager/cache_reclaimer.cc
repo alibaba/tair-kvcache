@@ -131,87 +131,108 @@ struct CacheReclaimer::GroupUsageData {
     void AddGroupUsageByType(const DataStorageType &type, std::size_t value) noexcept;
 
 private:
-    std::array<std::size_t, static_cast<std::size_t>(DataStorageType::COUNT)> grp_storage_usage_array_;
+    using array_t_ = std::array<std::size_t, static_cast<std::size_t>(DataStorageType::COUNT)>;
+    using size_t_ = array_t_::size_type;
+
+    // group storage usage data array aggregated by storage type
+    // slot 0: DATA_STORAGE_TYPE_UNKNOWN **UNUSED**
+    // slot 1: DATA_STORAGE_TYPE_HF3FS usage data
+    // slot 2: DATA_STORAGE_TYPE_MOONCAKE usage data
+    // slot 3: DATA_STORAGE_TYPE_TAIR_MEMPOOL usage data
+    // slot 4: DATA_STORAGE_TYPE_NFS usage data
+    // slot 5: DATA_STORAGE_TYPE_VCNS_HF3FS **UNUSED** (merged into HF3FS)
+    array_t_ grp_storage_usage_by_type_;
 };
 
 CacheReclaimer::GroupUsageData::GroupUsageData()
-    : grp_used_key_cnt_(0), grp_max_key_cnt_(0), grp_used_byte_sz_(0), grp_storage_usage_array_{0, 0, 0, 0, 0, 0} {}
+    : grp_used_key_cnt_(0)
+    , grp_max_key_cnt_(0)
+    , grp_used_byte_sz_(0)
+    , grp_storage_usage_by_type_{0, /* DATA_STORAGE_TYPE_UNKNOWN **UNUSED** */
+                                 0, /* DATA_STORAGE_TYPE_HF3FS */
+                                 0, /* DATA_STORAGE_TYPE_MOONCAKE */
+                                 0, /* DATA_STORAGE_TYPE_TAIR_MEMPOOL */
+                                 0, /* DATA_STORAGE_TYPE_NFS */
+                                 0 /** DATA_STORAGE_TYPE_VCNS_HF3FS **UNUSED** (merged into HF3FS) */} {}
 
 std::size_t CacheReclaimer::GroupUsageData::GetGroupUsageByType(const DataStorageType &type) const noexcept {
-    try {
-        return grp_storage_usage_array_.at(ToIndex(MapType(type)));
-    } catch (const std::out_of_range &e) {
-        KVCM_LOG_WARN("data storage type out of range, msg: [%s], array size: [%zu], type as index: [%zu]",
-                      e.what(),
-                      grp_storage_usage_array_.size(),
-                      ToIndex(MapType(type)));
-        return false;
+    const size_t_ idx = ToIndex(MapType(type));
+    if (idx >= grp_storage_usage_by_type_.size()) {
+        KVCM_LOG_WARN("data storage type to index out of range, array size: [%zu], type as index: [%zu]",
+                      grp_storage_usage_by_type_.size(),
+                      idx);
+        return 0;
     }
+    return grp_storage_usage_by_type_.at(idx);
 }
 
 void CacheReclaimer::GroupUsageData::AddGroupUsageByType(const DataStorageType &type,
                                                          const std::size_t value) noexcept {
-    try {
-        grp_storage_usage_array_.at(ToIndex(MapType(type))) += value;
-    } catch (const std::out_of_range &e) {
-        KVCM_LOG_WARN("data storage type out of range, msg: [%s], array size: [%zu], type as index: [%zu]",
-                      e.what(),
-                      grp_storage_usage_array_.size(),
-                      ToIndex(MapType(type)));
+    const size_t_ idx = ToIndex(MapType(type));
+    if (idx >= grp_storage_usage_by_type_.size()) {
+        KVCM_LOG_WARN("data storage type to index out of range, array size: [%zu], type as index: [%zu]",
+                      grp_storage_usage_by_type_.size(),
+                      idx);
+        return;
     }
+    grp_storage_usage_by_type_.at(idx) += value;
 }
 
 CacheReclaimer::WaterLevelExceed::WaterLevelExceed()
-    : water_level_exceed_array_{false, /* DATA_STORAGE_TYPE_UNKNOWN used as ALL */
-                                false, /* DATA_STORAGE_TYPE_HF3FS */
-                                false, /* DATA_STORAGE_TYPE_MOONCAKE */
-                                false, /* DATA_STORAGE_TYPE_TAIR_MEMPOOL */
-                                false, /* DATA_STORAGE_TYPE_NFS */
-                                false  /* DATA_STORAGE_TYPE_VCNS_HF3FS not used */} {}
+    : general_water_level_exceed_(false)
+    , water_level_exceed_by_type_{false, /* DATA_STORAGE_TYPE_UNKNOWN **UNUSED** */
+                                  false, /* DATA_STORAGE_TYPE_HF3FS */
+                                  false, /* DATA_STORAGE_TYPE_MOONCAKE */
+                                  false, /* DATA_STORAGE_TYPE_TAIR_MEMPOOL */
+                                  false, /* DATA_STORAGE_TYPE_NFS */
+                                  false /** DATA_STORAGE_TYPE_VCNS_HF3FS **UNUSED** (merged into HF3FS) */} {}
+
+bool CacheReclaimer::WaterLevelExceed::GetGeneralWaterLevelExceed() const noexcept {
+    return general_water_level_exceed_;
+}
 
 bool CacheReclaimer::WaterLevelExceed::GetWaterLevelExceedByType(const DataStorageType &type) const noexcept {
-    try {
-        return water_level_exceed_array_.at(ToIndex(MapType(type)));
-    } catch (const std::out_of_range &e) {
-        KVCM_LOG_WARN("data storage type out of range, msg: [%s], array size: [%zu], type as index: [%zu]",
-                      e.what(),
-                      water_level_exceed_array_.size(),
-                      ToIndex(MapType(type)));
+    const size_t_ idx = ToIndex(MapType(type));
+    if (idx >= water_level_exceed_by_type_.size()) {
+        KVCM_LOG_WARN("data storage type to index out of range, array size: [%zu], type as index: [%zu]",
+                      water_level_exceed_by_type_.size(),
+                      idx);
         return false;
     }
+    return water_level_exceed_by_type_.at(idx);
 }
 
-bool CacheReclaimer::WaterLevelExceed::AnyOfWaterLevelExceed() const noexcept {
-    if (std::any_of(water_level_exceed_array_.cbegin(), water_level_exceed_array_.cend(), [](const bool v) -> bool {
-            return v;
-        })) {
-        return true;
-    }
-    return false;
-}
-
-bool CacheReclaimer::WaterLevelExceed::AnyButTotalWaterLevelExceed() const noexcept {
-    for (std::size_t i = 1 /* skip DATA_STORAGE_TYPE_UNKNOWN */; i != water_level_exceed_array_.size(); ++i) {
-        if (i == static_cast<std::size_t>(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS)) {
-            continue;
-        }
-        if (water_level_exceed_array_.at(i)) {
-            return true;
-        }
-    }
-    return false;
+void CacheReclaimer::WaterLevelExceed::SetGeneralWaterLevelExceed(const bool value) noexcept {
+    general_water_level_exceed_ = value;
 }
 
 void CacheReclaimer::WaterLevelExceed::SetWaterLevelExceedByType(const DataStorageType &type,
                                                                  const bool value) noexcept {
-    try {
-        water_level_exceed_array_.at(ToIndex(MapType(type))) = value;
-    } catch (const std::out_of_range &e) {
-        KVCM_LOG_WARN("data storage type out of range, msg: [%s], array size: [%zu], type as index: [%zu]",
-                      e.what(),
-                      water_level_exceed_array_.size(),
-                      ToIndex(MapType(type)));
+    const size_t_ idx = ToIndex(MapType(type));
+    if (idx >= water_level_exceed_by_type_.size()) {
+        KVCM_LOG_WARN("data storage type to index out of range, array size: [%zu], type as index: [%zu]",
+                      water_level_exceed_by_type_.size(),
+                      idx);
+        return;
     }
+    water_level_exceed_by_type_.at(idx) = value;
+}
+
+bool CacheReclaimer::WaterLevelExceed::CheckGroupWaterLevelExceed() const noexcept {
+    return general_water_level_exceed_ || CheckStorageTypeWaterLevelExceed();
+}
+
+bool CacheReclaimer::WaterLevelExceed::CheckStorageTypeWaterLevelExceed() const noexcept {
+    for (size_t_ i = 0; i != water_level_exceed_by_type_.size(); ++i) {
+        if (i == static_cast<size_t_>(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN) ||
+            i == static_cast<size_t_>(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS)) {
+            continue;
+        }
+        if (water_level_exceed_by_type_.at(i)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 CacheReclaimer::CacheReclaimer(const std::size_t sampling_size_total,
@@ -423,7 +444,7 @@ bool CacheReclaimer::IsTriggerReclaiming(const RequestContext *request_context,
     //       2. storage type usage and capacity quota for this group
 
     auto get_trigger_result = [&request_context, &ins_gr, &out_water_level_exceed]() -> bool {
-        if (out_water_level_exceed.AnyOfWaterLevelExceed()) {
+        if (out_water_level_exceed.CheckGroupWaterLevelExceed()) {
             LOG_WITH_GR(DEBUG, "instance group trigger reclaiming");
             return true;
         }
@@ -469,8 +490,7 @@ bool CacheReclaimer::IsTriggerReclaiming(const RequestContext *request_context,
 
     // 2.2. result for the entire instance group
     if (data.grp_used_key_cnt_ == 0 || data.grp_used_byte_sz_ == 0) {
-        // DATA_STORAGE_TYPE_UNKNOWN be the entire group
-        out_water_level_exceed.SetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, false);
+        out_water_level_exceed.SetGeneralWaterLevelExceed(false);
         return get_trigger_result();
     }
 
@@ -481,8 +501,7 @@ bool CacheReclaimer::IsTriggerReclaiming(const RequestContext *request_context,
                     "instance group capacity quota used percentage [inf] "
                     "has reached or exceeded the threshold percentage [%f]",
                     threshold_used_percentage);
-        // DATA_STORAGE_TYPE_UNKNOWN be the entire group
-        out_water_level_exceed.SetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, true);
+        out_water_level_exceed.SetGeneralWaterLevelExceed(true);
         return get_trigger_result();
     }
     if (const double group_used_percentage =
@@ -493,8 +512,7 @@ bool CacheReclaimer::IsTriggerReclaiming(const RequestContext *request_context,
                     "has reached or exceeded the threshold percentage [%f]",
                     group_used_percentage,
                     threshold_used_percentage);
-        // DATA_STORAGE_TYPE_UNKNOWN be the entire group
-        out_water_level_exceed.SetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, true);
+        out_water_level_exceed.SetGeneralWaterLevelExceed(true);
         return get_trigger_result();
     }
 
@@ -504,8 +522,7 @@ bool CacheReclaimer::IsTriggerReclaiming(const RequestContext *request_context,
                     "instance group total key count used percentage [inf] "
                     "has reached or exceeded the threshold percentage [%f]",
                     threshold_used_percentage);
-        // DATA_STORAGE_TYPE_UNKNOWN be the entire group
-        out_water_level_exceed.SetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, true);
+        out_water_level_exceed.SetGeneralWaterLevelExceed(true);
         return get_trigger_result();
     }
     if (const double group_used_percentage =
@@ -516,14 +533,12 @@ bool CacheReclaimer::IsTriggerReclaiming(const RequestContext *request_context,
                     "has reached or exceeded the threshold percentage [%f]",
                     group_used_percentage,
                     threshold_used_percentage);
-        // DATA_STORAGE_TYPE_UNKNOWN be the entire group
-        out_water_level_exceed.SetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, true);
+        out_water_level_exceed.SetGeneralWaterLevelExceed(true);
         return get_trigger_result();
     }
 
     // 2.2.3. instance group do not trigger reclaiming
-    // DATA_STORAGE_TYPE_UNKNOWN be the entire group
-    out_water_level_exceed.SetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, false);
+    out_water_level_exceed.SetGeneralWaterLevelExceed(false);
     return get_trigger_result();
 }
 
@@ -916,7 +931,7 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
         for (const auto &[_, loc] : loc_map) {
             // pick out only the cache location with "serving" status
             if (loc.status() == CacheLocationStatus::CLS_SERVING) {
-                if (water_level_exceed.AnyButTotalWaterLevelExceed()) {
+                if (water_level_exceed.CheckStorageTypeWaterLevelExceed()) {
                     // some storage type water level exceeded; only
                     // collect the location with matched type but
                     // fairness is ignored
