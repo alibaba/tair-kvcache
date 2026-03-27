@@ -133,16 +133,16 @@ public:
                                        const std::string &instance_group) const noexcept;
 
 private:
-    class StorageQuotaAvail;
-
     std::size_t
     CalcGroupUsedSize(RequestContext const *request_context,
                       const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) const noexcept;
 
+    class StorageQuotaAvail;
+
     void GenStorageQuotaAvailTable(RequestContext const *request_context,
                                    const InstanceGroupQuota &quota,
                                    const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos,
-                                   StorageQuotaAvail &storage_quota_avail_table) const noexcept;
+                                   StorageQuotaAvail &out_storage_quota_avail_table) const noexcept;
 
     static void GetCandidates(RequestContext const *request_context,
                               const std::vector<std::shared_ptr<DataStorageBackend>> &avail_backends,

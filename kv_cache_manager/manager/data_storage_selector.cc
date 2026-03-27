@@ -29,10 +29,8 @@ namespace kv_cache_manager {
         KVCM_LOG_##LEVEL("trace_id [%s] | " format, trace_id.c_str(), ##args);                                         \
     } while (0)
 
-DataStorageSelector::DataStorageSelector(std::shared_ptr<MetaIndexerManager> meta_indexer_manager,
-                                         std::shared_ptr<RegistryManager> registry_manager)
-    : meta_indexer_manager_(std::move(meta_indexer_manager)), registry_manager_(std::move(registry_manager)) {}
-
+// record instance group storage quota availability flags
+// if any storage quota availability flag is unset, it won't be selected
 class DataStorageSelector::StorageQuotaAvail {
 public:
     StorageQuotaAvail();
@@ -42,40 +40,53 @@ public:
     void SetStorageQuotaAvailByType(const DataStorageType &type, bool value) noexcept;
 
 private:
-    std::array<bool, static_cast<std::size_t>(DataStorageType::COUNT)> storage_quota_avail_array_;
+    using array_t_ = std::array<bool, static_cast<std::size_t>(DataStorageType::COUNT)>;
+    using size_t_ = array_t_::size_type;
+
+    // group storage quota availability flag array by storage type
+    // slot 0: DATA_STORAGE_TYPE_UNKNOWN **UNUSED**
+    // slot 1: DATA_STORAGE_TYPE_HF3FS availability flag
+    // slot 2: DATA_STORAGE_TYPE_MOONCAKE availability flag
+    // slot 3: DATA_STORAGE_TYPE_TAIR_MEMPOOL availability flag
+    // slot 4: DATA_STORAGE_TYPE_NFS exceed availability flag
+    // slot 5: DATA_STORAGE_TYPE_VCNS_HF3FS **UNUSED** (merged into HF3FS)
+    array_t_ storage_quota_avail_by_type_;
 };
 
 DataStorageSelector::StorageQuotaAvail::StorageQuotaAvail()
-    : storage_quota_avail_array_{false, /* DATA_STORAGE_TYPE_UNKNOWN */
-                                 true,  /* DATA_STORAGE_TYPE_HF3FS */
-                                 true,  /* DATA_STORAGE_TYPE_MOONCAKE */
-                                 true,  /* DATA_STORAGE_TYPE_TAIR_MEMPOOL */
-                                 true,  /* DATA_STORAGE_TYPE_NFS */
-                                 false  /* DATA_STORAGE_TYPE_VCNS_HF3FS */ } {}
+    : storage_quota_avail_by_type_{false, /* DATA_STORAGE_TYPE_UNKNOWN **UNUSED** */
+                                   true,  /* DATA_STORAGE_TYPE_HF3FS */
+                                   true,  /* DATA_STORAGE_TYPE_MOONCAKE */
+                                   true,  /* DATA_STORAGE_TYPE_TAIR_MEMPOOL */
+                                   true,  /* DATA_STORAGE_TYPE_NFS */
+                                   false /** DATA_STORAGE_TYPE_VCNS_HF3FS **UNUSED** (merged into HF3FS) */} {}
 
 bool DataStorageSelector::StorageQuotaAvail::GetStorageQuotaAvailByType(const DataStorageType &type) const noexcept {
-    try {
-        return storage_quota_avail_array_.at(ToIndex(MapType(type)));
-    } catch (const std::out_of_range &e) {
-        KVCM_LOG_WARN("data storage type out of range, msg: [%s], array size: [%zu], type as index: [%zu]",
-                      e.what(),
-                      storage_quota_avail_array_.size(),
-                      ToIndex(MapType(type)));
+    const size_t_ idx = ToIndex(MapType(type));
+    if (idx >= storage_quota_avail_by_type_.size()) {
+        KVCM_LOG_WARN("data storage type to index out of range, array size: [%zu], type as index: [%zu]",
+                      storage_quota_avail_by_type_.size(),
+                      idx);
         return false;
     }
+    return storage_quota_avail_by_type_.at(idx);
 }
 
 void DataStorageSelector::StorageQuotaAvail::SetStorageQuotaAvailByType(const DataStorageType &type,
                                                                         const bool value) noexcept {
-    try {
-        storage_quota_avail_array_.at(ToIndex(MapType(type))) = value;
-    } catch (const std::out_of_range &e) {
-        KVCM_LOG_WARN("data storage type out of range, msg: [%s], array size: [%zu], type as index: [%zu]",
-                      e.what(),
-                      storage_quota_avail_array_.size(),
-                      ToIndex(MapType(type)));
+    const size_t_ idx = ToIndex(MapType(type));
+    if (idx >= storage_quota_avail_by_type_.size()) {
+        KVCM_LOG_WARN("data storage type to index out of range, array size: [%zu], type as index: [%zu]",
+                      storage_quota_avail_by_type_.size(),
+                      idx);
+        return;
     }
+    storage_quota_avail_by_type_.at(idx) = value;
 }
+
+DataStorageSelector::DataStorageSelector(std::shared_ptr<MetaIndexerManager> meta_indexer_manager,
+                                         std::shared_ptr<RegistryManager> registry_manager)
+    : meta_indexer_manager_(std::move(meta_indexer_manager)), registry_manager_(std::move(registry_manager)) {}
 
 /**
  * @brief Calculate the intersection of available backends and
@@ -372,7 +383,7 @@ void DataStorageSelector::GenStorageQuotaAvailTable(
     RequestContext const *request_context,
     const InstanceGroupQuota &quota,
     const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos,
-    StorageQuotaAvail &storage_quota_avail_table) const noexcept {
+    StorageQuotaAvail &out_storage_quota_avail_table) const noexcept {
     const auto &trace_id = request_context->trace_id();
 
     for (const auto &storage_quota : quota.quota_config()) {
@@ -396,7 +407,7 @@ void DataStorageSelector::GenStorageQuotaAvailTable(
         }
 
         if (storage_quota.capacity() <= total_sz) {
-            storage_quota_avail_table.SetStorageQuotaAvailByType(type, false);
+            out_storage_quota_avail_table.SetStorageQuotaAvailByType(type, false);
         }
     }
 }

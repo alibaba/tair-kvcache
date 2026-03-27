@@ -119,6 +119,7 @@ inline std::string CacheReclaimer::GenTraceID() {
     return ss.str();
 }
 
+// instance group key & storage usage data
 struct CacheReclaimer::GroupUsageData {
     std::size_t grp_used_key_cnt_;
     std::size_t grp_max_key_cnt_;
