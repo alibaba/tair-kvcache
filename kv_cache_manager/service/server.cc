@@ -307,10 +307,13 @@ void Server::CreateAndRegisterEventPublisher() {
 bool Server::CreateLeaderElector() {
     auto coordination_uri = config_.GetCoordinationUri();
     std::string node_id = config_.GetLeaderElectorNodeId();
-    if (node_id.empty()) {
+    std::string host = config_.GetAdvertisedHost();
+    if (host.empty()) {
         // TODO: replace local_ip_placeholder with real local ip
-        std::string local_ip = "local_ip_placeholder";
-        node_id = local_ip + ":" + std::to_string(config_.GetServiceAdminHttpPort()) + "_" +
+        host = "local_ip_placeholder";
+    }
+    if (node_id.empty()) {
+        node_id = host + ":" + std::to_string(config_.GetServiceAdminHttpPort()) + "_" +
                   StringUtil::GenerateRandomString(16);
     }
     coordination_backend_ =
@@ -331,7 +334,7 @@ bool Server::CreateLeaderElector() {
     // 写入本节点的连接信息到协调后端
     {
         NodeEndpointInfo node_info(node_id,
-                                   "",  // TODO: fill with real host/IP
+                                   host,
                                    config_.GetServiceRpcPort(),
                                    config_.GetServiceHttpPort(),
                                    config_.GetServiceAdminRpcPort(),

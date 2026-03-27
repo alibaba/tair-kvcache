@@ -294,6 +294,7 @@ message NodeEndpoint {
 
 message GetClusterInfoRequest {
     string trace_id = 1;
+    string instance_id = 2;
 }
 
 message GetClusterInfoResponse {

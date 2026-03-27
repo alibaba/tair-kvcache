@@ -40,6 +40,7 @@ public:
     KVCM_DECLARE_METRICS_COLLECTOR_MAP_METHOD_(FinishWriteCache);
     KVCM_DECLARE_METRICS_COLLECTOR_MAP_METHOD_(RemoveCache);
     KVCM_DECLARE_METRICS_COLLECTOR_MAP_METHOD_(TrimCache);
+    KVCM_DECLARE_METRICS_COLLECTOR_MAP_METHOD_(GetClusterInfo);
 
 protected:
     KVCM_DECLARE_METRICS_COLLECTOR_(RegisterInstance);
@@ -52,6 +53,7 @@ protected:
     KVCM_DECLARE_METRICS_COLLECTOR_MAP_(FinishWriteCache);
     KVCM_DECLARE_METRICS_COLLECTOR_MAP_(RemoveCache);
     KVCM_DECLARE_METRICS_COLLECTOR_MAP_(TrimCache);
+    KVCM_DECLARE_METRICS_COLLECTOR_MAP_(GetClusterInfo);
 
 private:
     std::shared_ptr<MetricsRegistry> metrics_registry_;
