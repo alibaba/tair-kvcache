@@ -103,8 +103,8 @@ jobs:
           DISK_CACHE_NAME="disk-${{ runner.os }}-${{ github.workflow }}-${{ matrix.name }}"
           gh cache list --repo ${{ github.repository }} --json id,key --limit 100 | \
             jq -r --arg arch "$RUNNER_ARCH_LOWER" --arg name "$DISK_CACHE_NAME" \
-              '.[] | select((.key | contains($arch)) and (.key | contains($name))) | .key' | \
-            xargs -I {} gh cache delete "{}" --repo ${{ github.repository }} || true
+              '.[] | select((.key | contains($arch)) and (.key | contains($name))) | .id' | \
+            xargs -I {} gh cache delete {} --repo ${{ github.repository }} || true
       - name: detect_crashes
         if: failure()
         run: |
