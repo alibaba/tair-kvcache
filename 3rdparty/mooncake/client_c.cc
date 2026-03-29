@@ -12,26 +12,16 @@
 
 #include "client_service.h"
 #include "utils.h"
-#include <ylt/coro_http/coro_http_client.hpp>
-
-#if __has_include("ha/ha_backend_factory.h") && \
-    __has_include("ha/ha_types.h") &&            \
-    __has_include("ha/leader_coordinator.h")
-#define MOONCAKE_CLIENT_C_HAS_NEW_HA 1
-#include "ha/ha_backend_factory.h"
 #include "ha/ha_types.h"
-#include "ha/leader_coordinator.h"
-#elif __has_include("ha_helper.h")
-#define MOONCAKE_CLIENT_C_HAS_LEGACY_HA 1
-#include "ha_helper.h"
-#endif
+#include "ha/leadership/leader_coordinator.h"
+#include "ha/leadership/leader_coordinator_factory.h"
+#include <ylt/coro_http/coro_http_client.hpp>
 
 using namespace mooncake;
 
 namespace {
 
 constexpr uint16_t kDefaultMasterMetricsPort = 9003;
-
 using ResolveMetricsHostFn = ErrorCode_t (*)(void *, std::string *);
 using DestroyMetricsResolverStateFn = void (*)(void *);
 
@@ -195,7 +185,19 @@ bool ParseUint64Metric(const std::string &payload,
     return false;
 }
 
-#if defined(MOONCAKE_CLIENT_C_HAS_NEW_HA)
+std::string ResolveHaClusterNamespaceFromEnv() {
+    const char *store_cluster_id = std::getenv("MC_STORE_CLUSTER_ID");
+    if (store_cluster_id != nullptr && store_cluster_id[0] != '\0') {
+        return store_cluster_id;
+    }
+
+    const char *mooncake_cluster_id = std::getenv("MOONCAKE_CLUSTER_ID");
+    if (mooncake_cluster_id != nullptr && mooncake_cluster_id[0] != '\0') {
+        return mooncake_cluster_id;
+    }
+
+    return "";
+}
 
 struct NewHaMetricsResolverState {
     std::optional<ha::HABackendSpec> ha_backend_spec;
@@ -218,7 +220,7 @@ tl::expected<std::optional<ha::HABackendSpec>, ErrorCode> ParseHABackendSpec(
     return std::optional<ha::HABackendSpec>{ha::HABackendSpec{
         .type = backend_type.value(),
         .connstring = std::string(master_server_entry.substr(delimiter_pos + 3)),
-        .cluster_namespace = "",
+        .cluster_namespace = ResolveHaClusterNamespaceFromEnv(),
     }};
 }
 
@@ -262,60 +264,8 @@ void DestroyNewHaMetricsResolverState(void *opaque) {
     delete reinterpret_cast<NewHaMetricsResolverState *>(opaque);
 }
 
-#elif defined(MOONCAKE_CLIENT_C_HAS_LEGACY_HA)
-
-struct LegacyEtcdMetricsResolverState {
-    std::string etcd_entry;
-    std::unique_ptr<MasterViewHelper> master_view_helper;
-    bool connected = false;
-};
-
-ErrorCode_t ResolveLegacyEtcdMetricsHost(void *opaque, std::string *host) {
-    if (opaque == nullptr || host == nullptr) {
-        return MOONCAKE_ERROR_INVALID_PARAMS;
-    }
-
-    auto *state = reinterpret_cast<LegacyEtcdMetricsResolverState *>(opaque);
-    if (state->etcd_entry.empty()) {
-        return MOONCAKE_ERROR_INVALID_PARAMS;
-    }
-
-    if (state->master_view_helper == nullptr) {
-        state->master_view_helper = std::make_unique<MasterViewHelper>();
-    }
-    if (!state->connected) {
-        auto err = state->master_view_helper->ConnectToEtcd(state->etcd_entry);
-        if (err != ErrorCode::OK) {
-            return ToCErrorCode(err);
-        }
-        state->connected = true;
-    }
-
-    std::string master_address;
-    ViewVersionId master_version = 0;
-    auto err = state->master_view_helper->GetMasterView(master_address,
-                                                        master_version);
-    if (err != ErrorCode::OK) {
-        return ToCErrorCode(err);
-    }
-
-    std::string resolved_host = ExtractHostFromAddress(master_address);
-    if (resolved_host.empty()) {
-        return MOONCAKE_ERROR_INVALID_PARAMS;
-    }
-    *host = std::move(resolved_host);
-    return MOONCAKE_ERROR_OK;
-}
-
-void DestroyLegacyEtcdMetricsResolverState(void *opaque) {
-    delete reinterpret_cast<LegacyEtcdMetricsResolverState *>(opaque);
-}
-
-#endif
-
 tl::expected<MetricsResolver, ErrorCode> BuildMetricsResolver(
     std::string_view master_server_entry) {
-#if defined(MOONCAKE_CLIENT_C_HAS_NEW_HA)
     auto ha_backend_spec = ParseHABackendSpec(master_server_entry);
     if (!ha_backend_spec) {
         return tl::make_unexpected(ha_backend_spec.error());
@@ -334,24 +284,6 @@ tl::expected<MetricsResolver, ErrorCode> BuildMetricsResolver(
                 },
         };
     }
-#elif defined(MOONCAKE_CLIENT_C_HAS_LEGACY_HA)
-    constexpr std::string_view kEtcdScheme = "etcd://";
-    if (master_server_entry.substr(0, kEtcdScheme.size()) == kEtcdScheme) {
-        auto *state = new LegacyEtcdMetricsResolverState{
-            .etcd_entry = std::string(master_server_entry.substr(kEtcdScheme.size())),
-            .master_view_helper = nullptr,
-            .connected = false,
-        };
-        return MetricsResolver{
-            .state = state,
-            .vtable =
-                MetricsResolverVTable{
-                    .resolve_host = ResolveLegacyEtcdMetricsHost,
-                    .destroy_state = DestroyLegacyEtcdMetricsResolverState,
-                },
-        };
-    }
-#endif
 
     std::string direct_master_host = ExtractHostFromAddress(master_server_entry);
     if (direct_master_host.empty()) {
@@ -369,6 +301,36 @@ tl::expected<MetricsResolver, ErrorCode> BuildMetricsResolver(
                 .destroy_state = DestroyDirectMetricsResolverState,
             },
     };
+}
+
+tl::expected<std::string, ErrorCode> ResolveNativeMasterServerEntry(
+    std::string_view master_server_entry) {
+    auto ha_backend_spec = ParseHABackendSpec(master_server_entry);
+    if (!ha_backend_spec) {
+        return tl::make_unexpected(ha_backend_spec.error());
+    }
+    if (ha_backend_spec.value().has_value()) {
+        auto coordinator =
+            ha::CreateLeaderCoordinator(ha_backend_spec.value().value());
+        if (!coordinator) {
+            return tl::make_unexpected(coordinator.error());
+        }
+
+        auto current_view = coordinator.value()->ReadCurrentView();
+        if (!current_view) {
+            return tl::make_unexpected(current_view.error());
+        }
+        if (!current_view.value().has_value()) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+        return current_view.value()->leader_address;
+    }
+
+    if (master_server_entry.empty()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return std::string(master_server_entry);
 }
 
 ErrorCode_t ResolveMetricsHost(ClientSession &session, std::string *host) {
@@ -415,7 +377,7 @@ client_t mooncake_client_create(const char *local_hostname,
                                 const char *protocol,
                                 const char *rdma_devices,
                                 const char *master_server_entry) {
-    const char *resolved_master_server_entry =
+    const char *configured_master_server_entry =
         (master_server_entry != nullptr && master_server_entry[0] != '\0')
             ? master_server_entry
             : kDefaultMasterAddress.c_str();
@@ -424,14 +386,23 @@ client_t mooncake_client_create(const char *local_hostname,
         (protocol != nullptr && strcmp(protocol, "rdma") == 0)
             ? std::optional<std::string>(rdma_devices)
             : std::nullopt;
+
+    auto native_master_server_entry =
+        ResolveNativeMasterServerEntry(configured_master_server_entry);
+    if (!native_master_server_entry) {
+        LOG(ERROR) << "Failed to resolve Mooncake client master entry: "
+                   << toString(native_master_server_entry.error());
+        return nullptr;
+    }
+
     std::optional<std::shared_ptr<Client>> native = Client::Create(
         local_hostname, metadata_connstring, protocol, device_names,
-        resolved_master_server_entry);
+        native_master_server_entry.value());
     if (!native) {
         return nullptr;
     }
 
-    auto resolver = BuildMetricsResolver(resolved_master_server_entry);
+    auto resolver = BuildMetricsResolver(configured_master_server_entry);
     if (!resolver) {
         LOG(ERROR) << "Failed to build Mooncake client metrics resolver: "
                    << toString(resolver.error());

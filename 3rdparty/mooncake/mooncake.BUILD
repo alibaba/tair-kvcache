@@ -264,7 +264,14 @@ cc_library(
         "@xxhash//:xxhash",
         "@zstd_lib//:zstd",
         "@com_github_gflags_gflags//:gflags",
+        "@hiredis//:hiredis",
     ],
-    copts = mooncake_copts,
+    copts = mooncake_copts + [
+        # Upstream real_client.cpp uses DEFINE_* without including gflags.h.
+        "-include",
+        "gflags/gflags.h",
+        "-Wno-error=invalid-memory-model",
+        "-DSTORE_USE_REDIS",
+    ],
     visibility = ["//visibility:public"],
 )
