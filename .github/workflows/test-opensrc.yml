@@ -5,7 +5,7 @@ permissions:
 on:
   push:
     branches: [ "main" ]
-  pull_request:
+  pull_request_target:
     branches: [ "main" ]
   workflow_dispatch:
     inputs:
@@ -21,8 +21,8 @@ on:
         type: boolean
         default: false
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.runs-on || 'ubuntu-latest' }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ inputs.runs-on || 'ubuntu-latest' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
 jobs:
   test:
     strategy:
@@ -58,6 +58,8 @@ jobs:
           echo "Disk space after cleanup:"
           df -h
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: bazel-contrib/setup-bazel@0.18.0
         with:
           bazelisk-cache: true
