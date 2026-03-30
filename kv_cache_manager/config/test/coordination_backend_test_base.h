@@ -8,24 +8,24 @@
 
 #include "kv_cache_manager/common/standard_uri.h"
 #include "kv_cache_manager/common/unittest.h"
-#include "kv_cache_manager/config/distributed_lock_backend.h"
-#include "kv_cache_manager/config/distributed_lock_backend_factory.h"
+#include "kv_cache_manager/config/coordination_backend.h"
+#include "kv_cache_manager/config/coordination_backend_factory.h"
 
 namespace kv_cache_manager {
-class DistributedLockBackendTest;
-struct DistributedLockBackendTestConfig {
-    std::function<std::string(DistributedLockBackendTest *)> get_test_uri;
-    std::function<void(DistributedLockBackendTest *test_base)> set_up_;
-    std::function<void(DistributedLockBackendTest *test_base)> tear_down_;
+class CoordinationBackendTest;
+struct CoordinationBackendTestConfig {
+    std::function<std::string(CoordinationBackendTest *)> get_test_uri;
+    std::function<void(CoordinationBackendTest *test_base)> set_up_;
+    std::function<void(CoordinationBackendTest *test_base)> tear_down_;
 };
 
-class DistributedLockBackendTest : public TESTBASE,
-                                   public testing::WithParamInterface<DistributedLockBackendTestConfig> {
+class CoordinationBackendTest : public TESTBASE,
+                                   public testing::WithParamInterface<CoordinationBackendTestConfig> {
 protected:
     void SetUp() override {
         GetParam().set_up_(this);
         // 创建锁后端实例
-        backend_ = DistributedLockBackendFactory::CreateAndInitDistributedLockBackend(GetTestUri());
+        backend_ = CoordinationBackendFactory::CreateAndInitCoordinationBackend(GetTestUri());
         EXPECT_NE(backend_, nullptr);
     }
 
@@ -36,11 +36,11 @@ protected:
 
 protected:
     std::string test_dir_;
-    std::unique_ptr<DistributedLockBackend> backend_;
+    std::unique_ptr<CoordinationBackend> backend_;
 };
 
 // 测试初始化
-TEST_P(DistributedLockBackendTest, TestInit) {
+TEST_P(CoordinationBackendTest, TestInit) {
     // 测试重复初始化（应该也成功）
     StandardUri uri = StandardUri::FromUri(this->GetTestUri());
     ErrorCode ec = backend_->Init(uri);
@@ -48,7 +48,7 @@ TEST_P(DistributedLockBackendTest, TestInit) {
 }
 
 // 测试TryLock基本功能
-TEST_P(DistributedLockBackendTest, TestTryLockBasic) {
+TEST_P(CoordinationBackendTest, TestTryLockBasic) {
 
     const std::string lock_key = "test_lock";
     const std::string lock_value = "value1";
@@ -68,7 +68,7 @@ TEST_P(DistributedLockBackendTest, TestTryLockBasic) {
 }
 
 // 测试TryLock过期锁
-TEST_P(DistributedLockBackendTest, TestTryLockExpired) {
+TEST_P(CoordinationBackendTest, TestTryLockExpired) {
     const std::string lock_key = "test_lock";
     const std::string lock_value1 = "value1";
     const std::string lock_value2 = "value2";
@@ -91,7 +91,7 @@ TEST_P(DistributedLockBackendTest, TestTryLockExpired) {
 }
 
 // 测试RenewLock基本功能
-TEST_P(DistributedLockBackendTest, TestRenewLockBasic) {
+TEST_P(CoordinationBackendTest, TestRenewLockBasic) {
     const std::string lock_key = "test_lock";
     const std::string lock_value = "value1";
     const int64_t ttl_ms = 1000;
@@ -114,7 +114,7 @@ TEST_P(DistributedLockBackendTest, TestRenewLockBasic) {
 }
 
 // 测试RenewLock过期锁
-TEST_P(DistributedLockBackendTest, TestRenewLockExpired) {
+TEST_P(CoordinationBackendTest, TestRenewLockExpired) {
     const std::string lock_key = "test_lock";
     const std::string lock_value = "value1";
     const int64_t short_ttl_ms = 100; // 100毫秒
@@ -132,7 +132,7 @@ TEST_P(DistributedLockBackendTest, TestRenewLockExpired) {
 }
 
 // 测试Unlock基本功能
-TEST_P(DistributedLockBackendTest, TestUnlockBasic) {
+TEST_P(CoordinationBackendTest, TestUnlockBasic) {
     const std::string lock_key = "test_lock";
     const std::string lock_value = "value1";
     const int64_t ttl_ms = 1000;
@@ -159,14 +159,14 @@ TEST_P(DistributedLockBackendTest, TestUnlockBasic) {
 }
 
 // 测试Unlock不存在的锁
-TEST_P(DistributedLockBackendTest, TestUnlockNonexistent) {
+TEST_P(CoordinationBackendTest, TestUnlockNonexistent) {
     // 释放不存在的锁（应该失败）
     ErrorCode ec = backend_->Unlock("nonexistent_lock", "value");
     EXPECT_EQ(EC_NOENT, ec);
 }
 
 // 测试GetLockHolder基本功能
-TEST_P(DistributedLockBackendTest, TestGetLockHolderBasic) {
+TEST_P(CoordinationBackendTest, TestGetLockHolderBasic) {
     const std::string lock_key = "test_lock";
     const std::string lock_value = "value1";
     const int64_t ttl_ms = 1000;
@@ -197,7 +197,7 @@ TEST_P(DistributedLockBackendTest, TestGetLockHolderBasic) {
 }
 
 // 测试GetLockHolder过期锁
-TEST_P(DistributedLockBackendTest, TestGetLockHolderExpired) {
+TEST_P(CoordinationBackendTest, TestGetLockHolderExpired) {
     const std::string lock_key = "test_lock";
     const std::string lock_value = "value1";
     const int64_t short_ttl_ms = 100; // 100毫秒
@@ -223,7 +223,7 @@ TEST_P(DistributedLockBackendTest, TestGetLockHolderExpired) {
 }
 
 // 测试多个不同的锁键
-TEST_P(DistributedLockBackendTest, TestMultipleLockKeys) {
+TEST_P(CoordinationBackendTest, TestMultipleLockKeys) {
     const std::string lock_key1 = "lock1";
     const std::string lock_key2 = "lock2";
     const std::string value1 = "value1";
@@ -256,7 +256,7 @@ TEST_P(DistributedLockBackendTest, TestMultipleLockKeys) {
 }
 
 // 测试特殊字符的锁键
-TEST_P(DistributedLockBackendTest, TestSpecialLockKey) {
+TEST_P(CoordinationBackendTest, TestSpecialLockKey) {
     // 包含特殊字符的锁键
     const std::string lock_key = "test/lock/key\\with/special@chars";
     const std::string lock_value = "value";
@@ -276,7 +276,7 @@ TEST_P(DistributedLockBackendTest, TestSpecialLockKey) {
 }
 
 // 测试并发场景（简单版本）
-TEST_P(DistributedLockBackendTest, TestConcurrentAccess) {
+TEST_P(CoordinationBackendTest, TestConcurrentAccess) {
     const std::string lock_key = "concurrent_lock";
     const std::string lock_value = "value";
     const int64_t ttl_ms = 1000;
@@ -303,7 +303,7 @@ TEST_P(DistributedLockBackendTest, TestConcurrentAccess) {
 }
 
 // 测试完整的锁生命周期
-TEST_P(DistributedLockBackendTest, TestFullLockLifecycle) {
+TEST_P(CoordinationBackendTest, TestFullLockLifecycle) {
     const std::string lock_key = "lifecycle_lock";
     const std::string lock_value = "process_123";
     const int64_t ttl_ms = 5000;
@@ -339,7 +339,7 @@ TEST_P(DistributedLockBackendTest, TestFullLockLifecycle) {
 }
 
 // 测试无效参数
-TEST_P(DistributedLockBackendTest, TestInvalidArguments) {
+TEST_P(CoordinationBackendTest, TestInvalidArguments) {
     // 测试空键名
     ErrorCode ec = backend_->TryLock("", "value", 1000);
     EXPECT_EQ(EC_BADARGS, ec);
@@ -354,6 +354,106 @@ TEST_P(DistributedLockBackendTest, TestInvalidArguments) {
 
     ec = backend_->TryLock("key", "value", -100);
     EXPECT_EQ(EC_BADARGS, ec);
+}
+
+// ---- KV Storage Tests ----
+
+// 测试 SetValue/GetValue 基本功能
+TEST_P(CoordinationBackendTest, TestSetGetBasic) {
+    const std::string key = "test_key";
+    const std::string value = "test_value";
+
+    // 设置值
+    ErrorCode ec = backend_->SetValue(key, value);
+    EXPECT_EQ(EC_OK, ec);
+
+    // 读取值
+    std::string out_value;
+    ec = backend_->GetValue(key, out_value);
+    EXPECT_EQ(EC_OK, ec);
+    EXPECT_EQ(value, out_value);
+}
+
+// 测试 GetValue 不存在的 key
+TEST_P(CoordinationBackendTest, TestGetNonExistentKey) {
+    std::string out_value;
+    ErrorCode ec = backend_->GetValue("nonexistent_key", out_value);
+    EXPECT_EQ(EC_NOENT, ec);
+}
+
+// 测试 SetValue 覆盖写
+TEST_P(CoordinationBackendTest, TestSetOverwrite) {
+    const std::string key = "overwrite_key";
+
+    // 第一次写入
+    ErrorCode ec = backend_->SetValue(key, "value1");
+    EXPECT_EQ(EC_OK, ec);
+
+    // 覆盖写入
+    ec = backend_->SetValue(key, "value2");
+    EXPECT_EQ(EC_OK, ec);
+
+    // 读取应该是最新值
+    std::string out_value;
+    ec = backend_->GetValue(key, out_value);
+    EXPECT_EQ(EC_OK, ec);
+    EXPECT_EQ("value2", out_value);
+}
+
+// 测试 SetValue/GetValue 无效参数
+TEST_P(CoordinationBackendTest, TestSetGetInvalidArgs) {
+    // 空 key
+    ErrorCode ec = backend_->SetValue("", "value");
+    EXPECT_EQ(EC_BADARGS, ec);
+
+    std::string out_value;
+    ec = backend_->GetValue("", out_value);
+    EXPECT_EQ(EC_BADARGS, ec);
+}
+
+// 测试多个不同 key 的 KV 存储
+TEST_P(CoordinationBackendTest, TestSetGetMultipleKeys) {
+    // 写入多个 key
+    EXPECT_EQ(EC_OK, backend_->SetValue("key1", "val1"));
+    EXPECT_EQ(EC_OK, backend_->SetValue("key2", "val2"));
+    EXPECT_EQ(EC_OK, backend_->SetValue("key3", "val3"));
+
+    // 分别读取验证
+    std::string out;
+    EXPECT_EQ(EC_OK, backend_->GetValue("key1", out));
+    EXPECT_EQ("val1", out);
+
+    EXPECT_EQ(EC_OK, backend_->GetValue("key2", out));
+    EXPECT_EQ("val2", out);
+
+    EXPECT_EQ(EC_OK, backend_->GetValue("key3", out));
+    EXPECT_EQ("val3", out);
+}
+
+// 测试 SetValue 空值
+TEST_P(CoordinationBackendTest, TestSetGetEmptyValue) {
+    const std::string key = "empty_value_key";
+
+    // 设置空值
+    ErrorCode ec = backend_->SetValue(key, "");
+    EXPECT_EQ(EC_OK, ec);
+
+    // 读取应返回 EC_OK 和空字符串
+    std::string out_value;
+    ec = backend_->GetValue(key, out_value);
+    EXPECT_EQ(EC_OK, ec);
+    EXPECT_EQ("", out_value);
+
+    // 覆盖为非空值后再改回空值
+    ec = backend_->SetValue(key, "non_empty");
+    EXPECT_EQ(EC_OK, ec);
+
+    ec = backend_->SetValue(key, "");
+    EXPECT_EQ(EC_OK, ec);
+
+    ec = backend_->GetValue(key, out_value);
+    EXPECT_EQ(EC_OK, ec);
+    EXPECT_EQ("", out_value);
 }
 
 } // namespace kv_cache_manager

@@ -1,6 +1,7 @@
 name: test-opensrc
 permissions:
   contents: read
+  actions: write
 on:
   push:
     branches: [ "main" ]
@@ -83,6 +84,27 @@ jobs:
           set -e
           ulimit -c unlimited
           bazelisk test ${{ matrix.test_target }} ${{ matrix.test_args }} --cache_test_results=no --test_output=errors
+      - name: delete_old_disk_cache
+        if: ${{ inputs.rebuildDiskCache || false }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -x
+          # Install gh and jq (not pre-installed in the container image)
+          ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+          curl -sLo /usr/local/bin/jq "https://github.com/jqlang/jq/releases/download/jq-1.8.1/jq-linux-${ARCH}" && chmod +x /usr/local/bin/jq
+          GH_VER=2.89.0
+          curl -sL "https://github.com/cli/cli/releases/download/v${GH_VER}/gh_${GH_VER}_linux_${ARCH}.tar.gz" | tar xz --strip-components=1 -C /usr/local
+          # Delete old disk cache so setup-bazel post action can save the new one.
+          # GitHub Actions cache is immutable - same key cannot be overwritten.
+          # Match by our disk-cache name and runner arch to avoid depending on
+          # setup-bazel's internal key format, while not deleting other arches' caches.
+          RUNNER_ARCH_LOWER=$(echo "${{ runner.arch }}" | tr '[:upper:]' '[:lower:]')
+          DISK_CACHE_NAME="disk-${{ runner.os }}-${{ github.workflow }}-${{ matrix.name }}"
+          gh cache list --repo ${{ github.repository }} --json id,key --limit 100 | \
+            jq -r --arg arch "$RUNNER_ARCH_LOWER" --arg name "$DISK_CACHE_NAME" \
+              '.[] | select((.key | contains($arch)) and (.key | contains($name))) | .id' | \
+            xargs -I {} gh cache delete {} --repo ${{ github.repository }} || true
       - name: detect_crashes
         if: failure()
         run: |

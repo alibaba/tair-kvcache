@@ -6,22 +6,22 @@
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/redis_client_ext.h"
 #include "kv_cache_manager/common/standard_uri.h"
-#include "kv_cache_manager/config/distributed_lock_backend.h"
+#include "kv_cache_manager/config/coordination_backend.h"
 
 namespace kv_cache_manager {
 
-class DistributedLockRedisBackend : public DistributedLockBackend {
+class CoordinationRedisBackend : public CoordinationBackend {
 public:
-    DistributedLockRedisBackend();
-    ~DistributedLockRedisBackend() override;
+    CoordinationRedisBackend();
+    ~CoordinationRedisBackend() override;
 
     // 禁止拷贝和赋值
-    DistributedLockRedisBackend(const DistributedLockRedisBackend &) = delete;
-    DistributedLockRedisBackend &operator=(const DistributedLockRedisBackend &) = delete;
+    CoordinationRedisBackend(const CoordinationRedisBackend &) = delete;
+    CoordinationRedisBackend &operator=(const CoordinationRedisBackend &) = delete;
 
     // 允许移动
-    DistributedLockRedisBackend(DistributedLockRedisBackend &&) = default;
-    DistributedLockRedisBackend &operator=(DistributedLockRedisBackend &&) = default;
+    CoordinationRedisBackend(CoordinationRedisBackend &&) = default;
+    CoordinationRedisBackend &operator=(CoordinationRedisBackend &&) = default;
 
 public:
     ErrorCode Init(const StandardUri &standard_uri) noexcept override;
@@ -30,10 +30,15 @@ public:
     ErrorCode Unlock(const std::string &lock_key, const std::string &lock_value) override;
     ErrorCode
     GetLockHolder(const std::string &lock_key, std::string &out_current_value, int64_t &out_expire_time_ms) override;
+    ErrorCode SetValue(const std::string &key, const std::string &value) override;
+    ErrorCode GetValue(const std::string &key, std::string &out_value) override;
 
 private:
-    // 生成Redis键名
-    std::string GetRedisKey(const std::string &lock_key) const;
+    // 生成Redis锁键名
+    std::string GetRedisLockKey(const std::string &lock_key) const;
+
+    // 生成Redis KV键名
+    std::string GetRedisKVKey(const std::string &key) const;
 
     // Lua脚本：尝试获取锁（原子操作）
     static constexpr const char *LUA_TRY_LOCK = R"(
@@ -111,7 +116,8 @@ private:
 
 private:
     std::unique_ptr<RedisClientExt> redis_client_;
-    std::string key_prefix_;
+    std::string lock_key_prefix_;
+    std::string kv_key_prefix_;
     bool initialized_{false};
 
     // Lua脚本的SHA1缓存

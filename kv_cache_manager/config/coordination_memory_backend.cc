@@ -1,4 +1,4 @@
-#include "kv_cache_manager/config/distributed_lock_memory_backend.h"
+#include "kv_cache_manager/config/coordination_memory_backend.h"
 
 #include <chrono>
 #include <mutex>
@@ -6,11 +6,11 @@
 
 namespace kv_cache_manager {
 
-DistributedLockMemoryBackend::DistributedLockMemoryBackend() = default;
+CoordinationMemoryBackend::CoordinationMemoryBackend() = default;
 
-DistributedLockMemoryBackend::~DistributedLockMemoryBackend() = default;
+CoordinationMemoryBackend::~CoordinationMemoryBackend() = default;
 
-ErrorCode DistributedLockMemoryBackend::Init(const StandardUri &standard_uri) noexcept {
+ErrorCode CoordinationMemoryBackend::Init(const StandardUri &standard_uri) noexcept {
     if (initialized_) {
         KVCM_LOG_WARN("Memory lock backend already initialized");
         return EC_OK;
@@ -22,11 +22,11 @@ ErrorCode DistributedLockMemoryBackend::Init(const StandardUri &standard_uri) no
     }
 
     initialized_ = true;
-    KVCM_LOG_INFO("DistributedLockMemoryBackend initialized successfully");
+    KVCM_LOG_INFO("CoordinationMemoryBackend initialized successfully");
     return EC_OK;
 }
 
-void DistributedLockMemoryBackend::CleanupExpiredLocks() {
+void CoordinationMemoryBackend::CleanupExpiredLocks() {
     auto now = Now();
     for (auto it = locks_.begin(); it != locks_.end();) {
         if (now >= it->second.expire_time) {
@@ -38,7 +38,7 @@ void DistributedLockMemoryBackend::CleanupExpiredLocks() {
 }
 
 ErrorCode
-DistributedLockMemoryBackend::TryLock(const std::string &lock_key, const std::string &lock_value, int64_t ttl_ms) {
+CoordinationMemoryBackend::TryLock(const std::string &lock_key, const std::string &lock_value, int64_t ttl_ms) {
     if (!initialized_) {
         KVCM_LOG_ERROR("Memory lock backend not initialized");
         return EC_ERROR;
@@ -84,7 +84,7 @@ DistributedLockMemoryBackend::TryLock(const std::string &lock_key, const std::st
 }
 
 ErrorCode
-DistributedLockMemoryBackend::RenewLock(const std::string &lock_key, const std::string &lock_value, int64_t ttl_ms) {
+CoordinationMemoryBackend::RenewLock(const std::string &lock_key, const std::string &lock_value, int64_t ttl_ms) {
     if (!initialized_) {
         KVCM_LOG_ERROR("Memory lock backend not initialized");
         return EC_ERROR;
@@ -122,7 +122,7 @@ DistributedLockMemoryBackend::RenewLock(const std::string &lock_key, const std::
     return EC_OK;
 }
 
-ErrorCode DistributedLockMemoryBackend::Unlock(const std::string &lock_key, const std::string &lock_value) {
+ErrorCode CoordinationMemoryBackend::Unlock(const std::string &lock_key, const std::string &lock_value) {
     if (!initialized_) {
         KVCM_LOG_ERROR("Memory lock backend not initialized");
         return EC_ERROR;
@@ -160,7 +160,7 @@ ErrorCode DistributedLockMemoryBackend::Unlock(const std::string &lock_key, cons
     return EC_OK;
 }
 
-ErrorCode DistributedLockMemoryBackend::GetLockHolder(const std::string &lock_key,
+ErrorCode CoordinationMemoryBackend::GetLockHolder(const std::string &lock_key,
                                                       std::string &out_current_value,
                                                       int64_t &out_expire_time_ms) {
     if (!initialized_) {
@@ -197,6 +197,38 @@ ErrorCode DistributedLockMemoryBackend::GetLockHolder(const std::string &lock_ke
     // 返回锁信息
     out_current_value = it->second.value;
     out_expire_time_ms = it->second.GetExpireTimeMs();
+    return EC_OK;
+}
+
+ErrorCode CoordinationMemoryBackend::SetValue(const std::string &key, const std::string &value) {
+    if (!initialized_) {
+        KVCM_LOG_ERROR("Memory coordination backend not initialized");
+        return EC_ERROR;
+    }
+    if (key.empty()) {
+        KVCM_LOG_ERROR("Invalid arguments for SetValue: key is empty");
+        return EC_BADARGS;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    kv_store_[key] = value;
+    return EC_OK;
+}
+
+ErrorCode CoordinationMemoryBackend::GetValue(const std::string &key, std::string &out_value) {
+    if (!initialized_) {
+        KVCM_LOG_ERROR("Memory coordination backend not initialized");
+        return EC_ERROR;
+    }
+    if (key.empty()) {
+        KVCM_LOG_ERROR("Invalid arguments for GetValue: key is empty");
+        return EC_BADARGS;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = kv_store_.find(key);
+    if (it == kv_store_.end()) {
+        return EC_NOENT;
+    }
+    out_value = it->second;
     return EC_OK;
 }
 

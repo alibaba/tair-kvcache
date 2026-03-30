@@ -12,7 +12,7 @@
 namespace kv_cache_manager {
 
 class LoopThread;
-class DistributedLockBackend;
+class CoordinationBackend;
 
 // 角色状态枚举
 enum class RoleState {
@@ -33,7 +33,7 @@ class LeaderElector {
 public:
     using HandlerFuncType = std::function<void()>;
 
-    LeaderElector(const std::shared_ptr<DistributedLockBackend> &lock_backend,
+    LeaderElector(const std::shared_ptr<CoordinationBackend> &coordination_backend,
                   const std::string &lock_key,
                   const std::string &lock_value,
                   int64_t lease_ms = 60,
@@ -98,7 +98,7 @@ private:
 
 private:
     // === 分布式锁相关 ===
-    std::shared_ptr<DistributedLockBackend> lock_backend_;
+    std::shared_ptr<CoordinationBackend> coordination_backend_;
     std::string lock_key_;
     std::string lock_value_;
     int64_t lease_timeout_us_;

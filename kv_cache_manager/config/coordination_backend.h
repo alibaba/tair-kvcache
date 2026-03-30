@@ -8,15 +8,16 @@ namespace kv_cache_manager {
 class StandardUri;
 
 /**
- * @brief Distributed lock backend interface
+ * @brief Coordination backend interface
  *
- * Provides basic operations for distributed locks, supporting multiple backend implementations
- * (e.g., local filesystem, Redis, etc.). All interfaces are thread-safe, and implementations
+ * Provides distributed coordination capabilities including distributed locks and
+ * key-value storage, supporting multiple backend implementations (e.g., local
+ * filesystem, Redis, etc.). All interfaces are thread-safe, and implementations
  * should ensure atomicity of operations.
  */
-class DistributedLockBackend {
+class CoordinationBackend {
 public:
-    virtual ~DistributedLockBackend() = default;
+    virtual ~CoordinationBackend() = default;
 
     /**
      * @brief Initialize the distributed lock backend
@@ -91,12 +92,13 @@ public:
      * @brief Get current lock holder information
      *
      * Queries the current status of the specified lock, including holder identifier
-     * and remaining expiration time. If the lock does not exist or has expired,
+     * and expiration time. If the lock does not exist or has expired,
      * returns EC_NOENT.
      *
      * @param lock_key The lock key
      * @param out_current_value [out] Current lock value (holder identifier)
-     * @param out_expire_time_ms [out] Lock expiration time (milliseconds timestamp)
+     * @param out_expire_time_ms [out] Lock expiration time as a Unix timestamp in
+     *        milliseconds (milliseconds since 1970-01-01 00:00:00 UTC).
      * @return ErrorCode error code
      *         - EC_OK: Query successful, lock exists and is not expired
      *         - EC_NOENT: Lock does not exist or has expired
@@ -105,6 +107,38 @@ public:
      */
     virtual ErrorCode
     GetLockHolder(const std::string &lock_key, std::string &out_current_value, int64_t &out_expire_time_ms) = 0;
+
+    // ---- Key-Value Storage ----
+
+    /**
+     * @brief Set a key-value pair
+     *
+     * Stores a string value associated with the given key. If the key already
+     * exists, its value is overwritten. No TTL is applied.
+     *
+     * @param key The key
+     * @param value The value to store
+     * @return ErrorCode error code
+     *         - EC_OK: Set successful
+     *         - EC_BADARGS: Invalid arguments (e.g., key is empty)
+     *         - EC_ERROR: Other errors
+     */
+    virtual ErrorCode SetValue(const std::string &key, const std::string &value) = 0;
+
+    /**
+     * @brief Get the value associated with a key
+     *
+     * Retrieves the string value stored for the given key.
+     *
+     * @param key The key to look up
+     * @param out_value [out] The retrieved value
+     * @return ErrorCode error code
+     *         - EC_OK: Get successful
+     *         - EC_NOENT: Key does not exist
+     *         - EC_BADARGS: Invalid arguments (e.g., key is empty)
+     *         - EC_ERROR: Other errors
+     */
+    virtual ErrorCode GetValue(const std::string &key, std::string &out_value) = 0;
 };
 
 } // namespace kv_cache_manager

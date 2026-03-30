@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <thread>
 
 #include "3rdparty/mooncake/client_c.h"
 #include "kv_cache_manager/data_storage/data_storage_backend.h"
@@ -35,8 +36,12 @@ public:
     std::vector<ErrorCode> UnLock(const std::vector<DataStorageUri> &storage_uris) override;
 
 private:
+    void DetectAvailableLoop(const std::string &trace_id);
+
+private:
     client_t client_{nullptr};
     MooncakeStorageSpec spec_;
+    std::thread available_thread_;
 };
 
 } // namespace kv_cache_manager

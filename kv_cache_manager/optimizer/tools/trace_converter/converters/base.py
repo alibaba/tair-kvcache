@@ -10,7 +10,8 @@ class BaseConverter(ABC):
     def __init__(self, default_instance_id: str = 'instance',
                  instance_block_sizes: Dict[str, int] = None,
                  mode: str = 'optimizer',
-                 keep_tokens: bool = False):
+                 keep_tokens: bool = False,
+                 **kwargs):
         """
         Args:
             default_instance_id: 默认实例ID (当输入格式没有instance信息时使用)

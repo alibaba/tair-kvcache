@@ -132,7 +132,7 @@ class HiCacheKVCM(HiCacheStorage):
         self.write_iov_block_size = self.extra_config.get("write_iov_block_size", 0)
         self.iov_size = self.location_spec_size * 1024
 
-        sdk_backend_configs = []
+        sdk_backend_configs = list(self.extra_config.get("sdk_backend_configs", []))
 
         hf3fs_configs = self.parse_hf3fs_configs(self.storage_configs)
         sdk_backend_configs.extend(hf3fs_configs)

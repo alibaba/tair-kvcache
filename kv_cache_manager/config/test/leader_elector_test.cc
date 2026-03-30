@@ -9,7 +9,7 @@
 #include "kv_cache_manager/common/loop_thread.h"
 #include "kv_cache_manager/common/standard_uri.h"
 #include "kv_cache_manager/common/unittest.h"
-#include "kv_cache_manager/config/distributed_lock_file_backend.h"
+#include "kv_cache_manager/config/coordination_file_backend.h"
 #include "kv_cache_manager/config/leader_elector.h"
 
 using namespace kv_cache_manager;
@@ -23,10 +23,10 @@ protected:
         std::filesystem::remove_all(test_dir_, std_ec);
         std::filesystem::create_directories(test_dir_);
 
-        // 初始化分布式锁后端
-        lock_backend_ = std::make_shared<DistributedLockFileBackend>();
+        // 初始化协调后端
+        coordination_backend_ = std::make_shared<CoordinationFileBackend>();
         StandardUri uri("file://" + test_dir_);
-        ErrorCode ec = lock_backend_->Init(uri);
+        ErrorCode ec = coordination_backend_->Init(uri);
         ASSERT_EQ(ec, EC_OK);
 
         // 准备选举器参数
@@ -45,12 +45,12 @@ protected:
     // 创建新的选举器实例
     std::shared_ptr<LeaderElector> CreateElector(const std::string &custom_value = "") {
         std::string value = custom_value.empty() ? lock_value_ : custom_value;
-        return std::make_shared<LeaderElector>(lock_backend_, lock_key_, value, lease_ms_, loop_interval_ms_);
+        return std::make_shared<LeaderElector>(coordination_backend_, lock_key_, value, lease_ms_, loop_interval_ms_);
     }
 
 protected:
     std::string test_dir_;
-    std::shared_ptr<DistributedLockBackend> lock_backend_;
+    std::shared_ptr<CoordinationBackend> coordination_backend_;
     std::string lock_key_;
     std::string lock_value_;
     int64_t lease_ms_;
@@ -263,9 +263,9 @@ TEST_F(LeaderElectorTest, LeaderLosesLock) {
     EXPECT_GT(lease_expiration, 0);
 
     // 模拟锁被外部抢占
-    ErrorCode unlock_ec = lock_backend_->Unlock(lock_key_, lock_value_);
+    ErrorCode unlock_ec = coordination_backend_->Unlock(lock_key_, lock_value_);
     EXPECT_EQ(unlock_ec, EC_OK) << "Unlock should succeed";
-    ErrorCode lock_ec = lock_backend_->TryLock(lock_key_, lock_value_ + "_other", 1000000);
+    ErrorCode lock_ec = coordination_backend_->TryLock(lock_key_, lock_value_ + "_other", 1000000);
     EXPECT_EQ(lock_ec, EC_OK) << "Lock by other should succeed";
 
     elector->DoWorkLoop(TimestampUtil::GetCurrentTimeUs());
@@ -349,7 +349,7 @@ TEST_F(LeaderElectorTest, WorkLoopMethod) {
 // 测试租约过期检测
 TEST_F(LeaderElectorTest, LeaseExpiration) {
     // 指定租约时间
-    auto elector = std::make_shared<LeaderElector>(lock_backend_, lock_key_, lock_value_, 50, 10);
+    auto elector = std::make_shared<LeaderElector>(coordination_backend_, lock_key_, lock_value_, 50, 10);
 
     std::atomic<bool> become_leader_called{false};
     std::atomic<bool> no_longer_leader_called{false};
@@ -413,8 +413,8 @@ TEST_F(LeaderElectorTest, MethodsWhenStopped) {
 
 // 测试多个选举器使用不同的锁键
 TEST_F(LeaderElectorTest, MultipleElectorsDifferentKeys) {
-    auto elector1 = std::make_shared<LeaderElector>(lock_backend_, "key1", "instance1", lease_ms_, loop_interval_ms_);
-    auto elector2 = std::make_shared<LeaderElector>(lock_backend_, "key2", "instance2", lease_ms_, loop_interval_ms_);
+    auto elector1 = std::make_shared<LeaderElector>(coordination_backend_, "key1", "instance1", lease_ms_, loop_interval_ms_);
+    auto elector2 = std::make_shared<LeaderElector>(coordination_backend_, "key2", "instance2", lease_ms_, loop_interval_ms_);
 
     std::atomic<bool> elector1_leader{false};
     std::atomic<bool> elector2_leader{false};
@@ -449,7 +449,7 @@ TEST_F(LeaderElectorTest, MultipleElectorsDifferentKeys) {
 // 测试边界条件：极短的租约时间
 TEST_F(LeaderElectorTest, VeryShortLease) {
     // 租约时间小于循环间隔的10倍，应该产生警告但正常工作
-    auto elector = std::make_shared<LeaderElector>(lock_backend_, lock_key_, lock_value_, 5, 2); // 5ms租约，2ms循环
+    auto elector = std::make_shared<LeaderElector>(coordination_backend_, lock_key_, lock_value_, 5, 2); // 5ms租约，2ms循环
 
     elector->SetBecomeLeaderHandler([]() {});
     elector->SetNoLongerLeaderHandler([]() {});

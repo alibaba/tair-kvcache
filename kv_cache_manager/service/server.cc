@@ -4,8 +4,8 @@
 #include <grpcpp/grpcpp.h>
 
 #include "kv_cache_manager/common/loop_thread.h"
-#include "kv_cache_manager/config/distributed_lock_backend.h"
-#include "kv_cache_manager/config/distributed_lock_backend_factory.h"
+#include "kv_cache_manager/config/coordination_backend.h"
+#include "kv_cache_manager/config/coordination_backend_factory.h"
 #include "kv_cache_manager/config/leader_elector.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/event/event_manager.h"
@@ -303,7 +303,7 @@ void Server::CreateAndRegisterEventPublisher() {
     KVCM_LOG_INFO("create and register event publisher OK");
 }
 bool Server::CreateLeaderElector() {
-    auto distributed_lock_uri = config_.GetDistributedLockUri();
+    auto coordination_uri = config_.GetCoordinationUri();
     std::string node_id = config_.GetLeaderElectorNodeId();
     if (node_id.empty()) {
         // TODO: replace local_ip_placeholder with real local ip
@@ -311,14 +311,14 @@ bool Server::CreateLeaderElector() {
         node_id = local_ip + ":" + std::to_string(config_.GetServiceAdminHttpPort()) + "_" +
                   StringUtil::GenerateRandomString(16);
     }
-    distributed_lock_backend_ =
-        DistributedLockBackendFactory::CreateAndInitDistributedLockBackend(distributed_lock_uri);
-    if (!distributed_lock_backend_) {
-        KVCM_LOG_ERROR("distributed_lock_backend[%s] init failed", distributed_lock_uri.c_str());
+    coordination_backend_ =
+        CoordinationBackendFactory::CreateAndInitCoordinationBackend(coordination_uri);
+    if (!coordination_backend_) {
+        KVCM_LOG_ERROR("coordination_backend[%s] init failed", coordination_uri.c_str());
         return false;
     }
 
-    leader_elector_ = std::make_shared<LeaderElector>(distributed_lock_backend_,
+    leader_elector_ = std::make_shared<LeaderElector>(coordination_backend_,
                                                       kLeaderLockKey,
                                                       node_id,
                                                       config_.GetLeaderElectorLeaseMs(),

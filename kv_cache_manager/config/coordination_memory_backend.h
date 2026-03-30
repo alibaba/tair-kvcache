@@ -8,7 +8,7 @@
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/standard_uri.h"
-#include "kv_cache_manager/config/distributed_lock_backend.h"
+#include "kv_cache_manager/config/coordination_backend.h"
 
 namespace kv_cache_manager {
 
@@ -21,18 +21,18 @@ namespace kv_cache_manager {
  *
  * URI format: memory:// (any path or parameters are ignored)
  */
-class DistributedLockMemoryBackend : public DistributedLockBackend {
+class CoordinationMemoryBackend : public CoordinationBackend {
 public:
-    DistributedLockMemoryBackend();
-    ~DistributedLockMemoryBackend() override;
+    CoordinationMemoryBackend();
+    ~CoordinationMemoryBackend() override;
 
     // 禁止拷贝和赋值
-    DistributedLockMemoryBackend(const DistributedLockMemoryBackend &) = delete;
-    DistributedLockMemoryBackend &operator=(const DistributedLockMemoryBackend &) = delete;
+    CoordinationMemoryBackend(const CoordinationMemoryBackend &) = delete;
+    CoordinationMemoryBackend &operator=(const CoordinationMemoryBackend &) = delete;
 
     // 允许移动
-    DistributedLockMemoryBackend(DistributedLockMemoryBackend &&) = default;
-    DistributedLockMemoryBackend &operator=(DistributedLockMemoryBackend &&) = default;
+    CoordinationMemoryBackend(CoordinationMemoryBackend &&) = default;
+    CoordinationMemoryBackend &operator=(CoordinationMemoryBackend &&) = default;
 
 public:
     ErrorCode Init(const StandardUri &standard_uri) noexcept override;
@@ -41,26 +41,28 @@ public:
     ErrorCode Unlock(const std::string &lock_key, const std::string &lock_value) override;
     ErrorCode
     GetLockHolder(const std::string &lock_key, std::string &out_current_value, int64_t &out_expire_time_ms) override;
+    ErrorCode SetValue(const std::string &key, const std::string &value) override;
+    ErrorCode GetValue(const std::string &key, std::string &out_value) override;
 
 private:
     // 锁信息结构
     struct LockInfo {
         std::string value;                                 // 锁持有者标识
-        std::chrono::steady_clock::time_point expire_time; // 过期时间点
+        std::chrono::system_clock::time_point expire_time; // 过期时间点
 
         // 检查锁是否过期
-        bool IsExpired() const { return std::chrono::steady_clock::now() >= expire_time; }
+        bool IsExpired() const { return std::chrono::system_clock::now() >= expire_time; }
 
         // 获取剩余过期时间（毫秒）
         int64_t GetRemainingTTLMs() const {
-            auto now = std::chrono::steady_clock::now();
+            auto now = std::chrono::system_clock::now();
             if (now >= expire_time) {
                 return 0;
             }
             return std::chrono::duration_cast<std::chrono::milliseconds>(expire_time - now).count();
         }
 
-        // 获取过期时间戳（毫秒）
+        // 获取过期时间戳（毫秒，Unix 时间戳）
         int64_t GetExpireTimeMs() const {
             return std::chrono::duration_cast<std::chrono::milliseconds>(expire_time.time_since_epoch()).count();
         }
@@ -71,16 +73,17 @@ private:
     void CleanupExpiredLocks();
 
     // 获取当前时间点
-    static std::chrono::steady_clock::time_point Now() { return std::chrono::steady_clock::now(); }
+    static std::chrono::system_clock::time_point Now() { return std::chrono::system_clock::now(); }
 
     // 从毫秒时间戳转换为时间点
-    static std::chrono::steady_clock::time_point FromMsTimestamp(int64_t ms_timestamp) {
-        return std::chrono::steady_clock::time_point(std::chrono::milliseconds(ms_timestamp));
+    static std::chrono::system_clock::time_point FromMsTimestamp(int64_t ms_timestamp) {
+        return std::chrono::system_clock::time_point(std::chrono::milliseconds(ms_timestamp));
     }
 
 private:
     std::mutex mutex_;
     std::unordered_map<std::string, LockInfo> locks_;
+    std::unordered_map<std::string, std::string> kv_store_;
     bool initialized_{false};
 };
 

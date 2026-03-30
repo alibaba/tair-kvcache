@@ -10,14 +10,14 @@
 
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/logger.h"
-#include "kv_cache_manager/config/distributed_lock_backend.h"
+#include "kv_cache_manager/config/coordination_backend.h"
 
 namespace kv_cache_manager {
 
-class DistributedLockFileBackend : public DistributedLockBackend {
+class CoordinationFileBackend : public CoordinationBackend {
 public:
-    DistributedLockFileBackend() = default;
-    ~DistributedLockFileBackend() override;
+    CoordinationFileBackend() = default;
+    ~CoordinationFileBackend() override;
 
 public:
     ErrorCode Init(const StandardUri &standard_uri) noexcept override;
@@ -26,6 +26,8 @@ public:
     ErrorCode Unlock(const std::string &lock_key, const std::string &lock_value) override;
     ErrorCode
     GetLockHolder(const std::string &lock_key, std::string &out_current_value, int64_t &out_expire_time_ms) override;
+    ErrorCode SetValue(const std::string &key, const std::string &value) override;
+    ErrorCode GetValue(const std::string &key, std::string &out_value) override;
 
 private:
     // RAII 类，用于管理文件锁和文件描述符
@@ -176,14 +178,17 @@ private:
     };
 
 private:
+    // 将 key 中的路径分隔符替换为下划线，生成安全的文件名
+    static std::string SanitizeKey(const std::string &key);
+
     // 获取锁文件的完整路径
     std::string GetLockFilePath(const std::string &lock_key) const;
 
-    // 读取锁文件内容
-    ErrorCode ReadLockFileContent(int fd, std::string &content);
+    // 读取文件内容
+    ErrorCode ReadFileContent(int fd, std::string &content);
 
-    // 写入锁文件内容
-    ErrorCode WriteLockFileContent(int fd, const std::string &content);
+    // 写入文件内容
+    ErrorCode WriteFileContent(int fd, const std::string &content);
 
     // 检查锁是否过期
     bool IsLockExpired(const std::string &lock_content, int64_t &expire_time_ms);
@@ -194,6 +199,12 @@ private:
     // 解析锁内容，返回是否成功解析出value和expire_time_ms
     bool
     ParseLockContent(const std::string &lock_content, std::string &out_lock_value, int64_t &out_expire_time_ms) const;
+
+    // 原子写入文件（write-to-temp + rename）
+    ErrorCode WriteFileAtomic(const std::string &file_path, const std::string &content);
+
+    // 获取KV存储文件的完整路径
+    std::string GetKVFilePath(const std::string &key) const;
 
 private:
     std::string lock_dir_path_;

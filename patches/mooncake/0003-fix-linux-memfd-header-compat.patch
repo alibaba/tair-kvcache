@@ -1,0 +1,28 @@
+--- a/mooncake-store/include/utils.h
++++ b/mooncake-store/include/utils.h
+@@ -5 +5,24 @@
+-#include <linux/memfd.h>
++#if defined(__has_include)
++#if __has_include(<linux/memfd.h>)
++#include <linux/memfd.h>
++#endif
++#endif
++#include <sys/mman.h>
++#ifndef MFD_CLOEXEC
++#define MFD_CLOEXEC 0x0001U
++#endif
++#ifndef MFD_ALLOW_SEALING
++#define MFD_ALLOW_SEALING 0x0002U
++#endif
++#ifndef MFD_HUGETLB
++#define MFD_HUGETLB 0x0004U
++#endif
++#ifndef MFD_HUGE_SHIFT
++#define MFD_HUGE_SHIFT 26
++#endif
++#ifndef MFD_HUGE_2MB
++#define MFD_HUGE_2MB (21U << MFD_HUGE_SHIFT)
++#endif
++#ifndef MFD_HUGE_1GB
++#define MFD_HUGE_1GB (30U << MFD_HUGE_SHIFT)
++#endif
