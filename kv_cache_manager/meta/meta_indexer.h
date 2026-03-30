@@ -119,7 +119,7 @@ private:
         std::uint64_t AddStorageUsageByType(const DataStorageType &type, std::uint64_t value) noexcept;
         std::uint64_t SubStorageUsageByType(const DataStorageType &type, std::uint64_t value) noexcept;
 
-        std::string Serialize() const noexcept;
+        [[nodiscard]] std::string Serialize() const noexcept;
         ErrorCode Deserialize(const std::string &str) noexcept;
 
     private:

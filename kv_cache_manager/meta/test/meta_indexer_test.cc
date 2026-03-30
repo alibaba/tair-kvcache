@@ -397,3 +397,141 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataManipulation) {
         }
     }
 }
+
+TEST_F(MetaIndexerTest, TestStorageUsageDataDeserializeEdgeCases) {
+    std::string configStr = R"({
+        "max_key_count" : 100,
+        "mutex_shard_num" : 8,
+        "persist_metadata_interval_time_ms" : 0,
+        "meta_storage_backend_config" : { "storage_type" : "local" },
+        "meta_cache_policy_config" : { "capacity" : 0 }
+    })";
+
+    ASSERT_EQ(EC_OK, InitIndexer(configStr));
+
+    // Successful round-trip: serialize then deserialize
+    {
+        std::vector<std::uint64_t> expected_usage_vec{1, 100, 200, 300, 400, 500};
+
+        meta_indexer_->storage_usage_data_.Reset();
+        for (std::size_t i = 0; i != expected_usage_vec.size(); ++i) {
+            meta_indexer_->storage_usage_data_.storage_usage_by_type_.at(i).store(expected_usage_vec.at(i));
+        }
+
+        std::string serialized = meta_indexer_->storage_usage_data_.Serialize();
+        ASSERT_EQ("1,100,200,300,400,500", serialized);
+
+        meta_indexer_->storage_usage_data_.Reset();
+        ASSERT_EQ(EC_OK, meta_indexer_->storage_usage_data_.Deserialize(serialized));
+        for (std::size_t i = 0; i != meta_indexer_->storage_usage_data_.storage_usage_by_type_.size(); ++i) {
+            ASSERT_EQ(expected_usage_vec.at(i), meta_indexer_->storage_usage_data_.storage_usage_by_type_.at(i).load());
+        }
+    }
+
+    // Legal input
+    {
+        const std::vector<std::uint64_t> expected_usage_vec{1, 2, 3, 4, 5, 6};
+
+        meta_indexer_->storage_usage_data_.Reset();
+        for (std::size_t i = 0; i != expected_usage_vec.size(); ++i) {
+            meta_indexer_->storage_usage_data_.storage_usage_by_type_.at(i).store(expected_usage_vec.at(i));
+        }
+        ASSERT_EQ(EC_OK, meta_indexer_->storage_usage_data_.Deserialize("1,2,3,4,5,6,"));
+        for (std::size_t i = 0; i != meta_indexer_->storage_usage_data_.storage_usage_by_type_.size(); ++i) {
+            ASSERT_EQ(expected_usage_vec.at(i), meta_indexer_->storage_usage_data_.storage_usage_by_type_.at(i).load());
+        }
+    }
+
+    // Legal input
+    {
+        const std::vector<std::uint64_t> expected_usage_vec{1, 2, 3, 4, 5, 6};
+        meta_indexer_->storage_usage_data_.Reset();
+        for (std::size_t i = 0; i != expected_usage_vec.size(); ++i) {
+            meta_indexer_->storage_usage_data_.storage_usage_by_type_.at(i).store(expected_usage_vec.at(i));
+        }
+        ASSERT_EQ(EC_OK, meta_indexer_->storage_usage_data_.Deserialize(" 1, 2, 3,   4, 5,6   "));
+        for (std::size_t i = 0; i != meta_indexer_->storage_usage_data_.storage_usage_by_type_.size(); ++i) {
+            ASSERT_EQ(expected_usage_vec.at(i), meta_indexer_->storage_usage_data_.storage_usage_by_type_.at(i).load());
+        }
+    }
+
+    // Legal input
+    {
+        const std::vector<std::uint64_t> expected_usage_vec{1, 2, 3, 4, 5, 6};
+        meta_indexer_->storage_usage_data_.Reset();
+        for (std::size_t i = 0; i != expected_usage_vec.size(); ++i) {
+            meta_indexer_->storage_usage_data_.storage_usage_by_type_.at(i).store(expected_usage_vec.at(i));
+        }
+        ASSERT_EQ(EC_OK, meta_indexer_->storage_usage_data_.Deserialize(" 1, 2, 3,   4, 5,6,  "));
+        for (std::size_t i = 0; i != meta_indexer_->storage_usage_data_.storage_usage_by_type_.size(); ++i) {
+            ASSERT_EQ(expected_usage_vec.at(i), meta_indexer_->storage_usage_data_.storage_usage_by_type_.at(i).load());
+        }
+    }
+
+
+    // Truncated input: fewer values than expected
+    {
+        meta_indexer_->storage_usage_data_.Reset();
+        meta_indexer_->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 999);
+        ASSERT_EQ(EC_ERROR, meta_indexer_->storage_usage_data_.Deserialize("100,200"));
+        // Original data must not be modified on error
+        ASSERT_EQ(999,
+                  meta_indexer_->storage_usage_data_.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+    }
+
+    // Extra values: more values than expected
+    {
+        meta_indexer_->storage_usage_data_.Reset();
+        meta_indexer_->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 888);
+        ASSERT_EQ(EC_ERROR, meta_indexer_->storage_usage_data_.Deserialize("0,1,2,3,4,5,6"));
+        // Original data must not be modified on error
+        ASSERT_EQ(888,
+                  meta_indexer_->storage_usage_data_.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+    }
+
+    // Empty string
+    {
+        meta_indexer_->storage_usage_data_.Reset();
+        meta_indexer_->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 888);
+        ASSERT_EQ(EC_ERROR, meta_indexer_->storage_usage_data_.Deserialize(""));
+        // Original data must not be modified on error
+        ASSERT_EQ(888,
+                  meta_indexer_->storage_usage_data_.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+    }
+
+    // Malformed data: non-numeric value
+    {
+        meta_indexer_->storage_usage_data_.Reset();
+        meta_indexer_->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 777);
+        ASSERT_EQ(EC_ERROR, meta_indexer_->storage_usage_data_.Deserialize("0,abc,2,3,4,5"));
+        // Original data must not be modified on error
+        ASSERT_EQ(777,
+                  meta_indexer_->storage_usage_data_.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+    }
+
+    // Malformed data: wrong format
+    {
+        meta_indexer_->storage_usage_data_.Reset();
+        meta_indexer_->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 777);
+
+        ASSERT_EQ(EC_ERROR, meta_indexer_->storage_usage_data_.Deserialize("0,,,2,3,4,5"));
+        // Original data must not be modified on error
+        ASSERT_EQ(777,
+                  meta_indexer_->storage_usage_data_.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+
+        ASSERT_EQ(EC_ERROR, meta_indexer_->storage_usage_data_.Deserialize("0,.,2,3,4,5"));
+        // Original data must not be modified on error
+        ASSERT_EQ(777,
+                  meta_indexer_->storage_usage_data_.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+    }
+
+    // Single value (too few)
+    {
+        meta_indexer_->storage_usage_data_.Reset();
+        meta_indexer_->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 888);
+        ASSERT_EQ(EC_ERROR, meta_indexer_->storage_usage_data_.Deserialize("42"));
+        // Original data must not be modified on error
+        ASSERT_EQ(888,
+                  meta_indexer_->storage_usage_data_.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+    }
+}

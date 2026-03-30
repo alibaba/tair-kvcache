@@ -152,17 +152,37 @@ std::string MetaIndexer::StorageUsageData::Serialize() const noexcept {
 
 ErrorCode MetaIndexer::StorageUsageData::Deserialize(const std::string &str) noexcept {
     KVCM_LOG_DEBUG("deserializing storage usage data: [%s]", str.c_str());
-    std::stringstream ss(str);
+    std::string str_copy{str};
+    StringUtil::Trim(str_copy);
+    if (str_copy.empty()) {
+        KVCM_LOG_ERROR("deserialize storage usage data failed: input string is empty");
+        return ErrorCode::EC_ERROR;
+    }
+    std::stringstream ss(str_copy);
     std::string v;
+    // parse into a temporary buffer first to avoid partial updates
+    std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> tmp{};
     size_t_ idx = 0;
-    while (std::getline(ss, v, ',') && idx != storage_usage_by_type_.size()) {
+    while (std::getline(ss, v, ',')) {
+        if (idx >= tmp.size()) {
+            KVCM_LOG_ERROR("deserialize storage usage data failed: too many values, expected [%zu]", tmp.size());
+            return ErrorCode::EC_ERROR;
+        }
         try {
-            storage_usage_by_type_.at(idx).store(std::stoull(v));
+            tmp.at(idx) = std::stoull(v);
         } catch (...) {
             KVCM_LOG_ERROR("interpret [%s] to unsigned integer failed", v.c_str());
             return ErrorCode::EC_ERROR;
         }
         ++idx;
+    }
+    if (idx != tmp.size()) {
+        KVCM_LOG_ERROR("deserialize storage usage data failed: expected [%zu] values but got [%zu]", tmp.size(), idx);
+        return ErrorCode::EC_ERROR;
+    }
+    // all values parsed successfully, apply to the actual array
+    for (size_t_ i = 0; i != storage_usage_by_type_.size(); ++i) {
+        storage_usage_by_type_.at(i).store(tmp.at(i));
     }
     return ErrorCode::EC_OK;
 }
