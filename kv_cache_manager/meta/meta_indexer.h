@@ -107,7 +107,7 @@ private:
     // instance storage usage data
     class StorageUsageData {
     public:
-        StorageUsageData();
+        StorageUsageData() = default;
         ~StorageUsageData() = default;
 
         [[nodiscard]] std::uint64_t GetStorageUsage() const noexcept;

@@ -53,13 +53,13 @@ private:
     array_t_ storage_quota_avail_by_type_;
 };
 
-DataStorageSelector::StorageQuotaAvail::StorageQuotaAvail()
-    : storage_quota_avail_by_type_{false, /* DATA_STORAGE_TYPE_UNKNOWN **UNUSED** */
-                                   true,  /* DATA_STORAGE_TYPE_HF3FS */
-                                   true,  /* DATA_STORAGE_TYPE_MOONCAKE */
-                                   true,  /* DATA_STORAGE_TYPE_TAIR_MEMPOOL */
-                                   true,  /* DATA_STORAGE_TYPE_NFS */
-                                   false /** DATA_STORAGE_TYPE_VCNS_HF3FS **UNUSED** (merged into HF3FS) */} {}
+DataStorageSelector::StorageQuotaAvail::StorageQuotaAvail() : storage_quota_avail_by_type_{} {
+    storage_quota_avail_by_type_.fill(false);
+    storage_quota_avail_by_type_.at(1) = true; /* DATA_STORAGE_TYPE_HF3FS */
+    storage_quota_avail_by_type_.at(2) = true; /* DATA_STORAGE_TYPE_MOONCAKE */
+    storage_quota_avail_by_type_.at(3) = true; /* DATA_STORAGE_TYPE_TAIR_MEMPOOL */
+    storage_quota_avail_by_type_.at(4) = true; /* DATA_STORAGE_TYPE_NFS */
+}
 
 bool DataStorageSelector::StorageQuotaAvail::GetStorageQuotaAvailByType(const DataStorageType &type) const noexcept {
     const size_t_ idx = ToIndex(ToBaseType(type));

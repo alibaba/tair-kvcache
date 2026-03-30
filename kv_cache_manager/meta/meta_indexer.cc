@@ -56,14 +56,6 @@ private:
     std::vector<int32_t> shard_indexs_;
 };
 
-MetaIndexer::StorageUsageData::StorageUsageData()
-    : storage_usage_by_type_{0, /* DATA_STORAGE_TYPE_UNKNOWN **UNUSED** */
-                             0, /* DATA_STORAGE_TYPE_HF3FS */
-                             0, /* DATA_STORAGE_TYPE_MOONCAKE */
-                             0, /* DATA_STORAGE_TYPE_TAIR_MEMPOOL */
-                             0, /* DATA_STORAGE_TYPE_NFS */
-                             0 /** DATA_STORAGE_TYPE_VCNS_HF3FS **UNUSED** (merged into HF3FS) */} {}
-
 std::uint64_t MetaIndexer::StorageUsageData::GetStorageUsage() const noexcept {
     std::uint64_t storage_usage = 0;
     for (size_t_ i = 0; i != storage_usage_by_type_.size(); ++i) {

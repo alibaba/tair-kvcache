@@ -146,15 +146,9 @@ private:
 };
 
 CacheReclaimer::GroupUsageData::GroupUsageData()
-    : grp_used_key_cnt_(0)
-    , grp_max_key_cnt_(0)
-    , grp_used_byte_sz_(0)
-    , grp_storage_usage_by_type_{0, /* DATA_STORAGE_TYPE_UNKNOWN **UNUSED** */
-                                 0, /* DATA_STORAGE_TYPE_HF3FS */
-                                 0, /* DATA_STORAGE_TYPE_MOONCAKE */
-                                 0, /* DATA_STORAGE_TYPE_TAIR_MEMPOOL */
-                                 0, /* DATA_STORAGE_TYPE_NFS */
-                                 0 /** DATA_STORAGE_TYPE_VCNS_HF3FS **UNUSED** (merged into HF3FS) */} {}
+    : grp_used_key_cnt_(0), grp_max_key_cnt_(0), grp_used_byte_sz_(0), grp_storage_usage_by_type_{} {
+    grp_storage_usage_by_type_.fill(0);
+}
 
 std::size_t CacheReclaimer::GroupUsageData::GetGroupUsageByType(const DataStorageType &type) const noexcept {
     const size_t_ idx = ToIndex(ToBaseType(type));
@@ -180,13 +174,9 @@ void CacheReclaimer::GroupUsageData::AddGroupUsageByType(const DataStorageType &
 }
 
 CacheReclaimer::WaterLevelExceed::WaterLevelExceed()
-    : general_water_level_exceed_(false)
-    , water_level_exceed_by_type_{false, /* DATA_STORAGE_TYPE_UNKNOWN **UNUSED** */
-                                  false, /* DATA_STORAGE_TYPE_HF3FS */
-                                  false, /* DATA_STORAGE_TYPE_MOONCAKE */
-                                  false, /* DATA_STORAGE_TYPE_TAIR_MEMPOOL */
-                                  false, /* DATA_STORAGE_TYPE_NFS */
-                                  false /** DATA_STORAGE_TYPE_VCNS_HF3FS **UNUSED** (merged into HF3FS) */} {}
+    : general_water_level_exceed_(false), water_level_exceed_by_type_{} {
+    water_level_exceed_by_type_.fill(false);
+}
 
 bool CacheReclaimer::WaterLevelExceed::GetGeneralWaterLevelExceed() const noexcept {
     return general_water_level_exceed_;
