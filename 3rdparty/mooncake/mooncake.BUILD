@@ -95,6 +95,8 @@ mooncake_copts = [
     "-fcoroutines",
     "-fPIC",
     "-DCONFIG_ERDMA",
+    "-DSTORE_USE_REDIS",
+    "-DUSE_REDIS"
 ] + select({
     ":enable_asan": ["-fsanitize=address", "-fsanitize=leak"],
     "//conditions:default": [],
@@ -197,6 +199,7 @@ cc_library(
         "@yalantinglibs//:ylt",
         "@glog//:glog",
         "@//3rdparty/libnuma",
+        "@hiredis//:hiredis",
     ] + select({
         ":enable_cuda": ["@local_config_cuda//cuda:cuda"],
         "//conditions:default": [],
@@ -263,15 +266,13 @@ cc_library(
         "@msgpack_cxx//:msgpack",
         "@xxhash//:xxhash",
         "@zstd_lib//:zstd",
-        "@com_github_gflags_gflags//:gflags",
-        "@hiredis//:hiredis",
+        "@com_github_gflags_gflags//:gflags"
     ],
     copts = mooncake_copts + [
         # Upstream real_client.cpp uses DEFINE_* without including gflags.h.
         "-include",
         "gflags/gflags.h",
-        "-Wno-error=invalid-memory-model",
-        "-DSTORE_USE_REDIS",
+        "-Wno-error=invalid-memory-model"
     ],
     visibility = ["//visibility:public"],
 )

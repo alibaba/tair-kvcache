@@ -131,7 +131,7 @@ def git_deps():
     new_git_repository(
         name = "mooncake",
         remote = "https://github.com/openanolis/Mooncake.git",  
-        commit = "211b75742b6d1fee739ad9a486f2ae9ce2695847",  
+        commit = "d860d4944c050b1a3a685b1bf41b7a68aa78bdd3",  
         build_file = clean_dep("//3rdparty/mooncake:mooncake.BUILD"),
         patches = [
             clean_dep("//patches/mooncake:0001-fix-spinlock-gcc10-compat.patch"),
