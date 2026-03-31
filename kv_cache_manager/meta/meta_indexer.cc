@@ -123,9 +123,22 @@ std::uint64_t MetaIndexer::StorageUsageData::SubStorageUsageByType(const DataSto
 
     auto &ref = storage_usage_by_type_.at(idx);
     std::uint64_t expected = ref.load(), desired = 0;
+    bool underflow = false;
     do {
-        desired = expected < value ? 0 : expected - value;
+        if (expected < value) {
+            underflow = true;
+            desired = 0;
+        } else {
+            desired = expected - value;
+        }
     } while (!ref.compare_exchange_weak(expected, desired));
+    if (underflow) {
+        KVCM_LOG_WARN("storage usage underflow for type [%zu]: "
+                      "current [%" PRIu64 "] < subtract [%" PRIu64 "], clamped to 0",
+                      idx,
+                      expected,
+                      value);
+    }
     return desired;
 }
 
