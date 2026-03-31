@@ -124,7 +124,7 @@ public:
     void set_master_server_entry(const std::string &master_server_entry) { master_server_entry_ = master_server_entry; }
 
 private:
-    std::string local_hostname_{"localhost"}; // (IP:Port),如果没有port,则选择默认端口12001
+    std::string local_hostname_{"localhost"};                           // (IP:Port),如果没有port,则选择默认端口12001
     std::string metadata_connstring_{"http://localhost:8080/metadata"}; // Connection string for metadata service
     std::string protocol_{"tcp"};                                       // Transfer protocol ("rdma" or "tcp")
     std::string rdma_device_;
