@@ -4,7 +4,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <set>
-#include <sstream>
 #include <string>
 #include <vector>
 
@@ -130,14 +129,49 @@ std::uint64_t MetaIndexer::StorageUsageData::SubStorageUsageByType(const DataSto
     return desired;
 }
 
-std::string MetaIndexer::StorageUsageData::Serialize() const noexcept {
-    std::string str;
+void MetaIndexer::StorageUsageData::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
     for (size_t_ i = 0; i != storage_usage_by_type_.size(); ++i) {
-        if (i > 0) {
-            str += ",";
-        }
-        str += std::to_string(storage_usage_by_type_.at(i).load());
+        const auto type = static_cast<DataStorageType>(i);
+        const std::string key = ToString(type);
+        Put(writer, key, storage_usage_by_type_.at(i).load());
     }
+}
+
+bool MetaIndexer::StorageUsageData::FromRapidValue(const rapidjson::Value &rapid_value) {
+    if (!rapid_value.IsObject()) {
+        return false;
+    }
+
+    // parse into a temporary buffer first to avoid partial updates
+    std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> buf{};
+    for (auto it = rapid_value.MemberBegin(); it != rapid_value.MemberEnd(); ++it) {
+        const std::string key(it->name.GetString(), it->name.GetStringLength());
+        const DataStorageType type = ToDataStorageType(key);
+        if (ToString(type) != key) {
+            // round-trip mismatch: key is not a recognized type
+            // prevent ToDataStorageType silently maps every unknown
+            // string to DATA_STORAGE_TYPE_UNKNOWN
+            KVCM_LOG_ERROR("deserialize storage usage data failed: unrecognized storage type [%s]", key.c_str());
+            return false;
+        }
+        const size_t_ idx = ToIndex(type);
+        if (it->value.IsUint64()) {
+            buf.at(idx) = it->value.GetUint64();
+        } else {
+            KVCM_LOG_ERROR("deserialize storage usage data failed: non-integer value for key [%s]", key.c_str());
+            return false;
+        }
+    }
+
+    // all values parsed successfully, apply to the actual array
+    for (size_t_ i = 0; i != storage_usage_by_type_.size(); ++i) {
+        storage_usage_by_type_.at(i).store(buf.at(i));
+    }
+    return true;
+}
+
+std::string MetaIndexer::StorageUsageData::Serialize() const noexcept {
+    const std::string str = ToJsonString();
     KVCM_LOG_DEBUG("serializing storage usage data into: [%s]", str.c_str());
     return str;
 }
@@ -150,31 +184,9 @@ ErrorCode MetaIndexer::StorageUsageData::Deserialize(const std::string &str) noe
         KVCM_LOG_ERROR("deserialize storage usage data failed: input string is empty");
         return ErrorCode::EC_ERROR;
     }
-    std::stringstream ss(str_copy);
-    std::string v;
-    // parse into a temporary buffer first to avoid partial updates
-    std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> tmp{};
-    size_t_ idx = 0;
-    while (std::getline(ss, v, ',')) {
-        if (idx >= tmp.size()) {
-            KVCM_LOG_ERROR("deserialize storage usage data failed: too many values, expected [%zu]", tmp.size());
-            return ErrorCode::EC_ERROR;
-        }
-        try {
-            tmp.at(idx) = std::stoull(v);
-        } catch (...) {
-            KVCM_LOG_ERROR("interpret [%s] to unsigned integer failed", v.c_str());
-            return ErrorCode::EC_ERROR;
-        }
-        ++idx;
-    }
-    if (idx != tmp.size()) {
-        KVCM_LOG_ERROR("deserialize storage usage data failed: expected [%zu] values but got [%zu]", tmp.size(), idx);
+    if (!FromJsonString(str_copy)) {
+        KVCM_LOG_ERROR("deserialize storage usage data failed: invalid JSON [%s]", str_copy.c_str());
         return ErrorCode::EC_ERROR;
-    }
-    // all values parsed successfully, apply to the actual array
-    for (size_t_ i = 0; i != storage_usage_by_type_.size(); ++i) {
-        storage_usage_by_type_.at(i).store(tmp.at(i));
     }
     return ErrorCode::EC_OK;
 }

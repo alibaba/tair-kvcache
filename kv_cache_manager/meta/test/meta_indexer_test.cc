@@ -411,7 +411,7 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataSeriDeseri) {
         }
 
         std::string serialized = storage_usage_data.Serialize();
-        ASSERT_EQ("1,100,200,300,400,500", serialized);
+        ASSERT_EQ(R"({"unknown":1,"hf3fs":100,"mooncake":200,"pace":300,"file":400,"vcns_hf3fs":500})", serialized);
 
         storage_usage_data.Reset();
         ASSERT_EQ(EC_OK, storage_usage_data.Deserialize(serialized));
@@ -420,62 +420,38 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataSeriDeseri) {
         }
     }
 
-    // Legal input
+    // Legal input: keys in different order
     {
         const std::vector<std::uint64_t> expected_usage_vec{1, 2, 3, 4, 5, 6};
-
         storage_usage_data.Reset();
-        for (std::size_t i = 0; i != expected_usage_vec.size(); ++i) {
-            storage_usage_data.storage_usage_by_type_.at(i).store(expected_usage_vec.at(i));
-        }
-        ASSERT_EQ(EC_OK, storage_usage_data.Deserialize("1,2,3,4,5,6,"));
+        ASSERT_EQ(
+            EC_OK,
+            storage_usage_data.Deserialize(R"({"vcns_hf3fs":6,"file":5,"pace":4,"mooncake":3,"hf3fs":2,"unknown":1})"));
         for (std::size_t i = 0; i != storage_usage_data.storage_usage_by_type_.size(); ++i) {
             ASSERT_EQ(expected_usage_vec.at(i), storage_usage_data.storage_usage_by_type_.at(i).load());
         }
     }
 
-    // Legal input
+    // Legal input: partial JSON (missing keys default to 0)
+    {
+        storage_usage_data.Reset();
+        storage_usage_data.SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 99);
+        ASSERT_EQ(EC_OK, storage_usage_data.Deserialize(R"({"hf3fs":100,"mooncake":200})"));
+        ASSERT_EQ(100, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+        ASSERT_EQ(200, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
+        ASSERT_EQ(0, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
+    }
+
+    // Legal input: whitespace-padded JSON
     {
         const std::vector<std::uint64_t> expected_usage_vec{1, 2, 3, 4, 5, 6};
         storage_usage_data.Reset();
-        for (std::size_t i = 0; i != expected_usage_vec.size(); ++i) {
-            storage_usage_data.storage_usage_by_type_.at(i).store(expected_usage_vec.at(i));
-        }
-        ASSERT_EQ(EC_OK, storage_usage_data.Deserialize(" 1, 2, 3,   4, 5,6   "));
+        ASSERT_EQ(EC_OK,
+                  storage_usage_data.Deserialize(
+                      "  {\"unknown\":1,\"hf3fs\":2,\"mooncake\":3,\"pace\":4,\"file\":5,\"vcns_hf3fs\":6}  "));
         for (std::size_t i = 0; i != storage_usage_data.storage_usage_by_type_.size(); ++i) {
             ASSERT_EQ(expected_usage_vec.at(i), storage_usage_data.storage_usage_by_type_.at(i).load());
         }
-    }
-
-    // Legal input
-    {
-        const std::vector<std::uint64_t> expected_usage_vec{1, 2, 3, 4, 5, 6};
-        storage_usage_data.Reset();
-        for (std::size_t i = 0; i != expected_usage_vec.size(); ++i) {
-            storage_usage_data.storage_usage_by_type_.at(i).store(expected_usage_vec.at(i));
-        }
-        ASSERT_EQ(EC_OK, storage_usage_data.Deserialize(" 1, 2, 3,   4, 5,6,  "));
-        for (std::size_t i = 0; i != storage_usage_data.storage_usage_by_type_.size(); ++i) {
-            ASSERT_EQ(expected_usage_vec.at(i), storage_usage_data.storage_usage_by_type_.at(i).load());
-        }
-    }
-
-    // Truncated input: fewer values than expected
-    {
-        storage_usage_data.Reset();
-        storage_usage_data.SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 999);
-        ASSERT_EQ(EC_ERROR, storage_usage_data.Deserialize("100,200"));
-        // Original data must not be modified on error
-        ASSERT_EQ(999, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
-    }
-
-    // Extra values: more values than expected
-    {
-        storage_usage_data.Reset();
-        storage_usage_data.SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 888);
-        ASSERT_EQ(EC_ERROR, storage_usage_data.Deserialize("0,1,2,3,4,5,6"));
-        // Original data must not be modified on error
-        ASSERT_EQ(888, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
     }
 
     // Empty string
@@ -487,7 +463,7 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataSeriDeseri) {
         ASSERT_EQ(888, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
     }
 
-    // Malformed data: non-numeric value
+    // Malformed data: not valid JSON (old comma-separated format)
     {
         storage_usage_data.Reset();
         storage_usage_data.SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 777);
@@ -496,26 +472,54 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataSeriDeseri) {
         ASSERT_EQ(777, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
     }
 
-    // Malformed data: wrong format
+    // Malformed data: JSON array instead of object
     {
         storage_usage_data.Reset();
         storage_usage_data.SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 777);
-
-        ASSERT_EQ(EC_ERROR, storage_usage_data.Deserialize("0,,,2,3,4,5"));
-        // Original data must not be modified on error
-        ASSERT_EQ(777, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
-
-        ASSERT_EQ(EC_ERROR, storage_usage_data.Deserialize("0,.,2,3,4,5"));
+        ASSERT_EQ(EC_ERROR, storage_usage_data.Deserialize("[1,2,3,4,5,6]"));
         // Original data must not be modified on error
         ASSERT_EQ(777, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
     }
 
-    // Single value (too few)
+    // Malformed data: non-integer value for a key
+    {
+        storage_usage_data.Reset();
+        storage_usage_data.SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 777);
+        ASSERT_EQ(EC_ERROR,
+                  storage_usage_data.Deserialize(
+                      R"({"unknown":0,"hf3fs":"not_a_number","mooncake":2,"pace":3,"file":4,"vcns_hf3fs":5})"));
+        // Original data must not be modified on error
+        ASSERT_EQ(777, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+    }
+
+    // Malformed data: floating-point value
+    {
+        storage_usage_data.Reset();
+        storage_usage_data.SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 777);
+        ASSERT_EQ(EC_ERROR,
+                  storage_usage_data.Deserialize(
+                      R"({"unknown":0,"hf3fs":1.5,"mooncake":2,"pace":3,"file":4,"vcns_hf3fs":5})"));
+        // Original data must not be modified on error
+        ASSERT_EQ(777, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+    }
+
+    // Unrecognized key: must be rejected and leave data unchanged
     {
         storage_usage_data.Reset();
         storage_usage_data.SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 888);
-        ASSERT_EQ(EC_ERROR, storage_usage_data.Deserialize("42"));
+        ASSERT_EQ(EC_ERROR, storage_usage_data.Deserialize(R"({"future_type": 999, "hf3fs": 10})"));
         // Original data must not be modified on error
         ASSERT_EQ(888, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+    }
+
+    // "unknown" is a legitimate key and must still be accepted.
+    {
+        storage_usage_data.Reset();
+        ASSERT_EQ(EC_OK, storage_usage_data.Deserialize(R"({"unknown":7,"hf3fs":10})"));
+        ASSERT_EQ(7u,
+                  storage_usage_data.storage_usage_by_type_
+                      .at(static_cast<std::size_t>(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN))
+                      .load());
+        ASSERT_EQ(10, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
     }
 }
