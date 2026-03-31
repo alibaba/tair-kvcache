@@ -55,10 +55,10 @@ private:
 
 DataStorageSelector::StorageQuotaAvail::StorageQuotaAvail() : storage_quota_avail_by_type_{} {
     storage_quota_avail_by_type_.fill(false);
-    storage_quota_avail_by_type_.at(1) = true; /* DATA_STORAGE_TYPE_HF3FS */
-    storage_quota_avail_by_type_.at(2) = true; /* DATA_STORAGE_TYPE_MOONCAKE */
-    storage_quota_avail_by_type_.at(3) = true; /* DATA_STORAGE_TYPE_TAIR_MEMPOOL */
-    storage_quota_avail_by_type_.at(4) = true; /* DATA_STORAGE_TYPE_NFS */
+    storage_quota_avail_by_type_.at(ToIndex(DataStorageType::DATA_STORAGE_TYPE_HF3FS)) = true;
+    storage_quota_avail_by_type_.at(ToIndex(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE)) = true;
+    storage_quota_avail_by_type_.at(ToIndex(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL)) = true;
+    storage_quota_avail_by_type_.at(ToIndex(DataStorageType::DATA_STORAGE_TYPE_NFS)) = true;
 }
 
 bool DataStorageSelector::StorageQuotaAvail::GetStorageQuotaAvailByType(const DataStorageType &type) const noexcept {
