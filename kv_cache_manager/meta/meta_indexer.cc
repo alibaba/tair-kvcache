@@ -795,9 +795,10 @@ ErrorCode MetaIndexer::RecoverMetaData() noexcept {
     key_count_ = key_count;
 
     if (const auto it = metadata_map.find(METADATA_PROPERTY_STORAGE_USAGE_DATA); it != metadata_map.end()) {
-        if (ec = storage_usage_data_.Deserialize(it->second); ec != EC_OK) {
-            KVCM_LOG_ERROR("meta indexer deserialize storage usage data str failed, str: [%s]", it->second.c_str());
-            return ec;
+        if (storage_usage_data_.Deserialize(it->second) != EC_OK) {
+            KVCM_LOG_WARN("meta indexer deserialize storage usage data failed, resetting to zero, str: [%s]",
+                          it->second.c_str());
+            storage_usage_data_.Reset();
         }
     }
 
