@@ -549,11 +549,12 @@ ErrorCode LeaderElector::SetNodeInfo(const std::string &node_id, const NodeEndpo
 }
 
 ErrorCode LeaderElector::SetSelfNodeInfo(const NodeEndpointInfo &node_info) {
-    {
+    ErrorCode ec = SetNodeInfo(GetSelfNodeID(), node_info);
+    if (ec == EC_OK) {
         std::lock_guard<std::mutex> guard(self_node_info_mutex_);
         self_node_info_cache_ = std::make_unique<NodeEndpointInfo>(node_info);
     }
-    return SetNodeInfo(GetSelfNodeID(), node_info);
+    return ec;
 }
 
 ErrorCode LeaderElector::GetSelfNodeInfo(NodeEndpointInfo &out_node_info) const {

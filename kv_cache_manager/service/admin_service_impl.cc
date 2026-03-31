@@ -811,6 +811,13 @@ void AdminServiceImpl::CheckHealth(RequestContext *request_context,
     auto *header = response->mutable_header();
     auto *status = header->mutable_status();
 
+    if (!leader_elector_) {
+        status->set_code(proto::admin::INTERNAL_ERROR);
+        status->set_message("Leader elector not available (non-HA mode)");
+        request_context->set_status_code(status->code());
+        return;
+    }
+
     response->set_is_leader(leader_elector_->IsLeader());
     response->set_is_health(true); // TODO: 实现健康检查逻辑，如IOHang探测、elector长时间不loop等
     response->set_elector_last_loop_time_ms(leader_elector_->GetLastLoopTimeUs() / 1000);
@@ -827,6 +834,13 @@ void AdminServiceImpl::GetManagerClusterInfo(RequestContext *request_context,
     API_CALL_GUARD("GetManagerClusterInfo", false);
     auto *header = response->mutable_header();
     auto *status = header->mutable_status();
+
+    if (!leader_elector_) {
+        status->set_code(proto::admin::INTERNAL_ERROR);
+        status->set_message("Leader elector not available (non-HA mode)");
+        request_context->set_status_code(status->code());
+        return;
+    }
 
     response->set_self_leader_expiration_time(leader_elector_->GetLeaseExpirationTime());
     std::string leader_node_id = leader_elector_->GetLeaderNodeID();
