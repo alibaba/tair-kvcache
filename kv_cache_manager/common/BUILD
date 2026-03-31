@@ -28,6 +28,7 @@ cc_library(
         ":common_util",
         ":env_util",
         ":hash_util",
+        ":net_util",
         ":string_util",
         ":timestamp_util",
     ],
@@ -102,6 +103,18 @@ cc_library(
         ":logger",
         ":timestamp_util",
         "@com_google_googletest//:gtest",
+    ],
+)
+
+cc_library(
+    name = "net_util",
+    srcs = [
+        "net_util.cc",
+    ],
+    hdrs = [
+        "net_util.h",
+    ],
+    deps = [
     ],
 )
 

@@ -4,6 +4,7 @@
 #include <grpcpp/grpcpp.h>
 
 #include "kv_cache_manager/common/loop_thread.h"
+#include "kv_cache_manager/common/net_util.h"
 #include "kv_cache_manager/config/coordination_backend.h"
 #include "kv_cache_manager/config/coordination_backend_factory.h"
 #include "kv_cache_manager/config/leader_elector.h"
@@ -309,8 +310,7 @@ bool Server::CreateLeaderElector() {
     std::string node_id = config_.GetLeaderElectorNodeId();
     std::string host = config_.GetAdvertisedHost();
     if (host.empty()) {
-        // TODO: replace local_ip_placeholder with real local ip
-        host = "local_ip_placeholder";
+        host = NetUtil::GetLocalIp();
     }
     if (node_id.empty()) {
         node_id = host + ":" + std::to_string(config_.GetServiceAdminHttpPort()) + "_" +
