@@ -99,8 +99,7 @@ struct ClusterInfo {
         std::string host;
         int32_t meta_rpc_port{0};
         int32_t meta_http_port{0};
-        int32_t admin_rpc_port{0};
-        int32_t admin_http_port{0};
+        std::string custom_info;
     };
     NodeEndpoint leader_endpoint;
 };

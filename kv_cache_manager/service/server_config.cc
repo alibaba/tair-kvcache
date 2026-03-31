@@ -136,6 +136,11 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
      [](const std::string &value, ServerConfig *config) {
          config->advertised_host_ = value;
          return true;
+     }},
+    {"kvcm.service.custom_info",
+     [](const std::string &value, ServerConfig *config) {
+         config->custom_info_ = value;
+         return true;
      }}};
 
 bool ServerConfig::Parse(const std::string &config_file, const EnvironMap &environ) {

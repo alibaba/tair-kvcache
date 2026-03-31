@@ -540,7 +540,7 @@ TEST_F(LeaderElectorTest, SetSelfNodeInfoAndGetNodeInfo) {
     std::string self_node_id = elector->GetSelfNodeID();
 
     // 写入节点信息
-    NodeEndpointInfo write_info(self_node_id, "192.168.1.100", 8001, 8002, 9001, 9002);
+    NodeEndpointInfo write_info(self_node_id, "192.168.1.100", 8001, 8002, 9001, 9002, "region=us-east-1");
     ErrorCode ec = elector->SetSelfNodeInfo(write_info);
     EXPECT_EQ(EC_OK, ec);
 
@@ -556,6 +556,7 @@ TEST_F(LeaderElectorTest, SetSelfNodeInfoAndGetNodeInfo) {
     EXPECT_EQ(8002, read_info.meta_http_port());
     EXPECT_EQ(9001, read_info.admin_rpc_port());
     EXPECT_EQ(9002, read_info.admin_http_port());
+    EXPECT_EQ("region=us-east-1", read_info.custom_info());
 }
 
 // 测试读取不存在的节点信息
@@ -574,6 +575,7 @@ TEST_F(LeaderElectorTest, LeaderDiscoveryEndToEnd) {
     const int32_t meta_http_port = 8080;
     const int32_t admin_rpc_port = 50052;
     const int32_t admin_http_port = 8081;
+    const std::string custom_info = "az=cn-hangzhou-h";
 
     auto elector = CreateElector();
 
@@ -592,7 +594,7 @@ TEST_F(LeaderElectorTest, LeaderDiscoveryEndToEnd) {
     std::string self_node_id = elector->GetSelfNodeID();
     NodeEndpointInfo node_info(self_node_id, advertised_host,
                                meta_rpc_port, meta_http_port,
-                               admin_rpc_port, admin_http_port);
+                               admin_rpc_port, admin_http_port, custom_info);
     ErrorCode ec = elector->SetSelfNodeInfo(node_info);
     ASSERT_EQ(EC_OK, ec);
 
@@ -614,6 +616,7 @@ TEST_F(LeaderElectorTest, LeaderDiscoveryEndToEnd) {
     EXPECT_EQ(meta_http_port, leader_info.meta_http_port());
     EXPECT_EQ(admin_rpc_port, leader_info.admin_rpc_port());
     EXPECT_EQ(admin_http_port, leader_info.admin_http_port());
+    EXPECT_EQ(custom_info, leader_info.custom_info());
 
     elector->Stop();
 }
@@ -635,8 +638,8 @@ TEST_F(LeaderElectorTest, LeaderDiscoveryTwoNodes) {
     elector2->SetNoLongerLeaderHandler([]() {});
 
     // 两个节点都写入自己的连接信息
-    NodeEndpointInfo info1("instance1", host1, 8001, 8002, 9001, 9002);
-    NodeEndpointInfo info2("instance2", host2, 8003, 8004, 9003, 9004);
+    NodeEndpointInfo info1("instance1", host1, 8001, 8002, 9001, 9002, "rack=A");
+    NodeEndpointInfo info2("instance2", host2, 8003, 8004, 9003, 9004, "rack=B");
     ASSERT_EQ(EC_OK, elector1->SetSelfNodeInfo(info1));
     ASSERT_EQ(EC_OK, elector2->SetSelfNodeInfo(info2));
 
@@ -671,12 +674,14 @@ TEST_F(LeaderElectorTest, LeaderDiscoveryTwoNodes) {
         EXPECT_EQ(8002, leader_info.meta_http_port());
         EXPECT_EQ(9001, leader_info.admin_rpc_port());
         EXPECT_EQ(9002, leader_info.admin_http_port());
+        EXPECT_EQ("rack=A", leader_info.custom_info());
     } else {
         EXPECT_EQ(host2, leader_info.host());
         EXPECT_EQ(8003, leader_info.meta_rpc_port());
         EXPECT_EQ(8004, leader_info.meta_http_port());
         EXPECT_EQ(9003, leader_info.admin_rpc_port());
         EXPECT_EQ(9004, leader_info.admin_http_port());
+        EXPECT_EQ("rack=B", leader_info.custom_info());
     }
 
     elector1->Stop();
@@ -690,11 +695,11 @@ TEST_F(LeaderElectorTest, NodeInfoOverwrite) {
     std::string self_node_id = elector->GetSelfNodeID();
 
     // 第一次写入
-    NodeEndpointInfo info1(self_node_id, "10.0.0.1", 8001, 8002, 9001, 9002);
+    NodeEndpointInfo info1(self_node_id, "10.0.0.1", 8001, 8002, 9001, 9002, "v1");
     ASSERT_EQ(EC_OK, elector->SetSelfNodeInfo(info1));
 
     // 覆盖写入（模拟端口变更）
-    NodeEndpointInfo info2(self_node_id, "10.0.0.1", 9999, 9998, 9997, 9996);
+    NodeEndpointInfo info2(self_node_id, "10.0.0.1", 9999, 9998, 9997, 9996, "v2");
     ASSERT_EQ(EC_OK, elector->SetSelfNodeInfo(info2));
 
     // 读取应该是最新的值
@@ -705,4 +710,5 @@ TEST_F(LeaderElectorTest, NodeInfoOverwrite) {
     EXPECT_EQ(9998, read_info.meta_http_port());
     EXPECT_EQ(9997, read_info.admin_rpc_port());
     EXPECT_EQ(9996, read_info.admin_http_port());
+    EXPECT_EQ("v2", read_info.custom_info());
 }

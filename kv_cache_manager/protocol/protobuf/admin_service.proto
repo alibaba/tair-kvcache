@@ -453,6 +453,7 @@ message NodeEndpoint {
     int32 meta_http_port = 4;
     int32 admin_rpc_port = 5;
     int32 admin_http_port = 6;
+    string custom_info = 7;
 }
 
 message GetManagerClusterInfoResponse {

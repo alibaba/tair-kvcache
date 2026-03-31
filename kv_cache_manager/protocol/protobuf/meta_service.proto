@@ -282,14 +282,13 @@ message RemoveCacheRequest {
     BlockMask block_mask = 5; // 对block_keys或者token_ids的mask
 }
 
-// 节点端点信息，用于客户端直连leader节点
-message NodeEndpoint {
+// Leader 节点信息，仅包含 Meta 服务连接信息，不暴露 Admin 端口
+message MetaNodeEndpoint {
     string node_id = 1;
     string host = 2;
     int32 meta_rpc_port = 3;
     int32 meta_http_port = 4;
-    int32 admin_rpc_port = 5;
-    int32 admin_http_port = 6;
+    string custom_info = 5;
 }
 
 message GetClusterInfoRequest {
@@ -301,7 +300,7 @@ message GetClusterInfoResponse {
     CommonResponseHeader header = 1;
     string self_node_id = 2;
     string leader_node_id = 3;
-    NodeEndpoint leader_endpoint = 4;
+    MetaNodeEndpoint leader_endpoint = 4;
 }
 
 enum TrimStrategy {

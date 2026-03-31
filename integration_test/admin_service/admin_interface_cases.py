@@ -399,6 +399,8 @@ class AdminServiceTestBase(abc.ABC, TestBase, unittest.TestCase):
         self.assertGreater(leader_ep["meta_http_port"], 0)
         self.assertGreater(leader_ep["admin_rpc_port"], 0)
         self.assertGreater(leader_ep["admin_http_port"], 0)
+        # custom_info 默认为空字符串（未配置时）
+        self.assertIn("custom_info", leader_ep)
 
     def test_get_leader_elector_config(self):
         """测试 GetLeaderElectorConfig 接口"""
@@ -564,12 +566,17 @@ class AdminServiceLeaderElectionTest(abc.ABC, TestBase, unittest.TestCase):
         kwargs[f'kvcm.distributed_lock.uri'] = self._lock_uri
         kwargs[f'kvcm.leader_elector.lease_ms'] = 2000
         kwargs[f'kvcm.service.advertised_host'] = '127.0.0.1'
-        self.assertTrue(self.worker_manager.start_all(**kwargs))
+        # 逐个启动 worker，为每个 worker 设置不同的 custom_info
+        for i in range(len(self.worker_manager.workers)):
+            worker_kwargs = dict(kwargs)
+            worker_kwargs[f'kvcm.service.custom_info'] = f'worker-{i}'
+            self.assertTrue(self.worker_manager.start_worker(i, **worker_kwargs))
 
     def start_worker_by_id(self, worker_id, **kwargs):
         kwargs[f'kvcm.distributed_lock.uri'] = self._lock_uri
         kwargs[f'kvcm.leader_elector.lease_ms'] = 2000
         kwargs[f'kvcm.service.advertised_host'] = '127.0.0.1'
+        kwargs[f'kvcm.service.custom_info'] = f'worker-{worker_id}'
         self.assertTrue(self.worker_manager.start_worker(worker_id, **kwargs))
 
     def clean_test_resource(self):
@@ -660,6 +667,8 @@ class AdminServiceLeaderElectionTest(abc.ABC, TestBase, unittest.TestCase):
             self.assertEqual(leader_ep["meta_http_port"], leader_worker.env.http_port)
             self.assertEqual(leader_ep["admin_rpc_port"], leader_worker.env.admin_rpc_port)
             self.assertEqual(leader_ep["admin_http_port"], leader_worker.env.admin_http_port)
+            self.assertEqual(leader_ep.get("custom_info", ""), f"worker-{leader_id}",
+                             "leader_endpoint.custom_info 应与 leader worker 启动时配置的一致")
 
             # 从 follower 查询也能获取正确的 leader_endpoint
             non_leader_id = 1 if leader_id == 0 else 0
@@ -674,6 +683,8 @@ class AdminServiceLeaderElectionTest(abc.ABC, TestBase, unittest.TestCase):
             self.assertEqual(follower_leader_ep["node_id"], leader_node_id)
             self.assertEqual(follower_leader_ep["host"], "127.0.0.1")
             self.assertEqual(follower_leader_ep["admin_http_port"], leader_worker.env.admin_http_port)
+            self.assertEqual(follower_leader_ep.get("custom_info", ""), f"worker-{leader_id}",
+                             "follower 查询到的 custom_info 也应与 leader 配置一致")
 
             # 测试leader降级功能（如果leader是当前worker）
             update_req = {"trace_id": "trace_demote_test", "campaign_delay_time_ms": 10 * 1000}

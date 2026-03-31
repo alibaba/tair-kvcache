@@ -42,6 +42,7 @@ public:
     int64_t metrics_report_interval_ms() { return metrics_report_interval_ms_; }
     const std::string &event_publishers_configs() { return event_publishers_configs_; }
     const std::string &GetAdvertisedHost() const { return advertised_host_; }
+    const std::string &GetCustomInfo() const { return custom_info_; }
 
 private:
     void UpdateDefaultConfig();
@@ -74,6 +75,7 @@ private:
     int64_t metrics_report_interval_ms_ = 0;
     std::string event_publishers_configs_;
     std::string advertised_host_;
+    std::string custom_info_;
 
 private:
     using SettingFunction = std::function<bool(const std::string &, ServerConfig *config)>;

@@ -338,7 +338,8 @@ bool Server::CreateLeaderElector() {
                                    config_.GetServiceRpcPort(),
                                    config_.GetServiceHttpPort(),
                                    config_.GetServiceAdminRpcPort(),
-                                   config_.GetServiceAdminHttpPort());
+                                   config_.GetServiceAdminHttpPort(),
+                                   config_.GetCustomInfo());
 
         ErrorCode ec = leader_elector_->SetSelfNodeInfo(node_info);
         if (ec != EC_OK) {

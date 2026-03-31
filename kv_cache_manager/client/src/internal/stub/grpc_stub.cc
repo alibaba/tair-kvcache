@@ -474,8 +474,7 @@ std::pair<ClientErrorCode, ClusterInfo> GrpcStub::GetClusterInfo(const std::stri
         info.leader_endpoint.host = ep.host();
         info.leader_endpoint.meta_rpc_port = ep.meta_rpc_port();
         info.leader_endpoint.meta_http_port = ep.meta_http_port();
-        info.leader_endpoint.admin_rpc_port = ep.admin_rpc_port();
-        info.leader_endpoint.admin_http_port = ep.admin_http_port();
+        info.leader_endpoint.custom_info = ep.custom_info();
     }
     KVCM_LOG_DEBUG("get cluster info success, self=%s, leader=%s",
                    info.self_node_id.c_str(),

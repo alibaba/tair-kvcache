@@ -891,7 +891,7 @@ TEST_F(GrpcStubTest, TestGetClusterInfoWithLeaderElector) {
     ASSERT_TRUE(WaitUntil([&]() { return leader_elector->IsLeader(); }, 5000, 50));
 
     // Write node endpoint info so GetClusterInfo can read it.
-    NodeEndpointInfo node_info("node1", "127.0.0.1", 9001, 9002, 9003, 9004);
+    NodeEndpointInfo node_info("node1", "127.0.0.1", 9001, 9002, 9003, 9004, "test_custom_info");
     ASSERT_EQ(EC_OK, leader_elector->SetSelfNodeInfo(node_info));
 
     // Recreate MetaServiceImpl with the leader elector.
@@ -919,8 +919,7 @@ TEST_F(GrpcStubTest, TestGetClusterInfoWithLeaderElector) {
     EXPECT_EQ("127.0.0.1", info.leader_endpoint.host);
     EXPECT_EQ(9001, info.leader_endpoint.meta_rpc_port);
     EXPECT_EQ(9002, info.leader_endpoint.meta_http_port);
-    EXPECT_EQ(9003, info.leader_endpoint.admin_rpc_port);
-    EXPECT_EQ(9004, info.leader_endpoint.admin_http_port);
+    EXPECT_EQ("test_custom_info", info.leader_endpoint.custom_info);
 
     leader_elector->Stop();
 }
