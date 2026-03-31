@@ -609,7 +609,7 @@ void MetaServiceImpl::GetClusterInfo(RequestContext *request_context,
 
     if (!leader_elector_) {
         status->set_code(proto::meta::SERVICE_NOT_READY);
-        status->set_message("Leader elector not available (non-HA mode)");
+        status->set_message("Leader elector not initialized");
         request_context->set_status_code(status->code());
         return;
     }

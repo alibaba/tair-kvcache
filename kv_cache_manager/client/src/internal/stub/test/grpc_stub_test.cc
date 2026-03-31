@@ -868,8 +868,8 @@ TEST_F(GrpcStubTest, TestSpanTracer) {
 }
 
 TEST_F(GrpcStubTest, TestGetClusterInfoNoLeaderElector) {
-    // MetaServiceImpl was created with leader_elector=nullptr,
-    // so GetClusterInfo should return SERVICE_NOT_READY which maps to ER_SERVICE_INTERNAL_ERROR.
+    // Test-only scenario: MetaServiceImpl was created with leader_elector=nullptr.
+    // GetClusterInfo should return SERVICE_NOT_READY which maps to ER_SERVICE_INTERNAL_ERROR.
     auto [ec, info] = stub_->GetClusterInfo("trace1", "");
     ASSERT_EQ(ER_SERVICE_INTERNAL_ERROR, ec);
 }

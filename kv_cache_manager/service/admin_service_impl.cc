@@ -813,7 +813,7 @@ void AdminServiceImpl::CheckHealth(RequestContext *request_context,
 
     if (!leader_elector_) {
         status->set_code(proto::admin::INTERNAL_ERROR);
-        status->set_message("Leader elector not available (non-HA mode)");
+        status->set_message("Leader elector not initialized");
         request_context->set_status_code(status->code());
         return;
     }
@@ -837,7 +837,7 @@ void AdminServiceImpl::GetManagerClusterInfo(RequestContext *request_context,
 
     if (!leader_elector_) {
         status->set_code(proto::admin::INTERNAL_ERROR);
-        status->set_message("Leader elector not available (non-HA mode)");
+        status->set_message("Leader elector not initialized");
         request_context->set_status_code(status->code());
         return;
     }
