@@ -405,7 +405,7 @@ TEST_F(SdkBufferCheckUtilTest, TestSdkBufferCheckPoolMultiDevice) {
                                                              handle->d_crcs,
                                                              handle->h_iovs,
                                                              max_check_iov_num,
-                                                             handle->cuda_stream);
+                                                             handle->gpu_stream);
         if (1 != block_hashs.size()) {
             return -1;
         }

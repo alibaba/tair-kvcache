@@ -31,11 +31,8 @@ struct IovDevice {
 class SdkBufferCheckUtil {
 public:
     static std::vector<int64_t> GetBlocksHash(const BlockBuffers &block_buffers);
-    static std::vector<int64_t> GetBlocksHash(const BlockBuffers &block_buffers,
-                                              IovDevice *iovs_d,
-                                              uint32_t *crcs_d,
-                                              size_t max_iov_num,
-                                              GpuStream_t stream);
+    static std::vector<int64_t> GetBlocksHash(
+        const BlockBuffers &block_buffers, IovDevice *iovs_d, uint32_t *crcs_d, size_t max_iov_num, GpuStream_t stream);
     static std::vector<int64_t> GetBlocksHash(const BlockBuffers &block_buffers,
                                               IovDevice *iovs_d,
                                               uint32_t *crcs_d,

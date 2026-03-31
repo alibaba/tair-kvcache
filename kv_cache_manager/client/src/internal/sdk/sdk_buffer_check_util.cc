@@ -61,13 +61,14 @@ std::vector<int64_t> SdkBufferCheckUtil::GetBlocksHash(const BlockBuffers &block
 }
 
 std::vector<uint32_t> SdkBufferCheckUtil::GetIovsCrc(const std::vector<IovDevice> &iovs_h) {
-    IovDevice *iovs_d = nullptr;
-    uint32_t *crcs_d = nullptr;
-    CHECK_CUDA_ERROR_RETURN(cudaMalloc(&iovs_d, sizeof(IovDevice) * iovs_h.size()), {}, "cudaMalloc fail");
-    CHECK_CUDA_ERROR_RETURN(cudaMalloc(&crcs_d, sizeof(uint32_t) * iovs_h.size()), {}, "cudaMalloc fail");
-    auto crcs = GetIovsCrc(iovs_h, iovs_d, crcs_d, nullptr);
-    CHECK_CUDA_ERROR_RETURN(cudaFree(iovs_d), {}, "cudaMalloc fail");
-    CHECK_CUDA_ERROR_RETURN(cudaFree(crcs_d), {}, "cudaMalloc fail");
+    CudaBufferGuard iovs_guard, crcs_guard;
+    size_t iovs_byte_size = sizeof(IovDevice) * iovs_h.size();
+    size_t crcs_byte_size = sizeof(uint32_t) * iovs_h.size();
+    if (!iovs_guard.Alloc(iovs_byte_size) || !crcs_guard.Alloc(crcs_byte_size)) {
+        return {};
+    }
+    auto crcs = GetIovsCrc(
+        iovs_h, static_cast<IovDevice *>(iovs_guard.Get()), static_cast<uint32_t *>(crcs_guard.Get()), nullptr);
     return crcs;
 }
 
@@ -123,9 +124,12 @@ bool SdkBufferCheckPool::Init(size_t max_check_iov_num) {
 bool SdkBufferCheckPool::WarmUp() {
     const std::string warmup_str("12345678");
     // crc32("12345678") == 9AE0DAAF
+    CudaBufferGuard buffer_guard;
     auto byte_size = warmup_str.size();
-    char *buffer = nullptr;
-    CHECK_CUDA_ERROR_RETURN(cudaMalloc(&buffer, byte_size), false, "cudaMalloc [%lu] bytes failed", byte_size);
+    if (!buffer_guard.Alloc(byte_size)) {
+        return false;
+    }
+    void *buffer = buffer_guard.Get();
     CHECK_CUDA_ERROR_RETURN(cudaMemcpy(buffer, warmup_str.data(), byte_size, cudaMemcpyHostToDevice),
                             false,
                             "cudaMemcpy from host[%p] to device[%p] failed",
@@ -134,15 +138,15 @@ bool SdkBufferCheckPool::WarmUp() {
     std::vector<IovDevice> iovs_h{{buffer, byte_size}};
     const std::vector<uint32_t> ecpected_crcs({0x9AE0DAAF});
     for (auto &cell : cells_) {
-        auto real_crcs = SdkBufferCheckUtil::GetIovsCrc(iovs_h, cell.d_iovs, cell.d_crcs, cell.cuda_stream);
+        auto real_crcs = SdkBufferCheckUtil::GetIovsCrc(iovs_h, cell.d_iovs, cell.d_crcs, cell.gpu_stream);
         if (ecpected_crcs != real_crcs) {
             KVCM_LOG_ERROR("warm up failed");
             return false;
         }
     }
 
-    if (buffer != nullptr) {
-        CHECK_CUDA_ERROR_RETURN(cudaFree(buffer), false, "cudaFree [%p] failed", buffer);
+    if (buffer != nullptr && !buffer_guard.Free()) {
+        return false;
     }
     return true;
 }
