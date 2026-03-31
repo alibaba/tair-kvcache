@@ -781,7 +781,7 @@ ErrorCode MetaIndexer::RecoverMetaData() noexcept {
     }
     key_count_ = key_count;
 
-    if (const auto it = metadata_map.find(METADATA_PROPERTY_STORAGE_USAGE_ARRAY); it != metadata_map.end()) {
+    if (const auto it = metadata_map.find(METADATA_PROPERTY_STORAGE_USAGE_DATA); it != metadata_map.end()) {
         if (ec = storage_usage_data_.Deserialize(it->second); ec != EC_OK) {
             KVCM_LOG_ERROR("meta indexer deserialize storage usage data str failed, str: [%s]", it->second.c_str());
             return ec;
@@ -797,7 +797,7 @@ void MetaIndexer::PersistMetaData() noexcept {
     if (current_time >= last_persist_metadata_time_ + persist_metadata_interval_time_ms_) {
         std::map<std::string, std::string> metadata_map;
         metadata_map[METADATA_PROPERTY_KEY_COUNT] = std::to_string(key_count_);
-        metadata_map[METADATA_PROPERTY_STORAGE_USAGE_ARRAY] = storage_usage_data_.Serialize();
+        metadata_map[METADATA_PROPERTY_STORAGE_USAGE_DATA] = storage_usage_data_.Serialize();
         auto ec = storage_->PutMetaData(metadata_map);
         if (ec != EC_OK) {
             KVCM_LOG_ERROR("meta indexer persist metadata failed, ec[%d]", ec);
