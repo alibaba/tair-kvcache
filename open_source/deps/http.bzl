@@ -44,21 +44,6 @@ def http_deps():
         sha256 = "48e0b91a8851b1b86d779c6c52dc7336bcc902795ac77558941ba1ba09321e50",
     )
 
-    # mooncake
-    http_archive(
-        name = "mooncake",
-        urls = ["https://github.com/kvcache-ai/Mooncake/archive/refs/tags/v0.3.10.tar.gz"],
-        build_file = clean_dep("//3rdparty/mooncake:mooncake.BUILD"),
-        strip_prefix = "Mooncake-0.3.10",
-        sha256 = "0555a5256e6f4a4e97d990553d2aec931cd60e81dde93fb7ae3725fe69fb5306",
-        patches = [
-            clean_dep("//patches/mooncake:0001-fix-spinlock-gcc10-compat.patch"),
-            clean_dep("//patches/mooncake:0002-fix-missing-gflags-include.patch"),
-            clean_dep("//patches/mooncake:0003-fix-linux-memfd-header-compat.patch"),
-        ],
-        patch_args = ["-p1"],
-    )
-
     # msgpack-cxx (header-only, required by mooncake-store)
     http_archive(
         name = "msgpack_cxx",

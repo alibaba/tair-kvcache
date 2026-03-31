@@ -21,7 +21,7 @@ on:
         type: boolean
         default: false
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.runs-on || 'ubuntu-latest' }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ inputs.runs-on || 'ubuntu-latest' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   test:

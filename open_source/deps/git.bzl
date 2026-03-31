@@ -128,6 +128,19 @@ def git_deps():
         shallow_since = "1569430560 -0700",
     )
 
+    new_git_repository(
+        name = "mooncake",
+        remote = "https://github.com/openanolis/Mooncake.git",  
+        commit = "211b75742b6d1fee739ad9a486f2ae9ce2695847",  
+        build_file = clean_dep("//3rdparty/mooncake:mooncake.BUILD"),
+        patches = [
+            clean_dep("//patches/mooncake:0001-fix-spinlock-gcc10-compat.patch"),
+            clean_dep("//patches/mooncake:0002-fix-missing-gflags-include.patch"),
+            clean_dep("//patches/mooncake:0003-fix-linux-memfd-header-compat.patch"),
+        ],
+        patch_args = ["-p1"],
+    )
+
     http_archive(
         name = "curl",
         build_file = clean_dep("//3rdparty/curl:curl.BUILD"),
