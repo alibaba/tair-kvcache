@@ -31,7 +31,7 @@ class MetaServiceGrpcClient(cases.MetaServiceClientBase):
         self._address = address
         self._channel = grpc.insecure_channel(self._address)
         self._stub = MetaServiceStub(self._channel)
-        self._timeout = timeout or self.DEFAULT_TIMEOUT
+        self._timeout = timeout if timeout is not None else self.DEFAULT_TIMEOUT
 
     def _convert_dict_to_proto(self, proto_class, data):
         """Convert a dictionary to a protobuf message"""
