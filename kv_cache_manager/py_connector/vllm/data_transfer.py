@@ -7,6 +7,19 @@ from typing import Any
 import torch
 from kv_cache_manager.client.pybind import kvcm_py_client
 
+
+def _get_device_module(device=None):
+    """Return the device module matching the runtime device."""
+    if device is not None and hasattr(torch, "get_device_module"):
+        return torch.get_device_module(device)
+    try:
+        if hasattr(torch, "musa") and torch.musa.is_available():
+            import torch_musa  # noqa: F401
+            return torch.musa
+    except Exception:
+        pass
+    return torch.cuda
+
 from kv_cache_manager.py_connector.common.tp_coordinator import CoordinateMsgSerializer, TpCoordinatorClient, \
     CoordinateMessage, SendBlockFinishedEvent, LoadBlockFinishedEvent
 from kv_cache_manager.py_connector.common.logger import logger
@@ -69,13 +82,14 @@ class DataTransferManager:
         self._transfer_client = transfer_client
         self._coordinator_client = coordinator_client
         self._extra_config = extra_config
+        self._device_mod = _get_device_module(self._kvcache_info.device)
 
         # 创建内部线程池执行器
         self._io_executor = self._create_io_executor()
         
         # 保存和加载流
-        self._save_stream = torch.cuda.Stream()
-        self._load_stream = torch.cuda.Stream()
+        self._save_stream = self._device_mod.Stream()
+        self._load_stream = self._device_mod.Stream()
     
     def _create_io_executor(self) -> ThreadPoolExecutor:
         """创建IO线程池执行器"""
@@ -84,7 +98,7 @@ class DataTransferManager:
         # 初始化线程池，设置线程名和初始化函数
         def init_worker():
             import torch
-            torch.cuda.set_device(self._kvcache_info.device)
+            self._device_mod.set_device(self._kvcache_info.device)
         
         return ThreadPoolExecutor(
             max_workers=32, 
@@ -135,7 +149,7 @@ class DataTransferManager:
         transfer_result = self._transfer_client.LoadKvCaches(remote_uris, buffers)
         logger.debug("done transfer,result:%s", transfer_result)
         if transfer_result == kvcm_py_client.ClientErrorCode.ER_OK:
-            with torch.cuda.stream(self._load_stream):
+            with self._device_mod.stream(self._load_stream):
                 batch_gather_scatter_helper.batch_scatter_kv_caches(
                     self._kvcache_info.all_kvcache_ptr_tensor_gpu,
                     self._copy_buffer_allocator._raw_buffer,
@@ -145,7 +159,7 @@ class DataTransferManager:
                     self._kvcache_info.per_token_per_layer_dim_size,
                 )
 
-                copy_done_event = torch.cuda.Event()
+                copy_done_event = self._device_mod.Event()
                 copy_done_event.record(self._load_stream)
             copy_done_event.synchronize()
 
@@ -188,7 +202,7 @@ class DataTransferManager:
         return generate_message
 
     def save_task(self, multi_result: MultiResult, task_idx, remote_uris, block_token_indices,
-                  kvcache_ready_event: torch.cuda.Event):
+                  kvcache_ready_event):
         """保存任务
         
         Args:
@@ -200,7 +214,7 @@ class DataTransferManager:
         """
         logger.debug("save remote_uris:%s, block_token_indices:%s", remote_uris, block_token_indices)
 
-        with torch.cuda.stream(self._save_stream):
+        with self._device_mod.stream(self._save_stream):
             kvcache_ready_event.wait()
             copy_buffer_indices = self._copy_buffer_allocator.alloc_buffer_idx_blocking(len(remote_uris))
             batch_gather_scatter_helper.batch_gather_kv_caches(
@@ -211,7 +225,7 @@ class DataTransferManager:
                 self._manager_block_size,
                 self._kvcache_info.per_token_per_layer_dim_size,
             )
-            copy_done_event = torch.cuda.Event()
+            copy_done_event = self._device_mod.Event()
             copy_done_event.record(self._save_stream)
 
         copy_done_event.synchronize()

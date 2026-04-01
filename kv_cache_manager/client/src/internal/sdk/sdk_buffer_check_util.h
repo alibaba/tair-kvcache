@@ -6,9 +6,22 @@
 #include <vector>
 
 #include "kv_cache_manager/client/include/common.h"
+
+#if defined(USING_CUDA)
 #include "kv_cache_manager/client/src/internal/sdk/cuda_util.h"
+#elif defined(USING_MUSA)
+#include "kv_cache_manager/client/src/internal/sdk/musa_util.h"
+#endif
 
 namespace kv_cache_manager {
+
+#if defined(USING_CUDA)
+using GpuStream_t = cudaStream_t;
+#elif defined(USING_MUSA)
+using GpuStream_t = musaStream_t;
+#else
+using GpuStream_t = void *;
+#endif
 
 struct IovDevice {
     const void *base;
@@ -22,19 +35,19 @@ public:
                                               IovDevice *iovs_d,
                                               uint32_t *crcs_d,
                                               size_t max_iov_num,
-                                              cudaStream_t stream);
+                                              GpuStream_t stream);
     static std::vector<int64_t> GetBlocksHash(const BlockBuffers &block_buffers,
                                               IovDevice *iovs_d,
                                               uint32_t *crcs_d,
                                               IovDevice *iovs_h_to_save,
                                               size_t max_iov_num,
-                                              cudaStream_t stream);
+                                              GpuStream_t stream);
 
     static std::vector<uint32_t> GetIovsCrc(const std::vector<IovDevice> &iovs_h);
     static std::vector<uint32_t>
-    GetIovsCrc(const std::vector<IovDevice> &iovs_h, IovDevice *iovs_d, uint32_t *crcs_d, cudaStream_t stream);
+    GetIovsCrc(const std::vector<IovDevice> &iovs_h, IovDevice *iovs_d, uint32_t *crcs_d, GpuStream_t stream);
     static std::vector<uint32_t>
-    GetIovsCrc(const IovDevice *iovs_h_ptr, size_t iovs_size, IovDevice *iovs_d, uint32_t *crcs_d, cudaStream_t stream);
+    GetIovsCrc(const IovDevice *iovs_h_ptr, size_t iovs_size, IovDevice *iovs_d, uint32_t *crcs_d, GpuStream_t stream);
 
 private:
     static size_t min_cal_byte_size_;
@@ -51,7 +64,7 @@ public:
         IovDevice *h_iovs = nullptr;
         IovDevice *d_iovs = nullptr;
         uint32_t *d_crcs = nullptr;
-        cudaStream_t cuda_stream = nullptr;
+        GpuStream_t gpu_stream = nullptr;
     };
 
     class CellHandle {

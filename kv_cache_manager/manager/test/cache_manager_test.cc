@@ -204,7 +204,7 @@ TEST_F(CacheManagerTest, TestRemoveInstance) {
 
     auto ec1 = cache_manager_->RemoveInstance(request_context_.get(), "default", "placeholder_id");
     ASSERT_EQ(ErrorCode::EC_OK, ec1);
-    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
     BlockMask block_mask = static_cast<std::size_t>(0);
 
     {

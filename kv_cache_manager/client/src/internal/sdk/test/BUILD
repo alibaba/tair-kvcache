@@ -10,6 +10,11 @@ config_setting(
     values = {"define": "using_cuda=true"},
 )
 
+config_setting(
+    name = "using_musa",
+    values = {"define": "using_musa=true"},
+)
+
 cc_test(
     name = "LocalFileSdkTest",
     srcs = [
@@ -113,10 +118,14 @@ cc_test(
     copts = ["-fno-access-control"],
     target_compatible_with = select({
         ":using_cuda": [],
+        ":using_musa": [],
         "//conditions:default": ["@platforms//:incompatible"],
     }),
     deps = [
-        "//kv_cache_manager/client/src/internal/sdk:sdk_buffer_check_util",
         "//kv_cache_manager/common:unittest",
-    ],
+    ] + select({
+        ":using_cuda": ["//kv_cache_manager/client/src/internal/sdk:sdk_buffer_check_util"],
+        ":using_musa": ["//kv_cache_manager/client/src/internal/sdk:sdk_buffer_check_util_musa"],
+        "//conditions:default": [],
+    }),
 )

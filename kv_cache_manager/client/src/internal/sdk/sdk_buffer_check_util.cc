@@ -27,7 +27,7 @@ std::vector<int64_t> SdkBufferCheckUtil::GetBlocksHash(const BlockBuffers &block
 }
 
 std::vector<int64_t> SdkBufferCheckUtil::GetBlocksHash(
-    const BlockBuffers &block_buffers, IovDevice *iovs_d, uint32_t *crcs_d, size_t max_iov_num, cudaStream_t stream) {
+    const BlockBuffers &block_buffers, IovDevice *iovs_d, uint32_t *crcs_d, size_t max_iov_num, GpuStream_t stream) {
     std::vector<IovDevice> iov_h(max_iov_num);
     return GetBlocksHash(block_buffers, iovs_d, crcs_d, iov_h.data(), max_iov_num, stream);
 }
@@ -37,7 +37,7 @@ std::vector<int64_t> SdkBufferCheckUtil::GetBlocksHash(const BlockBuffers &block
                                                        uint32_t *crcs_d,
                                                        IovDevice *iovs_h_to_save,
                                                        size_t max_iov_num,
-                                                       cudaStream_t stream) {
+                                                       GpuStream_t stream) {
     size_t iov_num = block_buffers.front().iovs.size();
     size_t iovs_size = 0;
     for (const auto &block_buffer : block_buffers) {
@@ -74,7 +74,7 @@ std::vector<uint32_t> SdkBufferCheckUtil::GetIovsCrc(const std::vector<IovDevice
 std::vector<uint32_t> SdkBufferCheckUtil::GetIovsCrc(const std::vector<IovDevice> &iovs_h,
                                                      IovDevice *iovs_d,
                                                      uint32_t *crcs_d,
-                                                     cudaStream_t stream) {
+                                                     GpuStream_t stream) {
     return GetIovsCrc(iovs_h.data(), iovs_h.size(), iovs_d, crcs_d, stream);
 }
 
@@ -105,7 +105,7 @@ bool SdkBufferCheckPool::Init(size_t max_check_iov_num) {
         CHECK_CUDA_ERROR_RETURN(
             cudaMalloc(&cell.d_crcs, crcs_byte_size), false, "cudaMalloc [%zu] byte failed", crcs_byte_size);
         CHECK_CUDA_ERROR_RETURN(
-            cudaStreamCreateWithFlags(&cell.cuda_stream, cudaStreamNonBlocking), false, "cuda stream create failed");
+            cudaStreamCreateWithFlags(&cell.gpu_stream, cudaStreamNonBlocking), false, "cuda stream create failed");
         cell_queue_.push(&cell);
     }
     KVCM_LOG_INFO(

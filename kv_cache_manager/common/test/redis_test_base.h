@@ -1,5 +1,7 @@
 #pragma once
 
+#include <optional>
+
 #include "kv_cache_manager/common/redis_client.h"
 
 namespace kv_cache_manager {

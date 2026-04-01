@@ -8,7 +8,6 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "kv_cache_manager/client/src/internal/sdk/hf3fs_cuda_util.h"
 #include "kv_cache_manager/client/src/internal/sdk/hf3fs_mempool.h"
 #include "kv_cache_manager/client/src/internal/sdk/hf3fs_usrbio_api.h"
 #include "kv_cache_manager/common/logger.h"
@@ -478,7 +477,7 @@ void Hf3fsUsrbioClient::DestroyIor(struct hf3fs_ior *ior) const {
 void Hf3fsUsrbioClient::CopyIovs(const std::vector<Iov> &iovs, const Hf3fsIovHandle &iov_handle, bool load) const {
     int64_t iov_offset = 0;
     auto iov_base = iov_handle.iov_base.get();
-    auto cuda_util = iov_handle.cuda_util;
+    auto gpu_util = iov_handle.gpu_util;
 
     for (const auto &iov : iovs) {
         if (iov.ignore) {
@@ -486,21 +485,29 @@ void Hf3fsUsrbioClient::CopyIovs(const std::vector<Iov> &iovs, const Hf3fsIovHan
         }
         if (load) {
             if (iov.type == MemoryType::GPU) {
-                cuda_util->CopyAsyncHostToDevice(iov.base, iov_base + iov_offset, iov.size);
+                if (gpu_util) {
+                    gpu_util->CopyAsyncHostToDevice(iov.base, iov_base + iov_offset, iov.size);
+                } else {
+                    KVCM_LOG_WARN("GPU iov copy skipped: gpu_util is null on handle");
+                }
             } else {
                 ::memcpy(iov.base, iov_base + iov_offset, iov.size);
             }
         } else {
             if (iov.type == MemoryType::GPU) {
-                cuda_util->CopyAsyncDeviceToHost(iov_base + iov_offset, iov.base, iov.size);
+                if (gpu_util) {
+                    gpu_util->CopyAsyncDeviceToHost(iov_base + iov_offset, iov.base, iov.size);
+                } else {
+                    KVCM_LOG_WARN("GPU iov copy skipped: gpu_util is null on handle");
+                }
             } else {
                 ::memcpy(iov_base + iov_offset, iov.base, iov.size);
             }
         }
         iov_offset += iov.size;
     }
-    if (cuda_util) {
-        cuda_util->Sync();
+    if (gpu_util) {
+        gpu_util->Sync();
     }
 }
 

@@ -303,7 +303,7 @@ TEST_F(SdkBufferCheckUtilTest, TestSdkBufferCheckPool) {
     push_buffer();
     auto handle = pool.GetCell();
     auto block_hashs = SdkBufferCheckUtil::GetBlocksHash(
-        block_buffers, handle->d_iovs, handle->d_crcs, handle->h_iovs, max_check_iov_num, handle->cuda_stream);
+        block_buffers, handle->d_iovs, handle->d_crcs, handle->h_iovs, max_check_iov_num, handle->gpu_stream);
     ASSERT_EQ(2, block_hashs.size());
     ASSERT_EQ(block_hashs[0], block_hashs[1]);
 #endif
@@ -352,7 +352,7 @@ TEST_F(SdkBufferCheckUtilTest, TestSdkBufferCheckPoolMultiThread) {
                                                              handle->d_crcs,
                                                              handle->h_iovs,
                                                              max_check_iov_num,
-                                                             handle->cuda_stream);
+                                                             handle->gpu_stream);
         ASSERT_EQ(1, block_hashs.size());
         expect = block_hashs[0];
     }
@@ -364,7 +364,7 @@ TEST_F(SdkBufferCheckUtilTest, TestSdkBufferCheckPoolMultiThread) {
                                                              handle->d_crcs,
                                                              handle->h_iovs,
                                                              max_check_iov_num,
-                                                             handle->cuda_stream);
+                                                             handle->gpu_stream);
         ASSERT_EQ(std::vector<int64_t>({expect}), block_hashs);
     };
     for (int i = 0; i < 20; ++i) {

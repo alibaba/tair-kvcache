@@ -1,7 +1,7 @@
 #include "kv_cache_manager/client/src/transfer_client_impl.h"
 
 #include <sstream>
-#ifdef USING_CUDA
+#if defined(USING_CUDA) || defined(USING_MUSA)
 #include "kv_cache_manager/client/src/internal/sdk/sdk_buffer_check_util.h"
 #include "kv_cache_manager/common/env_util.h"
 #endif
@@ -77,7 +77,7 @@ ClientErrorCode TransferClientImpl::Init(const std::string &client_config, const
             sdk_wrapper_.reset();
             return ec;
         }
-#ifdef USING_CUDA
+#if defined(USING_CUDA) || defined(USING_MUSA)
         is_check_buffer_ = EnvUtil::GetEnv("KVCM_SDK_CHECK", false);
         if (is_check_buffer_) {
             size_t sdk_check_cell_num = EnvUtil::GetEnv("KVCM_SDK_CHECK_CELL_NUM", 4);
@@ -131,14 +131,14 @@ ClientErrorCode TransferClientImpl::LoadKvCaches(const UriStrVec &uri_str_vec,
     if (ec != ER_OK) {
         return ec;
     }
-#ifdef USING_CUDA
+#if defined(USING_CUDA) || defined(USING_MUSA)
     if (is_check_buffer_) {
         bool need_print = (trace_info == nullptr) ? true : trace_info->need_print;
         std::vector<int64_t> block_hashs;
         if (need_print) {
             auto handle = sdk_buffer_check_pool_->GetCell();
             block_hashs = SdkBufferCheckUtil::GetBlocksHash(
-                block_buffers, handle->d_iovs, handle->d_crcs, handle->h_iovs, max_check_iov_num_, handle->cuda_stream);
+                block_buffers, handle->d_iovs, handle->d_crcs, handle->h_iovs, max_check_iov_num_, handle->gpu_stream);
         }
         PrintBlockHashAndUri("get_", uri_str_vec, block_hashs, trace_info);
     }
@@ -153,14 +153,14 @@ std::pair<ClientErrorCode, UriStrVec> TransferClientImpl::SaveKvCaches(const Uri
                    DebugStringUtil::ToString(uri_str_vec).c_str(),
                    DebugStringUtil::ToString(block_buffers).c_str());
     CHECK_SDK_WITH_TYPE();
-#ifdef USING_CUDA
+#if defined(USING_CUDA) || defined(USING_MUSA)
     if (is_check_buffer_) {
         bool need_print = (trace_info == nullptr) ? true : trace_info->need_print;
         std::vector<int64_t> block_hashs;
         if (need_print) {
             auto handle = sdk_buffer_check_pool_->GetCell();
             block_hashs = SdkBufferCheckUtil::GetBlocksHash(
-                block_buffers, handle->d_iovs, handle->d_crcs, handle->h_iovs, max_check_iov_num_, handle->cuda_stream);
+                block_buffers, handle->d_iovs, handle->d_crcs, handle->h_iovs, max_check_iov_num_, handle->gpu_stream);
         }
         PrintBlockHashAndUri("put_", uri_str_vec, block_hashs, trace_info);
     }

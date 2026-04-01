@@ -5,6 +5,7 @@ set -x
 SCRIPT_PATH=$(readlink -f "$0")
 SCRIPT_DIR=$(dirname "$SCRIPT_PATH")
 ROOT_PATH=${SCRIPT_DIR%/bin}
+KVCM_OPS_WHEEL_PATH=$ROOT_PATH/kvcm_ops-0.1.0-py3-none-any.whl
 BINARY_PATH=$ROOT_PATH/bin
 CONFIG_PATH=$ROOT_PATH/etc
 DEFAULT_SERVER_CONFIG=$CONFIG_PATH/default_server_config.conf
@@ -17,6 +18,7 @@ function start_server() {
 }
 
 function main() {
+    python3 -m pip install "$KVCM_OPS_WHEEL_PATH"
     start_server "$@"
 }
 

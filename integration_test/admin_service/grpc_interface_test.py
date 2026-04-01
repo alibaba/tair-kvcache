@@ -39,10 +39,13 @@ import integration_test.admin_service.admin_interface_cases as cases
 
 
 class AdminServiceGrpcClient(cases.AdminServiceClientBase):
-    def __init__(self, address: str):
+    DEFAULT_TIMEOUT = 5  # seconds
+
+    def __init__(self, address: str, timeout: int = None):
         self._address = address
         self._channel = grpc.insecure_channel(self._address)
         self._stub = AdminServiceStub(self._channel)
+        self._timeout = timeout if timeout is not None else self.DEFAULT_TIMEOUT
 
     def _convert_dict_to_proto(self, proto_class, data):
         return ParseDict(data, proto_class())
@@ -52,7 +55,7 @@ class AdminServiceGrpcClient(cases.AdminServiceClientBase):
 
     def add_storage(self, data, check_response=True):
         request = self._convert_dict_to_proto(AddStorageRequest, data)
-        response = self._stub.AddStorage(request)
+        response = self._stub.AddStorage(request, timeout=self._timeout)
         response_dict = self._convert_proto_to_dict(response)
         if check_response:
             if response_dict['header']['status']['code'] != "OK":
@@ -61,7 +64,7 @@ class AdminServiceGrpcClient(cases.AdminServiceClientBase):
 
     def enable_storage(self, data, check_response=True):
         request = self._convert_dict_to_proto(EnableStorageRequest, data)
-        response = self._stub.EnableStorage(request)
+        response = self._stub.EnableStorage(request, timeout=self._timeout)
         response_dict = self._convert_proto_to_dict(response)
         if check_response:
             if response_dict['header']['status']['code'] != "OK":
@@ -70,7 +73,7 @@ class AdminServiceGrpcClient(cases.AdminServiceClientBase):
 
     def disable_storage(self, data, check_response=True):
         request = self._convert_dict_to_proto(DisableStorageRequest, data)
-        response = self._stub.DisableStorage(request)
+        response = self._stub.DisableStorage(request, timeout=self._timeout)
         response_dict = self._convert_proto_to_dict(response)
         if check_response:
             if response_dict['header']['status']['code'] != "OK":
@@ -79,7 +82,7 @@ class AdminServiceGrpcClient(cases.AdminServiceClientBase):
 
     def remove_storage(self, data, check_response=True):
         request = self._convert_dict_to_proto(RemoveStorageRequest, data)
-        response = self._stub.RemoveStorage(request)
+        response = self._stub.RemoveStorage(request, timeout=self._timeout)
         response_dict = self._convert_proto_to_dict(response)
         if check_response:
             if response_dict['header']['status']['code'] != "OK":
@@ -88,7 +91,7 @@ class AdminServiceGrpcClient(cases.AdminServiceClientBase):
 
     def update_storage(self, data, check_response=True):
         request = self._convert_dict_to_proto(UpdateStorageRequest, data)
-        response = self._stub.UpdateStorage(request)
+        response = self._stub.UpdateStorage(request, timeout=self._timeout)
         response_dict = self._convert_proto_to_dict(response)
         if check_response:
             if response_dict['header']['status']['code'] != "OK":
@@ -97,7 +100,7 @@ class AdminServiceGrpcClient(cases.AdminServiceClientBase):
 
     def list_storage(self, data, check_response=True):
         request = self._convert_dict_to_proto(ListStorageRequest, data)
-        response = self._stub.ListStorage(request)
+        response = self._stub.ListStorage(request, timeout=self._timeout)
         response_dict = self._convert_proto_to_dict(response)
         if check_response:
             header = response_dict.get('header')
@@ -108,7 +111,7 @@ class AdminServiceGrpcClient(cases.AdminServiceClientBase):
 
     def create_instance_group(self, data, check_response=True):
         request = self._convert_dict_to_proto(CreateInstanceGroupRequest, data)
-        response = self._stub.CreateInstanceGroup(request)
+        response = self._stub.CreateInstanceGroup(request, timeout=self._timeout)
         response_dict = self._convert_proto_to_dict(response)
         if check_response:
             if response_dict['header']['status']['code'] != "OK":
@@ -117,7 +120,7 @@ class AdminServiceGrpcClient(cases.AdminServiceClientBase):
 
     def update_instance_group(self, data, check_response=True):
         request = self._convert_dict_to_proto(UpdateInstanceGroupRequest, data)
-        response = self._stub.UpdateInstanceGroup(request)
+        response = self._stub.UpdateInstanceGroup(request, timeout=self._timeout)
         response_dict = self._convert_proto_to_dict(response)
         if check_response:
             if response_dict['header']['status']['code'] != "OK":
@@ -126,7 +129,7 @@ class AdminServiceGrpcClient(cases.AdminServiceClientBase):
 
     def remove_instance_group(self, data, check_response=True):
         request = self._convert_dict_to_proto(RemoveInstanceGroupRequest, data)
-        response = self._stub.RemoveInstanceGroup(request)
+        response = self._stub.RemoveInstanceGroup(request, timeout=self._timeout)
         response_dict = self._convert_proto_to_dict(response)
         if check_response:
             if response_dict['header']['status']['code'] != "OK":
@@ -135,7 +138,7 @@ class AdminServiceGrpcClient(cases.AdminServiceClientBase):
 
     def get_instance_group(self, data, check_response=True):
         request = self._convert_dict_to_proto(GetInstanceGroupRequest, data)
-        response = self._stub.GetInstanceGroup(request)
+        response = self._stub.GetInstanceGroup(request, timeout=self._timeout)
         response_dict = self._convert_proto_to_dict(response)
         if check_response:
             header = response_dict.get('header')
@@ -146,7 +149,7 @@ class AdminServiceGrpcClient(cases.AdminServiceClientBase):
 
     def get_cache_meta(self, data, check_response=True):
         request = self._convert_dict_to_proto(GetCacheMetaRequest, data)
-        response = self._stub.GetCacheMeta(request)
+        response = self._stub.GetCacheMeta(request, timeout=self._timeout)
         response_dict = self._convert_proto_to_dict(response)
         if check_response:
             header = response_dict.get('header')
@@ -157,7 +160,7 @@ class AdminServiceGrpcClient(cases.AdminServiceClientBase):
 
     def remove_cache(self, data, check_response=True):
         request = self._convert_dict_to_proto(RemoveCacheRequest, data)
-        response = self._stub.RemoveCache(request)
+        response = self._stub.RemoveCache(request, timeout=self._timeout)
         response_dict = self._convert_proto_to_dict(response)
         if check_response:
             header = response_dict.get('header')
@@ -168,7 +171,7 @@ class AdminServiceGrpcClient(cases.AdminServiceClientBase):
 
     def register_instance(self, data, check_response=True):
         request = self._convert_dict_to_proto(RegisterInstanceRequest, data)
-        response = self._stub.RegisterInstance(request)
+        response = self._stub.RegisterInstance(request, timeout=self._timeout)
         response_dict = self._convert_proto_to_dict(response)
         if check_response:
             if response_dict['header']['status']['code'] != "OK":
@@ -177,7 +180,7 @@ class AdminServiceGrpcClient(cases.AdminServiceClientBase):
 
     def remove_instance(self, data, check_response=True):
         request = self._convert_dict_to_proto(RemoveInstanceRequest, data)
-        response = self._stub.RemoveInstance(request)
+        response = self._stub.RemoveInstance(request, timeout=self._timeout)
         response_dict = self._convert_proto_to_dict(response)
         if check_response:
             if response_dict['header']['status']['code'] != "OK":
@@ -186,7 +189,7 @@ class AdminServiceGrpcClient(cases.AdminServiceClientBase):
 
     def get_instance_info(self, data, check_response=True):
         request = self._convert_dict_to_proto(GetInstanceInfoRequest, data)
-        response = self._stub.GetInstanceInfo(request)
+        response = self._stub.GetInstanceInfo(request, timeout=self._timeout)
         response_dict = self._convert_proto_to_dict(response)
         if check_response:
             header = response_dict.get('header')
@@ -197,7 +200,7 @@ class AdminServiceGrpcClient(cases.AdminServiceClientBase):
 
     def list_instance_info(self, data, check_response=True):
         request = self._convert_dict_to_proto(ListInstanceInfoRequest, data)
-        response = self._stub.ListInstanceInfo(request)
+        response = self._stub.ListInstanceInfo(request, timeout=self._timeout)
         response_dict = self._convert_proto_to_dict(response)
         if check_response:
             header = response_dict.get('header')
@@ -208,7 +211,7 @@ class AdminServiceGrpcClient(cases.AdminServiceClientBase):
 
     def add_account(self, data, check_response=True):
         request = self._convert_dict_to_proto(AddAccountRequest, data)
-        response = self._stub.AddAccount(request)
+        response = self._stub.AddAccount(request, timeout=self._timeout)
         response_dict = self._convert_proto_to_dict(response)
         if check_response:
             if response_dict['header']['status']['code'] != "OK":
@@ -217,7 +220,7 @@ class AdminServiceGrpcClient(cases.AdminServiceClientBase):
 
     def delete_account(self, data, check_response=True):
         request = self._convert_dict_to_proto(DeleteAccountRequest, data)
-        response = self._stub.DeleteAccount(request)
+        response = self._stub.DeleteAccount(request, timeout=self._timeout)
         response_dict = self._convert_proto_to_dict(response)
         if check_response:
             if response_dict['header']['status']['code'] != "OK":
@@ -226,13 +229,13 @@ class AdminServiceGrpcClient(cases.AdminServiceClientBase):
 
     def list_account(self, data, check_response=True):
         request = self._convert_dict_to_proto(ListAccountRequest, data)
-        response = self._stub.ListAccount(request)
+        response = self._stub.ListAccount(request, timeout=self._timeout)
         response_dict = self._convert_proto_to_dict(response)
         return response_dict
 
     def gen_config_snapshot(self, data, check_response=True):
         request = self._convert_dict_to_proto(GenConfigSnapshotRequest, data)
-        response = self._stub.GenConfigSnapshot(request)
+        response = self._stub.GenConfigSnapshot(request, timeout=self._timeout)
         response_dict = self._convert_proto_to_dict(response)
         header = response_dict.get('header')
         if check_response and (not header or header['status']['code'] != "OK"):
@@ -242,7 +245,7 @@ class AdminServiceGrpcClient(cases.AdminServiceClientBase):
 
     def load_config_snapshot(self, data, check_response=True):
         request = self._convert_dict_to_proto(LoadConfigSnapshotRequest, data)
-        response = self._stub.LoadConfigSnapshot(request)
+        response = self._stub.LoadConfigSnapshot(request, timeout=self._timeout)
         response_dict = self._convert_proto_to_dict(response)
         if check_response:
             if response_dict['header']['status']['code'] != "OK":
@@ -251,7 +254,7 @@ class AdminServiceGrpcClient(cases.AdminServiceClientBase):
 
     def get_metrics(self, data, check_response=True):
         request = self._convert_dict_to_proto(GetMetricsRequest, data)
-        response = self._stub.GetMetrics(request)
+        response = self._stub.GetMetrics(request, timeout=self._timeout)
         response_dict = self._convert_proto_to_dict(response)
         header = response_dict.get('header')
         if check_response and (not header or header['status']['code'] != "OK"):
@@ -261,7 +264,7 @@ class AdminServiceGrpcClient(cases.AdminServiceClientBase):
 
     def check_health(self, data, check_response=True):
         request = self._convert_dict_to_proto(CheckHealthRequest, data)
-        response = self._stub.CheckHealth(request)
+        response = self._stub.CheckHealth(request, timeout=self._timeout)
         response_dict = self._convert_proto_to_dict(response)
         if check_response:
             header = response_dict.get('header')
@@ -272,7 +275,7 @@ class AdminServiceGrpcClient(cases.AdminServiceClientBase):
 
     def get_manager_cluster_info(self, data, check_response=True):
         request = self._convert_dict_to_proto(GetManagerClusterInfoRequest, data)
-        response = self._stub.GetManagerClusterInfo(request)
+        response = self._stub.GetManagerClusterInfo(request, timeout=self._timeout)
         response_dict = self._convert_proto_to_dict(response)
         if check_response:
             header = response_dict.get('header')
@@ -283,7 +286,7 @@ class AdminServiceGrpcClient(cases.AdminServiceClientBase):
 
     def leader_demote(self, data, check_response=True):
         request = self._convert_dict_to_proto(LeaderDemoteRequest, data)
-        response = self._stub.LeaderDemote(request)
+        response = self._stub.LeaderDemote(request, timeout=self._timeout)
         response_dict = self._convert_proto_to_dict(response)
         if check_response:
             if response_dict['header']['status']['code'] != "OK":
@@ -292,7 +295,7 @@ class AdminServiceGrpcClient(cases.AdminServiceClientBase):
 
     def get_leader_elector_config(self, data, check_response=True):
         request = self._convert_dict_to_proto(GetLeaderElectorConfigRequest, data)
-        response = self._stub.GetLeaderElectorConfig(request)
+        response = self._stub.GetLeaderElectorConfig(request, timeout=self._timeout)
         response_dict = self._convert_proto_to_dict(response)
         if check_response:
             header = response_dict.get('header')
@@ -303,7 +306,7 @@ class AdminServiceGrpcClient(cases.AdminServiceClientBase):
 
     def update_leader_elector_config(self, data, check_response=True):
         request = self._convert_dict_to_proto(UpdateLeaderElectorConfigRequest, data)
-        response = self._stub.UpdateLeaderElectorConfig(request)
+        response = self._stub.UpdateLeaderElectorConfig(request, timeout=self._timeout)
         response_dict = self._convert_proto_to_dict(response)
         if check_response:
             if response_dict['header']['status']['code'] != "OK":

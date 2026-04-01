@@ -25,11 +25,13 @@ import integration_test.meta_service.meta_interface_cases as cases
 
 class MetaServiceGrpcClient(cases.MetaServiceClientBase):
     """gRPC client for MetaService API endpoints"""
+    DEFAULT_TIMEOUT = 5  # seconds
 
-    def __init__(self, address):
+    def __init__(self, address, timeout=None):
         self._address = address
         self._channel = grpc.insecure_channel(self._address)
         self._stub = MetaServiceStub(self._channel)
+        self._timeout = timeout if timeout is not None else self.DEFAULT_TIMEOUT
 
     def _convert_dict_to_proto(self, proto_class, data):
         """Convert a dictionary to a protobuf message"""
@@ -43,7 +45,7 @@ class MetaServiceGrpcClient(cases.MetaServiceClientBase):
     def register_instance(self, data, check_response=True):
         """Register an instance with the service"""
         request = self._convert_dict_to_proto(RegisterInstanceRequest, data)
-        response = self._stub.RegisterInstance(request)
+        response = self._stub.RegisterInstance(request, timeout=self._timeout)
         response_dict = self._convert_proto_to_dict(response)
         if check_response:
             if response_dict['header']['status']['code'] != "OK":
@@ -54,7 +56,7 @@ class MetaServiceGrpcClient(cases.MetaServiceClientBase):
     def get_instance_info(self, data, check_response=True):
         """Get information about a registered instance"""
         request = self._convert_dict_to_proto(GetInstanceInfoRequest, data)
-        response = self._stub.GetInstanceInfo(request)
+        response = self._stub.GetInstanceInfo(request, timeout=self._timeout)
         response_dict = self._convert_proto_to_dict(response)
         if check_response:
             if response_dict['header']['status']['code'] != "OK":
@@ -65,7 +67,7 @@ class MetaServiceGrpcClient(cases.MetaServiceClientBase):
     def get_cache_location(self, data, check_response=True):
         """Get cache location for specified block keys"""
         request = self._convert_dict_to_proto(GetCacheLocationRequest, data)
-        response = self._stub.GetCacheLocation(request)
+        response = self._stub.GetCacheLocation(request, timeout=self._timeout)
         response_dict = self._convert_proto_to_dict(response)
         if check_response:
             if response_dict['header']['status']['code'] != "OK":
@@ -76,7 +78,7 @@ class MetaServiceGrpcClient(cases.MetaServiceClientBase):
     def start_write_cache(self, data, check_response=True):
         """Start writing cache data"""
         request = self._convert_dict_to_proto(StartWriteCacheRequest, data)
-        response = self._stub.StartWriteCache(request)
+        response = self._stub.StartWriteCache(request, timeout=self._timeout)
         response_dict = self._convert_proto_to_dict(response)
         if check_response:
             if response_dict['header']['status']['code'] != "OK":
@@ -87,7 +89,7 @@ class MetaServiceGrpcClient(cases.MetaServiceClientBase):
     def finish_write_cache(self, data, check_response=True):
         """Finish writing cache data"""
         request = self._convert_dict_to_proto(FinishWriteCacheRequest, data)
-        response = self._stub.FinishWriteCache(request)
+        response = self._stub.FinishWriteCache(request, timeout=self._timeout)
         response_dict = self._convert_proto_to_dict(response)
         if check_response:
             if response_dict['header']['status']['code'] != "OK":
@@ -98,7 +100,7 @@ class MetaServiceGrpcClient(cases.MetaServiceClientBase):
     def remove_cache(self, data, check_response=True):
         """Remove cache data for specified block keys"""
         request = self._convert_dict_to_proto(RemoveCacheRequest, data)
-        response = self._stub.RemoveCache(request)
+        response = self._stub.RemoveCache(request, timeout=self._timeout)
         response_dict = self._convert_proto_to_dict(response)
         if check_response:
             if response_dict['header']['status']['code'] != "OK":
@@ -109,7 +111,7 @@ class MetaServiceGrpcClient(cases.MetaServiceClientBase):
     def trim_cache(self, data, check_response=True):
         """Trim cache data based on specified strategy"""
         request = self._convert_dict_to_proto(TrimCacheRequest, data)
-        response = self._stub.TrimCache(request)
+        response = self._stub.TrimCache(request, timeout=self._timeout)
         response_dict = self._convert_proto_to_dict(response)
         if check_response:
             if response_dict['header']['status']['code'] != "OK":

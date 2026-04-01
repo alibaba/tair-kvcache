@@ -6,8 +6,10 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#ifdef USING_CUDA
+#if defined(USING_CUDA)
 #include "kv_cache_manager/client/src/internal/sdk/cuda_util.h"
+#elif defined(USING_MUSA)
+#include "kv_cache_manager/client/src/internal/sdk/musa_util.h"
 #endif
 #include "kv_cache_manager/client/src/internal/util/debug_string_util.h"
 #include "kv_cache_manager/common/logger.h"
@@ -16,9 +18,17 @@ namespace {
 class MmapHelper {
 public:
     MmapHelper(int fd, void *file_mem, size_t file_size) : fd_(fd), file_mem_(file_mem), file_size_(file_size) {}
-    kv_cache_manager::ClientErrorCode RegisterCuda(unsigned int register_flag) {
-#ifdef USING_CUDA
+    kv_cache_manager::ClientErrorCode RegisterGpu(unsigned int register_flag) {
+#if defined(USING_CUDA)
         CHECK_CUDA_ERROR_RETURN(cudaHostRegister(file_mem_, file_size_, register_flag),
+                                kv_cache_manager::ER_CUDA_HOST_REGISTER_ERROR,
+                                "register host mem [%p] fail, size: %zu, register_flag: %u",
+                                file_mem_,
+                                file_size_,
+                                register_flag);
+        is_mem_registered = true;
+#elif defined(USING_MUSA)
+        CHECK_MUSA_ERROR_RETURN(musaHostRegister(file_mem_, file_size_, register_flag),
                                 kv_cache_manager::ER_CUDA_HOST_REGISTER_ERROR,
                                 "register host mem [%p] fail, size: %zu, register_flag: %u",
                                 file_mem_,
@@ -30,9 +40,13 @@ public:
     }
 
     ~MmapHelper() {
-#ifdef USING_CUDA
+#if defined(USING_CUDA)
         if (is_mem_registered) {
             CHECK_CUDA_ERROR(cudaHostUnregister(file_mem_), "unregister host mem [%p] fail", file_mem_);
+        }
+#elif defined(USING_MUSA)
+        if (is_mem_registered) {
+            CHECK_MUSA_ERROR(musaHostUnregister(file_mem_), "unregister host mem [%p] fail", file_mem_);
         }
 #endif
         munmap(file_mem_, file_size_);
@@ -43,7 +57,7 @@ private:
     int fd_;
     void *file_mem_;
     size_t file_size_;
-#ifdef USING_CUDA
+#if defined(USING_CUDA) || defined(USING_MUSA)
     bool is_mem_registered = false;
 #endif
 };
@@ -52,9 +66,13 @@ private:
 namespace kv_cache_manager {
 
 LocalFileSdk::~LocalFileSdk() {
-#ifdef USING_CUDA
+#if defined(USING_CUDA)
     if (cuda_stream_) {
         CHECK_CUDA_ERROR(cudaStreamDestroy(cuda_stream_), "destroy cuda stream error");
+    }
+#elif defined(USING_MUSA)
+    if (musa_stream_) {
+        CHECK_MUSA_ERROR(musaStreamDestroy(musa_stream_), "destroy musa stream error");
     }
 #endif
 }
@@ -77,8 +95,12 @@ ClientErrorCode LocalFileSdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_
         KVCM_LOG_WARN("Init local file sdk failed, invalid byte_size_per_block [%ld]", byte_size_per_block_);
         return ER_INVALID_SDKBACKEND_CONFIG;
     }
-#ifdef USING_CUDA
+#if defined(USING_CUDA)
     CHECK_CUDA_ERROR_RETURN(cudaStreamCreateWithFlags(&cuda_stream_, cudaStreamNonBlocking),
+                            ER_CUDA_STREAM_CREATE_ERROR,
+                            "Init local file sdk failed");
+#elif defined(USING_MUSA)
+    CHECK_MUSA_ERROR_RETURN(musaStreamCreateWithFlags(&musa_stream_, musaStreamNonBlocking),
                             ER_CUDA_STREAM_CREATE_ERROR,
                             "Init local file sdk failed");
 #endif
@@ -193,8 +215,14 @@ ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_ur
         return ER_FILE_IO_ERROR;
     }
     MmapHelper helper(fd, file_mem, file_size);
-#ifdef USING_CUDA
-    auto register_ec = helper.RegisterCuda(cudaHostRegisterReadOnly);
+#if defined(USING_CUDA)
+    auto register_ec = helper.RegisterGpu(cudaHostRegisterReadOnly);
+    if (register_ec != ER_OK) {
+        return register_ec;
+    }
+    bool exist_gpu_iov = false;
+#elif defined(USING_MUSA)
+    auto register_ec = helper.RegisterGpu(musaHostRegisterReadOnly);
     if (register_ec != ER_OK) {
         return register_ec;
     }
@@ -231,12 +259,18 @@ ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_ur
                 if (iov.type == MemoryType::CPU) {
                     std::memcpy(iov.base, src + offset, iov.size);
                 } else if (iov.type == MemoryType::GPU) {
-#ifdef USING_CUDA
+#if defined(USING_CUDA)
                     exist_gpu_iov = true;
                     CHECK_CUDA_ERROR_RETURN(
                         cudaMemcpyAsync(iov.base, src + offset, iov.size, cudaMemcpyHostToDevice, cuda_stream_),
                         ER_CUDAMEMCPY_ERROR,
                         "cuda memcpy async fail");
+#elif defined(USING_MUSA)
+                    exist_gpu_iov = true;
+                    CHECK_MUSA_ERROR_RETURN(
+                        musaMemcpyAsync(iov.base, src + offset, iov.size, musaMemcpyHostToDevice, musa_stream_),
+                        ER_CUDAMEMCPY_ERROR,
+                        "musa memcpy async fail");
 #endif
                 }
             }
@@ -244,10 +278,15 @@ ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_ur
         }
     }
 
-#ifdef USING_CUDA
+#if defined(USING_CUDA)
     if (exist_gpu_iov) {
         CHECK_CUDA_ERROR_RETURN(
             cudaStreamSynchronize(cuda_stream_), ER_CUDA_STREAM_SYNCHRONIZE_ERROR, "cuda stream synchronize fail");
+    }
+#elif defined(USING_MUSA)
+    if (exist_gpu_iov) {
+        CHECK_MUSA_ERROR_RETURN(
+            musaStreamSynchronize(musa_stream_), ER_CUDA_STREAM_SYNCHRONIZE_ERROR, "musa stream synchronize fail");
     }
 #endif
 
@@ -313,8 +352,14 @@ ClientErrorCode LocalFileSdk::DoPut(const std::vector<DataStorageUri> &remote_ur
                    required_size,
                    DebugStringUtil::ToString(local_buffers).c_str());
     MmapHelper helper(fd, file_mem, required_size);
-#ifdef USING_CUDA
-    auto register_ec = helper.RegisterCuda(cudaHostRegisterDefault);
+#if defined(USING_CUDA)
+    auto register_ec = helper.RegisterGpu(cudaHostRegisterDefault);
+    if (register_ec != ER_OK) {
+        return register_ec;
+    }
+    bool exist_gpu_iov = false;
+#elif defined(USING_MUSA)
+    auto register_ec = helper.RegisterGpu(musaHostRegisterDefault);
     if (register_ec != ER_OK) {
         return register_ec;
     }
@@ -339,22 +384,33 @@ ClientErrorCode LocalFileSdk::DoPut(const std::vector<DataStorageUri> &remote_ur
                 if (iov.type == MemoryType::CPU) {
                     std::memcpy(dst + offset, iov.base, iov.size);
                 } else if (iov.type == MemoryType::GPU) {
-#ifdef USING_CUDA
+#if defined(USING_CUDA)
                     exist_gpu_iov = true;
                     CHECK_CUDA_ERROR_RETURN(
                         cudaMemcpyAsync(dst + offset, iov.base, iov.size, cudaMemcpyDeviceToHost, cuda_stream_),
                         ER_CUDAMEMCPY_ERROR,
                         "cuda memcpy async fail");
+#elif defined(USING_MUSA)
+                    exist_gpu_iov = true;
+                    CHECK_MUSA_ERROR_RETURN(
+                        musaMemcpyAsync(dst + offset, iov.base, iov.size, musaMemcpyDeviceToHost, musa_stream_),
+                        ER_CUDAMEMCPY_ERROR,
+                        "musa memcpy async fail");
 #endif
                 }
             }
             offset += iov.size;
         }
     }
-#ifdef USING_CUDA
+#if defined(USING_CUDA)
     if (exist_gpu_iov) {
         CHECK_CUDA_ERROR_RETURN(
             cudaStreamSynchronize(cuda_stream_), ER_CUDA_STREAM_SYNCHRONIZE_ERROR, "cuda stream synchronize fail");
+    }
+#elif defined(USING_MUSA)
+    if (exist_gpu_iov) {
+        CHECK_MUSA_ERROR_RETURN(
+            musaStreamSynchronize(musa_stream_), ER_CUDA_STREAM_SYNCHRONIZE_ERROR, "musa stream synchronize fail");
     }
 #endif
     if (msync(file_mem, required_size, MS_SYNC) != 0) {
