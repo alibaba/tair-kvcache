@@ -20,7 +20,7 @@ hisim_hook.install_class_hooks(
         sglang_hook.C_StorageBackendFactory,
         sglang_hook.C_HiCacheController,
         sglang_hook.C_HiRadixCacheHook,
-        tokenizer_manager.C_TokenizerManagerHook
+        tokenizer_manager.C_TokenizerManagerHook,
     ]
 )
 

@@ -11,7 +11,8 @@ class IndexableWrapper:
 
     def __call__(self, *args, **kwargs):
         return self._fn(*args, **kwargs)
-    
+
+
 def alloc_extend_cpu(
     pre_lens_ptr: torch.Tensor,
     seq_lens_ptr: torch.Tensor,
@@ -158,9 +159,11 @@ class C_PagedTokenToKVPoolAllocatorHook(BaseHook):
     @classmethod
     def hook(cls, target):
         original_init = target.__init__
+
         def wrapped_init(self, *args, **kwargs):
 
             from sglang.srt.mem_cache import allocator
+
             # triton kernels are not compatible with the CPU allocator, so we use python implementation instead.
             allocator.alloc_extend_kernel = IndexableWrapper(alloc_extend_cpu)
             allocator.alloc_decode_kernel = IndexableWrapper(alloc_decode_cpu)
@@ -168,5 +171,3 @@ class C_PagedTokenToKVPoolAllocatorHook(BaseHook):
             original_init(self, *args, **kwargs)
 
         target.__init__ = wrapped_init
-
-

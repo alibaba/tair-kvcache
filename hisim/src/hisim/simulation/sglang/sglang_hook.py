@@ -25,7 +25,6 @@ from hisim.time_predictor import (
     ScheduleBatch as HisimScheduleBatch,
 )
 from hisim.simulation.sglang.sglang_mock_class import (
-    MockTokenToKVPoolHost,
     MockHiCacheStorage,
 )
 from hisim.simulation.utils import (
@@ -121,6 +120,7 @@ class C_ModelRunnerHook(BaseHook):
             self.num_effective_layers = self.end_layer - self.start_layer
 
             from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+
             self.req_to_token_pool = ReqToTokenPool(
                 size=max_num_reqs,
                 max_context_len=model.max_seq_len,
@@ -128,11 +128,12 @@ class C_ModelRunnerHook(BaseHook):
                 enable_memory_saver=False,
             )
 
-            # During simulation, the actual data in kv cache pool is not important since the MHA computation is skipped, 
+            # During simulation, the actual data in kv cache pool is not important since the MHA computation is skipped,
             # so the head_num and head_dim can be set to 1 to reduce the memory usage.
-            # And the scheduler only matters about whether the token_to_kv_pool can be allocated enough space for the requests, 
+            # And the scheduler only matters about whether the token_to_kv_pool can be allocated enough space for the requests,
             # so the pool's implementation is not important and can be replaced with `MHATokenToKVPool` that only simulates the allocation logic.
             from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
             self.token_to_kv_pool = MHATokenToKVPool(
                 self.max_total_num_tokens,
                 page_size=self.page_size,
@@ -144,11 +145,12 @@ class C_ModelRunnerHook(BaseHook):
                 enable_memory_saver=self.server_args.enable_memory_saver,
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
-                enable_alt_stream=False
+                enable_alt_stream=False,
             )
 
             if self.page_size == 1:
                 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+
                 self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
                     size=self.max_total_num_tokens,
                     dtype=self.kv_cache_dtype,
@@ -158,6 +160,7 @@ class C_ModelRunnerHook(BaseHook):
                 )
             else:
                 from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
+
                 self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
                     size=self.max_total_num_tokens,
                     page_size=self.page_size,
@@ -433,7 +436,9 @@ class C_HiRadixCacheHook(BaseHook):
             self.page_size = params.page_size
             self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
             # Replace the host pool
-            self.token_to_kv_pool_host = MockTokenToKVPoolHost(
+            from sglang.srt.mem_cache.memory_pool_host import MHATokenToKVPoolHost
+
+            self.token_to_kv_pool_host = MHATokenToKVPoolHost(
                 self.kv_cache,
                 server_args.hicache_ratio,
                 server_args.hicache_size,
