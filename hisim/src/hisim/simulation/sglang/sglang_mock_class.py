@@ -11,9 +11,6 @@ from functools import wraps
 
 from hisim.utils.logger import get_logger
 from hisim.simulation.manager import StateManager, ConfigManager, Envs
-from sglang.srt.mem_cache.hicache_storage import (
-    HiCacheStorageExtraInfo,
-)
 from hisim.simulation.sglang.version import VersionDispatcher
 
 try:
@@ -1100,7 +1097,7 @@ class MockHiCacheStorage:
         self,
         keys: List[str],
         values: Optional[Any] = None,
-        extra_info: HiCacheStorageExtraInfo = None,
+        extra_info = None,  # HiCacheStorageExtraInfo
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> bool:
