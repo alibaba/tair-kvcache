@@ -605,7 +605,7 @@ TEST_F(DataStorageSelectorTest, TestSelectCacheWriteStorageBackendQuota01) {
         meta_indexer_g->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 512);
 
         InstanceGroupQuota quota;
-        quota.set_capacity(1025);                                      // quota_capacity > group_used_size
+        quota.set_capacity(1025); // quota_capacity > group_used_size
         QuotaConfig qc(511, DataStorageType::DATA_STORAGE_TYPE_HF3FS); // hf3fs quota 511 < 512
         quota.set_quota_config({qc});
         instance_group_g->set_quota(quota);

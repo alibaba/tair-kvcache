@@ -230,8 +230,7 @@ ErrorCode MetaLocalBackend::IncrFieldsForOneKey(const KeyType &key,
         KVCM_LOG_WARN("incr fields fail, cannot find key[%ld]", key);
         return EC_NOENT;
     }
-    if (ec != EC_OK)
-        return ec;
+    if (ec != EC_OK) return ec;
     return PersistToPath();
 }
 
