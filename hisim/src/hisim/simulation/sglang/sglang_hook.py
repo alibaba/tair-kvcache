@@ -25,7 +25,6 @@ from hisim.time_predictor import (
     ScheduleBatch as HisimScheduleBatch,
 )
 from hisim.simulation.sglang.sglang_mock_class import (
-    MockReqToTokenPool,
     MockTokenToKVPool,
     MockTokenToKVPoolAllocator,
     MockPagedTokenToKVPoolAllocator,
@@ -54,29 +53,6 @@ class C_EngineHook(BaseHook):
             )
 
         target.clear_hicache_storage = hook_clear_hicache_storage
-
-
-class C_TokenizerManagerHook(BaseHook):
-    HOOK_CLASS_NAME = "TokenizerManager"
-    HOOK_MODULE_NAME = "sglang.srt.managers.tokenizer_manager"
-
-    @classmethod
-    def hook(cls, target):
-        original_send_one_request = target._send_one_request
-
-        # When running with blocking mode, send the created time to schedule.
-        def wrapped_send_one_request(self, obj, tokenized_obj, created_time):
-            if obj.__class__.__name__ == "GenerateReqInput":
-                if (
-                    tokenized_obj.sampling_params.custom_params is not None
-                    and "simulation" in tokenized_obj.sampling_params.custom_params
-                ):
-                    tokenized_obj.sampling_params.custom_params["simulation"][
-                        "server_created_time"
-                    ] = created_time
-            return original_send_one_request(self, obj, tokenized_obj, created_time)
-
-        target._send_one_request = wrapped_send_one_request
 
 
 class C_ModelRunnerHook(BaseHook):
@@ -147,26 +123,31 @@ class C_ModelRunnerHook(BaseHook):
             self.end_layer = getattr(self.model, "end_layer", model_num_layers)
             self.num_effective_layers = self.end_layer - self.start_layer
 
-            self.req_to_token_pool = MockReqToTokenPool(
+            from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+            self.req_to_token_pool = ReqToTokenPool(
                 size=max_num_reqs,
                 max_context_len=model.max_seq_len,
                 device=self.device,
                 enable_memory_saver=False,
             )
 
-            self.token_to_kv_pool = MockTokenToKVPool(
+            # During simulation, the actual data in kv cache pool is not important since the MHA computation is skipped, 
+            # so the head_num and head_dim can be set to 1 to reduce the memory usage.
+            # And the scheduler only matters about whether the token_to_kv_pool can be allocated enough space for the requests, 
+            # so the pool's implementation is not important and can be replaced with `MHATokenToKVPool` that only simulates the allocation logic.
+            from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+            self.token_to_kv_pool = MHATokenToKVPool(
                 self.max_total_num_tokens,
                 page_size=self.page_size,
                 dtype=self.kv_cache_dtype,
-                head_num=self.model_config.get_num_kv_heads(
-                    1  # get_attention_tp_size()
-                ),
-                head_dim=self.model_config.head_dim,
+                head_num=1,  # Overwrite head_num and head_dim to 1.
+                head_dim=1,
                 layer_num=self.num_effective_layers,
                 device=self.device,
                 enable_memory_saver=self.server_args.enable_memory_saver,
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
+                enable_alt_stream=False
             )
 
             if self.page_size == 1:
@@ -492,10 +473,6 @@ class C_HiRadixCacheHook(BaseHook):
                 importlib.import_module("sglang.srt.managers.cache_controller"),
                 "HiCacheController",
             )
-            StorageMetricsCollector = getattr(
-                importlib.import_module("sglang.srt.metrics.collector"),
-                "StorageMetricsCollector",
-            )
 
             self.load_cache_event = threading.Event()
             self.cache_controller = HiCacheController(
@@ -518,6 +495,10 @@ class C_HiRadixCacheHook(BaseHook):
                     "tp_rank": self.cache_controller.tp_rank,
                     "dp_rank": self.cache_controller.dp_rank,
                 }
+                StorageMetricsCollector = getattr(
+                    importlib.import_module("sglang.srt.metrics.collector"),
+                    "StorageMetricsCollector",
+                )
                 self.storage_metrics_collector = StorageMetricsCollector(labels=labels)
 
             # Record the nodes with ongoing write-through

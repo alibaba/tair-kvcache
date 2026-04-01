@@ -4,7 +4,7 @@ import sys
 import argparse
 import torch
 import hisim.hook as hisim_hook
-from hisim.simulation.sglang import sgl_kernel_hook, sglang_hook
+from hisim.simulation.sglang import sgl_kernel_hook, sglang_hook, tokenizer_manager
 from hisim.simulation.sim_args import SimulationArgs
 from hisim.utils import get_logger
 
@@ -17,10 +17,10 @@ hisim_hook.install_class_hooks(
     [
         sglang_hook.C_SchedulerHook,
         sglang_hook.C_ModelRunnerHook,
-        sglang_hook.C_TokenizerManagerHook,
         sglang_hook.C_StorageBackendFactory,
         sglang_hook.C_HiCacheController,
         sglang_hook.C_HiRadixCacheHook,
+        tokenizer_manager.C_TokenizerManagerHook
     ]
 )
 

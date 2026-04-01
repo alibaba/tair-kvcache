@@ -28,7 +28,6 @@ hisim_hook.install_class_hooks(
     [
         sglang_hook.C_SchedulerHook,
         sglang_hook.C_ModelRunnerHook,
-        sglang_hook.C_TokenizerManagerHook,
         sglang_hook.C_StorageBackendFactory,
         sglang_hook.C_HiCacheController,
         sglang_hook.C_HiRadixCacheHook,
