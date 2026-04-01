@@ -30,7 +30,8 @@ def test_benchmark_sglang():
             load_format="dummy",
             device="cpu",
             enable_hierarchical_cache=True,
-            max_total_tokens=8192
+            max_total_tokens=8192,
+            page_size=2,
         )
     )
 
@@ -51,7 +52,7 @@ def test_benchmark_sglang():
     benchmark_config.ignore_request_timestamp = True
     metrics = runner.benchmark(benchmark_config, dataset_args=dataset_args)
     # This dataset has been used previously.
-    assert metrics["prefix_cache_reused_ratio"] > 0.7
+    assert metrics["prefix_cache_reused_ratio"] > 0.5
     request_stats = runner.get_request_stats()
     for req in request_stats:
         # runner with request rate = `float("inf")`

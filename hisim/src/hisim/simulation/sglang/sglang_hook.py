@@ -25,9 +25,6 @@ from hisim.time_predictor import (
     ScheduleBatch as HisimScheduleBatch,
 )
 from hisim.simulation.sglang.sglang_mock_class import (
-    MockTokenToKVPool,
-    MockTokenToKVPoolAllocator,
-    MockPagedTokenToKVPoolAllocator,
     MockTokenToKVPoolHost,
     MockHiCacheStorage,
 )
@@ -151,16 +148,17 @@ class C_ModelRunnerHook(BaseHook):
             )
 
             if self.page_size == 1:
-                self.token_to_kv_pool_allocator = MockTokenToKVPoolAllocator(
+                from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
+                self.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
                     size=self.max_total_num_tokens,
-                    page_size=1,
                     dtype=self.kv_cache_dtype,
                     device=self.device,
                     kvcache=self.token_to_kv_pool,
                     need_sort=False,
                 )
             else:
-                self.token_to_kv_pool_allocator = MockPagedTokenToKVPoolAllocator(
+                from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
+                self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
                     size=self.max_total_num_tokens,
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
