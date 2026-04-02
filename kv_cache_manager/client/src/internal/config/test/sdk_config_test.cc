@@ -158,19 +158,19 @@ TEST_F(SdkBackendConfigTest, TestSdkBackendConfigEquality) {
     config1.set_type(DataStorageType::DATA_STORAGE_TYPE_HF3FS);
     config1.set_sdk_log_file_path("log1.txt");
     config1.set_sdk_log_level("DEBUG");
-    config1.set_byte_size_per_block(1024);
+    config1.set_spec_byte_sizes_per_block({{"default", 1024}});
 
     SdkBackendConfig config2;
     config2.set_type(DataStorageType::DATA_STORAGE_TYPE_HF3FS);
     config2.set_sdk_log_file_path("log1.txt");
     config2.set_sdk_log_level("DEBUG");
-    config2.set_byte_size_per_block(1024);
+    config2.set_spec_byte_sizes_per_block({{"default", 1024}});
 
     SdkBackendConfig config3;
     config3.set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
     config3.set_sdk_log_file_path("log1.txt");
     config3.set_sdk_log_level("DEBUG");
-    config3.set_byte_size_per_block(1024);
+    config3.set_spec_byte_sizes_per_block({{"default", 1024}});
 
     // Test equality
     ASSERT_TRUE(config1 == config2);
@@ -251,19 +251,19 @@ TEST_F(SdkBackendConfigTest, TestTairMempoolSdkConfigEquality) {
     config1.set_type(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL);
     config1.set_sdk_log_file_path("tair.log");
     config1.set_sdk_log_level("INFO");
-    config1.set_byte_size_per_block(2048);
+    config1.set_spec_byte_sizes_per_block({{"default", 2048}});
 
     TairMempoolSdkConfig config2;
     config2.set_type(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL);
     config2.set_sdk_log_file_path("tair.log");
     config2.set_sdk_log_level("INFO");
-    config2.set_byte_size_per_block(2048);
+    config2.set_spec_byte_sizes_per_block({{"default", 2048}});
 
     TairMempoolSdkConfig config3;
     config3.set_type(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL);
     config3.set_sdk_log_file_path("tair.log");
     config3.set_sdk_log_level("DEBUG"); // Different value
-    config3.set_byte_size_per_block(2048);
+    config3.set_spec_byte_sizes_per_block({{"default", 2048}});
 
     // Test equality
     ASSERT_TRUE(config1 == config2);
@@ -283,19 +283,19 @@ TEST_F(SdkBackendConfigTest, TestNfsSdkConfigEquality) {
     config1.set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
     config1.set_sdk_log_file_path("nfs.log");
     config1.set_sdk_log_level("DEBUG");
-    config1.set_byte_size_per_block(4096);
+    config1.set_spec_byte_sizes_per_block({{"default", 4096}});
 
     NfsSdkConfig config2;
     config2.set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
     config2.set_sdk_log_file_path("nfs.log");
     config2.set_sdk_log_level("DEBUG");
-    config2.set_byte_size_per_block(4096);
+    config2.set_spec_byte_sizes_per_block({{"default", 4096}});
 
     NfsSdkConfig config3;
     config3.set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
     config3.set_sdk_log_file_path("nfs.log");
     config3.set_sdk_log_level("INFO"); // Different value
-    config3.set_byte_size_per_block(4096);
+    config3.set_spec_byte_sizes_per_block({{"default", 4096}});
 
     // Test equality
     ASSERT_TRUE(config1 == config2);
