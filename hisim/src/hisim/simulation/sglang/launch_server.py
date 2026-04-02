@@ -24,7 +24,6 @@ if not torch.cuda.is_available():
 hisim_hook.install_class_hooks(
     [
         scheduler.C_SchedulerHook,
-        scheduler.C_ModelRunnerHook,
         model_runner.C_ModelRunnerHook,
         hicache_storage.C_StorageBackendFactory,
         cache_controller.C_HiCacheController,
