@@ -4,7 +4,15 @@ import sys
 import argparse
 import torch
 import hisim.hook as hisim_hook
-from hisim.simulation.sglang import sgl_kernel_hook, sglang_hook, tokenizer_manager, hiradix_cache, hicache_storage, cache_controller
+from hisim.simulation.sglang import (
+    scheduler,
+    sgl_kernel_hook,
+    tokenizer_manager,
+    hiradix_cache,
+    hicache_storage,
+    cache_controller,
+    model_runner,
+)
 from hisim.simulation.sim_args import SimulationArgs
 from hisim.utils import get_logger
 
@@ -15,8 +23,9 @@ if not torch.cuda.is_available():
     hisim_hook.install_module_hooks([sgl_kernel_hook.M_SGLangKernelLoadUtilHook])
 hisim_hook.install_class_hooks(
     [
-        sglang_hook.C_SchedulerHook,
-        sglang_hook.C_ModelRunnerHook,
+        scheduler.C_SchedulerHook,
+        scheduler.C_ModelRunnerHook,
+        model_runner.C_ModelRunnerHook,
         hicache_storage.C_StorageBackendFactory,
         cache_controller.C_HiCacheController,
         hiradix_cache.C_HiRadixCacheHook,

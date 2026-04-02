@@ -16,8 +16,9 @@ from hisim.simulation.sglang import (
     hicache_storage,
     hiradix_cache,
     cache_controller,
+    scheduler,
+    model_runner,
 )
-from hisim.simulation.sglang import sglang_hook
 from hisim.simulation.base.runner import BaseBenchmarkRunner
 from hisim.simulation.types import BenchmarkConfig
 from hisim.dataset import (
@@ -33,8 +34,8 @@ if not torch.cuda.is_available():
     hisim_hook.install_module_hooks([sgl_kernel_hook.M_SGLangKernelLoadUtilHook])
 hisim_hook.install_class_hooks(
     [
-        sglang_hook.C_SchedulerHook,
-        sglang_hook.C_ModelRunnerHook,
+        scheduler.C_SchedulerHook,
+        model_runner.C_ModelRunnerHook,
         hicache_storage.C_StorageBackendFactory,
         cache_controller.C_HiCacheController,
         hiradix_cache.C_HiRadixCacheHook,
@@ -84,8 +85,8 @@ class SGLangBenchmarkRunner(BaseBenchmarkRunner):
     def flush_cache(self):
         self.engine.flush_cache()
 
-    def reset_storage_cache(self):
-        self.engine.clear_hicache_storage()
+    def clear_hicache_storage(self):
+        self.engine.tokenizer_manager.clear_hicache_storage()
 
     def get_request(
         self,

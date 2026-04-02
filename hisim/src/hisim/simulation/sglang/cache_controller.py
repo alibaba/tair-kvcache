@@ -2,7 +2,7 @@ from queue import Empty
 
 from hisim.hook import BaseHook
 from hisim.simulation.manager import StateManager, ConfigManager
-from hisim.simulation.sglang.sglang_hook import C_SchedulerHook
+from hisim.simulation.sglang.scheduler import C_SchedulerHook
 
 
 class C_HiCacheController(BaseHook):
