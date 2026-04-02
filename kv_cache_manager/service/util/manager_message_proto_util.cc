@@ -156,6 +156,8 @@ void ProtoConvert::CacheConfigToProto(const CacheConfig &cache_config_info,
         meta_indexer_config->set_max_key_count(origin_meta_indexer_config->GetMaxKeyCount());
         meta_indexer_config->set_mutex_shard_num(origin_meta_indexer_config->GetMutexShardNum());
         meta_indexer_config->set_batch_key_size(origin_meta_indexer_config->GetBatchKeySize());
+        meta_indexer_config->mutable_persist_metadata_interval_time_ms()->set_value(
+            origin_meta_indexer_config->GetPersistMetaDataIntervalTimeMs());
 
         // 转换meta_storage_backend_config
         auto origin_meta_storage_backend_config = origin_meta_indexer_config->GetMetaStorageBackendConfig();
@@ -207,6 +209,10 @@ void ProtoConvert::CacheConfigFromProto(const proto::admin::CacheConfig *proto_c
     meta_indexer_config->SetMaxKeyCount(proto_cache_config->meta_indexer_config().max_key_count());
     meta_indexer_config->SetMutexShardNum(proto_cache_config->meta_indexer_config().mutex_shard_num());
     meta_indexer_config->SetBatchKeySize(proto_cache_config->meta_indexer_config().batch_key_size());
+    if (proto_cache_config->meta_indexer_config().has_persist_metadata_interval_time_ms()) {
+        meta_indexer_config->SetPersistMetaDataIntervalTimeMs(
+            proto_cache_config->meta_indexer_config().persist_metadata_interval_time_ms().value());
+    }
 
     // 转换meta_storage_backend_config
     auto meta_storage_backend_config = std::make_shared<MetaStorageBackendConfig>();

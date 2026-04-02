@@ -34,6 +34,7 @@ public:
         : max_key_count_(max_key_count)
         , mutex_shard_num_(mutex_shard_num)
         , batch_key_size_(batch_key_size)
+        , persist_metadata_interval_time_ms_(kDefaultPersistMetaDataIntervalTimeMs)
         , meta_storage_backend_config_(meta_storage_backend_config)
         , meta_cache_policy_config_(meta_cache_policy_config) {}
 
@@ -83,6 +84,7 @@ public:
         Put(writer, "max_key_count", max_key_count_);
         Put(writer, "mutex_shard_num", mutex_shard_num_);
         Put(writer, "batch_key_size", batch_key_size_);
+        Put(writer, "persist_metadata_interval_time_ms", persist_metadata_interval_time_ms_);
         Put(writer, "meta_storage_backend_config", meta_storage_backend_config_);
         Put(writer, "meta_cache_policy_config", meta_cache_policy_config_);
     }
