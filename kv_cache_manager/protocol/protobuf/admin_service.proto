@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package kv_cache_manager.proto.admin;
 
+import "google/protobuf/wrappers.proto";
+
 option cc_generic_services = false;
 
 enum ErrorCode {
@@ -199,6 +201,10 @@ message MetaIndexerConfig {
     int64 batch_key_size = 3;
     MetaStorageBackendConfig meta_storage_backend_config = 4;
     MetaCachePolicyConfig meta_cache_policy_config = 5;
+    // google.protobuf.Int64Value as a wrapper for tracking presence of
+    // scalar fields in older proto3 versions (v3.12.0, before which
+    // the "optional" keyword is not available)
+    google.protobuf.Int64Value persist_metadata_interval_time_ms = 6;
 }
 
 message SystemStorageConfig {
