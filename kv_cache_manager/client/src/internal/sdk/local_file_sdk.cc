@@ -90,9 +90,9 @@ ClientErrorCode LocalFileSdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_
         KVCM_LOG_WARN("Init local file sdk failed, sdk backend config is null");
         return ER_INVALID_SDKBACKEND_CONFIG;
     }
-    byte_size_per_block_ = sdk_backend_config->byte_size_per_block();
-    if (byte_size_per_block_ <= 0) {
-        KVCM_LOG_WARN("Init local file sdk failed, invalid byte_size_per_block [%ld]", byte_size_per_block_);
+    spec_byte_sizes_per_block_ = sdk_backend_config->spec_byte_sizes_per_block();
+    if (spec_byte_sizes_per_block_.empty()) {
+        KVCM_LOG_WARN("Init local file sdk failed, spec_byte_sizes_per_block is empty");
         return ER_INVALID_SDKBACKEND_CONFIG;
     }
 #if defined(USING_CUDA)
@@ -240,14 +240,24 @@ ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_ur
             return ER_INVALID_PARAMS;
         }
         auto item = LocalFileItem::FromUri(remote_uri);
-        if (byte_size_per_block_ != item.size) {
-            KVCM_LOG_ERROR("Get failed, byte_size_per_block_ [%ld] not equal to uri size [%zu], origin uri: [%s]",
-                           byte_size_per_block_,
+
+        // 防御性校验：URI 的 size 必须在允许的 spec 范围内
+        bool size_valid = false;
+        for (const auto &[spec_name, byte_size_per_block] : spec_byte_sizes_per_block_) {
+            if (item.size == byte_size_per_block) {
+                size_valid = true;
+                break;
+            }
+        }
+        if (!size_valid) {
+            KVCM_LOG_ERROR("Get failed, URI size [%zu] not in allowed spec_byte_sizes_per_block, uri: %s",
                            item.size,
                            remote_uri.ToUriString().c_str());
             return ER_INVALID_PARAMS;
         }
-        offset = item.blkid * byte_size_per_block_;
+
+        // 使用 URI 的 size 计算 offset
+        offset = item.blkid * item.size;
 
         for (auto &iov : local_buffer.iovs) {
             if (offset + iov.size > file_size) {
@@ -311,15 +321,24 @@ ClientErrorCode LocalFileSdk::DoPut(const std::vector<DataStorageUri> &remote_ur
             return ER_INVALID_PARAMS;
         }
         auto item = LocalFileItem::FromUri(remote_uri);
-        if (byte_size_per_block_ != item.size) {
-            KVCM_LOG_ERROR("Get failed, byte_size_per_block_ [%ld] not equal to uri size [%zu], origin uri: [%s]",
-                           byte_size_per_block_,
+
+        // 防御性校验：URI 的 size 必须在允许的 spec 范围内
+        bool size_valid = false;
+        for (const auto &[spec_name, byte_size_per_block] : spec_byte_sizes_per_block_) {
+            if (item.size == byte_size_per_block) {
+                size_valid = true;
+                break;
+            }
+        }
+        if (!size_valid) {
+            KVCM_LOG_ERROR("Put failed, URI size [%zu] not in allowed spec_byte_sizes_per_block, uri: %s",
                            item.size,
                            remote_uri.ToUriString().c_str());
             return ER_INVALID_PARAMS;
         }
+
         max_blkid = std::max(max_blkid, item.blkid);
-        required_size = std::max(required_size, (max_blkid + 1) * byte_size_per_block_);
+        required_size = std::max(required_size, (max_blkid + 1) * item.size);
         items.push_back(item);
     }
 
@@ -371,7 +390,7 @@ ClientErrorCode LocalFileSdk::DoPut(const std::vector<DataStorageUri> &remote_ur
     for (size_t i = 0; i < items.size(); ++i) {
         auto &item = items[i];
         auto &local_buffer = local_buffers[i];
-        size_t offset = item.blkid * byte_size_per_block_;
+        size_t offset = item.blkid * item.size;
 
         for (auto &iov : local_buffer.iovs) {
             if (offset + iov.size > required_size) {
