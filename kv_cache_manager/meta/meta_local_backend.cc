@@ -35,7 +35,7 @@ ErrorCode MetaLocalBackend::Init(const std::string &instance_id,
     } else {
         StandardUri storage_uri = StandardUri::FromUri(storage_uri_str);
         enable_persistence_ = true;
-        path_ = storage_uri.GetPath();
+        path_ = storage_uri.GetPath() + "_" + instance_id;
     }
     return EC_OK;
 }
