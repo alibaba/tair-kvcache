@@ -45,6 +45,32 @@ bool WeightSLPolicy::ExistsForWrite(const CacheLocationMap &location_map) const 
     return false;
 }
 
+bool WeightSLPolicy::ExistsForWrite(const CacheLocationMap &location_map,
+                                    const std::vector<std::string> &requested_spec_names) const {
+    // If no specific spec names requested, fall back to block-level check
+    if (requested_spec_names.empty()) {
+        return ExistsForWrite(location_map);
+    }
+    // Check if any single serving location already covers ALL requested specs.
+    // Use linear search on location_specs (typically 2-4 elements) instead of
+    // building a hash set — avoids heap allocation and string copies.
+    for (auto &kv : location_map) {
+        if (kv.second.status() == CacheLocationStatus::CLS_NOT_FOUND)
+            continue;
+        if (GetWeight(kv) <= 0)
+            continue;
+        const auto &loc_specs = kv.second.location_specs();
+        bool covers_all = std::all_of(
+            requested_spec_names.begin(), requested_spec_names.end(), [&loc_specs](const std::string &name) {
+                return std::any_of(
+                    loc_specs.begin(), loc_specs.end(), [&name](const auto &spec) { return spec.name() == name; });
+            });
+        if (covers_all)
+            return true;
+    }
+    return false;
+}
+
 uint32_t StaticWeightSLPolicy::GetWeight(CacheLocationMap::const_reference kv) const {
     DataStorageType type = kv.second.type();
     uint32_t weight = StorageTypeWeights::DEFAULT;

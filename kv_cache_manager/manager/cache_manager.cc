@@ -463,6 +463,34 @@ CacheManager::StartWriteCache(RequestContext *request_context,
                                           keys.size(),
                                           location_spec_group_names.size());
     }
+    // Validate that every non-empty group name exists in the registered
+    // location_spec_groups.  Fail fast instead of letting FilterWriteCache
+    // silently degrade to block-level checks while GenWriteLocation errors out.
+    if (!location_spec_group_names.empty()) {
+        auto instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
+        if (instance_info) {
+            const auto &groups = instance_info->location_spec_groups();
+            // Deduplicate: typically all entries are the same value (e.g. N x "Linear"),
+            // so only the first insertion triggers the actual lower_bound lookup.
+            std::set<std::string_view> checked;
+            for (const auto &group_name : location_spec_group_names) {
+                if (group_name.empty() || !checked.insert(group_name).second)
+                    continue;
+                auto it = std::lower_bound(
+                    groups.begin(),
+                    groups.end(),
+                    group_name,
+                    [](const LocationSpecGroup &g, const std::string_view &name) { return g.name() < name; });
+                if (it == groups.end() || it->name() != group_name) {
+                    RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN,
+                                                      EC_BADARGS,
+                                                      StartWriteCacheInfo,
+                                                      "location_spec_group_name [%s] not found in registered groups",
+                                                      group_name.c_str());
+                }
+            }
+        }
+    }
     auto [ec, meta_searcher] = CheckInputAndGetMetaSearcher(request_context, instance_id, keys, tokens);
     RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, StartWriteCacheInfo, "start write cache failed");
     CacheLocationVector new_locations;
@@ -726,24 +754,64 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
     if (!policy) {
         return EC_ERROR;
     }
-    auto first_empty = std::find_if(
-        location_maps.begin(), location_maps.end(), [&policy](const auto &m) { return !policy->ExistsForWrite(m); });
-    bool only_prefix_not_empty =
-        std::all_of(first_empty, location_maps.end(), [&policy](const auto &m) { return !policy->ExistsForWrite(m); });
+
+    // Resolve instance_info for spec-group-aware filtering.
+    // When location_spec_group_names is provided, we check per-spec-group
+    // coverage instead of block-level existence, allowing complementary
+    // locations (e.g. KV-only and Mamba-only) to coexist in the same block.
+    std::shared_ptr<const InstanceInfo> instance_info;
+    if (!location_spec_group_names.empty()) {
+        instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
+    }
+
+    auto existsForWrite = [&](size_t i, const CacheLocationMap &m) -> bool {
+        if (!instance_info || i >= location_spec_group_names.size() || location_spec_group_names[i].empty()) {
+            return policy->ExistsForWrite(m);
+        }
+        const auto &groups = instance_info->location_spec_groups();
+        auto it = std::lower_bound(groups.begin(),
+                                   groups.end(),
+                                   location_spec_group_names[i],
+                                   [](const LocationSpecGroup &g, const std::string &name) { return g.name() < name; });
+        if (it == groups.end() || it->name() != location_spec_group_names[i]) {
+            return policy->ExistsForWrite(m);
+        }
+        return policy->ExistsForWrite(m, it->spec_names());
+    };
+
+    // Single pass: compute exists status for all blocks.
+    std::vector<bool> exists_flags(location_maps.size());
+    for (size_t i = 0; i < location_maps.size(); ++i) {
+        exists_flags[i] = existsForWrite(i, location_maps[i]);
+    }
+
+    // Analyze the flags: find prefix boundary and check pattern.
+    size_t first_empty_idx = location_maps.size();
+    bool only_prefix_not_empty = true;
+    for (size_t i = 0; i < location_maps.size(); ++i) {
+        if (!exists_flags[i]) {
+            if (first_empty_idx == location_maps.size()) {
+                first_empty_idx = i;
+            }
+        } else if (first_empty_idx != location_maps.size()) {
+            // Found an "exists" block after an "empty" block — not a clean prefix.
+            only_prefix_not_empty = false;
+            break;
+        }
+    }
     if (only_prefix_not_empty) {
-        size_t offset = first_empty - location_maps.begin();
-        block_mask = static_cast<BlockMaskOffset>(offset);
-        new_keys.insert(new_keys.end(), keys.begin() + offset, keys.end());
+        block_mask = static_cast<BlockMaskOffset>(first_empty_idx);
+        new_keys.insert(new_keys.end(), keys.begin() + first_empty_idx, keys.end());
         if (!location_spec_group_names.empty()) {
             new_location_spec_group_names.insert(new_location_spec_group_names.end(),
-                                                 location_spec_group_names.begin() + offset,
+                                                 location_spec_group_names.begin() + first_empty_idx,
                                                  location_spec_group_names.end());
         }
         return EC_OK;
     }
     block_mask = BlockMaskVector(location_maps.size(), false);
     for (size_t i = 0; i < location_maps.size(); ++i) {
-        if (!location_maps[i].empty()) {
+        if (exists_flags[i]) {
             std::get<BlockMaskVector>(block_mask)[i] = true;
         } else {
             new_keys.push_back(keys[i]);
