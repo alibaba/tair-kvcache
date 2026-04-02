@@ -15,14 +15,7 @@ class HisimCollectionDataset(BaseDataset):
     def __len__(self):
         return len(self.dataset)
 
-    def __getitem__(self, index):
-        if isinstance(index, slice):
-            start, stop, step = index.indices(len(self))
-            return [self[i] for i in range(start, stop, step)]
-
-        if index >= len(self):
-            raise IndexError
-
+    def _get_single_item(self, index: int) -> GenericRequest:
         return self.dataset[index]
 
     def _load_dataset(self, filepath: str) -> list[GenericRequest]:

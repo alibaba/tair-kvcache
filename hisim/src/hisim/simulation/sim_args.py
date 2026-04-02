@@ -10,7 +10,7 @@ class AcceleratorConfig:
 
 
 @dataclasses.dataclass
-class PlatformConfig:
+class SimPlatformConfig:
     accelerator: AcceleratorConfig = dataclasses.field(
         default_factory=AcceleratorConfig
     )
@@ -30,7 +30,7 @@ class PredictorConfig:
 
 
 @dataclasses.dataclass
-class SchedulerConfig:
+class SimSchedulerConfig:
     tp_size: int = 1
     ep_size: int = 1
     dp_size: int = 1
@@ -40,13 +40,22 @@ class SchedulerConfig:
     backend_version: Optional[str] = None
 
 
+def _apply_cli_args(ns: argparse.Namespace, target, mappings: list[tuple[str, str]]):
+    for cli_arg, field_name in mappings:
+        value = getattr(ns, cli_arg, None)
+        if value is not None:
+            setattr(target, field_name, value)
+
+
 @dataclasses.dataclass
 class SimulationArgs:
     config_path: Optional[str] = None
 
-    platform: PlatformConfig = dataclasses.field(default_factory=PlatformConfig)
+    platform: SimPlatformConfig = dataclasses.field(default_factory=SimPlatformConfig)
     predictor: PredictorConfig = dataclasses.field(default_factory=PredictorConfig)
-    scheduler: SchedulerConfig = dataclasses.field(default_factory=SchedulerConfig)
+    scheduler: SimSchedulerConfig = dataclasses.field(
+        default_factory=SimSchedulerConfig
+    )
 
     def add_cli_args(parser: argparse.ArgumentParser):
         prefix = "sim-"
@@ -153,7 +162,7 @@ class SimulationArgs:
 
         return SimulationArgs(
             config_path=path,
-            platform=PlatformConfig(
+            platform=SimPlatformConfig(
                 accelerator=AcceleratorConfig(name=accelerator.get("name", "H20")),
                 disk_read_bandwidth_gb=platform.get("disk_read_bandwidth_gb", 4.0),
                 disk_write_bandwidth_gb=platform.get("disk_write_bandwidth_gb", 4.0),
@@ -169,7 +178,7 @@ class SimulationArgs:
                 prefill_scale_factor=predictor.get("prefill_scale_factor", 1.0),
                 decode_scale_factor=predictor.get("decode_scale_factor", 1.0),
             ),
-            scheduler=SchedulerConfig(
+            scheduler=SimSchedulerConfig(
                 tp_size=scheduler.get("tp_size", 1),
                 ep_size=scheduler.get("ep_size", 1),
                 data_type=scheduler.get("data_type", "FP16"),
@@ -186,49 +195,52 @@ class SimulationArgs:
 
     @classmethod
     def from_cli_args(cls, ns: argparse.Namespace) -> "SimulationArgs":
-        # config_path
+        # If config path is provided, load from JSON
         if getattr(ns, "sim_config_path", None) is not None:
             return SimulationArgs.from_json(ns.sim_config_path)
 
         args = SimulationArgs()
 
-        # platform
+        # Platform config
         if getattr(ns, "sim_accelerator_name", None) is not None:
             args.platform.accelerator.name = ns.sim_accelerator_name
-        for arg, field in [
-            ("sim_disk_read_bandwidth_gb", "disk_read_bandwidth_gb"),
-            ("sim_disk_write_bandwidth_gb", "disk_write_bandwidth_gb"),
-            ("sim_memory_read_bandwidth_gb", "memory_read_bandwidth_gb"),
-            ("sim_memory_write_bandwidth_gb", "memory_write_bandwidth_gb"),
-        ]:
-            v = getattr(ns, arg, None)
-            if v is not None:
-                setattr(args.platform, field, v)
+        _apply_cli_args(
+            ns,
+            args.platform,
+            [
+                ("sim_disk_read_bandwidth_gb", "disk_read_bandwidth_gb"),
+                ("sim_disk_write_bandwidth_gb", "disk_write_bandwidth_gb"),
+                ("sim_memory_read_bandwidth_gb", "memory_read_bandwidth_gb"),
+                ("sim_memory_write_bandwidth_gb", "memory_write_bandwidth_gb"),
+            ],
+        )
 
-        # predictor
+        # Predictor config
         if getattr(ns, "sim_predictor_name", None) is not None:
             args.predictor.name = ns.sim_predictor_name
-        for arg, field in [
-            ("sim_database_path", "database_path"),
-            ("sim_device_name", "device_name"),
-            ("sim_prefill_scale_factor", "prefill_scale_factor"),
-            ("sim_decode_scale_factor", "decode_scale_factor"),
-        ]:
-            v = getattr(ns, arg, None)
-            if v is not None:
-                setattr(args.predictor, field, v)
+        _apply_cli_args(
+            ns,
+            args.predictor,
+            [
+                ("sim_database_path", "database_path"),
+                ("sim_device_name", "device_name"),
+                ("sim_prefill_scale_factor", "prefill_scale_factor"),
+                ("sim_decode_scale_factor", "decode_scale_factor"),
+            ],
+        )
 
-        # scheduler
-        for arg, field in [
-            ("sim_tp_size", "tp_size"),
-            ("sim_ep_size", "ep_size"),
-            ("sim_data_type", "data_type"),
-            ("sim_kv_cache_data_type", "kv_cache_data_type"),
-            ("sim_backend_name", "backend_name"),
-            ("sim_backend_version", "backend_version"),
-        ]:
-            v = getattr(ns, arg, None)
-            if v is not None:
-                setattr(args.scheduler, field, v)
+        # Scheduler config
+        _apply_cli_args(
+            ns,
+            args.scheduler,
+            [
+                ("sim_tp_size", "tp_size"),
+                ("sim_ep_size", "ep_size"),
+                ("sim_data_type", "data_type"),
+                ("sim_kv_cache_data_type", "kv_cache_data_type"),
+                ("sim_backend_name", "backend_name"),
+                ("sim_backend_version", "backend_version"),
+            ],
+        )
 
         return args

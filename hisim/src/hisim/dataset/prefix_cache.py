@@ -1,5 +1,4 @@
 from hisim.dataset.base_dataset import BaseDataset, GenericRequest
-from typing import Union
 
 
 class PrefixCacheDecorator(BaseDataset):
@@ -18,16 +17,7 @@ class PrefixCacheDecorator(BaseDataset):
     def __len__(self) -> int:
         return len(self._dataset)
 
-    def __getitem__(
-        self, index: Union[int, slice]
-    ) -> Union[GenericRequest, list[GenericRequest]]:
-        if isinstance(index, slice):
-            start, stop, step = index.indices(len(self))
-            return [self[i] for i in range(start, stop, step)]
-
-        if index >= len(self):
-            raise IndexError
-
+    def _get_single_item(self, index: int) -> GenericRequest:
         # If prefix_hit_rate is not set, delegate directly to the wrapped dataset
         if self.args.prefix_hit_rate is None:
             return self._dataset[index]

@@ -27,14 +27,7 @@ class ShareGPTDataset(BaseDataset):
     def __len__(self):
         return self.args.num_prompts
 
-    def __getitem__(self, index) -> GenericRequest:
-        if isinstance(index, slice):
-            start, stop, step = index.indices(len(self))
-            return [self[i] for i in range(start, stop, step)]
-
-        if index >= len(self):
-            raise IndexError
-
+    def _get_single_item(self, index: int) -> GenericRequest:
         input_len = randint(self.args.min_input_len, self.args.max_input_len)
 
         prompt: str = self.dataset[self.index % len(self.dataset)]

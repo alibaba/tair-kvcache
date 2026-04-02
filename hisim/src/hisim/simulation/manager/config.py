@@ -18,9 +18,26 @@ logger = get_logger()
 
 
 class ConfigManager:
+    """Centralized configuration manager with caching."""
+
     _model_info: ModelInfo = None
     _platform_config: PlatformConfig = None
     _scheduler_config: SchedulerConfig = None
+    _raw_config: dict = None
+
+    @classmethod
+    def _get_raw_config(cls) -> dict:
+        if cls._raw_config is None:
+            with open(Envs.config_path()) as f:
+                cls._raw_config = json.load(f)
+        return cls._raw_config
+
+    @classmethod
+    def reset_config_cache(cls):
+        cls._raw_config = None
+        cls._model_info = None
+        cls._platform_config = None
+        cls._scheduler_config = None
 
     @classmethod
     def set_model_info(cls, model: ModelInfo):
@@ -35,16 +52,14 @@ class ConfigManager:
                     f"Failed to initialize model information with configuration: {hf_config}"
                 )
         else:
-            with open(Envs.config_path()) as f:
-                config: dict = json.load(f)
+            config = cls._get_raw_config()
             model = ModelInfo.find_by_model_name(config.get("model", {}).get("name"))
 
         return model
 
     @classmethod
     def get_accelerator_info(cls) -> AcceleratorInfo:
-        with open(Envs.config_path()) as f:
-            config: dict = json.load(f)
+        config = cls._get_raw_config()
         platform_config = config.get("platform", {})
         device_name = platform_config.get("accelerator", {}).get("name")
         hw = AcceleratorInfo.find_by_hw_name(device_name)
@@ -54,15 +69,14 @@ class ConfigManager:
             )
             raise ValueError(f"Failed to initialize device info with {device_name}")
         else:
-            logger
+            logger.info(f"Device info initialized: {hw}")
         return hw
 
     @classmethod
     def get_platform_config(cls) -> PlatformConfig:
         if cls._platform_config is None:
             hw = cls.get_accelerator_info()
-            with open(Envs.config_path()) as f:
-                config: dict = json.load(f)
+            config = cls._get_raw_config()
             platform_config = config.get("platform", {})
             cls._platform_config = PlatformConfig(
                 device=hw,
@@ -117,8 +131,7 @@ class ConfigManager:
 
         internal_config = cls._parse_server_args(server_args, backend)
 
-        with open(Envs.config_path()) as f:
-            config: dict = json.load(f)
+        config = cls._get_raw_config()
         scheduler_config = config.get("scheduler", {})
 
         tp_size = scheduler_config.get("tp_size")
@@ -180,8 +193,7 @@ class ConfigManager:
     def get_inference_time_predictor(
         cls, model: ModelInfo, hw: AcceleratorInfo, sched_config: SchedulerConfig
     ) -> InferTimePredictor:
-        with open(Envs.config_path()) as f:
-            config: dict = json.load(f)
+        config = cls._get_raw_config()
         predictor_config = config.get("predictor", {})
         if predictor_config.get("name") == "aiconfigurator":
             device_name = predictor_config.get("device_name")

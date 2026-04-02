@@ -64,6 +64,14 @@ class RequestStats:
         return True
 
 
+def _bandwidth_property(gb_attr: str):
+    def getter(self):
+        gb_value = getattr(self, gb_attr)
+        return gb_value * 1e9 if gb_value else None
+
+    return property(getter)
+
+
 @dataclass
 class PlatformConfig:
     device: Union[AcceleratorInfo, str]
@@ -76,30 +84,8 @@ class PlatformConfig:
     memory_write_bandwidth_gb: Optional[float] = None
     num_device_per_node: int = 8
 
-    @property
-    def disk_read_bandwidth(self):
-        return (
-            self.disk_read_bandwidth_gb * 1e9 if self.disk_read_bandwidth_gb else None
-        )
-
-    @property
-    def disk_write_bandwidth(self):
-        return (
-            self.disk_write_bandwidth_gb * 1e9 if self.disk_write_bandwidth_gb else None
-        )
-
-    @property
-    def memory_read_bandwidth(self):
-        return (
-            self.memory_read_bandwidth_gb * 1e9
-            if self.memory_read_bandwidth_gb
-            else None
-        )
-
-    @property
-    def memory_write_bandwidth(self):
-        return (
-            self.memory_write_bandwidth_gb * 1e9
-            if self.memory_write_bandwidth_gb
-            else None
-        )
+    # Bandwidth properties (in bytes, converted from GB)
+    disk_read_bandwidth = _bandwidth_property("disk_read_bandwidth_gb")
+    disk_write_bandwidth = _bandwidth_property("disk_write_bandwidth_gb")
+    memory_read_bandwidth = _bandwidth_property("memory_read_bandwidth_gb")
+    memory_write_bandwidth = _bandwidth_property("memory_write_bandwidth_gb")

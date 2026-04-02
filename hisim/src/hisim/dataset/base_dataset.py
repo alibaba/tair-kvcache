@@ -31,6 +31,15 @@ class BaseDataset:
     def __getitem__(self, index: slice) -> list[GenericRequest]: ...
 
     def __getitem__(self, index):
+        """Get item(s) by index or slice. Delegates to _get_single_item for single items."""
+        if isinstance(index, slice):
+            start, stop, step = index.indices(len(self))
+            return [self[i] for i in range(start, stop, step)]
+        if index >= len(self):
+            raise IndexError
+        return self._get_single_item(index)
+
+    def _get_single_item(self, index: int) -> GenericRequest:
         raise NotImplementedError
 
     def __len__(self) -> int:
@@ -56,14 +65,7 @@ class SimpleDataset(BaseDataset):
     def add_request(self, req: GenericRequest):
         self.data.append(req)
 
-    def __getitem__(self, index):
-        if isinstance(index, slice):
-            start, stop, step = index.indices(len(self))
-            return [self[i] for i in range(start, stop, step)]
-
-        if index >= len(self):
-            raise IndexError
-
+    def _get_single_item(self, index: int) -> GenericRequest:
         return self.data[index]
 
     def __len__(self):
