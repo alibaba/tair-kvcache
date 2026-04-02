@@ -161,6 +161,121 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
         # now the writing of key=16 should success
         self._write(16)
 
+    def test_reclaiming_02(self):
+        """Test that CLS_WRITING keys left over after a server restart
+        should not permanently block reclaimer progress.
+
+        Scenario
+        --------
+        1. Setup: Fill test_instance_01 with 8 start_write_cache calls
+           (keys 0-7) without ever calling finish_write_cache.  The keys
+           are now in CLS_WRITING state and their write sessions exist
+           only in server memory.
+        2. Restart the server immediately.  The meta indexer recovers
+           keys 0-7 from the local-file backend (CLS_WRITING status
+           preserved), but the in-memory write session table is gone.
+        3. Re-register test_instance_01 (loads recovered indexer) and
+           verify finish_write_cache with the pre-restart session IDs
+           must all fail, because the server no longer knows those
+           sessions.
+        4. Write 8 new keys (8-15) into test_instance_01.
+        5. Lower the threshold for test_group_01; make the reclaimer
+           fires.
+        6. Assert: a new write to test_instance_01 (key id = 16) must
+           succeed once the reclaimer has freed a slot.
+        """
+        # add storage
+        add_storage_req = {
+            "trace_id": self._trace_id,
+            "storage": self._make_dummy_storage(),
+        }
+        self._admin_client.add_storage(add_storage_req)
+
+        # add instance group; reclaim trigger is intentionally too high
+        # to fire at this point
+        ig = self._make_dummy_instance_group()
+        create_ig_req = {
+            "trace_id": self._trace_id,
+            "instance_group": ig,
+        }
+        self._admin_client.create_instance_group(create_ig_req)
+
+        # register test_instance_01
+        reg_ins_01_req = self._make_dummy_ins_req()
+        self._client.register_instance(reg_ins_01_req)
+
+        # start writing keys 0-7 into test_instance_01 without finishing
+        # them; the keys are recorded in CLS_WRITING state in the
+        # indexer
+        for i in range(8):
+            self._start_write(i)
+
+        # restart the server immediately before any finish_write_cache
+        # is called; the write session table is lost, but the meta
+        # indexer is flushed to disk (local-file backend) so keys 0-7
+        # survive the restart with CLS_WRITING status
+        self.worker_manager.stop_worker(0)
+        self.assertTrue(
+            self.worker_manager.start_worker(
+                # configure batching_size=8 so the reclaimer always
+                # builds a batch contains test_instance_01's all old
+                # CLS_WRITING keys due to the LRU access time
+                0, **{"kvcm.cache_reclaimer.del_batch_size": 8}
+            )
+        )
+
+        # reconnect clients: update_ports() assigns fresh ports on every
+        # start
+        self._admin_client.close()
+        self._client.close()
+        self._admin_client, self._client = self._get_manager_client()
+
+        # re-add the storage and instance group after restart; the
+        # registry is in-memory only and was lost; using the same
+        # storage_uri causes MetaIndexer to reload keys 0-7 (CLS_WRITING)
+        # from the storage backend
+        # re-register test_instance_01 to bring the recovered indexer
+        # back online
+        self._admin_client.add_storage(add_storage_req)
+        create_ig_req["trace_id"] = self._trace_id + "_restart"
+        self._admin_client.create_instance_group(create_ig_req)
+        self._client.register_instance(reg_ins_01_req)
+
+        # the server lost all write session state on restart, so
+        # finish_write_cache with the pre-restart session IDs must fail
+        for i in range(8):
+            self._finish_write_expect_fail(i)
+
+        # write 8 new keys (8-15) into test_instance_01
+        for i in range(8, 16):
+            self._write(i)
+        # now the quota is full
+        self._start_write_expect_fail(16)
+
+        # fire the reclaimer for test_group_01
+        curr_ver = ig["version"]
+        ig["version"] = curr_ver + 1
+        ig[
+            "cache_config"
+        ][
+            "reclaim_strategy"
+        ][
+            "trigger_strategy"
+        ][
+            "used_percentage"
+        ] = 0.1
+        self._admin_client.update_instance_group({
+            "trace_id": self._trace_id + "_update_ig",
+            "instance_group": ig,
+            "current_version": curr_ver,
+        })
+
+        time.sleep(2)
+
+        # the orphaned CLS_WRITING should not stop the evicting
+        # new write should now be accepted
+        self._write(16)
+
     def test_persist_recover_00(self):
         """Test e2e persist/recover: cache locations and metadata
         survive a normal server restart.
@@ -485,6 +600,24 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
         resp = self._client.start_write_cache(start_write_req,
                                               check_response=False)
         self.assertNotEqual(resp['header']['status']['code'], "OK")
+
+    def _finish_write_expect_fail(self, blk_key):
+        logging.info(f"finish write expecting failure, block key: {blk_key}")
+        trace_id = f"{self._trace_id}_blk_key_{blk_key}"
+        resp = self._resp_dict[blk_key]
+        finish_write_req = {
+            "trace_id": trace_id,
+            "instance_id": self._instance_id,
+            "write_session_id": resp["write_session_id"],
+            "success_blocks": {
+                "bool_masks": {
+                    "values": [True],
+                }
+            },
+        }
+        resp = self._client.finish_write_cache(finish_write_req,
+                                               check_response=False)
+        self.assertNotEqual(resp["header"]["status"]["code"], "OK")
 
     def _start_write(self, blk_key):
         logging.info(f"start write, block key: {blk_key}")
