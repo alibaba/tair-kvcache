@@ -206,7 +206,9 @@ ErrorCode MetaIndexer::StorageUsageData::Deserialize(const std::string &str) noe
 
 MetaIndexer::~MetaIndexer() {
     // try to persist metadata when quit gracefully
-    PersistMetaData();
+    if (storage_) {
+        PersistMetaData();
+    }
 }
 
 ErrorCode MetaIndexer::Init(const std::string &instance_id, const std::shared_ptr<MetaIndexerConfig> &config) noexcept {
