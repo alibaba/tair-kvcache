@@ -50,14 +50,12 @@ public:
     DataStorageType type() const { return type_; }
     const std::string &sdk_log_file_path() const { return sdk_log_file_path_; }
     const std::string &sdk_log_level() const { return sdk_log_level_; }
-    const std::unordered_map<std::string, int64_t> &spec_byte_sizes_per_block() const {
-        return spec_byte_sizes_per_block_;
-    }
+    const std::map<std::string, int64_t> &spec_byte_sizes_per_block() const { return spec_byte_sizes_per_block_; }
 
     void set_type(DataStorageType type) { type_ = type; }
     void set_sdk_log_file_path(const std::string &value) { sdk_log_file_path_ = value; }
     void set_sdk_log_level(const std::string &value) { sdk_log_level_ = value; }
-    void set_spec_byte_sizes_per_block(const std::unordered_map<std::string, int64_t> &value) {
+    void set_spec_byte_sizes_per_block(const std::map<std::string, int64_t> &value) {
         spec_byte_sizes_per_block_ = value;
     }
 
@@ -65,7 +63,7 @@ private:
     DataStorageType type_;
     std::string sdk_log_file_path_;
     std::string sdk_log_level_;
-    std::unordered_map<std::string, int64_t> spec_byte_sizes_per_block_;
+    std::map<std::string, int64_t> spec_byte_sizes_per_block_;
 };
 
 class Hf3fsSdkConfig : public SdkBackendConfig {

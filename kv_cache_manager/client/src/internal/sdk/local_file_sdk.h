@@ -26,7 +26,7 @@ private:
     ClientErrorCode DoPut(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers);
 
 private:
-    std::unordered_map<std::string, int64_t> spec_byte_sizes_per_block_;
+    std::map<std::string, int64_t> spec_byte_sizes_per_block_;
 #if defined(USING_CUDA)
     cudaStream_t cuda_stream_ = nullptr;
 #elif defined(USING_MUSA)
