@@ -58,7 +58,7 @@ private:
     std::mutex mutex_;
     std::string path_;
     ConcurrentHashMap<KeyType, FieldMap> table_;
+    FieldMap metadata_;
     bool enable_persistence_ = false;
-    KeyType metadata_key_ = 0;
 };
 } // namespace kv_cache_manager

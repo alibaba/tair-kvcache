@@ -2,7 +2,6 @@
 
 #include <filesystem>
 #include <fstream>
-#include <limits>
 
 #include "kv_cache_manager/common/jsonizable.h"
 #include "kv_cache_manager/common/logger.h"
@@ -12,6 +11,11 @@
 #include "kv_cache_manager/meta/common.h"
 
 namespace kv_cache_manager {
+
+// special key used in the persistence file to identify the metadata
+// entry, non-numeric so it is guaranteed never to collide with any
+// numeric cache key
+static constexpr const char *kMetadataFileKey = "__metadata__";
 
 std::string MetaLocalBackend::GetStorageType() noexcept { return META_LOCAL_BACKEND_TYPE_STR; }
 
@@ -32,7 +36,6 @@ ErrorCode MetaLocalBackend::Init(const std::string &instance_id,
         StandardUri storage_uri = StandardUri::FromUri(storage_uri_str);
         enable_persistence_ = true;
         path_ = storage_uri.GetPath();
-        metadata_key_ = std::numeric_limits<KeyType>::max(); // use max key for metadata
     }
     return EC_OK;
 }
@@ -44,6 +47,7 @@ ErrorCode MetaLocalBackend::Open() noexcept {
     }
 
     std::lock_guard<std::mutex> guard(mutex_);
+    metadata_.clear();
     std::error_code ec;
     bool exists = std::filesystem::exists(path_, ec);
     if (ec) {
@@ -72,6 +76,10 @@ ErrorCode MetaLocalBackend::Open() noexcept {
             KVCM_LOG_ERROR("fail to parse field map json, file[%s] content[%s]", path_.c_str(), pair.second.c_str());
             return EC_ERROR;
         }
+        if (pair.first == kMetadataFileKey) {
+            metadata_ = std::move(tmp_field_table);
+            continue;
+        }
         KeyType key;
         if (!StringUtil::StrToInt64(pair.first.c_str(), key)) {
             KVCM_LOG_ERROR("fail to parse key, file[%s] content[%s]", path_.c_str(), pair.first.c_str());
@@ -96,6 +104,9 @@ ErrorCode MetaLocalBackend::PersistToPath() {
         tmp_table[std::to_string(key)] = Jsonizable::ToJsonString(field_map);
         return true;
     });
+    if (!metadata_.empty()) {
+        tmp_table[kMetadataFileKey] = Jsonizable::ToJsonString(metadata_);
+    }
     std::string json_content = Jsonizable::ToJsonString(tmp_table);
     std::ofstream ofs(path_);
     if (!ofs.is_open()) {
@@ -374,16 +385,17 @@ ErrorCode MetaLocalBackend::RandomSample(const int64_t count, std::vector<KeyTyp
 
 ErrorCode MetaLocalBackend::PutMetaData(const FieldMap &field_map) noexcept {
     std::lock_guard<std::mutex> guard(mutex_);
-    table_.Upsert(metadata_key_, field_map);
+    metadata_ = field_map;
     return PersistToPath();
 }
 
 ErrorCode MetaLocalBackend::GetMetaData(FieldMap &out_field_map) noexcept {
-    out_field_map.clear();
-    if (!table_.Get(metadata_key_, out_field_map)) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (metadata_.empty()) {
         return EC_NOENT;
     }
-    return out_field_map.empty() ? EC_NOENT : EC_OK;
+    out_field_map = metadata_;
+    return EC_OK;
 }
 
 } // namespace kv_cache_manager
