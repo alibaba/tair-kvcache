@@ -204,6 +204,11 @@ ErrorCode MetaIndexer::StorageUsageData::Deserialize(const std::string &str) noe
     return ErrorCode::EC_OK;
 }
 
+MetaIndexer::~MetaIndexer() {
+    // try to persist metadata when quit gracefully
+    PersistMetaData();
+}
+
 ErrorCode MetaIndexer::Init(const std::string &instance_id, const std::shared_ptr<MetaIndexerConfig> &config) noexcept {
     if (!config || !config->GetMetaStorageBackendConfig()) {
         KVCM_LOG_ERROR("instance[%s] meta indexer init failed, config is invalid", instance_id.c_str());
@@ -259,14 +264,17 @@ ErrorCode MetaIndexer::Init(const std::string &instance_id, const std::shared_pt
     }
     KVCM_LOG_INFO(
         "instance[%s] meta indexer init success, storage backend type[%s], mutex shard num[%lu], max key count[%lu], "
-        "batch key size[%lu], search cache size[%lu], key_count[%lu]",
+        "batch key size[%lu], search cache size[%lu], key_count[%lu], persist_metadata_interval_time_ms[%zu], "
+        "storage usage data[%s]",
         instance_id_.c_str(),
         storage_->GetStorageType().c_str(),
         mutex_shard_num_,
         max_key_count_,
         batch_key_size_,
         config->GetMetaCachePolicyConfig()->GetCapacity(),
-        key_count_.load());
+        key_count_.load(),
+        persist_metadata_interval_time_ms_,
+        storage_usage_data_.ToJsonString().c_str());
     return EC_OK;
 }
 
