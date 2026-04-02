@@ -6,6 +6,7 @@ import os
 
 from hisim.utils.logger import get_logger
 from hisim.simulation.manager import Envs
+from hisim.hook import BaseHook
 
 try:
     from kv_cache_manager.optimizer.pybind import kvcm_py_optimizer
@@ -22,6 +23,19 @@ def _pass_str_to_block_ids(hash_key):
     int_hash = int(hash_key, 16)
     MAX_18_DIGITS = 10**18
     return int_hash % MAX_18_DIGITS
+
+
+class C_StorageBackendFactory(BaseHook):
+    HOOK_CLASS_NAME = "StorageBackendFactory"
+    HOOK_MODULE_NAME = "sglang.srt.mem_cache.storage.backend_factory"
+
+    @classmethod
+    def hook(cls, target):
+        def override_create_backend(cls, *args, **kwargs):
+            logger.info("Creating hijacked cache storage backend.")
+            return MockHiCacheStorage()
+
+        target.create_backend = override_create_backend
 
 
 class MockHiCacheStorage:

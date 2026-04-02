@@ -9,7 +9,14 @@ import torch
 from hisim.utils.logger import get_logger
 
 import hisim.hook as hisim_hook
-from hisim.simulation.sglang import sgl_kernel_hook, mem_cache_allocator, mem_pool_host
+from hisim.simulation.sglang import (
+    sgl_kernel_hook,
+    mem_cache_allocator,
+    mem_pool_host,
+    hicache_storage,
+    hiradix_cache,
+    cache_controller,
+)
 from hisim.simulation.sglang import sglang_hook
 from hisim.simulation.base.runner import BaseBenchmarkRunner
 from hisim.simulation.types import BenchmarkConfig
@@ -28,9 +35,9 @@ hisim_hook.install_class_hooks(
     [
         sglang_hook.C_SchedulerHook,
         sglang_hook.C_ModelRunnerHook,
-        sglang_hook.C_StorageBackendFactory,
-        sglang_hook.C_HiCacheController,
-        sglang_hook.C_HiRadixCacheHook,
+        hicache_storage.C_StorageBackendFactory,
+        cache_controller.C_HiCacheController,
+        hiradix_cache.C_HiRadixCacheHook,
         mem_cache_allocator.C_PagedTokenToKVPoolAllocatorHook,
         mem_pool_host.C_MHATokenToKVPoolHostHook,
     ]

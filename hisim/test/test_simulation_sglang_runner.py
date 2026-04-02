@@ -30,6 +30,7 @@ def test_benchmark_sglang():
             load_format="dummy",
             device="cpu",
             enable_hierarchical_cache=True,
+            hicache_storage_backend="file",
             max_total_tokens=8192,
             page_size=2,
         )
