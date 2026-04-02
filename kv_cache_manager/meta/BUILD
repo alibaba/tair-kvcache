@@ -36,6 +36,7 @@ cc_library(
         ":common",
         ":meta_search_cache",
         ":meta_cached_backend",
+        ":meta_dummy_backend",
         ":meta_local_backend",
         ":meta_redis_backend",
         ":meta_storage_backend",
@@ -85,6 +86,23 @@ cc_library(
 )
 
 cc_library(
+    name = "meta_dummy_backend",
+    srcs = [
+        "meta_dummy_backend.cc",
+    ],
+    hdrs = [
+        "meta_dummy_backend.h",
+    ],
+    deps = [
+        ":common",
+        ":meta_storage_backend",
+        "//kv_cache_manager/common:concurrent_hash_map",
+        "//kv_cache_manager/common:standard_uri",
+        "//kv_cache_manager/common:string_util",
+    ],
+)
+
+cc_library(
     name = "meta_local_base_backend",
     srcs = [
     ],
@@ -108,7 +126,6 @@ cc_library(
         ":common",
         ":meta_local_base_backend",
         ":meta_search_cache",
-        "//kv_cache_manager/common:concurrent_hash_map",
         "//kv_cache_manager/common:lru_cache",
         "//kv_cache_manager/common:standard_uri",
         "//kv_cache_manager/common:string_util",

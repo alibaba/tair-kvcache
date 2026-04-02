@@ -71,6 +71,20 @@ cc_library(
 )
 
 cc_test(
+    name = "meta_dummy_backend_test",
+    srcs = [
+        "meta_dummy_backend_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    data = [],
+    deps = [
+        ":meta_storage_backend_testlib",
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/meta:meta_dummy_backend",
+    ],
+)
+
+cc_test(
     name = "meta_local_backend_test",
     srcs = [
         "meta_local_backend_test.cc",

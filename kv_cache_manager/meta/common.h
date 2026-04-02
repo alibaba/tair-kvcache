@@ -4,6 +4,7 @@
 #include <vector>
 
 namespace kv_cache_manager {
+static const std::string META_DUMMY_BACKEND_TYPE_STR = "dummy";
 static const std::string META_LOCAL_BACKEND_TYPE_STR = "local";
 static const std::string META_REDIS_BACKEND_TYPE_STR = "redis";
 static const std::string META_CACHED_BACKEND_TYPE_STR = "cached";
