@@ -55,7 +55,7 @@ public:
 public:
     /// @brief Initialize the meta indexer.
     MetaIndexer() = default;
-    ~MetaIndexer() = default;
+    ~MetaIndexer();
 
     ErrorCode Init(const std::string &instance_id, const std::shared_ptr<MetaIndexerConfig> &config) noexcept;
 

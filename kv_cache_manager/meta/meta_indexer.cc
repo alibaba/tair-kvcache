@@ -205,6 +205,13 @@ ErrorCode MetaIndexer::StorageUsageData::Deserialize(const std::string &str) noe
     return ErrorCode::EC_OK;
 }
 
+MetaIndexer::~MetaIndexer() {
+    // try to persist metadata when quit gracefully
+    if (storage_) {
+        PersistMetaData();
+    }
+}
+
 ErrorCode MetaIndexer::Init(const std::string &instance_id, const std::shared_ptr<MetaIndexerConfig> &config) noexcept {
     if (!config || !config->GetMetaStorageBackendConfig()) {
         KVCM_LOG_ERROR("instance[%s] meta indexer init failed, config is invalid", instance_id.c_str());
