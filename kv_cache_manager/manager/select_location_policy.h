@@ -12,6 +12,9 @@ namespace kv_cache_manager {
 
 using CheckLocDataExistFunc = std::function<bool(const CacheLocation &loc)>;
 
+// 从 URI 中提取 hostname，例如 "nfs://host01/path" → "host01"
+std::string_view ExtractHostName(std::string_view uri);
+
 class SelectLocationPolicy {
 public:
     // for match : select best location
@@ -25,6 +28,11 @@ public:
     // location already covers all requested_spec_names
     virtual bool ExistsForWrite(const CacheLocationMap &location_map,
                                 const std::vector<std::string> &requested_spec_names) const = 0;
+
+    // Returns true if candidate belongs to the same storage instance
+    // as reference (same type AND same hostname).
+    bool IsSameStorageInstance(const CacheLocation &candidate, const CacheLocation &reference) const;
+
     virtual ~SelectLocationPolicy() = default;
 };
 
@@ -93,7 +101,6 @@ public:
 
 private:
     uint32_t GetWeight(CacheLocationMap::const_reference kv) const override;
-    std::string_view ExtractHostName(std::string_view uri) const;
 
 private:
     WeightMap weight_map_;

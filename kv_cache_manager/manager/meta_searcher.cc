@@ -1,7 +1,6 @@
 #include "kv_cache_manager/manager/meta_searcher.h"
 
 #include <map>
-#include <set>
 #include <utility>
 
 #include "kv_cache_manager/common/logger.h"
@@ -37,9 +36,8 @@ CacheLocation SelectAndMergeForMatch(SelectLocationPolicy *policy,
                                      CacheLocationMap &location_map,
                                      CheckLocDataExistFunc check_loc_data_exist,
                                      std::vector<std::string> &out_prune_loc_ids) {
-    // Single pass: filter valid locations into a shared map, collect unique spec names.
+    // Filter valid locations into a shared map.
     CacheLocationMap valid_map;
-    std::set<std::string_view> spec_names;
     for (auto &[id, loc] : location_map) {
         if (loc.status() != CacheLocationStatus::CLS_SERVING)
             continue;
@@ -48,43 +46,42 @@ CacheLocation SelectAndMergeForMatch(SelectLocationPolicy *policy,
             continue;
         }
         valid_map.try_emplace(id, loc);
-        for (const auto &spec : loc.location_specs()) {
-            spec_names.insert(spec.name());
-        }
     }
     if (valid_map.empty())
         return {};
 
-    // For each unique spec, select the best location that provides it.
-    // Reuse valid_map for all specs — only L copies total instead of L*S.
-    std::vector<LocationSpec> merged_specs;
-    merged_specs.reserve(spec_names.size());
-    for (auto spec_name : spec_names) {
-        auto has_spec = [&spec_name](const CacheLocation &loc) -> bool {
-            return std::any_of(loc.location_specs().begin(), loc.location_specs().end(), [&spec_name](const auto &s) {
-                return s.name() == spec_name;
-            });
-        };
-        std::vector<std::string> unused_prune_ids;
-        CacheLocation *winner = policy->SelectForMatch(valid_map, has_spec, unused_prune_ids);
-        if (winner) {
-            for (const auto &spec : winner->location_specs()) {
-                if (spec.name() == spec_name) {
-                    merged_specs.emplace_back(spec.name(), spec.uri());
-                    break;
-                }
-            }
+    // Use the policy to select one winning location, which determines the
+    // target storage backend instance.
+    std::vector<std::string> unused_prune_ids;
+    CacheLocation *winner = policy->SelectForMatch(valid_map, nullptr, unused_prune_ids);
+    if (!winner || winner->location_specs().empty())
+        return {};
+
+    // Collect all specs from every valid location that belongs to the same
+    // storage backend as the winner, dedup by spec name.
+    std::map<std::string, LocationSpec> merged_specs;
+    for (auto &[id, loc] : valid_map) {
+        if (!policy->IsSameStorageInstance(loc, *winner))
+            continue;
+        for (const auto &spec : loc.location_specs()) {
+            merged_specs.try_emplace(spec.name(), spec);
         }
     }
 
-    // Assemble merged result.
-    CacheLocation merged;
-    merged.set_spec_size(merged_specs.size());
-    if (!merged_specs.empty()) {
-        merged.set_status(CacheLocationStatus::CLS_SERVING);
+    if (merged_specs.empty())
+        return {};
+
+    CacheLocation result;
+    result.set_status(CacheLocationStatus::CLS_SERVING);
+    result.set_type(winner->type());
+    result.set_spec_size(winner->spec_size());
+    std::vector<LocationSpec> specs;
+    specs.reserve(merged_specs.size());
+    for (auto &[name, spec] : merged_specs) {
+        specs.push_back(std::move(spec));
     }
-    merged.set_location_specs(std::move(merged_specs));
-    return merged;
+    result.set_location_specs(std::move(specs));
+    return result;
 }
 
 } // namespace

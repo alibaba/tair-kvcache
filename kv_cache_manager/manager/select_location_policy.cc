@@ -82,6 +82,7 @@ uint32_t StaticWeightSLPolicy::GetWeight(CacheLocationMap::const_reference kv) c
 }
 
 uint32_t NamedStorageWeightedSLPolicy::GetWeight(CacheLocationMap::const_reference kv) const {
+    // all location_specs in location have the same host name
     std::string_view host_name = ExtractHostName(kv.second.location_specs().front().uri());
     if (auto iter = weight_map_.find(host_name); iter != weight_map_.end()) {
         return iter->second;
@@ -89,7 +90,16 @@ uint32_t NamedStorageWeightedSLPolicy::GetWeight(CacheLocationMap::const_referen
     return 0;
 }
 
-std::string_view NamedStorageWeightedSLPolicy::ExtractHostName(std::string_view uri) const {
+bool SelectLocationPolicy::IsSameStorageInstance(const CacheLocation &candidate, const CacheLocation &reference) const {
+    if (candidate.type() != reference.type())
+        return false;
+    if (candidate.location_specs().empty() || reference.location_specs().empty())
+        return candidate.location_specs().empty() == reference.location_specs().empty();
+    return ExtractHostName(candidate.location_specs().front().uri()) ==
+           ExtractHostName(reference.location_specs().front().uri());
+}
+
+std::string_view ExtractHostName(std::string_view uri) {
     static std::string empty_str;
     // 找协议分隔符 "://"
     auto pos_protocol_end = uri.find("://");

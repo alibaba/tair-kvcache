@@ -1,5 +1,4 @@
 #include <filesystem>
-#include <set>
 
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/unittest.h"
@@ -1192,7 +1191,7 @@ TEST_F(MetaSearcherTest, TestBatchCADLocationStatusErrorCases) {
     EXPECT_EQ(ec, ErrorCode::EC_BADARGS);
 }
 
-TEST_F(MetaSearcherTest, TestPrefixMatchMergesSpecsFromMultipleLocations) {
+TEST_F(MetaSearcherTest, TestPrefixMatchMergesSpecsByStorageType) {
     MetaSearcher::KeyVector keys = {50000, 50001, 50002};
 
     // Location A: NFS with spec "tp0"
@@ -1200,10 +1199,10 @@ TEST_F(MetaSearcherTest, TestPrefixMatchMergesSpecsFromMultipleLocations) {
     CacheLocation loc_a =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, specs_a);
 
-    // Location B: HF3FS with spec "tp1"
-    std::vector<LocationSpec> specs_b = {MetaSearcherTestHelper::CreateLocationSpec("tp1", "hf3fs:///b/tp1")};
+    // Location B: NFS with spec "tp1" (same storage type, different spec)
+    std::vector<LocationSpec> specs_b = {MetaSearcherTestHelper::CreateLocationSpec("tp1", "nfs:///b/tp1")};
     CacheLocation loc_b =
-        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 1, specs_b);
+        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, specs_b);
 
     // Add location A to all keys
     CacheLocationVector locations_a = {loc_a, loc_a, loc_a};
@@ -1231,7 +1230,7 @@ TEST_F(MetaSearcherTest, TestPrefixMatchMergesSpecsFromMultipleLocations) {
     ec = meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), keys, batch_tasks, update_results);
     ASSERT_EQ(ec, ErrorCode::EC_OK);
 
-    // PrefixMatch should return merged locations
+    // PrefixMatch should merge specs from all same-type locations
     CacheLocationVector out_locations;
     BlockMask mask;
     ec = meta_searcher_->PrefixMatch(request_context_.get(), keys, mask, out_locations, &policy_);
@@ -1240,26 +1239,25 @@ TEST_F(MetaSearcherTest, TestPrefixMatchMergesSpecsFromMultipleLocations) {
 
     for (size_t i = 0; i < out_locations.size(); ++i) {
         const auto &loc = out_locations[i];
-        ASSERT_EQ(loc.location_specs().size(), 2) << "key index " << i << " should have 2 merged specs";
-        std::set<std::string> spec_names;
+        // Both locations are NFS, so specs from both should be merged
+        ASSERT_EQ(loc.location_specs().size(), 2) << "key index " << i << " should have 2 specs merged from same type";
+        EXPECT_EQ(loc.type(), DataStorageType::DATA_STORAGE_TYPE_NFS);
         for (const auto &spec : loc.location_specs()) {
-            spec_names.insert(spec.name());
             EXPECT_FALSE(spec.uri().empty());
         }
-        EXPECT_EQ(spec_names, (std::set<std::string>{"tp0", "tp1"}));
     }
 }
 
-TEST_F(MetaSearcherTest, TestBatchGetMergesSpecsFromMultipleLocations) {
+TEST_F(MetaSearcherTest, TestBatchGetMergesSpecsByStorageType) {
     MetaSearcher::KeyVector keys = {60000, 60001};
 
-    // Key 60000: add 2 locations with different specs
+    // Key 60000: add 2 locations with different specs but SAME storage type (NFS)
     std::vector<LocationSpec> specs_a = {MetaSearcherTestHelper::CreateLocationSpec("tp0", "nfs:///a/tp0")};
-    std::vector<LocationSpec> specs_b = {MetaSearcherTestHelper::CreateLocationSpec("tp1", "hf3fs:///b/tp1")};
+    std::vector<LocationSpec> specs_b = {MetaSearcherTestHelper::CreateLocationSpec("tp1", "nfs:///b/tp1")};
     CacheLocation loc_a =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, specs_a);
     CacheLocation loc_b =
-        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 1, specs_b);
+        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, specs_b);
 
     // Key 60001: add only 1 location
     std::vector<LocationSpec> specs_c = {MetaSearcherTestHelper::CreateLocationSpec("tp0", "mooncake:///c/tp0")};
@@ -1303,15 +1301,11 @@ TEST_F(MetaSearcherTest, TestBatchGetMergesSpecsFromMultipleLocations) {
     ASSERT_EQ(ec, ErrorCode::EC_OK);
     ASSERT_EQ(out_locations.size(), 2);
 
-    // Key 60000: merged from 2 locations → 2 specs
+    // Key 60000: both locations are NFS, specs should be merged → 2 specs
     {
         const auto &loc = out_locations[0];
         ASSERT_EQ(loc.location_specs().size(), 2);
-        std::set<std::string> spec_names;
-        for (const auto &spec : loc.location_specs()) {
-            spec_names.insert(spec.name());
-        }
-        EXPECT_EQ(spec_names, (std::set<std::string>{"tp0", "tp1"}));
+        EXPECT_EQ(loc.type(), DataStorageType::DATA_STORAGE_TYPE_NFS);
     }
 
     // Key 60001: single location → 1 spec
@@ -1319,5 +1313,6 @@ TEST_F(MetaSearcherTest, TestBatchGetMergesSpecsFromMultipleLocations) {
         const auto &loc = out_locations[1];
         ASSERT_EQ(loc.location_specs().size(), 1);
         EXPECT_EQ(loc.location_specs()[0].name(), "tp0");
+        EXPECT_EQ(loc.type(), DataStorageType::DATA_STORAGE_TYPE_MOONCAKE);
     }
 }

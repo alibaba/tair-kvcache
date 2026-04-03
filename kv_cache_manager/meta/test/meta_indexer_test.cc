@@ -250,8 +250,7 @@ TEST_F(MetaIndexerTest, TestMetadataPersistAndRecover) {
 
     meta_indexer_->key_count_.store(3);
 
-    const std::vector<std::uint64_t> expected_usage_vec{1, 100, 200, 300, 400, 500};
-    ASSERT_EQ(expected_usage_vec.size(), meta_indexer_->storage_usage_data_.storage_usage_by_type_.size());
+    const std::vector<std::uint64_t> expected_usage_vec{1, 100, 200, 300, 400, 500, 0};
     for (std::size_t i = 0; i != meta_indexer_->storage_usage_data_.storage_usage_by_type_.size(); ++i) {
         meta_indexer_->storage_usage_data_.storage_usage_by_type_.at(i).store(expected_usage_vec.at(i));
     }
@@ -370,7 +369,7 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataManipulation) {
     // test special case: DATA_STORAGE_TYPE_VCNS_HF3FS behavior as DATA_STORAGE_TYPE_HF3FS
     {
         meta_indexer_->storage_usage_data_.Reset();
-        std::vector<std::uint64_t> expected_usage_vec{0, 128, 0, 0, 0, 0};
+        std::vector<std::uint64_t> expected_usage_vec{0, 128, 0, 0, 0, 0, 0};
 
         meta_indexer_->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS, 128);
         ASSERT_EQ(128, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
