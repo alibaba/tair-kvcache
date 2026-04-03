@@ -53,6 +53,7 @@ class MetaSearcherManager;
 class RegistryManager;
 class RequestContext;
 class SchedulePlanExecutor;
+class WriteLocationManager;
 struct CacheLocationDelRequest;
 struct PlanExecuteResult;
 
@@ -72,8 +73,9 @@ struct PlanExecuteResult;
  *    thresholds
  * 3. Sampling keys from instances and identifying the least valuable
  *    ones
- * 4. Submitting deletion requests for locations in CLS_SERVING status
- *    only for those keys
+ * 4. Submitting deletion requests for locations in CLS_SERVING status,
+ *    or CLS_WRITING locations whose write session is no longer active
+ *    (i.e. orphaned after a server restart)
  *
  * @note This class is not thread-safe and should only be accessed by
  * the cache-manager thread.
@@ -105,6 +107,9 @@ public:
      * for cache-reclaimer related metrics data management
      * @param event_manager Shared pointer to EventManager for event
      * publish
+     * @param write_location_manager Shared pointer to WriteLocationManager
+     * used to detect orphaned CLS_WRITING locations whose write session
+     * is no longer active
      */
     CacheReclaimer(std::size_t sampling_size_total,
                    std::size_t sampling_size_per_task,
@@ -116,7 +121,8 @@ public:
                    std::shared_ptr<MetaSearcherManager> meta_searcher_manager,
                    std::shared_ptr<SchedulePlanExecutor> sched_plan_executor,
                    std::shared_ptr<MetricsRegistry> metrics_registry,
-                   std::shared_ptr<EventManager> event_manager);
+                   std::shared_ptr<EventManager> event_manager,
+                   std::shared_ptr<WriteLocationManager> write_location_manager);
 
     /**
      * @brief Delete copy constructor
@@ -270,6 +276,8 @@ private:
     const std::shared_ptr<MetricsRegistry> metrics_registry_;
     // for event publish
     const std::shared_ptr<EventManager> event_manager_;
+    // to detect orphaned CLS_WRITING locations during reclaiming
+    const std::shared_ptr<WriteLocationManager> write_location_manager_;
 
     // represents the object of the associated working thread
     std::thread reclaimer_;

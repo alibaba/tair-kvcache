@@ -83,6 +83,7 @@ cc_library(
         "//kv_cache_manager/event:event_publisher",
         "//kv_cache_manager/manager:meta_searcher",
         "//kv_cache_manager/manager:schedule_plan_executor",
+        "//kv_cache_manager/manager:write_location_manager",
         "//kv_cache_manager/meta",
         "//kv_cache_manager/metrics:metrics_registry",
     ],

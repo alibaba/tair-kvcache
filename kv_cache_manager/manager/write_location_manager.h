@@ -32,6 +32,7 @@ public:
              int64_t write_timeout_seconds,
              CallBack callback);
     bool GetAndDelete(const std::string &write_session_id, WriteLocationInfo &location_info);
+    bool HasLocationId(const std::string &location_id) const;
     size_t ExpireSize() const { return session_id_map_.Size(); }
 
 private:
@@ -53,6 +54,7 @@ private:
         void DropAll();
         void Put(ExpireUnitPtr unit);
         bool GetAndDelete(const std::string &write_session_id, WriteLocationInfo &location_info);
+        bool HasLocationId(const std::string &location_id) const;
 
     private:
         mutable std::mutex mux_;

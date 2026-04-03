@@ -39,6 +39,7 @@
 #include "kv_cache_manager/manager/meta_searcher.h"
 #include "kv_cache_manager/manager/meta_searcher_manager.h"
 #include "kv_cache_manager/manager/schedule_plan_executor.h"
+#include "kv_cache_manager/manager/write_location_manager.h"
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
@@ -236,13 +237,15 @@ CacheReclaimer::CacheReclaimer(const std::size_t sampling_size_total,
                                std::shared_ptr<MetaSearcherManager> meta_searcher_manager,
                                std::shared_ptr<SchedulePlanExecutor> sched_plan_executor,
                                std::shared_ptr<MetricsRegistry> metrics_registry,
-                               std::shared_ptr<EventManager> event_manager)
+                               std::shared_ptr<EventManager> event_manager,
+                               std::shared_ptr<WriteLocationManager> write_location_manager)
     : registry_manager_(std::move(registry_manager))
     , meta_indexer_manager_(std::move(meta_indexer_manager))
     , meta_searcher_manager_(std::move(meta_searcher_manager))
     , sched_plan_executor_(std::move(sched_plan_executor))
     , metrics_registry_(std::move(metrics_registry))
     , event_manager_(std::move(event_manager))
+    , write_location_manager_(std::move(write_location_manager))
     , job_state_flag_(false)
     , pause_flag_(false)
     , sampling_size_(sampling_size_total)
@@ -936,8 +939,15 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
     for (const auto &loc_map : loc_maps) {
         std::vector<std::string> loc_id_vec;
         for (const auto &[_, loc] : loc_map) {
-            // pick out only the cache location with "serving" status
-            if (loc.status() == CacheLocationStatus::CLS_SERVING) {
+            // a location is eligible for eviction if:
+            // 1. it is in CLS_SERVING status, OR
+            // 2. it is in CLS_WRITING status but its write session is
+            //    no longer active (orphaned after a server restart)
+            const bool is_orphaned_writing =
+                loc.status() == CacheLocationStatus::CLS_WRITING &&
+                write_location_manager_ != nullptr &&
+                !write_location_manager_->HasLocationId(loc.id());
+            if (loc.status() == CacheLocationStatus::CLS_SERVING || is_orphaned_writing) {
                 if (water_level_exceed.CheckStorageTypeWaterLevelExceed()) {
                     // some storage type water level exceeded; only
                     // collect the location with matched type but
