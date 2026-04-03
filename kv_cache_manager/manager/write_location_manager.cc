@@ -1,5 +1,7 @@
 #include "kv_cache_manager/manager/write_location_manager.h"
 
+#include <algorithm>
+
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/timestamp_util.h"
 namespace kv_cache_manager {
@@ -174,6 +176,21 @@ void WriteLocationManager::Put(const std::string &write_session_id,
 
 bool WriteLocationManager::GetAndDelete(const std::string &write_session_id, WriteLocationInfo &location_info) {
     return session_id_map_.GetAndDelete(write_session_id, location_info);
+}
+
+bool WriteLocationManager::SessionIdMap::HasLocationId(const std::string &location_id) const {
+    std::unique_lock lock(mux_);
+    for (const auto &[_, unit] : unit_map_) {
+        const auto &ids = unit->write_location_info.location_ids;
+        if (std::find(ids.begin(), ids.end(), location_id) != ids.end()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool WriteLocationManager::HasLocationId(const std::string &location_id) const {
+    return session_id_map_.HasLocationId(location_id);
 }
 
 } // namespace kv_cache_manager

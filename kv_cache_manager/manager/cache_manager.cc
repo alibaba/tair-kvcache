@@ -171,7 +171,8 @@ bool CacheManager::Init(int32_t schedule_plan_executor_thread_count,
                                                         meta_searcher_manager_,
                                                         schedule_plan_executor_,
                                                         metrics_registry_,
-                                                        event_manager_);
+                                                        event_manager_,
+                                                        write_location_manager_);
     if (cache_reclaimer_->Start() != EC_OK) {
         KVCM_LOG_ERROR("CacheManager init failed");
         return false;
