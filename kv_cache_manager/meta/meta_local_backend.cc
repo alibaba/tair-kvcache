@@ -390,6 +390,7 @@ ErrorCode MetaLocalBackend::PutMetaData(const FieldMap &field_map) noexcept {
 }
 
 ErrorCode MetaLocalBackend::GetMetaData(FieldMap &out_field_map) noexcept {
+    out_field_map.clear();
     std::lock_guard<std::mutex> guard(mutex_);
     if (metadata_.empty()) {
         return EC_NOENT;
