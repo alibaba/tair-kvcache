@@ -817,6 +817,10 @@ class HiCacheKVCM(HiCacheStorage):
     ##################################################
 
     def _tp_rank_to_spec_name(self, tp_rank: int) -> str:
+        # NOTE: Changed from f"tp_{tp_rank}" to f"tp_{tp_rank}_full" to distinguish
+        # KV attention specs ("Full" group) from Mamba/SSM specs ("Linear" group)
+        # in hybrid model support.  This is a breaking change: cached data written
+        # under the old "tp_{rank}" names will not be found by this version.
         return f"tp_{tp_rank}_full"
 
     def _tp_rank_to_linear_spec_name(self, tp_rank: int) -> str:

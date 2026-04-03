@@ -769,10 +769,11 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
             return policy->ExistsForWrite(m);
         }
         const auto &groups = instance_info->location_spec_groups();
-        auto it = std::lower_bound(groups.begin(),
-                                   groups.end(),
-                                   location_spec_group_names[i],
-                                   [](const LocationSpecGroup &g, const std::string &name) { return g.name() < name; });
+        auto it =
+            std::lower_bound(groups.begin(),
+                             groups.end(),
+                             location_spec_group_names[i],
+                             [](const LocationSpecGroup &g, const std::string_view &name) { return g.name() < name; });
         if (it == groups.end() || it->name() != location_spec_group_names[i]) {
             return policy->ExistsForWrite(m);
         }

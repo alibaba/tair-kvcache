@@ -36,6 +36,10 @@ ClientErrorCode MooncakeSdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_b
         KVCM_LOG_WARN("Init mooncake sdk failed, self_location_spec_name can not empty");
         return ER_INVALID_SDKBACKEND_CONFIG;
     }
+    if (sdk_backend_config_->spec_byte_sizes_per_block().empty()) {
+        KVCM_LOG_WARN("Init mooncake sdk failed, spec_byte_sizes_per_block is empty");
+        return ER_INVALID_SDKBACKEND_CONFIG;
+    }
     storage_config_ = storage_config;
     if (!storage_config_) {
         KVCM_LOG_WARN("Init mooncake sdk failed, empty storage config");
@@ -96,6 +100,11 @@ ClientErrorCode MooncakeSdk::Get(const std::vector<DataStorageUri> &remote_uris,
         KVCM_LOG_ERROR("mooncake get failed, remote_uris size not equal to local_buffer size");
         return ER_INVALID_PARAMS;
     }
+    // 防御性校验上界：取所有允许的 byte_size_per_block 的最大值
+    int64_t max_allowed_size = 0;
+    for (const auto &[spec_name, byte_size_per_block] : sdk_backend_config_->spec_byte_sizes_per_block()) {
+        max_allowed_size = std::max(max_allowed_size, byte_size_per_block);
+    }
     for (int i = 0; i < remote_uris.size(); i++) {
         MooncakeRemoteItem item = MooncakeRemoteItem::FromUri(remote_uris[i]);
         std::vector<Slice_t> slices;
@@ -108,11 +117,6 @@ ClientErrorCode MooncakeSdk::Get(const std::vector<DataStorageUri> &remote_uris,
             KVCM_LOG_WARN(
                 "mooncake get but iovs are invalid, key: [%s], read_len: [%zu] is zero", item.key.c_str(), read_len);
             return ER_INVALID_PARAMS;
-        }
-        // 防御性校验：read_len 必须不超过任意允许的 byte_size_per_block（取最大值作为上界）
-        int64_t max_allowed_size = 0;
-        for (const auto &[spec_name, byte_size_per_block] : sdk_backend_config_->spec_byte_sizes_per_block()) {
-            max_allowed_size = std::max(max_allowed_size, byte_size_per_block);
         }
         if (read_len > max_allowed_size) {
             KVCM_LOG_WARN(
@@ -140,6 +144,11 @@ ClientErrorCode MooncakeSdk::Put(const std::vector<DataStorageUri> &remote_uris,
         KVCM_LOG_WARN("mooncake put failed, remote_uris size not equal to local_buffers size");
         return ER_INVALID_PARAMS;
     }
+    // 防御性校验上界：取所有允许的 byte_size_per_block 的最大值
+    int64_t max_allowed_size = 0;
+    for (const auto &[spec_name, byte_size_per_block] : sdk_backend_config_->spec_byte_sizes_per_block()) {
+        max_allowed_size = std::max(max_allowed_size, byte_size_per_block);
+    }
     for (int i = 0; i < remote_uris.size(); i++) {
         MooncakeRemoteItem item = MooncakeRemoteItem::FromUri(remote_uris[i]);
         auto [write_len, success] = extractSlices(item, local_buffers[i], slices);
@@ -151,11 +160,6 @@ ClientErrorCode MooncakeSdk::Put(const std::vector<DataStorageUri> &remote_uris,
             KVCM_LOG_WARN(
                 "mooncake put but iovs are invalid, key: [%s], write_len: [%zu] is zero", item.key.c_str(), write_len);
             return ER_INVALID_PARAMS;
-        }
-        // 防御性校验：write_len 必须不超过任意允许的 byte_size_per_block（取最大值作为上界）
-        int64_t max_allowed_size = 0;
-        for (const auto &[spec_name, byte_size_per_block] : sdk_backend_config_->spec_byte_sizes_per_block()) {
-            max_allowed_size = std::max(max_allowed_size, byte_size_per_block);
         }
         if (write_len > max_allowed_size) {
             KVCM_LOG_WARN(

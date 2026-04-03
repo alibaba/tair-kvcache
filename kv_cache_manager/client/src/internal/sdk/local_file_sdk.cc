@@ -257,6 +257,11 @@ ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_ur
         }
 
         // 使用 URI 的 size 计算 offset
+        // ASSUMPTION: All items in a single batch must have the same `size`.
+        // The formula `blkid * size` produces correct, non-overlapping offsets
+        // only under this invariant.  The current calling convention guarantees
+        // this (separate sessions for different spec sizes), but the SDK does
+        // not enforce it explicitly.
         offset = item.blkid * item.size;
 
         for (auto &iov : local_buffer.iovs) {
@@ -387,6 +392,7 @@ ClientErrorCode LocalFileSdk::DoPut(const std::vector<DataStorageUri> &remote_ur
 
     char *dst = static_cast<char *>(file_mem);
     // url assumed sorted by blkid
+    // ASSUMPTION: same as DoGet — all items in a batch must share the same `size`.
     for (size_t i = 0; i < items.size(); ++i) {
         auto &item = items[i];
         auto &local_buffer = local_buffers[i];
