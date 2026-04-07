@@ -256,6 +256,22 @@ class HiCacheKVCM(HiCacheStorage):
         trace_id: str,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+        # NOTE on cross-rank consistency:
+        # start_write_cache and SaveKvCaches failures are synchronised
+        # across ranks (via broadcast / all_reduce) so every rank
+        # converges on the same result.
+        #
+        # finish_write_cache is called only on rank 0 *after* the
+        # all_reduce has already completed. If it throws, rank 0
+        # overrides flag to False while other ranks keep flag = True.
+        # Adding a second all_reduce just for this error path would
+        # penalise the hot path for a rare event. The practical
+        # consequence is that rank 1+ callers may believe the write
+        # succeeded, but the manager was never told to commit, so a
+        # subsequent batch_get on those blocks will miss. This is an
+        # accepted inconsistency -- the caller should tolerate cache
+        # misses gracefully.
+
         # Prepare keys
         block_keys, len_prefix, len_new = self._prepare_block_keys(keys, extra_info)
 
@@ -269,7 +285,11 @@ class HiCacheKVCM(HiCacheStorage):
                 "write_timeout_seconds": self.write_timeout_seconds,
             }
             logger.debug(f"start_write_cache {request=}")
-            result = self._manager_client.start_write_cache(request)
+            try:
+                result = self._manager_client.start_write_cache(request)
+            except Exception as e:
+                logger.error(f"start_write_cache failed: {e}")
+                result = None
 
             if self.tp_world_size > 1:
                 torch.distributed.broadcast_object_list(
@@ -283,6 +303,10 @@ class HiCacheKVCM(HiCacheStorage):
             result = recv[0]
 
         logger.debug(f"start_write_cache {result=}")
+
+        if result is None:
+            return [False] * len_new
+
         locations = result["locations"]
         write_session_id = result["write_session_id"]
         block_mask = result["block_mask"]
@@ -296,14 +320,17 @@ class HiCacheKVCM(HiCacheStorage):
                            f"aborting write session {write_session_id}")
             if self.tp_rank == 0:
                 # Mark all locations as failed so manager cleans them up.
-                self._manager_client.finish_write_cache(
-                    {
-                        "trace_id": finish_trace_id,
-                        "instance_id": self.instance_id,
-                        "write_session_id": write_session_id,
-                        "success_blocks": {"bool_masks": {"values": [False] * len(locations)}},
-                    }
-                )
+                try:
+                    self._manager_client.finish_write_cache(
+                        {
+                            "trace_id": finish_trace_id,
+                            "instance_id": self.instance_id,
+                            "write_session_id": write_session_id,
+                            "success_blocks": {"bool_masks": {"values": [False] * len(locations)}},
+                        }
+                    )
+                except Exception as e:
+                    logger.error(f"finish_write_cache failed: {e}")
             return [False] * len_new
 
         unmatched = len(save_indices)
@@ -311,38 +338,50 @@ class HiCacheKVCM(HiCacheStorage):
         # Early return if all new blocks are already cached.
         if unmatched == 0:
             if self.tp_rank == 0:
-                self._manager_client.finish_write_cache(
-                    {
-                        "trace_id": finish_trace_id,
-                        "instance_id": self.instance_id,
-                        "write_session_id": write_session_id,
-                        "success_blocks": {"bool_masks": {"values": [False] * len(locations)}},
-                    }
-                )
+                try:
+                    self._manager_client.finish_write_cache(
+                        {
+                            "trace_id": finish_trace_id,
+                            "instance_id": self.instance_id,
+                            "write_session_id": write_session_id,
+                            "success_blocks": {"bool_masks": {"values": [False] * len(locations)}},
+                        }
+                    )
+                except Exception as e:
+                    logger.error(f"finish_write_cache failed: {e}")
             return [True] * len_new
 
         assert unmatched == len(locations)
 
-        # Data transfer preparation
-        buffer_ptrs, buffer_sizes = self.mem_pool_host.get_page_buffer_meta(host_indices)
-        buffer_ptrs = [buffer_ptr for i, buffer_ptr in enumerate(buffer_ptrs) if (i // self.kv_factor) in save_indices]
-        buffer_sizes = [buffer_size for i, buffer_size in enumerate(
-            buffer_sizes) if (i // self.kv_factor) in save_indices]
+        # Data transfer preparation and execution.
+        # Wrapped in try-except so that every rank always reaches the
+        # all_reduce below, preventing cross-rank NCCL/gloo hangs.
+        try:
+            buffer_ptrs, buffer_sizes = self.mem_pool_host.get_page_buffer_meta(host_indices)
+            buffer_ptrs = [buffer_ptr for i, buffer_ptr in enumerate(buffer_ptrs) if (i // self.kv_factor) in save_indices]
+            buffer_sizes = [buffer_size for i, buffer_size in enumerate(
+                buffer_sizes) if (i // self.kv_factor) in save_indices]
 
-        # Extract URIs and prepare buffers
-        uris = self._extract_uris(locations)
-        buffers = self._prepare_buffers(buffer_ptrs, buffer_sizes)
-        assert len(uris) == len(buffers)
-        # Perform data transfer
-        start_time = time.perf_counter()
-        result = self.transfer_client.SaveKvCaches(uris, buffers)
-        end_time = time.perf_counter()
-        self.backup_pgs.append(unmatched)
-        self.backup_bandwidth.append(unmatched * self.location_spec_size / (1 << 30) / (end_time - start_time))
-        logger.debug(f"SaveKvCaches {result=}")
+            # Extract URIs and prepare buffers
+            uris = self._extract_uris(locations)
+            buffers = self._prepare_buffers(buffer_ptrs, buffer_sizes)
+            assert len(uris) == len(buffers)
+            # Perform data transfer
+            start_time = time.perf_counter()
+            result = self.transfer_client.SaveKvCaches(uris, buffers)
+            end_time = time.perf_counter()
+            self.backup_pgs.append(unmatched)
+            self.backup_bandwidth.append(unmatched * self.location_spec_size / (1 << 30) / (end_time - start_time))
+            logger.debug(f"SaveKvCaches {result=}")
+
+            flag = (result[0] == kvcm_py_client.ClientErrorCode.ER_OK)
+            if not flag:
+                logger.error(f"SaveKvCaches error: {result}")
+        except Exception as e:
+            logger.error(f"Data transfer (SaveKvCaches) failed: {e}")
+            flag = False
 
         # Finish write cache
-        flag = (result[0] == kvcm_py_client.ClientErrorCode.ER_OK)
         if self.tp_world_size > 1:
             flag_tensor = torch.tensor(flag, dtype=torch.int)
             torch.distributed.all_reduce(
@@ -354,14 +393,22 @@ class HiCacheKVCM(HiCacheStorage):
 
         finish_mask = [flag] * unmatched
         if self.tp_rank == 0:
-            self._manager_client.finish_write_cache(
-                {
-                    "trace_id": finish_trace_id,
-                    "instance_id": self.instance_id,
-                    "write_session_id": write_session_id,
-                    "success_blocks": {"bool_masks": {"values": finish_mask}},
-                }
-            )
+            try:
+                self._manager_client.finish_write_cache(
+                    {
+                        "trace_id": finish_trace_id,
+                        "instance_id": self.instance_id,
+                        "write_session_id": write_session_id,
+                        "success_blocks": {"bool_masks": {"values": finish_mask}},
+                    }
+                )
+            except Exception as e:
+                logger.error(f"finish_write_cache failed: {e}")
+                # This sets flag = False on rank 0 only; other ranks
+                # still have the post-all_reduce value (True if data
+                # transfer succeeded). See the NOTE at the top of
+                # _batch_set for why we accept this inconsistency.
+                flag = False
 
         # Build result list: 1:1 positional mapping with input keys
         # - keys not in save_indices → True
