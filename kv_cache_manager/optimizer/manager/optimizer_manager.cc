@@ -150,7 +150,13 @@ bool OptimizerManager::CreateRadixTreeIndex(const OptInstanceConfig &instance_co
     return true;
 }
 
-void OptimizerManager::DirectRun() { optimizer_runner_->Run(config_); }
+void OptimizerManager::DirectRun() {
+    if (!optimizer_runner_) {
+        KVCM_LOG_ERROR("optimizer_runner_ is not initialized");
+        return;
+    }
+    optimizer_runner_->Run(config_);
+}
 
 WriteCacheRes OptimizerManager::WriteCache(const std::string &instance_id,
                                            const std::string &trace_id,
