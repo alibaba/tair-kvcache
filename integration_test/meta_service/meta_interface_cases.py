@@ -567,3 +567,17 @@ class MetaServiceTestBase(abc.ABC, TestBase, unittest.TestCase):
         self.assertGreater(leader_ep["meta_http_port"], 0)
         # custom_info 字段应存在（未配置时为空字符串）
         self.assertIn("custom_info", leader_ep)
+
+    def test_get_cluster_info_unregistered_instance(self):
+        """测试 GetClusterInfo 在 instance_id 未注册时仍能正常返回"""
+        req = {
+            "trace_id": self._trace_id,
+            "instance_id": "not_registered_instance",
+        }
+        resp = self._client.get_cluster_info(req)
+        self.assertIn("header", resp)
+        self.assertEqual(resp["header"]["status"]["code"], "OK",
+                         "GetClusterInfo should succeed even with an unregistered instance_id")
+        self.assertIn("self_node_id", resp)
+        self.assertIn("leader_node_id", resp)
+        self.assertEqual(resp["self_node_id"], resp["leader_node_id"])

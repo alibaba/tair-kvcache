@@ -8,8 +8,12 @@
 
 #include "kv_cache_manager/client/src/internal/stub/grpc_stub.h"
 #include "kv_cache_manager/common/logger.h"
+#include "kv_cache_manager/common/standard_uri.h"
 #include "kv_cache_manager/common/unittest.h"
+#include "kv_cache_manager/config/coordination_memory_backend.h"
+#include "kv_cache_manager/config/leader_elector.h"
 #include "kv_cache_manager/config/model_deployment.h"
+#include "kv_cache_manager/config/node_endpoint_info.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/manager/cache_manager.h"
@@ -21,10 +25,6 @@
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/service/grpc_service/meta_service_grpc.h"
 #include "kv_cache_manager/service/meta_service_impl.h"
-#include "kv_cache_manager/config/coordination_memory_backend.h"
-#include "kv_cache_manager/config/leader_elector.h"
-#include "kv_cache_manager/config/node_endpoint_info.h"
-#include "kv_cache_manager/common/standard_uri.h"
 using namespace kv_cache_manager;
 
 namespace {
@@ -920,6 +920,12 @@ TEST_F(GrpcStubTest, TestGetClusterInfoWithLeaderElector) {
     EXPECT_EQ(9001, info.leader_endpoint.meta_rpc_port);
     EXPECT_EQ(9002, info.leader_endpoint.meta_http_port);
     EXPECT_EQ("test_custom_info", info.leader_endpoint.custom_info);
+
+    // 使用未注册的 instance_id 调用 GetClusterInfo，应同样成功（fallback 到全局 collector）
+    auto [ec2, info2] = stub_->GetClusterInfo("trace2", "not_registered_instance");
+    ASSERT_EQ(ER_OK, ec2);
+    EXPECT_EQ("node1", info2.self_node_id);
+    EXPECT_FALSE(info2.leader_node_id.empty());
 
     leader_elector->Stop();
 }

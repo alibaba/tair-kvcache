@@ -138,7 +138,12 @@ void MetaServiceHttp::TrimCache(coro_http::coro_http_connection *http_conn,
 void MetaServiceHttp::GetClusterInfo(coro_http::coro_http_connection *http_conn,
                                      proto::meta::GetClusterInfoRequest *request,
                                      proto::meta::GetClusterInfoResponse *response) {
-    API_CONTEXT_GET_COLLECTOR_AND_INIT_HTTP(GetClusterInfo, __NOTHING__);
+    // instance_id 可能尚未注册（如 RegisterInstance 之前），此时 fallback 到全局 collector
+    auto metrics_collector = get_metrics_collector_from_map_for_GetClusterInfo(request->instance_id());
+    if (metrics_collector == nullptr) {
+        metrics_collector = KVCM_METRICS_COLLECTOR_(GetClusterInfo);
+    }
+    API_CONTEXT_INIT(metrics_collector, GetHttpClientIp, http_conn)
     KVCM_LOG_DEBUG("[traceId: %s] GetClusterInfo request details: %s",
                    request->trace_id().c_str(),
                    request->ShortDebugString().c_str());

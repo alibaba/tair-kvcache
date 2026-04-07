@@ -43,6 +43,9 @@ std::string ExtractIpFromPeer(const std::string &peer);
     }
 #endif
 
+// NOTE: 以下两个宏在 instance_id 未注册时会直接返回 INSTANCE_NOT_EXIST 错误。
+// 对于不强制要求 instance 已注册的接口（如 GetClusterInfo），需自行获取 collector
+// 并 fallback 到全局 collector，而非使用这两个宏。
 #ifndef API_CONTEXT_GET_COLLECTOR_AND_INIT_GRPC
 #define API_CONTEXT_GET_COLLECTOR_AND_INIT_GRPC(method, return_value)                                                  \
     API_CONTEXT_GET_AND_INIT_COLLECTOR(method, return_value)                                                           \
