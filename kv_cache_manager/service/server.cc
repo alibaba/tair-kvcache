@@ -8,6 +8,7 @@
 #include "kv_cache_manager/config/coordination_backend.h"
 #include "kv_cache_manager/config/coordination_backend_factory.h"
 #include "kv_cache_manager/config/leader_elector.h"
+#include "kv_cache_manager/config/node_endpoint_info.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/event/log_event_publisher.h"
@@ -26,8 +27,6 @@
 #include "kv_cache_manager/service/http_service/debug_service_http.h"
 #include "kv_cache_manager/service/http_service/meta_service_http.h"
 #include "kv_cache_manager/service/meta_service_impl.h"
-#include "kv_cache_manager/config/node_endpoint_info.h"
-
 
 namespace kv_cache_manager {
 
@@ -313,11 +312,10 @@ bool Server::CreateLeaderElector() {
         host = NetUtil::GetLocalIp();
     }
     if (node_id.empty()) {
-        node_id = host + ":" + std::to_string(config_.GetServiceAdminHttpPort()) + "_" +
-                  StringUtil::GenerateRandomString(16);
+        node_id =
+            host + ":" + std::to_string(config_.GetServiceAdminHttpPort()) + "_" + StringUtil::GenerateRandomString(16);
     }
-    coordination_backend_ =
-        CoordinationBackendFactory::CreateAndInitCoordinationBackend(coordination_uri);
+    coordination_backend_ = CoordinationBackendFactory::CreateAndInitCoordinationBackend(coordination_uri);
     if (!coordination_backend_) {
         KVCM_LOG_ERROR("coordination_backend[%s] init failed", coordination_uri.c_str());
         return false;
@@ -343,10 +341,10 @@ bool Server::CreateLeaderElector() {
 
         ErrorCode ec = leader_elector_->SetSelfNodeInfo(node_info);
         if (ec != EC_OK) {
-            KVCM_LOG_WARN("failed to write node info for node_id[%s], ec=%d", node_id.c_str(), ec);
-        } else {
-            KVCM_LOG_INFO("node info written for node_id[%s]", node_id.c_str());
+            KVCM_LOG_ERROR("failed to write node info for node_id[%s], ec=%d", node_id.c_str(), ec);
+            return false;
         }
+        KVCM_LOG_INFO("node info written for node_id[%s]", node_id.c_str());
     }
 
     return true;
