@@ -1,6 +1,7 @@
 #include "kv_cache_manager/meta/meta_indexer.h"
 
 #include <algorithm>
+#include <cinttypes>
 #include <cstddef>
 #include <cstdint>
 #include <set>
@@ -259,14 +260,18 @@ ErrorCode MetaIndexer::Init(const std::string &instance_id, const std::shared_pt
     }
     KVCM_LOG_INFO(
         "instance[%s] meta indexer init success, storage backend type[%s], mutex shard num[%lu], max key count[%lu], "
-        "batch key size[%lu], search cache size[%lu], key_count[%lu]",
+        "batch key size[%lu], search cache size[%lu], key_count[%lu], persist_metadata_interval_time_ms[%zu], "
+        "storage usage data[%s], instance version[%" PRIu8 "]",
         instance_id_.c_str(),
         storage_->GetStorageType().c_str(),
         mutex_shard_num_,
         max_key_count_,
         batch_key_size_,
         config->GetMetaCachePolicyConfig()->GetCapacity(),
-        key_count_.load());
+        key_count_.load(),
+        persist_metadata_interval_time_ms_,
+        version_ == InstanceVersion::VERSION_1 ? storage_usage_data_.ToJsonString().c_str() : "N/A",
+        static_cast<std::uint8_t>(version_));
     return EC_OK;
 }
 
@@ -739,6 +744,8 @@ std::uint64_t MetaIndexer::SubStorageUsageByType(const DataStorageType &type, co
     return storage_usage_data_.SubStorageUsageByType(type, value);
 }
 
+MetaIndexer::InstanceVersion MetaIndexer::GetVersion() const noexcept { return version_; }
+
 // Combining batch size and lock granularity size to assemble batch data
 void MetaIndexer::MakeBatches(const KeyVector &keys,
                               PropertyMapVector &properties,
@@ -791,12 +798,17 @@ ErrorCode MetaIndexer::RecoverMetaData() noexcept {
     auto ec = storage_->GetMetaData(metadata_map);
     if (ec == EC_NOENT) {
         KVCM_LOG_INFO("there is no metadata key in storage backend, no need to recover metadata");
+        // no metadata to recover (new instance or persistence turned
+        // off), safe to set to the newest version
+        // version_ remains InstanceVersion::VERSION_1
         return ec;
     }
     if (ec != EC_OK) {
         KVCM_LOG_ERROR("meta indexer read metadata from storage backend failed, ec[%d]", ec);
         return ec;
     }
+
+    // METADATA_PROPERTY_KEY_COUNT *must* always be presented
     std::string key_count_str = metadata_map[METADATA_PROPERTY_KEY_COUNT];
     int64_t key_count;
     bool is_valid = StringUtil::StrToInt64(key_count_str.c_str(), key_count);
@@ -807,12 +819,16 @@ ErrorCode MetaIndexer::RecoverMetaData() noexcept {
     }
     key_count_ = key_count;
 
+    // METADATA_PROPERTY_STORAGE_USAGE_DATA decides the behavior version
     if (const auto it = metadata_map.find(METADATA_PROPERTY_STORAGE_USAGE_DATA); it != metadata_map.end()) {
         if (storage_usage_data_.Deserialize(it->second) != EC_OK) {
-            KVCM_LOG_WARN("meta indexer deserialize storage usage data failed, resetting to zero, str: [%s]",
-                          it->second.c_str());
-            storage_usage_data_.Reset();
+            KVCM_LOG_ERROR("meta indexer deserialize storage usage data failed, str: [%s]", it->second.c_str());
+            return EC_ERROR;
         }
+        // version_ remains InstanceVersion::VERSION_1
+    } else {
+        // METADATA_PROPERTY_STORAGE_USAGE_DATA do not exist
+        version_ = InstanceVersion::VERSION_0;
     }
 
     return EC_OK;
@@ -824,7 +840,9 @@ void MetaIndexer::PersistMetaData() noexcept {
     if (current_time >= last_persist_metadata_time_ + persist_metadata_interval_time_ms_) {
         std::map<std::string, std::string> metadata_map;
         metadata_map[METADATA_PROPERTY_KEY_COUNT] = std::to_string(key_count_);
-        metadata_map[METADATA_PROPERTY_STORAGE_USAGE_DATA] = storage_usage_data_.Serialize();
+        if (version_ == InstanceVersion::VERSION_1) {
+            metadata_map[METADATA_PROPERTY_STORAGE_USAGE_DATA] = storage_usage_data_.Serialize();
+        }
         auto ec = storage_->PutMetaData(metadata_map);
         if (ec != EC_OK) {
             KVCM_LOG_ERROR("meta indexer persist metadata failed, ec[%d]", ec);

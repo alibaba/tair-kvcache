@@ -96,11 +96,38 @@ public:
     size_t GetCacheUsage() const noexcept;
 
     // storage usage interfaces
+    //
+    // notes about backward compatibility:
+    //
+    // GetStorageUsage() is accurate for hybrid model arch, and should
+    // only be used under InstanceVersion::VERSION_1
+    //
+    // similar logic for Get/Add/Sub-StorageUsageByType() are already
+    // being used under InstanceVersion::VERSION_0; however they are
+    // only accurate under InstanceVersion::VERSION_1
+    //
+    // see also notes for instance behavior version
     [[nodiscard]] std::uint64_t GetStorageUsage() const noexcept;
     [[nodiscard]] std::uint64_t GetStorageUsageByType(const DataStorageType &type) const noexcept;
     void SetStorageUsageByType(const DataStorageType &type, std::uint64_t value) noexcept;
     std::uint64_t AddStorageUsageByType(const DataStorageType &type, std::uint64_t value) noexcept;
     std::uint64_t SubStorageUsageByType(const DataStorageType &type, std::uint64_t value) noexcept;
+
+    // instance behavior version
+    enum class InstanceVersion : std::uint8_t {
+        // version 0: metadata persisted = [
+        //     METADATA_PROPERTY_KEY_COUNT,
+        // ]
+        VERSION_0 = 0,
+
+        // version 1: metadata persisted = [
+        //     METADATA_PROPERTY_KEY_COUNT,
+        //     METADATA_PROPERTY_STORAGE_USAGE_DATA,
+        // ]
+        VERSION_1 = 1,
+    };
+
+    [[nodiscard]] InstanceVersion GetVersion() const noexcept;
 
 private:
     class ScopedBatchLock;
@@ -179,6 +206,7 @@ private:
     size_t batch_key_size_ = MetaIndexerConfig::kDefaultBatchKeySize;
     std::string instance_id_;
     StorageUsageData storage_usage_data_;
+    InstanceVersion version_ = InstanceVersion::VERSION_1;
 };
 
 } // namespace kv_cache_manager

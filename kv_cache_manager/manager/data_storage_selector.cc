@@ -4,6 +4,7 @@
 #include <cassert>
 #include <cinttypes>
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <utility>
@@ -365,7 +366,23 @@ std::size_t DataStorageSelector::CalcGroupUsedSize(
         }
 
         meta_indexer->PersistMetaData();
-        group_used_byte_size += meta_indexer->GetStorageUsage();
+        if (meta_indexer->GetVersion() == MetaIndexer::InstanceVersion::VERSION_0) {
+            const std::size_t ins_used_key_cnt = meta_indexer->GetKeyCount();
+
+            std::size_t byte_size_per_key = 0;
+            for (auto &location_spec_info : instance_info->location_spec_infos()) {
+                byte_size_per_key += location_spec_info.size();
+            }
+            const std::size_t ins_used_byte_size = byte_size_per_key * ins_used_key_cnt;
+
+            group_used_byte_size += ins_used_byte_size;
+        } else if (meta_indexer->GetVersion() == MetaIndexer::InstanceVersion::VERSION_1) {
+            group_used_byte_size += meta_indexer->GetStorageUsage();
+        } else {
+            PREFIX_LOG(WARN,
+                       "unknown meta_indexer version: [%" PRIu8 "]",
+                       static_cast<std::uint8_t>(meta_indexer->GetVersion()));
+        }
     }
 
     return group_used_byte_size;
