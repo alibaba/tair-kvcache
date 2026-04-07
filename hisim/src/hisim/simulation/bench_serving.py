@@ -926,6 +926,7 @@ class BenchmarkMetrics:
     max_concurrent_requests: int = 0
     mean_queue_ms: float = 0.0
     prefix_cache_reused_ratio: float = 0.0
+    disk_prefetch_ratio: float = 0.0
 
 
 SHAREGPT_URL = "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main/ShareGPT_V3_unfiltered_cleaned_split.json"
@@ -2429,6 +2430,7 @@ async def benchmark(
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
             "max_concurrent_requests": metrics.max_concurrent_requests,
             "prefix_cache_reused_ratio": metrics.prefix_cache_reused_ratio,
+            "disk_prefetch_ratio": metrics.disk_prefetch_ratio,
         }
     else:
         print(f"Error running benchmark for request rate: {request_rate}")
