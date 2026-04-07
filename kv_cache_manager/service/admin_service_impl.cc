@@ -11,6 +11,7 @@
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/config/leader_elector.h"
+#include "kv_cache_manager/config/node_endpoint_info.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
@@ -19,8 +20,6 @@
 #include "kv_cache_manager/service/util/manager_message_proto_util.h"
 #include "kv_cache_manager/service/util/proto_message_json_util.h"
 #include "kv_cache_manager/service/util/service_call_guard.h"
-
-#include "kv_cache_manager/config/node_endpoint_info.h"
 
 // TODO(rui): move into common.h
 #define API_CALL_GUARD(api_name, is_leader_only)                                                                       \
@@ -868,10 +867,6 @@ void AdminServiceImpl::GetManagerClusterInfo(RequestContext *request_context,
                           request->trace_id().c_str(),
                           leader_node_id.c_str(),
                           ec);
-            status->set_code(proto::admin::INTERNAL_ERROR);
-            status->set_message("Leader endpoint unavailable: leader exists but node info lookup failed");
-            request_context->set_status_code(status->code());
-            return;
         }
     }
 
