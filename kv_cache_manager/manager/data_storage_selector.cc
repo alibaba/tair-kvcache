@@ -382,6 +382,7 @@ std::size_t DataStorageSelector::CalcGroupUsedSize(
             PREFIX_LOG(WARN,
                        "unknown meta_indexer version: [%" PRIu8 "]",
                        static_cast<std::uint8_t>(meta_indexer->GetVersion()));
+            continue; // in case of more logic added below this
         }
     }
 
