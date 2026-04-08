@@ -1241,6 +1241,8 @@ TEST_F(MetaSearcherTest, TestPrefixMatchMergesSpecsByStorageType) {
         const auto &loc = out_locations[i];
         // Both locations are NFS, so specs from both should be merged
         ASSERT_EQ(loc.location_specs().size(), 2) << "key index " << i << " should have 2 specs merged from same type";
+        EXPECT_EQ(loc.spec_size(), loc.location_specs().size())
+            << "spec_size must equal location_specs count after merge";
         EXPECT_EQ(loc.type(), DataStorageType::DATA_STORAGE_TYPE_NFS);
         for (const auto &spec : loc.location_specs()) {
             EXPECT_FALSE(spec.uri().empty());
@@ -1305,6 +1307,8 @@ TEST_F(MetaSearcherTest, TestBatchGetMergesSpecsByStorageType) {
     {
         const auto &loc = out_locations[0];
         ASSERT_EQ(loc.location_specs().size(), 2);
+        EXPECT_EQ(loc.spec_size(), loc.location_specs().size())
+            << "spec_size must equal location_specs count after merge";
         EXPECT_EQ(loc.type(), DataStorageType::DATA_STORAGE_TYPE_NFS);
     }
 
@@ -1312,6 +1316,8 @@ TEST_F(MetaSearcherTest, TestBatchGetMergesSpecsByStorageType) {
     {
         const auto &loc = out_locations[1];
         ASSERT_EQ(loc.location_specs().size(), 1);
+        EXPECT_EQ(loc.spec_size(), loc.location_specs().size())
+            << "spec_size must equal location_specs count for single location";
         EXPECT_EQ(loc.location_specs()[0].name(), "tp0");
         EXPECT_EQ(loc.type(), DataStorageType::DATA_STORAGE_TYPE_MOONCAKE);
     }

@@ -74,12 +74,12 @@ CacheLocation SelectAndMergeForMatch(SelectLocationPolicy *policy,
     CacheLocation result;
     result.set_status(CacheLocationStatus::CLS_SERVING);
     result.set_type(winner->type());
-    result.set_spec_size(winner->spec_size());
     std::vector<LocationSpec> specs;
     specs.reserve(merged_specs.size());
     for (auto &[name, spec] : merged_specs) {
         specs.push_back(std::move(spec));
     }
+    result.set_spec_size(specs.size());
     result.set_location_specs(std::move(specs));
     return result;
 }

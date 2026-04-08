@@ -454,6 +454,8 @@ class HiCacheKVCM(HiCacheStorage):
                 recv, src=0, group=self.storage_tp_group
             )
             result = recv[0]
+        if result is None:
+            return [False] * len_new
 
         logger.debug(f"start_write_cache {result=}")
 
@@ -623,7 +625,11 @@ class HiCacheKVCM(HiCacheStorage):
                         "location_spec_group_names": ["Linear"] * len(block_keys),
                         "write_timeout_seconds": self.write_timeout_seconds,
                     }
-                    write_result = self._manager_client.start_write_cache(request)
+                    try:
+                        write_result = self._manager_client.start_write_cache(request)
+                    except Exception as e:
+                        logger.error(f"start_write_cache failed on rank 0: {trace_id=} {e=}")
+                        write_result = None
                     if self.tp_world_size > 1:
                         torch.distributed.broadcast_object_list(
                             [write_result], src=0, group=self.storage_tp_group
@@ -634,6 +640,9 @@ class HiCacheKVCM(HiCacheStorage):
                         recv, src=0, group=self.storage_tp_group
                     )
                     write_result = recv[0]
+                if write_result is None:
+                    results[transfer.name] = [False] * len(mamba_keys)
+                    continue
 
                 locations = write_result["locations"]
                 write_session_id = write_result["write_session_id"]

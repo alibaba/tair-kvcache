@@ -334,3 +334,54 @@ TEST_F(SelectLocationPolicyTest, TestNamedStorageWeightedExistsForWriteWithSpecN
         ASSERT_TRUE(policy.ExistsForWrite(location_map, {"tp0_F0"}));
     }
 }
+
+TEST_F(SelectLocationPolicyTest, TestIsSameStorageInstanceRejectsCrossType) {
+    StaticWeightSLPolicy policy;
+    // Same type, same host → true
+    {
+        CacheLocation nfs_a;
+        nfs_a.set_type(D_NFS);
+        nfs_a.set_location_specs({LocationSpec("tp0", "nfs://host01/a/tp0")});
+        CacheLocation nfs_b;
+        nfs_b.set_type(D_NFS);
+        nfs_b.set_location_specs({LocationSpec("tp1", "nfs://host01/b/tp1")});
+        EXPECT_TRUE(policy.IsSameStorageInstance(nfs_a, nfs_b));
+    }
+    // Different type (NFS vs Mooncake), same host → false
+    {
+        CacheLocation nfs_loc;
+        nfs_loc.set_type(D_NFS);
+        nfs_loc.set_location_specs({LocationSpec("tp0", "nfs://host01/a/tp0")});
+        CacheLocation mc_loc;
+        mc_loc.set_type(D_MOONCAKE);
+        mc_loc.set_location_specs({LocationSpec("tp0", "mooncake://host01/b/tp0")});
+        EXPECT_FALSE(policy.IsSameStorageInstance(nfs_loc, mc_loc));
+    }
+    // Same type, different host → false
+    {
+        CacheLocation nfs_a;
+        nfs_a.set_type(D_NFS);
+        nfs_a.set_location_specs({LocationSpec("tp0", "nfs://host01/a/tp0")});
+        CacheLocation nfs_b;
+        nfs_b.set_type(D_NFS);
+        nfs_b.set_location_specs({LocationSpec("tp0", "nfs://host02/b/tp0")});
+        EXPECT_FALSE(policy.IsSameStorageInstance(nfs_a, nfs_b));
+    }
+    // Both empty specs → true (vacuously same)
+    {
+        CacheLocation empty_a;
+        empty_a.set_type(D_NFS);
+        CacheLocation empty_b;
+        empty_b.set_type(D_NFS);
+        EXPECT_TRUE(policy.IsSameStorageInstance(empty_a, empty_b));
+    }
+    // One empty, one non-empty → false
+    {
+        CacheLocation empty_loc;
+        empty_loc.set_type(D_NFS);
+        CacheLocation nfs_loc;
+        nfs_loc.set_type(D_NFS);
+        nfs_loc.set_location_specs({LocationSpec("tp0", "nfs://host01/a/tp0")});
+        EXPECT_FALSE(policy.IsSameStorageInstance(empty_loc, nfs_loc));
+    }
+}
