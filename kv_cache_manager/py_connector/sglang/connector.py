@@ -88,22 +88,13 @@ class HiCacheKVCM(HiCacheStorage):
         self.model_name = self.storage_config.model_name
         self.is_mla_model = self.storage_config.is_mla_model
         self.kv_factor = 1 if self.is_mla_model else 2
-        self.kv_dtype = self.mem_pool_host.dtype
-        self.num_layer = self.mem_pool_host.layer_num
-
-        self.deployment = {
-            "model_name": self.model_name,
-            "tp_size": self.tp_size,
-            "dp_size": self.dp_size,
-            "pp_size": self.pp_size,
-            "use_mla": self.is_mla_model,
-            "dtype": str(self.kv_dtype)[6:],  # remove "torch."
-        }
+        kv_pool = self.registered_pools[PoolName.KV]
+        self.kv_dtype = kv_pool.dtype
 
         # manager
         self.block_size = self.mem_pool_host.page_size
 
-        self.location_spec_size = self.mem_pool_host.get_size_per_token() * self.block_size
+        self.location_spec_size = kv_pool.get_size_per_token() * self.block_size
         self.location_spec_infos = [{
             "name": self._tp_rank_to_spec_name(rank),
             "size": self.location_spec_size,
@@ -129,6 +120,16 @@ class HiCacheKVCM(HiCacheStorage):
                 "name": "Linear",
                 "spec_names": linear_spec_names,
             })
+
+        self.deployment = {
+            "model_name": self.model_name,
+            "tp_size": self.tp_size,
+            "dp_size": self.dp_size,
+            "pp_size": self.pp_size,
+            "use_mla": self.is_mla_model,
+            "dtype": str(self.kv_dtype)[6:],  # remove "torch."
+            "extra": f"has_mamba={self.has_mamba}",
+        }
 
         register_request = {
             "trace_id": self._get_trace_id(),
@@ -783,7 +784,19 @@ class HiCacheKVCM(HiCacheStorage):
             result = self._manager_client.get_cache_location(get_request)
             locations = result["locations"]
 
-            kv_hit_pages = len(locations)
+            # Count KV hit pages: prefix-match only locations that carry
+            # the KV ("Full") spec.  get_cache_location returns any block
+            # registered via start_write_cache regardless of spec group,
+            # so we must filter by checking each location's specs.
+            kv_hit_pages = 0
+            for loc in locations:
+                if any(
+                    spec["name"] == self.location_spec_name
+                    for spec in loc.get("location_specs", [])
+                ):
+                    kv_hit_pages += 1
+                else:
+                    break  # prefix match: stop at first gap
             pool_hit_pages = {PoolName.KV: kv_hit_pages} if kv_hit_pages else {}
             final_pages = kv_hit_pages
 

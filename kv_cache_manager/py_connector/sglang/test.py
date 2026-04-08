@@ -98,9 +98,8 @@ def _start_manager():
     return proc
 
 
-def test():
-    """Run the main test sequence."""
-    # Setup memory pools
+def _create_pool():
+    """Create shared device_pool + mem_pool_host (call once, reuse across tests)."""
     device_pool = MHATokenToKVPool(
         size=max_total_num_tokens,
         page_size=page_size,
@@ -118,8 +117,11 @@ def test():
         page_size=page_size,
         layout=hicache_mem_layout,
     )
+    return device_pool, mem_pool_host
 
-    # Configure storage backend
+
+def _create_backend(mem_pool_host, *, instance_id, is_mla_model=False):
+    """Create a HiCacheKVCM backend bound to the shared pool."""
     storage_config = HiCacheStorageConfig(
         tp_rank=0,
         tp_size=1,
@@ -132,32 +134,50 @@ def test():
         extra_config={
             "manager_uri": manager_uri,
             "instance_group": "default",
-            "instance_id": "0",
+            "instance_id": instance_id,
         },
     )
 
     # Initialize storage backend
     storage_backend = HiCacheKVCM(storage_config, {})
     storage_backend.register_mem_pool_host(mem_pool_host)
+    return storage_backend
 
-    # Generate test data
-    token_ids = list(range(1024))
+
+def _gen_blocks(num_blocks):
+    """Generate block hashes and host indices for num_blocks pages."""
+    token_ids = list(range(num_blocks * page_size))
     block_hashes = []
     block_hash = None
     host_indices = []
-
-    for i in range(0, 1024, page_size):
-        block_hash = get_hash_str(token_ids[i: i + page_size], block_hash)
+    for i in range(0, num_blocks * page_size, page_size):
+        block_hash = get_hash_str(token_ids[i:i + page_size], block_hash)
         block_hashes.append(block_hash)
         host_indices.extend(range(i, i + page_size))
+    return block_hashes, host_indices
 
-    # Fill KV buffer with test data
-    for i in range(mem_pool_host.page_num * mem_pool_host.page_size):
+
+def _fill_kv_buffer(mem_pool_host, num_tokens):
+    """Fill the first num_tokens slots with identifiable bf16 data."""
+    for i in range(num_tokens):
         page_id = i // page_size
         token_id = i % page_size
-        bf16_i = torch.tensor(i, dtype=torch.bfloat16)
         # (2, page_num, layer_num, page_size, head_num, head_dim)
-        mem_pool_host.kv_buffer[:, page_id, :, token_id] = bf16_i
+        mem_pool_host.kv_buffer[:, page_id, :, token_id] = torch.tensor(
+            i, dtype=torch.bfloat16
+        )
+
+
+def test(mem_pool_host):
+    """Run the main test sequence."""
+    storage_backend = _create_backend(mem_pool_host, instance_id="0")
+
+    # Generate test data (16 blocks)
+    num_blocks = 1024 // page_size
+    block_hashes, host_indices = _gen_blocks(num_blocks)
+
+    # Fill KV buffer with test data
+    _fill_kv_buffer(mem_pool_host, mem_pool_host.page_num * mem_pool_host.page_size)
 
     # Test 1: Basic set/get operations
     block_hashes_0 = block_hashes[:10]
@@ -652,6 +672,68 @@ def test_multi_rank(timeout_seconds=120):
     if failed:
         codes = {p.pid: p.exitcode for p in failed}
         raise RuntimeError(f"Multi-rank worker(s) failed: {codes}")
+
+
+def test_idempotent_write(mem_pool_host):
+    """Verify writing the same keys twice is idempotent — both return all True."""
+    storage_backend = _create_backend(mem_pool_host, instance_id="idempotent_0")
+
+    num_blocks = 10
+    block_hashes, host_indices = _gen_blocks(num_blocks)
+    _fill_kv_buffer(mem_pool_host, num_blocks * page_size)
+
+    # First write
+    result_1 = storage_backend.batch_set_v1(block_hashes, torch.tensor(host_indices))
+    assert len(result_1) == num_blocks
+    assert all(result_1), f"First batch_set_v1 failed: {result_1}"
+
+    # Second write (same keys) — should be idempotent
+    result_2 = storage_backend.batch_set_v1(block_hashes, torch.tensor(host_indices))
+    assert len(result_2) == num_blocks
+    assert all(result_2), f"Second batch_set_v1 failed: {result_2}"
+
+    # Confirm existence
+    assert storage_backend.batch_exists(block_hashes) == num_blocks
+
+    logger.info("test_idempotent_write passed!")
+
+
+def test_invalid_prefix(mem_pool_host):
+    """Verify that offset only masks the first N block_keys and does not
+    validate whether the prefix actually exists.
+
+    When querying with fake_hashes + block_hashes and offset=len(fake_hashes),
+    the server skips the fake prefix hashes and only looks up the real
+    block_hashes — which were previously written — so all should hit.
+    """
+    storage_backend = _create_backend(mem_pool_host, instance_id="invalid_prefix_0")
+
+    num_blocks = 5
+    block_hashes, host_indices = _gen_blocks(num_blocks)
+    _fill_kv_buffer(mem_pool_host, num_blocks * page_size)
+
+    set_result = storage_backend.batch_set_v1(block_hashes, torch.tensor(host_indices))
+    assert all(set_result)
+
+    # Without prefix — should find all 5
+    assert storage_backend.batch_exists(block_hashes) == num_blocks
+
+    # Generate unrelated fake prefix keys (different token sequence)
+    fake_token_ids = list(range(9000, 9000 + num_blocks * page_size))
+    fake_hashes = []
+    fake_hash = None
+    for i in range(0, num_blocks * page_size, page_size):
+        fake_hash = get_hash_str(fake_token_ids[i:i + page_size], fake_hash)
+        fake_hashes.append(fake_hash)
+
+    # Query with fake prefix — offset masks the prefix, real blocks still hit
+    extra_info = HiCacheStorageExtraInfo(prefix_keys=fake_hashes)
+    result = storage_backend.batch_exists(block_hashes, extra_info)
+    assert result == num_blocks, (
+        f"Expected {num_blocks} hits (offset only masks prefix), got {result}"
+    )
+
+    logger.info("test_invalid_prefix passed!")
 
 
 if __name__ == "__main__":
