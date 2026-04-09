@@ -9,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #include "kv_cache_manager/common/jsonizable.h"
@@ -59,7 +60,10 @@ ErrorCode MetaDummyBackend::Open() noexcept {
     std::error_code ec;
     bool exists = std::filesystem::exists(path_, ec);
     if (ec) {
-        KVCM_LOG_ERROR("file existed, err msg: [%s], path: [%s]", ec.message().c_str(), path_.c_str());
+        KVCM_LOG_ERROR("std::filesystem::exists call failed, err code: [%d], err msg: [%s], path: [%s]",
+                       ec.value(),
+                       ec.message().c_str(),
+                       path_.c_str());
         return ErrorCode::EC_IO_ERROR;
     }
     if (!exists) {
@@ -68,7 +72,7 @@ ErrorCode MetaDummyBackend::Open() noexcept {
 
     std::ifstream ifs(path_);
     if (!ifs.is_open()) {
-        KVCM_LOG_ERROR("fail to open file, path: [%s]", path_.c_str());
+        KVCM_LOG_ERROR("file open failed, path: [%s]", path_.c_str());
         return ErrorCode::EC_IO_ERROR;
     }
 
