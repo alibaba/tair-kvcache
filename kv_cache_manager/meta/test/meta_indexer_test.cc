@@ -236,33 +236,49 @@ TEST_F(MetaIndexerTest, TestMultiThread) {
 }
 
 TEST_F(MetaIndexerTest, TestMetadataPersistAndRecover) {
-    GTEST_SKIP() << "Skipping for local backend not support recover";
-
-    std::string configStr = R"({
+    const std::string configStr = R"({
         "max_key_count" : 100,
         "mutex_shard_num" : 8,
         "persist_metadata_interval_time_ms" : 0,
-        "meta_storage_backend_config" : { "storage_type" : "local" },
+        "meta_storage_backend_config" : { "storage_type" : "dummy" },
         "meta_cache_policy_config" : { "capacity" : 0 }
     })";
+    const auto meta_indexer_config = std::make_shared<MetaIndexerConfig>();
+    meta_indexer_config->FromJsonString(configStr);
+    const std::string path = GetPrivateTestRuntimeDataPath() + "meta_dummy_backend_file";
+    meta_indexer_config->meta_storage_backend_config_->SetStorageUri("file://" + path);
 
-    ASSERT_EQ(EC_OK, InitIndexer(configStr));
+    // verify fresh init behavior
+    {
+        meta_indexer_ = std::make_shared<MetaIndexer>();
+        ASSERT_EQ(ErrorCode::EC_OK, meta_indexer_->Init(/* instance_id */ "test_instance_01", meta_indexer_config));
 
+        ASSERT_EQ(MetaIndexer::InstanceVersion::VERSION_1, meta_indexer_->GetVersion());
+        ASSERT_EQ(0, meta_indexer_->GetKeyCount());
+        for (auto &v : meta_indexer_->storage_usage_data_.storage_usage_by_type_) {
+            ASSERT_EQ(0, v.load());
+        }
+    }
+
+    // persist
     meta_indexer_->key_count_.store(3);
-
     const std::vector<std::uint64_t> expected_usage_vec{1, 100, 200, 300, 400, 500};
     ASSERT_EQ(expected_usage_vec.size(), meta_indexer_->storage_usage_data_.storage_usage_by_type_.size());
     for (std::size_t i = 0; i != meta_indexer_->storage_usage_data_.storage_usage_by_type_.size(); ++i) {
         meta_indexer_->storage_usage_data_.storage_usage_by_type_.at(i).store(expected_usage_vec.at(i));
     }
-
     meta_indexer_->PersistMetaData();
 
-    meta_indexer_ = std::make_shared<MetaIndexer>();
-    ASSERT_EQ(EC_OK, InitIndexer(configStr));
-    ASSERT_EQ(3, meta_indexer_->GetKeyCount());
-    for (std::size_t i = 0; i != meta_indexer_->storage_usage_data_.storage_usage_by_type_.size(); ++i) {
-        ASSERT_EQ(expected_usage_vec.at(i), meta_indexer_->storage_usage_data_.storage_usage_by_type_.at(i).load());
+    // verify recovery behavior
+    {
+        meta_indexer_ = std::make_shared<MetaIndexer>();
+        ASSERT_EQ(ErrorCode::EC_OK, meta_indexer_->Init(/* instance_id */ "test_instance_01", meta_indexer_config));
+
+        ASSERT_EQ(MetaIndexer::InstanceVersion::VERSION_1, meta_indexer_->GetVersion());
+        ASSERT_EQ(3, meta_indexer_->GetKeyCount());
+        for (std::size_t i = 0; i != meta_indexer_->storage_usage_data_.storage_usage_by_type_.size(); ++i) {
+            ASSERT_EQ(expected_usage_vec.at(i), meta_indexer_->storage_usage_data_.storage_usage_by_type_.at(i).load());
+        }
     }
 }
 
