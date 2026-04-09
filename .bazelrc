@@ -158,3 +158,6 @@ build:client_with_musa --config=client
 build:client_with_musa --config=musa
 
 build:client_only_header  --define CLIENT_ONLY_HEADER=true
+
+# version stamping
+build --workspace_status_command=bazel/workspace_status.sh
