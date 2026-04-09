@@ -70,7 +70,7 @@ TEST_F(MetaDummyBackendTest, TestSimple) {
               {{{"f1", "v1-1"}, {"f2", "v1-2"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}});
     AssertListKeys(
         meta_storage_backend_.get(), SCAN_BASE_CURSOR, /*limit*/ 3, ErrorCode::EC_OK, SCAN_BASE_CURSOR, {1, 2});
-    AssertRandomSample(meta_storage_backend_.get(), /*count*/ 1, ErrorCode::EC_OK, {1, 2});
+    AssertSampleReclaimKeys(meta_storage_backend_.get(), /*count*/ 1, ErrorCode::EC_OK, {1, 2});
 
     ConstructMetaStorageBackend(); // recover
     ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Init("test_instance_0", meta_storage_backend_config_));
@@ -98,7 +98,7 @@ TEST_F(MetaDummyBackendTest, TestSimple) {
               {{{"f1", ""}, {"f2", ""}}, {{"f1", "v2-1-1"}, {"f2", "v2-2"}}, {{"f1", "v3-1"}, {"f2", "v3-2"}}});
     AssertListKeys(
         meta_storage_backend_.get(), SCAN_BASE_CURSOR, /*limit*/ 3, ErrorCode::EC_OK, SCAN_BASE_CURSOR, {2, 3});
-    AssertRandomSample(meta_storage_backend_.get(), /*count*/ 1, ErrorCode::EC_OK, {2, 3});
+    AssertSampleReclaimKeys(meta_storage_backend_.get(), /*count*/ 1, ErrorCode::EC_OK, {2, 3});
 
     ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Close());
 }
@@ -350,10 +350,10 @@ TEST_F(MetaDummyBackendTest, TestRandomSample) {
               meta_storage_backend_->Put({1}, {{{"f1", "v1-1"}, {"f2", "v1-2"}}}));
     ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK}),
               meta_storage_backend_->Put({2}, {{{"f1", "v2-1"}, {"f2", "v2-2"}}}));
-    AssertRandomSample(meta_storage_backend_.get(), /*count*/ 0, ErrorCode::EC_OK, {1, 2});
-    AssertRandomSample(meta_storage_backend_.get(), /*count*/ 1, ErrorCode::EC_OK, {1, 2});
-    AssertRandomSample(meta_storage_backend_.get(), /*count*/ 2, ErrorCode::EC_OK, {1, 2});
-    AssertRandomSample(meta_storage_backend_.get(), /*count*/ 3, ErrorCode::EC_OK, {1, 2});
+    AssertSampleReclaimKeys(meta_storage_backend_.get(), /*count*/ 0, ErrorCode::EC_OK, {1, 2});
+    AssertSampleReclaimKeys(meta_storage_backend_.get(), /*count*/ 1, ErrorCode::EC_OK, {1, 2});
+    AssertSampleReclaimKeys(meta_storage_backend_.get(), /*count*/ 2, ErrorCode::EC_OK, {1, 2});
+    AssertSampleReclaimKeys(meta_storage_backend_.get(), /*count*/ 3, ErrorCode::EC_OK, {1, 2});
 
     ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Close());
 }
