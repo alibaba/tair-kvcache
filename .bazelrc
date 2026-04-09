@@ -148,3 +148,6 @@ build:client_with_cuda --define MOONCAKE_USE_PEERMEM=true
 build:client_with_cuda --define TAIR_MEMPOOL_USE_CUDA=true
 
 build:client_only_header  --define CLIENT_ONLY_HEADER=true
+
+# version stamping
+build --workspace_status_command=bazel/workspace_status.sh

@@ -33,12 +33,14 @@ from sglang.srt.layers.dp_attention import get_attention_tp_group, is_dp_attenti
 
 from kv_cache_manager.py_connector.common.manager_client import KvCacheManagerClient
 from kv_cache_manager.client.pybind import kvcm_py_client
+from kv_cache_manager.py_connector.common._version_info import FULL_VERSION, GIT_COMMIT, BUILD_TIME
 
 logger = logging.getLogger(__name__)
 
 
 class HiCacheKVCM(HiCacheStorage):
     def __init__(self, storage_config: HiCacheStorageConfig, kwargs):
+        logger.warning("KVCM sglang connector version: %s (commit: %s, build: %s)", FULL_VERSION, GIT_COMMIT, BUILD_TIME)
         self.storage_config = storage_config
         # --hicache-storage-backend-extra-config '{"k":"v"}'
         self.extra_config = self.storage_config.extra_config
