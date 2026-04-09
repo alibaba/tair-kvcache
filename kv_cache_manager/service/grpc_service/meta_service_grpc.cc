@@ -90,4 +90,17 @@ grpc::Status MetaServiceGRpc::TrimCache(grpc::ServerContext *context,
     return grpc::Status::OK;
 }
 
+grpc::Status MetaServiceGRpc::GetClusterInfo(grpc::ServerContext *context,
+                                             const proto::meta::GetClusterInfoRequest *request,
+                                             proto::meta::GetClusterInfoResponse *response) {
+    // instance_id 可能尚未注册（如 RegisterInstance 之前），此时 fallback 到全局 collector
+    auto metrics_collector = get_metrics_collector_from_map_for_GetClusterInfo(request->instance_id());
+    if (metrics_collector == nullptr) {
+        metrics_collector = KVCM_METRICS_COLLECTOR_(GetClusterInfo);
+    }
+    API_CONTEXT_INIT(metrics_collector, ExtractIpFromPeer, context->peer())
+    meta_service_impl_->GetClusterInfo(request_context, request, response);
+    return grpc::Status::OK;
+}
+
 } // namespace kv_cache_manager

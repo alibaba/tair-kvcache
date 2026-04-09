@@ -22,6 +22,9 @@ py_repositories()
 load("//3rdparty/cuda_config:cuda_configure.bzl", "cuda_configure")
 cuda_configure(name = "local_config_cuda")
 
+load("//3rdparty/gpus:musa_configure.bzl", "musa_configure")
+musa_configure(name = "local_config_musa")
+
 py_repositories()
 
 load("//3rdparty/py:python_configure.bzl", "python_configure")

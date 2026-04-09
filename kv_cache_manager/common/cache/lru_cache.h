@@ -301,6 +301,16 @@ public: // Function definitions expected as parameter to ShardedCache
                      LRUHandle **handle,
                      Cache::Priority priority);
 
+    // Insert only if the key does not already exist in this shard.
+    // Returns EC_OK on success, EC_EXIST if key is already present.
+    ErrorCode InsertIfAbsent(const std::string_view &key,
+                             uint32_t hash,
+                             Cache::ObjectPtr value,
+                             const Cache::CacheItemHelper *helper,
+                             size_t charge,
+                             LRUHandle **handle,
+                             Cache::Priority priority);
+
     LRUHandle *CreateStandalone(const std::string_view &key,
                                 uint32_t hash,
                                 Cache::ObjectPtr obj,
@@ -352,12 +362,27 @@ public: // other function definitions
 
     void AppendPrintableOptions(std::string & /*str*/) const;
 
+    // Returns up to `count` oldest (least recently used) keys from this shard.
+    // Walks the LRU list from oldest to newest, collecting keys of in-cache entries.
+    // Returns the number of keys actually collected.
+    size_t GetOldestKeys(size_t count, std::vector<std::string> &out_keys);
+
 private:
     friend class LRUCache;
     // Insert an item into the hash table and, if handle is null, insert into
     // the LRU list. Older items are evicted as necessary. Frees `item` on
     // non-OK status.
     ErrorCode InsertItem(LRUHandle *item, LRUHandle **handle);
+
+    // Atomically check if key exists and insert if absent. Returns EC_EXIST
+    // if the key is already present (item is freed), EC_OK on success.
+    ErrorCode InsertItemIfAbsent(LRUHandle *item, LRUHandle **handle);
+
+    // Core insertion logic shared by InsertItem and InsertItemIfAbsent.
+    // Must be called while holding mutex_. Performs eviction, capacity check,
+    // hash table insertion, and LRU list management. Appends evicted entries
+    // to last_reference_list for deferred cleanup outside the lock.
+    ErrorCode DoInsertItemUnsafe(LRUHandle *e, LRUHandle **handle, autovector<LRUHandle *> *last_reference_list);
 
     void LRU_Remove(LRUHandle *e);
     void LRU_Insert(LRUHandle *e);
@@ -467,6 +492,11 @@ public:
     size_t TEST_GetLRUSize();
     // Retrieves high pri pool ratio.
     double GetHighPriPoolRatio();
+
+    // Returns up to `count` oldest keys from the specified shard.
+    size_t GetOldestKeysInShard(uint32_t shard_id,
+                                size_t count,
+                                std::vector<std::string> &out_keys) override;
 };
 
 } // namespace lru_cache

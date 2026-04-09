@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
@@ -16,6 +17,8 @@
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
+#include "kv_cache_manager/data_storage/storage_config.h"
+#include "kv_cache_manager/manager/schedule_plan_executor.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
 namespace kv_cache_manager {
@@ -284,6 +287,8 @@ private:
     // range: [0, kSizeLimit)
     // default to 1000
     std::atomic<std::size_t> sampling_size_;
+    // sampling_size_per_task_ == 0 || sampling_size_per_task_ >= sampling_size_ means single thread key sampling
+    // else use multi thread key sampling
     std::atomic<std::size_t> sampling_size_per_task_;
 
     // controls the maximum allowed key size of one del request that
@@ -324,30 +329,67 @@ private:
     };
     std::forward_list<DeleteHandler> delete_handlers_;
 
+    // record instance group water level exceed flags
+    class WaterLevelExceed {
+    public:
+        WaterLevelExceed();
+        ~WaterLevelExceed() = default;
+
+        [[nodiscard]] bool GetGeneralWaterLevelExceed() const noexcept;
+        [[nodiscard]] bool GetWaterLevelExceedByType(const DataStorageType &type) const noexcept;
+        void SetGeneralWaterLevelExceed(bool value) noexcept;
+        void SetWaterLevelExceedByType(const DataStorageType &type, bool value) noexcept;
+
+        [[nodiscard]] bool CheckGroupWaterLevelExceed() const noexcept;       // general or any storage type exceed
+        [[nodiscard]] bool CheckStorageTypeWaterLevelExceed() const noexcept; // any single storage type exceed
+
+    private:
+        // group general water level exceed flag
+        bool general_water_level_exceed_;
+
+        using array_t_ = std::array<bool, static_cast<std::size_t>(DataStorageType::COUNT)>;
+        using size_t_ = array_t_::size_type;
+
+        // group water level exceed flag array by storage type
+        // slot 0: DATA_STORAGE_TYPE_UNKNOWN **UNUSED**
+        // slot 1: DATA_STORAGE_TYPE_HF3FS exceed flag
+        // slot 2: DATA_STORAGE_TYPE_MOONCAKE exceed flag
+        // slot 3: DATA_STORAGE_TYPE_TAIR_MEMPOOL exceed flag
+        // slot 4: DATA_STORAGE_TYPE_NFS exceed flag
+        // slot 5: DATA_STORAGE_TYPE_VCNS_HF3FS **UNUSED** (merged into HF3FS)
+        array_t_ water_level_exceed_by_type_;
+    };
+
     /**
-     * @brief Determine if a reclamation should be triggered for an
-     * instance group
-     *
-     * A reclamation is triggered based on multiple criteria:
-     * 1. Group total used percentage exceeds quota threshold
-     * 2. Group total used percentage of key count exceeds threshold
-     * 3. A storage type used percentage exceeds it's quota threshold
+     * @brief Calculate the group's WaterLevelExceed data
      *
      * @param request_context The context of the request
      * @param instance_group_name Name of the instance group to check
      * @param instance_group_quota Quota info for the instance group
      * @param reclaim_strategy Strategy to use for reclamation decisions
      * @param instance_infos Vector of instance information
-     * @param out_water_level_exceed_results the detailed trigger result
-     * @return true if reclamation should be triggered
-     * @return false if reclamation should not be triggered
+     * @return shared pointer to the result WaterLevelExceed data
      */
-    [[nodiscard]] bool IsTriggerReclaiming(const RequestContext *request_context,
-                                           const std::string &instance_group_name,
-                                           const InstanceGroupQuota &instance_group_quota,
-                                           const std::shared_ptr<CacheReclaimStrategy> &reclaim_strategy,
-                                           const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos,
-                                           std::array<bool, 5> &out_water_level_exceed_results) noexcept;
+    [[nodiscard]] std::shared_ptr<WaterLevelExceed>
+    GetWaterLevelExceed(const RequestContext *request_context,
+                        const std::string &instance_group_name,
+                        const InstanceGroupQuota &instance_group_quota,
+                        const std::shared_ptr<CacheReclaimStrategy> &reclaim_strategy,
+                        const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) noexcept;
+
+    /**
+     * @brief Determine if a reclamation should be triggered for an
+     * instance group based on the passed-in WaterLevelExceed instance
+     *
+     * A reclamation is triggered based on multiple criteria:
+     * 1. Group total used percentage exceeds quota threshold
+     * 2. Group total used percentage of key count exceeds threshold
+     * 3. A storage type used percentage exceeds it's quota threshold
+     *
+     * @param water_level_exceed shared pointer to WaterLevelExceed
+     * @return true for trigger and verse visa
+     */
+    static bool IsTriggerReclaiming(const std::shared_ptr<WaterLevelExceed> &water_level_exceed);
 
     /**
      * @brief Reclaim cache entries using LRU (Least Recently Used)
@@ -360,11 +402,12 @@ private:
      * @param request_context A shared_ptr that holds the context of the
      * request
      * @param instance_info Instance information to process
+     * @param water_level_exceed the detailed trigger result
      * @param delay_before_delete_ms delay milliseconds for executor
      */
     void ReclaimByLRU(const std::shared_ptr<RequestContext> &request_context,
                       const std::shared_ptr<const InstanceInfo> &instance_info,
-                      const std::array<bool, 5> &water_level_exceed_results,
+                      const WaterLevelExceed &water_level_exceed,
                       std::int32_t delay_before_delete_ms) noexcept;
 
     /**
@@ -376,11 +419,12 @@ private:
      * @param request_context A shared_ptr that holds the context of the
      * request
      * @param instance_info Instance information to process
+     * @param water_level_exceed the detailed trigger result
      * @param delay_before_delete_ms delay milliseconds for executor
      */
     void ReclaimByLFU(const std::shared_ptr<RequestContext> &request_context,
                       const std::shared_ptr<const InstanceInfo> &instance_info,
-                      const std::array<bool, 5> &water_level_exceed_results,
+                      const WaterLevelExceed &water_level_exceed,
                       std::int32_t delay_before_delete_ms) noexcept;
 
     /**
@@ -391,11 +435,12 @@ private:
      * @param request_context A shared_ptr that holds the context of the
      * request
      * @param instance_info Instance information to process
+     * @param water_level_exceed the detailed trigger result
      * @param delay_before_delete_ms delay milliseconds for executor
      */
     void ReclaimByTTL(const std::shared_ptr<RequestContext> &request_context,
                       const std::shared_ptr<const InstanceInfo> &instance_info,
-                      const std::array<bool, 5> &water_level_exceed_results,
+                      const WaterLevelExceed &water_level_exceed,
                       std::int32_t delay_before_delete_ms) noexcept;
 
     bool TryReclaimOnGroup(const std::shared_ptr<RequestContext> &request_context,
@@ -429,21 +474,16 @@ private:
     bool FilterLocID(RequestContext *request_context,
                      const std::shared_ptr<const InstanceInfo> &instance_info,
                      const std::vector<std::int64_t> &batch,
-                     const std::array<bool, 5> &water_level_exceed_results,
+                     const WaterLevelExceed &water_level_exceed,
                      std::vector<std::vector<std::string>> &out_loc_ids) const noexcept;
 
     void SubmitDelReq(const std::shared_ptr<RequestContext> &request_context,
                       const std::shared_ptr<const InstanceInfo> &instance_info,
                       const CacheLocationDelRequest &req) noexcept;
 
-    struct GroupUsageData {
-        std::size_t grp_used_key_cnt_ = 0;
-        std::size_t grp_max_key_cnt_ = 0;
-        std::size_t grp_used_byte_sz_ = 0;
-        std::array<std::uint64_t, 5> grp_storage_usage_array_{0, 0, 0, 0, 0};
-    };
+    struct GroupUsageData;
 
-    [[nodiscard]] GroupUsageData
+    [[nodiscard]] std::shared_ptr<GroupUsageData>
     GetGroupUsageData(const RequestContext *request_context,
                       const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) const noexcept;
 

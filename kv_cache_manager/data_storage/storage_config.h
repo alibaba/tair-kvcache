@@ -1,5 +1,8 @@
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
+
 #include "kv_cache_manager/common/jsonizable.h"
 
 namespace kv_cache_manager {
@@ -11,11 +14,20 @@ enum class DataStorageType : uint8_t {
     DATA_STORAGE_TYPE_TAIR_MEMPOOL = 3,
     DATA_STORAGE_TYPE_NFS = 4,
     DATA_STORAGE_TYPE_VCNS_HF3FS = 5,
+    COUNT, // as sentinel
 };
 
 std::string ToString(const DataStorageType &type);
 
 DataStorageType ToDataStorageType(const std::string &type);
+
+constexpr std::size_t ToIndex(const DataStorageType &type) noexcept { return static_cast<std::size_t>(type); }
+
+// help mapping sub storage type to base storage type
+// e.g., VCNS_HF3FS (sub) --> HF3FS (base)
+// useful in scenarios like storage usage calculating where subtype
+// must be treated the same as the base type
+DataStorageType ToBaseType(const DataStorageType &type) noexcept;
 
 class StorageSpec : public Jsonizable {
 public:

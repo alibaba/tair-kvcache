@@ -383,7 +383,7 @@ class C_HiCacheController(BaseHook):
                     )
                     if completed_tokens < storage_hit_count:
                         # Continue to prefetch data next time.
-                        operation.completed_tokens = completed_tokens
+                        operation.completed_tokens = int(completed_tokens)
                         setattr(
                             self,
                             "chunked_prefetch_operation",

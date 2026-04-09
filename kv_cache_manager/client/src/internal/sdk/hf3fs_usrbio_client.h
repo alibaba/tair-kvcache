@@ -5,12 +5,12 @@
 #include <optional>
 
 #include "kv_cache_manager/client/include/common.h"
+#include "kv_cache_manager/client/src/internal/sdk/hf3fs_gpu_util_alias.h"
 #include "kv_cache_manager/client/src/internal/sdk/hf3fs_usrbio_api.h"
 
 namespace kv_cache_manager {
 
 class Hf3fsMempool;
-class Hf3fsCudaUtil;
 
 struct Hf3fsIovHandle {
     ::hf3fs_iov *iov{nullptr};
@@ -18,7 +18,7 @@ struct Hf3fsIovHandle {
     size_t iov_size{0};                // iov 的共享内存大小
     size_t iov_block_size{0};          // 每个共享内存块的大小, 0 表示单个大型共享内存块
     std::shared_ptr<Hf3fsMempool> iov_mempool;
-    std::shared_ptr<Hf3fsCudaUtil> cuda_util;
+    std::shared_ptr<Hf3fsGpuUtil> gpu_util;
 };
 
 struct Hf3fsIorHandle {

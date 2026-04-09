@@ -8,8 +8,12 @@
 
 #include "kv_cache_manager/client/src/internal/stub/grpc_stub.h"
 #include "kv_cache_manager/common/logger.h"
+#include "kv_cache_manager/common/standard_uri.h"
 #include "kv_cache_manager/common/unittest.h"
+#include "kv_cache_manager/config/coordination_memory_backend.h"
+#include "kv_cache_manager/config/leader_elector.h"
 #include "kv_cache_manager/config/model_deployment.h"
+#include "kv_cache_manager/config/node_endpoint_info.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/manager/cache_manager.h"
@@ -135,8 +139,9 @@ void GrpcStubTest::StartService(int port) {
     loader.Load("");
     metrics_reporter_ = std::make_shared<DummyMetricsReporter>();
     metrics_reporter_->Init(cache_manager_, metrics_registry_, "");
-    meta_service_impl_ = std::make_shared<MetaServiceImpl>(cache_manager_, metrics_reporter_);
+    meta_service_impl_ = std::make_shared<MetaServiceImpl>(cache_manager_, metrics_reporter_, nullptr);
     meta_service_ = std::make_shared<MetaServiceGRpc>(metrics_registry_, meta_service_impl_, registry_manager_);
+    meta_service_->Init();
     grpc::ServerBuilder builder;
     port_ = port < 0 ? GetFreePort() : port;
     ASSERT_LT(0, port_);
@@ -860,4 +865,67 @@ TEST_F(GrpcStubTest, TestSpanTracer) {
         ExpectLocationsEq(target_locations, locations);
         ASSERT_FALSE(HasFailure());
     }
+}
+
+TEST_F(GrpcStubTest, TestGetClusterInfoNoLeaderElector) {
+    // Test-only scenario: MetaServiceImpl was created with leader_elector=nullptr.
+    // GetClusterInfo should return SERVICE_NOT_READY which maps to ER_SERVICE_INTERNAL_ERROR.
+    auto [ec, info] = stub_->GetClusterInfo("trace1", "");
+    ASSERT_EQ(ER_SERVICE_INTERNAL_ERROR, ec);
+}
+
+TEST_F(GrpcStubTest, TestGetClusterInfoWithLeaderElector) {
+    // Shut down the server created by SetUp (no leader elector).
+    rpc_server_->Shutdown();
+    rpc_server_.reset();
+
+    // Create a memory-based coordination backend and leader elector.
+    auto backend = std::make_shared<CoordinationMemoryBackend>();
+    StandardUri uri("memory://");
+    ASSERT_EQ(EC_OK, backend->Init(uri));
+
+    auto leader_elector = std::make_shared<LeaderElector>(backend, "test_lock", "node1", 1000, 10);
+    leader_elector->SetBecomeLeaderHandler([]() {});
+    leader_elector->SetNoLongerLeaderHandler([]() {});
+    ASSERT_TRUE(leader_elector->Start());
+    ASSERT_TRUE(WaitUntil([&]() { return leader_elector->IsLeader(); }, 5000, 50));
+
+    // Write node endpoint info so GetClusterInfo can read it.
+    NodeEndpointInfo node_info("node1", "127.0.0.1", 9001, 9002, 9003, 9004, "test_custom_info");
+    ASSERT_EQ(EC_OK, leader_elector->SetSelfNodeInfo(node_info));
+
+    // Recreate MetaServiceImpl with the leader elector.
+    meta_service_impl_ = std::make_shared<MetaServiceImpl>(cache_manager_, metrics_reporter_, leader_elector);
+    meta_service_ = std::make_shared<MetaServiceGRpc>(metrics_registry_, meta_service_impl_, registry_manager_);
+    meta_service_->Init();
+
+    // Restart gRPC server on the same port.
+    grpc::ServerBuilder builder;
+    std::string server_spec = "0.0.0.0:" + std::to_string(port_);
+    builder.AddListeningPort(server_spec, grpc::InsecureServerCredentials());
+    builder.RegisterService(meta_service_.get());
+    rpc_server_ = builder.BuildAndStart();
+    ASSERT_TRUE(rpc_server_ != nullptr);
+
+    // Reconnect stub.
+    stub_ = std::make_shared<GrpcStub>(1, 5000);
+    ASSERT_EQ(ER_OK, stub_->AddConnection("0.0.0.0:" + std::to_string(port_), 1000));
+
+    // Call GetClusterInfo and verify.
+    auto [ec, info] = stub_->GetClusterInfo("trace1", "");
+    ASSERT_EQ(ER_OK, ec);
+    EXPECT_EQ("node1", info.self_node_id);
+    EXPECT_FALSE(info.leader_node_id.empty());
+    EXPECT_EQ("127.0.0.1", info.leader_endpoint.host);
+    EXPECT_EQ(9001, info.leader_endpoint.meta_rpc_port);
+    EXPECT_EQ(9002, info.leader_endpoint.meta_http_port);
+    EXPECT_EQ("test_custom_info", info.leader_endpoint.custom_info);
+
+    // 使用未注册的 instance_id 调用 GetClusterInfo，应同样成功（fallback 到全局 collector）
+    auto [ec2, info2] = stub_->GetClusterInfo("trace2", "not_registered_instance");
+    ASSERT_EQ(ER_OK, ec2);
+    EXPECT_EQ("node1", info2.self_node_id);
+    EXPECT_FALSE(info2.leader_node_id.empty());
+
+    leader_elector->Stop();
 }

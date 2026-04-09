@@ -20,7 +20,7 @@ def pytorch_dtype_to_triton_dtype(torch_dtype):
         torch.int32: tl.int32,
         torch.int64: tl.int64,
         torch.uint8: tl.uint8,
-        torch.float8_e4m3fn: tl.float8e4nv,
+        torch.float8_e4m3fn: tl.float8e4nv if hasattr(tl, 'float8e4nv') else tl.float8e4b8,
         torch.bool: tl.int1
     }
 

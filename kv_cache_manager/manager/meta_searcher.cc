@@ -32,17 +32,6 @@ void LogErrorCodes(const std::string &operation_name,
     }
 }
 
-bool safe_fetch_sub(std::atomic<std::uint64_t> &atom, const std::uint64_t sub_val) {
-    std::uint64_t cur_val = atom.load();
-    do {
-        // check for underflow before subtraction
-        if (cur_val < sub_val) {
-            return false; // would underflow
-        }
-    } while (!atom.compare_exchange_strong(cur_val, cur_val - sub_val));
-    return true;
-}
-
 } // namespace
 
 MetaSearcher::MetaSearcher(const std::shared_ptr<MetaIndexer> &meta_indexer) : meta_indexer_(meta_indexer) {}
@@ -366,8 +355,7 @@ ErrorCode MetaSearcher::BatchAddLocation(RequestContext *request_context,
 
     // record each location's storage type and total size between block
     // cache location metadata deserialize and serialize
-    std::vector<std::pair<DataStorageType, std::uint64_t>> loc_sz(keys.size(),
-                                                                  {DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, 0});
+    std::vector<std::pair<DataStorageType, std::uint64_t>> loc_sz(keys.size());
 
     MetaSearcherMetrics metrics;
     auto modifier = [&locations, &out_location_ids, &keys, &metrics, &loc_sz](
@@ -414,10 +402,7 @@ ErrorCode MetaSearcher::BatchAddLocation(RequestContext *request_context,
                 sz += spec_sz;
             }
         }
-        loc_sz[index] = std::make_pair(locations[index].type() == DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS
-                                           ? DataStorageType::DATA_STORAGE_TYPE_HF3FS // treat vcns_hf3fs as hf3fs
-                                           : locations[index].type(),
-                                       sz);
+        loc_sz[index] = std::make_pair(locations[index].type(), sz);
 
         int64_t begin_serialize_time = TimestampUtil::GetCurrentTimeUs();
         uri = meta.ToJsonString();
@@ -437,12 +422,7 @@ ErrorCode MetaSearcher::BatchAddLocation(RequestContext *request_context,
     // update the usage of each storage type
     for (std::size_t i = 0; i < keys.size(); i++) {
         if (result.error_codes[i] == ErrorCode::EC_OK) {
-            try {
-                meta_indexer_->storage_usage_array_.at(static_cast<std::uint8_t>(loc_sz[i].first))
-                    .fetch_add(loc_sz[i].second);
-            } catch (const std::out_of_range &e) {
-                KVCM_LOG_WARN("data storage type out of range: %d", static_cast<std::uint8_t>(loc_sz[i].first));
-            }
+            meta_indexer_->AddStorageUsageByType(loc_sz[i].first, loc_sz[i].second);
         }
     }
 
@@ -681,9 +661,7 @@ ErrorCode MetaSearcher::BatchCADLocationStatus(RequestContext *request_context,
                     }
                 }
             }
-            locs_sz[index].emplace_back(std::make_pair( // treat vcns_hf3fs as hf3fs
-                type == DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS ? DataStorageType::DATA_STORAGE_TYPE_HF3FS : type,
-                sz));
+            locs_sz[index].emplace_back(std::make_pair(type, sz));
 
             CacheLocationStatus status;
             ErrorCode ec = meta.GetLocationStatus(task.location_id, status);
@@ -740,16 +718,7 @@ ErrorCode MetaSearcher::BatchCADLocationStatus(RequestContext *request_context,
         if (result.error_codes[i] == ErrorCode::EC_OK) {
             for (std::size_t j = 0; j != batch_tasks[i].size(); ++j) {
                 if (out_batch_results[i][j] == ErrorCode::EC_OK) {
-                    try {
-                        if (!safe_fetch_sub(
-                                meta_indexer_->storage_usage_array_.at(static_cast<std::uint8_t>(locs_sz[i][j].first)),
-                                locs_sz[i][j].second)) {
-                            KVCM_LOG_DEBUG("would underflow");
-                        }
-                    } catch (const std::out_of_range &e) {
-                        KVCM_LOG_WARN("data storage type out of range: %d",
-                                      static_cast<std::uint8_t>(locs_sz[i][j].first));
-                    }
+                    meta_indexer_->SubStorageUsageByType(locs_sz[i][j].first, locs_sz[i][j].second);
                 }
             }
         }
@@ -774,8 +743,7 @@ ErrorCode MetaSearcher::BatchDeleteLocation(RequestContext *request_context,
 
     // record each location's storage type and total size between block
     // cache location metadata deserialize and serialize
-    std::vector<std::pair<DataStorageType, std::uint64_t>> loc_sz(keys.size(),
-                                                                  {DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, 0});
+    std::vector<std::pair<DataStorageType, std::uint64_t>> loc_sz(keys.size());
 
     MetaSearcherMetrics metrics;
     auto modifier = [&location_ids, &keys, &metrics, &loc_sz](
@@ -813,9 +781,7 @@ ErrorCode MetaSearcher::BatchDeleteLocation(RequestContext *request_context,
                 }
             }
         }
-        loc_sz[index] = std::make_pair( // treat vcns_hf3fs as hf3fs
-            type == DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS ? DataStorageType::DATA_STORAGE_TYPE_HF3FS : type,
-            sz);
+        loc_sz[index] = std::make_pair(type, sz);
 
         ErrorCode ec = meta.DeleteLocation(location_ids[index]);
         if (ec != ErrorCode::EC_OK) {
@@ -844,14 +810,7 @@ ErrorCode MetaSearcher::BatchDeleteLocation(RequestContext *request_context,
     // update the usage of each storage type
     for (std::size_t i = 0; i < keys.size(); i++) {
         if (result.error_codes[i] == ErrorCode::EC_OK) {
-            try {
-                if (!safe_fetch_sub(meta_indexer_->storage_usage_array_.at(static_cast<std::uint8_t>(loc_sz[i].first)),
-                                    loc_sz[i].second)) {
-                    KVCM_LOG_DEBUG("would underflow");
-                }
-            } catch (const std::out_of_range &e) {
-                KVCM_LOG_WARN("data storage type out of range: %d", static_cast<std::uint8_t>(loc_sz[i].first));
-            }
+            meta_indexer_->SubStorageUsageByType(loc_sz[i].first, loc_sz[i].second);
         }
     }
 

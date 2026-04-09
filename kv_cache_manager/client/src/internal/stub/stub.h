@@ -75,6 +75,10 @@ public:
                                         const TokenIdsVector &tokens,
                                         const BlockMask &block_mask) = 0;
     virtual bool TrimCache() = 0;
+
+    // leader 节点信息查询失败时 ClusterInfo::leader_endpoint 可能为空，调用方应据此决定是否重试。
+    virtual std::pair<ClientErrorCode, ClusterInfo> GetClusterInfo(const std::string &trace_id,
+                                                                   const std::string &instance_id) = 0;
 };
 
 } // namespace kv_cache_manager

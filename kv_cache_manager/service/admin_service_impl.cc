@@ -11,6 +11,7 @@
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/config/leader_elector.h"
+#include "kv_cache_manager/config/node_endpoint_info.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
@@ -809,6 +810,13 @@ void AdminServiceImpl::CheckHealth(RequestContext *request_context,
     auto *header = response->mutable_header();
     auto *status = header->mutable_status();
 
+    if (!leader_elector_) {
+        status->set_code(proto::admin::INTERNAL_ERROR);
+        status->set_message("Leader elector not initialized");
+        request_context->set_status_code(status->code());
+        return;
+    }
+
     response->set_is_leader(leader_elector_->IsLeader());
     response->set_is_health(true); // TODO: 实现健康检查逻辑，如IOHang探测、elector长时间不loop等
     response->set_elector_last_loop_time_ms(leader_elector_->GetLastLoopTimeUs() / 1000);
@@ -826,11 +834,41 @@ void AdminServiceImpl::GetManagerClusterInfo(RequestContext *request_context,
     auto *header = response->mutable_header();
     auto *status = header->mutable_status();
 
+    if (!leader_elector_) {
+        status->set_code(proto::admin::INTERNAL_ERROR);
+        status->set_message("Leader elector not initialized");
+        request_context->set_status_code(status->code());
+        return;
+    }
+
     response->set_self_leader_expiration_time(leader_elector_->GetLeaseExpirationTime());
-    response->set_leader_node_id(leader_elector_->GetLeaderNodeID());
-    response->set_self_node_id(leader_elector_->GetSelfNodeID());
+    std::string leader_node_id = leader_elector_->GetLeaderNodeID();
+    std::string self_node_id = leader_elector_->GetSelfNodeID();
+    response->set_leader_node_id(leader_node_id);
+    response->set_self_node_id(self_node_id);
     // TODO: 实现实际的集群信息获取逻辑
     response->set_info_updated_time(0);
+
+    // 获取 leader 的节点连接信息
+    if (!leader_node_id.empty()) {
+        NodeEndpointInfo node_info;
+        ErrorCode ec = leader_elector_->GetLeaderNodeInfo(node_info);
+        if (ec == EC_OK) {
+            auto *endpoint = response->mutable_leader_endpoint();
+            endpoint->set_node_id(node_info.node_id());
+            endpoint->set_host(node_info.host());
+            endpoint->set_meta_rpc_port(node_info.meta_rpc_port());
+            endpoint->set_meta_http_port(node_info.meta_http_port());
+            endpoint->set_admin_rpc_port(node_info.admin_rpc_port());
+            endpoint->set_admin_http_port(node_info.admin_http_port());
+            endpoint->set_custom_info(node_info.custom_info());
+        } else {
+            KVCM_LOG_WARN("[traceId: %s] GetManagerClusterInfo: failed to read node info for leader %s, ec=%d",
+                          request->trace_id().c_str(),
+                          leader_node_id.c_str(),
+                          ec);
+        }
+    }
 
     status->set_code(proto::admin::OK);
     request_context->set_status_code(status->code());

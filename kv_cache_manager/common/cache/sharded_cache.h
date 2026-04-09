@@ -179,6 +179,18 @@ public:
         return GetShard(hash).Insert(key, hash, obj, helper, charge, h_out, priority);
     }
 
+    ErrorCode InsertIfAbsent(const std::string_view &key,
+                             ObjectPtr obj,
+                             const CacheItemHelper *helper,
+                             size_t charge,
+                             Handle **handle = nullptr,
+                             Priority priority = Priority::LOW) override {
+        assert(helper);
+        HashVal hash = CacheShard::ComputeHash(key, hash_seed_);
+        auto h_out = reinterpret_cast<HandleImpl **>(handle);
+        return GetShard(hash).InsertIfAbsent(key, hash, obj, helper, charge, h_out, priority);
+    }
+
     Handle *CreateStandalone(const std::string_view &key,
                              ObjectPtr obj,
                              const CacheItemHelper *helper,
@@ -247,6 +259,23 @@ public:
 
     void EraseUnRefEntries() override {
         ForEachShard([](CacheShard *cs) { cs->EraseUnRefEntries(); });
+    }
+
+    void ApplyToSingleShard(
+        uint32_t shard_id,
+        const std::function<
+            void(const std::string_view &key, Cache::ObjectPtr obj, size_t charge, const Cache::CacheItemHelper *helper)>
+            &callback) override {
+        uint32_t num_shards = GetNumShards();
+        if (shard_id >= num_shards) {
+            return;
+        }
+        // Iterate over all entries in the target shard by driving
+        // ApplyToSomeEntries until the shard signals completion.
+        size_t state = 0;
+        while (state != SIZE_MAX) {
+            shards_[shard_id].ApplyToSomeEntries(callback, 1 /* average_entries_per_lock */, &state);
+        }
     }
 
     void DisownData() override {

@@ -48,6 +48,7 @@ public:
                        std::string &out_next_cursor,
                        std::vector<KeyType> &out_keys) noexcept override;
     ErrorCode RandomSample(const int64_t count, std::vector<KeyType> &out_keys) noexcept override;
+    ErrorCode SampleReclaimKeys(const int64_t count, std::vector<KeyType> &out_keys) noexcept override;
 
     // meta data
     ErrorCode PutMetaData(const FieldMap &field_maps) noexcept override;

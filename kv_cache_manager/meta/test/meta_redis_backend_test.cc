@@ -268,7 +268,7 @@ TEST_F(MetaRedisBackendTest, TestSimple) {
                        {{{"f1", "v1-1"}, {"f2", "v1-2"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}});
     AssertListKeys(
         meta_redis_backend_.get(), SCAN_BASE_CURSOR, /*limit*/ 5, EC_OK, /*expected_next_cursor*/ "5", {1, 2});
-    AssertRandomSample(meta_redis_backend_.get(), /*count*/ 2, EC_OK, {1, 2});
+    AssertSampleReclaimKeys(meta_redis_backend_.get(), /*count*/ 2, EC_OK, {1, 2});
 
     // test upsert
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
@@ -314,7 +314,7 @@ TEST_F(MetaRedisBackendTest, TestRedisError) {
     ASSERT_TRUE(next_cursor.empty());
     ASSERT_TRUE(keys.empty());
 
-    ASSERT_EQ(EC_ERROR, meta_redis_backend_->RandomSample(/*limit*/ 5, keys));
+    ASSERT_EQ(EC_ERROR, meta_redis_backend_->SampleReclaimKeys(/*count*/ 5, keys));
     ASSERT_TRUE(keys.empty());
 
     ASSERT_EQ(EC_OK, meta_redis_backend_->Close());

@@ -49,6 +49,9 @@ MetaServiceMetricsBase::MetaServiceMetricsBase(std::shared_ptr<MetricsRegistry> 
 void MetaServiceMetricsBase::InitMetrics() {
     MAKE_SERVICE_METRICS_COLLECTOR(RegisterInstance);
     MAKE_SERVICE_METRICS_COLLECTOR(GetInstanceInfo);
+    MAKE_SERVICE_METRICS_COLLECTOR(GetClusterInfo);
+    // GetClusterInfo 的全局 collector 也预置到 MAP 中，以空 instance_id 为 key
+    KVCM_METRICS_COLLECTOR_MAP_(GetClusterInfo)[""] = KVCM_METRICS_COLLECTOR_(GetClusterInfo);
 }
 
 KVCM_DEFINE_METRICS_COLLECTOR_MAP_METHOD_(GetCacheMeta);
@@ -58,5 +61,6 @@ KVCM_DEFINE_METRICS_COLLECTOR_MAP_METHOD_(StartWriteCache);
 KVCM_DEFINE_METRICS_COLLECTOR_MAP_METHOD_(FinishWriteCache);
 KVCM_DEFINE_METRICS_COLLECTOR_MAP_METHOD_(RemoveCache);
 KVCM_DEFINE_METRICS_COLLECTOR_MAP_METHOD_(TrimCache);
+KVCM_DEFINE_METRICS_COLLECTOR_MAP_METHOD_(GetClusterInfo);
 
 } // namespace kv_cache_manager

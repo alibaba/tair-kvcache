@@ -97,11 +97,20 @@ void CacheManagerMetricsRecorder::RecorderLoop() {
                 }
                 meta_indexer->PersistMetaData();
                 const std::size_t key_cnt = meta_indexer->GetKeyCount();
-                std::size_t byte_size_per_key = 0;
-                for (auto &location_spec_info : instance_info->location_spec_infos()) {
-                    byte_size_per_key += location_spec_info.size();
+                std::size_t byte_size = 0;
+                if (meta_indexer->GetVersion() == MetaIndexer::InstanceVersion::VERSION_0) {
+                    std::size_t byte_size_per_key = 0;
+                    for (auto &location_spec_info : instance_info->location_spec_infos()) {
+                        byte_size_per_key += location_spec_info.size();
+                    }
+                    byte_size = byte_size_per_key * key_cnt;
+                } else if (meta_indexer->GetVersion() == MetaIndexer::InstanceVersion::VERSION_1) {
+                    byte_size = meta_indexer->GetStorageUsage();
+                } else {
+                    KVCM_LOG_WARN("unknown meta_indexer version: [%" PRIu8 "]",
+                                  static_cast<std::uint8_t>(meta_indexer->GetVersion()));
+                    continue;
                 }
-                const std::size_t byte_size = byte_size_per_key * key_cnt;
                 group_byte_size += byte_size;
                 group_instance_id_metric_map[instance_group_name][instance_id] = InstanceMetric({key_cnt, byte_size});
             }

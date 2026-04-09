@@ -24,7 +24,6 @@ cc_library(
     name = "meta_indexer",
     srcs = [
         "meta_indexer.cc",
-        "meta_search_cache.cc",
         "meta_storage_backend_factory.cc",
     ],
     hdrs = [
@@ -35,12 +34,28 @@ cc_library(
     ],
     deps = [
         ":common",
+        ":meta_search_cache",
+        ":meta_cached_backend",
         ":meta_local_backend",
         ":meta_redis_backend",
         ":meta_storage_backend",
         "//kv_cache_manager/common",
-        "//kv_cache_manager/common:lru_cache",
         "//kv_cache_manager/common:utils",
+        "//kv_cache_manager/config",
+    ],
+)
+
+cc_library(
+    name = "meta_search_cache",
+    srcs = [
+        "meta_search_cache.cc",
+    ],
+    hdrs = [
+        "meta_search_cache.h",
+    ],
+    deps = [
+        "//kv_cache_manager/common",
+        "//kv_cache_manager/common:lru_cache",
         "//kv_cache_manager/config",
     ],
 )
@@ -70,6 +85,18 @@ cc_library(
 )
 
 cc_library(
+    name = "meta_local_base_backend",
+    srcs = [
+    ],
+    hdrs = [
+        "meta_local_base_backend.h",
+    ],
+    deps = [
+        ":meta_storage_backend",
+    ],
+)
+
+cc_library(
     name = "meta_local_backend",
     srcs = [
         "meta_local_backend.cc",
@@ -79,8 +106,10 @@ cc_library(
     ],
     deps = [
         ":common",
-        ":meta_storage_backend",
+        ":meta_local_base_backend",
+        ":meta_search_cache",
         "//kv_cache_manager/common:concurrent_hash_map",
+        "//kv_cache_manager/common:lru_cache",
         "//kv_cache_manager/common:standard_uri",
         "//kv_cache_manager/common:string_util",
     ],
@@ -99,5 +128,22 @@ cc_library(
         ":meta_storage_backend",
         "//kv_cache_manager/common:client_pool",
         "//kv_cache_manager/common:redis_client",
+    ],
+)
+
+cc_library(
+    name = "meta_cached_backend",
+    srcs = [
+        "meta_cached_backend.cc",
+    ],
+    hdrs = [
+        "meta_cached_backend.h",
+    ],
+    deps = [
+        ":common",
+        ":meta_local_backend",
+        ":meta_local_base_backend",
+        ":meta_redis_backend",
+        ":meta_storage_backend",
     ],
 )

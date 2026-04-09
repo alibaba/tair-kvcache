@@ -27,7 +27,7 @@ std::vector<int64_t> SdkBufferCheckUtil::GetBlocksHash(const BlockBuffers &block
 }
 
 std::vector<int64_t> SdkBufferCheckUtil::GetBlocksHash(
-    const BlockBuffers &block_buffers, IovDevice *iovs_d, uint32_t *crcs_d, size_t max_iov_num, cudaStream_t stream) {
+    const BlockBuffers &block_buffers, IovDevice *iovs_d, uint32_t *crcs_d, size_t max_iov_num, GpuStream_t stream) {
     std::vector<IovDevice> iov_h(max_iov_num);
     return GetBlocksHash(block_buffers, iovs_d, crcs_d, iov_h.data(), max_iov_num, stream);
 }
@@ -37,7 +37,7 @@ std::vector<int64_t> SdkBufferCheckUtil::GetBlocksHash(const BlockBuffers &block
                                                        uint32_t *crcs_d,
                                                        IovDevice *iovs_h_to_save,
                                                        size_t max_iov_num,
-                                                       cudaStream_t stream) {
+                                                       GpuStream_t stream) {
     size_t iov_num = block_buffers.front().iovs.size();
     size_t iovs_size = 0;
     for (const auto &block_buffer : block_buffers) {
@@ -61,20 +61,21 @@ std::vector<int64_t> SdkBufferCheckUtil::GetBlocksHash(const BlockBuffers &block
 }
 
 std::vector<uint32_t> SdkBufferCheckUtil::GetIovsCrc(const std::vector<IovDevice> &iovs_h) {
-    IovDevice *iovs_d = nullptr;
-    uint32_t *crcs_d = nullptr;
-    CHECK_CUDA_ERROR_RETURN(cudaMalloc(&iovs_d, sizeof(IovDevice) * iovs_h.size()), {}, "cudaMalloc fail");
-    CHECK_CUDA_ERROR_RETURN(cudaMalloc(&crcs_d, sizeof(uint32_t) * iovs_h.size()), {}, "cudaMalloc fail");
-    auto crcs = GetIovsCrc(iovs_h, iovs_d, crcs_d, nullptr);
-    CHECK_CUDA_ERROR_RETURN(cudaFree(iovs_d), {}, "cudaMalloc fail");
-    CHECK_CUDA_ERROR_RETURN(cudaFree(crcs_d), {}, "cudaMalloc fail");
+    CudaBufferGuard iovs_guard, crcs_guard;
+    size_t iovs_byte_size = sizeof(IovDevice) * iovs_h.size();
+    size_t crcs_byte_size = sizeof(uint32_t) * iovs_h.size();
+    if (!iovs_guard.Alloc(iovs_byte_size) || !crcs_guard.Alloc(crcs_byte_size)) {
+        return {};
+    }
+    auto crcs = GetIovsCrc(
+        iovs_h, static_cast<IovDevice *>(iovs_guard.Get()), static_cast<uint32_t *>(crcs_guard.Get()), nullptr);
     return crcs;
 }
 
 std::vector<uint32_t> SdkBufferCheckUtil::GetIovsCrc(const std::vector<IovDevice> &iovs_h,
                                                      IovDevice *iovs_d,
                                                      uint32_t *crcs_d,
-                                                     cudaStream_t stream) {
+                                                     GpuStream_t stream) {
     return GetIovsCrc(iovs_h.data(), iovs_h.size(), iovs_d, crcs_d, stream);
 }
 
@@ -97,6 +98,7 @@ SdkBufferCheckPool::~SdkBufferCheckPool() {
 bool SdkBufferCheckPool::Init(size_t max_check_iov_num) {
     size_t iovs_byte_size = max_check_iov_num * sizeof(IovDevice);
     size_t crcs_byte_size = max_check_iov_num * sizeof(uint32_t);
+    CHECK_CUDA_ERROR_RETURN(cudaGetDevice(&device_id_), false, "cudaGetDevice failed");
     for (auto &cell : cells_) {
         CHECK_CUDA_ERROR_RETURN(
             cudaMallocHost(&cell.h_iovs, iovs_byte_size), false, "cudaMallocHost [%zu] bytes failed", iovs_byte_size);
@@ -105,17 +107,67 @@ bool SdkBufferCheckPool::Init(size_t max_check_iov_num) {
         CHECK_CUDA_ERROR_RETURN(
             cudaMalloc(&cell.d_crcs, crcs_byte_size), false, "cudaMalloc [%zu] byte failed", crcs_byte_size);
         CHECK_CUDA_ERROR_RETURN(
-            cudaStreamCreateWithFlags(&cell.cuda_stream, cudaStreamNonBlocking), false, "cuda stream create failed");
+            cudaStreamCreateWithFlags(&cell.gpu_stream, cudaStreamNonBlocking), false, "cuda stream create failed");
         cell_queue_.push(&cell);
     }
-    KVCM_LOG_INFO(
-        "cell_size[%lu], iovs_byte_size[%lu], crcs_byte_size[%lu]", cells_.size(), iovs_byte_size, crcs_byte_size);
+    if (!WarmUp()) {
+        return false;
+    }
+    KVCM_LOG_INFO("cell_size[%lu], iovs_byte_size[%lu], crcs_byte_size[%lu], device_id[%d]",
+                  cells_.size(),
+                  iovs_byte_size,
+                  crcs_byte_size,
+                  device_id_);
     return true;
+}
+
+bool SdkBufferCheckPool::WarmUp() {
+    const std::string warmup_str("12345678");
+    // crc32("12345678") == 9AE0DAAF
+    CudaBufferGuard buffer_guard;
+    auto byte_size = warmup_str.size();
+    if (!buffer_guard.Alloc(byte_size)) {
+        return false;
+    }
+    void *buffer = buffer_guard.Get();
+    CHECK_CUDA_ERROR_RETURN(cudaMemcpy(buffer, warmup_str.data(), byte_size, cudaMemcpyHostToDevice),
+                            false,
+                            "cudaMemcpy from host[%p] to device[%p] failed",
+                            warmup_str.data(),
+                            buffer);
+    std::vector<IovDevice> iovs_h{{buffer, byte_size}};
+    const std::vector<uint32_t> ecpected_crcs({0x9AE0DAAF});
+    for (auto &cell : cells_) {
+        auto real_crcs = SdkBufferCheckUtil::GetIovsCrc(iovs_h, cell.d_iovs, cell.d_crcs, cell.gpu_stream);
+        if (ecpected_crcs != real_crcs) {
+            KVCM_LOG_ERROR("warm up failed");
+            return false;
+        }
+    }
+
+    if (buffer != nullptr && !buffer_guard.Free()) {
+        return false;
+    }
+    return true;
+}
+
+SdkBufferCheckPool::CellHandle::CellHandle(SdkBufferCheckPool *pool, Cell *cell, int device_id)
+    : pool_(pool), cell_(cell) {
+    cudaError_t err = cudaGetDevice(&prev_device_id_);
+    if (err != cudaSuccess) {
+        KVCM_LOG_WARN("cuda error [%d] [%s] | cudaGetDevice failed", err, cudaGetErrorString(err));
+    } else if (prev_device_id_ != device_id) {
+        CHECK_CUDA_ERROR(cudaSetDevice(device_id), "cudaSetDevice [%d] failed", device_id);
+        changed_device_ = true;
+    }
 }
 
 SdkBufferCheckPool::CellHandle::~CellHandle() {
     if (pool_) {
         pool_->PutCell(cell_);
+    }
+    if (changed_device_) {
+        CHECK_CUDA_ERROR(cudaSetDevice(prev_device_id_), "cudaSetDevice prev [%d] failed", prev_device_id_);
     }
 }
 
@@ -124,7 +176,7 @@ SdkBufferCheckPool::CellHandle SdkBufferCheckPool::GetCell() {
     cv_.wait(lock, [this] { return !cell_queue_.empty(); });
     Cell *cell = cell_queue_.front();
     cell_queue_.pop();
-    return CellHandle(this, cell);
+    return CellHandle(this, cell, device_id_);
 }
 
 void SdkBufferCheckPool::PutCell(Cell *cell) {

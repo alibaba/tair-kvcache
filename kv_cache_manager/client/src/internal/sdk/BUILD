@@ -27,6 +27,11 @@ config_setting(
     values = {"define": "using_cuda=true"},
 )
 
+config_setting(
+    name = "using_musa",
+    values = {"define": "using_musa=true"},
+)
+
 cc_library(
     name = "sdk_common",
     srcs = ["sdk_interface.cc"],
@@ -75,6 +80,8 @@ cc_library(
     }) + select({
         ":enable_hf3fs": [
             "hf3fs_cuda_util.h",
+            "hf3fs_gpu_util_alias.h",
+            "hf3fs_musa_util.h",
             "hf3fs_mempool.h",
             "hf3fs_sdk.h",
             "hf3fs_usrbio_api.h",
@@ -94,6 +101,10 @@ cc_library(
         ":using_cuda": [
             ":sdk_buffer_check_util",
             "@local_config_cuda//cuda",
+        ],
+        ":using_musa": [
+            ":sdk_buffer_check_util_musa",
+            "@local_config_musa//:musa",
         ],
         "//conditions:default": [],
     }) + select({
@@ -149,6 +160,7 @@ cuda_library(
         "-std=c++20",
         "--compiler-options=-fPIC",
     ],
+    defines = ["USING_CUDA=1"],
     target_compatible_with = select({
         ":using_cuda": [],
         "//conditions:default": ["@platforms//:incompatible"],
@@ -157,5 +169,42 @@ cuda_library(
         "//kv_cache_manager/client:common",
         "//kv_cache_manager/common:hash_util",
         "//kv_cache_manager/common:logger",
+    ],
+)
+
+# MUSA implementation compiled with mcc
+genrule(
+    name = "compile_musa_implementation",
+    srcs = ["sdk_buffer_check_util_musa.mu"],
+    outs = ["sdk_buffer_check_util_musa.o"],
+    cmd = """
+    /usr/local/musa/bin/mcc -x musa -std=c++20 -fPIC -c $< -o $@ -I. -I$(GENDIR)/../.. -DUSING_MUSA
+    """,
+    target_compatible_with = select({
+        ":using_musa": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+)
+
+cc_library(
+    name = "sdk_buffer_check_util_musa",
+    srcs = [
+        "sdk_buffer_check_util_musa.cc",
+        "sdk_buffer_check_util_musa.o",
+    ],
+    hdrs = [
+        "musa_util.h",
+        "sdk_buffer_check_util.h",
+    ],
+    linkopts = ["-L/usr/local/musa/lib", "-lmusart", "-Wl,-rpath,/usr/local/musa/lib"],
+    target_compatible_with = select({
+        ":using_musa": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = [
+        "//kv_cache_manager/client:common",
+        "//kv_cache_manager/common:hash_util",
+        "//kv_cache_manager/common:logger",
+        "@local_config_musa//:musa",
     ],
 )

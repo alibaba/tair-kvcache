@@ -166,16 +166,9 @@ TEST_F(MetaSearcherTest, TestBatchAddLocation2) {
         EXPECT_EQ(location_map.size(), 1);
     }
 
-    EXPECT_EQ(
-        3,
-        meta_indexer_->storage_usage_array_[static_cast<std::uint8_t>(DataStorageType::DATA_STORAGE_TYPE_NFS)].load());
-    EXPECT_EQ(4,
-              meta_indexer_->storage_usage_array_[static_cast<std::uint8_t>(DataStorageType::DATA_STORAGE_TYPE_HF3FS)]
-                  .load());
-    EXPECT_EQ(
-        10,
-        meta_indexer_->storage_usage_array_[static_cast<std::uint8_t>(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE)]
-            .load());
+    EXPECT_EQ(3, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
+    EXPECT_EQ(4, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+    EXPECT_EQ(10, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
 }
 
 TEST_F(MetaSearcherTest, TestPrefixMatch) {
@@ -662,16 +655,9 @@ TEST_F(MetaSearcherTest, TestBatchDeleteLocation2) {
     ec = meta_searcher_->BatchDeleteLocation(request_context_.get(), delete_keys, delete_location_ids, delete_results);
 
     // 验证结果
-    EXPECT_EQ(
-        0,
-        meta_indexer_->storage_usage_array_[static_cast<std::uint8_t>(DataStorageType::DATA_STORAGE_TYPE_NFS)].load());
-    EXPECT_EQ(0,
-              meta_indexer_->storage_usage_array_[static_cast<std::uint8_t>(DataStorageType::DATA_STORAGE_TYPE_HF3FS)]
-                  .load());
-    EXPECT_EQ(
-        10,
-        meta_indexer_->storage_usage_array_[static_cast<std::uint8_t>(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE)]
-            .load());
+    EXPECT_EQ(0, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
+    EXPECT_EQ(0, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+    EXPECT_EQ(10, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
 }
 
 TEST_F(MetaSearcherTest, TestBatchVsSequentialPerformance) {
@@ -995,16 +981,9 @@ TEST_F(MetaSearcherTest, TestBatchCADLocationStatus2) {
     EXPECT_EQ(ec, ErrorCode::EC_OK);
     EXPECT_EQ(out_batch_results.size(), 3);
 
-    EXPECT_EQ(
-        0,
-        meta_indexer_->storage_usage_array_[static_cast<std::uint8_t>(DataStorageType::DATA_STORAGE_TYPE_NFS)].load());
-    EXPECT_EQ(0,
-              meta_indexer_->storage_usage_array_[static_cast<std::uint8_t>(DataStorageType::DATA_STORAGE_TYPE_HF3FS)]
-                  .load());
-    EXPECT_EQ(
-        0,
-        meta_indexer_->storage_usage_array_[static_cast<std::uint8_t>(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE)]
-            .load());
+    EXPECT_EQ(0, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
+    EXPECT_EQ(0, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+    EXPECT_EQ(0, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
 }
 
 TEST_F(MetaSearcherTest, TestBatchCASLocationStatusMultipleTasksPerKey) {

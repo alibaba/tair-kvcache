@@ -1,6 +1,8 @@
 #pragma once
-#ifdef USING_CUDA
+#if defined(USING_CUDA)
 #include <cuda_runtime.h>
+#elif defined(USING_MUSA)
+#include <musa_runtime.h>
 #endif
 #include <shared_mutex>
 
@@ -44,7 +46,7 @@ private:
     InitParams init_params_;
     std::unique_ptr<SdkWrapper> sdk_wrapper_;
     mutable std::shared_mutex config_mutex_;
-#ifdef USING_CUDA
+#if defined(USING_CUDA) || defined(USING_MUSA)
     bool is_check_buffer_ = false;
     size_t max_check_iov_num_;
     std::shared_ptr<SdkBufferCheckPool> sdk_buffer_check_pool_;

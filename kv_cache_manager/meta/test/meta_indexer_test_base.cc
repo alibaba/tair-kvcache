@@ -207,7 +207,7 @@ void MetaIndexerTestBase::DoUpdateTest() {
     ASSERT_EQ(0, meta_indexer_->GetKeyCount());
 }
 
-void MetaIndexerTestBase::DoDeleteAndExistTest() {
+void MetaIndexerTestBase::DoDeleteAndExistTest(bool is_redis_test) {
     KVData data;
     int32_t key_count = 3;
     MakeKVData(/*start*/ 0, /*end*/ 3, data);
@@ -248,16 +248,19 @@ void MetaIndexerTestBase::DoDeleteAndExistTest() {
     AssertGet(data.keys, expect_uris, expect_get_result);
     AssertSearchCacheGet(data.keys, expect_uris, expect_get_result.error_codes);
     AssertGet(data.keys, expect_uris, expect_maps, expect_get_result);
-    auto expect_get_properties_result = Result(key_count);
-    AssertGetProperties(data.keys, {"p0"}, expect_p0_maps, expect_get_properties_result);
-    AssertGetProperties(data.keys, {"p1"}, expect_p1_maps, expect_get_properties_result);
+    if (is_redis_test) {
+        // redis backend can not determine whether keys exist when get some fields
+        expect_get_result = Result(key_count);
+    }
+    AssertGetProperties(data.keys, {"p0"}, expect_p0_maps, expect_get_result);
+    AssertGetProperties(data.keys, {"p1"}, expect_p1_maps, expect_get_result);
 
     // 3. delete all keys to avoid affecting other test cases
     meta_indexer_->Delete(request_context_.get(), data.keys);
     ASSERT_EQ(0, meta_indexer_->GetKeyCount());
 }
 
-void MetaIndexerTestBase::DoScanAndRandomSampleTest() {
+void MetaIndexerTestBase::DoScanAndSampleReclaimKeysTest() {
     KVData data;
     int32_t key_count = 3;
     MakeKVData(/*start*/ 0, /*end*/ 3, data);
@@ -283,12 +286,12 @@ void MetaIndexerTestBase::DoScanAndRandomSampleTest() {
     KeyVector expect_keys = {0, 1, 2};
     ASSERT_EQ(expect_keys, keys);
 
-    // 2. test random sample
+    // 2. test sample reclaim keys
     keys.clear();
     try_count = 100;
     while (try_count-- && keys.size() < key_count) {
         KeyVector out_keys;
-        ASSERT_EQ(EC_OK, meta_indexer_->RandomSample(request_context_.get(), key_count, out_keys));
+        ASSERT_EQ(EC_OK, meta_indexer_->SampleReclaimKeys(request_context_.get(), key_count, out_keys));
         for (const auto key : out_keys) {
             if (std::find(keys.begin(), keys.end(), key) == keys.end()) {
                 keys.push_back(key);
@@ -306,11 +309,11 @@ void MetaIndexerTestBase::DoScanAndRandomSampleTest() {
     ASSERT_EQ(0, meta_indexer_->GetKeyCount());
 }
 
-void MetaIndexerTestBase::DoSimpleTest() {
+void MetaIndexerTestBase::DoSimpleTest(bool is_redis_test) {
     DoPutTest();
     DoUpdateTest();
-    DoDeleteAndExistTest();
-    DoScanAndRandomSampleTest();
+    DoDeleteAndExistTest(is_redis_test);
+    DoScanAndSampleReclaimKeysTest();
     DoReadModifyWriteTest();
 }
 

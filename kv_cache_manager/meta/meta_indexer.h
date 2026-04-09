@@ -1,6 +1,9 @@
 #pragma once
 
+#include <array>
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
@@ -9,6 +12,7 @@
 #include <vector>
 
 #include "kv_cache_manager/config/meta_indexer_config.h"
+#include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_storage_backend.h"
 
@@ -84,14 +88,85 @@ public:
     ErrorCode
     Scan(const std::string &cursor, const size_t limit, std::string &out_next_cursor, KeyVector &out_keys) noexcept;
     ErrorCode RandomSample(RequestContext *request_context, const size_t count, KeyVector &out_keys) const noexcept;
+    ErrorCode SampleReclaimKeys(RequestContext *request_context, const int64_t count, KeyVector &out_keys) const noexcept;
 
     void PersistMetaData() noexcept;
     size_t GetKeyCount() const noexcept;
     size_t GetMaxKeyCount() const noexcept;
     size_t GetCacheUsage() const noexcept;
 
+    // storage usage interfaces
+    //
+    // notes about backward compatibility:
+    //
+    // GetStorageUsage() is accurate for hybrid model arch, and should
+    // only be used under InstanceVersion::VERSION_1
+    //
+    // similar logic for Get/Add/Sub-StorageUsageByType() are already
+    // being used under InstanceVersion::VERSION_0; however they are
+    // only accurate under InstanceVersion::VERSION_1
+    //
+    // see also notes for instance behavior version
+    [[nodiscard]] std::uint64_t GetStorageUsage() const noexcept;
+    [[nodiscard]] std::uint64_t GetStorageUsageByType(const DataStorageType &type) const noexcept;
+    void SetStorageUsageByType(const DataStorageType &type, std::uint64_t value) noexcept;
+    std::uint64_t AddStorageUsageByType(const DataStorageType &type, std::uint64_t value) noexcept;
+    std::uint64_t SubStorageUsageByType(const DataStorageType &type, std::uint64_t value) noexcept;
+
+    // instance behavior version
+    enum class InstanceVersion : std::uint8_t {
+        // version 0: metadata persisted = [
+        //     METADATA_PROPERTY_KEY_COUNT,
+        // ]
+        VERSION_0 = 0,
+
+        // version 1: metadata persisted = [
+        //     METADATA_PROPERTY_KEY_COUNT,
+        //     METADATA_PROPERTY_STORAGE_USAGE_DATA,
+        // ]
+        VERSION_1 = 1,
+    };
+
+    [[nodiscard]] InstanceVersion GetVersion() const noexcept;
+
 private:
     class ScopedBatchLock;
+
+    // instance storage usage data
+    class StorageUsageData : public Jsonizable {
+    public:
+        StorageUsageData() = default;
+        ~StorageUsageData() override = default;
+
+        [[nodiscard]] std::uint64_t GetStorageUsage() const noexcept;
+        [[nodiscard]] std::uint64_t GetStorageUsageByType(const DataStorageType &type) const noexcept;
+
+        void Reset() noexcept;
+        void SetStorageUsageByType(const DataStorageType &type, std::uint64_t value) noexcept;
+
+        std::uint64_t AddStorageUsageByType(const DataStorageType &type, std::uint64_t value) noexcept;
+        std::uint64_t SubStorageUsageByType(const DataStorageType &type, std::uint64_t value) noexcept;
+
+        void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
+        bool FromRapidValue(const rapidjson::Value &rapid_value) override;
+
+        [[nodiscard]] std::string Serialize() const noexcept;
+        ErrorCode Deserialize(const std::string &str) noexcept;
+
+    private:
+        using array_t_ = std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DataStorageType::COUNT)>;
+        using size_t_ = array_t_::size_type;
+
+        // storage usage data array aggregated by storage type
+        // slot 0: DATA_STORAGE_TYPE_UNKNOWN **UNUSED**
+        // slot 1: DATA_STORAGE_TYPE_HF3FS usage data
+        // slot 2: DATA_STORAGE_TYPE_MOONCAKE usage data
+        // slot 3: DATA_STORAGE_TYPE_TAIR_MEMPOOL usage data
+        // slot 4: DATA_STORAGE_TYPE_NFS usage data
+        // slot 5: DATA_STORAGE_TYPE_VCNS_HF3FS **UNUSED** (merged into HF3FS)
+        array_t_ storage_usage_by_type_;
+    };
+
     struct BatchMetaData {
         std::vector<std::vector<int32_t>> batch_shard_indexs; // shard mutex index
         std::vector<std::vector<int32_t>> batch_indexs;       // raw index in KeyVector
@@ -130,9 +205,8 @@ private:
     size_t mutex_shard_num_ = MetaIndexerConfig::kDefaultMutexShardNum;
     size_t batch_key_size_ = MetaIndexerConfig::kDefaultBatchKeySize;
     std::string instance_id_;
-
-public:
-    std::array<std::atomic<std::uint64_t>, 5> storage_usage_array_ = {0, 0, 0, 0, 0};
+    StorageUsageData storage_usage_data_;
+    InstanceVersion version_ = InstanceVersion::VERSION_1;
 };
 
 } // namespace kv_cache_manager

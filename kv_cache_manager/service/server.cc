@@ -4,9 +4,11 @@
 #include <grpcpp/grpcpp.h>
 
 #include "kv_cache_manager/common/loop_thread.h"
+#include "kv_cache_manager/common/net_util.h"
 #include "kv_cache_manager/config/coordination_backend.h"
 #include "kv_cache_manager/config/coordination_backend_factory.h"
 #include "kv_cache_manager/config/leader_elector.h"
+#include "kv_cache_manager/config/node_endpoint_info.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/event/log_event_publisher.h"
@@ -55,7 +57,7 @@ bool Server::Init(const ServerConfig &config) {
     CreateMetricsReporter();
     CreateAndRegisterEventPublisher();
 
-    meta_impl_ = std::make_shared<MetaServiceImpl>(cache_manager_, metrics_reporter_);
+    meta_impl_ = std::make_shared<MetaServiceImpl>(cache_manager_, metrics_reporter_, leader_elector_);
     admin_impl_ = std::make_shared<AdminServiceImpl>(
         cache_manager_, metrics_reporter_, metrics_registry_, registry_manager_, leader_elector_);
     debug_impl_ = std::make_shared<DebugServiceImpl>(cache_manager_);
@@ -305,14 +307,15 @@ void Server::CreateAndRegisterEventPublisher() {
 bool Server::CreateLeaderElector() {
     auto coordination_uri = config_.GetCoordinationUri();
     std::string node_id = config_.GetLeaderElectorNodeId();
-    if (node_id.empty()) {
-        // TODO: replace local_ip_placeholder with real local ip
-        std::string local_ip = "local_ip_placeholder";
-        node_id = local_ip + ":" + std::to_string(config_.GetServiceAdminHttpPort()) + "_" +
-                  StringUtil::GenerateRandomString(16);
+    std::string host = config_.GetAdvertisedHost();
+    if (host.empty()) {
+        host = NetUtil::GetLocalIp();
     }
-    coordination_backend_ =
-        CoordinationBackendFactory::CreateAndInitCoordinationBackend(coordination_uri);
+    if (node_id.empty()) {
+        node_id =
+            host + ":" + std::to_string(config_.GetServiceAdminHttpPort()) + "_" + StringUtil::GenerateRandomString(16);
+    }
+    coordination_backend_ = CoordinationBackendFactory::CreateAndInitCoordinationBackend(coordination_uri);
     if (!coordination_backend_) {
         KVCM_LOG_ERROR("coordination_backend[%s] init failed", coordination_uri.c_str());
         return false;
@@ -325,6 +328,25 @@ bool Server::CreateLeaderElector() {
                                                       config_.GetLeaderElectorLoopIntervalMs());
     leader_elector_->SetBecomeLeaderHandler([this]() { OnBecomeLeader(); });
     leader_elector_->SetNoLongerLeaderHandler([this]() { OnNoLongerLeader(); });
+
+    // 写入本节点的连接信息到协调后端
+    {
+        NodeEndpointInfo node_info(node_id,
+                                   host,
+                                   config_.GetServiceRpcPort(),
+                                   config_.GetServiceHttpPort(),
+                                   config_.GetServiceAdminRpcPort(),
+                                   config_.GetServiceAdminHttpPort(),
+                                   config_.GetCustomInfo());
+
+        ErrorCode ec = leader_elector_->SetSelfNodeInfo(node_info);
+        if (ec != EC_OK) {
+            KVCM_LOG_ERROR("failed to write node info for node_id[%s], ec=%d", node_id.c_str(), ec);
+            return false;
+        }
+        KVCM_LOG_INFO("node info written for node_id[%s]", node_id.c_str());
+    }
+
     return true;
 }
 

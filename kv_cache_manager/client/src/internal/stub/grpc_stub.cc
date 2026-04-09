@@ -455,6 +455,33 @@ bool GrpcStub::TrimCache() {
     return false;
 }
 
+std::pair<ClientErrorCode, ClusterInfo> GrpcStub::GetClusterInfo(const std::string &trace_id,
+                                                                  const std::string &instance_id) {
+    auto stub = GET_AND_CHECK_STUB_WITH_TYPE();
+    proto::meta::GetClusterInfoRequest request;
+    SetCommonInfo(request, trace_id, instance_id);
+    grpc::ClientContext context;
+    proto::meta::GetClusterInfoResponse response;
+    auto grpc_status = stub->GetClusterInfo(&context, request, &response);
+    CHECK_GRPC_STATUS_WITH_TYPE(grpc_status);
+    CHECK_COMMON_HEADER_WITH_TYPE(response);
+    ClusterInfo info;
+    info.self_node_id = response.self_node_id();
+    info.leader_node_id = response.leader_node_id();
+    if (response.has_leader_endpoint()) {
+        const auto &ep = response.leader_endpoint();
+        info.leader_endpoint.node_id = ep.node_id();
+        info.leader_endpoint.host = ep.host();
+        info.leader_endpoint.meta_rpc_port = ep.meta_rpc_port();
+        info.leader_endpoint.meta_http_port = ep.meta_http_port();
+        info.leader_endpoint.custom_info = ep.custom_info();
+    }
+    KVCM_LOG_DEBUG("get cluster info success, self=%s, leader=%s",
+                   info.self_node_id.c_str(),
+                   info.leader_node_id.c_str());
+    return {ER_OK, info};
+}
+
 std::shared_ptr<proto::meta::MetaService::Stub> GrpcStub::GetStub() const {
     std::shared_lock read_guard(stubs_mutex_);
     if (stubs_.empty()) {

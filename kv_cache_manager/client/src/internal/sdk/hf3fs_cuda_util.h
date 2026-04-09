@@ -16,6 +16,33 @@
 
 namespace kv_cache_manager {
 
+// No-op GPU helper when neither CUDA nor MUSA is enabled (see hf3fs_gpu_util_alias.h).
+class Hf3fsGpuUtilStub final {
+public:
+    Hf3fsGpuUtilStub() = default;
+    ~Hf3fsGpuUtilStub() { Release(); }
+
+    bool Init() { return true; }
+    void Release() {}
+    void CopyAsyncHostToDevice(void *dst, const void *src, size_t size) {
+        (void)dst;
+        (void)src;
+        (void)size;
+    }
+    void CopyAsyncDeviceToHost(void *dst, const void *src, size_t size) {
+        (void)dst;
+        (void)src;
+        (void)size;
+    }
+    void Sync() {}
+    bool RegisterHost(void *ptr, size_t size) const {
+        (void)ptr;
+        (void)size;
+        return true;
+    }
+    void UnregisterHost(void *ptr) const { (void)ptr; }
+};
+
 #ifdef USING_CUDA
 
 class Hf3fsCudaUtil final {
@@ -70,24 +97,6 @@ public:
 
 private:
     cudaStream_t cuda_stream_{nullptr};
-};
-
-#else
-
-// for without cuda
-class Hf3fsCudaUtil final {
-public:
-    Hf3fsCudaUtil() = default;
-    ~Hf3fsCudaUtil() { Release(); }
-
-public:
-    bool Init() { return true; }
-    void Release() {}
-    void CopyAsyncHostToDevice(void *dst, const void *src, size_t size) {}
-    void CopyAsyncDeviceToHost(void *dst, const void *src, size_t size) {}
-    void Sync() {}
-    bool RegisterHost(void *ptr, size_t size) const { return true; }
-    void UnregisterHost(void *ptr) const {}
 };
 
 #endif

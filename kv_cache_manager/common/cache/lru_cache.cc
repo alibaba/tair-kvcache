@@ -358,60 +358,87 @@ void LRUCacheShard::SetStrictCapacityLimit(bool strict_capacity_limit) {
     strict_capacity_limit_ = strict_capacity_limit;
 }
 
+ErrorCode LRUCacheShard::DoInsertItemUnsafe(LRUHandle *e, LRUHandle **handle,
+                                      autovector<LRUHandle *> *last_reference_list) {
+    // Free the space following strict LRU policy until enough space
+    // is freed or the lru list is empty.
+    EvictFromLRU(e->total_charge, last_reference_list);
+
+    if ((usage_ + e->total_charge) > capacity_ && (strict_capacity_limit_ || handle == nullptr)) {
+        e->SetInCache(false);
+        if (handle == nullptr) {
+            // Don't insert the entry but still return ok, as if the entry inserted
+            // into cache and get evicted immediately.
+            last_reference_list->push_back(e);
+        } else {
+            free(e);
+            e = nullptr;
+            *handle = nullptr;
+            return EC_NOSPC;
+        }
+    } else {
+        // Insert into the cache. Note that the cache might get larger than its
+        // capacity if not enough space was freed up.
+        LRUHandle *old = table_.Insert(e);
+        usage_ += e->total_charge;
+        if (old != nullptr) {
+            assert(old->InCache());
+            old->SetInCache(false);
+            if (!old->HasRefs()) {
+                // old is on LRU because it's in cache and its reference count is 0.
+                LRU_Remove(old);
+                assert(usage_ >= old->total_charge);
+                usage_ -= old->total_charge;
+                last_reference_list->push_back(old);
+            }
+        }
+        if (handle == nullptr) {
+            LRU_Insert(e);
+        } else {
+            // If caller already holds a ref, no need to take one here.
+            if (!e->HasRefs()) {
+                e->Ref();
+            }
+            *handle = e;
+        }
+    }
+    return EC_OK;
+}
+
 ErrorCode LRUCacheShard::InsertItem(LRUHandle *e, LRUHandle **handle) {
     ErrorCode s = EC_OK;
     autovector<LRUHandle *> last_reference_list;
 
     {
         std::lock_guard<std::mutex> l(mutex_);
+        s = DoInsertItemUnsafe(e, handle, &last_reference_list);
+    }
 
-        // Free the space following strict LRU policy until enough space
-        // is freed or the lru list is empty.
-        EvictFromLRU(e->total_charge, &last_reference_list);
+    NotifyEvicted(last_reference_list);
+    return s;
+}
 
-        if ((usage_ + e->total_charge) > capacity_ && (strict_capacity_limit_ || handle == nullptr)) {
+ErrorCode LRUCacheShard::InsertItemIfAbsent(LRUHandle *e, LRUHandle **handle) {
+    ErrorCode s = EC_OK;
+    autovector<LRUHandle *> last_reference_list;
+
+    {
+        std::lock_guard<std::mutex> l(mutex_);
+
+        // Atomically check if key already exists
+        LRUHandle *existing = table_.Lookup(e->key(), e->hash);
+        if (existing != nullptr) {
+            // Key already exists; free the new entry and return EC_EXIST
             e->SetInCache(false);
-            if (handle == nullptr) {
-                // Don't insert the entry but still return ok, as if the entry inserted
-                // into cache and get evicted immediately.
-                last_reference_list.push_back(e);
-            } else {
-                free(e);
-                e = nullptr;
-                *handle = nullptr;
-                s = EC_NOSPC;
-            }
+            last_reference_list.push_back(e);
+            s = EC_EXIST;
         } else {
-            // Insert into the cache. Note that the cache might get larger than its
-            // capacity if not enough space was freed up.
-            LRUHandle *old = table_.Insert(e);
-            usage_ += e->total_charge;
-            if (old != nullptr) {
-                // s = Status::OkOverwritten();
-                assert(old->InCache());
-                old->SetInCache(false);
-                if (!old->HasRefs()) {
-                    // old is on LRU because it's in cache and its reference count is 0.
-                    LRU_Remove(old);
-                    assert(usage_ >= old->total_charge);
-                    usage_ -= old->total_charge;
-                    last_reference_list.push_back(old);
-                }
-            }
-            if (handle == nullptr) {
-                LRU_Insert(e);
-            } else {
-                // If caller already holds a ref, no need to take one here.
-                if (!e->HasRefs()) {
-                    e->Ref();
-                }
-                *handle = e;
-            }
+            // Key does not exist; proceed with insertion
+            s = DoInsertItemUnsafe(e, handle, &last_reference_list);
         }
     }
 
     NotifyEvicted(last_reference_list);
-
     return s;
 }
 
@@ -545,6 +572,19 @@ ErrorCode LRUCacheShard::Insert(const std::string_view &key,
     return InsertItem(e, handle);
 }
 
+ErrorCode LRUCacheShard::InsertIfAbsent(const std::string_view &key,
+                                        uint32_t hash,
+                                        Cache::ObjectPtr value,
+                                        const Cache::CacheItemHelper *helper,
+                                        size_t charge,
+                                        LRUHandle **handle,
+                                        Cache::Priority priority) {
+    LRUHandle *e = CreateHandle(key, hash, value, helper, charge);
+    e->SetPriority(priority);
+    e->SetInCache(true);
+    return InsertItemIfAbsent(e, handle);
+}
+
 LRUHandle *LRUCacheShard::CreateStandalone(const std::string_view &key,
                                            uint32_t hash,
                                            Cache::ObjectPtr value,
@@ -625,6 +665,20 @@ size_t LRUCacheShard::GetTableAddressCount() const {
     return size_t{1} << table_.GetLengthBits();
 }
 
+size_t LRUCacheShard::GetOldestKeys(size_t count, std::vector<std::string> &out_keys) {
+    std::lock_guard<std::mutex> l(mutex_);
+    size_t collected = 0;
+    LRUHandle *current = lru_.next;
+    while (current != &lru_ && collected < count) {
+        if (current->InCache()) {
+            out_keys.emplace_back(current->key());
+            ++collected;
+        }
+        current = current->next;
+    }
+    return collected;
+}
+
 void LRUCacheShard::AppendPrintableOptions(std::string &str) const {
     const int kBufferSize = 200;
     char buffer[kBufferSize];
@@ -684,6 +738,16 @@ size_t LRUCache::TEST_GetLRUSize() {
 }
 
 double LRUCache::GetHighPriPoolRatio() { return GetShard(0).GetHighPriPoolRatio(); }
+
+size_t LRUCache::GetOldestKeysInShard(uint32_t shard_id,
+                                       size_t count,
+                                       std::vector<std::string> &out_keys) {
+    uint32_t num_shards = GetNumShards();
+    if (shard_id >= num_shards || count == 0) {
+        return 0;
+    }
+    return GetShard(shard_id).GetOldestKeys(count, out_keys);
+}
 
 } // namespace lru_cache
 

@@ -46,6 +46,7 @@ public:
                                std::string &out_next_cursor,
                                KeyTypeVec &out_keys) noexcept = 0;
     virtual ErrorCode RandomSample(const int64_t count, KeyTypeVec &out_keys) noexcept = 0;
+    virtual ErrorCode SampleReclaimKeys(const int64_t count, KeyTypeVec &out_keys) noexcept = 0;
 
     // meta data
     virtual ErrorCode PutMetaData(const FieldMap &field_maps) noexcept = 0;

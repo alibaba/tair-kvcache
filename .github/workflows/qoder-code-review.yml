@@ -1,7 +1,7 @@
 name: Qoder Auto Code Review
 
 on:
-  pull_request:
+  pull_request_target:
     types: [ opened, reopened, unlabeled ]
     branches: [ "main" ]
   issue_comment:
@@ -23,8 +23,8 @@ jobs:
     # 4. Manual workflow dispatch
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request' && github.event.action != 'unlabeled') ||
-      (github.event_name == 'pull_request' && github.event.label.name == 'ai reviewed') ||
+      (github.event_name == 'pull_request_target' && github.event.action != 'unlabeled') ||
+      (github.event_name == 'pull_request_target' && github.event.label.name == 'ai reviewed') ||
       (github.event_name == 'issue_comment' &&
        github.event.issue.pull_request &&
        contains(github.event.comment.body, '@tair-ci review') &&
@@ -38,7 +38,7 @@ jobs:
       - name: Determine PR number
         id: pr-info
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
+          if [ "${{ github.event_name }}" = "pull_request_target" ]; then
             echo "number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
           elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "number=${{ github.event.inputs.pr_number }}" >> "$GITHUB_OUTPUT"

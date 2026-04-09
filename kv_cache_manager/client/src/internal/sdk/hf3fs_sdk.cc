@@ -7,7 +7,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#include "kv_cache_manager/client/src/internal/sdk/hf3fs_cuda_util.h"
+#include "kv_cache_manager/client/src/internal/sdk/hf3fs_gpu_util_alias.h"
 #include "kv_cache_manager/client/src/internal/sdk/hf3fs_mempool.h"
 #include "kv_cache_manager/common/logger.h"
 
@@ -38,22 +38,22 @@ ClientErrorCode Hf3fsSdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_back
     }
     config_ = hf3fs_config;
 
-    auto cuda_util = std::make_shared<Hf3fsCudaUtil>();
-    if (!cuda_util->Init()) {
-        KVCM_LOG_WARN("dist storage 3fs init failed, cuda util init failed");
+    auto gpu_util = std::make_shared<Hf3fsGpuUtil>();
+    if (!gpu_util->Init()) {
+        KVCM_LOG_WARN("dist storage 3fs init failed, gpu util init failed");
         return ER_SDKINIT_ERROR;
     }
 
     usrbio_api_ = std::make_shared<Hf3fsUsrbioApi>();
 
     // read iov
-    if (!InitIovHandle(read_iov_handle_, config_->read_iov_block_size(), config_->read_iov_size(), cuda_util)) {
+    if (!InitIovHandle(read_iov_handle_, config_->read_iov_block_size(), config_->read_iov_size(), gpu_util)) {
         KVCM_LOG_WARN("init read iov handle failed");
         return ER_SDKINIT_ERROR;
     }
 
     // write iov
-    if (!InitIovHandle(write_iov_handle_, config_->write_iov_block_size(), config_->write_iov_size(), cuda_util)) {
+    if (!InitIovHandle(write_iov_handle_, config_->write_iov_block_size(), config_->write_iov_size(), gpu_util)) {
         KVCM_LOG_WARN("init write iov handle failed");
         ReleaseIovHandle(read_iov_handle_);
         return ER_SDKINIT_ERROR;
@@ -250,7 +250,7 @@ void Hf3fsSdk::DeleteRemainingIovShm() const {
 bool Hf3fsSdk::InitIovHandle(Hf3fsIovHandle &handle,
                              size_t iov_block_size,
                              size_t iov_size,
-                             const std::shared_ptr<Hf3fsCudaUtil> &cuda_util) const {
+                             const std::shared_ptr<Hf3fsGpuUtil> &gpu_util) const {
     if (iov_block_size != 0 && iov_size % iov_block_size != 0) {
         iov_size = (iov_size / iov_block_size + 1) * iov_block_size;
     }
@@ -271,28 +271,32 @@ bool Hf3fsSdk::InitIovHandle(Hf3fsIovHandle &handle,
         return false;
     }
 
-    if (!cuda_util->RegisterHost(iov->base, iov_size)) {
-        KVCM_LOG_WARN("cuda register iov failed, iov base: %p, expect iov size: %zu, actual iov size: %zu",
+    if (gpu_util != nullptr && !gpu_util->RegisterHost(iov->base, iov_size)) {
+        KVCM_LOG_WARN("gpu register iov failed, iov base: %p, expect iov size: %zu, actual iov size: %zu",
                       iov->base,
                       iov_size,
                       iov->size);
         DestroyIov(iov);
         return false;
     }
-    handle = {iov, nullptr, iov_size, iov_block_size, mempool, cuda_util};
+    handle.iov = iov;
+    handle.iov_size = iov_size;
+    handle.iov_block_size = iov_block_size;
+    handle.iov_mempool = mempool;
+    handle.gpu_util = gpu_util;
     return true;
 }
 
 void Hf3fsSdk::ReleaseIovHandle(Hf3fsIovHandle &iov_handle) {
     if (iov_handle.iov != nullptr) {
-        if (iov_handle.cuda_util) {
-            iov_handle.cuda_util->UnregisterHost(iov_handle.iov->base);
+        if (iov_handle.gpu_util) {
+            iov_handle.gpu_util->UnregisterHost(iov_handle.iov->base);
         }
         DestroyIov(iov_handle.iov);
         iov_handle.iov = nullptr;
     }
     iov_handle.iov_mempool.reset();
-    iov_handle.cuda_util.reset();
+    iov_handle.gpu_util.reset();
 }
 
 struct hf3fs_iov *Hf3fsSdk::CreateIov(const std::string &mountpoint, size_t iov_size, size_t iov_block_size) const {

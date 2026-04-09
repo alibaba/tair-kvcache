@@ -255,6 +255,11 @@ ErrorCode MetaRedisBackend::RandomSample(const int64_t count, std::vector<KeyTyp
     return EC_OK;
 }
 
+ErrorCode MetaRedisBackend::SampleReclaimKeys(const int64_t count, std::vector<KeyType> &out_keys) noexcept {
+    // For Redis backend, RandomSample already uses Redis RAND command which is efficient
+    return RandomSample(count, out_keys);
+}
+
 ErrorCode MetaRedisBackend::PutMetaData(const FieldMap &field_map) noexcept {
     auto handle = client_pool_->AcquireClient(timeout_ms_);
     if (!handle) {

@@ -3,7 +3,7 @@
 #include <fstream>
 #include <gtest/gtest.h>
 
-#include "kv_cache_manager/client/src/internal/sdk/hf3fs_cuda_util.h"
+#include "kv_cache_manager/client/src/internal/sdk/hf3fs_gpu_util_alias.h"
 #include "kv_cache_manager/client/src/internal/sdk/hf3fs_mempool.h"
 #include "kv_cache_manager/client/src/internal/sdk/hf3fs_sdk.h"
 #include "kv_cache_manager/client/src/internal/sdk/test/mock/mock_hf3fs_usrbio_api.h"
@@ -43,7 +43,7 @@ private:
         handle.iov_base = std::shared_ptr<uint8_t>((uint8_t *)malloc(size), [](void *ptr) { free(ptr); });
         std::memset(handle.iov_base.get(), c, size);
         handle.iov_size = size;
-        handle.cuda_util = std::make_shared<Hf3fsCudaUtil>();
+        handle.gpu_util = std::make_shared<Hf3fsGpuUtil>();
         auto mempool = std::make_shared<Hf3fsMempool>(handle.iov_base.get(), handle.iov_size, 0);
         EXPECT_TRUE(mempool->Init());
         handle.iov_mempool = mempool;
@@ -765,8 +765,8 @@ TEST_F(Hf3fsSdkTest, InitIovHandle_ReturnFalse_CreateIovFail) {
         }));
 
     Hf3fsIovHandle handle;
-    auto cuda_util = std::make_shared<Hf3fsCudaUtil>();
-    bool ok = sdk_->InitIovHandle(handle, 4096, 8192, cuda_util);
+    auto gpu_util = std::make_shared<Hf3fsGpuUtil>();
+    bool ok = sdk_->InitIovHandle(handle, 4096, 8192, gpu_util);
     EXPECT_FALSE(ok);
     EXPECT_EQ(captured_size, 8192u);
 }
@@ -783,8 +783,8 @@ TEST_F(Hf3fsSdkTest, InitIovHandle_ReturnFalse_SizeRoundedUp_CreateIovFail) {
         }));
 
     Hf3fsIovHandle handle;
-    auto cuda_util = std::make_shared<Hf3fsCudaUtil>();
-    bool ok = sdk_->InitIovHandle(handle, 4096, 5000, cuda_util);
+    auto gpu_util = std::make_shared<Hf3fsGpuUtil>();
+    bool ok = sdk_->InitIovHandle(handle, 4096, 5000, gpu_util);
     EXPECT_FALSE(ok);
     EXPECT_EQ(captured_size, 8192u);
 }
@@ -802,8 +802,8 @@ TEST_F(Hf3fsSdkTest, InitIovHandle_ReturnFalse_MempoolInitFail_DestroyIov) {
     EXPECT_CALL(*mock, Hf3fsIovDestroy(::testing::NotNull())).Times(1);
 
     Hf3fsIovHandle handle;
-    auto cuda_util = std::make_shared<Hf3fsCudaUtil>();
-    bool ok = sdk_->InitIovHandle(handle, 4096, 4096, cuda_util);
+    auto gpu_util = std::make_shared<Hf3fsGpuUtil>();
+    bool ok = sdk_->InitIovHandle(handle, 4096, 4096, gpu_util);
     EXPECT_FALSE(ok);
 }
 
@@ -819,8 +819,8 @@ TEST_F(Hf3fsSdkTest, InitIovHandle_ReturnTrue_Success) {
             return 0;
         }));
     Hf3fsIovHandle handle;
-    auto cuda_util = std::make_shared<Hf3fsCudaUtil>();
-    bool ok = sdk_->InitIovHandle(handle, 4096, 4096, cuda_util);
+    auto gpu_util = std::make_shared<Hf3fsGpuUtil>();
+    bool ok = sdk_->InitIovHandle(handle, 4096, 4096, gpu_util);
     EXPECT_TRUE(ok);
 
     EXPECT_CALL(*mock, Hf3fsIovDestroy(handle.iov)).WillOnce(::testing::Invoke([&](::hf3fs_iov *iov) {
@@ -830,7 +830,7 @@ TEST_F(Hf3fsSdkTest, InitIovHandle_ReturnTrue_Success) {
     sdk_->ReleaseIovHandle(handle);
     EXPECT_EQ(handle.iov, nullptr);
     EXPECT_EQ(handle.iov_mempool, nullptr);
-    EXPECT_EQ(handle.cuda_util, nullptr);
+    EXPECT_EQ(handle.gpu_util, nullptr);
 }
 #endif
 
@@ -838,7 +838,7 @@ TEST_F(Hf3fsSdkTest, InitIovHandle_ReturnTrue_Success) {
 TEST_F(Hf3fsSdkTest, ReleaseIovHandle_ReturnNoop_NullIov) {
     Hf3fsIovHandle handle;
     // set non-null resources to verify they get reset
-    handle.cuda_util = std::make_shared<Hf3fsCudaUtil>();
+    handle.gpu_util = std::make_shared<Hf3fsGpuUtil>();
     handle.iov_mempool = std::make_shared<Hf3fsMempool>((void *)0x1, 16, 0);
 
     auto mock = std::dynamic_pointer_cast<MockHf3fsUsrbioApi>(sdk_->usrbio_api_);
@@ -849,7 +849,7 @@ TEST_F(Hf3fsSdkTest, ReleaseIovHandle_ReturnNoop_NullIov) {
 
     EXPECT_EQ(handle.iov, nullptr);
     EXPECT_EQ(handle.iov_mempool, nullptr);
-    EXPECT_EQ(handle.cuda_util, nullptr);
+    EXPECT_EQ(handle.gpu_util, nullptr);
 }
 
 // ------------- CreateIov -------------

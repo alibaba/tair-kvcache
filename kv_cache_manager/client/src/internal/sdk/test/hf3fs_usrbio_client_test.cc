@@ -3,7 +3,7 @@
 #include <fstream>
 #include <gtest/gtest.h>
 
-#include "kv_cache_manager/client/src/internal/sdk/hf3fs_cuda_util.h"
+#include "kv_cache_manager/client/src/internal/sdk/hf3fs_gpu_util_alias.h"
 #include "kv_cache_manager/client/src/internal/sdk/hf3fs_mempool.h"
 #include "kv_cache_manager/client/src/internal/sdk/hf3fs_usrbio_api.h"
 #include "kv_cache_manager/client/src/internal/sdk/hf3fs_usrbio_client.h"
@@ -37,7 +37,7 @@ protected:
         handle.iov_base = std::shared_ptr<uint8_t>((uint8_t *)malloc(size), [](void *ptr) { free(ptr); });
         std::memset(handle.iov_base.get(), c, size);
         handle.iov_size = size;
-        handle.cuda_util = std::make_shared<Hf3fsCudaUtil>();
+        handle.gpu_util = std::make_shared<Hf3fsGpuUtil>();
         auto mempool = std::make_shared<Hf3fsMempool>(handle.iov_base.get(), handle.iov_size, 0);
         EXPECT_TRUE(mempool->Init());
         handle.iov_mempool = mempool;

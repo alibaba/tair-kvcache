@@ -44,7 +44,7 @@ from kv_cache_manager.py_connector.vllm.metadata import SaveRequest, LoadRequest
     TairKvCacheConnectorMetadata
 from kv_cache_manager.py_connector.vllm.config import TairKvCacheConnectorExtraConfig
 from kv_cache_manager.py_connector.vllm.location_query_manager import LocationQueryManager
-from kv_cache_manager.py_connector.vllm.data_transfer import MultiResult, DataTransferManager
+from kv_cache_manager.py_connector.vllm.data_transfer import MultiResult, DataTransferManager, _get_device_module
 
 if typing_extensions.TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
@@ -207,8 +207,9 @@ class TairKvCacheConnector(KVConnectorBase_V1):
 
         elif role == KVConnectorRole.WORKER:
             self._tp_rank = get_tensor_model_parallel_rank()
-            self._save_stream = torch.cuda.Stream()
-            self._load_stream = torch.cuda.Stream()
+            self._device_mod = None
+            self._save_stream = None
+            self._load_stream = None
 
             logger.warning(
                 "TairKvCacheConnector in worker inited, tp rank: %d, tp size: %d, host_ip: %s, port: %d" % (
@@ -373,6 +374,9 @@ class TairKvCacheConnector(KVConnectorBase_V1):
 
         self._dtype = first_layer_kvcache.dtype
         self._device = first_layer_kvcache.device
+        self._device_mod = _get_device_module(self._device)
+        self._save_stream = self._device_mod.Stream()
+        self._load_stream = self._device_mod.Stream()
         self._per_manager_location_spec_layer_shape = [first_layer_kvcache.shape[0],
                                                        self._manager_block_size,
                                                        first_layer_kvcache.shape[3] * first_layer_kvcache.shape[4]]
@@ -489,8 +493,8 @@ class TairKvCacheConnector(KVConnectorBase_V1):
 
         kvcache_ready_event = None
         if len(meta.to_save_requests) > 0:
-            kvcache_ready_event = torch.cuda.Event()
-            kvcache_ready_event.record(torch.cuda.current_stream())
+            kvcache_ready_event = self._device_mod.Event()
+            kvcache_ready_event.record(self._device_mod.current_stream())
 
         for req_save in meta.to_save_requests:
             req = self._alive_requests[req_save.req_id]

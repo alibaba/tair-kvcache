@@ -381,6 +381,27 @@ class AdminServiceTestBase(abc.ABC, TestBase, unittest.TestCase):
         self.assertIn("self_node_id", resp)
         self.assertIn("leader_node_id", resp)
 
+        # 验证 leader_endpoint 字段（leader discovery 功能）
+        self.assertIn("leader_endpoint", resp)
+        leader_ep = resp["leader_endpoint"]
+        self.assertIn("node_id", leader_ep)
+        self.assertIn("host", leader_ep)
+        self.assertIn("meta_rpc_port", leader_ep)
+        self.assertIn("meta_http_port", leader_ep)
+        self.assertIn("admin_rpc_port", leader_ep)
+        self.assertIn("admin_http_port", leader_ep)
+        # 单节点场景下 leader_endpoint.node_id 应和 leader_node_id 一致
+        self.assertEqual(leader_ep["node_id"], resp["leader_node_id"])
+        # host 不应为空（已通过 advertised_host 或 NetUtil 填充）
+        self.assertNotEqual(leader_ep["host"], "", "leader_endpoint.host should not be empty")
+        # 端口号应为正整数
+        self.assertGreater(leader_ep["meta_rpc_port"], 0)
+        self.assertGreater(leader_ep["meta_http_port"], 0)
+        self.assertGreater(leader_ep["admin_rpc_port"], 0)
+        self.assertGreater(leader_ep["admin_http_port"], 0)
+        # custom_info 默认为空字符串（未配置时）
+        self.assertIn("custom_info", leader_ep)
+
     def test_get_leader_elector_config(self):
         """测试 GetLeaderElectorConfig 接口"""
         req = {"trace_id": self._trace_id}
@@ -544,11 +565,18 @@ class AdminServiceLeaderElectionTest(abc.ABC, TestBase, unittest.TestCase):
         # 配置文件分布式锁
         kwargs[f'kvcm.distributed_lock.uri'] = self._lock_uri
         kwargs[f'kvcm.leader_elector.lease_ms'] = 2000
-        self.assertTrue(self.worker_manager.start_all(**kwargs))
+        kwargs[f'kvcm.service.advertised_host'] = '127.0.0.1'
+        # 逐个启动 worker，为每个 worker 设置不同的 custom_info
+        for i in range(len(self.worker_manager.workers)):
+            worker_kwargs = dict(kwargs)
+            worker_kwargs[f'kvcm.service.custom_info'] = f'worker-{i}'
+            self.assertTrue(self.worker_manager.start_worker(i, **worker_kwargs))
 
     def start_worker_by_id(self, worker_id, **kwargs):
         kwargs[f'kvcm.distributed_lock.uri'] = self._lock_uri
         kwargs[f'kvcm.leader_elector.lease_ms'] = 2000
+        kwargs[f'kvcm.service.advertised_host'] = '127.0.0.1'
+        kwargs[f'kvcm.service.custom_info'] = f'worker-{worker_id}'
         self.assertTrue(self.worker_manager.start_worker(worker_id, **kwargs))
 
     def clean_test_resource(self):
@@ -630,7 +658,19 @@ class AdminServiceLeaderElectionTest(abc.ABC, TestBase, unittest.TestCase):
             self.assertIn("self_leader_expiration_time", cluster_resp, "集群信息应该包含leader租约过期时间")
             leader_node_id = cluster_resp["leader_node_id"]
 
-            # 验证非leader的worker不是leader
+            # 验证 leader_endpoint（通过 advertised_host=127.0.0.1 保证确定性）
+            leader_ep = cluster_resp.get("leader_endpoint", {})
+            self.assertEqual(leader_ep["node_id"], leader_node_id, "leader_endpoint.node_id 应和 leader_node_id 一致")
+            self.assertEqual(leader_ep["host"], "127.0.0.1", "leader_endpoint.host 应为 advertised_host")
+            leader_worker = self.worker_manager.get_worker(leader_id)
+            self.assertEqual(leader_ep["meta_rpc_port"], leader_worker.env.rpc_port)
+            self.assertEqual(leader_ep["meta_http_port"], leader_worker.env.http_port)
+            self.assertEqual(leader_ep["admin_rpc_port"], leader_worker.env.admin_rpc_port)
+            self.assertEqual(leader_ep["admin_http_port"], leader_worker.env.admin_http_port)
+            self.assertEqual(leader_ep.get("custom_info", ""), f"worker-{leader_id}",
+                             "leader_endpoint.custom_info 应与 leader worker 启动时配置的一致")
+
+            # 从 follower 查询也能获取正确的 leader_endpoint
             non_leader_id = 1 if leader_id == 0 else 0
             non_leader_req = {"trace_id": "trace_non_leader_check"}
             non_leader_resp = original_follower_client.check_health(non_leader_req)
@@ -638,6 +678,13 @@ class AdminServiceLeaderElectionTest(abc.ABC, TestBase, unittest.TestCase):
             self.assertTrue(non_leader_resp.get("is_health"), f"Worker {non_leader_id} 应该健康")
             non_leader_cluster_resp = client0.get_manager_cluster_info(cluster_req)
             self.assertEqual(non_leader_cluster_resp["leader_node_id"], leader_node_id, "非leader节点应该看到正确的leader_id")
+            # follower 查询到的 leader_endpoint 也应与 leader 的一致
+            follower_leader_ep = non_leader_cluster_resp.get("leader_endpoint", {})
+            self.assertEqual(follower_leader_ep["node_id"], leader_node_id)
+            self.assertEqual(follower_leader_ep["host"], "127.0.0.1")
+            self.assertEqual(follower_leader_ep["admin_http_port"], leader_worker.env.admin_http_port)
+            self.assertEqual(follower_leader_ep.get("custom_info", ""), f"worker-{leader_id}",
+                             "follower 查询到的 custom_info 也应与 leader 配置一致")
 
             # 测试leader降级功能（如果leader是当前worker）
             update_req = {"trace_id": "trace_demote_test", "campaign_delay_time_ms": 10 * 1000}

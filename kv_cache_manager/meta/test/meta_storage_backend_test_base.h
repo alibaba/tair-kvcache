@@ -37,9 +37,9 @@ protected:
                                      const ErrorCode expected_ec,
                                      const std::set<MetaStorageBackend::KeyType> &expected_keys,
                                      std::string &out_next_cursor);
-    static void AssertRandomSample(MetaStorageBackend *meta_storage_backend,
-                                   const int64_t count,
-                                   const ErrorCode expected_ec,
-                                   const std::set<MetaStorageBackend::KeyType> &expected_keys);
+    static void AssertSampleReclaimKeys(MetaStorageBackend *meta_storage_backend,
+                                        const int64_t count,
+                                        const ErrorCode expected_ec,
+                                        const std::set<MetaStorageBackend::KeyType> &expected_keys);
 };
 } // namespace kv_cache_manager

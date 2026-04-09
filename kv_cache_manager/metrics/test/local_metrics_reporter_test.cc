@@ -321,6 +321,7 @@ TEST_F(LocalMetricsReporterTest, TestReportIntervalCacheManagerMetrics) {
               cache_manager_->meta_indexer_manager_->CreateMetaIndexer("test_instance_id", meta_indexer_config));
     auto meta_indexer = cache_manager_->meta_indexer_manager_->GetMetaIndexer("test_instance_id");
     meta_indexer->key_count_.store(5);
+    meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 1024 * 5);
     cache_manager_->metrics_recorder_->Start();
     std::this_thread::sleep_for(std::chrono::seconds(6));
     EXPECT_NO_FATAL_FAILURE(reporter_->ReportInterval());

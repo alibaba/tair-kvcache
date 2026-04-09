@@ -1,7 +1,12 @@
 #include "kv_cache_manager/meta/meta_indexer.h"
 
 #include <algorithm>
+#include <cinttypes>
+#include <cstddef>
+#include <cstdint>
 #include <set>
+#include <string>
+#include <vector>
 
 #include "kv_cache_manager/common/common.h"
 #include "kv_cache_manager/common/error_code.h"
@@ -10,6 +15,7 @@
 #include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/config/meta_indexer_config.h"
+#include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/meta/meta_search_cache.h"
 #include "kv_cache_manager/meta/meta_storage_backend_factory.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
@@ -50,6 +56,155 @@ private:
     std::vector<int32_t> shard_indexs_;
 };
 
+std::uint64_t MetaIndexer::StorageUsageData::GetStorageUsage() const noexcept {
+    std::uint64_t storage_usage = 0;
+    for (size_t_ i = 0; i != storage_usage_by_type_.size(); ++i) {
+        if (i == static_cast<size_t_>(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN) ||
+            i == static_cast<size_t_>(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS)) {
+            continue;
+        }
+        storage_usage += storage_usage_by_type_.at(i).load();
+    }
+    return storage_usage;
+}
+
+std::uint64_t MetaIndexer::StorageUsageData::GetStorageUsageByType(const DataStorageType &type) const noexcept {
+    const size_t_ idx = ToIndex(ToBaseType(type));
+    if (idx >= storage_usage_by_type_.size()) {
+        KVCM_LOG_WARN("data storage type to index out of range, array size: [%zu], type as index: [%zu]",
+                      storage_usage_by_type_.size(),
+                      idx);
+        return 0;
+    }
+    return storage_usage_by_type_.at(idx).load();
+}
+
+void MetaIndexer::StorageUsageData::Reset() noexcept {
+    // array.fill(0) won't work here due to the deleted operator= of the
+    // std::atomic type, explicitly assign 0 to all elements in the
+    // array instead
+    for (auto &v : storage_usage_by_type_) {
+        v.store(0);
+    }
+}
+
+void MetaIndexer::StorageUsageData::SetStorageUsageByType(const DataStorageType &type,
+                                                          const std::uint64_t value) noexcept {
+    const size_t_ idx = ToIndex(ToBaseType(type));
+    if (idx >= storage_usage_by_type_.size()) {
+        KVCM_LOG_WARN("data storage type to index out of range, array size: [%zu], type as index: [%zu]",
+                      storage_usage_by_type_.size(),
+                      idx);
+        return;
+    }
+    storage_usage_by_type_.at(idx).store(value);
+}
+
+std::uint64_t MetaIndexer::StorageUsageData::AddStorageUsageByType(const DataStorageType &type,
+                                                                   const std::uint64_t value) noexcept {
+    const size_t_ idx = ToIndex(ToBaseType(type));
+    if (idx >= storage_usage_by_type_.size()) {
+        KVCM_LOG_WARN("data storage type to index out of range, array size: [%zu], type as index: [%zu]",
+                      storage_usage_by_type_.size(),
+                      idx);
+        return 0;
+    }
+    return storage_usage_by_type_.at(idx).fetch_add(value);
+}
+
+std::uint64_t MetaIndexer::StorageUsageData::SubStorageUsageByType(const DataStorageType &type,
+                                                                   const std::uint64_t value) noexcept {
+    const size_t_ idx = ToIndex(ToBaseType(type));
+    if (idx >= storage_usage_by_type_.size()) {
+        KVCM_LOG_WARN("data storage type to index out of range, array size: [%zu], type as index: [%zu]",
+                      storage_usage_by_type_.size(),
+                      idx);
+        return 0;
+    }
+
+    auto &ref = storage_usage_by_type_.at(idx);
+    std::uint64_t expected = ref.load(), desired = 0;
+    bool underflow = false;
+    do {
+        if (expected < value) {
+            underflow = true;
+            desired = 0;
+        } else {
+            desired = expected - value;
+        }
+    } while (!ref.compare_exchange_weak(expected, desired));
+    if (underflow) {
+        KVCM_LOG_WARN("storage usage underflow for type [%zu]: "
+                      "current [%" PRIu64 "] < subtract [%" PRIu64 "], clamped to 0",
+                      idx,
+                      expected,
+                      value);
+    }
+    return desired;
+}
+
+void MetaIndexer::StorageUsageData::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
+    for (size_t_ i = 0; i != storage_usage_by_type_.size(); ++i) {
+        const auto type = static_cast<DataStorageType>(i);
+        const std::string key = ToString(type);
+        Put(writer, key, storage_usage_by_type_.at(i).load());
+    }
+}
+
+bool MetaIndexer::StorageUsageData::FromRapidValue(const rapidjson::Value &rapid_value) {
+    if (!rapid_value.IsObject()) {
+        return false;
+    }
+
+    // parse into a temporary buffer first to avoid partial updates
+    std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> buf{};
+    for (auto it = rapid_value.MemberBegin(); it != rapid_value.MemberEnd(); ++it) {
+        const std::string key(it->name.GetString(), it->name.GetStringLength());
+        const DataStorageType type = ToDataStorageType(key);
+        if (ToString(type) != key) {
+            // round-trip mismatch: key is not a recognized type
+            // prevent ToDataStorageType silently maps every unknown
+            // string to DATA_STORAGE_TYPE_UNKNOWN
+            KVCM_LOG_ERROR("deserialize storage usage data failed: unrecognized storage type [%s]", key.c_str());
+            return false;
+        }
+        const size_t_ idx = ToIndex(type);
+        if (it->value.IsUint64()) {
+            buf.at(idx) = it->value.GetUint64();
+        } else {
+            KVCM_LOG_ERROR("deserialize storage usage data failed: non-integer value for key [%s]", key.c_str());
+            return false;
+        }
+    }
+
+    // all values parsed successfully, apply to the actual array
+    for (size_t_ i = 0; i != storage_usage_by_type_.size(); ++i) {
+        storage_usage_by_type_.at(i).store(buf.at(i));
+    }
+    return true;
+}
+
+std::string MetaIndexer::StorageUsageData::Serialize() const noexcept {
+    const std::string str = ToJsonString();
+    KVCM_LOG_DEBUG("serializing storage usage data into: [%s]", str.c_str());
+    return str;
+}
+
+ErrorCode MetaIndexer::StorageUsageData::Deserialize(const std::string &str) noexcept {
+    KVCM_LOG_DEBUG("deserializing storage usage data: [%s]", str.c_str());
+    std::string str_copy{str};
+    StringUtil::Trim(str_copy);
+    if (str_copy.empty()) {
+        KVCM_LOG_ERROR("deserialize storage usage data failed: input string is empty");
+        return ErrorCode::EC_ERROR;
+    }
+    if (!FromJsonString(str_copy)) {
+        KVCM_LOG_ERROR("deserialize storage usage data failed: invalid JSON [%s]", str_copy.c_str());
+        return ErrorCode::EC_ERROR;
+    }
+    return ErrorCode::EC_OK;
+}
+
 ErrorCode MetaIndexer::Init(const std::string &instance_id, const std::shared_ptr<MetaIndexerConfig> &config) noexcept {
     if (!config || !config->GetMetaStorageBackendConfig()) {
         KVCM_LOG_ERROR("instance[%s] meta indexer init failed, config is invalid", instance_id.c_str());
@@ -72,8 +227,8 @@ ErrorCode MetaIndexer::Init(const std::string &instance_id, const std::shared_pt
     }
 
     instance_id_ = instance_id;
-    storage_ =
-        MetaStorageBackendFactory::CreateAndInitStorageBackend(instance_id, config->GetMetaStorageBackendConfig());
+    auto storage_backend_config = config->GetMetaStorageBackendConfig();
+    storage_ = MetaStorageBackendFactory::CreateAndInitStorageBackend(instance_id, storage_backend_config);
     if (!storage_) {
         KVCM_LOG_ERROR("instance[%s] create storage backend failed, storage backend type[%s]",
                        instance_id_.c_str(),
@@ -96,6 +251,8 @@ ErrorCode MetaIndexer::Init(const std::string &instance_id, const std::shared_pt
             return ec;
         }
     }
+
+    storage_usage_data_.Reset();
     ec = RecoverMetaData();
     if (ec != EC_OK && ec != EC_NOENT) {
         KVCM_LOG_ERROR("instance[%s] recover metadata failed, ec[%d]", instance_id_.c_str(), ec);
@@ -103,14 +260,18 @@ ErrorCode MetaIndexer::Init(const std::string &instance_id, const std::shared_pt
     }
     KVCM_LOG_INFO(
         "instance[%s] meta indexer init success, storage backend type[%s], mutex shard num[%lu], max key count[%lu], "
-        "batch key size[%lu], search cache size[%lu], key_count[%lu]",
+        "batch key size[%lu], search cache size[%lu], key_count[%lu], persist_metadata_interval_time_ms[%zu], "
+        "storage usage data[%s], instance version[%" PRIu8 "]",
         instance_id_.c_str(),
         storage_->GetStorageType().c_str(),
         mutex_shard_num_,
         max_key_count_,
         batch_key_size_,
         config->GetMetaCachePolicyConfig()->GetCapacity(),
-        key_count_.load());
+        key_count_.load(),
+        persist_metadata_interval_time_ms_,
+        version_ == InstanceVersion::VERSION_1 ? storage_usage_data_.ToJsonString().c_str() : "N/A",
+        static_cast<std::uint8_t>(version_));
     return EC_OK;
 }
 
@@ -541,6 +702,19 @@ MetaIndexer::RandomSample(RequestContext *request_context, const size_t count, K
     return ec;
 }
 
+ErrorCode
+MetaIndexer::SampleReclaimKeys(RequestContext *request_context, const int64_t count, KeyVector &out_keys) const noexcept {
+    out_keys.reserve(count);
+    auto ec = storage_->SampleReclaimKeys(count, out_keys);
+    if (ec != EC_OK) {
+        KVCM_LOG_ERROR("instance[%s] meta indexer sample reclaim keys failed, count[%lu] sample key size[%lu]",
+                       instance_id_.c_str(),
+                       count,
+                       out_keys.size());
+    }
+    return ec;
+}
+
 size_t MetaIndexer::GetKeyCount() const noexcept { return key_count_.load(); }
 
 size_t MetaIndexer::GetMaxKeyCount() const noexcept { return max_key_count_; }
@@ -551,6 +725,26 @@ size_t MetaIndexer::GetCacheUsage() const noexcept {
     }
     return 0;
 }
+
+std::uint64_t MetaIndexer::GetStorageUsage() const noexcept { return storage_usage_data_.GetStorageUsage(); }
+
+std::uint64_t MetaIndexer::GetStorageUsageByType(const DataStorageType &type) const noexcept {
+    return storage_usage_data_.GetStorageUsageByType(type);
+}
+
+void MetaIndexer::SetStorageUsageByType(const DataStorageType &type, const std::uint64_t value) noexcept {
+    storage_usage_data_.SetStorageUsageByType(type, value);
+}
+
+std::uint64_t MetaIndexer::AddStorageUsageByType(const DataStorageType &type, const std::uint64_t value) noexcept {
+    return storage_usage_data_.AddStorageUsageByType(type, value);
+}
+
+std::uint64_t MetaIndexer::SubStorageUsageByType(const DataStorageType &type, const std::uint64_t value) noexcept {
+    return storage_usage_data_.SubStorageUsageByType(type, value);
+}
+
+MetaIndexer::InstanceVersion MetaIndexer::GetVersion() const noexcept { return version_; }
 
 // Combining batch size and lock granularity size to assemble batch data
 void MetaIndexer::MakeBatches(const KeyVector &keys,
@@ -604,12 +798,17 @@ ErrorCode MetaIndexer::RecoverMetaData() noexcept {
     auto ec = storage_->GetMetaData(metadata_map);
     if (ec == EC_NOENT) {
         KVCM_LOG_INFO("there is no metadata key in storage backend, no need to recover metadata");
+        // no metadata to recover (new instance or persistence turned
+        // off), safe to set to the newest version
+        // version_ remains InstanceVersion::VERSION_1
         return ec;
     }
     if (ec != EC_OK) {
         KVCM_LOG_ERROR("meta indexer read metadata from storage backend failed, ec[%d]", ec);
         return ec;
     }
+
+    // METADATA_PROPERTY_KEY_COUNT *must* always be presented
     std::string key_count_str = metadata_map[METADATA_PROPERTY_KEY_COUNT];
     int64_t key_count;
     bool is_valid = StringUtil::StrToInt64(key_count_str.c_str(), key_count);
@@ -619,6 +818,19 @@ ErrorCode MetaIndexer::RecoverMetaData() noexcept {
         return EC_ERROR;
     }
     key_count_ = key_count;
+
+    // METADATA_PROPERTY_STORAGE_USAGE_DATA decides the behavior version
+    if (const auto it = metadata_map.find(METADATA_PROPERTY_STORAGE_USAGE_DATA); it != metadata_map.end()) {
+        if (storage_usage_data_.Deserialize(it->second) != EC_OK) {
+            KVCM_LOG_ERROR("meta indexer deserialize storage usage data failed, str: [%s]", it->second.c_str());
+            return EC_ERROR;
+        }
+        // version_ remains InstanceVersion::VERSION_1
+    } else {
+        // METADATA_PROPERTY_STORAGE_USAGE_DATA do not exist
+        version_ = InstanceVersion::VERSION_0;
+    }
+
     return EC_OK;
 }
 
@@ -628,6 +840,9 @@ void MetaIndexer::PersistMetaData() noexcept {
     if (current_time >= last_persist_metadata_time_ + persist_metadata_interval_time_ms_) {
         std::map<std::string, std::string> metadata_map;
         metadata_map[METADATA_PROPERTY_KEY_COUNT] = std::to_string(key_count_);
+        if (version_ == InstanceVersion::VERSION_1) {
+            metadata_map[METADATA_PROPERTY_STORAGE_USAGE_DATA] = storage_usage_data_.Serialize();
+        }
         auto ec = storage_->PutMetaData(metadata_map);
         if (ec != EC_OK) {
             KVCM_LOG_ERROR("meta indexer persist metadata failed, ec[%d]", ec);

@@ -35,7 +35,7 @@ private:
     bool InitIovHandle(Hf3fsIovHandle &handle,
                        size_t iov_block_size,
                        size_t iov_size,
-                       const std::shared_ptr<Hf3fsCudaUtil> &cuda_util) const;
+                       const std::shared_ptr<Hf3fsGpuUtil> &gpu_util) const;
     void ReleaseIovHandle(Hf3fsIovHandle &handle);
     struct hf3fs_iov *CreateIov(const std::string &mountpoint, size_t iov_size, size_t iov_block_size) const;
     void DestroyIov(struct hf3fs_iov *iov) const;

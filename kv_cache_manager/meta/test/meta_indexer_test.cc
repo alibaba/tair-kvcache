@@ -1,4 +1,8 @@
-#include <thread>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
 
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/unittest.h"
@@ -8,7 +12,7 @@
 #include "kv_cache_manager/meta/meta_search_cache.h"
 #include "kv_cache_manager/meta/meta_storage_backend.h"
 
-namespace kv_cache_manager {
+using namespace kv_cache_manager;
 
 class MetaIndexerTest : public MetaIndexerTestBase, public TESTBASE {
 public:
@@ -231,4 +235,293 @@ TEST_F(MetaIndexerTest, TestMultiThread) {
     DoMultiThreadTest();
 }
 
-} // namespace kv_cache_manager
+TEST_F(MetaIndexerTest, TestMetadataPersistAndRecover) {
+    GTEST_SKIP() << "Skipping for local backend not support recover";
+
+    std::string configStr = R"({
+        "max_key_count" : 100,
+        "mutex_shard_num" : 8,
+        "persist_metadata_interval_time_ms" : 0,
+        "meta_storage_backend_config" : { "storage_type" : "local" },
+        "meta_cache_policy_config" : { "capacity" : 0 }
+    })";
+
+    ASSERT_EQ(EC_OK, InitIndexer(configStr));
+
+    meta_indexer_->key_count_.store(3);
+
+    const std::vector<std::uint64_t> expected_usage_vec{1, 100, 200, 300, 400, 500};
+    ASSERT_EQ(expected_usage_vec.size(), meta_indexer_->storage_usage_data_.storage_usage_by_type_.size());
+    for (std::size_t i = 0; i != meta_indexer_->storage_usage_data_.storage_usage_by_type_.size(); ++i) {
+        meta_indexer_->storage_usage_data_.storage_usage_by_type_.at(i).store(expected_usage_vec.at(i));
+    }
+
+    meta_indexer_->PersistMetaData();
+
+    meta_indexer_ = std::make_shared<MetaIndexer>();
+    ASSERT_EQ(EC_OK, InitIndexer(configStr));
+    ASSERT_EQ(3, meta_indexer_->GetKeyCount());
+    for (std::size_t i = 0; i != meta_indexer_->storage_usage_data_.storage_usage_by_type_.size(); ++i) {
+        ASSERT_EQ(expected_usage_vec.at(i), meta_indexer_->storage_usage_data_.storage_usage_by_type_.at(i).load());
+    }
+}
+
+TEST_F(MetaIndexerTest, TestStorageUsageDataManipulation) {
+    std::string configStr = R"({
+        "max_key_count" : 100,
+        "mutex_shard_num" : 8,
+        "persist_metadata_interval_time_ms" : 0,
+        "meta_storage_backend_config" : { "storage_type" : "local" },
+        "meta_cache_policy_config" : { "capacity" : 0 }
+    })";
+
+    ASSERT_EQ(EC_OK, InitIndexer(configStr));
+
+    // test get/set
+    {
+        meta_indexer_->storage_usage_data_.Reset();
+        ASSERT_EQ(0, meta_indexer_->GetStorageUsage());
+
+        auto type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
+        std::vector<std::uint64_t> expected_usage_vec{0, 100, 200, 300, 400, 0};
+
+        type = DataStorageType::DATA_STORAGE_TYPE_HF3FS;
+        meta_indexer_->SetStorageUsageByType(type, expected_usage_vec.at(static_cast<std::size_t>(type)));
+
+        type = DataStorageType::DATA_STORAGE_TYPE_MOONCAKE;
+        meta_indexer_->SetStorageUsageByType(type, expected_usage_vec.at(static_cast<std::size_t>(type)));
+
+        type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
+        meta_indexer_->SetStorageUsageByType(type, expected_usage_vec.at(static_cast<std::size_t>(type)));
+
+        type = DataStorageType::DATA_STORAGE_TYPE_NFS;
+        meta_indexer_->SetStorageUsageByType(type, expected_usage_vec.at(static_cast<std::size_t>(type)));
+
+        for (std::size_t i = 0; i != meta_indexer_->storage_usage_data_.storage_usage_by_type_.size(); ++i) {
+            ASSERT_EQ(expected_usage_vec.at(i), meta_indexer_->storage_usage_data_.storage_usage_by_type_.at(i).load());
+        }
+
+        type = DataStorageType::DATA_STORAGE_TYPE_HF3FS;
+        ASSERT_EQ(expected_usage_vec.at(static_cast<std::size_t>(type)), meta_indexer_->GetStorageUsageByType(type));
+
+        type = DataStorageType::DATA_STORAGE_TYPE_MOONCAKE;
+        ASSERT_EQ(expected_usage_vec.at(static_cast<std::size_t>(type)), meta_indexer_->GetStorageUsageByType(type));
+
+        type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
+        ASSERT_EQ(expected_usage_vec.at(static_cast<std::size_t>(type)), meta_indexer_->GetStorageUsageByType(type));
+
+        type = DataStorageType::DATA_STORAGE_TYPE_NFS;
+        ASSERT_EQ(expected_usage_vec.at(static_cast<std::size_t>(type)), meta_indexer_->GetStorageUsageByType(type));
+
+        std::uint64_t expect_usage = 0;
+        for (const auto &v : expected_usage_vec) {
+            expect_usage += v;
+        }
+        ASSERT_EQ(expect_usage, meta_indexer_->GetStorageUsage());
+    }
+
+    // test add/sub
+    {
+        meta_indexer_->storage_usage_data_.Reset();
+        auto type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
+        std::vector<std::uint64_t> expected_usage_vec{0, 100, 200, 300, 400, 0};
+
+        type = DataStorageType::DATA_STORAGE_TYPE_HF3FS;
+        meta_indexer_->SetStorageUsageByType(type, expected_usage_vec.at(static_cast<std::size_t>(type)));
+        meta_indexer_->AddStorageUsageByType(type, 16);
+        ASSERT_EQ(expected_usage_vec.at(static_cast<std::size_t>(type)) + 16,
+                  meta_indexer_->GetStorageUsageByType(type));
+        meta_indexer_->SubStorageUsageByType(type, 16);
+        ASSERT_EQ(expected_usage_vec.at(static_cast<std::size_t>(type)), meta_indexer_->GetStorageUsageByType(type));
+        meta_indexer_->SubStorageUsageByType(type, 1024);         // would underflow
+        ASSERT_EQ(0, meta_indexer_->GetStorageUsageByType(type)); // expect to be proper handled
+
+        type = DataStorageType::DATA_STORAGE_TYPE_MOONCAKE;
+        meta_indexer_->SetStorageUsageByType(type, expected_usage_vec.at(static_cast<std::size_t>(type)));
+        meta_indexer_->AddStorageUsageByType(type, 16);
+        ASSERT_EQ(expected_usage_vec.at(static_cast<std::size_t>(type)) + 16,
+                  meta_indexer_->GetStorageUsageByType(type));
+        meta_indexer_->SubStorageUsageByType(type, 16);
+        ASSERT_EQ(expected_usage_vec.at(static_cast<std::size_t>(type)), meta_indexer_->GetStorageUsageByType(type));
+        meta_indexer_->SubStorageUsageByType(type, 1024);         // would underflow
+        ASSERT_EQ(0, meta_indexer_->GetStorageUsageByType(type)); // expect to be proper handled
+
+        type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
+        meta_indexer_->SetStorageUsageByType(type, expected_usage_vec.at(static_cast<std::size_t>(type)));
+        meta_indexer_->AddStorageUsageByType(type, 16);
+        ASSERT_EQ(expected_usage_vec.at(static_cast<std::size_t>(type)) + 16,
+                  meta_indexer_->GetStorageUsageByType(type));
+        meta_indexer_->SubStorageUsageByType(type, 16);
+        ASSERT_EQ(expected_usage_vec.at(static_cast<std::size_t>(type)), meta_indexer_->GetStorageUsageByType(type));
+        meta_indexer_->SubStorageUsageByType(type, 1024);         // would underflow
+        ASSERT_EQ(0, meta_indexer_->GetStorageUsageByType(type)); // expect to be proper handled
+
+        type = DataStorageType::DATA_STORAGE_TYPE_NFS;
+        meta_indexer_->SetStorageUsageByType(type, expected_usage_vec.at(static_cast<std::size_t>(type)));
+        meta_indexer_->AddStorageUsageByType(type, 16);
+        ASSERT_EQ(expected_usage_vec.at(static_cast<std::size_t>(type)) + 16,
+                  meta_indexer_->GetStorageUsageByType(type));
+        meta_indexer_->SubStorageUsageByType(type, 16);
+        ASSERT_EQ(expected_usage_vec.at(static_cast<std::size_t>(type)), meta_indexer_->GetStorageUsageByType(type));
+        meta_indexer_->SubStorageUsageByType(type, 1024);         // would underflow
+        ASSERT_EQ(0, meta_indexer_->GetStorageUsageByType(type)); // expect to be proper handled
+    }
+
+    // test special case: DATA_STORAGE_TYPE_VCNS_HF3FS behavior as DATA_STORAGE_TYPE_HF3FS
+    {
+        meta_indexer_->storage_usage_data_.Reset();
+        std::vector<std::uint64_t> expected_usage_vec{0, 128, 0, 0, 0, 0};
+
+        meta_indexer_->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS, 128);
+        ASSERT_EQ(128, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
+        ASSERT_EQ(128, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+        for (std::size_t i = 0; i != meta_indexer_->storage_usage_data_.storage_usage_by_type_.size(); ++i) {
+            ASSERT_EQ(expected_usage_vec.at(i), meta_indexer_->storage_usage_data_.storage_usage_by_type_.at(i).load());
+        }
+
+        meta_indexer_->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS, 16);
+        ASSERT_EQ(128 + 16, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
+        ASSERT_EQ(128 + 16, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+
+        meta_indexer_->SubStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS, 16);
+        ASSERT_EQ(128, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
+        ASSERT_EQ(128, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+        for (std::size_t i = 0; i != meta_indexer_->storage_usage_data_.storage_usage_by_type_.size(); ++i) {
+            ASSERT_EQ(expected_usage_vec.at(i), meta_indexer_->storage_usage_data_.storage_usage_by_type_.at(i).load());
+        }
+
+        meta_indexer_->SubStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS, 1024); // would underflow
+        ASSERT_EQ(0, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
+        ASSERT_EQ(0, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+        expected_usage_vec[1] = 0;
+        for (std::size_t i = 0; i != meta_indexer_->storage_usage_data_.storage_usage_by_type_.size(); ++i) {
+            ASSERT_EQ(expected_usage_vec.at(i), meta_indexer_->storage_usage_data_.storage_usage_by_type_.at(i).load());
+        }
+    }
+}
+
+TEST_F(MetaIndexerTest, TestStorageUsageDataSeriDeseri) {
+    MetaIndexer::StorageUsageData storage_usage_data;
+
+    // Successful round-trip: serialize then deserialize
+    {
+        std::vector<std::uint64_t> expected_usage_vec{1, 100, 200, 300, 400, 500};
+
+        storage_usage_data.Reset();
+        for (std::size_t i = 0; i != expected_usage_vec.size(); ++i) {
+            storage_usage_data.storage_usage_by_type_.at(i).store(expected_usage_vec.at(i));
+        }
+
+        std::string serialized = storage_usage_data.Serialize();
+        ASSERT_EQ(R"({"unknown":1,"hf3fs":100,"mooncake":200,"pace":300,"file":400,"vcns_hf3fs":500})", serialized);
+
+        storage_usage_data.Reset();
+        ASSERT_EQ(EC_OK, storage_usage_data.Deserialize(serialized));
+        for (std::size_t i = 0; i != storage_usage_data.storage_usage_by_type_.size(); ++i) {
+            ASSERT_EQ(expected_usage_vec.at(i), storage_usage_data.storage_usage_by_type_.at(i).load());
+        }
+    }
+
+    // Legal input: keys in different order
+    {
+        const std::vector<std::uint64_t> expected_usage_vec{1, 2, 3, 4, 5, 6};
+        storage_usage_data.Reset();
+        ASSERT_EQ(
+            EC_OK,
+            storage_usage_data.Deserialize(R"({"vcns_hf3fs":6,"file":5,"pace":4,"mooncake":3,"hf3fs":2,"unknown":1})"));
+        for (std::size_t i = 0; i != storage_usage_data.storage_usage_by_type_.size(); ++i) {
+            ASSERT_EQ(expected_usage_vec.at(i), storage_usage_data.storage_usage_by_type_.at(i).load());
+        }
+    }
+
+    // Legal input: partial JSON (missing keys default to 0)
+    {
+        storage_usage_data.Reset();
+        storage_usage_data.SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 99);
+        ASSERT_EQ(EC_OK, storage_usage_data.Deserialize(R"({"hf3fs":100,"mooncake":200})"));
+        ASSERT_EQ(100, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+        ASSERT_EQ(200, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
+        ASSERT_EQ(0, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
+    }
+
+    // Legal input: whitespace-padded JSON
+    {
+        const std::vector<std::uint64_t> expected_usage_vec{1, 2, 3, 4, 5, 6};
+        storage_usage_data.Reset();
+        ASSERT_EQ(EC_OK,
+                  storage_usage_data.Deserialize(
+                      "  {\"unknown\":1,\"hf3fs\":2,\"mooncake\":3,\"pace\":4,\"file\":5,\"vcns_hf3fs\":6}  "));
+        for (std::size_t i = 0; i != storage_usage_data.storage_usage_by_type_.size(); ++i) {
+            ASSERT_EQ(expected_usage_vec.at(i), storage_usage_data.storage_usage_by_type_.at(i).load());
+        }
+    }
+
+    // Empty string
+    {
+        storage_usage_data.Reset();
+        storage_usage_data.SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 888);
+        ASSERT_EQ(EC_ERROR, storage_usage_data.Deserialize(""));
+        // Original data must not be modified on error
+        ASSERT_EQ(888, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+    }
+
+    // Malformed data: not valid JSON (old comma-separated format)
+    {
+        storage_usage_data.Reset();
+        storage_usage_data.SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 777);
+        ASSERT_EQ(EC_ERROR, storage_usage_data.Deserialize("0,abc,2,3,4,5"));
+        // Original data must not be modified on error
+        ASSERT_EQ(777, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+    }
+
+    // Malformed data: JSON array instead of object
+    {
+        storage_usage_data.Reset();
+        storage_usage_data.SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 777);
+        ASSERT_EQ(EC_ERROR, storage_usage_data.Deserialize("[1,2,3,4,5,6]"));
+        // Original data must not be modified on error
+        ASSERT_EQ(777, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+    }
+
+    // Malformed data: non-integer value for a key
+    {
+        storage_usage_data.Reset();
+        storage_usage_data.SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 777);
+        ASSERT_EQ(EC_ERROR,
+                  storage_usage_data.Deserialize(
+                      R"({"unknown":0,"hf3fs":"not_a_number","mooncake":2,"pace":3,"file":4,"vcns_hf3fs":5})"));
+        // Original data must not be modified on error
+        ASSERT_EQ(777, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+    }
+
+    // Malformed data: floating-point value
+    {
+        storage_usage_data.Reset();
+        storage_usage_data.SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 777);
+        ASSERT_EQ(EC_ERROR,
+                  storage_usage_data.Deserialize(
+                      R"({"unknown":0,"hf3fs":1.5,"mooncake":2,"pace":3,"file":4,"vcns_hf3fs":5})"));
+        // Original data must not be modified on error
+        ASSERT_EQ(777, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+    }
+
+    // Unrecognized key: must be rejected and leave data unchanged
+    {
+        storage_usage_data.Reset();
+        storage_usage_data.SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 888);
+        ASSERT_EQ(EC_ERROR, storage_usage_data.Deserialize(R"({"future_type": 999, "hf3fs": 10})"));
+        // Original data must not be modified on error
+        ASSERT_EQ(888, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+    }
+
+    // "unknown" is a legitimate key and must still be accepted.
+    {
+        storage_usage_data.Reset();
+        ASSERT_EQ(EC_OK, storage_usage_data.Deserialize(R"({"unknown":7,"hf3fs":10})"));
+        ASSERT_EQ(7u,
+                  storage_usage_data.storage_usage_by_type_
+                      .at(static_cast<std::size_t>(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN))
+                      .load());
+        ASSERT_EQ(10, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+    }
+}

@@ -62,6 +62,11 @@ class MetaServiceClientBase(abc.ABC):
         return {}
 
     @abc.abstractmethod
+    def get_cluster_info(self, data, check_response=True) -> Dict:
+        """Get cluster info (leader discovery)"""
+        return {}
+
+    @abc.abstractmethod
     def close(self):
         pass
 
@@ -532,3 +537,47 @@ class MetaServiceTestBase(abc.ABC, TestBase, unittest.TestCase):
         msg = status.get('message', '')
         self.assertIn("block_size", msg,
                        f"Error message should mention mismatched field 'block_size', got: {msg}")
+
+    def test_get_cluster_info(self):
+        """测试 GetClusterInfo 接口（leader discovery）"""
+        req = {"trace_id": self._trace_id}
+        resp = self._client.get_cluster_info(req)
+        self.assertIn("header", resp)
+        self.assertEqual(resp["header"]["status"]["code"], "OK")
+        self.assertIn("self_node_id", resp)
+        self.assertIn("leader_node_id", resp)
+        # 单节点场景下自身即为 leader
+        self.assertEqual(resp["self_node_id"], resp["leader_node_id"])
+
+        # 验证 leader_endpoint 字段（MetaNodeEndpoint，不含 admin 端口）
+        self.assertIn("leader_endpoint", resp)
+        leader_ep = resp["leader_endpoint"]
+        self.assertIn("node_id", leader_ep)
+        self.assertIn("host", leader_ep)
+        self.assertIn("meta_rpc_port", leader_ep)
+        self.assertIn("meta_http_port", leader_ep)
+        self.assertNotIn("admin_rpc_port", leader_ep, "Meta API should not expose admin_rpc_port")
+        self.assertNotIn("admin_http_port", leader_ep, "Meta API should not expose admin_http_port")
+        # leader_endpoint.node_id 应和 leader_node_id 一致
+        self.assertEqual(leader_ep["node_id"], resp["leader_node_id"])
+        # host 不应为空
+        self.assertNotEqual(leader_ep["host"], "", "leader_endpoint.host should not be empty")
+        # 端口号应为正整数
+        self.assertGreater(leader_ep["meta_rpc_port"], 0)
+        self.assertGreater(leader_ep["meta_http_port"], 0)
+        # custom_info 字段应存在（未配置时为空字符串）
+        self.assertIn("custom_info", leader_ep)
+
+    def test_get_cluster_info_unregistered_instance(self):
+        """测试 GetClusterInfo 在 instance_id 未注册时仍能正常返回"""
+        req = {
+            "trace_id": self._trace_id,
+            "instance_id": "not_registered_instance",
+        }
+        resp = self._client.get_cluster_info(req)
+        self.assertIn("header", resp)
+        self.assertEqual(resp["header"]["status"]["code"], "OK",
+                         "GetClusterInfo should succeed even with an unregistered instance_id")
+        self.assertIn("self_node_id", resp)
+        self.assertIn("leader_node_id", resp)
+        self.assertEqual(resp["self_node_id"], resp["leader_node_id"])

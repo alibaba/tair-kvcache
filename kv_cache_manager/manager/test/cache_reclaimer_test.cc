@@ -28,6 +28,7 @@
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/config/trigger_strategy.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
+#include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/manager/cache_location.h"
 #include "kv_cache_manager/manager/cache_reclaimer.h"
@@ -239,6 +240,30 @@ ErrorCode MetaIndexer_RandomSample_stub(void *obj,
     return random_sample_result;
 }
 
+/* ---------------- MetaIndexer_SampleReclaimKeys_stub ---------------- */
+
+std::chrono::milliseconds mi_sample_reclaim_delay{0};
+ErrorCode sample_reclaim_result;
+MetaIndexer::KeyVector sample_reclaim_keys;
+
+ErrorCode MetaIndexer_SampleReclaimKeys_stub(void *obj,
+                                             RequestContext *rc,
+                                             const std::int64_t c,
+                                             MetaIndexer::KeyVector &out_keys) noexcept {
+    if (sample_reclaim_result == ErrorCode::EC_OK) {
+        if (c == static_cast<std::int64_t>(sample_reclaim_keys.size())) {
+            out_keys = sample_reclaim_keys;
+        } else if (c == 11) {
+            // special case
+            out_keys = sample_reclaim_keys;
+        } else {
+            out_keys = MetaIndexer::KeyVector(c);
+        }
+    }
+    std::this_thread::sleep_for(mi_sample_reclaim_delay);
+    return sample_reclaim_result;
+}
+
 /* ---------------- MetaIndexer KeyCount stubs ---------------- */
 
 std::size_t key_count;
@@ -287,6 +312,7 @@ public:
         stub_.set(ADDR(MetaIndexerManager, GetMetaIndexer), MetaIndexerManager_GetMetaIndexer_stub);
         stub_.set(ADDR(MetaIndexer, GetProperties), MetaIndexer_GetProperties_stub);
         stub_.set(ADDR(MetaIndexer, RandomSample), MetaIndexer_RandomSample_stub);
+        stub_.set(ADDR(MetaIndexer, SampleReclaimKeys), MetaIndexer_SampleReclaimKeys_stub);
         stub_.set(ADDR(MetaIndexer, GetKeyCount), MetaIndexer_GetKeyCount_stub);
         stub_.set(ADDR(MetaIndexer, GetMaxKeyCount), MetaIndexer_GetMaxKeyCount_stub);
         stub_.set(ADDR(MetaIndexer, PersistMetaData), MetaIndexer_PersistMetaData_stub);
@@ -307,6 +333,7 @@ public:
         del_result = {ErrorCode::EC_OK, ""};
         get_result = ErrorCode::EC_OK;
         random_sample_result = ErrorCode::EC_OK;
+        sample_reclaim_result = ErrorCode::EC_OK;
         batch_get_loc_result = ErrorCode::EC_OK;
 
         key_count = 1;
@@ -315,6 +342,7 @@ public:
         spe_submit_delay = std::chrono::milliseconds{0};
         mi_getprop_delay = std::chrono::milliseconds{0};
         mi_randsample_delay = std::chrono::milliseconds{0};
+        mi_sample_reclaim_delay = std::chrono::milliseconds{0};
         ms_batchgetloc_delay = std::chrono::milliseconds{0};
 
         request_context_ = std::make_shared<RequestContext>("cache_reclaimer_test_trace");
@@ -372,6 +400,7 @@ public:
 
         get_out_properties.clear();
         random_sample_keys.clear();
+        sample_reclaim_keys.clear();
         batch_get_loc_out_maps.clear();
 
         stub_.reset(ADDR(RegistryManager, ListInstanceGroup));
@@ -380,6 +409,7 @@ public:
         stub_.reset(ADDR(MetaIndexerManager, GetMetaIndexer));
         stub_.reset(ADDR(MetaIndexer, GetProperties));
         stub_.reset(ADDR(MetaIndexer, RandomSample));
+        stub_.reset(ADDR(MetaIndexer, SampleReclaimKeys));
         stub_.reset(ADDR(MetaIndexer, GetKeyCount));
         stub_.reset(ADDR(MetaIndexer, GetMaxKeyCount));
         stub_.reset(ADDR(MetaIndexer, PersistMetaData));
@@ -406,6 +436,7 @@ TEST_F(CacheReclaimerTest, TestStartStop) {
     stub_.reset(ADDR(MetaIndexerManager, GetMetaIndexer));
     stub_.reset(ADDR(MetaIndexer, GetProperties));
     stub_.reset(ADDR(MetaIndexer, RandomSample));
+    stub_.reset(ADDR(MetaIndexer, SampleReclaimKeys));
     stub_.reset(ADDR(MetaIndexer, GetKeyCount));
     stub_.reset(ADDR(MetaIndexer, GetMaxKeyCount));
     stub_.reset(ADDR(MetaIndexer, PersistMetaData));
@@ -543,7 +574,7 @@ TEST_F(CacheReclaimerTest, TestFastExiting) {
 }
 
 TEST_F(CacheReclaimerTest, TestPauseResume) {
-    random_sample_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
     get_out_properties = {
         {
             {PROPERTY_LRU_TIME, "0"},
@@ -579,6 +610,7 @@ TEST_F(CacheReclaimerTest, TestPauseResume) {
 
     // update the trigger strategy to trigger the reclaiming
     // so that the reclaiming method shall be entered
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 4096);
 
     // use instance 0 from setup()
     // construct instance 1
@@ -591,7 +623,7 @@ TEST_F(CacheReclaimerTest, TestPauseResume) {
     ins_group->quota_.set_capacity(2048);
     instance_groups.emplace_back(ins_group);
 
-    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), random_sample_keys.size()));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), sample_reclaim_keys.size()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 2));
     batch_get_loc_out_maps =
         std::vector<CacheLocationMap>(cache_reclaimer_->GetBatchingSize(request_context_.get()), CacheLocationMap{});
@@ -797,9 +829,10 @@ TEST_F(CacheReclaimerTest, TestRegistryManagerListInstanceInfoUnexpectedReturn) 
 TEST_F(CacheReclaimerTest, TestNullInstanceInfo) {
     // craft a case that can trigger the actual reclaiming
     // so that the reclaiming method shall be entered
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 4096);
     instance_groups.clear();
     const auto ins_group = InstanceGroupFactory();
-    ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_size(16);
+    ins_group->quota_.set_capacity(2048);
     instance_groups.emplace_back(ins_group);
 
     instance_infos.emplace_back(nullptr);
@@ -861,57 +894,63 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming00) {
     // instance 0 block byte size = 1024, key count = 1
     // 1024 * 1 > 16
     // should *not* trigger reclaiming by the used_size strategy
+    GTEST_SKIP() << "Skipping for reclaim_strategy->trigger_strategy().used_size() is ignored";
+
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 1024);
 
     // use instance 0 from setup()
 
     const auto ins_group = InstanceGroupFactory();
     ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_size(16);
-    std::array<bool, 5> water_level_exceed_results{false, false, false, false, false};
     cache_reclaimer_->job_state_flag_ = true;
-    ASSERT_FALSE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                       ins_group->name(),
-                                                       ins_group->quota(),
-                                                       ins_group->cache_config()->reclaim_strategy(),
-                                                       instance_infos,
-                                                       water_level_exceed_results));
+    auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                     ins_group->name(),
+                                                     ins_group->quota(),
+                                                     ins_group->cache_config()->reclaim_strategy(),
+                                                     instance_infos);
+    ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
 }
 
 TEST_F(CacheReclaimerTest, TestTriggerReclaiming01) {
     // instance 0 block byte size = 1024, key count = 1
     // 1024 * 1 == 1024
     // should *not* trigger reclaiming by the used_size strategy
+    GTEST_SKIP() << "Skipping for reclaim_strategy->trigger_strategy().used_size() is ignored";
+
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 1024);
 
     // use instance 0 from setup()
 
     const auto ins_group = InstanceGroupFactory();
     ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_size(1024);
-    std::array<bool, 5> water_level_exceed_results{false, false, false, false, false};
     cache_reclaimer_->job_state_flag_ = true;
-    ASSERT_FALSE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                       ins_group->name(),
-                                                       ins_group->quota(),
-                                                       ins_group->cache_config()->reclaim_strategy(),
-                                                       instance_infos,
-                                                       water_level_exceed_results));
+    auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                     ins_group->name(),
+                                                     ins_group->quota(),
+                                                     ins_group->cache_config()->reclaim_strategy(),
+                                                     instance_infos);
+    ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
 }
 
 TEST_F(CacheReclaimerTest, TestTriggerReclaiming02) {
     // instance 0 block byte size = 1024, key count = 1
     // 1024 * 1 < 1025
     // should *not* trigger reclaiming by the used_size strategy
+    GTEST_SKIP() << "Skipping for reclaim_strategy->trigger_strategy().used_size() is ignored";
+
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 1024);
 
     // use instance 0 from setup()
 
     const auto ins_group = InstanceGroupFactory();
     ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_size(1025);
-    std::array<bool, 5> water_level_exceed_results{false, false, false, false, false};
     cache_reclaimer_->job_state_flag_ = true;
-    ASSERT_FALSE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                       ins_group->name(),
-                                                       ins_group->quota(),
-                                                       ins_group->cache_config()->reclaim_strategy(),
-                                                       instance_infos,
-                                                       water_level_exceed_results));
+    auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                     ins_group->name(),
+                                                     ins_group->quota(),
+                                                     ins_group->cache_config()->reclaim_strategy(),
+                                                     instance_infos);
+    ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
 }
 
 TEST_F(CacheReclaimerTest, TestTriggerReclaiming03) {
@@ -920,24 +959,22 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming03) {
     // instance 1 block byte size = 256, key count = 1
     // 1024 * 1 + 256 * 1 > 1025
     // should *not* trigger reclaiming by the used_size strategy
+    GTEST_SKIP() << "Skipping for reclaim_strategy->trigger_strategy().used_size() is ignored";
+
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 1024);
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 256);
 
     // use instance 0 from setup()
 
-    // construct instance 1
-    const auto ins_info = InstanceInfoFactory();
-    ins_info->set_instance_id("test_instance_id_2");
-    instance_infos.emplace_back(ins_info);
-
     const auto ins_group = InstanceGroupFactory();
     ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_size(1025);
-    std::array<bool, 5> water_level_exceed_results{false, false, false, false, false};
     cache_reclaimer_->job_state_flag_ = true;
-    ASSERT_FALSE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                       ins_group->name(),
-                                                       ins_group->quota(),
-                                                       ins_group->cache_config()->reclaim_strategy(),
-                                                       instance_infos,
-                                                       water_level_exceed_results));
+    auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                     ins_group->name(),
+                                                     ins_group->quota(),
+                                                     ins_group->cache_config()->reclaim_strategy(),
+                                                     instance_infos);
+    ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
 }
 
 TEST_F(CacheReclaimerTest, TestTriggerReclaiming04) {
@@ -945,6 +982,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming04) {
     // instance 1 block byte size = 1024, key count = 1
     // (1024 * 1 + 1024 * 1) / 2048 > 0.8
     // should trigger reclaiming by the used_percentage strategy
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 1024); // x2 instances
 
     // use instance 0 from setup()
 
@@ -955,63 +993,70 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming04) {
 
     const auto ins_group = InstanceGroupFactory();
     ins_group->quota_.set_capacity(2048);
-    std::array<bool, 5> water_level_exceed_results{false, false, false, false, false};
     cache_reclaimer_->job_state_flag_ = true;
-    ASSERT_TRUE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                      ins_group->name(),
-                                                      ins_group->quota(),
-                                                      ins_group->cache_config()->reclaim_strategy(),
-                                                      instance_infos,
-                                                      water_level_exceed_results));
-    ASSERT_TRUE(water_level_exceed_results[0]);
-    ASSERT_FALSE(water_level_exceed_results[1]);
-    ASSERT_FALSE(water_level_exceed_results[2]);
-    ASSERT_FALSE(water_level_exceed_results[3]);
-    ASSERT_FALSE(water_level_exceed_results[4]);
+    auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                     ins_group->name(),
+                                                     ins_group->quota(),
+                                                     ins_group->cache_config()->reclaim_strategy(),
+                                                     instance_infos);
+    ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
+    ASSERT_TRUE(wle->CheckGroupWaterLevelExceed());
+    ASSERT_FALSE(wle->CheckStorageTypeWaterLevelExceed());
+    ASSERT_TRUE(wle->GetGeneralWaterLevelExceed());
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
 }
 
 TEST_F(CacheReclaimerTest, TestTriggerReclaiming05) {
     // instance 0 block byte size = 1024, key count = 1
     // (1024 * 1) / 2048 < 0.8
     // should *not* trigger reclaiming by the used_percentage strategy
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 1024);
 
     // use instance 0 from setup()
 
     const auto ins_group = InstanceGroupFactory();
     ins_group->quota_.set_capacity(2048);
-    std::array<bool, 5> water_level_exceed_results{false, false, false, false, false};
     cache_reclaimer_->job_state_flag_ = true;
-    ASSERT_FALSE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                       ins_group->name(),
-                                                       ins_group->quota(),
-                                                       ins_group->cache_config()->reclaim_strategy(),
-                                                       instance_infos,
-                                                       water_level_exceed_results));
+    auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                     ins_group->name(),
+                                                     ins_group->quota(),
+                                                     ins_group->cache_config()->reclaim_strategy(),
+                                                     instance_infos);
+    ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
 }
 
 TEST_F(CacheReclaimerTest, TestTriggerReclaiming06) {
     // instance 0 block byte size = 1024, key count = 1
     // (double)(1024 * 1) / 2048.0 is very close to 0.5
     // should trigger reclaiming by the used_percentage strategy
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 1024);
 
     // use instance 0 from setup()
 
     const auto ins_group = InstanceGroupFactory();
     ins_group->quota_.set_capacity(2048);
     ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.5);
-    std::array<bool, 5> water_level_exceed_results{false, false, false, false, false};
     cache_reclaimer_->job_state_flag_ = true;
-    ASSERT_TRUE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                      ins_group->name(),
-                                                      ins_group->quota(),
-                                                      ins_group->cache_config()->reclaim_strategy(),
-                                                      instance_infos,
-                                                      water_level_exceed_results));
-    ASSERT_TRUE(water_level_exceed_results[0]);
-    ASSERT_FALSE(water_level_exceed_results[1]);
-    ASSERT_FALSE(water_level_exceed_results[2]);
-    ASSERT_FALSE(water_level_exceed_results[3]);
-    ASSERT_FALSE(water_level_exceed_results[4]);
+    auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                     ins_group->name(),
+                                                     ins_group->quota(),
+                                                     ins_group->cache_config()->reclaim_strategy(),
+                                                     instance_infos);
+    ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
+    ASSERT_TRUE(wle->CheckGroupWaterLevelExceed());
+    ASSERT_FALSE(wle->CheckStorageTypeWaterLevelExceed());
+    ASSERT_TRUE(wle->GetGeneralWaterLevelExceed());
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
 }
 
 TEST_F(CacheReclaimerTest, TestTriggerReclaiming07) {
@@ -1019,6 +1064,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming07) {
     // instance 1 block byte size = 1024, key count = 1
     // (1024 * 1 + 1024 * 1) / 2048 < 1.2
     // should *not* trigger reclaiming by the used_percentage strategy
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 1024); // x2 instances
 
     // use instance 0 from setup()
 
@@ -1030,14 +1076,13 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming07) {
     const auto ins_group = InstanceGroupFactory();
     ins_group->quota_.set_capacity(2048);
     ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(1.2);
-    std::array<bool, 5> water_level_exceed_results{false, false, false, false, false};
     cache_reclaimer_->job_state_flag_ = true;
-    ASSERT_FALSE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                       ins_group->name(),
-                                                       ins_group->quota(),
-                                                       ins_group->cache_config()->reclaim_strategy(),
-                                                       instance_infos,
-                                                       water_level_exceed_results));
+    auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                     ins_group->name(),
+                                                     ins_group->quota(),
+                                                     ins_group->cache_config()->reclaim_strategy(),
+                                                     instance_infos);
+    ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
 }
 
 TEST_F(CacheReclaimerTest, TestTriggerReclaiming08) {
@@ -1046,6 +1091,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming08) {
     // instance 2 block byte size = 1024, key count = 1
     // (1024 * 1 + 1024 * 1 + 1024 * 1) / 2048 > 1.2
     // should trigger reclaiming by the used_percentage strategy
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 1024); // x3 instances
 
     // use instance 0 from setup()
 
@@ -1065,19 +1111,22 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming08) {
     const auto ins_group = InstanceGroupFactory();
     ins_group->quota_.set_capacity(2048);
     ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(1.2);
-    std::array<bool, 5> water_level_exceed_results{false, false, false, false, false};
     cache_reclaimer_->job_state_flag_ = true;
-    ASSERT_TRUE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                      ins_group->name(),
-                                                      ins_group->quota(),
-                                                      ins_group->cache_config()->reclaim_strategy(),
-                                                      instance_infos,
-                                                      water_level_exceed_results));
-    ASSERT_TRUE(water_level_exceed_results[0]);
-    ASSERT_FALSE(water_level_exceed_results[1]);
-    ASSERT_FALSE(water_level_exceed_results[2]);
-    ASSERT_FALSE(water_level_exceed_results[3]);
-    ASSERT_FALSE(water_level_exceed_results[4]);
+    auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                     ins_group->name(),
+                                                     ins_group->quota(),
+                                                     ins_group->cache_config()->reclaim_strategy(),
+                                                     instance_infos);
+    ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
+    ASSERT_TRUE(wle->CheckGroupWaterLevelExceed());
+    ASSERT_FALSE(wle->CheckStorageTypeWaterLevelExceed());
+    ASSERT_TRUE(wle->GetGeneralWaterLevelExceed());
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
 }
 
 TEST_F(CacheReclaimerTest, TestTriggerReclaiming09) {
@@ -1085,6 +1134,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming09) {
     // instance 1 block byte size = 1024, key count = 16, max key count = 32
     // (16 + 16) / (32 + 32) < 0.8
     // should not trigger reclaiming by the used_percentage strategy
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 1024); // x2 instances
     key_count = 16;
     max_key_count = 32;
 
@@ -1096,14 +1146,13 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming09) {
     instance_infos.emplace_back(ins_info);
 
     const auto &ins_group = instance_groups.at(0);
-    std::array<bool, 5> water_level_exceed_results{false, false, false, false, false};
     cache_reclaimer_->job_state_flag_ = true;
-    ASSERT_FALSE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                       ins_group->name(),
-                                                       ins_group->quota(),
-                                                       ins_group->cache_config()->reclaim_strategy(),
-                                                       instance_infos,
-                                                       water_level_exceed_results));
+    auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                     ins_group->name(),
+                                                     ins_group->quota(),
+                                                     ins_group->cache_config()->reclaim_strategy(),
+                                                     instance_infos);
+    ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
 }
 
 TEST_F(CacheReclaimerTest, TestTriggerReclaiming10) {
@@ -1111,6 +1160,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming10) {
     // instance 1 block byte size = 1024, key count = 32, max key count = 32
     // (double)((32 + 32) / (32 + 32)) is very close to 1.0
     // should trigger reclaiming by the used_percentage strategy
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 1024); // x2 isntances
     key_count = 32;
     max_key_count = 32;
 
@@ -1123,19 +1173,22 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming10) {
 
     const auto ins_group = InstanceGroupFactory();
     ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(1.0);
-    std::array<bool, 5> water_level_exceed_results{false, false, false, false, false};
     cache_reclaimer_->job_state_flag_ = true;
-    ASSERT_TRUE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                      ins_group->name(),
-                                                      ins_group->quota(),
-                                                      ins_group->cache_config()->reclaim_strategy(),
-                                                      instance_infos,
-                                                      water_level_exceed_results));
-    ASSERT_TRUE(water_level_exceed_results[0]);
-    ASSERT_FALSE(water_level_exceed_results[1]);
-    ASSERT_FALSE(water_level_exceed_results[2]);
-    ASSERT_FALSE(water_level_exceed_results[3]);
-    ASSERT_FALSE(water_level_exceed_results[4]);
+    auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                     ins_group->name(),
+                                                     ins_group->quota(),
+                                                     ins_group->cache_config()->reclaim_strategy(),
+                                                     instance_infos);
+    ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
+    ASSERT_TRUE(wle->CheckGroupWaterLevelExceed());
+    ASSERT_FALSE(wle->CheckStorageTypeWaterLevelExceed());
+    ASSERT_TRUE(wle->GetGeneralWaterLevelExceed());
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
 }
 
 TEST_F(CacheReclaimerTest, TestTriggerReclaiming11) {
@@ -1143,6 +1196,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming11) {
     // instance 1 block byte size = 1024, key count = 32, max key count = 32
     // (double)((32 + 32) / (32 + 32)) > 0.8
     // should trigger reclaiming by the used_percentage strategy
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 1024); // x2 instances
     key_count = 32;
     max_key_count = 32;
 
@@ -1154,19 +1208,22 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming11) {
     instance_infos.emplace_back(ins_info);
 
     const auto &ins_group = instance_groups.at(0);
-    std::array<bool, 5> water_level_exceed_results{false, false, false, false, false};
     cache_reclaimer_->job_state_flag_ = true;
-    ASSERT_TRUE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                      ins_group->name(),
-                                                      ins_group->quota(),
-                                                      ins_group->cache_config()->reclaim_strategy(),
-                                                      instance_infos,
-                                                      water_level_exceed_results));
-    ASSERT_TRUE(water_level_exceed_results[0]);
-    ASSERT_FALSE(water_level_exceed_results[1]);
-    ASSERT_FALSE(water_level_exceed_results[2]);
-    ASSERT_FALSE(water_level_exceed_results[3]);
-    ASSERT_FALSE(water_level_exceed_results[4]);
+    auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                     ins_group->name(),
+                                                     ins_group->quota(),
+                                                     ins_group->cache_config()->reclaim_strategy(),
+                                                     instance_infos);
+    ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
+    ASSERT_TRUE(wle->CheckGroupWaterLevelExceed());
+    ASSERT_FALSE(wle->CheckStorageTypeWaterLevelExceed());
+    ASSERT_TRUE(wle->GetGeneralWaterLevelExceed());
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
+    ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
 }
 
 TEST_F(CacheReclaimerTest, TestTriggerReclaiming15) {
@@ -1176,14 +1233,13 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming15) {
     const auto ins_group = InstanceGroupFactory();
     ins_group->quota_.set_capacity(2048);
     instance_infos.clear();
-    std::array<bool, 5> water_level_exceed_results{false, false, false, false, false};
     cache_reclaimer_->job_state_flag_ = true;
-    ASSERT_FALSE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                       ins_group->name(),
-                                                       ins_group->quota(),
-                                                       ins_group->cache_config()->reclaim_strategy(),
-                                                       instance_infos,
-                                                       water_level_exceed_results));
+    auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                     ins_group->name(),
+                                                     ins_group->quota(),
+                                                     ins_group->cache_config()->reclaim_strategy(),
+                                                     instance_infos);
+    ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
 }
 
 TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
@@ -1196,6 +1252,8 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
     ins_info->set_instance_id("test_instance_id_2");
     instance_infos.emplace_back(ins_info);
 
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 1024); // x2 isntances
+
     {
         // instance 0 block byte size = 1024, key count = 32, max key count = 0
         // instance 1 block byte size = 1024, key count = 32, max key count = 0
@@ -1206,19 +1264,22 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
         max_key_count = 0;
 
         const auto &ins_group = instance_groups.at(0);
-        std::array<bool, 5> water_level_exceed_results{false, false, false, false, false};
         cache_reclaimer_->job_state_flag_ = true;
-        ASSERT_TRUE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                          ins_group->name(),
-                                                          ins_group->quota(),
-                                                          ins_group->cache_config()->reclaim_strategy(),
-                                                          instance_infos,
-                                                          water_level_exceed_results));
-        ASSERT_TRUE(water_level_exceed_results[0]);
-        ASSERT_FALSE(water_level_exceed_results[1]);
-        ASSERT_FALSE(water_level_exceed_results[2]);
-        ASSERT_FALSE(water_level_exceed_results[3]);
-        ASSERT_FALSE(water_level_exceed_results[4]);
+        auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                         ins_group->name(),
+                                                         ins_group->quota(),
+                                                         ins_group->cache_config()->reclaim_strategy(),
+                                                         instance_infos);
+        ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
+        ASSERT_TRUE(wle->CheckGroupWaterLevelExceed());
+        ASSERT_FALSE(wle->CheckStorageTypeWaterLevelExceed());
+        ASSERT_TRUE(wle->GetGeneralWaterLevelExceed());
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
     }
 
     {
@@ -1231,14 +1292,13 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
         max_key_count = 0;
 
         const auto &ins_group = instance_groups.at(0);
-        std::array<bool, 5> water_level_exceed_results{false, false, false, false, false};
         cache_reclaimer_->job_state_flag_ = true;
-        ASSERT_FALSE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                           ins_group->name(),
-                                                           ins_group->quota(),
-                                                           ins_group->cache_config()->reclaim_strategy(),
-                                                           instance_infos,
-                                                           water_level_exceed_results));
+        auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                         ins_group->name(),
+                                                         ins_group->quota(),
+                                                         ins_group->cache_config()->reclaim_strategy(),
+                                                         instance_infos);
+        ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
     }
 
     {
@@ -1252,19 +1312,22 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
 
         const auto ins_group = InstanceGroupFactory();
         ins_group->quota_.set_capacity(0);
-        std::array<bool, 5> water_level_exceed_results{false, false, false, false, false};
         cache_reclaimer_->job_state_flag_ = true;
-        ASSERT_TRUE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                          ins_group->name(),
-                                                          ins_group->quota(),
-                                                          ins_group->cache_config()->reclaim_strategy(),
-                                                          instance_infos,
-                                                          water_level_exceed_results));
-        ASSERT_TRUE(water_level_exceed_results[0]);
-        ASSERT_FALSE(water_level_exceed_results[1]);
-        ASSERT_FALSE(water_level_exceed_results[2]);
-        ASSERT_FALSE(water_level_exceed_results[3]);
-        ASSERT_FALSE(water_level_exceed_results[4]);
+        auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                         ins_group->name(),
+                                                         ins_group->quota(),
+                                                         ins_group->cache_config()->reclaim_strategy(),
+                                                         instance_infos);
+        ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
+        ASSERT_TRUE(wle->CheckGroupWaterLevelExceed());
+        ASSERT_FALSE(wle->CheckStorageTypeWaterLevelExceed());
+        ASSERT_TRUE(wle->GetGeneralWaterLevelExceed());
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
     }
 
     {
@@ -1278,14 +1341,13 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
 
         const auto ins_group = InstanceGroupFactory();
         ins_group->quota_.set_capacity(0);
-        std::array<bool, 5> water_level_exceed_results{false, false, false, false, false};
         cache_reclaimer_->job_state_flag_ = true;
-        ASSERT_FALSE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                           ins_group->name(),
-                                                           ins_group->quota(),
-                                                           ins_group->cache_config()->reclaim_strategy(),
-                                                           instance_infos,
-                                                           water_level_exceed_results));
+        auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                         ins_group->name(),
+                                                         ins_group->quota(),
+                                                         ins_group->cache_config()->reclaim_strategy(),
+                                                         instance_infos);
+        ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
     }
 
     {
@@ -1299,19 +1361,22 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
 
         const auto ins_group = InstanceGroupFactory();
         ins_group->quota_.set_capacity(-1); // means no capacity, same as 0
-        std::array<bool, 5> water_level_exceed_results{false, false, false, false, false};
         cache_reclaimer_->job_state_flag_ = true;
-        ASSERT_TRUE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                          ins_group->name(),
-                                                          ins_group->quota(),
-                                                          ins_group->cache_config()->reclaim_strategy(),
-                                                          instance_infos,
-                                                          water_level_exceed_results));
-        ASSERT_TRUE(water_level_exceed_results[0]);
-        ASSERT_FALSE(water_level_exceed_results[1]);
-        ASSERT_FALSE(water_level_exceed_results[2]);
-        ASSERT_FALSE(water_level_exceed_results[3]);
-        ASSERT_FALSE(water_level_exceed_results[4]);
+        auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                         ins_group->name(),
+                                                         ins_group->quota(),
+                                                         ins_group->cache_config()->reclaim_strategy(),
+                                                         instance_infos);
+        ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
+        ASSERT_TRUE(wle->CheckGroupWaterLevelExceed());
+        ASSERT_FALSE(wle->CheckStorageTypeWaterLevelExceed());
+        ASSERT_TRUE(wle->GetGeneralWaterLevelExceed());
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
     }
 
     {
@@ -1325,14 +1390,13 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
 
         const auto ins_group = InstanceGroupFactory();
         ins_group->quota_.set_capacity(-1); // means no capacity, same as 0
-        std::array<bool, 5> water_level_exceed_results{false, false, false, false, false};
         cache_reclaimer_->job_state_flag_ = true;
-        ASSERT_FALSE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                           ins_group->name(),
-                                                           ins_group->quota(),
-                                                           ins_group->cache_config()->reclaim_strategy(),
-                                                           instance_infos,
-                                                           water_level_exceed_results));
+        auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                         ins_group->name(),
+                                                         ins_group->quota(),
+                                                         ins_group->cache_config()->reclaim_strategy(),
+                                                         instance_infos);
+        ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
     }
 }
 
@@ -1346,64 +1410,69 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming17) {
     ins_info->set_instance_id("test_instance_id_2");
     instance_infos.emplace_back(ins_info);
 
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 1024);      // x2 instances
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE, 1024); // x2 instances
+
     {
         // instance 0 block byte size = 1024, key count = 2
         // instance 1 block byte size = 1024, key count = 2
-        // (1024 * 2 + 1024 * 2) / 5120 < 0.9, total waterlevel not exceed
+        // (1024 * 2 + 1024 * 2 + 512 * 2) / 10240 < 0.9, total waterlevel not exceed
         // (512 + 512) / 1024 > 0.9, waterlevel exceed
 
-        dummy_meta_indexer->storage_usage_array_[static_cast<std::uint8_t>(DataStorageType::DATA_STORAGE_TYPE_HF3FS)] =
-            512;
+        dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 0);
+        dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 512); // x2 instances
 
         const auto ins_group = InstanceGroupFactory();
-        ins_group->quota_.set_capacity(5120);
+        ins_group->quota_.set_capacity(10240);
         QuotaConfig qc(1024, DataStorageType::DATA_STORAGE_TYPE_HF3FS);
         ins_group->quota_.set_quota_config({qc});
         ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.9);
-        std::array<bool, 5> water_level_exceed_results{false, false, false, false, false};
         cache_reclaimer_->job_state_flag_ = true;
-        ASSERT_TRUE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                          ins_group->name(),
-                                                          ins_group->quota(),
-                                                          ins_group->cache_config()->reclaim_strategy(),
-                                                          instance_infos,
-                                                          water_level_exceed_results));
-        ASSERT_FALSE(water_level_exceed_results[0]);
-        ASSERT_TRUE(water_level_exceed_results[1]);
-        ASSERT_FALSE(water_level_exceed_results[2]);
-        ASSERT_FALSE(water_level_exceed_results[3]);
-        ASSERT_FALSE(water_level_exceed_results[4]);
+        auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                         ins_group->name(),
+                                                         ins_group->quota(),
+                                                         ins_group->cache_config()->reclaim_strategy(),
+                                                         instance_infos);
+        ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
+        ASSERT_TRUE(wle->CheckGroupWaterLevelExceed());
+        ASSERT_TRUE(wle->CheckStorageTypeWaterLevelExceed());
+        ASSERT_FALSE(wle->GetGeneralWaterLevelExceed());
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
+        ASSERT_TRUE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
+        ASSERT_TRUE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
     }
 
     {
         // instance 0 block byte size = 1024, key count = 2
         // instance 1 block byte size = 1024, key count = 2
-        // (1024 * 2 + 1024 * 2) / 5120 < 0.9, total waterlevel not exceed
+        // (1024 * 2 + 1024 * 2 + 128 * 2) / 10240 < 0.9, total waterlevel not exceed
         // (128 + 128) / 1024 < 0.9, waterlevel not exceed
 
-        dummy_meta_indexer->storage_usage_array_[static_cast<std::uint8_t>(DataStorageType::DATA_STORAGE_TYPE_HF3FS)] =
-            128;
+        dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 0);
+        dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 128); // x2 instances
 
         const auto ins_group = InstanceGroupFactory();
-        ins_group->quota_.set_capacity(5120);
+        ins_group->quota_.set_capacity(10240);
         QuotaConfig qc(1024, DataStorageType::DATA_STORAGE_TYPE_HF3FS);
         ins_group->quota_.set_quota_config({qc});
         ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.9);
-        std::array<bool, 5> water_level_exceed_results{false, false, false, false, false};
         cache_reclaimer_->job_state_flag_ = true;
-        ASSERT_FALSE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                           ins_group->name(),
-                                                           ins_group->quota(),
-                                                           ins_group->cache_config()->reclaim_strategy(),
-                                                           instance_infos,
-                                                           water_level_exceed_results));
+        auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                         ins_group->name(),
+                                                         ins_group->quota(),
+                                                         ins_group->cache_config()->reclaim_strategy(),
+                                                         instance_infos);
+        ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
     }
 
     {
         // instance 0 block byte size = 1024, key count = 2
         // instance 1 block byte size = 1024, key count = 2
         // instance 2 block byte size = 1024, key count = 2
-        // (1024 * 2 + 1024 * 2 + 1024 * 2) / 5120 > 0.9, total waterlevel exceed
+        // (1024 * 2 + 1024 * 2 + 512 * 2) / 5120 > 0.9, total waterlevel exceed
         // (512 + 512) / 1024 > 0.9, waterlevel exceed
 
         // construct another instance
@@ -1411,32 +1480,35 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming17) {
         ins_info3->set_instance_id("test_instance_id_3");
         instance_infos.emplace_back(ins_info3);
 
-        dummy_meta_indexer->storage_usage_array_[static_cast<std::uint8_t>(DataStorageType::DATA_STORAGE_TYPE_HF3FS)] =
-            512;
+        dummy_meta_indexer->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 0);
+        dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 512); // x2 instances
 
         const auto ins_group = InstanceGroupFactory();
         ins_group->quota_.set_capacity(5120);
         QuotaConfig qc(1024, DataStorageType::DATA_STORAGE_TYPE_HF3FS);
         ins_group->quota_.set_quota_config({qc});
         ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.9);
-        std::array<bool, 5> water_level_exceed_results{false, false, false, false, false};
         cache_reclaimer_->job_state_flag_ = true;
-        ASSERT_TRUE(cache_reclaimer_->IsTriggerReclaiming(request_context_.get(),
-                                                          ins_group->name(),
-                                                          ins_group->quota(),
-                                                          ins_group->cache_config()->reclaim_strategy(),
-                                                          instance_infos,
-                                                          water_level_exceed_results));
-        ASSERT_TRUE(water_level_exceed_results[0]);
-        ASSERT_TRUE(water_level_exceed_results[1]);
-        ASSERT_FALSE(water_level_exceed_results[2]);
-        ASSERT_FALSE(water_level_exceed_results[3]);
-        ASSERT_FALSE(water_level_exceed_results[4]);
+        auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                         ins_group->name(),
+                                                         ins_group->quota(),
+                                                         ins_group->cache_config()->reclaim_strategy(),
+                                                         instance_infos);
+        ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
+        ASSERT_TRUE(wle->CheckGroupWaterLevelExceed());
+        ASSERT_TRUE(wle->CheckStorageTypeWaterLevelExceed());
+        ASSERT_TRUE(wle->GetGeneralWaterLevelExceed());
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
+        ASSERT_TRUE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
+        ASSERT_FALSE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
+        ASSERT_TRUE(wle->GetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
     }
 }
 
 TEST_F(CacheReclaimerTest, TestInsufficientSampledKeys) {
-    random_sample_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
     get_out_properties = {
         {
             {PROPERTY_LRU_TIME, "0"},
@@ -1472,6 +1544,7 @@ TEST_F(CacheReclaimerTest, TestInsufficientSampledKeys) {
 
     // update the trigger strategy to trigger the reclaiming
     // so that the reclaiming method shall be entered
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 4096);
 
     // use instance 0 from setup()
     // construct instance 1
@@ -1485,9 +1558,9 @@ TEST_F(CacheReclaimerTest, TestInsufficientSampledKeys) {
     instance_groups.emplace_back(ins_group);
 
     // batching_size default to 100 which is larger than the size of sampled keys (10)
-    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), random_sample_keys.size()));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), sample_reclaim_keys.size()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 100));
-    batch_get_loc_out_maps = std::vector<CacheLocationMap>(random_sample_keys.size(), CacheLocationMap{});
+    batch_get_loc_out_maps = std::vector<CacheLocationMap>(sample_reclaim_keys.size(), CacheLocationMap{});
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
 
     // main thread sleeps for 10ms to ensure the worker thread do
@@ -1508,7 +1581,7 @@ TEST_F(CacheReclaimerTest, TestInsufficientSampledKeys) {
 }
 
 TEST_F(CacheReclaimerTest, TestReclaimByLRU00) {
-    random_sample_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
     get_out_properties = {
         {
             {PROPERTY_LRU_TIME, "0"},
@@ -1544,6 +1617,7 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU00) {
 
     // update the trigger strategy to trigger the reclaiming
     // so that the reclaiming method shall be entered
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 4096);
 
     // use instance 0 from setup()
     // construct instance 1
@@ -1556,7 +1630,7 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU00) {
     ins_group->quota_.set_capacity(2048);
     instance_groups.emplace_back(ins_group);
 
-    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), random_sample_keys.size()));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), sample_reclaim_keys.size()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 2));
     batch_get_loc_out_maps =
         std::vector<CacheLocationMap>(cache_reclaimer_->GetBatchingSize(request_context_.get()), CacheLocationMap{});
@@ -1575,7 +1649,7 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU00) {
 }
 
 TEST_F(CacheReclaimerTest, TestReclaimByLRU01) {
-    random_sample_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
     get_out_properties = {
         {
             {PROPERTY_LRU_TIME, "9"}, // block key id -> 0
@@ -1611,6 +1685,7 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU01) {
 
     // update the trigger strategy to trigger the reclaiming
     // so that the reclaiming method shall be entered
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 4096);
 
     // use instance 0 from setup()
     // construct instance 1
@@ -1623,7 +1698,7 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU01) {
     ins_group->quota_.set_capacity(2048);
     instance_groups.emplace_back(ins_group);
 
-    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), random_sample_keys.size()));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), sample_reclaim_keys.size()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 3));
     batch_get_loc_out_maps =
         std::vector<CacheLocationMap>(cache_reclaimer_->GetBatchingSize(request_context_.get()), CacheLocationMap{});
@@ -1644,7 +1719,7 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU01) {
 }
 
 TEST_F(CacheReclaimerTest, TestReclaimByLRU02) {
-    random_sample_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
     get_out_properties = {
         {
             {PROPERTY_LRU_TIME, "9"}, // block key id -> 0
@@ -1680,6 +1755,7 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU02) {
 
     // update the trigger strategy to trigger the reclaiming
     // so that the reclaiming method shall be entered
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 4096);
 
     // use instance 0 from setup()
     // construct instance 1
@@ -1692,7 +1768,7 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU02) {
     ins_group->quota_.set_capacity(2048);
     instance_groups.emplace_back(ins_group);
 
-    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), random_sample_keys.size()));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), sample_reclaim_keys.size()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 3));
     batch_get_loc_out_maps =
         std::vector<CacheLocationMap>(cache_reclaimer_->GetBatchingSize(request_context_.get()), CacheLocationMap{});
@@ -1713,7 +1789,7 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU02) {
 }
 
 TEST_F(CacheReclaimerTest, TestReclaimByLRU03) {
-    random_sample_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
     get_out_properties = {
         {
             {PROPERTY_LRU_TIME, "2"}, // block key id -> 0
@@ -1749,6 +1825,7 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU03) {
 
     // update the trigger strategy to trigger the reclaiming
     // so that the reclaiming method shall be entered
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 4096);
 
     // use instance 0 from setup()
     // construct instance 1
@@ -1761,9 +1838,9 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU03) {
     ins_group->quota_.set_capacity(2048);
     instance_groups.emplace_back(ins_group);
 
-    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), random_sample_keys.size()));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), sample_reclaim_keys.size()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 0));
-    batch_get_loc_out_maps = std::vector<CacheLocationMap>(random_sample_keys.size(), CacheLocationMap{});
+    batch_get_loc_out_maps = std::vector<CacheLocationMap>(sample_reclaim_keys.size(), CacheLocationMap{});
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
 
     std::this_thread::sleep_for(std::chrono::milliseconds(16));
@@ -1775,7 +1852,7 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU03) {
 }
 
 TEST_F(CacheReclaimerTest, TestReclaimByLRU04) {
-    random_sample_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
     get_out_properties = {
         {
             {PROPERTY_LRU_TIME, "9"}, // block key id -> 0
@@ -1811,6 +1888,7 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU04) {
 
     // update the trigger strategy to trigger the reclaiming
     // so that the reclaiming method shall be entered
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 4096);
 
     // use instance 0 from setup()
     // construct instance 1
@@ -1823,7 +1901,7 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU04) {
     ins_group->quota_.set_capacity(2048);
     instance_groups.emplace_back(ins_group);
 
-    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), random_sample_keys.size()));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), sample_reclaim_keys.size()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 1));
     batch_get_loc_out_maps =
         std::vector<CacheLocationMap>(cache_reclaimer_->GetBatchingSize(request_context_.get()), CacheLocationMap{});
@@ -1843,7 +1921,7 @@ TEST_F(CacheReclaimerTest, TestReclaimByLRU04) {
 
 TEST_F(CacheReclaimerTest, TestMetaIndexerGetPropertiesFailure) {
     // set up test data
-    random_sample_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
 
     // configure the GetProperties stub to return an error
     get_result = ErrorCode::EC_ERROR;
@@ -1861,7 +1939,7 @@ TEST_F(CacheReclaimerTest, TestMetaIndexerGetPropertiesFailure) {
     ins_group->quota_.set_capacity(2048);
     instance_groups.emplace_back(ins_group);
 
-    batch_get_loc_out_maps = std::vector<CacheLocationMap>(random_sample_keys.size(), CacheLocationMap{});
+    batch_get_loc_out_maps = std::vector<CacheLocationMap>(sample_reclaim_keys.size(), CacheLocationMap{});
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
 
     std::this_thread::sleep_for(std::chrono::milliseconds(16));
@@ -1873,9 +1951,9 @@ TEST_F(CacheReclaimerTest, TestMetaIndexerGetPropertiesFailure) {
     ASSERT_TRUE(submitted_del_requests.empty());
 }
 
-TEST_F(CacheReclaimerTest, TestMetaIndexerRandomSampleFailure) {
-    // configure the RandomSample stub to return an error
-    random_sample_result = ErrorCode::EC_ERROR;
+TEST_F(CacheReclaimerTest, TestMetaIndexerSampleReclaimFailure) {
+    // configure the SampleReclaim stub to return an error
+    sample_reclaim_result = ErrorCode::EC_ERROR;
 
     // update the trigger strategy to trigger the reclaiming
 
@@ -1890,7 +1968,7 @@ TEST_F(CacheReclaimerTest, TestMetaIndexerRandomSampleFailure) {
     ins_group->quota_.set_capacity(2048);
     instance_groups.emplace_back(ins_group);
 
-    batch_get_loc_out_maps = std::vector<CacheLocationMap>(random_sample_keys.size(), CacheLocationMap{});
+    batch_get_loc_out_maps = std::vector<CacheLocationMap>(sample_reclaim_keys.size(), CacheLocationMap{});
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
 
     std::this_thread::sleep_for(std::chrono::milliseconds(16));
@@ -1898,13 +1976,13 @@ TEST_F(CacheReclaimerTest, TestMetaIndexerRandomSampleFailure) {
 
     cache_reclaimer_->Stop();
 
-    // no deletion requests should be submitted when RandomSample fails
+    // no deletion requests should be submitted when SampleReclaim fails
     ASSERT_TRUE(submitted_del_requests.empty());
 }
 
 TEST_F(CacheReclaimerTest, TestMetaIndexerSampleKeys00) {
     // test case that sampled keys size and properties size not match
-    random_sample_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}; // size is 10
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}; // size is 10
     get_out_properties = {
         {
             {PROPERTY_LRU_TIME, "9"}, // size is 1
@@ -1924,7 +2002,7 @@ TEST_F(CacheReclaimerTest, TestMetaIndexerSampleKeys00) {
     ins_group->quota_.set_capacity(2048);
     instance_groups.emplace_back(ins_group);
 
-    batch_get_loc_out_maps = std::vector<CacheLocationMap>(random_sample_keys.size(), CacheLocationMap{});
+    batch_get_loc_out_maps = std::vector<CacheLocationMap>(sample_reclaim_keys.size(), CacheLocationMap{});
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
 
     std::this_thread::sleep_for(std::chrono::milliseconds(16));
@@ -1938,7 +2016,7 @@ TEST_F(CacheReclaimerTest, TestMetaIndexerSampleKeys00) {
 
 TEST_F(CacheReclaimerTest, TestMetaIndexerSampleKeys01) {
     // test case that properties size match but has wrong field
-    random_sample_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}; // size is 10
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}; // size is 10
     get_out_properties = {
         {
             {PROPERTY_HIT_COUNT, "0"}, // wrong field
@@ -1985,7 +2063,7 @@ TEST_F(CacheReclaimerTest, TestMetaIndexerSampleKeys01) {
     ins_group->quota_.set_capacity(2048);
     instance_groups.emplace_back(ins_group);
 
-    batch_get_loc_out_maps = std::vector<CacheLocationMap>(random_sample_keys.size(), CacheLocationMap{});
+    batch_get_loc_out_maps = std::vector<CacheLocationMap>(sample_reclaim_keys.size(), CacheLocationMap{});
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
 
     std::this_thread::sleep_for(std::chrono::milliseconds(16));
@@ -1999,7 +2077,7 @@ TEST_F(CacheReclaimerTest, TestMetaIndexerSampleKeys01) {
 
 TEST_F(CacheReclaimerTest, TestSchedulePlanExecutorDelFailure) {
     // set up test data
-    random_sample_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
     get_out_properties = {
         {
             {PROPERTY_LRU_TIME, "0"},
@@ -2049,7 +2127,7 @@ TEST_F(CacheReclaimerTest, TestSchedulePlanExecutorDelFailure) {
     ins_group->quota_.set_capacity(2048);
     instance_groups.emplace_back(ins_group);
 
-    batch_get_loc_out_maps = std::vector<CacheLocationMap>(random_sample_keys.size(), CacheLocationMap{});
+    batch_get_loc_out_maps = std::vector<CacheLocationMap>(sample_reclaim_keys.size(), CacheLocationMap{});
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
 
     std::this_thread::sleep_for(std::chrono::milliseconds(16));
@@ -2063,7 +2141,7 @@ TEST_F(CacheReclaimerTest, TestEmptyInstanceGroups) {
     instance_groups.clear();
 
     // the mocking sample keys are set but should never be accessed
-    random_sample_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
     get_out_properties = {
         {
             {PROPERTY_LRU_TIME, "0"},
@@ -2097,7 +2175,7 @@ TEST_F(CacheReclaimerTest, TestEmptyInstanceGroups) {
         },
     };
 
-    batch_get_loc_out_maps = std::vector<CacheLocationMap>(random_sample_keys.size(), CacheLocationMap{});
+    batch_get_loc_out_maps = std::vector<CacheLocationMap>(sample_reclaim_keys.size(), CacheLocationMap{});
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
 
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -2114,7 +2192,7 @@ TEST_F(CacheReclaimerTest, TestEmptyInstanceInfos) {
     instance_infos.clear();
 
     // the mocking sample keys are set but should never be accessed
-    random_sample_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
     get_out_properties = {
         {
             {PROPERTY_LRU_TIME, "0"},
@@ -2161,7 +2239,7 @@ TEST_F(CacheReclaimerTest, TestEmptyInstanceInfos) {
     ins_group->quota_.set_capacity(2048);
     instance_groups.emplace_back(ins_group);
 
-    batch_get_loc_out_maps = std::vector<CacheLocationMap>(random_sample_keys.size(), CacheLocationMap{});
+    batch_get_loc_out_maps = std::vector<CacheLocationMap>(sample_reclaim_keys.size(), CacheLocationMap{});
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
 
     std::this_thread::sleep_for(std::chrono::milliseconds(16));
@@ -2174,6 +2252,8 @@ TEST_F(CacheReclaimerTest, TestEmptyInstanceInfos) {
 }
 
 TEST_F(CacheReclaimerTest, TestMultipleInstanceGroups) {
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 4096);
+
     // create multiple instance groups
     instance_groups.clear();
 
@@ -2205,7 +2285,7 @@ TEST_F(CacheReclaimerTest, TestMultipleInstanceGroups) {
     instance_infos.emplace_back(ins_info2);
 
     // set up test data
-    random_sample_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
     get_out_properties = {
         {
             {PROPERTY_LRU_TIME, "0"},
@@ -2239,7 +2319,7 @@ TEST_F(CacheReclaimerTest, TestMultipleInstanceGroups) {
         },
     };
 
-    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), random_sample_keys.size()));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), sample_reclaim_keys.size()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 5));
     batch_get_loc_out_maps =
         std::vector<CacheLocationMap>(cache_reclaimer_->GetBatchingSize(request_context_.get()), CacheLocationMap{});
@@ -2270,7 +2350,7 @@ TEST_F(CacheReclaimerTest, TestMultipleInstanceGroups) {
 }
 
 TEST_F(CacheReclaimerTest, TestKeyCountEdgeCases) {
-    random_sample_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
     get_out_properties = {
         {
             {PROPERTY_LRU_TIME, "0"},
@@ -2304,8 +2384,11 @@ TEST_F(CacheReclaimerTest, TestKeyCountEdgeCases) {
         },
     };
 
-    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), random_sample_keys.size()));
-    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), random_sample_keys.size()));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), sample_reclaim_keys.size()));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), sample_reclaim_keys.size()));
+
+    // usage size not zero so key count is tested
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 4096);
 
     {
         // test with zero key count
@@ -2318,7 +2401,7 @@ TEST_F(CacheReclaimerTest, TestKeyCountEdgeCases) {
         ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.01); // 1%
         instance_groups.emplace_back(ins_group);
 
-        batch_get_loc_out_maps = std::vector<CacheLocationMap>(random_sample_keys.size(), CacheLocationMap{});
+        batch_get_loc_out_maps = std::vector<CacheLocationMap>(sample_reclaim_keys.size(), CacheLocationMap{});
         ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
 
         std::this_thread::sleep_for(std::chrono::milliseconds(16));
@@ -2344,7 +2427,7 @@ TEST_F(CacheReclaimerTest, TestKeyCountEdgeCases) {
         // clear requests from previous test
         submitted_del_requests.clear();
 
-        batch_get_loc_out_maps = std::vector<CacheLocationMap>(random_sample_keys.size(), CacheLocationMap{});
+        batch_get_loc_out_maps = std::vector<CacheLocationMap>(sample_reclaim_keys.size(), CacheLocationMap{});
         ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
 
         std::this_thread::sleep_for(std::chrono::milliseconds(16));
@@ -2361,15 +2444,16 @@ TEST_F(CacheReclaimerTest, TestKeyCountEdgeCases) {
         key_count = 100;
         max_key_count = 0;
 
-        // clear requests from previous test
-        submitted_del_requests.clear();
-
         // update the trigger strategy to trigger at 90%
         instance_groups.clear();
         const auto &ins_group = InstanceGroupFactory();
+        ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(0.9); // 90%
         instance_groups.emplace_back(ins_group);
 
-        batch_get_loc_out_maps = std::vector<CacheLocationMap>(random_sample_keys.size(), CacheLocationMap{});
+        // clear requests from previous test
+        submitted_del_requests.clear();
+
+        batch_get_loc_out_maps = std::vector<CacheLocationMap>(sample_reclaim_keys.size(), CacheLocationMap{});
         ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->Start());
 
         std::this_thread::sleep_for(std::chrono::milliseconds(16));
@@ -2377,13 +2461,13 @@ TEST_F(CacheReclaimerTest, TestKeyCountEdgeCases) {
 
         cache_reclaimer_->Stop();
 
-        // reclaiming should happen since group used key count > 0 and used size > 16
+        // group max key count is zero, reclaiming should happen
         ASSERT_FALSE(submitted_del_requests.empty());
     }
 }
 
 TEST_F(CacheReclaimerTest, TestCronJobAdaptiveSleepInterval) {
-    random_sample_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
     get_out_properties = {
         {
             {PROPERTY_LRU_TIME, "0"},
@@ -2419,6 +2503,7 @@ TEST_F(CacheReclaimerTest, TestCronJobAdaptiveSleepInterval) {
 
     // update the trigger strategy to trigger the reclaiming
     // so that the reclaiming method shall be entered
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 4096);
 
     // use instance 0 from setup()
     // construct instance 1
@@ -2431,7 +2516,7 @@ TEST_F(CacheReclaimerTest, TestCronJobAdaptiveSleepInterval) {
     ins_group->quota_.set_capacity(2048);
     instance_groups.emplace_back(ins_group);
 
-    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), random_sample_keys.size()));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), sample_reclaim_keys.size()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 1));
     batch_get_loc_out_maps =
         std::vector<CacheLocationMap>(cache_reclaimer_->GetBatchingSize(request_context_.get()), CacheLocationMap{});
@@ -2498,7 +2583,7 @@ TEST_F(CacheReclaimerTest, TestCronJobAdaptiveSleepInterval) {
 }
 
 TEST_F(CacheReclaimerTest, TestCronJobAdaptiveSleepIntervalRecovery) {
-    random_sample_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
     get_out_properties = {
         {
             {PROPERTY_LRU_TIME, "0"},
@@ -2535,6 +2620,7 @@ TEST_F(CacheReclaimerTest, TestCronJobAdaptiveSleepIntervalRecovery) {
     {
         // update the trigger strategy to trigger the reclaiming
         // so that the reclaiming method shall be entered
+        dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 4096);
 
         // use instance 0 from setup()
         // construct instance 1
@@ -2548,7 +2634,7 @@ TEST_F(CacheReclaimerTest, TestCronJobAdaptiveSleepIntervalRecovery) {
         instance_groups.emplace_back(ins_group);
     }
 
-    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), random_sample_keys.size()));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), sample_reclaim_keys.size()));
     ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 1));
     batch_get_loc_out_maps =
         std::vector<CacheLocationMap>(cache_reclaimer_->GetBatchingSize(request_context_.get()), CacheLocationMap{});
@@ -2701,9 +2787,7 @@ TEST_F(CacheReclaimerTest, TestHandleDelRes03) {
 
     try {
         throw std::runtime_error("test exception");
-    } catch (...) {
-        promise->set_exception(std::current_exception());
-    }
+    } catch (...) { promise->set_exception(std::current_exception()); }
 
     cache_reclaimer_->HandleDelRes();
     ASSERT_TRUE(cache_reclaimer_->delete_handlers_.empty());
@@ -2726,7 +2810,7 @@ TEST_F(CacheReclaimerTest, TestHandleDelRes04) {
 }
 
 TEST_F(CacheReclaimerTest, TestDoKeySampling) {
-    random_sample_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
     get_out_properties = {
         {
             {PROPERTY_LRU_TIME, "0"},
@@ -2761,13 +2845,13 @@ TEST_F(CacheReclaimerTest, TestDoKeySampling) {
     };
 
     {
-        cache_reclaimer_->sampling_size_.store(random_sample_keys.size());
+        cache_reclaimer_->sampling_size_.store(sample_reclaim_keys.size());
         cache_reclaimer_->sampling_size_per_task_.store(100);
 
         std::vector<std::int64_t> keys;
         std::vector<std::map<std::string, std::string>> maps;
         ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_.get(), instance_infos.front(), keys, maps));
-        ASSERT_EQ(random_sample_keys.size(), keys.size());
+        ASSERT_EQ(sample_reclaim_keys.size(), keys.size());
         ASSERT_EQ(get_out_properties.size(), maps.size());
     }
 
@@ -2781,12 +2865,25 @@ TEST_F(CacheReclaimerTest, TestDoKeySampling) {
     }
 
     {
-        cache_reclaimer_->sampling_size_.store(random_sample_keys.size());
-        cache_reclaimer_->sampling_size_per_task_.store(0);
+        cache_reclaimer_->sampling_size_.store(sample_reclaim_keys.size());
+        cache_reclaimer_->sampling_size_per_task_.store(0); // 0 means single thread key sampling
 
         std::vector<std::int64_t> keys;
         std::vector<std::map<std::string, std::string>> maps;
-        ASSERT_FALSE(cache_reclaimer_->DoKeySampling(request_context_.get(), instance_infos.front(), keys, maps));
+        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_.get(), instance_infos.front(), keys, maps));
+        ASSERT_EQ(sample_reclaim_keys.size(), keys.size());
+        ASSERT_EQ(get_out_properties.size(), maps.size());
+    }
+    {
+        // sampling_size <= sampling_size_per_task means single thread key sampling
+        cache_reclaimer_->sampling_size_.store(1000);
+        cache_reclaimer_->sampling_size_per_task_.store(1000);
+
+        std::vector<std::int64_t> keys;
+        std::vector<std::map<std::string, std::string>> maps;
+        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_.get(), instance_infos.front(), keys, maps));
+        ASSERT_EQ(1000, keys.size());
+        ASSERT_EQ(1000, maps.size());
     }
 
     {
@@ -2830,7 +2927,8 @@ TEST_F(CacheReclaimerTest, TestDoKeySampling) {
         std::vector<std::map<std::string, std::string>> maps;
         ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_.get(), instance_infos.front(), keys, maps));
         ASSERT_EQ(1, keys.size());
-        ASSERT_EQ(1, maps.size());
+        // sampling_size_ <= delete_batch_size, will not get properties
+        ASSERT_EQ(0, maps.size());
     }
 
     {
@@ -2852,7 +2950,7 @@ TEST_F(CacheReclaimerTest, TestDoKeySampling) {
 
 TEST_F(CacheReclaimerTest, TestDupKeys) {
     {
-        random_sample_keys = {0, 0, 2, 3, 4, 5, 6, 7, 8, 9};
+        sample_reclaim_keys = {0, 0, 2, 3, 4, 5, 6, 7, 8, 9};
         get_out_properties = {
             {
                 {PROPERTY_LRU_TIME, "1"},
@@ -2886,11 +2984,11 @@ TEST_F(CacheReclaimerTest, TestDupKeys) {
             },
         };
 
-        cache_reclaimer_->sampling_size_.store(random_sample_keys.size());
+        cache_reclaimer_->sampling_size_.store(sample_reclaim_keys.size());
         cache_reclaimer_->sampling_size_per_task_.store(100);
-        cache_reclaimer_->batching_size_.store(random_sample_keys.size());
+        cache_reclaimer_->batching_size_.store(sample_reclaim_keys.size());
 
-        std::vector<std::int64_t> keys(random_sample_keys);
+        std::vector<std::int64_t> keys(sample_reclaim_keys);
         std::vector<std::map<std::string, std::string>> maps(get_out_properties);
         std::vector<std::int64_t> batch;
         ASSERT_TRUE(
@@ -2899,7 +2997,7 @@ TEST_F(CacheReclaimerTest, TestDupKeys) {
     }
 
     {
-        random_sample_keys = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
+        sample_reclaim_keys = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
         get_out_properties = {
             {
                 {PROPERTY_LRU_TIME, "0"},
@@ -2933,11 +3031,11 @@ TEST_F(CacheReclaimerTest, TestDupKeys) {
             },
         };
 
-        cache_reclaimer_->sampling_size_.store(random_sample_keys.size());
+        cache_reclaimer_->sampling_size_.store(sample_reclaim_keys.size());
         cache_reclaimer_->sampling_size_per_task_.store(100);
         cache_reclaimer_->batching_size_.store(2);
 
-        std::vector<std::int64_t> keys(random_sample_keys);
+        std::vector<std::int64_t> keys(sample_reclaim_keys);
         std::vector<std::map<std::string, std::string>> maps(get_out_properties);
         std::vector<std::int64_t> batch;
         ASSERT_TRUE(
@@ -2946,7 +3044,7 @@ TEST_F(CacheReclaimerTest, TestDupKeys) {
     }
 
     {
-        random_sample_keys = {1, 1, 1, 1, 1, 1, 1, 2, 1, 1};
+        sample_reclaim_keys = {1, 1, 1, 1, 1, 1, 1, 2, 1, 1};
         get_out_properties = {
             {
                 {PROPERTY_LRU_TIME, "9"},
@@ -2980,11 +3078,11 @@ TEST_F(CacheReclaimerTest, TestDupKeys) {
             },
         };
 
-        cache_reclaimer_->sampling_size_.store(random_sample_keys.size());
+        cache_reclaimer_->sampling_size_.store(sample_reclaim_keys.size());
         cache_reclaimer_->sampling_size_per_task_.store(100);
         cache_reclaimer_->batching_size_.store(2);
 
-        std::vector<std::int64_t> keys(random_sample_keys);
+        std::vector<std::int64_t> keys(sample_reclaim_keys);
         std::vector<std::map<std::string, std::string>> maps(get_out_properties);
         std::vector<std::int64_t> batch;
         ASSERT_TRUE(
@@ -3010,7 +3108,7 @@ TEST_F(CacheReclaimerTest, TestPerf) {
     cache_reclaimer_->batching_size_.store(batching_sz);
 
     for (int i = 0; i != sampling_sz_per_task; ++i) {
-        random_sample_keys.emplace_back(i);
+        sample_reclaim_keys.emplace_back(i);
         get_out_properties.emplace_back(MetaIndexer::PropertyMap{{PROPERTY_LRU_TIME, "9"}});
     }
 
@@ -3025,7 +3123,7 @@ TEST_F(CacheReclaimerTest, TestPerf) {
     auto start_tp = std::chrono::steady_clock::now();
     while (true) {
         cache_reclaimer_->ReclaimByLRU(
-            request_context_, instance_infos.front(), {false, false, false, false, false}, 1000);
+            request_context_, instance_infos.front(), CacheReclaimer::WaterLevelExceed{}, 1000);
         if (std::chrono::steady_clock::now() - start_tp >= std::chrono::milliseconds(60 * 1000)) {
             break;
         }

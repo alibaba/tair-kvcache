@@ -72,6 +72,9 @@ public:
 
     bool TrimCache() override;
 
+    std::pair<ClientErrorCode, ClusterInfo> GetClusterInfo(const std::string &trace_id,
+                                                            const std::string &instance_id) override;
+
 private:
     std::shared_ptr<proto::meta::MetaService::Stub> GetStub() const;
     uint32_t retry_time_ = 3;

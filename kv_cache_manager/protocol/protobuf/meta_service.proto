@@ -282,6 +282,28 @@ message RemoveCacheRequest {
     BlockMask block_mask = 5; // 对block_keys或者token_ids的mask
 }
 
+// Leader 节点信息，仅包含 Meta 服务连接信息，不暴露 Admin 端口
+message MetaNodeEndpoint {
+    string node_id = 1;
+    string host = 2;
+    int32 meta_rpc_port = 3;
+    int32 meta_http_port = 4;
+    string custom_info = 5;
+}
+
+message GetClusterInfoRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+}
+
+message GetClusterInfoResponse {
+    CommonResponseHeader header = 1;
+    string self_node_id = 2;
+    string leader_node_id = 3;
+    // leader 节点信息查询失败时可能缺失，调用方应据此决定是否重试。
+    MetaNodeEndpoint leader_endpoint = 4;
+}
+
 enum TrimStrategy {
     TS_UNSPECIFIED = 0;
     TS_REMOVE_ALL_CACHE = 1;
@@ -319,4 +341,6 @@ service MetaService {
     rpc RemoveCache(RemoveCacheRequest) returns (CommonResponse);
     // 删除全部cache或者meta，允许指定时间
     rpc TrimCache(TrimCacheRequest) returns (CommonResponse);
+    // 查询集群信息（leader发现），任意节点均可处理
+    rpc GetClusterInfo(GetClusterInfoRequest) returns (GetClusterInfoResponse);
 }

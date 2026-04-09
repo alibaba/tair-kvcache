@@ -61,6 +61,13 @@ build:cuda12_6 --action_env TF_CUDA_VERSION="12.6"
 build:cuda12_6 --host_action_env TF_CUDA_VERSION="12.6"
 build:cuda12_6 --copt="-D_GLIBCXX_USE_CXX11_ABI=1"
 
+build:musa --copt="-DUSING_MUSA=1"
+build:musa --define=using_musa=true
+build:musa --action_env MUSA_TOOLKIT_PATH="/usr/local/musa/"
+build:musa --host_action_env MUSA_TOOLKIT_PATH="/usr/local/musa/"
+build:musa --action_env LD_LIBRARY_PATH="/usr/local/musa/lib:$LD_LIBRARY_PATH"
+build:musa --host_action_env LD_LIBRARY_PATH="/usr/local/musa/lib:$LD_LIBRARY_PATH"
+
 build --spawn_strategy=local # avoid nvcc conflicts
 build --cxxopt="-std=c++17" --copt="-DGTEST_USE_OWN_TR1_TUPLE=0" --copt="-DEIGEN_MAX_CPP_VER=11"
 build -c opt
@@ -146,5 +153,8 @@ build:client_with_cuda --config=cuda
 build:client_with_cuda --define MOONCAKE_USE_CUDA=true
 build:client_with_cuda --define MOONCAKE_USE_PEERMEM=true
 build:client_with_cuda --define TAIR_MEMPOOL_USE_CUDA=true
+
+build:client_with_musa --config=client
+build:client_with_musa --config=musa
 
 build:client_only_header  --define CLIENT_ONLY_HEADER=true

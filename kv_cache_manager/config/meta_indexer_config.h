@@ -13,8 +13,8 @@ namespace kv_cache_manager {
 class MetaIndexerConfig : public Jsonizable {
 public:
     static constexpr size_t kDefaultMaxKeyCount = std::numeric_limits<size_t>::max();
-    static constexpr size_t kDefaultMutexShardNum = 16;
-    static constexpr size_t kDefaultBatchKeySize = 16;
+    static constexpr size_t kDefaultMutexShardNum = 1024;
+    static constexpr size_t kDefaultBatchKeySize = 128;
     static constexpr size_t kDefaultPersistMetaDataIntervalTimeMs = 1000;
 
 public:

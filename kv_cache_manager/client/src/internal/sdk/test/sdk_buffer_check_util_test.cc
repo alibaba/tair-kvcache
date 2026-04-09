@@ -303,7 +303,7 @@ TEST_F(SdkBufferCheckUtilTest, TestSdkBufferCheckPool) {
     push_buffer();
     auto handle = pool.GetCell();
     auto block_hashs = SdkBufferCheckUtil::GetBlocksHash(
-        block_buffers, handle->d_iovs, handle->d_crcs, handle->h_iovs, max_check_iov_num, handle->cuda_stream);
+        block_buffers, handle->d_iovs, handle->d_crcs, handle->h_iovs, max_check_iov_num, handle->gpu_stream);
     ASSERT_EQ(2, block_hashs.size());
     ASSERT_EQ(block_hashs[0], block_hashs[1]);
 #endif
@@ -352,7 +352,7 @@ TEST_F(SdkBufferCheckUtilTest, TestSdkBufferCheckPoolMultiThread) {
                                                              handle->d_crcs,
                                                              handle->h_iovs,
                                                              max_check_iov_num,
-                                                             handle->cuda_stream);
+                                                             handle->gpu_stream);
         ASSERT_EQ(1, block_hashs.size());
         expect = block_hashs[0];
     }
@@ -364,7 +364,7 @@ TEST_F(SdkBufferCheckUtilTest, TestSdkBufferCheckPoolMultiThread) {
                                                              handle->d_crcs,
                                                              handle->h_iovs,
                                                              max_check_iov_num,
-                                                             handle->cuda_stream);
+                                                             handle->gpu_stream);
         ASSERT_EQ(std::vector<int64_t>({expect}), block_hashs);
     };
     for (int i = 0; i < 20; ++i) {
@@ -379,4 +379,72 @@ TEST_F(SdkBufferCheckUtilTest, TestSdkBufferCheckPoolMultiThread) {
         go.store(false, std::memory_order_relaxed);
     }
 #endif
+}
+
+TEST_F(SdkBufferCheckUtilTest, TestSdkBufferCheckPoolMultiDevice) {
+    auto byte_size = 4 * 1024;
+    size_t max_check_iov_num = 10;
+    auto push_buffer = [byte_size](BlockBuffers &block_buffers) {
+        char *buffer = nullptr;
+        ASSERT_EQ(cudaSuccess, cudaMalloc(&buffer, byte_size));
+        std::string init(byte_size, 'a');
+        ASSERT_EQ(cudaSuccess, cudaMemcpy(buffer, init.data(), byte_size, cudaMemcpyHostToDevice));
+        block_buffers.push_back({});
+        auto &iovs = block_buffers.back().iovs;
+        iovs.push_back({MemoryType::GPU, buffer, 1024, false});
+        iovs.push_back({MemoryType::GPU, buffer + 1024, 1024, false});
+        iovs.push_back({MemoryType::GPU, buffer + 2 * 1024, 1024, false});
+        iovs.push_back({MemoryType::GPU, buffer + 3 * 1024, 1024, false});
+    };
+
+    auto get_block_hash = [max_check_iov_num](SdkBufferCheckPool &pool,
+                                              std::vector<BlockBuffers> &block_buffers_vec) -> int64_t {
+        auto handle = pool.GetCell();
+        auto block_hashs = SdkBufferCheckUtil::GetBlocksHash(block_buffers_vec[0],
+                                                             handle->d_iovs,
+                                                             handle->d_crcs,
+                                                             handle->h_iovs,
+                                                             max_check_iov_num,
+                                                             handle->gpu_stream);
+        if (1 != block_hashs.size()) {
+            return -1;
+        }
+        return block_hashs[0];
+    };
+
+    ASSERT_EQ(cudaSuccess, cudaSetDevice(0));
+    SdkBufferCheckPool pool_device_0;
+    SdkBufferCheckPool pool_device_1;
+    ASSERT_TRUE(pool_device_0.Init(max_check_iov_num));
+    std::vector<BlockBuffers> block_buffers_vec_device_0(2);
+    push_buffer(block_buffers_vec_device_0[0]);
+    push_buffer(block_buffers_vec_device_0[1]);
+
+    // in device0 context, get device0 block hash
+    int64_t hash_device_0 = get_block_hash(pool_device_0, block_buffers_vec_device_0);
+
+    std::vector<BlockBuffers> block_buffers_vec_device_1(2);
+    std::thread device_1_thread([&]() {
+        ASSERT_EQ(cudaSuccess, cudaSetDevice(1));
+        size_t max_check_iov_num = 10;
+        ASSERT_TRUE(pool_device_1.Init(max_check_iov_num));
+        std::vector<BlockBuffers> block_buffers_vec_device_1_local(2);
+        push_buffer(block_buffers_vec_device_1_local[0]);
+        push_buffer(block_buffers_vec_device_1_local[1]);
+        // in device1 context, get device1 block hash
+        int64_t hash_device_1_local = get_block_hash(pool_device_1, block_buffers_vec_device_1_local);
+        ASSERT_EQ(hash_device_0, hash_device_1_local);
+        // malloc in device1
+        push_buffer(block_buffers_vec_device_1[0]);
+        push_buffer(block_buffers_vec_device_1[1]);
+    });
+
+    device_1_thread.join();
+
+    // in device0 context, get device1 block hash
+    int64_t hash_device_1 = get_block_hash(pool_device_1, block_buffers_vec_device_1);
+    ASSERT_EQ(hash_device_0, hash_device_1);
+    // in device0 context, get device0 block hash by pool_device_1
+    int64_t hash_device_err = get_block_hash(pool_device_1, block_buffers_vec_device_0);
+    ASSERT_EQ(-1, hash_device_err);
 }

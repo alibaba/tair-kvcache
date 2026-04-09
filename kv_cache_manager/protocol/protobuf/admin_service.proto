@@ -445,12 +445,25 @@ message CheckHealthResponse {
 }
 message GetManagerClusterInfoRequest { string trace_id = 1; }
 
+// 节点端点信息，用于客户端直连leader节点
+message NodeEndpoint {
+    string node_id = 1;
+    string host = 2;
+    int32 meta_rpc_port = 3;
+    int32 meta_http_port = 4;
+    int32 admin_rpc_port = 5;
+    int32 admin_http_port = 6;
+    string custom_info = 7;
+}
+
 message GetManagerClusterInfoResponse {
     CommonResponseHeader header = 1;
     int64 info_updated_time = 2;
     int64 self_leader_expiration_time = 3;
     string self_node_id = 4;
     string leader_node_id = 5;
+    // leader 节点信息查询失败时可能缺失，调用方应据此决定是否重试。
+    NodeEndpoint leader_endpoint = 6;
 
     // TODO: add cluster node infos
 }

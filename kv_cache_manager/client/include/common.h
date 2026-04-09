@@ -91,6 +91,19 @@ struct WriteLocation {
     Locations locations;
 };
 
+struct ClusterInfo {
+    std::string self_node_id;
+    std::string leader_node_id;
+    struct NodeEndpoint {
+        std::string node_id;
+        std::string host;
+        int32_t meta_rpc_port{0};
+        int32_t meta_http_port{0};
+        std::string custom_info;
+    };
+    NodeEndpoint leader_endpoint;
+};
+
 enum class MemoryType : uint8_t {
     CPU = 0,
     GPU = 1,

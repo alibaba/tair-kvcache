@@ -1,7 +1,9 @@
 #pragma once
 
-#ifdef USING_CUDA
+#if defined(USING_CUDA)
 #include <cuda_runtime.h>
+#elif defined(USING_MUSA)
+#include <musa_runtime.h>
 #endif
 #include "kv_cache_manager/client/src/internal/sdk/sdk_interface.h"
 
@@ -25,8 +27,10 @@ private:
 
 private:
     int64_t byte_size_per_block_;
-#ifdef USING_CUDA
+#if defined(USING_CUDA)
     cudaStream_t cuda_stream_ = nullptr;
+#elif defined(USING_MUSA)
+    musaStream_t musa_stream_ = nullptr;
 #endif
 };
 } // namespace kv_cache_manager

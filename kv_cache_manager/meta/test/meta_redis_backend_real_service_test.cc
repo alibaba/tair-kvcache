@@ -247,7 +247,7 @@ TEST_F(MetaRedisBackendRealServiceTest, TestConcurrentListAndRandomOperations) {
             }
         } else {
             std::vector<KeyType> out_keys;
-            ErrorCode ec = meta_redis_backend_->RandomSample(5, out_keys);
+            ErrorCode ec = meta_redis_backend_->SampleReclaimKeys(5, out_keys);
             ASSERT_EQ(EC_OK, ec);
             for (const KeyType &key : out_keys) {
                 ASSERT_TRUE(key >= 0 && key <= COUNT * 2);
