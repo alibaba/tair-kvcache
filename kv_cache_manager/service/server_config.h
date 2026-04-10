@@ -40,6 +40,8 @@ public:
     const std::string &metrics_reporter_type() { return metrics_reporter_type_; }
     const std::string &metrics_reporter_config() { return metrics_reporter_config_; }
     int64_t metrics_report_interval_ms() { return metrics_report_interval_ms_; }
+    bool enable_prometheus() const { return enable_prometheus_; }
+    const std::string &prometheus_prefix() const { return prometheus_prefix_; }
     const std::string &event_publishers_configs() { return event_publishers_configs_; }
     const std::string &GetAdvertisedHost() const { return advertised_host_; }
     const std::string &GetCustomInfo() const { return custom_info_; }
@@ -73,6 +75,8 @@ private:
     std::string metrics_reporter_type_;
     std::string metrics_reporter_config_;
     int64_t metrics_report_interval_ms_ = 0;
+    bool enable_prometheus_ = true;
+    std::string prometheus_prefix_ = "kvcm";
     std::string event_publishers_configs_;
     std::string advertised_host_;
     std::string custom_info_;

@@ -52,6 +52,19 @@ cc_library(
 )
 
 cc_library(
+    name = "prometheus_exporter",
+    srcs = [
+        "prometheus_exporter.cc",
+    ],
+    hdrs = [
+        "prometheus_exporter.h",
+    ],
+    deps = [
+        ":metrics_registry",
+    ],
+)
+
+cc_library(
     name = "metrics_reporter_factory",
     srcs = [
         "metrics_reporter_factory.cc",

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <string>
 
 #include "kv_cache_manager/metrics/metrics_collector.h"
 #include "kv_cache_manager/protocol/protobuf/admin_service.pb.h"
@@ -15,6 +16,10 @@ class AdminServiceHttp : public CoroHttpService {
 public:
     AdminServiceHttp(std::shared_ptr<MetricsRegistry> metrics_registry,
                      std::shared_ptr<AdminServiceImpl> admin_service_impl);
+    AdminServiceHttp(std::shared_ptr<MetricsRegistry> metrics_registry,
+                     std::shared_ptr<AdminServiceImpl> admin_service_impl,
+                     bool enable_prometheus,
+                     const std::string &prometheus_prefix);
 
     void Init() override;
     void RegisterHandler() override;
@@ -115,6 +120,8 @@ public:
 private:
     std::shared_ptr<MetricsRegistry> metrics_registry_;
     std::shared_ptr<AdminServiceImpl> admin_service_impl_;
+    bool enable_prometheus_ = true;
+    std::string prometheus_prefix_ = "kvcm";
 
     // for storage APIs
     KVCM_DECLARE_METRICS_COLLECTOR_(AddStorage);

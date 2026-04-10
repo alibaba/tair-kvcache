@@ -223,7 +223,8 @@ bool Server::StartHttpServer() {
     int32_t admin_http_port = config_.GetServiceAdminHttpPort();
 
     meta_http_service_ = std::make_shared<MetaServiceHttp>(metrics_registry_, meta_impl_, registry_manager_);
-    admin_http_service_ = std::make_shared<AdminServiceHttp>(metrics_registry_, admin_impl_);
+    admin_http_service_ = std::make_shared<AdminServiceHttp>(
+        metrics_registry_, admin_impl_, config_.enable_prometheus(), config_.prometheus_prefix());
     debug_http_service_ = std::make_shared<DebugServiceHttp>(metrics_registry_, debug_impl_);
 
     meta_http_service_->Init();

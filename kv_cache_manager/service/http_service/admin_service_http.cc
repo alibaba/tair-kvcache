@@ -7,6 +7,7 @@
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
+#include "kv_cache_manager/metrics/prometheus_exporter.h"
 #include "kv_cache_manager/protocol/protobuf/admin_service.pb.h"
 #include "kv_cache_manager/service/admin_service_impl.h"
 #include "kv_cache_manager/service/util/common.h"
@@ -16,6 +17,15 @@ namespace kv_cache_manager {
 AdminServiceHttp::AdminServiceHttp(std::shared_ptr<MetricsRegistry> metrics_registry,
                                    std::shared_ptr<AdminServiceImpl> admin_service_impl)
     : metrics_registry_(std::move(metrics_registry)), admin_service_impl_(std::move(admin_service_impl)) {}
+
+AdminServiceHttp::AdminServiceHttp(std::shared_ptr<MetricsRegistry> metrics_registry,
+                                   std::shared_ptr<AdminServiceImpl> admin_service_impl,
+                                   bool enable_prometheus,
+                                   const std::string &prometheus_prefix)
+    : metrics_registry_(std::move(metrics_registry)),
+      admin_service_impl_(std::move(admin_service_impl)),
+      enable_prometheus_(enable_prometheus),
+      prometheus_prefix_(prometheus_prefix) {}
 
 void AdminServiceHttp::Init() {
     // for storage APIs
@@ -106,6 +116,18 @@ void AdminServiceHttp::RegisterHandler() {
 
     // Metrics API
     REGISTER_HTTP_HANDLER_FOR_ADMIN_SERVICE(Post, getMetrics, GetMetrics, GetMetrics, GetMetrics);
+
+    // Prometheus metrics endpoint (GET /metrics)
+    if (enable_prometheus_ && metrics_registry_) {
+        RegisterGetHandler("/metrics",
+                           [this](coro_http::coro_http_request &req,
+                                  coro_http::coro_http_response &res) -> async_simple::coro::Lazy<void> {
+                               std::string body = PrometheusExporter::Expose(*metrics_registry_, prometheus_prefix_);
+                               res.add_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
+                               res.set_status_and_content(coro_http::status_type::ok, std::move(body));
+                               co_return;
+                           });
+    }
 
     // High Availability APIs
     REGISTER_HTTP_HANDLER_FOR_ADMIN_SERVICE(Post, checkHealth, CheckHealth, CheckHealth, CheckHealth);

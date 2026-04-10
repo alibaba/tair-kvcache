@@ -25,6 +25,7 @@ cc_library(
         "//kv_cache_manager/config",
         "//kv_cache_manager/data_storage",
         "//kv_cache_manager/data_storage:common_define",
+        "//kv_cache_manager/metrics:prometheus_exporter",
         "//kv_cache_manager/protocol/protobuf:service_cc_proto",
         "//kv_cache_manager/service:admin_service_impl",
         "//kv_cache_manager/service:debug_service_impl",

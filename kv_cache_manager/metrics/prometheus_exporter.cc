@@ -1,0 +1,115 @@
+#include "kv_cache_manager/metrics/prometheus_exporter.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <sstream>
+#include <variant>
+#include <vector>
+
+#include "kv_cache_manager/metrics/metrics_registry.h"
+
+namespace kv_cache_manager {
+
+namespace {
+
+// Prometheus metric names must match [a-zA-Z_:][a-zA-Z0-9_:]*.
+// Replace every character that is not in that set with '_'.
+std::string SanitizeName(const std::string &prefix, const std::string &raw_name) {
+    std::string out;
+    out.reserve(prefix.size() + 1 + raw_name.size());
+    out += prefix;
+    out += '_';
+    for (char c : raw_name) {
+        if (c == '.' || c == '-') {
+            out += '_';
+        } else {
+            out += c;
+        }
+    }
+    return out;
+}
+
+// Prometheus label values use double-quoted strings.  Backslash,
+// double-quote and newline must be escaped.
+void EscapeLabelValue(std::ostringstream &ss, const std::string &v) {
+    for (char c : v) {
+        switch (c) {
+        case '\\':
+            ss << "\\\\";
+            break;
+        case '"':
+            ss << "\\\"";
+            break;
+        case '\n':
+            ss << "\\n";
+            break;
+        default:
+            ss << c;
+        }
+    }
+}
+
+void WriteLabels(std::ostringstream &ss, const MetricsTags &tags) {
+    if (tags.empty()) {
+        return;
+    }
+    ss << '{';
+    bool first = true;
+    for (const auto &[k, v] : tags) {
+        if (!first) {
+            ss << ',';
+        }
+        first = false;
+        ss << k << "=\"";
+        EscapeLabelValue(ss, v);
+        ss << '"';
+    }
+    ss << '}';
+}
+
+} // namespace
+
+std::string PrometheusExporter::Expose(MetricsRegistry &registry, const std::string &prefix) {
+    std::vector<MetricsRegistry::metrics_tuple_t> all_metrics;
+    registry.GetAllMetrics(all_metrics);
+
+    // Group metrics by name so we can emit TYPE / HELP lines once per
+    // metric family.
+    //
+    // GetAllMetrics returns entries ordered by name (the underlying
+    // map is std::map<string, ...>), so consecutive entries with the
+    // same name belong to the same family.
+    std::ostringstream ss;
+
+    std::string prev_name;
+    for (const auto &[name, tags, val] : all_metrics) {
+        std::string prom_name = SanitizeName(prefix, name);
+
+        if (name != prev_name) {
+            const char *type_str = "untyped";
+            if (std::holds_alternative<CounterValue>(*val)) {
+                type_str = "counter";
+            } else if (std::holds_alternative<GaugeValue>(*val)) {
+                type_str = "gauge";
+            }
+            ss << "# HELP " << prom_name << ' ' << name << '\n';
+            ss << "# TYPE " << prom_name << ' ' << type_str << '\n';
+            prev_name = name;
+        }
+
+        ss << prom_name;
+        WriteLabels(ss, tags);
+
+        if (std::holds_alternative<CounterValue>(*val)) {
+            ss << ' ' << std::get<CounterValue>(*val).load(std::memory_order_relaxed);
+        } else if (std::holds_alternative<GaugeValue>(*val)) {
+            double gv = std::get<GaugeValue>(*val).load(std::memory_order_relaxed);
+            ss << ' ' << gv;
+        }
+        ss << '\n';
+    }
+
+    return ss.str();
+}
+
+} // namespace kv_cache_manager

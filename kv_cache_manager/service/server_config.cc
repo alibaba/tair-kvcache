@@ -141,6 +141,16 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
      [](const std::string &value, ServerConfig *config) {
          config->custom_info_ = value;
          return true;
+     }},
+    {"kvcm.metrics.enable_prometheus",
+     [](const std::string &value, ServerConfig *config) {
+         config->enable_prometheus_ = value == "true";
+         return true;
+     }},
+    {"kvcm.metrics.prometheus_prefix",
+     [](const std::string &value, ServerConfig *config) {
+         config->prometheus_prefix_ = value;
+         return true;
      }}};
 
 bool ServerConfig::Parse(const std::string &config_file, const EnvironMap &environ) {

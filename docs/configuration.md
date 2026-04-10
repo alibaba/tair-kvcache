@@ -86,6 +86,12 @@ kvcm.metrics.reporter_config
 # 若启用的metrics reporter有周期性report任务，指定该任务的唤醒间隔；默认20000
 kvcm.metrics.report_interval_ms
 
+# 是否开启Prometheus metrics端点（GET /metrics），默认true
+kvcm.metrics.enable_prometheus=true
+
+# Prometheus metrics名称前缀，默认kvcm
+kvcm.metrics.prometheus_prefix=kvcm
+
 # log event publisher的初始化配置值，暂未启用
 kvcm.event.event_publishers_configs
 ```

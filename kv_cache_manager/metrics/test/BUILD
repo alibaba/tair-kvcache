@@ -97,6 +97,20 @@ cc_test(
 )
 
 cc_test(
+    name = "PrometheusExporterTest",
+    srcs = [
+        "prometheus_exporter_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    data = [],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/metrics:metrics_registry",
+        "//kv_cache_manager/metrics:prometheus_exporter",
+    ],
+)
+
+cc_test(
     name = "MetricsRegistryTest",
     srcs = [
         "metrics_registry_test.cc",
