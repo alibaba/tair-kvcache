@@ -200,3 +200,13 @@ echo "STABLE_KVCM_VERSION 0.0.1"
 ```
 
 发版时修改此值即可，所有组件会自动使用新版本号。
+
+## 无 .git 目录时的行为
+
+如果源码不在 git 仓库中（例如直接下载的源码包），构建流程**仍然可以正常完成**，不会失败。具体行为：
+
+- `workspace_status.sh` 中的所有 git 命令都有 `|| echo unknown` 兜底，git 信息会退化为 `unknown`
+- `STABLE_KVCM_VERSION`、`BUILD_DATE`、`BUILD_TIME` 不依赖 git，不受影响
+- 最终版本号为 `0.0.1+20260409.unknown`，PEP 440 合法
+- py_wheel stamp 中 `{STABLE_GIT_COMMIT}` 被替换为 `unknown`，wheel 正常构建
+- C++ 宏同理，编译不受影响
