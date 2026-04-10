@@ -251,6 +251,7 @@ TEST_F(MetaIndexerTest, TestMetadataPersistAndRecover) {
     meta_indexer_->key_count_.store(3);
 
     const std::vector<std::uint64_t> expected_usage_vec{1, 100, 200, 300, 400, 500};
+    ASSERT_EQ(expected_usage_vec.size(), meta_indexer_->storage_usage_data_.storage_usage_by_type_.size());
     for (std::size_t i = 0; i != meta_indexer_->storage_usage_data_.storage_usage_by_type_.size(); ++i) {
         meta_indexer_->storage_usage_data_.storage_usage_by_type_.at(i).store(expected_usage_vec.at(i));
     }

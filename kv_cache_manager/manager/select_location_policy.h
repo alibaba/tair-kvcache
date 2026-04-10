@@ -12,9 +12,6 @@ namespace kv_cache_manager {
 
 using CheckLocDataExistFunc = std::function<bool(const CacheLocation &loc)>;
 
-// 从 URI 中提取 hostname，例如 "nfs://host01/path" → "host01"
-std::string_view ExtractHostName(std::string_view uri);
-
 class SelectLocationPolicy {
 public:
     // for match : select best location
