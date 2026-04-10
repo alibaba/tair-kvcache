@@ -415,12 +415,22 @@ public: // functions
             void(const std::string_view &key, ObjectPtr obj, size_t charge, const CacheItemHelper *helper)> &callback,
         const ApplyToAllEntriesOptions &opts) = 0;
 
+    // Callback invoked (while holding the shard mutex) whenever the LRU tail
+    // of a shard changes. Parameters: (shard_id, tail_value_ptr).
+    // tail_value_ptr is nullptr when the shard becomes empty.
+    using TailChangeCallback = std::function<void(uint32_t shard_id, ObjectPtr tail_value)>;
+
+    // Register a callback that is invoked whenever the LRU tail of any shard
+    // changes. The callback is called inside the shard lock, so it must be
+    // very lightweight (e.g. a single atomic store).
+    // Default implementation is a no-op (not supported).
+    virtual void SetTailChangeCallback(TailChangeCallback /*callback*/) {}
+
     // Returns up to `count` oldest (least recently used) keys from the
     // specified shard. Returns the number of keys actually collected.
     // Default implementation returns 0 (not supported).
-    virtual size_t GetOldestKeysInShard(uint32_t /*shard_id*/,
-                                        size_t /*count*/,
-                                        std::vector<std::string> & /*out_keys*/) {
+    virtual size_t
+    GetOldestKeysInShard(uint32_t /*shard_id*/, size_t /*count*/, std::vector<std::string> & /*out_keys*/) {
         return 0;
     }
 
@@ -431,9 +441,9 @@ public: // functions
     // Default implementation is a no-op (not supported).
     virtual void ApplyToSingleShard(
         uint32_t /*shard_id*/,
-        const std::function<
-            void(const std::string_view &key, ObjectPtr obj, size_t charge, const CacheItemHelper *helper)>
-            & /*callback*/) {}
+        const std::function<void(
+            const std::string_view &key, ObjectPtr obj, size_t charge, const CacheItemHelper *helper)> & /*callback*/) {
+    }
 
     // Insert a mapping from key->object only if the key does not already exist.
     // Returns EC_OK on successful insertion, EC_EXIST if the key is already
@@ -680,8 +690,8 @@ public:
     void ApplyToSingleShard(
         uint32_t shard_id,
         const std::function<
-            void(const std::string_view &key, ObjectPtr value, size_t charge, const CacheItemHelper *helper)>
-            &callback) override {
+            void(const std::string_view &key, ObjectPtr value, size_t charge, const CacheItemHelper *helper)> &callback)
+        override {
         target_->ApplyToSingleShard(shard_id, callback);
     }
 

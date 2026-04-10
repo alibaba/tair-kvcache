@@ -144,13 +144,10 @@ TEST_F(RedisClientRealServiceTest, TestNotExistKey) {
     // get
     std::vector<std::string> all_keys{key1, key2, key3, key4};
     std::vector<std::map<std::string, std::string>> expected_field_maps = field_maps;
-    expected_field_maps[0]["f3"] = "";
-    expected_field_maps[1]["f3"] = "";
-    expected_field_maps.emplace_back(
-        std::map<std::string, std::string>{{"f1", ""}, {"f2", ""}, {"f3", ""}}); // not exist
-    expected_field_maps.emplace_back(
-        std::map<std::string, std::string>{{"f1", ""}, {"f2", ""}, {"f3", ""}}); // not exist
-    std::vector<ErrorCode> expected_ec_per_key = {EC_OK, EC_OK, EC_OK, EC_OK};
+    // f3 does not exist for key1 and key2, so it is skipped
+    expected_field_maps.emplace_back(std::map<std::string, std::string>{}); // key3 not exist
+    expected_field_maps.emplace_back(std::map<std::string, std::string>{}); // key4 not exist
+    std::vector<ErrorCode> expected_ec_per_key = {EC_OK, EC_OK, EC_NOENT, EC_NOENT};
     std::vector<std::map<std::string, std::string>> out_field_maps;
     ec_per_key = redis_client_->Get(all_keys, /*field_names*/ {"f1", "f2", "f3"}, out_field_maps);
     ASSERT_EQ(expected_ec_per_key, ec_per_key);

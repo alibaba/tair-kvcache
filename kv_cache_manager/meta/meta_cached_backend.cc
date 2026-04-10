@@ -305,15 +305,6 @@ std::vector<ErrorCode> MetaCachedBackend::Upsert(const KeyTypeVec &keys, const F
     return local_backend_->Upsert(keys, field_maps, persistent_results);
 }
 
-std::vector<ErrorCode> MetaCachedBackend::IncrFields(const KeyTypeVec &keys,
-                                                     const std::map<std::string, int64_t> &field_amounts) noexcept {
-    if (recover_state_.load(std::memory_order_acquire) == RecoverState::kRecover) {
-        EnsureKeyInLocal(keys);
-    }
-    std::vector<ErrorCode> persistent_results = persistent_backend_->IncrFields(keys, field_amounts);
-    return local_backend_->IncrFields(keys, field_amounts, persistent_results);
-}
-
 std::vector<ErrorCode> MetaCachedBackend::Delete(const KeyTypeVec &keys) noexcept {
     std::vector<ErrorCode> persistent_results = persistent_backend_->Delete(keys);
 
@@ -451,16 +442,7 @@ ErrorCode MetaCachedBackend::SampleReclaimKeys(const int64_t count, std::vector<
 }
 
 ErrorCode MetaCachedBackend::PutMetaData(const FieldMap &field_maps) noexcept {
-    ErrorCode persistent_ec = persistent_backend_->PutMetaData(field_maps);
-    if (persistent_ec != EC_OK) {
-        return persistent_ec;
-    }
-    ErrorCode cache_ec = local_backend_->PutMetaData(field_maps);
-    if (cache_ec != EC_OK) {
-        KVCM_LOG_ERROR("meta cached backend: cache PutMetaData failed ec[%d], persistent succeeded", cache_ec);
-        return cache_ec;
-    }
-    return EC_OK;
+    return persistent_backend_->PutMetaData(field_maps);
 }
 
 ErrorCode MetaCachedBackend::GetMetaData(FieldMap &field_maps) noexcept {

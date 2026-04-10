@@ -13,30 +13,28 @@ public:
     ~MetaLocalBaseBackend() override = default;
 
     using MetaStorageBackend::Delete;
-    using MetaStorageBackend::IncrFields;
     using MetaStorageBackend::Put;
     using MetaStorageBackend::UpdateFields;
     using MetaStorageBackend::Upsert;
+
+    virtual std::vector<ErrorCode> PutIfAbsent(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept = 0;
 
     // Conditional write: only processes keys where previous_error_codes[i] == EC_OK.
     // For skipped keys, the returned error code is copied from previous_error_codes.
     virtual std::vector<ErrorCode> Put(const KeyTypeVec &keys,
                                        const FieldMapVec &field_maps,
                                        const std::vector<ErrorCode> &previous_error_codes) noexcept = 0;
+    virtual std::vector<ErrorCode> PutIfAbsent(const KeyTypeVec &keys,
+                                               const FieldMapVec &field_maps,
+                                               const std::vector<ErrorCode> &previous_error_codes) noexcept = 0;
     virtual std::vector<ErrorCode> UpdateFields(const KeyTypeVec &keys,
                                                 const FieldMapVec &field_maps,
                                                 const std::vector<ErrorCode> &previous_error_codes) noexcept = 0;
     virtual std::vector<ErrorCode> Upsert(const KeyTypeVec &keys,
                                           const FieldMapVec &field_maps,
                                           const std::vector<ErrorCode> &previous_error_codes) noexcept = 0;
-    virtual std::vector<ErrorCode> IncrFields(const KeyTypeVec &keys,
-                                              const std::map<std::string, int64_t> &field_amounts,
-                                              const std::vector<ErrorCode> &previous_error_codes) noexcept = 0;
     virtual std::vector<ErrorCode> Delete(const KeyTypeVec &keys,
                                           const std::vector<ErrorCode> &previous_error_codes) noexcept = 0;
-    virtual std::vector<ErrorCode> PutIfAbsent(const KeyTypeVec &keys,
-                                               const FieldMapVec &field_maps,
-                                               const std::vector<ErrorCode> &previous_error_codes) noexcept = 0;
 };
 
 } // namespace kv_cache_manager

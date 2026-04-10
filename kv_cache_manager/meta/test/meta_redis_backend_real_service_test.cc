@@ -170,18 +170,22 @@ TEST_F(MetaRedisBackendRealServiceTest, TestConcurrentMixedOperations) {
             ASSERT_EQ(keys.size(), out_field_maps.size());
             for (int i = 0; i < ec_per_key.size(); ++i) {
                 auto ec = ec_per_key[i];
-                ASSERT_TRUE(ec == EC_OK) << ec;
-                if (!out_field_maps[i]["name"].empty()) {
-                    ASSERT_EQ(field_maps[i]["name"], out_field_maps[i]["name"]);
-                    ASSERT_EQ(field_maps[i]["value"], out_field_maps[i]["value"]);
-                    ASSERT_TRUE(out_field_maps[i]["updated"] == "true" || out_field_maps[i]["updated"] == "false");
-                    bool is_updated = out_field_maps[i]["updated"] == "true";
-                    ASSERT_EQ(is_updated ? std::string("1234") : std::string(), out_field_maps[i]["ts"]);
+                ASSERT_TRUE(ec == EC_OK || ec == EC_NOENT) << ec;
+                if (ec == EC_OK) {
+                    auto nameIt = out_field_maps[i].find("name");
+                    if (nameIt != out_field_maps[i].end() && !nameIt->second.empty()) {
+                        ASSERT_EQ(field_maps[i]["name"], out_field_maps[i]["name"]);
+                        ASSERT_EQ(field_maps[i]["value"], out_field_maps[i]["value"]);
+                        auto updatedIt = out_field_maps[i].find("updated");
+                        ASSERT_TRUE(updatedIt != out_field_maps[i].end());
+                        ASSERT_TRUE(updatedIt->second == "true" || updatedIt->second == "false");
+                        bool is_updated = updatedIt->second == "true";
+                        auto tsIt = out_field_maps[i].find("ts");
+                        ASSERT_EQ(is_updated ? std::string("1234") : std::string(),
+                                  tsIt != out_field_maps[i].end() ? tsIt->second : std::string());
+                    }
                 } else {
-                    ASSERT_EQ(std::string(), out_field_maps[i]["name"]);
-                    ASSERT_EQ(std::string(), out_field_maps[i]["value"]);
-                    ASSERT_EQ(std::string(), out_field_maps[i]["updated"]);
-                    ASSERT_EQ(std::string(), out_field_maps[i]["ts"]);
+                    ASSERT_TRUE(out_field_maps[i].empty());
                 }
             }
         } break;

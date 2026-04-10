@@ -277,7 +277,7 @@ TEST_F(MetaRedisBackendTest, TestSimple) {
               {2, 3},
               {"f1", "f2"},
               {EC_OK, EC_OK},
-              {{{"f1", "v2-1-2"}, {"f2", "v2-2"}}, {{"f1", "v3-1"}, {"f2", ""}}});
+              {{{"f1", "v2-1-2"}, {"f2", "v2-2"}}, {{"f1", "v3-1"}}});
 
     ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
 }

@@ -309,11 +309,9 @@ MetaIndexer::Result MetaIndexer::Put(RequestContext *request_context,
     }
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_key_count, keys.size());
-    std::string ts_str = std::to_string(TimestampUtil::GetCurrentTimeUs());
     for (int32_t i = 0; i < keys.size(); ++i) {
         PropertyMap &map = properties[i];
         map[PROPERTY_URI] = std::move(uris[i]);
-        map[PROPERTY_LRU_TIME] = ts_str;
     }
 
     BatchMetaData batch_datas;
@@ -350,12 +348,6 @@ MetaIndexer::Update(RequestContext *request_context, const KeyVector &keys, Prop
     }
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_key_count, keys.size());
-    std::string ts_str = std::to_string(TimestampUtil::GetCurrentTimeUs());
-    for (int32_t i = 0; i < keys.size(); ++i) {
-        PropertyMap &map = properties[i];
-        map[PROPERTY_LRU_TIME] = ts_str;
-    }
-
     BatchMetaData batch_datas;
     MakeBatches(keys, properties, batch_datas);
     KVCM_METRICS_COLLECTOR_SET_METRICS(
@@ -394,11 +386,9 @@ MetaIndexer::Result MetaIndexer::Update(RequestContext *request_context,
     }
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_key_count, keys.size());
-    std::string ts_str = std::to_string(TimestampUtil::GetCurrentTimeUs());
     for (int32_t i = 0; i < keys.size(); ++i) {
         PropertyMap &map = properties[i];
         map[PROPERTY_URI] = std::move(uris[i]);
-        map[PROPERTY_LRU_TIME] = ts_str;
     }
 
     BatchMetaData batch_datas;
@@ -430,7 +420,6 @@ MetaIndexer::Result MetaIndexer::ReadModifyWrite(RequestContext *request_context
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_key_count, keys.size());
     const auto &trace_id = request_context->trace_id();
-    std::string ts_str = std::to_string(TimestampUtil::GetCurrentTimeUs());
     BatchMetaData batch_datas;
     PropertyMapVector empty_properties;
     MakeBatches(keys, empty_properties, batch_datas);
@@ -485,7 +474,6 @@ MetaIndexer::Result MetaIndexer::ReadModifyWrite(RequestContext *request_context
                 continue;
             }
             map[PROPERTY_URI] = std::move(uris[j]);
-            map[PROPERTY_LRU_TIME] = ts_str;
             if (get_ec == EC_OK || get_ec == EC_NOENT) {
                 upsert_keys.push_back(keys[idx]);
                 upsert_indexs.push_back(idx);
@@ -709,8 +697,10 @@ MetaIndexer::RandomSample(RequestContext *request_context, const size_t count, K
     return ec;
 }
 
-ErrorCode
-MetaIndexer::SampleReclaimKeys(RequestContext *request_context, const int64_t count, KeyVector &out_keys) const noexcept {
+ErrorCode MetaIndexer::SampleReclaimKeys(RequestContext *request_context,
+                                         const int64_t count,
+                                         KeyVector &out_keys) const noexcept {
+    out_keys.clear();
     out_keys.reserve(count);
     auto ec = storage_->SampleReclaimKeys(count, out_keys);
     if (ec != EC_OK) {
@@ -852,7 +842,7 @@ void MetaIndexer::PersistMetaData() noexcept {
         }
         auto ec = storage_->PutMetaData(metadata_map);
         if (ec != EC_OK) {
-            KVCM_LOG_ERROR("meta indexer persist metadata failed, ec[%d]", ec);
+            KVCM_LOG_WARN("meta indexer persist metadata failed, ec[%d]", ec);
         }
         last_persist_metadata_time_ = current_time;
     }

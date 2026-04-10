@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <map>
 #include <memory>
 #include <random>
@@ -21,6 +22,7 @@ struct MetaMemCacheItem {
     using FieldMap = MetaLocalBaseBackend::FieldMap;
 
     FieldMap fields_;
+    std::atomic<int64_t> last_access_time_{0};
 
     // Estimates total memory footprint including the heap memory owned by
     // FieldMap entries, used as the "charge" for LRU cache eviction accounting.
@@ -49,9 +51,7 @@ struct MetaMemCacheItem {
         return item;
     }
 
-    static void Deleter(void *value, MemoryAllocator * /*allocator*/) {
-        delete static_cast<MetaMemCacheItem *>(value);
-    }
+    static void Deleter(void *value, MemoryAllocator * /*allocator*/) { delete static_cast<MetaMemCacheItem *>(value); }
 };
 
 class MetaLocalBackend : public MetaLocalBaseBackend {
@@ -68,30 +68,26 @@ public:
 
     // write
     std::vector<ErrorCode> Put(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept override;
+    std::vector<ErrorCode> PutIfAbsent(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept override;
     std::vector<ErrorCode> UpdateFields(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept override;
     std::vector<ErrorCode> Upsert(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept override;
-    std::vector<ErrorCode> IncrFields(const KeyTypeVec &keys,
-                                      const std::map<std::string, int64_t> &field_amounts) noexcept override;
     std::vector<ErrorCode> Delete(const KeyTypeVec &keys) noexcept override;
 
     // Conditional write: only processes keys where previous_error_codes[i] == EC_OK.
     std::vector<ErrorCode> Put(const KeyTypeVec &keys,
                                const FieldMapVec &field_maps,
                                const std::vector<ErrorCode> &previous_error_codes) noexcept override;
+    std::vector<ErrorCode> PutIfAbsent(const KeyTypeVec &keys,
+                                       const FieldMapVec &field_maps,
+                                       const std::vector<ErrorCode> &previous_error_codes) noexcept override;
     std::vector<ErrorCode> UpdateFields(const KeyTypeVec &keys,
                                         const FieldMapVec &field_maps,
                                         const std::vector<ErrorCode> &previous_error_codes) noexcept override;
     std::vector<ErrorCode> Upsert(const KeyTypeVec &keys,
                                   const FieldMapVec &field_maps,
                                   const std::vector<ErrorCode> &previous_error_codes) noexcept override;
-    std::vector<ErrorCode> IncrFields(const KeyTypeVec &keys,
-                                      const std::map<std::string, int64_t> &field_amounts,
-                                      const std::vector<ErrorCode> &previous_error_codes) noexcept override;
     std::vector<ErrorCode> Delete(const KeyTypeVec &keys,
                                   const std::vector<ErrorCode> &previous_error_codes) noexcept override;
-    std::vector<ErrorCode> PutIfAbsent(const KeyTypeVec &keys,
-                                       const FieldMapVec &field_maps,
-                                       const std::vector<ErrorCode> &previous_error_codes) noexcept override;
 
     // read
     std::vector<ErrorCode> Get(const KeyTypeVec &keys,
@@ -110,10 +106,11 @@ public:
     ErrorCode PutMetaData(const FieldMap &field_maps) noexcept override;
     ErrorCode GetMetaData(FieldMap &field_maps) noexcept override;
 
-    // Returns up to `count` oldest keys from a randomly chosen shard.
-    ErrorCode GetOldestKeysFromRandomShard(size_t count, std::vector<KeyType> &out_keys);
-
 private:
+    // Collects up to `count` oldest keys from the given shard, parses them to
+    // KeyType and appends to `out_keys`. Returns the number of keys collected.
+    size_t CollectOldestKeysFromShard(uint32_t shard_id, size_t count, std::vector<KeyType> &out_keys);
+
     // Per-key write helpers used by both unconditional and conditional write methods.
     ErrorCode UpsertForOneKey(KeyType key, const FieldMap &field_map);
     ErrorCode DeleteForOneKey(KeyType key);
@@ -139,7 +136,12 @@ private:
     std::shared_ptr<Cache::CacheItemHelper> cache_item_helper_;
     std::shared_ptr<Cache> cache_;
     uint32_t shard_mask_ = 0;
-    int64_t sample_times_ = 0;
+    size_t sample_times_ = 0;
+
+    // Per-shard approximate oldest access time, updated via tail-change callback
+    // from the LRU cache. Used by SampleReclaimKeys to select the oldest shards
+    // without acquiring any shard locks.
+    std::unique_ptr<std::atomic<int64_t>[]> shard_oldest_access_time_;
 };
 
 } // namespace kv_cache_manager

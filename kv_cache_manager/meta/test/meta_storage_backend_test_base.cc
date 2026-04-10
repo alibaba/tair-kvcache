@@ -1,5 +1,6 @@
 #include "kv_cache_manager/meta/test/meta_storage_backend_test_base.h"
 
+#include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_redis_backend.h"
 namespace kv_cache_manager {
 void MetaStorageBackendTestBase::AssertGet(MetaStorageBackend *meta_storage_backend,
@@ -42,11 +43,22 @@ void MetaStorageBackendTestBase::AssertGetAllFields(MetaStorageBackend *meta_sto
         const KeyType &key = keys[i];
         const FieldMap &field_map = field_maps[i];
         const FieldMap &expected_field_map = expected_field_maps[i];
-        ASSERT_EQ(expected_field_map.size(), field_map.size()) << key;
+        // Count actual fields excluding PROPERTY_LRU_TIME (dynamically filled by local backend).
+        size_t actual_count_without_lru = field_map.size();
+        if (field_map.count(PROPERTY_LRU_TIME) && !expected_field_map.count(PROPERTY_LRU_TIME)) {
+            --actual_count_without_lru;
+        }
+        ASSERT_EQ(expected_field_map.size(), actual_count_without_lru) << key;
+        // Verify all expected fields are present with correct values.
+        // PROPERTY_LRU_TIME is dynamically filled, so only check existence.
         for (const auto &[expected_field_name, expected_field_value] : expected_field_map) {
             const auto iter = field_map.find(expected_field_name);
             ASSERT_TRUE(iter != field_map.end()) << key << " " << expected_field_name;
-            ASSERT_EQ(expected_field_value, iter->second) << key << " " << expected_field_name;
+            if (expected_field_name == PROPERTY_LRU_TIME) {
+                ASSERT_FALSE(iter->second.empty()) << key << " " << expected_field_name << " should not be empty";
+            } else {
+                ASSERT_EQ(expected_field_value, iter->second) << key << " " << expected_field_name;
+            }
         }
     }
 }

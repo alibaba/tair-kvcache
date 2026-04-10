@@ -87,7 +87,7 @@ void LRUHandleTable::Resize() {
 
     uint32_t old_length = uint32_t{1} << length_bits_;
     int new_length_bits = length_bits_ + 1;
-    std::unique_ptr<LRUHandle *[]> new_list{new LRUHandle *[size_t{1} << new_length_bits] {}};
+    std::unique_ptr<LRUHandle *[]> new_list { new LRUHandle *[size_t{1} << new_length_bits] {} };
     [[maybe_unused]] uint32_t count = 0;
     for (uint32_t i = 0; i < old_length; i++) {
         LRUHandle *h = list_[i];
@@ -225,6 +225,7 @@ double LRUCacheShard::GetLowPriPoolRatio() {
 void LRUCacheShard::LRU_Remove(LRUHandle *e) {
     assert(e->next != nullptr);
     assert(e->prev != nullptr);
+    bool was_tail = (lru_.next == e);
     if (lru_low_pri_ == e) {
         lru_low_pri_ = e->prev;
     }
@@ -244,11 +245,15 @@ void LRUCacheShard::LRU_Remove(LRUHandle *e) {
         assert(low_pri_pool_usage_ >= e->total_charge);
         low_pri_pool_usage_ -= e->total_charge;
     }
+    if (was_tail) {
+        NotifyTailChange();
+    }
 }
 
 void LRUCacheShard::LRU_Insert(LRUHandle *e) {
     assert(e->next == nullptr);
     assert(e->prev == nullptr);
+    LRUHandle *old_tail = lru_.next;
     if (high_pri_pool_ratio_ > 0 && (e->IsHighPri() || e->HasHit())) {
         // Inset "e" to head of LRU list.
         e->next = &lru_;
@@ -285,6 +290,9 @@ void LRUCacheShard::LRU_Insert(LRUHandle *e) {
         lru_bottom_pri_ = e;
     }
     lru_usage_ += e->total_charge;
+    if (lru_.next != old_tail) {
+        NotifyTailChange();
+    }
 }
 
 void LRUCacheShard::MaintainPoolSize() {
@@ -358,8 +366,8 @@ void LRUCacheShard::SetStrictCapacityLimit(bool strict_capacity_limit) {
     strict_capacity_limit_ = strict_capacity_limit;
 }
 
-ErrorCode LRUCacheShard::DoInsertItemUnsafe(LRUHandle *e, LRUHandle **handle,
-                                      autovector<LRUHandle *> *last_reference_list) {
+ErrorCode
+LRUCacheShard::DoInsertItemUnsafe(LRUHandle *e, LRUHandle **handle, autovector<LRUHandle *> *last_reference_list) {
     // Free the space following strict LRU policy until enough space
     // is freed or the lru list is empty.
     EvictFromLRU(e->total_charge, last_reference_list);
@@ -679,6 +687,28 @@ size_t LRUCacheShard::GetOldestKeys(size_t count, std::vector<std::string> &out_
     return collected;
 }
 
+void LRUCacheShard::SetTailChangeCallback(uint32_t shard_id, const Cache::TailChangeCallback &callback) {
+    std::lock_guard<std::mutex> l(mutex_);
+    shard_id_ = shard_id;
+    tail_change_callback_ = callback;
+    // Notify immediately with current tail state so the caller gets the
+    // initial value.
+    NotifyTailChange();
+}
+
+void LRUCacheShard::NotifyTailChange() {
+    if (!tail_change_callback_) {
+        return;
+    }
+    LRUHandle *tail = lru_.next;
+    if (tail == &lru_) {
+        // LRU list is empty.
+        tail_change_callback_(shard_id_, nullptr);
+    } else {
+        tail_change_callback_(shard_id_, tail->value);
+    }
+}
+
 void LRUCacheShard::AppendPrintableOptions(std::string &str) const {
     const int kBufferSize = 200;
     char buffer[kBufferSize];
@@ -739,14 +769,19 @@ size_t LRUCache::TEST_GetLRUSize() {
 
 double LRUCache::GetHighPriPoolRatio() { return GetShard(0).GetHighPriPoolRatio(); }
 
-size_t LRUCache::GetOldestKeysInShard(uint32_t shard_id,
-                                       size_t count,
-                                       std::vector<std::string> &out_keys) {
+size_t LRUCache::GetOldestKeysInShard(uint32_t shard_id, size_t count, std::vector<std::string> &out_keys) {
     uint32_t num_shards = GetNumShards();
     if (shard_id >= num_shards || count == 0) {
         return 0;
     }
     return GetShard(shard_id).GetOldestKeys(count, out_keys);
+}
+
+void LRUCache::SetTailChangeCallback(TailChangeCallback callback) {
+    uint32_t num_shards = GetNumShards();
+    for (uint32_t i = 0; i < num_shards; ++i) {
+        GetShard(i).SetTailChangeCallback(i, callback);
+    }
 }
 
 } // namespace lru_cache

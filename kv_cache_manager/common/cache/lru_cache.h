@@ -367,6 +367,10 @@ public: // other function definitions
     // Returns the number of keys actually collected.
     size_t GetOldestKeys(size_t count, std::vector<std::string> &out_keys);
 
+    // Set the shard id and tail-change callback for this shard.
+    // The callback is invoked inside the shard mutex whenever the LRU tail changes.
+    void SetTailChangeCallback(uint32_t shard_id, const Cache::TailChangeCallback &callback);
+
 private:
     friend class LRUCache;
     // Insert an item into the hash table and, if handle is null, insert into
@@ -468,6 +472,14 @@ private:
 
     // A reference to Cache::eviction_callback_
     const Cache::EvictionCallback &eviction_callback_;
+
+    // Tail-change notification support.
+    uint32_t shard_id_{0};
+    Cache::TailChangeCallback tail_change_callback_;
+
+    // Must be called while holding mutex_. Invokes tail_change_callback_ with
+    // the current tail value (nullptr if the LRU list is empty).
+    void NotifyTailChange();
 };
 
 class LRUCache
@@ -494,9 +506,10 @@ public:
     double GetHighPriPoolRatio();
 
     // Returns up to `count` oldest keys from the specified shard.
-    size_t GetOldestKeysInShard(uint32_t shard_id,
-                                size_t count,
-                                std::vector<std::string> &out_keys) override;
+    size_t GetOldestKeysInShard(uint32_t shard_id, size_t count, std::vector<std::string> &out_keys) override;
+
+    // Register a callback invoked whenever the LRU tail of any shard changes.
+    void SetTailChangeCallback(TailChangeCallback callback) override;
 };
 
 } // namespace lru_cache
