@@ -1,10 +1,4 @@
-load("//bazel:version.bzl", "version_info_cc")
-
 package(default_visibility = ["//visibility:public"])
-
-version_info_cc(
-    name = "build_version",
-)
 
 config_setting(
     name = "client_only_header",
@@ -28,7 +22,7 @@ cc_library(
         "-fcoroutines",
     ],
     deps = [
-        ":build_version",
+        "//kv_cache_manager/common:build_version",
         ":grpc_wrapper",
         "//kv_cache_manager/common",
         "//kv_cache_manager/common:loop_thread",

@@ -189,7 +189,7 @@ bazel build //path/to:my_package.dist
 | vllm connector | Python wheel + 日志 | `py_connector/common/_version_info.py`，启动时打印 |
 | client pybind | Python wheel | wheel 包版本号 |
 | optimizer pybind | Python wheel | wheel 包版本号 |
-| manager (C++) | C++ 二进制 | `service/build_version.h`，`./main -v` 输出 |
+| manager (C++) | C++ 二进制 | `common/build_version.h`，`./main -v` 输出 |
 
 ## 修改版本号
 

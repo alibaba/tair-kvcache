@@ -6,7 +6,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "kv_cache_manager/service/build_version.h"
+#include "kv_cache_manager/common/build_version.h"
 
 namespace kv_cache_manager {
 
