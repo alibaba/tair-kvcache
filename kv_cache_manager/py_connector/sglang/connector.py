@@ -454,8 +454,6 @@ class HiCacheKVCM(HiCacheStorage):
                 recv, src=0, group=self.storage_tp_group
             )
             result = recv[0]
-        if result is None:
-            return [False] * len_new
 
         logger.debug(f"start_write_cache {result=}")
 
@@ -657,12 +655,15 @@ class HiCacheKVCM(HiCacheStorage):
                     logger.warning(f"batch_set_v2: inconsistent block_mask from manager, "
                                    f"aborting write session {write_session_id}")
                     if self.tp_rank == 0:
-                        self._manager_client.finish_write_cache({
-                            "trace_id": finish_trace_id,
-                            "instance_id": self.instance_id,
-                            "write_session_id": write_session_id,
-                            "success_blocks": {"bool_masks": {"values": [False] * len(locations)}},
-                        })
+                        try:
+                            self._manager_client.finish_write_cache({
+                                "trace_id": finish_trace_id,
+                                "instance_id": self.instance_id,
+                                "write_session_id": write_session_id,
+                                "success_blocks": {"bool_masks": {"values": [False] * len(locations)}},
+                            })
+                        except Exception as e:
+                            logger.error(f"finish_write_cache failed: {e}")
                     results[transfer.name] = [False] * len(mamba_keys)
                     continue
 
@@ -671,34 +672,39 @@ class HiCacheKVCM(HiCacheStorage):
                 if unmatched == 0:
                     # All blocks already have Linear specs written
                     if self.tp_rank == 0:
-                        self._manager_client.finish_write_cache({
-                            "trace_id": finish_trace_id,
-                            "instance_id": self.instance_id,
-                            "write_session_id": write_session_id,
-                            "success_blocks": {"bool_masks": {"values": [False] * len(locations)}},
-                        })
+                        try:
+                            self._manager_client.finish_write_cache({
+                                "trace_id": finish_trace_id,
+                                "instance_id": self.instance_id,
+                                "write_session_id": write_session_id,
+                                "success_blocks": {"bool_masks": {"values": [False] * len(locations)}},
+                            })
+                        except Exception as e:
+                            logger.error(f"finish_write_cache failed: {e}")
                     results[transfer.name] = [True] * len(mamba_keys)
                     continue
 
                 assert len(save_indices) == len(locations)
 
-                # Prepare mamba buffers for blocks that need writing
+                # Extract linear spec URIs, skip missing ones (mirrors batch_get_v2)
                 host_indices_list = (
                     transfer.host_indices.tolist()
                     if transfer.host_indices is not None else []
                 )
-                matched_host = [host_indices_list[i] for i in save_indices]
+                mamba_uris = []
+                valid_indices = []
+                for i, loc in enumerate(locations):
+                    uri = self._extract_single_linear_uri(loc)
+                    if uri:
+                        mamba_uris.append(uri)
+                        valid_indices.append(i)
+
+                matched_host = [host_indices_list[i] for i in valid_indices]
                 indices_tensor = torch.tensor(matched_host)
                 ptr_list, size_list = mamba_pool.get_page_buffer_meta(indices_tensor)
                 mamba_buffers = self._prepare_mamba_buffers(
                     ptr_list, size_list, len(matched_host)
                 )
-
-                # Extract linear spec URIs and write
-                mamba_uris = [
-                    self._extract_single_linear_uri(loc)
-                    for loc in locations
-                ]
                 assert len(mamba_uris) == len(mamba_buffers)
                 start_time = time.perf_counter()
                 save_result = self.transfer_client.SaveKvCaches(mamba_uris, mamba_buffers)
@@ -722,12 +728,15 @@ class HiCacheKVCM(HiCacheStorage):
                 # Finish write cache
                 finish_mask = [flag] * len(locations)
                 if self.tp_rank == 0:
-                    self._manager_client.finish_write_cache({
-                        "trace_id": finish_trace_id,
-                        "instance_id": self.instance_id,
-                        "write_session_id": write_session_id,
-                        "success_blocks": {"bool_masks": {"values": finish_mask}},
-                    })
+                    try:
+                        self._manager_client.finish_write_cache({
+                            "trace_id": finish_trace_id,
+                            "instance_id": self.instance_id,
+                            "write_session_id": write_session_id,
+                            "success_blocks": {"bool_masks": {"values": finish_mask}},
+                        })
+                    except Exception as e:
+                        logger.error(f"finish_write_cache failed: {e}")
 
                 # Build per-key results: filtered blocks already existed (True),
                 # written blocks depend on write success
@@ -967,9 +976,15 @@ class HiCacheKVCM(HiCacheStorage):
         return buffers
 
     def _check_pool_spec_existence(self, locations, kv_hit_pages, transfer):
-        """Check how many pages have the extra pool's spec."""
+        """Check how many pages have the extra pool's spec.
+
+        Returns the number of contiguous prefix pages that satisfy
+        transfer.hit_policy.  Falls back to 0 for unknown policies so
+        a stale/future enum value never causes an UnboundLocalError crash.
+        """
         if not self.has_mamba:
             return kv_hit_pages
+
         spec_name = self.mamba_location_spec_name
 
         def has_spec(loc):
@@ -978,21 +993,27 @@ class HiCacheKVCM(HiCacheStorage):
             )
 
         if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
-            boundary = next(
+            # First gap in the prefix is the boundary.
+            return next(
                 (i for i in range(kv_hit_pages) if not has_spec(locations[i])),
                 kv_hit_pages,
             )
-        elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:  # TRAILING_PAGES
+
+        if transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
             trailing = max(1, len(transfer.keys) if transfer.keys else 1)
-            boundary = 0
             for prefix_len in range(kv_hit_pages, 0, -1):
                 if all(
                     has_spec(locations[i])
                     for i in range(max(0, prefix_len - trailing), prefix_len)
                 ):
-                    boundary = prefix_len
-                    break
-        return boundary
+                    return prefix_len
+            return 0
+
+        logger.warning(
+            "_check_pool_spec_existence: unknown PoolHitPolicy %r, defaulting to 0",
+            transfer.hit_policy,
+        )
+        return 0
 
     ##################################################
 
