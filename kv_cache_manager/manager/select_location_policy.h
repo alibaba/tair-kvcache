@@ -26,9 +26,9 @@ public:
     virtual bool ExistsForWrite(const CacheLocationMap &location_map,
                                 const std::vector<std::string> &requested_spec_names) const = 0;
 
-    // Returns true if candidate belongs to the same storage instance
+    // Returns true if candidate belongs to the same data storage
     // as reference (same type AND same hostname).
-    bool IsSameStorageInstance(const CacheLocation &candidate, const CacheLocation &reference) const;
+    bool IsSameDataStorage(const CacheLocation &candidate, const CacheLocation &reference) const;
 
     virtual ~SelectLocationPolicy() = default;
 };

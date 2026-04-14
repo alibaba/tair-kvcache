@@ -127,7 +127,7 @@ uint32_t NamedStorageWeightedSLPolicy::GetWeight(CacheLocationMap::const_referen
     return 0;
 }
 
-bool SelectLocationPolicy::IsSameStorageInstance(const CacheLocation &candidate, const CacheLocation &reference) const {
+bool SelectLocationPolicy::IsSameDataStorage(const CacheLocation &candidate, const CacheLocation &reference) const {
     if (candidate.type() != reference.type()) {
         return false;
     }

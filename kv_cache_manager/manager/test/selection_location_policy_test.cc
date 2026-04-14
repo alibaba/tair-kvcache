@@ -335,7 +335,7 @@ TEST_F(SelectLocationPolicyTest, TestNamedStorageWeightedExistsForWriteWithSpecN
     }
 }
 
-TEST_F(SelectLocationPolicyTest, TestIsSameStorageInstanceRejectsCrossType) {
+TEST_F(SelectLocationPolicyTest, TestIsSameDataStorageRejectsCrossType) {
     StaticWeightSLPolicy policy;
     // Same type, same host → true
     {
@@ -345,7 +345,7 @@ TEST_F(SelectLocationPolicyTest, TestIsSameStorageInstanceRejectsCrossType) {
         CacheLocation nfs_b;
         nfs_b.set_type(D_NFS);
         nfs_b.set_location_specs({LocationSpec("tp1", "nfs://host01/b/tp1")});
-        EXPECT_TRUE(policy.IsSameStorageInstance(nfs_a, nfs_b));
+        EXPECT_TRUE(policy.IsSameDataStorage(nfs_a, nfs_b));
     }
     // Different type (NFS vs Mooncake), same host → false
     {
@@ -355,7 +355,7 @@ TEST_F(SelectLocationPolicyTest, TestIsSameStorageInstanceRejectsCrossType) {
         CacheLocation mc_loc;
         mc_loc.set_type(D_MOONCAKE);
         mc_loc.set_location_specs({LocationSpec("tp0", "mooncake://host01/b/tp0")});
-        EXPECT_FALSE(policy.IsSameStorageInstance(nfs_loc, mc_loc));
+        EXPECT_FALSE(policy.IsSameDataStorage(nfs_loc, mc_loc));
     }
     // Same type, different host → false
     {
@@ -365,7 +365,7 @@ TEST_F(SelectLocationPolicyTest, TestIsSameStorageInstanceRejectsCrossType) {
         CacheLocation nfs_b;
         nfs_b.set_type(D_NFS);
         nfs_b.set_location_specs({LocationSpec("tp0", "nfs://host02/b/tp0")});
-        EXPECT_FALSE(policy.IsSameStorageInstance(nfs_a, nfs_b));
+        EXPECT_FALSE(policy.IsSameDataStorage(nfs_a, nfs_b));
     }
     // Both empty specs → true (vacuously same)
     {
@@ -373,7 +373,7 @@ TEST_F(SelectLocationPolicyTest, TestIsSameStorageInstanceRejectsCrossType) {
         empty_a.set_type(D_NFS);
         CacheLocation empty_b;
         empty_b.set_type(D_NFS);
-        EXPECT_TRUE(policy.IsSameStorageInstance(empty_a, empty_b));
+        EXPECT_TRUE(policy.IsSameDataStorage(empty_a, empty_b));
     }
     // One empty, one non-empty → false
     {
@@ -382,6 +382,6 @@ TEST_F(SelectLocationPolicyTest, TestIsSameStorageInstanceRejectsCrossType) {
         CacheLocation nfs_loc;
         nfs_loc.set_type(D_NFS);
         nfs_loc.set_location_specs({LocationSpec("tp0", "nfs://host01/a/tp0")});
-        EXPECT_FALSE(policy.IsSameStorageInstance(empty_loc, nfs_loc));
+        EXPECT_FALSE(policy.IsSameDataStorage(empty_loc, nfs_loc));
     }
 }

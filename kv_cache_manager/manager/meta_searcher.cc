@@ -64,7 +64,7 @@ CacheLocation SelectAndMergeForMatch(SelectLocationPolicy *policy,
     // storage backend as the winner, dedup by spec name.
     std::map<std::string, LocationSpec> merged_specs;
     for (auto &[id, loc] : valid_map) {
-        if (!policy->IsSameStorageInstance(loc, *winner)) {
+        if (!policy->IsSameDataStorage(loc, *winner)) {
             continue;
         }
         for (const auto &spec : loc.location_specs()) {
