@@ -82,14 +82,16 @@ TEST_F(SelectLocationPolicyTest, TestStaticWeightSLPolicyExistsForWrite) {
         auto location_map = GenLocationMap(
             {{CLS_SERVING, D_MEMPOOL, "pace_01"}, {CLS_SERVING, D_3FS, "3fs_01"}, {CLS_SERVING, D_NFS, "nfs_01"}});
         for (int i = 0; i < 100; ++i) {
-            ASSERT_TRUE(policy.ExistsForWrite(location_map));
+            std::vector<std::string> prune_loc_ids;
+            ASSERT_TRUE(policy.ExistsForWrite(location_map, nullptr, prune_loc_ids));
         }
     }
     {
         auto location_map = GenLocationMap(
             {{CLS_NOT_FOUND, D_MEMPOOL, "pace_01"}, {CLS_NOT_FOUND, D_3FS, "3fs_01"}, {CLS_SERVING, D_NFS, "nfs_01"}});
         for (int i = 0; i < 100; ++i) {
-            ASSERT_TRUE(policy.ExistsForWrite(location_map));
+            std::vector<std::string> prune_loc_ids;
+            ASSERT_TRUE(policy.ExistsForWrite(location_map, nullptr, prune_loc_ids));
         }
     }
     {
@@ -98,7 +100,8 @@ TEST_F(SelectLocationPolicyTest, TestStaticWeightSLPolicyExistsForWrite) {
                                             {CLS_NOT_FOUND, D_3FS, "3fs_02"},
                                             {CLS_NOT_FOUND, D_NFS, "nfs_01"}});
         for (int i = 0; i < 100; ++i) {
-            ASSERT_FALSE(policy.ExistsForWrite(location_map));
+            std::vector<std::string> prune_loc_ids;
+            ASSERT_FALSE(policy.ExistsForWrite(location_map, nullptr, prune_loc_ids));
         }
     }
 }
@@ -157,26 +160,30 @@ TEST_F(SelectLocationPolicyTest, TestDynamicWeightSLPolicyExistsForWrite) {
         auto location_map = GenLocationMap(
             {{CLS_SERVING, D_MEMPOOL, "pace_01"}, {CLS_SERVING, D_3FS, "3fs_01"}, {CLS_SERVING, D_NFS, "nfs_01"}});
         for (int i = 0; i < 100; ++i) {
-            ASSERT_TRUE(policy.ExistsForWrite(location_map));
+            std::vector<std::string> prune_loc_ids;
+            ASSERT_TRUE(policy.ExistsForWrite(location_map, nullptr, prune_loc_ids));
         }
     }
     {
         auto location_map = GenLocationMap({{CLS_SERVING, D_NFS, "nfs_01"}});
         for (int i = 0; i < 100; ++i) {
-            ASSERT_FALSE(policy.ExistsForWrite(location_map));
+            std::vector<std::string> prune_loc_ids;
+            ASSERT_FALSE(policy.ExistsForWrite(location_map, nullptr, prune_loc_ids));
         }
     }
     {
         auto location_map = GenLocationMap({{CLS_SERVING, D_NFS, "nfs_01"}, {CLS_SERVING, D_NFS, "nfs_02"}});
         for (int i = 0; i < 100; ++i) {
-            ASSERT_FALSE(policy.ExistsForWrite(location_map));
+            std::vector<std::string> prune_loc_ids;
+            ASSERT_FALSE(policy.ExistsForWrite(location_map, nullptr, prune_loc_ids));
         }
     }
     {
         auto location_map = GenLocationMap(
             {{CLS_SERVING, D_3FS, "3fs_01"}, {CLS_SERVING, D_NFS, "nfs_01"}, {CLS_SERVING, D_NFS, "nfs_02"}});
         for (int i = 0; i < 100; ++i) {
-            ASSERT_TRUE(policy.ExistsForWrite(location_map));
+            std::vector<std::string> prune_loc_ids;
+            ASSERT_TRUE(policy.ExistsForWrite(location_map, nullptr, prune_loc_ids));
         }
     }
 }
@@ -221,26 +228,30 @@ TEST_F(SelectLocationPolicyTest, TestNamedStorageWeightedSLPolicyExistsForWrite)
         auto location_map = GenLocationMap(
             {{CLS_SERVING, D_MEMPOOL, "pace_01"}, {CLS_SERVING, D_3FS, "3fs_01"}, {CLS_SERVING, D_NFS, "nfs_01"}});
         for (int i = 0; i < 100; ++i) {
-            ASSERT_TRUE(policy.ExistsForWrite(location_map));
+            std::vector<std::string> prune_loc_ids;
+            ASSERT_TRUE(policy.ExistsForWrite(location_map, nullptr, prune_loc_ids));
         }
     }
     {
         auto location_map = GenLocationMap({{CLS_WRITING, D_MEMPOOL, "pace_01"}});
         for (int i = 0; i < 100; ++i) {
-            ASSERT_FALSE(policy.ExistsForWrite(location_map));
+            std::vector<std::string> prune_loc_ids;
+            ASSERT_FALSE(policy.ExistsForWrite(location_map, nullptr, prune_loc_ids));
         }
     }
     {
         auto location_map = GenLocationMap({{CLS_WRITING, D_MEMPOOL, "pace_01"}, {CLS_SERVING, D_3FS, "3fs_02"}});
         for (int i = 0; i < 100; ++i) {
-            ASSERT_FALSE(policy.ExistsForWrite(location_map));
+            std::vector<std::string> prune_loc_ids;
+            ASSERT_FALSE(policy.ExistsForWrite(location_map, nullptr, prune_loc_ids));
         }
     }
     {
         auto location_map = GenLocationMap(
             {{CLS_WRITING, D_MEMPOOL, "pace_01"}, {CLS_SERVING, D_3FS, "3fs_02"}, {CLS_SERVING, D_3FS, "3fs_01"}});
         for (int i = 0; i < 100; ++i) {
-            ASSERT_TRUE(policy.ExistsForWrite(location_map));
+            std::vector<std::string> prune_loc_ids;
+            ASSERT_TRUE(policy.ExistsForWrite(location_map, nullptr, prune_loc_ids));
         }
     }
 }
