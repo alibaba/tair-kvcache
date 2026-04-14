@@ -12,8 +12,8 @@ import torch.multiprocessing as mp
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
-    get_hash_str,
 )
+from sglang.srt.mem_cache.utils import get_hash_str
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.mem_cache.memory_pool_host import MHATokenToKVPoolHost
 from sglang.srt.distributed import (
@@ -125,6 +125,8 @@ def test():
         tp_size=1,
         pp_rank=0,
         pp_size=1,
+        attn_cp_rank=0,
+        attn_cp_size=1,
         is_mla_model=False,
         enable_storage_metrics=False,
         is_page_first_layout=True,
@@ -484,6 +486,8 @@ def _multi_rank_worker(rank, world_size, init_port):
         tp_size=world_size,
         pp_rank=0,
         pp_size=1,
+        attn_cp_rank=0,
+        attn_cp_size=1,
         is_mla_model=False,
         enable_storage_metrics=False,
         is_page_first_layout=True,

@@ -19,8 +19,8 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     PoolHitPolicy,
-    get_hash_str,
 )
+from sglang.srt.mem_cache.utils import get_hash_str
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MambaPool
 from sglang.srt.mem_cache.memory_pool_host import MHATokenToKVPoolHost, MambaPoolHost
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
@@ -146,6 +146,7 @@ def _create_pools():
         size=mamba_num_pages,
         spec_state_size=0,
         cache_params=mamba_cache_params,
+        mamba_layer_ids=mamba_layers,
         device=device,
     )
     mamba_pool = MambaPoolHost(
@@ -191,6 +192,8 @@ def _create_hybrid_backend(kv_pool_host, mamba_pool, instance_id, num_blocks=10)
         tp_size=1,
         pp_rank=0,
         pp_size=1,
+        attn_cp_rank=0,
+        attn_cp_size=1,
         is_mla_model=False,
         enable_storage_metrics=False,
         is_page_first_layout=True,
