@@ -32,5 +32,6 @@ private:
 #elif defined(USING_MUSA)
     musaStream_t musa_stream_ = nullptr;
 #endif
+    bool support_register_readonly_ = true;
 };
 } // namespace kv_cache_manager
