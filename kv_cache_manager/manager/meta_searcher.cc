@@ -119,33 +119,23 @@ ErrorCode MetaSearcher::PrefixMatchBestLocationImpl(RequestContext *request_cont
     if (!prune_keys.empty()) {
         for (; i != keys.size(); ++i) {
             if (result.error_codes[i] != ErrorCode::EC_OK) {
-                break;
+                continue;
             }
-
             int64_t begin_deserialize_time = TimestampUtil::GetCurrentTimeUs();
             BlockCacheLocationsMeta meta;
             if (!meta.FromJsonString(uris[i])) {
-                break;
+                continue;
             }
             index_deserialize_time_us += (TimestampUtil::GetCurrentTimeUs() - begin_deserialize_time);
-
             auto &location_map = meta.location_map();
             if (location_map.empty()) {
-                break;
+                continue;
             }
-
             std::vector<std::string> prune_loc_ids;
-            const CacheLocation *best_location =
-                policy->SelectForMatch(location_map, check_loc_data_exist_func_, prune_loc_ids);
+            policy->SelectForMatch(location_map, check_loc_data_exist_func_, prune_loc_ids);
             if (!prune_loc_ids.empty()) {
                 prune_keys.emplace_back(keys[i]);
                 prune_loc_ids_vec.emplace_back(prune_loc_ids);
-                if (best_location == nullptr) {
-                    continue;
-                }
-            }
-            if (best_location == nullptr) {
-                break;
             }
         }
     }
