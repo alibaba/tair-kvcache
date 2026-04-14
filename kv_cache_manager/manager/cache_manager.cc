@@ -379,8 +379,9 @@ CacheManager::GetCacheLocation(RequestContext *request_context,
     cache_get_event->SetEventTriggerTime();
     cache_get_event->SetAddtionalArgs(
         QueryTypeToString(query_type), query_keys, tokens, block_mask, sw_size, location_spec_names);
-    if (event_manager_)
+    if (event_manager_) {
         event_manager_->Publish(cache_get_event);
+    }
     return {ec, CacheLocationViewVecWrapper(std::move(cache_locations))};
 }
 
@@ -440,8 +441,9 @@ std::pair<ErrorCode, int64_t> CacheManager::GetCacheLocationLen(RequestContext *
     auto cache_get_event = std::make_shared<CacheGetEvent>(instance_id);
     cache_get_event->SetEventTriggerTime();
     cache_get_event->SetAddtionalArgs(QueryTypeToString(query_type), query_keys, tokens, BlockMask(), sw_size, {});
-    if (event_manager_)
+    if (event_manager_) {
         event_manager_->Publish(cache_get_event);
+    }
     return {ec, cache_location_len};
 }
 
@@ -474,8 +476,9 @@ CacheManager::StartWriteCache(RequestContext *request_context,
             // so only the first insertion triggers the actual lower_bound lookup.
             std::set<std::string_view> checked;
             for (const auto &group_name : location_spec_group_names) {
-                if (group_name.empty() || !checked.insert(group_name).second)
+                if (group_name.empty() || !checked.insert(group_name).second) {
                     continue;
+                }
                 auto it = std::lower_bound(
                     groups.begin(),
                     groups.end(),
@@ -567,8 +570,9 @@ CacheManager::StartWriteCache(RequestContext *request_context,
     start_write_event->SetEventTriggerTime();
     start_write_event->SetAddtionalArgs(
         write_session_id, query_keys, tokens, block_mask, location_spec_group_names, write_timeout_seconds);
-    if (event_manager_)
+    if (event_manager_) {
         event_manager_->Publish(start_write_event);
+    }
     return {EC_OK,
             StartWriteCacheInfo(std::move(write_session_id),
                                 std::move(block_mask),
@@ -644,8 +648,9 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
     auto finish_write_event = std::make_shared<FinishWriteCacheEvent>(instance_id);
     finish_write_event->SetEventTriggerTime();
     finish_write_event->SetAddtionalArgs(write_session_id, success_block_mask);
-    if (event_manager_)
+    if (event_manager_) {
         event_manager_->Publish(finish_write_event);
+    }
     return ec;
 }
 

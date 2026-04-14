@@ -39,37 +39,42 @@ CacheLocation SelectAndMergeForMatch(SelectLocationPolicy *policy,
     // Filter valid locations into a shared map.
     CacheLocationMap valid_map;
     for (auto &[id, loc] : location_map) {
-        if (loc.status() != CacheLocationStatus::CLS_SERVING)
+        if (loc.status() != CacheLocationStatus::CLS_SERVING) {
             continue;
+        }
         if (check_loc_data_exist && !check_loc_data_exist(loc)) {
             out_prune_loc_ids.push_back(id);
             continue;
         }
         valid_map.try_emplace(id, loc);
     }
-    if (valid_map.empty())
+    if (valid_map.empty()) {
         return {};
+    }
 
     // Use the policy to select one winning location, which determines the
     // target storage backend instance.
     std::vector<std::string> unused_prune_ids;
     CacheLocation *winner = policy->SelectForMatch(valid_map, nullptr, unused_prune_ids);
-    if (!winner || winner->location_specs().empty())
+    if (!winner || winner->location_specs().empty()) {
         return {};
+    }
 
     // Collect all specs from every valid location that belongs to the same
     // storage backend as the winner, dedup by spec name.
     std::map<std::string, LocationSpec> merged_specs;
     for (auto &[id, loc] : valid_map) {
-        if (!policy->IsSameStorageInstance(loc, *winner))
+        if (!policy->IsSameStorageInstance(loc, *winner)) {
             continue;
+        }
         for (const auto &spec : loc.location_specs()) {
             merged_specs.try_emplace(spec.name(), spec);
         }
     }
 
-    if (merged_specs.empty())
+    if (merged_specs.empty()) {
         return {};
+    }
 
     CacheLocation result;
     result.set_status(CacheLocationStatus::CLS_SERVING);

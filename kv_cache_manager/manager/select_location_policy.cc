@@ -89,18 +89,21 @@ bool WeightSLPolicy::ExistsForWrite(const CacheLocationMap &location_map,
     // Use linear search on location_specs (typically 2-4 elements) instead of
     // building a hash set — avoids heap allocation and string copies.
     for (auto &kv : location_map) {
-        if (kv.second.status() == CacheLocationStatus::CLS_NOT_FOUND)
+        if (kv.second.status() == CacheLocationStatus::CLS_NOT_FOUND) {
             continue;
-        if (GetWeight(kv) <= 0)
+        }
+        if (GetWeight(kv) <= 0) {
             continue;
+        }
         const auto &loc_specs = kv.second.location_specs();
         bool covers_all = std::all_of(
             requested_spec_names.begin(), requested_spec_names.end(), [&loc_specs](const std::string &name) {
                 return std::any_of(
                     loc_specs.begin(), loc_specs.end(), [&name](const auto &spec) { return spec.name() == name; });
             });
-        if (covers_all)
+        if (covers_all) {
             return true;
+        }
     }
     return false;
 }
@@ -125,10 +128,12 @@ uint32_t NamedStorageWeightedSLPolicy::GetWeight(CacheLocationMap::const_referen
 }
 
 bool SelectLocationPolicy::IsSameStorageInstance(const CacheLocation &candidate, const CacheLocation &reference) const {
-    if (candidate.type() != reference.type())
+    if (candidate.type() != reference.type()) {
         return false;
-    if (candidate.location_specs().empty() || reference.location_specs().empty())
+    }
+    if (candidate.location_specs().empty() || reference.location_specs().empty()) {
         return candidate.location_specs().empty() == reference.location_specs().empty();
+    }
     return ExtractHostName(candidate.location_specs().front().uri()) ==
            ExtractHostName(reference.location_specs().front().uri());
 }
