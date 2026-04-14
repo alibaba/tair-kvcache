@@ -113,37 +113,30 @@ ErrorCode MetaSearcher::PrefixMatchBestLocationImpl(RequestContext *request_cont
             break;
         }
 
-        bool no_loc_by_prune = false;
         std::vector<std::string> prune_loc_ids;
         const CacheLocation *best_location =
             policy->SelectForMatch(location_map, check_loc_data_exist_func_, prune_loc_ids);
         if (!prune_loc_ids.empty()) {
             prune_keys.emplace_back(keys[i]);
             prune_loc_ids_vec.emplace_back(prune_loc_ids);
-            if (best_location == nullptr) {
-                // no location of this key can be found
-                // because of potential location prune
-                no_loc_by_prune = true;
-            }
         }
 
-        if (!fin_by_prune) {
-            if (best_location == nullptr) {
+        if (best_location == nullptr) {
+            if (!fin_by_prune) {
                 KVCM_LOG_DEBUG("prefix match end because keys[%lu] no serving location", i);
-                if (no_loc_by_prune) {
+            }
+            if (!prune_loc_ids.empty()) {
+                // no location of this key can be found
+                // because of potential location prune
+                if (!fin_by_prune) {
                     fin_by_prune = true;
-                    continue;
                 }
-                break;
+                continue;
             }
+            break;
+        }
+        if (!fin_by_prune) {
             out_locations.push_back(*best_location);
-        } else {
-            if (best_location == nullptr) {
-                if (no_loc_by_prune) {
-                    continue;
-                }
-                break;
-            }
         }
     }
 
