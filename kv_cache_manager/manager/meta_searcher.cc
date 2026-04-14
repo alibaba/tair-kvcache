@@ -80,39 +80,28 @@ ErrorCode MetaSearcher::PrefixMatchBestLocationImpl(RequestContext *request_cont
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerGet);
     int64_t index_deserialize_time_us = 0;
 
-    // flag to mark an early semantic finish of matching caused by
-    // location prune
-    bool fin_by_prune = false;
-
     KeyVector prune_keys;
     std::vector<std::vector<std::string>> prune_loc_ids_vec;
-    for (size_t i = 0; i < keys.size(); ++i) {
+    std::size_t i = 0;
+    for (; i != keys.size(); ++i) {
         if (result.error_codes[i] != ErrorCode::EC_OK) {
-            if (!fin_by_prune) {
-                KVCM_LOG_DEBUG(
-                    "prefix match end because Get keys[%lu](%lu) return %d", i, keys[i], result.error_codes[i]);
-            }
+            KVCM_LOG_DEBUG("prefix match end because Get keys[%lu](%lu) return %d", i, keys[i], result.error_codes[i]);
             break;
         }
 
         int64_t begin_deserialize_time = TimestampUtil::GetCurrentTimeUs();
         BlockCacheLocationsMeta meta;
         if (!meta.FromJsonString(uris[i])) {
-            if (!fin_by_prune) {
-                KVCM_LOG_WARN("location json parse failed, key[%lu](%lu), content: %s", i, keys[i], uris[i].c_str());
-            }
+            KVCM_LOG_WARN("location json parse failed, key[%lu](%lu), content: %s", i, keys[i], uris[i].c_str());
             break;
         }
         index_deserialize_time_us += (TimestampUtil::GetCurrentTimeUs() - begin_deserialize_time);
 
         auto &location_map = meta.location_map();
         if (location_map.empty()) {
-            if (!fin_by_prune) {
-                KVCM_LOG_DEBUG("prefix match end because keys[%lu](%lu) no location", i, keys[i]);
-            }
+            KVCM_LOG_DEBUG("prefix match end because keys[%lu](%lu) no location", i, keys[i]);
             break;
         }
-
         std::vector<std::string> prune_loc_ids;
         const CacheLocation *best_location =
             policy->SelectForMatch(location_map, check_loc_data_exist_func_, prune_loc_ids);
@@ -120,23 +109,44 @@ ErrorCode MetaSearcher::PrefixMatchBestLocationImpl(RequestContext *request_cont
             prune_keys.emplace_back(keys[i]);
             prune_loc_ids_vec.emplace_back(prune_loc_ids);
         }
-
         if (best_location == nullptr) {
-            if (!fin_by_prune) {
-                KVCM_LOG_DEBUG("prefix match end because keys[%lu] no serving location", i);
-            }
-            if (!prune_loc_ids.empty()) {
-                // no location of this key can be found
-                // because of potential location prune
-                if (!fin_by_prune) {
-                    fin_by_prune = true;
-                }
-                continue;
-            }
+            KVCM_LOG_DEBUG("prefix match end because keys[%lu] no serving location", i);
             break;
         }
-        if (!fin_by_prune) {
-            out_locations.push_back(*best_location);
+        out_locations.push_back(*best_location);
+    }
+
+    if (!prune_keys.empty()) {
+        for (; i != keys.size(); ++i) {
+            if (result.error_codes[i] != ErrorCode::EC_OK) {
+                break;
+            }
+
+            int64_t begin_deserialize_time = TimestampUtil::GetCurrentTimeUs();
+            BlockCacheLocationsMeta meta;
+            if (!meta.FromJsonString(uris[i])) {
+                break;
+            }
+            index_deserialize_time_us += (TimestampUtil::GetCurrentTimeUs() - begin_deserialize_time);
+
+            auto &location_map = meta.location_map();
+            if (location_map.empty()) {
+                break;
+            }
+
+            std::vector<std::string> prune_loc_ids;
+            const CacheLocation *best_location =
+                policy->SelectForMatch(location_map, check_loc_data_exist_func_, prune_loc_ids);
+            if (!prune_loc_ids.empty()) {
+                prune_keys.emplace_back(keys[i]);
+                prune_loc_ids_vec.emplace_back(prune_loc_ids);
+                if (best_location == nullptr) {
+                    continue;
+                }
+            }
+            if (best_location == nullptr) {
+                break;
+            }
         }
     }
 
