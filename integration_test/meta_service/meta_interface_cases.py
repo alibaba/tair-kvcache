@@ -581,3 +581,397 @@ class MetaServiceTestBase(abc.ABC, TestBase, unittest.TestCase):
         self.assertIn("self_node_id", resp)
         self.assertIn("leader_node_id", resp)
         self.assertEqual(resp["self_node_id"], resp["leader_node_id"])
+
+    def _admin_api_post(self, endpoint, data):
+        """Helper: POST to the admin HTTP API and return the
+        parsed JSON response.  Asserts HTTP 200 and status OK.
+        Uses urllib so that no extra pip dependency is required."""
+        import urllib.request
+        admin_http_port = (
+            self.worker_manager.get_worker(0).env.admin_http_port
+        )
+        url = f"http://localhost:{admin_http_port}{endpoint}"
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(data).encode("utf-8"),
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req) as resp:
+            self.assertEqual(resp.status, 200,
+                             f"{endpoint} HTTP {resp.status}")
+            body = json.loads(resp.read())
+        self.assertEqual(
+            body["header"]["status"]["code"], "OK",
+            f"{endpoint} failed: {body['header']['status']}")
+        return body
+
+    def _setup_hf3fs_instance(self, storage_name, ig_name, instance_id):
+        """Set up an HF3FS storage backend with
+        touch_file_when_create, an instance group that uses it,
+        and a registered inference instance.  Returns the
+        mountpoint path."""
+        import os
+
+        hf3fs_mountpoint = os.path.join(self.workdir,
+                                        f"hf3fs_{storage_name}")
+        os.makedirs(hf3fs_mountpoint, exist_ok=True)
+
+        self._admin_api_post("/api/addStorage", {
+            "trace_id": self._trace_id,
+            "storage": {
+                "global_unique_name": storage_name,
+                "threefs": {
+                    "mountpoint": hf3fs_mountpoint,
+                    "root_dir": "data/",
+                    "key_count_per_file": 1,
+                    "touch_file_when_create": True,
+                },
+            },
+        })
+
+        self._admin_api_post("/api/createInstanceGroup", {
+            "trace_id": self._trace_id,
+            "instance_group": {
+                "name": ig_name,
+                "storage_candidates": [storage_name],
+                "global_quota_group_name": "default_quota_group",
+                "max_instance_count": 100,
+                "quota": {
+                    "capacity": 30000000000,
+                    "quota_config": [
+                        # ST_3FS = 1
+                        {"storage_type": 1, "capacity": 30000000000},
+                    ],
+                },
+                "cache_config": {
+                    "reclaim_strategy": {
+                        "storage_unique_name": storage_name,
+                        "reclaim_policy": 1,
+                        "trigger_strategy": {
+                            "used_percentage": 0.9,
+                        },
+                        "delay_before_delete_ms": 0,
+                    },
+                    # CPS_ALWAYS_3FS = 1
+                    "data_storage_strategy": 1,
+                    "meta_indexer_config": {
+                        "max_key_count": 1000000,
+                        "mutex_shard_num": 16,
+                        "meta_storage_backend_config": {
+                            "storage_type": "local",
+                            "storage_uri": "",
+                        },
+                        "meta_cache_policy_config": {
+                            "type": "LRU",
+                            "capacity": 10000,
+                        },
+                    },
+                },
+                "version": 1,
+            },
+        })
+
+        self._client.register_instance({
+            "trace_id": self._trace_id,
+            "instance_group": ig_name,
+            "instance_id": instance_id,
+            "block_size": 128,
+            "model_deployment": self._get_test_model_deployment(),
+            "location_spec_infos": [
+                {"name": "tp0", "size": 1024},
+            ],
+        })
+
+        return hf3fs_mountpoint
+
+    def _write_blocks(self, instance_id, block_keys, token_ids):
+        """Write a sequence of cache blocks and finish the write
+        session.  Returns the list of allocated locations."""
+        resp = self._client.start_write_cache({
+            "trace_id": self._trace_id,
+            "instance_id": instance_id,
+            "block_keys": block_keys,
+            "token_ids": token_ids,
+            "write_timeout_seconds": 30,
+        })
+        write_session_id = resp["write_session_id"]
+        locations = resp["locations"]
+        self._client.finish_write_cache({
+            "trace_id": self._trace_id,
+            "instance_id": instance_id,
+            "write_session_id": write_session_id,
+            "success_blocks": {
+                "bool_masks": {"values": [True] * len(locations)},
+            },
+        })
+        return locations
+
+    def _delete_location_files(self, locations, indices):
+        """Delete the backing data files for the given location
+        indices.  Asserts each file exists before removal."""
+        import os
+        from urllib.parse import urlparse
+
+        for i in indices:
+            loc = locations[i]
+            for spec in loc.get("location_specs", []):
+                file_path = urlparse(spec["uri"]).path
+                self.assertTrue(
+                    os.path.exists(file_path),
+                    f"Data file should exist before deletion: "
+                    f"{file_path}")
+                os.remove(file_path)
+
+    def _prefix_query(self, instance_id, block_keys):
+        """Issue a prefix-match query and return the response."""
+        return self._client.get_cache_location({
+            "trace_id": self._trace_id,
+            "query_type": "QT_PREFIX_MATCH",
+            "block_keys": block_keys,
+            "instance_id": instance_id,
+            "block_mask": {"offset": 0},
+        })
+
+    def test_aggressive_location_prune(self):
+        """Verify aggressive prune on a contiguous suffix.
+
+        When the underlying data for some cache blocks becomes
+        unavailable (MightExist() returns false), the aggressive prune
+        policy should clean ALL invalid locations in a single query or
+        write pass -- rather than only pruning the first invalid one and
+        requiring O(N) round-trips.
+
+        Scenario (prefix = A B C D E, data for B C D E lost):
+        1. Write A B C D E, confirm all 5 queryable.
+        2. Delete the data files backing B C D E.
+        3. Prefix-match query returns only [A].
+           (aggressive: B C D E pruned in one pass)
+        4. Re-write succeeds for all of B C D E in one pass.
+        5. Prefix-match query returns [A B C D E] again.
+
+        Uses HF3FS backend with touch_file_when_create enabled so that
+        MightExist() can detect data loss via filesystem stat().
+        """
+        import time
+
+        storage_name = "hf3fs_prune_test"
+        ig_name = "prune_test_group"
+        instance_id = "prune_test_instance"
+        self._setup_hf3fs_instance(storage_name, ig_name, instance_id)
+
+        # ---------- step 1: write blocks A B C D E --------------------
+        block_keys = [100, 101, 102, 103, 104]
+        token_ids = [200, 201, 202, 203, 204]
+        first_locations = self._write_blocks(instance_id, block_keys, token_ids)
+        self.assertEqual(
+            len(first_locations), 5,
+            "initial write should allocate 5 locations")
+
+        resp = self._prefix_query(instance_id, block_keys)
+        self.assertEqual(
+            len(resp["locations"]), 5,
+            "all 5 blocks should be queryable after initial write")
+
+        # ---------- step 2: simulate data loss for B C D E ------------
+        self._delete_location_files(first_locations, range(1, 5))
+
+        # ---------- step 3: prefix-match query (aggressive prune) -----
+        resp = self._prefix_query(instance_id, block_keys)
+        self.assertEqual(
+            len(resp["locations"]), 1,
+            "only block A should be returned after data loss; "
+            f"got {len(resp['locations'])} locations")
+
+        # --------- step 4: wait for the async metadata prune ----------
+        time.sleep(2)
+
+        # --------- step 5: re-write the full chain --------------------
+        # block A still valid (offset 1); B C D E need writing
+        resp = self._client.start_write_cache({
+            "trace_id": self._trace_id,
+            "instance_id": instance_id,
+            "block_keys": block_keys,
+            "token_ids": token_ids,
+            "write_timeout_seconds": 30,
+        })
+        write_session_id = resp["write_session_id"]
+        rewrite_locations = resp["locations"]
+        self.assertEqual(
+            len(rewrite_locations), 4,
+            "re-write should allocate 4 locations for B C D E; "
+            f"got {len(rewrite_locations)}")
+
+        self._client.finish_write_cache({
+            "trace_id": self._trace_id,
+            "instance_id": instance_id,
+            "write_session_id": write_session_id,
+            "success_blocks": {
+                "bool_masks": {"values": [True] * 4},
+            },
+        })
+
+        # --------- step 6: verify full recovery -----------------------
+        resp = self._prefix_query(instance_id, block_keys)
+        self.assertEqual(
+            len(resp["locations"]), 5,
+            "all 5 blocks should be queryable after re-write")
+
+    def test_aggressive_prune_non_contiguous(self):
+        """Verify aggressive prune with non-contiguous data loss.
+
+        When stale blocks are interleaved with valid ones (e.g., B and D
+        lost while A, C, E intact), the write path should produce a
+        BlockMaskVector (non-contiguous bitmap) rather than a simple
+        BlockMaskOffset, and allocate locations only for the stale blocks.
+
+        Scenario (prefix = A B C D E, data for B and D lost):
+        1. Write A B C D E, confirm all 5 queryable.
+        2. Delete the data files backing B and D only.
+        3. Prefix-match query returns only [A] (prefix truncated
+           at the first stale block).
+        4. Re-write allocates exactly 2 locations (for B and D).
+        5. Prefix-match query returns [A B C D E] again.
+        """
+        import time
+
+        storage_name = "hf3fs_noncontig_test"
+        ig_name = "noncontig_test_group"
+        instance_id = "noncontig_test_instance"
+        self._setup_hf3fs_instance(storage_name, ig_name, instance_id)
+
+        # ---------- step 1: write blocks A B C D E --------------------
+        block_keys = [200, 201, 202, 203, 204]
+        token_ids = [300, 301, 302, 303, 304]
+        first_locations = self._write_blocks(
+            instance_id, block_keys, token_ids)
+        self.assertEqual(
+            len(first_locations), 5,
+            "initial write should allocate 5 locations")
+
+        resp = self._prefix_query(instance_id, block_keys)
+        self.assertEqual(
+            len(resp["locations"]), 5,
+            "all 5 blocks should be queryable after initial write")
+
+        # ---------- step 2: delete data for B (idx 1) and D (idx 3) ---
+        self._delete_location_files(first_locations, [1, 3])
+
+        # ---------- step 3: prefix-match query ------------------------
+        # prefix truncated at the first hole (B), so only [A]
+        resp = self._prefix_query(instance_id, block_keys)
+        self.assertEqual(
+            len(resp["locations"]), 1,
+            "only block A should be returned; "
+            f"got {len(resp['locations'])} locations")
+
+        # --------- step 4: wait for the async metadata prune ----------
+        time.sleep(2)
+
+        # --------- step 5: re-write -----------------------------------
+        # A, C, E still valid; B and D need writing (2 locations)
+        resp = self._client.start_write_cache({
+            "trace_id": self._trace_id,
+            "instance_id": instance_id,
+            "block_keys": block_keys,
+            "token_ids": token_ids,
+            "write_timeout_seconds": 30,
+        })
+        write_session_id = resp["write_session_id"]
+        rewrite_locations = resp["locations"]
+        self.assertEqual(
+            len(rewrite_locations), 2,
+            "re-write should allocate 2 locations for B and D; "
+            f"got {len(rewrite_locations)}")
+
+        self._client.finish_write_cache({
+            "trace_id": self._trace_id,
+            "instance_id": instance_id,
+            "write_session_id": write_session_id,
+            "success_blocks": {
+                "bool_masks": {"values": [True] * 2},
+            },
+        })
+
+        # --------- step 6: verify full recovery -----------------------
+        resp = self._prefix_query(instance_id, block_keys)
+        self.assertEqual(
+            len(resp["locations"]), 5,
+            "all 5 blocks should be queryable after re-write")
+
+    def test_aggressive_prune_all_stale(self):
+        """Verify aggressive prune when all blocks are stale.
+
+        Scenario (prefix = A B C, all data lost):
+        1. Write A B C, confirm all 3 queryable.
+        2. Delete data files for all 3 blocks.
+        3. Prefix-match query returns empty result.
+        4. Re-write allocates 3 fresh locations.
+        5. Prefix-match query returns [A B C] again.
+        """
+        import time
+
+        storage_name = "hf3fs_allstale_test"
+        ig_name = "allstale_test_group"
+        instance_id = "allstale_test_instance"
+        self._setup_hf3fs_instance(storage_name, ig_name, instance_id)
+
+        # --------- step 1: write blocks A B C -------------------------
+        block_keys = [300, 301, 302]
+        token_ids = [400, 401, 402]
+        first_locations = self._write_blocks(
+            instance_id, block_keys, token_ids)
+        self.assertEqual(
+            len(first_locations), 3,
+            "initial write should allocate 3 locations")
+
+        resp = self._prefix_query(instance_id, block_keys)
+        self.assertEqual(
+            len(resp["locations"]), 3,
+            "all 3 blocks should be queryable after initial write")
+
+        # --------- step 2: delete all data files ----------------------
+        self._delete_location_files(first_locations, range(0, 3))
+
+        # --------- step 3: prefix-match query -------------------------
+        resp = self._prefix_query(instance_id, block_keys)
+        self.assertEqual(
+            len(resp["locations"]), 0,
+            "no blocks should be returned when all data is lost; "
+            f"got {len(resp['locations'])} locations")
+
+        # --------- step 4: wait for async metadata prune --------------
+        time.sleep(2)
+
+        # --------- step 5: re-write all blocks ------------------------
+        resp = self._client.start_write_cache({
+            "trace_id": self._trace_id,
+            "instance_id": instance_id,
+            "block_keys": block_keys,
+            "token_ids": token_ids,
+            "write_timeout_seconds": 30,
+        })
+        write_session_id = resp["write_session_id"]
+        rewrite_locations = resp["locations"]
+        self.assertEqual(
+            len(rewrite_locations), 3,
+            "re-write should allocate 3 locations; "
+            f"got {len(rewrite_locations)}")
+
+        self._client.finish_write_cache({
+            "trace_id": self._trace_id,
+            "instance_id": instance_id,
+            "write_session_id": write_session_id,
+            "success_blocks": {
+                "bool_masks": {"values": [True] * 3},
+            },
+        })
+
+        # --------- step 6: verify full recovery -----------------------
+        resp = self._prefix_query(instance_id, block_keys)
+        self.assertEqual(
+            len(resp["locations"]), 3,
+            "all 3 blocks should be queryable after re-write")
