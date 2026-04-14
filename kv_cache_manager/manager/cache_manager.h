@@ -29,6 +29,10 @@ class EventManager;
 class CacheManagerMetricsRecorder;
 constexpr unsigned int DEFAULT_SCHEDULE_PLAN_EXECUTOR_THREAD_COUNT = 2;
 
+using CheckLocDataExistFunc = std::function<bool(const CacheLocation &loc)>;
+using SubmitDelReqFunc = std::function<void(const std::vector<std::int64_t> &blk_keys,
+                                            const std::vector<std::vector<std::string>> &loc_ids)>;
+
 class CacheManager {
     // TODO should not public
 public:
@@ -206,6 +210,8 @@ private:
                                         CacheLocationVector &cache_locations) const;
     std::unique_ptr<SelectLocationPolicy> genSelectLocationPolicy(RequestContext *request_context,
                                                                   const std::string &instance_id) const;
+    CheckLocDataExistFunc GetCheckLocDataExistFunc() const;
+    SubmitDelReqFunc GetSubmitDelReqFunc(const std::string &instance_id) const;
 
 private:
     /***

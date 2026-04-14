@@ -726,10 +726,44 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
     if (!policy) {
         return EC_ERROR;
     }
-    auto first_empty = std::find_if(
-        location_maps.begin(), location_maps.end(), [&policy](const auto &m) { return !policy->ExistsForWrite(m); });
-    bool only_prefix_not_empty =
-        std::all_of(first_empty, location_maps.end(), [&policy](const auto &m) { return !policy->ExistsForWrite(m); });
+    const auto check_loc_data_exist = GetCheckLocDataExistFunc();
+    const auto submit_del_req = GetSubmitDelReqFunc(instance_id);
+    KeyVector prune_keys;
+    std::vector<std::vector<std::string>> prune_loc_ids_vec;
+    std::size_t idx = 0;
+    auto it = location_maps.begin();
+    for (; idx != keys.size() && it != location_maps.end(); ++idx, ++it) {
+        std::vector<std::string> prune_loc_ids;
+        const auto exists = policy->ExistsForWrite(*it, check_loc_data_exist, prune_loc_ids);
+        if (!prune_loc_ids.empty()) {
+            prune_keys.emplace_back(keys[idx]);
+            prune_loc_ids_vec.emplace_back(prune_loc_ids);
+        }
+        if (!exists) {
+            break;
+        }
+    }
+
+    const auto first_empty = it;
+
+    bool only_prefix_not_empty = true;
+    for (; idx != keys.size() && it != location_maps.end(); ++idx, ++it) {
+        std::vector<std::string> prune_loc_ids;
+        const auto exists = policy->ExistsForWrite(*it, check_loc_data_exist, prune_loc_ids);
+        if (!prune_loc_ids.empty()) {
+            prune_keys.emplace_back(keys[idx]);
+            prune_loc_ids_vec.emplace_back(prune_loc_ids);
+        }
+        if (exists) {
+            only_prefix_not_empty = false;
+            // do not stop; scan all left keys
+        }
+    }
+
+    if (!prune_keys.empty() && submit_del_req) {
+        submit_del_req(prune_keys, prune_loc_ids_vec);
+    }
+
     if (only_prefix_not_empty) {
         size_t offset = first_empty - location_maps.begin();
         block_mask = static_cast<BlockMaskOffset>(offset);
@@ -1016,47 +1050,8 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
 ErrorCode CacheManager::TryCreateMetaSearcher(RequestContext *request_context, const std::string &instance_id) {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
-
-    auto check_loc_data_exist = [this](const CacheLocation &loc) -> bool {
-        if (!registry_manager_ || !registry_manager_->data_storage_manager()) {
-            return true;
-        }
-
-        std::vector<DataStorageUri> storage_uris;
-        for (const auto &spec : loc.location_specs()) {
-            if (const DataStorageUri uri{spec.uri()}; uri.Valid()) {
-                storage_uris.emplace_back(uri);
-            }
-        }
-
-        if (storage_uris.empty()) {
-            // no uri to check
-            return true;
-        }
-
-        // multiple loc_spec in the same location are assumed to be in
-        // the same storage backend
-        const std::string storage_unique_name = storage_uris.front().GetHostName();
-        const auto result = registry_manager_->data_storage_manager()->Exist(storage_unique_name, storage_uris, true);
-        return std::all_of(result.cbegin(), result.cend(), [](const bool v) -> bool { return v; });
-    };
-
-    auto submit_del_req = [this, instance_id](const std::vector<std::int64_t> &blk_keys,
-                                              const std::vector<std::vector<std::string>> &loc_ids) -> void {
-        CacheLocationDelRequest request;
-        request.instance_id = instance_id;
-        request.delay = std::chrono::seconds(0);
-        request.block_keys = blk_keys;
-        request.location_ids = loc_ids;
-        if (schedule_plan_executor_) {
-            if (schedule_plan_executor_->SubmitNonBlocking(request)) {
-                KVCM_LOG_DEBUG("meta data del request submit OK");
-            } else {
-                KVCM_LOG_WARN("meta data del request submit failed");
-            }
-        }
-    };
-
+    const auto check_loc_data_exist = GetCheckLocDataExistFunc();
+    const auto submit_del_req = GetSubmitDelReqFunc(instance_id);
     MetaSearcher *meta_searcher = meta_searcher_manager_->TryCreateMetaSearcher(
         request_context, instance_id, check_loc_data_exist, submit_del_req);
     if (!meta_searcher) {
@@ -1312,4 +1307,49 @@ std::unique_ptr<SelectLocationPolicy> CacheManager::genSelectLocationPolicy(Requ
     }
     return std::make_unique<NamedStorageWeightedSLPolicy>(std::move(weight_map));
 }
+
+CheckLocDataExistFunc CacheManager::GetCheckLocDataExistFunc() const {
+    return [this](const CacheLocation &loc) -> bool {
+        if (!registry_manager_ || !registry_manager_->data_storage_manager()) {
+            return true;
+        }
+
+        std::vector<DataStorageUri> storage_uris;
+        for (const auto &spec : loc.location_specs()) {
+            if (const DataStorageUri uri{spec.uri()}; uri.Valid()) {
+                storage_uris.emplace_back(uri);
+            }
+        }
+
+        if (storage_uris.empty()) {
+            // no uri to check
+            return true;
+        }
+
+        // multiple loc_spec in the same location are assumed to be in
+        // the same storage backend
+        const std::string storage_unique_name = storage_uris.front().GetHostName();
+        const auto result = registry_manager_->data_storage_manager()->Exist(storage_unique_name, storage_uris, true);
+        return std::all_of(result.cbegin(), result.cend(), [](const bool v) -> bool { return v; });
+    };
+}
+
+SubmitDelReqFunc CacheManager::GetSubmitDelReqFunc(const std::string &instance_id) const {
+    return [this, instance_id](const std::vector<std::int64_t> &blk_keys,
+                               const std::vector<std::vector<std::string>> &loc_ids) -> void {
+        CacheLocationDelRequest request;
+        request.instance_id = instance_id;
+        request.delay = std::chrono::seconds(0);
+        request.block_keys = blk_keys;
+        request.location_ids = loc_ids;
+        if (schedule_plan_executor_) {
+            if (schedule_plan_executor_->SubmitNonBlocking(request)) {
+                KVCM_LOG_DEBUG("meta data del request submit OK");
+            } else {
+                KVCM_LOG_WARN("meta data del request submit failed");
+            }
+        }
+    };
+}
+
 } // namespace kv_cache_manager

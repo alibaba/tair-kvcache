@@ -34,9 +34,16 @@ CacheLocation *WeightSLPolicy::SelectForMatch(CacheLocationMap &location_map,
     return serving_locations[dist(rng)];
 }
 
-bool WeightSLPolicy::ExistsForWrite(const CacheLocationMap &location_map) const {
+bool WeightSLPolicy::ExistsForWrite(const CacheLocationMap &location_map,
+                                    CheckLocDataExistFunc check_loc_data_exist,
+                                    std::vector<std::string> &out_prune_loc_ids) const {
     for (auto &kv : location_map) {
         if (kv.second.status() != CacheLocationStatus::CLS_NOT_FOUND) {
+            if (kv.second.status() == CacheLocationStatus::CLS_SERVING && check_loc_data_exist &&
+                !check_loc_data_exist(kv.second)) {
+                out_prune_loc_ids.emplace_back(kv.first);
+                continue;
+            }
             if (GetWeight(kv) > 0) {
                 return true;
             }
