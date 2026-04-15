@@ -591,9 +591,10 @@ void CacheReclaimer::ReclaimByLRU(const std::shared_ptr<RequestContext> &request
         return;
     }
 
-    // 3. inspect the cache location status for every blocks so that
-    // only the cache locations with the "CLS_SERVING" status are
-    // submitted to be deleted
+    // 3. inspect the cache location status for every blocks so that:
+    //    a) cache locations in CLS_SERVING status
+    //    b) cache locations in CLS_WRITING status *and* is orphaned
+    //    are submitted to be deleted
     const std::int64_t begin_tp_filter = TimestampUtil::GetSteadyTimeUs();
     if (!FilterLocID(
             request_context.get(), instance_info, request.block_keys, water_level_exceed, request.location_ids)) {
