@@ -731,11 +731,13 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
     const auto submit_del_req = GetSubmitDelReqFunc(instance_id);
     KeyVector prune_keys;
     std::vector<std::vector<std::string>> prune_loc_ids_vec;
+    std::vector<bool> exists_results(keys.size(), false);
     std::size_t idx = 0;
     auto first_empty = location_maps.end();
     for (; idx != keys.size(); ++idx) {
         std::vector<std::string> prune_loc_ids;
         const auto exists = policy->ExistsForWrite(location_maps[idx], check_loc_data_exist, prune_loc_ids);
+        exists_results[idx] = exists;
         if (!prune_loc_ids.empty()) {
             prune_keys.emplace_back(keys[idx]);
             prune_loc_ids_vec.emplace_back(prune_loc_ids);
@@ -751,6 +753,7 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
     for (; idx != keys.size(); ++idx) {
         std::vector<std::string> prune_loc_ids;
         const auto exists = policy->ExistsForWrite(location_maps[idx], check_loc_data_exist, prune_loc_ids);
+        exists_results[idx] = exists;
         if (!prune_loc_ids.empty()) {
             prune_keys.emplace_back(keys[idx]);
             prune_loc_ids_vec.emplace_back(prune_loc_ids);
@@ -778,7 +781,7 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
     }
     block_mask = BlockMaskVector(location_maps.size(), false);
     for (size_t i = 0; i < location_maps.size(); ++i) {
-        if (!location_maps[i].empty()) {
+        if (exists_results[i]) {
             std::get<BlockMaskVector>(block_mask)[i] = true;
         } else {
             new_keys.push_back(keys[i]);
