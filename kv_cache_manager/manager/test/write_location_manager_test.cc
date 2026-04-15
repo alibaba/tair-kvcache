@@ -201,4 +201,52 @@ TEST_F(WriteLocationManagerTest, DoCleanupWithExpiredSessionsTest) {
     ASSERT_EQ(0, manager_.ExpireSize());
 }
 
+TEST_F(WriteLocationManagerTest, HasLocationIdBasicTest) {
+    // empty manager has no location ids
+    ASSERT_FALSE(manager_.HasLocationId("id1"));
+
+    manager_.Put("session_1", {1, 2, 3}, {"id1", "id2", "id3"}, 1000, [](WriteLocationInfoPtr) {});
+    ASSERT_TRUE(manager_.HasLocationId("id1"));
+    ASSERT_TRUE(manager_.HasLocationId("id2"));
+    ASSERT_TRUE(manager_.HasLocationId("id3"));
+    ASSERT_FALSE(manager_.HasLocationId("id4"));
+
+    // after GetAndDelete, location ids are removed from the index
+    WriteLocationManager::WriteLocationInfo info;
+    ASSERT_TRUE(manager_.GetAndDelete("session_1", info));
+    ASSERT_FALSE(manager_.HasLocationId("id1"));
+    ASSERT_FALSE(manager_.HasLocationId("id2"));
+    ASSERT_FALSE(manager_.HasLocationId("id3"));
+}
+
+TEST_F(WriteLocationManagerTest, HasLocationIdSharedAcrossSessionsTest) {
+    // two sessions share the same location_id "shared"
+    manager_.Put("session_1", {1}, {"shared", "only1"}, 1000, [](WriteLocationInfoPtr) {});
+    manager_.Put("session_2", {2}, {"shared", "only2"}, 1000, [](WriteLocationInfoPtr) {});
+
+    ASSERT_TRUE(manager_.HasLocationId("shared"));
+    ASSERT_TRUE(manager_.HasLocationId("only1"));
+    ASSERT_TRUE(manager_.HasLocationId("only2"));
+
+    // remove session_1: "shared" still present via session_2
+    WriteLocationManager::WriteLocationInfo info;
+    ASSERT_TRUE(manager_.GetAndDelete("session_1", info));
+    ASSERT_TRUE(manager_.HasLocationId("shared"));
+    ASSERT_FALSE(manager_.HasLocationId("only1"));
+    ASSERT_TRUE(manager_.HasLocationId("only2"));
+
+    // remove session_2: "shared" now gone
+    ASSERT_TRUE(manager_.GetAndDelete("session_2", info));
+    ASSERT_FALSE(manager_.HasLocationId("shared"));
+    ASSERT_FALSE(manager_.HasLocationId("only2"));
+}
+
+TEST_F(WriteLocationManagerTest, HasLocationIdAfterDoCleanupTest) {
+    manager_.Put("session_1", {1}, {"id1"}, 1000, [](WriteLocationInfoPtr) {});
+    ASSERT_TRUE(manager_.HasLocationId("id1"));
+
+    manager_.DoCleanup();
+    ASSERT_FALSE(manager_.HasLocationId("id1"));
+}
+
 } // namespace kv_cache_manager

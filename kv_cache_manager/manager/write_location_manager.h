@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstddef>
 #include <functional>
 #include <map>
 #include <memory>
@@ -57,9 +58,16 @@ private:
         bool HasLocationId(const std::string &location_id) const;
 
     private:
+        void AddToLocationIndex(const std::vector<std::string> &location_ids);
+        void RemoveFromLocationIndex(const std::vector<std::string> &location_ids);
+
         mutable std::mutex mux_;
         std::unordered_map<std::string, int64_t> session_id_map_impl_;
         std::map<int64_t, ExpireUnitPtr> unit_map_;
+
+        // inverted index to enable O(1) HasLocationId lookups:
+        // location_id -> refcount (number of sessions referencing it)
+        std::unordered_map<std::string, std::size_t> location_id_index_;
     };
 
     SessionIdMap session_id_map_;

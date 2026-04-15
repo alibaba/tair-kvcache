@@ -1,7 +1,5 @@
 #include "kv_cache_manager/manager/write_location_manager.h"
 
-#include <algorithm>
-
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/timestamp_util.h"
 namespace kv_cache_manager {
@@ -9,6 +7,22 @@ namespace kv_cache_manager {
 namespace {
 constexpr int kDefaultExpireLoopSleepTimeUs = 5 * 1000 * 1000; // us
 };
+
+// caller must hold mux_
+void WriteLocationManager::SessionIdMap::AddToLocationIndex(const std::vector<std::string> &location_ids) {
+    for (const auto &id : location_ids) {
+        ++location_id_index_[id];
+    }
+}
+
+// caller must hold mux_
+void WriteLocationManager::SessionIdMap::RemoveFromLocationIndex(const std::vector<std::string> &location_ids) {
+    for (const auto &id : location_ids) {
+        if (auto it = location_id_index_.find(id); it != location_id_index_.end() && --it->second == 0) {
+            location_id_index_.erase(it);
+        }
+    }
+}
 
 size_t WriteLocationManager::SessionIdMap::Size() const {
     std::unique_lock lock(mux_);
@@ -25,6 +39,7 @@ int64_t WriteLocationManager::SessionIdMap::DropByExpirePoint(int64_t cur_point)
     {
         std::unique_lock lock(mux_);
         for (auto it = unit_map_.begin(); (it != unit_map_.end()) && (it->first <= cur_point);) {
+            RemoveFromLocationIndex(it->second->write_location_info.location_ids);
             session_id_map_impl_.erase(it->second->write_session_id);
             prepare_to_expire_units.push_back(it->second);
             it = unit_map_.erase(it);
@@ -57,6 +72,7 @@ void WriteLocationManager::SessionIdMap::DropAll() {
             prepare_to_expire_units.push_back(it->second);
             it = unit_map_.erase(it);
         }
+        location_id_index_.clear();
     }
     for (auto &unit : prepare_to_expire_units) {
         KVCM_LOG_DEBUG("Expiring write_session [%s]", unit->write_session_id.c_str());
@@ -71,6 +87,7 @@ void WriteLocationManager::SessionIdMap::Put(ExpireUnitPtr unit) {
     while (unit_map_.find(unit->expire_point) != unit_map_.end()) {
         unit->expire_point++;
     }
+    AddToLocationIndex(unit->write_location_info.location_ids);
     unit_map_[unit->expire_point] = unit;
     session_id_map_impl_[unit->write_session_id] = unit->expire_point;
 }
@@ -84,6 +101,7 @@ bool WriteLocationManager::SessionIdMap::GetAndDelete(const std::string &write_s
     }
     auto it_u = unit_map_.find(it_s->second);
     assert(it_u != unit_map_.end());
+    RemoveFromLocationIndex(it_u->second->write_location_info.location_ids);
     location_info = std::move(it_u->second->write_location_info);
     unit_map_.erase(it_u);
     session_id_map_impl_.erase(it_s);
@@ -180,13 +198,7 @@ bool WriteLocationManager::GetAndDelete(const std::string &write_session_id, Wri
 
 bool WriteLocationManager::SessionIdMap::HasLocationId(const std::string &location_id) const {
     std::unique_lock lock(mux_);
-    for (const auto &[_, unit] : unit_map_) {
-        const auto &ids = unit->write_location_info.location_ids;
-        if (std::find(ids.begin(), ids.end(), location_id) != ids.end()) {
-            return true;
-        }
-    }
-    return false;
+    return location_id_index_.find(location_id) != location_id_index_.end();
 }
 
 bool WriteLocationManager::HasLocationId(const std::string &location_id) const {
