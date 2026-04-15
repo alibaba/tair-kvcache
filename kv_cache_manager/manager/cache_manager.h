@@ -9,6 +9,8 @@
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/manager/cache_location_view.h"
 #include "kv_cache_manager/manager/data_storage_selector.h"
+#include "kv_cache_manager/manager/meta_searcher.h"
+#include "kv_cache_manager/manager/select_location_policy.h"
 #include "kv_cache_manager/manager/write_location_manager.h"
 #include "kv_cache_manager/protocol/protobuf/meta_service.pb.h"
 
@@ -16,22 +18,15 @@ namespace kv_cache_manager {
 
 class RegistryManager;
 class MetaSearcherManager;
-class MetaSearcher;
 class MetaIndexerManager;
 class MetricsRegistry;
 class CacheReclaimer;
 class SchedulePlanExecutor;
 class ReclaimerTaskSupervisor;
 class StartupConfigLoader;
-class RequestContext;
-class SelectLocationPolicy;
 class EventManager;
 class CacheManagerMetricsRecorder;
 constexpr unsigned int DEFAULT_SCHEDULE_PLAN_EXECUTOR_THREAD_COUNT = 2;
-
-using CheckLocDataExistFunc = std::function<bool(const CacheLocation &loc)>;
-using SubmitDelReqFunc = std::function<void(const std::vector<std::int64_t> &blk_keys,
-                                            const std::vector<std::vector<std::string>> &loc_ids)>;
 
 class CacheManager {
     // TODO should not public
