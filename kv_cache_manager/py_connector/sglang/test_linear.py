@@ -581,6 +581,81 @@ def test_trailing_pages_policy(kv_pool_host, mamba_pool):
     logger.info("test_trailing_pages_policy passed!")
 
 
+def test_partial_write_buffer_indexing(kv_pool_host, mamba_pool):
+    """Verify correct buffer indexing when save_indices is a proper subset.
+
+    Write Mamba for first N blocks, then write ALL 2N blocks. The second call
+    triggers a partial write (only the new blocks). With the old buffer slicing
+    bug, data from buffer positions 0..N-1 would be written to storage for
+    blocks N..2N-1 instead of the correct buffer positions N..2N-1.
+    """
+    num_blocks = 6
+    first_n = 3
+
+    (storage_backend,
+     block_hashes, kv_host_indices, mamba_host_indices) = _create_hybrid_backend(
+        kv_pool_host, mamba_pool, "linear_partial_idx_0", num_blocks=num_blocks
+    )
+
+    _fill_mamba_buffer(mamba_pool)
+
+    # Step 1: Write Mamba for first 3 blocks — all new, save_indices = [0,1,2]
+    first_transfer = PoolTransfer(
+        name=PoolName.MAMBA,
+        host_indices=torch.tensor(mamba_host_indices[:first_n]),
+        keys=block_hashes[:first_n],
+        hit_policy=PoolHitPolicy.TRAILING_PAGES,
+    )
+    set_result_1 = storage_backend.batch_set_v2([first_transfer])
+    assert PoolName.MAMBA in set_result_1
+    assert all(set_result_1[PoolName.MAMBA]), (
+        f"First batch_set_v2 failed: {set_result_1[PoolName.MAMBA]}"
+    )
+
+    # Step 2: Write Mamba for ALL 6 blocks.
+    # Manager recognises blocks 0-2 as cached -> save_indices = [3,4,5].
+    # Old bug: buffer[0:3] saved to storage for blocks 3-5 (wrong positions).
+    full_transfer = PoolTransfer(
+        name=PoolName.MAMBA,
+        host_indices=torch.tensor(mamba_host_indices),
+        keys=block_hashes,
+        hit_policy=PoolHitPolicy.TRAILING_PAGES,
+    )
+    set_result_2 = storage_backend.batch_set_v2([full_transfer])
+    assert PoolName.MAMBA in set_result_2
+
+    # Step 3: Clear buffers and read back ALL blocks
+    orig_temporal = mamba_pool.temporal_buffer[:num_blocks].clone()
+    orig_conv = [conv[:num_blocks].clone() for conv in mamba_pool.conv_buffer]
+
+    mamba_pool.temporal_buffer[:num_blocks].zero_()
+    for conv_buf in mamba_pool.conv_buffer:
+        conv_buf[:num_blocks].zero_()
+
+    get_result = storage_backend.batch_get_v2([full_transfer])
+    assert PoolName.MAMBA in get_result
+    assert all(get_result[PoolName.MAMBA]), (
+        f"batch_get_v2 failed: {get_result[PoolName.MAMBA]}"
+    )
+
+    # Step 4: Verify each page has its own correct data (not swapped).
+    # With the old bug, pages 3-5 would contain data from pages 0-2.
+    for i in range(num_blocks):
+        assert torch.allclose(
+            mamba_pool.temporal_buffer[i], orig_temporal[i]
+        ), (
+            f"Temporal mismatch at page {i}: "
+            f"got {mamba_pool.temporal_buffer[i].flatten()[0].item()}, "
+            f"expected {orig_temporal[i].flatten()[0].item()}"
+        )
+        for j, conv_buf in enumerate(mamba_pool.conv_buffer):
+            assert torch.allclose(
+                conv_buf[i], orig_conv[j][i]
+            ), f"Conv {j} mismatch at page {i}"
+
+    logger.info("test_partial_write_buffer_indexing passed!")
+
+
 def test_non_mamba_pool_transfer_returns_false(kv_pool_host, mamba_pool):
     """Non-MAMBA pool transfers in batch_set_v2 / batch_get_v2 return all False."""
     (storage_backend,
@@ -626,6 +701,7 @@ if __name__ == "__main__":
         test_kv_then_mamba_cross_order(_kv_pool_host, _mamba_pool)
         test_full_hybrid_round_trip(_kv_pool_host, _mamba_pool)
         test_trailing_pages_policy(_kv_pool_host, _mamba_pool)
+        test_partial_write_buffer_indexing(_kv_pool_host, _mamba_pool)
         test_non_mamba_pool_transfer_returns_false(_kv_pool_host, _mamba_pool)
         logger.info("All hybrid tests passed successfully!")
     except Exception as e:

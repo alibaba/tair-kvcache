@@ -383,17 +383,12 @@ class HiCacheKVCM(HiCacheStorage):
                     results[transfer.name] = [False] * len(keys)
                     continue
 
-                host_indices = transfer.host_indices
-                page_size = getattr(pool, "page_size", 1) or 1
-                matched_host = []
-                for i in valid_indices:
-                    start = i * page_size
-                    end = start + page_size
-                    matched_host.extend(host_indices[start:end].tolist())
-                indices_tensor = torch.tensor(matched_host)
-                ptr_list, size_list = pool.get_page_buffer_meta(indices_tensor)
+                ptr_list, size_list = pool.get_page_buffer_meta(transfer.host_indices)
+                components = self._get_extra_pool_components_per_page(transfer.name)
+                ptr_list = [p for i, p in enumerate(ptr_list) if (i // components) in valid_indices]
+                size_list = [s for i, s in enumerate(size_list) if (i // components) in valid_indices]
                 buffers = self._prepare_extra_pool_buffers(
-                    ptr_list, size_list, transfer.name
+                    ptr_list, size_list, components
                 )
                 assert len(uris) == len(buffers)
 
@@ -700,37 +695,40 @@ class HiCacheKVCM(HiCacheStorage):
 
                 assert len(save_indices) == len(locations)
 
-                host_indices = transfer.host_indices
-                page_size = getattr(pool, "page_size", 1) or 1
-                uris = []
-                valid_indices = []
-                for i, loc in enumerate(locations):
-                    uri = self._extract_single_spec_uri(loc, spec_name)
-                    if uri:
-                        uris.append(uri)
-                        valid_indices.append(i)
+                # Data transfer preparation and execution.
+                # Wrapped in try-except so that every rank always reaches the
+                # all_reduce below, preventing cross-rank NCCL/gloo hangs.
+                try:
+                    ptr_list, size_list = pool.get_page_buffer_meta(transfer.host_indices)
+                    components = self._get_extra_pool_components_per_page(transfer.name)
+                    save_set = set(save_indices)
+                    ptr_list = [p for i, p in enumerate(ptr_list) if (i // components) in save_set]
+                    size_list = [s for i, s in enumerate(size_list) if (i // components) in save_set]
 
-                matched_host = []
-                for i in valid_indices:
-                    start = i * page_size
-                    end = start + page_size
-                    matched_host.extend(host_indices[start:end].tolist())
-                indices_tensor = torch.tensor(matched_host)
-                ptr_list, size_list = pool.get_page_buffer_meta(indices_tensor)
-                buffers = self._prepare_extra_pool_buffers(
-                    ptr_list, size_list, transfer.name
-                )
-                assert len(uris) == len(buffers)
-                start_time = time.perf_counter()
-                save_result = self.transfer_client.SaveKvCaches(uris, buffers)
-                end_time = time.perf_counter()
-                flag = (save_result[0] == kvcm_py_client.ClientErrorCode.ER_OK)
-                if flag:
-                    spec_size = self._get_extra_pool_spec_size(transfer.name)
-                    self.backup_pgs.append(unmatched)
-                    self.backup_bandwidth.append(
-                        unmatched * spec_size / (1 << 30) / (end_time - start_time)
+                    uris = []
+                    for loc in locations:
+                        uri = self._extract_single_spec_uri(loc, spec_name)
+                        if uri:
+                            uris.append(uri)
+                    buffers = self._prepare_extra_pool_buffers(
+                        ptr_list, size_list, components
                     )
+                    assert len(uris) == len(buffers)
+                    start_time = time.perf_counter()
+                    save_result = self.transfer_client.SaveKvCaches(uris, buffers)
+                    end_time = time.perf_counter()
+                    flag = (save_result[0] == kvcm_py_client.ClientErrorCode.ER_OK)
+                    if flag:
+                        spec_size = self._get_extra_pool_spec_size(transfer.name)
+                        self.backup_pgs.append(unmatched)
+                        self.backup_bandwidth.append(
+                            unmatched * spec_size / (1 << 30) / (end_time - start_time)
+                        )
+                    if not flag:
+                        logger.error(f"SaveKvCaches v2 error: {transfer.name}")
+                except Exception as e:
+                    logger.error(f"Data transfer v2 (SaveKvCaches) failed: {transfer.name} {e}")
+                    flag = False
 
                 if self.tp_world_size > 1:
                     flag_tensor = torch.tensor(flag, dtype=torch.int)
@@ -992,13 +990,12 @@ class HiCacheKVCM(HiCacheStorage):
         return 0
 
 
-    def _prepare_extra_pool_buffers(self, ptr_list, size_list, pool_name: str):
+    def _prepare_extra_pool_buffers(self, ptr_list, size_list, components_per_page: int):
         """Convert get_page_buffer_meta output to BlockBuffer list.
 
         Each logical page maps to `components_per_page` IOVs in a single BlockBuffer.
         Works for both Mamba (temporal + conv components) and Indexer (single component).
         """
-        components_per_page = self._get_extra_pool_components_per_page(pool_name)
         buffers = []
         for i in range(0, len(ptr_list), components_per_page):
             buffer = kvcm_py_client.BlockBuffer()

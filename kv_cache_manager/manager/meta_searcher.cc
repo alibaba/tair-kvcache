@@ -76,6 +76,9 @@ CacheLocation SelectAndMergeForMatch(SelectLocationPolicy *policy,
         return {};
     }
 
+    // NOTE: id intentionally left empty — this is an aggregated view merging
+    // specs from multiple locations, not a real stored entity. Downstream
+    // CacheLocationView / proto serialization never accesses id either.
     CacheLocation result;
     result.set_status(CacheLocationStatus::CLS_SERVING);
     result.set_type(winner->type());

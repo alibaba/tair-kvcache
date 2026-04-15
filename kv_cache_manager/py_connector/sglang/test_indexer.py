@@ -598,6 +598,72 @@ def test_indexer_all_pages_policy(kv_pool_host, indexer_pool):
     logger.info("test_indexer_all_pages_policy passed!")
 
 
+def test_indexer_partial_write_buffer_indexing(kv_pool_host, indexer_pool):
+    """Verify correct buffer indexing when save_indices is a proper subset.
+
+    Write Indexer for first N blocks, then write ALL 2N blocks. The second call
+    triggers a partial write (only the new blocks). With the old buffer slicing
+    bug, data from buffer positions 0..N-1 would be written to storage for
+    blocks N..2N-1 instead of the correct buffer positions N..2N-1.
+    """
+    num_blocks = 6
+    first_n = 3
+
+    (storage_backend,
+     block_hashes, kv_host_indices, indexer_host_indices) = _create_indexer_backend(
+        kv_pool_host, indexer_pool, "indexer_partial_idx_0", num_blocks=num_blocks
+    )
+
+    _fill_indexer_buffer(indexer_pool, num_blocks)
+
+    # Step 1: Write Indexer for first 3 blocks — all new, save_indices = [0,1,2]
+    first_transfer = PoolTransfer(
+        name=PoolName.INDEXER,
+        host_indices=torch.tensor(indexer_host_indices[:first_n * page_size]),
+        keys=block_hashes[:first_n],
+        hit_policy=PoolHitPolicy.ALL_PAGES,
+    )
+    set_result_1 = storage_backend.batch_set_v2([first_transfer])
+    assert PoolName.INDEXER in set_result_1
+    assert all(set_result_1[PoolName.INDEXER]), (
+        f"First batch_set_v2 failed: {set_result_1[PoolName.INDEXER]}"
+    )
+
+    # Step 2: Write Indexer for ALL 6 blocks.
+    # Manager recognises blocks 0-2 as cached -> save_indices = [3,4,5].
+    # Old bug: buffer[0:3] saved to storage for blocks 3-5 (wrong positions).
+    full_transfer = PoolTransfer(
+        name=PoolName.INDEXER,
+        host_indices=torch.tensor(indexer_host_indices),
+        keys=block_hashes,
+        hit_policy=PoolHitPolicy.ALL_PAGES,
+    )
+    set_result_2 = storage_backend.batch_set_v2([full_transfer])
+    assert PoolName.INDEXER in set_result_2
+
+    # Step 3: Clear buffer and read back ALL blocks
+    orig_buf = indexer_pool.index_k_with_scale_buffer[:num_blocks].clone()
+    indexer_pool.index_k_with_scale_buffer[:num_blocks].zero_()
+
+    get_result = storage_backend.batch_get_v2([full_transfer])
+    assert PoolName.INDEXER in get_result
+    assert all(get_result[PoolName.INDEXER]), (
+        f"batch_get_v2 failed: {get_result[PoolName.INDEXER]}"
+    )
+
+    # Step 4: Verify each page has its own correct data (not swapped).
+    # With the old bug, pages 3-5 would contain data from pages 0-2.
+    for i in range(num_blocks):
+        assert torch.equal(
+            indexer_pool.index_k_with_scale_buffer[i], orig_buf[i]
+        ), (
+            f"Indexer mismatch at page {i}: "
+            f"expected fill value {(i + 1) % 256}"
+        )
+
+    logger.info("test_indexer_partial_write_buffer_indexing passed!")
+
+
 if __name__ == "__main__":
     logger.info("Starting hybrid (KV + Indexer) tests")
 
@@ -611,6 +677,7 @@ if __name__ == "__main__":
         test_indexer_kv_first_then_indexer(_kv_pool_host, _indexer_pool)
         test_indexer_full_round_trip(_kv_pool_host, _indexer_pool)
         test_indexer_all_pages_policy(_kv_pool_host, _indexer_pool)
+        test_indexer_partial_write_buffer_indexing(_kv_pool_host, _indexer_pool)
         logger.info("All Indexer tests passed successfully!")
     except Exception as e:
         logger.error(f"Test failed with error: {e}")
