@@ -726,30 +726,31 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
     if (!policy) {
         return EC_ERROR;
     }
+
     const auto check_loc_data_exist = GetCheckLocDataExistFunc();
     const auto submit_del_req = GetSubmitDelReqFunc(instance_id);
     KeyVector prune_keys;
     std::vector<std::vector<std::string>> prune_loc_ids_vec;
     std::size_t idx = 0;
-    auto it = location_maps.begin();
-    for (; idx != keys.size() && it != location_maps.end(); ++idx, ++it) {
+    auto first_empty = location_maps.end();
+    for (; idx != keys.size(); ++idx) {
         std::vector<std::string> prune_loc_ids;
-        const auto exists = policy->ExistsForWrite(*it, check_loc_data_exist, prune_loc_ids);
+        const auto exists = policy->ExistsForWrite(location_maps[idx], check_loc_data_exist, prune_loc_ids);
         if (!prune_loc_ids.empty()) {
             prune_keys.emplace_back(keys[idx]);
             prune_loc_ids_vec.emplace_back(prune_loc_ids);
         }
         if (!exists) {
+            first_empty = location_maps.begin() + idx;
+            ++idx;
             break;
         }
     }
 
-    const auto first_empty = it;
-
     bool only_prefix_not_empty = true;
-    for (; idx != keys.size() && it != location_maps.end(); ++idx, ++it) {
+    for (; idx != keys.size(); ++idx) {
         std::vector<std::string> prune_loc_ids;
-        const auto exists = policy->ExistsForWrite(*it, check_loc_data_exist, prune_loc_ids);
+        const auto exists = policy->ExistsForWrite(location_maps[idx], check_loc_data_exist, prune_loc_ids);
         if (!prune_loc_ids.empty()) {
             prune_keys.emplace_back(keys[idx]);
             prune_loc_ids_vec.emplace_back(prune_loc_ids);

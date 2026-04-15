@@ -86,6 +86,7 @@ ErrorCode MetaSearcher::PrefixMatchBestLocationImpl(RequestContext *request_cont
     for (; i != keys.size(); ++i) {
         if (result.error_codes[i] != ErrorCode::EC_OK) {
             KVCM_LOG_DEBUG("prefix match end because Get keys[%lu](%lu) return %d", i, keys[i], result.error_codes[i]);
+            ++i;
             break;
         }
 
@@ -93,6 +94,7 @@ ErrorCode MetaSearcher::PrefixMatchBestLocationImpl(RequestContext *request_cont
         BlockCacheLocationsMeta meta;
         if (!meta.FromJsonString(uris[i])) {
             KVCM_LOG_WARN("location json parse failed, key[%lu](%lu), content: %s", i, keys[i], uris[i].c_str());
+            ++i;
             break;
         }
         index_deserialize_time_us += (TimestampUtil::GetCurrentTimeUs() - begin_deserialize_time);
@@ -100,6 +102,7 @@ ErrorCode MetaSearcher::PrefixMatchBestLocationImpl(RequestContext *request_cont
         auto &location_map = meta.location_map();
         if (location_map.empty()) {
             KVCM_LOG_DEBUG("prefix match end because keys[%lu](%lu) no location", i, keys[i]);
+            ++i;
             break;
         }
         std::vector<std::string> prune_loc_ids;
@@ -111,6 +114,7 @@ ErrorCode MetaSearcher::PrefixMatchBestLocationImpl(RequestContext *request_cont
         }
         if (best_location == nullptr) {
             KVCM_LOG_DEBUG("prefix match end because keys[%lu] no serving location", i);
+            ++i;
             break;
         }
         out_locations.push_back(*best_location);
