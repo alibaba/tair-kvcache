@@ -100,9 +100,9 @@ class HiCacheKVCM(HiCacheStorage):
             "size": self.location_spec_size,
         } for rank in range(self.tp_size)]
 
-        # LocationSpecGroup: "Full" contains only KV specs
+        # LocationSpecGroup: KV specs only
         kv_spec_names = [self._tp_rank_to_spec_name(rank) for rank in range(self.tp_size)]
-        self.location_spec_groups = [{"name": "Full", "spec_names": kv_spec_names}]
+        self.location_spec_groups = [{"name": self._get_kv_spec_group(), "spec_names": kv_spec_names}]
 
         # Mamba/Linear specs
         self.has_mamba = PoolName.MAMBA in self.registered_pools
@@ -116,7 +116,7 @@ class HiCacheKVCM(HiCacheStorage):
                 linear_spec_names.append(name)
             self.mamba_location_spec_name = self._tp_rank_to_linear_spec_name(self.tp_rank)
             self.location_spec_groups.append({
-                "name": "Linear",
+                "name": self._get_extra_pool_spec_group(PoolName.MAMBA),
                 "spec_names": linear_spec_names,
             })
 
@@ -132,7 +132,7 @@ class HiCacheKVCM(HiCacheStorage):
                 indexer_spec_names.append(name)
             self.indexer_location_spec_name = self._tp_rank_to_indexer_spec_name(self.tp_rank)
             self.location_spec_groups.append({
-                "name": "Indexer",
+                "name": self._get_extra_pool_spec_group(PoolName.INDEXER),
                 "spec_names": indexer_spec_names,
             })
 
@@ -143,7 +143,6 @@ class HiCacheKVCM(HiCacheStorage):
             "pp_size": self.pp_size,
             "use_mla": self.is_mla_model,
             "dtype": str(self.kv_dtype)[6:],  # remove "torch."
-            "extra": f"has_mamba={self.has_mamba},has_indexer={self.has_indexer}",
         }
 
         register_request = {
@@ -441,9 +440,9 @@ class HiCacheKVCM(HiCacheStorage):
         # Start write cache
         if self.tp_rank == 0:
             start_trace_id = f"start-{trace_id}"
-            # When extra pools exist, explicitly use "Full" to write KV specs only
+            # When extra pools exist, use KV spec group to write KV specs only
             has_extra_pools = self.has_mamba or self.has_indexer
-            location_spec_group_names = ["Full"] * len(block_keys) if has_extra_pools else []
+            location_spec_group_names = [self._get_kv_spec_group()] * len(block_keys) if has_extra_pools else []
             request = {
                 "trace_id": start_trace_id,
                 "instance_id": self.instance_id,
@@ -859,11 +858,13 @@ class HiCacheKVCM(HiCacheStorage):
     ##################################################
 
     def _tp_rank_to_spec_name(self, tp_rank: int) -> str:
-        # NOTE: Changed from f"tp_{tp_rank}" to f"tp_{tp_rank}_full" to distinguish
-        # KV attention specs ("Full" group) from Mamba/SSM specs ("Linear" group)
-        # in hybrid model support.  This is a breaking change: cached data written
-        # under the old "tp_{rank}" names will not be found by this version.
-        return f"tp_{tp_rank}_full"
+        # For pure FullAttention models (no Mamba/Indexer), use old format "tp_{rank}"
+        # for backward compatibility with existing cached data.
+        # For hybrid models, use "tp_{rank}_full" to distinguish KV specs from
+        # Mamba/SSM specs ("tp_{rank}_linear") and Indexer specs.
+        if self.has_mamba or self.has_indexer:
+            return f"tp_{tp_rank}_full"
+        return f"tp_{tp_rank}"
 
     def _tp_rank_to_linear_spec_name(self, tp_rank: int) -> str:
         return f"tp_{tp_rank}_linear"
@@ -972,6 +973,10 @@ class HiCacheKVCM(HiCacheStorage):
         if pool_name == PoolName.INDEXER:
             return 1  # single indexer buffer per page
         return 1
+
+    def _get_kv_spec_group(self) -> str:
+        """Spec group name used in start_write_cache for KV pool."""
+        return "Full"
 
     def _get_extra_pool_spec_group(self, pool_name: str) -> str:
         """Spec group name used in start_write_cache for an extra pool."""
