@@ -58,8 +58,8 @@ private:
         bool HasLocationId(const std::string &location_id) const;
 
     private:
-        void AddToLocationIndex(const std::vector<std::string> &location_ids);
-        void RemoveFromLocationIndex(const std::vector<std::string> &location_ids);
+        void AddToLocationIndexUnsafe(const std::vector<std::string> &location_ids);
+        void RemoveFromLocationIndexUnsafe(const std::vector<std::string> &location_ids);
 
         mutable std::mutex mux_;
         std::unordered_map<std::string, int64_t> session_id_map_impl_;
