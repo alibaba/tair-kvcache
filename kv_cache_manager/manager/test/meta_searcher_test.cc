@@ -241,8 +241,7 @@ TEST_F(MetaSearcherTest, TestPrefixMatch) {
         EXPECT_EQ(ec, ErrorCode::EC_OK);
         EXPECT_EQ(out_locations.size(), test_data.result_length);
 
-        // 验证返回的locations与添加的locations匹配
-        // 注意：由于 SelectAndMergeForMatch 会合并多个 location，返回的 id/type 是合并后的结果
+        // 验证返回的 locations（合并视图的 id 无单一元数据语义；type 为策略 winner 的后端类型）
         for (size_t i = 0; i < out_locations.size(); i++) {
             EXPECT_EQ(out_locations[i].status(), CLS_SERVING);
         }
@@ -262,8 +261,7 @@ TEST_F(MetaSearcherTest, TestPrefixMatch) {
         EXPECT_EQ(ec, ErrorCode::EC_OK);
         EXPECT_EQ(out_locations.size(), 2);
 
-        // 验证返回的locations与添加的locations匹配（跳过第一个）
-        // 注意：由于 SelectAndMergeForMatch 会合并多个 location，返回的 id/type 是合并后的结果
+        // 验证返回的 locations（合并视图的 id 无单一元数据语义）
         for (size_t i = 0; i < out_locations.size(); i++) {
             EXPECT_EQ(out_locations[i].status(), CLS_SERVING);
         }

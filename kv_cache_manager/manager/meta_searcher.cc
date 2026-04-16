@@ -76,17 +76,10 @@ CacheLocation SelectAndMergeForMatch(SelectLocationPolicy *policy,
         return {};
     }
 
-    // 合并视图可能聚合多个同后端的 location，但对外仍以策略选中的 winner 作为代表：
-    // id/type 取自 winner，spec 为同后端有效 location 的去并集。
-    std::string representative_id = winner->id();
-    if (representative_id.empty()) {
-        for (const auto &[map_id, loc] : valid_map) {
-            if (&loc == winner) {
-                representative_id = map_id;
-                break;
-            }
-        }
-    }
+    // NOTE: this is an aggregated view merging
+    // specs from multiple locations, not a real stored entity. Downstream
+    // CacheLocationView / proto serialization never accesses id either.
+    std::string representative_id = winner->id() + "merged";
     CacheLocation result;
     result.set_id(std::move(representative_id));
     result.set_status(CacheLocationStatus::CLS_SERVING);
