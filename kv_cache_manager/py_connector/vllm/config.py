@@ -26,3 +26,10 @@ class TairKvCacheConnectorExtraConfig:
         self.async_get_cache_location = extra_config.get("async_get_cache_location", True)
         # TODO: add async and try wait
         # self.async_get_cache_location_wait_time = extra_config.get("async_get_cache_location_wait_time", 0)
+
+        # Leader discovery
+        self.auto_discover_leader: bool = extra_config.get("auto_discover_leader", False)
+        self.leader_retry_count: int = extra_config.get("leader_retry_count", 1)
+        self.leader_retry_base_interval_seconds: float = extra_config.get("leader_retry_base_interval_seconds", 0.005)
+        self.discovery_refresh_interval_seconds: int = extra_config.get("discovery_refresh_interval_seconds", 30)
+        self.min_discover_interval_seconds: int = extra_config.get("min_discover_interval_seconds", 1)

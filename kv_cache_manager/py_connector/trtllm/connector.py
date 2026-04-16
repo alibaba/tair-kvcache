@@ -52,7 +52,15 @@ def init_kvcm_config():
 
 def init_kvcm_meta_client(llm_args: TorchLlmArgs):
     kvcm_config = init_kvcm_config()
-    manager_client = KvCacheManagerClient(kvcm_config["manager_uri"])
+    manager_client = KvCacheManagerClient(
+        kvcm_config["manager_uri"],
+        instance_id=kvcm_config.get("instance_id", ""),
+        auto_discover_leader=kvcm_config.get("auto_discover_leader", False),
+        leader_retry_count=kvcm_config.get("leader_retry_count", 1),
+        leader_retry_base_interval_seconds=kvcm_config.get("leader_retry_base_interval_seconds", 0.005),
+        discovery_refresh_interval_seconds=kvcm_config.get("discovery_refresh_interval_seconds", 30),
+        min_discover_interval_seconds=kvcm_config.get("min_discover_interval_seconds", 1),
+    )
     logger.info("kvcm manager_client initialized")
     return kvcm_config, manager_client
 
