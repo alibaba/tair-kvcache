@@ -9,6 +9,8 @@
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/model_deployment.h"
 #include "kv_cache_manager/config/registry_manager.h"
+#include "kv_cache_manager/data_storage/data_storage_backend.h"
+#include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/manager/cache_location_view.h"
 #include "kv_cache_manager/manager/cache_manager.h"
@@ -29,6 +31,65 @@ static const std::string default_storage_configs(
 } // namespace
 
 namespace kv_cache_manager {
+
+class MockDataStorageBackend : public DataStorageBackend {
+public:
+    explicit MockDataStorageBackend(std::shared_ptr<MetricsRegistry> mr) : DataStorageBackend(std::move(mr)) {}
+    MOCK_METHOD(DataStorageType, GetType, (), (override));
+    MOCK_METHOD(bool, Available, (), (override));
+    MOCK_METHOD(double, GetStorageUsageRatio, (const std::string &), (const, override));
+    MOCK_METHOD(ErrorCode, DoOpen, (const StorageConfig &, const std::string &), (override));
+    MOCK_METHOD(ErrorCode, Close, (), (override));
+    MOCK_METHOD((std::vector<std::pair<ErrorCode, DataStorageUri>>),
+                Create,
+                (const std::vector<std::string> &, size_t, const std::string &, std::function<void()>),
+                (override));
+    MOCK_METHOD(std::vector<ErrorCode>,
+                Delete,
+                (const std::vector<DataStorageUri> &, const std::string &, std::function<void()>),
+                (override));
+    MOCK_METHOD(std::vector<bool>, Exist, (const std::vector<DataStorageUri> &), (override));
+    MOCK_METHOD(std::vector<bool>, MightExist, (const std::vector<DataStorageUri> &), (override));
+    MOCK_METHOD(std::vector<ErrorCode>, Lock, (const std::vector<DataStorageUri> &), (override));
+    MOCK_METHOD(std::vector<ErrorCode>, UnLock, (const std::vector<DataStorageUri> &), (override));
+};
+
+// wraps a real DataStorageBackend but intercepts MightExist() with a
+// user-provided function; all other calls are delegated to the real
+// backend
+class MightExistInterceptor : public DataStorageBackend {
+public:
+    using MightExistFunc = std::function<std::vector<bool>(const std::vector<DataStorageUri> &)>;
+
+    MightExistInterceptor(std::shared_ptr<DataStorageBackend> delegate, MightExistFunc fn)
+        : DataStorageBackend(delegate->metrics_registry_), delegate_(std::move(delegate)), fn_(std::move(fn)) {
+        SetOpen(delegate_->IsOpen());
+        SetAvailable(true);
+    }
+
+    DataStorageType GetType() override { return delegate_->GetType(); }
+    bool Available() override { return delegate_->Available(); }
+    double GetStorageUsageRatio(const std::string &t) const override { return delegate_->GetStorageUsageRatio(t); }
+    const StorageConfig &GetStorageConfig() override { return delegate_->GetStorageConfig(); }
+    ErrorCode DoOpen(const StorageConfig &c, const std::string &t) override { return delegate_->DoOpen(c, t); }
+    ErrorCode Close() override { return delegate_->Close(); }
+    std::vector<std::pair<ErrorCode, DataStorageUri>>
+    Create(const std::vector<std::string> &k, size_t s, const std::string &t, std::function<void()> cb) override {
+        return delegate_->Create(k, s, t, std::move(cb));
+    }
+    std::vector<ErrorCode>
+    Delete(const std::vector<DataStorageUri> &u, const std::string &t, std::function<void()> cb) override {
+        return delegate_->Delete(u, t, std::move(cb));
+    }
+    std::vector<bool> Exist(const std::vector<DataStorageUri> &u) override { return delegate_->Exist(u); }
+    std::vector<bool> MightExist(const std::vector<DataStorageUri> &u) override { return fn_(u); }
+    std::vector<ErrorCode> Lock(const std::vector<DataStorageUri> &u) override { return delegate_->Lock(u); }
+    std::vector<ErrorCode> UnLock(const std::vector<DataStorageUri> &u) override { return delegate_->UnLock(u); }
+
+private:
+    std::shared_ptr<DataStorageBackend> delegate_;
+    MightExistFunc fn_;
+};
 
 class CacheManagerTest : public TESTBASE {
 public:
@@ -1408,6 +1469,668 @@ TEST_F(CacheManagerTest, TestGetCacheLocationLen) {
         ASSERT_EQ(EC_OK, ec);
         ASSERT_EQ(2, cache_location_len);
     }
+}
+
+TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_NullRegistryManager) {
+    // when registry_manager_ is null, the functor should return true
+    // (assume data exists as a safe fallback)
+    auto saved = cache_manager_->registry_manager_;
+    cache_manager_->registry_manager_ = nullptr;
+
+    auto func = cache_manager_->GetCheckLocDataExistFunc();
+
+    CacheLocation loc;
+    loc.set_status(CLS_SERVING);
+    loc.set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
+    loc.set_location_specs({LocationSpec("tp0", "file://mock_store/path")});
+    ASSERT_TRUE(func(loc));
+
+    cache_manager_->registry_manager_ = saved;
+}
+
+TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_NullDataStorageManager) {
+    // when data_storage_manager() is null, the functor should return
+    // true
+    auto saved = registry_manager_->data_storage_manager_;
+    registry_manager_->data_storage_manager_ = nullptr;
+
+    auto func = cache_manager_->GetCheckLocDataExistFunc();
+
+    CacheLocation loc;
+    loc.set_status(CLS_SERVING);
+    loc.set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
+    loc.set_location_specs({LocationSpec("tp0", "file://mock_store/path")});
+    ASSERT_TRUE(func(loc));
+
+    registry_manager_->data_storage_manager_ = saved;
+}
+
+TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_EmptyLocationSpecs) {
+    // no location specs -> no URIs to check -> returns true
+    auto func = cache_manager_->GetCheckLocDataExistFunc();
+
+    CacheLocation loc;
+    loc.set_status(CLS_SERVING);
+    loc.set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
+    ASSERT_TRUE(func(loc));
+}
+
+TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_InvalidUri) {
+    // invalid URI string (no protocol) -> DataStorageUri::Valid() is
+    // false -> no valid URIs collected -> returns true
+    auto func = cache_manager_->GetCheckLocDataExistFunc();
+
+    CacheLocation loc;
+    loc.set_status(CLS_SERVING);
+    loc.set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
+    loc.set_location_specs({LocationSpec("tp0", "no_protocol_here")});
+    ASSERT_TRUE(func(loc));
+}
+
+TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_AllExist) {
+    // inject a mock backend where MightExist returns all true;
+    // the functor should return true
+    auto metrics_registry = cache_manager_->metrics_registry_;
+    auto mock_backend = std::make_shared<MockDataStorageBackend>(metrics_registry);
+    EXPECT_CALL(*mock_backend, MightExist(_)).WillOnce([](const std::vector<DataStorageUri> &uris) {
+        return std::vector<bool>(uris.size(), true);
+    });
+
+    auto dsm = registry_manager_->data_storage_manager_;
+    dsm->storage_map_["mock_store"] = mock_backend;
+
+    auto func = cache_manager_->GetCheckLocDataExistFunc();
+
+    CacheLocation loc;
+    loc.set_status(CLS_SERVING);
+    loc.set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
+    loc.set_location_specs(
+        {LocationSpec("tp0", "file://mock_store/path_a"), LocationSpec("tp1", "file://mock_store/path_b")});
+    ASSERT_TRUE(func(loc));
+
+    dsm->storage_map_.erase("mock_store");
+}
+
+TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_NoneExist) {
+    // inject a mock backend where MightExist returns all false;
+    // the functor should return false
+    auto metrics_registry = cache_manager_->metrics_registry_;
+    auto mock_backend = std::make_shared<MockDataStorageBackend>(metrics_registry);
+    EXPECT_CALL(*mock_backend, MightExist(_)).WillOnce([](const std::vector<DataStorageUri> &uris) {
+        return std::vector<bool>(uris.size(), false);
+    });
+
+    auto dsm = registry_manager_->data_storage_manager_;
+    dsm->storage_map_["mock_store"] = mock_backend;
+
+    auto func = cache_manager_->GetCheckLocDataExistFunc();
+
+    CacheLocation loc;
+    loc.set_status(CLS_SERVING);
+    loc.set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
+    loc.set_location_specs(
+        {LocationSpec("tp0", "file://mock_store/path_a"), LocationSpec("tp1", "file://mock_store/path_b")});
+    ASSERT_FALSE(func(loc));
+
+    dsm->storage_map_.erase("mock_store");
+}
+
+TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_PartialExist) {
+    // inject a mock backend where MightExist returns mixed results;
+    // std::all_of requires all true, so the functor should return false
+    auto metrics_registry = cache_manager_->metrics_registry_;
+    auto mock_backend = std::make_shared<MockDataStorageBackend>(metrics_registry);
+    EXPECT_CALL(*mock_backend, MightExist(_)).WillOnce([](const std::vector<DataStorageUri> &uris) {
+        std::vector<bool> result(uris.size(), true);
+        // mark the last URI as non-existent
+        result.back() = false;
+        return result;
+    });
+
+    auto dsm = registry_manager_->data_storage_manager_;
+    dsm->storage_map_["mock_store"] = mock_backend;
+
+    auto func = cache_manager_->GetCheckLocDataExistFunc();
+
+    CacheLocation loc;
+    loc.set_status(CLS_SERVING);
+    loc.set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
+    loc.set_location_specs(
+        {LocationSpec("tp0", "file://mock_store/path_a"), LocationSpec("tp1", "file://mock_store/path_b")});
+    ASSERT_FALSE(func(loc));
+
+    dsm->storage_map_.erase("mock_store");
+}
+
+TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_VerifiesUriPassthrough) {
+    // verify that the functor passes the correct parsed URIs to
+    // MightExist and uses the hostname from the first URI for backend
+    // lookup
+    auto metrics_registry = cache_manager_->metrics_registry_;
+    auto mock_backend = std::make_shared<MockDataStorageBackend>(metrics_registry);
+    EXPECT_CALL(*mock_backend, MightExist(_)).WillOnce([](const std::vector<DataStorageUri> &uris) {
+        // should receive exactly 2 valid URIs (invalid ones
+        // filtered out)
+        EXPECT_EQ(2u, uris.size());
+        EXPECT_EQ("mock_store", uris[0].GetHostName());
+        EXPECT_EQ("mock_store", uris[1].GetHostName());
+        return std::vector<bool>{true, true};
+    });
+
+    auto dsm = registry_manager_->data_storage_manager_;
+    dsm->storage_map_["mock_store"] = mock_backend;
+
+    auto func = cache_manager_->GetCheckLocDataExistFunc();
+
+    CacheLocation loc;
+    loc.set_status(CLS_SERVING);
+    loc.set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
+    // mix of invalid and valid URIs; only valid ones should reach
+    // MightExist
+    loc.set_location_specs({LocationSpec("tp0", "no_protocol"),
+                            LocationSpec("tp1", "file://mock_store/path_a"),
+                            LocationSpec("tp2", "file://mock_store/path_b")});
+    ASSERT_TRUE(func(loc));
+
+    dsm->storage_map_.erase("mock_store");
+}
+
+TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_UnregisteredBackend) {
+    // valid URIs whose hostname does not match any registered backend;
+    // DataStorageManager::Exist returns an empty vector, and
+    // std::all_of on an empty range is true -> functor returns true
+    auto func = cache_manager_->GetCheckLocDataExistFunc();
+
+    CacheLocation loc;
+    loc.set_status(CLS_SERVING);
+    loc.set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
+    loc.set_location_specs({LocationSpec("tp0", "file://nonexistent_backend/path")});
+    ASSERT_TRUE(func(loc));
+}
+
+TEST_F(CacheManagerTest, TestGetSubmitDelReqFunc_NullExecutor) {
+    // when schedule_plan_executor_ is null, calling the functor should
+    // not crash
+    auto saved = cache_manager_->schedule_plan_executor_;
+    cache_manager_->schedule_plan_executor_ = nullptr;
+
+    auto func = cache_manager_->GetSubmitDelReqFunc("test_instance");
+    func({1, 2, 3}, {{"loc_a"}, {"loc_b"}, {"loc_c"}});
+
+    cache_manager_->schedule_plan_executor_ = saved;
+}
+
+TEST_F(CacheManagerTest, TestGetSubmitDelReqFunc_SubmitsToExecutor) {
+    // verify that the functor actually submits a task to the
+    // schedule_plan_executor_ by checking that the internal task queue
+    // grows
+    auto &executor = cache_manager_->schedule_plan_executor_;
+
+    // stop worker threads so tasks accumulate in the queue without
+    // being consumed
+    executor->stop_.store(true);
+    executor->condition_.notify_all();
+    for (auto &w : executor->workers_) {
+        if (w.joinable()) {
+            w.join();
+        }
+    }
+    executor->workers_.clear();
+    // reset stop_ so SubmitRaw accepts new tasks
+    executor->stop_.store(false);
+
+    {
+        std::lock_guard<std::mutex> lock(executor->queue_mutex_);
+        executor->tasks_.clear();
+    }
+
+    auto func = cache_manager_->GetSubmitDelReqFunc("test_instance");
+    func({100, 200}, {{"loc_a"}, {"loc_b"}});
+
+    {
+        std::lock_guard<std::mutex> lock(executor->queue_mutex_);
+        ASSERT_EQ(1u, executor->tasks_.size());
+    }
+
+    // submit a second request and verify count increases
+    func({300}, {{"loc_c"}});
+    {
+        std::lock_guard<std::mutex> lock(executor->queue_mutex_);
+        ASSERT_EQ(2u, executor->tasks_.size());
+    }
+
+    // clean up: clear tasks so executor destructor is clean
+    {
+        std::lock_guard<std::mutex> lock(executor->queue_mutex_);
+        executor->tasks_.clear();
+    }
+}
+
+TEST_F(CacheManagerTest, TestGetSubmitDelReqFunc_DeletesLocationMetadata) {
+    // end-to-end: write cache entries, then use the del functor to
+    // request deletion; verify the location status changes
+    auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    ASSERT_EQ(expected,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               "test_instance",
+                                               64,
+                                               createLocationSpecInfos(),
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>()));
+
+    std::vector<std::int64_t> keys{1001, 1002};
+    auto [ec1, start_write_cache_info] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 100000000);
+    ASSERT_EQ(EC_OK, ec1);
+
+    {
+        BlockMask block_mask = static_cast<std::size_t>(2);
+        auto ec = cache_manager_->FinishWriteCache(
+            request_context_.get(), "test_instance", start_write_cache_info.write_session_id(), block_mask);
+        ASSERT_EQ(EC_OK, ec);
+    }
+
+    // collect location IDs from metadata
+    BlockMask block_mask = static_cast<std::size_t>(0);
+    std::vector<std::vector<std::string>> loc_ids;
+    {
+        auto [ec, cache_metas] =
+            cache_manager_->GetCacheMeta(request_context_.get(), "test_instance", keys, {}, block_mask, 0);
+        ASSERT_EQ(EC_OK, ec);
+        const auto &views = cache_metas.cache_locations_view();
+        ASSERT_EQ(2u, views.size());
+        for (const auto &view : views) {
+            std::map<std::string, std::string> meta;
+            ASSERT_TRUE(Jsonizable::FromJsonString(cache_metas.metas()[&view - &views[0]], meta));
+            ASSERT_EQ(CacheLocation::CacheLocationStatusToString(CacheLocationStatus::CLS_SERVING), meta.at("status"));
+            loc_ids.push_back({view.cache_location_.id()});
+        }
+    }
+
+    // use GetSubmitDelReqFunc to submit a deletion request
+    auto del_func = cache_manager_->GetSubmitDelReqFunc("test_instance");
+    del_func(keys, loc_ids);
+
+    // wait for the async executor to process the request
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+    // verify location statuses changed to DELETING or NOT_FOUND
+    {
+        auto [ec, cache_metas] =
+            cache_manager_->GetCacheMeta(request_context_.get(), "test_instance", keys, {}, block_mask, 0);
+        ASSERT_EQ(EC_OK, ec);
+        const auto &metas = cache_metas.metas();
+        ASSERT_EQ(2u, metas.size());
+        for (int i = 0; i < 2; ++i) {
+            std::map<std::string, std::string> meta;
+            ASSERT_TRUE(Jsonizable::FromJsonString(metas[i], meta));
+            auto status = meta.at("status");
+            ASSERT_TRUE(status == CacheLocation::CacheLocationStatusToString(CacheLocationStatus::CLS_DELETING) ||
+                        status == CacheLocation::CacheLocationStatusToString(CacheLocationStatus::CLS_NOT_FOUND))
+                << "expected DELETING or NOT_FOUND, got: " << status;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// FilterWriteCache tests: verify the aggressive prune policy feature
+// where stale locations (data no longer on storage) are detected via
+// MightExist, excluded from the block mask, and submitted for deletion.
+// ---------------------------------------------------------------------
+
+TEST_F(CacheManagerTest, TestFilterWriteCache_NoStaleLocations) {
+    // baseline: all existing locations have valid data, so behaviour
+    // should be the same as before the aggressive prune feature
+    auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    ASSERT_EQ(expected,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               "test_instance",
+                                               64,
+                                               createLocationSpecInfos(),
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>()));
+
+    // write keys {1,2} and finish them as CLS_SERVING
+    std::vector<std::int64_t> write_keys{1, 2};
+    auto [ec1, swci1] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", write_keys, {}, {}, 100000000);
+    ASSERT_EQ(EC_OK, ec1);
+    {
+        BlockMask bm = static_cast<std::size_t>(2);
+        ASSERT_EQ(
+            EC_OK,
+            cache_manager_->FinishWriteCache(request_context_.get(), "test_instance", swci1.write_session_id(), bm));
+    }
+
+    // install interceptor that returns all-true (data exists)
+    auto dsm = registry_manager_->data_storage_manager_;
+    auto original = dsm->storage_map_["nfs_01"];
+    std::atomic<int> might_exist_calls{0};
+    dsm->storage_map_["nfs_01"] = std::make_shared<MightExistInterceptor>(
+        original, [&might_exist_calls](const std::vector<DataStorageUri> &uris) {
+            might_exist_calls.fetch_add(1);
+            return std::vector<bool>(uris.size(), true);
+        });
+
+    // StartWriteCache with {1, 2, 3, 4}; keys 1,2 exist, 3,4 need
+    // new writes
+    std::vector<std::int64_t> keys{1, 2, 3, 4};
+    auto [ec2, swci2] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 100000000);
+    ASSERT_EQ(EC_OK, ec2);
+
+    // contiguous prefix → BlockMaskOffset
+    ASSERT_EQ(2u, std::get<BlockMaskOffset>(swci2.block_mask()));
+    ASSERT_EQ(2u, swci2.locations().cache_locations_view().size());
+
+    // MightExist should have been called for the 2 existing
+    // CLS_SERVING locations
+    ASSERT_EQ(2, might_exist_calls.load());
+
+    dsm->storage_map_["nfs_01"] = original;
+}
+
+TEST_F(CacheManagerTest, TestFilterWriteCache_StaleBreaksPrefix) {
+    // one stale location in the middle of what would otherwise be a
+    // contiguous prefix; the block mask should become a vector
+    auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    ASSERT_EQ(expected,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               "test_instance",
+                                               64,
+                                               createLocationSpecInfos(),
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>()));
+
+    // write keys {1,2,3} and finish as CLS_SERVING
+    std::vector<std::int64_t> write_keys{1, 2, 3};
+    auto [ec1, swci1] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", write_keys, {}, {}, 100000000);
+    ASSERT_EQ(EC_OK, ec1);
+    {
+        BlockMask bm = static_cast<std::size_t>(3);
+        ASSERT_EQ(
+            EC_OK,
+            cache_manager_->FinishWriteCache(request_context_.get(), "test_instance", swci1.write_session_id(), bm));
+    }
+
+    // stop executor workers so we can inspect queued tasks
+    auto &executor = cache_manager_->schedule_plan_executor_;
+    executor->stop_.store(true);
+    executor->condition_.notify_all();
+    for (auto &w : executor->workers_) {
+        if (w.joinable()) {
+            w.join();
+        }
+    }
+    executor->workers_.clear();
+    executor->stop_.store(false);
+    {
+        std::lock_guard<std::mutex> lock(executor->queue_mutex_);
+        executor->tasks_.clear();
+    }
+
+    // install interceptor: key 1 exists, key 2 stale, key 3 exists
+    auto dsm = registry_manager_->data_storage_manager_;
+    auto original = dsm->storage_map_["nfs_01"];
+    std::atomic<int> call_idx{0};
+    dsm->storage_map_["nfs_01"] =
+        std::make_shared<MightExistInterceptor>(original, [&call_idx](const std::vector<DataStorageUri> &uris) {
+            int idx = call_idx.fetch_add(1);
+            if (idx == 1) {
+                // second CLS_SERVING location (key 2): stale
+                return std::vector<bool>(uris.size(), false);
+            }
+            return std::vector<bool>(uris.size(), true);
+        });
+
+    // StartWriteCache with {1, 2, 3, 4}
+    std::vector<std::int64_t> keys{1, 2, 3, 4};
+    auto [ec2, swci2] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 100000000);
+    ASSERT_EQ(EC_OK, ec2);
+
+    // key 2 stale breaks the contiguous prefix → BlockMaskVector
+    auto mask = std::get<BlockMaskVector>(swci2.block_mask());
+    ASSERT_EQ(4u, mask.size());
+    ASSERT_TRUE(mask[0]);  // key 1: valid
+    ASSERT_FALSE(mask[1]); // key 2: stale
+    ASSERT_TRUE(mask[2]);  // key 3: valid
+    ASSERT_FALSE(mask[3]); // key 4: not written yet
+    // 2 new write locations: for keys 2 and 4
+    ASSERT_EQ(2u, swci2.locations().cache_locations_view().size());
+
+    // a deletion request should have been submitted for the stale
+    // location
+    {
+        std::lock_guard<std::mutex> lock(executor->queue_mutex_);
+        ASSERT_EQ(1u, executor->tasks_.size());
+    }
+
+    // clean up
+    {
+        std::lock_guard<std::mutex> lock(executor->queue_mutex_);
+        executor->tasks_.clear();
+    }
+    dsm->storage_map_["nfs_01"] = original;
+}
+
+TEST_F(CacheManagerTest, TestFilterWriteCache_AllStale) {
+    // all existing locations are stale; block mask should indicate all
+    // keys need new writes (offset 0); deletion requests submitted for
+    // all stale keys
+    auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    ASSERT_EQ(expected,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               "test_instance",
+                                               64,
+                                               createLocationSpecInfos(),
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>()));
+
+    // write keys {1,2} and finish as CLS_SERVING
+    std::vector<std::int64_t> write_keys{1, 2};
+    auto [ec1, swci1] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", write_keys, {}, {}, 100000000);
+    ASSERT_EQ(EC_OK, ec1);
+    {
+        BlockMask bm = static_cast<std::size_t>(2);
+        ASSERT_EQ(
+            EC_OK,
+            cache_manager_->FinishWriteCache(request_context_.get(), "test_instance", swci1.write_session_id(), bm));
+    }
+
+    // stop executor workers
+    auto &executor = cache_manager_->schedule_plan_executor_;
+    executor->stop_.store(true);
+    executor->condition_.notify_all();
+    for (auto &w : executor->workers_) {
+        if (w.joinable()) {
+            w.join();
+        }
+    }
+    executor->workers_.clear();
+    executor->stop_.store(false);
+    {
+        std::lock_guard<std::mutex> lock(executor->queue_mutex_);
+        executor->tasks_.clear();
+    }
+
+    // install interceptor: all stale
+    auto dsm = registry_manager_->data_storage_manager_;
+    auto original = dsm->storage_map_["nfs_01"];
+    dsm->storage_map_["nfs_01"] = std::make_shared<MightExistInterceptor>(
+        original, [](const std::vector<DataStorageUri> &uris) { return std::vector<bool>(uris.size(), false); });
+
+    // StartWriteCache with {1, 2, 3}
+    std::vector<std::int64_t> keys{1, 2, 3};
+    auto [ec2, swci2] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 100000000);
+    ASSERT_EQ(EC_OK, ec2);
+
+    // all stale + one new key → contiguous prefix of not-existing from
+    // offset 0
+    ASSERT_EQ(0u, std::get<BlockMaskOffset>(swci2.block_mask()));
+    // all 3 keys need new write locations
+    ASSERT_EQ(3u, swci2.locations().cache_locations_view().size());
+
+    // deletion request submitted for the 2 stale keys
+    {
+        std::lock_guard<std::mutex> lock(executor->queue_mutex_);
+        ASSERT_EQ(1u, executor->tasks_.size());
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(executor->queue_mutex_);
+        executor->tasks_.clear();
+    }
+    dsm->storage_map_["nfs_01"] = original;
+}
+
+TEST_F(CacheManagerTest, TestFilterWriteCache_StaleSuffix) {
+    // stale locations are in the suffix (after the first valid prefix);
+    // since all entries from first_empty onward are not-existing, the
+    // contiguous prefix optimisation (BlockMaskOffset) still applies
+    auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    ASSERT_EQ(expected,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               "test_instance",
+                                               64,
+                                               createLocationSpecInfos(),
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>()));
+
+    // write keys {1,2,3} and finish as CLS_SERVING
+    std::vector<std::int64_t> write_keys{1, 2, 3};
+    auto [ec1, swci1] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", write_keys, {}, {}, 100000000);
+    ASSERT_EQ(EC_OK, ec1);
+    {
+        BlockMask bm = static_cast<std::size_t>(3);
+        ASSERT_EQ(
+            EC_OK,
+            cache_manager_->FinishWriteCache(request_context_.get(), "test_instance", swci1.write_session_id(), bm));
+    }
+
+    // stop executor workers
+    auto &executor = cache_manager_->schedule_plan_executor_;
+    executor->stop_.store(true);
+    executor->condition_.notify_all();
+    for (auto &w : executor->workers_) {
+        if (w.joinable()) {
+            w.join();
+        }
+    }
+    executor->workers_.clear();
+    executor->stop_.store(false);
+    {
+        std::lock_guard<std::mutex> lock(executor->queue_mutex_);
+        executor->tasks_.clear();
+    }
+
+    // install interceptor: key 1 valid, key 2 stale, key 3 stale
+    auto dsm = registry_manager_->data_storage_manager_;
+    auto original = dsm->storage_map_["nfs_01"];
+    std::atomic<int> call_idx{0};
+    dsm->storage_map_["nfs_01"] =
+        std::make_shared<MightExistInterceptor>(original, [&call_idx](const std::vector<DataStorageUri> &uris) {
+            int idx = call_idx.fetch_add(1);
+            if (idx == 0) {
+                // first CLS_SERVING location (key 1): valid
+                return std::vector<bool>(uris.size(), true);
+            }
+            // keys 2, 3: stale
+            return std::vector<bool>(uris.size(), false);
+        });
+
+    // StartWriteCache with {1, 2, 3}; key 1 exists, keys 2,3 stale
+    std::vector<std::int64_t> keys{1, 2, 3};
+    auto [ec2, swci2] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 100000000);
+    ASSERT_EQ(EC_OK, ec2);
+
+    // from offset 1 onward all are not-existing → BlockMaskOffset
+    ASSERT_EQ(1u, std::get<BlockMaskOffset>(swci2.block_mask()));
+    // 2 new write locations for keys 2,3
+    ASSERT_EQ(2u, swci2.locations().cache_locations_view().size());
+
+    // deletion request submitted for stale keys 2,3
+    {
+        std::lock_guard<std::mutex> lock(executor->queue_mutex_);
+        ASSERT_EQ(1u, executor->tasks_.size());
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(executor->queue_mutex_);
+        executor->tasks_.clear();
+    }
+    dsm->storage_map_["nfs_01"] = original;
+}
+
+TEST_F(CacheManagerTest, TestFilterWriteCache_StaleVsNonEmptyBlockMask) {
+    // verify that the block mask uses exists_results (data existence)
+    // rather than the old !location_maps[i].empty() check; a location
+    // map can be non-empty (has CLS_SERVING metadata) yet the data is
+    // stale, so it should be marked false in the mask
+    auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    ASSERT_EQ(expected,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               "test_instance",
+                                               64,
+                                               createLocationSpecInfos(),
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>()));
+
+    // write keys {1,2,3,4} and finish as CLS_SERVING
+    std::vector<std::int64_t> write_keys{1, 2, 3, 4};
+    auto [ec1, swci1] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", write_keys, {}, {}, 100000000);
+    ASSERT_EQ(EC_OK, ec1);
+    {
+        BlockMask bm = static_cast<std::size_t>(4);
+        ASSERT_EQ(
+            EC_OK,
+            cache_manager_->FinishWriteCache(request_context_.get(), "test_instance", swci1.write_session_id(), bm));
+    }
+
+    // install interceptor: keys 1,3 valid; keys 2,4 stale
+    auto dsm = registry_manager_->data_storage_manager_;
+    auto original = dsm->storage_map_["nfs_01"];
+    std::atomic<int> call_idx{0};
+    dsm->storage_map_["nfs_01"] =
+        std::make_shared<MightExistInterceptor>(original, [&call_idx](const std::vector<DataStorageUri> &uris) {
+            int idx = call_idx.fetch_add(1);
+            if (idx == 0 || idx == 2) {
+                // keys 1 and 3: valid
+                return std::vector<bool>(uris.size(), true);
+            }
+            // keys 2 and 4: stale
+            return std::vector<bool>(uris.size(), false);
+        });
+
+    // StartWriteCache with {1, 2, 3, 4}; re-request same keys
+    std::vector<std::int64_t> keys{1, 2, 3, 4};
+    auto [ec2, swci2] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 100000000);
+    ASSERT_EQ(EC_OK, ec2);
+
+    // stale entries produce a non-contiguous pattern → BlockMaskVector
+    auto mask = std::get<BlockMaskVector>(swci2.block_mask());
+    ASSERT_EQ(4u, mask.size());
+    ASSERT_TRUE(mask[0]);  // key 1: valid data
+    ASSERT_FALSE(mask[1]); // key 2: stale → needs rewrite
+    ASSERT_TRUE(mask[2]);  // key 3: valid data
+    ASSERT_FALSE(mask[3]); // key 4: stale → needs rewrite
+    // 2 new write locations for stale keys 2 and 4
+    ASSERT_EQ(2u, swci2.locations().cache_locations_view().size());
+
+    dsm->storage_map_["nfs_01"] = original;
 }
 
 } // namespace kv_cache_manager
