@@ -700,7 +700,7 @@ class HiCacheKVCM(HiCacheStorage):
                     results[transfer.name] = [True] * len(keys)
                     continue
 
-                assert len(save_indices) == len(locations)
+                assert len(save_indices) + _prefix_write_count == len(locations)
 
                 # Data transfer preparation and execution.
                 # Wrapped in try-except so that every rank always reaches the
