@@ -30,7 +30,6 @@ public:
                                   const std::string &trace_id,
                                   std::function<void()> cb) override;
     std::vector<bool> Exist(const std::vector<DataStorageUri> &storage_uris) override;
-    std::vector<bool> MightExist(const std::vector<DataStorageUri> &storage_uris) override;
     std::vector<ErrorCode> Lock(const std::vector<DataStorageUri> &storage_uris) override;
     std::vector<ErrorCode> UnLock(const std::vector<DataStorageUri> &storage_uris) override;
 

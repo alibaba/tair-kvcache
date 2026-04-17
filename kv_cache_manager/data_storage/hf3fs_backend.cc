@@ -130,13 +130,6 @@ std::vector<bool> Hf3fsBackend::Exist(const std::vector<DataStorageUri> &storage
     return result;
 }
 
-std::vector<bool> Hf3fsBackend::MightExist(const std::vector<DataStorageUri> &storage_uris) {
-    if (!spec_.touch_file_when_create()) {
-        return std::vector<bool>(storage_uris.size(), true);
-    }
-    return Exist(storage_uris);
-}
-
 std::vector<ErrorCode> Hf3fsBackend::Lock(const std::vector<DataStorageUri> &storage_uris) {
     std::vector<ErrorCode> result(storage_uris.size(), EC_OK);
     // not supported yet
