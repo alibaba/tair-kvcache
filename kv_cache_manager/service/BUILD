@@ -22,6 +22,7 @@ cc_library(
         "-fcoroutines",
     ],
     deps = [
+        "//kv_cache_manager/common:build_version",
         ":grpc_wrapper",
         "//kv_cache_manager/common",
         "//kv_cache_manager/common:loop_thread",

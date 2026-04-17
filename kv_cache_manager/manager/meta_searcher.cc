@@ -1,6 +1,6 @@
 #include "kv_cache_manager/manager/meta_searcher.h"
 
-#include <set>
+#include <map>
 #include <utility>
 
 #include "kv_cache_manager/common/logger.h"
@@ -30,6 +30,68 @@ void LogErrorCodes(const std::string &operation_name,
             KVCM_LOG_WARN("%s failed, keys[%lu](%lu) return %d", operation_name.c_str(), i, keys[i], error_codes[i]);
         }
     }
+}
+
+CacheLocation SelectAndMergeForMatch(SelectLocationPolicy *policy,
+                                     CacheLocationMap &location_map,
+                                     CheckLocDataExistFunc check_loc_data_exist,
+                                     std::vector<std::string> &out_prune_loc_ids) {
+    // Filter valid locations into a shared map.
+    CacheLocationMap valid_map;
+    for (auto &[id, loc] : location_map) {
+        if (loc.status() != CacheLocationStatus::CLS_SERVING) {
+            continue;
+        }
+        if (check_loc_data_exist && !check_loc_data_exist(loc)) {
+            out_prune_loc_ids.push_back(id);
+            continue;
+        }
+        valid_map.try_emplace(id, loc);
+    }
+    if (valid_map.empty()) {
+        return {};
+    }
+
+    // Use the policy to select one winning location, which determines the
+    // target storage backend instance.
+    std::vector<std::string> unused_prune_ids;
+    CacheLocation *winner = policy->SelectForMatch(valid_map, nullptr, unused_prune_ids);
+    if (!winner || winner->location_specs().empty()) {
+        return {};
+    }
+
+    // Collect all specs from every valid location that belongs to the same
+    // storage backend as the winner, dedup by spec name.
+    std::map<std::string, LocationSpec> merged_specs;
+    for (auto &[id, loc] : valid_map) {
+        if (!policy->IsSameDataStorage(loc, *winner)) {
+            continue;
+        }
+        for (const auto &spec : loc.location_specs()) {
+            merged_specs.try_emplace(spec.name(), spec);
+        }
+    }
+
+    if (merged_specs.empty()) {
+        return {};
+    }
+
+    // NOTE: this is an aggregated view merging
+    // specs from multiple locations, not a real stored entity. Downstream
+    // CacheLocationView / proto serialization never accesses id either.
+    std::string representative_id = winner->id() + "merged";
+    CacheLocation result;
+    result.set_id(std::move(representative_id));
+    result.set_status(CacheLocationStatus::CLS_SERVING);
+    result.set_type(winner->type());
+    std::vector<LocationSpec> specs;
+    specs.reserve(merged_specs.size());
+    for (auto &[name, spec] : merged_specs) {
+        specs.push_back(std::move(spec));
+    }
+    result.set_spec_size(specs.size());
+    result.set_location_specs(std::move(specs));
+    return result;
 }
 
 } // namespace
@@ -106,18 +168,17 @@ ErrorCode MetaSearcher::PrefixMatchBestLocationImpl(RequestContext *request_cont
             break;
         }
         std::vector<std::string> prune_loc_ids;
-        const CacheLocation *best_location =
-            policy->SelectForMatch(location_map, check_loc_data_exist_func_, prune_loc_ids);
+        CacheLocation merged = SelectAndMergeForMatch(policy, location_map, check_loc_data_exist_func_, prune_loc_ids);
         if (!prune_loc_ids.empty()) {
             prune_keys.emplace_back(keys[i]);
             prune_loc_ids_vec.emplace_back(prune_loc_ids);
         }
-        if (best_location == nullptr) {
+        if (merged.location_specs().empty()) {
             KVCM_LOG_DEBUG("prefix match end because keys[%lu] no serving location", i);
             ++i;
             break;
         }
-        out_locations.push_back(*best_location);
+        out_locations.push_back(std::move(merged));
     }
 
     if (!prune_keys.empty()) {
@@ -221,17 +282,16 @@ ErrorCode MetaSearcher::BatchGetBestLocation(RequestContext *request_context,
             continue;
         }
         std::vector<std::string> prune_loc_ids;
-        const CacheLocation *best_location =
-            policy->SelectForMatch(location_map, check_loc_data_exist_func_, prune_loc_ids);
+        CacheLocation merged = SelectAndMergeForMatch(policy, location_map, check_loc_data_exist_func_, prune_loc_ids);
         if (!prune_loc_ids.empty()) {
             prune_keys.emplace_back(keys[i]);
             prune_loc_ids_vec.emplace_back(prune_loc_ids);
         }
-        if (best_location == nullptr) {
+        if (merged.location_specs().empty()) {
             out_locations.push_back({});
             continue;
         }
-        out_locations.push_back(*best_location);
+        out_locations.push_back(std::move(merged));
     }
     KVCM_METRICS_COLLECTOR_SET_METRICS(
         service_metrics_collector, meta_searcher, index_deserialize_time_us, index_deserialize_time_us);
@@ -298,19 +358,19 @@ ErrorCode MetaSearcher::ReverseRollSlideWindowMatch(RequestContext *request_cont
                 break;
             }
             std::vector<std::string> prune_loc_ids;
-            CacheLocation *best_location =
-                policy->SelectForMatch(location_map, check_loc_data_exist_func_, prune_loc_ids);
+            CacheLocation merged =
+                SelectAndMergeForMatch(policy, location_map, check_loc_data_exist_func_, prune_loc_ids);
             if (!prune_loc_ids.empty()) {
                 prune_keys.emplace_back(keys[base + offset]);
                 prune_loc_ids_vec.emplace_back(prune_loc_ids);
             }
-            if (best_location == nullptr) {
+            if (merged.location_specs().empty()) {
                 temp_sw_locations.clear();
                 base -= sw_size - offset;
                 is_match = false;
                 break;
             }
-            temp_sw_locations.push_back(std::move(*best_location));
+            temp_sw_locations.push_back(std::move(merged));
         }
         if (is_match) {
             std::move(temp_sw_locations.begin(), temp_sw_locations.end(), out_locations.begin() + base);

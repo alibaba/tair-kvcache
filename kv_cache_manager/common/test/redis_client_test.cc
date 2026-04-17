@@ -338,9 +338,8 @@ TEST_F(RedisClientTest, TestGet) {
 
         std::vector<std::string> keys{"key1", "key2"};
         std::vector<std::map<std::string, std::string>> field_maps;
-        std::vector<std::map<std::string, std::string>> expected_field_maps{{{"f1", ""}, {"f2", ""}},
-                                                                            {{"f1", ""}, {"f2", "v2-2-0"}}};
-        std::vector<ErrorCode> expected_ec_per_key{EC_OK, EC_OK};
+        std::vector<std::map<std::string, std::string>> expected_field_maps{{}, {{"f2", "v2-2-0"}}};
+        std::vector<ErrorCode> expected_ec_per_key{EC_NOENT, EC_OK};
         auto ec_per_key = redis_client_->Get(keys, /*field_names*/ {"f1", "f2"}, field_maps);
         ASSERT_EQ(expected_ec_per_key, ec_per_key);
         ASSERT_EQ(expected_field_maps, field_maps);
@@ -357,9 +356,8 @@ TEST_F(RedisClientTest, TestGet) {
 
         std::vector<std::string> keys{"key1", "key2"};
         std::vector<std::map<std::string, std::string>> field_maps;
-        std::vector<std::map<std::string, std::string>> expected_field_maps{{{"f1", ""}, {"f2", ""}},
-                                                                            {{"f1", ""}, {"f2", ""}}};
-        std::vector<ErrorCode> expected_ec_per_key{EC_OK, EC_OK};
+        std::vector<std::map<std::string, std::string>> expected_field_maps{{}, {}};
+        std::vector<ErrorCode> expected_ec_per_key{EC_NOENT, EC_NOENT};
         auto ec_per_key = redis_client_->Get(keys, /*field_names*/ {"f1", "f2"}, field_maps);
         ASSERT_EQ(expected_ec_per_key, ec_per_key);
         ASSERT_EQ(expected_field_maps, field_maps);

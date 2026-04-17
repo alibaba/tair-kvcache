@@ -241,11 +241,9 @@ TEST_F(MetaSearcherTest, TestPrefixMatch) {
         EXPECT_EQ(ec, ErrorCode::EC_OK);
         EXPECT_EQ(out_locations.size(), test_data.result_length);
 
-        // 验证返回的locations与添加的locations匹配
+        // 验证返回的 locations（合并视图的 id 无单一元数据语义；type 为策略 winner 的后端类型）
         for (size_t i = 0; i < out_locations.size(); i++) {
-            EXPECT_EQ(out_locations[i].id(), out_location_ids[i]);
             EXPECT_EQ(out_locations[i].status(), CLS_SERVING);
-            EXPECT_EQ(out_locations[i].type(), locations[i].type());
         }
     }
 
@@ -263,11 +261,9 @@ TEST_F(MetaSearcherTest, TestPrefixMatch) {
         EXPECT_EQ(ec, ErrorCode::EC_OK);
         EXPECT_EQ(out_locations.size(), 2);
 
-        // 验证返回的locations与添加的locations匹配（跳过第一个）
+        // 验证返回的 locations（合并视图的 id 无单一元数据语义）
         for (size_t i = 0; i < out_locations.size(); i++) {
-            EXPECT_EQ(out_locations[i].id(), out_location_ids[i + 1]);
             EXPECT_EQ(out_locations[i].status(), CLS_SERVING);
-            EXPECT_EQ(out_locations[i].type(), locations[i + 1].type());
         }
     }
 }
@@ -1191,4 +1187,136 @@ TEST_F(MetaSearcherTest, TestBatchCADLocationStatusErrorCases) {
     std::vector<std::vector<ErrorCode>> out_batch_results;
     ErrorCode ec = meta_searcher_->BatchCADLocationStatus(request_context_.get(), keys, batch_tasks, out_batch_results);
     EXPECT_EQ(ec, ErrorCode::EC_BADARGS);
+}
+
+TEST_F(MetaSearcherTest, TestPrefixMatchMergesSpecsByStorageType) {
+    MetaSearcher::KeyVector keys = {50000, 50001, 50002};
+
+    // Location A: NFS with spec "tp0"
+    std::vector<LocationSpec> specs_a = {MetaSearcherTestHelper::CreateLocationSpec("tp0", "nfs:///a/tp0")};
+    CacheLocation loc_a =
+        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, specs_a);
+
+    // Location B: NFS with spec "tp1" (same storage type, different spec)
+    std::vector<LocationSpec> specs_b = {MetaSearcherTestHelper::CreateLocationSpec("tp1", "nfs:///b/tp1")};
+    CacheLocation loc_b =
+        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, specs_b);
+
+    // Add location A to all keys
+    CacheLocationVector locations_a = {loc_a, loc_a, loc_a};
+    std::vector<std::string> out_ids_a;
+    ErrorCode ec = meta_searcher_->BatchAddLocation(request_context_.get(), keys, locations_a, out_ids_a);
+    ASSERT_EQ(ec, ErrorCode::EC_OK);
+    ASSERT_EQ(out_ids_a.size(), 3);
+
+    // Add location B to all keys
+    CacheLocationVector locations_b = {loc_b, loc_b, loc_b};
+    std::vector<std::string> out_ids_b;
+    ec = meta_searcher_->BatchAddLocation(request_context_.get(), keys, locations_b, out_ids_b);
+    ASSERT_EQ(ec, ErrorCode::EC_OK);
+    ASSERT_EQ(out_ids_b.size(), 3);
+
+    // Mark all locations as SERVING
+    std::vector<std::vector<MetaSearcher::LocationUpdateTask>> batch_tasks;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        std::vector<MetaSearcher::LocationUpdateTask> tasks;
+        tasks.push_back({out_ids_a[i], CLS_SERVING});
+        tasks.push_back({out_ids_b[i], CLS_SERVING});
+        batch_tasks.push_back(tasks);
+    }
+    std::vector<std::vector<ErrorCode>> update_results;
+    ec = meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), keys, batch_tasks, update_results);
+    ASSERT_EQ(ec, ErrorCode::EC_OK);
+
+    // PrefixMatch should merge specs from all same-type locations
+    CacheLocationVector out_locations;
+    BlockMask mask;
+    ec = meta_searcher_->PrefixMatch(request_context_.get(), keys, mask, out_locations, &policy_);
+    ASSERT_EQ(ec, ErrorCode::EC_OK);
+    ASSERT_EQ(out_locations.size(), 3);
+
+    for (size_t i = 0; i < out_locations.size(); ++i) {
+        const auto &loc = out_locations[i];
+        // Both locations are NFS, so specs from both should be merged
+        ASSERT_EQ(loc.location_specs().size(), 2) << "key index " << i << " should have 2 specs merged from same type";
+        EXPECT_EQ(loc.spec_size(), loc.location_specs().size())
+            << "spec_size must equal location_specs count after merge";
+        EXPECT_EQ(loc.type(), DataStorageType::DATA_STORAGE_TYPE_NFS);
+        for (const auto &spec : loc.location_specs()) {
+            EXPECT_FALSE(spec.uri().empty());
+        }
+    }
+}
+
+TEST_F(MetaSearcherTest, TestBatchGetMergesSpecsByStorageType) {
+    MetaSearcher::KeyVector keys = {60000, 60001};
+
+    // Key 60000: add 2 locations with different specs but SAME storage type (NFS)
+    std::vector<LocationSpec> specs_a = {MetaSearcherTestHelper::CreateLocationSpec("tp0", "nfs:///a/tp0")};
+    std::vector<LocationSpec> specs_b = {MetaSearcherTestHelper::CreateLocationSpec("tp1", "nfs:///b/tp1")};
+    CacheLocation loc_a =
+        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, specs_a);
+    CacheLocation loc_b =
+        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, specs_b);
+
+    // Key 60001: add only 1 location
+    std::vector<LocationSpec> specs_c = {MetaSearcherTestHelper::CreateLocationSpec("tp0", "mooncake:///c/tp0")};
+    CacheLocation loc_c =
+        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE, 1, specs_c);
+
+    // Add loc_a to key 60000, loc_c to key 60001
+    {
+        CacheLocationVector locs = {loc_a, loc_c};
+        std::vector<std::string> out_ids;
+        ErrorCode ec = meta_searcher_->BatchAddLocation(request_context_.get(), keys, locs, out_ids);
+        ASSERT_EQ(ec, ErrorCode::EC_OK);
+
+        std::vector<std::vector<MetaSearcher::LocationUpdateTask>> tasks;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            tasks.push_back({{out_ids[i], CLS_SERVING}});
+        }
+        std::vector<std::vector<ErrorCode>> results;
+        ec = meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), keys, tasks, results);
+        ASSERT_EQ(ec, ErrorCode::EC_OK);
+    }
+
+    // Add loc_b to key 60000 only
+    {
+        MetaSearcher::KeyVector key_60000 = {60000};
+        CacheLocationVector locs = {loc_b};
+        std::vector<std::string> out_ids;
+        ErrorCode ec = meta_searcher_->BatchAddLocation(request_context_.get(), key_60000, locs, out_ids);
+        ASSERT_EQ(ec, ErrorCode::EC_OK);
+
+        std::vector<std::vector<MetaSearcher::LocationUpdateTask>> tasks;
+        tasks.push_back({{out_ids[0], CLS_SERVING}});
+        std::vector<std::vector<ErrorCode>> results;
+        ec = meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), key_60000, tasks, results);
+        ASSERT_EQ(ec, ErrorCode::EC_OK);
+    }
+
+    // BatchGetBestLocation
+    CacheLocationVector out_locations;
+    ErrorCode ec = meta_searcher_->BatchGetBestLocation(request_context_.get(), keys, out_locations, &policy_);
+    ASSERT_EQ(ec, ErrorCode::EC_OK);
+    ASSERT_EQ(out_locations.size(), 2);
+
+    // Key 60000: both locations are NFS, specs should be merged → 2 specs
+    {
+        const auto &loc = out_locations[0];
+        ASSERT_EQ(loc.location_specs().size(), 2);
+        EXPECT_EQ(loc.spec_size(), loc.location_specs().size())
+            << "spec_size must equal location_specs count after merge";
+        EXPECT_EQ(loc.type(), DataStorageType::DATA_STORAGE_TYPE_NFS);
+    }
+
+    // Key 60001: single location → 1 spec
+    {
+        const auto &loc = out_locations[1];
+        ASSERT_EQ(loc.location_specs().size(), 1);
+        EXPECT_EQ(loc.spec_size(), loc.location_specs().size())
+            << "spec_size must equal location_specs count for single location";
+        EXPECT_EQ(loc.location_specs()[0].name(), "tp0");
+        EXPECT_EQ(loc.type(), DataStorageType::DATA_STORAGE_TYPE_MOONCAKE);
+    }
 }

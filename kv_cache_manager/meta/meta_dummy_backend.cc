@@ -16,6 +16,7 @@
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/standard_uri.h"
 #include "kv_cache_manager/common/string_util.h"
+#include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/meta/common.h"
 
@@ -161,7 +162,9 @@ std::vector<ErrorCode> MetaDummyBackend::Put(const KeyTypeVec &keys, const Field
 
 ErrorCode MetaDummyBackend::PutForOneKey(const KeyType &key, const FieldMap &field_map) {
     std::lock_guard<std::mutex> guard(mutex_);
-    table_.Upsert(key, field_map);
+    FieldMap enriched_map = field_map;
+    enriched_map[PROPERTY_LRU_TIME] = std::to_string(TimestampUtil::GetCurrentTimeUs());
+    table_.Upsert(key, std::move(enriched_map));
     return PersistToPath();
 }
 
@@ -188,6 +191,7 @@ ErrorCode MetaDummyBackend::UpdateFieldsForOneKey(const KeyType &key, const Fiel
         for (const auto &[field_name, field_value] : field_map) {
             existing_map[field_name] = field_value;
         }
+        existing_map[PROPERTY_LRU_TIME] = std::to_string(TimestampUtil::GetCurrentTimeUs());
     });
     if (!found) {
         KVCM_LOG_WARN("update fields failed due to key cannot be found, key: [%" PRIi64 "]", key);
@@ -214,69 +218,17 @@ std::vector<ErrorCode> MetaDummyBackend::Upsert(const KeyTypeVec &keys, const Fi
 
 ErrorCode MetaDummyBackend::UpsertForOneKey(const KeyType &key, const FieldMap &field_map) {
     std::lock_guard<std::mutex> guard(mutex_);
+    const std::string current_time_str = std::to_string(TimestampUtil::GetCurrentTimeUs());
     const bool found = table_.FindAndModify(key, [&](FieldMap &existing_map) {
         for (const auto &[field_name, field_value] : field_map) {
             existing_map[field_name] = field_value;
         }
+        existing_map[PROPERTY_LRU_TIME] = current_time_str;
     });
     if (!found) {
-        table_.Upsert(key, field_map);
-    }
-    return PersistToPath();
-}
-
-std::vector<ErrorCode> MetaDummyBackend::IncrFields(const KeyTypeVec &keys,
-                                                    const std::map<std::string, std::int64_t> &field_amounts) noexcept {
-    std::vector<ErrorCode> ec_vec;
-    for (const KeyType &key : keys) {
-        ec_vec.emplace_back(IncrFieldsForOneKey(key, field_amounts));
-        if (ec_vec.back() != ErrorCode::EC_OK) {
-            KVCM_LOG_WARN("incr fields failed, key: [%" PRIi64 "], error code: [%" PRIi32 "]",
-                          key,
-                          static_cast<std::int32_t>(ec_vec.back()));
-        }
-    }
-    return ec_vec;
-}
-
-ErrorCode MetaDummyBackend::IncrFieldsForOneKey(const KeyType &key,
-                                                const std::map<std::string, std::int64_t> &field_amounts) {
-    std::lock_guard<std::mutex> guard(mutex_);
-    ErrorCode ec = ErrorCode::EC_OK;
-    const bool found = table_.FindAndModify(key, [&](FieldMap &field_map) {
-        std::map<std::string, std::string> new_field_map;
-        for (const auto &[field_name, amount] : field_amounts) {
-            const auto field_iter = field_map.find(field_name);
-            if (field_iter == field_map.end()) {
-                KVCM_LOG_ERROR("incr fields failed due to field cannot be found, field: [%s], key: [%" PRIi64 "]",
-                               field_name.c_str(),
-                               key);
-                ec = ErrorCode::EC_BADARGS;
-                return;
-            }
-            const auto &old_field_value = field_iter->second;
-            std::int64_t old_field_value_num = 0;
-            if (!StringUtil::StrToInt64(old_field_value.c_str(), old_field_value_num)) {
-                KVCM_LOG_ERROR("incr fields failed due to value cannot be interpreted to int64_t, "
-                               "field: [%s], value: [%s], key: [%" PRIi64 "]",
-                               field_name.c_str(),
-                               old_field_value.c_str(),
-                               key);
-                ec = ErrorCode::EC_BADARGS;
-                return;
-            }
-            new_field_map[field_name] = std::to_string(old_field_value_num + amount);
-        }
-        for (const auto &[field_name, new_field_value] : new_field_map) {
-            field_map[field_name] = new_field_value;
-        }
-    });
-    if (!found) {
-        KVCM_LOG_WARN("incr fields failed due to key cannot be found, key: [%" PRIi64 "]", key);
-        return ErrorCode::EC_NOENT;
-    }
-    if (ec != ErrorCode::EC_OK) {
-        return ec;
+        FieldMap enriched_map = field_map;
+        enriched_map[PROPERTY_LRU_TIME] = current_time_str;
+        table_.Upsert(key, std::move(enriched_map));
     }
     return PersistToPath();
 }
@@ -321,19 +273,23 @@ std::vector<ErrorCode> MetaDummyBackend::Get(const KeyTypeVec &keys,
 
 ErrorCode MetaDummyBackend::GetForOneKey(const KeyType &key,
                                          const std::vector<std::string> &field_names,
-                                         FieldMap &out_field_map) const {
+                                         FieldMap &out_field_map) {
     out_field_map.clear();
     const bool found = table_.FindAndApply(key, [&](const FieldMap &field_table) {
         for (const auto &field_name : field_names) {
             const auto field_iter = field_table.find(field_name);
-            out_field_map[field_name] = (field_iter == field_table.end() ? "" : field_iter->second);
+            if (field_iter != field_table.end()) {
+                out_field_map[field_name] = field_iter->second;
+            }
         }
     });
     if (!found) {
-        for (const auto &field_name : field_names) {
-            out_field_map[field_name] = "";
-        }
+        return ErrorCode::EC_NOENT;
     }
+    // Update last access time after reading the stored value
+    table_.FindAndModify(key, [](FieldMap &field_table) {
+        field_table[PROPERTY_LRU_TIME] = std::to_string(TimestampUtil::GetCurrentTimeUs());
+    });
     return ErrorCode::EC_OK;
 }
 
@@ -351,12 +307,19 @@ std::vector<ErrorCode> MetaDummyBackend::GetAllFields(const KeyTypeVec &keys, Fi
     return ec_vec;
 }
 
-ErrorCode MetaDummyBackend::GetAllFieldsForOneKey(const KeyType &key, FieldMap &out_field_map) const {
+ErrorCode MetaDummyBackend::GetAllFieldsForOneKey(const KeyType &key, FieldMap &out_field_map) {
     out_field_map.clear();
     if (!table_.Get(key, out_field_map)) {
         return ErrorCode::EC_NOENT;
     }
-    return out_field_map.empty() ? ErrorCode::EC_NOENT : ErrorCode::EC_OK;
+    if (out_field_map.empty()) {
+        return ErrorCode::EC_NOENT;
+    }
+    // Update last access time in the stored map after copying the old value
+    table_.FindAndModify(key, [](FieldMap &field_table) {
+        field_table[PROPERTY_LRU_TIME] = std::to_string(TimestampUtil::GetCurrentTimeUs());
+    });
+    return ErrorCode::EC_OK;
 }
 
 std::vector<ErrorCode> MetaDummyBackend::Exists(const KeyTypeVec &keys, std::vector<bool> &out_is_exist_vec) noexcept {
@@ -376,8 +339,13 @@ std::vector<ErrorCode> MetaDummyBackend::Exists(const KeyTypeVec &keys, std::vec
     return ec_vec;
 }
 
-ErrorCode MetaDummyBackend::ExistsForOneKey(const KeyType &key, bool &out_is_exist) const {
+ErrorCode MetaDummyBackend::ExistsForOneKey(const KeyType &key, bool &out_is_exist) {
     out_is_exist = (table_.Count(key) > 0);
+    if (out_is_exist) {
+        table_.FindAndModify(key, [](FieldMap &field_table) {
+            field_table[PROPERTY_LRU_TIME] = std::to_string(TimestampUtil::GetCurrentTimeUs());
+        });
+    }
     return ErrorCode::EC_OK;
 }
 

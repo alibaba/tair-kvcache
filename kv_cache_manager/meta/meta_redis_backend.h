@@ -33,8 +33,6 @@ public:
     std::vector<ErrorCode> Put(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept override;
     std::vector<ErrorCode> UpdateFields(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept override;
     std::vector<ErrorCode> Upsert(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept override;
-    std::vector<ErrorCode> IncrFields(const KeyTypeVec &keys,
-                                      const std::map<std::string, int64_t> &field_amounts) noexcept override;
     std::vector<ErrorCode> Delete(const KeyTypeVec &keys) noexcept override;
 
     // read

@@ -79,7 +79,7 @@ TEST_F(MetaIndexerRedisTest, TestRedisSimple) {
     ASSERT_EQ(META_REDIS_BACKEND_TYPE_STR, meta_indexer_->storage_->GetStorageType());
     ASSERT_TRUE(meta_indexer_->cache_);
     ASSERT_EQ(1024, meta_indexer_->cache_->cache_size_);
-    DoSimpleTest(true);
+    DoSimpleTest();
 
     // test redis recover
     ASSERT_EQ(0, meta_indexer_->GetKeyCount());

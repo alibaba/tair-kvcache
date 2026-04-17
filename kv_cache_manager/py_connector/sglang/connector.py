@@ -11,6 +11,10 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
+    PoolName,
+    PoolTransfer,
+    PoolTransferResult,
+    PoolHitPolicy,
 )
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 StorageMetrics = None
@@ -33,12 +37,14 @@ from sglang.srt.layers.dp_attention import get_attention_tp_group, is_dp_attenti
 
 from kv_cache_manager.py_connector.common.manager_client import KvCacheManagerClient
 from kv_cache_manager.client.pybind import kvcm_py_client
+from kv_cache_manager.py_connector.common._version_info import FULL_VERSION, GIT_COMMIT, BUILD_TIME
 
 logger = logging.getLogger(__name__)
 
 
 class HiCacheKVCM(HiCacheStorage):
     def __init__(self, storage_config: HiCacheStorageConfig, kwargs):
+        logger.warning("KVCM sglang connector version: %s (commit: %s, build: %s)", FULL_VERSION, GIT_COMMIT, BUILD_TIME)
         self.storage_config = storage_config
         # --hicache-storage-backend-extra-config '{"k":"v"}'
         self.extra_config = self.storage_config.extra_config
@@ -50,6 +56,8 @@ class HiCacheKVCM(HiCacheStorage):
         self._manager_client = KvCacheManagerClient(
             self.extra_config["manager_uri"]
         )
+
+        self.registered_pools = {}
 
         self.prefetch_pgs = []
         self.backup_pgs = []
@@ -82,8 +90,53 @@ class HiCacheKVCM(HiCacheStorage):
         self.model_name = self.storage_config.model_name
         self.is_mla_model = self.storage_config.is_mla_model
         self.kv_factor = 1 if self.is_mla_model else 2
-        self.kv_dtype = self.mem_pool_host.dtype
-        self.num_layer = self.mem_pool_host.layer_num
+        kv_pool = self.registered_pools[PoolName.KV]
+        self.kv_dtype = kv_pool.dtype
+
+        # manager
+        self.block_size = self.mem_pool_host.page_size
+
+        self.location_spec_size = kv_pool.get_size_per_token() * self.block_size
+        self.location_spec_infos = [{
+            "name": self._tp_rank_to_spec_name(rank),
+            "size": self.location_spec_size,
+        } for rank in range(self.tp_size)]
+
+        # LocationSpecGroup: KV specs only
+        kv_spec_names = [self._tp_rank_to_spec_name(rank) for rank in range(self.tp_size)]
+        self.location_spec_groups = [{"name": self._get_kv_spec_group(), "spec_names": kv_spec_names}]
+
+        # Mamba/Linear specs
+        self.has_mamba = PoolName.MAMBA in self.registered_pools
+        if self.has_mamba:
+            mamba_pool = self.registered_pools[PoolName.MAMBA]
+            self.mamba_spec_size = mamba_pool.get_size_per_token()
+            linear_spec_names = []
+            for rank in range(self.tp_size):
+                name = self._tp_rank_to_linear_spec_name(rank)
+                self.location_spec_infos.append({"name": name, "size": self.mamba_spec_size})
+                linear_spec_names.append(name)
+            self.mamba_location_spec_name = self._tp_rank_to_linear_spec_name(self.tp_rank)
+            self.location_spec_groups.append({
+                "name": self._get_extra_pool_spec_group(PoolName.MAMBA),
+                "spec_names": linear_spec_names,
+            })
+
+        # Indexer specs (NSA/DSA)
+        self.has_indexer = PoolName.INDEXER in self.registered_pools
+        if self.has_indexer:
+            indexer_pool = self.registered_pools[PoolName.INDEXER]
+            self.indexer_spec_size = indexer_pool.get_size_per_token() * self.block_size
+            indexer_spec_names = []
+            for rank in range(self.tp_size):
+                name = self._tp_rank_to_indexer_spec_name(rank)
+                self.location_spec_infos.append({"name": name, "size": self.indexer_spec_size})
+                indexer_spec_names.append(name)
+            self.indexer_location_spec_name = self._tp_rank_to_indexer_spec_name(self.tp_rank)
+            self.location_spec_groups.append({
+                "name": self._get_extra_pool_spec_group(PoolName.INDEXER),
+                "spec_names": indexer_spec_names,
+            })
 
         self.deployment = {
             "model_name": self.model_name,
@@ -94,15 +147,6 @@ class HiCacheKVCM(HiCacheStorage):
             "dtype": str(self.kv_dtype)[6:],  # remove "torch."
         }
 
-        # manager
-        self.block_size = self.mem_pool_host.page_size
-
-        self.location_spec_size = self.mem_pool_host.get_size_per_token() * self.block_size
-        self.location_spec_infos = [{
-            "name": self._tp_rank_to_spec_name(rank),
-            "size": self.location_spec_size,
-        } for rank in range(self.tp_size)]
-
         register_request = {
             "trace_id": self._get_trace_id(),
             "instance_group": self.instance_group,
@@ -110,6 +154,7 @@ class HiCacheKVCM(HiCacheStorage):
             "model_deployment": self.deployment,
             "block_size": self.block_size,
             "location_spec_infos": self.location_spec_infos,
+            "location_spec_groups": self.location_spec_groups,
         }
         # TODO: check conflict and update
         register_response = self._manager_client.register_instance(register_request)
@@ -130,13 +175,25 @@ class HiCacheKVCM(HiCacheStorage):
 
         self.read_iov_block_size = self.extra_config.get("read_iov_block_size", 0)
         self.write_iov_block_size = self.extra_config.get("write_iov_block_size", 0)
-        self.iov_size = self.location_spec_size * 1024
+
+        # TODO: the HF3FS backend is currently not well suited for hybrid
+        # (KV + Mamba) transfers.  A single IOV mempool is shared across
+        # all spec types, so when location_spec_size and mamba_spec_size
+        # differ significantly the mempool is either over-allocated for the
+        # smaller spec or too small for the larger one.  Per-spec IOV
+        # sizing would require changes to the HF3FS SDK itself.
+        self.iov_size = max(
+            self.location_spec_size * 1024,
+            self.mamba_spec_size * 1024 if self.has_mamba else 0,
+            self.indexer_spec_size * 1024 if self.has_indexer else 0,
+        )
 
         sdk_backend_configs = list(self.extra_config.get("sdk_backend_configs", []))
 
         hf3fs_configs = self.parse_hf3fs_configs(self.storage_configs)
         sdk_backend_configs.extend(hf3fs_configs)
         logger.debug(sdk_backend_configs)
+
         transfer_client_json = {
             "instance_group": self.instance_group,
             "instance_id": self.instance_id,
@@ -152,10 +209,22 @@ class HiCacheKVCM(HiCacheStorage):
             },
             "location_spec_infos": {
                 self.location_spec_name: self.location_spec_size,
+                **(
+                    {self.mamba_location_spec_name: self.mamba_spec_size}
+                    if self.has_mamba else {}
+                ),
+                **(
+                    {self.indexer_location_spec_name: self.indexer_spec_size}
+                    if self.has_indexer else {}
+                ),
             },
         }
         self.transfer_client_config = json.dumps(transfer_client_json)
 
+        # InitParams carries metadata consumed by the C++ SdkWrapper::Init:
+        #   - self_location_spec_name: validated against location_spec_infos;
+        #     also used to construct a unique Mooncake hostname when the
+        #     Mooncake backend is present (format: {host}_{spec_name}_{rand}).
         self.init_params = kvcm_py_client.InitParams()
         self.init_params.role_type = kvcm_py_client.RoleType.WORKER
         self.init_params.self_location_spec_name = self.location_spec_name
@@ -185,7 +254,33 @@ class HiCacheKVCM(HiCacheStorage):
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         self.mem_pool_host = mem_pool_host
+        # Extract all pools from HostPoolGroup.entries if available
+        if hasattr(mem_pool_host, 'entries'):
+            for entry in mem_pool_host.entries:
+                self.registered_pools[entry.name] = entry.host_pool
+                logger.info(
+                    "register_mem_pool_host: found pool entry name=%s, "
+                    "host_pool type=%s, is_anchor=%s",
+                    entry.name,
+                    type(entry.host_pool).__name__,
+                    getattr(entry, 'is_primary_index_anchor', None),
+                )
+        else:
+            self.registered_pools[PoolName.KV] = mem_pool_host
+            logger.info(
+                "register_mem_pool_host: single pool, type=%s",
+                type(mem_pool_host).__name__,
+            )
+        logger.info(
+            "register_mem_pool_host: registered_pools=%s",
+            {k: type(v).__name__ for k, v in self.registered_pools.items()},
+        )
         self._init_kvcm_client()
+
+    def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
+        # All pools already extracted from HostPoolGroup in register_mem_pool_host,
+        # so this is a no-op for KVCM connector.
+        pass
 
     def _batch_get(
         self,
@@ -249,6 +344,75 @@ class HiCacheKVCM(HiCacheStorage):
             logger.error(f"batch_get_v1 failed: {trace_id=} {e=}")
             return [False] * len(keys)
 
+    def batch_get_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict[str, List[bool]]:
+        results = {}
+        trace_id = self._get_trace_id()
+        try:
+            for transfer in transfers:
+                spec_name = self._get_extra_pool_spec_name(transfer.name)
+                pool = self.registered_pools.get(transfer.name)
+                keys = transfer.keys or []
+                if spec_name is None or pool is None or not keys:
+                    results[transfer.name] = [False] * len(keys)
+                    continue
+
+                block_keys, _, _ = self._prepare_block_keys(keys)
+                get_request = {
+                    "trace_id": trace_id,
+                    "block_keys": block_keys,
+                    "instance_id": self.instance_id,
+                    "query_type": "QT_BATCH_GET",
+                    "block_mask": {"offset": 0},
+                }
+                result = self._manager_client.get_cache_location(get_request)
+                logger.debug(f"get_cache_location v2 {transfer.name} {result=}")
+                locations = result["locations"]
+
+                uris = []
+                valid_indices = []
+                for i, loc in enumerate(locations):
+                    uri = self._extract_single_spec_uri(loc, spec_name)
+                    if uri:
+                        uris.append(uri)
+                        valid_indices.append(i)
+
+                if not uris:
+                    results[transfer.name] = [False] * len(keys)
+                    continue
+
+                ptr_list, size_list = pool.get_page_buffer_meta(transfer.host_indices)
+                components = self._get_extra_pool_components_per_page(transfer.name)
+                ptr_list = [p for i, p in enumerate(ptr_list) if (i // components) in valid_indices]
+                size_list = [s for i, s in enumerate(size_list) if (i // components) in valid_indices]
+                buffers = self._prepare_extra_pool_buffers(
+                    ptr_list, size_list, components
+                )
+                assert len(uris) == len(buffers)
+
+                start_time = time.perf_counter()
+                load_result = self.transfer_client.LoadKvCaches(uris, buffers)
+                end_time = time.perf_counter()
+                flag = (load_result == kvcm_py_client.ClientErrorCode.ER_OK)
+                if flag:
+                    spec_size = self._get_extra_pool_spec_size(transfer.name)
+                    self.prefetch_pgs.append(len(valid_indices))
+                    self.prefetch_bandwidth.append(
+                        len(valid_indices) * spec_size / (1 << 30) / (end_time - start_time)
+                    )
+                per_key = [False] * len(keys)
+                for idx in valid_indices:
+                    per_key[idx] = flag
+                results[transfer.name] = per_key
+
+            return results
+        except Exception as e:
+            logger.error(f"batch_get_v2 failed: {trace_id=} {e=}")
+            return {t.name: [False] * len(t.keys or []) for t in transfers}
+
     def _batch_set(
         self,
         keys: List[str],
@@ -278,10 +442,14 @@ class HiCacheKVCM(HiCacheStorage):
         # Start write cache
         if self.tp_rank == 0:
             start_trace_id = f"start-{trace_id}"
+            # When extra pools exist, use KV spec group to write KV specs only
+            has_extra_pools = self.has_mamba or self.has_indexer
+            location_spec_group_names = [self._get_kv_spec_group()] * len(block_keys) if has_extra_pools else []
             request = {
                 "trace_id": start_trace_id,
                 "instance_id": self.instance_id,
                 "block_keys": block_keys,
+                "location_spec_group_names": location_spec_group_names,
                 "write_timeout_seconds": self.write_timeout_seconds,
             }
             logger.debug(f"start_write_cache {request=}")
@@ -434,6 +602,166 @@ class HiCacheKVCM(HiCacheStorage):
             logger.error(f"batch_set_v1 failed: {trace_id=} {e=}")
             return [False] * len(keys)
 
+    def batch_set_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict[str, List[bool]]:
+        """Write extra pool data (e.g. Mamba/Indexer) in independent write sessions.
+
+        Each PoolTransfer gets its own StartWriteCache -> Save -> FinishWriteCache
+        using the pool's spec group, allowing writes to blocks whose KV cache
+        was already committed in a separate write session.
+        """
+        results = {}
+        trace_id = self._get_trace_id()
+        try:
+            for transfer in transfers:
+                spec_name = self._get_extra_pool_spec_name(transfer.name)
+                pool = self.registered_pools.get(transfer.name)
+                keys = transfer.keys or []
+                if spec_name is None or pool is None or not keys:
+                    results[transfer.name] = [False] * len(keys)
+                    continue
+
+                spec_group = self._get_extra_pool_spec_group(transfer.name)
+                block_keys, _, _ = self._prepare_block_keys(keys)
+
+                if self.tp_rank == 0:
+                    start_trace_id = f"start-v2-{trace_id}"
+                    request = {
+                        "trace_id": start_trace_id,
+                        "instance_id": self.instance_id,
+                        "block_keys": block_keys,
+                        "location_spec_group_names": [spec_group] * len(block_keys),
+                        "write_timeout_seconds": self.write_timeout_seconds,
+                    }
+                    try:
+                        write_result = self._manager_client.start_write_cache(request)
+                    except Exception as e:
+                        logger.error(f"start_write_cache failed on rank 0: {trace_id=} {e=}")
+                        write_result = None
+                    if self.tp_world_size > 1:
+                        torch.distributed.broadcast_object_list(
+                            [write_result], src=0, group=self.storage_tp_group
+                        )
+                else:
+                    recv = [None]
+                    torch.distributed.broadcast_object_list(
+                        recv, src=0, group=self.storage_tp_group
+                    )
+                    write_result = recv[0]
+                if write_result is None:
+                    results[transfer.name] = [False] * len(keys)
+                    continue
+
+                locations = write_result["locations"]
+                write_session_id = write_result["write_session_id"]
+                block_mask = write_result["block_mask"]
+                finish_trace_id = f"finish-v2-{trace_id}"
+
+                save_indices = self._parse_block_mask(block_mask, 0, len(keys))
+
+                if save_indices is None:
+                    logger.warning(f"batch_set_v2: inconsistent block_mask from manager, "
+                                   f"aborting write session {write_session_id}")
+                    if self.tp_rank == 0:
+                        try:
+                            self._manager_client.finish_write_cache({
+                                "trace_id": finish_trace_id,
+                                "instance_id": self.instance_id,
+                                "write_session_id": write_session_id,
+                                "success_blocks": {"bool_masks": {"values": [False] * len(locations)}},
+                            })
+                        except Exception as e:
+                            logger.error(f"finish_write_cache failed: {e}")
+                    results[transfer.name] = [False] * len(keys)
+                    continue
+
+                unmatched = len(save_indices)
+
+                if unmatched == 0:
+                    if self.tp_rank == 0:
+                        try:
+                            self._manager_client.finish_write_cache({
+                                "trace_id": finish_trace_id,
+                                "instance_id": self.instance_id,
+                                "write_session_id": write_session_id,
+                                "success_blocks": {"bool_masks": {"values": [False] * len(locations)}},
+                            })
+                        except Exception as e:
+                            logger.error(f"finish_write_cache failed: {e}")
+                    results[transfer.name] = [True] * len(keys)
+                    continue
+
+                assert len(save_indices) == len(locations)
+
+                # Data transfer preparation and execution.
+                # Wrapped in try-except so that every rank always reaches the
+                # all_reduce below, preventing cross-rank NCCL/gloo hangs.
+                try:
+                    ptr_list, size_list = pool.get_page_buffer_meta(transfer.host_indices)
+                    components = self._get_extra_pool_components_per_page(transfer.name)
+                    save_set = set(save_indices)
+                    ptr_list = [p for i, p in enumerate(ptr_list) if (i // components) in save_set]
+                    size_list = [s for i, s in enumerate(size_list) if (i // components) in save_set]
+
+                    uris = []
+                    for loc in locations:
+                        uri = self._extract_single_spec_uri(loc, spec_name)
+                        if uri:
+                            uris.append(uri)
+                    buffers = self._prepare_extra_pool_buffers(
+                        ptr_list, size_list, components
+                    )
+                    assert len(uris) == len(buffers)
+                    start_time = time.perf_counter()
+                    save_result = self.transfer_client.SaveKvCaches(uris, buffers)
+                    end_time = time.perf_counter()
+                    flag = (save_result[0] == kvcm_py_client.ClientErrorCode.ER_OK)
+                    if flag:
+                        spec_size = self._get_extra_pool_spec_size(transfer.name)
+                        self.backup_pgs.append(unmatched)
+                        self.backup_bandwidth.append(
+                            unmatched * spec_size / (1 << 30) / (end_time - start_time)
+                        )
+                    if not flag:
+                        logger.error(f"SaveKvCaches v2 error: {transfer.name}")
+                except Exception as e:
+                    logger.error(f"Data transfer v2 (SaveKvCaches) failed: {transfer.name} {e}")
+                    flag = False
+
+                if self.tp_world_size > 1:
+                    flag_tensor = torch.tensor(flag, dtype=torch.int)
+                    torch.distributed.all_reduce(
+                        flag_tensor,
+                        op=torch.distributed.ReduceOp.MIN,
+                        group=self.storage_tp_group,
+                    )
+                    flag = bool(flag_tensor.item())
+
+                finish_mask = [flag] * len(locations)
+                if self.tp_rank == 0:
+                    try:
+                        self._manager_client.finish_write_cache({
+                            "trace_id": finish_trace_id,
+                            "instance_id": self.instance_id,
+                            "write_session_id": write_session_id,
+                            "success_blocks": {"bool_masks": {"values": finish_mask}},
+                        })
+                    except Exception as e:
+                        logger.error(f"finish_write_cache failed: {e}")
+
+                per_key = [True] * len(keys)
+                for idx in save_indices:
+                    per_key[idx] = flag
+                results[transfer.name] = per_key
+
+            return results
+        except Exception as e:
+            logger.error(f"batch_set_v2 failed: {trace_id=} {e=}")
+            return {t.name: [False] * len(t.keys or []) for t in transfers}
+
     def _batch_exists(
         self,
         keys: List[str],
@@ -465,6 +793,58 @@ class HiCacheKVCM(HiCacheStorage):
             logger.error(f"batch_exists failed: {trace_id=} {e=}")
             return 0
 
+    def batch_exists_v2(
+        self,
+        keys: List[str],
+        pool_transfers: Optional[List[PoolTransfer]] = None,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> PoolTransferResult:
+        trace_id = self._get_trace_id()
+        try:
+            # Reuse the same get_cache_location call as batch_exists,
+            # but inspect per-location specs for extra pool existence.
+            block_keys, len_prefix, len_new = self._prepare_block_keys(keys, extra_info)
+            get_request = {
+                "trace_id": trace_id,
+                "block_keys": block_keys,
+                "instance_id": self.instance_id,
+                "query_type": "QT_PREFIX_MATCH",
+                "block_mask": {"offset": len_prefix},
+            }
+            result = self._manager_client.get_cache_location(get_request)
+            locations = result["locations"]
+
+            # Count KV hit pages: prefix-match only locations that carry
+            # the KV ("Full") spec.  get_cache_location returns any block
+            # registered via start_write_cache regardless of spec group,
+            # so we must filter by checking each location's specs.
+            kv_hit_pages = 0
+            for loc in locations:
+                if any(
+                    spec["name"] == self.location_spec_name
+                    for spec in loc.get("location_specs", [])
+                ):
+                    kv_hit_pages += 1
+                else:
+                    break  # prefix match: stop at first gap
+            pool_hit_pages = {PoolName.KV: kv_hit_pages} if kv_hit_pages else {}
+            final_pages = kv_hit_pages
+
+            # Check extra pool spec existence
+            for transfer in (pool_transfers or []):
+                if final_pages == 0:
+                    break
+                boundary = self._check_pool_spec_existence(
+                    locations, kv_hit_pages, transfer
+                )
+                pool_hit_pages[transfer.name] = boundary
+                final_pages = min(final_pages, boundary)
+
+            return PoolTransferResult(final_pages, pool_hit_pages)
+        except Exception as e:
+            logger.error(f"batch_exists_v2 failed: {trace_id=} {e=}")
+            return PoolTransferResult.empty()
+
     def get_stats(self):
         storage_metrics = StorageMetrics()
         storage_metrics.prefetch_pgs.extend(self.prefetch_pgs)
@@ -480,7 +860,19 @@ class HiCacheKVCM(HiCacheStorage):
     ##################################################
 
     def _tp_rank_to_spec_name(self, tp_rank: int) -> str:
+        # For pure FullAttention models (no Mamba/Indexer), use old format "tp_{rank}"
+        # for backward compatibility with existing cached data.
+        # For hybrid models, use "tp_{rank}_full" to distinguish KV specs from
+        # Mamba/SSM specs ("tp_{rank}_linear") and Indexer specs.
+        if self.has_mamba or self.has_indexer:
+            return f"tp_{tp_rank}_full"
         return f"tp_{tp_rank}"
+
+    def _tp_rank_to_linear_spec_name(self, tp_rank: int) -> str:
+        return f"tp_{tp_rank}_linear"
+
+    def _tp_rank_to_indexer_spec_name(self, tp_rank: int) -> str:
+        return f"tp_{tp_rank}_indexer"
 
     def _get_trace_id(self) -> str:
         return str(uuid.uuid1())
@@ -492,7 +884,7 @@ class HiCacheKVCM(HiCacheStorage):
         return hash_int64
 
     def _prepare_block_keys(
-            self, keys: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None) -> tuple[List[int], int]:
+            self, keys: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None) -> tuple[List[int], int, int]:
         """Prepare block keys and return them along with the prefix offset."""
         prefix_keys = (
             extra_info.prefix_keys
@@ -566,6 +958,112 @@ class HiCacheKVCM(HiCacheStorage):
             save_indices.extend([i for i in range(len_prefix, max_index + 1) if not bool_masks[i]])
         save_indices = [(i - len_prefix) for i in save_indices if i >= len_prefix]
         return save_indices
+
+    def _extract_single_spec_uri(self, location, spec_name: str):
+        """Extract the URI for a named spec from a single location dict."""
+        for spec in location.get("location_specs", []):
+            if spec["name"] == spec_name and spec.get("uri"):
+                return spec["uri"]
+        return None
+
+    def _get_extra_pool_components_per_page(self, pool_name: str) -> int:
+        """Number of IOV components per logical page for an extra pool."""
+        if pool_name == PoolName.MAMBA:
+            mamba_pool = self.registered_pools.get(PoolName.MAMBA)
+            conv_num = len(getattr(mamba_pool, "conv_buffer", []) or [])
+            return 1 + conv_num  # temporal + N conv
+        if pool_name == PoolName.INDEXER:
+            return 1  # single indexer buffer per page
+        return 1
+
+    def _get_kv_spec_group(self) -> str:
+        """Spec group name used in start_write_cache for KV pool."""
+        return "Full"
+
+    def _get_extra_pool_spec_group(self, pool_name: str) -> str:
+        """Spec group name used in start_write_cache for an extra pool."""
+        if pool_name == PoolName.MAMBA:
+            return "Linear"
+        if pool_name == PoolName.INDEXER:
+            return "Indexer"
+        raise ValueError(f"Unknown extra pool: {pool_name}")
+
+    def _get_extra_pool_spec_size(self, pool_name: str) -> int:
+        """Per-block spec size in bytes for bandwidth tracking."""
+        if pool_name == PoolName.MAMBA:
+            return self.mamba_spec_size
+        if pool_name == PoolName.INDEXER:
+            return self.indexer_spec_size
+        return 0
+
+
+    def _prepare_extra_pool_buffers(self, ptr_list, size_list, components_per_page: int):
+        """Convert get_page_buffer_meta output to BlockBuffer list.
+
+        Each logical page maps to `components_per_page` IOVs in a single BlockBuffer.
+        Works for both Mamba (temporal + conv components) and Indexer (single component).
+        """
+        buffers = []
+        for i in range(0, len(ptr_list), components_per_page):
+            buffer = kvcm_py_client.BlockBuffer()
+            iovs = []
+            for j in range(components_per_page):
+                iov = kvcm_py_client.Iov()
+                iov.type = kvcm_py_client.MemoryType.CPU
+                iov.base = ptr_list[i + j]
+                iov.size = size_list[i + j]
+                iov.ignore = False
+                iovs.append(iov)
+            buffer.iovs = iovs
+            buffers.append(buffer)
+        return buffers
+
+    def _get_extra_pool_spec_name(self, pool_name: str) -> Optional[str]:
+        """Map a PoolName to its KVCM location spec name for the current rank."""
+        if pool_name == PoolName.MAMBA and self.has_mamba:
+            return self.mamba_location_spec_name
+        if pool_name == PoolName.INDEXER and self.has_indexer:
+            return self.indexer_location_spec_name
+        return None
+
+    def _check_pool_spec_existence(self, locations, kv_hit_pages, transfer):
+        """Check how many pages have the extra pool's spec.
+
+        Returns the number of contiguous prefix pages that satisfy
+        transfer.hit_policy.  Falls back to 0 for unknown policies so
+        a stale/future enum value never causes an UnboundLocalError crash.
+        """
+        spec_name = self._get_extra_pool_spec_name(transfer.name)
+        if spec_name is None:
+            return kv_hit_pages
+
+        def has_spec(loc):
+            return any(
+                spec["name"] == spec_name for spec in loc.get("location_specs", [])
+            )
+
+        if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
+            # First gap in the prefix is the boundary.
+            return next(
+                (i for i in range(kv_hit_pages) if not has_spec(locations[i])),
+                kv_hit_pages,
+            )
+
+        if transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+            trailing = max(1, len(transfer.keys) if transfer.keys else 1)
+            for prefix_len in range(kv_hit_pages, 0, -1):
+                if all(
+                    has_spec(locations[i])
+                    for i in range(max(0, prefix_len - trailing), prefix_len)
+                ):
+                    return prefix_len
+            return 0
+
+        logger.warning(
+            "_check_pool_spec_existence: unknown PoolHitPolicy %r, defaulting to 0",
+            transfer.hit_policy,
+        )
+        return 0
 
     ##################################################
 

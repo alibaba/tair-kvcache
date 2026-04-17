@@ -160,11 +160,6 @@ std::vector<ErrorCode> MetaRedisBackend::Upsert(const KeyTypeVec &keys, const Fi
     return handle->Upsert(full_keys, field_maps);
 }
 
-std::vector<ErrorCode> MetaRedisBackend::IncrFields(const KeyTypeVec &keys,
-                                                    const std::map<std::string, int64_t> &field_amounts) noexcept {
-    return std::vector<ErrorCode>(keys.size(), EC_UNIMPLEMENTED);
-}
-
 std::vector<ErrorCode> MetaRedisBackend::Delete(const KeyTypeVec &keys) noexcept {
     auto handle = client_pool_->AcquireClient(timeout_ms_);
     if (!handle) {

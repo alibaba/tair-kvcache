@@ -41,21 +41,19 @@ ClientErrorCode SdkWrapper::Init(const std::unique_ptr<ClientConfig> &client_con
     }
 
     auto regist_span = init_params.regist_span;
-    // For now, use the size of first location_spec_info and assuming all sizes in location_spec_infos are
-    // consistent.
     const auto &location_spec_infos = client_config->location_spec_infos();
     if (location_spec_infos.empty()) {
         KVCM_LOG_WARN("location_spec_infos is empty");
         return ER_INVALID_CLIENT_CONFIG;
     }
 
-    auto iter = location_spec_infos.find(init_params.self_location_spec_name);
-    if (iter == location_spec_infos.end()) {
+    // 验证 self_location_spec_name 存在于 location_spec_infos 中
+    if (location_spec_infos.find(init_params.self_location_spec_name) == location_spec_infos.end()) {
         KVCM_LOG_WARN("location_spec_infos does not contain self_location_spec_name [%s]",
                       init_params.self_location_spec_name.c_str());
         return ER_INVALID_CLIENT_CONFIG;
     }
-    int64_t byte_size_per_block = iter->second;
+
     for (const auto &storage_config : storage_configs_) {
         DataStorageType type = storage_config->type();
         const auto &sdk_backend_config = wrapper_config_->GetSdkBackendConfig(type);
@@ -68,7 +66,10 @@ ClientErrorCode SdkWrapper::Init(const std::unique_ptr<ClientConfig> &client_con
             KVCM_LOG_WARN("fill span failed, storage config: %s", storage_config->ToString().c_str());
             return ec;
         }
-        sdk_backend_config->set_byte_size_per_block(byte_size_per_block);
+
+        // 将完整的 spec → byte_size_per_block 映射传给 SDK
+        sdk_backend_config->set_spec_byte_sizes_per_block(location_spec_infos);
+
         auto sdk = sdk_factory_->CreateSdk(type, sdk_backend_config, storage_config);
         if (!sdk) {
             KVCM_LOG_WARN("create sdk failed, storage config: %s", storage_config->ToString().c_str());

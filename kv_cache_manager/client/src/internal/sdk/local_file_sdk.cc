@@ -61,6 +61,57 @@ private:
     bool is_mem_registered = false;
 #endif
 };
+
+[[maybe_unused]] int getGpusDeviceCount() {
+    int count = 0;
+#if defined(USING_CUDA)
+    CHECK_CUDA_ERROR_RETURN(cudaGetDeviceCount(&count), -1, "cudaGetDeviceCount failed");
+#elif defined(USING_MUSA)
+    CHECK_MUSA_ERROR_RETURN(musaGetDeviceCount(&count), -1, "musaGetDeviceCount failed");
+#endif
+    return count;
+}
+
+[[maybe_unused]] bool allGpusSupportHostRegister() {
+    int count = getGpusDeviceCount();
+    if (count < 0) {
+        return false;
+    }
+
+    for (int dev = 0; dev < count; ++dev) {
+        int value = 0;
+#if defined(USING_CUDA)
+        CHECK_CUDA_ERROR_RETURN(cudaDeviceGetAttribute(&value, cudaDevAttrHostRegisterSupported, dev), false, "get cudaDevAttrHostRegisterSupported failed");
+#elif defined(USING_MUSA)
+        CHECK_MUSA_ERROR_RETURN(musaDeviceGetAttribute(&value, musaDevAttrHostRegisterSupported, dev), false, "get musaDevAttrHostRegisterSupported failed");
+#endif
+        if (value != 1) {
+            return false;
+        }
+    }
+    return true;
+}
+
+[[maybe_unused]] bool allGpusSupportHostRegisterReadOnly() {
+    int count = getGpusDeviceCount();
+    if (count < 0) {
+        return false;
+    }
+
+    for (int dev = 0; dev < count; ++dev) {
+        int value = 0;
+#if defined(USING_CUDA)
+        CHECK_CUDA_ERROR_RETURN(cudaDeviceGetAttribute(&value, cudaDevAttrHostRegisterReadOnlySupported, dev), false, "get cudaDevAttrHostRegisterReadOnlySupported failed");
+#elif defined(USING_MUSA)
+        CHECK_MUSA_ERROR(musaDeviceGetAttribute(&value, musaDevAttrHostRegisterReadOnlySupported, dev), false, "get musaDevAttrHostRegisterReadOnlySupported failed");
+#endif
+        if (value != 1) {
+            return false;
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 namespace kv_cache_manager {
@@ -90,19 +141,33 @@ ClientErrorCode LocalFileSdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_
         KVCM_LOG_WARN("Init local file sdk failed, sdk backend config is null");
         return ER_INVALID_SDKBACKEND_CONFIG;
     }
-    byte_size_per_block_ = sdk_backend_config->byte_size_per_block();
-    if (byte_size_per_block_ <= 0) {
-        KVCM_LOG_WARN("Init local file sdk failed, invalid byte_size_per_block [%ld]", byte_size_per_block_);
+    spec_byte_sizes_per_block_ = sdk_backend_config->spec_byte_sizes_per_block();
+    if (spec_byte_sizes_per_block_.empty()) {
+        KVCM_LOG_WARN("Init local file sdk failed, spec_byte_sizes_per_block is empty");
         return ER_INVALID_SDKBACKEND_CONFIG;
     }
 #if defined(USING_CUDA)
     CHECK_CUDA_ERROR_RETURN(cudaStreamCreateWithFlags(&cuda_stream_, cudaStreamNonBlocking),
                             ER_CUDA_STREAM_CREATE_ERROR,
                             "Init local file sdk failed");
+    if (!allGpusSupportHostRegister()) {
+        KVCM_LOG_ERROR("gpu not support HostRegister");
+        return ER_SDKINIT_ERROR;
+    }
+
+    support_register_readonly_ = allGpusSupportHostRegisterReadOnly();
+    KVCM_LOG_INFO("gpu support register readonly [%d]", static_cast<int>(support_register_readonly_));
 #elif defined(USING_MUSA)
     CHECK_MUSA_ERROR_RETURN(musaStreamCreateWithFlags(&musa_stream_, musaStreamNonBlocking),
                             ER_CUDA_STREAM_CREATE_ERROR,
                             "Init local file sdk failed");
+    if (!allGpusSupportHostRegister()) {
+        KVCM_LOG_ERROR("gpu not support HostRegister");
+        return ER_SDKINIT_ERROR;
+    }
+
+    support_register_readonly_ = allGpusSupportHostRegisterReadOnly();
+    KVCM_LOG_INFO("gpu support register readonly [%d]", static_cast<int>(support_register_readonly_));
 #endif
     return ER_OK;
 }
@@ -208,7 +273,11 @@ ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_ur
                    file_path.c_str(),
                    file_size,
                    DebugStringUtil::ToString(local_buffers).c_str());
-    void *file_mem = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    int prot = PROT_READ;
+    if (!support_register_readonly_) {
+        prot |= PROT_WRITE;
+    }
+    void *file_mem = mmap(nullptr, file_size, prot, MAP_PRIVATE, fd, 0);
     if (file_mem == MAP_FAILED) {
         KVCM_LOG_ERROR("Get failed, mmap file %s failed", file_path.c_str());
         close(fd);
@@ -216,13 +285,13 @@ ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_ur
     }
     MmapHelper helper(fd, file_mem, file_size);
 #if defined(USING_CUDA)
-    auto register_ec = helper.RegisterGpu(cudaHostRegisterReadOnly);
+    auto register_ec = helper.RegisterGpu(support_register_readonly_ ? cudaHostRegisterReadOnly : cudaHostRegisterDefault);
     if (register_ec != ER_OK) {
         return register_ec;
     }
     bool exist_gpu_iov = false;
 #elif defined(USING_MUSA)
-    auto register_ec = helper.RegisterGpu(musaHostRegisterReadOnly);
+    auto register_ec = helper.RegisterGpu(support_register_readonly_ ? musaHostRegisterReadOnly : musaHostRegisterDefault);
     if (register_ec != ER_OK) {
         return register_ec;
     }
@@ -240,14 +309,29 @@ ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_ur
             return ER_INVALID_PARAMS;
         }
         auto item = LocalFileItem::FromUri(remote_uri);
-        if (byte_size_per_block_ != item.size) {
-            KVCM_LOG_ERROR("Get failed, byte_size_per_block_ [%ld] not equal to uri size [%zu], origin uri: [%s]",
-                           byte_size_per_block_,
+
+        // 防御性校验：URI 的 size 必须在允许的 spec 范围内
+        bool size_valid = false;
+        for (const auto &[spec_name, byte_size_per_block] : spec_byte_sizes_per_block_) {
+            if (item.size == byte_size_per_block) {
+                size_valid = true;
+                break;
+            }
+        }
+        if (!size_valid) {
+            KVCM_LOG_ERROR("Get failed, URI size [%zu] not in allowed spec_byte_sizes_per_block, uri: %s",
                            item.size,
                            remote_uri.ToUriString().c_str());
             return ER_INVALID_PARAMS;
         }
-        offset = item.blkid * byte_size_per_block_;
+
+        // 使用 URI 的 size 计算 offset
+        // ASSUMPTION: All items in a single batch must have the same `size`.
+        // The formula `blkid * size` produces correct, non-overlapping offsets
+        // only under this invariant.  The current calling convention guarantees
+        // this (separate sessions for different spec sizes), but the SDK does
+        // not enforce it explicitly.
+        offset = item.blkid * item.size;
 
         for (auto &iov : local_buffer.iovs) {
             if (offset + iov.size > file_size) {
@@ -311,15 +395,24 @@ ClientErrorCode LocalFileSdk::DoPut(const std::vector<DataStorageUri> &remote_ur
             return ER_INVALID_PARAMS;
         }
         auto item = LocalFileItem::FromUri(remote_uri);
-        if (byte_size_per_block_ != item.size) {
-            KVCM_LOG_ERROR("Get failed, byte_size_per_block_ [%ld] not equal to uri size [%zu], origin uri: [%s]",
-                           byte_size_per_block_,
+
+        // 防御性校验：URI 的 size 必须在允许的 spec 范围内
+        bool size_valid = false;
+        for (const auto &[spec_name, byte_size_per_block] : spec_byte_sizes_per_block_) {
+            if (item.size == byte_size_per_block) {
+                size_valid = true;
+                break;
+            }
+        }
+        if (!size_valid) {
+            KVCM_LOG_ERROR("Put failed, URI size [%zu] not in allowed spec_byte_sizes_per_block, uri: %s",
                            item.size,
                            remote_uri.ToUriString().c_str());
             return ER_INVALID_PARAMS;
         }
+
         max_blkid = std::max(max_blkid, item.blkid);
-        required_size = std::max(required_size, (max_blkid + 1) * byte_size_per_block_);
+        required_size = std::max(required_size, (max_blkid + 1) * item.size);
         items.push_back(item);
     }
 
@@ -368,10 +461,11 @@ ClientErrorCode LocalFileSdk::DoPut(const std::vector<DataStorageUri> &remote_ur
 
     char *dst = static_cast<char *>(file_mem);
     // url assumed sorted by blkid
+    // ASSUMPTION: same as DoGet — all items in a batch must share the same `size`.
     for (size_t i = 0; i < items.size(); ++i) {
         auto &item = items[i];
         auto &local_buffer = local_buffers[i];
-        size_t offset = item.blkid * byte_size_per_block_;
+        size_t offset = item.blkid * item.size;
 
         for (auto &iov : local_buffer.iovs) {
             if (offset + iov.size > required_size) {

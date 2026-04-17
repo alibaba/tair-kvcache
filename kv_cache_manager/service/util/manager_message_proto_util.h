@@ -292,6 +292,7 @@ void ProtoConvert::DataStorageTypeToProto(const DataStorageType &data_storage_ty
     }
     case DataStorageType::DATA_STORAGE_TYPE_NFS: {
         *proto_data_storage_type = T::ST_NFS;
+        break;
     }
     default: {
         // Handle unknown storage type case if necessary

@@ -37,6 +37,7 @@ from kv_cache_manager.py_connector.common.manager_client import KvCacheManagerCl
 from kv_cache_manager.py_connector.common.tp_coordinator import CoordinateMsgSerializer, TpCoordinatorServer, \
     TpCoordinatorClient, SendBlockStartEvent, CoordinateMessage, SaveContext
 from kv_cache_manager.py_connector.common.logger import logger
+from kv_cache_manager.py_connector.common._version_info import FULL_VERSION, GIT_COMMIT, BUILD_TIME
 
 from kv_cache_manager.py_connector.common.types import KVCacheInfo
 from kv_cache_manager.py_connector.kernel.gather_scatter_helper import CopyBufferAllocator
@@ -122,6 +123,8 @@ class TairKvCacheConnector(KVConnectorBase_V1):
         else:
             # vllm >= 0.11.1
             super().__init__(vllm_config, role, kv_cache_config)
+
+        logger.warning("KVCM vllm connector version: %s (commit: %s, build: %s)", FULL_VERSION, GIT_COMMIT, BUILD_TIME)
 
         self._extra_config = TairKvCacheConnectorExtraConfig(vllm_config.kv_transfer_config.kv_connector_extra_config)
         self._kv_caches: Optional[dict[str, torch.Tensor]] = None

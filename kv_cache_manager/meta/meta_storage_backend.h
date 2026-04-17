@@ -32,8 +32,6 @@ public:
     virtual std::vector<ErrorCode> Put(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept = 0;
     virtual std::vector<ErrorCode> UpdateFields(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept = 0;
     virtual std::vector<ErrorCode> Upsert(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept = 0;
-    virtual std::vector<ErrorCode> IncrFields(const KeyTypeVec &keys,
-                                              const std::map<std::string, int64_t> &field_amounts) noexcept = 0;
     virtual std::vector<ErrorCode> Delete(const KeyTypeVec &keys) noexcept = 0;
 
     // read

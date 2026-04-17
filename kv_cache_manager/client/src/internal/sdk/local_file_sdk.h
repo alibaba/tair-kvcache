@@ -26,11 +26,12 @@ private:
     ClientErrorCode DoPut(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers);
 
 private:
-    int64_t byte_size_per_block_;
+    std::map<std::string, int64_t> spec_byte_sizes_per_block_;
 #if defined(USING_CUDA)
     cudaStream_t cuda_stream_ = nullptr;
 #elif defined(USING_MUSA)
     musaStream_t musa_stream_ = nullptr;
 #endif
+    bool support_register_readonly_ = true;
 };
 } // namespace kv_cache_manager

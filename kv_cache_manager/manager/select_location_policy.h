@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <functional>
 #include <map>
@@ -17,10 +18,22 @@ public:
     virtual CacheLocation *SelectForMatch(CacheLocationMap &location_map,
                                           CheckLocDataExistFunc check_loc_data_exist,
                                           std::vector<std::string> &out_prune_loc_ids) const = 0;
+
     // for write : return true if exists means that not need write again
     virtual bool ExistsForWrite(const CacheLocationMap &location_map,
                                 CheckLocDataExistFunc check_loc_data_exist,
                                 std::vector<std::string> &out_prune_loc_ids) const = 0;
+    // for write : spec-group aware version, returns true only if some serving
+    // location already covers all requested_spec_names
+    virtual bool ExistsForWrite(const CacheLocationMap &location_map,
+                                const std::vector<std::string> &requested_spec_names,
+                                CheckLocDataExistFunc check_loc_data_exist,
+                                std::vector<std::string> &out_prune_loc_ids) const = 0;
+
+    // Returns true if candidate belongs to the same data storage
+    // as reference (same type AND same hostname).
+    bool IsSameDataStorage(const CacheLocation &candidate, const CacheLocation &reference) const;
+
     virtual ~SelectLocationPolicy() = default;
 };
 
@@ -30,6 +43,10 @@ public:
                                   CheckLocDataExistFunc check_loc_data_exist,
                                   std::vector<std::string> &out_prune_loc_ids) const override;
     bool ExistsForWrite(const CacheLocationMap &location_map,
+                        CheckLocDataExistFunc check_loc_data_exist,
+                        std::vector<std::string> &out_prune_loc_ids) const override;
+    bool ExistsForWrite(const CacheLocationMap &location_map,
+                        const std::vector<std::string> &requested_spec_names,
                         CheckLocDataExistFunc check_loc_data_exist,
                         std::vector<std::string> &out_prune_loc_ids) const override;
 
@@ -89,7 +106,6 @@ public:
 
 private:
     uint32_t GetWeight(CacheLocationMap::const_reference kv) const override;
-    std::string_view ExtractHostName(std::string_view uri) const;
 
 private:
     WeightMap weight_map_;

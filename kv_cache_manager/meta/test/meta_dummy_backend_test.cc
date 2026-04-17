@@ -94,8 +94,8 @@ TEST_F(MetaDummyBackendTest, TestSimple) {
     AssertGet(meta_storage_backend_.get(),
               {1, 2, 3},
               {"f1", "f2"},
-              {ErrorCode::EC_OK, ErrorCode::EC_OK, ErrorCode::EC_OK},
-              {{{"f1", ""}, {"f2", ""}}, {{"f1", "v2-1-1"}, {"f2", "v2-2"}}, {{"f1", "v3-1"}, {"f2", "v3-2"}}});
+              {ErrorCode::EC_NOENT, ErrorCode::EC_OK, ErrorCode::EC_OK},
+              {{}, {{"f1", "v2-1-1"}, {"f2", "v2-2"}}, {{"f1", "v3-1"}, {"f2", "v3-2"}}});
     AssertListKeys(
         meta_storage_backend_.get(), SCAN_BASE_CURSOR, /*limit*/ 3, ErrorCode::EC_OK, SCAN_BASE_CURSOR, {2, 3});
     AssertSampleReclaimKeys(meta_storage_backend_.get(), /*count*/ 1, ErrorCode::EC_OK, {2, 3});
@@ -127,7 +127,7 @@ TEST_F(MetaDummyBackendTest, TestPut) {
               {1, 2},
               {"f1", "f2", "f3"},
               {ErrorCode::EC_OK, ErrorCode::EC_OK},
-              {{{"f1", "v1-1-1"}, {"f2", ""}, {"f3", "v1-3"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}, {"f3", ""}}});
+              {{{"f1", "v1-1-1"}, {"f3", "v1-3"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}});
 
     ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Close());
 }
@@ -151,7 +151,7 @@ TEST_F(MetaDummyBackendTest, TestUpdateFields) {
               {1, 2},
               {"f1", "f2", "f3"},
               {ErrorCode::EC_OK, ErrorCode::EC_OK},
-              {{{"f1", "v1-1-1"}, {"f2", "v1-2"}, {"f3", "v1-3"}}, {{"f1", "v2-1"}, {"f2", "v2-2-1"}, {"f3", ""}}});
+              {{{"f1", "v1-1-1"}, {"f2", "v1-2"}, {"f3", "v1-3"}}, {{"f1", "v2-1"}, {"f2", "v2-2-1"}}});
 
     // can not update key that dont exist
     ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_NOENT}),
@@ -175,56 +175,12 @@ TEST_F(MetaDummyBackendTest, TestUpsert) {
     ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK, ErrorCode::EC_OK, ErrorCode::EC_OK}),
               meta_storage_backend_->Upsert(
                   {1, 2, 3}, {{{"f1", "v1-1-1"}, {"f3", "v1-3"}}, {{"f2", "v2-2-1"}}, {{"f3", "v3-1"}}}));
-    AssertGet(meta_storage_backend_.get(),
-              {1, 2, 3},
-              {"f1", "f2", "f3"},
-              {ErrorCode::EC_OK, ErrorCode::EC_OK, ErrorCode::EC_OK},
-              {{{"f1", "v1-1-1"}, {"f2", "v1-2"}, {"f3", "v1-3"}},
-               {{"f1", "v2-1"}, {"f2", "v2-2-1"}, {"f3", ""}},
-               {{"f1", ""}, {"f2", ""}, {"f3", "v3-1"}}});
-
-    ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Close());
-}
-
-TEST_F(MetaDummyBackendTest, TestIncrFields) {
-    ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Init("test_instance_0", meta_storage_backend_config_));
-    ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Open());
-
-    ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK, ErrorCode::EC_OK}),
-              meta_storage_backend_->Put(
-                  {1, 2}, {{{"hit_count", "10"}, {"weight", "100"}}, {{"hit_count", "20"}, {"weight", "200"}}}));
-    AssertGet(meta_storage_backend_.get(),
-              {1, 2},
-              {"hit_count", "weight"},
-              {ErrorCode::EC_OK, ErrorCode::EC_OK},
-              {{{"hit_count", "10"}, {"weight", "100"}}, {{"hit_count", "20"}, {"weight", "200"}}});
-
-    ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK, ErrorCode::EC_OK}),
-              meta_storage_backend_->IncrFields({1, 2}, {{"hit_count", /*amount*/ 2}}));
-    AssertGet(meta_storage_backend_.get(),
-              {1, 2},
-              {"hit_count", "weight"},
-              {ErrorCode::EC_OK, ErrorCode::EC_OK},
-              {{{"hit_count", "12"}, {"weight", "100"}}, {{"hit_count", "22"}, {"weight", "200"}}});
-    ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK, ErrorCode::EC_OK}),
-              meta_storage_backend_->IncrFields({1, 2}, {{"weight", /*amount*/ 3}}));
-    AssertGet(meta_storage_backend_.get(),
-              {1, 2},
-              {"hit_count", "weight"},
-              {ErrorCode::EC_OK, ErrorCode::EC_OK},
-              {{{"hit_count", "12"}, {"weight", "103"}}, {{"hit_count", "22"}, {"weight", "203"}}});
-
-    // can not update key that dont exist
-    ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_NOENT}),
-              meta_storage_backend_->IncrFields({3}, {{"hit_count", /*amount*/ 2}}));
-
-    // can not update field that is not num
-    ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK}), meta_storage_backend_->Put({4}, {{{"f1", "v1"}}}));
-    ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_BADARGS}),
-              meta_storage_backend_->IncrFields({4}, {{"f1", /*amount*/ 2}}));
-    // can not update field that is not exist
-    ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_BADARGS}),
-              meta_storage_backend_->IncrFields({4}, {{"f2", /*amount*/ 2}}));
+    AssertGet(
+        meta_storage_backend_.get(),
+        {1, 2, 3},
+        {"f1", "f2", "f3"},
+        {ErrorCode::EC_OK, ErrorCode::EC_OK, ErrorCode::EC_OK},
+        {{{"f1", "v1-1-1"}, {"f2", "v1-2"}, {"f3", "v1-3"}}, {{"f1", "v2-1"}, {"f2", "v2-2-1"}}, {{"f3", "v3-1"}}});
 
     ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Close());
 }
@@ -267,11 +223,7 @@ TEST_F(MetaDummyBackendTest, TestGet) {
               {{{"f1", "v1-1"}, {"f2", "v1-2"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}}); // all fields
     AssertGet(
         meta_storage_backend_.get(), {1, 2}, {}, {ErrorCode::EC_OK, ErrorCode::EC_OK}, FieldMapVec(2)); // no fields
-    AssertGet(meta_storage_backend_.get(),
-              {3},
-              {"f1", "f2"},
-              {ErrorCode::EC_OK},
-              {{{"f1", ""}, {"f2", ""}}}); // key not exist
+    AssertGet(meta_storage_backend_.get(), {3}, {"f1", "f2"}, {ErrorCode::EC_NOENT}, {{}});             // key not exist
 
     ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Close());
 }

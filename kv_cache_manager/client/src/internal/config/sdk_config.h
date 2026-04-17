@@ -42,7 +42,7 @@ public:
 
     bool operator==(const SdkBackendConfig &other) const {
         return type_ == other.type_ && sdk_log_file_path_ == other.sdk_log_file_path_ &&
-               sdk_log_level_ == other.sdk_log_level_ && byte_size_per_block_ == other.byte_size_per_block_;
+               sdk_log_level_ == other.sdk_log_level_ && spec_byte_sizes_per_block_ == other.spec_byte_sizes_per_block_;
     }
 
     bool operator!=(const SdkBackendConfig &other) const { return !(*this == other); }
@@ -50,18 +50,20 @@ public:
     DataStorageType type() const { return type_; }
     const std::string &sdk_log_file_path() const { return sdk_log_file_path_; }
     const std::string &sdk_log_level() const { return sdk_log_level_; }
-    int64_t byte_size_per_block() const { return byte_size_per_block_; }
+    const std::map<std::string, int64_t> &spec_byte_sizes_per_block() const { return spec_byte_sizes_per_block_; }
 
     void set_type(DataStorageType type) { type_ = type; }
     void set_sdk_log_file_path(const std::string &value) { sdk_log_file_path_ = value; }
     void set_sdk_log_level(const std::string &value) { sdk_log_level_ = value; }
-    void set_byte_size_per_block(int64_t value) { byte_size_per_block_ = value; }
+    void set_spec_byte_sizes_per_block(const std::map<std::string, int64_t> &value) {
+        spec_byte_sizes_per_block_ = value;
+    }
 
 private:
     DataStorageType type_;
     std::string sdk_log_file_path_;
     std::string sdk_log_level_;
-    int64_t byte_size_per_block_{0};
+    std::map<std::string, int64_t> spec_byte_sizes_per_block_;
 };
 
 class Hf3fsSdkConfig : public SdkBackendConfig {

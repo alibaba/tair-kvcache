@@ -132,7 +132,7 @@ public:
 private:
     std::string id_;
     CacheLocationStatus status_ = CacheLocationStatus::CLS_NEW;
-    DataStorageType type_;
+    DataStorageType type_ = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
     size_t spec_size_ = 0;
     std::vector<LocationSpec> location_specs_;
 };

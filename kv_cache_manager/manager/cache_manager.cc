@@ -171,7 +171,8 @@ bool CacheManager::Init(int32_t schedule_plan_executor_thread_count,
                                                         meta_searcher_manager_,
                                                         schedule_plan_executor_,
                                                         metrics_registry_,
-                                                        event_manager_);
+                                                        event_manager_,
+                                                        write_location_manager_);
     if (cache_reclaimer_->Start() != EC_OK) {
         KVCM_LOG_ERROR("CacheManager init failed");
         return false;
@@ -379,8 +380,9 @@ CacheManager::GetCacheLocation(RequestContext *request_context,
     cache_get_event->SetEventTriggerTime();
     cache_get_event->SetAddtionalArgs(
         QueryTypeToString(query_type), query_keys, tokens, block_mask, sw_size, location_spec_names);
-    if (event_manager_)
+    if (event_manager_) {
         event_manager_->Publish(cache_get_event);
+    }
     return {ec, CacheLocationViewVecWrapper(std::move(cache_locations))};
 }
 
@@ -440,8 +442,9 @@ std::pair<ErrorCode, int64_t> CacheManager::GetCacheLocationLen(RequestContext *
     auto cache_get_event = std::make_shared<CacheGetEvent>(instance_id);
     cache_get_event->SetEventTriggerTime();
     cache_get_event->SetAddtionalArgs(QueryTypeToString(query_type), query_keys, tokens, BlockMask(), sw_size, {});
-    if (event_manager_)
+    if (event_manager_) {
         event_manager_->Publish(cache_get_event);
+    }
     return {ec, cache_location_len};
 }
 
@@ -462,6 +465,35 @@ CacheManager::StartWriteCache(RequestContext *request_context,
                                           "location_spec_group_names size not match , expect[%zu], real[%zu]",
                                           keys.size(),
                                           location_spec_group_names.size());
+    }
+    // Validate that every non-empty group name exists in the registered
+    // location_spec_groups.  Fail fast instead of letting FilterWriteCache
+    // silently degrade to block-level checks while GenWriteLocation errors out.
+    if (!location_spec_group_names.empty()) {
+        auto instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
+        if (instance_info) {
+            const auto &groups = instance_info->location_spec_groups();
+            // Deduplicate: typically all entries are the same value (e.g. N x "Linear"),
+            // so only the first insertion triggers the actual lower_bound lookup.
+            std::set<std::string_view> checked;
+            for (const auto &group_name : location_spec_group_names) {
+                if (group_name.empty() || !checked.insert(group_name).second) {
+                    continue;
+                }
+                auto it = std::lower_bound(
+                    groups.begin(),
+                    groups.end(),
+                    group_name,
+                    [](const LocationSpecGroup &g, const std::string_view &name) { return g.name() < name; });
+                if (it == groups.end() || it->name() != group_name) {
+                    RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN,
+                                                      EC_BADARGS,
+                                                      StartWriteCacheInfo,
+                                                      "location_spec_group_name [%s] not found in registered groups",
+                                                      group_name.c_str());
+                }
+            }
+        }
     }
     auto [ec, meta_searcher] = CheckInputAndGetMetaSearcher(request_context, instance_id, keys, tokens);
     RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, StartWriteCacheInfo, "start write cache failed");
@@ -539,8 +571,9 @@ CacheManager::StartWriteCache(RequestContext *request_context,
     start_write_event->SetEventTriggerTime();
     start_write_event->SetAddtionalArgs(
         write_session_id, query_keys, tokens, block_mask, location_spec_group_names, write_timeout_seconds);
-    if (event_manager_)
+    if (event_manager_) {
         event_manager_->Publish(start_write_event);
+    }
     return {EC_OK,
             StartWriteCacheInfo(std::move(write_session_id),
                                 std::move(block_mask),
@@ -616,8 +649,9 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
     auto finish_write_event = std::make_shared<FinishWriteCacheEvent>(instance_id);
     finish_write_event->SetEventTriggerTime();
     finish_write_event->SetAddtionalArgs(write_session_id, success_block_mask);
-    if (event_manager_)
+    if (event_manager_) {
         event_manager_->Publish(finish_write_event);
+    }
     return ec;
 }
 
@@ -731,57 +765,74 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
     const auto submit_del_req = GetSubmitDelReqFunc(instance_id);
     KeyVector prune_keys;
     std::vector<std::vector<std::string>> prune_loc_ids_vec;
-    std::vector<bool> exists_results(keys.size(), false);
-    std::size_t idx = 0;
-    auto first_empty = location_maps.end();
-    for (; idx != keys.size(); ++idx) {
-        std::vector<std::string> prune_loc_ids;
-        const auto exists = policy->ExistsForWrite(location_maps[idx], check_loc_data_exist, prune_loc_ids);
-        exists_results[idx] = exists;
-        if (!prune_loc_ids.empty()) {
-            prune_keys.emplace_back(keys[idx]);
-            prune_loc_ids_vec.emplace_back(prune_loc_ids);
-        }
-        if (!exists) {
-            first_empty = location_maps.begin() + idx;
-            ++idx;
-            break;
-        }
+
+    // Resolve instance_info for spec-group-aware filtering.
+    // When location_spec_group_names is provided, we check per-spec-group
+    // coverage instead of block-level existence, allowing complementary
+    // locations (e.g. KV-only and Mamba-only) to coexist in the same block.
+    std::shared_ptr<const InstanceInfo> instance_info;
+    if (!location_spec_group_names.empty()) {
+        instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
     }
 
-    bool only_prefix_not_empty = true;
-    for (; idx != keys.size(); ++idx) {
+    auto existsForWrite =
+        [&](size_t i, const CacheLocationMap &m, std::vector<std::string> &out_prune_loc_ids) -> bool {
+        if (!instance_info || i >= location_spec_group_names.size() || location_spec_group_names[i].empty()) {
+            return policy->ExistsForWrite(m, check_loc_data_exist, out_prune_loc_ids);
+        }
+        const auto &groups = instance_info->location_spec_groups();
+        auto it =
+            std::lower_bound(groups.begin(),
+                             groups.end(),
+                             location_spec_group_names[i],
+                             [](const LocationSpecGroup &g, const std::string_view &name) { return g.name() < name; });
+        if (it == groups.end() || it->name() != location_spec_group_names[i]) {
+            return policy->ExistsForWrite(m, check_loc_data_exist, out_prune_loc_ids);
+        }
+        return policy->ExistsForWrite(m, it->spec_names(), check_loc_data_exist, out_prune_loc_ids);
+    };
+
+    // Single pass: compute exists status for all blocks.
+    std::vector<bool> exists_flags(location_maps.size());
+    for (size_t i = 0; i < location_maps.size(); ++i) {
         std::vector<std::string> prune_loc_ids;
-        const auto exists = policy->ExistsForWrite(location_maps[idx], check_loc_data_exist, prune_loc_ids);
-        exists_results[idx] = exists;
+        exists_flags[i] = existsForWrite(i, location_maps[i], prune_loc_ids);
         if (!prune_loc_ids.empty()) {
-            prune_keys.emplace_back(keys[idx]);
+            prune_keys.emplace_back(keys[i]);
             prune_loc_ids_vec.emplace_back(prune_loc_ids);
         }
-        if (exists) {
-            only_prefix_not_empty = false;
-            // do not stop; scan all left keys
-        }
     }
-
     if (!prune_keys.empty() && submit_del_req) {
         submit_del_req(prune_keys, prune_loc_ids_vec);
     }
 
+    // Analyze the flags: find prefix boundary and check pattern.
+    size_t first_empty_idx = location_maps.size();
+    bool only_prefix_not_empty = true;
+    for (size_t i = 0; i < location_maps.size(); ++i) {
+        if (!exists_flags[i]) {
+            if (first_empty_idx == location_maps.size()) {
+                first_empty_idx = i;
+            }
+        } else if (first_empty_idx != location_maps.size()) {
+            // Found an "exists" block after an "empty" block — not a clean prefix.
+            only_prefix_not_empty = false;
+            break;
+        }
+    }
     if (only_prefix_not_empty) {
-        size_t offset = first_empty - location_maps.begin();
-        block_mask = static_cast<BlockMaskOffset>(offset);
-        new_keys.insert(new_keys.end(), keys.begin() + offset, keys.end());
+        block_mask = static_cast<BlockMaskOffset>(first_empty_idx);
+        new_keys.insert(new_keys.end(), keys.begin() + first_empty_idx, keys.end());
         if (!location_spec_group_names.empty()) {
             new_location_spec_group_names.insert(new_location_spec_group_names.end(),
-                                                 location_spec_group_names.begin() + offset,
+                                                 location_spec_group_names.begin() + first_empty_idx,
                                                  location_spec_group_names.end());
         }
         return EC_OK;
     }
     block_mask = BlockMaskVector(location_maps.size(), false);
     for (size_t i = 0; i < location_maps.size(); ++i) {
-        if (exists_results[i]) {
+        if (exists_flags[i]) {
             std::get<BlockMaskVector>(block_mask)[i] = true;
         } else {
             new_keys.push_back(keys[i]);

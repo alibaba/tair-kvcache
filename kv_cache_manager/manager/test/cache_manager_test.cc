@@ -2133,4 +2133,173 @@ TEST_F(CacheManagerTest, TestFilterWriteCache_StaleVsNonEmptyBlockMask) {
     dsm->storage_map_["nfs_01"] = original;
 }
 
+TEST_F(CacheManagerTest, TestStartWriteCacheSpecGroupDedup) {
+    auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    std::vector<LocationSpecInfo> location_spec_infos = {
+        LocationSpecInfo("tp0_F0", 512),
+        LocationSpecInfo("tp1_F0", 512),
+        LocationSpecInfo("tp0_L1", 512),
+        LocationSpecInfo("tp1_L1", 512),
+    };
+    std::vector<LocationSpecGroup> location_spec_groups = {
+        LocationSpecGroup("F0", {"tp0_F0", "tp1_F0"}),
+        LocationSpecGroup("L1", {"tp0_L1", "tp1_L1"}),
+    };
+    ASSERT_EQ(expected,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               "test_dedup",
+                                               64,
+                                               location_spec_infos,
+                                               createModelDeployment(),
+                                               location_spec_groups));
+    std::vector<int64_t> keys{1, 2, 3};
+
+    // First write: F0 group
+    std::string write_session_id_1;
+    {
+        auto [ec, info] = cache_manager_->StartWriteCache(
+            request_context_.get(), "test_dedup", keys, {}, {"F0", "F0", "F0"}, 100000000);
+        ASSERT_EQ(EC_OK, ec);
+        write_session_id_1 = info.write_session_id();
+        ASSERT_EQ(0, std::get<BlockMaskOffset>(info.block_mask()));
+        const auto &views = info.locations().cache_locations_view();
+        ASSERT_EQ(3, views.size());
+        for (size_t i = 0; i < views.size(); ++i) {
+            ASSERT_EQ(2, views[i].spec_size()) << "F0 group should have 2 specs at key index " << i;
+        }
+    }
+    // Finish first write successfully
+    {
+        BlockMask block_mask = static_cast<size_t>(3); // all 3 blocks succeed
+        auto ec =
+            cache_manager_->FinishWriteCache(request_context_.get(), "test_dedup", write_session_id_1, block_mask);
+        ASSERT_EQ(EC_OK, ec);
+    }
+
+    // Second write: L1 group for same keys → should NOT be deduped
+    std::string write_session_id_2;
+    {
+        auto [ec, info] = cache_manager_->StartWriteCache(
+            request_context_.get(), "test_dedup", keys, {}, {"L1", "L1", "L1"}, 100000000);
+        ASSERT_EQ(EC_OK, ec);
+        write_session_id_2 = info.write_session_id();
+        ASSERT_EQ(0, std::get<BlockMaskOffset>(info.block_mask()))
+            << "L1 write should not be deduped by existing F0 locations";
+        const auto &views = info.locations().cache_locations_view();
+        ASSERT_EQ(3, views.size());
+        for (size_t i = 0; i < views.size(); ++i) {
+            ASSERT_EQ(2, views[i].spec_size()) << "L1 group should have 2 specs at key index " << i;
+        }
+    }
+    // Finish second write
+    {
+        BlockMask block_mask = static_cast<size_t>(3);
+        auto ec =
+            cache_manager_->FinishWriteCache(request_context_.get(), "test_dedup", write_session_id_2, block_mask);
+        ASSERT_EQ(EC_OK, ec);
+    }
+
+    // Third write: F0 group again → should be fully deduped
+    {
+        auto [ec, info] = cache_manager_->StartWriteCache(
+            request_context_.get(), "test_dedup", keys, {}, {"F0", "F0", "F0"}, 100000000);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(3, std::get<BlockMaskOffset>(info.block_mask())) << "F0 re-write should be fully deduped";
+        ASSERT_EQ(0, info.locations().cache_locations_view().size());
+    }
+}
+
+TEST_F(CacheManagerTest, TestWriteThenReadRoundTripWithSpecGroups) {
+    auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    std::vector<LocationSpecInfo> location_spec_infos = {
+        LocationSpecInfo("tp0_F0", 512),
+        LocationSpecInfo("tp1_F0", 512),
+        LocationSpecInfo("tp0_L1", 512),
+        LocationSpecInfo("tp1_L1", 512),
+    };
+    std::vector<LocationSpecGroup> location_spec_groups = {
+        LocationSpecGroup("F0", {"tp0_F0", "tp1_F0"}),
+        LocationSpecGroup("L1", {"tp0_L1", "tp1_L1"}),
+    };
+    ASSERT_EQ(expected,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               "test_roundtrip",
+                                               64,
+                                               location_spec_infos,
+                                               createModelDeployment(),
+                                               location_spec_groups));
+    std::vector<int64_t> keys{100, 200, 300};
+
+    // Write F0 group
+    {
+        auto [ec, info] = cache_manager_->StartWriteCache(
+            request_context_.get(), "test_roundtrip", keys, {}, {"F0", "F0", "F0"}, 100000000);
+        ASSERT_EQ(EC_OK, ec);
+        BlockMask block_mask = static_cast<size_t>(3);
+        ec = cache_manager_->FinishWriteCache(
+            request_context_.get(), "test_roundtrip", info.write_session_id(), block_mask);
+        ASSERT_EQ(EC_OK, ec);
+    }
+
+    // Write L1 group
+    {
+        auto [ec, info] = cache_manager_->StartWriteCache(
+            request_context_.get(), "test_roundtrip", keys, {}, {"L1", "L1", "L1"}, 100000000);
+        ASSERT_EQ(EC_OK, ec);
+        BlockMask block_mask = static_cast<size_t>(3);
+        ec = cache_manager_->FinishWriteCache(
+            request_context_.get(), "test_roundtrip", info.write_session_id(), block_mask);
+        ASSERT_EQ(EC_OK, ec);
+    }
+
+    // Read back via QT_PREFIX_MATCH
+    {
+        BlockMask block_mask = static_cast<size_t>(0);
+        auto [ec, cache_locations] = cache_manager_->GetCacheLocation(request_context_.get(),
+                                                                      "test_roundtrip",
+                                                                      CacheManager::QueryType::QT_PREFIX_MATCH,
+                                                                      keys,
+                                                                      {},
+                                                                      block_mask,
+                                                                      0,
+                                                                      {});
+        ASSERT_EQ(EC_OK, ec);
+        const auto &views = cache_locations.cache_locations_view();
+        ASSERT_EQ(3, views.size());
+        for (size_t i = 0; i < views.size(); ++i) {
+            // Both F0 and L1 groups are on the same storage type (NFS),
+            // so specs from both locations are merged → 4 specs total
+            ASSERT_EQ(4, views[i].location_specs().size())
+                << "key index " << i << " should have 4 specs merged from same storage type";
+            for (const auto &spec : views[i].location_specs()) {
+                EXPECT_FALSE(spec.uri().empty());
+            }
+        }
+    }
+
+    // Read with spec name filter: only F0 specs
+    {
+        BlockMask block_mask = static_cast<size_t>(0);
+        auto [ec, cache_locations] = cache_manager_->GetCacheLocation(request_context_.get(),
+                                                                      "test_roundtrip",
+                                                                      CacheManager::QueryType::QT_PREFIX_MATCH,
+                                                                      keys,
+                                                                      {},
+                                                                      block_mask,
+                                                                      0,
+                                                                      {"tp0_F0", "tp1_F0"});
+        ASSERT_EQ(EC_OK, ec);
+        const auto &views = cache_locations.cache_locations_view();
+        ASSERT_EQ(3, views.size());
+        for (size_t i = 0; i < views.size(); ++i) {
+            // All specs come from NFS (same type), so filtering by F0 spec names
+            // should always yield 2 specs
+            ASSERT_EQ(2, views[i].location_specs().size())
+                << "key index " << i << " should have 2 F0 specs after filtering";
+        }
+    }
+}
+
 } // namespace kv_cache_manager

@@ -32,7 +32,7 @@ TEST_F(ClientConfigTest, TestClientConfigTairMemPoolSuccess) {
     ASSERT_EQ("logs/pace_client.log", tair_mempool_config->sdk_log_file_path());
     ASSERT_EQ("DEBUG", tair_mempool_config->sdk_log_level());
     // 需要在sdk wrapper的init阶段填充
-    ASSERT_EQ(0, tair_mempool_config->byte_size_per_block());
+    ASSERT_TRUE(tair_mempool_config->spec_byte_sizes_per_block().empty());
 
     // 再次序列化
     std::string json_string2 = client_config.ToJsonString();

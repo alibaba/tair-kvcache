@@ -207,7 +207,7 @@ void MetaIndexerTestBase::DoUpdateTest() {
     ASSERT_EQ(0, meta_indexer_->GetKeyCount());
 }
 
-void MetaIndexerTestBase::DoDeleteAndExistTest(bool is_redis_test) {
+void MetaIndexerTestBase::DoDeleteAndExistTest() {
     KVData data;
     int32_t key_count = 3;
     MakeKVData(/*start*/ 0, /*end*/ 3, data);
@@ -248,10 +248,6 @@ void MetaIndexerTestBase::DoDeleteAndExistTest(bool is_redis_test) {
     AssertGet(data.keys, expect_uris, expect_get_result);
     AssertSearchCacheGet(data.keys, expect_uris, expect_get_result.error_codes);
     AssertGet(data.keys, expect_uris, expect_maps, expect_get_result);
-    if (is_redis_test) {
-        // redis backend can not determine whether keys exist when get some fields
-        expect_get_result = Result(key_count);
-    }
     AssertGetProperties(data.keys, {"p0"}, expect_p0_maps, expect_get_result);
     AssertGetProperties(data.keys, {"p1"}, expect_p1_maps, expect_get_result);
 
@@ -309,10 +305,10 @@ void MetaIndexerTestBase::DoScanAndSampleReclaimKeysTest() {
     ASSERT_EQ(0, meta_indexer_->GetKeyCount());
 }
 
-void MetaIndexerTestBase::DoSimpleTest(bool is_redis_test) {
+void MetaIndexerTestBase::DoSimpleTest() {
     DoPutTest();
     DoUpdateTest();
-    DoDeleteAndExistTest(is_redis_test);
+    DoDeleteAndExistTest();
     DoScanAndSampleReclaimKeysTest();
     DoReadModifyWriteTest();
 }

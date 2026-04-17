@@ -22,7 +22,7 @@ protected:
         sdk_config->set_type(DataStorageType::DATA_STORAGE_TYPE_HF3FS);
         sdk_config->set_sdk_log_file_path(mount_point_ + "/sdk.log");
         sdk_config->set_sdk_log_level("INFO");
-        sdk_config->set_byte_size_per_block(1024 * 1024);
+        sdk_config->set_spec_byte_sizes_per_block({{"default", 1024 * 1024}});
         sdk_config->set_mountpoint(mount_point_);
         sdk_config->set_root_dir("/");
 

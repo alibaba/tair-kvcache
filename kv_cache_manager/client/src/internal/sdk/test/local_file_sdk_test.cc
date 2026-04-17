@@ -13,8 +13,7 @@ public:
     void SetUp() override {
         root_path_ = GetPrivateTestRuntimeDataPath();
         sdk_backend_config_ = std::make_shared<NfsSdkConfig>();
-        ;
-        sdk_backend_config_->set_byte_size_per_block(1024);
+        sdk_backend_config_->set_spec_byte_sizes_per_block({{"default", 1024}});
     }
     void TearDown() override {}
 
@@ -26,9 +25,9 @@ private:
 TEST_F(LocalFileSdkTest, TestInit) {
     LocalFileSdk sdk;
     ASSERT_EQ(ER_INVALID_SDKBACKEND_CONFIG, sdk.Init(nullptr, nullptr));
-    sdk_backend_config_->set_byte_size_per_block(-1);
+    sdk_backend_config_->set_spec_byte_sizes_per_block({});
     ASSERT_EQ(ER_INVALID_SDKBACKEND_CONFIG, sdk.Init(sdk_backend_config_, nullptr));
-    sdk_backend_config_->set_byte_size_per_block(1024);
+    sdk_backend_config_->set_spec_byte_sizes_per_block({{"default", 1024}});
     ASSERT_EQ(ER_OK, sdk.Init(sdk_backend_config_, nullptr));
 }
 

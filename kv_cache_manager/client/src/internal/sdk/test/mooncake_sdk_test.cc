@@ -21,7 +21,7 @@ public:
         sdk_backend_config_->set_type(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE);
         sdk_backend_config_->set_local_buffer_size(128 * 1024 * 1024);
         sdk_backend_config_->set_location("*");
-        sdk_backend_config_->set_byte_size_per_block(1024);
+        sdk_backend_config_->set_spec_byte_sizes_per_block({{"default", 1024}});
         sdk_backend_config_->set_self_location_spec_name("tp0_F0");
 
         storage_config_ = std::make_shared<StorageConfig>();
@@ -52,10 +52,10 @@ TEST_F(MooncakeSdkTest, TestInit) {
     // invalid storage config
     auto empty_storage_config = std::make_shared<StorageConfig>();
     ASSERT_EQ(ER_INVALID_STORAGE_CONFIG, sdk.Init(sdk_backend_config_, empty_storage_config));
-    // invalid byte_size_per_block
-    sdk_backend_config_->set_byte_size_per_block(-1);
+    // invalid spec_byte_sizes_per_block
+    sdk_backend_config_->set_spec_byte_sizes_per_block({});
     ASSERT_EQ(ER_INVALID_SDKBACKEND_CONFIG, sdk.Init(sdk_backend_config_, storage_config_));
-    sdk_backend_config_->set_byte_size_per_block(1024);
+    sdk_backend_config_->set_spec_byte_sizes_per_block({{"default", 1024}});
     // empty local buffer
     ASSERT_EQ(nullptr, sdk_backend_config_->local_mem_ptr());
     sdk_backend_config_->set_self_location_spec_name("tp1_F0");

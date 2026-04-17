@@ -356,7 +356,8 @@ public:
         dsm_ = std::make_shared<DataStorageManager>(mr_);
         spe_ = std::make_shared<SchedulePlanExecutor>(0, mim_, dsm_, mr_);
 
-        cache_reclaimer_ = std::make_unique<CacheReclaimer>(10, 100, 1, 10, 16, rm_, mim_, msm_, spe_, mr_, em_);
+        cache_reclaimer_ =
+            std::make_unique<CacheReclaimer>(10, 100, 1, 10, 16, rm_, mim_, msm_, spe_, mr_, em_, nullptr);
 
         // avoid nullptr issue when testing methods that involve metrics
         // counter but no need to start the working thread
@@ -493,7 +494,7 @@ TEST_F(CacheReclaimerTest, TestStartStop) {
     {
         // test the case that all the dependencies are given as nullptr
         auto cache_reclaimer = std::make_unique<CacheReclaimer>(
-            1000, 100, 100, 100, 16, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+            1000, 100, 100, 100, 16, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
         ASSERT_EQ(ErrorCode::EC_ERROR, cache_reclaimer->Start());
         ASSERT_FALSE(cache_reclaimer->IsRunning());
         ASSERT_FALSE(cache_reclaimer->reclaimer_.joinable());
@@ -502,7 +503,7 @@ TEST_F(CacheReclaimerTest, TestStartStop) {
     {
         // test the case that RegisterManager is nullptr
         auto cache_reclaimer =
-            std::make_unique<CacheReclaimer>(1000, 100, 100, 100, 16, nullptr, mim_, msm_, spe_, mr_, em_);
+            std::make_unique<CacheReclaimer>(1000, 100, 100, 100, 16, nullptr, mim_, msm_, spe_, mr_, em_, nullptr);
         ASSERT_EQ(ErrorCode::EC_ERROR, cache_reclaimer->Start());
         ASSERT_FALSE(cache_reclaimer->IsRunning());
         ASSERT_FALSE(cache_reclaimer->reclaimer_.joinable());
@@ -511,7 +512,7 @@ TEST_F(CacheReclaimerTest, TestStartStop) {
     {
         // test the case that MetaIndexerManager is nullptr
         auto cache_reclaimer =
-            std::make_unique<CacheReclaimer>(1000, 100, 100, 100, 16, rm_, nullptr, msm_, spe_, mr_, em_);
+            std::make_unique<CacheReclaimer>(1000, 100, 100, 100, 16, rm_, nullptr, msm_, spe_, mr_, em_, nullptr);
         ASSERT_EQ(ErrorCode::EC_ERROR, cache_reclaimer->Start());
         ASSERT_FALSE(cache_reclaimer->IsRunning());
         ASSERT_FALSE(cache_reclaimer->reclaimer_.joinable());
@@ -520,7 +521,7 @@ TEST_F(CacheReclaimerTest, TestStartStop) {
     {
         // test the case that MetaSearcherManager is nullptr
         auto cache_reclaimer =
-            std::make_unique<CacheReclaimer>(1000, 100, 100, 100, 16, rm_, mim_, nullptr, spe_, mr_, em_);
+            std::make_unique<CacheReclaimer>(1000, 100, 100, 100, 16, rm_, mim_, nullptr, spe_, mr_, em_, nullptr);
         ASSERT_EQ(ErrorCode::EC_ERROR, cache_reclaimer->Start());
         ASSERT_FALSE(cache_reclaimer->IsRunning());
         ASSERT_FALSE(cache_reclaimer->reclaimer_.joinable());
@@ -529,7 +530,7 @@ TEST_F(CacheReclaimerTest, TestStartStop) {
     {
         // test the case that SchedulePlanExecutor is nullptr
         auto cache_reclaimer =
-            std::make_unique<CacheReclaimer>(1000, 100, 100, 100, 16, rm_, mim_, msm_, nullptr, mr_, em_);
+            std::make_unique<CacheReclaimer>(1000, 100, 100, 100, 16, rm_, mim_, msm_, nullptr, mr_, em_, nullptr);
         ASSERT_EQ(ErrorCode::EC_ERROR, cache_reclaimer->Start());
         ASSERT_FALSE(cache_reclaimer->IsRunning());
         ASSERT_FALSE(cache_reclaimer->reclaimer_.joinable());
@@ -538,7 +539,7 @@ TEST_F(CacheReclaimerTest, TestStartStop) {
     {
         // test the case that MetricsRegistry is nullptr
         auto cache_reclaimer =
-            std::make_unique<CacheReclaimer>(1000, 100, 100, 100, 16, rm_, mim_, msm_, spe_, nullptr, em_);
+            std::make_unique<CacheReclaimer>(1000, 100, 100, 100, 16, rm_, mim_, msm_, spe_, nullptr, em_, nullptr);
         ASSERT_EQ(ErrorCode::EC_ERROR, cache_reclaimer->Start());
         ASSERT_FALSE(cache_reclaimer->IsRunning());
         ASSERT_FALSE(cache_reclaimer->reclaimer_.joinable());
@@ -547,7 +548,7 @@ TEST_F(CacheReclaimerTest, TestStartStop) {
     {
         // test the case that MetricsRegistry is nullptr
         auto cache_reclaimer =
-            std::make_unique<CacheReclaimer>(1000, 100, 100, 100, 16, rm_, mim_, msm_, spe_, mr_, nullptr);
+            std::make_unique<CacheReclaimer>(1000, 100, 100, 100, 16, rm_, mim_, msm_, spe_, mr_, nullptr, nullptr);
         ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer->Start());
         ASSERT_TRUE(cache_reclaimer->IsRunning());
         ASSERT_TRUE(cache_reclaimer->reclaimer_.joinable());
@@ -699,8 +700,8 @@ TEST_F(CacheReclaimerTest, TestDoubleStops) {
 }
 
 TEST_F(CacheReclaimerTest, TestWorkerConfigValues) {
-    cache_reclaimer_ =
-        std::make_unique<CacheReclaimer>(1000, 100, 100, 100, 16, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+    cache_reclaimer_ = std::make_unique<CacheReclaimer>(
+        1000, 100, 100, 100, 16, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
 
     {
         // default values

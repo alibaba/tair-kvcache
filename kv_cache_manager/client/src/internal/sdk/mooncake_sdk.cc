@@ -32,13 +32,12 @@ ClientErrorCode MooncakeSdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_b
                       sdk_backend_config_ ? ToString(sdk_backend_config_->type()).c_str() : "unknown");
         return ER_INVALID_SDKBACKEND_CONFIG;
     }
-    if (sdk_backend_config_->byte_size_per_block() <= 0) {
-        KVCM_LOG_WARN("Init mooncake sdk failed, invalid byte_size_per_block [%ld]",
-                      sdk_backend_config_->byte_size_per_block());
-        return ER_INVALID_SDKBACKEND_CONFIG;
-    }
     if (sdk_backend_config_->self_location_spec_name().empty()) {
         KVCM_LOG_WARN("Init mooncake sdk failed, self_location_spec_name can not empty");
+        return ER_INVALID_SDKBACKEND_CONFIG;
+    }
+    if (sdk_backend_config_->spec_byte_sizes_per_block().empty()) {
+        KVCM_LOG_WARN("Init mooncake sdk failed, spec_byte_sizes_per_block is empty");
         return ER_INVALID_SDKBACKEND_CONFIG;
     }
     storage_config_ = storage_config;
@@ -101,6 +100,11 @@ ClientErrorCode MooncakeSdk::Get(const std::vector<DataStorageUri> &remote_uris,
         KVCM_LOG_ERROR("mooncake get failed, remote_uris size not equal to local_buffer size");
         return ER_INVALID_PARAMS;
     }
+    // 防御性校验上界：取所有允许的 byte_size_per_block 的最大值
+    int64_t max_allowed_size = 0;
+    for (const auto &[spec_name, byte_size_per_block] : sdk_backend_config_->spec_byte_sizes_per_block()) {
+        max_allowed_size = std::max(max_allowed_size, byte_size_per_block);
+    }
     for (int i = 0; i < remote_uris.size(); i++) {
         MooncakeRemoteItem item = MooncakeRemoteItem::FromUri(remote_uris[i]);
         std::vector<Slice_t> slices;
@@ -109,11 +113,17 @@ ClientErrorCode MooncakeSdk::Get(const std::vector<DataStorageUri> &remote_uris,
             KVCM_LOG_WARN("mooncake get item failed, key: %s, extract slices failed", item.key.c_str());
             return ER_EXTRACT_SLICES_ERROR;
         }
-        if (read_len == 0 || read_len > sdk_backend_config_->byte_size_per_block()) {
-            KVCM_LOG_WARN("mooncake get but iovs are invalid, key: [%s], write_len: [%zu], byte_size_per_block: [%ld]",
-                          item.key.c_str(),
-                          read_len,
-                          sdk_backend_config_->byte_size_per_block());
+        if (read_len == 0) {
+            KVCM_LOG_WARN(
+                "mooncake get but iovs are invalid, key: [%s], read_len: [%zu] is zero", item.key.c_str(), read_len);
+            return ER_INVALID_PARAMS;
+        }
+        if (read_len > max_allowed_size) {
+            KVCM_LOG_WARN(
+                "mooncake get but iovs exceed max allowed size, key: [%s], read_len: [%zu], max_allowed: [%ld]",
+                item.key.c_str(),
+                read_len,
+                max_allowed_size);
             return ER_INVALID_PARAMS;
         }
         ErrorCode_t err = mooncake_client_get(client_, item.key.c_str(), slices.data(), slices.size());
@@ -134,6 +144,11 @@ ClientErrorCode MooncakeSdk::Put(const std::vector<DataStorageUri> &remote_uris,
         KVCM_LOG_WARN("mooncake put failed, remote_uris size not equal to local_buffers size");
         return ER_INVALID_PARAMS;
     }
+    // 防御性校验上界：取所有允许的 byte_size_per_block 的最大值
+    int64_t max_allowed_size = 0;
+    for (const auto &[spec_name, byte_size_per_block] : sdk_backend_config_->spec_byte_sizes_per_block()) {
+        max_allowed_size = std::max(max_allowed_size, byte_size_per_block);
+    }
     for (int i = 0; i < remote_uris.size(); i++) {
         MooncakeRemoteItem item = MooncakeRemoteItem::FromUri(remote_uris[i]);
         auto [write_len, success] = extractSlices(item, local_buffers[i], slices);
@@ -141,14 +156,19 @@ ClientErrorCode MooncakeSdk::Put(const std::vector<DataStorageUri> &remote_uris,
             KVCM_LOG_WARN("mooncake put item failed, key: %s, extract slices failed", item.key.c_str());
             return ER_EXTRACT_SLICES_ERROR;
         }
-        if (write_len == 0 || write_len > sdk_backend_config_->byte_size_per_block()) {
-            KVCM_LOG_WARN("mooncake put but iovs are invalid, key: [%s], write_len: [%zu], byte_size_per_block: [%ld]",
-                          item.key.c_str(),
-                          write_len,
-                          sdk_backend_config_->byte_size_per_block());
+        if (write_len == 0) {
+            KVCM_LOG_WARN(
+                "mooncake put but iovs are invalid, key: [%s], write_len: [%zu] is zero", item.key.c_str(), write_len);
             return ER_INVALID_PARAMS;
         }
-
+        if (write_len > max_allowed_size) {
+            KVCM_LOG_WARN(
+                "mooncake put but iovs exceed max allowed size, key: [%s], write_len: [%zu], max_allowed: [%ld]",
+                item.key.c_str(),
+                write_len,
+                max_allowed_size);
+            return ER_INVALID_PARAMS;
+        }
         ReplicateConfig_t cfg;
         cfg.replica_num = sdk_backend_config_->put_replica_num();
         auto err = mooncake_client_put(client_, item.key.c_str(), slices.data(), slices.size(), cfg);

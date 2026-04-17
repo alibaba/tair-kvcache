@@ -38,8 +38,6 @@ public:
     std::vector<ErrorCode> Put(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept override;
     std::vector<ErrorCode> UpdateFields(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept override;
     std::vector<ErrorCode> Upsert(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept override;
-    std::vector<ErrorCode> IncrFields(const KeyTypeVec &keys,
-                                      const std::map<std::string, std::int64_t> &field_amounts) noexcept override;
     std::vector<ErrorCode> Delete(const KeyTypeVec &keys) noexcept override;
 
     // read
@@ -65,13 +63,11 @@ private:
     ErrorCode PutForOneKey(const KeyType &key, const FieldMap &field_map);
     ErrorCode UpdateFieldsForOneKey(const KeyType &key, const FieldMap &field_map);
     ErrorCode UpsertForOneKey(const KeyType &key, const FieldMap &field_map);
-    ErrorCode IncrFieldsForOneKey(const KeyType &key, const std::map<std::string, std::int64_t> &field_amounts);
     ErrorCode DeleteForOneKey(const KeyType &key);
 
-    ErrorCode
-    GetForOneKey(const KeyType &key, const std::vector<std::string> &field_names, FieldMap &out_field_map) const;
-    ErrorCode GetAllFieldsForOneKey(const KeyType &key, FieldMap &out_field_map) const;
-    ErrorCode ExistsForOneKey(const KeyType &key, bool &out_is_exist) const;
+    ErrorCode GetForOneKey(const KeyType &key, const std::vector<std::string> &field_names, FieldMap &out_field_map);
+    ErrorCode GetAllFieldsForOneKey(const KeyType &key, FieldMap &out_field_map);
+    ErrorCode ExistsForOneKey(const KeyType &key, bool &out_is_exist);
 
     std::mutex mutex_;
     ConcurrentHashMap<KeyType, FieldMap> table_; // block data

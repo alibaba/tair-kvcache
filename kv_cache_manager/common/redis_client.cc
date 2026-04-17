@@ -473,9 +473,19 @@ std::vector<ErrorCode> RedisClient::Get(const std::vector<std::string> &keys,
                 hasError = true;
                 break;
             }
-            out_field_map.emplace(field_name, std::move(field_value));
+            // Skip nil values: treat them as non-existent fields
+            if (!field_value.empty()) {
+                out_field_map.emplace(field_name, std::move(field_value));
+            }
         }
-        ec_per_key.emplace_back(hasError ? EC_ERROR : EC_OK);
+        if (hasError) {
+            ec_per_key.emplace_back(EC_ERROR);
+        } else if (out_field_map.empty()) {
+            // All fields are nil: key does not exist or has no matching fields
+            ec_per_key.emplace_back(EC_NOENT);
+        } else {
+            ec_per_key.emplace_back(EC_OK);
+        }
     }
     return ec_per_key;
 }

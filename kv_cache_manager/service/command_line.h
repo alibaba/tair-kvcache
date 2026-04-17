@@ -6,6 +6,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "kv_cache_manager/common/build_version.h"
+
 namespace kv_cache_manager {
 
 static constexpr const char *KVCM_ART = R"D(
@@ -20,10 +22,9 @@ __/\\\________/\\\__/\\\________/\\\________/\\\\\\\\\__/\\\\____________/\\\\
         _\///________\///________\///______________\/////////__\///______________\///_
 )D";
 
-// TODO 生成
-static constexpr const char *SYS_GLB_BUILD_TIME = "2020-08-08 08:08:08";
-static constexpr const char *SYS_GLB_GIT_INFO = "...todo...git_info..";
-static constexpr const char *SYS_GLB_VERSION = "1.0.0";
+static constexpr const char *SYS_GLB_BUILD_TIME = KVCM_BUILD_TIME;
+static constexpr const char *SYS_GLB_GIT_INFO = KVCM_GIT_COMMIT;
+static constexpr const char *SYS_GLB_VERSION = KVCM_FULL_VERSION;
 
 class Server;
 class CommandLine;

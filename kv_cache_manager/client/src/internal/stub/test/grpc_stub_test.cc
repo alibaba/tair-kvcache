@@ -411,7 +411,7 @@ TEST_F(GrpcStubTest, TestStartWriteCacheWithLocationSpecGroup) {
     { // not exist group
         auto [success, write_location] = stub_->StartWriteCache(
             "trace4", "instance1", {31, 32, 33, 34}, {}, {"F0", "F0L1", "F0", "F0L1_notexist"}, 1000000);
-        ASSERT_EQ(ER_SERVICE_INTERNAL_ERROR, success);
+        ASSERT_EQ(ER_SERVICE_INVALID_ARGUMENT, success);
     }
 }
 

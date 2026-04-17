@@ -42,6 +42,37 @@ public:
         location.set_location_specs({LocationSpec("tp0", uri)});
         return location;
     }
+
+    struct FakeLocationMetaWithSpecs {
+        CacheLocationStatus status;
+        DataStorageType type;
+        std::string unique_name;
+        std::vector<std::string> spec_names;
+    };
+
+    CacheLocation GenFakeLocationWithSpecs(const std::string &id, const FakeLocationMetaWithSpecs &meta) const {
+        CacheLocation location;
+        location.set_id(id);
+        location.set_status(meta.status);
+        location.set_type(meta.type);
+        location.set_spec_size(meta.spec_names.size());
+        std::vector<LocationSpec> specs;
+        for (const auto &name : meta.spec_names) {
+            std::string uri = ToString(meta.type) + "://" + meta.unique_name + "/" + id + "/" + name;
+            specs.emplace_back(name, uri);
+        }
+        location.set_location_specs(std::move(specs));
+        return location;
+    }
+
+    CacheLocationMap GenLocationMapWithSpecs(const std::vector<FakeLocationMetaWithSpecs> &metas) {
+        CacheLocationMap location_map;
+        for (const auto &meta : metas) {
+            auto id = StringUtil::GenerateRandomString(8);
+            location_map[id] = GenFakeLocationWithSpecs(id, meta);
+        }
+        return location_map;
+    }
 };
 
 TEST_F(SelectLocationPolicyTest, TestStaticWeightSLPolicySelectForMatch) {
@@ -624,5 +655,123 @@ TEST_F(SelectLocationPolicyTest, TestNamedStorageWeightedSLPolicyExistsForWriteW
         ASSERT_TRUE(policy.ExistsForWrite(location_map, stale_check, prune_loc_ids));
         ASSERT_EQ(prune_loc_ids.size(), 1u);
         ASSERT_EQ(location_map.at(prune_loc_ids[0]).type(), D_3FS);
+    }
+}
+
+TEST_F(SelectLocationPolicyTest, TestStaticWeightExistsForWriteWithSpecNames) {
+    StaticWeightSLPolicy policy;
+    // empty spec_names falls back to original 1-param overload
+    {
+        auto location_map = GenLocationMapWithSpecs({{CLS_SERVING, D_3FS, "3fs_01", {"tp0"}}});
+        std::vector<std::string> prune_loc_ids;
+        ASSERT_TRUE(policy.ExistsForWrite(location_map, {}, nullptr, prune_loc_ids));
+    }
+    // single location covers all requested specs
+    {
+        auto location_map = GenLocationMapWithSpecs({{CLS_SERVING, D_3FS, "3fs_01", {"tp0_F0", "tp1_F0", "tp0_L1"}}});
+        std::vector<std::string> prune_loc_ids;
+        ASSERT_TRUE(policy.ExistsForWrite(location_map, {"tp0_F0", "tp1_F0"}, nullptr, prune_loc_ids));
+    }
+    // no single location covers all requested specs (split across two locations)
+    {
+        auto location_map = GenLocationMapWithSpecs({{CLS_SERVING, D_3FS, "3fs_01", {"tp0_F0", "tp1_F0"}},
+                                                     {CLS_SERVING, D_NFS, "nfs_01", {"tp0_L1", "tp1_L1"}}});
+        std::vector<std::string> prune_loc_ids;
+        ASSERT_FALSE(policy.ExistsForWrite(location_map, {"tp0_F0", "tp0_L1"}, nullptr, prune_loc_ids));
+    }
+    // NOT_FOUND status location is skipped even if specs match
+    {
+        auto location_map = GenLocationMapWithSpecs({{CLS_NOT_FOUND, D_3FS, "3fs_01", {"tp0_F0", "tp1_F0"}}});
+        std::vector<std::string> prune_loc_ids;
+        ASSERT_FALSE(policy.ExistsForWrite(location_map, {"tp0_F0"}, nullptr, prune_loc_ids));
+    }
+}
+
+TEST_F(SelectLocationPolicyTest, TestDynamicWeightExistsForWriteWithSpecNames) {
+    DynamicWeightSLPoliy policy({
+        0, // default
+        1, // 3fs
+        1, // mooncake
+        1, // pace
+        0  // nfs
+    });
+    // NFS covers all specs but weight=0 → false
+    {
+        auto location_map = GenLocationMapWithSpecs({{CLS_SERVING, D_NFS, "nfs_01", {"tp0_F0", "tp1_F0"}}});
+        std::vector<std::string> prune_loc_ids;
+        ASSERT_FALSE(policy.ExistsForWrite(location_map, {"tp0_F0"}, nullptr, prune_loc_ids));
+    }
+    // 3FS covers spec and weight>0 → true
+    {
+        auto location_map = GenLocationMapWithSpecs({{CLS_SERVING, D_3FS, "3fs_01", {"tp0_F0"}}});
+        std::vector<std::string> prune_loc_ids;
+        ASSERT_TRUE(policy.ExistsForWrite(location_map, {"tp0_F0"}, nullptr, prune_loc_ids));
+    }
+}
+
+TEST_F(SelectLocationPolicyTest, TestNamedStorageWeightedExistsForWriteWithSpecNames) {
+    NamedStorageWeightedSLPolicy policy({{"3fs_01", 1}, {"3fs_02", 0}});
+    // 3fs_02 weight=0, covers spec → false
+    {
+        auto location_map = GenLocationMapWithSpecs({{CLS_SERVING, D_3FS, "3fs_02", {"tp0_F0"}}});
+        std::vector<std::string> prune_loc_ids;
+        ASSERT_FALSE(policy.ExistsForWrite(location_map, {"tp0_F0"}, nullptr, prune_loc_ids));
+    }
+    // 3fs_01 weight=1, covers spec → true
+    {
+        auto location_map = GenLocationMapWithSpecs({{CLS_SERVING, D_3FS, "3fs_01", {"tp0_F0"}}});
+        std::vector<std::string> prune_loc_ids;
+        ASSERT_TRUE(policy.ExistsForWrite(location_map, {"tp0_F0"}, nullptr, prune_loc_ids));
+    }
+}
+
+TEST_F(SelectLocationPolicyTest, TestIsSameDataStorageRejectsCrossType) {
+    StaticWeightSLPolicy policy;
+    // Same type, same host → true
+    {
+        CacheLocation nfs_a;
+        nfs_a.set_type(D_NFS);
+        nfs_a.set_location_specs({LocationSpec("tp0", "nfs://host01/a/tp0")});
+        CacheLocation nfs_b;
+        nfs_b.set_type(D_NFS);
+        nfs_b.set_location_specs({LocationSpec("tp1", "nfs://host01/b/tp1")});
+        EXPECT_TRUE(policy.IsSameDataStorage(nfs_a, nfs_b));
+    }
+    // Different type (NFS vs Mooncake), same host → false
+    {
+        CacheLocation nfs_loc;
+        nfs_loc.set_type(D_NFS);
+        nfs_loc.set_location_specs({LocationSpec("tp0", "nfs://host01/a/tp0")});
+        CacheLocation mc_loc;
+        mc_loc.set_type(D_MOONCAKE);
+        mc_loc.set_location_specs({LocationSpec("tp0", "mooncake://host01/b/tp0")});
+        EXPECT_FALSE(policy.IsSameDataStorage(nfs_loc, mc_loc));
+    }
+    // Same type, different host → false
+    {
+        CacheLocation nfs_a;
+        nfs_a.set_type(D_NFS);
+        nfs_a.set_location_specs({LocationSpec("tp0", "nfs://host01/a/tp0")});
+        CacheLocation nfs_b;
+        nfs_b.set_type(D_NFS);
+        nfs_b.set_location_specs({LocationSpec("tp0", "nfs://host02/b/tp0")});
+        EXPECT_FALSE(policy.IsSameDataStorage(nfs_a, nfs_b));
+    }
+    // Both empty specs → true (vacuously same)
+    {
+        CacheLocation empty_a;
+        empty_a.set_type(D_NFS);
+        CacheLocation empty_b;
+        empty_b.set_type(D_NFS);
+        EXPECT_TRUE(policy.IsSameDataStorage(empty_a, empty_b));
+    }
+    // One empty, one non-empty → false
+    {
+        CacheLocation empty_loc;
+        empty_loc.set_type(D_NFS);
+        CacheLocation nfs_loc;
+        nfs_loc.set_type(D_NFS);
+        nfs_loc.set_location_specs({LocationSpec("tp0", "nfs://host01/a/tp0")});
+        EXPECT_FALSE(policy.IsSameDataStorage(empty_loc, nfs_loc));
     }
 }
