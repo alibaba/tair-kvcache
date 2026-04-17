@@ -20,6 +20,12 @@ _mock_kvcm.ClientErrorCode.ER_OK = 0
 _mock_pybind.kvcm_py_client = _mock_kvcm
 sys.modules["kv_cache_manager.client.pybind"] = _mock_pybind
 
+_mock_version = types.ModuleType("kv_cache_manager.py_connector.common._version_info")
+_mock_version.FULL_VERSION = "0.0.0-test"
+_mock_version.GIT_COMMIT = "test"
+_mock_version.BUILD_TIME = "test"
+sys.modules.setdefault("kv_cache_manager.py_connector.common._version_info", _mock_version)
+
 from kv_cache_manager.py_connector.sglang.connector import HiCacheKVCM  # noqa: E402
 
 
@@ -45,6 +51,9 @@ def _build_connector(*, tp_rank=0, tp_world_size=1, kv_factor=2,
     obj._manager_client = MagicMock()
     obj.transfer_client = MagicMock()
     obj.mem_pool_host = MagicMock()
+    obj.has_mamba = False
+    obj.has_indexer = False
+    obj.registered_pools = {}
     return obj
 
 
@@ -275,19 +284,27 @@ class TestBatchSetReturnValue(unittest.TestCase):
         # index 4 → write failed (False)
         self.assertEqual(result, [False, True, False, True, False])
 
-    # ── Case 9: inconsistent offset (offset < len_prefix) → all False ─
-    def test_inconsistent_offset_returns_all_false(self):
-        """When offset < len_prefix, manager state is inconsistent → all False."""
+    # ── Case 9: offset behind prefix → best-effort write succeeds ───
+    def test_offset_behind_prefix_best_effort_success(self):
+        """When offset < len_prefix, skip prefix blocks and write new blocks."""
         keys = ["k3", "k4", "k5"]
 
         # prefix_keys = ["p0", "p1", "p2"], len_prefix=3
-        # offset=1 < len_prefix=3 → inconsistent
+        # offset=1 → blocks [1..5] need writing:
+        #   p1, p2 (prefix, can't write) + k3, k4, k5 (new, can write)
+        # prefix_write_count=2, save_indices=[0,1,2]
+        # locations: 5 entries (2 prefix + 3 new)
+        locations = [
+            {"location_specs": [{"name": "tp_0", "uri": f"uri_{i}"}]}
+            for i in range(5)
+        ]
         result_from_manager = {
-            "locations": [],
+            "locations": locations,
             "write_session_id": "ws-9",
             "block_mask": {"offset": 1},
         }
-        c = self._setup_connector(start_write_result=result_from_manager)
+        c = self._setup_connector(start_write_result=result_from_manager,
+                                  save_ok=True)
 
         extra_info = MagicMock()
         extra_info.prefix_keys = ["p0", "p1", "p2"]
@@ -296,21 +313,107 @@ class TestBatchSetReturnValue(unittest.TestCase):
                               extra_info=extra_info)
 
         self.assertEqual(len(result), len(keys))
+        # All new blocks written successfully
+        self.assertEqual(result, [True, True, True])
+
+        # Verify finish_write_cache was called with prefix blocks marked as failed
+        call_args = c._manager_client.finish_write_cache.call_args[0][0]
+        finish_mask = call_args["success_blocks"]["bool_masks"]["values"]
+        # First 2 entries (prefix) = False, last 3 (new) = True
+        self.assertEqual(finish_mask, [False, False, True, True, True])
+
+    # ── Case 10: offset behind prefix → best-effort write fails ───
+    def test_offset_behind_prefix_best_effort_failure(self):
+        """When offset < len_prefix, skip prefix; new blocks fail → all False."""
+        keys = ["k3", "k4", "k5"]
+
+        locations = [
+            {"location_specs": [{"name": "tp_0", "uri": f"uri_{i}"}]}
+            for i in range(5)
+        ]
+        result_from_manager = {
+            "locations": locations,
+            "write_session_id": "ws-10",
+            "block_mask": {"offset": 1},
+        }
+        c = self._setup_connector(start_write_result=result_from_manager,
+                                  save_ok=False)
+
+        extra_info = MagicMock()
+        extra_info.prefix_keys = ["p0", "p1", "p2"]
+
+        result = c._batch_set(keys, torch.zeros(3), trace_id="t10",
+                              extra_info=extra_info)
+
+        self.assertEqual(len(result), len(keys))
+        # New blocks write failed
         self.assertEqual(result, [False, False, False])
 
-    # ── Case 10: inconsistent bool_masks (prefix not cached) → all False
-    def test_inconsistent_bool_masks_returns_all_false(self):
-        """When prefix blocks not fully cached in bool_masks → all False."""
+        # Verify finish_write_cache: prefix=False, new=False
+        call_args = c._manager_client.finish_write_cache.call_args[0][0]
+        finish_mask = call_args["success_blocks"]["bool_masks"]["values"]
+        self.assertEqual(finish_mask, [False, False, False, False, False])
+
+    # ── Case 11: bool_masks prefix not cached → best-effort succeeds ─
+    def test_bool_masks_prefix_not_cached_best_effort(self):
+        """When prefix blocks not fully cached in bool_masks, write new blocks."""
         keys = ["k2", "k3", "k4"]
 
         # prefix_keys = ["p0", "p1"], len_prefix=2
-        # bool_masks[:2] = [True, False] → not all True → inconsistent
+        # bool_masks: [True, False, False, True, False]
+        #   p0:True p1:False(prefix,skip) k2:False(write) k3:True(cached) k4:False(write)
+        # prefix_write_count=1, save_indices=[0,2] (k2 and k4)
+        # locations: 3 entries (1 prefix + 2 new)
+        locations = [
+            {"location_specs": [{"name": "tp_0", "uri": f"uri_{i}"}]}
+            for i in range(3)
+        ]
         result_from_manager = {
-            "locations": [],
-            "write_session_id": "ws-10",
+            "locations": locations,
+            "write_session_id": "ws-11",
             "block_mask": {
                 "bool_masks": {
                     "values": [True, False, False, True, False]
+                }
+            },
+        }
+        c = self._setup_connector(start_write_result=result_from_manager,
+                                  save_ok=True)
+
+        extra_info = MagicMock()
+        extra_info.prefix_keys = ["p0", "p1"]
+
+        result = c._batch_set(keys, torch.zeros(3), trace_id="t11",
+                              extra_info=extra_info)
+
+        self.assertEqual(len(result), len(keys))
+        # k2: write succeeded, k3: cached, k4: write succeeded
+        self.assertEqual(result, [True, True, True])
+
+        # Verify finish_write_cache: prefix p1=False, k2=True, k4=True
+        call_args = c._manager_client.finish_write_cache.call_args[0][0]
+        finish_mask = call_args["success_blocks"]["bool_masks"]["values"]
+        self.assertEqual(finish_mask, [False, True, True])
+
+    # ── Case 12: all new cached but prefix needs write → all True ────
+    def test_all_new_cached_but_prefix_needs_write(self):
+        """All new blocks cached, only prefix needs writing → return all True."""
+        keys = ["k2", "k3"]
+
+        # prefix_keys = ["p0", "p1"], len_prefix=2
+        # bool_masks: [True, False, True, True]
+        #   p0:True p1:False(prefix,skip) k2:True(cached) k3:True(cached)
+        # prefix_write_count=1, save_indices=[] (all new cached)
+        # locations: 1 entry (for p1 only)
+        locations = [
+            {"location_specs": [{"name": "tp_0", "uri": "uri_0"}]}
+        ]
+        result_from_manager = {
+            "locations": locations,
+            "write_session_id": "ws-12",
+            "block_mask": {
+                "bool_masks": {
+                    "values": [True, False, True, True]
                 }
             },
         }
@@ -319,13 +422,19 @@ class TestBatchSetReturnValue(unittest.TestCase):
         extra_info = MagicMock()
         extra_info.prefix_keys = ["p0", "p1"]
 
-        result = c._batch_set(keys, torch.zeros(3), trace_id="t10",
+        result = c._batch_set(keys, torch.zeros(2), trace_id="t12",
                               extra_info=extra_info)
 
         self.assertEqual(len(result), len(keys))
-        self.assertEqual(result, [False, False, False])
+        # All new blocks are cached → True
+        self.assertEqual(result, [True, True])
 
-    # ── Case 11: incomplete bool_masks (shorter than expected) → all False
+        # Verify finish_write_cache marks prefix location as failed
+        call_args = c._manager_client.finish_write_cache.call_args[0][0]
+        finish_mask = call_args["success_blocks"]["bool_masks"]["values"]
+        self.assertEqual(finish_mask, [False])
+
+    # ── Case 13: incomplete bool_masks (shorter than expected) → all False
     def test_incomplete_bool_masks_returns_all_false(self):
         """When bool_masks is shorter than len_prefix + len_new → all False."""
         keys = ["k0", "k1", "k2"]
@@ -333,7 +442,7 @@ class TestBatchSetReturnValue(unittest.TestCase):
         # 3 keys, no prefix → expected bool_masks length = 3, but only 1 given
         result_from_manager = {
             "locations": [],
-            "write_session_id": "ws-11",
+            "write_session_id": "ws-13",
             "block_mask": {
                 "bool_masks": {
                     "values": [True]
@@ -342,19 +451,19 @@ class TestBatchSetReturnValue(unittest.TestCase):
         }
         c = self._setup_connector(start_write_result=result_from_manager)
 
-        result = c._batch_set(keys, torch.zeros(3), trace_id="t11")
+        result = c._batch_set(keys, torch.zeros(3), trace_id="t13")
 
         self.assertEqual(len(result), len(keys))
         self.assertEqual(result, [False, False, False])
 
-    # ── Case 12: empty bool_masks → all False ────────────────────────
+    # ── Case 14: empty bool_masks → all False ────────────────────────
     def test_empty_bool_masks_returns_all_false(self):
         """When bool_masks is empty → all False (all([]) would be True)."""
         keys = ["k0", "k1"]
 
         result_from_manager = {
             "locations": [],
-            "write_session_id": "ws-12",
+            "write_session_id": "ws-14",
             "block_mask": {
                 "bool_masks": {
                     "values": []
@@ -363,12 +472,12 @@ class TestBatchSetReturnValue(unittest.TestCase):
         }
         c = self._setup_connector(start_write_result=result_from_manager)
 
-        result = c._batch_set(keys, torch.zeros(2), trace_id="t12")
+        result = c._batch_set(keys, torch.zeros(2), trace_id="t14")
 
         self.assertEqual(len(result), len(keys))
         self.assertEqual(result, [False, False])
 
-    # ── Case 13: batch_set_v1 exception returns all False ─────────────
+    # ── Case 15: batch_set_v1 exception returns all False ─────────────
     def test_batch_set_v1_exception(self):
         """batch_set_v1 catches exceptions and returns all False."""
         c = _build_connector()
