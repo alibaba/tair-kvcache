@@ -30,7 +30,7 @@ private:
     ClientErrorCode Get(const DataStorageUri &uri, const BlockBuffer &block_buffer) const;
     ClientErrorCode Put(const DataStorageUri &uri, const BlockBuffer &block_buffer) const;
 
-    bool CheckConfig(const Hf3fsSdkConfig &hf3fs_config) const;
+    bool CheckConfig(const ThreeFSStorageSpec &spec) const;
     void DeleteRemainingIovShm() const;
     bool InitIovHandle(Hf3fsIovHandle &handle,
                        size_t iov_block_size,
@@ -46,6 +46,7 @@ private:
 private:
     int64_t byte_size_per_block_;
     std::shared_ptr<Hf3fsSdkConfig> config_;
+    std::shared_ptr<ThreeFSStorageSpec> spec_;
     std::shared_ptr<Hf3fsUsrbioApi> usrbio_api_;
     Hf3fsIovHandle read_iov_handle_;
     Hf3fsIovHandle write_iov_handle_;

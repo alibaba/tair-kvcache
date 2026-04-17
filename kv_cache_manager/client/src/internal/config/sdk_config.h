@@ -99,8 +99,8 @@ public:
     void set_write_iov_size(size_t write_iov_size) { write_iov_size_ = write_iov_size; }
 
 private:
-    std::string mountpoint_{"/3fs/stage/3fs/"};
-    std::string root_dir_{"kv_manager/"};
+    std::string mountpoint_{"/mnt/3fs"};
+    std::string root_dir_{"kv_cache"};
 
     size_t read_iov_block_size_{0};
     size_t read_iov_size_{1ULL << 32};        // 4GB

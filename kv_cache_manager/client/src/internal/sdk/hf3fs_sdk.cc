@@ -32,7 +32,15 @@ ClientErrorCode Hf3fsSdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_back
     }
     KVCM_LOG_INFO("init 3fs sdk, config: %s", hf3fs_config->ToString().c_str());
 
-    if (!CheckConfig(*hf3fs_config)) {
+    if (auto cfg = std::dynamic_pointer_cast<ThreeFSStorageSpec>(storage_config->storage_spec())) {
+        spec_ = cfg;
+    } else {
+        KVCM_LOG_WARN("unexpected config type, storage config: [%s]", storage_config->ToString().c_str());
+        return ER_INVALID_STORAGE_CONFIG;
+    }
+    KVCM_LOG_INFO("init 3fs sdk, spec: %s", spec_->ToString().c_str());
+
+    if (!CheckConfig(*spec_)) {
         KVCM_LOG_WARN("3fs init failed, check init params failed");
         return ER_INVALID_SDKBACKEND_CONFIG;
     }
@@ -177,9 +185,9 @@ ClientErrorCode Hf3fsSdk::Alloc(const std::vector<DataStorageUri> &remote_uris,
     return ER_OK;
 }
 
-bool Hf3fsSdk::CheckConfig(const Hf3fsSdkConfig &hf3fs_config) const {
+bool Hf3fsSdk::CheckConfig(const ThreeFSStorageSpec &spec) const {
     // TODO(LXQ): maybe need to move to Hf3fsSdkConfig::Validate()
-    const auto &mountpoint = hf3fs_config.mountpoint();
+    const auto &mountpoint = spec.mountpoint();
     if (mountpoint.empty()) {
         KVCM_LOG_WARN("init failed, 3fs mountpoint is empty");
         return false;
@@ -189,7 +197,7 @@ bool Hf3fsSdk::CheckConfig(const Hf3fsSdkConfig &hf3fs_config) const {
         return false;
     }
 
-    const auto &root_dir = hf3fs_config.root_dir();
+    const auto &root_dir = spec.root_dir();
     if (root_dir.empty()) {
         KVCM_LOG_WARN("init failed, 3fs root dir is empty");
         return false;
@@ -255,7 +263,7 @@ bool Hf3fsSdk::InitIovHandle(Hf3fsIovHandle &handle,
         iov_size = (iov_size / iov_block_size + 1) * iov_block_size;
     }
 
-    auto iov = CreateIov(config_->mountpoint(), iov_size, iov_block_size);
+    auto iov = CreateIov(spec_->mountpoint(), iov_size, iov_block_size);
     if (iov == nullptr) {
         KVCM_LOG_WARN("create iov failed, iov size: %zu, iov block size: %zu", iov_size, iov_block_size);
         return false;
@@ -335,7 +343,7 @@ void Hf3fsSdk::DestroyIov(struct hf3fs_iov *iov) const {
 Hf3fsFileConfig Hf3fsSdk::BuildHf3fsFileConfig(const std::string &filepath) const {
     Hf3fsFileConfig config;
     config.filepath = filepath;
-    config.mountpoint = config_->mountpoint();
+    config.mountpoint = spec_->mountpoint();
     return config;
 }
 
