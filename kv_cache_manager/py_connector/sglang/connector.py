@@ -96,6 +96,10 @@ class HiCacheKVCM(HiCacheStorage):
         # manager
         self.block_size = self.mem_pool_host.page_size
 
+        # Detect extra pools early — _tp_rank_to_spec_name depends on these.
+        self.has_mamba = PoolName.MAMBA in self.registered_pools
+        self.has_indexer = PoolName.INDEXER in self.registered_pools
+
         self.location_spec_size = kv_pool.get_size_per_token() * self.block_size
         self.location_spec_infos = [{
             "name": self._tp_rank_to_spec_name(rank),
@@ -107,7 +111,6 @@ class HiCacheKVCM(HiCacheStorage):
         self.location_spec_groups = [{"name": self._get_kv_spec_group(), "spec_names": kv_spec_names}]
 
         # Mamba/Linear specs
-        self.has_mamba = PoolName.MAMBA in self.registered_pools
         if self.has_mamba:
             mamba_pool = self.registered_pools[PoolName.MAMBA]
             self.mamba_spec_size = mamba_pool.get_size_per_token()
@@ -123,7 +126,6 @@ class HiCacheKVCM(HiCacheStorage):
             })
 
         # Indexer specs (NSA/DSA)
-        self.has_indexer = PoolName.INDEXER in self.registered_pools
         if self.has_indexer:
             indexer_pool = self.registered_pools[PoolName.INDEXER]
             self.indexer_spec_size = indexer_pool.get_size_per_token() * self.block_size
