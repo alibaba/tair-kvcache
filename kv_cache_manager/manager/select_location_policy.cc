@@ -72,6 +72,7 @@ bool WeightSLPolicy::ExistsForWrite(const CacheLocationMap &location_map,
                                     CheckLocDataExistFunc check_loc_data_exist,
                                     std::vector<std::string> &out_prune_loc_ids) const {
     bool exists = false;
+    out_prune_loc_ids.clear();
     for (auto &kv : location_map) {
         if (kv.second.status() != CacheLocationStatus::CLS_NOT_FOUND) {
             if (kv.second.status() == CacheLocationStatus::CLS_SERVING && check_loc_data_exist &&
@@ -99,6 +100,7 @@ bool WeightSLPolicy::ExistsForWrite(const CacheLocationMap &location_map,
     // Use linear search on location_specs (typically 2-4 elements) instead of
     // building a hash set — avoids heap allocation and string copies.
     bool exists = false;
+    out_prune_loc_ids.clear();
     for (auto &kv : location_map) {
         if (kv.second.status() == CacheLocationStatus::CLS_NOT_FOUND) {
             continue;
