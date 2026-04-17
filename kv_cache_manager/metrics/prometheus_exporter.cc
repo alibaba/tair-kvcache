@@ -1,8 +1,8 @@
 #include "kv_cache_manager/metrics/prometheus_exporter.h"
 
-#include <algorithm>
-#include <cstdint>
+#include <cmath>
 #include <sstream>
+#include <string>
 #include <variant>
 #include <vector>
 
@@ -104,7 +104,13 @@ std::string PrometheusExporter::Expose(MetricsRegistry &registry, const std::str
             ss << ' ' << std::get<CounterValue>(*val).load(std::memory_order_relaxed);
         } else if (std::holds_alternative<GaugeValue>(*val)) {
             double gv = std::get<GaugeValue>(*val).load(std::memory_order_relaxed);
-            ss << ' ' << gv;
+            if (std::isnan(gv)) {
+                ss << " NaN";
+            } else if (std::isinf(gv)) {
+                ss << ' ' << (gv > 0 ? "+Inf" : "-Inf");
+            } else {
+                ss << ' ' << gv;
+            }
         }
         ss << '\n';
     }
