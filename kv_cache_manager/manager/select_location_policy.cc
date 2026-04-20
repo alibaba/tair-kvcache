@@ -1,5 +1,6 @@
 #include "select_location_policy.h"
 
+#include <algorithm>
 #include <random>
 #include <string>
 #include <vector>
@@ -97,8 +98,6 @@ bool WeightSLPolicy::ExistsForWrite(const CacheLocationMap &location_map,
         return ExistsForWrite(location_map, check_loc_data_exist, out_prune_loc_ids);
     }
     // Check if any single serving location already covers ALL requested specs.
-    // Use linear search on location_specs (typically 2-4 elements) instead of
-    // building a hash set — avoids heap allocation and string copies.
     bool exists = false;
     out_prune_loc_ids.clear();
     for (auto &kv : location_map) {
@@ -117,12 +116,15 @@ bool WeightSLPolicy::ExistsForWrite(const CacheLocationMap &location_map,
             continue;
         }
         const auto &loc_specs = kv.second.location_specs();
-        bool covers_all = std::all_of(
-            requested_spec_names.begin(), requested_spec_names.end(), [&loc_specs](const std::string &name) {
-                return std::any_of(
-                    loc_specs.begin(), loc_specs.end(), [&name](const auto &spec) { return spec.name() == name; });
-            });
-        if (covers_all) {
+        // Build sorted name list from location's specs (typically 2-4 elements)
+        std::vector<std::string_view> loc_names;
+        loc_names.reserve(loc_specs.size());
+        for (const auto &spec : loc_specs) {
+            loc_names.push_back(spec.name());
+        }
+        std::sort(loc_names.begin(), loc_names.end());
+        if (std::includes(
+                loc_names.begin(), loc_names.end(), requested_spec_names.begin(), requested_spec_names.end())) {
             exists = true;
         }
     }

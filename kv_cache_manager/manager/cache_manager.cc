@@ -94,25 +94,19 @@ IsSpecNameInSpecGroup(const std::string &trace_id,
                       const std::string &instance_id,
                       std::string_view spec_name,
                       std::string_view group_name,
-                      const std::vector<kv_cache_manager::LocationSpecGroup> &location_spec_groups) {
-    // we have sorted location_spec_groups before
-    auto it_group = std::lower_bound(location_spec_groups.begin(),
-                                     location_spec_groups.end(),
-                                     group_name,
-                                     [](const auto &location_spec_group, std::string_view group_name) {
-                                         return location_spec_group.name() < group_name;
-                                     });
-    if (it_group == location_spec_groups.end() || it_group->name() != group_name) {
+                      const kv_cache_manager::InstanceInfo &instance_info) {
+    const auto *group = instance_info.FindSpecGroup(group_name);
+    if (!group) {
         PREFIX_LOG(WARN, "not find group [%s]", group_name.data());
         return {EC_ERROR, false};
     }
-    const auto &group = *it_group;
+    const auto &spec_names = group->spec_names();
     auto it_spec_name = std::lower_bound(
-        group.spec_names().begin(),
-        group.spec_names().end(),
+        spec_names.begin(),
+        spec_names.end(),
         spec_name,
         [](const std::string &src_spec_name, std::string_view dst_spec_name) { return src_spec_name < dst_spec_name; });
-    if (it_spec_name == group.spec_names().end() || *it_spec_name != spec_name) {
+    if (it_spec_name == spec_names.end() || *it_spec_name != spec_name) {
         PREFIX_LOG(DEBUG, "not find spec_name [%s] in group [%s]", spec_name.data(), group_name.data());
         return {EC_OK, false};
     }
@@ -466,35 +460,35 @@ CacheManager::StartWriteCache(RequestContext *request_context,
                                           keys.size(),
                                           location_spec_group_names.size());
     }
-    // Validate that every non-empty group name exists in the registered
-    // location_spec_groups.  Fail fast instead of letting FilterWriteCache
-    // silently degrade to block-level checks while GenWriteLocation errors out.
+
+    // Fail-fast: validate all group names exist before entering the write pipeline.
     if (!location_spec_group_names.empty()) {
         auto instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
-        if (instance_info) {
-            const auto &groups = instance_info->location_spec_groups();
-            // Deduplicate: typically all entries are the same value (e.g. N x "Linear"),
-            // so only the first insertion triggers the actual lower_bound lookup.
-            std::set<std::string_view> checked;
-            for (const auto &group_name : location_spec_group_names) {
-                if (group_name.empty() || !checked.insert(group_name).second) {
-                    continue;
-                }
-                auto it = std::lower_bound(
-                    groups.begin(),
-                    groups.end(),
-                    group_name,
-                    [](const LocationSpecGroup &g, const std::string_view &name) { return g.name() < name; });
-                if (it == groups.end() || it->name() != group_name) {
-                    RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN,
-                                                      EC_BADARGS,
-                                                      StartWriteCacheInfo,
-                                                      "location_spec_group_name [%s] not found in registered groups",
-                                                      group_name.c_str());
-                }
+        if (!instance_info) {
+            RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN,
+                                              EC_INSTANCE_NOT_EXIST,
+                                              StartWriteCacheInfo,
+                                              "instance [%s] not registered but location_spec_group_names provided",
+                                              instance_id.c_str());
+        }
+        // location_spec_group_names has one entry per block (potentially thousands),
+        // but distinct values are typically just a handful. Deduplicate first.
+        std::set<std::string_view> unique_groups(location_spec_group_names.begin(), location_spec_group_names.end());
+        for (const auto &group_name : unique_groups) {
+            if (group_name.empty()) {
+                continue;
+            }
+            if (!instance_info->FindSpecGroup(group_name)) {
+                RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN,
+                                                  EC_BADARGS,
+                                                  StartWriteCacheInfo,
+                                                  "location_spec_group_name [%.*s] not found in registered instance",
+                                                  static_cast<int>(group_name.size()),
+                                                  group_name.data());
             }
         }
     }
+
     auto [ec, meta_searcher] = CheckInputAndGetMetaSearcher(request_context, instance_id, keys, tokens);
     RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, StartWriteCacheInfo, "start write cache failed");
     CacheLocationVector new_locations;
@@ -766,31 +760,27 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
     KeyVector prune_keys;
     std::vector<std::vector<std::string>> prune_loc_ids_vec;
 
-    // Resolve instance_info for spec-group-aware filtering.
-    // When location_spec_group_names is provided, we check per-spec-group
-    // coverage instead of block-level existence, allowing complementary
-    // locations (e.g. KV-only and Mamba-only) to coexist in the same block.
-    std::shared_ptr<const InstanceInfo> instance_info;
-    if (!location_spec_group_names.empty()) {
-        instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
-    }
+    // Build the per-block existence checker.
+    // Two modes: spec-group-aware (checks per-group coverage, allowing complementary
+    // locations like KV-only and Mamba-only to coexist) vs. plain block-level check.
+    using ExistsForWriteFn = std::function<bool(size_t, const CacheLocationMap &, std::vector<std::string> &)>;
+    ExistsForWriteFn existsForWrite;
 
-    auto existsForWrite =
-        [&](size_t i, const CacheLocationMap &m, std::vector<std::string> &out_prune_loc_ids) -> bool {
-        if (!instance_info || i >= location_spec_group_names.size() || location_spec_group_names[i].empty()) {
+    if (location_spec_group_names.empty()) {
+        existsForWrite = [&](size_t, const CacheLocationMap &m, std::vector<std::string> &out_prune_loc_ids) {
             return policy->ExistsForWrite(m, check_loc_data_exist, out_prune_loc_ids);
-        }
-        const auto &groups = instance_info->location_spec_groups();
-        auto it =
-            std::lower_bound(groups.begin(),
-                             groups.end(),
-                             location_spec_group_names[i],
-                             [](const LocationSpecGroup &g, const std::string_view &name) { return g.name() < name; });
-        if (it == groups.end() || it->name() != location_spec_group_names[i]) {
-            return policy->ExistsForWrite(m, check_loc_data_exist, out_prune_loc_ids);
-        }
-        return policy->ExistsForWrite(m, it->spec_names(), check_loc_data_exist, out_prune_loc_ids);
-    };
+        };
+    } else {
+        auto instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
+        existsForWrite =
+            [&, instance_info](size_t i, const CacheLocationMap &m, std::vector<std::string> &out_prune_loc_ids) {
+                const auto *group = (!location_spec_group_names[i].empty() && instance_info)
+                                        ? instance_info->FindSpecGroup(location_spec_group_names[i])
+                                        : nullptr;
+                return group ? policy->ExistsForWrite(m, group->spec_names(), check_loc_data_exist, out_prune_loc_ids)
+                             : policy->ExistsForWrite(m, check_loc_data_exist, out_prune_loc_ids);
+            };
+    }
 
     // Single pass: compute exists status for all blocks.
     std::vector<bool> exists_flags(location_maps.size());
@@ -875,11 +865,8 @@ CacheManager::CreateInSingleBatch(RequestContext *request_context,
             }
         } else {
             for (size_t i = 0; i < keys.size(); i++) {
-                auto [ec, found] = IsSpecNameInSpecGroup(trace_id,
-                                                         instance_id,
-                                                         spec_info.name(),
-                                                         location_spec_group_names[i],
-                                                         instance_info->location_spec_groups());
+                auto [ec, found] = IsSpecNameInSpecGroup(
+                    trace_id, instance_id, spec_info.name(), location_spec_group_names[i], *instance_info);
                 RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "IsSpecNameInSpecGroup failed");
                 if (found) {
                     std::string block_key =
@@ -945,11 +932,8 @@ ErrorCode CacheManager::CreateBySpec(RequestContext *request_context,
             }
         } else {
             for (size_t i = 0; i < keys.size(); i++) {
-                auto [ec, found] = IsSpecNameInSpecGroup(trace_id,
-                                                         instance_id,
-                                                         spec_info.name(),
-                                                         location_spec_group_names[i],
-                                                         instance_info->location_spec_groups());
+                auto [ec, found] = IsSpecNameInSpecGroup(
+                    trace_id, instance_id, spec_info.name(), location_spec_group_names[i], *instance_info);
                 RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "IsSpecNameInSpecGroup failed");
                 if (found) {
                     std::string block_key =
