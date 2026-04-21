@@ -440,8 +440,9 @@ class HiCacheKVCM(HiCacheStorage):
 
         # Prepare keys
         block_keys, len_prefix, len_new = self._prepare_block_keys(keys, extra_info)
-        local_len_new = len_new      # Preserve local key count for return value
-        input_hash = hash(tuple(block_keys))  # Hash of full block_keys for cross-rank consistency check
+        local_len_new = len_new        # Preserve local key count for return value
+        local_len_prefix = len_prefix  # Preserve for divergence check
+        input_hash = hash((len_prefix, len_new, *block_keys))  # Hash covers prefix/new boundary + all keys
 
         # Start write cache
         if self.tp_rank == 0:
@@ -484,7 +485,7 @@ class HiCacheKVCM(HiCacheStorage):
         # storage. The rank still participates in all_reduce with all-zero
         # flags so NCCL doesn't hang.
         skip_transfer = False
-        local_hash = hash(tuple(block_keys))
+        local_hash = hash((local_len_prefix, local_len_new, *block_keys))
         if local_hash != input_hash:
             logger.warning(f"_batch_set: local block_keys hash ({local_hash}) != "
                            f"rank 0 hash ({input_hash}), inputs diverged across TP ranks. "
@@ -537,7 +538,7 @@ class HiCacheKVCM(HiCacheStorage):
                     )
                 except Exception as e:
                     logger.error(f"finish_write_cache failed: {e}")
-            return [True] * local_len_new
+            return [False] * local_len_new if skip_transfer else [True] * local_len_new
 
         assert unmatched + prefix_write_count == len(locations)
 
@@ -629,6 +630,10 @@ class HiCacheKVCM(HiCacheStorage):
         # Use local_len_new so the return length matches the caller's input.
         # - keys not in save_indices → True (assumed cached / no-op)
         # - keys in save_indices → per-block success from all_reduce
+        # When input diverged (skip_transfer), nothing was written and the
+        # local keys don't match rank 0's — return all False.
+        if skip_transfer:
+            return [False] * local_len_new
         block_flag_map = {save_indices[j]: new_block_success[j] for j in range(unmatched)}
         result_list = [
             block_flag_map.get(i, True)
