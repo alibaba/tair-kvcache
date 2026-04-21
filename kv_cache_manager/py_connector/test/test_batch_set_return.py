@@ -630,5 +630,140 @@ class TestBatchSetReturnValue(unittest.TestCase):
         self.assertEqual(result, [False, False, False])
 
 
+class TestSkipTransfer(unittest.TestCase):
+    """Verify _batch_set returns all False when input diverges across TP ranks.
+
+    These tests simulate a non-rank-0 worker whose local block_keys differ
+    from rank 0's.  The broadcast delivers rank 0's result + hash, and the
+    hash mismatch sets skip_transfer = True.
+    """
+
+    @staticmethod
+    def _make_rank1_connector():
+        """Build a rank-1 connector (tp_world_size=2)."""
+        c = _build_connector(tp_rank=1, tp_world_size=2)
+        c.storage_tp_group = MagicMock()
+        return c
+
+    @staticmethod
+    def _broadcast_side_effect(result, len_prefix, len_new, input_hash):
+        """Return a side_effect that fills the recv list with rank 0's data."""
+        def _side_effect(tensor_list, src, group):
+            tensor_list[0] = result
+            tensor_list[1] = len_prefix
+            tensor_list[2] = len_new
+            tensor_list[3] = input_hash
+        return _side_effect
+
+    @staticmethod
+    def _rank0_hash(keys_raw, len_prefix, len_new):
+        """Compute the hash rank 0 would broadcast for the given raw keys."""
+        c_tmp = _build_connector()
+        int_keys = [c_tmp._sha256_to_int64(k) for k in keys_raw]
+        return hash((len_prefix, len_new, *int_keys))
+
+    # ── Case 19: skip_transfer + unmatched == 0 → all False ──────────
+    def test_skip_transfer_all_cached(self):
+        """Input diverges but all blocks cached (unmatched==0) → all False."""
+        c = self._make_rank1_connector()
+
+        # Rank 1's local keys (different from rank 0's)
+        local_keys = ["local_k0", "local_k1", "local_k2"]
+
+        # Rank 0 had different keys, all cached
+        rank0_len_prefix, rank0_len_new = 0, 3
+        rank0_hash = self._rank0_hash(
+            ["rank0_k0", "rank0_k1", "rank0_k2"],
+            rank0_len_prefix, rank0_len_new,
+        )
+        rank0_result = {
+            "locations": [],
+            "write_session_id": "ws-19",
+            "block_mask": {"offset": 3},  # all cached
+        }
+
+        bcast = self._broadcast_side_effect(
+            rank0_result, rank0_len_prefix, rank0_len_new, rank0_hash,
+        )
+        with patch("torch.distributed.broadcast_object_list", side_effect=bcast):
+            result = c._batch_set(local_keys, torch.zeros(3), trace_id="t19")
+
+        self.assertEqual(len(result), 3)
+        self.assertEqual(result, [False, False, False])
+
+    # ── Case 20: skip_transfer + unmatched > 0 → all False ───────────
+    def test_skip_transfer_partial_write(self):
+        """Input diverges, some blocks need writing → all False."""
+        c = self._make_rank1_connector()
+
+        local_keys = ["local_k0", "local_k1", "local_k2", "local_k3"]
+
+        # Rank 0 had different keys, first 2 cached, last 2 need writing
+        rank0_len_prefix, rank0_len_new = 0, 4
+        rank0_hash = self._rank0_hash(
+            ["rank0_k0", "rank0_k1", "rank0_k2", "rank0_k3"],
+            rank0_len_prefix, rank0_len_new,
+        )
+        locations = [
+            {"location_specs": [{"name": "tp_0", "uri": f"uri_{i}"}]}
+            for i in range(2)
+        ]
+        rank0_result = {
+            "locations": locations,
+            "write_session_id": "ws-20",
+            "block_mask": {"offset": 2},  # indices [2,3] need writing
+        }
+
+        bcast = self._broadcast_side_effect(
+            rank0_result, rank0_len_prefix, rank0_len_new, rank0_hash,
+        )
+
+        # all_reduce is a no-op (keeps all-zero flags)
+        with patch("torch.distributed.broadcast_object_list", side_effect=bcast), \
+             patch("torch.distributed.all_reduce"):
+            result = c._batch_set(local_keys, torch.zeros(4), trace_id="t20")
+
+        self.assertEqual(len(result), 4)
+        self.assertEqual(result, [False, False, False, False])
+
+    # ── Case 21: skip_transfer + prefix + unmatched > 0 → all False ──
+    def test_skip_transfer_with_prefix(self):
+        """Input diverges (including prefix), blocks need writing → all False."""
+        c = self._make_rank1_connector()
+
+        local_keys = ["local_k3", "local_k4", "local_k5"]
+        local_extra = MagicMock()
+        local_extra.prefix_keys = ["local_p0", "local_p1", "local_p2"]
+
+        # Rank 0 had different prefix+keys
+        rank0_len_prefix, rank0_len_new = 3, 3
+        rank0_hash = self._rank0_hash(
+            ["rank0_p0", "rank0_p1", "rank0_p2", "rank0_k3", "rank0_k4", "rank0_k5"],
+            rank0_len_prefix, rank0_len_new,
+        )
+        # offset=1 < len_prefix=3 → prefix best-effort path, all 5 blocks in locations
+        locations = [
+            {"location_specs": [{"name": "tp_0", "uri": f"uri_{i}"}]}
+            for i in range(5)
+        ]
+        rank0_result = {
+            "locations": locations,
+            "write_session_id": "ws-21",
+            "block_mask": {"offset": 1},
+        }
+
+        bcast = self._broadcast_side_effect(
+            rank0_result, rank0_len_prefix, rank0_len_new, rank0_hash,
+        )
+
+        with patch("torch.distributed.broadcast_object_list", side_effect=bcast), \
+             patch("torch.distributed.all_reduce"):
+            result = c._batch_set(local_keys, torch.zeros(3), trace_id="t21",
+                                  extra_info=local_extra)
+
+        self.assertEqual(len(result), 3)
+        self.assertEqual(result, [False, False, False])
+
+
 if __name__ == "__main__":
     unittest.main()

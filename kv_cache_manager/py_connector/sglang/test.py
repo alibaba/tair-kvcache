@@ -674,6 +674,37 @@ def _multi_rank_worker(rank, world_size, init_port):
     torch.distributed.barrier()
     logger.info(f"[Rank {rank}] MR-7 PASSED: prefix best-effort multi-rank")
 
+    # ------------------------------------------------------------------
+    # MR-8: Input divergence across ranks → both return all False
+    #   Rank 0 uses block hashes [30..33], rank 1 uses a completely
+    #   different set of hashes.  The broadcast delivers rank 0's hash;
+    #   rank 1 detects the mismatch (skip_transfer=True) and contributes
+    #   all-zero per-block flags.  After all_reduce(MIN), all flags are
+    #   zero on every rank → both return [False, False, False].
+    # ------------------------------------------------------------------
+    if rank == 0:
+        h8 = mr_hashes[30:33]
+    else:
+        # Generate hashes from a different token range so they differ
+        diverge_ids = list(range(90000, 90000 + 3 * page_size))
+        h8 = []
+        _h = None
+        for i in range(0, len(diverge_ids), page_size):
+            _h = get_hash_str(diverge_ids[i:i + page_size], _h)
+            h8.append(_h)
+
+    idx8 = mr_indices[30 * page_size:33 * page_size]  # 3 blocks
+
+    torch.distributed.barrier()
+    result = storage_backend.batch_set_v1(h8, torch.tensor(idx8))
+
+    assert len(result) == 3, f"MR-8 rank {rank}: expected 3 results, got {len(result)}"
+    assert all(r is False for r in result), \
+        f"MR-8 rank {rank}: expected all False (input diverged), got {result}"
+
+    torch.distributed.barrier()
+    logger.info(f"[Rank {rank}] MR-8 PASSED: input divergence → all False")
+
     if debug_client:
         debug_client.close()
     logger.info(f"[Rank {rank}] All multi-rank tests passed!")

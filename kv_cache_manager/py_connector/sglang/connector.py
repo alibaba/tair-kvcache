@@ -441,8 +441,7 @@ class HiCacheKVCM(HiCacheStorage):
         # Prepare keys
         block_keys, len_prefix, len_new = self._prepare_block_keys(keys, extra_info)
         local_len_new = len_new        # Preserve local key count for return value
-        local_len_prefix = len_prefix  # Preserve for divergence check
-        input_hash = hash((len_prefix, len_new, *block_keys))  # Hash covers prefix/new boundary + all keys
+        local_hash = hash((len_prefix, len_new, *block_keys))  # Hash covers prefix/new boundary + all keys
 
         # Start write cache
         if self.tp_rank == 0:
@@ -466,14 +465,14 @@ class HiCacheKVCM(HiCacheStorage):
 
             if self.tp_world_size > 1:
                 torch.distributed.broadcast_object_list(
-                    [result, len_prefix, len_new, input_hash], src=0, group=self.storage_tp_group
+                    [result, len_prefix, len_new, local_hash], src=0, group=self.storage_tp_group
                 )
         else:
             recv = [None, None, None, None]
             torch.distributed.broadcast_object_list(
                 recv, src=0, group=self.storage_tp_group
             )
-            result, len_prefix, len_new, input_hash = recv
+            result, len_prefix, len_new, rank0_hash = recv
 
         logger.debug(f"start_write_cache {result=}")
 
@@ -485,10 +484,9 @@ class HiCacheKVCM(HiCacheStorage):
         # storage. The rank still participates in all_reduce with all-zero
         # flags so NCCL doesn't hang.
         skip_transfer = False
-        local_hash = hash((local_len_prefix, local_len_new, *block_keys))
-        if local_hash != input_hash:
+        if self.tp_rank != 0 and local_hash != rank0_hash:
             logger.warning(f"_batch_set: local block_keys hash ({local_hash}) != "
-                           f"rank 0 hash ({input_hash}), inputs diverged across TP ranks. "
+                           f"rank 0 hash ({rank0_hash}), inputs diverged across TP ranks. "
                            f"local_block_keys={block_keys}")
             skip_transfer = True
 
