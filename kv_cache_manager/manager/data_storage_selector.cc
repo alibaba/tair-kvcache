@@ -51,6 +51,7 @@ private:
     // slot 3: DATA_STORAGE_TYPE_TAIR_MEMPOOL availability flag
     // slot 4: DATA_STORAGE_TYPE_NFS exceed availability flag
     // slot 5: DATA_STORAGE_TYPE_VCNS_HF3FS **UNUSED** (merged into HF3FS)
+    // slot 6: DATA_STORAGE_TYPE_DUMMY availability flag (testing only)
     array_t_ storage_quota_avail_by_type_;
 };
 
@@ -60,6 +61,7 @@ DataStorageSelector::StorageQuotaAvail::StorageQuotaAvail() : storage_quota_avai
     storage_quota_avail_by_type_.at(ToIndex(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE)) = true;
     storage_quota_avail_by_type_.at(ToIndex(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL)) = true;
     storage_quota_avail_by_type_.at(ToIndex(DataStorageType::DATA_STORAGE_TYPE_NFS)) = true;
+    storage_quota_avail_by_type_.at(ToIndex(DataStorageType::DATA_STORAGE_TYPE_DUMMY)) = true;
 }
 
 bool DataStorageSelector::StorageQuotaAvail::GetStorageQuotaAvailByType(const DataStorageType &type) const noexcept {

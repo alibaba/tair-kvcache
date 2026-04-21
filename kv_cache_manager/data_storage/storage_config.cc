@@ -160,6 +160,8 @@ std::string ToString(const DataStorageType &type) {
         return "pace";
     case DataStorageType::DATA_STORAGE_TYPE_NFS:
         return "file";
+    case DataStorageType::DATA_STORAGE_TYPE_DUMMY:
+        return "dummy";
     default:
         return "unrecognized";
     }
@@ -176,6 +178,8 @@ DataStorageType ToDataStorageType(const std::string &type) {
         return DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
     } else if (type == "file") {
         return DataStorageType::DATA_STORAGE_TYPE_NFS;
+    } else if (type == "dummy") {
+        return DataStorageType::DATA_STORAGE_TYPE_DUMMY;
     } else {
         return DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
     }
@@ -271,6 +275,38 @@ void NfsStorageSpec::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &w
     Put(writer, "key_count_per_file", key_count_per_file_);
 }
 
+// DummyStorageSpec
+std::string DummyStorageSpec::ToString() const {
+    std::ostringstream oss;
+    oss << "root_path: " << root_path_;
+    oss << " , key_count_per_file: " << key_count_per_file_;
+    return oss.str();
+}
+
+bool DummyStorageSpec::ValidateRequiredFields(std::string &invalid_fields) const {
+    bool valid = true;
+    std::string local_invalid_fields;
+    if (root_path_.empty()) {
+        valid = false;
+        local_invalid_fields += "{root_path}";
+    }
+    if (!valid) {
+        invalid_fields += "{DummyStorageSpec: " + local_invalid_fields + "}";
+    }
+    return valid;
+}
+
+bool DummyStorageSpec::FromRapidValue(const rapidjson::Value &rapid_value) {
+    KVCM_JSON_GET_MACRO(rapid_value, "root_path", root_path_);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "key_count_per_file", key_count_per_file_, 1);
+    return true;
+}
+
+void DummyStorageSpec::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
+    Put(writer, "root_path", root_path_);
+    Put(writer, "key_count_per_file", key_count_per_file_);
+}
+
 bool StorageConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
     std::string type_str;
     KVCM_JSON_GET_MACRO(rapid_value, "type", type_str);
@@ -295,6 +331,10 @@ bool StorageConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
         storage_spec_ = tmp;
     } else if (type_ == DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL) {
         auto tmp = std::make_shared<TairMemPoolStorageSpec>();
+        KVCM_JSON_GET_MACRO(rapid_value, "storage_spec", tmp);
+        storage_spec_ = tmp;
+    } else if (type_ == DataStorageType::DATA_STORAGE_TYPE_DUMMY) {
+        auto tmp = std::make_shared<DummyStorageSpec>();
         KVCM_JSON_GET_MACRO(rapid_value, "storage_spec", tmp);
         storage_spec_ = tmp;
     } else {

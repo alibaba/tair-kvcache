@@ -42,9 +42,14 @@ enum StorageType {
     ST_TAIRMEMPOOL = 3;
     ST_NFS = 4;
     ST_VCNS_3FS = 5;
+    ST_DUMMY = 6;
 }
 
-message LocalStorageSpec {}
+// for dummy storage backend
+message LocalStorageSpec {
+    string root_path = 1;
+    int32 key_count_per_file = 2;
+}
 
 // 3fs
 message ThreeFSStorageSpec {

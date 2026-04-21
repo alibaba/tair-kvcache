@@ -283,18 +283,15 @@ class LocationPruningTest(abc.ABC, TestBase, unittest.TestCase):
                 self.assertEqual(int(os.path.basename(file_path), base=16), key)
 
     def _make_dummy_storage(self):
-        # TODO: use dummy storage backend instead of hf3fs
-        hf3fs_mountpoint = f"{self.get_workdir()}/{self._storage_name}/"
-        os.makedirs(hf3fs_mountpoint, exist_ok=True)
+        dummy_root_path = f"{self.get_workdir()}/{self._storage_name}/data/"
+        os.makedirs(dummy_root_path, exist_ok=True)
         add_storage_req = {
             "trace_id": self._trace_id + "-add_storage",
             "storage": {
                 "global_unique_name": self._storage_name,
-                "threefs": {
-                    "mountpoint": hf3fs_mountpoint,
-                    "root_dir": "data/",
+                "local": {
+                    "root_path": dummy_root_path,
                     "key_count_per_file": 1,
-                    "touch_file_when_create": True,
                 }
             },
         }

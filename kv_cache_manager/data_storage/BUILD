@@ -4,6 +4,7 @@ cc_library(
     name = "data_storage",
     srcs = [
         "data_storage_manager.cc",
+        "dummy_backend.cc",
         "hf3fs_backend.cc",
         "mooncake_backend.cc",
         "nfs_backend.cc",
@@ -11,6 +12,7 @@ cc_library(
     hdrs = [
         "data_storage_backend.h",
         "data_storage_manager.h",
+        "dummy_backend.h",
         "hf3fs_backend.h",
         "mooncake_backend.h",
         "nfs_backend.h",

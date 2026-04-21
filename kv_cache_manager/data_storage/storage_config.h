@@ -14,6 +14,7 @@ enum class DataStorageType : uint8_t {
     DATA_STORAGE_TYPE_TAIR_MEMPOOL = 3,
     DATA_STORAGE_TYPE_NFS = 4,
     DATA_STORAGE_TYPE_VCNS_HF3FS = 5,
+    DATA_STORAGE_TYPE_DUMMY = 6,
     COUNT, // as sentinel
 };
 
@@ -157,6 +158,23 @@ private:
 };
 
 class NfsStorageSpec : public StorageSpec {
+public:
+    bool FromRapidValue(const rapidjson::Value &rapid_value) override;
+    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
+    bool ValidateRequiredFields(std::string &invalid_fields) const override;
+
+    std::string ToString() const override;
+    const std::string &root_path() const { return root_path_; }
+    void set_root_path(const std::string &root_path) { root_path_ = root_path; }
+    int32_t key_count_per_file() const { return key_count_per_file_; }
+    void set_key_count_per_file(int32_t value) { key_count_per_file_ = value; }
+
+private:
+    std::string root_path_;
+    int32_t key_count_per_file_ = 0;
+};
+
+class DummyStorageSpec : public StorageSpec {
 public:
     bool FromRapidValue(const rapidjson::Value &rapid_value) override;
     void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;

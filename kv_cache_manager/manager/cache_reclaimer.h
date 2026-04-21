@@ -365,6 +365,7 @@ private:
         // slot 3: DATA_STORAGE_TYPE_TAIR_MEMPOOL exceed flag
         // slot 4: DATA_STORAGE_TYPE_NFS exceed flag
         // slot 5: DATA_STORAGE_TYPE_VCNS_HF3FS **UNUSED** (merged into HF3FS)
+        // slot 6: DATA_STORAGE_TYPE_DUMMY exceed flag (testing only)
         array_t_ water_level_exceed_by_type_;
     };
 
