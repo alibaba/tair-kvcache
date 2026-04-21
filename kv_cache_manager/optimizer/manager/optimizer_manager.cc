@@ -142,8 +142,9 @@ bool OptimizerManager::CreateRadixTreeIndex(const OptInstanceConfig &instance_co
         return false;
     }
 
+    int64_t default_ttl_us = group_it->second.default_block_ttl_seconds() * 1000000;
     if (!indexer_manager_->CreateOptIndexer(
-            instance_config, storage_configs, group_it->second.hierarchical_eviction_enabled())) {
+            instance_config, storage_configs, group_it->second.hierarchical_eviction_enabled(), default_ttl_us)) {
         KVCM_LOG_ERROR("Failed to create optimizer indexer for instance_id: %s", instance_config.instance_id().c_str());
         return false;
     }
@@ -163,13 +164,17 @@ WriteCacheRes OptimizerManager::WriteCache(const std::string &instance_id,
                                            const std::string &trace_id,
                                            const int64_t timestamp,
                                            const std::vector<int64_t> &block_ids,
-                                           const std::vector<int64_t> &token_ids) {
+                                           const std::vector<int64_t> &token_ids,
+                                           const int64_t ttl_seconds) {
     WriteCacheSchemaTrace trace;
     trace.set_instance_id(instance_id);
     trace.set_trace_id(trace_id);
     trace.set_timestamp_us(timestamp);
     trace.set_keys(block_ids);
     trace.set_tokens(token_ids);
+
+    int64_t ttl_us = (ttl_seconds > 0) ? ttl_seconds * 1000000 : ttl_seconds;
+    trace.set_ttl_us(ttl_us);
     optimizer_runner_->HandleWriteCache(trace);
     stats_collector_->UpdateTimestamp(instance_id, timestamp);
 

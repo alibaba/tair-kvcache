@@ -43,6 +43,7 @@ PYBIND11_MODULE(kvcm_py_optimizer, module) {
         .value("LRU", kvcm::EvictionPolicyType::POLICY_LRU)
         .value("RANDOM_LRU", kvcm::EvictionPolicyType::POLICY_RANDOM_LRU)
         .value("LEAF_AWARE_LRU", kvcm::EvictionPolicyType::POLICY_LEAF_AWARE_LRU)
+        .value("TTL", kvcm::EvictionPolicyType::POLICY_TTL)
         .finalize();
 
     py::native_enum<kvcm::DataStorageType>(module, "DataStorageType", "enum.Enum")
@@ -130,7 +131,8 @@ PYBIND11_MODULE(kvcm_py_optimizer, module) {
              py::arg("trace_id"),
              py::arg("timestamp"),
              py::arg("block_ids"),
-             py::arg("token_ids"))
+             py::arg("token_ids"),
+             py::arg("ttl_seconds") = int64_t(0))
         .def(
             "GetCacheLocation",
             [](kvcm::OptimizerManager &self,

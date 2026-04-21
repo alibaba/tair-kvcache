@@ -19,6 +19,10 @@ bool OptInstanceConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
         RandomLruParams random_lru_params;
         KVCM_JSON_GET_MACRO(rapid_value, "eviction_policy_params", random_lru_params);
         eviction_policy_param_ = random_lru_params;
+    } else if (eviction_policy_type_ == EvictionPolicyType::POLICY_TTL) {
+        TtlParams ttl_params;
+        KVCM_JSON_GET_MACRO(rapid_value, "eviction_policy_params", ttl_params);
+        eviction_policy_param_ = ttl_params;
     } else {
         KVCM_LOG_ERROR("Unknown eviction policy type: %s", eviction_policy_type_str.c_str());
     }
@@ -35,6 +39,8 @@ void OptInstanceConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer>
         Put(writer, "eviction_policy_params", std::get<LruParams>(eviction_policy_param_));
     } else if (eviction_policy_type_ == EvictionPolicyType::POLICY_RANDOM_LRU) {
         Put(writer, "eviction_policy_params", std::get<RandomLruParams>(eviction_policy_param_));
+    } else if (eviction_policy_type_ == EvictionPolicyType::POLICY_TTL) {
+        Put(writer, "eviction_policy_params", std::get<TtlParams>(eviction_policy_param_));
     }
 };
 } // namespace kv_cache_manager

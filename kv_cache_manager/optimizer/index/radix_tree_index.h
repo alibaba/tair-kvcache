@@ -18,7 +18,9 @@ class StatsCollector;
 void AppendBlockLocation(BlockEntry *block, const std::string &unique_name, int64_t timestamp);
 class RadixTreeIndex {
 public:
-    RadixTreeIndex(const std::string &instance_id, const std::shared_ptr<EvictionPolicy> &eviction_policy);
+    RadixTreeIndex(const std::string &instance_id,
+                   const std::shared_ptr<EvictionPolicy> &eviction_policy,
+                   int64_t default_ttl_us = 0);
     RadixTreeIndex();
     ~RadixTreeIndex() = default;
 
@@ -26,7 +28,8 @@ public:
         std::vector<int64_t> inserted_keys;
     };
 
-    InsertResult InsertOnly(const std::vector<int64_t> &block_keys, const int64_t timestamp);
+    // ttl_us: 0 = 使用 default_ttl_us_，-1 = 禁用 TTL，>0 = 自定义微秒
+    InsertResult InsertOnly(const std::vector<int64_t> &block_keys, int64_t timestamp, int64_t ttl_us = 0);
     void PrefixQuery(const std::vector<int64_t> &block_keys,
                      const BlockMask &block_mask,
                      const int64_t timestamp,
@@ -68,17 +71,20 @@ private:
     std::unique_ptr<RadixTreeNode> root_;
     std::shared_ptr<EvictionPolicy> eviction_policy_;
     std::string instance_id_;
+    int64_t default_ttl_us_ = 0;
     std::shared_ptr<StatsCollector> stats_collector_;
 
 private:
     std::vector<BlockEntry *>
-    AppendNewBlocks(RadixTreeNode *node, const std::vector<int64_t> &block_keys, const int64_t timestamp);
+    AppendNewBlocks(RadixTreeNode *node, const std::vector<int64_t> &block_keys, int64_t timestamp, int64_t ttl_us);
 
-    InsertResult InsertNode(RadixTreeNode *node, const std::vector<int64_t> &block_keys, const int64_t timestamp);
+    InsertResult
+    InsertNode(RadixTreeNode *node, const std::vector<int64_t> &block_keys, int64_t timestamp, int64_t ttl_us);
     void SplitNode(RadixTreeNode *existing_node,
                    size_t split_pos,
                    const std::vector<int64_t> &remaining_keys,
-                   int64_t timestamp);
+                   int64_t timestamp,
+                   int64_t ttl_us = 0);
     std::vector<int64_t> InsertQuery(RadixTreeNode *node,
                                      const std::vector<int64_t> &block_keys,
                                      const int64_t timestamp,
@@ -86,12 +92,12 @@ private:
                                      std::vector<std::vector<int64_t>> &hits);
 
     using WriteModify = std::function<std::vector<BlockEntry *>(const std::vector<int64_t> &, int64_t)>;
-    WriteModify AppendEvictBlocks(std::unordered_map<int64_t, BlockEntry *> blocks_map);
+    WriteModify AppendEvictBlocks(std::unordered_map<int64_t, BlockEntry *> blocks_map, int64_t ttl_us);
 
-    void
-    WriteToTier(RadixTreeNode *node, const std::vector<int64_t> &block_keys, const int64_t timestamp, WriteModify cb);
+    void WriteToTier(
+        RadixTreeNode *node, const std::vector<int64_t> &block_keys, int64_t timestamp, int64_t ttl_us, WriteModify cb);
 
     void OnBlockAccessed(BlockEntry *block, int64_t timestamp);
-    bool IsBlockEvict(BlockEntry *block) const;
+    bool IsBlockEvict(BlockEntry *block, int64_t timestamp) const;
 };
 } // namespace kv_cache_manager

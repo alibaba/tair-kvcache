@@ -38,6 +38,16 @@ std::shared_ptr<EvictionPolicy> EvictionPolicyFactory::CreatePolicy(EvictionPoli
         KVCM_LOG_INFO("Creating Leaf Aware LRU policy with sample_rate=%f", lru_params.sample_rate);
         return std::make_shared<LeafAwareLruEvictionPolicy>(name, lru_params);
     }
+    case EvictionPolicyType::POLICY_TTL: {
+        if (!std::holds_alternative<TtlParams>(param)) {
+            KVCM_LOG_ERROR("Invalid parameters for TTL eviction policy on tier %s", name.c_str());
+            return nullptr;
+        }
+        const TtlParams &ttl_params = std::get<TtlParams>(param);
+        KVCM_LOG_INFO(
+            "Creating TTL policy for tier %s, fallback_on_pressure=%d", name.c_str(), ttl_params.fallback_on_pressure);
+        return std::make_shared<TtlEvictionPolicy>(name, ttl_params.fallback_on_pressure);
+    }
     case EvictionPolicyType::POLICY_UNSPECIFIED:
     default:
         KVCM_LOG_ERROR("Unsupported eviction policy type for tier %s", name.c_str());

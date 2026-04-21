@@ -26,11 +26,13 @@ public:
 public:
     void DirectRun();
 
+    // ttl_seconds: 0 = 使用 group 默认, -1 = 禁用 TTL, >0 = 自定义秒数
     WriteCacheRes WriteCache(const std::string &instance_id,
                              const std::string &trace_id,
                              const int64_t timestamp,
                              const std::vector<int64_t> &block_ids,
-                             const std::vector<int64_t> &token_ids);
+                             const std::vector<int64_t> &token_ids,
+                             const int64_t ttl_seconds = 0);
     GetCacheLocationRes GetCacheLocation(const std::string &instance_id,
                                          const std::string &trace_id,
                                          const int64_t timestamp,

@@ -116,7 +116,7 @@ void OptimizerRunner::HandleWriteCache(const WriteCacheSchemaTrace &trace) {
         return;
     }
 
-    auto result = indexer->InsertOnly(trace.keys(), trace.timestamp_us());
+    auto result = indexer->InsertOnly(trace.keys(), trace.timestamp_us(), trace.ttl_us());
     bool evicted = indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_us());
     if (evicted) {
         KVCM_LOG_DEBUG("Eviction in %zu to instance_id: %s", trace.timestamp_us(), instance_id.c_str());

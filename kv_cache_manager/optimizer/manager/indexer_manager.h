@@ -17,7 +17,8 @@ public:
     ~OptIndexerManager() = default;
     bool CreateOptIndexer(const OptInstanceConfig &instance_config,
                           const std::vector<OptTierConfig> &storage_configs,
-                          bool hierarchical_eviction_enabled = false);
+                          bool hierarchical_eviction_enabled = false,
+                          int64_t default_ttl_us = 0);
 
     std::shared_ptr<RadixTreeIndex> GetOptIndexer(const std::string &instance_id) const;
     std::unordered_map<std::string, std::shared_ptr<RadixTreeIndex>> GetAllOptIndexers() const;

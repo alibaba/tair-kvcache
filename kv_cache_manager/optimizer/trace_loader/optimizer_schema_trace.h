@@ -110,13 +110,23 @@ private:
 // 只包含写入缓存相关的信息
 class WriteCacheSchemaTrace : public OptimizerSchemaTrace {
 public:
+    int64_t ttl_us() const { return ttl_us_; }
+    void set_ttl_us(int64_t ttl_us) { ttl_us_ = ttl_us; }
+
     bool FromRapidValue(const rapidjson::Value &rapid_value) override {
-        // 调用基类的FromRapidValue解析基础字段
-        return OptimizerSchemaTrace::FromRapidValue(rapid_value);
+        if (!OptimizerSchemaTrace::FromRapidValue(rapid_value)) {
+            return false;
+        }
+        KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "ttl_us", ttl_us_, int64_t(0));
+        return true;
     }
     void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override {
         OptimizerSchemaTrace::ToRapidWriter(writer);
+        Put(writer, "ttl_us", ttl_us_);
     }
+
+private:
+    int64_t ttl_us_ = 0; // 0 = 使用 group 默认, -1 = 禁用
 };
 // 整个对话轮次的Trace，包含输入输出信息
 // 目前直接服务于算力画像的输入

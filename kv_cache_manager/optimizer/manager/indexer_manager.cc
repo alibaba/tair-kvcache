@@ -9,7 +9,8 @@ OptIndexerManager::OptIndexerManager(const std::shared_ptr<OptEvictionManager> &
 
 bool OptIndexerManager::CreateOptIndexer(const OptInstanceConfig &instance_config,
                                          const std::vector<OptTierConfig> &storage_configs,
-                                         bool hierarchical_eviction_enabled) {
+                                         bool hierarchical_eviction_enabled,
+                                         int64_t default_ttl_us) {
 
     std::string instance_id = instance_config.instance_id();
     auto indexer = GetOptIndexer(instance_id);
@@ -24,7 +25,7 @@ bool OptIndexerManager::CreateOptIndexer(const OptInstanceConfig &instance_confi
         KVCM_LOG_ERROR("Failed to create eviction policy for instance_id: %s", instance_id.c_str());
         return false;
     }
-    indexer = std::make_shared<RadixTreeIndex>(instance_id, eviction_policy);
+    indexer = std::make_shared<RadixTreeIndex>(instance_id, eviction_policy, default_ttl_us);
 
     opt_indexer_map_[instance_id] = indexer;
     KVCM_LOG_INFO("Create optimizer indexer success, instance_id: %s", instance_id.c_str());
