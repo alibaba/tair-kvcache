@@ -98,7 +98,7 @@ class HiCacheKVCM(HiCacheStorage):
 
         # Detect extra pools early — _tp_rank_to_spec_name depends on these.
         self.has_mamba = PoolName.MAMBA in self.registered_pools
-        self.has_indexer = PoolName.INDEXER in self.registered_pools
+        self.has_indexer = getattr(PoolName, "INDEXER", None) is not None and PoolName.INDEXER in self.registered_pools
 
         self.location_spec_size = kv_pool.get_size_per_token() * self.block_size
         self.location_spec_infos = [{
@@ -441,6 +441,7 @@ class HiCacheKVCM(HiCacheStorage):
         # Prepare keys
         block_keys, len_prefix, len_new = self._prepare_block_keys(keys, extra_info)
         local_len_new = len_new      # Preserve local key count for return value
+        input_hash = hash(tuple(block_keys))  # Hash of full block_keys for cross-rank consistency check
 
         # Start write cache
         if self.tp_rank == 0:
@@ -464,20 +465,31 @@ class HiCacheKVCM(HiCacheStorage):
 
             if self.tp_world_size > 1:
                 torch.distributed.broadcast_object_list(
-                    [result, len_prefix, len_new], src=0, group=self.storage_tp_group
+                    [result, len_prefix, len_new, input_hash], src=0, group=self.storage_tp_group
                 )
         else:
-            recv = [None, None, None]
+            recv = [None, None, None, None]
             torch.distributed.broadcast_object_list(
                 recv, src=0, group=self.storage_tp_group
             )
-            result, len_prefix, len_new = recv
+            result, len_prefix, len_new, input_hash = recv
 
         logger.debug(f"start_write_cache {result=}")
 
         # All ranks now share rank 0's len_prefix/len_new so that
         # _parse_block_mask produces the same save_indices everywhere,
         # preventing control-flow divergence (and NCCL hangs).
+        # We also compare a hash of the full block_keys list: if a non-rank-0
+        # rank's local block_keys differ from rank 0's, writing would corrupt
+        # storage. The rank still participates in all_reduce with all-zero
+        # flags so NCCL doesn't hang.
+        skip_transfer = False
+        local_hash = hash(tuple(block_keys))
+        if local_hash != input_hash:
+            logger.warning(f"_batch_set: local block_keys hash ({local_hash}) != "
+                           f"rank 0 hash ({input_hash}), inputs diverged across TP ranks. "
+                           f"local_block_keys={block_keys}")
+            skip_transfer = True
 
         if result is None:
             return [False] * local_len_new
