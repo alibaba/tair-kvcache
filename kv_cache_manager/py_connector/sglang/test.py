@@ -612,6 +612,68 @@ def _multi_rank_worker(rank, world_size, init_port):
     torch.distributed.barrier()
     logger.info(f"[Rank {rank}] MR-5 PASSED: recovery")
 
+    # ------------------------------------------------------------------
+    # MR-6: Per-block best-effort across ranks
+    #   Rank 0 passes 5 blocks of host_indices, rank 1 passes only 3.
+    #   Both ranks pass the same 5 keys. Rank 1's get_page_buffer_meta
+    #   returns fewer entries → local_block_count=3 → only blocks [0,1,2]
+    #   written by rank 1. After all_reduce(MIN), blocks [3,4] are marked
+    #   failed on ALL ranks. Verifies no hang and correct per-block result.
+    # ------------------------------------------------------------------
+    h6 = mr_hashes[25:30]
+    if rank == 0:
+        idx6 = mr_indices[25 * page_size:30 * page_size]  # 5 blocks
+    else:
+        idx6 = mr_indices[25 * page_size:28 * page_size]  # 3 blocks
+
+    torch.distributed.barrier()
+    result = storage_backend.batch_set_v1(h6, torch.tensor(idx6))
+
+    # Both ranks should get [True, True, True, False, False]:
+    # blocks 0-2 succeeded on all ranks, blocks 3-4 only rank 0 had data
+    assert len(result) == 5, f"MR-6 rank {rank}: expected 5 results, got {len(result)}"
+    assert result[:3] == [True, True, True], \
+        f"MR-6 rank {rank}: first 3 blocks should be True, got {result[:3]}"
+    assert result[3:] == [False, False], \
+        f"MR-6 rank {rank}: last 2 blocks should be False, got {result[3:]}"
+
+    torch.distributed.barrier()
+    logger.info(f"[Rank {rank}] MR-6 PASSED: per-block best-effort")
+
+    # ------------------------------------------------------------------
+    # MR-7: Prefix best-effort across ranks
+    #   Uses prefix_keys that were NEVER written → manager returns offset=0
+    #   which is < len_prefix → triggers prefix best-effort path.
+    #   Rank 0 passes full host_indices for new blocks (3 blocks).
+    #   Rank 1 passes fewer host_indices (2 blocks).
+    #   After all_reduce(MIN): blocks [0,1] succeed, block [2] fails.
+    #   Verifies prefix best-effort + per-block MIN in multi-rank.
+    # ------------------------------------------------------------------
+    prefix_keys_7 = mr_hashes[5:8]    # 3 blocks never written → not in cache
+    h7 = mr_hashes[8:11]              # 3 new blocks
+
+    if rank == 0:
+        idx7 = mr_indices[8 * page_size:11 * page_size]   # 3 blocks of data
+    else:
+        idx7 = mr_indices[8 * page_size:10 * page_size]   # 2 blocks of data
+
+    extra_info_7 = HiCacheStorageExtraInfo(prefix_keys=prefix_keys_7)
+
+    torch.distributed.barrier()
+    result = storage_backend.batch_set_v1(h7, torch.tensor(idx7), extra_info_7)
+
+    # Both ranks: len_prefix=3, offset=0 → prefix_write_count=3, save_indices=[0,1,2]
+    # Rank 0 writes blocks [0,1,2]; Rank 1 writes blocks [0,1] only.
+    # all_reduce(MIN) → [1,1,0]. Result for new keys: [True, True, False]
+    assert len(result) == 3, f"MR-7 rank {rank}: expected 3 results, got {len(result)}"
+    assert result[:2] == [True, True], \
+        f"MR-7 rank {rank}: first 2 blocks should be True, got {result[:2]}"
+    assert result[2] == False, \
+        f"MR-7 rank {rank}: last block should be False, got {result[2]}"
+
+    torch.distributed.barrier()
+    logger.info(f"[Rank {rank}] MR-7 PASSED: prefix best-effort multi-rank")
+
     if debug_client:
         debug_client.close()
     logger.info(f"[Rank {rank}] All multi-rank tests passed!")
