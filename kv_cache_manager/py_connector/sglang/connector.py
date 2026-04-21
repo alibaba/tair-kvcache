@@ -440,6 +440,7 @@ class HiCacheKVCM(HiCacheStorage):
 
         # Prepare keys
         block_keys, len_prefix, len_new = self._prepare_block_keys(keys, extra_info)
+        local_len_new = len_new      # Preserve local key count for return value
 
         # Start write cache
         if self.tp_rank == 0:
@@ -463,19 +464,23 @@ class HiCacheKVCM(HiCacheStorage):
 
             if self.tp_world_size > 1:
                 torch.distributed.broadcast_object_list(
-                    [result], src=0, group=self.storage_tp_group
+                    [result, len_prefix, len_new], src=0, group=self.storage_tp_group
                 )
         else:
-            recv = [None]
+            recv = [None, None, None]
             torch.distributed.broadcast_object_list(
                 recv, src=0, group=self.storage_tp_group
             )
-            result = recv[0]
+            result, len_prefix, len_new = recv
 
         logger.debug(f"start_write_cache {result=}")
 
+        # All ranks now share rank 0's len_prefix/len_new so that
+        # _parse_block_mask produces the same save_indices everywhere,
+        # preventing control-flow divergence (and NCCL hangs).
+
         if result is None:
-            return [False] * len_new
+            return [False] * local_len_new
 
         locations = result["locations"]
         write_session_id = result["write_session_id"]
@@ -501,7 +506,7 @@ class HiCacheKVCM(HiCacheStorage):
                     )
                 except Exception as e:
                     logger.error(f"finish_write_cache failed: {e}")
-            return [False] * len_new
+            return [False] * local_len_new
 
         save_indices, prefix_write_count = parsed
         unmatched = len(save_indices)
@@ -520,51 +525,79 @@ class HiCacheKVCM(HiCacheStorage):
                     )
                 except Exception as e:
                     logger.error(f"finish_write_cache failed: {e}")
-            return [True] * len_new
+            return [True] * local_len_new
 
         assert unmatched + prefix_write_count == len(locations)
 
         # Data transfer preparation and execution.
         # Skip prefix locations — sglang cannot write prefix blocks.
+        # Best-effort: each rank writes only the blocks it has local data for.
+        # A per-block flag vector is all_reduced (MIN) so only blocks written
+        # by ALL ranks are considered successful.
         # Wrapped in try-except so that every rank always reaches the
         # all_reduce below, preventing cross-rank NCCL/gloo hangs.
         new_locations = locations[prefix_write_count:]
-        try:
-            buffer_ptrs, buffer_sizes = self.mem_pool_host.get_page_buffer_meta(host_indices)
-            buffer_ptrs = [buffer_ptr for i, buffer_ptr in enumerate(buffer_ptrs) if (i // self.kv_factor) in save_indices]
-            buffer_sizes = [buffer_size for i, buffer_size in enumerate(
-                buffer_sizes) if (i // self.kv_factor) in save_indices]
+        per_block_flags = torch.zeros(unmatched, dtype=torch.int)
+        if skip_transfer:
+            # This rank's block_keys diverged from rank 0 — writing would
+            # corrupt storage. Keep per_block_flags as all-zero and still
+            # participate in all_reduce below.
+            logger.warning("_batch_set: skipping data transfer on this rank due to input divergence")
+        else:
+            try:
+                buffer_ptrs, buffer_sizes = self.mem_pool_host.get_page_buffer_meta(host_indices)
+                local_block_count = len(buffer_ptrs) // self.kv_factor
 
-            # Extract URIs and prepare buffers
-            uris = self._extract_uris(new_locations)
-            buffers = self._prepare_buffers(buffer_ptrs, buffer_sizes)
-            assert len(uris) == len(buffers)
-            # Perform data transfer
-            start_time = time.perf_counter()
-            result = self.transfer_client.SaveKvCaches(uris, buffers)
-            end_time = time.perf_counter()
-            self.backup_pgs.append(unmatched)
-            self.backup_bandwidth.append(unmatched * self.location_spec_size / (1 << 30) / (end_time - start_time))
-            logger.debug(f"SaveKvCaches {result=}")
+                # Determine which save_indices have local data available
+                valid_save_mask = [(idx < local_block_count) for idx in save_indices]
+                valid_save_set = set(idx for idx, valid in zip(save_indices, valid_save_mask) if valid)
+                num_valid = sum(valid_save_mask)
 
-            flag = (result[0] == kvcm_py_client.ClientErrorCode.ER_OK)
-            if not flag:
-                logger.error(f"SaveKvCaches error: {result}")
-        except Exception as e:
-            logger.error(f"Data transfer (SaveKvCaches) failed: {e}")
-            flag = False
+                if num_valid > 0:
+                    buffer_ptrs = [ptr for i, ptr in enumerate(buffer_ptrs)
+                                   if (i // self.kv_factor) in valid_save_set]
+                    buffer_sizes = [sz for i, sz in enumerate(buffer_sizes)
+                                    if (i // self.kv_factor) in valid_save_set]
 
-        # Finish write cache
+                    # Extract URIs only for blocks with local data
+                    valid_locations = [loc for loc, valid in zip(new_locations, valid_save_mask) if valid]
+                    uris = self._extract_uris(valid_locations)
+                    buffers = self._prepare_buffers(buffer_ptrs, buffer_sizes)
+                    assert len(uris) == len(buffers)
+
+                    # Perform data transfer
+                    start_time = time.perf_counter()
+                    result = self.transfer_client.SaveKvCaches(uris, buffers)
+                    end_time = time.perf_counter()
+                    self.backup_pgs.append(num_valid)
+                    self.backup_bandwidth.append(num_valid * self.location_spec_size / (1 << 30) / (end_time - start_time))
+                    logger.debug(f"SaveKvCaches {result=}")
+
+                    transfer_ok = (result[0] == kvcm_py_client.ClientErrorCode.ER_OK)
+                    if not transfer_ok:
+                        logger.error(f"SaveKvCaches error: {result}")
+                else:
+                    transfer_ok = True  # nothing to write on this rank
+
+                # Mark blocks this rank successfully wrote
+                for j, valid in enumerate(valid_save_mask):
+                    if valid and transfer_ok:
+                        per_block_flags[j] = 1
+
+            except Exception as e:
+                logger.error(f"Data transfer (SaveKvCaches) failed: {e}")
+                # per_block_flags remains all zeros
+
+        # Per-block all_reduce: only blocks ALL ranks wrote are marked success
         if self.tp_world_size > 1:
-            flag_tensor = torch.tensor(flag, dtype=torch.int)
             torch.distributed.all_reduce(
-                flag_tensor,
+                per_block_flags,
                 op=torch.distributed.ReduceOp.MIN,
                 group=self.storage_tp_group,
             )
-            flag = bool(flag_tensor.item())
 
-        finish_mask = [False] * prefix_write_count + [flag] * unmatched
+        new_block_success = [bool(per_block_flags[j]) for j in range(unmatched)]
+        finish_mask = [False] * prefix_write_count + new_block_success
         if self.tp_rank == 0:
             try:
                 self._manager_client.finish_write_cache(
@@ -577,19 +610,17 @@ class HiCacheKVCM(HiCacheStorage):
                 )
             except Exception as e:
                 logger.error(f"finish_write_cache failed: {e}")
-                # This sets flag = False on rank 0 only; other ranks
-                # still have the post-all_reduce value (True if data
-                # transfer succeeded). See the NOTE at the top of
-                # _batch_set for why we accept this inconsistency.
-                flag = False
+                # Mark all as failed on rank 0 for the return value.
+                new_block_success = [False] * unmatched
 
-        # Build result list: 1:1 positional mapping with input keys
-        # - keys not in save_indices → True
-        # - keys in save_indices → flag (True if save succeeded)
-        save_indices_set = set(save_indices)
+        # Build result list: 1:1 positional mapping with input keys.
+        # Use local_len_new so the return length matches the caller's input.
+        # - keys not in save_indices → True (assumed cached / no-op)
+        # - keys in save_indices → per-block success from all_reduce
+        block_flag_map = {save_indices[j]: new_block_success[j] for j in range(unmatched)}
         result_list = [
-            flag if i in save_indices_set else True
-            for i in range(len_new)
+            block_flag_map.get(i, True)
+            for i in range(local_len_new)
         ]
         return result_list
 

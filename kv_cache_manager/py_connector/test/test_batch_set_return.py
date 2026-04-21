@@ -477,7 +477,149 @@ class TestBatchSetReturnValue(unittest.TestCase):
         self.assertEqual(len(result), len(keys))
         self.assertEqual(result, [False, False])
 
-    # ── Case 15: batch_set_v1 exception returns all False ─────────────
+    # ── Case 15: per-block best-effort with partial local data ─────────
+    def test_per_block_best_effort_partial_local_data(self):
+        """When local rank has fewer blocks than save_indices expects,
+        only blocks with local data are written; others return False."""
+        keys = ["k0", "k1", "k2", "k3", "k4"]
+
+        # All 5 keys need writing (offset=0), 5 locations
+        locations = [
+            {"location_specs": [{"name": "tp_0", "uri": f"uri_{i}"}]}
+            for i in range(5)
+        ]
+        result_from_manager = {
+            "locations": locations,
+            "write_session_id": "ws-15",
+            "block_mask": {"offset": 0},
+        }
+        c = _build_connector()
+        c._manager_client.start_write_cache.return_value = result_from_manager
+
+        # Only 3 blocks worth of buffer data (kv_factor=2, so 6 entries)
+        # This simulates a rank that has fewer local blocks available.
+        # local_block_count = 6 // 2 = 3, so only save_indices [0,1,2] are valid.
+        c.mem_pool_host.get_page_buffer_meta.return_value = (
+            list(range(6)),           # 6 ptrs → 3 blocks
+            [c.location_spec_size] * 6,
+        )
+
+        # SaveKvCaches succeeds for the 3 valid blocks
+        c.transfer_client.SaveKvCaches.return_value = (
+            _mock_kvcm.ClientErrorCode.ER_OK,
+        )
+
+        result = c._batch_set(keys, torch.zeros(5), trace_id="t15")
+
+        self.assertEqual(len(result), len(keys))
+        # Blocks 0,1,2 have local data → True; blocks 3,4 do not → False
+        self.assertEqual(result, [True, True, True, False, False])
+
+        # Verify SaveKvCaches was called with only 3 URIs (valid blocks)
+        save_call_args = c.transfer_client.SaveKvCaches.call_args[0]
+        uris_arg = save_call_args[0]
+        self.assertEqual(len(uris_arg), 3)
+
+        # Verify finish_write_cache mask reflects per-block success
+        call_args = c._manager_client.finish_write_cache.call_args[0][0]
+        finish_mask = call_args["success_blocks"]["bool_masks"]["values"]
+        self.assertEqual(finish_mask, [True, True, True, False, False])
+
+    # ── Case 16: per-block best-effort, transfer fails for valid blocks ─
+    def test_per_block_best_effort_transfer_fails(self):
+        """When local rank has partial data but transfer fails, all return False."""
+        keys = ["k0", "k1", "k2", "k3"]
+
+        # All 4 keys need writing (offset=0)
+        locations = [
+            {"location_specs": [{"name": "tp_0", "uri": f"uri_{i}"}]}
+            for i in range(4)
+        ]
+        result_from_manager = {
+            "locations": locations,
+            "write_session_id": "ws-16",
+            "block_mask": {"offset": 0},
+        }
+        c = _build_connector()
+        c._manager_client.start_write_cache.return_value = result_from_manager
+
+        # Only 2 blocks of local data (kv_factor=2, so 4 entries)
+        # local_block_count = 4 // 2 = 2, save_indices [0,1] valid, [2,3] invalid
+        c.mem_pool_host.get_page_buffer_meta.return_value = (
+            list(range(4)),
+            [c.location_spec_size] * 4,
+        )
+
+        # SaveKvCaches FAILS
+        c.transfer_client.SaveKvCaches.return_value = (999,)
+
+        result = c._batch_set(keys, torch.zeros(4), trace_id="t16")
+
+        self.assertEqual(len(result), len(keys))
+        # Blocks 0,1 had local data but transfer failed → False
+        # Blocks 2,3 had no local data → False
+        self.assertEqual(result, [False, False, False, False])
+
+        # Verify finish_write_cache: all False
+        call_args = c._manager_client.finish_write_cache.call_args[0][0]
+        finish_mask = call_args["success_blocks"]["bool_masks"]["values"]
+        self.assertEqual(finish_mask, [False, False, False, False])
+
+    # ── Case 17: per-block best-effort with prefix + partial local data ─
+    def test_per_block_best_effort_prefix_plus_partial(self):
+        """Prefix blocks skipped AND local rank has partial data for new blocks."""
+        keys = ["k2", "k3", "k4", "k5"]
+
+        # prefix_keys = ["p0", "p1"], len_prefix=2
+        # offset=1 → blocks [1..5] need writing:
+        #   p1 (prefix, can't write) + k2, k3, k4, k5 (new, can write)
+        # prefix_write_count=1, save_indices=[0,1,2,3]
+        # locations: 5 entries (1 prefix + 4 new)
+        locations = [
+            {"location_specs": [{"name": "tp_0", "uri": f"uri_{i}"}]}
+            for i in range(5)
+        ]
+        result_from_manager = {
+            "locations": locations,
+            "write_session_id": "ws-17",
+            "block_mask": {"offset": 1},
+        }
+        c = _build_connector()
+        c._manager_client.start_write_cache.return_value = result_from_manager
+
+        # Only 2 blocks of local data (kv_factor=2, so 4 entries)
+        # local_block_count = 4 // 2 = 2
+        # save_indices = [0,1,2,3], valid: [0<2, 1<2, 2<2, 3<2] = [T, T, F, F]
+        c.mem_pool_host.get_page_buffer_meta.return_value = (
+            list(range(4)),
+            [c.location_spec_size] * 4,
+        )
+
+        # SaveKvCaches succeeds for the 2 valid blocks
+        c.transfer_client.SaveKvCaches.return_value = (
+            _mock_kvcm.ClientErrorCode.ER_OK,
+        )
+
+        extra_info = MagicMock()
+        extra_info.prefix_keys = ["p0", "p1"]
+
+        result = c._batch_set(keys, torch.zeros(4), trace_id="t17",
+                              extra_info=extra_info)
+
+        self.assertEqual(len(result), len(keys))
+        # k2(idx0): local data + success → True
+        # k3(idx1): local data + success → True
+        # k4(idx2): no local data → False
+        # k5(idx3): no local data → False
+        self.assertEqual(result, [True, True, False, False])
+
+        # Verify finish_write_cache: prefix=False, block0=True, block1=True,
+        # block2=False, block3=False
+        call_args = c._manager_client.finish_write_cache.call_args[0][0]
+        finish_mask = call_args["success_blocks"]["bool_masks"]["values"]
+        self.assertEqual(finish_mask, [False, True, True, False, False])
+
+    # ── Case 18: batch_set_v1 exception returns all False ─────────────
     def test_batch_set_v1_exception(self):
         """batch_set_v1 catches exceptions and returns all False."""
         c = _build_connector()
