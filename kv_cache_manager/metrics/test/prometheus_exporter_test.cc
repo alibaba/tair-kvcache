@@ -106,6 +106,20 @@ TEST_F(PrometheusExporterTest, DotAndDashInNames) {
     EXPECT_NE(output.find("kvcm_my_group_some_metric"), std::string::npos);
 }
 
+TEST_F(PrometheusExporterTest, LabelKeySanitization) {
+    MetricsTags tags = {{"storage.type", "hf3fs"}, {"host-name", "node01"}};
+    Gauge g = registry_->GetGauge("test.label_keys", tags);
+    g = 1.0;
+
+    std::string output = PrometheusExporter::Expose(*registry_);
+    // dots and dashes in label keys should be replaced with underscores
+    EXPECT_NE(output.find("storage_type=\"hf3fs\""), std::string::npos) << "Actual output:\n" << output;
+    EXPECT_NE(output.find("host_name=\"node01\""), std::string::npos) << "Actual output:\n" << output;
+    // originals should not appear as label keys
+    EXPECT_EQ(output.find("storage.type="), std::string::npos);
+    EXPECT_EQ(output.find("host-name="), std::string::npos);
+}
+
 TEST_F(PrometheusExporterTest, HelpLineContainsOriginalName) {
     Gauge g = registry_->GetGauge("meta_searcher.indexer_get_time_us");
     g = 99.5;
