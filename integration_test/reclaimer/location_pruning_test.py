@@ -70,7 +70,7 @@ class LocationPruningTest(abc.ABC, TestBase, unittest.TestCase):
             "all 5 blocks should be queryable after initial write")
 
         # ---------- step 2: simulate data loss for B C D E ------------
-        self._delete_location_files(locations, range(1, 5))
+        LocationPruningTest._delete_cache_locations(locations, range(1, 5))
 
         # ---------- step 3: prefix-match query ------------------------
         resp = self._prefix_query(block_keys)
@@ -92,9 +92,74 @@ class LocationPruningTest(abc.ABC, TestBase, unittest.TestCase):
                          f"got {len(locations)} locations")
         self._verify_block_keys(locations,
                                 [block_keys[i] for i in (1, 2, 3, 4,)])
+        # simulate the actual location data write
+        LocationPruningTest._touch_cache_locations(locations)
         self._finish_write_blocks(write_session_id, 4)
 
         # --------- step 6: verify full recovery -----------------------
+        resp = self._prefix_query(block_keys)
+        self.assertEqual(len(resp["locations"]), 5,
+                         "all 5 blocks should be queryable after re-write")
+
+    def test_aggressive_location_prune_contiguous_wo_query(self):
+        """Verify aggressive prune on a contiguous suffix with
+        start_write_cache only.
+
+        When the underlying data for some cache blocks becomes
+        unavailable (MightExist() returns false), the aggressive prune
+        policy should clean ALL invalid locations in a single write pass
+        -- rather than only pruning the first invalid one and requiring
+        O(N) round-trips.
+
+        Scenario (prefix = A B C D E, data for B C D E lost):
+        1. Write A B C D E, confirm all 5 queryable.
+        2. Delete the data files backing B C D E.
+        3. Send start_write_cache for B C D E, the server is expected to
+           return all these locations to write, with same path URI (but
+           different location_id).
+        4. The original locations are deleted from the meta indexer,
+           together with the file specified by URI; and since the new
+           locations share the same URIs, they may need to be re-created.
+        5. Prefix-match query returns [A B C D E] again.
+        """
+
+        self._make_dummy_storage()
+        self._make_dummy_instance_group()
+        self._make_dummy_instance()
+
+        # ---------- step 1: write blocks A B C D E --------------------
+        block_keys = [100, 101, 102, 103, 104]
+        token_ids = [200, 201, 202, 203, 204]
+        locations = self._write_blocks(block_keys, token_ids)
+        self.assertEqual(len(locations), 5,
+                         "initial write should allocate 5 locations")
+
+        resp = self._prefix_query(block_keys)
+        self.assertEqual(
+            len(resp["locations"]), 5,
+            "all 5 blocks should be queryable after initial write")
+
+        # ---------- step 2: simulate data loss for B C D E ------------
+        LocationPruningTest._delete_cache_locations(locations, range(1, 5))
+
+        # ---------- step 3: re-write the full chain -------------------
+        # A still valid; B C D E need writing
+        resp = self._start_write_blocks(block_keys, token_ids)
+        write_session_id = resp["write_session_id"]
+        locations = resp["locations"]
+        self.assertEqual(len(locations), 4,
+                         "re-write should allocate 4 locations for B C D E; "
+                         f"got {len(locations)} locations")
+        self._verify_block_keys(locations,
+                                [block_keys[i] for i in (1, 2, 3, 4,)])
+
+        # --------- step 4: wait for the async metadata prune ----------
+        time.sleep(2)
+        # simulate the actual location data write
+        LocationPruningTest._touch_cache_locations(locations)
+        self._finish_write_blocks(write_session_id, len(locations))
+
+        # --------- step 5: verify full recovery -----------------------
         resp = self._prefix_query(block_keys)
         self.assertEqual(len(resp["locations"]), 5,
                          "all 5 blocks should be queryable after re-write")
@@ -103,10 +168,11 @@ class LocationPruningTest(abc.ABC, TestBase, unittest.TestCase):
         """Verify aggressive prune with non-contiguous data loss.
 
         When stale blocks are interleaved with valid ones (e.g., B and D
-        lost while A, C, E intact), the write path should produce a
-        BlockMaskVector (non-contiguous bitmap) rather than a simple
-        BlockMaskOffset, and allocate locations only for the stale
-        blocks.
+        lost while A, C, E intact), the aggressive prune policy should
+        clean ALL invalid locations in a single query or write pass --
+        rather than only pruning the first invalid one and requiring
+        O(N) round-trips, and the write allocate locations only for the
+        stale blocks.
 
         Scenario (prefix = A B C D E, data for B and D lost):
         1. Write A B C D E, confirm all 5 queryable.
@@ -134,7 +200,7 @@ class LocationPruningTest(abc.ABC, TestBase, unittest.TestCase):
             "all 5 blocks should be queryable after initial write")
 
         # ---------- step 2: simulate data loss for B and D ------------
-        self._delete_location_files(locations, [1, 3])
+        LocationPruningTest._delete_cache_locations(locations, [1, 3])
 
         # ---------- step 3: prefix-match query ------------------------
         resp = self._prefix_query(block_keys)
@@ -155,6 +221,8 @@ class LocationPruningTest(abc.ABC, TestBase, unittest.TestCase):
                          "re-write should allocate 2 locations for B and D; "
                          f"got {len(locations)} locations")
         self._verify_block_keys(locations, [block_keys[i] for i in (1, 3,)])
+        # simulate the actual location data write
+        LocationPruningTest._touch_cache_locations(locations)
         self._finish_write_blocks(write_session_id, 2)
 
         # --------- step 6: verify full recovery -----------------------
@@ -162,14 +230,82 @@ class LocationPruningTest(abc.ABC, TestBase, unittest.TestCase):
         self.assertEqual(len(resp["locations"]), 5,
                          "all 5 blocks should be queryable after re-write")
 
+    def test_aggressive_location_prune_non_contiguous_wo_query(self):
+        """Verify aggressive prune with non-contiguous data loss with
+        start_write_cache only.
+
+        When stale blocks are interleaved with valid ones (e.g., B and D
+        lost while A, C, E intact), the aggressive prune policy should
+        clean ALL invalid locations in a single write pass -- rather
+        than only pruning the first invalid one and requiring O(N)
+        round-trips, and allocate locations only for the stale blocks.
+
+        Scenario (prefix = A B C D E, data for B and D lost):
+        1. Write A B C D E, confirm all 5 queryable.
+        2. Delete the data files backing B and D only.
+        3. Send start_write_cache for B D, the server is expected to
+           return all these locations to write, with same path URI (but
+           different location_id).
+        4. The original locations are deleted from the meta indexer,
+           together with the file specified by URI; and since the new
+           locations share the same URIs, they may need to be re-created.
+        5. Prefix-match query returns [A B C D E] again.
+        """
+
+        self._make_dummy_storage()
+        self._make_dummy_instance_group()
+        self._make_dummy_instance()
+
+        # ---------- step 1: write blocks A B C D E --------------------
+        block_keys = [200, 201, 202, 203, 204]
+        token_ids = [300, 301, 302, 303, 304]
+        locations = self._write_blocks(block_keys, token_ids)
+        self.assertEqual(len(locations), 5,
+                         "initial write should allocate 5 locations")
+
+        resp = self._prefix_query(block_keys)
+        self.assertEqual(
+            len(resp["locations"]), 5,
+            "all 5 blocks should be queryable after initial write")
+
+        # ---------- step 2: simulate data loss for B and D ------------
+        LocationPruningTest._delete_cache_locations(locations, [1, 3])
+
+        # --------- step 3: re-write the full chain --------------------
+        # A, C, E still valid; B and D need writing
+        resp = self._start_write_blocks(block_keys, token_ids)
+        write_session_id = resp["write_session_id"]
+        locations = resp["locations"]
+        self.assertEqual(len(locations), 2,
+                         "re-write should allocate 2 locations for B and D; "
+                         f"got {len(locations)} locations")
+        self._verify_block_keys(locations, [block_keys[i] for i in (1, 3,)])
+
+        # --------- step 4: wait for the async metadata prune ----------
+        time.sleep(2)
+        # simulate the actual location data write
+        LocationPruningTest._touch_cache_locations(locations)
+        self._finish_write_blocks(write_session_id, len(locations))
+
+        # --------- step 5: verify full recovery -----------------------
+        resp = self._prefix_query(block_keys)
+        self.assertEqual(len(resp["locations"]), 5,
+                         "all 5 blocks should be queryable after re-write")
+
     def test_aggressive_location_prune_all_missing(self):
         """Verify aggressive prune when all blocks are missing.
 
+        When the underlying data for all the cache blocks become
+        unavailable (MightExist() returns false), the aggressive prune
+        policy should clean ALL invalid locations in a single query or
+        write pass -- rather than only pruning the first invalid one and
+        requiring O(N) round-trips.
+
         Scenario (prefix = A B C D E, all data lost):
-        1. Write A B C D E, confirm all 3 queryable.
-        2. Delete data files for all 3 blocks.
+        1. Write A B C D E, confirm all 5 queryable.
+        2. Delete data files for all 5 blocks.
         3. Prefix-match query returns empty result.
-        4. Re-write allocates 3 fresh locations.
+        4. Re-write allocates 5 fresh locations.
         5. Prefix-match query returns [A B C D E] again.
         """
 
@@ -180,8 +316,8 @@ class LocationPruningTest(abc.ABC, TestBase, unittest.TestCase):
         # --------- step 1: write blocks A B C -------------------------
         block_keys = [300, 301, 302, 303, 304]
         token_ids = [400, 401, 402, 403, 404]
-        first_locations = self._write_blocks(block_keys, token_ids)
-        self.assertEqual(len(first_locations), 5,
+        locations = self._write_blocks(block_keys, token_ids)
+        self.assertEqual(len(locations), 5,
                          "initial write should allocate 5 locations")
 
         resp = self._prefix_query(block_keys)
@@ -189,7 +325,7 @@ class LocationPruningTest(abc.ABC, TestBase, unittest.TestCase):
                          "all 5 blocks should be queryable after initial write")
 
         # --------- step 2: simulate data loss for A B C D E -----------
-        self._delete_location_files(first_locations, range(0, 5))
+        LocationPruningTest._delete_cache_locations(locations, range(0, 5))
 
         # --------- step 3: prefix-match query -------------------------
         resp = self._prefix_query(block_keys)
@@ -209,9 +345,71 @@ class LocationPruningTest(abc.ABC, TestBase, unittest.TestCase):
                          "re-write should allocate 5 locations for A B C D E; "
                          f"got {len(locations)} locations")
         self._verify_block_keys(locations, block_keys)
+        # simulate the actual location data write
+        LocationPruningTest._touch_cache_locations(locations)
         self._finish_write_blocks(write_session_id, 5)
 
         # --------- step 6: verify full recovery -----------------------
+        resp = self._prefix_query(block_keys)
+        self.assertEqual(len(resp["locations"]), 5,
+                         "all 5 blocks should be queryable after re-write")
+
+    def test_aggressive_location_prune_all_missing_wo_query(self):
+        """Verify aggressive prune when all blocks are missing with
+        start_write_cache only.
+
+        When the underlying data for all the cache blocks become
+        unavailable (MightExist() returns false), the aggressive prune
+        policy should clean ALL invalid locations in a single write pass
+        -- rather than only pruning the first invalid one and requiring
+        O(N) round-trips.
+
+        Scenario (prefix = A B C D E, all data lost):
+        1. Write A B C D E, confirm all 5 queryable.
+        2. Delete data files for all 5 blocks.
+        3. Send start_write_cache for A B C D E, the server is expected
+           to return all these locations to write, with same path URI
+           (but different location_id).
+        4. The original locations are deleted from the meta indexer,
+           together with the file specified by URI; and since the new
+           locations share the same URIs, they may need to be re-created.
+        5. Prefix-match query returns [A B C D E] again.
+        """
+
+        self._make_dummy_storage()
+        self._make_dummy_instance_group()
+        self._make_dummy_instance()
+
+        # --------- step 1: write blocks A B C -------------------------
+        block_keys = [300, 301, 302, 303, 304]
+        token_ids = [400, 401, 402, 403, 404]
+        locations = self._write_blocks(block_keys, token_ids)
+        self.assertEqual(len(locations), 5,
+                         "initial write should allocate 5 locations")
+
+        resp = self._prefix_query(block_keys)
+        self.assertEqual(len(resp["locations"]), 5,
+                         "all 5 blocks should be queryable after initial write")
+
+        # --------- step 2: simulate data loss for A B C D E -----------
+        LocationPruningTest._delete_cache_locations(locations, range(0, 5))
+
+        # --------- step 3: re-write all blocks ------------------------
+        resp = self._start_write_blocks(block_keys, token_ids)
+        write_session_id = resp["write_session_id"]
+        locations = resp["locations"]
+        self.assertEqual(len(locations), 5,
+                         "re-write should allocate 5 locations for A B C D E; "
+                         f"got {len(locations)} locations")
+        self._verify_block_keys(locations, block_keys)
+
+        # --------- step 4: wait for async metadata prune --------------
+        time.sleep(2)
+        # simulate the actual location data write
+        LocationPruningTest._touch_cache_locations(locations)
+        self._finish_write_blocks(write_session_id, len(locations))
+
+        # --------- step 5: verify full recovery -----------------------
         resp = self._prefix_query(block_keys)
         self.assertEqual(len(resp["locations"]), 5,
                          "all 5 blocks should be queryable after re-write")
@@ -233,6 +431,9 @@ class LocationPruningTest(abc.ABC, TestBase, unittest.TestCase):
         resp = self._start_write_blocks(block_keys, token_ids)
         write_session_id = resp["write_session_id"]
         locations = resp["locations"]
+
+        LocationPruningTest._touch_cache_locations(locations)
+
         self._finish_write_blocks(write_session_id, len(locations))
         return locations
 
@@ -264,15 +465,35 @@ class LocationPruningTest(abc.ABC, TestBase, unittest.TestCase):
             "block_mask": {"offset": 0},
         })
 
-    def _delete_location_files(self, locations, indices):
+    @staticmethod
+    def _touch_cache_locations(locations):
+        """simulate the cache data write"""
+        for loc in locations:
+            for spec in loc.get("location_specs", []):
+                file_path = urlparse(spec["uri"]).path
+                try:
+                    # the data file can be deleted by a slow pruning
+                    # after being touched here, which is acceptable
+                    # (this is indistinguishable from being reclaimed,
+                    # if the reclaimer were being enabled)
+                    os.utime(file_path)
+                except FileNotFoundError as e:
+                    # if here, there are 2 possibilities:
+                    # 1. initial write; create it
+                    # 2. the data file might have been deleted by
+                    #    the location pruning process; create it again
+                    logging.info(f"FileNotFoundError: {e}, path: {file_path}")
+                    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+                    with open(file_path, 'x') as _:
+                        pass
+
+    @staticmethod
+    def _delete_cache_locations(locations, indices):
+        """simulate the cache data lost event"""
         for i in indices:
             loc = locations[i]
             for spec in loc.get("location_specs", []):
                 file_path = urlparse(spec["uri"]).path
-                self.assertTrue(
-                    os.path.exists(file_path),
-                    f"Data file should exist before deletion: "
-                    f"{file_path}")
                 os.remove(file_path)
 
     def _verify_block_keys(self, locations, block_keys):
@@ -284,7 +505,6 @@ class LocationPruningTest(abc.ABC, TestBase, unittest.TestCase):
 
     def _make_dummy_storage(self):
         dummy_root_path = f"{self.get_workdir()}/{self._storage_name}/data/"
-        os.makedirs(dummy_root_path, exist_ok=True)
         add_storage_req = {
             "trace_id": self._trace_id + "-add_storage",
             "storage": {
@@ -310,10 +530,8 @@ class LocationPruningTest(abc.ABC, TestBase, unittest.TestCase):
                 "quota": {
                     "capacity": 1024 * 32,
                     "quota_config": [
-                        # StorageType.ST_TAIRMEMPOOL=3
-                        {"storage_type": 3, "capacity": 1024 * 16},
-                        # StorageType.ST_NFS=4
-                        {"storage_type": 4, "capacity": 1024 * 16},
+                        # StorageType.ST_DUMMY=6
+                        {"storage_type": 6, "capacity": 1024 * 32},
                     ],
                 },
                 "cache_config": {
@@ -326,7 +544,7 @@ class LocationPruningTest(abc.ABC, TestBase, unittest.TestCase):
                         },
                         "delay_before_delete_ms": 100,
                     },
-                    "data_storage_strategy": 2,  # CPS_PREFER_3FS
+                    "data_storage_strategy": 2,  # TODO: CPS_PREFER_3FS?
                     "meta_indexer_config": {
                         "max_key_count": 16,  # start with 16 max key
                         "mutex_shard_num": 16,

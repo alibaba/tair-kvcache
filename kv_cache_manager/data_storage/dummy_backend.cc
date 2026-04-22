@@ -18,28 +18,6 @@
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
-namespace {
-
-bool TouchFile(const std::string &file_path) {
-    const std::filesystem::path path(file_path);
-    std::error_code ec;
-    std::filesystem::create_directories(path.parent_path(), ec);
-    if (ec) {
-        KVCM_LOG_WARN(
-            "create parent directories failed, path: [%s], msg: [%s]", file_path.c_str(), ec.message().c_str());
-        return false;
-    }
-    std::ofstream ofs(file_path, std::ios::app);
-    if (!ofs) {
-        KVCM_LOG_WARN("open or create file failed, path: [%s]", file_path.c_str());
-        return false;
-    }
-    ofs.close();
-    return true;
-}
-
-} // anonymous namespace
-
 namespace kv_cache_manager {
 
 DummyBackend::DummyBackend(std::shared_ptr<MetricsRegistry> metrics_registry)
@@ -118,7 +96,6 @@ std::vector<std::pair<ErrorCode, DataStorageUri>> DummyBackend::Create(const std
                 storage_uri.SetParam("blkid", std::to_string(i));
             }
             results.emplace_back(ErrorCode::EC_OK, storage_uri);
-            TouchFile(storage_uri.GetPath());
         }
     }
 
