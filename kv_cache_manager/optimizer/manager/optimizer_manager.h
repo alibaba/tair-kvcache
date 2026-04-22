@@ -64,6 +64,7 @@ private:
     OptimizerConfig config_;
     std::unordered_map<std::string, OptInstanceGroupConfig> instance_group_configs_;
     std::unordered_map<std::string, OptInstanceConfig> instance_configs_;
+    std::unordered_map<std::string, bool> instance_group_ttl_disabled_;
 
     std::shared_ptr<OptEvictionManager> eviction_manager_;
     std::shared_ptr<OptIndexerManager> indexer_manager_;

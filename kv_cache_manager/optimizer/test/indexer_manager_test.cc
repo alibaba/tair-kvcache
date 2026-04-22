@@ -176,7 +176,8 @@ TEST_F(OptIndexerManagerTest, CheckAndEvict) {
     indexer_manager_->CreateOptIndexer(instance_config, tier_configs, false);
 
     // 检查并触发驱逐，传入测试时间戳
-    indexer_manager_->CheckAndEvict("instance1", 1000);
+    auto evicted_blocks = indexer_manager_->CheckAndEvict("instance1");
+    indexer_manager_->CleanEvictedBlocks(evicted_blocks, 1000);
 
     // 不应该崩溃
     SUCCEED();
@@ -239,7 +240,8 @@ TEST_F(OptIndexerManagerTest, RegisterInstanceGroupsAndInstances) {
 
 TEST_F(OptIndexerManagerTest, CheckAndEvictNonExistentInstance) {
     // 检查不存在的实例
-    indexer_manager_->CheckAndEvict("non_existent_instance", 1000);
+    auto evicted_blocks = indexer_manager_->CheckAndEvict("non_existent_instance");
+    indexer_manager_->CleanEvictedBlocks(evicted_blocks, 1000);
 
     // 不应该崩溃
     SUCCEED();
@@ -248,4 +250,53 @@ TEST_F(OptIndexerManagerTest, CheckAndEvictNonExistentInstance) {
 TEST_F(OptIndexerManagerTest, GetCurrentInstanceUsageNonExistent) {
     auto usage = indexer_manager_->GetCurrentInstanceUsage("non_existent_instance");
     EXPECT_EQ(usage, 0);
+}
+
+TEST_F(OptIndexerManagerTest, EvictExpiredBeforeAccessOnlyExpiresLocationWithoutNodeCleanup) {
+    OptInstanceConfig ttl_instance;
+    ttl_instance.set_instance_id("instance_ttl");
+    ttl_instance.set_instance_group_name("ttl_group");
+    ttl_instance.set_block_size(1024);
+    ttl_instance.set_eviction_policy_type(EvictionPolicyType::POLICY_TTL);
+    TtlParams ttl_params;
+    ttl_params.fallback_on_pressure = true;
+    ttl_instance.set_eviction_policy_param(ttl_params);
+
+    auto tier_configs = CreateTestTierConfigs();
+    ASSERT_TRUE(indexer_manager_->CreateOptIndexer(ttl_instance, tier_configs, false, 0));
+
+    OptInstanceGroupConfig ttl_group;
+    ttl_group.set_group_name("ttl_group");
+    ttl_group.set_quota_capacity(1024 * 1024 * 100);
+    ttl_group.set_used_percentage(1.0);
+    ttl_group.set_hierarchical_eviction_enabled(false);
+    ttl_group.set_storages(tier_configs);
+    ttl_group.set_instances({ttl_instance});
+
+    std::unordered_map<std::string, OptInstanceGroupConfig> groups;
+    groups["ttl_group"] = ttl_group;
+    indexer_manager_->RegisterInstanceGroups(groups);
+
+    std::unordered_map<std::string, OptInstanceConfig> instances;
+    instances["instance_ttl"] = ttl_instance;
+    indexer_manager_->RegisterInstances(instances);
+
+    auto indexer = indexer_manager_->GetOptIndexer("instance_ttl");
+    ASSERT_NE(indexer, nullptr);
+
+    indexer->InsertOnly({1}, 1000, 100); // 1200 时过期
+    indexer->InsertOnly({2}, 1000, 0);   // 永不过期
+    // TTL 策略使用内部已知时间判断过期，通过后续写入推进时间到 1200
+    indexer->InsertOnly({3}, 1200, 0);
+
+    auto *block1 = indexer->root_->children.at(1)->blocks[0].get();
+    auto *block2 = indexer->root_->children.at(2)->blocks[0].get();
+    ASSERT_FALSE(block1->location_map.empty());
+    ASSERT_FALSE(block2->location_map.empty());
+
+    auto evicted_blocks = indexer_manager_->EvictExpiredBeforeAccess("instance_ttl", 1200);
+    EXPECT_FALSE(evicted_blocks.empty());
+    // 不做节点清理，仅验证 TTL 过期清理会清空过期 block 的 location
+    EXPECT_TRUE(block1->location_map.empty());
+    EXPECT_FALSE(block2->location_map.empty());
 }

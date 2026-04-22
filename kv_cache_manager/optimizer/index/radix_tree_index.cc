@@ -294,15 +294,25 @@ std::vector<int64_t> RadixTreeIndex::InsertQuery(RadixTreeNode *node,
         }
     }
 }
-void RadixTreeIndex::CleanEmptyBlocks(const std::vector<BlockEntry *> &blocks, int64_t eviction_timestamp) {
+void RadixTreeIndex::CleanEmptyBlocks(const std::vector<BlockEntry *> &blocks,
+                                      int64_t eviction_timestamp,
+                                      bool use_logical_expire_time) {
     std::unordered_set<RadixTreeNode *> nodes_to_check;
 
     // 步骤 1：在删除前记录驱逐信息，收集需要检查的节点
     for (auto *block : blocks) {
         if (block->location_map.empty()) {
-            // 使用真实的驱逐时间戳
+            int64_t effective_eviction_timestamp = eviction_timestamp;
+            if (use_logical_expire_time && block->ttl_us > 0 && block->last_access_time >= 0) {
+                // TTL 过期清理使用逻辑过期时刻（last_access + ttl）
+                effective_eviction_timestamp = block->last_access_time + block->ttl_us;
+                if (effective_eviction_timestamp > eviction_timestamp) {
+                    effective_eviction_timestamp = eviction_timestamp;
+                }
+            }
+            // 使用真实/逻辑驱逐时间戳记录事件
             if (stats_collector_) {
-                stats_collector_->OnBlockEviction(instance_id_, block, eviction_timestamp);
+                stats_collector_->OnBlockEviction(instance_id_, block, effective_eviction_timestamp);
             }
 
             block->ResetAccess();
@@ -398,6 +408,9 @@ RadixTreeIndex::WriteModify RadixTreeIndex::AppendEvictBlocks(std::unordered_map
                     revived_blocks.push_back(block);
 
                     if (stats_collector_) {
+                        // 注意：TTL 过期后的写入会触发一次新的 birth。
+                        // 在当前 Lazy Eviction 机制下，这里记录的是“系统观察到重写”的时间，
+                        // 不是严格意义上的真实过期边界时间点。
                         stats_collector_->OnBlockBirth(instance_id_, block, timestamp);
                     }
                 }
@@ -442,9 +455,13 @@ void RadixTreeIndex::OnBlockAccessed(BlockEntry *block, int64_t timestamp) {
         }
     }
 }
-// block 逻辑上空了：location 全空（被驱逐）或 TTL 过期
+// block 逻辑上空了：location 全空（被驱逐）
+// V1 语义：
+// 1) POLICY_TTL：过期块在读写前通过 EvictExpiredBeforeAccess 物理清理
+// 2) 非 TTL 策略：不启用 TTL（既不做前置物理清理，也不做逻辑过期判定）
 bool RadixTreeIndex::IsBlockEvict(BlockEntry *block, int64_t timestamp) const {
-    return block->location_map.empty() || block->IsExpired(timestamp);
+    (void)timestamp;
+    return block->location_map.empty();
 }
 
 // 导出前缀树用于可视化

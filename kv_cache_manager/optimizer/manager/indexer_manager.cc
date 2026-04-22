@@ -53,12 +53,34 @@ void OptIndexerManager::RegisterInstances(const std::unordered_map<std::string, 
     instance_configs_ = instances;
 }
 
-bool OptIndexerManager::CheckAndEvict(const std::string &instance_id, int64_t eviction_timestamp) {
+OptIndexerManager::EvictedBlocks OptIndexerManager::EvictExpiredBeforeAccess(const std::string &instance_id,
+                                                                             int64_t current_timestamp) {
+    EvictedBlocks empty_result;
+    auto instance_it = instance_configs_.find(instance_id);
+    if (instance_it == instance_configs_.end()) {
+        KVCM_LOG_ERROR("Instance config not found for instance_id: %s", instance_id.c_str());
+        return empty_result;
+    }
+    const auto &instance_config = instance_it->second;
+
+    auto group_it = instance_group_configs_.find(instance_config.instance_group_name());
+    if (group_it == instance_group_configs_.end()) {
+        KVCM_LOG_ERROR("Instance group config not found for group_name: %s",
+                       instance_config.instance_group_name().c_str());
+        return empty_result;
+    }
+    const auto &group_config = group_it->second;
+
+    return eviction_manager_->ActiveEvictExpired(group_config, current_timestamp);
+}
+
+OptIndexerManager::EvictedBlocks OptIndexerManager::CheckAndEvict(const std::string &instance_id) {
+    EvictedBlocks empty_result;
 
     auto instance_it = instance_configs_.find(instance_id);
     if (instance_it == instance_configs_.end()) {
         KVCM_LOG_ERROR("Instance config not found for instance_id: %s", instance_id.c_str());
-        return false;
+        return empty_result;
     }
     const auto &instance_config = instance_it->second;
     auto group_name = instance_config.instance_group_name();
@@ -68,26 +90,35 @@ bool OptIndexerManager::CheckAndEvict(const std::string &instance_id, int64_t ev
     if (group_it == instance_group_configs_.end()) {
         KVCM_LOG_ERROR("Instance group config not found for group_name: %s",
                        instance_config.instance_group_name().c_str());
-        return false;
+        return empty_result;
     }
     const auto &group_config = group_it->second;
 
-    // 调用 EvictionManager 驱逐
-    auto evicted_blocks = eviction_manager_->EvictByMode(instance_id, group_config);
+    // ---- 检查是否需要容量驱逐（TTL 无 fallback 时提前结束） ----
+    auto policy = eviction_manager_->GetEvictionPolicy(instance_id);
+    if (policy && !policy->NeedCapacityEviction()) {
+        // TTL 策略且 fallback=false：读写前已执行过期清理，这里无需容量驱逐
+        return empty_result;
+    }
 
-    // 通知所有 RadixTreeIndex 清理被驱逐的块
-    if (!evicted_blocks.empty()) {
-        for (auto &evicted_block : evicted_blocks) {
-            auto indexer = GetOptIndexer(evicted_block.first);
-            KVCM_LOG_DEBUG("Evicted %zu blocks from instance_id: %s by CheckAndEvict",
-                           evicted_block.second.size(),
-                           evicted_block.first.c_str());
-            if (indexer) {
-                indexer->CleanEmptyBlocks(evicted_block.second, eviction_timestamp);
-            }
+    // ---- 容量压力驱逐（LRU / TTL fallback） ----
+    return eviction_manager_->EvictByMode(instance_id, group_config);
+}
+
+void OptIndexerManager::CleanEvictedBlocks(const EvictedBlocks &evicted_blocks,
+                                           int64_t eviction_timestamp,
+                                           bool use_logical_expire_time) {
+    if (evicted_blocks.empty()) {
+        return;
+    }
+    for (const auto &evicted_block : evicted_blocks) {
+        auto indexer = GetOptIndexer(evicted_block.first);
+        KVCM_LOG_DEBUG(
+            "Evicted %zu blocks from instance_id: %s", evicted_block.second.size(), evicted_block.first.c_str());
+        if (indexer) {
+            indexer->CleanEmptyBlocks(evicted_block.second, eviction_timestamp, use_logical_expire_time);
         }
     }
-    return !evicted_blocks.empty();
 }
 
 size_t OptIndexerManager::GetCurrentInstanceUsage(const std::string &instance_id) const {

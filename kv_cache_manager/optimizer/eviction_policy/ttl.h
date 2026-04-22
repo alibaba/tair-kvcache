@@ -1,4 +1,6 @@
 #pragma once
+#include <cstdint>
+#include <queue>
 #include <unordered_map>
 #include <vector>
 
@@ -25,9 +27,26 @@ public:
     void OnBlockAccessed(BlockEntry *block, int64_t timestamp) override;
     std::vector<BlockEntry *> EvictBlocks(size_t count) override;
     void Clear() override;
+    bool NeedCapacityEviction() const override { return fallback_on_pressure_; }
+    bool IsTtlPolicy() const override { return true; }
+    void AdvanceClock(int64_t timestamp) override;
 
 private:
     void EvictOne(BlockEntry *block);
+    void PushExpireEvent(BlockEntry *block);
+    bool TryPopOneExpired(BlockEntry *&expired_block);
+    void MaybeCompactExpireHeap();
+    void RebuildExpireHeap();
+
+    struct ExpireEvent {
+        int64_t expire_ts = 0;
+        uint64_t version = 0;
+        BlockEntry *block = nullptr;
+    };
+
+    struct ExpireEventCompare {
+        bool operator()(const ExpireEvent &a, const ExpireEvent &b) const { return a.expire_ts > b.expire_ts; }
+    };
 
     struct ListNode : public LinkedListNode {
         BlockEntry *payload_ = nullptr;
@@ -37,6 +56,8 @@ private:
     bool fallback_on_pressure_;
     LinkedList list_;
     std::unordered_map<BlockEntry *, ListNode *> node_map_;
+    std::priority_queue<ExpireEvent, std::vector<ExpireEvent>, ExpireEventCompare> expire_min_heap_;
+    std::unordered_map<BlockEntry *, uint64_t> expire_event_version_;
     int64_t last_known_timestamp_ = 0;
 };
 

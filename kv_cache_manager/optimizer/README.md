@@ -24,7 +24,7 @@ KVCacheManager Optimizer 是一个独立的缓存优化分析模块，通过回�
 ### 核心特性
 
 - **多种驱逐策略**：支持 LRU、RandomLRU、LeafAwareLRU、TTL 等驱逐算法
-- **TTL 过期机制**：支持跨策略的 block 级别 TTL 过期，可与任意驱逐策略组合使用
+- **TTL 过期机制**：当前采用 V1 语义，仅 `POLICY_TTL` 执行 TTL 过期物理清理
 - **分层存储**：支持多层级存储配置，目前功能不完备
 - **Trace 回放**：支持 Publisher Log、Qwen Bailian 等多种 trace 格式
 - **详细统计**：提供命中率、缓存使用情况等详细统计
@@ -62,23 +62,32 @@ OptimizerManager (核心协调器)
 - 两阶段驱逐：先清走所有 TTL 过期的 block，若容量仍超限则按 `last_access_time` 从最旧开始兜底驱逐
 - `fallback_on_pressure`（默认 true）：关闭后退化为纯 TTL，只回收过期 block，无容量兜底
 
-#### TTL 过期机制
+#### TTL 过期机制（V1）
 
-TTL 过期标记可以与任意驱逐策略组合，但 **TTL 只影响读写路径的逻辑判定，不参与其他策略的驱逐决策**：
+当前实现语义：
+
+- 仅 `eviction_policy_type: "ttl"` 的实例会执行读写前 TTL 过期物理清理。
+- 非 TTL 策略（`lru` / `random_lru` / `leaf_aware_lru`）下，TTL 视为不存在（既不做前置清理，也不做逻辑过期判定）。
 
 | 使用模式 | 配置方式 | 驱逐行为 |
 |---|---|---|
-| 纯 LRU 容量管理 | `eviction_policy_type: "lru"` + `default_block_ttl_seconds: 0` | LRU 按访问时间驱逐 |
-| LRU + TTL 过期标记 | `eviction_policy_type: "lru"` + `default_block_ttl_seconds: 300` | LRU 驱逐；TTL 过期 block 读不命中、写时复活，但不主动驱逐 |
-| TTL 优先 + 容量兜底 | `eviction_policy_type: "ttl"` + `fallback_on_pressure: true` | 先清所有过期 block，不够则按 LRU 兜底 |
+| 纯 LRU 容量管理 | `eviction_policy_type: "lru"` | LRU 按访问时间驱逐 |
+| TTL 优先 + 容量兜底 | `eviction_policy_type: "ttl"` + `fallback_on_pressure: true` | 先清所有过期 block，不够则按链表尾部兜底 |
 | 纯时间驱逐（无兜底） | `eviction_policy_type: "ttl"` + `fallback_on_pressure: false` | 只清过期 block，容量不足不管 |
 
 **TTL 行为规则**：
-- `default_block_ttl_seconds`：在 instance group 级别配置，0 = 关闭 TTL
-- 写入时，block 的 `last_access_time` 设为当前时间，TTL 从此刻开始计时
-- 读取时（PrefixQuery），`last_access_time` 被刷新，实现 **Sliding Window TTL**（续命）
-- 写入时，TTL 过期的 block 视为逻辑死亡，会被原地复活（重写 location + 重置 TTL）
-- 驱逐统一在写入后的 `CheckAndEvict` 中执行（Lazy Eviction）
+- `default_block_ttl_seconds`：在 instance group 级别配置，`0` 表示组级禁用 TTL。
+- 组级禁用 TTL 时，请求级 `ttl_seconds > 0` 不生效（写入路径会强制关闭 TTL）。
+- 写入时，block 的 `last_access_time` 设为当前时间，TTL 从此刻开始计时。
+- 读取时（`PrefixQuery`），`last_access_time` 被刷新，实现 Sliding Window TTL（续命）。
+- 读写请求执行前，会先进行一次 TTL 过期块物理清理，并由 `CleanEvictedBlocks` 统一做节点清理。
+- 写入完成后，`CheckAndEvict` 负责容量驱逐；当 `fallback_on_pressure=false` 时跳过容量驱逐。
+- `POLICY_TTL` 过期清理已优化为基于最小过期时间堆（min-heap）的增量回收，避免每次请求全链表扫描。
+
+**TTL 生命周期统计注意事项（重要）**：
+- TTL 模式下的 Block 生命周期统计（`birth_time_us/death_time_us/lifespan_us`）仅反映系统实际处理事件的时间点，不代表真实过期时刻。
+- 由于当前采用写后惰性驱逐（Lazy Eviction），`death_time_us` 记录的是被系统清理/处理的时间，而非严格的 `last_access_time + ttl`。
+- 因此 TTL 场景下的生命周期数据仅用于相对趋势分析，不建议用于精确时长评估或跨策略精确对比。
 
 **Per-request TTL 覆盖**（通过 `WriteCache` API）：
 
@@ -86,7 +95,7 @@ TTL 过期标记可以与任意驱逐策略组合，但 **TTL 只影响读写路
 |---|---|
 | `0`（默认） | 使用 group 的 `default_block_ttl_seconds` |
 | `-1` | 禁用 TTL，该 block 永不过期 |
-| `>0` | 自定义 TTL（秒） |
+| `>0` | 自定义 TTL（秒）；若 group 已禁用 TTL（`default_block_ttl_seconds=0`），该值会被忽略 |
 
 ### Trace 类型
 

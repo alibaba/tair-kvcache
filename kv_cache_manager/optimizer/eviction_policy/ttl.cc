@@ -21,6 +21,7 @@ void TtlEvictionPolicy::OnBlockWritten(BlockEntry *block) {
     if (block->last_access_time > last_known_timestamp_) {
         last_known_timestamp_ = block->last_access_time;
     }
+    PushExpireEvent(block);
 }
 
 void TtlEvictionPolicy::OnNodeWritten(std::vector<BlockEntry *> &blocks) {
@@ -36,8 +37,75 @@ void TtlEvictionPolicy::OnBlockAccessed(BlockEntry *block, int64_t timestamp) {
     }
     block->last_access_time = timestamp;
     block->access_count += 1;
-    last_known_timestamp_ = timestamp;
+    if (timestamp > last_known_timestamp_) {
+        last_known_timestamp_ = timestamp;
+    }
     list_.move_to_front(it->second);
+    PushExpireEvent(block);
+}
+
+void TtlEvictionPolicy::AdvanceClock(int64_t timestamp) {
+    if (timestamp > last_known_timestamp_) {
+        last_known_timestamp_ = timestamp;
+    }
+}
+
+void TtlEvictionPolicy::PushExpireEvent(BlockEntry *block) {
+    if (!block || block->ttl_us <= 0) {
+        return;
+    }
+    auto &version = expire_event_version_[block];
+    ++version;
+    expire_min_heap_.push(ExpireEvent{block->last_access_time + block->ttl_us, version, block});
+    MaybeCompactExpireHeap();
+}
+
+bool TtlEvictionPolicy::TryPopOneExpired(BlockEntry *&expired_block) {
+    expired_block = nullptr;
+    while (!expire_min_heap_.empty()) {
+        auto event = expire_min_heap_.top();
+        if (event.expire_ts > last_known_timestamp_) {
+            return false;
+        }
+        expire_min_heap_.pop();
+
+        auto node_it = node_map_.find(event.block);
+        if (node_it == node_map_.end()) {
+            continue;
+        }
+        auto version_it = expire_event_version_.find(event.block);
+        if (version_it == expire_event_version_.end() || version_it->second != event.version) {
+            continue;
+        }
+        expired_block = event.block;
+        return true;
+    }
+    return false;
+}
+
+void TtlEvictionPolicy::MaybeCompactExpireHeap() {
+    if (node_map_.empty()) {
+        return;
+    }
+    if (expire_min_heap_.size() > node_map_.size() * 4) {
+        RebuildExpireHeap();
+    }
+}
+
+void TtlEvictionPolicy::RebuildExpireHeap() {
+    decltype(expire_min_heap_) new_heap;
+    for (const auto &[block, node] : node_map_) {
+        (void)node;
+        if (!block || block->ttl_us <= 0) {
+            continue;
+        }
+        auto version_it = expire_event_version_.find(block);
+        if (version_it == expire_event_version_.end()) {
+            continue;
+        }
+        new_heap.push(ExpireEvent{block->last_access_time + block->ttl_us, version_it->second, block});
+    }
+    expire_min_heap_.swap(new_heap);
 }
 
 // ============================================================
@@ -53,22 +121,17 @@ std::vector<BlockEntry *> TtlEvictionPolicy::EvictBlocks(size_t count) {
     }
 
     // ---- Phase 1: 收割所有过期 block ----
-    std::vector<ListNode *> expired_nodes;
-    size_t remaining = list_.size();
-    auto *cursor = static_cast<ListNode *>(list_.getTail());
-    while (cursor && remaining > 0) {
-        auto *prev = static_cast<ListNode *>(cursor->prev);
-        remaining--;
-        if (cursor->payload_ && cursor->payload_->IsExpired(last_known_timestamp_)) {
-            expired_nodes.push_back(cursor);
+    BlockEntry *expired_block = nullptr;
+    while (TryPopOneExpired(expired_block)) {
+        auto node_it = node_map_.find(expired_block);
+        if (node_it == node_map_.end()) {
+            continue;
         }
-        cursor = prev;
-    }
-
-    for (auto *node : expired_nodes) {
-        EvictOne(node->payload_);
-        evicted.push_back(node->payload_);
-        node_map_.erase(node->payload_);
+        auto *node = node_it->second;
+        EvictOne(expired_block);
+        evicted.push_back(expired_block);
+        node_map_.erase(node_it);
+        expire_event_version_.erase(expired_block);
         list_.unlink(node);
         delete node;
     }
@@ -83,6 +146,7 @@ std::vector<BlockEntry *> TtlEvictionPolicy::EvictBlocks(size_t count) {
             }
             EvictOne(tail->payload_);
             evicted.push_back(tail->payload_);
+            expire_event_version_.erase(tail->payload_);
             node_map_.erase(tail->payload_);
             list_.unlink(tail);
             delete tail;
@@ -110,6 +174,9 @@ void TtlEvictionPolicy::Clear() {
     }
     list_.clear();
     node_map_.clear();
+    expire_event_version_.clear();
+    decltype(expire_min_heap_) empty_heap;
+    expire_min_heap_.swap(empty_heap);
 }
 
 } // namespace kv_cache_manager

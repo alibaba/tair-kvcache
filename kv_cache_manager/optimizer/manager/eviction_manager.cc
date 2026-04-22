@@ -232,6 +232,38 @@ OptEvictionManager::EvictByInstancePrecise(const std::string &instance_id,
     return evict_blocks;
 }
 
+std::unordered_map<std::string, std::vector<BlockEntry *>>
+OptEvictionManager::ActiveEvictExpired(const OptInstanceGroupConfig &instance_group_config, int64_t current_timestamp) {
+    std::unordered_map<std::string, std::vector<BlockEntry *>> result;
+
+    // V1 语义：仅对 POLICY_TTL 做前置物理过期清理
+    for (const auto &instance_config : instance_group_config.instances()) {
+        if (instance_config.eviction_policy_type() != EvictionPolicyType::POLICY_TTL) {
+            continue;
+        }
+        auto instance_id = instance_config.instance_id();
+        auto it = instance_eviction_policy_map_.find(instance_id);
+        if (it == instance_eviction_policy_map_.end()) {
+            KVCM_LOG_WARN("Eviction policy not found for instance: %s", instance_id.c_str());
+            continue;
+        }
+        if (it->second->size() == 0) {
+            continue;
+        }
+
+        // V1 语义：仅 TTL 策略执行前置过期清理
+        it->second->AdvanceClock(current_timestamp);
+        auto evicted = it->second->EvictBlocks(0);
+        if (!evicted.empty()) {
+            result[instance_id] = evicted;
+            KVCM_LOG_DEBUG(
+                "Actively evicted %zu expired blocks from instance: %s", evicted.size(), instance_id.c_str());
+        }
+    }
+
+    return result;
+}
+
 size_t OptEvictionManager::GetCurrentGroupUsage(const OptInstanceGroupConfig &instance_group_config) const {
     size_t current_group_used = 0;
 
@@ -271,4 +303,13 @@ size_t OptEvictionManager::GetCurrentInstanceUsage(const std::string &instance_i
     current_instance_used = instance_it->second->size();
     return current_instance_used;
 }
+
+std::shared_ptr<EvictionPolicy> OptEvictionManager::GetEvictionPolicy(const std::string &instance_id) const {
+    auto it = instance_eviction_policy_map_.find(instance_id);
+    if (it != instance_eviction_policy_map_.end()) {
+        return it->second;
+    }
+    return nullptr;
+}
+
 } // namespace kv_cache_manager

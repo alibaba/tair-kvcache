@@ -91,12 +91,14 @@ bool OptimizerManager::Init() {
             }
 
             instance_configs_[instance_id] = instance_config;
+            instance_group_ttl_disabled_[instance_id] = (group.default_block_ttl_seconds() == 0);
 
             if (!CreateRadixTreeIndex(instance_config, storage_configs)) {
                 KVCM_LOG_ERROR("Failed to create RadixTreeIndex for instance: %s", instance_id.c_str());
                 failed_instances++;
                 failed_instance_ids.push_back(instance_id);
                 instance_configs_.erase(instance_id);
+                instance_group_ttl_disabled_.erase(instance_id);
                 continue;
             }
 
@@ -173,7 +175,14 @@ WriteCacheRes OptimizerManager::WriteCache(const std::string &instance_id,
     trace.set_keys(block_ids);
     trace.set_tokens(token_ids);
 
+    // ---- 如果 group 的 default_ttl=0，强制关闭 TTL ----
     int64_t ttl_us = (ttl_seconds > 0) ? ttl_seconds * 1000000 : ttl_seconds;
+
+    auto ttl_disabled_it = instance_group_ttl_disabled_.find(instance_id);
+    if (ttl_disabled_it != instance_group_ttl_disabled_.end() && ttl_disabled_it->second) {
+        ttl_us = -1; // group 级别关闭 TTL，强制禁用
+    }
+
     trace.set_ttl_us(ttl_us);
     optimizer_runner_->HandleWriteCache(trace);
     stats_collector_->UpdateTimestamp(instance_id, timestamp);

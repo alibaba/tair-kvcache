@@ -81,6 +81,10 @@ void OptimizerRunner::HandleGetLocation(const GetLocationSchemaTrace &trace) {
         return;
     }
 
+    // 读请求前统一清理过期 block，并做节点清理（TTL 使用逻辑过期时刻记录）
+    auto expired_evicted_blocks = indexer_manager_->EvictExpiredBeforeAccess(instance_id, trace.timestamp_us());
+    indexer_manager_->CleanEvictedBlocks(expired_evicted_blocks, trace.timestamp_us(), true);
+
     std::vector<std::vector<int64_t>> external_hits;
     std::vector<std::vector<int64_t>> internal_hits;
     indexer->PrefixQuery(trace.keys(), trace.block_mask(), trace.timestamp_us(), external_hits, internal_hits);
@@ -116,10 +120,15 @@ void OptimizerRunner::HandleWriteCache(const WriteCacheSchemaTrace &trace) {
         return;
     }
 
+    // 写请求前统一清理过期 block，并做节点清理（TTL 使用逻辑过期时刻记录）
+    auto expired_evicted_blocks = indexer_manager_->EvictExpiredBeforeAccess(instance_id, trace.timestamp_us());
+    indexer_manager_->CleanEvictedBlocks(expired_evicted_blocks, trace.timestamp_us(), true);
+
     auto result = indexer->InsertOnly(trace.keys(), trace.timestamp_us(), trace.ttl_us());
-    bool evicted = indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_us());
-    if (evicted) {
-        KVCM_LOG_DEBUG("Eviction in %zu to instance_id: %s", trace.timestamp_us(), instance_id.c_str());
+    auto capacity_evicted_blocks = indexer_manager_->CheckAndEvict(instance_id);
+    indexer_manager_->CleanEvictedBlocks(capacity_evicted_blocks, trace.timestamp_us());
+    if (!capacity_evicted_blocks.empty()) {
+        KVCM_LOG_DEBUG("Eviction by capacity in %zu to instance_id: %s", trace.timestamp_us(), instance_id.c_str());
     }
 
     WriteRecord record;
@@ -138,9 +147,14 @@ void OptimizerRunner::HandleDialogTurn(const DialogTurnSchemaTrace &trace) {
         return;
     }
 
+    // DialogTurn 前统一清理过期 block，并做节点清理（TTL 使用逻辑过期时刻记录）
+    auto expired_evicted_blocks = indexer_manager_->EvictExpiredBeforeAccess(instance_id, trace.timestamp_us());
+    indexer_manager_->CleanEvictedBlocks(expired_evicted_blocks, trace.timestamp_us(), true);
+
     std::vector<std::vector<int64_t>> hits;
     indexer->InsertWithQuery(trace.total_keys(), trace.timestamp_us(), hits);
-    indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_us());
+    auto capacity_evicted_blocks = indexer_manager_->CheckAndEvict(instance_id);
+    indexer_manager_->CleanEvictedBlocks(capacity_evicted_blocks, trace.timestamp_us());
 
     // ---- ReadRecord ----
     ReadRecord read_record = BuildReadRecord(instance_id, trace.timestamp_us());

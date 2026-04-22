@@ -39,7 +39,9 @@ public:
     std::vector<int64_t> InsertWithQuery(const std::vector<int64_t> &block_keys,
                                          const int64_t timestamp,
                                          std::vector<std::vector<int64_t>> &hits);
-    void CleanEmptyBlocks(const std::vector<BlockEntry *> &blocks, int64_t eviction_timestamp);
+    void CleanEmptyBlocks(const std::vector<BlockEntry *> &blocks,
+                          int64_t eviction_timestamp,
+                          bool use_logical_expire_time = false);
 
     // 清空整个RadixTree的缓存
     void Clear();
