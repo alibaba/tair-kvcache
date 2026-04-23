@@ -12,15 +12,27 @@ namespace kv_cache_manager {
 
 namespace {
 
-// Prometheus metric names must match [a-zA-Z_:][a-zA-Z0-9_:]*
-// Prometheus label names must match [a-zA-Z_][a-zA-Z0-9_]*
-// replace every character that is not in that set with '_'
-// and ignore the ':' handling for unity
+// replace characters that are invalid in a prometheus identifier
+// with underscores; keeps only [a-zA-Z0-9_]
+// a leading digit is prefixed with '_' since both metric names and
+// label names require the first character to match [a-zA-Z_]
+//
+// WARN:
+// distinct raw strings that differ only in characters replaced by '_'
+// (e.g. "storage.type" vs "storage_type") will produce the same output
+// callers must avoid tag keys that would collide after sanitization --
+// duplicate label names are invalid in prometheus text format
 std::string SanitizeIdentifier(const std::string &raw) {
     std::string out;
-    out.reserve(raw.size());
-    for (char c : raw) {
-        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_') {
+    out.reserve(raw.size() + 1);
+    for (std::size_t i = 0; i < raw.size(); ++i) {
+        char c = raw[i];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_') {
+            out += c;
+        } else if (c >= '0' && c <= '9') {
+            if (i == 0) {
+                out += '_';
+            }
             out += c;
         } else {
             out += '_';
