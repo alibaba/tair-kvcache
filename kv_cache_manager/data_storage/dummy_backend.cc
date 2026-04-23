@@ -73,7 +73,7 @@ std::vector<std::pair<ErrorCode, DataStorageUri>> DummyBackend::Create(const std
     auto batch_size = spec_.key_count_per_file();
     batch_size = batch_size <= 0 ? 1 : batch_size;
     using diff_t = std::vector<std::string>::difference_type;
-    for (std::size_t start = 0; start != keys.size(); start += batch_size) {
+    for (std::size_t start = 0; start < keys.size(); start += batch_size) {
         batches.emplace_back(std::next(keys.begin(), static_cast<diff_t>(start)),
                              std::next(keys.begin(), static_cast<diff_t>(std::min(start + batch_size, keys.size()))));
     }
