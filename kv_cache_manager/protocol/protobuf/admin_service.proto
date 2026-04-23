@@ -45,8 +45,9 @@ enum StorageType {
     ST_DUMMY = 6;
 }
 
-// for dummy storage backend
-message LocalStorageSpec {
+message LocalStorageSpec {}
+
+message DummyStorageSpec {
     string root_path = 1;
     int32 key_count_per_file = 2;
 }
@@ -105,6 +106,7 @@ message StorageConfig {
         TairMemPoolStorageSpec tair_mem_pool = 5;
         NfsStorageSpec nfs = 6;
         VcnsThreeFSStorageSpec vcnsthreefs = 7;
+        DummyStorageSpec dummy = 9;
     }
     bool check_storage_available_when_open = 8;
 }

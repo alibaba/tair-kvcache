@@ -509,7 +509,7 @@ class LocationPruningTest(abc.ABC, TestBase, unittest.TestCase):
             "trace_id": self._trace_id + "-add_storage",
             "storage": {
                 "global_unique_name": self._storage_name,
-                "local": {
+                "dummy": {
                     "root_path": dummy_root_path,
                     "key_count_per_file": 1,
                 }

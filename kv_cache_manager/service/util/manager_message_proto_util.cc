@@ -57,9 +57,9 @@ void ProtoConvert::StorageConfigToProto(const StorageConfig &storage_config,
         nfs->set_key_count_per_file(nfs_storage.key_count_per_file());
     } else if (type == DataStorageType::DATA_STORAGE_TYPE_DUMMY) {
         const auto &dummy_storage = *std::dynamic_pointer_cast<DummyStorageSpec>(storage_config.storage_spec());
-        auto *local = proto_storage_config->mutable_local();
-        local->set_root_path(dummy_storage.root_path());
-        local->set_key_count_per_file(dummy_storage.key_count_per_file());
+        auto *dummy = proto_storage_config->mutable_dummy();
+        dummy->set_root_path(dummy_storage.root_path());
+        dummy->set_key_count_per_file(dummy_storage.key_count_per_file());
     }
 }
 
@@ -124,10 +124,10 @@ void ProtoConvert::StorageFromProto(const proto::admin::StorageConfig *proto_sto
         storage_config.set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
         break;
     }
-    case proto::admin::StorageConfig::kLocal: {
+    case proto::admin::StorageConfig::kDummy: {
         DummyStorageSpec spec;
-        spec.set_root_path(proto_storage_config->local().root_path());
-        spec.set_key_count_per_file(proto_storage_config->local().key_count_per_file());
+        spec.set_root_path(proto_storage_config->dummy().root_path());
+        spec.set_key_count_per_file(proto_storage_config->dummy().key_count_per_file());
         storage_config.set_storage_spec(std::make_shared<DummyStorageSpec>(spec));
         storage_config.set_type(DataStorageType::DATA_STORAGE_TYPE_DUMMY);
         break;
