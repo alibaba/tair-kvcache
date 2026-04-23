@@ -477,7 +477,11 @@ class HiCacheKVCM(HiCacheStorage):
                 torch.distributed.broadcast_object_list(
                     [result, len_prefix, len_new, local_hash], src=0, group=self.storage_tp_group
                 )
-        elif not self.is_mla_model:
+        elif self.is_mla_model:
+            logger.warning(f"_batch_set called on non-rank-0 (tp_rank={self.tp_rank}) "
+                           f"for MLA model; only rank 0 should write. Returning all False.")
+            return [False] * len_new
+        else:
             recv = [None, None, None, None]
             torch.distributed.broadcast_object_list(
                 recv, src=0, group=self.storage_tp_group
@@ -706,7 +710,12 @@ class HiCacheKVCM(HiCacheStorage):
                         torch.distributed.broadcast_object_list(
                             [write_result], src=0, group=self.storage_tp_group
                         )
-                elif not self.is_mla_model:
+                elif self.is_mla_model:
+                    logger.warning(f"batch_set_v2 called on non-rank-0 (tp_rank={self.tp_rank}) "
+                                   f"for MLA model; only rank 0 should write. Returning all False.")
+                    results[transfer.name] = [False] * len(keys)
+                    continue
+                else:
                     recv = [None]
                     torch.distributed.broadcast_object_list(
                         recv, src=0, group=self.storage_tp_group
