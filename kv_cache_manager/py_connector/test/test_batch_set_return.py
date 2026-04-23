@@ -36,7 +36,8 @@ def _make_obj(cls):
 
 def _build_connector(*, tp_rank=0, tp_world_size=1, kv_factor=2,
                      instance_id="test", location_spec_name="tp_0",
-                     location_spec_size=4096, write_timeout_seconds=30):
+                     location_spec_size=4096, write_timeout_seconds=30,
+                     is_mla_model=False):
     """Build a HiCacheKVCM with attributes set manually (bypass __init__)."""
     obj = _make_obj(HiCacheKVCM)
     obj.tp_rank = tp_rank
@@ -46,6 +47,7 @@ def _build_connector(*, tp_rank=0, tp_world_size=1, kv_factor=2,
     obj.location_spec_name = location_spec_name
     obj.location_spec_size = location_spec_size
     obj.write_timeout_seconds = write_timeout_seconds
+    obj.is_mla_model = is_mla_model
     obj.backup_pgs = []
     obj.backup_bandwidth = []
     obj._manager_client = MagicMock()
@@ -763,6 +765,95 @@ class TestSkipTransfer(unittest.TestCase):
 
         self.assertEqual(len(result), 3)
         self.assertEqual(result, [False, False, False])
+
+
+class TestMLASkipTPSync(unittest.TestCase):
+    """Verify MLA models skip broadcast/all_reduce in _batch_set.
+
+    MLA models set is_mla_model=True. In sglang only rank 0 writes
+    (backup_skip), so the connector skips TP synchronisation to avoid hangs.
+    """
+
+    def _make_mla_rank0(self):
+        """MLA connector at rank 0 in a 2-rank setup."""
+        c = _build_connector(
+            tp_rank=0, tp_world_size=2, kv_factor=1,
+            location_spec_name="tp_0_full", is_mla_model=True,
+        )
+        c.storage_tp_group = MagicMock()
+        return c
+
+    def _setup_write(self, c, num_keys=3, save_ok=True):
+        locations = [
+            {"location_specs": [{"name": "tp_0_full", "uri": f"uri_{i}"}]}
+            for i in range(num_keys)
+        ]
+        c._manager_client.start_write_cache.return_value = {
+            "locations": locations,
+            "write_session_id": "ws-mla",
+            "block_mask": {"offset": 0},
+        }
+        c.mem_pool_host.get_page_buffer_meta.return_value = (
+            list(range(num_keys * c.kv_factor)),
+            [c.location_spec_size] * (num_keys * c.kv_factor),
+        )
+        err = _mock_kvcm.ClientErrorCode.ER_OK if save_ok else 999
+        c.transfer_client.SaveKvCaches.return_value = (err,)
+
+    # ── MLA-1: rank 0 writes succeed without broadcast/all_reduce ─────
+    def test_mla_rank0_no_broadcast(self):
+        """MLA rank 0 writes successfully; broadcast is never called."""
+        c = self._make_mla_rank0()
+        self._setup_write(c)
+
+        with patch("torch.distributed.broadcast_object_list") as mock_bcast, \
+             patch("torch.distributed.all_reduce") as mock_allreduce:
+            result = c._batch_set(["k0", "k1", "k2"], torch.zeros(3), trace_id="mla1")
+
+        self.assertEqual(result, [True, True, True])
+        mock_bcast.assert_not_called()
+        mock_allreduce.assert_not_called()
+
+    # ── MLA-2: rank 0 write fails, still no broadcast ────────────────
+    def test_mla_rank0_failure_no_broadcast(self):
+        """MLA rank 0 write fails; broadcast/all_reduce still not called."""
+        c = self._make_mla_rank0()
+        self._setup_write(c, save_ok=False)
+
+        with patch("torch.distributed.broadcast_object_list") as mock_bcast, \
+             patch("torch.distributed.all_reduce") as mock_allreduce:
+            result = c._batch_set(["k0", "k1", "k2"], torch.zeros(3), trace_id="mla2")
+
+        self.assertEqual(result, [False, False, False])
+        mock_bcast.assert_not_called()
+        mock_allreduce.assert_not_called()
+
+    # ── MLA-3: rank 0 start_write_cache fails, no broadcast ──────────
+    def test_mla_rank0_start_write_fails_no_broadcast(self):
+        """MLA rank 0: start_write_cache throws; no broadcast, returns all False."""
+        c = self._make_mla_rank0()
+        c._manager_client.start_write_cache.side_effect = RuntimeError("boom")
+
+        with patch("torch.distributed.broadcast_object_list") as mock_bcast:
+            result = c.batch_set_v1(["k0", "k1"], torch.zeros(2))
+
+        self.assertEqual(result, [False, False])
+        mock_bcast.assert_not_called()
+
+    # ── MLA-4: kv_factor=1 produces correct number of IOVs ───────────
+    def test_mla_kv_factor_1(self):
+        """MLA uses kv_factor=1: each page has 1 IOV (not 2 like MHA)."""
+        c = self._make_mla_rank0()
+        self._setup_write(c, num_keys=4)
+
+        with patch("torch.distributed.broadcast_object_list"), \
+             patch("torch.distributed.all_reduce"):
+            c._batch_set(["k0", "k1", "k2", "k3"], torch.zeros(4), trace_id="mla4")
+
+        # SaveKvCaches should be called with 4 URIs (1 per page, not 8)
+        save_args = c.transfer_client.SaveKvCaches.call_args[0]
+        self.assertEqual(len(save_args[0]), 4)  # uris
+        self.assertEqual(len(save_args[1]), 4)  # buffers
 
 
 if __name__ == "__main__":

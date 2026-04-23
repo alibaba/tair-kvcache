@@ -125,7 +125,8 @@ class HiCacheKVCM(HiCacheStorage):
                 name = self._tp_rank_to_linear_spec_name(rank)
                 self.location_spec_infos.append({"name": name, "size": self.mamba_spec_size})
                 linear_spec_names.append(name)
-            self.mamba_location_spec_name = self._tp_rank_to_linear_spec_name(self.tp_rank)
+            mamba_spec_rank = 0 if self.is_mla_model else self.tp_rank
+            self.mamba_location_spec_name = self._tp_rank_to_linear_spec_name(mamba_spec_rank)
             self.location_spec_groups.append({
                 "name": self._get_extra_pool_spec_group(PoolName.MAMBA),
                 "spec_names": linear_spec_names,
@@ -140,7 +141,8 @@ class HiCacheKVCM(HiCacheStorage):
                 name = self._tp_rank_to_indexer_spec_name(rank)
                 self.location_spec_infos.append({"name": name, "size": self.indexer_spec_size})
                 indexer_spec_names.append(name)
-            self.indexer_location_spec_name = self._tp_rank_to_indexer_spec_name(self.tp_rank)
+            indexer_spec_rank = 0 if self.is_mla_model else self.tp_rank
+            self.indexer_location_spec_name = self._tp_rank_to_indexer_spec_name(indexer_spec_rank)
             self.location_spec_groups.append({
                 "name": self._get_extra_pool_spec_group(PoolName.INDEXER),
                 "spec_names": indexer_spec_names,
@@ -171,7 +173,9 @@ class HiCacheKVCM(HiCacheStorage):
         self.storage_configs = register_response["storage_configs"]
 
         # data transfer setup
-        self.location_spec_name = self._tp_rank_to_spec_name(self.tp_rank)
+        # MLA: only rank 0 writes, so all ranks use rank 0's spec for read/write
+        kv_spec_rank = 0 if self.is_mla_model else self.tp_rank
+        self.location_spec_name = self._tp_rank_to_spec_name(kv_spec_rank)
 
         self.write_timeout_seconds = self.extra_config.get("write_timeout_seconds", 30)
 
@@ -469,11 +473,11 @@ class HiCacheKVCM(HiCacheStorage):
                 logger.error(f"start_write_cache failed: {e}")
                 result = None
 
-            if self.tp_world_size > 1:
+            if self.tp_world_size > 1 and not self.is_mla_model:
                 torch.distributed.broadcast_object_list(
                     [result, len_prefix, len_new, local_hash], src=0, group=self.storage_tp_group
                 )
-        else:
+        elif not self.is_mla_model:
             recv = [None, None, None, None]
             torch.distributed.broadcast_object_list(
                 recv, src=0, group=self.storage_tp_group
@@ -606,7 +610,7 @@ class HiCacheKVCM(HiCacheStorage):
                 # per_block_flags remains all zeros
 
         # Per-block all_reduce: only blocks ALL ranks wrote are marked success
-        if self.tp_world_size > 1:
+        if self.tp_world_size > 1 and not self.is_mla_model:
             torch.distributed.all_reduce(
                 per_block_flags,
                 op=torch.distributed.ReduceOp.MIN,
@@ -698,11 +702,11 @@ class HiCacheKVCM(HiCacheStorage):
                     except Exception as e:
                         logger.error(f"start_write_cache failed on rank 0: {trace_id=} {e=}")
                         write_result = None
-                    if self.tp_world_size > 1:
+                    if self.tp_world_size > 1 and not self.is_mla_model:
                         torch.distributed.broadcast_object_list(
                             [write_result], src=0, group=self.storage_tp_group
                         )
-                else:
+                elif not self.is_mla_model:
                     recv = [None]
                     torch.distributed.broadcast_object_list(
                         recv, src=0, group=self.storage_tp_group
@@ -789,7 +793,7 @@ class HiCacheKVCM(HiCacheStorage):
                     logger.error(f"Data transfer v2 (SaveKvCaches) failed: {transfer.name} {e}")
                     flag = False
 
-                if self.tp_world_size > 1:
+                if self.tp_world_size > 1 and not self.is_mla_model:
                     flag_tensor = torch.tensor(flag, dtype=torch.int)
                     torch.distributed.all_reduce(
                         flag_tensor,
