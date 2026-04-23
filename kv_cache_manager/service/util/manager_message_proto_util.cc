@@ -135,7 +135,7 @@ void ProtoConvert::StorageFromProto(const proto::admin::StorageConfig *proto_sto
     default:
         storage_config.set_type(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN);
         KVCM_LOG_WARN("Unknown storage type in request proto: storage_type should be : threefs, mooncake, "
-                      "tair_mem_pool, nfs or local");
+                      "tair_mem_pool, nfs or dummy");
         break;
     }
 }
