@@ -726,7 +726,8 @@ bool CacheReclaimer::DoKeySampling(RequestContext *request_context,
                       std::size_t sampling_sz,
                       std::vector<std::int64_t> &keys,
                       std::vector<std::map<std::string, std::string>> &maps) -> ErrorCode {
-        if (const auto ec = meta_indexer->SampleReclaimKeys(request_context, sampling_sz, keys); ec != ErrorCode::EC_OK) {
+        if (const auto ec = meta_indexer->SampleReclaimKeys(request_context, sampling_sz, keys);
+            ec != ErrorCode::EC_OK) {
             LOG_WITH_ID(WARN, "random sample failed, error code: [%d]", static_cast<std::int32_t>(ec));
             return ec;
         }
@@ -944,10 +945,9 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
             // 1. it is in CLS_SERVING status, OR
             // 2. it is in CLS_WRITING status but its write session is
             //    no longer active (orphaned after a server restart)
-            const bool is_orphaned_writing =
-                loc.status() == CacheLocationStatus::CLS_WRITING &&
-                write_location_manager_ != nullptr &&
-                !write_location_manager_->HasLocationId(loc.id());
+            const bool is_orphaned_writing = loc.status() == CacheLocationStatus::CLS_WRITING &&
+                                             write_location_manager_ != nullptr &&
+                                             !write_location_manager_->HasLocationId(loc.id());
             if (loc.status() == CacheLocationStatus::CLS_SERVING || is_orphaned_writing) {
                 if (water_level_exceed.CheckStorageTypeWaterLevelExceed()) {
                     // some storage type water level exceeded; only
