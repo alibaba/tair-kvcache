@@ -145,6 +145,7 @@ std::vector<bool> DummyBackend::Exist(const std::vector<DataStorageUri> &storage
                            ec.message().c_str(),
                            uri.GetPath().c_str());
             results.push_back(false);
+            continue;
         }
         results.push_back(res);
     }
