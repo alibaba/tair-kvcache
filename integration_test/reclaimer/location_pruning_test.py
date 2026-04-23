@@ -544,7 +544,7 @@ class LocationPruningTest(abc.ABC, TestBase, unittest.TestCase):
                         },
                         "delay_before_delete_ms": 100,
                     },
-                    "data_storage_strategy": 2,  # TODO: CPS_PREFER_3FS?
+                    "data_storage_strategy": 2,  # CPS_PREFER_3FS
                     "meta_indexer_config": {
                         "max_key_count": 16,  # start with 16 max key
                         "mutex_shard_num": 16,
