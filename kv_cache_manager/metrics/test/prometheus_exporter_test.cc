@@ -89,6 +89,15 @@ TEST_F(PrometheusExporterTest, CustomPrefix) {
     EXPECT_EQ(output.find("kvcm_"), std::string::npos);
 }
 
+TEST_F(PrometheusExporterTest, PrefixSanitization) {
+    Gauge g = registry_->GetGauge("service.qps");
+    g = 1.0;
+
+    std::string output = PrometheusExporter::Expose(*registry_, "my-app.v2");
+    EXPECT_NE(output.find("my_app_v2_service_qps"), std::string::npos) << "Actual output:\n" << output;
+    EXPECT_EQ(output.find("my-app"), std::string::npos);
+}
+
 TEST_F(PrometheusExporterTest, LabelValueEscaping) {
     MetricsTags tags = {{"path", "a\\b\"c\nd"}};
     Gauge g = registry_->GetGauge("test.escape", tags);

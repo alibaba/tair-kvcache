@@ -33,7 +33,7 @@ std::string SanitizeIdentifier(const std::string &raw) {
 std::string SanitizeName(const std::string &prefix, const std::string &raw_name) {
     std::string out;
     out.reserve(prefix.size() + 1 + raw_name.size());
-    out += prefix;
+    out += SanitizeIdentifier(prefix);
     out += '_';
     out += SanitizeIdentifier(raw_name);
     return out;
