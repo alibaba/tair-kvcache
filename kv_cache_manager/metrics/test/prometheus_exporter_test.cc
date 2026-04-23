@@ -159,6 +159,10 @@ TEST_F(PrometheusExporterTest, SpecialCharsInMetricName) {
 
     std::string output = PrometheusExporter::Expose(*registry_);
     EXPECT_NE(output.find("kvcm_ns_group_metric_name_v2"), std::string::npos) << "Actual output:\n" << output;
+    // HELP line must preserve the original raw name (pre-sanitization)
+    EXPECT_NE(output.find("# HELP kvcm_ns_group_metric_name_v2 ns:group/metric name@v2"), std::string::npos)
+        << "Actual output:\n"
+        << output;
 }
 
 TEST_F(PrometheusExporterTest, AllValidInputUnchanged) {

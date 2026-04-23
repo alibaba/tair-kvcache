@@ -20,8 +20,10 @@ namespace {
 // WARN:
 // distinct raw strings that differ only in characters replaced by '_'
 // (e.g. "storage.type" vs "storage_type") will produce the same output
-// callers must avoid tag keys that would collide after sanitization --
-// duplicate label names are invalid in prometheus text format
+// callers must avoid collisions after sanitization in all contexts:
+// - metric names: duplicates cause repeated HELP/TYPE lines
+// - label keys: duplicates are invalid in prometheus text format
+// - prefixes: same collision risk as metric names
 std::string SanitizeIdentifier(const std::string &raw) {
     std::string out;
     out.reserve(raw.size() + 1);
