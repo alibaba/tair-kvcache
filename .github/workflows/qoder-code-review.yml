@@ -52,6 +52,7 @@ jobs:
           ref: refs/pull/${{ steps.pr-info.outputs.number }}/head
           fetch-depth: 0
       - name: Run Qoder Code Review
+        timeout-minutes: 30
         # uses: QoderAI/qoder-action@v0
         uses: QoderAI/qoder-action@0881d27d15a7a93778ebc5c942d11da313ee8b7e
         with:
