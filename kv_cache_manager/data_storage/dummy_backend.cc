@@ -8,6 +8,7 @@
 #include <iterator>
 #include <memory>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -136,7 +137,15 @@ std::vector<ErrorCode> DummyBackend::Delete(const std::vector<DataStorageUri> &s
 std::vector<bool> DummyBackend::Exist(const std::vector<DataStorageUri> &storage_uris) {
     std::vector<bool> results;
     for (auto &uri : storage_uris) {
-        const bool res = std::filesystem::exists(uri.GetPath());
+        std::error_code ec;
+        const bool res = std::filesystem::exists(uri.GetPath(), ec);
+        if (ec) {
+            KVCM_LOG_ERROR("std::filesystem::exists call failed, err code: [%d], err msg: [%s], path: [%s]",
+                           ec.value(),
+                           ec.message().c_str(),
+                           uri.GetPath().c_str());
+            results.push_back(false);
+        }
         results.push_back(res);
     }
     return results;
