@@ -10,10 +10,14 @@ class MetricsRegistry;
 // text exposition format (text/plain; version=0.0.4; charset=utf-8).
 //
 // Naming rules applied during serialization:
-//   - Dots in the internal metric name are replaced with underscores.
+//   - Metric names, label keys and the prefix are sanitized to the
+//     Prometheus identifier charset [a-zA-Z0-9_].  Characters outside
+//     that set are replaced with underscores; a leading digit gets a
+//     '_' prefix.
 //   - A configurable prefix (default "kvcm") is prepended, separated
 //     by an underscore.
-//   - MetricsTags become Prometheus labels.
+//   - MetricsTags become Prometheus labels (keys sanitized, values
+//     escaped per the exposition format).
 //   - CounterValue metrics are emitted with TYPE counter.
 //   - GaugeValue   metrics are emitted with TYPE gauge.
 class PrometheusExporter {

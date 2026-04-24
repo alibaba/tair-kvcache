@@ -12,25 +12,49 @@ namespace kv_cache_manager {
 
 namespace {
 
-// Prometheus metric names must match [a-zA-Z_:][a-zA-Z0-9_:]*.
-// Replace every character that is not in that set with '_'.
-std::string SanitizeName(const std::string &prefix, const std::string &raw_name) {
+// replace characters that are invalid in a prometheus identifier
+// with underscores; keeps only [a-zA-Z0-9_]
+// a leading digit is prefixed with '_' since both metric names and
+// label names require the first character to match [a-zA-Z_]
+//
+// WARN:
+// distinct raw strings that differ only in characters replaced by '_'
+// (e.g. "storage.type" vs "storage_type") will produce the same output
+// callers must avoid collisions after sanitization in all contexts:
+// - metric names: duplicates cause repeated HELP/TYPE lines
+// - label keys: duplicates are invalid in prometheus text format
+// - prefixes: same collision risk as metric names
+std::string SanitizeIdentifier(const std::string &raw) {
     std::string out;
-    out.reserve(prefix.size() + 1 + raw_name.size());
-    out += prefix;
-    out += '_';
-    for (char c : raw_name) {
-        if (c == '.' || c == '-') {
-            out += '_';
-        } else {
+    out.reserve(raw.size() + 1);
+    for (std::size_t i = 0; i < raw.size(); ++i) {
+        char c = raw[i];
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_') {
             out += c;
+        } else if (c >= '0' && c <= '9') {
+            if (i == 0) {
+                out += '_';
+            }
+            out += c;
+        } else {
+            out += '_';
         }
     }
     return out;
 }
 
-// Prometheus label values use double-quoted strings.  Backslash,
-// double-quote and newline must be escaped.
+// build a prometheus metric name: prefix + '_' + sanitized(raw_name)
+std::string SanitizeName(const std::string &prefix, const std::string &raw_name) {
+    std::string out;
+    out.reserve(prefix.size() + 1 + raw_name.size());
+    out += SanitizeIdentifier(prefix);
+    out += '_';
+    out += SanitizeIdentifier(raw_name);
+    return out;
+}
+
+// prometheus label values use double-quoted strings; backslash,
+// double-quote and newline must be escaped
 void EscapeLabelValue(std::ostringstream &ss, const std::string &v) {
     for (char c : v) {
         switch (c) {
@@ -60,7 +84,7 @@ void WriteLabels(std::ostringstream &ss, const MetricsTags &tags) {
             ss << ',';
         }
         first = false;
-        ss << k << "=\"";
+        ss << SanitizeIdentifier(k) << "=\"";
         EscapeLabelValue(ss, v);
         ss << '"';
     }

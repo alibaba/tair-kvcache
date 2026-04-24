@@ -21,11 +21,13 @@ cc_library(
         "src/common/env_util.cpp",
         "src/cuda/cuda_util.cpp",
         "src/pace_mp_api.cpp",
+        "src/monitor/latency_profiler.cpp"
     ],
     hdrs = glob([
         "include/pace_mp.h",
         "include/pace_mp_meta.h",
         "include/kernel/sm_copy_kernel.h",
+        "include/monitor/latency_profiler.h"
     ]),
     copts = [
         "-std=c++20",

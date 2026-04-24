@@ -89,6 +89,15 @@ TEST_F(PrometheusExporterTest, CustomPrefix) {
     EXPECT_EQ(output.find("kvcm_"), std::string::npos);
 }
 
+TEST_F(PrometheusExporterTest, PrefixSanitization) {
+    Gauge g = registry_->GetGauge("service.qps");
+    g = 1.0;
+
+    std::string output = PrometheusExporter::Expose(*registry_, "my-app.v2");
+    EXPECT_NE(output.find("my_app_v2_service_qps"), std::string::npos) << "Actual output:\n" << output;
+    EXPECT_EQ(output.find("my-app"), std::string::npos);
+}
+
 TEST_F(PrometheusExporterTest, LabelValueEscaping) {
     MetricsTags tags = {{"path", "a\\b\"c\nd"}};
     Gauge g = registry_->GetGauge("test.escape", tags);
@@ -104,6 +113,20 @@ TEST_F(PrometheusExporterTest, DotAndDashInNames) {
 
     std::string output = PrometheusExporter::Expose(*registry_);
     EXPECT_NE(output.find("kvcm_my_group_some_metric"), std::string::npos);
+}
+
+TEST_F(PrometheusExporterTest, LabelKeySanitization) {
+    MetricsTags tags = {{"storage.type", "hf3fs"}, {"host-name", "node01"}};
+    Gauge g = registry_->GetGauge("test.label_keys", tags);
+    g = 1.0;
+
+    std::string output = PrometheusExporter::Expose(*registry_);
+    // dots and dashes in label keys should be replaced with underscores
+    EXPECT_NE(output.find("storage_type=\"hf3fs\""), std::string::npos) << "Actual output:\n" << output;
+    EXPECT_NE(output.find("host_name=\"node01\""), std::string::npos) << "Actual output:\n" << output;
+    // originals should not appear as label keys
+    EXPECT_EQ(output.find("storage.type="), std::string::npos);
+    EXPECT_EQ(output.find("host-name="), std::string::npos);
 }
 
 TEST_F(PrometheusExporterTest, HelpLineContainsOriginalName) {
@@ -125,4 +148,64 @@ TEST_F(PrometheusExporterTest, MultipleMetricFamilies) {
     std::string output = PrometheusExporter::Expose(*registry_);
     EXPECT_NE(output.find("# TYPE kvcm_meta_indexer_total_key_count gauge"), std::string::npos);
     EXPECT_NE(output.find("# TYPE kvcm_service_query_counter counter"), std::string::npos);
+}
+
+// -- SanitizeIdentifier specification tests (exercised through Expose) --
+
+TEST_F(PrometheusExporterTest, SpecialCharsInMetricName) {
+    // characters beyond '.' and '-': @, space, colon, slash
+    Gauge g = registry_->GetGauge("ns:group/metric name@v2");
+    g = 1.0;
+
+    std::string output = PrometheusExporter::Expose(*registry_);
+    EXPECT_NE(output.find("kvcm_ns_group_metric_name_v2"), std::string::npos) << "Actual output:\n" << output;
+    // HELP line must preserve the original raw name (pre-sanitization)
+    EXPECT_NE(output.find("# HELP kvcm_ns_group_metric_name_v2 ns:group/metric name@v2"), std::string::npos)
+        << "Actual output:\n"
+        << output;
+}
+
+TEST_F(PrometheusExporterTest, AllValidInputUnchanged) {
+    // a name with only [a-zA-Z0-9_] should pass through unchanged
+    Gauge g = registry_->GetGauge("abc_XYZ_012");
+    g = 1.0;
+
+    std::string output = PrometheusExporter::Expose(*registry_);
+    EXPECT_NE(output.find("kvcm_abc_XYZ_012"), std::string::npos);
+}
+
+TEST_F(PrometheusExporterTest, ConsecutiveSpecialChars) {
+    Gauge g = registry_->GetGauge("a..b--c");
+    g = 1.0;
+
+    std::string output = PrometheusExporter::Expose(*registry_);
+    EXPECT_NE(output.find("kvcm_a__b__c"), std::string::npos) << "Actual output:\n" << output;
+}
+
+TEST_F(PrometheusExporterTest, LeadingDigitInMetricName) {
+    Gauge g = registry_->GetGauge("3abc");
+    g = 1.0;
+
+    std::string output = PrometheusExporter::Expose(*registry_);
+    // leading digit gets a '_' prefix: "3abc" -> "_3abc"
+    EXPECT_NE(output.find("kvcm__3abc"), std::string::npos) << "Actual output:\n" << output;
+}
+
+TEST_F(PrometheusExporterTest, LeadingDigitInLabelKey) {
+    MetricsTags tags = {{"1abc", "val"}};
+    Gauge g = registry_->GetGauge("test.leading_digit_label", tags);
+    g = 1.0;
+
+    std::string output = PrometheusExporter::Expose(*registry_);
+    EXPECT_NE(output.find("_1abc=\"val\""), std::string::npos) << "Actual output:\n" << output;
+    // raw key must not appear
+    EXPECT_EQ(output.find("{1abc="), std::string::npos);
+}
+
+TEST_F(PrometheusExporterTest, LeadingDigitInPrefix) {
+    Gauge g = registry_->GetGauge("service.qps");
+    g = 1.0;
+
+    std::string output = PrometheusExporter::Expose(*registry_, "9app");
+    EXPECT_NE(output.find("_9app_service_qps"), std::string::npos) << "Actual output:\n" << output;
 }
