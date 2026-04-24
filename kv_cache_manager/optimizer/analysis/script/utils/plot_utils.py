@@ -6,6 +6,7 @@
 - 颜色/标记常量
 - 单策略 Pareto 曲线（每个 instance 一条线）
 - 多策略对比子图（每个 instance 一个子图）
+- Per-Tier 对比图（所有层放在一起）
 """
 
 import os
@@ -62,7 +63,7 @@ def plot_single_policy_curves(
     Args:
         results:       [{"capacity": int, "instances": {...}}, ...]
         output_dir:    图片根输出目录，图表保存至 output_dir/pareto/
-        hit_rate_type: "total" | "internal" | "external"
+        hit_rate_type: "total" | "local" | "remote"
         title:         图标题（None 则自动生成）
         axis_limits:   {"x_min", "x_max", "y_min", "y_max"}，None 表示不限制
     """
@@ -120,7 +121,7 @@ def plot_multi_policy_subplots(
     Args:
         results_by_policy: {"policy": [{"capacity", "instances"}, ...]}
         output_dir:        图片根输出目录，图表保存至 output_dir/pareto/
-        hit_rate_type:     "total" | "internal" | "external"
+        hit_rate_type:     "total" | "local" | "remote"
     """
     if not results_by_policy:
         print("No data to plot!")
@@ -133,7 +134,7 @@ def plot_multi_policy_subplots(
     for policy, results in results_by_policy.items():
         for r in results:
             for iid, metrics in r["instances"].items():
-                plot_data[iid][policy]["storage"].append(metrics["cached_blocks_all"])
+                plot_data[iid][policy]["storage"].append(metrics["cached_block_num_all"])
                 plot_data[iid][policy]["hit_rates"].append(metrics[hit_rate_type])
 
     instance_ids = sorted(plot_data.keys())
@@ -187,4 +188,101 @@ def plot_multi_policy_subplots(
     out = os.path.join(pareto_dir, f"multi_policy_{hit_rate_type}.png")
     plt.savefig(out, dpi=300, bbox_inches="tight")
     print(f"\nSaved: {out}")
+    plt.close()
+
+
+# ============================================================================
+# Per-Tier 对比图
+# ============================================================================
+
+def plot_per_tier_curves(
+    results: List[dict],
+    output_dir: str,
+    title: str = None,
+    axis_limits: dict = None,
+):
+    """
+    绘制 per-tier 命中率对比曲线，所有层放在一起。
+
+    Args:
+        results:       [{"capacity": int, "instances": {...}}, ...]
+                       每个 instance 的 metrics 需包含 tier_names, acc_tier_hit_rates
+        output_dir:    图片根输出目录，图表保存至 output_dir/pareto/
+        title:         图标题（None 则自动生成）
+        axis_limits:   {"x_min", "x_max", "y_min", "y_max"}，None 表示不限制
+    """
+    if not results:
+        print("No data to plot!")
+        return
+
+    # 收集所有 tier 名称
+    all_tier_names = set()
+    for r in results:
+        for iid, metrics in r["instances"].items():
+            if "tier_names" in metrics:
+                all_tier_names.update(metrics["tier_names"])
+    
+    if not all_tier_names:
+        print("No per-tier data available!")
+        return
+    
+    tier_names = sorted(all_tier_names)
+    instance_ids = list(results[0]["instances"].keys())
+    
+    # 为每个 tier 分配颜色和标记
+    tier_colors = {
+        tier: COLORS[idx % len(COLORS)]
+        for idx, tier in enumerate(tier_names)
+    }
+    tier_markers = {
+        tier: MARKERS[idx % len(MARKERS)]
+        for idx, tier in enumerate(tier_names)
+    }
+    
+    plt.figure(figsize=(14, 9))
+    
+    # 为每个 instance 和每个 tier 绘制曲线
+    for idx, iid in enumerate(instance_ids):
+        for tier_idx, tier_name in enumerate(tier_names):
+            caps = []
+            rates = []
+            for r in results:
+                if iid in r["instances"]:
+                    metrics = r["instances"][iid]
+                    if "acc_tier_hit_rates" in metrics and tier_name in metrics["acc_tier_hit_rates"]:
+                        caps.append(r["capacity"])
+                        rates.append(metrics["acc_tier_hit_rates"][tier_name])
+            
+            if not caps:
+                continue
+            
+            # 使用不同的颜色和标记区分 tier
+            # 同一个 tier 在不同 instance 上用相同颜色，但用透明度区分
+            alpha = 0.3 + 0.7 * (1.0 - idx / max(len(instance_ids) - 1, 1))
+            plt.scatter(caps, rates,
+                       color=tier_colors[tier_name],
+                       marker=tier_markers[tier_name],
+                       s=50, 
+                       label=f"{tier_name}" if idx == 0 else None,  # 只在第一个 instance 添加 legend
+                       alpha=min(alpha, 0.9))
+    
+    plt.xlabel("Cache Capacity (blocks)", fontsize=12)
+    plt.ylabel("Hit Rate", fontsize=12)
+    plt.title(title or "Per-Tier Hit Rate vs Cache Capacity", fontsize=14)
+    plt.legend(loc="lower right", fontsize=10)
+    plt.grid(True, alpha=0.3)
+    
+    al = axis_limits or {}
+    if al.get("x_min") is not None or al.get("x_max") is not None:
+        plt.xlim(al.get("x_min"), al.get("x_max"))
+    y_lo = al.get("y_min") if al.get("y_min") is not None else 0
+    y_hi = al.get("y_max") if al.get("y_max") is not None else 1
+    plt.ylim(y_lo, y_hi)
+    
+    plt.tight_layout()
+    pareto_dir = os.path.join(output_dir, "pareto")
+    os.makedirs(pareto_dir, exist_ok=True)
+    out = os.path.join(pareto_dir, "per_tier_curves.png")
+    plt.savefig(out, dpi=300, bbox_inches="tight")
+    print(f"Saved: {out}")
     plt.close()

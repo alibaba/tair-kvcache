@@ -5,7 +5,7 @@
 #include <vector>
 namespace kv_cache_manager {
 LeafAwareLruEvictionPolicy::LeafAwareLruEvictionPolicy(const std::string &name, const LruParams &params)
-    : name_(name), params_(params) {}
+    : EvictionPolicy(name), params_(params) {}
 
 LeafAwareLruEvictionPolicy::~LeafAwareLruEvictionPolicy() {
     for (auto &pair : node_map_) {
@@ -39,9 +39,6 @@ void LeafAwareLruEvictionPolicy::OnNodeWritten(std::vector<BlockEntry *> &blocks
 void LeafAwareLruEvictionPolicy::OnBlockAccessed(BlockEntry *block, int64_t timestamp) {
     auto node_it = node_map_.find(block);
     if (node_it != node_map_.end()) {
-        // 更新所有 block 的访问时间（包括非叶子节点的 block）
-        block->last_access_time = timestamp;
-        block->access_count++;
         // 只有在驱逐链表中的 block 才需要移动到头部
         auto it = leaf_blocks_.find(block);
         if (it != leaf_blocks_.end()) {
@@ -104,15 +101,8 @@ std::vector<BlockEntry *> LeafAwareLruEvictionPolicy::EvictBlocks(size_t count) 
             continue;
         }
 
-        // 驱逐 block
         evicted_blocks.push_back(block);
-
-        if (name_ == "shared") {
-            block->location_map.clear();
-        } else {
-            block->location_map.erase(name_);
-        }
-
+        ClearBlockLocation(block);
         leaf_blocks_.erase(block);
         node_map_.erase(block);
         leaf_lru_list_.remove(tail_node);
@@ -159,15 +149,8 @@ bool LeafAwareLruEvictionPolicy::UpdateNodeState(RadixTreeNode *node) {
 }
 
 void LeafAwareLruEvictionPolicy::Clear() {
-    // 清空所有blocks的location信息
     for (auto &[block, node] : node_map_) {
-        if (name_ == "shared") {
-            // 全局驱逐时，清空所有location信息
-            block->location_map.clear();
-        } else {
-            // 分层驱逐时，仅清除当前tier的location信息
-            block->location_map.erase(name_);
-        }
+        ClearBlockLocation(block);
     }
     // 清空LRU链表和映射
     leaf_lru_list_.clear();

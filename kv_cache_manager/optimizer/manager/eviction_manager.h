@@ -1,5 +1,6 @@
 #pragma once
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -11,33 +12,77 @@
 #include "kv_cache_manager/optimizer/config/types.h"
 #include "kv_cache_manager/optimizer/eviction_policy/base.h"
 namespace kv_cache_manager {
+
+struct TieredPolicyGroup {
+    // 驱逐策略列表，按 tier priority 从高到低排序。
+    // - 非分层模式: 仅包含一个 name="shared" 的策略，通过 shared_policy() 访问。
+    // - 分层模式:   每个 tier 各一个策略，通过 policies[tier_idx] 访问。
+    std::vector<std::shared_ptr<EvictionPolicy>> policies;
+    std::vector<OptTierConfig> tier_configs; // 对应的 tier 配置
+
+    size_t tier_count() const { return policies.size(); }
+
+    std::shared_ptr<EvictionPolicy> GetPolicyByIndex(size_t idx) const {
+        return idx < policies.size() ? policies[idx] : nullptr;
+    }
+
+    // 非分层模式下的唯一策略。仅在 policies 包含单个 "shared" 策略时使用。
+    const std::shared_ptr<EvictionPolicy> &shared_policy() const { return policies.front(); }
+};
+
 class OptEvictionManager {
 public:
     OptEvictionManager() = default;
     ~OptEvictionManager() = default;
     bool Init(const EvictionConfig &eviction_config);
 
-    std::shared_ptr<EvictionPolicy> CreateAndRegisterEvictionPolicy(const OptInstanceConfig &instance_config,
-                                                                    const std::vector<OptTierConfig> &storage_configs,
-                                                                    bool hierarchical_eviction_enabled = false);
+    TieredPolicyGroup *CreateAndRegisterEvictionPolicy(const OptInstanceConfig &instance_config,
+                                                       const std::vector<OptTierConfig> &storage_configs,
+                                                       bool hierarchical_eviction_enabled = false);
+
+    // 统一驱逐入口，内部根据 hierarchical_eviction_enabled 处理分层/非分层逻辑
     std::unordered_map<std::string, std::vector<BlockEntry *>>
     EvictByMode(const std::string &instance_id, const OptInstanceGroupConfig &instance_group_config);
 
-    size_t GetCurrentGroupUsage(const OptInstanceGroupConfig &instance_group_config) const;
+    // ---- 用量查询接口 ----
+
+    // 统一超额计算：tier_idx 有值表示分层(对标 storages[tier_idx].capacity)，nullopt 表示非分层(对标 quota_capacity)
+    size_t GetExcessUsage(const OptInstanceGroupConfig &instance_group_config, std::optional<size_t> tier_idx) const;
+
+    // Group 用量：tier_idx 有值表示指定 tier 的用量，nullopt 表示 shared_policy 用量
+    size_t GetCurrentGroupUsage(const OptInstanceGroupConfig &instance_group_config,
+                                std::optional<size_t> tier_idx = std::nullopt) const;
+
+    // Instance 用量：物理存储总占用（累加所有 tier）
     size_t GetCurrentInstanceUsage(const std::string &instance_id) const;
-    size_t GetExcessUsageForInstanceInGroup(const OptInstanceGroupConfig &instance_group_config) const;
+
+    // Instance per-tier 用量明细
+    std::vector<size_t> GetCurrentInstanceUsagePerTier(const std::string &instance_id) const;
 
 private:
+    // 驱逐模式分发：根据 eviction_mode 调用对应的驱逐实现
     std::unordered_map<std::string, std::vector<BlockEntry *>>
-    EvictByGroupRough(const std::string &instance_id, const OptInstanceGroupConfig &instance_group_config);
+    DispatchEviction(const std::string &instance_id,
+                     const OptInstanceGroupConfig &instance_group_config,
+                     std::optional<size_t> tier_idx,
+                     size_t excess);
+
+    // 驱逐核心实现
+    // tier_idx: nullopt 表示非分层模式(使用 shared_policy)，有值表示分层模式(使用 policies[tier_idx])
+    // excess: 需要驱逐的 block 数量
+    std::unordered_map<std::string, std::vector<BlockEntry *>> EvictByGroupRough(
+        const OptInstanceGroupConfig &instance_group_config, std::optional<size_t> tier_idx, size_t excess);
+    // precise=false: 每轮固定 batch size; precise=true: 每轮 cap 到剩余所需数量
     std::unordered_map<std::string, std::vector<BlockEntry *>>
-    EvictByInstanceRough(const std::string &instance_id, const OptInstanceGroupConfig &instance_group_config);
-    std::unordered_map<std::string, std::vector<BlockEntry *>>
-    EvictByInstancePrecise(const std::string &instance_id, const OptInstanceGroupConfig &instance_group_config);
+    EvictByInstance(const std::string &instance_id,
+                    const OptInstanceGroupConfig &instance_group_config,
+                    std::optional<size_t> tier_idx,
+                    size_t excess,
+                    bool precise);
 
 private:
     EvictionConfig eviction_config_;
-    std::unordered_map<std::string, std::shared_ptr<EvictionPolicy>> instance_eviction_policy_map_;
+    std::unordered_map<std::string, TieredPolicyGroup> instance_tiered_policy_map_;
 };
 
 } // namespace kv_cache_manager

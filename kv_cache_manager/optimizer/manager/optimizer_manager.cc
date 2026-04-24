@@ -209,7 +209,7 @@ GetCacheLocationRes OptimizerManager::GetCacheLocation(const std::string &instan
 
     const auto *last_read = hit_rate_tracker_->LastReadRecord(instance_id);
     if (last_read) {
-        res.kvcm_hit_length = last_read->external_hit_blocks;
+        res.kvcm_hit_length = last_read->remote_hit_blocks;
     }
     return res;
 }

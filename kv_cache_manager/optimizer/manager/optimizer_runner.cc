@@ -58,61 +58,70 @@ void OptimizerRunner::RunTrace(std::shared_ptr<OptimizerSchemaTrace> trace) {
     }
 }
 
-ReadRecord OptimizerRunner::BuildReadRecord(const std::string &instance_id, int64_t timestamp_us) {
-    ReadRecord record{};
-    record.timestamp_us = timestamp_us;
-    record.current_cache_blocks = eviction_manager_->GetCurrentInstanceUsage(instance_id);
-
-    auto indexer_map = indexer_manager_->GetAllOptIndexers();
-    record.blocks_per_instance.resize(indexer_map.size(), 0);
-    size_t idx = 0;
-    for (const auto &pair : indexer_map) {
-        record.blocks_per_instance[idx] = eviction_manager_->GetCurrentInstanceUsage(pair.first);
-        idx++;
-    }
-    return record;
-}
-
-void OptimizerRunner::HandleGetLocation(const GetLocationSchemaTrace &trace) {
-    std::string instance_id = trace.instance_id();
+std::shared_ptr<RadixTreeIndex> OptimizerRunner::GetIndexer(const std::string &instance_id) {
     auto indexer = indexer_manager_->GetOptIndexer(instance_id);
     if (!indexer) {
         KVCM_LOG_ERROR("Optimizer indexer not found for instance_id: %s", instance_id.c_str());
-        return;
+    }
+    return indexer;
+}
+
+void OptimizerRunner::SubmitReadRecord(const std::string &instance_id,
+                                       int64_t timestamp_us,
+                                       const QueryHit &query_hit,
+                                       const std::shared_ptr<RadixTreeIndex> &indexer,
+                                       size_t local_read_block_num,
+                                       size_t remote_read_block_num) {
+    ReadRecord record{};
+    record.timestamp_us = timestamp_us;
+    record.current_cache_block_num = eviction_manager_->GetCurrentInstanceUsage(instance_id);
+
+    auto indexer_map = indexer_manager_->GetAllOptIndexers();
+    record.block_num_per_instance.resize(indexer_map.size(), 0);
+    size_t idx = 0;
+    for (const auto &pair : indexer_map) {
+        record.block_num_per_instance[idx] = eviction_manager_->GetCurrentInstanceUsage(pair.first);
+        idx++;
     }
 
-    std::vector<std::vector<int64_t>> external_hits;
-    std::vector<std::vector<int64_t>> internal_hits;
-    indexer->PrefixQuery(trace.keys(), trace.block_mask(), trace.timestamp_us(), external_hits, internal_hits);
-
-    // ---- 构造 ReadRecord 并委托给 StatsCollector ----
-    ReadRecord record = BuildReadRecord(instance_id, trace.timestamp_us());
-    record.trace_id = trace.trace_id();
-    record.keys_ptr = &trace.keys();
-
-    if (std::holds_alternative<BlockMaskVector>(trace.block_mask())) {
-        const auto &mask_vector = std::get<BlockMaskVector>(trace.block_mask());
-        record.internal_read_blocks = std::count(mask_vector.begin(), mask_vector.end(), true);
-    } else if (std::holds_alternative<BlockMaskOffset>(trace.block_mask())) {
-        record.internal_read_blocks = std::get<BlockMaskOffset>(trace.block_mask());
-    }
-    record.external_read_blocks = trace.keys().size() - record.internal_read_blocks;
-
-    for (const auto &hit : external_hits) {
-        record.external_hit_blocks += hit.size();
-    }
-    for (const auto &hit : internal_hits) {
-        record.internal_hit_blocks += hit.size();
-    }
+    record.remote_hit_block_num = query_hit.remote_hit_block_num;
+    record.local_hit_block_num = query_hit.local_hit_block_num;
+    record.per_tier_hit_block_num = query_hit.per_tier_hit_block_num;
+    record.tier_names = indexer->GetTierNames();
+    record.per_tier_block_num = eviction_manager_->GetCurrentInstanceUsagePerTier(instance_id);
+    record.local_read_block_num = local_read_block_num;
+    record.remote_read_block_num = remote_read_block_num;
 
     stats_collector_->OnReadComplete(instance_id, record);
 }
 
+void OptimizerRunner::HandleGetLocation(const GetLocationSchemaTrace &trace) {
+    std::string instance_id = trace.instance_id();
+    auto indexer = GetIndexer(instance_id);
+    if (!indexer) {
+        return;
+    }
+
+    QueryHit query_hit;
+    indexer->PrefixQuery(trace.keys(), trace.block_mask(), trace.timestamp_us(), &query_hit);
+
+    size_t local_read_block_num = 0;
+    if (std::holds_alternative<BlockMaskVector>(trace.block_mask())) {
+        const auto &mask_vector = std::get<BlockMaskVector>(trace.block_mask());
+        local_read_block_num = std::count(mask_vector.begin(), mask_vector.end(), true);
+    } else if (std::holds_alternative<BlockMaskOffset>(trace.block_mask())) {
+        local_read_block_num = std::get<BlockMaskOffset>(trace.block_mask());
+    }
+    size_t remote_read_block_num = trace.keys().size() - local_read_block_num;
+
+    SubmitReadRecord(
+        instance_id, trace.timestamp_us(), query_hit, indexer, local_read_block_num, remote_read_block_num);
+}
+
 void OptimizerRunner::HandleWriteCache(const WriteCacheSchemaTrace &trace) {
     std::string instance_id = trace.instance_id();
-    auto indexer = indexer_manager_->GetOptIndexer(instance_id);
+    auto indexer = GetIndexer(instance_id);
     if (!indexer) {
-        KVCM_LOG_ERROR("Optimizer indexer not found for instance_id: %s", instance_id.c_str());
         return;
     }
 
@@ -124,41 +133,27 @@ void OptimizerRunner::HandleWriteCache(const WriteCacheSchemaTrace &trace) {
 
     WriteRecord record;
     record.timestamp_us = trace.timestamp_us();
-    record.write_blocks = trace.keys().size();
-    record.newly_inserted_blocks = result.inserted_keys.size();
+    record.write_block_num = trace.keys().size();
+    record.newly_inserted_block_num = result.inserted_keys.size();
     record.trace_id = trace.trace_id();
     stats_collector_->OnWriteComplete(instance_id, record);
 }
 
 void OptimizerRunner::HandleDialogTurn(const DialogTurnSchemaTrace &trace) {
     std::string instance_id = trace.instance_id();
-    auto indexer = indexer_manager_->GetOptIndexer(instance_id);
+    auto indexer = GetIndexer(instance_id);
     if (!indexer) {
-        KVCM_LOG_ERROR("Optimizer indexer not found for instance_id: %s", instance_id.c_str());
         return;
     }
 
-    std::vector<std::vector<int64_t>> hits;
-    indexer->InsertWithQuery(trace.total_keys(), trace.timestamp_us(), hits);
+    QueryHit query_hit;
+    indexer->InsertWithQuery(trace.total_keys(), trace.timestamp_us(), &query_hit);
     indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_us());
 
-    // ---- ReadRecord ----
-    ReadRecord read_record = BuildReadRecord(instance_id, trace.timestamp_us());
-    read_record.trace_id = trace.trace_id();
-    read_record.keys_ptr = &trace.keys();
-    read_record.external_read_blocks = trace.keys().size();
-    read_record.internal_read_blocks = 0;
-    for (const auto &hit : hits) {
-        read_record.external_hit_blocks += hit.size();
-    }
-    read_record.internal_hit_blocks = 0;
+    SubmitReadRecord(instance_id, trace.timestamp_us(), query_hit, indexer, 0, trace.keys().size());
 
-    stats_collector_->OnReadComplete(instance_id, read_record);
-
-    // ---- WriteRecord ----
-    // DialogTurn 的写入部分是 decode 新增的 block，全部视为新插入
-    size_t decode_blocks = trace.total_keys().size() - trace.keys().size();
-    WriteRecord write_record{trace.timestamp_us(), decode_blocks, decode_blocks};
+    size_t decode_block_num = trace.total_keys().size() - trace.keys().size();
+    WriteRecord write_record{trace.timestamp_us(), decode_block_num, decode_block_num};
     stats_collector_->OnWriteComplete(instance_id, write_record);
 }
 } // namespace kv_cache_manager

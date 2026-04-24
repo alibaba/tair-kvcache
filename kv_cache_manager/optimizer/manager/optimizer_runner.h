@@ -26,7 +26,13 @@ public:
     void HandleDialogTurn(const DialogTurnSchemaTrace &trace);
 
 private:
-    ReadRecord BuildReadRecord(const std::string &instance_id, int64_t timestamp_us);
+    std::shared_ptr<RadixTreeIndex> GetIndexer(const std::string &instance_id);
+    void SubmitReadRecord(const std::string &instance_id,
+                          int64_t timestamp_us,
+                          const QueryHit &query_hit,
+                          const std::shared_ptr<RadixTreeIndex> &indexer,
+                          size_t local_read_blocks,
+                          size_t remote_read_blocks);
 
     std::shared_ptr<OptIndexerManager> indexer_manager_;
     std::shared_ptr<OptEvictionManager> eviction_manager_;

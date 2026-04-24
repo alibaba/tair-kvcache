@@ -18,6 +18,9 @@ class StatsCollector;
 void AppendBlockLocation(BlockEntry *block, const std::string &unique_name, int64_t timestamp);
 class RadixTreeIndex {
 public:
+    // 新构造函数 (多 tier)
+    RadixTreeIndex(const std::string &instance_id, std::vector<std::shared_ptr<EvictionPolicy>> tier_policies);
+    // 兼容构造函数 (单 policy)
     RadixTreeIndex(const std::string &instance_id, const std::shared_ptr<EvictionPolicy> &eviction_policy);
     RadixTreeIndex();
     ~RadixTreeIndex() = default;
@@ -30,18 +33,18 @@ public:
     void PrefixQuery(const std::vector<int64_t> &block_keys,
                      const BlockMask &block_mask,
                      const int64_t timestamp,
-                     std::vector<std::vector<int64_t>> &external_hits,
-                     std::vector<std::vector<int64_t>> &internal_hits);
+                     QueryHit *query_hit = nullptr);
 
-    std::vector<int64_t> InsertWithQuery(const std::vector<int64_t> &block_keys,
-                                         const int64_t timestamp,
-                                         std::vector<std::vector<int64_t>> &hits);
+    std::vector<int64_t>
+    InsertWithQuery(const std::vector<int64_t> &block_keys, const int64_t timestamp, QueryHit *query_hit = nullptr);
     void CleanEmptyBlocks(const std::vector<BlockEntry *> &blocks, int64_t eviction_timestamp);
 
     // 清空整个RadixTree的缓存
     void Clear();
 
     void SetStatsCollector(std::shared_ptr<StatsCollector> collector) { stats_collector_ = collector; }
+
+    const std::vector<std::string> &GetTierNames() const { return tier_names_; }
 
     // 导出前缀树用于可视化
     struct RadixTreeExportNode {
@@ -66,7 +69,8 @@ public:
 
 private:
     std::unique_ptr<RadixTreeNode> root_;
-    std::shared_ptr<EvictionPolicy> eviction_policy_;
+    std::vector<std::shared_ptr<EvictionPolicy>> tier_policies_; // 按 tier priority 排序
+    std::vector<std::string> tier_names_;                        // 缓存 policy name
     std::string instance_id_;
     std::shared_ptr<StatsCollector> stats_collector_;
 
@@ -83,7 +87,7 @@ private:
                                      const std::vector<int64_t> &block_keys,
                                      const int64_t timestamp,
                                      bool is_prefix_hit,
-                                     std::vector<std::vector<int64_t>> &hits);
+                                     QueryHit *query_hit = nullptr);
 
     using WriteModify = std::function<std::vector<BlockEntry *>(const std::vector<int64_t> &, int64_t)>;
     WriteModify AppendEvictBlocks(std::unordered_map<int64_t, BlockEntry *> blocks_map);
@@ -93,5 +97,8 @@ private:
 
     void OnBlockAccessed(BlockEntry *block, int64_t timestamp);
     bool IsBlockEvict(BlockEntry *block) const;
+
+    // per-tier 命中检测辅助方法
+    void RecordTieredHit(BlockEntry *block, bool is_remote, QueryHit *query_hit) const;
 };
 } // namespace kv_cache_manager

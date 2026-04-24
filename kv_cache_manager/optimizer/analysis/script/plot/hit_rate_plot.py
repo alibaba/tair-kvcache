@@ -13,6 +13,7 @@
 
 import glob
 import os
+import re
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -88,7 +89,7 @@ def plot_multi_instance_analysis(csv_dir, output_dir: str = None):
 
         # 数值化 + 排序
         for c in ['TimestampUs', 'CachedBlocksAllInstance',
-                  'AccHitRate', 'AccExternalHitRate', 'AccReadBlocks']:
+                  'AccHitRate', 'AccRemoteHitRate', 'AccReadBlocks']:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors='coerce')
         df = df.dropna(subset=['TimestampUs']).sort_values('TimestampUs')
@@ -101,7 +102,7 @@ def plot_multi_instance_analysis(csv_dir, output_dir: str = None):
         print("Error: No valid CSV data could be loaded")
         return
 
-    required_cols = ['TimestampUs', 'CachedBlocksAllInstance', 'AccHitRate', 'AccExternalHitRate', 'AccReadBlocks']
+    required_cols = ['TimestampUs', 'CachedBlocksAllInstance', 'AccHitRate', 'AccRemoteHitRate', 'AccReadBlocks']
     for i, df in enumerate(dataframes):
         missing = [c for c in required_cols if c not in df.columns]
         if missing:
@@ -118,9 +119,12 @@ def plot_multi_instance_analysis(csv_dir, output_dir: str = None):
     base_timestamps = np.unique(np.concatenate(all_t))
     base = pd.DataFrame({'t': base_timestamps})  # 用于merge_asof
 
-    all_acc_hit, all_acc_external_hit, all_time_ranges = [], [], []
-    all_acc_read_blocks, all_acc_hit_blocks, all_acc_ext_hit_blocks = [], [], []
     all_acc_sp_hit = []
+    all_acc_hit, all_acc_remote_hit, all_time_ranges = [], [], []
+    # 用于瞬时命中率计算：累积读块数 / 累积命中块数（反推）
+    all_acc_read_blocks, all_acc_hit_blocks, all_acc_remote_hit_blocks = [], [], []
+    all_acc_sp_hit = []
+
     global_updates_list = []
     for df in dataframes:
         d = df.copy()
@@ -128,8 +132,8 @@ def plot_multi_instance_analysis(csv_dir, output_dir: str = None):
         d = d.sort_values('t')
 
         # 反推累积命中块数：AccHitBlocks = AccHitRate × AccReadBlocks
-        d['AccHitBlocks']    = d['AccHitRate']         * d['AccReadBlocks']
-        d['AccExtHitBlocks'] = d['AccExternalHitRate'] * d['AccReadBlocks']
+        d['AccHitBlocks']       = d['AccHitRate']       * d['AccReadBlocks']
+        d['AccRemoteHitBlocks'] = d['AccRemoteHitRate'] * d['AccReadBlocks']
 
         global_updates_list.append(d[['t', 'CachedBlocksAllInstance']])
         t0, t1 = d['t'].iloc[0], d['t'].iloc[-1]
@@ -138,23 +142,23 @@ def plot_multi_instance_analysis(csv_dir, output_dir: str = None):
         # 真实对齐：取 <=t 的最后一次上报（ZOH），不插值
         aligned = pd.merge_asof(
             base,
-            d[['t', 'AccHitRate', 'AccExternalHitRate',
-               'AccReadBlocks', 'AccHitBlocks', 'AccExtHitBlocks']],
+            d[['t', 'AccHitRate', 'AccRemoteHitRate',
+               'AccReadBlocks', 'AccHitBlocks', 'AccRemoteHitBlocks']],
             on='t',
             direction='backward',
             allow_exact_matches=True
         )
 
         mask_out = (aligned['t'] < t0)
-        acc_cols = ['AccHitRate', 'AccExternalHitRate',
-                    'AccReadBlocks', 'AccHitBlocks', 'AccExtHitBlocks']
+        acc_cols = ['AccHitRate', 'AccRemoteHitRate',
+                    'AccReadBlocks', 'AccHitBlocks', 'AccRemoteHitBlocks']
         aligned.loc[mask_out, acc_cols] = np.nan
 
         all_acc_hit.append(aligned['AccHitRate'].to_numpy(float))
-        all_acc_external_hit.append(aligned['AccExternalHitRate'].to_numpy(float))
+        all_acc_remote_hit.append(aligned['AccRemoteHitRate'].to_numpy(float))
         all_acc_read_blocks.append(aligned['AccReadBlocks'].to_numpy(float))
         all_acc_hit_blocks.append(aligned['AccHitBlocks'].to_numpy(float))
-        all_acc_ext_hit_blocks.append(aligned['AccExtHitBlocks'].to_numpy(float))
+        all_acc_remote_hit_blocks.append(aligned['AccRemoteHitBlocks'].to_numpy(float))
 
     # ---- SP 累积命中率对齐 ----
     for idx, name in enumerate(instance_names):
@@ -299,7 +303,7 @@ def plot_multi_instance_analysis(csv_dir, output_dir: str = None):
         l1 = ax_top_r.plot(base_timestamps[valid], np.array(all_acc_hit[i])[valid],
                         color=colors[i], label=f'{name} - AccHitRate',
                         linewidth=2, alpha=0.85, drawstyle='steps-post')
-        ax_top_r.plot(base_timestamps[valid], np.array(all_acc_external_hit[i])[valid],
+        ax_top_r.plot(base_timestamps[valid], np.array(all_acc_remote_hit[i])[valid],
                     color=colors[i], linestyle='--', alpha=0.6,
                     linewidth=1.5, drawstyle='steps-post')
         top_lines += l1
@@ -327,9 +331,9 @@ def plot_multi_instance_analysis(csv_dir, output_dir: str = None):
             all_acc_read_blocks[i],
             window_seconds,
         )
-        ext_sm = window_hit_rate(
+        remote_sm = window_hit_rate(
             base_timestamps,
-            all_acc_ext_hit_blocks[i],
+            all_acc_remote_hit_blocks[i],
             all_acc_read_blocks[i],
             window_seconds,
         )
@@ -351,7 +355,7 @@ def plot_multi_instance_analysis(csv_dir, output_dir: str = None):
                         color=colors[i], label=f'{name} - HitRate',
                         linewidth=2, alpha=0.85)
 
-        ax_bot_r.plot(base_timestamps[idx], ext_sm[idx],
+        ax_bot_r.plot(base_timestamps[idx], remote_sm[idx],
                     color=colors[i], linestyle='--', alpha=0.6,
                     linewidth=1.5)
         bot_lines += l2
@@ -373,3 +377,127 @@ def plot_multi_instance_analysis(csv_dir, output_dir: str = None):
     print(f"Chart saved to: {output_file}")
     plt.close()
 
+
+# ============================================================================
+# Per-Tier 时序图
+# ============================================================================
+
+def plot_per_tier_timeseries(csv_dir, output_dir: str = None):
+    """
+    读取 csv_dir 下的命中率 CSV，生成 per-tier 命中率时序图。
+    
+    所有 tier 的命中率放在一张图上，方便对比各层随时间的变化。
+    
+    Args:
+        csv_dir:    CSV 数据目录
+        output_dir: 图表根输出目录，图表保存至 output_dir/timeseries/
+    """
+    csv_files = sorted(glob.glob(os.path.join(csv_dir, "*_hit_rates.csv")))
+    if not csv_files:
+        print(f"No hit_rates CSV files found in {csv_dir}")
+        return
+    
+    # 读取所有 instance 的数据
+    dataframes = []
+    instance_names = []
+    
+    for csv_file in csv_files:
+        df = read_csv_file(csv_file)
+        if df is None:
+            continue
+        
+        # 检查是否有 per-tier 数据
+        tier_cols = [col for col in df.columns if col.startswith("AccTier") and col.endswith("_HitRate")]
+        if not tier_cols:
+            continue
+        
+        # 数值化 + 排序
+        for c in ['TimestampUs'] + tier_cols:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors='coerce')
+        df = df.dropna(subset=['TimestampUs']).sort_values('TimestampUs')
+        
+        dataframes.append(df)
+        instance_names.append(os.path.splitext(os.path.basename(csv_file))[0].replace("_hit_rates", ""))
+    
+    if not dataframes:
+        print("No valid CSV data with per-tier information could be loaded")
+        return
+    
+    # 提取 tier 名称
+    tier_names = []
+    for col in dataframes[0].columns:
+        if col.startswith("AccTier") and col.endswith("_HitRate"):
+            match = re.search(r'AccTier\d+\(([^)]+)\)_HitRate', col)
+            if match:
+                tier_names.append(match.group(1))
+    
+    if not tier_names:
+        print("No per-tier data found in CSV files")
+        return
+    
+    # 统一时间轴
+    all_timestamps = set()
+    for df in dataframes:
+        all_timestamps.update(df['TimestampUs'].values)
+    all_timestamps = sorted(all_timestamps)
+    min_timestamp = min(all_timestamps)
+    base_timestamps = np.array([(t - min_timestamp) / 1e6 for t in all_timestamps])
+    
+    # 颜色配置
+    COLORS = [
+        "tab:blue", "tab:orange", "tab:green", "tab:red", "tab:purple",
+        "tab:brown", "tab:pink", "tab:gray", "tab:olive", "tab:cyan",
+    ]
+    
+    # 创建图表
+    fig, ax = plt.subplots(figsize=(16, 8))
+    
+    # 为每个 tier 绘制时序曲线
+    for tier_idx, tier_name in enumerate(tier_names):
+        tier_col = f"AccTier{tier_idx}({tier_name})_HitRate"
+        
+        # 聚合所有 instance 的数据（取平均）
+        all_tier_rates = []
+        for df in dataframes:
+            if tier_col in df.columns:
+                # 对齐到统一时间轴
+                df_aligned = pd.DataFrame({'t': base_timestamps})
+                df['t'] = (df['TimestampUs'] - min_timestamp) / 1e6
+                df_aligned = pd.merge_asof(
+                    df_aligned,
+                    df[['t', tier_col]],
+                    on='t',
+                    direction='backward',
+                    allow_exact_matches=True
+                )
+                all_tier_rates.append(df_aligned[tier_col].values)
+        
+        if not all_tier_rates:
+            continue
+        
+        # 计算平均值
+        avg_rates = np.nanmean(all_tier_rates, axis=0)
+        
+        # 绘制曲线
+        ax.plot(base_timestamps, avg_rates,
+               color=COLORS[tier_idx % len(COLORS)],
+               linewidth=2.5,
+               label=f"{tier_name}",
+               alpha=0.9)
+    
+    ax.set_xlabel('Time (seconds)', fontsize=12)
+    ax.set_ylabel('Accumulative Hit Rate', fontsize=12)
+    ax.set_title(f'Per-Tier Hit Rate Over Time - {len(instance_names)} Instances', 
+                fontsize=14, fontweight='bold')
+    ax.legend(loc='lower right', fontsize=11, framealpha=0.95)
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(0, 1.05)
+    
+    fig.tight_layout()
+    timeseries_dir = os.path.join(output_dir or csv_dir, "timeseries")
+    os.makedirs(timeseries_dir, exist_ok=True)
+    output_file = os.path.join(timeseries_dir, "per_tier_timeseries.png")
+    plt.savefig(output_file, dpi=300, bbox_inches='tight', facecolor='white')
+    print(f"Per-tier timeseries chart saved to: {output_file}")
+    plt.close()

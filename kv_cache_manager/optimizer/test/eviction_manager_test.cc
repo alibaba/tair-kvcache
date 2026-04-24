@@ -93,9 +93,10 @@ TEST_F(OptEvictionManagerTest, CreateAndRegisterEvictionPolicy) {
     auto tier_configs = CreateTestTierConfigs();
 
     // 启用分层驱逐,这样策略名称是tier1
-    auto policy = manager_->CreateAndRegisterEvictionPolicy(instance_config, tier_configs, true);
-    EXPECT_NE(policy, nullptr);
-    EXPECT_EQ(policy->name(), "tier1");
+    auto *policy_group = manager_->CreateAndRegisterEvictionPolicy(instance_config, tier_configs, true);
+    EXPECT_NE(policy_group, nullptr);
+    EXPECT_GE(policy_group->tier_count(), 1);
+    EXPECT_EQ(policy_group->GetPolicyByIndex(0)->name(), "tier1");
 }
 
 TEST_F(OptEvictionManagerTest, CreateMultipleEvictionPolicies) {
@@ -104,23 +105,23 @@ TEST_F(OptEvictionManagerTest, CreateMultipleEvictionPolicies) {
     auto tier_configs = CreateTestTierConfigs();
 
     // 启用分层驱逐
-    auto policy1 = manager_->CreateAndRegisterEvictionPolicy(instance_config1, tier_configs, true);
-    auto policy2 = manager_->CreateAndRegisterEvictionPolicy(instance_config2, tier_configs, true);
+    auto *pg1 = manager_->CreateAndRegisterEvictionPolicy(instance_config1, tier_configs, true);
+    auto *pg2 = manager_->CreateAndRegisterEvictionPolicy(instance_config2, tier_configs, true);
 
-    EXPECT_NE(policy1, nullptr);
-    EXPECT_NE(policy2, nullptr);
-    EXPECT_EQ(policy1->name(), "tier1");
-    EXPECT_EQ(policy2->name(), "tier1");
+    EXPECT_NE(pg1, nullptr);
+    EXPECT_NE(pg2, nullptr);
+    EXPECT_EQ(pg1->GetPolicyByIndex(0)->name(), "tier1");
+    EXPECT_EQ(pg2->GetPolicyByIndex(0)->name(), "tier1");
 }
 
-TEST_F(OptEvictionManagerTest, EvictByInstancePrecise) {
+TEST_F(OptEvictionManagerTest, EvictByInstancePreciseMode) {
     auto instance_config = CreateTestInstanceConfig("instance1");
     auto tier_configs = CreateTestTierConfigs();
     auto instance_group_config = CreateTestInstanceGroupConfig();
 
     // 启用分层驱逐
-    auto policy = manager_->CreateAndRegisterEvictionPolicy(instance_config, tier_configs, true);
-    ASSERT_NE(policy, nullptr);
+    auto *pg = manager_->CreateAndRegisterEvictionPolicy(instance_config, tier_configs, true);
+    ASSERT_NE(pg, nullptr);
 
     // 驱逐测试
     auto evicted = manager_->EvictByMode("instance1", instance_group_config);
@@ -128,7 +129,7 @@ TEST_F(OptEvictionManagerTest, EvictByInstancePrecise) {
     SUCCEED();
 }
 
-TEST_F(OptEvictionManagerTest, EvictByInstanceRough) {
+TEST_F(OptEvictionManagerTest, EvictByInstanceRoughMode) {
     auto manager = std::make_shared<OptEvictionManager>();
     EvictionConfig eviction_config;
     eviction_config.set_eviction_batch_size_per_instance(10);
@@ -140,8 +141,8 @@ TEST_F(OptEvictionManagerTest, EvictByInstanceRough) {
     auto instance_group_config = CreateTestInstanceGroupConfig();
 
     // 启用分层驱逐
-    auto policy = manager->CreateAndRegisterEvictionPolicy(instance_config, tier_configs, true);
-    ASSERT_NE(policy, nullptr);
+    auto *pg = manager->CreateAndRegisterEvictionPolicy(instance_config, tier_configs, true);
+    ASSERT_NE(pg, nullptr);
 
     // 驱逐测试
     auto evicted = manager->EvictByMode("instance1", instance_group_config);
@@ -161,8 +162,8 @@ TEST_F(OptEvictionManagerTest, EvictByGroupRough) {
     auto instance_group_config = CreateTestInstanceGroupConfig();
 
     // 启用分层驱逐
-    auto policy = manager->CreateAndRegisterEvictionPolicy(instance_config, tier_configs, true);
-    ASSERT_NE(policy, nullptr);
+    auto *pg = manager->CreateAndRegisterEvictionPolicy(instance_config, tier_configs, true);
+    ASSERT_NE(pg, nullptr);
 
     // 驱逐测试
     auto evicted = manager->EvictByMode("instance1", instance_group_config);
@@ -175,20 +176,21 @@ TEST_F(OptEvictionManagerTest, GetCurrentInstanceUsage) {
     auto tier_configs = CreateTestTierConfigs();
 
     // 启用分层驱逐
-    auto policy = manager_->CreateAndRegisterEvictionPolicy(instance_config, tier_configs, true);
-    ASSERT_NE(policy, nullptr);
+    auto *pg = manager_->CreateAndRegisterEvictionPolicy(instance_config, tier_configs, true);
+    ASSERT_NE(pg, nullptr);
 
     // 初始使用量为0
     auto usage = manager_->GetCurrentInstanceUsage("instance1");
     EXPECT_EQ(usage, 0);
 
     // 添加一些块
+    auto front_policy = pg->GetPolicyByIndex(0);
     for (int i = 0; i < 5; i++) {
         BlockEntry block;
         block.key = i;
         block.last_access_time = i * 100;
         block.writing_time = i * 100;
-        policy->OnBlockWritten(&block);
+        front_policy->OnBlockWritten(&block);
     }
 
     // 使用量应该增加
@@ -203,31 +205,33 @@ TEST_F(OptEvictionManagerTest, GetCurrentGroupUsage) {
     auto instance_group_config = CreateTestInstanceGroupConfig();
 
     // 启用分层驱逐
-    auto policy1 = manager_->CreateAndRegisterEvictionPolicy(instance_config1, tier_configs, true);
-    auto policy2 = manager_->CreateAndRegisterEvictionPolicy(instance_config2, tier_configs, true);
-    ASSERT_NE(policy1, nullptr);
-    ASSERT_NE(policy2, nullptr);
+    auto *pg1 = manager_->CreateAndRegisterEvictionPolicy(instance_config1, tier_configs, true);
+    auto *pg2 = manager_->CreateAndRegisterEvictionPolicy(instance_config2, tier_configs, true);
+    ASSERT_NE(pg1, nullptr);
+    ASSERT_NE(pg2, nullptr);
 
     // 初始使用量为0
     auto usage = manager_->GetCurrentGroupUsage(instance_group_config);
     EXPECT_EQ(usage, 0);
 
     // 给instance1添加块
+    auto p1 = pg1->GetPolicyByIndex(0);
     for (int i = 0; i < 3; i++) {
         BlockEntry block;
         block.key = i;
         block.last_access_time = i * 100;
         block.writing_time = i * 100;
-        policy1->OnBlockWritten(&block);
+        p1->OnBlockWritten(&block);
     }
 
     // 给instance2添加块
+    auto p2 = pg2->GetPolicyByIndex(0);
     for (int i = 0; i < 2; i++) {
         BlockEntry block;
         block.key = i + 10;
         block.last_access_time = i * 100;
         block.writing_time = i * 100;
-        policy2->OnBlockWritten(&block);
+        p2->OnBlockWritten(&block);
     }
 
     // 组使用量应该等于两个实例使用量之和
@@ -235,30 +239,60 @@ TEST_F(OptEvictionManagerTest, GetCurrentGroupUsage) {
     EXPECT_GT(usage, 0);
 }
 
-TEST_F(OptEvictionManagerTest, GetExcessUsageForInstanceInGroup) {
+TEST_F(OptEvictionManagerTest, GetExcessUsageNonTiered) {
     auto instance_config = CreateTestInstanceConfig("instance1");
     auto tier_configs = CreateTestTierConfigs();
     auto instance_group_config = CreateTestInstanceGroupConfig();
 
-    // 启用分层驱逐
-    auto policy = manager_->CreateAndRegisterEvictionPolicy(instance_config, tier_configs, true);
-    ASSERT_NE(policy, nullptr);
+    // 非分层模式
+    auto *pg = manager_->CreateAndRegisterEvictionPolicy(instance_config, tier_configs, false);
+    ASSERT_NE(pg, nullptr);
 
     // 初始没有超额使用
-    auto excess = manager_->GetExcessUsageForInstanceInGroup(instance_group_config);
+    auto excess = manager_->GetExcessUsage(instance_group_config, std::nullopt);
     EXPECT_EQ(excess, 0);
 
     // 添加大量块,超过容量
+    auto front_policy = pg->GetPolicyByIndex(0);
     for (int i = 0; i < 100; i++) {
         BlockEntry block;
         block.key = i;
         block.last_access_time = i * 100;
         block.writing_time = i * 100;
-        policy->OnBlockWritten(&block);
+        front_policy->OnBlockWritten(&block);
     }
 
     // 应该有超额使用
-    excess = manager_->GetExcessUsageForInstanceInGroup(instance_group_config);
+    excess = manager_->GetExcessUsage(instance_group_config, std::nullopt);
+    EXPECT_GT(excess, 0);
+}
+
+TEST_F(OptEvictionManagerTest, GetExcessUsageTiered) {
+    auto instance_config = CreateTestInstanceConfig("instance1");
+    auto tier_configs = CreateTestTierConfigs();
+    auto instance_group_config = CreateTestInstanceGroupConfig();
+    instance_group_config.set_hierarchical_eviction_enabled(true);
+
+    // 分层模式
+    auto *pg = manager_->CreateAndRegisterEvictionPolicy(instance_config, tier_configs, true);
+    ASSERT_NE(pg, nullptr);
+
+    // 初始 tier0 没有超额
+    auto excess = manager_->GetExcessUsage(instance_group_config, size_t(0));
+    EXPECT_EQ(excess, 0);
+
+    // 添加块到 tier0 policy
+    auto front_policy = pg->GetPolicyByIndex(0);
+    for (int i = 0; i < 100; i++) {
+        BlockEntry block;
+        block.key = i;
+        block.last_access_time = i * 100;
+        block.writing_time = i * 100;
+        front_policy->OnBlockWritten(&block);
+    }
+
+    // tier0 应该有超额使用
+    excess = manager_->GetExcessUsage(instance_group_config, size_t(0));
     EXPECT_GT(excess, 0);
 }
 

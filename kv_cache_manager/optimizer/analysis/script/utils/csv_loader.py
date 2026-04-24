@@ -10,6 +10,7 @@ CSV 数据加载层
 """
 
 import os
+import re
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -41,20 +42,50 @@ def parse_instance_metrics(csv_file: str) -> Optional[dict]:
     从单个 instance CSV 解析累计指标（取最后一行）。
 
     Returns:
-        {"acc_total_hit_rate", "acc_internal_hit_rate",
-         "acc_external_hit_rate", "cached_blocks_all"}
+        {"acc_total_hit_rate", "acc_local_hit_rate",
+         "acc_remote_hit_rate", "cached_block_num_all",
+         "tier_names": [...], "acc_tier_hit_rates": {...}, "tier_block_nums": {...}}
         或 None（文件为空时）
     """
     df = pd.read_csv(csv_file)
     if df.empty:
         return None
     last = df.iloc[-1]
-    return {
+    
+    result = {
         "acc_total_hit_rate": float(last["AccHitRate"]),
-        "acc_internal_hit_rate": float(last["AccInternalHitRate"]),
-        "acc_external_hit_rate": float(last["AccExternalHitRate"]),
-        "cached_blocks_all": int(last["CachedBlocksAllInstance"]),
+        "acc_local_hit_rate": float(last["AccLocalHitRate"]),
+        "acc_remote_hit_rate": float(last["AccRemoteHitRate"]),
+        "cached_block_num_all": int(last["CachedBlockNumAllInstance"]),
     }
+    
+    # 解析 per-tier 数据
+    tier_names = []
+    acc_tier_hit_rates = {}
+    tier_block_nums = {}
+    
+    # 从列名中提取 tier 信息
+    for col in df.columns:
+        if col.startswith("AccTier") and col.endswith("_HitRate"):
+            # 提取 tier 名称: AccTier0(GPU)_HitRate -> GPU
+            match = re.search(r'AccTier\d+\(([^)]+)\)_HitRate', col)
+            if match:
+                tier_name = match.group(1)
+                tier_names.append(tier_name)
+                acc_tier_hit_rates[tier_name] = float(last[col])
+        elif col.startswith("Tier") and col.endswith("_BlockNum"):
+            # 提取 tier 名称: Tier0(GPU)_BlockNum -> GPU
+            match = re.search(r'Tier\d+\(([^)]+)\)_BlockNum', col)
+            if match:
+                tier_name = match.group(1)
+                tier_block_nums[tier_name] = int(last[col])
+    
+    if tier_names:
+        result["tier_names"] = tier_names
+        result["acc_tier_hit_rates"] = acc_tier_hit_rates
+        result["tier_block_nums"] = tier_block_nums
+    
+    return result
 
 
 def _read_hit_rates_from_csv(csv_path: str) -> Optional[dict]:
@@ -62,7 +93,7 @@ def _read_hit_rates_from_csv(csv_path: str) -> Optional[dict]:
     读取单个 hit_rates CSV，兼容 Acc* 和非 Acc* 列名。
 
     Returns:
-        {"total", "internal", "external", "cached_blocks_all"}
+        {"total", "local", "remote", "cached_block_num_all"}
         或 None
     """
     try:
@@ -78,12 +109,12 @@ def _read_hit_rates_from_csv(csv_path: str) -> Optional[dict]:
                 return float(last[col_fallback])
             return 0.0
 
-        cached = int(last["CachedBlocksAllInstance"]) if "CachedBlocksAllInstance" in df.columns else 0
+        cached = int(last["CachedBlockNumAllInstance"]) if "CachedBlockNumAllInstance" in df.columns else 0
         return {
             "total": _get("AccHitRate", "HitRate"),
-            "internal": _get("AccInternalHitRate", "InternalHitRate"),
-            "external": _get("AccExternalHitRate", "ExternalHitRate"),
-            "cached_blocks_all": cached,
+            "local": _get("AccLocalHitRate", "LocalHitRate"),
+            "remote": _get("AccRemoteHitRate", "RemoteHitRate"),
+            "cached_block_num_all": cached,
         }
     except Exception as e:
         print(f"  Warning: Failed to read {csv_path}: {e}")

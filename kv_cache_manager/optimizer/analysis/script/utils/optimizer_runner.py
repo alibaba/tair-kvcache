@@ -139,11 +139,11 @@ def warmup_pass(
 
         first_csv = next(iter(csv_map.values()))
         df = pd.read_csv(first_csv)
-        max_blocks = int(df["CachedBlocksAllInstance"].max())
+        max_blocks = int(df["CachedBlockNumAllInstance"].max())
 
-        acc_read = int(df["AccReadBlocks"].iloc[-1]) if "AccReadBlocks" in df.columns else 0
-        acc_write = int(df["AccWriteBlocks"].iloc[-1]) if "AccWriteBlocks" in df.columns else 0
-        print(f"Warmup done. Max cached: {max_blocks}, AccReadBlocks: {acc_read}, AccWriteBlocks: {acc_write}")
+        acc_read = int(df["AccReadBlockNum"].iloc[-1]) if "AccReadBlockNum" in df.columns else 0
+        acc_write = int(df["AccWriteBlockNum"].iloc[-1]) if "AccWriteBlockNum" in df.columns else 0
+        print(f"Warmup done. Max cached: {max_blocks}, AccReadBlockNum: {acc_read}, AccWriteBlockNum: {acc_write}")
 
         return max_blocks
     finally:
@@ -174,8 +174,8 @@ def run_single_experiment(
         {
             "policy": str,
             "capacity": int,
-            "instances": {instance_id: {"total": float, "internal": float,
-                                        "external": float, "cached_blocks_all": int}},
+            "instances": {instance_id: {"total": float, "local": float,
+                                        "remote": float, "cached_block_num_all": int}},
             "success": bool,
             "error": str | None,
         }
@@ -209,9 +209,9 @@ def run_single_experiment(
                 continue
             instance_metrics[iid] = {
                 "total": metrics["acc_total_hit_rate"],
-                "internal": metrics["acc_internal_hit_rate"],
-                "external": metrics["acc_external_hit_rate"],
-                "cached_blocks_all": metrics["cached_blocks_all"],
+                "local": metrics["acc_local_hit_rate"],
+                "remote": metrics["acc_remote_hit_rate"],
+                "cached_block_num_all": metrics["cached_block_num_all"],
             }
 
         result["instances"] = instance_metrics

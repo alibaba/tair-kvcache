@@ -10,7 +10,6 @@ namespace kv_cache_manager {
 
 class LeafAwareLruEvictionPolicy : public EvictionPolicy {
 private:
-    std::string name_;
     LruParams params_;
     struct LeafLRUListNode : public LinkedListNode {
         BlockEntry *payload_;
@@ -27,11 +26,7 @@ private:
 
 public:
     explicit LeafAwareLruEvictionPolicy(const std::string &name, const LruParams &params);
-
     ~LeafAwareLruEvictionPolicy() override;
-
-    std::string name() const override { return name_; }
-    void set_name(const std::string &name) override { name_ = name; }
     void OnBlockWritten(BlockEntry *block) override;
     void OnNodeWritten(std::vector<BlockEntry *> &blocks) override;
     void OnBlockAccessed(BlockEntry *block, int64_t timestamp) override;

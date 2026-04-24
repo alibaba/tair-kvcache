@@ -10,12 +10,26 @@
 #include "kv_cache_manager/optimizer/analysis/stats_collector.h"
 
 namespace kv_cache_manager {
+
+// 新构造函数 (多 tier)
+RadixTreeIndex::RadixTreeIndex(const std::string &instance_id,
+                               std::vector<std::shared_ptr<EvictionPolicy>> tier_policies) {
+    root_ = std::make_unique<RadixTreeNode>();
+    tier_policies_ = std::move(tier_policies);
+    for (auto &p : tier_policies_) {
+        tier_names_.push_back(p->name());
+    }
+    instance_id_ = instance_id;
+}
+
+// 兼容构造函数 (单 policy)
 RadixTreeIndex::RadixTreeIndex(const std::string &instance_id, const std::shared_ptr<EvictionPolicy> &eviction_policy) {
     root_ = std::make_unique<RadixTreeNode>();
-
-    eviction_policy_ = eviction_policy;
-    instance_id_ = instance_id; // 设置实例ID
+    tier_policies_.push_back(eviction_policy);
+    tier_names_.push_back(eviction_policy->name());
+    instance_id_ = instance_id;
 }
+
 // TODO 后续改为 记录需要更新信息的node和blockentry，然后统一用一个接口更新
 // 这样可以做到反向更新lru链表，避免同一时间戳下先驱逐前缀
 RadixTreeIndex::InsertResult RadixTreeIndex::InsertOnly(const std::vector<int64_t> &block_keys,
@@ -129,8 +143,7 @@ void RadixTreeIndex::SplitNode(RadixTreeNode *existing_node,
 void RadixTreeIndex::PrefixQuery(const std::vector<int64_t> &block_keys,
                                  const BlockMask &block_mask,
                                  const int64_t timestamp,
-                                 std::vector<std::vector<int64_t>> &external_hits,
-                                 std::vector<std::vector<int64_t>> &internal_hits) {
+                                 QueryHit *query_hit) {
     if (block_keys.empty()) {
         return;
     }
@@ -155,8 +168,8 @@ void RadixTreeIndex::PrefixQuery(const std::vector<int64_t> &block_keys,
         }
         RadixTreeNode *child = child_it->second.get();
         size_t match_len = 0;
-        std::vector<int64_t> temp_hits;
-        std::vector<int64_t> temp_internal_hits;
+        bool has_remote_hit = false;
+        bool has_local_hit = false;
         while (match_len < child->blocks.size() && (key_idx + match_len) < block_keys.size() &&
                child->blocks[match_len]->key == block_keys[key_idx + match_len]) {
             if (IsBlockEvict(child->blocks[match_len].get())) {
@@ -164,24 +177,21 @@ void RadixTreeIndex::PrefixQuery(const std::vector<int64_t> &block_keys,
             }
             BlockEntry *blk = child->blocks[match_len].get();
             if (query_keys.count(block_keys[key_idx + match_len])) {
-                temp_hits.push_back(block_keys[key_idx + match_len]);
-                // 访问block，更新存在的tier的访问信息
+                has_remote_hit = true;
+                RecordTieredHit(blk, true, query_hit);
                 OnBlockAccessed(blk, timestamp);
             } else if (mask_keys.count(block_keys[key_idx + match_len])) {
-                temp_internal_hits.push_back(block_keys[key_idx + match_len]);
+                has_local_hit = true;
+                RecordTieredHit(blk, false, query_hit);
                 OnBlockAccessed(blk, timestamp);
             }
             match_len++;
         }
-        if (!temp_hits.empty()) {
-            external_hits.emplace_back(std::move(temp_hits));
+        if (has_remote_hit) {
             child->stat.last_access_time = timestamp;
             child->stat.access_count += 1;
         }
-        if (!temp_internal_hits.empty()) {
-            internal_hits.emplace_back(std::move(temp_internal_hits));
-            // 为了保证高频前缀命中，hbm命中也更新节点访问信息
-            // 可能会对前缀树可视化产生影响
+        if (has_local_hit) {
             child->stat.last_access_time = timestamp;
             child->stat.access_count += 1;
         }
@@ -195,14 +205,12 @@ void RadixTreeIndex::PrefixQuery(const std::vector<int64_t> &block_keys,
     }
 }
 
-std::vector<int64_t> RadixTreeIndex::InsertWithQuery(const std::vector<int64_t> &block_keys,
-                                                     const int64_t timestamp,
-                                                     std::vector<std::vector<int64_t>> &hits) {
+std::vector<int64_t>
+RadixTreeIndex::InsertWithQuery(const std::vector<int64_t> &block_keys, const int64_t timestamp, QueryHit *query_hit) {
     if (block_keys.empty()) {
         return block_keys;
     }
-    std::vector<int64_t> insert_block_keys = InsertQuery(root_.get(), block_keys, timestamp, true, hits);
-    // CleanEmptyLeafNodes(root_.get());
+    std::vector<int64_t> insert_block_keys = InsertQuery(root_.get(), block_keys, timestamp, true, query_hit);
     return insert_block_keys;
 }
 // 该接口服务于直接trace分析，在这种场景下无法得知prefill的执行时间，相当于读写同时进行
@@ -213,7 +221,7 @@ std::vector<int64_t> RadixTreeIndex::InsertQuery(RadixTreeNode *node,
                                                  const std::vector<int64_t> &block_keys,
                                                  const int64_t timestamp,
                                                  bool is_prefix_hit,
-                                                 std::vector<std::vector<int64_t>> &hits) {
+                                                 QueryHit *query_hit) {
     if (block_keys.empty()) {
         return block_keys;
     }
@@ -234,7 +242,7 @@ std::vector<int64_t> RadixTreeIndex::InsertQuery(RadixTreeNode *node,
     } else {
         RadixTreeNode *child = child_it->second.get();
         std::vector<int64_t> insert_keys;
-        std::vector<int64_t> temp_hits;
+        bool has_hit = false;
         std::unordered_map<int64_t, BlockEntry *> evicted_blocks;
         size_t match_len = 0;
         while (match_len < child->blocks.size() && match_len < block_keys.size() &&
@@ -245,7 +253,8 @@ std::vector<int64_t> RadixTreeIndex::InsertQuery(RadixTreeNode *node,
                 evicted_blocks[block_keys[match_len]] = blk;
                 is_prefix_hit = false;
             } else if (is_prefix_hit) {
-                temp_hits.push_back(block_keys[match_len]);
+                has_hit = true;
+                RecordTieredHit(blk, true, query_hit);
                 OnBlockAccessed(blk, timestamp);
             }
             match_len++;
@@ -253,8 +262,7 @@ std::vector<int64_t> RadixTreeIndex::InsertQuery(RadixTreeNode *node,
         if (!evicted_blocks.empty()) {
             WriteToTier(child, insert_keys, timestamp, AppendEvictBlocks(std::move(evicted_blocks)));
         }
-        if (!temp_hits.empty()) {
-            hits.emplace_back(std::move(temp_hits));
+        if (has_hit) {
             child->stat.access_count += 1;
             child->stat.last_access_time = timestamp;
         }
@@ -264,7 +272,7 @@ std::vector<int64_t> RadixTreeIndex::InsertQuery(RadixTreeNode *node,
                                               std::vector<int64_t>(block_keys.begin() + match_len, block_keys.end()),
                                               timestamp,
                                               is_prefix_hit,
-                                              hits);
+                                              query_hit);
             insert_keys.insert(insert_keys.end(), remain_results.begin(), remain_results.end());
             return insert_keys;
         } else if (match_len == block_keys.size()) {
@@ -328,9 +336,9 @@ void RadixTreeIndex::CleanEmptyBlocks(const std::vector<BlockEntry *> &blocks, i
         }
     }
 }
+
 std::vector<BlockEntry *>
 RadixTreeIndex::AppendNewBlocks(RadixTreeNode *node, const std::vector<int64_t> &block_keys, const int64_t timestamp) {
-    auto tier_name = eviction_policy_->name();
     std::vector<BlockEntry *> inserted_blocks;
     inserted_blocks.reserve(block_keys.size());
     for (size_t i = 0; i < block_keys.size(); ++i) {
@@ -340,7 +348,10 @@ RadixTreeIndex::AppendNewBlocks(RadixTreeNode *node, const std::vector<int64_t> 
         entry->last_access_time = timestamp;
         entry->owner_node = node;
         BlockEntry *entry_ptr = entry.get();
-        AppendBlockLocation(entry_ptr, tier_name, timestamp);
+        // Write-through: 为所有 tier 写入 location
+        for (const auto &name : tier_names_) {
+            AppendBlockLocation(entry_ptr, name, timestamp);
+        }
         node->blocks.emplace_back(std::move(entry));
         inserted_blocks.push_back(entry_ptr);
 
@@ -366,15 +377,16 @@ RadixTreeIndex::WriteModify RadixTreeIndex::AppendEvictBlocks(std::unordered_map
         std::vector<BlockEntry *> revived_blocks;
         revived_blocks.reserve(block_keys.size());
 
-        auto tier_name = eviction_policy_->name();
-
         for (int64_t key : block_keys) {
             auto it = blocks_map.find(key);
             if (it != blocks_map.end()) {
                 BlockEntry *block = it->second;
                 block->writing_time = timestamp;
                 block->last_access_time = timestamp;
-                AppendBlockLocation(block, tier_name, timestamp);
+                // Write-through: 恢复所有 tier 的 location
+                for (const auto &name : tier_names_) {
+                    AppendBlockLocation(block, name, timestamp);
+                }
                 revived_blocks.push_back(block);
 
                 if (stats_collector_) {
@@ -390,7 +402,6 @@ void RadixTreeIndex::WriteToTier(RadixTreeNode *node,
                                  const std::vector<int64_t> &block_keys,
                                  const int64_t timestamp,
                                  RadixTreeIndex::WriteModify cb) {
-    // TODO 选择具体tier进行写入
     std::vector<BlockEntry *> inserted_blocks;
     if (!cb) {
         // 节点直接添加新blocks
@@ -400,27 +411,53 @@ void RadixTreeIndex::WriteToTier(RadixTreeNode *node,
         inserted_blocks = cb(block_keys, timestamp);
     }
     node->stat.last_access_time = timestamp;
-    eviction_policy_->OnNodeWritten(inserted_blocks);
+    // Write-through: 注册到所有 tier 的驱逐队列
+    for (auto &policy : tier_policies_) {
+        policy->OnNodeWritten(inserted_blocks);
+    }
 }
 
 void RadixTreeIndex::OnBlockAccessed(BlockEntry *block, int64_t timestamp) {
-    // 全局驱逐
-    if (eviction_policy_->name() == "shared") {
-        eviction_policy_->OnBlockAccessed(block, timestamp);
-    } else {
-        // 分层驱逐，但目前只创建了第一层的驱逐策略，只对第一层进行驱逐,其他层写进去先不管
-        // TODO 后续依照kvcm分层逻辑来实现
-        eviction_policy_->OnBlockAccessed(block, timestamp);
-        for (auto &location_pair : block->location_map) {
-            // 现在不论是不是在第一层命中，都只更新第一层tier的访问信息
-            std::string tier_name = eviction_policy_->name();
-            if (location_pair.first == tier_name) {
-                location_pair.second.access_count += 1;
-                location_pair.second.last_access_time = timestamp;
-            }
+    // block 级别的统计只更新一次，避免多 tier 场景下重复递增
+    block->access_count += 1;
+    block->last_access_time = timestamp;
+
+    // 遍历所有 tier，如果 block 在该 tier 中存在，则更新策略和 per-tier 统计
+    for (size_t i = 0; i < tier_policies_.size(); ++i) {
+        const auto &tier_name = tier_names_[i];
+        auto loc_it = block->location_map.find(tier_name);
+        if (loc_it != block->location_map.end()) {
+            tier_policies_[i]->OnBlockAccessed(block, timestamp);
+            loc_it->second.access_count += 1;
+            loc_it->second.last_access_time = timestamp;
         }
     }
 }
+
+void RadixTreeIndex::RecordTieredHit(BlockEntry *block, bool is_remote, QueryHit *query_hit) const {
+    if (!query_hit) {
+        return;
+    }
+    if (is_remote) {
+        query_hit->remote_hit_block_num++;
+    } else {
+        query_hit->local_hit_block_num++;
+    }
+    if (tier_names_.size() <= 1) {
+        return;
+    }
+    // 按 priority 从高到低检查，命中最高优先级的那一层
+    if (query_hit->per_tier_hit_block_num.size() < tier_names_.size()) {
+        query_hit->per_tier_hit_block_num.resize(tier_names_.size(), 0);
+    }
+    for (size_t i = 0; i < tier_names_.size(); ++i) {
+        if (block->location_map.count(tier_names_[i])) {
+            query_hit->per_tier_hit_block_num[i]++;
+            break;
+        }
+    }
+}
+
 // 判断block是否被驱逐，所有location都为空则认为被驱逐
 bool RadixTreeIndex::IsBlockEvict(BlockEntry *block) const { return block->location_map.empty(); }
 
@@ -484,10 +521,8 @@ RadixTreeIndex::RadixTreeExport RadixTreeIndex::ExportForVisualization() const {
         node_queue.pop();
 
         if (!node_id_map.count(current)) {
-            // 如果没有 ID，生成一个
-            std::string current_id = generate_node_id(current, "node");
+            generate_node_id(current, "node");
         }
-
         std::string current_id = node_id_map[current];
         std::string parent_id = "";
 
@@ -509,7 +544,6 @@ RadixTreeIndex::RadixTreeExport RadixTreeIndex::ExportForVisualization() const {
         export_node.is_leaf = current->isLeaf();
 
         // 收集 block 序列
-        size_t node_cached_count = 0;
         for (const auto &block : current->blocks) {
             if (!block) {
                 // 跳过空指针，避免未定义行为
@@ -518,7 +552,6 @@ RadixTreeIndex::RadixTreeExport RadixTreeIndex::ExportForVisualization() const {
             }
             if (is_block_cached(block.get())) {
                 export_node.cached_blocks.push_back(block->key);
-                node_cached_count++;
             }
             export_node.total_blocks.push_back(block->key);
         }
@@ -561,9 +594,11 @@ RadixTreeIndex::RadixTreeExport RadixTreeIndex::ExportForVisualization() const {
 }
 
 void RadixTreeIndex::Clear() {
-    // 清空驱逐策略
-    if (eviction_policy_) {
-        eviction_policy_->Clear();
+    // 清空所有 tier 的驱逐策略
+    for (auto &policy : tier_policies_) {
+        if (policy) {
+            policy->Clear();
+        }
     }
 
     // 重新创建根节点，清空整个树

@@ -41,27 +41,25 @@ TEST_F(RadixTreeIndexTest, InsertOnlyDuplicate) {
 
 TEST_F(RadixTreeIndexTest, InsertWithQueryNoHit) {
     std::vector<int64_t> block_keys = {1, 2, 3, 4, 5};
-    std::vector<std::vector<int64_t>> hits;
+    QueryHit query_hit;
 
-    auto inserted = index_->InsertWithQuery(block_keys, 1000, hits);
+    auto inserted = index_->InsertWithQuery(block_keys, 1000, &query_hit);
     EXPECT_EQ(inserted.size(), 5);
-    EXPECT_EQ(hits.size(), 0); // 第一次插入不应该有命中
+    EXPECT_EQ(query_hit.remote_hit_block_num, 0); // 第一次插入不应该有命中
 }
 
 TEST_F(RadixTreeIndexTest, InsertWithQueryWithHit) {
     // 第一次插入
     std::vector<int64_t> block_keys1 = {1, 2, 3, 4, 5};
-    std::vector<std::vector<int64_t>> hits1;
-    index_->InsertWithQuery(block_keys1, 1000, hits1);
+    index_->InsertWithQuery(block_keys1, 1000);
 
     // 第二次插入,应该命中
     std::vector<int64_t> block_keys2 = {1, 2, 3, 4, 5};
-    std::vector<std::vector<int64_t>> hits2;
-    auto inserted = index_->InsertWithQuery(block_keys2, 2000, hits2);
+    QueryHit query_hit;
+    auto inserted = index_->InsertWithQuery(block_keys2, 2000, &query_hit);
 
-    EXPECT_EQ(inserted.size(), 0); // 所有块都已存在
-    EXPECT_EQ(hits2.size(), 1);    // 应该有一个命中
-    EXPECT_EQ(hits2[0].size(), 5); // 命中了5个块
+    EXPECT_EQ(inserted.size(), 0);                // 所有块都已存在
+    EXPECT_EQ(query_hit.remote_hit_block_num, 5); // 命中了5个块
 }
 
 TEST_F(RadixTreeIndexTest, PrefixQueryNoHit) {
@@ -71,10 +69,8 @@ TEST_F(RadixTreeIndexTest, PrefixQueryNoHit) {
     // 查询不同的序列
     std::vector<int64_t> query_keys = {10, 11, 12};
     BlockMask block_mask = std::vector<bool>(query_keys.size(), true);
-    std::vector<std::vector<int64_t>> external_hits;
-    std::vector<std::vector<int64_t>> internal_hits;
 
-    index_->PrefixQuery(query_keys, block_mask, 2000, external_hits, internal_hits);
+    index_->PrefixQuery(query_keys, block_mask, 2000);
     // 不应该崩溃
     SUCCEED();
 }
@@ -86,10 +82,8 @@ TEST_F(RadixTreeIndexTest, PrefixQueryWithHit) {
     // 查询相同的前缀
     std::vector<int64_t> query_keys = {1, 2, 3};
     BlockMask block_mask = std::vector<bool>(query_keys.size(), true);
-    std::vector<std::vector<int64_t>> external_hits;
-    std::vector<std::vector<int64_t>> internal_hits;
 
-    index_->PrefixQuery(query_keys, block_mask, 2000, external_hits, internal_hits);
+    index_->PrefixQuery(query_keys, block_mask, 2000);
     // 不应该崩溃
     SUCCEED();
 }
@@ -101,10 +95,8 @@ TEST_F(RadixTreeIndexTest, PrefixQueryPartialMask) {
     // 查询时mask部分块
     std::vector<int64_t> query_keys = {1, 2, 3};
     BlockMask block_mask = std::vector<bool>{true, false, true}; // 只查询第1和第3个块
-    std::vector<std::vector<int64_t>> external_hits;
-    std::vector<std::vector<int64_t>> internal_hits;
 
-    index_->PrefixQuery(query_keys, block_mask, 2000, external_hits, internal_hits);
+    index_->PrefixQuery(query_keys, block_mask, 2000);
     // 不应该崩溃
     SUCCEED();
 }
@@ -112,16 +104,15 @@ TEST_F(RadixTreeIndexTest, PrefixQueryPartialMask) {
 TEST_F(RadixTreeIndexTest, InsertWithQueryPartialHit) {
     // 第一次插入
     std::vector<int64_t> block_keys1 = {1, 2, 3, 4, 5};
-    std::vector<std::vector<int64_t>> hits1;
-    index_->InsertWithQuery(block_keys1, 1000, hits1);
+    index_->InsertWithQuery(block_keys1, 1000);
 
     // 第二次插入,部分命中
     std::vector<int64_t> block_keys2 = {1, 2, 6, 7, 8};
-    std::vector<std::vector<int64_t>> hits2;
-    auto inserted = index_->InsertWithQuery(block_keys2, 2000, hits2);
+    QueryHit query_hit;
+    auto inserted = index_->InsertWithQuery(block_keys2, 2000, &query_hit);
 
-    EXPECT_EQ(inserted.size(), 3); // 6, 7, 8是新的
-    EXPECT_GT(hits2.size(), 0);    // 1, 2应该命中
+    EXPECT_EQ(inserted.size(), 3);                 // 6, 7, 8是新的
+    EXPECT_GT(query_hit.remote_hit_block_num, 0u); // 1, 2应该命中
 }
 
 TEST_F(RadixTreeIndexTest, MultipleInsertions) {
@@ -137,10 +128,8 @@ TEST_F(RadixTreeIndexTest, MultipleInsertions) {
     // 查询第一个序列
     std::vector<int64_t> query_keys = {1, 2, 3};
     BlockMask block_mask = std::vector<bool>(query_keys.size(), true);
-    std::vector<std::vector<int64_t>> external_hits;
-    std::vector<std::vector<int64_t>> internal_hits;
 
-    index_->PrefixQuery(query_keys, block_mask, 4000, external_hits, internal_hits);
+    index_->PrefixQuery(query_keys, block_mask, 4000);
     // 不应该崩溃
     SUCCEED();
 }
@@ -159,17 +148,16 @@ TEST_F(RadixTreeIndexTest, CleanEmptyBlocks) {
 
 TEST_F(RadixTreeIndexTest, InsertWithQueryAndUpdateAccessTime) {
     std::vector<int64_t> block_keys = {1, 2, 3, 4, 5};
-    std::vector<std::vector<int64_t>> hits;
 
     // 第一次插入
-    index_->InsertWithQuery(block_keys, 1000, hits);
+    index_->InsertWithQuery(block_keys, 1000);
 
     // 第二次查询相同的数据,应该更新访问时间
-    std::vector<std::vector<int64_t>> hits2;
-    auto inserted = index_->InsertWithQuery(block_keys, 2000, hits2);
+    QueryHit query_hit;
+    auto inserted = index_->InsertWithQuery(block_keys, 2000, &query_hit);
 
     EXPECT_EQ(inserted.size(), 0);
-    EXPECT_EQ(hits2.size(), 1);
+    EXPECT_EQ(query_hit.remote_hit_block_num, 5);
 }
 
 TEST_F(RadixTreeIndexTest, LargeBlockSequence) {
@@ -189,10 +177,8 @@ TEST_F(RadixTreeIndexTest, LargeBlockSequence) {
     }
 
     BlockMask block_mask = std::vector<bool>(query_keys.size(), true);
-    std::vector<std::vector<int64_t>> external_hits;
-    std::vector<std::vector<int64_t>> internal_hits;
 
-    index_->PrefixQuery(query_keys, block_mask, 2000, external_hits, internal_hits);
+    index_->PrefixQuery(query_keys, block_mask, 2000);
     // 不应该崩溃
     SUCCEED();
 }

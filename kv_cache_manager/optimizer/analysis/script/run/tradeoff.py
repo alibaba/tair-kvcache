@@ -24,8 +24,8 @@ from kv_cache_manager.optimizer.pybind import kvcm_py_optimizer
 
 from utils.optimizer_runner import init_kvcm_logger, warmup_pass, run_experiments_parallel
 from utils.csv_loader import generate_capacity_list, load_results_from_csv_dir
-from utils.plot_utils import plot_single_policy_curves, plot_multi_policy_subplots
-from plot.hit_rate_plot import plot_multi_instance_analysis
+from utils.plot_utils import plot_single_policy_curves, plot_multi_policy_subplots, plot_per_tier_curves
+from plot.hit_rate_plot import plot_multi_instance_analysis, plot_per_tier_timeseries
 
 
 # ============================================================================
@@ -58,14 +58,14 @@ def _print_single_policy_table(results):
         return
     iids = sorted(results[0]["instances"].keys())
     print("{:>12} | {:<20} | {:>10} | {:>10} | {:>10}".format(
-        "Capacity", "Instance", "Total", "Internal", "External"))
+        "Capacity", "Instance", "Total", "Local", "Remote"))
     print("-" * 70)
     for r in results:
         for iid in iids:
             m = r["instances"].get(iid)
             if m:
                 print("{:12,} | {:<20} | {:10.6f} | {:10.6f} | {:10.6f}".format(
-                    r["capacity"], iid, m["total"], m["internal"], m["external"]))
+                    r["capacity"], iid, m["total"], m["local"], m["remote"]))
 
 
 def _print_multi_policy_table(results_by_policy, policies):
@@ -94,11 +94,11 @@ def _print_multi_policy_table(results_by_policy, policies):
                 insts = cap_lookup.get((cap, pol), {})
                 m = insts.get(iid)
                 if m:
-                    row += " {:6.4f}/{:6.4f}/{:6.4f} |".format(m["total"], m["internal"], m["external"])
+                    row += " {:6.4f}/{:6.4f}/{:6.4f} |".format(m["total"], m["local"], m["remote"])
                 else:
                     row += " {:^22} |".format("N/A")
             print(row)
-        print("\nLegend: Total / Internal / External")
+        print("\nLegend: Total / Local / Remote")
 
 
 # ============================================================================
@@ -152,7 +152,7 @@ def main():
     parser.add_argument("--warmup-capacity", type=int, default=30000000)
     parser.add_argument("--num-points", type=int, default=40)
     parser.add_argument("--hit-rate-type", default="total",
-                        choices=["total", "internal", "external", "all"])
+                        choices=["total", "local", "remote", "all"])
     parser.add_argument("--max-workers", type=int, default=4)
     parser.add_argument("--save-csv", action="store_true",
                         help="保留每次运行的 CSV 文件")
@@ -164,6 +164,10 @@ def main():
                         help="为容量点生成时序图（需要 --save-csv 或 --skip-run）")
     parser.add_argument("--plot-capacity", type=int, nargs="+", default=None,
                         help="只为指定容量点生成时序图")
+    parser.add_argument("--plot-per-tier", action="store_true",
+                        help="绘制 per-tier 命中率对比图（所有层放在一起）")
+    parser.add_argument("--plot-per-tier-timeseries", action="store_true",
+                        help="绘制 per-tier 命中率时序图（所有层放在一起）")
     parser.add_argument("--x-min", type=float, default=None)
     parser.add_argument("--x-max", type=float, default=None)
     parser.add_argument("--y-min", type=float, default=None)
@@ -249,7 +253,7 @@ def main():
     print("=" * 60)
     output_dir = config.output_result_path()
     axis_limits = {"x_min": args.x_min, "x_max": args.x_max, "y_min": args.y_min, "y_max": args.y_max}
-    hit_types = ["total", "internal", "external"] if args.hit_rate_type == "all" else [args.hit_rate_type]
+    hit_types = ["total", "local", "remote"] if args.hit_rate_type == "all" else [args.hit_rate_type]
 
     if len(actual_policies) == 1:
         for ht in hit_types:
@@ -258,6 +262,49 @@ def main():
     else:
         for ht in hit_types:
             plot_multi_policy_subplots(results_by_policy, output_dir, ht)
+
+    # ----------------------------------------------------------------
+    # 可选：Per-Tier 对比图
+    # ----------------------------------------------------------------
+    if args.plot_per_tier:
+        print("\n" + "=" * 60)
+        print("Generating Per-Tier Comparison Plots")
+        print("=" * 60)
+        if len(actual_policies) == 1:
+            plot_per_tier_curves(
+                results_by_policy[actual_policies[0]], output_dir, axis_limits=axis_limits)
+        else:
+            # 多策略时为每个策略生成 per-tier 图
+            for pol in actual_policies:
+                plot_per_tier_curves(
+                    results_by_policy[pol], output_dir, 
+                    title=f"Per-Tier Hit Rate - {pol}", axis_limits=axis_limits)
+
+    # ----------------------------------------------------------------
+    # 可选：Per-Tier 时序图
+    # ----------------------------------------------------------------
+    if args.plot_per_tier_timeseries and has_csv:
+        print("
+" + "=" * 60)
+        print("Generating Per-Tier Timeseries Plots")
+        print("=" * 60)
+        count = 0
+        for pol, results in results_by_policy.items():
+            caps = args.plot_capacity or [r["capacity"] for r in results]
+            for cap in caps:
+                cap_dir = os.path.join(csv_save_dir, "cap_{}_{}".format(cap, pol))
+                if os.path.exists(cap_dir):
+                    print("Plotting per-tier timeseries {} capacity={}".format(pol, cap))
+                    try:
+                        plot_per_tier_timeseries(cap_dir, output_dir)
+                        count += 1
+                    except Exception as e:
+                        print("  Failed: {}".format(e))
+        print("
+Generated {} per-tier timeseries plots.".format(count))
+    elif args.plot_per_tier_timeseries and not has_csv:
+        print("
+Warning: --plot-per-tier-timeseries requires --save-csv or --skip-run")
 
     # ----------------------------------------------------------------
     # 可选：时序图

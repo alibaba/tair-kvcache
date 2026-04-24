@@ -99,10 +99,10 @@ TEST_F(OptIndexerManagerTest, CreateOptIndexer) {
     auto result = indexer->InsertOnly(block_keys, 1000);
     EXPECT_EQ(result.inserted_keys.size(), 5);
 
-    std::vector<std::vector<int64_t>> hits;
-    auto inserted2 = indexer->InsertWithQuery(block_keys, 2000, hits);
-    EXPECT_EQ(inserted2.size(), 0); // 已存在
-    EXPECT_EQ(hits.size(), 1);      // 命中
+    QueryHit query_hit;
+    auto inserted2 = indexer->InsertWithQuery(block_keys, 2000, &query_hit);
+    EXPECT_EQ(inserted2.size(), 0);               // 已存在
+    EXPECT_EQ(query_hit.remote_hit_block_num, 5); // 命中
 }
 
 TEST_F(OptIndexerManagerTest, CreateMultipleOptIndexers) {

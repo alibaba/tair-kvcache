@@ -18,13 +18,15 @@ bool OptIndexerManager::CreateOptIndexer(const OptInstanceConfig &instance_confi
         return false;
     }
     // 每个index实例对应一个instance_config，以及包含多层
-    auto eviction_policy = eviction_manager_->CreateAndRegisterEvictionPolicy(
+    auto *policy_group = eviction_manager_->CreateAndRegisterEvictionPolicy(
         instance_config, storage_configs, hierarchical_eviction_enabled);
-    if (!eviction_policy) {
+    if (!policy_group) {
         KVCM_LOG_ERROR("Failed to create eviction policy for instance_id: %s", instance_id.c_str());
         return false;
     }
-    indexer = std::make_shared<RadixTreeIndex>(instance_id, eviction_policy);
+
+    // 传递策略列表给 RadixTreeIndex
+    indexer = std::make_shared<RadixTreeIndex>(instance_id, policy_group->policies);
 
     opt_indexer_map_[instance_id] = indexer;
     KVCM_LOG_INFO("Create optimizer indexer success, instance_id: %s", instance_id.c_str());
@@ -71,18 +73,26 @@ bool OptIndexerManager::CheckAndEvict(const std::string &instance_id, int64_t ev
     }
     const auto &group_config = group_it->second;
 
-    // 调用 EvictionManager 驱逐
+    // 统一驱逐入口：内部根据 hierarchical_eviction_enabled 决定分层/非分层模式
     auto evicted_blocks = eviction_manager_->EvictByMode(instance_id, group_config);
 
-    // 通知所有 RadixTreeIndex 清理被驱逐的块
+    // 清理 location_map 为空的 block (彻底驱逐)
     if (!evicted_blocks.empty()) {
-        for (auto &evicted_block : evicted_blocks) {
-            auto indexer = GetOptIndexer(evicted_block.first);
-            KVCM_LOG_DEBUG("Evicted %zu blocks from instance_id: %s by CheckAndEvict",
-                           evicted_block.second.size(),
-                           evicted_block.first.c_str());
+        for (auto &[inst_id, blocks] : evicted_blocks) {
+            auto indexer = GetOptIndexer(inst_id);
+            KVCM_LOG_DEBUG("Evicted %zu blocks from instance_id: %s by CheckAndEvict", blocks.size(), inst_id.c_str());
             if (indexer) {
-                indexer->CleanEmptyBlocks(evicted_block.second, eviction_timestamp);
+                // 只对 location_map 完全为空的 block 执行 CleanEmptyBlocks
+                // (tier0 驱逐后 block 仍在 tier1，不应清理)
+                std::vector<BlockEntry *> truly_evicted;
+                for (auto *block : blocks) {
+                    if (block->location_map.empty()) {
+                        truly_evicted.push_back(block);
+                    }
+                }
+                if (!truly_evicted.empty()) {
+                    indexer->CleanEmptyBlocks(truly_evicted, eviction_timestamp);
+                }
             }
         }
     }

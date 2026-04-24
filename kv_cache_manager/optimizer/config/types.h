@@ -70,6 +70,12 @@ struct RadixTreeNode {
     }
 };
 
+struct QueryHit {
+    size_t local_hit_block_num = 0;
+    size_t remote_hit_block_num = 0;
+    std::vector<size_t> per_tier_hit_block_num; // indexed by tier priority order
+};
+
 EvictionPolicyType ToEvictionPolicyType(const std::string &str);
 std::string ToString(const EvictionPolicyType &type);
 } // namespace kv_cache_manager

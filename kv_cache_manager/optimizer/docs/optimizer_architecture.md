@@ -395,12 +395,12 @@ struct ResultCounters {
 
 struct ReadRecord {
     int64_t timestamp_us;
-    size_t external_read_blocks;
-    size_t external_hit_blocks;
-    size_t internal_read_blocks;
-    size_t internal_hit_blocks;
-    size_t current_cache_blocks;
-    std::vector<size_t> blocks_per_instance;
+    size_t external_read_block_num;
+    size_t external_hit_block_num;
+    size_t internal_read_block_num;
+    size_t internal_hit_block_num;
+    size_t current_cache_block_num;
+    std::vector<size_t> block_num_per_instance;
 };
 
 struct Result {
