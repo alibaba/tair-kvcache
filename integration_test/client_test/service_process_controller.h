@@ -100,7 +100,7 @@ private:
 
     std::optional<std::pair<pid_t, bool>> GetServiceProcessPid(const PortsArray &ports) {
         std::stringstream ss;
-        ss << "pgrep -f 'kv_cache_manager_bin";
+        ss << "pgrep -f '[k]v_cache_manager_bin";
         for (int port : ports) {
             ss << ".*" << port;
         }
