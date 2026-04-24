@@ -26,15 +26,16 @@ public:
     void OnNodeWritten(std::vector<BlockEntry *> &blocks) override;
     void OnBlockAccessed(BlockEntry *block, int64_t timestamp) override;
     std::vector<BlockEntry *> EvictBlocks(size_t count) override;
+    std::vector<BlockEntry *> EvictExpired() override;
     void Clear() override;
     bool NeedCapacityEviction() const override { return fallback_on_pressure_; }
-    bool IsTtlPolicy() const override { return true; }
     void AdvanceClock(int64_t timestamp) override;
 
 private:
     void EvictOne(BlockEntry *block);
     void PushExpireEvent(BlockEntry *block);
     bool TryPopOneExpired(BlockEntry *&expired_block);
+    std::vector<BlockEntry *> HarvestExpiredBlocks();
     void MaybeCompactExpireHeap();
     void RebuildExpireHeap();
 

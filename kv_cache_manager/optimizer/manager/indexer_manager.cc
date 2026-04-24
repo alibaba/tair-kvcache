@@ -94,14 +94,7 @@ OptIndexerManager::EvictedBlocks OptIndexerManager::CheckAndEvict(const std::str
     }
     const auto &group_config = group_it->second;
 
-    // ---- 检查是否需要容量驱逐（TTL 无 fallback 时提前结束） ----
-    auto policy = eviction_manager_->GetEvictionPolicy(instance_id);
-    if (policy && !policy->NeedCapacityEviction()) {
-        // TTL 策略且 fallback=false：读写前已执行过期清理，这里无需容量驱逐
-        return empty_result;
-    }
-
-    // ---- 容量压力驱逐（LRU / TTL fallback） ----
+    // ---- 容量压力驱逐（是否需要由 eviction_manager 内部统一判定） ----
     return eviction_manager_->EvictByMode(instance_id, group_config);
 }
 

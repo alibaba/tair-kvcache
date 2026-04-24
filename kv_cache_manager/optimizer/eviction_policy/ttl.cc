@@ -83,6 +83,25 @@ bool TtlEvictionPolicy::TryPopOneExpired(BlockEntry *&expired_block) {
     return false;
 }
 
+std::vector<BlockEntry *> TtlEvictionPolicy::HarvestExpiredBlocks() {
+    std::vector<BlockEntry *> evicted;
+    BlockEntry *expired_block = nullptr;
+    while (TryPopOneExpired(expired_block)) {
+        auto node_it = node_map_.find(expired_block);
+        if (node_it == node_map_.end()) {
+            continue;
+        }
+        auto *node = node_it->second;
+        EvictOne(expired_block);
+        evicted.push_back(expired_block);
+        node_map_.erase(node_it);
+        expire_event_version_.erase(expired_block);
+        list_.unlink(node);
+        delete node;
+    }
+    return evicted;
+}
+
 void TtlEvictionPolicy::MaybeCompactExpireHeap() {
     if (node_map_.empty()) {
         return;
@@ -115,25 +134,9 @@ void TtlEvictionPolicy::RebuildExpireHeap() {
 //            从链表尾部按 last_access_time 最旧优先补足
 // ============================================================
 std::vector<BlockEntry *> TtlEvictionPolicy::EvictBlocks(size_t count) {
-    std::vector<BlockEntry *> evicted;
+    auto evicted = HarvestExpiredBlocks();
     if (node_map_.empty()) {
         return evicted;
-    }
-
-    // ---- Phase 1: 收割所有过期 block ----
-    BlockEntry *expired_block = nullptr;
-    while (TryPopOneExpired(expired_block)) {
-        auto node_it = node_map_.find(expired_block);
-        if (node_it == node_map_.end()) {
-            continue;
-        }
-        auto *node = node_it->second;
-        EvictOne(expired_block);
-        evicted.push_back(expired_block);
-        node_map_.erase(node_it);
-        expire_event_version_.erase(expired_block);
-        list_.unlink(node);
-        delete node;
     }
 
     // ---- Phase 2: LRU 兜底，从尾部取最旧的补足 ----
@@ -155,6 +158,8 @@ std::vector<BlockEntry *> TtlEvictionPolicy::EvictBlocks(size_t count) {
 
     return evicted;
 }
+
+std::vector<BlockEntry *> TtlEvictionPolicy::EvictExpired() { return HarvestExpiredBlocks(); }
 
 void TtlEvictionPolicy::EvictOne(BlockEntry *block) {
     if (name_ == "shared") {

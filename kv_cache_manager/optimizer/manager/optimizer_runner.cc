@@ -124,7 +124,13 @@ void OptimizerRunner::HandleWriteCache(const WriteCacheSchemaTrace &trace) {
     auto expired_evicted_blocks = indexer_manager_->EvictExpiredBeforeAccess(instance_id, trace.timestamp_us());
     indexer_manager_->CleanEvictedBlocks(expired_evicted_blocks, trace.timestamp_us(), true);
 
-    auto result = indexer->InsertOnly(trace.keys(), trace.timestamp_us(), trace.ttl_us());
+    int64_t effective_ttl_us = trace.ttl_us();
+    auto ttl_disabled_it = instance_group_ttl_disabled_.find(instance_id);
+    if (ttl_disabled_it != instance_group_ttl_disabled_.end() && ttl_disabled_it->second) {
+        effective_ttl_us = -1;
+    }
+
+    auto result = indexer->InsertOnly(trace.keys(), trace.timestamp_us(), effective_ttl_us);
     auto capacity_evicted_blocks = indexer_manager_->CheckAndEvict(instance_id);
     indexer_manager_->CleanEvictedBlocks(capacity_evicted_blocks, trace.timestamp_us());
     if (!capacity_evicted_blocks.empty()) {

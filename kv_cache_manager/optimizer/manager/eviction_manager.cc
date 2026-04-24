@@ -85,6 +85,7 @@ OptEvictionManager::EvictByMode(const std::string &instance_id, const OptInstanc
 std::unordered_map<std::string, std::vector<BlockEntry *>>
 OptEvictionManager::EvictByGroupRough(const std::string &instance_id,
                                       const OptInstanceGroupConfig &instance_group_config) {
+    (void)instance_id;
     std::unordered_map<std::string, std::vector<BlockEntry *>> evict_blocks;
     auto group_name = instance_group_config.group_name();
     size_t excess = GetExcessUsageForInstanceInGroup(instance_group_config);
@@ -102,12 +103,13 @@ OptEvictionManager::EvictByGroupRough(const std::string &instance_id,
         for (const auto &instance_config : instance_group_config.instances()) {
 
             auto instance_id_in_group = instance_config.instance_id();
-            auto it = instance_eviction_policy_map_.find(instance_id_in_group);
-            if (it == instance_eviction_policy_map_.end()) {
-                KVCM_LOG_WARN("Eviction policy not found for instance: %s", instance_id_in_group.c_str());
+            auto eviction_policy = GetPolicyOrLog(instance_id_in_group, "EvictByGroupRough");
+            if (!eviction_policy) {
                 continue;
             }
-            auto eviction_policy = it->second;
+            if (!eviction_policy->NeedCapacityEviction()) {
+                continue;
+            }
 
             // 每轮驱逐 eviction_batch_size_per_instance_ 个块
             auto instance_evicted_blocks =
@@ -156,12 +158,13 @@ OptEvictionManager::EvictByInstanceRough(const std::string &instance_id,
     // 循环驱逐直到达到 excess 数量
     size_t total_evicted = 0;
     size_t round = 0;
-    auto it = instance_eviction_policy_map_.find(instance_id);
-    if (it == instance_eviction_policy_map_.end()) {
-        KVCM_LOG_ERROR("Eviction policy not found for instance: %s", instance_id.c_str());
+    auto eviction_policy = GetPolicyOrLog(instance_id, "EvictByInstanceRough");
+    if (!eviction_policy) {
         return evict_blocks;
     }
-    auto eviction_policy = it->second;
+    if (!eviction_policy->NeedCapacityEviction()) {
+        return evict_blocks;
+    }
     while (total_evicted < excess) {
         round++;
         // 每轮驱逐 eviction_batch_size_per_instance_ 个块
@@ -197,14 +200,15 @@ OptEvictionManager::EvictByInstancePrecise(const std::string &instance_id,
         return evict_blocks;
     }
     KVCM_LOG_DEBUG("Evicting blocks for instance: %s, excess: %zu", instance_id.c_str(), excess);
-    auto it = instance_eviction_policy_map_.find(instance_id);
-    if (it == instance_eviction_policy_map_.end()) {
-        KVCM_LOG_ERROR("Eviction policy not found for instance: %s", instance_id.c_str());
+    auto eviction_policy = GetPolicyOrLog(instance_id, "EvictByInstancePrecise");
+    if (!eviction_policy) {
+        return evict_blocks;
+    }
+    if (!eviction_policy->NeedCapacityEviction()) {
         return evict_blocks;
     }
     size_t total_evicted = 0;
     size_t round = 0;
-    auto eviction_policy = it->second;
     while (total_evicted < excess) {
         round++;
         auto evict_count =
@@ -236,24 +240,19 @@ std::unordered_map<std::string, std::vector<BlockEntry *>>
 OptEvictionManager::ActiveEvictExpired(const OptInstanceGroupConfig &instance_group_config, int64_t current_timestamp) {
     std::unordered_map<std::string, std::vector<BlockEntry *>> result;
 
-    // V1 语义：仅对 POLICY_TTL 做前置物理过期清理
+    // 显式过期驱逐入口：由策略实现决定是否有过期语义（非 TTL 默认返回空）
     for (const auto &instance_config : instance_group_config.instances()) {
-        if (instance_config.eviction_policy_type() != EvictionPolicyType::POLICY_TTL) {
-            continue;
-        }
         auto instance_id = instance_config.instance_id();
-        auto it = instance_eviction_policy_map_.find(instance_id);
-        if (it == instance_eviction_policy_map_.end()) {
-            KVCM_LOG_WARN("Eviction policy not found for instance: %s", instance_id.c_str());
+        auto policy = GetPolicyOrLog(instance_id, "ActiveEvictExpired");
+        if (!policy) {
             continue;
         }
-        if (it->second->size() == 0) {
+        if (policy->size() == 0) {
             continue;
         }
 
-        // V1 语义：仅 TTL 策略执行前置过期清理
-        it->second->AdvanceClock(current_timestamp);
-        auto evicted = it->second->EvictBlocks(0);
+        policy->AdvanceClock(current_timestamp);
+        auto evicted = policy->EvictExpired();
         if (!evicted.empty()) {
             result[instance_id] = evicted;
             KVCM_LOG_DEBUG(
@@ -295,21 +294,22 @@ size_t OptEvictionManager::GetExcessUsageForInstanceInGroup(const OptInstanceGro
 
 size_t OptEvictionManager::GetCurrentInstanceUsage(const std::string &instance_id) const {
     size_t current_instance_used = 0;
-    auto instance_it = instance_eviction_policy_map_.find(instance_id);
-    if (instance_it == instance_eviction_policy_map_.end()) {
-        KVCM_LOG_ERROR("Instance eviction policy not found for instance_id: %s", instance_id.c_str());
+    auto policy = GetPolicyOrLog(instance_id, "GetCurrentInstanceUsage");
+    if (!policy) {
         return current_instance_used;
     }
-    current_instance_used = instance_it->second->size();
+    current_instance_used = policy->size();
     return current_instance_used;
 }
 
-std::shared_ptr<EvictionPolicy> OptEvictionManager::GetEvictionPolicy(const std::string &instance_id) const {
+std::shared_ptr<EvictionPolicy> OptEvictionManager::GetPolicyOrLog(const std::string &instance_id,
+                                                                   const char *context) const {
     auto it = instance_eviction_policy_map_.find(instance_id);
-    if (it != instance_eviction_policy_map_.end()) {
-        return it->second;
+    if (it == instance_eviction_policy_map_.end()) {
+        KVCM_LOG_WARN("[%s] Eviction policy not found for instance: %s", context, instance_id.c_str());
+        return nullptr;
     }
-    return nullptr;
+    return it->second;
 }
 
 } // namespace kv_cache_manager

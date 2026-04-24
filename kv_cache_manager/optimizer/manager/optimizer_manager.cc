@@ -93,6 +93,18 @@ bool OptimizerManager::Init() {
             instance_configs_[instance_id] = instance_config;
             instance_group_ttl_disabled_[instance_id] = (group.default_block_ttl_seconds() == 0);
 
+            if (instance_config.eviction_policy_type() == EvictionPolicyType::POLICY_TTL &&
+                group.default_block_ttl_seconds() == 0 &&
+                std::holds_alternative<TtlParams>(instance_config.eviction_policy_param())) {
+                const auto &ttl_params = std::get<TtlParams>(instance_config.eviction_policy_param());
+                if (!ttl_params.fallback_on_pressure) {
+                    KVCM_LOG_WARN("instance %s uses TTL policy with default_block_ttl_seconds=0 and "
+                                  "fallback_on_pressure=false; no expiration and no capacity fallback, "
+                                  "cache may grow without bound",
+                                  instance_id.c_str());
+                }
+            }
+
             if (!CreateRadixTreeIndex(instance_config, storage_configs)) {
                 KVCM_LOG_ERROR("Failed to create RadixTreeIndex for instance: %s", instance_id.c_str());
                 failed_instances++;
@@ -130,7 +142,8 @@ bool OptimizerManager::Init() {
     indexer_manager_->RegisterInstanceGroups(instance_group_configs_);
     indexer_manager_->RegisterInstances(instance_configs_);
 
-    optimizer_runner_.reset(new OptimizerRunner(indexer_manager_, eviction_manager_, stats_collector_));
+    optimizer_runner_.reset(
+        new OptimizerRunner(indexer_manager_, eviction_manager_, stats_collector_, instance_group_ttl_disabled_));
     return true;
 }
 
@@ -145,6 +158,12 @@ bool OptimizerManager::CreateRadixTreeIndex(const OptInstanceConfig &instance_co
     }
 
     int64_t default_ttl_us = group_it->second.default_block_ttl_seconds() * 1000000;
+    if (default_ttl_us > 0 && instance_config.eviction_policy_type() != EvictionPolicyType::POLICY_TTL) {
+        KVCM_LOG_WARN("default_block_ttl_seconds=%ld is set but eviction_policy_type is not TTL; "
+                      "TTL will not be enforced for instance %s",
+                      group_it->second.default_block_ttl_seconds(),
+                      instance_config.instance_id().c_str());
+    }
     if (!indexer_manager_->CreateOptIndexer(
             instance_config, storage_configs, group_it->second.hierarchical_eviction_enabled(), default_ttl_us)) {
         KVCM_LOG_ERROR("Failed to create optimizer indexer for instance_id: %s", instance_config.instance_id().c_str());
@@ -175,13 +194,7 @@ WriteCacheRes OptimizerManager::WriteCache(const std::string &instance_id,
     trace.set_keys(block_ids);
     trace.set_tokens(token_ids);
 
-    // ---- 如果 group 的 default_ttl=0，强制关闭 TTL ----
     int64_t ttl_us = (ttl_seconds > 0) ? ttl_seconds * 1000000 : ttl_seconds;
-
-    auto ttl_disabled_it = instance_group_ttl_disabled_.find(instance_id);
-    if (ttl_disabled_it != instance_group_ttl_disabled_.end() && ttl_disabled_it->second) {
-        ttl_us = -1; // group 级别关闭 TTL，强制禁用
-    }
 
     trace.set_ttl_us(ttl_us);
     optimizer_runner_->HandleWriteCache(trace);
