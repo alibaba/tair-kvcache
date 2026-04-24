@@ -112,9 +112,10 @@ class HiCacheKVCM(HiCacheStorage):
             "size": self.location_spec_size,
         } for rank in range(self.tp_size)]
 
-        # LocationSpecGroup: KV specs only
+        # LocationSpecGroup: KV specs always prepared, but only sent when
+        # extra pools exist (backward compat with older managers).
         kv_spec_names = [self._tp_rank_to_spec_name(rank) for rank in range(self.tp_size)]
-        self.location_spec_groups = [{"name": self._get_kv_spec_group(), "spec_names": kv_spec_names}]
+        self.location_spec_groups = []
 
         # Mamba/Linear specs
         if self.has_mamba:
@@ -148,6 +149,12 @@ class HiCacheKVCM(HiCacheStorage):
                 "spec_names": indexer_spec_names,
             })
 
+        if self.location_spec_groups:
+            self.location_spec_groups.insert(0, {
+                "name": self._get_kv_spec_group(),
+                "spec_names": kv_spec_names,
+            })
+
         self.deployment = {
             "model_name": self.model_name,
             "tp_size": self.tp_size,
@@ -164,8 +171,9 @@ class HiCacheKVCM(HiCacheStorage):
             "model_deployment": self.deployment,
             "block_size": self.block_size,
             "location_spec_infos": self.location_spec_infos,
-            "location_spec_groups": self.location_spec_groups,
         }
+        if self.location_spec_groups:
+            register_request["location_spec_groups"] = self.location_spec_groups
         # TODO: check conflict and update
         register_response = self._manager_client.register_instance(register_request)
         logger.debug(f"register_instance {register_response=}")
