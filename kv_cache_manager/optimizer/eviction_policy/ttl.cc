@@ -64,7 +64,7 @@ bool TtlEvictionPolicy::TryPopOneExpired(BlockEntry *&expired_block) {
     expired_block = nullptr;
     while (!expire_min_heap_.empty()) {
         auto event = expire_min_heap_.top();
-        if (event.expire_ts > last_known_timestamp_) {
+        if (event.expire_ts >= last_known_timestamp_) {
             return false;
         }
         expire_min_heap_.pop();
@@ -75,6 +75,10 @@ bool TtlEvictionPolicy::TryPopOneExpired(BlockEntry *&expired_block) {
         }
         auto version_it = expire_event_version_.find(event.block);
         if (version_it == expire_event_version_.end() || version_it->second != event.version) {
+            continue;
+        }
+        // 防 ABA：即使指针和版本碰巧复用，也必须满足“当前时间已过期”才允许淘汰。
+        if (!event.block->IsExpired(last_known_timestamp_)) {
             continue;
         }
         expired_block = event.block;
