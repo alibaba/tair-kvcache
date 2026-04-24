@@ -1172,6 +1172,11 @@ std::string CacheManager::GetStorageConfigStr(RequestContext *request_context, c
     // TODO : try optimize these copy operation
     std::vector<const StorageConfig *> result;
     for (const auto &config : all_configs) {
+        // dummy backend is server-internal (testing only);
+        // clients have no SDK for it and would fail on init
+        if (config.type() == DataStorageType::DATA_STORAGE_TYPE_DUMMY) {
+            continue;
+        }
         if (storage_candadate_set.find(config.global_unique_name()) != storage_candadate_set.end()) {
             result.push_back(&config);
         }
