@@ -4,10 +4,13 @@ set -euo pipefail
 
 BAZEL_VERSION="${BAZEL_VERSION:-6.4.0}"
 BAZEL_BASE_URL="${BAZEL_BASE_URL:-https://mirrors.huaweicloud.com/bazel}"
+BAZEL_SHA256="${BAZEL_SHA256:-}"
 INSTALL_PREFIX="${INSTALL_PREFIX:-/usr/local/bin}"
 RUN_BUILD="${RUN_BUILD:-0}"
 INSTALL_BUILDIFIER="${INSTALL_BUILDIFIER:-0}"
 BUILDIFIER_VERSION="${BUILDIFIER_VERSION:-8.2.1}"
+BUILDIFIER_SHA256="${BUILDIFIER_SHA256:-}"
+CURL_MAX_TIME="${CURL_MAX_TIME:-600}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -22,8 +25,11 @@ Manager in this container.
 Environment overrides:
   BAZEL_VERSION         Bazel version to install. Default: ${BAZEL_VERSION}
   BAZEL_BASE_URL        Bazel download base URL. Default: ${BAZEL_BASE_URL}
+  BAZEL_SHA256          Expected Bazel binary SHA256 for custom versions.
   INSTALL_PREFIX        Tool install directory. Default: ${INSTALL_PREFIX}
   INSTALL_BUILDIFIER=1  Also install buildifier from GitHub releases.
+  BUILDIFIER_SHA256     Expected buildifier SHA256 for custom versions.
+  CURL_MAX_TIME         Max seconds per download. Default: ${CURL_MAX_TIME}
   RUN_BUILD=1           Run bazelisk build //kv_cache_manager:main after setup.
 USAGE
 }
@@ -134,6 +140,45 @@ bazel_arch() {
     esac
 }
 
+default_bazel_sha256() {
+    local arch="$1"
+    case "${BAZEL_VERSION}:${arch}" in
+        6.4.0:x86_64)
+            echo "79e4f370efa6e31717b486af5d9efd95864d0ef13da138582224ac9b2a1bad86"
+            ;;
+        6.4.0:arm64)
+            echo "1df1147765ad4aa23d7f12045b8e8d21b47db40525de69c877ac49234bf2d22d"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+default_buildifier_sha256() {
+    local arch="$1"
+    case "${BUILDIFIER_VERSION}:${arch}" in
+        8.2.1:amd64)
+            echo "6ceb7b0ab7cf66fceccc56a027d21d9cc557a7f34af37d2101edb56b92fcfa1a"
+            ;;
+        8.2.1:arm64)
+            echo "3baa1cf7eb41d51f462fdd1fff3a6a4d81d757275d05b2dd5f48671284e9a1a5"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+download_checked() {
+    local url="$1"
+    local output="$2"
+    local expected_sha256="$3"
+
+    curl -fL --retry 3 --connect-timeout 20 --max-time "${CURL_MAX_TIME}" "${url}" -o "${output}"
+    printf "%s  %s\n" "${expected_sha256}" "${output}" | sha256sum -c -
+}
+
 install_bazel() {
     local current
     current="$(current_bazel_version || true)"
@@ -145,14 +190,24 @@ install_bazel() {
     local arch
     arch="$(bazel_arch)"
     local url="${BAZEL_BASE_URL%/}/${BAZEL_VERSION}/bazel-${BAZEL_VERSION}-linux-${arch}"
+    local expected_sha256="${BAZEL_SHA256}"
+    if [[ -z "${expected_sha256}" ]]; then
+        if ! expected_sha256="$(default_bazel_sha256 "${arch}")"; then
+            echo "No built-in Bazel SHA256 for ${BAZEL_VERSION} on ${arch}; set BAZEL_SHA256." >&2
+            exit 1
+        fi
+    fi
+
     local tmp
     tmp="$(mktemp)"
+    trap 'rm -f "${tmp}"' RETURN
 
     echo "Installing Bazel ${BAZEL_VERSION} from ${url}"
-    curl -fL --retry 3 --connect-timeout 20 "${url}" -o "${tmp}"
+    download_checked "${url}" "${tmp}" "${expected_sha256}"
     run_root install -m 0755 "${tmp}" "${INSTALL_PREFIX}/bazel"
     run_root ln -sf "${INSTALL_PREFIX}/bazel" "${INSTALL_PREFIX}/bazelisk"
     rm -f "${tmp}"
+    trap - RETURN
 }
 
 install_buildifier() {
@@ -175,13 +230,23 @@ install_buildifier() {
     esac
 
     local url="https://github.com/bazelbuild/buildtools/releases/download/v${BUILDIFIER_VERSION}/buildifier-linux-${arch}"
+    local expected_sha256="${BUILDIFIER_SHA256}"
+    if [[ -z "${expected_sha256}" ]]; then
+        if ! expected_sha256="$(default_buildifier_sha256 "${arch}")"; then
+            echo "No built-in buildifier SHA256 for ${BUILDIFIER_VERSION} on ${arch}; set BUILDIFIER_SHA256." >&2
+            exit 1
+        fi
+    fi
+
     local tmp
     tmp="$(mktemp)"
+    trap 'rm -f "${tmp}"' RETURN
 
     echo "Installing buildifier ${BUILDIFIER_VERSION} from ${url}"
-    curl -fL --retry 3 --connect-timeout 20 "${url}" -o "${tmp}"
+    download_checked "${url}" "${tmp}" "${expected_sha256}"
     run_root install -m 0755 "${tmp}" "${INSTALL_PREFIX}/buildifier"
     rm -f "${tmp}"
+    trap - RETURN
 }
 
 verify_build() {
