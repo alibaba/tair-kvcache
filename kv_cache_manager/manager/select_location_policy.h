@@ -63,7 +63,7 @@ NamedStorageWeightedSLPolicy : 解析uri, 如果有相同类型的多个存储�
 
 class StaticWeightSLPolicy : public WeightSLPolicy {
 public:
-    using WeightArray = std::array<uint32_t, 5>;
+    using WeightArray = std::array<uint32_t, static_cast<std::size_t>(DataStorageType::COUNT)>;
 
 protected:
     uint32_t GetWeight(CacheLocationMap::const_reference kv) const override;
@@ -78,11 +78,15 @@ protected:
 protected:
     // 直接用一个简单的映射表来选权重(映射表顺序与DataStorageType一样）
     // 代替switch-case
+    // order follows DataStorageType enum values:
+    // UNKNOWN, HF3FS, MOONCAKE, TAIR_MEMPOOL, NFS, VCNS_HF3FS, DUMMY
     inline static WeightArray default_storage_weights_{StorageTypeWeights::DEFAULT,
                                                        StorageTypeWeights::THREEFS,
                                                        StorageTypeWeights::MOONCAKE,
                                                        StorageTypeWeights::TAIR_MEMPOOL,
-                                                       StorageTypeWeights::NFS};
+                                                       StorageTypeWeights::NFS,
+                                                       StorageTypeWeights::THREEFS,
+                                                       StorageTypeWeights::DEFAULT};
 
     WeightArray &storage_weights_ = default_storage_weights_;
 };

@@ -1338,7 +1338,7 @@ std::unique_ptr<SelectLocationPolicy> CacheManager::genSelectLocationPolicy(Requ
         KVCM_INTERVAL_LOG_WARN(10, "all storages are unavailable!");
         return nullptr;
     }
-    std::array<uint32_t, 5> data_storage_counts{0};
+    std::array<uint32_t, static_cast<std::size_t>(DataStorageType::COUNT)> data_storage_counts{};
     bool is_all_type_only_one = true;
     for (const auto &storage : group_storages) {
         size_t idx = static_cast<size_t>(storage->GetType());
@@ -1348,7 +1348,7 @@ std::unique_ptr<SelectLocationPolicy> CacheManager::genSelectLocationPolicy(Requ
         }
     }
     if (is_all_type_only_one) {
-        StaticWeightSLPolicy::WeightArray weight_array{0};
+        StaticWeightSLPolicy::WeightArray weight_array{};
         for (const auto &storage : group_available_storages) {
             size_t idx = static_cast<size_t>(storage->GetType());
             weight_array[idx] = 1;
