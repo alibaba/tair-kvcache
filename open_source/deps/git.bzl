@@ -1,4 +1,3 @@
-load("@bazel_tools//tools/build_defs/repo:git.bzl", "git_repository", "new_git_repository")
 load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive", "http_file")
 
 # Sanitize a dependency so that it works correctly from code that includes
@@ -7,27 +6,32 @@ def clean_dep(dep):
     return str(Label(dep))
 
 def git_deps():
-    git_repository(
+    http_archive(
         name = "rules_cc",
-        remote = "https://github.com/bazelbuild/rules_cc.git",
-        commit = "1477dbab59b401daa94acedbeaefe79bf9112167",
+        sha256 = "b87996d308549fc3933f57a786004ef65b44b83fd63f1b0303a4bbc3fd26bbaf",
+        strip_prefix = "rules_cc-1477dbab59b401daa94acedbeaefe79bf9112167",
+        type = "tar.gz",
+        urls = ["https://codeload.github.com/bazelbuild/rules_cc/tar.gz/1477dbab59b401daa94acedbeaefe79bf9112167"],
     )
 
-    git_repository(
+    http_archive(
         name = "rules_python",
-        remote = "https://github.com/bazelbuild/rules_python.git",
-        commit = "084b877c98b580839ceab2b071b02fc6768f3de6",
+        sha256 = "3d6fe72f1a056b3462f02afba5049210acbaec131087fb19082fa6792198a9fa",
+        strip_prefix = "rules_python-084b877c98b580839ceab2b071b02fc6768f3de6",
+        type = "tar.gz",
+        urls = ["https://codeload.github.com/bazelbuild/rules_python/tar.gz/084b877c98b580839ceab2b071b02fc6768f3de6"],
         patches = [
             "//patches/rules_python:0001-add-extra-data.patch",
             "//patches/rules_python:0002-remove-import-from-rules_cc.patch",
             "//patches/rules_python:0001-xx.patch",
         ],
     )
-    git_repository(
+    http_archive(
         name = "com_google_googletest",
-        remote = "https://github.com/google/googletest.git",
-        commit = "f8d7d77c06936315286eb55f8de22cd23c188571",
-        shallow_since = "1690989893 -0700",
+        sha256 = "7ff5db23de232a39cbb5c9f5143c355885e30ac596161a6b9fc50c4538bfbf01",
+        strip_prefix = "googletest-f8d7d77c06936315286eb55f8de22cd23c188571",
+        type = "tar.gz",
+        urls = ["https://codeload.github.com/google/googletest/tar.gz/f8d7d77c06936315286eb55f8de22cd23c188571"],
     )
 
     http_archive(
@@ -61,9 +65,12 @@ def git_deps():
         sha256 = "c3e5e9fdd5004dcb542feda5ee4f0ff0744628baf8ed2dd5d66f8ca1197cb1a1",
     )
 
-    git_repository(
+    http_archive(
         name = "com_google_absl",
-        remote = "https://github.com/abseil/abseil-cpp.git",
+        sha256 = "62c27e7a633e965a2f40ff16b487c3b778eae440bab64cad83b34ef1cbe3aa93",
+        strip_prefix = "abseil-cpp-6f9d96a1f41439ac172ee2ef7ccd8edf0e5d068c",
+        type = "tar.gz",
+        urls = ["https://codeload.github.com/abseil/abseil-cpp/tar.gz/6f9d96a1f41439ac172ee2ef7ccd8edf0e5d068c"],
         patch_cmds = [
             "sed -i -e 's/^#define ABSL_OPTION_USE_STD_STRING_VIEW 2/#define ABSL_OPTION_USE_STD_STRING_VIEW 0/' 'absl/base/options.h'",
             "sed 's$@bazel_tools//platforms:(linux|osx|windows|android|freebsd|ios|os)$@platforms//os:\\1$' -E -i absl/BUILD.bazel",
@@ -71,8 +78,6 @@ def git_deps():
             "sed 's$@bazel_tools//platforms:(linux|osx|windows|android|freebsd|ios|os)$@platforms//os:\\1$' -E -i absl/time/internal/cctz/BUILD.bazel",
             "sed 's$@bazel_tools//platforms:(cpu|x86_32|x86_64|ppc|arm|aarch64|s390x)$@platforms//cpu:\\1$' -i -E absl/time/internal/cctz/BUILD.bazel",
         ],
-        commit = "6f9d96a1f41439ac172ee2ef7ccd8edf0e5d068c",
-        shallow_since = "1678195250 +0800",
     )
 
     native.local_repository(
@@ -80,28 +85,31 @@ def git_deps():
         path = "3rdparty/protobuf",
     )
 
-    git_repository(
+    http_archive(
         name = "grpc",
-        remote = "https://github.com/grpc/grpc.git",
-        commit = "109c570727c3089fef655edcdd0dd02cc5958010",
+        sha256 = "ddd5c9c42bc609108c2e9494e9cfa34ea42d0efd0eb4b183db8a4124dabdc1c2",
+        strip_prefix = "grpc-109c570727c3089fef655edcdd0dd02cc5958010",
+        type = "tar.gz",
+        urls = ["https://codeload.github.com/grpc/grpc/tar.gz/109c570727c3089fef655edcdd0dd02cc5958010"],
         patches = ["//patches/grpc:0001-Rename-gettid-functions.patch"],
-        shallow_since = "1552075646 -0800",
     )
 
-    new_git_repository(
+    http_archive(
         name = "rapidjson",
-        remote = "https://github.com/Tencent/rapidjson.git",
-        # tag = "v1.1.0",
-        commit = "f54b0e47a08782a6131cc3d60f94d038fa6e0a51",
+        sha256 = "4a76453d36770c9628d7d175a2e9baccbfbd2169ced44f0cb72e86c5f5f2f7cd",
+        strip_prefix = "rapidjson-f54b0e47a08782a6131cc3d60f94d038fa6e0a51",
+        type = "tar.gz",
+        urls = ["https://codeload.github.com/Tencent/rapidjson/tar.gz/f54b0e47a08782a6131cc3d60f94d038fa6e0a51"],
         patches = ["//3rdparty/rapidjson:0001-document_h.patch"],
         build_file = clean_dep("//3rdparty/rapidjson:rapidjson.BUILD"),
     )
 
-    new_git_repository(
+    http_archive(
         name = "havenask",
-        remote = "https://github.com/alibaba/havenask.git",
-        commit = "3c973500afbd40933eb0a80cfdfb6592274377fb",
-        shallow_since = "1713326599 +0800",
+        sha256 = "e03d63fa06095b612c5ba77e6b668dba4102ee90fdc79f7b45df545e64893b8b",
+        strip_prefix = "havenask-3c973500afbd40933eb0a80cfdfb6592274377fb",
+        type = "tar.gz",
+        urls = ["https://codeload.github.com/alibaba/havenask/tar.gz/3c973500afbd40933eb0a80cfdfb6592274377fb"],
         patches = [
             "//patches/havenask:havenask.patch",
             "//patches/havenask:anet.patch",
@@ -110,28 +118,33 @@ def git_deps():
         build_file = clean_dep("//3rdparty/kmonitor:kmonitor.BUILD"),
     )
 
-    new_git_repository(
+    http_archive(
         name = "nacos_sdk_cpp",
-        remote = "https://github.com/nacos-group/nacos-sdk-cpp.git",
-        commit = "2b4104d2524776dff236a228ad2abff4676fb916",
+        sha256 = "7c020f763b9af9706e84da42250146eb84bfd359c7286f7c1e1aa9a5be42d72d",
+        strip_prefix = "nacos-sdk-cpp-2b4104d2524776dff236a228ad2abff4676fb916",
+        type = "tar.gz",
+        urls = ["https://codeload.github.com/nacos-group/nacos-sdk-cpp/tar.gz/2b4104d2524776dff236a228ad2abff4676fb916"],
         patches = [
             "//patches/nacos_sdk_cpp:nacos-compile.patch",
         ],
         build_file = clean_dep("//3rdparty/nacos_sdk_cpp:nacos_sdk_cpp.BUILD"),
     )
 
-    new_git_repository(
+    http_archive(
         name = "yaml-cpp",
-        remote = "https://github.com/jbeder/yaml-cpp.git",
+        sha256 = "e39f54bd2927692603378e373009e56b4891701cee8af7c27370c36978a43ffa",
+        strip_prefix = "yaml-cpp-9a3624205e8774953ef18f57067b3426c1c5ada6",
+        type = "tar.gz",
+        urls = ["https://codeload.github.com/jbeder/yaml-cpp/tar.gz/9a3624205e8774953ef18f57067b3426c1c5ada6"],
         build_file = clean_dep("//3rdparty/yaml-cpp:BUILD"),
-        commit = "9a3624205e8774953ef18f57067b3426c1c5ada6",
-        shallow_since = "1569430560 -0700",
     )
 
-    new_git_repository(
+    http_archive(
         name = "mooncake",
-        remote = "https://github.com/openanolis/Mooncake.git",  
-        commit = "211b75742b6d1fee739ad9a486f2ae9ce2695847",  
+        sha256 = "eb3f3f53d873d441cbd04cebd76506b56d7526c805da25b8525ed54abc2a06ba",
+        strip_prefix = "Mooncake-211b75742b6d1fee739ad9a486f2ae9ce2695847",
+        type = "tar.gz",
+        urls = ["https://codeload.github.com/openanolis/Mooncake/tar.gz/211b75742b6d1fee739ad9a486f2ae9ce2695847"],
         build_file = clean_dep("//3rdparty/mooncake:mooncake.BUILD"),
         patches = [
             clean_dep("//patches/mooncake:0001-fix-spinlock-gcc10-compat.patch"),
