@@ -1114,7 +1114,7 @@ class MockHiCacheStorage:
             ]
             # insert to kvcm
             trace_id = "1"
-            write_timestamp = int(time.time() * 1000)
+            write_timestamp = int(StateManager.get_global_clock() * 1e6)
             write_token_ids = [1]
             self.storage_manager.WriteCache(
                 self.instance_id,
@@ -1122,6 +1122,7 @@ class MockHiCacheStorage:
                 write_timestamp,
                 int_hash_keys,
                 write_token_ids,
+                200, # ttl驱逐策略新增ttl_seconds，暂定为200s
             )
             return True
         else:
@@ -1143,7 +1144,7 @@ class MockHiCacheStorage:
             int_hash_keys = [_pass_str_to_block_ids(key) for key in keys]
             # Call the kvcm interface to match L3 prefix
             trace_id = "2"
-            read_timestamp = int(time.time() * 1000)
+            read_timestamp = int(StateManager.get_global_clock() * 1e6)
             read_token_ids = [1]
             mask_offset = 0
             res = self.storage_manager.GetCacheLocation(

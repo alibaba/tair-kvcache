@@ -11,6 +11,7 @@
             "quota_capacity" : 12000,
             "used_percentage" : 1.0,
             "hierarchical_eviction_enabled": false,
+            "default_block_ttl_seconds":1200,
             "storages": [
                         {
                             "unique_name": "pace_00",
@@ -31,9 +32,9 @@
                 {
                     "instance_id": "3780643326877293460",
                     "block_size": 16,
-                    "eviction_policy_type": "lru",
+                    "eviction_policy_type": "ttl",
                     "eviction_policy_params": {
-                                "sample_rate": 0.1
+                                "fallback_on_pressure": false
                             }
 
                 }
