@@ -78,7 +78,7 @@ build --copt -Werror
 build --copt -Wno-unknown-pragmas # omp
 build --copt -Wno-sign-compare # alog
 build --copt -Wno-attributes # pybind11
-build --copt -Wno-error=array-bounds # havenask gcc13
+build --per_file_copt=external/havenask/.*@-Wno-error=array-bounds # havenask gcc13
 build --copt -Wno-stringop-truncation # grpc
 build --copt -Wno-stringop-overflow # grpc
 build --copt -Wno-tautological-compare # grpc
