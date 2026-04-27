@@ -13,6 +13,7 @@
 
 import glob
 import os
+from typing import Dict, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -75,15 +76,21 @@ def _load_sp_cumulative(csv_dir, instance_name):
     })
 
 
-def plot_multi_instance_analysis(csv_dir, output_dir: str = None, show_template: bool = True):
+def plot_multi_instance_analysis(
+    csv_dir,
+    output_dir: str = None,
+    show_template: bool = True,
+    bytes_per_block_map: Optional[Dict[str, int]] = None,
+):
     """
     读取 csv_dir 下的命中率 CSV，生成时序分析图。
 
     Args:
-        csv_dir:    CSV 数据目录
-        output_dir: 图表根输出目录，图表保存至 output_dir/timeseries/
-                    默认为 csv_dir（向后兼容）
-        show_template: 是否在图上显示 SP 累积命中率线（需要 template_prefix_traces.csv）
+        csv_dir:             CSV 数据目录
+        output_dir:          图表根输出目录，图表保存至 output_dir/timeseries/
+                             默认为 csv_dir（向后兼容）
+        show_template:       是否在图上显示 SP 累计命中率线（需要 template_prefix_traces.csv）
+        bytes_per_block_map: {instance_id: bytes_per_block}，不提供时存储量以 blocks 显示
     """
     csv_files = sorted(glob.glob(os.path.join(csv_dir, "*_hit_rates.csv")))
     if not csv_files:
@@ -203,7 +210,13 @@ def plot_multi_instance_analysis(csv_dir, output_dir: str = None, show_template:
         allow_exact_matches=True
     )
 
-    total_storage = global_aligned['CachedBlocksAllInstance'].to_numpy(float)    
+    total_storage = global_aligned['CachedBlocksAllInstance'].to_numpy(float)
+    if bytes_per_block_map:
+        rep_bpb = next(iter(bytes_per_block_map.values()))
+        total_storage = total_storage * rep_bpb / (1024 ** 3)
+        storage_label = 'InstanceGroup Storage (GB)'
+    else:
+        storage_label = 'InstanceGroup Storage'
 
     # ---- 画图 ----
     fig, (ax_top, ax_bot) = plt.subplots(
@@ -212,9 +225,9 @@ def plot_multi_instance_analysis(csv_dir, output_dir: str = None, show_template:
     )
 
     def setup_left_axis(ax):
-        ax.set_ylabel('InstanceGroup Storage', color='#1f77b4', fontsize=12)
+        ax.set_ylabel(storage_label, color='#1f77b4', fontsize=12)
         ax.plot(base_timestamps, total_storage, color='#1f77b4',
-                label='InstanceGroup Storage', linewidth=2.2, alpha=0.9,
+                label=storage_label, linewidth=2.2, alpha=0.9,
                 drawstyle='steps-post')
         y_upper = np.nanmax(total_storage) * 1.15 if np.any(~np.isnan(total_storage)) else 1
         ax.set_ylim(0, y_upper)

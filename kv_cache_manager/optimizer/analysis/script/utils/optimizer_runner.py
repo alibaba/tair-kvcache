@@ -16,7 +16,7 @@ import shutil
 import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from kv_cache_manager.optimizer.pybind import kvcm_py_optimizer
 
@@ -77,7 +77,10 @@ def run_optimizer_with_config_explicit(
 
     # 设置容量 / 策略
     for group in config_json.get("instance_groups", []):
-        group["quota_capacity"] = capacity
+        # quota_capacity in config is GB; convert blocks -> GB for C++ FromRapidValue (bytes internally)
+        inst = group.get("instances", [{}])[0] if group.get("instances") else {}
+        bpb = inst.get("bytes_per_token", 0) * inst.get("block_size", 0)
+        group["quota_capacity"] = capacity * bpb / (1024 ** 3) if bpb > 0 else capacity
         if policy is not None:
             for instance in group.get("instances", []):
                 instance["eviction_policy_type"] = policy
@@ -111,12 +114,45 @@ def run_optimizer_with_config_explicit(
 
 
 # ============================================================================
+# 配置工具
+# ============================================================================
+
+def extract_bytes_per_block_map(config_path: str) -> Dict[str, int]:
+    """
+    从 config JSON 提取每个 instance 的 bytes_per_block。
+
+    bytes_per_block = block_size × bytes_per_token
+    所有 instance 必须配置 bytes_per_token 且 block_size > 0，否则抛异常。
+
+    Returns:
+        {instance_id: bytes_per_block}
+    """
+    with open(config_path, "r") as f:
+        config_json = json.load(f)
+
+    result: Dict[str, int] = {}
+    for group in config_json.get("instance_groups", []):
+        for inst in group.get("instances", []):
+            bpt = inst.get("bytes_per_token", 0)
+            bs = inst.get("block_size", 0)
+            iid = inst.get("instance_id", "<unknown>")
+            if bpt <= 0 or bs <= 0:
+                raise ValueError(
+                    f"Instance '{iid}' is missing bytes_per_token or block_size configuration. "
+                    "bytes_per_token is required to display storage in GB."
+                )
+            result[iid] = bs * bpt
+    return result
+
+
+# ============================================================================
 # Warmup Pass
 # ============================================================================
 
 def warmup_pass(
     config_path: str,
     warmup_capacity: int,
+    bytes_per_block_map: Dict[str, int],
     policy: str = None,
     enable_lifecycle_tracking: bool = False,
     enable_template_analysis: bool = False,
@@ -145,9 +181,11 @@ def warmup_pass(
         df = pd.read_csv(first_csv)
         max_blocks = int(df["CachedBlocksAllInstance"].max())
 
+        rep_bpb = next(iter(bytes_per_block_map.values()))
+        max_gb = max_blocks * rep_bpb / (1024 ** 3)
         acc_read = int(df["AccReadBlocks"].iloc[-1]) if "AccReadBlocks" in df.columns else 0
         acc_write = int(df["AccWriteBlocks"].iloc[-1]) if "AccWriteBlocks" in df.columns else 0
-        print(f"Warmup done. Max cached: {max_blocks}, AccReadBlocks: {acc_read}, AccWriteBlocks: {acc_write}")
+        print(f"Warmup done. Max cached: {max_gb:.2f} GB ({max_blocks} blocks), AccReadBlocks: {acc_read}, AccWriteBlocks: {acc_write}")
 
         return max_blocks
     finally:
@@ -168,6 +206,7 @@ def run_single_experiment(
     policy: str,
     exp_id: int,
     total_exps: int,
+    bytes_per_block_map: Dict[str, int],
     save_csv_to: str = None,
     enable_lifecycle_tracking: bool = False,
     enable_template_analysis: bool = False,
@@ -180,7 +219,7 @@ def run_single_experiment(
             "policy": str,
             "capacity": int,
             "instances": {instance_id: {"total": float, "internal": float,
-                                        "external": float, "cached_blocks_all": int}},
+                                        "external": float, "cached_gb": float}},
             "success": bool,
             "error": str | None,
         }
@@ -209,14 +248,14 @@ def run_single_experiment(
 
         instance_metrics = {}
         for iid, csv_file in csv_map.items():
-            metrics = parse_instance_metrics(csv_file)
+            metrics = parse_instance_metrics(csv_file, bytes_per_block_map[iid])
             if metrics is None:
                 continue
             instance_metrics[iid] = {
                 "total": metrics["acc_total_hit_rate"],
                 "internal": metrics["acc_internal_hit_rate"],
                 "external": metrics["acc_external_hit_rate"],
-                "cached_blocks_all": metrics["cached_blocks_all"],
+                "cached_gb": metrics["cached_gb"],
             }
 
         result["instances"] = instance_metrics
@@ -241,6 +280,7 @@ def run_single_experiment(
 def run_experiments_parallel(
     config_path: str,
     experiments: List[tuple],
+    bytes_per_block_map: Dict[str, int],
     max_workers: int = 4,
     save_csv_dir: str = None,
     enable_lifecycle_tracking: bool = False,
@@ -268,6 +308,7 @@ def run_experiments_parallel(
         tasks.append((
             config_path, capacity, policy,
             i + 1, len(experiments),
+            bytes_per_block_map,
             csv_subdir, enable_lifecycle_tracking,
             enable_template_analysis,
         ))

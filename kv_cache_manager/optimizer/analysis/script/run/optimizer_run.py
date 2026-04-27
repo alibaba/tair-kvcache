@@ -14,7 +14,7 @@ import time
 
 from kv_cache_manager.optimizer.pybind import kvcm_py_optimizer
 
-from utils.optimizer_runner import init_kvcm_logger
+from utils.optimizer_runner import init_kvcm_logger, extract_bytes_per_block_map
 from plot.hit_rate_plot import plot_multi_instance_analysis
 
 
@@ -87,7 +87,12 @@ def main():
     if args.draw_chart:
         t5 = time.time()
         print("\n[5/5] Generating charts...")
-        plot_multi_instance_analysis(output_path, output_path, show_template=args.enable_template_analysis)
+        bytes_per_block_map = extract_bytes_per_block_map(args.config)
+        plot_multi_instance_analysis(
+            output_path, output_path,
+            show_template=args.enable_template_analysis,
+            bytes_per_block_map=bytes_per_block_map,
+        )
         print("      Charts done: {:.2f}s".format(time.time() - t5))
     else:
         print("\n[5/5] Skipping chart generation.")

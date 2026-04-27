@@ -87,16 +87,16 @@ OptEvictionManager::EvictByGroupRough(const std::string &instance_id,
                                       const OptInstanceGroupConfig &instance_group_config) {
     std::unordered_map<std::string, std::vector<BlockEntry *>> evict_blocks;
     auto group_name = instance_group_config.group_name();
-    size_t excess = GetExcessUsageForInstanceInGroup(instance_group_config);
-    if (excess == 0) {
+    size_t excess_bytes = GetExcessUsageForInstanceInGroup(instance_group_config);
+    if (excess_bytes == 0) {
         // 不需要驱逐
         return evict_blocks;
     }
-    KVCM_LOG_DEBUG("Evicting blocks for group: %s, excess: %zu", group_name.c_str(), excess);
+    KVCM_LOG_DEBUG("Evicting blocks for group: %s, excess: %zu bytes", group_name.c_str(), excess_bytes);
     // 循环驱逐直到达到 excess 数量
-    size_t total_evicted = 0;
+    size_t total_evicted_bytes = 0;
     size_t round = 0;
-    while (total_evicted < excess) {
+    while (total_evicted_bytes < excess_bytes) {
         round++;
         bool any_evicted_this_round = false;
         for (const auto &instance_config : instance_group_config.instances()) {
@@ -114,31 +114,35 @@ OptEvictionManager::EvictByGroupRough(const std::string &instance_id,
                 eviction_policy->EvictBlocks(eviction_config_.eviction_batch_size_per_instance());
             if (!instance_evicted_blocks.empty()) {
                 any_evicted_this_round = true;
-                total_evicted += instance_evicted_blocks.size();
+                const size_t evicted_bytes =
+                    instance_evicted_blocks.size() * static_cast<size_t>(instance_config.bytes_per_block());
+                total_evicted_bytes += evicted_bytes;
                 evict_blocks[instance_id_in_group].insert(evict_blocks[instance_id_in_group].end(),
                                                           instance_evicted_blocks.begin(),
                                                           instance_evicted_blocks.end());
-                KVCM_LOG_DEBUG("Round %zu: Evicted %zu blocks from instance: %s (total: %zu/%zu)",
+                KVCM_LOG_DEBUG("Round %zu: Evicted %zu blocks (%zu bytes) from instance: %s (total: %zu/%zu bytes)",
                                round,
                                instance_evicted_blocks.size(),
+                               evicted_bytes,
                                instance_id_in_group.c_str(),
-                               total_evicted,
-                               excess);
+                               total_evicted_bytes,
+                               excess_bytes);
             }
         }
         // 如果这一轮没有任何实例驱逐到块，说明已经无可驱逐的块了，退出循环
         if (!any_evicted_this_round) {
-            KVCM_LOG_WARN("No more blocks can be evicted from any instance in group: %s (evicted: %zu, required: %zu)",
+            KVCM_LOG_WARN("No more blocks can be evicted from any instance in group: %s (evicted: %zu bytes, required: "
+                          "%zu bytes)",
                           group_name.c_str(),
-                          total_evicted,
-                          excess);
+                          total_evicted_bytes,
+                          excess_bytes);
             break;
         }
     }
-    KVCM_LOG_DEBUG("Eviction completed for group: %s, total evicted: %zu, required: %zu, rounds: %zu",
+    KVCM_LOG_DEBUG("Eviction completed for group: %s, total evicted: %zu bytes, required: %zu bytes, rounds: %zu",
                    group_name.c_str(),
-                   total_evicted,
-                   excess,
+                   total_evicted_bytes,
+                   excess_bytes,
                    round);
     return evict_blocks;
 }
@@ -147,14 +151,22 @@ std::unordered_map<std::string, std::vector<BlockEntry *>>
 OptEvictionManager::EvictByInstanceRough(const std::string &instance_id,
                                          const OptInstanceGroupConfig &instance_group_config) {
     std::unordered_map<std::string, std::vector<BlockEntry *>> evict_blocks;
-    size_t excess = GetExcessUsageForInstanceInGroup(instance_group_config);
-    if (excess == 0) {
+    size_t excess_bytes = GetExcessUsageForInstanceInGroup(instance_group_config);
+    if (excess_bytes == 0) {
         // 不需要驱逐
         return evict_blocks;
     }
-    KVCM_LOG_DEBUG("Evicting blocks for instance: %s, excess: %zu", instance_id.c_str(), excess);
+    KVCM_LOG_DEBUG("Evicting blocks for instance: %s, excess: %zu bytes", instance_id.c_str(), excess_bytes);
+    // Find bytes_per_block for the target instance
+    int64_t bpb = 1;
+    for (const auto &ic : instance_group_config.instances()) {
+        if (ic.instance_id() == instance_id) {
+            bpb = ic.bytes_per_block();
+            break;
+        }
+    }
     // 循环驱逐直到达到 excess 数量
-    size_t total_evicted = 0;
+    size_t total_evicted_bytes = 0;
     size_t round = 0;
     auto it = instance_eviction_policy_map_.find(instance_id);
     if (it == instance_eviction_policy_map_.end()) {
@@ -162,27 +174,27 @@ OptEvictionManager::EvictByInstanceRough(const std::string &instance_id,
         return evict_blocks;
     }
     auto eviction_policy = it->second;
-    while (total_evicted < excess) {
+    while (total_evicted_bytes < excess_bytes) {
         round++;
         // 每轮驱逐 eviction_batch_size_per_instance_ 个块
         auto round_evicted_blocks = eviction_policy->EvictBlocks(eviction_config_.eviction_batch_size_per_instance());
         if (round_evicted_blocks.empty()) {
             // 无法驱逐更多块了
-            KVCM_LOG_WARN("No more blocks can be evicted from instance: %s (evicted: %zu, required: %zu)",
+            KVCM_LOG_WARN("No more blocks can be evicted from instance: %s (evicted: %zu bytes, required: %zu bytes)",
                           instance_id.c_str(),
-                          total_evicted,
-                          excess);
+                          total_evicted_bytes,
+                          excess_bytes);
             break;
         }
         evict_blocks[instance_id].insert(
             evict_blocks[instance_id].end(), round_evicted_blocks.begin(), round_evicted_blocks.end());
-        total_evicted += round_evicted_blocks.size();
-        KVCM_LOG_DEBUG("Round %zu: Evicted %zu blocks from instance: %s (total: %zu/%zu)",
+        total_evicted_bytes += round_evicted_blocks.size() * static_cast<size_t>(bpb);
+        KVCM_LOG_DEBUG("Round %zu: Evicted %zu blocks from instance: %s (total: %zu/%zu bytes)",
                        round,
                        round_evicted_blocks.size(),
                        instance_id.c_str(),
-                       total_evicted,
-                       excess);
+                       total_evicted_bytes,
+                       excess_bytes);
     }
     return evict_blocks;
 }
@@ -191,74 +203,83 @@ std::unordered_map<std::string, std::vector<BlockEntry *>>
 OptEvictionManager::EvictByInstancePrecise(const std::string &instance_id,
                                            const OptInstanceGroupConfig &instance_group_config) {
     std::unordered_map<std::string, std::vector<BlockEntry *>> evict_blocks;
-    size_t excess = GetExcessUsageForInstanceInGroup(instance_group_config);
-    if (excess == 0) {
+    size_t excess_bytes = GetExcessUsageForInstanceInGroup(instance_group_config);
+    if (excess_bytes == 0) {
         // 不需要驱逐
         return evict_blocks;
     }
-    KVCM_LOG_DEBUG("Evicting blocks for instance: %s, excess: %zu", instance_id.c_str(), excess);
+    KVCM_LOG_DEBUG("Evicting blocks for instance: %s, excess: %zu bytes", instance_id.c_str(), excess_bytes);
+    // Find bytes_per_block for the target instance
+    int64_t bpb = 1;
+    for (const auto &ic : instance_group_config.instances()) {
+        if (ic.instance_id() == instance_id) {
+            bpb = ic.bytes_per_block();
+            break;
+        }
+    }
     auto it = instance_eviction_policy_map_.find(instance_id);
     if (it == instance_eviction_policy_map_.end()) {
         KVCM_LOG_ERROR("Eviction policy not found for instance: %s", instance_id.c_str());
         return evict_blocks;
     }
-    size_t total_evicted = 0;
+    size_t total_evicted_bytes = 0;
     size_t round = 0;
     auto eviction_policy = it->second;
-    while (total_evicted < excess) {
+    while (total_evicted_bytes < excess_bytes) {
         round++;
-        auto evict_count =
-            std::min(eviction_config_.eviction_batch_size_per_instance(), static_cast<int32_t>(excess - total_evicted));
+        const size_t remaining_bytes = excess_bytes - total_evicted_bytes;
+        const size_t remaining_blocks = (remaining_bytes + static_cast<size_t>(bpb) - 1) / static_cast<size_t>(bpb);
+        auto evict_count = static_cast<int32_t>(
+            std::min(static_cast<size_t>(eviction_config_.eviction_batch_size_per_instance()), remaining_blocks));
         // 每轮驱逐 eviction_batch_size_per_instance_ 个块
         auto round_evicted_blocks = eviction_policy->EvictBlocks(evict_count);
         if (round_evicted_blocks.empty()) {
             // 无法驱逐更多块了
-            KVCM_LOG_WARN("No more blocks can be evicted from instance: %s (evicted: %zu, required: %zu)",
+            KVCM_LOG_WARN("No more blocks can be evicted from instance: %s (evicted: %zu bytes, required: %zu bytes)",
                           instance_id.c_str(),
-                          total_evicted,
-                          excess);
+                          total_evicted_bytes,
+                          excess_bytes);
             break;
         }
         evict_blocks[instance_id].insert(
             evict_blocks[instance_id].end(), round_evicted_blocks.begin(), round_evicted_blocks.end());
-        total_evicted += round_evicted_blocks.size();
-        KVCM_LOG_DEBUG("Round %zu: Evicted %zu blocks from instance: %s (total: %zu/%zu)",
+        total_evicted_bytes += round_evicted_blocks.size() * static_cast<size_t>(bpb);
+        KVCM_LOG_DEBUG("Round %zu: Evicted %zu blocks from instance: %s (total: %zu/%zu bytes)",
                        round,
                        round_evicted_blocks.size(),
                        instance_id.c_str(),
-                       total_evicted,
-                       excess);
+                       total_evicted_bytes,
+                       excess_bytes);
     }
     return evict_blocks;
 }
 
-size_t OptEvictionManager::GetCurrentGroupUsage(const OptInstanceGroupConfig &instance_group_config) const {
-    size_t current_group_used = 0;
+size_t OptEvictionManager::GetCurrentGroupUsageBytes(const OptInstanceGroupConfig &instance_group_config) const {
+    size_t current_group_used_bytes = 0;
 
     for (const auto &instance_config : instance_group_config.instances()) {
-        current_group_used += instance_eviction_policy_map_.at(instance_config.instance_id())->size();
+        current_group_used_bytes += instance_eviction_policy_map_.at(instance_config.instance_id())->size() *
+                                    static_cast<size_t>(instance_config.bytes_per_block());
     }
-    return current_group_used;
+    return current_group_used_bytes;
 }
 
 size_t OptEvictionManager::GetExcessUsageForInstanceInGroup(const OptInstanceGroupConfig &instance_group_config) const {
-    size_t excess = 0;
-
-    int64_t group_capacity = 0;
+    // group_capacity and tier capacity are stored in bytes
+    int64_t group_capacity_bytes = 0;
     // TODO 多层容量计算的简单实现，后续优化
     if (instance_group_config.hierarchical_eviction_enabled()) {
-        group_capacity = instance_group_config.storages().front().capacity();
+        group_capacity_bytes = instance_group_config.storages().front().capacity();
     } else {
-        group_capacity = instance_group_config.quota_capacity();
+        group_capacity_bytes = instance_group_config.quota_capacity();
     }
     auto used_percentage = instance_group_config.used_percentage();
-    size_t current_group_used = GetCurrentGroupUsage(instance_group_config);
-    size_t projected_used = current_group_used;
-    size_t quota = static_cast<size_t>(group_capacity * used_percentage);
-    if (projected_used > quota) {
-        excess = projected_used - quota;
+    size_t current_group_used_bytes = GetCurrentGroupUsageBytes(instance_group_config);
+    size_t quota_bytes = static_cast<size_t>(group_capacity_bytes * used_percentage);
+    if (current_group_used_bytes > quota_bytes) {
+        return current_group_used_bytes - quota_bytes;
     }
-    return excess;
+    return 0;
 }
 
 size_t OptEvictionManager::GetCurrentInstanceUsage(const std::string &instance_id) const {

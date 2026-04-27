@@ -23,7 +23,7 @@ public:
     std::unordered_map<std::string, std::vector<BlockEntry *>>
     EvictByMode(const std::string &instance_id, const OptInstanceGroupConfig &instance_group_config);
 
-    size_t GetCurrentGroupUsage(const OptInstanceGroupConfig &instance_group_config) const;
+    size_t GetCurrentGroupUsageBytes(const OptInstanceGroupConfig &instance_group_config) const;
     size_t GetCurrentInstanceUsage(const std::string &instance_id) const;
     size_t GetExcessUsageForInstanceInGroup(const OptInstanceGroupConfig &instance_group_config) const;
 
