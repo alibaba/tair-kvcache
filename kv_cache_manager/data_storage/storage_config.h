@@ -16,6 +16,8 @@ enum class DataStorageType : uint8_t {
     DATA_STORAGE_TYPE_VCNS_HF3FS = 5,
     DATA_STORAGE_TYPE_DUMMY = 6,
     COUNT, // as sentinel
+    DATA_STORAGE_TYPE_VINEYARD = 7,
+    COUNT, // as sentinel, must be last
 };
 
 std::string ToString(const DataStorageType &type);

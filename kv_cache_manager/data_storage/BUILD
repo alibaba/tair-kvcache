@@ -8,6 +8,7 @@ cc_library(
         "hf3fs_backend.cc",
         "mooncake_backend.cc",
         "nfs_backend.cc",
+        "vineyard_backend.cc",
     ],
     hdrs = [
         "data_storage_backend.h",
@@ -16,6 +17,7 @@ cc_library(
         "hf3fs_backend.h",
         "mooncake_backend.h",
         "nfs_backend.h",
+        "vineyard_backend.h",
     ],
     deps = [
         # 不一定用
@@ -33,12 +35,14 @@ cc_library(
     name = "common_define",
     srcs = [
         "storage_config.cc",
+        "vineyard_storage_spec.cc",
     ],
     hdrs = [
         "common_define.h",
         "data_storage_backend.h",
         "data_storage_uri.h",
         "storage_config.h",
+        "vineyard_storage_spec.h",
     ],
     deps = [
         "//kv_cache_manager/common",

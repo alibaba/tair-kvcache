@@ -103,4 +103,12 @@ grpc::Status MetaServiceGRpc::GetClusterInfo(grpc::ServerContext *context,
     return grpc::Status::OK;
 }
 
+grpc::Status MetaServiceGRpc::ReportEvent(grpc::ServerContext *context,
+                                          const proto::meta::ReportEventRequest *request,
+                                          proto::meta::ReportEventResponse *response) {
+    API_CONTEXT_INIT_GRPC(ReportEvent);
+    meta_service_impl_->ReportEvent(request_context, request, response);
+    return grpc::Status::OK;
+}
+
 } // namespace kv_cache_manager

@@ -125,6 +125,13 @@ public:
                           const KeyVector &keys,
                           const TokenIdsVector &tokens,
                           const BlockMask &block_mask /*TODO*/);
+
+    // ReportEvent: entry point for all V6D-side events (node registration,
+    // block add/delete, host down).  Called from MetaServiceImpl which is
+    // shared by both gRPC and HTTP handlers.
+    ErrorCode ReportEvent(RequestContext *request_context,
+                          const proto::meta::ReportEventRequest *request,
+                          proto::meta::ReportEventResponse *response);
     ErrorCode TrimCache(RequestContext *request_context,
                         const std::string &instance_id,
                         const proto::meta::TrimStrategy &trim_strategy,
@@ -184,6 +191,11 @@ private:
     std::pair<ErrorCode, int64_t> GetBlockSize(RequestContext *request_context, const std::string &instance_id) const;
     void FilterLocationSpecByName(CacheLocationVector &locations, const std::vector<std::string> &location_spec_names);
     std::string GetStorageConfigStr(RequestContext *request_context, const std::string &instance_id) const;
+
+    // Asynchronously scan and delete all CacheLocation entries that belong to
+    // the given V6D node (identified by host_ip_port) within an instance.
+    // Submitted to SchedulePlanExecutor by the EVENT_HOST_DOWN handler.
+    void CleanupHostLocations(const std::string &instance_id, const std::string &host_ip_port);
     ErrorCode GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
                                           RequestContext *request_context,
                                           const std::string &instance_id,

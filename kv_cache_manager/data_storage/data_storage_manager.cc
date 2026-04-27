@@ -10,6 +10,7 @@
 #include "kv_cache_manager/data_storage/mooncake_backend.h"
 #include "kv_cache_manager/data_storage/nfs_backend.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
+#include "kv_cache_manager/data_storage/vineyard_backend.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "stub_source/kv_cache_manager/data_storage/tair_mempool_backend.h"
@@ -172,6 +173,8 @@ std::shared_ptr<DataStorageBackend> DataStorageManager::CreateStorageBackend(con
         return std::make_shared<NfsBackend>(metrics_registry_);
     case DataStorageType::DATA_STORAGE_TYPE_DUMMY:
         return std::make_shared<DummyBackend>(metrics_registry_);
+    case DataStorageType::DATA_STORAGE_TYPE_VINEYARD:
+        return std::make_shared<VineyardBackend>(metrics_registry_);
     default:
         return nullptr;
     }
