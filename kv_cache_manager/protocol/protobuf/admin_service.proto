@@ -112,7 +112,7 @@ message StorageConfig {
         NfsStorageSpec nfs = 6;
         VcnsThreeFSStorageSpec vcnsthreefs = 7;
         DummyStorageSpec dummy = 9;
-        VineyardStorageSpec vineyard = 9;
+        VineyardStorageSpec vineyard = 10;
     }
     bool check_storage_available_when_open = 8;
 }

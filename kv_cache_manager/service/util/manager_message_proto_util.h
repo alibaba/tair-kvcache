@@ -296,6 +296,8 @@ void ProtoConvert::DataStorageTypeToProto(const DataStorageType &data_storage_ty
     }
     case DataStorageType::DATA_STORAGE_TYPE_DUMMY: {
         *proto_data_storage_type = T::ST_DUMMY;
+        break;
+    }
     case DataStorageType::DATA_STORAGE_TYPE_VINEYARD: {
         *proto_data_storage_type = T::ST_VINEYARD;
         break;
@@ -338,6 +340,8 @@ void ProtoConvert::DataStorageTypeFromProto(const T proto_data_storage_type, Dat
     }
     case T::ST_DUMMY: {
         data_storage_type_info = DataStorageType::DATA_STORAGE_TYPE_DUMMY;
+        break;
+    }
     case T::ST_VINEYARD: {
         data_storage_type_info = DataStorageType::DATA_STORAGE_TYPE_VINEYARD;
         break;

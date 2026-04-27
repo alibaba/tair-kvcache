@@ -42,6 +42,9 @@ public:
     grpc::Status StartWriteCache(grpc::ServerContext *context,
                                  const proto::meta::StartWriteCacheRequest *request,
                                  proto::meta::StartWriteCacheResponse *response) override;
+    grpc::Status StartEvictWriteCache(grpc::ServerContext *context,
+                                      const proto::meta::StartEvictWriteCacheRequest *request,
+                                      proto::meta::StartWriteCacheResponse *response) override;
     grpc::Status FinishWriteCache(grpc::ServerContext *context,
                                   const proto::meta::FinishWriteCacheRequest *request,
                                   proto::meta::CommonResponse *response) override;

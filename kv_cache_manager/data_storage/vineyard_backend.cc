@@ -11,7 +11,6 @@
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
-#include "kv_cache_manager/data_storage/vineyard_storage_spec.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
 namespace kv_cache_manager {

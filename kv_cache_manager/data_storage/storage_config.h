@@ -15,7 +15,6 @@ enum class DataStorageType : uint8_t {
     DATA_STORAGE_TYPE_NFS = 4,
     DATA_STORAGE_TYPE_VCNS_HF3FS = 5,
     DATA_STORAGE_TYPE_DUMMY = 6,
-    COUNT, // as sentinel
     DATA_STORAGE_TYPE_VINEYARD = 7,
     COUNT, // as sentinel, must be last
 };
@@ -191,6 +190,20 @@ public:
 private:
     std::string root_path_;
     int32_t key_count_per_file_ = 0;
+};
+
+class VineyardStorageSpec : public StorageSpec {
+public:
+    bool FromRapidValue(const rapidjson::Value &rapid_value) override;
+    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
+    bool ValidateRequiredFields(std::string &invalid_fields) const override;
+    std::string ToString() const override;
+
+    const std::string &cluster_name() const { return cluster_name_; }
+    void set_cluster_name(const std::string &cluster_name) { cluster_name_ = cluster_name; }
+
+private:
+    std::string cluster_name_;
 };
 
 class StorageConfig : public Jsonizable {
