@@ -13,6 +13,7 @@
 
 #include "kv_cache_manager/config/meta_indexer_config.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
+#include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_storage_backend.h"
 
@@ -28,13 +29,19 @@ class MetaIndexer {
 public:
     using KeyType = int64_t;
     using KeyVector = std::vector<KeyType>;
-    using UriType = std::string;
-    using UriVector = std::vector<UriType>;
+
+    // Location-granularity types
+    using LocationId = std::string;
+    using LocationIdVector = std::vector<LocationId>;
+    using LocationMap = std::unordered_map<LocationId, CacheLocation>;
+    using LocationMapVector = std::vector<LocationMap>;
+    using LocationIdsPerKey = std::vector<LocationIdVector>;
+    using LocationsPerKey = std::vector<CacheLocationVector>;
+
     using PropertyMap = std::map<std::string, std::string>;
     using PropertyMapVector = std::vector<PropertyMap>;
-    // Define the uri modifier function type for ReadModifyWrite
-    // Parameters: uri string, get uri error code, index
-    // Return value: std::pair<ModifierAction, ErrorCode>
+
+    // Modifier action codes shared by both block-level and location-level RMW.
     enum ModifierAction {
         MA_OK = 1,
         MA_FAIL = 2,
@@ -42,53 +49,137 @@ public:
         MA_DELETE = 4
     };
     using ModifierResult = std::pair<ModifierAction, ErrorCode>;
-    using ModifierFunc = std::function<ModifierResult(std::string &, ErrorCode, size_t, PropertyMap &)>;
+
+    // Block-level modifier: sees the entire LocationMap of one block_key.
+    // Suitable when the modifier needs a global view (e.g. allocate a unique
+    // location_id, or write block-level property like _prev_key_).
+    using BlockModifierFunc = std::function<ModifierResult(
+        LocationMap & /*loc_map*/, ErrorCode /*get_ec*/, size_t /*key_index*/, PropertyMap & /*upsert_property_map*/)>;
+
+    // Lightweight block-level modifier: only sees the existing location id list
+    // (no location values are deserialized). The modifier can produce new
+    // CacheLocations to be written via the output LocationMap.
+    using BlockIdsOnlyModifierFunc = std::function<ModifierResult(const LocationIdVector & /*existing_ids*/,
+                                                                  ErrorCode /*get_ec*/,
+                                                                  size_t /*key_index*/,
+                                                                  PropertyMap & /*upsert_property_map*/,
+                                                                  LocationMap & /*out_new_locations*/)>;
+
+    // Location-level modifier: sees one (block_key, location_id, CacheLocation) at a time.
+    // Backend only reads/writes the specified location field.
+    using LocationModifierFunc = std::function<ModifierResult(CacheLocation & /*loc*/,
+                                                              ErrorCode /*get_ec*/,
+                                                              size_t /*key_index*/,
+                                                              const LocationId & /*loc_id*/,
+                                                              PropertyMap & /*upsert_property_map*/)>;
 
 public:
+    // Per-key result.
     struct Result {
         ErrorCode ec = EC_OK;
         std::vector<ErrorCode> error_codes; // per_key_ec
-        Result(ErrorCode error_code) : ec(error_code) {}
-        Result(size_t count) : ec(EC_OK), error_codes(count, EC_OK) {}
+        explicit Result(ErrorCode error_code) : ec(error_code) {}
+        explicit Result(size_t count) : ec(EC_OK), error_codes(count, EC_OK) {}
+    };
+
+    // Per-(key, location_id) result for location-granularity APIs.
+    struct LocationResult {
+        ErrorCode ec = EC_OK;
+        // [i][j] is the ec of keys[i]'s j-th selected location.
+        std::vector<std::vector<ErrorCode>> per_location_error_codes;
+        explicit LocationResult(ErrorCode error_code) : ec(error_code) {}
+        explicit LocationResult(const LocationIdsPerKey &location_ids) : ec(EC_OK) {
+            per_location_error_codes.resize(location_ids.size());
+            for (size_t i = 0; i < location_ids.size(); ++i) {
+                per_location_error_codes[i].assign(location_ids[i].size(), EC_OK);
+            }
+        }
     };
 
 public:
-    /// @brief Initialize the meta indexer.
     MetaIndexer() = default;
     ~MetaIndexer();
 
     ErrorCode Init(const std::string &instance_id, const std::shared_ptr<MetaIndexerConfig> &config) noexcept;
 
-    Result Put(RequestContext *request_context,
-               const KeyVector &keys,
-               UriVector &uris,
-               PropertyMapVector &properties) noexcept;
+    // ---------- Put ----------
+    // Whole-block put: replace keys[i]'s entire location set with location_maps[i].
+    Result PutLocations(RequestContext *request_context,
+                        const KeyVector &keys,
+                        LocationMapVector &location_maps,
+                        PropertyMapVector &properties) noexcept;
+    // Per-location upsert: insert/overwrite the specified locations on each key,
+    // leaving other locations on the same block untouched.
+    // The CacheLocation::id() of each element MUST be set by the caller.
+    LocationResult UpsertLocations(RequestContext *request_context,
+                                   const KeyVector &keys,
+                                   LocationsPerKey &locations,
+                                   PropertyMapVector &properties) noexcept;
 
-    Result Update(RequestContext *request_context, const KeyVector &keys, PropertyMapVector &properties) noexcept;
-    Result Update(RequestContext *request_context,
-                  const KeyVector &keys,
-                  UriVector &uris,
-                  PropertyMapVector &properties) noexcept;
-    Result
-    ReadModifyWrite(RequestContext *request_context, const KeyVector &keys, const ModifierFunc &modifier) noexcept;
-
-    Result Delete(RequestContext *request_context, const KeyVector &keys) noexcept;
-
+    // ---------- Get ----------
     Result Exist(RequestContext *request_context, const KeyVector &keys, std::vector<bool> &out_exists) noexcept;
-    Result Get(RequestContext *request_context, const KeyVector &keys, UriVector &out_uris) noexcept;
+    // Whole-block get + business properties.
     Result Get(RequestContext *request_context,
                const KeyVector &keys,
-               UriVector &out_uris,
+               LocationMapVector &out_location_maps,
                PropertyMapVector &out_properties) noexcept;
+    // Whole-block get: fetch every location of each block_key.
+    Result
+    GetLocations(RequestContext *request_context, const KeyVector &keys, LocationMapVector &out_location_maps) noexcept;
+    // Per-location get: fetch only the specified location_ids for each block_key.
+    LocationResult GetLocations(RequestContext *request_context,
+                                const KeyVector &keys,
+                                const LocationIdsPerKey &location_ids,
+                                LocationsPerKey &out_locations) noexcept;
+    // Fetch only block-level business properties (no location data is read).
     Result GetProperties(RequestContext *request_context,
                          const KeyVector &keys,
                          const std::vector<std::string> &property_names,
                          PropertyMapVector &out_properties) noexcept;
 
+    // ---------- Modify ----------
+    // Block-level RMW: modifier sees the whole LocationMap; can add/remove/update
+    // multiple locations atomically under the per-block mutex.
+    Result ReadModifyWriteBlock(RequestContext *request_context,
+                                const KeyVector &keys,
+                                const BlockModifierFunc &modifier) noexcept;
+    // Lightweight block-level RMW: backend only reads the existing location id
+    // list (e.g. HKEYS) instead of the full location values. The modifier
+    // inspects the id list, optionally produces new CacheLocations to be written
+    // via out_new_locations. This avoids deserializing any existing location.
+    Result ReadModifyWriteBlock(RequestContext *request_context,
+                                const KeyVector &keys,
+                                const BlockIdsOnlyModifierFunc &modifier) noexcept;
+    // Location-level RMW: modifier is invoked per (key, location_id), and the
+    // backend only reads/writes the targeted location field. If the modifier
+    // returns MA_DELETE the field is removed; if all locations of a block end
+    // up removed, the whole block_key is deleted and key_count_ is adjusted.
+    LocationResult ReadModifyWriteLocation(RequestContext *request_context,
+                                           const KeyVector &keys,
+                                           const LocationIdsPerKey &location_ids,
+                                           const LocationModifierFunc &modifier) noexcept;
+    // Update only block-level properties (does not touch any location).
+    Result
+    UpdateProperties(RequestContext *request_context, const KeyVector &keys, PropertyMapVector &properties) noexcept;
+
+    // ---------- Delete ----------
+    // Delete the whole block_key (including all locations).
+    Result Delete(RequestContext *request_context, const KeyVector &keys) noexcept;
+    // Delete the specified locations on each block_key. If after deletion a
+    // block_key has zero locations left, the whole block_key is removed and
+    // key_count_ is adjusted. The deleted CacheLocation objects are returned
+    // via out_deleted_locations so the caller can update storage usage stats.
+    LocationResult DeleteLocations(RequestContext *request_context,
+                                   const KeyVector &keys,
+                                   const LocationIdsPerKey &location_ids,
+                                   LocationsPerKey &out_deleted_locations) noexcept;
+
+    // ---------- Scan / Sample ----------
     ErrorCode
     Scan(const std::string &cursor, const size_t limit, std::string &out_next_cursor, KeyVector &out_keys) noexcept;
     ErrorCode RandomSample(RequestContext *request_context, const size_t count, KeyVector &out_keys) const noexcept;
-    ErrorCode SampleReclaimKeys(RequestContext *request_context, const int64_t count, KeyVector &out_keys) const noexcept;
+    ErrorCode
+    SampleReclaimKeys(RequestContext *request_context, const int64_t count, KeyVector &out_keys) const noexcept;
 
     void PersistMetaData() noexcept;
     size_t GetKeyCount() const noexcept;
@@ -180,8 +271,6 @@ private:
     ErrorCode RecoverMetaData() noexcept;
     int32_t GetShardIndex(KeyType key) const noexcept;
     void AdjustKeyCountMeta(const int32_t delta) noexcept;
-    Result DoGetWithCache(RequestContext *request_context, const KeyVector &keys, UriVector &out_uris) noexcept;
-    Result DoGetWithoutCache(RequestContext *request_context, const KeyVector &keys, UriVector &out_uris) noexcept;
     int32_t ProcessErrorCodes(const std::string &trace_id,
                               const std::vector<ErrorCode> &error_codes,
                               const std::vector<int32_t> &indexs,

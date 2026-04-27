@@ -282,6 +282,7 @@ ErrorCode MetaIndexer::Init(const std::string &instance_id, const std::shared_pt
     return EC_OK;
 }
 
+/*
 // Put, Update will move uris and properties to storage
 MetaIndexer::Result MetaIndexer::Put(RequestContext *request_context,
                                      const KeyVector &keys,
@@ -545,6 +546,7 @@ MetaIndexer::Result MetaIndexer::ReadModifyWrite(RequestContext *request_context
     ProcessErrorResult(trace_id, kRmwMetaOperation, error_count, keys.size(), result);
     return result;
 }
+*/
 
 MetaIndexer::Result MetaIndexer::Delete(RequestContext *request_context, const KeyVector &keys) noexcept {
     if (keys.size() == 0) {
@@ -583,6 +585,7 @@ MetaIndexer::Exist(RequestContext *request_context, const KeyVector &keys, std::
     return result;
 }
 
+/*
 MetaIndexer::Result
 MetaIndexer::Get(RequestContext *request_context, const KeyVector &keys, UriVector &out_uris) noexcept {
     out_uris.resize(keys.size());
@@ -636,6 +639,7 @@ MetaIndexer::Result MetaIndexer::Get(RequestContext *request_context,
     ProcessErrorResult(trace_id, kGetMetaOperation, error_count, keys.size(), result);
     return result;
 }
+*/
 
 // When get properties, maybe a key exists but its properties in property_names do not exist.
 // To ensure consistent semantics, EC_OK is returned even if the property map is empty.
@@ -866,6 +870,7 @@ void MetaIndexer::AdjustKeyCountMeta(const int32_t delta) noexcept {
     } while (!key_count_.compare_exchange_weak(expected, desired, std::memory_order_relaxed));
 }
 
+/*
 MetaIndexer::Result
 MetaIndexer::DoGetWithCache(RequestContext *request_context, const KeyVector &keys, UriVector &out_uris) noexcept {
     // get from cache first
@@ -969,6 +974,7 @@ MetaIndexer::DoGetWithoutCache(RequestContext *request_context, const KeyVector 
     ProcessErrorResult(trace_id, kGetMetaOperation, error_count, keys.size(), result);
     return result;
 }
+*/
 
 int32_t MetaIndexer::ProcessErrorCodes(const std::string &trace_id,
                                        const std::vector<ErrorCode> &error_codes,
@@ -1013,6 +1019,116 @@ void MetaIndexer::ProcessErrorResult(const std::string &trace_id,
         PREFIX_INDEXER_LOG(
             DEBUG, "partial keys %s failed, key count[%d] failed count[%d]", op_name.c_str(), key_count, error_count);
     }
+}
+
+// ============================================================================
+// New location-granularity APIs (empty placeholder implementations).
+//
+// These stubs only return EC_OK so that downstream callers can compile while
+// the real per-location storage layer is being built. Real logic will be
+// filled in once MetaSearcher migration is staged in.
+// ============================================================================
+
+MetaIndexer::Result MetaIndexer::PutLocations(RequestContext *request_context,
+                                              const KeyVector &keys,
+                                              LocationMapVector &location_maps,
+                                              PropertyMapVector &properties) noexcept {
+    (void)request_context;
+    (void)location_maps;
+    (void)properties;
+    return Result(keys.size());
+}
+
+MetaIndexer::LocationResult MetaIndexer::UpsertLocations(RequestContext *request_context,
+                                                         const KeyVector &keys,
+                                                         LocationsPerKey &locations,
+                                                         PropertyMapVector &properties) noexcept {
+    (void)request_context;
+    (void)keys;
+    (void)properties;
+    LocationIdsPerKey shape(locations.size());
+    for (size_t i = 0; i < locations.size(); ++i) {
+        shape[i].resize(locations[i].size());
+    }
+    return LocationResult(shape);
+}
+
+MetaIndexer::Result MetaIndexer::Get(RequestContext *request_context,
+                                     const KeyVector &keys,
+                                     LocationMapVector &out_location_maps,
+                                     PropertyMapVector &out_properties) noexcept {
+    (void)request_context;
+    out_location_maps.assign(keys.size(), LocationMap{});
+    out_properties.assign(keys.size(), PropertyMap{});
+    return Result(keys.size());
+}
+
+MetaIndexer::Result MetaIndexer::GetLocations(RequestContext *request_context,
+                                              const KeyVector &keys,
+                                              LocationMapVector &out_location_maps) noexcept {
+    (void)request_context;
+    out_location_maps.assign(keys.size(), LocationMap{});
+    return Result(keys.size());
+}
+
+MetaIndexer::LocationResult MetaIndexer::GetLocations(RequestContext *request_context,
+                                                      const KeyVector &keys,
+                                                      const LocationIdsPerKey &location_ids,
+                                                      LocationsPerKey &out_locations) noexcept {
+    (void)request_context;
+    (void)keys;
+    out_locations.assign(location_ids.size(), CacheLocationVector{});
+    for (size_t i = 0; i < location_ids.size(); ++i) {
+        out_locations[i].resize(location_ids[i].size());
+    }
+    return LocationResult(location_ids);
+}
+
+MetaIndexer::Result MetaIndexer::ReadModifyWriteBlock(RequestContext *request_context,
+                                                      const KeyVector &keys,
+                                                      const BlockModifierFunc &modifier) noexcept {
+    (void)request_context;
+    (void)modifier;
+    return Result(keys.size());
+}
+
+MetaIndexer::Result MetaIndexer::ReadModifyWriteBlock(RequestContext *request_context,
+                                                      const KeyVector &keys,
+                                                      const BlockIdsOnlyModifierFunc &modifier) noexcept {
+    (void)request_context;
+    (void)modifier;
+    return Result(keys.size());
+}
+
+MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocation(RequestContext *request_context,
+                                                                 const KeyVector &keys,
+                                                                 const LocationIdsPerKey &location_ids,
+                                                                 const LocationModifierFunc &modifier) noexcept {
+    (void)request_context;
+    (void)keys;
+    (void)modifier;
+    return LocationResult(location_ids);
+}
+
+MetaIndexer::Result MetaIndexer::UpdateProperties(RequestContext *request_context,
+                                                  const KeyVector &keys,
+                                                  PropertyMapVector &properties) noexcept {
+    (void)request_context;
+    (void)properties;
+    return Result(keys.size());
+}
+
+MetaIndexer::LocationResult MetaIndexer::DeleteLocations(RequestContext *request_context,
+                                                         const KeyVector &keys,
+                                                         const LocationIdsPerKey &location_ids,
+                                                         LocationsPerKey &out_deleted_locations) noexcept {
+    (void)request_context;
+    (void)keys;
+    out_deleted_locations.assign(location_ids.size(), CacheLocationVector{});
+    for (size_t i = 0; i < location_ids.size(); ++i) {
+        out_deleted_locations[i].resize(location_ids[i].size());
+    }
+    return LocationResult(location_ids);
 }
 
 } // namespace kv_cache_manager

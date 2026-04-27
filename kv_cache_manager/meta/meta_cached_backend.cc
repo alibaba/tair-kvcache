@@ -321,6 +321,16 @@ std::vector<ErrorCode> MetaCachedBackend::Delete(const KeyTypeVec &keys) noexcep
     return local_backend_->Delete(keys, persistent_results);
 }
 
+std::vector<ErrorCode>
+MetaCachedBackend::DeleteFields(const KeyTypeVec &keys,
+                                const std::vector<std::vector<std::string>> &field_names_vec) noexcept {
+    if (recover_state_.load(std::memory_order_acquire) == RecoverState::kRecover) {
+        EnsureKeyInLocal(keys);
+    }
+    std::vector<ErrorCode> persistent_results = persistent_backend_->DeleteFields(keys, field_names_vec);
+    return local_backend_->DeleteFields(keys, field_names_vec, persistent_results);
+}
+
 std::vector<ErrorCode> MetaCachedBackend::Get(const KeyTypeVec &keys,
                                               const std::vector<std::string> &field_names,
                                               FieldMapVec &out_field_maps) noexcept {
@@ -344,6 +354,39 @@ std::vector<ErrorCode> MetaCachedBackend::Get(const KeyTypeVec &keys,
     FieldMapVec persistent_field_maps;
     std::vector<ErrorCode> persistent_results =
         persistent_backend_->Get(missing_keys, field_names, persistent_field_maps);
+    for (size_t i = 0; i < missing_keys.size(); ++i) {
+        size_t original_idx = missing_indices[i];
+        results[original_idx] = persistent_results[i];
+        out_field_maps[original_idx] = std::move(persistent_field_maps[i]);
+    }
+    return results;
+}
+
+std::vector<ErrorCode> MetaCachedBackend::Get(const KeyTypeVec &keys,
+                                              const std::vector<std::vector<std::string>> &field_names_vec,
+                                              FieldMapVec &out_field_maps) noexcept {
+    std::vector<ErrorCode> results = local_backend_->Get(keys, field_names_vec, out_field_maps);
+    if (recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning) {
+        return results;
+    }
+
+    KeyTypeVec missing_keys;
+    std::vector<size_t> missing_indices;
+    std::vector<std::vector<std::string>> missing_field_names_vec;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if ((results[i] == EC_OK && out_field_maps[i].empty()) || results[i] == EC_NOENT) {
+            missing_keys.push_back(keys[i]);
+            missing_indices.push_back(i);
+            missing_field_names_vec.push_back(field_names_vec[i]);
+        }
+    }
+    if (missing_keys.empty()) {
+        return results;
+    }
+
+    FieldMapVec persistent_field_maps;
+    std::vector<ErrorCode> persistent_results =
+        persistent_backend_->Get(missing_keys, missing_field_names_vec, persistent_field_maps);
     for (size_t i = 0; i < missing_keys.size(); ++i) {
         size_t original_idx = missing_indices[i];
         results[original_idx] = persistent_results[i];
@@ -404,6 +447,37 @@ std::vector<ErrorCode> MetaCachedBackend::Exists(const KeyTypeVec &keys, std::ve
         size_t original_idx = missing_indices[i];
         results[original_idx] = persistent_results[i];
         out_is_exist_vec[original_idx] = persistent_exists[i];
+    }
+    return results;
+}
+
+std::vector<ErrorCode> MetaCachedBackend::ExistsFieldWithPrefix(const KeyTypeVec &keys,
+                                                                const std::string &field_prefix,
+                                                                std::vector<bool> &out_exists_vec) noexcept {
+    std::vector<ErrorCode> results = local_backend_->ExistsFieldWithPrefix(keys, field_prefix, out_exists_vec);
+    if (recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning) {
+        return results;
+    }
+
+    KeyTypeVec missing_keys;
+    std::vector<size_t> missing_indices;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if ((results[i] == EC_OK && !out_exists_vec[i]) || results[i] == EC_NOENT) {
+            missing_keys.push_back(keys[i]);
+            missing_indices.push_back(i);
+        }
+    }
+    if (missing_keys.empty()) {
+        return results;
+    }
+
+    std::vector<bool> persistent_exists;
+    std::vector<ErrorCode> persistent_results =
+        persistent_backend_->ExistsFieldWithPrefix(missing_keys, field_prefix, persistent_exists);
+    for (size_t i = 0; i < missing_keys.size(); ++i) {
+        size_t original_idx = missing_indices[i];
+        results[original_idx] = persistent_results[i];
+        out_exists_vec[original_idx] = persistent_exists[i];
     }
     return results;
 }

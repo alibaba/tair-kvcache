@@ -90,7 +90,8 @@ TEST_F(MetricsCollectorTest, MetaSearcherMetricsTest) {
     ASSERT_NE(nullptr, p);
 
     EXPECT_DOUBLE_EQ(GET(p, meta_searcher, indexer_get_time_us), 0.);
-    EXPECT_DOUBLE_EQ(GET(p, meta_searcher, indexer_read_modify_write_time_us), 0.);
+    EXPECT_DOUBLE_EQ(GET(p, meta_searcher, indexer_read_modify_write_block_time_us), 0.);
+    EXPECT_DOUBLE_EQ(GET(p, meta_searcher, indexer_read_modify_write_location_time_us), 0.);
     EXPECT_DOUBLE_EQ(GET(p, meta_searcher, index_serialize_time_us), 0.);
     EXPECT_DOUBLE_EQ(GET(p, meta_searcher, index_deserialize_time_us), 0.);
     EXPECT_DOUBLE_EQ(GET(p, meta_searcher, indexer_query_times), 0.);
@@ -104,12 +105,15 @@ TEST_F(MetricsCollectorTest, MetaSearcherMetricsTest) {
 
     // Test time measurement for indexer get
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(p, MetaSearcherIndexerGet);
-    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(p, MetaSearcherIndexerReadModifyWrite);
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(p, MetaSearcherIndexerReadModifyWriteBlock);
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(p, MetaSearcherIndexerReadModifyWriteLocation);
     usleep(1000); // 1ms
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(p, MetaSearcherIndexerGet);
-    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(p, MetaSearcherIndexerReadModifyWrite);
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(p, MetaSearcherIndexerReadModifyWriteBlock);
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(p, MetaSearcherIndexerReadModifyWriteLocation);
     EXPECT_GE(GET(p, meta_searcher, indexer_get_time_us), 1000.0);
-    EXPECT_GE(GET(p, meta_searcher, indexer_read_modify_write_time_us), 1000.0);
+    EXPECT_GE(GET(p, meta_searcher, indexer_read_modify_write_block_time_us), 1000.0);
+    EXPECT_GE(GET(p, meta_searcher, indexer_read_modify_write_location_time_us), 1000.0);
 }
 
 // Test Manager metrics functionality

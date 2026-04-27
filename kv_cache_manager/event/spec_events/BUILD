@@ -9,7 +9,7 @@ cc_library(
     ],
     deps = [
         "//kv_cache_manager/event:base_event",
-        "//kv_cache_manager/manager:cache_location",
+        "//kv_cache_manager/meta:cache_location",
     ],
 )
 

@@ -73,7 +73,8 @@ DEFINE_METRICS_NAME_FOR_MANAGER(batch_update_location_time_us);
     REGISTER_METRICS_W_TAGS_GAUGE_(metrics_registry_, meta_searcher, name, metrics_tags_)
 
 DEFINE_METRICS_NAME_FOR_META_SEARCHER(indexer_get_time_us);
-DEFINE_METRICS_NAME_FOR_META_SEARCHER(indexer_read_modify_write_time_us);
+DEFINE_METRICS_NAME_FOR_META_SEARCHER(indexer_read_modify_write_block_time_us);
+DEFINE_METRICS_NAME_FOR_META_SEARCHER(indexer_read_modify_write_location_time_us);
 DEFINE_METRICS_NAME_FOR_META_SEARCHER(index_serialize_time_us);
 DEFINE_METRICS_NAME_FOR_META_SEARCHER(index_deserialize_time_us);
 DEFINE_METRICS_NAME_FOR_META_SEARCHER(indexer_query_times);
@@ -135,7 +136,8 @@ bool ServiceMetricsCollector::Init() {
 
     // meta searcher metrics
     REGISTER_GAUGE_METRICS_FOR_META_SEARCHER(indexer_get_time_us);
-    REGISTER_GAUGE_METRICS_FOR_META_SEARCHER(indexer_read_modify_write_time_us);
+    REGISTER_GAUGE_METRICS_FOR_META_SEARCHER(indexer_read_modify_write_block_time_us);
+    REGISTER_GAUGE_METRICS_FOR_META_SEARCHER(indexer_read_modify_write_location_time_us);
     REGISTER_GAUGE_METRICS_FOR_META_SEARCHER(index_serialize_time_us);
     REGISTER_GAUGE_METRICS_FOR_META_SEARCHER(index_deserialize_time_us);
     REGISTER_GAUGE_METRICS_FOR_META_SEARCHER(indexer_query_times);

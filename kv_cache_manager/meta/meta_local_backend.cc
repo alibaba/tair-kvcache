@@ -75,7 +75,7 @@ ErrorCode MetaLocalBackend::Init(const std::string &instance_id,
             shard_oldest_access_time_[shard_id].store(INT64_MAX, std::memory_order_relaxed);
         } else {
             auto *item = static_cast<MetaMemCacheItem *>(tail_value);
-            int64_t access_time = item->last_access_time_.load(std::memory_order_relaxed);
+            int64_t access_time = item->GetLastAccessTime();
             shard_oldest_access_time_[shard_id].store(access_time, std::memory_order_relaxed);
         }
     });
@@ -111,7 +111,7 @@ ErrorCode MetaLocalBackend::Close() noexcept {
 
 ErrorCode MetaLocalBackend::CreateAndInsert(const std::string &key_str, const FieldMap &fields) {
     MetaMemCacheItem *item = MetaMemCacheItem::Create(fields);
-    item->last_access_time_.store(TimestampUtil::GetCurrentTimeUs(), std::memory_order_relaxed);
+    item->TouchAccessTime();
     size_t charge = item->Size();
     ErrorCode ret = cache_->Insert(key_str, item, cache_item_helper_.get(), charge);
     if (ret != EC_OK) {
@@ -122,7 +122,7 @@ ErrorCode MetaLocalBackend::CreateAndInsert(const std::string &key_str, const Fi
 
 ErrorCode MetaLocalBackend::CreateAndInsert(const std::string &key_str, FieldMap &&fields) {
     MetaMemCacheItem *item = MetaMemCacheItem::Create(std::move(fields));
-    item->last_access_time_.store(TimestampUtil::GetCurrentTimeUs(), std::memory_order_relaxed);
+    item->TouchAccessTime();
     size_t charge = item->Size();
     ErrorCode ret = cache_->Insert(key_str, item, cache_item_helper_.get(), charge);
     if (ret != EC_OK) {
@@ -133,7 +133,7 @@ ErrorCode MetaLocalBackend::CreateAndInsert(const std::string &key_str, FieldMap
 
 ErrorCode MetaLocalBackend::CreateAndInsertIfAbsent(const std::string &key_str, const FieldMap &fields) {
     MetaMemCacheItem *item = MetaMemCacheItem::Create(fields);
-    item->last_access_time_.store(TimestampUtil::GetCurrentTimeUs(), std::memory_order_relaxed);
+    item->TouchAccessTime();
     size_t charge = item->Size();
     ErrorCode ret = cache_->InsertIfAbsent(key_str, item, cache_item_helper_.get(), charge);
     if (ret != EC_OK && ret != EC_EXIST) {
@@ -148,7 +148,7 @@ bool MetaLocalBackend::LookupFields(const std::string &key_str, FieldMap &out_fi
         return false;
     }
     auto *existing = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
-    existing->last_access_time_.store(TimestampUtil::GetCurrentTimeUs(), std::memory_order_relaxed);
+    existing->TouchAccessTime();
     out_fields = existing->GetFields();
     cache_->Release(handle);
     return true;
@@ -159,11 +159,9 @@ ErrorCode MetaLocalBackend::UpdateFieldsInPlace(const std::string &key_str, cons
     if (!handle) {
         return EC_NOENT;
     }
-    // Safe to modify fields_ in place: the handle holds a reference so the
-    // item cannot be evicted or freed by another thread.  The FieldMap itself
-    // is not involved in any LRU list or hash table operations.
+    // Safe to modify fields_ in place: MetaIndexer lock on key
     auto *existing = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
-    existing->last_access_time_.store(TimestampUtil::GetCurrentTimeUs(), std::memory_order_relaxed);
+    existing->TouchAccessTime();
     for (const auto &[key, value] : updates) {
         existing->GetMutableFields()[key] = value;
     }
@@ -172,7 +170,7 @@ ErrorCode MetaLocalBackend::UpdateFieldsInPlace(const std::string &key_str, cons
 }
 
 // ---------------------------------------------------------------------------
-// Per-key write helpers
+// Per-key helpers
 // ---------------------------------------------------------------------------
 
 ErrorCode MetaLocalBackend::UpsertForOneKey(KeyType key, const FieldMap &field_map) {
@@ -192,6 +190,49 @@ ErrorCode MetaLocalBackend::DeleteForOneKey(KeyType key) {
     }
     cache_->Release(handle);
     cache_->Erase(key_str);
+    return EC_OK;
+}
+
+ErrorCode MetaLocalBackend::DeleteFieldsForOneKey(KeyType key, const std::vector<std::string> &field_names) {
+    std::string key_str = std::to_string(key);
+    Cache::Handle *handle = cache_->Lookup(key_str);
+    if (!handle) {
+        return EC_NOENT;
+    }
+    auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
+    item->TouchAccessTime();
+    for (const auto &field_name : field_names) {
+        item->GetMutableFields().erase(field_name);
+    }
+    cache_->Release(handle);
+    return EC_OK;
+}
+
+ErrorCode
+MetaLocalBackend::GetForOneKey(KeyType key, const std::vector<std::string> &field_names, FieldMap &out_field_map) {
+    out_field_map.clear();
+
+    std::string key_str = std::to_string(key);
+    Cache::Handle *handle = cache_->Lookup(key_str);
+    if (!handle) {
+        return EC_NOENT;
+    }
+
+    auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
+    int64_t stored_time = item->GetLastAccessTime();
+    item->TouchAccessTime();
+    const auto &fields = item->GetFields();
+    for (const auto &field_name : field_names) {
+        if (field_name == PROPERTY_LRU_TIME) {
+            out_field_map[PROPERTY_LRU_TIME] = std::to_string(stored_time);
+            continue;
+        }
+        auto it = fields.find(field_name);
+        if (it != fields.end()) {
+            out_field_map[field_name] = it->second;
+        }
+    }
+    cache_->Release(handle);
     return EC_OK;
 }
 
@@ -293,6 +334,27 @@ std::vector<ErrorCode> MetaLocalBackend::Delete(const KeyTypeVec &keys,
     return results;
 }
 
+std::vector<ErrorCode>
+MetaLocalBackend::DeleteFields(const KeyTypeVec &keys,
+                               const std::vector<std::vector<std::string>> &field_names_vec) noexcept {
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        results[i] = DeleteFieldsForOneKey(keys[i], field_names_vec[i]);
+    }
+    return results;
+}
+
+std::vector<ErrorCode> MetaLocalBackend::DeleteFields(const KeyTypeVec &keys,
+                                                      const std::vector<std::vector<std::string>> &field_names_vec,
+                                                      const std::vector<ErrorCode> &previous_error_codes) noexcept {
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        results[i] = (previous_error_codes[i] == EC_OK) ? DeleteFieldsForOneKey(keys[i], field_names_vec[i])
+                                                        : previous_error_codes[i];
+    }
+    return results;
+}
+
 // ---------------------------------------------------------------------------
 // Read operations
 // ---------------------------------------------------------------------------
@@ -302,35 +364,20 @@ std::vector<ErrorCode> MetaLocalBackend::Get(const KeyTypeVec &keys,
                                              FieldMapVec &out_field_maps) noexcept {
     std::vector<ErrorCode> results(keys.size(), EC_OK);
     out_field_maps.resize(keys.size());
-
     for (size_t i = 0; i < keys.size(); ++i) {
-        std::string key_str = std::to_string(keys[i]);
-
-        Cache::Handle *handle = cache_->Lookup(key_str);
-        if (!handle) {
-            results[i] = EC_NOENT;
-            continue;
-        }
-
-        auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
-        int64_t stored_time = item->last_access_time_.load(std::memory_order_relaxed);
-        item->last_access_time_.store(TimestampUtil::GetCurrentTimeUs(), std::memory_order_relaxed);
-        const auto &fields = item->GetFields();
-        FieldMap &out_field_map = out_field_maps[i];
-        for (const auto &field_name : field_names) {
-            if (field_name == PROPERTY_LRU_TIME) {
-                out_field_map[PROPERTY_LRU_TIME] = std::to_string(stored_time);
-                continue;
-            }
-            auto it = fields.find(field_name);
-            if (it != fields.end()) {
-                out_field_map[field_name] = it->second;
-            }
-        }
-        cache_->Release(handle);
-        results[i] = EC_OK;
+        results[i] = GetForOneKey(keys[i], field_names, out_field_maps[i]);
     }
+    return results;
+}
 
+std::vector<ErrorCode> MetaLocalBackend::Get(const KeyTypeVec &keys,
+                                             const std::vector<std::vector<std::string>> &field_names_vec,
+                                             FieldMapVec &out_field_maps) noexcept {
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    out_field_maps.resize(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        results[i] = GetForOneKey(keys[i], field_names_vec[i], out_field_maps[i]);
+    }
     return results;
 }
 
@@ -348,8 +395,8 @@ std::vector<ErrorCode> MetaLocalBackend::GetAllFields(const KeyTypeVec &keys, Fi
         }
 
         auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
-        int64_t stored_time = item->last_access_time_.load(std::memory_order_relaxed);
-        item->last_access_time_.store(TimestampUtil::GetCurrentTimeUs(), std::memory_order_relaxed);
+        int64_t stored_time = item->GetLastAccessTime();
+        item->TouchAccessTime();
         out_field_maps[i] = item->GetFields();
         out_field_maps[i][PROPERTY_LRU_TIME] = std::to_string(stored_time);
         cache_->Release(handle);
@@ -361,7 +408,7 @@ std::vector<ErrorCode> MetaLocalBackend::GetAllFields(const KeyTypeVec &keys, Fi
 
 std::vector<ErrorCode> MetaLocalBackend::Exists(const KeyTypeVec &keys, std::vector<bool> &out_is_exist_vec) noexcept {
     std::vector<ErrorCode> results(keys.size(), EC_OK);
-    out_is_exist_vec.resize(keys.size());
+    out_is_exist_vec.resize(keys.size(), false);
 
     for (size_t i = 0; i < keys.size(); ++i) {
         std::string key_str = std::to_string(keys[i]);
@@ -371,11 +418,39 @@ std::vector<ErrorCode> MetaLocalBackend::Exists(const KeyTypeVec &keys, std::vec
 
         if (handle) {
             auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
-            item->last_access_time_.store(TimestampUtil::GetCurrentTimeUs(), std::memory_order_relaxed);
+            item->TouchAccessTime();
             cache_->Release(handle);
         }
 
         results[i] = EC_OK;
+    }
+
+    return results;
+}
+
+std::vector<ErrorCode> MetaLocalBackend::ExistsFieldWithPrefix(const KeyTypeVec &keys,
+                                                               const std::string &field_prefix,
+                                                               std::vector<bool> &out_exists_vec) noexcept {
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    out_exists_vec.resize(keys.size(), false);
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        std::string key_str = std::to_string(keys[i]);
+        Cache::Handle *handle = cache_->Lookup(key_str);
+        if (!handle) {
+            results[i] = EC_NOENT;
+            continue;
+        }
+
+        auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
+        item->TouchAccessTime();
+        const auto &fields = item->GetFields();
+        auto it = fields.lower_bound(field_prefix);
+        if (it != fields.end() && it->first.size() >= field_prefix.size() &&
+            it->first.compare(0, field_prefix.size(), field_prefix) == 0) {
+            out_exists_vec[i] = true;
+        }
+        cache_->Release(handle);
     }
 
     return results;

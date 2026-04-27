@@ -255,6 +255,40 @@ ErrorCode MetaDummyBackend::DeleteForOneKey(const KeyType &key) {
     return PersistToPath();
 }
 
+std::vector<ErrorCode>
+MetaDummyBackend::DeleteFields(const KeyTypeVec &keys,
+                               const std::vector<std::vector<std::string>> &field_names_vec) noexcept {
+    if (keys.size() != field_names_vec.size()) {
+        KVCM_LOG_ERROR("delete fields failed, keys.size: [%zu] != field_names_vec.size: [%zu]",
+                       keys.size(),
+                       field_names_vec.size());
+        return std::vector<ErrorCode>(keys.size(), ErrorCode::EC_BADARGS);
+    }
+    std::vector<ErrorCode> ec_vec;
+    for (std::size_t i = 0; i != keys.size(); ++i) {
+        ec_vec.emplace_back(DeleteFieldsForOneKey(keys[i], field_names_vec[i]));
+        if (ec_vec.back() != ErrorCode::EC_OK && ec_vec.back() != ErrorCode::EC_NOENT) {
+            KVCM_LOG_WARN("delete fields failed, key: [%" PRIi64 "], error code: [%" PRIi32 "]",
+                          keys[i],
+                          static_cast<std::int32_t>(ec_vec.back()));
+        }
+    }
+    return ec_vec;
+}
+
+ErrorCode MetaDummyBackend::DeleteFieldsForOneKey(const KeyType &key, const std::vector<std::string> &field_names) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    const bool found = table_.FindAndModify(key, [&](FieldMap &existing_map) {
+        for (const auto &field_name : field_names) {
+            existing_map.erase(field_name);
+        }
+    });
+    if (!found) {
+        return ErrorCode::EC_NOENT;
+    }
+    return PersistToPath();
+}
+
 std::vector<ErrorCode> MetaDummyBackend::Get(const KeyTypeVec &keys,
                                              const std::vector<std::string> &field_names,
                                              FieldMapVec &out_field_maps) noexcept {
@@ -262,6 +296,27 @@ std::vector<ErrorCode> MetaDummyBackend::Get(const KeyTypeVec &keys,
     out_field_maps = FieldMapVec(keys.size());
     for (std::size_t i = 0; i != keys.size(); ++i) {
         ec_vec.emplace_back(GetForOneKey(keys[i], field_names, out_field_maps[i]));
+        if (ec_vec.back() != ErrorCode::EC_OK && ec_vec.back() != ErrorCode::EC_NOENT) {
+            KVCM_LOG_WARN("get failed, key: [%" PRIi64 "], error code: [%" PRIi32 "]",
+                          keys[i],
+                          static_cast<std::int32_t>(ec_vec.back()));
+        }
+    }
+    return ec_vec;
+}
+
+std::vector<ErrorCode> MetaDummyBackend::Get(const KeyTypeVec &keys,
+                                             const std::vector<std::vector<std::string>> &field_names_vec,
+                                             FieldMapVec &out_field_maps) noexcept {
+    if (keys.size() != field_names_vec.size()) {
+        KVCM_LOG_ERROR(
+            "get failed, keys.size: [%zu] != field_names_vec.size: [%zu]", keys.size(), field_names_vec.size());
+        return std::vector<ErrorCode>(keys.size(), ErrorCode::EC_BADARGS);
+    }
+    std::vector<ErrorCode> ec_vec;
+    out_field_maps = FieldMapVec(keys.size());
+    for (std::size_t i = 0; i != keys.size(); ++i) {
+        ec_vec.emplace_back(GetForOneKey(keys[i], field_names_vec[i], out_field_maps[i]));
         if (ec_vec.back() != ErrorCode::EC_OK && ec_vec.back() != ErrorCode::EC_NOENT) {
             KVCM_LOG_WARN("get failed, key: [%" PRIi64 "], error code: [%" PRIi32 "]",
                           keys[i],
@@ -347,6 +402,28 @@ ErrorCode MetaDummyBackend::ExistsForOneKey(const KeyType &key, bool &out_is_exi
         });
     }
     return ErrorCode::EC_OK;
+}
+
+std::vector<ErrorCode> MetaDummyBackend::ExistsFieldWithPrefix(const KeyTypeVec &keys,
+                                                               const std::string &field_prefix,
+                                                               std::vector<bool> &out_exists_vec) noexcept {
+    out_exists_vec.resize(keys.size(), false);
+    std::vector<ErrorCode> ec_vec(keys.size(), ErrorCode::EC_OK);
+    for (std::size_t i = 0; i != keys.size(); ++i) {
+        const bool found = table_.FindAndApply(keys[i], [&](const FieldMap &field_table) {
+            for (const auto &[field_name, field_value] : field_table) {
+                if (field_name.size() >= field_prefix.size() &&
+                    field_name.compare(0, field_prefix.size(), field_prefix) == 0) {
+                    out_exists_vec[i] = true;
+                    return;
+                }
+            }
+        });
+        if (!found) {
+            ec_vec[i] = ErrorCode::EC_NOENT;
+        }
+    }
+    return ec_vec;
 }
 
 ErrorCode MetaDummyBackend::ListKeys(const std::string &cursor,

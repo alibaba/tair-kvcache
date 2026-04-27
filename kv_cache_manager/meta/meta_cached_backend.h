@@ -39,13 +39,21 @@ public:
     std::vector<ErrorCode> UpdateFields(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept override;
     std::vector<ErrorCode> Upsert(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept override;
     std::vector<ErrorCode> Delete(const KeyTypeVec &keys) noexcept override;
+    std::vector<ErrorCode> DeleteFields(const KeyTypeVec &keys,
+                                        const std::vector<std::vector<std::string>> &field_names_vec) noexcept override;
 
     // read
     std::vector<ErrorCode> Get(const KeyTypeVec &keys,
                                const std::vector<std::string> &field_names,
                                FieldMapVec &out_field_maps) noexcept override;
+    std::vector<ErrorCode> Get(const KeyTypeVec &keys,
+                               const std::vector<std::vector<std::string>> &field_names_vec,
+                               FieldMapVec &out_field_maps) noexcept override;
     std::vector<ErrorCode> GetAllFields(const KeyTypeVec &keys, FieldMapVec &out_field_maps) noexcept override;
     std::vector<ErrorCode> Exists(const KeyTypeVec &keys, std::vector<bool> &out_is_exist_vec) noexcept override;
+    std::vector<ErrorCode> ExistsFieldWithPrefix(const KeyTypeVec &keys,
+                                                 const std::string &field_prefix,
+                                                 std::vector<bool> &out_exists_vec) noexcept override;
     ErrorCode ListKeys(const std::string &cursor,
                        const int64_t limit,
                        std::string &out_next_cursor,

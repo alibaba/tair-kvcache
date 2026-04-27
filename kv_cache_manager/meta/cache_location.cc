@@ -1,4 +1,4 @@
-#include "cache_location.h"
+#include "kv_cache_manager/meta/cache_location.h"
 
 #include "kv_cache_manager/common/string_util.h"
 namespace kv_cache_manager {

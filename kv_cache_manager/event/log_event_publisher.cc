@@ -8,8 +8,6 @@
 
 #include "kv_cache_manager/common/jsonizable.h"
 #include "kv_cache_manager/common/logger.h"
-#include "kv_cache_manager/manager/cache_location.h"
-
 namespace kv_cache_manager {
 
 LogEventPublisher::LogEventPublisher() = default;
