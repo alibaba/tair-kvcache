@@ -9,7 +9,6 @@
 #include <unordered_map>
 
 #include "kv_cache_manager/data_storage/data_storage_backend.h"
-#include "kv_cache_manager/data_storage/vineyard_storage_spec.h"
 
 namespace kv_cache_manager {
 

@@ -35,14 +35,12 @@ cc_library(
     name = "common_define",
     srcs = [
         "storage_config.cc",
-        "vineyard_storage_spec.cc",
     ],
     hdrs = [
         "common_define.h",
         "data_storage_backend.h",
         "data_storage_uri.h",
         "storage_config.h",
-        "vineyard_storage_spec.h",
     ],
     deps = [
         "//kv_cache_manager/common",

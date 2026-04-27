@@ -129,6 +129,21 @@ bool WeightSLPolicy::ExistsForWrite(const CacheLocationMap &location_map,
     return exists;
 }
 
+bool WeightSLPolicy::ExistsForWriteWithMinCount(const CacheLocationMap &location_map, int32_t min_count) const {
+    int32_t count = 0;
+    for (auto &kv : location_map) {
+        if (kv.second.status() != CacheLocationStatus::CLS_NOT_FOUND) {
+            if (GetWeight(kv) > 0) {
+                ++count;
+                if (count >= min_count) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 uint32_t StaticWeightSLPolicy::GetWeight(CacheLocationMap::const_reference kv) const {
     DataStorageType type = kv.second.type();
     uint32_t weight = StorageTypeWeights::DEFAULT;

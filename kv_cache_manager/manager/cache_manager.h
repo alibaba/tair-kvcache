@@ -113,6 +113,17 @@ public:
                                                               const TokenIdsVector &tokens,
                                                               const std::vector<std::string> &location_spec_group_names,
                                                               int64_t write_timeout_seconds);
+
+    // V6D eviction variant: same as StartWriteCache but requires
+    // >= min_replica_count existing replicas to skip the write.
+    std::pair<ErrorCode, StartWriteCacheInfo>
+    StartEvictWriteCache(RequestContext *request_context,
+                         const std::string &instance_id,
+                         const KeyVector &keys,
+                         const TokenIdsVector &tokens,
+                         const std::vector<std::string> &location_spec_group_names,
+                         int64_t write_timeout_seconds,
+                         int32_t min_replica_count);
     ErrorCode
     FinishWriteCache(RequestContext *request_context,
                      const std::string &instance_id,
@@ -156,6 +167,15 @@ private:
                                const std::vector<std::string> &location_spec_group_names,
                                std::vector<std::string_view> &new_location_spec_group_names,
                                BlockMask &block_mask);
+    ErrorCode FilterWriteCacheWithMinReplica(RequestContext *request_context,
+                                             const std::string &instance_id,
+                                             MetaSearcher *meta_searcher,
+                                             const KeyVector &keys,
+                                             KeyVector &new_keys,
+                                             const std::vector<std::string> &location_spec_group_names,
+                                             std::vector<std::string_view> &new_location_spec_group_names,
+                                             BlockMask &block_mask,
+                                             int32_t min_replica_count);
     ErrorCode GenWriteLocation(RequestContext *request_context,
                                const std::string &instance_id,
                                const CacheManager::KeyVector &keys,

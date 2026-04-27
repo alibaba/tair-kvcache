@@ -45,6 +45,10 @@ public:
                          const proto::meta::StartWriteCacheRequest *request,
                          proto::meta::StartWriteCacheResponse *response);
 
+    void StartEvictWriteCache(RequestContext *request_context,
+                              const proto::meta::StartEvictWriteCacheRequest *request,
+                              proto::meta::StartWriteCacheResponse *response);
+
     void FinishWriteCache(RequestContext *request_context,
                           const proto::meta::FinishWriteCacheRequest *request,
                           proto::meta::CommonResponse *response);
