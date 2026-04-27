@@ -29,20 +29,23 @@ def read_lifecycle_csv(csv_path: str) -> Optional[pd.DataFrame]:
         df = pd.read_csv(csv_path, comment="#")
         df.columns = df.columns.str.strip()
 
-        for col in ["BlockKey", "BirthTimeUs", "DeathTimeUs", "LifespanUs",
-                     "AccessCount", "LastAccessTimeUs"]:
+        ns_time_cols = ["BirthTimeNs", "DeathTimeNs", "LifespanNs", "LastAccessTimeNs"]
+
+        for col in ["BlockKey", "AccessCount"] + ns_time_cols:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
-
         if "IsAlive" in df.columns:
             df["IsAlive"] = df["IsAlive"].astype(str).str.strip().str.lower() == "true"
-
-        for col in ["BirthTimeUs", "DeathTimeUs", "LifespanUs", "LastAccessTimeUs"]:
-            if col in df.columns:
-                df[col[:-2] + "S"] = df[col] / 1e6
-
-        if "LastAccessTimeUs" in df.columns and "BirthTimeUs" in df.columns:
-            df["ActiveLifespanS"] = (df["LastAccessTimeUs"] - df["BirthTimeUs"]) / 1e6
+        if "BirthTimeNs" in df.columns:
+            df["BirthTimeS"] = df["BirthTimeNs"] / 1e9
+        if "DeathTimeNs" in df.columns:
+            df["DeathTimeS"] = df["DeathTimeNs"] / 1e9
+        if "LifespanNs" in df.columns:
+            df["LifespanS"] = df["LifespanNs"] / 1e9
+        if "LastAccessTimeNs" in df.columns:
+            df["LastAccessTimeS"] = df["LastAccessTimeNs"] / 1e9
+        if "LastAccessTimeNs" in df.columns and "BirthTimeNs" in df.columns:
+            df["ActiveLifespanS"] = (df["LastAccessTimeNs"] - df["BirthTimeNs"]) / 1e9
 
         return df
     except Exception as e:

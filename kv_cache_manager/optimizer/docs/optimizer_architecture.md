@@ -394,7 +394,7 @@ struct ResultCounters {
 };
 
 struct ReadRecord {
-    int64_t timestamp_us;
+    int64_t timestamp_ns;
     size_t external_read_blocks;
     size_t external_hit_blocks;
     size_t internal_read_blocks;
@@ -415,7 +415,7 @@ struct Result {
 **文件名**：`{instance_id}_hit_rates.csv`
 
 **主要列**：
-- `TimestampUs` - 时间戳（微秒）
+- `TimestampNs` - 时间戳（纳秒）
 - `CachedBlocksCurrentInstance` - 当前实例的缓存块数
 - `CachedBlocksAllInstance` - 所有实例的总缓存块数
 - `HitRate` - 当前命中率

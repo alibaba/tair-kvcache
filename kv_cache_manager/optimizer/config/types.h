@@ -47,7 +47,7 @@ struct BlockEntry {
 struct NodeStat {
     size_t access_count = 0;
     int64_t last_access_time = 0;
-    int64_t ttl = 250000; // 默认TTL为250000微秒，即250毫秒
+    int64_t ttl = 250000000; // 默认 TTL 250 毫秒（纳秒）
 };
 
 struct RadixTreeNode {

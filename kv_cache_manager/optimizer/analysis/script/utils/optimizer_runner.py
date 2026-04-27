@@ -43,6 +43,7 @@ def run_optimizer_with_config(
     policy: str = None,
     save_csv_to: str = None,
     enable_lifecycle_tracking: bool = False,
+    enable_template_analysis: bool = False,
 ) -> str:
     """
     运行 optimizer，返回临时输出目录路径。
@@ -51,7 +52,7 @@ def run_optimizer_with_config(
     """
     temp_dir, _ = run_optimizer_with_config_explicit(
         config_path, capacity, policy, save_csv_to,
-        enable_lifecycle_tracking,
+        enable_lifecycle_tracking, enable_template_analysis,
     )
     return temp_dir
 
@@ -62,6 +63,7 @@ def run_optimizer_with_config_explicit(
     policy: str = None,
     save_csv_to: str = None,
     enable_lifecycle_tracking: bool = False,
+    enable_template_analysis: bool = False,
 ) -> Tuple[str, object]:
     """
     运行 optimizer，返回 (临时目录路径, OptimizerManager对象)。
@@ -91,7 +93,7 @@ def run_optimizer_with_config_explicit(
         raise RuntimeError(f"Failed to load config: {temp_config_path}")
     config = config_loader.config()
 
-    manager = kvcm_py_optimizer.OptimizerManager(config, enable_lifecycle_tracking)
+    manager = kvcm_py_optimizer.OptimizerManager(config, enable_lifecycle_tracking, enable_template_analysis)
     manager.Init()
     manager.DirectRun()
     manager.AnalyzeResults()
@@ -117,6 +119,7 @@ def warmup_pass(
     warmup_capacity: int,
     policy: str = None,
     enable_lifecycle_tracking: bool = False,
+    enable_template_analysis: bool = False,
 ) -> int:
     """
     用大容量跑一遍，获取 group 内最大 block 数。
@@ -130,6 +133,7 @@ def warmup_pass(
     temp_dir, manager = run_optimizer_with_config_explicit(
         config_path, warmup_capacity, policy,
         enable_lifecycle_tracking=enable_lifecycle_tracking,
+        enable_template_analysis=enable_template_analysis,
     )
 
     try:
@@ -166,6 +170,7 @@ def run_single_experiment(
     total_exps: int,
     save_csv_to: str = None,
     enable_lifecycle_tracking: bool = False,
+    enable_template_analysis: bool = False,
 ) -> dict:
     """
     运行单个实验，返回结果字典。
@@ -195,7 +200,7 @@ def run_single_experiment(
 
         temp_dir, manager = run_optimizer_with_config_explicit(
             config_path, capacity, policy, save_csv_to,
-            enable_lifecycle_tracking,
+            enable_lifecycle_tracking, enable_template_analysis,
         )
         csv_map = collect_instance_csvs(temp_dir)
         if not csv_map:
@@ -239,6 +244,7 @@ def run_experiments_parallel(
     max_workers: int = 4,
     save_csv_dir: str = None,
     enable_lifecycle_tracking: bool = False,
+    enable_template_analysis: bool = False,
 ) -> List[dict]:
     """
     并行运行实验列表。
@@ -263,6 +269,7 @@ def run_experiments_parallel(
             config_path, capacity, policy,
             i + 1, len(experiments),
             csv_subdir, enable_lifecycle_tracking,
+            enable_template_analysis,
         ))
 
     results = []

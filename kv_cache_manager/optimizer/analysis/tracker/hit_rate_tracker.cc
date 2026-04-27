@@ -107,7 +107,7 @@ void HitRateTracker::ExportHitRates(const std::string &instance_id,
     }
 
     // ---- 写入 CSV ----
-    file << "TimestampUs,CachedBlocksCurrentInstance,CachedBlocksPerInstance,CachedBlocksAllInstance,"
+    file << "TimestampNs,CachedBlocksCurrentInstance,CachedBlocksPerInstance,CachedBlocksAllInstance,"
             "InternalReadBlocks,ExternalReadBlocks,TotalReadBlocks,InternalHitBlocks,"
             "InternalHitRate,ExternalHitBlocks,ExternalHitRate,HitRate,AccInternalHitRate,AccExternalHitRate,"
             "AccHitRate,AccReadBlocks,AccWriteBlocks\n";
@@ -122,12 +122,12 @@ void HitRateTracker::ExportHitRates(const std::string &instance_id,
         acc_read_blocks += current_read;
 
         while (write_index < data.write_records.size() &&
-               data.write_records[write_index].timestamp_us <= r.timestamp_us) {
+               data.write_records[write_index].timestamp_ns <= r.timestamp_ns) {
             acc_write_blocks += data.write_records[write_index].write_blocks;
             write_index++;
         }
 
-        file << r.timestamp_us << "," << r.current_cache_blocks << "," << JoinVecSizeT(r.blocks_per_instance) << ","
+        file << r.timestamp_ns << "," << r.current_cache_blocks << "," << JoinVecSizeT(r.blocks_per_instance) << ","
              << SumVecSizeT(r.blocks_per_instance) << "," << r.internal_read_blocks << "," << r.external_read_blocks
              << "," << current_read << "," << r.internal_hit_blocks << "," << internal_hit_rates[i] << ","
              << r.external_hit_blocks << "," << external_hit_rates[i] << ","

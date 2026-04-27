@@ -118,7 +118,7 @@ def _plot_timeseries(csv_save_dir, results_by_policy, output_dir, target_caps=No
             if os.path.exists(cap_dir):
                 print("Plotting {} capacity={}...".format(pol, cap))
                 try:
-                    plot_multi_instance_analysis(cap_dir, output_dir)
+                    plot_multi_instance_analysis(cap_dir, output_dir, show_template=False)
                     count += 1
                 except Exception as e:
                     print("  Failed: {}".format(e))

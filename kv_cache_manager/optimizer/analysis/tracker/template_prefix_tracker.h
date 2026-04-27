@@ -58,9 +58,9 @@ struct TraceTemplateResult {
 class TemplatePrefixTracker : public StatsTracker {
 public:
     struct Config {
-        size_t fan_out_threshold = 4;
-        size_t access_count_threshold = 10;
-        size_t min_prefix_depth = 10;
+        size_t fan_out_threshold = 10;
+        size_t access_count_threshold = 50;
+        size_t min_prefix_depth = 20;
         // 子树最大 fan_out / 当前节点 fan_out < 此比值时，回滚子树模板（视为噪声）
         double fan_dominance_ratio = 0.5;
     };

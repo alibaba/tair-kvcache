@@ -14,8 +14,12 @@
 #include "kv_cache_manager/optimizer/trace_loader/trace_util.h"
 namespace kv_cache_manager {
 
-OptimizerManager::OptimizerManager(const OptimizerConfig &config, bool enable_lifecycle_tracking)
-    : config_(config), enable_lifecycle_tracking_(enable_lifecycle_tracking) {}
+OptimizerManager::OptimizerManager(const OptimizerConfig &config,
+                                   bool enable_lifecycle_tracking,
+                                   bool enable_template_analysis)
+    : config_(config)
+    , enable_lifecycle_tracking_(enable_lifecycle_tracking)
+    , enable_template_analysis_(enable_template_analysis) {}
 
 bool OptimizerManager::Init() {
     eviction_manager_.reset(new OptEvictionManager());
@@ -33,7 +37,13 @@ bool OptimizerManager::Init() {
     // ---- 初始化 StatsCollector 并注册子 Tracker ----
     stats_collector_ = std::make_shared<StatsCollector>();
     hit_rate_tracker_ = stats_collector_->EmplaceTracker<HitRateTracker>();
-    template_prefix_tracker_ = stats_collector_->EmplaceTracker<TemplatePrefixTracker>();
+
+    if (enable_template_analysis_) {
+        template_prefix_tracker_ = stats_collector_->EmplaceTracker<TemplatePrefixTracker>();
+        KVCM_LOG_INFO("Template analysis enabled");
+    } else {
+        KVCM_LOG_DEBUG("Template analysis disabled (replay performance optimization)");
+    }
 
     if (enable_lifecycle_tracking_) {
         stats_collector_->EmplaceTracker<BlockLifecycleTracker>();
@@ -167,7 +177,7 @@ WriteCacheRes OptimizerManager::WriteCache(const std::string &instance_id,
     WriteCacheSchemaTrace trace;
     trace.set_instance_id(instance_id);
     trace.set_trace_id(trace_id);
-    trace.set_timestamp_us(timestamp);
+    trace.set_timestamp_ns(timestamp);
     trace.set_keys(block_ids);
     trace.set_tokens(token_ids);
     optimizer_runner_->HandleWriteCache(trace);
@@ -196,7 +206,7 @@ GetCacheLocationRes OptimizerManager::GetCacheLocation(const std::string &instan
     GetLocationSchemaTrace trace;
     trace.set_instance_id(instance_id);
     trace.set_trace_id(trace_id);
-    trace.set_timestamp_us(timestamp);
+    trace.set_timestamp_ns(timestamp);
     trace.set_keys(block_ids);
     trace.set_tokens(token_ids);
     trace.set_block_mask(block_mask);

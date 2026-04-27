@@ -26,7 +26,7 @@ public:
     void HandleDialogTurn(const DialogTurnSchemaTrace &trace);
 
 private:
-    ReadRecord BuildReadRecord(const std::string &instance_id, int64_t timestamp_us);
+    ReadRecord BuildReadRecord(const std::string &instance_id, int64_t timestamp_ns);
 
     std::shared_ptr<OptIndexerManager> indexer_manager_;
     std::shared_ptr<OptEvictionManager> eviction_manager_;

@@ -395,7 +395,7 @@ def main():
         if args.no_sort:
             print("   Mode: No sorting")
         else:
-            print("   Mode: Sort by timestamp_us")
+            print("   Mode: Sort by timestamp_ns")
         
         merged_count = merge_jsonl_files(
             input_files=converted_files,

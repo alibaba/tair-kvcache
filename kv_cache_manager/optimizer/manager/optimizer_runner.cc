@@ -42,25 +42,25 @@ void OptimizerRunner::RunTrace(std::shared_ptr<OptimizerSchemaTrace> trace) {
             return;
         }
         HandleDialogTurn(*turn_trace);
-        stats_collector_->UpdateTimestamp(turn_trace->instance_id(), turn_trace->timestamp_us());
+        stats_collector_->UpdateTimestamp(turn_trace->instance_id(), turn_trace->timestamp_ns());
     } else if (auto get_trace = std::dynamic_pointer_cast<GetLocationSchemaTrace>(trace)) {
         if (get_trace->query_type() != "prefix_match") {
             KVCM_LOG_WARN("Unsupported query type: %s", get_trace->query_type().c_str());
             return;
         }
         HandleGetLocation(*get_trace);
-        stats_collector_->UpdateTimestamp(get_trace->instance_id(), get_trace->timestamp_us());
+        stats_collector_->UpdateTimestamp(get_trace->instance_id(), get_trace->timestamp_ns());
     } else if (auto write_trace = std::dynamic_pointer_cast<WriteCacheSchemaTrace>(trace)) {
         HandleWriteCache(*write_trace);
-        stats_collector_->UpdateTimestamp(write_trace->instance_id(), write_trace->timestamp_us());
+        stats_collector_->UpdateTimestamp(write_trace->instance_id(), write_trace->timestamp_ns());
     } else {
         KVCM_LOG_WARN("Unknown trace type, skipping");
     }
 }
 
-ReadRecord OptimizerRunner::BuildReadRecord(const std::string &instance_id, int64_t timestamp_us) {
+ReadRecord OptimizerRunner::BuildReadRecord(const std::string &instance_id, int64_t timestamp_ns) {
     ReadRecord record{};
-    record.timestamp_us = timestamp_us;
+    record.timestamp_ns = timestamp_ns;
     record.current_cache_blocks = eviction_manager_->GetCurrentInstanceUsage(instance_id);
 
     auto indexer_map = indexer_manager_->GetAllOptIndexers();
@@ -83,10 +83,10 @@ void OptimizerRunner::HandleGetLocation(const GetLocationSchemaTrace &trace) {
 
     std::vector<std::vector<int64_t>> external_hits;
     std::vector<std::vector<int64_t>> internal_hits;
-    indexer->PrefixQuery(trace.keys(), trace.block_mask(), trace.timestamp_us(), external_hits, internal_hits);
+    indexer->PrefixQuery(trace.keys(), trace.block_mask(), trace.timestamp_ns(), external_hits, internal_hits);
 
     // ---- 构造 ReadRecord 并委托给 StatsCollector ----
-    ReadRecord record = BuildReadRecord(instance_id, trace.timestamp_us());
+    ReadRecord record = BuildReadRecord(instance_id, trace.timestamp_ns());
     record.trace_id = trace.trace_id();
     record.keys_ptr = &trace.keys();
 
@@ -116,14 +116,16 @@ void OptimizerRunner::HandleWriteCache(const WriteCacheSchemaTrace &trace) {
         return;
     }
 
-    auto result = indexer->InsertOnly(trace.keys(), trace.timestamp_us());
-    bool evicted = indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_us());
+    auto result = indexer->InsertOnly(trace.keys(), trace.timestamp_ns());
+    bool evicted = indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_ns());
     if (evicted) {
-        KVCM_LOG_DEBUG("Eviction in %zu to instance_id: %s", trace.timestamp_us(), instance_id.c_str());
+        KVCM_LOG_DEBUG("Eviction at ts=%lld for instance_id: %s",
+                       static_cast<long long>(trace.timestamp_ns()),
+                       instance_id.c_str());
     }
 
     WriteRecord record;
-    record.timestamp_us = trace.timestamp_us();
+    record.timestamp_ns = trace.timestamp_ns();
     record.write_blocks = trace.keys().size();
     record.newly_inserted_blocks = result.inserted_keys.size();
     record.trace_id = trace.trace_id();
@@ -139,11 +141,11 @@ void OptimizerRunner::HandleDialogTurn(const DialogTurnSchemaTrace &trace) {
     }
 
     std::vector<std::vector<int64_t>> hits;
-    indexer->InsertWithQuery(trace.total_keys(), trace.timestamp_us(), hits);
-    indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_us());
+    indexer->InsertWithQuery(trace.total_keys(), trace.timestamp_ns(), hits);
+    indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_ns());
 
     // ---- ReadRecord ----
-    ReadRecord read_record = BuildReadRecord(instance_id, trace.timestamp_us());
+    ReadRecord read_record = BuildReadRecord(instance_id, trace.timestamp_ns());
     read_record.trace_id = trace.trace_id();
     read_record.keys_ptr = &trace.keys();
     read_record.external_read_blocks = trace.keys().size();
@@ -158,7 +160,7 @@ void OptimizerRunner::HandleDialogTurn(const DialogTurnSchemaTrace &trace) {
     // ---- WriteRecord ----
     // DialogTurn 的写入部分是 decode 新增的 block，全部视为新插入
     size_t decode_blocks = trace.total_keys().size() - trace.keys().size();
-    WriteRecord write_record{trace.timestamp_us(), decode_blocks, decode_blocks};
+    WriteRecord write_record{trace.timestamp_ns(), decode_blocks, decode_blocks};
     stats_collector_->OnWriteComplete(instance_id, write_record);
 }
 } // namespace kv_cache_manager

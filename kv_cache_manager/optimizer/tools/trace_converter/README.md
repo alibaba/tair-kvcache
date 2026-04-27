@@ -234,8 +234,8 @@ JSON格式,每行一个事件:
 ```json
 {
   "instance_id": "instance",
-  "trace_id": "trace_instance_1704110400000000",
-  "timestamp_us": 1704110400000000,
+  "trace_id": "trace_instance_1704110400000000000",
+  "timestamp_ns": 1704110400000000000,
   "tokens": [],
   "keys": [123, 456, 789],
   "query_type": "prefix_match",
@@ -249,8 +249,8 @@ JSON格式,每行一个事件:
 ```json
 {
   "instance_id": "instance",
-  "trace_id": "trace_instance_1704110400000001",
-  "timestamp_us": 1704110400000001,
+  "trace_id": "trace_instance_1704110400000000001",
+  "timestamp_ns": 1704110400000000001,
   "tokens": [],
   "keys": [123, 456, 789, 1011]
 }
@@ -261,8 +261,8 @@ JSON格式,每行一个事件:
 ```json
 {
   "instance_id": "instance",
-  "trace_id": "trace_instance_1704110400000000",
-  "timestamp_us": 1704110400000000,
+  "trace_id": "trace_instance_1704110400000000000",
+  "timestamp_ns": 1704110400000000000,
   "tokens": [],
   "keys": [123, 456, 789],
   "query_type": "prefix_match",
@@ -459,8 +459,8 @@ for token in tokens:
 原始时间戳: T
 
 生成策略:
-- GetLocationSchemaTrace.timestamp_us = T
-- WriteCacheSchemaTrace.timestamp_us = T + 1 (微秒)
+- GetLocationSchemaTrace.timestamp_ns = T
+- WriteCacheSchemaTrace.timestamp_ns = T + 1 (纳秒)
 
 理由: 保证Get在Write之前 (prefill先于decode)
 ```
@@ -517,7 +517,7 @@ python3 trace_converter.py -i input.jsonl -o output.jsonl -f my
 ```python
 # 创建 Get trace
 self._create_get_trace(
-    timestamp_us=timestamp_us,
+    timestamp_ns=timestamp_ns,
     keys=block_keys,
     instance_id=instance_id,
     tokens=token_ids  # 可选
@@ -525,7 +525,7 @@ self._create_get_trace(
 
 # 创建 Write trace
 self._create_write_trace(
-    timestamp_us=timestamp_us,
+    timestamp_ns=timestamp_ns,
     keys=block_keys,
     instance_id=instance_id,
     tokens=token_ids  # 可选
@@ -533,7 +533,7 @@ self._create_write_trace(
 
 # 创建 DialogTurn trace
 self._create_dialog_trace(
-    timestamp_us=timestamp_us,
+    timestamp_ns=timestamp_ns,
     keys=prefill_keys,
     input_len=input_token_count,
     output_len=output_token_count,

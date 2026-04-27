@@ -32,11 +32,20 @@ def read_csv_file(csv_file_path):
         print(f"Error reading {csv_file_path}: {str(e)}")
         return None
 
+
+def _ensure_hit_rate_timestamp_ns(df: pd.DataFrame) -> pd.DataFrame:
+    """命中 CSV 仅使用 TimestampNs（纳秒）。"""
+    if "TimestampNs" not in df.columns:
+        raise ValueError("hit_rates CSV 缺少 TimestampNs 列")
+    df["TimestampNs"] = pd.to_numeric(df["TimestampNs"], errors="coerce")
+    return df
+
+
 def _load_sp_cumulative(csv_dir, instance_name):
     """
     从 template_prefix_traces.csv 计算 system prompt 累积命中率时序。
 
-    返回 DataFrame: [TimestampUs, AccSpHitRate]
+    返回 DataFrame: [TimestampNs, AccSpHitRate]
     AccSpHitRate = cumsum(min(hit, template_depth)) / cumsum(total_blocks)
     """
     basename = instance_name.replace("_hit_rates", "")
@@ -45,9 +54,9 @@ def _load_sp_cumulative(csv_dir, instance_name):
         return None
 
     df = pd.read_csv(sp_path)
-    # trace_id format: trace_<instance>_<timestamp_us>
-    df['TimestampUs'] = df['TraceId'].str.rsplit('_', n=1).str[-1].astype(np.int64)
-    df = df.sort_values('TimestampUs')
+    # trace_id format: trace_<instance>_<timestamp_ns>
+    df["TimestampNs"] = df["TraceId"].str.rsplit("_", n=1).str[-1].astype(np.int64)
+    df = df.sort_values("TimestampNs")
 
     sp_hits = np.where(
         (df['TemplateId'] != 'NONE') & (df['TemplateDepth'] > 0),
@@ -61,12 +70,12 @@ def _load_sp_cumulative(csv_dir, instance_name):
     acc_sp_rate = np.where(cum_total > 0, cum_sp_hits / cum_total, 0.0)
 
     return pd.DataFrame({
-        'TimestampUs': df['TimestampUs'].values,
-        'AccSpHitRate': acc_sp_rate,
+        "TimestampNs": df["TimestampNs"].values,
+        "AccSpHitRate": acc_sp_rate,
     })
 
 
-def plot_multi_instance_analysis(csv_dir, output_dir: str = None):
+def plot_multi_instance_analysis(csv_dir, output_dir: str = None, show_template: bool = True):
     """
     读取 csv_dir 下的命中率 CSV，生成时序分析图。
 
@@ -74,6 +83,7 @@ def plot_multi_instance_analysis(csv_dir, output_dir: str = None):
         csv_dir:    CSV 数据目录
         output_dir: 图表根输出目录，图表保存至 output_dir/timeseries/
                     默认为 csv_dir（向后兼容）
+        show_template: 是否在图上显示 SP 累积命中率线（需要 template_prefix_traces.csv）
     """
     csv_files = sorted(glob.glob(os.path.join(csv_dir, "*_hit_rates.csv")))
     if not csv_files:
@@ -86,12 +96,13 @@ def plot_multi_instance_analysis(csv_dir, output_dir: str = None):
         if df is None:
             continue
 
+        df = _ensure_hit_rate_timestamp_ns(df)
+
         # 数值化 + 排序
-        for c in ['TimestampUs', 'CachedBlocksAllInstance',
-                  'AccHitRate', 'AccExternalHitRate', 'AccReadBlocks']:
+        for c in ["CachedBlocksAllInstance", "AccHitRate", "AccExternalHitRate", "AccReadBlocks"]:
             if c in df.columns:
-                df[c] = pd.to_numeric(df[c], errors='coerce')
-        df = df.dropna(subset=['TimestampUs']).sort_values('TimestampUs')
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+        df = df.dropna(subset=["TimestampNs"]).sort_values("TimestampNs")
 
 
         dataframes.append(df)
@@ -101,7 +112,7 @@ def plot_multi_instance_analysis(csv_dir, output_dir: str = None):
         print("Error: No valid CSV data could be loaded")
         return
 
-    required_cols = ['TimestampUs', 'CachedBlocksAllInstance', 'AccHitRate', 'AccExternalHitRate', 'AccReadBlocks']
+    required_cols = ["TimestampNs", "CachedBlocksAllInstance", "AccHitRate", "AccExternalHitRate", "AccReadBlocks"]
     for i, df in enumerate(dataframes):
         missing = [c for c in required_cols if c not in df.columns]
         if missing:
@@ -109,12 +120,12 @@ def plot_multi_instance_analysis(csv_dir, output_dir: str = None):
             return
 
     # 全局基准：最早起点
-    min_timestamp = min(df['TimestampUs'].iloc[0] for df in dataframes)
+    min_timestamp = min(df["TimestampNs"].iloc[0] for df in dataframes)
 
     # “每个trace都画”：基准时间轴取所有instance的时间戳并集（秒）
     all_t = []
     for df in dataframes:
-        all_t.append(((df['TimestampUs'] - min_timestamp) / 1e6).to_numpy())
+        all_t.append(((df["TimestampNs"] - min_timestamp) / 1e9).to_numpy())
     base_timestamps = np.unique(np.concatenate(all_t))
     base = pd.DataFrame({'t': base_timestamps})  # 用于merge_asof
 
@@ -124,7 +135,7 @@ def plot_multi_instance_analysis(csv_dir, output_dir: str = None):
     global_updates_list = []
     for df in dataframes:
         d = df.copy()
-        d['t'] = (d['TimestampUs'] - min_timestamp) / 1e6
+        d["t"] = (d["TimestampNs"] - min_timestamp) / 1e9
         d = d.sort_values('t')
 
         # 反推累积命中块数：AccHitBlocks = AccHitRate × AccReadBlocks
@@ -157,20 +168,23 @@ def plot_multi_instance_analysis(csv_dir, output_dir: str = None):
         all_acc_ext_hit_blocks.append(aligned['AccExtHitBlocks'].to_numpy(float))
 
     # ---- SP 累积命中率对齐 ----
-    for idx, name in enumerate(instance_names):
-        sp_df = _load_sp_cumulative(csv_dir, name)
-        if sp_df is None:
-            all_acc_sp_hit.append(None)
-            continue
-        sp_df['t'] = (sp_df['TimestampUs'] - min_timestamp) / 1e6
-        sp_df = sp_df.sort_values('t')
-        sp_aligned = pd.merge_asof(
-            base, sp_df[['t', 'AccSpHitRate']], on='t',
-            direction='backward', allow_exact_matches=True
-        )
-        t0, _ = all_time_ranges[idx]
-        sp_aligned.loc[sp_aligned['t'] < t0, 'AccSpHitRate'] = np.nan
-        all_acc_sp_hit.append(sp_aligned['AccSpHitRate'].to_numpy(float))
+    if show_template:
+        for idx, name in enumerate(instance_names):
+            sp_df = _load_sp_cumulative(csv_dir, name)
+            if sp_df is None:
+                all_acc_sp_hit.append(None)
+                continue
+            sp_df["t"] = (sp_df["TimestampNs"] - min_timestamp) / 1e9
+            sp_df = sp_df.sort_values('t')
+            sp_aligned = pd.merge_asof(
+                base, sp_df[['t', 'AccSpHitRate']], on='t',
+                direction='backward', allow_exact_matches=True
+            )
+            t0, _ = all_time_ranges[idx]
+            sp_aligned.loc[sp_aligned['t'] < t0, 'AccSpHitRate'] = np.nan
+            all_acc_sp_hit.append(sp_aligned['AccSpHitRate'].to_numpy(float))
+    else:
+        all_acc_sp_hit = [None] * len(instance_names)
 
     global_updates = pd.concat(global_updates_list, ignore_index=True)
     global_updates = global_updates.dropna(subset=['t', 'CachedBlocksAllInstance']).sort_values('t')
