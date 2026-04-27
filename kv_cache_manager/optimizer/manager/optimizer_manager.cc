@@ -92,6 +92,9 @@ bool OptimizerManager::Init() {
 
             instance_configs_[instance_id] = instance_config;
             instance_group_ttl_disabled_[instance_id] = (group.default_block_ttl_seconds() == 0);
+            instance_ttl_refresh_on_read_[instance_id] =
+                (instance_config.eviction_policy_type() == EvictionPolicyType::POLICY_TTL) ? group.ttl_refresh_on_read()
+                                                                                           : true;
 
             if (instance_config.eviction_policy_type() == EvictionPolicyType::POLICY_TTL &&
                 group.default_block_ttl_seconds() == 0 &&
@@ -111,6 +114,7 @@ bool OptimizerManager::Init() {
                 failed_instance_ids.push_back(instance_id);
                 instance_configs_.erase(instance_id);
                 instance_group_ttl_disabled_.erase(instance_id);
+                instance_ttl_refresh_on_read_.erase(instance_id);
                 continue;
             }
 
@@ -142,8 +146,11 @@ bool OptimizerManager::Init() {
     indexer_manager_->RegisterInstanceGroups(instance_group_configs_);
     indexer_manager_->RegisterInstances(instance_configs_);
 
-    optimizer_runner_.reset(
-        new OptimizerRunner(indexer_manager_, eviction_manager_, stats_collector_, instance_group_ttl_disabled_));
+    optimizer_runner_.reset(new OptimizerRunner(indexer_manager_,
+                                                eviction_manager_,
+                                                stats_collector_,
+                                                instance_group_ttl_disabled_,
+                                                instance_ttl_refresh_on_read_));
     return true;
 }
 

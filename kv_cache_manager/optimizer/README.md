@@ -77,9 +77,10 @@ OptimizerManager (核心协调器)
 
 **TTL 行为规则**：
 - `default_block_ttl_seconds`：在 instance group 级别配置，`0` 表示组级禁用 TTL。
+- `ttl_refresh_on_read`：控制读命中是否刷新 TTL 锚点；默认 `true`（Sliding TTL），`false` 时读不续命。
 - 组级禁用 TTL 时，请求级 `ttl_seconds > 0` 不生效（写入路径会强制关闭 TTL）。
-- 写入时，block 的 `last_access_time` 设为当前时间，TTL 从此刻开始计时。
-- 读取时（`PrefixQuery`），`last_access_time` 被刷新，实现 Sliding Window TTL（续命）。
+- 写入时，`ttl_anchor_time` 重置为写入时间，TTL 从该锚点开始计时。
+- 读取时（`PrefixQuery`），`last_access_time` 总是刷新；仅在 `ttl_refresh_on_read=true` 时刷新 `ttl_anchor_time`。
 - 读写请求执行前，会先进行一次 TTL 过期块物理清理，并由 `CleanEvictedBlocks` 统一做节点清理。
 - 写入完成后，`CheckAndEvict` 负责容量驱逐；当 `fallback_on_pressure=false` 时跳过容量驱逐。
 - `POLICY_TTL` 过期清理已优化为基于最小过期时间堆（min-heap）的增量回收，避免每次请求全链表扫描。
@@ -313,6 +314,7 @@ optimizer.ClearAllCachesAndResetStats()           # 清空所有实例并重置�
 | eviction_mode | 驱逐模式：1=GROUP_ROUGH, 2=INSTANCE_ROUGH, 3=INSTANCE_PRECISE |
 | eviction_policy_type | 驱逐策略类型：lru、random_lru、leaf_aware_lru、ttl |
 | default_block_ttl_seconds | instance group 级别的默认 TTL（秒），0 = 关闭 TTL |
+| ttl_refresh_on_read | instance group 级别 TTL 续命开关：true=读续命，false=固定窗口 |
 | fallback_on_pressure | TTL 策略参数：过期不够时是否按 LRU 兜底（默认 true） |
 
 ### 示例

@@ -24,7 +24,7 @@ public:
 
     void OnBlockWritten(BlockEntry *block) override;
     void OnNodeWritten(std::vector<BlockEntry *> &blocks) override;
-    void OnBlockAccessed(BlockEntry *block, int64_t timestamp) override;
+    void OnBlockAccessedWithOptions(BlockEntry *block, int64_t timestamp, bool refresh_ttl_on_read) override;
     std::vector<BlockEntry *> EvictBlocks(size_t count) override;
     std::vector<BlockEntry *> EvictExpired() override;
     void Clear() override;
@@ -32,6 +32,8 @@ public:
     void AdvanceClock(int64_t timestamp) override;
 
 private:
+    // NVI hook：外部只能通过 OnBlockAccessedWithOptions 调用，此处仅供基类默认实现 dispatch。
+    void OnBlockAccessed(BlockEntry *block, int64_t timestamp) override;
     void EvictOne(BlockEntry *block);
     void PushExpireEvent(BlockEntry *block);
     bool TryPopOneExpired(BlockEntry *&expired_block);

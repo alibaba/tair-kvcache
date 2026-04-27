@@ -315,7 +315,7 @@ TEST_F(OptEvictionManagerTest, ActiveEvictExpiredShouldNotTriggerFallbackEvictio
 
     policy->OnBlockWritten(&expired_block);
     policy->OnBlockWritten(&alive_block);
-    policy->OnBlockAccessed(&alive_block, 1000); // 推进时钟，确保 expired_block 过期
+    policy->OnBlockAccessedWithOptions(&alive_block, 1000, true); // 推进时钟，确保 expired_block 过期
 
     OptInstanceGroupConfig ttl_group;
     ttl_group.set_group_name("ttl_group");

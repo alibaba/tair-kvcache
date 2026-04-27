@@ -54,7 +54,7 @@ TEST_F(LruEvictionPolicyTest, OnBlockAccessed) {
     policy_->OnBlockWritten(&block2);
 
     // 访问block1,将其移到LRU链表头部
-    policy_->OnBlockAccessed(&block1, 3000);
+    policy_->OnBlockAccessedWithOptions(&block1, 3000, true);
     EXPECT_EQ(block1.last_access_time, 3000);
 
     // 驱逐应该先驱逐block2(最久未使用)
@@ -160,9 +160,9 @@ TEST_F(LruEvictionPolicyTest, LruOrderAfterMultipleAccesses) {
     policy_->OnBlockWritten(&block3);
 
     // 多次访问不同的块
-    policy_->OnBlockAccessed(&block1, 4000);
-    policy_->OnBlockAccessed(&block3, 5000);
-    policy_->OnBlockAccessed(&block2, 6000);
+    policy_->OnBlockAccessedWithOptions(&block1, 4000, true);
+    policy_->OnBlockAccessedWithOptions(&block3, 5000, true);
+    policy_->OnBlockAccessedWithOptions(&block2, 6000, true);
 
     // block3应该是最久未使用的(最后访问时间是5000,而block1是4000,block2是6000)
     // LRU驱逐最久未访问的,即最后访问时间最小的

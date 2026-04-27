@@ -70,6 +70,20 @@ bazel build //kv_cache_manager/optimizer:optimizer_main
 - `eviction_mode`: 1=GROUP_ROUGH, 2=INSTANCE_ROUGH, 3=INSTANCE_PRECISE
 - `eviction_policy_type`: lru、random_lru、leaf_aware_lru、ttl
 
+### TTL 时间语义说明
+
+当实例使用 `ttl` 策略时，`BlockEntry` 中有两类时间字段：
+
+- `last_access_time`：记录最近访问时间，用于访问统计和 LRU 热度排序。
+- `ttl_anchor_time`：TTL 过期锚点，过期判定使用 `current_time > ttl_anchor_time + ttl_us`。
+
+`ttl_refresh_on_read` 控制读路径是否续命：
+
+- `true`（默认）：读命中会更新 `ttl_anchor_time`，TTL 采用滑动窗口。
+- `false`：读命中不更新 `ttl_anchor_time`，TTL 采用固定窗口；但 `last_access_time` 仍会更新，保证统计与 LRU fallback 热度正常。
+
+写入路径会将 `ttl_anchor_time` 重置为写入事件时间，保证 TTL 起点明确且与事件时间一致。
+
 
 ## 基本使用
 基本示例见 [Optimizer README](../kv_cache_manager/optimizer/README.md#示例)

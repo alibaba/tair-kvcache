@@ -35,6 +35,9 @@ struct BlockEntry {
     std::vector<int64_t> token_ids; // 可选
     int64_t writing_time = -1;
     int64_t last_access_time = -1;
+    // TTL 续命锚点（与访问统计时间 last_access_time 解耦）。
+    // 不变式：仅在 ttl_us > 0 时有意义；IsExpired 已守卫 ttl_us <= 0，anchor = -1 不会误判。
+    int64_t ttl_anchor_time = -1;
     size_t access_count = 0;
     int64_t ttl_us = 0;                  // TTL 微秒，0 = 永不过期
     RadixTreeNode *owner_node = nullptr; // 所属节点指针
@@ -42,12 +45,13 @@ struct BlockEntry {
     void ResetAccess() {
         access_count = 0;
         last_access_time = -1;
+        ttl_anchor_time = -1;
         writing_time = -1;
         ttl_us = 0;
     }
 
     bool IsExpired(int64_t current_timestamp) const {
-        return ttl_us > 0 && current_timestamp > last_access_time + ttl_us;
+        return ttl_us > 0 && current_timestamp > ttl_anchor_time + ttl_us;
     }
 };
 

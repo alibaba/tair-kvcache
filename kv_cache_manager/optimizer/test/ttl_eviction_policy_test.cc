@@ -15,6 +15,7 @@ protected:
         BlockEntry b;
         b.key = key;
         b.last_access_time = last_access;
+        b.ttl_anchor_time = last_access;
         b.ttl_us = ttl_us;
         if (with_location) {
             b.location_map["shared"] = TierStat{};
@@ -54,7 +55,7 @@ TEST_F(TtlEvictionPolicyTest, OnlyExpiredBlocksEvicted) {
     policy_->OnBlockWritten(&b2);
 
     // t=1200: b1 过期 (1000+100<1200), b2 永不过期
-    policy_->OnBlockAccessed(&b2, 1200);
+    policy_->OnBlockAccessedWithOptions(&b2, 1200, true);
 
     auto evicted = policy_->EvictBlocks(10);
     ASSERT_EQ(evicted.size(), 1);
@@ -69,7 +70,7 @@ TEST_F(TtlEvictionPolicyTest, NoExpiredNothingEvicted) {
     policy_->OnBlockWritten(&b1);
     policy_->OnBlockWritten(&b2);
 
-    policy_->OnBlockAccessed(&b1, 3000);
+    policy_->OnBlockAccessedWithOptions(&b1, 3000, true);
 
     auto evicted = policy_->EvictBlocks(100);
     EXPECT_EQ(evicted.size(), 0);
@@ -140,7 +141,7 @@ TEST_F(TtlEvictionPolicyTest, AccessRefreshesTtl) {
 
     EXPECT_FALSE(b.IsExpired(1400));
 
-    policy_->OnBlockAccessed(&b, 1400);
+    policy_->OnBlockAccessedWithOptions(&b, 1400, true);
     EXPECT_EQ(b.last_access_time, 1400);
 
     // t=1800: 距新 last_access 400us，仍未过期
@@ -182,7 +183,7 @@ TEST_F(TtlEvictionPolicyTest, MixedExpiredAndAlive) {
     policy_->OnBlockWritten(&b3);
 
     // t=350: b1 过期 (100+50<350), b3 未过期 (300+100=400>350), b2 永不过期
-    policy_->OnBlockAccessed(&b3, 350);
+    policy_->OnBlockAccessedWithOptions(&b3, 350, true);
 
     auto evicted = policy_->EvictBlocks(10);
     ASSERT_EQ(evicted.size(), 1);

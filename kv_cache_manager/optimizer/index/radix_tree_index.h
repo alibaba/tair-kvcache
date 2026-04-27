@@ -34,7 +34,8 @@ public:
                      const BlockMask &block_mask,
                      const int64_t timestamp,
                      std::vector<std::vector<int64_t>> &external_hits,
-                     std::vector<std::vector<int64_t>> &internal_hits);
+                     std::vector<std::vector<int64_t>> &internal_hits,
+                     bool refresh_ttl_on_read = true);
 
     std::vector<int64_t> InsertWithQuery(const std::vector<int64_t> &block_keys,
                                          const int64_t timestamp,
@@ -99,7 +100,7 @@ private:
     void WriteToTier(
         RadixTreeNode *node, const std::vector<int64_t> &block_keys, int64_t timestamp, int64_t ttl_us, WriteModify cb);
 
-    void OnBlockAccessed(BlockEntry *block, int64_t timestamp);
+    void OnBlockAccessed(BlockEntry *block, int64_t timestamp, bool refresh_ttl_on_read = true);
     bool IsBlockEvict(BlockEntry *block, int64_t timestamp) const;
 };
 } // namespace kv_cache_manager

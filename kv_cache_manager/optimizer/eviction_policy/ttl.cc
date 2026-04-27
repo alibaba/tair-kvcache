@@ -21,6 +21,7 @@ void TtlEvictionPolicy::OnBlockWritten(BlockEntry *block) {
     if (block->last_access_time > last_known_timestamp_) {
         last_known_timestamp_ = block->last_access_time;
     }
+    block->ttl_anchor_time = block->last_access_time;
     PushExpireEvent(block);
 }
 
@@ -31,6 +32,10 @@ void TtlEvictionPolicy::OnNodeWritten(std::vector<BlockEntry *> &blocks) {
 }
 
 void TtlEvictionPolicy::OnBlockAccessed(BlockEntry *block, int64_t timestamp) {
+    OnBlockAccessedWithOptions(block, timestamp, true);
+}
+
+void TtlEvictionPolicy::OnBlockAccessedWithOptions(BlockEntry *block, int64_t timestamp, bool refresh_ttl_on_read) {
     auto it = node_map_.find(block);
     if (it == node_map_.end()) {
         return;
@@ -41,6 +46,10 @@ void TtlEvictionPolicy::OnBlockAccessed(BlockEntry *block, int64_t timestamp) {
         last_known_timestamp_ = timestamp;
     }
     list_.move_to_front(it->second);
+    if (!refresh_ttl_on_read) {
+        return;
+    }
+    block->ttl_anchor_time = timestamp;
     PushExpireEvent(block);
 }
 
@@ -56,7 +65,7 @@ void TtlEvictionPolicy::PushExpireEvent(BlockEntry *block) {
     }
     auto &version = expire_event_version_[block];
     ++version;
-    expire_min_heap_.push(ExpireEvent{block->last_access_time + block->ttl_us, version, block});
+    expire_min_heap_.push(ExpireEvent{block->ttl_anchor_time + block->ttl_us, version, block});
     MaybeCompactExpireHeap();
 }
 
@@ -126,7 +135,7 @@ void TtlEvictionPolicy::RebuildExpireHeap() {
         if (version_it == expire_event_version_.end()) {
             continue;
         }
-        new_heap.push(ExpireEvent{block->last_access_time + block->ttl_us, version_it->second, block});
+        new_heap.push(ExpireEvent{block->ttl_anchor_time + block->ttl_us, version_it->second, block});
     }
     expire_min_heap_.swap(new_heap);
 }

@@ -87,7 +87,13 @@ void OptimizerRunner::HandleGetLocation(const GetLocationSchemaTrace &trace) {
 
     std::vector<std::vector<int64_t>> external_hits;
     std::vector<std::vector<int64_t>> internal_hits;
-    indexer->PrefixQuery(trace.keys(), trace.block_mask(), trace.timestamp_us(), external_hits, internal_hits);
+    bool refresh_ttl_on_read = true;
+    auto it = instance_ttl_refresh_on_read_.find(instance_id);
+    if (it != instance_ttl_refresh_on_read_.end()) {
+        refresh_ttl_on_read = it->second;
+    }
+    indexer->PrefixQuery(
+        trace.keys(), trace.block_mask(), trace.timestamp_us(), external_hits, internal_hits, refresh_ttl_on_read);
 
     // ---- 构造 ReadRecord 并委托给 StatsCollector ----
     ReadRecord record = BuildReadRecord(instance_id, trace.timestamp_us());

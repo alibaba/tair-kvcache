@@ -137,7 +137,8 @@ void RadixTreeIndex::PrefixQuery(const std::vector<int64_t> &block_keys,
                                  const BlockMask &block_mask,
                                  const int64_t timestamp,
                                  std::vector<std::vector<int64_t>> &external_hits,
-                                 std::vector<std::vector<int64_t>> &internal_hits) {
+                                 std::vector<std::vector<int64_t>> &internal_hits,
+                                 bool refresh_ttl_on_read) {
     if (block_keys.empty()) {
         return;
     }
@@ -172,11 +173,11 @@ void RadixTreeIndex::PrefixQuery(const std::vector<int64_t> &block_keys,
             BlockEntry *blk = child->blocks[match_len].get();
             if (query_keys.count(block_keys[key_idx + match_len])) {
                 temp_hits.push_back(block_keys[key_idx + match_len]);
-                // 访问block，更新存在的tier的访问信息
-                OnBlockAccessed(blk, timestamp);
+                // 访问block，始终更新访问热度；TTL 是否续命由 refresh_ttl_on_read 控制。
+                OnBlockAccessed(blk, timestamp, refresh_ttl_on_read);
             } else if (mask_keys.count(block_keys[key_idx + match_len])) {
                 temp_internal_hits.push_back(block_keys[key_idx + match_len]);
-                OnBlockAccessed(blk, timestamp);
+                OnBlockAccessed(blk, timestamp, refresh_ttl_on_read);
             }
             match_len++;
         }
@@ -303,9 +304,11 @@ void RadixTreeIndex::CleanEmptyBlocks(const std::vector<BlockEntry *> &blocks,
     for (auto *block : blocks) {
         if (block->location_map.empty()) {
             int64_t effective_eviction_timestamp = eviction_timestamp;
-            if (use_logical_expire_time && block->ttl_us > 0 && block->last_access_time >= 0) {
-                // TTL 过期清理使用逻辑过期时刻（last_access + ttl）
-                effective_eviction_timestamp = block->last_access_time + block->ttl_us;
+            if (use_logical_expire_time && block->ttl_us > 0 && block->ttl_anchor_time >= 0) {
+                // TTL 过期清理使用逻辑过期时刻（ttl_anchor + ttl），与 IsExpired 保持同一判据。
+                // 不能用 last_access_time：当 ttl_refresh_on_read=false（固定窗口）时，
+                // last_access_time 会晚于 ttl_anchor_time，导致 death_time_us 被高估。
+                effective_eviction_timestamp = block->ttl_anchor_time + block->ttl_us;
                 if (effective_eviction_timestamp > eviction_timestamp) {
                     effective_eviction_timestamp = eviction_timestamp;
                 }
@@ -437,14 +440,14 @@ void RadixTreeIndex::WriteToTier(RadixTreeNode *node,
     eviction_policy_->OnNodeWritten(inserted_blocks);
 }
 
-void RadixTreeIndex::OnBlockAccessed(BlockEntry *block, int64_t timestamp) {
+void RadixTreeIndex::OnBlockAccessed(BlockEntry *block, int64_t timestamp, bool refresh_ttl_on_read) {
     // 全局驱逐
     if (eviction_policy_->name() == "shared") {
-        eviction_policy_->OnBlockAccessed(block, timestamp);
+        eviction_policy_->OnBlockAccessedWithOptions(block, timestamp, refresh_ttl_on_read);
     } else {
         // 分层驱逐，但目前只创建了第一层的驱逐策略，只对第一层进行驱逐,其他层写进去先不管
         // TODO 后续依照kvcm分层逻辑来实现
-        eviction_policy_->OnBlockAccessed(block, timestamp);
+        eviction_policy_->OnBlockAccessedWithOptions(block, timestamp, refresh_ttl_on_read);
         for (auto &location_pair : block->location_map) {
             // 现在不论是不是在第一层命中，都只更新第一层tier的访问信息
             std::string tier_name = eviction_policy_->name();

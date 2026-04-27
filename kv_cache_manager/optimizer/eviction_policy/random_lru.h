@@ -29,14 +29,14 @@ public:
 
     void OnNodeWritten(std::vector<BlockEntry *> &blocks) override;
 
-    void OnBlockAccessed(BlockEntry *block, int64_t timestamp) override;
-
     // 驱逐 count 个块（分批，每批按 RandomLRU）
     std::vector<BlockEntry *> EvictBlocks(size_t count) override;
     void Clear() override;
     size_t size() const override { return blocks_.size(); }
 
 private:
+    // NVI hook：外部统一通过基类 OnBlockAccessedWithOptions 入口调用。
+    void OnBlockAccessed(BlockEntry *block, int64_t timestamp) override;
     // 随机采样 sample_size 个块
     // 从候选块中选出 k 个 LRU 的块（按 last_access_time 排序）
 

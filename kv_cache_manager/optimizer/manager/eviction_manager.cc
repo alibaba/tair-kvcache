@@ -247,11 +247,10 @@ OptEvictionManager::ActiveEvictExpired(const OptInstanceGroupConfig &instance_gr
         if (!policy) {
             continue;
         }
+        policy->AdvanceClock(current_timestamp);
         if (policy->size() == 0) {
             continue;
         }
-
-        policy->AdvanceClock(current_timestamp);
         auto evicted = policy->EvictExpired();
         if (!evicted.empty()) {
             result[instance_id] = evicted;
