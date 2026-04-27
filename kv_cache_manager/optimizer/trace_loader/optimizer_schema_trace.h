@@ -1,6 +1,6 @@
 #pragma once
 #include "kv_cache_manager/common/jsonizable.h"
-#include "kv_cache_manager/manager/cache_location.h"
+#include "kv_cache_manager/meta/cache_location.h"
 
 namespace kv_cache_manager {
 // 基础的Optimizer Schema Trace

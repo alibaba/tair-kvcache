@@ -6,7 +6,7 @@
 #include <sstream>
 #include <unordered_set>
 
-#include "kv_cache_manager/manager/cache_location.h"
+#include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/optimizer/analysis/stats_collector.h"
 
 namespace kv_cache_manager {

@@ -33,6 +33,7 @@ cc_library(
         "meta_storage_backend_factory.h",
     ],
     deps = [
+        ":cache_location",
         ":common",
         ":meta_search_cache",
         ":meta_cached_backend",
@@ -43,6 +44,21 @@ cc_library(
         "//kv_cache_manager/common",
         "//kv_cache_manager/common:utils",
         "//kv_cache_manager/config",
+    ],
+)
+
+cc_library(
+    name = "cache_location",
+    srcs = [
+        "cache_location.cc",
+    ],
+    hdrs = [
+        "cache_location.h",
+    ],
+    deps = [
+        "//kv_cache_manager/common",
+        "//kv_cache_manager/common:string_util",
+        "//kv_cache_manager/data_storage:common_define",
     ],
 )
 

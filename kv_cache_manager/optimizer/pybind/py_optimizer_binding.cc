@@ -6,7 +6,7 @@
 #include <pybind11/stl_bind.h>
 
 #include "kv_cache_manager/common/logger.h"
-#include "kv_cache_manager/manager/cache_location.h"
+#include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/optimizer/config/insight_simulator_types.h"
 #include "kv_cache_manager/optimizer/config/instance_config.h"
 #include "kv_cache_manager/optimizer/config/instance_group_config.h"

@@ -4,10 +4,10 @@
 #include <string>
 #include <vector>
 
-#include "cache_location.h"
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/manager/select_location_policy.h"
+#include "kv_cache_manager/meta/cache_location.h"
 
 namespace kv_cache_manager {
 

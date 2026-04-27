@@ -13,6 +13,7 @@ public:
     ~MetaLocalBaseBackend() override = default;
 
     using MetaStorageBackend::Delete;
+    using MetaStorageBackend::DeleteFields;
     using MetaStorageBackend::Put;
     using MetaStorageBackend::UpdateFields;
     using MetaStorageBackend::Upsert;
@@ -35,6 +36,9 @@ public:
                                           const std::vector<ErrorCode> &previous_error_codes) noexcept = 0;
     virtual std::vector<ErrorCode> Delete(const KeyTypeVec &keys,
                                           const std::vector<ErrorCode> &previous_error_codes) noexcept = 0;
+    virtual std::vector<ErrorCode> DeleteFields(const KeyTypeVec &keys,
+                                                const std::vector<std::vector<std::string>> &field_names_vec,
+                                                const std::vector<ErrorCode> &previous_error_codes) noexcept = 0;
 };
 
 } // namespace kv_cache_manager

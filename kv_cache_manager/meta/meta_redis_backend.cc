@@ -173,6 +173,19 @@ std::vector<ErrorCode> MetaRedisBackend::Delete(const KeyTypeVec &keys) noexcept
     return handle->Delete(full_keys);
 }
 
+std::vector<ErrorCode>
+MetaRedisBackend::DeleteFields(const KeyTypeVec &keys,
+                               const std::vector<std::vector<std::string>> &field_names_vec) noexcept {
+    auto handle = client_pool_->AcquireClient(timeout_ms_);
+    if (!handle) {
+        KVCM_INTERVAL_LOG_WARN(
+            10, "delete fields fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
+        return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
+    }
+    std::vector<std::string> full_keys = AppendPrefixToKeys(keys);
+    return handle->DeleteFields(full_keys, field_names_vec);
+}
+
 std::vector<ErrorCode> MetaRedisBackend::Get(const KeyTypeVec &keys,
                                              const std::vector<std::string> &field_names,
                                              FieldMapVec &out_field_maps) noexcept {
@@ -183,6 +196,18 @@ std::vector<ErrorCode> MetaRedisBackend::Get(const KeyTypeVec &keys,
     }
     std::vector<std::string> full_keys = AppendPrefixToKeys(keys);
     return handle->Get(full_keys, field_names, out_field_maps);
+}
+
+std::vector<ErrorCode> MetaRedisBackend::Get(const KeyTypeVec &keys,
+                                             const std::vector<std::vector<std::string>> &field_names_vec,
+                                             FieldMapVec &out_field_maps) noexcept {
+    auto handle = client_pool_->AcquireClient(timeout_ms_);
+    if (!handle) {
+        KVCM_INTERVAL_LOG_WARN(10, "get fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
+        return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
+    }
+    std::vector<std::string> full_keys = AppendPrefixToKeys(keys);
+    return handle->Get(full_keys, field_names_vec, out_field_maps);
 }
 
 std::vector<ErrorCode> MetaRedisBackend::GetAllFields(const KeyTypeVec &keys, FieldMapVec &out_field_maps) noexcept {
@@ -204,6 +229,19 @@ std::vector<ErrorCode> MetaRedisBackend::Exists(const KeyTypeVec &keys, std::vec
     }
     std::vector<std::string> full_keys = AppendPrefixToKeys(keys);
     return handle->Exists(full_keys, out_is_exist_vec);
+}
+
+std::vector<ErrorCode> MetaRedisBackend::ExistsFieldWithPrefix(const KeyTypeVec &keys,
+                                                               const std::string &field_prefix,
+                                                               std::vector<bool> &out_exists_vec) noexcept {
+    auto handle = client_pool_->AcquireClient(timeout_ms_);
+    if (!handle) {
+        KVCM_INTERVAL_LOG_WARN(
+            10, "exists field with prefix fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
+        return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
+    }
+    std::vector<std::string> full_keys = AppendPrefixToKeys(keys);
+    return handle->ExistsFieldWithPrefix(full_keys, field_prefix, out_exists_vec);
 }
 
 ErrorCode MetaRedisBackend::ListKeys(const std::string &cursor,

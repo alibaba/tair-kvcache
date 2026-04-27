@@ -30,12 +30,20 @@ public:
     std::vector<ErrorCode> Upsert(const std::vector<std::string> &keys,
                                   const std::vector<std::map<std::string, std::string>> &field_maps);
     std::vector<ErrorCode> Delete(const std::vector<std::string> &keys);
+    std::vector<ErrorCode> DeleteFields(const std::vector<std::string> &keys,
+                                        const std::vector<std::vector<std::string>> &field_names_vec);
     std::vector<ErrorCode> Get(const std::vector<std::string> &keys,
                                const std::vector<std::string> &field_names,
+                               std::vector<std::map<std::string, std::string>> &out_field_maps);
+    std::vector<ErrorCode> Get(const std::vector<std::string> &keys,
+                               const std::vector<std::vector<std::string>> &field_names_vec,
                                std::vector<std::map<std::string, std::string>> &out_field_maps);
     std::vector<ErrorCode> GetAllFields(const std::vector<std::string> &keys,
                                         std::vector<std::map<std::string, std::string>> &out_field_maps);
     std::vector<ErrorCode> Exists(const std::vector<std::string> &keys, std::vector<bool> &out_is_exist_vec);
+    std::vector<ErrorCode> ExistsFieldWithPrefix(const std::vector<std::string> &keys,
+                                                 const std::string &field_prefix,
+                                                 std::vector<bool> &out_exists_vec);
     ErrorCode Scan(const std::string &matching_prefix,
                    const std::string &cursor,
                    const int64_t limit,

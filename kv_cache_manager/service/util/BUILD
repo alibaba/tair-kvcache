@@ -26,7 +26,7 @@ cc_library(
         "//kv_cache_manager/config",
         "//kv_cache_manager/config:meta_cache_policy_config",
         "//kv_cache_manager/data_storage",
-        "//kv_cache_manager/manager:cache_location",
+        "//kv_cache_manager/meta:cache_location",
         "//kv_cache_manager/manager:cache_location_view",
         "//kv_cache_manager/protocol/protobuf:service_cc_proto",
     ],

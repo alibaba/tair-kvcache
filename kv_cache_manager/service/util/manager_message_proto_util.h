@@ -16,8 +16,8 @@
 #include "kv_cache_manager/config/trigger_strategy.h"
 #include "kv_cache_manager/data_storage/common_define.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
-#include "kv_cache_manager/manager/cache_location.h"
 #include "kv_cache_manager/manager/cache_location_view.h"
+#include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/protocol/protobuf/admin_service.pb.h"
 #include "kv_cache_manager/protocol/protobuf/meta_service.pb.h"
 namespace kv_cache_manager {
