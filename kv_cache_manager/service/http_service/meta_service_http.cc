@@ -35,6 +35,7 @@ void MetaServiceHttp::RegisterHandler() {
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, removeCache, RemoveCache, Common, RemoveCache);
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, trimCache, TrimCache, Common, TrimCache);
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, getClusterInfo, GetClusterInfo, GetClusterInfo, GetClusterInfo);
+    REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, reportEvent, ReportEvent, ReportEvent, ReportEvent);
 }
 
 void MetaServiceHttp::RegisterInstance(coro_http::coro_http_connection *http_conn,
@@ -148,6 +149,17 @@ void MetaServiceHttp::GetClusterInfo(coro_http::coro_http_connection *http_conn,
                    request->trace_id().c_str(),
                    request->ShortDebugString().c_str());
     meta_service_impl_->GetClusterInfo(request_context, request, response);
+}
+
+void MetaServiceHttp::ReportEvent(coro_http::coro_http_connection *http_conn,
+                                  proto::meta::ReportEventRequest *request,
+                                  proto::meta::ReportEventResponse *response) {
+    API_CONTEXT_INIT_HTTP(ReportEvent);
+    KVCM_LOG_INFO("[traceId: %s] ReportEvent called, instance_id: %s, event_type: %d",
+                  request->trace_id().c_str(),
+                  request->instance_id().c_str(),
+                  static_cast<int>(request->event_type()));
+    meta_service_impl_->ReportEvent(request_context, request, response);
 }
 
 } // namespace kv_cache_manager

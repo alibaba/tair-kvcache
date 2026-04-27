@@ -42,6 +42,54 @@ enum StorageType {
     ST_NFS = 4;
     ST_VCNS_3FS = 5;
     ST_DUMMY = 6;
+    ST_VINEYARD = 7;
+}
+
+// ---- Vineyard (V6D) event reporting ----
+
+enum ReportEventType {
+    EVENT_UNSPECIFIED = 0;
+    EVENT_NODE_REGISTER = 1; // V6D node starts up and registers with KVCM
+    EVENT_BLOCK_ADD = 2;     // V6D stored a new block locally
+    EVENT_BLOCK_DELETE = 3;  // V6D deleted a block locally
+    EVENT_HOST_DOWN = 4;     // V6D node is going down (graceful or detected)
+}
+
+message NodeRegisterParams {
+    string host_ip_port = 1; // e.g. "192.168.1.100:8080"
+}
+
+message BlockAddParams {
+    string block_key = 1;    // int64 as string
+    string location_json = 2; // raw JSON from V6D, stored as LocationSpec.uri
+    string host_ip_port = 3;
+}
+
+message BlockDeleteParams {
+    string block_key = 1;
+    string host_ip_port = 2;
+}
+
+message HostDownParams {
+    string down_host_ip_port = 1;
+}
+
+message ReportEventRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    ReportEventType event_type = 3;
+
+    oneof event_params {
+        NodeRegisterParams node_register = 4;
+        BlockAddParams block_add = 5;
+        BlockDeleteParams block_delete = 6;
+        HostDownParams host_down = 7;
+    }
+}
+
+message ReportEventResponse {
+    ErrorCode ec = 1;
+    string error_msg = 2;
 }
 
 // 使用URI统一多种存储表示，由client或者connector负责解析
@@ -350,4 +398,6 @@ service MetaService {
     rpc TrimCache(TrimCacheRequest) returns (CommonResponse);
     // 查询集群信息（leader发现），任意节点均可处理
     rpc GetClusterInfo(GetClusterInfoRequest) returns (GetClusterInfoResponse);
+    // V6D 上报事件（节点注册、Block 增删、节点宕机）
+    rpc ReportEvent(ReportEventRequest) returns (ReportEventResponse);
 }

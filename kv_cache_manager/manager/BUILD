@@ -22,11 +22,13 @@ cc_library(
         ":data_storage_selector",
         ":hash_util",
         ":meta_searcher",
+        ":priority_then_random_policy",
         ":reclaimer_task_supervisor",
         ":startup_config_loader",
         ":write_location_manager",
         "//kv_cache_manager/common",
         "//kv_cache_manager/config",
+        "//kv_cache_manager/data_storage",
         "//kv_cache_manager/event:event_publisher",
         "//kv_cache_manager/metrics:metrics_collector",
         "//kv_cache_manager/metrics:metrics_registry",
@@ -158,6 +160,15 @@ cc_library(
     hdrs = ["select_location_policy.h"],
     deps = [
         ":cache_location",
+    ],
+)
+
+cc_library(
+    name = "priority_then_random_policy",
+    srcs = ["priority_then_random_policy.cc"],
+    hdrs = ["priority_then_random_policy.h"],
+    deps = [
+        ":select_location_policy",
     ],
 )
 

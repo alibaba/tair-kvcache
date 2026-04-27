@@ -2,6 +2,8 @@
 
 #include <sstream>
 
+#include "kv_cache_manager/data_storage/vineyard_storage_spec.h"
+
 namespace kv_cache_manager {
 
 std::string ThreeFSStorageSpec::ToString() const {
@@ -162,6 +164,8 @@ std::string ToString(const DataStorageType &type) {
         return "file";
     case DataStorageType::DATA_STORAGE_TYPE_DUMMY:
         return "dummy";
+    case DataStorageType::DATA_STORAGE_TYPE_VINEYARD:
+        return "vineyard";
     default:
         return "unrecognized";
     }
@@ -180,6 +184,8 @@ DataStorageType ToDataStorageType(const std::string &type) {
         return DataStorageType::DATA_STORAGE_TYPE_NFS;
     } else if (type == "dummy") {
         return DataStorageType::DATA_STORAGE_TYPE_DUMMY;
+    } else if (type == "vineyard") {
+        return DataStorageType::DATA_STORAGE_TYPE_VINEYARD;
     } else {
         return DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
     }
@@ -335,6 +341,8 @@ bool StorageConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
         storage_spec_ = tmp;
     } else if (type_ == DataStorageType::DATA_STORAGE_TYPE_DUMMY) {
         auto tmp = std::make_shared<DummyStorageSpec>();
+    } else if (type_ == DataStorageType::DATA_STORAGE_TYPE_VINEYARD) {
+        auto tmp = std::make_shared<VineyardStorageSpec>();
         KVCM_JSON_GET_MACRO(rapid_value, "storage_spec", tmp);
         storage_spec_ = tmp;
     } else {
