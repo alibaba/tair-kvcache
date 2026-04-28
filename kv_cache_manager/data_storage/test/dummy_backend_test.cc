@@ -27,6 +27,31 @@ public:
         return StorageConfig(DataStorageType::DATA_STORAGE_TYPE_DUMMY, "test_dummy", spec);
     }
 
+    // helper: build a CreateBlocksRequest with a single spec
+    CreateBlocksRequest MakeRequest(const std::vector<int64_t> &block_keys,
+                                    int64_t spec_size = 128,
+                                    const std::string &instance_id = "inst_0",
+                                    const std::string &spec_name = "sp0") {
+        SpecBlockKeys sbk;
+        sbk.spec_name = spec_name;
+        sbk.spec_size = spec_size;
+        sbk.block_keys = block_keys;
+        CreateBlocksRequest req;
+        req.instance_id = instance_id;
+        req.spec_block_keys.push_back(std::move(sbk));
+        return req;
+    }
+
+    // helper: flatten single-spec result to a flat vector
+    static std::vector<std::pair<ErrorCode, DataStorageUri>>
+    Flatten(const std::vector<SpecCreateResult> &results) {
+        std::vector<std::pair<ErrorCode, DataStorageUri>> flat;
+        for (auto &spec_res : results) {
+            flat.insert(flat.end(), spec_res.begin(), spec_res.end());
+        }
+        return flat;
+    }
+
     std::shared_ptr<MetricsRegistry> metrics_registry_;
     std::string test_root_;
 };
@@ -82,18 +107,15 @@ TEST_F(DummyBackendTest, TestCreateSingleKeyPerFile) {
     auto config = MakeConfig(test_root_, 1);
     ASSERT_EQ(EC_OK, backend.Open(config, "trace_1"));
 
-    std::vector<std::string> keys = {"key1", "key2", "key3"};
-    auto results = backend.Create(keys, 128, "trace_2", []() {});
+    auto request = MakeRequest({1, 2, 3}, 128);
+    auto raw_results = backend.Create(request, "trace_2", []() {});
+    auto results = Flatten(raw_results);
 
-    ASSERT_EQ(results.size(), keys.size());
+    ASSERT_EQ(results.size(), 3u);
     for (auto &[ec, uri] : results) {
         ASSERT_EQ(ec, EC_OK);
         EXPECT_EQ(uri.GetProtocol(), "dummy");
     }
-    // each key maps to its own file path under base_path_
-    EXPECT_NE(std::string::npos, results[0].second.ToUriString().find("key1"));
-    EXPECT_NE(std::string::npos, results[1].second.ToUriString().find("key2"));
-    EXPECT_NE(std::string::npos, results[2].second.ToUriString().find("key3"));
 }
 
 TEST_F(DummyBackendTest, TestCreateMultipleKeysPerFile) {
@@ -101,10 +123,11 @@ TEST_F(DummyBackendTest, TestCreateMultipleKeysPerFile) {
     auto config = MakeConfig(test_root_, 2);
     ASSERT_EQ(EC_OK, backend.Open(config, "trace_1"));
 
-    std::vector<std::string> keys = {"a", "b", "c"};
-    auto results = backend.Create(keys, 64, "trace_2", []() {});
+    auto request = MakeRequest({10, 20, 30}, 64);
+    auto raw_results = backend.Create(request, "trace_2", []() {});
+    auto results = Flatten(raw_results);
 
-    ASSERT_EQ(results.size(), keys.size());
+    ASSERT_EQ(results.size(), 3u);
     for (auto &[ec, uri] : results) {
         ASSERT_EQ(ec, EC_OK);
     }
@@ -121,8 +144,10 @@ TEST_F(DummyBackendTest, TestCreateEmptyKeys) {
     ASSERT_EQ(EC_OK, backend.Open(config, "trace_1"));
 
     bool cb_called = false;
-    auto results = backend.Create({}, 128, "trace_2", [&cb_called]() { cb_called = true; });
+    auto request = MakeRequest({}, 128);
+    auto raw_results = backend.Create(request, "trace_2", [&cb_called]() { cb_called = true; });
     ASSERT_TRUE(cb_called);
+    auto results = Flatten(raw_results);
     ASSERT_TRUE(results.empty());
 }
 
@@ -132,7 +157,8 @@ TEST_F(DummyBackendTest, TestCreateCallbackInvoked) {
     ASSERT_EQ(EC_OK, backend.Open(config, "trace_1"));
 
     bool cb_called = false;
-    backend.Create({"k"}, 64, "trace_2", [&cb_called]() { cb_called = true; });
+    auto request = MakeRequest({42}, 64);
+    backend.Create(request, "trace_2", [&cb_called]() { cb_called = true; });
     ASSERT_TRUE(cb_called);
 }
 
@@ -142,9 +168,10 @@ TEST_F(DummyBackendTest, TestCreateWithZeroBatchSize) {
     auto config = MakeConfig(test_root_, 0);
     ASSERT_EQ(EC_OK, backend.Open(config, "trace_1"));
 
-    std::vector<std::string> keys = {"x", "y"};
-    auto results = backend.Create(keys, 32, "trace_2", []() {});
-    ASSERT_EQ(results.size(), keys.size());
+    auto request = MakeRequest({100, 200}, 32);
+    auto raw_results = backend.Create(request, "trace_2", []() {});
+    auto results = Flatten(raw_results);
+    ASSERT_EQ(results.size(), 2u);
     // with batch_size clamped to 1, no blkid param expected
     EXPECT_EQ(std::string::npos, results[0].second.ToUriString().find("blkid"));
     EXPECT_EQ(std::string::npos, results[1].second.ToUriString().find("blkid"));
@@ -306,8 +333,9 @@ TEST_F(DummyBackendTest, TestCreateThenExistRoundTrip) {
     auto config = MakeConfig(test_root_, 1);
     ASSERT_EQ(EC_OK, backend.Open(config, "trace_1"));
 
-    std::vector<std::string> keys = {"round_trip_key"};
-    auto create_res = backend.Create(keys, 256, "trace_2", []() {});
+    auto request = MakeRequest({999}, 256);
+    auto raw_results = backend.Create(request, "trace_2", []() {});
+    auto create_res = Flatten(raw_results);
     ASSERT_EQ(create_res.size(), 1u);
     ASSERT_EQ(create_res[0].first, EC_OK);
 

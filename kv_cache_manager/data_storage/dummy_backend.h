@@ -29,10 +29,9 @@ public:
     ErrorCode DoOpen(const StorageConfig &storage_config, const std::string &trace_id) override;
     ErrorCode Close() override;
 
-    std::vector<std::pair<ErrorCode, DataStorageUri>> Create(const std::vector<std::string> &keys,
-                                                             std::size_t size_per_key,
-                                                             const std::string &trace_id,
-                                                             std::function<void()> cb) override;
+    std::vector<SpecCreateResult> Create(const CreateBlocksRequest &request,
+                                        const std::string &trace_id,
+                                        std::function<void()> cb) override;
     std::vector<ErrorCode> Delete(const std::vector<DataStorageUri> &storage_uris,
                                   const std::string &trace_id,
                                   std::function<void()> cb) override;
