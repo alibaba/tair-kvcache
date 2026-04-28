@@ -15,64 +15,18 @@
 #include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/common.h"
-#include "kv_cache_manager/meta/meta_storage_backend.h"
+#include "kv_cache_manager/meta/types.h"
 
 namespace kv_cache_manager {
 
 class MetaIndexerConfig;
 class MetaSearchCache;
+class MetaStorageBackendManager;
 class RequestContext;
 class MetricsCollector;
 class MetricsRegistry;
 
 class MetaIndexer {
-public:
-    using KeyType = int64_t;
-    using KeyVector = std::vector<KeyType>;
-
-    // Location-granularity types
-    using LocationId = std::string;
-    using LocationIdVector = std::vector<LocationId>;
-    using LocationMap = std::unordered_map<LocationId, CacheLocation>;
-    using LocationMapVector = std::vector<LocationMap>;
-    using LocationIdsPerKey = std::vector<LocationIdVector>;
-    using LocationsPerKey = std::vector<CacheLocationVector>;
-
-    using PropertyMap = std::map<std::string, std::string>;
-    using PropertyMapVector = std::vector<PropertyMap>;
-
-    // Modifier action codes shared by both block-level and location-level RMW.
-    enum ModifierAction {
-        MA_OK = 1,
-        MA_FAIL = 2,
-        MA_SKIP = 3,
-        MA_DELETE = 4
-    };
-    using ModifierResult = std::pair<ModifierAction, ErrorCode>;
-
-    // Block-level modifier: sees the entire LocationMap of one block_key.
-    // Suitable when the modifier needs a global view (e.g. allocate a unique
-    // location_id, or write block-level property like _prev_key_).
-    using BlockModifierFunc = std::function<ModifierResult(
-        LocationMap & /*loc_map*/, ErrorCode /*get_ec*/, size_t /*key_index*/, PropertyMap & /*upsert_property_map*/)>;
-
-    // Lightweight block-level modifier: only sees the existing location id list
-    // (no location values are deserialized). The modifier can produce new
-    // CacheLocations to be written via the output LocationMap.
-    using BlockIdsOnlyModifierFunc = std::function<ModifierResult(const LocationIdVector & /*existing_ids*/,
-                                                                  ErrorCode /*get_ec*/,
-                                                                  size_t /*key_index*/,
-                                                                  PropertyMap & /*upsert_property_map*/,
-                                                                  LocationMap & /*out_new_locations*/)>;
-
-    // Location-level modifier: sees one (block_key, location_id, CacheLocation) at a time.
-    // Backend only reads/writes the specified location field.
-    using LocationModifierFunc = std::function<ModifierResult(CacheLocation & /*loc*/,
-                                                              ErrorCode /*get_ec*/,
-                                                              size_t /*key_index*/,
-                                                              const LocationId & /*loc_id*/,
-                                                              PropertyMap & /*upsert_property_map*/)>;
-
 public:
     // Per-key result.
     struct Result {
@@ -104,17 +58,16 @@ public:
 
     // ---------- Put ----------
     // Whole-block put: replace keys[i]'s entire location set with location_maps[i].
-    Result PutLocations(RequestContext *request_context,
+    Result Put(RequestContext *request_context,
                         const KeyVector &keys,
                         LocationMapVector &location_maps,
                         PropertyMapVector &properties) noexcept;
-    // Per-location upsert: insert/overwrite the specified locations on each key,
-    // leaving other locations on the same block untouched.
-    // The CacheLocation::id() of each element MUST be set by the caller.
-    LocationResult UpsertLocations(RequestContext *request_context,
-                                   const KeyVector &keys,
-                                   LocationsPerKey &locations,
-                                   PropertyMapVector &properties) noexcept;
+    // Whole-block update: overwrite keys[i]'s location set with location_maps[i]
+    // and update its block-level properties at the same time.
+    Result Update(RequestContext *request_context,
+                  const KeyVector &keys,
+                  LocationMapVector &location_maps,
+                  PropertyMapVector &properties) noexcept;
 
     // ---------- Get ----------
     Result Exist(RequestContext *request_context, const KeyVector &keys, std::vector<bool> &out_exists) noexcept;
@@ -158,9 +111,6 @@ public:
                                            const KeyVector &keys,
                                            const LocationIdsPerKey &location_ids,
                                            const LocationModifierFunc &modifier) noexcept;
-    // Update only block-level properties (does not touch any location).
-    Result
-    UpdateProperties(RequestContext *request_context, const KeyVector &keys, PropertyMapVector &properties) noexcept;
 
     // ---------- Delete ----------
     // Delete the whole block_key (including all locations).
@@ -259,17 +209,19 @@ private:
         array_t_ storage_usage_by_type_;
     };
 
-    struct BatchMetaData {
-        std::vector<std::vector<int32_t>> batch_shard_indexs; // shard mutex index
-        std::vector<std::vector<int32_t>> batch_indexs;       // raw index in KeyVector
-        std::vector<KeyVector> batch_keys;
-        std::vector<PropertyMapVector> batch_properties;
-    };
-
 private:
-    void MakeBatches(const KeyVector &keys, PropertyMapVector &properties, BatchMetaData &batch_data) const noexcept;
+    // Partition a request into one or more BatchMetaData. Each batch spans an
+    // unbroken set of shard indices (determined via GetShardIndex from
+    // utils.h) and holds at most batch_key_size_ keys (best-effort; the final
+    // shard of a batch is always included). `locations` and `properties` are
+    // moved-from when non-empty; pass empty vectors for ops that do not carry
+    // them. Uses mutex_shard_mask_ / batch_key_size_ directly so callers do
+    // not have to thread them through.
+    std::vector<BatchMetaData> MakeBatches(const KeyVector &keys,
+                                           LocationMapVector &locations,
+                                           PropertyMapVector &properties) const noexcept;
+
     ErrorCode RecoverMetaData() noexcept;
-    int32_t GetShardIndex(KeyType key) const noexcept;
     void AdjustKeyCountMeta(const int32_t delta) noexcept;
     int32_t ProcessErrorCodes(const std::string &trace_id,
                               const std::vector<ErrorCode> &error_codes,
@@ -285,14 +237,19 @@ private:
 
 private:
     std::vector<std::unique_ptr<std::mutex>> mutex_shards_;
-    std::unique_ptr<MetaStorageBackend> storage_;
+    std::unique_ptr<MetaStorageBackendManager> backend_manager_;
     std::shared_ptr<MetaSearchCache> cache_;
 
     std::atomic<int64_t> key_count_ = {0};
     int64_t last_persist_metadata_time_ = 0;
     int64_t persist_metadata_interval_time_ms_ = 0;
     size_t max_key_count_ = MetaIndexerConfig::kDefaultMaxKeyCount;
-    size_t mutex_shard_num_ = MetaIndexerConfig::kDefaultMutexShardNum;
+    // Bit mask used to fold a hash into a shard index in O(1):
+    //   shard_idx = hash & mutex_shard_mask_
+    // Equals (shard_num - 1) where shard_num MUST be a power of two
+    // (validated in Init()). Default kDefaultMutexShardNum is also a power of
+    // two so the initial mask is well-formed.
+    size_t mutex_shard_mask_ = MetaIndexerConfig::kDefaultMutexShardNum - 1;
     size_t batch_key_size_ = MetaIndexerConfig::kDefaultBatchKeySize;
     std::string instance_id_;
     StorageUsageData storage_usage_data_;
