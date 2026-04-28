@@ -35,15 +35,66 @@ cc_library(
     deps = [
         ":cache_location",
         ":common",
-        ":meta_search_cache",
         ":meta_cached_backend",
         ":meta_dummy_backend",
         ":meta_local_backend",
         ":meta_redis_backend",
+        ":meta_search_cache",
         ":meta_storage_backend",
+        ":meta_storage_backend_manager",
+        ":types",
+        ":utils",
         "//kv_cache_manager/common",
         "//kv_cache_manager/common:utils",
         "//kv_cache_manager/config",
+    ],
+)
+
+cc_library(
+    name = "meta_storage_backend_manager",
+    srcs = [
+        "meta_storage_backend_factory.cc",
+        "meta_storage_backend_manager.cc",
+    ],
+    hdrs = [
+        "meta_storage_backend_factory.h",
+        "meta_storage_backend_manager.h",
+    ],
+    deps = [
+        ":cache_location",
+        ":common",
+        ":meta_cached_backend",
+        ":meta_dummy_backend",
+        ":meta_local_backend",
+        ":meta_local_base_backend",
+        ":meta_redis_backend",
+        ":meta_storage_backend",
+        ":types",
+        "//kv_cache_manager/common",
+        "//kv_cache_manager/common:standard_uri",
+        "//kv_cache_manager/config",
+    ],
+)
+
+cc_library(
+    name = "types",
+    hdrs = [
+        "types.h",
+    ],
+    deps = [
+        ":cache_location",
+        "//kv_cache_manager/common",
+    ],
+)
+
+cc_library(
+    name = "utils",
+    hdrs = [
+        "utils.h",
+    ],
+    deps = [
+        ":types",
+        "//kv_cache_manager/common/hash",
     ],
 )
 
@@ -96,6 +147,7 @@ cc_library(
         "meta_storage_backend.h",
     ],
     deps = [
+        ":types",
         "//kv_cache_manager/common",
         "//kv_cache_manager/config",
     ],

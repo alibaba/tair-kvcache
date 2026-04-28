@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
+#include "kv_cache_manager/meta/types.h"
 
 namespace kv_cache_manager {
 class MetaStorageBackendConfig;
@@ -13,10 +14,13 @@ class MetaStorageBackendConfig;
 // MetaIndexer 后端存储抽象基类
 class MetaStorageBackend {
 public:
-    using KeyType = int64_t;
-    using KeyTypeVec = std::vector<KeyType>;
-    using FieldMap = std::map<std::string, std::string>;
-    using FieldMapVec = std::vector<std::map<std::string, std::string>>;
+    // The storage primitives (KeyType / KeyTypeVec / FieldMap / FieldMapVec)
+    // are now defined once in kv_cache_manager/meta/types.h. We re-export them
+    // here for the existing call sites that reach for them via this class.
+    using KeyType = ::kv_cache_manager::KeyType;
+    using KeyTypeVec = ::kv_cache_manager::KeyTypeVec;
+    using FieldMap = ::kv_cache_manager::FieldMap;
+    using FieldMapVec = ::kv_cache_manager::FieldMapVec;
 
 public:
     virtual ~MetaStorageBackend() = default;

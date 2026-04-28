@@ -44,7 +44,7 @@ TEST_F(MetaIndexerRedisTest, TestInit) {
     })";
     ASSERT_EQ(EC_OK, InitIndexer(configStr));
     ASSERT_EQ(100, meta_indexer_->max_key_count_);
-    ASSERT_EQ(8, meta_indexer_->mutex_shard_num_);
+    ASSERT_EQ(7, meta_indexer_->mutex_shard_mask_);
     ASSERT_TRUE(meta_indexer_->cache_);
     ASSERT_EQ(1024, meta_indexer_->cache_->cache_size_);
     ASSERT_EQ(META_REDIS_BACKEND_TYPE_STR, meta_indexer_->storage_->GetStorageType());
@@ -75,7 +75,7 @@ TEST_F(MetaIndexerRedisTest, TestRedisSimple) {
     })";
     ASSERT_EQ(EC_OK, InitIndexer(configStr));
     ASSERT_EQ(100, meta_indexer_->max_key_count_);
-    ASSERT_EQ(8, meta_indexer_->mutex_shard_num_);
+    ASSERT_EQ(7, meta_indexer_->mutex_shard_mask_);
     ASSERT_EQ(META_REDIS_BACKEND_TYPE_STR, meta_indexer_->storage_->GetStorageType());
     ASSERT_TRUE(meta_indexer_->cache_);
     ASSERT_EQ(1024, meta_indexer_->cache_->cache_size_);
@@ -120,7 +120,7 @@ TEST_F(MetaIndexerRedisTest, TestMultiThread) {
     })";
     ASSERT_EQ(EC_OK, InitIndexer(configStr));
     ASSERT_EQ(10000, meta_indexer_->max_key_count_);
-    ASSERT_EQ(8, meta_indexer_->mutex_shard_num_);
+    ASSERT_EQ(7, meta_indexer_->mutex_shard_mask_);
     ASSERT_EQ(8, meta_indexer_->batch_key_size_);
     ASSERT_EQ(META_REDIS_BACKEND_TYPE_STR, meta_indexer_->storage_->GetStorageType());
     ASSERT_TRUE(meta_indexer_->cache_);

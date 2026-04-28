@@ -3,7 +3,6 @@
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/meta/common.h"
-#include "kv_cache_manager/meta/meta_cached_backend.h"
 #include "kv_cache_manager/meta/meta_dummy_backend.h"
 #include "kv_cache_manager/meta/meta_local_backend.h"
 #include "kv_cache_manager/meta/meta_redis_backend.h"
@@ -18,8 +17,6 @@ MetaStorageBackendFactory::CreateAndInitStorageBackend(const std::string &instan
         storage_backend = std::make_unique<MetaRedisBackend>();
     } else if (config->GetStorageType() == META_LOCAL_BACKEND_TYPE_STR) {
         storage_backend = std::make_unique<MetaLocalBackend>();
-    } else if (config->GetStorageType() == META_CACHED_BACKEND_TYPE_STR) {
-        storage_backend = std::make_unique<MetaCachedBackend>();
     } else if (config->GetStorageType() == META_DUMMY_BACKEND_TYPE_STR) {
         storage_backend = std::make_unique<MetaDummyBackend>();
     } else {
@@ -32,6 +29,50 @@ MetaStorageBackendFactory::CreateAndInitStorageBackend(const std::string &instan
         return nullptr;
     }
     return storage_backend;
+}
+
+std::unique_ptr<MetaStorageBackend>
+MetaStorageBackendFactory::CreatePersistentBackend(const std::string &instance_id,
+                                                   const std::shared_ptr<MetaStorageBackendConfig> &config) {
+    const std::string &storage_type = config->GetStorageType();
+    std::unique_ptr<MetaStorageBackend> backend;
+    if (storage_type == META_REDIS_BACKEND_TYPE_STR) {
+        backend = std::make_unique<MetaRedisBackend>();
+    } else if (storage_type == META_DUMMY_BACKEND_TYPE_STR) {
+        backend = std::make_unique<MetaDummyBackend>();
+    } else {
+        KVCM_LOG_ERROR("create persistent backend failed, unsupported type[%s], expect redis or dummy",
+                       storage_type.c_str());
+        return nullptr;
+    }
+    if (backend->Init(instance_id, config) != EC_OK) {
+        KVCM_LOG_ERROR("init persistent backend failed, type[%s] instance[%s]",
+                       storage_type.c_str(),
+                       instance_id.c_str());
+        return nullptr;
+    }
+    return backend;
+}
+
+std::unique_ptr<MetaLocalBaseBackend>
+MetaStorageBackendFactory::CreateLocalBackend(const std::string &instance_id,
+                                              const std::shared_ptr<MetaStorageBackendConfig> &config) {
+    const std::string &storage_type = config->GetStorageType();
+    std::unique_ptr<MetaLocalBaseBackend> backend;
+    if (storage_type == META_LOCAL_BACKEND_TYPE_STR) {
+        backend = std::make_unique<MetaLocalBackend>();
+    } else {
+        KVCM_LOG_ERROR("create local backend failed, unsupported type[%s], expect local",
+                       storage_type.c_str());
+        return nullptr;
+    }
+    if (backend->Init(instance_id, config) != EC_OK) {
+        KVCM_LOG_ERROR("init local backend failed, type[%s] instance[%s]",
+                       storage_type.c_str(),
+                       instance_id.c_str());
+        return nullptr;
+    }
+    return backend;
 }
 
 } // namespace kv_cache_manager
