@@ -40,9 +40,9 @@ public:
     MOCK_METHOD(double, GetStorageUsageRatio, (const std::string &), (const, override));
     MOCK_METHOD(ErrorCode, DoOpen, (const StorageConfig &, const std::string &), (override));
     MOCK_METHOD(ErrorCode, Close, (), (override));
-    MOCK_METHOD((std::vector<std::pair<ErrorCode, DataStorageUri>>),
+    MOCK_METHOD((std::vector<SpecCreateResult>),
                 Create,
-                (const std::vector<std::string> &, size_t, const std::string &, std::function<void()>),
+                (const CreateBlocksRequest &, const std::string &, std::function<void()>),
                 (override));
     MOCK_METHOD(std::vector<ErrorCode>,
                 Delete,
@@ -73,9 +73,9 @@ public:
     const StorageConfig &GetStorageConfig() override { return delegate_->GetStorageConfig(); }
     ErrorCode DoOpen(const StorageConfig &c, const std::string &t) override { return delegate_->DoOpen(c, t); }
     ErrorCode Close() override { return delegate_->Close(); }
-    std::vector<std::pair<ErrorCode, DataStorageUri>>
-    Create(const std::vector<std::string> &k, size_t s, const std::string &t, std::function<void()> cb) override {
-        return delegate_->Create(k, s, t, std::move(cb));
+    std::vector<SpecCreateResult>
+    Create(const CreateBlocksRequest &r, const std::string &t, std::function<void()> cb) override {
+        return delegate_->Create(r, t, std::move(cb));
     }
     std::vector<ErrorCode>
     Delete(const std::vector<DataStorageUri> &u, const std::string &t, std::function<void()> cb) override {
