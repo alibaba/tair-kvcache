@@ -6,6 +6,7 @@ bool OptimizerConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
     KVCM_JSON_GET_MACRO(rapid_value, "output_result_path", output_result_path_);
     KVCM_JSON_GET_MACRO(rapid_value, "eviction_params", eviction_config_);
     KVCM_JSON_GET_MACRO(rapid_value, "instance_groups", instance_groups_);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "enable_remote_matching", enable_remote_matching_, false);
     return true;
 };
 
@@ -14,5 +15,6 @@ void OptimizerConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &
     Put(writer, "output_result_path", output_result_path_);
     Put(writer, "eviction_params", eviction_config_);
     Put(writer, "instance_groups", instance_groups_);
+    Put(writer, "enable_remote_matching", enable_remote_matching_);
 }
 } // namespace kv_cache_manager

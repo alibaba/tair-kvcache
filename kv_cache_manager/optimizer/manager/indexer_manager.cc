@@ -77,6 +77,16 @@ bool OptIndexerManager::CheckAndEvict(const std::string &instance_id, int64_t ev
     // 通知所有 RadixTreeIndex 清理被驱逐的块
     if (!evicted_blocks.empty()) {
         for (auto &evicted_block : evicted_blocks) {
+            // 逐出前从 GlobalRegistry 反注册
+            if (global_registry_) {
+                std::vector<int64_t> evicted_keys;
+                evicted_keys.reserve(evicted_block.second.size());
+                for (auto *block : evicted_block.second) {
+                    evicted_keys.push_back(block->key);
+                }
+                global_registry_->Deregister(evicted_block.first, evicted_keys, eviction_timestamp);
+            }
+
             auto indexer = GetOptIndexer(evicted_block.first);
             KVCM_LOG_DEBUG("Evicted %zu blocks from instance_id: %s by CheckAndEvict",
                            evicted_block.second.size(),

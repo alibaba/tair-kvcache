@@ -14,6 +14,14 @@ struct BlockEntry;
 // 所有 Tracker 使用的 Record 结构体统一定义于此。
 // ============================================================================
 
+struct RemoteHitDetail {
+    int64_t block_key;
+    int64_t register_time_us;       // key 首次注册到 GlobalRegistry 的时间
+    int64_t read_time_us;           // 本次 remote read 的时间
+    int64_t delta_us;               // read_time - register_time
+    std::string source_instance_id; // 首次注册该 key 的 instance
+};
+
 struct ReadRecord {
     int64_t timestamp_us;
     size_t external_read_blocks;
@@ -24,6 +32,9 @@ struct ReadRecord {
     std::vector<size_t> blocks_per_instance;
     std::string trace_id;
     const std::vector<int64_t> *keys_ptr = nullptr; // 借用，仅 OnReadComplete 期间有效
+    size_t remote_read_blocks = 0;  // 尝试 remote 匹配的 key 数
+    size_t remote_hit_blocks = 0;   // remote 命中的 key 数
+    std::vector<RemoteHitDetail> remote_hit_details; // 每条 remote hit 的明细
 };
 
 struct WriteRecord {

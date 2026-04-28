@@ -50,6 +50,7 @@ void HitRateTracker::Export(const std::string &instance_id, const OptimizerConfi
         return;
     }
     ExportHitRates(instance_id, it->second, config);
+    ExportRemoteHitDetails(instance_id, it->second, config);
 }
 
 void HitRateTracker::ExportHitRates(const std::string &instance_id,
@@ -85,32 +86,40 @@ void HitRateTracker::ExportHitRates(const std::string &instance_id,
     // ---- 计算逐请求命中率和累计命中率 ----
     std::vector<double> external_hit_rates;
     std::vector<double> internal_hit_rates;
+    std::vector<double> remote_hit_rates;
     std::vector<double> acc_external_hit_rates;
     std::vector<double> acc_internal_hit_rates;
+    std::vector<double> acc_remote_hit_rates;
 
     size_t acc_total_read = 0;
     size_t acc_ext_hit = 0;
     size_t acc_int_hit = 0;
+    size_t acc_remote_hit = 0;
 
     for (const auto &record : data.read_records) {
         size_t total = record.external_read_blocks + record.internal_read_blocks;
         double ext_rate = total > 0 ? static_cast<double>(record.external_hit_blocks) / total : 0.0;
         double int_rate = total > 0 ? static_cast<double>(record.internal_hit_blocks) / total : 0.0;
+        double rmt_rate = total > 0 ? static_cast<double>(record.remote_hit_blocks) / total : 0.0;
         external_hit_rates.push_back(ext_rate);
         internal_hit_rates.push_back(int_rate);
+        remote_hit_rates.push_back(rmt_rate);
 
         acc_total_read += total;
         acc_ext_hit += record.external_hit_blocks;
         acc_int_hit += record.internal_hit_blocks;
+        acc_remote_hit += record.remote_hit_blocks;
         acc_external_hit_rates.push_back(acc_total_read > 0 ? static_cast<double>(acc_ext_hit) / acc_total_read : 0.0);
         acc_internal_hit_rates.push_back(acc_total_read > 0 ? static_cast<double>(acc_int_hit) / acc_total_read : 0.0);
+        acc_remote_hit_rates.push_back(acc_total_read > 0 ? static_cast<double>(acc_remote_hit) / acc_total_read : 0.0);
     }
 
     // ---- 写入 CSV ----
     file << "TimestampUs,CachedBlocksCurrentInstance,CachedBlocksPerInstance,CachedBlocksAllInstance,"
             "InternalReadBlocks,ExternalReadBlocks,TotalReadBlocks,InternalHitBlocks,"
             "InternalHitRate,ExternalHitBlocks,ExternalHitRate,HitRate,AccInternalHitRate,AccExternalHitRate,"
-            "AccHitRate,AccReadBlocks,AccWriteBlocks\n";
+            "AccHitRate,AccReadBlocks,AccWriteBlocks,"
+            "RemoteReadBlocks,RemoteHitBlocks,RemoteHitRate,AccRemoteHitRate\n";
 
     size_t acc_read_blocks = 0;
     size_t acc_write_blocks = 0;
@@ -133,7 +142,9 @@ void HitRateTracker::ExportHitRates(const std::string &instance_id,
              << r.external_hit_blocks << "," << external_hit_rates[i] << ","
              << (internal_hit_rates[i] + external_hit_rates[i]) << "," << acc_internal_hit_rates[i] << ","
              << acc_external_hit_rates[i] << "," << (acc_internal_hit_rates[i] + acc_external_hit_rates[i]) << ","
-             << acc_read_blocks << "," << acc_write_blocks << "\n";
+             << acc_read_blocks << "," << acc_write_blocks << ","
+             << r.remote_read_blocks << "," << r.remote_hit_blocks << "," << remote_hit_rates[i] << ","
+             << acc_remote_hit_rates[i] << "\n";
     }
 
     file.close();
@@ -145,6 +156,45 @@ void HitRateTracker::Reset(const std::string &instance_id) {
     if (it != instance_data_.end()) {
         it->second = InstanceData{};
     }
+}
+
+void HitRateTracker::ExportRemoteHitDetails(const std::string &instance_id,
+                                             const InstanceData &data,
+                                             const OptimizerConfig &config) {
+    // 检查是否有任何 remote hit detail
+    bool has_any = false;
+    for (const auto &r : data.read_records) {
+        if (!r.remote_hit_details.empty()) {
+            has_any = true;
+            break;
+        }
+    }
+    if (!has_any) {
+        return;
+    }
+
+    std::string file_dir = config.output_result_path();
+    std::filesystem::create_directories(file_dir);
+
+    std::string filename = file_dir + "/" + instance_id + "_remote_hits.csv";
+    std::ofstream file(filename);
+    if (!file.is_open()) {
+        KVCM_LOG_ERROR("Failed to open file for writing remote hit details: %s", filename.c_str());
+        return;
+    }
+
+    file << "ReadTimestampUs,BlockKey,RegisterTimestampUs,DeltaUs,SourceInstanceId\n";
+
+    for (const auto &r : data.read_records) {
+        for (const auto &detail : r.remote_hit_details) {
+            file << detail.read_time_us << "," << detail.block_key << ","
+                 << detail.register_time_us << "," << detail.delta_us << ","
+                 << detail.source_instance_id << "\n";
+        }
+    }
+
+    file.close();
+    KVCM_LOG_INFO("Remote hit details exported to: %s", filename.c_str());
 }
 
 } // namespace kv_cache_manager

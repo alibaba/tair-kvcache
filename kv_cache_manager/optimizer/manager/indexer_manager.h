@@ -8,6 +8,7 @@
 #include "kv_cache_manager/optimizer/config/instance_config.h"
 #include "kv_cache_manager/optimizer/config/instance_group_config.h"
 #include "kv_cache_manager/optimizer/config/tier_config.h"
+#include "kv_cache_manager/optimizer/index/global_registry.h"
 #include "kv_cache_manager/optimizer/index/radix_tree_index.h"
 #include "kv_cache_manager/optimizer/manager/eviction_manager.h"
 namespace kv_cache_manager {
@@ -31,6 +32,9 @@ public:
     // 检查容量并触发驱逐，eviction_timestamp 用于正确记录 block 的驱逐时刻
     bool CheckAndEvict(const std::string &instance_id, int64_t eviction_timestamp);
 
+    // 设置全局注册表（用于跨 instance remote matching）
+    void SetGlobalRegistry(std::shared_ptr<GlobalRegistry> registry) { global_registry_ = std::move(registry); }
+
     // 获取容量使用情况
     size_t GetCurrentInstanceUsage(const std::string &instance_id) const;
 
@@ -43,6 +47,7 @@ public:
 private:
     std::unordered_map<std::string, std::shared_ptr<RadixTreeIndex>> opt_indexer_map_;
     std::shared_ptr<OptEvictionManager> eviction_manager_;
+    std::shared_ptr<GlobalRegistry> global_registry_;
 
     std::unordered_map<std::string, OptInstanceGroupConfig> instance_group_configs_;
     std::unordered_map<std::string, OptInstanceConfig> instance_configs_;

@@ -35,6 +35,7 @@ private:
     };
 
     void ExportHitRates(const std::string &instance_id, const InstanceData &data, const OptimizerConfig &config);
+    void ExportRemoteHitDetails(const std::string &instance_id, const InstanceData &data, const OptimizerConfig &config);
 
     std::unordered_map<std::string, InstanceData> instance_data_;
 };

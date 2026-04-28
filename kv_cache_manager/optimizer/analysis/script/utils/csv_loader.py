@@ -49,10 +49,12 @@ def parse_instance_metrics(csv_file: str) -> Optional[dict]:
     if df.empty:
         return None
     last = df.iloc[-1]
+    remote = float(last["AccRemoteHitRate"]) if "AccRemoteHitRate" in df.columns else 0.0
     return {
         "acc_total_hit_rate": float(last["AccHitRate"]),
         "acc_internal_hit_rate": float(last["AccInternalHitRate"]),
         "acc_external_hit_rate": float(last["AccExternalHitRate"]),
+        "acc_remote_hit_rate": remote,
         "cached_blocks_all": int(last["CachedBlocksAllInstance"]),
     }
 
@@ -79,10 +81,12 @@ def _read_hit_rates_from_csv(csv_path: str) -> Optional[dict]:
             return 0.0
 
         cached = int(last["CachedBlocksAllInstance"]) if "CachedBlocksAllInstance" in df.columns else 0
+        remote = _get("AccRemoteHitRate", "RemoteHitRate")
         return {
             "total": _get("AccHitRate", "HitRate"),
             "internal": _get("AccInternalHitRate", "InternalHitRate"),
             "external": _get("AccExternalHitRate", "ExternalHitRate"),
+            "remote": remote,
             "cached_blocks_all": cached,
         }
     except Exception as e:

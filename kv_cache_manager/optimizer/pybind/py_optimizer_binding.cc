@@ -86,7 +86,9 @@ PYBIND11_MODULE(kvcm_py_optimizer, module) {
         .def("set_trace_file_path", &kvcm::OptimizerConfig::set_trace_file_path)
         .def("trace_file_path", &kvcm::OptimizerConfig::trace_file_path)
         .def("set_output_result_path", &kvcm::OptimizerConfig::set_output_result_path)
-        .def("output_result_path", &kvcm::OptimizerConfig::output_result_path);
+        .def("output_result_path", &kvcm::OptimizerConfig::output_result_path)
+        .def("set_enable_remote_matching", &kvcm::OptimizerConfig::set_enable_remote_matching)
+        .def("enable_remote_matching", &kvcm::OptimizerConfig::enable_remote_matching);
 
     py::class_<kvcm::OptInstanceGroupConfig>(module, "OptInstanceGroupConfig")
         .def(py::init<>())

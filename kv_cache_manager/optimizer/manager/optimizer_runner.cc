@@ -105,6 +105,34 @@ void OptimizerRunner::HandleGetLocation(const GetLocationSchemaTrace &trace) {
         record.internal_hit_blocks += hit.size();
     }
 
+    // ---- 远程前缀匹配：本地匹配结束后，逐 key 查 GlobalRegistry ----
+    if (global_registry_) {
+        size_t local_match_count = 0;
+        for (const auto &hit : external_hits) local_match_count += hit.size();
+        for (const auto &hit : internal_hits) local_match_count += hit.size();
+
+        if (local_match_count < trace.keys().size()) {
+            record.remote_read_blocks = trace.keys().size() - local_match_count;
+            size_t remote_hit_count = 0;
+            for (size_t i = local_match_count; i < trace.keys().size(); i++) {
+                auto info = global_registry_->QueryRemoteKey(trace.keys()[i], instance_id);
+                if (info.has_value()) {
+                    remote_hit_count++;
+                    record.remote_hit_details.push_back(RemoteHitDetail{
+                        trace.keys()[i],
+                        info->register_time_us,
+                        trace.timestamp_us(),
+                        trace.timestamp_us() - info->register_time_us,
+                        info->source_instance_id,
+                    });
+                } else {
+                    break; // 前缀断裂
+                }
+            }
+            record.remote_hit_blocks = remote_hit_count;
+        }
+    }
+
     stats_collector_->OnReadComplete(instance_id, record);
 }
 
@@ -117,6 +145,11 @@ void OptimizerRunner::HandleWriteCache(const WriteCacheSchemaTrace &trace) {
     }
 
     auto result = indexer->InsertOnly(trace.keys(), trace.timestamp_us());
+
+    // 写入完成后注册到 GlobalRegistry
+    if (global_registry_ && !inserted_keys.empty()) {
+        global_registry_->Register(instance_id, inserted_keys, trace.timestamp_us());
+    }
     bool evicted = indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_us());
     if (evicted) {
         KVCM_LOG_DEBUG("Eviction in %zu to instance_id: %s", trace.timestamp_us(), instance_id.c_str());
@@ -139,7 +172,13 @@ void OptimizerRunner::HandleDialogTurn(const DialogTurnSchemaTrace &trace) {
     }
 
     std::vector<std::vector<int64_t>> hits;
-    indexer->InsertWithQuery(trace.total_keys(), trace.timestamp_us(), hits);
+    auto inserted_keys = indexer->InsertWithQuery(trace.total_keys(), trace.timestamp_us(), hits);
+
+    // 写入完成后注册到 GlobalRegistry
+    if (global_registry_ && !inserted_keys.empty()) {
+        global_registry_->Register(instance_id, inserted_keys, trace.timestamp_us());
+    }
+
     indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_us());
 
     // ---- ReadRecord ----
@@ -152,6 +191,33 @@ void OptimizerRunner::HandleDialogTurn(const DialogTurnSchemaTrace &trace) {
         read_record.external_hit_blocks += hit.size();
     }
     read_record.internal_hit_blocks = 0;
+
+    // ---- 远程前缀匹配（对 reuse 部分 trace.keys()）----
+    if (global_registry_) {
+        size_t local_match_count = 0;
+        for (const auto &hit : hits) local_match_count += hit.size();
+
+        if (local_match_count < trace.keys().size()) {
+            read_record.remote_read_blocks = trace.keys().size() - local_match_count;
+            size_t remote_hit_count = 0;
+            for (size_t i = local_match_count; i < trace.keys().size(); i++) {
+                auto info = global_registry_->QueryRemoteKey(trace.keys()[i], instance_id);
+                if (info.has_value()) {
+                    remote_hit_count++;
+                    read_record.remote_hit_details.push_back(RemoteHitDetail{
+                        trace.keys()[i],
+                        info->register_time_us,
+                        trace.timestamp_us(),
+                        trace.timestamp_us() - info->register_time_us,
+                        info->source_instance_id,
+                    });
+                } else {
+                    break; // 前缀断裂
+                }
+            }
+            read_record.remote_hit_blocks = remote_hit_count;
+        }
+    }
 
     stats_collector_->OnReadComplete(instance_id, read_record);
 

@@ -23,17 +23,20 @@ public:
     [[nodiscard]] const EvictionConfig &eviction_config() const { return eviction_config_; }
     [[nodiscard]] const std::vector<OptInstanceGroupConfig> &instance_groups() const { return instance_groups_; }
     [[nodiscard]] std::vector<OptInstanceGroupConfig> &mutable_instance_groups() { return instance_groups_; }
+    [[nodiscard]] bool enable_remote_matching() const { return enable_remote_matching_; }
 
     void set_trace_file_path(const std::string &path) { trace_file_path_ = path; }
     void set_output_result_path(const std::string &path) { output_result_path_ = path; }
     void set_eviction_params(const EvictionConfig &config) { eviction_config_ = config; }
     void set_instance_groups(const std::vector<OptInstanceGroupConfig> &groups) { instance_groups_ = groups; }
+    void set_enable_remote_matching(bool enabled) { enable_remote_matching_ = enabled; }
 
 private:
     std::string trace_file_path_;
     std::string output_result_path_;
     EvictionConfig eviction_config_;
     std::vector<OptInstanceGroupConfig> instance_groups_;
+    bool enable_remote_matching_ = false;
 };
 
 } // namespace kv_cache_manager

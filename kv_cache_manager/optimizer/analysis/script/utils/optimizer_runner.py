@@ -43,6 +43,7 @@ def run_optimizer_with_config(
     policy: str = None,
     save_csv_to: str = None,
     enable_lifecycle_tracking: bool = False,
+    enable_remote_matching: bool = False,
 ) -> str:
     """
     运行 optimizer，返回临时输出目录路径。
@@ -52,6 +53,7 @@ def run_optimizer_with_config(
     temp_dir, _ = run_optimizer_with_config_explicit(
         config_path, capacity, policy, save_csv_to,
         enable_lifecycle_tracking,
+        enable_remote_matching=enable_remote_matching,
     )
     return temp_dir
 
@@ -62,6 +64,7 @@ def run_optimizer_with_config_explicit(
     policy: str = None,
     save_csv_to: str = None,
     enable_lifecycle_tracking: bool = False,
+    enable_remote_matching: bool = False,
 ) -> Tuple[str, object]:
     """
     运行 optimizer，返回 (临时目录路径, OptimizerManager对象)。
@@ -81,6 +84,9 @@ def run_optimizer_with_config_explicit(
                 instance["eviction_policy_type"] = policy
 
     config_json["output_result_path"] = temp_dir
+
+    if enable_remote_matching:
+        config_json["enable_remote_matching"] = True
 
     temp_config_path = os.path.join(temp_dir, "temp_config.json")
     with open(temp_config_path, "w") as f:
@@ -166,6 +172,7 @@ def run_single_experiment(
     total_exps: int,
     save_csv_to: str = None,
     enable_lifecycle_tracking: bool = False,
+    enable_remote_matching: bool = False,
 ) -> dict:
     """
     运行单个实验，返回结果字典。
@@ -196,6 +203,7 @@ def run_single_experiment(
         temp_dir, manager = run_optimizer_with_config_explicit(
             config_path, capacity, policy, save_csv_to,
             enable_lifecycle_tracking,
+            enable_remote_matching=enable_remote_matching,
         )
         csv_map = collect_instance_csvs(temp_dir)
         if not csv_map:
@@ -239,6 +247,7 @@ def run_experiments_parallel(
     max_workers: int = 4,
     save_csv_dir: str = None,
     enable_lifecycle_tracking: bool = False,
+    enable_remote_matching: bool = False,
 ) -> List[dict]:
     """
     并行运行实验列表。
@@ -263,6 +272,7 @@ def run_experiments_parallel(
             config_path, capacity, policy,
             i + 1, len(experiments),
             csv_subdir, enable_lifecycle_tracking,
+            enable_remote_matching,
         ))
 
     results = []

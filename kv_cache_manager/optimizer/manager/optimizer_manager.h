@@ -9,6 +9,7 @@
 #include "kv_cache_manager/optimizer/config/optimizer_config.h"
 #include "kv_cache_manager/optimizer/config/optimizer_config_loader.h"
 #include "kv_cache_manager/optimizer/eviction_policy/base.h"
+#include "kv_cache_manager/optimizer/index/global_registry.h"
 #include "kv_cache_manager/optimizer/index/radix_tree_index.h"
 #include "kv_cache_manager/optimizer/manager/eviction_manager.h"
 #include "kv_cache_manager/optimizer/manager/indexer_manager.h"
@@ -67,6 +68,7 @@ private:
     std::shared_ptr<OptIndexerManager> indexer_manager_;
     std::shared_ptr<OptimizerRunner> optimizer_runner_;
     std::shared_ptr<StatsCollector> stats_collector_;
+    std::shared_ptr<GlobalRegistry> global_registry_;
 
     // 快速访问指针，所有权归 StatsCollector
     HitRateTracker *hit_rate_tracker_ = nullptr;

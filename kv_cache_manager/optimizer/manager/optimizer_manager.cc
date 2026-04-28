@@ -42,6 +42,14 @@ bool OptimizerManager::Init() {
         KVCM_LOG_DEBUG("Lifecycle tracking disabled (memory optimization)");
     }
 
+    // ---- 初始化 GlobalRegistry（可选）----
+    if (config_.enable_remote_matching()) {
+        global_registry_ = std::make_shared<GlobalRegistry>();
+        KVCM_LOG_INFO("Remote matching enabled: GlobalRegistry created");
+    } else {
+        KVCM_LOG_DEBUG("Remote matching disabled");
+    }
+
     size_t total_instances = 0;
     size_t failed_instances = 0;
     std::vector<std::string> failed_instance_ids;
@@ -127,8 +135,9 @@ bool OptimizerManager::Init() {
 
     indexer_manager_->RegisterInstanceGroups(instance_group_configs_);
     indexer_manager_->RegisterInstances(instance_configs_);
+    indexer_manager_->SetGlobalRegistry(global_registry_);
 
-    optimizer_runner_.reset(new OptimizerRunner(indexer_manager_, eviction_manager_, stats_collector_));
+    optimizer_runner_.reset(new OptimizerRunner(indexer_manager_, eviction_manager_, stats_collector_, global_registry_));
     return true;
 }
 
@@ -215,6 +224,11 @@ GetCacheLocationRes OptimizerManager::GetCacheLocation(const std::string &instan
 }
 
 void OptimizerManager::AnalyzeResults() {
+    // 导出全局重复 block 统计
+    if (global_registry_) {
+        global_registry_->ExportDuplicateStats(config_.output_result_path());
+    }
+
     for (const auto &[instance_id, _] : instance_configs_) {
         int64_t final_timestamp = stats_collector_->GetLastTimestamp(instance_id);
         KVCM_LOG_INFO("Finalizing stats for instance %s with timestamp: %ld", instance_id.c_str(), final_timestamp);
@@ -260,6 +274,9 @@ bool OptimizerManager::ClearCache(const std::string &instance_id) {
         KVCM_LOG_ERROR("Indexer manager not initialized");
         return false;
     }
+    if (global_registry_) {
+        global_registry_->DeregisterInstance(instance_id);
+    }
     return indexer_manager_->ClearCache(instance_id);
 }
 
@@ -267,6 +284,9 @@ void OptimizerManager::ClearAllCaches() {
     if (!indexer_manager_) {
         KVCM_LOG_ERROR("Indexer manager not initialized");
         return;
+    }
+    if (global_registry_) {
+        global_registry_->Clear();
     }
     indexer_manager_->ClearAllCaches();
 }
