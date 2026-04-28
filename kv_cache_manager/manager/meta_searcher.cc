@@ -13,7 +13,8 @@
 
 namespace kv_cache_manager {
 
-const std::string MetaSearcher::PROPERTY_PREV_BLOCK_KEY = "_prev_key_";
+// V8 §2.1.1: block-level prev-key pointer is now a BP#-prefixed Hash field.
+const std::string MetaSearcher::PROPERTY_PREV_BLOCK_KEY = "BP#prev_key";
 
 namespace {
 

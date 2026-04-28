@@ -43,6 +43,9 @@ cc_library(
         "//kv_cache_manager/common",
         "//kv_cache_manager/common:utils",
         "//kv_cache_manager/config",
+        # V8 §2.1.1: meta_indexer materializes BlockCacheLocationsMeta from
+        # the L#-prefixed Hash fields, so it needs to know about it.
+        "//kv_cache_manager/manager:cache_location",
     ],
 )
 

@@ -1,7 +1,9 @@
 #include "kv_cache_manager/data_storage/vineyard_backend.h"
 
+#include <algorithm>
 #include <chrono>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <utility>
@@ -14,13 +16,6 @@
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
 namespace kv_cache_manager {
-
-namespace {
-constexpr std::string_view kVineyardLocationPrefix = "kvs_vineyard_";
-constexpr int kDetectRetryCount = 10;
-constexpr int kDetectRetryIntervalSeconds = 1;
-constexpr int kDetectLoopIntervalSeconds = 10;
-} // anonymous namespace
 
 VineyardBackend::VineyardBackend(std::shared_ptr<MetricsRegistry> metrics_registry)
     : DataStorageBackend(std::move(metrics_registry)) {}
@@ -46,82 +41,132 @@ ErrorCode VineyardBackend::DoOpen(const StorageConfig &config, const std::string
         return EC_ERROR;
     }
     spec_ = *spec;
+    heartbeat_timeout_ms_ = spec_.heartbeat_timeout_ms();
+    cleanup_grace_ms_ = spec_.cleanup_grace_ms();
+    liveness_check_interval_ms_ = spec_.liveness_check_interval_ms();
+
     SetOpen(true);
-    KVCM_LOG_INFO(
-        "trace_id [%s] | VineyardBackend opened, cluster: [%s]", trace_id.c_str(), spec_.cluster_name().c_str());
+
+    liveness_checker_running_.store(true, std::memory_order_relaxed);
+    liveness_checker_thread_ = std::thread(&VineyardBackend::LivenessCheckerLoop, this);
+
+    KVCM_LOG_INFO("trace_id [%s] | VineyardBackend opened, cluster: [%s], hb_timeout=%ldms, "
+                  "cleanup_grace=%ldms, check_interval=%ldms",
+                  trace_id.c_str(),
+                  spec_.cluster_name().c_str(),
+                  heartbeat_timeout_ms_,
+                  cleanup_grace_ms_,
+                  liveness_check_interval_ms_);
     return EC_OK;
 }
 
 ErrorCode VineyardBackend::Close() {
     SetOpen(false);
-
-    std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
-    for (auto &kv : nodes_) {
-        if (kv.second && kv.second->probe_thread.joinable()) {
-            kv.second->probe_thread.join();
-        }
+    liveness_checker_running_.store(false, std::memory_order_relaxed);
+    if (liveness_checker_thread_.joinable()) {
+        liveness_checker_thread_.join();
     }
-    nodes_.clear();
-
+    {
+        std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
+        nodes_.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(cleanup_cb_mutex_);
+        cleanup_callback_ = nullptr;
+    }
     KVCM_LOG_INFO("VineyardBackend closed, cluster: [%s]", spec_.cluster_name().c_str());
     return EC_OK;
 }
 
-ErrorCode VineyardBackend::RegisterNode(const std::string &host_ip_port) {
-    {
-        std::shared_lock<std::shared_mutex> rlock(nodes_mutex_);
-        if (nodes_.count(host_ip_port) > 0) {
-            KVCM_LOG_INFO("VineyardBackend: node [%s] already registered", host_ip_port.c_str());
-            return EC_OK;
+void VineyardBackend::SetCleanupCallback(CleanupCallback cb) {
+    std::lock_guard<std::mutex> lock(cleanup_cb_mutex_);
+    cleanup_callback_ = std::move(cb);
+}
+
+ErrorCode VineyardBackend::RegisterNode(const std::string &host_ip_port, const std::vector<std::string> &mediums) {
+    if (host_ip_port.empty()) {
+        return EC_BADARGS;
+    }
+    std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
+    auto it = nodes_.find(host_ip_port);
+    int64_t now_ms = NowMillis();
+    if (it != nodes_.end()) {
+        // Idempotent re-registration: merge mediums and refresh heartbeat
+        // so a restarted V6D node immediately leaves the unavailable set.
+        auto &info = *it->second;
+        for (const auto &m : mediums) {
+            if (std::find(info.mediums.begin(), info.mediums.end(), m) == info.mediums.end()) {
+                info.mediums.push_back(m);
+            }
         }
+        info.last_heartbeat_ms.store(now_ms, std::memory_order_relaxed);
+        info.available.store(true, std::memory_order_relaxed);
+        info.unavailable_since_ms.store(0, std::memory_order_relaxed);
+        KVCM_LOG_INFO("VineyardBackend: node [%s] already registered, mediums=%zu (refreshed heartbeat)",
+                      host_ip_port.c_str(),
+                      info.mediums.size());
+        return EC_OK;
     }
 
     auto info = std::make_unique<NodeInfo>();
-    info->probe_thread = std::thread(&VineyardBackend::ProbeNodeLoop, this, host_ip_port);
+    info->last_heartbeat_ms.store(now_ms, std::memory_order_relaxed);
+    info->available.store(true, std::memory_order_relaxed);
+    info->unavailable_since_ms.store(0, std::memory_order_relaxed);
+    info->mediums = mediums;
+    nodes_[host_ip_port] = std::move(info);
 
-    {
-        std::unique_lock<std::shared_mutex> wlock(nodes_mutex_);
-        // Double-check after acquiring write lock
-        if (nodes_.count(host_ip_port) == 0) {
-            nodes_[host_ip_port] = std::move(info);
-        }
-    }
-
-    KVCM_LOG_INFO(
-        "VineyardBackend: node [%s] registered in cluster [%s]", host_ip_port.c_str(), spec_.cluster_name().c_str());
+    KVCM_LOG_INFO("VineyardBackend: node [%s] registered in cluster [%s], mediums=%zu",
+                  host_ip_port.c_str(),
+                  spec_.cluster_name().c_str(),
+                  mediums.size());
     return EC_OK;
 }
 
 ErrorCode VineyardBackend::UnregisterNode(const std::string &host_ip_port) {
-    std::unique_ptr<NodeInfo> node_to_destroy;
-
-    {
-        std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
-        auto it = nodes_.find(host_ip_port);
-        if (it == nodes_.end()) {
-            KVCM_LOG_WARN("VineyardBackend: node [%s] not found for unregister", host_ip_port.c_str());
-            return EC_NOENT;
-        }
-        node_to_destroy = std::move(it->second);
-        nodes_.erase(it);
+    std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
+    auto it = nodes_.find(host_ip_port);
+    if (it == nodes_.end()) {
+        KVCM_LOG_WARN("VineyardBackend: node [%s] not found for unregister", host_ip_port.c_str());
+        return EC_NOENT;
     }
-
-    // Join outside the lock to avoid deadlock with ProbeNodeLoop
-    if (node_to_destroy && node_to_destroy->probe_thread.joinable()) {
-        node_to_destroy->probe_thread.join();
-    }
-
+    nodes_.erase(it);
     KVCM_LOG_INFO("VineyardBackend: node [%s] unregistered from cluster [%s]",
                   host_ip_port.c_str(),
                   spec_.cluster_name().c_str());
     return EC_OK;
 }
 
-void VineyardBackend::SetNodeAvailable(const std::string &host_ip_port, bool available) {
+void VineyardBackend::OnHeartbeat(const std::string &host_ip_port,
+                                  const std::map<std::string, std::string> &system_status) {
     std::shared_lock<std::shared_mutex> lock(nodes_mutex_);
     auto it = nodes_.find(host_ip_port);
-    if (it != nodes_.end() && it->second) {
-        it->second->available.store(available, std::memory_order_relaxed);
+    if (it == nodes_.end()) {
+        // V6D must NODE_REGISTER first; ignore stray heartbeats so we don't
+        // accidentally promote unregistered hosts and miss medium info.
+        KVCM_LOG_WARN("VineyardBackend: heartbeat from unregistered node [%s], skipped", host_ip_port.c_str());
+        return;
+    }
+    auto &info = *it->second;
+    int64_t now_ms = NowMillis();
+    info.last_heartbeat_ms.store(now_ms, std::memory_order_relaxed);
+    bool prev = info.available.exchange(true, std::memory_order_relaxed);
+    if (!prev) {
+        info.unavailable_since_ms.store(0, std::memory_order_relaxed);
+        KVCM_LOG_INFO("VineyardBackend: node [%s] recovered from unavailable", host_ip_port.c_str());
+    }
+    info.last_system_status = system_status;
+}
+
+void VineyardBackend::SetNodeUnavailable(const std::string &host_ip_port) {
+    std::shared_lock<std::shared_mutex> lock(nodes_mutex_);
+    auto it = nodes_.find(host_ip_port);
+    if (it == nodes_.end()) {
+        return;
+    }
+    auto &info = *it->second;
+    bool prev = info.available.exchange(false, std::memory_order_relaxed);
+    if (prev) {
+        info.unavailable_since_ms.store(NowMillis(), std::memory_order_relaxed);
     }
 }
 
@@ -135,56 +180,71 @@ bool VineyardBackend::IsNodeAvailable(const std::string &host_ip_port) const {
 }
 
 bool VineyardBackend::IsLocationAvailable(const std::string &location_id) const {
-    if (location_id.size() <= kVineyardLocationPrefix.size() ||
-        location_id.compare(0, kVineyardLocationPrefix.size(), kVineyardLocationPrefix) != 0) {
+    // location_id format: "kvs#v6d#{medium}#{host_ip_port}".
+    // host_ip_port itself never contains '#', so splitting from the trailing
+    // '#' yields the host slice regardless of how many '#' precede it.
+    auto pos = location_id.rfind('#');
+    if (pos == std::string::npos || pos + 1 >= location_id.size()) {
         return false;
     }
-    const std::string host_ip_port = location_id.substr(kVineyardLocationPrefix.size());
-    return IsNodeAvailable(host_ip_port);
+    return IsNodeAvailable(location_id.substr(pos + 1));
 }
 
-bool VineyardBackend::IsNodeRegistered(const std::string &host_ip_port) const {
-    std::shared_lock<std::shared_mutex> lock(nodes_mutex_);
-    return nodes_.count(host_ip_port) > 0;
-}
+void VineyardBackend::LivenessCheckerLoop() {
+    while (liveness_checker_running_.load(std::memory_order_relaxed) && IsOpen()) {
+        int64_t now_ms = NowMillis();
+        std::vector<std::string> to_cleanup;
 
-bool VineyardBackend::DetectNodeHealthy(const std::string &host_ip_port) const {
-    // TODO: implement actual health check (e.g. TCP connect or gRPC ping).
-    // Returning true here makes the backend always assume healthy until a real
-    // probe mechanism is implemented by the Vineyard team.
-    (void)host_ip_port;
-    return true;
-}
+        {
+            std::shared_lock<std::shared_mutex> lock(nodes_mutex_);
+            for (auto &kv : nodes_) {
+                if (!kv.second) {
+                    continue;
+                }
+                auto &info = *kv.second;
+                int64_t last_hb = info.last_heartbeat_ms.load(std::memory_order_relaxed);
+                if (last_hb == 0 || now_ms - last_hb <= heartbeat_timeout_ms_) {
+                    // healthy: leave available untouched (heartbeat path may
+                    // already have set it back to true).
+                    continue;
+                }
 
-void VineyardBackend::ProbeNodeLoop(const std::string &host_ip_port) {
-    while (IsOpen() && IsNodeRegistered(host_ip_port)) {
-        bool healthy = false;
-
-        for (int i = 0; i < kDetectRetryCount; i++) {
-            if (!IsOpen() || !IsNodeRegistered(host_ip_port)) {
-                return;
+                bool prev = info.available.exchange(false, std::memory_order_relaxed);
+                if (prev) {
+                    info.unavailable_since_ms.store(now_ms, std::memory_order_relaxed);
+                    KVCM_LOG_WARN("VineyardBackend: node [%s] timed out (no hb for %ldms), marked unavailable",
+                                  kv.first.c_str(),
+                                  now_ms - last_hb);
+                }
+                int64_t unavailable_since = info.unavailable_since_ms.load(std::memory_order_relaxed);
+                if (unavailable_since > 0 && now_ms - unavailable_since >= cleanup_grace_ms_) {
+                    to_cleanup.push_back(kv.first);
+                }
             }
-            if (DetectNodeHealthy(host_ip_port)) {
-                healthy = true;
-                break;
-            }
-            std::this_thread::sleep_for(std::chrono::seconds(kDetectRetryIntervalSeconds));
         }
 
-        bool prev_available = IsNodeAvailable(host_ip_port);
-        SetNodeAvailable(host_ip_port, healthy);
-
-        if (prev_available && !healthy) {
-            KVCM_LOG_WARN("VineyardBackend: node [%s] became unavailable", host_ip_port.c_str());
-            // TriggerNodeDownCleanup is called from CacheManager which owns the
-            // VineyardBackend.  We only log here; CacheManager registers a
-            // callback via the EventManager if needed, but for now the
-            // check_loc_data_exist callback already filters unavailable nodes.
-        } else if (!prev_available && healthy) {
-            KVCM_LOG_INFO("VineyardBackend: node [%s] recovered", host_ip_port.c_str());
+        if (!to_cleanup.empty()) {
+            CleanupCallback cb_copy;
+            {
+                std::lock_guard<std::mutex> lock(cleanup_cb_mutex_);
+                cb_copy = cleanup_callback_;
+            }
+            for (const auto &host : to_cleanup) {
+                KVCM_LOG_WARN("VineyardBackend: node [%s] passed cleanup_grace_ms, triggering cleanup", host.c_str());
+                if (cb_copy) {
+                    cb_copy(host);
+                }
+                // Reset unavailable_since_ms so we don't re-trigger every
+                // tick; if the node truly stays dead and is re-registered
+                // later, the new registration starts a fresh window.
+                std::shared_lock<std::shared_mutex> lock(nodes_mutex_);
+                if (auto it = nodes_.find(host); it != nodes_.end() && it->second) {
+                    it->second->unavailable_since_ms.store(0, std::memory_order_relaxed);
+                }
+            }
         }
 
-        std::this_thread::sleep_for(std::chrono::seconds(kDetectLoopIntervalSeconds));
+        std::this_thread::sleep_for(std::chrono::milliseconds(liveness_check_interval_ms_));
     }
 }
 

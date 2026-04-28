@@ -73,6 +73,10 @@ cc_library(
         "//kv_cache_manager/common",
         "//kv_cache_manager/common:string_util",
         "//kv_cache_manager/data_storage:common_define",
+        # V8 §2.1.1: ToFieldMap/FromFieldMap reference PROPERTY_LOCATION_PREFIX
+        # from meta/common.h. The dep is one-way (common.h has no deps), so no
+        # cycle with meta_indexer -> cache_location.
+        "//kv_cache_manager/meta:common",
     ],
 )
 

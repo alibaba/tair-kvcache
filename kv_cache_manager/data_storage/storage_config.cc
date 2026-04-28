@@ -379,24 +379,54 @@ bool StorageConfig::ValidateRequiredFields(std::string &invalid_fields) const {
 // VineyardStorageSpec
 bool VineyardStorageSpec::FromRapidValue(const rapidjson::Value &rapid_value) {
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "cluster_name", cluster_name_, std::string(""));
+    KVCM_JSON_GET_DEFAULT_MACRO(
+        rapid_value, "heartbeat_timeout_ms", heartbeat_timeout_ms_, static_cast<int64_t>(kDefaultHeartbeatTimeoutMs));
+    KVCM_JSON_GET_DEFAULT_MACRO(
+        rapid_value, "cleanup_grace_ms", cleanup_grace_ms_, static_cast<int64_t>(kDefaultCleanupGraceMs));
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value,
+                                "liveness_check_interval_ms",
+                                liveness_check_interval_ms_,
+                                static_cast<int64_t>(kDefaultLivenessCheckIntervalMs));
     return true;
 }
 
 void VineyardStorageSpec::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
     Put(writer, "cluster_name", cluster_name_);
+    Put(writer, "heartbeat_timeout_ms", heartbeat_timeout_ms_);
+    Put(writer, "cleanup_grace_ms", cleanup_grace_ms_);
+    Put(writer, "liveness_check_interval_ms", liveness_check_interval_ms_);
 }
 
 bool VineyardStorageSpec::ValidateRequiredFields(std::string &invalid_fields) const {
+    bool valid = true;
+    std::string local_invalid_fields;
     if (cluster_name_.empty()) {
-        invalid_fields += "{VineyardStorageSpec: {cluster_name}}";
-        return false;
+        valid = false;
+        local_invalid_fields += "{cluster_name}";
     }
-    return true;
+    if (heartbeat_timeout_ms_ <= 0) {
+        valid = false;
+        local_invalid_fields += "{heartbeat_timeout_ms}";
+    }
+    if (cleanup_grace_ms_ <= 0) {
+        valid = false;
+        local_invalid_fields += "{cleanup_grace_ms}";
+    }
+    if (liveness_check_interval_ms_ <= 0) {
+        valid = false;
+        local_invalid_fields += "{liveness_check_interval_ms}";
+    }
+    if (!valid) {
+        invalid_fields += "{VineyardStorageSpec: " + local_invalid_fields + "}";
+    }
+    return valid;
 }
 
 std::string VineyardStorageSpec::ToString() const {
     std::ostringstream oss;
-    oss << "cluster_name: " << cluster_name_;
+    oss << "cluster_name: " << cluster_name_ << ", heartbeat_timeout_ms: " << heartbeat_timeout_ms_
+        << ", cleanup_grace_ms: " << cleanup_grace_ms_
+        << ", liveness_check_interval_ms: " << liveness_check_interval_ms_;
     return oss.str();
 }
 

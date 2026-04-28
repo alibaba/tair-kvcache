@@ -45,7 +45,7 @@ enum StorageType {
     ST_VINEYARD = 7;
 }
 
-// ---- Vineyard (V6D) event reporting ----
+// ---- Vineyard (V6D) event reporting (V8: batch + heartbeat) ----
 
 enum ReportEventType {
     EVENT_UNSPECIFIED = 0;
@@ -53,43 +53,57 @@ enum ReportEventType {
     EVENT_BLOCK_ADD = 2;     // V6D stored a new block locally
     EVENT_BLOCK_DELETE = 3;  // V6D deleted a block locally
     EVENT_HOST_DOWN = 4;     // V6D node is going down (graceful or detected)
+    EVENT_HEARTBEAT = 5;     // V6D periodic heartbeat
 }
 
 message NodeRegisterParams {
-    string host_ip_port = 1; // e.g. "192.168.1.100:8080"
+    repeated string mediums = 1; // mediums supported by the node, e.g. ["mem","disk"]
 }
 
 message BlockAddParams {
-    string block_key = 1;    // int64 as string
-    string location_json = 2; // raw JSON from V6D, stored as LocationSpec.uri
-    string host_ip_port = 3;
+    string block_key = 1; // int64 as string
+    string uri = 2;       // standard URI: vineyard://{ip}:{port}/{medium}?...
+    string medium = 3;    // medium tag, e.g. "mem"/"disk"/"ssd"/"hbm"; KVCM does not interpret
 }
 
 message BlockDeleteParams {
     string block_key = 1;
-    string host_ip_port = 2;
+    string medium = 2;
 }
 
 message HostDownParams {
-    string down_host_ip_port = 1;
+    // host_ip_port is shared at request level; no payload needed
+}
+
+message HeartbeatParams {
+    // KVCM only refreshes last_heartbeat; system_status is opaque observability data
+    map<string, string> system_status = 1;
+}
+
+message EventItem {
+    ReportEventType event_type = 1;
+    oneof event_params {
+        NodeRegisterParams node_register = 2;
+        BlockAddParams block_add = 3;
+        BlockDeleteParams block_delete = 4;
+        HostDownParams host_down = 5;
+        HeartbeatParams heartbeat = 6;
+    }
 }
 
 message ReportEventRequest {
     string trace_id = 1;
     string instance_id = 2;
-    ReportEventType event_type = 3;
-
-    oneof event_params {
-        NodeRegisterParams node_register = 4;
-        BlockAddParams block_add = 5;
-        BlockDeleteParams block_delete = 6;
-        HostDownParams host_down = 7;
-    }
+    string host_ip_port = 3;     // shared by every EventItem in this batch
+    repeated EventItem events = 4;
 }
 
 message ReportEventResponse {
     ErrorCode ec = 1;
     string error_msg = 2;
+    // Per-item results aligned with request.events when partial failures happen.
+    // Empty when all items succeeded.
+    repeated ErrorCode item_results = 3;
 }
 
 // 使用URI统一多种存储表示，由client或者connector负责解析

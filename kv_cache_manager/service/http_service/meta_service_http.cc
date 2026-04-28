@@ -164,10 +164,11 @@ void MetaServiceHttp::ReportEvent(coro_http::coro_http_connection *http_conn,
                                   proto::meta::ReportEventRequest *request,
                                   proto::meta::ReportEventResponse *response) {
     API_CONTEXT_INIT_HTTP(ReportEvent);
-    KVCM_LOG_INFO("[traceId: %s] ReportEvent called, instance_id: %s, event_type: %d",
+    KVCM_LOG_INFO("[traceId: %s] ReportEvent called, instance_id: %s, host_ip_port: %s, event_count: %d",
                   request->trace_id().c_str(),
                   request->instance_id().c_str(),
-                  static_cast<int>(request->event_type()));
+                  request->host_ip_port().c_str(),
+                  request->events_size());
     meta_service_impl_->ReportEvent(request_context, request, response);
 }
 

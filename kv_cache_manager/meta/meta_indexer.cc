@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "kv_cache_manager/common/common.h"
@@ -16,6 +17,7 @@
 #include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/config/meta_indexer_config.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
+#include "kv_cache_manager/manager/cache_location.h"
 #include "kv_cache_manager/meta/meta_search_cache.h"
 #include "kv_cache_manager/meta/meta_storage_backend_factory.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
@@ -24,6 +26,75 @@
 namespace kv_cache_manager {
 #define PREFIX_INDEXER_LOG(LEVEL, format, args...)                                                                     \
     KVCM_LOG_##LEVEL("trace_id[%s] instance[%s] | " format, trace_id.c_str(), instance_id_.c_str(), ##args);
+
+namespace {
+
+// V8 §2.1.1 read-side helper: given the full HASH field map returned by
+// storage_->GetAllFields / Get, gather every L#{loc_id} entry into a single
+// BlockCacheLocationsMeta and serialize it to a JSON string. The string is
+// what older callers received as PROPERTY_URI ("__uri__") so we keep the
+// modifier API source-compatible.
+//
+// Dual-mode: if no L# fields are present, fall back to the legacy
+// PROPERTY_URI value. This keeps storage-backend unit tests (which write
+// opaque strings into `__uri__`) working alongside V8 production data.
+std::string SynthesizeUriFromFields(const std::map<std::string, std::string> &field_map) {
+    BlockCacheLocationsMeta meta;
+    bool any_location_field = false;
+    for (const auto &kv : field_map) {
+        if (kv.first.rfind(PROPERTY_LOCATION_PREFIX, 0) == 0) {
+            any_location_field = true;
+            break;
+        }
+    }
+    if (any_location_field) {
+        // Best-effort: a malformed L# entry returns the partially-decoded meta
+        // instead of failing the whole read; matches the lenient v7 contract.
+        meta.FromFieldMap(field_map);
+        return meta.ToJsonString();
+    }
+    if (auto it = field_map.find(PROPERTY_URI); it != field_map.end()) {
+        return it->second;
+    }
+    return std::string();
+}
+
+// V8 §2.1.1 write-side helper: take a property map prepared by callers (which
+// historically wrote the BlockCacheLocationsMeta JSON under PROPERTY_URI) and
+// expand the URI string into individual L#{loc_id} fields. PROPERTY_URI is
+// removed from the map when expansion succeeds so the on-disk layout is
+// purely BP#/L#/P#.
+//
+// If the URI does not parse as a BlockCacheLocationsMeta JSON, we leave the
+// raw string under PROPERTY_URI ("__uri__") instead. This dual-mode behavior
+// preserves backwards compatibility with storage-backend tests that store
+// opaque strings, while still routing V8 production payloads through the L#
+// decomposition. Returns true unconditionally because both branches are
+// considered valid writes.
+bool ExpandUriIntoFields(std::map<std::string, std::string> &field_map) {
+    auto it = field_map.find(PROPERTY_URI);
+    if (it == field_map.end()) {
+        return true;
+    }
+    std::string uri_json = std::move(it->second);
+    if (uri_json.empty()) {
+        field_map.erase(it);
+        return true;
+    }
+    BlockCacheLocationsMeta meta;
+    if (!meta.FromJsonString(uri_json)) {
+        // Legacy / opaque payload: keep it under PROPERTY_URI as-is. This
+        // path is exercised by tests that store arbitrary strings; production
+        // callers always emit valid BlockCacheLocationsMeta JSON.
+        it->second = std::move(uri_json);
+        return true;
+    }
+    field_map.erase(it);
+    meta.ToFieldMap(field_map);
+    return true;
+}
+
+} // anonymous namespace
 
 static constexpr const char *kPutMetaOperation = "put";
 static constexpr const char *kUpdateMetaOperation = "update";
@@ -316,13 +387,22 @@ MetaIndexer::Result MetaIndexer::Put(RequestContext *request_context,
 
     BatchMetaData batch_datas;
     MakeBatches(keys, properties, batch_datas);
-    KVCM_METRICS_COLLECTOR_SET_METRICS(
-        service_metrics_collector, meta_indexer, query_batch_num, batch_datas.batch_keys.size());
+    // V8: each batch row carries a synthetic PROPERTY_URI built from the
+    // BlockCacheLocationsMeta JSON; expand it into L#{loc_id} fields before
+    // writing to storage. Bad JSON short-circuits with EC_ERROR per row.
     Result result(keys.size());
     int32_t error_count = 0;
     int64_t put_io_time_us = 0;
+    KVCM_METRICS_COLLECTOR_SET_METRICS(
+        service_metrics_collector, meta_indexer, query_batch_num, batch_datas.batch_keys.size());
     for (int32_t i = 0; i < batch_datas.batch_keys.size(); ++i) {
         ScopedBatchLock lock(*this, batch_datas.batch_shard_indexs[i]);
+        // V8: rewrite each batch row's PROPERTY_URI to BP/L/P field layout
+        // before talking to storage_. Opaque non-JSON payloads stay under
+        // PROPERTY_URI for back-compat with storage-backend tests.
+        for (auto &fm : batch_datas.batch_properties[i]) {
+            ExpandUriIntoFields(fm);
+        }
         int64_t begin_put_io_time = TimestampUtil::GetCurrentTimeUs();
         auto error_codes = storage_->Put(batch_datas.batch_keys[i], batch_datas.batch_properties[i]);
         put_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin_put_io_time;
@@ -400,6 +480,11 @@ MetaIndexer::Result MetaIndexer::Update(RequestContext *request_context,
     int64_t update_io_time_us = 0;
     for (int32_t i = 0; i < batch_datas.batch_keys.size(); ++i) {
         ScopedBatchLock lock(*this, batch_datas.batch_shard_indexs[i]);
+        // Same URI-to-L# expansion as Put. UpdateFields is field-additive
+        // (HSET-only), but expanding still keeps the on-disk layout uniform.
+        for (auto &fm : batch_datas.batch_properties[i]) {
+            ExpandUriIntoFields(fm);
+        }
         int64_t begin_update_io_time = TimestampUtil::GetCurrentTimeUs();
         auto error_codes = storage_->UpdateFields(batch_datas.batch_keys[i], batch_datas.batch_properties[i]);
         update_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin_update_io_time;
@@ -428,14 +513,6 @@ MetaIndexer::Result MetaIndexer::ReadModifyWrite(RequestContext *request_context
     Result result(keys.size());
     int32_t error_count = 0;
 
-    // for ephemeral metrics data recording
-    // to avoid interfere with the global metrics registry
-    std::shared_ptr<MetricsRegistry> ephemeral_metrics_registry = std::make_shared<MetricsRegistry>();
-    std::shared_ptr<MetricsCollector> ephemeral_metrics_collector =
-        std::make_shared<ServiceMetricsCollector>(ephemeral_metrics_registry);
-    ephemeral_metrics_collector->Init();
-    auto get_request_context =
-        std::make_shared<RequestContext>("get_in_read_modify_write", ephemeral_metrics_collector);
     int64_t get_io_time_us = 0;
     int64_t upsert_io_time_us = 0;
     int64_t delete_io_time_us = 0;
@@ -444,23 +521,25 @@ MetaIndexer::Result MetaIndexer::ReadModifyWrite(RequestContext *request_context
     int64_t delete_key_count = 0;
     for (int32_t i = 0; i < batch_datas.batch_keys.size(); ++i) {
         ScopedBatchLock lock(*this, batch_datas.batch_shard_indexs[i]);
-        // 1. get
-        UriVector uris;
-        auto get_result = Get(get_request_context.get(), batch_datas.batch_keys[i], uris);
-        auto *ephemeral_service_metrics_collector =
-            dynamic_cast<ServiceMetricsCollector *>(get_request_context->metrics_collector());
-        int64_t v = 0;
-        KVCM_METRICS_COLLECTOR_GET_METRICS(ephemeral_service_metrics_collector, meta_indexer, get_io_time_us, v);
-        get_io_time_us += v;
+        // 1. get -- V8 reads ALL fields (BP#/L#/P# plus any legacy data) so we
+        //    can both synthesize the BlockCacheLocationsMeta JSON for the
+        //    modifier AND preserve unmodified BP#/P# fields on write-back.
+        MetaStorageBackend::FieldMapVec all_field_maps;
+        int64_t begin_get_io_time = TimestampUtil::GetCurrentTimeUs();
+        auto get_error_codes = storage_->GetAllFields(batch_datas.batch_keys[i], all_field_maps);
+        get_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin_get_io_time;
         // 2. modify
         KeyVector upsert_keys, delete_keys;
         std::vector<int32_t> put_indexs, upsert_indexs, delete_indexs;
         PropertyMapVector upsert_properties;
-        for (int32_t j = 0; j < get_result.error_codes.size(); ++j) {
-            auto get_ec = get_result.error_codes[j];
+        for (int32_t j = 0; j < static_cast<int32_t>(get_error_codes.size()); ++j) {
+            auto get_ec = get_error_codes[j];
             int32_t idx = batch_datas.batch_indexs[i][j];
+            // For NOENT keys all_field_maps[j] is empty; that's the expected
+            // "first write" state.
+            std::string uri = SynthesizeUriFromFields(all_field_maps[j]);
             PropertyMap map;
-            auto [action, ec] = modifier(uris[j], get_ec, idx, map);
+            auto [action, ec] = modifier(uri, get_ec, idx, map);
             if (action == MA_FAIL || action == MA_SKIP) {
                 if (ec != EC_OK) {
                     ++error_count;
@@ -473,20 +552,50 @@ MetaIndexer::Result MetaIndexer::ReadModifyWrite(RequestContext *request_context
                 delete_indexs.push_back(idx);
                 continue;
             }
-            map[PROPERTY_URI] = std::move(uris[j]);
-            if (get_ec == EC_OK || get_ec == EC_NOENT) {
-                upsert_keys.push_back(keys[idx]);
-                upsert_indexs.push_back(idx);
-                upsert_properties.push_back(std::move(map));
-                if (get_ec == EC_NOENT) {
-                    put_indexs.push_back(idx);
-                }
-            } else {
+            if (get_ec != EC_OK && get_ec != EC_NOENT) {
                 ++error_count;
                 result.error_codes[idx] = get_ec;
+                continue;
+            }
+            // Build the post-modify field map. Steps:
+            //   (a) start from existing all_field_maps[j] (preserves BP#/P#)
+            //   (b) erase every existing L# entry; the new uri is the
+            //       authoritative location set
+            //   (c) overlay modifier-supplied props
+            //   (d) drop the synthetic PROPERTY_URI key by expanding it into
+            //       L#{loc_id} fields
+            MetaStorageBackend::FieldMap final_map = std::move(all_field_maps[j]);
+            for (auto it = final_map.begin(); it != final_map.end();) {
+                if (it->first.rfind(PROPERTY_LOCATION_PREFIX, 0) == 0) {
+                    it = final_map.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            for (auto &kv : map) {
+                final_map[kv.first] = std::move(kv.second);
+            }
+            final_map[PROPERTY_URI] = std::move(uri);
+            ExpandUriIntoFields(final_map);
+            if (final_map.empty()) {
+                // Defensive: a modifier that returns MA_OK but produces zero
+                // fields would result in an HSET with no field/value pairs,
+                // which Redis rejects. Convert to a delete instead.
+                delete_keys.push_back(keys[idx]);
+                delete_indexs.push_back(idx);
+                continue;
+            }
+            upsert_keys.push_back(keys[idx]);
+            upsert_indexs.push_back(idx);
+            upsert_properties.push_back(std::move(final_map));
+            if (get_ec == EC_NOENT) {
+                put_indexs.push_back(idx);
             }
         }
-        // 3. upsert: if exist then update, if not exist then insert.
+        // 3. upsert -- atomically replace each Hash via Put (DEL+HSET). We use
+        //    Put (not Upsert/HSET-only) so removed L#{loc_id} fields actually
+        //    leave Redis; preservation of unrelated BP#/P# fields was already
+        //    done in step 2 by carrying them through final_map.
         if (!upsert_keys.empty()) {
             put_key_count += put_indexs.size();
             update_key_count += upsert_keys.size() - put_indexs.size();
@@ -500,7 +609,7 @@ MetaIndexer::Result MetaIndexer::ReadModifyWrite(RequestContext *request_context
                 error_codes = std::vector<ErrorCode>(upsert_keys.size(), EC_NOSPC);
             } else {
                 int64_t begin_upsert_io_time = TimestampUtil::GetCurrentTimeUs();
-                error_codes = storage_->Upsert(upsert_keys, upsert_properties);
+                error_codes = storage_->Put(upsert_keys, upsert_properties);
                 upsert_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin_upsert_io_time;
             }
             int32_t upsert_error_count =
@@ -616,9 +725,13 @@ MetaIndexer::Result MetaIndexer::Get(RequestContext *request_context,
     int32_t error_count = 0;
     for (int32_t i = 0; i < keys.size(); ++i) {
         auto &map = maps[i];
-        out_uris.emplace_back(std::move(map[PROPERTY_URI]));
+        // V8: synthesize PROPERTY_URI from the L# field family so callers
+        // continue to receive a single BlockCacheLocationsMeta JSON.
+        out_uris.emplace_back(SynthesizeUriFromFields(map));
+        // Strip every internal field (BP#/L#/P# and legacy __) before handing
+        // properties to user code.
         for (auto it = map.begin(); it != map.end();) {
-            if (it->first.rfind(PROPERTY_INNER_PREFIX, 0) == 0) {
+            if (IsInternalPropertyName(it->first)) {
                 it = map.erase(it);
             } else {
                 ++it;
@@ -897,19 +1010,22 @@ MetaIndexer::DoGetWithCache(RequestContext *request_context, const KeyVector &ke
         return result;
     }
 
-    // for cache miss keys, get from storage backend, and put into cache
-    const std::vector<std::string> property_names = {PROPERTY_URI};
+    // V8: pull every Hash field and synthesize the URI from the L# family.
+    // GetAllFields is intrinsically larger than the old single-field HMGET,
+    // but each block_key carries at most O(replicas) L#s plus a handful of
+    // BP#/P# entries -- this is acceptable for the read path and keeps the
+    // implementation symmetric with ReadModifyWrite.
     PropertyMapVector maps;
     int32_t error_count = 0;
     int32_t not_exist_key_count = 0;
     int64_t begin_get_io_time = TimestampUtil::GetCurrentTimeUs();
-    auto error_codes = storage_->Get(miss_keys, property_names, maps);
+    auto error_codes = storage_->GetAllFields(miss_keys, maps);
     KVCM_METRICS_COLLECTOR_SET_METRICS(
         service_metrics_collector, meta_indexer, get_io_time_us, TimestampUtil::GetCurrentTimeUs() - begin_get_io_time);
     size_t io_data_size = 0;
     for (int32_t i = 0; i < miss_keys.size(); ++i) {
         int32_t index = miss_indexs[i];
-        out_uris[index] = std::move(maps[i][PROPERTY_URI]);
+        out_uris[index] = SynthesizeUriFromFields(maps[i]);
         io_data_size += out_uris[index].size();
         if (out_uris[index].empty()) {
             error_codes[i] = EC_NOENT;
@@ -935,21 +1051,19 @@ MetaIndexer::DoGetWithCache(RequestContext *request_context, const KeyVector &ke
 
 MetaIndexer::Result
 MetaIndexer::DoGetWithoutCache(RequestContext *request_context, const KeyVector &keys, UriVector &out_uris) noexcept {
-    // for cache miss keys, get from storage backend, and put into cache
     const auto &trace_id = request_context->trace_id();
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
-    const std::vector<std::string> property_names = {PROPERTY_URI};
     PropertyMapVector maps;
     int32_t error_count = 0;
     int32_t not_exist_key_count = 0;
     Result result(keys.size());
     int64_t begin_get_io_time = TimestampUtil::GetCurrentTimeUs();
-    auto error_codes = storage_->Get(keys, property_names, maps);
+    auto error_codes = storage_->GetAllFields(keys, maps);
     KVCM_METRICS_COLLECTOR_SET_METRICS(
         service_metrics_collector, meta_indexer, get_io_time_us, TimestampUtil::GetCurrentTimeUs() - begin_get_io_time);
     size_t io_data_size = 0;
     for (int32_t i = 0; i < keys.size(); ++i) {
-        out_uris[i] = std::move(maps[i][PROPERTY_URI]);
+        out_uris[i] = SynthesizeUriFromFields(maps[i]);
         io_data_size += out_uris[i].size();
         if (out_uris[i].empty()) {
             error_codes[i] = EC_NOENT;

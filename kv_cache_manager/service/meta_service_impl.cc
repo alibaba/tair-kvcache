@@ -715,13 +715,14 @@ void MetaServiceImpl::ReportEvent(RequestContext *request_context,
                                   const proto::meta::ReportEventRequest *request,
                                   proto::meta::ReportEventResponse *response) {
     SPAN_TRACER(request_context);
-    KVCM_LOG_INFO("[traceId: %s] ReportEvent called, instance_id: %s, event_type: %d",
+    KVCM_LOG_INFO("[traceId: %s] ReportEvent called, instance_id: %s, host_ip_port: %s, event_count: %d",
                   request->trace_id().c_str(),
                   request->instance_id().c_str(),
-                  static_cast<int>(request->event_type()));
+                  request->host_ip_port().c_str(),
+                  request->events_size());
 
     auto ec = cache_manager_->ReportEvent(request_context, request, response);
-    if (ec != EC_OK) {
+    if (ec != EC_OK && ec != EC_PARTIAL_OK) {
         KVCM_LOG_WARN("[traceId: %s] ReportEvent failed, ec=%d", request->trace_id().c_str(), ec);
     }
 }

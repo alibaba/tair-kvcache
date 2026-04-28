@@ -1,6 +1,7 @@
 #include "cache_location.h"
 
 #include "kv_cache_manager/common/string_util.h"
+#include "kv_cache_manager/meta/common.h"
 namespace kv_cache_manager {
 
 LocationSpec::LocationSpec() = default;
@@ -81,5 +82,38 @@ ErrorCode BlockCacheLocationsMeta::GetLocationStatus(const std::string &location
     return ErrorCode::EC_OK;
 }
 size_t BlockCacheLocationsMeta::GetLocationCount() const { return location_map_.size(); }
+
+void BlockCacheLocationsMeta::ToFieldMap(std::map<std::string, std::string> &out_field_map) const noexcept {
+    for (const auto &kv : location_map_) {
+        // Per-location entries land at L#{location_id}; the value is the full
+        // CacheLocation JSON so callers can deserialize one row at a time.
+        out_field_map[PROPERTY_LOCATION_PREFIX + kv.first] = kv.second.ToJsonString();
+    }
+}
+
+bool BlockCacheLocationsMeta::FromFieldMap(const std::map<std::string, std::string> &field_map) {
+    for (const auto &kv : field_map) {
+        if (kv.first.rfind(PROPERTY_LOCATION_PREFIX, 0) != 0) {
+            // Skip BP#/P#/legacy fields here; they belong to other consumers.
+            continue;
+        }
+        const std::string location_id = kv.first.substr(PROPERTY_LOCATION_PREFIX.size());
+        if (location_id.empty()) {
+            // Defensive: an empty location_id means a malformed key like "L#".
+            return false;
+        }
+        CacheLocation loc;
+        if (!loc.FromJsonString(kv.second)) {
+            return false;
+        }
+        if (loc.id().empty()) {
+            // Materialize the id from the field name for callers that may not
+            // have populated CacheLocation::id_ at write time.
+            loc.set_id(location_id);
+        }
+        location_map_[location_id] = std::move(loc);
+    }
+    return true;
+}
 
 } // namespace kv_cache_manager
