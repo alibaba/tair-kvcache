@@ -5,6 +5,7 @@
 用法:
   python run/optimizer_run.py -c config.json
   python run/optimizer_run.py -c config.json --draw-chart
+  python run/optimizer_run.py -c config.json --fast-chart
   python run/optimizer_run.py -c config.json --export-lifecycle
 """
 
@@ -16,6 +17,8 @@ from kv_cache_manager.optimizer.pybind import kvcm_py_optimizer
 
 from utils.optimizer_runner import init_kvcm_logger
 from plot.hit_rate_plot import plot_multi_instance_analysis
+from plot.hit_rate_plot_fast import plot_multi_instance_analysis as plot_multi_instance_analysis_fast
+from plot.duplicate_block_plot import plot_duplicate_blocks
 
 
 def parse_args():
@@ -24,6 +27,8 @@ def parse_args():
                         help="优化器启动配置文件路径 (JSON格式)")
     parser.add_argument("--draw-chart", action="store_true", default=False,
                         help="是否生成时序命中率图表 (默认: 不生成)")
+    parser.add_argument("--fast-chart", action="store_true", default=False,
+                        help="使用高性能画图（隐含 --draw-chart）")
     parser.add_argument("--export-lifecycle", action="store_true", default=False,
                         help="导出 lifecycle CSV（警告：可能生成超大文件）")
     return parser.parse_args()
@@ -77,10 +82,15 @@ def main():
     dur_analysis = time.time() - t4
     print("      Analysis done: {:.2f}s".format(dur_analysis))
 
-    if args.draw_chart:
+    if args.fast_chart or args.draw_chart:
         t5 = time.time()
-        print("\n[5/5] Generating charts...")
-        plot_multi_instance_analysis(output_path, output_path)
+        if args.fast_chart:
+            print("\n[5/5] Generating charts (fast)...")
+            plot_multi_instance_analysis_fast(output_path)
+        else:
+            print("\n[5/5] Generating charts...")
+            plot_multi_instance_analysis(output_path)
+        plot_duplicate_blocks(output_path)
         print("      Charts done: {:.2f}s".format(time.time() - t5))
     else:
         print("\n[5/5] Skipping chart generation.")
