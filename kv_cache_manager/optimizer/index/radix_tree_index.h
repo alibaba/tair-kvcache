@@ -19,7 +19,9 @@ void AppendBlockLocation(BlockEntry *block, const std::string &unique_name, int6
 class RadixTreeIndex {
 public:
     // 新构造函数 (多 tier)
-    RadixTreeIndex(const std::string &instance_id, std::vector<std::shared_ptr<EvictionPolicy>> tier_policies);
+    RadixTreeIndex(const std::string &instance_id,
+                   std::vector<std::shared_ptr<EvictionPolicy>> tier_policies,
+                   TierWriteMode write_mode = TierWriteMode::WRITE_THROUGH);
     // 兼容构造函数 (单 policy)
     RadixTreeIndex(const std::string &instance_id, const std::shared_ptr<EvictionPolicy> &eviction_policy);
     RadixTreeIndex();
@@ -71,6 +73,11 @@ private:
     std::unique_ptr<RadixTreeNode> root_;
     std::vector<std::shared_ptr<EvictionPolicy>> tier_policies_; // 按 tier priority 排序
     std::vector<std::string> tier_names_;                        // 缓存 policy name
+    // 写入模式：WRITE_THROUGH = 所有 tier 都写，CASCADING = 仅写 tier 0，超出的通过 EvictionManager 级联降级
+    TierWriteMode write_mode_ = TierWriteMode::WRITE_THROUGH;
+    // 写入流量应落地的 tier 数，构造时结合 write_mode_ 与 tier 数一次性确定
+    // WRITE_THROUGH=全部层，CASCADING=仅 tier 0（单层退化为全部）
+    size_t write_tier_count_ = 0;
     std::string instance_id_;
     std::shared_ptr<StatsCollector> stats_collector_;
 

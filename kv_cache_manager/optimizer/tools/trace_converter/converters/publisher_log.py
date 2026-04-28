@@ -58,7 +58,7 @@ class PublisherLogConverter(BaseConverter):
         self._convert_pending_get_location_event(traces)
 
         # 按timestamp排序（保证输出有序）
-        traces.sort(key=lambda t: t.get('timestamp_us', 0))
+        traces.sort(key=lambda t: t.get("timestamp_ns", 0))
 
         # 打印统计信息
         if self.discovered_instances:
@@ -112,7 +112,7 @@ class PublisherLogConverter(BaseConverter):
 
         trace = {
             'instance_id': instance_id,
-            'timestamp_us': data.get('trigger_time_us', 0),
+            'timestamp_ns': int(data.get('trigger_time_us', 0)) * 1000,
             'keys': data.get('keys', []),
             'tokens': data.get('tokens', []),  # 提取tokens字段
             'query_type': data.get('query_type', 'prefix_match'),
@@ -139,7 +139,7 @@ class PublisherLogConverter(BaseConverter):
 
         write_trace = {
             'instance_id': instance_id,
-            'timestamp_us': data.get('trigger_time_us', 0),
+            'timestamp_ns': int(data.get('trigger_time_us', 0)) * 1000,
             'keys': data.get('keys', []),
             'tokens': data.get('tokens', []),
         }
@@ -166,7 +166,7 @@ class PublisherLogConverter(BaseConverter):
         
         write_trace = self.pending_write_sessions.pop(key)
         # 更新为FinishWrite的时间戳
-        write_trace['timestamp_us'] = data.get('trigger_time_us', 0)
+        write_trace['timestamp_ns'] = int(data.get('trigger_time_us', 0)) * 1000
         
         # 尝试匹配GetLocation并生成traces
         return self._find_matching_get_location_trace(write_trace)
@@ -174,7 +174,7 @@ class PublisherLogConverter(BaseConverter):
     def _find_matching_get_location_trace(self, write_trace: dict):
         """匹配GetLocation和WriteCache生成DialogTurn或Get+Write"""
         write_keys = write_trace['keys']
-        write_timestamp = write_trace['timestamp_us']
+        write_timestamp = write_trace['timestamp_ns']
         write_instance = write_trace['instance_id']
 
         # 反向查找匹配的GetLocation
@@ -184,7 +184,7 @@ class PublisherLogConverter(BaseConverter):
             # 检查instance_id和时间戳
             if get_trace['instance_id'] != write_instance:
                 continue
-            if get_trace['timestamp_us'] > write_timestamp:
+            if get_trace['timestamp_ns'] > write_timestamp:
                 continue
 
             get_keys = get_trace['keys']
@@ -226,7 +226,7 @@ class PublisherLogConverter(BaseConverter):
 
         # Get trace (保留原始时间戳和instance_id)
         get_result = self._create_get_trace(
-            timestamp_us=get_trace['timestamp_us'],
+            timestamp_ns=get_trace['timestamp_ns'],
             keys=get_trace['keys'],
             instance_id=instance_id,
             tokens=get_trace.get('tokens', []),
@@ -238,7 +238,7 @@ class PublisherLogConverter(BaseConverter):
 
         # Write trace (保留原始时间戳和instance_id)
         write_result = self._create_write_trace(
-            timestamp_us=write_trace['timestamp_us'],
+            timestamp_ns=write_trace['timestamp_ns'],
             keys=write_trace['keys'],
             instance_id=instance_id,
             tokens=write_trace.get('tokens', [])
@@ -259,7 +259,7 @@ class PublisherLogConverter(BaseConverter):
         match_len = len(get_keys) - 1
 
         dialog_trace = self._create_dialog_trace(
-            timestamp_us=write_trace['timestamp_us'],
+            timestamp_ns=write_trace['timestamp_ns'],
             keys=get_keys,
             input_len=len(get_keys) * block_size,
             output_len=(len(write_keys) - match_len) * block_size,
@@ -278,7 +278,7 @@ class PublisherLogConverter(BaseConverter):
         """处理未完成的write事件 - 尝试匹配Get trace"""
         for write_trace in self.pending_write_sessions.values():
             # 假设结束时间比开始时间晚100ms
-            write_trace['timestamp_us'] += 100000
+            write_trace['timestamp_ns'] += 100_000_000
 
             # ✅ 尝试匹配Get trace
             result = self._find_matching_get_location_trace(write_trace)
@@ -293,7 +293,7 @@ class PublisherLogConverter(BaseConverter):
                 # 未匹配到Get,只输出Write trace (仅Optimizer模式)
                 if self.mode == 'optimizer':
                     write_only = self._create_write_trace(
-                        timestamp_us=write_trace['timestamp_us'],
+                        timestamp_ns=write_trace['timestamp_ns'],
                         keys=write_trace['keys'],
                         instance_id=write_trace['instance_id'],
                         tokens=write_trace.get('tokens', [])
@@ -312,7 +312,7 @@ class PublisherLogConverter(BaseConverter):
             if self.mode == 'optimizer':
                 # Optimizer模式: 只生成Get trace
                 result = self._create_get_trace(
-                    timestamp_us=get_trace['timestamp_us'],
+                    timestamp_ns=get_trace['timestamp_ns'],
                     keys=get_trace['keys'],
                     instance_id=instance_id,
                     tokens=get_trace.get('tokens', []),
@@ -325,7 +325,7 @@ class PublisherLogConverter(BaseConverter):
             else:
                 # Inference模式: 生成DialogTurn (output_len=0)
                 dialog_trace = self._create_dialog_trace(
-                    timestamp_us=get_trace['timestamp_us'],
+                    timestamp_ns=get_trace['timestamp_ns'],
                     keys=get_trace['keys'],
                     input_len=len(get_trace['keys']) * block_size,
                     output_len=0,

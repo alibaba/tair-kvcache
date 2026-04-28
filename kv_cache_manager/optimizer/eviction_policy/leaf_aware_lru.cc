@@ -53,27 +53,36 @@ void LeafAwareLruEvictionPolicy::insert_sorted_by_priority(LeafLRUListNode *node
         return;
     }
 
-    int64_t node_time = node->payload_->last_access_time;
+    // 排序基于本 tier 的 TierStat.last_access_time，各层独立（不读跨层的 block 级字段）
+    // 链表语义：head = 最新 (priority 最大)，tail = 最旧 (priority 最小)
+    // priority = -tier_access_time ，所以 access_time 越大 priority 越大 → 在 head 端
+    auto compare = [this](const LinkedListNode *a, const LinkedListNode *b) {
+        const auto *na = static_cast<const LeafLRUListNode *>(a);
+        const auto *nb = static_cast<const LeafLRUListNode *>(b);
+        return GetTierAccessTime(na->payload_) > GetTierAccessTime(nb->payload_);
+    };
 
-    // 获取头尾节点的 last_access_time
+    int64_t node_time = GetTierAccessTime(node->payload_);
+
+    // 获取头尾节点的 tier 级访问时间
     auto *head_node = static_cast<LeafLRUListNode *>(leaf_lru_list_.getHead());
     auto *tail_node = static_cast<LeafLRUListNode *>(leaf_lru_list_.getTail());
-    int64_t head_time = head_node->payload_->last_access_time;
-    int64_t tail_time = tail_node->payload_->last_access_time;
+    int64_t head_time = GetTierAccessTime(head_node->payload_);
+    int64_t tail_time = GetTierAccessTime(tail_node->payload_);
 
     // 自适应选择遍历方向：离哪端近就从哪端开始
     if (node_time >= head_time) {
         // 比头部还热门，从头部开始遍历
-        leaf_lru_list_.insert_sorted(node, LeafLRUListNode::compare);
+        leaf_lru_list_.insert_sorted(node, compare);
     } else if (node_time <= tail_time) {
         // 比尾部还冷门，从尾部开始遍历
-        leaf_lru_list_.insert_sorted_reverse(node, LeafLRUListNode::compare);
+        leaf_lru_list_.insert_sorted_reverse(node, compare);
     } else {
         // 在中间位置，比较距离决定方向
         if ((head_time - node_time) < (node_time - tail_time)) {
-            leaf_lru_list_.insert_sorted(node, LeafLRUListNode::compare);
+            leaf_lru_list_.insert_sorted(node, compare);
         } else {
-            leaf_lru_list_.insert_sorted_reverse(node, LeafLRUListNode::compare);
+            leaf_lru_list_.insert_sorted_reverse(node, compare);
         }
     }
 }

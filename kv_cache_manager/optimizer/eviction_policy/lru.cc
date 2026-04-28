@@ -28,7 +28,7 @@ int64_t LruEvictionPolicy::GetShardTailTime(int32_t shard_index) const {
         return INT64_MAX;
     }
     auto *lru_node = static_cast<const LRUListNode *>(tail);
-    return lru_node->payload_ ? lru_node->payload_->last_access_time : INT64_MAX;
+    return lru_node->payload_ ? GetTierAccessTime(lru_node->payload_) : INT64_MAX;
 }
 
 void LruEvictionPolicy::OnBlockWritten(BlockEntry *block) {
@@ -53,6 +53,8 @@ void LruEvictionPolicy::OnBlockAccessed(BlockEntry *block, int64_t timestamp) {
     if (it == node_map_.end()) {
         return;
     }
+    // block 级 / tier 级 last_access_time 由 RadixTreeIndex::OnBlockAccessed 统一写入；
+    // 本函数仅负责将 block 在 LRU 链表中的物理位置刷新到头部
     LRUListNode *node = it->second;
     shard_lists_[GetShardIndex(block)].move_to_front(node);
 }
@@ -139,8 +141,8 @@ std::vector<BlockEntry *> LruEvictionPolicy::EvictBlocks(size_t count) {
         std::partial_sort(candidates.begin(),
                           candidates.begin() + count,
                           candidates.end(),
-                          [](const CandidateEntry &a, const CandidateEntry &b) {
-                              return a.block->last_access_time < b.block->last_access_time;
+                          [this](const CandidateEntry &a, const CandidateEntry &b) {
+                              return GetTierAccessTime(a.block) < GetTierAccessTime(b.block);
                           });
 
         std::vector<CandidateEntry> to_evict(candidates.begin(), candidates.begin() + count);

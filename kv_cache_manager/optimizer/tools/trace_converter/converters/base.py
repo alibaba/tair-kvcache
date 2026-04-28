@@ -60,7 +60,7 @@ class BaseConverter(ABC):
 
         Args:
             instance_id: 实例ID
-            base_timestamp: 基础时间戳
+            base_timestamp: 基础时间戳（纳秒）
 
         Returns:
             无冲突的时间戳
@@ -77,7 +77,7 @@ class BaseConverter(ABC):
 
     def _create_get_trace(
         self,
-        timestamp_us: int,
+        timestamp_ns: int,
         keys: list,
         instance_id: str = None,
         **kwargs
@@ -86,7 +86,7 @@ class BaseConverter(ABC):
         创建GetLocationSchemaTrace (optimizer模式)
 
         Args:
-            timestamp_us: 微秒时间戳
+            timestamp_ns: 纳秒时间戳
             keys: block ID列表
             instance_id: 实例ID (None则使用default_instance_id)
             **kwargs: 其他可选字段
@@ -99,7 +99,7 @@ class BaseConverter(ABC):
             instance_id = self.default_instance_id
 
         # 分配无冲突的时间戳
-        timestamp_us = self._allocate_timestamp(instance_id, timestamp_us)
+        timestamp_ns = self._allocate_timestamp(instance_id, timestamp_ns)
 
         # tokens字段处理: 根据keep_tokens决定是否保留
         tokens = kwargs.get('tokens', []) if self.keep_tokens else []
@@ -108,8 +108,8 @@ class BaseConverter(ABC):
             'type': 'get',  # 显式标记为Get trace
             # OptimizerSchemaTrace 基础字段
             'instance_id': instance_id,
-            'trace_id': f"trace_{instance_id}_{timestamp_us}",
-            'timestamp_us': timestamp_us,
+            'trace_id': f"trace_{instance_id}_{timestamp_ns}",
+            'timestamp_ns': timestamp_ns,
             'tokens': tokens,
             'keys': keys,
 
@@ -124,7 +124,7 @@ class BaseConverter(ABC):
 
     def _create_write_trace(
         self,
-        timestamp_us: int,
+        timestamp_ns: int,
         keys: list,
         instance_id: str = None,
         **kwargs
@@ -133,7 +133,7 @@ class BaseConverter(ABC):
         创建WriteCacheSchemaTrace (optimizer模式)
 
         Args:
-            timestamp_us: 微秒时间戳
+            timestamp_ns: 纳秒时间戳
             keys: block ID列表
             instance_id: 实例ID (None则使用default_instance_id)
             **kwargs: 其他可选字段
@@ -146,7 +146,7 @@ class BaseConverter(ABC):
             instance_id = self.default_instance_id
 
         # 分配无冲突的时间戳
-        timestamp_us = self._allocate_timestamp(instance_id, timestamp_us)
+        timestamp_ns = self._allocate_timestamp(instance_id, timestamp_ns)
 
         # tokens字段处理: 根据keep_tokens决定是否保留
         tokens = kwargs.get('tokens', []) if self.keep_tokens else []
@@ -155,8 +155,8 @@ class BaseConverter(ABC):
             'type': 'write',  # 显式标记为Write trace
             # OptimizerSchemaTrace 基础字段
             'instance_id': instance_id,
-            'trace_id': f"trace_{instance_id}_{timestamp_us}",
-            'timestamp_us': timestamp_us,
+            'trace_id': f"trace_{instance_id}_{timestamp_ns}",
+            'timestamp_ns': timestamp_ns,
             'tokens': tokens,
             'keys': keys,
         }
@@ -165,7 +165,7 @@ class BaseConverter(ABC):
 
     def _create_dialog_trace(
         self,
-        timestamp_us: int,
+        timestamp_ns: int,
         keys: list,
         input_len: int,
         output_len: int,
@@ -177,7 +177,7 @@ class BaseConverter(ABC):
         创建DialogTurnSchemaTrace (inference模式)
 
         Args:
-            timestamp_us: 微秒时间戳
+            timestamp_ns: 纳秒时间戳
             keys: prefill阶段的block ID列表
             input_len: 输入token数
             output_len: 输出token数
@@ -193,7 +193,7 @@ class BaseConverter(ABC):
             instance_id = self.default_instance_id
 
         # 分配无冲突的时间戳
-        timestamp_us = self._allocate_timestamp(instance_id, timestamp_us)
+        timestamp_ns = self._allocate_timestamp(instance_id, timestamp_ns)
 
         # tokens字段处理: 根据keep_tokens决定是否保留
         tokens = kwargs.get('tokens', []) if self.keep_tokens else []
@@ -202,8 +202,8 @@ class BaseConverter(ABC):
             'type': 'dialog',  # 显式标记为DialogTurn trace
             # OptimizerSchemaTrace 基础字段
             'instance_id': instance_id,
-            'trace_id': f"trace_{instance_id}_{timestamp_us}",
-            'timestamp_us': timestamp_us,
+            'trace_id': f"trace_{instance_id}_{timestamp_ns}",
+            'timestamp_ns': timestamp_ns,
             'tokens': tokens,
             'keys': keys,
 

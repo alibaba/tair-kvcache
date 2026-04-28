@@ -18,6 +18,13 @@ enum class EvictionMode {
     EVICTION_MODE_INSTANCE_ROUGH = 2,
     EVICTION_MODE_INSTANCE_PRECISE = 3
 };
+
+// Tier 写入模式：仅在 hierarchical_eviction_enabled=true 时生效。
+// 控制 block 在多 tier 间的流动方式，与分层开关正交。
+enum class TierWriteMode {
+    WRITE_THROUGH = 0, // 默认：写入时落所有 tier，各层独立驱逐
+    CASCADING = 1,     // 只写 tier 0，tier_i 驱逐出的 block 级联降级到 tier_{i+1}
+};
 struct TierStat {
     size_t access_count = 0;
     int64_t last_access_time = -1;
@@ -47,7 +54,7 @@ struct BlockEntry {
 struct NodeStat {
     size_t access_count = 0;
     int64_t last_access_time = 0;
-    int64_t ttl = 250000; // 默认TTL为250000微秒，即250毫秒
+    int64_t ttl = 250000000; // 默认 TTL 250 毫秒（纳秒）
 };
 
 struct RadixTreeNode {
@@ -78,4 +85,7 @@ struct QueryHit {
 
 EvictionPolicyType ToEvictionPolicyType(const std::string &str);
 std::string ToString(const EvictionPolicyType &type);
+
+TierWriteMode ToTierWriteMode(const std::string &str);
+std::string ToString(const TierWriteMode &mode);
 } // namespace kv_cache_manager

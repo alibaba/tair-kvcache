@@ -99,7 +99,7 @@ def _process_chunk_text(
             ts_str = data.get(time_field, '')
             ts_str = ts_str.replace(',', '.')
             dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S.%f")
-            timestamp_us = int(dt.timestamp() * 1000000)
+            timestamp_ns = int(dt.timestamp() * 1_000_000_000)
             
             # 提取内容并tokenize
             content = data.get(content_field)
@@ -116,13 +116,13 @@ def _process_chunk_text(
             if mode == 'optimizer':
                 # Optimizer模式: Get+Write
                 get_trace = converter._create_get_trace(
-                    timestamp_us=timestamp_us,
+                    timestamp_ns=timestamp_ns,
                     keys=block_ids,
                     instance_id=default_instance_id,
                     tokens=token_ids
                 )
                 write_trace = converter._create_write_trace(
-                    timestamp_us=timestamp_us + 1,
+                    timestamp_ns=timestamp_ns + 1,
                     keys=block_ids,
                     instance_id=default_instance_id,
                     tokens=token_ids
@@ -132,7 +132,7 @@ def _process_chunk_text(
                 # Inference模式: DialogTurn
                 input_len = len(block_ids) * block_size
                 dialog_trace = converter._create_dialog_trace(
-                    timestamp_us=timestamp_us,
+                    timestamp_ns=timestamp_ns,
                     keys=block_ids,
                     input_len=input_len,
                     output_len=0,
@@ -262,7 +262,7 @@ class TextTraceConverter(BaseConverter):
         
         # 按timestamp排序（保证输出有序，尤其多进程时）
         print("Sorting traces by timestamp...")
-        all_traces.sort(key=lambda t: t.get('timestamp_us', 0))
+        all_traces.sort(key=lambda t: t.get("timestamp_ns", 0))
         
         total_elapsed = time.time() - start_time
         print(f"\n✅ Completed: {len(all_traces)} traces in {total_elapsed:.1f}s "
@@ -278,7 +278,7 @@ class TextTraceConverter(BaseConverter):
         ts_str = ts_str.replace(',', '.')
         dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S.%f")
 
-        return int(dt.timestamp() * 1000000)
+        return int(dt.timestamp() * 1_000_000_000)
 
     def _extract_content(self, data: dict):
         """提取内容字段"""
@@ -291,7 +291,7 @@ class TextTraceConverter(BaseConverter):
         """对内容进行tokenize (使用智能tokenization)"""
         return smart_tokenize(self.tokenizer, content, use_chat_template=True)
 
-    def _generate_optimizer_traces(self, timestamp_us: int, block_ids: list, tokens: list = None) -> list:
+    def _generate_optimizer_traces(self, timestamp_ns: int, block_ids: list, tokens: list = None) -> list:
         """
         生成Optimizer格式的Get+Write traces
         
@@ -302,15 +302,15 @@ class TextTraceConverter(BaseConverter):
         
         # Get trace - 显式使用default_instance_id
         get_trace = self._create_get_trace(
-            timestamp_us=timestamp_us,
+            timestamp_ns=timestamp_ns,
             keys=block_ids,
             instance_id=self.default_instance_id,
             tokens=tokens
         )
 
-        # Write trace (时间戳+1微秒) - 显式使用default_instance_id
+        # Write trace (时间戳+1纳秒) - 显式使用default_instance_id
         write_trace = self._create_write_trace(
-            timestamp_us=timestamp_us + 1,
+            timestamp_ns=timestamp_ns + 1,
             keys=block_ids,
             instance_id=self.default_instance_id,
             tokens=tokens
@@ -318,7 +318,7 @@ class TextTraceConverter(BaseConverter):
 
         return [get_trace, write_trace]
 
-    def _generate_inference_trace(self, timestamp_us: int, block_ids: list, tokens: list = None) -> dict:
+    def _generate_inference_trace(self, timestamp_ns: int, block_ids: list, tokens: list = None) -> dict:
         """
         生成Inference格式的DialogTurn trace
         
@@ -330,7 +330,7 @@ class TextTraceConverter(BaseConverter):
 
         # DialogTurn trace - 显式使用default_instance_id
         dialog_trace = self._create_dialog_trace(
-            timestamp_us=timestamp_us,
+            timestamp_ns=timestamp_ns,
             keys=block_ids,
             input_len=input_len,
             output_len=0,  # 文本输入没有输出

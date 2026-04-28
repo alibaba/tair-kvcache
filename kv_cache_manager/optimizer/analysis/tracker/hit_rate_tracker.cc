@@ -110,15 +110,15 @@ void HitRateTracker::ExportHitRates(const std::string &instance_id,
     size_t acc_local_hit = 0;
 
     for (const auto &record : data.read_records) {
-        size_t total = record.remote_read_block_num + record.local_read_block_num;
-        double remote_rate = total > 0 ? static_cast<double>(record.remote_hit_block_num) / total : 0.0;
-        double local_rate = total > 0 ? static_cast<double>(record.local_hit_block_num) / total : 0.0;
+        size_t total = record.remote_read_blocks + record.local_read_blocks;
+        double remote_rate = total > 0 ? static_cast<double>(record.remote_hit_blocks) / total : 0.0;
+        double local_rate = total > 0 ? static_cast<double>(record.local_hit_blocks) / total : 0.0;
         remote_hit_rates.push_back(remote_rate);
         local_hit_rates.push_back(local_rate);
 
         // per-tier 命中率
         for (size_t t = 0; t < num_tiers; ++t) {
-            size_t tier_hits = (t < record.per_tier_hit_block_num.size()) ? record.per_tier_hit_block_num[t] : 0;
+            size_t tier_hits = (t < record.per_tier_hit_blocks.size()) ? record.per_tier_hit_blocks[t] : 0;
             double t_rate = total > 0 ? static_cast<double>(tier_hits) / total : 0.0;
             tier_hit_rates[t].push_back(t_rate);
             if (tier_hits > 0) {
@@ -128,8 +128,8 @@ void HitRateTracker::ExportHitRates(const std::string &instance_id,
         }
 
         acc_total_read += total;
-        acc_remote_hit += record.remote_hit_block_num;
-        acc_local_hit += record.local_hit_block_num;
+        acc_remote_hit += record.remote_hit_blocks;
+        acc_local_hit += record.local_hit_blocks;
         acc_remote_hit_rates.push_back(acc_total_read > 0 ? static_cast<double>(acc_remote_hit) / acc_total_read : 0.0);
         acc_local_hit_rates.push_back(acc_total_read > 0 ? static_cast<double>(acc_local_hit) / acc_total_read : 0.0);
         for (size_t t = 0; t < num_tiers; ++t) {
@@ -139,14 +139,14 @@ void HitRateTracker::ExportHitRates(const std::string &instance_id,
     }
 
     // ---- 写入 CSV ----
-    file << "TimestampUs,CachedBlockNumCurrentInstance,CachedBlockNumPerInstance,CachedBlockNumAllInstance,"
-            "LocalReadBlockNum,RemoteReadBlockNum,TotalReadBlockNum,LocalHitBlockNum,"
-            "LocalHitRate,RemoteHitBlockNum,RemoteHitRate,HitRate,AccLocalHitRate,AccRemoteHitRate,"
-            "AccHitRate,AccReadBlockNum,AccWriteBlockNum";
+    file << "TimestampNs,CachedBlocksCurrentInstance,CachedBlocksPerInstance,CachedBlocksAllInstance,"
+            "LocalReadBlocks,RemoteReadBlocks,TotalReadBlocks,LocalHitBlocks,"
+            "LocalHitRate,RemoteHitBlocks,RemoteHitRate,HitRate,AccLocalHitRate,AccRemoteHitRate,"
+            "AccHitRate,AccReadBlocks,AccWriteBlocks";
     if (has_tiered_data) {
         for (size_t t = 0; t < num_tiers; ++t) {
             const auto &name = tier_names[t];
-            file << ",Tier" << t << "(" << name << ")_HitBlockNum";
+            file << ",Tier" << t << "(" << name << ")_HitBlocks";
         }
         for (size_t t = 0; t < num_tiers; ++t) {
             const auto &name = tier_names[t];
@@ -169,25 +169,24 @@ void HitRateTracker::ExportHitRates(const std::string &instance_id,
 
     for (size_t i = 0; i < data.read_records.size(); ++i) {
         const auto &r = data.read_records[i];
-        size_t current_read = r.local_read_block_num + r.remote_read_block_num;
+        size_t current_read = r.local_read_blocks + r.remote_read_blocks;
         acc_read_blocks += current_read;
 
         while (write_index < data.write_records.size() &&
-               data.write_records[write_index].timestamp_us <= r.timestamp_us) {
-            acc_write_blocks += data.write_records[write_index].write_block_num;
+               data.write_records[write_index].timestamp_ns <= r.timestamp_ns) {
+            acc_write_blocks += data.write_records[write_index].write_blocks;
             write_index++;
         }
 
-        file << r.timestamp_us << "," << r.current_cache_block_num << "," << JoinVecSizeT(r.block_num_per_instance)
-             << "," << SumVecSizeT(r.block_num_per_instance) << "," << r.local_read_block_num << ","
-             << r.remote_read_block_num << "," << current_read << "," << r.local_hit_block_num << ","
-             << local_hit_rates[i] << "," << r.remote_hit_block_num << "," << remote_hit_rates[i] << ","
-             << (local_hit_rates[i] + remote_hit_rates[i]) << "," << acc_local_hit_rates[i] << ","
-             << acc_remote_hit_rates[i] << "," << (acc_local_hit_rates[i] + acc_remote_hit_rates[i]) << ","
-             << acc_read_blocks << "," << acc_write_blocks;
+        file << r.timestamp_ns << "," << r.current_cache_blocks << "," << JoinVecSizeT(r.blocks_per_instance) << ","
+             << SumVecSizeT(r.blocks_per_instance) << "," << r.local_read_blocks << "," << r.remote_read_blocks << ","
+             << current_read << "," << r.local_hit_blocks << "," << local_hit_rates[i] << "," << r.remote_hit_blocks
+             << "," << remote_hit_rates[i] << "," << (local_hit_rates[i] + remote_hit_rates[i]) << ","
+             << acc_local_hit_rates[i] << "," << acc_remote_hit_rates[i] << ","
+             << (acc_local_hit_rates[i] + acc_remote_hit_rates[i]) << "," << acc_read_blocks << "," << acc_write_blocks;
         if (has_tiered_data) {
             for (size_t t = 0; t < num_tiers; ++t) {
-                size_t hits = (t < r.per_tier_hit_block_num.size()) ? r.per_tier_hit_block_num[t] : 0;
+                size_t hits = (t < r.per_tier_hit_blocks.size()) ? r.per_tier_hit_blocks[t] : 0;
                 file << "," << hits;
             }
             for (size_t t = 0; t < num_tiers; ++t) {
@@ -197,7 +196,7 @@ void HitRateTracker::ExportHitRates(const std::string &instance_id,
                 file << "," << acc_tier_hit_rates[t][i];
             }
             for (size_t t = 0; t < num_tiers; ++t) {
-                size_t blocks = (t < r.per_tier_block_num.size()) ? r.per_tier_block_num[t] : 0;
+                size_t blocks = (t < r.per_tier_blocks.size()) ? r.per_tier_blocks[t] : 0;
                 file << "," << blocks;
             }
         }

@@ -117,8 +117,8 @@ bool StandardTraceLoader::ValidateTrace(const OptimizerSchemaTrace &trace) {
         KVCM_LOG_ERROR("Validation failed: empty instance_id");
         return false;
     }
-    if (trace.timestamp_us() <= 0) {
-        KVCM_LOG_ERROR("Validation failed: invalid timestamp_us");
+    if (trace.timestamp_ns() <= 0) {
+        KVCM_LOG_ERROR("Validation failed: invalid timestamp_ns");
         return false;
     }
     if (trace.keys().empty()) {

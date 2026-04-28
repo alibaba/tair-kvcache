@@ -53,6 +53,7 @@ MARKERS = ["o", "s", "^", "D", "v", "<", ">", "p", "h", "*"]
 def plot_single_policy_curves(
     results: List[dict],
     output_dir: str,
+    bytes_per_block_map: Dict[str, int],
     hit_rate_type: str = "total",
     title: str = None,
     axis_limits: dict = None,
@@ -61,21 +62,24 @@ def plot_single_policy_curves(
     绘制单策略的容量-命中率散点图，每个 instance 一条曲线。
 
     Args:
-        results:       [{"capacity": int, "instances": {...}}, ...]
-        output_dir:    图片根输出目录，图表保存至 output_dir/pareto/
-        hit_rate_type: "total" | "local" | "remote"
-        title:         图标题（None 则自动生成）
-        axis_limits:   {"x_min", "x_max", "y_min", "y_max"}，None 表示不限制
+        results:             [{"capacity": int, "instances": {...}}, ...]
+        output_dir:          图片根输出目录，图表保存至 output_dir/pareto/
+        bytes_per_block_map: {instance_id: bytes_per_block}，用于容量 blocks → GB 转换
+        hit_rate_type:       "total" | "local" | "remote"
+        title:               图标题（None 则自动生成）
+        axis_limits:         {"x_min", "x_max", "y_min", "y_max"}，单位 GB；None 表示不限制
     """
     if not results:
         print("No data to plot!")
         return
 
     instance_ids = list(results[0]["instances"].keys())
+    rep_bpb = next(iter(bytes_per_block_map.values()))
     plt.figure(figsize=(12, 8))
 
     for idx, iid in enumerate(instance_ids):
-        caps = [r["capacity"] for r in results if iid in r["instances"]]
+        bpb = bytes_per_block_map.get(iid, rep_bpb)
+        caps = [r["capacity"] * bpb / (1024 ** 3) for r in results if iid in r["instances"]]
         rates = [r["instances"][iid][hit_rate_type] for r in results if iid in r["instances"]]
         if not caps:
             continue
@@ -84,7 +88,7 @@ def plot_single_policy_curves(
                     marker=MARKERS[idx % len(MARKERS)],
                     s=1, label=iid, alpha=0.8)
 
-    plt.xlabel("Cache Capacity (blocks)", fontsize=12)
+    plt.xlabel("Cache Capacity (GB)", fontsize=12)
     plt.ylabel(f"{hit_rate_type.capitalize()} Hit Rate", fontsize=12)
     plt.title(title or f"KVCache Trade-off Curve - {hit_rate_type.capitalize()} Hit Rate", fontsize=14)
     plt.legend(loc="lower right", fontsize=10)
@@ -113,15 +117,17 @@ def plot_single_policy_curves(
 def plot_multi_policy_subplots(
     results_by_policy: Dict[str, List[dict]],
     output_dir: str,
+    bytes_per_block_map: Dict[str, int],
     hit_rate_type: str = "total",
 ):
     """
     多策略对比：每个 instance 一个子图，每个子图里每条策略一条曲线。
 
     Args:
-        results_by_policy: {"policy": [{"capacity", "instances"}, ...]}
-        output_dir:        图片根输出目录，图表保存至 output_dir/pareto/
-        hit_rate_type:     "total" | "local" | "remote"
+        results_by_policy:   {"policy": [{"capacity", "instances"}, ...]}
+        output_dir:          图片根输出目录，图表保存至 output_dir/pareto/
+        bytes_per_block_map: {instance_id: bytes_per_block}，用于存储量 blocks → GB 转换
+        hit_rate_type:       "total" | "local" | "remote"
     """
     if not results_by_policy:
         print("No data to plot!")
@@ -134,7 +140,7 @@ def plot_multi_policy_subplots(
     for policy, results in results_by_policy.items():
         for r in results:
             for iid, metrics in r["instances"].items():
-                plot_data[iid][policy]["storage"].append(metrics["cached_block_num_all"])
+                plot_data[iid][policy]["storage"].append(metrics["cached_gb"])
                 plot_data[iid][policy]["hit_rates"].append(metrics[hit_rate_type])
 
     instance_ids = sorted(plot_data.keys())
@@ -167,7 +173,7 @@ def plot_multi_policy_subplots(
                        color=COLORS[pi % len(COLORS)],
                        marker=MARKERS[pi % len(MARKERS)],
                        s=1, alpha=0.8)
-        ax.set_xlabel("Group Total Storage (blocks)", fontsize=11)
+        ax.set_xlabel("Group Total Storage (GB)", fontsize=11)
         ax.set_ylabel(f"{hit_rate_type.capitalize()} Hit Rate", fontsize=11)
         ax.set_ylim(0, 1.05)
         ax.grid(True, alpha=0.3, linestyle="--")
@@ -198,6 +204,7 @@ def plot_multi_policy_subplots(
 def plot_per_tier_curves(
     results: List[dict],
     output_dir: str,
+    bytes_per_block_map: Optional[Dict[str, int]] = None,
     title: str = None,
     axis_limits: dict = None,
 ):
@@ -205,11 +212,13 @@ def plot_per_tier_curves(
     绘制 per-tier 命中率对比曲线，所有层放在一起。
 
     Args:
-        results:       [{"capacity": int, "instances": {...}}, ...]
-                       每个 instance 的 metrics 需包含 tier_names, acc_tier_hit_rates
-        output_dir:    图片根输出目录，图表保存至 output_dir/pareto/
-        title:         图标题（None 则自动生成）
-        axis_limits:   {"x_min", "x_max", "y_min", "y_max"}，None 表示不限制
+        results:             [{"capacity": int, "instances": {...}}, ...]
+                             每个 instance 的 metrics 需包含 tier_names, acc_tier_hit_rates
+        output_dir:          图片根输出目录，图表保存至 output_dir/pareto/
+        bytes_per_block_map: {instance_id: bytes_per_block}，用于容量 blocks → GB 转换；
+                             为 None 时降级使用 blocks 单位
+        title:               图标题（None 则自动生成）
+        axis_limits:         {"x_min", "x_max", "y_min", "y_max"}，单位 GB；None 表示不限制
     """
     if not results:
         print("No data to plot!")
@@ -256,6 +265,12 @@ def plot_per_tier_curves(
             if not caps:
                 continue
             
+            # blocks → GB 转换（降级：无 bytes_per_block_map 时保持 blocks）
+            if bytes_per_block_map:
+                rep_bpb = next(iter(bytes_per_block_map.values()))
+                bpb = bytes_per_block_map.get(iid, rep_bpb)
+                caps = [c * bpb / (1024 ** 3) for c in caps]
+
             # 使用不同的颜色和标记区分 tier
             # 同一个 tier 在不同 instance 上用相同颜色，但用透明度区分
             alpha = 0.3 + 0.7 * (1.0 - idx / max(len(instance_ids) - 1, 1))
@@ -266,7 +281,8 @@ def plot_per_tier_curves(
                        label=f"{tier_name}" if idx == 0 else None,  # 只在第一个 instance 添加 legend
                        alpha=min(alpha, 0.9))
     
-    plt.xlabel("Cache Capacity (blocks)", fontsize=12)
+    x_label = "Cache Capacity (GB)" if bytes_per_block_map else "Cache Capacity (blocks)"
+    plt.xlabel(x_label, fontsize=12)
     plt.ylabel("Hit Rate", fontsize=12)
     plt.title(title or "Per-Tier Hit Rate vs Cache Capacity", fontsize=14)
     plt.legend(loc="lower right", fontsize=10)

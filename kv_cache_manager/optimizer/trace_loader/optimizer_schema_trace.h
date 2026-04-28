@@ -11,7 +11,23 @@ public:
     bool FromRapidValue(const rapidjson::Value &rapid_value) override {
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "instance_id", instance_id_, std::string(""));
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "trace_id", trace_id_, std::string(""));
-        KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "timestamp_us", timestamp_us_, int64_t(0));
+        // Optimizer 读 trace 入口：可含 timestamp_ns，或旧数据 timestamp_us（微秒→×1000）；之后全用纳秒
+        timestamp_ns_ = 0;
+        if (rapid_value.HasMember("timestamp_ns")) {
+            const auto &v = rapid_value["timestamp_ns"];
+            if (v.IsInt64()) {
+                timestamp_ns_ = v.GetInt64();
+            } else if (v.IsUint64()) {
+                timestamp_ns_ = static_cast<int64_t>(v.GetUint64());
+            }
+        } else if (rapid_value.HasMember("timestamp_us")) {
+            const auto &v = rapid_value["timestamp_us"];
+            if (v.IsInt64()) {
+                timestamp_ns_ = v.GetInt64() * 1000;
+            } else if (v.IsUint64()) {
+                timestamp_ns_ = static_cast<int64_t>(v.GetUint64()) * 1000;
+            }
+        }
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "tokens", tokens_, std::vector<int64_t>{});
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "keys", keys_, std::vector<int64_t>{});
         return true;
@@ -19,7 +35,7 @@ public:
     void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override {
         Put(writer, "instance_id", instance_id_);
         Put(writer, "trace_id", trace_id_);
-        Put(writer, "timestamp_us", timestamp_us_);
+        Put(writer, "timestamp_ns", timestamp_ns_);
         Put(writer, "tokens", tokens_);
         Put(writer, "keys", keys_);
     };
@@ -27,19 +43,19 @@ public:
 public:
     const std::string &instance_id() const { return instance_id_; }
     const std::string &trace_id() const { return trace_id_; }
-    int64_t timestamp_us() const { return timestamp_us_; }
+    int64_t timestamp_ns() const { return timestamp_ns_; }
     const std::vector<int64_t> &keys() const { return keys_; }
     const std::vector<int64_t> &tokens() const { return tokens_; }
     void set_instance_id(const std::string &instance_id) { instance_id_ = instance_id; }
     void set_trace_id(const std::string &trace_id) { trace_id_ = trace_id; }
-    void set_timestamp_us(int64_t timestamp_us) { timestamp_us_ = timestamp_us; }
+    void set_timestamp_ns(int64_t timestamp_ns) { timestamp_ns_ = timestamp_ns; }
     void set_keys(const std::vector<int64_t> &keys) { keys_ = keys; }
     void set_tokens(const std::vector<int64_t> &tokens) { tokens_ = tokens; }
 
 private:
     std::string instance_id_;
     std::string trace_id_;
-    int64_t timestamp_us_;
+    int64_t timestamp_ns_;
     std::vector<int64_t> keys_;
     std::vector<int64_t> tokens_;
 };
@@ -127,7 +143,7 @@ public:
     explicit DialogTurnSchemaTrace(const GetLocationSchemaTrace &other) {
         // 复制基类GetLocationSchemaTrace的成员
         set_instance_id(other.instance_id());
-        set_timestamp_us(other.timestamp_us());
+        set_timestamp_ns(other.timestamp_ns());
         set_keys(other.keys());
         set_tokens(other.tokens());
         set_query_type(other.query_type());
@@ -143,7 +159,7 @@ public:
     explicit DialogTurnSchemaTrace(const std::shared_ptr<GetLocationSchemaTrace> &other_ptr) {
         // 复制基类GetLocationSchemaTrace的成员
         set_instance_id(other_ptr->instance_id());
-        set_timestamp_us(other_ptr->timestamp_us());
+        set_timestamp_ns(other_ptr->timestamp_ns());
         set_keys(other_ptr->keys());
         set_tokens(other_ptr->tokens());
         set_query_type(other_ptr->query_type());

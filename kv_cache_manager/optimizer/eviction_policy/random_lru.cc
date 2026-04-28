@@ -16,7 +16,8 @@ RandomLruEvictionPolicy::~RandomLruEvictionPolicy() { block_to_index_.clear(); }
 
 void RandomLruEvictionPolicy::OnBlockWritten(BlockEntry *block) {
     blocks_.push_back(block);
-    timestamps_.push_back(block->last_access_time);
+    // 读取本 tier 的 TierStat.last_access_time，各层独立
+    timestamps_.push_back(GetTierAccessTime(block));
     block_to_index_[block] = blocks_.size() - 1;
 }
 void RandomLruEvictionPolicy::OnNodeWritten(std::vector<BlockEntry *> &blocks) {

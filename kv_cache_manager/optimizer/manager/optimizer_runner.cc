@@ -42,17 +42,17 @@ void OptimizerRunner::RunTrace(std::shared_ptr<OptimizerSchemaTrace> trace) {
             return;
         }
         HandleDialogTurn(*turn_trace);
-        stats_collector_->UpdateTimestamp(turn_trace->instance_id(), turn_trace->timestamp_us());
+        stats_collector_->UpdateTimestamp(turn_trace->instance_id(), turn_trace->timestamp_ns());
     } else if (auto get_trace = std::dynamic_pointer_cast<GetLocationSchemaTrace>(trace)) {
         if (get_trace->query_type() != "prefix_match") {
             KVCM_LOG_WARN("Unsupported query type: %s", get_trace->query_type().c_str());
             return;
         }
         HandleGetLocation(*get_trace);
-        stats_collector_->UpdateTimestamp(get_trace->instance_id(), get_trace->timestamp_us());
+        stats_collector_->UpdateTimestamp(get_trace->instance_id(), get_trace->timestamp_ns());
     } else if (auto write_trace = std::dynamic_pointer_cast<WriteCacheSchemaTrace>(trace)) {
         HandleWriteCache(*write_trace);
-        stats_collector_->UpdateTimestamp(write_trace->instance_id(), write_trace->timestamp_us());
+        stats_collector_->UpdateTimestamp(write_trace->instance_id(), write_trace->timestamp_ns());
     } else {
         KVCM_LOG_WARN("Unknown trace type, skipping");
     }
@@ -67,30 +67,30 @@ std::shared_ptr<RadixTreeIndex> OptimizerRunner::GetIndexer(const std::string &i
 }
 
 void OptimizerRunner::SubmitReadRecord(const std::string &instance_id,
-                                       int64_t timestamp_us,
+                                       int64_t timestamp_ns,
                                        const QueryHit &query_hit,
                                        const std::shared_ptr<RadixTreeIndex> &indexer,
                                        size_t local_read_block_num,
                                        size_t remote_read_block_num) {
     ReadRecord record{};
-    record.timestamp_us = timestamp_us;
-    record.current_cache_block_num = eviction_manager_->GetCurrentInstanceUsage(instance_id);
+    record.timestamp_ns = timestamp_ns;
+    record.current_cache_blocks = eviction_manager_->GetCurrentInstanceUsage(instance_id);
 
     auto indexer_map = indexer_manager_->GetAllOptIndexers();
-    record.block_num_per_instance.resize(indexer_map.size(), 0);
+    record.blocks_per_instance.resize(indexer_map.size(), 0);
     size_t idx = 0;
     for (const auto &pair : indexer_map) {
-        record.block_num_per_instance[idx] = eviction_manager_->GetCurrentInstanceUsage(pair.first);
+        record.blocks_per_instance[idx] = eviction_manager_->GetCurrentInstanceUsage(pair.first);
         idx++;
     }
 
-    record.remote_hit_block_num = query_hit.remote_hit_block_num;
-    record.local_hit_block_num = query_hit.local_hit_block_num;
-    record.per_tier_hit_block_num = query_hit.per_tier_hit_block_num;
+    record.remote_hit_blocks = query_hit.remote_hit_block_num;
+    record.local_hit_blocks = query_hit.local_hit_block_num;
+    record.per_tier_hit_blocks = query_hit.per_tier_hit_block_num;
     record.tier_names = indexer->GetTierNames();
-    record.per_tier_block_num = eviction_manager_->GetCurrentInstanceUsagePerTier(instance_id);
-    record.local_read_block_num = local_read_block_num;
-    record.remote_read_block_num = remote_read_block_num;
+    record.per_tier_blocks = eviction_manager_->GetCurrentInstanceUsagePerTier(instance_id);
+    record.local_read_blocks = local_read_block_num;
+    record.remote_read_blocks = remote_read_block_num;
 
     stats_collector_->OnReadComplete(instance_id, record);
 }
@@ -103,7 +103,7 @@ void OptimizerRunner::HandleGetLocation(const GetLocationSchemaTrace &trace) {
     }
 
     QueryHit query_hit;
-    indexer->PrefixQuery(trace.keys(), trace.block_mask(), trace.timestamp_us(), &query_hit);
+    indexer->PrefixQuery(trace.keys(), trace.block_mask(), trace.timestamp_ns(), &query_hit);
 
     size_t local_read_block_num = 0;
     if (std::holds_alternative<BlockMaskVector>(trace.block_mask())) {
@@ -115,7 +115,7 @@ void OptimizerRunner::HandleGetLocation(const GetLocationSchemaTrace &trace) {
     size_t remote_read_block_num = trace.keys().size() - local_read_block_num;
 
     SubmitReadRecord(
-        instance_id, trace.timestamp_us(), query_hit, indexer, local_read_block_num, remote_read_block_num);
+        instance_id, trace.timestamp_ns(), query_hit, indexer, local_read_block_num, remote_read_block_num);
 }
 
 void OptimizerRunner::HandleWriteCache(const WriteCacheSchemaTrace &trace) {
@@ -125,16 +125,18 @@ void OptimizerRunner::HandleWriteCache(const WriteCacheSchemaTrace &trace) {
         return;
     }
 
-    auto result = indexer->InsertOnly(trace.keys(), trace.timestamp_us());
-    bool evicted = indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_us());
+    auto result = indexer->InsertOnly(trace.keys(), trace.timestamp_ns());
+    bool evicted = indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_ns());
     if (evicted) {
-        KVCM_LOG_DEBUG("Eviction in %zu to instance_id: %s", trace.timestamp_us(), instance_id.c_str());
+        KVCM_LOG_DEBUG("Eviction at ts=%lld for instance_id: %s",
+                       static_cast<long long>(trace.timestamp_ns()),
+                       instance_id.c_str());
     }
 
     WriteRecord record;
-    record.timestamp_us = trace.timestamp_us();
-    record.write_block_num = trace.keys().size();
-    record.newly_inserted_block_num = result.inserted_keys.size();
+    record.timestamp_ns = trace.timestamp_ns();
+    record.write_blocks = trace.keys().size();
+    record.newly_inserted_blocks = result.inserted_keys.size();
     record.trace_id = trace.trace_id();
     stats_collector_->OnWriteComplete(instance_id, record);
 }
@@ -147,13 +149,13 @@ void OptimizerRunner::HandleDialogTurn(const DialogTurnSchemaTrace &trace) {
     }
 
     QueryHit query_hit;
-    indexer->InsertWithQuery(trace.total_keys(), trace.timestamp_us(), &query_hit);
-    indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_us());
+    indexer->InsertWithQuery(trace.total_keys(), trace.timestamp_ns(), &query_hit);
+    indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_ns());
 
-    SubmitReadRecord(instance_id, trace.timestamp_us(), query_hit, indexer, 0, trace.keys().size());
+    SubmitReadRecord(instance_id, trace.timestamp_ns(), query_hit, indexer, 0, trace.keys().size());
 
     size_t decode_block_num = trace.total_keys().size() - trace.keys().size();
-    WriteRecord write_record{trace.timestamp_us(), decode_block_num, decode_block_num};
+    WriteRecord write_record{trace.timestamp_ns(), decode_block_num, decode_block_num};
     stats_collector_->OnWriteComplete(instance_id, write_record);
 }
 } // namespace kv_cache_manager

@@ -40,24 +40,35 @@ public:
                                                        const std::vector<OptTierConfig> &storage_configs,
                                                        bool hierarchical_eviction_enabled = false);
 
-    // 统一驱逐入口，内部根据 hierarchical_eviction_enabled 处理分层/非分层逻辑
+    // 统一驱逐入口，内部根据 hierarchical_eviction_enabled 与 tier_write_mode 处理分层/非分层逻辑
+    // eviction_timestamp 仅在 cascading 降级时用来写入新 tier 的 TierStat，其他分支不使用
     std::unordered_map<std::string, std::vector<BlockEntry *>>
-    EvictByMode(const std::string &instance_id, const OptInstanceGroupConfig &instance_group_config);
+    EvictByMode(const std::string &instance_id,
+                const OptInstanceGroupConfig &instance_group_config,
+                int64_t eviction_timestamp);
 
     // ---- 用量查询接口 ----
 
-    // 统一超额计算：tier_idx 有值表示分层(对标 storages[tier_idx].capacity)，nullopt 表示非分层(对标 quota_capacity)
+    // 统一超额计算(bytes)：tier_idx 有值表示分层(对标 storages[tier_idx].capacity)，nullopt 表示非分层(对标
+    // quota_capacity)
     size_t GetExcessUsage(const OptInstanceGroupConfig &instance_group_config, std::optional<size_t> tier_idx) const;
 
-    // Group 用量：tier_idx 有值表示指定 tier 的用量，nullopt 表示 shared_policy 用量
-    size_t GetCurrentGroupUsage(const OptInstanceGroupConfig &instance_group_config,
-                                std::optional<size_t> tier_idx = std::nullopt) const;
+    // Group 用量(bytes)：tier_idx 有值表示指定 tier 的用量，nullopt 表示 shared_policy 用量
+    size_t GetCurrentGroupUsageBytes(const OptInstanceGroupConfig &instance_group_config,
+                                     std::optional<size_t> tier_idx = std::nullopt) const;
 
     // Instance 用量：物理存储总占用（累加所有 tier）
     size_t GetCurrentInstanceUsage(const std::string &instance_id) const;
 
     // Instance per-tier 用量明细
     std::vector<size_t> GetCurrentInstanceUsagePerTier(const std::string &instance_id) const;
+
+    // 级联降级：将 blocks 写入 tier_{next_idx} 的 location_map + LRU 队列
+    // 只跟 tier 级统计打交道，不触碰 BlockEntry 的跨层连续字段（access_count / last_access_time / writing_time）
+    void DemoteToNextTier(const std::string &instance_id,
+                          size_t next_tier_idx,
+                          const std::vector<BlockEntry *> &blocks,
+                          int64_t timestamp);
 
 private:
     // 驱逐模式分发：根据 eviction_mode 调用对应的驱逐实现
@@ -69,7 +80,7 @@ private:
 
     // 驱逐核心实现
     // tier_idx: nullopt 表示非分层模式(使用 shared_policy)，有值表示分层模式(使用 policies[tier_idx])
-    // excess: 需要驱逐的 block 数量
+    // excess: 需要驱逐的 bytes 数量
     std::unordered_map<std::string, std::vector<BlockEntry *>> EvictByGroupRough(
         const OptInstanceGroupConfig &instance_group_config, std::optional<size_t> tier_idx, size_t excess);
     // precise=false: 每轮固定 batch size; precise=true: 每轮 cap 到剩余所需数量

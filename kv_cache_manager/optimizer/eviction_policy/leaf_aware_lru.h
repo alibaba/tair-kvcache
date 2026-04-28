@@ -13,12 +13,6 @@ private:
     LruParams params_;
     struct LeafLRUListNode : public LinkedListNode {
         BlockEntry *payload_;
-        int64_t priority() const { return -payload_->last_access_time; }
-        static bool compare(const LinkedListNode *a, const LinkedListNode *b) {
-            const LeafLRUListNode *node_a = static_cast<const LeafLRUListNode *>(a);
-            const LeafLRUListNode *node_b = static_cast<const LeafLRUListNode *>(b);
-            return node_a->priority() > node_b->priority();
-        }
     };
     LinkedList leaf_lru_list_;
     std::unordered_map<BlockEntry *, LeafLRUListNode *> node_map_;

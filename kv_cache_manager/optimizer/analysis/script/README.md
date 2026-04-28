@@ -51,6 +51,8 @@ bazel run //kv_cache_manager/optimizer/analysis/script:optimizer_run -- -c confi
 
 在多个容量点上运行 optimizer，绘制容量-命中率权衡曲线。自动判断单策略/多策略模式。
 
+> **适用范围**：Tradeoff 分析仅适用于非分层模式。在分层模式（`hierarchical_eviction_enabled=true`）下，容量扫描仅修改 `quota_capacity`，而驱逐决策依据各 tier 独立的 `storages[i].capacity`，因此扫描结果无法反映真实的容量-性能权衡关系。
+
 ### 单策略模式
 
 不指定 `--eviction-policies`，使用配置文件中的默认策略。每个 instance 一条曲线。
@@ -97,7 +99,7 @@ bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
 |------|------|------|------|
 | `-c, --config` | ✅ | — | 配置文件路径 |
 | `--eviction-policies` | — | 配置默认 | 驱逐策略列表（空格分隔） |
-| `--warmup-capacity` | — | 30000000 | warmup 阶段容量 |
+| `--warmup-capacity` | — | 10000 | warmup 阶段容量（GB） |
 | `--num-points` | — | 40 | 容量采样点数（指数分布） |
 | `--hit-rate-type` | — | total | 命中率类型：total / internal / external / all |
 | `--max-workers` | — | 4 | 并行实验线程数 |

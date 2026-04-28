@@ -92,7 +92,7 @@ class QwenBailianConverter(BaseConverter):
                     continue
 
         # 按timestamp排序（保证输出有序）
-        traces.sort(key=lambda t: t.get('timestamp_us', 0))
+        traces.sort(key=lambda t: t.get("timestamp_ns", 0))
 
         return traces
 
@@ -115,19 +115,19 @@ class QwenBailianConverter(BaseConverter):
         Returns:
             [Get trace, Write trace]
         """
-        base_timestamp_us = int(timestamp * 1000000)
+        base_timestamp_ns = int(timestamp * 1_000_000_000)
 
         # hash_ids本身就是input的完整block keys,直接使用
         # Get trace (prefill阶段) - 显式使用default_instance_id
         get_trace = self._create_get_trace(
-            timestamp_us=base_timestamp_us,
+            timestamp_ns=base_timestamp_ns,
             keys=block_keys,
             instance_id=self.default_instance_id
         )
 
-        # Write trace (prefill阶段, 时间戳+1微秒) - 显式使用default_instance_id
+        # Write trace (prefill阶段, 时间戳+1纳秒) - 显式使用default_instance_id
         write_trace = self._create_write_trace(
-            timestamp_us=base_timestamp_us + 1,
+            timestamp_ns=base_timestamp_ns + 1,
             keys=block_keys,
             instance_id=self.default_instance_id
         )
@@ -153,12 +153,12 @@ class QwenBailianConverter(BaseConverter):
         Returns:
             DialogTurn trace
         """
-        base_timestamp_us = int(timestamp * 1000000)
+        base_timestamp_ns = int(timestamp * 1_000_000_000)
 
         # hash_ids本身就是input的完整block keys,直接使用
         # DialogTurn trace - 显式使用default_instance_id
         dialog_trace = self._create_dialog_trace(
-            timestamp_us=base_timestamp_us,
+            timestamp_ns=base_timestamp_ns,
             keys=block_keys,
             input_len=input_length,
             output_len=output_length,

@@ -34,6 +34,7 @@ OptInstanceConfig OptEvictionManagerTest::CreateTestInstanceConfig(const std::st
     config.set_instance_id(instance_id);
     config.set_instance_group_name("test_group");
     config.set_block_size(1024);
+    config.set_bytes_per_token(1); // bytes_per_block = block_size * bytes_per_token = 1024
     LruParams params;
     params.sample_rate = 1.0; // 采样率100%
     EvictionPolicyParam policy_param;
@@ -77,6 +78,7 @@ OptInstanceGroupConfig OptEvictionManagerTest::CreateTestInstanceGroupConfig() {
     instance1.set_instance_id("instance1");
     instance1.set_instance_group_name("test_group");
     instance1.set_block_size(1024);
+    instance1.set_bytes_per_token(1); // bytes_per_block = 1024
     LruParams params;
     params.sample_rate = 1.0;
     EvictionPolicyParam policy_param;
@@ -198,7 +200,7 @@ TEST_F(OptEvictionManagerTest, GetCurrentInstanceUsage) {
     EXPECT_GT(usage, 0);
 }
 
-TEST_F(OptEvictionManagerTest, GetCurrentGroupUsage) {
+TEST_F(OptEvictionManagerTest, GetCurrentGroupUsageBytes) {
     auto instance_config1 = CreateTestInstanceConfig("instance1");
     auto instance_config2 = CreateTestInstanceConfig("instance2");
     auto tier_configs = CreateTestTierConfigs();
@@ -211,7 +213,7 @@ TEST_F(OptEvictionManagerTest, GetCurrentGroupUsage) {
     ASSERT_NE(pg2, nullptr);
 
     // 初始使用量为0
-    auto usage = manager_->GetCurrentGroupUsage(instance_group_config);
+    auto usage = manager_->GetCurrentGroupUsageBytes(instance_group_config);
     EXPECT_EQ(usage, 0);
 
     // 给instance1添加块
@@ -235,7 +237,7 @@ TEST_F(OptEvictionManagerTest, GetCurrentGroupUsage) {
     }
 
     // 组使用量应该等于两个实例使用量之和
-    usage = manager_->GetCurrentGroupUsage(instance_group_config);
+    usage = manager_->GetCurrentGroupUsageBytes(instance_group_config);
     EXPECT_GT(usage, 0);
 }
 

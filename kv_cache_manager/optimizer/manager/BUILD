@@ -40,5 +40,6 @@ cc_library(
         "//kv_cache_manager/optimizer/eviction_policy",
         "//kv_cache_manager/common:logger",
         "//kv_cache_manager/optimizer/config",
+        "//kv_cache_manager/optimizer/index",
     ],
 )

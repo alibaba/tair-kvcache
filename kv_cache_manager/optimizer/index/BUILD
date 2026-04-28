@@ -13,7 +13,6 @@ cc_library(
         "//kv_cache_manager/manager:cache_location",
         "//kv_cache_manager/optimizer/config",
         "//kv_cache_manager/optimizer/trace_loader",
-        "//kv_cache_manager/optimizer/manager:eviction_manager",
         "//kv_cache_manager/optimizer/analysis",
     ],
 )

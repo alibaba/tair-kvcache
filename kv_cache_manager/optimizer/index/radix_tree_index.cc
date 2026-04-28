@@ -13,12 +13,17 @@ namespace kv_cache_manager {
 
 // 新构造函数 (多 tier)
 RadixTreeIndex::RadixTreeIndex(const std::string &instance_id,
-                               std::vector<std::shared_ptr<EvictionPolicy>> tier_policies) {
+                               std::vector<std::shared_ptr<EvictionPolicy>> tier_policies,
+                               TierWriteMode write_mode) {
     root_ = std::make_unique<RadixTreeNode>();
     tier_policies_ = std::move(tier_policies);
     for (auto &p : tier_policies_) {
         tier_names_.push_back(p->name());
     }
+    write_mode_ = write_mode;
+    // CASCADING 且多层时仅落 tier 0；其余情形（WRITE_THROUGH 或单层）落全部
+    write_tier_count_ =
+        (write_mode_ == TierWriteMode::CASCADING && tier_policies_.size() > 1) ? 1 : tier_policies_.size();
     instance_id_ = instance_id;
 }
 
@@ -27,6 +32,7 @@ RadixTreeIndex::RadixTreeIndex(const std::string &instance_id, const std::shared
     root_ = std::make_unique<RadixTreeNode>();
     tier_policies_.push_back(eviction_policy);
     tier_names_.push_back(eviction_policy->name());
+    write_tier_count_ = 1;
     instance_id_ = instance_id;
 }
 
@@ -348,9 +354,9 @@ RadixTreeIndex::AppendNewBlocks(RadixTreeNode *node, const std::vector<int64_t> 
         entry->last_access_time = timestamp;
         entry->owner_node = node;
         BlockEntry *entry_ptr = entry.get();
-        // Write-through: 为所有 tier 写入 location
-        for (const auto &name : tier_names_) {
-            AppendBlockLocation(entry_ptr, name, timestamp);
+        // 根据写入模式落到对应 tier：WRITE_THROUGH=全部层，CASCADING=仅 tier 0
+        for (size_t t = 0; t < write_tier_count_; ++t) {
+            AppendBlockLocation(entry_ptr, tier_names_[t], timestamp);
         }
         node->blocks.emplace_back(std::move(entry));
         inserted_blocks.push_back(entry_ptr);
@@ -383,9 +389,9 @@ RadixTreeIndex::WriteModify RadixTreeIndex::AppendEvictBlocks(std::unordered_map
                 BlockEntry *block = it->second;
                 block->writing_time = timestamp;
                 block->last_access_time = timestamp;
-                // Write-through: 恢复所有 tier 的 location
-                for (const auto &name : tier_names_) {
-                    AppendBlockLocation(block, name, timestamp);
+                // 根据写入模式恢复到对应 tier：WRITE_THROUGH=全部层，CASCADING=仅 tier 0
+                for (size_t t = 0; t < write_tier_count_; ++t) {
+                    AppendBlockLocation(block, tier_names_[t], timestamp);
                 }
                 revived_blocks.push_back(block);
 
@@ -411,9 +417,9 @@ void RadixTreeIndex::WriteToTier(RadixTreeNode *node,
         inserted_blocks = cb(block_keys, timestamp);
     }
     node->stat.last_access_time = timestamp;
-    // Write-through: 注册到所有 tier 的驱逐队列
-    for (auto &policy : tier_policies_) {
-        policy->OnNodeWritten(inserted_blocks);
+    // 根据写入模式注册到对应 tier 的驱逐队列：WRITE_THROUGH=所有层，CASCADING=仅 tier 0
+    for (size_t t = 0; t < write_tier_count_; ++t) {
+        tier_policies_[t]->OnNodeWritten(inserted_blocks);
     }
 }
 
@@ -422,14 +428,19 @@ void RadixTreeIndex::OnBlockAccessed(BlockEntry *block, int64_t timestamp) {
     block->access_count += 1;
     block->last_access_time = timestamp;
 
-    // 遍历所有 tier，如果 block 在该 tier 中存在，则更新策略和 per-tier 统计
+    // 遍历所有 tier：last_access_time 对所有持有副本的 tier 都刷新（冷热信号）
+    // access_count 仅对“首个命中层”+1（分层读优先读快层，tier 索引最小的持有层视为命中层）
+    bool first_hit = true;
     for (size_t i = 0; i < tier_policies_.size(); ++i) {
         const auto &tier_name = tier_names_[i];
         auto loc_it = block->location_map.find(tier_name);
         if (loc_it != block->location_map.end()) {
             tier_policies_[i]->OnBlockAccessed(block, timestamp);
-            loc_it->second.access_count += 1;
             loc_it->second.last_access_time = timestamp;
+            if (first_hit) {
+                loc_it->second.access_count += 1;
+                first_hit = false;
+            }
         }
     }
 }

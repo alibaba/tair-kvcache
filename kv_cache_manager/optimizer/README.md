@@ -186,7 +186,7 @@ bazel run //kv_cache_manager/optimizer/analysis/script:visualize_tree -- \
 ```bash
 bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff_analysis_run_by_instances -- \
     -c /path/to/config.json \
-    --warmup-capacity 30000000 \
+    --warmup-capacity 10000 \
     --num-points 40 \
     --hit-rate-type total \
     --max-workers 4
@@ -194,7 +194,7 @@ bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff_analysis_run_by_
 
 **参数说明**：
 - `-c, --config` - 配置文件路径
-- `--warmup-capacity` - Warmup 阶段使用的大容量（默认 30000000）
+- `--warmup-capacity` - Warmup 阶段使用的大容量，单位 GB（默认 10000）
 - `--num-points` - 容量采样点数量（默认 40）
 - `--hit-rate-type` - 命中率类型：total/internal/external/all（默认 total）
 - `--max-workers` - 并行执行的最大线程数（默认 4）
@@ -208,7 +208,7 @@ bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff_analysis_run_by_
 ```bash
 bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff_analysis_run_by_policies -- \
     -c /path/to/config.json \
-    --warmup-capacity 30000000 \
+    --warmup-capacity 10000 \
     --eviction-policies lru random_lru leaf_aware_lru \
     --num-points 40 \
     --hit-rate-type total \
@@ -217,7 +217,7 @@ bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff_analysis_run_by_
 
 **参数说明**：
 - `-c, --config` - 配置文件路径
-- `--warmup-capacity` - Warmup 阶段使用的大容量（默认 30000000）
+- `--warmup-capacity` - Warmup 阶段使用的大容量，单位 GB（默认 10000）
 - `--eviction-policies` - 要对比的驱逐策略列表（默认 lru random_lru leaf_aware_lru）
 - `--num-points` - 容量采样点数量（默认 40）
 - `--hit-rate-type` - 命中率类型：total/internal/external/all（默认 total）
@@ -263,6 +263,8 @@ optimizer.ClearAllCachesAndResetStats()           # 清空所有实例并重置�
 |------|------|
 | eviction_mode | 驱逐模式：1=GROUP_ROUGH, 2=INSTANCE_ROUGH, 3=INSTANCE_PRECISE |
 | eviction_policy_type | 驱逐策略类型：lru、random_lru、leaf_aware_lru |
+| hierarchical_eviction_enabled | 是否开启分层驱逐（各 tier 独立容量与独立驱逐策略）；`false` 时所有 tier 共享一个 `shared` 策略与 `quota_capacity` 配额（GB） |
+| tier_write_mode | 仅在 `hierarchical_eviction_enabled=true` 时生效。可选值：`write_through`（默认）一次写所有 tier，各层独立驱逐；`cascading` 仅写 tier 0，tier_i 驱逐的 block 自动降级到 tier_{i+1}，最后一层驱逐即丢弃 |
 
 ### 示例
 
