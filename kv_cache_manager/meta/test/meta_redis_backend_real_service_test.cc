@@ -109,7 +109,8 @@ TEST_F(MetaRedisBackendRealServiceTest, TestMultiThreadSimple) {
     auto get_task = [&, this]() {
         int i = get_index++;
         FieldMapVec out_field_map;
-        auto ec_per_key = meta_redis_backend_->Get(keys_vec[i], {"f1", "f2"}, out_field_map);
+        auto ec_per_key =
+            meta_redis_backend_->Get(keys_vec[i], std::vector<std::string>{"f1", "f2"}, out_field_map);
         ASSERT_EQ(std::vector<ErrorCode>(keys_vec[i].size(), EC_OK), ec_per_key);
         ASSERT_EQ(field_maps_vec[i], out_field_map);
     };
@@ -396,7 +397,8 @@ TEST_F(MetaRedisBackendRealServiceTest, TestMultiOpen) {
     auto get_task = [&, this]() {
         int i = get_index++;
         FieldMapVec out_field_map;
-        auto ec_per_key = meta_redis_backend_->Get(keys_vec[i], {"f1", "f2"}, out_field_map);
+        auto ec_per_key =
+            meta_redis_backend_->Get(keys_vec[i], std::vector<std::string>{"f1", "f2"}, out_field_map);
         ASSERT_EQ(std::vector<ErrorCode>(keys_vec[i].size(), EC_OK), ec_per_key);
         ASSERT_EQ(field_maps_vec[i], out_field_map);
     };

@@ -45,7 +45,7 @@ using PropertyMapVector = std::vector<PropertyMap>;
 // ---------- Location primitives ----------
 using LocationId = std::string;
 using LocationIdVector = std::vector<LocationId>;
-using LocationMap = std::map<LocationId, CacheLocation>;
+using LocationMap = std::unordered_map<LocationId, CacheLocation>;
 using LocationMapVector = std::vector<LocationMap>;
 using LocationIdsPerKey = std::vector<LocationIdVector>;
 using LocationsPerKey = std::vector<CacheLocationVector>;
@@ -59,7 +59,7 @@ enum ModifierAction {
     MA_DELETE = 4
 };
 using ModifierResult = std::pair<ModifierAction, ErrorCode>;
-
+using LocationModifierResult = std::pair<ModifierAction, std::vector<ErrorCode>>;
 
 // Lightweight block-level modifier: only sees the existing location id list
 // (no location values are deserialized). The modifier can produce new
@@ -70,25 +70,18 @@ using BlockIdsOnlyModifierFunc = std::function<ModifierResult(const LocationIdVe
                                                               PropertyMap & /*upsert_property_map*/,
                                                               LocationMap & /*out_new_locations*/)>;
 
-// Block-level modifier: sees the entire LocationMap of one block_key.
-// Suitable when the modifier needs a global view (e.g. allocate a unique
-// location_id, or write block-level property like _prev_key_).
-using BlockModifierFunc = std::function<ModifierResult(
-    LocationMap & /*loc_map*/, ErrorCode /*get_ec*/, size_t /*key_index*/, PropertyMap & /*upsert_property_map*/)>;
-
-using BlockIdsOnlyModifierFunc = std::function<ModifierResult(const LocationIdVector & /*existing_ids*/,
-                                                                ErrorCode /*get_ec*/,
-                                                                size_t /*key_index*/,
-                                                                PropertyMap & /*upsert_property_map*/,
-                                                                LocationMap & /*out_new_locations*/)>;
+// Note: an earlier `BlockModifierFunc` variant (sees the entire LocationMap
+// of one block_key) was removed because nothing in the codebase ever used
+// it. If a future caller really needs the deserialized map, it should fetch
+// it via MetaIndexer::GetLocations and then drive ReadModifyWriteLocation.
 
 // Location-level modifier: sees one (block_key, location_id, CacheLocation) at
 // a time. Backend only reads/writes the specified location field.
-using LocationModifierFunc = std::function<ModifierResult(CacheLocation & /*loc*/,
-                                                          ErrorCode /*get_ec*/,
-                                                          size_t /*key_index*/,
-                                                          const LocationId & /*loc_id*/,
-                                                          PropertyMap & /*upsert_property_map*/)>;
+using LocationModifierFunc = std::function<LocationModifierResult(CacheLocationVector & /*loc*/,
+                                                                std::vector<ErrorCode> /*get_ec*/,
+                                                                size_t /*key_index*/,
+                                                                const LocationIdVector & /*loc_id*/,
+                                                                PropertyMap & /*upsert_property_map*/)>;
 
 // ---------- Batch primitives ----------
 // Single-batch view consumed by MetaStorageBackendManager. Fields with suffix
@@ -98,6 +91,7 @@ struct BatchMetaData {
     std::vector<int32_t> batch_indexs;       // raw index in the original KeyVector
     KeyVector batch_keys;                    // keys in this batch
     LocationMapVector batch_locations;       // optional per-key CacheLocations
+    LocationIdsPerKey batch_location_ids;    // optional per-key location ids
     PropertyMapVector batch_properties;      // optional per-key properties
 };
 

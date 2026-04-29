@@ -5,12 +5,61 @@
 
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/logger.h"
+#include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/standard_uri.h"
+#include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_storage_backend_factory.h"
+#include "kv_cache_manager/metrics/metrics_collector.h"
 
 namespace kv_cache_manager {
+
+namespace {
+
+// Accumulate the just-measured latency (microseconds) onto the GAUGE metric.
+// We read the existing value and overwrite with (existing + delta) so that
+// multiple calls within one request scope produce a per-request total
+// instead of being clobbered by the last call. `request_context` may be null
+// (e.g. cross-batch / recovery paths without an originating request); in
+// that case the helper is a no-op.
+void AccumulateIndexSerializeTimeUs(RequestContext *request_context, int64_t delta_us) noexcept {
+    if (request_context == nullptr || delta_us <= 0) {
+        return;
+    }
+    auto *service_metrics_collector =
+        dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+    if (service_metrics_collector == nullptr) {
+        return;
+    }
+    double accumulated = 0.0;
+    KVCM_METRICS_COLLECTOR_GET_METRICS(
+        service_metrics_collector, meta_searcher, index_serialize_time_us, accumulated);
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector,
+                                       meta_searcher,
+                                       index_serialize_time_us,
+                                       accumulated + static_cast<double>(delta_us));
+}
+
+void AccumulateIndexDeserializeTimeUs(RequestContext *request_context, int64_t delta_us) noexcept {
+    if (request_context == nullptr || delta_us <= 0) {
+        return;
+    }
+    auto *service_metrics_collector =
+        dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+    if (service_metrics_collector == nullptr) {
+        return;
+    }
+    double accumulated = 0.0;
+    KVCM_METRICS_COLLECTOR_GET_METRICS(
+        service_metrics_collector, meta_searcher, index_deserialize_time_us, accumulated);
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector,
+                                       meta_searcher,
+                                       index_deserialize_time_us,
+                                       accumulated + static_cast<double>(delta_us));
+}
+
+} // namespace
 
 namespace {
 
@@ -318,7 +367,8 @@ std::string MetaStorageBackendManager::MakeLocationFieldName(const std::string &
     return LOCATION_PREFIX + location_id;
 }
 
-PropertyMapVector &MetaStorageBackendManager::BuildEffectiveFieldMaps(BatchMetaData &batch) const noexcept {
+PropertyMapVector &MetaStorageBackendManager::BuildEffectiveFieldMaps(RequestContext *request_context,
+                                                                      BatchMetaData &batch) const noexcept {
     const size_t key_count = batch.batch_keys.size();
 
     // Normalise batch_properties so it is always parallel to batch_keys. When
@@ -334,18 +384,23 @@ PropertyMapVector &MetaStorageBackendManager::BuildEffectiveFieldMaps(BatchMetaD
     }
     assert(batch.batch_locations.size() == key_count);
 
+    // Time only the serialization hot loop; the surrounding bookkeeping above
+    // is cheap and skewing it onto the metric would dilute the signal callers
+    // care about (JSON encoding cost of CacheLocation).
+    const int64_t begin_us = TimestampUtil::GetCurrentTimeUs();
     for (size_t i = 0; i < key_count; ++i) {
         for (const auto &loc_kv : batch.batch_locations[i]) {
             const CacheLocation &location = loc_kv.second;
             batch.batch_properties[i][MakeLocationFieldName(location.id())] = location.ToJsonString();
         }
     }
+    AccumulateIndexSerializeTimeUs(request_context, TimestampUtil::GetCurrentTimeUs() - begin_us);
     return batch.batch_properties;
 }
 
-std::vector<ErrorCode> MetaStorageBackendManager::Put(BatchMetaData &batch) noexcept {
+std::vector<ErrorCode> MetaStorageBackendManager::Put(RequestContext *request_context, BatchMetaData &batch) noexcept {
     const auto &keys = batch.batch_keys;
-    PropertyMapVector &effective = BuildEffectiveFieldMaps(batch);
+    PropertyMapVector &effective = BuildEffectiveFieldMaps(request_context, batch);
 
     // Persistent first; local write is conditional on persistent results so a
     // persistent failure is never retried locally.
@@ -356,9 +411,10 @@ std::vector<ErrorCode> MetaStorageBackendManager::Put(BatchMetaData &batch) noex
     return local_backend_->Put(keys, effective, persistent_results);
 }
 
-std::vector<ErrorCode> MetaStorageBackendManager::UpdateFields(BatchMetaData &batch) noexcept {
+std::vector<ErrorCode> MetaStorageBackendManager::UpdateFields(RequestContext *request_context,
+                                                               BatchMetaData &batch) noexcept {
     const auto &keys = batch.batch_keys;
-    PropertyMapVector &effective = BuildEffectiveFieldMaps(batch);
+    PropertyMapVector &effective = BuildEffectiveFieldMaps(request_context, batch);
 
     // Partial-update during Recover: hydrate local from persistent first so
     // the conditional mirror write below has the full pre-restart field set
@@ -374,9 +430,10 @@ std::vector<ErrorCode> MetaStorageBackendManager::UpdateFields(BatchMetaData &ba
     return local_backend_->UpdateFields(keys, effective, persistent_results);
 }
 
-std::vector<ErrorCode> MetaStorageBackendManager::Upsert(BatchMetaData &batch) noexcept {
+std::vector<ErrorCode> MetaStorageBackendManager::Upsert(RequestContext *request_context,
+                                                         BatchMetaData &batch) noexcept {
     const auto &keys = batch.batch_keys;
-    PropertyMapVector &effective = BuildEffectiveFieldMaps(batch);
+    PropertyMapVector &effective = BuildEffectiveFieldMaps(request_context, batch);
 
     // See UpdateFields(): Upsert may also touch only a subset of fields, so
     // the same Recover-time hydration is needed.
@@ -391,15 +448,14 @@ std::vector<ErrorCode> MetaStorageBackendManager::Upsert(BatchMetaData &batch) n
     return local_backend_->Upsert(keys, effective, persistent_results);
 }
 
-std::vector<ErrorCode> MetaStorageBackendManager::Delete(const BatchMetaData &batch) noexcept {
-    const auto &keys = batch.batch_keys;
 
+std::vector<ErrorCode> MetaStorageBackendManager::Delete(const KeyVector &keys) noexcept {
     std::vector<ErrorCode> persistent_results = persistent_backend_->Delete(keys);
     if (!local_backend_) {
         return persistent_results;
     }
     if (recover_state_.load(std::memory_order_acquire) == RecoverState::kRecover) {
-        // Tombstone before touching local so concurrent backfill cannot resurrect these keys.
+        // Tombstone to prevent Recover backfill from resurrecting deleted keys.
         std::lock_guard<std::mutex> lock(deleted_keys_mutex_);
         for (const auto &key : keys) {
             deleted_keys_.insert(key);
@@ -409,35 +465,78 @@ std::vector<ErrorCode> MetaStorageBackendManager::Delete(const BatchMetaData &ba
 }
 
 std::vector<ErrorCode>
-MetaStorageBackendManager::Delete(const BatchMetaData &batch,
-                                  const std::vector<std::string> &location_ids) noexcept {
-    const auto &keys = batch.batch_keys;
-    if (keys.empty() || location_ids.empty()) {
+MetaStorageBackendManager::Delete(const KeyVector &keys,
+                                  const LocationIdsPerKey &location_ids,
+                                  int32_t &out_reclaimed_count) noexcept {
+    out_reclaimed_count = 0;
+    if (keys.empty()) {
+        return {};
+    }
+    assert(location_ids.size() == keys.size());
+
+    std::vector<std::vector<std::string>> field_names_vec(keys.size());
+    bool any_field_to_delete = false;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        field_names_vec[i].reserve(location_ids[i].size());
+        for (const auto &id : location_ids[i]) {
+            field_names_vec[i].emplace_back(MakeLocationFieldName(id));
+        }
+        any_field_to_delete = any_field_to_delete || !field_names_vec[i].empty();
+    }
+    if (!any_field_to_delete) {
         return std::vector<ErrorCode>(keys.size(), EC_OK);
     }
 
-    // No field-level delete primitive in the backend; overwrite targeted
-    // location fields with empty strings and let readers treat "empty" as
-    // "removed".
-    FieldMap empty_location_fields;
-    for (const auto &id : location_ids) {
-        empty_location_fields[MakeLocationFieldName(id)] = std::string();
-    }
-    FieldMapVec field_maps(keys.size(), empty_location_fields);
-
-    // Per-location delete is implemented as a partial UpdateFields on the
-    // location columns, so it needs the same Recover-time hydration as
-    // UpdateFields/Upsert; otherwise a key absent from local would have its
-    // sibling location fields lost when the conditional mirror write lands.
-    if (local_backend_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRecover) {
-        EnsureKeyInLocal(keys);
-    }
-
-    std::vector<ErrorCode> persistent_results = persistent_backend_->UpdateFields(keys, field_maps);
+    std::vector<ErrorCode> persistent_results = persistent_backend_->DeleteFields(keys, field_names_vec);
+    std::vector<ErrorCode> results;
     if (!local_backend_) {
-        return persistent_results;
+        results = persistent_results;
+    } else {
+        results = local_backend_->DeleteFields(keys, field_names_vec, persistent_results);
     }
-    return local_backend_->UpdateFields(keys, field_maps, persistent_results);
+
+    out_reclaimed_count = MaybeReclaimEmptyKeys(keys, results);
+    return results;
+}
+
+int32_t MetaStorageBackendManager::MaybeReclaimEmptyKeys(const KeyVector &keys,
+                                                        const std::vector<ErrorCode> &delete_results) noexcept {
+    KeyVector candidates;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (delete_results[i] == EC_OK) {
+            candidates.push_back(keys[i]);
+        }
+    }
+    if (candidates.empty()) {
+        return 0;
+    }
+
+    std::vector<bool> has_locations;
+    std::vector<ErrorCode> exists_ecs; 
+    if (local_backend_) {
+        exists_ecs = local_backend_->ExistsFieldWithPrefix(candidates, LOCATION_PREFIX, has_locations);
+    } else {
+        exists_ecs = persistent_backend_->ExistsFieldWithPrefix(candidates, LOCATION_PREFIX, has_locations);
+    }
+
+    KeyVector empty_keys;
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        if (exists_ecs[i] == EC_OK && !has_locations[i]) {
+            empty_keys.push_back(candidates[i]);
+        }
+    }
+    if (empty_keys.empty()) {
+        return 0;
+    }
+
+    std::vector<ErrorCode> whole_ecs = Delete(empty_keys);
+    int32_t reclaimed = 0;
+    for (const ErrorCode ec : whole_ecs) {
+        if (ec == EC_OK || ec == EC_NOENT) {
+            ++reclaimed;
+        }
+    }
+    return reclaimed;
 }
 
 // ---------------------------------------------------------------------------
@@ -480,13 +579,18 @@ std::vector<ErrorCode> MetaStorageBackendManager::Get(const KeyVector &keys,
     return results;
 }
 
-std::vector<ErrorCode>
-    MetaStorageBackendManager::GetLocations(const KeyVector &keys, LocationMapVector &out_location_maps) noexcept {
+std::vector<ErrorCode> MetaStorageBackendManager::GetLocations(RequestContext *request_context,
+                                                               const KeyVector &keys,
+                                                               LocationMapVector &out_location_maps) noexcept {
     FieldMapVec field_maps;
     std::vector<ErrorCode> results = GetAllFields(keys, field_maps);
 
     out_location_maps.clear();
     out_location_maps.resize(keys.size());
+    // Time only the JSON decode loop. The GetAllFields IO above is already
+    // covered by other backend/indexer metrics and mixing it in here would
+    // conflate transport cost with pure deserialization cost.
+    const int64_t begin_us = TimestampUtil::GetCurrentTimeUs();
     for (size_t i = 0; i < keys.size(); ++i) {
         if (results[i] != EC_OK) {
             continue;
@@ -509,10 +613,12 @@ std::vector<ErrorCode>
             out_location_maps[i].emplace(location.id(), std::move(location));
         }
     }
+    AccumulateIndexDeserializeTimeUs(request_context, TimestampUtil::GetCurrentTimeUs() - begin_us);
     return results;
 }
 
-std::vector<std::vector<ErrorCode>> MetaStorageBackendManager::GetLocations(const KeyVector &keys,
+std::vector<std::vector<ErrorCode>> MetaStorageBackendManager::GetLocations(RequestContext *request_context,
+                                                                            const KeyVector &keys,
                                                                             const LocationIdsPerKey &location_ids,
                                                                             LocationsPerKey &out_locations) noexcept {
     assert(keys.size() == location_ids.size());
@@ -520,12 +626,53 @@ std::vector<std::vector<ErrorCode>> MetaStorageBackendManager::GetLocations(cons
     std::vector<std::vector<ErrorCode>> results(keys.size());
     out_locations.clear();
     out_locations.resize(keys.size());
+    if (keys.empty()) {
+        return results;
+    }
 
-    // The backend's Get(keys, field_names, ...) treats field_names as a single
-    // list shared across all keys, which doesn't fit our per-key field set.
-    // Pull all fields and filter per-key in memory.
+    // Build per-key field name lists so the backend's per-key Get can fetch
+    // exactly the requested location fields instead of every field on the key.
+    std::vector<std::vector<std::string>> field_names_vec(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        field_names_vec[i].reserve(location_ids[i].size());
+        for (const auto &id : location_ids[i]) {
+            field_names_vec[i].emplace_back(MakeLocationFieldName(id));
+        }
+    }
+
+    // Local-first with persistent fallback during Recover, mirroring the
+    // pattern used by Get/GetAllFields/Exists. We treat both EC_NOENT and
+    // EC_OK-with-empty-map as "missing from local" so pre-restart data stays
+    // observable until backfill completes.
     FieldMapVec field_maps;
-    std::vector<ErrorCode> get_results = GetAllFields(keys, field_maps);
+    std::vector<ErrorCode> get_results;
+    if (local_backend_) {
+        get_results = local_backend_->Get(keys, field_names_vec, field_maps);
+        if (recover_state_.load(std::memory_order_acquire) != RecoverState::kRunning) {
+            KeyTypeVec missing_keys;
+            std::vector<std::vector<std::string>> missing_field_names;
+            std::vector<size_t> missing_indices;
+            for (size_t i = 0; i < keys.size(); ++i) {
+                if ((get_results[i] == EC_OK && field_maps[i].empty()) || get_results[i] == EC_NOENT) {
+                    missing_keys.push_back(keys[i]);
+                    missing_field_names.push_back(field_names_vec[i]);
+                    missing_indices.push_back(i);
+                }
+            }
+            if (!missing_keys.empty()) {
+                FieldMapVec persistent_field_maps;
+                std::vector<ErrorCode> persistent_results =
+                    persistent_backend_->Get(missing_keys, missing_field_names, persistent_field_maps);
+                for (size_t i = 0; i < missing_keys.size(); ++i) {
+                    const size_t original_idx = missing_indices[i];
+                    get_results[original_idx] = persistent_results[i];
+                    field_maps[original_idx] = std::move(persistent_field_maps[i]);
+                }
+            }
+        }
+    } else {
+        get_results = persistent_backend_->Get(keys, field_names_vec, field_maps);
+    }
 
     for (size_t i = 0; i < keys.size(); ++i) {
         if (get_results[i] != EC_OK) {
@@ -536,9 +683,10 @@ std::vector<std::vector<ErrorCode>> MetaStorageBackendManager::GetLocations(cons
         out_locations[i].resize(location_ids[i].size());
         const auto &fields = field_maps[i];
         for (size_t j = 0; j < location_ids[i].size(); ++j) {
-            const std::string field_name = MakeLocationFieldName(location_ids[i][j]);
+            const std::string &field_name = field_names_vec[i][j];
             auto it = fields.find(field_name);
-            // Empty value is a tombstone written by Delete(batch, location_ids).
+            // Empty value is a tombstone left by historical Delete(batch, location_ids)
+            // writes that overwrote the field with "" instead of deleting it.
             if (it == fields.end() || it->second.empty()) {
                 results[i][j] = EC_NOENT;
                 continue;

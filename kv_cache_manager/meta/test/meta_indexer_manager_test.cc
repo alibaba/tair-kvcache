@@ -44,8 +44,10 @@ TEST_F(MetaIndexerManagerTest, TestSingleThreadCreateAndGet) {
     // ASSERT_TRUE(manager_->GetMetaIndexer(id_2) != nullptr);
     ASSERT_TRUE(manager_->GetMetaIndexer(id_3) == nullptr);
     ASSERT_EQ(1, manager_->GetIndexerSize());
-    ASSERT_EQ(META_LOCAL_BACKEND_TYPE_STR, manager_->GetMetaIndexer(id_1)->storage_->GetStorageType());
-    // ASSERT_EQ(META_REDIS_BACKEND_TYPE_STR, manager_->GetMetaIndexer(id_2)->storage_->GetStorageType());
+    ASSERT_EQ(META_LOCAL_BACKEND_TYPE_STR,
+              manager_->GetMetaIndexer(id_1)->backend_manager_->persistent_backend_->GetStorageType());
+    // ASSERT_EQ(META_REDIS_BACKEND_TYPE_STR,
+    //           manager_->GetMetaIndexer(id_2)->backend_manager_->persistent_backend_->GetStorageType());
 
     // test delete, TODO
     // ASSERT_EQ(ErrorCode::EC_NOENT, manager_->DeleteMetaIndexer("3"));
@@ -139,7 +141,8 @@ TEST_F(MetaIndexerManagerTest, TestDoCleanup) {
     ASSERT_TRUE(manager_->GetMetaIndexer(id_2) != nullptr);
     ASSERT_TRUE(manager_->GetMetaIndexer(id_3) != nullptr);
     ASSERT_EQ(3, manager_->GetIndexerSize());
-    ASSERT_EQ(META_LOCAL_BACKEND_TYPE_STR, manager_->GetMetaIndexer(id_1)->storage_->GetStorageType());
+    ASSERT_EQ(META_LOCAL_BACKEND_TYPE_STR,
+              manager_->GetMetaIndexer(id_1)->backend_manager_->persistent_backend_->GetStorageType());
 }
 
 TEST_F(MetaIndexerManagerTest, TestDoCleanupWithEmptyManager) {

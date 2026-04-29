@@ -533,7 +533,7 @@ TEST_F(MetaLocalBackendTest, TestLruTimeUpdatedByReadWriteOps) {
     // Helper lambda: get LRU time for a key via Get.
     auto getLruTime = [&](int64_t key) -> int64_t {
         FieldMapVec out;
-        auto ec = meta_storage_backend_->Get({key}, {PROPERTY_LRU_TIME}, out);
+        auto ec = meta_storage_backend_->Get({key}, std::vector<std::string>{PROPERTY_LRU_TIME}, out);
         EXPECT_EQ((std::vector<ErrorCode>{EC_OK}), ec);
         return std::stoll(out[0][PROPERTY_LRU_TIME]);
     };
@@ -550,7 +550,8 @@ TEST_F(MetaLocalBackendTest, TestLruTimeUpdatedByReadWriteOps) {
     // --- Get updates LRU time ---
     usleep(1000);
     FieldMapVec all_out;
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->Get({1}, {PROPERTY_URI}, all_out));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              meta_storage_backend_->Get({1}, std::vector<std::string>{PROPERTY_URI}, all_out));
     ASSERT_EQ("uri1", all_out[0][PROPERTY_URI]);
     int64_t lru_after_get = getLruTime(1);
     ASSERT_GE(lru_after_get - lru_after_put, kMinTimeDiffUs) << "Get should update LRU time by >= 1000us";
@@ -658,12 +659,12 @@ TEST_F(MetaLocalBackendTest, TestSampleReclaimKeysSelectsOldestShard) {
     // Sleep and then access all keys via Get to make them "newer".
     for (int64_t i = 1; i <= 50; ++i) {
         FieldMapVec out;
-        meta_storage_backend_->Get({i}, {PROPERTY_URI}, out);
+        meta_storage_backend_->Get({i}, std::vector<std::string>{PROPERTY_URI}, out);
     }
     usleep(1000);
     for (int64_t i = 51; i <= 100; ++i) {
         FieldMapVec out;
-        meta_storage_backend_->Get({i}, {PROPERTY_URI}, out);
+        meta_storage_backend_->Get({i}, std::vector<std::string>{PROPERTY_URI}, out);
     }
 
     // Now SampleReclaimKeys should return keys.
@@ -722,6 +723,102 @@ TEST_F(MetaLocalBackendTest, TestSampleReclaimKeysAfterDeleteUpdatesTimestamp) {
     ASSERT_EQ(EC_OK, meta_storage_backend_->SampleReclaimKeys(1, reclaim_keys));
     ASSERT_EQ(1u, reclaim_keys.size());
     ASSERT_EQ(2, reclaim_keys[0]);
+
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
+}
+
+// Covers the new MetaStorageBackend interfaces DeleteFields / ExistsFieldWithPrefix
+// on the local backend: partial-field deletion preserves other fields, and the
+// prefix existence check reports accurately for existing / missing keys.
+TEST_F(MetaLocalBackendTest, TestDeleteFieldsAndExistsFieldWithPrefix) {
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("test_instance_delete_fields", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
+
+    // Seed two keys with location-prefixed + normal fields.
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
+              meta_storage_backend_->Put({1, 2},
+                                         {{{LOCATION_PREFIX + "a", "la"}, {LOCATION_PREFIX + "b", "lb"}, {PROPERTY_URI, "u1"}},
+                                          {{LOCATION_PREFIX + "c", "lc"}, {PROPERTY_URI, "u2"}}}));
+
+    // Prefix check: both keys have LOCATION_PREFIX fields, key 3 does not exist.
+    AssertExistsFieldWithPrefix(meta_storage_backend_.get(),
+                                {1, 2, 3},
+                                LOCATION_PREFIX,
+                                {EC_OK, EC_OK, EC_NOENT},
+                                {true, true, false});
+
+    // Delete one location field from key 1 and the sole location from key 2.
+    AssertDeleteFields(meta_storage_backend_.get(),
+                       {1, 2, 3},
+                       {{LOCATION_PREFIX + "a"}, {LOCATION_PREFIX + "c"}, {"anything"}},
+                       {EC_OK, EC_OK, EC_NOENT});
+
+    // After deletion: key 1 still has one LOCATION_PREFIX field, key 2 has none.
+    AssertExistsFieldWithPrefix(meta_storage_backend_.get(),
+                                {1, 2},
+                                LOCATION_PREFIX,
+                                {EC_OK, EC_OK},
+                                {true, false});
+    // Non-deleted fields must survive.
+    AssertGet(meta_storage_backend_.get(),
+              {1, 2},
+              {LOCATION_PREFIX + "a", LOCATION_PREFIX + "b", PROPERTY_URI},
+              {EC_OK, EC_OK},
+              {{{LOCATION_PREFIX + "b", "lb"}, {PROPERTY_URI, "u1"}}, {{PROPERTY_URI, "u2"}}});
+
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
+}
+
+// Covers the new Get overload that accepts a per-key field_names_vec:
+// each key may request a different subset of fields; missing keys report
+// EC_NOENT with empty FieldMap.
+TEST_F(MetaLocalBackendTest, TestGetWithPerKeyFieldNames) {
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("test_instance_0", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
+
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
+              meta_storage_backend_->Put({1, 2},
+                                         {{{PROPERTY_URI, "uri1"}, {PROPERTY_HIT_COUNT, "100"}},
+                                          {{PROPERTY_URI, "uri2"}, {PROPERTY_HIT_COUNT, "200"}}}));
+
+    // Each key queries a different subset; key 3 does not exist.
+    FieldMapVec field_maps;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_NOENT}),
+              meta_storage_backend_->Get(
+                  {1, 2, 3},
+                  std::vector<std::vector<std::string>>{{PROPERTY_URI}, {PROPERTY_HIT_COUNT}, {PROPERTY_URI}},
+                  field_maps));
+    ASSERT_EQ(
+        (FieldMapVec{{{PROPERTY_URI, "uri1"}}, {{PROPERTY_HIT_COUNT, "200"}}, {}}), field_maps);
+
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
+}
+
+// Covers the conditional DeleteFields overload: only keys whose previous_error_codes
+// entry is EC_OK are processed; other entries are passed through unchanged.
+TEST_F(MetaLocalBackendTest, TestConditionalDeleteFields) {
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("test_instance_0", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
+
+    MetaLocalBackend *local_backend = GetLocalBackend();
+
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
+              meta_storage_backend_->Put({1, 2},
+                                         {{{LOCATION_PREFIX + "a", "la"}, {PROPERTY_URI, "u1"}},
+                                          {{LOCATION_PREFIX + "b", "lb"}, {PROPERTY_URI, "u2"}}}));
+
+    // previous_error_codes[0]=EC_OK -> actually delete; [1]=EC_EXIST -> passthrough untouched.
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_EXIST}),
+              local_backend->DeleteFields({1, 2},
+                                          {{LOCATION_PREFIX + "a"}, {LOCATION_PREFIX + "b"}},
+                                          /*previous_error_codes*/ {EC_OK, EC_EXIST}));
+
+    // Key 1's LOCATION_PREFIX field was removed, key 2's remains intact.
+    AssertExistsFieldWithPrefix(meta_storage_backend_.get(),
+                                {1, 2},
+                                LOCATION_PREFIX,
+                                {EC_OK, EC_OK},
+                                {false, true});
 
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }

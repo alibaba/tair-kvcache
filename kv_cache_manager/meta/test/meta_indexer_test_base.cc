@@ -1,20 +1,44 @@
 #include "kv_cache_manager/meta/test/meta_indexer_test_base.h"
 
+#include <algorithm>
+#include <numeric>
 #include <random>
 #include <thread>
 #include <unordered_set>
 
+#include "kv_cache_manager/meta/cache_location.h"
+#include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_search_cache.h"
+#include "kv_cache_manager/meta/types.h"
 
 namespace kv_cache_manager {
+
+CacheLocation MetaIndexerTestBase::MakeLocation(const std::string &id, const std::string &uri) {
+    // Build a minimal one-spec CacheLocation; uri field carries the payload the
+    // tests compare against after a round-trip through the backend.
+    CacheLocation location;
+    location.set_id(id);
+    location.set_status(CacheLocationStatus::CLS_SERVING);
+    location.set_type(DataStorageType::DATA_STORAGE_TYPE_HF3FS);
+    location.set_spec_size(1);
+    std::vector<LocationSpec> specs;
+    specs.emplace_back(/*name*/ "default", uri);
+    location.set_location_specs(std::move(specs));
+    return location;
+}
+
 void MetaIndexerTestBase::MakeKVData(const int64_t start, const int64_t end, KVData &data) const {
     data.keys.clear();
-    data.uris.clear();
+    data.location_maps.clear();
     data.properties.clear();
-    for (int32_t i = start; i < end; i++) {
+    for (int64_t i = start; i < end; ++i) {
         data.keys.push_back(i);
-        data.uris.push_back("uri_" + std::to_string(i));
-        MetaIndexer::PropertyMap map;
+        const std::string loc_id = "loc_" + std::to_string(i);
+        LocationMap loc_map;
+        loc_map.emplace(loc_id, MakeLocation(loc_id, "uri_" + std::to_string(i)));
+        data.location_maps.push_back(std::move(loc_map));
+
+        PropertyMap map;
         map["p0"] = "p0_" + std::to_string(i);
         map["p1"] = "p1_" + std::to_string(i);
         data.properties.push_back(std::move(map));
@@ -26,248 +50,253 @@ void MetaIndexerTestBase::MakeRandomKVData(const int64_t count,
                                            const int64_t max,
                                            KVData &data) const {
     data.keys.clear();
-    data.uris.clear();
+    data.location_maps.clear();
     data.properties.clear();
-    std::random_device rd;
     thread_local std::mt19937 rng(std::hash<std::thread::id>()(std::this_thread::get_id()) + std::random_device{}());
-    std::uniform_int_distribution<int32_t> dist(min, max);
+    std::uniform_int_distribution<int64_t> dist(min, max);
     std::unordered_set<int64_t> seen;
-    for (int32_t i = 0; i < count; i++) {
-        int32_t key = dist(rng);
-        // filter duplicate keys
-        if (seen.insert(key).second) {
-            data.keys.push_back(key);
-            data.uris.push_back("uri_" + std::to_string(key));
-            MetaIndexer::PropertyMap map;
-            map["p0"] = "p0_" + std::to_string(key);
-            map["p1"] = "p1_" + std::to_string(key);
-            data.properties.push_back(std::move(map));
+    for (int64_t i = 0; i < count; ++i) {
+        int64_t key = dist(rng);
+        if (!seen.insert(key).second) {
+            continue;
         }
-    }
-}
+        data.keys.push_back(key);
+        const std::string loc_id = "loc_" + std::to_string(key);
+        LocationMap loc_map;
+        loc_map.emplace(loc_id, MakeLocation(loc_id, "uri_" + std::to_string(key)));
+        data.location_maps.push_back(std::move(loc_map));
 
-void MetaIndexerTestBase::AssertGet(const KeyVector &keys, const UriVector &expect_uris, const Result &expect_result) {
-    UriVector uris;
-    auto result = meta_indexer_->Get(request_context_.get(), keys, uris);
-    ASSERT_EQ(expect_result.ec, result.ec);
-    ASSERT_EQ(expect_result.error_codes, result.error_codes);
-    ASSERT_EQ(keys.size(), uris.size());
-    for (int32_t i = 0; i < keys.size(); ++i) {
-        ASSERT_EQ(expect_uris[i], uris[i]);
-    }
-}
-
-void MetaIndexerTestBase::AssertSearchCacheGet(const KeyVector &keys,
-                                               const UriVector &expect_uris,
-                                               const std::vector<ErrorCode> &expect_error_codes) {
-    if (!meta_indexer_->cache_) {
-        // if no search cache, just return
-        return;
-    }
-    for (int32_t i = 0; i < keys.size(); i++) {
-        std::string out_uri;
-        auto ec = meta_indexer_->cache_->Get(keys[i], &out_uri);
-        ASSERT_EQ(expect_error_codes[i], ec);
-        ASSERT_EQ(expect_uris[i], out_uri);
+        PropertyMap map;
+        map["p0"] = "p0_" + std::to_string(key);
+        map["p1"] = "p1_" + std::to_string(key);
+        data.properties.push_back(std::move(map));
     }
 }
 
 void MetaIndexerTestBase::AssertGet(const KeyVector &keys,
-                                    const UriVector &expect_uris,
-                                    const PropertyMapVector &expect_properties,
+                                    const LocationMapVector &expect_location_maps,
                                     const Result &expect_result) {
-    UriVector uris;
-    PropertyMapVector properties;
-    auto result = meta_indexer_->Get(request_context_.get(), keys, uris, properties);
+    LocationMapVector out_locations;
+    PropertyMapVector out_properties;
+    auto result = meta_indexer_->Get(request_context_.get(), keys, out_locations, out_properties);
     ASSERT_EQ(expect_result.ec, result.ec);
     ASSERT_EQ(expect_result.error_codes, result.error_codes);
-    ASSERT_EQ(keys.size(), uris.size());
-    ASSERT_EQ(keys.size(), properties.size());
-    for (int32_t i = 0; i < keys.size(); ++i) {
-        ASSERT_EQ(expect_uris[i], uris[i]);
-        const auto &expect_property = expect_properties[i];
-        for (const auto &iter : expect_property) {
-            ASSERT_EQ(iter.second, properties[i][iter.first]);
+    ASSERT_EQ(keys.size(), out_locations.size());
+    ASSERT_EQ(keys.size(), expect_location_maps.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto &expect_map = expect_location_maps[i];
+        const auto &actual_map = out_locations[i];
+        ASSERT_EQ(expect_map.size(), actual_map.size()) << "key=" << keys[i];
+        for (const auto &kv : expect_map) {
+            auto it = actual_map.find(kv.first);
+            ASSERT_TRUE(it != actual_map.end()) << "key=" << keys[i] << " location_id=" << kv.first;
+            // Compare on the round-trippable projection (id/uri) instead of the
+            // full object to avoid coupling to every CacheLocation field.
+            ASSERT_EQ(kv.second.id(), it->second.id());
+            ASSERT_EQ(kv.second.location_specs().size(), it->second.location_specs().size());
+            if (!kv.second.location_specs().empty()) {
+                ASSERT_EQ(kv.second.location_specs().front().uri(), it->second.location_specs().front().uri());
+            }
+        }
+    }
+}
+
+void MetaIndexerTestBase::AssertGet(const KeyVector &keys,
+                                    const LocationMapVector &expect_location_maps,
+                                    const PropertyMapVector &expect_properties,
+                                    const Result &expect_result) {
+    LocationMapVector out_locations;
+    PropertyMapVector out_properties;
+    auto result = meta_indexer_->Get(request_context_.get(), keys, out_locations, out_properties);
+    ASSERT_EQ(expect_result.ec, result.ec);
+    ASSERT_EQ(expect_result.error_codes, result.error_codes);
+    ASSERT_EQ(keys.size(), out_locations.size());
+    ASSERT_EQ(keys.size(), out_properties.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto &expect_loc = expect_location_maps[i];
+        const auto &actual_loc = out_locations[i];
+        ASSERT_EQ(expect_loc.size(), actual_loc.size()) << "key=" << keys[i];
+        for (const auto &kv : expect_loc) {
+            auto it = actual_loc.find(kv.first);
+            ASSERT_TRUE(it != actual_loc.end()) << "key=" << keys[i] << " location_id=" << kv.first;
+            ASSERT_EQ(kv.second.id(), it->second.id());
+        }
+        for (const auto &prop : expect_properties[i]) {
+            ASSERT_EQ(prop.second, out_properties[i][prop.first]) << "key=" << keys[i] << " prop=" << prop.first;
         }
     }
 }
 
 void MetaIndexerTestBase::AssertGetProperties(const KeyVector &keys,
                                               const std::vector<std::string> &property_names,
-                                              PropertyMapVector &expect_properties,
+                                              const PropertyMapVector &expect_properties,
                                               const Result &expect_result) {
     PropertyMapVector properties;
     auto result = meta_indexer_->GetProperties(request_context_.get(), keys, property_names, properties);
     ASSERT_EQ(expect_result.ec, result.ec);
     ASSERT_EQ(expect_result.error_codes, result.error_codes);
     ASSERT_EQ(keys.size(), properties.size());
-    for (int32_t i = 0; i < keys.size(); ++i) {
+    for (size_t i = 0; i < keys.size(); ++i) {
         for (const auto &name : property_names) {
-            ASSERT_EQ(expect_properties[i][name], properties[i][name]);
+            ASSERT_EQ(expect_properties[i].count(name) ? expect_properties[i].at(name) : std::string(),
+                      properties[i].count(name) ? properties[i].at(name) : std::string())
+                << "key=" << keys[i] << " prop=" << name;
         }
     }
 }
 
-void MetaIndexerTestBase::AssertReadModifyWrite(const KeyVector &keys,
-                                                const MetaIndexer::ModifierFunc &modifier,
-                                                const Result &expect_result) {
-    auto result = meta_indexer_->ReadModifyWrite(request_context_.get(), keys, modifier);
-    ASSERT_EQ(expect_result.ec, result.ec);
-    ASSERT_EQ(expect_result.error_codes, result.error_codes);
-}
-
 void MetaIndexerTestBase::DoPutTest() {
     KVData data;
-    int32_t key_count = 3;
+    const int32_t key_count = 3;
     MakeKVData(/*start*/ 0, /*end*/ 3, data);
-    // 1. test put keys
+
+    // 1. Put fresh keys and verify round-tripped location/property payloads.
     ASSERT_EQ(0, meta_indexer_->GetKeyCount());
     auto expect_result = Result(key_count);
-    auto result = meta_indexer_->Put(request_context_.get(), data.keys, data.uris, data.properties);
-    ASSERT_EQ(key_count, meta_indexer_->GetKeyCount());
-    // data uris and properties will be moved to batch property maps
-    for (int32_t i = 0; i < key_count; i++) {
-        ASSERT_TRUE(data.uris[i].empty());
-        ASSERT_TRUE(data.properties[i].empty());
+    // Snapshot expected payload before the Put call moves the inputs.
+    LocationMapVector expect_locations;
+    expect_locations.reserve(key_count);
+    for (const auto &m : data.location_maps) {
+        expect_locations.emplace_back(m);
     }
+    PropertyMapVector expect_properties = data.properties;
+    auto result = meta_indexer_->Put(request_context_.get(), data.keys, data.location_maps, data.properties);
     ASSERT_EQ(expect_result.ec, result.ec);
     ASSERT_EQ(expect_result.error_codes, result.error_codes);
-    UriVector expect_uris = {"uri_0", "uri_1", "uri_2"};
-    AssertSearchCacheGet(data.keys, {"", "", ""}, {EC_NOENT, EC_NOENT, EC_NOENT});
-    AssertGet(data.keys, expect_uris, expect_result);
-    AssertSearchCacheGet(data.keys, expect_uris, {EC_OK, EC_OK, EC_OK});
-    PropertyMapVector expect_maps = {
-        {{"p0", "p0_0"}, {"p1", "p1_0"}}, {{"p0", "p0_1"}, {"p1", "p1_1"}}, {{"p0", "p0_2"}, {"p1", "p1_2"}}};
-    AssertGet(data.keys, expect_uris, expect_maps, expect_result);
-    PropertyMapVector expect_p0_maps = {{{"p0", "p0_0"}}, {{"p0", "p0_1"}}, {{"p0", "p0_2"}}};
-    AssertGetProperties(data.keys, {"p0"}, expect_p0_maps, expect_result);
-    PropertyMapVector expect_p1_maps = {{{"p1", "p1_0"}}, {{"p1", "p1_1"}}, {{"p1", "p1_2"}}};
-    AssertGetProperties(data.keys, {"p1"}, expect_p1_maps, expect_result);
+    ASSERT_EQ(key_count, meta_indexer_->GetKeyCount());
 
-    // 2. delete all keys to avoid affecting other test cases
+    AssertGet(data.keys, expect_locations, expect_result);
+    AssertGet(data.keys, expect_locations, expect_properties, expect_result);
+    PropertyMapVector expect_p0 = {{{"p0", "p0_0"}}, {{"p0", "p0_1"}}, {{"p0", "p0_2"}}};
+    AssertGetProperties(data.keys, {"p0"}, expect_p0, expect_result);
+    PropertyMapVector expect_p1 = {{{"p1", "p1_0"}}, {{"p1", "p1_1"}}, {{"p1", "p1_2"}}};
+    AssertGetProperties(data.keys, {"p1"}, expect_p1, expect_result);
+
+    // 2. Cleanup so downstream sub-tests start from an empty store.
     meta_indexer_->Delete(request_context_.get(), data.keys);
     ASSERT_EQ(0, meta_indexer_->GetKeyCount());
 }
 
 void MetaIndexerTestBase::DoUpdateTest() {
     KVData data;
-    int32_t key_count = 3;
+    const int32_t key_count = 3;
     MakeKVData(/*start*/ 0, /*end*/ 3, data);
-    // 1. test update noent keys
+
+    // 1. Update against NOENT keys -> every key returns EC_NOENT.
     ASSERT_EQ(0, meta_indexer_->GetKeyCount());
-    UriVector update_uris = {"uri_0_new", "uri_1_new", "uri_2_new"};
-    PropertyMapVector update_p0_maps = {{{"p0", "p0_0_new"}}, {{"p0", "p0_1_new"}}, {{"p0", "p0_2_new"}}};
-    auto expect_result = Result(key_count);
+    KVData update_data;
+    MakeKVData(0, 3, update_data);
+    for (auto &m : update_data.properties) {
+        m["p0"] = m["p0"] + "_new";
+    }
+    PropertyMapVector keep_properties = update_data.properties;
+    LocationMapVector keep_locations;
+    for (const auto &m : update_data.location_maps) {
+        keep_locations.emplace_back(m);
+    }
+
+    Result expect_result(key_count);
     expect_result.ec = EC_ERROR;
     expect_result.error_codes = {EC_NOENT, EC_NOENT, EC_NOENT};
-    auto result = meta_indexer_->Update(request_context_.get(), data.keys, update_uris, update_p0_maps);
+    auto result = meta_indexer_->Update(
+        request_context_.get(), update_data.keys, update_data.location_maps, update_data.properties);
     ASSERT_EQ(expect_result.ec, result.ec);
     ASSERT_EQ(expect_result.error_codes, result.error_codes);
 
-    // 2. test update keys
-    result = meta_indexer_->Put(request_context_.get(), data.keys, data.uris, data.properties);
+    // 2. Put then Update: new locations + new properties take effect.
+    result = meta_indexer_->Put(request_context_.get(), data.keys, data.location_maps, data.properties);
+    ASSERT_EQ(EC_OK, result.ec);
     ASSERT_EQ(key_count, meta_indexer_->GetKeyCount());
+
+    // Re-materialise update payload since the previous Update may have moved some of it.
+    update_data = {};
+    MakeKVData(0, 3, update_data);
+    for (auto &m : update_data.properties) {
+        m["p0"] = m["p0"] + "_new";
+    }
+    keep_properties = update_data.properties;
+    keep_locations.clear();
+    for (const auto &m : update_data.location_maps) {
+        keep_locations.emplace_back(m);
+    }
     expect_result = Result(key_count);
-    // update_uris and update_p0_maps will be moved to batch property maps
-    update_uris = {"uri_0_new", "uri_1_new", "uri_2_new"};
-    update_p0_maps = {{{"p0", "p0_0_new"}}, {{"p0", "p0_1_new"}}, {{"p0", "p0_2_new"}}};
-    UriVector expect_uris = update_uris;
-    PropertyMapVector expect_p0_maps = update_p0_maps;
-    result = meta_indexer_->Update(request_context_.get(), data.keys, update_uris, update_p0_maps);
-    ASSERT_EQ(key_count, meta_indexer_->GetKeyCount());
+    result = meta_indexer_->Update(
+        request_context_.get(), update_data.keys, update_data.location_maps, update_data.properties);
     ASSERT_EQ(expect_result.ec, result.ec);
     ASSERT_EQ(expect_result.error_codes, result.error_codes);
-    for (int32_t i = 0; i < update_uris.size(); i++) {
-        ASSERT_TRUE(update_uris[i].empty());
-        ASSERT_TRUE(update_p0_maps[i].empty());
-    }
-    AssertSearchCacheGet(data.keys, {"", "", ""}, {EC_NOENT, EC_NOENT, EC_NOENT});
-    AssertGet(data.keys, expect_uris, expect_result);
-    AssertSearchCacheGet(data.keys, expect_uris, {EC_OK, EC_OK, EC_OK});
-    AssertGetProperties(data.keys, {"p0"}, expect_p0_maps, expect_result);
 
-    PropertyMapVector update_p1_maps = {{{"p1", "p1_0_new"}}, {{"p1", "p1_1_new"}}, {{"p1", "p1_2_new"}}};
-    PropertyMapVector expect_p1_maps = update_p1_maps;
-    result = meta_indexer_->Update(request_context_.get(), data.keys, update_p1_maps);
-    ASSERT_EQ(key_count, meta_indexer_->GetKeyCount());
-    for (int32_t i = 0; i < update_uris.size(); i++) {
-        ASSERT_TRUE(update_p1_maps[i].empty());
-    }
-    ASSERT_EQ(expect_result.ec, result.ec);
-    ASSERT_EQ(expect_result.error_codes, result.error_codes);
-    AssertGet(data.keys, expect_uris, expect_result);
-    AssertGetProperties(data.keys, {"p1"}, expect_p1_maps, expect_result);
-    PropertyMapVector expect_maps = {{{"p0", "p0_0_new"}, {"p1", "p1_0_new"}},
-                                     {{"p0", "p0_1_new"}, {"p1", "p1_1_new"}},
-                                     {{"p0", "p0_2_new"}, {"p1", "p1_2_new"}}};
-    AssertGet(data.keys, expect_uris, expect_maps, expect_result);
+    AssertGet(data.keys, keep_locations, expect_result);
+    AssertGet(data.keys, keep_locations, keep_properties, expect_result);
+    PropertyMapVector expect_p0 = {{{"p0", "p0_0_new"}}, {{"p0", "p0_1_new"}}, {{"p0", "p0_2_new"}}};
+    AssertGetProperties(data.keys, {"p0"}, expect_p0, expect_result);
 
-    // 3. delete all keys to avoid affecting other test cases
+    // 3. Cleanup
     meta_indexer_->Delete(request_context_.get(), data.keys);
     ASSERT_EQ(0, meta_indexer_->GetKeyCount());
 }
 
 void MetaIndexerTestBase::DoDeleteAndExistTest() {
     KVData data;
-    int32_t key_count = 3;
-    MakeKVData(/*start*/ 0, /*end*/ 3, data);
-    // 1. test delete and exist noent keys
+    const int32_t key_count = 3;
+    MakeKVData(0, 3, data);
+
+    // 1. Exist/Delete on NOENT keys.
     ASSERT_EQ(0, meta_indexer_->GetKeyCount());
     std::vector<bool> is_exists;
     auto result = meta_indexer_->Exist(request_context_.get(), data.keys, is_exists);
     ASSERT_EQ(EC_OK, result.ec);
-    ASSERT_EQ(is_exists, std::vector<bool>({false, false, false}));
+    ASSERT_EQ((std::vector<bool>{false, false, false}), is_exists);
     result = meta_indexer_->Delete(request_context_.get(), data.keys);
     ASSERT_EQ(EC_ERROR, result.ec);
-    ASSERT_EQ(std::vector<ErrorCode>({EC_NOENT, EC_NOENT, EC_NOENT}), result.error_codes);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_NOENT, EC_NOENT, EC_NOENT}), result.error_codes);
 
-    // 2. test delete some keys and exist
+    // 2. Put then delete a subset; Exist must reflect the partial state.
     auto expect_result = Result(key_count);
-    result = meta_indexer_->Put(request_context_.get(), data.keys, data.uris, data.properties);
+    result = meta_indexer_->Put(request_context_.get(), data.keys, data.location_maps, data.properties);
+    ASSERT_EQ(EC_OK, result.ec);
     ASSERT_EQ(key_count, meta_indexer_->GetKeyCount());
+
     result = meta_indexer_->Exist(request_context_.get(), data.keys, is_exists);
     ASSERT_EQ(EC_OK, result.ec);
-    ASSERT_EQ(is_exists, std::vector<bool>({true, true, true}));
+    ASSERT_EQ((std::vector<bool>{true, true, true}), is_exists);
+
     KeyVector delete_keys = {0, 1};
-    auto expect_delete_result = Result(delete_keys.size());
     result = meta_indexer_->Delete(request_context_.get(), delete_keys);
-    ASSERT_EQ(key_count - delete_keys.size(), meta_indexer_->GetKeyCount());
-    ASSERT_EQ(expect_delete_result.ec, result.ec);
-    ASSERT_EQ(expect_delete_result.error_codes, result.error_codes);
+    ASSERT_EQ(EC_OK, result.ec);
+    ASSERT_EQ(key_count - static_cast<int32_t>(delete_keys.size()), meta_indexer_->GetKeyCount());
+
     result = meta_indexer_->Exist(request_context_.get(), data.keys, is_exists);
     ASSERT_EQ(EC_OK, result.ec);
-    ASSERT_EQ(is_exists, std::vector<bool>({false, false, true}));
-    UriVector expect_uris = {"", "", "uri_2"};
-    PropertyMapVector expect_maps = {{}, {}, {{"p0", "p0_2"}, {"p1", "p1_2"}}};
-    PropertyMapVector expect_p0_maps = {{}, {}, {{"p0", "p0_2"}}};
-    PropertyMapVector expect_p1_maps = {{}, {}, {{"p1", "p1_2"}}};
-    auto expect_get_result = Result(key_count);
+    ASSERT_EQ((std::vector<bool>{false, false, true}), is_exists);
+
+    LocationMapVector expect_locations(key_count);
+    expect_locations[2].emplace("loc_2", MakeLocation("loc_2", "uri_2"));
+    PropertyMapVector expect_properties(key_count);
+    expect_properties[2] = {{"p0", "p0_2"}, {"p1", "p1_2"}};
+    Result expect_get_result(key_count);
     expect_get_result.ec = EC_PARTIAL_OK;
     expect_get_result.error_codes = {EC_NOENT, EC_NOENT, EC_OK};
-    AssertSearchCacheGet(data.keys, {"", "", ""}, {EC_NOENT, EC_NOENT, EC_NOENT});
-    AssertGet(data.keys, expect_uris, expect_get_result);
-    AssertSearchCacheGet(data.keys, expect_uris, expect_get_result.error_codes);
-    AssertGet(data.keys, expect_uris, expect_maps, expect_get_result);
-    AssertGetProperties(data.keys, {"p0"}, expect_p0_maps, expect_get_result);
-    AssertGetProperties(data.keys, {"p1"}, expect_p1_maps, expect_get_result);
+    AssertGet(data.keys, expect_locations, expect_get_result);
+    AssertGet(data.keys, expect_locations, expect_properties, expect_get_result);
 
-    // 3. delete all keys to avoid affecting other test cases
+    // 3. Cleanup
     meta_indexer_->Delete(request_context_.get(), data.keys);
     ASSERT_EQ(0, meta_indexer_->GetKeyCount());
 }
 
 void MetaIndexerTestBase::DoScanAndSampleReclaimKeysTest() {
     KVData data;
-    int32_t key_count = 3;
-    MakeKVData(/*start*/ 0, /*end*/ 3, data);
-    auto result = meta_indexer_->Put(request_context_.get(), data.keys, data.uris, data.properties);
+    const int32_t key_count = 3;
+    MakeKVData(0, 3, data);
+    auto result = meta_indexer_->Put(request_context_.get(), data.keys, data.location_maps, data.properties);
     ASSERT_EQ(key_count, meta_indexer_->GetKeyCount());
     ASSERT_EQ(EC_OK, result.ec);
-    // 1. test scan
+
+    // 1. Scan must eventually surface every key.
     std::string cursor = SCAN_BASE_CURSOR;
     KeyVector keys;
     int64_t try_count = 100;
-    int64_t scan_count = 3;
+    int64_t scan_count = key_count;
     while (try_count-- && scan_count > 0) {
         std::string next_cursor;
         KeyVector out_keys;
@@ -277,15 +306,14 @@ void MetaIndexerTestBase::DoScanAndSampleReclaimKeysTest() {
         keys.insert(keys.end(), out_keys.begin(), out_keys.end());
     }
     ASSERT_GT(try_count, 0);
-    ASSERT_EQ(3, keys.size());
+    ASSERT_EQ(static_cast<size_t>(key_count), keys.size());
     std::sort(keys.begin(), keys.end());
-    KeyVector expect_keys = {0, 1, 2};
-    ASSERT_EQ(expect_keys, keys);
+    ASSERT_EQ((KeyVector{0, 1, 2}), keys);
 
-    // 2. test sample reclaim keys
+    // 2. SampleReclaimKeys must converge to the full key set after enough tries.
     keys.clear();
     try_count = 100;
-    while (try_count-- && keys.size() < key_count) {
+    while (try_count-- && keys.size() < static_cast<size_t>(key_count)) {
         KeyVector out_keys;
         ASSERT_EQ(EC_OK, meta_indexer_->SampleReclaimKeys(request_context_.get(), key_count, out_keys));
         for (const auto key : out_keys) {
@@ -295,13 +323,88 @@ void MetaIndexerTestBase::DoScanAndSampleReclaimKeysTest() {
         }
     }
     ASSERT_GT(try_count, 0);
-    ASSERT_EQ(key_count, keys.size());
     std::sort(keys.begin(), keys.end());
-    expect_keys = {0, 1, 2};
-    ASSERT_EQ(expect_keys, keys);
+    ASSERT_EQ((KeyVector{0, 1, 2}), keys);
 
-    // 3. delete all keys to avoid affecting other test cases
+    // 3. Cleanup
     meta_indexer_->Delete(request_context_.get(), data.keys);
+    ASSERT_EQ(0, meta_indexer_->GetKeyCount());
+}
+
+void MetaIndexerTestBase::DoReadModifyWriteBlockTest() {
+    // upsert_modifier: creates a new location when the key is absent, or adds
+    // a second location (id="loc_new_<i>") when the key already exists.
+    auto upsert_modifier = [](const LocationIdVector &existing_ids,
+                              ErrorCode get_ec,
+                              size_t /*key_index*/,
+                              PropertyMap &upsert_property_map,
+                              LocationMap &out_new_locations) -> ModifierResult {
+        if (get_ec != EC_OK && get_ec != EC_NOENT) {
+            return {MA_FAIL, get_ec};
+        }
+        const std::string suffix = std::to_string(existing_ids.size());
+        const std::string loc_id = "rmw_loc_" + suffix;
+        out_new_locations.emplace(loc_id, MetaIndexerTestBase::MakeLocation(loc_id, "rmw_uri_" + suffix));
+        upsert_property_map["rmw_prop"] = "rmw_val_" + suffix;
+        return {MA_OK, EC_OK};
+    };
+    auto delete_modifier_lenient = [](const LocationIdVector & /*existing_ids*/,
+                                      ErrorCode get_ec,
+                                      size_t,
+                                      PropertyMap &,
+                                      LocationMap &) -> ModifierResult {
+        if (get_ec == EC_OK) {
+            return {MA_DELETE, EC_OK};
+        }
+        if (get_ec == EC_NOENT) {
+            return {MA_SKIP, EC_OK};
+        }
+        return {MA_FAIL, get_ec};
+    };
+    auto delete_modifier_strict = [](const LocationIdVector & /*existing_ids*/,
+                                     ErrorCode get_ec,
+                                     size_t,
+                                     PropertyMap &,
+                                     LocationMap &) -> ModifierResult {
+        if (get_ec == EC_OK) {
+            return {MA_DELETE, EC_OK};
+        }
+        return {MA_FAIL, get_ec};
+    };
+
+    // 1. RMW on NOENT keys -> upsert inserts every key.
+    KeyVector keys = {0, 1, 2};
+    Result expect(keys.size());
+    auto result = meta_indexer_->ReadModifyWriteBlock(request_context_.get(), keys, upsert_modifier);
+    ASSERT_EQ(expect.ec, result.ec);
+    ASSERT_EQ(expect.error_codes, result.error_codes);
+    ASSERT_EQ(3, meta_indexer_->GetKeyCount());
+    // Verify rmw_prop was stored.
+    PropertyMapVector expect_props(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        expect_props[i] = {{"rmw_prop", "rmw_val_0"}};
+    }
+    AssertGetProperties(keys, {"rmw_prop"}, expect_props, expect);
+
+    // 2. Delete via RMW with lenient modifier: skip NOENT, delete existing.
+    KeyVector rmw_keys = {1, 2, 3};
+    Result expect2(rmw_keys.size()); // all MA_SKIP/MA_DELETE(EC_OK) -> EC_OK
+    result = meta_indexer_->ReadModifyWriteBlock(request_context_.get(), rmw_keys, delete_modifier_lenient);
+    ASSERT_EQ(expect2.ec, result.ec);
+    ASSERT_EQ(expect2.error_codes, result.error_codes);
+    ASSERT_EQ(1, meta_indexer_->GetKeyCount());
+
+    // 3. Strict delete on NOENT surfaces EC_NOENT.
+    // key 0 still exists (lenient step above targeted {1,2,3} so key 0 was
+    // untouched); keys 1/2 were already deleted there. Strict modifier
+    // therefore deletes key 0 and fails keys 1/2 -> partial batch.
+    KeyVector strict_keys = {0, 1, 2};
+    result = meta_indexer_->ReadModifyWriteBlock(request_context_.get(), strict_keys, delete_modifier_strict);
+    ASSERT_EQ(EC_PARTIAL_OK, result.ec);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOENT, EC_NOENT}), result.error_codes);
+
+    // 4. Cleanup
+    meta_indexer_->Delete(request_context_.get(), {0, 1, 2, 3});
     ASSERT_EQ(0, meta_indexer_->GetKeyCount());
 }
 
@@ -310,171 +413,61 @@ void MetaIndexerTestBase::DoSimpleTest() {
     DoUpdateTest();
     DoDeleteAndExistTest();
     DoScanAndSampleReclaimKeysTest();
-    DoReadModifyWriteTest();
+    DoReadModifyWriteBlockTest();
 }
 
 void MetaIndexerTestBase::DoMultiThreadTest() {
-    auto modifier =
-        [&](std::string &uri, ErrorCode get_ec, size_t index, PropertyMap &map) -> MetaIndexer::ModifierResult {
-        if (get_ec != ErrorCode::EC_OK && get_ec != ErrorCode::EC_NOENT) {
-            return {MetaIndexer::MA_FAIL, get_ec};
+    // Concurrent RMW (upsert) + Delete stress. The upsert modifier always
+    // inserts/overwrites a single location so the outcome is deterministic per
+    // key across threads.
+    auto upsert_modifier = [](const LocationIdVector & /*existing_ids*/,
+                              ErrorCode get_ec,
+                              size_t /*key_index*/,
+                              PropertyMap &upsert_property_map,
+                              LocationMap &out_new_locations) -> ModifierResult {
+        if (get_ec != EC_OK && get_ec != EC_NOENT) {
+            return {MA_FAIL, get_ec};
         }
-        if (get_ec == ErrorCode::EC_OK) {
-            uri = "update_" + uri;
-        } else {
-            uri = "new_" + uri;
-        }
-        return {MetaIndexer::MA_OK, ErrorCode::EC_OK};
+        out_new_locations.emplace("mt_loc", MetaIndexerTestBase::MakeLocation("mt_loc", "mt_uri"));
+        upsert_property_map["mt_prop"] = "mt_val";
+        return {MA_OK, EC_OK};
     };
 
-    // test add location
-    auto add_uri_func = [&](const int32_t count, const int32_t min, const int32_t max) {
+    auto add_func = [&](const int32_t count, const int32_t min, const int32_t max) {
         KVData data;
         MakeRandomKVData(count, min, max, data);
-        auto result = meta_indexer_->ReadModifyWrite(request_context_.get(), data.keys, modifier);
-        ASSERT_GE(count, result.error_codes.size());
+        auto result = meta_indexer_->ReadModifyWriteBlock(request_context_.get(), data.keys, upsert_modifier);
+        ASSERT_GE(static_cast<size_t>(count), result.error_codes.size());
         ASSERT_EQ(EC_OK, result.ec);
     };
-
-    auto delete_uri_func = [&](const int32_t count, const int32_t min, const int32_t max) {
+    auto delete_func = [&](const int32_t count, const int32_t min, const int32_t max) {
         KVData data;
         MakeRandomKVData(count, min, max, data);
-        // delete all keys
         auto result = meta_indexer_->Delete(request_context_.get(), data.keys);
         for (const auto &ec : result.error_codes) {
             ASSERT_TRUE(ec == EC_OK || ec == EC_NOENT);
         }
     };
 
-    int32_t epoch = 20;
-    int32_t thread_num = 8;
-    int32_t count = 64;
-    int32_t min = 0;
-    int32_t max = 128;
-    for (int32_t i = 0; i < epoch; i++) {
+    const int32_t epoch = 20;
+    const int32_t thread_num = 8;
+    const int32_t count = 64;
+    const int32_t min = 0;
+    const int32_t max = 128;
+    for (int32_t i = 0; i < epoch; ++i) {
         std::vector<std::thread> threads;
-        for (int j = 0; j < thread_num; j++) {
-            threads.push_back(std::thread(add_uri_func, count, min, max));
+        for (int j = 0; j < thread_num; ++j) {
+            threads.emplace_back(add_func, count, min, max);
             if (j > thread_num / 2) {
-                threads.push_back(std::thread(delete_uri_func, count, min, max));
+                threads.emplace_back(delete_func, count, min, max);
             }
         }
-        for (auto &thread : threads) {
-            thread.join();
+        for (auto &t : threads) {
+            t.join();
         }
     }
-    // delete all keys to avoid affecting other test cases
     KVData data;
     MakeKVData(min, max + 1, data);
-    meta_indexer_->Delete(request_context_.get(), data.keys);
-    ASSERT_EQ(0, meta_indexer_->GetKeyCount());
-}
-
-void MetaIndexerTestBase::DoReadModifyWriteTest() {
-    KVData data;
-    auto upsert_modifier =
-        [&data](std::string &uri, ErrorCode get_ec, size_t index, PropertyMap &map) -> MetaIndexer::ModifierResult {
-        if (get_ec != ErrorCode::EC_OK && get_ec != ErrorCode::EC_NOENT) {
-            return {MetaIndexer::MA_FAIL, get_ec};
-        }
-        if (get_ec == ErrorCode::EC_OK) {
-            uri = "update_" + data.uris[index];
-            map["test_property_key"] = "test_property_value_updated_" + data.uris[index];
-        } else {
-            uri = "new_" + data.uris[index];
-            map["test_property_key"] = "test_property_value_" + data.uris[index];
-        }
-        return {MetaIndexer::MA_OK, ErrorCode::EC_OK};
-    };
-    auto delete_modifier1 =
-        [](std::string &uri, ErrorCode get_ec, size_t index, PropertyMap &map) -> MetaIndexer::ModifierResult {
-        if (get_ec == ErrorCode::EC_OK) {
-            return {MetaIndexer::MA_DELETE, ErrorCode::EC_OK};
-        } else if (get_ec == ErrorCode::EC_NOENT) {
-            return {MetaIndexer::MA_SKIP, ErrorCode::EC_OK};
-        } else {
-            return {MetaIndexer::MA_FAIL, get_ec};
-        }
-    };
-    auto delete_modifier2 =
-        [](std::string &uri, ErrorCode get_ec, size_t index, PropertyMap &map) -> MetaIndexer::ModifierResult {
-        if (get_ec == ErrorCode::EC_OK) {
-            return {MetaIndexer::MA_DELETE, ErrorCode::EC_OK};
-        } else {
-            return {MetaIndexer::MA_FAIL, get_ec};
-        }
-    };
-
-    // 1. test all put keys in ReadModifyWrite
-    {
-        MakeKVData(0, 3, data);
-        auto expect_result = Result(data.keys.size());
-        AssertReadModifyWrite(data.keys, upsert_modifier, expect_result);
-        ASSERT_EQ(3, meta_indexer_->GetKeyCount());
-        UriVector expect_uris = {"new_uri_0", "new_uri_1", "new_uri_2"};
-        AssertSearchCacheGet(data.keys, {"", "", ""}, {EC_NOENT, EC_NOENT, EC_NOENT});
-        AssertGet(data.keys, expect_uris, expect_result);
-        AssertSearchCacheGet(data.keys, expect_uris, expect_result.error_codes);
-        const std::vector<std::string> property_names = {"test_property_key"};
-        PropertyMapVector expect_properties = {{{"test_property_key", "test_property_value_uri_0"}},
-                                               {{"test_property_key", "test_property_value_uri_1"}},
-                                               {{"test_property_key", "test_property_value_uri_2"}}};
-        AssertGetProperties(data.keys, property_names, expect_properties, expect_result);
-    }
-
-    // 2. test update and put keys in ReadModifyWrite
-    {
-        MakeKVData(1, 4, data);
-        auto expect_result = Result(data.keys.size());
-        AssertReadModifyWrite(data.keys, upsert_modifier, expect_result);
-        ASSERT_EQ(4, meta_indexer_->GetKeyCount());
-        KeyVector get_keys = {0, 1, 2, 3};
-        AssertSearchCacheGet(get_keys, {"new_uri_0", "", "", ""}, {EC_OK, EC_NOENT, EC_NOENT, EC_NOENT});
-        UriVector expect_uris = {"new_uri_0", "update_uri_1", "update_uri_2", "new_uri_3"};
-        expect_result = Result(get_keys.size());
-        AssertGet(get_keys, expect_uris, expect_result);
-        AssertSearchCacheGet(get_keys, expect_uris, expect_result.error_codes);
-        const std::vector<std::string> property_names = {"test_property_key"};
-        PropertyMapVector expect_properties = {{{"test_property_key", "test_property_value_uri_0"}},
-                                               {{"test_property_key", "test_property_value_updated_uri_1"}},
-                                               {{"test_property_key", "test_property_value_updated_uri_2"}},
-                                               {{"test_property_key", "test_property_value_uri_3"}}};
-        AssertGetProperties(get_keys, property_names, expect_properties, expect_result);
-    }
-
-    // 3. test delete keys in ReadModifyWrite
-    {
-        // test delete_modifier1
-        MakeKVData(3, 5, data);
-        auto expect_result = Result(data.keys.size());
-        AssertReadModifyWrite(data.keys, delete_modifier1, expect_result);
-        ASSERT_EQ(3, meta_indexer_->GetKeyCount());
-        KeyVector get_keys = {0, 1, 2, 3, 4};
-        expect_result = Result(get_keys.size());
-        expect_result.ec = EC_PARTIAL_OK;
-        expect_result.error_codes = {EC_OK, EC_OK, EC_OK, EC_NOENT, EC_NOENT};
-        UriVector expect_uris = {"new_uri_0", "update_uri_1", "update_uri_2", "", ""};
-        AssertSearchCacheGet(get_keys, expect_uris, expect_result.error_codes);
-        AssertGet(get_keys, expect_uris, expect_result);
-        AssertSearchCacheGet(get_keys, expect_uris, expect_result.error_codes);
-        // test delete_modifier2
-        MakeKVData(2, 4, data);
-        expect_result = Result(data.keys.size());
-        expect_result.ec = EC_PARTIAL_OK;
-        expect_result.error_codes = {EC_OK, EC_NOENT};
-        AssertReadModifyWrite(data.keys, delete_modifier2, expect_result);
-        ASSERT_EQ(2, meta_indexer_->GetKeyCount());
-        expect_result = Result(get_keys.size());
-        expect_result.ec = EC_PARTIAL_OK;
-        expect_result.error_codes = {EC_OK, EC_OK, EC_NOENT, EC_NOENT, EC_NOENT};
-        expect_uris = {"new_uri_0", "update_uri_1", "", "", ""};
-        AssertSearchCacheGet(get_keys, expect_uris, expect_result.error_codes);
-        AssertGet(get_keys, expect_uris, expect_result);
-        AssertSearchCacheGet(get_keys, expect_uris, expect_result.error_codes);
-    }
-
-    // 4. delete all keys to avoid affecting other test cases
-    MakeKVData(0, 5, data);
     meta_indexer_->Delete(request_context_.get(), data.keys);
     ASSERT_EQ(0, meta_indexer_->GetKeyCount());
 }

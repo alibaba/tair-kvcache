@@ -25,7 +25,7 @@ cc_test(
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/optimizer/config",
         "//kv_cache_manager/optimizer/eviction_policy",
-        "//kv_cache_manager/manager:cache_location",
+        "//kv_cache_manager/manager:cache_location_view",
         "//kv_cache_manager/data_storage:common_define",
     ],
 )
