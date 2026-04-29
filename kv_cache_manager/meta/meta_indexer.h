@@ -16,12 +16,12 @@
 #include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/types.h"
+#include "kv_cache_manager/meta/meta_storage_backend_manager.h"
 
 namespace kv_cache_manager {
 
 class MetaIndexerConfig;
 class MetaSearchCache;
-class MetaStorageBackendManager;
 class RequestContext;
 class MetricsCollector;
 class MetricsRegistry;
@@ -91,38 +91,18 @@ public:
                          PropertyMapVector &out_properties) noexcept;
 
     // ---------- Modify ----------
-    // Block-level RMW: modifier sees the whole LocationMap; can add/remove/update
-    // multiple locations atomically under the per-block mutex.
-    Result ReadModifyWriteBlock(RequestContext *request_context,
-                                const KeyVector &keys,
-                                const BlockModifierFunc &modifier) noexcept;
-    // Lightweight block-level RMW: backend only reads the existing location id
-    // list (e.g. HKEYS) instead of the full location values. The modifier
-    // inspects the id list, optionally produces new CacheLocations to be written
-    // via out_new_locations. This avoids deserializing any existing location.
+    // Block-level RMW: modifier sees only existing location id list per key.
     Result ReadModifyWriteBlock(RequestContext *request_context,
                                 const KeyVector &keys,
                                 const BlockIdsOnlyModifierFunc &modifier) noexcept;
-    // Location-level RMW: modifier is invoked per (key, location_id), and the
-    // backend only reads/writes the targeted location field. If the modifier
-    // returns MA_DELETE the field is removed; if all locations of a block end
-    // up removed, the whole block_key is deleted and key_count_ is adjusted.
+    // Location-level RMW: modifier sees per-key CacheLocation vector.
     LocationResult ReadModifyWriteLocation(RequestContext *request_context,
                                            const KeyVector &keys,
                                            const LocationIdsPerKey &location_ids,
                                            const LocationModifierFunc &modifier) noexcept;
 
     // ---------- Delete ----------
-    // Delete the whole block_key (including all locations).
     Result Delete(RequestContext *request_context, const KeyVector &keys) noexcept;
-    // Delete the specified locations on each block_key. If after deletion a
-    // block_key has zero locations left, the whole block_key is removed and
-    // key_count_ is adjusted. The deleted CacheLocation objects are returned
-    // via out_deleted_locations so the caller can update storage usage stats.
-    LocationResult DeleteLocations(RequestContext *request_context,
-                                   const KeyVector &keys,
-                                   const LocationIdsPerKey &location_ids,
-                                   LocationsPerKey &out_deleted_locations) noexcept;
 
     // ---------- Scan / Sample ----------
     ErrorCode
@@ -218,6 +198,7 @@ private:
     // them. Uses mutex_shard_mask_ / batch_key_size_ directly so callers do
     // not have to thread them through.
     std::vector<BatchMetaData> MakeBatches(const KeyVector &keys,
+                                           const LocationIdsPerKey &location_ids,
                                            LocationMapVector &locations,
                                            PropertyMapVector &properties) const noexcept;
 
@@ -235,6 +216,41 @@ private:
                             const int32_t key_count,
                             Result &result) const noexcept;
 
+    // ----- ReadModifyWrite helpers -----
+    //
+    // Aggregates the per-RMW-call IO timings and key counters that every RMW
+    // entry point emits as metrics at the end of the operation. Bundling them
+    // into a single struct keeps the RMW bodies free of bookkeeping noise.
+    struct RmwStats {
+        int64_t get_io_time_us = 0;
+        int64_t upsert_io_time_us = 0;
+        int64_t delete_io_time_us = 0;
+        int64_t put_key_count = 0;    // brand-new keys created by upsert
+        int64_t update_key_count = 0; // existing keys updated by upsert
+        int64_t delete_key_count = 0; // keys deleted by whole-key delete
+    };
+
+    // Returns {error_count, put_success_count}.
+    // `request_context` is forwarded to the backend manager so CacheLocation
+    // serialization latency can be attributed to the originating request.
+    std::pair<int32_t, int32_t> ExecuteRmwUpsert(RequestContext *request_context,
+                                                 BatchMetaData &upsert_batch,
+                                                 const std::vector<int32_t> &put_global_indexs,
+                                                 const KeyVector &all_keys,
+                                                 RmwStats &stats,
+                                                 Result &result) noexcept;
+
+    // Returns {error_count, delete_success_count}.
+    std::pair<int32_t, int32_t> ExecuteRmwDelete(const std::string &trace_id,
+                                                 const BatchMetaData &delete_batch,
+                                                 const KeyVector &all_keys,
+                                                 RmwStats &stats,
+                                                 Result &result) noexcept;
+
+    void EmitBlockRmwMetrics(MetricsCollector *metrics_collector,
+                             const RmwStats &stats,
+                             size_t total_key_count) const noexcept;
+
 private:
     std::vector<std::unique_ptr<std::mutex>> mutex_shards_;
     std::unique_ptr<MetaStorageBackendManager> backend_manager_;
@@ -244,11 +260,6 @@ private:
     int64_t last_persist_metadata_time_ = 0;
     int64_t persist_metadata_interval_time_ms_ = 0;
     size_t max_key_count_ = MetaIndexerConfig::kDefaultMaxKeyCount;
-    // Bit mask used to fold a hash into a shard index in O(1):
-    //   shard_idx = hash & mutex_shard_mask_
-    // Equals (shard_num - 1) where shard_num MUST be a power of two
-    // (validated in Init()). Default kDefaultMutexShardNum is also a power of
-    // two so the initial mask is well-formed.
     size_t mutex_shard_mask_ = MetaIndexerConfig::kDefaultMutexShardNum - 1;
     size_t batch_key_size_ = MetaIndexerConfig::kDefaultBatchKeySize;
     std::string instance_id_;

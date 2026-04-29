@@ -356,3 +356,72 @@ TEST_F(MetaDummyBackendTest, TestRecoverBinarySafe) {
         ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Close());
     }
 }
+
+// Covers the new MetaStorageBackend interfaces DeleteFields / ExistsFieldWithPrefix
+// on the dummy backend: partial-field deletion preserves other fields, and the
+// prefix existence check reports accurately for existing / missing keys.
+TEST_F(MetaDummyBackendTest, TestDeleteFieldsAndExistsFieldWithPrefix) {
+    ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Init("test_instance_delete_fields", meta_storage_backend_config_));
+    ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Open());
+
+    // Seed two keys with location-prefixed + normal fields.
+    ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK, ErrorCode::EC_OK}),
+              meta_storage_backend_->Put({1, 2},
+                                         {{{LOCATION_PREFIX + "a", "la"}, {LOCATION_PREFIX + "b", "lb"}, {"p0", "v0"}},
+                                          {{LOCATION_PREFIX + "c", "lc"}, {"p0", "v0"}}}));
+
+    // Prefix check: both keys have LOCATION_PREFIX fields, key 3 does not exist.
+    AssertExistsFieldWithPrefix(meta_storage_backend_.get(),
+                                {1, 2, 3},
+                                LOCATION_PREFIX,
+                                {ErrorCode::EC_OK, ErrorCode::EC_OK, ErrorCode::EC_NOENT},
+                                {true, true, false});
+
+    // Delete one location field from key 1 and the sole location from key 2.
+    AssertDeleteFields(meta_storage_backend_.get(),
+                       {1, 2, 3},
+                       {{LOCATION_PREFIX + "a"}, {LOCATION_PREFIX + "c"}, {"anything"}},
+                       {ErrorCode::EC_OK, ErrorCode::EC_OK, ErrorCode::EC_NOENT});
+
+    // After deletion: key 1 still has one LOCATION_PREFIX field, key 2 has none.
+    AssertExistsFieldWithPrefix(meta_storage_backend_.get(),
+                                {1, 2},
+                                LOCATION_PREFIX,
+                                {ErrorCode::EC_OK, ErrorCode::EC_OK},
+                                {true, false});
+    // Non-deleted fields must survive.
+    AssertGet(meta_storage_backend_.get(),
+              {1, 2},
+              {LOCATION_PREFIX + "a", LOCATION_PREFIX + "b", "p0"},
+              {ErrorCode::EC_OK, ErrorCode::EC_OK},
+              {{{LOCATION_PREFIX + "b", "lb"}, {"p0", "v0"}}, {{"p0", "v0"}}});
+
+    ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Close());
+}
+
+// Covers the new Get overload that accepts a per-key field_names_vec:
+// each key may request a different subset of fields; missing keys report
+// EC_NOENT with empty FieldMap; size mismatch returns EC_BADARGS.
+TEST_F(MetaDummyBackendTest, TestGetWithPerKeyFieldNames) {
+    ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Init("test_instance_0", meta_storage_backend_config_));
+    ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Open());
+
+    ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK, ErrorCode::EC_OK}),
+              meta_storage_backend_->Put({1, 2},
+                                         {{{"f1", "v1-1"}, {"f2", "v1-2"}, {"f3", "v1-3"}},
+                                          {{"f1", "v2-1"}, {"f2", "v2-2"}}}));
+
+    // Each key queries a different subset; key 3 does not exist.
+    FieldMapVec field_maps;
+    ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK, ErrorCode::EC_OK, ErrorCode::EC_NOENT}),
+              meta_storage_backend_->Get({1, 2, 3},
+                                         std::vector<std::vector<std::string>>{{"f1", "f3"}, {"f2"}, {"f1"}},
+                                         field_maps));
+    ASSERT_EQ((FieldMapVec{{{"f1", "v1-1"}, {"f3", "v1-3"}}, {{"f2", "v2-2"}}, {}}), field_maps);
+
+    // Size mismatch between keys and field_names_vec -> EC_BADARGS per key.
+    ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_BADARGS, ErrorCode::EC_BADARGS}),
+              meta_storage_backend_->Get({1, 2}, std::vector<std::vector<std::string>>{{"f1"}}, field_maps));
+
+    ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Close());
+}

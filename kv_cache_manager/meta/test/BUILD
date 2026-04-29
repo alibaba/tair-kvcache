@@ -162,3 +162,43 @@ cc_test(
         "//kv_cache_manager/meta:meta_redis_backend",
     ],
 )
+
+cc_test(
+    name = "meta_storage_backend_manager_test",
+    srcs = [
+        "meta_storage_backend_manager_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    data = [],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/meta:cache_location",
+        "//kv_cache_manager/meta:common",
+        "//kv_cache_manager/meta:meta_dummy_backend",
+        "//kv_cache_manager/meta:meta_local_backend",
+        "//kv_cache_manager/meta:meta_storage_backend",
+        "//kv_cache_manager/meta:meta_storage_backend_manager",
+        "//kv_cache_manager/meta:types",
+    ],
+)
+
+cc_test(
+    name = "meta_storage_backend_manager_real_redis_test",
+    srcs = [
+        "meta_storage_backend_manager_real_redis_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    data = [],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/meta:cache_location",
+        "//kv_cache_manager/meta:common",
+        "//kv_cache_manager/meta:meta_storage_backend",
+        "//kv_cache_manager/meta:meta_storage_backend_manager",
+        "//kv_cache_manager/meta:types",
+    ],
+    tags = [
+        "manual",
+        "redis",
+    ],
+)

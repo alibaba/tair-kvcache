@@ -41,5 +41,17 @@ protected:
                                         const int64_t count,
                                         const ErrorCode expected_ec,
                                         const std::set<MetaStorageBackend::KeyType> &expected_keys);
+    // Invokes DeleteFields() and asserts the returned per-key ErrorCode vector.
+    static void AssertDeleteFields(MetaStorageBackend *meta_storage_backend,
+                                   const MetaStorageBackend::KeyTypeVec &keys,
+                                   const std::vector<std::vector<std::string>> &field_names_vec,
+                                   const std::vector<ErrorCode> &expected_ec_vec);
+    // Invokes ExistsFieldWithPrefix() and asserts both ErrorCode vector and the
+    // out_exists_vec (true if any field under `field_prefix` is present).
+    static void AssertExistsFieldWithPrefix(MetaStorageBackend *meta_storage_backend,
+                                            const MetaStorageBackend::KeyTypeVec &keys,
+                                            const std::string &field_prefix,
+                                            const std::vector<ErrorCode> &expected_ec_vec,
+                                            const std::vector<bool> &expected_exists_vec);
 };
 } // namespace kv_cache_manager
