@@ -29,6 +29,7 @@
 #include "kv_cache_manager/manager/data_storage_selector.h"
 #include "kv_cache_manager/manager/hash_util.h"
 #include "kv_cache_manager/manager/meta_searcher_manager.h"
+#include "kv_cache_manager/manager/priority_then_random_policy.h"
 #include "kv_cache_manager/manager/reclaimer_task_supervisor.h"
 #include "kv_cache_manager/manager/schedule_plan_executor.h"
 #include "kv_cache_manager/manager/select_location_policy.h"
@@ -962,7 +963,10 @@ ErrorCode CacheManager::FilterWriteCacheWithMinReplica(RequestContext *request_c
 
     auto existsForWrite = [&](size_t /*i*/, const CacheLocationMap &m) -> bool {
         if (weight_policy) {
-            return weight_policy->ExistsForWriteWithMinCount(m, min_replica_count);
+            // V8 §2.6: pass the stale-check so unavailable V6D replicas are
+            // excluded from n_total -- otherwise a host with an expired
+            // heartbeat would be counted toward the min_replica threshold.
+            return weight_policy->ExistsForWriteWithMinCount(m, min_replica_count, check_loc_data_exist);
         }
         std::vector<std::string> unused_prune;
         return policy->ExistsForWrite(m, check_loc_data_exist, unused_prune);
@@ -1924,6 +1928,15 @@ ErrorCode CacheManager::DoCleanup() {
 std::unique_ptr<SelectLocationPolicy> CacheManager::genSelectLocationPolicy(RequestContext *request_context,
                                                                             const std::string &instance_id) const {
     const auto &trace_id = request_context->trace_id();
+    // V8 §2.8: PriorityThenRandomSLPolicy is opt-in via env. When enabled it
+    // takes precedence over the auto-selected weighted policies below: the
+    // V6D ↔ TAIR weighting story relies on deterministic top-tier selection
+    // (e.g. VINEYARD=10 always beats TAIR_MEMPOOL=3) which discrete_distribution
+    // cannot guarantee.
+    static const std::string policy_env = EnvUtil::GetEnv("KVCM_SELECT_LOCATION_POLICY", std::string());
+    if (policy_env == "priority_then_random") {
+        return std::make_unique<PriorityThenRandomSLPolicy>();
+    }
     auto all_storages = registry_manager_->data_storage_manager()->GetAllStorageNames();
     auto all_available_storages = registry_manager_->data_storage_manager()->GetAvailableStorages();
     if (all_available_storages.size() >= all_storages.size()) {

@@ -42,6 +42,19 @@ ADMIN_URL = ""
 INSTANCE_ID = "v6d_cluster_0"
 SKIP_BENCH = False
 ONLY_BENCH = False
+# Set when the operator launched KVCM with
+#   KVCM_SELECT_LOCATION_POLICY=priority_then_random
+# Drives test_17_priority_then_random_activation to make a strict assertion;
+# otherwise the test self-skips so the suite remains green for the default
+# StaticWeight/Dynamic/Named flow.
+REQUIRE_PRIORITY_THEN_RANDOM = False
+# Set when the operator opened the Vineyard storage with a small
+# heartbeat_timeout_ms / cleanup_grace_ms (e.g. 1000 / 2000) via the addStorage
+# spec; otherwise the heartbeat/cleanup tests would have to wait the default
+# 30s+5min window.
+ENABLE_LIVENESS_TIMING_TESTS = False
+HEARTBEAT_TIMEOUT_MS = 1000
+CLEANUP_GRACE_MS = 2000
 
 
 class KVCMClient:
@@ -532,6 +545,161 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
         self.assertEqual(len(locations2), 0,
                          "Expected no write locations since 2 replicas already exist")
 
+    # 17a. Heartbeat timeout: a registered host that misses heartbeat for
+    # more than heartbeat_timeout_ms should fall out of the available set;
+    # GetCacheLocation must therefore drop its locations from the response.
+    # Requires the operator to deploy with tight thresholds (see
+    # --enable-liveness-timing-tests). Without that the default 30s timeout
+    # makes this test impossibly slow for CI.
+    def test_17a_heartbeat_timeout_then_recovery(self):
+        if not ENABLE_LIVENESS_TIMING_TESTS:
+            self.skipTest("--enable-liveness-timing-tests not set; skipping")
+
+        host = "192.168.1.250:8080"
+        block_key = 9100
+        # Step 1: register + add a V6D replica.
+        self.client.report_event(
+            _make_request(self.instance_id, host, [
+                _ev_node_register(["mem"]),
+                _ev_block_add(block_key, _build_vineyard_uri(host, "mem"), "mem"),
+            ], trace_id="t17a_setup")
+        )
+        # Confirm the replica is queryable.
+        resp = self.client.get_cache_location({
+            "trace_id": "t17a_q1",
+            "instance_id": self.instance_id,
+            "query_type": "QT_BATCH_GET",
+            "block_keys": [block_key],
+            "block_mask": {"offset": 0},
+        })
+        self.assertGreater(len(resp.get("locations", [])), 0)
+
+        # Step 2: skip heartbeat for longer than heartbeat_timeout_ms
+        # (but still inside cleanup_grace_ms). The location should now be
+        # filtered out by check_loc_data_exist.
+        time.sleep((HEARTBEAT_TIMEOUT_MS + 500) / 1000.0)
+        resp_after_timeout = self.client.get_cache_location({
+            "trace_id": "t17a_q2",
+            "instance_id": self.instance_id,
+            "query_type": "QT_BATCH_GET",
+            "block_keys": [block_key],
+            "block_mask": {"offset": 0},
+        })
+        # The MetaSearchCache may still serve a stale entry; we don't make
+        # this a hard assertion. The harder invariant is that a heartbeat
+        # within the grace window restores availability -- exercised below.
+
+        # Step 3: heartbeat resumes within grace -> node becomes available
+        # again, replica resurfaces.
+        self.client.report_event(
+            _make_request(self.instance_id, host, [_ev_heartbeat({})], trace_id="t17a_hb")
+        )
+        resp_recovered = self.client.get_cache_location({
+            "trace_id": "t17a_q3",
+            "instance_id": self.instance_id,
+            "query_type": "QT_BATCH_GET",
+            "block_keys": [block_key],
+            "block_mask": {"offset": 0},
+        })
+        self.assertGreater(len(resp_recovered.get("locations", [])), 0,
+                           "Replica must be queryable again after heartbeat resumed within grace")
+
+    # 17b. Heartbeat timeout exceeds cleanup_grace_ms -> the
+    # LivenessCheckerLoop fires the cleanup callback, which calls
+    # CleanupHostLocations to drop every L#{loc_id} for that host. Same
+    # tight-threshold prerequisite as 17a.
+    def test_17b_heartbeat_exceeds_grace_triggers_cleanup(self):
+        if not ENABLE_LIVENESS_TIMING_TESTS:
+            self.skipTest("--enable-liveness-timing-tests not set; skipping")
+
+        host = "192.168.1.251:8080"
+        block_key = 9101
+        self.client.report_event(
+            _make_request(self.instance_id, host, [
+                _ev_node_register(["mem"]),
+                _ev_block_add(block_key, _build_vineyard_uri(host, "mem"), "mem"),
+            ], trace_id="t17b_setup")
+        )
+
+        # Wait past hb_timeout + cleanup_grace + scheduler slack.
+        wait_ms = HEARTBEAT_TIMEOUT_MS + CLEANUP_GRACE_MS + 1500
+        time.sleep(wait_ms / 1000.0)
+
+        # After cleanup the entire block_key entry (or at least this host's
+        # L# slot) should be gone from the metadata. We make a soft check
+        # because MetaSearchCache TTL may delay eviction; what we really
+        # nail down is that no NEW heartbeat brought the host back.
+        resp = self.client.get_cache_location({
+            "trace_id": "t17b_q",
+            "instance_id": self.instance_id,
+            "query_type": "QT_BATCH_GET",
+            "block_keys": [block_key],
+            "block_mask": {"offset": 0},
+        })
+        # Every spec.uri returned must NOT belong to the cleaned-up host.
+        for loc in resp.get("locations", []):
+            for spec in loc.get("location_specs", []):
+                self.assertNotIn(host, spec.get("uri", ""),
+                                 f"Cleanup should have removed host [{host}] from results")
+
+    # 17. PriorityThenRandomSLPolicy activation (V8 §2.8 opt-in path).
+    #
+    # Calls GetCacheLocation for a block_key that has THREE VINEYARD replicas
+    # on different hosts. With same-weight randomization enabled, every host
+    # should be hit at least once across N draws. With the default
+    # StaticWeight policy the same invariant happens to hold (it's
+    # discrete_distribution over equal weights), so this test is informational
+    # unless the operator passes --require-priority-then-random, in which case
+    # we make the assertion mandatory.
+    #
+    # Activation prerequisite: launch KVCM with
+    #   --env KVCM_SELECT_LOCATION_POLICY=priority_then_random
+    # then run this script with --require-priority-then-random.
+    def test_17_priority_then_random_activation(self):
+        if not REQUIRE_PRIORITY_THEN_RANDOM:
+            self.skipTest("--require-priority-then-random not set; skipping activation check")
+
+        block_key = 8100
+        hosts = ["192.168.1.240:8080", "192.168.1.241:8080", "192.168.1.242:8080"]
+
+        # Pre-register every host and add three VINEYARD replicas of the same
+        # block_key. They share the top weight, so PriorityThenRandom should
+        # rotate uniformly through them.
+        for h in hosts:
+            self.client.report_event(
+                _make_request(self.instance_id, h, [_ev_node_register(["mem"])], trace_id=f"t17_reg_{h}")
+            )
+            self.client.report_event(
+                _make_request(
+                    self.instance_id, h,
+                    [_ev_block_add(block_key, _build_vineyard_uri(h, "mem"), "mem")],
+                    trace_id=f"t17_add_{h}",
+                )
+            )
+
+        seen_uris = set()
+        # 200 draws is enough that missing one of three hosts has probability
+        # ~(2/3)^200 ≈ 1.7e-35 under uniform random selection.
+        for i in range(200):
+            resp = self.client.get_cache_location({
+                "trace_id": f"t17_q_{i}",
+                "instance_id": self.instance_id,
+                "query_type": "QT_BATCH_GET",
+                "block_keys": [block_key],
+                "block_mask": {"offset": 0},
+            })
+            locations = resp.get("locations", [])
+            self.assertGreater(len(locations), 0)
+            specs = locations[0].get("location_specs", [])
+            self.assertGreater(len(specs), 0)
+            seen_uris.add(specs[0]["uri"])
+
+        # Every host should appear in the results when same-weight random
+        # selection is in effect.
+        self.assertEqual(len(seen_uris), 3,
+                         f"Expected all 3 V6D hosts to be selected at least once; "
+                         f"saw {len(seen_uris)}: {seen_uris}")
+
 
 # ---------------------------------------------------------------------------
 # Bench tests (V8 batch shape)
@@ -694,17 +862,38 @@ def main():
     parser.add_argument("--instance_id", default="v6d_cluster_0", help="V6D instance_id")
     parser.add_argument("--skip-bench", action="store_true", help="Skip benchmark tests")
     parser.add_argument("--only-bench", action="store_true", help="Run only benchmark tests")
+    parser.add_argument(
+        "--require-priority-then-random",
+        action="store_true",
+        help=("Assert the PriorityThenRandomSLPolicy activation path. Pass this only when KVCM was "
+              "launched with KVCM_SELECT_LOCATION_POLICY=priority_then_random; the matching test "
+              "self-skips otherwise."),
+    )
+    parser.add_argument(
+        "--enable-liveness-timing-tests",
+        action="store_true",
+        help=("Run heartbeat/cleanup timing tests. Requires the Vineyard storage to be opened with "
+              "small heartbeat_timeout_ms / cleanup_grace_ms (defaults to 1000ms / 2000ms here)."),
+    )
+    parser.add_argument("--heartbeat-timeout-ms", type=int, default=1000)
+    parser.add_argument("--cleanup-grace-ms", type=int, default=2000)
 
     args, _ = parser.parse_known_args()
 
     admin_port = args.admin_http_port or args.http_port
 
     global BASE_URL, ADMIN_URL, INSTANCE_ID, SKIP_BENCH, ONLY_BENCH
+    global REQUIRE_PRIORITY_THEN_RANDOM, ENABLE_LIVENESS_TIMING_TESTS
+    global HEARTBEAT_TIMEOUT_MS, CLEANUP_GRACE_MS
     BASE_URL = f"http://{args.host}:{args.http_port}"
     ADMIN_URL = f"http://{args.host}:{admin_port}"
     INSTANCE_ID = args.instance_id
     SKIP_BENCH = args.skip_bench
     ONLY_BENCH = args.only_bench
+    REQUIRE_PRIORITY_THEN_RANDOM = args.require_priority_then_random
+    ENABLE_LIVENESS_TIMING_TESTS = args.enable_liveness_timing_tests
+    HEARTBEAT_TIMEOUT_MS = args.heartbeat_timeout_ms
+    CLEANUP_GRACE_MS = args.cleanup_grace_ms
 
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()

@@ -50,10 +50,17 @@ public:
                         CheckLocDataExistFunc check_loc_data_exist,
                         std::vector<std::string> &out_prune_loc_ids) const override;
 
-    // Returns true when the number of available locations (weight > 0,
-    // status != NOT_FOUND) reaches min_count.  Used by V6D eviction to
-    // require >= 2 replicas before skipping the write.
-    bool ExistsForWriteWithMinCount(const CacheLocationMap &location_map, int32_t min_count) const;
+    // Returns true when the number of effective replicas reaches min_count.
+    // A location counts as a replica iff:
+    //   - status != CLS_NOT_FOUND
+    //   - GetWeight(kv) > 0
+    //   - check_loc_data_exist (when supplied) returns true for it
+    // Used by V6D eviction (V8 §2.6) to require >= 2 replicas before skipping
+    // the write. The optional check_loc_data_exist hook lets the caller
+    // exclude stale replicas (e.g. V6D nodes that just timed out heartbeat).
+    bool ExistsForWriteWithMinCount(const CacheLocationMap &location_map,
+                                    int32_t min_count,
+                                    CheckLocDataExistFunc check_loc_data_exist = nullptr) const;
 
 protected:
     virtual uint32_t GetWeight(CacheLocationMap::const_reference kv) const = 0;

@@ -129,16 +129,29 @@ bool WeightSLPolicy::ExistsForWrite(const CacheLocationMap &location_map,
     return exists;
 }
 
-bool WeightSLPolicy::ExistsForWriteWithMinCount(const CacheLocationMap &location_map, int32_t min_count) const {
+bool WeightSLPolicy::ExistsForWriteWithMinCount(const CacheLocationMap &location_map,
+                                                int32_t min_count,
+                                                CheckLocDataExistFunc check_loc_data_exist) const {
     int32_t count = 0;
     for (auto &kv : location_map) {
-        if (kv.second.status() != CacheLocationStatus::CLS_NOT_FOUND) {
-            if (GetWeight(kv) > 0) {
-                ++count;
-                if (count >= min_count) {
-                    return true;
-                }
-            }
+        if (kv.second.status() == CacheLocationStatus::CLS_NOT_FOUND) {
+            continue;
+        }
+        if (GetWeight(kv) == 0) {
+            continue;
+        }
+        // V8 §2.6: stale replicas must not contribute to n_total. We only
+        // apply the staleness check to CLS_SERVING entries -- CLS_WRITING
+        // is a placeholder for an in-flight write and conventionally bypasses
+        // the data-existence predicate (see ExistsForWrite for the same
+        // rationale).
+        if (check_loc_data_exist && kv.second.status() == CacheLocationStatus::CLS_SERVING &&
+            !check_loc_data_exist(kv.second)) {
+            continue;
+        }
+        ++count;
+        if (count >= min_count) {
+            return true;
         }
     }
     return false;
