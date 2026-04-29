@@ -142,4 +142,25 @@ void MetaStorageBackendTestBase::AssertSampleReclaimKeys(MetaStorageBackend *met
     }
 }
 
+void MetaStorageBackendTestBase::AssertDeleteFields(MetaStorageBackend *meta_storage_backend,
+                                                    const KeyTypeVec &keys,
+                                                    const std::vector<std::vector<std::string>> &field_names_vec,
+                                                    const std::vector<ErrorCode> &expected_ec_vec) {
+    ASSERT_TRUE(meta_storage_backend);
+    std::vector<ErrorCode> ec_vec = meta_storage_backend->DeleteFields(keys, field_names_vec);
+    ASSERT_EQ(expected_ec_vec, ec_vec);
+}
+
+void MetaStorageBackendTestBase::AssertExistsFieldWithPrefix(MetaStorageBackend *meta_storage_backend,
+                                                             const KeyTypeVec &keys,
+                                                             const std::string &field_prefix,
+                                                             const std::vector<ErrorCode> &expected_ec_vec,
+                                                             const std::vector<bool> &expected_exists_vec) {
+    ASSERT_TRUE(meta_storage_backend);
+    std::vector<bool> exists_vec;
+    std::vector<ErrorCode> ec_vec = meta_storage_backend->ExistsFieldWithPrefix(keys, field_prefix, exists_vec);
+    ASSERT_EQ(expected_ec_vec, ec_vec);
+    ASSERT_EQ(expected_exists_vec, exists_vec);
+}
+
 } // namespace kv_cache_manager

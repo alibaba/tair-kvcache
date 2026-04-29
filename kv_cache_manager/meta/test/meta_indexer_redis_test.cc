@@ -47,9 +47,9 @@ TEST_F(MetaIndexerRedisTest, TestInit) {
     ASSERT_EQ(7, meta_indexer_->mutex_shard_mask_);
     ASSERT_TRUE(meta_indexer_->cache_);
     ASSERT_EQ(1024, meta_indexer_->cache_->cache_size_);
-    ASSERT_EQ(META_REDIS_BACKEND_TYPE_STR, meta_indexer_->storage_->GetStorageType());
+    ASSERT_EQ(META_REDIS_BACKEND_TYPE_STR, meta_indexer_->backend_manager_->persistent_backend_->GetStorageType());
 
-    auto *redis_storage = dynamic_cast<MetaRedisBackend *>(meta_indexer_->storage_.get());
+    auto *redis_storage = dynamic_cast<MetaRedisBackend *>(meta_indexer_->backend_manager_->persistent_backend_.get());
     ASSERT_TRUE(redis_storage);
     const StandardUri &storage_uri = redis_storage->storage_uri_;
     ASSERT_EQ("test_redis_user:test_redis_password", storage_uri.GetUserInfo());
@@ -76,7 +76,7 @@ TEST_F(MetaIndexerRedisTest, TestRedisSimple) {
     ASSERT_EQ(EC_OK, InitIndexer(configStr));
     ASSERT_EQ(100, meta_indexer_->max_key_count_);
     ASSERT_EQ(7, meta_indexer_->mutex_shard_mask_);
-    ASSERT_EQ(META_REDIS_BACKEND_TYPE_STR, meta_indexer_->storage_->GetStorageType());
+    ASSERT_EQ(META_REDIS_BACKEND_TYPE_STR, meta_indexer_->backend_manager_->persistent_backend_->GetStorageType());
     ASSERT_TRUE(meta_indexer_->cache_);
     ASSERT_EQ(1024, meta_indexer_->cache_->cache_size_);
     DoSimpleTest();
@@ -84,24 +84,25 @@ TEST_F(MetaIndexerRedisTest, TestRedisSimple) {
     // test redis recover
     ASSERT_EQ(0, meta_indexer_->GetKeyCount());
     KVData data;
-    int32_t key_count = 3;
+    const int32_t key_count = 3;
     MakeKVData(/*start*/ 0, /*end*/ 3, data);
-    auto result = meta_indexer_->Put(request_context_.get(), data.keys, data.uris, data.properties);
+    // Snapshot the expected location payload before Put potentially moves inputs.
+    LocationMapVector expect_locations;
+    expect_locations.reserve(data.location_maps.size());
+    for (const auto &location_map : data.location_maps) {
+        expect_locations.emplace_back(location_map);
+    }
+    Result expect_result(key_count);
+    auto result = meta_indexer_->Put(request_context_.get(), data.keys, data.location_maps, data.properties);
     ASSERT_EQ(key_count, meta_indexer_->GetKeyCount());
     ASSERT_EQ(EC_OK, result.ec);
-    AssertSearchCacheGet({0, 1, 2}, {"", "", ""}, {EC_NOENT, EC_NOENT, EC_NOENT});
-    Result expect_result(3);
-    UriVector expect_uris = {"uri_0", "uri_1", "uri_2"};
-    AssertGet({0, 1, 2}, expect_uris, expect_result);
-    AssertSearchCacheGet({0, 1, 2}, expect_uris, {EC_OK, EC_OK, EC_OK});
+    AssertGet(data.keys, expect_locations, expect_result);
 
     meta_indexer_->PersistMetaData();
     meta_indexer_ = std::make_unique<MetaIndexer>();
     ASSERT_EQ(EC_OK, InitIndexer(configStr));
     ASSERT_EQ(key_count, meta_indexer_->GetKeyCount());
-    AssertSearchCacheGet({0, 1, 2}, {"", "", ""}, {EC_NOENT, EC_NOENT, EC_NOENT});
-    AssertGet({0, 1, 2}, expect_uris, expect_result);
-    AssertSearchCacheGet({0, 1, 2}, expect_uris, {EC_OK, EC_OK, EC_OK});
+    AssertGet(data.keys, expect_locations, expect_result);
 }
 
 TEST_F(MetaIndexerRedisTest, TestMultiThread) {
@@ -122,7 +123,7 @@ TEST_F(MetaIndexerRedisTest, TestMultiThread) {
     ASSERT_EQ(10000, meta_indexer_->max_key_count_);
     ASSERT_EQ(7, meta_indexer_->mutex_shard_mask_);
     ASSERT_EQ(8, meta_indexer_->batch_key_size_);
-    ASSERT_EQ(META_REDIS_BACKEND_TYPE_STR, meta_indexer_->storage_->GetStorageType());
+    ASSERT_EQ(META_REDIS_BACKEND_TYPE_STR, meta_indexer_->backend_manager_->persistent_backend_->GetStorageType());
     ASSERT_TRUE(meta_indexer_->cache_);
     ASSERT_EQ(1024, meta_indexer_->cache_->cache_size_);
     DoMultiThreadTest();

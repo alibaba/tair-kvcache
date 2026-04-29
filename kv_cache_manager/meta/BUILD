@@ -35,12 +35,7 @@ cc_library(
     deps = [
         ":cache_location",
         ":common",
-        ":meta_cached_backend",
-        ":meta_dummy_backend",
-        ":meta_local_backend",
-        ":meta_redis_backend",
         ":meta_search_cache",
-        ":meta_storage_backend",
         ":meta_storage_backend_manager",
         ":types",
         ":utils",
@@ -72,7 +67,9 @@ cc_library(
         ":types",
         "//kv_cache_manager/common",
         "//kv_cache_manager/common:standard_uri",
+        "//kv_cache_manager/common:timestamp_util",
         "//kv_cache_manager/config",
+        "//kv_cache_manager/metrics:metrics_collector",
     ],
 )
 

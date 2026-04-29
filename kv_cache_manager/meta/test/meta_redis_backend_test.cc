@@ -303,7 +303,8 @@ TEST_F(MetaRedisBackendTest, TestRedisError) {
     ASSERT_EQ(std::vector<bool>(2, false), is_exist_vec);
 
     FieldMapVec field_maps;
-    ASSERT_EQ((std::vector<ErrorCode>{EC_ERROR, EC_ERROR}), meta_redis_backend_->Get({1, 2}, {"f1", "f2"}, field_maps));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_ERROR, EC_ERROR}),
+              meta_redis_backend_->Get({1, 2}, std::vector<std::string>{"f1", "f2"}, field_maps));
     ASSERT_EQ(std::vector<FieldMap>(2), field_maps);
     ASSERT_EQ((std::vector<ErrorCode>{EC_ERROR, EC_ERROR}), meta_redis_backend_->GetAllFields({1, 2}, field_maps));
     ASSERT_EQ(std::vector<FieldMap>(2), field_maps);
@@ -363,6 +364,85 @@ TEST_F(MetaRedisBackendTest, TestMultiThreadSimple) {
     for (auto &thread : threads) {
         thread.join();
     }
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
+}
+
+// Covers the new MetaStorageBackend interfaces on redis backend:
+// - DeleteFields   -> HDEL <full_key> <field...> per key (integer=0 => EC_NOENT).
+// - Get(per-key)   -> HMGET <full_key> <field...> per key with its own subset.
+// - ExistsFieldWithPrefix -> HSCAN <full_key> 0 MATCH <prefix>* COUNT 1000 per key.
+TEST_F(MetaRedisBackendTest, TestNewInterfaces) {
+    EXPECT_CALL(*meta_redis_backend_, CreateRedisClient()).WillOnce(Invoke([]() {
+        StandardUri empty_storage_uri;
+        auto mock_redis_client = std::make_unique<MockRedisClient>(empty_storage_uri);
+        EXPECT_CALL(*mock_redis_client, IsContextOk()).WillRepeatedly(Return(true));
+        EXPECT_CALL(*mock_redis_client, Reconnect()).WillRepeatedly(Return(true));
+
+        // DeleteFields: key 1 removes 1 field (=> EC_OK), key 2 removes a missing field (=> EC_NOENT).
+        std::vector<ReplyUPtr> del_fields_replies;
+        del_fields_replies.emplace_back(MakeFakeReplyInteger(1));
+        del_fields_replies.emplace_back(MakeFakeReplyInteger(0));
+        EXPECT_CALL(
+            *mock_redis_client,
+            TryExecPipeline(ElementsAre(
+                ElementsAre(StrEq("HDEL"), StrEq("kvcache:instance_instance_0:cache_1"), StrEq("f1")),
+                ElementsAre(StrEq("HDEL"), StrEq("kvcache:instance_instance_0:cache_2"), StrEq("f2")))))
+            .WillOnce(Return(ByMove(std::move(del_fields_replies))));
+
+        // Get(per-key field_names_vec): key 1 asks {f1}, key 2 asks {f2}.
+        std::vector<ReplyUPtr> get_per_key_replies;
+        get_per_key_replies.emplace_back(MakeFakeReplyArrayString({"v1-1"}));
+        get_per_key_replies.emplace_back(MakeFakeReplyArrayString({"v2-2"}));
+        EXPECT_CALL(
+            *mock_redis_client,
+            TryExecPipeline(ElementsAre(
+                ElementsAre(StrEq("HMGET"), StrEq("kvcache:instance_instance_0:cache_1"), StrEq("f1")),
+                ElementsAre(StrEq("HMGET"), StrEq("kvcache:instance_instance_0:cache_2"), StrEq("f2")))))
+            .WillOnce(Return(ByMove(std::move(get_per_key_replies))));
+
+        // ExistsFieldWithPrefix: key 1 hits on first HSCAN (elements=2 -> true),
+        // key 2 returns empty with next_cursor=0 (-> false).
+        std::vector<ReplyUPtr> hscan_replies;
+        hscan_replies.emplace_back(MakeFakeReplyScan(/*next_cursor*/ "0", {"__loc__a", "la"}));
+        hscan_replies.emplace_back(MakeFakeReplyScan(/*next_cursor*/ "0", {}));
+        EXPECT_CALL(*mock_redis_client,
+                    TryExecPipeline(ElementsAre(
+                        ElementsAre(StrEq("HSCAN"),
+                                    StrEq("kvcache:instance_instance_0:cache_1"),
+                                    StrEq("0"),
+                                    StrEq("MATCH"),
+                                    StrEq(LOCATION_PREFIX + "*"),
+                                    StrEq("COUNT"),
+                                    StrEq("1000")),
+                        ElementsAre(StrEq("HSCAN"),
+                                    StrEq("kvcache:instance_instance_0:cache_2"),
+                                    StrEq("0"),
+                                    StrEq("MATCH"),
+                                    StrEq(LOCATION_PREFIX + "*"),
+                                    StrEq("COUNT"),
+                                    StrEq("1000")))))
+            .WillOnce(Return(ByMove(std::move(hscan_replies))));
+        return mock_redis_client;
+    }));
+
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Init("instance_0", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
+
+    AssertDeleteFields(meta_redis_backend_.get(),
+                       {1, 2},
+                       /*field_names_vec*/ {{"f1"}, {"f2"}},
+                       {EC_OK, EC_NOENT});
+
+    FieldMapVec field_maps;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
+              meta_redis_backend_->Get({1, 2},
+                                       std::vector<std::vector<std::string>>{{"f1"}, {"f2"}},
+                                       field_maps));
+    ASSERT_EQ((FieldMapVec{{{"f1", "v1-1"}}, {{"f2", "v2-2"}}}), field_maps);
+
+    AssertExistsFieldWithPrefix(
+        meta_redis_backend_.get(), {1, 2}, LOCATION_PREFIX, {EC_OK, EC_OK}, {true, false});
+
     ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
 }
 

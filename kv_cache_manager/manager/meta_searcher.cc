@@ -1,5 +1,6 @@
 #include "kv_cache_manager/manager/meta_searcher.h"
 
+#include <algorithm>
 #include <map>
 #include <set>
 #include <utility>
@@ -136,7 +137,7 @@ ErrorCode MetaSearcher::PrefixMatchBestLocationImpl(RequestContext *request_cont
 
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerGet);
-    MetaIndexer::LocationMapVector location_maps;
+    LocationMapVector location_maps;
     auto result = meta_indexer_->GetLocations(request_context, keys, location_maps);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerGet);
 
@@ -229,7 +230,7 @@ ErrorCode MetaSearcher::BatchGetBestLocation(RequestContext *request_context,
     out_locations.reserve(keys.size());
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerGet);
-    MetaIndexer::LocationMapVector location_maps;
+    LocationMapVector location_maps;
     auto result = meta_indexer_->GetLocations(request_context, keys, location_maps);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerGet);
     KeyVector prune_keys;
@@ -283,7 +284,7 @@ ErrorCode MetaSearcher::ReverseRollSlideWindowMatch(RequestContext *request_cont
     out_locations.assign(keys.size(), {});
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerGet);
-    MetaIndexer::LocationMapVector location_maps;
+    LocationMapVector location_maps;
     auto result = meta_indexer_->GetLocations(request_context, keys, location_maps);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerGet);
     bool is_match = false;
@@ -380,15 +381,14 @@ ErrorCode MetaSearcher::BatchAddLocation(RequestContext *request_context,
     out_location_ids.resize(keys.size());
     std::vector<std::pair<DataStorageType, std::uint64_t>> loc_sz(keys.size());
 
-    auto modifier = [&locations, &out_location_ids, &keys, &loc_sz](
-                        const MetaIndexer::LocationIdVector &existing_ids,
-                        ErrorCode get_ec,
-                        size_t index,
-                        MetaIndexer::PropertyMap &upsert_property_map,
-                        MetaIndexer::LocationMap &out_new_locations) -> MetaIndexer::ModifierResult {
+    auto modifier = [&locations, &out_location_ids, &keys, &loc_sz](const LocationIdVector &existing_ids,
+                                                                    ErrorCode get_ec,
+                                                                    size_t index,
+                                                                    PropertyMap &upsert_property_map,
+                                                                    LocationMap &out_new_locations) -> ModifierResult {
         if (get_ec != ErrorCode::EC_OK && get_ec != ErrorCode::EC_NOENT) {
             KVCM_LOG_WARN("load location failed, key[%lu](%lu) return %d", index, keys[index], get_ec);
-            return {MetaIndexer::MA_FAIL, get_ec};
+            return {ModifierAction::MA_FAIL, get_ec};
         }
 
         // first time this block_key is created: record prev_key
@@ -425,7 +425,7 @@ ErrorCode MetaSearcher::BatchAddLocation(RequestContext *request_context,
         loc_sz[index] = std::make_pair(locations[index].type(), sz);
 
         out_location_ids[index] = std::move(location_id);
-        return {MetaIndexer::MA_OK, ErrorCode::EC_OK};
+        return {ModifierAction::MA_OK, ErrorCode::EC_OK};
     };
 
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
@@ -457,53 +457,60 @@ ErrorCode MetaSearcher::BatchUpdateLocationStatus(RequestContext *request_contex
     out_batch_results.clear();
     out_batch_results.resize(keys.size());
 
-    // Build LocationIdsPerKey and a task lookup map from batch_tasks.
-    MetaIndexer::LocationIdsPerKey location_ids_per_key(keys.size());
-    // task_status_map[key_index][location_id] = new_status
-    std::vector<std::map<std::string, CacheLocationStatus>> task_status_map(keys.size());
+    // Build LocationIdsPerKey directly aligned with batch_tasks; the modifier
+    // re-uses the same indexing instead of an auxiliary id-keyed lookup.
+    LocationIdsPerKey location_ids_per_key(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
+        location_ids_per_key[i].reserve(batch_tasks[i].size());
         for (const auto &task : batch_tasks[i]) {
             location_ids_per_key[i].push_back(task.location_id);
-            task_status_map[i][task.location_id] = task.new_status;
         }
     }
 
-    auto modifier = [&keys,
-                     &task_status_map](CacheLocation &loc,
-                                       ErrorCode get_ec,
-                                       size_t key_index,
-                                       const MetaIndexer::LocationId &loc_id,
-                                       MetaIndexer::PropertyMap &upsert_property_map) -> MetaIndexer::ModifierResult {
-        if (get_ec == ErrorCode::EC_NOENT) {
-            return {MetaIndexer::MA_SKIP, ErrorCode::EC_NOENT};
+    // Per-key modifier: OK slots flip to new_status and report EC_OK so the
+    // upsert ec eventually lands on them; NOENT slots are reported as EC_OK
+    // (idempotent no-op); hard errors are surfaced verbatim per slot.
+    auto modifier = [&keys, &batch_tasks](CacheLocationVector &locs,
+                                          const std::vector<ErrorCode> &get_ecs,
+                                          size_t key_index,
+                                          const LocationIdVector &loc_ids,
+                                          PropertyMap &upsert_property_map) -> LocationModifierResult {
+        (void)upsert_property_map;
+        std::vector<ErrorCode> modifier_ecs(loc_ids.size(), ErrorCode::EC_OK);
+        bool updated = false;
+        for (size_t k = 0; k < loc_ids.size(); ++k) {
+            const ErrorCode ec = get_ecs[k];
+            if (ec == ErrorCode::EC_OK) {
+                updated = true;
+                locs[k].set_status(batch_tasks[key_index][k].new_status);
+            } else if (ec == ErrorCode::EC_NOENT) {
+                modifier_ecs[k] = ec;
+                KVCM_LOG_WARN("load location failed, key[%lu](%lu), location_id: %s, return %d",
+                              key_index,
+                              keys[key_index],
+                              loc_ids[k].c_str(),
+                              ec);
+            } else {
+                KVCM_LOG_WARN("location json parse failed, key[%lu](%lu), loc_id: %s",
+                              key_index,
+                              keys[key_index],
+                              loc_ids[k].c_str());
+                modifier_ecs.assign(loc_ids.size(), ErrorCode::EC_CORRUPTION);
+                return {ModifierAction::MA_FAIL, std::move(modifier_ecs)};
+            }
         }
-        if (get_ec != ErrorCode::EC_OK) {
-            KVCM_LOG_WARN("load location failed, key[%lu](%lu), location_id: %s, return %d",
-                          key_index,
-                          keys[key_index],
-                          loc_id.c_str(),
-                          get_ec);
-            return {MetaIndexer::MA_FAIL, get_ec};
+        if (!updated) {
+            // do not need to update status, skip and return ok
+            return {ModifierAction::MA_SKIP, std::move(modifier_ecs)};
         }
-        auto it = task_status_map[key_index].find(loc_id);
-        if (it == task_status_map[key_index].end()) {
-            return {MetaIndexer::MA_SKIP, ErrorCode::EC_NOENT};
-        }
-        loc.set_status(it->second);
-        return {MetaIndexer::MA_OK, ErrorCode::EC_OK};
+        return {ModifierAction::MA_OK, std::move(modifier_ecs)};
     };
 
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
     auto result = meta_indexer_->ReadModifyWriteLocation(request_context, keys, location_ids_per_key, modifier);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
-    for (size_t i = 0; i < keys.size(); ++i) {
-        if (i < result.per_location_error_codes.size()) {
-            out_batch_results[i] = result.per_location_error_codes[i];
-        } else {
-            out_batch_results[i].assign(batch_tasks[i].size(), ErrorCode::EC_ERROR);
-        }
-    }
+    out_batch_results = std::move(result.per_location_error_codes);
 
     if (result.ec != ErrorCode::EC_OK) {
         KVCM_LOG_WARN("meta_indexer_->ReadModifyWriteLocation failed, ec: %d", result.ec);
@@ -522,59 +529,65 @@ ErrorCode MetaSearcher::BatchCASLocationStatus(RequestContext *request_context,
     out_batch_results.clear();
     out_batch_results.resize(keys.size());
 
-    // Build LocationIdsPerKey and a task lookup map from batch_tasks.
-    MetaIndexer::LocationIdsPerKey location_ids_per_key(keys.size());
-    // task_map[key_index][location_id] = {old_status, new_status}
-    struct CASPair {
-        CacheLocationStatus old_status;
-        CacheLocationStatus new_status;
-    };
-    std::vector<std::map<std::string, CASPair>> task_map(keys.size());
+    // Build LocationIdsPerKey directly aligned with batch_tasks (same
+    // contract as BatchUpdateLocationStatus).
+    LocationIdsPerKey location_ids_per_key(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
+        location_ids_per_key[i].reserve(batch_tasks[i].size());
         for (const auto &task : batch_tasks[i]) {
             location_ids_per_key[i].push_back(task.location_id);
-            task_map[i][task.location_id] = {task.old_status, task.new_status};
         }
     }
 
-    auto modifier = [&keys, &task_map](CacheLocation &loc,
-                                       ErrorCode get_ec,
-                                       size_t key_index,
-                                       const MetaIndexer::LocationId &loc_id,
-                                       MetaIndexer::PropertyMap &upsert_property_map) -> MetaIndexer::ModifierResult {
-        if (get_ec == ErrorCode::EC_NOENT) {
-            return {MetaIndexer::MA_SKIP, ErrorCode::EC_NOENT};
+    // Per-key CAS modifier: OK slot whose status matches old_status flips to
+    // new_status (slot ec EC_OK -> participates in upsert); status mismatch
+    // yields EC_MISMATCH; NOENT is idempotent EC_OK; hard errors surface as-is.
+    auto modifier = [&keys, &batch_tasks](CacheLocationVector &locs,
+                                          const std::vector<ErrorCode> &get_ecs,
+                                          size_t key_index,
+                                          const LocationIdVector &loc_ids,
+                                          PropertyMap &upsert_property_map) -> LocationModifierResult {
+        (void)upsert_property_map;
+        std::vector<ErrorCode> modifier_ecs(loc_ids.size(), ErrorCode::EC_OK);
+        bool updated = false;
+        for (size_t k = 0; k < loc_ids.size(); ++k) {
+            const ErrorCode ec = get_ecs[k];
+            if (ec == ErrorCode::EC_OK) {
+                const auto &task = batch_tasks[key_index][k];
+                if (locs[k].status() != task.old_status) {
+                    modifier_ecs[k] = ErrorCode::EC_MISMATCH;
+                } else {
+                    updated = true;
+                    locs[k].set_status(task.new_status);
+                }
+            } else if (ec == ErrorCode::EC_NOENT) {
+                modifier_ecs[k] = ec;
+                KVCM_LOG_WARN("load location failed, key[%lu](%lu), location_id: %s, return %d",
+                              key_index,
+                              keys[key_index],
+                              loc_ids[k].c_str(),
+                              ec);
+            } else {
+                KVCM_LOG_WARN("location json parse failed, key[%lu](%lu), loc_id: %s",
+                              key_index,
+                              keys[key_index],
+                              loc_ids[k].c_str());
+                modifier_ecs.assign(loc_ids.size(), ErrorCode::EC_CORRUPTION);
+                return {ModifierAction::MA_FAIL, std::move(modifier_ecs)};
+            }
         }
-        if (get_ec != ErrorCode::EC_OK) {
-            KVCM_LOG_WARN("load location failed, key[%lu](%lu), location_id: %s, return %d",
-                          key_index,
-                          keys[key_index],
-                          loc_id.c_str(),
-                          get_ec);
-            return {MetaIndexer::MA_FAIL, get_ec};
+        if (!updated) {
+            // do not need to update status, skip and return ok
+            return {ModifierAction::MA_SKIP, std::move(modifier_ecs)};
         }
-        auto it = task_map[key_index].find(loc_id);
-        if (it == task_map[key_index].end()) {
-            return {MetaIndexer::MA_SKIP, ErrorCode::EC_NOENT};
-        }
-        if (loc.status() != it->second.old_status) {
-            return {MetaIndexer::MA_FAIL, ErrorCode::EC_MISMATCH};
-        }
-        loc.set_status(it->second.new_status);
-        return {MetaIndexer::MA_OK, ErrorCode::EC_OK};
+        return {ModifierAction::MA_OK, std::move(modifier_ecs)};
     };
 
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
     auto result = meta_indexer_->ReadModifyWriteLocation(request_context, keys, location_ids_per_key, modifier);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
-    for (size_t i = 0; i < keys.size(); ++i) {
-        if (i < result.per_location_error_codes.size()) {
-            out_batch_results[i] = result.per_location_error_codes[i];
-        } else {
-            out_batch_results[i].assign(batch_tasks[i].size(), ErrorCode::EC_ERROR);
-        }
-    }
+    out_batch_results = std::move(result.per_location_error_codes);
 
     if (result.ec != ErrorCode::EC_OK) {
         KVCM_LOG_WARN("meta_indexer_->ReadModifyWriteLocation failed, ec: %d", result.ec);
@@ -592,73 +605,82 @@ ErrorCode MetaSearcher::BatchCADLocationStatus(RequestContext *request_context,
     out_batch_results.clear();
     out_batch_results.resize(keys.size());
 
-    // record multiple locations' storage type and total size for usage tracking
-    std::vector<size_t> loc_counters(keys.size(), 0);
+    // Per-(key, slot) usage tracking: capture the storage type and total
+    // payload size of each location before its delete is dispatched, then
+    // after the indexer reports per-slot success, replay the subtractions
+    // against the storage usage counters. locs_sz[i][k] is paired with
+    // batch_tasks[i][k] / out_batch_results[i][k].
     std::vector<std::vector<std::pair<DataStorageType, std::uint64_t>>> locs_sz(keys.size());
 
-    // Build LocationIdsPerKey and a task lookup map from batch_tasks.
-    MetaIndexer::LocationIdsPerKey location_ids_per_key(keys.size());
-    std::vector<std::map<std::string, CacheLocationStatus>> task_map(keys.size());
+    // Build LocationIdsPerKey directly aligned with batch_tasks.
+    LocationIdsPerKey location_ids_per_key(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
         locs_sz[i].resize(batch_tasks[i].size());
-        for (size_t j = 0; j < batch_tasks[i].size(); ++j) {
-            location_ids_per_key[i].push_back(batch_tasks[i][j].location_id);
-            task_map[i][batch_tasks[i][j].location_id] = batch_tasks[i][j].expect_status;
+        location_ids_per_key[i].reserve(batch_tasks[i].size());
+        for (const auto &task : batch_tasks[i]) {
+            location_ids_per_key[i].push_back(task.location_id);
         }
     }
 
-    auto modifier = [&keys, &task_map, &locs_sz, &loc_counters](
-                        CacheLocation &loc,
-                        ErrorCode get_ec,
-                        size_t key_index,
-                        const MetaIndexer::LocationId &loc_id,
-                        MetaIndexer::PropertyMap &upsert_property_map) -> MetaIndexer::ModifierResult {
-        size_t loc_idx = loc_counters[key_index]++;
+    // Per-key CAD modifier: each slot is gated by a status match. Matching
+    // OK slots stay EC_OK (delete will be dispatched, payload size captured
+    // for usage replay); mismatches yield EC_MISMATCH; NOENT is EC_OK
+    // (idempotent); hard errors surface verbatim.
+    auto modifier = [&keys, &batch_tasks, &locs_sz](CacheLocationVector &locs,
+                                                    const std::vector<ErrorCode> &get_ecs,
+                                                    size_t key_index,
+                                                    const LocationIdVector &loc_ids,
+                                                    PropertyMap &upsert_property_map) -> LocationModifierResult {
+        (void)upsert_property_map;
+        std::vector<ErrorCode> modifier_ecs(loc_ids.size(), ErrorCode::EC_OK);
+        bool updated = false;
+        for (size_t k = 0; k < loc_ids.size(); ++k) {
+            const ErrorCode ec = get_ecs[k];
 
-        if (get_ec == ErrorCode::EC_NOENT) {
-            return {MetaIndexer::MA_SKIP, ErrorCode::EC_NOENT};
-        }
-        if (get_ec != ErrorCode::EC_OK) {
-            KVCM_LOG_WARN("load location failed, key[%lu](%lu), location_id: %s, return %d",
-                          key_index,
-                          keys[key_index],
-                          loc_id.c_str(),
-                          get_ec);
-            return {MetaIndexer::MA_FAIL, get_ec};
-        }
-        auto it = task_map[key_index].find(loc_id);
-        if (it == task_map[key_index].end()) {
-            return {MetaIndexer::MA_SKIP, ErrorCode::EC_NOENT};
-        }
-
-        if (loc.status() != it->second) {
-            return {MetaIndexer::MA_FAIL, ErrorCode::EC_MISMATCH};
-        }
-
-        // compute storage size before deletion for usage tracking
-        std::uint64_t sz = 0;
-        for (const auto &loc_spec : loc.location_specs()) {
-            if (DataStorageUri ds_uri(loc_spec.uri()); ds_uri.Valid()) {
-                std::uint64_t spec_sz;
-                ds_uri.GetParamAs<std::uint64_t>("size", spec_sz);
-                sz += spec_sz;
+            if (ec == ErrorCode::EC_NOENT) {
+                modifier_ecs[k] = ec;
+                KVCM_LOG_WARN("load location failed, key[%lu](%lu), location_id: %s, return %d",
+                              key_index,
+                              keys[key_index],
+                              loc_ids[k].c_str(),
+                              ec);
+                continue;
+            } else if (ec != ErrorCode::EC_OK) {
+                KVCM_LOG_WARN("location json parse failed, key[%lu](%lu), loc_id: %s",
+                              key_index,
+                              keys[key_index],
+                              loc_ids[k].c_str());
+                modifier_ecs.assign(loc_ids.size(), ErrorCode::EC_CORRUPTION);
+                return {ModifierAction::MA_FAIL, std::move(modifier_ecs)};
             }
+            if (locs[k].status() != batch_tasks[key_index][k].expect_status) {
+                modifier_ecs[k] = ErrorCode::EC_MISMATCH;
+                continue;
+            }
+            updated = true;
+            // compute storage size before deletion for usage tracking
+            std::uint64_t sz = 0;
+            for (const auto &loc_spec : locs[k].location_specs()) {
+                if (DataStorageUri ds_uri(loc_spec.uri()); ds_uri.Valid()) {
+                    std::uint64_t spec_sz = 0;
+                    ds_uri.GetParamAs<std::uint64_t>("size", spec_sz);
+                    sz += spec_sz;
+                }
+            }
+            locs_sz[key_index][k] = std::make_pair(locs[k].type(), sz);
         }
-        locs_sz[key_index][loc_idx] = std::make_pair(loc.type(), sz);
-        return {MetaIndexer::MA_DELETE, ErrorCode::EC_OK};
+        if (!updated) {
+            // do not need to update status, skip and return ok
+            return {ModifierAction::MA_SKIP, std::move(modifier_ecs)};
+        }
+        return {ModifierAction::MA_DELETE, std::move(modifier_ecs)};
     };
 
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
     auto result = meta_indexer_->ReadModifyWriteLocation(request_context, keys, location_ids_per_key, modifier);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
-    for (size_t i = 0; i < keys.size(); ++i) {
-        if (i < result.per_location_error_codes.size()) {
-            out_batch_results[i] = result.per_location_error_codes[i];
-        } else {
-            out_batch_results[i].assign(batch_tasks[i].size(), ErrorCode::EC_ERROR);
-        }
-    }
+    out_batch_results = std::move(result.per_location_error_codes);
 
     // update the usage of each storage type
     for (std::size_t i = 0; i < keys.size(); ++i) {
@@ -689,40 +711,57 @@ ErrorCode MetaSearcher::BatchDeleteLocation(RequestContext *request_context,
     // record each location's storage type and total size for usage tracking
     std::vector<std::pair<DataStorageType, std::uint64_t>> loc_sz(keys.size());
 
-    // Build LocationIdsPerKey: each key has exactly one location to delete
-    MetaIndexer::LocationIdsPerKey location_ids_per_key(keys.size());
+    // Build LocationIdsPerKey: each key has exactly one location to delete.
+    LocationIdsPerKey location_ids_per_key(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
         location_ids_per_key[i].push_back(location_ids[i]);
     }
 
-    auto modifier = [&keys, &loc_sz](CacheLocation &loc,
-                                     ErrorCode get_ec,
+    // Per-key modifier: each key carries exactly one target location. OK
+    // slot's payload size is captured for usage replay and ec stays EC_OK
+    // (delete will be dispatched); NOENT is idempotent; errors surface as-is.
+    auto modifier = [&keys, &loc_sz](CacheLocationVector &locs,
+                                     const std::vector<ErrorCode> &get_ecs,
                                      size_t key_index,
-                                     const MetaIndexer::LocationId &loc_id,
-                                     MetaIndexer::PropertyMap &upsert_property_map) -> MetaIndexer::ModifierResult {
-        if (get_ec == ErrorCode::EC_NOENT) {
-            return {MetaIndexer::MA_SKIP, ErrorCode::EC_NOENT};
-        }
-        if (get_ec != ErrorCode::EC_OK) {
-            KVCM_LOG_WARN("load location failed, key[%lu](%lu), location_id: %s, return %d",
-                          key_index,
-                          keys[key_index],
-                          loc_id.c_str(),
-                          get_ec);
-            return {MetaIndexer::MA_FAIL, get_ec};
-        }
-
-        // compute storage size before deletion for usage tracking
-        std::uint64_t sz = 0;
-        for (const auto &loc_spec : loc.location_specs()) {
-            if (DataStorageUri ds_uri(loc_spec.uri()); ds_uri.Valid()) {
-                std::uint64_t spec_sz;
-                ds_uri.GetParamAs<std::uint64_t>("size", spec_sz);
-                sz += spec_sz;
+                                     const LocationIdVector &loc_ids,
+                                     PropertyMap &upsert_property_map) -> LocationModifierResult {
+        (void)upsert_property_map;
+        std::vector<ErrorCode> modifier_ecs(loc_ids.size(), ErrorCode::EC_OK);
+        bool updated = false;
+        for (size_t k = 0; k < loc_ids.size(); ++k) {
+            const ErrorCode ec = get_ecs[k];
+            if (ec == ErrorCode::EC_NOENT) {
+                modifier_ecs[k] = ec;
+                KVCM_LOG_WARN("load location failed, key[%lu](%lu), location_id: %s, return %d",
+                              key_index,
+                              keys[key_index],
+                              loc_ids[k].c_str(),
+                              ec);
+                continue;
+            } else if (ec != ErrorCode::EC_OK) {
+                KVCM_LOG_WARN("location json parse failed, key[%lu](%lu), loc_id: %s",
+                              key_index,
+                              keys[key_index],
+                              loc_ids[k].c_str());
+                modifier_ecs.assign(loc_ids.size(), ErrorCode::EC_CORRUPTION);
+                return {ModifierAction::MA_FAIL, std::move(modifier_ecs)};
             }
+            updated = true;
+            std::uint64_t sz = 0;
+            for (const auto &loc_spec : locs[k].location_specs()) {
+                if (DataStorageUri ds_uri(loc_spec.uri()); ds_uri.Valid()) {
+                    std::uint64_t spec_sz = 0;
+                    ds_uri.GetParamAs<std::uint64_t>("size", spec_sz);
+                    sz += spec_sz;
+                }
+            }
+            loc_sz[key_index] = std::make_pair(locs[k].type(), sz);
         }
-        loc_sz[key_index] = std::make_pair(loc.type(), sz);
-        return {MetaIndexer::MA_DELETE, ErrorCode::EC_OK};
+        if (!updated) {
+            // do not need to update status, skip and return ok
+            return {ModifierAction::MA_SKIP, std::move(modifier_ecs)};
+        }
+        return {ModifierAction::MA_DELETE, std::move(modifier_ecs)};
     };
 
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
@@ -730,19 +769,11 @@ ErrorCode MetaSearcher::BatchDeleteLocation(RequestContext *request_context,
     auto result = meta_indexer_->ReadModifyWriteLocation(request_context, keys, location_ids_per_key, modifier);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
     for (size_t i = 0; i < keys.size(); ++i) {
-        results[i] = ErrorCode::EC_OK;
-        if (i >= result.per_location_error_codes.size() ||
-            result.per_location_error_codes[i].size() != location_ids.size()) {
+        if (i >= result.per_location_error_codes.size() || result.per_location_error_codes[i].size() != 1) {
             results[i] = ErrorCode::EC_MISMATCH;
             continue;
         }
-        size_t error_cnt = 0;
-        for (const auto &ec : result.per_location_error_codes[i]) {
-            error_cnt += (ec == ErrorCode::EC_OK);
-        }
-        results[i] =
-            (error_cnt == 0 ? ErrorCode::EC_OK
-                            : (error_cnt == location_ids.size() ? ErrorCode::EC_ERROR : ErrorCode::EC_PARTIAL_OK));
+        results[i] = result.per_location_error_codes[i].front();
     }
 
     // update the usage of each storage type

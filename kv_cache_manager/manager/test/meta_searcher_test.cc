@@ -570,7 +570,7 @@ TEST_F(MetaSearcherTest, TestBatchDeleteLocation) {
     ec = meta_searcher_->BatchDeleteLocation(request_context_.get(), delete_keys, delete_location_ids, delete_results);
 
     // 验证结果
-    EXPECT_EQ(ec, ErrorCode::EC_PARTIAL_OK);
+    EXPECT_EQ(ec, ErrorCode::EC_OK);
     EXPECT_EQ(delete_results.size(), 3);
     EXPECT_EQ(delete_results[0], ErrorCode::EC_OK);    // 成功删除第一个
     EXPECT_EQ(delete_results[1], ErrorCode::EC_OK);    // 成功删除第二个
@@ -908,7 +908,7 @@ TEST_F(MetaSearcherTest, TestBatchCADLocationStatus) {
 
     std::vector<std::vector<ErrorCode>> out_batch_results_fail;
     ec = meta_searcher_->BatchCADLocationStatus(request_context_.get(), keys, batch_tasks_fail, out_batch_results_fail);
-    EXPECT_EQ(ec, ErrorCode::EC_ERROR); // location删空了，key也不存在了，所以会error。
+    EXPECT_EQ(ec, ErrorCode::EC_OK); // location已删除，不存在，会SKIP并返回OK。
 
     // 验证CAD失败的结果
     for (const auto &results : out_batch_results_fail) {
@@ -1044,13 +1044,8 @@ TEST_F(MetaSearcherTest, TestBatchCASLocationStatusMultipleTasksPerKey) {
     auto it2 = out_location_maps[0].find(out_location_ids2[0]);
     EXPECT_NE(it1, out_location_maps[0].end());
     EXPECT_NE(it2, out_location_maps[0].end());
-
-    if (it1 != out_location_maps[0].end()) {
-        EXPECT_EQ(it1->second.status(), CLS_SERVING);
-    }
-    if (it2 != out_location_maps[0].end()) {
-        EXPECT_EQ(it2->second.status(), CLS_DELETING);
-    }
+    EXPECT_EQ(it1->second.status(), CLS_SERVING);
+    EXPECT_EQ(it2->second.status(), CLS_DELETING);
 }
 
 TEST_F(MetaSearcherTest, TestBatchCADLocationStatusMultipleTasksPerKey) {
@@ -1092,7 +1087,7 @@ TEST_F(MetaSearcherTest, TestBatchCADLocationStatusMultipleTasksPerKey) {
         EXPECT_EQ(loc_pair.second.status(), CLS_WRITING);
     }
 
-    // 将两个位置的状态都更新为DELETING
+    // 将第一个位置的状态都更新为DELETING
     std::vector<CacheLocationStatus> new_statuses1 = {CLS_DELETING};
     // 构建批量任务，每个key对应一个任务
     std::vector<std::vector<MetaSearcher::LocationUpdateTask>> batch_tasks1;
@@ -1109,51 +1104,52 @@ TEST_F(MetaSearcherTest, TestBatchCADLocationStatusMultipleTasksPerKey) {
     ec = meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), keys, batch_tasks1, out_batch_results1);
     EXPECT_EQ(ec, ErrorCode::EC_OK);
 
-    std::vector<CacheLocationStatus> new_statuses2 = {CLS_DELETING};
-    // 构建批量任务，每个key对应一个任务
-    std::vector<std::vector<MetaSearcher::LocationUpdateTask>> batch_tasks2;
-    batch_tasks2.reserve(keys.size());
-    for (size_t i = 0; i < keys.size(); ++i) {
-        std::vector<MetaSearcher::LocationUpdateTask> tasks;
-        if (i < out_location_ids2.size()) {
-            tasks.push_back({out_location_ids2[i], new_statuses2[0]});
-        }
-        batch_tasks2.push_back(tasks);
-    }
-
-    std::vector<std::vector<ErrorCode>> out_batch_results2;
-    ec = meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), keys, batch_tasks2, out_batch_results2);
-    EXPECT_EQ(ec, ErrorCode::EC_OK);
-
     // 验证状态已更新
     out_location_maps.clear();
     ec = meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, out_location_maps);
     EXPECT_EQ(ec, ErrorCode::EC_OK);
     EXPECT_EQ(out_location_maps.size(), 1);
     EXPECT_EQ(out_location_maps[0].size(), 2); // 仍然有两个位置
-    for (const auto &loc_pair : out_location_maps[0]) {
-        EXPECT_EQ(loc_pair.second.status(), CLS_DELETING);
-    }
+    auto it1 = out_location_maps[0].find(out_location_ids[0]);
+    auto it2 = out_location_maps[0].find(out_location_ids[1]);
+    EXPECT_NE(it1, out_location_maps[0].end());
+    EXPECT_NE(it2, out_location_maps[0].end());
+    EXPECT_EQ(it1->second.status(), CLS_DELETING);
+    EXPECT_EQ(it2->second.status(), CLS_WRITING);
 
-    // 准备CAD任务：删除同一个key的两个位置
+    // CAD任务：删除状态为DELETING的两个位置
     std::vector<std::vector<MetaSearcher::LocationCADTask>> batch_tasks;
     std::vector<MetaSearcher::LocationCADTask> tasks;
     tasks.push_back({out_location_ids[0], CLS_DELETING}); // 删除第一个位置
     tasks.push_back({out_location_ids[1], CLS_DELETING}); // 删除第二个位置
     batch_tasks.push_back(tasks);
-
     // 调用BatchCADLocationStatus
     std::vector<std::vector<ErrorCode>> out_batch_results;
     ec = meta_searcher_->BatchCADLocationStatus(request_context_.get(), keys, batch_tasks, out_batch_results);
     EXPECT_EQ(ec, ErrorCode::EC_OK);
     EXPECT_EQ(out_batch_results.size(), 1);
     EXPECT_EQ(out_batch_results[0].size(), 2); // 应该有两个结果
-
     // 验证结果
-    EXPECT_EQ(out_batch_results[0][0], ErrorCode::EC_OK); // 第一个位置删除成功
-    EXPECT_EQ(out_batch_results[0][1], ErrorCode::EC_OK); // 第二个位置删除成功
+    EXPECT_EQ(out_batch_results[0][0], ErrorCode::EC_OK);       // 第一个位置删除成功
+    EXPECT_EQ(out_batch_results[0][1], ErrorCode::EC_MISMATCH); // 第二个位置状态不匹配
 
-    // 验证位置已被删除
+    // CAD任务：删除状态为WRITING的两个位置
+    batch_tasks.clear();
+    tasks.clear();
+    tasks.push_back({out_location_ids[0], CLS_WRITING}); // 删除第一个位置
+    tasks.push_back({out_location_ids[1], CLS_WRITING}); // 删除第二个位置
+    batch_tasks.push_back(tasks);
+    // 调用BatchCADLocationStatus
+    out_batch_results.clear();
+    ec = meta_searcher_->BatchCADLocationStatus(request_context_.get(), keys, batch_tasks, out_batch_results);
+    EXPECT_EQ(ec, ErrorCode::EC_OK);
+    EXPECT_EQ(out_batch_results.size(), 1);
+    EXPECT_EQ(out_batch_results[0].size(), 2); // 应该有两个结果
+    // 验证结果
+    EXPECT_EQ(out_batch_results[0][0], ErrorCode::EC_NOENT); // 第一个位置不存在
+    EXPECT_EQ(out_batch_results[0][1], ErrorCode::EC_OK);    // 第二个位置删除成功
+
+    // 验证两个位置均被删除
     out_location_maps.clear();
     ec = meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, out_location_maps);
     EXPECT_EQ(ec, ErrorCode::EC_OK);
