@@ -6,7 +6,10 @@
 - 颜色/标记常量
 - 单策略 Pareto 曲线（每个 instance 一条线）
 - 多策略对比子图（每个 instance 一个子图）
-- Per-Tier 对比图（所有层放在一起）
+
+Note: Tradeoff（Pareto 曲线）分析仅适用于非分层模式
+（hierarchical_eviction_enabled=false）。分层模式下各 tier
+独立容量构成多维搜索空间，quota_capacity 扫描无意义。
 """
 
 import os
@@ -57,6 +60,7 @@ def plot_single_policy_curves(
     hit_rate_type: str = "total",
     title: str = None,
     axis_limits: dict = None,
+    config_quota_gb_map: Optional[Dict[str, float]] = None,
 ):
     """
     绘制单策略的容量-命中率散点图，每个 instance 一条曲线。
@@ -68,6 +72,8 @@ def plot_single_policy_curves(
         hit_rate_type:       "total" | "local" | "remote"
         title:               图标题（None 则自动生成）
         axis_limits:         {"x_min", "x_max", "y_min", "y_max"}，单位 GB；None 表示不限制
+        config_quota_gb_map: {instance_id: quota_capacity_gb}，用于标注当前配置容量位置。
+                             每个唯一的 quota_capacity_gb 对应一根竖赋参考线。
     """
     if not results:
         print("No data to plot!")
@@ -87,6 +93,32 @@ def plot_single_policy_curves(
                     color=COLORS[idx % len(COLORS)],
                     marker=MARKERS[idx % len(MARKERS)],
                     s=1, label=iid, alpha=0.8)
+
+    # Draw vertical reference lines for configured quota_capacity
+    if config_quota_gb_map:
+        # Collect unique quota values; use first matching instance_id as label suffix
+        # when multiple groups have different quotas.
+        quota_to_repr: Dict[float, str] = {}
+        for iid in instance_ids:
+            quota_gb = config_quota_gb_map.get(iid)
+            if quota_gb is not None and quota_gb not in quota_to_repr:
+                quota_to_repr[quota_gb] = iid
+        multi_quota = len(quota_to_repr) > 1
+        vline_colors = ["black", "dimgray", "saddlebrown"]
+        for vi, (quota_gb, repr_iid) in enumerate(sorted(quota_to_repr.items())):
+            label = (
+                f"Config quota ({repr_iid}): {quota_gb:.1f} GB"
+                if multi_quota
+                else f"Config quota: {quota_gb:.1f} GB"
+            )
+            plt.axvline(
+                x=quota_gb,
+                color=vline_colors[vi % len(vline_colors)],
+                linestyle="--",
+                linewidth=1.5,
+                label=label,
+                alpha=0.75,
+            )
 
     plt.xlabel("Cache Capacity (GB)", fontsize=12)
     plt.ylabel(f"{hit_rate_type.capitalize()} Hit Rate", fontsize=12)
@@ -119,6 +151,7 @@ def plot_multi_policy_subplots(
     output_dir: str,
     bytes_per_block_map: Dict[str, int],
     hit_rate_type: str = "total",
+    config_quota_gb_map: Optional[Dict[str, float]] = None,
 ):
     """
     多策略对比：每个 instance 一个子图，每个子图里每条策略一条曲线。
@@ -128,6 +161,7 @@ def plot_multi_policy_subplots(
         output_dir:          图片根输出目录，图表保存至 output_dir/pareto/
         bytes_per_block_map: {instance_id: bytes_per_block}，用于存储量 blocks → GB 转换
         hit_rate_type:       "total" | "local" | "remote"
+        config_quota_gb_map: {instance_id: quota_capacity_gb}，用于在各子图中标注配置容量位置。
     """
     if not results_by_policy:
         print("No data to plot!")
@@ -173,6 +207,18 @@ def plot_multi_policy_subplots(
                        color=COLORS[pi % len(COLORS)],
                        marker=MARKERS[pi % len(MARKERS)],
                        s=1, alpha=0.8)
+        # Draw vertical reference line for this instance's configured quota_capacity
+        if config_quota_gb_map:
+            quota_gb = config_quota_gb_map.get(iid)
+            if quota_gb is not None:
+                ax.axvline(
+                    x=quota_gb,
+                    color="black",
+                    linestyle="--",
+                    linewidth=1.5,
+                    label=f"Config quota: {quota_gb:.1f} GB",
+                    alpha=0.75,
+                )
         ax.set_xlabel("Group Total Storage (GB)", fontsize=11)
         ax.set_ylabel(f"{hit_rate_type.capitalize()} Hit Rate", fontsize=11)
         ax.set_ylim(0, 1.05)
@@ -194,111 +240,4 @@ def plot_multi_policy_subplots(
     out = os.path.join(pareto_dir, f"multi_policy_{hit_rate_type}.png")
     plt.savefig(out, dpi=300, bbox_inches="tight")
     print(f"\nSaved: {out}")
-    plt.close()
-
-
-# ============================================================================
-# Per-Tier 对比图
-# ============================================================================
-
-def plot_per_tier_curves(
-    results: List[dict],
-    output_dir: str,
-    bytes_per_block_map: Optional[Dict[str, int]] = None,
-    title: str = None,
-    axis_limits: dict = None,
-):
-    """
-    绘制 per-tier 命中率对比曲线，所有层放在一起。
-
-    Args:
-        results:             [{"capacity": int, "instances": {...}}, ...]
-                             每个 instance 的 metrics 需包含 tier_names, acc_tier_hit_rates
-        output_dir:          图片根输出目录，图表保存至 output_dir/pareto/
-        bytes_per_block_map: {instance_id: bytes_per_block}，用于容量 blocks → GB 转换；
-                             为 None 时降级使用 blocks 单位
-        title:               图标题（None 则自动生成）
-        axis_limits:         {"x_min", "x_max", "y_min", "y_max"}，单位 GB；None 表示不限制
-    """
-    if not results:
-        print("No data to plot!")
-        return
-
-    # 收集所有 tier 名称
-    all_tier_names = set()
-    for r in results:
-        for iid, metrics in r["instances"].items():
-            if "tier_names" in metrics:
-                all_tier_names.update(metrics["tier_names"])
-    
-    if not all_tier_names:
-        print("No per-tier data available!")
-        return
-    
-    tier_names = sorted(all_tier_names)
-    instance_ids = list(results[0]["instances"].keys())
-    
-    # 为每个 tier 分配颜色和标记
-    tier_colors = {
-        tier: COLORS[idx % len(COLORS)]
-        for idx, tier in enumerate(tier_names)
-    }
-    tier_markers = {
-        tier: MARKERS[idx % len(MARKERS)]
-        for idx, tier in enumerate(tier_names)
-    }
-    
-    plt.figure(figsize=(14, 9))
-    
-    # 为每个 instance 和每个 tier 绘制曲线
-    for idx, iid in enumerate(instance_ids):
-        for tier_idx, tier_name in enumerate(tier_names):
-            caps = []
-            rates = []
-            for r in results:
-                if iid in r["instances"]:
-                    metrics = r["instances"][iid]
-                    if "acc_tier_hit_rates" in metrics and tier_name in metrics["acc_tier_hit_rates"]:
-                        caps.append(r["capacity"])
-                        rates.append(metrics["acc_tier_hit_rates"][tier_name])
-            
-            if not caps:
-                continue
-            
-            # blocks → GB 转换（降级：无 bytes_per_block_map 时保持 blocks）
-            if bytes_per_block_map:
-                rep_bpb = next(iter(bytes_per_block_map.values()))
-                bpb = bytes_per_block_map.get(iid, rep_bpb)
-                caps = [c * bpb / (1024 ** 3) for c in caps]
-
-            # 使用不同的颜色和标记区分 tier
-            # 同一个 tier 在不同 instance 上用相同颜色，但用透明度区分
-            alpha = 0.3 + 0.7 * (1.0 - idx / max(len(instance_ids) - 1, 1))
-            plt.scatter(caps, rates,
-                       color=tier_colors[tier_name],
-                       marker=tier_markers[tier_name],
-                       s=50, 
-                       label=f"{tier_name}" if idx == 0 else None,  # 只在第一个 instance 添加 legend
-                       alpha=min(alpha, 0.9))
-    
-    x_label = "Cache Capacity (GB)" if bytes_per_block_map else "Cache Capacity (blocks)"
-    plt.xlabel(x_label, fontsize=12)
-    plt.ylabel("Hit Rate", fontsize=12)
-    plt.title(title or "Per-Tier Hit Rate vs Cache Capacity", fontsize=14)
-    plt.legend(loc="lower right", fontsize=10)
-    plt.grid(True, alpha=0.3)
-    
-    al = axis_limits or {}
-    if al.get("x_min") is not None or al.get("x_max") is not None:
-        plt.xlim(al.get("x_min"), al.get("x_max"))
-    y_lo = al.get("y_min") if al.get("y_min") is not None else 0
-    y_hi = al.get("y_max") if al.get("y_max") is not None else 1
-    plt.ylim(y_lo, y_hi)
-    
-    plt.tight_layout()
-    pareto_dir = os.path.join(output_dir, "pareto")
-    os.makedirs(pareto_dir, exist_ok=True)
-    out = os.path.join(pareto_dir, "per_tier_curves.png")
-    plt.savefig(out, dpi=300, bbox_inches="tight")
-    print(f"Saved: {out}")
     plt.close()

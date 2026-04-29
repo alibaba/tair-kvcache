@@ -82,6 +82,11 @@ def run_optimizer_with_config_explicit(
         # This function only modifies quota_capacity, so capacity sweeps in tradeoff
         # analysis are ineffective for tiered configurations.
         # quota_capacity in config is GB; convert blocks -> GB for C++ FromRapidValue (bytes internally)
+        # Use instances[0] as representative for bytes_per_block calculation.
+        # Assumption: all instances in the same group serve the same model and
+        # therefore share identical block_size (enforced by C++ MismatchFields check
+        # in RegisterInstance) and bytes_per_token (Python-only annotation field,
+        # not validated by C++, but expected to be consistent within a group).
         inst = group.get("instances", [{}])[0] if group.get("instances") else {}
         bpb = inst.get("bytes_per_token", 0) * inst.get("block_size", 0)
         group["quota_capacity"] = capacity * bpb / (1024 ** 3) if bpb > 0 else capacity
@@ -126,6 +131,13 @@ def extract_bytes_per_block_map(config_path: str) -> Dict[str, int]:
     从 config JSON 提取每个 instance 的 bytes_per_block。
 
     bytes_per_block = block_size × bytes_per_token
+
+    Note:
+        bytes_per_token 是 Python 侧的配置注解字段，C++ 层（OptInstanceConfig）不解析该字段。
+        block_size 在 KVCM C++ 层由 RegisterInstance/MismatchFields 强制要求同一 group 内一致；
+        bytes_per_token 无 C++ 层强制约束，依赖配置人员保证同一 group 内的值一致（通常
+        同一 group 服务同一模型，bytes_per_token 自然相同）。
+
     缺少配置时打印 warning 并将该 instance 的值设为 0（调用方需检查）。
 
     Returns:
@@ -148,6 +160,31 @@ def extract_bytes_per_block_map(config_path: str) -> Dict[str, int]:
                 result[iid] = 0
             else:
                 result[iid] = bs * bpt
+    return result
+
+
+def extract_config_quota_gb_map(config_path: str) -> Dict[str, float]:
+    """
+    从 config JSON 提取每个 instance 所属 group 的 quota_capacity（单位：GB）。
+
+    quota_capacity 是 group 级别的共享配额，同一 group 内所有 instances 共享该值。
+    用于在 tradeoff 曲线上标注当前配置的实际部署容量位置（竖线参考线）。
+
+    Returns:
+        {instance_id: quota_capacity_gb}
+        若某 group 未配置 quota_capacity，则其 instances 不会出现在结果中。
+    """
+    with open(config_path, "r") as f:
+        config_json = json.load(f)
+
+    result: Dict[str, float] = {}
+    for group in config_json.get("instance_groups", []):
+        quota_gb = group.get("quota_capacity")
+        if quota_gb is None:
+            continue
+        for inst in group.get("instances", []):
+            iid = inst.get("instance_id", "<unknown>")
+            result[iid] = float(quota_gb)
     return result
 
 

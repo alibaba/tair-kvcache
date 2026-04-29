@@ -28,7 +28,7 @@ from collections import defaultdict
 
 from kv_cache_manager.optimizer.pybind import kvcm_py_optimizer
 
-from utils.optimizer_runner import init_kvcm_logger, warmup_pass, run_experiments_parallel, extract_bytes_per_block_map
+from utils.optimizer_runner import init_kvcm_logger, warmup_pass, run_experiments_parallel, extract_bytes_per_block_map, extract_config_quota_gb_map
 from utils.csv_loader import generate_capacity_list, load_results_from_csv_dir
 from utils.plot_utils import plot_single_policy_curves, plot_multi_policy_subplots
 from plot.hit_rate_plot import plot_multi_instance_analysis
@@ -203,6 +203,7 @@ def main():
             break
 
     bytes_per_block_map = extract_bytes_per_block_map(args.config)
+    config_quota_gb_map = extract_config_quota_gb_map(args.config)
 
     config_loader = kvcm_py_optimizer.OptimizerConfigLoader()
     if not config_loader.load(args.config):
@@ -236,6 +237,11 @@ def main():
         if multi_policy and policies[0] is not None:
             results_by_policy = {p: results_by_policy[p] for p in policies if p in results_by_policy}
     else:
+        # Use first instance's bytes_per_block as a representative value to convert
+        # warmup_capacity (GB) to blocks. This assumes all instances share the same
+        # bytes_per_block (i.e., same model / same block_size and bytes_per_token).
+        # If instances have heterogeneous bytes_per_block, the conversion is approximate
+        # but acceptable since warmup only needs a sufficiently large upper bound.
         rep_bpb = next(iter(bytes_per_block_map.values()))
         warmup_blocks = int(args.warmup_capacity * (1024 ** 3) / rep_bpb)
         max_blocks = warmup_pass(args.config, warmup_blocks, bytes_per_block_map)
@@ -293,10 +299,13 @@ def main():
     if len(actual_policies) == 1:
         for ht in hit_types:
             plot_single_policy_curves(
-                results_by_policy[actual_policies[0]], output_dir, bytes_per_block_map, ht, axis_limits=axis_limits)
+                results_by_policy[actual_policies[0]], output_dir, bytes_per_block_map, ht,
+                axis_limits=axis_limits, config_quota_gb_map=config_quota_gb_map)
     else:
         for ht in hit_types:
-            plot_multi_policy_subplots(results_by_policy, output_dir, bytes_per_block_map, ht)
+            plot_multi_policy_subplots(
+                results_by_policy, output_dir, bytes_per_block_map, ht,
+                config_quota_gb_map=config_quota_gb_map)
 
     # ----------------------------------------------------------------
     # 可选：时序图
