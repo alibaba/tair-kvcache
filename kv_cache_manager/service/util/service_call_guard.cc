@@ -126,6 +126,11 @@ ServiceCallGuard::~ServiceCallGuard() {
     assert(request_context_);
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context_->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, ServiceQuery);
+    {
+        double query_rt_val = 0;
+        KVCM_METRICS_COLLECTOR_GET_METRICS(service_metrics_collector, service, query_rt_us, query_rt_val);
+        KVCM_LOG_INFO("[metrics] query_rt_us=%.0f", query_rt_val);
+    }
     if (response_debug_setter_) {
         response_debug_setter_();
     }

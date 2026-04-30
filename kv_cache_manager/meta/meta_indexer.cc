@@ -439,11 +439,14 @@ MetaIndexer::Result MetaIndexer::ReadModifyWrite(RequestContext *request_context
     int64_t get_io_time_us = 0;
     int64_t upsert_io_time_us = 0;
     int64_t delete_io_time_us = 0;
+    int64_t lock_wait_time_us = 0;
     int64_t update_key_count = 0;
     int64_t put_key_count = 0;
     int64_t delete_key_count = 0;
     for (int32_t i = 0; i < batch_datas.batch_keys.size(); ++i) {
+        int64_t begin_lock_wait_time = TimestampUtil::GetCurrentTimeUs();
         ScopedBatchLock lock(*this, batch_datas.batch_shard_indexs[i]);
+        lock_wait_time_us += TimestampUtil::GetCurrentTimeUs() - begin_lock_wait_time;
         // 1. get
         UriVector uris;
         auto get_result = Get(get_request_context.get(), batch_datas.batch_keys[i], uris);
@@ -532,7 +535,19 @@ MetaIndexer::Result MetaIndexer::ReadModifyWrite(RequestContext *request_context
     }
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, get_io_time_us, get_io_time_us);
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, upsert_io_time_us, upsert_io_time_us);
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, lock_wait_time_us, lock_wait_time_us);
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, delete_io_time_us, delete_io_time_us);
+    PREFIX_INDEXER_LOG(
+        INFO,
+        "[metrics][ReadModifyWrite] get_io_us=%ld, upsert_io_us=%ld, lock_wait_us=%ld, delete_io_us=%ld, "
+        "put_keys=%ld, update_keys=%ld, delete_keys=%ld",
+        get_io_time_us,
+        upsert_io_time_us,
+        lock_wait_time_us,
+        delete_io_time_us,
+        put_key_count,
+        update_key_count,
+        delete_key_count);
     KVCM_METRICS_COLLECTOR_SET_METRICS(
         service_metrics_collector, meta_indexer, read_modify_write_update_key_count, update_key_count);
     KVCM_METRICS_COLLECTOR_SET_METRICS(

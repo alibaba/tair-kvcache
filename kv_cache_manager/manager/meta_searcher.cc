@@ -497,8 +497,16 @@ ErrorCode MetaSearcher::BatchAddLocation(RequestContext *request_context,
     };
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerReadModifyWrite);
+    int64_t rmw_begin_time = TimestampUtil::GetCurrentTimeUs();
     auto result = meta_indexer_->ReadModifyWrite(request_context, keys, modifier);
+    int64_t rmw_time_us = TimestampUtil::GetCurrentTimeUs() - rmw_begin_time;
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWrite);
+    {
+        KVCM_LOG_INFO("[metrics][BatchAddNewLocation] rmw_time_us=%ld, deserialize_us=%ld, serialize_us=%ld",
+                      rmw_time_us,
+                      metrics.index_deserialize_time_us,
+                      metrics.index_serialize_time_us);
+    }
     KVCM_METRICS_COLLECTOR_SET_METRICS(
         service_metrics_collector, meta_searcher, index_deserialize_time_us, metrics.index_deserialize_time_us);
     KVCM_METRICS_COLLECTOR_SET_METRICS(
@@ -584,8 +592,16 @@ ErrorCode MetaSearcher::BatchUpdateLocationStatus(RequestContext *request_contex
 
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerReadModifyWrite);
+    int64_t rmw_begin_time = TimestampUtil::GetCurrentTimeUs();
     auto result = meta_indexer_->ReadModifyWrite(request_context, keys, modifier);
+    int64_t rmw_time_us = TimestampUtil::GetCurrentTimeUs() - rmw_begin_time;
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWrite);
+    {
+        KVCM_LOG_INFO("[metrics][BatchUpdateLocationStatus] rmw_time_us=%ld, deserialize_us=%ld, serialize_us=%ld",
+                      rmw_time_us,
+                      metrics.index_deserialize_time_us,
+                      metrics.index_serialize_time_us);
+    }
     KVCM_METRICS_COLLECTOR_SET_METRICS(
         service_metrics_collector, meta_searcher, index_deserialize_time_us, metrics.index_deserialize_time_us);
     KVCM_METRICS_COLLECTOR_SET_METRICS(
