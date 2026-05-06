@@ -39,6 +39,12 @@ public:
         return kv_cache_manager::ER_OK;
     }
 
+    void SkipRegistration() {
+#if defined(USING_CUDA) || defined(USING_MUSA)
+        is_mem_registered = false;
+#endif
+    }
+
     ~MmapHelper() {
 #if defined(USING_CUDA)
         if (is_mem_registered) {
@@ -103,7 +109,30 @@ private:
 #if defined(USING_CUDA)
         CHECK_CUDA_ERROR_RETURN(cudaDeviceGetAttribute(&value, cudaDevAttrHostRegisterReadOnlySupported, dev), false, "get cudaDevAttrHostRegisterReadOnlySupported failed");
 #elif defined(USING_MUSA)
-        CHECK_MUSA_ERROR(musaDeviceGetAttribute(&value, musaDevAttrHostRegisterReadOnlySupported, dev), false, "get musaDevAttrHostRegisterReadOnlySupported failed");
+        CHECK_MUSA_ERROR_RETURN(musaDeviceGetAttribute(&value, musaDevAttrHostRegisterReadOnlySupported, dev), false, "get musaDevAttrHostRegisterReadOnlySupported failed");
+#endif
+        if (value != 1) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Check if all GPUs support direct access to pageable memory (including mmap'd memory)
+// If true, cudaHostRegister is not needed for mmap'd memory
+[[maybe_unused]] bool allGpusSupportPageableMemoryAccess() {
+    int count = getGpusDeviceCount();
+    if (count < 0) {
+        return false;
+    }
+
+    for (int dev = 0; dev < count; ++dev) {
+        int value = 0;
+#if defined(USING_CUDA)
+        CHECK_CUDA_ERROR_RETURN(cudaDeviceGetAttribute(&value, cudaDevAttrPageableMemoryAccess, dev), false, "get cudaDevAttrPageableMemoryAccess failed");
+#elif defined(USING_MUSA)
+        // MUSA equivalent - adjust if needed
+        CHECK_MUSA_ERROR_RETURN(musaDeviceGetAttribute(&value, musaDevAttrPageableMemoryAccess, dev), false, "get musaDevAttrPageableMemoryAccess failed");
 #endif
         if (value != 1) {
             return false;
@@ -157,6 +186,11 @@ ClientErrorCode LocalFileSdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_
 
     support_register_readonly_ = allGpusSupportHostRegisterReadOnly();
     KVCM_LOG_INFO("gpu support register readonly [%d]", static_cast<int>(support_register_readonly_));
+    
+    // Check if GPUs support direct pageable memory access
+    // If true, we can skip cudaHostRegister for mmap'd memory
+    support_pageable_memory_access_ = allGpusSupportPageableMemoryAccess();
+    KVCM_LOG_INFO("gpu support pageable memory access [%d]", static_cast<int>(support_pageable_memory_access_));
 #elif defined(USING_MUSA)
     CHECK_MUSA_ERROR_RETURN(musaStreamCreateWithFlags(&musa_stream_, musaStreamNonBlocking),
                             ER_CUDA_STREAM_CREATE_ERROR,
@@ -168,6 +202,10 @@ ClientErrorCode LocalFileSdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_
 
     support_register_readonly_ = allGpusSupportHostRegisterReadOnly();
     KVCM_LOG_INFO("gpu support register readonly [%d]", static_cast<int>(support_register_readonly_));
+    
+    // Check if GPUs support direct pageable memory access
+    support_pageable_memory_access_ = allGpusSupportPageableMemoryAccess();
+    KVCM_LOG_INFO("gpu support pageable memory access [%d]", static_cast<int>(support_pageable_memory_access_));
 #endif
     return ER_OK;
 }
@@ -283,19 +321,29 @@ ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_ur
         close(fd);
         return ER_FILE_IO_ERROR;
     }
+
     MmapHelper helper(fd, file_mem, file_size);
 #if defined(USING_CUDA)
-    auto register_ec = helper.RegisterGpu(support_register_readonly_ ? cudaHostRegisterReadOnly : cudaHostRegisterDefault);
-    if (register_ec != ER_OK) {
-        return register_ec;
+    bool exist_gpu_iov = false; 
+    // If GPU supports direct pageable memory access, skip cudaHostRegister
+    // This allows direct DMA transfer between GPU and mmap'd memory without pinning
+    if (!support_pageable_memory_access_) {
+        auto register_ec = helper.RegisterGpu(support_register_readonly_ ? cudaHostRegisterReadOnly : cudaHostRegisterDefault);
+        if (register_ec != ER_OK) {
+            return register_ec;
+        }
+    } else {
+        KVCM_LOG_DEBUG("Skipping cudaHostRegister - GPU supports direct pageable memory access");
+        helper.SkipRegistration(); // Mark as not registered since we don't need to
     }
-    bool exist_gpu_iov = false;
 #elif defined(USING_MUSA)
-    auto register_ec = helper.RegisterGpu(support_register_readonly_ ? musaHostRegisterReadOnly : musaHostRegisterDefault);
-    if (register_ec != ER_OK) {
-        return register_ec;
-    }
     bool exist_gpu_iov = false;
+    if (!support_pageable_memory_access_) {
+        auto register_ec = helper.RegisterGpu(support_register_readonly_ ? musaHostRegisterReadOnly : musaHostRegisterDefault);
+        if (register_ec != ER_OK) {
+            return register_ec;
+        }
+    }
 #endif
 
     size_t offset = 0;
@@ -440,23 +488,33 @@ ClientErrorCode LocalFileSdk::DoPut(const std::vector<DataStorageUri> &remote_ur
         close(fd);
         return ER_FILE_IO_ERROR;
     }
+
     KVCM_LOG_DEBUG("Put file path [%s] size [%zu] block buffer [%s]",
                    file_path.c_str(),
                    required_size,
                    DebugStringUtil::ToString(local_buffers).c_str());
     MmapHelper helper(fd, file_mem, required_size);
 #if defined(USING_CUDA)
-    auto register_ec = helper.RegisterGpu(cudaHostRegisterDefault);
-    if (register_ec != ER_OK) {
-        return register_ec;
-    }
     bool exist_gpu_iov = false;
+    // If GPU supports direct pageable memory access, skip cudaHostRegister
+    // This allows direct DMA transfer between GPU and mmap'd memory without pinning
+    if (!support_pageable_memory_access_) {
+        auto register_ec = helper.RegisterGpu(cudaHostRegisterDefault);
+        if (register_ec != ER_OK) {
+            return register_ec;
+        }
+    } else {
+        KVCM_LOG_DEBUG("Skipping cudaHostRegister - GPU supports direct pageable memory access");
+        helper.SkipRegistration(); // Mark as not registered since we don't need to
+    }
 #elif defined(USING_MUSA)
-    auto register_ec = helper.RegisterGpu(musaHostRegisterDefault);
-    if (register_ec != ER_OK) {
-        return register_ec;
-    }
     bool exist_gpu_iov = false;
+    if (!support_pageable_memory_access_) {
+        auto register_ec = helper.RegisterGpu(musaHostRegisterDefault);
+        if (register_ec != ER_OK) {
+            return register_ec;
+        }
+    }
 #endif
 
     char *dst = static_cast<char *>(file_mem);

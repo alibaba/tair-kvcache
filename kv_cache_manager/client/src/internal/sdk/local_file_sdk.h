@@ -33,5 +33,6 @@ private:
     musaStream_t musa_stream_ = nullptr;
 #endif
     bool support_register_readonly_ = true;
+    bool support_pageable_memory_access_ = false; // If true, no need to call cudaHostRegister for mmap'd memory
 };
 } // namespace kv_cache_manager
