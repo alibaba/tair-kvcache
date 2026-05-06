@@ -42,6 +42,9 @@ public:
     grpc::Status StartWriteCache(grpc::ServerContext *context,
                                  const proto::meta::StartWriteCacheRequest *request,
                                  proto::meta::StartWriteCacheResponse *response) override;
+    grpc::Status StartEvictWriteCache(grpc::ServerContext *context,
+                                      const proto::meta::StartEvictWriteCacheRequest *request,
+                                      proto::meta::StartWriteCacheResponse *response) override;
     grpc::Status FinishWriteCache(grpc::ServerContext *context,
                                   const proto::meta::FinishWriteCacheRequest *request,
                                   proto::meta::CommonResponse *response) override;
@@ -54,6 +57,10 @@ public:
     grpc::Status GetClusterInfo(grpc::ServerContext *context,
                                 const proto::meta::GetClusterInfoRequest *request,
                                 proto::meta::GetClusterInfoResponse *response) override;
+
+    grpc::Status ReportEvent(grpc::ServerContext *context,
+                             const proto::meta::ReportEventRequest *request,
+                             proto::meta::ReportEventResponse *response) override;
 
 private:
     std::shared_ptr<MetaServiceImpl> meta_service_impl_;

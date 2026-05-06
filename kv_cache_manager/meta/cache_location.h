@@ -168,12 +168,26 @@ public:
     }
 
     [[nodiscard]] CacheLocationMap &location_map() { return location_map_; }
+    [[nodiscard]] const CacheLocationMap &location_map() const { return location_map_; }
 
     void AddNewLocation(const CacheLocation &location, std::string &out_location_id);
     ErrorCode UpdateLocationStatus(const std::string &location_id, CacheLocationStatus status);
     ErrorCode DeleteLocation(const std::string &location_id);
     ErrorCode GetLocationStatus(const std::string &location_id, CacheLocationStatus &out_status);
     size_t GetLocationCount() const;
+
+    // V8 §2.1.1 field-granular layout helpers.
+    //
+    // ToFieldMap writes one entry per location into `out_field_map` keyed
+    // "L#{location_id}" -> CacheLocation JSON. Other entries in
+    // `out_field_map` are left untouched, so callers can merge BP#/P# data
+    // alongside L# entries before issuing the storage write.
+    //
+    // FromFieldMap walks the input map and ingests every "L#..." entry into
+    // location_map_. It returns false if any L#-tagged value fails to parse;
+    // entries without the L# prefix are ignored.
+    void ToFieldMap(std::map<std::string, std::string> &out_field_map) const noexcept;
+    bool FromFieldMap(const std::map<std::string, std::string> &field_map);
 
 private:
     CacheLocationMap location_map_;

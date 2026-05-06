@@ -132,6 +132,13 @@ void ProtoConvert::StorageFromProto(const proto::admin::StorageConfig *proto_sto
         storage_config.set_type(DataStorageType::DATA_STORAGE_TYPE_DUMMY);
         break;
     }
+    case proto::admin::StorageConfig::kVineyard: {
+        VineyardStorageSpec spec;
+        spec.set_cluster_name(proto_storage_config->vineyard().cluster_name());
+        storage_config.set_storage_spec(std::make_shared<VineyardStorageSpec>(spec));
+        storage_config.set_type(DataStorageType::DATA_STORAGE_TYPE_VINEYARD);
+        break;
+    }
     default:
         storage_config.set_type(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN);
         KVCM_LOG_WARN("Unknown storage type in request proto: storage_type should be : threefs, mooncake, "

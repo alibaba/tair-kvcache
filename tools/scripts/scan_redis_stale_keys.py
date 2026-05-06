@@ -78,35 +78,49 @@ def scan_stale_keys(r: redis.Redis, key_pattern: str = "*", hours_threshold: flo
         hash_keys = [key for key, t in zip(keys, types) if t == b'hash']
         
         if hash_keys:
-            # pipeline批量获取__uri__和__lru_time__字段
-            hmget_pipe = r.pipeline(transaction=False)
+            # V8 §2.1.1: each block_key Hash carries `BP#lru_time` plus one
+            # `L#{location_id}` entry per location. HGETALL is the simplest way
+            # to consume the full layout in one shot since the key set is
+            # variable per block.
+            hgetall_pipe = r.pipeline(transaction=False)
             for key in hash_keys:
-                hmget_pipe.hmget(key, '__uri__', '__lru_time__')
-            hmget_results = hmget_pipe.execute()
-            
-            for key, fields in zip(hash_keys, hmget_results):
+                hgetall_pipe.hgetall(key)
+            hgetall_results = hgetall_pipe.execute()
+
+            for key, raw_fields in zip(hash_keys, hgetall_results):
                 key_str = key.decode('utf-8') if isinstance(key, bytes) else key
-                uri_value = fields[0]
-                lru_time_value = fields[1]
-                
-                if not uri_value or not lru_time_value:
+                if not raw_fields:
                     continue
-                
-                uri_str = uri_value.decode('utf-8') if isinstance(uri_value, bytes) else uri_value
-                lru_time_str = lru_time_value.decode('utf-8') if isinstance(lru_time_value, bytes) else lru_time_value
-                
+                # Normalize bytes -> str for both keys and values.
+                fields = {
+                    (k.decode('utf-8') if isinstance(k, bytes) else k):
+                    (v.decode('utf-8') if isinstance(v, bytes) else v)
+                    for k, v in raw_fields.items()
+                }
+                lru_time_str = fields.get('BP#lru_time')
+                if not lru_time_str:
+                    continue
                 try:
                     lru_time_us = int(lru_time_str)
-                    uri_data = json.loads(uri_str)
-                except (ValueError, json.JSONDecodeError):
+                except ValueError:
                     continue
-                
-                # 检查时间是否超过阈值
+                # 时间是否超过阈值
                 time_diff_us = current_time_us - lru_time_us
                 if time_diff_us < threshold_us:
                     continue
-                
-                # 检查每个item的status
+                # Aggregate L# fields into a single dict shaped like the legacy
+                # __uri__ JSON for downstream consumers.
+                uri_data = {}
+                for fname, fval in fields.items():
+                    if not fname.startswith('L#'):
+                        continue
+                    location_id = fname[2:]
+                    try:
+                        uri_data[location_id] = json.loads(fval)
+                    except (ValueError, json.JSONDecodeError):
+                        continue
+                if not uri_data:
+                    continue
                 for item_key, item_value in uri_data.items():
                     if isinstance(item_value, dict):
                         status = item_value.get('status')
