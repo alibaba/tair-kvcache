@@ -321,7 +321,7 @@ MetaIndexer::Result MetaIndexer::Put(RequestContext *request_context,
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_key_count, keys.size());
 
-    LocationIdsPerKey empty_location_ids;
+    static LocationIdsPerKey empty_location_ids;
     std::vector<BatchMetaData> batches = MakeBatches(keys, empty_location_ids, location_maps, properties);
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_batch_num, batches.size());
     Result result(keys.size());
@@ -359,7 +359,7 @@ MetaIndexer::Result MetaIndexer::Update(RequestContext *request_context,
     }
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_key_count, keys.size());
-    LocationIdsPerKey empty_location_ids;
+    static LocationIdsPerKey empty_location_ids;
     std::vector<BatchMetaData> batches = MakeBatches(keys, empty_location_ids, location_maps, properties);
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_batch_num, batches.size());
     Result result(keys.size());
@@ -384,9 +384,9 @@ MetaIndexer::Result MetaIndexer::Delete(RequestContext *request_context, const K
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_key_count, keys.size());
     const auto &trace_id = request_context->trace_id();
-    LocationIdsPerKey empty_location_ids;
-    LocationMapVector empty_locations;
-    PropertyMapVector empty_properties;
+    static LocationIdsPerKey empty_location_ids;
+    static LocationMapVector empty_locations;
+    static PropertyMapVector empty_properties;
     std::vector<BatchMetaData> batches = MakeBatches(keys, empty_location_ids, empty_locations, empty_properties);
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_batch_num, batches.size());
     Result result(keys.size());
@@ -1117,9 +1117,9 @@ MetaIndexer::Result MetaIndexer::ReadModifyWriteBlock(RequestContext *request_co
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_key_count, keys.size());
 
-    LocationIdsPerKey empty_location_ids;
-    LocationMapVector empty_locations;
-    PropertyMapVector empty_properties;
+    static LocationIdsPerKey empty_location_ids;
+    static LocationMapVector empty_locations;
+    static PropertyMapVector empty_properties;
     std::vector<BatchMetaData> batches = MakeBatches(keys, empty_location_ids, empty_locations, empty_properties);
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_batch_num, batches.size());
 
@@ -1130,15 +1130,16 @@ MetaIndexer::Result MetaIndexer::ReadModifyWriteBlock(RequestContext *request_co
     for (auto &batch : batches) {
         ScopedBatchLock lock(*this, batch.batch_shard_indexs);
 
+        const auto &batch_keys = batch.batch_keys;
         // 1. Read each key's current state. We only need the existing location
         //    id list; values are not deserialized. The backend exposes no
         //    "field-names only" primitive, so we still pay one GetAllFields.
         FieldMapVec batch_field_maps;
         const int64_t begin_get = TimestampUtil::GetCurrentTimeUs();
         // TODO:(tianran) 实现一个GetLocationId，无需反序列化location
-        std::vector<ErrorCode> get_ecs = backend_manager_->GetAllFields(batch.batch_keys, batch_field_maps);
+        std::vector<ErrorCode> get_ecs = backend_manager_->GetAllFields(batch_keys, batch_field_maps);
         stats.get_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin_get;
-        if (batch_field_maps.size() != batch.batch_keys.size()) {
+        if (batch_field_maps.size() != batch_keys.size()) {
             // Backend protocol violation: surface a per-key error and skip.
             for (const int32_t idx : batch.batch_indexs) {
                 result.error_codes[idx] = EC_ERROR;
@@ -1152,10 +1153,10 @@ MetaIndexer::Result MetaIndexer::ReadModifyWriteBlock(RequestContext *request_co
         BatchMetaData delete_batch;
         std::vector<int32_t> put_global_indexs; // brand-new keys (subset of upsert_batch)
 
-        for (size_t j = 0; j < batch.batch_keys.size(); ++j) {
+        for (size_t j = 0; j < batch_keys.size(); ++j) {
             const ErrorCode get_ec = get_ecs[j];
             const int32_t global_idx = batch.batch_indexs[j];
-            const KeyType key = batch.batch_keys[j];
+            const KeyType key = batch_keys[j];
 
             const LocationIdVector existing_ids = ExtractLocationIds(batch_field_maps[j]);
 
@@ -1237,8 +1238,8 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocation(RequestContext 
     // batches and drive one batch at a time. `location_ids` is not threaded
     // through MakeBatches (it carries no key-level payload), we re-project it
     // per batch via batch.batch_indexs below.
-    LocationMapVector empty_locations;
-    PropertyMapVector empty_properties;
+    static LocationMapVector empty_locations;
+    static PropertyMapVector empty_properties;
     std::vector<BatchMetaData> batches = MakeBatches(keys, location_ids, empty_locations, empty_properties);
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_batch_num, batches.size());
 
@@ -1250,7 +1251,7 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocation(RequestContext 
     for (auto &batch : batches) {
         ScopedBatchLock lock(*this, batch.batch_shard_indexs);
 
-        const auto &keys = batch.batch_keys;
+        const auto &batch_keys = batch.batch_keys;
         // 1. One batched read for every (key, location_id) pair in this
         //    batch. The backend returns a per-(key, location) ec matrix and
         //    fills out_locations[j][k] with the deserialised CacheLocation
@@ -1258,8 +1259,8 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocation(RequestContext 
         //    CacheLocation that we never read.
         LocationsPerKey batch_locations_per_key;
         const int64_t begin_get = TimestampUtil::GetCurrentTimeUs();
-        std::vector<std::vector<ErrorCode>> get_ecs_per_key =
-            backend_manager_->GetLocations(request_context, keys, batch.batch_location_ids, batch_locations_per_key);
+        std::vector<std::vector<ErrorCode>> get_ecs_per_key = backend_manager_->GetLocations(
+            request_context, batch_keys, batch.batch_location_ids, batch_locations_per_key);
         stats.get_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin_get;
 
         // 2. Per-key modifier dispatch -> bucket each key into the upsert
@@ -1270,9 +1271,9 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocation(RequestContext 
         BatchMetaData delete_batch;
         std::vector<int32_t> put_global_indexs; // brand-new keys (subset of upsert_global_indexs)
 
-        for (size_t j = 0; j < keys.size(); ++j) {
+        for (size_t j = 0; j < batch_keys.size(); ++j) {
             const int32_t global_idx = batch.batch_indexs[j];
-            const KeyType key = keys[j];
+            const KeyType key = batch_keys[j];
             const std::vector<ErrorCode> &get_ecs = get_ecs_per_key[j];
             const LocationIdVector &loc_ids = batch.batch_location_ids[j];
             CacheLocationVector &loc_values = batch_locations_per_key[j];
