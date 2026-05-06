@@ -1,6 +1,7 @@
 #include "kv_cache_manager/optimizer/manager/eviction_manager.h"
 
 #include <algorithm>
+#include <unordered_set>
 
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/optimizer/eviction_policy/policy_factory.h"
@@ -338,23 +339,42 @@ std::unordered_map<std::string, std::vector<BlockEntry *>>
 OptEvictionManager::ActiveEvictExpired(const OptInstanceGroupConfig &instance_group_config, int64_t current_timestamp) {
     std::unordered_map<std::string, std::vector<BlockEntry *>> result;
 
-    // 显式过期驱逐入口：由策略实现决定是否有过期语义（非 TTL 默认返回空）
+    // TTL 是 block 级属性，过期时从所有 tier 中清除。
+    // 遍历所有 tier policies 调用 EvictExpired()（各自从内部结构移除），去重后统一 clear location_map。
     for (const auto &instance_config : instance_group_config.instances()) {
         auto instance_id = instance_config.instance_id();
-        auto policy = GetPolicyOrLog(instance_id, "ActiveEvictExpired");
-        if (!policy) {
+        auto it = instance_tiered_policy_map_.find(instance_id);
+        if (it == instance_tiered_policy_map_.end()) {
+            KVCM_LOG_WARN("[ActiveEvictExpired] Eviction policy not found for instance: %s", instance_id.c_str());
             continue;
         }
-        policy->AdvanceClock(current_timestamp);
-        if (policy->size() == 0) {
+        auto &policies = it->second.policies;
+
+        // 从所有 tier 收集过期 block（去重）
+        std::unordered_set<BlockEntry *> expired_set;
+        for (auto &policy : policies) {
+            policy->AdvanceClock(current_timestamp);
+            if (policy->size() == 0) {
+                continue;
+            }
+            auto evicted = policy->EvictExpired();
+            for (auto *block : evicted) {
+                expired_set.insert(block);
+            }
+        }
+
+        if (expired_set.empty()) {
             continue;
         }
-        auto evicted = policy->EvictExpired();
-        if (!evicted.empty()) {
-            result[instance_id] = evicted;
-            KVCM_LOG_DEBUG(
-                "Actively evicted %zu expired blocks from instance: %s", evicted.size(), instance_id.c_str());
+
+        // block 级 TTL 过期：清除所有 tier 的 location
+        for (auto *block : expired_set) {
+            block->location_map.clear();
         }
+
+        result[instance_id] = std::vector<BlockEntry *>(expired_set.begin(), expired_set.end());
+        KVCM_LOG_DEBUG(
+            "Actively evicted %zu expired blocks from instance: %s", expired_set.size(), instance_id.c_str());
     }
 
     return result;
@@ -425,16 +445,6 @@ std::vector<size_t> OptEvictionManager::GetCurrentInstanceUsagePerTier(const std
         result.push_back(policy->size());
     }
     return result;
-}
-
-std::shared_ptr<EvictionPolicy> OptEvictionManager::GetPolicyOrLog(const std::string &instance_id,
-                                                                   const char *context) const {
-    auto it = instance_tiered_policy_map_.find(instance_id);
-    if (it == instance_tiered_policy_map_.end()) {
-        KVCM_LOG_WARN("[%s] Eviction policy not found for instance: %s", context, instance_id.c_str());
-        return nullptr;
-    }
-    return it->second.shared_policy();
 }
 
 } // namespace kv_cache_manager

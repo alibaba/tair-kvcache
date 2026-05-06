@@ -87,8 +87,6 @@ public:
                           int64_t timestamp);
 
 private:
-    std::shared_ptr<EvictionPolicy> GetPolicyOrLog(const std::string &instance_id, const char *context) const;
-
     // 驱逐模式分发：根据 eviction_mode 调用对应的驱逐实现
     std::unordered_map<std::string, std::vector<BlockEntry *>>
     DispatchEviction(const std::string &instance_id,

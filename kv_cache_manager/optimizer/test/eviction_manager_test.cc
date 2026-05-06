@@ -431,3 +431,77 @@ TEST_F(OptEvictionManagerTest, ActiveEvictExpiredSkipsNonTtlPolicyInV1) {
     EXPECT_FALSE(expired_block.location_map.empty());
     EXPECT_FALSE(alive_block.location_map.empty());
 }
+
+// TTL 过期应清除 block 在所有 tier 的 location（block 级语义）
+TEST_F(OptEvictionManagerTest, ActiveEvictExpiredClearsAllTiers) {
+    // 创建 2-tier hierarchical TTL 实例
+    OptInstanceConfig ttl_instance;
+    ttl_instance.set_instance_id("ttl_multi_tier");
+    ttl_instance.set_instance_group_name("ttl_mt_group");
+    ttl_instance.set_block_size(1024);
+    ttl_instance.set_eviction_policy_type(EvictionPolicyType::POLICY_TTL);
+    TtlParams ttl_params;
+    ttl_params.fallback_on_pressure = false;
+    ttl_instance.set_eviction_policy_param(ttl_params);
+
+    // 两个 tier
+    std::vector<OptTierConfig> tier_configs;
+    OptTierConfig tier0;
+    tier0.set_unique_name("gpu");
+    tier0.set_capacity(1024 * 1024);
+    tier_configs.push_back(tier0);
+    OptTierConfig tier1;
+    tier1.set_unique_name("host");
+    tier1.set_capacity(1024 * 1024);
+    tier_configs.push_back(tier1);
+
+    auto *policy_group = manager_->CreateAndRegisterEvictionPolicy(ttl_instance, tier_configs, true);
+    ASSERT_NE(policy_group, nullptr);
+    ASSERT_EQ(policy_group->tier_count(), 2);
+
+    // 构造一个 block，同时注册到两个 tier（模拟 WRITE_THROUGH）
+    BlockEntry expired_block;
+    expired_block.key = 42;
+    expired_block.last_access_time = 100;
+    expired_block.ttl_us = 50; // 会在 timestamp > 150 时过期
+    expired_block.location_map["gpu"] = TierStat{};
+    expired_block.location_map["host"] = TierStat{};
+
+    // 写入两个 tier 的策略
+    policy_group->policies[0]->OnBlockWritten(&expired_block);
+    policy_group->policies[1]->OnBlockWritten(&expired_block);
+    ASSERT_EQ(policy_group->policies[0]->size(), 1);
+    ASSERT_EQ(policy_group->policies[1]->size(), 1);
+
+    // 构造一个不过期的 block 作为对照
+    BlockEntry alive_block;
+    alive_block.key = 43;
+    alive_block.last_access_time = 100;
+    alive_block.ttl_us = 10000;
+    alive_block.location_map["gpu"] = TierStat{};
+    alive_block.location_map["host"] = TierStat{};
+    policy_group->policies[0]->OnBlockWritten(&alive_block);
+    policy_group->policies[1]->OnBlockWritten(&alive_block);
+
+    OptInstanceGroupConfig group;
+    group.set_group_name("ttl_mt_group");
+    group.set_instances({ttl_instance});
+
+    // 触发过期驱逐，timestamp=200 > 100+50=150，expired_block 应过期
+    auto evicted = manager_->ActiveEvictExpired(group, 200);
+    ASSERT_EQ(evicted.size(), 1);
+    ASSERT_TRUE(evicted.count("ttl_multi_tier"));
+    ASSERT_EQ(evicted["ttl_multi_tier"].size(), 1);
+    EXPECT_EQ(evicted["ttl_multi_tier"][0]->key, 42);
+
+    // 核心断言：expired_block 的 location_map 应被完全清空（所有 tier）
+    EXPECT_TRUE(expired_block.location_map.empty());
+
+    // expired_block 应从两个 tier 的策略中都被移除
+    EXPECT_EQ(policy_group->policies[0]->size(), 1); // 只剩 alive_block
+    EXPECT_EQ(policy_group->policies[1]->size(), 1);
+
+    // alive_block 不受影响
+    EXPECT_FALSE(alive_block.location_map.empty());
+    EXPECT_EQ(alive_block.location_map.size(), 2);
+}
