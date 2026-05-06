@@ -33,6 +33,7 @@
                 {
                     "instance_id": "3780643326877293460",
                     "block_size": 16,
+                    "bytes_per_token": 32768,
                     "eviction_policy_type": "lru",
                     "eviction_policy_params": {
                                 "sample_rate": 0.1

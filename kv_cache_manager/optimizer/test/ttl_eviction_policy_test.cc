@@ -141,10 +141,13 @@ TEST_F(TtlEvictionPolicyTest, AccessRefreshesTtl) {
 
     EXPECT_FALSE(b.IsExpired(1400));
 
+    // 模拟 RadixTreeIndex::OnBlockAccessed 的 block 级字段更新
+    // （生产路径中 block 级统计由 RadixTreeIndex 统一负责，策略层不写）
+    b.last_access_time = 1400;
     policy_->OnBlockAccessedWithOptions(&b, 1400, true);
     EXPECT_EQ(b.last_access_time, 1400);
 
-    // t=1800: 距新 last_access 400us，仍未过期
+    // t=1800: 距新 ttl_anchor 400us，仍未过期
     EXPECT_FALSE(b.IsExpired(1800));
 
     // t=1901: 超过 1400+500=1900，过期

@@ -22,12 +22,18 @@ from typing import List, Iterator, Tuple, Any
 def _trace_iterator(file_path: Path) -> Iterator[Tuple[int, dict]]:
     """生成 (timestamp_ns, trace)。"""
     with open(file_path, 'r', encoding='utf-8') as f:
-        for line in f:
+        for line_no, line in enumerate(f, 1):
             line = line.strip()
             if not line:
                 continue
-            
+
             trace = json.loads(line)
+            if "timestamp_ns" not in trace:
+                raise ValueError(
+                    f"Missing 'timestamp_ns' in {file_path}:{line_no} — "
+                    f"this field is required (produced by trace_converter). "
+                    f"If using legacy trace with 'timestamp_us', run trace_converter first."
+                )
             yield (int(trace["timestamp_ns"]), trace)
 
 

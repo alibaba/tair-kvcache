@@ -40,8 +40,8 @@ void TtlEvictionPolicy::OnBlockAccessedWithOptions(BlockEntry *block, int64_t ti
     if (it == node_map_.end()) {
         return;
     }
-    block->last_access_time = timestamp;
-    block->access_count += 1;
+    // 注意：block->access_count / last_access_time 由 RadixTreeIndex::OnBlockAccessed 统一更新，
+    // 此处不再重复递增 access_count，避免多层/多策略场景下双重计数
     if (timestamp > last_known_timestamp_) {
         last_known_timestamp_ = timestamp;
     }

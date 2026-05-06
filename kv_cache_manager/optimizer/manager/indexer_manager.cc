@@ -102,29 +102,7 @@ OptIndexerManager::EvictedBlocks OptIndexerManager::CheckAndEvict(const std::str
     const auto &group_config = group_it->second;
 
     // 统一驱逐入口：内部根据 hierarchical_eviction_enabled 与 tier_write_mode 决定分支
-    auto evicted_blocks = eviction_manager_->EvictByMode(instance_id, group_config, eviction_timestamp);
-
-    // 清理 location_map 为空的 block (彻底驱逐)
-    if (!evicted_blocks.empty()) {
-        for (auto &[inst_id, blocks] : evicted_blocks) {
-            auto indexer = GetOptIndexer(inst_id);
-            KVCM_LOG_DEBUG("Evicted %zu blocks from instance_id: %s by CheckAndEvict", blocks.size(), inst_id.c_str());
-            if (indexer) {
-                // 只对 location_map 完全为空的 block 执行 CleanEmptyBlocks
-                // (tier0 驱逐后 block 仍在 tier1，不应清理)
-                std::vector<BlockEntry *> truly_evicted;
-                for (auto *block : blocks) {
-                    if (block->location_map.empty()) {
-                        truly_evicted.push_back(block);
-                    }
-                }
-                if (!truly_evicted.empty()) {
-                    indexer->CleanEmptyBlocks(truly_evicted, eviction_timestamp);
-                }
-            }
-        }
-    }
-    return evicted_blocks;
+    return eviction_manager_->EvictByMode(instance_id, group_config, eviction_timestamp);
 }
 
 void OptIndexerManager::CleanEvictedBlocks(const EvictedBlocks &evicted_blocks,
@@ -145,16 +123,9 @@ void OptIndexerManager::CleanEvictedBlocks(const EvictedBlocks &evicted_blocks,
             }
         }
         if (!truly_evicted.empty()) {
-            int64_t clean_ts = eviction_timestamp;
-            if (use_logical_expire_time) {
-                // TTL expired: use logical expire time (ttl_anchor_time + ttl_us) as clean timestamp
-                for (auto *block : truly_evicted) {
-                    if (block->ttl_us > 0 && block->ttl_anchor_time >= 0) {
-                        clean_ts = std::max(clean_ts, block->ttl_anchor_time + block->ttl_us);
-                    }
-                }
-            }
-            indexer->CleanEmptyBlocks(truly_evicted, clean_ts);
+            // 传入 eviction_timestamp + use_logical_expire_time 标志，
+            // 由 CleanEmptyBlocks 内部 per-block 计算各自的 logical expire time，
+            indexer->CleanEmptyBlocks(truly_evicted, eviction_timestamp, use_logical_expire_time);
         }
     }
 }

@@ -47,7 +47,7 @@ protected:
             return INT64_MAX;
         }
         auto it = block->location_map.find(name_);
-        return (it != block->location_map.end()) ? it->second.last_access_time : block->last_access_time;
+        return (it != block->location_map.end()) ? it->second.last_access_time : INT64_MAX;
     }
 
 private:
