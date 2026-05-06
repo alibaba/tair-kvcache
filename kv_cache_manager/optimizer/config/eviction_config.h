@@ -37,7 +37,18 @@ struct RandomLruParams : public Jsonizable {
     }
 };
 
-using EvictionPolicyParam = std::variant<LruParams, RandomLruParams>;
+struct TtlParams : public Jsonizable {
+    bool fallback_on_pressure = true;
+    bool FromRapidValue(const rapidjson::Value &v) override {
+        KVCM_JSON_GET_MACRO(v, "fallback_on_pressure", fallback_on_pressure);
+        return true;
+    }
+    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override {
+        Put(writer, "fallback_on_pressure", fallback_on_pressure);
+    }
+};
+
+using EvictionPolicyParam = std::variant<LruParams, RandomLruParams, TtlParams>;
 
 class EvictionConfig : public Jsonizable {
 public:

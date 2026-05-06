@@ -11,6 +11,7 @@ enum class EvictionPolicyType {
     POLICY_LRU = 1,
     POLICY_RANDOM_LRU = 2,
     POLICY_LEAF_AWARE_LRU = 3,
+    POLICY_TTL = 4,
 };
 enum class EvictionMode {
     EVICTION_MODE_UNSPECIFIED = 0,
@@ -41,20 +42,29 @@ struct BlockEntry {
     std::vector<int64_t> token_ids; // 可选
     int64_t writing_time = -1;
     int64_t last_access_time = -1;
+    // TTL 续命锚点（与访问统计时间 last_access_time 解耦）。
+    // 不变式：仅在 ttl_us > 0 时有意义；IsExpired 已守卫 ttl_us <= 0，anchor = -1 不会误判。
+    int64_t ttl_anchor_time = -1;
     size_t access_count = 0;
+    int64_t ttl_us = 0;                  // TTL 微秒，0 = 永不过期
     RadixTreeNode *owner_node = nullptr; // 所属节点指针
 
     void ResetAccess() {
         access_count = 0;
         last_access_time = -1;
+        ttl_anchor_time = -1;
         writing_time = -1;
+        ttl_us = 0;
+    }
+
+    bool IsExpired(int64_t current_timestamp) const {
+        return ttl_us > 0 && current_timestamp > ttl_anchor_time + ttl_us;
     }
 };
 
 struct NodeStat {
     size_t access_count = 0;
     int64_t last_access_time = 0;
-    int64_t ttl = 250000000; // 默认 TTL 250 毫秒（纳秒）
 };
 
 struct RadixTreeNode {

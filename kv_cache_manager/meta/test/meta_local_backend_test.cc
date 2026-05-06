@@ -430,7 +430,7 @@ TEST_F(MetaLocalBackendTest, TestPutMetaDataAndGetMetaData) {
 
     FieldMap field_maps;
     field_maps["key1"] = "value1";
-    ASSERT_EQ(EC_UNIMPLEMENTED, meta_storage_backend_->PutMetaData(field_maps));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->PutMetaData(field_maps));
 
     FieldMap out_field_maps;
     ASSERT_EQ(EC_NOENT, meta_storage_backend_->GetMetaData(out_field_maps));

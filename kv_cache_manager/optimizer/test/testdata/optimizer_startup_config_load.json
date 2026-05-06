@@ -11,6 +11,8 @@
             "quota_capacity" : 12000,
             "used_percentage" : 1.0,
             "hierarchical_eviction_enabled": false,
+            "default_block_ttl_seconds": 3600,
+            "ttl_refresh_on_read": true,
             "storages": [
                         {
                             "unique_name": "pace_00",

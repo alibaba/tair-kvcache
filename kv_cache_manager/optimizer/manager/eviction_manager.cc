@@ -214,6 +214,9 @@ std::unordered_map<std::string, std::vector<BlockEntry *>> OptEvictionManager::E
             }
             auto &eviction_policy =
                 tier_idx.has_value() ? it->second.policies[tier_idx.value()] : it->second.shared_policy();
+            if (!eviction_policy->NeedCapacityEviction()) {
+                continue;
+            }
 
             // 每轮驱逐 eviction_batch_size_per_instance_ 个块
             auto instance_evicted_blocks =
@@ -286,6 +289,9 @@ OptEvictionManager::EvictByInstance(const std::string &instance_id,
 
     // 根据 tier_idx 选择策略：有值用分层策略，无值用 shared_policy
     auto &eviction_policy = tier_idx.has_value() ? it->second.policies[tier_idx.value()] : it->second.shared_policy();
+    if (!eviction_policy->NeedCapacityEviction()) {
+        return evict_blocks;
+    }
 
     // Find bytes_per_block for the target instance
     int64_t bpb = 1;
@@ -326,6 +332,32 @@ OptEvictionManager::EvictByInstance(const std::string &instance_id,
                        excess);
     }
     return evict_blocks;
+}
+
+std::unordered_map<std::string, std::vector<BlockEntry *>>
+OptEvictionManager::ActiveEvictExpired(const OptInstanceGroupConfig &instance_group_config, int64_t current_timestamp) {
+    std::unordered_map<std::string, std::vector<BlockEntry *>> result;
+
+    // 显式过期驱逐入口：由策略实现决定是否有过期语义（非 TTL 默认返回空）
+    for (const auto &instance_config : instance_group_config.instances()) {
+        auto instance_id = instance_config.instance_id();
+        auto policy = GetPolicyOrLog(instance_id, "ActiveEvictExpired");
+        if (!policy) {
+            continue;
+        }
+        policy->AdvanceClock(current_timestamp);
+        if (policy->size() == 0) {
+            continue;
+        }
+        auto evicted = policy->EvictExpired();
+        if (!evicted.empty()) {
+            result[instance_id] = evicted;
+            KVCM_LOG_DEBUG(
+                "Actively evicted %zu expired blocks from instance: %s", evicted.size(), instance_id.c_str());
+        }
+    }
+
+    return result;
 }
 
 size_t OptEvictionManager::GetCurrentGroupUsageBytes(const OptInstanceGroupConfig &instance_group_config,
@@ -394,4 +426,15 @@ std::vector<size_t> OptEvictionManager::GetCurrentInstanceUsagePerTier(const std
     }
     return result;
 }
+
+std::shared_ptr<EvictionPolicy> OptEvictionManager::GetPolicyOrLog(const std::string &instance_id,
+                                                                   const char *context) const {
+    auto it = instance_tiered_policy_map_.find(instance_id);
+    if (it == instance_tiered_policy_map_.end()) {
+        KVCM_LOG_WARN("[%s] Eviction policy not found for instance: %s", context, instance_id.c_str());
+        return nullptr;
+    }
+    return it->second.shared_policy();
+}
+
 } // namespace kv_cache_manager

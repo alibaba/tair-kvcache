@@ -28,6 +28,18 @@ struct TieredPolicyGroup {
 
     // 非分层模式下的唯一策略。仅在 policies 包含单个 "shared" 策略时使用。
     const std::shared_ptr<EvictionPolicy> &shared_policy() const { return policies.front(); }
+
+    // 测试及外部便捷入口：委托给所有层策略
+    void OnBlockWritten(BlockEntry *block) {
+        for (auto &p : policies) {
+            p->OnBlockWritten(block);
+        }
+    }
+    void OnBlockAccessedWithOptions(BlockEntry *block, int64_t timestamp, bool refresh_ttl_on_read) {
+        for (auto &p : policies) {
+            p->OnBlockAccessedWithOptions(block, timestamp, refresh_ttl_on_read);
+        }
+    }
 };
 
 class OptEvictionManager {
@@ -46,6 +58,10 @@ public:
     EvictByMode(const std::string &instance_id,
                 const OptInstanceGroupConfig &instance_group_config,
                 int64_t eviction_timestamp);
+
+    // 显式过期驱逐：遍历所有实例调用 EvictExpired()
+    std::unordered_map<std::string, std::vector<BlockEntry *>>
+    ActiveEvictExpired(const OptInstanceGroupConfig &instance_group_config, int64_t current_timestamp);
 
     // ---- 用量查询接口 ----
 
@@ -71,6 +87,8 @@ public:
                           int64_t timestamp);
 
 private:
+    std::shared_ptr<EvictionPolicy> GetPolicyOrLog(const std::string &instance_id, const char *context) const;
+
     // 驱逐模式分发：根据 eviction_mode 调用对应的驱逐实现
     std::unordered_map<std::string, std::vector<BlockEntry *>>
     DispatchEviction(const std::string &instance_id,

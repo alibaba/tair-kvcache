@@ -15,10 +15,16 @@ public:
 
     virtual void OnBlockWritten(BlockEntry *block) = 0;
     virtual void OnNodeWritten(std::vector<BlockEntry *> &blocks) = 0;
-    virtual void OnBlockAccessed(BlockEntry *block, int64_t timestamp) = 0;
+    virtual void OnBlockAccessedWithOptions(BlockEntry *block, int64_t timestamp, bool refresh_ttl_on_read) {
+        (void)refresh_ttl_on_read;
+        block->last_access_time = timestamp;
+        OnBlockAccessed(block, timestamp);
+    }
     virtual std::vector<BlockEntry *> EvictBlocks(size_t num_blocks) = 0;
-
+    virtual std::vector<BlockEntry *> EvictExpired() { return {}; }
     virtual void Clear() = 0;
+    virtual bool NeedCapacityEviction() const { return true; }
+    virtual void AdvanceClock(int64_t timestamp) { (void)timestamp; }
 
     const std::string &name() const { return name_; }
     void set_name(const std::string &name) { name_ = name; }
@@ -33,18 +39,19 @@ protected:
         }
     }
 
-    // 读取 block 在“本策略所属 tier”上的最近访问时间
+    // 读取 block 在"本策略所属 tier"上的最近访问时间
     // 驱逐排序 / 尾部比较均基于此，实现各层 LRU 独立（不被跨层 block 级统计污染）
-    // 若 block 未注册到本层（不应发生，调用方已保证）返回 INT64_MAX
+    // 若 block 未注册到本层，回退到 block 级 last_access_time
     int64_t GetTierAccessTime(const BlockEntry *block) const {
         if (block == nullptr) {
             return INT64_MAX;
         }
         auto it = block->location_map.find(name_);
-        return (it != block->location_map.end()) ? it->second.last_access_time : INT64_MAX;
+        return (it != block->location_map.end()) ? it->second.last_access_time : block->last_access_time;
     }
 
 private:
+    virtual void OnBlockAccessed(BlockEntry *block, int64_t timestamp) = 0;
     std::string name_;
 };
 } // namespace kv_cache_manager

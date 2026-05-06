@@ -13,12 +13,15 @@
 namespace kv_cache_manager {
 class OptIndexerManager {
 public:
+    using EvictedBlocks = std::unordered_map<std::string, std::vector<BlockEntry *>>;
+
     OptIndexerManager(const std::shared_ptr<OptEvictionManager> &eviction_manager);
     ~OptIndexerManager() = default;
     bool CreateOptIndexer(const OptInstanceConfig &instance_config,
                           const std::vector<OptTierConfig> &storage_configs,
                           bool hierarchical_eviction_enabled = false,
-                          TierWriteMode tier_write_mode = TierWriteMode::WRITE_THROUGH);
+                          TierWriteMode tier_write_mode = TierWriteMode::WRITE_THROUGH,
+                          int64_t default_ttl_us = 0);
 
     std::shared_ptr<RadixTreeIndex> GetOptIndexer(const std::string &instance_id) const;
     std::unordered_map<std::string, std::shared_ptr<RadixTreeIndex>> GetAllOptIndexers() const;
@@ -29,8 +32,16 @@ public:
     void RegisterInstanceGroups(const std::unordered_map<std::string, OptInstanceGroupConfig> &instance_groups);
     void RegisterInstances(const std::unordered_map<std::string, OptInstanceConfig> &instances);
 
-    // 检查容量并触发驱逐，eviction_timestamp 用于正确记录 block 的驱逐时刻
-    bool CheckAndEvict(const std::string &instance_id, int64_t eviction_timestamp);
+    // 仅做过期清理，不做容量驱逐；返回待清理的 block 列表
+    EvictedBlocks EvictExpiredBeforeAccess(const std::string &instance_id, int64_t current_timestamp);
+
+    // 仅做容量驱逐；返回待清理的 block 列表
+    EvictedBlocks CheckAndEvict(const std::string &instance_id, int64_t eviction_timestamp = 0);
+
+    // 统一清理驱逐后的 block，并触发节点清理
+    void CleanEvictedBlocks(const EvictedBlocks &evicted_blocks,
+                            int64_t eviction_timestamp,
+                            bool use_logical_expire_time = false);
 
     // 获取容量使用情况
     size_t GetCurrentInstanceUsage(const std::string &instance_id) const;

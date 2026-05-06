@@ -12,6 +12,8 @@
             "used_percentage": 1.0,
             "hierarchical_eviction_enabled": true,
             "tier_write_mode": "write_through",
+            "default_block_ttl_seconds": 0,
+            "ttl_refresh_on_read": true,
             "storages": [
                 {
                     "unique_name": "pace_00",

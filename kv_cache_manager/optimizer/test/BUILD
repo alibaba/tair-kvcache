@@ -16,6 +16,21 @@ cc_test(
 )
 
 cc_test(
+    name = "TtlEvictionPolicyTest",
+    srcs = [
+        "ttl_eviction_policy_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/optimizer/config",
+        "//kv_cache_manager/optimizer/eviction_policy",
+        "//kv_cache_manager/manager:cache_location",
+        "//kv_cache_manager/data_storage:common_define",
+    ],
+)
+
+cc_test(
     name = "RadixTreeIndexTest",
     srcs = [
         "radix_tree_index_test.cc",

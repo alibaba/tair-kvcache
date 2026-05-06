@@ -23,7 +23,8 @@ KVCacheManager Optimizer 是一个独立的缓存优化分析模块，通过回�
 
 ### 核心特性
 
-- **多种驱逐策略**：支持 LRU、RandomLRU、LeafAwareLRU 等驱逐算法
+- **多种驱逐策略**：支持 LRU、RandomLRU、LeafAwareLRU、TTL 等驱逐算法
+- **TTL 过期机制**：当前采用 V1 语义，仅 `POLICY_TTL` 执行 TTL 过期物理清理
 - **分层存储**：支持多层级存储配置，目前功能不完备
 - **Trace 回放**：支持 Publisher Log、Qwen Bailian 等多种 trace 格式
 - **详细统计**：提供命中率、缓存使用情况等详细统计
@@ -56,6 +57,46 @@ OptimizerManager (核心协调器)
 
 **LeafAwareLRU**
 - 在 LRU 基础上增加了对叶子节点的感知，优先驱逐叶子节点中的块
+
+**TTL (Time-To-Live)**
+- 两阶段驱逐：先清走所有 TTL 过期的 block，若容量仍超限则按 `last_access_time` 从最旧开始兜底驱逐
+- `fallback_on_pressure`（默认 true）：关闭后退化为纯 TTL，只回收过期 block，无容量兜底
+
+#### TTL 过期机制（V1）
+
+当前实现语义：
+
+- 仅 `eviction_policy_type: "ttl"` 的实例会执行读写前 TTL 过期物理清理。
+- 非 TTL 策略（`lru` / `random_lru` / `leaf_aware_lru`）下，TTL 视为不存在（既不做前置清理，也不做逻辑过期判定）。
+
+| 使用模式 | 配置方式 | 驱逐行为 |
+|---|---|---|
+| 纯 LRU 容量管理 | `eviction_policy_type: "lru"` | LRU 按访问时间驱逐 |
+| TTL 优先 + 容量兜底 | `eviction_policy_type: "ttl"` + `fallback_on_pressure: true` | 先清所有过期 block，不够则按链表尾部兜底 |
+| 纯时间驱逐（无兜底） | `eviction_policy_type: "ttl"` + `fallback_on_pressure: false` | 只清过期 block，容量不足不管 |
+
+**TTL 行为规则**：
+- `default_block_ttl_seconds`：在 instance group 级别配置，`0` 表示组级禁用 TTL。
+- `ttl_refresh_on_read`：控制读命中是否刷新 TTL 锚点；默认 `true`（Sliding TTL），`false` 时读不续命。
+- 组级禁用 TTL 时，请求级 `ttl_seconds > 0` 不生效（写入路径会强制关闭 TTL）。
+- 写入时，`ttl_anchor_time` 重置为写入时间，TTL 从该锚点开始计时。
+- 读取时（`PrefixQuery`），`last_access_time` 总是刷新；仅在 `ttl_refresh_on_read=true` 时刷新 `ttl_anchor_time`。
+- 读写请求执行前，会先进行一次 TTL 过期块物理清理，并由 `CleanEvictedBlocks` 统一做节点清理。
+- 写入完成后，`CheckAndEvict` 负责容量驱逐；当 `fallback_on_pressure=false` 时跳过容量驱逐。
+- `POLICY_TTL` 过期清理已优化为基于最小过期时间堆（min-heap）的增量回收，避免每次请求全链表扫描。
+
+**TTL 生命周期统计注意事项（重要）**：
+- TTL 模式下的 Block 生命周期统计（`birth_time_us/death_time_us/lifespan_us`）仅反映系统实际处理事件的时间点，不代表真实过期时刻。
+- 由于当前采用写后惰性驱逐（Lazy Eviction），`death_time_us` 记录的是被系统清理/处理的时间，而非严格的 `last_access_time + ttl`。
+- 因此 TTL 场景下的生命周期数据仅用于相对趋势分析，不建议用于精确时长评估或跨策略精确对比。
+
+**Per-request TTL 覆盖**（通过 `WriteCache` API）：
+
+| `ttl_seconds` 值 | 含义 |
+|---|---|
+| `0`（默认） | 使用 group 的 `default_block_ttl_seconds` |
+| `-1` | 禁用 TTL，该 block 永不过期 |
+| `>0` | 自定义 TTL（秒）；若 group 已禁用 TTL（`default_block_ttl_seconds=0`），该值会被忽略 |
 
 ### Trace 类型
 
@@ -112,6 +153,7 @@ bazel build //kv_cache_manager/optimizer:optimizer_main
             "quota_capacity": 12000,
             "used_percentage": 1.0,
             "hierarchical_eviction_enabled": false,
+            "default_block_ttl_seconds": 0, // 0=关闭TTL, >0=默认TTL秒数
             "storages": [
                 {
                     "unique_name": "pace_00",
@@ -209,7 +251,7 @@ bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff_analysis_run_by_
 bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff_analysis_run_by_policies -- \
     -c /path/to/config.json \
     --warmup-capacity 10000 \
-    --eviction-policies lru random_lru leaf_aware_lru \
+    --eviction-policies lru random_lru leaf_aware_lru ttl \
     --num-points 40 \
     --hit-rate-type total \
     --max-workers 4
@@ -218,7 +260,7 @@ bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff_analysis_run_by_
 **参数说明**：
 - `-c, --config` - 配置文件路径
 - `--warmup-capacity` - Warmup 阶段使用的大容量，单位 GB（默认 10000）
-- `--eviction-policies` - 要对比的驱逐策略列表（默认 lru random_lru leaf_aware_lru）
+- `--eviction-policies` - 要对比的驱逐策略列表（默认 lru random_lru leaf_aware_lru ttl）
 - `--num-points` - 容量采样点数量（默认 40）
 - `--hit-rate-type` - 命中率类型：total/internal/external/all（默认 total）
 - `--max-workers` - 并行执行的最大线程数（默认 4）
@@ -248,6 +290,14 @@ optimizer.AnalyzeResults()
 write_res = optimizer.WriteCache("instance_id", "trace_001", timestamp, block_ids, token_ids)
 read_res = optimizer.GetCacheLocation("instance_id", "trace_002", timestamp, block_ids, token_ids, block_mask)
 
+# 写入时指定 TTL（可选）
+write_res = optimizer.WriteCache("instance_id", "trace_003", timestamp, block_ids, token_ids,
+                                  ttl_seconds=0)    # 使用 group 默认
+write_res = optimizer.WriteCache("instance_id", "trace_004", timestamp, block_ids, token_ids,
+                                  ttl_seconds=-1)   # 禁用 TTL，永不过期
+write_res = optimizer.WriteCache("instance_id", "trace_005", timestamp, block_ids, token_ids,
+                                  ttl_seconds=300)   # 自定义 300 秒
+
 # 清空缓存（保留统计）
 optimizer.ClearCache("instance_id")        # 清空指定实例
 optimizer.ClearAllCaches()                 # 清空所有实例
@@ -262,9 +312,12 @@ optimizer.ClearAllCachesAndResetStats()           # 清空所有实例并重置�
 | 参数 | 说明 |
 |------|------|
 | eviction_mode | 驱逐模式：1=GROUP_ROUGH, 2=INSTANCE_ROUGH, 3=INSTANCE_PRECISE |
-| eviction_policy_type | 驱逐策略类型：lru、random_lru、leaf_aware_lru |
+| eviction_policy_type | 驱逐策略类型：lru、random_lru、leaf_aware_lru、ttl |
 | hierarchical_eviction_enabled | 是否开启分层驱逐（各 tier 独立容量与独立驱逐策略）；`false` 时所有 tier 共享一个 `shared` 策略与 `quota_capacity` 配额（GB） |
 | tier_write_mode | 仅在 `hierarchical_eviction_enabled=true` 时生效。可选值：`write_through`（默认）一次写所有 tier，各层独立驱逐；`cascading` 仅写 tier 0，tier_i 驱逐的 block 自动降级到 tier_{i+1}，最后一层驱逐即丢弃 |
+| default_block_ttl_seconds | instance group 级别的默认 TTL（秒），0 = 关闭 TTL |
+| ttl_refresh_on_read | instance group 级别 TTL 续命开关：true=读续命，false=固定窗口 |
+| fallback_on_pressure | TTL 策略参数：过期不够时是否按 LRU 兜底（默认 true） |
 
 ### 示例
 
@@ -455,6 +508,7 @@ python3 trace_converter.py -i input.jsonl -o output.jsonl -f custom \
         {
             "group_name": "instance_group_01",
             "quota_capacity": 12000,
+            "default_block_ttl_seconds": 0,
             "instances": [
                 {
                     "instance_id": "instance",

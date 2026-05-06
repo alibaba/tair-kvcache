@@ -481,7 +481,8 @@ ErrorCode MetaLocalBackend::SampleReclaimKeys(const int64_t count, std::vector<K
     return EC_OK;
 }
 
-ErrorCode MetaLocalBackend::PutMetaData(const FieldMap & /*field_maps*/) noexcept { return EC_UNIMPLEMENTED; }
+// return OK to avoid error in MetaIndexer::PersistMetaData()
+ErrorCode MetaLocalBackend::PutMetaData(const FieldMap & /*field_maps*/) noexcept { return EC_OK; }
 
 ErrorCode MetaLocalBackend::GetMetaData(FieldMap & /*field_maps*/) noexcept { return EC_NOENT; }
 

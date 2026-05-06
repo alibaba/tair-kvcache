@@ -36,12 +36,14 @@ private:
     void ReturnCandidates(const std::vector<CandidateEntry> &candidates);
     void CommitEviction(const std::vector<CandidateEntry> &candidates, std::vector<BlockEntry *> &evicted_blocks);
 
+    // NVI hook：外部统一通过基类 OnBlockAccessedWithOptions 入口调用。
+    void OnBlockAccessed(BlockEntry *block, int64_t timestamp) override;
+
 public:
     explicit LruEvictionPolicy(const std::string &name, const LruParams &params);
     ~LruEvictionPolicy() override;
     void OnBlockWritten(BlockEntry *block) override;
     void OnNodeWritten(std::vector<BlockEntry *> &blocks) override;
-    void OnBlockAccessed(BlockEntry *block, int64_t timestamp) override;
     std::vector<BlockEntry *> EvictBlocks(size_t count) override;
     void Clear() override;
     size_t size() const override { return node_map_.size(); }

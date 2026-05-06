@@ -145,7 +145,7 @@ class ReclaimStrategy(JsonData):
 
 class MetaStorageBackendConfig(JsonData):
     def __init__(self,
-                 storage_type: str = "local", # local|redis
+                 storage_type: str = "local", # local|redis|cached
                  storage_uri: str = ""): # if set empty, no persistence
         self._storage_type = storage_type
         self._storage_uri = storage_uri
@@ -159,8 +159,8 @@ class MetaStorageBackendConfig(JsonData):
     
     def check(self) -> bool:
         _storage_type = self._storage_type.lower()
-        if not _storage_type in ["local", "redis"]:
-            raise RuntimeError(f"MetaStorageBackendConfig type {_storage_type} invalid, support local|redis")
+        if not _storage_type in ["local", "redis", "cached"]:
+            raise RuntimeError(f"MetaStorageBackendConfig type {_storage_type} invalid, support local|redis|cached")
         self._storage_type = _storage_type
     
     @classmethod

@@ -101,12 +101,30 @@ bool OptimizerManager::Init() {
             }
 
             instance_configs_[instance_id] = instance_config;
+            instance_group_ttl_disabled_[instance_id] = (group.default_block_ttl_seconds() == 0);
+            instance_ttl_refresh_on_read_[instance_id] =
+                (instance_config.eviction_policy_type() == EvictionPolicyType::POLICY_TTL) ? group.ttl_refresh_on_read()
+                                                                                           : true;
+
+            if (instance_config.eviction_policy_type() == EvictionPolicyType::POLICY_TTL &&
+                group.default_block_ttl_seconds() == 0 &&
+                std::holds_alternative<TtlParams>(instance_config.eviction_policy_param())) {
+                const auto &ttl_params = std::get<TtlParams>(instance_config.eviction_policy_param());
+                if (!ttl_params.fallback_on_pressure) {
+                    KVCM_LOG_WARN("instance %s uses TTL policy with default_block_ttl_seconds=0 and "
+                                  "fallback_on_pressure=false; no expiration and no capacity fallback, "
+                                  "cache may grow without bound",
+                                  instance_id.c_str());
+                }
+            }
 
             if (!CreateRadixTreeIndex(instance_config, storage_configs)) {
                 KVCM_LOG_ERROR("Failed to create RadixTreeIndex for instance: %s", instance_id.c_str());
                 failed_instances++;
                 failed_instance_ids.push_back(instance_id);
                 instance_configs_.erase(instance_id);
+                instance_group_ttl_disabled_.erase(instance_id);
+                instance_ttl_refresh_on_read_.erase(instance_id);
                 continue;
             }
 
@@ -138,7 +156,11 @@ bool OptimizerManager::Init() {
     indexer_manager_->RegisterInstanceGroups(instance_group_configs_);
     indexer_manager_->RegisterInstances(instance_configs_);
 
-    optimizer_runner_.reset(new OptimizerRunner(indexer_manager_, eviction_manager_, stats_collector_));
+    optimizer_runner_.reset(new OptimizerRunner(indexer_manager_,
+                                                eviction_manager_,
+                                                stats_collector_,
+                                                instance_group_ttl_disabled_,
+                                                instance_ttl_refresh_on_read_));
     return true;
 }
 
@@ -152,10 +174,18 @@ bool OptimizerManager::CreateRadixTreeIndex(const OptInstanceConfig &instance_co
         return false;
     }
 
+    int64_t default_ttl_us = group_it->second.default_block_ttl_seconds() * 1000000;
+    if (default_ttl_us > 0 && instance_config.eviction_policy_type() != EvictionPolicyType::POLICY_TTL) {
+        KVCM_LOG_WARN("default_block_ttl_seconds=%ld is set but eviction_policy_type is not TTL; "
+                      "TTL will not be enforced for instance %s",
+                      group_it->second.default_block_ttl_seconds(),
+                      instance_config.instance_id().c_str());
+    }
     if (!indexer_manager_->CreateOptIndexer(instance_config,
                                             storage_configs,
                                             group_it->second.hierarchical_eviction_enabled(),
-                                            group_it->second.tier_write_mode())) {
+                                            group_it->second.tier_write_mode(),
+                                            default_ttl_us)) {
         KVCM_LOG_ERROR("Failed to create optimizer indexer for instance_id: %s", instance_config.instance_id().c_str());
         return false;
     }
@@ -175,13 +205,18 @@ WriteCacheRes OptimizerManager::WriteCache(const std::string &instance_id,
                                            const std::string &trace_id,
                                            const int64_t timestamp,
                                            const std::vector<int64_t> &block_ids,
-                                           const std::vector<int64_t> &token_ids) {
+                                           const std::vector<int64_t> &token_ids,
+                                           const int64_t ttl_seconds) {
     WriteCacheSchemaTrace trace;
     trace.set_instance_id(instance_id);
     trace.set_trace_id(trace_id);
     trace.set_timestamp_ns(timestamp);
     trace.set_keys(block_ids);
     trace.set_tokens(token_ids);
+
+    int64_t ttl_us = (ttl_seconds > 0) ? ttl_seconds * 1000000 : ttl_seconds;
+
+    trace.set_ttl_us(ttl_us);
     optimizer_runner_->HandleWriteCache(trace);
     stats_collector_->UpdateTimestamp(instance_id, timestamp);
 

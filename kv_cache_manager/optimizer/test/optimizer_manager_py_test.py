@@ -9,6 +9,7 @@ import os
 import tempfile
 import unittest
 import copy
+import json
 from kv_cache_manager.optimizer.pybind import kvcm_py_optimizer
 # instance id与 配置文件 optimizer_startup_config_load.json 中一致
 class OptimizerManagerPyTest(unittest.TestCase):
@@ -23,6 +24,9 @@ class OptimizerManagerPyTest(unittest.TestCase):
                 test_srcdir, 
                 "kv_cache_manager/kv_cache_manager/optimizer/test/testdata/optimizer_startup_config_load.json"
             )
+
+        self.config_file = config_file
+
         self.config_loader = kvcm_py_optimizer.OptimizerConfigLoader()
         self.assertTrue(self.config_loader.load(config_file))
         self.config = self.config_loader.config()
@@ -63,6 +67,36 @@ class OptimizerManagerPyTest(unittest.TestCase):
 
         self.assertEqual(res.trace_id, trace_id)
         self.assertEqual(res.kvcm_hit_length, 2)
+
+    def test_ttl_expiration(self):
+        """测试 TTL: 写入显式传 ttl_seconds，过期前命中、过期后失效"""
+        # 仅 TTL 用例要求测试配置为 ttl 策略，其他用例不受限
+        with open(self.config_file, "r", encoding="utf-8") as fp:
+            config_json = json.load(fp)
+        policy_type = config_json["instance_groups"][0]["instances"][0]["eviction_policy_type"]
+        if policy_type != "ttl":
+            self.skipTest(f"test_ttl_expiration requires ttl policy, current policy is: {policy_type}")
+
+        instance_id = "3780643326877293460"
+        trace_id = "test_ttl_trace"
+        write_timestamp = 1_000_000
+        block_ids = [101, 102]
+        ttl_seconds = 1
+
+        self.manager.WriteCache(instance_id, trace_id, write_timestamp, block_ids, [], ttl_seconds)
+
+        # 过期前查询（1 秒内）
+        before_expire = self.manager.GetCacheLocation(
+            instance_id, trace_id, write_timestamp + 500_000, block_ids, [], 0
+        )
+        self.assertEqual(before_expire.kvcm_hit_length, 2, "Should hit before TTL expiration")
+
+        # TTL 是滑动窗口：上一次访问会刷新 last_access_time，因此要基于 before_expire 的时间继续推进
+        after_expire_timestamp = (write_timestamp + 500_000) + ttl_seconds * 1_000_000 + 1
+        after_expire = self.manager.GetCacheLocation(
+            instance_id, trace_id, after_expire_timestamp, block_ids, [], 0
+        )
+        self.assertEqual(after_expire.kvcm_hit_length, 0, "Should miss after TTL expiration")
 
     def test_clear_cache(self):
         """测试清空缓存功能（保留统计）"""

@@ -10,7 +10,8 @@ OptIndexerManager::OptIndexerManager(const std::shared_ptr<OptEvictionManager> &
 bool OptIndexerManager::CreateOptIndexer(const OptInstanceConfig &instance_config,
                                          const std::vector<OptTierConfig> &storage_configs,
                                          bool hierarchical_eviction_enabled,
-                                         TierWriteMode tier_write_mode) {
+                                         TierWriteMode tier_write_mode,
+                                         int64_t default_ttl_us) {
 
     std::string instance_id = instance_config.instance_id();
     auto indexer = GetOptIndexer(instance_id);
@@ -30,7 +31,7 @@ bool OptIndexerManager::CreateOptIndexer(const OptInstanceConfig &instance_confi
     // 非分层模式下 tier_write_mode 被忽略（tier_policies_ 中仅含单个 "shared" 策略，全层写等同单层写）
     const TieredPolicyGroup *group_ptr = policy_group;
     const TierWriteMode effective_mode = hierarchical_eviction_enabled ? tier_write_mode : TierWriteMode::WRITE_THROUGH;
-    indexer = std::make_shared<RadixTreeIndex>(instance_id, group_ptr->policies, effective_mode);
+    indexer = std::make_shared<RadixTreeIndex>(instance_id, group_ptr->policies, effective_mode, default_ttl_us);
 
     opt_indexer_map_[instance_id] = indexer;
     KVCM_LOG_INFO("Create optimizer indexer success, instance_id: %s", instance_id.c_str());
@@ -58,12 +59,35 @@ void OptIndexerManager::RegisterInstances(const std::unordered_map<std::string, 
     instance_configs_ = instances;
 }
 
-bool OptIndexerManager::CheckAndEvict(const std::string &instance_id, int64_t eviction_timestamp) {
+OptIndexerManager::EvictedBlocks OptIndexerManager::EvictExpiredBeforeAccess(const std::string &instance_id,
+                                                                             int64_t current_timestamp) {
+    EvictedBlocks empty_result;
+    auto instance_it = instance_configs_.find(instance_id);
+    if (instance_it == instance_configs_.end()) {
+        KVCM_LOG_ERROR("Instance config not found for instance_id: %s", instance_id.c_str());
+        return empty_result;
+    }
+    const auto &instance_config = instance_it->second;
+
+    auto group_it = instance_group_configs_.find(instance_config.instance_group_name());
+    if (group_it == instance_group_configs_.end()) {
+        KVCM_LOG_ERROR("Instance group config not found for group_name: %s",
+                       instance_config.instance_group_name().c_str());
+        return empty_result;
+    }
+    const auto &group_config = group_it->second;
+
+    return eviction_manager_->ActiveEvictExpired(group_config, current_timestamp);
+}
+
+OptIndexerManager::EvictedBlocks OptIndexerManager::CheckAndEvict(const std::string &instance_id,
+                                                                  int64_t eviction_timestamp) {
+    EvictedBlocks empty_result;
 
     auto instance_it = instance_configs_.find(instance_id);
     if (instance_it == instance_configs_.end()) {
         KVCM_LOG_ERROR("Instance config not found for instance_id: %s", instance_id.c_str());
-        return false;
+        return empty_result;
     }
     const auto &instance_config = instance_it->second;
     auto group_name = instance_config.instance_group_name();
@@ -73,7 +97,7 @@ bool OptIndexerManager::CheckAndEvict(const std::string &instance_id, int64_t ev
     if (group_it == instance_group_configs_.end()) {
         KVCM_LOG_ERROR("Instance group config not found for group_name: %s",
                        instance_config.instance_group_name().c_str());
-        return false;
+        return empty_result;
     }
     const auto &group_config = group_it->second;
 
@@ -100,7 +124,39 @@ bool OptIndexerManager::CheckAndEvict(const std::string &instance_id, int64_t ev
             }
         }
     }
-    return !evicted_blocks.empty();
+    return evicted_blocks;
+}
+
+void OptIndexerManager::CleanEvictedBlocks(const EvictedBlocks &evicted_blocks,
+                                           int64_t eviction_timestamp,
+                                           bool use_logical_expire_time) {
+    if (evicted_blocks.empty()) {
+        return;
+    }
+    for (const auto &[inst_id, blocks] : evicted_blocks) {
+        auto indexer = GetOptIndexer(inst_id);
+        if (!indexer) {
+            continue;
+        }
+        std::vector<BlockEntry *> truly_evicted;
+        for (auto *block : blocks) {
+            if (block->location_map.empty()) {
+                truly_evicted.push_back(block);
+            }
+        }
+        if (!truly_evicted.empty()) {
+            int64_t clean_ts = eviction_timestamp;
+            if (use_logical_expire_time) {
+                // TTL expired: use logical expire time (ttl_anchor_time + ttl_us) as clean timestamp
+                for (auto *block : truly_evicted) {
+                    if (block->ttl_us > 0 && block->ttl_anchor_time >= 0) {
+                        clean_ts = std::max(clean_ts, block->ttl_anchor_time + block->ttl_us);
+                    }
+                }
+            }
+            indexer->CleanEmptyBlocks(truly_evicted, clean_ts);
+        }
+    }
 }
 
 size_t OptIndexerManager::GetCurrentInstanceUsage(const std::string &instance_id) const {

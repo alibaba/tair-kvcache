@@ -28,11 +28,13 @@ public:
 public:
     void DirectRun();
 
+    // ttl_seconds: 0 = 使用 group 默认, -1 = 禁用 TTL, >0 = 自定义秒数
     WriteCacheRes WriteCache(const std::string &instance_id,
                              const std::string &trace_id,
                              const int64_t timestamp,
                              const std::vector<int64_t> &block_ids,
-                             const std::vector<int64_t> &token_ids);
+                             const std::vector<int64_t> &token_ids,
+                             const int64_t ttl_seconds = 0);
     GetCacheLocationRes GetCacheLocation(const std::string &instance_id,
                                          const std::string &trace_id,
                                          const int64_t timestamp,
@@ -64,6 +66,8 @@ private:
     OptimizerConfig config_;
     std::unordered_map<std::string, OptInstanceGroupConfig> instance_group_configs_;
     std::unordered_map<std::string, OptInstanceConfig> instance_configs_;
+    std::unordered_map<std::string, bool> instance_group_ttl_disabled_;
+    std::unordered_map<std::string, bool> instance_ttl_refresh_on_read_;
 
     std::shared_ptr<OptEvictionManager> eviction_manager_;
     std::shared_ptr<OptIndexerManager> indexer_manager_;

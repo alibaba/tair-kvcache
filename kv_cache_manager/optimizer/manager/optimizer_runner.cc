@@ -102,8 +102,18 @@ void OptimizerRunner::HandleGetLocation(const GetLocationSchemaTrace &trace) {
         return;
     }
 
+    // 读请求前统一清理过期 block，并做节点清理（TTL 使用逻辑过期时刻记录）
+    auto expired_evicted_blocks = indexer_manager_->EvictExpiredBeforeAccess(instance_id, trace.timestamp_ns());
+    indexer_manager_->CleanEvictedBlocks(expired_evicted_blocks, trace.timestamp_ns(), true);
+
+    bool refresh_ttl_on_read = true;
+    auto it = instance_ttl_refresh_on_read_.find(instance_id);
+    if (it != instance_ttl_refresh_on_read_.end()) {
+        refresh_ttl_on_read = it->second;
+    }
+
     QueryHit query_hit;
-    indexer->PrefixQuery(trace.keys(), trace.block_mask(), trace.timestamp_ns(), &query_hit);
+    indexer->PrefixQuery(trace.keys(), trace.block_mask(), trace.timestamp_ns(), &query_hit, refresh_ttl_on_read);
 
     size_t local_read_block_num = 0;
     if (std::holds_alternative<BlockMaskVector>(trace.block_mask())) {
@@ -125,8 +135,19 @@ void OptimizerRunner::HandleWriteCache(const WriteCacheSchemaTrace &trace) {
         return;
     }
 
-    auto result = indexer->InsertOnly(trace.keys(), trace.timestamp_ns());
-    bool evicted = indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_ns());
+    // 写请求前统一清理过期 block，并做节点清理（TTL 使用逻辑过期时刻记录）
+    auto expired_evicted_blocks = indexer_manager_->EvictExpiredBeforeAccess(instance_id, trace.timestamp_ns());
+    indexer_manager_->CleanEvictedBlocks(expired_evicted_blocks, trace.timestamp_ns(), true);
+
+    int64_t effective_ttl_us = trace.ttl_us();
+    auto ttl_disabled_it = instance_group_ttl_disabled_.find(instance_id);
+    if (ttl_disabled_it != instance_group_ttl_disabled_.end() && ttl_disabled_it->second) {
+        effective_ttl_us = -1;
+    }
+
+    auto result = indexer->InsertOnly(trace.keys(), trace.timestamp_ns(), effective_ttl_us);
+    auto capacity_evicted_blocks = indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_ns());
+    bool evicted = !capacity_evicted_blocks.empty();
     if (evicted) {
         KVCM_LOG_DEBUG("Eviction at ts=%lld for instance_id: %s",
                        static_cast<long long>(trace.timestamp_ns()),
@@ -147,6 +168,10 @@ void OptimizerRunner::HandleDialogTurn(const DialogTurnSchemaTrace &trace) {
     if (!indexer) {
         return;
     }
+
+    // DialogTurn 前统一清理过期 block，并做节点清理（TTL 使用逻辑过期时刻记录）
+    auto expired_evicted_blocks = indexer_manager_->EvictExpiredBeforeAccess(instance_id, trace.timestamp_ns());
+    indexer_manager_->CleanEvictedBlocks(expired_evicted_blocks, trace.timestamp_ns(), true);
 
     QueryHit query_hit;
     indexer->InsertWithQuery(trace.total_keys(), trace.timestamp_ns(), &query_hit);

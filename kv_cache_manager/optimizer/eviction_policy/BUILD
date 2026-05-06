@@ -6,6 +6,7 @@ cc_library(
         "lru.cc",
         "random_lru.cc",
         "leaf_aware_lru.cc",
+        "ttl.cc",
         "policy_factory.cc",
     ],
     hdrs = [
@@ -15,6 +16,7 @@ cc_library(
         "lru.h",
         "random_lru.h",
         "leaf_aware_lru.h",
+        "ttl.h",
     ],
     deps = [
         "//kv_cache_manager/manager:cache_location",

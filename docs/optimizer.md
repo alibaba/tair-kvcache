@@ -5,7 +5,7 @@
 KVCacheManager Optimizer 是一个独立的缓存优化分析模块，通过回放 trace 数据来模拟缓存读写操作，评估不同驱逐策略和配置对缓存命中率的影响。
 
 **核心功能**：
-- 支持多种驱逐策略（LRU、RandomLRU、LeafAwareLRU）
+- 支持多种驱逐策略（LRU、RandomLRU、LeafAwareLRU、TTL）
 - 支持多种 trace 格式（Publisher Log、Qwen Bailian）
 - 提供详细的缓存命中率统计和分析
 - 支持多种可视化分析工具
@@ -68,7 +68,22 @@ bazel build //kv_cache_manager/optimizer:optimizer_main
 **可选配置项**：
 - `trace_type`: publisher_log, qwen_bailian
 - `eviction_mode`: 1=GROUP_ROUGH, 2=INSTANCE_ROUGH, 3=INSTANCE_PRECISE
-- `eviction_policy_type`: lru、random_lru、leaf_aware_lru
+- `eviction_policy_type`: lru、random_lru、leaf_aware_lru、ttl
+
+### TTL 时间语义说明
+
+当实例使用 `ttl` 策略时，`BlockEntry` 中有两类时间字段：
+
+- `last_access_time`：记录最近访问时间，用于访问统计和 LRU 热度排序。
+- `ttl_anchor_time`：TTL 过期锚点，过期判定使用 `current_time > ttl_anchor_time + ttl_us`。
+
+`ttl_refresh_on_read` 控制读路径是否续命：
+
+- `true`（默认）：读命中会更新 `ttl_anchor_time`，TTL 采用滑动窗口。
+- `false`：读命中不更新 `ttl_anchor_time`，TTL 采用固定窗口；但 `last_access_time` 仍会更新，保证统计与 LRU fallback 热度正常。
+
+写入路径会将 `ttl_anchor_time` 重置为写入事件时间，保证 TTL 起点明确且与事件时间一致。
+
 
 ## 基本使用
 基本示例见 [Optimizer README](../kv_cache_manager/optimizer/README.md#示例)
@@ -101,7 +116,7 @@ bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff_analysis_run_by_
 **多策略对比分析**：
 ```bash
 bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff_analysis_run_by_policies -- \
-    -c /path/to/config.json --eviction-policies lru random_lru leaf_aware_lru
+    -c /path/to/config.json --eviction-policies lru random_lru leaf_aware_lru ttl
 ```
 
 ## 扩展开发

@@ -8,6 +8,7 @@
 #include "kv_cache_manager/optimizer/config/tier_config.h"
 #include "kv_cache_manager/optimizer/config/types.h"
 #include "kv_cache_manager/optimizer/eviction_policy/lru.h"
+#include "kv_cache_manager/optimizer/eviction_policy/ttl.h"
 #include "kv_cache_manager/optimizer/manager/eviction_manager.h"
 
 using namespace kv_cache_manager;
@@ -126,7 +127,7 @@ TEST_F(OptEvictionManagerTest, EvictByInstancePreciseMode) {
     ASSERT_NE(pg, nullptr);
 
     // 驱逐测试
-    auto evicted = manager_->EvictByMode("instance1", instance_group_config);
+    auto evicted = manager_->EvictByMode("instance1", instance_group_config, 0);
     // 不应该崩溃
     SUCCEED();
 }
@@ -147,7 +148,7 @@ TEST_F(OptEvictionManagerTest, EvictByInstanceRoughMode) {
     ASSERT_NE(pg, nullptr);
 
     // 驱逐测试
-    auto evicted = manager->EvictByMode("instance1", instance_group_config);
+    auto evicted = manager->EvictByMode("instance1", instance_group_config, 0);
     // 不应该崩溃
     SUCCEED();
 }
@@ -168,7 +169,7 @@ TEST_F(OptEvictionManagerTest, EvictByGroupRough) {
     ASSERT_NE(pg, nullptr);
 
     // 驱逐测试
-    auto evicted = manager->EvictByMode("instance1", instance_group_config);
+    auto evicted = manager->EvictByMode("instance1", instance_group_config, 0);
     // 不应该崩溃
     SUCCEED();
 }
@@ -304,7 +305,7 @@ TEST_F(OptEvictionManagerTest, EvictFromNonExistentInstance) {
     // 尝试从不存在的实例驱逐 - 可能会抛出异常
     // 这个测试验证了系统的健壮性
     try {
-        auto evicted = manager_->EvictByMode("non_existent_instance", instance_group_config);
+        auto evicted = manager_->EvictByMode("non_existent_instance", instance_group_config, 0);
         // 如果没有抛出异常,检查返回值
         EXPECT_TRUE(evicted.empty());
     } catch (...) {
@@ -320,4 +321,113 @@ TEST_F(OptEvictionManagerTest, HierarchicalEvictionEnabled) {
     // 启用分层驱逐
     auto policy = manager_->CreateAndRegisterEvictionPolicy(instance_config, tier_configs, true);
     EXPECT_NE(policy, nullptr);
+}
+
+TEST_F(OptEvictionManagerTest, ActiveEvictExpiredShouldNotTriggerFallbackEviction) {
+    OptInstanceConfig ttl_instance;
+    ttl_instance.set_instance_id("ttl_instance");
+    ttl_instance.set_instance_group_name("ttl_group");
+    ttl_instance.set_block_size(1024);
+    ttl_instance.set_eviction_policy_type(EvictionPolicyType::POLICY_TTL);
+    TtlParams ttl_params;
+    ttl_params.fallback_on_pressure = true;
+    ttl_instance.set_eviction_policy_param(ttl_params);
+
+    auto tier_configs = CreateTestTierConfigs();
+    auto policy = manager_->CreateAndRegisterEvictionPolicy(ttl_instance, tier_configs, true);
+    ASSERT_NE(policy, nullptr);
+
+    BlockEntry expired_block;
+    expired_block.key = 1;
+    expired_block.last_access_time = 100;
+    expired_block.ttl_us = 10;
+    expired_block.location_map["tier1"] = TierStat{};
+
+    BlockEntry alive_block;
+    alive_block.key = 2;
+    alive_block.last_access_time = 100;
+    alive_block.ttl_us = 1000;
+    alive_block.location_map["tier1"] = TierStat{};
+
+    policy->OnBlockWritten(&expired_block);
+    policy->OnBlockWritten(&alive_block);
+    policy->OnBlockAccessedWithOptions(&alive_block, 1000, true); // 推进时钟，确保 expired_block 过期
+
+    OptInstanceGroupConfig ttl_group;
+    ttl_group.set_group_name("ttl_group");
+    ttl_group.set_instances({ttl_instance});
+
+    auto evicted = manager_->ActiveEvictExpired(ttl_group, 1000);
+    ASSERT_EQ(evicted.size(), 1);
+    ASSERT_TRUE(evicted.count("ttl_instance"));
+    ASSERT_EQ(evicted["ttl_instance"].size(), 1);
+    EXPECT_EQ(evicted["ttl_instance"][0]->key, 1);
+    EXPECT_FALSE(alive_block.location_map.empty());
+}
+
+TEST_F(OptEvictionManagerTest, ActiveEvictExpiredUsesCurrentTimestamp) {
+    OptInstanceConfig ttl_instance;
+    ttl_instance.set_instance_id("ttl_instance_ts");
+    ttl_instance.set_instance_group_name("ttl_group_ts");
+    ttl_instance.set_block_size(1024);
+    ttl_instance.set_eviction_policy_type(EvictionPolicyType::POLICY_TTL);
+    TtlParams ttl_params;
+    ttl_params.fallback_on_pressure = false;
+    ttl_instance.set_eviction_policy_param(ttl_params);
+
+    auto tier_configs = CreateTestTierConfigs();
+    auto policy = manager_->CreateAndRegisterEvictionPolicy(ttl_instance, tier_configs, true);
+    ASSERT_NE(policy, nullptr);
+
+    BlockEntry expired_block;
+    expired_block.key = 100;
+    expired_block.last_access_time = 100;
+    expired_block.ttl_us = 10;
+    expired_block.location_map["tier1"] = TierStat{};
+    policy->OnBlockWritten(&expired_block);
+
+    // 这里不通过 OnBlockAccessed 推进策略时钟，仅依赖 ActiveEvictExpired 的 current_timestamp。
+    auto ttl_group = OptInstanceGroupConfig();
+    ttl_group.set_group_name("ttl_group_ts");
+    ttl_group.set_instances({ttl_instance});
+
+    auto evicted = manager_->ActiveEvictExpired(ttl_group, 1000);
+    ASSERT_EQ(evicted.size(), 1);
+    ASSERT_TRUE(evicted.count("ttl_instance_ts"));
+    ASSERT_EQ(evicted["ttl_instance_ts"].size(), 1);
+    EXPECT_EQ(evicted["ttl_instance_ts"][0]->key, 100);
+}
+
+TEST_F(OptEvictionManagerTest, ActiveEvictExpiredSkipsNonTtlPolicyInV1) {
+    auto lru_instance = CreateTestInstanceConfig("lru_instance_with_ttl");
+    lru_instance.set_instance_group_name("mixed_group");
+    lru_instance.set_eviction_policy_type(EvictionPolicyType::POLICY_LRU);
+
+    auto tier_configs = CreateTestTierConfigs();
+    auto policy = manager_->CreateAndRegisterEvictionPolicy(lru_instance, tier_configs, true);
+    ASSERT_NE(policy, nullptr);
+
+    BlockEntry expired_block;
+    expired_block.key = 200;
+    expired_block.last_access_time = 100;
+    expired_block.ttl_us = 10;
+    expired_block.location_map["tier1"] = TierStat{};
+
+    BlockEntry alive_block;
+    alive_block.key = 201;
+    alive_block.last_access_time = 100;
+    alive_block.ttl_us = 10000;
+    alive_block.location_map["tier1"] = TierStat{};
+
+    policy->OnBlockWritten(&expired_block);
+    policy->OnBlockWritten(&alive_block);
+
+    OptInstanceGroupConfig group_cfg;
+    group_cfg.set_group_name("mixed_group");
+    group_cfg.set_instances({lru_instance});
+
+    auto evicted = manager_->ActiveEvictExpired(group_cfg, 1000);
+    EXPECT_TRUE(evicted.empty());
+    EXPECT_FALSE(expired_block.location_map.empty());
+    EXPECT_FALSE(alive_block.location_map.empty());
 }
