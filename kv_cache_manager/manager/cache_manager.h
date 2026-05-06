@@ -113,6 +113,17 @@ public:
                                                               const TokenIdsVector &tokens,
                                                               const std::vector<std::string> &location_spec_group_names,
                                                               int64_t write_timeout_seconds);
+
+    // V6D eviction variant: same as StartWriteCache but requires
+    // >= min_replica_count existing replicas to skip the write.
+    std::pair<ErrorCode, StartWriteCacheInfo>
+    StartEvictWriteCache(RequestContext *request_context,
+                         const std::string &instance_id,
+                         const KeyVector &keys,
+                         const TokenIdsVector &tokens,
+                         const std::vector<std::string> &location_spec_group_names,
+                         int64_t write_timeout_seconds,
+                         int32_t min_replica_count);
     ErrorCode
     FinishWriteCache(RequestContext *request_context,
                      const std::string &instance_id,
@@ -125,6 +136,13 @@ public:
                           const KeyVector &keys,
                           const TokenIdsVector &tokens,
                           const BlockMask &block_mask /*TODO*/);
+
+    // ReportEvent: entry point for all V6D-side events (node registration,
+    // block add/delete, host down).  Called from MetaServiceImpl which is
+    // shared by both gRPC and HTTP handlers.
+    ErrorCode ReportEvent(RequestContext *request_context,
+                          const proto::meta::ReportEventRequest *request,
+                          proto::meta::ReportEventResponse *response);
     ErrorCode TrimCache(RequestContext *request_context,
                         const std::string &instance_id,
                         const proto::meta::TrimStrategy &trim_strategy,
@@ -149,6 +167,15 @@ private:
                                const std::vector<std::string> &location_spec_group_names,
                                std::vector<std::string_view> &new_location_spec_group_names,
                                BlockMask &block_mask);
+    ErrorCode FilterWriteCacheWithMinReplica(RequestContext *request_context,
+                                             const std::string &instance_id,
+                                             MetaSearcher *meta_searcher,
+                                             const KeyVector &keys,
+                                             KeyVector &new_keys,
+                                             const std::vector<std::string> &location_spec_group_names,
+                                             std::vector<std::string_view> &new_location_spec_group_names,
+                                             BlockMask &block_mask,
+                                             int32_t min_replica_count);
     ErrorCode GenWriteLocation(RequestContext *request_context,
                                const std::string &instance_id,
                                const CacheManager::KeyVector &keys,
@@ -184,6 +211,11 @@ private:
     std::pair<ErrorCode, int64_t> GetBlockSize(RequestContext *request_context, const std::string &instance_id) const;
     void FilterLocationSpecByName(CacheLocationVector &locations, const std::vector<std::string> &location_spec_names);
     std::string GetStorageConfigStr(RequestContext *request_context, const std::string &instance_id) const;
+
+    // Asynchronously scan and delete all CacheLocation entries that belong to
+    // the given V6D node (identified by host_ip_port) within an instance.
+    // Submitted to SchedulePlanExecutor by the EVENT_HOST_DOWN handler.
+    void CleanupHostLocations(const std::string &instance_id, const std::string &host_ip_port);
     ErrorCode GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
                                           RequestContext *request_context,
                                           const std::string &instance_id,
@@ -205,7 +237,7 @@ private:
                                         CacheLocationVector &cache_locations) const;
     std::unique_ptr<SelectLocationPolicy> genSelectLocationPolicy(RequestContext *request_context,
                                                                   const std::string &instance_id) const;
-    CheckLocDataExistFunc GetCheckLocDataExistFunc() const;
+    CheckLocDataExistFunc GetCheckLocDataExistFunc(const std::string &instance_id) const;
     SubmitDelReqFunc GetSubmitDelReqFunc(const std::string &instance_id) const;
 
 private:

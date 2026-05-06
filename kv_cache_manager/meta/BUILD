@@ -119,6 +119,7 @@ cc_library(
         "cache_location.h",
     ],
     deps = [
+        ":common",
         "//kv_cache_manager/common",
         "//kv_cache_manager/common:string_util",
         "//kv_cache_manager/data_storage:common_define",
