@@ -45,6 +45,10 @@ public:
                          const proto::meta::StartWriteCacheRequest *request,
                          proto::meta::StartWriteCacheResponse *response);
 
+    void StartEvictWriteCache(RequestContext *request_context,
+                              const proto::meta::StartEvictWriteCacheRequest *request,
+                              proto::meta::StartWriteCacheResponse *response);
+
     void FinishWriteCache(RequestContext *request_context,
                           const proto::meta::FinishWriteCacheRequest *request,
                           proto::meta::CommonResponse *response);
@@ -60,6 +64,10 @@ public:
     void GetClusterInfo(RequestContext *request_context,
                         const proto::meta::GetClusterInfoRequest *request,
                         proto::meta::GetClusterInfoResponse *response);
+
+    void ReportEvent(RequestContext *request_context,
+                     const proto::meta::ReportEventRequest *request,
+                     proto::meta::ReportEventResponse *response);
 
 private:
     std::shared_ptr<CacheManager> cache_manager_;

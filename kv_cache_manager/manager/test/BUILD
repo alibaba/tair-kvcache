@@ -155,6 +155,36 @@ cc_test(
 )
 
 cc_test(
+    name = "PriorityThenRandomPolicyTest",
+    srcs = [
+        "priority_then_random_policy_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    data = [],
+    deps = [
+        "//kv_cache_manager/common:string_util",
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/data_storage:common_define",
+        "//kv_cache_manager/manager:priority_then_random_policy",
+    ],
+)
+
+cc_test(
+    name = "FilterWriteCacheTest",
+    srcs = [
+        "filter_write_cache_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    data = [],
+    deps = [
+        "//kv_cache_manager/common:string_util",
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/data_storage:common_define",
+        "//kv_cache_manager/manager:select_location_policy",
+    ],
+)
+
+cc_test(
     name = "ReclaimerTaskSupervisorTest",
     srcs = [
         "reclaimer_task_supervisor_test.cc",

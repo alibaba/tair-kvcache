@@ -8,6 +8,7 @@
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/manager/select_location_policy.h"
 #include "kv_cache_manager/meta/cache_location.h"
+#include "kv_cache_manager/meta/types.h"
 
 namespace kv_cache_manager {
 
@@ -54,6 +55,20 @@ public:
                                const KeyVector &keys,
                                const CacheLocationVector &locations,
                                std::vector<std::string> &out_location_ids);
+    // Caller-driven upsert: location_id and status come from the caller, unlike
+    // BatchAddLocation which randomizes the id and forces CLS_WRITING. Each
+    // entry in new_locations_per_key[i] is merged into keys[i]'s location set;
+    // entries with the same id replace any prior value.
+    struct UpsertLocation {
+        std::string location_id;
+        DataStorageType type;
+        CacheLocationStatus status;
+        std::vector<LocationSpec> specs;
+    };
+    ErrorCode BatchUpsertLocations(RequestContext *request_context,
+                                   const KeyVector &keys,
+                                   const std::vector<std::vector<UpsertLocation>> &new_locations_per_key,
+                                   std::vector<ErrorCode> &out_per_key_ec);
     struct LocationUpdateTask {
         std::string location_id;
         CacheLocationStatus new_status;
@@ -83,6 +98,19 @@ public:
                                   const KeyVector &keys,
                                   const std::vector<std::string> &location_ids,
                                   std::vector<ErrorCode> &results);
+    // Aggregated delete: keys[i] drops every id in location_ids_per_key[i] in
+    // one ReadModifyWriteLocation pass. Differs from BatchDeleteLocation
+    // (singular), which is exactly one location_id per key.
+    ErrorCode BatchDeleteLocations(RequestContext *request_context,
+                                   const KeyVector &keys,
+                                   const LocationIdsPerKey &location_ids_per_key,
+                                   std::vector<std::vector<ErrorCode>> &out_per_location_ec);
+    // Scan every block in the instance and drop all VINEYARD locations whose
+    // id ends with host_suffix. Long-running; the caller is responsible for
+    // running this off the RPC thread.
+    ErrorCode CleanupLocationsByHost(RequestContext *request_context,
+                                     const std::string &host_suffix,
+                                     size_t scan_batch_size = 1000);
 
 private:
     struct StorageTypeWeights {

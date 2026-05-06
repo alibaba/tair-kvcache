@@ -6,6 +6,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -20,6 +21,7 @@
 #include "kv_cache_manager/config/meta_cache_policy_config.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
+#include "kv_cache_manager/data_storage/vineyard_backend.h"
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/event/spec_events/optimizer_event.h"
 #include "kv_cache_manager/manager/cache_manager_metrics_recorder.h"
@@ -27,6 +29,7 @@
 #include "kv_cache_manager/manager/data_storage_selector.h"
 #include "kv_cache_manager/manager/hash_util.h"
 #include "kv_cache_manager/manager/meta_searcher_manager.h"
+#include "kv_cache_manager/manager/priority_then_random_policy.h"
 #include "kv_cache_manager/manager/reclaimer_task_supervisor.h"
 #include "kv_cache_manager/manager/schedule_plan_executor.h"
 #include "kv_cache_manager/manager/select_location_policy.h"
@@ -34,6 +37,7 @@
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
+#include "kv_cache_manager/meta/types.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/protocol/protobuf/meta_service.pb.h"
@@ -358,7 +362,13 @@ CacheManager::GetCacheLocation(RequestContext *request_context,
     if (query_type == QueryType::QT_UNSPECIFIED) {
         RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, EC_ERROR, CacheLocationViewVecWrapper, "unknown query type");
     }
-    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, ManagerPrefixMatch);
+    // 按 QueryType 路由到不同的 chrono gauge：
+    //   - QT_BATCH_GET -> manager.batch_get_time_us
+    //   - 其它（QT_PREFIX_MATCH / QT_REVERSE_ROLL_SW_MATCH）-> manager.prefix_match_time_us
+    // 两个 gauge 互斥写入，单次请求只会有一个非零，便于大盘按 QueryType 区分。
+    auto query_scope = (query_type == QueryType::QT_BATCH_GET)
+                           ? KVCM_METRICS_COLLECTOR_CHRONO_SCOPE(service_metrics_collector, ManagerBatchGet)
+                           : KVCM_METRICS_COLLECTOR_CHRONO_SCOPE(service_metrics_collector, ManagerPrefixMatch);
     CacheLocationVector cache_locations;
     KeyVector query_keys = keys;
     ec = PerformCacheLocationQuery(request_context,
@@ -372,7 +382,7 @@ CacheManager::GetCacheLocation(RequestContext *request_context,
                                    sw_size,
                                    query_keys,
                                    cache_locations);
-    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, ManagerPrefixMatch);
+    query_scope = ChronoScopeGuard{};
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, prefix_match_len, cache_locations.size());
     RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, CacheLocationViewVecWrapper, "get cache location failed");
     FilterLocationSpecByName(cache_locations, location_spec_names);
@@ -581,6 +591,96 @@ CacheManager::StartWriteCache(RequestContext *request_context,
                                 CacheLocationViewVecWrapper(std::move(new_locations)))};
 }
 
+std::pair<ErrorCode, StartWriteCacheInfo>
+CacheManager::StartEvictWriteCache(RequestContext *request_context,
+                                   const std::string &instance_id,
+                                   const KeyVector &keys,
+                                   const TokenIdsVector &tokens,
+                                   const std::vector<std::string> &location_spec_group_names,
+                                   int64_t write_timeout_seconds,
+                                   int32_t min_replica_count) {
+    SPAN_TRACER(request_context);
+    const std::string &trace_id = request_context->trace_id();
+
+    if (min_replica_count <= 0) {
+        min_replica_count = 2;
+    }
+
+    if (!location_spec_group_names.empty() && keys.size() != location_spec_group_names.size()) {
+        RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN,
+                                          EC_ERROR,
+                                          StartWriteCacheInfo,
+                                          "location_spec_group_names size not match , expect[%zu], real[%zu]",
+                                          keys.size(),
+                                          location_spec_group_names.size());
+    }
+
+    auto [ec, meta_searcher] = CheckInputAndGetMetaSearcher(request_context, instance_id, keys, tokens);
+    RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, StartWriteCacheInfo, "start evict write cache failed");
+    CacheLocationVector new_locations;
+    BlockMask block_mask;
+    KeyVector new_keys;
+    std::vector<std::string_view> new_location_spec_group_names;
+    KeyVector query_keys = keys;
+
+    ErrorCode filter_ec;
+    if (!keys.empty()) {
+        filter_ec = FilterWriteCacheWithMinReplica(request_context,
+                                                   instance_id,
+                                                   meta_searcher,
+                                                   keys,
+                                                   new_keys,
+                                                   location_spec_group_names,
+                                                   new_location_spec_group_names,
+                                                   block_mask,
+                                                   min_replica_count);
+    } else {
+        auto [ec_temp, block_size] = GetBlockSize(request_context, instance_id);
+        RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec_temp, StartWriteCacheInfo, "start evict write cache failed");
+        auto gen_keys = GenKeyVector(tokens, block_size);
+        query_keys = gen_keys;
+        filter_ec = FilterWriteCacheWithMinReplica(request_context,
+                                                   instance_id,
+                                                   meta_searcher,
+                                                   gen_keys,
+                                                   new_keys,
+                                                   location_spec_group_names,
+                                                   new_location_spec_group_names,
+                                                   block_mask,
+                                                   min_replica_count);
+    }
+    RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, filter_ec, StartWriteCacheInfo, "filter evict write cache failed");
+
+    std::vector<std::string> location_ids;
+    std::string write_session_id = StringUtil::GenerateRandomString(32);
+    if (new_keys.empty()) {
+        write_timeout_seconds = 10;
+    } else {
+        ec = GenWriteLocation(request_context, instance_id, new_keys, new_location_spec_group_names, new_locations);
+        RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, StartWriteCacheInfo, "start evict write cache failed");
+        ec = meta_searcher->BatchAddLocation(request_context, new_keys, new_locations, location_ids);
+        RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, StartWriteCacheInfo, "start evict write cache failed");
+    }
+    constexpr int64_t kMaxWriteTimeoutSeconds = 1800;
+    write_location_manager_->Put(
+        write_session_id,
+        std::move(new_keys),
+        std::move(location_ids),
+        std::min(kMaxWriteTimeoutSeconds, write_timeout_seconds),
+        [this, trace_id, instance_id, write_session_id](
+            std::unique_ptr<WriteLocationManager::WriteLocationInfo> write_location_info) {
+            RequestContext temp_request_context(trace_id + "_timeout_callback");
+            BlockMaskOffset succeed_block = 0;
+            auto ec = this->FinishWriteCache(
+                &temp_request_context, instance_id, write_session_id, succeed_block, std::move(write_location_info));
+            static_cast<void>(ec);
+        });
+    return {EC_OK,
+            StartWriteCacheInfo(std::move(write_session_id),
+                                std::move(block_mask),
+                                CacheLocationViewVecWrapper(std::move(new_locations)))};
+}
+
 ErrorCode
 CacheManager::FinishWriteCache(RequestContext *request_context,
                                const std::string &instance_id,
@@ -762,7 +862,7 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
         return EC_ERROR;
     }
 
-    const auto check_loc_data_exist = GetCheckLocDataExistFunc();
+    const auto check_loc_data_exist = GetCheckLocDataExistFunc(instance_id);
     const auto submit_del_req = GetSubmitDelReqFunc(instance_id);
     KeyVector prune_keys;
     std::vector<std::vector<std::string>> prune_loc_ids_vec;
@@ -817,6 +917,82 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
             }
         } else if (first_empty_idx != location_maps.size()) {
             // Found an "exists" block after an "empty" block — not a clean prefix.
+            only_prefix_not_empty = false;
+            break;
+        }
+    }
+    if (only_prefix_not_empty) {
+        block_mask = static_cast<BlockMaskOffset>(first_empty_idx);
+        new_keys.insert(new_keys.end(), keys.begin() + first_empty_idx, keys.end());
+        if (!location_spec_group_names.empty()) {
+            new_location_spec_group_names.insert(new_location_spec_group_names.end(),
+                                                 location_spec_group_names.begin() + first_empty_idx,
+                                                 location_spec_group_names.end());
+        }
+        return EC_OK;
+    }
+    block_mask = BlockMaskVector(location_maps.size(), false);
+    for (size_t i = 0; i < location_maps.size(); ++i) {
+        if (exists_flags[i]) {
+            std::get<BlockMaskVector>(block_mask)[i] = true;
+        } else {
+            new_keys.push_back(keys[i]);
+            if (!location_spec_group_names.empty()) {
+                new_location_spec_group_names.push_back(location_spec_group_names[i]);
+            }
+        }
+    }
+    return EC_OK;
+}
+
+ErrorCode CacheManager::FilterWriteCacheWithMinReplica(RequestContext *request_context,
+                                                       const std::string &instance_id,
+                                                       MetaSearcher *meta_searcher,
+                                                       const KeyVector &keys,
+                                                       KeyVector &new_keys,
+                                                       const std::vector<std::string> &location_spec_group_names,
+                                                       std::vector<std::string_view> &new_location_spec_group_names,
+                                                       BlockMask &block_mask,
+                                                       int32_t min_replica_count) {
+    SPAN_TRACER(request_context);
+    const std::string &trace_id = request_context->trace_id();
+    static BlockMask empty_block_mask = static_cast<size_t>(0);
+    std::vector<CacheLocationMap> location_maps;
+    auto ec = meta_searcher->BatchGetLocation(request_context, keys, empty_block_mask, location_maps);
+    RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "BatchGetLocation failed");
+    assert(keys.size() == location_maps.size());
+    auto policy = genSelectLocationPolicy(request_context, instance_id);
+    if (!policy) {
+        return EC_ERROR;
+    }
+
+    auto *weight_policy = dynamic_cast<WeightSLPolicy *>(policy.get());
+    const auto check_loc_data_exist = GetCheckLocDataExistFunc(instance_id);
+
+    auto existsForWrite = [&](size_t /*i*/, const CacheLocationMap &m) -> bool {
+        if (weight_policy) {
+            // V8 §2.6: pass the stale-check so unavailable V6D replicas are
+            // excluded from n_total -- otherwise a host with an expired
+            // heartbeat would be counted toward the min_replica threshold.
+            return weight_policy->ExistsForWriteWithMinCount(m, min_replica_count, check_loc_data_exist);
+        }
+        std::vector<std::string> unused_prune;
+        return policy->ExistsForWrite(m, check_loc_data_exist, unused_prune);
+    };
+
+    std::vector<bool> exists_flags(location_maps.size());
+    for (size_t i = 0; i < location_maps.size(); ++i) {
+        exists_flags[i] = existsForWrite(i, location_maps[i]);
+    }
+
+    size_t first_empty_idx = location_maps.size();
+    bool only_prefix_not_empty = true;
+    for (size_t i = 0; i < location_maps.size(); ++i) {
+        if (!exists_flags[i]) {
+            if (first_empty_idx == location_maps.size()) {
+                first_empty_idx = i;
+            }
+        } else if (first_empty_idx != location_maps.size()) {
             only_prefix_not_empty = false;
             break;
         }
@@ -1103,10 +1279,442 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
     return EC_OK;
 }
 
+// --------------------------------------------------------------------------
+// ReportEvent implementation (V8: batch + heartbeat + medium-aware)
+// --------------------------------------------------------------------------
+
+namespace {
+
+// Storage unique_name convention for V6D: "v6d_{instance_id}".
+std::string VineyardStorageNameFromInstance(const std::string &instance_id) { return "v6d_" + instance_id; }
+
+// V8 location_id format: "kvs#v6d#{medium}#{host_ip_port}".
+std::string BuildVineyardLocationId(const std::string &medium, const std::string &host_ip_port) {
+    std::string id;
+    id.reserve(8 + medium.size() + 1 + host_ip_port.size());
+    id.append("kvs#v6d#");
+    id.append(medium);
+    id.push_back('#');
+    id.append(host_ip_port);
+    return id;
+}
+
+// Tail used to identify all V6D locations belonging to one host (any medium).
+std::string VineyardHostSuffix(const std::string &host_ip_port) { return "#" + host_ip_port; }
+
+bool ParseInt64(const std::string &s, int64_t &out) {
+    try {
+        size_t consumed = 0;
+        int64_t v = std::stoll(s, &consumed);
+        if (consumed != s.size()) {
+            return false;
+        }
+        out = v;
+        return true;
+    } catch (...) { return false; }
+}
+
+VineyardBackend *LookupVineyardBackend(const std::shared_ptr<RegistryManager> &registry_manager,
+                                       const std::string &instance_id) {
+    if (!registry_manager || !registry_manager->data_storage_manager()) {
+        return nullptr;
+    }
+    auto backend =
+        registry_manager->data_storage_manager()->GetDataStorageBackend(VineyardStorageNameFromInstance(instance_id));
+    if (!backend) {
+        return nullptr;
+    }
+    return dynamic_cast<VineyardBackend *>(backend.get());
+}
+
+} // anonymous namespace
+
+ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
+                                    const proto::meta::ReportEventRequest *request,
+                                    proto::meta::ReportEventResponse *response) {
+    SPAN_TRACER(request_context);
+    const std::string &trace_id = request_context->trace_id();
+    const std::string &instance_id = request->instance_id();
+    const std::string &host_ip_port = request->host_ip_port();
+    auto *response_status = response->mutable_header()->mutable_status();
+
+    if (instance_id.empty() || host_ip_port.empty()) {
+        KVCM_LOG_WARN("trace_id [%s] | ReportEvent: empty instance_id or host_ip_port", trace_id.c_str());
+        response_status->set_code(proto::meta::INVALID_ARGUMENT);
+        response_status->set_message("empty instance_id or host_ip_port");
+        return EC_BADARGS;
+    }
+    if (request->events_size() == 0) {
+        response_status->set_code(proto::meta::OK);
+        return EC_OK;
+    }
+
+    auto *vineyard_backend = LookupVineyardBackend(registry_manager_, instance_id);
+    if (!vineyard_backend) {
+        KVCM_LOG_WARN(
+            "trace_id [%s] | ReportEvent: VineyardBackend [v6d_%s] not found", trace_id.c_str(), instance_id.c_str());
+        response_status->set_code(proto::meta::INSTANCE_NOT_EXIST);
+        response_status->set_message("VineyardBackend not found for instance: " + instance_id);
+        return EC_INSTANCE_NOT_EXIST;
+    }
+
+    // Ensure the LivenessCheckerLoop knows how to drive cleanup. Setting the
+    // callback every time is cheap (a function copy) and avoids a chicken-and-
+    // egg problem -- VineyardBackend::DoOpen runs before CacheManager exists,
+    // so we can only inject this hook lazily from here.
+    vineyard_backend->SetCleanupCallback([this, instance_id](const std::string &down_host) {
+        if (this->schedule_plan_executor_) {
+            this->schedule_plan_executor_->SubmitTask(
+                [this, instance_id, down_host] { this->CleanupHostLocations(instance_id, down_host); });
+        } else {
+            std::thread([this, instance_id, down_host] {
+                this->CleanupHostLocations(instance_id, down_host);
+            }).detach();
+        }
+    });
+
+    MetaSearcher *meta_searcher = meta_searcher_manager_->GetMetaSearcher(instance_id);
+    if (!meta_searcher) {
+        KVCM_LOG_WARN("trace_id [%s] | ReportEvent: meta searcher not found for instance [%s]",
+                      trace_id.c_str(),
+                      instance_id.c_str());
+        response_status->set_code(proto::meta::INSTANCE_NOT_EXIST);
+        response_status->set_message("meta searcher not found for instance: " + instance_id);
+        return EC_INSTANCE_NOT_EXIST;
+    }
+
+    const int events_size = request->events_size();
+    std::vector<ErrorCode> per_item_ec(events_size, EC_OK);
+
+    // Aggregation buckets per V8 §2.3.2:
+    //   - register_mediums:  union of mediums across all NODE_REGISTER items
+    //   - heartbeat_status:  most recent system_status payload (HEARTBEAT items)
+    //   - block_add_*:       parallel arrays of (block_key, location) for batch upsert
+    //   - block_del_*:       parallel arrays of (block_key, location_id) for batch delete
+    //   - host_down:         bool flag; triggers SetNodeUnavailable + CleanupHostLocations once
+    //   - has_register / has_heartbeat: gate optional follow-up calls
+    bool has_register = false;
+    bool has_heartbeat = false;
+    bool has_host_down = false;
+    std::vector<std::string> register_mediums;
+    std::map<std::string, std::string> heartbeat_status;
+
+    // Per-block aggregation:
+    //   block_to_add[block_key] = vector<BlockAddEntry>   # upsert
+    //   block_to_del[block_key] = vector<BlockDelEntry>   # remove
+    // The same block_key + same medium repeated within a batch will get the
+    // last-writer-wins semantics inside the modifier.
+    struct BlockAddEntry {
+        std::string location_id;
+        std::vector<LocationSpec> specs;
+        int event_index;
+    };
+    struct BlockDelEntry {
+        std::string location_id;
+        int event_index;
+    };
+    std::map<int64_t, std::vector<BlockAddEntry>> block_to_add;
+    std::map<int64_t, std::vector<BlockDelEntry>> block_to_del;
+
+    for (int i = 0; i < events_size; ++i) {
+        const auto &item = request->events(i);
+        switch (item.event_type()) {
+        case proto::meta::EVENT_NODE_REGISTER: {
+            has_register = true;
+            if (item.has_node_register()) {
+                for (const auto &m : item.node_register().mediums()) {
+                    if (std::find(register_mediums.begin(), register_mediums.end(), m) == register_mediums.end()) {
+                        register_mediums.push_back(m);
+                    }
+                }
+            }
+            break;
+        }
+        case proto::meta::EVENT_HEARTBEAT: {
+            has_heartbeat = true;
+            if (item.has_heartbeat()) {
+                // Last-writer-wins inside the batch: KVCM only needs the latest payload.
+                heartbeat_status.clear();
+                for (const auto &kv : item.heartbeat().system_status()) {
+                    heartbeat_status[kv.first] = kv.second;
+                }
+            }
+            break;
+        }
+        case proto::meta::EVENT_HOST_DOWN: {
+            has_host_down = true;
+            break;
+        }
+        case proto::meta::EVENT_BLOCK_ADD: {
+            if (!item.has_block_add()) {
+                per_item_ec[i] = EC_BADARGS;
+                break;
+            }
+            const auto &p = item.block_add();
+            int64_t block_key = 0;
+            if (!ParseInt64(p.block_key(), block_key)) {
+                KVCM_LOG_WARN(
+                    "trace_id [%s] | EVENT_BLOCK_ADD: invalid block_key [%s]", trace_id.c_str(), p.block_key().c_str());
+                per_item_ec[i] = EC_BADARGS;
+                break;
+            }
+            if (p.medium().empty()) {
+                KVCM_LOG_WARN(
+                    "trace_id [%s] | EVENT_BLOCK_ADD: empty medium for block_key [%ld]", trace_id.c_str(), block_key);
+                per_item_ec[i] = EC_BADARGS;
+                break;
+            }
+            if (p.specs_size() == 0) {
+                KVCM_LOG_WARN(
+                    "trace_id [%s] | EVENT_BLOCK_ADD: empty specs for block_key [%ld]", trace_id.c_str(), block_key);
+                per_item_ec[i] = EC_BADARGS;
+                break;
+            }
+            std::string location_id = BuildVineyardLocationId(p.medium(), host_ip_port);
+            std::vector<LocationSpec> entry_specs;
+            entry_specs.reserve(p.specs_size());
+            for (const auto &s : p.specs()) {
+                entry_specs.emplace_back(s.name(), s.uri());
+            }
+            block_to_add[block_key].push_back(BlockAddEntry{std::move(location_id), std::move(entry_specs), i});
+            break;
+        }
+        case proto::meta::EVENT_BLOCK_DELETE: {
+            if (!item.has_block_delete()) {
+                per_item_ec[i] = EC_BADARGS;
+                break;
+            }
+            const auto &p = item.block_delete();
+            int64_t block_key = 0;
+            if (!ParseInt64(p.block_key(), block_key)) {
+                KVCM_LOG_WARN("trace_id [%s] | EVENT_BLOCK_DELETE: invalid block_key [%s]",
+                              trace_id.c_str(),
+                              p.block_key().c_str());
+                per_item_ec[i] = EC_BADARGS;
+                break;
+            }
+            if (p.medium().empty()) {
+                KVCM_LOG_WARN("trace_id [%s] | EVENT_BLOCK_DELETE: empty medium for block_key [%ld]",
+                              trace_id.c_str(),
+                              block_key);
+                per_item_ec[i] = EC_BADARGS;
+                break;
+            }
+            block_to_del[block_key].push_back(BlockDelEntry{BuildVineyardLocationId(p.medium(), host_ip_port), i});
+            break;
+        }
+        default:
+            KVCM_LOG_WARN("trace_id [%s] | ReportEvent: unknown event_type %d at index %d (ignored)",
+                          trace_id.c_str(),
+                          static_cast<int>(item.event_type()),
+                          i);
+            per_item_ec[i] = EC_BADARGS;
+            break;
+        }
+    }
+
+    // Apply NODE_REGISTER first so subsequent BLOCK_ADD/HEARTBEAT see a
+    // registered node entry. Idempotent re-registration also resurrects an
+    // unavailable node, matching the "register implies the node is up" intent.
+    if (has_register) {
+        auto ec = vineyard_backend->RegisterNode(host_ip_port, register_mediums);
+        if (ec != EC_OK) {
+            for (int i = 0; i < events_size; ++i) {
+                if (request->events(i).event_type() == proto::meta::EVENT_NODE_REGISTER) {
+                    per_item_ec[i] = ec;
+                }
+            }
+        } else {
+            KVCM_LOG_INFO("trace_id [%s] | NODE_REGISTER: host [%s] mediums=%zu in instance [%s]",
+                          trace_id.c_str(),
+                          host_ip_port.c_str(),
+                          register_mediums.size(),
+                          instance_id.c_str());
+        }
+    }
+
+    if (has_heartbeat) {
+        vineyard_backend->OnHeartbeat(host_ip_port, heartbeat_status);
+    }
+
+    // BLOCK_ADD / BLOCK_DELETE go through MetaSearcher::BatchUpsertLocations
+    // and BatchDeleteLocations: the searcher owns the indexer-facing modifier
+    // and storage-usage bookkeeping, while CacheManager keeps event-level
+    // concerns (per-item ec mapping, V6D ReportEvent sub-collectors).
+    auto find_sub_collector = [&request_context](const std::string &api_name) -> ServiceMetricsCollector * {
+        for (const auto &mc : request_context->GetMetricsCollectorsVehicle().GetMetricsCollectors()) {
+            auto *smc = dynamic_cast<ServiceMetricsCollector *>(mc.get());
+            if (smc) {
+                const auto &tags = smc->GetMetricsTags();
+                auto it = tags.find("api_name");
+                if (it != tags.end() && it->second == api_name) {
+                    return smc;
+                }
+            }
+        }
+        return nullptr;
+    };
+
+    if (!block_to_add.empty()) {
+        KeyVector add_keys_aggr;
+        std::vector<const std::vector<BlockAddEntry> *> add_entries_aggr;
+        add_keys_aggr.reserve(block_to_add.size());
+        add_entries_aggr.reserve(block_to_add.size());
+        for (const auto &kv : block_to_add) {
+            add_keys_aggr.push_back(kv.first);
+            add_entries_aggr.push_back(&kv.second);
+        }
+
+        std::vector<std::vector<MetaSearcher::UpsertLocation>> upserts(add_keys_aggr.size());
+        for (size_t i = 0; i < add_keys_aggr.size(); ++i) {
+            const auto &entries = *add_entries_aggr[i];
+            upserts[i].reserve(entries.size());
+            for (const auto &entry : entries) {
+                upserts[i].push_back(MetaSearcher::UpsertLocation{
+                    entry.location_id,
+                    DataStorageType::DATA_STORAGE_TYPE_VINEYARD,
+                    CacheLocationStatus::CLS_SERVING,
+                    entry.specs,
+                });
+            }
+        }
+
+        std::vector<ErrorCode> per_key_ec;
+        meta_searcher->BatchUpsertLocations(request_context, add_keys_aggr, upserts, per_key_ec);
+
+        for (size_t k = 0; k < add_keys_aggr.size(); ++k) {
+            ErrorCode key_ec = (k < per_key_ec.size()) ? per_key_ec[k] : EC_ERROR;
+            if (key_ec == EC_OK) {
+                continue;
+            }
+            for (const auto &entry : *add_entries_aggr[k]) {
+                if (per_item_ec[entry.event_index] == EC_OK) {
+                    per_item_ec[entry.event_index] = key_ec;
+                }
+            }
+        }
+        if (auto *add_mc = find_sub_collector("EventBlockAdd")) {
+            KVCM_METRICS_COLLECTOR_SET_METRICS(add_mc, manager, request_key_count, add_keys_aggr.size());
+            KVCM_METRICS_COLLECTOR_SET_METRICS(add_mc, meta_indexer, query_key_count, add_keys_aggr.size());
+        }
+    }
+
+    if (!block_to_del.empty()) {
+        KeyVector del_keys_aggr;
+        std::vector<const std::vector<BlockDelEntry> *> del_entries_aggr;
+        del_keys_aggr.reserve(block_to_del.size());
+        del_entries_aggr.reserve(block_to_del.size());
+        for (const auto &kv : block_to_del) {
+            del_keys_aggr.push_back(kv.first);
+            del_entries_aggr.push_back(&kv.second);
+        }
+
+        LocationIdsPerKey del_location_ids(del_keys_aggr.size());
+        for (size_t i = 0; i < del_keys_aggr.size(); ++i) {
+            for (const auto &entry : *del_entries_aggr[i]) {
+                del_location_ids[i].push_back(entry.location_id);
+            }
+        }
+
+        std::vector<std::vector<ErrorCode>> per_location_ec;
+        meta_searcher->BatchDeleteLocations(request_context, del_keys_aggr, del_location_ids, per_location_ec);
+
+        for (size_t k = 0; k < del_keys_aggr.size(); ++k) {
+            ErrorCode key_ec = EC_OK;
+            if (k < per_location_ec.size()) {
+                for (const auto &loc_ec : per_location_ec[k]) {
+                    if (loc_ec != EC_OK && loc_ec != EC_NOENT) {
+                        key_ec = loc_ec;
+                        break;
+                    }
+                }
+            } else {
+                key_ec = EC_ERROR;
+            }
+            if (key_ec == EC_OK) {
+                continue;
+            }
+            for (const auto &entry : *del_entries_aggr[k]) {
+                if (per_item_ec[entry.event_index] == EC_OK) {
+                    per_item_ec[entry.event_index] = key_ec;
+                }
+            }
+        }
+        if (auto *del_mc = find_sub_collector("EventBlockDelete")) {
+            KVCM_METRICS_COLLECTOR_SET_METRICS(del_mc, manager, request_key_count, del_keys_aggr.size());
+            KVCM_METRICS_COLLECTOR_SET_METRICS(del_mc, meta_indexer, query_key_count, del_keys_aggr.size());
+        }
+    }
+
+    if (has_host_down) {
+        vineyard_backend->SetNodeUnavailable(host_ip_port);
+        // Long-running scan; offload off the RPC thread.
+        if (schedule_plan_executor_) {
+            auto inst = instance_id;
+            auto host = host_ip_port;
+            schedule_plan_executor_->SubmitTask([this, inst, host] { this->CleanupHostLocations(inst, host); });
+        } else {
+            std::thread([this, instance_id, host_ip_port] {
+                this->CleanupHostLocations(instance_id, host_ip_port);
+            }).detach();
+        }
+        KVCM_LOG_INFO("trace_id [%s] | HOST_DOWN: host [%s] marked unavailable, cleanup scheduled",
+                      trace_id.c_str(),
+                      host_ip_port.c_str());
+    }
+
+    bool any_failure = false;
+    for (auto ec : per_item_ec) {
+        if (ec != EC_OK) {
+            any_failure = true;
+            break;
+        }
+    }
+    if (any_failure) {
+        // Per V8 §2.3.1, item_results is opaque to KVCM beyond the OK/error
+        // distinction; we only collapse to a small set of proto codes that
+        // match what the V6D client needs to retry vs. abort.
+        for (auto ec : per_item_ec) {
+            proto::meta::ErrorCode mapped = proto::meta::OK;
+            if (ec == EC_OK) {
+                mapped = proto::meta::OK;
+            } else if (ec == EC_BADARGS) {
+                mapped = proto::meta::INVALID_ARGUMENT;
+            } else if (ec == EC_INSTANCE_NOT_EXIST) {
+                mapped = proto::meta::INSTANCE_NOT_EXIST;
+            } else {
+                mapped = proto::meta::INTERNAL_ERROR;
+            }
+            response->add_item_results(mapped);
+        }
+        response_status->set_code(proto::meta::INTERNAL_ERROR);
+        response_status->set_message("ReportEvent partially failed; see item_results");
+        return EC_PARTIAL_OK;
+    }
+    response_status->set_code(proto::meta::OK);
+    return EC_OK;
+}
+
+void CacheManager::CleanupHostLocations(const std::string &instance_id, const std::string &host_ip_port) {
+    MetaSearcher *meta_searcher = meta_searcher_manager_->GetMetaSearcher(instance_id);
+    if (!meta_searcher) {
+        KVCM_LOG_WARN("CleanupHostLocations: meta searcher not found for instance [%s]", instance_id.c_str());
+        return;
+    }
+
+    RequestContext cleanup_ctx("cleanup_host_" + host_ip_port);
+    const std::string host_suffix = VineyardHostSuffix(host_ip_port);
+    meta_searcher->CleanupLocationsByHost(&cleanup_ctx, host_suffix);
+
+    KVCM_LOG_INFO("CleanupHostLocations: finished cleaning host [%s] from instance [%s]",
+                  host_ip_port.c_str(),
+                  instance_id.c_str());
+}
+
 ErrorCode CacheManager::TryCreateMetaSearcher(RequestContext *request_context, const std::string &instance_id) {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
-    const auto check_loc_data_exist = GetCheckLocDataExistFunc();
+    const auto check_loc_data_exist = GetCheckLocDataExistFunc(instance_id);
     const auto submit_del_req = GetSubmitDelReqFunc(instance_id);
     MetaSearcher *meta_searcher = meta_searcher_manager_->TryCreateMetaSearcher(
         request_context, instance_id, check_loc_data_exist, submit_del_req);
@@ -1355,6 +1963,15 @@ ErrorCode CacheManager::DoCleanup() {
 std::unique_ptr<SelectLocationPolicy> CacheManager::genSelectLocationPolicy(RequestContext *request_context,
                                                                             const std::string &instance_id) const {
     const auto &trace_id = request_context->trace_id();
+    // V8 §2.8: PriorityThenRandomSLPolicy is opt-in via env. When enabled it
+    // takes precedence over the auto-selected weighted policies below: the
+    // V6D ↔ TAIR weighting story relies on deterministic top-tier selection
+    // (e.g. VINEYARD=10 always beats TAIR_MEMPOOL=3) which discrete_distribution
+    // cannot guarantee.
+    static const std::string policy_env = EnvUtil::GetEnv("KVCM_SELECT_LOCATION_POLICY", std::string());
+    if (policy_env == "priority_then_random") {
+        return std::make_unique<PriorityThenRandomSLPolicy>();
+    }
     auto all_storages = registry_manager_->data_storage_manager()->GetAllStorageNames();
     auto all_available_storages = registry_manager_->data_storage_manager()->GetAvailableStorages();
     if (all_available_storages.size() >= all_storages.size()) {
@@ -1429,8 +2046,8 @@ std::unique_ptr<SelectLocationPolicy> CacheManager::genSelectLocationPolicy(Requ
     return std::make_unique<NamedStorageWeightedSLPolicy>(std::move(weight_map));
 }
 
-CheckLocDataExistFunc CacheManager::GetCheckLocDataExistFunc() const {
-    return [this](const CacheLocation &loc) -> bool {
+CheckLocDataExistFunc CacheManager::GetCheckLocDataExistFunc(const std::string &instance_id) const {
+    return [this, instance_id](const CacheLocation &loc) -> bool {
         if (!registry_manager_ || !registry_manager_->data_storage_manager()) {
             return true;
         }
@@ -1443,13 +2060,15 @@ CheckLocDataExistFunc CacheManager::GetCheckLocDataExistFunc() const {
         }
 
         if (storage_uris.empty()) {
-            // no uri to check
             return true;
         }
 
         // multiple loc_spec in the same location are assumed to be in
         // the same storage backend
-        const std::string storage_unique_name = storage_uris.front().GetHostName();
+        std::string storage_unique_name = storage_uris.front().GetHostName();
+        if (storage_uris.front().GetProtocol() == "vineyard") {
+            storage_unique_name = VineyardStorageNameFromInstance(instance_id);
+        }
         const auto result = registry_manager_->data_storage_manager()->Exist(storage_unique_name, storage_uris, true);
         return std::all_of(result.cbegin(), result.cend(), [](const bool v) -> bool { return v; });
     };
