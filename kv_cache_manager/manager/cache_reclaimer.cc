@@ -79,6 +79,16 @@ namespace kv_cache_manager {
                          ##args);                                                                                      \
     } while (0)
 
+#define INTERVAL_LOG_WITH_ID(LEVEL, interval, format, args...)                                                         \
+    do {                                                                                                               \
+        KVCM_INTERVAL_LOG_##LEVEL(interval,                                                                            \
+                                  "trace_id [%s] | instance_id [%s] | instance_group [%s] | " format,                  \
+                                  request_context->trace_id().c_str(),                                                 \
+                                  ins_id.c_str(),                                                                      \
+                                  ins_gr.c_str(),                                                                      \
+                                  ##args);                                                                             \
+    } while (0)
+
 #define DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(name) DEFINE_METRICS_NAME_(CacheReclaimer, cache_reclaimer, name)
 
 #define REGISTER_COUNTER_METRICS_FOR_CACHE_RECLAIMER(name)                                                             \
@@ -845,20 +855,21 @@ bool CacheReclaimer::MakeBatchByLRU(const RequestContext *request_context,
     for (std::size_t i = 0; i != sampled_keys.size(); ++i) {
         const auto &k = sampled_keys[i];
         const auto &m = property_maps[i];
+        int64_t lru_ts = 0;
+        // if PROPERTY_LRU_TIME is not found, use 0 as the timestamp, the reclaim strategy will degrade
         if (const auto it = m.find(PROPERTY_LRU_TIME); it != m.end()) {
             // the PROPERTY_LRU_TIME value is represented as an int64_t type
             // timepoint string; parse them into integers
             const auto &lru_ts_str = it->second;
-            std::int64_t lru_ts;
             if (!StringUtil::StrToInt64(lru_ts_str.c_str(), lru_ts)) {
-                LOG_WITH_ID(WARN, "lru_time str [%s] to int64 failed", lru_ts_str.c_str());
-                return false;
+                INTERVAL_LOG_WITH_ID(
+                    WARN, 10000, "lru_time str [%s] to int64 failed, use 0 instead", lru_ts_str.c_str());
+                lru_ts = 0;
             }
-            key_tp_vec.emplace_back(k, lru_ts);
         } else {
-            LOG_WITH_ID(WARN, "PROPERTY_LRU_TIME not found");
-            return false;
+            INTERVAL_LOG_WITH_ID(WARN, 10000, "PROPERTY_LRU_TIME not found, use 0 instead");
         }
+        key_tp_vec.emplace_back(k, lru_ts);
     }
 
     std::sort(key_tp_vec.begin(),
