@@ -84,6 +84,7 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(meta_indexer, delete_io_time_us);
     DECLARE_METRICS(meta_indexer, get_io_time_us);
     DECLARE_METRICS(meta_indexer, rand_io_time_us);
+    DECLARE_METRICS(meta_indexer, rmw_get_io_time_us);
     DECLARE_METRICS(meta_indexer, read_modify_write_put_key_count);
     DECLARE_METRICS(meta_indexer, read_modify_write_update_key_count);
     DECLARE_METRICS(meta_indexer, read_modify_write_skip_key_count);
@@ -303,6 +304,7 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(meta_indexer, delete_io_time_us);
     REGISTER_GAUGE_METRIC(meta_indexer, get_io_time_us);
     REGISTER_GAUGE_METRIC(meta_indexer, rand_io_time_us);
+    REGISTER_GAUGE_METRIC(meta_indexer, rmw_get_io_time_us);
     REGISTER_GAUGE_METRIC(meta_indexer, read_modify_write_put_key_count);
     REGISTER_GAUGE_METRIC(meta_indexer, read_modify_write_update_key_count);
     REGISTER_GAUGE_METRIC(meta_indexer, read_modify_write_skip_key_count);
@@ -446,6 +448,7 @@ void KmonitorMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
         REPORT_COLLECTED_METRICS(meta_indexer, delete_io_time_us);
         REPORT_COLLECTED_METRICS(meta_indexer, get_io_time_us);
         REPORT_COLLECTED_METRICS(meta_indexer, rand_io_time_us);
+        REPORT_COLLECTED_METRICS(meta_indexer, rmw_get_io_time_us);
         REPORT_STEAL_METRICS(meta_indexer, read_modify_write_put_key_count);
         REPORT_COLLECTED_METRICS(meta_indexer, read_modify_write_update_key_count);
         REPORT_COLLECTED_METRICS(meta_indexer, read_modify_write_skip_key_count);

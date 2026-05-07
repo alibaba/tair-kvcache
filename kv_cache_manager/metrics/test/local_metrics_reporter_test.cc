@@ -19,12 +19,12 @@
 
 using namespace kv_cache_manager;
 
-std::size_t MetaIndexer_GetCacheUsage_stub() noexcept { return 16; }
+std::size_t MetaIndexer_GetMemUsage_stub() noexcept { return 16; }
 
 class LocalMetricsReporterTest : public TESTBASE {
 public:
     void SetUp() override {
-        stub_.set(ADDR(MetaIndexer, GetCacheUsage), MetaIndexer_GetCacheUsage_stub);
+        stub_.set(ADDR(MetaIndexer, GetMemUsage), MetaIndexer_GetMemUsage_stub);
 
         metrics_registry_ = std::make_shared<MetricsRegistry>();
         registry_manager_ = std::make_shared<RegistryManager>("", metrics_registry_);
@@ -33,7 +33,7 @@ public:
         reporter_->Init(cache_manager_, metrics_registry_, "");
     }
 
-    void TearDown() override { stub_.reset(ADDR(MetaIndexer, GetCacheUsage)); }
+    void TearDown() override { stub_.reset(ADDR(MetaIndexer, GetMemUsage)); }
 
     Stub stub_;
     std::shared_ptr<MetricsRegistry> metrics_registry_;
@@ -168,14 +168,12 @@ TEST_F(LocalMetricsReporterTest, TestReportPerQuery02) {
     ServiceMetricsCollector collector(metrics_registry_);
     collector.Init();
 
-    // EXPECT_EQ(3 + 5 + 11 + 5 + 17, metrics_registry_->GetSize());
-    EXPECT_EQ(3 + 5 + 11 + 5 + 18, metrics_registry_->GetSize());
+    EXPECT_EQ(3 + 5 + 11 + 5 + 19, metrics_registry_->GetSize());
 
     {
         reporter_->ReportPerQuery(&collector);
 
-        // EXPECT_EQ(3 + 5 + 11 + 5 + 17, metrics_registry_->GetSize());
-        EXPECT_EQ(3 + 5 + 11 + 5 + 18, metrics_registry_->GetSize());
+        EXPECT_EQ(3 + 5 + 11 + 5 + 19, metrics_registry_->GetSize());
 
         std::uint64_t v;
         GET_METRICS_(&collector, service, query_counter, v);
@@ -192,8 +190,7 @@ TEST_F(LocalMetricsReporterTest, TestReportPerQuery02) {
 
         reporter_->ReportPerQuery(&collector);
 
-        // EXPECT_EQ(3 + 5 + 11 + 5 + 17, metrics_registry_->GetSize());
-        EXPECT_EQ(3 + 5 + 11 + 5 + 18, metrics_registry_->GetSize());
+        EXPECT_EQ(3 + 5 + 11 + 5 + 19, metrics_registry_->GetSize());
 
         std::uint64_t v;
         GET_METRICS_(&collector, service, query_counter, v);

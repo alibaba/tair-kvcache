@@ -117,6 +117,8 @@ public:
     ErrorCode PutMetaData(const FieldMap &field_maps) noexcept override;
     ErrorCode GetMetaData(FieldMap &field_maps) noexcept override;
 
+    size_t GetMemUsage() const noexcept override;
+
 private:
     // Collects up to `count` oldest keys from the given shard, parses them to
     // KeyType and appends to `out_keys`. Returns the number of keys collected.

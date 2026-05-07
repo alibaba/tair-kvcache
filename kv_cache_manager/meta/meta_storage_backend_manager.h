@@ -83,6 +83,8 @@ public:
     ErrorCode PutMetaData(const FieldMap &field_maps) noexcept;
     ErrorCode GetMetaData(FieldMap &field_maps) noexcept;
 
+    size_t GetMemUsage() const noexcept;
+
 private:
     void AsyncRecoverTask() noexcept;
     int64_t BackfillKeysToLocal(const KeyTypeVec &keys,

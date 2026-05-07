@@ -64,6 +64,7 @@ private:
     void DoDeleteAndExistTest();
     void DoScanAndSampleReclaimKeysTest();
     void DoReadModifyWriteBlockTest();
+    void DoReadModifyWriteLocationTest();
 
 protected:
     std::shared_ptr<MetaIndexer> meta_indexer_;

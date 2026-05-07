@@ -334,7 +334,7 @@ void MetaIndexerTestBase::DoScanAndSampleReclaimKeysTest() {
 void MetaIndexerTestBase::DoReadModifyWriteBlockTest() {
     // upsert_modifier: creates a new location when the key is absent, or adds
     // a second location (id="loc_new_<i>") when the key already exists.
-    auto upsert_modifier = [](const LocationIdVector &existing_ids,
+    auto upsert_modifier = [](const LocationMap &existing_locations,
                               ErrorCode get_ec,
                               size_t /*key_index*/,
                               PropertyMap &upsert_property_map,
@@ -342,13 +342,13 @@ void MetaIndexerTestBase::DoReadModifyWriteBlockTest() {
         if (get_ec != EC_OK && get_ec != EC_NOENT) {
             return {MA_FAIL, get_ec};
         }
-        const std::string suffix = std::to_string(existing_ids.size());
+        const std::string suffix = std::to_string(existing_locations.size());
         const std::string loc_id = "rmw_loc_" + suffix;
         out_new_locations.emplace(loc_id, MetaIndexerTestBase::MakeLocation(loc_id, "rmw_uri_" + suffix));
         upsert_property_map["rmw_prop"] = "rmw_val_" + suffix;
         return {MA_OK, EC_OK};
     };
-    auto delete_modifier_lenient = [](const LocationIdVector & /*existing_ids*/,
+    auto delete_modifier_lenient = [](const LocationMap & /*existing_locations*/,
                                       ErrorCode get_ec,
                                       size_t,
                                       PropertyMap &,
@@ -361,7 +361,7 @@ void MetaIndexerTestBase::DoReadModifyWriteBlockTest() {
         }
         return {MA_FAIL, get_ec};
     };
-    auto delete_modifier_strict = [](const LocationIdVector & /*existing_ids*/,
+    auto delete_modifier_strict = [](const LocationMap & /*existing_locations*/,
                                      ErrorCode get_ec,
                                      size_t,
                                      PropertyMap &,
@@ -408,19 +408,115 @@ void MetaIndexerTestBase::DoReadModifyWriteBlockTest() {
     ASSERT_EQ(0, meta_indexer_->GetKeyCount());
 }
 
+void MetaIndexerTestBase::DoReadModifyWriteLocationTest() {
+    // Seed two keys, each with two locations (loc_a/loc_b).
+    KeyVector keys = {0, 1};
+    LocationMapVector seed_locations(keys.size());
+    PropertyMapVector seed_properties(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        seed_locations[i].emplace("loc_a", MakeLocation("loc_a", "uri_a_" + std::to_string(keys[i])));
+        seed_locations[i].emplace("loc_b", MakeLocation("loc_b", "uri_b_" + std::to_string(keys[i])));
+        seed_properties[i] = {{"p0", "p0_" + std::to_string(keys[i])}};
+    }
+    ASSERT_EQ(EC_OK, meta_indexer_->Put(request_context_.get(), keys, seed_locations, seed_properties).ec);
+
+    // 1. Upsert: rewrite loc_a, add loc_new; loc_b stays untouched.
+    auto upsert_modifier = [](CacheLocationVector &loc,
+                              std::vector<ErrorCode> get_ec,
+                              size_t /*key_index*/,
+                              const LocationIdVector &loc_id,
+                              PropertyMap &upsert_property_map) -> LocationModifierResult {
+        std::vector<ErrorCode> ecs(loc_id.size(), EC_OK);
+        for (size_t k = 0; k < loc_id.size(); ++k) {
+            if (get_ec[k] != EC_OK && get_ec[k] != EC_NOENT) {
+                ecs[k] = get_ec[k];
+                continue;
+            }
+            loc[k] = MetaIndexerTestBase::MakeLocation(loc_id[k], "rmw_" + loc_id[k]);
+        }
+        upsert_property_map["rmw_prop"] = "v";
+        return {MA_OK, std::move(ecs)};
+    };
+    LocationIdsPerKey upsert_ids = {{"loc_a", "loc_new"}, {"loc_a", "loc_new"}};
+    auto loc_result = meta_indexer_->ReadModifyWriteLocation(request_context_.get(), keys, upsert_ids, upsert_modifier);
+    ASSERT_EQ(EC_OK, loc_result.ec);
+    for (const auto &per_key : loc_result.per_location_error_codes) {
+        ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), per_key);
+    }
+    LocationMapVector expect_locations(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        expect_locations[i].emplace("loc_a", MakeLocation("loc_a", "rmw_loc_a"));
+        expect_locations[i].emplace("loc_b", MakeLocation("loc_b", "uri_b_" + std::to_string(keys[i])));
+        expect_locations[i].emplace("loc_new", MakeLocation("loc_new", "rmw_loc_new"));
+    }
+    AssertGet(keys, expect_locations, Result(keys.size()));
+    PropertyMapVector expect_props(keys.size(), {{"rmw_prop", "v"}});
+    AssertGetProperties(keys, {"rmw_prop"}, expect_props, Result(keys.size()));
+
+    // 2. Delete: drop loc_b on key 0; key 1 untouched.
+    auto delete_modifier = [](CacheLocationVector & /*loc*/,
+                              std::vector<ErrorCode> get_ec,
+                              size_t /*key_index*/,
+                              const LocationIdVector &loc_id,
+                              PropertyMap & /*upsert_property_map*/) -> LocationModifierResult {
+        std::vector<ErrorCode> ecs(loc_id.size(), EC_OK);
+        for (size_t k = 0; k < loc_id.size(); ++k) {
+            if (get_ec[k] != EC_OK) {
+                ecs[k] = get_ec[k];
+            }
+        }
+        return {MA_DELETE, std::move(ecs)};
+    };
+    LocationIdsPerKey delete_ids = {{"loc_b"}, {}};
+    loc_result = meta_indexer_->ReadModifyWriteLocation(request_context_.get(), keys, delete_ids, delete_modifier);
+    ASSERT_EQ(EC_OK, loc_result.ec);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), loc_result.per_location_error_codes[0]);
+    ASSERT_TRUE(loc_result.per_location_error_codes[1].empty());
+    expect_locations[0].erase("loc_b");
+    AssertGet(keys, expect_locations, Result(keys.size()));
+
+    // 3. NOENT key surfaces per-location EC_NOENT and leaves the store unchanged.
+    auto noent_modifier = [](CacheLocationVector & /*loc*/,
+                             std::vector<ErrorCode> get_ec,
+                             size_t /*key_index*/,
+                             const LocationIdVector &loc_id,
+                             PropertyMap & /*upsert_property_map*/) -> LocationModifierResult {
+        std::vector<ErrorCode> ecs(loc_id.size(), EC_OK);
+        for (size_t k = 0; k < loc_id.size(); ++k) {
+            ecs[k] = get_ec[k];
+        }
+        return {MA_SKIP, std::move(ecs)};
+    };
+    KeyVector miss_keys = {99};
+    LocationIdsPerKey miss_ids = {{"loc_a"}};
+    loc_result = meta_indexer_->ReadModifyWriteLocation(request_context_.get(), miss_keys, miss_ids, noent_modifier);
+    ASSERT_EQ(EC_OK, loc_result.ec);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_NOENT}), loc_result.per_location_error_codes[0]);
+
+    // 4. Bad args: keys/location_ids size mismatch.
+    LocationIdsPerKey bad_ids = {{"loc_a"}};
+    auto bad_result = meta_indexer_->ReadModifyWriteLocation(request_context_.get(), keys, bad_ids, upsert_modifier);
+    ASSERT_EQ(EC_BADARGS, bad_result.ec);
+
+    // 5. Cleanup
+    meta_indexer_->Delete(request_context_.get(), keys);
+    ASSERT_EQ(0, meta_indexer_->GetKeyCount());
+}
+
 void MetaIndexerTestBase::DoSimpleTest() {
     DoPutTest();
     DoUpdateTest();
     DoDeleteAndExistTest();
     DoScanAndSampleReclaimKeysTest();
     DoReadModifyWriteBlockTest();
+    DoReadModifyWriteLocationTest();
 }
 
 void MetaIndexerTestBase::DoMultiThreadTest() {
     // Concurrent RMW (upsert) + Delete stress. The upsert modifier always
     // inserts/overwrites a single location so the outcome is deterministic per
     // key across threads.
-    auto upsert_modifier = [](const LocationIdVector & /*existing_ids*/,
+    auto upsert_modifier = [](const LocationMap & /*existing_locations*/,
                               ErrorCode get_ec,
                               size_t /*key_index*/,
                               PropertyMap &upsert_property_map,

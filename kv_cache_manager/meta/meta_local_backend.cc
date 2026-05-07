@@ -561,6 +561,8 @@ ErrorCode MetaLocalBackend::PutMetaData(const FieldMap & /*field_maps*/) noexcep
 
 ErrorCode MetaLocalBackend::GetMetaData(FieldMap & /*field_maps*/) noexcept { return EC_NOENT; }
 
+size_t MetaLocalBackend::GetMemUsage() const noexcept { return cache_->GetUsage(); }
+
 size_t MetaLocalBackend::CollectOldestKeysFromShard(uint32_t shard_id, size_t count, std::vector<KeyType> &out_keys) {
     std::vector<std::string> string_keys;
     string_keys.reserve(count);

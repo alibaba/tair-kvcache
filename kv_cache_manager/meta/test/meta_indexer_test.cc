@@ -1,12 +1,11 @@
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <string>
-#include <vector>
-
-#include <algorithm>
 #include <numeric>
 #include <set>
+#include <string>
+#include <vector>
 
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/unittest.h"
@@ -63,8 +62,6 @@ TEST_F(MetaIndexerTest, TestInit) {
     ASSERT_EQ(EC_OK, InitIndexer(configStr));
     ASSERT_EQ(100, meta_indexer_->max_key_count_);
     ASSERT_EQ(7, meta_indexer_->mutex_shard_mask_);
-    ASSERT_TRUE(meta_indexer_->cache_);
-    ASSERT_EQ(MetaCachePolicyConfig::kDefaultCacheCapacity, meta_indexer_->cache_->cache_size_);
     ASSERT_EQ(META_LOCAL_BACKEND_TYPE_STR, GetPersistentStorageType(*meta_indexer_));
 
     // test failed
@@ -100,12 +97,6 @@ TEST_F(MetaIndexerTest, TestInit) {
         "meta_cache_policy_config" : {}
     })";
     ASSERT_EQ(EC_CONFIG_ERROR, InitIndexer(configStr));
-
-    configStr = R"({
-        "meta_storage_backend_config" : { "storage_type" : "local" },
-        "meta_cache_policy_config" : { "type" : "fifo" }
-    })";
-    ASSERT_EQ(EC_ERROR, InitIndexer(configStr));
 }
 
 // Verifies the invariants of MakeBatches() that callers rely on, regardless
@@ -127,7 +118,6 @@ TEST_F(MetaIndexerTest, TestMakeBatches) {
     ASSERT_EQ(100, meta_indexer_->max_key_count_);
     ASSERT_EQ(7, meta_indexer_->mutex_shard_mask_);
     ASSERT_EQ(2, meta_indexer_->batch_key_size_);
-    ASSERT_FALSE(meta_indexer_->cache_);
     ASSERT_EQ(META_LOCAL_BACKEND_TYPE_STR, GetPersistentStorageType(*meta_indexer_));
 
     KeyVector keys = {0, 1, 2, 3, 4, 8, 9, 80, 800};
@@ -171,7 +161,6 @@ TEST_F(MetaIndexerTest, TestMakeBatches2) {
     ASSERT_EQ(100, meta_indexer_->max_key_count_);
     ASSERT_EQ(15, meta_indexer_->mutex_shard_mask_);
     ASSERT_EQ(3, meta_indexer_->batch_key_size_);
-    ASSERT_FALSE(meta_indexer_->cache_);
     ASSERT_EQ(META_LOCAL_BACKEND_TYPE_STR, GetPersistentStorageType(*meta_indexer_));
 
     KeyVector keys = {0, 4, 7, 16, 20, 32, 33, 34, 35, 64};
@@ -225,22 +214,6 @@ TEST_F(MetaIndexerTest, TestLocalSimple) {
     ASSERT_EQ(100, meta_indexer_->max_key_count_);
     ASSERT_EQ(7, meta_indexer_->mutex_shard_mask_);
     ASSERT_EQ(META_LOCAL_BACKEND_TYPE_STR, GetPersistentStorageType(*meta_indexer_));
-    ASSERT_FALSE(meta_indexer_->cache_);
-    DoSimpleTest();
-
-    configStr = R"({
-        "max_key_count" : 100,
-        "mutex_shard_num" : 8,        
-        "batch_key_size" : 2,
-        "meta_storage_backend_config" : {
-            "storage_type" : "local"
-        },
-        "meta_cache_policy_config" : { "capacity" : 16 }
-    })";
-    meta_indexer_ = std::make_unique<MetaIndexer>();
-    ASSERT_EQ(EC_OK, InitIndexer(configStr));
-    ASSERT_TRUE(meta_indexer_->cache_);
-    ASSERT_EQ(16, meta_indexer_->cache_->cache_size_);
     DoSimpleTest();
 }
 
@@ -258,23 +231,7 @@ TEST_F(MetaIndexerTest, TestMultiThread) {
     ASSERT_EQ(10000, meta_indexer_->max_key_count_);
     ASSERT_EQ(15, meta_indexer_->mutex_shard_mask_);
     ASSERT_EQ(4, meta_indexer_->batch_key_size_);
-    ASSERT_FALSE(meta_indexer_->cache_);
     ASSERT_EQ(META_LOCAL_BACKEND_TYPE_STR, GetPersistentStorageType(*meta_indexer_));
-    DoMultiThreadTest();
-
-    configStr = R"({
-        "max_key_count" : 10000,
-        "mutex_shard_num" : 16,        
-        "batch_key_size" : 4,
-        "meta_storage_backend_config" : {
-            "storage_type" : "local"
-        },
-        "meta_cache_policy_config" : { "capacity" : 16 }
-    })";
-    meta_indexer_ = std::make_unique<MetaIndexer>();
-    ASSERT_EQ(EC_OK, InitIndexer(configStr));
-    ASSERT_TRUE(meta_indexer_->cache_);
-    ASSERT_EQ(16, meta_indexer_->cache_->cache_size_);
     DoMultiThreadTest();
 }
 

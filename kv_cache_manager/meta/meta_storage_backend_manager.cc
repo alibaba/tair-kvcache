@@ -17,46 +17,28 @@ namespace kv_cache_manager {
 
 namespace {
 
-// Accumulate the just-measured latency (microseconds) onto the GAUGE metric.
-// We read the existing value and overwrite with (existing + delta) so that
-// multiple calls within one request scope produce a per-request total
-// instead of being clobbered by the last call. `request_context` may be null
-// (e.g. cross-batch / recovery paths without an originating request); in
-// that case the helper is a no-op.
-void AccumulateIndexSerializeTimeUs(RequestContext *request_context, int64_t delta_us) noexcept {
+void SetIndexSerializeTimeUs(RequestContext *request_context, int64_t delta_us) noexcept {
     if (request_context == nullptr || delta_us <= 0) {
         return;
     }
-    auto *service_metrics_collector =
-        dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+    auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     if (service_metrics_collector == nullptr) {
         return;
     }
-    double accumulated = 0.0;
-    KVCM_METRICS_COLLECTOR_GET_METRICS(
-        service_metrics_collector, meta_searcher, index_serialize_time_us, accumulated);
-    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector,
-                                       meta_searcher,
-                                       index_serialize_time_us,
-                                       accumulated + static_cast<double>(delta_us));
+    KVCM_METRICS_COLLECTOR_SET_METRICS(
+        service_metrics_collector, meta_searcher, index_serialize_time_us, static_cast<double>(delta_us));
 }
 
-void AccumulateIndexDeserializeTimeUs(RequestContext *request_context, int64_t delta_us) noexcept {
+void SetIndexDeserializeTimeUs(RequestContext *request_context, int64_t delta_us) noexcept {
     if (request_context == nullptr || delta_us <= 0) {
         return;
     }
-    auto *service_metrics_collector =
-        dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+    auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     if (service_metrics_collector == nullptr) {
         return;
     }
-    double accumulated = 0.0;
-    KVCM_METRICS_COLLECTOR_GET_METRICS(
-        service_metrics_collector, meta_searcher, index_deserialize_time_us, accumulated);
-    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector,
-                                       meta_searcher,
-                                       index_deserialize_time_us,
-                                       accumulated + static_cast<double>(delta_us));
+    KVCM_METRICS_COLLECTOR_SET_METRICS(
+        service_metrics_collector, meta_searcher, index_deserialize_time_us, static_cast<double>(delta_us));
 }
 
 } // namespace
@@ -115,6 +97,15 @@ ErrorCode MetaStorageBackendManager::Init(const std::string &instance_id,
         persistent_type = uri.GetParam("persistent_type");
         cache_type = uri.GetParam("cache_type");
     }
+    if (config->GetStorageType() == META_CACHED_BACKEND_TYPE_STR) {
+        // default to redis / local for cached type
+        if (persistent_type.empty()) {
+            persistent_type = META_REDIS_BACKEND_TYPE_STR;
+        }
+        if (cache_type.empty()) {
+            cache_type = META_LOCAL_BACKEND_TYPE_STR;
+        }
+    }
 
     const bool single_backend_mode = persistent_type.empty() && cache_type.empty();
     if (single_backend_mode) {
@@ -171,8 +162,7 @@ ErrorCode MetaStorageBackendManager::Open() noexcept {
         // the steady state and read/write paths can short-circuit to
         // persistent without consulting recover_state_.
         recover_state_.store(RecoverState::kRunning, std::memory_order_release);
-        KVCM_LOG_INFO("meta storage backend manager opened in single-backend mode, instance[%s]",
-                      instance_id_.c_str());
+        KVCM_LOG_INFO("meta storage backend manager opened in single-backend mode, instance[%s]", instance_id_.c_str());
         return EC_OK;
     }
 
@@ -394,7 +384,7 @@ PropertyMapVector &MetaStorageBackendManager::BuildEffectiveFieldMaps(RequestCon
             batch.batch_properties[i][MakeLocationFieldName(location.id())] = location.ToJsonString();
         }
     }
-    AccumulateIndexSerializeTimeUs(request_context, TimestampUtil::GetCurrentTimeUs() - begin_us);
+    SetIndexSerializeTimeUs(request_context, TimestampUtil::GetCurrentTimeUs() - begin_us);
     return batch.batch_properties;
 }
 
@@ -448,7 +438,6 @@ std::vector<ErrorCode> MetaStorageBackendManager::Upsert(RequestContext *request
     return local_backend_->Upsert(keys, effective, persistent_results);
 }
 
-
 std::vector<ErrorCode> MetaStorageBackendManager::Delete(const KeyVector &keys) noexcept {
     std::vector<ErrorCode> persistent_results = persistent_backend_->Delete(keys);
     if (!local_backend_) {
@@ -464,10 +453,9 @@ std::vector<ErrorCode> MetaStorageBackendManager::Delete(const KeyVector &keys) 
     return local_backend_->Delete(keys, persistent_results);
 }
 
-std::vector<ErrorCode>
-MetaStorageBackendManager::Delete(const KeyVector &keys,
-                                  const LocationIdsPerKey &location_ids,
-                                  int32_t &out_reclaimed_count) noexcept {
+std::vector<ErrorCode> MetaStorageBackendManager::Delete(const KeyVector &keys,
+                                                         const LocationIdsPerKey &location_ids,
+                                                         int32_t &out_reclaimed_count) noexcept {
     out_reclaimed_count = 0;
     if (keys.empty()) {
         return {};
@@ -500,7 +488,7 @@ MetaStorageBackendManager::Delete(const KeyVector &keys,
 }
 
 int32_t MetaStorageBackendManager::MaybeReclaimEmptyKeys(const KeyVector &keys,
-                                                        const std::vector<ErrorCode> &delete_results) noexcept {
+                                                         const std::vector<ErrorCode> &delete_results) noexcept {
     KeyVector candidates;
     for (size_t i = 0; i < keys.size(); ++i) {
         if (delete_results[i] == EC_OK) {
@@ -512,7 +500,7 @@ int32_t MetaStorageBackendManager::MaybeReclaimEmptyKeys(const KeyVector &keys,
     }
 
     std::vector<bool> has_locations;
-    std::vector<ErrorCode> exists_ecs; 
+    std::vector<ErrorCode> exists_ecs;
     if (local_backend_) {
         exists_ecs = local_backend_->ExistsFieldWithPrefix(candidates, LOCATION_PREFIX, has_locations);
     } else {
@@ -605,15 +593,13 @@ std::vector<ErrorCode> MetaStorageBackendManager::GetLocations(RequestContext *r
             }
             CacheLocation location;
             if (!location.FromJsonString(field_value)) {
-                KVCM_LOG_WARN("deserialize CacheLocation failed, key[%ld] field[%s]",
-                              keys[i],
-                              field_name.c_str());
+                KVCM_LOG_WARN("deserialize CacheLocation failed, key[%ld] field[%s]", keys[i], field_name.c_str());
                 continue;
             }
             out_location_maps[i].emplace(location.id(), std::move(location));
         }
     }
-    AccumulateIndexDeserializeTimeUs(request_context, TimestampUtil::GetCurrentTimeUs() - begin_us);
+    SetIndexDeserializeTimeUs(request_context, TimestampUtil::GetCurrentTimeUs() - begin_us);
     return results;
 }
 
@@ -674,6 +660,7 @@ std::vector<std::vector<ErrorCode>> MetaStorageBackendManager::GetLocations(Requ
         get_results = persistent_backend_->Get(keys, field_names_vec, field_maps);
     }
 
+    const int64_t begin_us = TimestampUtil::GetCurrentTimeUs();
     for (size_t i = 0; i < keys.size(); ++i) {
         if (get_results[i] != EC_OK) {
             results[i].assign(location_ids[i].size(), get_results[i]);
@@ -693,15 +680,15 @@ std::vector<std::vector<ErrorCode>> MetaStorageBackendManager::GetLocations(Requ
             }
             CacheLocation location;
             if (!location.FromJsonString(it->second)) {
-                KVCM_LOG_WARN("deserialize CacheLocation failed, key[%ld] location_id[%s]",
-                              keys[i],
-                              location_ids[i][j].c_str());
+                KVCM_LOG_WARN(
+                    "deserialize CacheLocation failed, key[%ld] location_id[%s]", keys[i], location_ids[i][j].c_str());
                 results[i][j] = EC_ERROR;
                 continue;
             }
             out_locations[i][j] = std::move(location);
         }
     }
+    SetIndexDeserializeTimeUs(request_context, TimestampUtil::GetCurrentTimeUs() - begin_us);
     return results;
 }
 
@@ -809,6 +796,13 @@ ErrorCode MetaStorageBackendManager::PutMetaData(const FieldMap &field_maps) noe
 
 ErrorCode MetaStorageBackendManager::GetMetaData(FieldMap &field_maps) noexcept {
     return persistent_backend_->GetMetaData(field_maps);
+}
+
+size_t MetaStorageBackendManager::GetMemUsage() const noexcept {
+    if (local_backend_) {
+        return local_backend_->GetMemUsage();
+    }
+    return 0;
 }
 
 } // namespace kv_cache_manager

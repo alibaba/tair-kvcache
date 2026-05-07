@@ -39,6 +39,8 @@ public:
     virtual std::vector<ErrorCode> DeleteFields(const KeyTypeVec &keys,
                                                 const std::vector<std::vector<std::string>> &field_names_vec,
                                                 const std::vector<ErrorCode> &previous_error_codes) noexcept = 0;
+
+    virtual size_t GetMemUsage() const noexcept = 0;
 };
 
 } // namespace kv_cache_manager
