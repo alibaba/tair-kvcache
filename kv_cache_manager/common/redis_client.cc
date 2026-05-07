@@ -694,7 +694,7 @@ std::vector<ErrorCode> RedisClient::GetAllFields(const std::vector<std::string> 
 }
 
 std::vector<ErrorCode> RedisClient::Exists(const std::vector<std::string> &keys, std::vector<bool> &out_is_exist_vec) {
-    out_is_exist_vec.resize(keys.size(), false);
+    out_is_exist_vec.assign(keys.size(), false);
 
     std::vector<CmdArgs> exists_cmds;
     exists_cmds.reserve(keys.size());
@@ -730,12 +730,9 @@ std::vector<ErrorCode> RedisClient::Exists(const std::vector<std::string> &keys,
 std::vector<ErrorCode> RedisClient::ExistsFieldWithPrefix(const std::vector<std::string> &keys,
                                                           const std::string &field_prefix,
                                                           std::vector<bool> &out_exists_vec) {
-    std::vector<ErrorCode> ec_per_key(keys.size(), EC_OK);
-    if (keys.empty()) {
-        return ec_per_key;
-    }
+    out_exists_vec.assign(keys.size(), false);
 
-    out_exists_vec.resize(keys.size(), false);
+    std::vector<ErrorCode> ec_per_key(keys.size(), EC_OK);
     const std::string pattern = field_prefix + "*";
     const std::string count_hint = "1000";
     struct PendingKey {

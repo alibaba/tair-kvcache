@@ -15,8 +15,8 @@
 #include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/common.h"
-#include "kv_cache_manager/meta/types.h"
 #include "kv_cache_manager/meta/meta_storage_backend_manager.h"
+#include "kv_cache_manager/meta/types.h"
 
 namespace kv_cache_manager {
 
@@ -59,9 +59,9 @@ public:
     // ---------- Put ----------
     // Whole-block put: replace keys[i]'s entire location set with location_maps[i].
     Result Put(RequestContext *request_context,
-                        const KeyVector &keys,
-                        LocationMapVector &location_maps,
-                        PropertyMapVector &properties) noexcept;
+               const KeyVector &keys,
+               LocationMapVector &location_maps,
+               PropertyMapVector &properties) noexcept;
     // Whole-block update: overwrite keys[i]'s location set with location_maps[i]
     // and update its block-level properties at the same time.
     Result Update(RequestContext *request_context,
@@ -114,7 +114,7 @@ public:
     void PersistMetaData() noexcept;
     size_t GetKeyCount() const noexcept;
     size_t GetMaxKeyCount() const noexcept;
-    size_t GetCacheUsage() const noexcept;
+    size_t GetMemUsage() const noexcept;
 
     // storage usage interfaces
     //
@@ -190,13 +190,6 @@ private:
     };
 
 private:
-    // Partition a request into one or more BatchMetaData. Each batch spans an
-    // unbroken set of shard indices (determined via GetShardIndex from
-    // utils.h) and holds at most batch_key_size_ keys (best-effort; the final
-    // shard of a batch is always included). `locations` and `properties` are
-    // moved-from when non-empty; pass empty vectors for ops that do not carry
-    // them. Uses mutex_shard_mask_ / batch_key_size_ directly so callers do
-    // not have to thread them through.
     std::vector<BatchMetaData> MakeBatches(const KeyVector &keys,
                                            const LocationIdsPerKey &location_ids,
                                            LocationMapVector &locations,
@@ -217,23 +210,20 @@ private:
                             Result &result) const noexcept;
 
     // ----- ReadModifyWrite helpers -----
-    //
-    // Aggregates the per-RMW-call IO timings and key counters that every RMW
-    // entry point emits as metrics at the end of the operation. Bundling them
-    // into a single struct keeps the RMW bodies free of bookkeeping noise.
     struct RmwStats {
         int64_t get_io_time_us = 0;
         int64_t upsert_io_time_us = 0;
         int64_t delete_io_time_us = 0;
+        int64_t index_serialize_time_us = 0;
+        int64_t index_deserialize_time_us = 0;
         int64_t put_key_count = 0;    // brand-new keys created by upsert
         int64_t update_key_count = 0; // existing keys updated by upsert
         int64_t delete_key_count = 0; // keys deleted by whole-key delete
     };
 
     // Returns {error_count, put_success_count}.
-    // `request_context` is forwarded to the backend manager so CacheLocation
-    // serialization latency can be attributed to the originating request.
-    std::pair<int32_t, int32_t> ExecuteRmwUpsert(RequestContext *request_context,
+    std::pair<int32_t, int32_t> ExecuteRmwUpsert(const std::string &trace_id,
+                                                 RequestContext *request_context,
                                                  BatchMetaData &upsert_batch,
                                                  const std::vector<int32_t> &put_global_indexs,
                                                  const KeyVector &all_keys,
@@ -247,14 +237,12 @@ private:
                                                  RmwStats &stats,
                                                  Result &result) noexcept;
 
-    void EmitBlockRmwMetrics(MetricsCollector *metrics_collector,
-                             const RmwStats &stats,
-                             size_t total_key_count) const noexcept;
+    void
+    EmitRmwMetrics(MetricsCollector *metrics_collector, const RmwStats &stats, size_t total_key_count) const noexcept;
 
 private:
     std::vector<std::unique_ptr<std::mutex>> mutex_shards_;
     std::unique_ptr<MetaStorageBackendManager> backend_manager_;
-    std::shared_ptr<MetaSearchCache> cache_;
 
     std::atomic<int64_t> key_count_ = {0};
     int64_t last_persist_metadata_time_ = 0;

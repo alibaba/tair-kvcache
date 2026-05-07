@@ -109,8 +109,7 @@ TEST_F(MetaRedisBackendRealServiceTest, TestMultiThreadSimple) {
     auto get_task = [&, this]() {
         int i = get_index++;
         FieldMapVec out_field_map;
-        auto ec_per_key =
-            meta_redis_backend_->Get(keys_vec[i], std::vector<std::string>{"f1", "f2"}, out_field_map);
+        auto ec_per_key = meta_redis_backend_->Get(keys_vec[i], std::vector<std::string>{"f1", "f2"}, out_field_map);
         ASSERT_EQ(std::vector<ErrorCode>(keys_vec[i].size(), EC_OK), ec_per_key);
         ASSERT_EQ(field_maps_vec[i], out_field_map);
     };
@@ -397,8 +396,7 @@ TEST_F(MetaRedisBackendRealServiceTest, TestMultiOpen) {
     auto get_task = [&, this]() {
         int i = get_index++;
         FieldMapVec out_field_map;
-        auto ec_per_key =
-            meta_redis_backend_->Get(keys_vec[i], std::vector<std::string>{"f1", "f2"}, out_field_map);
+        auto ec_per_key = meta_redis_backend_->Get(keys_vec[i], std::vector<std::string>{"f1", "f2"}, out_field_map);
         ASSERT_EQ(std::vector<ErrorCode>(keys_vec[i].size(), EC_OK), ec_per_key);
         ASSERT_EQ(field_maps_vec[i], out_field_map);
     };
@@ -420,6 +418,120 @@ TEST_F(MetaRedisBackendRealServiceTest, TestMultiOpen) {
         thread.join();
     }
 
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
+}
+
+TEST_F(MetaRedisBackendRealServiceTest, TestDeleteFields) {
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Init("test_delete_fields", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
+
+    constexpr KeyType kKey1 = 9001;
+    constexpr KeyType kKey2 = 9002;
+    constexpr KeyType kKeyMissing = 9003;
+
+    // Clean residual data from previous runs to make the test idempotent.
+    meta_redis_backend_->Delete({kKey1, kKey2, kKeyMissing});
+
+    // Seed two keys: kKey1 has 3 fields, kKey2 has 1 field.
+    ASSERT_EQ(
+        (std::vector<ErrorCode>{EC_OK, EC_OK}),
+        meta_redis_backend_->Put({kKey1, kKey2}, {{{"f1", "v1-1"}, {"f2", "v1-2"}, {"f3", "v1-3"}}, {{"f1", "v2-1"}}}));
+
+    // kKey1: delete two existing fields (EC_OK);
+    // kKey2: delete a missing field (EC_NOENT, key exists but field doesn't);
+    // kKeyMissing: key does not exist (EC_NOENT).
+    auto ec_vec =
+        meta_redis_backend_->DeleteFields({kKey1, kKey2, kKeyMissing}, {{"f1", "f2"}, {"missing_field"}, {"anything"}});
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOENT, EC_NOENT}), ec_vec);
+
+    // kKey1 should retain only f3; kKey2 should still have its original field.
+    FieldMapVec field_maps;
+    auto get_ec = meta_redis_backend_->Get({kKey1, kKey2}, std::vector<std::string>{"f1", "f2", "f3"}, field_maps);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), get_ec);
+    ASSERT_EQ(1u, field_maps[0].size());
+    ASSERT_EQ("v1-3", field_maps[0]["f3"]);
+    ASSERT_EQ("v2-1", field_maps[1]["f1"]);
+
+    // Cleanup.
+    meta_redis_backend_->Delete({kKey1, kKey2});
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
+}
+
+TEST_F(MetaRedisBackendRealServiceTest, TestExistsFieldWithPrefix) {
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Init("test_exists_field_with_prefix", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
+
+    constexpr KeyType kKeyWithPrefix = 9101;
+    constexpr KeyType kKeyWithoutPrefix = 9102;
+    constexpr KeyType kKeyMissing = 9103;
+
+    meta_redis_backend_->Delete({kKeyWithPrefix, kKeyWithoutPrefix, kKeyMissing});
+
+    ASSERT_EQ(
+        (std::vector<ErrorCode>{EC_OK, EC_OK}),
+        meta_redis_backend_->Put(
+            {kKeyWithPrefix, kKeyWithoutPrefix},
+            {{{LOCATION_PREFIX + "a", "la"}, {LOCATION_PREFIX + "b", "lb"}, {"p0", "v0"}}, {{"p0", "v0"}}}));
+
+    // Note: against a real redis, HSCAN on a non-existent key returns an empty
+    // result with next_cursor=0 instead of an error, so the redis backend
+    // reports EC_OK with `false` for missing keys (rather than EC_NOENT like
+    // the dummy/local backends).
+    std::vector<bool> exists_vec;
+    auto ec_vec = meta_redis_backend_->ExistsFieldWithPrefix(
+        {kKeyWithPrefix, kKeyWithoutPrefix, kKeyMissing}, LOCATION_PREFIX, exists_vec);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}), ec_vec);
+    ASSERT_EQ((std::vector<bool>{true, false, false}), exists_vec);
+
+    // Removing one of the two LOCATION_PREFIX fields: the remaining one still
+    // satisfies the prefix check.
+    auto del_ec = meta_redis_backend_->DeleteFields({kKeyWithPrefix}, {{LOCATION_PREFIX + "a"}});
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), del_ec);
+    ec_vec = meta_redis_backend_->ExistsFieldWithPrefix({kKeyWithPrefix}, LOCATION_PREFIX, exists_vec);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), ec_vec);
+    ASSERT_EQ((std::vector<bool>{true}), exists_vec);
+
+    // Removing the remaining LOCATION_PREFIX field: now the prefix check is false.
+    del_ec = meta_redis_backend_->DeleteFields({kKeyWithPrefix}, {{LOCATION_PREFIX + "b"}});
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), del_ec);
+    ec_vec = meta_redis_backend_->ExistsFieldWithPrefix({kKeyWithPrefix}, LOCATION_PREFIX, exists_vec);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), ec_vec);
+    ASSERT_EQ((std::vector<bool>{false}), exists_vec);
+
+    // Cleanup.
+    meta_redis_backend_->Delete({kKeyWithPrefix, kKeyWithoutPrefix});
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
+}
+
+TEST_F(MetaRedisBackendRealServiceTest, TestGet) {
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Init("test_get_per_key_fields", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
+
+    constexpr KeyType kKey1 = 9201;
+    constexpr KeyType kKey2 = 9202;
+    constexpr KeyType kKeyMissing = 9203;
+
+    meta_redis_backend_->Delete({kKey1, kKey2, kKeyMissing});
+
+    ASSERT_EQ(
+        (std::vector<ErrorCode>{EC_OK, EC_OK}),
+        meta_redis_backend_->Put({kKey1, kKey2},
+                                 {{{"f1", "v1-1"}, {"f2", "v1-2"}, {"f3", "v1-3"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}}));
+
+    // kKey1 asks {f1, f3}; kKey2 asks {f2, f3} (f3 missing -> dropped);
+    // kKeyMissing does not exist -> EC_NOENT.
+    FieldMapVec field_maps;
+    auto ec_vec = meta_redis_backend_->Get({kKey1, kKey2, kKeyMissing},
+                                           std::vector<std::vector<std::string>>{{"f1", "f3"}, {"f2", "f3"}, {"f1"}},
+                                           field_maps);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_NOENT}), ec_vec);
+    ASSERT_EQ(3u, field_maps.size());
+    ASSERT_EQ((FieldMap{{"f1", "v1-1"}, {"f3", "v1-3"}}), field_maps[0]);
+    ASSERT_EQ((FieldMap{{"f2", "v2-2"}}), field_maps[1]);
+    ASSERT_TRUE(field_maps[2].empty());
+
+    // Cleanup.
+    meta_redis_backend_->Delete({kKey1, kKey2});
     ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
 }
 

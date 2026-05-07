@@ -381,7 +381,7 @@ ErrorCode MetaSearcher::BatchAddLocation(RequestContext *request_context,
     out_location_ids.resize(keys.size());
     std::vector<std::pair<DataStorageType, std::uint64_t>> loc_sz(keys.size());
 
-    auto modifier = [&locations, &out_location_ids, &keys, &loc_sz](const LocationIdVector &existing_ids,
+    auto modifier = [&locations, &out_location_ids, &keys, &loc_sz](const LocationMap &existing_locations,
                                                                     ErrorCode get_ec,
                                                                     size_t index,
                                                                     PropertyMap &upsert_property_map,
@@ -401,11 +401,10 @@ ErrorCode MetaSearcher::BatchAddLocation(RequestContext *request_context,
         }
 
         // generate a unique location_id that does not collide with existing ones
-        std::set<std::string> existing_id_set(existing_ids.begin(), existing_ids.end());
         std::string location_id;
         do {
             location_id = StringUtil::GenerateRandomString(8);
-        } while (existing_id_set.count(location_id) > 0);
+        } while (existing_locations.count(location_id) > 0);
 
         // build the new CacheLocation with status = CLS_WRITING
         CacheLocation new_loc = locations[index];

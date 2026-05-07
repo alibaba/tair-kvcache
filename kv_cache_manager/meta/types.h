@@ -64,7 +64,7 @@ using LocationModifierResult = std::pair<ModifierAction, std::vector<ErrorCode>>
 // Lightweight block-level modifier: only sees the existing location id list
 // (no location values are deserialized). The modifier can produce new
 // CacheLocations to be written via the output LocationMap.
-using BlockIdsOnlyModifierFunc = std::function<ModifierResult(const LocationIdVector & /*existing_ids*/,
+using BlockIdsOnlyModifierFunc = std::function<ModifierResult(const LocationMap & /*existing_locations*/,
                                                               ErrorCode /*get_ec*/,
                                                               size_t /*key_index*/,
                                                               PropertyMap & /*upsert_property_map*/,

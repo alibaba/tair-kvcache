@@ -357,66 +357,75 @@ TEST_F(MetaDummyBackendTest, TestRecoverBinarySafe) {
     }
 }
 
-// Covers the new MetaStorageBackend interfaces DeleteFields / ExistsFieldWithPrefix
-// on the dummy backend: partial-field deletion preserves other fields, and the
-// prefix existence check reports accurately for existing / missing keys.
-TEST_F(MetaDummyBackendTest, TestDeleteFieldsAndExistsFieldWithPrefix) {
-    ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Init("test_instance_delete_fields", meta_storage_backend_config_));
+TEST_F(MetaDummyBackendTest, TestDeleteFields) {
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_storage_backend_->Init("test_instance_delete_fields", meta_storage_backend_config_));
     ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Open());
 
-    // Seed two keys with location-prefixed + normal fields.
     ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK, ErrorCode::EC_OK}),
-              meta_storage_backend_->Put({1, 2},
-                                         {{{LOCATION_PREFIX + "a", "la"}, {LOCATION_PREFIX + "b", "lb"}, {"p0", "v0"}},
-                                          {{LOCATION_PREFIX + "c", "lc"}, {"p0", "v0"}}}));
+              meta_storage_backend_->Put(
+                  {1, 2}, {{{"f1", "v1-1"}, {"f2", "v1-2"}, {"f3", "v1-3"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}}));
 
-    // Prefix check: both keys have LOCATION_PREFIX fields, key 3 does not exist.
-    AssertExistsFieldWithPrefix(meta_storage_backend_.get(),
-                                {1, 2, 3},
-                                LOCATION_PREFIX,
-                                {ErrorCode::EC_OK, ErrorCode::EC_OK, ErrorCode::EC_NOENT},
-                                {true, true, false});
-
-    // Delete one location field from key 1 and the sole location from key 2.
+    // key 1: delete one of three fields; key 2: delete all listed fields;
+    // key 3: not exist -> EC_NOENT.
     AssertDeleteFields(meta_storage_backend_.get(),
                        {1, 2, 3},
-                       {{LOCATION_PREFIX + "a"}, {LOCATION_PREFIX + "c"}, {"anything"}},
+                       {{"f1"}, {"f1", "f2"}, {"f1"}},
                        {ErrorCode::EC_OK, ErrorCode::EC_OK, ErrorCode::EC_NOENT});
 
-    // After deletion: key 1 still has one LOCATION_PREFIX field, key 2 has none.
-    AssertExistsFieldWithPrefix(meta_storage_backend_.get(),
-                                {1, 2},
-                                LOCATION_PREFIX,
-                                {ErrorCode::EC_OK, ErrorCode::EC_OK},
-                                {true, false});
-    // Non-deleted fields must survive.
+    // Surviving fields are intact; deleted fields are absent.
     AssertGet(meta_storage_backend_.get(),
               {1, 2},
-              {LOCATION_PREFIX + "a", LOCATION_PREFIX + "b", "p0"},
+              {"f1", "f2", "f3"},
               {ErrorCode::EC_OK, ErrorCode::EC_OK},
-              {{{LOCATION_PREFIX + "b", "lb"}, {"p0", "v0"}}, {{"p0", "v0"}}});
+              {{{"f2", "v1-2"}, {"f3", "v1-3"}}, {}});
+
+    // Deleting a non-existent field on an existing key still returns EC_OK.
+    AssertDeleteFields(meta_storage_backend_.get(), {1}, {{"not_exist_field"}}, {ErrorCode::EC_OK});
+
+    // Empty field list on an existing key is a no-op (EC_OK), original fields kept.
+    AssertDeleteFields(meta_storage_backend_.get(), {1}, {{}}, {ErrorCode::EC_OK});
+    AssertGet(meta_storage_backend_.get(), {1}, {"f2", "f3"}, {ErrorCode::EC_OK}, {{{"f2", "v1-2"}, {"f3", "v1-3"}}});
 
     ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Close());
 }
 
-// Covers the new Get overload that accepts a per-key field_names_vec:
-// each key may request a different subset of fields; missing keys report
-// EC_NOENT with empty FieldMap; size mismatch returns EC_BADARGS.
-TEST_F(MetaDummyBackendTest, TestGetWithPerKeyFieldNames) {
+TEST_F(MetaDummyBackendTest, TestExistsFieldWithPrefix) {
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_storage_backend_->Init("test_instance_exists_prefix", meta_storage_backend_config_));
+    ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Open());
+
+    // key 1: has LOCATION_PREFIX field; key 2: has only normal fields; key 3: not exist.
+    ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK, ErrorCode::EC_OK}),
+              meta_storage_backend_->Put({1, 2}, {{{LOCATION_PREFIX + "a", "la"}, {"p0", "v0"}}, {{"p0", "v0"}}}));
+
+    AssertExistsFieldWithPrefix(meta_storage_backend_.get(),
+                                {1, 2, 3},
+                                LOCATION_PREFIX,
+                                {ErrorCode::EC_OK, ErrorCode::EC_OK, ErrorCode::EC_NOENT},
+                                {true, false, false});
+
+    // After removing the only LOCATION_PREFIX field from key 1, prefix check is false.
+    AssertDeleteFields(meta_storage_backend_.get(), {1}, {{LOCATION_PREFIX + "a"}}, {ErrorCode::EC_OK});
+    AssertExistsFieldWithPrefix(meta_storage_backend_.get(), {1}, LOCATION_PREFIX, {ErrorCode::EC_OK}, {false});
+
+    ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Close());
+}
+
+TEST_F(MetaDummyBackendTest, TestGetPerKeyFields) {
     ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Init("test_instance_0", meta_storage_backend_config_));
     ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Open());
 
     ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK, ErrorCode::EC_OK}),
-              meta_storage_backend_->Put({1, 2},
-                                         {{{"f1", "v1-1"}, {"f2", "v1-2"}, {"f3", "v1-3"}},
-                                          {{"f1", "v2-1"}, {"f2", "v2-2"}}}));
+              meta_storage_backend_->Put(
+                  {1, 2}, {{{"f1", "v1-1"}, {"f2", "v1-2"}, {"f3", "v1-3"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}}));
 
-    // Each key queries a different subset; key 3 does not exist.
+    // Each key queries a different subset; key 3 does not exist; key 2 asks for
+    // a missing field "f3" which is silently dropped from the returned map.
     FieldMapVec field_maps;
     ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK, ErrorCode::EC_OK, ErrorCode::EC_NOENT}),
-              meta_storage_backend_->Get({1, 2, 3},
-                                         std::vector<std::vector<std::string>>{{"f1", "f3"}, {"f2"}, {"f1"}},
-                                         field_maps));
+              meta_storage_backend_->Get(
+                  {1, 2, 3}, std::vector<std::vector<std::string>>{{"f1", "f3"}, {"f2", "f3"}, {"f1"}}, field_maps));
     ASSERT_EQ((FieldMapVec{{{"f1", "v1-1"}, {"f3", "v1-3"}}, {{"f2", "v2-2"}}, {}}), field_maps);
 
     // Size mismatch between keys and field_names_vec -> EC_BADARGS per key.
