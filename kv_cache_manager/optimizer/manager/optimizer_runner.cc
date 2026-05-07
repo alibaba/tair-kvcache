@@ -36,14 +36,7 @@ void OptimizerRunner::RunTrace(std::shared_ptr<OptimizerSchemaTrace> trace) {
         return;
     }
 
-    if (auto turn_trace = std::dynamic_pointer_cast<DialogTurnSchemaTrace>(trace)) {
-        if (turn_trace->query_type() != "prefix_match") {
-            KVCM_LOG_WARN("Unsupported query type: %s", turn_trace->query_type().c_str());
-            return;
-        }
-        HandleDialogTurn(*turn_trace);
-        stats_collector_->UpdateTimestamp(turn_trace->instance_id(), turn_trace->timestamp_ns());
-    } else if (auto get_trace = std::dynamic_pointer_cast<GetLocationSchemaTrace>(trace)) {
+    if (auto get_trace = std::dynamic_pointer_cast<GetLocationSchemaTrace>(trace)) {
         if (get_trace->query_type() != "prefix_match") {
             KVCM_LOG_WARN("Unsupported query type: %s", get_trace->query_type().c_str());
             return;
@@ -147,6 +140,7 @@ void OptimizerRunner::HandleWriteCache(const WriteCacheSchemaTrace &trace) {
 
     auto result = indexer->InsertOnly(trace.keys(), trace.timestamp_ns(), effective_ttl_us);
     auto capacity_evicted_blocks = indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_ns());
+    indexer_manager_->CleanEvictedBlocks(capacity_evicted_blocks, trace.timestamp_ns());
     bool evicted = !capacity_evicted_blocks.empty();
     if (evicted) {
         KVCM_LOG_DEBUG("Eviction at ts=%lld for instance_id: %s",
@@ -160,27 +154,5 @@ void OptimizerRunner::HandleWriteCache(const WriteCacheSchemaTrace &trace) {
     record.newly_inserted_blocks = result.inserted_keys.size();
     record.trace_id = trace.trace_id();
     stats_collector_->OnWriteComplete(instance_id, record);
-}
-
-void OptimizerRunner::HandleDialogTurn(const DialogTurnSchemaTrace &trace) {
-    std::string instance_id = trace.instance_id();
-    auto indexer = GetIndexer(instance_id);
-    if (!indexer) {
-        return;
-    }
-
-    // DialogTurn 前统一清理过期 block，并做节点清理（TTL 使用逻辑过期时刻记录）
-    auto expired_evicted_blocks = indexer_manager_->EvictExpiredBeforeAccess(instance_id, trace.timestamp_ns());
-    indexer_manager_->CleanEvictedBlocks(expired_evicted_blocks, trace.timestamp_ns(), true);
-
-    QueryHit query_hit;
-    indexer->InsertWithQuery(trace.total_keys(), trace.timestamp_ns(), &query_hit);
-    indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_ns());
-
-    SubmitReadRecord(instance_id, trace.timestamp_ns(), query_hit, indexer, 0, trace.keys().size());
-
-    size_t decode_block_num = trace.total_keys().size() - trace.keys().size();
-    WriteRecord write_record{trace.timestamp_ns(), decode_block_num, decode_block_num};
-    stats_collector_->OnWriteComplete(instance_id, write_record);
 }
 } // namespace kv_cache_manager

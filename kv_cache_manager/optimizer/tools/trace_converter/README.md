@@ -1,6 +1,6 @@
 # Trace Converter - 统一的Trace格式转换工具
 
-将各种trace格式转换为Optimizer标准的Get+Write格式或推理引擎的DialogTurn格式。
+将各种trace格式转换为Optimizer标准的Get+Write格式。
 
 ## ✨ 特性
 
@@ -36,9 +36,7 @@ pip install -e .
 
 ## 快速开始
 
-**自动输出文件名**: 如果不指定`-o`参数,会自动在输入文件同目录生成输出文件:
-- Optimizer模式: `<input_name>_optimizer.jsonl`
-- Inference模式: `<input_name>_inference.jsonl`
+**自动输出文件名**: 如果不指定`-o`参数,会自动在输入文件同目录生成`<input_name>_optimizer.jsonl`。
 
 ### Publisher Log转换
 
@@ -74,12 +72,6 @@ python trace_converter.py \
     -f publisher_log \
     --mode optimizer
 
-# Inference模式 (DialogTurn格式)
-python trace_converter.py \
-    -i /path/to/publisher.log \
-    -o /path/to/inference_trace.jsonl \
-    -f publisher_log \
-    --mode inference
 ```
 
 ### Qwen Bailian数据集转换
@@ -256,25 +248,6 @@ JSON格式,每行一个事件:
 }
 ```
 
-### Inference模式 (DialogTurn)
-
-```json
-{
-  "instance_id": "instance",
-  "trace_id": "trace_instance_1704110400000000000",
-  "timestamp_ns": 1704110400000000000,
-  "tokens": [],
-  "keys": [123, 456, 789],
-  "query_type": "prefix_match",
-  "block_mask": [],
-  "sw_size": 0,
-  "location_spec_names": [],
-  "input_len": 48,
-  "output_len": 32,
-  "total_keys": [123, 456, 789, 1011]
-}
-```
-
 ## 命令行参数
 
 ### 通用参数
@@ -282,9 +255,9 @@ JSON格式,每行一个事件:
 | 参数 | 必需 | 说明 | 默认值 |
 |------|------|------|--------|
 | `-i, --input` | 是 | 输入文件路径 | - |
-| `-o, --output` | 否 | 输出文件路径 | 自动生成: `<input>_optimizer.jsonl` 或 `<input>_inference.jsonl` |
+| `-o, --output` | 否 | 输出文件路径 | 自动生成: `<input>_optimizer.jsonl` |
 | `-f, --format` | 是 | 输入格式: `publisher_log`, `qwen_bailian`, `text` | - |
-| `--mode` | 否 | 输出模式: `optimizer` (Get+Write) 或 `inference` (DialogTurn) | `optimizer` |
+| `--mode` | 否 | 输出模式: `optimizer` (Get+Write) | `optimizer` |
 | `--instance-id` | 否 | 默认实例ID (仅当格式无instance信息时使用) | `instance` |
 | `--instance-block-sizes` | 否 | 每个instance的block_size (格式: `inst1:16,inst2:32`) | 未指定使用默认16 |
 
@@ -527,17 +500,6 @@ self._create_get_trace(
 self._create_write_trace(
     timestamp_ns=timestamp_ns,
     keys=block_keys,
-    instance_id=instance_id,
-    tokens=token_ids  # 可选
-)
-
-# 创建 DialogTurn trace
-self._create_dialog_trace(
-    timestamp_ns=timestamp_ns,
-    keys=prefill_keys,
-    input_len=input_token_count,
-    output_len=output_token_count,
-    total_keys=all_keys,
     instance_id=instance_id,
     tokens=token_ids  # 可选
 )

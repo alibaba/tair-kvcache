@@ -18,8 +18,7 @@ class PublisherLogConverter(BaseConverter):
     Publisher Log转换器
 
     处理GetCacheLocation、StartWriteCache、FinishWriteCache事件
-    并进行事件关联生成完整的DialogTurnSchemaTrace (inference模式)
-    或Get+Write traces (optimizer模式)
+    生成Get+Write traces (optimizer模式)
 
     自动识别日志中的所有instance (通过source字段)
     """
@@ -62,7 +61,7 @@ class PublisherLogConverter(BaseConverter):
 
         # 打印统计信息
         if self.discovered_instances:
-            print(f"\n✅ Discovered {len(self.discovered_instances)} instance(s):")
+            print(f"\n Discovered {len(self.discovered_instances)} instance(s):")
             for inst_id, blk_size in sorted(self.discovered_instances.items()):
                 inst_traces = sum(1 for t in traces if isinstance(t, dict) and t.get('instance_id') == inst_id)
                 print(f"   - {inst_id}: block_size={blk_size}, traces={inst_traces}")
@@ -88,13 +87,13 @@ class PublisherLogConverter(BaseConverter):
         except json.JSONDecodeError as e:
             # 提供更详细的错误诊断
             line_preview = line[:100] + '...' if len(line) > 100 else line
-            print(f"\n⚠️  Warning: JSON parse error at position {e.pos}")
+            print(f"\n Warning: JSON parse error at position {e.pos}")
             print(f"   Line length: {len(line)} chars")
             print(f"   Error: {e.msg}")
             print(f"   Preview: {line_preview}")
         except Exception as e:
             line_preview = line[:100] + '...' if len(line) > 100 else line
-            print(f"\n⚠️  Warning: Failed to parse line: {e}")
+            print(f"\n Warning: Failed to parse line: {e}")
             print(f"   Preview: {line_preview}")
 
         return None
@@ -108,7 +107,7 @@ class PublisherLogConverter(BaseConverter):
         if instance_id not in self.discovered_instances:
             block_size = self.get_block_size(instance_id)
             self.discovered_instances[instance_id] = block_size
-            print(f"📌 Discovered instance: {instance_id} (block_size={block_size})")
+            print(f"Discovered instance: {instance_id} (block_size={block_size})")
 
         trace = {
             'instance_id': instance_id,
@@ -135,7 +134,7 @@ class PublisherLogConverter(BaseConverter):
         if instance_id not in self.discovered_instances:
             block_size = self.get_block_size(instance_id)
             self.discovered_instances[instance_id] = block_size
-            print(f"📌 Discovered instance: {instance_id} (block_size={block_size})")
+            print(f"Discovered instance: {instance_id} (block_size={block_size})")
 
         write_trace = {
             'instance_id': instance_id,
@@ -172,7 +171,7 @@ class PublisherLogConverter(BaseConverter):
         return self._find_matching_get_location_trace(write_trace)
 
     def _find_matching_get_location_trace(self, write_trace: dict):
-        """匹配GetLocation和WriteCache生成DialogTurn或Get+Write"""
+        """匹配GetLocation和WriteCache生成Get+Write traces"""
         write_keys = write_trace['keys']
         write_timestamp = write_trace['timestamp_ns']
         write_instance = write_trace['instance_id']
@@ -195,19 +194,10 @@ class PublisherLogConverter(BaseConverter):
             match_len = len(get_keys) - 1
             if len(write_keys) >= match_len:
                 if write_keys[:match_len] == get_keys[:match_len]:
-                    # 找到匹配
-                    block_size = self.discovered_instances.get(write_instance, self.default_block_size)
-
-                    if self.mode == 'optimizer':
-                        # Optimizer模式: 生成Get+Write
-                        result = self._generate_optimizer_traces_from_match(
-                            get_trace, write_trace, block_size
-                        )
-                    else:
-                        # Inference模式: 生成DialogTurn
-                        result = self._generate_inference_trace_from_match(
-                            get_trace, write_trace, block_size
-                        )
+                    # 找到匹配 - 生成Get+Write
+                    result = self._generate_optimizer_traces_from_match(
+                        get_trace, write_trace
+                    )
 
                     # 从pending中移除
                     del self.pending_get_location_traces[i]
@@ -218,8 +208,7 @@ class PublisherLogConverter(BaseConverter):
     def _generate_optimizer_traces_from_match(
         self,
         get_trace: dict,
-        write_trace: dict,
-        block_size: int
+        write_trace: dict
     ) -> list:
         """从匹配的Get和Write生成Optimizer格式traces"""
         instance_id = get_trace['instance_id']
@@ -246,60 +235,30 @@ class PublisherLogConverter(BaseConverter):
 
         return [get_result, write_result]
 
-    def _generate_inference_trace_from_match(
-        self,
-        get_trace: dict,
-        write_trace: dict,
-        block_size: int
-    ) -> dict:
-        """从匹配的Get和Write生成Inference格式DialogTurn"""
-        instance_id = get_trace['instance_id']
-        get_keys = get_trace['keys']
-        write_keys = write_trace['keys']
-        match_len = len(get_keys) - 1
-
-        dialog_trace = self._create_dialog_trace(
-            timestamp_ns=write_trace['timestamp_ns'],
-            keys=get_keys,
-            input_len=len(get_keys) * block_size,
-            output_len=(len(write_keys) - match_len) * block_size,
-            total_keys=write_keys,
-            instance_id=instance_id,
-            tokens=get_trace.get('tokens', []),
-            query_type=get_trace.get('query_type', 'prefix_match'),
-            block_mask=get_trace.get('block_mask', []),
-            sw_size=get_trace.get('sw_size', 0),
-            location_spec_names=get_trace.get('location_spec_names', [])
-        )
-
-        return dialog_trace
-
     def _check_and_convert_pending_write_event(self, traces: list):
         """处理未完成的write事件 - 尝试匹配Get trace"""
         for write_trace in self.pending_write_sessions.values():
             # 假设结束时间比开始时间晚100ms
             write_trace['timestamp_ns'] += 100_000_000
 
-            # ✅ 尝试匹配Get trace
+            # 尝试匹配Get trace
             result = self._find_matching_get_location_trace(write_trace)
 
             if result:
-                # 成功匹配,添加Get+Write或DialogTurn
+                # 成功匹配,添加Get+Write
                 if isinstance(result, list):
                     traces.extend(result)
                 else:
                     traces.append(result)
             else:
-                # 未匹配到Get,只输出Write trace (仅Optimizer模式)
-                if self.mode == 'optimizer':
-                    write_only = self._create_write_trace(
-                        timestamp_ns=write_trace['timestamp_ns'],
-                        keys=write_trace['keys'],
-                        instance_id=write_trace['instance_id'],
-                        tokens=write_trace.get('tokens', [])
-                    )
-                    traces.append(write_only)
-                # Inference模式下,单独的write没有意义,跳过
+                # 未匹配到Get,只输出Write trace
+                write_only = self._create_write_trace(
+                    timestamp_ns=write_trace['timestamp_ns'],
+                    keys=write_trace['keys'],
+                    instance_id=write_trace['instance_id'],
+                    tokens=write_trace.get('tokens', [])
+                )
+                traces.append(write_only)
 
         self.pending_write_sessions.clear()
 
@@ -307,36 +266,18 @@ class PublisherLogConverter(BaseConverter):
         """处理未匹配的GetLocation事件"""
         for get_trace in self.pending_get_location_traces:
             instance_id = get_trace['instance_id']
-            block_size = self.discovered_instances.get(instance_id, self.default_block_size)
 
-            if self.mode == 'optimizer':
-                # Optimizer模式: 只生成Get trace
-                result = self._create_get_trace(
-                    timestamp_ns=get_trace['timestamp_ns'],
-                    keys=get_trace['keys'],
-                    instance_id=instance_id,
-                    tokens=get_trace.get('tokens', []),
-                    query_type=get_trace.get('query_type', 'prefix_match'),
-                    block_mask=get_trace.get('block_mask', []),
-                    sw_size=get_trace.get('sw_size', 0),
-                    location_spec_names=get_trace.get('location_spec_names', [])
-                )
-                traces.append(result)
-            else:
-                # Inference模式: 生成DialogTurn (output_len=0)
-                dialog_trace = self._create_dialog_trace(
-                    timestamp_ns=get_trace['timestamp_ns'],
-                    keys=get_trace['keys'],
-                    input_len=len(get_trace['keys']) * block_size,
-                    output_len=0,
-                    total_keys=get_trace['keys'],
-                    instance_id=instance_id,
-                    tokens=get_trace.get('tokens', []),
-                    query_type=get_trace.get('query_type', 'prefix_match'),
-                    block_mask=get_trace.get('block_mask', []),
-                    sw_size=get_trace.get('sw_size', 0),
-                    location_spec_names=get_trace.get('location_spec_names', [])
-                )
-                traces.append(dialog_trace)
+            # 只生成Get trace
+            result = self._create_get_trace(
+                timestamp_ns=get_trace['timestamp_ns'],
+                keys=get_trace['keys'],
+                instance_id=instance_id,
+                tokens=get_trace.get('tokens', []),
+                query_type=get_trace.get('query_type', 'prefix_match'),
+                block_mask=get_trace.get('block_mask', []),
+                sw_size=get_trace.get('sw_size', 0),
+                location_spec_names=get_trace.get('location_spec_names', [])
+            )
+            traces.append(result)
 
         self.pending_get_location_traces.clear()

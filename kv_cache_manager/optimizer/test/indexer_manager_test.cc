@@ -99,10 +99,11 @@ TEST_F(OptIndexerManagerTest, CreateOptIndexer) {
     auto result = indexer->InsertOnly(block_keys, 1000);
     EXPECT_EQ(result.inserted_keys.size(), 5);
 
+    // 验证 PrefixQuery 可以查询到之前插入的数据
     QueryHit query_hit;
-    auto inserted2 = indexer->InsertWithQuery(block_keys, 2000, &query_hit);
-    EXPECT_EQ(inserted2.size(), 0);               // 已存在
-    EXPECT_EQ(query_hit.remote_hit_block_num, 5); // 命中
+    BlockMask block_mask = std::vector<bool>(block_keys.size(), true);
+    indexer->PrefixQuery(block_keys, block_mask, 2000, &query_hit);
+    EXPECT_EQ(query_hit.local_hit_block_num, 5);
 }
 
 TEST_F(OptIndexerManagerTest, CreateMultipleOptIndexers) {

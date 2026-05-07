@@ -103,13 +103,12 @@ OptimizerManager (核心协调器)
 ```
 OptimizerSchemaTrace (基类)
     ├── GetLocationSchemaTrace (读操作)
-    │   └── DialogTurnSchemaTrace (对话轮次)
     └── WriteCacheSchemaTrace (写操作)
 ```
 
 **支持的 Trace 格式**
 - **Publisher Log**：KVCacheManager Event Publisher 日志，区分读写请求
-- **Qwen Bailian**：百炼开源数据集格式，不区分读写请求
+- **Qwen Bailian**：百炼开源数据集格式，转换后强制区分读写请求
 
 ## 快速开始
 
@@ -438,7 +437,6 @@ Optimizer支持三种标准trace类型:
 
 - **GetLocationSchemaTrace**: 读操作 (prefill阶段)
 - **WriteCacheSchemaTrace**: 写操作 (decode阶段)
-- **DialogTurnSchemaTrace**: 完整对话轮次 (仅用于推理引擎模拟器)
 
 **推荐**: 所有Optimizer输入统一使用Get+Write格式以保留精确的读写时序。
 
@@ -463,12 +461,6 @@ python trace_converter.py \
     -f <format> \
     --mode optimizer
 
-# 转换trace为推理引擎格式
-python trace_converter.py \
-    -i your_trace.log \
-    -o inference_trace.jsonl \
-    -f <format> \
-    --mode inference
 ```
 
 **支持的格式**:

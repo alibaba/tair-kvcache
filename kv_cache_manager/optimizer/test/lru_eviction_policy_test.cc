@@ -17,6 +17,14 @@ public:
     }
 
 protected:
+    BlockEntry CreateBlock(int64_t key, int64_t last_access_time) {
+        BlockEntry block;
+        block.key = key;
+        block.last_access_time = last_access_time;
+        block.location_map[policy_->name()] = TierStat{0, last_access_time, -1};
+        return block;
+    }
+
     std::shared_ptr<LruEvictionPolicy> policy_;
 };
 
@@ -26,13 +34,8 @@ TEST_F(LruEvictionPolicyTest, BasicInitialization) {
 }
 
 TEST_F(LruEvictionPolicyTest, OnBlockWritten) {
-    BlockEntry block1;
-    block1.key = 1;
-    block1.last_access_time = 1000;
-
-    BlockEntry block2;
-    block2.key = 2;
-    block2.last_access_time = 2000;
+    auto block1 = CreateBlock(1, 1000);
+    auto block2 = CreateBlock(2, 2000);
 
     policy_->OnBlockWritten(&block1);
     EXPECT_EQ(policy_->size(), 1);
@@ -42,13 +45,8 @@ TEST_F(LruEvictionPolicyTest, OnBlockWritten) {
 }
 
 TEST_F(LruEvictionPolicyTest, OnBlockAccessed) {
-    BlockEntry block1;
-    block1.key = 1;
-    block1.last_access_time = 1000;
-
-    BlockEntry block2;
-    block2.key = 2;
-    block2.last_access_time = 2000;
+    auto block1 = CreateBlock(1, 1000);
+    auto block2 = CreateBlock(2, 2000);
 
     policy_->OnBlockWritten(&block1);
     policy_->OnBlockWritten(&block2);
@@ -64,17 +62,9 @@ TEST_F(LruEvictionPolicyTest, OnBlockAccessed) {
 }
 
 TEST_F(LruEvictionPolicyTest, EvictBlocks) {
-    BlockEntry block1;
-    block1.key = 1;
-    block1.last_access_time = 1000;
-
-    BlockEntry block2;
-    block2.key = 2;
-    block2.last_access_time = 2000;
-
-    BlockEntry block3;
-    block3.key = 3;
-    block3.last_access_time = 3000;
+    auto block1 = CreateBlock(1, 1000);
+    auto block2 = CreateBlock(2, 2000);
+    auto block3 = CreateBlock(3, 3000);
 
     policy_->OnBlockWritten(&block1);
     policy_->OnBlockWritten(&block2);
@@ -93,13 +83,8 @@ TEST_F(LruEvictionPolicyTest, EvictBlocks) {
 }
 
 TEST_F(LruEvictionPolicyTest, EvictAllBlocks) {
-    BlockEntry block1;
-    block1.key = 1;
-    block1.last_access_time = 1000;
-
-    BlockEntry block2;
-    block2.key = 2;
-    block2.last_access_time = 2000;
+    auto block1 = CreateBlock(1, 1000);
+    auto block2 = CreateBlock(2, 2000);
 
     policy_->OnBlockWritten(&block1);
     policy_->OnBlockWritten(&block2);
@@ -113,13 +98,8 @@ TEST_F(LruEvictionPolicyTest, EvictAllBlocks) {
 }
 
 TEST_F(LruEvictionPolicyTest, OnNodeWritten) {
-    BlockEntry block1;
-    block1.key = 1;
-    block1.last_access_time = 1000;
-
-    BlockEntry block2;
-    block2.key = 2;
-    block2.last_access_time = 2000;
+    auto block1 = CreateBlock(1, 1000);
+    auto block2 = CreateBlock(2, 2000);
 
     std::vector<BlockEntry *> blocks = {&block1, &block2};
     policy_->OnNodeWritten(blocks);
@@ -128,9 +108,7 @@ TEST_F(LruEvictionPolicyTest, OnNodeWritten) {
 }
 
 TEST_F(LruEvictionPolicyTest, EvictMoreThanAvailable) {
-    BlockEntry block1;
-    block1.key = 1;
-    block1.last_access_time = 1000;
+    auto block1 = CreateBlock(1, 1000);
 
     policy_->OnBlockWritten(&block1);
     EXPECT_EQ(policy_->size(), 1);
@@ -143,17 +121,9 @@ TEST_F(LruEvictionPolicyTest, EvictMoreThanAvailable) {
 }
 
 TEST_F(LruEvictionPolicyTest, LruOrderAfterMultipleAccesses) {
-    BlockEntry block1;
-    block1.key = 1;
-    block1.last_access_time = 1000;
-
-    BlockEntry block2;
-    block2.key = 2;
-    block2.last_access_time = 2000;
-
-    BlockEntry block3;
-    block3.key = 3;
-    block3.last_access_time = 3000;
+    auto block1 = CreateBlock(1, 1000);
+    auto block2 = CreateBlock(2, 2000);
+    auto block3 = CreateBlock(3, 3000);
 
     policy_->OnBlockWritten(&block1);
     policy_->OnBlockWritten(&block2);

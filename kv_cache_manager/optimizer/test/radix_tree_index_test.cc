@@ -39,29 +39,6 @@ TEST_F(RadixTreeIndexTest, InsertOnlyDuplicate) {
     EXPECT_EQ(result.inserted_keys.size(), 0);
 }
 
-TEST_F(RadixTreeIndexTest, InsertWithQueryNoHit) {
-    std::vector<int64_t> block_keys = {1, 2, 3, 4, 5};
-    QueryHit query_hit;
-
-    auto inserted = index_->InsertWithQuery(block_keys, 1000, &query_hit);
-    EXPECT_EQ(inserted.size(), 5);
-    EXPECT_EQ(query_hit.remote_hit_block_num, 0); // 第一次插入不应该有命中
-}
-
-TEST_F(RadixTreeIndexTest, InsertWithQueryWithHit) {
-    // 第一次插入
-    std::vector<int64_t> block_keys1 = {1, 2, 3, 4, 5};
-    index_->InsertWithQuery(block_keys1, 1000);
-
-    // 第二次插入,应该命中
-    std::vector<int64_t> block_keys2 = {1, 2, 3, 4, 5};
-    QueryHit query_hit;
-    auto inserted = index_->InsertWithQuery(block_keys2, 2000, &query_hit);
-
-    EXPECT_EQ(inserted.size(), 0);                // 所有块都已存在
-    EXPECT_EQ(query_hit.remote_hit_block_num, 5); // 命中了5个块
-}
-
 TEST_F(RadixTreeIndexTest, PrefixQueryNoHit) {
     std::vector<int64_t> block_keys = {1, 2, 3, 4, 5};
     index_->InsertOnly(block_keys, 1000);
@@ -101,20 +78,6 @@ TEST_F(RadixTreeIndexTest, PrefixQueryPartialMask) {
     SUCCEED();
 }
 
-TEST_F(RadixTreeIndexTest, InsertWithQueryPartialHit) {
-    // 第一次插入
-    std::vector<int64_t> block_keys1 = {1, 2, 3, 4, 5};
-    index_->InsertWithQuery(block_keys1, 1000);
-
-    // 第二次插入,部分命中
-    std::vector<int64_t> block_keys2 = {1, 2, 6, 7, 8};
-    QueryHit query_hit;
-    auto inserted = index_->InsertWithQuery(block_keys2, 2000, &query_hit);
-
-    EXPECT_EQ(inserted.size(), 3);                 // 6, 7, 8是新的
-    EXPECT_GT(query_hit.remote_hit_block_num, 0u); // 1, 2应该命中
-}
-
 TEST_F(RadixTreeIndexTest, MultipleInsertions) {
     std::vector<int64_t> block_keys1 = {1, 2, 3};
     index_->InsertOnly(block_keys1, 1000);
@@ -144,20 +107,6 @@ TEST_F(RadixTreeIndexTest, CleanEmptyBlocks) {
 
     // 不应该崩溃
     SUCCEED();
-}
-
-TEST_F(RadixTreeIndexTest, InsertWithQueryAndUpdateAccessTime) {
-    std::vector<int64_t> block_keys = {1, 2, 3, 4, 5};
-
-    // 第一次插入
-    index_->InsertWithQuery(block_keys, 1000);
-
-    // 第二次查询相同的数据,应该更新访问时间
-    QueryHit query_hit;
-    auto inserted = index_->InsertWithQuery(block_keys, 2000, &query_hit);
-
-    EXPECT_EQ(inserted.size(), 0);
-    EXPECT_EQ(query_hit.remote_hit_block_num, 5);
 }
 
 TEST_F(RadixTreeIndexTest, LargeBlockSequence) {

@@ -50,7 +50,6 @@ def _process_chunk_text(
     tokenizer_path: str,
     model_name: Optional[str],
     block_size: int,
-    mode: str,
     default_instance_id: str,
     time_field: str,
     content_field: str
@@ -63,7 +62,6 @@ def _process_chunk_text(
         tokenizer_path: tokenizer路径
         model_name: 模型名称
         block_size: block大小
-        mode: 输出模式
         default_instance_id: 默认instance ID
         time_field: 时间字段名
         content_field: 内容字段名
@@ -78,7 +76,6 @@ def _process_chunk_text(
     converter = TextTraceConverter(
         default_instance_id=default_instance_id,
         instance_block_sizes={default_instance_id: block_size},
-        mode=mode,
         tokenizer_path=tokenizer_path,
         model_name=model_name,
         time_field=time_field,
@@ -111,36 +108,20 @@ def _process_chunk_text(
             # 转换为block IDs
             block_ids = tokens_to_block_ids(token_ids, block_size=block_size)
             
-            # 根据模式生成traces
-            # tokens字段由BaseConverter根据keep_tokens参数自动控制
-            if mode == 'optimizer':
-                # Optimizer模式: Get+Write
-                get_trace = converter._create_get_trace(
-                    timestamp_ns=timestamp_ns,
-                    keys=block_ids,
-                    instance_id=default_instance_id,
-                    tokens=token_ids
-                )
-                write_trace = converter._create_write_trace(
-                    timestamp_ns=timestamp_ns + 1,
-                    keys=block_ids,
-                    instance_id=default_instance_id,
-                    tokens=token_ids
-                )
-                traces.extend([get_trace, write_trace])
-            else:
-                # Inference模式: DialogTurn
-                input_len = len(block_ids) * block_size
-                dialog_trace = converter._create_dialog_trace(
-                    timestamp_ns=timestamp_ns,
-                    keys=block_ids,
-                    input_len=input_len,
-                    output_len=0,
-                    total_keys=block_ids,
-                    instance_id=default_instance_id,
-                    tokens=token_ids
-                )
-                traces.append(dialog_trace)
+            # 生成Get+Write traces
+            get_trace = converter._create_get_trace(
+                timestamp_ns=timestamp_ns,
+                keys=block_ids,
+                instance_id=default_instance_id,
+                tokens=token_ids
+            )
+            write_trace = converter._create_write_trace(
+                timestamp_ns=timestamp_ns + 1,
+                keys=block_ids,
+                instance_id=default_instance_id,
+                tokens=token_ids
+            )
+            traces.extend([get_trace, write_trace])
         
         except Exception:
             # 静默跳过错误行（避免进程间输出混乱）
@@ -216,7 +197,6 @@ class TextTraceConverter(BaseConverter):
             tokenizer_path=self.tokenizer_path,
             model_name=self.model_name,
             block_size=self.block_size,
-            mode=self.mode,
             default_instance_id=self.default_instance_id,
             time_field=self.time_field,
             content_field=self.content_field
@@ -265,7 +245,7 @@ class TextTraceConverter(BaseConverter):
         all_traces.sort(key=lambda t: t.get("timestamp_ns", 0))
         
         total_elapsed = time.time() - start_time
-        print(f"\n✅ Completed: {len(all_traces)} traces in {total_elapsed:.1f}s "
+        print(f"\n Completed: {len(all_traces)} traces in {total_elapsed:.1f}s "
               f"({len(all_traces)/total_elapsed:.0f} traces/s)")
         
         return all_traces
@@ -317,26 +297,3 @@ class TextTraceConverter(BaseConverter):
         )
 
         return [get_trace, write_trace]
-
-    def _generate_inference_trace(self, timestamp_ns: int, block_ids: list, tokens: list = None) -> dict:
-        """
-        生成Inference格式的DialogTurn trace
-        
-        Args:
-            tokens: token IDs列表（由base层根据keep_tokens决定是否保留）
-        """
-        tokens = tokens or []
-        input_len = len(block_ids) * self.block_size
-
-        # DialogTurn trace - 显式使用default_instance_id
-        dialog_trace = self._create_dialog_trace(
-            timestamp_ns=timestamp_ns,
-            keys=block_ids,
-            input_len=input_len,
-            output_len=0,  # 文本输入没有输出
-            total_keys=block_ids,
-            instance_id=self.default_instance_id,
-            tokens=tokens
-        )
-
-        return dialog_trace

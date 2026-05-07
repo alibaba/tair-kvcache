@@ -130,7 +130,7 @@ public:
 
 ### 2. OptimizerRunner（优化器运行器）
 
-**职责**：执行 Trace 回放和模拟，处理三种 Trace 类型（GetLocationSchemaTrace、WriteCacheSchemaTrace、DialogTurnSchemaTrace），支持读写分离模式。
+**职责**：执行 Trace 回放和模拟，处理两种 Trace 类型（GetLocationSchemaTrace、WriteCacheSchemaTrace），支持读写分离模式。
 
 ### 3. OptEvictionManager（驱逐管理器）
 
@@ -336,8 +336,7 @@ public:
 **核心操作**：
 1. `InsertOnly()` - 仅插入块，不查询
 2. `PrefixQuery()` - 前缀匹配查询
-3. `InsertWithQuery()` - 插入并查询（组合操作）
-4. `ExportForVisualization()` - 导出前缀树用于可视化
+3. `ExportForVisualization()` - 导出前缀树用于可视化
 
 ### Radix Tree 数据结构
 
@@ -386,7 +385,6 @@ struct BlockEntry {
 ```
 OptimizerSchemaTrace (基类)
     ├── GetLocationSchemaTrace (读操作)
-    │   └── DialogTurnSchemaTrace (对话轮次)
     └── WriteCacheSchemaTrace (写操作)
 ```
 
@@ -394,7 +392,7 @@ OptimizerSchemaTrace (基类)
 
 **支持的格式**：
 - **Publisher Log**：转换 KVCacheManager Event Publisher 日志，区分读和写请求
-- **Qwen Bailian**：转换 Qwen Bailian 数据集格式，直接创建 DialogTurnSchemaTrace
+- **Qwen Bailian**：转换 Qwen Bailian 数据集格式，输出读写分离 trace
 
 **转换流程**：
 1. 根据配置文件选择转换器

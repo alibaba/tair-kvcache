@@ -30,7 +30,6 @@ public:
 public:
     void HandleGetLocation(const GetLocationSchemaTrace &trace);
     void HandleWriteCache(const WriteCacheSchemaTrace &trace);
-    void HandleDialogTurn(const DialogTurnSchemaTrace &trace);
 
 private:
     std::shared_ptr<RadixTreeIndex> GetIndexer(const std::string &instance_id);
