@@ -15,7 +15,7 @@ struct OSException {
 } // namespace
 
 PYBIND11_MODULE(kvcm_py_client, module) {
-    pybind11::register_exception_translator([](std::exception_ptr p) {
+    pybind11::register_local_exception_translator([](std::exception_ptr p) {
         try {
             if (p)
                 std::rethrow_exception(p);
