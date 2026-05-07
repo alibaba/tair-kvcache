@@ -15,7 +15,7 @@ namespace kv_cache_manager {
 RadixTreeIndex::RadixTreeIndex(const std::string &instance_id,
                                std::vector<std::shared_ptr<EvictionPolicy>> tier_policies,
                                TierWriteMode write_mode,
-                               int64_t default_ttl_us) {
+                               int64_t default_ttl_ns) {
     root_ = std::make_unique<RadixTreeNode>();
     tier_policies_ = std::move(tier_policies);
     for (auto &p : tier_policies_) {
@@ -26,30 +26,30 @@ RadixTreeIndex::RadixTreeIndex(const std::string &instance_id,
     write_tier_count_ =
         (write_mode_ == TierWriteMode::CASCADING && tier_policies_.size() > 1) ? 1 : tier_policies_.size();
     instance_id_ = instance_id;
-    default_ttl_us_ = default_ttl_us;
+    default_ttl_ns_ = default_ttl_ns;
 }
 
 // 兼容构造函数 (单 policy)
 RadixTreeIndex::RadixTreeIndex(const std::string &instance_id,
                                const std::shared_ptr<EvictionPolicy> &eviction_policy,
-                               int64_t default_ttl_us) {
+                               int64_t default_ttl_ns) {
     root_ = std::make_unique<RadixTreeNode>();
     tier_policies_.push_back(eviction_policy);
     tier_names_.push_back(eviction_policy->name());
     write_tier_count_ = 1;
     instance_id_ = instance_id;
-    default_ttl_us_ = default_ttl_us;
+    default_ttl_ns_ = default_ttl_ns;
 }
 
 // TODO 后续改为 记录需要更新信息的node和blockentry，然后统一用一个接口更新
 // 这样可以做到反向更新lru链表，避免同一时间戳下先驱逐前缀
 RadixTreeIndex::InsertResult
-RadixTreeIndex::InsertOnly(const std::vector<int64_t> &block_keys, int64_t timestamp, int64_t ttl_us) {
+RadixTreeIndex::InsertOnly(const std::vector<int64_t> &block_keys, int64_t timestamp, int64_t ttl_ns) {
     if (block_keys.empty()) {
         return {block_keys};
     }
-    // 0 = 使用 default_ttl_us_, -1 = 禁用(永不过期), >0 = 自定义
-    int64_t resolved_ttl = (ttl_us > 0) ? ttl_us : (ttl_us == 0) ? default_ttl_us_ : 0;
+    // 0 = 使用 default_ttl_ns_, -1 = 禁用(永不过期), >0 = 自定义
+    int64_t resolved_ttl = (ttl_ns > 0) ? ttl_ns : (ttl_ns == 0) ? default_ttl_ns_ : 0;
     return InsertNode(root_.get(), block_keys, timestamp, resolved_ttl);
 }
 // 先返回键值，后续看需要location或是针对block的access信息的需求之后再返回BlockEntry指针
@@ -57,13 +57,13 @@ RadixTreeIndex::InsertOnly(const std::vector<int64_t> &block_keys, int64_t times
 RadixTreeIndex::InsertResult RadixTreeIndex::InsertNode(RadixTreeNode *node,
                                                         const std::vector<int64_t> &block_keys,
                                                         int64_t timestamp,
-                                                        int64_t ttl_us) {
+                                                        int64_t ttl_ns) {
     if (block_keys.empty()) {
         return {block_keys};
     }
     // 叶子追加 = 严格前缀包含（树结构保证 B 走完了 A 的全部 blocks）
     if (node->isLeaf() && node->parent != nullptr) {
-        WriteToTier(node, block_keys, timestamp, ttl_us, nullptr);
+        WriteToTier(node, block_keys, timestamp, ttl_ns, nullptr);
         return {block_keys};
     }
     int64_t current_key = block_keys.front();
@@ -71,7 +71,7 @@ RadixTreeIndex::InsertResult RadixTreeIndex::InsertNode(RadixTreeNode *node,
     if (child_it == node->children.end()) {
         auto new_node = std::make_unique<RadixTreeNode>();
         new_node->parent = node;
-        WriteToTier(new_node.get(), block_keys, timestamp, ttl_us, nullptr);
+        WriteToTier(new_node.get(), block_keys, timestamp, ttl_ns, nullptr);
         node->children[current_key] = std::move(new_node);
         return InsertResult{block_keys};
     } else {
@@ -91,12 +91,12 @@ RadixTreeIndex::InsertResult RadixTreeIndex::InsertNode(RadixTreeNode *node,
         }
         // 处理被驱逐的blocks，block存在但location为空，需要重新写入location
         if (!evicted_blocks.empty()) {
-            WriteToTier(child, insert_keys, timestamp, ttl_us, AppendEvictBlocks(std::move(evicted_blocks), ttl_us));
+            WriteToTier(child, insert_keys, timestamp, ttl_ns, AppendEvictBlocks(std::move(evicted_blocks), ttl_ns));
         }
         if (match_len == child->blocks.size()) {
             // 完全匹配，递归向下
             auto remain_result = InsertNode(
-                child, std::vector<int64_t>(block_keys.begin() + match_len, block_keys.end()), timestamp, ttl_us);
+                child, std::vector<int64_t>(block_keys.begin() + match_len, block_keys.end()), timestamp, ttl_ns);
             insert_keys.insert(
                 insert_keys.end(), remain_result.inserted_keys.begin(), remain_result.inserted_keys.end());
             return InsertResult{insert_keys};
@@ -109,7 +109,7 @@ RadixTreeIndex::InsertResult RadixTreeIndex::InsertNode(RadixTreeNode *node,
                       match_len,
                       std::vector<int64_t>(block_keys.begin() + match_len, block_keys.end()),
                       timestamp,
-                      ttl_us);
+                      ttl_ns);
             auto remain_results = std::vector<int64_t>(block_keys.begin() + match_len, block_keys.end());
             insert_keys.insert(insert_keys.end(), remain_results.begin(), remain_results.end());
             return InsertResult{insert_keys};
@@ -121,7 +121,7 @@ void RadixTreeIndex::SplitNode(RadixTreeNode *existing_node,
                                size_t split_pos,
                                const std::vector<int64_t> &right_keys,
                                int64_t timestamp,
-                               int64_t ttl_us) {
+                               int64_t ttl_ns) {
     if (split_pos == 0)
         return;
 
@@ -151,7 +151,7 @@ void RadixTreeIndex::SplitNode(RadixTreeNode *existing_node,
     if (!right_keys.empty()) {
         auto new_leaf = std::make_unique<RadixTreeNode>();
         new_leaf->parent = middle_ptr;
-        WriteToTier(new_leaf.get(), right_keys, timestamp, ttl_us, nullptr);
+        WriteToTier(new_leaf.get(), right_keys, timestamp, ttl_ns, nullptr);
         middle_ptr->children[right_keys.front()] = std::move(new_leaf);
     }
 
@@ -206,11 +206,7 @@ void RadixTreeIndex::PrefixQuery(const std::vector<int64_t> &block_keys,
             }
             match_len++;
         }
-        if (has_remote_hit) {
-            child->stat.last_access_time = timestamp;
-            child->stat.access_count += 1;
-        }
-        if (has_local_hit) {
+        if (has_remote_hit || has_local_hit) {
             child->stat.last_access_time = timestamp;
             child->stat.access_count += 1;
         }
@@ -233,11 +229,11 @@ void RadixTreeIndex::CleanEmptyBlocks(const std::vector<BlockEntry *> &blocks,
     for (auto *block : blocks) {
         if (block->location_map.empty()) {
             int64_t effective_eviction_timestamp = eviction_timestamp;
-            if (use_logical_expire_time && block->ttl_us > 0 && block->ttl_anchor_time >= 0) {
+            if (use_logical_expire_time && block->ttl_ns > 0 && block->ttl_anchor_time >= 0) {
                 // TTL 过期清理使用逻辑过期时刻（ttl_anchor + ttl），与 IsExpired 保持同一判据。
                 // 不能用 last_access_time：当 ttl_refresh_on_read=false（固定窗口）时，
                 // last_access_time 会晚于 ttl_anchor_time，导致 death_time_us 被高估。
-                effective_eviction_timestamp = block->ttl_anchor_time + block->ttl_us;
+                effective_eviction_timestamp = block->ttl_anchor_time + block->ttl_ns;
                 if (effective_eviction_timestamp > eviction_timestamp) {
                     effective_eviction_timestamp = eviction_timestamp;
                 }
@@ -288,7 +284,7 @@ void RadixTreeIndex::CleanEmptyBlocks(const std::vector<BlockEntry *> &blocks,
 std::vector<BlockEntry *> RadixTreeIndex::AppendNewBlocks(RadixTreeNode *node,
                                                           const std::vector<int64_t> &block_keys,
                                                           int64_t timestamp,
-                                                          int64_t ttl_us) {
+                                                          int64_t ttl_ns) {
     std::vector<BlockEntry *> inserted_blocks;
     inserted_blocks.reserve(block_keys.size());
     for (size_t i = 0; i < block_keys.size(); ++i) {
@@ -296,7 +292,7 @@ std::vector<BlockEntry *> RadixTreeIndex::AppendNewBlocks(RadixTreeNode *node,
         entry->key = block_keys[i];
         entry->writing_time = timestamp;
         entry->last_access_time = timestamp;
-        entry->ttl_us = ttl_us;
+        entry->ttl_ns = ttl_ns;
         entry->owner_node = node;
         BlockEntry *entry_ptr = entry.get();
         // 根据写入模式落到对应 tier：WRITE_THROUGH=全部层，CASCADING=仅 tier 0
@@ -324,9 +320,9 @@ void AppendBlockLocation(BlockEntry *block, const std::string &unique_name, int6
 }
 
 RadixTreeIndex::WriteModify RadixTreeIndex::AppendEvictBlocks(std::unordered_map<int64_t, BlockEntry *> blocks_map,
-                                                              int64_t ttl_us) {
+                                                              int64_t ttl_ns) {
     return
-        [this, blocks_map = std::move(blocks_map), ttl_us](const std::vector<int64_t> &block_keys, int64_t timestamp) {
+        [this, blocks_map = std::move(blocks_map), ttl_ns](const std::vector<int64_t> &block_keys, int64_t timestamp) {
             std::vector<BlockEntry *> revived_blocks;
             revived_blocks.reserve(block_keys.size());
 
@@ -336,7 +332,7 @@ RadixTreeIndex::WriteModify RadixTreeIndex::AppendEvictBlocks(std::unordered_map
                     BlockEntry *block = it->second;
                     block->writing_time = timestamp;
                     block->last_access_time = timestamp;
-                    block->ttl_us = ttl_us;
+                    block->ttl_ns = ttl_ns;
                     // 根据写入模式恢复到对应 tier：WRITE_THROUGH=全部层，CASCADING=仅 tier 0
                     for (size_t t = 0; t < write_tier_count_; ++t) {
                         AppendBlockLocation(block, tier_names_[t], timestamp);
@@ -355,12 +351,12 @@ RadixTreeIndex::WriteModify RadixTreeIndex::AppendEvictBlocks(std::unordered_map
 void RadixTreeIndex::WriteToTier(RadixTreeNode *node,
                                  const std::vector<int64_t> &block_keys,
                                  int64_t timestamp,
-                                 int64_t ttl_us,
+                                 int64_t ttl_ns,
                                  RadixTreeIndex::WriteModify cb) {
     std::vector<BlockEntry *> inserted_blocks;
     if (!cb) {
         // 节点直接添加新blocks
-        inserted_blocks = AppendNewBlocks(node, block_keys, timestamp, ttl_us);
+        inserted_blocks = AppendNewBlocks(node, block_keys, timestamp, ttl_ns);
     } else {
         // 节点填充空block 的 location
         inserted_blocks = cb(block_keys, timestamp);

@@ -78,6 +78,25 @@ TEST_F(RadixTreeIndexTest, PrefixQueryPartialMask) {
     SUCCEED();
 }
 
+TEST_F(RadixTreeIndexTest, PrefixQueryCountsMixedLocalRemoteNodeOnce) {
+    std::vector<int64_t> block_keys = {1, 2, 3};
+    index_->InsertOnly(block_keys, 1000);
+
+    BlockMask block_mask = std::vector<bool>{true, false, true};
+    QueryHit query_hit;
+    index_->PrefixQuery(block_keys, block_mask, 2000, &query_hit);
+
+    const auto *root = index_->GetRoot();
+    ASSERT_NE(root, nullptr);
+    auto child_it = root->children.find(1);
+    ASSERT_NE(child_it, root->children.end());
+
+    EXPECT_EQ(child_it->second->stat.access_count, 1);
+    EXPECT_EQ(child_it->second->stat.last_access_time, 2000);
+    EXPECT_EQ(query_hit.local_hit_block_num, 2);
+    EXPECT_EQ(query_hit.remote_hit_block_num, 1);
+}
+
 TEST_F(RadixTreeIndexTest, MultipleInsertions) {
     std::vector<int64_t> block_keys1 = {1, 2, 3};
     index_->InsertOnly(block_keys1, 1000);

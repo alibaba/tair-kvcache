@@ -22,11 +22,11 @@ public:
     RadixTreeIndex(const std::string &instance_id,
                    std::vector<std::shared_ptr<EvictionPolicy>> tier_policies,
                    TierWriteMode write_mode = TierWriteMode::WRITE_THROUGH,
-                   int64_t default_ttl_us = 0);
+                   int64_t default_ttl_ns = 0);
     // 兼容构造函数 (单 policy)
     RadixTreeIndex(const std::string &instance_id,
                    const std::shared_ptr<EvictionPolicy> &eviction_policy,
-                   int64_t default_ttl_us = 0);
+                   int64_t default_ttl_ns = 0);
     RadixTreeIndex();
     ~RadixTreeIndex() = default;
 
@@ -34,8 +34,8 @@ public:
         std::vector<int64_t> inserted_keys;
     };
 
-    // ttl_us: 0 = 使用 default_ttl_us_，-1 = 禁用 TTL，>0 = 自定义微秒
-    InsertResult InsertOnly(const std::vector<int64_t> &block_keys, int64_t timestamp, int64_t ttl_us = 0);
+    // ttl_ns: 0 = 使用 default_ttl_ns_，-1 = 禁用 TTL，>0 = 自定义纳秒
+    InsertResult InsertOnly(const std::vector<int64_t> &block_keys, int64_t timestamp, int64_t ttl_ns = 0);
     void PrefixQuery(const std::vector<int64_t> &block_keys,
                      const BlockMask &block_mask,
                      const int64_t timestamp,
@@ -84,26 +84,26 @@ private:
     // WRITE_THROUGH=全部层，CASCADING=仅 tier 0（单层退化为全部）
     size_t write_tier_count_ = 0;
     std::string instance_id_;
-    int64_t default_ttl_us_ = 0;
+    int64_t default_ttl_ns_ = 0;
     std::shared_ptr<StatsCollector> stats_collector_;
 
 private:
     std::vector<BlockEntry *>
-    AppendNewBlocks(RadixTreeNode *node, const std::vector<int64_t> &block_keys, int64_t timestamp, int64_t ttl_us);
+    AppendNewBlocks(RadixTreeNode *node, const std::vector<int64_t> &block_keys, int64_t timestamp, int64_t ttl_ns);
 
     InsertResult
-    InsertNode(RadixTreeNode *node, const std::vector<int64_t> &block_keys, int64_t timestamp, int64_t ttl_us);
+    InsertNode(RadixTreeNode *node, const std::vector<int64_t> &block_keys, int64_t timestamp, int64_t ttl_ns);
     void SplitNode(RadixTreeNode *existing_node,
                    size_t split_pos,
                    const std::vector<int64_t> &remaining_keys,
                    int64_t timestamp,
-                   int64_t ttl_us = 0);
+                   int64_t ttl_ns = 0);
 
     using WriteModify = std::function<std::vector<BlockEntry *>(const std::vector<int64_t> &, int64_t)>;
-    WriteModify AppendEvictBlocks(std::unordered_map<int64_t, BlockEntry *> blocks_map, int64_t ttl_us);
+    WriteModify AppendEvictBlocks(std::unordered_map<int64_t, BlockEntry *> blocks_map, int64_t ttl_ns);
 
     void WriteToTier(
-        RadixTreeNode *node, const std::vector<int64_t> &block_keys, int64_t timestamp, int64_t ttl_us, WriteModify cb);
+        RadixTreeNode *node, const std::vector<int64_t> &block_keys, int64_t timestamp, int64_t ttl_ns, WriteModify cb);
 
     void OnBlockAccessed(BlockEntry *block, int64_t timestamp, bool refresh_ttl_on_read = true);
     bool IsBlockEvict(BlockEntry *block, int64_t timestamp) const;

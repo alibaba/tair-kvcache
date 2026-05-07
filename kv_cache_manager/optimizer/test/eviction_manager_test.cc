@@ -340,13 +340,13 @@ TEST_F(OptEvictionManagerTest, ActiveEvictExpiredShouldNotTriggerFallbackEvictio
     BlockEntry expired_block;
     expired_block.key = 1;
     expired_block.last_access_time = 100;
-    expired_block.ttl_us = 10;
+    expired_block.ttl_ns = 10;
     expired_block.location_map["tier1"] = TierStat{};
 
     BlockEntry alive_block;
     alive_block.key = 2;
     alive_block.last_access_time = 100;
-    alive_block.ttl_us = 1000;
+    alive_block.ttl_ns = 1000;
     alive_block.location_map["tier1"] = TierStat{};
 
     policy->OnBlockWritten(&expired_block);
@@ -382,7 +382,7 @@ TEST_F(OptEvictionManagerTest, ActiveEvictExpiredUsesCurrentTimestamp) {
     BlockEntry expired_block;
     expired_block.key = 100;
     expired_block.last_access_time = 100;
-    expired_block.ttl_us = 10;
+    expired_block.ttl_ns = 10;
     expired_block.location_map["tier1"] = TierStat{};
     policy->OnBlockWritten(&expired_block);
 
@@ -410,13 +410,13 @@ TEST_F(OptEvictionManagerTest, ActiveEvictExpiredSkipsNonTtlPolicyInV1) {
     BlockEntry expired_block;
     expired_block.key = 200;
     expired_block.last_access_time = 100;
-    expired_block.ttl_us = 10;
+    expired_block.ttl_ns = 10;
     expired_block.location_map["tier1"] = TierStat{};
 
     BlockEntry alive_block;
     alive_block.key = 201;
     alive_block.last_access_time = 100;
-    alive_block.ttl_us = 10000;
+    alive_block.ttl_ns = 10000;
     alive_block.location_map["tier1"] = TierStat{};
 
     policy->OnBlockWritten(&expired_block);
@@ -463,7 +463,7 @@ TEST_F(OptEvictionManagerTest, ActiveEvictExpiredClearsAllTiers) {
     BlockEntry expired_block;
     expired_block.key = 42;
     expired_block.last_access_time = 100;
-    expired_block.ttl_us = 50; // 会在 timestamp > 150 时过期
+    expired_block.ttl_ns = 50; // 会在 timestamp > 150 时过期
     expired_block.location_map["gpu"] = TierStat{};
     expired_block.location_map["host"] = TierStat{};
 
@@ -477,7 +477,7 @@ TEST_F(OptEvictionManagerTest, ActiveEvictExpiredClearsAllTiers) {
     BlockEntry alive_block;
     alive_block.key = 43;
     alive_block.last_access_time = 100;
-    alive_block.ttl_us = 10000;
+    alive_block.ttl_ns = 10000;
     alive_block.location_map["gpu"] = TierStat{};
     alive_block.location_map["host"] = TierStat{};
     policy_group->policies[0]->OnBlockWritten(&alive_block);

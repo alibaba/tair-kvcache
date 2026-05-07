@@ -60,12 +60,12 @@ void TtlEvictionPolicy::AdvanceClock(int64_t timestamp) {
 }
 
 void TtlEvictionPolicy::PushExpireEvent(BlockEntry *block) {
-    if (!block || block->ttl_us <= 0) {
+    if (!block || block->ttl_ns <= 0) {
         return;
     }
     auto &version = expire_event_version_[block];
     ++version;
-    expire_min_heap_.push(ExpireEvent{block->ttl_anchor_time + block->ttl_us, version, block});
+    expire_min_heap_.push(ExpireEvent{block->ttl_anchor_time + block->ttl_ns, version, block});
     MaybeCompactExpireHeap();
 }
 
@@ -128,14 +128,14 @@ void TtlEvictionPolicy::RebuildExpireHeap() {
     decltype(expire_min_heap_) new_heap;
     for (const auto &[block, node] : node_map_) {
         (void)node;
-        if (!block || block->ttl_us <= 0) {
+        if (!block || block->ttl_ns <= 0) {
             continue;
         }
         auto version_it = expire_event_version_.find(block);
         if (version_it == expire_event_version_.end()) {
             continue;
         }
-        new_heap.push(ExpireEvent{block->ttl_anchor_time + block->ttl_us, version_it->second, block});
+        new_heap.push(ExpireEvent{block->ttl_anchor_time + block->ttl_ns, version_it->second, block});
     }
     expire_min_heap_.swap(new_heap);
 }

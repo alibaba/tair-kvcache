@@ -11,12 +11,12 @@ class TtlEvictionPolicyTest : public TESTBASE {
 protected:
     void SetUp() override { policy_ = std::make_shared<TtlEvictionPolicy>("shared", false); }
 
-    BlockEntry MakeBlock(int64_t key, int64_t last_access = 0, int64_t ttl_us = 0, bool with_location = false) {
+    BlockEntry MakeBlock(int64_t key, int64_t last_access = 0, int64_t ttl_ns = 0, bool with_location = false) {
         BlockEntry b;
         b.key = key;
         b.last_access_time = last_access;
         b.ttl_anchor_time = last_access;
-        b.ttl_us = ttl_us;
+        b.ttl_ns = ttl_ns;
         if (with_location) {
             b.location_map["shared"] = TierStat{};
         }

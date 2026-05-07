@@ -34,6 +34,8 @@ public:
 private:
     std::shared_ptr<RadixTreeIndex> GetIndexer(const std::string &instance_id);
     void SubmitReadRecord(const std::string &instance_id,
+                          const std::string &trace_id,
+                          const std::vector<int64_t> &keys,
                           int64_t timestamp_ns,
                           const QueryHit &query_hit,
                           const std::shared_ptr<RadixTreeIndex> &indexer,

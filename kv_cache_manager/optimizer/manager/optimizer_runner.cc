@@ -9,6 +9,9 @@
 #include "kv_cache_manager/optimizer/manager/optimizer_loader.h"
 
 namespace kv_cache_manager {
+namespace {
+int64_t TtlUsToNs(int64_t ttl_us) { return ttl_us > 0 ? ttl_us * 1000 : ttl_us; }
+} // namespace
 
 void OptimizerRunner::Run(OptimizerConfig &config) {
     auto starting_time = std::chrono::high_resolution_clock::now();
@@ -60,6 +63,8 @@ std::shared_ptr<RadixTreeIndex> OptimizerRunner::GetIndexer(const std::string &i
 }
 
 void OptimizerRunner::SubmitReadRecord(const std::string &instance_id,
+                                       const std::string &trace_id,
+                                       const std::vector<int64_t> &keys,
                                        int64_t timestamp_ns,
                                        const QueryHit &query_hit,
                                        const std::shared_ptr<RadixTreeIndex> &indexer,
@@ -67,6 +72,8 @@ void OptimizerRunner::SubmitReadRecord(const std::string &instance_id,
                                        size_t remote_read_block_num) {
     ReadRecord record{};
     record.timestamp_ns = timestamp_ns;
+    record.trace_id = trace_id;
+    record.keys_ptr = &keys;
     record.current_cache_blocks = eviction_manager_->GetCurrentInstanceUsage(instance_id);
 
     auto indexer_map = indexer_manager_->GetAllOptIndexers();
@@ -117,8 +124,14 @@ void OptimizerRunner::HandleGetLocation(const GetLocationSchemaTrace &trace) {
     }
     size_t remote_read_block_num = trace.keys().size() - local_read_block_num;
 
-    SubmitReadRecord(
-        instance_id, trace.timestamp_ns(), query_hit, indexer, local_read_block_num, remote_read_block_num);
+    SubmitReadRecord(instance_id,
+                     trace.trace_id(),
+                     trace.keys(),
+                     trace.timestamp_ns(),
+                     query_hit,
+                     indexer,
+                     local_read_block_num,
+                     remote_read_block_num);
 }
 
 void OptimizerRunner::HandleWriteCache(const WriteCacheSchemaTrace &trace) {
@@ -132,13 +145,13 @@ void OptimizerRunner::HandleWriteCache(const WriteCacheSchemaTrace &trace) {
     auto expired_evicted_blocks = indexer_manager_->EvictExpiredBeforeAccess(instance_id, trace.timestamp_ns());
     indexer_manager_->CleanEvictedBlocks(expired_evicted_blocks, trace.timestamp_ns(), true);
 
-    int64_t effective_ttl_us = trace.ttl_us();
+    int64_t effective_ttl_ns = TtlUsToNs(trace.ttl_us());
     auto ttl_disabled_it = instance_group_ttl_disabled_.find(instance_id);
     if (ttl_disabled_it != instance_group_ttl_disabled_.end() && ttl_disabled_it->second) {
-        effective_ttl_us = -1;
+        effective_ttl_ns = -1;
     }
 
-    auto result = indexer->InsertOnly(trace.keys(), trace.timestamp_ns(), effective_ttl_us);
+    auto result = indexer->InsertOnly(trace.keys(), trace.timestamp_ns(), effective_ttl_ns);
     auto capacity_evicted_blocks = indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_ns());
     indexer_manager_->CleanEvictedBlocks(capacity_evicted_blocks, trace.timestamp_ns());
     bool evicted = !capacity_evicted_blocks.empty();

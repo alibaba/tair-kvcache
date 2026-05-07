@@ -174,8 +174,8 @@ bool OptimizerManager::CreateRadixTreeIndex(const OptInstanceConfig &instance_co
         return false;
     }
 
-    int64_t default_ttl_us = group_it->second.default_block_ttl_seconds() * 1000000;
-    if (default_ttl_us > 0 && instance_config.eviction_policy_type() != EvictionPolicyType::POLICY_TTL) {
+    int64_t default_ttl_ns = group_it->second.default_block_ttl_seconds() * 1000000000;
+    if (default_ttl_ns > 0 && instance_config.eviction_policy_type() != EvictionPolicyType::POLICY_TTL) {
         KVCM_LOG_WARN("default_block_ttl_seconds=%ld is set but eviction_policy_type is not TTL; "
                       "TTL will not be enforced for instance %s",
                       group_it->second.default_block_ttl_seconds(),
@@ -185,7 +185,7 @@ bool OptimizerManager::CreateRadixTreeIndex(const OptInstanceConfig &instance_co
                                             storage_configs,
                                             group_it->second.hierarchical_eviction_enabled(),
                                             group_it->second.tier_write_mode(),
-                                            default_ttl_us)) {
+                                            default_ttl_ns)) {
         KVCM_LOG_ERROR("Failed to create optimizer indexer for instance_id: %s", instance_config.instance_id().c_str());
         return false;
     }
