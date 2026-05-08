@@ -703,6 +703,10 @@ std::vector<ErrorCode> MetaStorageBackendManager::GetLocationIds(const KeyVector
         if (results[i] != EC_OK) {
             continue;
         }
+        if (field_names_vec[i].empty()) {
+            results[i] = EC_NOENT;
+            continue;
+        }
         out_location_ids[i].reserve(field_names_vec[i].size());
         for (auto &field_name : field_names_vec[i]) {
             if (field_name.size() > prefix_len) {
