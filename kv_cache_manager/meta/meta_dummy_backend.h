@@ -55,9 +55,9 @@ public:
                                                  const std::string &field_prefix,
                                                  std::vector<bool> &out_exists_vec) noexcept override;
     std::vector<ErrorCode>
-    ListFieldNamesWithPrefix(const KeyTypeVec &keys,
-                             const std::string &field_prefix,
-                             std::vector<std::vector<std::string>> &out_field_names_vec) noexcept override;
+    GetFieldNamesWithPrefix(const KeyTypeVec &keys,
+                            const std::string &field_prefix,
+                            std::vector<std::vector<std::string>> &out_field_names_vec) noexcept override;
     ErrorCode ListKeys(const std::string &cursor,
                        std::int64_t limit,
                        std::string &out_next_cursor,

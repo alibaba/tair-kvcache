@@ -789,9 +789,9 @@ std::vector<ErrorCode> RedisClient::ExistsFieldWithPrefix(const std::vector<std:
 }
 
 std::vector<ErrorCode>
-RedisClient::ListFieldNamesWithPrefix(const std::vector<std::string> &keys,
-                                      const std::string &field_prefix,
-                                      std::vector<std::vector<std::string>> &out_field_names_vec) {
+RedisClient::GetFieldNamesWithPrefix(const std::vector<std::string> &keys,
+                                     const std::string &field_prefix,
+                                     std::vector<std::vector<std::string>> &out_field_names_vec) {
     out_field_names_vec.resize(keys.size());
 
     std::vector<ErrorCode> ec_per_key(keys.size(), EC_OK);

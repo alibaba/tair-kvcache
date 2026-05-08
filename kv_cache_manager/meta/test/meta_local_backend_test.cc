@@ -870,7 +870,7 @@ TEST_F(MetaLocalBackendTest, TestConcurrentReadWrite) {
         }
     };
 
-    // Reader threads: exercise Get, GetAllFields, ExistsFieldWithPrefix, ListFieldNamesWithPrefix.
+    // Reader threads: exercise Get, GetAllFields, ExistsFieldWithPrefix, GetFieldNamesWithPrefix.
     auto reader_fn = [&](int /*reader_id*/) {
         for (int i = 0; i < kIterations && !stop.load(std::memory_order_relaxed); ++i) {
             // Get with specific field names
@@ -891,11 +891,12 @@ TEST_F(MetaLocalBackendTest, TestConcurrentReadWrite) {
             ASSERT_EQ(1u, exists_ec.size());
             ASSERT_EQ(EC_OK, exists_ec[0]);
 
-            // ListFieldNamesWithPrefix
+            // GetFieldNamesWithPrefix
             std::vector<std::vector<std::string>> names_vec;
-            auto list_ec = meta_storage_backend_->ListFieldNamesWithPrefix({kTestKey}, LOCATION_PREFIX, names_vec);
-            ASSERT_EQ(1u, list_ec.size());
-            ASSERT_EQ(EC_OK, list_ec[0]);
+            auto get_field_names_ec =
+                meta_storage_backend_->GetFieldNamesWithPrefix({kTestKey}, LOCATION_PREFIX, names_vec);
+            ASSERT_EQ(1u, get_field_names_ec.size());
+            ASSERT_EQ(EC_OK, get_field_names_ec[0]);
         }
     };
 

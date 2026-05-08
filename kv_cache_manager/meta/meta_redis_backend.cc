@@ -242,9 +242,9 @@ std::vector<ErrorCode> MetaRedisBackend::ExistsFieldWithPrefix(const KeyTypeVec 
 }
 
 std::vector<ErrorCode>
-MetaRedisBackend::ListFieldNamesWithPrefix(const KeyTypeVec &keys,
-                                           const std::string &field_prefix,
-                                           std::vector<std::vector<std::string>> &out_field_names_vec) noexcept {
+MetaRedisBackend::GetFieldNamesWithPrefix(const KeyTypeVec &keys,
+                                          const std::string &field_prefix,
+                                          std::vector<std::vector<std::string>> &out_field_names_vec) noexcept {
     auto handle = client_pool_->AcquireClient(timeout_ms_);
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(
@@ -252,7 +252,7 @@ MetaRedisBackend::ListFieldNamesWithPrefix(const KeyTypeVec &keys,
         return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
     }
     std::vector<std::string> full_keys = AppendPrefixToKeys(keys);
-    return handle->ListFieldNamesWithPrefix(full_keys, field_prefix, out_field_names_vec);
+    return handle->GetFieldNamesWithPrefix(full_keys, field_prefix, out_field_names_vec);
 }
 
 ErrorCode MetaRedisBackend::ListKeys(const std::string &cursor,

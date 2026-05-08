@@ -474,9 +474,9 @@ std::vector<ErrorCode> MetaLocalBackend::ExistsFieldWithPrefix(const KeyTypeVec 
 }
 
 std::vector<ErrorCode>
-MetaLocalBackend::ListFieldNamesWithPrefix(const KeyTypeVec &keys,
-                                           const std::string &field_prefix,
-                                           std::vector<std::vector<std::string>> &out_field_names_vec) noexcept {
+MetaLocalBackend::GetFieldNamesWithPrefix(const KeyTypeVec &keys,
+                                          const std::string &field_prefix,
+                                          std::vector<std::vector<std::string>> &out_field_names_vec) noexcept {
     std::vector<ErrorCode> results(keys.size(), EC_OK);
     out_field_names_vec.resize(keys.size());
 

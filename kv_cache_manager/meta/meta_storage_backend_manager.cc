@@ -651,7 +651,7 @@ std::vector<std::vector<ErrorCode>> MetaStorageBackendManager::GetLocations(Requ
             if (!location.FromJsonString(it->second)) {
                 KVCM_LOG_ERROR(
                     "deserialize CacheLocation failed, key[%ld] location_id[%s]", keys[i], location_ids[i][j].c_str());
-                results[i][j] = EC_ERROR;
+                results[i][j] = EC_CORRUPTION;
                 continue;
             }
             out_locations[i][j] = std::move(location);
@@ -671,7 +671,7 @@ std::vector<ErrorCode> MetaStorageBackendManager::GetLocationIds(const KeyVector
     std::vector<std::vector<std::string>> field_names_vec;
     std::vector<ErrorCode> results;
     if (cache_backend_) {
-        results = cache_backend_->ListFieldNamesWithPrefix(keys, LOCATION_PREFIX, field_names_vec);
+        results = cache_backend_->GetFieldNamesWithPrefix(keys, LOCATION_PREFIX, field_names_vec);
         if (recover_state_.load(std::memory_order_acquire) != RecoverState::kRunning) {
             KeyTypeVec missing_keys;
             std::vector<size_t> missing_indices;
@@ -683,8 +683,8 @@ std::vector<ErrorCode> MetaStorageBackendManager::GetLocationIds(const KeyVector
             }
             if (!missing_keys.empty()) {
                 std::vector<std::vector<std::string>> persistent_field_names;
-                std::vector<ErrorCode> persistent_results = persistent_backend_->ListFieldNamesWithPrefix(
-                    missing_keys, LOCATION_PREFIX, persistent_field_names);
+                std::vector<ErrorCode> persistent_results =
+                    persistent_backend_->GetFieldNamesWithPrefix(missing_keys, LOCATION_PREFIX, persistent_field_names);
                 for (size_t i = 0; i < missing_keys.size(); ++i) {
                     const size_t original_idx = missing_indices[i];
                     results[original_idx] = persistent_results[i];
@@ -693,7 +693,7 @@ std::vector<ErrorCode> MetaStorageBackendManager::GetLocationIds(const KeyVector
             }
         }
     } else {
-        results = persistent_backend_->ListFieldNamesWithPrefix(keys, LOCATION_PREFIX, field_names_vec);
+        results = persistent_backend_->GetFieldNamesWithPrefix(keys, LOCATION_PREFIX, field_names_vec);
     }
 
     // Strip LOCATION_PREFIX from field names to produce location ids.

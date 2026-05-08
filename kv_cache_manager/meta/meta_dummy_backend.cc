@@ -427,9 +427,9 @@ std::vector<ErrorCode> MetaDummyBackend::ExistsFieldWithPrefix(const KeyTypeVec 
 }
 
 std::vector<ErrorCode>
-MetaDummyBackend::ListFieldNamesWithPrefix(const KeyTypeVec &keys,
-                                           const std::string &field_prefix,
-                                           std::vector<std::vector<std::string>> &out_field_names_vec) noexcept {
+MetaDummyBackend::GetFieldNamesWithPrefix(const KeyTypeVec &keys,
+                                          const std::string &field_prefix,
+                                          std::vector<std::vector<std::string>> &out_field_names_vec) noexcept {
     out_field_names_vec.resize(keys.size());
     std::vector<ErrorCode> ec_vec(keys.size(), ErrorCode::EC_OK);
     for (std::size_t i = 0; i != keys.size(); ++i) {

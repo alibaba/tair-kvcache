@@ -47,14 +47,14 @@ public:
                                        const std::vector<std::vector<std::string>> &field_names_vec,
                                        FieldMapVec &out_field_maps) noexcept = 0;
     virtual std::vector<ErrorCode> GetAllFields(const KeyTypeVec &keys, FieldMapVec &out_field_maps) noexcept = 0;
+    virtual std::vector<ErrorCode>
+    GetFieldNamesWithPrefix(const KeyTypeVec &keys,
+                            const std::string &field_prefix,
+                            std::vector<std::vector<std::string>> &out_field_names_vec) noexcept = 0;
     virtual std::vector<ErrorCode> Exists(const KeyTypeVec &keys, std::vector<bool> &out_is_exist_vec) noexcept = 0;
     virtual std::vector<ErrorCode> ExistsFieldWithPrefix(const KeyTypeVec &keys,
                                                          const std::string &field_prefix,
                                                          std::vector<bool> &out_exists_vec) noexcept = 0;
-    virtual std::vector<ErrorCode>
-    ListFieldNamesWithPrefix(const KeyTypeVec &keys,
-                             const std::string &field_prefix,
-                             std::vector<std::vector<std::string>> &out_field_names_vec) noexcept = 0;
     virtual ErrorCode ListKeys(const std::string &cursor,
                                const int64_t limit,
                                std::string &out_next_cursor,
