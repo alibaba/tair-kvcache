@@ -4,6 +4,7 @@
 #include <map>
 #include <memory>
 #include <random>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -33,6 +34,7 @@ struct MetaMemCacheItem {
     }
     const FieldMap &GetFields() const { return fields_; }
     FieldMap &GetMutableFields() { return fields_; }
+    std::shared_mutex &GetMutex() const { return mutex_; }
 
     int64_t GetLastAccessTime() const { return last_access_time_.load(std::memory_order_relaxed); }
     void TouchAccessTime() { last_access_time_.store(TimestampUtil::GetCurrentTimeUs(), std::memory_order_relaxed); }
@@ -52,6 +54,7 @@ struct MetaMemCacheItem {
 private:
     FieldMap fields_;
     std::atomic<int64_t> last_access_time_{0};
+    mutable std::shared_mutex mutex_;
 };
 
 class MetaLocalBackend : public MetaCacheBaseBackend {

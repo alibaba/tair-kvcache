@@ -1,5 +1,8 @@
+#include <atomic>
 #include <filesystem>
 #include <set>
+#include <thread>
+#include <vector>
 
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
@@ -827,6 +830,96 @@ TEST_F(MetaLocalBackendTest, TestConditionalDeleteFields) {
 
     // Key 1's LOCATION_PREFIX field was removed, key 2's remains intact.
     AssertExistsFieldWithPrefix(meta_storage_backend_.get(), {1, 2}, LOCATION_PREFIX, {EC_OK, EC_OK}, {false, true});
+
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
+}
+
+// ---------------------------------------------------------------------------
+// Concurrent read-write stress test for MetaMemCacheItem fields_ mutex
+// ---------------------------------------------------------------------------
+TEST_F(MetaLocalBackendTest, TestConcurrentReadWrite) {
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("test_instance_concurrent", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
+
+    constexpr KeyType kTestKey = 42;
+    constexpr int kIterations = 5000;
+    constexpr int kNumWriters = 3;
+    constexpr int kNumReaders = 6;
+
+    // Seed an initial entry so readers/writers always have something to operate on.
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->Put({kTestKey}, {{{PROPERTY_URI, "initial"}}}));
+
+    std::atomic<bool> stop{false};
+    std::atomic<int> write_count{0};
+
+    // Writer threads: UpdateFields + DeleteFields on rotating location fields.
+    auto writer_fn = [&](int writer_id) {
+        for (int i = 0; i < kIterations && !stop.load(std::memory_order_relaxed); ++i) {
+            std::string field_name = LOCATION_PREFIX + "w" + std::to_string(writer_id) + "_" + std::to_string(i);
+            std::string field_value = "value_" + std::to_string(i);
+
+            auto update_ec = meta_storage_backend_->UpdateFields({kTestKey}, {{{field_name, field_value}}});
+            ASSERT_EQ(1u, update_ec.size());
+            ASSERT_EQ(EC_OK, update_ec[0]);
+
+            auto delete_ec = meta_storage_backend_->DeleteFields({kTestKey}, {{field_name}});
+            ASSERT_EQ(1u, delete_ec.size());
+            ASSERT_EQ(EC_OK, delete_ec[0]);
+
+            write_count.fetch_add(1, std::memory_order_relaxed);
+        }
+    };
+
+    // Reader threads: exercise Get, GetAllFields, ExistsFieldWithPrefix, ListFieldNamesWithPrefix.
+    auto reader_fn = [&](int /*reader_id*/) {
+        for (int i = 0; i < kIterations && !stop.load(std::memory_order_relaxed); ++i) {
+            // Get with specific field names
+            FieldMapVec field_maps;
+            auto get_ec = meta_storage_backend_->Get({kTestKey}, {PROPERTY_URI}, field_maps);
+            ASSERT_EQ(1u, get_ec.size());
+            ASSERT_EQ(EC_OK, get_ec[0]);
+
+            // GetAllFields
+            FieldMapVec all_maps;
+            auto all_ec = meta_storage_backend_->GetAllFields({kTestKey}, all_maps);
+            ASSERT_EQ(1u, all_ec.size());
+            ASSERT_EQ(EC_OK, all_ec[0]);
+
+            // ExistsFieldWithPrefix
+            std::vector<bool> exists_vec;
+            auto exists_ec = meta_storage_backend_->ExistsFieldWithPrefix({kTestKey}, LOCATION_PREFIX, exists_vec);
+            ASSERT_EQ(1u, exists_ec.size());
+            ASSERT_EQ(EC_OK, exists_ec[0]);
+
+            // ListFieldNamesWithPrefix
+            std::vector<std::vector<std::string>> names_vec;
+            auto list_ec = meta_storage_backend_->ListFieldNamesWithPrefix({kTestKey}, LOCATION_PREFIX, names_vec);
+            ASSERT_EQ(1u, list_ec.size());
+            ASSERT_EQ(EC_OK, list_ec[0]);
+        }
+    };
+
+    // Launch all threads.
+    std::vector<std::thread> threads;
+    threads.reserve(kNumWriters + kNumReaders);
+    for (int w = 0; w < kNumWriters; ++w) {
+        threads.emplace_back(writer_fn, w);
+    }
+    for (int r = 0; r < kNumReaders; ++r) {
+        threads.emplace_back(reader_fn, r);
+    }
+    for (auto &t : threads) {
+        t.join();
+    }
+
+    // Sanity: all writer iterations completed without crash.
+    ASSERT_EQ(kNumWriters * kIterations, write_count.load());
+
+    // The initial PROPERTY_URI field should still be intact.
+    FieldMapVec final_maps;
+    auto final_ec = meta_storage_backend_->Get({kTestKey}, {PROPERTY_URI}, final_maps);
+    ASSERT_EQ(EC_OK, final_ec[0]);
+    ASSERT_EQ("initial", final_maps[0][PROPERTY_URI]);
 
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
