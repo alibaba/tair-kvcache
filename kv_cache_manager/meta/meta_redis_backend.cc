@@ -79,11 +79,14 @@ ErrorCode MetaRedisBackend::Init(const std::string &instance_id,
     if (tmp_timeout_ms > 0) {
         timeout_ms_ = tmp_timeout_ms;
     }
+    int64_t db_index = 0;
+    storage_uri_.GetParamAs("db", db_index);
 
-    KVCM_LOG_INFO("meta redis backend init successfully, instance[%s], storage uri[%s], timeout ms[%ld]",
+    KVCM_LOG_INFO("meta redis backend init successfully, instance[%s], storage uri[%s], timeout ms[%ld], redis db[%ld]",
                   instance_id_.c_str(),
                   config->GetStorageUri().c_str(),
-                  timeout_ms_);
+                  timeout_ms_,
+                  db_index);
     return EC_OK;
 }
 

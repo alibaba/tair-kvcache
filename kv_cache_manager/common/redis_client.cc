@@ -18,6 +18,11 @@ namespace kv_cache_manager {
 
 RedisClient::RedisClient(const StandardUri &storage_uri)
     : user_info_(storage_uri.GetUserInfo()), host_(storage_uri.GetHostName()), port_(storage_uri.GetPort()) {
+    int64_t tmp_db = 0;
+    storage_uri.GetParamAs("db", tmp_db);
+    if (tmp_db >= 0) {
+        db_ = tmp_db;
+    }
     int64_t tmp_timeout_ms = 0;
     storage_uri.GetParamAs("timeout_ms", tmp_timeout_ms);
     if (tmp_timeout_ms > 0) {
@@ -137,7 +142,15 @@ bool RedisClient::Connect() {
         }
     }
 
-    KVCM_REDIS_LOG_INFO("connect to redis timeout_ms[%ld] retry_count[%ld]", timeout_ms_, retry_count_);
+    if (db_ > 0) {
+        ReplyUPtr select_reply((redisReply *)redisCommand(context_, "SELECT %ld", db_), freeReplyObject);
+        if (!IsReplyOk(select_reply.get())) {
+            KVCM_REDIS_LOG_WARN("fail to select redis db[%ld]", db_);
+            return false;
+        }
+    }
+
+    KVCM_REDIS_LOG_INFO("connect to redis db[%ld] timeout_ms[%ld] retry_count[%ld]", db_, timeout_ms_, retry_count_);
     return true;
 }
 

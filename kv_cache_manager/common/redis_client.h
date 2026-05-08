@@ -65,6 +65,7 @@ private:
     std::string user_info_;
     std::string host_;
     int64_t port_ = 0;
+    int64_t db_ = 0;
     int64_t timeout_ms_ = 2000;
     int64_t retry_count_ = 2;
     int64_t randomkey_batch_num_ = 20;
