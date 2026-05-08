@@ -312,6 +312,10 @@ private:
     // default to 100
     std::atomic<std::uint32_t> sleep_interval_ms_;
 
+    // controls the maximum wait time for key sampling worker futures
+    // default to kFutureTimeoutMs
+    std::atomic<std::uint32_t> future_timeout_ms_;
+
     std::mutex task_queue_mutex_;
     std::condition_variable cv_task_queue_;
     std::deque<std::function<void()>> task_queue_;

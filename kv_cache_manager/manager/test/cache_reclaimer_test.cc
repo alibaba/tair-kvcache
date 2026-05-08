@@ -2949,6 +2949,105 @@ TEST_F(CacheReclaimerTest, TestDoKeySampling) {
     }
 }
 
+TEST_F(CacheReclaimerTest, TestDoKeySamplingFutureTimeout_SampleReclaimKeysHangs) {
+    // when SampleReclaimKeys blocks longer than the future timeout,
+    // DoKeySampling should return false instead of blocking forever
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    get_out_properties = {
+        {{PROPERTY_LRU_TIME, "0"}},
+        {{PROPERTY_LRU_TIME, "1"}},
+        {{PROPERTY_LRU_TIME, "2"}},
+        {{PROPERTY_LRU_TIME, "3"}},
+        {{PROPERTY_LRU_TIME, "4"}},
+        {{PROPERTY_LRU_TIME, "5"}},
+        {{PROPERTY_LRU_TIME, "6"}},
+        {{PROPERTY_LRU_TIME, "7"}},
+        {{PROPERTY_LRU_TIME, "8"}},
+        {{PROPERTY_LRU_TIME, "9"}},
+    };
+
+    // set a very short future timeout (50ms) and a long sample delay (500ms)
+    cache_reclaimer_->future_timeout_ms_.store(50);
+    mi_sample_reclaim_delay = std::chrono::milliseconds{500};
+
+    // use multi-thread path: sampling_size > sampling_size_per_task
+    cache_reclaimer_->sampling_size_.store(10);
+    cache_reclaimer_->sampling_size_per_task_.store(5);
+
+    std::vector<std::int64_t> keys;
+    std::vector<std::map<std::string, std::string>> maps;
+    ASSERT_FALSE(cache_reclaimer_->DoKeySampling(request_context_.get(), instance_infos.front(), keys, maps));
+
+    // wait for the hanging tasks to complete so they don't interfere
+    std::this_thread::sleep_for(std::chrono::milliseconds(600));
+}
+
+TEST_F(CacheReclaimerTest, TestDoKeySamplingFutureTimeout_GetPropertiesHangs) {
+    // when GetProperties blocks longer than the future timeout,
+    // DoKeySampling should return false instead of blocking forever
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    get_out_properties = {
+        {{PROPERTY_LRU_TIME, "0"}},
+        {{PROPERTY_LRU_TIME, "1"}},
+        {{PROPERTY_LRU_TIME, "2"}},
+        {{PROPERTY_LRU_TIME, "3"}},
+        {{PROPERTY_LRU_TIME, "4"}},
+        {{PROPERTY_LRU_TIME, "5"}},
+        {{PROPERTY_LRU_TIME, "6"}},
+        {{PROPERTY_LRU_TIME, "7"}},
+        {{PROPERTY_LRU_TIME, "8"}},
+        {{PROPERTY_LRU_TIME, "9"}},
+    };
+
+    // set a very short future timeout (50ms) and a long GetProperties delay (500ms)
+    cache_reclaimer_->future_timeout_ms_.store(50);
+    mi_getprop_delay = std::chrono::milliseconds{500};
+
+    // use multi-thread path with sampling_size > batching_size to trigger GetProperties
+    cache_reclaimer_->sampling_size_.store(10);
+    cache_reclaimer_->sampling_size_per_task_.store(5);
+    cache_reclaimer_->batching_size_.store(1);
+
+    std::vector<std::int64_t> keys;
+    std::vector<std::map<std::string, std::string>> maps;
+    ASSERT_FALSE(cache_reclaimer_->DoKeySampling(request_context_.get(), instance_infos.front(), keys, maps));
+
+    // wait for the hanging tasks to complete so they don't interfere
+    std::this_thread::sleep_for(std::chrono::milliseconds(600));
+}
+
+TEST_F(CacheReclaimerTest, TestDoKeySamplingFutureTimeout_NoTimeoutOnFastTasks) {
+    // when tasks complete quickly, DoKeySampling should succeed normally
+    // even with a timeout configured
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    get_out_properties = {
+        {{PROPERTY_LRU_TIME, "0"}},
+        {{PROPERTY_LRU_TIME, "1"}},
+        {{PROPERTY_LRU_TIME, "2"}},
+        {{PROPERTY_LRU_TIME, "3"}},
+        {{PROPERTY_LRU_TIME, "4"}},
+        {{PROPERTY_LRU_TIME, "5"}},
+        {{PROPERTY_LRU_TIME, "6"}},
+        {{PROPERTY_LRU_TIME, "7"}},
+        {{PROPERTY_LRU_TIME, "8"}},
+        {{PROPERTY_LRU_TIME, "9"}},
+    };
+
+    // set a reasonable future timeout (5000ms) and no delay
+    cache_reclaimer_->future_timeout_ms_.store(5000);
+    mi_sample_reclaim_delay = std::chrono::milliseconds{0};
+    mi_getprop_delay = std::chrono::milliseconds{0};
+
+    // use multi-thread path
+    cache_reclaimer_->sampling_size_.store(10);
+    cache_reclaimer_->sampling_size_per_task_.store(5);
+
+    std::vector<std::int64_t> keys;
+    std::vector<std::map<std::string, std::string>> maps;
+    ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_.get(), instance_infos.front(), keys, maps));
+    ASSERT_EQ(10u, keys.size());
+}
+
 TEST_F(CacheReclaimerTest, TestDupKeys) {
     {
         sample_reclaim_keys = {0, 0, 2, 3, 4, 5, 6, 7, 8, 9};

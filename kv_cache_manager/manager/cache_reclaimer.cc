@@ -253,6 +253,7 @@ CacheReclaimer::CacheReclaimer(const std::size_t sampling_size_total,
     , sampling_size_per_task_(sampling_size_per_task)
     , batching_size_(batching_size)
     , sleep_interval_ms_(sleep_interval_ms)
+    , future_timeout_ms_(kFutureTimeoutMs)
     , worker_stop_(false) {
     if (worker_size == 0) {
         worker_size = 1;
@@ -792,8 +793,9 @@ bool CacheReclaimer::DoKeySampling(RequestContext *request_context,
     for (auto &fut : futures) {
         if (fut.valid()) {
             // drain all the known futures with bounded waiting time
-            if (fut.wait_for(std::chrono::milliseconds(kFutureTimeoutMs)) != std::future_status::ready) {
-                LOG_WITH_ID(WARN, "key sampling task timed out after [%u] ms", kFutureTimeoutMs);
+            const std::uint32_t timeout_ms = future_timeout_ms_.load();
+            if (fut.wait_for(std::chrono::milliseconds(timeout_ms)) != std::future_status::ready) {
+                LOG_WITH_ID(WARN, "key sampling task timed out after [%u] ms", timeout_ms);
                 result = false;
                 continue;
             }
