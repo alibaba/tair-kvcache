@@ -1048,21 +1048,7 @@ std::shared_ptr<CacheReclaimer::GroupUsageData> CacheReclaimer::GetGroupUsageDat
         const std::size_t ins_used_key_cnt = meta_indexer->GetKeyCount();
         const std::size_t ins_max_key_cnt = meta_indexer->GetMaxKeyCount();
 
-        std::size_t ins_used_byte_size = 0;
-        if (meta_indexer->GetVersion() == MetaIndexer::InstanceVersion::VERSION_0) {
-            std::size_t byte_size_per_key = 0;
-            for (auto &location_spec_info : instance_info->location_spec_infos()) {
-                byte_size_per_key += location_spec_info.size();
-            }
-            ins_used_byte_size = byte_size_per_key * ins_used_key_cnt;
-        } else if (meta_indexer->GetVersion() == MetaIndexer::InstanceVersion::VERSION_1) {
-            ins_used_byte_size = meta_indexer->GetStorageUsage();
-        } else {
-            LOG_WITH_ID(WARN,
-                        "unknown meta_indexer version: [%" PRIu8 "]",
-                        static_cast<std::uint8_t>(meta_indexer->GetVersion()));
-            continue;
-        }
+        const std::size_t ins_used_byte_size = meta_indexer->GetStorageUsage();
 
         data->grp_used_key_cnt_ += ins_used_key_cnt;
         data->grp_max_key_cnt_ += ins_max_key_cnt;

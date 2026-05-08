@@ -26,9 +26,8 @@ public:
     static std::shared_ptr<MetaStorageBackendConfig> MakeDualConfig() {
         auto config = std::make_shared<MetaStorageBackendConfig>();
         config->SetStorageType(META_REDIS_BACKEND_TYPE_STR);
-        config->SetStorageUri(
-            "redis://test_redis_user:test_redis_password@localhost:6379/"
-            "?client_max_pool_size=4&persistent_type=redis&cache_type=local");
+        config->SetStorageUri("redis://test_redis_user:test_redis_password@localhost:6379/"
+                              "?client_max_pool_size=4&persistent_type=redis&cache_type=local");
         return config;
     }
 
@@ -37,8 +36,7 @@ public:
     static std::shared_ptr<MetaStorageBackendConfig> MakeSingleConfig() {
         auto config = std::make_shared<MetaStorageBackendConfig>();
         config->SetStorageType(META_REDIS_BACKEND_TYPE_STR);
-        config->SetStorageUri(
-            "redis://test_redis_user:test_redis_password@localhost:6379/?client_max_pool_size=4");
+        config->SetStorageUri("redis://test_redis_user:test_redis_password@localhost:6379/?client_max_pool_size=4");
         return config;
     }
 
@@ -102,9 +100,7 @@ public:
 
     // Best-effort Delete; swallow NOENT so repeated runs against the same
     // redis instance stay idempotent even when a previous run aborted midway.
-    static void Cleanup(MetaStorageBackendManager &mgr, const KeyVector &keys) {
-        mgr.Delete(keys);
-    }
+    static void Cleanup(MetaStorageBackendManager &mgr, const KeyVector &keys) { mgr.Delete(keys); }
 
 protected:
     std::shared_ptr<RequestContext> request_context_;
@@ -129,8 +125,7 @@ TEST_F(MetaStorageBackendManagerRealRedisTest, TestDualBackendPutAndGet) {
     for (size_t i = 0; i < keys.size(); ++i) {
         const std::string loc_id = "loc_" + std::to_string(keys[i]);
         ASSERT_EQ(1u, out_locations[i].size());
-        ASSERT_EQ("uri_" + std::to_string(keys[i]),
-                  out_locations[i].at(loc_id).location_specs().front().uri());
+        ASSERT_EQ("uri_" + std::to_string(keys[i]), out_locations[i].at(loc_id).location_specs().front().uri());
     }
 
     Cleanup(mgr, keys);
@@ -144,9 +139,8 @@ TEST_F(MetaStorageBackendManagerRealRedisTest, TestInitInvalidBackendTypesReject
     {
         auto config = std::make_shared<MetaStorageBackendConfig>();
         config->SetStorageType(META_REDIS_BACKEND_TYPE_STR);
-        config->SetStorageUri(
-            "redis://test_redis_user:test_redis_password@localhost:6379/"
-            "?client_max_pool_size=4&persistent_type=bogus&cache_type=local");
+        config->SetStorageUri("redis://test_redis_user:test_redis_password@localhost:6379/"
+                              "?client_max_pool_size=4&persistent_type=bogus&cache_type=local");
         MetaStorageBackendManager mgr;
         ASSERT_EQ(EC_ERROR, mgr.Init("inst_redis_bad_persistent", config));
     }
@@ -154,9 +148,8 @@ TEST_F(MetaStorageBackendManagerRealRedisTest, TestInitInvalidBackendTypesReject
     {
         auto config = std::make_shared<MetaStorageBackendConfig>();
         config->SetStorageType(META_REDIS_BACKEND_TYPE_STR);
-        config->SetStorageUri(
-            "redis://test_redis_user:test_redis_password@localhost:6379/"
-            "?client_max_pool_size=4&persistent_type=redis&cache_type=bogus");
+        config->SetStorageUri("redis://test_redis_user:test_redis_password@localhost:6379/"
+                              "?client_max_pool_size=4&persistent_type=redis&cache_type=bogus");
         MetaStorageBackendManager mgr;
         ASSERT_EQ(EC_ERROR, mgr.Init("inst_redis_bad_cache", config));
     }
@@ -172,7 +165,7 @@ TEST_F(MetaStorageBackendManagerRealRedisTest, TestSingleBackendCrud) {
     ASSERT_EQ(EC_OK, mgr.Init("inst_redis_single", MakeSingleConfig()));
     ASSERT_EQ(EC_OK, mgr.Open());
     ASSERT_EQ(MetaStorageBackendManager::RecoverState::kRunning, mgr.GetRecoverState());
-    ASSERT_FALSE(mgr.local_backend_);
+    ASSERT_FALSE(mgr.cache_backend_);
 
     KeyVector keys = {20001, 20002};
     Cleanup(mgr, keys);
@@ -188,8 +181,7 @@ TEST_F(MetaStorageBackendManagerRealRedisTest, TestSingleBackendCrud) {
     ASSERT_EQ((std::vector<bool>{true, true}), exists_vec);
 
     LocationMapVector out_locs;
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
-              mgr.GetLocations(request_context_.get(), keys, out_locs));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), mgr.GetLocations(request_context_.get(), keys, out_locs));
     ASSERT_EQ("uri_20001", out_locs[0].at("loc_20001").location_specs().front().uri());
 
     // Delete the only location of each key -> MaybeReclaimEmptyKeys walks
@@ -229,14 +221,12 @@ TEST_F(MetaStorageBackendManagerRealRedisTest, TestRecoverReadFallbackToPersiste
     auto extra_batch = MakeBatch(extra);
     SerializeLocationsIntoProperties(extra_batch);
     {
-        std::vector<ErrorCode> ecs =
-            mgr.persistent_backend_->Put(extra_batch.batch_keys, extra_batch.batch_properties);
+        std::vector<ErrorCode> ecs = mgr.persistent_backend_->Put(extra_batch.batch_keys, extra_batch.batch_properties);
         ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), ecs);
     }
 
     // Flip back to Recover so local-miss triggers the persistent fallback.
-    mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover,
-                             std::memory_order_release);
+    mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover, std::memory_order_release);
 
     KeyVector keys = {30001, 30002, 30003};
     FieldMapVec fms;
@@ -273,8 +263,7 @@ TEST_F(MetaStorageBackendManagerRealRedisTest, TestRecoverWriteDualWriteAndDelet
 
     // Force Recover so Delete writes a tombstone and UpdateFields runs
     // EnsureKeyInLocal before the conditional write.
-    mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover,
-                             std::memory_order_release);
+    mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover, std::memory_order_release);
 
     KeyVector keys = {40042};
     Cleanup(mgr, keys);
@@ -295,7 +284,7 @@ TEST_F(MetaStorageBackendManagerRealRedisTest, TestRecoverWriteDualWriteAndDelet
     stale_fms[0]["p0"] = "stale";
     ASSERT_EQ(0, mgr.BackfillKeysToLocal(keys, stale_fms, {EC_OK}));
     std::vector<bool> exists_vec;
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.local_backend_->Exists(keys, exists_vec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.cache_backend_->Exists(keys, exists_vec));
     ASSERT_FALSE(exists_vec[0]);
 
     // Key 40007 lives only in redis: UpdateFields under Recover must hydrate
@@ -340,12 +329,10 @@ TEST_F(MetaStorageBackendManagerRealRedisTest, TestRunningReadLocalOnly) {
     // Bypass manager and write k2 only into redis; in Running state reads
     // must not see it (local-only path).
     auto b2 = MakeBatch(k2);
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
-              mgr.persistent_backend_->Put(b2.batch_keys, b2.batch_properties));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.persistent_backend_->Put(b2.batch_keys, b2.batch_properties));
 
     std::vector<bool> exists_vec;
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
-              mgr.Exists(KeyVector{50001, 50002}, exists_vec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), mgr.Exists(KeyVector{50001, 50002}, exists_vec));
     ASSERT_EQ((std::vector<bool>{true, false}), exists_vec);
 
     FieldMapVec fms;

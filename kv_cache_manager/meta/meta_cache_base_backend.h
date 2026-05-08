@@ -8,9 +8,9 @@ namespace kv_cache_manager {
 // Extends MetaStorageBackend with conditional write operations that accept
 // previous_error_codes, allowing callers to skip keys that already failed
 // in a prior write stage (e.g. persistent write) without copying key/value vectors.
-class MetaLocalBaseBackend : public MetaStorageBackend {
+class MetaCacheBaseBackend : public MetaStorageBackend {
 public:
-    ~MetaLocalBaseBackend() override = default;
+    ~MetaCacheBaseBackend() override = default;
 
     using MetaStorageBackend::Delete;
     using MetaStorageBackend::DeleteFields;

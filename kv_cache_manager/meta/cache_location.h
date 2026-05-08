@@ -140,43 +140,4 @@ private:
 using CacheLocationVector = std::vector<CacheLocation>;
 using CacheLocationMap = std::unordered_map<std::string, CacheLocation>;
 
-class BlockCacheLocationsMeta : public Jsonizable {
-public:
-    BlockCacheLocationsMeta();
-    ~BlockCacheLocationsMeta() override;
-
-    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override {
-        for (auto &location_kv : location_map_) {
-            Put(writer, location_kv.first, location_kv.second);
-        }
-    }
-
-    bool FromRapidValue(const rapidjson::Value &rapid_value) override {
-        if (!rapid_value.IsObject()) {
-            return false;
-        }
-        for (auto itr = rapid_value.MemberBegin(); itr != rapid_value.MemberEnd(); ++itr) {
-            const std::string key = itr->name.GetString();
-            CacheLocation location;
-            if (location.FromRapidValue(itr->value)) {
-                location_map_[key] = location;
-            } else {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    [[nodiscard]] CacheLocationMap &location_map() { return location_map_; }
-
-    void AddNewLocation(const CacheLocation &location, std::string &out_location_id);
-    ErrorCode UpdateLocationStatus(const std::string &location_id, CacheLocationStatus status);
-    ErrorCode DeleteLocation(const std::string &location_id);
-    ErrorCode GetLocationStatus(const std::string &location_id, CacheLocationStatus &out_status);
-    size_t GetLocationCount() const;
-
-private:
-    CacheLocationMap location_map_;
-};
-
 } // namespace kv_cache_manager

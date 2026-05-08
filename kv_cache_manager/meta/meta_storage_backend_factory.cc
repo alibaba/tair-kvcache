@@ -46,30 +46,26 @@ MetaStorageBackendFactory::CreatePersistentBackend(const std::string &instance_i
         return nullptr;
     }
     if (backend->Init(instance_id, config) != EC_OK) {
-        KVCM_LOG_ERROR("init persistent backend failed, type[%s] instance[%s]",
-                       storage_type.c_str(),
-                       instance_id.c_str());
+        KVCM_LOG_ERROR(
+            "init persistent backend failed, type[%s] instance[%s]", storage_type.c_str(), instance_id.c_str());
         return nullptr;
     }
     return backend;
 }
 
-std::unique_ptr<MetaLocalBaseBackend>
-MetaStorageBackendFactory::CreateLocalBackend(const std::string &instance_id,
+std::unique_ptr<MetaCacheBaseBackend>
+MetaStorageBackendFactory::CreateCacheBackend(const std::string &instance_id,
                                               const std::shared_ptr<MetaStorageBackendConfig> &config) {
     const std::string &storage_type = config->GetStorageType();
-    std::unique_ptr<MetaLocalBaseBackend> backend;
+    std::unique_ptr<MetaCacheBaseBackend> backend;
     if (storage_type == META_LOCAL_BACKEND_TYPE_STR) {
         backend = std::make_unique<MetaLocalBackend>();
     } else {
-        KVCM_LOG_ERROR("create local backend failed, unsupported type[%s], expect local",
-                       storage_type.c_str());
+        KVCM_LOG_ERROR("create cache backend failed, unsupported type[%s], expect local", storage_type.c_str());
         return nullptr;
     }
     if (backend->Init(instance_id, config) != EC_OK) {
-        KVCM_LOG_ERROR("init local backend failed, type[%s] instance[%s]",
-                       storage_type.c_str(),
-                       instance_id.c_str());
+        KVCM_LOG_ERROR("init cache backend failed, type[%s] instance[%s]", storage_type.c_str(), instance_id.c_str());
         return nullptr;
     }
     return backend;

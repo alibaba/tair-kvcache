@@ -456,6 +456,37 @@ std::vector<ErrorCode> MetaLocalBackend::ExistsFieldWithPrefix(const KeyTypeVec 
     return results;
 }
 
+std::vector<ErrorCode>
+MetaLocalBackend::ListFieldNamesWithPrefix(const KeyTypeVec &keys,
+                                           const std::string &field_prefix,
+                                           std::vector<std::vector<std::string>> &out_field_names_vec) noexcept {
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    out_field_names_vec.resize(keys.size());
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        std::string key_str = std::to_string(keys[i]);
+        Cache::Handle *handle = cache_->Lookup(key_str);
+        if (!handle) {
+            results[i] = EC_NOENT;
+            continue;
+        }
+
+        auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
+        item->TouchAccessTime();
+        const auto &fields = item->GetFields();
+        for (auto it = fields.lower_bound(field_prefix); it != fields.end(); ++it) {
+            if (it->first.size() < field_prefix.size() ||
+                it->first.compare(0, field_prefix.size(), field_prefix) != 0) {
+                break;
+            }
+            out_field_names_vec[i].emplace_back(it->first);
+        }
+        cache_->Release(handle);
+    }
+
+    return results;
+}
+
 ErrorCode MetaLocalBackend::ListKeys(const std::string &cursor,
                                      const int64_t limit,
                                      std::string &out_next_cursor,

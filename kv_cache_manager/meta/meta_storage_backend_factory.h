@@ -5,7 +5,7 @@
 namespace kv_cache_manager {
 class MetaStorageBackendConfig;
 class MetaStorageBackend;
-class MetaLocalBaseBackend;
+class MetaCacheBaseBackend;
 
 class MetaStorageBackendFactory {
 public:
@@ -20,15 +20,13 @@ public:
     // setup is the source-of-truth, so only durable / shareable backends are
     // accepted here: redis (production) and dummy (tests).
     static std::unique_ptr<MetaStorageBackend>
-    CreatePersistentBackend(const std::string &instance_id,
-                            const std::shared_ptr<MetaStorageBackendConfig> &config);
+    CreatePersistentBackend(const std::string &instance_id, const std::shared_ptr<MetaStorageBackendConfig> &config);
 
     // Local-cache backend factory. The local slot is the in-memory hot cache
-    // and must implement MetaLocalBaseBackend's conditional write API; only
+    // and must implement MetaCacheBaseBackend's conditional write API; only
     // local is accepted.
-    static std::unique_ptr<MetaLocalBaseBackend>
-    CreateLocalBackend(const std::string &instance_id,
-                       const std::shared_ptr<MetaStorageBackendConfig> &config);
+    static std::unique_ptr<MetaCacheBaseBackend>
+    CreateCacheBackend(const std::string &instance_id, const std::shared_ptr<MetaStorageBackendConfig> &config);
 };
 
 } // namespace kv_cache_manager

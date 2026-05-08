@@ -788,6 +788,86 @@ std::vector<ErrorCode> RedisClient::ExistsFieldWithPrefix(const std::vector<std:
     return ec_per_key;
 }
 
+std::vector<ErrorCode>
+RedisClient::ListFieldNamesWithPrefix(const std::vector<std::string> &keys,
+                                      const std::string &field_prefix,
+                                      std::vector<std::vector<std::string>> &out_field_names_vec) {
+    out_field_names_vec.resize(keys.size());
+
+    std::vector<ErrorCode> ec_per_key(keys.size(), EC_OK);
+    const std::string pattern = field_prefix + "*";
+    const std::string count_hint = "1000";
+    struct PendingKey {
+        size_t original_index;
+        std::string cursor;
+    };
+    std::vector<PendingKey> pending;
+    pending.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        pending.push_back({i, "0"});
+    }
+    while (!pending.empty()) {
+        std::vector<CmdArgs> hscan_cmds;
+        hscan_cmds.reserve(pending.size());
+        for (const auto &entry : pending) {
+            hscan_cmds.push_back(
+                {"HSCAN", keys[entry.original_index], entry.cursor, "MATCH", pattern, "COUNT", count_hint});
+        }
+
+        std::vector<ReplyUPtr> replies = CommandPipeline(hscan_cmds);
+        if (replies.size() != hscan_cmds.size()) {
+            KVCM_REDIS_LOG_ERROR(
+                "redis list field names with prefix fail, pipeline hscan_cmds.size[%lu] != replies.size[%lu]",
+                hscan_cmds.size(),
+                replies.size());
+            for (auto &entry : pending) {
+                ec_per_key[entry.original_index] = EC_ERROR;
+            }
+            break;
+        }
+
+        std::vector<PendingKey> next_pending;
+        for (size_t i = 0; i < pending.size(); ++i) {
+            size_t original_idx = pending[i].original_index;
+            const ReplyUPtr &hscan_reply = replies[i];
+            if (!IsReplyOk(hscan_reply.get()) || !CheckReplyArray(hscan_reply.get()) || hscan_reply->elements != 2) {
+                KVCM_REDIS_LOG_ERROR("redis list field names with prefix fail, key[%s] HSCAN fail",
+                                     keys[original_idx].c_str());
+                ec_per_key[original_idx] = EC_ERROR;
+                continue;
+            }
+
+            const redisReply *next_cursor_reply = hscan_reply->element[0];
+            const redisReply *fields_reply = hscan_reply->element[1];
+            std::string next_cursor;
+            if (!GetReplyStrOrNil(next_cursor_reply, next_cursor)) {
+                KVCM_REDIS_LOG_ERROR("redis list field names with prefix fail, key[%s] get next cursor fail",
+                                     keys[original_idx].c_str());
+                ec_per_key[original_idx] = EC_ERROR;
+                continue;
+            }
+            if (!CheckReplyArray(fields_reply)) {
+                KVCM_REDIS_LOG_ERROR("redis list field names with prefix fail, key[%s] check fields reply fail",
+                                     keys[original_idx].c_str());
+                ec_per_key[original_idx] = EC_ERROR;
+                continue;
+            }
+            // HSCAN returns [field1, value1, field2, value2, ...]; collect only field names (even indices).
+            for (size_t j = 0; j + 1 < fields_reply->elements; j += 2) {
+                std::string field_name;
+                if (GetReplyStrOrNil(fields_reply->element[j], field_name) && !field_name.empty()) {
+                    out_field_names_vec[original_idx].emplace_back(std::move(field_name));
+                }
+            }
+            if (next_cursor != "0") {
+                next_pending.push_back({original_idx, std::move(next_cursor)});
+            }
+        }
+        pending = std::move(next_pending);
+    }
+    return ec_per_key;
+}
+
 ErrorCode RedisClient::Scan(const std::string &matching_prefix,
                             const std::string &cursor,
                             const int64_t limit,
