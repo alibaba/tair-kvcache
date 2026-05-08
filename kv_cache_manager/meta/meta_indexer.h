@@ -1,6 +1,5 @@
 #pragma once
 
-#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -16,6 +15,7 @@
 #include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_storage_backend_manager.h"
+#include "kv_cache_manager/meta/storage_usage_data.h"
 #include "kv_cache_manager/meta/types.h"
 
 namespace kv_cache_manager {
@@ -56,41 +56,16 @@ public:
 
     ErrorCode Init(const std::string &instance_id, const std::shared_ptr<MetaIndexerConfig> &config) noexcept;
 
-    // ---------- Put ----------
-    // Whole-block put: replace keys[i]'s entire location set with location_maps[i].
+    // ---------- WRITE ----------
     Result Put(RequestContext *request_context,
                const KeyVector &keys,
                LocationMapVector &location_maps,
                PropertyMapVector &properties) noexcept;
-    // Whole-block update: overwrite keys[i]'s location set with location_maps[i]
-    // and update its block-level properties at the same time.
     Result Update(RequestContext *request_context,
                   const KeyVector &keys,
                   LocationMapVector &location_maps,
                   PropertyMapVector &properties) noexcept;
-
-    // ---------- Get ----------
-    Result Exist(RequestContext *request_context, const KeyVector &keys, std::vector<bool> &out_exists) noexcept;
-    // Whole-block get + business properties.
-    Result Get(RequestContext *request_context,
-               const KeyVector &keys,
-               LocationMapVector &out_location_maps,
-               PropertyMapVector &out_properties) noexcept;
-    // Whole-block get: fetch every location of each block_key.
-    Result
-    GetLocations(RequestContext *request_context, const KeyVector &keys, LocationMapVector &out_location_maps) noexcept;
-    // Per-location get: fetch only the specified location_ids for each block_key.
-    LocationResult GetLocations(RequestContext *request_context,
-                                const KeyVector &keys,
-                                const LocationIdsPerKey &location_ids,
-                                LocationsPerKey &out_locations) noexcept;
-    // Fetch only block-level business properties (no location data is read).
-    Result GetProperties(RequestContext *request_context,
-                         const KeyVector &keys,
-                         const std::vector<std::string> &property_names,
-                         PropertyMapVector &out_properties) noexcept;
-
-    // ---------- Modify ----------
+    Result Delete(RequestContext *request_context, const KeyVector &keys) noexcept;
     // Block-level RMW: modifier sees only existing location id list per key.
     Result ReadModifyWriteBlock(RequestContext *request_context,
                                 const KeyVector &keys,
@@ -101,10 +76,22 @@ public:
                                            const LocationIdsPerKey &location_ids,
                                            const LocationModifierFunc &modifier) noexcept;
 
-    // ---------- Delete ----------
-    Result Delete(RequestContext *request_context, const KeyVector &keys) noexcept;
-
-    // ---------- Scan / Sample ----------
+    // ---------- READ ----------
+    Result Exist(RequestContext *request_context, const KeyVector &keys, std::vector<bool> &out_exists) noexcept;
+    Result Get(RequestContext *request_context,
+               const KeyVector &keys,
+               LocationMapVector &out_location_maps,
+               PropertyMapVector &out_properties) noexcept;
+    Result
+    GetLocations(RequestContext *request_context, const KeyVector &keys, LocationMapVector &out_location_maps) noexcept;
+    LocationResult GetLocations(RequestContext *request_context,
+                                const KeyVector &keys,
+                                const LocationIdsPerKey &location_ids,
+                                LocationsPerKey &out_locations) noexcept;
+    Result GetProperties(RequestContext *request_context,
+                         const KeyVector &keys,
+                         const std::vector<std::string> &property_names,
+                         PropertyMapVector &out_properties) noexcept;
     ErrorCode
     Scan(const std::string &cursor, const size_t limit, std::string &out_next_cursor, KeyVector &out_keys) noexcept;
     ErrorCode RandomSample(RequestContext *request_context, const size_t count, KeyVector &out_keys) const noexcept;
@@ -117,77 +104,14 @@ public:
     size_t GetMemUsage() const noexcept;
 
     // storage usage interfaces
-    //
-    // notes about backward compatibility:
-    //
-    // GetStorageUsage() is accurate for hybrid model arch, and should
-    // only be used under InstanceVersion::VERSION_1
-    //
-    // similar logic for Get/Add/Sub-StorageUsageByType() are already
-    // being used under InstanceVersion::VERSION_0; however they are
-    // only accurate under InstanceVersion::VERSION_1
-    //
-    // see also notes for instance behavior version
     [[nodiscard]] std::uint64_t GetStorageUsage() const noexcept;
     [[nodiscard]] std::uint64_t GetStorageUsageByType(const DataStorageType &type) const noexcept;
     void SetStorageUsageByType(const DataStorageType &type, std::uint64_t value) noexcept;
     std::uint64_t AddStorageUsageByType(const DataStorageType &type, std::uint64_t value) noexcept;
     std::uint64_t SubStorageUsageByType(const DataStorageType &type, std::uint64_t value) noexcept;
 
-    // instance behavior version
-    enum class InstanceVersion : std::uint8_t {
-        // version 0: metadata persisted = [
-        //     METADATA_PROPERTY_KEY_COUNT,
-        // ]
-        VERSION_0 = 0,
-
-        // version 1: metadata persisted = [
-        //     METADATA_PROPERTY_KEY_COUNT,
-        //     METADATA_PROPERTY_STORAGE_USAGE_DATA,
-        // ]
-        VERSION_1 = 1,
-    };
-
-    [[nodiscard]] InstanceVersion GetVersion() const noexcept;
-
 private:
     class ScopedBatchLock;
-
-    // instance storage usage data
-    class StorageUsageData : public Jsonizable {
-    public:
-        StorageUsageData() = default;
-        ~StorageUsageData() override = default;
-
-        [[nodiscard]] std::uint64_t GetStorageUsage() const noexcept;
-        [[nodiscard]] std::uint64_t GetStorageUsageByType(const DataStorageType &type) const noexcept;
-
-        void Reset() noexcept;
-        void SetStorageUsageByType(const DataStorageType &type, std::uint64_t value) noexcept;
-
-        std::uint64_t AddStorageUsageByType(const DataStorageType &type, std::uint64_t value) noexcept;
-        std::uint64_t SubStorageUsageByType(const DataStorageType &type, std::uint64_t value) noexcept;
-
-        void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
-        bool FromRapidValue(const rapidjson::Value &rapid_value) override;
-
-        [[nodiscard]] std::string Serialize() const noexcept;
-        ErrorCode Deserialize(const std::string &str) noexcept;
-
-    private:
-        using array_t_ = std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DataStorageType::COUNT)>;
-        using size_t_ = array_t_::size_type;
-
-        // storage usage data array aggregated by storage type
-        // slot 0: DATA_STORAGE_TYPE_UNKNOWN **UNUSED**
-        // slot 1: DATA_STORAGE_TYPE_HF3FS usage data
-        // slot 2: DATA_STORAGE_TYPE_MOONCAKE usage data
-        // slot 3: DATA_STORAGE_TYPE_TAIR_MEMPOOL usage data
-        // slot 4: DATA_STORAGE_TYPE_NFS usage data
-        // slot 5: DATA_STORAGE_TYPE_VCNS_HF3FS **UNUSED** (merged into HF3FS)
-        // slot 6: DATA_STORAGE_TYPE_DUMMY usage data (testing only)
-        array_t_ storage_usage_by_type_;
-    };
 
 private:
     std::vector<BatchMetaData> MakeBatches(const KeyVector &keys,
@@ -216,11 +140,11 @@ private:
         int64_t delete_io_time_us = 0;
         int64_t index_serialize_time_us = 0;
         int64_t index_deserialize_time_us = 0;
-        int64_t put_key_count = 0;    // brand-new keys created by upsert
-        int64_t update_key_count = 0; // existing keys updated by upsert
-        int64_t delete_key_count = 0; // keys deleted by whole-key delete
+        int64_t lock_wait_time_us = 0; // accumulated time waiting for shard locks
+        int64_t put_key_count = 0;     // brand-new keys created by upsert
+        int64_t update_key_count = 0;  // existing keys updated by upsert
+        int64_t delete_key_count = 0;  // keys deleted by whole-key delete
     };
-
     // Returns {error_count, put_success_count}.
     std::pair<int32_t, int32_t> ExecuteRmwUpsert(const std::string &trace_id,
                                                  RequestContext *request_context,
@@ -229,14 +153,12 @@ private:
                                                  const KeyVector &all_keys,
                                                  RmwStats &stats,
                                                  Result &result) noexcept;
-
     // Returns {error_count, delete_success_count}.
     std::pair<int32_t, int32_t> ExecuteRmwDelete(const std::string &trace_id,
                                                  const BatchMetaData &delete_batch,
                                                  const KeyVector &all_keys,
                                                  RmwStats &stats,
                                                  Result &result) noexcept;
-
     void
     EmitRmwMetrics(MetricsCollector *metrics_collector, const RmwStats &stats, size_t total_key_count) const noexcept;
 
@@ -252,7 +174,6 @@ private:
     size_t batch_key_size_ = MetaIndexerConfig::kDefaultBatchKeySize;
     std::string instance_id_;
     StorageUsageData storage_usage_data_;
-    InstanceVersion version_ = InstanceVersion::VERSION_1;
 };
 
 } // namespace kv_cache_manager

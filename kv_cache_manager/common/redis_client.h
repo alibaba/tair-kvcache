@@ -44,6 +44,9 @@ public:
     std::vector<ErrorCode> ExistsFieldWithPrefix(const std::vector<std::string> &keys,
                                                  const std::string &field_prefix,
                                                  std::vector<bool> &out_exists_vec);
+    std::vector<ErrorCode> GetFieldNamesWithPrefix(const std::vector<std::string> &keys,
+                                                   const std::string &field_prefix,
+                                                   std::vector<std::vector<std::string>> &out_field_names_vec);
     ErrorCode Scan(const std::string &matching_prefix,
                    const std::string &cursor,
                    const int64_t limit,

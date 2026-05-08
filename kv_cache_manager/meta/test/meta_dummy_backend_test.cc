@@ -412,6 +412,40 @@ TEST_F(MetaDummyBackendTest, TestExistsFieldWithPrefix) {
     ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Close());
 }
 
+// Tombstone: a location field with empty value should not be treated as valid.
+TEST_F(MetaDummyBackendTest, TestTombstoneNotTreatedAsValidLocation) {
+    ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Init("test_instance_tombstone", meta_storage_backend_config_));
+    ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Open());
+
+    // Put key 1 with a real location and a tombstone (empty value) location.
+    ASSERT_EQ(
+        (std::vector<ErrorCode>{ErrorCode::EC_OK}),
+        meta_storage_backend_->Put({1}, {{{LOCATION_PREFIX + "real", "valid_data"}, {LOCATION_PREFIX + "tomb", ""}}}));
+
+    // ExistsFieldWithPrefix should return true (real location exists).
+    AssertExistsFieldWithPrefix(meta_storage_backend_.get(), {1}, LOCATION_PREFIX, {ErrorCode::EC_OK}, {true});
+
+    // GetFieldNamesWithPrefix should only return the non-tombstone field.
+    std::vector<std::vector<std::string>> field_names_vec;
+    auto ecs = meta_storage_backend_->GetFieldNamesWithPrefix({1}, LOCATION_PREFIX, field_names_vec);
+    ASSERT_EQ(ErrorCode::EC_OK, ecs[0]);
+    ASSERT_EQ(1u, field_names_vec[0].size());
+    EXPECT_EQ(LOCATION_PREFIX + "real", field_names_vec[0][0]);
+
+    // Now update the real location to empty (tombstone it).
+    ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK}),
+              meta_storage_backend_->UpdateFields({1}, {{{LOCATION_PREFIX + "real", ""}}}));
+
+    // Both locations are now tombstones — should report no valid locations.
+    AssertExistsFieldWithPrefix(meta_storage_backend_.get(), {1}, LOCATION_PREFIX, {ErrorCode::EC_OK}, {false});
+    field_names_vec.clear();
+    ecs = meta_storage_backend_->GetFieldNamesWithPrefix({1}, LOCATION_PREFIX, field_names_vec);
+    ASSERT_EQ(ErrorCode::EC_OK, ecs[0]);
+    EXPECT_TRUE(field_names_vec[0].empty());
+
+    ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Close());
+}
+
 TEST_F(MetaDummyBackendTest, TestGetPerKeyFields) {
     ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Init("test_instance_0", meta_storage_backend_config_));
     ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Open());

@@ -149,7 +149,10 @@ bool MetaLocalBackend::LookupFields(const std::string &key_str, FieldMap &out_fi
     }
     auto *existing = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
     existing->TouchAccessTime();
-    out_fields = existing->GetFields();
+    {
+        std::shared_lock lock(existing->GetMutex());
+        out_fields = existing->GetFields();
+    }
     cache_->Release(handle);
     return true;
 }
@@ -159,11 +162,13 @@ ErrorCode MetaLocalBackend::UpdateFieldsInPlace(const std::string &key_str, cons
     if (!handle) {
         return EC_NOENT;
     }
-    // Safe to modify fields_ in place: MetaIndexer lock on key
     auto *existing = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
     existing->TouchAccessTime();
-    for (const auto &[key, value] : updates) {
-        existing->GetMutableFields()[key] = value;
+    {
+        std::unique_lock lock(existing->GetMutex());
+        for (const auto &[key, value] : updates) {
+            existing->GetMutableFields()[key] = value;
+        }
     }
     cache_->Release(handle);
     return EC_OK;
@@ -201,8 +206,11 @@ ErrorCode MetaLocalBackend::DeleteFieldsForOneKey(KeyType key, const std::vector
     }
     auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
     item->TouchAccessTime();
-    for (const auto &field_name : field_names) {
-        item->GetMutableFields().erase(field_name);
+    {
+        std::unique_lock lock(item->GetMutex());
+        for (const auto &field_name : field_names) {
+            item->GetMutableFields().erase(field_name);
+        }
     }
     cache_->Release(handle);
     return EC_OK;
@@ -221,15 +229,18 @@ MetaLocalBackend::GetForOneKey(KeyType key, const std::vector<std::string> &fiel
     auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
     int64_t stored_time = item->GetLastAccessTime();
     item->TouchAccessTime();
-    const auto &fields = item->GetFields();
-    for (const auto &field_name : field_names) {
-        if (field_name == PROPERTY_LRU_TIME) {
-            out_field_map[PROPERTY_LRU_TIME] = std::to_string(stored_time);
-            continue;
-        }
-        auto it = fields.find(field_name);
-        if (it != fields.end()) {
-            out_field_map[field_name] = it->second;
+    {
+        std::shared_lock lock(item->GetMutex());
+        const auto &fields = item->GetFields();
+        for (const auto &field_name : field_names) {
+            if (field_name == PROPERTY_LRU_TIME) {
+                out_field_map[PROPERTY_LRU_TIME] = std::to_string(stored_time);
+                continue;
+            }
+            auto it = fields.find(field_name);
+            if (it != fields.end()) {
+                out_field_map[field_name] = it->second;
+            }
         }
     }
     cache_->Release(handle);
@@ -397,7 +408,10 @@ std::vector<ErrorCode> MetaLocalBackend::GetAllFields(const KeyTypeVec &keys, Fi
         auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
         int64_t stored_time = item->GetLastAccessTime();
         item->TouchAccessTime();
-        out_field_maps[i] = item->GetFields();
+        {
+            std::shared_lock lock(item->GetMutex());
+            out_field_maps[i] = item->GetFields();
+        }
         out_field_maps[i][PROPERTY_LRU_TIME] = std::to_string(stored_time);
         cache_->Release(handle);
         results[i] = EC_OK;
@@ -444,11 +458,57 @@ std::vector<ErrorCode> MetaLocalBackend::ExistsFieldWithPrefix(const KeyTypeVec 
 
         auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
         item->TouchAccessTime();
-        const auto &fields = item->GetFields();
-        auto it = fields.lower_bound(field_prefix);
-        if (it != fields.end() && it->first.size() >= field_prefix.size() &&
-            it->first.compare(0, field_prefix.size(), field_prefix) == 0) {
-            out_exists_vec[i] = true;
+        {
+            std::shared_lock lock(item->GetMutex());
+            const auto &fields = item->GetFields();
+            for (auto it = fields.lower_bound(field_prefix); it != fields.end(); ++it) {
+                if (it->first.size() < field_prefix.size() ||
+                    it->first.compare(0, field_prefix.size(), field_prefix) != 0) {
+                    break;
+                }
+                // Skip tombstones (empty value) — they are not valid locations.
+                if (!it->second.empty()) {
+                    out_exists_vec[i] = true;
+                    break;
+                }
+            }
+        }
+        cache_->Release(handle);
+    }
+
+    return results;
+}
+
+std::vector<ErrorCode>
+MetaLocalBackend::GetFieldNamesWithPrefix(const KeyTypeVec &keys,
+                                          const std::string &field_prefix,
+                                          std::vector<std::vector<std::string>> &out_field_names_vec) noexcept {
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    out_field_names_vec.resize(keys.size());
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        std::string key_str = std::to_string(keys[i]);
+        Cache::Handle *handle = cache_->Lookup(key_str);
+        if (!handle) {
+            results[i] = EC_NOENT;
+            continue;
+        }
+
+        auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
+        item->TouchAccessTime();
+        {
+            std::shared_lock lock(item->GetMutex());
+            const auto &fields = item->GetFields();
+            for (auto it = fields.lower_bound(field_prefix); it != fields.end(); ++it) {
+                if (it->first.size() < field_prefix.size() ||
+                    it->first.compare(0, field_prefix.size(), field_prefix) != 0) {
+                    break;
+                }
+                // Skip tombstones (empty value) — they are not valid locations.
+                if (!it->second.empty()) {
+                    out_field_names_vec[i].emplace_back(it->first);
+                }
+            }
         }
         cache_->Release(handle);
     }

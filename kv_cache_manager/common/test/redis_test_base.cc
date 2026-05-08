@@ -7,7 +7,10 @@ RedisTestBase::ReplyUPtr RedisTestBase::MakeFakeReply(int type, const std::strin
     redisReply *r = (redisReply *)malloc(sizeof(redisReply));
     memset(r, 0, sizeof(redisReply));
     r->type = type;
-    if (!str.empty()) {
+    // For string-typed replies, always set r->str (even when empty) so that
+    // callers converting to std::string never dereference nullptr. Only skip
+    // setting str for NIL replies where the absence of data is intentional.
+    if (type == REDIS_REPLY_STRING || !str.empty()) {
         r->str = strdup(str.c_str());
         r->len = str.size();
     }

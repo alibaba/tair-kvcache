@@ -413,9 +413,36 @@ std::vector<ErrorCode> MetaDummyBackend::ExistsFieldWithPrefix(const KeyTypeVec 
         const bool found = table_.FindAndApply(keys[i], [&](const FieldMap &field_table) {
             for (const auto &[field_name, field_value] : field_table) {
                 if (field_name.size() >= field_prefix.size() &&
-                    field_name.compare(0, field_prefix.size(), field_prefix) == 0) {
+                    field_name.compare(0, field_prefix.size(), field_prefix) == 0 && !field_value.empty()) {
+                    // Skip tombstones (empty value) — they are not valid locations.
                     out_exists_vec[i] = true;
                     return;
+                }
+            }
+        });
+        if (!found) {
+            ec_vec[i] = ErrorCode::EC_NOENT;
+        }
+    }
+    return ec_vec;
+}
+
+std::vector<ErrorCode>
+MetaDummyBackend::GetFieldNamesWithPrefix(const KeyTypeVec &keys,
+                                          const std::string &field_prefix,
+                                          std::vector<std::vector<std::string>> &out_field_names_vec) noexcept {
+    out_field_names_vec.resize(keys.size());
+    std::vector<ErrorCode> ec_vec(keys.size(), ErrorCode::EC_OK);
+    for (std::size_t i = 0; i != keys.size(); ++i) {
+        const bool found = table_.FindAndApply(keys[i], [&](const FieldMap &field_table) {
+            for (auto it = field_table.lower_bound(field_prefix); it != field_table.end(); ++it) {
+                if (it->first.size() < field_prefix.size() ||
+                    it->first.compare(0, field_prefix.size(), field_prefix) != 0) {
+                    break;
+                }
+                // Skip tombstones (empty value) — they are not valid locations.
+                if (!it->second.empty()) {
+                    out_field_names_vec[i].emplace_back(it->first);
                 }
             }
         });

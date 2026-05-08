@@ -16,6 +16,8 @@
 namespace kv_cache_manager {
 
 namespace {
+constexpr int64_t kRecoverScanBatchSize = 1000;
+constexpr int kRecoverMaxConsecutiveFailures = 3;
 
 void SetIndexSerializeTimeUs(RequestContext *request_context, int64_t delta_us) noexcept {
     if (request_context == nullptr || delta_us <= 0) {
@@ -40,20 +42,6 @@ void SetIndexDeserializeTimeUs(RequestContext *request_context, int64_t delta_us
     KVCM_METRICS_COLLECTOR_SET_METRICS(
         service_metrics_collector, meta_searcher, index_deserialize_time_us, static_cast<double>(delta_us));
 }
-
-} // namespace
-
-namespace {
-
-// Page size used by the background recover task when scanning the persistent
-// backend. Kept identical to MetaCachedBackend to preserve operational
-// characteristics.
-constexpr int64_t kRecoverScanBatchSize = 1000;
-// Hard ceiling on consecutive scan failures before we abandon recover and
-// transition to Running. Without this guard a perpetually unhealthy
-// persistent backend could pin the manager in Recover indefinitely.
-constexpr int kRecoverMaxConsecutiveFailures = 3;
-
 } // namespace
 
 MetaStorageBackendManager::~MetaStorageBackendManager() {
@@ -63,10 +51,6 @@ MetaStorageBackendManager::~MetaStorageBackendManager() {
         recover_thread_.join();
     }
 }
-
-// ---------------------------------------------------------------------------
-// Lifecycle
-// ---------------------------------------------------------------------------
 
 ErrorCode MetaStorageBackendManager::Init(const std::string &instance_id,
                                           const std::shared_ptr<MetaStorageBackendConfig> &config) noexcept {
@@ -80,14 +64,23 @@ ErrorCode MetaStorageBackendManager::Init(const std::string &instance_id,
     }
     instance_id_ = instance_id;
 
-    // Parse persistent_type / cache_type from the storage URI. If neither
-    // param is present we fall back to single-backend mode and build the
-    // backend directly from `config->GetStorageType()`. If at least one URI
-    // param is present we enter dual-backend mode with the missing side
-    // defaulting to redis (persistent) / local (cache).
+    const std::string &storage_uri = config->GetStorageUri();
+    if (config->GetStorageType() != META_CACHED_BACKEND_TYPE_STR) {
+        // Single-backend mode: one backend serves every read/write directly.
+        persistent_backend_ = MetaStorageBackendFactory::CreateAndInitStorageBackend(instance_id_, config);
+        if (!persistent_backend_) {
+            KVCM_LOG_ERROR("fail to create persistent backend uri[%s]", storage_uri.c_str());
+            return EC_ERROR;
+        }
+        KVCM_LOG_INFO("meta storage backend manager init ok in single-backend mode, instance[%s] type[%s]",
+                      instance_id_.c_str(),
+                      config->GetStorageType().c_str());
+        return EC_OK;
+    }
+
+    assert((config->GetStorageType() == META_CACHED_BACKEND_TYPE_STR));
     std::string persistent_type;
     std::string cache_type;
-    const std::string &storage_uri = config->GetStorageUri();
     if (!storage_uri.empty()) {
         StandardUri uri = StandardUri::FromUri(storage_uri);
         if (!uri.Valid()) {
@@ -97,51 +90,24 @@ ErrorCode MetaStorageBackendManager::Init(const std::string &instance_id,
         persistent_type = uri.GetParam("persistent_type");
         cache_type = uri.GetParam("cache_type");
     }
-    if (config->GetStorageType() == META_CACHED_BACKEND_TYPE_STR) {
-        // default to redis / local for cached type
-        if (persistent_type.empty()) {
-            persistent_type = META_REDIS_BACKEND_TYPE_STR;
-        }
-        if (cache_type.empty()) {
-            cache_type = META_LOCAL_BACKEND_TYPE_STR;
-        }
-    }
-
-    const bool single_backend_mode = persistent_type.empty() && cache_type.empty();
-    if (single_backend_mode) {
-        // Single-backend mode: one backend serves every read/write directly.
-        persistent_backend_ = MetaStorageBackendFactory::CreateAndInitStorageBackend(instance_id_, config);
-        if (!persistent_backend_) {
-            return EC_ERROR;
-        }
-        KVCM_LOG_INFO("meta storage backend manager init ok in single-backend mode, instance[%s] type[%s]",
-                      instance_id_.c_str(),
-                      config->GetStorageType().c_str());
-        return EC_OK;
-    }
-
-    // Dual-backend mode: fill in defaults for whichever side the URI omitted.
-    if (persistent_type.empty()) {
-        persistent_type = META_REDIS_BACKEND_TYPE_STR;
-    }
-    if (cache_type.empty()) {
-        cache_type = META_LOCAL_BACKEND_TYPE_STR;
-    }
+    // default to redis / local
+    persistent_type = persistent_type.empty() ? META_REDIS_BACKEND_TYPE_STR : persistent_type;
+    cache_type = cache_type.empty() ? META_LOCAL_BACKEND_TYPE_STR : cache_type;
 
     auto persistent_config = std::make_shared<MetaStorageBackendConfig>(persistent_type);
     persistent_config->SetStorageUri(storage_uri);
     persistent_backend_ = MetaStorageBackendFactory::CreatePersistentBackend(instance_id_, persistent_config);
     if (!persistent_backend_) {
+        KVCM_LOG_ERROR("fail to create persistent backend uri[%s]", storage_uri.c_str());
         return EC_ERROR;
     }
-
     auto cache_config = std::make_shared<MetaStorageBackendConfig>(cache_type);
     cache_config->SetStorageUri(storage_uri);
-    local_backend_ = MetaStorageBackendFactory::CreateLocalBackend(instance_id_, cache_config);
-    if (!local_backend_) {
+    cache_backend_ = MetaStorageBackendFactory::CreateCacheBackend(instance_id_, cache_config);
+    if (!cache_backend_) {
+        KVCM_LOG_ERROR("fail to create cache backend uri[%s]", storage_uri.c_str());
         return EC_ERROR;
     }
-
     KVCM_LOG_INFO("meta storage backend manager init ok, instance[%s] cache[%s] persistent[%s]",
                   instance_id_.c_str(),
                   cache_type.c_str(),
@@ -150,6 +116,11 @@ ErrorCode MetaStorageBackendManager::Init(const std::string &instance_id,
 }
 
 ErrorCode MetaStorageBackendManager::Open() noexcept {
+    if (!persistent_backend_) {
+        KVCM_LOG_ERROR("persistent backend not inited! instance[%s]", instance_id_.c_str());
+        return EC_ERROR;
+    }
+
     ErrorCode ec = persistent_backend_->Open();
     if (ec != EC_OK) {
         KVCM_LOG_ERROR("open persistent failed, instance[%s] ec[%d]", instance_id_.c_str(), ec);
@@ -157,50 +128,40 @@ ErrorCode MetaStorageBackendManager::Open() noexcept {
     }
     is_closed_.store(false, std::memory_order_release);
 
-    if (!local_backend_) {
-        // Single-backend mode: nothing to back-fill, so we are immediately in
-        // the steady state and read/write paths can short-circuit to
-        // persistent without consulting recover_state_.
+    if (!cache_backend_) {
         recover_state_.store(RecoverState::kRunning, std::memory_order_release);
         KVCM_LOG_INFO("meta storage backend manager opened in single-backend mode, instance[%s]", instance_id_.c_str());
         return EC_OK;
     }
 
-    ec = local_backend_->Open();
+    ec = cache_backend_->Open();
     if (ec != EC_OK) {
-        KVCM_LOG_ERROR("open local failed, instance[%s] ec[%d]", instance_id_.c_str(), ec);
+        KVCM_LOG_ERROR("open cache failed, instance[%s] ec[%d]", instance_id_.c_str(), ec);
         return ec;
     }
-
-    // Dual-backend mode: kick off async recover. The thread may still be
-    // running when Close() is invoked - is_closed_ provides cooperative
-    // cancellation.
     recover_state_.store(RecoverState::kRecover, std::memory_order_release);
     recover_thread_ = std::thread(&MetaStorageBackendManager::AsyncRecoverTask, this);
-
     KVCM_LOG_INFO("meta storage backend manager opened, instance[%s], async recover started", instance_id_.c_str());
     return EC_OK;
 }
 
 ErrorCode MetaStorageBackendManager::Close() noexcept {
-    // Signal the recover thread first so it can exit early instead of
-    // performing more work that the caller is about to throw away.
     is_closed_.store(true, std::memory_order_release);
     if (recover_thread_.joinable()) {
         recover_thread_.join();
     }
 
-    ErrorCode local_ec = EC_OK;
+    ErrorCode cache_ec = EC_OK;
     ErrorCode persistent_ec = EC_OK;
-    if (local_backend_) {
-        local_ec = local_backend_->Close();
+    if (cache_backend_) {
+        cache_ec = cache_backend_->Close();
     }
     if (persistent_backend_) {
         persistent_ec = persistent_backend_->Close();
     }
-    if (local_ec != EC_OK) {
-        KVCM_LOG_ERROR("close local failed, instance[%s] ec[%d]", instance_id_.c_str(), local_ec);
-        return local_ec;
+    if (cache_ec != EC_OK) {
+        KVCM_LOG_ERROR("close cache failed, instance[%s] ec[%d]", instance_id_.c_str(), cache_ec);
+        return cache_ec;
     }
     if (persistent_ec != EC_OK) {
         KVCM_LOG_ERROR("close persistent failed, instance[%s] ec[%d]", instance_id_.c_str(), persistent_ec);
@@ -209,10 +170,6 @@ ErrorCode MetaStorageBackendManager::Close() noexcept {
     KVCM_LOG_INFO("meta storage backend manager closed, instance[%s]", instance_id_.c_str());
     return EC_OK;
 }
-
-// ---------------------------------------------------------------------------
-// Async recover (mirrors MetaCachedBackend::AsyncRecoverTask)
-// ---------------------------------------------------------------------------
 
 void MetaStorageBackendManager::AsyncRecoverTask() noexcept {
     KVCM_LOG_INFO("meta storage backend manager async recover started, instance[%s]", instance_id_.c_str());
@@ -257,7 +214,7 @@ void MetaStorageBackendManager::AsyncRecoverTask() noexcept {
                     KVCM_LOG_WARN("async recover key[%ld] get failed ec[%d]", scanned_keys[i], get_error_codes[i]);
                 }
             }
-            total_backfilled_keys += BackfillKeysToLocal(scanned_keys, field_maps, get_error_codes);
+            total_backfilled_keys += BackfillKeysToCache(scanned_keys, field_maps, get_error_codes);
         }
         cursor = next_cursor;
     } while (cursor != SCAN_BASE_CURSOR);
@@ -273,24 +230,17 @@ void MetaStorageBackendManager::AsyncRecoverTask() noexcept {
     }
     recover_state_.store(RecoverState::kRunning, std::memory_order_release);
     {
-        // Tombstones are only meaningful while we may still be back-filling;
-        // once we are Running the in-memory backend is the source of truth
-        // for reads, so the set can be reclaimed.
         std::lock_guard<std::mutex> lock(deleted_keys_mutex_);
         deleted_keys_.clear();
     }
 }
 
-void MetaStorageBackendManager::EnsureKeyInLocal(const KeyTypeVec &keys) noexcept {
+void MetaStorageBackendManager::EnsureKeyInCache(const KeyTypeVec &keys) noexcept {
     if (keys.empty()) {
         return;
     }
-    // Identify the keys that local has not seen yet. EC_OK + !exists and
-    // EC_NOENT both indicate "not present"; any other error is treated as
-    // missing too so we err on the side of hydrating (worst case is one extra
-    // Put that local will later coalesce).
     std::vector<bool> exists_vec;
-    std::vector<ErrorCode> exists_results = local_backend_->Exists(keys, exists_vec);
+    std::vector<ErrorCode> exists_results = cache_backend_->Exists(keys, exists_vec);
     KeyTypeVec missing_keys;
     for (size_t i = 0; i < keys.size(); ++i) {
         if (exists_results[i] != EC_OK || !exists_vec[i]) {
@@ -301,25 +251,19 @@ void MetaStorageBackendManager::EnsureKeyInLocal(const KeyTypeVec &keys) noexcep
         return;
     }
 
-    // Pull the full field set from persistent and Put it (not PutIfAbsent)
-    // into local. The conditional Put uses the per-key persistent error code
-    // as the precondition so keys missing from persistent are skipped
-    // naturally.
     FieldMapVec field_maps;
     std::vector<ErrorCode> get_results = persistent_backend_->GetAllFields(missing_keys, field_maps);
-    std::vector<ErrorCode> put_results = local_backend_->Put(missing_keys, field_maps, get_results);
+    std::vector<ErrorCode> put_results = cache_backend_->Put(missing_keys, field_maps, get_results);
     for (size_t i = 0; i < missing_keys.size(); ++i) {
         if (put_results[i] != EC_OK && put_results[i] != EC_NOENT) {
-            KVCM_LOG_WARN("ensure key[%ld] in local failed, ec[%d]", missing_keys[i], put_results[i]);
+            KVCM_LOG_WARN("ensure key[%ld] in cache failed, ec[%d]", missing_keys[i], put_results[i]);
         }
     }
 }
 
-int64_t MetaStorageBackendManager::BackfillKeysToLocal(const KeyTypeVec &keys,
+int64_t MetaStorageBackendManager::BackfillKeysToCache(const KeyTypeVec &keys,
                                                        const FieldMapVec &field_maps,
                                                        const std::vector<ErrorCode> &get_error_codes) noexcept {
-    // Atomically check the tombstone set and PutIfAbsent so that a concurrent
-    // Delete cannot slip a key out from under us between the two operations.
     std::lock_guard<std::mutex> lock(deleted_keys_mutex_);
 
     assert(get_error_codes.size() == keys.size());
@@ -337,7 +281,7 @@ int64_t MetaStorageBackendManager::BackfillKeysToLocal(const KeyTypeVec &keys,
         return 0;
     }
 
-    std::vector<ErrorCode> put_results = local_backend_->PutIfAbsent(keys, field_maps, previous_error_codes);
+    std::vector<ErrorCode> put_results = cache_backend_->PutIfAbsent(keys, field_maps, previous_error_codes);
     int64_t backfilled_count = 0;
     for (size_t i = 0; i < keys.size(); ++i) {
         if (put_results[i] == EC_OK) {
@@ -349,10 +293,6 @@ int64_t MetaStorageBackendManager::BackfillKeysToLocal(const KeyTypeVec &keys,
     return backfilled_count;
 }
 
-// ---------------------------------------------------------------------------
-// Write APIs
-// ---------------------------------------------------------------------------
-
 std::string MetaStorageBackendManager::MakeLocationFieldName(const std::string &location_id) noexcept {
     return LOCATION_PREFIX + location_id;
 }
@@ -361,9 +301,7 @@ PropertyMapVector &MetaStorageBackendManager::BuildEffectiveFieldMaps(RequestCon
                                                                       BatchMetaData &batch) const noexcept {
     const size_t key_count = batch.batch_keys.size();
 
-    // Normalise batch_properties so it is always parallel to batch_keys. When
-    // the caller only supplied locations (batch_properties.empty()), grow it
-    // here to hold the upcoming location fields.
+    // When the caller only supplied locations, grow it here to hold the upcoming location fields.
     if (batch.batch_properties.empty()) {
         batch.batch_properties.resize(key_count);
     }
@@ -372,11 +310,8 @@ PropertyMapVector &MetaStorageBackendManager::BuildEffectiveFieldMaps(RequestCon
     if (batch.batch_locations.empty()) {
         return batch.batch_properties;
     }
-    assert(batch.batch_locations.size() == key_count);
 
-    // Time only the serialization hot loop; the surrounding bookkeeping above
-    // is cheap and skewing it onto the metric would dilute the signal callers
-    // care about (JSON encoding cost of CacheLocation).
+    assert(batch.batch_locations.size() == key_count);
     const int64_t begin_us = TimestampUtil::GetCurrentTimeUs();
     for (size_t i = 0; i < key_count; ++i) {
         for (const auto &loc_kv : batch.batch_locations[i]) {
@@ -391,14 +326,11 @@ PropertyMapVector &MetaStorageBackendManager::BuildEffectiveFieldMaps(RequestCon
 std::vector<ErrorCode> MetaStorageBackendManager::Put(RequestContext *request_context, BatchMetaData &batch) noexcept {
     const auto &keys = batch.batch_keys;
     PropertyMapVector &effective = BuildEffectiveFieldMaps(request_context, batch);
-
-    // Persistent first; local write is conditional on persistent results so a
-    // persistent failure is never retried locally.
     std::vector<ErrorCode> persistent_results = persistent_backend_->Put(keys, effective);
-    if (!local_backend_) {
+    if (!cache_backend_) {
         return persistent_results;
     }
-    return local_backend_->Put(keys, effective, persistent_results);
+    return cache_backend_->Put(keys, effective, persistent_results);
 }
 
 std::vector<ErrorCode> MetaStorageBackendManager::UpdateFields(RequestContext *request_context,
@@ -406,18 +338,17 @@ std::vector<ErrorCode> MetaStorageBackendManager::UpdateFields(RequestContext *r
     const auto &keys = batch.batch_keys;
     PropertyMapVector &effective = BuildEffectiveFieldMaps(request_context, batch);
 
-    // Partial-update during Recover: hydrate local from persistent first so
+    // Partial-update during Recover: hydrate cache from persistent first so
     // the conditional mirror write below has the full pre-restart field set
     // to update against (and async backfill cannot later overwrite us).
-    if (local_backend_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRecover) {
-        EnsureKeyInLocal(keys);
+    if (cache_backend_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRecover) {
+        EnsureKeyInCache(keys);
     }
-
     std::vector<ErrorCode> persistent_results = persistent_backend_->UpdateFields(keys, effective);
-    if (!local_backend_) {
+    if (!cache_backend_) {
         return persistent_results;
     }
-    return local_backend_->UpdateFields(keys, effective, persistent_results);
+    return cache_backend_->UpdateFields(keys, effective, persistent_results);
 }
 
 std::vector<ErrorCode> MetaStorageBackendManager::Upsert(RequestContext *request_context,
@@ -427,20 +358,19 @@ std::vector<ErrorCode> MetaStorageBackendManager::Upsert(RequestContext *request
 
     // See UpdateFields(): Upsert may also touch only a subset of fields, so
     // the same Recover-time hydration is needed.
-    if (local_backend_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRecover) {
-        EnsureKeyInLocal(keys);
+    if (cache_backend_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRecover) {
+        EnsureKeyInCache(keys);
     }
-
     std::vector<ErrorCode> persistent_results = persistent_backend_->Upsert(keys, effective);
-    if (!local_backend_) {
+    if (!cache_backend_) {
         return persistent_results;
     }
-    return local_backend_->Upsert(keys, effective, persistent_results);
+    return cache_backend_->Upsert(keys, effective, persistent_results);
 }
 
 std::vector<ErrorCode> MetaStorageBackendManager::Delete(const KeyVector &keys) noexcept {
     std::vector<ErrorCode> persistent_results = persistent_backend_->Delete(keys);
-    if (!local_backend_) {
+    if (!cache_backend_) {
         return persistent_results;
     }
     if (recover_state_.load(std::memory_order_acquire) == RecoverState::kRecover) {
@@ -450,7 +380,7 @@ std::vector<ErrorCode> MetaStorageBackendManager::Delete(const KeyVector &keys) 
             deleted_keys_.insert(key);
         }
     }
-    return local_backend_->Delete(keys, persistent_results);
+    return cache_backend_->Delete(keys, persistent_results);
 }
 
 std::vector<ErrorCode> MetaStorageBackendManager::Delete(const KeyVector &keys,
@@ -461,6 +391,13 @@ std::vector<ErrorCode> MetaStorageBackendManager::Delete(const KeyVector &keys,
         return {};
     }
     assert(location_ids.size() == keys.size());
+
+    // Partial-delete during Recover: hydrate cache from persistent first so
+    // the conditional mirror write below has the full pre-restart field set
+    // to delete against (and async backfill cannot later overwrite us).
+    if (cache_backend_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRecover) {
+        EnsureKeyInCache(keys);
+    }
 
     std::vector<std::vector<std::string>> field_names_vec(keys.size());
     bool any_field_to_delete = false;
@@ -477,10 +414,10 @@ std::vector<ErrorCode> MetaStorageBackendManager::Delete(const KeyVector &keys,
 
     std::vector<ErrorCode> persistent_results = persistent_backend_->DeleteFields(keys, field_names_vec);
     std::vector<ErrorCode> results;
-    if (!local_backend_) {
-        results = persistent_results;
+    if (!cache_backend_) {
+        results = std::move(persistent_results);
     } else {
-        results = local_backend_->DeleteFields(keys, field_names_vec, persistent_results);
+        results = cache_backend_->DeleteFields(keys, field_names_vec, persistent_results);
     }
 
     out_reclaimed_count = MaybeReclaimEmptyKeys(keys, results);
@@ -489,35 +426,35 @@ std::vector<ErrorCode> MetaStorageBackendManager::Delete(const KeyVector &keys,
 
 int32_t MetaStorageBackendManager::MaybeReclaimEmptyKeys(const KeyVector &keys,
                                                          const std::vector<ErrorCode> &delete_results) noexcept {
-    KeyVector candidates;
+    KeyVector candidate_keys;
     for (size_t i = 0; i < keys.size(); ++i) {
         if (delete_results[i] == EC_OK) {
-            candidates.push_back(keys[i]);
+            candidate_keys.push_back(keys[i]);
         }
     }
-    if (candidates.empty()) {
+    if (candidate_keys.empty()) {
         return 0;
     }
 
     std::vector<bool> has_locations;
     std::vector<ErrorCode> exists_ecs;
-    if (local_backend_) {
-        exists_ecs = local_backend_->ExistsFieldWithPrefix(candidates, LOCATION_PREFIX, has_locations);
+    if (cache_backend_) {
+        exists_ecs = cache_backend_->ExistsFieldWithPrefix(candidate_keys, LOCATION_PREFIX, has_locations);
     } else {
-        exists_ecs = persistent_backend_->ExistsFieldWithPrefix(candidates, LOCATION_PREFIX, has_locations);
+        exists_ecs = persistent_backend_->ExistsFieldWithPrefix(candidate_keys, LOCATION_PREFIX, has_locations);
     }
 
-    KeyVector empty_keys;
-    for (size_t i = 0; i < candidates.size(); ++i) {
+    KeyVector reclaimed_keys;
+    for (size_t i = 0; i < candidate_keys.size(); ++i) {
         if (exists_ecs[i] == EC_OK && !has_locations[i]) {
-            empty_keys.push_back(candidates[i]);
+            reclaimed_keys.push_back(candidate_keys[i]);
         }
     }
-    if (empty_keys.empty()) {
+    if (reclaimed_keys.empty()) {
         return 0;
     }
 
-    std::vector<ErrorCode> whole_ecs = Delete(empty_keys);
+    std::vector<ErrorCode> whole_ecs = Delete(reclaimed_keys);
     int32_t reclaimed = 0;
     for (const ErrorCode ec : whole_ecs) {
         if (ec == EC_OK || ec == EC_NOENT) {
@@ -527,23 +464,18 @@ int32_t MetaStorageBackendManager::MaybeReclaimEmptyKeys(const KeyVector &keys,
     return reclaimed;
 }
 
-// ---------------------------------------------------------------------------
-// Read APIs
-// ---------------------------------------------------------------------------
-
 std::vector<ErrorCode> MetaStorageBackendManager::Get(const KeyVector &keys,
                                                       const std::vector<std::string> &field_names,
                                                       FieldMapVec &out_field_maps) noexcept {
-    if (!local_backend_) {
+    if (!cache_backend_) {
         return persistent_backend_->Get(keys, field_names, out_field_maps);
     }
-    std::vector<ErrorCode> results = local_backend_->Get(keys, field_names, out_field_maps);
+
+    std::vector<ErrorCode> results = cache_backend_->Get(keys, field_names, out_field_maps);
     if (recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning) {
         return results;
     }
 
-    // In Recover, fall back to persistent for keys missing from local so that
-    // pre-restart data is still observable while backfill is in progress.
     KeyTypeVec missing_keys;
     std::vector<size_t> missing_indices;
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -559,6 +491,103 @@ std::vector<ErrorCode> MetaStorageBackendManager::Get(const KeyVector &keys,
     FieldMapVec persistent_field_maps;
     std::vector<ErrorCode> persistent_results =
         persistent_backend_->Get(missing_keys, field_names, persistent_field_maps);
+    if (missing_keys.size() != persistent_field_maps.size()) {
+        KVCM_LOG_ERROR("persistent_field_maps size[%lu] mismatch missing_keys's[%lu]",
+                       persistent_field_maps.size(),
+                       missing_keys.size());
+        for (size_t i = 0; i < missing_keys.size(); ++i) {
+            results[missing_indices[i]] = EC_ERROR;
+        }
+        return results;
+    }
+    for (size_t i = 0; i < missing_keys.size(); ++i) {
+        const size_t original_idx = missing_indices[i];
+        results[original_idx] = persistent_results[i];
+        out_field_maps[original_idx] = std::move(persistent_field_maps[i]);
+    }
+    return results;
+}
+
+std::vector<ErrorCode> MetaStorageBackendManager::Get(const KeyVector &keys,
+                                                      const std::vector<std::vector<std::string>> &field_names_vec,
+                                                      FieldMapVec &out_field_maps) noexcept {
+    if (!cache_backend_) {
+        return persistent_backend_->Get(keys, field_names_vec, out_field_maps);
+    }
+
+    std::vector<ErrorCode> results = cache_backend_->Get(keys, field_names_vec, out_field_maps);
+    if (recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning) {
+        return results;
+    }
+
+    KeyTypeVec missing_keys;
+    std::vector<std::vector<std::string>> missing_field_names;
+    std::vector<size_t> missing_indices;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if ((results[i] == EC_OK && out_field_maps[i].empty()) || results[i] == EC_NOENT) {
+            missing_keys.push_back(keys[i]);
+            missing_field_names.push_back(field_names_vec[i]);
+            missing_indices.push_back(i);
+        }
+    }
+    if (missing_keys.empty()) {
+        return results;
+    }
+
+    FieldMapVec persistent_field_maps;
+    std::vector<ErrorCode> persistent_results =
+        persistent_backend_->Get(missing_keys, missing_field_names, persistent_field_maps);
+    if (missing_keys.size() != persistent_field_maps.size()) {
+        KVCM_LOG_ERROR("persistent_field_maps size[%lu] mismatch missing_keys's[%lu]",
+                       persistent_field_maps.size(),
+                       missing_keys.size());
+        for (size_t i = 0; i < missing_keys.size(); ++i) {
+            results[missing_indices[i]] = EC_ERROR;
+        }
+        return results;
+    }
+    for (size_t i = 0; i < missing_keys.size(); ++i) {
+        const size_t original_idx = missing_indices[i];
+        results[original_idx] = persistent_results[i];
+        out_field_maps[original_idx] = std::move(persistent_field_maps[i]);
+    }
+    return results;
+}
+
+std::vector<ErrorCode> MetaStorageBackendManager::GetAllFields(const KeyVector &keys,
+                                                               FieldMapVec &out_field_maps) noexcept {
+    if (!cache_backend_) {
+        return persistent_backend_->GetAllFields(keys, out_field_maps);
+    }
+
+    std::vector<ErrorCode> results = cache_backend_->GetAllFields(keys, out_field_maps);
+    if (recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning) {
+        return results;
+    }
+
+    KeyTypeVec missing_keys;
+    std::vector<size_t> missing_indices;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if ((results[i] == EC_OK && out_field_maps[i].empty()) || results[i] == EC_NOENT) {
+            missing_keys.push_back(keys[i]);
+            missing_indices.push_back(i);
+        }
+    }
+    if (missing_keys.empty()) {
+        return results;
+    }
+
+    FieldMapVec persistent_field_maps;
+    std::vector<ErrorCode> persistent_results = persistent_backend_->GetAllFields(missing_keys, persistent_field_maps);
+    if (missing_keys.size() != persistent_field_maps.size()) {
+        KVCM_LOG_ERROR("persistent_field_maps size[%lu] mismatch missing_keys's[%lu]",
+                       persistent_field_maps.size(),
+                       missing_keys.size());
+        for (size_t i = 0; i < missing_keys.size(); ++i) {
+            results[missing_indices[i]] = EC_ERROR;
+        }
+        return results;
+    }
     for (size_t i = 0; i < missing_keys.size(); ++i) {
         const size_t original_idx = missing_indices[i];
         results[original_idx] = persistent_results[i];
@@ -575,9 +604,6 @@ std::vector<ErrorCode> MetaStorageBackendManager::GetLocations(RequestContext *r
 
     out_location_maps.clear();
     out_location_maps.resize(keys.size());
-    // Time only the JSON decode loop. The GetAllFields IO above is already
-    // covered by other backend/indexer metrics and mixing it in here would
-    // conflate transport cost with pure deserialization cost.
     const int64_t begin_us = TimestampUtil::GetCurrentTimeUs();
     for (size_t i = 0; i < keys.size(); ++i) {
         if (results[i] != EC_OK) {
@@ -586,15 +612,15 @@ std::vector<ErrorCode> MetaStorageBackendManager::GetLocations(RequestContext *r
         for (const auto &field_kv : field_maps[i]) {
             const std::string &field_name = field_kv.first;
             const std::string &field_value = field_kv.second;
-            // Field name must start with LOCATION_PREFIX; anything else is an
-            // unrelated property that should not be deserialized as a location.
             if (field_name.compare(0, LOCATION_PREFIX.size(), LOCATION_PREFIX) != 0 || field_value.empty()) {
                 continue;
             }
             CacheLocation location;
             if (!location.FromJsonString(field_value)) {
-                KVCM_LOG_WARN("deserialize CacheLocation failed, key[%ld] field[%s]", keys[i], field_name.c_str());
-                continue;
+                KVCM_LOG_ERROR("deserialize CacheLocation failed, key[%ld] field[%s]", keys[i], field_name.c_str());
+                results[i] = EC_CORRUPTION;
+                out_location_maps[i].clear();
+                break;
             }
             out_location_maps[i].emplace(location.id(), std::move(location));
         }
@@ -608,7 +634,6 @@ std::vector<std::vector<ErrorCode>> MetaStorageBackendManager::GetLocations(Requ
                                                                             const LocationIdsPerKey &location_ids,
                                                                             LocationsPerKey &out_locations) noexcept {
     assert(keys.size() == location_ids.size());
-
     std::vector<std::vector<ErrorCode>> results(keys.size());
     out_locations.clear();
     out_locations.resize(keys.size());
@@ -616,8 +641,7 @@ std::vector<std::vector<ErrorCode>> MetaStorageBackendManager::GetLocations(Requ
         return results;
     }
 
-    // Build per-key field name lists so the backend's per-key Get can fetch
-    // exactly the requested location fields instead of every field on the key.
+    // Build per-key field name vectors from location ids.
     std::vector<std::vector<std::string>> field_names_vec(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
         field_names_vec[i].reserve(location_ids[i].size());
@@ -626,40 +650,12 @@ std::vector<std::vector<ErrorCode>> MetaStorageBackendManager::GetLocations(Requ
         }
     }
 
-    // Local-first with persistent fallback during Recover, mirroring the
-    // pattern used by Get/GetAllFields/Exists. We treat both EC_NOENT and
-    // EC_OK-with-empty-map as "missing from local" so pre-restart data stays
-    // observable until backfill completes.
+    // Delegate to the per-key field names Get which already handles
+    // cache-first with persistent Recover fallback.
     FieldMapVec field_maps;
-    std::vector<ErrorCode> get_results;
-    if (local_backend_) {
-        get_results = local_backend_->Get(keys, field_names_vec, field_maps);
-        if (recover_state_.load(std::memory_order_acquire) != RecoverState::kRunning) {
-            KeyTypeVec missing_keys;
-            std::vector<std::vector<std::string>> missing_field_names;
-            std::vector<size_t> missing_indices;
-            for (size_t i = 0; i < keys.size(); ++i) {
-                if ((get_results[i] == EC_OK && field_maps[i].empty()) || get_results[i] == EC_NOENT) {
-                    missing_keys.push_back(keys[i]);
-                    missing_field_names.push_back(field_names_vec[i]);
-                    missing_indices.push_back(i);
-                }
-            }
-            if (!missing_keys.empty()) {
-                FieldMapVec persistent_field_maps;
-                std::vector<ErrorCode> persistent_results =
-                    persistent_backend_->Get(missing_keys, missing_field_names, persistent_field_maps);
-                for (size_t i = 0; i < missing_keys.size(); ++i) {
-                    const size_t original_idx = missing_indices[i];
-                    get_results[original_idx] = persistent_results[i];
-                    field_maps[original_idx] = std::move(persistent_field_maps[i]);
-                }
-            }
-        }
-    } else {
-        get_results = persistent_backend_->Get(keys, field_names_vec, field_maps);
-    }
+    std::vector<ErrorCode> get_results = Get(keys, field_names_vec, field_maps);
 
+    // Deserialize the returned field values into CacheLocations.
     const int64_t begin_us = TimestampUtil::GetCurrentTimeUs();
     for (size_t i = 0; i < keys.size(); ++i) {
         if (get_results[i] != EC_OK) {
@@ -680,9 +676,9 @@ std::vector<std::vector<ErrorCode>> MetaStorageBackendManager::GetLocations(Requ
             }
             CacheLocation location;
             if (!location.FromJsonString(it->second)) {
-                KVCM_LOG_WARN(
+                KVCM_LOG_ERROR(
                     "deserialize CacheLocation failed, key[%ld] location_id[%s]", keys[i], location_ids[i][j].c_str());
-                results[i][j] = EC_ERROR;
+                results[i][j] = EC_CORRUPTION;
                 continue;
             }
             out_locations[i][j] = std::move(location);
@@ -692,44 +688,73 @@ std::vector<std::vector<ErrorCode>> MetaStorageBackendManager::GetLocations(Requ
     return results;
 }
 
-std::vector<ErrorCode> MetaStorageBackendManager::GetAllFields(const KeyVector &keys,
-                                                               FieldMapVec &out_field_maps) noexcept {
-    if (!local_backend_) {
-        return persistent_backend_->GetAllFields(keys, out_field_maps);
-    }
-    std::vector<ErrorCode> results = local_backend_->GetAllFields(keys, out_field_maps);
-    if (recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning) {
-        return results;
+std::vector<ErrorCode> MetaStorageBackendManager::GetLocationIds(const KeyVector &keys,
+                                                                 LocationIdsPerKey &out_location_ids) noexcept {
+    out_location_ids.clear();
+    if (keys.empty()) {
+        return {};
     }
 
-    KeyTypeVec missing_keys;
-    std::vector<size_t> missing_indices;
-    for (size_t i = 0; i < keys.size(); ++i) {
-        if ((results[i] == EC_OK && out_field_maps[i].empty()) || results[i] == EC_NOENT) {
-            missing_keys.push_back(keys[i]);
-            missing_indices.push_back(i);
+    std::vector<std::vector<std::string>> field_names_vec;
+    std::vector<ErrorCode> results;
+    if (cache_backend_) {
+        results = cache_backend_->GetFieldNamesWithPrefix(keys, LOCATION_PREFIX, field_names_vec);
+        if (recover_state_.load(std::memory_order_acquire) != RecoverState::kRunning) {
+            KeyTypeVec missing_keys;
+            std::vector<size_t> missing_indices;
+            for (size_t i = 0; i < keys.size(); ++i) {
+                if ((results[i] == EC_OK && field_names_vec[i].empty()) || results[i] == EC_NOENT) {
+                    missing_keys.push_back(keys[i]);
+                    missing_indices.push_back(i);
+                }
+            }
+            if (!missing_keys.empty()) {
+                std::vector<std::vector<std::string>> persistent_field_names;
+                std::vector<ErrorCode> persistent_results =
+                    persistent_backend_->GetFieldNamesWithPrefix(missing_keys, LOCATION_PREFIX, persistent_field_names);
+                if (missing_keys.size() != persistent_field_names.size()) {
+                    KVCM_LOG_ERROR("persistent_field_names size[%lu] mismatch missing_keys's[%lu]",
+                                   persistent_field_names.size(),
+                                   missing_keys.size());
+                    for (size_t i = 0; i < missing_keys.size(); ++i) {
+                        results[missing_indices[i]] = EC_ERROR;
+                    }
+                    return results;
+                }
+                for (size_t i = 0; i < missing_keys.size(); ++i) {
+                    const size_t original_idx = missing_indices[i];
+                    results[original_idx] = persistent_results[i];
+                    field_names_vec[original_idx] = std::move(persistent_field_names[i]);
+                }
+            }
         }
-    }
-    if (missing_keys.empty()) {
-        return results;
+    } else {
+        results = persistent_backend_->GetFieldNamesWithPrefix(keys, LOCATION_PREFIX, field_names_vec);
     }
 
-    FieldMapVec persistent_field_maps;
-    std::vector<ErrorCode> persistent_results = persistent_backend_->GetAllFields(missing_keys, persistent_field_maps);
-    for (size_t i = 0; i < missing_keys.size(); ++i) {
-        const size_t original_idx = missing_indices[i];
-        results[original_idx] = persistent_results[i];
-        out_field_maps[original_idx] = std::move(persistent_field_maps[i]);
+    // Strip LOCATION_PREFIX from field names to produce location ids.
+    out_location_ids.resize(keys.size());
+    const size_t prefix_len = LOCATION_PREFIX.size();
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (results[i] != EC_OK || field_names_vec[i].empty()) {
+            continue;
+        }
+        out_location_ids[i].reserve(field_names_vec[i].size());
+        for (auto &field_name : field_names_vec[i]) {
+            if (field_name.size() > prefix_len) {
+                out_location_ids[i].emplace_back(field_name.substr(prefix_len));
+            }
+        }
     }
     return results;
 }
 
 std::vector<ErrorCode> MetaStorageBackendManager::Exists(const KeyVector &keys,
                                                          std::vector<bool> &out_is_exist_vec) noexcept {
-    if (!local_backend_) {
+    if (!cache_backend_) {
         return persistent_backend_->Exists(keys, out_is_exist_vec);
     }
-    std::vector<ErrorCode> results = local_backend_->Exists(keys, out_is_exist_vec);
+    std::vector<ErrorCode> results = cache_backend_->Exists(keys, out_is_exist_vec);
     if (recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning) {
         return results;
     }
@@ -748,6 +773,14 @@ std::vector<ErrorCode> MetaStorageBackendManager::Exists(const KeyVector &keys,
 
     std::vector<bool> persistent_exists;
     std::vector<ErrorCode> persistent_results = persistent_backend_->Exists(missing_keys, persistent_exists);
+    if (missing_keys.size() != persistent_exists.size()) {
+        KVCM_LOG_ERROR(
+            "persistent_exists size[%lu] mismatch missing_keys's[%lu]", persistent_exists.size(), missing_keys.size());
+        for (size_t i = 0; i < missing_keys.size(); ++i) {
+            results[missing_indices[i]] = EC_ERROR;
+        }
+        return results;
+    }
     for (size_t i = 0; i < missing_keys.size(); ++i) {
         const size_t original_idx = missing_indices[i];
         results[original_idx] = persistent_results[i];
@@ -756,23 +789,19 @@ std::vector<ErrorCode> MetaStorageBackendManager::Exists(const KeyVector &keys,
     return results;
 }
 
-// ---------------------------------------------------------------------------
-// Cross-batch APIs (no shard-locking semantics required)
-// ---------------------------------------------------------------------------
-
 ErrorCode MetaStorageBackendManager::ListKeys(const std::string &cursor,
                                               const int64_t limit,
                                               std::string &out_next_cursor,
                                               KeyTypeVec &out_keys) noexcept {
-    if (local_backend_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning) {
-        return local_backend_->ListKeys(cursor, limit, out_next_cursor, out_keys);
+    if (cache_backend_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning) {
+        return cache_backend_->ListKeys(cursor, limit, out_next_cursor, out_keys);
     }
     return persistent_backend_->ListKeys(cursor, limit, out_next_cursor, out_keys);
 }
 
 ErrorCode MetaStorageBackendManager::RandomSample(const int64_t count, KeyTypeVec &out_keys) noexcept {
-    if (local_backend_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning) {
-        return local_backend_->RandomSample(count, out_keys);
+    if (cache_backend_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning) {
+        return cache_backend_->RandomSample(count, out_keys);
     }
     return persistent_backend_->RandomSample(count, out_keys);
 }
@@ -781,11 +810,11 @@ ErrorCode MetaStorageBackendManager::SampleReclaimKeys(const int64_t count, KeyT
     if (count <= 0) {
         return EC_OK;
     }
-    // Until recover finishes, the local backend has not seen every key yet,
+    // Until recover finishes, the cache backend has not seen every key yet,
     // so we still go to persistent to avoid biased reclamation. In single-
-    // backend mode (no local) we always go to persistent.
-    if (local_backend_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning) {
-        return local_backend_->SampleReclaimKeys(count, out_keys);
+    // backend mode (no cache) we always go to persistent.
+    if (cache_backend_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning) {
+        return cache_backend_->SampleReclaimKeys(count, out_keys);
     }
     return persistent_backend_->SampleReclaimKeys(count, out_keys);
 }
@@ -799,8 +828,8 @@ ErrorCode MetaStorageBackendManager::GetMetaData(FieldMap &field_maps) noexcept 
 }
 
 size_t MetaStorageBackendManager::GetMemUsage() const noexcept {
-    if (local_backend_) {
-        return local_backend_->GetMemUsage();
+    if (cache_backend_) {
+        return cache_backend_->GetMemUsage();
     }
     return 0;
 }

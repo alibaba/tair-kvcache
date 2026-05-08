@@ -472,98 +472,6 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
         # requires storage_usage_data to have survived the restart
         self._write(16)
 
-    def test_persist_recover_02(self):
-        """Test metadata persistence-recovery backward compatibility
-        handling.
-
-        Scenario
-        --------
-        1. Setup: Fill test_instance_01 with 16 blocks but do not
-           trigger reclaiming.
-        2. Restart the server with intentionally crafted version 0
-           metadata file, that is, only key_count is included.
-        3. Re-register test_instance_01, lower the threshold for
-           test_group_01; make the reclaimer fires.
-        4. Assert: a new write to test_instance_01 should success, which
-           means the reclaiming worked as expected, thus the backward
-           compatibility is properly handled.
-        """
-        # add storage
-        add_storage_req = {
-            "trace_id": self._trace_id,
-            "storage": self._make_dummy_storage(),
-        }
-        self._admin_client.add_storage(add_storage_req)
-
-        # add instance group; reclaim trigger is intentionally too high
-        # to fire at this point
-        ig = self._make_dummy_instance_group()
-        create_ig_req = {
-            "trace_id": self._trace_id,
-            "instance_group": ig,
-        }
-        self._admin_client.create_instance_group(create_ig_req)
-
-        # register test_instance_01
-        reg_ins_01_req = self._make_dummy_ins_req()
-        self._client.register_instance(reg_ins_01_req)
-
-        # write 16 keys into test_instance_01
-        for i in range(16):
-            self._write(i)
-
-        # storage quota is full
-        self._start_write_expect_fail(16)
-
-        # restart the server
-        self.worker_manager.stop_worker(0)
-        meta_storage_backend_config = ig[
-            "cache_config"
-        ][
-            "meta_indexer_config"
-        ][
-            "meta_storage_backend_config"
-        ]
-        self._make_v0_persist_data(meta_storage_backend_config)
-        self.assertTrue(self.worker_manager.start_worker(0))
-
-        # reconnect clients: update_ports() assigns fresh ports on every
-        # start
-        self._admin_client.close()
-        self._client.close()
-        self._admin_client, self._client = self._get_manager_client()
-
-        # re-add the storage and instance group after restart
-        # re-register test_instance_01 to bring the recovered indexer
-        # back online
-        self._admin_client.add_storage(add_storage_req)
-        create_ig_req["trace_id"] = self._trace_id + "_restart"
-        self._admin_client.create_instance_group(create_ig_req)
-        self._client.register_instance(reg_ins_01_req)
-
-        # fire the reclaimer for test_group_01
-        curr_ver = ig["version"]
-        ig["version"] = curr_ver + 1
-        ig[
-            "cache_config"
-        ][
-            "reclaim_strategy"
-        ][
-            "trigger_strategy"
-        ][
-            "used_percentage"
-        ] = 0.1
-        self._admin_client.update_instance_group({
-            "trace_id": self._trace_id + "_update_ig",
-            "instance_group": ig,
-            "current_version": curr_ver,
-        })
-
-        time.sleep(2)
-
-        # this write can succeed only when v0 meta is properly handled
-        self._write(16)
-
     def _get_manager_client(self):
         self._admin_http_port = self.worker_manager.get_worker(
             0).env.admin_http_port
@@ -771,34 +679,6 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
             "dp_size": 1,
             "pp_size": 1,
         }
-
-    def _make_v0_persist_data(self, meta_storage_backend_conf):
-        if meta_storage_backend_conf["storage_type"] == "dummy":
-            # rewrite the persisted metadata file
-            import json
-            d = {}
-
-            persist_path = meta_storage_backend_conf["storage_uri"]
-            persist_path = persist_path.removeprefix("file://")
-            persist_path = "_".join((persist_path, self._instance_id,))
-
-            with open(persist_path, 'r') as f:
-                meta_key = "__metadata__"
-                key = "__storage_usage_data__"
-                d = json.load(f)
-                d1 = json.loads(d[meta_key])
-                if key in d1:
-                    del d1[key]
-                d[meta_key] = json.dumps(d1)
-
-            with open(persist_path, 'w') as f:
-                json.dump(d, f)
-
-        elif meta_storage_backend_conf["storage_type"] == "local":
-            pass
-        elif meta_storage_backend_conf["storage_type"] == "redis":
-            # TODO
-            pass
 
 
 if __name__ == "__main__":

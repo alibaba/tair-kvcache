@@ -18,9 +18,7 @@ namespace kv_cache_manager {
 
 class MetaStorageBackendManagerTest : public TESTBASE {
 public:
-    void SetUp() override {
-        request_context_ = std::make_shared<RequestContext>("test_trace_id");
-    }
+    void SetUp() override { request_context_ = std::make_shared<RequestContext>("test_trace_id"); }
 
     // Build a dual-backend config URI with persistent=dummy (file-backed) so
     // the test does not depend on a running redis service. The dummy backend
@@ -28,10 +26,9 @@ public:
     // GetPrivateTestRuntimeDataPath().
     std::shared_ptr<MetaStorageBackendConfig> MakeDualConfig(const std::string &path) {
         auto config = std::make_shared<MetaStorageBackendConfig>();
-        // storage_type is ignored when both persistent_type/cache_type are
-        // provided in the URI; setting it to the persistent type keeps the
-        // config consistent for anyone who inspects it independently.
-        config->SetStorageType(META_DUMMY_BACKEND_TYPE_STR);
+        // storage_type must be "cached" so that Init enters the dual-backend
+        // code path which parses persistent_type/cache_type from the URI.
+        config->SetStorageType(META_CACHED_BACKEND_TYPE_STR);
         config->SetStorageUri("file://" + path + "?persistent_type=dummy&cache_type=local");
         return config;
     }
@@ -123,13 +120,13 @@ TEST_F(MetaStorageBackendManagerTest, TestInitBadArgs) {
 
 TEST_F(MetaStorageBackendManagerTest, TestInitSingleBackend) {
     // No persistent_type/cache_type params in URI -> single-backend mode
-    // (local_backend_ stays null, recover_state goes straight to kRunning).
+    // (cache_backend_ stays null, recover_state goes straight to kRunning).
     const std::string path = GetPrivateTestRuntimeDataPath() + "mgr_single";
     std::filesystem::remove(path);
     MetaStorageBackendManager mgr;
     ASSERT_EQ(EC_OK, mgr.Init("inst_single", MakeSingleConfig(path)));
     ASSERT_TRUE(mgr.persistent_backend_);
-    ASSERT_FALSE(mgr.local_backend_);
+    ASSERT_FALSE(mgr.cache_backend_);
     ASSERT_EQ(EC_OK, mgr.Open());
     ASSERT_EQ(MetaStorageBackendManager::RecoverState::kRunning, mgr.GetRecoverState());
     ASSERT_EQ(EC_OK, mgr.Close());
@@ -142,7 +139,7 @@ TEST_F(MetaStorageBackendManagerTest, TestInitDualBackend) {
     MetaStorageBackendManager mgr;
     ASSERT_EQ(EC_OK, mgr.Init("inst_dual", MakeDualConfig(path)));
     ASSERT_TRUE(mgr.persistent_backend_);
-    ASSERT_TRUE(mgr.local_backend_);
+    ASSERT_TRUE(mgr.cache_backend_);
     ASSERT_EQ(EC_OK, mgr.Open());
     WaitRunning(mgr);
     ASSERT_EQ(EC_OK, mgr.Close());
@@ -295,7 +292,7 @@ TEST_F(MetaStorageBackendManagerTest, TestInitInvalidBackendTypesRejected) {
     // Unknown persistent_type -> factory returns nullptr -> EC_ERROR.
     {
         auto config = std::make_shared<MetaStorageBackendConfig>();
-        config->SetStorageType(META_DUMMY_BACKEND_TYPE_STR);
+        config->SetStorageType(META_CACHED_BACKEND_TYPE_STR);
         config->SetStorageUri("file://" + path + "?persistent_type=bogus&cache_type=local");
         MetaStorageBackendManager mgr;
         ASSERT_EQ(EC_ERROR, mgr.Init("inst_bad_persistent", config));
@@ -303,7 +300,7 @@ TEST_F(MetaStorageBackendManagerTest, TestInitInvalidBackendTypesRejected) {
     // Unknown cache_type -> EC_ERROR (persistent constructed, local fails).
     {
         auto config = std::make_shared<MetaStorageBackendConfig>();
-        config->SetStorageType(META_DUMMY_BACKEND_TYPE_STR);
+        config->SetStorageType(META_CACHED_BACKEND_TYPE_STR);
         config->SetStorageUri("file://" + path + "?persistent_type=dummy&cache_type=bogus");
         MetaStorageBackendManager mgr;
         ASSERT_EQ(EC_ERROR, mgr.Init("inst_bad_cache", config));
@@ -323,7 +320,7 @@ TEST_F(MetaStorageBackendManagerTest, TestSingleBackendCrud) {
     ASSERT_EQ(EC_OK, mgr.Init("inst_single_crud", MakeSingleConfig(path)));
     ASSERT_EQ(EC_OK, mgr.Open());
     ASSERT_EQ(MetaStorageBackendManager::RecoverState::kRunning, mgr.GetRecoverState());
-    ASSERT_FALSE(mgr.local_backend_);
+    ASSERT_FALSE(mgr.cache_backend_);
 
     KeyVector keys = {1, 2};
     auto batch = MakeBatch(keys);
@@ -338,8 +335,7 @@ TEST_F(MetaStorageBackendManagerTest, TestSingleBackendCrud) {
     ASSERT_EQ((std::vector<bool>{true, true}), exists_vec);
 
     LocationMapVector out_locs;
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
-              mgr.GetLocations(request_context_.get(), keys, out_locs));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), mgr.GetLocations(request_context_.get(), keys, out_locs));
     ASSERT_EQ("uri_1", out_locs[0].at("loc_1").location_specs().front().uri());
 
     // Delete location field -> reclaim path resolves emptiness via persistent.
@@ -381,8 +377,7 @@ TEST_F(MetaStorageBackendManagerTest, TestRecoverReadFallbackToPersistent) {
               mgr.persistent_backend_->Put(extra_batch.batch_keys, extra_batch.batch_properties));
 
     // Flip back to Recover to force the local-miss -> persistent-fallback path.
-    mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover,
-                             std::memory_order_release);
+    mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover, std::memory_order_release);
 
     KeyVector keys = {1, 2, 3};
     FieldMapVec fms;
@@ -426,8 +421,7 @@ TEST_F(MetaStorageBackendManagerTest, TestRecoverWriteDualWriteAndDeleteTombston
 
     // Force Recover so UpdateFields/Upsert hit EnsureKeyInLocal and Delete
     // inserts into deleted_keys_.
-    mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover,
-                             std::memory_order_release);
+    mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover, std::memory_order_release);
 
     // Put in Recover -> dual-write; then Delete in Recover -> tombstone set.
     KeyVector keys = {42};
@@ -444,9 +438,9 @@ TEST_F(MetaStorageBackendManagerTest, TestRecoverWriteDualWriteAndDeleteTombston
     // see the tombstone and refuse to reinsert the key into local.
     FieldMapVec stale_fms(1);
     stale_fms[0]["p0"] = "stale";
-    ASSERT_EQ(0, mgr.BackfillKeysToLocal(keys, stale_fms, {EC_OK}));
+    ASSERT_EQ(0, mgr.BackfillKeysToCache(keys, stale_fms, {EC_OK}));
     std::vector<bool> exists_vec;
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.local_backend_->Exists(keys, exists_vec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.cache_backend_->Exists(keys, exists_vec));
     ASSERT_FALSE(exists_vec[0]);
 
     // UpdateFields under Recover hydrates missing keys via EnsureKeyInLocal
@@ -490,8 +484,7 @@ TEST_F(MetaStorageBackendManagerTest, TestRunningReadLocalOnly) {
     // not know about it; in Running state reads must not see it.
     KeyVector k2 = {2};
     auto b2 = MakeBatch(k2);
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
-              mgr.persistent_backend_->Put(b2.batch_keys, b2.batch_properties));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.persistent_backend_->Put(b2.batch_keys, b2.batch_properties));
 
     std::vector<bool> exists_vec;
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), mgr.Exists(KeyVector{1, 2}, exists_vec));
@@ -552,6 +545,110 @@ TEST_F(MetaStorageBackendManagerTest, TestEmptyInputsAreNoOp) {
     BatchMetaData empty_batch;
     auto put_ecs = mgr.Put(request_context_.get(), empty_batch);
     ASSERT_TRUE(put_ecs.empty());
+
+    ASSERT_EQ(EC_OK, mgr.Close());
+}
+
+// --- Tombstone: GetLocationIds ignores empty-value fields --------------------
+
+TEST_F(MetaStorageBackendManagerTest, TestGetLocationIdsIgnoresTombstone) {
+    const std::string path = GetPrivateTestRuntimeDataPath() + "mgr_tombstone";
+    std::filesystem::remove(path);
+    MetaStorageBackendManager mgr;
+    ASSERT_EQ(EC_OK, mgr.Init("inst_tomb", MakeDualConfig(path)));
+    ASSERT_EQ(EC_OK, mgr.Open());
+    WaitRunning(mgr);
+
+    // Put key 10 with a real location.
+    KeyVector keys = {10};
+    auto batch = MakeBatch(keys);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.Put(request_context_.get(), batch));
+
+    // Verify GetLocationIds returns the real location.
+    LocationIdsPerKey loc_ids;
+    auto ecs = mgr.GetLocationIds(keys, loc_ids);
+    ASSERT_EQ(EC_OK, ecs[0]);
+    ASSERT_EQ(1u, loc_ids[0].size());
+    EXPECT_EQ("loc_10", loc_ids[0][0]);
+
+    // Now overwrite the location field with an empty value (tombstone) via
+    // UpdateFields on the persistent backend directly, then invalidate cache.
+    FieldMapVec tombstone_fields = {{{LOCATION_PREFIX + "loc_10", ""}}};
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.persistent_backend_->UpdateFields(keys, tombstone_fields));
+    if (mgr.cache_backend_) {
+        FieldMapVec cache_tomb = {{{LOCATION_PREFIX + "loc_10", ""}}};
+        mgr.cache_backend_->UpdateFields(keys, cache_tomb);
+    }
+
+    // GetLocationIds should now return EC_OK with empty location ids
+    // (key still exists but has no valid non-tombstone locations).
+    loc_ids.clear();
+    ecs = mgr.GetLocationIds(keys, loc_ids);
+    ASSERT_EQ(EC_OK, ecs[0]);
+    EXPECT_TRUE(loc_ids[0].empty());
+
+    ASSERT_EQ(EC_OK, mgr.Close());
+}
+
+// --- Delete with empty location_ids per key is a no-op -----------------------
+
+TEST_F(MetaStorageBackendManagerTest, TestDeleteEmptyLocationIdsIsNoOp) {
+    const std::string path = GetPrivateTestRuntimeDataPath() + "mgr_del_empty_lids";
+    std::filesystem::remove(path);
+    MetaStorageBackendManager mgr;
+    ASSERT_EQ(EC_OK, mgr.Init("inst_del_empty", MakeDualConfig(path)));
+    ASSERT_EQ(EC_OK, mgr.Open());
+    WaitRunning(mgr);
+
+    // Put key 20 with a real location.
+    KeyVector keys = {20};
+    auto batch = MakeBatch(keys);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.Put(request_context_.get(), batch));
+
+    // Delete with empty location_ids should be a no-op → EC_OK, 0 reclaimed.
+    int32_t reclaimed = -1;
+    LocationIdsPerKey empty_ids = {{}};
+    auto del_ecs = mgr.Delete(keys, empty_ids, reclaimed);
+    ASSERT_EQ(EC_OK, del_ecs[0]);
+    ASSERT_EQ(0, reclaimed);
+
+    // The original location should still exist.
+    LocationIdsPerKey loc_ids;
+    auto get_ecs = mgr.GetLocationIds(keys, loc_ids);
+    ASSERT_EQ(EC_OK, get_ecs[0]);
+    ASSERT_EQ(1u, loc_ids[0].size());
+    EXPECT_EQ("loc_20", loc_ids[0][0]);
+
+    ASSERT_EQ(EC_OK, mgr.Close());
+}
+
+// --- MaybeReclaimEmptyKeys after deleting last location ----------------------
+
+TEST_F(MetaStorageBackendManagerTest, TestMaybeReclaimEmptyKeysAfterLastLocationDeleted) {
+    const std::string path = GetPrivateTestRuntimeDataPath() + "mgr_reclaim_empty";
+    std::filesystem::remove(path);
+    MetaStorageBackendManager mgr;
+    ASSERT_EQ(EC_OK, mgr.Init("inst_reclaim", MakeDualConfig(path)));
+    ASSERT_EQ(EC_OK, mgr.Open());
+    WaitRunning(mgr);
+
+    // Put key 30 with a single location.
+    KeyVector keys = {30};
+    auto batch = MakeBatch(keys);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.Put(request_context_.get(), batch));
+
+    // Delete that location → the key should be auto-reclaimed.
+    int32_t reclaimed = 0;
+    LocationIdsPerKey ids = {{"loc_30"}};
+    auto del_ecs = mgr.Delete(keys, ids, reclaimed);
+    ASSERT_EQ(EC_OK, del_ecs[0]);
+    EXPECT_EQ(1, reclaimed);
+
+    // The key should no longer exist.
+    std::vector<bool> exists_vec;
+    auto exists_ecs = mgr.Exists(keys, exists_vec);
+    ASSERT_EQ(EC_OK, exists_ecs[0]);
+    EXPECT_FALSE(exists_vec[0]);
 
     ASSERT_EQ(EC_OK, mgr.Close());
 }

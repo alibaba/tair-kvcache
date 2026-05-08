@@ -21,6 +21,21 @@ cc_library(
 )
 
 cc_library(
+    name = "storage_usage_data",
+    srcs = [
+        "storage_usage_data.cc",
+    ],
+    hdrs = [
+        "storage_usage_data.h",
+    ],
+    deps = [
+        "//kv_cache_manager/common",
+        "//kv_cache_manager/common:string_util",
+        "//kv_cache_manager/data_storage:common_define",
+    ],
+)
+
+cc_library(
     name = "meta_indexer",
     srcs = [
         "meta_indexer.cc",
@@ -37,6 +52,7 @@ cc_library(
         ":common",
         ":meta_search_cache",
         ":meta_storage_backend_manager",
+        ":storage_usage_data",
         ":types",
         ":utils",
         "//kv_cache_manager/common",
@@ -58,10 +74,9 @@ cc_library(
     deps = [
         ":cache_location",
         ":common",
-        ":meta_cached_backend",
+        ":meta_cache_base_backend",
         ":meta_dummy_backend",
         ":meta_local_backend",
-        ":meta_local_base_backend",
         ":meta_redis_backend",
         ":meta_storage_backend",
         ":types",
@@ -168,11 +183,11 @@ cc_library(
 )
 
 cc_library(
-    name = "meta_local_base_backend",
+    name = "meta_cache_base_backend",
     srcs = [
     ],
     hdrs = [
-        "meta_local_base_backend.h",
+        "meta_cache_base_backend.h",
     ],
     deps = [
         ":meta_storage_backend",
@@ -189,7 +204,7 @@ cc_library(
     ],
     deps = [
         ":common",
-        ":meta_local_base_backend",
+        ":meta_cache_base_backend",
         ":meta_search_cache",
         "//kv_cache_manager/common:lru_cache",
         "//kv_cache_manager/common:standard_uri",
@@ -213,19 +228,3 @@ cc_library(
     ],
 )
 
-cc_library(
-    name = "meta_cached_backend",
-    srcs = [
-        "meta_cached_backend.cc",
-    ],
-    hdrs = [
-        "meta_cached_backend.h",
-    ],
-    deps = [
-        ":common",
-        ":meta_local_backend",
-        ":meta_local_base_backend",
-        ":meta_redis_backend",
-        ":meta_storage_backend",
-    ],
-)

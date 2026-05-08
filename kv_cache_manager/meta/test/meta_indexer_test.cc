@@ -16,6 +16,7 @@
 #include "kv_cache_manager/meta/meta_search_cache.h"
 #include "kv_cache_manager/meta/meta_storage_backend.h"
 #include "kv_cache_manager/meta/meta_storage_backend_manager.h"
+#include "kv_cache_manager/meta/storage_usage_data.h"
 #include "kv_cache_manager/meta/types.h"
 #include "kv_cache_manager/meta/utils.h"
 
@@ -253,7 +254,6 @@ TEST_F(MetaIndexerTest, TestMetadataPersistAndRecover) {
         meta_indexer_ = std::make_shared<MetaIndexer>();
         ASSERT_EQ(ErrorCode::EC_OK, meta_indexer_->Init(/* instance_id */ "test_instance_01", meta_indexer_config));
 
-        ASSERT_EQ(MetaIndexer::InstanceVersion::VERSION_1, meta_indexer_->GetVersion());
         ASSERT_EQ(0, meta_indexer_->GetKeyCount());
         for (auto &v : meta_indexer_->storage_usage_data_.storage_usage_by_type_) {
             ASSERT_EQ(0, v.load());
@@ -274,7 +274,6 @@ TEST_F(MetaIndexerTest, TestMetadataPersistAndRecover) {
         meta_indexer_ = std::make_shared<MetaIndexer>();
         ASSERT_EQ(ErrorCode::EC_OK, meta_indexer_->Init(/* instance_id */ "test_instance_01", meta_indexer_config));
 
-        ASSERT_EQ(MetaIndexer::InstanceVersion::VERSION_1, meta_indexer_->GetVersion());
         ASSERT_EQ(3, meta_indexer_->GetKeyCount());
         for (std::size_t i = 0; i != meta_indexer_->storage_usage_data_.storage_usage_by_type_.size(); ++i) {
             ASSERT_EQ(expected_usage_vec.at(i), meta_indexer_->storage_usage_data_.storage_usage_by_type_.at(i).load());
@@ -417,7 +416,7 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataManipulation) {
 }
 
 TEST_F(MetaIndexerTest, TestStorageUsageDataSeriDeseri) {
-    MetaIndexer::StorageUsageData storage_usage_data;
+    StorageUsageData storage_usage_data;
 
     // Successful round-trip: serialize then deserialize
     {

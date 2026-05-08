@@ -4,6 +4,7 @@
 #include <map>
 #include <memory>
 #include <random>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -14,12 +15,12 @@
 #include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/config/meta_cache_policy_config.h"
 #include "kv_cache_manager/meta/common.h"
-#include "kv_cache_manager/meta/meta_local_base_backend.h"
+#include "kv_cache_manager/meta/meta_cache_base_backend.h"
 
 namespace kv_cache_manager {
 
 struct MetaMemCacheItem {
-    using FieldMap = MetaLocalBaseBackend::FieldMap;
+    using FieldMap = MetaCacheBaseBackend::FieldMap;
 
     // Estimates total memory footprint including the heap memory owned by
     // FieldMap entries, used as the "charge" for LRU cache eviction accounting.
@@ -33,6 +34,7 @@ struct MetaMemCacheItem {
     }
     const FieldMap &GetFields() const { return fields_; }
     FieldMap &GetMutableFields() { return fields_; }
+    std::shared_mutex &GetMutex() const { return mutex_; }
 
     int64_t GetLastAccessTime() const { return last_access_time_.load(std::memory_order_relaxed); }
     void TouchAccessTime() { last_access_time_.store(TimestampUtil::GetCurrentTimeUs(), std::memory_order_relaxed); }
@@ -52,9 +54,10 @@ struct MetaMemCacheItem {
 private:
     FieldMap fields_;
     std::atomic<int64_t> last_access_time_{0};
+    mutable std::shared_mutex mutex_;
 };
 
-class MetaLocalBackend : public MetaLocalBaseBackend {
+class MetaLocalBackend : public MetaCacheBaseBackend {
 public:
     MetaLocalBackend() = default;
     ~MetaLocalBackend() = default;
@@ -106,6 +109,10 @@ public:
     std::vector<ErrorCode> ExistsFieldWithPrefix(const KeyTypeVec &keys,
                                                  const std::string &field_prefix,
                                                  std::vector<bool> &out_exists_vec) noexcept override;
+    std::vector<ErrorCode>
+    GetFieldNamesWithPrefix(const KeyTypeVec &keys,
+                            const std::string &field_prefix,
+                            std::vector<std::vector<std::string>> &out_field_names_vec) noexcept override;
     ErrorCode ListKeys(const std::string &cursor,
                        const int64_t limit,
                        std::string &out_next_cursor,

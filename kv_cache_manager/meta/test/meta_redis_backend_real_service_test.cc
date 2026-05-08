@@ -438,11 +438,11 @@ TEST_F(MetaRedisBackendRealServiceTest, TestDeleteFields) {
         meta_redis_backend_->Put({kKey1, kKey2}, {{{"f1", "v1-1"}, {"f2", "v1-2"}, {"f3", "v1-3"}}, {{"f1", "v2-1"}}}));
 
     // kKey1: delete two existing fields (EC_OK);
-    // kKey2: delete a missing field (EC_NOENT, key exists but field doesn't);
-    // kKeyMissing: key does not exist (EC_NOENT).
+    // kKey2: delete a missing field — HDEL is idempotent (EC_OK);
+    // kKeyMissing: key does not exist — HDEL is idempotent (EC_OK).
     auto ec_vec =
         meta_redis_backend_->DeleteFields({kKey1, kKey2, kKeyMissing}, {{"f1", "f2"}, {"missing_field"}, {"anything"}});
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOENT, EC_NOENT}), ec_vec);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}), ec_vec);
 
     // kKey1 should retain only f3; kKey2 should still have its original field.
     FieldMapVec field_maps;
@@ -467,11 +467,10 @@ TEST_F(MetaRedisBackendRealServiceTest, TestExistsFieldWithPrefix) {
 
     meta_redis_backend_->Delete({kKeyWithPrefix, kKeyWithoutPrefix, kKeyMissing});
 
-    ASSERT_EQ(
-        (std::vector<ErrorCode>{EC_OK, EC_OK}),
-        meta_redis_backend_->Put(
-            {kKeyWithPrefix, kKeyWithoutPrefix},
-            {{{LOCATION_PREFIX + "a", "la"}, {LOCATION_PREFIX + "b", "lb"}, {"p0", "v0"}}, {{"p0", "v0"}}}));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
+              meta_redis_backend_->Put(
+                  {kKeyWithPrefix, kKeyWithoutPrefix},
+                  {{{LOCATION_PREFIX + "a", "la"}, {LOCATION_PREFIX + "b", "lb"}, {"p0", "v0"}}, {{"p0", "v0"}}}));
 
     // Note: against a real redis, HSCAN on a non-existent key returns an empty
     // result with next_cursor=0 instead of an error, so the redis backend

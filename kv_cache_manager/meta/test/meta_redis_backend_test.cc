@@ -390,10 +390,11 @@ TEST_F(MetaRedisBackendTest, TestDeleteFields) {
     ASSERT_EQ(EC_OK, meta_redis_backend_->Init("instance_0", meta_storage_backend_config_));
     ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
 
+    // HDEL returning 0 (no field actually removed) is now idempotent EC_OK.
     AssertDeleteFields(meta_redis_backend_.get(),
                        {1, 2},
                        /*field_names_vec*/ {{"f1", "f2"}, {"f3"}},
-                       {EC_OK, EC_NOENT});
+                       {EC_OK, EC_OK});
 
     ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
 }
@@ -433,6 +434,52 @@ TEST_F(MetaRedisBackendTest, TestExistsFieldWithPrefix) {
     ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
 
     AssertExistsFieldWithPrefix(meta_redis_backend_.get(), {1, 2}, LOCATION_PREFIX, {EC_OK, EC_OK}, {true, false});
+
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
+}
+
+// Tombstone: HSCAN returns field with empty value → not treated as valid location.
+TEST_F(MetaRedisBackendTest, TestExistsFieldWithPrefixIgnoresTombstone) {
+    EXPECT_CALL(*meta_redis_backend_, CreateRedisClient()).WillOnce(Invoke([]() {
+        StandardUri empty_storage_uri;
+        auto mock_redis_client = std::make_unique<MockRedisClient>(empty_storage_uri);
+        EXPECT_CALL(*mock_redis_client, IsContextOk()).WillRepeatedly(Return(true));
+        EXPECT_CALL(*mock_redis_client, Reconnect()).WillRepeatedly(Return(true));
+
+        // key 1: HSCAN returns one field with empty value (tombstone) → false.
+        // key 2: HSCAN returns one field with non-empty value → true.
+        std::vector<ReplyUPtr> replies;
+        replies.emplace_back(MakeFakeReplyScan("0", {LOCATION_PREFIX + "tomb", ""}));
+        replies.emplace_back(MakeFakeReplyScan("0", {LOCATION_PREFIX + "real", "valid"}));
+        EXPECT_CALL(*mock_redis_client, TryExecPipeline(testing::_)).WillOnce(Return(ByMove(std::move(replies))));
+        return mock_redis_client;
+    }));
+
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Init("instance_0", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
+
+    AssertExistsFieldWithPrefix(meta_redis_backend_.get(), {1, 2}, LOCATION_PREFIX, {EC_OK, EC_OK}, {false, true});
+
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
+}
+
+// DeleteFields with empty field list should not issue HDEL and return EC_OK.
+TEST_F(MetaRedisBackendTest, TestDeleteFieldsEmptyFieldList) {
+    EXPECT_CALL(*meta_redis_backend_, CreateRedisClient()).WillOnce(Invoke([]() {
+        StandardUri empty_storage_uri;
+        auto mock_redis_client = std::make_unique<MockRedisClient>(empty_storage_uri);
+        EXPECT_CALL(*mock_redis_client, IsContextOk()).WillRepeatedly(Return(true));
+        EXPECT_CALL(*mock_redis_client, Reconnect()).WillRepeatedly(Return(true));
+
+        // No HDEL should be issued — TryExecPipeline must not be called.
+        EXPECT_CALL(*mock_redis_client, TryExecPipeline(testing::_)).Times(0);
+        return mock_redis_client;
+    }));
+
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Init("instance_0", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
+
+    AssertDeleteFields(meta_redis_backend_.get(), {1, 2}, {{}, {}}, {EC_OK, EC_OK});
 
     ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
 }

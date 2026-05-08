@@ -32,21 +32,26 @@ public:
     virtual ErrorCode Open() noexcept = 0;
     virtual ErrorCode Close() noexcept = 0;
 
-    // write
+    // ----- Write -----
     virtual std::vector<ErrorCode> Put(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept = 0;
     virtual std::vector<ErrorCode> UpdateFields(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept = 0;
     virtual std::vector<ErrorCode> Upsert(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept = 0;
     virtual std::vector<ErrorCode> Delete(const KeyTypeVec &keys) noexcept = 0;
+
     virtual std::vector<ErrorCode>
     DeleteFields(const KeyTypeVec &keys, const std::vector<std::vector<std::string>> &field_names_vec) noexcept = 0;
 
-    // read
+    // ----- Read -----
     virtual std::vector<ErrorCode>
     Get(const KeyTypeVec &keys, const std::vector<std::string> &field_names, FieldMapVec &out_field_maps) noexcept = 0;
     virtual std::vector<ErrorCode> Get(const KeyTypeVec &keys,
                                        const std::vector<std::vector<std::string>> &field_names_vec,
                                        FieldMapVec &out_field_maps) noexcept = 0;
     virtual std::vector<ErrorCode> GetAllFields(const KeyTypeVec &keys, FieldMapVec &out_field_maps) noexcept = 0;
+    virtual std::vector<ErrorCode>
+    GetFieldNamesWithPrefix(const KeyTypeVec &keys,
+                            const std::string &field_prefix,
+                            std::vector<std::vector<std::string>> &out_field_names_vec) noexcept = 0;
     virtual std::vector<ErrorCode> Exists(const KeyTypeVec &keys, std::vector<bool> &out_is_exist_vec) noexcept = 0;
     virtual std::vector<ErrorCode> ExistsFieldWithPrefix(const KeyTypeVec &keys,
                                                          const std::string &field_prefix,
