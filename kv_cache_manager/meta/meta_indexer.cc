@@ -37,10 +37,18 @@ static constexpr const char *kGetMetaOperation = "get";
 
 class MetaIndexer::ScopedBatchLock {
 public:
-    ScopedBatchLock(MetaIndexer &indexer, const std::vector<int32_t> &shard_indexs)
+    // If `out_lock_wait_time_us` is non-null, accumulates the elapsed time
+    // spent acquiring all shard mutexes (in microseconds).
+    ScopedBatchLock(MetaIndexer &indexer,
+                    const std::vector<int32_t> &shard_indexs,
+                    int64_t *out_lock_wait_time_us = nullptr)
         : indexer_(indexer), shard_indexs_(shard_indexs) {
+        const int64_t begin = TimestampUtil::GetCurrentTimeUs();
         for (const int32_t shardIdx : shard_indexs_) {
             indexer_.mutex_shards_[shardIdx]->lock();
+        }
+        if (out_lock_wait_time_us != nullptr) {
+            *out_lock_wait_time_us += TimestampUtil::GetCurrentTimeUs() - begin;
         }
     }
     ~ScopedBatchLock() {
@@ -160,8 +168,9 @@ MetaIndexer::Result MetaIndexer::Put(RequestContext *request_context,
     Result result(keys.size());
     int32_t error_count = 0;
     int64_t put_io_time_us = 0;
+    int64_t lock_wait_time_us = 0;
     for (auto &batch : batches) {
-        ScopedBatchLock lock(*this, batch.batch_shard_indexs);
+        ScopedBatchLock lock(*this, batch.batch_shard_indexs, &lock_wait_time_us);
         int64_t begin_put_io_time = TimestampUtil::GetCurrentTimeUs();
         auto error_codes = backend_manager_->Put(request_context, batch);
         put_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin_put_io_time;
@@ -169,6 +178,7 @@ MetaIndexer::Result MetaIndexer::Put(RequestContext *request_context,
     }
     AdjustKeyCountMeta(keys.size() - error_count);
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, put_io_time_us, put_io_time_us);
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, lock_wait_time_us, lock_wait_time_us);
     ProcessErrorResult(trace_id, kPutMetaOperation, error_count, keys.size(), result);
     return result;
 }
@@ -201,14 +211,16 @@ MetaIndexer::Result MetaIndexer::Update(RequestContext *request_context,
     Result result(keys.size());
     int32_t error_count = 0;
     int64_t update_io_time_us = 0;
+    int64_t lock_wait_time_us = 0;
     for (auto &batch : batches) {
-        ScopedBatchLock lock(*this, batch.batch_shard_indexs);
+        ScopedBatchLock lock(*this, batch.batch_shard_indexs, &lock_wait_time_us);
         int64_t begin_update_io_time = TimestampUtil::GetCurrentTimeUs();
         auto error_codes = backend_manager_->UpdateFields(request_context, batch);
         update_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin_update_io_time;
         error_count += ProcessErrorCodes(trace_id, error_codes, batch.batch_indexs, keys, kUpdateMetaOperation, result);
     }
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, update_io_time_us, update_io_time_us);
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, lock_wait_time_us, lock_wait_time_us);
     ProcessErrorResult(trace_id, kUpdateMetaOperation, error_count, keys.size(), result);
     return result;
 }
@@ -227,12 +239,14 @@ MetaIndexer::Result MetaIndexer::Delete(RequestContext *request_context, const K
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_batch_num, batches.size());
     Result result(keys.size());
     int32_t error_count = 0;
+    int64_t lock_wait_time_us = 0;
     for (auto &batch : batches) {
-        ScopedBatchLock lock(*this, batch.batch_shard_indexs);
+        ScopedBatchLock lock(*this, batch.batch_shard_indexs, &lock_wait_time_us);
         auto error_codes = backend_manager_->Delete(batch.batch_keys);
         error_count += ProcessErrorCodes(trace_id, error_codes, batch.batch_indexs, keys, kDeleteMetaOperation, result);
     }
     AdjustKeyCountMeta(error_count - keys.size());
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, lock_wait_time_us, lock_wait_time_us);
     ProcessErrorResult(trace_id, kDeleteMetaOperation, error_count, keys.size(), result);
     return result;
 }
@@ -325,6 +339,8 @@ void MetaIndexer::EmitRmwMetrics(MetricsCollector *metrics_collector,
     KVCM_METRICS_COLLECTOR_SET_METRICS(
         service_metrics_collector, meta_indexer, delete_io_time_us, stats.delete_io_time_us);
     KVCM_METRICS_COLLECTOR_SET_METRICS(
+        service_metrics_collector, meta_indexer, lock_wait_time_us, stats.lock_wait_time_us);
+    KVCM_METRICS_COLLECTOR_SET_METRICS(
         service_metrics_collector, meta_searcher, index_serialize_time_us, stats.index_serialize_time_us);
     KVCM_METRICS_COLLECTOR_SET_METRICS(
         service_metrics_collector, meta_searcher, index_deserialize_time_us, stats.index_deserialize_time_us);
@@ -366,7 +382,7 @@ MetaIndexer::Result MetaIndexer::ReadModifyWriteBlock(RequestContext *request_co
     int32_t error_count = 0;
     RmwStats stats;
     for (auto &batch : batches) {
-        ScopedBatchLock lock(*this, batch.batch_shard_indexs);
+        ScopedBatchLock lock(*this, batch.batch_shard_indexs, &stats.lock_wait_time_us);
 
         // 1. Read each key's existing location id list (no value deserialization)
         const auto &batch_keys = batch.batch_keys;
@@ -462,7 +478,7 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocation(RequestContext 
     int32_t error_count = 0;
     RmwStats stats;
     for (auto &batch : batches) {
-        ScopedBatchLock lock(*this, batch.batch_shard_indexs);
+        ScopedBatchLock lock(*this, batch.batch_shard_indexs, &stats.lock_wait_time_us);
 
         // 1. One batched read for every (key, location_id) return deserialised CacheLocation
         const auto &batch_keys = batch.batch_keys;

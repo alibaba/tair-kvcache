@@ -140,9 +140,10 @@ private:
         int64_t delete_io_time_us = 0;
         int64_t index_serialize_time_us = 0;
         int64_t index_deserialize_time_us = 0;
-        int64_t put_key_count = 0;    // brand-new keys created by upsert
-        int64_t update_key_count = 0; // existing keys updated by upsert
-        int64_t delete_key_count = 0; // keys deleted by whole-key delete
+        int64_t lock_wait_time_us = 0; // accumulated time waiting for shard locks
+        int64_t put_key_count = 0;     // brand-new keys created by upsert
+        int64_t update_key_count = 0;  // existing keys updated by upsert
+        int64_t delete_key_count = 0;  // keys deleted by whole-key delete
     };
     // Returns {error_count, put_success_count}.
     std::pair<int32_t, int32_t> ExecuteRmwUpsert(const std::string &trace_id,
