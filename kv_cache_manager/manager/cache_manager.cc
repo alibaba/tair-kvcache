@@ -751,6 +751,28 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
                                          BlockMask &block_mask) {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
+    // RAII timer: prints the total wall-clock time spent in FilterWriteCache on
+    // every return path (success, fail-fast, error). Captures by value so the
+    // closure stays valid no matter when ~ScopeExit fires.
+    class FilterWriteCacheCostLogger {
+    public:
+        FilterWriteCacheCostLogger(std::string trace_id, size_t key_count)
+            : begin_us_(TimestampUtil::GetCurrentTimeUs()), trace_id_(std::move(trace_id)), key_count_(key_count) {}
+        ~FilterWriteCacheCostLogger() {
+            const int64_t cost_us = TimestampUtil::GetCurrentTimeUs() - begin_us_;
+            KVCM_LOG_INFO("[metrics][FilterWriteCache] trace_id[%s] keys=%lu cost_us=%ld",
+                          trace_id_.c_str(),
+                          key_count_,
+                          cost_us);
+        }
+
+    private:
+        int64_t begin_us_;
+        std::string trace_id_;
+        size_t key_count_;
+    };
+    FilterWriteCacheCostLogger filter_write_cache_cost_logger(trace_id, keys.size());
+
     static BlockMask empty_block_mask = static_cast<size_t>(0);
     std::vector<CacheLocationMap> location_maps;
     auto ec = meta_searcher->BatchGetLocation(request_context, keys, empty_block_mask, location_maps);
@@ -792,18 +814,25 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
         return policy->ExistsForWrite(m, it->spec_names(), check_loc_data_exist, out_prune_loc_ids);
     };
 
+    // Benchmark bypass: when KVCM_BENCH_SKIP_WRITE_FILTER is set, treat all blocks
+    // as non-existent so that every StartWriteCache adds a new location to the block.
+    // This is for testing multi-location performance only; never use in production.
+    static const bool bench_skip_write_filter = (std::getenv("KVCM_BENCH_SKIP_WRITE_FILTER") != nullptr);
+
     // Single pass: compute exists status for all blocks.
-    std::vector<bool> exists_flags(location_maps.size());
-    for (size_t i = 0; i < location_maps.size(); ++i) {
-        std::vector<std::string> prune_loc_ids;
-        exists_flags[i] = existsForWrite(i, location_maps[i], prune_loc_ids);
-        if (!prune_loc_ids.empty()) {
-            prune_keys.emplace_back(keys[i]);
-            prune_loc_ids_vec.emplace_back(prune_loc_ids);
+    std::vector<bool> exists_flags(location_maps.size(), false);
+    if (!bench_skip_write_filter) {
+        for (size_t i = 0; i < location_maps.size(); ++i) {
+            std::vector<std::string> prune_loc_ids;
+            exists_flags[i] = existsForWrite(i, location_maps[i], prune_loc_ids);
+            if (!prune_loc_ids.empty()) {
+                prune_keys.emplace_back(keys[i]);
+                prune_loc_ids_vec.emplace_back(prune_loc_ids);
+            }
         }
-    }
-    if (!prune_keys.empty() && submit_del_req) {
-        submit_del_req(prune_keys, prune_loc_ids_vec);
+        if (!prune_keys.empty() && submit_del_req) {
+            submit_del_req(prune_keys, prune_loc_ids_vec);
+        }
     }
 
     // Analyze the flags: find prefix boundary and check pattern.
