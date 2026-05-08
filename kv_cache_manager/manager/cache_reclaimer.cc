@@ -723,7 +723,7 @@ bool CacheReclaimer::DoKeySampling(RequestContext *request_context,
 
     const std::size_t batching_size = batching_size_.load();
     bool need_get_properties = total_sampling_sz > batching_size;
-    auto sample = [request_context, &ins_id, &ins_gr, &meta_indexer, &need_get_properties](
+    auto sample = [request_context, ins_id, ins_gr, meta_indexer, need_get_properties](
                       std::size_t sampling_sz,
                       std::vector<std::int64_t> &keys,
                       std::vector<std::map<std::string, std::string>> &maps) -> ErrorCode {
@@ -791,7 +791,12 @@ bool CacheReclaimer::DoKeySampling(RequestContext *request_context,
     bool result = true;
     for (auto &fut : futures) {
         if (fut.valid()) {
-            fut.wait(); // drain all the known futures
+            // drain all the known futures with bounded waiting time
+            if (fut.wait_for(std::chrono::milliseconds(kFutureTimeoutMs)) != std::future_status::ready) {
+                LOG_WITH_ID(WARN, "key sampling task timed out after [%u] ms", kFutureTimeoutMs);
+                result = false;
+                continue;
+            }
             if (!result) {
                 // some tasks already failed, no need to extract data any further
                 continue;

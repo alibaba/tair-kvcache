@@ -261,6 +261,8 @@ public:
 private:
     static constexpr double kEpsilon = 1e-9;
     static constexpr std::size_t kSizeLimit = 1 << 16;
+    // timeout for key sampling worker futures to prevent indefinite blocking
+    static constexpr std::uint32_t kFutureTimeoutMs = 60000;
     static const std::string kTraceIDPrefix;
     static std::string GenTraceID();
 
