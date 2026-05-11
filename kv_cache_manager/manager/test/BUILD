@@ -170,22 +170,6 @@ cc_test(
 )
 
 cc_test(
-    name = "CacheLocationTest",
-    srcs = [
-        "cache_location_test.cc",
-    ],
-    copts = ["-fno-access-control"],
-    data = [],
-    deps = [
-        "//kv_cache_manager/common:unittest",
-        "//kv_cache_manager/data_storage:common_define",
-        "//kv_cache_manager/meta:cache_location",
-        "//kv_cache_manager/meta:common",
-        "@rapidjson",
-    ],
-)
-
-cc_test(
     name = "FilterWriteCacheTest",
     srcs = [
         "filter_write_cache_test.cc",

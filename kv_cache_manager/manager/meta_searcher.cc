@@ -872,10 +872,10 @@ ErrorCode MetaSearcher::BatchDeleteLocations(RequestContext *request_context,
         locs_sz[i].resize(location_ids_per_key[i].size());
     }
 
-    auto modifier = [&keys, &locs_sz](CacheLocationVector &locs,
-                                      const std::vector<ErrorCode> &get_ecs,
-                                      size_t key_index,
+    auto modifier = [&keys, &locs_sz](const std::vector<ErrorCode> &get_ecs,
                                       const LocationIdVector &loc_ids,
+                                      size_t key_index,
+                                      CacheLocationVector &locs,
                                       PropertyMap & /*upsert_property_map*/) -> LocationModifierResult {
         std::vector<ErrorCode> modifier_ecs(loc_ids.size(), ErrorCode::EC_OK);
         bool any_found = false;
