@@ -324,6 +324,10 @@ private:
     void WorkerRoutine();
     void SubmitTask(const std::function<void()> &task);
 
+    // tracks the number of sampling tasks currently executing on
+    // workers; incremented on submit, decremented on task completion
+    std::atomic<std::size_t> in_flight_sampling_tasks_{0};
+
     // a singly-linked list to help inspect the deleting result in a
     // non-blocking way
     struct DeleteHandler {
@@ -475,7 +479,7 @@ private:
     void ReclaimCron() noexcept;
 
     // below are helper routines for internal usage
-    bool DoKeySampling(RequestContext *request_context,
+    bool DoKeySampling(const std::shared_ptr<RequestContext> &request_context,
                        const std::shared_ptr<const InstanceInfo> &instance_info,
                        std::vector<std::int64_t> &out_keys,
                        std::vector<std::map<std::string, std::string>> &out_maps) noexcept;

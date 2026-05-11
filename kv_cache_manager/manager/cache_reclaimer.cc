@@ -565,7 +565,7 @@ void CacheReclaimer::ReclaimByLRU(const std::shared_ptr<RequestContext> &request
     // 1. get the sampled block keys and the LRU timestamp info from
     // the meta indexer
     const std::int64_t begin_tp_sample = TimestampUtil::GetSteadyTimeUs();
-    if (!DoKeySampling(request_context.get(), instance_info, keys, maps)) {
+    if (!DoKeySampling(request_context, instance_info, keys, maps)) {
         LOG_WITH_ID(DEBUG, "key sampling failed");
         return;
     }
@@ -699,7 +699,7 @@ void CacheReclaimer::ReclaimCron() noexcept {
     }
 }
 
-bool CacheReclaimer::DoKeySampling(RequestContext *request_context,
+bool CacheReclaimer::DoKeySampling(const std::shared_ptr<RequestContext> &request_context,
                                    const std::shared_ptr<const InstanceInfo> &instance_info,
                                    std::vector<std::int64_t> &out_keys,
                                    std::vector<std::map<std::string, std::string>> &out_maps) noexcept {
@@ -724,11 +724,15 @@ bool CacheReclaimer::DoKeySampling(RequestContext *request_context,
 
     const std::size_t batching_size = batching_size_.load();
     bool need_get_properties = total_sampling_sz > batching_size;
-    auto sample = [request_context, ins_id, ins_gr, meta_indexer, need_get_properties](
+    auto cancelled = std::make_shared<std::atomic<bool>>(false);
+    auto sample = [request_context, ins_id, ins_gr, meta_indexer, need_get_properties, cancelled](
                       std::size_t sampling_sz,
                       std::vector<std::int64_t> &keys,
                       std::vector<std::map<std::string, std::string>> &maps) -> ErrorCode {
-        if (const auto ec = meta_indexer->SampleReclaimKeys(request_context, sampling_sz, keys);
+        if (cancelled->load(std::memory_order_relaxed)) {
+            return ErrorCode::EC_ERROR;
+        }
+        if (const auto ec = meta_indexer->SampleReclaimKeys(request_context.get(), sampling_sz, keys);
             ec != ErrorCode::EC_OK) {
             LOG_WITH_ID(WARN, "random sample failed, error code: [%d]", static_cast<std::int32_t>(ec));
             return ec;
@@ -744,7 +748,10 @@ bool CacheReclaimer::DoKeySampling(RequestContext *request_context,
             return ErrorCode::EC_OK;
         }
 
-        if (const auto res = meta_indexer->GetProperties(request_context, keys, {PROPERTY_LRU_TIME}, maps);
+        if (cancelled->load(std::memory_order_relaxed)) {
+            return ErrorCode::EC_ERROR;
+        }
+        if (const auto res = meta_indexer->GetProperties(request_context.get(), keys, {PROPERTY_LRU_TIME}, maps);
             res.ec != ErrorCode::EC_OK) {
             LOG_WITH_ID(WARN, "get properties failed, error code: [%d]", static_cast<std::int32_t>(res.ec));
             return res.ec;
@@ -766,6 +773,13 @@ bool CacheReclaimer::DoKeySampling(RequestContext *request_context,
         return sample(total_sampling_sz, out_keys, out_maps) == ErrorCode::EC_OK;
     }
 
+    // guard: skip submitting new tasks if too many prior tasks are still
+    // in-flight (stuck on backend), to prevent worker pool exhaustion
+    if (const std::size_t in_flight = in_flight_sampling_tasks_.load(); in_flight >= workers_.size()) {
+        LOG_WITH_ID(WARN, "skipping key sampling: [%zu] tasks still in-flight, worker pool saturated", in_flight);
+        return false;
+    }
+
     std::size_t sampling_sz_todo = total_sampling_sz;
     std::vector<std::future<KeySamplingResult>> futures;
     for (std::size_t i = 0; i != worker_sz; ++i) {
@@ -774,38 +788,39 @@ bool CacheReclaimer::DoKeySampling(RequestContext *request_context,
 
         // final task do sample with left key size
         std::size_t sampling_sz = (i == worker_sz - 1) ? sampling_sz_todo : sampling_sz_per_task;
-        SubmitTask([sample, sampling_sz, promise]() {
+        in_flight_sampling_tasks_.fetch_add(1);
+        SubmitTask([this, sample, sampling_sz, promise]() {
             std::vector<std::int64_t> keys;
             std::vector<std::map<std::string, std::string>> maps;
             const auto ec = sample(sampling_sz, keys, maps);
             if (ec != ErrorCode::EC_OK) {
                 promise->set_value({ec, nullptr, nullptr});
-                return;
+            } else {
+                promise->set_value(
+                    {ErrorCode::EC_OK,
+                     std::make_shared<std::vector<std::int64_t>>(std::move(keys)),
+                     std::make_shared<std::vector<std::map<std::string, std::string>>>(std::move(maps))});
             }
-            promise->set_value({ErrorCode::EC_OK,
-                                std::make_shared<std::vector<std::int64_t>>(std::move(keys)),
-                                std::make_shared<std::vector<std::map<std::string, std::string>>>(std::move(maps))});
+            in_flight_sampling_tasks_.fetch_sub(1);
         });
         sampling_sz_todo -= sampling_sz;
     }
 
     bool result = true;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(future_timeout_ms_.load());
     for (auto &fut : futures) {
         if (fut.valid()) {
-            // drain all the known futures with bounded waiting time
-            const std::uint32_t timeout_ms = future_timeout_ms_.load();
-            if (fut.wait_for(std::chrono::milliseconds(timeout_ms)) != std::future_status::ready) {
-                LOG_WITH_ID(WARN, "key sampling task timed out after [%u] ms", timeout_ms);
+            if (const auto remaining = deadline - std::chrono::steady_clock::now();
+                remaining <= std::chrono::milliseconds::zero() ||
+                fut.wait_for(remaining) != std::future_status::ready) {
+                LOG_WITH_ID(WARN, "key sampling task timed out, deadline exceeded");
                 result = false;
-                continue;
-            }
-            if (!result) {
-                // some tasks already failed, no need to extract data any further
-                continue;
+                break;
             }
 
             if (auto key_sampling_res = fut.get(); key_sampling_res.ec != ErrorCode::EC_OK) {
                 result = false;
+                break;
             } else {
                 out_keys.insert(out_keys.end(),
                                 std::make_move_iterator(key_sampling_res.keys->begin()),
@@ -816,7 +831,13 @@ bool CacheReclaimer::DoKeySampling(RequestContext *request_context,
             }
         } else {
             result = false;
+            break;
         }
+    }
+    if (!result) {
+        // signal cancellation so still-running tasks abort early at the
+        // next checkpoint
+        cancelled->store(true, std::memory_order_relaxed);
     }
     return result;
 }

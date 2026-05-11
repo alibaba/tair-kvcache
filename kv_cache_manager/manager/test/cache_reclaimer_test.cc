@@ -2851,7 +2851,7 @@ TEST_F(CacheReclaimerTest, TestDoKeySampling) {
 
         std::vector<std::int64_t> keys;
         std::vector<std::map<std::string, std::string>> maps;
-        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_.get(), instance_infos.front(), keys, maps));
+        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
         ASSERT_EQ(sample_reclaim_keys.size(), keys.size());
         ASSERT_EQ(get_out_properties.size(), maps.size());
     }
@@ -2862,7 +2862,7 @@ TEST_F(CacheReclaimerTest, TestDoKeySampling) {
 
         std::vector<std::int64_t> keys;
         std::vector<std::map<std::string, std::string>> maps;
-        ASSERT_FALSE(cache_reclaimer_->DoKeySampling(request_context_.get(), instance_infos.front(), keys, maps));
+        ASSERT_FALSE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
     }
 
     {
@@ -2871,7 +2871,7 @@ TEST_F(CacheReclaimerTest, TestDoKeySampling) {
 
         std::vector<std::int64_t> keys;
         std::vector<std::map<std::string, std::string>> maps;
-        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_.get(), instance_infos.front(), keys, maps));
+        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
         ASSERT_EQ(sample_reclaim_keys.size(), keys.size());
         ASSERT_EQ(get_out_properties.size(), maps.size());
     }
@@ -2882,7 +2882,7 @@ TEST_F(CacheReclaimerTest, TestDoKeySampling) {
 
         std::vector<std::int64_t> keys;
         std::vector<std::map<std::string, std::string>> maps;
-        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_.get(), instance_infos.front(), keys, maps));
+        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
         ASSERT_EQ(1000, keys.size());
         ASSERT_EQ(1000, maps.size());
     }
@@ -2893,7 +2893,7 @@ TEST_F(CacheReclaimerTest, TestDoKeySampling) {
 
         std::vector<std::int64_t> keys;
         std::vector<std::map<std::string, std::string>> maps;
-        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_.get(), instance_infos.front(), keys, maps));
+        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
         ASSERT_EQ(1000, keys.size());
         ASSERT_EQ(1000, maps.size());
     }
@@ -2904,7 +2904,7 @@ TEST_F(CacheReclaimerTest, TestDoKeySampling) {
 
         std::vector<std::int64_t> keys;
         std::vector<std::map<std::string, std::string>> maps;
-        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_.get(), instance_infos.front(), keys, maps));
+        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
         ASSERT_EQ(999, keys.size());
         ASSERT_EQ(999, maps.size());
     }
@@ -2915,7 +2915,7 @@ TEST_F(CacheReclaimerTest, TestDoKeySampling) {
 
         std::vector<std::int64_t> keys;
         std::vector<std::map<std::string, std::string>> maps;
-        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_.get(), instance_infos.front(), keys, maps));
+        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
         ASSERT_EQ(1001, keys.size());
         ASSERT_EQ(1001, maps.size());
     }
@@ -2926,7 +2926,7 @@ TEST_F(CacheReclaimerTest, TestDoKeySampling) {
 
         std::vector<std::int64_t> keys;
         std::vector<std::map<std::string, std::string>> maps;
-        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_.get(), instance_infos.front(), keys, maps));
+        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
         ASSERT_EQ(1, keys.size());
         // sampling_size_ <= delete_batch_size, will not get properties
         ASSERT_EQ(0, maps.size());
@@ -2943,7 +2943,7 @@ TEST_F(CacheReclaimerTest, TestDoKeySampling) {
 
         std::vector<std::int64_t> keys;
         std::vector<std::map<std::string, std::string>> maps;
-        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_.get(), instance_infos.front(), keys, maps));
+        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
         ASSERT_EQ(91, keys.size());
         ASSERT_EQ(91, maps.size());
     }
@@ -2976,10 +2976,21 @@ TEST_F(CacheReclaimerTest, TestDoKeySamplingFutureTimeout_SampleReclaimKeysHangs
 
     std::vector<std::int64_t> keys;
     std::vector<std::map<std::string, std::string>> maps;
-    ASSERT_FALSE(cache_reclaimer_->DoKeySampling(request_context_.get(), instance_infos.front(), keys, maps));
 
-    // wait for the hanging tasks to complete so they don't interfere
-    std::this_thread::sleep_for(std::chrono::milliseconds(600));
+    const auto t0 = std::chrono::steady_clock::now();
+    ASSERT_FALSE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+
+    // should return within the timeout budget (~50ms), not wait for the full 500ms task
+    ASSERT_LT(elapsed, std::chrono::milliseconds(300));
+
+    // in-flight counter was incremented for 2 tasks
+    ASSERT_GT(cache_reclaimer_->in_flight_sampling_tasks_.load(), 0u);
+
+    // wait for background tasks to finish naturally
+    while (cache_reclaimer_->in_flight_sampling_tasks_.load() > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
 }
 
 TEST_F(CacheReclaimerTest, TestDoKeySamplingFutureTimeout_GetPropertiesHangs) {
@@ -3010,10 +3021,12 @@ TEST_F(CacheReclaimerTest, TestDoKeySamplingFutureTimeout_GetPropertiesHangs) {
 
     std::vector<std::int64_t> keys;
     std::vector<std::map<std::string, std::string>> maps;
-    ASSERT_FALSE(cache_reclaimer_->DoKeySampling(request_context_.get(), instance_infos.front(), keys, maps));
+    ASSERT_FALSE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
 
-    // wait for the hanging tasks to complete so they don't interfere
-    std::this_thread::sleep_for(std::chrono::milliseconds(600));
+    // wait for background tasks to finish naturally
+    while (cache_reclaimer_->in_flight_sampling_tasks_.load() > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
 }
 
 TEST_F(CacheReclaimerTest, TestDoKeySamplingFutureTimeout_NoTimeoutOnFastTasks) {
@@ -3044,8 +3057,90 @@ TEST_F(CacheReclaimerTest, TestDoKeySamplingFutureTimeout_NoTimeoutOnFastTasks) 
 
     std::vector<std::int64_t> keys;
     std::vector<std::map<std::string, std::string>> maps;
-    ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_.get(), instance_infos.front(), keys, maps));
+    ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
     ASSERT_EQ(10u, keys.size());
+
+    // all tasks completed, in-flight should be zero
+    ASSERT_EQ(0u, cache_reclaimer_->in_flight_sampling_tasks_.load());
+}
+
+TEST_F(CacheReclaimerTest, TestDoKeySamplingFutureTimeout_DeadlineBoundsAllFutures) {
+    // verify that the total wait is bounded by a single deadline, not
+    // N * timeout (where N is the number of worker tasks)
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    get_out_properties = {
+        {{PROPERTY_LRU_TIME, "0"}},
+        {{PROPERTY_LRU_TIME, "1"}},
+        {{PROPERTY_LRU_TIME, "2"}},
+        {{PROPERTY_LRU_TIME, "3"}},
+        {{PROPERTY_LRU_TIME, "4"}},
+        {{PROPERTY_LRU_TIME, "5"}},
+        {{PROPERTY_LRU_TIME, "6"}},
+        {{PROPERTY_LRU_TIME, "7"}},
+        {{PROPERTY_LRU_TIME, "8"}},
+        {{PROPERTY_LRU_TIME, "9"}},
+    };
+
+    // 100ms timeout, 500ms delay; 5 worker tasks should all time out
+    // but total wait should be ~100ms, not 5 * 100ms
+    cache_reclaimer_->future_timeout_ms_.store(100);
+    mi_sample_reclaim_delay = std::chrono::milliseconds{500};
+
+    cache_reclaimer_->sampling_size_.store(10);
+    cache_reclaimer_->sampling_size_per_task_.store(2); // 5 tasks
+
+    std::vector<std::int64_t> keys;
+    std::vector<std::map<std::string, std::string>> maps;
+
+    const auto t0 = std::chrono::steady_clock::now();
+    ASSERT_FALSE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+
+    // should be bounded by ~100ms deadline, not 500ms (5 tasks * 100ms)
+    ASSERT_LT(elapsed, std::chrono::milliseconds(300));
+
+    // wait for background tasks to finish
+    while (cache_reclaimer_->in_flight_sampling_tasks_.load() > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+}
+
+TEST_F(CacheReclaimerTest, TestDoKeySamplingFutureTimeout_WorkerSaturationGuard) {
+    // when all workers are occupied by timed-out tasks, subsequent
+    // DoKeySampling calls should fail fast without submitting more work
+    sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+    get_out_properties = {
+        {{PROPERTY_LRU_TIME, "0"}},
+        {{PROPERTY_LRU_TIME, "1"}},
+        {{PROPERTY_LRU_TIME, "2"}},
+        {{PROPERTY_LRU_TIME, "3"}},
+        {{PROPERTY_LRU_TIME, "4"}},
+        {{PROPERTY_LRU_TIME, "5"}},
+        {{PROPERTY_LRU_TIME, "6"}},
+        {{PROPERTY_LRU_TIME, "7"}},
+        {{PROPERTY_LRU_TIME, "8"}},
+        {{PROPERTY_LRU_TIME, "9"}},
+    };
+
+    // simulate saturated worker pool by setting in_flight >= workers_.size()
+    cache_reclaimer_->in_flight_sampling_tasks_.store(cache_reclaimer_->workers_.size());
+
+    cache_reclaimer_->future_timeout_ms_.store(5000);
+    mi_sample_reclaim_delay = std::chrono::milliseconds{0};
+    cache_reclaimer_->sampling_size_.store(10);
+    cache_reclaimer_->sampling_size_per_task_.store(5);
+
+    std::vector<std::int64_t> keys;
+    std::vector<std::map<std::string, std::string>> maps;
+
+    // should immediately return false without submitting new work
+    const auto t0 = std::chrono::steady_clock::now();
+    ASSERT_FALSE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    ASSERT_LT(elapsed, std::chrono::milliseconds(50));
+
+    // restore
+    cache_reclaimer_->in_flight_sampling_tasks_.store(0);
 }
 
 TEST_F(CacheReclaimerTest, TestDupKeys) {
