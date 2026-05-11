@@ -42,6 +42,7 @@ cc_library(
     ],
     deps = [
         "//kv_cache_manager/common",
+        "//kv_cache_manager/common:service_discovery",
         "//kv_cache_manager/common:standard_uri",
     ],
 )

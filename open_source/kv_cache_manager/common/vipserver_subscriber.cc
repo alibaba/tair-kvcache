@@ -4,18 +4,24 @@
 
 namespace kv_cache_manager {
 
-bool VIPServerSubscriber::init(const std::string &domain) {
-    KVCM_LOG_ERROR("no implementation for VIPServerSubscriber");
+bool VIPServerSubscriber::Init(const std::string &service_address) {
+    KVCM_LOG_ERROR("no implementation for VIPServerSubscriber::Init, service_address=%s", service_address.c_str());
     return false;
 }
 
-bool VIPServerSubscriber::getOneAddress(std::string &address) const {
-    KVCM_LOG_ERROR("no implementation for VIPServerSubscriber");
+bool VIPServerSubscriber::GetAllEndpoints(std::vector<ServiceEndpoint> &endpoints) {
+    KVCM_LOG_ERROR("no implementation for VIPServerSubscriber::GetAllEndpoints");
+    endpoints.clear();
     return false;
 }
 
-bool VIPServerSubscriber::getAllAddresses(std::vector<std::string> &addresses) const {
-    KVCM_LOG_ERROR("no implementation for VIPServerSubscriber");
+bool VIPServerSubscriber::GetOneEndpoint(ServiceEndpoint &endpoint) {
+    KVCM_LOG_ERROR("no implementation for VIPServerSubscriber::GetOneEndpoint");
+    return false;
+}
+
+bool VIPServerSubscriber::Refresh() {
+    KVCM_LOG_ERROR("no implementation for VIPServerSubscriber::Refresh");
     return false;
 }
 

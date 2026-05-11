@@ -104,8 +104,7 @@ bool MooncakeStorageSpec::ValidateRequiredFields(std::string &invalid_fields) co
 }
 std::string TairMemPoolStorageSpec::ToString() const {
     std::ostringstream oss;
-    oss << "enable_vipserver: " << enable_vipserver_ << ", domain: " << domain_
-        << ", vipserver_domain: " << vipserver_domain_ << ", timeout: " << timeout_;
+    oss << "domain: " << domain_ << ", timeout: " << timeout_ << ", service_discovery_url: " << service_discovery_url_;
     return oss.str();
 }
 bool TairMemPoolStorageSpec::ValidateRequiredFields(std::string &invalid_fields) const {
@@ -250,18 +249,16 @@ void MooncakeStorageSpec::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffe
 
 // TairMemPoolStorageSpec
 bool TairMemPoolStorageSpec::FromRapidValue(const rapidjson::Value &rapid_value) {
-    KVCM_JSON_GET_MACRO(rapid_value, "enable_vipserver", enable_vipserver_);
-    KVCM_JSON_GET_MACRO(rapid_value, "vipserver_domain", vipserver_domain_);
     KVCM_JSON_GET_MACRO(rapid_value, "domain", domain_);
     KVCM_JSON_GET_MACRO(rapid_value, "timeout", timeout_);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "service_discovery_url", service_discovery_url_, std::string(""));
     return true;
 }
 
 void TairMemPoolStorageSpec::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
-    Put(writer, "enable_vipserver", enable_vipserver_);
-    Put(writer, "vipserver_domain", vipserver_domain_);
     Put(writer, "domain", domain_);
     Put(writer, "timeout", timeout_);
+    Put(writer, "service_discovery_url", service_discovery_url_);
 }
 
 bool NfsStorageSpec::FromRapidValue(const rapidjson::Value &rapid_value) {
