@@ -6,6 +6,7 @@
 #include <variant>
 #include <vector>
 
+#include "kv_cache_manager/common/env_util.h"
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
@@ -25,9 +26,12 @@
 #define API_CALL_GUARD(api_name, is_leader_only)                                                                       \
     request_context->set_api_name(api_name);                                                                           \
     response->mutable_header()->set_request_id(request_context->request_id());                                         \
-    std::string request_debug;                                                                                         \
-    ProtoMessageJsonUtil::ToJson(request, request_debug);                                                              \
-    request_context->set_request_debug(request_debug);                                                                 \
+    static const bool kAccessLogWithPayload = EnvUtil::GetEnv<bool>("KVCM_ACCESS_LOG_WITH_PAYLOAD", true);             \
+    if (kAccessLogWithPayload) {                                                                                       \
+        std::string request_debug;                                                                                     \
+        ProtoMessageJsonUtil::ToJson(request, request_debug);                                                          \
+        request_context->set_request_debug(request_debug);                                                             \
+    }                                                                                                                  \
     if (!CheckAndIncrementRequestCount(is_leader_only)) {                                                              \
         auto *header = response->mutable_header();                                                                     \
         auto *status = header->mutable_status();                                                                       \
@@ -39,9 +43,11 @@
     }                                                                                                                  \
     ServiceCallGuard service_call_guard(                                                                               \
         cache_manager_.get(), request_context, metrics_reporter_.get(), [request_context, response, this]() {          \
-            std::string response_debug;                                                                                \
-            ProtoMessageJsonUtil::ToJson(response, response_debug);                                                    \
-            request_context->set_response_debug(response_debug);                                                       \
+            if (kAccessLogWithPayload) {                                                                               \
+                std::string response_debug;                                                                            \
+                ProtoMessageJsonUtil::ToJson(response, response_debug);                                                \
+                request_context->set_response_debug(response_debug);                                                   \
+            }                                                                                                          \
             DecrementRequestCount(is_leader_only);                                                                     \
         });
 
