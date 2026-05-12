@@ -10,6 +10,62 @@
 
 namespace kv_cache_manager {
 
+// RAII guard that records a begin timestamp on construction and writes
+// (now - begin) into the target Gauge on explicit reset (move-assign) or,
+// when auto_finish is true, on destruction.
+//
+// Two usage modes controlled by auto_finish:
+//   - CHRONO_SCOPE (auto_finish=true):  records on destruction (scope guard)
+//   - MARK_BEGIN/END (auto_finish=false): records only via MARK_END (move-assign);
+//     if MARK_END is never reached (early return), destructor is a no-op.
+//
+// Stores begin_us_ per-instance (stack / member), eliminating the
+// multi-thread race that existed when begin_ lived on a shared collector.
+class ChronoScopeGuard {
+public:
+    ChronoScopeGuard() noexcept = default;
+
+    explicit ChronoScopeGuard(Gauge *g, bool auto_finish = true) noexcept
+        : gauge_(g), begin_us_(g ? TimestampUtil::GetCurrentTimeUs() : 0), auto_finish_(auto_finish) {}
+
+    ChronoScopeGuard(const ChronoScopeGuard &) = delete;
+    ChronoScopeGuard &operator=(const ChronoScopeGuard &) = delete;
+
+    ChronoScopeGuard(ChronoScopeGuard &&o) noexcept
+        : gauge_(o.gauge_), begin_us_(o.begin_us_), auto_finish_(o.auto_finish_) {
+        o.gauge_ = nullptr;
+    }
+
+    ChronoScopeGuard &operator=(ChronoScopeGuard &&o) noexcept {
+        if (this != &o) {
+            Finish();
+            gauge_ = o.gauge_;
+            begin_us_ = o.begin_us_;
+            auto_finish_ = o.auto_finish_;
+            o.gauge_ = nullptr;
+        }
+        return *this;
+    }
+
+    ~ChronoScopeGuard() {
+        if (auto_finish_) {
+            Finish();
+        }
+    }
+
+private:
+    void Finish() noexcept {
+        if (gauge_) {
+            *gauge_ = static_cast<double>(TimestampUtil::GetCurrentTimeUs() - begin_us_);
+            gauge_ = nullptr;
+        }
+    }
+
+    Gauge *gauge_ = nullptr;
+    std::int64_t begin_us_ = 0;
+    bool auto_finish_ = false;
+};
+
 /* ---------------------- Generic Help Macros ----------------------- */
 
 #ifndef KVCM_METRICS_COLLECTOR_
@@ -28,24 +84,18 @@ namespace kv_cache_manager {
     } while (0)
 #endif
 
+#ifndef KVCM_METRICS_COLLECTOR_CHRONO_SCOPE
+#define KVCM_METRICS_COLLECTOR_CHRONO_SCOPE(ptr, method) ((ptr) ? (ptr)->Make##method##Scope() : ChronoScopeGuard{})
+#endif
+
 #ifndef KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN
 #define KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(ptr, method)                                                          \
-    do {                                                                                                               \
-        if (!(ptr)) {                                                                                                  \
-            break;                                                                                                     \
-        }                                                                                                              \
-        (ptr)->Mark##method##Begin();                                                                                  \
-    } while (0)
+    auto kvcm_chrono_scope_##method##_ = ((ptr) ? (ptr)->Make##method##Scope(false) : ChronoScopeGuard{})
 #endif
 
 #ifndef KVCM_METRICS_COLLECTOR_CHRONO_MARK_END
 #define KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(ptr, method)                                                            \
-    do {                                                                                                               \
-        if (!(ptr)) {                                                                                                  \
-            break;                                                                                                     \
-        }                                                                                                              \
-        (ptr)->Mark##method##End();                                                                                    \
-    } while (0)
+    kvcm_chrono_scope_##method##_ = ChronoScopeGuard {}
 #endif
 
 #ifndef KVCM_METRICS_COLLECTOR_SET_METRICS
@@ -187,13 +237,9 @@ private:                                                                        
 #define KVCM_CHRONO_METRICS(group, name, method)                                                                       \
     KVCM_GAUGE_METRICS(group, name)                                                                                    \
 public:                                                                                                                \
-    void Mark##method##Begin() { group##_##name##_begin_ = TimestampUtil::GetCurrentTimeUs(); }                        \
-    void Mark##method##End() {                                                                                         \
-        METRICS_(group, name) = static_cast<double>(TimestampUtil::GetCurrentTimeUs() - group##_##name##_begin_);      \
-    }                                                                                                                  \
-                                                                                                                       \
-private:                                                                                                               \
-    std::int64_t group##_##name##_begin_ = 0;
+    ChronoScopeGuard Make##method##Scope(bool auto_finish = true) {                                                    \
+        return ChronoScopeGuard(&METRICS_(group, name), auto_finish);                                                  \
+    }
 #endif
 
 /* ------------------- ServiceMetricsCollector ---------------------- */

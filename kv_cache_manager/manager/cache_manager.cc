@@ -365,11 +365,9 @@ CacheManager::GetCacheLocation(RequestContext *request_context,
     //   - QT_BATCH_GET -> manager.batch_get_time_us
     //   - 其它（QT_PREFIX_MATCH / QT_REVERSE_ROLL_SW_MATCH）-> manager.prefix_match_time_us
     // 两个 gauge 互斥写入，单次请求只会有一个非零，便于大盘按 QueryType 区分。
-    if (query_type == QueryType::QT_BATCH_GET) {
-        KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, ManagerBatchGet);
-    } else {
-        KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, ManagerPrefixMatch);
-    }
+    auto query_scope = (query_type == QueryType::QT_BATCH_GET)
+                           ? KVCM_METRICS_COLLECTOR_CHRONO_SCOPE(service_metrics_collector, ManagerBatchGet)
+                           : KVCM_METRICS_COLLECTOR_CHRONO_SCOPE(service_metrics_collector, ManagerPrefixMatch);
     CacheLocationVector cache_locations;
     KeyVector query_keys = keys;
     ec = PerformCacheLocationQuery(request_context,
@@ -383,11 +381,7 @@ CacheManager::GetCacheLocation(RequestContext *request_context,
                                    sw_size,
                                    query_keys,
                                    cache_locations);
-    if (query_type == QueryType::QT_BATCH_GET) {
-        KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, ManagerBatchGet);
-    } else {
-        KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, ManagerPrefixMatch);
-    }
+    query_scope = ChronoScopeGuard{};
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, prefix_match_len, cache_locations.size());
     RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, CacheLocationViewVecWrapper, "get cache location failed");
     FilterLocationSpecByName(cache_locations, location_spec_names);
@@ -546,6 +540,7 @@ CacheManager::StartWriteCache(RequestContext *request_context,
                                      new_location_spec_group_names,
                                      block_mask);
     }
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, ManagerFilterWriteCache);
     RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, filter_ec, StartWriteCacheInfo, "filter write cache failed");
 
     std::vector<std::string> location_ids;
@@ -554,7 +549,6 @@ CacheManager::StartWriteCache(RequestContext *request_context,
         // if no new keys, delete this write_session_id as soon as possible
         write_timeout_seconds = 10; // seconds
     } else {
-        KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, ManagerFilterWriteCache);
         RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, StartWriteCacheInfo, "start write cache failed");
         KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, GenWriteLocation);
         ec = GenWriteLocation(request_context, instance_id, new_keys, new_location_spec_group_names, new_locations);

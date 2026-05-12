@@ -1,5 +1,7 @@
 #include <memory>
+#include <thread>
 #include <unistd.h>
+#include <vector>
 
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
@@ -259,4 +261,114 @@ TEST_F(MetricsCollectorTest, MetaIndexerAccumulativeMetricsCollectorTest) {
     SET_METRICS_(p, meta_indexer, total_cache_usage, 456.);
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, total_key_count), 123.);
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, total_cache_usage), 456.);
+}
+
+TEST_F(MetricsCollectorTest, ChronoScopeConcurrentTest) {
+    metrics_collector_ = std::make_shared<ServiceMetricsCollector>(metrics_registry_);
+    metrics_collector_->Init();
+
+    auto p = std::dynamic_pointer_cast<ServiceMetricsCollector>(metrics_collector_);
+    ASSERT_NE(nullptr, p);
+
+    constexpr int kThreadCount = 8;
+    constexpr int kIterations = 50;
+    constexpr int kSleepUs = 1000; // 1ms
+
+    for (int iter = 0; iter < kIterations; ++iter) {
+        std::vector<std::thread> threads;
+        threads.reserve(kThreadCount);
+        for (int t = 0; t < kThreadCount; ++t) {
+            threads.emplace_back([&p]() {
+                auto scope = KVCM_METRICS_COLLECTOR_CHRONO_SCOPE(p, MetaSearcherIndexerGet);
+                usleep(kSleepUs);
+            });
+        }
+        for (auto &th : threads) {
+            th.join();
+        }
+        EXPECT_GE(GET(p, meta_searcher, indexer_get_time_us), static_cast<double>(kSleepUs));
+    }
+}
+
+TEST_F(MetricsCollectorTest, MarkBeginWithoutMarkEndDoesNotRecord) {
+    metrics_collector_ = std::make_shared<ServiceMetricsCollector>(metrics_registry_);
+    metrics_collector_->Init();
+
+    auto p = std::dynamic_pointer_cast<ServiceMetricsCollector>(metrics_collector_);
+    ASSERT_NE(nullptr, p);
+
+    EXPECT_DOUBLE_EQ(GET(p, manager, batch_get_location_time_us), 0.);
+
+    // MARK_BEGIN without MARK_END: guard destructor should NOT write
+    {
+        KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(p, ManagerBatchGetLocation);
+        usleep(1000);
+    }
+    EXPECT_DOUBLE_EQ(GET(p, manager, batch_get_location_time_us), 0.);
+
+    // MARK_BEGIN + MARK_END: should record normally
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(p, ManagerBatchGetLocation);
+    usleep(1000);
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(p, ManagerBatchGetLocation);
+    EXPECT_GT(GET(p, manager, batch_get_location_time_us), 1000.0);
+}
+
+TEST_F(MetricsCollectorTest, ChronoScopeAutoFinishOnDestruct) {
+    metrics_collector_ = std::make_shared<ServiceMetricsCollector>(metrics_registry_);
+    metrics_collector_->Init();
+
+    auto p = std::dynamic_pointer_cast<ServiceMetricsCollector>(metrics_collector_);
+    ASSERT_NE(nullptr, p);
+
+    EXPECT_DOUBLE_EQ(GET(p, meta_searcher, indexer_get_time_us), 0.);
+
+    // CHRONO_SCOPE without explicit end: guard destructor SHOULD write
+    {
+        auto scope = KVCM_METRICS_COLLECTOR_CHRONO_SCOPE(p, MetaSearcherIndexerGet);
+        usleep(1000);
+    }
+    EXPECT_GT(GET(p, meta_searcher, indexer_get_time_us), 1000.0);
+}
+
+// Verify per-scope isolation with a shared collector, asymmetric sleep,
+// and staggered start.  With the old shared-begin_ member, thread B's
+// MarkBegin() would overwrite thread A's begin_, causing A to compute
+// ~3 ms instead of ~5 ms.  Per-scope begin_us_ on the stack keeps each
+// measurement independent.
+TEST_F(MetricsCollectorTest, ChronoScopeAsymmetricConcurrentTest) {
+    constexpr int kIterations = 20;
+    constexpr int kLongSleepUs = 5000;  // 5 ms – thread A
+    constexpr int kShortSleepUs = 1000; // 1 ms – thread B
+    constexpr int kStaggerUs = 2000;    // 2 ms delay before starting thread B
+
+    for (int iter = 0; iter < kIterations; ++iter) {
+        metrics_collector_ = std::make_shared<ServiceMetricsCollector>(metrics_registry_);
+        metrics_collector_->Init();
+        auto p = std::dynamic_pointer_cast<ServiceMetricsCollector>(metrics_collector_);
+        ASSERT_NE(nullptr, p);
+
+        // Thread A: starts immediately, sleeps 5 ms (finishes last → last writer to Gauge)
+        std::thread t_long([&p]() {
+            auto scope = KVCM_METRICS_COLLECTOR_CHRONO_SCOPE(p, MetaSearcherIndexerGet);
+            usleep(kLongSleepUs);
+        });
+
+        // Stagger: wait 2 ms so thread B's MarkBegin timestamp differs from A's
+        usleep(kStaggerUs);
+
+        // Thread B: starts 2 ms later, sleeps 1 ms (finishes at ~3 ms, before A at ~5 ms)
+        std::thread t_short([&p]() {
+            auto scope = KVCM_METRICS_COLLECTOR_CHRONO_SCOPE(p, MetaSearcherIndexerGet);
+            usleep(kShortSleepUs);
+        });
+
+        t_short.join();
+        t_long.join();
+
+        // Thread A finishes last and overwrites the Gauge.
+        // Correct per-scope: Gauge ≈ 5 ms (A's own begin_us_)
+        // Broken shared begin_: Gauge ≈ 3 ms (A would use B's begin_)
+        double val = GET(p, meta_searcher, indexer_get_time_us);
+        EXPECT_GE(val, static_cast<double>(kLongSleepUs - 500));
+    }
 }
