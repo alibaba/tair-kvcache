@@ -530,6 +530,7 @@ CacheManager::StartWriteCache(RequestContext *request_context,
                                      new_location_spec_group_names,
                                      block_mask);
     }
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, ManagerFilterWriteCache);
     RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, filter_ec, StartWriteCacheInfo, "filter write cache failed");
 
     std::vector<std::string> location_ids;
@@ -538,7 +539,6 @@ CacheManager::StartWriteCache(RequestContext *request_context,
         // if no new keys, delete this write_session_id as soon as possible
         write_timeout_seconds = 10; // seconds
     } else {
-        KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, ManagerFilterWriteCache);
         RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, StartWriteCacheInfo, "start write cache failed");
         KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, GenWriteLocation);
         ec = GenWriteLocation(request_context, instance_id, new_keys, new_location_spec_group_names, new_locations);
