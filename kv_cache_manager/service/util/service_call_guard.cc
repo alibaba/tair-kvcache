@@ -105,7 +105,8 @@ ServiceCallGuard::ServiceCallGuard(CacheManager *cache_manager,
                                    RequestContext *request_context,
                                    MetricsReporter *metrics_reporter)
     : cache_manager_(cache_manager), request_context_(request_context), metrics_reporter_(metrics_reporter) {
-    query_begin_time_us_ = TimestampUtil::GetCurrentTimeUs();
+    auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, ServiceQuery);
 }
 
 ServiceCallGuard::ServiceCallGuard(CacheManager *cache_manager,
@@ -116,17 +117,15 @@ ServiceCallGuard::ServiceCallGuard(CacheManager *cache_manager,
     , request_context_(request_context)
     , metrics_reporter_(metrics_reporter)
     , response_debug_setter_(std::move(response_debug_setter)) {
-    query_begin_time_us_ = TimestampUtil::GetCurrentTimeUs();
+    auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, ServiceQuery);
 }
 
 ServiceCallGuard::~ServiceCallGuard() {
     assert(cache_manager_);
     assert(request_context_);
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context_->metrics_collector());
-    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector,
-                                       service,
-                                       query_rt_us,
-                                       static_cast<double>(TimestampUtil::GetCurrentTimeUs() - query_begin_time_us_));
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, ServiceQuery);
     if (response_debug_setter_) {
         response_debug_setter_();
     }

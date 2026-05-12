@@ -1,6 +1,5 @@
 #pragma once
 
-#include <cstdint>
 #include <functional>
 
 namespace kv_cache_manager {
@@ -25,7 +24,6 @@ private:
     RequestContext *request_context_;
     MetricsReporter *metrics_reporter_;
     std::function<void()> response_debug_setter_;
-    int64_t query_begin_time_us_ = 0;
 };
 
 } // namespace kv_cache_manager
