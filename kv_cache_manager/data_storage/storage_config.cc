@@ -104,8 +104,7 @@ bool MooncakeStorageSpec::ValidateRequiredFields(std::string &invalid_fields) co
 }
 std::string TairMemPoolStorageSpec::ToString() const {
     std::ostringstream oss;
-    oss << "enable_vipserver: " << enable_vipserver_ << ", domain: " << domain_
-        << ", vipserver_domain: " << vipserver_domain_ << ", timeout: " << timeout_;
+    oss << "domain: " << domain_ << ", timeout: " << timeout_ << ", service_discovery_url: " << service_discovery_url_;
     return oss.str();
 }
 bool TairMemPoolStorageSpec::ValidateRequiredFields(std::string &invalid_fields) const {
@@ -250,18 +249,31 @@ void MooncakeStorageSpec::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffe
 
 // TairMemPoolStorageSpec
 bool TairMemPoolStorageSpec::FromRapidValue(const rapidjson::Value &rapid_value) {
-    KVCM_JSON_GET_MACRO(rapid_value, "enable_vipserver", enable_vipserver_);
-    KVCM_JSON_GET_MACRO(rapid_value, "vipserver_domain", vipserver_domain_);
     KVCM_JSON_GET_MACRO(rapid_value, "domain", domain_);
     KVCM_JSON_GET_MACRO(rapid_value, "timeout", timeout_);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "service_discovery_url", service_discovery_url_, std::string(""));
+
+    // 向后兼容：把已废弃的 enable_vipserver / vipserver_domain 自动迁移成 service_discovery_url，
+    // 兼容旧 admin 工具 / 旧持久化数据。新字段 service_discovery_url 优先级更高，
+    // 已显式指定时不会被旧字段覆盖。
+    if (service_discovery_url_.empty()) {
+        bool legacy_enable_vipserver = false;
+        std::string legacy_vipserver_domain;
+        if (!Get(rapid_value, "enable_vipserver", legacy_enable_vipserver, false) ||
+            !Get(rapid_value, "vipserver_domain", legacy_vipserver_domain, std::string(""))) {
+            return false;
+        }
+        if (legacy_enable_vipserver && !legacy_vipserver_domain.empty()) {
+            service_discovery_url_ = "vipserver://" + legacy_vipserver_domain;
+        }
+    }
     return true;
 }
 
 void TairMemPoolStorageSpec::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
-    Put(writer, "enable_vipserver", enable_vipserver_);
-    Put(writer, "vipserver_domain", vipserver_domain_);
     Put(writer, "domain", domain_);
     Put(writer, "timeout", timeout_);
+    Put(writer, "service_discovery_url", service_discovery_url_);
 }
 
 bool NfsStorageSpec::FromRapidValue(const rapidjson::Value &rapid_value) {

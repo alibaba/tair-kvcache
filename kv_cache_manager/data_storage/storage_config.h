@@ -4,6 +4,7 @@
 #include <cstdint>
 
 #include "kv_cache_manager/common/jsonizable.h"
+#include "kv_cache_manager/common/service_discovery.h"
 
 namespace kv_cache_manager {
 
@@ -132,6 +133,13 @@ private:
     std::string master_server_entry_{"localhost:50051"}; // master server
 };
 
+/**
+ * Tair MemPool（PACE）存储 spec。
+ *
+ * 服务发现配置统一通过 service_discovery_url_ 表达，URL 解析与具体实现选择由
+ * kv_cache_manager::CreateServiceDiscovery() 工厂负责。空字符串表示不使用服务发现，
+ * 直接使用 domain_。具体支持的 URL 形式见 service_discovery_factory.h。
+ */
 class TairMemPoolStorageSpec : public StorageSpec {
 public:
     bool FromRapidValue(const rapidjson::Value &rapid_value) override;
@@ -140,21 +148,19 @@ public:
     std::string ToString() const override;
     const std::string &cluster_name() const { return cluster_name_; }
     const std::string &domain() const { return domain_; }
-    const std::string &vipserver_domain() const { return vipserver_domain_; }
     int64_t timeout() const { return timeout_; }
-    const bool enable_vipserver() const { return enable_vipserver_; }
+    const std::string &service_discovery_url() const { return service_discovery_url_; }
+
     void set_domain(const std::string &domain) { domain_ = domain; }
-    void set_vipserver_domain(const std::string &vipserver_domain) { vipserver_domain_ = vipserver_domain; }
     void set_cluster_name(const std::string &cluster_name) { cluster_name_ = cluster_name; }
     void set_timeout(int64_t timeout) { timeout_ = timeout; }
-    void set_enable_vipserver(bool enable_vipserver) { enable_vipserver_ = enable_vipserver; }
+    void set_service_discovery_url(const std::string &url) { service_discovery_url_ = url; }
 
 private:
-    std::string domain_;            // 统一接入
-    std::string vipserver_domain_;  // vipserver
-    int64_t timeout_{0};            // 目前连接超时、请求超时时间的值一样
-    bool enable_vipserver_ = false; // 是否使用vipserver
-    std::string cluster_name_;      // TODO proto中没有这个字段并且未使用，考虑删除
+    std::string domain_;                // 统一接入
+    int64_t timeout_{0};                // 目前连接超时、请求超时时间的值一样
+    std::string service_discovery_url_; // 见类注释
+    std::string cluster_name_;          // TODO proto中没有这个字段并且未使用，考虑删除
 };
 
 class NfsStorageSpec : public StorageSpec {

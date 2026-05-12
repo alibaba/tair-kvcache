@@ -163,3 +163,30 @@ cc_test(
         "//kv_cache_manager/common:unittest",
     ],
 )
+
+cc_test(
+    name = "service_discovery_factory_test",
+    srcs = [
+        "service_discovery_factory_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:service_discovery",
+        "//kv_cache_manager/common:service_discovery_factory",
+        "//stub_source/kv_cache_manager/common:spectrum_service_discovery",
+        "//kv_cache_manager/common:static_service_discovery",
+        "//kv_cache_manager/common:unittest",
+    ],
+)
+
+cc_test(
+    name = "service_discovery_test",
+    srcs = [
+        "service_discovery_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:service_discovery",
+        "//kv_cache_manager/common:unittest",
+    ],
+)
