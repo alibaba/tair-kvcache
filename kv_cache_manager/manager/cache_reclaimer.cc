@@ -815,12 +815,15 @@ bool CacheReclaimer::DoKeySampling(const std::shared_ptr<RequestContext> &reques
                 fut.wait_for(remaining) != std::future_status::ready) {
                 LOG_WITH_ID(WARN, "key sampling task timed out, deadline exceeded");
                 result = false;
-                break;
+                break; // timeout must have happened, break early
+            }
+            if (!result) {
+                // some tasks already failed, no need to extract data any further
+                continue;
             }
 
             if (auto key_sampling_res = fut.get(); key_sampling_res.ec != ErrorCode::EC_OK) {
                 result = false;
-                break;
             } else {
                 out_keys.insert(out_keys.end(),
                                 std::make_move_iterator(key_sampling_res.keys->begin()),
@@ -831,7 +834,6 @@ bool CacheReclaimer::DoKeySampling(const std::shared_ptr<RequestContext> &reques
             }
         } else {
             result = false;
-            break;
         }
     }
     if (!result) {
