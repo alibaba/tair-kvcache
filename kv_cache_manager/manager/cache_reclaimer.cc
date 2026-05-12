@@ -793,6 +793,7 @@ bool CacheReclaimer::DoKeySampling(const std::shared_ptr<RequestContext> &reques
             std::vector<std::int64_t> keys;
             std::vector<std::map<std::string, std::string>> maps;
             const auto ec = sample(sampling_sz, keys, maps);
+            in_flight_sampling_tasks_.fetch_sub(1);
             if (ec != ErrorCode::EC_OK) {
                 promise->set_value({ec, nullptr, nullptr});
             } else {
@@ -801,7 +802,6 @@ bool CacheReclaimer::DoKeySampling(const std::shared_ptr<RequestContext> &reques
                      std::make_shared<std::vector<std::int64_t>>(std::move(keys)),
                      std::make_shared<std::vector<std::map<std::string, std::string>>>(std::move(maps))});
             }
-            in_flight_sampling_tasks_.fetch_sub(1);
         });
         sampling_sz_todo -= sampling_sz;
     }
