@@ -108,6 +108,7 @@ void LRUHandleTable::Resize() {
 
 LRUCacheShard::LRUCacheShard(size_t capacity,
                              bool strict_capacity_limit,
+                             bool no_evict_on_insert,
                              double high_pri_pool_ratio,
                              double low_pri_pool_ratio,
                              bool use_adaptive_mutex,
@@ -120,6 +121,7 @@ LRUCacheShard::LRUCacheShard(size_t capacity,
     , high_pri_pool_usage_(0)
     , low_pri_pool_usage_(0)
     , strict_capacity_limit_(strict_capacity_limit)
+    , no_evict_on_insert_(no_evict_on_insert)
     , high_pri_pool_ratio_(high_pri_pool_ratio)
     , high_pri_pool_capacity_(0)
     , low_pri_pool_ratio_(low_pri_pool_ratio)
@@ -370,7 +372,9 @@ ErrorCode
 LRUCacheShard::DoInsertItemUnsafe(LRUHandle *e, LRUHandle **handle, autovector<LRUHandle *> *last_reference_list) {
     // Free the space following strict LRU policy until enough space
     // is freed or the lru list is empty.
-    EvictFromLRU(e->total_charge, last_reference_list);
+    if (!no_evict_on_insert_) {
+        EvictFromLRU(e->total_charge, last_reference_list);
+    }
 
     if ((usage_ + e->total_charge) > capacity_ && (strict_capacity_limit_ || handle == nullptr)) {
         e->SetInCache(false);
@@ -479,6 +483,22 @@ bool LRUCacheShard::Ref(LRUHandle *e) {
     return true;
 }
 
+void LRUCacheShard::AdjustCharge(LRUHandle *e, ssize_t delta) {
+    std::lock_guard<std::mutex> l(mutex_);
+    assert(e->HasRefs());
+    assert(e->InCache());
+    if (delta > 0) {
+        e->total_charge += static_cast<size_t>(delta);
+        usage_ += static_cast<size_t>(delta);
+    } else if (delta < 0) {
+        size_t decrease = static_cast<size_t>(-delta);
+        decrease = std::min(decrease, e->total_charge);
+        decrease = std::min(decrease, usage_);
+        e->total_charge -= decrease;
+        usage_ -= decrease;
+    }
+}
+
 void LRUCacheShard::SetHighPriorityPoolRatio(double high_pri_pool_ratio) {
     std::lock_guard<std::mutex> l(mutex_);
     high_pri_pool_ratio_ = high_pri_pool_ratio;
@@ -505,8 +525,12 @@ bool LRUCacheShard::Release(LRUHandle *e, bool /*useful*/, bool erase_if_last_re
         was_in_cache = e->InCache();
         if (must_free && was_in_cache) {
             // The item is still in cache, and nobody else holds a reference to it.
-            if (usage_ > capacity_ || erase_if_last_ref) {
-                // The LRU list must be empty since the cache is full.
+            if (erase_if_last_ref || (!no_evict_on_insert_ && usage_ > capacity_)) {
+                // When no_evict_on_insert_ is false: usage > capacity means the
+                // LRU list must be empty (EvictFromLRU drained it on Insert).
+                // When no_evict_on_insert_ is true: skip opportunistic eviction
+                // to avoid silently dropping entries whose charge grew in-place
+                // (via AdjustCharge).
                 assert(lru_.next == &lru_ || erase_if_last_ref);
                 // Take this opportunity and remove the item.
                 table_.Remove(e->key(), e->hash);
@@ -608,7 +632,9 @@ LRUHandle *LRUCacheShard::CreateStandalone(const std::string_view &key,
     {
         std::lock_guard<std::mutex> l(mutex_);
 
-        EvictFromLRU(e->total_charge, &last_reference_list);
+        if (!no_evict_on_insert_) {
+            EvictFromLRU(e->total_charge, &last_reference_list);
+        }
 
         if (strict_capacity_limit_ && (usage_ + e->total_charge) > capacity_) {
             if (allow_uncharged) {
@@ -729,6 +755,7 @@ LRUCache::LRUCache(const LRUCacheOptions &opts) : ShardedCache(opts) {
     InitShards([&](LRUCacheShard *cs) {
         new (cs) LRUCacheShard(per_shard,
                                opts.strict_capacity_limit,
+                               opts.no_evict_on_insert,
                                opts.high_pri_pool_ratio,
                                opts.low_pri_pool_ratio,
                                opts.use_adaptive_mutex,

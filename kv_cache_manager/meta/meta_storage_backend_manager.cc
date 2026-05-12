@@ -479,7 +479,7 @@ std::vector<ErrorCode> MetaStorageBackendManager::Get(const KeyVector &keys,
     KeyTypeVec missing_keys;
     std::vector<size_t> missing_indices;
     for (size_t i = 0; i < keys.size(); ++i) {
-        if ((results[i] == EC_OK && out_field_maps[i].empty()) || results[i] == EC_NOENT) {
+        if (results[i] == EC_NOENT) {
             missing_keys.push_back(keys[i]);
             missing_indices.push_back(i);
         }
@@ -524,7 +524,7 @@ std::vector<ErrorCode> MetaStorageBackendManager::Get(const KeyVector &keys,
     std::vector<std::vector<std::string>> missing_field_names;
     std::vector<size_t> missing_indices;
     for (size_t i = 0; i < keys.size(); ++i) {
-        if ((results[i] == EC_OK && out_field_maps[i].empty()) || results[i] == EC_NOENT) {
+        if (results[i] == EC_NOENT) {
             missing_keys.push_back(keys[i]);
             missing_field_names.push_back(field_names_vec[i]);
             missing_indices.push_back(i);
@@ -568,7 +568,7 @@ std::vector<ErrorCode> MetaStorageBackendManager::GetAllFields(const KeyVector &
     KeyTypeVec missing_keys;
     std::vector<size_t> missing_indices;
     for (size_t i = 0; i < keys.size(); ++i) {
-        if ((results[i] == EC_OK && out_field_maps[i].empty()) || results[i] == EC_NOENT) {
+        if (results[i] == EC_NOENT) {
             missing_keys.push_back(keys[i]);
             missing_indices.push_back(i);
         }
@@ -703,7 +703,7 @@ std::vector<ErrorCode> MetaStorageBackendManager::GetLocationIds(const KeyVector
             KeyTypeVec missing_keys;
             std::vector<size_t> missing_indices;
             for (size_t i = 0; i < keys.size(); ++i) {
-                if ((results[i] == EC_OK && field_names_vec[i].empty()) || results[i] == EC_NOENT) {
+                if (results[i] == EC_NOENT) {
                     missing_keys.push_back(keys[i]);
                     missing_indices.push_back(i);
                 }

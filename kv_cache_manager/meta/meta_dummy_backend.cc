@@ -266,6 +266,10 @@ MetaDummyBackend::DeleteFields(const KeyTypeVec &keys,
     }
     std::vector<ErrorCode> ec_vec;
     for (std::size_t i = 0; i != keys.size(); ++i) {
+        if (field_names_vec[i].empty()) {
+            ec_vec.emplace_back(ErrorCode::EC_OK); // Nothing to delete — idempotent success.
+            continue;
+        }
         ec_vec.emplace_back(DeleteFieldsForOneKey(keys[i], field_names_vec[i]));
         if (ec_vec.back() != ErrorCode::EC_OK && ec_vec.back() != ErrorCode::EC_NOENT) {
             KVCM_LOG_WARN("delete fields failed, key: [%" PRIi64 "], error code: [%" PRIi32 "]",
@@ -308,13 +312,13 @@ std::vector<ErrorCode> MetaDummyBackend::Get(const KeyTypeVec &keys,
 std::vector<ErrorCode> MetaDummyBackend::Get(const KeyTypeVec &keys,
                                              const std::vector<std::vector<std::string>> &field_names_vec,
                                              FieldMapVec &out_field_maps) noexcept {
+    out_field_maps = FieldMapVec(keys.size());
     if (keys.size() != field_names_vec.size()) {
         KVCM_LOG_ERROR(
             "get failed, keys.size: [%zu] != field_names_vec.size: [%zu]", keys.size(), field_names_vec.size());
         return std::vector<ErrorCode>(keys.size(), ErrorCode::EC_BADARGS);
     }
     std::vector<ErrorCode> ec_vec;
-    out_field_maps = FieldMapVec(keys.size());
     for (std::size_t i = 0; i != keys.size(); ++i) {
         ec_vec.emplace_back(GetForOneKey(keys[i], field_names_vec[i], out_field_maps[i]));
         if (ec_vec.back() != ErrorCode::EC_OK && ec_vec.back() != ErrorCode::EC_NOENT) {
@@ -365,9 +369,6 @@ std::vector<ErrorCode> MetaDummyBackend::GetAllFields(const KeyTypeVec &keys, Fi
 ErrorCode MetaDummyBackend::GetAllFieldsForOneKey(const KeyType &key, FieldMap &out_field_map) {
     out_field_map.clear();
     if (!table_.Get(key, out_field_map)) {
-        return ErrorCode::EC_NOENT;
-    }
-    if (out_field_map.empty()) {
         return ErrorCode::EC_NOENT;
     }
     // Update last access time in the stored map after copying the old value

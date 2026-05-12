@@ -17,15 +17,17 @@ ErrorCode MetaSearchCache::Init(const std::shared_ptr<MetaCachePolicyConfig> &co
     std::string cache_type = config->GetCachePolicyType();
     StringUtil::ToLower(cache_type);
     if (cache_type != "lru") {
-        KVCM_LOG_ERROR("meta search cache init failed, only support lru, type [%s]",
-                       cache_type.c_str());
+        KVCM_LOG_ERROR("meta search cache init failed, only support lru, type [%s]", cache_type.c_str());
         return EC_ERROR;
     }
     cache_size_ = config->GetCapacity();
     int32_t cache_shard_bits = config->GetCacheShardBits();
     double high_pri_pool_ratio = config->GetHighPriPoolRatio();
-    cache_ =
-        NewLRUCache(cache_size_ * 1024 * 1024, cache_shard_bits, /*strict_capacity_limit*/ true, high_pri_pool_ratio);
+    cache_ = NewLRUCache(cache_size_ * 1024 * 1024,
+                         cache_shard_bits,
+                         /*strict_capacity_limit=*/true,
+                         /*no_evict_on_insert=*/false,
+                         high_pri_pool_ratio);
     if (!cache_) {
         KVCM_LOG_ERROR(
             "create meta search cache failed, cache size [%lu]MB, cache shard bits [%d], high pri pool ratio [%f]",

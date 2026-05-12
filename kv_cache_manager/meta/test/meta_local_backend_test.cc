@@ -959,4 +959,112 @@ TEST_F(MetaLocalBackendTest, TestConcurrentReadWrite) {
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
 
+// ---------------------------------------------------------------------------
+// Test that UpdateFields / Upsert / DeleteFields correctly adjust LRU usage
+// ---------------------------------------------------------------------------
+TEST_F(MetaLocalBackendTest, TestChargeAdjustment) {
+    // Use a small capacity (1 MB) with 0 shard bits (single shard) for
+    // deterministic usage tracking.
+    auto config = std::make_shared<MetaStorageBackendConfig>();
+    config->SetStorageUri("local://?capacity=1&num_shard_bits=0");
+    auto backend = std::make_shared<MetaLocalBackend>();
+    ASSERT_EQ(EC_OK, backend->Init("test_charge_adj", config));
+    ASSERT_EQ(EC_OK, backend->Open());
+
+    // Per-field overhead in MetaMemCacheItem::Size(): sizeof(void*) * 4
+    constexpr size_t kMapNodeOverhead = sizeof(void *) * 4;
+
+    // Insert a key with a small field.
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), backend->Put({1}, {{{PROPERTY_URI, "v"}}}));
+    size_t usage_after_put = backend->GetMemUsage();
+
+    // --- UpdateFields: add a new field ---
+    // Expected delta: field_name.size() + field_value.size() + kMapNodeOverhead
+    std::string field_name_a = "field_a";
+    std::string field_value_a(1024, 'x');
+    ssize_t expected_delta_add = static_cast<ssize_t>(field_name_a.size() + field_value_a.size() + kMapNodeOverhead);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), backend->UpdateFields({1}, {{{field_name_a, field_value_a}}}));
+    size_t usage_after_add = backend->GetMemUsage();
+    ASSERT_EQ(static_cast<ssize_t>(usage_after_add - usage_after_put), expected_delta_add);
+
+    // --- UpdateFields: overwrite existing field with shorter value ---
+    // Expected delta: new_value.size() - old_value.size() (name and node overhead unchanged)
+    std::string field_value_a_short = "short";
+    ssize_t expected_delta_shrink =
+        static_cast<ssize_t>(field_value_a_short.size()) - static_cast<ssize_t>(field_value_a.size());
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), backend->UpdateFields({1}, {{{field_name_a, field_value_a_short}}}));
+    size_t usage_after_shrink = backend->GetMemUsage();
+    ASSERT_EQ(static_cast<ssize_t>(usage_after_shrink) - static_cast<ssize_t>(usage_after_add), expected_delta_shrink);
+
+    // --- Upsert: add another new field (key exists, goes through UpdateFieldsInPlace) ---
+    std::string field_name_b = "field_b";
+    std::string field_value_b(512, 'y');
+    ssize_t expected_delta_upsert = static_cast<ssize_t>(field_name_b.size() + field_value_b.size() + kMapNodeOverhead);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), backend->Upsert({1}, {{{field_name_b, field_value_b}}}));
+    size_t usage_after_upsert = backend->GetMemUsage();
+    ASSERT_EQ(static_cast<ssize_t>(usage_after_upsert - usage_after_shrink), expected_delta_upsert);
+
+    // --- DeleteFields: remove field_b ---
+    // Expected delta: -(field_name.size() + field_value.size() + kMapNodeOverhead)
+    ssize_t expected_delta_delete =
+        -static_cast<ssize_t>(field_name_b.size() + field_value_b.size() + kMapNodeOverhead);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), backend->DeleteFields({1}, {{field_name_b}}));
+    size_t usage_after_delete = backend->GetMemUsage();
+    ASSERT_EQ(static_cast<ssize_t>(usage_after_delete) - static_cast<ssize_t>(usage_after_upsert),
+              expected_delta_delete);
+
+    // After all adjustments, usage should equal the initial put usage + net delta from field_a shrink.
+    ASSERT_EQ(
+        usage_after_delete,
+        static_cast<size_t>(static_cast<ssize_t>(usage_after_put) +
+                            static_cast<ssize_t>(field_name_a.size() + field_value_a_short.size() + kMapNodeOverhead)));
+
+    // Verify the remaining data is intact.
+    FieldMapVec out;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), backend->Get({1}, {PROPERTY_URI, field_name_a}, out));
+    ASSERT_EQ("v", out[0][PROPERTY_URI]);
+    ASSERT_EQ(field_value_a_short, out[0][field_name_a]);
+
+    ASSERT_EQ(EC_OK, backend->Close());
+}
+
+// ---------------------------------------------------------------------------
+// Test that Insert fails with EC_NOSPC when capacity is full
+// (strict_capacity_limit is enabled)
+// ---------------------------------------------------------------------------
+TEST_F(MetaLocalBackendTest, TestStrictCapacityInsertFails) {
+    // Use smallest possible capacity: 1 MB, single shard.
+    auto config = std::make_shared<MetaStorageBackendConfig>();
+    config->SetStorageUri("local://?capacity=1&num_shard_bits=0");
+    auto backend = std::make_shared<MetaLocalBackend>();
+    ASSERT_EQ(EC_OK, backend->Init("test_strict_cap", config));
+    ASSERT_EQ(EC_OK, backend->Open());
+
+    const size_t capacity = backend->cache_->GetCapacity(); // 1 MB
+
+    // Insert a small entry first to verify basic functionality.
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), backend->Put({1}, {{{PROPERTY_URI, "small"}}}));
+
+    // Try to insert an entry whose charge exceeds the entire capacity.
+    std::string huge_value(capacity + 1, 'A');
+    auto results = backend->Put({2}, {{{PROPERTY_URI, huge_value}}});
+    ASSERT_EQ(EC_NOSPC, results[0]);
+
+    // The small entry should still be readable
+    FieldMapVec out;
+    auto get_ec = backend->Get({1}, {PROPERTY_URI}, out);
+    ASSERT_TRUE(EC_OK == get_ec[0]);
+
+    FieldMapVec out2;
+    auto get_ec2 = backend->Get({2}, {PROPERTY_URI}, out2);
+    ASSERT_EQ(EC_NOENT, get_ec2[0]);
+
+    // A reasonably-sized entry should succeed after the failed attempt.
+    std::string normal_value(1024, 'B');
+    auto retry = backend->Put({3}, {{{PROPERTY_URI, normal_value}}});
+    ASSERT_EQ(EC_OK, retry[0]);
+
+    ASSERT_EQ(EC_OK, backend->Close());
+}
+
 } // namespace kv_cache_manager

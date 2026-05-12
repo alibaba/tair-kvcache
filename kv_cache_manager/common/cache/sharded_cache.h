@@ -217,6 +217,11 @@ public:
         GetShard(hash).Erase(key, hash);
     }
 
+    void AdjustCharge(Handle *handle, ssize_t delta) override {
+        auto h = static_cast<HandleImpl *>(handle);
+        GetShard(h->GetHash()).AdjustCharge(h, delta);
+    }
+
     bool Release(Handle *handle, bool useful, bool erase_if_last_ref = false) override {
         auto h = static_cast<HandleImpl *>(handle);
         return GetShard(h->GetHash()).Release(h, useful, erase_if_last_ref);
@@ -263,8 +268,8 @@ public:
 
     void ApplyToSingleShard(
         uint32_t shard_id,
-        const std::function<
-            void(const std::string_view &key, Cache::ObjectPtr obj, size_t charge, const Cache::CacheItemHelper *helper)>
+        const std::function<void(
+            const std::string_view &key, Cache::ObjectPtr obj, size_t charge, const Cache::CacheItemHelper *helper)>
             &callback) override {
         uint32_t num_shards = GetNumShards();
         if (shard_id >= num_shards) {

@@ -746,7 +746,15 @@ std::vector<ErrorCode> RedisClient::ExistsFieldWithPrefix(const std::vector<std:
                                                           std::vector<bool> &out_exists_vec) {
     out_exists_vec.assign(keys.size(), false);
 
-    std::vector<ErrorCode> ec_per_key(keys.size(), EC_OK);
+    // First check which keys exist. Non-existent keys get EC_NOENT immediately.
+    std::vector<bool> key_exists_vec;
+    std::vector<ErrorCode> ec_per_key = Exists(keys, key_exists_vec);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (ec_per_key[i] == EC_OK && !key_exists_vec[i]) {
+            ec_per_key[i] = EC_NOENT;
+        }
+    }
+
     const std::string pattern = field_prefix + "*";
     const std::string count_hint = "1000";
     struct PendingKey {
@@ -756,7 +764,9 @@ std::vector<ErrorCode> RedisClient::ExistsFieldWithPrefix(const std::vector<std:
     std::vector<PendingKey> pending;
     pending.reserve(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
-        pending.push_back({i, "0"});
+        if (ec_per_key[i] == EC_OK) {
+            pending.push_back({i, "0"});
+        }
     }
     while (!pending.empty()) {
         std::vector<CmdArgs> hscan_cmds;
@@ -831,7 +841,15 @@ RedisClient::GetFieldNamesWithPrefix(const std::vector<std::string> &keys,
                                      std::vector<std::vector<std::string>> &out_field_names_vec) {
     out_field_names_vec.resize(keys.size());
 
-    std::vector<ErrorCode> ec_per_key(keys.size(), EC_OK);
+    // First check which keys exist. Non-existent keys get EC_NOENT immediately.
+    std::vector<bool> key_exists_vec;
+    std::vector<ErrorCode> ec_per_key = Exists(keys, key_exists_vec);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (ec_per_key[i] == EC_OK && !key_exists_vec[i]) {
+            ec_per_key[i] = EC_NOENT;
+        }
+    }
+
     const std::string pattern = field_prefix + "*";
     const std::string count_hint = "1000";
     struct PendingKey {
@@ -841,7 +859,9 @@ RedisClient::GetFieldNamesWithPrefix(const std::vector<std::string> &keys,
     std::vector<PendingKey> pending;
     pending.reserve(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
-        pending.push_back({i, "0"});
+        if (ec_per_key[i] == EC_OK) {
+            pending.push_back({i, "0"});
+        }
     }
     while (!pending.empty()) {
         std::vector<CmdArgs> hscan_cmds;

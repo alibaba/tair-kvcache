@@ -198,9 +198,11 @@ void SchedulePlanExecutor::DoLocationDelTask(const std::shared_ptr<std::promise<
             if (delete_results[i] != ErrorCode::EC_OK) {
                 // 这里存储删除报错暂且不管，报个warn表示哪个storageUri删失败了
                 result.status = ErrorCode::EC_PARTIAL_OK;
-                KVCM_LOG_WARN("Failed to delete kvcache from storage %s, uri: %s",
+                KVCM_LOG_WARN("storage delete failed, instance[%s] storage[%s] uri[%s] ec[%d]",
+                              task.instance_id.c_str(),
                               storage_unique_name.c_str(),
-                              storage_uris[i].ToUriString().c_str());
+                              storage_uris[i].ToUriString().c_str(),
+                              static_cast<int>(delete_results[i]));
             }
         }
     }

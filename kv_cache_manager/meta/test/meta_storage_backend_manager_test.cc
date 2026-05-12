@@ -653,4 +653,205 @@ TEST_F(MetaStorageBackendManagerTest, TestMaybeReclaimEmptyKeysAfterLastLocation
     ASSERT_EQ(EC_OK, mgr.Close());
 }
 
+// --- Multi-key, multi-location: gradual deletion until key reclaimed ----------
+
+TEST_F(MetaStorageBackendManagerTest, TestMultiKeyMultiLocationGradualDeletion) {
+    const std::string path = GetPrivateTestRuntimeDataPath() + "mgr_multi_loc_gradual";
+    std::filesystem::remove(path);
+    MetaStorageBackendManager mgr;
+    ASSERT_EQ(EC_OK, mgr.Init("inst_multi_loc", MakeDualConfig(path)));
+    ASSERT_EQ(EC_OK, mgr.Open());
+    WaitRunning(mgr);
+
+    // Put 3 keys, each with 3 locations in a single batch (Put is overwrite,
+    // so all locations must be in the same batch).
+    KeyVector keys = {40, 50, 60};
+    BatchMetaData batch;
+    batch.batch_keys = keys;
+    batch.batch_indexs = {0, 1, 2};
+    batch.batch_locations.resize(keys.size());
+    batch.batch_properties.resize(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const std::string key_str = std::to_string(keys[i]);
+        const std::string loc_a = "loc_" + key_str;
+        const std::string loc_b = "loc_" + key_str + "_b";
+        const std::string loc_c = "loc_" + key_str + "_c";
+        batch.batch_locations[i].emplace(loc_a, MakeLocation(loc_a, "uri_a_" + key_str));
+        batch.batch_locations[i].emplace(loc_b, MakeLocation(loc_b, "uri_b_" + key_str));
+        batch.batch_locations[i].emplace(loc_c, MakeLocation(loc_c, "uri_c_" + key_str));
+        batch.batch_properties[i]["p0"] = "p0_" + key_str;
+    }
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}), mgr.Put(request_context_.get(), batch));
+
+    // Verify each key now has 3 locations.
+    {
+        LocationMapVector out_locations;
+        auto get_ecs = mgr.GetLocations(request_context_.get(), keys, out_locations);
+        for (size_t i = 0; i < keys.size(); ++i) {
+            ASSERT_EQ(EC_OK, get_ecs[i]) << "key=" << keys[i];
+            ASSERT_EQ(3u, out_locations[i].size()) << "key=" << keys[i] << " should have 3 locations";
+        }
+    }
+
+    // --- Round 1: delete 1 location from each key → keys still alive ---------
+    {
+        LocationIdsPerKey del_ids = {
+            {"loc_40"},
+            {"loc_50"},
+            {"loc_60"},
+        };
+        int32_t reclaimed = -1;
+        auto del_ecs = mgr.Delete(keys, del_ids, reclaimed);
+        ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}), del_ecs);
+        EXPECT_EQ(0, reclaimed) << "keys still have 2 locations each, none should be reclaimed";
+
+        // All keys should still exist.
+        std::vector<bool> exists_vec;
+        auto exists_ecs = mgr.Exists(keys, exists_vec);
+        ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}), exists_ecs);
+        ASSERT_EQ((std::vector<bool>{true, true, true}), exists_vec);
+
+        // Each key should have exactly 2 remaining locations.
+        LocationMapVector out_locations;
+        auto get_ecs = mgr.GetLocations(request_context_.get(), keys, out_locations);
+        for (size_t i = 0; i < keys.size(); ++i) {
+            ASSERT_EQ(EC_OK, get_ecs[i]);
+            EXPECT_EQ(2u, out_locations[i].size()) << "key=" << keys[i] << " should have 2 locations left";
+        }
+    }
+
+    // --- Round 2: delete another location from each key → keys still alive ---
+    {
+        LocationIdsPerKey del_ids = {
+            {"loc_40_b"},
+            {"loc_50_b"},
+            {"loc_60_b"},
+        };
+        int32_t reclaimed = -1;
+        auto del_ecs = mgr.Delete(keys, del_ids, reclaimed);
+        ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}), del_ecs);
+        EXPECT_EQ(0, reclaimed) << "keys still have 1 location each, none should be reclaimed";
+
+        // All keys should still exist.
+        std::vector<bool> exists_vec;
+        auto exists_ecs = mgr.Exists(keys, exists_vec);
+        ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}), exists_ecs);
+        ASSERT_EQ((std::vector<bool>{true, true, true}), exists_vec);
+
+        // Each key should have exactly 1 remaining location.
+        LocationMapVector out_locations;
+        auto get_ecs = mgr.GetLocations(request_context_.get(), keys, out_locations);
+        for (size_t i = 0; i < keys.size(); ++i) {
+            ASSERT_EQ(EC_OK, get_ecs[i]);
+            EXPECT_EQ(1u, out_locations[i].size()) << "key=" << keys[i] << " should have 1 location left";
+            // Verify the remaining location is the "_c" one.
+            const std::string expected_id = "loc_" + std::to_string(keys[i]) + "_c";
+            EXPECT_TRUE(out_locations[i].count(expected_id) > 0) << "remaining location should be " << expected_id;
+        }
+    }
+
+    // --- Round 3: delete the last location → all keys should be reclaimed ----
+    {
+        LocationIdsPerKey del_ids = {
+            {"loc_40_c"},
+            {"loc_50_c"},
+            {"loc_60_c"},
+        };
+        int32_t reclaimed = -1;
+        auto del_ecs = mgr.Delete(keys, del_ids, reclaimed);
+        ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}), del_ecs);
+        EXPECT_EQ(3, reclaimed) << "all 3 keys should be reclaimed after last location deleted";
+
+        // All keys should be gone.
+        std::vector<bool> exists_vec;
+        auto exists_ecs = mgr.Exists(keys, exists_vec);
+        ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}), exists_ecs);
+        ASSERT_EQ((std::vector<bool>{false, false, false}), exists_vec);
+    }
+
+    ASSERT_EQ(EC_OK, mgr.Close());
+}
+
+// --- Mixed scenario: some keys reclaimed, some survive -----------------------
+
+TEST_F(MetaStorageBackendManagerTest, TestMultiKeyPartialReclamation) {
+    const std::string path = GetPrivateTestRuntimeDataPath() + "mgr_partial_reclaim";
+    std::filesystem::remove(path);
+    MetaStorageBackendManager mgr;
+    ASSERT_EQ(EC_OK, mgr.Init("inst_partial", MakeDualConfig(path)));
+    ASSERT_EQ(EC_OK, mgr.Open());
+    WaitRunning(mgr);
+
+    // key 70: 2 locations (loc_70, loc_70_b)
+    // key 80: 3 locations (loc_80, loc_80_b, loc_80_c)
+    // key 90: 1 location  (loc_90)
+    // All locations must be in a single Put per key (Put is overwrite).
+    KeyVector keys = {70, 80, 90};
+    BatchMetaData batch;
+    batch.batch_keys = keys;
+    batch.batch_indexs = {0, 1, 2};
+    batch.batch_locations.resize(3);
+    batch.batch_properties.resize(3);
+    // key 70: 2 locations
+    batch.batch_locations[0].emplace("loc_70", MakeLocation("loc_70", "uri_70"));
+    batch.batch_locations[0].emplace("loc_70_b", MakeLocation("loc_70_b", "uri_70_b"));
+    batch.batch_properties[0]["p0"] = "p0_70";
+    // key 80: 3 locations
+    batch.batch_locations[1].emplace("loc_80", MakeLocation("loc_80", "uri_80"));
+    batch.batch_locations[1].emplace("loc_80_b", MakeLocation("loc_80_b", "uri_80_b"));
+    batch.batch_locations[1].emplace("loc_80_c", MakeLocation("loc_80_c", "uri_80_c"));
+    batch.batch_properties[1]["p0"] = "p0_80";
+    // key 90: 1 location
+    batch.batch_locations[2].emplace("loc_90", MakeLocation("loc_90", "uri_90"));
+    batch.batch_properties[2]["p0"] = "p0_90";
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}), mgr.Put(request_context_.get(), batch));
+
+    // Verify initial state: key70=2, key80=3, key90=1
+    {
+        LocationMapVector out_locations;
+        auto get_ecs = mgr.GetLocations(request_context_.get(), keys, out_locations);
+        ASSERT_EQ(EC_OK, get_ecs[0]);
+        ASSERT_EQ(EC_OK, get_ecs[1]);
+        ASSERT_EQ(EC_OK, get_ecs[2]);
+        EXPECT_EQ(2u, out_locations[0].size());
+        EXPECT_EQ(3u, out_locations[1].size());
+        EXPECT_EQ(1u, out_locations[2].size());
+    }
+
+    // Delete: key70 loses 1 of 2, key80 loses all 3, key90 loses its only 1.
+    // Expected: key70 survives, key80 and key90 are reclaimed.
+    {
+        LocationIdsPerKey del_ids = {
+            {"loc_70"},                         // key70: 1 of 2 deleted → survives
+            {"loc_80", "loc_80_b", "loc_80_c"}, // key80: all 3 deleted → reclaimed
+            {"loc_90"},                         // key90: only 1 deleted → reclaimed
+        };
+        int32_t reclaimed = -1;
+        auto del_ecs = mgr.Delete(keys, del_ids, reclaimed);
+        ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}), del_ecs);
+        EXPECT_EQ(2, reclaimed) << "key80 and key90 should be reclaimed";
+    }
+
+    // Verify: key70 still exists with 1 location, key80 and key90 are gone.
+    {
+        std::vector<bool> exists_vec;
+        auto exists_ecs = mgr.Exists(keys, exists_vec);
+        ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}), exists_ecs);
+        EXPECT_TRUE(exists_vec[0]) << "key70 should still exist";
+        EXPECT_FALSE(exists_vec[1]) << "key80 should be reclaimed";
+        EXPECT_FALSE(exists_vec[2]) << "key90 should be reclaimed";
+    }
+
+    // key70 should have exactly 1 remaining location.
+    {
+        LocationMapVector out_locations;
+        auto get_ecs = mgr.GetLocations(request_context_.get(), {70}, out_locations);
+        ASSERT_EQ(EC_OK, get_ecs[0]);
+        ASSERT_EQ(1u, out_locations[0].size());
+        EXPECT_TRUE(out_locations[0].count("loc_70_b") > 0);
+    }
+
+    ASSERT_EQ(EC_OK, mgr.Close());
+}
+
 } // namespace kv_cache_manager

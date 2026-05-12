@@ -117,18 +117,15 @@ ErrorCode MetaIndexer::Init(const std::string &instance_id, const std::shared_pt
         KVCM_LOG_ERROR("instance[%s] recover metadata failed, ec[%d]", instance_id_.c_str(), ec);
         return ec;
     }
-    KVCM_LOG_INFO(
-        "instance[%s] meta indexer init success, mutex shard num[%lu], max key count[%lu], "
-        "batch key size[%lu], search cache size[%lu], key_count[%lu], persist_metadata_interval_time_ms[%zu], "
-        "storage usage data[%s]",
-        instance_id_.c_str(),
-        mutex_shard_num,
-        max_key_count_,
-        batch_key_size_,
-        config->GetMetaCachePolicyConfig()->GetCapacity(),
-        key_count_.load(),
-        persist_metadata_interval_time_ms_,
-        storage_usage_data_.ToJsonString().c_str());
+    KVCM_LOG_INFO("instance[%s] meta indexer init success, mutex shard num[%lu], max key count[%lu], "
+                  "batch key size[%lu], key_count[%lu], persist_metadata_interval_time_ms[%zu], storage usage data[%s]",
+                  instance_id_.c_str(),
+                  mutex_shard_num,
+                  max_key_count_,
+                  batch_key_size_,
+                  key_count_.load(),
+                  persist_metadata_interval_time_ms_,
+                  storage_usage_data_.ToJsonString().c_str());
     return EC_OK;
 }
 

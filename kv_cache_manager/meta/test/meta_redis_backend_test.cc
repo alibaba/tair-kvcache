@@ -406,8 +406,17 @@ TEST_F(MetaRedisBackendTest, TestExistsFieldWithPrefix) {
         EXPECT_CALL(*mock_redis_client, IsContextOk()).WillRepeatedly(Return(true));
         EXPECT_CALL(*mock_redis_client, Reconnect()).WillRepeatedly(Return(true));
 
-        // key 1: HSCAN returns one matching field-value pair -> true.
-        // key 2: HSCAN returns empty list with next_cursor=0 -> false.
+        // Step 1: EXISTS check — both keys exist.
+        std::vector<ReplyUPtr> exists_replies;
+        exists_replies.emplace_back(MakeFakeReplyInteger(1));
+        exists_replies.emplace_back(MakeFakeReplyInteger(1));
+        EXPECT_CALL(
+            *mock_redis_client,
+            TryExecPipeline(ElementsAre(ElementsAre(StrEq("EXISTS"), StrEq("kvcache:instance_instance_0:cache_1")),
+                                        ElementsAre(StrEq("EXISTS"), StrEq("kvcache:instance_instance_0:cache_2")))))
+            .WillOnce(Return(ByMove(std::move(exists_replies))));
+
+        // Step 2: HSCAN — key 1 has matching field, key 2 has empty list.
         std::vector<ReplyUPtr> replies;
         replies.emplace_back(MakeFakeReplyScan(/*next_cursor*/ "0", {LOCATION_PREFIX + "a", "la"}));
         replies.emplace_back(MakeFakeReplyScan(/*next_cursor*/ "0", {}));
@@ -446,8 +455,16 @@ TEST_F(MetaRedisBackendTest, TestExistsFieldWithPrefixIgnoresTombstone) {
         EXPECT_CALL(*mock_redis_client, IsContextOk()).WillRepeatedly(Return(true));
         EXPECT_CALL(*mock_redis_client, Reconnect()).WillRepeatedly(Return(true));
 
-        // key 1: HSCAN returns one field with empty value (tombstone) → false.
-        // key 2: HSCAN returns one field with non-empty value → true.
+        testing::InSequence seq;
+
+        // Step 1: EXISTS check — both keys exist.
+        std::vector<ReplyUPtr> exists_replies;
+        exists_replies.emplace_back(MakeFakeReplyInteger(1));
+        exists_replies.emplace_back(MakeFakeReplyInteger(1));
+        EXPECT_CALL(*mock_redis_client, TryExecPipeline(testing::_))
+            .WillOnce(Return(ByMove(std::move(exists_replies))));
+
+        // Step 2: HSCAN — key 1 has tombstone (empty value), key 2 has valid field.
         std::vector<ReplyUPtr> replies;
         replies.emplace_back(MakeFakeReplyScan("0", {LOCATION_PREFIX + "tomb", ""}));
         replies.emplace_back(MakeFakeReplyScan("0", {LOCATION_PREFIX + "real", "valid"}));
@@ -459,6 +476,48 @@ TEST_F(MetaRedisBackendTest, TestExistsFieldWithPrefixIgnoresTombstone) {
     ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
 
     AssertExistsFieldWithPrefix(meta_redis_backend_.get(), {1, 2}, LOCATION_PREFIX, {EC_OK, EC_OK}, {false, true});
+
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
+}
+
+// ExistsFieldWithPrefix with a non-existent key should return EC_NOENT.
+TEST_F(MetaRedisBackendTest, TestExistsFieldWithPrefixKeyNotExist) {
+    EXPECT_CALL(*meta_redis_backend_, CreateRedisClient()).WillOnce(Invoke([]() {
+        StandardUri empty_storage_uri;
+        auto mock_redis_client = std::make_unique<MockRedisClient>(empty_storage_uri);
+        EXPECT_CALL(*mock_redis_client, IsContextOk()).WillRepeatedly(Return(true));
+        EXPECT_CALL(*mock_redis_client, Reconnect()).WillRepeatedly(Return(true));
+
+        // EXISTS check — key 1 exists, key 2 does not exist.
+        // No HSCAN should be issued for key 2.
+        std::vector<ReplyUPtr> exists_replies;
+        exists_replies.emplace_back(MakeFakeReplyInteger(1));
+        exists_replies.emplace_back(MakeFakeReplyInteger(0));
+        EXPECT_CALL(
+            *mock_redis_client,
+            TryExecPipeline(ElementsAre(ElementsAre(StrEq("EXISTS"), StrEq("kvcache:instance_instance_0:cache_1")),
+                                        ElementsAre(StrEq("EXISTS"), StrEq("kvcache:instance_instance_0:cache_2")))))
+            .WillOnce(Return(ByMove(std::move(exists_replies))));
+
+        // HSCAN only for key 1.
+        std::vector<ReplyUPtr> hscan_replies;
+        hscan_replies.emplace_back(MakeFakeReplyScan("0", {LOCATION_PREFIX + "a", "la"}));
+        EXPECT_CALL(*mock_redis_client,
+                    TryExecPipeline(ElementsAre(ElementsAre(StrEq("HSCAN"),
+                                                            StrEq("kvcache:instance_instance_0:cache_1"),
+                                                            StrEq("0"),
+                                                            StrEq("MATCH"),
+                                                            StrEq(LOCATION_PREFIX + "*"),
+                                                            StrEq("COUNT"),
+                                                            StrEq("1000")))))
+            .WillOnce(Return(ByMove(std::move(hscan_replies))));
+        return mock_redis_client;
+    }));
+
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Init("instance_0", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
+
+    AssertExistsFieldWithPrefix(meta_redis_backend_.get(), {1, 2}, LOCATION_PREFIX, {EC_OK, EC_NOENT}, {true, false});
 
     ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
 }

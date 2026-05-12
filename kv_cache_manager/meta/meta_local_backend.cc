@@ -54,7 +54,10 @@ ErrorCode MetaLocalBackend::Init(const std::string &instance_id,
     }
 
     shard_mask_ = (1 << num_shard_bits) - 1;
-    cache_ = NewLRUCache(capacity * 1024 * 1024ULL, num_shard_bits);
+    cache_ = NewLRUCache(capacity * 1024 * 1024ULL,
+                         num_shard_bits,
+                         /*strict_capacity_limit=*/true,
+                         /*no_evict_on_insert=*/true);
     if (!cache_) {
         KVCM_LOG_ERROR("fail to create LRUCache");
         return EC_ERROR;
@@ -93,6 +96,7 @@ ErrorCode MetaLocalBackend::Open() noexcept {
         KVCM_LOG_ERROR("Cache is not initialized");
         return EC_ERROR;
     }
+    KVCM_LOG_INFO("local backend open ok");
     return EC_OK;
 }
 
@@ -102,6 +106,7 @@ ErrorCode MetaLocalBackend::Close() noexcept {
     }
     cache_.reset();
     cache_item_helper_.reset();
+    KVCM_LOG_INFO("local backend close ok");
     return EC_OK;
 }
 
@@ -113,9 +118,18 @@ ErrorCode MetaLocalBackend::CreateAndInsert(const std::string &key_str, const Fi
     MetaMemCacheItem *item = MetaMemCacheItem::Create(fields);
     item->TouchAccessTime();
     size_t charge = item->Size();
-    ErrorCode ret = cache_->Insert(key_str, item, cache_item_helper_.get(), charge);
+    // We must pass &handle (not nullptr) so that when strict_capacity_limit
+    // is enabled and capacity is exceeded, Insert returns EC_NOSPC instead
+    // of silently discarding the entry with EC_OK.
+    // On success the handle holds a reference that pins the entry out of
+    // the LRU list (preventing eviction), so we Release it immediately to
+    // let the entry become evictable again.
+    Cache::Handle *handle = nullptr;
+    ErrorCode ret = cache_->Insert(key_str, item, cache_item_helper_.get(), charge, &handle);
     if (ret != EC_OK) {
         MetaMemCacheItem::Deleter(item, nullptr);
+    } else if (handle) {
+        cache_->Release(handle);
     }
     return ret;
 }
@@ -124,9 +138,13 @@ ErrorCode MetaLocalBackend::CreateAndInsert(const std::string &key_str, FieldMap
     MetaMemCacheItem *item = MetaMemCacheItem::Create(std::move(fields));
     item->TouchAccessTime();
     size_t charge = item->Size();
-    ErrorCode ret = cache_->Insert(key_str, item, cache_item_helper_.get(), charge);
+    // See the const-ref overload above for why we pass &handle.
+    Cache::Handle *handle = nullptr;
+    ErrorCode ret = cache_->Insert(key_str, item, cache_item_helper_.get(), charge, &handle);
     if (ret != EC_OK) {
         MetaMemCacheItem::Deleter(item, nullptr);
+    } else if (handle) {
+        cache_->Release(handle);
     }
     return ret;
 }
@@ -135,26 +153,15 @@ ErrorCode MetaLocalBackend::CreateAndInsertIfAbsent(const std::string &key_str, 
     MetaMemCacheItem *item = MetaMemCacheItem::Create(fields);
     item->TouchAccessTime();
     size_t charge = item->Size();
-    ErrorCode ret = cache_->InsertIfAbsent(key_str, item, cache_item_helper_.get(), charge);
+    // See CreateAndInsert above for why we pass &handle.
+    Cache::Handle *handle = nullptr;
+    ErrorCode ret = cache_->InsertIfAbsent(key_str, item, cache_item_helper_.get(), charge, &handle);
     if (ret != EC_OK && ret != EC_EXIST) {
         MetaMemCacheItem::Deleter(item, nullptr);
+    } else if (handle) {
+        cache_->Release(handle);
     }
     return ret;
-}
-
-bool MetaLocalBackend::LookupFields(const std::string &key_str, FieldMap &out_fields) {
-    Cache::Handle *handle = cache_->Lookup(key_str);
-    if (!handle) {
-        return false;
-    }
-    auto *existing = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
-    existing->TouchAccessTime();
-    {
-        std::shared_lock lock(existing->GetMutex());
-        out_fields = existing->GetFields();
-    }
-    cache_->Release(handle);
-    return true;
 }
 
 ErrorCode MetaLocalBackend::UpdateFieldsInPlace(const std::string &key_str, const FieldMap &updates) {
@@ -164,11 +171,25 @@ ErrorCode MetaLocalBackend::UpdateFieldsInPlace(const std::string &key_str, cons
     }
     auto *existing = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
     existing->TouchAccessTime();
+    ssize_t charge_delta = 0;
     {
         std::unique_lock lock(existing->GetMutex());
-        for (const auto &[key, value] : updates) {
-            existing->GetMutableFields()[key] = value;
+        auto &fields = existing->GetMutableFields();
+        for (const auto &[field_name, field_value] : updates) {
+            auto it = fields.find(field_name);
+            if (it != fields.end()) {
+                // Existing field: delta is difference in value length.
+                charge_delta += static_cast<ssize_t>(field_value.size()) - static_cast<ssize_t>(it->second.size());
+                it->second = field_value;
+            } else {
+                // New field: add full entry overhead.
+                charge_delta += static_cast<ssize_t>(field_name.size() + field_value.size() + sizeof(void *) * 4);
+                fields[field_name] = field_value;
+            }
         }
+    }
+    if (charge_delta != 0) {
+        cache_->AdjustCharge(handle, charge_delta);
     }
     cache_->Release(handle);
     return EC_OK;
@@ -206,11 +227,20 @@ ErrorCode MetaLocalBackend::DeleteFieldsForOneKey(KeyType key, const std::vector
     }
     auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
     item->TouchAccessTime();
+    ssize_t charge_delta = 0;
     {
         std::unique_lock lock(item->GetMutex());
+        auto &fields = item->GetMutableFields();
         for (const auto &field_name : field_names) {
-            item->GetMutableFields().erase(field_name);
+            auto it = fields.find(field_name);
+            if (it != fields.end()) {
+                charge_delta -= static_cast<ssize_t>(it->first.size() + it->second.size() + sizeof(void *) * 4);
+                fields.erase(it);
+            }
         }
+    }
+    if (charge_delta != 0) {
+        cache_->AdjustCharge(handle, charge_delta);
     }
     cache_->Release(handle);
     return EC_OK;
@@ -350,6 +380,9 @@ MetaLocalBackend::DeleteFields(const KeyTypeVec &keys,
                                const std::vector<std::vector<std::string>> &field_names_vec) noexcept {
     std::vector<ErrorCode> results(keys.size(), EC_OK);
     for (size_t i = 0; i < keys.size(); ++i) {
+        if (field_names_vec[i].empty()) {
+            continue; // Nothing to delete — idempotent success.
+        }
         results[i] = DeleteFieldsForOneKey(keys[i], field_names_vec[i]);
     }
     return results;
@@ -360,6 +393,10 @@ std::vector<ErrorCode> MetaLocalBackend::DeleteFields(const KeyTypeVec &keys,
                                                       const std::vector<ErrorCode> &previous_error_codes) noexcept {
     std::vector<ErrorCode> results(keys.size(), EC_OK);
     for (size_t i = 0; i < keys.size(); ++i) {
+        if (field_names_vec[i].empty()) {
+            results[i] = previous_error_codes[i];
+            continue; // Nothing to delete — idempotent success (propagate previous ec).
+        }
         results[i] = (previous_error_codes[i] == EC_OK) ? DeleteFieldsForOneKey(keys[i], field_names_vec[i])
                                                         : previous_error_codes[i];
     }

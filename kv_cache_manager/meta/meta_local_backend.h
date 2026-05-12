@@ -52,9 +52,9 @@ struct MetaMemCacheItem {
     static void Deleter(void *value, MemoryAllocator * /*allocator*/) { delete static_cast<MetaMemCacheItem *>(value); }
 
 private:
+    mutable std::shared_mutex mutex_;
     FieldMap fields_;
     std::atomic<int64_t> last_access_time_{0};
-    mutable std::shared_mutex mutex_;
 };
 
 class MetaLocalBackend : public MetaCacheBaseBackend {
@@ -93,6 +93,7 @@ public:
                                   const std::vector<ErrorCode> &previous_error_codes) noexcept override;
     std::vector<ErrorCode> Delete(const KeyTypeVec &keys,
                                   const std::vector<ErrorCode> &previous_error_codes) noexcept override;
+    // Adjusts the LRU charge to reflect the size change.
     std::vector<ErrorCode> DeleteFields(const KeyTypeVec &keys,
                                         const std::vector<std::vector<std::string>> &field_names_vec,
                                         const std::vector<ErrorCode> &previous_error_codes) noexcept override;
@@ -146,12 +147,8 @@ private:
     // Creates a MetaMemCacheItem and inserts it into cache_ via InsertIfAbsent().
     ErrorCode CreateAndInsertIfAbsent(const std::string &key_str, const FieldMap &fields);
 
-    // Looks up an existing cache item and returns a copy of its fields.
-    // Returns true if the key was found, false otherwise.
-    bool LookupFields(const std::string &key_str, FieldMap &out_fields);
-
     // Looks up an existing cache item and merges `updates` into its fields
-    // in place (the handle prevents eviction during the update).
+    // in place. Adjusts the LRU charge to reflect the size change.
     // Returns EC_OK on success, EC_NOENT if key not found.
     ErrorCode UpdateFieldsInPlace(const std::string &key_str, const FieldMap &updates);
 

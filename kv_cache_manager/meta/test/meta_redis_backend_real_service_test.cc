@@ -472,14 +472,12 @@ TEST_F(MetaRedisBackendRealServiceTest, TestExistsFieldWithPrefix) {
                   {kKeyWithPrefix, kKeyWithoutPrefix},
                   {{{LOCATION_PREFIX + "a", "la"}, {LOCATION_PREFIX + "b", "lb"}, {"p0", "v0"}}, {{"p0", "v0"}}}));
 
-    // Note: against a real redis, HSCAN on a non-existent key returns an empty
-    // result with next_cursor=0 instead of an error, so the redis backend
-    // reports EC_OK with `false` for missing keys (rather than EC_NOENT like
-    // the dummy/local backends).
+    // ExistsFieldWithPrefix now uses EXISTS to detect missing keys.
+    // kKeyMissing does not exist → EC_NOENT; the other two exist → EC_OK.
     std::vector<bool> exists_vec;
     auto ec_vec = meta_redis_backend_->ExistsFieldWithPrefix(
         {kKeyWithPrefix, kKeyWithoutPrefix, kKeyMissing}, LOCATION_PREFIX, exists_vec);
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}), ec_vec);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_NOENT}), ec_vec);
     ASSERT_EQ((std::vector<bool>{true, false, false}), exists_vec);
 
     // Removing one of the two LOCATION_PREFIX fields: the remaining one still

@@ -233,16 +233,16 @@ void ProtoConvert::CacheConfigFromProto(const proto::admin::CacheConfig *proto_c
         proto_cache_config->meta_indexer_config().meta_storage_backend_config().storage_uri());
     meta_indexer_config->SetMetaStorageBackendConfig(meta_storage_backend_config);
 
-    // 转换meta_cache_policy_config
-    auto meta_cache_policy_config = std::make_shared<MetaCachePolicyConfig>();
-    meta_cache_policy_config->SetCapacity(
-        proto_cache_config->meta_indexer_config().meta_cache_policy_config().capacity());
-    meta_cache_policy_config->SetType(proto_cache_config->meta_indexer_config().meta_cache_policy_config().type());
-    meta_cache_policy_config->SetCacheShardBits(
-        proto_cache_config->meta_indexer_config().meta_cache_policy_config().cache_shard_bits());
-    meta_cache_policy_config->SetHighPriPoolRatio(
-        proto_cache_config->meta_indexer_config().meta_cache_policy_config().high_pri_pool_ratio());
-    meta_indexer_config->SetMetaCachePolicyConfig(meta_cache_policy_config);
+    // 转换meta_cache_policy_config（仅当 proto 中实际配置了时才填充）
+    const auto &proto_cache_policy = proto_cache_config->meta_indexer_config().meta_cache_policy_config();
+    if (!proto_cache_policy.type().empty()) {
+        auto meta_cache_policy_config = std::make_shared<MetaCachePolicyConfig>();
+        meta_cache_policy_config->SetCapacity(proto_cache_policy.capacity());
+        meta_cache_policy_config->SetType(proto_cache_policy.type());
+        meta_cache_policy_config->SetCacheShardBits(proto_cache_policy.cache_shard_bits());
+        meta_cache_policy_config->SetHighPriPoolRatio(proto_cache_policy.high_pri_pool_ratio());
+        meta_indexer_config->SetMetaCachePolicyConfig(meta_cache_policy_config);
+    }
 
     cache_config_info.set_meta_indexer_config(meta_indexer_config);
 }
