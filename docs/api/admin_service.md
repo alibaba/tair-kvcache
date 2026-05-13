@@ -294,13 +294,23 @@ curl -g -vvv -X POST http://localhost:6492/api/getInstanceGroup \
 }'
 ```
 
+## List Instance Group
+```bash
+curl -g -vvv -X POST http://localhost:6492/api/listInstanceGroup \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json" \
+  -d '{
+    "trace_id": "trace_id_211"
+}'
+```
+
 ## Get Cache Meta
 ```bash
 curl -g -vvv -X POST http://localhost:6492/api/getCacheMeta \
   -H "Content-Type: application/json" \
   -H "Accept: application/json" \
   -d '{
-    "trace_id": "trace_id_211",
+    "trace_id": "trace_id_212",
     "instance_id": "instance1",
     "block_keys": [123],
     "token_ids": [456],
