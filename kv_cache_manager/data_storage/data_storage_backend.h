@@ -33,7 +33,8 @@ public:
     virtual ErrorCode Open(const StorageConfig &config, const std::string &trace_id) {
         config_ = config;
         metrics_collector_ = std::make_shared<DataStorageMetricsCollector>(
-            metrics_registry_, MetricsTags{{ToString(config.type()), config.global_unique_name()}});
+            metrics_registry_,
+            MetricsTags{{"type", ToString(config.type())}, {"unique_name", config.global_unique_name()}});
         if (!metrics_collector_->Init()) {
             metrics_collector_ = nullptr;
         }

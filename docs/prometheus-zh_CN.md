@@ -72,6 +72,22 @@ kvcm_data_storage_storage_usage_ratio{type="hf3fs",unique_name="nfs_01"} 0.75
 kvcm_cache_manager_group_usage_ratio{instance_group="default"} 0.42
 ```
 
+### Label 规范
+
+为了让 `data_storage.*` 系列指标能在 PromQL 中互相 `join` /
+聚合，所有按存储实例维度的 `data_storage.*` 序列统一使用两个
+label：
+
+- `type`：后端类型，例如 `hf3fs`、`nfs`、`pace`、`tair_mempool`。
+- `unique_name`：后端实例的 `global_unique_name`。
+
+```
+kvcm_data_storage_create_counter{type="nfs",unique_name="nfs_01"} 100
+kvcm_data_storage_create_keys_counter{type="nfs",unique_name="nfs_01"} 12800
+kvcm_data_storage_healthy_status{type="nfs",unique_name="nfs_01"} 1
+kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="nfs_01"} 0.6
+```
+
 ## 输出示例
 
 ```
