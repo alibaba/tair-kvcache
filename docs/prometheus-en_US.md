@@ -145,6 +145,34 @@ every `kvcm.metrics.report_interval_ms`, default 20s).
 The full list depends on the active `MetricsReporter` type. The
 `kmonitor` reporter populates the most complete set of metrics.
 
+## Mapping to KMonitor Metrics
+
+KVCacheManager simultaneously exports metrics via KMonitor and via
+the Prometheus `/metrics` endpoint. The two pipelines write to
+different metric stores, so a few KMonitor metric names are not
+emitted by Prometheus *under the same name* — most commonly the
+`*.qps` family, which is materialized server-side by KMonitor's QPS
+reducer. Use `rate(<counter>[Xm])` in PromQL instead.
+
+### QPS-style metrics
+
+| KMonitor metric | Prometheus equivalent |
+|---|---|
+| `service.qps` | `rate(kvcm_service_query_counter[1m])` |
+| `service.error_qps` | `rate(kvcm_service_error_counter[1m])` |
+| `data_storage.create_qps` | `rate(kvcm_data_storage_create_counter[1m])` |
+| `data_storage.create_keys_qps` | `rate(kvcm_data_storage_create_keys_counter[1m])` |
+
+The Prometheus side stores the underlying *counter* (monotonically
+increasing). KMonitor's `*.qps` value is computed by the agent at
+report time. Both views describe the same event stream — pick `rate`
+on the counter when querying Prometheus.
+
+Note that `data_storage.create_keys_qps` is also exported as a Prom
+gauge with the latest *batch size* (not a per-second rate). Prefer
+`rate(kvcm_data_storage_create_keys_counter[1m])` for the per-second
+view, and the gauge only for "the most recent batch size" diagnostics.
+
 ## Architecture
 
 The Prometheus endpoint is implemented as a lightweight serializer

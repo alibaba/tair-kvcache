@@ -142,6 +142,32 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 完整指标列表取决于当前使用的 `MetricsReporter` 类型。`kmonitor`
 类型的 reporter 会填充最完整的指标集。
 
+## 与 KMonitor 指标对照
+
+KVCacheManager 同时通过 KMonitor 与 Prometheus `/metrics` 端点导出
+指标。两条管线写入不同的存储，因此部分 KMonitor 指标名在
+Prometheus 侧并不以**同名**输出 —— 最常见的是 `*.qps` 一族，由
+KMonitor agent 在上报时计算。Prometheus 侧请用 PromQL
+`rate(<counter>[Xm])` 等价获取。
+
+### QPS 类指标
+
+| KMonitor 指标 | Prometheus 等价 |
+|---|---|
+| `service.qps` | `rate(kvcm_service_query_counter[1m])` |
+| `service.error_qps` | `rate(kvcm_service_error_counter[1m])` |
+| `data_storage.create_qps` | `rate(kvcm_data_storage_create_counter[1m])` |
+| `data_storage.create_keys_qps` | `rate(kvcm_data_storage_create_keys_counter[1m])` |
+
+Prometheus 侧存储的是底层 *counter*（单调递增），KMonitor 的
+`*.qps` 值由 agent 在上报时计算。两种视图反映的是同一事件流，
+查询 Prometheus 时直接用 counter + `rate` 即可。
+
+注：`data_storage.create_keys_qps` 在 Prom 侧也会以 gauge 形式
+导出"最近一次批次大小"（不是每秒速率）。每秒速率请使用
+`rate(kvcm_data_storage_create_keys_counter[1m])`，gauge 仅作
+"最近一次批次大小"诊断用。
+
 ## 架构
 
 Prometheus 端点通过一个轻量级序列化器（`PrometheusExporter`）实现，
