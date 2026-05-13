@@ -41,6 +41,7 @@ void AdminServiceHttp::Init() {
     MAKE_SERVICE_METRICS_COLLECTOR(UpdateInstanceGroup);
     MAKE_SERVICE_METRICS_COLLECTOR(RemoveInstanceGroup);
     MAKE_SERVICE_METRICS_COLLECTOR(GetInstanceGroup);
+    MAKE_SERVICE_METRICS_COLLECTOR(ListInstanceGroup);
 
     // for cache APIs
     MAKE_SERVICE_METRICS_COLLECTOR(GetCacheMeta);
@@ -93,6 +94,8 @@ void AdminServiceHttp::RegisterHandler() {
         Post, removeInstanceGroup, RemoveInstanceGroup, Common, RemoveInstanceGroup);
     REGISTER_HTTP_HANDLER_FOR_ADMIN_SERVICE(
         Post, getInstanceGroup, GetInstanceGroup, GetInstanceGroup, GetInstanceGroup);
+    REGISTER_HTTP_HANDLER_FOR_ADMIN_SERVICE(
+        Post, listInstanceGroup, ListInstanceGroup, ListInstanceGroup, ListInstanceGroup);
 
     // Cache APIs
     REGISTER_HTTP_HANDLER_FOR_ADMIN_SERVICE(Post, getCacheMeta, GetCacheMeta, GetCacheMeta, GetCacheMeta);
@@ -236,6 +239,14 @@ void AdminServiceHttp::GetInstanceGroup(coro_http::coro_http_connection *http_co
     API_CONTEXT_INIT_HTTP(GetInstanceGroup)
     KVCM_LOG_INFO("[traceId: %s] GetInstanceGroup [%s] called.", request->trace_id().c_str(), request->name().c_str());
     admin_service_impl_->GetInstanceGroup(request_context, request, response);
+}
+
+void AdminServiceHttp::ListInstanceGroup(coro_http::coro_http_connection *http_conn,
+                                         proto::admin::ListInstanceGroupRequest *request,
+                                         proto::admin::ListInstanceGroupResponse *response) {
+    API_CONTEXT_INIT_HTTP(ListInstanceGroup)
+    KVCM_LOG_INFO("[traceId: %s] ListInstanceGroup called.", request->trace_id().c_str());
+    admin_service_impl_->ListInstanceGroup(request_context, request, response);
 }
 
 void AdminServiceHttp::GetCacheMeta(coro_http::coro_http_connection *http_conn,

@@ -268,6 +268,13 @@ message GetInstanceGroupResponse {
     InstanceGroup instance_group = 2;
 }
 
+message ListInstanceGroupRequest { string trace_id = 1; }
+
+message ListInstanceGroupResponse {
+    CommonResponseHeader header = 1;
+    repeated InstanceGroup instance_group = 2;
+}
+
 message BoolMasksType { repeated bool values = 1; }
 message BlockMask {
     oneof info {
@@ -515,6 +522,7 @@ service AdminService {
     rpc UpdateInstanceGroup(UpdateInstanceGroupRequest) returns (CommonResponse);
     rpc RemoveInstanceGroup(RemoveInstanceGroupRequest) returns (CommonResponse);
     rpc GetInstanceGroup(GetInstanceGroupRequest) returns (GetInstanceGroupResponse);
+    rpc ListInstanceGroup(ListInstanceGroupRequest) returns (ListInstanceGroupResponse);
     // 增删改查单条CacheMeta信息,暂时与meta_service保持一致
     rpc GetCacheMeta(GetCacheMetaRequest) returns (GetCacheMetaResponse);
     // 删除指定key的cache,用于修复用户反馈的单query异常,暂时与meta_service保持一致

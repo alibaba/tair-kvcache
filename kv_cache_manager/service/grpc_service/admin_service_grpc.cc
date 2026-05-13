@@ -30,6 +30,7 @@ void AdminServiceGRpc::Init() {
     MAKE_SERVICE_METRICS_COLLECTOR(UpdateInstanceGroup);
     MAKE_SERVICE_METRICS_COLLECTOR(RemoveInstanceGroup);
     MAKE_SERVICE_METRICS_COLLECTOR(GetInstanceGroup);
+    MAKE_SERVICE_METRICS_COLLECTOR(ListInstanceGroup);
 
     // for cache APIs
     MAKE_SERVICE_METRICS_COLLECTOR(GetCacheMeta);
@@ -141,6 +142,14 @@ grpc::Status AdminServiceGRpc::GetInstanceGroup(grpc::ServerContext *context,
                                                 proto::admin::GetInstanceGroupResponse *response) {
     API_CONTEXT_INIT_GRPC(GetInstanceGroup)
     admin_service_impl_->GetInstanceGroup(request_context, request, response);
+    return grpc::Status::OK;
+}
+
+grpc::Status AdminServiceGRpc::ListInstanceGroup(grpc::ServerContext *context,
+                                                 const proto::admin::ListInstanceGroupRequest *request,
+                                                 proto::admin::ListInstanceGroupResponse *response) {
+    API_CONTEXT_INIT_GRPC(ListInstanceGroup)
+    admin_service_impl_->ListInstanceGroup(request_context, request, response);
     return grpc::Status::OK;
 }
 

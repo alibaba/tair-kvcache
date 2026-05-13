@@ -49,6 +49,9 @@ public:
     grpc::Status GetInstanceGroup(grpc::ServerContext *context,
                                   const proto::admin::GetInstanceGroupRequest *request,
                                   proto::admin::GetInstanceGroupResponse *response) override;
+    grpc::Status ListInstanceGroup(grpc::ServerContext *context,
+                                   const proto::admin::ListInstanceGroupRequest *request,
+                                   proto::admin::ListInstanceGroupResponse *response) override;
     grpc::Status GetCacheMeta(grpc::ServerContext *context,
                               const proto::admin::GetCacheMetaRequest *request,
                               proto::admin::GetCacheMetaResponse *response) override;
@@ -123,6 +126,7 @@ private:
     KVCM_DECLARE_METRICS_COLLECTOR_(UpdateInstanceGroup);
     KVCM_DECLARE_METRICS_COLLECTOR_(RemoveInstanceGroup);
     KVCM_DECLARE_METRICS_COLLECTOR_(GetInstanceGroup);
+    KVCM_DECLARE_METRICS_COLLECTOR_(ListInstanceGroup);
 
     // for cache APIs
     KVCM_DECLARE_METRICS_COLLECTOR_(GetCacheMeta);
