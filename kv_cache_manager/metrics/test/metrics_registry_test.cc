@@ -26,16 +26,16 @@ bool VecContains(const std::vector<MetricsRegistry::metrics_tuple_t> &vec, const
         const auto &[name_e, tags_e, val_e] = e;
         const auto &[name_v, tags_v, val_v] = v;
 
-        if (name_e != name_v || tags_e != tags_v || val_e->index() != val_v->index()) {
+        if (name_e != name_v || tags_e != tags_v || val_e->value.index() != val_v->value.index()) {
             return false;
         }
 
-        if (std::holds_alternative<CounterValue>(*val_e)) {
-            return std::get<CounterValue>(*val_e).load() == std::get<CounterValue>(*val_v).load();
+        if (std::holds_alternative<CounterValue>(val_e->value)) {
+            return std::get<CounterValue>(val_e->value).load() == std::get<CounterValue>(val_v->value).load();
         }
 
-        if (std::holds_alternative<GaugeValue>(*val_e)) {
-            return AlmostEqual(std::get<GaugeValue>(*val_e).load(), std::get<GaugeValue>(*val_v).load());
+        if (std::holds_alternative<GaugeValue>(val_e->value)) {
+            return AlmostEqual(std::get<GaugeValue>(val_e->value).load(), std::get<GaugeValue>(val_v->value).load());
         }
 
         return false;
@@ -375,7 +375,7 @@ TEST_F(MetricsRegistryTest, TestMetricsDataGetOrCreate) {
 
 TEST_F(MetricsRegistryTest, TestMetricsRegistryGetCounter) {
     auto c = registry_->GetCounter("foo.bar");
-    ASSERT_TRUE(std::holds_alternative<CounterValue>(*c.GetRaw()));
+    ASSERT_TRUE(std::holds_alternative<CounterValue>(c.GetRaw()->value));
     ASSERT_EQ(0, c.Get());
     ++c;
     ASSERT_EQ(1, c.Get());
@@ -397,7 +397,7 @@ TEST_F(MetricsRegistryTest, TestMetricsRegistryGetCounter) {
 
 TEST_F(MetricsRegistryTest, TestMetricsRegistryGetCounterWithTags) {
     auto c = registry_->GetCounter("foo.bar", {{"foo", "bar"}});
-    ASSERT_TRUE(std::holds_alternative<CounterValue>(*c.GetRaw()));
+    ASSERT_TRUE(std::holds_alternative<CounterValue>(c.GetRaw()->value));
     ASSERT_EQ(0, c.Get());
     ++c;
     ASSERT_EQ(1, c.Get());
@@ -422,7 +422,7 @@ TEST_F(MetricsRegistryTest, TestMetricsRegistryGetCounterWithTags) {
 
 TEST_F(MetricsRegistryTest, TestMetricsRegistryGetGauge) {
     auto c = registry_->GetGauge("foo.bar");
-    ASSERT_TRUE(std::holds_alternative<GaugeValue>(*c.GetRaw()));
+    ASSERT_TRUE(std::holds_alternative<GaugeValue>(c.GetRaw()->value));
     ASSERT_DOUBLE_EQ(0., c.Get());
     c += 8.;
     ASSERT_DOUBLE_EQ(8., c.Get());
@@ -444,7 +444,7 @@ TEST_F(MetricsRegistryTest, TestMetricsRegistryGetGauge) {
 
 TEST_F(MetricsRegistryTest, TestMetricsRegistryGetGaugeWithTags) {
     auto c = registry_->GetGauge("foo.bar", {{"foo", "bar"}});
-    ASSERT_TRUE(std::holds_alternative<GaugeValue>(*c.GetRaw()));
+    ASSERT_TRUE(std::holds_alternative<GaugeValue>(c.GetRaw()->value));
     ASSERT_DOUBLE_EQ(0., c.Get());
     c += 8.;
     ASSERT_DOUBLE_EQ(8., c.Get());
@@ -471,11 +471,11 @@ TEST_F(MetricsRegistryTest, TestMetricsRegistryAdaptiveGet) {
     // adaptive get should not be supported
 
     auto counter = registry_->GetCounter("foo.bar");
-    ASSERT_TRUE(std::holds_alternative<CounterValue>(*counter.GetRaw()));
+    ASSERT_TRUE(std::holds_alternative<CounterValue>(counter.GetRaw()->value));
     ASSERT_THROW(registry_->GetGauge("foo.bar"), std::runtime_error);
 
     auto gauge = registry_->GetGauge("foo2.bar2");
-    ASSERT_TRUE(std::holds_alternative<GaugeValue>(*gauge.GetRaw()));
+    ASSERT_TRUE(std::holds_alternative<GaugeValue>(gauge.GetRaw()->value));
     ASSERT_THROW(registry_->GetCounter("foo2.bar2"), std::runtime_error);
 }
 

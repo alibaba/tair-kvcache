@@ -209,3 +209,63 @@ TEST_F(PrometheusExporterTest, LeadingDigitInPrefix) {
     std::string output = PrometheusExporter::Expose(*registry_, "9app");
     EXPECT_NE(output.find("_9app_service_qps"), std::string::npos) << "Actual output:\n" << output;
 }
+
+// Untouched series (registered but never written) must not appear in
+// the output, and a metric family with no touched series must not
+// emit its # HELP / # TYPE header either.
+TEST_F(PrometheusExporterTest, RegisteredCounterNeverWrittenIsSkipped) {
+    Counter c = registry_->GetCounter("service.query_counter");
+    (void)c;
+
+    std::string output = PrometheusExporter::Expose(*registry_);
+    EXPECT_TRUE(output.empty()) << "Actual output:\n" << output;
+}
+
+TEST_F(PrometheusExporterTest, RegisteredGaugeNeverWrittenIsSkipped) {
+    Gauge g = registry_->GetGauge("data_storage.healthy_status");
+    (void)g;
+
+    std::string output = PrometheusExporter::Expose(*registry_);
+    EXPECT_TRUE(output.empty()) << "Actual output:\n" << output;
+}
+
+TEST_F(PrometheusExporterTest, OnlyTouchedSeriesAppearInFamily) {
+    MetricsTags tags_a = {{"api_name", "GetCacheLocation"}};
+    MetricsTags tags_b = {{"api_name", "StartWriteCache"}};
+
+    Gauge ga = registry_->GetGauge("manager.batch_add_location_time_us", tags_a);
+    Gauge gb = registry_->GetGauge("manager.batch_add_location_time_us", tags_b);
+
+    // only the StartWriteCache series is actually written
+    gb = 42.0;
+    (void)ga;
+
+    std::string output = PrometheusExporter::Expose(*registry_);
+
+    EXPECT_NE(output.find("# TYPE kvcm_manager_batch_add_location_time_us gauge"), std::string::npos);
+    EXPECT_NE(output.find("api_name=\"StartWriteCache\"} 42"), std::string::npos);
+    EXPECT_EQ(output.find("api_name=\"GetCacheLocation\""), std::string::npos)
+        << "Untouched series should not appear:\n"
+        << output;
+}
+
+// Writing zero is still an explicit observation — the series must
+// stay visible.
+TEST_F(PrometheusExporterTest, GaugeExplicitlySetToZeroAppears) {
+    Gauge g = registry_->GetGauge("data_storage.healthy_status");
+    g = 0.0;
+
+    std::string output = PrometheusExporter::Expose(*registry_);
+    EXPECT_NE(output.find("kvcm_data_storage_healthy_status 0"), std::string::npos)
+        << "Actual output:\n"
+        << output;
+}
+
+TEST_F(PrometheusExporterTest, CounterIncrementedThenResetAppears) {
+    Counter c = registry_->GetCounter("service.query_counter");
+    ++c;
+    c.Reset();
+
+    std::string output = PrometheusExporter::Expose(*registry_);
+    EXPECT_NE(output.find("kvcm_service_query_counter 0"), std::string::npos) << "Actual output:\n" << output;
+}

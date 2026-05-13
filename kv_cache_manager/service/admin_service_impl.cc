@@ -787,11 +787,11 @@ void AdminServiceImpl::GetMetrics(RequestContext *request_context,
         }
 
         // value
-        if (std::holds_alternative<CounterValue>(*val)) {
+        if (std::holds_alternative<CounterValue>(val->value)) {
             pb_data->mutable_metric_value()->set_int_value(
-                static_cast<std::int64_t>(std::get<CounterValue>(*val).load()));
-        } else if (std::holds_alternative<GaugeValue>(*val)) {
-            pb_data->mutable_metric_value()->set_float_value(std::get<GaugeValue>(*val).load());
+                static_cast<std::int64_t>(std::get<CounterValue>(val->value).load()));
+        } else if (std::holds_alternative<GaugeValue>(val->value)) {
+            pb_data->mutable_metric_value()->set_float_value(std::get<GaugeValue>(val->value).load());
         }
     }
 
