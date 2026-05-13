@@ -74,6 +74,22 @@ kvcm_data_storage_storage_usage_ratio{type="hf3fs",unique_name="nfs_01"} 0.75
 kvcm_cache_manager_group_usage_ratio{instance_group="default"} 0.42
 ```
 
+### Label Conventions
+
+To allow PromQL `join` / aggregation across the `data_storage.*`
+metric family, every per-instance `data_storage.*` series uses the
+same two labels:
+
+- `type`: backend type, e.g. `hf3fs`, `nfs`, `pace`, `tair_mempool`.
+- `unique_name`: the backend instance's `global_unique_name`.
+
+```
+kvcm_data_storage_create_counter{type="nfs",unique_name="nfs_01"} 100
+kvcm_data_storage_create_keys_counter{type="nfs",unique_name="nfs_01"} 12800
+kvcm_data_storage_healthy_status{type="nfs",unique_name="nfs_01"} 1
+kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="nfs_01"} 0.6
+```
+
 ## Example Output
 
 ```
