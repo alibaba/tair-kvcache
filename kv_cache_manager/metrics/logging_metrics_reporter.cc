@@ -36,10 +36,10 @@ void LoggingMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
         ss << "]:";
 
         // value
-        if (std::holds_alternative<CounterValue>(*val)) {
-            ss << std::get<CounterValue>(*val).load();
-        } else if (std::holds_alternative<GaugeValue>(*val)) {
-            ss << std::get<GaugeValue>(*val).load();
+        if (std::holds_alternative<CounterValue>(val->value)) {
+            ss << std::get<CounterValue>(val->value).load();
+        } else if (std::holds_alternative<GaugeValue>(val->value)) {
+            ss << std::get<GaugeValue>(val->value).load();
         } else {
             ss << "<unknown_value_type>";
         }
@@ -75,10 +75,10 @@ void LoggingMetricsReporter::ReportInterval() {
         ss << "]:";
 
         // value
-        if (std::holds_alternative<CounterValue>(*val)) {
-                ss << std::get<CounterValue>(*val).load();
-        } else if (std::holds_alternative<GaugeValue>(*val)) {
-                ss << std::get<GaugeValue>(*val).load();
+        if (std::holds_alternative<CounterValue>(val->value)) {
+                ss << std::get<CounterValue>(val->value).load();
+        } else if (std::holds_alternative<GaugeValue>(val->value)) {
+                ss << std::get<GaugeValue>(val->value).load();
         } else {
             ss << "<unknown_value_type>";
         }
