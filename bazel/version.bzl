@@ -15,7 +15,7 @@ def version_info_py(name, **kwargs):
     """Generate a Python _version_info.py module with build metadata.
 
     The generated file exposes VERSION, GIT_COMMIT, GIT_COMMIT_FULL,
-    GIT_REPO, BUILD_DATE, BUILD_TIME, and FULL_VERSION variables.
+    GIT_REPO, BUILD_DATE, BUILD_TIMESTAMP, BUILD_TIME, and FULL_VERSION variables.
     """
     native.genrule(
         name = name,
@@ -34,7 +34,7 @@ def version_info_cc(name, header_name = "build_version.h", **kwargs):
 
     The generated header defines KVCM_VERSION, KVCM_GIT_COMMIT,
     KVCM_GIT_COMMIT_FULL, KVCM_GIT_REPO, KVCM_BUILD_DATE,
-    KVCM_BUILD_TIME, and KVCM_FULL_VERSION macros.
+    KVCM_BUILD_TIMESTAMP, KVCM_BUILD_TIME, and KVCM_FULL_VERSION macros.
     """
     gen_name = name + "_gen"
     native.genrule(
