@@ -143,15 +143,25 @@ def _ev_node_register(mediums):
     }
 
 
-def _ev_block_add(block_key, uri, medium):
+def _ev_block_add(block_key, medium, specs):
+    """Build a block_add event.
+
+    Args:
+        specs: list of {"name": ..., "uri": ...} dicts.
+    """
     return {
         "event_type": "EVENT_BLOCK_ADD",
         "block_add": {
             "block_key": str(block_key),
-            "uri": uri,
             "medium": medium,
+            "specs": specs,
         },
     }
+
+
+def _make_single_spec(name, uri):
+    """Convenience: build a one-element specs list."""
+    return [{"name": name, "uri": uri}]
 
 
 def _ev_block_delete(block_key, medium):
@@ -283,26 +293,27 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
         )
         self.assertIn("header", body)
 
-    # 3. BLOCK_ADD with explicit medium
+    # 3. BLOCK_ADD with single spec
     def test_03_block_add(self):
         uri = _build_vineyard_uri(self.HOST, "mem", {"gpu": "A100"})
         body = self.client.report_event(
             _make_request(
                 self.instance_id, self.HOST,
-                [_ev_block_add(9001, uri, "mem")],
+                [_ev_block_add(9001, "mem", _make_single_spec("default", uri))],
                 trace_id="t03",
             )
         )
         self.assertIn("header", body)
 
-    # 4. BLOCK_ADD then query: location_id must be kvs#v6d#{medium}#{host}
+    # 4. BLOCK_ADD then query: spec name/uri should match what was sent
     def test_04_block_add_then_query(self):
         block_key = 9002
         uri = _build_vineyard_uri(self.HOST, "mem", {"flavor": "test_query"})
+        spec_name = "tp0"
         self.client.report_event(
             _make_request(
                 self.instance_id, self.HOST,
-                [_ev_block_add(block_key, uri, "mem")],
+                [_ev_block_add(block_key, "mem", _make_single_spec(spec_name, uri))],
                 trace_id="t04",
             )
         )
@@ -319,13 +330,10 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
         self.assertGreater(len(locations), 0, "Expected at least one location after BLOCK_ADD")
         specs = locations[0].get("location_specs", [])
         self.assertGreater(len(specs), 0)
-        # V8: spec.uri must be the standard URI we sent in BLOCK_ADD.
         self.assertEqual(specs[0]["uri"], uri,
-                         "spec.uri should be the V8 standard vineyard:// URI")
-        # V8: spec.name should be the deterministic location_id pattern.
-        expected_loc_id = f"kvs#v6d#mem#{self.HOST}"
-        self.assertEqual(specs[0]["name"], expected_loc_id,
-                         f"spec.name should be {expected_loc_id}")
+                         "spec.uri should match the URI sent in BLOCK_ADD")
+        self.assertEqual(specs[0]["name"], spec_name,
+                         f"spec.name should be {spec_name}")
 
     # 5. Two mediums on same host: each becomes its own location_id
     def test_05_block_add_multi_medium(self):
@@ -341,8 +349,8 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
             _make_request(
                 self.instance_id, host,
                 [
-                    _ev_block_add(block_key, uri_mem, "mem"),
-                    _ev_block_add(block_key, uri_disk, "disk"),
+                    _ev_block_add(block_key, "mem", _make_single_spec("mem_spec", uri_mem)),
+                    _ev_block_add(block_key, "disk", _make_single_spec("disk_spec", uri_disk)),
                 ],
                 trace_id="t05b",
             )
@@ -362,15 +370,51 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
         locations = resp.get("locations", [])
         self.assertEqual(len(locations), 1, "QT_BATCH_GET with one key should return one row")
         specs = locations[0].get("location_specs", [])
-        # MetaSearcher merges V6D replicas on the same host into one CacheLocation with
-        # multiple LocationSpecs (see SelectAndMergeForMatch + IsSameDataStorage).
         by_name = {s["name"]: s for s in specs if s.get("name")}
-        expected_mem = f"kvs#v6d#mem#{host}"
-        expected_disk = f"kvs#v6d#disk#{host}"
-        self.assertIn(expected_mem, by_name, f"Expected mem replica id, specs={list(by_name)}")
-        self.assertIn(expected_disk, by_name, f"Expected disk replica id, specs={list(by_name)}")
-        self.assertEqual(by_name[expected_mem]["uri"], uri_mem)
-        self.assertEqual(by_name[expected_disk]["uri"], uri_disk)
+        self.assertIn("mem_spec", by_name, f"Expected mem_spec, specs={list(by_name)}")
+        self.assertIn("disk_spec", by_name, f"Expected disk_spec, specs={list(by_name)}")
+        self.assertEqual(by_name["mem_spec"]["uri"], uri_mem)
+        self.assertEqual(by_name["disk_spec"]["uri"], uri_disk)
+
+    # 5b. BLOCK_ADD with multiple specs in one CacheLocation
+    def test_05b_block_add_multi_spec(self):
+        block_key = 9025
+        host = "192.168.1.221:8080"
+        self.client.report_event(
+            _make_request(self.instance_id, host, [_ev_node_register(["mem"])], trace_id="t05b_reg")
+        )
+        uri_spec0 = _build_vineyard_uri(host, "mem", {"obj_id": "o1", "size": "512"})
+        uri_spec1 = _build_vineyard_uri(host, "mem", {"obj_id": "o2", "size": "512"})
+        body = self.client.report_event(
+            _make_request(
+                self.instance_id, host,
+                [_ev_block_add(block_key, "mem", [
+                    {"name": "spec_4096", "uri": uri_spec0},
+                    {"name": "spec_8192", "uri": uri_spec1},
+                ])],
+                trace_id="t05b_add",
+            )
+        )
+        self.assertIn("header", body)
+
+        resp = self.client.get_cache_location({
+            "trace_id": "t05b_query",
+            "instance_id": self.instance_id,
+            "query_type": "QT_BATCH_GET",
+            "block_keys": [block_key],
+            "block_mask": {"offset": 0},
+        })
+        code = resp.get("header", {}).get("status", {}).get("code")
+        self.assertEqual(code, "OK", f"getCacheLocation failed: {json.dumps(resp, ensure_ascii=False)}")
+
+        locations = resp.get("locations", [])
+        self.assertEqual(len(locations), 1)
+        specs = locations[0].get("location_specs", [])
+        by_name = {s["name"]: s for s in specs}
+        self.assertIn("spec_4096", by_name, f"Expected spec_4096 in specs={list(by_name)}")
+        self.assertIn("spec_8192", by_name, f"Expected spec_8192 in specs={list(by_name)}")
+        self.assertEqual(by_name["spec_4096"]["uri"], uri_spec0)
+        self.assertEqual(by_name["spec_8192"]["uri"], uri_spec1)
 
     # 6. BLOCK_DELETE removes the specific (block_key, medium) entry
     def test_06_block_delete(self):
@@ -379,7 +423,7 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
         self.client.report_event(
             _make_request(
                 self.instance_id, self.HOST,
-                [_ev_block_add(block_key, uri, "mem")],
+                [_ev_block_add(block_key, "mem", _make_single_spec("spec_4096", uri))],
                 trace_id="t06a",
             )
         )
@@ -414,8 +458,8 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
         # Register + add mem/disk replicas in a single batch.
         events = [_ev_node_register(["mem", "disk"])]
         for bk in block_keys:
-            events.append(_ev_block_add(bk, _build_vineyard_uri(down_host, "mem"), "mem"))
-            events.append(_ev_block_add(bk, _build_vineyard_uri(down_host, "disk"), "disk"))
+            events.append(_ev_block_add(bk, "mem", _make_single_spec("spec_4096", _build_vineyard_uri(down_host, "mem"))))
+            events.append(_ev_block_add(bk, "disk", _make_single_spec("spec_4096", _build_vineyard_uri(down_host, "disk"))))
         self.client.report_event(_make_request(self.instance_id, down_host, events, trace_id="t08a"))
 
         body = self.client.report_event(
@@ -466,7 +510,7 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
         block_key = 9030
         events = [
             _ev_node_register(["mem"]),
-            _ev_block_add(block_key, _build_vineyard_uri(host, "mem"), "mem"),
+            _ev_block_add(block_key, "mem", _make_single_spec("spec_4096", _build_vineyard_uri(host, "mem"))),
             _ev_heartbeat({"phase": "boot"}),
         ]
         body = self.client.report_event(
@@ -518,7 +562,7 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
         self.client.report_event(
             _make_request(
                 self.instance_id, self.HOST,
-                [_ev_block_add(block_key, uri, "mem")],
+                [_ev_block_add(block_key, "mem", _make_single_spec("spec_4096", uri))],
                 trace_id="t16_add",
             )
         )
@@ -574,7 +618,7 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
         self.client.report_event(
             _make_request(self.instance_id, host, [
                 _ev_node_register(["mem"]),
-                _ev_block_add(block_key, _build_vineyard_uri(host, "mem"), "mem"),
+                _ev_block_add(block_key, "mem", _make_single_spec("spec_4096", _build_vineyard_uri(host, "mem"))),
             ], trace_id="t17a_setup")
         )
         # Confirm the replica is queryable.
@@ -630,7 +674,7 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
         self.client.report_event(
             _make_request(self.instance_id, host, [
                 _ev_node_register(["mem"]),
-                _ev_block_add(block_key, _build_vineyard_uri(host, "mem"), "mem"),
+                _ev_block_add(block_key, "mem", _make_single_spec("spec_4096", _build_vineyard_uri(host, "mem"))),
             ], trace_id="t17b_setup")
         )
 
@@ -685,7 +729,7 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
             self.client.report_event(
                 _make_request(
                     self.instance_id, h,
-                    [_ev_block_add(block_key, _build_vineyard_uri(h, "mem"), "mem")],
+                    [_ev_block_add(block_key, "mem", _make_single_spec("spec_4096", _build_vineyard_uri(h, "mem")))],
                     trace_id=f"t17_add_{h}",
                 )
             )
@@ -766,7 +810,7 @@ class VineyardReportEventBenchTest(unittest.TestCase):
                 block_key = thread_id * ops_per_thread + i + 100000
                 payload = _make_request(
                     self.instance_id, host,
-                    [_ev_block_add(block_key, _build_vineyard_uri(host, "mem"), "mem")],
+                    [_ev_block_add(block_key, "mem", _make_single_spec("spec_4096", _build_vineyard_uri(host, "mem")))],
                     trace_id=f"bench_add_{thread_id}_{i}",
                 )
                 t0 = time.monotonic()
@@ -822,7 +866,7 @@ class VineyardReportEventBenchTest(unittest.TestCase):
             for i in range(ops_per_thread):
                 block_key = thread_id * ops_per_thread + i + 200000
                 events = [
-                    _ev_block_add(block_key, _build_vineyard_uri(host, "mem"), "mem"),
+                    _ev_block_add(block_key, "mem", _make_single_spec("spec_4096", _build_vineyard_uri(host, "mem"))),
                     _ev_block_delete(block_key, "mem"),
                     _ev_heartbeat({"thread": str(thread_id)}),
                 ]

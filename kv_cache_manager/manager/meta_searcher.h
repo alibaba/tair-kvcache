@@ -63,7 +63,7 @@ public:
         std::string location_id;
         DataStorageType type;
         CacheLocationStatus status;
-        std::string uri;
+        std::vector<LocationSpec> specs;
     };
     ErrorCode BatchUpsertLocations(RequestContext *request_context,
                                    const KeyVector &keys,

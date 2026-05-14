@@ -62,8 +62,9 @@ message NodeRegisterParams {
 
 message BlockAddParams {
     string block_key = 1; // int64 as string
-    string uri = 2;       // standard URI: vineyard://{ip}:{port}/{medium}?...
-    string medium = 3;    // medium tag, e.g. "mem"/"disk"/"ssd"/"hbm"; KVCM does not interpret
+    string uri = 2;       // deprecated, use specs instead
+    string medium = 3;    // medium tag, e.g. "mem"/"disk"/"ssd"/"hbm"; used to build location_id
+    repeated LocationSpec specs = 4; // each entry provides (name, uri) for one spec in the location
 }
 
 message BlockDeleteParams {

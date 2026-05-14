@@ -1399,21 +1399,21 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
     std::map<std::string, std::string> heartbeat_status;
 
     // Per-block aggregation:
-    //   block_to_add[block_key] = vector<{location_id, uri}>     # upsert
-    //   block_to_del[block_key] = vector<location_id>            # remove
+    //   block_to_add[block_key] = vector<BlockAddEntry>   # upsert
+    //   block_to_del[block_key] = vector<BlockDelEntry>   # remove
     // The same block_key + same medium repeated within a batch will get the
     // last-writer-wins semantics inside the modifier.
-    struct AddSpec {
+    struct BlockAddEntry {
         std::string location_id;
-        std::string uri;
+        std::vector<LocationSpec> specs;
         int event_index;
     };
-    struct DelSpec {
+    struct BlockDelEntry {
         std::string location_id;
         int event_index;
     };
-    std::map<int64_t, std::vector<AddSpec>> block_to_add;
-    std::map<int64_t, std::vector<DelSpec>> block_to_del;
+    std::map<int64_t, std::vector<BlockAddEntry>> block_to_add;
+    std::map<int64_t, std::vector<BlockDelEntry>> block_to_del;
 
     for (int i = 0; i < events_size; ++i) {
         const auto &item = request->events(i);
@@ -1463,7 +1463,19 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 per_item_ec[i] = EC_BADARGS;
                 break;
             }
-            block_to_add[block_key].push_back(AddSpec{BuildVineyardLocationId(p.medium(), host_ip_port), p.uri(), i});
+            if (p.specs_size() == 0) {
+                KVCM_LOG_WARN(
+                    "trace_id [%s] | EVENT_BLOCK_ADD: empty specs for block_key [%ld]", trace_id.c_str(), block_key);
+                per_item_ec[i] = EC_BADARGS;
+                break;
+            }
+            std::string location_id = BuildVineyardLocationId(p.medium(), host_ip_port);
+            std::vector<LocationSpec> entry_specs;
+            entry_specs.reserve(p.specs_size());
+            for (const auto &s : p.specs()) {
+                entry_specs.emplace_back(s.name(), s.uri());
+            }
+            block_to_add[block_key].push_back(BlockAddEntry{std::move(location_id), std::move(entry_specs), i});
             break;
         }
         case proto::meta::EVENT_BLOCK_DELETE: {
@@ -1487,7 +1499,7 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 per_item_ec[i] = EC_BADARGS;
                 break;
             }
-            block_to_del[block_key].push_back(DelSpec{BuildVineyardLocationId(p.medium(), host_ip_port), i});
+            block_to_del[block_key].push_back(BlockDelEntry{BuildVineyardLocationId(p.medium(), host_ip_port), i});
             break;
         }
         default:
@@ -1544,24 +1556,24 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
 
     if (!block_to_add.empty()) {
         KeyVector add_keys_aggr;
-        std::vector<const std::vector<AddSpec> *> add_specs_aggr;
+        std::vector<const std::vector<BlockAddEntry> *> add_entries_aggr;
         add_keys_aggr.reserve(block_to_add.size());
-        add_specs_aggr.reserve(block_to_add.size());
+        add_entries_aggr.reserve(block_to_add.size());
         for (const auto &kv : block_to_add) {
             add_keys_aggr.push_back(kv.first);
-            add_specs_aggr.push_back(&kv.second);
+            add_entries_aggr.push_back(&kv.second);
         }
 
         std::vector<std::vector<MetaSearcher::UpsertLocation>> upserts(add_keys_aggr.size());
         for (size_t i = 0; i < add_keys_aggr.size(); ++i) {
-            const auto &specs = *add_specs_aggr[i];
-            upserts[i].reserve(specs.size());
-            for (const auto &spec : specs) {
+            const auto &entries = *add_entries_aggr[i];
+            upserts[i].reserve(entries.size());
+            for (const auto &entry : entries) {
                 upserts[i].push_back(MetaSearcher::UpsertLocation{
-                    spec.location_id,
+                    entry.location_id,
                     DataStorageType::DATA_STORAGE_TYPE_VINEYARD,
                     CacheLocationStatus::CLS_SERVING,
-                    spec.uri,
+                    entry.specs,
                 });
             }
         }
@@ -1574,9 +1586,9 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             if (key_ec == EC_OK) {
                 continue;
             }
-            for (const auto &spec : *add_specs_aggr[k]) {
-                if (per_item_ec[spec.event_index] == EC_OK) {
-                    per_item_ec[spec.event_index] = key_ec;
+            for (const auto &entry : *add_entries_aggr[k]) {
+                if (per_item_ec[entry.event_index] == EC_OK) {
+                    per_item_ec[entry.event_index] = key_ec;
                 }
             }
         }
@@ -1588,18 +1600,18 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
 
     if (!block_to_del.empty()) {
         KeyVector del_keys_aggr;
-        std::vector<const std::vector<DelSpec> *> del_specs_aggr;
+        std::vector<const std::vector<BlockDelEntry> *> del_entries_aggr;
         del_keys_aggr.reserve(block_to_del.size());
-        del_specs_aggr.reserve(block_to_del.size());
+        del_entries_aggr.reserve(block_to_del.size());
         for (const auto &kv : block_to_del) {
             del_keys_aggr.push_back(kv.first);
-            del_specs_aggr.push_back(&kv.second);
+            del_entries_aggr.push_back(&kv.second);
         }
 
         LocationIdsPerKey del_location_ids(del_keys_aggr.size());
         for (size_t i = 0; i < del_keys_aggr.size(); ++i) {
-            for (const auto &spec : *del_specs_aggr[i]) {
-                del_location_ids[i].push_back(spec.location_id);
+            for (const auto &entry : *del_entries_aggr[i]) {
+                del_location_ids[i].push_back(entry.location_id);
             }
         }
 
@@ -1621,9 +1633,9 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             if (key_ec == EC_OK) {
                 continue;
             }
-            for (const auto &spec : *del_specs_aggr[k]) {
-                if (per_item_ec[spec.event_index] == EC_OK) {
-                    per_item_ec[spec.event_index] = key_ec;
+            for (const auto &entry : *del_entries_aggr[k]) {
+                if (per_item_ec[entry.event_index] == EC_OK) {
+                    per_item_ec[entry.event_index] = key_ec;
                 }
             }
         }

@@ -471,24 +471,23 @@ ErrorCode MetaSearcher::BatchUpsertLocations(RequestContext *request_context,
         }
         std::uint64_t key_total_sz = 0;
         DataStorageType key_type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
-        for (const auto &spec : new_locations_per_key[index]) {
+        for (const auto &entry : new_locations_per_key[index]) {
             CacheLocation loc;
-            loc.set_id(spec.location_id);
-            loc.set_type(spec.type);
-            loc.set_status(spec.status);
-            loc.set_spec_size(1);
-            LocationSpec ls(spec.location_id, spec.uri);
-            loc.push_location_spec(std::move(ls));
-            // Idempotent upsert: same id replaces any prior entry.
-            out_new_locations[spec.location_id] = std::move(loc);
-
-            if (DataStorageUri ds_uri(spec.uri); ds_uri.Valid()) {
-                std::uint64_t spec_sz = 0;
-                ds_uri.GetParamAs<std::uint64_t>("size", spec_sz);
-                key_total_sz += spec_sz;
+            loc.set_id(entry.location_id);
+            loc.set_type(entry.type);
+            loc.set_status(entry.status);
+            loc.set_spec_size(entry.specs.size());
+            for (const auto &ls : entry.specs) {
+                loc.push_location_spec(LocationSpec(ls.name(), ls.uri()));
+                if (DataStorageUri ds_uri(ls.uri()); ds_uri.Valid()) {
+                    std::uint64_t spec_sz = 0;
+                    ds_uri.GetParamAs<std::uint64_t>("size", spec_sz);
+                    key_total_sz += spec_sz;
+                }
             }
+            out_new_locations[entry.location_id] = std::move(loc);
             if (key_type == DataStorageType::DATA_STORAGE_TYPE_UNKNOWN) {
-                key_type = spec.type;
+                key_type = entry.type;
             }
         }
         loc_sz[index] = std::make_pair(key_type, key_total_sz);
