@@ -129,6 +129,15 @@ void AdminServiceHttp::RegisterHandler() {
                            });
     }
 
+    // Health check endpoint (GET /api/healthy)
+    RegisterGetHandler("/api/healthy",
+                       [](coro_http::coro_http_request &req,
+                          coro_http::coro_http_response &res) -> async_simple::coro::Lazy<void> {
+                           res.add_header("Content-Type", "application/json");
+                           res.set_status_and_content(coro_http::status_type::ok, R"({"status":"OK"})");
+                           co_return;
+                       });
+
     // High Availability APIs
     REGISTER_HTTP_HANDLER_FOR_ADMIN_SERVICE(Post, checkHealth, CheckHealth, CheckHealth, CheckHealth);
     REGISTER_HTTP_HANDLER_FOR_ADMIN_SERVICE(
