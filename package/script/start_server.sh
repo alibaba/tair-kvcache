@@ -12,13 +12,17 @@ DEFAULT_SERVER_CONFIG=$CONFIG_PATH/default_server_config.conf
 DEFAULT_LOGGER_CONFIG=$CONFIG_PATH/default_logger_config.conf
 BINARY=$BINARY_PATH/kv_cache_manager_bin
 
+function install_kvcm_ops() {
+    python3 -m pip install "$KVCM_OPS_WHEEL_PATH"
+}
+
 function start_server() {
     echo "start server at: "$BINARY
     exec $BINARY -c $DEFAULT_SERVER_CONFIG -l $DEFAULT_LOGGER_CONFIG "$@"
 }
 
 function main() {
-    python3 -m pip install "$KVCM_OPS_WHEEL_PATH"
+    install_kvcm_ops
     start_server "$@"
 }
 
