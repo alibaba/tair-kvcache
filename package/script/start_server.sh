@@ -14,7 +14,11 @@ BINARY=$BINARY_PATH/kv_cache_manager_bin
 
 function start_server() {
     echo "start server at: "$BINARY
-    exec $BINARY -c $DEFAULT_SERVER_CONFIG -l $DEFAULT_LOGGER_CONFIG "$@"
+    local env_args=()
+    while IFS='=' read -r key value; do
+        env_args+=(-e "${key}=${value}")
+    done < <(env | grep '^kvcm\.')
+    exec $BINARY -c $DEFAULT_SERVER_CONFIG -l $DEFAULT_LOGGER_CONFIG "${env_args[@]}" "$@"
 }
 
 function main() {
