@@ -824,7 +824,7 @@ void AdminServiceImpl::CheckHealth(RequestContext *request_context,
     status->set_code(proto::admin::OK);
     request_context->set_status_code(status->code());
     status->set_message("Health check completed");
-    KVCM_LOG_INFO("[traceId: %s] CheckHealth succeeded", request->trace_id().c_str());
+    KVCM_LOG_DEBUG("[traceId: %s] CheckHealth succeeded", request->trace_id().c_str());
 }
 
 void AdminServiceImpl::GetManagerClusterInfo(RequestContext *request_context,
