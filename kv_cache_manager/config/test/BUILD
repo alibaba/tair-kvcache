@@ -101,6 +101,21 @@ cc_test(
 )
 
 cc_test(
+    name = "coordination_redis_backend_unit_test",
+    srcs = [
+        "coordination_redis_backend_unit_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    data = [],
+    deps = [
+        "//kv_cache_manager/common:redis_client_ext",
+        "//kv_cache_manager/common:standard_uri",
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config:coordination_backend",
+    ],
+)
+
+cc_test(
     name = "coordination_file_backend_test",
     srcs = [
         "coordination_file_backend_test.cc",
