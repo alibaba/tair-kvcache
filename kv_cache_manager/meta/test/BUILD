@@ -168,6 +168,34 @@ cc_test(
 )
 
 cc_test(
+    name = "mpsc_write_queue_test",
+    srcs = [
+        "mpsc_write_queue_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    data = [],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/meta:mpsc_write_queue",
+    ],
+)
+
+cc_test(
+    name = "meta_async_redis_backend_test",
+    srcs = [
+        "meta_async_redis_backend_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    data = [],
+    deps = [
+        ":meta_storage_backend_testlib",
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/common/test:redis_client_testlib",
+        "//kv_cache_manager/meta:meta_async_redis_backend",
+    ],
+)
+
+cc_test(
     name = "meta_storage_backend_manager_real_redis_test",
     srcs = [
         "meta_storage_backend_manager_real_redis_test.cc",

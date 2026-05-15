@@ -344,5 +344,9 @@ TEST_F(LocalMetricsReporterTest, TestReportIntervalCacheManagerMetrics) {
         GET_METRICS_(p, cache_manager_instance, byte_size, byte_size_v);
         EXPECT_DOUBLE_EQ(5, key_count_v);
         EXPECT_DOUBLE_EQ(5 * 1024, byte_size_v);
+
+        // async_queue_sizes should be empty since the default meta backend has no async queues
+        const auto &queue_sizes = GET_SUMMARY_(p, cache_manager_instance, async_queue_sizes);
+        EXPECT_TRUE(queue_sizes.empty());
     }
 }

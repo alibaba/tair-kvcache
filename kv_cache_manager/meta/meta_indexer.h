@@ -108,6 +108,12 @@ public:
     size_t GetMemUsage() const noexcept;
     int64_t GetOldestAccessTime() const noexcept;
 
+    // Synchronously flush pending writes for the given keys to persistent storage.
+    bool Sync(const KeyVector &keys) noexcept;
+
+    // Returns per-queue pending key sizes from async backend.
+    std::vector<int64_t> GetAsyncQueueSizes() const noexcept;
+
     // storage usage interfaces
     [[nodiscard]] std::uint64_t GetStorageUsage() const noexcept;
     [[nodiscard]] std::uint64_t GetStorageUsageByType(const DataStorageType &type) const noexcept;

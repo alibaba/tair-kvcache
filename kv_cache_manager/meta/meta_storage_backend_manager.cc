@@ -721,6 +721,20 @@ ErrorCode MetaStorageBackendManager::GetMetaData(FieldMap &field_maps) noexcept 
     return persistent_backend_->GetMetaData(field_maps);
 }
 
+bool MetaStorageBackendManager::Sync(const KeyVector &keys) noexcept {
+    if (!persistent_backend_) {
+        return true;
+    }
+    return persistent_backend_->Sync(keys);
+}
+
+std::vector<int64_t> MetaStorageBackendManager::GetAsyncQueueSizes() const noexcept {
+    if (!persistent_backend_) {
+        return {};
+    }
+    return persistent_backend_->GetAsyncQueueSizes();
+}
+
 size_t MetaStorageBackendManager::GetMemUsage() const noexcept {
     if (cache_backend_) {
         return cache_backend_->GetMemUsage();

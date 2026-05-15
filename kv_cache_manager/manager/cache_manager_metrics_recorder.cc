@@ -108,7 +108,8 @@ void CacheManagerMetricsRecorder::RecorderLoop() {
                     max_lru_age_us = TimestampUtil::GetCurrentTimeUs() - oldest_access_time;
                 }
                 group_instance_id_metric_map[instance_group_name][instance_id] =
-                    InstanceMetric({key_cnt, byte_size, max_lru_age_us});
+                   
+                    InstanceMetric({key_cnt, byte_size, meta_indexer->GetAsyncQueueSizes(), max_lru_age_us});
             }
             int64_t capacity = instance_group->quota().capacity();
             group_usage_ratio_map[instance_group_name] =

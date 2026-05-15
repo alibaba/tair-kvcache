@@ -87,6 +87,13 @@ public:
     ErrorCode PutMetaData(const FieldMap &field_maps) noexcept;
     ErrorCode GetMetaData(FieldMap &field_maps) noexcept;
 
+    // Synchronously flush pending writes for the given keys to persistent storage.
+    // Returns true on success, false on failure/timeout.
+    bool Sync(const KeyVector &keys) noexcept;
+
+    // Returns per-queue pending key sizes from persistent backend.
+    std::vector<int64_t> GetAsyncQueueSizes() const noexcept;
+
     size_t GetMemUsage() const noexcept;
     int64_t GetOldestAccessTime() const noexcept;
 

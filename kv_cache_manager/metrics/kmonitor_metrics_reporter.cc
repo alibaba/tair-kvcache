@@ -141,6 +141,7 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(cache_manager_group, usage_ratio);
     DECLARE_METRICS(cache_manager_instance, key_count);
     DECLARE_METRICS(cache_manager_instance, byte_size);
+    DECLARE_METRICS(cache_manager_instance, async_queue_size);
     DECLARE_METRICS(cache_manager_instance, max_lru_age_us);
 
     struct MapHashFunc {
@@ -267,6 +268,17 @@ bool KmonitorMetricsReporter::Init(std::shared_ptr<CacheManager> cache_manager,
         }                                                                                                              \
     } while (0)
 
+#define REGISTER_SUMMARY_METRIC(group, name)                                                                           \
+    do {                                                                                                               \
+        std::string metric_name = #group "." #name;                                                                    \
+        ctx_->group##_##name##_metrics.reset(                                                                          \
+            reporter->RegisterMetric(metric_name, kmonitor::SUMMARY, kmonitor::FATAL));                                \
+        if (nullptr == ctx_->group##_##name##_metrics) {                                                               \
+            KVCM_LOG_ERROR("failed to register metric:[%s]", metric_name.c_str());                                     \
+            return false;                                                                                              \
+        }                                                                                                              \
+    } while (0)
+
 bool KmonitorMetricsReporter::InitMetrics() {
     ctx_->kmonitor = kmonitor::KMonitorFactory::GetKMonitor("kvcm_default");
     auto reporter = ctx_->kmonitor;
@@ -371,6 +383,7 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(cache_manager_group, usage_ratio);
     REGISTER_GAUGE_METRIC(cache_manager_instance, key_count);
     REGISTER_GAUGE_METRIC(cache_manager_instance, byte_size);
+    REGISTER_SUMMARY_METRIC(cache_manager_instance, async_queue_size);
     REGISTER_GAUGE_METRIC(cache_manager_instance, max_lru_age_us);
 
     return true;
@@ -378,6 +391,7 @@ bool KmonitorMetricsReporter::InitMetrics() {
 
 #undef REGISTER_QPS_METRIC
 #undef REGISTER_GAUGE_METRIC
+#undef REGISTER_SUMMARY_METRIC
 
 #define REPORT_METRICS(group, name, value)                                                                             \
     do {                                                                                                               \
@@ -668,6 +682,9 @@ void KmonitorMetricsReporter::ReportInterval() {
                     REPORT_METRICS(cache_manager_instance, key_count, key_count_v);
                     GET_METRICS_(p, cache_manager_instance, byte_size, byte_size_v);
                     REPORT_METRICS(cache_manager_instance, byte_size, byte_size_v);
+                    for (const int64_t v : GET_SUMMARY_(p, cache_manager_instance, async_queue_sizes)) {
+                        REPORT_METRICS(cache_manager_instance, async_queue_size, v);
+                    }
                     GET_METRICS_(p, cache_manager_instance, max_lru_age_us, max_lru_age_us_v);
                     REPORT_METRICS(cache_manager_instance, max_lru_age_us, max_lru_age_us_v);
                 }
