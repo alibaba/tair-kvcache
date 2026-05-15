@@ -242,6 +242,17 @@ public:                                                                         
     }
 #endif
 
+#ifndef KVCM_SUMMARY_METRICS
+#define KVCM_SUMMARY_METRICS(group, name)                                                                              \
+public:                                                                                                                \
+    DECLARE_METRICS_NAME_(group, name);                                                                                \
+    DEFINE_SET_METRICS_SUMMARY_(group, name)                                                                           \
+    DEFINE_GET_METRICS_SUMMARY_(group, name)                                                                           \
+                                                                                                                       \
+private:                                                                                                               \
+    DECLARE_METRICS_SUMMARY_(group, name);
+#endif
+
 /* ------------------- ServiceMetricsCollector ---------------------- */
 
 #ifndef KVCM_SERVICE_METRICS_COLLECTOR_PTR
@@ -415,6 +426,7 @@ class CacheManagerInstanceMetricsCollector final : public MetricsCollector {
     KVCM_GAUGE_METRICS(cache_manager_instance, key_count)
     KVCM_GAUGE_METRICS(cache_manager_instance, byte_size)
     KVCM_GAUGE_METRICS(cache_manager_instance, max_lru_age_us)
+    KVCM_SUMMARY_METRICS(cache_manager_instance, async_queue_sizes)
 
 public:
     CacheManagerInstanceMetricsCollector() = delete;
@@ -428,5 +440,6 @@ public:
 
 #undef KVCM_CHRONO_METRICS
 #undef KVCM_GAUGE_METRICS
+#undef KVCM_SUMMARY_METRICS
 
 } // namespace kv_cache_manager

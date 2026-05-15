@@ -54,9 +54,36 @@ public:
                    std::vector<std::string> &out_keys);
     ErrorCode Rand(const std::string &matching_prefix, const int64_t count, std::vector<std::string> &out_keys);
 
-protected:
     using ReplyUPtr = std::unique_ptr<redisReply, void (*)(void *)>;
     using CmdArgs = std::vector<std::string>;
+
+    // Public pipeline interface for batch command execution.
+    // Returns per-command replies; empty vector on total connection failure.
+    std::vector<ReplyUPtr> BatchExecute(const std::vector<CmdArgs> &cmds) { return CommandPipeline(cmds); }
+
+    // --- Static command builders ---
+    // Pure utility functions that construct Redis CmdArgs without any connection or state.
+    // Callers use these to build command sequences, then execute via BatchExecute/CommandPipeline.
+
+    // DEL + HSET per key (overwrite semantics). Skips keys with empty field_maps.
+    static void BuildSetCmds(const std::vector<std::string> &keys,
+                             const std::vector<std::map<std::string, std::string>> &field_maps,
+                             std::vector<CmdArgs> &out_cmds);
+
+    // HSET per key (merge/upsert semantics). Skips keys with empty field_maps.
+    static void BuildHashSetCmds(const std::vector<std::string> &keys,
+                                 const std::vector<std::map<std::string, std::string>> &field_maps,
+                                 std::vector<CmdArgs> &out_cmds);
+
+    // DEL per key.
+    static void BuildDeleteCmds(const std::vector<std::string> &keys, std::vector<CmdArgs> &out_cmds);
+
+    // HDEL per key. Skips keys with empty field_names.
+    static void BuildHashDeleteCmds(const std::vector<std::string> &keys,
+                                    const std::vector<std::vector<std::string>> &field_names_vec,
+                                    std::vector<CmdArgs> &out_cmds);
+
+protected:
 
     bool IsReplyOk(const redisReply *reply) const;
     bool CheckReplyInteger(const redisReply *reply) const;

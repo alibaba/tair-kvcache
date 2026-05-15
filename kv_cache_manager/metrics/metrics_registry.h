@@ -73,6 +73,14 @@ namespace kv_cache_manager {
 #define DEFINE_STEAL_METRICS_GAUGE_(group, name)                                                                       \
     double steal_##group##_##name##_metrics() { return METRICS_(group, name).Steal(); }
 
+#define DECLARE_METRICS_SUMMARY_(group, name) std::vector<int64_t> group##_##name##_summary_
+
+#define DEFINE_SET_METRICS_SUMMARY_(group, name)                                                                       \
+    void set_##group##_##name##_summary(const std::vector<int64_t> &v) { group##_##name##_summary_ = v; }
+
+#define DEFINE_GET_METRICS_SUMMARY_(group, name)                                                                       \
+    const std::vector<int64_t> &get_##group##_##name##_summary() const { return group##_##name##_summary_; }
+
 #define COPY_METRICS_(ptr, group, name, value)                                                                         \
     do {                                                                                                               \
         (ptr)->copy_##group##_##name##_metrics(value);                                                                 \
@@ -92,6 +100,13 @@ namespace kv_cache_manager {
     do {                                                                                                               \
         (value) = (ptr)->steal_##group##_##name##_metrics();                                                           \
     } while (0)
+
+#define SET_SUMMARY_(ptr, group, name, value)                                                                          \
+    do {                                                                                                               \
+        (ptr)->set_##group##_##name##_summary(value);                                                                  \
+    } while (0)
+
+#define GET_SUMMARY_(ptr, group, name) (ptr)->get_##group##_##name##_summary()
 
 #endif
 

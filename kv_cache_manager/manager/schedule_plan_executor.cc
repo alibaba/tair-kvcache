@@ -446,6 +446,15 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::Submit(const CacheLocationD
         return future;
     }
 
+    // Sync: ensure CAS(→DELETING) is persisted before scheduling Phase 2.
+    if (!indexer->Sync(actual_task.block_keys)) {
+        KVCM_LOG_WARN("Sync failed or timed out for location delete, instance[%s], "
+                      "skipping Phase 2, CacheReclaimer will retry",
+                      task.instance_id.c_str());
+        promise->set_value(PlanExecuteResult{ErrorCode::EC_OK, ""});
+        return future;
+    }
+
     KVCM_LOG_DEBUG("Location statuses updated, submitting task to worker pool with delay: %lld microseconds",
                    static_cast<long long>(task.delay.count()));
 

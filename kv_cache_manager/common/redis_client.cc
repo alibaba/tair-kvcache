@@ -247,6 +247,71 @@ bool RedisClient::Open() {
 
 void RedisClient::Close() { Disconnect(); }
 
+// --- Static command builders ---
+
+void RedisClient::BuildSetCmds(const std::vector<std::string> &keys,
+                               const std::vector<std::map<std::string, std::string>> &field_maps,
+                               std::vector<CmdArgs> &out_cmds) {
+    assert(keys.size() == field_maps.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        out_cmds.push_back({"DEL", keys[i]});
+        if (!field_maps[i].empty()) {
+            CmdArgs hset_cmd;
+            hset_cmd.reserve(field_maps[i].size() * 2 + 2);
+            hset_cmd.emplace_back("HSET");
+            hset_cmd.emplace_back(keys[i]);
+            for (const auto &[field_name, field_value] : field_maps[i]) {
+                hset_cmd.emplace_back(field_name);
+                hset_cmd.emplace_back(field_value);
+            }
+            out_cmds.emplace_back(std::move(hset_cmd));
+        }
+    }
+}
+
+void RedisClient::BuildHashSetCmds(const std::vector<std::string> &keys,
+                                   const std::vector<std::map<std::string, std::string>> &field_maps,
+                                   std::vector<CmdArgs> &out_cmds) {
+    assert(keys.size() == field_maps.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (field_maps[i].empty())
+            continue;
+        CmdArgs hset_cmd;
+        hset_cmd.reserve(field_maps[i].size() * 2 + 2);
+        hset_cmd.emplace_back("HSET");
+        hset_cmd.emplace_back(keys[i]);
+        for (const auto &[field_name, field_value] : field_maps[i]) {
+            hset_cmd.emplace_back(field_name);
+            hset_cmd.emplace_back(field_value);
+        }
+        out_cmds.emplace_back(std::move(hset_cmd));
+    }
+}
+
+void RedisClient::BuildDeleteCmds(const std::vector<std::string> &keys, std::vector<CmdArgs> &out_cmds) {
+    for (const auto &key : keys) {
+        out_cmds.push_back({"DEL", key});
+    }
+}
+
+void RedisClient::BuildHashDeleteCmds(const std::vector<std::string> &keys,
+                                      const std::vector<std::vector<std::string>> &field_names_vec,
+                                      std::vector<CmdArgs> &out_cmds) {
+    assert(keys.size() == field_names_vec.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (field_names_vec[i].empty())
+            continue;
+        CmdArgs hdel_cmd;
+        hdel_cmd.reserve(field_names_vec[i].size() + 2);
+        hdel_cmd.emplace_back("HDEL");
+        hdel_cmd.emplace_back(keys[i]);
+        for (const auto &field_name : field_names_vec[i]) {
+            hdel_cmd.emplace_back(field_name);
+        }
+        out_cmds.emplace_back(std::move(hdel_cmd));
+    }
+}
+
 // cover old key-fields
 std::vector<ErrorCode> RedisClient::Set(const std::vector<std::string> &keys,
                                         const std::vector<std::map<std::string, std::string>> &field_maps) {
@@ -257,21 +322,7 @@ std::vector<ErrorCode> RedisClient::Set(const std::vector<std::string> &keys,
 
     std::vector<CmdArgs> cmds;
     cmds.reserve(keys.size() * 2);
-    for (size_t i = 0; i < keys.size(); ++i) {
-        const std::string &key = keys[i];
-        const std::map<std::string, std::string> &field_map = field_maps[i];
-        CmdArgs del_cmd{"DEL", key};
-        CmdArgs hset_cmd;
-        hset_cmd.reserve((field_map.size() + 1) * 2);
-        hset_cmd.emplace_back("HSET");
-        hset_cmd.emplace_back(key);
-        for (const auto &[field_name, field_value] : field_map) {
-            hset_cmd.emplace_back(field_name);
-            hset_cmd.emplace_back(field_value);
-        }
-        cmds.emplace_back(std::move(del_cmd));
-        cmds.emplace_back(std::move(hset_cmd));
-    }
+    BuildSetCmds(keys, field_maps, cmds);
 
     std::vector<ReplyUPtr> replies = CommandPipeline(cmds);
     if (cmds.size() != replies.size()) {
@@ -281,15 +332,23 @@ std::vector<ErrorCode> RedisClient::Set(const std::vector<std::string> &keys,
     }
     std::vector<ErrorCode> ec_per_key;
     ec_per_key.reserve(keys.size());
+    size_t reply_idx = 0;
     for (size_t i = 0; i < keys.size(); ++i) {
-        const ReplyUPtr &del_reply = replies[i * 2];
-        const ReplyUPtr &hset_reply = replies[i * 2 + 1];
+        const ReplyUPtr &del_reply = replies[reply_idx++];
         if (!IsReplyOk(del_reply.get()) || !CheckReplyInteger(del_reply.get())) {
             KVCM_REDIS_LOG_ERROR("redis set fail, key[%s] DEL fail", keys[i].c_str());
             ec_per_key.emplace_back(EC_ERROR);
-        } else if (!IsReplyOk(hset_reply.get()) || !CheckReplyInteger(hset_reply.get())) {
-            KVCM_REDIS_LOG_ERROR("redis set fail, key[%s] HSET fail", keys[i].c_str());
-            ec_per_key.emplace_back(EC_ERROR);
+            if (!field_maps[i].empty()) {
+                ++reply_idx;
+            }
+        } else if (!field_maps[i].empty()) {
+            const ReplyUPtr &hset_reply = replies[reply_idx++];
+            if (!IsReplyOk(hset_reply.get()) || !CheckReplyInteger(hset_reply.get())) {
+                KVCM_REDIS_LOG_ERROR("redis set fail, key[%s] HSET fail", keys[i].c_str());
+                ec_per_key.emplace_back(EC_ERROR);
+            } else {
+                ec_per_key.emplace_back(EC_OK);
+            }
         } else {
             ec_per_key.emplace_back(EC_OK);
         }
@@ -366,18 +425,7 @@ std::vector<ErrorCode> RedisClient::Upsert(const std::vector<std::string> &keys,
 
     std::vector<CmdArgs> hset_cmds;
     hset_cmds.reserve(keys.size());
-    for (size_t i = 0; i < keys.size(); ++i) {
-        const std::map<std::string, std::string> &field_map = field_maps[i];
-        CmdArgs hset_cmd;
-        hset_cmd.reserve((field_map.size() + 1) * 2);
-        hset_cmd.emplace_back("HSET");
-        hset_cmd.emplace_back(keys[i]);
-        for (const auto &[field_name, field_value] : field_map) {
-            hset_cmd.emplace_back(field_name);
-            hset_cmd.emplace_back(field_value);
-        }
-        hset_cmds.emplace_back(std::move(hset_cmd));
-    }
+    BuildHashSetCmds(keys, field_maps, hset_cmds);
 
     std::vector<ReplyUPtr> hset_replies = CommandPipeline(hset_cmds);
     if (hset_cmds.size() != hset_replies.size()) {
@@ -403,10 +451,7 @@ std::vector<ErrorCode> RedisClient::Upsert(const std::vector<std::string> &keys,
 std::vector<ErrorCode> RedisClient::Delete(const std::vector<std::string> &keys) {
     std::vector<CmdArgs> del_cmds;
     del_cmds.reserve(keys.size());
-    for (size_t i = 0; i < keys.size(); ++i) {
-        CmdArgs del_cmd{"DEL", keys[i]};
-        del_cmds.emplace_back(std::move(del_cmd));
-    }
+    BuildDeleteCmds(keys, del_cmds);
 
     std::vector<ReplyUPtr> del_replies = CommandPipeline(del_cmds);
     if (del_cmds.size() != del_replies.size()) {
@@ -446,19 +491,11 @@ std::vector<ErrorCode> RedisClient::DeleteFields(const std::vector<std::string> 
     hdel_cmds.reserve(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
         if (field_names_vec[i].empty()) {
-            // Nothing to delete — idempotent success.
             continue;
         }
-        CmdArgs hdel_cmd;
-        hdel_cmd.reserve(field_names_vec[i].size() + 2);
-        hdel_cmd.emplace_back("HDEL");
-        hdel_cmd.emplace_back(keys[i]);
-        for (const auto &field_name : field_names_vec[i]) {
-            hdel_cmd.emplace_back(field_name);
-        }
-        hdel_cmds.emplace_back(std::move(hdel_cmd));
         original_indexes.emplace_back(i);
     }
+    BuildHashDeleteCmds(keys, field_names_vec, hdel_cmds);
     if (hdel_cmds.empty()) {
         return ec_per_key;
     }
