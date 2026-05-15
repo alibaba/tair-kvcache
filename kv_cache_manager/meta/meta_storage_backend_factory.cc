@@ -3,6 +3,7 @@
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/meta/common.h"
+#include "kv_cache_manager/meta/meta_async_redis_backend.h"
 #include "kv_cache_manager/meta/meta_dummy_backend.h"
 #include "kv_cache_manager/meta/meta_local_backend.h"
 #include "kv_cache_manager/meta/meta_redis_backend.h"
@@ -38,10 +39,12 @@ MetaStorageBackendFactory::CreatePersistentBackend(const std::string &instance_i
     std::unique_ptr<MetaStorageBackend> backend;
     if (storage_type == META_REDIS_BACKEND_TYPE_STR) {
         backend = std::make_unique<MetaRedisBackend>();
+    } else if (storage_type == META_ASYNC_REDIS_BACKEND_TYPE_STR) {
+        backend = std::make_unique<MetaAsyncRedisBackend>();
     } else if (storage_type == META_DUMMY_BACKEND_TYPE_STR) {
         backend = std::make_unique<MetaDummyBackend>();
     } else {
-        KVCM_LOG_ERROR("create persistent backend failed, unsupported type[%s], expect redis or dummy",
+        KVCM_LOG_ERROR("create persistent backend failed, unsupported type[%s], expect redis/async_redis or dummy",
                        storage_type.c_str());
         return nullptr;
     }

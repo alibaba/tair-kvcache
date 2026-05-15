@@ -258,5 +258,13 @@ public:
     // @param field_maps [out] 读到的元数据
     // @return EC_OK 成功；EC_NOENT 无元数据；EC_ERROR 读取失败
     virtual ErrorCode GetMetaData(FieldMap &field_maps) noexcept = 0;
+
+    // Synchronously flush pending writes for the given keys.
+    // Returns true if all writes persisted successfully, false on failure/timeout.
+    // Default: no-op (sync backends have no pending writes).
+    virtual bool Sync(const KeyTypeVec & /*keys*/) noexcept { return true; }
+
+    // Returns per-queue pending key sizes. Default: empty (no async queues).
+    virtual std::vector<int64_t> GetAsyncQueueSizes() const noexcept { return {}; }
 };
 } // namespace kv_cache_manager

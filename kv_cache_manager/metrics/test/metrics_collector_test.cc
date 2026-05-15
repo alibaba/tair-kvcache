@@ -264,6 +264,50 @@ TEST_F(MetricsCollectorTest, MetaIndexerAccumulativeMetricsCollectorTest) {
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, total_cache_usage), 456.);
 }
 
+TEST_F(MetricsCollectorTest, CacheManagerInstanceMetricsCollectorTest) {
+    metrics_collector_ = std::make_shared<CacheManagerInstanceMetricsCollector>(metrics_registry_);
+    metrics_collector_->Init();
+
+    auto p = std::dynamic_pointer_cast<CacheManagerInstanceMetricsCollector>(metrics_collector_);
+    ASSERT_NE(nullptr, p);
+
+    // Test GAUGE metrics
+    EXPECT_DOUBLE_EQ(GET(p, cache_manager_instance, key_count), 0.);
+    EXPECT_DOUBLE_EQ(GET(p, cache_manager_instance, byte_size), 0.);
+    SET_METRICS_(p, cache_manager_instance, key_count, 100.);
+    SET_METRICS_(p, cache_manager_instance, byte_size, 2048.);
+    EXPECT_DOUBLE_EQ(GET(p, cache_manager_instance, key_count), 100.);
+    EXPECT_DOUBLE_EQ(GET(p, cache_manager_instance, byte_size), 2048.);
+
+    // Test SUMMARY metrics - initial state is empty
+    const auto &empty_summary = GET_SUMMARY_(p, cache_manager_instance, async_queue_sizes);
+    EXPECT_TRUE(empty_summary.empty());
+
+    // Test SET_SUMMARY_ / GET_SUMMARY_ with values
+    std::vector<int64_t> queue_sizes = {10, 20, 30, 0, 5};
+    SET_SUMMARY_(p, cache_manager_instance, async_queue_sizes, queue_sizes);
+    const auto &result = GET_SUMMARY_(p, cache_manager_instance, async_queue_sizes);
+    ASSERT_EQ(5, result.size());
+    EXPECT_EQ(10, result[0]);
+    EXPECT_EQ(20, result[1]);
+    EXPECT_EQ(30, result[2]);
+    EXPECT_EQ(0, result[3]);
+    EXPECT_EQ(5, result[4]);
+
+    // Test overwrite with new values
+    std::vector<int64_t> new_sizes = {100, 200};
+    SET_SUMMARY_(p, cache_manager_instance, async_queue_sizes, new_sizes);
+    const auto &new_result = GET_SUMMARY_(p, cache_manager_instance, async_queue_sizes);
+    ASSERT_EQ(2, new_result.size());
+    EXPECT_EQ(100, new_result[0]);
+    EXPECT_EQ(200, new_result[1]);
+
+    // Test overwrite with empty
+    std::vector<int64_t> empty_sizes;
+    SET_SUMMARY_(p, cache_manager_instance, async_queue_sizes, empty_sizes);
+    EXPECT_TRUE(GET_SUMMARY_(p, cache_manager_instance, async_queue_sizes).empty());
+}
+
 TEST_F(MetricsCollectorTest, ChronoScopeConcurrentTest) {
     metrics_collector_ = std::make_shared<ServiceMetricsCollector>(metrics_registry_);
     metrics_collector_->Init();
