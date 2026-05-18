@@ -39,7 +39,6 @@ TEST_F(MetricsCollectorTest, MetaIndexerMetricsTest) {
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, search_cache_hit_ratio), 0.);
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, io_data_size), 0.);
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, put_io_time_us), 0.);
-    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, update_io_time_us), 0.);
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, upsert_io_time_us), 0.);
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, lock_wait_time_us), 0.);
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, delete_io_time_us), 0.);
@@ -59,7 +58,6 @@ TEST_F(MetricsCollectorTest, MetaIndexerMetricsTest) {
     SET_METRICS_(p, meta_indexer, search_cache_hit_ratio, 50.);
     SET_METRICS_(p, meta_indexer, io_data_size, 2048.);
     SET_METRICS_(p, meta_indexer, put_io_time_us, 1000.);
-    SET_METRICS_(p, meta_indexer, update_io_time_us, 1000.);
     SET_METRICS_(p, meta_indexer, upsert_io_time_us, 1000.);
     SET_METRICS_(p, meta_indexer, lock_wait_time_us, 200.);
     SET_METRICS_(p, meta_indexer, delete_io_time_us, 500.);
@@ -78,7 +76,6 @@ TEST_F(MetricsCollectorTest, MetaIndexerMetricsTest) {
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, search_cache_hit_ratio), 50.);
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, io_data_size), 2048.);
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, put_io_time_us), 1000.);
-    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, update_io_time_us), 1000.);
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, upsert_io_time_us), 1000.);
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, lock_wait_time_us), 200.);
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, delete_io_time_us), 500.);

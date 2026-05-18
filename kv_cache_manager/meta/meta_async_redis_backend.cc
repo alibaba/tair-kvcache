@@ -9,6 +9,7 @@
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
+#include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/utils.h"
 
@@ -17,6 +18,10 @@ namespace kv_cache_manager {
 MetaAsyncRedisBackend::~MetaAsyncRedisBackend() { [[maybe_unused]] ErrorCode _ = Close(); }
 
 std::string MetaAsyncRedisBackend::GetStorageType() noexcept { return META_ASYNC_REDIS_BACKEND_TYPE_STR; }
+
+// ---------------------------------------------------------------------------
+// Key prefix helpers
+// ---------------------------------------------------------------------------
 
 std::vector<std::string> MetaAsyncRedisBackend::AppendPrefixToKeys(const KeyTypeVec &keys) const {
     std::vector<std::string> keys_with_prefix;
@@ -54,6 +59,62 @@ bool MetaAsyncRedisBackend::StripPrefixInKeys(const std::vector<std::string> &ke
     }
     return true;
 }
+
+// ---------------------------------------------------------------------------
+// Serialization helpers (same logic as MetaRedisBackend)
+// ---------------------------------------------------------------------------
+
+FieldMap MetaAsyncRedisBackend::SerializeToFieldMap(const CacheLocationMap &locations, const PropertyMap &properties) {
+    FieldMap field_map;
+    for (const auto &[loc_id, loc_ptr] : locations) {
+        field_map[LOCATION_PREFIX + loc_id] = loc_ptr ? loc_ptr->ToJsonString() : "";
+    }
+    for (const auto &[key, value] : properties) {
+        field_map[key] = value;
+    }
+    return field_map;
+}
+
+ErrorCode MetaAsyncRedisBackend::DeserializeFieldMap(const FieldMap &field_map,
+                                                     CacheLocationMap &out_locations,
+                                                     PropertyMap &out_properties) {
+    for (const auto &[field_name, field_value] : field_map) {
+        if (field_name.rfind(LOCATION_PREFIX, 0) == 0) {
+            std::string loc_id = field_name.substr(LOCATION_PREFIX.size());
+            auto location = std::make_shared<CacheLocation>();
+            if (field_value.empty()) {
+                location->set_id(loc_id);
+            } else if (!location->FromJsonString(field_value)) {
+                return EC_CORRUPTION;
+            }
+            out_locations[loc_id] = std::move(location);
+        } else {
+            out_properties[field_name] = field_value;
+        }
+    }
+    return EC_OK;
+}
+
+ErrorCode MetaAsyncRedisBackend::DeserializeLocations(const FieldMap &field_map, CacheLocationMap &out_locations) {
+    for (const auto &[field_name, field_value] : field_map) {
+        if (field_name.rfind(LOCATION_PREFIX, 0) != 0) {
+            continue;
+        }
+        std::string loc_id = field_name.substr(LOCATION_PREFIX.size());
+        auto location = std::make_shared<CacheLocation>();
+        if (field_value.empty()) {
+            location->set_id(loc_id);
+        } else if (!location->FromJsonString(field_value)) {
+            return EC_CORRUPTION;
+        }
+        out_locations[loc_id] = std::move(location);
+    }
+    return EC_OK;
+}
+
+// ---------------------------------------------------------------------------
+// Init / Open / Close
+// ---------------------------------------------------------------------------
 
 std::shared_ptr<RedisClient> MetaAsyncRedisBackend::CreateRedisClient() const {
     return std::make_shared<RedisClient>(storage_uri_);
@@ -141,7 +202,6 @@ ErrorCode MetaAsyncRedisBackend::Init(const std::string &instance_id,
 }
 
 ErrorCode MetaAsyncRedisBackend::Open() noexcept {
-    // Create per-consumer RedisClients
     consumer_clients_.resize(queue_count_);
     for (int i = 0; i < queue_count_; ++i) {
         auto client = CreateRedisClient();
@@ -154,7 +214,6 @@ ErrorCode MetaAsyncRedisBackend::Open() noexcept {
         consumer_clients_[i] = std::move(client);
     }
 
-    // Create read client pool
     constexpr int32_t kReadPoolMin = 1;
     constexpr int32_t kReadPoolMax = 16;
     read_client_pool_ = std::make_shared<DynamicClientPool<RedisClient>>(
@@ -173,13 +232,11 @@ ErrorCode MetaAsyncRedisBackend::Open() noexcept {
         return EC_ERROR;
     }
 
-    // Create queues
     queues_.resize(queue_count_);
     for (int i = 0; i < queue_count_; ++i) {
         queues_[i] = std::make_unique<MpscWriteQueue>();
     }
 
-    // Start consumer threads
     is_running_.store(true, std::memory_order_release);
     consumer_threads_.reserve(queue_count_);
     for (int i = 0; i < queue_count_; ++i) {
@@ -197,14 +254,12 @@ ErrorCode MetaAsyncRedisBackend::Close() noexcept {
         return EC_OK;
     }
 
-    // Wake up all consumers
     for (auto &q : queues_) {
         if (q) {
             q->NotifyConsumer();
         }
     }
 
-    // Join all consumer threads
     for (auto &t : consumer_threads_) {
         if (t.joinable()) {
             t.join();
@@ -212,7 +267,6 @@ ErrorCode MetaAsyncRedisBackend::Close() noexcept {
     }
     consumer_threads_.clear();
 
-    // Close consumer clients
     for (auto &client : consumer_clients_) {
         if (client) {
             client->Close();
@@ -220,7 +274,6 @@ ErrorCode MetaAsyncRedisBackend::Close() noexcept {
     }
     consumer_clients_.clear();
 
-    // Close read pool
     read_client_pool_.reset();
     queues_.clear();
 
@@ -296,53 +349,66 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::EnqueueWriteOp(WriteOp op) {
     return results;
 }
 
-std::vector<ErrorCode> MetaAsyncRedisBackend::Put(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept {
+std::vector<ErrorCode> MetaAsyncRedisBackend::Put(RequestContext * /*request_context*/,
+                                                  const KeyTypeVec &keys,
+                                                  const CacheLocationMapVector &locations,
+                                                  const PropertyMapVector &properties) noexcept {
     WriteOp op;
     op.type = WriteOpType::kPut;
     op.keys = keys;
-    op.field_maps = field_maps;
+    op.field_maps.resize(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        op.field_maps[i] = SerializeToFieldMap(locations[i], properties[i]);
+    }
     return EnqueueWriteOp(std::move(op));
 }
 
-std::vector<ErrorCode> MetaAsyncRedisBackend::UpdateFields(const KeyTypeVec &keys,
-                                                           const FieldMapVec &field_maps) noexcept {
-    WriteOp op;
-    op.type = WriteOpType::kUpdateFields;
-    op.keys = keys;
-    op.field_maps = field_maps;
-    return EnqueueWriteOp(std::move(op));
-}
-
-std::vector<ErrorCode> MetaAsyncRedisBackend::Upsert(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept {
+std::vector<ErrorCode> MetaAsyncRedisBackend::Upsert(RequestContext * /*request_context*/,
+                                                     const KeyTypeVec &keys,
+                                                     const CacheLocationMapVector &locations,
+                                                     const PropertyMapVector &properties) noexcept {
     WriteOp op;
     op.type = WriteOpType::kUpsert;
     op.keys = keys;
-    op.field_maps = field_maps;
+    op.field_maps.resize(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        op.field_maps[i] = SerializeToFieldMap(locations[i], properties[i]);
+    }
     return EnqueueWriteOp(std::move(op));
 }
 
-std::vector<ErrorCode> MetaAsyncRedisBackend::Delete(const KeyTypeVec &keys) noexcept {
+std::vector<ErrorCode> MetaAsyncRedisBackend::Delete(RequestContext * /*request_context*/,
+                                                     const KeyTypeVec &keys) noexcept {
     WriteOp op;
     op.type = WriteOpType::kDelete;
     op.keys = keys;
     return EnqueueWriteOp(std::move(op));
 }
 
-std::vector<ErrorCode>
-MetaAsyncRedisBackend::DeleteFields(const KeyTypeVec &keys,
-                                    const std::vector<std::vector<std::string>> &field_names_vec) noexcept {
+std::vector<ErrorCode> MetaAsyncRedisBackend::DeleteLocations(RequestContext * /*request_context*/,
+                                                              const KeyTypeVec &keys,
+                                                              const LocationIdsPerKey &location_ids) noexcept {
+    std::vector<std::vector<std::string>> field_names_vec(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        field_names_vec[i].reserve(location_ids[i].size());
+        for (const auto &loc_id : location_ids[i]) {
+            field_names_vec[i].push_back(LOCATION_PREFIX + loc_id);
+        }
+    }
+
     WriteOp op;
-    op.type = WriteOpType::kDeleteFields;
+    op.type = WriteOpType::kDeleteLocations;
     op.keys = keys;
-    op.field_names_vec = field_names_vec;
+    op.field_names_vec = std::move(field_names_vec);
     return EnqueueWriteOp(std::move(op));
 }
 
 // ==================== Read Operations (sync passthrough) ====================
 
-std::vector<ErrorCode> MetaAsyncRedisBackend::Get(const KeyTypeVec &keys,
-                                                  const std::vector<std::string> &field_names,
-                                                  FieldMapVec &out_field_maps) noexcept {
+std::vector<ErrorCode> MetaAsyncRedisBackend::Get(RequestContext * /*request_context*/,
+                                                  const KeyTypeVec &keys,
+                                                  CacheLocationMapVector &out_locations,
+                                                  PropertyMapVector &out_properties) noexcept {
     auto handle = read_client_pool_->AcquireClient(timeout_ms_);
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(
@@ -350,35 +416,160 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::Get(const KeyTypeVec &keys,
         return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
     }
     std::vector<std::string> full_keys = AppendPrefixToKeys(keys);
-    return handle->Get(full_keys, field_names, out_field_maps);
+    FieldMapVec field_maps;
+    std::vector<ErrorCode> results = handle->GetAllFields(full_keys, field_maps);
+
+    out_locations.resize(keys.size());
+    out_properties.resize(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (results[i] != EC_OK) {
+            continue;
+        }
+        ErrorCode ec = DeserializeFieldMap(field_maps[i], out_locations[i], out_properties[i]);
+        if (ec != EC_OK) {
+            KVCM_LOG_ERROR("async redis get deserialize failed, key[%ld], instance[%s]", keys[i], instance_id_.c_str());
+            results[i] = ec;
+        }
+    }
+    return results;
 }
 
-std::vector<ErrorCode> MetaAsyncRedisBackend::Get(const KeyTypeVec &keys,
-                                                  const std::vector<std::vector<std::string>> &field_names_vec,
-                                                  FieldMapVec &out_field_maps) noexcept {
+std::vector<ErrorCode> MetaAsyncRedisBackend::GetLocations(RequestContext * /*request_context*/,
+                                                           const KeyTypeVec &keys,
+                                                           CacheLocationMapVector &out_locations) noexcept {
     auto handle = read_client_pool_->AcquireClient(timeout_ms_);
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(
-            10, "async redis get fail, fail to acquire read client, instance[%s]", instance_id_.c_str());
+            10, "async redis get locations fail, fail to acquire read client, instance[%s]", instance_id_.c_str());
         return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
     }
     std::vector<std::string> full_keys = AppendPrefixToKeys(keys);
-    return handle->Get(full_keys, field_names_vec, out_field_maps);
+    FieldMapVec field_maps;
+    std::vector<ErrorCode> results = handle->GetAllFields(full_keys, field_maps);
+
+    out_locations.resize(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (results[i] != EC_OK) {
+            continue;
+        }
+        ErrorCode ec = DeserializeLocations(field_maps[i], out_locations[i]);
+        if (ec != EC_OK) {
+            KVCM_LOG_ERROR(
+                "async redis get locations deserialize failed, key[%ld], instance[%s]", keys[i], instance_id_.c_str());
+            results[i] = ec;
+        }
+    }
+    return results;
 }
 
-std::vector<ErrorCode> MetaAsyncRedisBackend::GetAllFields(const KeyTypeVec &keys,
-                                                           FieldMapVec &out_field_maps) noexcept {
+std::vector<std::vector<ErrorCode>>
+MetaAsyncRedisBackend::GetLocations(RequestContext * /*request_context*/,
+                                    const KeyTypeVec &keys,
+                                    const LocationIdsPerKey &location_ids,
+                                    LocationsPerKey &out_locations) noexcept {
+    std::vector<std::vector<std::string>> field_names_vec(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        field_names_vec[i].reserve(location_ids[i].size());
+        for (const auto &loc_id : location_ids[i]) {
+            field_names_vec[i].push_back(LOCATION_PREFIX + loc_id);
+        }
+    }
+
     auto handle = read_client_pool_->AcquireClient(timeout_ms_);
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(
-            10, "async redis get all fields fail, fail to acquire read client, instance[%s]", instance_id_.c_str());
+            10, "async redis get locations by id fail, fail to acquire read client, instance[%s]", instance_id_.c_str());
+        std::vector<std::vector<ErrorCode>> results(keys.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            results[i].assign(location_ids[i].size(), EC_TIMEOUT);
+        }
+        return results;
+    }
+    std::vector<std::string> full_keys = AppendPrefixToKeys(keys);
+    FieldMapVec field_maps;
+    std::vector<ErrorCode> key_results = handle->Get(full_keys, field_names_vec, field_maps);
+
+    std::vector<std::vector<ErrorCode>> results(keys.size());
+    out_locations.resize(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        out_locations[i].resize(location_ids[i].size());
+        if (key_results[i] != EC_OK) {
+            results[i].assign(location_ids[i].size(), key_results[i]);
+            continue;
+        }
+        results[i].resize(location_ids[i].size());
+        for (size_t j = 0; j < location_ids[i].size(); ++j) {
+            auto it = field_maps[i].find(field_names_vec[i][j]);
+            if (it == field_maps[i].end() || it->second.empty()) {
+                results[i][j] = EC_NOENT;
+                continue;
+            }
+            auto location = std::make_shared<CacheLocation>();
+            if (!location->FromJsonString(it->second)) {
+                results[i][j] = EC_CORRUPTION;
+                continue;
+            }
+            out_locations[i][j] = std::move(location);
+            results[i][j] = EC_OK;
+        }
+    }
+    return results;
+}
+
+std::vector<ErrorCode> MetaAsyncRedisBackend::GetLocationIds(RequestContext * /*request_context*/,
+                                                             const KeyTypeVec &keys,
+                                                             LocationIdsPerKey &out_location_ids) noexcept {
+    auto handle = read_client_pool_->AcquireClient(timeout_ms_);
+    if (!handle) {
+        KVCM_INTERVAL_LOG_WARN(
+            10, "async redis get location ids fail, fail to acquire read client, instance[%s]", instance_id_.c_str());
         return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
     }
     std::vector<std::string> full_keys = AppendPrefixToKeys(keys);
-    return handle->GetAllFields(full_keys, out_field_maps);
+    std::vector<std::vector<std::string>> raw_field_names_vec;
+    std::vector<ErrorCode> results = handle->GetFieldNamesWithPrefix(full_keys, LOCATION_PREFIX, raw_field_names_vec);
+
+    out_location_ids.resize(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (results[i] != EC_OK) {
+            continue;
+        }
+        out_location_ids[i].reserve(raw_field_names_vec[i].size());
+        for (const auto &field_name : raw_field_names_vec[i]) {
+            if (field_name.size() > LOCATION_PREFIX.size() && field_name.rfind(LOCATION_PREFIX, 0) == 0) {
+                out_location_ids[i].push_back(field_name.substr(LOCATION_PREFIX.size()));
+            }
+        }
+    }
+    return results;
 }
 
-std::vector<ErrorCode> MetaAsyncRedisBackend::Exists(const KeyTypeVec &keys,
+std::vector<ErrorCode> MetaAsyncRedisBackend::GetProperties(RequestContext * /*request_context*/,
+                                                            const KeyTypeVec &keys,
+                                                            const std::vector<std::string> &field_names,
+                                                            PropertyMapVector &out_properties) noexcept {
+    auto handle = read_client_pool_->AcquireClient(timeout_ms_);
+    if (!handle) {
+        KVCM_INTERVAL_LOG_WARN(
+            10, "async redis get properties fail, fail to acquire read client, instance[%s]", instance_id_.c_str());
+        return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
+    }
+    std::vector<std::string> full_keys = AppendPrefixToKeys(keys);
+    FieldMapVec field_maps;
+    std::vector<ErrorCode> results = handle->Get(full_keys, field_names, field_maps);
+
+    out_properties.resize(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (results[i] != EC_OK) {
+            continue;
+        }
+        out_properties[i] = std::move(field_maps[i]);
+    }
+    return results;
+}
+
+std::vector<ErrorCode> MetaAsyncRedisBackend::Exists(RequestContext * /*request_context*/,
+                                                     const KeyTypeVec &keys,
                                                      std::vector<bool> &out_is_exist_vec) noexcept {
     auto handle = read_client_pool_->AcquireClient(timeout_ms_);
     if (!handle) {
@@ -390,34 +581,21 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::Exists(const KeyTypeVec &keys,
     return handle->Exists(full_keys, out_is_exist_vec);
 }
 
-std::vector<ErrorCode> MetaAsyncRedisBackend::ExistsFieldWithPrefix(const KeyTypeVec &keys,
-                                                                    const std::string &field_prefix,
-                                                                    std::vector<bool> &out_exists_vec) noexcept {
+std::vector<ErrorCode> MetaAsyncRedisBackend::ExistsLocation(RequestContext * /*request_context*/,
+                                                             const KeyTypeVec &keys,
+                                                             std::vector<bool> &out_exists) noexcept {
     auto handle = read_client_pool_->AcquireClient(timeout_ms_);
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(
-            10, "async redis exists field fail, fail to acquire read client, instance[%s]", instance_id_.c_str());
+            10, "async redis exists location fail, fail to acquire read client, instance[%s]", instance_id_.c_str());
         return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
     }
     std::vector<std::string> full_keys = AppendPrefixToKeys(keys);
-    return handle->ExistsFieldWithPrefix(full_keys, field_prefix, out_exists_vec);
+    return handle->ExistsFieldWithPrefix(full_keys, LOCATION_PREFIX, out_exists);
 }
 
-std::vector<ErrorCode>
-MetaAsyncRedisBackend::GetFieldNamesWithPrefix(const KeyTypeVec &keys,
-                                               const std::string &field_prefix,
-                                               std::vector<std::vector<std::string>> &out_field_names_vec) noexcept {
-    auto handle = read_client_pool_->AcquireClient(timeout_ms_);
-    if (!handle) {
-        KVCM_INTERVAL_LOG_WARN(
-            10, "async redis get field names fail, fail to acquire read client, instance[%s]", instance_id_.c_str());
-        return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
-    }
-    std::vector<std::string> full_keys = AppendPrefixToKeys(keys);
-    return handle->GetFieldNamesWithPrefix(full_keys, field_prefix, out_field_names_vec);
-}
-
-ErrorCode MetaAsyncRedisBackend::ListKeys(const std::string &cursor,
+ErrorCode MetaAsyncRedisBackend::ListKeys(RequestContext * /*request_context*/,
+                                          const std::string &cursor,
                                           const int64_t limit,
                                           std::string &out_next_cursor,
                                           KeyTypeVec &out_keys) noexcept {
@@ -440,7 +618,9 @@ ErrorCode MetaAsyncRedisBackend::ListKeys(const std::string &cursor,
     return EC_OK;
 }
 
-ErrorCode MetaAsyncRedisBackend::RandomSample(const int64_t count, KeyTypeVec &out_keys) noexcept {
+ErrorCode MetaAsyncRedisBackend::RandomSample(RequestContext * /*request_context*/,
+                                              const int64_t count,
+                                              KeyTypeVec &out_keys) noexcept {
     out_keys.clear();
     auto handle = read_client_pool_->AcquireClient(timeout_ms_);
     if (!handle) {
@@ -460,8 +640,10 @@ ErrorCode MetaAsyncRedisBackend::RandomSample(const int64_t count, KeyTypeVec &o
     return EC_OK;
 }
 
-ErrorCode MetaAsyncRedisBackend::SampleReclaimKeys(const int64_t count, KeyTypeVec &out_keys) noexcept {
-    return RandomSample(count, out_keys);
+ErrorCode MetaAsyncRedisBackend::SampleReclaimKeys(RequestContext * /*request_context*/,
+                                                   const int64_t count,
+                                                   KeyTypeVec &out_keys) noexcept {
+    return RandomSample(nullptr, count, out_keys);
 }
 
 ErrorCode MetaAsyncRedisBackend::PutMetaData(const FieldMap &field_map) noexcept {
@@ -548,7 +730,6 @@ void MetaAsyncRedisBackend::ConsumerLoop(int queue_id) {
         BatchFlush(queue_id, items, taken_keys);
     }
 
-    // Drain remaining items on shutdown
     DrainQueue(queue_id);
     KVCM_LOG_INFO("async redis consumer[%d] stopped, instance[%s]", queue_id, instance_id_.c_str());
 }
@@ -560,14 +741,13 @@ void MetaAsyncRedisBackend::CompileWriteOp(const WriteOp &op, std::vector<CmdArg
     case WriteOpType::kPut:
         RedisClient::BuildSetCmds(full_keys, op.field_maps, cmds);
         break;
-    case WriteOpType::kUpdateFields:
     case WriteOpType::kUpsert:
         RedisClient::BuildHashSetCmds(full_keys, op.field_maps, cmds);
         break;
     case WriteOpType::kDelete:
         RedisClient::BuildDeleteCmds(full_keys, cmds);
         break;
-    case WriteOpType::kDeleteFields:
+    case WriteOpType::kDeleteLocations:
         RedisClient::BuildHashDeleteCmds(full_keys, op.field_names_vec, cmds);
         break;
     }
@@ -576,7 +756,6 @@ void MetaAsyncRedisBackend::CompileWriteOp(const WriteOp &op, std::vector<CmdArg
 void MetaAsyncRedisBackend::BatchFlush(int queue_id, std::vector<QueueItem> &items, int64_t total_keys) {
     RedisClient *client = consumer_clients_[queue_id].get();
 
-    // Compile all WriteOps into a flat cmd list, track barrier positions
     std::vector<CmdArgs> all_cmds;
     all_cmds.reserve(static_cast<size_t>(total_keys) * 2);
     struct BarrierRecord {
@@ -597,7 +776,6 @@ void MetaAsyncRedisBackend::BatchFlush(int queue_id, std::vector<QueueItem> &ite
         }
     }
 
-    // No cmds — fence all empty barriers
     if (all_cmds.empty()) {
         for (auto &b : barriers) {
             if (b.ctx) {
@@ -607,7 +785,6 @@ void MetaAsyncRedisBackend::BatchFlush(int queue_id, std::vector<QueueItem> &ite
         return;
     }
 
-    // Execute all cmds in a single pipeline (one RTT)
     auto replies = client->BatchExecute(all_cmds);
 
     if (replies.size() != all_cmds.size()) {
@@ -624,7 +801,6 @@ void MetaAsyncRedisBackend::BatchFlush(int queue_id, std::vector<QueueItem> &ite
         return;
     }
 
-    // Check per-barrier success and fence
     for (auto &b : barriers) {
         if (!b.ctx) {
             continue;
@@ -656,7 +832,6 @@ void MetaAsyncRedisBackend::DrainQueue(int queue_id) {
         BatchFlush(queue_id, items, taken_keys);
     }
 
-    // If there are still remaining items after timeout, handle barriers
     int64_t remaining_keys = 0;
     auto remaining = queues_[queue_id]->PopBatch(queue_max_size_, remaining_keys);
     for (auto &item : remaining) {

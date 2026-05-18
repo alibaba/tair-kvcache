@@ -248,29 +248,6 @@ std::vector<ErrorCode> MetaRedisBackend::Upsert(RequestContext *request_context,
     return handle->Upsert(full_keys, field_maps);
 }
 
-std::vector<ErrorCode> MetaRedisBackend::Update(RequestContext *request_context,
-                                                const KeyTypeVec &keys,
-                                                const CacheLocationMapVector &locations,
-                                                const PropertyMapVector &properties) noexcept {
-    const int64_t serde_begin = TimestampUtil::GetCurrentTimeUs();
-    FieldMapVec field_maps(keys.size());
-    for (size_t i = 0; i < keys.size(); ++i) {
-        field_maps[i] = SerializeToFieldMap(locations[i], properties[i]);
-    }
-    const int64_t serde_us = TimestampUtil::GetCurrentTimeUs() - serde_begin;
-    auto *service_metrics_collector =
-        request_context ? dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector()) : nullptr;
-    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_searcher, index_serialize_time_us, serde_us);
-
-    auto handle = client_pool_->AcquireClient(timeout_ms_);
-    if (!handle) {
-        KVCM_INTERVAL_LOG_WARN(10, "update fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
-        return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
-    }
-    std::vector<std::string> full_keys = AppendPrefixToKeys(keys);
-    return handle->Update(full_keys, field_maps);
-}
-
 std::vector<ErrorCode> MetaRedisBackend::Delete(RequestContext * /*request_context*/, const KeyTypeVec &keys) noexcept {
     auto handle = client_pool_->AcquireClient(timeout_ms_);
     if (!handle) {

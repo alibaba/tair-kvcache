@@ -423,7 +423,7 @@ TEST_F(MetaStorageBackendManagerTest, TestRecoverWriteDualWriteAndDeleteTombston
     ASSERT_EQ(EC_OK, mgr.Open());
     WaitRunning(mgr);
 
-    // Force Recover so UpdateFields/Upsert hit EnsureKeyInLocal and Delete
+    // Force Recover so Upsert hits EnsureKeyInLocal and Delete
     // inserts into deleted_keys_.
     mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover, std::memory_order_release);
 
@@ -448,9 +448,9 @@ TEST_F(MetaStorageBackendManagerTest, TestRecoverWriteDualWriteAndDeleteTombston
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.cache_backend_->Exists(nullptr, keys, exists_vec));
     ASSERT_FALSE(exists_vec[0]);
 
-    // UpdateFields under Recover hydrates missing keys via EnsureKeyInLocal
+    // Upsert under Recover hydrates missing keys via EnsureKeyInLocal
     // before the conditional write. Seed key 7 into persistent only and
-    // verify the update is observable afterwards.
+    // verify the upsert is observable afterwards.
     KeyVector k7 = {7};
     auto batch7 = MakeBatch(k7);
     SerializeLocationsIntoProperties(batch7);
@@ -458,11 +458,11 @@ TEST_F(MetaStorageBackendManagerTest, TestRecoverWriteDualWriteAndDeleteTombston
         (std::vector<ErrorCode>{EC_OK}),
         mgr.persistent_backend_->Put(nullptr, batch7.batch_keys, batch7.batch_locations, batch7.batch_properties));
 
-    BatchMetaData update_batch;
-    update_batch.batch_keys = k7;
-    update_batch.batch_properties.resize(1);
-    update_batch.batch_properties[0]["p0"] = "p0_7_updated";
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.UpdateFields(request_context_.get(), update_batch));
+    BatchMetaData upsert_batch;
+    upsert_batch.batch_keys = k7;
+    upsert_batch.batch_properties.resize(1);
+    upsert_batch.batch_properties[0]["p0"] = "p0_7_updated";
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.Upsert(request_context_.get(), upsert_batch));
 
     PropertyMapVector fms;
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.GetProperties(nullptr, k7, {"p0"}, fms));

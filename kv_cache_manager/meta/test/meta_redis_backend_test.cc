@@ -155,25 +155,17 @@ TEST_F(MetaRedisBackendTest, TestSimple) {
                 ElementsAre(StrEq("HSET"), StrEq("kvcache:instance_instance_0:cache_2"), StrEq("f1"), StrEq("v2-1")))))
             .WillOnce(Return(ByMove(std::move(put_replies))));
 
-        std::vector<ReplyUPtr> update_replies_1;
-        update_replies_1.emplace_back(MakeFakeReplyInteger(1));
-        update_replies_1.emplace_back(MakeFakeReplyInteger(1));
-        update_replies_1.emplace_back(MakeFakeReplyInteger(0));
-        EXPECT_CALL(
-            *mock_redis_client,
-            TryExecPipeline(ElementsAre(ElementsAre(StrEq("EXISTS"), StrEq("kvcache:instance_instance_0:cache_1")),
-                                        ElementsAre(StrEq("EXISTS"), StrEq("kvcache:instance_instance_0:cache_2")),
-                                        ElementsAre(StrEq("EXISTS"), StrEq("kvcache:instance_instance_0:cache_3")))))
-            .WillOnce(Return(ByMove(std::move(update_replies_1))));
-        std::vector<ReplyUPtr> update_replies_2;
-        update_replies_2.emplace_back(MakeFakeReplyInteger(1));
-        update_replies_2.emplace_back(MakeFakeReplyInteger(1));
+        std::vector<ReplyUPtr> upsert_replies_1;
+        upsert_replies_1.emplace_back(MakeFakeReplyInteger(1));
+        upsert_replies_1.emplace_back(MakeFakeReplyInteger(1));
+        upsert_replies_1.emplace_back(MakeFakeReplyInteger(1));
         EXPECT_CALL(
             *mock_redis_client,
             TryExecPipeline(ElementsAre(
                 ElementsAre(StrEq("HSET"), StrEq("kvcache:instance_instance_0:cache_1"), StrEq("f2"), StrEq("v1-2")),
-                ElementsAre(StrEq("HSET"), StrEq("kvcache:instance_instance_0:cache_2"), StrEq("f2"), StrEq("v2-2")))))
-            .WillOnce(Return(ByMove(std::move(update_replies_2))));
+                ElementsAre(StrEq("HSET"), StrEq("kvcache:instance_instance_0:cache_2"), StrEq("f2"), StrEq("v2-2")),
+                ElementsAre(StrEq("HSET"), StrEq("kvcache:instance_instance_0:cache_3"), StrEq("f3"), StrEq("v3-2")))))
+            .WillOnce(Return(ByMove(std::move(upsert_replies_1))));
 
         std::vector<ReplyUPtr> exist_replies;
         exist_replies.emplace_back(MakeFakeReplyInteger(1));
@@ -253,8 +245,8 @@ TEST_F(MetaRedisBackendTest, TestSimple) {
     ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
               PutWithFieldMaps(meta_redis_backend_.get(), {1, 2}, {{{"f1", "v1-1"}}, {{"f1", "v2-1"}}}));
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_NOENT}),
-              UpdateWithFieldMaps(
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}),
+              UpsertWithFieldMaps(
                   meta_redis_backend_.get(), {1, 2, 3}, {{{"f2", "v1-2"}}, {{"f2", "v2-2"}}, {{"f3", "v3-2"}}}));
 
     AssertExists(meta_redis_backend_.get(), {1, 2, 4}, {EC_OK, EC_OK, EC_OK}, /*is_exist*/ {true, true, false});
@@ -297,7 +289,7 @@ TEST_F(MetaRedisBackendTest, TestRedisError) {
     ASSERT_EQ((std::vector<ErrorCode>{EC_ERROR, EC_ERROR}),
               PutWithFieldMaps(meta_redis_backend_.get(), {1, 2}, {{{"f1", "v1-1"}}, {{"f1", "v2-1"}}}));
     ASSERT_EQ((std::vector<ErrorCode>{EC_ERROR, EC_ERROR, EC_ERROR}),
-              UpdateWithFieldMaps(
+              UpsertWithFieldMaps(
                   meta_redis_backend_.get(), {1, 2, 3}, {{{"f2", "v1-2"}}, {{"f2", "v2-2"}}, {{"f3", "v3-2"}}}));
 
     std::vector<bool> is_exist_vec;

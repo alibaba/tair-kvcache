@@ -57,15 +57,6 @@ std::vector<ErrorCode> MetaStorageBackendTestBase::UpsertWithFieldMaps(MetaStora
     return backend->Upsert(nullptr, keys, locations, properties);
 }
 
-std::vector<ErrorCode> MetaStorageBackendTestBase::UpdateWithFieldMaps(MetaStorageBackend *backend,
-                                                                       const KeyTypeVec &keys,
-                                                                       const FieldMapVec &field_maps) {
-    CacheLocationMapVector locations;
-    PropertyMapVector properties;
-    SplitFieldMaps(field_maps, locations, properties);
-    return backend->Update(nullptr, keys, locations, properties);
-}
-
 std::vector<ErrorCode>
 MetaStorageBackendTestBase::PutIfAbsentWithFieldMaps(MetaCacheBaseBackend *backend,
                                                      const KeyTypeVec &keys,

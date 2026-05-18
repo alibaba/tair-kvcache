@@ -26,7 +26,6 @@ namespace kv_cache_manager {
 
 namespace {
 static constexpr const char *kPutMetaOperation = "put";
-static constexpr const char *kUpdateMetaOperation = "update";
 static constexpr const char *kRmwMetaOperation = "read_modify_write";
 static constexpr const char *kRmwUpsertMetaOperation = "read_modify_write_upsert";
 static constexpr const char *kRmwDeleteMetaOperation = "read_modify_write_delete";
@@ -177,48 +176,6 @@ MetaIndexer::Result MetaIndexer::Put(RequestContext *request_context,
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, put_io_time_us, put_io_time_us);
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, lock_wait_time_us, lock_wait_time_us);
     ProcessErrorResult(trace_id, kPutMetaOperation, error_count, keys.size(), result);
-    return result;
-}
-
-MetaIndexer::Result MetaIndexer::Update(RequestContext *request_context,
-                                        const KeyVector &keys,
-                                        CacheLocationMapVector &location_maps,
-                                        PropertyMapVector &properties) noexcept {
-    if (keys.size() == 0) {
-        return Result(EC_OK);
-    }
-    const auto &trace_id = request_context->trace_id();
-    if ((!location_maps.empty() && keys.size() != location_maps.size()) ||
-        (!properties.empty() && keys.size() != properties.size())) {
-        PREFIX_INDEXER_LOG(ERROR,
-                           "Update keys size[%lu], location_maps size[%lu], properties size[%lu] not equal",
-                           keys.size(),
-                           location_maps.size(),
-                           properties.size());
-        return Result(EC_ERROR);
-    }
-
-    auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
-    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_key_count, keys.size());
-
-    static LocationIdsPerKey empty_location_ids;
-    std::vector<BatchMetaData> batches = MakeBatches(keys, empty_location_ids, location_maps, properties);
-    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_batch_num, batches.size());
-
-    Result result(keys.size());
-    int32_t error_count = 0;
-    int64_t update_io_time_us = 0;
-    int64_t lock_wait_time_us = 0;
-    for (auto &batch : batches) {
-        ScopedBatchLock lock(*this, batch.batch_shard_indexs, &lock_wait_time_us);
-        int64_t begin_update_io_time = TimestampUtil::GetCurrentTimeUs();
-        auto error_codes = backend_manager_->UpdateFields(request_context, batch);
-        update_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin_update_io_time;
-        error_count += ProcessErrorCodes(trace_id, error_codes, batch.batch_indexs, keys, kUpdateMetaOperation, result);
-    }
-    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, update_io_time_us, update_io_time_us);
-    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, lock_wait_time_us, lock_wait_time_us);
-    ProcessErrorResult(trace_id, kUpdateMetaOperation, error_count, keys.size(), result);
     return result;
 }
 

@@ -59,7 +59,6 @@ protected:
 
 private:
     void DoPutTest();
-    void DoUpdateTest();
     void DoDeleteAndExistTest();
     void DoScanAndSampleReclaimKeysTest();
     void DoReadModifyWriteBlockTest();

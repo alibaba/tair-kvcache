@@ -44,8 +44,8 @@ public:
     RecoverState GetRecoverState() const noexcept { return recover_state_.load(std::memory_order_acquire); }
 
     // ----- Write APIs -----
+    // Put / Upsert merge CacheLocations into batch.batch_properties in place.
     std::vector<ErrorCode> Put(RequestContext *request_context, BatchMetaData &batch) noexcept;
-    std::vector<ErrorCode> UpdateFields(RequestContext *request_context, BatchMetaData &batch) noexcept;
     std::vector<ErrorCode> Upsert(RequestContext *request_context, BatchMetaData &batch) noexcept;
     std::vector<ErrorCode> Delete(RequestContext *request_context, const KeyVector &keys) noexcept;
     std::vector<ErrorCode> Delete(RequestContext *request_context,

@@ -190,7 +190,7 @@ TEST_F(MpscWriteQueueTest, TestMultiProducerSingleConsumer) {
 
 TEST_F(MpscWriteQueueTest, TestMixedWriteOpsAndBarriers) {
     queue_->Push(QueueItem{MakeWriteOp(WriteOpType::kPut, {1})});
-    queue_->Push(QueueItem{MakeWriteOp(WriteOpType::kUpdateFields, {2})});
+    queue_->Push(QueueItem{MakeWriteOp(WriteOpType::kUpsert, {2})});
 
     auto ctx = std::make_shared<BarrierContext>();
     ctx->remain.store(1);

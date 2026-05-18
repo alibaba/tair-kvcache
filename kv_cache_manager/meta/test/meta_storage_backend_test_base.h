@@ -29,8 +29,6 @@ protected:
     PutWithFieldMaps(MetaStorageBackend *backend, const KeyTypeVec &keys, const FieldMapVec &field_maps);
     static std::vector<ErrorCode>
     UpsertWithFieldMaps(MetaStorageBackend *backend, const KeyTypeVec &keys, const FieldMapVec &field_maps);
-    static std::vector<ErrorCode>
-    UpdateWithFieldMaps(MetaStorageBackend *backend, const KeyTypeVec &keys, const FieldMapVec &field_maps);
     // Legacy-compatible PutIfAbsent that accepts FieldMapVec (for MetaLocalBackend / MetaCacheBaseBackend).
     static std::vector<ErrorCode> PutIfAbsentWithFieldMaps(MetaCacheBaseBackend *backend,
                                                            const KeyTypeVec &keys,
