@@ -123,7 +123,7 @@ TEST_F(MetaIndexerTest, TestMakeBatches) {
 
     KeyVector keys = {0, 1, 2, 3, 4, 8, 9, 80, 800};
     LocationIdsPerKey empty_location_ids;
-    LocationMapVector empty_locations;
+    CacheLocationMapVector empty_locations;
     PropertyMapVector empty_properties;
     auto batches = meta_indexer_->MakeBatches(keys, empty_location_ids, empty_locations, empty_properties);
 
@@ -176,7 +176,7 @@ TEST_F(MetaIndexerTest, TestMakeBatches2) {
                                     {{"uri", "35"}},
                                     {{"uri", "64"}}};
     LocationIdsPerKey empty_location_ids;
-    LocationMapVector empty_locations;
+    CacheLocationMapVector empty_locations;
     auto batches = meta_indexer_->MakeBatches(keys, empty_location_ids, empty_locations, properties);
 
     std::vector<int32_t> covered_indexs;

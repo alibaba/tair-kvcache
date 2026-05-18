@@ -45,8 +45,6 @@ using PropertyMapVector = std::vector<PropertyMap>;
 // ---------- Location primitives ----------
 using LocationId = std::string;
 using LocationIdVector = std::vector<LocationId>;
-using LocationMap = std::unordered_map<LocationId, CacheLocation>;
-using LocationMapVector = std::vector<LocationMap>;
 using LocationIdsPerKey = std::vector<LocationIdVector>;
 using LocationsPerKey = std::vector<CacheLocationVector>;
 
@@ -63,14 +61,14 @@ using LocationModifierResult = std::pair<ModifierAction, std::vector<ErrorCode>>
 
 // Lightweight block-level modifier: only sees the existing location id list
 // (no location values are deserialized). The modifier can produce new
-// CacheLocations to be written via the output LocationMap.
+// CacheLocations to be written via the output CacheLocationMap.
 using BlockIdsOnlyModifierFunc = std::function<ModifierResult(const LocationIdVector & /*existing_location_ids*/,
                                                               ErrorCode /*get_ec*/,
                                                               size_t /*key_index*/,
                                                               PropertyMap & /*upsert_property_map*/,
-                                                              LocationMap & /*out_new_locations*/)>;
+                                                              CacheLocationMap & /*out_new_locations*/)>;
 
-// Note: an earlier `BlockModifierFunc` variant (sees the entire LocationMap
+// Note: an earlier `BlockModifierFunc` variant (sees the entire CacheLocationMap
 // of one block_key) was removed because nothing in the codebase ever used
 // it. If a future caller really needs the deserialized map, it should fetch
 // it via MetaIndexer::GetLocations and then drive ReadModifyWriteLocation.
@@ -90,9 +88,19 @@ struct BatchMetaData {
     std::vector<int32_t> batch_shard_indexs; // shard mutex indices in this batch
     std::vector<int32_t> batch_indexs;       // raw index in the original KeyVector
     KeyVector batch_keys;                    // keys in this batch
-    LocationMapVector batch_locations;       // optional per-key CacheLocations
+    CacheLocationMapVector batch_locations;  // optional per-key CacheLocations
     LocationIdsPerKey batch_location_ids;    // optional per-key location ids
     PropertyMapVector batch_properties;      // optional per-key properties
+
+    // Ensure batch_locations and batch_properties are sized to match batch_keys.
+    void EnsureLocationsAndPropertiesResized() {
+        if (batch_locations.empty()) {
+            batch_locations.resize(batch_keys.size());
+        }
+        if (batch_properties.empty()) {
+            batch_properties.resize(batch_keys.size());
+        }
+    }
 };
 
 } // namespace kv_cache_manager

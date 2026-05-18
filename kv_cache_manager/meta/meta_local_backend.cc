@@ -114,16 +114,15 @@ ErrorCode MetaLocalBackend::Close() noexcept {
 // Private helpers
 // ---------------------------------------------------------------------------
 
-ErrorCode MetaLocalBackend::CreateAndInsert(const std::string &key_str, const FieldMap &fields) {
-    MetaMemCacheItem *item = MetaMemCacheItem::Create(fields);
+ErrorCode MetaLocalBackend::CreateAndInsert(const std::string &key_str,
+                                            const CacheLocationMap &locations,
+                                            const PropertyMap &properties) {
+    MetaMemCacheItem *item = MetaMemCacheItem::Create(locations, properties);
     item->TouchAccessTime();
     size_t charge = item->Size();
     // We must pass &handle (not nullptr) so that when strict_capacity_limit
     // is enabled and capacity is exceeded, Insert returns EC_NOSPC instead
     // of silently discarding the entry with EC_OK.
-    // On success the handle holds a reference that pins the entry out of
-    // the LRU list (preventing eviction), so we Release it immediately to
-    // let the entry become evictable again.
     Cache::Handle *handle = nullptr;
     ErrorCode ret = cache_->Insert(key_str, item, cache_item_helper_.get(), charge, &handle);
     if (ret != EC_OK) {
@@ -134,26 +133,12 @@ ErrorCode MetaLocalBackend::CreateAndInsert(const std::string &key_str, const Fi
     return ret;
 }
 
-ErrorCode MetaLocalBackend::CreateAndInsert(const std::string &key_str, FieldMap &&fields) {
-    MetaMemCacheItem *item = MetaMemCacheItem::Create(std::move(fields));
+ErrorCode MetaLocalBackend::CreateAndInsertIfAbsent(const std::string &key_str,
+                                                    const CacheLocationMap &locations,
+                                                    const PropertyMap &properties) {
+    MetaMemCacheItem *item = MetaMemCacheItem::Create(locations, properties);
     item->TouchAccessTime();
     size_t charge = item->Size();
-    // See the const-ref overload above for why we pass &handle.
-    Cache::Handle *handle = nullptr;
-    ErrorCode ret = cache_->Insert(key_str, item, cache_item_helper_.get(), charge, &handle);
-    if (ret != EC_OK) {
-        MetaMemCacheItem::Deleter(item, nullptr);
-    } else if (handle) {
-        cache_->Release(handle);
-    }
-    return ret;
-}
-
-ErrorCode MetaLocalBackend::CreateAndInsertIfAbsent(const std::string &key_str, const FieldMap &fields) {
-    MetaMemCacheItem *item = MetaMemCacheItem::Create(fields);
-    item->TouchAccessTime();
-    size_t charge = item->Size();
-    // See CreateAndInsert above for why we pass &handle.
     Cache::Handle *handle = nullptr;
     ErrorCode ret = cache_->InsertIfAbsent(key_str, item, cache_item_helper_.get(), charge, &handle);
     if (ret != EC_OK && ret != EC_EXIST) {
@@ -164,7 +149,9 @@ ErrorCode MetaLocalBackend::CreateAndInsertIfAbsent(const std::string &key_str, 
     return ret;
 }
 
-ErrorCode MetaLocalBackend::UpdateFieldsInPlace(const std::string &key_str, const FieldMap &updates) {
+ErrorCode MetaLocalBackend::UpdateInPlace(const std::string &key_str,
+                                          const CacheLocationMap &locations,
+                                          const PropertyMap &properties) {
     Cache::Handle *handle = cache_->Lookup(key_str);
     if (!handle) {
         return EC_NOENT;
@@ -174,17 +161,27 @@ ErrorCode MetaLocalBackend::UpdateFieldsInPlace(const std::string &key_str, cons
     ssize_t charge_delta = 0;
     {
         std::unique_lock lock(existing->GetMutex());
-        auto &fields = existing->GetMutableFields();
-        for (const auto &[field_name, field_value] : updates) {
-            auto it = fields.find(field_name);
-            if (it != fields.end()) {
-                // Existing field: delta is difference in value length.
-                charge_delta += static_cast<ssize_t>(field_value.size()) - static_cast<ssize_t>(it->second.size());
-                it->second = field_value;
+        auto &existing_locations = existing->GetMutableLocations();
+        for (const auto &[loc_id, loc] : locations) {
+            auto it = existing_locations.find(loc_id);
+            if (it != existing_locations.end()) {
+                ssize_t old_usage = static_cast<ssize_t>(it->second.EstimateMemUsage());
+                it->second = loc;
+                charge_delta += static_cast<ssize_t>(loc.EstimateMemUsage()) - old_usage;
             } else {
-                // New field: add full entry overhead.
-                charge_delta += static_cast<ssize_t>(field_name.size() + field_value.size() + sizeof(void *) * 4);
-                fields[field_name] = field_value;
+                charge_delta += static_cast<ssize_t>(sizeof(void *) * 4 + loc_id.size() + loc.EstimateMemUsage());
+                existing_locations[loc_id] = loc;
+            }
+        }
+        auto &existing_properties = existing->GetMutableProperties();
+        for (const auto &[prop_name, prop_value] : properties) {
+            auto it = existing_properties.find(prop_name);
+            if (it != existing_properties.end()) {
+                charge_delta += static_cast<ssize_t>(prop_value.size()) - static_cast<ssize_t>(it->second.size());
+                it->second = prop_value;
+            } else {
+                charge_delta += static_cast<ssize_t>(sizeof(void *) * 4 + prop_name.size() + prop_value.size());
+                existing_properties[prop_name] = prop_value;
             }
         }
     }
@@ -199,13 +196,23 @@ ErrorCode MetaLocalBackend::UpdateFieldsInPlace(const std::string &key_str, cons
 // Per-key helpers
 // ---------------------------------------------------------------------------
 
-ErrorCode MetaLocalBackend::UpsertForOneKey(KeyType key, const FieldMap &field_map) {
+ErrorCode
+MetaLocalBackend::UpsertForOneKey(KeyType key, const CacheLocationMap &locations, const PropertyMap &properties) {
     std::string key_str = std::to_string(key);
-    if (UpdateFieldsInPlace(key_str, field_map) == EC_OK) {
+    ErrorCode update_ec = UpdateInPlace(key_str, locations, properties);
+    if (update_ec != EC_OK && update_ec != EC_NOENT) {
+        KVCM_LOG_ERROR("local backend fail to update key[%ld] in upsert, ec[%d]", key, update_ec);
+        return update_ec;
+    }
+    if (update_ec == EC_OK) {
         return EC_OK;
     }
-    FieldMap fields = field_map;
-    return CreateAndInsert(key_str, std::move(fields));
+    ErrorCode insert_ec = CreateAndInsert(key_str, locations, properties);
+    if (insert_ec != EC_OK) {
+        KVCM_LOG_ERROR("local backend fail to insert key[%ld] in upsert, ec[%d]", key, insert_ec);
+        return insert_ec;
+    }
+    return EC_OK;
 }
 
 ErrorCode MetaLocalBackend::DeleteForOneKey(KeyType key) {
@@ -219,7 +226,7 @@ ErrorCode MetaLocalBackend::DeleteForOneKey(KeyType key) {
     return EC_OK;
 }
 
-ErrorCode MetaLocalBackend::DeleteFieldsForOneKey(KeyType key, const std::vector<std::string> &field_names) {
+ErrorCode MetaLocalBackend::DeleteLocationsForOneKey(KeyType key, const std::vector<LocationId> &location_ids) {
     std::string key_str = std::to_string(key);
     Cache::Handle *handle = cache_->Lookup(key_str);
     if (!handle) {
@@ -230,12 +237,13 @@ ErrorCode MetaLocalBackend::DeleteFieldsForOneKey(KeyType key, const std::vector
     ssize_t charge_delta = 0;
     {
         std::unique_lock lock(item->GetMutex());
-        auto &fields = item->GetMutableFields();
-        for (const auto &field_name : field_names) {
-            auto it = fields.find(field_name);
-            if (it != fields.end()) {
-                charge_delta -= static_cast<ssize_t>(it->first.size() + it->second.size() + sizeof(void *) * 4);
-                fields.erase(it);
+        auto &locs = item->GetMutableLocations();
+        for (const auto &loc_id : location_ids) {
+            auto it = locs.find(loc_id);
+            if (it != locs.end()) {
+                charge_delta -=
+                    static_cast<ssize_t>(sizeof(void *) * 4 + it->first.size() + it->second.EstimateMemUsage());
+                locs.erase(it);
             }
         }
     }
@@ -246,119 +254,55 @@ ErrorCode MetaLocalBackend::DeleteFieldsForOneKey(KeyType key, const std::vector
     return EC_OK;
 }
 
-ErrorCode
-MetaLocalBackend::GetForOneKey(KeyType key, const std::vector<std::string> &field_names, FieldMap &out_field_map) {
-    out_field_map.clear();
-
-    std::string key_str = std::to_string(key);
-    Cache::Handle *handle = cache_->Lookup(key_str);
-    if (!handle) {
-        return EC_NOENT;
-    }
-
-    auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
-    int64_t stored_time = item->GetLastAccessTime();
-    item->TouchAccessTime();
-    {
-        std::shared_lock lock(item->GetMutex());
-        const auto &fields = item->GetFields();
-        for (const auto &field_name : field_names) {
-            if (field_name == PROPERTY_LRU_TIME) {
-                out_field_map[PROPERTY_LRU_TIME] = std::to_string(stored_time);
-                continue;
-            }
-            auto it = fields.find(field_name);
-            if (it != fields.end()) {
-                out_field_map[field_name] = it->second;
-            }
-        }
-    }
-    cache_->Release(handle);
-    return EC_OK;
-}
-
 // ---------------------------------------------------------------------------
-// Write operations
+// Write operations (unconditional)
 // ---------------------------------------------------------------------------
 
-std::vector<ErrorCode> MetaLocalBackend::Put(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept {
+std::vector<ErrorCode> MetaLocalBackend::Put(RequestContext * /*request_context*/,
+                                             const KeyTypeVec &keys,
+                                             const CacheLocationMapVector &locations,
+                                             const PropertyMapVector &properties) noexcept {
     std::vector<ErrorCode> results(keys.size(), EC_OK);
     for (size_t i = 0; i < keys.size(); ++i) {
-        results[i] = CreateAndInsert(std::to_string(keys[i]), field_maps[i]);
+        results[i] = CreateAndInsert(std::to_string(keys[i]), locations[i], properties[i]);
     }
     return results;
 }
 
-std::vector<ErrorCode> MetaLocalBackend::Put(const KeyTypeVec &keys,
-                                             const FieldMapVec &field_maps,
-                                             const std::vector<ErrorCode> &previous_error_codes) noexcept {
+std::vector<ErrorCode> MetaLocalBackend::PutIfAbsent(RequestContext * /*request_context*/,
+                                                     const KeyTypeVec &keys,
+                                                     const CacheLocationMapVector &locations,
+                                                     const PropertyMapVector &properties) noexcept {
     std::vector<ErrorCode> results(keys.size(), EC_OK);
     for (size_t i = 0; i < keys.size(); ++i) {
-        results[i] = (previous_error_codes[i] == EC_OK) ? CreateAndInsert(std::to_string(keys[i]), field_maps[i])
-                                                        : previous_error_codes[i];
+        results[i] = CreateAndInsertIfAbsent(std::to_string(keys[i]), locations[i], properties[i]);
     }
     return results;
 }
 
-std::vector<ErrorCode> MetaLocalBackend::PutIfAbsent(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept {
+std::vector<ErrorCode> MetaLocalBackend::Upsert(RequestContext * /*request_context*/,
+                                                const KeyTypeVec &keys,
+                                                const CacheLocationMapVector &locations,
+                                                const PropertyMapVector &properties) noexcept {
     std::vector<ErrorCode> results(keys.size(), EC_OK);
     for (size_t i = 0; i < keys.size(); ++i) {
-        results[i] = CreateAndInsertIfAbsent(std::to_string(keys[i]), field_maps[i]);
+        results[i] = UpsertForOneKey(keys[i], locations[i], properties[i]);
     }
     return results;
 }
 
-std::vector<ErrorCode> MetaLocalBackend::PutIfAbsent(const KeyTypeVec &keys,
-                                                     const FieldMapVec &field_maps,
-                                                     const std::vector<ErrorCode> &previous_error_codes) noexcept {
+std::vector<ErrorCode> MetaLocalBackend::Update(RequestContext * /*request_context*/,
+                                                const KeyTypeVec &keys,
+                                                const CacheLocationMapVector &locations,
+                                                const PropertyMapVector &properties) noexcept {
     std::vector<ErrorCode> results(keys.size(), EC_OK);
     for (size_t i = 0; i < keys.size(); ++i) {
-        results[i] = (previous_error_codes[i] == EC_OK)
-                         ? CreateAndInsertIfAbsent(std::to_string(keys[i]), field_maps[i])
-                         : previous_error_codes[i];
+        results[i] = UpdateInPlace(std::to_string(keys[i]), locations[i], properties[i]);
     }
     return results;
 }
 
-std::vector<ErrorCode> MetaLocalBackend::UpdateFields(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept {
-    std::vector<ErrorCode> results(keys.size(), EC_OK);
-    for (size_t i = 0; i < keys.size(); ++i) {
-        results[i] = UpdateFieldsInPlace(std::to_string(keys[i]), field_maps[i]);
-    }
-    return results;
-}
-
-std::vector<ErrorCode> MetaLocalBackend::UpdateFields(const KeyTypeVec &keys,
-                                                      const FieldMapVec &field_maps,
-                                                      const std::vector<ErrorCode> &previous_error_codes) noexcept {
-    std::vector<ErrorCode> results(keys.size(), EC_OK);
-    for (size_t i = 0; i < keys.size(); ++i) {
-        results[i] = (previous_error_codes[i] == EC_OK) ? UpdateFieldsInPlace(std::to_string(keys[i]), field_maps[i])
-                                                        : previous_error_codes[i];
-    }
-    return results;
-}
-
-std::vector<ErrorCode> MetaLocalBackend::Upsert(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept {
-    std::vector<ErrorCode> results(keys.size(), EC_OK);
-    for (size_t i = 0; i < keys.size(); ++i) {
-        results[i] = UpsertForOneKey(keys[i], field_maps[i]);
-    }
-    return results;
-}
-
-std::vector<ErrorCode> MetaLocalBackend::Upsert(const KeyTypeVec &keys,
-                                                const FieldMapVec &field_maps,
-                                                const std::vector<ErrorCode> &previous_error_codes) noexcept {
-    std::vector<ErrorCode> results(keys.size(), EC_OK);
-    for (size_t i = 0; i < keys.size(); ++i) {
-        results[i] =
-            (previous_error_codes[i] == EC_OK) ? UpsertForOneKey(keys[i], field_maps[i]) : previous_error_codes[i];
-    }
-    return results;
-}
-
-std::vector<ErrorCode> MetaLocalBackend::Delete(const KeyTypeVec &keys) noexcept {
+std::vector<ErrorCode> MetaLocalBackend::Delete(RequestContext * /*request_context*/, const KeyTypeVec &keys) noexcept {
     std::vector<ErrorCode> results(keys.size(), EC_OK);
     for (size_t i = 0; i < keys.size(); ++i) {
         results[i] = DeleteForOneKey(keys[i]);
@@ -366,7 +310,80 @@ std::vector<ErrorCode> MetaLocalBackend::Delete(const KeyTypeVec &keys) noexcept
     return results;
 }
 
-std::vector<ErrorCode> MetaLocalBackend::Delete(const KeyTypeVec &keys,
+std::vector<ErrorCode> MetaLocalBackend::DeleteLocations(RequestContext * /*request_context*/,
+                                                         const KeyTypeVec &keys,
+                                                         const LocationIdsPerKey &location_ids) noexcept {
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (location_ids[i].empty()) {
+            continue;
+        }
+        results[i] = DeleteLocationsForOneKey(keys[i], location_ids[i]);
+    }
+    return results;
+}
+
+// ---------------------------------------------------------------------------
+// Write operations (PutIfAbsent + conditional with previous_error_codes)
+// ---------------------------------------------------------------------------
+
+std::vector<ErrorCode> MetaLocalBackend::Put(RequestContext *request_context,
+                                             const KeyTypeVec &keys,
+                                             const CacheLocationMapVector &locations,
+                                             const PropertyMapVector &properties,
+                                             const std::vector<ErrorCode> &previous_error_codes) noexcept {
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        results[i] = (previous_error_codes[i] == EC_OK)
+                         ? CreateAndInsert(std::to_string(keys[i]), locations[i], properties[i])
+                         : previous_error_codes[i];
+    }
+    return results;
+}
+
+std::vector<ErrorCode> MetaLocalBackend::PutIfAbsent(RequestContext *request_context,
+                                                     const KeyTypeVec &keys,
+                                                     const CacheLocationMapVector &locations,
+                                                     const PropertyMapVector &properties,
+                                                     const std::vector<ErrorCode> &previous_error_codes) noexcept {
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        results[i] = (previous_error_codes[i] == EC_OK)
+                         ? CreateAndInsertIfAbsent(std::to_string(keys[i]), locations[i], properties[i])
+                         : previous_error_codes[i];
+    }
+    return results;
+}
+
+std::vector<ErrorCode> MetaLocalBackend::Upsert(RequestContext *request_context,
+                                                const KeyTypeVec &keys,
+                                                const CacheLocationMapVector &locations,
+                                                const PropertyMapVector &properties,
+                                                const std::vector<ErrorCode> &previous_error_codes) noexcept {
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        results[i] = (previous_error_codes[i] == EC_OK) ? UpsertForOneKey(keys[i], locations[i], properties[i])
+                                                        : previous_error_codes[i];
+    }
+    return results;
+}
+
+std::vector<ErrorCode> MetaLocalBackend::Update(RequestContext *request_context,
+                                                const KeyTypeVec &keys,
+                                                const CacheLocationMapVector &locations,
+                                                const PropertyMapVector &properties,
+                                                const std::vector<ErrorCode> &previous_error_codes) noexcept {
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        results[i] = (previous_error_codes[i] == EC_OK)
+                         ? UpdateInPlace(std::to_string(keys[i]), locations[i], properties[i])
+                         : previous_error_codes[i];
+    }
+    return results;
+}
+
+std::vector<ErrorCode> MetaLocalBackend::Delete(RequestContext *request_context,
+                                                const KeyTypeVec &keys,
                                                 const std::vector<ErrorCode> &previous_error_codes) noexcept {
     std::vector<ErrorCode> results(keys.size(), EC_OK);
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -375,29 +392,17 @@ std::vector<ErrorCode> MetaLocalBackend::Delete(const KeyTypeVec &keys,
     return results;
 }
 
-std::vector<ErrorCode>
-MetaLocalBackend::DeleteFields(const KeyTypeVec &keys,
-                               const std::vector<std::vector<std::string>> &field_names_vec) noexcept {
+std::vector<ErrorCode> MetaLocalBackend::DeleteLocations(RequestContext *request_context,
+                                                         const KeyTypeVec &keys,
+                                                         const LocationIdsPerKey &location_ids,
+                                                         const std::vector<ErrorCode> &previous_error_codes) noexcept {
     std::vector<ErrorCode> results(keys.size(), EC_OK);
     for (size_t i = 0; i < keys.size(); ++i) {
-        if (field_names_vec[i].empty()) {
-            continue; // Nothing to delete — idempotent success.
-        }
-        results[i] = DeleteFieldsForOneKey(keys[i], field_names_vec[i]);
-    }
-    return results;
-}
-
-std::vector<ErrorCode> MetaLocalBackend::DeleteFields(const KeyTypeVec &keys,
-                                                      const std::vector<std::vector<std::string>> &field_names_vec,
-                                                      const std::vector<ErrorCode> &previous_error_codes) noexcept {
-    std::vector<ErrorCode> results(keys.size(), EC_OK);
-    for (size_t i = 0; i < keys.size(); ++i) {
-        if (field_names_vec[i].empty()) {
+        if (location_ids[i].empty()) {
             results[i] = previous_error_codes[i];
-            continue; // Nothing to delete — idempotent success (propagate previous ec).
+            continue;
         }
-        results[i] = (previous_error_codes[i] == EC_OK) ? DeleteFieldsForOneKey(keys[i], field_names_vec[i])
+        results[i] = (previous_error_codes[i] == EC_OK) ? DeleteLocationsForOneKey(keys[i], location_ids[i])
                                                         : previous_error_codes[i];
     }
     return results;
@@ -407,84 +412,165 @@ std::vector<ErrorCode> MetaLocalBackend::DeleteFields(const KeyTypeVec &keys,
 // Read operations
 // ---------------------------------------------------------------------------
 
-std::vector<ErrorCode> MetaLocalBackend::Get(const KeyTypeVec &keys,
-                                             const std::vector<std::string> &field_names,
-                                             FieldMapVec &out_field_maps) noexcept {
+ErrorCode MetaLocalBackend::GetForOneKey(KeyType key,
+                                         const std::vector<std::string> *field_names,
+                                         CacheLocationMap *out_location_map,
+                                         PropertyMap *out_property_map,
+                                         std::vector<LocationId> *out_location_ids) {
+    std::string key_str = std::to_string(key);
+    Cache::Handle *handle = cache_->Lookup(key_str);
+    if (!handle) {
+        return EC_NOENT;
+    }
+    auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
+    int64_t stored_time = item->GetLastAccessTime();
+    item->TouchAccessTime();
+    {
+        std::shared_lock lock(item->GetMutex());
+        if (out_location_map || out_location_ids) {
+            const auto &locs = item->GetLocations();
+            if (out_location_map) {
+                *out_location_map = locs;
+            }
+            if (out_location_ids) {
+                out_location_ids->reserve(locs.size());
+                for (const auto &[loc_id, _] : locs) {
+                    out_location_ids->push_back(loc_id);
+                }
+            }
+        }
+        if (out_property_map) {
+            if (field_names) {
+                const auto &props = item->GetProperties();
+                for (const auto &field_name : *field_names) {
+                    if (field_name == PROPERTY_LRU_TIME) {
+                        (*out_property_map)[PROPERTY_LRU_TIME] = std::to_string(stored_time);
+                        continue;
+                    }
+                    auto it = props.find(field_name);
+                    if (it != props.end()) {
+                        (*out_property_map)[field_name] = it->second;
+                    }
+                }
+            } else {
+                *out_property_map = item->GetProperties();
+                (*out_property_map)[PROPERTY_LRU_TIME] = std::to_string(stored_time);
+            }
+        }
+    }
+    cache_->Release(handle);
+    return EC_OK;
+}
+
+std::vector<ErrorCode> MetaLocalBackend::Get(RequestContext * /*request_context*/,
+                                             const KeyTypeVec &keys,
+                                             CacheLocationMapVector &out_locations,
+                                             PropertyMapVector &out_properties) noexcept {
     std::vector<ErrorCode> results(keys.size(), EC_OK);
-    out_field_maps.resize(keys.size());
+    out_locations.resize(keys.size());
+    out_properties.resize(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
-        results[i] = GetForOneKey(keys[i], field_names, out_field_maps[i]);
+        results[i] = GetForOneKey(keys[i], nullptr, &out_locations[i], &out_properties[i], nullptr);
     }
     return results;
 }
 
-std::vector<ErrorCode> MetaLocalBackend::Get(const KeyTypeVec &keys,
-                                             const std::vector<std::vector<std::string>> &field_names_vec,
-                                             FieldMapVec &out_field_maps) noexcept {
+std::vector<ErrorCode> MetaLocalBackend::GetLocations(RequestContext * /*request_context*/,
+                                                      const KeyTypeVec &keys,
+                                                      CacheLocationMapVector &out_locations) noexcept {
     std::vector<ErrorCode> results(keys.size(), EC_OK);
-    out_field_maps.resize(keys.size());
+    out_locations.resize(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
-        results[i] = GetForOneKey(keys[i], field_names_vec[i], out_field_maps[i]);
+        results[i] = GetForOneKey(keys[i], nullptr, &out_locations[i], nullptr, nullptr);
     }
     return results;
 }
 
-std::vector<ErrorCode> MetaLocalBackend::GetAllFields(const KeyTypeVec &keys, FieldMapVec &out_field_maps) noexcept {
-    std::vector<ErrorCode> results(keys.size(), EC_OK);
-    out_field_maps.resize(keys.size());
+std::vector<std::vector<ErrorCode>> MetaLocalBackend::GetLocations(RequestContext * /*request_context*/,
+                                                                   const KeyTypeVec &keys,
+                                                                   const LocationIdsPerKey &location_ids,
+                                                                   LocationsPerKey &out_locations) noexcept {
+    assert(keys.size() == location_ids.size());
+    std::vector<std::vector<ErrorCode>> results(keys.size());
+    out_locations.resize(keys.size());
 
     for (size_t i = 0; i < keys.size(); ++i) {
+        out_locations[i].resize(location_ids[i].size());
+
         std::string key_str = std::to_string(keys[i]);
-
         Cache::Handle *handle = cache_->Lookup(key_str);
         if (!handle) {
-            results[i] = EC_NOENT;
+            results[i].assign(location_ids[i].size(), EC_NOENT);
             continue;
         }
-
         auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
-        int64_t stored_time = item->GetLastAccessTime();
         item->TouchAccessTime();
+        results[i].resize(location_ids[i].size());
         {
             std::shared_lock lock(item->GetMutex());
-            out_field_maps[i] = item->GetFields();
+            const auto &locs = item->GetLocations();
+            for (size_t j = 0; j < location_ids[i].size(); ++j) {
+                auto it = locs.find(location_ids[i][j]);
+                if (it != locs.end()) {
+                    out_locations[i][j] = it->second;
+                    results[i][j] = EC_OK;
+                } else {
+                    results[i][j] = EC_NOENT;
+                }
+            }
         }
-        out_field_maps[i][PROPERTY_LRU_TIME] = std::to_string(stored_time);
         cache_->Release(handle);
-        results[i] = EC_OK;
     }
-
     return results;
 }
 
-std::vector<ErrorCode> MetaLocalBackend::Exists(const KeyTypeVec &keys, std::vector<bool> &out_is_exist_vec) noexcept {
+std::vector<ErrorCode> MetaLocalBackend::GetLocationIds(RequestContext * /*request_context*/,
+                                                        const KeyTypeVec &keys,
+                                                        LocationIdsPerKey &out_location_ids) noexcept {
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    out_location_ids.resize(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        results[i] = GetForOneKey(keys[i], nullptr, nullptr, nullptr, &out_location_ids[i]);
+    }
+    return results;
+}
+
+std::vector<ErrorCode> MetaLocalBackend::GetProperties(RequestContext * /*request_context*/,
+                                                       const KeyTypeVec &keys,
+                                                       const std::vector<std::string> &field_names,
+                                                       PropertyMapVector &out_properties) noexcept {
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    out_properties.resize(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        results[i] = GetForOneKey(keys[i], &field_names, nullptr, &out_properties[i], nullptr);
+    }
+    return results;
+}
+
+std::vector<ErrorCode> MetaLocalBackend::Exists(RequestContext * /*request_context*/,
+                                                const KeyTypeVec &keys,
+                                                std::vector<bool> &out_is_exist_vec) noexcept {
     std::vector<ErrorCode> results(keys.size(), EC_OK);
     out_is_exist_vec.resize(keys.size(), false);
 
     for (size_t i = 0; i < keys.size(); ++i) {
         std::string key_str = std::to_string(keys[i]);
-
         Cache::Handle *handle = cache_->Lookup(key_str);
         out_is_exist_vec[i] = (handle != nullptr);
-
         if (handle) {
             auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
             item->TouchAccessTime();
             cache_->Release(handle);
         }
-
-        results[i] = EC_OK;
     }
-
     return results;
 }
 
-std::vector<ErrorCode> MetaLocalBackend::ExistsFieldWithPrefix(const KeyTypeVec &keys,
-                                                               const std::string &field_prefix,
-                                                               std::vector<bool> &out_exists_vec) noexcept {
+std::vector<ErrorCode> MetaLocalBackend::ExistsLocation(RequestContext * /*request_context*/,
+                                                        const KeyTypeVec &keys,
+                                                        std::vector<bool> &out_exists) noexcept {
     std::vector<ErrorCode> results(keys.size(), EC_OK);
-    out_exists_vec.resize(keys.size(), false);
-
+    out_exists.resize(keys.size(), false);
     for (size_t i = 0; i < keys.size(); ++i) {
         std::string key_str = std::to_string(keys[i]);
         Cache::Handle *handle = cache_->Lookup(key_str);
@@ -492,68 +578,19 @@ std::vector<ErrorCode> MetaLocalBackend::ExistsFieldWithPrefix(const KeyTypeVec 
             results[i] = EC_NOENT;
             continue;
         }
-
         auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
         item->TouchAccessTime();
         {
             std::shared_lock lock(item->GetMutex());
-            const auto &fields = item->GetFields();
-            for (auto it = fields.lower_bound(field_prefix); it != fields.end(); ++it) {
-                if (it->first.size() < field_prefix.size() ||
-                    it->first.compare(0, field_prefix.size(), field_prefix) != 0) {
-                    break;
-                }
-                // Skip tombstones (empty value) — they are not valid locations.
-                if (!it->second.empty()) {
-                    out_exists_vec[i] = true;
-                    break;
-                }
-            }
+            out_exists[i] = !item->GetLocations().empty();
         }
         cache_->Release(handle);
     }
-
     return results;
 }
 
-std::vector<ErrorCode>
-MetaLocalBackend::GetFieldNamesWithPrefix(const KeyTypeVec &keys,
-                                          const std::string &field_prefix,
-                                          std::vector<std::vector<std::string>> &out_field_names_vec) noexcept {
-    std::vector<ErrorCode> results(keys.size(), EC_OK);
-    out_field_names_vec.resize(keys.size());
-
-    for (size_t i = 0; i < keys.size(); ++i) {
-        std::string key_str = std::to_string(keys[i]);
-        Cache::Handle *handle = cache_->Lookup(key_str);
-        if (!handle) {
-            results[i] = EC_NOENT;
-            continue;
-        }
-
-        auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
-        item->TouchAccessTime();
-        {
-            std::shared_lock lock(item->GetMutex());
-            const auto &fields = item->GetFields();
-            for (auto it = fields.lower_bound(field_prefix); it != fields.end(); ++it) {
-                if (it->first.size() < field_prefix.size() ||
-                    it->first.compare(0, field_prefix.size(), field_prefix) != 0) {
-                    break;
-                }
-                // Skip tombstones (empty value) — they are not valid locations.
-                if (!it->second.empty()) {
-                    out_field_names_vec[i].emplace_back(it->first);
-                }
-            }
-        }
-        cache_->Release(handle);
-    }
-
-    return results;
-}
-
-ErrorCode MetaLocalBackend::ListKeys(const std::string &cursor,
+ErrorCode MetaLocalBackend::ListKeys(RequestContext * /*request_context*/,
+                                     const std::string &cursor,
                                      const int64_t limit,
                                      std::string &out_next_cursor,
                                      std::vector<KeyType> &out_keys) noexcept {
@@ -593,7 +630,9 @@ ErrorCode MetaLocalBackend::ListKeys(const std::string &cursor,
     return EC_OK;
 }
 
-ErrorCode MetaLocalBackend::RandomSample(const int64_t count, std::vector<KeyType> &out_keys) noexcept {
+ErrorCode MetaLocalBackend::RandomSample(RequestContext * /*request_context*/,
+                                         const int64_t count,
+                                         std::vector<KeyType> &out_keys) noexcept {
     if (!cache_) {
         KVCM_LOG_ERROR("local backend not inited");
         return EC_ERROR;
@@ -616,7 +655,9 @@ ErrorCode MetaLocalBackend::RandomSample(const int64_t count, std::vector<KeyTyp
     return EC_OK;
 }
 
-ErrorCode MetaLocalBackend::SampleReclaimKeys(const int64_t count, std::vector<KeyType> &out_keys) noexcept {
+ErrorCode MetaLocalBackend::SampleReclaimKeys(RequestContext * /*request_context*/,
+                                              const int64_t count,
+                                              std::vector<KeyType> &out_keys) noexcept {
     out_keys.clear();
     if (!cache_) {
         KVCM_LOG_ERROR("local backend not inited");

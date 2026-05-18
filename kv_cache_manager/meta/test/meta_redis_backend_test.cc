@@ -252,16 +252,17 @@ TEST_F(MetaRedisBackendTest, TestSimple) {
     ASSERT_EQ(EC_OK, meta_redis_backend_->Init("instance_0", meta_storage_backend_config_));
     ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
-              meta_redis_backend_->Put({1, 2}, {{{"f1", "v1-1"}}, {{"f1", "v2-1"}}}));
+              PutWithFieldMaps(meta_redis_backend_.get(), {1, 2}, {{{"f1", "v1-1"}}, {{"f1", "v2-1"}}}));
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_NOENT}),
-              meta_redis_backend_->UpdateFields({1, 2, 3}, {{{"f2", "v1-2"}}, {{"f2", "v2-2"}}, {{"f3", "v3-2"}}}));
+              UpdateWithFieldMaps(
+                  meta_redis_backend_.get(), {1, 2, 3}, {{{"f2", "v1-2"}}, {{"f2", "v2-2"}}, {{"f3", "v3-2"}}}));
 
     AssertExists(meta_redis_backend_.get(), {1, 2, 4}, {EC_OK, EC_OK, EC_OK}, /*is_exist*/ {true, true, false});
-    AssertGet(meta_redis_backend_.get(),
-              {1, 2},
-              {"f1", "f2"},
-              {EC_OK, EC_OK},
-              {{{"f1", "v1-1"}, {"f2", "v1-2"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}});
+    AssertGetProperties(meta_redis_backend_.get(),
+                        {1, 2},
+                        {"f1", "f2"},
+                        {EC_OK, EC_OK},
+                        {{{"f1", "v1-1"}, {"f2", "v1-2"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}});
     AssertGetAllFields(meta_redis_backend_.get(),
                        {1, 2},
                        {EC_OK, EC_OK},
@@ -272,12 +273,12 @@ TEST_F(MetaRedisBackendTest, TestSimple) {
 
     // test upsert
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
-              meta_redis_backend_->Upsert({2, 3}, {{{"f1", "v2-1-2"}}, {{"f1", "v3-1"}}}));
-    AssertGet(meta_redis_backend_.get(),
-              {2, 3},
-              {"f1", "f2"},
-              {EC_OK, EC_OK},
-              {{{"f1", "v2-1-2"}, {"f2", "v2-2"}}, {{"f1", "v3-1"}}});
+              UpsertWithFieldMaps(meta_redis_backend_.get(), {2, 3}, {{{"f1", "v2-1-2"}}, {{"f1", "v3-1"}}}));
+    AssertGetProperties(meta_redis_backend_.get(),
+                        {2, 3},
+                        {"f1", "f2"},
+                        {EC_OK, EC_OK},
+                        {{{"f1", "v2-1-2"}, {"f2", "v2-2"}}, {{"f1", "v3-1"}}});
 
     ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
 }
@@ -294,28 +295,32 @@ TEST_F(MetaRedisBackendTest, TestRedisError) {
     ASSERT_EQ(EC_OK, meta_redis_backend_->Init("instance_0", meta_storage_backend_config_));
     ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
     ASSERT_EQ((std::vector<ErrorCode>{EC_ERROR, EC_ERROR}),
-              meta_redis_backend_->Put({1, 2}, {{{"f1", "v1-1"}}, {{"f1", "v2-1"}}}));
+              PutWithFieldMaps(meta_redis_backend_.get(), {1, 2}, {{{"f1", "v1-1"}}, {{"f1", "v2-1"}}}));
     ASSERT_EQ((std::vector<ErrorCode>{EC_ERROR, EC_ERROR, EC_ERROR}),
-              meta_redis_backend_->UpdateFields({1, 2, 3}, {{{"f2", "v1-2"}}, {{"f2", "v2-2"}}, {{"f3", "v3-2"}}}));
+              UpdateWithFieldMaps(
+                  meta_redis_backend_.get(), {1, 2, 3}, {{{"f2", "v1-2"}}, {{"f2", "v2-2"}}, {{"f3", "v3-2"}}}));
 
     std::vector<bool> is_exist_vec;
-    ASSERT_EQ((std::vector<ErrorCode>{EC_ERROR, EC_ERROR}), meta_redis_backend_->Exists({1, 2}, is_exist_vec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_ERROR, EC_ERROR}), meta_redis_backend_->Exists(nullptr, {1, 2}, is_exist_vec));
     ASSERT_EQ(std::vector<bool>(2, false), is_exist_vec);
 
-    FieldMapVec field_maps;
+    PropertyMapVector prop_maps;
     ASSERT_EQ((std::vector<ErrorCode>{EC_ERROR, EC_ERROR}),
-              meta_redis_backend_->Get({1, 2}, std::vector<std::string>{"f1", "f2"}, field_maps));
-    ASSERT_EQ(std::vector<FieldMap>(2), field_maps);
-    ASSERT_EQ((std::vector<ErrorCode>{EC_ERROR, EC_ERROR}), meta_redis_backend_->GetAllFields({1, 2}, field_maps));
-    ASSERT_EQ(std::vector<FieldMap>(2), field_maps);
+              meta_redis_backend_->GetProperties(nullptr, {1, 2}, std::vector<std::string>{"f1", "f2"}, prop_maps));
+    ASSERT_EQ(PropertyMapVector(2), prop_maps);
+    CacheLocationMapVector out_locs;
+    PropertyMapVector out_props;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_ERROR, EC_ERROR}),
+              meta_redis_backend_->Get(nullptr, {1, 2}, out_locs, out_props));
+    ASSERT_EQ(PropertyMapVector(2), out_props);
 
     std::string next_cursor;
     KeyTypeVec keys;
-    ASSERT_EQ(EC_ERROR, meta_redis_backend_->ListKeys(SCAN_BASE_CURSOR, /*limit*/ 5, next_cursor, keys));
+    ASSERT_EQ(EC_ERROR, meta_redis_backend_->ListKeys(nullptr, SCAN_BASE_CURSOR, /*limit*/ 5, next_cursor, keys));
     ASSERT_TRUE(next_cursor.empty());
     ASSERT_TRUE(keys.empty());
 
-    ASSERT_EQ(EC_ERROR, meta_redis_backend_->SampleReclaimKeys(/*count*/ 5, keys));
+    ASSERT_EQ(EC_ERROR, meta_redis_backend_->SampleReclaimKeys(nullptr, /*count*/ 5, keys));
     ASSERT_TRUE(keys.empty());
 
     ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
@@ -350,11 +355,11 @@ TEST_F(MetaRedisBackendTest, TestMultiThreadSimple) {
     ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
 
     auto get_task = [this]() {
-        AssertGet(meta_redis_backend_.get(),
-                  {1, 2},
-                  {"f1", "f2"},
-                  {EC_OK, EC_OK},
-                  {{{"f1", "v1-1"}, {"f2", "v1-2"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}});
+        AssertGetProperties(meta_redis_backend_.get(),
+                            {1, 2},
+                            {"f1", "f2"},
+                            {EC_OK, EC_OK},
+                            {{{"f1", "v1-1"}, {"f2", "v1-2"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}});
     };
     std::vector<std::thread> threads;
     for (int i = 0; i < 10; ++i) {
@@ -391,10 +396,10 @@ TEST_F(MetaRedisBackendTest, TestDeleteFields) {
     ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
 
     // HDEL returning 0 (no field actually removed) is now idempotent EC_OK.
-    AssertDeleteFields(meta_redis_backend_.get(),
-                       {1, 2},
-                       /*field_names_vec*/ {{"f1", "f2"}, {"f3"}},
-                       {EC_OK, EC_OK});
+    AssertDeleteLocations(meta_redis_backend_.get(),
+                          {1, 2},
+                          /*location_ids*/ {{"f1", "f2"}, {"f3"}},
+                          {EC_OK, EC_OK});
 
     ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
 }
@@ -442,7 +447,7 @@ TEST_F(MetaRedisBackendTest, TestExistsFieldWithPrefix) {
     ASSERT_EQ(EC_OK, meta_redis_backend_->Init("instance_0", meta_storage_backend_config_));
     ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
 
-    AssertExistsFieldWithPrefix(meta_redis_backend_.get(), {1, 2}, LOCATION_PREFIX, {EC_OK, EC_OK}, {true, false});
+    AssertExistsLocation(meta_redis_backend_.get(), {1, 2}, {EC_OK, EC_OK}, {true, false});
 
     ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
 }
@@ -475,7 +480,7 @@ TEST_F(MetaRedisBackendTest, TestExistsFieldWithPrefixIgnoresTombstone) {
     ASSERT_EQ(EC_OK, meta_redis_backend_->Init("instance_0", meta_storage_backend_config_));
     ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
 
-    AssertExistsFieldWithPrefix(meta_redis_backend_.get(), {1, 2}, LOCATION_PREFIX, {EC_OK, EC_OK}, {false, true});
+    AssertExistsLocation(meta_redis_backend_.get(), {1, 2}, {EC_OK, EC_OK}, {false, true});
 
     ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
 }
@@ -517,7 +522,7 @@ TEST_F(MetaRedisBackendTest, TestExistsFieldWithPrefixKeyNotExist) {
     ASSERT_EQ(EC_OK, meta_redis_backend_->Init("instance_0", meta_storage_backend_config_));
     ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
 
-    AssertExistsFieldWithPrefix(meta_redis_backend_.get(), {1, 2}, LOCATION_PREFIX, {EC_OK, EC_NOENT}, {true, false});
+    AssertExistsLocation(meta_redis_backend_.get(), {1, 2}, {EC_OK, EC_NOENT}, {true, false});
 
     ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
 }
@@ -538,7 +543,7 @@ TEST_F(MetaRedisBackendTest, TestDeleteFieldsEmptyFieldList) {
     ASSERT_EQ(EC_OK, meta_redis_backend_->Init("instance_0", meta_storage_backend_config_));
     ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
 
-    AssertDeleteFields(meta_redis_backend_.get(), {1, 2}, {{}, {}}, {EC_OK, EC_OK});
+    AssertDeleteLocations(meta_redis_backend_.get(), {1, 2}, {{}, {}}, {EC_OK, EC_OK});
 
     ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
 }
@@ -566,11 +571,15 @@ TEST_F(MetaRedisBackendTest, TestGet) {
     ASSERT_EQ(EC_OK, meta_redis_backend_->Init("instance_0", meta_storage_backend_config_));
     ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
 
-    FieldMapVec field_maps;
-    ASSERT_EQ(
-        (std::vector<ErrorCode>{EC_OK, EC_OK}),
-        meta_redis_backend_->Get({1, 2}, std::vector<std::vector<std::string>>{{"f1"}, {"f2", "f3"}}, field_maps));
-    ASSERT_EQ((FieldMapVec{{{"f1", "v1-1"}}, {{"f2", "v2-2"}}}), field_maps);
+    // Note: the new API uses a uniform field_names for all keys via GetProperties.
+    // Test key 1 with f1, key 2 with f2.
+    PropertyMapVector props1;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_redis_backend_->GetProperties(nullptr, {1}, {"f1"}, props1));
+    ASSERT_EQ("v1-1", props1[0]["f1"]);
+    PropertyMapVector props2;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_redis_backend_->GetProperties(nullptr, {2}, {"f2", "f3"}, props2));
+    ASSERT_EQ("v2-2", props2[0]["f2"]);
+    ASSERT_TRUE(props2[0].find("f3") == props2[0].end());
 
     ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
 }

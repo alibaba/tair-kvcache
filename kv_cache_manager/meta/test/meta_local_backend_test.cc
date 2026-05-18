@@ -50,15 +50,16 @@ TEST_F(MetaLocalBackendTest, TestSimple) {
     ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
 
     // Put two entries with uri field
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
-              meta_storage_backend_->Put({1, 2}, {{{PROPERTY_URI, "uri1"}}, {{PROPERTY_URI, "uri2"}}}));
-    // UpdateFields to add hit_count
     ASSERT_EQ(
         (std::vector<ErrorCode>{EC_OK, EC_OK}),
-        meta_storage_backend_->UpdateFields({1, 2}, {{{PROPERTY_HIT_COUNT, "100"}}, {{PROPERTY_HIT_COUNT, "200"}}}));
+        PutWithFieldMaps(meta_storage_backend_.get(), {1, 2}, {{{PROPERTY_URI, "uri1"}}, {{PROPERTY_URI, "uri2"}}}));
+    // UpdateFields to add hit_count
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
+              UpdateWithFieldMaps(
+                  meta_storage_backend_.get(), {1, 2}, {{{PROPERTY_HIT_COUNT, "100"}}, {{PROPERTY_HIT_COUNT, "200"}}}));
 
     AssertExists(meta_storage_backend_.get(), {1, 2, 3}, {EC_OK, EC_OK, EC_OK}, /*is_exist*/ {true, true, false});
-    AssertGet(
+    AssertGetProperties(
         meta_storage_backend_.get(),
         {1, 2},
         {PROPERTY_URI, PROPERTY_HIT_COUNT},
@@ -67,21 +68,22 @@ TEST_F(MetaLocalBackendTest, TestSimple) {
     AssertListKeys(meta_storage_backend_.get(), SCAN_BASE_CURSOR, /*limit*/ 3, EC_OK, SCAN_BASE_CURSOR, {1, 2});
     AssertSampleReclaimKeys(meta_storage_backend_.get(), /*count*/ 1, EC_OK, {1, 2});
 
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->Delete({1}));
-    ASSERT_EQ((std::vector<ErrorCode>{EC_NOENT}), meta_storage_backend_->Delete({1}));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->Delete(nullptr, {1}));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_NOENT}), meta_storage_backend_->Delete(nullptr, {1}));
+    ASSERT_EQ(
+        (std::vector<ErrorCode>{EC_OK}),
+        PutWithFieldMaps(meta_storage_backend_.get(), {3}, {{{PROPERTY_URI, "uri3"}, {PROPERTY_HIT_COUNT, "300"}}}));
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
-              meta_storage_backend_->Put({3}, {{{PROPERTY_URI, "uri3"}, {PROPERTY_HIT_COUNT, "300"}}}));
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
-              meta_storage_backend_->UpdateFields({2}, {{{PROPERTY_URI, "uri2-updated"}}}));
+              UpdateWithFieldMaps(meta_storage_backend_.get(), {2}, {{{PROPERTY_URI, "uri2-updated"}}}));
 
     AssertExists(meta_storage_backend_.get(), {1, 2, 3}, {EC_OK, EC_OK, EC_OK}, /*is_exist*/ {false, true, true});
-    AssertGet(meta_storage_backend_.get(),
-              {1, 2, 3},
-              {PROPERTY_URI, PROPERTY_HIT_COUNT},
-              {EC_NOENT, EC_OK, EC_OK},
-              {{},
-               {{PROPERTY_URI, "uri2-updated"}, {PROPERTY_HIT_COUNT, "200"}},
-               {{PROPERTY_URI, "uri3"}, {PROPERTY_HIT_COUNT, "300"}}});
+    AssertGetProperties(meta_storage_backend_.get(),
+                        {1, 2, 3},
+                        {PROPERTY_URI, PROPERTY_HIT_COUNT},
+                        {EC_NOENT, EC_OK, EC_OK},
+                        {{},
+                         {{PROPERTY_URI, "uri2-updated"}, {PROPERTY_HIT_COUNT, "200"}},
+                         {{PROPERTY_URI, "uri3"}, {PROPERTY_HIT_COUNT, "300"}}});
     AssertListKeys(meta_storage_backend_.get(), SCAN_BASE_CURSOR, /*limit*/ 3, EC_OK, SCAN_BASE_CURSOR, {2, 3});
     AssertSampleReclaimKeys(meta_storage_backend_.get(), /*count*/ 1, EC_OK, {2, 3});
 
@@ -109,8 +111,8 @@ TEST_F(MetaLocalBackendTest, TestParseStorageUri) {
     ASSERT_EQ(50, backend->sample_times_);
 
     // Verify the backend is functional with custom parameters
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), backend->Put({1}, {{{PROPERTY_URI, "uri1"}}}));
-    AssertGet(backend.get(), {1}, {PROPERTY_URI}, {EC_OK}, {{{PROPERTY_URI, "uri1"}}});
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), PutWithFieldMaps(backend.get(), {1}, {{{PROPERTY_URI, "uri1"}}}));
+    AssertGetProperties(backend.get(), {1}, {PROPERTY_URI}, {EC_OK}, {{{PROPERTY_URI, "uri1"}}});
 
     ASSERT_EQ(EC_OK, backend->Close());
 }
@@ -128,8 +130,8 @@ TEST_F(MetaLocalBackendTest, TestParseStorageUriEmpty) {
     ASSERT_EQ(expected_shard_mask, backend->shard_mask_);
     ASSERT_EQ(META_LOCAL_BACKEND_DEFAULT_SAMPLE_TIMES, backend->sample_times_);
 
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), backend->Put({1}, {{{PROPERTY_URI, "uri1"}}}));
-    AssertGet(backend.get(), {1}, {PROPERTY_URI}, {EC_OK}, {{{PROPERTY_URI, "uri1"}}});
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), PutWithFieldMaps(backend.get(), {1}, {{{PROPERTY_URI, "uri1"}}}));
+    AssertGetProperties(backend.get(), {1}, {PROPERTY_URI}, {EC_OK}, {{{PROPERTY_URI, "uri1"}}});
 
     ASSERT_EQ(EC_OK, backend->Close());
 }
@@ -148,10 +150,11 @@ TEST_F(MetaLocalBackendTest, TestPut) {
     ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
 
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
-              meta_storage_backend_->Put({1, 2},
-                                         {{{PROPERTY_URI, "uri1"}, {PROPERTY_HIT_COUNT, "100"}},
-                                          {{PROPERTY_URI, "uri2"}, {PROPERTY_HIT_COUNT, "200"}}}));
-    AssertGet(
+              PutWithFieldMaps(meta_storage_backend_.get(),
+                               {1, 2},
+                               {{{PROPERTY_URI, "uri1"}, {PROPERTY_HIT_COUNT, "100"}},
+                                {{PROPERTY_URI, "uri2"}, {PROPERTY_HIT_COUNT, "200"}}}));
+    AssertGetProperties(
         meta_storage_backend_.get(),
         {1, 2},
         {PROPERTY_URI, PROPERTY_HIT_COUNT},
@@ -159,12 +162,13 @@ TEST_F(MetaLocalBackendTest, TestPut) {
         {{{PROPERTY_URI, "uri1"}, {PROPERTY_HIT_COUNT, "100"}}, {{PROPERTY_URI, "uri2"}, {PROPERTY_HIT_COUNT, "200"}}});
 
     // Put again to overwrite
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->Put({1}, {{{PROPERTY_URI, "uri1-new"}}}));
-    AssertGet(meta_storage_backend_.get(),
-              {1, 2},
-              {PROPERTY_URI},
-              {EC_OK, EC_OK},
-              {{{PROPERTY_URI, "uri1-new"}}, {{PROPERTY_URI, "uri2"}}});
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              PutWithFieldMaps(meta_storage_backend_.get(), {1}, {{{PROPERTY_URI, "uri1-new"}}}));
+    AssertGetProperties(meta_storage_backend_.get(),
+                        {1, 2},
+                        {PROPERTY_URI},
+                        {EC_OK, EC_OK},
+                        {{{PROPERTY_URI, "uri1-new"}}, {{PROPERTY_URI, "uri2"}}});
 
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
@@ -174,23 +178,26 @@ TEST_F(MetaLocalBackendTest, TestUpdateFields) {
     ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
 
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
-              meta_storage_backend_->Put({1, 2},
-                                         {{{PROPERTY_URI, "uri1"}, {PROPERTY_HIT_COUNT, "100"}},
-                                          {{PROPERTY_URI, "uri2"}, {PROPERTY_HIT_COUNT, "200"}}}));
+              PutWithFieldMaps(meta_storage_backend_.get(),
+                               {1, 2},
+                               {{{PROPERTY_URI, "uri1"}, {PROPERTY_HIT_COUNT, "100"}},
+                                {{PROPERTY_URI, "uri2"}, {PROPERTY_HIT_COUNT, "200"}}}));
 
     // Update uri only, lru_time should be preserved
-    ASSERT_EQ(
-        (std::vector<ErrorCode>{EC_OK, EC_OK}),
-        meta_storage_backend_->UpdateFields({1, 2}, {{{PROPERTY_URI, "uri1-updated"}}, {{PROPERTY_HIT_COUNT, "250"}}}));
-    AssertGet(meta_storage_backend_.get(),
-              {1, 2},
-              {PROPERTY_URI, PROPERTY_HIT_COUNT},
-              {EC_OK, EC_OK},
-              {{{PROPERTY_URI, "uri1-updated"}, {PROPERTY_HIT_COUNT, "100"}},
-               {{PROPERTY_URI, "uri2"}, {PROPERTY_HIT_COUNT, "250"}}});
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
+              UpdateWithFieldMaps(meta_storage_backend_.get(),
+                                  {1, 2},
+                                  {{{PROPERTY_URI, "uri1-updated"}}, {{PROPERTY_HIT_COUNT, "250"}}}));
+    AssertGetProperties(meta_storage_backend_.get(),
+                        {1, 2},
+                        {PROPERTY_URI, PROPERTY_HIT_COUNT},
+                        {EC_OK, EC_OK},
+                        {{{PROPERTY_URI, "uri1-updated"}, {PROPERTY_HIT_COUNT, "100"}},
+                         {{PROPERTY_URI, "uri2"}, {PROPERTY_HIT_COUNT, "250"}}});
 
     // Cannot update key that does not exist
-    ASSERT_EQ((std::vector<ErrorCode>{EC_NOENT}), meta_storage_backend_->UpdateFields({3}, {{{PROPERTY_URI, "uri3"}}}));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_NOENT}),
+              UpdateWithFieldMaps(meta_storage_backend_.get(), {3}, {{{PROPERTY_URI, "uri3"}}}));
 
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
@@ -200,23 +207,25 @@ TEST_F(MetaLocalBackendTest, TestUpsert) {
     ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
 
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
-              meta_storage_backend_->Put({1, 2},
-                                         {{{PROPERTY_URI, "uri1"}, {PROPERTY_HIT_COUNT, "100"}},
-                                          {{PROPERTY_URI, "uri2"}, {PROPERTY_HIT_COUNT, "200"}}}));
+              PutWithFieldMaps(meta_storage_backend_.get(),
+                               {1, 2},
+                               {{{PROPERTY_URI, "uri1"}, {PROPERTY_HIT_COUNT, "100"}},
+                                {{PROPERTY_URI, "uri2"}, {PROPERTY_HIT_COUNT, "200"}}}));
 
     // Upsert: update existing, insert new
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}),
-              meta_storage_backend_->Upsert(
+              UpsertWithFieldMaps(
+                  meta_storage_backend_.get(),
                   {1, 2, 3},
                   {{{PROPERTY_URI, "uri1-upserted"}}, {{PROPERTY_HIT_COUNT, "250"}}, {{PROPERTY_URI, "uri3-new"}}}));
     // Verify existing keys preserve unmodified fields
-    AssertGet(meta_storage_backend_.get(),
-              {1, 2, 3},
-              {PROPERTY_URI, PROPERTY_HIT_COUNT},
-              {EC_OK, EC_OK, EC_OK},
-              {{{PROPERTY_URI, "uri1-upserted"}, {PROPERTY_HIT_COUNT, "100"}},
-               {{PROPERTY_URI, "uri2"}, {PROPERTY_HIT_COUNT, "250"}},
-               {{PROPERTY_URI, "uri3-new"}}});
+    AssertGetProperties(meta_storage_backend_.get(),
+                        {1, 2, 3},
+                        {PROPERTY_URI, PROPERTY_HIT_COUNT},
+                        {EC_OK, EC_OK, EC_OK},
+                        {{{PROPERTY_URI, "uri1-upserted"}, {PROPERTY_HIT_COUNT, "100"}},
+                         {{PROPERTY_URI, "uri2"}, {PROPERTY_HIT_COUNT, "250"}},
+                         {{PROPERTY_URI, "uri3-new"}}});
 
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
@@ -226,10 +235,11 @@ TEST_F(MetaLocalBackendTest, TestDelete) {
     ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
 
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}),
-              meta_storage_backend_->Put(
-                  {1, 2, 3}, {{{PROPERTY_URI, "uri1"}}, {{PROPERTY_URI, "uri2"}}, {{PROPERTY_URI, "uri3"}}}));
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), meta_storage_backend_->Delete({1, 3}));
-    ASSERT_EQ((std::vector<ErrorCode>{EC_NOENT, EC_NOENT}), meta_storage_backend_->Delete({1, 3}));
+              PutWithFieldMaps(meta_storage_backend_.get(),
+                               {1, 2, 3},
+                               {{{PROPERTY_URI, "uri1"}}, {{PROPERTY_URI, "uri2"}}, {{PROPERTY_URI, "uri3"}}}));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), meta_storage_backend_->Delete(nullptr, {1, 3}));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_NOENT, EC_NOENT}), meta_storage_backend_->Delete(nullptr, {1, 3}));
     AssertExists(meta_storage_backend_.get(), {1, 2, 3}, {EC_OK, EC_OK, EC_OK}, /*is_exist*/ {false, true, false});
 
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
@@ -240,19 +250,20 @@ TEST_F(MetaLocalBackendTest, TestGet) {
     ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
 
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
-              meta_storage_backend_->Put({1, 2},
-                                         {{{PROPERTY_URI, "uri1"}, {PROPERTY_HIT_COUNT, "100"}},
-                                          {{PROPERTY_URI, "uri2"}, {PROPERTY_HIT_COUNT, "200"}}}));
+              PutWithFieldMaps(meta_storage_backend_.get(),
+                               {1, 2},
+                               {{{PROPERTY_URI, "uri1"}, {PROPERTY_HIT_COUNT, "100"}},
+                                {{PROPERTY_URI, "uri2"}, {PROPERTY_HIT_COUNT, "200"}}}));
 
     // Get single field
-    AssertGet(meta_storage_backend_.get(),
-              {1, 2},
-              {PROPERTY_URI},
-              {EC_OK, EC_OK},
-              {{{PROPERTY_URI, "uri1"}}, {{PROPERTY_URI, "uri2"}}});
+    AssertGetProperties(meta_storage_backend_.get(),
+                        {1, 2},
+                        {PROPERTY_URI},
+                        {EC_OK, EC_OK},
+                        {{{PROPERTY_URI, "uri1"}}, {{PROPERTY_URI, "uri2"}}});
 
     // Get all supported fields
-    AssertGet(
+    AssertGetProperties(
         meta_storage_backend_.get(),
         {1, 2},
         {PROPERTY_URI, PROPERTY_HIT_COUNT},
@@ -260,13 +271,13 @@ TEST_F(MetaLocalBackendTest, TestGet) {
         {{{PROPERTY_URI, "uri1"}, {PROPERTY_HIT_COUNT, "100"}}, {{PROPERTY_URI, "uri2"}, {PROPERTY_HIT_COUNT, "200"}}});
 
     // Get no fields
-    AssertGet(meta_storage_backend_.get(), {1, 2}, {}, {EC_OK, EC_OK}, FieldMapVec(2));
+    AssertGetProperties(meta_storage_backend_.get(), {1, 2}, {}, {EC_OK, EC_OK}, FieldMapVec(2));
 
     // Get non-existent key returns empty values
-    AssertGet(meta_storage_backend_.get(), {3}, {PROPERTY_URI, PROPERTY_HIT_COUNT}, {EC_NOENT}, {{}});
+    AssertGetProperties(meta_storage_backend_.get(), {3}, {PROPERTY_URI, PROPERTY_HIT_COUNT}, {EC_NOENT}, {{}});
 
     // Get unsupported field returns empty string
-    AssertGet(meta_storage_backend_.get(), {1}, {"unsupported_field"}, {EC_OK}, {{}});
+    AssertGetProperties(meta_storage_backend_.get(), {1}, {"unsupported_field"}, {EC_OK}, {{}});
 
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
@@ -276,9 +287,10 @@ TEST_F(MetaLocalBackendTest, TestGetAll) {
     ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
 
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
-              meta_storage_backend_->Put({1, 2},
-                                         {{{PROPERTY_URI, "uri1"}, {PROPERTY_HIT_COUNT, "100"}},
-                                          {{PROPERTY_URI, "uri2"}, {PROPERTY_HIT_COUNT, "200"}}}));
+              PutWithFieldMaps(meta_storage_backend_.get(),
+                               {1, 2},
+                               {{{PROPERTY_URI, "uri1"}, {PROPERTY_HIT_COUNT, "100"}},
+                                {{PROPERTY_URI, "uri2"}, {PROPERTY_HIT_COUNT, "200"}}}));
     // GetAllFields returns all stored fields plus a dynamically generated PROPERTY_LRU_TIME.
     // AssertGetAllFields skips PROPERTY_LRU_TIME value comparison (only checks existence).
     AssertGetAllFields(meta_storage_backend_.get(),
@@ -295,8 +307,9 @@ TEST_F(MetaLocalBackendTest, TestExists) {
     ASSERT_EQ(EC_OK, meta_storage_backend_->Init("test_instance_0", meta_storage_backend_config_));
     ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
 
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
-              meta_storage_backend_->Put({1, 2}, {{{PROPERTY_URI, "uri1"}}, {{PROPERTY_URI, "uri2"}}}));
+    ASSERT_EQ(
+        (std::vector<ErrorCode>{EC_OK, EC_OK}),
+        PutWithFieldMaps(meta_storage_backend_.get(), {1, 2}, {{{PROPERTY_URI, "uri1"}}, {{PROPERTY_URI, "uri2"}}}));
     AssertExists(meta_storage_backend_.get(), {1, 2, 3}, {EC_OK, EC_OK, EC_OK}, /*is_exist*/ {true, true, false});
 
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
@@ -306,9 +319,12 @@ TEST_F(MetaLocalBackendTest, TestListKeys) {
     ASSERT_EQ(EC_OK, meta_storage_backend_->Init("test_instance_0", meta_storage_backend_config_));
     ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
 
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->Put({1}, {{{PROPERTY_URI, "uri1"}}}));
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->Put({2}, {{{PROPERTY_URI, "uri2"}}}));
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->Put({3}, {{{PROPERTY_URI, "uri3"}}}));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              PutWithFieldMaps(meta_storage_backend_.get(), {1}, {{{PROPERTY_URI, "uri1"}}}));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              PutWithFieldMaps(meta_storage_backend_.get(), {2}, {{{PROPERTY_URI, "uri2"}}}));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              PutWithFieldMaps(meta_storage_backend_.get(), {3}, {{{PROPERTY_URI, "uri3"}}}));
 
     // List all keys
     AssertListKeys(meta_storage_backend_.get(),
@@ -325,8 +341,10 @@ TEST_F(MetaLocalBackendTest, TestSampleReclaimKeys) {
     ASSERT_EQ(EC_OK, meta_storage_backend_->Init("test_instance_0", meta_storage_backend_config_));
     ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
 
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->Put({1}, {{{PROPERTY_URI, "uri1"}}}));
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->Put({2}, {{{PROPERTY_URI, "uri2"}}}));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              PutWithFieldMaps(meta_storage_backend_.get(), {1}, {{{PROPERTY_URI, "uri1"}}}));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              PutWithFieldMaps(meta_storage_backend_.get(), {2}, {{{PROPERTY_URI, "uri2"}}}));
     AssertSampleReclaimKeys(meta_storage_backend_.get(), /*count*/ 0, EC_OK, {1, 2});
     AssertSampleReclaimKeys(meta_storage_backend_.get(), /*count*/ 1, EC_OK, {1, 2});
     AssertSampleReclaimKeys(meta_storage_backend_.get(), /*count*/ 2, EC_OK, {1, 2});
@@ -336,35 +354,37 @@ TEST_F(MetaLocalBackendTest, TestSampleReclaimKeys) {
 }
 
 TEST_F(MetaLocalBackendTest, TestMetaMemCacheItemFieldMap) {
-    // Verify MetaMemCacheItem stores all fields in a single FieldMap
-    MetaMemCacheItem::FieldMap fields = {{PROPERTY_URI, "test://some/long/uri/path/for/testing"},
-                                         {PROPERTY_HIT_COUNT, "1234567890"}};
+    // Verify MetaMemCacheItem stores locations and properties separately.
+    CacheLocationMap locations;
+    PropertyMap properties = {{PROPERTY_URI, "test://some/long/uri/path/for/testing"},
+                              {PROPERTY_HIT_COUNT, "1234567890"}};
 
-    MetaMemCacheItem *item = MetaMemCacheItem::Create(fields);
+    MetaMemCacheItem *item = MetaMemCacheItem::Create(locations, properties);
     ASSERT_NE(nullptr, item);
-    ASSERT_EQ("test://some/long/uri/path/for/testing", item->GetFields().at(PROPERTY_URI));
-    ASSERT_EQ("1234567890", item->GetFields().at(PROPERTY_HIT_COUNT));
-    ASSERT_EQ(2u, item->GetFields().size());
+    ASSERT_EQ("test://some/long/uri/path/for/testing", item->GetProperties().at(PROPERTY_URI));
+    ASSERT_EQ("1234567890", item->GetProperties().at(PROPERTY_HIT_COUNT));
+    ASSERT_EQ(2u, item->GetProperties().size());
+    ASSERT_TRUE(item->GetLocations().empty());
     // Size should be at least sizeof(MetaMemCacheItem) plus string heap overhead
     ASSERT_GE(item->Size(), sizeof(MetaMemCacheItem));
 
     MetaMemCacheItem::Deleter(item, nullptr);
 
     // Test with empty fields
-    MetaMemCacheItem *empty_item = MetaMemCacheItem::Create({});
+    MetaMemCacheItem *empty_item = MetaMemCacheItem::Create({}, {});
     ASSERT_NE(nullptr, empty_item);
-    ASSERT_TRUE(empty_item->GetFields().empty());
+    ASSERT_TRUE(empty_item->GetProperties().empty());
+    ASSERT_TRUE(empty_item->GetLocations().empty());
     ASSERT_EQ(sizeof(MetaMemCacheItem), empty_item->Size());
 
     MetaMemCacheItem::Deleter(empty_item, nullptr);
 
-    // Test with extra custom fields
-    MetaMemCacheItem::FieldMap custom_fields = {
-        {PROPERTY_URI, "uri1"}, {PROPERTY_HIT_COUNT, "100"}, {"custom_key", "custom_value"}};
-    MetaMemCacheItem *custom_item = MetaMemCacheItem::Create(custom_fields);
+    // Test with extra custom properties
+    PropertyMap custom_props = {{PROPERTY_URI, "uri1"}, {PROPERTY_HIT_COUNT, "100"}, {"custom_key", "custom_value"}};
+    MetaMemCacheItem *custom_item = MetaMemCacheItem::Create({}, custom_props);
     ASSERT_NE(nullptr, custom_item);
-    ASSERT_EQ(3u, custom_item->GetFields().size());
-    ASSERT_EQ("custom_value", custom_item->GetFields().at("custom_key"));
+    ASSERT_EQ(3u, custom_item->GetProperties().size());
+    ASSERT_EQ("custom_value", custom_item->GetProperties().at("custom_key"));
 
     MetaMemCacheItem::Deleter(custom_item, nullptr);
 }
@@ -375,23 +395,24 @@ TEST_F(MetaLocalBackendTest, TestRandomSample) {
 
     // No entries inserted, should return empty
     std::vector<MetaStorageBackend::KeyType> oldest_keys;
-    ErrorCode ret = meta_storage_backend_->RandomSample(5, oldest_keys);
+    ErrorCode ret = meta_storage_backend_->RandomSample(nullptr, 5, oldest_keys);
     ASSERT_EQ(EC_OK, ret);
     ASSERT_TRUE(oldest_keys.empty());
 
     // count = 0 should return OK with no keys
-    ret = meta_storage_backend_->RandomSample(0, oldest_keys);
+    ret = meta_storage_backend_->RandomSample(nullptr, 0, oldest_keys);
     ASSERT_EQ(EC_OK, ret);
     ASSERT_TRUE(oldest_keys.empty());
 
     // Insert multiple entries
     for (int64_t i = 1; i <= 20; ++i) {
         std::string uri = "uri" + std::to_string(i);
-        ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->Put({i}, {{{PROPERTY_URI, uri}}}));
+        ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+                  PutWithFieldMaps(meta_storage_backend_.get(), {i}, {{{PROPERTY_URI, uri}}}));
     }
 
     // RandomSample should return some keys
-    ret = meta_storage_backend_->RandomSample(5, oldest_keys);
+    ret = meta_storage_backend_->RandomSample(nullptr, 5, oldest_keys);
     ASSERT_EQ(EC_OK, ret);
     // The returned keys should be a subset of inserted keys
     for (const auto &key : oldest_keys) {
@@ -408,17 +429,17 @@ TEST_F(MetaLocalBackendTest, TestRandomSampleAfterDelete) {
     // Insert entries
     for (int64_t i = 1; i <= 10; ++i) {
         ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
-                  meta_storage_backend_->Put({i}, {{{PROPERTY_URI, "uri" + std::to_string(i)}}}));
+                  PutWithFieldMaps(meta_storage_backend_.get(), {i}, {{{PROPERTY_URI, "uri" + std::to_string(i)}}}));
     }
 
     // Delete some entries
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}), meta_storage_backend_->Delete({1, 3, 5}));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}), meta_storage_backend_->Delete(nullptr, {1, 3, 5}));
 
     // RandomSample should not return deleted keys
     std::set<int64_t> remaining_keys = {2, 4, 6, 7, 8, 9, 10};
 
     std::vector<MetaStorageBackend::KeyType> oldest_keys;
-    ErrorCode ret = meta_storage_backend_->RandomSample(10, oldest_keys);
+    ErrorCode ret = meta_storage_backend_->RandomSample(nullptr, 10, oldest_keys);
     ASSERT_EQ(EC_OK, ret);
     for (const auto &key : oldest_keys) {
         ASSERT_TRUE(remaining_keys.count(key) > 0) << "Deleted key " << key << " should not appear in oldest keys";
@@ -449,13 +470,14 @@ TEST_F(MetaLocalBackendTest, TestPutIfAbsent) {
 
     // Insert new keys should succeed
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
-              local_backend->PutIfAbsent({1, 2},
-                                         {{{PROPERTY_URI, "uri1"}, {PROPERTY_HIT_COUNT, "100"}},
-                                          {{PROPERTY_URI, "uri2"}, {PROPERTY_HIT_COUNT, "200"}}},
-                                         {EC_OK, EC_OK}));
+              PutIfAbsentWithFieldMaps(local_backend,
+                                       {1, 2},
+                                       {{{PROPERTY_URI, "uri1"}, {PROPERTY_HIT_COUNT, "100"}},
+                                        {{PROPERTY_URI, "uri2"}, {PROPERTY_HIT_COUNT, "200"}}},
+                                       {EC_OK, EC_OK}));
 
     // Verify inserted data
-    AssertGet(
+    AssertGetProperties(
         meta_storage_backend_.get(),
         {1, 2},
         {PROPERTY_URI, PROPERTY_HIT_COUNT},
@@ -464,13 +486,14 @@ TEST_F(MetaLocalBackendTest, TestPutIfAbsent) {
 
     // Insert again with same keys should return EC_EXIST and not overwrite
     ASSERT_EQ((std::vector<ErrorCode>{EC_EXIST, EC_EXIST}),
-              local_backend->PutIfAbsent({1, 2},
-                                         {{{PROPERTY_URI, "uri1-new"}, {PROPERTY_HIT_COUNT, "999"}},
-                                          {{PROPERTY_URI, "uri2-new"}, {PROPERTY_HIT_COUNT, "888"}}},
-                                         {EC_OK, EC_OK}));
+              PutIfAbsentWithFieldMaps(local_backend,
+                                       {1, 2},
+                                       {{{PROPERTY_URI, "uri1-new"}, {PROPERTY_HIT_COUNT, "999"}},
+                                        {{PROPERTY_URI, "uri2-new"}, {PROPERTY_HIT_COUNT, "888"}}},
+                                       {EC_OK, EC_OK}));
 
     // Verify original data is unchanged
-    AssertGet(
+    AssertGetProperties(
         meta_storage_backend_.get(),
         {1, 2},
         {PROPERTY_URI, PROPERTY_HIT_COUNT},
@@ -479,13 +502,14 @@ TEST_F(MetaLocalBackendTest, TestPutIfAbsent) {
 
     // Mixed: one existing key and one new key
     ASSERT_EQ((std::vector<ErrorCode>{EC_EXIST, EC_OK}),
-              local_backend->PutIfAbsent(
+              PutIfAbsentWithFieldMaps(
+                  local_backend,
                   {1, 3},
                   {{{PROPERTY_URI, "uri1-again"}}, {{PROPERTY_URI, "uri3"}, {PROPERTY_HIT_COUNT, "300"}}},
                   {EC_OK, EC_OK}));
 
     // Verify key 1 unchanged, key 3 inserted
-    AssertGet(
+    AssertGetProperties(
         meta_storage_backend_.get(),
         {1, 3},
         {PROPERTY_URI, PROPERTY_HIT_COUNT},
@@ -503,22 +527,24 @@ TEST_F(MetaLocalBackendTest, TestPutIfAbsentThenDelete) {
 
     // Insert a key
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
-              local_backend->PutIfAbsent({1}, {{{PROPERTY_URI, "uri1"}, {PROPERTY_HIT_COUNT, "100"}}}, {EC_OK, EC_OK}));
+              PutIfAbsentWithFieldMaps(
+                  local_backend, {1}, {{{PROPERTY_URI, "uri1"}, {PROPERTY_HIT_COUNT, "100"}}}, {EC_OK, EC_OK}));
 
     // Delete the key
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->Delete({1}));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->Delete(nullptr, {1}));
 
     // PutIfAbsent should succeed again after deletion
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
-              local_backend->PutIfAbsent(
-                  {1}, {{{PROPERTY_URI, "uri1-reinserted"}, {PROPERTY_HIT_COUNT, "200"}}}, {EC_OK, EC_OK}));
+    ASSERT_EQ(
+        (std::vector<ErrorCode>{EC_OK}),
+        PutIfAbsentWithFieldMaps(
+            local_backend, {1}, {{{PROPERTY_URI, "uri1-reinserted"}, {PROPERTY_HIT_COUNT, "200"}}}, {EC_OK, EC_OK}));
 
     // Verify the reinserted data
-    AssertGet(meta_storage_backend_.get(),
-              {1},
-              {PROPERTY_URI, PROPERTY_HIT_COUNT},
-              {EC_OK},
-              {{{PROPERTY_URI, "uri1-reinserted"}, {PROPERTY_HIT_COUNT, "200"}}});
+    AssertGetProperties(meta_storage_backend_.get(),
+                        {1},
+                        {PROPERTY_URI, PROPERTY_HIT_COUNT},
+                        {EC_OK},
+                        {{{PROPERTY_URI, "uri1-reinserted"}, {PROPERTY_HIT_COUNT, "200"}}});
 
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
@@ -536,13 +562,15 @@ TEST_F(MetaLocalBackendTest, TestLruTimeUpdatedByReadWriteOps) {
     // Helper lambda: get LRU time for a key via Get.
     auto getLruTime = [&](int64_t key) -> int64_t {
         FieldMapVec out;
-        auto ec = meta_storage_backend_->Get({key}, std::vector<std::string>{PROPERTY_LRU_TIME}, out);
+        auto ec =
+            meta_storage_backend_->GetProperties(nullptr, {key}, std::vector<std::string>{PROPERTY_LRU_TIME}, out);
         EXPECT_EQ((std::vector<ErrorCode>{EC_OK}), ec);
         return std::stoll(out[0][PROPERTY_LRU_TIME]);
     };
 
     // --- Put ---
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->Put({1}, {{{PROPERTY_URI, "uri1"}}}));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              PutWithFieldMaps(meta_storage_backend_.get(), {1}, {{{PROPERTY_URI, "uri1"}}}));
     int64_t lru_after_put = getLruTime(1);
     ASSERT_GT(lru_after_put, 0);
 
@@ -554,22 +582,26 @@ TEST_F(MetaLocalBackendTest, TestLruTimeUpdatedByReadWriteOps) {
     usleep(1000);
     FieldMapVec all_out;
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
-              meta_storage_backend_->Get({1}, std::vector<std::string>{PROPERTY_URI}, all_out));
+              meta_storage_backend_->GetProperties(nullptr, {1}, std::vector<std::string>{PROPERTY_URI}, all_out));
     ASSERT_EQ("uri1", all_out[0][PROPERTY_URI]);
     int64_t lru_after_get = getLruTime(1);
     ASSERT_GE(lru_after_get - lru_after_put, kMinTimeDiffUs) << "Get should update LRU time by >= 1000us";
 
     // --- GetAllFields updates LRU time ---
     usleep(1000);
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->GetAllFields({1}, all_out));
-    ASSERT_EQ("uri1", all_out[0][PROPERTY_URI]);
+    {
+        CacheLocationMapVector out_locs;
+        PropertyMapVector out_props;
+        ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->Get(nullptr, {1}, out_locs, out_props));
+        ASSERT_EQ("uri1", out_props[0][PROPERTY_URI]);
+    }
     int64_t lru_after_getall = getLruTime(1);
     ASSERT_GE(lru_after_getall - lru_after_get, kMinTimeDiffUs) << "GetAllFields should update LRU time by >= 1000us";
 
     // --- Exists updates LRU time ---
     usleep(1000);
     std::vector<bool> exist_vec;
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->Exists({1}, exist_vec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->Exists(nullptr, {1}, exist_vec));
     ASSERT_TRUE(exist_vec[0]);
     int64_t lru_after_exists = getLruTime(1);
     ASSERT_GE(lru_after_exists - lru_after_getall, kMinTimeDiffUs) << "Exists should update LRU time by >= 1000us";
@@ -577,20 +609,22 @@ TEST_F(MetaLocalBackendTest, TestLruTimeUpdatedByReadWriteOps) {
     // --- UpdateFields updates LRU time ---
     usleep(1000);
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
-              meta_storage_backend_->UpdateFields({1}, {{{PROPERTY_URI, "uri1-updated"}}}));
+              UpdateWithFieldMaps(meta_storage_backend_.get(), {1}, {{{PROPERTY_URI, "uri1-updated"}}}));
     int64_t lru_after_update = getLruTime(1);
     ASSERT_GE(lru_after_update - lru_after_exists, kMinTimeDiffUs)
         << "UpdateFields should update LRU time by >= 1000us";
 
     // --- Upsert updates LRU time ---
     usleep(1000);
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->Upsert({1}, {{{PROPERTY_URI, "uri1-upserted"}}}));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              UpsertWithFieldMaps(meta_storage_backend_.get(), {1}, {{{PROPERTY_URI, "uri1-upserted"}}}));
     int64_t lru_after_upsert = getLruTime(1);
     ASSERT_GE(lru_after_upsert - lru_after_update, kMinTimeDiffUs) << "Upsert should update LRU time by >= 1000us";
 
     // --- PutIfAbsent on new key ---
     usleep(1000);
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), local_backend->PutIfAbsent({2}, {{{PROPERTY_URI, "uri2"}}}, {EC_OK}));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              PutIfAbsentWithFieldMaps(local_backend, {2}, {{{PROPERTY_URI, "uri2"}}}, {EC_OK}));
     int64_t lru_key2 = getLruTime(2);
     ASSERT_GT(lru_key2, 0) << "PutIfAbsent should set LRU time on new key";
 
@@ -610,7 +644,8 @@ TEST_F(MetaLocalBackendTest, TestShardOldestAccessTimeEmptyToNonEmpty) {
     ASSERT_EQ(INT64_MAX, local_backend->shard_oldest_access_time_[1].load(std::memory_order_relaxed));
 
     // Insert a key.
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->Put({100}, {{{PROPERTY_URI, "uri100"}}}));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              PutWithFieldMaps(meta_storage_backend_.get(), {100}, {{{PROPERTY_URI, "uri100"}}}));
 
     // At least one shard should now have a non-INT64_MAX timestamp.
     bool any_updated = (local_backend->shard_oldest_access_time_[0].load(std::memory_order_relaxed) < INT64_MAX) ||
@@ -629,11 +664,12 @@ TEST_F(MetaLocalBackendTest, TestShardOldestAccessTimeNonEmptyToEmpty) {
     MetaLocalBackend *local_backend = GetLocalBackend();
 
     // Insert one key.
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->Put({1}, {{{PROPERTY_URI, "uri1"}}}));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              PutWithFieldMaps(meta_storage_backend_.get(), {1}, {{{PROPERTY_URI, "uri1"}}}));
     ASSERT_LT(local_backend->shard_oldest_access_time_[0].load(std::memory_order_relaxed), INT64_MAX);
 
     // Delete the key — shard becomes empty, timestamp should go back to INT64_MAX.
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->Delete({1}));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->Delete(nullptr, {1}));
     ASSERT_EQ(INT64_MAX, local_backend->shard_oldest_access_time_[0].load(std::memory_order_relaxed));
 
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
@@ -650,7 +686,7 @@ TEST_F(MetaLocalBackendTest, TestSampleReclaimKeysSelectsOldestShard) {
     // Insert keys into both shards.
     for (int64_t i = 1; i <= 100; ++i) {
         ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
-                  meta_storage_backend_->Put({i}, {{{PROPERTY_URI, "uri" + std::to_string(i)}}}));
+                  PutWithFieldMaps(meta_storage_backend_.get(), {i}, {{{PROPERTY_URI, "uri" + std::to_string(i)}}}));
     }
 
     // Both shards should have entries now.
@@ -662,17 +698,17 @@ TEST_F(MetaLocalBackendTest, TestSampleReclaimKeysSelectsOldestShard) {
     // Sleep and then access all keys via Get to make them "newer".
     for (int64_t i = 1; i <= 50; ++i) {
         FieldMapVec out;
-        meta_storage_backend_->Get({i}, std::vector<std::string>{PROPERTY_URI}, out);
+        meta_storage_backend_->GetProperties(nullptr, {i}, std::vector<std::string>{PROPERTY_URI}, out);
     }
     usleep(1000);
     for (int64_t i = 51; i <= 100; ++i) {
         FieldMapVec out;
-        meta_storage_backend_->Get({i}, std::vector<std::string>{PROPERTY_URI}, out);
+        meta_storage_backend_->GetProperties(nullptr, {i}, std::vector<std::string>{PROPERTY_URI}, out);
     }
 
     // Now SampleReclaimKeys should return keys.
     std::vector<MetaStorageBackend::KeyType> reclaim_keys;
-    ASSERT_EQ(EC_OK, meta_storage_backend_->SampleReclaimKeys(10, reclaim_keys));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->SampleReclaimKeys(nullptr, 10, reclaim_keys));
     ASSERT_FALSE(reclaim_keys.empty()) << "SampleReclaimKeys should return some keys";
 
     // All returned keys should be valid (subset of inserted keys).
@@ -690,7 +726,7 @@ TEST_F(MetaLocalBackendTest, TestSampleReclaimKeysEmptyCache) {
 
     // SampleReclaimKeys on empty cache should return OK with no keys.
     std::vector<MetaStorageBackend::KeyType> reclaim_keys;
-    ASSERT_EQ(EC_OK, meta_storage_backend_->SampleReclaimKeys(10, reclaim_keys));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->SampleReclaimKeys(nullptr, 10, reclaim_keys));
     ASSERT_TRUE(reclaim_keys.empty());
 
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
@@ -705,25 +741,27 @@ TEST_F(MetaLocalBackendTest, TestSampleReclaimKeysAfterDeleteUpdatesTimestamp) {
     MetaLocalBackend *local_backend = GetLocalBackend();
 
     // Insert two keys with a time gap.
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->Put({1}, {{{PROPERTY_URI, "uri1"}}}));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              PutWithFieldMaps(meta_storage_backend_.get(), {1}, {{{PROPERTY_URI, "uri1"}}}));
     usleep(1000);
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->Put({2}, {{{PROPERTY_URI, "uri2"}}}));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              PutWithFieldMaps(meta_storage_backend_.get(), {2}, {{{PROPERTY_URI, "uri2"}}}));
 
     int64_t ts_before_delete = local_backend->shard_oldest_access_time_[0].load(std::memory_order_relaxed);
 
     // Sample should return key 1 (oldest in LRU).
     std::vector<MetaStorageBackend::KeyType> reclaim_keys;
-    ASSERT_EQ(EC_OK, meta_storage_backend_->SampleReclaimKeys(1, reclaim_keys));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->SampleReclaimKeys(nullptr, 1, reclaim_keys));
     ASSERT_EQ(1u, reclaim_keys.size());
     ASSERT_EQ(1, reclaim_keys[0]);
 
     // Delete the sampled key.
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->Delete(reclaim_keys));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->Delete(nullptr, reclaim_keys));
 
     // After deletion, the shard's oldest timestamp should have changed.
     int64_t ts_after_delete = local_backend->shard_oldest_access_time_[0].load(std::memory_order_relaxed);
     ASSERT_GE(ts_after_delete, ts_before_delete) << "After deleting the oldest key, shard timestamp should advance";
-    ASSERT_EQ(EC_OK, meta_storage_backend_->SampleReclaimKeys(1, reclaim_keys));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->SampleReclaimKeys(nullptr, 1, reclaim_keys));
     ASSERT_EQ(1u, reclaim_keys.size());
     ASSERT_EQ(2, reclaim_keys[0]);
 
@@ -737,31 +775,31 @@ TEST_F(MetaLocalBackendTest, TestDeleteFields) {
     // Seed two keys: one with multiple location-prefixed fields, another with
     // a single location field plus a normal field.
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
-              meta_storage_backend_->Put(
-                  {1, 2},
-                  {{{LOCATION_PREFIX + "a", "la"}, {LOCATION_PREFIX + "b", "lb"}, {PROPERTY_URI, "u1"}},
-                   {{LOCATION_PREFIX + "c", "lc"}, {PROPERTY_URI, "u2"}}}));
+              PutWithFieldMaps(meta_storage_backend_.get(),
+                               {1, 2},
+                               {{{LOCATION_PREFIX + "a", "la"}, {LOCATION_PREFIX + "b", "lb"}, {PROPERTY_URI, "u1"}},
+                                {{LOCATION_PREFIX + "c", "lc"}, {PROPERTY_URI, "u2"}}}));
 
     // key 1: delete one of two location fields; key 2: delete its only
     // location field; key 3: does not exist -> EC_NOENT.
-    AssertDeleteFields(meta_storage_backend_.get(),
-                       {1, 2, 3},
-                       {{LOCATION_PREFIX + "a"}, {LOCATION_PREFIX + "c"}, {"anything"}},
-                       {EC_OK, EC_OK, EC_NOENT});
+    AssertDeleteLocations(meta_storage_backend_.get(),
+                          {1, 2, 3},
+                          {{LOCATION_PREFIX + "a"}, {LOCATION_PREFIX + "c"}, {"anything"}},
+                          {EC_OK, EC_OK, EC_NOENT});
 
     // Non-deleted fields survive.
-    AssertGet(meta_storage_backend_.get(),
-              {1, 2},
-              {LOCATION_PREFIX + "a", LOCATION_PREFIX + "b", PROPERTY_URI},
-              {EC_OK, EC_OK},
-              {{{LOCATION_PREFIX + "b", "lb"}, {PROPERTY_URI, "u1"}}, {{PROPERTY_URI, "u2"}}});
+    AssertGetProperties(meta_storage_backend_.get(),
+                        {1, 2},
+                        {LOCATION_PREFIX + "a", LOCATION_PREFIX + "b", PROPERTY_URI},
+                        {EC_OK, EC_OK},
+                        {{{LOCATION_PREFIX + "b", "lb"}, {PROPERTY_URI, "u1"}}, {{PROPERTY_URI, "u2"}}});
 
     // Deleting a non-existent field on an existing key still returns EC_OK.
-    AssertDeleteFields(meta_storage_backend_.get(), {1}, {{"not_exist_field"}}, {EC_OK});
+    AssertDeleteLocations(meta_storage_backend_.get(), {1}, {{"not_exist_field"}}, {EC_OK});
 
     // Empty field list on an existing key is a no-op (EC_OK).
-    AssertDeleteFields(meta_storage_backend_.get(), {2}, {{}}, {EC_OK});
-    AssertGet(meta_storage_backend_.get(), {2}, {PROPERTY_URI}, {EC_OK}, {{{PROPERTY_URI, "u2"}}});
+    AssertDeleteLocations(meta_storage_backend_.get(), {2}, {{}}, {EC_OK});
+    AssertGetProperties(meta_storage_backend_.get(), {2}, {PROPERTY_URI}, {EC_OK}, {{{PROPERTY_URI, "u2"}}});
 
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
@@ -772,15 +810,15 @@ TEST_F(MetaLocalBackendTest, TestExistsFieldWithPrefix) {
 
     // key 1: has LOCATION_PREFIX field; key 2: only normal fields; key 3: not exist.
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
-              meta_storage_backend_->Put(
-                  {1, 2}, {{{LOCATION_PREFIX + "a", "la"}, {PROPERTY_URI, "u1"}}, {{PROPERTY_URI, "u2"}}}));
+              PutWithFieldMaps(meta_storage_backend_.get(),
+                               {1, 2},
+                               {{{LOCATION_PREFIX + "a", "la"}, {PROPERTY_URI, "u1"}}, {{PROPERTY_URI, "u2"}}}));
 
-    AssertExistsFieldWithPrefix(
-        meta_storage_backend_.get(), {1, 2, 3}, LOCATION_PREFIX, {EC_OK, EC_OK, EC_NOENT}, {true, false, false});
+    AssertExistsLocation(meta_storage_backend_.get(), {1, 2, 3}, {EC_OK, EC_OK, EC_NOENT}, {true, false, false});
 
-    // After removing the only LOCATION_PREFIX field from key 1, prefix check is false.
-    AssertDeleteFields(meta_storage_backend_.get(), {1}, {{LOCATION_PREFIX + "a"}}, {EC_OK});
-    AssertExistsFieldWithPrefix(meta_storage_backend_.get(), {1}, LOCATION_PREFIX, {EC_OK}, {false});
+    // After removing the only location from key 1, location check is false.
+    AssertDeleteLocations(meta_storage_backend_.get(), {1}, {{"a"}}, {EC_OK});
+    AssertExistsLocation(meta_storage_backend_.get(), {1}, {EC_OK}, {false});
 
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
@@ -791,30 +829,30 @@ TEST_F(MetaLocalBackendTest, TestTombstoneNotTreatedAsValidLocation) {
     ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
 
     // Put key 1 with a real location and a tombstone (empty value) location.
-    ASSERT_EQ(
-        (std::vector<ErrorCode>{EC_OK}),
-        meta_storage_backend_->Put({1}, {{{LOCATION_PREFIX + "real", "valid_data"}, {LOCATION_PREFIX + "tomb", ""}}}));
-
-    // ExistsFieldWithPrefix should return true (real location exists).
-    AssertExistsFieldWithPrefix(meta_storage_backend_.get(), {1}, LOCATION_PREFIX, {EC_OK}, {true});
-
-    // GetFieldNamesWithPrefix should only return the non-tombstone field.
-    std::vector<std::vector<std::string>> field_names_vec;
-    auto ecs = meta_storage_backend_->GetFieldNamesWithPrefix({1}, LOCATION_PREFIX, field_names_vec);
-    ASSERT_EQ(EC_OK, ecs[0]);
-    ASSERT_EQ(1u, field_names_vec[0].size());
-    EXPECT_EQ(LOCATION_PREFIX + "real", field_names_vec[0][0]);
-
-    // Now update the real location to empty (tombstone it).
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
-              meta_storage_backend_->UpdateFields({1}, {{{LOCATION_PREFIX + "real", ""}}}));
+              PutWithFieldMaps(meta_storage_backend_.get(),
+                               {1},
+                               {{{LOCATION_PREFIX + "real", "valid_data"}, {LOCATION_PREFIX + "tomb", ""}}}));
 
-    // Both locations are now tombstones — should report no valid locations.
-    AssertExistsFieldWithPrefix(meta_storage_backend_.get(), {1}, LOCATION_PREFIX, {EC_OK}, {false});
-    field_names_vec.clear();
-    ecs = meta_storage_backend_->GetFieldNamesWithPrefix({1}, LOCATION_PREFIX, field_names_vec);
+    // ExistsLocation should return true (real location exists).
+    AssertExistsLocation(meta_storage_backend_.get(), {1}, {EC_OK}, {true});
+
+    // GetLocationIds should only return the non-tombstone location.
+    LocationIdsPerKey location_ids_vec;
+    auto ecs = meta_storage_backend_->GetLocationIds(nullptr, {1}, location_ids_vec);
     ASSERT_EQ(EC_OK, ecs[0]);
-    EXPECT_TRUE(field_names_vec[0].empty());
+    ASSERT_EQ(1u, location_ids_vec[0].size());
+    EXPECT_EQ("real", location_ids_vec[0][0]);
+
+    // Now delete the real location so only the tombstone remains.
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->DeleteLocations(nullptr, {1}, {{"real"}}));
+
+    // The only valid location was removed — should report no valid locations.
+    AssertExistsLocation(meta_storage_backend_.get(), {1}, {EC_OK}, {false});
+    location_ids_vec.clear();
+    ecs = meta_storage_backend_->GetLocationIds(nullptr, {1}, location_ids_vec);
+    ASSERT_EQ(EC_OK, ecs[0]);
+    EXPECT_TRUE(location_ids_vec[0].empty());
 
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
@@ -824,23 +862,31 @@ TEST_F(MetaLocalBackendTest, TestGetPerKeyFields) {
     ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
 
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
-              meta_storage_backend_->Put({1, 2},
-                                         {{{PROPERTY_URI, "uri1"}, {PROPERTY_HIT_COUNT, "100"}},
-                                          {{PROPERTY_URI, "uri2"}, {PROPERTY_HIT_COUNT, "200"}}}));
+              PutWithFieldMaps(meta_storage_backend_.get(),
+                               {1, 2},
+                               {{{PROPERTY_URI, "uri1"}, {PROPERTY_HIT_COUNT, "100"}},
+                                {{PROPERTY_URI, "uri2"}, {PROPERTY_HIT_COUNT, "200"}}}));
 
-    // Each key queries a different subset; key 3 does not exist.
-    FieldMapVec field_maps;
+    // Each key queries a specific property subset; key 3 does not exist.
+    // Note: the new API uses a uniform field_names for all keys, so we test
+    // each subset separately.
+    PropertyMapVector props_uri;
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_NOENT}),
-              meta_storage_backend_->Get(
-                  {1, 2, 3},
-                  std::vector<std::vector<std::string>>{{PROPERTY_URI}, {PROPERTY_HIT_COUNT}, {PROPERTY_URI}},
-                  field_maps));
-    ASSERT_EQ((FieldMapVec{{{PROPERTY_URI, "uri1"}}, {{PROPERTY_HIT_COUNT, "200"}}, {}}), field_maps);
+              meta_storage_backend_->GetProperties(nullptr, {1, 2, 3}, {PROPERTY_URI}, props_uri));
+    ASSERT_EQ("uri1", props_uri[0][PROPERTY_URI]);
+    ASSERT_EQ("uri2", props_uri[1][PROPERTY_URI]);
+    ASSERT_TRUE(props_uri[2].empty());
 
-    // Empty field list on existing key returns EC_OK with empty FieldMap.
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
-              meta_storage_backend_->Get({1}, std::vector<std::vector<std::string>>{{}}, field_maps));
-    ASSERT_EQ((FieldMapVec{{}}), field_maps);
+    PropertyMapVector props_hit;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
+              meta_storage_backend_->GetProperties(nullptr, {1, 2}, {PROPERTY_HIT_COUNT}, props_hit));
+    ASSERT_EQ("100", props_hit[0][PROPERTY_HIT_COUNT]);
+    ASSERT_EQ("200", props_hit[1][PROPERTY_HIT_COUNT]);
+
+    // Empty field list on existing key returns EC_OK with empty PropertyMap.
+    PropertyMapVector props_empty;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->GetProperties(nullptr, {1}, {}, props_empty));
+    ASSERT_TRUE(props_empty[0].empty());
 
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
@@ -852,18 +898,20 @@ TEST_F(MetaLocalBackendTest, TestConditionalDeleteFields) {
     MetaLocalBackend *local_backend = GetLocalBackend();
 
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
-              meta_storage_backend_->Put({1, 2},
-                                         {{{LOCATION_PREFIX + "a", "la"}, {PROPERTY_URI, "u1"}},
-                                          {{LOCATION_PREFIX + "b", "lb"}, {PROPERTY_URI, "u2"}}}));
+              PutWithFieldMaps(meta_storage_backend_.get(),
+                               {1, 2},
+                               {{{LOCATION_PREFIX + "a", "la"}, {PROPERTY_URI, "u1"}},
+                                {{LOCATION_PREFIX + "b", "lb"}, {PROPERTY_URI, "u2"}}}));
 
     // previous_error_codes[0]=EC_OK -> actually delete; [1]=EC_EXIST -> passthrough untouched.
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_EXIST}),
-              local_backend->DeleteFields({1, 2},
-                                          {{LOCATION_PREFIX + "a"}, {LOCATION_PREFIX + "b"}},
-                                          /*previous_error_codes*/ {EC_OK, EC_EXIST}));
+              local_backend->DeleteLocations(nullptr,
+                                             {1, 2},
+                                             {{"a"}, {"b"}},
+                                             /*previous_error_codes*/ {EC_OK, EC_EXIST}));
 
-    // Key 1's LOCATION_PREFIX field was removed, key 2's remains intact.
-    AssertExistsFieldWithPrefix(meta_storage_backend_.get(), {1, 2}, LOCATION_PREFIX, {EC_OK, EC_OK}, {false, true});
+    // Key 1's location was removed, key 2's remains intact.
+    AssertExistsLocation(meta_storage_backend_.get(), {1, 2}, {EC_OK, EC_OK}, {false, true});
 
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
@@ -881,7 +929,8 @@ TEST_F(MetaLocalBackendTest, TestConcurrentReadWrite) {
     constexpr int kNumReaders = 6;
 
     // Seed an initial entry so readers/writers always have something to operate on.
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->Put({kTestKey}, {{{PROPERTY_URI, "initial"}}}));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              PutWithFieldMaps(meta_storage_backend_.get(), {kTestKey}, {{{PROPERTY_URI, "initial"}}}));
 
     std::atomic<bool> stop{false};
     std::atomic<int> write_count{0};
@@ -892,11 +941,12 @@ TEST_F(MetaLocalBackendTest, TestConcurrentReadWrite) {
             std::string field_name = LOCATION_PREFIX + "w" + std::to_string(writer_id) + "_" + std::to_string(i);
             std::string field_value = "value_" + std::to_string(i);
 
-            auto update_ec = meta_storage_backend_->UpdateFields({kTestKey}, {{{field_name, field_value}}});
+            auto update_ec =
+                UpdateWithFieldMaps(meta_storage_backend_.get(), {kTestKey}, {{{field_name, field_value}}});
             ASSERT_EQ(1u, update_ec.size());
             ASSERT_EQ(EC_OK, update_ec[0]);
 
-            auto delete_ec = meta_storage_backend_->DeleteFields({kTestKey}, {{field_name}});
+            auto delete_ec = meta_storage_backend_->DeleteLocations(nullptr, {kTestKey}, {{field_name}});
             ASSERT_EQ(1u, delete_ec.size());
             ASSERT_EQ(EC_OK, delete_ec[0]);
 
@@ -904,33 +954,33 @@ TEST_F(MetaLocalBackendTest, TestConcurrentReadWrite) {
         }
     };
 
-    // Reader threads: exercise Get, GetAllFields, ExistsFieldWithPrefix, GetFieldNamesWithPrefix.
+    // Reader threads: exercise GetProperties, Get, ExistsLocation, GetLocationIds.
     auto reader_fn = [&](int /*reader_id*/) {
         for (int i = 0; i < kIterations && !stop.load(std::memory_order_relaxed); ++i) {
-            // Get with specific field names
-            FieldMapVec field_maps;
-            auto get_ec = meta_storage_backend_->Get({kTestKey}, {PROPERTY_URI}, field_maps);
+            // GetProperties with specific field names
+            PropertyMapVector prop_maps;
+            auto get_ec = meta_storage_backend_->GetProperties(nullptr, {kTestKey}, {PROPERTY_URI}, prop_maps);
             ASSERT_EQ(1u, get_ec.size());
             ASSERT_EQ(EC_OK, get_ec[0]);
 
-            // GetAllFields
-            FieldMapVec all_maps;
-            auto all_ec = meta_storage_backend_->GetAllFields({kTestKey}, all_maps);
+            // Get (full locations + properties)
+            CacheLocationMapVector out_locs;
+            PropertyMapVector out_props;
+            auto all_ec = meta_storage_backend_->Get(nullptr, {kTestKey}, out_locs, out_props);
             ASSERT_EQ(1u, all_ec.size());
             ASSERT_EQ(EC_OK, all_ec[0]);
 
-            // ExistsFieldWithPrefix
+            // ExistsLocation
             std::vector<bool> exists_vec;
-            auto exists_ec = meta_storage_backend_->ExistsFieldWithPrefix({kTestKey}, LOCATION_PREFIX, exists_vec);
+            auto exists_ec = meta_storage_backend_->ExistsLocation(nullptr, {kTestKey}, exists_vec);
             ASSERT_EQ(1u, exists_ec.size());
             ASSERT_EQ(EC_OK, exists_ec[0]);
 
-            // GetFieldNamesWithPrefix
-            std::vector<std::vector<std::string>> names_vec;
-            auto get_field_names_ec =
-                meta_storage_backend_->GetFieldNamesWithPrefix({kTestKey}, LOCATION_PREFIX, names_vec);
-            ASSERT_EQ(1u, get_field_names_ec.size());
-            ASSERT_EQ(EC_OK, get_field_names_ec[0]);
+            // GetLocationIds
+            LocationIdsPerKey loc_ids;
+            auto get_loc_ids_ec = meta_storage_backend_->GetLocationIds(nullptr, {kTestKey}, loc_ids);
+            ASSERT_EQ(1u, get_loc_ids_ec.size());
+            ASSERT_EQ(EC_OK, get_loc_ids_ec[0]);
         }
     };
 
@@ -951,8 +1001,8 @@ TEST_F(MetaLocalBackendTest, TestConcurrentReadWrite) {
     ASSERT_EQ(kNumWriters * kIterations, write_count.load());
 
     // The initial PROPERTY_URI field should still be intact.
-    FieldMapVec final_maps;
-    auto final_ec = meta_storage_backend_->Get({kTestKey}, {PROPERTY_URI}, final_maps);
+    PropertyMapVector final_maps;
+    auto final_ec = meta_storage_backend_->GetProperties(nullptr, {kTestKey}, {PROPERTY_URI}, final_maps);
     ASSERT_EQ(EC_OK, final_ec[0]);
     ASSERT_EQ("initial", final_maps[0][PROPERTY_URI]);
 
@@ -975,7 +1025,7 @@ TEST_F(MetaLocalBackendTest, TestChargeAdjustment) {
     constexpr size_t kMapNodeOverhead = sizeof(void *) * 4;
 
     // Insert a key with a small field.
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), backend->Put({1}, {{{PROPERTY_URI, "v"}}}));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), PutWithFieldMaps(backend.get(), {1}, {{{PROPERTY_URI, "v"}}}));
     size_t usage_after_put = backend->GetMemUsage();
 
     // --- UpdateFields: add a new field ---
@@ -983,7 +1033,8 @@ TEST_F(MetaLocalBackendTest, TestChargeAdjustment) {
     std::string field_name_a = "field_a";
     std::string field_value_a(1024, 'x');
     ssize_t expected_delta_add = static_cast<ssize_t>(field_name_a.size() + field_value_a.size() + kMapNodeOverhead);
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), backend->UpdateFields({1}, {{{field_name_a, field_value_a}}}));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              UpdateWithFieldMaps(backend.get(), {1}, {{{field_name_a, field_value_a}}}));
     size_t usage_after_add = backend->GetMemUsage();
     ASSERT_EQ(static_cast<ssize_t>(usage_after_add - usage_after_put), expected_delta_add);
 
@@ -992,7 +1043,8 @@ TEST_F(MetaLocalBackendTest, TestChargeAdjustment) {
     std::string field_value_a_short = "short";
     ssize_t expected_delta_shrink =
         static_cast<ssize_t>(field_value_a_short.size()) - static_cast<ssize_t>(field_value_a.size());
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), backend->UpdateFields({1}, {{{field_name_a, field_value_a_short}}}));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              UpdateWithFieldMaps(backend.get(), {1}, {{{field_name_a, field_value_a_short}}}));
     size_t usage_after_shrink = backend->GetMemUsage();
     ASSERT_EQ(static_cast<ssize_t>(usage_after_shrink) - static_cast<ssize_t>(usage_after_add), expected_delta_shrink);
 
@@ -1000,7 +1052,8 @@ TEST_F(MetaLocalBackendTest, TestChargeAdjustment) {
     std::string field_name_b = "field_b";
     std::string field_value_b(512, 'y');
     ssize_t expected_delta_upsert = static_cast<ssize_t>(field_name_b.size() + field_value_b.size() + kMapNodeOverhead);
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), backend->Upsert({1}, {{{field_name_b, field_value_b}}}));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              UpsertWithFieldMaps(backend.get(), {1}, {{{field_name_b, field_value_b}}}));
     size_t usage_after_upsert = backend->GetMemUsage();
     ASSERT_EQ(static_cast<ssize_t>(usage_after_upsert - usage_after_shrink), expected_delta_upsert);
 
@@ -1008,7 +1061,7 @@ TEST_F(MetaLocalBackendTest, TestChargeAdjustment) {
     // Expected delta: -(field_name.size() + field_value.size() + kMapNodeOverhead)
     ssize_t expected_delta_delete =
         -static_cast<ssize_t>(field_name_b.size() + field_value_b.size() + kMapNodeOverhead);
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), backend->DeleteFields({1}, {{field_name_b}}));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), backend->DeleteLocations(nullptr, {1}, {{field_name_b}}));
     size_t usage_after_delete = backend->GetMemUsage();
     ASSERT_EQ(static_cast<ssize_t>(usage_after_delete) - static_cast<ssize_t>(usage_after_upsert),
               expected_delta_delete);
@@ -1021,7 +1074,7 @@ TEST_F(MetaLocalBackendTest, TestChargeAdjustment) {
 
     // Verify the remaining data is intact.
     FieldMapVec out;
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), backend->Get({1}, {PROPERTY_URI, field_name_a}, out));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), backend->GetProperties(nullptr, {1}, {PROPERTY_URI, field_name_a}, out));
     ASSERT_EQ("v", out[0][PROPERTY_URI]);
     ASSERT_EQ(field_value_a_short, out[0][field_name_a]);
 
@@ -1043,25 +1096,25 @@ TEST_F(MetaLocalBackendTest, TestStrictCapacityInsertFails) {
     const size_t capacity = backend->cache_->GetCapacity(); // 1 MB
 
     // Insert a small entry first to verify basic functionality.
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), backend->Put({1}, {{{PROPERTY_URI, "small"}}}));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), PutWithFieldMaps(backend.get(), {1}, {{{PROPERTY_URI, "small"}}}));
 
     // Try to insert an entry whose charge exceeds the entire capacity.
     std::string huge_value(capacity + 1, 'A');
-    auto results = backend->Put({2}, {{{PROPERTY_URI, huge_value}}});
+    auto results = PutWithFieldMaps(backend.get(), {2}, {{{PROPERTY_URI, huge_value}}});
     ASSERT_EQ(EC_NOSPC, results[0]);
 
     // The small entry should still be readable
     FieldMapVec out;
-    auto get_ec = backend->Get({1}, {PROPERTY_URI}, out);
+    auto get_ec = backend->GetProperties(nullptr, {1}, {PROPERTY_URI}, out);
     ASSERT_TRUE(EC_OK == get_ec[0]);
 
     FieldMapVec out2;
-    auto get_ec2 = backend->Get({2}, {PROPERTY_URI}, out2);
+    auto get_ec2 = backend->GetProperties(nullptr, {2}, {PROPERTY_URI}, out2);
     ASSERT_EQ(EC_NOENT, get_ec2[0]);
 
     // A reasonably-sized entry should succeed after the failed attempt.
     std::string normal_value(1024, 'B');
-    auto retry = backend->Put({3}, {{{PROPERTY_URI, normal_value}}});
+    auto retry = PutWithFieldMaps(backend.get(), {3}, {{{PROPERTY_URI, normal_value}}});
     ASSERT_EQ(EC_OK, retry[0]);
 
     ASSERT_EQ(EC_OK, backend->Close());

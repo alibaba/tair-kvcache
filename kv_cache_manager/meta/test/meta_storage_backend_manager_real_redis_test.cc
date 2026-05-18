@@ -100,7 +100,7 @@ public:
 
     // Best-effort Delete; swallow NOENT so repeated runs against the same
     // redis instance stay idempotent even when a previous run aborted midway.
-    static void Cleanup(MetaStorageBackendManager &mgr, const KeyVector &keys) { mgr.Delete(keys); }
+    static void Cleanup(MetaStorageBackendManager &mgr, const KeyVector &keys) { mgr.Delete(nullptr, keys); }
 
 protected:
     std::shared_ptr<RequestContext> request_context_;
@@ -188,7 +188,7 @@ TEST_F(MetaStorageBackendManagerRealRedisTest, TestSingleBackendCrud) {
     // through persistent (redis) to discover keys with no remaining locations.
     LocationIdsPerKey loc_ids = {{"loc_20001"}, {"loc_20002"}};
     int32_t reclaimed = 0;
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), mgr.Delete(keys, loc_ids, reclaimed));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), mgr.Delete(nullptr, keys, loc_ids, reclaimed));
     ASSERT_EQ(2, reclaimed);
 
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), mgr.Exists(keys, exists_vec));
@@ -272,7 +272,7 @@ TEST_F(MetaStorageBackendManagerRealRedisTest, TestRecoverWriteDualWriteAndDelet
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.Put(request_context_.get(), batch));
 
     // Delete in Recover -> tombstone recorded.
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.Delete(keys));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.Delete(nullptr, keys));
     {
         std::lock_guard<std::mutex> lock(mgr.deleted_keys_mutex_);
         ASSERT_EQ(1u, mgr.deleted_keys_.count(40042));

@@ -128,13 +128,38 @@ class MultiLocationTest(abc.ABC, TestBase, unittest.TestCase):
         # Delete all GroupA location files
         self._delete_cache_locations(locs_a, list(range(len(locs_a))))
 
-        # Wait for async prune to detect and clean stale locations
-        time.sleep(2)
+        # Poll until tp0 is fully pruned (query triggers lazy detection).
+        # Each query submits async prune requests; retry to wait for them
+        # to take effect in the meta indexer.
+        max_attempts = 5
+        for attempt in range(max_attempts):
+            resp = self._prefix_query(block_keys)
+            if len(resp["locations"]) != 3:
+                if attempt < max_attempts - 1:
+                    time.sleep(2)
+                    continue
+                self.fail(
+                    f"blocks should still be queryable via GroupB location, "
+                    f"got {len(resp['locations'])} after {max_attempts} attempts")
 
-        # Query: trigger prune detection via SelectForMatch
-        resp = self._prefix_query(block_keys)
-        self.assertEqual(len(resp["locations"]), 3,
-                         "blocks should still be queryable via GroupB location")
+            all_specs = set()
+            for loc in resp["locations"]:
+                for s in loc["location_specs"]:
+                    all_specs.add(s["name"])
+
+            if "tp0" not in all_specs:
+                # tp0 fully pruned — success
+                break
+
+            if attempt < max_attempts - 1:
+                logging.info(
+                    "attempt %d: tp0 still present, waiting for async "
+                    "prune to complete...", attempt + 1)
+                time.sleep(2)
+            else:
+                self.fail(
+                    f"tp0 specs still present after {max_attempts} attempts; "
+                    f"async prune did not complete in time")
 
         # Verify only tp1 specs remain (tp0 was pruned)
         for loc in resp["locations"]:

@@ -59,11 +59,11 @@ public:
     // ---------- WRITE ----------
     Result Put(RequestContext *request_context,
                const KeyVector &keys,
-               LocationMapVector &location_maps,
+               CacheLocationMapVector &location_maps,
                PropertyMapVector &properties) noexcept;
     Result Update(RequestContext *request_context,
                   const KeyVector &keys,
-                  LocationMapVector &location_maps,
+                  CacheLocationMapVector &location_maps,
                   PropertyMapVector &properties) noexcept;
     Result Delete(RequestContext *request_context, const KeyVector &keys) noexcept;
     // Block-level RMW: modifier sees only existing location id list per key.
@@ -80,10 +80,11 @@ public:
     Result Exist(RequestContext *request_context, const KeyVector &keys, std::vector<bool> &out_exists) noexcept;
     Result Get(RequestContext *request_context,
                const KeyVector &keys,
-               LocationMapVector &out_location_maps,
+               CacheLocationMapVector &out_location_maps,
                PropertyMapVector &out_properties) noexcept;
-    Result
-    GetLocations(RequestContext *request_context, const KeyVector &keys, LocationMapVector &out_location_maps) noexcept;
+    Result GetLocations(RequestContext *request_context,
+                        const KeyVector &keys,
+                        CacheLocationMapVector &out_location_maps) noexcept;
     LocationResult GetLocations(RequestContext *request_context,
                                 const KeyVector &keys,
                                 const LocationIdsPerKey &location_ids,
@@ -92,8 +93,11 @@ public:
                          const KeyVector &keys,
                          const std::vector<std::string> &property_names,
                          PropertyMapVector &out_properties) noexcept;
-    ErrorCode
-    Scan(const std::string &cursor, const size_t limit, std::string &out_next_cursor, KeyVector &out_keys) noexcept;
+    ErrorCode Scan(RequestContext *request_context,
+                   const std::string &cursor,
+                   const size_t limit,
+                   std::string &out_next_cursor,
+                   KeyVector &out_keys) noexcept;
     ErrorCode RandomSample(RequestContext *request_context, const size_t count, KeyVector &out_keys) const noexcept;
     ErrorCode
     SampleReclaimKeys(RequestContext *request_context, const int64_t count, KeyVector &out_keys) const noexcept;
@@ -116,7 +120,7 @@ private:
 private:
     std::vector<BatchMetaData> MakeBatches(const KeyVector &keys,
                                            const LocationIdsPerKey &location_ids,
-                                           LocationMapVector &locations,
+                                           CacheLocationMapVector &locations,
                                            PropertyMapVector &properties) const noexcept;
 
     ErrorCode RecoverMetaData() noexcept;
@@ -155,6 +159,7 @@ private:
                                                  Result &result) noexcept;
     // Returns {error_count, delete_success_count}.
     std::pair<int32_t, int32_t> ExecuteRmwDelete(const std::string &trace_id,
+                                                 RequestContext *request_context,
                                                  const BatchMetaData &delete_batch,
                                                  const KeyVector &all_keys,
                                                  RmwStats &stats,

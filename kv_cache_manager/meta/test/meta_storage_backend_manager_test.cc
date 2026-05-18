@@ -76,7 +76,7 @@ public:
     // bypass the manager and write straight to persistent_backend_. Without
     // this merge the persistent side would only carry block-level properties
     // and later GetLocations fallbacks would find no location fields -> the
-    // caller's map::at on the returned LocationMapVector would throw.
+    // caller's map::at on the returned CacheLocationMapVector would throw.
     static void SerializeLocationsIntoProperties(BatchMetaData &batch) {
         if (batch.batch_locations.empty()) {
             return;
@@ -169,7 +169,7 @@ TEST_F(MetaStorageBackendManagerTest, TestPutAndGetLocationsRoundTrip) {
     }
 
     // GetLocations must deserialize back into the same (id, uri) pairs.
-    LocationMapVector out_locations;
+    CacheLocationMapVector out_locations;
     auto get_ecs = mgr.GetLocations(request_context_.get(), keys, out_locations);
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}), get_ecs);
     ASSERT_EQ(keys.size(), out_locations.size());
@@ -182,8 +182,8 @@ TEST_F(MetaStorageBackendManagerTest, TestPutAndGetLocationsRoundTrip) {
     }
 
     // Block-level properties should be preserved alongside the location fields.
-    FieldMapVec field_maps;
-    auto field_ecs = mgr.Get(keys, {"p0"}, field_maps);
+    PropertyMapVector field_maps;
+    auto field_ecs = mgr.GetProperties(nullptr, keys, {"p0"}, field_maps);
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}), field_ecs);
     for (size_t i = 0; i < keys.size(); ++i) {
         ASSERT_EQ("p0_" + std::to_string(keys[i]), field_maps[i].at("p0"));
@@ -210,13 +210,13 @@ TEST_F(MetaStorageBackendManagerTest, TestDeleteLocationFieldsReclaimsEmptyKeys)
     // reclaimed by MaybeReclaimEmptyKeys.
     LocationIdsPerKey location_ids = {{"loc_10"}, {"loc_20"}};
     int32_t reclaimed = 0;
-    auto del_ecs = mgr.Delete(keys, location_ids, reclaimed);
+    auto del_ecs = mgr.Delete(nullptr, keys, location_ids, reclaimed);
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), del_ecs);
     ASSERT_EQ(2, reclaimed);
 
     // After reclaim both keys must be gone.
     std::vector<bool> exists_vec;
-    auto exists_ecs = mgr.Exists(keys, exists_vec);
+    auto exists_ecs = mgr.Exists(nullptr, keys, exists_vec);
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), exists_ecs);
     ASSERT_EQ((std::vector<bool>{false, false}), exists_vec);
 
@@ -243,7 +243,7 @@ TEST_F(MetaStorageBackendManagerTest, TestListKeysAndRandomSample) {
     for (int i = 0; i < 20 && seen.size() < keys.size(); ++i) {
         std::string next;
         KeyTypeVec out;
-        ASSERT_EQ(EC_OK, mgr.ListKeys(cursor, /*limit*/ 50, next, out));
+        ASSERT_EQ(EC_OK, mgr.ListKeys(nullptr, cursor, /*limit*/ 50, next, out));
         for (auto k : out) {
             seen.insert(k);
         }
@@ -258,7 +258,7 @@ TEST_F(MetaStorageBackendManagerTest, TestListKeysAndRandomSample) {
 
     // RandomSample should return at most `count` keys from the set above.
     KeyTypeVec sampled;
-    ASSERT_EQ(EC_OK, mgr.RandomSample(/*count*/ 1, sampled));
+    ASSERT_EQ(EC_OK, mgr.RandomSample(nullptr, /*count*/ 1, sampled));
     ASSERT_LE(sampled.size(), 1u);
 
     ASSERT_EQ(EC_OK, mgr.Close());
@@ -326,25 +326,25 @@ TEST_F(MetaStorageBackendManagerTest, TestSingleBackendCrud) {
     auto batch = MakeBatch(keys);
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), mgr.Put(request_context_.get(), batch));
 
-    FieldMapVec field_maps;
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), mgr.Get(keys, {"p0"}, field_maps));
+    PropertyMapVector field_maps;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), mgr.GetProperties(nullptr, keys, {"p0"}, field_maps));
     ASSERT_EQ("p0_1", field_maps[0].at("p0"));
 
     std::vector<bool> exists_vec;
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), mgr.Exists(keys, exists_vec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), mgr.Exists(nullptr, keys, exists_vec));
     ASSERT_EQ((std::vector<bool>{true, true}), exists_vec);
 
-    LocationMapVector out_locs;
+    CacheLocationMapVector out_locs;
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), mgr.GetLocations(request_context_.get(), keys, out_locs));
     ASSERT_EQ("uri_1", out_locs[0].at("loc_1").location_specs().front().uri());
 
     // Delete location field -> reclaim path resolves emptiness via persistent.
     LocationIdsPerKey loc_ids = {{"loc_1"}, {"loc_2"}};
     int32_t reclaimed = 0;
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), mgr.Delete(keys, loc_ids, reclaimed));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), mgr.Delete(nullptr, keys, loc_ids, reclaimed));
     ASSERT_EQ(2, reclaimed);
 
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), mgr.Exists(keys, exists_vec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), mgr.Exists(nullptr, keys, exists_vec));
     ASSERT_EQ((std::vector<bool>{false, false}), exists_vec);
 
     ASSERT_EQ(EC_OK, mgr.Close());
@@ -374,26 +374,27 @@ TEST_F(MetaStorageBackendManagerTest, TestRecoverReadFallbackToPersistent) {
     auto extra_batch = MakeBatch(extra);
     SerializeLocationsIntoProperties(extra_batch);
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
-              mgr.persistent_backend_->Put(extra_batch.batch_keys, extra_batch.batch_properties));
+              mgr.persistent_backend_->Put(
+                  nullptr, extra_batch.batch_keys, extra_batch.batch_locations, extra_batch.batch_properties));
 
     // Flip back to Recover to force the local-miss -> persistent-fallback path.
     mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover, std::memory_order_release);
 
     KeyVector keys = {1, 2, 3};
-    FieldMapVec fms;
-    auto ecs = mgr.Get(keys, {"p0"}, fms);
+    PropertyMapVector fms;
+    auto ecs = mgr.GetProperties(nullptr, keys, {"p0"}, fms);
     ASSERT_EQ(EC_OK, ecs[0]);
     ASSERT_EQ(EC_OK, ecs[1]);
     ASSERT_EQ("p0_1", fms[0].at("p0"));
     ASSERT_EQ("p0_2", fms[1].at("p0"));
 
     std::vector<bool> exists_vec;
-    auto exists_ecs = mgr.Exists(keys, exists_vec);
+    auto exists_ecs = mgr.Exists(nullptr, keys, exists_vec);
     ASSERT_EQ(EC_OK, exists_ecs[0]);
     ASSERT_EQ(EC_OK, exists_ecs[1]);
     ASSERT_EQ((std::vector<bool>{true, true, false}), exists_vec);
 
-    LocationMapVector locs;
+    CacheLocationMapVector locs;
     auto loc_ecs = mgr.GetLocations(request_context_.get(), KeyVector{1, 2}, locs);
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), loc_ecs);
     ASSERT_EQ("uri_2", locs[1].at("loc_2").location_specs().front().uri());
@@ -428,19 +429,20 @@ TEST_F(MetaStorageBackendManagerTest, TestRecoverWriteDualWriteAndDeleteTombston
     auto batch = MakeBatch(keys);
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.Put(request_context_.get(), batch));
 
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.Delete(keys));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.Delete(nullptr, keys));
     {
         std::lock_guard<std::mutex> lock(mgr.deleted_keys_mutex_);
         ASSERT_EQ(1u, mgr.deleted_keys_.count(42));
     }
 
-    // Simulate a late backfill racing after Delete: BackfillKeysToLocal must
+    // Simulate a late backfill racing after Delete: BackfillKeysToCache must
     // see the tombstone and refuse to reinsert the key into local.
-    FieldMapVec stale_fms(1);
-    stale_fms[0]["p0"] = "stale";
-    ASSERT_EQ(0, mgr.BackfillKeysToCache(keys, stale_fms, {EC_OK}));
+    CacheLocationMapVector stale_locs(1);
+    PropertyMapVector stale_props(1);
+    stale_props[0]["p0"] = "stale";
+    ASSERT_EQ(0, mgr.BackfillKeysToCache(keys, stale_locs, stale_props, {EC_OK}));
     std::vector<bool> exists_vec;
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.cache_backend_->Exists(keys, exists_vec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.cache_backend_->Exists(nullptr, keys, exists_vec));
     ASSERT_FALSE(exists_vec[0]);
 
     // UpdateFields under Recover hydrates missing keys via EnsureKeyInLocal
@@ -449,8 +451,9 @@ TEST_F(MetaStorageBackendManagerTest, TestRecoverWriteDualWriteAndDeleteTombston
     KeyVector k7 = {7};
     auto batch7 = MakeBatch(k7);
     SerializeLocationsIntoProperties(batch7);
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
-              mgr.persistent_backend_->Put(batch7.batch_keys, batch7.batch_properties));
+    ASSERT_EQ(
+        (std::vector<ErrorCode>{EC_OK}),
+        mgr.persistent_backend_->Put(nullptr, batch7.batch_keys, batch7.batch_locations, batch7.batch_properties));
 
     BatchMetaData update_batch;
     update_batch.batch_keys = k7;
@@ -458,8 +461,8 @@ TEST_F(MetaStorageBackendManagerTest, TestRecoverWriteDualWriteAndDeleteTombston
     update_batch.batch_properties[0]["p0"] = "p0_7_updated";
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.UpdateFields(request_context_.get(), update_batch));
 
-    FieldMapVec fms;
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.Get(k7, {"p0"}, fms));
+    PropertyMapVector fms;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.GetProperties(nullptr, k7, {"p0"}, fms));
     ASSERT_EQ("p0_7_updated", fms[0].at("p0"));
 
     ASSERT_EQ(EC_OK, mgr.Close());
@@ -484,14 +487,15 @@ TEST_F(MetaStorageBackendManagerTest, TestRunningReadLocalOnly) {
     // not know about it; in Running state reads must not see it.
     KeyVector k2 = {2};
     auto b2 = MakeBatch(k2);
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.persistent_backend_->Put(b2.batch_keys, b2.batch_properties));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+              mgr.persistent_backend_->Put(nullptr, b2.batch_keys, b2.batch_locations, b2.batch_properties));
 
     std::vector<bool> exists_vec;
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), mgr.Exists(KeyVector{1, 2}, exists_vec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), mgr.Exists(nullptr, KeyVector{1, 2}, exists_vec));
     ASSERT_EQ((std::vector<bool>{true, false}), exists_vec);
 
-    FieldMapVec fms;
-    auto ecs = mgr.Get(KeyVector{2}, {"p0"}, fms);
+    PropertyMapVector fms;
+    auto ecs = mgr.GetProperties(nullptr, KeyVector{2}, {"p0"}, fms);
     // Local miss: EC_OK with empty map OR EC_NOENT, both must not leak the
     // persistent-only entry.
     ASSERT_TRUE(ecs[0] == EC_NOENT || (ecs[0] == EC_OK && fms[0].empty()));
@@ -538,7 +542,7 @@ TEST_F(MetaStorageBackendManagerTest, TestEmptyInputsAreNoOp) {
     WaitRunning(mgr);
 
     int32_t reclaimed = -1;
-    auto del_ecs = mgr.Delete(/*keys*/ {}, /*location_ids*/ {}, reclaimed);
+    auto del_ecs = mgr.Delete(nullptr, /*keys*/ {}, /*location_ids*/ {}, reclaimed);
     ASSERT_TRUE(del_ecs.empty());
     ASSERT_EQ(0, reclaimed);
 
@@ -566,24 +570,22 @@ TEST_F(MetaStorageBackendManagerTest, TestGetLocationIdsIgnoresTombstone) {
 
     // Verify GetLocationIds returns the real location.
     LocationIdsPerKey loc_ids;
-    auto ecs = mgr.GetLocationIds(keys, loc_ids);
+    auto ecs = mgr.GetLocationIds(nullptr, keys, loc_ids);
     ASSERT_EQ(EC_OK, ecs[0]);
     ASSERT_EQ(1u, loc_ids[0].size());
     EXPECT_EQ("loc_10", loc_ids[0][0]);
 
-    // Now overwrite the location field with an empty value (tombstone) via
-    // UpdateFields on the persistent backend directly, then invalidate cache.
-    FieldMapVec tombstone_fields = {{{LOCATION_PREFIX + "loc_10", ""}}};
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.persistent_backend_->UpdateFields(keys, tombstone_fields));
+    // Now delete the location via DeleteLocations on both backends directly.
+    LocationIdsPerKey del_loc_ids = {{"loc_10"}};
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.persistent_backend_->DeleteLocations(nullptr, keys, del_loc_ids));
     if (mgr.cache_backend_) {
-        FieldMapVec cache_tomb = {{{LOCATION_PREFIX + "loc_10", ""}}};
-        mgr.cache_backend_->UpdateFields(keys, cache_tomb);
+        mgr.cache_backend_->DeleteLocations(nullptr, keys, del_loc_ids);
     }
 
     // GetLocationIds should now return EC_OK with empty location ids
     // (key still exists but has no valid non-tombstone locations).
     loc_ids.clear();
-    ecs = mgr.GetLocationIds(keys, loc_ids);
+    ecs = mgr.GetLocationIds(nullptr, keys, loc_ids);
     ASSERT_EQ(EC_OK, ecs[0]);
     EXPECT_TRUE(loc_ids[0].empty());
 
@@ -608,13 +610,13 @@ TEST_F(MetaStorageBackendManagerTest, TestDeleteEmptyLocationIdsIsNoOp) {
     // Delete with empty location_ids should be a no-op → EC_OK, 0 reclaimed.
     int32_t reclaimed = -1;
     LocationIdsPerKey empty_ids = {{}};
-    auto del_ecs = mgr.Delete(keys, empty_ids, reclaimed);
+    auto del_ecs = mgr.Delete(nullptr, keys, empty_ids, reclaimed);
     ASSERT_EQ(EC_OK, del_ecs[0]);
     ASSERT_EQ(0, reclaimed);
 
     // The original location should still exist.
     LocationIdsPerKey loc_ids;
-    auto get_ecs = mgr.GetLocationIds(keys, loc_ids);
+    auto get_ecs = mgr.GetLocationIds(nullptr, keys, loc_ids);
     ASSERT_EQ(EC_OK, get_ecs[0]);
     ASSERT_EQ(1u, loc_ids[0].size());
     EXPECT_EQ("loc_20", loc_ids[0][0]);
@@ -640,13 +642,13 @@ TEST_F(MetaStorageBackendManagerTest, TestMaybeReclaimEmptyKeysAfterLastLocation
     // Delete that location → the key should be auto-reclaimed.
     int32_t reclaimed = 0;
     LocationIdsPerKey ids = {{"loc_30"}};
-    auto del_ecs = mgr.Delete(keys, ids, reclaimed);
+    auto del_ecs = mgr.Delete(nullptr, keys, ids, reclaimed);
     ASSERT_EQ(EC_OK, del_ecs[0]);
     EXPECT_EQ(1, reclaimed);
 
     // The key should no longer exist.
     std::vector<bool> exists_vec;
-    auto exists_ecs = mgr.Exists(keys, exists_vec);
+    auto exists_ecs = mgr.Exists(nullptr, keys, exists_vec);
     ASSERT_EQ(EC_OK, exists_ecs[0]);
     EXPECT_FALSE(exists_vec[0]);
 
@@ -685,7 +687,7 @@ TEST_F(MetaStorageBackendManagerTest, TestMultiKeyMultiLocationGradualDeletion) 
 
     // Verify each key now has 3 locations.
     {
-        LocationMapVector out_locations;
+        CacheLocationMapVector out_locations;
         auto get_ecs = mgr.GetLocations(request_context_.get(), keys, out_locations);
         for (size_t i = 0; i < keys.size(); ++i) {
             ASSERT_EQ(EC_OK, get_ecs[i]) << "key=" << keys[i];
@@ -701,18 +703,18 @@ TEST_F(MetaStorageBackendManagerTest, TestMultiKeyMultiLocationGradualDeletion) 
             {"loc_60"},
         };
         int32_t reclaimed = -1;
-        auto del_ecs = mgr.Delete(keys, del_ids, reclaimed);
+        auto del_ecs = mgr.Delete(nullptr, keys, del_ids, reclaimed);
         ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}), del_ecs);
         EXPECT_EQ(0, reclaimed) << "keys still have 2 locations each, none should be reclaimed";
 
         // All keys should still exist.
         std::vector<bool> exists_vec;
-        auto exists_ecs = mgr.Exists(keys, exists_vec);
+        auto exists_ecs = mgr.Exists(nullptr, keys, exists_vec);
         ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}), exists_ecs);
         ASSERT_EQ((std::vector<bool>{true, true, true}), exists_vec);
 
         // Each key should have exactly 2 remaining locations.
-        LocationMapVector out_locations;
+        CacheLocationMapVector out_locations;
         auto get_ecs = mgr.GetLocations(request_context_.get(), keys, out_locations);
         for (size_t i = 0; i < keys.size(); ++i) {
             ASSERT_EQ(EC_OK, get_ecs[i]);
@@ -728,18 +730,18 @@ TEST_F(MetaStorageBackendManagerTest, TestMultiKeyMultiLocationGradualDeletion) 
             {"loc_60_b"},
         };
         int32_t reclaimed = -1;
-        auto del_ecs = mgr.Delete(keys, del_ids, reclaimed);
+        auto del_ecs = mgr.Delete(nullptr, keys, del_ids, reclaimed);
         ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}), del_ecs);
         EXPECT_EQ(0, reclaimed) << "keys still have 1 location each, none should be reclaimed";
 
         // All keys should still exist.
         std::vector<bool> exists_vec;
-        auto exists_ecs = mgr.Exists(keys, exists_vec);
+        auto exists_ecs = mgr.Exists(nullptr, keys, exists_vec);
         ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}), exists_ecs);
         ASSERT_EQ((std::vector<bool>{true, true, true}), exists_vec);
 
         // Each key should have exactly 1 remaining location.
-        LocationMapVector out_locations;
+        CacheLocationMapVector out_locations;
         auto get_ecs = mgr.GetLocations(request_context_.get(), keys, out_locations);
         for (size_t i = 0; i < keys.size(); ++i) {
             ASSERT_EQ(EC_OK, get_ecs[i]);
@@ -758,13 +760,13 @@ TEST_F(MetaStorageBackendManagerTest, TestMultiKeyMultiLocationGradualDeletion) 
             {"loc_60_c"},
         };
         int32_t reclaimed = -1;
-        auto del_ecs = mgr.Delete(keys, del_ids, reclaimed);
+        auto del_ecs = mgr.Delete(nullptr, keys, del_ids, reclaimed);
         ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}), del_ecs);
         EXPECT_EQ(3, reclaimed) << "all 3 keys should be reclaimed after last location deleted";
 
         // All keys should be gone.
         std::vector<bool> exists_vec;
-        auto exists_ecs = mgr.Exists(keys, exists_vec);
+        auto exists_ecs = mgr.Exists(nullptr, keys, exists_vec);
         ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}), exists_ecs);
         ASSERT_EQ((std::vector<bool>{false, false, false}), exists_vec);
     }
@@ -808,7 +810,7 @@ TEST_F(MetaStorageBackendManagerTest, TestMultiKeyPartialReclamation) {
 
     // Verify initial state: key70=2, key80=3, key90=1
     {
-        LocationMapVector out_locations;
+        CacheLocationMapVector out_locations;
         auto get_ecs = mgr.GetLocations(request_context_.get(), keys, out_locations);
         ASSERT_EQ(EC_OK, get_ecs[0]);
         ASSERT_EQ(EC_OK, get_ecs[1]);
@@ -827,7 +829,7 @@ TEST_F(MetaStorageBackendManagerTest, TestMultiKeyPartialReclamation) {
             {"loc_90"},                         // key90: only 1 deleted → reclaimed
         };
         int32_t reclaimed = -1;
-        auto del_ecs = mgr.Delete(keys, del_ids, reclaimed);
+        auto del_ecs = mgr.Delete(nullptr, keys, del_ids, reclaimed);
         ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}), del_ecs);
         EXPECT_EQ(2, reclaimed) << "key80 and key90 should be reclaimed";
     }
@@ -835,7 +837,7 @@ TEST_F(MetaStorageBackendManagerTest, TestMultiKeyPartialReclamation) {
     // Verify: key70 still exists with 1 location, key80 and key90 are gone.
     {
         std::vector<bool> exists_vec;
-        auto exists_ecs = mgr.Exists(keys, exists_vec);
+        auto exists_ecs = mgr.Exists(nullptr, keys, exists_vec);
         ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}), exists_ecs);
         EXPECT_TRUE(exists_vec[0]) << "key70 should still exist";
         EXPECT_FALSE(exists_vec[1]) << "key80 should be reclaimed";
@@ -844,7 +846,7 @@ TEST_F(MetaStorageBackendManagerTest, TestMultiKeyPartialReclamation) {
 
     // key70 should have exactly 1 remaining location.
     {
-        LocationMapVector out_locations;
+        CacheLocationMapVector out_locations;
         auto get_ecs = mgr.GetLocations(request_context_.get(), {70}, out_locations);
         ASSERT_EQ(EC_OK, get_ecs[0]);
         ASSERT_EQ(1u, out_locations[0].size());

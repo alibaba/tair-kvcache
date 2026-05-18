@@ -96,13 +96,25 @@ ErrorCode MetaDummyBackend::Open() noexcept {
             continue;
         }
 
-        // parse block data
+        // parse block data: reconstruct DummyItem from serialized FieldMap
         KeyType key;
         if (!StringUtil::StrToInt64(k.c_str(), key)) {
             KVCM_LOG_ERROR("parse key to int64_t failed, path: [%s], raw key string: [%s]", path_.c_str(), k.c_str());
             return ErrorCode::EC_ERROR;
         }
-        table_.Emplace(key, std::move(parsed_v));
+        DummyItem item;
+        for (auto &[field_name, field_value] : parsed_v) {
+            if (field_name.rfind(LOCATION_PREFIX, 0) == 0) {
+                std::string loc_id = field_name.substr(LOCATION_PREFIX.size());
+                CacheLocation loc;
+                if (loc.FromJsonString(field_value)) {
+                    item.locations[loc_id] = std::move(loc);
+                }
+            } else {
+                item.properties[field_name] = std::move(field_value);
+            }
+        }
+        table_.Emplace(key, std::move(item));
     }
 
     return ErrorCode::EC_OK;
@@ -121,9 +133,16 @@ ErrorCode MetaDummyBackend::PersistToPath() {
 
     std::map<std::string, std::string> persist_table;
 
-    // block data
-    table_.ForEachKV([&](const KeyType &key, const FieldMap &field_map) {
-        persist_table[std::to_string(key)] = Jsonizable::ToJsonString(field_map);
+    // block data: serialize each DummyItem as a FieldMap with locations serialized as JSON values
+    table_.ForEachKV([&](const KeyType &key, const DummyItem &item) {
+        FieldMap serialized;
+        for (const auto &[loc_id, loc] : item.locations) {
+            serialized[LOCATION_PREFIX + loc_id] = loc.ToJsonString();
+        }
+        for (const auto &[prop_name, prop_value] : item.properties) {
+            serialized[prop_name] = prop_value;
+        }
+        persist_table[std::to_string(key)] = Jsonizable::ToJsonString(serialized);
         return true;
     });
 
@@ -142,319 +161,271 @@ ErrorCode MetaDummyBackend::PersistToPath() {
     return ErrorCode::EC_OK;
 }
 
-std::vector<ErrorCode> MetaDummyBackend::Put(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept {
-    if (keys.size() != field_maps.size()) {
-        KVCM_LOG_ERROR("put failed, keys.size: [%zu] != field_maps.size: [%zu]", keys.size(), field_maps.size());
-        return std::vector<ErrorCode>(keys.size(), ErrorCode::EC_BADARGS);
-    }
+// ---------------------------------------------------------------------------
+// Write operations
+// ---------------------------------------------------------------------------
 
-    std::vector<ErrorCode> ec_vec;
-    for (std::size_t i = 0; i != keys.size(); ++i) {
-        ec_vec.emplace_back(PutForOneKey(keys[i], field_maps[i]));
-        if (ec_vec.back() != ErrorCode::EC_OK) {
-            KVCM_LOG_WARN("put failed, key: [%" PRIi64 "], error code: [%" PRIi32 "]",
-                          keys[i],
-                          static_cast<std::int32_t>(ec_vec.back()));
-        }
-    }
-    return ec_vec;
-}
-
-ErrorCode MetaDummyBackend::PutForOneKey(const KeyType &key, const FieldMap &field_map) {
+std::vector<ErrorCode> MetaDummyBackend::Put(RequestContext * /*request_context*/,
+                                             const KeyTypeVec &keys,
+                                             const CacheLocationMapVector &locations,
+                                             const PropertyMapVector &properties) noexcept {
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
     std::lock_guard<std::mutex> guard(mutex_);
-    FieldMap enriched_map = field_map;
-    enriched_map[PROPERTY_LRU_TIME] = std::to_string(TimestampUtil::GetCurrentTimeUs());
-    table_.Upsert(key, std::move(enriched_map));
-    return PersistToPath();
+    for (size_t i = 0; i < keys.size(); ++i) {
+        DummyItem item;
+        item.locations = locations[i];
+        item.properties = properties[i];
+        item.properties[PROPERTY_LRU_TIME] = std::to_string(TimestampUtil::GetCurrentTimeUs());
+        table_.Upsert(keys[i], std::move(item));
+    }
+    PersistToPath();
+    return results;
 }
 
-std::vector<ErrorCode> MetaDummyBackend::UpdateFields(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept {
-    if (keys.size() != field_maps.size()) {
-        KVCM_LOG_ERROR("update fields failed, keys.size[%zu] != field_maps.size[%zu]", keys.size(), field_maps.size());
-        return std::vector<ErrorCode>(keys.size(), ErrorCode::EC_BADARGS);
-    }
-    std::vector<ErrorCode> ec_vec;
-    for (std::size_t i = 0; i != keys.size(); ++i) {
-        ec_vec.emplace_back(UpdateFieldsForOneKey(keys[i], field_maps[i]));
-        if (ec_vec.back() != ErrorCode::EC_OK && ec_vec.back() != ErrorCode::EC_NOENT) {
-            KVCM_LOG_WARN("update fields failed, key: [%" PRIi64 "], ec:[%" PRIi32 "]",
-                          keys[i],
-                          static_cast<std::int32_t>(ec_vec.back()));
-        }
-    }
-    return ec_vec;
-}
-
-ErrorCode MetaDummyBackend::UpdateFieldsForOneKey(const KeyType &key, const FieldMap &field_map) {
+std::vector<ErrorCode> MetaDummyBackend::Upsert(RequestContext * /*request_context*/,
+                                                const KeyTypeVec &keys,
+                                                const CacheLocationMapVector &locations,
+                                                const PropertyMapVector &properties) noexcept {
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
     std::lock_guard<std::mutex> guard(mutex_);
-    const bool found = table_.FindAndModify(key, [&](FieldMap &existing_map) {
-        for (const auto &[field_name, field_value] : field_map) {
-            existing_map[field_name] = field_value;
-        }
-        existing_map[PROPERTY_LRU_TIME] = std::to_string(TimestampUtil::GetCurrentTimeUs());
-    });
-    if (!found) {
-        KVCM_LOG_WARN("update fields failed due to key cannot be found, key: [%" PRIi64 "]", key);
-        return ErrorCode::EC_NOENT;
-    }
-    return PersistToPath();
-}
-
-std::vector<ErrorCode> MetaDummyBackend::Upsert(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept {
-    if (keys.size() != field_maps.size()) {
-        KVCM_LOG_ERROR("upsert failed, keys.size: [%zu] != field_maps.size: [%zu]", keys.size(), field_maps.size());
-        return std::vector<ErrorCode>(keys.size(), ErrorCode::EC_BADARGS);
-    }
-
-    std::vector<ErrorCode> ec_vec;
-    for (std::size_t i = 0; i != keys.size(); ++i) {
-        ec_vec.emplace_back(UpsertForOneKey(keys[i], field_maps[i]));
-        if (ec_vec.back() != ErrorCode::EC_OK) {
-            KVCM_LOG_WARN("upsert failed, key: [%" PRIi64 "], error code: [%" PRIi32 "]", keys[i], ec_vec.back());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const bool found = table_.FindAndModify(keys[i], [&](DummyItem &existing) {
+            for (const auto &[loc_id, loc] : locations[i]) {
+                existing.locations[loc_id] = loc;
+            }
+            for (const auto &[prop_name, prop_value] : properties[i]) {
+                existing.properties[prop_name] = prop_value;
+            }
+            existing.properties[PROPERTY_LRU_TIME] = std::to_string(TimestampUtil::GetCurrentTimeUs());
+        });
+        if (!found) {
+            DummyItem item;
+            item.locations = locations[i];
+            item.properties = properties[i];
+            item.properties[PROPERTY_LRU_TIME] = std::to_string(TimestampUtil::GetCurrentTimeUs());
+            table_.Upsert(keys[i], std::move(item));
         }
     }
-    return ec_vec;
+    PersistToPath();
+    return results;
 }
 
-ErrorCode MetaDummyBackend::UpsertForOneKey(const KeyType &key, const FieldMap &field_map) {
+std::vector<ErrorCode> MetaDummyBackend::Update(RequestContext * /*request_context*/,
+                                                const KeyTypeVec &keys,
+                                                const CacheLocationMapVector &locations,
+                                                const PropertyMapVector &properties) noexcept {
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
     std::lock_guard<std::mutex> guard(mutex_);
-    const std::string current_time_str = std::to_string(TimestampUtil::GetCurrentTimeUs());
-    const bool found = table_.FindAndModify(key, [&](FieldMap &existing_map) {
-        for (const auto &[field_name, field_value] : field_map) {
-            existing_map[field_name] = field_value;
-        }
-        existing_map[PROPERTY_LRU_TIME] = current_time_str;
-    });
-    if (!found) {
-        FieldMap enriched_map = field_map;
-        enriched_map[PROPERTY_LRU_TIME] = current_time_str;
-        table_.Upsert(key, std::move(enriched_map));
-    }
-    return PersistToPath();
-}
-
-std::vector<ErrorCode> MetaDummyBackend::Delete(const KeyTypeVec &keys) noexcept {
-    std::vector<ErrorCode> ec_vec;
-    for (const KeyType &key : keys) {
-        ec_vec.emplace_back(DeleteForOneKey(key));
-        if (ec_vec.back() != ErrorCode::EC_OK && ec_vec.back() != ErrorCode::EC_NOENT) {
-            KVCM_LOG_WARN("delete failed, key: [%" PRIi64 "], error code: [%" PRIi32 "]",
-                          key,
-                          static_cast<std::int32_t>(ec_vec.back()));
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const bool found = table_.FindAndModify(keys[i], [&](DummyItem &existing) {
+            for (const auto &[loc_id, loc] : locations[i]) {
+                existing.locations[loc_id] = loc;
+            }
+            for (const auto &[prop_name, prop_value] : properties[i]) {
+                existing.properties[prop_name] = prop_value;
+            }
+            existing.properties[PROPERTY_LRU_TIME] = std::to_string(TimestampUtil::GetCurrentTimeUs());
+        });
+        if (!found) {
+            results[i] = EC_NOENT;
         }
     }
-    return ec_vec;
+    PersistToPath();
+    return results;
 }
 
-ErrorCode MetaDummyBackend::DeleteForOneKey(const KeyType &key) {
+std::vector<ErrorCode> MetaDummyBackend::Delete(RequestContext * /*request_context*/, const KeyTypeVec &keys) noexcept {
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
     std::lock_guard<std::mutex> guard(mutex_);
-    if (!table_.Contains(key)) {
-        return ErrorCode::EC_NOENT;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (!table_.Contains(keys[i])) {
+            results[i] = EC_NOENT;
+        } else {
+            table_.Erase(keys[i]);
+        }
     }
-    table_.Erase(key);
-    return PersistToPath();
+    PersistToPath();
+    return results;
 }
 
-std::vector<ErrorCode>
-MetaDummyBackend::DeleteFields(const KeyTypeVec &keys,
-                               const std::vector<std::vector<std::string>> &field_names_vec) noexcept {
-    if (keys.size() != field_names_vec.size()) {
-        KVCM_LOG_ERROR("delete fields failed, keys.size: [%zu] != field_names_vec.size: [%zu]",
-                       keys.size(),
-                       field_names_vec.size());
-        return std::vector<ErrorCode>(keys.size(), ErrorCode::EC_BADARGS);
-    }
-    std::vector<ErrorCode> ec_vec;
-    for (std::size_t i = 0; i != keys.size(); ++i) {
-        if (field_names_vec[i].empty()) {
-            ec_vec.emplace_back(ErrorCode::EC_OK); // Nothing to delete — idempotent success.
+std::vector<ErrorCode> MetaDummyBackend::DeleteLocations(RequestContext * /*request_context*/,
+                                                         const KeyTypeVec &keys,
+                                                         const LocationIdsPerKey &location_ids) noexcept {
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    std::lock_guard<std::mutex> guard(mutex_);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (location_ids[i].empty()) {
             continue;
         }
-        ec_vec.emplace_back(DeleteFieldsForOneKey(keys[i], field_names_vec[i]));
-        if (ec_vec.back() != ErrorCode::EC_OK && ec_vec.back() != ErrorCode::EC_NOENT) {
-            KVCM_LOG_WARN("delete fields failed, key: [%" PRIi64 "], error code: [%" PRIi32 "]",
-                          keys[i],
-                          static_cast<std::int32_t>(ec_vec.back()));
-        }
-    }
-    return ec_vec;
-}
-
-ErrorCode MetaDummyBackend::DeleteFieldsForOneKey(const KeyType &key, const std::vector<std::string> &field_names) {
-    std::lock_guard<std::mutex> guard(mutex_);
-    const bool found = table_.FindAndModify(key, [&](FieldMap &existing_map) {
-        for (const auto &field_name : field_names) {
-            existing_map.erase(field_name);
-        }
-    });
-    if (!found) {
-        return ErrorCode::EC_NOENT;
-    }
-    return PersistToPath();
-}
-
-std::vector<ErrorCode> MetaDummyBackend::Get(const KeyTypeVec &keys,
-                                             const std::vector<std::string> &field_names,
-                                             FieldMapVec &out_field_maps) noexcept {
-    std::vector<ErrorCode> ec_vec;
-    out_field_maps = FieldMapVec(keys.size());
-    for (std::size_t i = 0; i != keys.size(); ++i) {
-        ec_vec.emplace_back(GetForOneKey(keys[i], field_names, out_field_maps[i]));
-        if (ec_vec.back() != ErrorCode::EC_OK && ec_vec.back() != ErrorCode::EC_NOENT) {
-            KVCM_LOG_WARN("get failed, key: [%" PRIi64 "], error code: [%" PRIi32 "]",
-                          keys[i],
-                          static_cast<std::int32_t>(ec_vec.back()));
-        }
-    }
-    return ec_vec;
-}
-
-std::vector<ErrorCode> MetaDummyBackend::Get(const KeyTypeVec &keys,
-                                             const std::vector<std::vector<std::string>> &field_names_vec,
-                                             FieldMapVec &out_field_maps) noexcept {
-    out_field_maps = FieldMapVec(keys.size());
-    if (keys.size() != field_names_vec.size()) {
-        KVCM_LOG_ERROR(
-            "get failed, keys.size: [%zu] != field_names_vec.size: [%zu]", keys.size(), field_names_vec.size());
-        return std::vector<ErrorCode>(keys.size(), ErrorCode::EC_BADARGS);
-    }
-    std::vector<ErrorCode> ec_vec;
-    for (std::size_t i = 0; i != keys.size(); ++i) {
-        ec_vec.emplace_back(GetForOneKey(keys[i], field_names_vec[i], out_field_maps[i]));
-        if (ec_vec.back() != ErrorCode::EC_OK && ec_vec.back() != ErrorCode::EC_NOENT) {
-            KVCM_LOG_WARN("get failed, key: [%" PRIi64 "], error code: [%" PRIi32 "]",
-                          keys[i],
-                          static_cast<std::int32_t>(ec_vec.back()));
-        }
-    }
-    return ec_vec;
-}
-
-ErrorCode MetaDummyBackend::GetForOneKey(const KeyType &key,
-                                         const std::vector<std::string> &field_names,
-                                         FieldMap &out_field_map) {
-    out_field_map.clear();
-    const bool found = table_.FindAndApply(key, [&](const FieldMap &field_table) {
-        for (const auto &field_name : field_names) {
-            const auto field_iter = field_table.find(field_name);
-            if (field_iter != field_table.end()) {
-                out_field_map[field_name] = field_iter->second;
+        const bool found = table_.FindAndModify(keys[i], [&](DummyItem &existing) {
+            for (const auto &loc_id : location_ids[i]) {
+                existing.locations.erase(loc_id);
             }
-        }
-    });
-    if (!found) {
-        return ErrorCode::EC_NOENT;
-    }
-    // Update last access time after reading the stored value
-    table_.FindAndModify(key, [](FieldMap &field_table) {
-        field_table[PROPERTY_LRU_TIME] = std::to_string(TimestampUtil::GetCurrentTimeUs());
-    });
-    return ErrorCode::EC_OK;
-}
-
-std::vector<ErrorCode> MetaDummyBackend::GetAllFields(const KeyTypeVec &keys, FieldMapVec &out_field_maps) noexcept {
-    std::vector<ErrorCode> ec_vec;
-    out_field_maps = FieldMapVec(keys.size());
-    for (std::size_t i = 0; i != keys.size(); ++i) {
-        ec_vec.emplace_back(GetAllFieldsForOneKey(keys[i], out_field_maps[i]));
-        if (ec_vec.back() != ErrorCode::EC_OK && ec_vec.back() != ErrorCode::EC_NOENT) {
-            KVCM_LOG_WARN("get all fields failed, key: [%" PRIi64 "], error code: [%" PRIi32 "]",
-                          keys[i],
-                          static_cast<std::int32_t>(ec_vec.back()));
-        }
-    }
-    return ec_vec;
-}
-
-ErrorCode MetaDummyBackend::GetAllFieldsForOneKey(const KeyType &key, FieldMap &out_field_map) {
-    out_field_map.clear();
-    if (!table_.Get(key, out_field_map)) {
-        return ErrorCode::EC_NOENT;
-    }
-    // Update last access time in the stored map after copying the old value
-    table_.FindAndModify(key, [](FieldMap &field_table) {
-        field_table[PROPERTY_LRU_TIME] = std::to_string(TimestampUtil::GetCurrentTimeUs());
-    });
-    return ErrorCode::EC_OK;
-}
-
-std::vector<ErrorCode> MetaDummyBackend::Exists(const KeyTypeVec &keys, std::vector<bool> &out_is_exist_vec) noexcept {
-    out_is_exist_vec.clear();
-    out_is_exist_vec.reserve(keys.size());
-    std::vector<ErrorCode> ec_vec;
-    for (std::size_t i = 0; i != keys.size(); ++i) {
-        bool is_exist = false;
-        ec_vec.emplace_back(ExistsForOneKey(keys[i], is_exist));
-        if (ec_vec.back() != ErrorCode::EC_OK) {
-            KVCM_LOG_WARN("get all fields failed, key: [%" PRIi64 "], error code: [%" PRIi32 "]",
-                          keys[i],
-                          static_cast<std::int32_t>(ec_vec.back()));
-        }
-        out_is_exist_vec.emplace_back(is_exist);
-    }
-    return ec_vec;
-}
-
-ErrorCode MetaDummyBackend::ExistsForOneKey(const KeyType &key, bool &out_is_exist) {
-    out_is_exist = (table_.Count(key) > 0);
-    if (out_is_exist) {
-        table_.FindAndModify(key, [](FieldMap &field_table) {
-            field_table[PROPERTY_LRU_TIME] = std::to_string(TimestampUtil::GetCurrentTimeUs());
         });
+        if (!found) {
+            results[i] = EC_NOENT;
+        }
     }
-    return ErrorCode::EC_OK;
+    PersistToPath();
+    return results;
 }
 
-std::vector<ErrorCode> MetaDummyBackend::ExistsFieldWithPrefix(const KeyTypeVec &keys,
-                                                               const std::string &field_prefix,
-                                                               std::vector<bool> &out_exists_vec) noexcept {
-    out_exists_vec.resize(keys.size(), false);
-    std::vector<ErrorCode> ec_vec(keys.size(), ErrorCode::EC_OK);
-    for (std::size_t i = 0; i != keys.size(); ++i) {
-        const bool found = table_.FindAndApply(keys[i], [&](const FieldMap &field_table) {
-            for (const auto &[field_name, field_value] : field_table) {
-                if (field_name.size() >= field_prefix.size() &&
-                    field_name.compare(0, field_prefix.size(), field_prefix) == 0 && !field_value.empty()) {
-                    // Skip tombstones (empty value) — they are not valid locations.
-                    out_exists_vec[i] = true;
-                    return;
+// ---------------------------------------------------------------------------
+// Read operations
+// ---------------------------------------------------------------------------
+
+std::vector<ErrorCode> MetaDummyBackend::Get(RequestContext * /*request_context*/,
+                                             const KeyTypeVec &keys,
+                                             CacheLocationMapVector &out_locations,
+                                             PropertyMapVector &out_properties) noexcept {
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    out_locations.resize(keys.size());
+    out_properties.resize(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const bool found = table_.FindAndApply(keys[i], [&](const DummyItem &item) {
+            out_locations[i] = item.locations;
+            out_properties[i] = item.properties;
+        });
+        if (!found) {
+            results[i] = EC_NOENT;
+        } else {
+            table_.FindAndModify(keys[i], [](DummyItem &item) {
+                item.properties[PROPERTY_LRU_TIME] = std::to_string(TimestampUtil::GetCurrentTimeUs());
+            });
+        }
+    }
+    return results;
+}
+
+std::vector<ErrorCode> MetaDummyBackend::GetLocations(RequestContext * /*request_context*/,
+                                                      const KeyTypeVec &keys,
+                                                      CacheLocationMapVector &out_locations) noexcept {
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    out_locations.resize(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const bool found =
+            table_.FindAndApply(keys[i], [&](const DummyItem &item) { out_locations[i] = item.locations; });
+        if (!found) {
+            results[i] = EC_NOENT;
+        } else {
+            table_.FindAndModify(keys[i], [](DummyItem &item) {
+                item.properties[PROPERTY_LRU_TIME] = std::to_string(TimestampUtil::GetCurrentTimeUs());
+            });
+        }
+    }
+    return results;
+}
+
+std::vector<std::vector<ErrorCode>> MetaDummyBackend::GetLocations(RequestContext * /*request_context*/,
+                                                                   const KeyTypeVec &keys,
+                                                                   const LocationIdsPerKey &location_ids,
+                                                                   LocationsPerKey &out_locations) noexcept {
+    std::vector<std::vector<ErrorCode>> results(keys.size());
+    out_locations.resize(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        results[i].resize(location_ids[i].size(), EC_NOENT);
+        out_locations[i].resize(location_ids[i].size());
+        const bool found = table_.FindAndApply(keys[i], [&](const DummyItem &item) {
+            for (size_t j = 0; j < location_ids[i].size(); ++j) {
+                auto it = item.locations.find(location_ids[i][j]);
+                if (it != item.locations.end()) {
+                    out_locations[i][j] = it->second;
+                    results[i][j] = EC_OK;
                 }
             }
         });
         if (!found) {
-            ec_vec[i] = ErrorCode::EC_NOENT;
+            // All remain EC_NOENT (key not found).
+        } else {
+            table_.FindAndModify(keys[i], [](DummyItem &item) {
+                item.properties[PROPERTY_LRU_TIME] = std::to_string(TimestampUtil::GetCurrentTimeUs());
+            });
         }
     }
-    return ec_vec;
+    return results;
 }
 
-std::vector<ErrorCode>
-MetaDummyBackend::GetFieldNamesWithPrefix(const KeyTypeVec &keys,
-                                          const std::string &field_prefix,
-                                          std::vector<std::vector<std::string>> &out_field_names_vec) noexcept {
-    out_field_names_vec.resize(keys.size());
-    std::vector<ErrorCode> ec_vec(keys.size(), ErrorCode::EC_OK);
-    for (std::size_t i = 0; i != keys.size(); ++i) {
-        const bool found = table_.FindAndApply(keys[i], [&](const FieldMap &field_table) {
-            for (auto it = field_table.lower_bound(field_prefix); it != field_table.end(); ++it) {
-                if (it->first.size() < field_prefix.size() ||
-                    it->first.compare(0, field_prefix.size(), field_prefix) != 0) {
-                    break;
-                }
-                // Skip tombstones (empty value) — they are not valid locations.
-                if (!it->second.empty()) {
-                    out_field_names_vec[i].emplace_back(it->first);
+std::vector<ErrorCode> MetaDummyBackend::GetLocationIds(RequestContext * /*request_context*/,
+                                                        const KeyTypeVec &keys,
+                                                        LocationIdsPerKey &out_location_ids) noexcept {
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    out_location_ids.resize(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const bool found = table_.FindAndApply(keys[i], [&](const DummyItem &item) {
+            for (const auto &[loc_id, loc] : item.locations) {
+                out_location_ids[i].push_back(loc_id);
+            }
+        });
+        if (!found) {
+            results[i] = EC_NOENT;
+        }
+    }
+    return results;
+}
+
+std::vector<ErrorCode> MetaDummyBackend::ExistsLocation(RequestContext * /*request_context*/,
+                                                        const KeyTypeVec &keys,
+                                                        std::vector<bool> &out_exists) noexcept {
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    out_exists.resize(keys.size(), false);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const bool found =
+            table_.FindAndApply(keys[i], [&](const DummyItem &item) { out_exists[i] = !item.locations.empty(); });
+        if (!found) {
+            results[i] = EC_NOENT;
+        }
+    }
+    return results;
+}
+
+std::vector<ErrorCode> MetaDummyBackend::GetProperties(RequestContext * /*request_context*/,
+                                                       const KeyTypeVec &keys,
+                                                       const std::vector<std::string> &field_names,
+                                                       PropertyMapVector &out_properties) noexcept {
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    out_properties.resize(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const bool found = table_.FindAndApply(keys[i], [&](const DummyItem &item) {
+            for (const auto &field_name : field_names) {
+                auto it = item.properties.find(field_name);
+                if (it != item.properties.end()) {
+                    out_properties[i][field_name] = it->second;
                 }
             }
         });
         if (!found) {
-            ec_vec[i] = ErrorCode::EC_NOENT;
+            results[i] = EC_NOENT;
+        } else {
+            table_.FindAndModify(keys[i], [](DummyItem &item) {
+                item.properties[PROPERTY_LRU_TIME] = std::to_string(TimestampUtil::GetCurrentTimeUs());
+            });
         }
     }
-    return ec_vec;
+    return results;
 }
 
-ErrorCode MetaDummyBackend::ListKeys(const std::string &cursor,
+// ---------------------------------------------------------------------------
+// Key-level operations
+// ---------------------------------------------------------------------------
+
+std::vector<ErrorCode> MetaDummyBackend::Exists(RequestContext * /*request_context*/,
+                                                const KeyTypeVec &keys,
+                                                std::vector<bool> &out_is_exist_vec) noexcept {
+    std::vector<ErrorCode> results(keys.size(), EC_OK);
+    out_is_exist_vec.resize(keys.size(), false);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        out_is_exist_vec[i] = table_.Contains(keys[i]);
+        if (out_is_exist_vec[i]) {
+            table_.FindAndModify(keys[i], [](DummyItem &item) {
+                item.properties[PROPERTY_LRU_TIME] = std::to_string(TimestampUtil::GetCurrentTimeUs());
+            });
+        }
+    }
+    return results;
+}
+
+ErrorCode MetaDummyBackend::ListKeys(RequestContext * /*request_context*/,
+                                     const std::string &cursor,
                                      const std::int64_t limit,
                                      std::string &out_next_cursor,
                                      KeyTypeVec &out_keys) noexcept {
@@ -472,7 +443,7 @@ ErrorCode MetaDummyBackend::ListKeys(const std::string &cursor,
     std::int64_t current_index = 0;
     const std::int64_t end_index = start_index + limit;
     bool reached_limit = false;
-    table_.ForEachKV([&](const KeyType &key, const FieldMap &) {
+    table_.ForEachKV([&](const KeyType &key, const DummyItem &) {
         if (current_index >= end_index) {
             reached_limit = true;
             return false;
@@ -488,10 +459,12 @@ ErrorCode MetaDummyBackend::ListKeys(const std::string &cursor,
     return ErrorCode::EC_OK;
 }
 
-ErrorCode MetaDummyBackend::RandomSample(const std::int64_t count, KeyTypeVec &out_keys) noexcept {
+ErrorCode MetaDummyBackend::RandomSample(RequestContext * /*request_context*/,
+                                         const std::int64_t count,
+                                         KeyTypeVec &out_keys) noexcept {
     out_keys.clear();
-    table_.ForEachKV([&](const KeyType &key, const FieldMap &map) {
-        if (out_keys.size() >= count) {
+    table_.ForEachKV([&](const KeyType &key, const DummyItem &) {
+        if (static_cast<std::int64_t>(out_keys.size()) >= count) {
             return false;
         }
         out_keys.emplace_back(key);
@@ -500,9 +473,15 @@ ErrorCode MetaDummyBackend::RandomSample(const std::int64_t count, KeyTypeVec &o
     return ErrorCode::EC_OK;
 }
 
-ErrorCode MetaDummyBackend::SampleReclaimKeys(const std::int64_t count, KeyTypeVec &out_keys) noexcept {
-    return RandomSample(count, out_keys);
+ErrorCode MetaDummyBackend::SampleReclaimKeys(RequestContext *request_context,
+                                              const std::int64_t count,
+                                              KeyTypeVec &out_keys) noexcept {
+    return RandomSample(request_context, count, out_keys);
 }
+
+// ---------------------------------------------------------------------------
+// Metadata operations
+// ---------------------------------------------------------------------------
 
 ErrorCode MetaDummyBackend::PutMetaData(const FieldMap &field_map) noexcept {
     std::lock_guard<std::mutex> guard(mutex_);

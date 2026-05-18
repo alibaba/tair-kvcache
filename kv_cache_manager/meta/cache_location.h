@@ -128,6 +128,13 @@ public:
     [[nodiscard]] CacheLocationStatus status() const { return status_; }
     [[nodiscard]] DataStorageType type() const { return type_; }
     [[nodiscard]] size_t spec_size() const { return spec_size_; }
+    [[nodiscard]] size_t EstimateMemUsage() const {
+        size_t usage = sizeof(CacheLocation) + id_.size();
+        for (const auto &spec : location_specs_) {
+            usage += sizeof(LocationSpec) + spec.name().size() + spec.uri().size();
+        }
+        return usage;
+    }
 
 private:
     std::string id_;
@@ -139,5 +146,6 @@ private:
 
 using CacheLocationVector = std::vector<CacheLocation>;
 using CacheLocationMap = std::unordered_map<std::string, CacheLocation>;
+using CacheLocationMapVector = std::vector<CacheLocationMap>;
 
 } // namespace kv_cache_manager

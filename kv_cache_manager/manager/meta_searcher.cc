@@ -137,7 +137,7 @@ ErrorCode MetaSearcher::PrefixMatchBestLocationImpl(RequestContext *request_cont
 
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerGet);
-    LocationMapVector location_maps;
+    CacheLocationMapVector location_maps;
     auto result = meta_indexer_->GetLocations(request_context, keys, location_maps);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerGet);
 
@@ -230,7 +230,7 @@ ErrorCode MetaSearcher::BatchGetBestLocation(RequestContext *request_context,
     out_locations.reserve(keys.size());
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerGet);
-    LocationMapVector location_maps;
+    CacheLocationMapVector location_maps;
     auto result = meta_indexer_->GetLocations(request_context, keys, location_maps);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerGet);
     KeyVector prune_keys;
@@ -284,7 +284,7 @@ ErrorCode MetaSearcher::ReverseRollSlideWindowMatch(RequestContext *request_cont
     out_locations.assign(keys.size(), {});
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerGet);
-    LocationMapVector location_maps;
+    CacheLocationMapVector location_maps;
     auto result = meta_indexer_->GetLocations(request_context, keys, location_maps);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerGet);
     bool is_match = false;
@@ -381,11 +381,12 @@ ErrorCode MetaSearcher::BatchAddLocation(RequestContext *request_context,
     out_location_ids.resize(keys.size());
     std::vector<std::pair<DataStorageType, std::uint64_t>> loc_sz(keys.size());
 
-    auto modifier = [&locations, &out_location_ids, &keys, &loc_sz](const LocationIdVector &existing_location_ids,
-                                                                    ErrorCode get_ec,
-                                                                    size_t index,
-                                                                    PropertyMap &upsert_property_map,
-                                                                    LocationMap &out_new_locations) -> ModifierResult {
+    auto modifier =
+        [&locations, &out_location_ids, &keys, &loc_sz](const LocationIdVector &existing_location_ids,
+                                                        ErrorCode get_ec,
+                                                        size_t index,
+                                                        PropertyMap &upsert_property_map,
+                                                        CacheLocationMap &out_new_locations) -> ModifierResult {
         if (get_ec != ErrorCode::EC_OK && get_ec != ErrorCode::EC_NOENT) {
             KVCM_LOG_WARN("load location failed, key[%lu](%lu) return %d", index, keys[index], get_ec);
             return {ModifierAction::MA_FAIL, get_ec};

@@ -12,35 +12,68 @@ class MetaCacheBaseBackend : public MetaStorageBackend {
 public:
     ~MetaCacheBaseBackend() override = default;
 
+    // Bring base-class write overloads into scope (without previous_error_codes).
     using MetaStorageBackend::Delete;
-    using MetaStorageBackend::DeleteFields;
+    using MetaStorageBackend::DeleteLocations;
     using MetaStorageBackend::Put;
-    using MetaStorageBackend::UpdateFields;
+    using MetaStorageBackend::Update;
     using MetaStorageBackend::Upsert;
 
-    virtual std::vector<ErrorCode> PutIfAbsent(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept = 0;
-
-    // Conditional write: only processes keys where previous_error_codes[i] == EC_OK.
-    // For skipped keys, the returned error code is copied from previous_error_codes.
-    virtual std::vector<ErrorCode> Put(const KeyTypeVec &keys,
-                                       const FieldMapVec &field_maps,
-                                       const std::vector<ErrorCode> &previous_error_codes) noexcept = 0;
-    virtual std::vector<ErrorCode> PutIfAbsent(const KeyTypeVec &keys,
-                                               const FieldMapVec &field_maps,
-                                               const std::vector<ErrorCode> &previous_error_codes) noexcept = 0;
-    virtual std::vector<ErrorCode> UpdateFields(const KeyTypeVec &keys,
-                                                const FieldMapVec &field_maps,
-                                                const std::vector<ErrorCode> &previous_error_codes) noexcept = 0;
-    virtual std::vector<ErrorCode> Upsert(const KeyTypeVec &keys,
-                                          const FieldMapVec &field_maps,
-                                          const std::vector<ErrorCode> &previous_error_codes) noexcept = 0;
-    virtual std::vector<ErrorCode> Delete(const KeyTypeVec &keys,
-                                          const std::vector<ErrorCode> &previous_error_codes) noexcept = 0;
-    virtual std::vector<ErrorCode> DeleteFields(const KeyTypeVec &keys,
-                                                const std::vector<std::vector<std::string>> &field_names_vec,
-                                                const std::vector<ErrorCode> &previous_error_codes) noexcept = 0;
-
     virtual size_t GetMemUsage() const noexcept = 0;
+
+    // 写入 locations + properties，仅当 key 在 cache 中不存在时才写入。
+    // 若 key 已存在，返回 EC_OK 且不修改已有数据（幂等）。
+    // @param request_context    请求上下文；可为 nullptr
+    // @param keys               待写入的 key 列表
+    // @param locations          每个 key 的 CacheLocationMap
+    // @param properties         每个 key 的 PropertyMap
+    // @return 每个 key 的错误码：
+    //   - EC_OK:    写入成功或 key 已存在（均视为成功）
+    //   - EC_ERROR: 写入失败
+    virtual std::vector<ErrorCode> PutIfAbsent(RequestContext *request_context,
+                                               const KeyTypeVec &keys,
+                                               const CacheLocationMapVector &locations,
+                                               const PropertyMapVector &properties) noexcept = 0;
+
+    // =====================================================================
+    // Overloaded writes with previous_error_codes
+    // =====================================================================
+    // For each key:
+    //   - If previous_error_codes[i] != EC_OK → skip, return previous_error_codes[i]
+    //   - Otherwise → perform the write normally
+
+    virtual std::vector<ErrorCode> Put(RequestContext *request_context,
+                                       const KeyTypeVec &keys,
+                                       const CacheLocationMapVector &locations,
+                                       const PropertyMapVector &properties,
+                                       const std::vector<ErrorCode> &previous_error_codes) noexcept = 0;
+
+    virtual std::vector<ErrorCode> PutIfAbsent(RequestContext *request_context,
+                                               const KeyTypeVec &keys,
+                                               const CacheLocationMapVector &locations,
+                                               const PropertyMapVector &properties,
+                                               const std::vector<ErrorCode> &previous_error_codes) noexcept = 0;
+
+    virtual std::vector<ErrorCode> Upsert(RequestContext *request_context,
+                                          const KeyTypeVec &keys,
+                                          const CacheLocationMapVector &locations,
+                                          const PropertyMapVector &properties,
+                                          const std::vector<ErrorCode> &previous_error_codes) noexcept = 0;
+
+    virtual std::vector<ErrorCode> Update(RequestContext *request_context,
+                                          const KeyTypeVec &keys,
+                                          const CacheLocationMapVector &locations,
+                                          const PropertyMapVector &properties,
+                                          const std::vector<ErrorCode> &previous_error_codes) noexcept = 0;
+
+    virtual std::vector<ErrorCode> Delete(RequestContext *request_context,
+                                          const KeyTypeVec &keys,
+                                          const std::vector<ErrorCode> &previous_error_codes) noexcept = 0;
+
+    virtual std::vector<ErrorCode> DeleteLocations(RequestContext *request_context,
+                                                   const KeyTypeVec &keys,
+                                                   const LocationIdsPerKey &location_ids,
+                                                   const std::vector<ErrorCode> &previous_error_codes) noexcept = 0;
 };
 
 } // namespace kv_cache_manager

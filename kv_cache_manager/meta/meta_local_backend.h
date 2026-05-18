@@ -20,40 +20,47 @@
 namespace kv_cache_manager {
 
 struct MetaMemCacheItem {
-    using FieldMap = MetaCacheBaseBackend::FieldMap;
-
     // Estimates total memory footprint including the heap memory owned by
-    // FieldMap entries, used as the "charge" for LRU cache eviction accounting.
+    // CacheLocationMap and PropertyMap entries, used as the "charge" for LRU cache eviction accounting.
     size_t Size() const {
         size_t total = sizeof(MetaMemCacheItem);
-        for (const auto &[field_name, field_value] : fields_) {
-            // Each map entry: key string heap + value string heap + tree-node overhead
-            total += field_name.size() + field_value.size() + sizeof(void *) * 4;
+        for (const auto &[location_id, location] : locations_) {
+            // unordered_map node overhead + key string heap + CacheLocation footprint
+            total += sizeof(void *) * 4 + location_id.size() + location.EstimateMemUsage();
+        }
+        for (const auto &[prop_name, prop_value] : properties_) {
+            total += sizeof(void *) * 4 + prop_name.size() + prop_value.size();
         }
         return total;
     }
-    const FieldMap &GetFields() const { return fields_; }
-    FieldMap &GetMutableFields() { return fields_; }
+
+    const CacheLocationMap &GetLocations() const { return locations_; }
+    CacheLocationMap &GetMutableLocations() { return locations_; }
+    const PropertyMap &GetProperties() const { return properties_; }
+    PropertyMap &GetMutableProperties() { return properties_; }
     std::shared_mutex &GetMutex() const { return mutex_; }
 
     int64_t GetLastAccessTime() const { return last_access_time_.load(std::memory_order_relaxed); }
     void TouchAccessTime() { last_access_time_.store(TimestampUtil::GetCurrentTimeUs(), std::memory_order_relaxed); }
 
-    static MetaMemCacheItem *Create(const FieldMap &fields) {
+    static MetaMemCacheItem *Create(const CacheLocationMap &locations, const PropertyMap &properties) {
         auto *item = new MetaMemCacheItem();
-        item->fields_ = fields;
+        item->locations_ = locations;
+        item->properties_ = properties;
         return item;
     }
-    static MetaMemCacheItem *Create(FieldMap &&fields) {
+    static MetaMemCacheItem *Create(CacheLocationMap &&locations, PropertyMap &&properties) {
         auto *item = new MetaMemCacheItem();
-        item->fields_ = std::move(fields);
+        item->locations_ = std::move(locations);
+        item->properties_ = std::move(properties);
         return item;
     }
     static void Deleter(void *value, MemoryAllocator * /*allocator*/) { delete static_cast<MetaMemCacheItem *>(value); }
 
 private:
     mutable std::shared_mutex mutex_;
-    FieldMap fields_;
+    CacheLocationMap locations_;
+    PropertyMap properties_;
     std::atomic<int64_t> last_access_time_{0};
 };
 
@@ -70,56 +77,92 @@ public:
     ErrorCode Close() noexcept override;
 
     // write
-    std::vector<ErrorCode> Put(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept override;
-    std::vector<ErrorCode> PutIfAbsent(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept override;
-    std::vector<ErrorCode> UpdateFields(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept override;
-    std::vector<ErrorCode> Upsert(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept override;
-    std::vector<ErrorCode> Delete(const KeyTypeVec &keys) noexcept override;
-    std::vector<ErrorCode> DeleteFields(const KeyTypeVec &keys,
-                                        const std::vector<std::vector<std::string>> &field_names_vec) noexcept override;
+    std::vector<ErrorCode> Put(RequestContext *request_context,
+                               const KeyTypeVec &keys,
+                               const CacheLocationMapVector &locations,
+                               const PropertyMapVector &properties) noexcept override;
+    std::vector<ErrorCode> PutIfAbsent(RequestContext *request_context,
+                                       const KeyTypeVec &keys,
+                                       const CacheLocationMapVector &locations,
+                                       const PropertyMapVector &properties) noexcept override;
+    std::vector<ErrorCode> Upsert(RequestContext *request_context,
+                                  const KeyTypeVec &keys,
+                                  const CacheLocationMapVector &locations,
+                                  const PropertyMapVector &properties) noexcept override;
+    std::vector<ErrorCode> Update(RequestContext *request_context,
+                                  const KeyTypeVec &keys,
+                                  const CacheLocationMapVector &locations,
+                                  const PropertyMapVector &properties) noexcept override;
+    std::vector<ErrorCode> Delete(RequestContext *request_context, const KeyTypeVec &keys) noexcept override;
+    std::vector<ErrorCode> DeleteLocations(RequestContext *request_context,
+                                           const KeyTypeVec &keys,
+                                           const LocationIdsPerKey &location_ids) noexcept override;
 
     // Conditional write: only processes keys where previous_error_codes[i] == EC_OK.
-    std::vector<ErrorCode> Put(const KeyTypeVec &keys,
-                               const FieldMapVec &field_maps,
+    std::vector<ErrorCode> Put(RequestContext *request_context,
+                               const KeyTypeVec &keys,
+                               const CacheLocationMapVector &locations,
+                               const PropertyMapVector &properties,
                                const std::vector<ErrorCode> &previous_error_codes) noexcept override;
-    std::vector<ErrorCode> PutIfAbsent(const KeyTypeVec &keys,
-                                       const FieldMapVec &field_maps,
+    std::vector<ErrorCode> PutIfAbsent(RequestContext *request_context,
+                                       const KeyTypeVec &keys,
+                                       const CacheLocationMapVector &locations,
+                                       const PropertyMapVector &properties,
                                        const std::vector<ErrorCode> &previous_error_codes) noexcept override;
-    std::vector<ErrorCode> UpdateFields(const KeyTypeVec &keys,
-                                        const FieldMapVec &field_maps,
-                                        const std::vector<ErrorCode> &previous_error_codes) noexcept override;
-    std::vector<ErrorCode> Upsert(const KeyTypeVec &keys,
-                                  const FieldMapVec &field_maps,
+    std::vector<ErrorCode> Upsert(RequestContext *request_context,
+                                  const KeyTypeVec &keys,
+                                  const CacheLocationMapVector &locations,
+                                  const PropertyMapVector &properties,
                                   const std::vector<ErrorCode> &previous_error_codes) noexcept override;
-    std::vector<ErrorCode> Delete(const KeyTypeVec &keys,
+    std::vector<ErrorCode> Update(RequestContext *request_context,
+                                  const KeyTypeVec &keys,
+                                  const CacheLocationMapVector &locations,
+                                  const PropertyMapVector &properties,
                                   const std::vector<ErrorCode> &previous_error_codes) noexcept override;
-    // Adjusts the LRU charge to reflect the size change.
-    std::vector<ErrorCode> DeleteFields(const KeyTypeVec &keys,
-                                        const std::vector<std::vector<std::string>> &field_names_vec,
-                                        const std::vector<ErrorCode> &previous_error_codes) noexcept override;
+    std::vector<ErrorCode> Delete(RequestContext *request_context,
+                                  const KeyTypeVec &keys,
+                                  const std::vector<ErrorCode> &previous_error_codes) noexcept override;
+    std::vector<ErrorCode> DeleteLocations(RequestContext *request_context,
+                                           const KeyTypeVec &keys,
+                                           const LocationIdsPerKey &location_ids,
+                                           const std::vector<ErrorCode> &previous_error_codes) noexcept override;
 
     // read
-    std::vector<ErrorCode> Get(const KeyTypeVec &keys,
-                               const std::vector<std::string> &field_names,
-                               FieldMapVec &out_field_maps) noexcept override;
-    std::vector<ErrorCode> Get(const KeyTypeVec &keys,
-                               const std::vector<std::vector<std::string>> &field_names_vec,
-                               FieldMapVec &out_field_maps) noexcept override;
-    std::vector<ErrorCode> GetAllFields(const KeyTypeVec &keys, FieldMapVec &out_field_maps) noexcept override;
-    std::vector<ErrorCode> Exists(const KeyTypeVec &keys, std::vector<bool> &out_is_exist_vec) noexcept override;
-    std::vector<ErrorCode> ExistsFieldWithPrefix(const KeyTypeVec &keys,
-                                                 const std::string &field_prefix,
-                                                 std::vector<bool> &out_exists_vec) noexcept override;
-    std::vector<ErrorCode>
-    GetFieldNamesWithPrefix(const KeyTypeVec &keys,
-                            const std::string &field_prefix,
-                            std::vector<std::vector<std::string>> &out_field_names_vec) noexcept override;
-    ErrorCode ListKeys(const std::string &cursor,
+    std::vector<ErrorCode> Get(RequestContext *request_context,
+                               const KeyTypeVec &keys,
+                               CacheLocationMapVector &out_locations,
+                               PropertyMapVector &out_properties) noexcept override;
+    std::vector<ErrorCode> GetLocations(RequestContext *request_context,
+                                        const KeyTypeVec &keys,
+                                        CacheLocationMapVector &out_locations) noexcept override;
+    std::vector<std::vector<ErrorCode>> GetLocations(RequestContext *request_context,
+                                                     const KeyTypeVec &keys,
+                                                     const LocationIdsPerKey &location_ids,
+                                                     LocationsPerKey &out_locations) noexcept override;
+    std::vector<ErrorCode> GetLocationIds(RequestContext *request_context,
+                                          const KeyTypeVec &keys,
+                                          LocationIdsPerKey &out_location_ids) noexcept override;
+    std::vector<ErrorCode> GetProperties(RequestContext *request_context,
+                                         const KeyTypeVec &keys,
+                                         const std::vector<std::string> &field_names,
+                                         PropertyMapVector &out_properties) noexcept override;
+    std::vector<ErrorCode> Exists(RequestContext *request_context,
+                                  const KeyTypeVec &keys,
+                                  std::vector<bool> &out_is_exist_vec) noexcept override;
+    std::vector<ErrorCode> ExistsLocation(RequestContext *request_context,
+                                          const KeyTypeVec &keys,
+                                          std::vector<bool> &out_exists) noexcept override;
+    ErrorCode ListKeys(RequestContext *request_context,
+                       const std::string &cursor,
                        const int64_t limit,
                        std::string &out_next_cursor,
                        std::vector<KeyType> &out_keys) noexcept override;
-    ErrorCode RandomSample(const int64_t count, std::vector<KeyType> &out_keys) noexcept override;
-    ErrorCode SampleReclaimKeys(const int64_t count, std::vector<KeyType> &out_keys) noexcept override;
+    ErrorCode RandomSample(RequestContext *request_context,
+                           const int64_t count,
+                           std::vector<KeyType> &out_keys) noexcept override;
+    ErrorCode SampleReclaimKeys(RequestContext *request_context,
+                                const int64_t count,
+                                std::vector<KeyType> &out_keys) noexcept override;
 
     // meta data
     ErrorCode PutMetaData(const FieldMap &field_maps) noexcept override;
@@ -128,39 +171,35 @@ public:
     size_t GetMemUsage() const noexcept override;
 
 private:
-    // Collects up to `count` oldest keys from the given shard, parses them to
-    // KeyType and appends to `out_keys`. Returns the number of keys collected.
     size_t CollectOldestKeysFromShard(uint32_t shard_id, size_t count, std::vector<KeyType> &out_keys);
-
-    // Per-key helpers used by both unconditional and conditional write methods.
-    ErrorCode UpsertForOneKey(KeyType key, const FieldMap &field_map);
+    ErrorCode
+    CreateAndInsert(const std::string &key_str, const CacheLocationMap &locations, const PropertyMap &properties);
+    ErrorCode CreateAndInsertIfAbsent(const std::string &key_str,
+                                      const CacheLocationMap &locations,
+                                      const PropertyMap &properties);
+    ErrorCode
+    UpdateInPlace(const std::string &key_str, const CacheLocationMap &locations, const PropertyMap &properties);
+    ErrorCode UpsertForOneKey(KeyType key, const CacheLocationMap &locations, const PropertyMap &properties);
     ErrorCode DeleteForOneKey(KeyType key);
-    ErrorCode DeleteFieldsForOneKey(KeyType key, const std::vector<std::string> &field_names);
-    ErrorCode GetForOneKey(KeyType key, const std::vector<std::string> &field_names, FieldMap &out_field_map);
-
-    // Creates a MetaMemCacheItem from the given fields and inserts it into
-    // cache_ via Insert().  On failure the item is deleted and the error code
-    // is returned.
-    ErrorCode CreateAndInsert(const std::string &key_str, const FieldMap &fields);
-    ErrorCode CreateAndInsert(const std::string &key_str, FieldMap &&fields);
-
-    // Creates a MetaMemCacheItem and inserts it into cache_ via InsertIfAbsent().
-    ErrorCode CreateAndInsertIfAbsent(const std::string &key_str, const FieldMap &fields);
-
-    // Looks up an existing cache item and merges `updates` into its fields
-    // in place. Adjusts the LRU charge to reflect the size change.
-    // Returns EC_OK on success, EC_NOENT if key not found.
-    ErrorCode UpdateFieldsInPlace(const std::string &key_str, const FieldMap &updates);
+    ErrorCode DeleteLocationsForOneKey(KeyType key, const std::vector<LocationId> &location_ids);
+    // Unified read helper. Fetches data from cache for a single key.
+    // Pass nullptr for any output you don't need.
+    // - field_names: if non-null, only these properties are returned; otherwise all properties
+    // - out_location_map: if non-null, copies the full CacheLocationMap
+    // - out_property_map: if non-null, copies properties
+    // - out_location_ids: if non-null, collects all location ids from the key
+    // Returns EC_OK if key found, EC_NOENT otherwise.
+    ErrorCode GetForOneKey(KeyType key,
+                           const std::vector<std::string> *field_names,
+                           CacheLocationMap *out_location_map,
+                           PropertyMap *out_property_map,
+                           std::vector<LocationId> *out_location_ids);
 
     std::shared_ptr<Cache::CacheItemHelper> cache_item_helper_;
     std::shared_ptr<Cache> cache_;
+    std::unique_ptr<std::atomic<int64_t>[]> shard_oldest_access_time_;
     uint32_t shard_mask_ = 0;
     size_t sample_times_ = 0;
-
-    // Per-shard approximate oldest access time, updated via tail-change callback
-    // from the LRU cache. Used by SampleReclaimKeys to select the oldest shards
-    // without acquiring any shard locks.
-    std::unique_ptr<std::atomic<int64_t>[]> shard_oldest_access_time_;
 };
 
 } // namespace kv_cache_manager

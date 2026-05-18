@@ -707,7 +707,7 @@ ErrorCode CacheManager::TrimCache(RequestContext *request_context,
         CacheMetaDelRequest request;
         request.instance_id = instance_id;
 
-        if (const auto ec = meta_indexer->Scan(cursor, limit, next_cursor, request.block_keys);
+        if (const ErrorCode ec = meta_indexer->Scan(request_context, cursor, limit, next_cursor, request.block_keys);
             ec != ErrorCode::EC_OK) {
             // TODO (rui): cache reclaimer should reclaim the dangling blocks
             RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "trim cache failed");

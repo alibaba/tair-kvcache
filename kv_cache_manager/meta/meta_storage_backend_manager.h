@@ -44,41 +44,45 @@ public:
     RecoverState GetRecoverState() const noexcept { return recover_state_.load(std::memory_order_acquire); }
 
     // ----- Write APIs -----
-    // Put / UpdateFields / Upsert merge CacheLocations into batch.batch_properties in place.
     std::vector<ErrorCode> Put(RequestContext *request_context, BatchMetaData &batch) noexcept;
     std::vector<ErrorCode> UpdateFields(RequestContext *request_context, BatchMetaData &batch) noexcept;
     std::vector<ErrorCode> Upsert(RequestContext *request_context, BatchMetaData &batch) noexcept;
-
-    // Delete entire block keys.
-    std::vector<ErrorCode> Delete(const KeyVector &keys) noexcept;
-
-    // Delete specific location fields within each key.
-    std::vector<ErrorCode>
-    Delete(const KeyVector &keys, const LocationIdsPerKey &location_ids, int32_t &out_reclaimed_count) noexcept;
+    std::vector<ErrorCode> Delete(RequestContext *request_context, const KeyVector &keys) noexcept;
+    std::vector<ErrorCode> Delete(RequestContext *request_context,
+                                  const KeyVector &keys,
+                                  const LocationIdsPerKey &location_ids,
+                                  int32_t &out_reclaimed_count) noexcept;
 
     // ----- Read APIs -----
-    std::vector<ErrorCode>
-    Get(const KeyVector &keys, const std::vector<std::string> &field_names, FieldMapVec &out_field_maps) noexcept;
-    std::vector<ErrorCode> Get(const KeyVector &keys,
-                               const std::vector<std::vector<std::string>> &field_names_vec,
-                               FieldMapVec &out_field_maps) noexcept;
-    std::vector<ErrorCode> GetAllFields(const KeyVector &keys, FieldMapVec &out_field_maps) noexcept;
-    std::vector<ErrorCode>
-    GetLocations(RequestContext *request_context, const KeyVector &keys, LocationMapVector &out_location_maps) noexcept;
+    std::vector<ErrorCode> Get(RequestContext *request_context,
+                               const KeyVector &keys,
+                               CacheLocationMapVector &out_locations,
+                               PropertyMapVector &out_properties) noexcept;
+    std::vector<ErrorCode> GetLocations(RequestContext *request_context,
+                                        const KeyVector &keys,
+                                        CacheLocationMapVector &out_location_maps) noexcept;
     std::vector<std::vector<ErrorCode>> GetLocations(RequestContext *request_context,
                                                      const KeyVector &keys,
                                                      const LocationIdsPerKey &location_ids,
                                                      LocationsPerKey &out_locations) noexcept;
-    std::vector<ErrorCode> GetLocationIds(const KeyVector &keys, LocationIdsPerKey &out_location_ids) noexcept;
-    std::vector<ErrorCode> Exists(const KeyVector &keys, std::vector<bool> &out_is_exist_vec) noexcept;
+    std::vector<ErrorCode> GetLocationIds(RequestContext *request_context,
+                                          const KeyVector &keys,
+                                          LocationIdsPerKey &out_location_ids) noexcept;
+    std::vector<ErrorCode> GetProperties(RequestContext *request_context,
+                                         const KeyVector &keys,
+                                         const std::vector<std::string> &field_names,
+                                         PropertyMapVector &out_properties) noexcept;
+    std::vector<ErrorCode>
+    Exists(RequestContext *request_context, const KeyVector &keys, std::vector<bool> &out_is_exist_vec) noexcept;
 
     // ----- Cross-batch APIs (no shard locks) -----
-    ErrorCode ListKeys(const std::string &cursor,
+    ErrorCode ListKeys(RequestContext *request_context,
+                       const std::string &cursor,
                        const int64_t limit,
                        std::string &out_next_cursor,
                        KeyTypeVec &out_keys) noexcept;
-    ErrorCode RandomSample(const int64_t count, KeyTypeVec &out_keys) noexcept;
-    ErrorCode SampleReclaimKeys(const int64_t count, KeyTypeVec &out_keys) noexcept;
+    ErrorCode RandomSample(RequestContext *request_context, const int64_t count, KeyTypeVec &out_keys) noexcept;
+    ErrorCode SampleReclaimKeys(RequestContext *request_context, const int64_t count, KeyTypeVec &out_keys) noexcept;
 
     ErrorCode PutMetaData(const FieldMap &field_maps) noexcept;
     ErrorCode GetMetaData(FieldMap &field_maps) noexcept;
@@ -88,16 +92,15 @@ public:
 private:
     void AsyncRecoverTask() noexcept;
     int64_t BackfillKeysToCache(const KeyTypeVec &keys,
-                                const FieldMapVec &field_maps,
+                                const CacheLocationMapVector &locations,
+                                const PropertyMapVector &properties,
                                 const std::vector<ErrorCode> &get_error_codes) noexcept;
     // Hydrate missing keys from persistent into cache during Recover.
-    void EnsureKeyInCache(const KeyTypeVec &keys) noexcept;
-    // Merge CacheLocations into batch.batch_properties in place. Accumulates
-    // serialization latency onto `request_context` when non-null.
-    PropertyMapVector &BuildEffectiveFieldMaps(RequestContext *request_context, BatchMetaData &batch) const noexcept;
-    static std::string MakeLocationFieldName(const std::string &location_id) noexcept;
+    void EnsureKeyInCache(RequestContext *request_context, const KeyTypeVec &keys) noexcept;
     // Delete keys that have no remaining location fields. Returns reclaimed count.
-    int32_t MaybeReclaimEmptyKeys(const KeyVector &keys, const std::vector<ErrorCode> &delete_results) noexcept;
+    int32_t MaybeReclaimEmptyKeys(RequestContext *request_context,
+                                  const KeyVector &keys,
+                                  const std::vector<ErrorCode> &delete_results) noexcept;
 
     std::string instance_id_;
     std::unique_ptr<MetaStorageBackend> persistent_backend_;

@@ -1,59 +1,141 @@
 #include "kv_cache_manager/meta/test/meta_storage_backend_test_base.h"
 
+#include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/common.h"
-#include "kv_cache_manager/meta/meta_redis_backend.h"
+
 namespace kv_cache_manager {
-void MetaStorageBackendTestBase::AssertGet(MetaStorageBackend *meta_storage_backend,
-                                           const KeyTypeVec &keys,
-                                           const std::vector<std::string> &field_names,
-                                           const std::vector<ErrorCode> expected_ec_vec,
-                                           const FieldMapVec &expected_field_maps) {
+
+// ---------------------------------------------------------------------------
+// Compatibility wrappers
+// ---------------------------------------------------------------------------
+
+void MetaStorageBackendTestBase::SplitFieldMaps(const FieldMapVec &field_maps,
+                                                CacheLocationMapVector &out_locations,
+                                                PropertyMapVector &out_properties) {
+    out_locations.resize(field_maps.size());
+    out_properties.resize(field_maps.size());
+    for (size_t i = 0; i < field_maps.size(); ++i) {
+        for (const auto &[name, value] : field_maps[i]) {
+            if (name.rfind(LOCATION_PREFIX, 0) == 0) {
+                std::string loc_id = name.substr(LOCATION_PREFIX.size());
+                CacheLocation loc;
+                loc.set_id(loc_id);
+                // Store raw value in a location_spec uri so round-trip tests
+                // that compare serialised JSON can still work. For empty value
+                // (tombstone), leave the location default-constructed (no specs).
+                if (!value.empty()) {
+                    loc.FromJsonString(value);
+                    // If FromJsonString failed (value was not valid JSON),
+                    // fall back to storing raw value.
+                    if (loc.id().empty()) {
+                        loc.set_id(loc_id);
+                    }
+                }
+                out_locations[i][loc_id] = std::move(loc);
+            } else {
+                out_properties[i][name] = value;
+            }
+        }
+    }
+}
+
+std::vector<ErrorCode> MetaStorageBackendTestBase::PutWithFieldMaps(MetaStorageBackend *backend,
+                                                                    const KeyTypeVec &keys,
+                                                                    const FieldMapVec &field_maps) {
+    CacheLocationMapVector locations;
+    PropertyMapVector properties;
+    SplitFieldMaps(field_maps, locations, properties);
+    return backend->Put(nullptr, keys, locations, properties);
+}
+
+std::vector<ErrorCode> MetaStorageBackendTestBase::UpsertWithFieldMaps(MetaStorageBackend *backend,
+                                                                       const KeyTypeVec &keys,
+                                                                       const FieldMapVec &field_maps) {
+    CacheLocationMapVector locations;
+    PropertyMapVector properties;
+    SplitFieldMaps(field_maps, locations, properties);
+    return backend->Upsert(nullptr, keys, locations, properties);
+}
+
+std::vector<ErrorCode> MetaStorageBackendTestBase::UpdateWithFieldMaps(MetaStorageBackend *backend,
+                                                                       const KeyTypeVec &keys,
+                                                                       const FieldMapVec &field_maps) {
+    CacheLocationMapVector locations;
+    PropertyMapVector properties;
+    SplitFieldMaps(field_maps, locations, properties);
+    return backend->Update(nullptr, keys, locations, properties);
+}
+
+std::vector<ErrorCode>
+MetaStorageBackendTestBase::PutIfAbsentWithFieldMaps(MetaCacheBaseBackend *backend,
+                                                     const KeyTypeVec &keys,
+                                                     const FieldMapVec &field_maps,
+                                                     const std::vector<ErrorCode> &previous_error_codes) {
+    CacheLocationMapVector locations;
+    PropertyMapVector properties;
+    SplitFieldMaps(field_maps, locations, properties);
+    return backend->PutIfAbsent(nullptr, keys, locations, properties, previous_error_codes);
+}
+
+void MetaStorageBackendTestBase::AssertGetProperties(MetaStorageBackend *meta_storage_backend,
+                                                     const KeyTypeVec &keys,
+                                                     const std::vector<std::string> &field_names,
+                                                     const std::vector<ErrorCode> &expected_ec_vec,
+                                                     const PropertyMapVector &expected_properties) {
     ASSERT_TRUE(meta_storage_backend);
-    FieldMapVec field_maps;
-    std::vector<ErrorCode> ec_vec = meta_storage_backend->Get(keys, field_names, field_maps);
+    PropertyMapVector out_properties;
+    std::vector<ErrorCode> ec_vec = meta_storage_backend->GetProperties(nullptr, keys, field_names, out_properties);
     ASSERT_EQ(keys.size(), expected_ec_vec.size());
     ASSERT_EQ(expected_ec_vec, ec_vec);
-    ASSERT_EQ(keys.size(), field_maps.size());
-    ASSERT_EQ(expected_field_maps.size(), field_maps.size());
-    for (int i = 0; i < keys.size(); ++i) {
+    ASSERT_EQ(keys.size(), out_properties.size());
+    ASSERT_EQ(expected_properties.size(), out_properties.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
         const KeyType &key = keys[i];
-        const FieldMap &field_map = field_maps[i];
-        const FieldMap &expected_field_map = expected_field_maps[i];
-        ASSERT_EQ(expected_field_map.size(), field_map.size()) << key;
-        for (const auto &[expected_field_name, expected_field_value] : expected_field_map) {
-            const auto iter = field_map.find(expected_field_name);
-            ASSERT_TRUE(iter != field_map.end()) << key << " " << expected_field_name;
-            ASSERT_EQ(expected_field_value, iter->second) << key << " " << expected_field_name;
+        const PropertyMap &actual = out_properties[i];
+        const PropertyMap &expected = expected_properties[i];
+        ASSERT_EQ(expected.size(), actual.size()) << key;
+        for (const auto &[name, value] : expected) {
+            const auto iter = actual.find(name);
+            ASSERT_TRUE(iter != actual.end()) << key << " " << name;
+            ASSERT_EQ(value, iter->second) << key << " " << name;
         }
     }
 }
 
 void MetaStorageBackendTestBase::AssertGetAllFields(MetaStorageBackend *meta_storage_backend,
                                                     const KeyTypeVec &keys,
-                                                    const std::vector<ErrorCode> expected_ec_vec,
+                                                    const std::vector<ErrorCode> &expected_ec_vec,
                                                     const FieldMapVec &expected_field_maps) {
     ASSERT_TRUE(meta_storage_backend);
-    FieldMapVec field_maps;
-    std::vector<ErrorCode> ec_vec = meta_storage_backend->GetAllFields(keys, field_maps);
+    CacheLocationMapVector out_locations;
+    PropertyMapVector out_properties;
+    std::vector<ErrorCode> ec_vec = meta_storage_backend->Get(nullptr, keys, out_locations, out_properties);
     ASSERT_EQ(keys.size(), expected_ec_vec.size());
     ASSERT_EQ(expected_ec_vec, ec_vec);
-    ASSERT_EQ(keys.size(), field_maps.size());
-    ASSERT_EQ(expected_field_maps.size(), field_maps.size());
-    for (int i = 0; i < keys.size(); ++i) {
+    ASSERT_EQ(keys.size(), out_locations.size());
+    ASSERT_EQ(keys.size(), out_properties.size());
+    ASSERT_EQ(expected_field_maps.size(), out_locations.size());
+
+    // Merge locations + properties back into a FieldMap for comparison.
+    for (size_t i = 0; i < keys.size(); ++i) {
         const KeyType &key = keys[i];
-        const FieldMap &field_map = field_maps[i];
+        FieldMap merged;
+        for (const auto &[loc_id, loc] : out_locations[i]) {
+            merged[LOCATION_PREFIX + loc_id] = loc.ToJsonString();
+        }
+        for (const auto &[prop_name, prop_value] : out_properties[i]) {
+            merged[prop_name] = prop_value;
+        }
         const FieldMap &expected_field_map = expected_field_maps[i];
         // Count actual fields excluding PROPERTY_LRU_TIME (dynamically filled by local backend).
-        size_t actual_count_without_lru = field_map.size();
-        if (field_map.count(PROPERTY_LRU_TIME) && !expected_field_map.count(PROPERTY_LRU_TIME)) {
+        size_t actual_count_without_lru = merged.size();
+        if (merged.count(PROPERTY_LRU_TIME) && !expected_field_map.count(PROPERTY_LRU_TIME)) {
             --actual_count_without_lru;
         }
         ASSERT_EQ(expected_field_map.size(), actual_count_without_lru) << key;
-        // Verify all expected fields are present with correct values.
-        // PROPERTY_LRU_TIME is dynamically filled, so only check existence.
         for (const auto &[expected_field_name, expected_field_value] : expected_field_map) {
-            const auto iter = field_map.find(expected_field_name);
-            ASSERT_TRUE(iter != field_map.end()) << key << " " << expected_field_name;
+            const auto iter = merged.find(expected_field_name);
+            ASSERT_TRUE(iter != merged.end()) << key << " " << expected_field_name;
             if (expected_field_name == PROPERTY_LRU_TIME) {
                 ASSERT_FALSE(iter->second.empty()) << key << " " << expected_field_name << " should not be empty";
             } else {
@@ -65,20 +147,18 @@ void MetaStorageBackendTestBase::AssertGetAllFields(MetaStorageBackend *meta_sto
 
 void MetaStorageBackendTestBase::AssertExists(MetaStorageBackend *meta_storage_backend,
                                               const KeyTypeVec &keys,
-                                              const std::vector<ErrorCode> expected_ec_vec,
+                                              const std::vector<ErrorCode> &expected_ec_vec,
                                               const std::vector<bool> &expected_is_exist_vec) {
     ASSERT_TRUE(meta_storage_backend);
     std::vector<bool> is_exist_vec;
-    std::vector<ErrorCode> ec_vec = meta_storage_backend->Exists(keys, is_exist_vec);
+    std::vector<ErrorCode> ec_vec = meta_storage_backend->Exists(nullptr, keys, is_exist_vec);
     ASSERT_EQ(keys.size(), expected_ec_vec.size());
     ASSERT_EQ(expected_ec_vec, ec_vec);
     ASSERT_EQ(keys.size(), is_exist_vec.size());
     ASSERT_EQ(expected_is_exist_vec.size(), is_exist_vec.size());
-    for (int i = 0; i < keys.size(); ++i) {
+    for (size_t i = 0; i < keys.size(); ++i) {
         const KeyType &key = keys[i];
-        const bool is_exist = is_exist_vec[i];
-        const bool expected_is_exist = expected_is_exist_vec[i];
-        ASSERT_EQ(expected_is_exist, is_exist) << "key is: " << key;
+        ASSERT_EQ(expected_is_exist_vec[i], is_exist_vec[i]) << "key is: " << key;
     }
 }
 
@@ -91,14 +171,13 @@ void MetaStorageBackendTestBase::AssertListKeys(MetaStorageBackend *meta_storage
     ASSERT_TRUE(meta_storage_backend);
     std::string next_cursor;
     std::vector<KeyType> keys;
-    ErrorCode ec = meta_storage_backend->ListKeys(cursor, limit, next_cursor, keys);
+    ErrorCode ec = meta_storage_backend->ListKeys(nullptr, cursor, limit, next_cursor, keys);
     ASSERT_EQ(expected_ec, ec);
     if (ec == EC_OK) {
         ASSERT_EQ(expected_next_cursor, next_cursor);
-        ASSERT_EQ(std::min((size_t)limit, expected_keys.size()), keys.size());
+        ASSERT_EQ(std::min(static_cast<size_t>(limit), expected_keys.size()), keys.size());
         for (const auto &key : keys) {
-            const auto iter = expected_keys.find(key);
-            ASSERT_TRUE(iter != expected_keys.end()) << key;
+            ASSERT_TRUE(expected_keys.count(key)) << key;
         }
     } else {
         ASSERT_EQ("", next_cursor);
@@ -114,13 +193,12 @@ void MetaStorageBackendTestBase::AssertListKeysByStep(MetaStorageBackend *meta_s
                                                       std::string &out_next_cursor) {
     ASSERT_TRUE(meta_storage_backend);
     std::vector<KeyType> keys;
-    ErrorCode ec = meta_storage_backend->ListKeys(cursor, limit, out_next_cursor, keys);
+    ErrorCode ec = meta_storage_backend->ListKeys(nullptr, cursor, limit, out_next_cursor, keys);
     ASSERT_EQ(expected_ec, ec);
     if (ec == EC_OK) {
-        ASSERT_EQ(std::min((size_t)limit, expected_keys.size()), keys.size());
+        ASSERT_EQ(std::min(static_cast<size_t>(limit), expected_keys.size()), keys.size());
         for (const auto &key : keys) {
-            const auto iter = expected_keys.find(key);
-            ASSERT_TRUE(iter != expected_keys.end()) << key;
+            ASSERT_TRUE(expected_keys.count(key)) << key;
         }
     } else {
         ASSERT_EQ("", out_next_cursor);
@@ -134,31 +212,29 @@ void MetaStorageBackendTestBase::AssertSampleReclaimKeys(MetaStorageBackend *met
                                                          const std::set<KeyType> &expected_keys) {
     ASSERT_TRUE(meta_storage_backend);
     std::vector<KeyType> keys;
-    ErrorCode ec = meta_storage_backend->SampleReclaimKeys(count, keys);
+    ErrorCode ec = meta_storage_backend->SampleReclaimKeys(nullptr, count, keys);
     ASSERT_EQ(expected_ec, ec);
     for (const auto &key : keys) {
-        const auto iter = expected_keys.find(key);
-        ASSERT_TRUE(iter != expected_keys.end()) << key;
+        ASSERT_TRUE(expected_keys.count(key)) << key;
     }
 }
 
-void MetaStorageBackendTestBase::AssertDeleteFields(MetaStorageBackend *meta_storage_backend,
-                                                    const KeyTypeVec &keys,
-                                                    const std::vector<std::vector<std::string>> &field_names_vec,
-                                                    const std::vector<ErrorCode> &expected_ec_vec) {
+void MetaStorageBackendTestBase::AssertDeleteLocations(MetaStorageBackend *meta_storage_backend,
+                                                       const KeyTypeVec &keys,
+                                                       const LocationIdsPerKey &location_ids,
+                                                       const std::vector<ErrorCode> &expected_ec_vec) {
     ASSERT_TRUE(meta_storage_backend);
-    std::vector<ErrorCode> ec_vec = meta_storage_backend->DeleteFields(keys, field_names_vec);
+    std::vector<ErrorCode> ec_vec = meta_storage_backend->DeleteLocations(nullptr, keys, location_ids);
     ASSERT_EQ(expected_ec_vec, ec_vec);
 }
 
-void MetaStorageBackendTestBase::AssertExistsFieldWithPrefix(MetaStorageBackend *meta_storage_backend,
-                                                             const KeyTypeVec &keys,
-                                                             const std::string &field_prefix,
-                                                             const std::vector<ErrorCode> &expected_ec_vec,
-                                                             const std::vector<bool> &expected_exists_vec) {
+void MetaStorageBackendTestBase::AssertExistsLocation(MetaStorageBackend *meta_storage_backend,
+                                                      const KeyTypeVec &keys,
+                                                      const std::vector<ErrorCode> &expected_ec_vec,
+                                                      const std::vector<bool> &expected_exists_vec) {
     ASSERT_TRUE(meta_storage_backend);
     std::vector<bool> exists_vec;
-    std::vector<ErrorCode> ec_vec = meta_storage_backend->ExistsFieldWithPrefix(keys, field_prefix, exists_vec);
+    std::vector<ErrorCode> ec_vec = meta_storage_backend->ExistsLocation(nullptr, keys, exists_vec);
     ASSERT_EQ(expected_ec_vec, ec_vec);
     ASSERT_EQ(expected_exists_vec, exists_vec);
 }

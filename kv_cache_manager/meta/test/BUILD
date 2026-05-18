@@ -64,6 +64,7 @@ cc_library(
     ],
     copts = ["-fno-access-control"],
     deps = [
+        "//kv_cache_manager/meta:meta_cache_base_backend",
         "//kv_cache_manager/meta:meta_storage_backend",
         "//kv_cache_manager/meta:meta_redis_backend",
         "@com_google_googletest//:gtest",

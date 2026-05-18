@@ -55,19 +55,19 @@ TEST_F(MetaDummyBackendTest, TestSimple) {
     ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Open());
 
     ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK, ErrorCode::EC_OK}),
-              meta_storage_backend_->Put({1, 2}, {{{"f1", "v1-1"}}, {{"f1", "v2-1"}}}));
+              PutWithFieldMaps(meta_storage_backend_.get(), {1, 2}, {{{"f1", "v1-1"}}, {{"f1", "v2-1"}}}));
     ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK, ErrorCode::EC_OK}),
-              meta_storage_backend_->UpdateFields({1, 2}, {{{"f2", "v1-2"}}, {{"f2", "v2-2"}}}));
+              UpdateWithFieldMaps(meta_storage_backend_.get(), {1, 2}, {{{"f2", "v1-2"}}, {{"f2", "v2-2"}}}));
 
     AssertExists(meta_storage_backend_.get(),
                  {1, 2, 3},
                  {ErrorCode::EC_OK, ErrorCode::EC_OK, ErrorCode::EC_OK},
                  /*is_exist*/ {true, true, false});
-    AssertGet(meta_storage_backend_.get(),
-              {1, 2},
-              {"f1", "f2"},
-              {ErrorCode::EC_OK, ErrorCode::EC_OK},
-              {{{"f1", "v1-1"}, {"f2", "v1-2"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}});
+    AssertGetProperties(meta_storage_backend_.get(),
+                        {1, 2},
+                        {"f1", "f2"},
+                        {ErrorCode::EC_OK, ErrorCode::EC_OK},
+                        {{{"f1", "v1-1"}, {"f2", "v1-2"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}});
     AssertListKeys(
         meta_storage_backend_.get(), SCAN_BASE_CURSOR, /*limit*/ 3, ErrorCode::EC_OK, SCAN_BASE_CURSOR, {1, 2});
     AssertSampleReclaimKeys(meta_storage_backend_.get(), /*count*/ 1, ErrorCode::EC_OK, {1, 2});
@@ -80,22 +80,22 @@ TEST_F(MetaDummyBackendTest, TestSimple) {
                  (std::vector<ErrorCode>{ErrorCode::EC_OK, ErrorCode::EC_OK, ErrorCode::EC_OK}),
                  /*is_exist*/ {true, true, false});
 
-    ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK}), meta_storage_backend_->Delete({1}));
-    ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_NOENT}), meta_storage_backend_->Delete({1}));
+    ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK}), meta_storage_backend_->Delete(nullptr, {1}));
+    ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_NOENT}), meta_storage_backend_->Delete(nullptr, {1}));
     ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK}),
-              meta_storage_backend_->Put({3}, {{{"f1", "v3-1"}, {"f2", "v3-2"}}}));
+              PutWithFieldMaps(meta_storage_backend_.get(), {3}, {{{"f1", "v3-1"}, {"f2", "v3-2"}}}));
     ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK}),
-              meta_storage_backend_->UpdateFields({2}, {{{"f1", "v2-1-1"}}}));
+              UpdateWithFieldMaps(meta_storage_backend_.get(), {2}, {{{"f1", "v2-1-1"}}}));
 
     AssertExists(meta_storage_backend_.get(),
                  {1, 2, 3},
                  {ErrorCode::EC_OK, ErrorCode::EC_OK, ErrorCode::EC_OK},
                  /*is_exist*/ {false, true, true});
-    AssertGet(meta_storage_backend_.get(),
-              {1, 2, 3},
-              {"f1", "f2"},
-              {ErrorCode::EC_NOENT, ErrorCode::EC_OK, ErrorCode::EC_OK},
-              {{}, {{"f1", "v2-1-1"}, {"f2", "v2-2"}}, {{"f1", "v3-1"}, {"f2", "v3-2"}}});
+    AssertGetProperties(meta_storage_backend_.get(),
+                        {1, 2, 3},
+                        {"f1", "f2"},
+                        {ErrorCode::EC_NOENT, ErrorCode::EC_OK, ErrorCode::EC_OK},
+                        {{}, {{"f1", "v2-1-1"}, {"f2", "v2-2"}}, {{"f1", "v3-1"}, {"f2", "v3-2"}}});
     AssertListKeys(
         meta_storage_backend_.get(), SCAN_BASE_CURSOR, /*limit*/ 3, ErrorCode::EC_OK, SCAN_BASE_CURSOR, {2, 3});
     AssertSampleReclaimKeys(meta_storage_backend_.get(), /*count*/ 1, ErrorCode::EC_OK, {2, 3});
@@ -114,20 +114,23 @@ TEST_F(MetaDummyBackendTest, TestPut) {
     ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Open());
 
     ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK, ErrorCode::EC_OK}),
-              meta_storage_backend_->Put({1, 2}, {{{"f1", "v1-1"}, {"f2", "v1-2"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}}));
-    AssertGet(meta_storage_backend_.get(),
-              {1, 2},
-              {"f1", "f2"},
-              {ErrorCode::EC_OK, ErrorCode::EC_OK},
-              {{{"f1", "v1-1"}, {"f2", "v1-2"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}});
+              PutWithFieldMaps(meta_storage_backend_.get(),
+                               {1, 2},
+                               {{{"f1", "v1-1"}, {"f2", "v1-2"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}}));
+    AssertGetProperties(meta_storage_backend_.get(),
+                        {1, 2},
+                        {"f1", "f2"},
+                        {ErrorCode::EC_OK, ErrorCode::EC_OK},
+                        {{{"f1", "v1-1"}, {"f2", "v1-2"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}});
 
-    ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK}),
-              meta_storage_backend_->Put({1}, {{{"f1", "v1-1-1"}, {"f3", "v1-3"}}})); // cover old value
-    AssertGet(meta_storage_backend_.get(),
-              {1, 2},
-              {"f1", "f2", "f3"},
-              {ErrorCode::EC_OK, ErrorCode::EC_OK},
-              {{{"f1", "v1-1-1"}, {"f3", "v1-3"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}});
+    ASSERT_EQ(
+        (std::vector<ErrorCode>{ErrorCode::EC_OK}),
+        PutWithFieldMaps(meta_storage_backend_.get(), {1}, {{{"f1", "v1-1-1"}, {"f3", "v1-3"}}})); // cover old value
+    AssertGetProperties(meta_storage_backend_.get(),
+                        {1, 2},
+                        {"f1", "f2", "f3"},
+                        {ErrorCode::EC_OK, ErrorCode::EC_OK},
+                        {{{"f1", "v1-1-1"}, {"f3", "v1-3"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}});
 
     ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Close());
 }
@@ -137,25 +140,28 @@ TEST_F(MetaDummyBackendTest, TestUpdateFields) {
     ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Open());
 
     ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK, ErrorCode::EC_OK}),
-              meta_storage_backend_->Put({1, 2}, {{{"f1", "v1-1"}, {"f2", "v1-2"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}}));
-    AssertGet(meta_storage_backend_.get(),
-              {1, 2},
-              {"f1", "f2"},
-              {ErrorCode::EC_OK, ErrorCode::EC_OK},
-              {{{"f1", "v1-1"}, {"f2", "v1-2"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}});
+              PutWithFieldMaps(meta_storage_backend_.get(),
+                               {1, 2},
+                               {{{"f1", "v1-1"}, {"f2", "v1-2"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}}));
+    AssertGetProperties(meta_storage_backend_.get(),
+                        {1, 2},
+                        {"f1", "f2"},
+                        {ErrorCode::EC_OK, ErrorCode::EC_OK},
+                        {{{"f1", "v1-1"}, {"f2", "v1-2"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}});
 
     ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK, ErrorCode::EC_OK}),
-              meta_storage_backend_->UpdateFields(
-                  {1, 2}, {{{"f1", "v1-1-1"}, {"f3", "v1-3"}}, {{"f2", "v2-2-1"}}})); // merge old value
-    AssertGet(meta_storage_backend_.get(),
-              {1, 2},
-              {"f1", "f2", "f3"},
-              {ErrorCode::EC_OK, ErrorCode::EC_OK},
-              {{{"f1", "v1-1-1"}, {"f2", "v1-2"}, {"f3", "v1-3"}}, {{"f1", "v2-1"}, {"f2", "v2-2-1"}}});
+              UpdateWithFieldMaps(meta_storage_backend_.get(),
+                                  {1, 2},
+                                  {{{"f1", "v1-1-1"}, {"f3", "v1-3"}}, {{"f2", "v2-2-1"}}})); // merge old value
+    AssertGetProperties(meta_storage_backend_.get(),
+                        {1, 2},
+                        {"f1", "f2", "f3"},
+                        {ErrorCode::EC_OK, ErrorCode::EC_OK},
+                        {{{"f1", "v1-1-1"}, {"f2", "v1-2"}, {"f3", "v1-3"}}, {{"f1", "v2-1"}, {"f2", "v2-2-1"}}});
 
     // can not update key that dont exist
     ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_NOENT}),
-              meta_storage_backend_->UpdateFields({3}, {{{"f1", "v3-1"}}}));
+              UpdateWithFieldMaps(meta_storage_backend_.get(), {3}, {{{"f1", "v3-1"}}}));
 
     ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Close());
 }
@@ -165,17 +171,20 @@ TEST_F(MetaDummyBackendTest, TestUpsert) {
     ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Open());
 
     ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK, ErrorCode::EC_OK}),
-              meta_storage_backend_->Put({1, 2}, {{{"f1", "v1-1"}, {"f2", "v1-2"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}}));
-    AssertGet(meta_storage_backend_.get(),
-              {1, 2},
-              {"f1", "f2"},
-              {ErrorCode::EC_OK, ErrorCode::EC_OK},
-              {{{"f1", "v1-1"}, {"f2", "v1-2"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}});
+              PutWithFieldMaps(meta_storage_backend_.get(),
+                               {1, 2},
+                               {{{"f1", "v1-1"}, {"f2", "v1-2"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}}));
+    AssertGetProperties(meta_storage_backend_.get(),
+                        {1, 2},
+                        {"f1", "f2"},
+                        {ErrorCode::EC_OK, ErrorCode::EC_OK},
+                        {{{"f1", "v1-1"}, {"f2", "v1-2"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}});
     // update or insert
     ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK, ErrorCode::EC_OK, ErrorCode::EC_OK}),
-              meta_storage_backend_->Upsert(
-                  {1, 2, 3}, {{{"f1", "v1-1-1"}, {"f3", "v1-3"}}, {{"f2", "v2-2-1"}}, {{"f3", "v3-1"}}}));
-    AssertGet(
+              UpsertWithFieldMaps(meta_storage_backend_.get(),
+                                  {1, 2, 3},
+                                  {{{"f1", "v1-1-1"}, {"f3", "v1-3"}}, {{"f2", "v2-2-1"}}, {{"f3", "v3-1"}}}));
+    AssertGetProperties(
         meta_storage_backend_.get(),
         {1, 2, 3},
         {"f1", "f2", "f3"},
@@ -191,12 +200,14 @@ TEST_F(MetaDummyBackendTest, TestDelete) {
 
     ASSERT_EQ(
         (std::vector<ErrorCode>{ErrorCode::EC_OK, ErrorCode::EC_OK, ErrorCode::EC_OK}),
-        meta_storage_backend_->Put(
+        PutWithFieldMaps(
+            meta_storage_backend_.get(),
             {1, 2, 3},
             {{{"f1", "v1-1"}, {"f2", "v1-2"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}, {{"f1", "v3-1"}, {"f2", "v3-2"}}}));
-    ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK, ErrorCode::EC_OK}), meta_storage_backend_->Delete({1, 3}));
+    ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK, ErrorCode::EC_OK}),
+              meta_storage_backend_->Delete(nullptr, {1, 3}));
     ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_NOENT, ErrorCode::EC_NOENT}),
-              meta_storage_backend_->Delete({1, 3}));
+              meta_storage_backend_->Delete(nullptr, {1, 3}));
     AssertExists(meta_storage_backend_.get(),
                  {1, 2, 3},
                  {ErrorCode::EC_OK, ErrorCode::EC_OK, ErrorCode::EC_OK},
@@ -210,20 +221,22 @@ TEST_F(MetaDummyBackendTest, TestGet) {
     ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Open());
 
     ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK, ErrorCode::EC_OK}),
-              meta_storage_backend_->Put({1, 2}, {{{"f1", "v1-1"}, {"f2", "v1-2"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}}));
-    AssertGet(meta_storage_backend_.get(),
-              {1, 2},
-              {"f1"},
-              {ErrorCode::EC_OK, ErrorCode::EC_OK},
-              {{{"f1", "v1-1"}}, {{"f1", "v2-1"}}}); // part fields
-    AssertGet(meta_storage_backend_.get(),
-              {1, 2},
-              {"f1", "f2"},
-              {ErrorCode::EC_OK, ErrorCode::EC_OK},
-              {{{"f1", "v1-1"}, {"f2", "v1-2"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}}); // all fields
-    AssertGet(
+              PutWithFieldMaps(meta_storage_backend_.get(),
+                               {1, 2},
+                               {{{"f1", "v1-1"}, {"f2", "v1-2"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}}));
+    AssertGetProperties(meta_storage_backend_.get(),
+                        {1, 2},
+                        {"f1"},
+                        {ErrorCode::EC_OK, ErrorCode::EC_OK},
+                        {{{"f1", "v1-1"}}, {{"f1", "v2-1"}}}); // part fields
+    AssertGetProperties(meta_storage_backend_.get(),
+                        {1, 2},
+                        {"f1", "f2"},
+                        {ErrorCode::EC_OK, ErrorCode::EC_OK},
+                        {{{"f1", "v1-1"}, {"f2", "v1-2"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}}); // all fields
+    AssertGetProperties(
         meta_storage_backend_.get(), {1, 2}, {}, {ErrorCode::EC_OK, ErrorCode::EC_OK}, FieldMapVec(2)); // no fields
-    AssertGet(meta_storage_backend_.get(), {3}, {"f1", "f2"}, {ErrorCode::EC_NOENT}, {{}});             // key not exist
+    AssertGetProperties(meta_storage_backend_.get(), {3}, {"f1", "f2"}, {ErrorCode::EC_NOENT}, {{}});   // key not exist
 
     ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Close());
 }
@@ -233,7 +246,9 @@ TEST_F(MetaDummyBackendTest, TestGetAll) {
     ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Open());
 
     ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK, ErrorCode::EC_OK}),
-              meta_storage_backend_->Put({1, 2}, {{{"f1", "v1-1"}, {"f2", "v1-2"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}}));
+              PutWithFieldMaps(meta_storage_backend_.get(),
+                               {1, 2},
+                               {{{"f1", "v1-1"}, {"f2", "v1-2"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}}));
     AssertGetAllFields(meta_storage_backend_.get(),
                        {1, 2},
                        {ErrorCode::EC_OK, ErrorCode::EC_OK},
@@ -248,7 +263,9 @@ TEST_F(MetaDummyBackendTest, TestExists) {
     ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Open());
 
     ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK, ErrorCode::EC_OK}),
-              meta_storage_backend_->Put({1, 2}, {{{"f1", "v1-1"}, {"f2", "v1-2"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}}));
+              PutWithFieldMaps(meta_storage_backend_.get(),
+                               {1, 2},
+                               {{{"f1", "v1-1"}, {"f2", "v1-2"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}}));
     AssertExists(meta_storage_backend_.get(),
                  {1, 2, 3},
                  {ErrorCode::EC_OK, ErrorCode::EC_OK, ErrorCode::EC_OK},
@@ -262,11 +279,11 @@ TEST_F(MetaDummyBackendTest, TestListKeys) {
     ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Open());
 
     ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK}),
-              meta_storage_backend_->Put({1}, {{{"f1", "v1-1"}, {"f2", "v1-2"}}}));
+              PutWithFieldMaps(meta_storage_backend_.get(), {1}, {{{"f1", "v1-1"}, {"f2", "v1-2"}}}));
     ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK}),
-              meta_storage_backend_->Put({2}, {{{"f1", "v2-1"}, {"f2", "v2-2"}}}));
+              PutWithFieldMaps(meta_storage_backend_.get(), {2}, {{{"f1", "v2-1"}, {"f2", "v2-2"}}}));
     ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK}),
-              meta_storage_backend_->Put({3}, {{{"f1", "v3-1"}, {"f2", "v3-2"}}}));
+              PutWithFieldMaps(meta_storage_backend_.get(), {3}, {{{"f1", "v3-1"}, {"f2", "v3-2"}}}));
 
     // list keys by step
     std::string current_cursor = SCAN_BASE_CURSOR;
@@ -299,9 +316,9 @@ TEST_F(MetaDummyBackendTest, TestRandomSample) {
     ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Open());
 
     ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK}),
-              meta_storage_backend_->Put({1}, {{{"f1", "v1-1"}, {"f2", "v1-2"}}}));
+              PutWithFieldMaps(meta_storage_backend_.get(), {1}, {{{"f1", "v1-1"}, {"f2", "v1-2"}}}));
     ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK}),
-              meta_storage_backend_->Put({2}, {{{"f1", "v2-1"}, {"f2", "v2-2"}}}));
+              PutWithFieldMaps(meta_storage_backend_.get(), {2}, {{{"f1", "v2-1"}, {"f2", "v2-2"}}}));
     AssertSampleReclaimKeys(meta_storage_backend_.get(), /*count*/ 0, ErrorCode::EC_OK, {1, 2});
     AssertSampleReclaimKeys(meta_storage_backend_.get(), /*count*/ 1, ErrorCode::EC_OK, {1, 2});
     AssertSampleReclaimKeys(meta_storage_backend_.get(), /*count*/ 2, ErrorCode::EC_OK, {1, 2});
@@ -319,12 +336,12 @@ TEST_F(MetaDummyBackendTest, TestRecover) {
         {
             std::string keyStr = std::to_string(i);
             ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK}),
-                      meta_storage_backend_->Put({i}, {{{"f" + keyStr, "v" + keyStr}}}));
+                      PutWithFieldMaps(meta_storage_backend_.get(), {i}, {{{"f" + keyStr, "v" + keyStr}}}));
         }
 
         for (std::int32_t j = 0; j <= i; ++j) {
             std::string keyStr = std::to_string(j);
-            AssertGet(
+            AssertGetProperties(
                 meta_storage_backend_.get(), {j}, {"f" + keyStr}, {ErrorCode::EC_OK}, {{{"f" + keyStr, "v" + keyStr}}});
         }
 
@@ -341,130 +358,76 @@ TEST_F(MetaDummyBackendTest, TestRecoverBinarySafe) {
         {
             std::string keyStr = std::to_string(i);
             ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK}),
-                      meta_storage_backend_->Put({i}, {{{"f " + keyStr, "v " + keyStr}}}));
+                      PutWithFieldMaps(meta_storage_backend_.get(), {i}, {{{"f " + keyStr, "v " + keyStr}}}));
         }
 
         for (std::int32_t j = 0; j <= i; ++j) {
             std::string keyStr = std::to_string(j);
-            AssertGet(meta_storage_backend_.get(),
-                      {j},
-                      {"f " + keyStr},
-                      {ErrorCode::EC_OK},
-                      {{{"f " + keyStr, "v " + keyStr}}});
+            AssertGetProperties(meta_storage_backend_.get(),
+                                {j},
+                                {"f " + keyStr},
+                                {ErrorCode::EC_OK},
+                                {{{"f " + keyStr, "v " + keyStr}}});
         }
 
         ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Close());
     }
 }
 
-TEST_F(MetaDummyBackendTest, TestDeleteFields) {
+TEST_F(MetaDummyBackendTest, TestDeleteLocations) {
     ASSERT_EQ(ErrorCode::EC_OK,
-              meta_storage_backend_->Init("test_instance_delete_fields", meta_storage_backend_config_));
+              meta_storage_backend_->Init("test_instance_delete_locations", meta_storage_backend_config_));
     ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Open());
 
+    // Seed: key 1 has two locations + one property; key 2 has one location + one property.
     ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK, ErrorCode::EC_OK}),
-              meta_storage_backend_->Put(
-                  {1, 2}, {{{"f1", "v1-1"}, {"f2", "v1-2"}, {"f3", "v1-3"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}}));
+              PutWithFieldMaps(meta_storage_backend_.get(),
+                               {1, 2},
+                               {{{LOCATION_PREFIX + "a", "la"}, {LOCATION_PREFIX + "b", "lb"}, {"p0", "v0"}},
+                                {{LOCATION_PREFIX + "c", "lc"}, {"p0", "v0"}}}));
 
-    // key 1: delete one of three fields; key 2: delete all listed fields;
-    // key 3: not exist -> EC_NOENT.
-    AssertDeleteFields(meta_storage_backend_.get(),
-                       {1, 2, 3},
-                       {{"f1"}, {"f1", "f2"}, {"f1"}},
-                       {ErrorCode::EC_OK, ErrorCode::EC_OK, ErrorCode::EC_NOENT});
+    // key 1: delete one of two locations; key 2: delete its only location;
+    // key 3: does not exist -> EC_NOENT.
+    AssertDeleteLocations(meta_storage_backend_.get(),
+                          {1, 2, 3},
+                          {{"a"}, {"c"}, {"anything"}},
+                          {ErrorCode::EC_OK, ErrorCode::EC_OK, ErrorCode::EC_NOENT});
 
-    // Surviving fields are intact; deleted fields are absent.
-    AssertGet(meta_storage_backend_.get(),
-              {1, 2},
-              {"f1", "f2", "f3"},
-              {ErrorCode::EC_OK, ErrorCode::EC_OK},
-              {{{"f2", "v1-2"}, {"f3", "v1-3"}}, {}});
+    // Deleting a non-existent location on an existing key still returns EC_OK.
+    AssertDeleteLocations(meta_storage_backend_.get(), {1}, {{"not_exist_loc"}}, {ErrorCode::EC_OK});
 
-    // Deleting a non-existent field on an existing key still returns EC_OK.
-    AssertDeleteFields(meta_storage_backend_.get(), {1}, {{"not_exist_field"}}, {ErrorCode::EC_OK});
+    // Empty location id list on an existing key is a no-op (EC_OK).
+    AssertDeleteLocations(meta_storage_backend_.get(), {2}, {{}}, {ErrorCode::EC_OK});
 
-    // Empty field list on an existing key is a no-op (EC_OK), original fields kept.
-    AssertDeleteFields(meta_storage_backend_.get(), {1}, {{}}, {ErrorCode::EC_OK});
-    AssertGet(meta_storage_backend_.get(), {1}, {"f2", "f3"}, {ErrorCode::EC_OK}, {{{"f2", "v1-2"}, {"f3", "v1-3"}}});
+    // Properties survive location deletion.
+    AssertGetProperties(meta_storage_backend_.get(),
+                        {1, 2},
+                        {"p0"},
+                        {ErrorCode::EC_OK, ErrorCode::EC_OK},
+                        {{{"p0", "v0"}}, {{"p0", "v0"}}});
 
     ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Close());
 }
 
-TEST_F(MetaDummyBackendTest, TestExistsFieldWithPrefix) {
+TEST_F(MetaDummyBackendTest, TestExistsLocation) {
     ASSERT_EQ(ErrorCode::EC_OK,
-              meta_storage_backend_->Init("test_instance_exists_prefix", meta_storage_backend_config_));
+              meta_storage_backend_->Init("test_instance_exists_location", meta_storage_backend_config_));
     ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Open());
 
-    // key 1: has LOCATION_PREFIX field; key 2: has only normal fields; key 3: not exist.
+    // key 1: has location; key 2: has only properties; key 3: not exist.
     ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK, ErrorCode::EC_OK}),
-              meta_storage_backend_->Put({1, 2}, {{{LOCATION_PREFIX + "a", "la"}, {"p0", "v0"}}, {{"p0", "v0"}}}));
+              PutWithFieldMaps(meta_storage_backend_.get(),
+                               {1, 2},
+                               {{{LOCATION_PREFIX + "a", "la"}, {"p0", "v0"}}, {{"p0", "v0"}}}));
 
-    AssertExistsFieldWithPrefix(meta_storage_backend_.get(),
-                                {1, 2, 3},
-                                LOCATION_PREFIX,
-                                {ErrorCode::EC_OK, ErrorCode::EC_OK, ErrorCode::EC_NOENT},
-                                {true, false, false});
+    AssertExistsLocation(meta_storage_backend_.get(),
+                         {1, 2, 3},
+                         {ErrorCode::EC_OK, ErrorCode::EC_OK, ErrorCode::EC_NOENT},
+                         {true, false, false});
 
-    // After removing the only LOCATION_PREFIX field from key 1, prefix check is false.
-    AssertDeleteFields(meta_storage_backend_.get(), {1}, {{LOCATION_PREFIX + "a"}}, {ErrorCode::EC_OK});
-    AssertExistsFieldWithPrefix(meta_storage_backend_.get(), {1}, LOCATION_PREFIX, {ErrorCode::EC_OK}, {false});
-
-    ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Close());
-}
-
-// Tombstone: a location field with empty value should not be treated as valid.
-TEST_F(MetaDummyBackendTest, TestTombstoneNotTreatedAsValidLocation) {
-    ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Init("test_instance_tombstone", meta_storage_backend_config_));
-    ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Open());
-
-    // Put key 1 with a real location and a tombstone (empty value) location.
-    ASSERT_EQ(
-        (std::vector<ErrorCode>{ErrorCode::EC_OK}),
-        meta_storage_backend_->Put({1}, {{{LOCATION_PREFIX + "real", "valid_data"}, {LOCATION_PREFIX + "tomb", ""}}}));
-
-    // ExistsFieldWithPrefix should return true (real location exists).
-    AssertExistsFieldWithPrefix(meta_storage_backend_.get(), {1}, LOCATION_PREFIX, {ErrorCode::EC_OK}, {true});
-
-    // GetFieldNamesWithPrefix should only return the non-tombstone field.
-    std::vector<std::vector<std::string>> field_names_vec;
-    auto ecs = meta_storage_backend_->GetFieldNamesWithPrefix({1}, LOCATION_PREFIX, field_names_vec);
-    ASSERT_EQ(ErrorCode::EC_OK, ecs[0]);
-    ASSERT_EQ(1u, field_names_vec[0].size());
-    EXPECT_EQ(LOCATION_PREFIX + "real", field_names_vec[0][0]);
-
-    // Now update the real location to empty (tombstone it).
-    ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK}),
-              meta_storage_backend_->UpdateFields({1}, {{{LOCATION_PREFIX + "real", ""}}}));
-
-    // Both locations are now tombstones — should report no valid locations.
-    AssertExistsFieldWithPrefix(meta_storage_backend_.get(), {1}, LOCATION_PREFIX, {ErrorCode::EC_OK}, {false});
-    field_names_vec.clear();
-    ecs = meta_storage_backend_->GetFieldNamesWithPrefix({1}, LOCATION_PREFIX, field_names_vec);
-    ASSERT_EQ(ErrorCode::EC_OK, ecs[0]);
-    EXPECT_TRUE(field_names_vec[0].empty());
-
-    ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Close());
-}
-
-TEST_F(MetaDummyBackendTest, TestGetPerKeyFields) {
-    ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Init("test_instance_0", meta_storage_backend_config_));
-    ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Open());
-
-    ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK, ErrorCode::EC_OK}),
-              meta_storage_backend_->Put(
-                  {1, 2}, {{{"f1", "v1-1"}, {"f2", "v1-2"}, {"f3", "v1-3"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}}));
-
-    // Each key queries a different subset; key 3 does not exist; key 2 asks for
-    // a missing field "f3" which is silently dropped from the returned map.
-    FieldMapVec field_maps;
-    ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK, ErrorCode::EC_OK, ErrorCode::EC_NOENT}),
-              meta_storage_backend_->Get(
-                  {1, 2, 3}, std::vector<std::vector<std::string>>{{"f1", "f3"}, {"f2", "f3"}, {"f1"}}, field_maps));
-    ASSERT_EQ((FieldMapVec{{{"f1", "v1-1"}, {"f3", "v1-3"}}, {{"f2", "v2-2"}}, {}}), field_maps);
-
-    // Size mismatch between keys and field_names_vec -> EC_BADARGS per key.
-    ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_BADARGS, ErrorCode::EC_BADARGS}),
-              meta_storage_backend_->Get({1, 2}, std::vector<std::vector<std::string>>{{"f1"}}, field_maps));
+    // After removing the only location from key 1, ExistsLocation is false.
+    AssertDeleteLocations(meta_storage_backend_.get(), {1}, {{"a"}}, {ErrorCode::EC_OK});
+    AssertExistsLocation(meta_storage_backend_.get(), {1}, {ErrorCode::EC_OK}, {false});
 
     ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Close());
 }

@@ -131,7 +131,7 @@ ErrorCode MetaIndexer::Init(const std::string &instance_id, const std::shared_pt
 
 MetaIndexer::Result MetaIndexer::Put(RequestContext *request_context,
                                      const KeyVector &keys,
-                                     LocationMapVector &location_maps,
+                                     CacheLocationMapVector &location_maps,
                                      PropertyMapVector &properties) noexcept {
     if (keys.size() == 0) {
         return Result(EC_OK);
@@ -182,7 +182,7 @@ MetaIndexer::Result MetaIndexer::Put(RequestContext *request_context,
 
 MetaIndexer::Result MetaIndexer::Update(RequestContext *request_context,
                                         const KeyVector &keys,
-                                        LocationMapVector &location_maps,
+                                        CacheLocationMapVector &location_maps,
                                         PropertyMapVector &properties) noexcept {
     if (keys.size() == 0) {
         return Result(EC_OK);
@@ -230,7 +230,7 @@ MetaIndexer::Result MetaIndexer::Delete(RequestContext *request_context, const K
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_key_count, keys.size());
     const auto &trace_id = request_context->trace_id();
     static LocationIdsPerKey empty_location_ids;
-    static LocationMapVector empty_locations;
+    static CacheLocationMapVector empty_locations;
     static PropertyMapVector empty_properties;
     std::vector<BatchMetaData> batches = MakeBatches(keys, empty_location_ids, empty_locations, empty_properties);
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_batch_num, batches.size());
@@ -239,7 +239,7 @@ MetaIndexer::Result MetaIndexer::Delete(RequestContext *request_context, const K
     int64_t lock_wait_time_us = 0;
     for (auto &batch : batches) {
         ScopedBatchLock lock(*this, batch.batch_shard_indexs, &lock_wait_time_us);
-        auto error_codes = backend_manager_->Delete(batch.batch_keys);
+        std::vector<ErrorCode> error_codes = backend_manager_->Delete(request_context, batch.batch_keys);
         error_count += ProcessErrorCodes(trace_id, error_codes, batch.batch_indexs, keys, kDeleteMetaOperation, result);
     }
     AdjustKeyCountMeta(error_count - keys.size());
@@ -296,6 +296,7 @@ std::pair<int32_t, int32_t> MetaIndexer::ExecuteRmwUpsert(const std::string &tra
 }
 
 std::pair<int32_t, int32_t> MetaIndexer::ExecuteRmwDelete(const std::string &trace_id,
+                                                          RequestContext *request_context,
                                                           const BatchMetaData &delete_batch,
                                                           const KeyVector &all_keys,
                                                           RmwStats &stats,
@@ -309,10 +310,10 @@ std::pair<int32_t, int32_t> MetaIndexer::ExecuteRmwDelete(const std::string &tra
     std::vector<ErrorCode> delete_ecs;
     int32_t reclaimed_count = 0;
     if (delete_batch.batch_location_ids.empty()) {
-        delete_ecs = backend_manager_->Delete(delete_batch.batch_keys);
+        delete_ecs = backend_manager_->Delete(request_context, delete_batch.batch_keys);
     } else {
-        delete_ecs =
-            backend_manager_->Delete(delete_batch.batch_keys, delete_batch.batch_location_ids, reclaimed_count);
+        delete_ecs = backend_manager_->Delete(
+            request_context, delete_batch.batch_keys, delete_batch.batch_location_ids, reclaimed_count);
     }
     stats.delete_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin;
 
@@ -370,7 +371,7 @@ MetaIndexer::Result MetaIndexer::ReadModifyWriteBlock(RequestContext *request_co
         std::make_shared<RequestContext>("read_modify_write_block", ephemeral_metrics_collector);
 
     static LocationIdsPerKey empty_location_ids;
-    static LocationMapVector empty_locations;
+    static CacheLocationMapVector empty_locations;
     static PropertyMapVector empty_properties;
     std::vector<BatchMetaData> batches = MakeBatches(keys, empty_location_ids, empty_locations, empty_properties);
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_batch_num, batches.size());
@@ -385,7 +386,8 @@ MetaIndexer::Result MetaIndexer::ReadModifyWriteBlock(RequestContext *request_co
         const auto &batch_keys = batch.batch_keys;
         LocationIdsPerKey batch_location_ids;
         const int64_t begin_get = TimestampUtil::GetCurrentTimeUs();
-        std::vector<ErrorCode> get_ecs = backend_manager_->GetLocationIds(batch_keys, batch_location_ids);
+        std::vector<ErrorCode> get_ecs =
+            backend_manager_->GetLocationIds(ephemeral_request_context.get(), batch_keys, batch_location_ids);
         stats.get_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin_get;
 
         // 2. Modify -> bucket each key into upsert_batch / delete_batch.
@@ -399,7 +401,7 @@ MetaIndexer::Result MetaIndexer::ReadModifyWriteBlock(RequestContext *request_co
             const ErrorCode get_ec = get_ecs[i];
             const int32_t global_idx = batch.batch_indexs[i];
             PropertyMap upsert_property_map;
-            LocationMap out_new_locations;
+            CacheLocationMap out_new_locations;
             const auto [action, modifier_ec] = modifier(
                 existing_location_ids, get_ec, static_cast<size_t>(global_idx), upsert_property_map, out_new_locations);
             if (action == MA_OK) {
@@ -430,7 +432,8 @@ MetaIndexer::Result MetaIndexer::ReadModifyWriteBlock(RequestContext *request_co
         // 3. Dispatch upsert and delete sub-batches.
         const auto [upsert_errs, put_success_count] = ExecuteRmwUpsert(
             trace_id, ephemeral_request_context.get(), upsert_batch, put_global_indexs, keys, stats, result);
-        const auto [delete_errs, delete_success_count] = ExecuteRmwDelete(trace_id, delete_batch, keys, stats, result);
+        const auto [delete_errs, delete_success_count] =
+            ExecuteRmwDelete(trace_id, ephemeral_request_context.get(), delete_batch, keys, stats, result);
         error_count += upsert_errs + delete_errs;
         AdjustKeyCountMeta(put_success_count - delete_success_count);
     }
@@ -465,7 +468,7 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocation(RequestContext 
     auto ephemeral_request_context =
         std::make_shared<RequestContext>("read_modify_write_location", ephemeral_metrics_collector);
 
-    static LocationMapVector empty_locations;
+    static CacheLocationMapVector empty_locations;
     static PropertyMapVector empty_properties;
     std::vector<BatchMetaData> batches = MakeBatches(keys, location_ids, empty_locations, empty_properties);
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_batch_num, batches.size());
@@ -511,7 +514,7 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocation(RequestContext 
                 action = MA_FAIL;
             }
             if (action == MA_OK) {
-                LocationMap upsert_loc_map;
+                CacheLocationMap upsert_loc_map;
                 for (size_t loc_index = 0; loc_index < loc_ids.size(); ++loc_index) {
                     if (modifier_ecs[loc_index] != EC_OK) {
                         location_result.per_location_error_codes[global_idx][loc_index] = modifier_ecs[loc_index];
@@ -564,7 +567,7 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocation(RequestContext 
             }
         }
         const auto [delete_errs, delete_success_count] =
-            ExecuteRmwDelete(trace_id, delete_batch, keys, stats, rmw_result);
+            ExecuteRmwDelete(trace_id, ephemeral_request_context.get(), delete_batch, keys, stats, rmw_result);
         for (const auto &global_index : delete_batch.batch_indexs) {
             for (const auto &location_index : delete_location_indexs[global_index]) {
                 location_result.per_location_error_codes[global_index][location_index] =
@@ -591,7 +594,7 @@ MetaIndexer::Result
 MetaIndexer::Exist(RequestContext *request_context, const KeyVector &keys, std::vector<bool> &out_exists) noexcept {
     const auto &trace_id = request_context->trace_id();
     out_exists.reserve(keys.size());
-    auto error_codes = backend_manager_->Exists(keys, out_exists);
+    std::vector<ErrorCode> error_codes = backend_manager_->Exists(request_context, keys, out_exists);
 
     Result result(keys.size());
     int32_t error_count = ProcessErrorCodes(trace_id, error_codes, {}, keys, kExistMetaOperation, result);
@@ -601,7 +604,7 @@ MetaIndexer::Exist(RequestContext *request_context, const KeyVector &keys, std::
 
 MetaIndexer::Result MetaIndexer::Get(RequestContext *request_context,
                                      const KeyVector &keys,
-                                     LocationMapVector &out_location_maps,
+                                     CacheLocationMapVector &out_location_maps,
                                      PropertyMapVector &out_properties) noexcept {
     if (keys.empty()) {
         out_location_maps.clear();
@@ -612,54 +615,20 @@ MetaIndexer::Result MetaIndexer::Get(RequestContext *request_context,
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, query_key_count, keys.size());
     const auto &trace_id = request_context->trace_id();
 
-    out_location_maps.assign(keys.size(), LocationMap{});
-    out_properties.assign(keys.size(), PropertyMap{});
-
-    FieldMapVec field_maps;
     int64_t begin_get_io_time = TimestampUtil::GetCurrentTimeUs();
-    auto error_codes = backend_manager_->GetAllFields(keys, field_maps);
+    auto error_codes = backend_manager_->Get(request_context, keys, out_location_maps, out_properties);
     KVCM_METRICS_COLLECTOR_SET_METRICS(
         service_metrics_collector, meta_indexer, get_io_time_us, TimestampUtil::GetCurrentTimeUs() - begin_get_io_time);
 
     Result result(keys.size());
-    int32_t error_count = 0;
-    for (size_t i = 0; i < keys.size(); ++i) {
-        if (error_codes[i] != EC_OK) {
-            if (error_codes[i] != EC_NOENT) {
-                PREFIX_INDEXER_LOG(ERROR, "meta indexer get failed, key[%ld] ec[%d]", keys[i], error_codes[i]);
-            }
-            result.error_codes[i] = error_codes[i];
-            ++error_count;
-            continue;
-        }
-        for (auto &kv : field_maps[i]) {
-            if (kv.first.rfind(LOCATION_PREFIX, 0) == 0) {
-                if (kv.second.empty()) {
-                    continue;
-                }
-                CacheLocation location;
-                if (!location.FromJsonString(kv.second)) {
-                    PREFIX_INDEXER_LOG(
-                        ERROR, "deserialize CacheLocation failed, key[%ld] field[%s]", keys[i], kv.first.c_str());
-                    result.error_codes[i] = EC_CORRUPTION;
-                    ++error_count;
-                    out_location_maps[i].clear();
-                    out_properties[i].clear();
-                    break;
-                }
-                out_location_maps[i].emplace(location.id(), std::move(location));
-            } else {
-                out_properties[i].emplace(kv.first, std::move(kv.second));
-            }
-        }
-    }
+    int32_t error_count = ProcessErrorCodes(trace_id, error_codes, {}, keys, kGetMetaOperation, result);
     ProcessErrorResult(trace_id, kGetMetaOperation, error_count, keys.size(), result);
     return result;
 }
 
 MetaIndexer::Result MetaIndexer::GetLocations(RequestContext *request_context,
                                               const KeyVector &keys,
-                                              LocationMapVector &out_location_maps) noexcept {
+                                              CacheLocationMapVector &out_location_maps) noexcept {
     if (keys.empty()) {
         out_location_maps.clear();
         return Result(EC_OK);
@@ -738,7 +707,7 @@ MetaIndexer::Result MetaIndexer::GetProperties(RequestContext *request_context,
     const auto &trace_id = request_context->trace_id();
     out_properties.reserve(keys.size());
     int64_t begin_get_io_time = TimestampUtil::GetCurrentTimeUs();
-    auto error_codes = backend_manager_->Get(keys, property_names, out_properties);
+    auto error_codes = backend_manager_->GetProperties(request_context, keys, property_names, out_properties);
     KVCM_METRICS_COLLECTOR_SET_METRICS(
         service_metrics_collector, meta_indexer, get_io_time_us, TimestampUtil::GetCurrentTimeUs() - begin_get_io_time);
     Result result(keys.size());
@@ -747,12 +716,13 @@ MetaIndexer::Result MetaIndexer::GetProperties(RequestContext *request_context,
     return result;
 }
 
-ErrorCode MetaIndexer::Scan(const std::string &cursor,
+ErrorCode MetaIndexer::Scan(RequestContext *request_context,
+                            const std::string &cursor,
                             const size_t limit,
                             std::string &out_next_cursor,
                             KeyVector &out_keys) noexcept {
     out_keys.reserve(limit);
-    auto ec = backend_manager_->ListKeys(cursor, limit, out_next_cursor, out_keys);
+    ErrorCode ec = backend_manager_->ListKeys(request_context, cursor, limit, out_next_cursor, out_keys);
     if (ec != EC_OK) {
         KVCM_LOG_ERROR(
             "instance[%s] meta indexer scan failed, cursor[%s] limit[%lu] next cursor[%s] scan key size[%lu]",
@@ -770,7 +740,7 @@ MetaIndexer::RandomSample(RequestContext *request_context, const size_t count, K
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     out_keys.reserve(count);
     int64_t begin_get_io_time = TimestampUtil::GetCurrentTimeUs();
-    auto ec = backend_manager_->RandomSample(count, out_keys);
+    ErrorCode ec = backend_manager_->RandomSample(request_context, count, out_keys);
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector,
                                        meta_indexer,
                                        rand_io_time_us,
@@ -789,7 +759,7 @@ ErrorCode MetaIndexer::SampleReclaimKeys(RequestContext *request_context,
                                          KeyVector &out_keys) const noexcept {
     out_keys.clear();
     out_keys.reserve(count);
-    auto ec = backend_manager_->SampleReclaimKeys(count, out_keys);
+    ErrorCode ec = backend_manager_->SampleReclaimKeys(request_context, count, out_keys);
     if (ec != EC_OK) {
         KVCM_LOG_ERROR("instance[%s] meta indexer sample reclaim keys failed, count[%lu] sample key size[%lu]",
                        instance_id_.c_str(),
@@ -825,7 +795,7 @@ std::uint64_t MetaIndexer::SubStorageUsageByType(const DataStorageType &type, co
 
 std::vector<BatchMetaData> MetaIndexer::MakeBatches(const KeyVector &keys,
                                                     const LocationIdsPerKey &location_ids,
-                                                    LocationMapVector &locations,
+                                                    CacheLocationMapVector &locations,
                                                     PropertyMapVector &properties) const noexcept {
     std::vector<BatchMetaData> result;
 
@@ -879,7 +849,7 @@ std::vector<BatchMetaData> MetaIndexer::MakeBatches(const KeyVector &keys,
 
 ErrorCode MetaIndexer::RecoverMetaData() noexcept {
     PropertyMap metadata_map;
-    auto ec = backend_manager_->GetMetaData(metadata_map);
+    ErrorCode ec = backend_manager_->GetMetaData(metadata_map);
     if (ec == EC_NOENT) {
         KVCM_LOG_INFO("there is no metadata key in storage backend, no need to recover metadata");
         return ec;
@@ -917,7 +887,7 @@ void MetaIndexer::PersistMetaData() noexcept {
         std::map<std::string, std::string> metadata_map;
         metadata_map[METADATA_PROPERTY_KEY_COUNT] = std::to_string(key_count_);
         metadata_map[METADATA_PROPERTY_STORAGE_USAGE_DATA] = storage_usage_data_.Serialize();
-        auto ec = backend_manager_->PutMetaData(metadata_map);
+        ErrorCode ec = backend_manager_->PutMetaData(metadata_map);
         if (ec != EC_OK) {
             KVCM_LOG_WARN("meta indexer persist metadata failed, ec[%d]", ec);
         }
@@ -925,8 +895,6 @@ void MetaIndexer::PersistMetaData() noexcept {
     }
 }
 
-// 如果key重复，put时key count将重复计算，将比真实值偏大
-// KV Cache场景key是累积hash的计算值，同一个请求中不会存在重复值
 void MetaIndexer::AdjustKeyCountMeta(const int32_t delta) noexcept {
     if (delta >= 0) {
         key_count_ += delta;

@@ -34,7 +34,7 @@ void MetaIndexerTestBase::MakeKVData(const int64_t start, const int64_t end, KVD
     for (int64_t i = start; i < end; ++i) {
         data.keys.push_back(i);
         const std::string loc_id = "loc_" + std::to_string(i);
-        LocationMap loc_map;
+        CacheLocationMap loc_map;
         loc_map.emplace(loc_id, MakeLocation(loc_id, "uri_" + std::to_string(i)));
         data.location_maps.push_back(std::move(loc_map));
 
@@ -62,7 +62,7 @@ void MetaIndexerTestBase::MakeRandomKVData(const int64_t count,
         }
         data.keys.push_back(key);
         const std::string loc_id = "loc_" + std::to_string(key);
-        LocationMap loc_map;
+        CacheLocationMap loc_map;
         loc_map.emplace(loc_id, MakeLocation(loc_id, "uri_" + std::to_string(key)));
         data.location_maps.push_back(std::move(loc_map));
 
@@ -74,9 +74,9 @@ void MetaIndexerTestBase::MakeRandomKVData(const int64_t count,
 }
 
 void MetaIndexerTestBase::AssertGet(const KeyVector &keys,
-                                    const LocationMapVector &expect_location_maps,
+                                    const CacheLocationMapVector &expect_location_maps,
                                     const Result &expect_result) {
-    LocationMapVector out_locations;
+    CacheLocationMapVector out_locations;
     PropertyMapVector out_properties;
     auto result = meta_indexer_->Get(request_context_.get(), keys, out_locations, out_properties);
     ASSERT_EQ(expect_result.ec, result.ec);
@@ -102,10 +102,10 @@ void MetaIndexerTestBase::AssertGet(const KeyVector &keys,
 }
 
 void MetaIndexerTestBase::AssertGet(const KeyVector &keys,
-                                    const LocationMapVector &expect_location_maps,
+                                    const CacheLocationMapVector &expect_location_maps,
                                     const PropertyMapVector &expect_properties,
                                     const Result &expect_result) {
-    LocationMapVector out_locations;
+    CacheLocationMapVector out_locations;
     PropertyMapVector out_properties;
     auto result = meta_indexer_->Get(request_context_.get(), keys, out_locations, out_properties);
     ASSERT_EQ(expect_result.ec, result.ec);
@@ -154,7 +154,7 @@ void MetaIndexerTestBase::DoPutTest() {
     ASSERT_EQ(0, meta_indexer_->GetKeyCount());
     auto expect_result = Result(key_count);
     // Snapshot expected payload before the Put call moves the inputs.
-    LocationMapVector expect_locations;
+    CacheLocationMapVector expect_locations;
     expect_locations.reserve(key_count);
     for (const auto &m : data.location_maps) {
         expect_locations.emplace_back(m);
@@ -190,7 +190,7 @@ void MetaIndexerTestBase::DoUpdateTest() {
         m["p0"] = m["p0"] + "_new";
     }
     PropertyMapVector keep_properties = update_data.properties;
-    LocationMapVector keep_locations;
+    CacheLocationMapVector keep_locations;
     for (const auto &m : update_data.location_maps) {
         keep_locations.emplace_back(m);
     }
@@ -269,7 +269,7 @@ void MetaIndexerTestBase::DoDeleteAndExistTest() {
     ASSERT_EQ(EC_OK, result.ec);
     ASSERT_EQ((std::vector<bool>{false, false, true}), is_exists);
 
-    LocationMapVector expect_locations(key_count);
+    CacheLocationMapVector expect_locations(key_count);
     expect_locations[2].emplace("loc_2", MakeLocation("loc_2", "uri_2"));
     PropertyMapVector expect_properties(key_count);
     expect_properties[2] = {{"p0", "p0_2"}, {"p1", "p1_2"}};
@@ -300,7 +300,7 @@ void MetaIndexerTestBase::DoScanAndSampleReclaimKeysTest() {
     while (try_count-- && scan_count > 0) {
         std::string next_cursor;
         KeyVector out_keys;
-        ASSERT_EQ(EC_OK, meta_indexer_->Scan(cursor, /*limit*/ 50, next_cursor, out_keys));
+        ASSERT_EQ(EC_OK, meta_indexer_->Scan(nullptr, cursor, /*limit*/ 50, next_cursor, out_keys));
         cursor = next_cursor;
         scan_count -= out_keys.size();
         keys.insert(keys.end(), out_keys.begin(), out_keys.end());
@@ -340,7 +340,7 @@ void MetaIndexerTestBase::DoReadModifyWriteBlockTest() {
                               ErrorCode get_ec,
                               size_t /*key_index*/,
                               PropertyMap &upsert_property_map,
-                              LocationMap &out_new_locations) -> ModifierResult {
+                              CacheLocationMap &out_new_locations) -> ModifierResult {
         if (get_ec != EC_OK && get_ec != EC_NOENT) {
             return {MA_FAIL, get_ec};
         }
@@ -356,7 +356,7 @@ void MetaIndexerTestBase::DoReadModifyWriteBlockTest() {
                                       ErrorCode get_ec,
                                       size_t,
                                       PropertyMap &,
-                                      LocationMap &) -> ModifierResult {
+                                      CacheLocationMap &) -> ModifierResult {
         if (get_ec == EC_NOENT || (get_ec == EC_OK && existing_location_ids.empty())) {
             return {MA_SKIP, EC_OK};
         }
@@ -370,7 +370,7 @@ void MetaIndexerTestBase::DoReadModifyWriteBlockTest() {
                                      ErrorCode get_ec,
                                      size_t,
                                      PropertyMap &,
-                                     LocationMap &) -> ModifierResult {
+                                     CacheLocationMap &) -> ModifierResult {
         if (get_ec == EC_NOENT || (get_ec == EC_OK && existing_location_ids.empty())) {
             return {MA_FAIL, EC_NOENT};
         }
@@ -416,7 +416,7 @@ void MetaIndexerTestBase::DoReadModifyWriteBlockTest() {
 void MetaIndexerTestBase::DoReadModifyWriteLocationTest() {
     // Seed two keys, each with two locations (loc_a/loc_b).
     KeyVector keys = {0, 1};
-    LocationMapVector seed_locations(keys.size());
+    CacheLocationMapVector seed_locations(keys.size());
     PropertyMapVector seed_properties(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
         seed_locations[i].emplace("loc_a", MakeLocation("loc_a", "uri_a_" + std::to_string(keys[i])));
@@ -448,7 +448,7 @@ void MetaIndexerTestBase::DoReadModifyWriteLocationTest() {
     for (const auto &per_key : loc_result.per_location_error_codes) {
         ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), per_key);
     }
-    LocationMapVector expect_locations(keys.size());
+    CacheLocationMapVector expect_locations(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
         expect_locations[i].emplace("loc_a", MakeLocation("loc_a", "rmw_loc_a"));
         expect_locations[i].emplace("loc_b", MakeLocation("loc_b", "uri_b_" + std::to_string(keys[i])));
@@ -527,7 +527,7 @@ void MetaIndexerTestBase::DoMultiThreadTest() {
                               ErrorCode get_ec,
                               size_t /*key_index*/,
                               PropertyMap &upsert_property_map,
-                              LocationMap &out_new_locations) -> ModifierResult {
+                              CacheLocationMap &out_new_locations) -> ModifierResult {
         if (get_ec != EC_OK && get_ec != EC_NOENT) {
             return {MA_FAIL, get_ec};
         }

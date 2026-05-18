@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstdint>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -12,6 +11,12 @@
 #include "kv_cache_manager/meta/meta_storage_backend.h"
 
 namespace kv_cache_manager {
+
+// Per-key storage item for dummy backend.
+struct DummyItem {
+    CacheLocationMap locations;
+    PropertyMap properties;
+};
 
 /*
  * MetaDummyBackend is a meta storage backend implementation with
@@ -34,58 +39,83 @@ public:
     ErrorCode Open() noexcept override;
     ErrorCode Close() noexcept override;
 
-    // write
-    std::vector<ErrorCode> Put(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept override;
-    std::vector<ErrorCode> UpdateFields(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept override;
-    std::vector<ErrorCode> Upsert(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept override;
-    std::vector<ErrorCode> Delete(const KeyTypeVec &keys) noexcept override;
-    std::vector<ErrorCode> DeleteFields(const KeyTypeVec &keys,
-                                        const std::vector<std::vector<std::string>> &field_names_vec) noexcept override;
+    // =====================================================================
+    // Write APIs
+    // =====================================================================
 
-    // read
-    std::vector<ErrorCode> Get(const KeyTypeVec &keys,
-                               const std::vector<std::string> &field_names,
-                               FieldMapVec &out_field_maps) noexcept override;
-    std::vector<ErrorCode> Get(const KeyTypeVec &keys,
-                               const std::vector<std::vector<std::string>> &field_names_vec,
-                               FieldMapVec &out_field_maps) noexcept override;
-    std::vector<ErrorCode> GetAllFields(const KeyTypeVec &keys, FieldMapVec &out_field_maps) noexcept override;
-    std::vector<ErrorCode> Exists(const KeyTypeVec &keys, std::vector<bool> &out_is_exist_vec) noexcept override;
-    std::vector<ErrorCode> ExistsFieldWithPrefix(const KeyTypeVec &keys,
-                                                 const std::string &field_prefix,
-                                                 std::vector<bool> &out_exists_vec) noexcept override;
-    std::vector<ErrorCode>
-    GetFieldNamesWithPrefix(const KeyTypeVec &keys,
-                            const std::string &field_prefix,
-                            std::vector<std::vector<std::string>> &out_field_names_vec) noexcept override;
-    ErrorCode ListKeys(const std::string &cursor,
+    std::vector<ErrorCode> Put(RequestContext *request_context,
+                               const KeyTypeVec &keys,
+                               const CacheLocationMapVector &locations,
+                               const PropertyMapVector &properties) noexcept override;
+    std::vector<ErrorCode> Upsert(RequestContext *request_context,
+                                  const KeyTypeVec &keys,
+                                  const CacheLocationMapVector &locations,
+                                  const PropertyMapVector &properties) noexcept override;
+    std::vector<ErrorCode> Update(RequestContext *request_context,
+                                  const KeyTypeVec &keys,
+                                  const CacheLocationMapVector &locations,
+                                  const PropertyMapVector &properties) noexcept override;
+    std::vector<ErrorCode> Delete(RequestContext *request_context, const KeyTypeVec &keys) noexcept override;
+    std::vector<ErrorCode> DeleteLocations(RequestContext *request_context,
+                                           const KeyTypeVec &keys,
+                                           const LocationIdsPerKey &location_ids) noexcept override;
+
+    // =====================================================================
+    // Read APIs
+    // =====================================================================
+
+    std::vector<ErrorCode> Get(RequestContext *request_context,
+                               const KeyTypeVec &keys,
+                               CacheLocationMapVector &out_locations,
+                               PropertyMapVector &out_properties) noexcept override;
+    std::vector<ErrorCode> GetLocations(RequestContext *request_context,
+                                        const KeyTypeVec &keys,
+                                        CacheLocationMapVector &out_locations) noexcept override;
+    std::vector<std::vector<ErrorCode>> GetLocations(RequestContext *request_context,
+                                                     const KeyTypeVec &keys,
+                                                     const LocationIdsPerKey &location_ids,
+                                                     LocationsPerKey &out_locations) noexcept override;
+    std::vector<ErrorCode> GetLocationIds(RequestContext *request_context,
+                                          const KeyTypeVec &keys,
+                                          LocationIdsPerKey &out_location_ids) noexcept override;
+    std::vector<ErrorCode> ExistsLocation(RequestContext *request_context,
+                                          const KeyTypeVec &keys,
+                                          std::vector<bool> &out_exists) noexcept override;
+    std::vector<ErrorCode> GetProperties(RequestContext *request_context,
+                                         const KeyTypeVec &keys,
+                                         const std::vector<std::string> &field_names,
+                                         PropertyMapVector &out_properties) noexcept override;
+
+    // =====================================================================
+    // Key-level APIs
+    // =====================================================================
+
+    std::vector<ErrorCode> Exists(RequestContext *request_context,
+                                  const KeyTypeVec &keys,
+                                  std::vector<bool> &out_is_exist_vec) noexcept override;
+    ErrorCode ListKeys(RequestContext *request_context,
+                       const std::string &cursor,
                        std::int64_t limit,
                        std::string &out_next_cursor,
                        KeyTypeVec &out_keys) noexcept override;
-    ErrorCode RandomSample(std::int64_t count, KeyTypeVec &out_keys) noexcept override;
-    ErrorCode SampleReclaimKeys(std::int64_t count, KeyTypeVec &out_keys) noexcept override;
+    ErrorCode RandomSample(RequestContext *request_context, std::int64_t count, KeyTypeVec &out_keys) noexcept override;
+    ErrorCode
+    SampleReclaimKeys(RequestContext *request_context, std::int64_t count, KeyTypeVec &out_keys) noexcept override;
 
-    // meta data
+    // =====================================================================
+    // Metadata APIs
+    // =====================================================================
+
     ErrorCode PutMetaData(const FieldMap &field_map) noexcept override;
     ErrorCode GetMetaData(FieldMap &out_field_map) noexcept override;
 
 private:
     ErrorCode PersistToPath();
 
-    ErrorCode PutForOneKey(const KeyType &key, const FieldMap &field_map);
-    ErrorCode UpdateFieldsForOneKey(const KeyType &key, const FieldMap &field_map);
-    ErrorCode UpsertForOneKey(const KeyType &key, const FieldMap &field_map);
-    ErrorCode DeleteForOneKey(const KeyType &key);
-    ErrorCode DeleteFieldsForOneKey(const KeyType &key, const std::vector<std::string> &field_names);
-
-    ErrorCode GetForOneKey(const KeyType &key, const std::vector<std::string> &field_names, FieldMap &out_field_map);
-    ErrorCode GetAllFieldsForOneKey(const KeyType &key, FieldMap &out_field_map);
-    ErrorCode ExistsForOneKey(const KeyType &key, bool &out_is_exist);
-
     std::mutex mutex_;
-    ConcurrentHashMap<KeyType, FieldMap> table_; // block data
-    FieldMap metadata_;                          // metadata
-    std::string path_;                           // persistence local filesystem path
+    ConcurrentHashMap<KeyType, DummyItem> table_;
+    FieldMap metadata_;
+    std::string path_;
     bool enable_persistence_ = false;
 };
 

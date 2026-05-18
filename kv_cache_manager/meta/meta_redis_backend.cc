@@ -1,9 +1,12 @@
 #include "kv_cache_manager/meta/meta_redis_backend.h"
 
 #include "kv_cache_manager/common/logger.h"
+#include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/string_util.h"
+#include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/meta/common.h"
+#include "kv_cache_manager/metrics/metrics_collector.h"
 
 namespace kv_cache_manager {
 
@@ -133,7 +136,86 @@ ErrorCode MetaRedisBackend::Close() noexcept {
     return EC_OK;
 }
 
-std::vector<ErrorCode> MetaRedisBackend::Put(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept {
+// ---------------------------------------------------------------------------
+// Serialization helpers
+// ---------------------------------------------------------------------------
+
+FieldMap MetaRedisBackend::SerializeToFieldMap(const CacheLocationMap &locations, const PropertyMap &properties) {
+    FieldMap field_map;
+    for (const auto &[loc_id, loc] : locations) {
+        field_map[LOCATION_PREFIX + loc_id] = loc.ToJsonString();
+    }
+    for (const auto &[key, value] : properties) {
+        field_map[key] = value;
+    }
+    return field_map;
+}
+
+ErrorCode MetaRedisBackend::DeserializeFieldMap(const FieldMap &field_map,
+                                                CacheLocationMap &out_locations,
+                                                PropertyMap &out_properties) {
+    for (const auto &[field_name, field_value] : field_map) {
+        if (field_name.rfind(LOCATION_PREFIX, 0) == 0) {
+            if (field_value.empty()) {
+                continue;
+            }
+            std::string loc_id = field_name.substr(LOCATION_PREFIX.size());
+            CacheLocation location;
+            if (!location.FromJsonString(field_value)) {
+                return EC_CORRUPTION;
+            }
+            out_locations[loc_id] = std::move(location);
+        } else {
+            out_properties[field_name] = field_value;
+        }
+    }
+    return EC_OK;
+}
+
+ErrorCode MetaRedisBackend::DeserializeLocations(const FieldMap &field_map, CacheLocationMap &out_locations) {
+    for (const auto &[field_name, field_value] : field_map) {
+        if (field_name.rfind(LOCATION_PREFIX, 0) != 0) {
+            continue;
+        }
+        if (field_value.empty()) {
+            continue;
+        }
+        std::string loc_id = field_name.substr(LOCATION_PREFIX.size());
+        CacheLocation location;
+        if (!location.FromJsonString(field_value)) {
+            return EC_CORRUPTION;
+        }
+        out_locations[loc_id] = std::move(location);
+    }
+    return EC_OK;
+}
+
+void MetaRedisBackend::ExtractLocationIds(const FieldMap &field_map, std::vector<LocationId> &out_location_ids) {
+    for (const auto &[field_name, field_value] : field_map) {
+        if (field_name.rfind(LOCATION_PREFIX, 0) == 0) {
+            out_location_ids.push_back(field_name.substr(LOCATION_PREFIX.size()));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Write operations
+// ---------------------------------------------------------------------------
+
+std::vector<ErrorCode> MetaRedisBackend::Put(RequestContext *request_context,
+                                             const KeyTypeVec &keys,
+                                             const CacheLocationMapVector &locations,
+                                             const PropertyMapVector &properties) noexcept {
+    const int64_t serde_begin = TimestampUtil::GetCurrentTimeUs();
+    FieldMapVec field_maps(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        field_maps[i] = SerializeToFieldMap(locations[i], properties[i]);
+    }
+    const int64_t serde_us = TimestampUtil::GetCurrentTimeUs() - serde_begin;
+    auto *service_metrics_collector =
+        request_context ? dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector()) : nullptr;
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_searcher, index_serialize_time_us, serde_us);
+
     auto handle = client_pool_->AcquireClient(timeout_ms_);
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(10, "put fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
@@ -143,17 +225,20 @@ std::vector<ErrorCode> MetaRedisBackend::Put(const KeyTypeVec &keys, const Field
     return handle->Set(full_keys, field_maps);
 }
 
-std::vector<ErrorCode> MetaRedisBackend::UpdateFields(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept {
-    auto handle = client_pool_->AcquireClient(timeout_ms_);
-    if (!handle) {
-        KVCM_INTERVAL_LOG_WARN(10, "update fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
-        return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
+std::vector<ErrorCode> MetaRedisBackend::Upsert(RequestContext *request_context,
+                                                const KeyTypeVec &keys,
+                                                const CacheLocationMapVector &locations,
+                                                const PropertyMapVector &properties) noexcept {
+    const int64_t serde_begin = TimestampUtil::GetCurrentTimeUs();
+    FieldMapVec field_maps(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        field_maps[i] = SerializeToFieldMap(locations[i], properties[i]);
     }
-    std::vector<std::string> full_keys = AppendPrefixToKeys(keys);
-    return handle->Update(full_keys, field_maps);
-}
+    const int64_t serde_us = TimestampUtil::GetCurrentTimeUs() - serde_begin;
+    auto *service_metrics_collector =
+        request_context ? dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector()) : nullptr;
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_searcher, index_serialize_time_us, serde_us);
 
-std::vector<ErrorCode> MetaRedisBackend::Upsert(const KeyTypeVec &keys, const FieldMapVec &field_maps) noexcept {
     auto handle = client_pool_->AcquireClient(timeout_ms_);
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(10, "upsert fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
@@ -163,7 +248,30 @@ std::vector<ErrorCode> MetaRedisBackend::Upsert(const KeyTypeVec &keys, const Fi
     return handle->Upsert(full_keys, field_maps);
 }
 
-std::vector<ErrorCode> MetaRedisBackend::Delete(const KeyTypeVec &keys) noexcept {
+std::vector<ErrorCode> MetaRedisBackend::Update(RequestContext *request_context,
+                                                const KeyTypeVec &keys,
+                                                const CacheLocationMapVector &locations,
+                                                const PropertyMapVector &properties) noexcept {
+    const int64_t serde_begin = TimestampUtil::GetCurrentTimeUs();
+    FieldMapVec field_maps(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        field_maps[i] = SerializeToFieldMap(locations[i], properties[i]);
+    }
+    const int64_t serde_us = TimestampUtil::GetCurrentTimeUs() - serde_begin;
+    auto *service_metrics_collector =
+        request_context ? dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector()) : nullptr;
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_searcher, index_serialize_time_us, serde_us);
+
+    auto handle = client_pool_->AcquireClient(timeout_ms_);
+    if (!handle) {
+        KVCM_INTERVAL_LOG_WARN(10, "update fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
+        return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
+    }
+    std::vector<std::string> full_keys = AppendPrefixToKeys(keys);
+    return handle->Update(full_keys, field_maps);
+}
+
+std::vector<ErrorCode> MetaRedisBackend::Delete(RequestContext * /*request_context*/, const KeyTypeVec &keys) noexcept {
     auto handle = client_pool_->AcquireClient(timeout_ms_);
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(10, "delete fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
@@ -173,55 +281,218 @@ std::vector<ErrorCode> MetaRedisBackend::Delete(const KeyTypeVec &keys) noexcept
     return handle->Delete(full_keys);
 }
 
-std::vector<ErrorCode>
-MetaRedisBackend::DeleteFields(const KeyTypeVec &keys,
-                               const std::vector<std::vector<std::string>> &field_names_vec) noexcept {
+std::vector<ErrorCode> MetaRedisBackend::DeleteLocations(RequestContext * /*request_context*/,
+                                                         const KeyTypeVec &keys,
+                                                         const LocationIdsPerKey &location_ids) noexcept {
+    // Convert location ids to field names with LOCATION_PREFIX for Redis DeleteFields.
+    std::vector<std::vector<std::string>> field_names_vec(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        field_names_vec[i].reserve(location_ids[i].size());
+        for (const auto &loc_id : location_ids[i]) {
+            field_names_vec[i].push_back(LOCATION_PREFIX + loc_id);
+        }
+    }
+
     auto handle = client_pool_->AcquireClient(timeout_ms_);
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(
-            10, "delete fields fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
+            10, "delete locations fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
         return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
     }
     std::vector<std::string> full_keys = AppendPrefixToKeys(keys);
     return handle->DeleteFields(full_keys, field_names_vec);
 }
 
-std::vector<ErrorCode> MetaRedisBackend::Get(const KeyTypeVec &keys,
-                                             const std::vector<std::string> &field_names,
-                                             FieldMapVec &out_field_maps) noexcept {
+// ---------------------------------------------------------------------------
+// Read operations
+// ---------------------------------------------------------------------------
+
+std::vector<ErrorCode> MetaRedisBackend::Get(RequestContext *request_context,
+                                             const KeyTypeVec &keys,
+                                             CacheLocationMapVector &out_locations,
+                                             PropertyMapVector &out_properties) noexcept {
     auto handle = client_pool_->AcquireClient(timeout_ms_);
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(10, "get fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
         return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
     }
     std::vector<std::string> full_keys = AppendPrefixToKeys(keys);
-    return handle->Get(full_keys, field_names, out_field_maps);
-}
+    FieldMapVec field_maps;
+    std::vector<ErrorCode> results = handle->GetAllFields(full_keys, field_maps);
 
-std::vector<ErrorCode> MetaRedisBackend::Get(const KeyTypeVec &keys,
-                                             const std::vector<std::vector<std::string>> &field_names_vec,
-                                             FieldMapVec &out_field_maps) noexcept {
-    auto handle = client_pool_->AcquireClient(timeout_ms_);
-    if (!handle) {
-        KVCM_INTERVAL_LOG_WARN(10, "get fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
-        return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
+    const int64_t serde_begin = TimestampUtil::GetCurrentTimeUs();
+    out_locations.resize(keys.size());
+    out_properties.resize(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (results[i] != EC_OK) {
+            continue;
+        }
+        ErrorCode ec = DeserializeFieldMap(field_maps[i], out_locations[i], out_properties[i]);
+        if (ec != EC_OK) {
+            KVCM_LOG_ERROR("get deserialize failed, key[%ld], instance[%s]", keys[i], instance_id_.c_str());
+            results[i] = ec;
+        }
     }
-    std::vector<std::string> full_keys = AppendPrefixToKeys(keys);
-    return handle->Get(full_keys, field_names_vec, out_field_maps);
+    const int64_t serde_us = TimestampUtil::GetCurrentTimeUs() - serde_begin;
+    auto *service_metrics_collector =
+        request_context ? dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector()) : nullptr;
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_searcher, index_deserialize_time_us, serde_us);
+    return results;
 }
 
-std::vector<ErrorCode> MetaRedisBackend::GetAllFields(const KeyTypeVec &keys, FieldMapVec &out_field_maps) noexcept {
+std::vector<ErrorCode> MetaRedisBackend::GetLocations(RequestContext *request_context,
+                                                      const KeyTypeVec &keys,
+                                                      CacheLocationMapVector &out_locations) noexcept {
     auto handle = client_pool_->AcquireClient(timeout_ms_);
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(
-            10, "get all fields fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
+            10, "get locations fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
         return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
     }
     std::vector<std::string> full_keys = AppendPrefixToKeys(keys);
-    return handle->GetAllFields(full_keys, out_field_maps);
+    FieldMapVec field_maps;
+    std::vector<ErrorCode> results = handle->GetAllFields(full_keys, field_maps);
+
+    const int64_t serde_begin = TimestampUtil::GetCurrentTimeUs();
+    out_locations.resize(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (results[i] != EC_OK) {
+            continue;
+        }
+        ErrorCode ec = DeserializeLocations(field_maps[i], out_locations[i]);
+        if (ec != EC_OK) {
+            KVCM_LOG_ERROR("get locations deserialize failed, key[%ld], instance[%s]", keys[i], instance_id_.c_str());
+            results[i] = ec;
+        }
+    }
+    const int64_t serde_us = TimestampUtil::GetCurrentTimeUs() - serde_begin;
+    auto *service_metrics_collector =
+        request_context ? dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector()) : nullptr;
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_searcher, index_deserialize_time_us, serde_us);
+    return results;
 }
 
-std::vector<ErrorCode> MetaRedisBackend::Exists(const KeyTypeVec &keys, std::vector<bool> &out_is_exist_vec) noexcept {
+std::vector<std::vector<ErrorCode>> MetaRedisBackend::GetLocations(RequestContext *request_context,
+                                                                   const KeyTypeVec &keys,
+                                                                   const LocationIdsPerKey &location_ids,
+                                                                   LocationsPerKey &out_locations) noexcept {
+    assert(keys.size() == location_ids.size());
+
+    // Build per-key field names to fetch only requested locations.
+    std::vector<std::vector<std::string>> field_names_vec(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        field_names_vec[i].reserve(location_ids[i].size());
+        for (const auto &loc_id : location_ids[i]) {
+            field_names_vec[i].push_back(LOCATION_PREFIX + loc_id);
+        }
+    }
+
+    auto handle = client_pool_->AcquireClient(timeout_ms_);
+    if (!handle) {
+        KVCM_INTERVAL_LOG_WARN(
+            10, "get locations by id fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
+        std::vector<std::vector<ErrorCode>> results(keys.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            results[i].assign(location_ids[i].size(), EC_TIMEOUT);
+        }
+        return results;
+    }
+    std::vector<std::string> full_keys = AppendPrefixToKeys(keys);
+    FieldMapVec field_maps;
+    std::vector<ErrorCode> key_results = handle->Get(full_keys, field_names_vec, field_maps);
+
+    const int64_t serde_begin = TimestampUtil::GetCurrentTimeUs();
+    std::vector<std::vector<ErrorCode>> results(keys.size());
+    out_locations.resize(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        out_locations[i].resize(location_ids[i].size());
+        if (key_results[i] != EC_OK) {
+            results[i].assign(location_ids[i].size(), key_results[i]);
+            continue;
+        }
+        results[i].resize(location_ids[i].size());
+        for (size_t j = 0; j < location_ids[i].size(); ++j) {
+            auto it = field_maps[i].find(field_names_vec[i][j]);
+            if (it == field_maps[i].end() || it->second.empty()) {
+                results[i][j] = EC_NOENT;
+                continue;
+            }
+            CacheLocation location;
+            if (!location.FromJsonString(it->second)) {
+                results[i][j] = EC_CORRUPTION;
+                continue;
+            }
+            out_locations[i][j] = std::move(location);
+            results[i][j] = EC_OK;
+        }
+    }
+    const int64_t serde_us = TimestampUtil::GetCurrentTimeUs() - serde_begin;
+    auto *service_metrics_collector =
+        request_context ? dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector()) : nullptr;
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_searcher, index_deserialize_time_us, serde_us);
+    return results;
+}
+
+std::vector<ErrorCode> MetaRedisBackend::GetLocationIds(RequestContext * /*request_context*/,
+                                                        const KeyTypeVec &keys,
+                                                        LocationIdsPerKey &out_location_ids) noexcept {
+    auto handle = client_pool_->AcquireClient(timeout_ms_);
+    if (!handle) {
+        KVCM_INTERVAL_LOG_WARN(
+            10, "get location ids fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
+        return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
+    }
+    std::vector<std::string> full_keys = AppendPrefixToKeys(keys);
+    std::vector<std::vector<std::string>> raw_field_names_vec;
+    std::vector<ErrorCode> results = handle->GetFieldNamesWithPrefix(full_keys, LOCATION_PREFIX, raw_field_names_vec);
+
+    out_location_ids.resize(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (results[i] != EC_OK) {
+            continue;
+        }
+        out_location_ids[i].reserve(raw_field_names_vec[i].size());
+        for (const auto &field_name : raw_field_names_vec[i]) {
+            if (field_name.size() > LOCATION_PREFIX.size() && field_name.rfind(LOCATION_PREFIX, 0) == 0) {
+                out_location_ids[i].push_back(field_name.substr(LOCATION_PREFIX.size()));
+            }
+        }
+    }
+    return results;
+}
+
+std::vector<ErrorCode> MetaRedisBackend::GetProperties(RequestContext * /*request_context*/,
+                                                       const KeyTypeVec &keys,
+                                                       const std::vector<std::string> &field_names,
+                                                       PropertyMapVector &out_properties) noexcept {
+    auto handle = client_pool_->AcquireClient(timeout_ms_);
+    if (!handle) {
+        KVCM_INTERVAL_LOG_WARN(
+            10, "get properties fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
+        return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
+    }
+    std::vector<std::string> full_keys = AppendPrefixToKeys(keys);
+    FieldMapVec field_maps;
+    std::vector<ErrorCode> results = handle->Get(full_keys, field_names, field_maps);
+
+    out_properties.resize(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (results[i] != EC_OK) {
+            continue;
+        }
+        // Properties are stored as plain fields (no LOCATION_PREFIX).
+        out_properties[i] = std::move(field_maps[i]);
+    }
+    return results;
+}
+
+// ---------------------------------------------------------------------------
+// Key-level operations
+// ---------------------------------------------------------------------------
+
+std::vector<ErrorCode> MetaRedisBackend::Exists(RequestContext * /*request_context*/,
+                                                const KeyTypeVec &keys,
+                                                std::vector<bool> &out_is_exist_vec) noexcept {
     auto handle = client_pool_->AcquireClient(timeout_ms_);
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(10, "exists fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
@@ -231,39 +502,25 @@ std::vector<ErrorCode> MetaRedisBackend::Exists(const KeyTypeVec &keys, std::vec
     return handle->Exists(full_keys, out_is_exist_vec);
 }
 
-std::vector<ErrorCode> MetaRedisBackend::ExistsFieldWithPrefix(const KeyTypeVec &keys,
-                                                               const std::string &field_prefix,
-                                                               std::vector<bool> &out_exists_vec) noexcept {
+std::vector<ErrorCode> MetaRedisBackend::ExistsLocation(RequestContext * /*request_context*/,
+                                                        const KeyTypeVec &keys,
+                                                        std::vector<bool> &out_exists) noexcept {
     auto handle = client_pool_->AcquireClient(timeout_ms_);
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(
-            10, "exists field with prefix fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
+            10, "exists location fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
         return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
     }
     std::vector<std::string> full_keys = AppendPrefixToKeys(keys);
-    return handle->ExistsFieldWithPrefix(full_keys, field_prefix, out_exists_vec);
+    return handle->ExistsFieldWithPrefix(full_keys, LOCATION_PREFIX, out_exists);
 }
 
-std::vector<ErrorCode>
-MetaRedisBackend::GetFieldNamesWithPrefix(const KeyTypeVec &keys,
-                                          const std::string &field_prefix,
-                                          std::vector<std::vector<std::string>> &out_field_names_vec) noexcept {
-    auto handle = client_pool_->AcquireClient(timeout_ms_);
-    if (!handle) {
-        KVCM_INTERVAL_LOG_WARN(
-            10, "list field names with prefix fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
-        return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
-    }
-    std::vector<std::string> full_keys = AppendPrefixToKeys(keys);
-    return handle->GetFieldNamesWithPrefix(full_keys, field_prefix, out_field_names_vec);
-}
-
-ErrorCode MetaRedisBackend::ListKeys(const std::string &cursor,
+ErrorCode MetaRedisBackend::ListKeys(RequestContext * /*request_context*/,
+                                     const std::string &cursor,
                                      const int64_t limit,
                                      std::string &out_next_cursor,
-                                     std::vector<KeyType> &out_keys) noexcept {
+                                     KeyTypeVec &out_keys) noexcept {
     out_keys.clear();
-
     auto handle = client_pool_->AcquireClient(timeout_ms_);
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(10, "list keys fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
@@ -283,9 +540,10 @@ ErrorCode MetaRedisBackend::ListKeys(const std::string &cursor,
     return EC_OK;
 }
 
-ErrorCode MetaRedisBackend::RandomSample(const int64_t count, std::vector<KeyType> &out_keys) noexcept {
+ErrorCode MetaRedisBackend::RandomSample(RequestContext * /*request_context*/,
+                                         const int64_t count,
+                                         KeyTypeVec &out_keys) noexcept {
     out_keys.clear();
-
     auto handle = client_pool_->AcquireClient(timeout_ms_);
     if (!handle) {
         KVCM_INTERVAL_LOG_WARN(10, "random fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
@@ -305,10 +563,15 @@ ErrorCode MetaRedisBackend::RandomSample(const int64_t count, std::vector<KeyTyp
     return EC_OK;
 }
 
-ErrorCode MetaRedisBackend::SampleReclaimKeys(const int64_t count, std::vector<KeyType> &out_keys) noexcept {
-    // For Redis backend, RandomSample already uses Redis RAND command which is efficient
-    return RandomSample(count, out_keys);
+ErrorCode MetaRedisBackend::SampleReclaimKeys(RequestContext * /*request_context*/,
+                                              const int64_t count,
+                                              KeyTypeVec &out_keys) noexcept {
+    return RandomSample(nullptr, count, out_keys);
 }
+
+// ---------------------------------------------------------------------------
+// Metadata
+// ---------------------------------------------------------------------------
 
 ErrorCode MetaRedisBackend::PutMetaData(const FieldMap &field_map) noexcept {
     auto handle = client_pool_->AcquireClient(timeout_ms_);
