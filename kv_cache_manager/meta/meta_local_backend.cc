@@ -293,17 +293,6 @@ std::vector<ErrorCode> MetaLocalBackend::Upsert(RequestContext * /*request_conte
     return results;
 }
 
-std::vector<ErrorCode> MetaLocalBackend::Update(RequestContext * /*request_context*/,
-                                                const KeyTypeVec &keys,
-                                                const CacheLocationMapVector &locations,
-                                                const PropertyMapVector &properties) noexcept {
-    std::vector<ErrorCode> results(keys.size(), EC_OK);
-    for (size_t i = 0; i < keys.size(); ++i) {
-        results[i] = UpdateInPlace(std::to_string(keys[i]), locations[i], properties[i]);
-    }
-    return results;
-}
-
 std::vector<ErrorCode> MetaLocalBackend::Delete(RequestContext * /*request_context*/, const KeyTypeVec &keys) noexcept {
     std::vector<ErrorCode> results(keys.size(), EC_OK);
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -366,20 +355,6 @@ std::vector<ErrorCode> MetaLocalBackend::Upsert(RequestContext *request_context,
     for (size_t i = 0; i < keys.size(); ++i) {
         results[i] = (previous_error_codes[i] == EC_OK) ? UpsertForOneKey(keys[i], locations[i], properties[i])
                                                         : previous_error_codes[i];
-    }
-    return results;
-}
-
-std::vector<ErrorCode> MetaLocalBackend::Update(RequestContext *request_context,
-                                                const KeyTypeVec &keys,
-                                                const CacheLocationMapVector &locations,
-                                                const PropertyMapVector &properties,
-                                                const std::vector<ErrorCode> &previous_error_codes) noexcept {
-    std::vector<ErrorCode> results(keys.size(), EC_OK);
-    for (size_t i = 0; i < keys.size(); ++i) {
-        results[i] = (previous_error_codes[i] == EC_OK)
-                         ? UpdateInPlace(std::to_string(keys[i]), locations[i], properties[i])
-                         : previous_error_codes[i];
     }
     return results;
 }

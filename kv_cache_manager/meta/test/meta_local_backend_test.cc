@@ -53,9 +53,9 @@ TEST_F(MetaLocalBackendTest, TestSimple) {
     ASSERT_EQ(
         (std::vector<ErrorCode>{EC_OK, EC_OK}),
         PutWithFieldMaps(meta_storage_backend_.get(), {1, 2}, {{{PROPERTY_URI, "uri1"}}, {{PROPERTY_URI, "uri2"}}}));
-    // UpdateFields to add hit_count
+    // Upsert to add hit_count
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
-              UpdateWithFieldMaps(
+              UpsertWithFieldMaps(
                   meta_storage_backend_.get(), {1, 2}, {{{PROPERTY_HIT_COUNT, "100"}}, {{PROPERTY_HIT_COUNT, "200"}}}));
 
     AssertExists(meta_storage_backend_.get(), {1, 2, 3}, {EC_OK, EC_OK, EC_OK}, /*is_exist*/ {true, true, false});
@@ -74,7 +74,7 @@ TEST_F(MetaLocalBackendTest, TestSimple) {
         (std::vector<ErrorCode>{EC_OK}),
         PutWithFieldMaps(meta_storage_backend_.get(), {3}, {{{PROPERTY_URI, "uri3"}, {PROPERTY_HIT_COUNT, "300"}}}));
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
-              UpdateWithFieldMaps(meta_storage_backend_.get(), {2}, {{{PROPERTY_URI, "uri2-updated"}}}));
+              UpsertWithFieldMaps(meta_storage_backend_.get(), {2}, {{{PROPERTY_URI, "uri2-updated"}}}));
 
     AssertExists(meta_storage_backend_.get(), {1, 2, 3}, {EC_OK, EC_OK, EC_OK}, /*is_exist*/ {false, true, true});
     AssertGetProperties(meta_storage_backend_.get(),
@@ -169,35 +169,6 @@ TEST_F(MetaLocalBackendTest, TestPut) {
                         {PROPERTY_URI},
                         {EC_OK, EC_OK},
                         {{{PROPERTY_URI, "uri1-new"}}, {{PROPERTY_URI, "uri2"}}});
-
-    ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
-}
-
-TEST_F(MetaLocalBackendTest, TestUpdateFields) {
-    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("test_instance_0", meta_storage_backend_config_));
-    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
-
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
-              PutWithFieldMaps(meta_storage_backend_.get(),
-                               {1, 2},
-                               {{{PROPERTY_URI, "uri1"}, {PROPERTY_HIT_COUNT, "100"}},
-                                {{PROPERTY_URI, "uri2"}, {PROPERTY_HIT_COUNT, "200"}}}));
-
-    // Update uri only, lru_time should be preserved
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
-              UpdateWithFieldMaps(meta_storage_backend_.get(),
-                                  {1, 2},
-                                  {{{PROPERTY_URI, "uri1-updated"}}, {{PROPERTY_HIT_COUNT, "250"}}}));
-    AssertGetProperties(meta_storage_backend_.get(),
-                        {1, 2},
-                        {PROPERTY_URI, PROPERTY_HIT_COUNT},
-                        {EC_OK, EC_OK},
-                        {{{PROPERTY_URI, "uri1-updated"}, {PROPERTY_HIT_COUNT, "100"}},
-                         {{PROPERTY_URI, "uri2"}, {PROPERTY_HIT_COUNT, "250"}}});
-
-    // Cannot update key that does not exist
-    ASSERT_EQ((std::vector<ErrorCode>{EC_NOENT}),
-              UpdateWithFieldMaps(meta_storage_backend_.get(), {3}, {{{PROPERTY_URI, "uri3"}}}));
 
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
@@ -551,8 +522,8 @@ TEST_F(MetaLocalBackendTest, TestPutIfAbsentThenDelete) {
 
 TEST_F(MetaLocalBackendTest, TestLruTimeUpdatedByReadWriteOps) {
     // Verify that PROPERTY_LRU_TIME (backed by last_access_time_) is updated
-    // by all read/write operations: Get, GetAllFields, Exists, UpdateFields,
-    // Upsert, and PutIfAbsent.
+    // by all read/write operations: Get, GetAllFields, Exists, Upsert,
+    // and PutIfAbsent.
     meta_storage_backend_config_->SetStorageUri("local://?capacity=64&num_shard_bits=0&sample_times=1");
     ASSERT_EQ(EC_OK, meta_storage_backend_->Init("test_lru_time_ops", meta_storage_backend_config_));
     ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
@@ -606,20 +577,12 @@ TEST_F(MetaLocalBackendTest, TestLruTimeUpdatedByReadWriteOps) {
     int64_t lru_after_exists = getLruTime(1);
     ASSERT_GE(lru_after_exists - lru_after_getall, kMinTimeDiffUs) << "Exists should update LRU time by >= 1000us";
 
-    // --- UpdateFields updates LRU time ---
-    usleep(1000);
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
-              UpdateWithFieldMaps(meta_storage_backend_.get(), {1}, {{{PROPERTY_URI, "uri1-updated"}}}));
-    int64_t lru_after_update = getLruTime(1);
-    ASSERT_GE(lru_after_update - lru_after_exists, kMinTimeDiffUs)
-        << "UpdateFields should update LRU time by >= 1000us";
-
     // --- Upsert updates LRU time ---
     usleep(1000);
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
               UpsertWithFieldMaps(meta_storage_backend_.get(), {1}, {{{PROPERTY_URI, "uri1-upserted"}}}));
     int64_t lru_after_upsert = getLruTime(1);
-    ASSERT_GE(lru_after_upsert - lru_after_update, kMinTimeDiffUs) << "Upsert should update LRU time by >= 1000us";
+    ASSERT_GE(lru_after_upsert - lru_after_exists, kMinTimeDiffUs) << "Upsert should update LRU time by >= 1000us";
 
     // --- PutIfAbsent on new key ---
     usleep(1000);
@@ -938,14 +901,14 @@ TEST_F(MetaLocalBackendTest, TestConcurrentReadWrite) {
     std::atomic<bool> stop{false};
     std::atomic<int> write_count{0};
 
-    // Writer threads: UpdateFields + DeleteFields on rotating location fields.
+    // Writer threads: Upsert + DeleteFields on rotating location fields.
     auto writer_fn = [&](int writer_id) {
         for (int i = 0; i < kIterations && !stop.load(std::memory_order_relaxed); ++i) {
             std::string field_name = LOCATION_PREFIX + "w" + std::to_string(writer_id) + "_" + std::to_string(i);
             std::string field_value = "value_" + std::to_string(i);
 
             auto update_ec =
-                UpdateWithFieldMaps(meta_storage_backend_.get(), {kTestKey}, {{{field_name, field_value}}});
+                UpsertWithFieldMaps(meta_storage_backend_.get(), {kTestKey}, {{{field_name, field_value}}});
             ASSERT_EQ(1u, update_ec.size());
             ASSERT_EQ(EC_OK, update_ec[0]);
 
@@ -1013,7 +976,7 @@ TEST_F(MetaLocalBackendTest, TestConcurrentReadWrite) {
 }
 
 // ---------------------------------------------------------------------------
-// Test that UpdateFields / Upsert / DeleteFields correctly adjust LRU usage
+// Test that Upsert / DeleteFields correctly adjust LRU usage
 // ---------------------------------------------------------------------------
 TEST_F(MetaLocalBackendTest, TestChargeAdjustment) {
     // Use a small capacity (1 MB) with 0 shard bits (single shard) for
@@ -1031,23 +994,23 @@ TEST_F(MetaLocalBackendTest, TestChargeAdjustment) {
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), PutWithFieldMaps(backend.get(), {1}, {{{PROPERTY_URI, "v"}}}));
     size_t usage_after_put = backend->GetMemUsage();
 
-    // --- UpdateFields: add a new field ---
+    // --- Upsert: add a new field ---
     // Expected delta: field_name.size() + field_value.size() + kMapNodeOverhead
     std::string field_name_a = "field_a";
     std::string field_value_a(1024, 'x');
     ssize_t expected_delta_add = static_cast<ssize_t>(field_name_a.size() + field_value_a.size() + kMapNodeOverhead);
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
-              UpdateWithFieldMaps(backend.get(), {1}, {{{field_name_a, field_value_a}}}));
+              UpsertWithFieldMaps(backend.get(), {1}, {{{field_name_a, field_value_a}}}));
     size_t usage_after_add = backend->GetMemUsage();
     ASSERT_EQ(static_cast<ssize_t>(usage_after_add - usage_after_put), expected_delta_add);
 
-    // --- UpdateFields: overwrite existing field with shorter value ---
+    // --- Upsert: overwrite existing field with shorter value ---
     // Expected delta: new_value.size() - old_value.size() (name and node overhead unchanged)
     std::string field_value_a_short = "short";
     ssize_t expected_delta_shrink =
         static_cast<ssize_t>(field_value_a_short.size()) - static_cast<ssize_t>(field_value_a.size());
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
-              UpdateWithFieldMaps(backend.get(), {1}, {{{field_name_a, field_value_a_short}}}));
+              UpsertWithFieldMaps(backend.get(), {1}, {{{field_name_a, field_value_a_short}}}));
     size_t usage_after_shrink = backend->GetMemUsage();
     ASSERT_EQ(static_cast<ssize_t>(usage_after_shrink) - static_cast<ssize_t>(usage_after_add), expected_delta_shrink);
 

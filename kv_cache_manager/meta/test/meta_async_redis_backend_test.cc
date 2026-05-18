@@ -5,6 +5,7 @@
 #include "kv_cache_manager/common/test/redis_test_base.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
+#include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_async_redis_backend.h"
 #include "kv_cache_manager/meta/test/meta_storage_backend_test_base.h"
@@ -42,7 +43,7 @@ protected:
     void SetupMockRedisClients() {
         EXPECT_CALL(*backend_, CreateRedisClient()).WillRepeatedly(Invoke([this]() {
             StandardUri empty_uri;
-            auto mock = std::make_shared<MockRedisClient>(empty_uri);
+            auto mock = std::make_shared<::testing::NiceMock<MockRedisClient>>(empty_uri);
             ON_CALL(*mock, IsContextOk()).WillByDefault(Return(true));
             ON_CALL(*mock, Reconnect()).WillByDefault(Return(true));
             ON_CALL(*mock, TryExecPipeline(_)).WillByDefault(Invoke([](const std::vector<CmdArgs> &cmds) {
@@ -121,7 +122,7 @@ TEST_F(MetaAsyncRedisBackendTest, TestOpenAndClose) {
 TEST_F(MetaAsyncRedisBackendTest, TestOpenFailsOnClientCreation) {
     EXPECT_CALL(*backend_, CreateRedisClient()).WillOnce(Invoke([]() {
         StandardUri empty_uri;
-        auto mock = std::make_shared<MockRedisClient>(empty_uri);
+        auto mock = std::make_shared<::testing::NiceMock<MockRedisClient>>(empty_uri);
         EXPECT_CALL(*mock, Reconnect()).WillRepeatedly(Return(false));
         return mock;
     }));
@@ -141,32 +142,21 @@ TEST_F(MetaAsyncRedisBackendTest, TestPut) {
     ASSERT_EQ(EC_OK, InitAndOpen());
 
     KeyTypeVec keys = {100, 200};
-    FieldMapVec field_maps = {
-        {{"f1", "v1"}, {"f2", "v2"}},
-        {{"f3", "v3"}},
-    };
-    auto results = backend_->Put(keys, field_maps);
+    CacheLocationMapVector locations(2);
+    PropertyMapVector properties = {{{"f1", "v1"}, {"f2", "v2"}}, {{"f3", "v3"}}};
+    auto results = backend_->Put(nullptr, keys, locations, properties);
     ASSERT_EQ(2, results.size());
     ASSERT_EQ(EC_OK, results[0]);
     ASSERT_EQ(EC_OK, results[1]);
-}
-
-TEST_F(MetaAsyncRedisBackendTest, TestUpdateFields) {
-    ASSERT_EQ(EC_OK, InitAndOpen());
-
-    KeyTypeVec keys = {300};
-    FieldMapVec field_maps = {{{"f1", "updated"}}};
-    auto results = backend_->UpdateFields(keys, field_maps);
-    ASSERT_EQ(1, results.size());
-    ASSERT_EQ(EC_OK, results[0]);
 }
 
 TEST_F(MetaAsyncRedisBackendTest, TestUpsert) {
     ASSERT_EQ(EC_OK, InitAndOpen());
 
     KeyTypeVec keys = {400, 500, 600};
-    FieldMapVec field_maps = {{{"a", "1"}}, {{"b", "2"}}, {{"c", "3"}}};
-    auto results = backend_->Upsert(keys, field_maps);
+    CacheLocationMapVector locations(3);
+    PropertyMapVector properties = {{{"a", "1"}}, {{"b", "2"}}, {{"c", "3"}}};
+    auto results = backend_->Upsert(nullptr, keys, locations, properties);
     ASSERT_EQ(3, results.size());
     for (auto &ec : results) {
         ASSERT_EQ(EC_OK, ec);
@@ -177,18 +167,18 @@ TEST_F(MetaAsyncRedisBackendTest, TestDelete) {
     ASSERT_EQ(EC_OK, InitAndOpen());
 
     KeyTypeVec keys = {700, 800};
-    auto results = backend_->Delete(keys);
+    auto results = backend_->Delete(nullptr, keys);
     ASSERT_EQ(2, results.size());
     ASSERT_EQ(EC_OK, results[0]);
     ASSERT_EQ(EC_OK, results[1]);
 }
 
-TEST_F(MetaAsyncRedisBackendTest, TestDeleteFields) {
+TEST_F(MetaAsyncRedisBackendTest, TestDeleteLocations) {
     ASSERT_EQ(EC_OK, InitAndOpen());
 
     KeyTypeVec keys = {900};
-    std::vector<std::vector<std::string>> field_names_vec = {{"loc_1", "loc_2"}};
-    auto results = backend_->DeleteFields(keys, field_names_vec);
+    LocationIdsPerKey location_ids = {{"loc_1", "loc_2"}};
+    auto results = backend_->DeleteLocations(nullptr, keys, location_ids);
     ASSERT_EQ(1, results.size());
     ASSERT_EQ(EC_OK, results[0]);
 }
@@ -196,7 +186,7 @@ TEST_F(MetaAsyncRedisBackendTest, TestDeleteFields) {
 TEST_F(MetaAsyncRedisBackendTest, TestWriteEmptyKeys) {
     ASSERT_EQ(EC_OK, InitAndOpen());
 
-    auto results = backend_->Put({}, {});
+    auto results = backend_->Put(nullptr, {}, {}, {});
     ASSERT_TRUE(results.empty());
 }
 
@@ -210,9 +200,9 @@ TEST_F(MetaAsyncRedisBackendTest, TestSyncEmpty) {
 TEST_F(MetaAsyncRedisBackendTest, TestSyncBasic) {
     ASSERT_EQ(EC_OK, InitAndOpen());
 
-    // Put some data first
-    backend_->Put({10, 20}, {{{"f", "v"}}, {{"f", "v"}}});
-    // Sync should wait for the consumer to process
+    CacheLocationMapVector locs(2);
+    PropertyMapVector props = {{{"f", "v"}}, {{"f", "v"}}};
+    backend_->Put(nullptr, {10, 20}, locs, props);
     ASSERT_TRUE(backend_->Sync({10, 20}));
 }
 
@@ -225,18 +215,16 @@ TEST_F(MetaAsyncRedisBackendTest, TestSyncNotRunning) {
 TEST_F(MetaAsyncRedisBackendTest, TestSyncMultiQueue) {
     ASSERT_EQ(EC_OK, InitAndOpen());
 
-    // Generate keys that hash to different queues (with 2 queues)
     KeyTypeVec keys;
     for (int i = 0; i < 100; ++i) {
         keys.push_back(i);
     }
-    FieldMapVec field_maps;
+    CacheLocationMapVector locations(keys.size());
+    PropertyMapVector properties(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
-        field_maps.push_back({{"field", "value"}});
+        properties[i] = {{"field", "value"}};
     }
-    backend_->Put(keys, field_maps);
-
-    // Sync all keys - should touch both queues
+    backend_->Put(nullptr, keys, locations, properties);
     ASSERT_TRUE(backend_->Sync(keys));
 }
 
@@ -246,10 +234,10 @@ TEST_F(MetaAsyncRedisBackendTest, TestGetPassthrough) {
     ASSERT_EQ(EC_OK, InitAndOpen());
 
     KeyTypeVec keys = {1, 2};
-    std::vector<std::string> field_names = {"f1", "f2"};
-    FieldMapVec out_field_maps;
-    auto results = backend_->Get(keys, field_names, out_field_maps);
-    // With our mock returning INTEGER replies, the HMGET parsing will fail
+    CacheLocationMapVector out_locations;
+    PropertyMapVector out_properties;
+    auto results = backend_->Get(nullptr, keys, out_locations, out_properties);
+    // With our mock returning INTEGER replies, the HGETALL parsing will fail
     // But we're testing that the read path doesn't crash and properly routes to read pool
     ASSERT_EQ(2, results.size());
 }
@@ -259,8 +247,7 @@ TEST_F(MetaAsyncRedisBackendTest, TestExistsPassthrough) {
 
     KeyTypeVec keys = {1, 2};
     std::vector<bool> out_exists;
-    auto results = backend_->Exists(keys, out_exists);
-    // Mock returns INTEGER=1 for EXISTS, so keys exist
+    auto results = backend_->Exists(nullptr, keys, out_exists);
     ASSERT_EQ(2, results.size());
     ASSERT_EQ(EC_OK, results[0]);
     ASSERT_EQ(EC_OK, results[1]);
@@ -284,35 +271,14 @@ TEST_F(MetaAsyncRedisBackendTest, TestCompileWriteOpPut) {
 
     // kPut: DEL + HSET per key = 4 commands
     ASSERT_EQ(4, cmds.size());
-    // Key 1: DEL
     ASSERT_EQ("DEL", cmds[0][0]);
     ASSERT_TRUE(cmds[0][1].find("test_instance") != std::string::npos);
-    // Key 1: HSET
     ASSERT_EQ("HSET", cmds[1][0]);
-    ASSERT_EQ(cmds[0][1], cmds[1][1]); // same key
-    ASSERT_EQ(6, cmds[1].size());      // HSET key f1 v1 f2 v2
-    // Key 2: DEL
+    ASSERT_EQ(cmds[0][1], cmds[1][1]);
+    ASSERT_EQ(6, cmds[1].size()); // HSET key f1 v1 f2 v2
     ASSERT_EQ("DEL", cmds[2][0]);
-    // Key 2: HSET
     ASSERT_EQ("HSET", cmds[3][0]);
     ASSERT_EQ(4, cmds[3].size()); // HSET key f3 v3
-}
-
-TEST_F(MetaAsyncRedisBackendTest, TestCompileWriteOpUpdateFields) {
-    ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
-
-    WriteOp op;
-    op.type = WriteOpType::kUpdateFields;
-    op.keys = {10};
-    op.field_maps = {{{"field", "value"}}};
-
-    std::vector<CmdArgs> cmds;
-    backend_->CompileWriteOp(op, cmds);
-
-    // kUpdateFields: HSET only
-    ASSERT_EQ(1, cmds.size());
-    ASSERT_EQ("HSET", cmds[0][0]);
-    ASSERT_EQ(4, cmds[0].size()); // HSET key field value
 }
 
 TEST_F(MetaAsyncRedisBackendTest, TestCompileWriteOpUpsert) {
@@ -348,11 +314,11 @@ TEST_F(MetaAsyncRedisBackendTest, TestCompileWriteOpDelete) {
     }
 }
 
-TEST_F(MetaAsyncRedisBackendTest, TestCompileWriteOpDeleteFields) {
+TEST_F(MetaAsyncRedisBackendTest, TestCompileWriteOpDeleteLocations) {
     ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
 
     WriteOp op;
-    op.type = WriteOpType::kDeleteFields;
+    op.type = WriteOpType::kDeleteLocations;
     op.keys = {70};
     op.field_names_vec = {{"loc_1", "loc_2", "loc_3"}};
 
@@ -367,16 +333,14 @@ TEST_F(MetaAsyncRedisBackendTest, TestCompileWriteOpDeleteFields) {
 TEST_F(MetaAsyncRedisBackendTest, TestCompileWriteOpEmptyFieldMaps) {
     ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
 
-    // kPut with empty field_maps - should still DEL but no HSET
     WriteOp op;
     op.type = WriteOpType::kPut;
     op.keys = {80};
-    op.field_maps = {{}}; // empty map for key 80
+    op.field_maps = {{}};
 
     std::vector<CmdArgs> cmds;
     backend_->CompileWriteOp(op, cmds);
 
-    // BuildSetCmds generates DEL always, and skips HSET when field_map is empty
     ASSERT_EQ(1, cmds.size());
     ASSERT_EQ("DEL", cmds[0][0]);
 }
@@ -386,14 +350,12 @@ TEST_F(MetaAsyncRedisBackendTest, TestCompileWriteOpEmptyFieldMaps) {
 TEST_F(MetaAsyncRedisBackendTest, TestGetQueueIndexForKey) {
     ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
 
-    // With 2 queues, all keys should map to 0 or 1
     for (KeyType k = 0; k < 100; ++k) {
         int qi = backend_->GetQueueIndexForKey(k);
         ASSERT_GE(qi, 0);
         ASSERT_LT(qi, 2);
     }
 
-    // Same key always routes to same queue
     int q1 = backend_->GetQueueIndexForKey(42);
     int q2 = backend_->GetQueueIndexForKey(42);
     ASSERT_EQ(q1, q2);
@@ -429,47 +391,45 @@ TEST_F(MetaAsyncRedisBackendTest, TestStripPrefixInvalid) {
 TEST_F(MetaAsyncRedisBackendTest, TestEndToEndPutAndFlush) {
     ASSERT_EQ(EC_OK, InitAndOpen());
 
-    // Write multiple keys
     KeyTypeVec keys = {1000, 2000, 3000, 4000, 5000};
-    FieldMapVec field_maps;
+    CacheLocationMapVector locations(keys.size());
+    PropertyMapVector properties(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
-        field_maps.push_back({{"field_" + std::to_string(i), "value_" + std::to_string(i)}});
+        properties[i] = {{"field_" + std::to_string(i), "value_" + std::to_string(i)}};
     }
 
-    auto put_results = backend_->Put(keys, field_maps);
+    auto put_results = backend_->Put(nullptr, keys, locations, properties);
     ASSERT_EQ(5, put_results.size());
     for (auto &ec : put_results) {
         ASSERT_EQ(EC_OK, ec);
     }
 
-    // Sync ensures all are consumed
     ASSERT_TRUE(backend_->Sync(keys));
 }
 
 TEST_F(MetaAsyncRedisBackendTest, TestEndToEndMultipleOpTypes) {
     ASSERT_EQ(EC_OK, InitAndOpen());
 
-    backend_->Put({1}, {{{"f1", "v1"}}});
-    backend_->UpdateFields({1}, {{{"f2", "v2"}}});
-    backend_->Upsert({2}, {{{"f3", "v3"}}});
-    backend_->Delete({3});
-    backend_->DeleteFields({4}, {{"loc_1"}});
+    CacheLocationMapVector locs1(1), locs2(1);
+    PropertyMapVector props1 = {{{"f1", "v1"}}};
+    PropertyMapVector props2 = {{{"f3", "v3"}}};
+    backend_->Put(nullptr, {1}, locs1, props1);
+    backend_->Upsert(nullptr, {2}, locs2, props2);
+    backend_->Delete(nullptr, {3});
+    backend_->DeleteLocations(nullptr, {4}, {{"loc_1"}});
 
-    // Flush all
     ASSERT_TRUE(backend_->Sync({1, 2, 3, 4}));
 }
 
 // ==================== Backpressure Tests ====================
 
 TEST_F(MetaAsyncRedisBackendTest, TestBackpressureEnqueue) {
-    // Use very small queue to trigger backpressure
     config_->SetStorageUri("redis://user:pass@host:6379/?async_queue_count=1&async_max_size=5"
                            "&async_enqueue_timeout_ms=100&async_enqueue_retry_us=1000");
 
-    // Make consumer block by using a slow TryExecPipeline
     EXPECT_CALL(*backend_, CreateRedisClient()).WillRepeatedly(Invoke([]() {
         StandardUri empty_uri;
-        auto mock = std::make_shared<MockRedisClient>(empty_uri);
+        auto mock = std::make_shared<::testing::NiceMock<MockRedisClient>>(empty_uri);
         ON_CALL(*mock, IsContextOk()).WillByDefault(Return(true));
         ON_CALL(*mock, Reconnect()).WillByDefault(Return(true));
         ON_CALL(*mock, TryExecPipeline(_)).WillByDefault(Invoke([](const std::vector<CmdArgs> &cmds) {
@@ -490,15 +450,15 @@ TEST_F(MetaAsyncRedisBackendTest, TestBackpressureEnqueue) {
     ASSERT_EQ(EC_OK, backend_->Init("bp_test", config_));
     ASSERT_EQ(EC_OK, backend_->Open());
 
-    // Fill queue beyond max_size rapidly
     int timeout_count = 0;
     for (int i = 0; i < 50; ++i) {
-        auto results = backend_->Put({(KeyType)i}, {{{"f", "v"}}});
+        CacheLocationMapVector locs(1);
+        PropertyMapVector props = {{{"f", "v"}}};
+        auto results = backend_->Put(nullptr, {(KeyType)i}, locs, props);
         if (!results.empty() && results[0] == EC_TIMEOUT) {
             ++timeout_count;
         }
     }
-    // With max_size=5 and slow consumer, we should see some timeouts
     ASSERT_GT(timeout_count, 0);
     ASSERT_EQ(EC_OK, backend_->Close());
 }
@@ -509,7 +469,6 @@ TEST_F(MetaAsyncRedisBackendTest, TestPutAndGetMetaData) {
     ASSERT_EQ(EC_OK, InitAndOpen());
 
     FieldMap meta = {{"version", "1"}, {"created_at", "2024-01-01"}};
-    // PutMetaData uses Set which returns INTEGER replies - our mock returns integer=1
     ErrorCode ec = backend_->PutMetaData(meta);
     ASSERT_EQ(EC_OK, ec);
 }
@@ -517,11 +476,9 @@ TEST_F(MetaAsyncRedisBackendTest, TestPutAndGetMetaData) {
 // ==================== Metrics Tests ====================
 
 TEST_F(MetaAsyncRedisBackendTest, TestGetAsyncQueueSizes) {
-    // Before Open(), queues_ is empty
     ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
     EXPECT_TRUE(backend_->GetAsyncQueueSizes().empty());
 
-    // After Open(), should have queue_count (2) entries, all zero
     SetupMockRedisClients();
     ASSERT_EQ(EC_OK, backend_->Open());
     {
@@ -531,17 +488,17 @@ TEST_F(MetaAsyncRedisBackendTest, TestGetAsyncQueueSizes) {
         EXPECT_EQ(0, sizes[1]);
     }
 
-    // After Close() + reopen with slow consumer, enqueue and observe non-zero sizes
     ASSERT_EQ(EC_OK, backend_->Close());
 
-    config_->SetStorageUri("redis://user:pass@host:6379/?async_queue_count=2&async_max_batch=64"
+    config_->SetStorageUri("redis://user:pass@host:6379/?async_queue_count=2&async_max_batch=1"
                            "&async_wait_us=500000&async_max_size=10000");
     EXPECT_CALL(*backend_, CreateRedisClient()).WillRepeatedly(Invoke([]() {
         StandardUri empty_uri;
-        auto mock = std::make_shared<MockRedisClient>(empty_uri);
+        auto mock = std::make_shared<::testing::NiceMock<MockRedisClient>>(empty_uri);
         ON_CALL(*mock, IsContextOk()).WillByDefault(Return(true));
         ON_CALL(*mock, Reconnect()).WillByDefault(Return(true));
         ON_CALL(*mock, TryExecPipeline(_)).WillByDefault(Invoke([](const std::vector<CmdArgs> &cmds) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
             std::vector<RedisClient::ReplyUPtr> replies;
             for (size_t i = 0; i < cmds.size(); ++i) {
                 redisReply *r = (redisReply *)malloc(sizeof(redisReply));
@@ -557,13 +514,21 @@ TEST_F(MetaAsyncRedisBackendTest, TestGetAsyncQueueSizes) {
     ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
     ASSERT_EQ(EC_OK, backend_->Open());
 
+    CacheLocationMapVector seed_locs(1);
+    PropertyMapVector seed_props = {{{"f", "v"}}};
+    backend_->Put(nullptr, {0}, seed_locs, seed_props);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
     KeyTypeVec keys;
-    FieldMapVec field_maps;
-    for (int i = 0; i < 20; ++i) {
+    CacheLocationMapVector locations;
+    PropertyMapVector properties;
+    for (int i = 1; i <= 20; ++i) {
         keys.push_back(i);
-        field_maps.push_back({{"f", "v"}});
+        locations.push_back({});
+        properties.push_back({{"f", "v"}});
     }
-    backend_->Put(keys, field_maps);
+    backend_->Put(nullptr, keys, locations, properties);
 
     {
         auto sizes = backend_->GetAsyncQueueSizes();

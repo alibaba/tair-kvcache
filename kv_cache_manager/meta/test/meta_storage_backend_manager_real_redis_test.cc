@@ -31,6 +31,18 @@ public:
         return config;
     }
 
+    // URI with persistent=async_redis + cache=local forces dual-backend mode
+    // with asynchronous writes to redis.
+    static std::shared_ptr<MetaStorageBackendConfig> MakeAsyncDualConfig() {
+        auto config = std::make_shared<MetaStorageBackendConfig>();
+        config->SetStorageType(META_REDIS_BACKEND_TYPE_STR);
+        config->SetStorageUri("redis://test_redis_user:test_redis_password@localhost:6379/"
+                              "?client_max_pool_size=4&persistent_type=async_redis&cache_type=local"
+                              "&async_queue_count=2&async_max_batch=64&async_wait_us=1000"
+                              "&async_max_size=1000&async_drain_ms=2000");
+        return config;
+    }
+
     // URI without persistent_type/cache_type params -> single-backend mode
     // routed straight to the real redis instance.
     static std::shared_ptr<MetaStorageBackendConfig> MakeSingleConfig() {
@@ -67,28 +79,6 @@ public:
         return batch;
     }
 
-    // Mirror MetaStorageBackendManager::BuildEffectiveFieldMaps for tests that
-    // bypass the manager and write straight to persistent_backend_. Without
-    // this merge the persistent side would only carry block-level properties
-    // and later GetLocations fallbacks would find no location fields -> the
-    // caller's map::at / out-of-bounds access on the returned locations would
-    // throw or read garbage.
-    static void SerializeLocationsIntoProperties(BatchMetaData &batch) {
-        if (batch.batch_locations.empty()) {
-            return;
-        }
-        if (batch.batch_properties.empty()) {
-            batch.batch_properties.resize(batch.batch_keys.size());
-        }
-        for (size_t i = 0; i < batch.batch_keys.size(); ++i) {
-            for (const auto &[loc_id, loc_ptr] : batch.batch_locations[i]) {
-                if (!loc_ptr)
-                    continue;
-                batch.batch_properties[i][LOCATION_PREFIX + loc_ptr->id()] = loc_ptr->ToJsonString();
-            }
-        }
-    }
-
     static void WaitRunning(MetaStorageBackendManager &mgr) {
         for (int i = 0; i < 200; ++i) {
             if (mgr.GetRecoverState() == MetaStorageBackendManager::RecoverState::kRunning) {
@@ -103,35 +93,148 @@ public:
     // redis instance stay idempotent even when a previous run aborted midway.
     static void Cleanup(MetaStorageBackendManager &mgr, const KeyVector &keys) { mgr.Delete(nullptr, keys); }
 
+    // ---- Reusable test bodies (parameterised by config + instance + keys) ----
+
+    void DoDualPutAndGetTest(const std::shared_ptr<MetaStorageBackendConfig> &config,
+                             const std::string &inst_id, KeyType key_base) {
+        MetaStorageBackendManager mgr;
+        ASSERT_EQ(EC_OK, mgr.Init(inst_id, config));
+        ASSERT_EQ(EC_OK, mgr.Open());
+        WaitRunning(mgr);
+
+        KeyVector keys = {key_base, key_base + 1};
+        Cleanup(mgr, keys);
+        auto batch = MakeBatch(keys);
+        ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), mgr.Put(request_context_.get(), batch));
+
+        CacheLocationMapVector out_locations;
+        auto get_ecs = mgr.GetLocations(request_context_.get(), keys, out_locations);
+        ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), get_ecs);
+        for (size_t i = 0; i < keys.size(); ++i) {
+            const std::string loc_id = "loc_" + std::to_string(keys[i]);
+            ASSERT_EQ(1u, out_locations[i].size());
+            ASSERT_EQ("uri_" + std::to_string(keys[i]), out_locations[i].at(loc_id)->location_specs().front().uri());
+        }
+
+        Cleanup(mgr, keys);
+        ASSERT_EQ(EC_OK, mgr.Close());
+    }
+
+    void DoGetLocationsPerIdTest(const std::shared_ptr<MetaStorageBackendConfig> &config,
+                                 const std::string &inst_id, KeyType key_base) {
+        MetaStorageBackendManager mgr;
+        ASSERT_EQ(EC_OK, mgr.Init(inst_id, config));
+        ASSERT_EQ(EC_OK, mgr.Open());
+        WaitRunning(mgr);
+
+        KeyVector keys = {key_base, key_base + 1};
+        Cleanup(mgr, keys);
+        auto batch = MakeBatch(keys);
+        ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), mgr.Put(request_context_.get(), batch));
+
+        LocationIdsPerKey ids = {{"loc_" + std::to_string(keys[0]), "missing_loc"},
+                                 {"loc_" + std::to_string(keys[1]), "missing_loc"}};
+        LocationsPerKey out_locs;
+        auto ecs = mgr.GetLocations(request_context_.get(), keys, ids, out_locs);
+        ASSERT_EQ(2u, ecs.size());
+        ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOENT}), ecs[0]);
+        ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOENT}), ecs[1]);
+        ASSERT_EQ("uri_" + std::to_string(keys[0]), out_locs[0][0]->location_specs().front().uri());
+        ASSERT_EQ("uri_" + std::to_string(keys[1]), out_locs[1][0]->location_specs().front().uri());
+
+        Cleanup(mgr, keys);
+        ASSERT_EQ(EC_OK, mgr.Close());
+    }
+
+    void DoListKeysAndRandomSampleTest(const std::shared_ptr<MetaStorageBackendConfig> &config,
+                                       const std::string &inst_id, KeyType key_base) {
+        MetaStorageBackendManager mgr;
+        ASSERT_EQ(EC_OK, mgr.Init(inst_id, config));
+        ASSERT_EQ(EC_OK, mgr.Open());
+        WaitRunning(mgr);
+
+        KeyVector keys = {key_base, key_base + 100, key_base + 200};
+        Cleanup(mgr, keys);
+        auto batch = MakeBatch(keys);
+        ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}), mgr.Put(request_context_.get(), batch));
+
+        std::set<KeyType> seen;
+        std::string cursor = SCAN_BASE_CURSOR;
+        for (int i = 0; i < 50 && seen.size() < keys.size(); ++i) {
+            std::string next;
+            KeyTypeVec out;
+            ASSERT_EQ(EC_OK, mgr.ListKeys(nullptr, cursor, 100, next, out));
+            for (auto k : out) {
+                seen.insert(k);
+            }
+            cursor = next;
+            if (cursor == SCAN_BASE_CURSOR) {
+                break;
+            }
+        }
+        for (auto k : keys) {
+            ASSERT_TRUE(seen.count(k) > 0) << "missing key=" << k;
+        }
+
+        KeyTypeVec sampled;
+        ASSERT_EQ(EC_OK, mgr.RandomSample(nullptr, 1, sampled));
+        ASSERT_LE(sampled.size(), 1u);
+
+        Cleanup(mgr, keys);
+        ASSERT_EQ(EC_OK, mgr.Close());
+    }
+
+    void DoPutGetMetaDataTest(const std::shared_ptr<MetaStorageBackendConfig> &config,
+                              const std::string &inst_id) {
+        MetaStorageBackendManager mgr;
+        ASSERT_EQ(EC_OK, mgr.Init(inst_id, config));
+        ASSERT_EQ(EC_OK, mgr.Open());
+        WaitRunning(mgr);
+
+        FieldMap input = {{"k1", "v1"}, {"k2", "v2"}};
+        ASSERT_EQ(EC_OK, mgr.PutMetaData(input));
+        FieldMap output;
+        ASSERT_EQ(EC_OK, mgr.GetMetaData(output));
+        ASSERT_EQ("v1", output["k1"]);
+        ASSERT_EQ("v2", output["k2"]);
+
+        ASSERT_EQ(EC_OK, mgr.Close());
+    }
+
+    void DoRunningReadLocalOnlyTest(const std::shared_ptr<MetaStorageBackendConfig> &config,
+                                    const std::string &inst_id, KeyType key_base) {
+        MetaStorageBackendManager mgr;
+        ASSERT_EQ(EC_OK, mgr.Init(inst_id, config));
+        ASSERT_EQ(EC_OK, mgr.Open());
+        WaitRunning(mgr);
+
+        KeyVector k1 = {key_base};
+        KeyVector k2 = {key_base + 1};
+        Cleanup(mgr, KeyVector{key_base, key_base + 1});
+
+        auto b1 = MakeBatch(k1);
+        ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.Put(request_context_.get(), b1));
+
+        auto b2 = MakeBatch(k2);
+        ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
+                  mgr.persistent_backend_->Put(nullptr, b2.batch_keys, b2.batch_locations, b2.batch_properties));
+
+        std::vector<bool> exists_vec;
+        ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
+                  mgr.Exists(request_context_.get(), KeyVector{key_base, key_base + 1}, exists_vec));
+        ASSERT_EQ((std::vector<bool>{true, false}), exists_vec);
+
+        PropertyMapVector props;
+        auto ecs = mgr.GetProperties(request_context_.get(), KeyVector{key_base + 1}, {"p0"}, props);
+        ASSERT_TRUE(ecs[0] == EC_NOENT || (ecs[0] == EC_OK && props[0].empty()));
+
+        Cleanup(mgr, KeyVector{key_base, key_base + 1});
+        ASSERT_EQ(EC_OK, mgr.Close());
+    }
+
 protected:
     std::shared_ptr<RequestContext> request_context_;
 };
-
-// --- Dual-backend: Put + GetLocations round-trip against real redis ----------
-
-TEST_F(MetaStorageBackendManagerRealRedisTest, TestDualBackendPutAndGet) {
-    MetaStorageBackendManager mgr;
-    ASSERT_EQ(EC_OK, mgr.Init("inst_redis_dual", MakeDualConfig()));
-    ASSERT_EQ(EC_OK, mgr.Open());
-    WaitRunning(mgr);
-
-    KeyVector keys = {10001, 10002};
-    Cleanup(mgr, keys); // defensive: wipe any leftover from a prior aborted run
-    auto batch = MakeBatch(keys);
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), mgr.Put(request_context_.get(), batch));
-
-    CacheLocationMapVector out_locations;
-    auto get_ecs = mgr.GetLocations(request_context_.get(), keys, out_locations);
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), get_ecs);
-    for (size_t i = 0; i < keys.size(); ++i) {
-        const std::string loc_id = "loc_" + std::to_string(keys[i]);
-        ASSERT_EQ(1u, out_locations[i].size());
-        ASSERT_EQ("uri_" + std::to_string(keys[i]), out_locations[i].at(loc_id)->location_specs().front().uri());
-    }
-
-    Cleanup(mgr, keys);
-    ASSERT_EQ(EC_OK, mgr.Close());
-}
 
 // --- Init: invalid URI types rejected against a live redis URI ---------------
 
@@ -173,12 +276,12 @@ TEST_F(MetaStorageBackendManagerRealRedisTest, TestSingleBackendCrud) {
     auto batch = MakeBatch(keys);
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), mgr.Put(request_context_.get(), batch));
 
-    FieldMapVec field_maps;
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), mgr.Get(keys, {"p0"}, field_maps));
-    ASSERT_EQ("p0_20001", field_maps[0].at("p0"));
+    PropertyMapVector out_props;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), mgr.GetProperties(request_context_.get(), keys, {"p0"}, out_props));
+    ASSERT_EQ("p0_20001", out_props[0].at("p0"));
 
     std::vector<bool> exists_vec;
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), mgr.Exists(keys, exists_vec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), mgr.Exists(request_context_.get(), keys, exists_vec));
     ASSERT_EQ((std::vector<bool>{true, true}), exists_vec);
 
     CacheLocationMapVector out_locs;
@@ -192,7 +295,7 @@ TEST_F(MetaStorageBackendManagerRealRedisTest, TestSingleBackendCrud) {
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), mgr.Delete(nullptr, keys, loc_ids, reclaimed));
     ASSERT_EQ(2, reclaimed);
 
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), mgr.Exists(keys, exists_vec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), mgr.Exists(request_context_.get(), keys, exists_vec));
     ASSERT_EQ((std::vector<bool>{false, false}), exists_vec);
 
     Cleanup(mgr, keys);
@@ -220,9 +323,9 @@ TEST_F(MetaStorageBackendManagerRealRedisTest, TestRecoverReadFallbackToPersiste
     // would observe no location fields.
     KeyVector extra = {30002};
     auto extra_batch = MakeBatch(extra);
-    SerializeLocationsIntoProperties(extra_batch);
     {
-        std::vector<ErrorCode> ecs = mgr.persistent_backend_->Put(extra_batch.batch_keys, extra_batch.batch_properties);
+        std::vector<ErrorCode> ecs = mgr.persistent_backend_->Put(
+            nullptr, extra_batch.batch_keys, extra_batch.batch_locations, extra_batch.batch_properties);
         ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), ecs);
     }
 
@@ -230,15 +333,15 @@ TEST_F(MetaStorageBackendManagerRealRedisTest, TestRecoverReadFallbackToPersiste
     mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover, std::memory_order_release);
 
     KeyVector keys = {30001, 30002, 30003};
-    FieldMapVec fms;
-    auto ecs = mgr.Get(keys, {"p0"}, fms);
+    PropertyMapVector props;
+    auto ecs = mgr.GetProperties(request_context_.get(), keys, {"p0"}, props);
     ASSERT_EQ(EC_OK, ecs[0]);
     ASSERT_EQ(EC_OK, ecs[1]);
-    ASSERT_EQ("p0_30001", fms[0].at("p0"));
-    ASSERT_EQ("p0_30002", fms[1].at("p0"));
+    ASSERT_EQ("p0_30001", props[0].at("p0"));
+    ASSERT_EQ("p0_30002", props[1].at("p0"));
 
     std::vector<bool> exists_vec;
-    auto exists_ecs = mgr.Exists(keys, exists_vec);
+    auto exists_ecs = mgr.Exists(request_context_.get(), keys, exists_vec);
     ASSERT_EQ(EC_OK, exists_ecs[0]);
     ASSERT_EQ(EC_OK, exists_ecs[1]);
     ASSERT_EQ((std::vector<bool>{true, true, false}), exists_vec);
@@ -262,7 +365,7 @@ TEST_F(MetaStorageBackendManagerRealRedisTest, TestRecoverWriteDualWriteAndDelet
     ASSERT_EQ(EC_OK, mgr.Open());
     WaitRunning(mgr);
 
-    // Force Recover so Delete writes a tombstone and UpdateFields runs
+    // Force Recover so Delete writes a tombstone and Upsert runs
     // EnsureKeyInLocal before the conditional write.
     mgr.recover_state_.store(MetaStorageBackendManager::RecoverState::kRecover, std::memory_order_release);
 
@@ -279,155 +382,72 @@ TEST_F(MetaStorageBackendManagerRealRedisTest, TestRecoverWriteDualWriteAndDelet
         ASSERT_EQ(1u, mgr.deleted_keys_.count(40042));
     }
 
-    // Simulate a late backfill after Delete: BackfillKeysToLocal must see the
+    // Simulate a late backfill after Delete: BackfillKeysToCache must see the
     // tombstone and refuse to reinsert the key into local.
-    FieldMapVec stale_fms(1);
-    stale_fms[0]["p0"] = "stale";
-    ASSERT_EQ(0, mgr.BackfillKeysToLocal(keys, stale_fms, {EC_OK}));
+    CacheLocationMapVector stale_locs(1);
+    PropertyMapVector stale_props(1);
+    stale_props[0]["p0"] = "stale";
+    ASSERT_EQ(0, mgr.BackfillKeysToCache(keys, stale_locs, stale_props, {EC_OK}));
     std::vector<bool> exists_vec;
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.cache_backend_->Exists(keys, exists_vec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.cache_backend_->Exists(nullptr, keys, exists_vec));
     ASSERT_FALSE(exists_vec[0]);
 
-    // Key 40007 lives only in redis: UpdateFields under Recover must hydrate
+    // Key 40007 lives only in redis: Upsert under Recover must hydrate
     // it into local via EnsureKeyInLocal before the conditional write, so the
-    // subsequent Get observes the update.
+    // subsequent Get observes the upsert.
     KeyVector k7 = {40007};
     Cleanup(mgr, k7);
     auto batch7 = MakeBatch(k7);
-    SerializeLocationsIntoProperties(batch7);
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
-              mgr.persistent_backend_->Put(batch7.batch_keys, batch7.batch_properties));
+              mgr.persistent_backend_->Put(nullptr, batch7.batch_keys, batch7.batch_locations, batch7.batch_properties));
 
-    BatchMetaData update_batch;
-    update_batch.batch_keys = k7;
-    update_batch.batch_properties.resize(1);
-    update_batch.batch_properties[0]["p0"] = "p0_40007_updated";
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.UpdateFields(request_context_.get(), update_batch));
+    BatchMetaData upsert_batch;
+    upsert_batch.batch_keys = k7;
+    upsert_batch.batch_properties.resize(1);
+    upsert_batch.batch_properties[0]["p0"] = "p0_40007_updated";
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.Upsert(request_context_.get(), upsert_batch));
 
-    FieldMapVec fms;
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.Get(k7, {"p0"}, fms));
-    ASSERT_EQ("p0_40007_updated", fms[0].at("p0"));
+    PropertyMapVector props;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.GetProperties(request_context_.get(), k7, {"p0"}, props));
+    ASSERT_EQ("p0_40007_updated", props[0].at("p0"));
 
     Cleanup(mgr, k7);
     ASSERT_EQ(EC_OK, mgr.Close());
+}
+
+// --- Dual-backend: Put + GetLocations round-trip against real redis ----------
+
+TEST_F(MetaStorageBackendManagerRealRedisTest, TestDualBackendPutAndGet) {
+    DoDualPutAndGetTest(MakeDualConfig(), "inst_redis_dual", 10001);
+    DoDualPutAndGetTest(MakeAsyncDualConfig(), "inst_async_dual", 80001);
 }
 
 // --- Running phase: reads stay local-only, no redis fallback -----------------
 
 TEST_F(MetaStorageBackendManagerRealRedisTest, TestRunningReadLocalOnly) {
-    MetaStorageBackendManager mgr;
-    ASSERT_EQ(EC_OK, mgr.Init("inst_redis_running", MakeDualConfig()));
-    ASSERT_EQ(EC_OK, mgr.Open());
-    WaitRunning(mgr);
-
-    KeyVector k1 = {50001};
-    KeyVector k2 = {50002};
-    Cleanup(mgr, KeyVector{50001, 50002});
-
-    auto b1 = MakeBatch(k1);
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.Put(request_context_.get(), b1));
-
-    // Bypass manager and write k2 only into redis; in Running state reads
-    // must not see it (local-only path).
-    auto b2 = MakeBatch(k2);
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), mgr.persistent_backend_->Put(b2.batch_keys, b2.batch_properties));
-
-    std::vector<bool> exists_vec;
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), mgr.Exists(KeyVector{50001, 50002}, exists_vec));
-    ASSERT_EQ((std::vector<bool>{true, false}), exists_vec);
-
-    FieldMapVec fms;
-    auto ecs = mgr.Get(KeyVector{50002}, {"p0"}, fms);
-    ASSERT_TRUE(ecs[0] == EC_NOENT || (ecs[0] == EC_OK && fms[0].empty()));
-
-    Cleanup(mgr, KeyVector{50001, 50002});
-    ASSERT_EQ(EC_OK, mgr.Close());
+    DoRunningReadLocalOnlyTest(MakeDualConfig(), "inst_redis_running", 50001);
+    DoRunningReadLocalOnlyTest(MakeAsyncDualConfig(), "inst_async_running", 80101);
 }
 
 // --- GetLocations(keys, location_ids): per-id EC semantics -------------------
 
 TEST_F(MetaStorageBackendManagerRealRedisTest, TestGetLocationsPerLocationIdSemantics) {
-    MetaStorageBackendManager mgr;
-    ASSERT_EQ(EC_OK, mgr.Init("inst_redis_get_loc_ids", MakeDualConfig()));
-    ASSERT_EQ(EC_OK, mgr.Open());
-    WaitRunning(mgr);
-
-    KeyVector keys = {60005, 60006};
-    Cleanup(mgr, keys);
-    auto batch = MakeBatch(keys);
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), mgr.Put(request_context_.get(), batch));
-
-    // Two ids per key: one existing, one non-existent -> {EC_OK, EC_NOENT}.
-    LocationIdsPerKey ids = {{"loc_60005", "missing_loc"}, {"loc_60006", "missing_loc"}};
-    LocationsPerKey out_locs;
-    auto ecs = mgr.GetLocations(request_context_.get(), keys, ids, out_locs);
-    ASSERT_EQ(2u, ecs.size());
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOENT}), ecs[0]);
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOENT}), ecs[1]);
-    ASSERT_EQ("uri_60005", out_locs[0][0]->location_specs().front().uri());
-    ASSERT_EQ("uri_60006", out_locs[1][0]->location_specs().front().uri());
-
-    Cleanup(mgr, keys);
-    ASSERT_EQ(EC_OK, mgr.Close());
+    DoGetLocationsPerIdTest(MakeDualConfig(), "inst_redis_get_loc_ids", 60005);
+    DoGetLocationsPerIdTest(MakeAsyncDualConfig(), "inst_async_get_loc_ids", 80201);
 }
 
 // --- Cross-batch APIs: ListKeys + RandomSample -------------------------------
 
 TEST_F(MetaStorageBackendManagerRealRedisTest, TestListKeysAndRandomSample) {
-    MetaStorageBackendManager mgr;
-    ASSERT_EQ(EC_OK, mgr.Init("inst_redis_list", MakeDualConfig()));
-    ASSERT_EQ(EC_OK, mgr.Open());
-    WaitRunning(mgr);
-
-    KeyVector keys = {70100, 70200, 70300};
-    Cleanup(mgr, keys);
-    auto batch = MakeBatch(keys);
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}), mgr.Put(request_context_.get(), batch));
-
-    // ListKeys must eventually surface every inserted key. Other tenants may
-    // share the redis instance, so we only assert inclusion (not equality).
-    std::set<KeyType> seen;
-    std::string cursor = SCAN_BASE_CURSOR;
-    for (int i = 0; i < 50 && seen.size() < keys.size(); ++i) {
-        std::string next;
-        KeyTypeVec out;
-        ASSERT_EQ(EC_OK, mgr.ListKeys(cursor, /*limit*/ 100, next, out));
-        for (auto k : out) {
-            seen.insert(k);
-        }
-        cursor = next;
-        if (cursor == SCAN_BASE_CURSOR) {
-            break;
-        }
-    }
-    for (auto k : keys) {
-        ASSERT_TRUE(seen.count(k) > 0) << "missing key=" << k;
-    }
-
-    KeyTypeVec sampled;
-    ASSERT_EQ(EC_OK, mgr.RandomSample(/*count*/ 1, sampled));
-    ASSERT_LE(sampled.size(), 1u);
-
-    Cleanup(mgr, keys);
-    ASSERT_EQ(EC_OK, mgr.Close());
+    DoListKeysAndRandomSampleTest(MakeDualConfig(), "inst_redis_list", 70100);
+    DoListKeysAndRandomSampleTest(MakeAsyncDualConfig(), "inst_async_list", 80301);
 }
 
 // --- PutMetaData / GetMetaData always routed to redis ------------------------
 
 TEST_F(MetaStorageBackendManagerRealRedisTest, TestPutGetMetaData) {
-    MetaStorageBackendManager mgr;
-    ASSERT_EQ(EC_OK, mgr.Init("inst_redis_metadata", MakeDualConfig()));
-    ASSERT_EQ(EC_OK, mgr.Open());
-    WaitRunning(mgr);
-
-    FieldMap input = {{"k1", "v1"}, {"k2", "v2"}};
-    ASSERT_EQ(EC_OK, mgr.PutMetaData(input));
-    FieldMap output;
-    ASSERT_EQ(EC_OK, mgr.GetMetaData(output));
-    ASSERT_EQ("v1", output["k1"]);
-    ASSERT_EQ("v2", output["k2"]);
-
-    ASSERT_EQ(EC_OK, mgr.Close());
+    DoPutGetMetaDataTest(MakeDualConfig(), "inst_redis_metadata");
+    DoPutGetMetaDataTest(MakeAsyncDualConfig(), "inst_async_metadata");
 }
 
 } // namespace kv_cache_manager

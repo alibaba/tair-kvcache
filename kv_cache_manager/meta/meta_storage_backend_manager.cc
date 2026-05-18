@@ -302,27 +302,6 @@ std::vector<ErrorCode> MetaStorageBackendManager::Put(RequestContext *request_co
     return cache_backend_->Put(request_context, keys, locations, properties, persistent_results);
 }
 
-std::vector<ErrorCode> MetaStorageBackendManager::UpdateFields(RequestContext *request_context,
-                                                               BatchMetaData &batch) noexcept {
-    const KeyVector &keys = batch.batch_keys;
-    batch.EnsureLocationsAndPropertiesResized();
-    CacheLocationMapVector &locations = batch.batch_locations;
-    PropertyMapVector &properties = batch.batch_properties;
-
-    // Partial-update during Recover: hydrate cache from persistent first so
-    // the conditional mirror write below has the full pre-restart field set
-    // to update against (and async backfill cannot later overwrite us).
-    if (cache_backend_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRecover) {
-        EnsureKeyInCache(request_context, keys);
-    }
-    std::vector<ErrorCode> persistent_results =
-        persistent_backend_->Update(request_context, keys, locations, properties);
-    if (!cache_backend_) {
-        return persistent_results;
-    }
-    return cache_backend_->Update(request_context, keys, locations, properties, persistent_results);
-}
-
 std::vector<ErrorCode> MetaStorageBackendManager::Upsert(RequestContext *request_context,
                                                          BatchMetaData &batch) noexcept {
     const KeyVector &keys = batch.batch_keys;
@@ -330,8 +309,8 @@ std::vector<ErrorCode> MetaStorageBackendManager::Upsert(RequestContext *request
     CacheLocationMapVector &locations = batch.batch_locations;
     PropertyMapVector &properties = batch.batch_properties;
 
-    // See UpdateFields(): Upsert may also touch only a subset of fields, so
-    // the same Recover-time hydration is needed.
+    // Upsert may touch only a subset of fields, so Recover-time hydration
+    // is needed to avoid overwriting unmentioned fields with empty values.
     if (cache_backend_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRecover) {
         EnsureKeyInCache(request_context, keys);
     }

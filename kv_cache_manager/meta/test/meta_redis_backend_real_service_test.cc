@@ -191,12 +191,12 @@ TEST_F(MetaRedisBackendRealServiceTest, TestConcurrentMixedOperations) {
                 }
             }
         } break;
-        case 2: // UPDATE
+        case 2: // UPSERT
         {
             FieldMap update_map = {{"updated", "true"}, {"ts", "1234"}};
             FieldMapVec update_maps(keys.size(), update_map);
             auto ec_per_key =
-                meta_redis_backend_->Update(nullptr, keys, CacheLocationMapVector(keys.size()), update_maps);
+                meta_redis_backend_->Upsert(nullptr, keys, CacheLocationMapVector(keys.size()), update_maps);
             ASSERT_EQ(keys.size(), ec_per_key.size());
             for (auto ec : ec_per_key) {
                 ASSERT_TRUE(ec == EC_OK || ec == EC_NOENT) << ec;

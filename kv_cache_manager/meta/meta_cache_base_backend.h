@@ -16,7 +16,6 @@ public:
     using MetaStorageBackend::Delete;
     using MetaStorageBackend::DeleteLocations;
     using MetaStorageBackend::Put;
-    using MetaStorageBackend::Update;
     using MetaStorageBackend::Upsert;
 
     virtual size_t GetMemUsage() const noexcept = 0;
@@ -56,12 +55,6 @@ public:
                                                const std::vector<ErrorCode> &previous_error_codes) noexcept = 0;
 
     virtual std::vector<ErrorCode> Upsert(RequestContext *request_context,
-                                          const KeyTypeVec &keys,
-                                          const CacheLocationMapVector &locations,
-                                          const PropertyMapVector &properties,
-                                          const std::vector<ErrorCode> &previous_error_codes) noexcept = 0;
-
-    virtual std::vector<ErrorCode> Update(RequestContext *request_context,
                                           const KeyTypeVec &keys,
                                           const CacheLocationMapVector &locations,
                                           const PropertyMapVector &properties,

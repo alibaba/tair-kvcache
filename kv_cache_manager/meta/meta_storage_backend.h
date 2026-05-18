@@ -79,22 +79,6 @@ public:
                                           const CacheLocationMapVector &locations,
                                           const PropertyMapVector &properties) noexcept = 0;
 
-    // 增量更新：仅更新传入的 locations 和 properties 字段，不影响 key 中其他已有字段。
-    // @param request_context  请求上下文；可为 nullptr
-    // @param keys             待更新的 key 列表
-    // @param locations        每个 key 要更新的 CacheLocationMap，大小必须等于 keys.size()；
-    //                         空 map 表示不更新该 key 的 location
-    // @param properties       每个 key 要更新的 PropertyMap，大小必须等于 keys.size()；
-    //                         空 map 表示不更新该 key 的 property
-    // @return 每个 key 的错误码：
-    //   - EC_OK:    更新成功
-    //   - EC_NOENT: key 不存在
-    //   - EC_ERROR: 更新失败
-    virtual std::vector<ErrorCode> Update(RequestContext *request_context,
-                                          const KeyTypeVec &keys,
-                                          const CacheLocationMapVector &locations,
-                                          const PropertyMapVector &properties) noexcept = 0;
-
     // 删除整个 key 及其所有 locations 和 properties。
     // @param request_context  请求上下文；可为 nullptr
     // @param keys  待删除的 key 列表
