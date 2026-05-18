@@ -119,6 +119,8 @@ public:
         registry_manager_->instance_group_configs_["test_group"] = instance_group;
         registry_manager_->instance_infos_["test_instance"] = instance_info;
         registry_manager_->Init();
+        // Mark registry as recovered since data was injected directly (not via backend)
+        registry_manager_->recover_complete_.store(true);
         std::unique_ptr<CacheManager> cache_manager =
             std::make_unique<CacheManager>(metrics_registry, registry_manager_);
 
@@ -2300,6 +2302,88 @@ TEST_F(CacheManagerTest, TestWriteThenReadRoundTripWithSpecGroups) {
                 << "key index " << i << " should have 2 F0 specs after filtering";
         }
     }
+}
+
+TEST_F(CacheManagerTest, TestDoRecoverAfterCleanup) {
+    // Cleanup then recover
+    ASSERT_EQ(EC_OK, cache_manager_->DoCleanup());
+    ASSERT_EQ(EC_OK, cache_manager_->DoRecoverOnce());
+
+    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    ASSERT_TRUE(meta_searcher);
+    ASSERT_TRUE(meta_searcher->meta_indexer_);
+    ASSERT_EQ("test_instance", meta_searcher->meta_indexer_->instance_id_);
+
+    // Call again - should be idempotent
+    ASSERT_EQ(EC_OK, cache_manager_->DoRecoverOnce());
+    meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    ASSERT_TRUE(meta_searcher);
+    ASSERT_EQ("test_instance", meta_searcher->meta_indexer_->instance_id_);
+}
+
+TEST_F(CacheManagerTest, TestDoRecoverOnceWithRegistryPartialFailureThenFix) {
+    // Scenario:
+    // 1. RegistryManager has instance_group + test_instance recovered, but a second instance
+    //    "missing_instance" is expected but not in instance_infos_ (simulates partial recover failure)
+    // 2. RegistryManager::IsRecoverComplete() returns false
+    // 3. CacheManager::DoRecoverOnce() succeeds for test_instance but overall returns ERROR
+    // 4. "Fix" RegistryManager by adding missing_instance and marking recover complete
+    // 5. CacheManager::DoRecoverOnce() now succeeds and missing_instance gets its MetaSearcher
+
+    // Cleanup to start fresh
+    ASSERT_EQ(EC_OK, cache_manager_->DoCleanup());
+
+    // Simulate RegistryManager partial failure: recover_complete_ is false
+    // test_instance is already in instance_infos_ (from SetUp), but mark as incomplete
+    registry_manager_->recover_complete_.store(false);
+
+    // CacheManager DoRecoverOnce - should return ERROR because RegistryManager is incomplete
+    auto ec = cache_manager_->DoRecoverOnce();
+    ASSERT_EQ(EC_ERROR, ec);
+
+    // test_instance MetaSearcher should still have been created (partial progress is retained)
+    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    ASSERT_TRUE(meta_searcher);
+    ASSERT_EQ("test_instance", meta_searcher->meta_indexer_->instance_id_);
+
+    // "missing_instance" doesn't exist yet - no MetaSearcher
+    meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("missing_instance");
+    ASSERT_FALSE(meta_searcher);
+
+    // Now "fix" RegistryManager: add missing_instance to instance_infos_ and mark complete
+    auto missing_instance_info = std::make_shared<InstanceInfo>(
+        "test_quota_group", "default", "missing_instance", 64, createLocationSpecInfos(), createModelDeployment());
+    registry_manager_->instance_infos_["missing_instance"] = missing_instance_info;
+    registry_manager_->recover_complete_.store(true);
+
+    // CacheManager DoRecoverOnce - should now succeed
+    ec = cache_manager_->DoRecoverOnce();
+    ASSERT_EQ(EC_OK, ec);
+
+    // Both instances should have MetaSearcher
+    meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    ASSERT_TRUE(meta_searcher);
+    ASSERT_EQ("test_instance", meta_searcher->meta_indexer_->instance_id_);
+
+    meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("missing_instance");
+    ASSERT_TRUE(meta_searcher);
+    ASSERT_EQ("missing_instance", meta_searcher->meta_indexer_->instance_id_);
+}
+
+TEST_F(CacheManagerTest, TestRecoverRetryLoopLifecycle) {
+    // StopRecoverRetryLoop should be safe without active thread
+    cache_manager_->StopRecoverRetryLoop();
+    cache_manager_->StopRecoverRetryLoop(); // double-stop should not crash
+
+    // StartRecoverRetryLoop + StopRecoverRetryLoop
+    cache_manager_->StartRecoverRetryLoop();
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    cache_manager_->StopRecoverRetryLoop(); // should join within ~100ms
+
+    // DoCleanup should stop retry thread
+    cache_manager_->StartRecoverRetryLoop();
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    ASSERT_EQ(EC_OK, cache_manager_->DoCleanup());
 }
 
 } // namespace kv_cache_manager

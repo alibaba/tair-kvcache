@@ -133,6 +133,7 @@ CacheManager::CacheManager(std::shared_ptr<MetricsRegistry> metrics_registry,
           meta_indexer_manager_, write_location_manager_, registry_manager_)) {}
 
 CacheManager::~CacheManager() {
+    StopRecoverRetryLoop();
     if (write_location_manager_) {
         write_location_manager_->Stop();
         write_location_manager_.reset();
@@ -1237,25 +1238,27 @@ ErrorCode CacheManager::GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
     return ec;
 }
 
-ErrorCode CacheManager::DoRecover() {
+ErrorCode CacheManager::DoRecoverOnce() {
     if (!registry_manager_) {
         KVCM_LOG_ERROR("CacheManager do recover failed, registry_manager is nullptr");
         return EC_ERROR;
     }
+    size_t error_count = 0;
     auto request_context = std::make_shared<RequestContext>("cache_manager_recover_trace");
     auto [ec1, instance_groups] = registry_manager_->ListInstanceGroup(request_context.get());
     if (ec1 != EC_OK) {
-        KVCM_LOG_ERROR("CacheManager ListInstanceGroup failed when recover, ec[%d]", ec1);
-        return ec1;
+        KVCM_LOG_WARN("CacheManager ListInstanceGroup failed when recover, ec[%d], will retry later", ec1);
+        return EC_ERROR;
     }
     for (const auto &instance_group : instance_groups) {
         std::string group_name = instance_group->name();
         auto [ec2, instance_infos] = registry_manager_->ListInstanceInfo(request_context.get(), group_name);
         if (ec2 != EC_OK) {
-            KVCM_LOG_ERROR("CacheManager ListInstanceInfo failed when recover, ec[%d] instance_group name[%s]",
-                           ec2,
-                           group_name.c_str());
-            return ec2;
+            KVCM_LOG_WARN("CacheManager ListInstanceInfo failed when recover, skip. ec[%d] instance_group name[%s]",
+                          ec2,
+                          group_name.c_str());
+            ++error_count;
+            continue;
         }
         for (const auto &instance_info : instance_infos) {
             auto [ec3, config_str] = RegisterInstance(request_context.get(),
@@ -1265,28 +1268,86 @@ ErrorCode CacheManager::DoRecover() {
                                                       instance_info->location_spec_infos(),
                                                       instance_info->model_deployment(),
                                                       instance_info->location_spec_groups());
-            if (ec3 != EC_OK) {
-                KVCM_LOG_ERROR("CacheManager RegisterInstance failed when recover, ec[%d] instance_group "
-                               "name[%s] instance_id[%s]",
-                               ec3,
-                               group_name.c_str(),
-                               instance_info->instance_id().c_str());
-                return ec3;
+            if (ec3 != EC_OK && ec3 != EC_DUPLICATE_ENTITY) {
+                KVCM_LOG_WARN("CacheManager RegisterInstance failed when recover, skip. ec[%d] instance_group "
+                              "name[%s] instance_id[%s]",
+                              ec3,
+                              group_name.c_str(),
+                              instance_info->instance_id().c_str());
+                ++error_count;
+                continue;
             }
             KVCM_LOG_INFO("CacheManager RegisterInstance success when recover, instance_id[%s], storage_config[%s]",
                           instance_info->instance_id().c_str(),
                           config_str.c_str());
         }
     }
+
+    // CacheManager recover is only complete when RegistryManager recover is also complete
+    if (!registry_manager_->IsRecoverComplete()) {
+        KVCM_LOG_WARN("CacheManager recover waiting for RegistryManager recover to complete");
+        ++error_count;
+    }
+
+    KVCM_LOG_INFO("CacheManager do recover once done, error_count[%lu]", error_count);
+    return error_count > 0 ? EC_ERROR : EC_OK;
+}
+
+ErrorCode CacheManager::DoRecover() {
+    auto ec = DoRecoverOnce();
+    if (ec == EC_OK) {
+        return EC_OK;
+    }
+    KVCM_LOG_WARN("CacheManager DoRecover partially failed, starting retry loop in background");
+    StartRecoverRetryLoop();
     return EC_OK;
 }
+
+void CacheManager::StartRecoverRetryLoop() {
+    StopRecoverRetryLoop();
+    recover_retry_stop_.store(false);
+    recover_retry_thread_ = std::thread([this]() {
+        while (!recover_retry_stop_.load()) {
+            for (int i = 0; i < 100 && !recover_retry_stop_.load(); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            if (recover_retry_stop_.load()) {
+                break;
+            }
+            KVCM_LOG_INFO("CacheManager recover retry loop executing...");
+            auto ec = DoRecoverOnce();
+            if (ec == EC_OK) {
+                KVCM_LOG_INFO("CacheManager recover retry loop completed successfully, stopping retry");
+                break;
+            }
+        }
+    });
+}
+
+void CacheManager::StopRecoverRetryLoop() {
+    recover_retry_stop_.store(true);
+    if (recover_retry_thread_.joinable()) {
+        recover_retry_thread_.join();
+    }
+}
 ErrorCode CacheManager::DoCleanup() {
+    StopRecoverRetryLoop();
     // aborting write session need meta indexer
-    write_location_manager_->DoCleanup();
-    meta_searcher_manager_->DoCleanup();
-    meta_indexer_manager_->DoCleanup();
-    metrics_recorder_->DoCleanup();
-    data_storage_selector_->DoCleanup();
+    if (write_location_manager_) {
+        write_location_manager_->DoCleanup();
+    }
+    if (meta_searcher_manager_) {
+        meta_searcher_manager_->DoCleanup();
+    }
+    if (meta_indexer_manager_) {
+        meta_indexer_manager_->DoCleanup();
+    }
+    if (metrics_recorder_) {
+        metrics_recorder_->DoCleanup();
+    }
+    if (data_storage_selector_) {
+        data_storage_selector_->DoCleanup();
+    }
 
     return EC_OK;
 }

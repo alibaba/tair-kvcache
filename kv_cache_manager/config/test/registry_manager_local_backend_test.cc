@@ -500,4 +500,191 @@ TEST_F(RegistryManagerLocalBackendTest, TestDoCleanupCompleteness) {
     ASSERT_TRUE(storage_configs_after.empty()) << "data_storage_manager_ should have no storages after cleanup";
 }
 
+TEST_F(RegistryManagerLocalBackendTest, TestDoRecoverOnceIdempotent) {
+    std::string local_path = GetPrivateTestRuntimeDataPath() + "_registry_local_backend_recover_idempotent_test";
+    std::string uri = "local://" + local_path + "?cluster_name=test";
+
+    // Setup initial data
+    {
+        ASSERT_TRUE(InitRegistryManager(uri));
+        AddNfsStorage("storage1", 1);
+        AddNfsStorage("storage2", 2);
+        ASSERT_EQ(EC_OK, registry_manager_->DisableStorage(request_context_.get(), "storage2"));
+        CreateInstanceGroup("group1");
+        RegisterInstance("group1", "instance1");
+        ASSERT_EQ(EC_OK,
+                  registry_manager_->AddAccount(request_context_.get(), "user1", "pwd1", AccountRole::ROLE_USER));
+    }
+
+    // Re-init and call DoRecoverOnce multiple times - should be idempotent
+    {
+        ASSERT_TRUE(InitRegistryManager(uri));
+        ASSERT_EQ(EC_OK, registry_manager_->DoRecoverOnce());
+
+        // Second call should also succeed (skip already-recovered items)
+        ASSERT_EQ(EC_OK, registry_manager_->DoRecoverOnce());
+
+        // Third call
+        ASSERT_EQ(EC_OK, registry_manager_->DoRecoverOnce());
+
+        // Verify data is correct (not duplicated)
+        auto storage1 = registry_manager_->data_storage_manager()->GetDataStorageBackend("storage1");
+        ASSERT_TRUE(storage1);
+        ASSERT_TRUE(storage1->Available());
+
+        auto storage2 = registry_manager_->data_storage_manager()->GetDataStorageBackend("storage2");
+        ASSERT_TRUE(storage2);
+        ASSERT_FALSE(storage2->Available());
+
+        auto [ec_groups, groups] = registry_manager_->ListInstanceGroup(request_context_.get());
+        ASSERT_EQ(EC_OK, ec_groups);
+        ASSERT_EQ(1, groups.size());
+
+        auto instance_info = registry_manager_->GetInstanceInfo(request_context_.get(), "instance1");
+        ASSERT_TRUE(instance_info);
+        ASSERT_EQ("instance1", instance_info->instance_id());
+
+        auto [ec_accounts, accounts] = registry_manager_->ListAccount(request_context_.get());
+        ASSERT_EQ(EC_OK, ec_accounts);
+        ASSERT_EQ(1, accounts.size());
+    }
+}
+
+TEST_F(RegistryManagerLocalBackendTest, TestDoRecoverOncePartialFailure) {
+    std::string local_path = GetPrivateTestRuntimeDataPath() + "_recover_partial_fail_test";
+    std::string uri = "local://" + local_path + "?cluster_name=test";
+
+    // Setup valid data first
+    ASSERT_TRUE(InitRegistryManager(uri));
+    AddNfsStorage("storage1", 1);
+    CreateInstanceGroup("group1");
+    RegisterInstance("group1", "instance1");
+    ASSERT_EQ(EC_OK, registry_manager_->AddAccount(request_context_.get(), "user1", "pwd1", AccountRole::ROLE_USER));
+
+    // Inject invalid entries directly via storage_ backend
+    std::map<std::string, std::string> storage_map;
+    registry_manager_->storage_->Load("storage", storage_map);
+    storage_map["bad_storage"] = "this_is_not_valid_json";
+    registry_manager_->storage_->Save("storage", storage_map);
+
+    std::map<std::string, std::string> account_map;
+    registry_manager_->storage_->Load("account", account_map);
+    account_map["bad_account"] = "invalid_json";
+    registry_manager_->storage_->Save("account", account_map);
+
+    // Re-init from persistent storage containing both valid and invalid entries
+    ASSERT_TRUE(InitRegistryManager(uri));
+    auto ec = registry_manager_->DoRecoverOnce();
+    ASSERT_EQ(EC_ERROR, ec) << "Should report error due to invalid entries";
+
+    // Valid data should still be recovered
+    auto storage1 = registry_manager_->data_storage_manager()->GetDataStorageBackend("storage1");
+    ASSERT_TRUE(storage1) << "Valid storage1 should be recovered";
+    ASSERT_TRUE(storage1->Available());
+
+    auto bad_storage = registry_manager_->data_storage_manager()->GetDataStorageBackend("bad_storage");
+    ASSERT_FALSE(bad_storage) << "Invalid bad_storage should not be recovered";
+
+    auto [ec_groups, groups] = registry_manager_->ListInstanceGroup(request_context_.get());
+    ASSERT_EQ(EC_OK, ec_groups);
+    ASSERT_EQ(1, groups.size());
+
+    auto instance_info = registry_manager_->GetInstanceInfo(request_context_.get(), "instance1");
+    ASSERT_TRUE(instance_info);
+
+    auto [ec_accounts, accounts] = registry_manager_->ListAccount(request_context_.get());
+    ASSERT_EQ(EC_OK, ec_accounts);
+    ASSERT_EQ(1, accounts.size()) << "Valid user1 recovered, bad_account skipped";
+
+    // Call again - idempotent (valid items skipped, bad items still fail)
+    ec = registry_manager_->DoRecoverOnce();
+    ASSERT_EQ(EC_ERROR, ec);
+    storage1 = registry_manager_->data_storage_manager()->GetDataStorageBackend("storage1");
+    ASSERT_TRUE(storage1);
+}
+
+TEST_F(RegistryManagerLocalBackendTest, TestDoRecoverFixedAfterRetry) {
+    std::string local_path = GetPrivateTestRuntimeDataPath() + "_recover_fix_after_retry_test";
+    std::string uri = "local://" + local_path + "?cluster_name=test";
+
+    // Setup valid data
+    ASSERT_TRUE(InitRegistryManager(uri));
+    AddNfsStorage("storage1", 1);
+
+    // Inject invalid entry
+    std::map<std::string, std::string> storage_map;
+    registry_manager_->storage_->Load("storage", storage_map);
+    storage_map["bad_storage"] = "invalid";
+    registry_manager_->storage_->Save("storage", storage_map);
+
+    // Cleanup and recover - partial failure
+    ASSERT_EQ(EC_OK, registry_manager_->DoCleanup());
+    auto ec = registry_manager_->DoRecoverOnce();
+    ASSERT_EQ(EC_ERROR, ec);
+
+    // Fix the bad entry by removing it from backend
+    registry_manager_->storage_->Load("storage", storage_map);
+    storage_map.erase("bad_storage");
+    registry_manager_->storage_->Save("storage", storage_map);
+
+    // Retry should now succeed
+    ec = registry_manager_->DoRecoverOnce();
+    ASSERT_EQ(EC_OK, ec);
+}
+
+TEST_F(RegistryManagerLocalBackendTest, TestDoRecoverStartsRetryOnFailure) {
+    std::string local_path = GetPrivateTestRuntimeDataPath() + "_recover_starts_retry_test";
+    std::string uri = "local://" + local_path + "?cluster_name=test";
+
+    // Setup valid data + inject bad entry
+    ASSERT_TRUE(InitRegistryManager(uri));
+    AddNfsStorage("storage1", 1);
+
+    std::map<std::string, std::string> storage_map;
+    registry_manager_->storage_->Load("storage", storage_map);
+    storage_map["bad_storage"] = "invalid";
+    registry_manager_->storage_->Save("storage", storage_map);
+
+    // Cleanup memory, then DoRecover - should return EC_OK but start retry loop
+    ASSERT_EQ(EC_OK, registry_manager_->DoCleanup());
+    auto ec = registry_manager_->DoRecover();
+    ASSERT_EQ(EC_OK, ec) << "DoRecover tolerates errors and returns OK";
+
+    // Valid storage should still be recovered
+    auto storage1 = registry_manager_->data_storage_manager()->GetDataStorageBackend("storage1");
+    ASSERT_TRUE(storage1);
+
+    // Stop the retry thread
+    registry_manager_->StopRecoverRetryLoop();
+}
+
+TEST_F(RegistryManagerLocalBackendTest, TestRecoverRetryLoopLifecycle) {
+    std::string local_path = GetPrivateTestRuntimeDataPath() + "_recover_retry_lifecycle_test";
+    std::string uri = "local://" + local_path + "?cluster_name=test";
+
+    // StopRecoverRetryLoop should be safe to call even without active thread
+    {
+        ASSERT_TRUE(InitRegistryManager(uri));
+        registry_manager_->StopRecoverRetryLoop();
+        registry_manager_->StopRecoverRetryLoop(); // double-stop should not crash
+    }
+
+    // StartRecoverRetryLoop + StopRecoverRetryLoop lifecycle
+    {
+        ASSERT_TRUE(InitRegistryManager(uri));
+        registry_manager_->StartRecoverRetryLoop();
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        registry_manager_->StopRecoverRetryLoop(); // should join within ~100ms
+    }
+
+    // Destructor should properly stop retry thread via DoCleanup
+    {
+        auto rm = std::make_shared<RegistryManager>(uri, std::make_shared<MetricsRegistry>());
+        ASSERT_TRUE(rm->Init());
+        rm->StartRecoverRetryLoop();
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        rm.reset(); // destructor -> DoCleanup -> StopRecoverRetryLoop
+    }
+}
+
 } // namespace kv_cache_manager

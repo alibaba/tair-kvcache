@@ -73,7 +73,6 @@ void Server::OnBecomeLeader() {
     KVCM_LOG_INFO("Server promoted to leader, starting recover...");
     ErrorCode ec = registry_manager_->DoRecover();
     if (ec != EC_OK) {
-        // TODO: 添加异常情况下回滚和重试
         KVCM_LOG_ERROR("registry_manager recover failed");
         return;
     }
@@ -89,7 +88,6 @@ void Server::OnBecomeLeader() {
 
     ec = cache_manager_->DoRecover();
     if (ec != EC_OK) {
-        // TODO: 添加异常情况下回滚和重试
         KVCM_LOG_ERROR("cache_manager recover failed");
         return;
     }

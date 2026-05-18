@@ -125,6 +125,8 @@ RegistryManager::RegistryManager(const std::string &registry_storage_uri,
                                  std::shared_ptr<MetricsRegistry> metrics_registry)
     : registry_storage_uri_(registry_storage_uri), metrics_registry_(std::move(metrics_registry)) {}
 
+RegistryManager::~RegistryManager() { DoCleanup(); }
+
 bool RegistryManager::Init() {
     data_storage_manager_.reset(new DataStorageManager(metrics_registry_));
     storage_ = RegistryStorageBackendFactory::CreateAndInitStorageBackend(registry_storage_uri_);
@@ -203,8 +205,7 @@ ErrorCode RegistryManager::CreateInstanceGroup(RequestContext *request_context, 
     const auto &instance_group_name = instance_group.name();
     std::unique_lock<std::shared_mutex> lock(mutex_);
     if (instance_group_configs_.find(instance_group_name) != instance_group_configs_.end()) {
-        RETURN_IF_EC_NOT_OK_WITH_LOG_G(
-            WARN, EC_EXIST, "create instance group failed: instance group already existed");
+        RETURN_IF_EC_NOT_OK_WITH_LOG_G(WARN, EC_EXIST, "create instance group failed: instance group already existed");
     }
     // save to storage backend
     auto ec = LoadAndSave(kRegistryGroupKey, instance_group_name, &instance_group);
@@ -287,7 +288,8 @@ ErrorCode RegistryManager::RegisterInstance(RequestContext *request_context,
     auto it = instance_infos_.find(instance_id);
     if (it != instance_infos_.end()) {
         const auto &existing = it->second;
-        auto mismatched = existing->MismatchFields(block_size, location_spec_infos, model_deployment, location_spec_groups);
+        auto mismatched =
+            existing->MismatchFields(block_size, location_spec_infos, model_deployment, location_spec_groups);
         if (!mismatched.empty()) {
             auto mismatched_str = StringUtil::Join(mismatched, ", ");
             request_context->error_tracer()->AddErrorMsg(
@@ -495,115 +497,202 @@ ErrorCode RegistryManager::UpdateStorageAvailableStatus(const std::string &globa
     return LoadAndSave(kRegistryStorageKey, global_unique_name, &storage_config);
 }
 
-ErrorCode RegistryManager::DoRecover() {
-    std::unique_lock<std::shared_mutex> lock(mutex_);
-
-    size_t storage_num = 0;
-    size_t not_available_storage_num = 0;
+size_t RegistryManager::RecoverStorageUnsafe() {
+    size_t error_count = 0;
     auto request_context = std::make_shared<RequestContext>("registry_manager_recover_trace");
-    // recover storage
     std::map<std::string, std::string> value_map;
     auto ec = storage_->Load(kRegistryStorageKey, value_map);
     if (ec != EC_OK && ec != EC_NOENT) {
-        KVCM_LOG_ERROR("load registry storage backend failed");
-        return ec;
+        KVCM_LOG_WARN("load registry storage backend failed, will retry later");
+        return 1;
     }
     for (const auto &[id, val] : value_map) {
         StorageConfig storage_config;
         if (!storage_config.FromJsonString(val)) {
-            KVCM_LOG_ERROR("storage config from json string failed, json string[%s]", val.c_str());
-            return EC_CONFIG_ERROR;
+            KVCM_LOG_WARN("storage config from json string failed, skip. json string[%s]", val.c_str());
+            ++error_count;
+            continue;
         }
         auto name = storage_config.global_unique_name();
+        auto existing_backend = data_storage_manager_->GetDataStorageBackend(name);
+        if (existing_backend != nullptr) {
+            if (!storage_config.is_available() && existing_backend->Available()) {
+                ec = data_storage_manager_->DisableStorage(name);
+                if (ec != EC_OK) {
+                    KVCM_LOG_WARN("disable existing storage failed when recover, skip. name[%s]", name.c_str());
+                    ++error_count;
+                }
+            }
+            continue;
+        }
         ec = data_storage_manager_->RegisterStorage(request_context.get(), name, storage_config);
         if (ec != EC_OK) {
-            KVCM_LOG_ERROR(
-                "register storage failed when recover, name[%s], json string[%s]", name.c_str(), val.c_str());
-            return ec;
+            KVCM_LOG_WARN(
+                "register storage failed when recover, skip. name[%s], json string[%s]", name.c_str(), val.c_str());
+            ++error_count;
+            continue;
         }
         if (!storage_config.is_available()) {
             ec = data_storage_manager_->DisableStorage(name);
             if (ec != EC_OK) {
-                KVCM_LOG_ERROR(
-                    "disable storage failed when recover, name[%s], json string[%s]", name.c_str(), val.c_str());
-                return ec;
+                KVCM_LOG_WARN(
+                    "disable storage failed when recover, skip. name[%s], json string[%s]", name.c_str(), val.c_str());
+                ++error_count;
+                continue;
             }
-            ++not_available_storage_num;
         }
-        ++storage_num;
     }
+    return error_count;
+}
 
-    // recover account
-    value_map.clear();
-    ec = storage_->Load(kRegistryAccountKey, value_map);
+size_t RegistryManager::RecoverAccountUnsafe() {
+    size_t error_count = 0;
+    std::map<std::string, std::string> value_map;
+    auto ec = storage_->Load(kRegistryAccountKey, value_map);
     if (ec != EC_OK && ec != EC_NOENT) {
-        KVCM_LOG_ERROR("load registry account failed");
-        return ec;
+        KVCM_LOG_WARN("load registry account failed, will retry later");
+        return 1;
     }
     for (const auto &[id, val] : value_map) {
         auto account = std::make_shared<Account>();
         if (!account->FromJsonString(val)) {
-            KVCM_LOG_ERROR("account from json string failed, json string[%s]", val.c_str());
-            return EC_CONFIG_ERROR;
+            KVCM_LOG_WARN("account from json string failed, skip. json string[%s]", val.c_str());
+            ++error_count;
+            continue;
+        }
+        if (accounts_.find(account->user_name()) != accounts_.end()) {
+            continue;
         }
         accounts_[account->user_name()] = account;
     }
-    // recover instance group
-    value_map.clear();
-    ec = storage_->Load(kRegistryGroupKey, value_map);
+    return error_count;
+}
+
+size_t RegistryManager::RecoverInstanceGroupUnsafe() {
+    size_t error_count = 0;
+    std::map<std::string, std::string> value_map;
+    auto ec = storage_->Load(kRegistryGroupKey, value_map);
     if (ec != EC_OK && ec != EC_NOENT) {
-        KVCM_LOG_ERROR("load registry instance group failed");
-        return ec;
+        KVCM_LOG_WARN("load registry instance group failed, will retry later");
+        return 1;
     }
     for (const auto &[id, val] : value_map) {
         auto instance_group = std::make_shared<InstanceGroup>();
         if (!instance_group->FromJsonString(val)) {
-            KVCM_LOG_ERROR("instance group from json string failed, json string[%s]", val.c_str());
-            return EC_CONFIG_ERROR;
+            KVCM_LOG_WARN("instance group from json string failed, skip. json string[%s]", val.c_str());
+            ++error_count;
+            continue;
+        }
+        if (instance_group_configs_.find(instance_group->name()) != instance_group_configs_.end()) {
+            continue;
         }
         instance_group_configs_[instance_group->name()] = instance_group;
     }
+    return error_count;
+}
 
-    // recover instance info
-    value_map.clear();
-    ec = storage_->Load(kRegistryInstanceKey, value_map);
+size_t RegistryManager::RecoverInstanceInfoUnsafe() {
+    size_t error_count = 0;
+    std::map<std::string, std::string> value_map;
+    auto ec = storage_->Load(kRegistryInstanceKey, value_map);
     if (ec != EC_OK && ec != EC_NOENT) {
-        KVCM_LOG_ERROR("load registry instance group failed");
-        return ec;
+        KVCM_LOG_WARN("load registry instance info failed, will retry later");
+        return 1;
     }
-    std::vector<std::string> instance_ids;
     for (const auto &[id, val] : value_map) {
+        if (instance_infos_.find(id) != instance_infos_.end()) {
+            continue;
+        }
         std::map<std::string, std::string> instance_map;
         ec = storage_->Load(id, instance_map);
         if (ec != EC_OK) {
-            KVCM_LOG_ERROR("load registry instance info failed, instance id[%s]", id.c_str());
-            return ec;
+            KVCM_LOG_WARN("load registry instance info failed, skip. instance id[%s]", id.c_str());
+            ++error_count;
+            continue;
         }
         auto instance_info = std::make_shared<InstanceInfo>();
         if (!instance_info->FromJsonString(instance_map[id])) {
-            KVCM_LOG_ERROR("instance info from json string failed, json string[%s]", instance_map[id].c_str());
-            return EC_CONFIG_ERROR;
+            KVCM_LOG_WARN("instance info from json string failed, skip. json string[%s]", instance_map[id].c_str());
+            ++error_count;
+            continue;
         }
         instance_infos_[id] = instance_info;
     }
-    KVCM_LOG_INFO(
-        "registry manager do recover success, recover storage num[%lu], available storage num[%lu], account num[%lu], "
-        "instance group num[%lu], instance info num[%lu]",
-        storage_num,
-        storage_num - not_available_storage_num,
-        accounts_.size(),
-        instance_group_configs_.size(),
-        instance_infos_.size());
-    return EC_OK;
+    return error_count;
 }
-ErrorCode RegistryManager::DoCleanup() {
+
+ErrorCode RegistryManager::DoRecoverOnce() {
     std::unique_lock<std::shared_mutex> lock(mutex_);
 
+    size_t error_count = 0;
+    error_count += RecoverStorageUnsafe();
+    error_count += RecoverAccountUnsafe();
+    error_count += RecoverInstanceGroupUnsafe();
+    error_count += RecoverInstanceInfoUnsafe();
+
+    KVCM_LOG_INFO("registry manager do recover once done, error_count[%lu], account num[%lu], "
+                  "instance group num[%lu], instance info num[%lu]",
+                  error_count,
+                  accounts_.size(),
+                  instance_group_configs_.size(),
+                  instance_infos_.size());
+    if (error_count == 0) {
+        recover_complete_.store(true);
+    }
+    return error_count > 0 ? EC_ERROR : EC_OK;
+}
+
+bool RegistryManager::IsRecoverComplete() const { return recover_complete_.load(); }
+
+ErrorCode RegistryManager::DoRecover() {
+    auto ec = DoRecoverOnce();
+    if (ec == EC_OK) {
+        return EC_OK;
+    }
+    KVCM_LOG_WARN("registry manager DoRecover partially failed, starting retry loop in background");
+    StartRecoverRetryLoop();
+    return EC_OK;
+}
+
+void RegistryManager::StartRecoverRetryLoop() {
+    StopRecoverRetryLoop();
+    recover_retry_stop_.store(false);
+    recover_retry_thread_ = std::thread([this]() {
+        while (!recover_retry_stop_.load()) {
+            for (int i = 0; i < 100 && !recover_retry_stop_.load(); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            if (recover_retry_stop_.load()) {
+                break;
+            }
+            KVCM_LOG_INFO("registry manager recover retry loop executing...");
+            auto ec = DoRecoverOnce();
+            if (ec == EC_OK) {
+                KVCM_LOG_INFO("registry manager recover retry loop completed successfully, stopping retry");
+                break;
+            }
+        }
+    });
+}
+
+void RegistryManager::StopRecoverRetryLoop() {
+    recover_retry_stop_.store(true);
+    if (recover_retry_thread_.joinable()) {
+        recover_retry_thread_.join();
+    }
+}
+ErrorCode RegistryManager::DoCleanup() {
     KVCM_LOG_INFO("registry manager start cleanup");
 
-    auto ec = data_storage_manager_->DoCleanup();
-    if (ec != EC_OK) {
-        KVCM_LOG_WARN("failed during cleanup data_storage_manager, ec[%d]", ec);
+    StopRecoverRetryLoop(); // need to be outside of lock
+    recover_complete_.store(false);
+
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    if (data_storage_manager_) {
+        auto ec = data_storage_manager_->DoCleanup();
+        if (ec != EC_OK) {
+            KVCM_LOG_WARN("failed during cleanup data_storage_manager, ec[%d]", ec);
+        }
     }
     // clear config and infos
     instance_group_configs_.clear();
