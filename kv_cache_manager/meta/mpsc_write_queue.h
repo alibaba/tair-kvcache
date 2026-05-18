@@ -14,10 +14,9 @@ namespace kv_cache_manager {
 
 enum class WriteOpType {
     kPut,
-    kUpdateFields,
     kUpsert,
     kDelete,
-    kDeleteFields,
+    kDeleteLocations,
 };
 
 struct WriteOp {

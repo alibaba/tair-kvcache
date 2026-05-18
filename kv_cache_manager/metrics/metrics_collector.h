@@ -302,7 +302,6 @@ class ServiceMetricsCollector final : public MetricsCollector {
     KVCM_GAUGE_METRICS(meta_indexer, search_cache_hit_ratio)
     KVCM_GAUGE_METRICS(meta_indexer, io_data_size)
     KVCM_GAUGE_METRICS(meta_indexer, put_io_time_us)
-    KVCM_GAUGE_METRICS(meta_indexer, update_io_time_us)
     KVCM_GAUGE_METRICS(meta_indexer, upsert_io_time_us)
     KVCM_GAUGE_METRICS(meta_indexer, lock_wait_time_us)
     KVCM_GAUGE_METRICS(meta_indexer, delete_io_time_us)

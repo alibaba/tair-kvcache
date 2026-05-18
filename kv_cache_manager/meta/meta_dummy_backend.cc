@@ -210,30 +210,6 @@ std::vector<ErrorCode> MetaDummyBackend::Upsert(RequestContext * /*request_conte
     return results;
 }
 
-std::vector<ErrorCode> MetaDummyBackend::Update(RequestContext * /*request_context*/,
-                                                const KeyTypeVec &keys,
-                                                const CacheLocationMapVector &locations,
-                                                const PropertyMapVector &properties) noexcept {
-    std::vector<ErrorCode> results(keys.size(), EC_OK);
-    std::lock_guard<std::mutex> guard(mutex_);
-    for (size_t i = 0; i < keys.size(); ++i) {
-        const bool found = table_.FindAndModify(keys[i], [&](DummyItem &existing) {
-            for (const auto &[loc_id, loc] : locations[i]) {
-                existing.locations[loc_id] = loc;
-            }
-            for (const auto &[prop_name, prop_value] : properties[i]) {
-                existing.properties[prop_name] = prop_value;
-            }
-            existing.properties[PROPERTY_LRU_TIME] = std::to_string(TimestampUtil::GetCurrentTimeUs());
-        });
-        if (!found) {
-            results[i] = EC_NOENT;
-        }
-    }
-    PersistToPath();
-    return results;
-}
-
 std::vector<ErrorCode> MetaDummyBackend::Delete(RequestContext * /*request_context*/, const KeyTypeVec &keys) noexcept {
     std::vector<ErrorCode> results(keys.size(), EC_OK);
     std::lock_guard<std::mutex> guard(mutex_);

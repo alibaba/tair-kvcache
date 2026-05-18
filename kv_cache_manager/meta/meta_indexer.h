@@ -61,10 +61,6 @@ public:
                const KeyVector &keys,
                CacheLocationMapVector &location_maps,
                PropertyMapVector &properties) noexcept;
-    Result Update(RequestContext *request_context,
-                  const KeyVector &keys,
-                  CacheLocationMapVector &location_maps,
-                  PropertyMapVector &properties) noexcept;
     Result Delete(RequestContext *request_context, const KeyVector &keys) noexcept;
     // Block-level RMW: modifier sees only existing location id list per key.
     Result ReadModifyWriteBlock(RequestContext *request_context,
