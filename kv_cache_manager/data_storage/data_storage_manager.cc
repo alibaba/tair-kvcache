@@ -177,11 +177,10 @@ std::shared_ptr<DataStorageBackend> DataStorageManager::CreateStorageBackend(con
     }
 }
 
-std::vector<std::pair<ErrorCode, DataStorageUri>> DataStorageManager::Create(RequestContext *request_context,
-                                                                             const std::string &unique_name,
-                                                                             const std::vector<std::string> &keys,
-                                                                             size_t size_per_key,
-                                                                             std::function<void()> cb) {
+std::vector<SpecCreateResult> DataStorageManager::Create(RequestContext *request_context,
+                                              const std::string &unique_name,
+                                              const CreateBlocksRequest &request,
+                                              std::function<void()> cb) {
     SPAN_TRACER(request_context);
     std::shared_lock<std::shared_mutex> lock(rw_lock_);
     const std::string &trace_id = request_context->trace_id();
@@ -193,18 +192,24 @@ std::vector<std::pair<ErrorCode, DataStorageUri>> DataStorageManager::Create(Req
     auto storage_backend = iter->second;
     const auto dsmc = storage_backend->GetMetricsCollector();
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(dsmc, DataStorageCreate);
-    std::vector<std::pair<ErrorCode, DataStorageUri>> create_result =
-        storage_backend->Create(keys, size_per_key, trace_id, cb);
+    auto create_result = storage_backend->Create(request, trace_id, cb);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(dsmc, DataStorageCreate);
-    KVCM_METRICS_COLLECTOR_SET_METRICS(dsmc, data_storage, create_keys_qps, keys.size());
+    // Count total keys from all specs for metrics
+    size_t total_keys = 0;
+    for (const auto &spec_block : request.spec_block_keys) {
+        total_keys += spec_block.block_keys.size();
+    }
+    KVCM_METRICS_COLLECTOR_SET_METRICS(dsmc, data_storage, create_keys_qps, total_keys);
     if (request_context) {
         request_context->GetMetricsCollectorsVehicle().AddMetricsCollector(dsmc);
     }
-    std::for_each(create_result.begin(), create_result.end(), [&unique_name](auto &pair) {
-        if (pair.first == EC_OK) {
-            pair.second.SetHostName(unique_name);
+    for (auto &spec_result : create_result) {
+        for (auto &[ec, uri] : spec_result) {
+            if (ec == EC_OK) {
+                uri.SetHostName(unique_name);
+            }
         }
-    });
+    }
     return create_result;
 }
 

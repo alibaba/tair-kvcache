@@ -36,11 +36,10 @@ public:
     ErrorCode UnRegisterStorage(const std::string &name);
     ErrorCode DoCleanup();
 
-    std::vector<std::pair<ErrorCode, DataStorageUri>> Create(RequestContext *request_context,
-                                                             const std::string &unique_name,
-                                                             const std::vector<std::string> &keys,
-                                                             size_t size_per_key,
-                                                             std::function<void()> cb);
+    std::vector<SpecCreateResult> Create(RequestContext *request_context,
+                                        const std::string &unique_name,
+                                        const CreateBlocksRequest &request,
+                                        std::function<void()> cb);
 
     std::vector<ErrorCode> Delete(RequestContext *request_context,
                                   const std::string &unique_name,
