@@ -32,65 +32,68 @@ void LogErrorCodes(const std::string &operation_name,
     }
 }
 
-CacheLocation SelectAndMergeForMatch(SelectLocationPolicy *policy,
-                                     CacheLocationMap &location_map,
-                                     CheckLocDataExistFunc check_loc_data_exist,
-                                     std::vector<std::string> &out_prune_loc_ids) {
+CacheLocationConstPtr SelectAndMergeForMatch(SelectLocationPolicy *policy,
+                                             CacheLocationMap &location_map,
+                                             CheckLocDataExistFunc check_loc_data_exist,
+                                             std::vector<std::string> &out_prune_loc_ids) {
     // Filter valid locations into a shared map.
     CacheLocationMap valid_map;
-    for (auto &[id, loc] : location_map) {
-        if (loc.status() != CacheLocationStatus::CLS_SERVING) {
+    for (auto &[id, loc_ptr] : location_map) {
+        if (!loc_ptr) {
             continue;
         }
-        if (check_loc_data_exist && !check_loc_data_exist(loc)) {
+        if (loc_ptr->status() != CacheLocationStatus::CLS_SERVING) {
+            continue;
+        }
+        if (check_loc_data_exist && !check_loc_data_exist(*loc_ptr)) {
             out_prune_loc_ids.push_back(id);
             continue;
         }
-        valid_map.try_emplace(id, loc);
+        valid_map.try_emplace(id, loc_ptr);
     }
     if (valid_map.empty()) {
-        return {};
+        return std::make_shared<CacheLocation>();
     }
 
     // Use the policy to select one winning location, which determines the
     // target storage backend instance.
     std::vector<std::string> unused_prune_ids;
-    CacheLocation *winner = policy->SelectForMatch(valid_map, nullptr, unused_prune_ids);
+    CacheLocationConstPtr winner = policy->SelectForMatch(valid_map, nullptr, unused_prune_ids);
     if (!winner || winner->location_specs().empty()) {
-        return {};
+        return std::make_shared<CacheLocation>();
     }
 
     // Collect all specs from every valid location that belongs to the same
     // storage backend as the winner, dedup by spec name.
     std::map<std::string, LocationSpec> merged_specs;
-    for (auto &[id, loc] : valid_map) {
-        if (!policy->IsSameDataStorage(loc, *winner)) {
+    for (const auto &[id, loc_ptr] : valid_map) {
+        if (!loc_ptr || !policy->IsSameDataStorage(*loc_ptr, *winner)) {
             continue;
         }
-        for (const auto &spec : loc.location_specs()) {
+        for (const auto &spec : loc_ptr->location_specs()) {
             merged_specs.try_emplace(spec.name(), spec);
         }
     }
 
     if (merged_specs.empty()) {
-        return {};
+        return std::make_shared<CacheLocation>();
     }
 
     // NOTE: this is an aggregated view merging
     // specs from multiple locations, not a real stored entity. Downstream
     // CacheLocationView / proto serialization never accesses id either.
     std::string representative_id = winner->id() + "merged";
-    CacheLocation result;
-    result.set_id(std::move(representative_id));
-    result.set_status(CacheLocationStatus::CLS_SERVING);
-    result.set_type(winner->type());
+    auto result = std::make_shared<CacheLocation>();
+    result->set_id(std::move(representative_id));
+    result->set_status(CacheLocationStatus::CLS_SERVING);
+    result->set_type(winner->type());
     std::vector<LocationSpec> specs;
     specs.reserve(merged_specs.size());
     for (auto &[name, spec] : merged_specs) {
         specs.push_back(std::move(spec));
     }
-    result.set_spec_size(specs.size());
-    result.set_location_specs(std::move(specs));
+    result->set_spec_size(specs.size());
+    result->set_location_specs(std::move(specs));
     return result;
 }
 
@@ -156,12 +159,13 @@ ErrorCode MetaSearcher::PrefixMatchBestLocationImpl(RequestContext *request_cont
             break;
         }
         std::vector<std::string> prune_loc_ids;
-        CacheLocation merged = SelectAndMergeForMatch(policy, location_map, check_loc_data_exist_func_, prune_loc_ids);
+        CacheLocationConstPtr merged =
+            SelectAndMergeForMatch(policy, location_map, check_loc_data_exist_func_, prune_loc_ids);
         if (!prune_loc_ids.empty()) {
             prune_keys.emplace_back(keys[i]);
             prune_loc_ids_vec.emplace_back(prune_loc_ids);
         }
-        if (merged.location_specs().empty()) {
+        if (merged->location_specs().empty()) {
             KVCM_LOG_DEBUG("prefix match end because keys[%lu] no serving location", i);
             break;
         }
@@ -237,7 +241,7 @@ ErrorCode MetaSearcher::BatchGetBestLocation(RequestContext *request_context,
     std::vector<std::vector<std::string>> prune_loc_ids_vec;
     for (size_t i = 0; i < keys.size(); ++i) {
         if (result.error_codes[i] == ErrorCode::EC_NOENT) {
-            out_locations.push_back({});
+            out_locations.push_back(std::make_shared<CacheLocation>());
             continue;
         }
         if (result.error_codes[i] != ErrorCode::EC_OK) {
@@ -247,17 +251,18 @@ ErrorCode MetaSearcher::BatchGetBestLocation(RequestContext *request_context,
 
         auto &location_map = location_maps[i];
         if (location_map.empty()) {
-            out_locations.push_back({});
+            out_locations.push_back(std::make_shared<CacheLocation>());
             continue;
         }
         std::vector<std::string> prune_loc_ids;
-        CacheLocation merged = SelectAndMergeForMatch(policy, location_map, check_loc_data_exist_func_, prune_loc_ids);
+        CacheLocationConstPtr merged =
+            SelectAndMergeForMatch(policy, location_map, check_loc_data_exist_func_, prune_loc_ids);
         if (!prune_loc_ids.empty()) {
             prune_keys.emplace_back(keys[i]);
             prune_loc_ids_vec.emplace_back(prune_loc_ids);
         }
-        if (merged.location_specs().empty()) {
-            out_locations.push_back({});
+        if (merged->location_specs().empty()) {
+            out_locations.push_back(std::make_shared<CacheLocation>());
             continue;
         }
         out_locations.push_back(std::move(merged));
@@ -281,14 +286,18 @@ ErrorCode MetaSearcher::ReverseRollSlideWindowMatch(RequestContext *request_cont
     assert(sw_size > 0);
     // TODO: error handle
     out_locations.clear();
-    out_locations.assign(keys.size(), {});
+    out_locations.clear();
+    out_locations.reserve(keys.size());
+    for (size_t idx = 0; idx < keys.size(); ++idx) {
+        out_locations.push_back(std::make_shared<CacheLocation>());
+    }
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerGet);
     CacheLocationMapVector location_maps;
     auto result = meta_indexer_->GetLocations(request_context, keys, location_maps);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerGet);
     bool is_match = false;
-    std::vector<CacheLocation> temp_sw_locations;
+    CacheLocationVector temp_sw_locations;
     temp_sw_locations.reserve(sw_size);
     KeyVector prune_keys;
     std::vector<std::vector<std::string>> prune_loc_ids_vec;
@@ -313,13 +322,13 @@ ErrorCode MetaSearcher::ReverseRollSlideWindowMatch(RequestContext *request_cont
                 break;
             }
             std::vector<std::string> prune_loc_ids;
-            CacheLocation merged =
+            CacheLocationConstPtr merged =
                 SelectAndMergeForMatch(policy, location_map, check_loc_data_exist_func_, prune_loc_ids);
             if (!prune_loc_ids.empty()) {
                 prune_keys.emplace_back(keys[base + offset]);
                 prune_loc_ids_vec.emplace_back(prune_loc_ids);
             }
-            if (merged.location_specs().empty()) {
+            if (!merged || merged->location_specs().empty()) {
                 temp_sw_locations.clear();
                 base -= sw_size - offset;
                 is_match = false;
@@ -407,21 +416,21 @@ ErrorCode MetaSearcher::BatchAddLocation(RequestContext *request_context,
         } while (existing_id_set.count(location_id) > 0);
 
         // build the new CacheLocation with status = CLS_WRITING
-        CacheLocation new_loc = locations[index];
-        new_loc.set_id(location_id);
-        new_loc.set_status(CLS_WRITING);
+        auto new_loc = std::make_shared<CacheLocation>(*locations[index]);
+        new_loc->set_id(location_id);
+        new_loc->set_status(CLS_WRITING);
         out_new_locations[location_id] = std::move(new_loc);
 
         // compute storage size for usage tracking
         std::uint64_t sz = 0;
-        for (const auto &loc_spec : locations[index].location_specs()) {
+        for (const auto &loc_spec : locations[index]->location_specs()) {
             if (DataStorageUri ds_uri(loc_spec.uri()); ds_uri.Valid()) {
                 std::uint64_t spec_sz;
                 ds_uri.GetParamAs<std::uint64_t>("size", spec_sz);
                 sz += spec_sz;
             }
         }
-        loc_sz[index] = std::make_pair(locations[index].type(), sz);
+        loc_sz[index] = std::make_pair(locations[index]->type(), sz);
 
         out_location_ids[index] = std::move(location_id);
         return {ModifierAction::MA_OK, ErrorCode::EC_OK};
@@ -478,7 +487,6 @@ ErrorCode MetaSearcher::BatchUpdateLocationStatus(RequestContext *request_contex
         for (size_t loc_index = 0; loc_index < loc_ids.size(); ++loc_index) {
             const ErrorCode ec = get_ecs[loc_index];
             const std::string &loc_id = loc_ids[loc_index];
-            CacheLocation &loc = locs[loc_index];
             if (ec != ErrorCode::EC_OK) {
                 modifier_ecs[loc_index] = ec;
                 if (ec != ErrorCode::EC_NOENT) {
@@ -491,7 +499,10 @@ ErrorCode MetaSearcher::BatchUpdateLocationStatus(RequestContext *request_contex
                 continue;
             }
             updated = true;
-            loc.set_status(batch_tasks[key_index][loc_index].new_status);
+            // COW: copy the location, modify the copy, replace the pointer
+            auto new_loc = std::make_shared<CacheLocation>(*locs[loc_index]);
+            new_loc->set_status(batch_tasks[key_index][loc_index].new_status);
+            locs[loc_index] = std::move(new_loc);
         }
         if (!updated) {
             // do not need to update status, skip and return ok
@@ -545,7 +556,6 @@ ErrorCode MetaSearcher::BatchCASLocationStatus(RequestContext *request_context,
         for (size_t loc_index = 0; loc_index < loc_ids.size(); ++loc_index) {
             const ErrorCode ec = get_ecs[loc_index];
             const std::string &loc_id = loc_ids[loc_index];
-            CacheLocation &loc = locs[loc_index];
             if (ec != ErrorCode::EC_OK) {
                 modifier_ecs[loc_index] = ec;
                 if (ec != ErrorCode::EC_NOENT) {
@@ -558,11 +568,14 @@ ErrorCode MetaSearcher::BatchCASLocationStatus(RequestContext *request_context,
                 continue;
             }
             const auto &task = batch_tasks[key_index][loc_index];
-            if (loc.status() != task.old_status) {
+            if (locs[loc_index]->status() != task.old_status) {
                 modifier_ecs[loc_index] = ErrorCode::EC_MISMATCH;
             } else {
                 updated = true;
-                loc.set_status(task.new_status);
+                // COW: copy the location, modify the copy, replace the pointer
+                auto new_loc = std::make_shared<CacheLocation>(*locs[loc_index]);
+                new_loc->set_status(task.new_status);
+                locs[loc_index] = std::move(new_loc);
             }
         }
         if (!updated) {
@@ -619,7 +632,6 @@ ErrorCode MetaSearcher::BatchCADLocationStatus(RequestContext *request_context,
         for (size_t loc_index = 0; loc_index < loc_ids.size(); ++loc_index) {
             const ErrorCode ec = get_ecs[loc_index];
             const std::string &loc_id = loc_ids[loc_index];
-            CacheLocation &loc = locs[loc_index];
             if (ec != ErrorCode::EC_OK) {
                 modifier_ecs[loc_index] = ec;
                 if (ec != ErrorCode::EC_NOENT) {
@@ -631,21 +643,21 @@ ErrorCode MetaSearcher::BatchCADLocationStatus(RequestContext *request_context,
                 }
                 continue;
             }
-            if (loc.status() != batch_tasks[key_index][loc_index].expect_status) {
+            if (!locs[loc_index] || locs[loc_index]->status() != batch_tasks[key_index][loc_index].expect_status) {
                 modifier_ecs[loc_index] = ErrorCode::EC_MISMATCH;
                 continue;
             }
             updated = true;
             // compute storage size before deletion for usage tracking
             std::uint64_t sz = 0;
-            for (const auto &loc_spec : loc.location_specs()) {
+            for (const auto &loc_spec : locs[loc_index]->location_specs()) {
                 if (DataStorageUri ds_uri(loc_spec.uri()); ds_uri.Valid()) {
                     std::uint64_t spec_sz = 0;
                     ds_uri.GetParamAs<std::uint64_t>("size", spec_sz);
                     sz += spec_sz;
                 }
             }
-            locs_sz[key_index][loc_index] = std::make_pair(loc.type(), sz);
+            locs_sz[key_index][loc_index] = std::make_pair(locs[loc_index]->type(), sz);
         }
         if (!updated) {
             // do not need to update status, skip and return ok
@@ -706,7 +718,6 @@ ErrorCode MetaSearcher::BatchDeleteLocation(RequestContext *request_context,
         for (size_t loc_index = 0; loc_index < loc_ids.size(); ++loc_index) {
             const ErrorCode ec = get_ecs[loc_index];
             const std::string &loc_id = loc_ids[loc_index];
-            CacheLocation &loc = locs[loc_index];
             if (ec != ErrorCode::EC_OK) {
                 modifier_ecs[loc_index] = ec;
                 if (ec != ErrorCode::EC_NOENT) {
@@ -718,16 +729,20 @@ ErrorCode MetaSearcher::BatchDeleteLocation(RequestContext *request_context,
                 }
                 continue;
             }
+            if (!locs[loc_index]) {
+                modifier_ecs[loc_index] = ErrorCode::EC_NOENT;
+                continue;
+            }
             updated = true;
             std::uint64_t sz = 0;
-            for (const auto &loc_spec : loc.location_specs()) {
+            for (const auto &loc_spec : locs[loc_index]->location_specs()) {
                 if (DataStorageUri ds_uri(loc_spec.uri()); ds_uri.Valid()) {
                     std::uint64_t spec_sz = 0;
                     ds_uri.GetParamAs<std::uint64_t>("size", spec_sz);
                     sz += spec_sz;
                 }
             }
-            loc_sz[key_index] = std::make_pair(loc.type(), sz);
+            loc_sz[key_index] = std::make_pair(locs[loc_index]->type(), sz);
         }
         if (!updated) {
             // do not need to update status, skip and return ok

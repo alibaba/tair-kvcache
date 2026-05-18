@@ -383,11 +383,13 @@ TEST_F(MetaRedisBackendTest, TestDeleteFields) {
         std::vector<ReplyUPtr> replies;
         replies.emplace_back(MakeFakeReplyInteger(2));
         replies.emplace_back(MakeFakeReplyInteger(0));
-        EXPECT_CALL(
-            *mock_redis_client,
-            TryExecPipeline(ElementsAre(
-                ElementsAre(StrEq("HDEL"), StrEq("kvcache:instance_instance_0:cache_1"), StrEq("f1"), StrEq("f2")),
-                ElementsAre(StrEq("HDEL"), StrEq("kvcache:instance_instance_0:cache_2"), StrEq("f3")))))
+        EXPECT_CALL(*mock_redis_client,
+                    TryExecPipeline(ElementsAre(
+                        ElementsAre(StrEq("HDEL"),
+                                    StrEq("kvcache:instance_instance_0:cache_1"),
+                                    StrEq("__loc__f1"),
+                                    StrEq("__loc__f2")),
+                        ElementsAre(StrEq("HDEL"), StrEq("kvcache:instance_instance_0:cache_2"), StrEq("__loc__f3")))))
             .WillOnce(Return(ByMove(std::move(replies))));
         return mock_redis_client;
     }));
@@ -555,24 +557,29 @@ TEST_F(MetaRedisBackendTest, TestGet) {
         EXPECT_CALL(*mock_redis_client, IsContextOk()).WillRepeatedly(Return(true));
         EXPECT_CALL(*mock_redis_client, Reconnect()).WillRepeatedly(Return(true));
 
-        // key 1 asks {f1} -> "v1-1"; key 2 asks {f2, f3} -> "v2-2", null (f3 missing).
-        std::vector<ReplyUPtr> replies;
-        replies.emplace_back(MakeFakeReplyArrayString({"v1-1"}));
-        replies.emplace_back(MakeFakeReplyArrayString({"v2-2", std::nullopt}));
-        EXPECT_CALL(
-            *mock_redis_client,
-            TryExecPipeline(ElementsAre(
-                ElementsAre(StrEq("HMGET"), StrEq("kvcache:instance_instance_0:cache_1"), StrEq("f1")),
-                ElementsAre(StrEq("HMGET"), StrEq("kvcache:instance_instance_0:cache_2"), StrEq("f2"), StrEq("f3")))))
-            .WillOnce(Return(ByMove(std::move(replies))));
+        // Each GetProperties call creates a separate pipeline request.
+        // Call 1: key 1 asks {f1} -> "v1-1"
+        std::vector<ReplyUPtr> replies1;
+        replies1.emplace_back(MakeFakeReplyArrayString({"v1-1"}));
+        EXPECT_CALL(*mock_redis_client,
+                    TryExecPipeline(ElementsAre(
+                        ElementsAre(StrEq("HMGET"), StrEq("kvcache:instance_instance_0:cache_1"), StrEq("f1")))))
+            .WillOnce(Return(ByMove(std::move(replies1))));
+
+        // Call 2: key 2 asks {f2, f3} -> "v2-2", null (f3 missing)
+        std::vector<ReplyUPtr> replies2;
+        replies2.emplace_back(MakeFakeReplyArrayString({"v2-2", std::nullopt}));
+        EXPECT_CALL(*mock_redis_client,
+                    TryExecPipeline(ElementsAre(ElementsAre(
+                        StrEq("HMGET"), StrEq("kvcache:instance_instance_0:cache_2"), StrEq("f2"), StrEq("f3")))))
+            .WillOnce(Return(ByMove(std::move(replies2))));
         return mock_redis_client;
     }));
 
     ASSERT_EQ(EC_OK, meta_redis_backend_->Init("instance_0", meta_storage_backend_config_));
     ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
 
-    // Note: the new API uses a uniform field_names for all keys via GetProperties.
-    // Test key 1 with f1, key 2 with f2.
+    // Each GetProperties call sends a separate pipeline to Redis.
     PropertyMapVector props1;
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_redis_backend_->GetProperties(nullptr, {1}, {"f1"}, props1));
     ASSERT_EQ("v1-1", props1[0]["f1"]);

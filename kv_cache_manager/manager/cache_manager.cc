@@ -294,16 +294,15 @@ std::pair<ErrorCode, CacheMetaVecWrapper> CacheManager::GetCacheMeta(RequestCont
     std::map<std::string, std::string> meta;
     for (CacheLocationMap &location_map : location_maps) {
         auto iter = location_map.begin();
-        if (iter != location_map.end()) {
-            auto nh = location_map.extract(iter);
-            cache_locations.push_back(std::move(nh.mapped()));
-            meta["id"] = cache_locations.back().id();
+        if (iter != location_map.end() && iter->second) {
+            cache_locations.push_back(iter->second);
+            meta["id"] = cache_locations.back()->id();
         } else {
-            CacheLocation cache_location;
-            cache_location.set_status(CacheLocationStatus::CLS_NOT_FOUND);
-            cache_locations.push_back(std::move(cache_location));
+            auto not_found_loc = std::make_shared<CacheLocation>();
+            not_found_loc->set_status(CacheLocationStatus::CLS_NOT_FOUND);
+            cache_locations.push_back(std::move(not_found_loc));
         }
-        meta["status"] = CacheLocation::CacheLocationStatusToString(cache_locations.back().status());
+        meta["status"] = CacheLocation::CacheLocationStatusToString(cache_locations.back()->status());
         metas.push_back(Jsonizable::ToJsonString(meta));
     }
 
@@ -418,9 +417,12 @@ std::pair<ErrorCode, int64_t> CacheManager::GetCacheLocationLen(RequestContext *
     switch (query_type) {
     case QueryType::QT_BATCH_GET:
     case QueryType::QT_REVERSE_ROLL_SW_MATCH: {
-        for (const auto &location : cache_locations) {
+        for (const auto &loc_ptr : cache_locations) {
+            if (!loc_ptr) {
+                continue;
+            }
             bool has_valid_uri = false;
-            for (const auto &spec : location.location_specs()) {
+            for (const auto &spec : loc_ptr->location_specs()) {
                 if (!spec.uri().empty()) {
                     has_valid_uri = true;
                     break;
@@ -729,15 +731,21 @@ void CacheManager::FilterLocationSpecByName(CacheLocationVector &locations,
     }
 
     const std::unordered_set<std::string> names_set(location_spec_names.begin(), location_spec_names.end());
-    for (auto &location : locations) {
+    for (auto &loc_ptr : locations) {
+        if (!loc_ptr) {
+            continue;
+        }
         std::vector<LocationSpec> new_specs;
-        for (auto &spec : location.location_specs()) {
+        for (const auto &spec : loc_ptr->location_specs()) {
             if (names_set.count(spec.name()) == 0) {
                 continue;
             }
             new_specs.push_back(spec);
         }
-        location.set_location_specs(std::move(new_specs));
+        // COW: copy, modify, replace
+        auto new_loc = std::make_shared<CacheLocation>(*loc_ptr);
+        new_loc->set_location_specs(std::move(new_specs));
+        loc_ptr = std::move(new_loc);
     }
 }
 
@@ -1088,15 +1096,15 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
     }
 
     for (const auto &uris : key_to_uris) {
-        CacheLocation cache_location;
-        cache_location.set_type(select_result.type);
+        auto cache_location = std::make_shared<CacheLocation>();
+        cache_location->set_type(select_result.type);
         for (const auto &[data_storage_uri_idx, location_spec_info] : uris) {
             LocationSpec location_spec;
             location_spec.set_name(location_spec_info->name());
             location_spec.set_uri(allocated_uris[data_storage_uri_idx].ToUriString());
-            cache_location.push_location_spec(std::move(location_spec));
+            cache_location->push_location_spec(std::move(location_spec));
         }
-        cache_location.set_spec_size(uris.size());
+        cache_location->set_spec_size(uris.size());
         new_locations.push_back(std::move(cache_location));
     }
     return EC_OK;
@@ -1225,12 +1233,15 @@ ErrorCode CacheManager::GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
             request_context->error_tracer()->AddErrorMsg("instance not found");
             RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_INSTANCE_NOT_EXIST, "instance not found");
         }
-        for (auto &location : cache_locations) {
-            if (location.spec_size() == 0) {
-                location.set_spec_size(instance_info->location_spec_infos().size());
+        for (auto &loc_ptr : cache_locations) {
+            if (!loc_ptr || loc_ptr->spec_size() == 0) {
+                // COW: create or copy, then modify
+                auto new_loc = loc_ptr ? std::make_shared<CacheLocation>(*loc_ptr) : std::make_shared<CacheLocation>();
+                new_loc->set_spec_size(instance_info->location_spec_infos().size());
                 for (auto &spec_info : instance_info->location_spec_infos()) {
-                    location.push_location_spec(LocationSpec(spec_info.name(), ""));
+                    new_loc->push_location_spec(LocationSpec(spec_info.name(), ""));
                 }
+                loc_ptr = std::move(new_loc);
             }
         }
     }

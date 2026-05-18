@@ -561,10 +561,10 @@ std::vector<ErrorCode> MetaStorageBackendManager::GetLocationIds(RequestContext 
                                                                  const KeyVector &keys,
                                                                  LocationIdsPerKey &out_location_ids) noexcept {
     if (!cache_backend_) {
-        return persistent_backend_->GetLocationIds(nullptr, keys, out_location_ids);
+        return persistent_backend_->GetLocationIds(request_context, keys, out_location_ids);
     }
 
-    std::vector<ErrorCode> results = cache_backend_->GetLocationIds(nullptr, keys, out_location_ids);
+    std::vector<ErrorCode> results = cache_backend_->GetLocationIds(request_context, keys, out_location_ids);
     if (recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning) {
         return results;
     }
@@ -576,7 +576,7 @@ std::vector<ErrorCode> MetaStorageBackendManager::GetLocationIds(RequestContext 
 
     LocationIdsPerKey persistent_location_ids;
     std::vector<ErrorCode> persistent_results =
-        persistent_backend_->GetLocationIds(nullptr, missing_keys, persistent_location_ids);
+        persistent_backend_->GetLocationIds(request_context, missing_keys, persistent_location_ids);
     if (missing_keys.size() != persistent_location_ids.size()) {
         KVCM_LOG_ERROR("persistent_location_ids size[%lu] mismatch keys's[%lu]",
                        persistent_location_ids.size(),

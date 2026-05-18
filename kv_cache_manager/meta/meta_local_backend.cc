@@ -162,15 +162,17 @@ ErrorCode MetaLocalBackend::UpdateInPlace(const std::string &key_str,
     {
         std::unique_lock lock(existing->GetMutex());
         auto &existing_locations = existing->GetMutableLocations();
-        for (const auto &[loc_id, loc] : locations) {
+        for (const auto &[loc_id, loc_ptr] : locations) {
             auto it = existing_locations.find(loc_id);
             if (it != existing_locations.end()) {
-                ssize_t old_usage = static_cast<ssize_t>(it->second.EstimateMemUsage());
-                it->second = loc;
-                charge_delta += static_cast<ssize_t>(loc.EstimateMemUsage()) - old_usage;
+                ssize_t old_usage = it->second ? static_cast<ssize_t>(it->second->EstimateMemUsage()) : 0;
+                it->second = loc_ptr;
+                ssize_t new_usage = loc_ptr ? static_cast<ssize_t>(loc_ptr->EstimateMemUsage()) : 0;
+                charge_delta += new_usage - old_usage;
             } else {
-                charge_delta += static_cast<ssize_t>(sizeof(void *) * 4 + loc_id.size() + loc.EstimateMemUsage());
-                existing_locations[loc_id] = loc;
+                ssize_t new_usage = loc_ptr ? static_cast<ssize_t>(loc_ptr->EstimateMemUsage()) : 0;
+                charge_delta += static_cast<ssize_t>(sizeof(void *) * 4 + loc_id.size()) + new_usage;
+                existing_locations[loc_id] = loc_ptr;
             }
         }
         auto &existing_properties = existing->GetMutableProperties();
@@ -241,8 +243,8 @@ ErrorCode MetaLocalBackend::DeleteLocationsForOneKey(KeyType key, const std::vec
         for (const auto &loc_id : location_ids) {
             auto it = locs.find(loc_id);
             if (it != locs.end()) {
-                charge_delta -=
-                    static_cast<ssize_t>(sizeof(void *) * 4 + it->first.size() + it->second.EstimateMemUsage());
+                ssize_t loc_usage = it->second ? static_cast<ssize_t>(it->second->EstimateMemUsage()) : 0;
+                charge_delta -= static_cast<ssize_t>(sizeof(void *) * 4 + it->first.size()) + loc_usage;
                 locs.erase(it);
             }
         }

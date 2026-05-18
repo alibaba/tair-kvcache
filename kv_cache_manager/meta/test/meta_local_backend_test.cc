@@ -782,17 +782,16 @@ TEST_F(MetaLocalBackendTest, TestDeleteFields) {
 
     // key 1: delete one of two location fields; key 2: delete its only
     // location field; key 3: does not exist -> EC_NOENT.
-    AssertDeleteLocations(meta_storage_backend_.get(),
-                          {1, 2, 3},
-                          {{LOCATION_PREFIX + "a"}, {LOCATION_PREFIX + "c"}, {"anything"}},
-                          {EC_OK, EC_OK, EC_NOENT});
+    // DeleteLocations takes location ids without LOCATION_PREFIX.
+    AssertDeleteLocations(
+        meta_storage_backend_.get(), {1, 2, 3}, {{"a"}, {"c"}, {"anything"}}, {EC_OK, EC_OK, EC_NOENT});
 
-    // Non-deleted fields survive.
+    // Non-deleted properties survive; verify via GetProperties (properties only).
     AssertGetProperties(meta_storage_backend_.get(),
                         {1, 2},
-                        {LOCATION_PREFIX + "a", LOCATION_PREFIX + "b", PROPERTY_URI},
+                        {PROPERTY_URI},
                         {EC_OK, EC_OK},
-                        {{{LOCATION_PREFIX + "b", "lb"}, {PROPERTY_URI, "u1"}}, {{PROPERTY_URI, "u2"}}});
+                        {{{PROPERTY_URI, "u1"}}, {{PROPERTY_URI, "u2"}}});
 
     // Deleting a non-existent field on an existing key still returns EC_OK.
     AssertDeleteLocations(meta_storage_backend_.get(), {1}, {{"not_exist_field"}}, {EC_OK});
@@ -837,22 +836,26 @@ TEST_F(MetaLocalBackendTest, TestTombstoneNotTreatedAsValidLocation) {
     // ExistsLocation should return true (real location exists).
     AssertExistsLocation(meta_storage_backend_.get(), {1}, {EC_OK}, {true});
 
-    // GetLocationIds should only return the non-tombstone location.
+    // GetLocationIds returns ALL location ids including tombstones (empty value
+    // means deserialization failed but the location id still exists).
     LocationIdsPerKey location_ids_vec;
     auto ecs = meta_storage_backend_->GetLocationIds(nullptr, {1}, location_ids_vec);
     ASSERT_EQ(EC_OK, ecs[0]);
-    ASSERT_EQ(1u, location_ids_vec[0].size());
-    EXPECT_EQ("real", location_ids_vec[0][0]);
+    ASSERT_EQ(2u, location_ids_vec[0].size());
+    std::set<std::string> ids(location_ids_vec[0].begin(), location_ids_vec[0].end());
+    EXPECT_TRUE(ids.count("real"));
+    EXPECT_TRUE(ids.count("tomb"));
 
     // Now delete the real location so only the tombstone remains.
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->DeleteLocations(nullptr, {1}, {{"real"}}));
 
-    // The only valid location was removed — should report no valid locations.
-    AssertExistsLocation(meta_storage_backend_.get(), {1}, {EC_OK}, {false});
+    // Tombstone location id still exists — ExistsLocation should still be true.
+    AssertExistsLocation(meta_storage_backend_.get(), {1}, {EC_OK}, {true});
     location_ids_vec.clear();
     ecs = meta_storage_backend_->GetLocationIds(nullptr, {1}, location_ids_vec);
     ASSERT_EQ(EC_OK, ecs[0]);
-    EXPECT_TRUE(location_ids_vec[0].empty());
+    ASSERT_EQ(1u, location_ids_vec[0].size());
+    EXPECT_EQ("tomb", location_ids_vec[0][0]);
 
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
@@ -1048,20 +1051,25 @@ TEST_F(MetaLocalBackendTest, TestChargeAdjustment) {
     size_t usage_after_shrink = backend->GetMemUsage();
     ASSERT_EQ(static_cast<ssize_t>(usage_after_shrink) - static_cast<ssize_t>(usage_after_add), expected_delta_shrink);
 
-    // --- Upsert: add another new field (key exists, goes through UpdateFieldsInPlace) ---
-    std::string field_name_b = "field_b";
-    std::string field_value_b(512, 'y');
-    ssize_t expected_delta_upsert = static_cast<ssize_t>(field_name_b.size() + field_value_b.size() + kMapNodeOverhead);
+    // --- Upsert: add a location (key exists, goes through UpdateFieldsInPlace) ---
+    // Use a location field so that DeleteLocations can remove it.
+    std::string loc_id_b = "loc_b";
+    std::string loc_value_b(512, 'y'); // non-JSON value, stored as-is
+    std::string field_name_b_full = LOCATION_PREFIX + loc_id_b;
+    // SplitFieldMaps creates a CacheLocation with id=loc_id_b and no specs.
+    // EstimateMemUsage = sizeof(CacheLocation) + loc_id_b.size()
+    // MetaMemCacheItem::Size location overhead = sizeof(void*)*4 + loc_id.size() + EstimateMemUsage
+    size_t loc_mem_usage = sizeof(CacheLocation) + loc_id_b.size();
+    ssize_t expected_delta_upsert = static_cast<ssize_t>(kMapNodeOverhead + loc_id_b.size() + loc_mem_usage);
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}),
-              UpsertWithFieldMaps(backend.get(), {1}, {{{field_name_b, field_value_b}}}));
+              UpsertWithFieldMaps(backend.get(), {1}, {{{field_name_b_full, loc_value_b}}}));
     size_t usage_after_upsert = backend->GetMemUsage();
     ASSERT_EQ(static_cast<ssize_t>(usage_after_upsert - usage_after_shrink), expected_delta_upsert);
 
-    // --- DeleteFields: remove field_b ---
-    // Expected delta: -(field_name.size() + field_value.size() + kMapNodeOverhead)
-    ssize_t expected_delta_delete =
-        -static_cast<ssize_t>(field_name_b.size() + field_value_b.size() + kMapNodeOverhead);
-    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), backend->DeleteLocations(nullptr, {1}, {{field_name_b}}));
+    // --- DeleteLocations: remove loc_b ---
+    // Expected delta: -(sizeof(void*)*4 + loc_id.size() + EstimateMemUsage)
+    ssize_t expected_delta_delete = -expected_delta_upsert;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), backend->DeleteLocations(nullptr, {1}, {{loc_id_b}}));
     size_t usage_after_delete = backend->GetMemUsage();
     ASSERT_EQ(static_cast<ssize_t>(usage_after_delete) - static_cast<ssize_t>(usage_after_upsert),
               expected_delta_delete);

@@ -161,13 +161,13 @@ void SchedulePlanExecutor::DoLocationDelTask(const std::shared_ptr<std::promise<
 
         for (auto &location_id : need_delete_location_ids) {
             auto iter = location_map.find(location_id);
-            if (iter == location_map.end()) {
+            if (iter == location_map.end() || !iter->second) {
                 continue;
             }
-            if (iter->second.status() != CacheLocationStatus::CLS_DELETING) {
+            if (iter->second->status() != CacheLocationStatus::CLS_DELETING) {
                 continue;
             }
-            for (const auto &loc_spec : iter->second.location_specs()) {
+            for (const auto &loc_spec : iter->second->location_specs()) {
                 DataStorageUri uri(loc_spec.uri());
                 if (uri.Valid()) {
                     std::string storage_unique_name = uri.GetHostName();
@@ -284,7 +284,10 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::Submit(const CacheMetaDelRe
     for (size_t block_key_idx = 0; block_key_idx < task.block_keys.size(); ++block_key_idx) {
         std::vector<MetaSearcher::LocationCASTask> cas_tasks;
         for (const auto &loc_kv : location_maps[block_key_idx]) {
-            cas_tasks.push_back({loc_kv.first, loc_kv.second.status(), CLS_DELETING});
+            if (!loc_kv.second) {
+                continue;
+            }
+            cas_tasks.push_back({loc_kv.first, loc_kv.second->status(), CLS_DELETING});
         }
         if (cas_tasks.empty()) {
             continue;
@@ -402,7 +405,10 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::Submit(const CacheLocationD
         auto &location_map = location_maps[block_key_idx];
         std::vector<MetaSearcher::LocationCASTask> location_cas_tasks;
         for (const auto &loc_kv : location_map) {
-            const auto &location = loc_kv.second;
+            if (!loc_kv.second) {
+                continue;
+            }
+            const auto &location = *loc_kv.second;
             if (location.status() == CacheLocationStatus::CLS_DELETING) {
                 continue; // ignore already deleting
             }

@@ -20,10 +20,10 @@ public:
         return spec;
     }
 
-    static CacheLocation CreateCacheLocation(DataStorageType type = DataStorageType::DATA_STORAGE_TYPE_NFS,
-                                             size_t spec_size = 1,
-                                             const std::vector<LocationSpec> &specs = {}) {
-        return CacheLocation(type, spec_size, specs);
+    static CacheLocationConstPtr CreateCacheLocation(DataStorageType type = DataStorageType::DATA_STORAGE_TYPE_NFS,
+                                                     size_t spec_size = 1,
+                                                     const std::vector<LocationSpec> &specs = {}) {
+        return std::make_shared<CacheLocation>(type, spec_size, specs);
     }
 
     static std::vector<LocationSpec> CreateDefaultLocationSpecs() {
@@ -94,11 +94,11 @@ TEST_F(SchedulePlanExecutorTest, TestSubmit) {
         MetaSearcher meta_searcher(meta_manager_->GetMetaIndexer(kTestInstanceName));
 
         // 创建CacheLocation对象
-        CacheLocation location1 = SchedulePlanExecutorTestHelper::CreateCacheLocation(
+        CacheLocationConstPtr location1 = SchedulePlanExecutorTestHelper::CreateCacheLocation(
             DataStorageType::DATA_STORAGE_TYPE_NFS,
             1,
             {SchedulePlanExecutorTestHelper::CreateLocationSpec("TP0", "nfs://nfs_01/block" + std::to_string(i * 2))});
-        CacheLocation location2 = SchedulePlanExecutorTestHelper::CreateCacheLocation(
+        CacheLocationConstPtr location2 = SchedulePlanExecutorTestHelper::CreateCacheLocation(
             DataStorageType::DATA_STORAGE_TYPE_NFS,
             1,
             {SchedulePlanExecutorTestHelper::CreateLocationSpec("TP0",
@@ -199,7 +199,7 @@ TEST_F(SchedulePlanExecutorTest, TestSetStatusToDeleting) {
     MetaSearcher meta_searcher(meta_manager_->GetMetaIndexer(kTestInstanceName));
 
     // 创建CacheLocation对象
-    CacheLocation new_location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
+    CacheLocationConstPtr new_location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
         DataStorageType::DATA_STORAGE_TYPE_NFS,
         1,
         {SchedulePlanExecutorTestHelper::CreateLocationSpec("test_loc", "nfs://nfs_01/block200")});
@@ -233,7 +233,7 @@ TEST_F(SchedulePlanExecutorTest, TestSetStatusToDeleting) {
 
     for (const auto &location_map : location_maps) {
         for (const auto &loc_kv : location_map) {
-            const auto &location = loc_kv.second;
+            const auto &location = *loc_kv.second;
             ASSERT_EQ(CacheLocationStatus::CLS_DELETING, location.status())
                 << "Location status should be CLS_DELETING after Submit";
         }
@@ -256,15 +256,15 @@ TEST_F(SchedulePlanExecutorTest, TestMultipleLocationsPerBlockKey) {
     MetaSearcher meta_searcher(meta_manager_->GetMetaIndexer(kTestInstanceName));
 
     // 创建多个CacheLocation对象
-    CacheLocation location1 = SchedulePlanExecutorTestHelper::CreateCacheLocation(
+    CacheLocationConstPtr location1 = SchedulePlanExecutorTestHelper::CreateCacheLocation(
         DataStorageType::DATA_STORAGE_TYPE_NFS,
         1,
         {SchedulePlanExecutorTestHelper::CreateLocationSpec("TP0", "nfs://nfs_01/block1")});
-    CacheLocation location2 = SchedulePlanExecutorTestHelper::CreateCacheLocation(
+    CacheLocationConstPtr location2 = SchedulePlanExecutorTestHelper::CreateCacheLocation(
         DataStorageType::DATA_STORAGE_TYPE_NFS,
         1,
         {SchedulePlanExecutorTestHelper::CreateLocationSpec("TP0", "nfs://nfs_01/block2")});
-    CacheLocation location3 = SchedulePlanExecutorTestHelper::CreateCacheLocation(
+    CacheLocationConstPtr location3 = SchedulePlanExecutorTestHelper::CreateCacheLocation(
         DataStorageType::DATA_STORAGE_TYPE_NFS,
         1,
         {SchedulePlanExecutorTestHelper::CreateLocationSpec("TP0", "nfs://nfs_01/block3")});
@@ -307,7 +307,7 @@ TEST_F(SchedulePlanExecutorTest, TestMultipleLocationsPerBlockKey) {
 
     // 检查所有location的状态是否都更新为DELETING
     for (const auto &loc_kv : location_maps[0]) {
-        const auto &location = loc_kv.second;
+        const auto &location = *loc_kv.second;
         KVCM_LOG_INFO("Location ID: %s, Status: %d", loc_kv.first.c_str(), location.status());
         ASSERT_EQ(CacheLocationStatus::CLS_DELETING, location.status())
             << "Location status should be CLS_DELETING after Submit";
@@ -336,7 +336,7 @@ TEST_F(SchedulePlanExecutorTest, TestStorageDelete) {
     MetaSearcher meta_searcher(meta_manager_->GetMetaIndexer(kTestInstanceName));
 
     // 创建CacheLocation对象
-    CacheLocation location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
+    CacheLocationConstPtr location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
         DataStorageType::DATA_STORAGE_TYPE_NFS,
         1,
         {SchedulePlanExecutorTestHelper::CreateLocationSpec("test_loc", "nfs://nfs_01/test_block_for_storage_delete")});
@@ -389,7 +389,7 @@ TEST_F(SchedulePlanExecutorTest, TestDelayExecution) {
     MetaSearcher meta_searcher(meta_manager_->GetMetaIndexer(kTestInstanceName));
 
     // 创建CacheLocation对象
-    CacheLocation location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
+    CacheLocationConstPtr location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
         DataStorageType::DATA_STORAGE_TYPE_NFS,
         1,
         {SchedulePlanExecutorTestHelper::CreateLocationSpec("test_loc", "nfs://nfs_01/test_block_for_delay")});
@@ -459,7 +459,7 @@ TEST_F(SchedulePlanExecutorTest, TestMultipleDelayedTasksExecutionOrder) {
 
     for (int i = 0; i < 3; i++) {
         // 创建CacheLocation对象
-        CacheLocation location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
+        CacheLocationConstPtr location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
             DataStorageType::DATA_STORAGE_TYPE_NFS,
             1,
             {SchedulePlanExecutorTestHelper::CreateLocationSpec(
@@ -540,15 +540,15 @@ TEST_F(SchedulePlanExecutorTest, TestSubmitLocationDelRequest) {
     MetaSearcher meta_searcher(meta_manager_->GetMetaIndexer(kTestInstanceName));
 
     // 创建多个CacheLocation对象
-    CacheLocation location1 = SchedulePlanExecutorTestHelper::CreateCacheLocation(
+    CacheLocationConstPtr location1 = SchedulePlanExecutorTestHelper::CreateCacheLocation(
         DataStorageType::DATA_STORAGE_TYPE_NFS,
         1,
         {SchedulePlanExecutorTestHelper::CreateLocationSpec("TP0", "nfs://nfs_01/block100")});
-    CacheLocation location2 = SchedulePlanExecutorTestHelper::CreateCacheLocation(
+    CacheLocationConstPtr location2 = SchedulePlanExecutorTestHelper::CreateCacheLocation(
         DataStorageType::DATA_STORAGE_TYPE_NFS,
         1,
         {SchedulePlanExecutorTestHelper::CreateLocationSpec("TP0", "nfs://nfs_01/block101")});
-    CacheLocation location3 = SchedulePlanExecutorTestHelper::CreateCacheLocation(
+    CacheLocationConstPtr location3 = SchedulePlanExecutorTestHelper::CreateCacheLocation(
         DataStorageType::DATA_STORAGE_TYPE_NFS,
         1,
         {SchedulePlanExecutorTestHelper::CreateLocationSpec("TP0", "nfs://nfs_01/block102")});
@@ -601,7 +601,7 @@ TEST_F(SchedulePlanExecutorTest, TestSubmitLocationDelRequest) {
     // 检查被标记为删除的location的状态是否都更新为DELETING
     int deleting_count = 0;
     for (const auto &loc_kv : location_maps[0]) {
-        const auto &location = loc_kv.second;
+        const auto &location = *loc_kv.second;
         if (loc_kv.first == original_location_ids[0] || loc_kv.first == original_location_ids[1]) {
             // 这两个应该被标记为DELETING
             ASSERT_EQ(CacheLocationStatus::CLS_DELETING, location.status())
@@ -668,7 +668,7 @@ TEST_F(SchedulePlanExecutorTest, TestSubmitLocationDelRequestWithDelay) {
     MetaSearcher meta_searcher(meta_manager_->GetMetaIndexer(kTestInstanceName));
 
     // 创建CacheLocation对象
-    CacheLocation location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
+    CacheLocationConstPtr location = SchedulePlanExecutorTestHelper::CreateCacheLocation(
         DataStorageType::DATA_STORAGE_TYPE_NFS,
         1,
         {SchedulePlanExecutorTestHelper::CreateLocationSpec("test_loc", "nfs://nfs_01/test_block_for_location_delay")});

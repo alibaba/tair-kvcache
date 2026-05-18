@@ -521,9 +521,9 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocation(RequestContext 
                         continue;
                     }
                     const LocationId &loc_id = loc_ids[loc_index];
-                    CacheLocation &working_loc = loc_values[loc_index];
-                    assert(loc_id == working_loc.id());
-                    upsert_loc_map.emplace(loc_id, std::move(working_loc));
+                    const CacheLocationConstPtr &working_loc = loc_values[loc_index];
+                    assert(working_loc && loc_id == working_loc->id());
+                    upsert_loc_map.emplace(loc_id, working_loc);
                     upsert_location_indexs[global_idx].emplace_back(loc_index);
                 }
                 if (!upsert_loc_map.empty() || !upsert_property_map.empty()) {

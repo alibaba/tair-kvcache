@@ -1,5 +1,6 @@
 #pragma once
 
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <variant>
@@ -144,8 +145,9 @@ private:
     std::vector<LocationSpec> location_specs_;
 };
 
-using CacheLocationVector = std::vector<CacheLocation>;
-using CacheLocationMap = std::unordered_map<std::string, CacheLocation>;
+using CacheLocationConstPtr = std::shared_ptr<const CacheLocation>;
+using CacheLocationVector = std::vector<CacheLocationConstPtr>;
+using CacheLocationMap = std::unordered_map<std::string, CacheLocationConstPtr>;
 using CacheLocationMapVector = std::vector<CacheLocationMap>;
 
 } // namespace kv_cache_manager

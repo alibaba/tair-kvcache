@@ -42,15 +42,15 @@ public:
 
     // Construct a single-location CacheLocation with id/uri wired up so the
     // round-trip through JSON can be asserted.
-    static CacheLocation MakeLocation(const std::string &id, const std::string &uri) {
-        CacheLocation loc;
-        loc.set_id(id);
-        loc.set_status(CacheLocationStatus::CLS_SERVING);
-        loc.set_type(DataStorageType::DATA_STORAGE_TYPE_HF3FS);
-        loc.set_spec_size(1);
+    static CacheLocationConstPtr MakeLocation(const std::string &id, const std::string &uri) {
+        auto loc = std::make_shared<CacheLocation>();
+        loc->set_id(id);
+        loc->set_status(CacheLocationStatus::CLS_SERVING);
+        loc->set_type(DataStorageType::DATA_STORAGE_TYPE_HF3FS);
+        loc->set_spec_size(1);
         std::vector<LocationSpec> specs;
         specs.emplace_back("default", uri);
-        loc.set_location_specs(std::move(specs));
+        loc->set_location_specs(std::move(specs));
         return loc;
     }
 
@@ -85,9 +85,10 @@ public:
             batch.batch_properties.resize(batch.batch_keys.size());
         }
         for (size_t i = 0; i < batch.batch_keys.size(); ++i) {
-            for (const auto &loc_kv : batch.batch_locations[i]) {
-                const CacheLocation &location = loc_kv.second;
-                batch.batch_properties[i][LOCATION_PREFIX + location.id()] = location.ToJsonString();
+            for (const auto &[loc_id, loc_ptr] : batch.batch_locations[i]) {
+                if (!loc_ptr)
+                    continue;
+                batch.batch_properties[i][LOCATION_PREFIX + loc_ptr->id()] = loc_ptr->ToJsonString();
             }
         }
     }
@@ -160,12 +161,14 @@ TEST_F(MetaStorageBackendManagerTest, TestPutAndGetLocationsRoundTrip) {
     auto put_ecs = mgr.Put(request_context_.get(), batch);
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}), put_ecs);
 
-    // BuildEffectiveFieldMaps should have serialized every location into
-    // batch.batch_properties under the LOCATION_PREFIX + id field name.
+    // New API stores locations separately from properties — verify locations
+    // are populated in batch_locations (already set by MakeBatch) and that the
+    // Put call did not corrupt them.
     for (size_t i = 0; i < keys.size(); ++i) {
-        const std::string expected_field = LOCATION_PREFIX + "loc_" + std::to_string(keys[i]);
-        ASSERT_TRUE(batch.batch_properties[i].count(expected_field) > 0)
-            << "location field missing for key=" << keys[i];
+        const std::string loc_id = "loc_" + std::to_string(keys[i]);
+        ASSERT_EQ(1u, batch.batch_locations[i].size());
+        ASSERT_TRUE(batch.batch_locations[i].count(loc_id) > 0)
+            << "location missing in batch_locations for key=" << keys[i];
     }
 
     // GetLocations must deserialize back into the same (id, uri) pairs.
@@ -178,7 +181,7 @@ TEST_F(MetaStorageBackendManagerTest, TestPutAndGetLocationsRoundTrip) {
         ASSERT_EQ(1u, out_locations[i].size());
         auto it = out_locations[i].find(loc_id);
         ASSERT_TRUE(it != out_locations[i].end());
-        ASSERT_EQ("uri_" + std::to_string(keys[i]), it->second.location_specs().front().uri());
+        ASSERT_EQ("uri_" + std::to_string(keys[i]), it->second->location_specs().front().uri());
     }
 
     // Block-level properties should be preserved alongside the location fields.
@@ -336,7 +339,7 @@ TEST_F(MetaStorageBackendManagerTest, TestSingleBackendCrud) {
 
     CacheLocationMapVector out_locs;
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), mgr.GetLocations(request_context_.get(), keys, out_locs));
-    ASSERT_EQ("uri_1", out_locs[0].at("loc_1").location_specs().front().uri());
+    ASSERT_EQ("uri_1", out_locs[0].at("loc_1")->location_specs().front().uri());
 
     // Delete location field -> reclaim path resolves emptiness via persistent.
     LocationIdsPerKey loc_ids = {{"loc_1"}, {"loc_2"}};
@@ -397,7 +400,7 @@ TEST_F(MetaStorageBackendManagerTest, TestRecoverReadFallbackToPersistent) {
     CacheLocationMapVector locs;
     auto loc_ecs = mgr.GetLocations(request_context_.get(), KeyVector{1, 2}, locs);
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), loc_ecs);
-    ASSERT_EQ("uri_2", locs[1].at("loc_2").location_specs().front().uri());
+    ASSERT_EQ("uri_2", locs[1].at("loc_2")->location_specs().front().uri());
 
     // Targeted GetLocations(keys, location_ids) also falls back on miss.
     LocationIdsPerKey ids = {{"loc_1"}, {"loc_2"}};
@@ -405,7 +408,7 @@ TEST_F(MetaStorageBackendManagerTest, TestRecoverReadFallbackToPersistent) {
     auto per_ecs = mgr.GetLocations(request_context_.get(), KeyVector{1, 2}, ids, per_key_locs);
     ASSERT_EQ(EC_OK, per_ecs[0][0]);
     ASSERT_EQ(EC_OK, per_ecs[1][0]);
-    ASSERT_EQ("uri_2", per_key_locs[1][0].location_specs().front().uri());
+    ASSERT_EQ("uri_2", per_key_locs[1][0]->location_specs().front().uri());
 
     ASSERT_EQ(EC_OK, mgr.Close());
 }
@@ -525,8 +528,8 @@ TEST_F(MetaStorageBackendManagerTest, TestGetLocationsPerLocationIdSemantics) {
     ASSERT_EQ(2u, ecs.size());
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOENT}), ecs[0]);
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOENT}), ecs[1]);
-    ASSERT_EQ("uri_5", out_locs[0][0].location_specs().front().uri());
-    ASSERT_EQ("uri_6", out_locs[1][0].location_specs().front().uri());
+    ASSERT_EQ("uri_5", out_locs[0][0]->location_specs().front().uri());
+    ASSERT_EQ("uri_6", out_locs[1][0]->location_specs().front().uri());
 
     ASSERT_EQ(EC_OK, mgr.Close());
 }

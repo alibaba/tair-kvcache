@@ -83,7 +83,7 @@ TEST_F(MetaIndexerRedisTest, TestRedisSimple) {
     const int32_t key_count = 3;
     MakeKVData(/*start*/ 0, /*end*/ 3, data);
     // Snapshot the expected location payload before Put potentially moves inputs.
-    LocationMapVector expect_locations;
+    CacheLocationMapVector expect_locations;
     expect_locations.reserve(data.location_maps.size());
     for (const auto &location_map : data.location_maps) {
         expect_locations.emplace_back(location_map);

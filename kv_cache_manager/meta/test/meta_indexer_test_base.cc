@@ -13,17 +13,17 @@
 
 namespace kv_cache_manager {
 
-CacheLocation MetaIndexerTestBase::MakeLocation(const std::string &id, const std::string &uri) {
+CacheLocationConstPtr MetaIndexerTestBase::MakeLocation(const std::string &id, const std::string &uri) {
     // Build a minimal one-spec CacheLocation; uri field carries the payload the
     // tests compare against after a round-trip through the backend.
-    CacheLocation location;
-    location.set_id(id);
-    location.set_status(CacheLocationStatus::CLS_SERVING);
-    location.set_type(DataStorageType::DATA_STORAGE_TYPE_HF3FS);
-    location.set_spec_size(1);
+    auto location = std::make_shared<CacheLocation>();
+    location->set_id(id);
+    location->set_status(CacheLocationStatus::CLS_SERVING);
+    location->set_type(DataStorageType::DATA_STORAGE_TYPE_HF3FS);
+    location->set_spec_size(1);
     std::vector<LocationSpec> specs;
     specs.emplace_back(/*name*/ "default", uri);
-    location.set_location_specs(std::move(specs));
+    location->set_location_specs(std::move(specs));
     return location;
 }
 
@@ -92,10 +92,10 @@ void MetaIndexerTestBase::AssertGet(const KeyVector &keys,
             ASSERT_TRUE(it != actual_map.end()) << "key=" << keys[i] << " location_id=" << kv.first;
             // Compare on the round-trippable projection (id/uri) instead of the
             // full object to avoid coupling to every CacheLocation field.
-            ASSERT_EQ(kv.second.id(), it->second.id());
-            ASSERT_EQ(kv.second.location_specs().size(), it->second.location_specs().size());
-            if (!kv.second.location_specs().empty()) {
-                ASSERT_EQ(kv.second.location_specs().front().uri(), it->second.location_specs().front().uri());
+            ASSERT_EQ(kv.second->id(), it->second->id());
+            ASSERT_EQ(kv.second->location_specs().size(), it->second->location_specs().size());
+            if (!kv.second->location_specs().empty()) {
+                ASSERT_EQ(kv.second->location_specs().front().uri(), it->second->location_specs().front().uri());
             }
         }
     }
@@ -119,7 +119,7 @@ void MetaIndexerTestBase::AssertGet(const KeyVector &keys,
         for (const auto &kv : expect_loc) {
             auto it = actual_loc.find(kv.first);
             ASSERT_TRUE(it != actual_loc.end()) << "key=" << keys[i] << " location_id=" << kv.first;
-            ASSERT_EQ(kv.second.id(), it->second.id());
+            ASSERT_EQ(kv.second->id(), it->second->id());
         }
         for (const auto &prop : expect_properties[i]) {
             ASSERT_EQ(prop.second, out_properties[i][prop.first]) << "key=" << keys[i] << " prop=" << prop.first;

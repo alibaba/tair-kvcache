@@ -15,9 +15,9 @@ using CheckLocDataExistFunc = std::function<bool(const CacheLocation &loc)>;
 class SelectLocationPolicy {
 public:
     // for match : select best location
-    virtual CacheLocation *SelectForMatch(CacheLocationMap &location_map,
-                                          CheckLocDataExistFunc check_loc_data_exist,
-                                          std::vector<std::string> &out_prune_loc_ids) const = 0;
+    virtual CacheLocationConstPtr SelectForMatch(CacheLocationMap &location_map,
+                                                 CheckLocDataExistFunc check_loc_data_exist,
+                                                 std::vector<std::string> &out_prune_loc_ids) const = 0;
 
     // for write : return true if exists means that not need write again
     virtual bool ExistsForWrite(const CacheLocationMap &location_map,
@@ -39,9 +39,9 @@ public:
 
 class WeightSLPolicy : public SelectLocationPolicy {
 public:
-    CacheLocation *SelectForMatch(CacheLocationMap &location_map,
-                                  CheckLocDataExistFunc check_loc_data_exist,
-                                  std::vector<std::string> &out_prune_loc_ids) const override;
+    CacheLocationConstPtr SelectForMatch(CacheLocationMap &location_map,
+                                         CheckLocDataExistFunc check_loc_data_exist,
+                                         std::vector<std::string> &out_prune_loc_ids) const override;
     bool ExistsForWrite(const CacheLocationMap &location_map,
                         CheckLocDataExistFunc check_loc_data_exist,
                         std::vector<std::string> &out_prune_loc_ids) const override;

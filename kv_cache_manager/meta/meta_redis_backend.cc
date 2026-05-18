@@ -142,8 +142,8 @@ ErrorCode MetaRedisBackend::Close() noexcept {
 
 FieldMap MetaRedisBackend::SerializeToFieldMap(const CacheLocationMap &locations, const PropertyMap &properties) {
     FieldMap field_map;
-    for (const auto &[loc_id, loc] : locations) {
-        field_map[LOCATION_PREFIX + loc_id] = loc.ToJsonString();
+    for (const auto &[loc_id, loc_ptr] : locations) {
+        field_map[LOCATION_PREFIX + loc_id] = loc_ptr ? loc_ptr->ToJsonString() : "";
     }
     for (const auto &[key, value] : properties) {
         field_map[key] = value;
@@ -156,12 +156,12 @@ ErrorCode MetaRedisBackend::DeserializeFieldMap(const FieldMap &field_map,
                                                 PropertyMap &out_properties) {
     for (const auto &[field_name, field_value] : field_map) {
         if (field_name.rfind(LOCATION_PREFIX, 0) == 0) {
-            if (field_value.empty()) {
-                continue;
-            }
             std::string loc_id = field_name.substr(LOCATION_PREFIX.size());
-            CacheLocation location;
-            if (!location.FromJsonString(field_value)) {
+            auto location = std::make_shared<CacheLocation>();
+            if (field_value.empty()) {
+                // Empty value: deserialization failed but location id still exists.
+                location->set_id(loc_id);
+            } else if (!location->FromJsonString(field_value)) {
                 return EC_CORRUPTION;
             }
             out_locations[loc_id] = std::move(location);
@@ -177,12 +177,12 @@ ErrorCode MetaRedisBackend::DeserializeLocations(const FieldMap &field_map, Cach
         if (field_name.rfind(LOCATION_PREFIX, 0) != 0) {
             continue;
         }
-        if (field_value.empty()) {
-            continue;
-        }
         std::string loc_id = field_name.substr(LOCATION_PREFIX.size());
-        CacheLocation location;
-        if (!location.FromJsonString(field_value)) {
+        auto location = std::make_shared<CacheLocation>();
+        if (field_value.empty()) {
+            // Empty value: deserialization failed but location id still exists.
+            location->set_id(loc_id);
+        } else if (!location->FromJsonString(field_value)) {
             return EC_CORRUPTION;
         }
         out_locations[loc_id] = std::move(location);
@@ -417,8 +417,8 @@ std::vector<std::vector<ErrorCode>> MetaRedisBackend::GetLocations(RequestContex
                 results[i][j] = EC_NOENT;
                 continue;
             }
-            CacheLocation location;
-            if (!location.FromJsonString(it->second)) {
+            auto location = std::make_shared<CacheLocation>();
+            if (!location->FromJsonString(it->second)) {
                 results[i][j] = EC_CORRUPTION;
                 continue;
             }

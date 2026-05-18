@@ -18,10 +18,10 @@ public:
         return spec;
     }
 
-    static CacheLocation CreateCacheLocation(DataStorageType type = DataStorageType::DATA_STORAGE_TYPE_NFS,
-                                             size_t spec_size = 1,
-                                             const std::vector<LocationSpec> &specs = {}) {
-        return CacheLocation(type, spec_size, specs);
+    static CacheLocationConstPtr CreateCacheLocation(DataStorageType type = DataStorageType::DATA_STORAGE_TYPE_NFS,
+                                                     size_t spec_size = 1,
+                                                     const std::vector<LocationSpec> &specs = {}) {
+        return std::make_shared<CacheLocation>(type, spec_size, specs);
     }
 
     static std::vector<LocationSpec> CreateDefaultLocationSpecs() {
@@ -89,11 +89,11 @@ TEST_F(MetaSearcherTest, TestBatchAddLocation) {
 
     // 创建CacheLocation对象
     auto location_specs = MetaSearcherTestHelper::CreateDefaultLocationSpecs();
-    CacheLocation location1 =
+    CacheLocationConstPtr location1 =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, location_specs);
-    CacheLocation location2 =
+    CacheLocationConstPtr location2 =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 2, location_specs);
-    CacheLocation location3 =
+    CacheLocationConstPtr location3 =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE, 3, location_specs);
 
     CacheLocationVector locations = {location1, location2, location3};
@@ -128,18 +128,18 @@ TEST_F(MetaSearcherTest, TestBatchAddLocation2) {
     // 创建CacheLocation对象
     std::vector<LocationSpec> specs1(
         1, MetaSearcherTestHelper::CreateLocationSpec("nfs", "file:///tmp/test1/test.txt?offset=1&length=2&size=3"));
-    CacheLocation location1 =
+    CacheLocationConstPtr location1 =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, specs1);
 
     std::vector<LocationSpec> specs2(
         1, MetaSearcherTestHelper::CreateLocationSpec("hf3fs", "hf3fs:///tmp/test1/test.txt?offset=1&length=2&size=4"));
-    CacheLocation location2 =
+    CacheLocationConstPtr location2 =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 2, specs2);
 
     std::vector<LocationSpec> specs3(2,
                                      MetaSearcherTestHelper::CreateLocationSpec(
                                          "mooncake", "mooncake:///tmp/test1/test.txt?offset=1&length=2&size=5"));
-    CacheLocation location3 =
+    CacheLocationConstPtr location3 =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE, 3, specs3);
 
     CacheLocationVector locations = {location1, location2, location3};
@@ -177,11 +177,11 @@ TEST_F(MetaSearcherTest, TestPrefixMatch) {
 
     // 创建CacheLocation对象
     auto location_specs = MetaSearcherTestHelper::CreateDefaultLocationSpecs();
-    CacheLocation location1 =
+    CacheLocationConstPtr location1 =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, location_specs);
-    CacheLocation location2 =
+    CacheLocationConstPtr location2 =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 2, location_specs);
-    CacheLocation location3 =
+    CacheLocationConstPtr location3 =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE, 3, location_specs);
 
     CacheLocationVector locations = {location1, location2, location3};
@@ -243,7 +243,7 @@ TEST_F(MetaSearcherTest, TestPrefixMatch) {
 
         // 验证返回的 locations（合并视图的 id 无单一元数据语义；type 为策略 winner 的后端类型）
         for (size_t i = 0; i < out_locations.size(); i++) {
-            EXPECT_EQ(out_locations[i].status(), CLS_SERVING);
+            EXPECT_EQ(out_locations[i]->status(), CLS_SERVING);
         }
     }
 
@@ -263,7 +263,7 @@ TEST_F(MetaSearcherTest, TestPrefixMatch) {
 
         // 验证返回的 locations（合并视图的 id 无单一元数据语义）
         for (size_t i = 0; i < out_locations.size(); i++) {
-            EXPECT_EQ(out_locations[i].status(), CLS_SERVING);
+            EXPECT_EQ(out_locations[i]->status(), CLS_SERVING);
         }
     }
 }
@@ -274,11 +274,11 @@ TEST_F(MetaSearcherTest, TestBatchGet) {
 
     // 创建CacheLocation对象
     auto location_specs = MetaSearcherTestHelper::CreateDefaultLocationSpecs();
-    CacheLocation location1 =
+    CacheLocationConstPtr location1 =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, location_specs);
-    CacheLocation location2 =
+    CacheLocationConstPtr location2 =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 2, location_specs);
-    CacheLocation location3 =
+    CacheLocationConstPtr location3 =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE, 3, location_specs);
 
     CacheLocationVector locations = {location1, location2, location3};
@@ -310,10 +310,10 @@ TEST_F(MetaSearcherTest, TestBatchGet) {
         EXPECT_NE(it, location_map.end());
 
         if (it != location_map.end()) {
-            const CacheLocation &location = it->second;
+            const auto &location = *it->second;
             EXPECT_EQ(location.id(), out_location_ids[i]);
             EXPECT_EQ(location.status(), CLS_WRITING);
-            EXPECT_EQ(location.type(), locations[i].type());
+            EXPECT_EQ(location.type(), locations[i]->type());
         }
     }
 
@@ -344,11 +344,11 @@ TEST_F(MetaSearcherTest, TestBatchUpdateLocationStatus) {
 
     // 创建CacheLocation对象
     auto location_specs = MetaSearcherTestHelper::CreateDefaultLocationSpecs();
-    CacheLocation location1 =
+    CacheLocationConstPtr location1 =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, location_specs);
-    CacheLocation location2 =
+    CacheLocationConstPtr location2 =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 2, location_specs);
-    CacheLocation location3 =
+    CacheLocationConstPtr location3 =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE, 3, location_specs);
 
     CacheLocationVector locations = {location1, location2, location3};
@@ -377,10 +377,10 @@ TEST_F(MetaSearcherTest, TestBatchUpdateLocationStatus) {
         EXPECT_NE(it, location_map.end());
 
         if (it != location_map.end()) {
-            const CacheLocation &location = it->second;
+            const auto &location = *it->second;
             EXPECT_EQ(location.id(), out_location_ids[i]);
             EXPECT_EQ(location.status(), CLS_WRITING); // 初始状态应为CLS_WRITING
-            EXPECT_EQ(location.type(), locations[i].type());
+            EXPECT_EQ(location.type(), locations[i]->type());
         }
     }
 
@@ -416,10 +416,10 @@ TEST_F(MetaSearcherTest, TestBatchUpdateLocationStatus) {
         EXPECT_NE(it, location_map.end());
 
         if (it != location_map.end()) {
-            const CacheLocation &location = it->second;
+            const auto &location = *it->second;
             EXPECT_EQ(location.id(), out_location_ids[i]);
             EXPECT_EQ(location.status(), new_statuses[i]); // 状态应已更新
-            EXPECT_EQ(location.type(), locations[i].type());
+            EXPECT_EQ(location.type(), locations[i]->type());
         }
     }
 
@@ -465,11 +465,11 @@ TEST_F(MetaSearcherTest, TestBlockKeyWithMultipleLocations) {
     std::vector<LocationSpec> location_specs2 = {MetaSearcherTestHelper::CreateLocationSpec("tp1", "uri2")};
     std::vector<LocationSpec> location_specs3 = {MetaSearcherTestHelper::CreateLocationSpec("tp2", "uri3")};
 
-    CacheLocation location1 =
+    CacheLocationConstPtr location1 =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, location_specs1);
-    CacheLocation location2 =
+    CacheLocationConstPtr location2 =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 2, location_specs2);
-    CacheLocation location3 =
+    CacheLocationConstPtr location3 =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE, 3, location_specs3);
 
     // 将三个location添加到同一个key
@@ -510,17 +510,17 @@ TEST_F(MetaSearcherTest, TestBlockKeyWithMultipleLocations) {
     EXPECT_NE(location_map.find(out_location_ids3[0]), location_map.end());
 
     // 验证每个location的信息
-    const CacheLocation &retrieved_location1 = location_map.at(out_location_ids1[0]);
+    const auto &retrieved_location1 = *location_map.at(out_location_ids1[0]);
     EXPECT_EQ(retrieved_location1.type(), DataStorageType::DATA_STORAGE_TYPE_NFS);
     EXPECT_EQ(retrieved_location1.spec_size(), 1);
     EXPECT_EQ(retrieved_location1.location_specs().size(), 1);
 
-    const CacheLocation &retrieved_location2 = location_map.at(out_location_ids2[0]);
+    const auto &retrieved_location2 = *location_map.at(out_location_ids2[0]);
     EXPECT_EQ(retrieved_location2.type(), DataStorageType::DATA_STORAGE_TYPE_HF3FS);
     EXPECT_EQ(retrieved_location2.spec_size(), 2);
     EXPECT_EQ(retrieved_location2.location_specs().size(), 1);
 
-    const CacheLocation &retrieved_location3 = location_map.at(out_location_ids3[0]);
+    const auto &retrieved_location3 = *location_map.at(out_location_ids3[0]);
     EXPECT_EQ(retrieved_location3.type(), DataStorageType::DATA_STORAGE_TYPE_MOONCAKE);
     EXPECT_EQ(retrieved_location3.spec_size(), 3);
     EXPECT_EQ(retrieved_location3.location_specs().size(), 1);
@@ -532,11 +532,11 @@ TEST_F(MetaSearcherTest, TestBatchDeleteLocation) {
 
     // 创建CacheLocation对象
     auto location_specs = MetaSearcherTestHelper::CreateDefaultLocationSpecs();
-    CacheLocation location1 =
+    CacheLocationConstPtr location1 =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, location_specs);
-    CacheLocation location2 =
+    CacheLocationConstPtr location2 =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 2, location_specs);
-    CacheLocation location3 =
+    CacheLocationConstPtr location3 =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE, 3, location_specs);
 
     CacheLocationVector locations = {location1, location2, location3};
@@ -597,10 +597,10 @@ TEST_F(MetaSearcherTest, TestBatchDeleteLocation) {
     EXPECT_NE(it, out_location_maps[2].end());
 
     if (it != out_location_maps[2].end()) {
-        const CacheLocation &location = it->second;
+        const auto &location = *it->second;
         EXPECT_EQ(location.id(), out_location_ids[2]);
         EXPECT_EQ(location.status(), CLS_WRITING);
-        EXPECT_EQ(location.type(), locations[2].type());
+        EXPECT_EQ(location.type(), locations[2]->type());
     }
 
     // 测试错误情况：key和location_id数量不匹配
@@ -620,18 +620,18 @@ TEST_F(MetaSearcherTest, TestBatchDeleteLocation2) {
     // 创建CacheLocation对象
     std::vector<LocationSpec> specs1(
         1, MetaSearcherTestHelper::CreateLocationSpec("nfs", "file:///tmp/test1/test.txt?offset=1&length=2&size=3"));
-    CacheLocation location1 =
+    CacheLocationConstPtr location1 =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, specs1);
 
     std::vector<LocationSpec> specs2(
         1, MetaSearcherTestHelper::CreateLocationSpec("hf3fs", "hf3fs:///tmp/test1/test.txt?offset=1&length=2&size=4"));
-    CacheLocation location2 =
+    CacheLocationConstPtr location2 =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 2, specs2);
 
     std::vector<LocationSpec> specs3(2,
                                      MetaSearcherTestHelper::CreateLocationSpec(
                                          "mooncake", "mooncake:///tmp/test1/test.txt?offset=1&length=2&size=5"));
-    CacheLocation location3 =
+    CacheLocationConstPtr location3 =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE, 3, specs3);
 
     CacheLocationVector locations = {location1, location2, location3};
@@ -665,7 +665,7 @@ TEST_F(MetaSearcherTest, TestBatchVsSequentialPerformance) {
         keys.push_back(10000 + i);
 
         auto location_specs = MetaSearcherTestHelper::CreateDefaultLocationSpecs();
-        CacheLocation location =
+        CacheLocationConstPtr location =
             MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, location_specs);
         locations.push_back(location);
     }
@@ -726,11 +726,11 @@ TEST_F(MetaSearcherTest, TestBatchCASLocationStatus) {
 
     // 创建CacheLocation对象
     auto location_specs = MetaSearcherTestHelper::CreateDefaultLocationSpecs();
-    CacheLocation location1 =
+    CacheLocationConstPtr location1 =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, location_specs);
-    CacheLocation location2 =
+    CacheLocationConstPtr location2 =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 2, location_specs);
-    CacheLocation location3 =
+    CacheLocationConstPtr location3 =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE, 3, location_specs);
 
     CacheLocationVector locations = {location1, location2, location3};
@@ -759,7 +759,7 @@ TEST_F(MetaSearcherTest, TestBatchCASLocationStatus) {
         EXPECT_NE(it, location_map.end());
 
         if (it != location_map.end()) {
-            const CacheLocation &location = it->second;
+            const auto &location = *it->second;
             EXPECT_EQ(location.id(), out_location_ids[i]);
             EXPECT_EQ(location.status(), CLS_WRITING); // 初始状态应为CLS_WRITING
         }
@@ -801,10 +801,10 @@ TEST_F(MetaSearcherTest, TestBatchCASLocationStatus) {
         EXPECT_NE(it, location_map.end());
 
         if (it != location_map.end()) {
-            const CacheLocation &location = it->second;
+            const auto &location = *it->second;
             EXPECT_EQ(location.id(), out_location_ids[i]);
             EXPECT_EQ(location.status(), CLS_SERVING); // 状态应已更新为SERVING
-            EXPECT_EQ(location.type(), locations[i].type());
+            EXPECT_EQ(location.type(), locations[i]->type());
         }
     }
 
@@ -834,11 +834,11 @@ TEST_F(MetaSearcherTest, TestBatchCADLocationStatus) {
 
     // 创建CacheLocation对象
     auto location_specs = MetaSearcherTestHelper::CreateDefaultLocationSpecs();
-    CacheLocation location1 =
+    CacheLocationConstPtr location1 =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, location_specs);
-    CacheLocation location2 =
+    CacheLocationConstPtr location2 =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 2, location_specs);
-    CacheLocation location3 =
+    CacheLocationConstPtr location3 =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE, 3, location_specs);
 
     CacheLocationVector locations = {location1, location2, location3};
@@ -925,18 +925,18 @@ TEST_F(MetaSearcherTest, TestBatchCADLocationStatus2) {
     // 创建CacheLocation对象
     std::vector<LocationSpec> specs1(
         1, MetaSearcherTestHelper::CreateLocationSpec("nfs", "file:///tmp/test1/test.txt?offset=1&length=2&size=3"));
-    CacheLocation location1 =
+    CacheLocationConstPtr location1 =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, specs1);
 
     std::vector<LocationSpec> specs2(
         1, MetaSearcherTestHelper::CreateLocationSpec("hf3fs", "hf3fs:///tmp/test1/test.txt?offset=1&length=2&size=4"));
-    CacheLocation location2 =
+    CacheLocationConstPtr location2 =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 2, specs2);
 
     std::vector<LocationSpec> specs3(2,
                                      MetaSearcherTestHelper::CreateLocationSpec(
                                          "mooncake", "mooncake:///tmp/test1/test.txt?offset=1&length=2&size=5"));
-    CacheLocation location3 =
+    CacheLocationConstPtr location3 =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE, 3, specs3);
 
     CacheLocationVector locations = {location1, location2, location3};
@@ -988,7 +988,7 @@ TEST_F(MetaSearcherTest, TestBatchCASLocationStatusMultipleTasksPerKey) {
 
     // 创建CacheLocation对象
     auto location_specs = MetaSearcherTestHelper::CreateDefaultLocationSpecs();
-    CacheLocation location1 =
+    CacheLocationConstPtr location1 =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, location_specs);
 
     CacheLocationVector locations = {location1};
@@ -1000,7 +1000,7 @@ TEST_F(MetaSearcherTest, TestBatchCASLocationStatusMultipleTasksPerKey) {
     EXPECT_EQ(out_location_ids.size(), 1);
 
     // 添加第二个位置到同一个key
-    CacheLocation location2 =
+    CacheLocationConstPtr location2 =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 1, location_specs);
     std::vector<std::string> out_location_ids2;
     ec = meta_searcher_->BatchAddLocation(request_context_.get(), keys, {location2}, out_location_ids2);
@@ -1044,8 +1044,8 @@ TEST_F(MetaSearcherTest, TestBatchCASLocationStatusMultipleTasksPerKey) {
     auto it2 = out_location_maps[0].find(out_location_ids2[0]);
     EXPECT_NE(it1, out_location_maps[0].end());
     EXPECT_NE(it2, out_location_maps[0].end());
-    EXPECT_EQ(it1->second.status(), CLS_SERVING);
-    EXPECT_EQ(it2->second.status(), CLS_DELETING);
+    EXPECT_EQ(it1->second->status(), CLS_SERVING);
+    EXPECT_EQ(it2->second->status(), CLS_DELETING);
 }
 
 TEST_F(MetaSearcherTest, TestBatchCADLocationStatusMultipleTasksPerKey) {
@@ -1054,9 +1054,9 @@ TEST_F(MetaSearcherTest, TestBatchCADLocationStatusMultipleTasksPerKey) {
 
     // 创建CacheLocation对象
     auto location_specs = MetaSearcherTestHelper::CreateDefaultLocationSpecs();
-    CacheLocation location1 =
+    CacheLocationConstPtr location1 =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, location_specs);
-    CacheLocation location2 =
+    CacheLocationConstPtr location2 =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 1, location_specs);
 
     // 添加第一个位置信息
@@ -1084,7 +1084,7 @@ TEST_F(MetaSearcherTest, TestBatchCADLocationStatusMultipleTasksPerKey) {
     EXPECT_EQ(out_location_maps.size(), 1);
     EXPECT_EQ(out_location_maps[0].size(), 2); // 应该有两个位置
     for (const auto &loc_pair : out_location_maps[0]) {
-        EXPECT_EQ(loc_pair.second.status(), CLS_WRITING);
+        EXPECT_EQ(loc_pair.second->status(), CLS_WRITING);
     }
 
     // 将第一个位置的状态都更新为DELETING
@@ -1114,8 +1114,8 @@ TEST_F(MetaSearcherTest, TestBatchCADLocationStatusMultipleTasksPerKey) {
     auto it2 = out_location_maps[0].find(out_location_ids[1]);
     EXPECT_NE(it1, out_location_maps[0].end());
     EXPECT_NE(it2, out_location_maps[0].end());
-    EXPECT_EQ(it1->second.status(), CLS_DELETING);
-    EXPECT_EQ(it2->second.status(), CLS_WRITING);
+    EXPECT_EQ(it1->second->status(), CLS_DELETING);
+    EXPECT_EQ(it2->second->status(), CLS_WRITING);
 
     // CAD任务：删除状态为DELETING的两个位置
     std::vector<std::vector<MetaSearcher::LocationCADTask>> batch_tasks;
@@ -1190,12 +1190,12 @@ TEST_F(MetaSearcherTest, TestPrefixMatchMergesSpecsByStorageType) {
 
     // Location A: NFS with spec "tp0"
     std::vector<LocationSpec> specs_a = {MetaSearcherTestHelper::CreateLocationSpec("tp0", "nfs:///a/tp0")};
-    CacheLocation loc_a =
+    CacheLocationConstPtr loc_a =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, specs_a);
 
     // Location B: NFS with spec "tp1" (same storage type, different spec)
     std::vector<LocationSpec> specs_b = {MetaSearcherTestHelper::CreateLocationSpec("tp1", "nfs:///b/tp1")};
-    CacheLocation loc_b =
+    CacheLocationConstPtr loc_b =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, specs_b);
 
     // Add location A to all keys
@@ -1234,11 +1234,11 @@ TEST_F(MetaSearcherTest, TestPrefixMatchMergesSpecsByStorageType) {
     for (size_t i = 0; i < out_locations.size(); ++i) {
         const auto &loc = out_locations[i];
         // Both locations are NFS, so specs from both should be merged
-        ASSERT_EQ(loc.location_specs().size(), 2) << "key index " << i << " should have 2 specs merged from same type";
-        EXPECT_EQ(loc.spec_size(), loc.location_specs().size())
+        ASSERT_EQ(loc->location_specs().size(), 2) << "key index " << i << " should have 2 specs merged from same type";
+        EXPECT_EQ(loc->spec_size(), loc->location_specs().size())
             << "spec_size must equal location_specs count after merge";
-        EXPECT_EQ(loc.type(), DataStorageType::DATA_STORAGE_TYPE_NFS);
-        for (const auto &spec : loc.location_specs()) {
+        EXPECT_EQ(loc->type(), DataStorageType::DATA_STORAGE_TYPE_NFS);
+        for (const auto &spec : loc->location_specs()) {
             EXPECT_FALSE(spec.uri().empty());
         }
     }
@@ -1250,14 +1250,14 @@ TEST_F(MetaSearcherTest, TestBatchGetMergesSpecsByStorageType) {
     // Key 60000: add 2 locations with different specs but SAME storage type (NFS)
     std::vector<LocationSpec> specs_a = {MetaSearcherTestHelper::CreateLocationSpec("tp0", "nfs:///a/tp0")};
     std::vector<LocationSpec> specs_b = {MetaSearcherTestHelper::CreateLocationSpec("tp1", "nfs:///b/tp1")};
-    CacheLocation loc_a =
+    CacheLocationConstPtr loc_a =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, specs_a);
-    CacheLocation loc_b =
+    CacheLocationConstPtr loc_b =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, specs_b);
 
     // Key 60001: add only 1 location
     std::vector<LocationSpec> specs_c = {MetaSearcherTestHelper::CreateLocationSpec("tp0", "mooncake:///c/tp0")};
-    CacheLocation loc_c =
+    CacheLocationConstPtr loc_c =
         MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE, 1, specs_c);
 
     // Add loc_a to key 60000, loc_c to key 60001
@@ -1300,19 +1300,19 @@ TEST_F(MetaSearcherTest, TestBatchGetMergesSpecsByStorageType) {
     // Key 60000: both locations are NFS, specs should be merged → 2 specs
     {
         const auto &loc = out_locations[0];
-        ASSERT_EQ(loc.location_specs().size(), 2);
-        EXPECT_EQ(loc.spec_size(), loc.location_specs().size())
+        ASSERT_EQ(loc->location_specs().size(), 2);
+        EXPECT_EQ(loc->spec_size(), loc->location_specs().size())
             << "spec_size must equal location_specs count after merge";
-        EXPECT_EQ(loc.type(), DataStorageType::DATA_STORAGE_TYPE_NFS);
+        EXPECT_EQ(loc->type(), DataStorageType::DATA_STORAGE_TYPE_NFS);
     }
 
     // Key 60001: single location → 1 spec
     {
         const auto &loc = out_locations[1];
-        ASSERT_EQ(loc.location_specs().size(), 1);
-        EXPECT_EQ(loc.spec_size(), loc.location_specs().size())
+        ASSERT_EQ(loc->location_specs().size(), 1);
+        EXPECT_EQ(loc->spec_size(), loc->location_specs().size())
             << "spec_size must equal location_specs count for single location";
-        EXPECT_EQ(loc.location_specs()[0].name(), "tp0");
-        EXPECT_EQ(loc.type(), DataStorageType::DATA_STORAGE_TYPE_MOONCAKE);
+        EXPECT_EQ(loc->location_specs()[0].name(), "tp0");
+        EXPECT_EQ(loc->type(), DataStorageType::DATA_STORAGE_TYPE_MOONCAKE);
     }
 }

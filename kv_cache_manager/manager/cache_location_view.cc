@@ -40,8 +40,9 @@ CacheLocationViewVecWrapper::CacheLocationViewVecWrapper(CacheLocationVector &&r
     if (size) {
         CacheLocationTransformer transformer;
         cache_locations_view_.reserve(size);
-        for (const auto &cache_location : raw_cache_locations_) {
-            cache_locations_view_.push_back(transformer(cache_location));
+        for (const auto &loc_ptr : raw_cache_locations_) {
+            assert(loc_ptr);
+            cache_locations_view_.push_back(transformer(*loc_ptr));
         }
     }
 }

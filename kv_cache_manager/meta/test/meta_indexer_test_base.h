@@ -36,7 +36,7 @@ protected:
 
     // Build a single-location CacheLocation with the given id/uri, using the
     // same schema as MakeKVData so producers/consumers stay in lockstep.
-    static CacheLocation MakeLocation(const std::string &id, const std::string &uri);
+    static CacheLocationConstPtr MakeLocation(const std::string &id, const std::string &uri);
 
     // Assertions over MetaIndexer::Get(LocationMapVector, PropertyMapVector)
     // (the new whole-block read path).

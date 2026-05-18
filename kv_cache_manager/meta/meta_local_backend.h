@@ -25,8 +25,9 @@ struct MetaMemCacheItem {
     size_t Size() const {
         size_t total = sizeof(MetaMemCacheItem);
         for (const auto &[location_id, location] : locations_) {
-            // unordered_map node overhead + key string heap + CacheLocation footprint
-            total += sizeof(void *) * 4 + location_id.size() + location.EstimateMemUsage();
+            // unordered_map node overhead + key string heap + shared_ptr overhead + CacheLocation footprint
+            total += sizeof(void *) * 4 + location_id.size() + sizeof(CacheLocationConstPtr) +
+                     (location ? location->EstimateMemUsage() : 0);
         }
         for (const auto &[prop_name, prop_value] : properties_) {
             total += sizeof(void *) * 4 + prop_name.size() + prop_value.size();

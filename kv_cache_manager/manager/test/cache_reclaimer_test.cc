@@ -222,10 +222,8 @@ std::chrono::milliseconds mi_randsample_delay{0};
 ErrorCode random_sample_result;
 KeyVector random_sample_keys;
 
-ErrorCode MetaIndexer_RandomSample_stub(void *obj,
-                                        RequestContext *rc,
-                                        const std::size_t c,
-                                        KeyVector &out_keys) noexcept {
+ErrorCode
+MetaIndexer_RandomSample_stub(void *obj, RequestContext *rc, const std::size_t c, KeyVector &out_keys) noexcept {
     if (random_sample_result == ErrorCode::EC_OK) {
         if (c == random_sample_keys.size()) {
             out_keys = random_sample_keys;
@@ -246,10 +244,8 @@ std::chrono::milliseconds mi_sample_reclaim_delay{0};
 ErrorCode sample_reclaim_result;
 KeyVector sample_reclaim_keys;
 
-ErrorCode MetaIndexer_SampleReclaimKeys_stub(void *obj,
-                                             RequestContext *rc,
-                                             const std::int64_t c,
-                                             KeyVector &out_keys) noexcept {
+ErrorCode
+MetaIndexer_SampleReclaimKeys_stub(void *obj, RequestContext *rc, const std::int64_t c, KeyVector &out_keys) noexcept {
     if (sample_reclaim_result == ErrorCode::EC_OK) {
         if (c == static_cast<std::int64_t>(sample_reclaim_keys.size())) {
             out_keys = sample_reclaim_keys;
@@ -3115,9 +3111,12 @@ TEST_F(CacheReclaimerTest, TestPerf) {
 
     batch_get_loc_out_maps = std::vector<CacheLocationMap>(
         batching_sz,
-        CacheLocationMap{
-            {"foo",
-             CacheLocation{"foo", CacheLocationStatus::CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_NFS, 8, {}}}});
+        CacheLocationMap{{"foo",
+                          std::make_shared<CacheLocation>("foo",
+                                                          CacheLocationStatus::CLS_SERVING,
+                                                          DataStorageType::DATA_STORAGE_TYPE_NFS,
+                                                          8,
+                                                          std::vector<LocationSpec>{})}});
 
     cache_reclaimer_->job_state_flag_ = true;
 

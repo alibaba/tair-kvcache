@@ -18,17 +18,17 @@ void MetaStorageBackendTestBase::SplitFieldMaps(const FieldMapVec &field_maps,
         for (const auto &[name, value] : field_maps[i]) {
             if (name.rfind(LOCATION_PREFIX, 0) == 0) {
                 std::string loc_id = name.substr(LOCATION_PREFIX.size());
-                CacheLocation loc;
-                loc.set_id(loc_id);
+                auto loc = std::make_shared<CacheLocation>();
+                loc->set_id(loc_id);
                 // Store raw value in a location_spec uri so round-trip tests
                 // that compare serialised JSON can still work. For empty value
                 // (tombstone), leave the location default-constructed (no specs).
                 if (!value.empty()) {
-                    loc.FromJsonString(value);
+                    loc->FromJsonString(value);
                     // If FromJsonString failed (value was not valid JSON),
                     // fall back to storing raw value.
-                    if (loc.id().empty()) {
-                        loc.set_id(loc_id);
+                    if (loc->id().empty()) {
+                        loc->set_id(loc_id);
                     }
                 }
                 out_locations[i][loc_id] = std::move(loc);
@@ -120,8 +120,8 @@ void MetaStorageBackendTestBase::AssertGetAllFields(MetaStorageBackend *meta_sto
     for (size_t i = 0; i < keys.size(); ++i) {
         const KeyType &key = keys[i];
         FieldMap merged;
-        for (const auto &[loc_id, loc] : out_locations[i]) {
-            merged[LOCATION_PREFIX + loc_id] = loc.ToJsonString();
+        for (const auto &[loc_id, loc_ptr] : out_locations[i]) {
+            merged[LOCATION_PREFIX + loc_id] = loc_ptr ? loc_ptr->ToJsonString() : "";
         }
         for (const auto &[prop_name, prop_value] : out_properties[i]) {
             merged[prop_name] = prop_value;

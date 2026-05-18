@@ -952,7 +952,11 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
     out_loc_ids.reserve(loc_maps.size());
     for (const auto &loc_map : loc_maps) {
         std::vector<std::string> loc_id_vec;
-        for (const auto &[_, loc] : loc_map) {
+        for (const auto &[_, loc_ptr] : loc_map) {
+            if (!loc_ptr) {
+                continue;
+            }
+            const auto &loc = *loc_ptr;
             // a location is eligible for eviction if:
             // 1. it is in CLS_SERVING status, OR
             // 2. it is in CLS_WRITING status but its write session is

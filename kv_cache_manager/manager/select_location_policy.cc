@@ -40,29 +40,32 @@ std::string_view ExtractHostName(std::string_view uri) {
 
 namespace kv_cache_manager {
 
-CacheLocation *WeightSLPolicy::SelectForMatch(CacheLocationMap &location_map,
-                                              CheckLocDataExistFunc check_loc_data_exist,
-                                              std::vector<std::string> &out_prune_loc_ids) const {
+CacheLocationConstPtr WeightSLPolicy::SelectForMatch(CacheLocationMap &location_map,
+                                                     CheckLocDataExistFunc check_loc_data_exist,
+                                                     std::vector<std::string> &out_prune_loc_ids) const {
     thread_local std::mt19937 rng(std::random_device{}());
-    std::vector<CacheLocation *> serving_locations;
+    std::vector<CacheLocationConstPtr> serving_locations;
     std::vector<uint32_t> weights;
     serving_locations.reserve(location_map.size());
     weights.reserve(location_map.size());
     out_prune_loc_ids.clear();
-    for (auto &kv : location_map) {
-        if (kv.second.status() == CacheLocationStatus::CLS_SERVING) {
-            if (check_loc_data_exist && !check_loc_data_exist(kv.second)) {
+    for (const auto &kv : location_map) {
+        if (!kv.second) {
+            continue;
+        }
+        if (kv.second->status() == CacheLocationStatus::CLS_SERVING) {
+            if (check_loc_data_exist && !check_loc_data_exist(*kv.second)) {
                 out_prune_loc_ids.emplace_back(kv.first);
                 continue;
             }
             if (int32_t weight = GetWeight(kv); weight > 0) {
-                serving_locations.push_back(&kv.second);
+                serving_locations.push_back(kv.second);
                 weights.push_back(weight);
             }
         }
     }
     if (serving_locations.empty() || weights.empty()) {
-        return nullptr;
+        return std::make_shared<CacheLocation>();
     }
     std::discrete_distribution<uint32_t> dist(weights.begin(), weights.end());
     return serving_locations[dist(rng)];
@@ -73,10 +76,13 @@ bool WeightSLPolicy::ExistsForWrite(const CacheLocationMap &location_map,
                                     std::vector<std::string> &out_prune_loc_ids) const {
     bool exists = false;
     out_prune_loc_ids.clear();
-    for (auto &kv : location_map) {
-        if (kv.second.status() != CacheLocationStatus::CLS_NOT_FOUND) {
-            if (kv.second.status() == CacheLocationStatus::CLS_SERVING && check_loc_data_exist &&
-                !check_loc_data_exist(kv.second)) {
+    for (const auto &kv : location_map) {
+        if (!kv.second) {
+            continue;
+        }
+        if (kv.second->status() != CacheLocationStatus::CLS_NOT_FOUND) {
+            if (kv.second->status() == CacheLocationStatus::CLS_SERVING && check_loc_data_exist &&
+                !check_loc_data_exist(*kv.second)) {
                 out_prune_loc_ids.emplace_back(kv.first);
                 continue;
             }
@@ -101,12 +107,15 @@ bool WeightSLPolicy::ExistsForWrite(const CacheLocationMap &location_map,
     // building a hash set — avoids heap allocation and string copies.
     bool exists = false;
     out_prune_loc_ids.clear();
-    for (auto &kv : location_map) {
-        if (kv.second.status() == CacheLocationStatus::CLS_NOT_FOUND) {
+    for (const auto &kv : location_map) {
+        if (!kv.second) {
             continue;
         }
-        if (kv.second.status() == CacheLocationStatus::CLS_SERVING && check_loc_data_exist &&
-            !check_loc_data_exist(kv.second)) {
+        if (kv.second->status() == CacheLocationStatus::CLS_NOT_FOUND) {
+            continue;
+        }
+        if (kv.second->status() == CacheLocationStatus::CLS_SERVING && check_loc_data_exist &&
+            !check_loc_data_exist(*kv.second)) {
             out_prune_loc_ids.emplace_back(kv.first);
             continue;
         }
@@ -116,7 +125,7 @@ bool WeightSLPolicy::ExistsForWrite(const CacheLocationMap &location_map,
         if (GetWeight(kv) <= 0) {
             continue;
         }
-        const auto &loc_specs = kv.second.location_specs();
+        const auto &loc_specs = kv.second->location_specs();
         bool covers_all = std::all_of(
             requested_spec_names.begin(), requested_spec_names.end(), [&loc_specs](const std::string &name) {
                 return std::any_of(
@@ -130,7 +139,10 @@ bool WeightSLPolicy::ExistsForWrite(const CacheLocationMap &location_map,
 }
 
 uint32_t StaticWeightSLPolicy::GetWeight(CacheLocationMap::const_reference kv) const {
-    DataStorageType type = kv.second.type();
+    if (!kv.second) {
+        return 0;
+    }
+    DataStorageType type = kv.second->type();
     uint32_t weight = StorageTypeWeights::DEFAULT;
     // 如果枚举值对应数组索引可用，就直接取
     if (static_cast<size_t>(type) < std::size(storage_weights_)) {
@@ -140,8 +152,11 @@ uint32_t StaticWeightSLPolicy::GetWeight(CacheLocationMap::const_reference kv) c
 }
 
 uint32_t NamedStorageWeightedSLPolicy::GetWeight(CacheLocationMap::const_reference kv) const {
+    if (!kv.second || kv.second->location_specs().empty()) {
+        return 0;
+    }
     // all location_specs in location have the same host name
-    std::string_view host_name = ExtractHostName(kv.second.location_specs().front().uri());
+    std::string_view host_name = ExtractHostName(kv.second->location_specs().front().uri());
     if (auto iter = weight_map_.find(host_name); iter != weight_map_.end()) {
         return iter->second;
     }

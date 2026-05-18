@@ -40,15 +40,15 @@ public:
         return config;
     }
 
-    static CacheLocation MakeLocation(const std::string &id, const std::string &uri) {
-        CacheLocation loc;
-        loc.set_id(id);
-        loc.set_status(CacheLocationStatus::CLS_SERVING);
-        loc.set_type(DataStorageType::DATA_STORAGE_TYPE_HF3FS);
-        loc.set_spec_size(1);
+    static CacheLocationConstPtr MakeLocation(const std::string &id, const std::string &uri) {
+        auto loc = std::make_shared<CacheLocation>();
+        loc->set_id(id);
+        loc->set_status(CacheLocationStatus::CLS_SERVING);
+        loc->set_type(DataStorageType::DATA_STORAGE_TYPE_HF3FS);
+        loc->set_spec_size(1);
         std::vector<LocationSpec> specs;
         specs.emplace_back("default", uri);
-        loc.set_location_specs(std::move(specs));
+        loc->set_location_specs(std::move(specs));
         return loc;
     }
 
@@ -81,9 +81,10 @@ public:
             batch.batch_properties.resize(batch.batch_keys.size());
         }
         for (size_t i = 0; i < batch.batch_keys.size(); ++i) {
-            for (const auto &loc_kv : batch.batch_locations[i]) {
-                const CacheLocation &location = loc_kv.second;
-                batch.batch_properties[i][LOCATION_PREFIX + location.id()] = location.ToJsonString();
+            for (const auto &[loc_id, loc_ptr] : batch.batch_locations[i]) {
+                if (!loc_ptr)
+                    continue;
+                batch.batch_properties[i][LOCATION_PREFIX + loc_ptr->id()] = loc_ptr->ToJsonString();
             }
         }
     }
@@ -119,13 +120,13 @@ TEST_F(MetaStorageBackendManagerRealRedisTest, TestDualBackendPutAndGet) {
     auto batch = MakeBatch(keys);
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), mgr.Put(request_context_.get(), batch));
 
-    LocationMapVector out_locations;
+    CacheLocationMapVector out_locations;
     auto get_ecs = mgr.GetLocations(request_context_.get(), keys, out_locations);
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), get_ecs);
     for (size_t i = 0; i < keys.size(); ++i) {
         const std::string loc_id = "loc_" + std::to_string(keys[i]);
         ASSERT_EQ(1u, out_locations[i].size());
-        ASSERT_EQ("uri_" + std::to_string(keys[i]), out_locations[i].at(loc_id).location_specs().front().uri());
+        ASSERT_EQ("uri_" + std::to_string(keys[i]), out_locations[i].at(loc_id)->location_specs().front().uri());
     }
 
     Cleanup(mgr, keys);
@@ -180,9 +181,9 @@ TEST_F(MetaStorageBackendManagerRealRedisTest, TestSingleBackendCrud) {
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), mgr.Exists(keys, exists_vec));
     ASSERT_EQ((std::vector<bool>{true, true}), exists_vec);
 
-    LocationMapVector out_locs;
+    CacheLocationMapVector out_locs;
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), mgr.GetLocations(request_context_.get(), keys, out_locs));
-    ASSERT_EQ("uri_20001", out_locs[0].at("loc_20001").location_specs().front().uri());
+    ASSERT_EQ("uri_20001", out_locs[0].at("loc_20001")->location_specs().front().uri());
 
     // Delete the only location of each key -> MaybeReclaimEmptyKeys walks
     // through persistent (redis) to discover keys with no remaining locations.
@@ -247,7 +248,7 @@ TEST_F(MetaStorageBackendManagerRealRedisTest, TestRecoverReadFallbackToPersiste
     auto per_ecs = mgr.GetLocations(request_context_.get(), KeyVector{30001, 30002}, ids, per_key_locs);
     ASSERT_EQ(EC_OK, per_ecs[0][0]);
     ASSERT_EQ(EC_OK, per_ecs[1][0]);
-    ASSERT_EQ("uri_30002", per_key_locs[1][0].location_specs().front().uri());
+    ASSERT_EQ("uri_30002", per_key_locs[1][0]->location_specs().front().uri());
 
     Cleanup(mgr, KeyVector{30001, 30002});
     ASSERT_EQ(EC_OK, mgr.Close());
@@ -363,8 +364,8 @@ TEST_F(MetaStorageBackendManagerRealRedisTest, TestGetLocationsPerLocationIdSema
     ASSERT_EQ(2u, ecs.size());
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOENT}), ecs[0]);
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_NOENT}), ecs[1]);
-    ASSERT_EQ("uri_60005", out_locs[0][0].location_specs().front().uri());
-    ASSERT_EQ("uri_60006", out_locs[1][0].location_specs().front().uri());
+    ASSERT_EQ("uri_60005", out_locs[0][0]->location_specs().front().uri());
+    ASSERT_EQ("uri_60006", out_locs[1][0]->location_specs().front().uri());
 
     Cleanup(mgr, keys);
     ASSERT_EQ(EC_OK, mgr.Close());
