@@ -7,3 +7,11 @@ filegroup(
     ],
     visibility = ["//visibility:public"],
 )
+
+filegroup(
+    name = "decode_stack_trace_script",
+    srcs = [
+        "decode_stack_trace.sh",
+    ],
+    visibility = ["//visibility:public"],
+)

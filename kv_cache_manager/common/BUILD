@@ -86,6 +86,22 @@ cc_library(
 )
 
 cc_library(
+    name = "crash_handler",
+    srcs = [
+        "crash_handler.cc",
+    ],
+    hdrs = [
+        "crash_handler.h",
+    ],
+    linkopts = [
+        "-rdynamic",
+    ],
+    deps = [
+        ":build_version",
+    ],
+)
+
+cc_library(
     name = "jsonizable",
     srcs = [
         "jsonizable.cc",

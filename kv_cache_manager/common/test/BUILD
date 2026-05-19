@@ -27,6 +27,22 @@ cc_test(
 )
 
 cc_test(
+    name = "CrashHandlerTest",
+    srcs = [
+        "crash_handler_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    linkopts = [
+        "-rdynamic",
+    ],
+    data = [],
+    deps = [
+        "//kv_cache_manager/common:crash_handler",
+        "//kv_cache_manager/common:unittest",
+    ],
+)
+
+cc_test(
     name = "JsonizableTest",
     srcs = [
         "jsonizable_test.cc",

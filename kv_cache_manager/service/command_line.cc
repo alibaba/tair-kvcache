@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <unistd.h>
 
+#include "kv_cache_manager/common/crash_handler.h"
 #include "kv_cache_manager/service/server.h"
 #include "kv_cache_manager/service/server_config.h"
 namespace kv_cache_manager {
@@ -179,6 +180,7 @@ void CommandLine::UpdateLogLevel(uint32_t log_level) {
 }
 
 void CommandLine::RegisterSignal() {
+    CrashHandler::Install();
     signal(SIGPIPE, SIG_IGN);
     signal(SIGUSR1, __sign_handler__);
     signal(SIGUSR2, __sign_handler__);

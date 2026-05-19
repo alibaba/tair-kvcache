@@ -32,6 +32,7 @@ bundle_files(
 bundle_files(
     name = "pkg_script",
     srcs = [
+        "//package/script:decode_stack_trace_script",
         "//package/script:start_server_script",
     ],
     prefix = "bin",
