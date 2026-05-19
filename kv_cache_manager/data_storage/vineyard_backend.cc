@@ -149,7 +149,7 @@ void VineyardBackend::OnHeartbeat(const std::string &host_ip_port,
     }
     auto &info = *it->second;
     int64_t now_ms = NowMillis();
-    info.last_heartbeat_ms.store(now_ms, std::memory_order_relaxed);
+    info.last_heartbeat_ms.store(now_ms, std::memory_order_release);
     bool prev = info.available.exchange(true, std::memory_order_relaxed);
     if (!prev) {
         info.unavailable_since_ms.store(0, std::memory_order_relaxed);
@@ -205,8 +205,14 @@ void VineyardBackend::LivenessCheckerLoop() {
                 auto &info = *kv.second;
                 int64_t last_hb = info.last_heartbeat_ms.load(std::memory_order_relaxed);
                 if (last_hb == 0 || now_ms - last_hb <= heartbeat_timeout_ms_) {
-                    // healthy: leave available untouched (heartbeat path may
-                    // already have set it back to true).
+                    continue;
+                }
+
+                // Re-read with fresh timestamp to avoid racing with OnHeartbeat
+                // which may have updated last_heartbeat_ms after our first read.
+                last_hb = info.last_heartbeat_ms.load(std::memory_order_acquire);
+                int64_t fresh_now = NowMillis();
+                if (fresh_now - last_hb <= heartbeat_timeout_ms_) {
                     continue;
                 }
 
