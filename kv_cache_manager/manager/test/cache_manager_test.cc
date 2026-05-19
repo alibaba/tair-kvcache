@@ -1549,7 +1549,7 @@ TEST_F(CacheManagerTest, TestGetCacheLocationLen) {
 }
 
 TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_NullRegistryManager) {
-    // when registry_manager_ is null, the functor should return true
+    // when registry_manager_ is null, the functor should return EXIST
     // (assume data exists as a safe fallback)
     auto saved = cache_manager_->registry_manager_;
     cache_manager_->registry_manager_ = nullptr;
@@ -1560,14 +1560,13 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_NullRegistryManager) {
     loc.set_status(CLS_SERVING);
     loc.set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
     loc.set_location_specs({LocationSpec("tp0", "file://mock_store/path")});
-    ASSERT_TRUE(func(loc));
+    ASSERT_EQ(func(loc), LocCheckResult::EXIST);
 
     cache_manager_->registry_manager_ = saved;
 }
 
 TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_NullDataStorageManager) {
-    // when data_storage_manager() is null, the functor should return
-    // true
+    // when data_storage_manager() is null, the functor should return EXIST
     auto saved = registry_manager_->data_storage_manager_;
     registry_manager_->data_storage_manager_ = nullptr;
 
@@ -1577,36 +1576,36 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_NullDataStorageManager) {
     loc.set_status(CLS_SERVING);
     loc.set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
     loc.set_location_specs({LocationSpec("tp0", "file://mock_store/path")});
-    ASSERT_TRUE(func(loc));
+    ASSERT_EQ(func(loc), LocCheckResult::EXIST);
 
     registry_manager_->data_storage_manager_ = saved;
 }
 
 TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_EmptyLocationSpecs) {
-    // no location specs -> no URIs to check -> returns true
+    // no location specs -> no URIs to check -> returns EXIST
     auto func = cache_manager_->GetCheckLocDataExistFunc("test_instance");
 
     CacheLocation loc;
     loc.set_status(CLS_SERVING);
     loc.set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
-    ASSERT_TRUE(func(loc));
+    ASSERT_EQ(func(loc), LocCheckResult::EXIST);
 }
 
 TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_InvalidUri) {
     // invalid URI string (no protocol) -> DataStorageUri::Valid() is
-    // false -> no valid URIs collected -> returns true
+    // false -> no valid URIs collected -> returns EXIST
     auto func = cache_manager_->GetCheckLocDataExistFunc("test_instance");
 
     CacheLocation loc;
     loc.set_status(CLS_SERVING);
     loc.set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
     loc.set_location_specs({LocationSpec("tp0", "no_protocol_here")});
-    ASSERT_TRUE(func(loc));
+    ASSERT_EQ(func(loc), LocCheckResult::EXIST);
 }
 
 TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_AllExist) {
     // inject a mock backend where MightExist returns all true;
-    // the functor should return true
+    // the functor should return EXIST
     auto metrics_registry = cache_manager_->metrics_registry_;
     auto mock_backend = std::make_shared<MockDataStorageBackend>(metrics_registry);
     EXPECT_CALL(*mock_backend, MightExist(_)).WillOnce([](const std::vector<DataStorageUri> &uris) {
@@ -1623,14 +1622,14 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_AllExist) {
     loc.set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
     loc.set_location_specs(
         {LocationSpec("tp0", "file://mock_store/path_a"), LocationSpec("tp1", "file://mock_store/path_b")});
-    ASSERT_TRUE(func(loc));
+    ASSERT_EQ(func(loc), LocCheckResult::EXIST);
 
     dsm->storage_map_.erase("mock_store");
 }
 
 TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_NoneExist) {
     // inject a mock backend where MightExist returns all false;
-    // the functor should return false
+    // the functor should return NOT_EXIST
     auto metrics_registry = cache_manager_->metrics_registry_;
     auto mock_backend = std::make_shared<MockDataStorageBackend>(metrics_registry);
     EXPECT_CALL(*mock_backend, MightExist(_)).WillOnce([](const std::vector<DataStorageUri> &uris) {
@@ -1647,14 +1646,14 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_NoneExist) {
     loc.set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
     loc.set_location_specs(
         {LocationSpec("tp0", "file://mock_store/path_a"), LocationSpec("tp1", "file://mock_store/path_b")});
-    ASSERT_FALSE(func(loc));
+    ASSERT_EQ(func(loc), LocCheckResult::NOT_EXIST);
 
     dsm->storage_map_.erase("mock_store");
 }
 
 TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_PartialExist) {
     // inject a mock backend where MightExist returns mixed results;
-    // std::all_of requires all true, so the functor should return false
+    // std::all_of requires all true, so the functor should return NOT_EXIST
     auto metrics_registry = cache_manager_->metrics_registry_;
     auto mock_backend = std::make_shared<MockDataStorageBackend>(metrics_registry);
     EXPECT_CALL(*mock_backend, MightExist(_)).WillOnce([](const std::vector<DataStorageUri> &uris) {
@@ -1674,7 +1673,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_PartialExist) {
     loc.set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
     loc.set_location_specs(
         {LocationSpec("tp0", "file://mock_store/path_a"), LocationSpec("tp1", "file://mock_store/path_b")});
-    ASSERT_FALSE(func(loc));
+    ASSERT_EQ(func(loc), LocCheckResult::NOT_EXIST);
 
     dsm->storage_map_.erase("mock_store");
 }
@@ -1707,7 +1706,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_VerifiesUriPassthrough) {
     loc.set_location_specs({LocationSpec("tp0", "no_protocol"),
                             LocationSpec("tp1", "file://mock_store/path_a"),
                             LocationSpec("tp2", "file://mock_store/path_b")});
-    ASSERT_TRUE(func(loc));
+    ASSERT_EQ(func(loc), LocCheckResult::EXIST);
 
     dsm->storage_map_.erase("mock_store");
 }
@@ -1715,14 +1714,14 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_VerifiesUriPassthrough) {
 TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_UnregisteredBackend) {
     // valid URIs whose hostname does not match any registered backend;
     // DataStorageManager::Exist returns an empty vector, and
-    // std::all_of on an empty range is true -> functor returns true
+    // std::all_of on an empty range is true -> functor returns EXIST
     auto func = cache_manager_->GetCheckLocDataExistFunc("test_instance");
 
     CacheLocation loc;
     loc.set_status(CLS_SERVING);
     loc.set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
     loc.set_location_specs({LocationSpec("tp0", "file://nonexistent_backend/path")});
-    ASSERT_TRUE(func(loc));
+    ASSERT_EQ(func(loc), LocCheckResult::EXIST);
 }
 
 TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_VineyardFallbackLookup) {
@@ -1753,15 +1752,14 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_VineyardFallbackLookup) {
     loc.set_status(CLS_SERVING);
     loc.set_type(DataStorageType::DATA_STORAGE_TYPE_VINEYARD);
     loc.set_location_specs({LocationSpec("tp0", "vineyard://192.168.1.100:8080/mem?gpu=A100")});
-    ASSERT_TRUE(func(loc));
+    ASSERT_EQ(func(loc), LocCheckResult::EXIST);
 
     dsm->storage_map_.erase(v6d_storage_name);
 }
 
-/*
 TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_VineyardNodeUnavailable) {
-    // When a vineyard node's heartbeat times out, MightExist should
-    // return false for that node's URIs.
+    // When a vineyard node is registered but unavailable (grace period),
+    // the functor should return TEMPORARILY_UNREACHABLE.
     const std::string instance_id = "my_cluster";
     const std::string v6d_storage_name = "v6d_" + instance_id;
     const std::string node_host = "192.168.1.200:8080";
@@ -1788,7 +1786,38 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_VineyardNodeUnavailable) {
     loc.set_status(CLS_SERVING);
     loc.set_type(DataStorageType::DATA_STORAGE_TYPE_VINEYARD);
     loc.set_location_specs({LocationSpec("tp0", "vineyard://192.168.1.200:8080/mem")});
-    ASSERT_FALSE(func(loc));
+    ASSERT_EQ(func(loc), LocCheckResult::TEMPORARILY_UNREACHABLE);
+
+    dsm->storage_map_.erase(v6d_storage_name);
+}
+
+TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_VineyardNodeUnregistered) {
+    // When a vineyard node has been unregistered (dead, past grace period),
+    // MightExist returns false -> the functor should return NOT_EXIST.
+    const std::string instance_id = "my_cluster";
+    const std::string v6d_storage_name = "v6d_" + instance_id;
+    const std::string node_host = "192.168.1.200:8080";
+
+    auto metrics_registry = cache_manager_->metrics_registry_;
+    auto vineyard_backend = std::make_shared<VineyardBackend>(metrics_registry);
+
+    StorageConfig config;
+    config.set_global_unique_name(v6d_storage_name);
+    config.set_type(DataStorageType::DATA_STORAGE_TYPE_VINEYARD);
+    auto spec = std::make_shared<VineyardStorageSpec>();
+    config.set_storage_spec(spec);
+    vineyard_backend->Open(config, "test_trace");
+
+    auto dsm = registry_manager_->data_storage_manager_;
+    dsm->storage_map_[v6d_storage_name] = vineyard_backend;
+
+    auto func = cache_manager_->GetCheckLocDataExistFunc(instance_id);
+
+    CacheLocation loc;
+    loc.set_status(CLS_SERVING);
+    loc.set_type(DataStorageType::DATA_STORAGE_TYPE_VINEYARD);
+    loc.set_location_specs({LocationSpec("tp0", "vineyard://192.168.1.200:8080/mem")});
+    ASSERT_EQ(func(loc), LocCheckResult::NOT_EXIST);
 
     dsm->storage_map_.erase(v6d_storage_name);
 }
@@ -1804,7 +1833,6 @@ TEST_F(CacheManagerTest, TestGetSubmitDelReqFunc_NullExecutor) {
 
     cache_manager_->schedule_plan_executor_ = saved;
 }
-*/
 
 TEST_F(CacheManagerTest, TestGetSubmitDelReqFunc_SubmitsToExecutor) {
     // verify that the functor actually submits a task to the

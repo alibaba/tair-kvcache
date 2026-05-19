@@ -14,7 +14,9 @@ using namespace kv_cache_manager;
 #define D_VINEYARD DataStorageType::DATA_STORAGE_TYPE_VINEYARD
 #define D_UNKNOWN DataStorageType::DATA_STORAGE_TYPE_UNKNOWN
 
-static CheckLocDataExistFunc dummy_check = [](const CacheLocation &) -> bool { return true; };
+static CheckLocDataExistFunc dummy_check = [](const CacheLocation &) -> LocCheckResult {
+    return LocCheckResult::EXIST;
+};
 static std::vector<std::string> dummy_loc_ids;
 
 class PriorityThenRandomSLPolicyTest : public TESTBASE {
@@ -99,7 +101,9 @@ TEST_F(PriorityThenRandomSLPolicyTest, StaleTopTierFallsBackToLower) {
         {CLS_SERVING, D_MEMPOOL, "pace_01"},
         {CLS_SERVING, D_3FS, "3fs_01"},
     });
-    auto stale_check = [](const CacheLocation &loc) -> bool { return loc.type() != D_VINEYARD; };
+    auto stale_check = [](const CacheLocation &loc) -> LocCheckResult {
+        return loc.type() == D_VINEYARD ? LocCheckResult::NOT_EXIST : LocCheckResult::EXIST;
+    };
     for (int i = 0; i < 100; ++i) {
         std::vector<std::string> prune;
         CacheLocation *picked = policy.SelectForMatch(location_map, stale_check, prune);
@@ -123,7 +127,7 @@ TEST_F(PriorityThenRandomSLPolicyTest, AllStaleReturnsNullptr) {
         {CLS_SERVING, D_VINEYARD, "v6d_a"},
         {CLS_SERVING, D_MEMPOOL, "pace_01"},
     });
-    auto stale_check = [](const CacheLocation &) -> bool { return false; };
+    auto stale_check = [](const CacheLocation &) -> LocCheckResult { return LocCheckResult::NOT_EXIST; };
     std::vector<std::string> prune;
     CacheLocation *picked = policy.SelectForMatch(location_map, stale_check, prune);
     ASSERT_EQ(picked, nullptr);

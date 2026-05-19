@@ -82,6 +82,10 @@ public:
     // Whether the host is registered AND currently flagged available.
     bool IsNodeAvailable(const std::string &host_ip_port) const;
 
+    // Whether the host is registered in nodes_ (regardless of available flag).
+    // Used by MightExist: registered = data physically still on the V6D node.
+    bool IsNodeRegistered(const std::string &host_ip_port) const;
+
     // location_id format: "kvs#v6d#{medium}#{ip:port}" (V8 §2.1.4).
     // Slices the host_ip_port off the suffix and queries IsNodeAvailable.
     bool IsLocationAvailable(const std::string &location_id) const;

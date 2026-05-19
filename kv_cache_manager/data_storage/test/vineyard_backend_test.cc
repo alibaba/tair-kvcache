@@ -172,7 +172,7 @@ TEST_F(VineyardBackendTest, OnHeartbeatRefreshesAndRevivesNode) {
 }
 
 // (5) LivenessCheckerLoop three-stage flow: healthy -> unavailable (lazy) ->
-//     dead (cleanup callback fires)
+//     dead (cleanup callback fires + node erased from nodes_)
 TEST_F(VineyardBackendTest, LivenessLoopHealthyToUnavailableToCleanup) {
     VineyardBackend backend(metrics_registry_);
     // hb=100ms, grace=200ms, tick=20ms -> total observable window ~300ms.
@@ -201,6 +201,9 @@ TEST_F(VineyardBackendTest, LivenessLoopHealthyToUnavailableToCleanup) {
     }
     EXPECT_GE(cleanup_calls.load(), 1);
     EXPECT_EQ(cleanup_host, "10.0.0.4:8080");
+
+    // After cleanup, the node must be removed from nodes_ (no zombie entry).
+    EXPECT_EQ(backend.nodes_.count("10.0.0.4:8080"), 0u);
 
     ASSERT_EQ(EC_OK, backend.Close());
 }
@@ -231,10 +234,9 @@ TEST_F(VineyardBackendTest, HeartbeatWithinGraceWindowRecovers) {
     ASSERT_EQ(EC_OK, backend.Close());
 }
 
-// (7) Cleanup callback is idempotent: even after cleanup fires, a subsequent
-//     OnHeartbeat should resurrect the node so V6D can re-register state via
-//     EVENT_BLOCK_ADD without restart.
-TEST_F(VineyardBackendTest, RegisterAfterCleanupReusesEntry) {
+// (7) After cleanup fires the node is erased; re-registration creates a fresh
+//     entry so V6D can rejoin the cluster without restart.
+TEST_F(VineyardBackendTest, RegisterAfterCleanupCreatesNewEntry) {
     VineyardBackend backend(metrics_registry_);
     ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 80, /*grace*/ 120, /*tick*/ 20), "trace"));
 
@@ -247,9 +249,46 @@ TEST_F(VineyardBackendTest, RegisterAfterCleanupReusesEntry) {
     }
     ASSERT_GE(cleanup_calls.load(), 1);
 
-    // Re-register: the node entry must be reusable and back to available.
-    ASSERT_EQ(EC_OK, backend.RegisterNode("10.0.0.6:8080", {"mem"}));
+    // Node must have been erased from the table after cleanup.
+    EXPECT_EQ(backend.nodes_.count("10.0.0.6:8080"), 0u);
+
+    // Re-register: creates a fresh NodeInfo (new entry branch, not merge).
+    ASSERT_EQ(EC_OK, backend.RegisterNode("10.0.0.6:8080", {"mem", "disk"}));
     ASSERT_TRUE(backend.IsNodeAvailable("10.0.0.6:8080"));
+    {
+        auto it = backend.nodes_.find("10.0.0.6:8080");
+        ASSERT_NE(it, backend.nodes_.end());
+        EXPECT_EQ(it->second->mediums.size(), 2u);
+    }
+
+    ASSERT_EQ(EC_OK, backend.Close());
+}
+
+// (8) Simulate EVENT_HOST_DOWN path: SetNodeUnavailable + UnregisterNode
+//     removes the node from nodes_ immediately; cleanup callback is NOT
+//     triggered by the LivenessCheckerLoop afterwards.
+TEST_F(VineyardBackendTest, HostDownRemovesNodeFromTable) {
+    VineyardBackend backend(metrics_registry_);
+    ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 200, /*grace*/ 400, /*tick*/ 50), "trace"));
+
+    std::atomic<int> cleanup_calls{0};
+    backend.SetCleanupCallback([&](const std::string &) { ++cleanup_calls; });
+
+    ASSERT_EQ(EC_OK, backend.RegisterNode("10.0.0.7:8080", {"mem"}));
+    ASSERT_TRUE(backend.IsNodeAvailable("10.0.0.7:8080"));
+
+    // Simulate EVENT_HOST_DOWN: mark unavailable then unregister.
+    backend.SetNodeUnavailable("10.0.0.7:8080");
+    ASSERT_FALSE(backend.IsNodeAvailable("10.0.0.7:8080"));
+    ASSERT_EQ(EC_OK, backend.UnregisterNode("10.0.0.7:8080"));
+
+    // Node must be gone.
+    EXPECT_EQ(backend.nodes_.count("10.0.0.7:8080"), 0u);
+
+    // Wait enough time to confirm LivenessCheckerLoop does NOT fire cleanup
+    // for the already-removed node.
+    std::this_thread::sleep_for(500ms);
+    EXPECT_EQ(cleanup_calls.load(), 0);
 
     ASSERT_EQ(EC_OK, backend.Close());
 }

@@ -105,36 +105,42 @@ TEST_F(FilterWriteCachePredicateTest, NotFoundLocationsAreExcluded) {
 // (6) check_loc_data_exist must subtract stale replicas from n_total.
 //     Two V6D entries exist on paper, but the stale check fails one of them
 //     -> only one effective replica -> n_total < 2 -> false (write needed).
+//     The NOT_EXIST entry must appear in out_prune_loc_ids.
 TEST_F(FilterWriteCachePredicateTest, StaleCheckRemovesUnhealthyReplica) {
     StaticWeightSLPolicy policy;
     auto m = MakeMap({
         {CLS_SERVING, D_VINEYARD, "v6d_alive"},
         {CLS_SERVING, D_VINEYARD, "v6d_stale"},
     });
-    auto stale_check = [](const CacheLocation &loc) -> bool {
-        // Drop the location whose URI contains "v6d_stale".
+    auto stale_check = [](const CacheLocation &loc) -> LocCheckResult {
         for (const auto &spec : loc.location_specs()) {
             if (spec.uri().find("v6d_stale") != std::string::npos) {
-                return false;
+                return LocCheckResult::NOT_EXIST;
             }
         }
-        return true;
+        return LocCheckResult::EXIST;
     };
-    EXPECT_FALSE(policy.ExistsForWriteWithMinCount(m, /*min*/ 2, stale_check));
+    std::vector<std::string> prune_loc_ids;
+    EXPECT_FALSE(policy.ExistsForWriteWithMinCount(m, /*min*/ 2, stale_check, prune_loc_ids));
+    EXPECT_EQ(prune_loc_ids.size(), 1u);
     // Same map, min=1 still satisfied because v6d_alive remains.
-    EXPECT_TRUE(policy.ExistsForWriteWithMinCount(m, /*min*/ 1, stale_check));
+    EXPECT_TRUE(policy.ExistsForWriteWithMinCount(m, /*min*/ 1, stale_check, prune_loc_ids));
+    EXPECT_EQ(prune_loc_ids.size(), 1u);
 }
 
 // (7) When all replicas are stale, the predicate must return false even if
 //     the underlying type/weight would otherwise qualify.
+//     All entries must appear in out_prune_loc_ids.
 TEST_F(FilterWriteCachePredicateTest, AllStaleReturnsFalse) {
     StaticWeightSLPolicy policy;
     auto m = MakeMap({
         {CLS_SERVING, D_VINEYARD, "v6d_a"},
         {CLS_SERVING, D_VINEYARD, "v6d_b"},
     });
-    auto stale_check = [](const CacheLocation &) -> bool { return false; };
-    EXPECT_FALSE(policy.ExistsForWriteWithMinCount(m, /*min*/ 1, stale_check));
+    auto stale_check = [](const CacheLocation &) -> LocCheckResult { return LocCheckResult::NOT_EXIST; };
+    std::vector<std::string> prune_loc_ids;
+    EXPECT_FALSE(policy.ExistsForWriteWithMinCount(m, /*min*/ 1, stale_check, prune_loc_ids));
+    EXPECT_EQ(prune_loc_ids.size(), 2u);
 }
 
 // (8) CLS_WRITING bypasses stale check (an in-flight write is conceptually
@@ -145,6 +151,6 @@ TEST_F(FilterWriteCachePredicateTest, WritingPlaceholderBypassesStaleCheck) {
     auto m = MakeMap({
         {CLS_WRITING, D_VINEYARD, "v6d_writing"},
     });
-    auto stale_check = [](const CacheLocation &) -> bool { return false; };
+    auto stale_check = [](const CacheLocation &) -> LocCheckResult { return LocCheckResult::NOT_EXIST; };
     EXPECT_TRUE(policy.ExistsForWriteWithMinCount(m, /*min*/ 1, stale_check));
 }

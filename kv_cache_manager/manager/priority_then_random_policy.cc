@@ -23,9 +23,15 @@ CacheLocation *PriorityThenRandomSLPolicy::SelectForMatch(CacheLocationMap &loca
         if (kv.second.status() != CacheLocationStatus::CLS_SERVING) {
             continue;
         }
-        if (check_loc_data_exist && !check_loc_data_exist(kv.second)) {
-            out_prune_loc_ids.emplace_back(kv.first);
-            continue;
+        if (check_loc_data_exist) {
+            auto result = check_loc_data_exist(kv.second);
+            if (result == LocCheckResult::NOT_EXIST) {
+                out_prune_loc_ids.emplace_back(kv.first);
+                continue;
+            }
+            if (result == LocCheckResult::TEMPORARILY_UNREACHABLE) {
+                continue;
+            }
         }
         uint32_t w = GetWeight(kv);
         if (w == 0) {

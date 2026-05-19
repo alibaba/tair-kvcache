@@ -10,7 +10,13 @@
 
 namespace kv_cache_manager {
 
-using CheckLocDataExistFunc = std::function<bool(const CacheLocation &loc)>;
+enum class LocCheckResult {
+    EXIST,                   // 数据存在且可达，正常参与选择
+    TEMPORARILY_UNREACHABLE, // 数据可能仍在但暂时不可达，过滤但不删除
+    NOT_EXIST                // 数据不存在或确认不可恢复，过滤且删除
+};
+
+using CheckLocDataExistFunc = std::function<LocCheckResult(const CacheLocation &loc)>;
 
 class SelectLocationPolicy {
 public:
@@ -54,10 +60,16 @@ public:
     // A location counts as a replica iff:
     //   - status != CLS_NOT_FOUND
     //   - GetWeight(kv) > 0
-    //   - check_loc_data_exist (when supplied) returns true for it
+    //   - check_loc_data_exist (when supplied) returns EXIST for it
     // Used by V6D eviction (V8 §2.6) to require >= 2 replicas before skipping
     // the write. The optional check_loc_data_exist hook lets the caller
     // exclude stale replicas (e.g. V6D nodes that just timed out heartbeat).
+    // Locations returning NOT_EXIST are collected into out_prune_loc_ids so
+    // the caller can schedule asynchronous meta cleanup.
+    bool ExistsForWriteWithMinCount(const CacheLocationMap &location_map,
+                                    int32_t min_count,
+                                    CheckLocDataExistFunc check_loc_data_exist,
+                                    std::vector<std::string> &out_prune_loc_ids) const;
     bool ExistsForWriteWithMinCount(const CacheLocationMap &location_map,
                                     int32_t min_count,
                                     CheckLocDataExistFunc check_loc_data_exist = nullptr) const;

@@ -180,6 +180,11 @@ bool VineyardBackend::IsNodeAvailable(const std::string &host_ip_port) const {
     return it->second->available.load(std::memory_order_relaxed);
 }
 
+bool VineyardBackend::IsNodeRegistered(const std::string &host_ip_port) const {
+    std::shared_lock<std::shared_mutex> lock(nodes_mutex_);
+    return nodes_.count(host_ip_port) > 0;
+}
+
 bool VineyardBackend::IsLocationAvailable(const std::string &location_id) const {
     // location_id format: "kvs#v6d#{medium}#{host_ip_port}".
     // host_ip_port itself never contains '#', so splitting from the trailing
@@ -241,13 +246,7 @@ void VineyardBackend::LivenessCheckerLoop() {
                 if (cb_copy) {
                     cb_copy(host);
                 }
-                // Reset unavailable_since_ms so we don't re-trigger every
-                // tick; if the node truly stays dead and is re-registered
-                // later, the new registration starts a fresh window.
-                std::shared_lock<std::shared_mutex> lock(nodes_mutex_);
-                if (auto it = nodes_.find(host); it != nodes_.end() && it->second) {
-                    it->second->unavailable_since_ms.store(0, std::memory_order_relaxed);
-                }
+                UnregisterNode(host);
             }
         }
 
@@ -275,22 +274,20 @@ std::vector<bool> VineyardBackend::Exist(const std::vector<DataStorageUri> &stor
     return std::vector<bool>(storage_uris.size(), false);
 }
 
+// 超出cleanup_grace_ms时间没有收到某个v6d节点心跳后，会从把这个节点的nodeinfo从nodes_中移除，目前在nodes_中的节点就返回true
 std::vector<bool> VineyardBackend::MightExist(const std::vector<DataStorageUri> &storage_uris) {
-    // todo:这里先默认写成true
-    return std::vector<bool>(storage_uris.size(), true);
-    // std::vector<bool> result;
-    // result.reserve(storage_uris.size());
-    // for (const auto &uri : storage_uris) {
-    //     std::string host_ip_port;
-    //     std::string medium;
-    //     std::map<std::string, std::string> params;
-    //     if (VineyardUri::Parse(uri.ToUriString(), host_ip_port, medium, params)) {
-    //         result.push_back(IsNodeAvailable(host_ip_port));
-    //     } else {
-    //         result.push_back(true);
-    //     }
-    // }
-    // return result;
+    std::vector<bool> result;
+    result.reserve(storage_uris.size());
+    for (const auto &uri : storage_uris) {
+        std::string host_ip_port, medium;
+        std::map<std::string, std::string> params;
+        if (VineyardUri::Parse(uri.ToUriString(), host_ip_port, medium, params)) {
+            result.push_back(IsNodeRegistered(host_ip_port));
+        } else {
+            result.push_back(true);
+        }
+    }
+    return result;
 }
 
 std::vector<ErrorCode> VineyardBackend::Lock(const std::vector<DataStorageUri> &storage_uris) {

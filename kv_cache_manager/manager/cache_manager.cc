@@ -22,6 +22,7 @@
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
 #include "kv_cache_manager/data_storage/vineyard_backend.h"
+#include "kv_cache_manager/data_storage/vineyard_uri.h"
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/event/spec_events/optimizer_event.h"
 #include "kv_cache_manager/manager/cache_manager_metrics_recorder.h"
@@ -968,21 +969,33 @@ ErrorCode CacheManager::FilterWriteCacheWithMinReplica(RequestContext *request_c
 
     auto *weight_policy = dynamic_cast<WeightSLPolicy *>(policy.get());
     const auto check_loc_data_exist = GetCheckLocDataExistFunc(instance_id);
+    const auto submit_del_req = GetSubmitDelReqFunc(instance_id);
+    KeyVector prune_keys;
+    std::vector<std::vector<std::string>> prune_loc_ids_vec;
 
-    auto existsForWrite = [&](size_t /*i*/, const CacheLocationMap &m) -> bool {
+    auto existsForWrite =
+        [&](size_t /*i*/, const CacheLocationMap &m, std::vector<std::string> &out_prune_loc_ids) -> bool {
         if (weight_policy) {
             // V8 §2.6: pass the stale-check so unavailable V6D replicas are
             // excluded from n_total -- otherwise a host with an expired
             // heartbeat would be counted toward the min_replica threshold.
-            return weight_policy->ExistsForWriteWithMinCount(m, min_replica_count, check_loc_data_exist);
+            return weight_policy->ExistsForWriteWithMinCount(
+                m, min_replica_count, check_loc_data_exist, out_prune_loc_ids);
         }
-        std::vector<std::string> unused_prune;
-        return policy->ExistsForWrite(m, check_loc_data_exist, unused_prune);
+        return policy->ExistsForWrite(m, check_loc_data_exist, out_prune_loc_ids);
     };
 
     std::vector<bool> exists_flags(location_maps.size());
     for (size_t i = 0; i < location_maps.size(); ++i) {
-        exists_flags[i] = existsForWrite(i, location_maps[i]);
+        std::vector<std::string> prune_loc_ids;
+        exists_flags[i] = existsForWrite(i, location_maps[i], prune_loc_ids);
+        if (!prune_loc_ids.empty()) {
+            prune_keys.emplace_back(keys[i]);
+            prune_loc_ids_vec.emplace_back(std::move(prune_loc_ids));
+        }
+    }
+    if (!prune_keys.empty() && submit_del_req) {
+        submit_del_req(prune_keys, prune_loc_ids_vec);
     }
 
     size_t first_empty_idx = location_maps.size();
@@ -1658,7 +1671,8 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 this->CleanupHostLocations(instance_id, host_ip_port);
             }).detach();
         }
-        KVCM_LOG_INFO("trace_id [%s] | HOST_DOWN: host [%s] marked unavailable, cleanup scheduled",
+        vineyard_backend->UnregisterNode(host_ip_port);
+        KVCM_LOG_INFO("trace_id [%s] | HOST_DOWN: host [%s] cleanup scheduled and removed from node table",
                       trace_id.c_str(),
                       host_ip_port.c_str());
     }
@@ -2047,9 +2061,9 @@ std::unique_ptr<SelectLocationPolicy> CacheManager::genSelectLocationPolicy(Requ
 }
 
 CheckLocDataExistFunc CacheManager::GetCheckLocDataExistFunc(const std::string &instance_id) const {
-    return [this, instance_id](const CacheLocation &loc) -> bool {
+    return [this, instance_id](const CacheLocation &loc) -> LocCheckResult {
         if (!registry_manager_ || !registry_manager_->data_storage_manager()) {
-            return true;
+            return LocCheckResult::EXIST;
         }
 
         std::vector<DataStorageUri> storage_uris;
@@ -2060,17 +2074,37 @@ CheckLocDataExistFunc CacheManager::GetCheckLocDataExistFunc(const std::string &
         }
 
         if (storage_uris.empty()) {
-            return true;
+            return LocCheckResult::EXIST;
         }
 
         // multiple loc_spec in the same location are assumed to be in
         // the same storage backend
         std::string storage_unique_name = storage_uris.front().GetHostName();
-        if (storage_uris.front().GetProtocol() == "vineyard") {
+        bool is_vineyard = (storage_uris.front().GetProtocol() == "vineyard");
+        if (is_vineyard) {
             storage_unique_name = VineyardStorageNameFromInstance(instance_id);
         }
         const auto result = registry_manager_->data_storage_manager()->Exist(storage_unique_name, storage_uris, true);
-        return std::all_of(result.cbegin(), result.cend(), [](const bool v) -> bool { return v; });
+        bool all_exist = std::all_of(result.cbegin(), result.cend(), [](const bool v) -> bool { return v; });
+
+        if (!all_exist) {
+            return LocCheckResult::NOT_EXIST;
+        }
+
+        if (is_vineyard) {
+            auto backend = registry_manager_->data_storage_manager()->GetDataStorageBackend(storage_unique_name);
+            auto *v6d = dynamic_cast<VineyardBackend *>(backend.get());
+            if (v6d) {
+                std::string host, medium;
+                std::map<std::string, std::string> params;
+                if (VineyardUri::Parse(storage_uris.front().ToUriString(), host, medium, params) &&
+                    !v6d->IsNodeAvailable(host)) {
+                    return LocCheckResult::TEMPORARILY_UNREACHABLE;
+                }
+            }
+        }
+
+        return LocCheckResult::EXIST;
     };
 }
 
