@@ -146,7 +146,9 @@ bool Server::Start() {
 }
 
 bool Server::Wait() {
-    rpc_server_->Wait();
+    if (rpc_server_) {
+        rpc_server_->Wait();
+    }
     if (meta_http_thread_.joinable()) {
         meta_http_thread_.join();
     }
@@ -366,7 +368,12 @@ void Server::Stop() {
     }
     stop_ = true;
     KVCM_LOG_INFO("server stopping...");
-    rpc_server_->Shutdown();
+    if (rpc_server_) {
+        rpc_server_->Shutdown();
+    }
+    if (admin_rpc_server_) {
+        admin_rpc_server_->Shutdown();
+    }
     KVCM_LOG_INFO("rpc server stopped.");
     if (meta_http_service_) {
         meta_http_service_->Stop();
@@ -379,8 +386,10 @@ void Server::Stop() {
         debug_http_service_->Stop();
         KVCM_LOG_INFO("debug http server stopped.");
     }
-    metrics_report_thread_->Stop();
-    KVCM_LOG_INFO("metrics reporter stopped.");
+    if (metrics_report_thread_) {
+        metrics_report_thread_->Stop();
+        KVCM_LOG_INFO("metrics reporter stopped.");
+    }
     KVCM_LOG_INFO("admin http server stopped.");
     KVCM_LOG_INFO("kvcm server stopped, goodbye!");
 }
