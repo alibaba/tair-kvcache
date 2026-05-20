@@ -113,6 +113,7 @@ DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_lru_batch_duration_us);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_lru_filter_duration_us);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_lru_submit_duration_us);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(in_flight_del_bytes);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(in_flight_del_keys);
 
 const std::string CacheReclaimer::kTraceIDPrefix{"cache_reclaimer_internal_trace_"};
 
@@ -239,6 +240,45 @@ CacheReclaimer::GetInFlightDelBytes(const std::string &instance_group_name) cons
         return {};
     }
     return it->second;
+}
+
+void CacheReclaimer::AddInFlightDelKeys(const std::string &instance_group_name,
+                                        const std::uint64_t keys) noexcept {
+    auto [it, _] = in_flight_del_keys_by_group_.try_emplace(instance_group_name, std::uint64_t{0});
+    it->second += keys;
+
+    // recompute the gauge as the sum across all groups
+    std::uint64_t total = 0;
+    for (const auto &[_unused, v] : in_flight_del_keys_by_group_) {
+        total += v;
+    }
+    METRICS_(cache_reclaimer, in_flight_del_keys) = static_cast<double>(total);
+}
+
+void CacheReclaimer::SubInFlightDelKeys(const std::string &instance_group_name,
+                                        const std::uint64_t keys) noexcept {
+    const auto it = in_flight_del_keys_by_group_.find(instance_group_name);
+    if (it == in_flight_del_keys_by_group_.end()) {
+        return;
+    }
+    // saturating subtraction to clamp at 0; defensive against any
+    // mismatch between submit-time prediction and reap-time accounting
+    it->second = (it->second > keys) ? (it->second - keys) : 0;
+    if (it->second == 0) {
+        in_flight_del_keys_by_group_.erase(it);
+    }
+
+    // recompute the gauge as the sum across all groups
+    std::uint64_t total = 0;
+    for (const auto &[_unused, v] : in_flight_del_keys_by_group_) {
+        total += v;
+    }
+    METRICS_(cache_reclaimer, in_flight_del_keys) = static_cast<double>(total);
+}
+
+std::uint64_t CacheReclaimer::GetInFlightDelKeys(const std::string &instance_group_name) const noexcept {
+    const auto it = in_flight_del_keys_by_group_.find(instance_group_name);
+    return it == in_flight_del_keys_by_group_.end() ? std::uint64_t{0} : it->second;
 }
 
 CacheReclaimer::WaterLevelExceed::WaterLevelExceed()
@@ -387,6 +427,7 @@ ErrorCode CacheReclaimer::Start() noexcept {
     REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_lru_filter_duration_us);
     REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_lru_submit_duration_us);
     REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(in_flight_del_bytes);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(in_flight_del_keys);
 
     {
         std::unique_lock<std::mutex> lock(job_state_mutex_);
@@ -533,6 +574,13 @@ CacheReclaimer::GetWaterLevelExceed(const RequestContext *request_context,
     }
     const std::size_t adjusted_grp_used_byte_sz = saturating_sub(data->grp_used_byte_sz_, in_flight_total);
 
+    // same race exists for the key-count threshold: ``key_count_'' is
+    // only decremented after the delayed delete fires, so subtract the
+    // keys already submitted (predicted to be fully reclaimed) before
+    // comparing against the threshold
+    const std::uint64_t in_flight_keys = GetInFlightDelKeys(ins_gr);
+    const std::size_t adjusted_grp_used_key_cnt = saturating_sub(data->grp_used_key_cnt_, in_flight_keys);
+
     // 2. generate the result water level exceeding array
     const double threshold_used_percentage = reclaim_strategy->trigger_strategy().used_percentage();
 
@@ -572,11 +620,10 @@ CacheReclaimer::GetWaterLevelExceed(const RequestContext *request_context,
     }
 
     // 2.2. result for the entire instance group
-    if (data->grp_used_key_cnt_ == 0 || adjusted_grp_used_byte_sz == 0) {
+    if (adjusted_grp_used_key_cnt == 0 || adjusted_grp_used_byte_sz == 0) {
         water_level_exceed->SetGeneralWaterLevelExceed(false);
         return water_level_exceed;
     }
-
     // 2.2.1. trigger_strategy:used_percent for instance group quota capacity
     if (instance_group_quota.capacity() <= 0) {
         // proceed as group quota capacity is 0
@@ -609,7 +656,7 @@ CacheReclaimer::GetWaterLevelExceed(const RequestContext *request_context,
         return water_level_exceed;
     }
     if (const double group_used_percentage =
-            static_cast<double>(data->grp_used_key_cnt_) / static_cast<double>(data->grp_max_key_cnt_);
+            static_cast<double>(adjusted_grp_used_key_cnt) / static_cast<double>(data->grp_max_key_cnt_);
         group_used_percentage + kEpsilon > threshold_used_percentage) {
         LOG_WITH_GR(DEBUG,
                     "instance group total key count used percentage [%f] "
@@ -688,13 +735,15 @@ void CacheReclaimer::ReclaimByLRU(const std::shared_ptr<RequestContext> &request
     //    b) cache locations in CLS_WRITING status *and* is orphaned
     //    are submitted to be deleted
     std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> bytes_by_type{};
+    std::uint64_t predicted_keys = 0;
     const std::int64_t begin_tp_filter = TimestampUtil::GetSteadyTimeUs();
     if (!FilterLocID(request_context.get(),
                      instance_info,
                      request.block_keys,
                      water_level_exceed,
                      request.location_ids,
-                     bytes_by_type)) {
+                     bytes_by_type,
+                     predicted_keys)) {
         LOG_WITH_ID(DEBUG, "filter location ID failed");
         return;
     }
@@ -703,7 +752,7 @@ void CacheReclaimer::ReclaimByLRU(const std::shared_ptr<RequestContext> &request
 
     // 4. submit the final deleting request to the executor
     const std::int64_t begin_tp_submit = TimestampUtil::GetSteadyTimeUs();
-    SubmitDelReq(request_context, instance_info, request, bytes_by_type);
+    SubmitDelReq(request_context, instance_info, request, bytes_by_type, predicted_keys);
     METRICS_(cache_reclaimer, reclaim_lru_submit_duration_us) =
         static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp_submit);
 
@@ -1007,8 +1056,10 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
                                  const WaterLevelExceed &water_level_exceed,
                                  std::vector<std::vector<std::string>> &out_loc_ids,
                                  std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)>
-                                     &out_bytes_by_type) const noexcept {
+                                     &out_bytes_by_type,
+                                 std::uint64_t &out_predicted_keys) const noexcept {
     out_bytes_by_type.fill(0);
+    out_predicted_keys = 0;
 
     const std::string &ins_id = instance_info->instance_id();
     const std::string &ins_gr = instance_info->instance_group_name();
@@ -1096,6 +1147,15 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
                 }
             }
         }
+        // a block is predicted to be fully reclaimed (its key_count_
+        // entry will drop) only when every location currently mapped
+        // for the block ends up in the to-delete set; if the block has
+        // any non-eligible location (e.g. CLS_WRITING that is NOT
+        // orphaned) the comparison naturally fails because
+        // loc_id_vec.size() < loc_map.size()
+        if (!loc_id_vec.empty() && loc_id_vec.size() == loc_map.size()) {
+            ++out_predicted_keys;
+        }
         out_loc_ids.emplace_back(std::move(loc_id_vec));
     }
     return true;
@@ -1105,7 +1165,8 @@ void CacheReclaimer::SubmitDelReq(
     const std::shared_ptr<RequestContext> &request_context,
     const std::shared_ptr<const InstanceInfo> &instance_info,
     const CacheLocationDelRequest &req,
-    const std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> &bytes_by_type) noexcept {
+    const std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> &bytes_by_type,
+    const std::uint64_t predicted_keys) noexcept {
     if (!IsRunning() || IsPaused()) {
         // fast exiting in the middle of one job round
         return;
@@ -1127,12 +1188,16 @@ void CacheReclaimer::SubmitDelReq(
 
     auto fut = sched_plan_executor_->Submit(req);
     delete_handlers_.emplace_front(
-        request_context, ins_id, ins_gr, blk_count, loc_count, bytes_by_type, std::move(fut));
+        request_context, ins_id, ins_gr, blk_count, loc_count, bytes_by_type, predicted_keys, std::move(fut));
 
     // record the bytes that are now in-flight; they will be subtracted
     // from observed usage by GetWaterLevelExceed() until HandleDelRes()
     // reaps the corresponding future
     AddInFlightDelBytes(ins_gr, bytes_by_type);
+    // record predicted in-flight key removals; only blocks that will
+    // become fully empty count, because key_count_ is decremented only
+    // when every location of a block is removed (see ExecuteRmwDelete)
+    AddInFlightDelKeys(ins_gr, predicted_keys);
 
     METRICS_(cache_reclaimer, block_submit_count) += blk_count;
     METRICS_(cache_reclaimer, location_submit_count) += loc_count;
@@ -1208,6 +1273,8 @@ void CacheReclaimer::HandleDelRes() noexcept {
             // accounted for at submit time and must be released here
             // to avoid permanently blocking eviction
             SubInFlightDelBytes(it->ins_gr_, it->bytes_by_type_);
+            // same reasoning for predicted in-flight keys
+            SubInFlightDelKeys(it->ins_gr_, it->keys_in_flight_);
             it = delete_handlers_.erase_after(it_pre);
         } else if (const auto fs = it->fut_.wait_for(std::chrono::seconds::zero()); fs == std::future_status::ready) {
             try {
@@ -1238,6 +1305,10 @@ void CacheReclaimer::HandleDelRes() noexcept {
             // the delete is no longer queued (failure / exception); the
             // observed usage is again authoritative
             SubInFlightDelBytes(it->ins_gr_, it->bytes_by_type_);
+            // same reasoning applies to predicted in-flight keys: the
+            // matching ``key_count_'' decrement (or non-decrement on
+            // failure) is now resolved
+            SubInFlightDelKeys(it->ins_gr_, it->keys_in_flight_);
 
             // eliminate this handler anyway, by erasing and updating
             // the iterator ``it''; ``it_pre'' remains unchanged
@@ -1359,6 +1430,7 @@ CacheReclaimer::DeleteHandler::DeleteHandler(
     const std::uint64_t blk_count,
     const std::uint64_t loc_count,
     std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> bytes_by_type,
+    const std::uint64_t keys_in_flight,
     std::future<PlanExecuteResult> fut)
     : req_ctx_(std::move(req_ctx))
     , ins_id_(std::move(ins_id))
@@ -1366,6 +1438,7 @@ CacheReclaimer::DeleteHandler::DeleteHandler(
     , blk_count_(blk_count)
     , loc_count_(loc_count)
     , bytes_by_type_(bytes_by_type)
+    , keys_in_flight_(keys_in_flight)
     , fut_(std::move(fut)) {}
 
 void CacheReclaimer::WorkerRoutine() {

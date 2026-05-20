@@ -331,6 +331,11 @@ private:
         // deletion in this handler, used to deduct the matching counters
         // in in_flight_del_bytes_by_group_ once the delete completes
         const std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> bytes_by_type_;
+        // predicted number of keys whose key_count_ entry will drop once
+        // this delete handler completes (i.e. blocks where every mapped
+        // location lands in the to-delete set); deducted from
+        // in_flight_del_keys_by_group_ when reaped by HandleDelRes()
+        const std::uint64_t keys_in_flight_;
         std::future<PlanExecuteResult> fut_;
 
         DeleteHandler(std::shared_ptr<RequestContext> req_ctx,
@@ -339,6 +344,7 @@ private:
                       std::uint64_t blk_count,
                       std::uint64_t loc_count,
                       std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> bytes_by_type,
+                      std::uint64_t keys_in_flight,
                       std::future<PlanExecuteResult> fut);
     };
     std::forward_list<DeleteHandler> delete_handlers_;
@@ -363,6 +369,19 @@ private:
         const std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> &by_type) noexcept;
     [[nodiscard]] std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)>
     GetInFlightDelBytes(const std::string &instance_group_name) const noexcept;
+
+    // tracks per-instance-group predicted key removals that have been
+    // submitted for deletion but not yet executed; mirrors
+    // in_flight_del_bytes_by_group_ but uses a single counter per group
+    // because key_count_ is per-instance, not per-storage-type
+    //
+    // same single-thread invariant: only the reclaimer_ thread reads or
+    // writes this map; if that changes, access must be made thread-safe
+    std::unordered_map<std::string, std::uint64_t> in_flight_del_keys_by_group_;
+
+    void AddInFlightDelKeys(const std::string &instance_group_name, std::uint64_t keys) noexcept;
+    void SubInFlightDelKeys(const std::string &instance_group_name, std::uint64_t keys) noexcept;
+    [[nodiscard]] std::uint64_t GetInFlightDelKeys(const std::string &instance_group_name) const noexcept;
 
     // record instance group water level exceed flags
     class WaterLevelExceed {
@@ -513,13 +532,15 @@ private:
                      const WaterLevelExceed &water_level_exceed,
                      std::vector<std::vector<std::string>> &out_loc_ids,
                      std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)>
-                         &out_bytes_by_type) const noexcept;
+                         &out_bytes_by_type,
+                     std::uint64_t &out_predicted_keys) const noexcept;
 
     void SubmitDelReq(const std::shared_ptr<RequestContext> &request_context,
                       const std::shared_ptr<const InstanceInfo> &instance_info,
                       const CacheLocationDelRequest &req,
                       const std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)>
-                          &bytes_by_type) noexcept;
+                          &bytes_by_type,
+                      std::uint64_t predicted_keys) noexcept;
 
     struct GroupUsageData;
 
@@ -543,6 +564,7 @@ private:
     KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_lru_filter_duration_us)
     KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_lru_submit_duration_us)
     KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(in_flight_del_bytes)
+    KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(in_flight_del_keys)
 };
 
 #undef KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER

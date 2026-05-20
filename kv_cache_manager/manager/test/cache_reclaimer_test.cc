@@ -1504,6 +1504,208 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming17) {
     }
 }
 
+TEST_F(CacheReclaimerTest, TestTriggerReclaimingInFlightKeys) {
+    // verify that AddInFlightDelKeys suppresses the key-count water
+    // level trigger to prevent over-eviction while a previous batch is
+    // still queued behind ``delay_before_delete_ms''
+    //
+    // setup mirrors TestTriggerReclaiming10:
+    //   instance 0 block byte size = 1024, key count = 32, max key count = 32
+    //   instance 1 block byte size = 1024, key count = 32, max key count = 32
+    //   used_percentage = 1.0, group capacity is 10G so byte threshold
+    //   does not trigger; only the key-count threshold trips
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 1024); // x2 instances
+    key_count = 32;
+    max_key_count = 32;
+
+    // use instance 0 from setup()
+
+    // construct instance 1
+    const auto ins_info = InstanceInfoFactory();
+    ins_info->set_instance_id("test_instance_id_2");
+    instance_infos.emplace_back(ins_info);
+
+    const auto ins_group = InstanceGroupFactory();
+    ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_percentage(1.0);
+    cache_reclaimer_->job_state_flag_ = true;
+
+    // 1. without any in-flight keys recorded the key-count threshold
+    //    trips
+    {
+        auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                         ins_group->name(),
+                                                         ins_group->quota(),
+                                                         ins_group->cache_config()->reclaim_strategy(),
+                                                         instance_infos);
+        ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
+        ASSERT_TRUE(wle->GetGeneralWaterLevelExceed());
+    }
+
+    // 2. recording all 64 keys as in-flight cancels the trigger via
+    //    the saturating subtraction (adjusted_grp_used_key_cnt = 0)
+    cache_reclaimer_->AddInFlightDelKeys(ins_group->name(), 64);
+    ASSERT_EQ(64u, cache_reclaimer_->GetInFlightDelKeys(ins_group->name()));
+    {
+        auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                         ins_group->name(),
+                                                         ins_group->quota(),
+                                                         ins_group->cache_config()->reclaim_strategy(),
+                                                         instance_infos);
+        ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
+        ASSERT_FALSE(wle->GetGeneralWaterLevelExceed());
+    }
+
+    // 3. saturating subtraction clamps at 0 even when the in-flight
+    //    counter exceeds the observed key count
+    cache_reclaimer_->AddInFlightDelKeys(ins_group->name(), 100);
+    ASSERT_EQ(164u, cache_reclaimer_->GetInFlightDelKeys(ins_group->name()));
+    {
+        auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                         ins_group->name(),
+                                                         ins_group->quota(),
+                                                         ins_group->cache_config()->reclaim_strategy(),
+                                                         instance_infos);
+        ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
+    }
+
+    // 4. once in-flight keys drain back to 0 the threshold trips again
+    cache_reclaimer_->SubInFlightDelKeys(ins_group->name(), 164);
+    ASSERT_EQ(0u, cache_reclaimer_->GetInFlightDelKeys(ins_group->name()));
+    {
+        auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
+                                                         ins_group->name(),
+                                                         ins_group->quota(),
+                                                         ins_group->cache_config()->reclaim_strategy(),
+                                                         instance_infos);
+        ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
+        ASSERT_TRUE(wle->GetGeneralWaterLevelExceed());
+    }
+
+    // 5. saturating subtraction on Sub also clamps at 0; overshooting
+    //    Sub does not underflow the counter
+    cache_reclaimer_->AddInFlightDelKeys(ins_group->name(), 10);
+    cache_reclaimer_->SubInFlightDelKeys(ins_group->name(), 1000);
+    ASSERT_EQ(0u, cache_reclaimer_->GetInFlightDelKeys(ins_group->name()));
+}
+
+TEST_F(CacheReclaimerTest, TestFilterLocIDPredictedKeys) {
+    // verify the ``predicted keys'' output of FilterLocID for the
+    // four canonical scenarios listed in silent-brook-bear.md:
+    //   1. block with 2 CLS_SERVING locations, both eligible -> +1
+    //   2. block with one CLS_SERVING + one non-orphaned CLS_WRITING
+    //      -> +0 (size mismatch: only the CLS_SERVING enters the
+    //      to-delete set)
+    //   3. block with no eligible locations -> +0
+    //   4. multi-block batch covering all of the above -> 1
+
+    // build a CacheLocation with a URI that carries ``size=N'' so
+    // that ``compute_loc_size'' returns a non-zero value (matches the
+    // production path used by MetaSearcher::BatchDeleteLocation)
+    auto make_loc = [](const std::string &id,
+                       CacheLocationStatus status,
+                       DataStorageType type,
+                       std::uint64_t size) {
+        std::vector<LocationSpec> specs;
+        specs.emplace_back("spec",
+                           "file://reclaimer_test/" + id + "?size=" + std::to_string(size));
+        return std::make_shared<CacheLocation>(id, status, type, /*spec_size=*/1, specs);
+    };
+
+    const auto &ins_info = instance_infos.front();
+    const CacheReclaimer::WaterLevelExceed wle{}; // no per-type exceed; collect all
+
+    // scenario 1: 2 CLS_SERVING locations on the same block
+    {
+        CacheLocationMap loc_map_full_serving;
+        loc_map_full_serving.emplace(
+            "loc_a", make_loc("loc_a", CacheLocationStatus::CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_NFS, 64));
+        loc_map_full_serving.emplace(
+            "loc_b", make_loc("loc_b", CacheLocationStatus::CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_NFS, 32));
+        batch_get_loc_out_maps = {loc_map_full_serving};
+
+        std::vector<std::vector<std::string>> out_loc_ids;
+        std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> out_bytes{};
+        std::uint64_t out_predicted = 999;
+        ASSERT_TRUE(cache_reclaimer_->FilterLocID(
+            request_context_.get(), ins_info, {0}, wle, out_loc_ids, out_bytes, out_predicted));
+        ASSERT_EQ(1u, out_loc_ids.size());
+        ASSERT_EQ(2u, out_loc_ids.at(0).size());
+        ASSERT_EQ(1u, out_predicted);
+    }
+
+    // scenario 2: CLS_SERVING + CLS_WRITING (write_location_manager_
+    // is nullptr in the test fixture, so ``HasLocationId'' is never
+    // consulted and CLS_WRITING is *not* treated as orphaned)
+    {
+        CacheLocationMap loc_map_partial;
+        loc_map_partial.emplace(
+            "loc_s", make_loc("loc_s", CacheLocationStatus::CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_NFS, 64));
+        loc_map_partial.emplace(
+            "loc_w", make_loc("loc_w", CacheLocationStatus::CLS_WRITING, DataStorageType::DATA_STORAGE_TYPE_NFS, 32));
+        batch_get_loc_out_maps = {loc_map_partial};
+
+        std::vector<std::vector<std::string>> out_loc_ids;
+        std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> out_bytes{};
+        std::uint64_t out_predicted = 999;
+        ASSERT_TRUE(cache_reclaimer_->FilterLocID(
+            request_context_.get(), ins_info, {0}, wle, out_loc_ids, out_bytes, out_predicted));
+        ASSERT_EQ(1u, out_loc_ids.size());
+        ASSERT_EQ(1u, out_loc_ids.at(0).size()); // only CLS_SERVING entered the set
+        ASSERT_EQ(0u, out_predicted);            // size mismatch -> no key drop predicted
+    }
+
+    // scenario 3: block with no eligible locations
+    {
+        CacheLocationMap loc_map_no_eligible;
+        loc_map_no_eligible.emplace(
+            "loc_w1", make_loc("loc_w1", CacheLocationStatus::CLS_WRITING, DataStorageType::DATA_STORAGE_TYPE_NFS, 64));
+        loc_map_no_eligible.emplace(
+            "loc_w2", make_loc("loc_w2", CacheLocationStatus::CLS_WRITING, DataStorageType::DATA_STORAGE_TYPE_NFS, 32));
+        batch_get_loc_out_maps = {loc_map_no_eligible};
+
+        std::vector<std::vector<std::string>> out_loc_ids;
+        std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> out_bytes{};
+        std::uint64_t out_predicted = 999;
+        ASSERT_TRUE(cache_reclaimer_->FilterLocID(
+            request_context_.get(), ins_info, {0}, wle, out_loc_ids, out_bytes, out_predicted));
+        ASSERT_EQ(1u, out_loc_ids.size());
+        ASSERT_TRUE(out_loc_ids.at(0).empty());
+        ASSERT_EQ(0u, out_predicted);
+    }
+
+    // scenario 4: multi-block batch combining (1) + (2) + (3)
+    {
+        CacheLocationMap loc_map_full_serving;
+        loc_map_full_serving.emplace(
+            "loc_a", make_loc("loc_a", CacheLocationStatus::CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_NFS, 64));
+        loc_map_full_serving.emplace(
+            "loc_b", make_loc("loc_b", CacheLocationStatus::CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_NFS, 32));
+
+        CacheLocationMap loc_map_partial;
+        loc_map_partial.emplace(
+            "loc_s", make_loc("loc_s", CacheLocationStatus::CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_NFS, 64));
+        loc_map_partial.emplace(
+            "loc_w", make_loc("loc_w", CacheLocationStatus::CLS_WRITING, DataStorageType::DATA_STORAGE_TYPE_NFS, 32));
+
+        CacheLocationMap loc_map_no_eligible;
+        loc_map_no_eligible.emplace(
+            "loc_w1", make_loc("loc_w1", CacheLocationStatus::CLS_WRITING, DataStorageType::DATA_STORAGE_TYPE_NFS, 64));
+
+        batch_get_loc_out_maps = {loc_map_full_serving, loc_map_partial, loc_map_no_eligible};
+
+        std::vector<std::vector<std::string>> out_loc_ids;
+        std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> out_bytes{};
+        std::uint64_t out_predicted = 999;
+        ASSERT_TRUE(cache_reclaimer_->FilterLocID(
+            request_context_.get(), ins_info, {0, 1, 2}, wle, out_loc_ids, out_bytes, out_predicted));
+        ASSERT_EQ(3u, out_loc_ids.size());
+        ASSERT_EQ(2u, out_loc_ids.at(0).size());
+        ASSERT_EQ(1u, out_loc_ids.at(1).size());
+        ASSERT_TRUE(out_loc_ids.at(2).empty());
+        ASSERT_EQ(1u, out_predicted); // only the fully-eligible block contributes
+    }
+}
+
 TEST_F(CacheReclaimerTest, TestInsufficientSampledKeys) {
     sample_reclaim_keys = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
     get_out_properties = {
@@ -2717,6 +2919,7 @@ TEST_F(CacheReclaimerTest, TestHandleDelRes01) {
         2,
         3,
         std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)>{},
+        static_cast<std::uint64_t>(0),
         std::move(fut));
 
     cache_reclaimer_->HandleDelRes();
@@ -2748,6 +2951,7 @@ TEST_F(CacheReclaimerTest, TestHandleDelRes02) {
             0,
             0,
             std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)>{},
+            static_cast<std::uint64_t>(0),
             std::move(fut));
     }
 
@@ -2794,6 +2998,7 @@ TEST_F(CacheReclaimerTest, TestHandleDelRes03) {
         0,
         0,
         std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)>{},
+        static_cast<std::uint64_t>(0),
         std::move(fut));
 
     try {
@@ -2820,6 +3025,7 @@ TEST_F(CacheReclaimerTest, TestHandleDelRes04) {
         0,
         0,
         std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)>{},
+        static_cast<std::uint64_t>(0),
         std::move(fut));
 
     cache_reclaimer_->HandleDelRes();
