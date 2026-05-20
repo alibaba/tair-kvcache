@@ -112,6 +112,7 @@ DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_lru_sample_duration_us);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_lru_batch_duration_us);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_lru_filter_duration_us);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_lru_submit_duration_us);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(in_flight_del_bytes);
 
 const std::string CacheReclaimer::kTraceIDPrefix{"cache_reclaimer_internal_trace_"};
 
@@ -183,6 +184,61 @@ void CacheReclaimer::GroupUsageData::AddGroupUsageByType(const DataStorageType &
         return;
     }
     grp_storage_usage_by_type_.at(idx) += value;
+}
+
+void CacheReclaimer::AddInFlightDelBytes(
+    const std::string &instance_group_name,
+    const std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> &by_type) noexcept {
+    auto [it, _] = in_flight_del_bytes_by_group_.try_emplace(
+        instance_group_name,
+        std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)>{});
+    auto &slot = it->second;
+    std::uint64_t total = 0;
+    for (std::size_t i = 0; i != slot.size(); ++i) {
+        slot[i] += by_type[i];
+        total += slot[i];
+    }
+    METRICS_(cache_reclaimer, in_flight_del_bytes) = static_cast<double>(total);
+}
+
+void CacheReclaimer::SubInFlightDelBytes(
+    const std::string &instance_group_name,
+    const std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> &by_type) noexcept {
+    const auto it = in_flight_del_bytes_by_group_.find(instance_group_name);
+    if (it == in_flight_del_bytes_by_group_.end()) {
+        return;
+    }
+    auto &slot = it->second;
+    bool all_zero = true;
+    for (std::size_t i = 0; i != slot.size(); ++i) {
+        // saturating subtraction to clamp at 0; defensive against any
+        // mismatch between submit-time and reap-time accounting
+        slot[i] = (slot[i] > by_type[i]) ? (slot[i] - by_type[i]) : 0;
+        if (slot[i] != 0) {
+            all_zero = false;
+        }
+    }
+    if (all_zero) {
+        in_flight_del_bytes_by_group_.erase(it);
+    }
+
+    // recompute the gauge as the sum across all groups
+    std::uint64_t total = 0;
+    for (const auto &[_, arr] : in_flight_del_bytes_by_group_) {
+        for (const auto v : arr) {
+            total += v;
+        }
+    }
+    METRICS_(cache_reclaimer, in_flight_del_bytes) = static_cast<double>(total);
+}
+
+std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)>
+CacheReclaimer::GetInFlightDelBytes(const std::string &instance_group_name) const noexcept {
+    const auto it = in_flight_del_bytes_by_group_.find(instance_group_name);
+    if (it == in_flight_del_bytes_by_group_.end()) {
+        return {};
+    }
+    return it->second;
 }
 
 CacheReclaimer::WaterLevelExceed::WaterLevelExceed()
@@ -330,6 +386,7 @@ ErrorCode CacheReclaimer::Start() noexcept {
     REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_lru_batch_duration_us);
     REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_lru_filter_duration_us);
     REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_lru_submit_duration_us);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(in_flight_del_bytes);
 
     {
         std::unique_lock<std::mutex> lock(job_state_mutex_);
@@ -457,6 +514,25 @@ CacheReclaimer::GetWaterLevelExceed(const RequestContext *request_context,
         return nullptr;
     }
 
+    // adjust the observed usage by the bytes already submitted for
+    // deletion but not yet executed; this prevents the cron from
+    // piling on redundant delete batches while the previous batch is
+    // still queued behind ``delay_before_delete_ms''
+    //
+    // saturating subtraction (clamp at 0) covers the brief window
+    // when ``BatchCASLocationStatus'' inside ``DoLocationDelTask''
+    // has already decremented ``StorageUsageData'' but the matching
+    // future has not yet been reaped by ``HandleDelRes()''
+    const auto in_flight = GetInFlightDelBytes(ins_gr);
+    auto saturating_sub = [](std::size_t a, std::uint64_t b) -> std::size_t {
+        return a > b ? a - static_cast<std::size_t>(b) : 0;
+    };
+    std::uint64_t in_flight_total = 0;
+    for (const auto v : in_flight) {
+        in_flight_total += v;
+    }
+    const std::size_t adjusted_grp_used_byte_sz = saturating_sub(data->grp_used_byte_sz_, in_flight_total);
+
     // 2. generate the result water level exceeding array
     const double threshold_used_percentage = reclaim_strategy->trigger_strategy().used_percentage();
 
@@ -468,6 +544,11 @@ CacheReclaimer::GetWaterLevelExceed(const RequestContext *request_context,
             continue;
         }
 
+        const std::size_t type_idx = ToIndex(ToBaseType(type));
+        const std::uint64_t in_flight_for_type = type_idx < in_flight.size() ? in_flight[type_idx] : 0;
+        const std::size_t adjusted_storage_usage =
+            saturating_sub(data->GetGroupUsageByType(type), in_flight_for_type);
+
         if (storage_quota.capacity() <= 0) {
             LOG_WITH_GR(DEBUG,
                         "instance group storage type [%d] capacity quota used percentage [inf] "
@@ -478,7 +559,7 @@ CacheReclaimer::GetWaterLevelExceed(const RequestContext *request_context,
             continue;
         }
         if (const double storage_type_wl =
-                static_cast<double>(data->GetGroupUsageByType(type)) / static_cast<double>(storage_quota.capacity());
+                static_cast<double>(adjusted_storage_usage) / static_cast<double>(storage_quota.capacity());
             storage_type_wl + kEpsilon > threshold_used_percentage) {
             LOG_WITH_GR(DEBUG,
                         "instance group storage type [%d] capacity quota used percentage [%f] "
@@ -491,7 +572,7 @@ CacheReclaimer::GetWaterLevelExceed(const RequestContext *request_context,
     }
 
     // 2.2. result for the entire instance group
-    if (data->grp_used_key_cnt_ == 0 || data->grp_used_byte_sz_ == 0) {
+    if (data->grp_used_key_cnt_ == 0 || adjusted_grp_used_byte_sz == 0) {
         water_level_exceed->SetGeneralWaterLevelExceed(false);
         return water_level_exceed;
     }
@@ -507,7 +588,7 @@ CacheReclaimer::GetWaterLevelExceed(const RequestContext *request_context,
         return water_level_exceed;
     }
     if (const double group_used_percentage =
-            static_cast<double>(data->grp_used_byte_sz_) / static_cast<double>(instance_group_quota.capacity());
+            static_cast<double>(adjusted_grp_used_byte_sz) / static_cast<double>(instance_group_quota.capacity());
         group_used_percentage + kEpsilon > threshold_used_percentage) {
         LOG_WITH_GR(DEBUG,
                     "instance group capacity quota used percentage [%f] "
@@ -606,9 +687,14 @@ void CacheReclaimer::ReclaimByLRU(const std::shared_ptr<RequestContext> &request
     //    a) cache locations in CLS_SERVING status
     //    b) cache locations in CLS_WRITING status *and* is orphaned
     //    are submitted to be deleted
+    std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> bytes_by_type{};
     const std::int64_t begin_tp_filter = TimestampUtil::GetSteadyTimeUs();
-    if (!FilterLocID(
-            request_context.get(), instance_info, request.block_keys, water_level_exceed, request.location_ids)) {
+    if (!FilterLocID(request_context.get(),
+                     instance_info,
+                     request.block_keys,
+                     water_level_exceed,
+                     request.location_ids,
+                     bytes_by_type)) {
         LOG_WITH_ID(DEBUG, "filter location ID failed");
         return;
     }
@@ -617,7 +703,7 @@ void CacheReclaimer::ReclaimByLRU(const std::shared_ptr<RequestContext> &request
 
     // 4. submit the final deleting request to the executor
     const std::int64_t begin_tp_submit = TimestampUtil::GetSteadyTimeUs();
-    SubmitDelReq(request_context, instance_info, request);
+    SubmitDelReq(request_context, instance_info, request, bytes_by_type);
     METRICS_(cache_reclaimer, reclaim_lru_submit_duration_us) =
         static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp_submit);
 
@@ -919,7 +1005,11 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
                                  const std::shared_ptr<const InstanceInfo> &instance_info,
                                  const std::vector<std::int64_t> &batch,
                                  const WaterLevelExceed &water_level_exceed,
-                                 std::vector<std::vector<std::string>> &out_loc_ids) const noexcept {
+                                 std::vector<std::vector<std::string>> &out_loc_ids,
+                                 std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)>
+                                     &out_bytes_by_type) const noexcept {
+    out_bytes_by_type.fill(0);
+
     const std::string &ins_id = instance_info->instance_id();
     const std::string &ins_gr = instance_info->instance_group_name();
 
@@ -947,6 +1037,22 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
         return false;
     }
 
+    // helper that extracts the total payload size of a CacheLocation by
+    // summing up the URI ``size'' parameter of each location_spec; this
+    // mirrors what MetaSearcher::BatchDeleteLocation does for usage
+    // accounting at delete time
+    auto compute_loc_size = [](const CacheLocation &loc) -> std::uint64_t {
+        std::uint64_t sz = 0;
+        for (const auto &loc_spec : loc.location_specs()) {
+            if (DataStorageUri ds_uri(loc_spec.uri()); ds_uri.Valid()) {
+                std::uint64_t spec_sz = 0;
+                ds_uri.GetParamAs<std::uint64_t>("size", spec_sz);
+                sz += spec_sz;
+            }
+        }
+        return sz;
+    };
+
     // inspect the cache location status of each block and get the
     // filtered location ID vecs
     out_loc_ids.reserve(loc_maps.size());
@@ -972,6 +1078,10 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
                     // TODO (rui): implement the fair eviction
                     if (water_level_exceed.GetWaterLevelExceedByType(loc.type())) {
                         loc_id_vec.emplace_back(loc.id());
+                        const std::size_t idx = ToIndex(ToBaseType(loc.type()));
+                        if (idx < out_bytes_by_type.size()) {
+                            out_bytes_by_type[idx] += compute_loc_size(loc);
+                        }
                     }
                 } else {
                     // there's no storage type water level exceeded
@@ -979,6 +1089,10 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
                     // usage water level must be exceeded; ignore the
                     // type detection
                     loc_id_vec.emplace_back(loc.id());
+                    const std::size_t idx = ToIndex(ToBaseType(loc.type()));
+                    if (idx < out_bytes_by_type.size()) {
+                        out_bytes_by_type[idx] += compute_loc_size(loc);
+                    }
                 }
             }
         }
@@ -987,9 +1101,11 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
     return true;
 }
 
-void CacheReclaimer::SubmitDelReq(const std::shared_ptr<RequestContext> &request_context,
-                                  const std::shared_ptr<const InstanceInfo> &instance_info,
-                                  const CacheLocationDelRequest &req) noexcept {
+void CacheReclaimer::SubmitDelReq(
+    const std::shared_ptr<RequestContext> &request_context,
+    const std::shared_ptr<const InstanceInfo> &instance_info,
+    const CacheLocationDelRequest &req,
+    const std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> &bytes_by_type) noexcept {
     if (!IsRunning() || IsPaused()) {
         // fast exiting in the middle of one job round
         return;
@@ -1010,7 +1126,13 @@ void CacheReclaimer::SubmitDelReq(const std::shared_ptr<RequestContext> &request
     }
 
     auto fut = sched_plan_executor_->Submit(req);
-    delete_handlers_.emplace_front(request_context, ins_id, ins_gr, blk_count, loc_count, std::move(fut));
+    delete_handlers_.emplace_front(
+        request_context, ins_id, ins_gr, blk_count, loc_count, bytes_by_type, std::move(fut));
+
+    // record the bytes that are now in-flight; they will be subtracted
+    // from observed usage by GetWaterLevelExceed() until HandleDelRes()
+    // reaps the corresponding future
+    AddInFlightDelBytes(ins_gr, bytes_by_type);
 
     METRICS_(cache_reclaimer, block_submit_count) += blk_count;
     METRICS_(cache_reclaimer, location_submit_count) += loc_count;
@@ -1082,6 +1204,10 @@ void CacheReclaimer::HandleDelRes() noexcept {
 
         if (!it->fut_.valid()) {
             LOG_WITH_ID(WARN, "reclaim request got invalid future");
+            // even though the future is invalid, the bytes were
+            // accounted for at submit time and must be released here
+            // to avoid permanently blocking eviction
+            SubInFlightDelBytes(it->ins_gr_, it->bytes_by_type_);
             it = delete_handlers_.erase_after(it_pre);
         } else if (const auto fs = it->fut_.wait_for(std::chrono::seconds::zero()); fs == std::future_status::ready) {
             try {
@@ -1105,6 +1231,13 @@ void CacheReclaimer::HandleDelRes() noexcept {
             } catch (...) {
                 // make sure no exception can possibly escape
             }
+
+            // release the in-flight delete bytes regardless of success
+            // or failure: by this point the underlying ``StorageUsageData''
+            // counter has either already been decremented (success) or
+            // the delete is no longer queued (failure / exception); the
+            // observed usage is again authoritative
+            SubInFlightDelBytes(it->ins_gr_, it->bytes_by_type_);
 
             // eliminate this handler anyway, by erasing and updating
             // the iterator ``it''; ``it_pre'' remains unchanged
@@ -1219,17 +1352,20 @@ bool CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &re
     return true;
 }
 
-CacheReclaimer::DeleteHandler::DeleteHandler(std::shared_ptr<RequestContext> req_ctx,
-                                             std::string ins_id,
-                                             std::string ins_gr,
-                                             const std::uint64_t blk_count,
-                                             const std::uint64_t loc_count,
-                                             std::future<PlanExecuteResult> fut)
+CacheReclaimer::DeleteHandler::DeleteHandler(
+    std::shared_ptr<RequestContext> req_ctx,
+    std::string ins_id,
+    std::string ins_gr,
+    const std::uint64_t blk_count,
+    const std::uint64_t loc_count,
+    std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> bytes_by_type,
+    std::future<PlanExecuteResult> fut)
     : req_ctx_(std::move(req_ctx))
     , ins_id_(std::move(ins_id))
     , ins_gr_(std::move(ins_gr))
     , blk_count_(blk_count)
     , loc_count_(loc_count)
+    , bytes_by_type_(bytes_by_type)
     , fut_(std::move(fut)) {}
 
 void CacheReclaimer::WorkerRoutine() {

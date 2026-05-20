@@ -14,6 +14,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
@@ -326,6 +327,10 @@ private:
         const std::string ins_gr_;
         const std::uint64_t blk_count_;
         const std::uint64_t loc_count_;
+        // per-storage-type byte sums of the cache locations submitted for
+        // deletion in this handler, used to deduct the matching counters
+        // in in_flight_del_bytes_by_group_ once the delete completes
+        const std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> bytes_by_type_;
         std::future<PlanExecuteResult> fut_;
 
         DeleteHandler(std::shared_ptr<RequestContext> req_ctx,
@@ -333,9 +338,31 @@ private:
                       std::string ins_gr,
                       std::uint64_t blk_count,
                       std::uint64_t loc_count,
+                      std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> bytes_by_type,
                       std::future<PlanExecuteResult> fut);
     };
     std::forward_list<DeleteHandler> delete_handlers_;
+
+    // tracks per-instance-group + per-storage-type bytes that have been
+    // submitted for deletion but not yet executed (i.e. still queued
+    // behind ``delay_before_delete_ms'' inside the SchedulePlanExecutor)
+    //
+    // these counters are only ever read or written from the reclaimer_
+    // thread (ReclaimCron and HandleDelRes both run there), so no mutex
+    // is required; if this invariant changes, the access must be made
+    // thread-safe
+    std::unordered_map<std::string,
+                       std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)>>
+        in_flight_del_bytes_by_group_;
+
+    void AddInFlightDelBytes(
+        const std::string &instance_group_name,
+        const std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> &by_type) noexcept;
+    void SubInFlightDelBytes(
+        const std::string &instance_group_name,
+        const std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> &by_type) noexcept;
+    [[nodiscard]] std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)>
+    GetInFlightDelBytes(const std::string &instance_group_name) const noexcept;
 
     // record instance group water level exceed flags
     class WaterLevelExceed {
@@ -484,11 +511,15 @@ private:
                      const std::shared_ptr<const InstanceInfo> &instance_info,
                      const std::vector<std::int64_t> &batch,
                      const WaterLevelExceed &water_level_exceed,
-                     std::vector<std::vector<std::string>> &out_loc_ids) const noexcept;
+                     std::vector<std::vector<std::string>> &out_loc_ids,
+                     std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)>
+                         &out_bytes_by_type) const noexcept;
 
     void SubmitDelReq(const std::shared_ptr<RequestContext> &request_context,
                       const std::shared_ptr<const InstanceInfo> &instance_info,
-                      const CacheLocationDelRequest &req) noexcept;
+                      const CacheLocationDelRequest &req,
+                      const std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)>
+                          &bytes_by_type) noexcept;
 
     struct GroupUsageData;
 
@@ -511,6 +542,7 @@ private:
     KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_lru_batch_duration_us)
     KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_lru_filter_duration_us)
     KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_lru_submit_duration_us)
+    KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(in_flight_del_bytes)
 };
 
 #undef KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER

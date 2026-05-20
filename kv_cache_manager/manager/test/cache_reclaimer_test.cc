@@ -2711,7 +2711,13 @@ TEST_F(CacheReclaimerTest, TestHandleDelRes01) {
 
     cache_reclaimer_->delete_handlers_.clear();
     cache_reclaimer_->delete_handlers_.emplace_front(
-        request_context_, "test_instance", "test_instance_group", 2, 3, std::move(fut));
+        request_context_,
+        "test_instance",
+        "test_instance_group",
+        2,
+        3,
+        std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)>{},
+        std::move(fut));
 
     cache_reclaimer_->HandleDelRes();
     ASSERT_FALSE(cache_reclaimer_->delete_handlers_.empty());
@@ -2735,12 +2741,14 @@ TEST_F(CacheReclaimerTest, TestHandleDelRes02) {
         promises.emplace_back(promise);
 
         auto fut = promise->get_future();
-        cache_reclaimer_->delete_handlers_.emplace_front(request_context_,
-                                                         "test_instance" + std::to_string(i),
-                                                         "test_instance_group" + std::to_string(i),
-                                                         0,
-                                                         0,
-                                                         std::move(fut));
+        cache_reclaimer_->delete_handlers_.emplace_front(
+            request_context_,
+            "test_instance" + std::to_string(i),
+            "test_instance_group" + std::to_string(i),
+            0,
+            0,
+            std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)>{},
+            std::move(fut));
     }
 
     cache_reclaimer_->HandleDelRes();
@@ -2780,7 +2788,13 @@ TEST_F(CacheReclaimerTest, TestHandleDelRes03) {
 
     cache_reclaimer_->delete_handlers_.clear();
     cache_reclaimer_->delete_handlers_.emplace_front(
-        request_context_, "test_instance", "test_instance_group", 0, 0, std::move(fut));
+        request_context_,
+        "test_instance",
+        "test_instance_group",
+        0,
+        0,
+        std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)>{},
+        std::move(fut));
 
     try {
         throw std::runtime_error("test exception");
@@ -2800,7 +2814,13 @@ TEST_F(CacheReclaimerTest, TestHandleDelRes04) {
 
     cache_reclaimer_->delete_handlers_.clear();
     cache_reclaimer_->delete_handlers_.emplace_front(
-        request_context_, "test_instance", "test_instance_group", 0, 0, std::move(fut));
+        request_context_,
+        "test_instance",
+        "test_instance_group",
+        0,
+        0,
+        std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)>{},
+        std::move(fut));
 
     cache_reclaimer_->HandleDelRes();
     ASSERT_TRUE(cache_reclaimer_->delete_handlers_.empty());
