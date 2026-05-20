@@ -7,11 +7,14 @@
 #include <unordered_set>
 
 #include "kv_cache_manager/common/logger.h"
+#include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/string_util.h"
+#include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/utils.h"
+#include "kv_cache_manager/metrics/metrics_collector.h"
 
 namespace kv_cache_manager {
 
@@ -287,18 +290,22 @@ int MetaAsyncRedisBackend::GetQueueIndexForKey(KeyType key) const noexcept {
 
 // ==================== Write Operations (async enqueue) ====================
 
-bool MetaAsyncRedisBackend::WaitForQueueCapacity(int queue_id) {
+bool MetaAsyncRedisBackend::WaitForQueueCapacity(int queue_id, int64_t &out_wait_time_us) {
+    out_wait_time_us = 0;
     if (queues_[queue_id]->GetKeySize() < queue_max_size_) {
         return true;
     }
+    const int64_t begin_us = TimestampUtil::GetSteadyTimeUs();
     int64_t waited_us = 0;
     while (waited_us < enqueue_timeout_ms_ * 1000) {
         std::this_thread::sleep_for(std::chrono::microseconds(enqueue_retry_interval_us_));
         waited_us += enqueue_retry_interval_us_;
         if (queues_[queue_id]->GetKeySize() < queue_max_size_) {
+            out_wait_time_us = TimestampUtil::GetSteadyTimeUs() - begin_us;
             return true;
         }
     }
+    out_wait_time_us = TimestampUtil::GetSteadyTimeUs() - begin_us;
     KVCM_INTERVAL_LOG_WARN(10,
                            "async redis enqueue timeout, queue[%d] key_size[%ld], instance[%s]",
                            queue_id,
@@ -307,17 +314,20 @@ bool MetaAsyncRedisBackend::WaitForQueueCapacity(int queue_id) {
     return false;
 }
 
-std::vector<ErrorCode> MetaAsyncRedisBackend::EnqueueWriteOp(WriteOp op) {
+std::vector<ErrorCode> MetaAsyncRedisBackend::EnqueueWriteOp(RequestContext *request_context, WriteOp op) {
     if (op.keys.empty()) {
         return {};
     }
+    const int64_t enqueue_begin_us = TimestampUtil::GetSteadyTimeUs();
 
     std::unordered_map<int, std::vector<size_t>> queue_to_indices;
     for (size_t i = 0; i < op.keys.size(); ++i) {
         queue_to_indices[GetQueueIndexForKey(op.keys[i])].push_back(i);
     }
 
-    std::vector<ErrorCode> results(op.keys.size(), EC_OK);
+    EnqueueStats stats;
+    std::vector<ErrorCode> error_codes(op.keys.size(), EC_OK);
+    int64_t total_wait_time_us = 0;
     for (auto &[qi, indices] : queue_to_indices) {
         WriteOp sub_op;
         sub_op.type = op.type;
@@ -338,18 +348,35 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::EnqueueWriteOp(WriteOp op) {
             }
         }
 
-        if (!WaitForQueueCapacity(qi)) {
+        int64_t wait_time_us = 0;
+        if (!WaitForQueueCapacity(qi, wait_time_us)) {
+            total_wait_time_us += wait_time_us;
+            stats.enqueue_timeout_count += static_cast<int64_t>(indices.size());
             for (size_t idx : indices) {
-                results[idx] = EC_TIMEOUT;
+                error_codes[idx] = EC_TIMEOUT;
             }
             continue;
         }
+        total_wait_time_us += wait_time_us;
         queues_[qi]->Push(QueueItem{std::move(sub_op)});
     }
-    return results;
+
+    stats.wait_for_queue_time_us = total_wait_time_us;
+    stats.enqueue_time_us = TimestampUtil::GetSteadyTimeUs() - enqueue_begin_us;
+
+    if (request_context) {
+        auto *mc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+        if (mc) {
+            KVCM_METRICS_COLLECTOR_SET_METRICS(mc, meta_indexer, async_enqueue_timeout_count, stats.enqueue_timeout_count);
+            KVCM_METRICS_COLLECTOR_SET_METRICS(mc, meta_indexer, async_enqueue_time_us, stats.enqueue_time_us);
+            KVCM_METRICS_COLLECTOR_SET_METRICS(mc, meta_indexer, async_wait_for_queue_time_us, stats.wait_for_queue_time_us);
+        }
+    }
+
+    return error_codes;
 }
 
-std::vector<ErrorCode> MetaAsyncRedisBackend::Put(RequestContext * /*request_context*/,
+std::vector<ErrorCode> MetaAsyncRedisBackend::Put(RequestContext *request_context,
                                                   const KeyTypeVec &keys,
                                                   const CacheLocationMapVector &locations,
                                                   const PropertyMapVector &properties) noexcept {
@@ -360,10 +387,10 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::Put(RequestContext * /*request_con
     for (size_t i = 0; i < keys.size(); ++i) {
         op.field_maps[i] = SerializeToFieldMap(locations[i], properties[i]);
     }
-    return EnqueueWriteOp(std::move(op));
+    return EnqueueWriteOp(request_context, std::move(op));
 }
 
-std::vector<ErrorCode> MetaAsyncRedisBackend::Upsert(RequestContext * /*request_context*/,
+std::vector<ErrorCode> MetaAsyncRedisBackend::Upsert(RequestContext *request_context,
                                                      const KeyTypeVec &keys,
                                                      const CacheLocationMapVector &locations,
                                                      const PropertyMapVector &properties) noexcept {
@@ -374,18 +401,18 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::Upsert(RequestContext * /*request_
     for (size_t i = 0; i < keys.size(); ++i) {
         op.field_maps[i] = SerializeToFieldMap(locations[i], properties[i]);
     }
-    return EnqueueWriteOp(std::move(op));
+    return EnqueueWriteOp(request_context, std::move(op));
 }
 
-std::vector<ErrorCode> MetaAsyncRedisBackend::Delete(RequestContext * /*request_context*/,
+std::vector<ErrorCode> MetaAsyncRedisBackend::Delete(RequestContext *request_context,
                                                      const KeyTypeVec &keys) noexcept {
     WriteOp op;
     op.type = WriteOpType::kDelete;
     op.keys = keys;
-    return EnqueueWriteOp(std::move(op));
+    return EnqueueWriteOp(request_context, std::move(op));
 }
 
-std::vector<ErrorCode> MetaAsyncRedisBackend::DeleteLocations(RequestContext * /*request_context*/,
+std::vector<ErrorCode> MetaAsyncRedisBackend::DeleteLocations(RequestContext *request_context,
                                                               const KeyTypeVec &keys,
                                                               const LocationIdsPerKey &location_ids) noexcept {
     std::vector<std::vector<std::string>> field_names_vec(keys.size());
@@ -400,7 +427,7 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::DeleteLocations(RequestContext * /
     op.type = WriteOpType::kDeleteLocations;
     op.keys = keys;
     op.field_names_vec = std::move(field_names_vec);
-    return EnqueueWriteOp(std::move(op));
+    return EnqueueWriteOp(request_context, std::move(op));
 }
 
 // ==================== Read Operations (sync passthrough) ====================
@@ -707,13 +734,27 @@ bool MetaAsyncRedisBackend::Sync(const KeyTypeVec &keys) noexcept {
 
 // ==================== Metrics ====================
 
-std::vector<int64_t> MetaAsyncRedisBackend::GetAsyncQueueSizes() const noexcept {
-    std::vector<int64_t> sizes;
-    sizes.reserve(queues_.size());
+MetaStorageBackend::AsyncWriteStats MetaAsyncRedisBackend::GetAsyncWriteStats() noexcept {
+    AsyncWriteStats stats;
+
+    // Compute live queue sizes
+    int64_t max_size = 0;
+    int64_t sum_size = 0;
     for (const auto &q : queues_) {
-        sizes.push_back(q ? q->GetKeySize() : 0);
+        int64_t s = q ? q->GetKeySize() : 0;
+        sum_size += s;
+        if (s > max_size) {
+            max_size = s;
+        }
     }
-    return sizes;
+    stats.max_async_queue_size = max_size;
+    stats.avg_async_queue_size = queues_.empty() ? 0 : sum_size / static_cast<int64_t>(queues_.size());
+
+    // CAS reset: read and reset accumulated counters
+    stats.flush_key_count = stats_flush_key_count_.exchange(0, std::memory_order_relaxed);
+    stats.batch_flush_time_us = stats_batch_flush_time_us_.exchange(0, std::memory_order_relaxed);
+    stats.pipeline_error_count = stats_pipeline_error_count_.exchange(0, std::memory_order_relaxed);
+    return stats;
 }
 
 // ==================== Consumer Thread ====================
@@ -754,6 +795,7 @@ void MetaAsyncRedisBackend::CompileWriteOp(const WriteOp &op, std::vector<CmdArg
 }
 
 void MetaAsyncRedisBackend::BatchFlush(int queue_id, std::vector<QueueItem> &items, int64_t total_keys) {
+    const int64_t flush_begin_us = TimestampUtil::GetSteadyTimeUs();
     RedisClient *client = consumer_clients_[queue_id].get();
 
     std::vector<CmdArgs> all_cmds;
@@ -793,13 +835,18 @@ void MetaAsyncRedisBackend::BatchFlush(int queue_id, std::vector<QueueItem> &ite
                        all_cmds.size(),
                        replies.size(),
                        instance_id_.c_str());
+        stats_pipeline_error_count_.fetch_add(1, std::memory_order_relaxed);
         for (auto &b : barriers) {
             if (b.ctx) {
                 b.ctx->SetFailed();
             }
         }
+        stats_batch_flush_time_us_.fetch_add(TimestampUtil::GetSteadyTimeUs() - flush_begin_us,
+                                             std::memory_order_relaxed);
         return;
     }
+
+    stats_flush_key_count_.fetch_add(total_keys, std::memory_order_relaxed);
 
     for (auto &b : barriers) {
         if (!b.ctx) {
@@ -818,6 +865,9 @@ void MetaAsyncRedisBackend::BatchFlush(int queue_id, std::vector<QueueItem> &ite
             b.ctx->SetFailed();
         }
     }
+
+    stats_batch_flush_time_us_.fetch_add(TimestampUtil::GetSteadyTimeUs() - flush_begin_us,
+                                         std::memory_order_relaxed);
 }
 
 void MetaAsyncRedisBackend::DrainQueue(int queue_id) {

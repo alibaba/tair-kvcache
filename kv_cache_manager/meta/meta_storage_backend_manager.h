@@ -91,8 +91,8 @@ public:
     // Returns true on success, false on failure/timeout.
     bool Sync(const KeyVector &keys) noexcept;
 
-    // Returns per-queue pending key sizes from persistent backend.
-    std::vector<int64_t> GetAsyncQueueSizes() const noexcept;
+    // Returns async write stats from persistent backend.
+    MetaStorageBackend::AsyncWriteStats GetAsyncWriteStats() noexcept;
 
     size_t GetMemUsage() const noexcept;
     int64_t GetOldestAccessTime() const noexcept;

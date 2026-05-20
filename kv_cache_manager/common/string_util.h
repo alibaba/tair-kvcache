@@ -51,9 +51,8 @@ public:
         return false;
     }
     static std::string GenerateRandomString(size_t length) {
-        const std::string charset = "abcdefghijklmnopqrstuvwxyz0123456789";
-        std::random_device rd;
-        std::mt19937 generator(rd());
+        static const std::string charset = "abcdefghijklmnopqrstuvwxyz0123456789";
+        static thread_local std::mt19937 generator(std::random_device{}());
         std::uniform_int_distribution<> distribution(0, charset.size() - 1);
         std::string result;
         result.reserve(length);

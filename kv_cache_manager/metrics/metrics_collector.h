@@ -242,16 +242,6 @@ public:                                                                         
     }
 #endif
 
-#ifndef KVCM_SUMMARY_METRICS
-#define KVCM_SUMMARY_METRICS(group, name)                                                                              \
-public:                                                                                                                \
-    DECLARE_METRICS_NAME_(group, name);                                                                                \
-    DEFINE_SET_METRICS_SUMMARY_(group, name)                                                                           \
-    DEFINE_GET_METRICS_SUMMARY_(group, name)                                                                           \
-                                                                                                                       \
-private:                                                                                                               \
-    DECLARE_METRICS_SUMMARY_(group, name);
-#endif
 
 /* ------------------- ServiceMetricsCollector ---------------------- */
 
@@ -312,6 +302,9 @@ class ServiceMetricsCollector final : public MetricsCollector {
     KVCM_GAUGE_METRICS(meta_indexer, read_modify_write_update_key_count)
     KVCM_GAUGE_METRICS(meta_indexer, read_modify_write_skip_key_count)
     KVCM_GAUGE_METRICS(meta_indexer, read_modify_write_delete_key_count)
+    KVCM_GAUGE_METRICS(meta_indexer, async_enqueue_timeout_count)
+    KVCM_GAUGE_METRICS(meta_indexer, async_enqueue_time_us)
+    KVCM_GAUGE_METRICS(meta_indexer, async_wait_for_queue_time_us)
 
 public:
     ServiceMetricsCollector() = delete;
@@ -424,8 +417,15 @@ public:
 class CacheManagerInstanceMetricsCollector final : public MetricsCollector {
     KVCM_GAUGE_METRICS(cache_manager_instance, key_count)
     KVCM_GAUGE_METRICS(cache_manager_instance, byte_size)
+<<<<<<< HEAD
     KVCM_GAUGE_METRICS(cache_manager_instance, max_lru_age_us)
-    KVCM_SUMMARY_METRICS(cache_manager_instance, async_queue_sizes)
+=======
+    KVCM_GAUGE_METRICS(cache_manager_instance, async_queue_max_size)
+    KVCM_GAUGE_METRICS(cache_manager_instance, async_queue_avg_size)
+    KVCM_GAUGE_METRICS(cache_manager_instance, async_flush_key_count)
+    KVCM_GAUGE_METRICS(cache_manager_instance, async_batch_flush_time_us)
+    KVCM_GAUGE_METRICS(cache_manager_instance, async_pipeline_error_count)
+>>>>>>> [meta] add async metrics in indexer
 
 public:
     CacheManagerInstanceMetricsCollector() = delete;
@@ -439,6 +439,5 @@ public:
 
 #undef KVCM_CHRONO_METRICS
 #undef KVCM_GAUGE_METRICS
-#undef KVCM_SUMMARY_METRICS
 
 } // namespace kv_cache_manager

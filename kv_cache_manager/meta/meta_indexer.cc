@@ -734,7 +734,9 @@ size_t MetaIndexer::GetMemUsage() const noexcept { return backend_manager_->GetM
 
 bool MetaIndexer::Sync(const KeyVector &keys) noexcept { return backend_manager_->Sync(keys); }
 
-std::vector<int64_t> MetaIndexer::GetAsyncQueueSizes() const noexcept { return backend_manager_->GetAsyncQueueSizes(); }
+MetaStorageBackend::AsyncWriteStats MetaIndexer::GetAsyncWriteStats() noexcept {
+    return backend_manager_->GetAsyncWriteStats();
+}
 
 int64_t MetaIndexer::GetOldestAccessTime() const noexcept { return backend_manager_->GetOldestAccessTime(); }
 

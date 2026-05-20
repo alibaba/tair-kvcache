@@ -707,11 +707,11 @@ bool MetaStorageBackendManager::Sync(const KeyVector &keys) noexcept {
     return persistent_backend_->Sync(keys);
 }
 
-std::vector<int64_t> MetaStorageBackendManager::GetAsyncQueueSizes() const noexcept {
+MetaStorageBackend::AsyncWriteStats MetaStorageBackendManager::GetAsyncWriteStats() noexcept {
     if (!persistent_backend_) {
         return {};
     }
-    return persistent_backend_->GetAsyncQueueSizes();
+    return persistent_backend_->GetAsyncWriteStats();
 }
 
 size_t MetaStorageBackendManager::GetMemUsage() const noexcept {

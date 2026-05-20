@@ -102,6 +102,9 @@ DEFINE_METRICS_NAME_FOR_META_INDEXER(read_modify_write_put_key_count);
 DEFINE_METRICS_NAME_FOR_META_INDEXER(read_modify_write_update_key_count);
 DEFINE_METRICS_NAME_FOR_META_INDEXER(read_modify_write_skip_key_count);
 DEFINE_METRICS_NAME_FOR_META_INDEXER(read_modify_write_delete_key_count);
+DEFINE_METRICS_NAME_FOR_META_INDEXER(async_enqueue_timeout_count);
+DEFINE_METRICS_NAME_FOR_META_INDEXER(async_enqueue_time_us);
+DEFINE_METRICS_NAME_FOR_META_INDEXER(async_wait_for_queue_time_us);
 
 ServiceMetricsCollector::ServiceMetricsCollector(std::shared_ptr<MetricsRegistry> metrics_registry) noexcept
     : MetricsCollector(std::move(metrics_registry)) {}
@@ -162,6 +165,9 @@ bool ServiceMetricsCollector::Init() {
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER(read_modify_write_update_key_count);
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER(read_modify_write_skip_key_count);
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER(read_modify_write_delete_key_count);
+    REGISTER_GAUGE_METRICS_FOR_META_INDEXER(async_enqueue_timeout_count);
+    REGISTER_GAUGE_METRICS_FOR_META_INDEXER(async_enqueue_time_us);
+    REGISTER_GAUGE_METRICS_FOR_META_INDEXER(async_wait_for_queue_time_us);
 
     return true;
 }
@@ -302,7 +308,11 @@ bool CacheManagerGroupMetricsCollector::Init() {
 
 DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector, cache_manager_instance, key_count);
 DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector, cache_manager_instance, byte_size);
-DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector, cache_manager_instance, async_queue_sizes);
+DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector, cache_manager_instance, async_queue_max_size);
+DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector, cache_manager_instance, async_queue_avg_size);
+DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector, cache_manager_instance, async_flush_key_count);
+DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector, cache_manager_instance, async_batch_flush_time_us);
+DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector, cache_manager_instance, async_pipeline_error_count);
 DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector, cache_manager_instance, max_lru_age_us);
 
 CacheManagerInstanceMetricsCollector::CacheManagerInstanceMetricsCollector(
@@ -321,6 +331,11 @@ bool CacheManagerInstanceMetricsCollector::Init() {
     REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, key_count);
     REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, byte_size);
     REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, max_lru_age_us);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, async_queue_max_size);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, async_queue_avg_size);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, async_flush_key_count);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, async_batch_flush_time_us);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, async_pipeline_error_count);
 
     return true;
 }
