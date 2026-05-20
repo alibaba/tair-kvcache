@@ -1,11 +1,13 @@
 #pragma once
 
 #include <atomic>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <random>
 #include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "kv_cache_manager/common/cache/advanced_cache.h"
@@ -164,14 +166,23 @@ public:
     int64_t GetOldestAccessTime() const noexcept override;
 
 private:
+    static std::string_view KeyToView(const KeyType &key) {
+        return {reinterpret_cast<const char *>(&key), sizeof(KeyType)};
+    }
+    static KeyType ViewToKey(std::string_view sv) {
+        KeyType key = 0;
+        std::memcpy(&key, sv.data(), sizeof(KeyType));
+        return key;
+    }
+
     size_t CollectOldestKeysFromShard(uint32_t shard_id, size_t count, std::vector<KeyType> &out_keys);
     ErrorCode
-    CreateAndInsert(const std::string &key_str, const CacheLocationMap &locations, const PropertyMap &properties);
-    ErrorCode CreateAndInsertIfAbsent(const std::string &key_str,
+    CreateAndInsert(std::string_view key_sv, const CacheLocationMap &locations, const PropertyMap &properties);
+    ErrorCode CreateAndInsertIfAbsent(std::string_view key_sv,
                                       const CacheLocationMap &locations,
                                       const PropertyMap &properties);
     ErrorCode
-    UpdateInPlace(const std::string &key_str, const CacheLocationMap &locations, const PropertyMap &properties);
+    UpdateInPlace(std::string_view key_sv, const CacheLocationMap &locations, const PropertyMap &properties);
     ErrorCode UpsertForOneKey(KeyType key, const CacheLocationMap &locations, const PropertyMap &properties);
     ErrorCode DeleteForOneKey(KeyType key);
     ErrorCode DeleteLocationsForOneKey(KeyType key, const std::vector<LocationId> &location_ids);

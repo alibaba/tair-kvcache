@@ -475,17 +475,20 @@ TEST_F(MetaAsyncRedisBackendTest, TestPutAndGetMetaData) {
 
 // ==================== Metrics Tests ====================
 
-TEST_F(MetaAsyncRedisBackendTest, TestGetAsyncQueueSizes) {
+TEST_F(MetaAsyncRedisBackendTest, TestGetAsyncWriteStatsQueueSizes) {
     ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
-    EXPECT_TRUE(backend_->GetAsyncQueueSizes().empty());
+    {
+        auto stats = backend_->GetAsyncWriteStats();
+        EXPECT_EQ(0, stats.max_async_queue_size);
+        EXPECT_EQ(0, stats.avg_async_queue_size);
+    }
 
     SetupMockRedisClients();
     ASSERT_EQ(EC_OK, backend_->Open());
     {
-        auto sizes = backend_->GetAsyncQueueSizes();
-        ASSERT_EQ(2, sizes.size());
-        EXPECT_EQ(0, sizes[0]);
-        EXPECT_EQ(0, sizes[1]);
+        auto stats = backend_->GetAsyncWriteStats();
+        EXPECT_EQ(0, stats.max_async_queue_size);
+        EXPECT_EQ(0, stats.avg_async_queue_size);
     }
 
     ASSERT_EQ(EC_OK, backend_->Close());
@@ -531,10 +534,133 @@ TEST_F(MetaAsyncRedisBackendTest, TestGetAsyncQueueSizes) {
     backend_->Put(nullptr, keys, locations, properties);
 
     {
-        auto sizes = backend_->GetAsyncQueueSizes();
-        ASSERT_EQ(2, sizes.size());
-        EXPECT_GT(sizes[0] + sizes[1], 0);
+        auto stats = backend_->GetAsyncWriteStats();
+        EXPECT_GT(stats.max_async_queue_size + stats.avg_async_queue_size, 0);
     }
+
+    ASSERT_EQ(EC_OK, backend_->Close());
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestGetAsyncWriteStats) {
+    ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
+    {
+        auto stats = backend_->GetAsyncWriteStats();
+        EXPECT_EQ(0, stats.flush_key_count);
+        EXPECT_EQ(0, stats.batch_flush_time_us);
+        EXPECT_EQ(0, stats.pipeline_error_count);
+    }
+
+    SetupMockRedisClients();
+    ASSERT_EQ(EC_OK, backend_->Open());
+
+    // Put some keys and wait for flush
+    KeyTypeVec keys = {1, 2, 3};
+    CacheLocationMapVector locations(3);
+    PropertyMapVector properties = {{{"f", "v"}}, {{"f", "v"}}, {{"f", "v"}}};
+    auto results = backend_->Put(nullptr, keys, locations, properties);
+    for (auto ec : results) {
+        EXPECT_EQ(EC_OK, ec);
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    {
+        auto stats = backend_->GetAsyncWriteStats();
+        EXPECT_GT(stats.flush_key_count, 0);
+        EXPECT_GT(stats.batch_flush_time_us, 0);
+        EXPECT_EQ(0, stats.pipeline_error_count);
+    }
+
+    // CAS reset: second read should return zeros for accumulated counters
+    {
+        auto stats = backend_->GetAsyncWriteStats();
+        EXPECT_EQ(0, stats.flush_key_count);
+        EXPECT_EQ(0, stats.batch_flush_time_us);
+        EXPECT_EQ(0, stats.pipeline_error_count);
+    }
+
+    ASSERT_EQ(EC_OK, backend_->Close());
+
+    // Test enqueue timeout: tiny queue capacity
+    config_->SetStorageUri("redis://user:pass@host:6379/?async_queue_count=1&async_max_batch=1"
+                           "&async_wait_us=500000&async_max_size=1&async_enqueue_timeout_ms=1");
+    ConstructBackend();
+    EXPECT_CALL(*backend_, CreateRedisClient()).WillRepeatedly(Invoke([]() {
+        StandardUri empty_uri;
+        auto mock = std::make_shared<::testing::NiceMock<MockRedisClient>>(empty_uri);
+        ON_CALL(*mock, IsContextOk()).WillByDefault(Return(true));
+        ON_CALL(*mock, Reconnect()).WillByDefault(Return(true));
+        ON_CALL(*mock, TryExecPipeline(_)).WillByDefault(Invoke([](const std::vector<CmdArgs> &cmds) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            std::vector<RedisClient::ReplyUPtr> replies;
+            for (size_t i = 0; i < cmds.size(); ++i) {
+                redisReply *r = (redisReply *)malloc(sizeof(redisReply));
+                memset(r, 0, sizeof(redisReply));
+                r->type = REDIS_REPLY_INTEGER;
+                r->integer = 1;
+                replies.emplace_back(r, freeReplyObject);
+            }
+            return replies;
+        }));
+        return mock;
+    }));
+    ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
+    ASSERT_EQ(EC_OK, backend_->Open());
+
+    // First put fills the queue, subsequent puts should timeout
+    CacheLocationMapVector locs1(1);
+    PropertyMapVector props1 = {{{"f", "v"}}};
+    backend_->Put(nullptr, {100}, locs1, props1);
+
+    // Give consumer time to pick up but it sleeps 500ms in pipeline
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    // Now queue should be blocked, more puts will timeout
+    KeyTypeVec timeout_keys;
+    CacheLocationMapVector timeout_locs;
+    PropertyMapVector timeout_props;
+    for (int i = 200; i < 210; ++i) {
+        timeout_keys.push_back(i);
+        timeout_locs.push_back({});
+        timeout_props.push_back({{"f", "v"}});
+    }
+    auto timeout_results = backend_->Put(nullptr, timeout_keys, timeout_locs, timeout_props);
+    for (auto ec : timeout_results) {
+        EXPECT_TRUE(ec == EC_OK || ec == EC_TIMEOUT);
+    }
+
+    ASSERT_EQ(EC_OK, backend_->Close());
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestGetAsyncWriteStatsPipelineError) {
+    // Setup a backend with pipeline that always fails
+    config_->SetStorageUri("redis://user:pass@host:6379/?async_queue_count=1&async_max_batch=64&async_wait_us=1000"
+                           "&async_max_size=1000");
+    ConstructBackend();
+    EXPECT_CALL(*backend_, CreateRedisClient()).WillRepeatedly(Invoke([]() {
+        StandardUri empty_uri;
+        auto mock = std::make_shared<::testing::NiceMock<MockRedisClient>>(empty_uri);
+        ON_CALL(*mock, IsContextOk()).WillByDefault(Return(true));
+        ON_CALL(*mock, Reconnect()).WillByDefault(Return(true));
+        ON_CALL(*mock, TryExecPipeline(_)).WillByDefault(Invoke([](const std::vector<CmdArgs> &) {
+            return std::vector<RedisClient::ReplyUPtr>{};
+        }));
+        return mock;
+    }));
+    ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
+    ASSERT_EQ(EC_OK, backend_->Open());
+
+    KeyTypeVec keys = {1, 2, 3};
+    CacheLocationMapVector locations(3);
+    PropertyMapVector properties = {{{"f", "v"}}, {{"f", "v"}}, {{"f", "v"}}};
+    backend_->Put(nullptr, keys, locations, properties);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    auto stats = backend_->GetAsyncWriteStats();
+    EXPECT_GT(stats.pipeline_error_count, 0);
+    EXPECT_EQ(0, stats.flush_key_count);
+    EXPECT_GT(stats.batch_flush_time_us, 0);
 
     ASSERT_EQ(EC_OK, backend_->Close());
 }

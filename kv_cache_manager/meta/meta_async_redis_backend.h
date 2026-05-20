@@ -82,10 +82,14 @@ public:
     bool Sync(const KeyTypeVec &keys) noexcept override;
 
     // ----- Metrics -----
-    std::vector<int64_t> GetAsyncQueueSizes() const noexcept override;
+    AsyncWriteStats GetAsyncWriteStats() noexcept override;
 
 private:
-    std::vector<ErrorCode> EnqueueWriteOp(WriteOp op);
+    struct EnqueueStats {
+        int64_t enqueue_timeout_key_count = 0;
+        int64_t enqueue_time_us = 0;
+    };
+    std::vector<ErrorCode> EnqueueWriteOp(RequestContext *request_context, WriteOp op);
     bool WaitForQueueCapacity(int queue_id);
     void ConsumerLoop(int queue_id);
     void BatchFlush(int queue_id, std::vector<QueueItem> &items, int64_t total_keys);
@@ -133,6 +137,11 @@ private:
 
     // Read client pool (for concurrent read operations)
     std::shared_ptr<DynamicClientPool<RedisClient>> read_client_pool_;
+
+    // Consumer-thread write stats (atomics, reset on read via CAS)
+    std::atomic<int64_t> stats_flush_key_count_{0};
+    std::atomic<int64_t> stats_batch_flush_time_us_{0};
+    std::atomic<int64_t> stats_pipeline_error_count_{0};
 };
 
 } // namespace kv_cache_manager
