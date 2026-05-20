@@ -50,6 +50,7 @@ pkg_files(
     name = "rpm_script",
     srcs = [
         "//package/script:start_server_script",
+        "//package/script:start_server_spectrum_script",
     ],
     attributes = pkg_attributes(
         mode = "0755",

@@ -7,3 +7,11 @@ filegroup(
     ],
     visibility = ["//visibility:public"],
 )
+
+filegroup(
+    name = "start_server_spectrum_script",
+    srcs = [
+        "start_server_spectrum.sh",
+    ],
+    visibility = ["//visibility:public"],
+)

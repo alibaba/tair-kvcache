@@ -33,6 +33,7 @@ bundle_files(
     name = "pkg_script",
     srcs = [
         "//package/script:start_server_script",
+        "//package/script:start_server_spectrum_script",
     ],
     prefix = "bin",
 )
