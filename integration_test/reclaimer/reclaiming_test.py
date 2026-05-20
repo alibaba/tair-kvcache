@@ -276,6 +276,154 @@ class ReclaimingTest(abc.ABC, TestBase, unittest.TestCase):
         # new write should now be accepted
         self._write(16)
 
+    def test_no_over_eviction_with_delay(self):
+        """Test that a long delay_before_delete_ms does not cause the
+        reclaimer to over-evict.
+
+        The bug:
+        - ReclaimCron runs every 100ms.
+        - After submitting a delete batch the usage counter is only
+          decremented after delay_before_delete_ms (default 1s).
+        - During the delay window the reclaimer observes the same high
+          usage and keeps submitting redundant delete batches.
+        - When all queued deletes fire the cache is drained far below
+          the water mark.
+
+        The fix:
+        - In-flight delete bytes are subtracted from observed usage in
+          GetWaterLevelExceed(), so subsequent cron iterations see the
+          adjusted (lower) usage and do not pile on extra batches.
+
+        Setup:
+        - capacity = 20480 bytes (20 * 1024)
+        - max_key_count = 20
+        - location_spec_info.size = 1024 bytes per block
+        - write 12 blocks -> usage = 12288/20480 = 60% > 50%
+        - used_percentage threshold = 0.5
+        - delay_before_delete_ms = 3000
+        - del_batch_size = 4 (server-level setting)
+
+        Expected after fix:
+        - Reclaimer submits at most one batch (4 keys, 4096 bytes)
+        - After the delayed delete fires, remaining keys >= 8
+        - Before the fix: reclaimer would pile ~30 batches in 3s,
+          draining most/all of the cache
+        """
+        # configure the server with a small batching_size to make the
+        # test deterministic: exactly 4 keys per delete batch
+        self.worker_manager.stop_worker(0)
+        self.assertTrue(
+            self.worker_manager.start_worker(
+                0, **{"kvcm.cache_reclaimer.del_batch_size": 4}
+            )
+        )
+        self._admin_client.close()
+        self._client.close()
+        self._admin_client, self._client = self._get_manager_client()
+
+        # add storage
+        add_storage_req = {
+            "trace_id": self._trace_id,
+            "storage": self._make_dummy_storage(),
+        }
+        self._admin_client.add_storage(add_storage_req)
+
+        # create instance group with a high threshold so reclaimer
+        # does not trigger while we fill blocks
+        ig = self._make_dummy_instance_group()
+        # override for this test:
+        # - general capacity = 20480 so 12 blocks (12288) = 60% > 50%
+        # - per-type quotas set high (30720) so per-type ratio 40% < 50%
+        #   (only the general quota should trigger)
+        # - max_key_count = 30 so key ratio 12/30 = 40% < 50%
+        #   (key count threshold must NOT independently trigger)
+        ig["quota"]["capacity"] = 1024 * 20
+        ig["quota"]["quota_config"] = [
+            {"storage_type": 3, "capacity": 1024 * 30},
+            {"storage_type": 4, "capacity": 1024 * 30},
+        ]
+        ig["cache_config"]["meta_indexer_config"]["max_key_count"] = 30
+        ig["cache_config"]["reclaim_strategy"]["delay_before_delete_ms"] = 3000
+        create_ig_req = {
+            "trace_id": self._trace_id,
+            "instance_group": ig,
+        }
+        self._admin_client.create_instance_group(create_ig_req)
+
+        # register instance
+        reg_ins_data_req = self._make_dummy_ins_req()
+        self._client.register_instance(reg_ins_data_req)
+
+        # write 12 blocks: usage = 12 * 1024 = 12288 bytes
+        # 12288 / 20480 = 0.6 > 0.5 threshold
+        for i in range(12):
+            self._write(i)
+
+        # now lower the threshold to trigger reclaiming
+        curr_ver = ig["version"]
+        ig["version"] = curr_ver + 1
+        ig[
+            "cache_config"
+        ][
+            "reclaim_strategy"
+        ][
+            "trigger_strategy"
+        ][
+            "used_percentage"
+        ] = 0.5
+        update_ig_req = {
+            "trace_id": self._trace_id + "_update_ig",
+            "instance_group": ig,
+            "current_version": curr_ver,
+        }
+        self._admin_client.update_instance_group(update_ig_req)
+
+        # wait long enough for the delay (3s) to expire plus the cron
+        # to fire a few times before and after; 5 seconds total
+        time.sleep(5)
+
+        # count how many of the 12 blocks still have a cache location;
+        # with the fix: the reclaimer submits only one batch of 4
+        # keys, so at least 8 blocks should remain (12 - 4 = 8)
+        surviving_blocks = 0
+        for i in range(12):
+            get_location_req = {
+                "trace_id": f"{self._trace_id}_check_{i}",
+                "query_type": "QT_PREFIX_MATCH",
+                "block_keys": [i],
+                "instance_id": self._instance_id,
+                "block_mask": {
+                    "offset": 0,
+                },
+            }
+            resp = self._client.get_cache_location(
+                get_location_req, check_response=False)
+            if resp.get("header", {}).get("status", {}).get("code") == "OK":
+                locations = resp.get("locations", [])
+                if locations and len(locations) > 0:
+                    # the block still has at least one location entry
+                    for loc in locations:
+                        if loc:
+                            surviving_blocks += 1
+                            break
+
+        logging.info(
+            f"test_no_over_eviction_with_delay: "
+            f"surviving_blocks={surviving_blocks} out of 12"
+        )
+
+        # with batching_size=4, the reclaimer should delete at most
+        # one batch (4 keys); allow for a small margin (second batch
+        # could slip in right before the in-flight subtraction takes
+        # effect), so assert at least 4 blocks remain (12 - 2*4 = 4)
+        self.assertGreaterEqual(
+            surviving_blocks, 4,
+            f"Over-eviction detected: only {surviving_blocks}/12 blocks "
+            f"survived; expected at least 4 (i.e. at most 2 batches of 4 "
+            f"deleted). The fix should keep in-flight bytes tracked to "
+            f"prevent redundant delete submissions."
+        )
+
     def test_persist_recover_00(self):
         """Test e2e persist/recover: cache locations and metadata
         survive a normal server restart.
