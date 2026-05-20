@@ -345,6 +345,19 @@ message FinishWriteCacheRequest {
     repeated CacheLocation locations = 5;
 }
 
+// V6D 驱逐前写远端：与 StartWriteCache 逻辑相同，
+// 但判断"是否需要写"时要求可用副本数 >= min_replica_count 才跳过。
+// V6D 驱逐场景下 min_replica_count=2（自己即将删除的那份不算）。
+message StartEvictWriteCacheRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    repeated int64 block_keys = 3;
+    repeated int64 token_ids = 4;
+    repeated string location_spec_group_names = 5;
+    int32 write_timeout_seconds = 6;
+    int32 min_replica_count = 7; // 0 or unset defaults to 2
+}
+
 // 删除指定 blockKeys，用于修复线上用户反馈case说某些提示词会胡言乱语的情况
 message RemoveCacheRequest {
     string trace_id = 1;
@@ -415,6 +428,8 @@ service MetaService {
     rpc TrimCache(TrimCacheRequest) returns (CommonResponse);
     // 查询集群信息（leader发现），任意节点均可处理
     rpc GetClusterInfo(GetClusterInfoRequest) returns (GetClusterInfoResponse);
+    // V6D 驱逐前写远端（需要 >= min_replica_count 份才跳过）
+    rpc StartEvictWriteCache(StartEvictWriteCacheRequest) returns (StartWriteCacheResponse);
     // V6D 上报事件（节点注册、Block 增删、节点宕机）
     rpc ReportEvent(ReportEventRequest) returns (ReportEventResponse);
 }

@@ -51,9 +51,15 @@ CacheLocation *WeightSLPolicy::SelectForMatch(CacheLocationMap &location_map,
     out_prune_loc_ids.clear();
     for (auto &kv : location_map) {
         if (kv.second.status() == CacheLocationStatus::CLS_SERVING) {
-            if (check_loc_data_exist && !check_loc_data_exist(kv.second)) {
-                out_prune_loc_ids.emplace_back(kv.first);
-                continue;
+            if (check_loc_data_exist) {
+                auto result = check_loc_data_exist(kv.second);
+                if (result == LocCheckResult::NOT_EXIST) {
+                    out_prune_loc_ids.emplace_back(kv.first);
+                    continue;
+                }
+                if (result == LocCheckResult::TEMPORARILY_UNREACHABLE) {
+                    continue;
+                }
             }
             if (int32_t weight = GetWeight(kv); weight > 0) {
                 serving_locations.push_back(&kv.second);
@@ -75,10 +81,15 @@ bool WeightSLPolicy::ExistsForWrite(const CacheLocationMap &location_map,
     out_prune_loc_ids.clear();
     for (auto &kv : location_map) {
         if (kv.second.status() != CacheLocationStatus::CLS_NOT_FOUND) {
-            if (kv.second.status() == CacheLocationStatus::CLS_SERVING && check_loc_data_exist &&
-                !check_loc_data_exist(kv.second)) {
-                out_prune_loc_ids.emplace_back(kv.first);
-                continue;
+            if (kv.second.status() == CacheLocationStatus::CLS_SERVING && check_loc_data_exist) {
+                auto result = check_loc_data_exist(kv.second);
+                if (result == LocCheckResult::NOT_EXIST) {
+                    out_prune_loc_ids.emplace_back(kv.first);
+                    continue;
+                }
+                if (result == LocCheckResult::TEMPORARILY_UNREACHABLE) {
+                    continue;
+                }
             }
             if (!exists && GetWeight(kv) > 0) {
                 exists = true;
@@ -105,10 +116,15 @@ bool WeightSLPolicy::ExistsForWrite(const CacheLocationMap &location_map,
         if (kv.second.status() == CacheLocationStatus::CLS_NOT_FOUND) {
             continue;
         }
-        if (kv.second.status() == CacheLocationStatus::CLS_SERVING && check_loc_data_exist &&
-            !check_loc_data_exist(kv.second)) {
-            out_prune_loc_ids.emplace_back(kv.first);
-            continue;
+        if (kv.second.status() == CacheLocationStatus::CLS_SERVING && check_loc_data_exist) {
+            auto result = check_loc_data_exist(kv.second);
+            if (result == LocCheckResult::NOT_EXIST) {
+                out_prune_loc_ids.emplace_back(kv.first);
+                continue;
+            }
+            if (result == LocCheckResult::TEMPORARILY_UNREACHABLE) {
+                continue;
+            }
         }
         if (exists) {
             continue;
@@ -127,6 +143,49 @@ bool WeightSLPolicy::ExistsForWrite(const CacheLocationMap &location_map,
         }
     }
     return exists;
+}
+
+bool WeightSLPolicy::ExistsForWriteWithMinCount(const CacheLocationMap &location_map,
+                                                int32_t min_count,
+                                                CheckLocDataExistFunc check_loc_data_exist,
+                                                std::vector<std::string> &out_prune_loc_ids) const {
+    out_prune_loc_ids.clear();
+    int32_t count = 0;
+    for (auto &kv : location_map) {
+        if (kv.second.status() == CacheLocationStatus::CLS_NOT_FOUND) {
+            continue;
+        }
+        if (GetWeight(kv) == 0) {
+            continue;
+        }
+        // V8 §2.6: stale replicas must not contribute to n_total. We only
+        // apply the staleness check to CLS_SERVING entries -- CLS_WRITING
+        // is a placeholder for an in-flight write and conventionally bypasses
+        // the data-existence predicate (see ExistsForWrite for the same
+        // rationale).
+        if (check_loc_data_exist && kv.second.status() == CacheLocationStatus::CLS_SERVING) {
+            auto result = check_loc_data_exist(kv.second);
+            if (result == LocCheckResult::NOT_EXIST) {
+                out_prune_loc_ids.emplace_back(kv.first);
+                continue;
+            }
+            if (result == LocCheckResult::TEMPORARILY_UNREACHABLE) {
+                continue;
+            }
+        }
+        ++count;
+        if (count >= min_count) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool WeightSLPolicy::ExistsForWriteWithMinCount(const CacheLocationMap &location_map,
+                                                int32_t min_count,
+                                                CheckLocDataExistFunc check_loc_data_exist) const {
+    std::vector<std::string> unused_prune;
+    return ExistsForWriteWithMinCount(location_map, min_count, check_loc_data_exist, unused_prune);
 }
 
 uint32_t StaticWeightSLPolicy::GetWeight(CacheLocationMap::const_reference kv) const {

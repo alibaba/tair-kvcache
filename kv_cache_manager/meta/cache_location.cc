@@ -1,6 +1,7 @@
 #include "kv_cache_manager/meta/cache_location.h"
 
 #include "kv_cache_manager/common/string_util.h"
+#include "kv_cache_manager/meta/common.h"
 namespace kv_cache_manager {
 
 LocationSpec::LocationSpec() = default;

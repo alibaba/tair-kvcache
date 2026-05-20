@@ -13,7 +13,8 @@
 
 namespace kv_cache_manager {
 
-const std::string MetaSearcher::PROPERTY_PREV_BLOCK_KEY = "_prev_key_";
+// V8 §2.1.1: block-level prev-key pointer is now a BP#-prefixed Hash field.
+const std::string MetaSearcher::PROPERTY_PREV_BLOCK_KEY = "BP#prev_key";
 
 namespace {
 
@@ -42,9 +43,15 @@ CacheLocation SelectAndMergeForMatch(SelectLocationPolicy *policy,
         if (loc.status() != CacheLocationStatus::CLS_SERVING) {
             continue;
         }
-        if (check_loc_data_exist && !check_loc_data_exist(loc)) {
-            out_prune_loc_ids.push_back(id);
-            continue;
+        if (check_loc_data_exist) {
+            auto result = check_loc_data_exist(loc);
+            if (result == LocCheckResult::NOT_EXIST) {
+                out_prune_loc_ids.push_back(id);
+                continue;
+            }
+            if (result == LocCheckResult::TEMPORARILY_UNREACHABLE) {
+                continue;
+            }
         }
         valid_map.try_emplace(id, loc);
     }

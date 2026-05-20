@@ -103,6 +103,14 @@ grpc::Status MetaServiceGRpc::GetClusterInfo(grpc::ServerContext *context,
     return grpc::Status::OK;
 }
 
+grpc::Status MetaServiceGRpc::StartEvictWriteCache(grpc::ServerContext *context,
+                                                   const proto::meta::StartEvictWriteCacheRequest *request,
+                                                   proto::meta::StartWriteCacheResponse *response) {
+    API_CONTEXT_INIT_GRPC(StartEvictWriteCache);
+    meta_service_impl_->StartEvictWriteCache(request_context, request, response);
+    return grpc::Status::OK;
+}
+
 grpc::Status MetaServiceGRpc::ReportEvent(grpc::ServerContext *context,
                                           const proto::meta::ReportEventRequest *request,
                                           proto::meta::ReportEventResponse *response) {
