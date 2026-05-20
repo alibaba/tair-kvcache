@@ -165,16 +165,21 @@ MetaIndexer::Result MetaIndexer::Put(RequestContext *request_context,
     int32_t error_count = 0;
     int64_t put_io_time_us = 0;
     int64_t lock_wait_time_us = 0;
+    int64_t cache_backend_put_time_us = 0;
     for (auto &batch : batches) {
         ScopedBatchLock lock(*this, batch.batch_shard_indexs, &lock_wait_time_us);
         int64_t begin_put_io_time = TimestampUtil::GetCurrentTimeUs();
         auto error_codes = backend_manager_->Put(request_context, batch);
         put_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin_put_io_time;
+        int64_t v = 0;
+        KVCM_METRICS_COLLECTOR_GET_METRICS(service_metrics_collector, meta_indexer, cache_backend_put_time_us, v);
+        cache_backend_put_time_us += v;
         error_count += ProcessErrorCodes(trace_id, error_codes, batch.batch_indexs, keys, kPutMetaOperation, result);
     }
     AdjustKeyCountMeta(keys.size() - error_count);
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, put_io_time_us, put_io_time_us);
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, lock_wait_time_us, lock_wait_time_us);
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, cache_backend_put_time_us, cache_backend_put_time_us);
     ProcessErrorResult(trace_id, kPutMetaOperation, error_count, keys.size(), result);
     return result;
 }
@@ -194,13 +199,18 @@ MetaIndexer::Result MetaIndexer::Delete(RequestContext *request_context, const K
     Result result(keys.size());
     int32_t error_count = 0;
     int64_t lock_wait_time_us = 0;
+    int64_t cache_backend_delete_time_us = 0;
     for (auto &batch : batches) {
         ScopedBatchLock lock(*this, batch.batch_shard_indexs, &lock_wait_time_us);
         std::vector<ErrorCode> error_codes = backend_manager_->Delete(request_context, batch.batch_keys);
+        int64_t v = 0;
+        KVCM_METRICS_COLLECTOR_GET_METRICS(service_metrics_collector, meta_indexer, cache_backend_delete_time_us, v);
+        cache_backend_delete_time_us += v;
         error_count += ProcessErrorCodes(trace_id, error_codes, batch.batch_indexs, keys, kDeleteMetaOperation, result);
     }
     AdjustKeyCountMeta(error_count - keys.size());
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, lock_wait_time_us, lock_wait_time_us);
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, cache_backend_delete_time_us, cache_backend_delete_time_us);
     ProcessErrorResult(trace_id, kDeleteMetaOperation, error_count, keys.size(), result);
     return result;
 }
@@ -235,6 +245,15 @@ std::pair<int32_t, int32_t> MetaIndexer::ExecuteRmwUpsert(const std::string &tra
         auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
         KVCM_METRICS_COLLECTOR_GET_METRICS(service_metrics_collector, meta_searcher, index_serialize_time_us, v);
         stats.index_serialize_time_us += v;
+        v = 0;
+        KVCM_METRICS_COLLECTOR_GET_METRICS(service_metrics_collector, meta_indexer, async_enqueue_timeout_key_count, v);
+        stats.async_enqueue_timeout_key_count += v;
+        v = 0;
+        KVCM_METRICS_COLLECTOR_GET_METRICS(service_metrics_collector, meta_indexer, async_enqueue_time_us, v);
+        stats.async_enqueue_time_us += v;
+        v = 0;
+        KVCM_METRICS_COLLECTOR_GET_METRICS(service_metrics_collector, meta_indexer, cache_backend_upsert_time_us, v);
+        stats.cache_backend_upsert_time_us += v;
     }
 
     const int32_t error_count =
@@ -273,6 +292,16 @@ std::pair<int32_t, int32_t> MetaIndexer::ExecuteRmwDelete(const std::string &tra
             request_context, delete_batch.batch_keys, delete_batch.batch_location_ids, reclaimed_count);
     }
     stats.delete_io_time_us += TimestampUtil::GetCurrentTimeUs() - begin;
+    int64_t v = 0;
+    auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+    KVCM_METRICS_COLLECTOR_GET_METRICS(service_metrics_collector, meta_indexer, async_enqueue_timeout_key_count, v);
+    stats.async_enqueue_timeout_key_count += v;
+    v = 0;
+    KVCM_METRICS_COLLECTOR_GET_METRICS(service_metrics_collector, meta_indexer, async_enqueue_time_us, v);
+    stats.async_enqueue_time_us += v;
+    v = 0;
+    KVCM_METRICS_COLLECTOR_GET_METRICS(service_metrics_collector, meta_indexer, cache_backend_delete_time_us, v);
+    stats.cache_backend_delete_time_us += v;
 
     const int32_t error_count =
         ProcessErrorCodes(trace_id, delete_ecs, delete_batch.batch_indexs, all_keys, kRmwDeleteMetaOperation, result);
@@ -295,6 +324,14 @@ void MetaIndexer::EmitRmwMetrics(MetricsCollector *metrics_collector,
         service_metrics_collector, meta_indexer, delete_io_time_us, stats.delete_io_time_us);
     KVCM_METRICS_COLLECTOR_SET_METRICS(
         service_metrics_collector, meta_indexer, lock_wait_time_us, stats.lock_wait_time_us);
+    KVCM_METRICS_COLLECTOR_SET_METRICS(
+        service_metrics_collector, meta_indexer, async_enqueue_timeout_key_count, stats.async_enqueue_timeout_key_count);
+    KVCM_METRICS_COLLECTOR_SET_METRICS(
+        service_metrics_collector, meta_indexer, async_enqueue_time_us, stats.async_enqueue_time_us);
+    KVCM_METRICS_COLLECTOR_SET_METRICS(
+        service_metrics_collector, meta_indexer, cache_backend_upsert_time_us, stats.cache_backend_upsert_time_us);
+    KVCM_METRICS_COLLECTOR_SET_METRICS(
+        service_metrics_collector, meta_indexer, cache_backend_delete_time_us, stats.cache_backend_delete_time_us);
     KVCM_METRICS_COLLECTOR_SET_METRICS(
         service_metrics_collector, meta_searcher, index_serialize_time_us, stats.index_serialize_time_us);
     KVCM_METRICS_COLLECTOR_SET_METRICS(
@@ -734,7 +771,9 @@ size_t MetaIndexer::GetMemUsage() const noexcept { return backend_manager_->GetM
 
 bool MetaIndexer::Sync(const KeyVector &keys) noexcept { return backend_manager_->Sync(keys); }
 
-std::vector<int64_t> MetaIndexer::GetAsyncQueueSizes() const noexcept { return backend_manager_->GetAsyncQueueSizes(); }
+MetaStorageBackend::AsyncWriteStats MetaIndexer::GetAsyncWriteStats() noexcept {
+    return backend_manager_->GetAsyncWriteStats();
+}
 
 int64_t MetaIndexer::GetOldestAccessTime() const noexcept { return backend_manager_->GetOldestAccessTime(); }
 

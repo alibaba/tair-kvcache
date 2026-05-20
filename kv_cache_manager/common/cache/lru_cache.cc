@@ -652,7 +652,7 @@ LRUHandle *LRUCacheShard::CreateStandalone(const std::string_view &key,
     return e;
 }
 
-void LRUCacheShard::Erase(const std::string_view &key, uint32_t hash) {
+bool LRUCacheShard::Erase(const std::string_view &key, uint32_t hash) {
     LRUHandle *e;
     bool last_reference = false;
     {
@@ -676,6 +676,12 @@ void LRUCacheShard::Erase(const std::string_view &key, uint32_t hash) {
     if (last_reference) {
         e->Free(table_.GetAllocator());
     }
+    return e != nullptr;
+}
+
+bool LRUCacheShard::Exists(const std::string_view &key, uint32_t hash) {
+    std::lock_guard<std::mutex> l(mutex_);
+    return table_.Lookup(key, hash) != nullptr;
 }
 
 size_t LRUCacheShard::GetUsage() const {

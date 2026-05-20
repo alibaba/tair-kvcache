@@ -107,8 +107,8 @@ public:
     // Synchronously flush pending writes for the given keys to persistent storage.
     bool Sync(const KeyVector &keys) noexcept;
 
-    // Returns per-queue pending key sizes from async backend.
-    std::vector<int64_t> GetAsyncQueueSizes() const noexcept;
+    // Returns async write path stats from async backend.
+    MetaStorageBackend::AsyncWriteStats GetAsyncWriteStats() noexcept;
 
     // storage usage interfaces
     [[nodiscard]] std::uint64_t GetStorageUsage() const noexcept;
@@ -148,6 +148,10 @@ private:
         int64_t index_serialize_time_us = 0;
         int64_t index_deserialize_time_us = 0;
         int64_t lock_wait_time_us = 0; // accumulated time waiting for shard locks
+        int64_t async_enqueue_timeout_key_count = 0;
+        int64_t async_enqueue_time_us = 0;
+        int64_t cache_backend_upsert_time_us = 0;
+        int64_t cache_backend_delete_time_us = 0;
         int64_t put_key_count = 0;     // brand-new keys created by upsert
         int64_t update_key_count = 0;  // existing keys updated by upsert
         int64_t delete_key_count = 0;  // keys deleted by whole-key delete

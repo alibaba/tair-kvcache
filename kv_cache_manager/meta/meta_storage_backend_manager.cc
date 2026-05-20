@@ -12,6 +12,7 @@
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_storage_backend_factory.h"
+#include "kv_cache_manager/metrics/metrics_collector.h"
 
 namespace kv_cache_manager {
 
@@ -299,7 +300,14 @@ std::vector<ErrorCode> MetaStorageBackendManager::Put(RequestContext *request_co
     if (!cache_backend_) {
         return persistent_results;
     }
-    return cache_backend_->Put(request_context, keys, locations, properties, persistent_results);
+    const int64_t cache_begin = TimestampUtil::GetCurrentTimeUs();
+    auto results = cache_backend_->Put(request_context, keys, locations, properties, persistent_results);
+    if (request_context) {
+        auto *mc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+        KVCM_METRICS_COLLECTOR_SET_METRICS(mc, meta_indexer, cache_backend_put_time_us,
+                                           TimestampUtil::GetCurrentTimeUs() - cache_begin);
+    }
+    return results;
 }
 
 std::vector<ErrorCode> MetaStorageBackendManager::Upsert(RequestContext *request_context,
@@ -319,7 +327,14 @@ std::vector<ErrorCode> MetaStorageBackendManager::Upsert(RequestContext *request
     if (!cache_backend_) {
         return persistent_results;
     }
-    return cache_backend_->Upsert(request_context, keys, locations, properties, persistent_results);
+    const int64_t cache_begin = TimestampUtil::GetCurrentTimeUs();
+    auto results = cache_backend_->Upsert(request_context, keys, locations, properties, persistent_results);
+    if (request_context) {
+        auto *mc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+        KVCM_METRICS_COLLECTOR_SET_METRICS(mc, meta_indexer, cache_backend_upsert_time_us,
+                                           TimestampUtil::GetCurrentTimeUs() - cache_begin);
+    }
+    return results;
 }
 
 std::vector<ErrorCode> MetaStorageBackendManager::Delete(RequestContext *request_context,
@@ -335,7 +350,14 @@ std::vector<ErrorCode> MetaStorageBackendManager::Delete(RequestContext *request
             deleted_keys_.insert(key);
         }
     }
-    return cache_backend_->Delete(request_context, keys, persistent_results);
+    const int64_t cache_begin = TimestampUtil::GetCurrentTimeUs();
+    auto results = cache_backend_->Delete(request_context, keys, persistent_results);
+    if (request_context) {
+        auto *mc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+        KVCM_METRICS_COLLECTOR_SET_METRICS(mc, meta_indexer, cache_backend_delete_time_us,
+                                           TimestampUtil::GetCurrentTimeUs() - cache_begin);
+    }
+    return results;
 }
 
 std::vector<ErrorCode> MetaStorageBackendManager::Delete(RequestContext *request_context,
@@ -361,7 +383,13 @@ std::vector<ErrorCode> MetaStorageBackendManager::Delete(RequestContext *request
     if (!cache_backend_) {
         results = std::move(persistent_results);
     } else {
+        const int64_t cache_begin = TimestampUtil::GetCurrentTimeUs();
         results = cache_backend_->DeleteLocations(request_context, keys, location_ids, persistent_results);
+        if (request_context) {
+            auto *mc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+            KVCM_METRICS_COLLECTOR_SET_METRICS(mc, meta_indexer, cache_backend_delete_time_us,
+                                               TimestampUtil::GetCurrentTimeUs() - cache_begin);
+        }
     }
 
     out_reclaimed_count = MaybeReclaimEmptyKeys(request_context, keys, results);
@@ -707,11 +735,11 @@ bool MetaStorageBackendManager::Sync(const KeyVector &keys) noexcept {
     return persistent_backend_->Sync(keys);
 }
 
-std::vector<int64_t> MetaStorageBackendManager::GetAsyncQueueSizes() const noexcept {
+MetaStorageBackend::AsyncWriteStats MetaStorageBackendManager::GetAsyncWriteStats() noexcept {
     if (!persistent_backend_) {
         return {};
     }
-    return persistent_backend_->GetAsyncQueueSizes();
+    return persistent_backend_->GetAsyncWriteStats();
 }
 
 size_t MetaStorageBackendManager::GetMemUsage() const noexcept {

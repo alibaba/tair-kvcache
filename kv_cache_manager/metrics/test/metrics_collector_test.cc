@@ -85,6 +85,23 @@ TEST_F(MetricsCollectorTest, MetaIndexerMetricsTest) {
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, read_modify_write_update_key_count), 200.);
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, read_modify_write_skip_key_count), 10.);
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, read_modify_write_delete_key_count), 10.);
+
+    // async enqueue per-query metrics
+    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, async_enqueue_timeout_key_count), 0.);
+    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, async_enqueue_time_us), 0.);
+    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, cache_backend_put_time_us), 0.);
+    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, cache_backend_upsert_time_us), 0.);
+    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, cache_backend_delete_time_us), 0.);
+    SET_METRICS_(p, meta_indexer, async_enqueue_timeout_key_count, 5.);
+    SET_METRICS_(p, meta_indexer, async_enqueue_time_us, 800.);
+    SET_METRICS_(p, meta_indexer, cache_backend_put_time_us, 400.);
+    SET_METRICS_(p, meta_indexer, cache_backend_upsert_time_us, 500.);
+    SET_METRICS_(p, meta_indexer, cache_backend_delete_time_us, 300.);
+    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, async_enqueue_timeout_key_count), 5.);
+    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, async_enqueue_time_us), 800.);
+    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, cache_backend_put_time_us), 400.);
+    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, cache_backend_upsert_time_us), 500.);
+    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, cache_backend_delete_time_us), 300.);
 }
 
 // Test MetaSearcher metrics functionality
@@ -276,33 +293,24 @@ TEST_F(MetricsCollectorTest, CacheManagerInstanceMetricsCollectorTest) {
     EXPECT_DOUBLE_EQ(GET(p, cache_manager_instance, key_count), 100.);
     EXPECT_DOUBLE_EQ(GET(p, cache_manager_instance, byte_size), 2048.);
 
-    // Test SUMMARY metrics - initial state is empty
-    const auto &empty_summary = GET_SUMMARY_(p, cache_manager_instance, async_queue_sizes);
-    EXPECT_TRUE(empty_summary.empty());
+    // Test async_queue gauge metrics
+    EXPECT_DOUBLE_EQ(GET(p, cache_manager_instance, async_queue_max_size), 0.);
+    EXPECT_DOUBLE_EQ(GET(p, cache_manager_instance, async_queue_avg_size), 0.);
+    SET_METRICS_(p, cache_manager_instance, async_queue_max_size, 30.);
+    SET_METRICS_(p, cache_manager_instance, async_queue_avg_size, 13.);
+    EXPECT_DOUBLE_EQ(GET(p, cache_manager_instance, async_queue_max_size), 30.);
+    EXPECT_DOUBLE_EQ(GET(p, cache_manager_instance, async_queue_avg_size), 13.);
 
-    // Test SET_SUMMARY_ / GET_SUMMARY_ with values
-    std::vector<int64_t> queue_sizes = {10, 20, 30, 0, 5};
-    SET_SUMMARY_(p, cache_manager_instance, async_queue_sizes, queue_sizes);
-    const auto &result = GET_SUMMARY_(p, cache_manager_instance, async_queue_sizes);
-    ASSERT_EQ(5, result.size());
-    EXPECT_EQ(10, result[0]);
-    EXPECT_EQ(20, result[1]);
-    EXPECT_EQ(30, result[2]);
-    EXPECT_EQ(0, result[3]);
-    EXPECT_EQ(5, result[4]);
-
-    // Test overwrite with new values
-    std::vector<int64_t> new_sizes = {100, 200};
-    SET_SUMMARY_(p, cache_manager_instance, async_queue_sizes, new_sizes);
-    const auto &new_result = GET_SUMMARY_(p, cache_manager_instance, async_queue_sizes);
-    ASSERT_EQ(2, new_result.size());
-    EXPECT_EQ(100, new_result[0]);
-    EXPECT_EQ(200, new_result[1]);
-
-    // Test overwrite with empty
-    std::vector<int64_t> empty_sizes;
-    SET_SUMMARY_(p, cache_manager_instance, async_queue_sizes, empty_sizes);
-    EXPECT_TRUE(GET_SUMMARY_(p, cache_manager_instance, async_queue_sizes).empty());
+    // Test async write stats gauge metrics
+    EXPECT_DOUBLE_EQ(GET(p, cache_manager_instance, async_flush_key_count), 0.);
+    EXPECT_DOUBLE_EQ(GET(p, cache_manager_instance, async_batch_flush_time_us), 0.);
+    EXPECT_DOUBLE_EQ(GET(p, cache_manager_instance, async_pipeline_error_count), 0.);
+    SET_METRICS_(p, cache_manager_instance, async_flush_key_count, 1000.);
+    SET_METRICS_(p, cache_manager_instance, async_batch_flush_time_us, 500.);
+    SET_METRICS_(p, cache_manager_instance, async_pipeline_error_count, 2.);
+    EXPECT_DOUBLE_EQ(GET(p, cache_manager_instance, async_flush_key_count), 1000.);
+    EXPECT_DOUBLE_EQ(GET(p, cache_manager_instance, async_batch_flush_time_us), 500.);
+    EXPECT_DOUBLE_EQ(GET(p, cache_manager_instance, async_pipeline_error_count), 2.);
 }
 
 TEST_F(MetricsCollectorTest, ChronoScopeConcurrentTest) {

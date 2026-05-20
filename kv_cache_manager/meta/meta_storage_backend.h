@@ -248,7 +248,13 @@ public:
     // Default: no-op (sync backends have no pending writes).
     virtual bool Sync(const KeyTypeVec & /*keys*/) noexcept { return true; }
 
-    // Returns per-queue pending key sizes. Default: empty (no async queues).
-    virtual std::vector<int64_t> GetAsyncQueueSizes() const noexcept { return {}; }
+    struct AsyncWriteStats {
+        int64_t max_async_queue_size = 0;
+        int64_t avg_async_queue_size = 0;
+        int64_t flush_key_count = 0;
+        int64_t batch_flush_time_us = 0;
+        int64_t pipeline_error_count = 0;
+    };
+    virtual AsyncWriteStats GetAsyncWriteStats() noexcept { return {}; }
 };
 } // namespace kv_cache_manager

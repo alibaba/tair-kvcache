@@ -328,7 +328,8 @@ public: // Function definitions expected as parameter to ShardedCache
 
     bool Release(LRUHandle *handle, bool useful, bool erase_if_last_ref);
     bool Ref(LRUHandle *handle);
-    void Erase(const std::string_view &key, uint32_t hash);
+    bool Erase(const std::string_view &key, uint32_t hash);
+    bool Exists(const std::string_view &key, uint32_t hash);
 
     // Adjust the charge of a referenced handle by `delta` (may be negative).
     // The caller must hold an external reference to `handle`.
