@@ -34,6 +34,7 @@ bundle_files(
     srcs = [
         "//package/script:decode_stack_trace_script",
         "//package/script:start_server_script",
+        "//package/script:start_server_spectrum_script",
     ],
     prefix = "bin",
 )
