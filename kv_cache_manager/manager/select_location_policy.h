@@ -68,25 +68,27 @@ public:
 protected:
     uint32_t GetWeight(CacheLocationMap::const_reference kv) const override;
     struct StorageTypeWeights {
-        static constexpr uint32_t NFS = 5;          // NFS存储权重较高
-        static constexpr uint32_t MOONCAKE = 3;     // Mooncake存储权重中等
-        static constexpr uint32_t THREEFS = 3;      // 3FS存储权重较低
-        static constexpr uint32_t TAIR_MEMPOOL = 3; // Tair存储权重最低
-        static constexpr uint32_t DEFAULT = 1;      // 默认权重
+        static constexpr uint32_t NFS = 5;
+        static constexpr uint32_t MOONCAKE = 3;
+        static constexpr uint32_t THREEFS = 3;
+        static constexpr uint32_t TAIR_MEMPOOL = 3;
+        static constexpr uint32_t DEFAULT = 1;
+        static constexpr uint32_t VCNS_HF3FS = THREEFS;
+        static constexpr uint32_t VINEYARD = 10;
     };
 
 protected:
-    // 直接用一个简单的映射表来选权重(映射表顺序与DataStorageType一样）
-    // 代替switch-case
-    // order follows DataStorageType enum values:
-    // UNKNOWN, HF3FS, MOONCAKE, TAIR_MEMPOOL, NFS, VCNS_HF3FS, DUMMY
-    inline static WeightArray default_storage_weights_{StorageTypeWeights::DEFAULT,
-                                                       StorageTypeWeights::THREEFS,
-                                                       StorageTypeWeights::MOONCAKE,
-                                                       StorageTypeWeights::TAIR_MEMPOOL,
-                                                       StorageTypeWeights::NFS,
-                                                       StorageTypeWeights::THREEFS,
-                                                       StorageTypeWeights::DEFAULT};
+    // Order follows DataStorageType enum.
+    inline static WeightArray default_storage_weights_{
+        StorageTypeWeights::DEFAULT,
+        StorageTypeWeights::THREEFS,
+        StorageTypeWeights::MOONCAKE,
+        StorageTypeWeights::TAIR_MEMPOOL,
+        StorageTypeWeights::NFS,
+        StorageTypeWeights::VCNS_HF3FS,
+        StorageTypeWeights::DEFAULT,
+        StorageTypeWeights::VINEYARD,
+    };
 
     WeightArray &storage_weights_ = default_storage_weights_;
 };

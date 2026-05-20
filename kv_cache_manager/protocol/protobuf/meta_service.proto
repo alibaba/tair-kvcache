@@ -42,6 +42,66 @@ enum StorageType {
     ST_NFS = 4;
     ST_VCNS_3FS = 5;
     ST_DUMMY = 6;
+    ST_VINEYARD = 7;
+}
+
+// ---- V6D event reporting ----
+
+enum ReportEventType {
+    EVENT_UNSPECIFIED = 0;
+    EVENT_NODE_REGISTER = 1; // V6D node starts up and registers with KVCM
+    EVENT_BLOCK_ADD = 2;     // V6D stored a new block locally
+    EVENT_BLOCK_DELETE = 3;  // V6D deleted a block locally
+    EVENT_HOST_DOWN = 4;     // V6D node is going down (graceful or detected)
+    EVENT_HEARTBEAT = 5;     // V6D periodic heartbeat
+}
+
+message NodeRegisterParams {
+    repeated string mediums = 1; // mediums supported by the node, e.g. ["mem","disk"]
+}
+
+message BlockAddParams {
+    string block_key = 1; // int64 as string
+    string uri = 2;       // deprecated, use specs instead
+    string medium = 3;    // e.g. "mem"/"disk"/"ssd"/"hbm"
+    repeated LocationSpec specs = 4;
+}
+
+message BlockDeleteParams {
+    string block_key = 1;
+    string medium = 2;
+}
+
+message HostDownParams {
+}
+
+message HeartbeatParams {
+    // KVCM only refreshes last_heartbeat; system_status is opaque observability data
+    map<string, string> system_status = 1;
+}
+
+message EventItem {
+    ReportEventType event_type = 1;
+    oneof event_params {
+        NodeRegisterParams node_register = 2;
+        BlockAddParams block_add = 3;
+        BlockDeleteParams block_delete = 4;
+        HostDownParams host_down = 5;
+        HeartbeatParams heartbeat = 6;
+    }
+}
+
+message ReportEventRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    string host_ip_port = 3;
+    repeated EventItem events = 4;
+}
+
+message ReportEventResponse {
+    CommonResponseHeader header = 1;
+    // Non-empty only when partial failures happen.
+    repeated ErrorCode item_results = 2;
 }
 
 // 使用URI统一多种存储表示，由client或者connector负责解析
@@ -353,4 +413,6 @@ service MetaService {
     rpc TrimCache(TrimCacheRequest) returns (CommonResponse);
     // 查询集群信息（leader发现），任意节点均可处理
     rpc GetClusterInfo(GetClusterInfoRequest) returns (GetClusterInfoResponse);
+    // V6D 上报事件（节点注册、Block 增删、节点宕机）
+    rpc ReportEvent(ReportEventRequest) returns (ReportEventResponse);
 }

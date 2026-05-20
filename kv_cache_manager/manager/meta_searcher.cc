@@ -454,6 +454,70 @@ ErrorCode MetaSearcher::BatchAddLocation(RequestContext *request_context,
     return result.ec;
 }
 
+ErrorCode MetaSearcher::BatchUpsertLocations(RequestContext *request_context,
+                                             const KeyVector &keys,
+                                             const std::vector<std::vector<UpsertLocation>> &new_locations_per_key,
+                                             std::vector<ErrorCode> &out_per_key_ec) {
+    if (keys.size() != new_locations_per_key.size()) {
+        return EC_BADARGS;
+    }
+    out_per_key_ec.assign(keys.size(), ErrorCode::EC_OK);
+
+    std::vector<std::pair<DataStorageType, std::uint64_t>> loc_sz(keys.size());
+
+    auto modifier = [&new_locations_per_key, &keys, &loc_sz](const LocationIdVector & /*existing_ids*/,
+                                                             ErrorCode get_ec,
+                                                             size_t index,
+                                                             PropertyMap & /*upsert_property_map*/,
+                                                             CacheLocationMap &out_new_locations) -> ModifierResult {
+        if (get_ec != ErrorCode::EC_OK && get_ec != ErrorCode::EC_NOENT) {
+            KVCM_LOG_WARN("load location failed, key[%lu](%lu) return %d", index, keys[index], get_ec);
+            return {ModifierAction::MA_FAIL, get_ec};
+        }
+        std::uint64_t key_total_sz = 0;
+        DataStorageType key_type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
+        for (const auto &entry : new_locations_per_key[index]) {
+            CacheLocation loc;
+            loc.set_id(entry.location_id);
+            loc.set_type(entry.type);
+            loc.set_status(entry.status);
+            loc.set_spec_size(entry.specs.size());
+            for (const auto &ls : entry.specs) {
+                loc.push_location_spec(LocationSpec(ls.name(), ls.uri()));
+                if (DataStorageUri ds_uri(ls.uri()); ds_uri.Valid()) {
+                    std::uint64_t spec_sz = 0;
+                    ds_uri.GetParamAs<std::uint64_t>("size", spec_sz);
+                    key_total_sz += spec_sz;
+                }
+            }
+            out_new_locations[entry.location_id] = std::make_shared<const CacheLocation>(std::move(loc));
+            if (key_type == DataStorageType::DATA_STORAGE_TYPE_UNKNOWN) {
+                key_type = entry.type;
+            }
+        }
+        loc_sz[index] = std::make_pair(key_type, key_total_sz);
+        return {ModifierAction::MA_OK, ErrorCode::EC_OK};
+    };
+
+    auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerReadModifyWriteBlock);
+    auto result = meta_indexer_->ReadModifyWriteBlock(request_context, keys, modifier);
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWriteBlock);
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        ErrorCode key_ec = (i < result.error_codes.size()) ? result.error_codes[i] : result.ec;
+        out_per_key_ec[i] = key_ec;
+        if (key_ec == ErrorCode::EC_OK) {
+            meta_indexer_->AddStorageUsageByType(loc_sz[i].first, loc_sz[i].second);
+        }
+    }
+
+    if (result.ec != ErrorCode::EC_OK) {
+        LogErrorCodes("meta_indexer_->ReadModifyWriteBlock", result.error_codes, keys);
+    }
+    return result.ec;
+}
+
 ErrorCode MetaSearcher::BatchUpdateLocationStatus(RequestContext *request_context,
                                                   const KeyVector &keys,
                                                   const std::vector<std::vector<LocationUpdateTask>> &batch_tasks,
@@ -774,6 +838,167 @@ ErrorCode MetaSearcher::BatchDeleteLocation(RequestContext *request_context,
         KVCM_LOG_WARN("meta_indexer_->ReadModifyWriteLocation failed, ec: %d", result.ec);
     }
     return result.ec;
+}
+
+ErrorCode MetaSearcher::BatchDeleteLocations(RequestContext *request_context,
+                                             const KeyVector &keys,
+                                             const LocationIdsPerKey &location_ids_per_key,
+                                             std::vector<std::vector<ErrorCode>> &out_per_location_ec) {
+    if (keys.size() != location_ids_per_key.size()) {
+        return EC_BADARGS;
+    }
+    out_per_location_ec.clear();
+    out_per_location_ec.resize(keys.size());
+
+    std::vector<std::vector<std::pair<DataStorageType, std::uint64_t>>> locs_sz(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        locs_sz[i].resize(location_ids_per_key[i].size());
+    }
+
+    auto modifier = [&keys, &locs_sz](const std::vector<ErrorCode> &get_ecs,
+                                      const LocationIdVector &loc_ids,
+                                      size_t key_index,
+                                      CacheLocationVector &locs,
+                                      PropertyMap & /*upsert_property_map*/) -> LocationModifierResult {
+        std::vector<ErrorCode> modifier_ecs(loc_ids.size(), ErrorCode::EC_OK);
+        bool any_found = false;
+        for (size_t k = 0; k < loc_ids.size(); ++k) {
+            const ErrorCode ec = get_ecs[k];
+            if (ec == ErrorCode::EC_NOENT || loc_ids[k].empty()) {
+                modifier_ecs[k] = (ec != ErrorCode::EC_OK) ? ec : ErrorCode::EC_NOENT;
+                continue;
+            }
+            if (ec != ErrorCode::EC_OK) {
+                KVCM_LOG_WARN("location load failed, key[%lu](%lu), loc_id: %s, return %d",
+                              key_index,
+                              keys[key_index],
+                              loc_ids[k].c_str(),
+                              ec);
+                modifier_ecs[k] = ec;
+                continue;
+            }
+            any_found = true;
+            std::uint64_t sz = 0;
+            for (const auto &loc_spec : locs[k]->location_specs()) {
+                if (DataStorageUri ds_uri(loc_spec.uri()); ds_uri.Valid()) {
+                    std::uint64_t spec_sz = 0;
+                    ds_uri.GetParamAs<std::uint64_t>("size", spec_sz);
+                    sz += spec_sz;
+                }
+            }
+            locs_sz[key_index][k] = std::make_pair(locs[k]->type(), sz);
+        }
+        if (!any_found) {
+            return {ModifierAction::MA_SKIP, std::move(modifier_ecs)};
+        }
+        return {ModifierAction::MA_DELETE, std::move(modifier_ecs)};
+    };
+
+    auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
+    auto result = meta_indexer_->ReadModifyWriteLocation(request_context, keys, location_ids_per_key, modifier);
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
+    out_per_location_ec = std::move(result.per_location_error_codes);
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (i >= out_per_location_ec.size()) {
+            continue;
+        }
+        for (size_t k = 0; k < location_ids_per_key[i].size(); ++k) {
+            if (k >= out_per_location_ec[i].size()) {
+                continue;
+            }
+            if (out_per_location_ec[i][k] == ErrorCode::EC_OK && !location_ids_per_key[i][k].empty()) {
+                meta_indexer_->SubStorageUsageByType(locs_sz[i][k].first, locs_sz[i][k].second);
+            }
+        }
+    }
+
+    if (result.ec != ErrorCode::EC_OK) {
+        KVCM_LOG_WARN("meta_indexer_->ReadModifyWriteLocation failed, ec: %d", result.ec);
+    }
+    return result.ec;
+}
+
+ErrorCode MetaSearcher::CleanupLocationsByHost(RequestContext *request_context,
+                                               const std::string &host_suffix,
+                                               size_t scan_batch_size,
+                                               std::function<bool()> should_abort) {
+    if (host_suffix.empty()) {
+        return EC_BADARGS;
+    }
+    if (scan_batch_size == 0) {
+        scan_batch_size = 1000;
+    }
+
+    bool has_failure = false;
+    std::string cursor = SCAN_BASE_CURSOR;
+    do {
+        if (should_abort && should_abort()) {
+            KVCM_LOG_INFO("CleanupLocationsByHost: aborted by caller (host_suffix=%s)", host_suffix.c_str());
+            return EC_OK;
+        }
+        std::string next_cursor;
+        KeyVector keys;
+        if (auto ec = meta_indexer_->Scan(request_context, cursor, scan_batch_size, next_cursor, keys); ec != EC_OK) {
+            KVCM_LOG_WARN("CleanupLocationsByHost: scan failed, ec %d", ec);
+            has_failure = true;
+            break;
+        }
+        if (!keys.empty()) {
+            CacheLocationMapVector location_maps;
+            auto get_result = meta_indexer_->GetLocations(request_context, keys, location_maps);
+            if (get_result.ec == EC_OK || get_result.ec == EC_PARTIAL_OK) {
+                if (get_result.ec == EC_PARTIAL_OK) {
+                    has_failure = true;
+                }
+                LocationIdsPerKey delete_loc_ids(keys.size());
+                bool has_any_location = false;
+                for (size_t i = 0; i < keys.size(); ++i) {
+                    if (get_result.ec == EC_PARTIAL_OK && get_result.error_codes[i] != EC_OK) {
+                        continue;
+                    }
+                    for (const auto &kv : location_maps[i]) {
+                        const std::string &loc_id = kv.first;
+                        const CacheLocation &loc = *kv.second;
+                        if (loc.type() == DataStorageType::DATA_STORAGE_TYPE_VINEYARD &&
+                            loc_id.size() >= host_suffix.size() &&
+                            loc_id.compare(loc_id.size() - host_suffix.size(), host_suffix.size(), host_suffix) == 0) {
+                            delete_loc_ids[i].push_back(loc_id);
+                            has_any_location = true;
+                        }
+                    }
+                }
+                if (has_any_location) {
+                    std::vector<std::vector<ErrorCode>> per_location_ec;
+                    auto del_ec = BatchDeleteLocations(request_context, keys, delete_loc_ids, per_location_ec);
+                    if (del_ec != EC_OK) {
+                        KVCM_LOG_WARN("CleanupLocationsByHost: BatchDeleteLocations failed, ec %d", del_ec);
+                        has_failure = true;
+                    } else {
+                        for (size_t i = 0; i < per_location_ec.size(); ++i) {
+                            for (const auto &loc_ec : per_location_ec[i]) {
+                                if (loc_ec != EC_OK && loc_ec != EC_NOENT) {
+                                    KVCM_LOG_WARN(
+                                        "CleanupLocationsByHost: delete location failed for key index %zu, ec %d",
+                                        i,
+                                        loc_ec);
+                                    has_failure = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                KVCM_LOG_WARN("CleanupLocationsByHost: GetLocations failed, ec %d", get_result.ec);
+                has_failure = true;
+            }
+        }
+        cursor = next_cursor;
+    } while (cursor != SCAN_BASE_CURSOR);
+
+    return has_failure ? EC_PARTIAL_OK : EC_OK;
 }
 
 } // namespace kv_cache_manager

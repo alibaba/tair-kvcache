@@ -61,6 +61,10 @@ public:
                         const proto::meta::GetClusterInfoRequest *request,
                         proto::meta::GetClusterInfoResponse *response);
 
+    void ReportEvent(RequestContext *request_context,
+                     const proto::meta::ReportEventRequest *request,
+                     proto::meta::ReportEventResponse *response);
+
 private:
     std::shared_ptr<CacheManager> cache_manager_;
     std::shared_ptr<MetricsReporter> metrics_reporter_;
