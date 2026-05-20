@@ -467,4 +467,11 @@ bool SchedulePlanExecutor::SubmitNonBlocking(const CacheLocationDelRequest &req)
     return SubmitRaw([this, req]() { Submit(req); }, std::chrono::microseconds{0});
 }
 
+bool SchedulePlanExecutor::SubmitTask(std::function<void()> task, std::chrono::microseconds delay) {
+    if (!task) {
+        return false;
+    }
+    return SubmitRaw(std::move(task), delay);
+}
+
 } // namespace kv_cache_manager

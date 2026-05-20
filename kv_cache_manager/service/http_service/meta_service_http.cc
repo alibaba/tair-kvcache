@@ -35,6 +35,7 @@ void MetaServiceHttp::RegisterHandler() {
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, removeCache, RemoveCache, Common, RemoveCache);
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, trimCache, TrimCache, Common, TrimCache);
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, getClusterInfo, GetClusterInfo, GetClusterInfo, GetClusterInfo);
+    REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, reportEvent, ReportEvent, ReportEvent, ReportEvent);
 }
 
 void MetaServiceHttp::RegisterInstance(coro_http::coro_http_connection *http_conn,
@@ -148,6 +149,35 @@ void MetaServiceHttp::GetClusterInfo(coro_http::coro_http_connection *http_conn,
                    request->trace_id().c_str(),
                    request->ShortDebugString().c_str());
     meta_service_impl_->GetClusterInfo(request_context, request, response);
+}
+
+void MetaServiceHttp::ReportEvent(coro_http::coro_http_connection *http_conn,
+                                  proto::meta::ReportEventRequest *request,
+                                  proto::meta::ReportEventResponse *response) {
+    API_CONTEXT_GET_COLLECTOR_AND_INIT_HTTP(ReportEvent, __NOTHING__);
+    KVCM_LOG_INFO("[traceId: %s] ReportEvent called, instance_id: %s, host_ip_port: %s, event_count: %d",
+                  request->trace_id().c_str(),
+                  request->instance_id().c_str(),
+                  request->host_ip_port().c_str(),
+                  request->events_size());
+    bool has_block_add = false, has_block_delete = false;
+    for (int i = 0; i < request->events_size(); ++i) {
+        if (request->events(i).event_type() == proto::meta::EVENT_BLOCK_ADD)
+            has_block_add = true;
+        if (request->events(i).event_type() == proto::meta::EVENT_BLOCK_DELETE)
+            has_block_delete = true;
+    }
+    if (has_block_add && !request->instance_id().empty()) {
+        auto mc = get_metrics_collector_from_map_for_EventBlockAdd(request->instance_id());
+        if (mc)
+            request_context->GetMetricsCollectorsVehicle().AddMetricsCollector(mc);
+    }
+    if (has_block_delete && !request->instance_id().empty()) {
+        auto mc = get_metrics_collector_from_map_for_EventBlockDelete(request->instance_id());
+        if (mc)
+            request_context->GetMetricsCollectorsVehicle().AddMetricsCollector(mc);
+    }
+    meta_service_impl_->ReportEvent(request_context, request, response);
 }
 
 } // namespace kv_cache_manager

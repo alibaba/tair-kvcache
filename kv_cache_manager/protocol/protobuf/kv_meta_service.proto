@@ -40,6 +40,7 @@ enum StorageType {
     ST_NFS = 4;
     ST_VCNS_3FS = 5;
     ST_DUMMY = 6;
+    ST_VINEYARD = 7;
 }
 
 // 使用URI统一多种存储表示，由client或者connector负责解析

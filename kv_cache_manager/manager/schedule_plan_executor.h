@@ -76,6 +76,10 @@ public:
     bool SubmitNonBlocking(const CacheMetaDelRequest &req);
     bool SubmitNonBlocking(const CacheLocationDelRequest &req);
 
+    // Generic fire-and-forget submission for ad-hoc work (e.g. HOST_DOWN
+    // cleanup). Returns false if the executor is stopping.
+    bool SubmitTask(std::function<void()> task, std::chrono::microseconds delay = std::chrono::microseconds(0));
+
 private:
     std::shared_ptr<MetaIndexerManager> meta_manager_;
     std::shared_ptr<DataStorageManager> data_storage_manager_;
