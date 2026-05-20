@@ -11,7 +11,9 @@ using namespace kv_cache_manager;
 #define D_MEMPOOL DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL
 #define D_UNKNOWN DataStorageType::DATA_STORAGE_TYPE_UNKNOWN
 
-static CheckLocDataExistFunc dummy_check_loc_data_exist = [](const CacheLocation &) -> bool { return true; };
+static CheckLocDataExistFunc dummy_check_loc_data_exist = [](const CacheLocation &) -> LocCheckResult {
+    return LocCheckResult::EXIST;
+};
 static std::vector<std::string> dummy_loc_ids;
 
 class SelectLocationPolicyTest : public TESTBASE {
@@ -115,7 +117,7 @@ TEST_F(SelectLocationPolicyTest, TestStaticWeightSLPolicySelectForMatchWithStale
     //     all pruned, returns nullptr
     {
         auto location_map = GenLocationMap({{CLS_SERVING, D_3FS, "3fs_01"}, {CLS_SERVING, D_NFS, "nfs_01"}});
-        auto stale_check = [](const CacheLocation &) -> bool { return false; };
+        auto stale_check = [](const CacheLocation &) -> LocCheckResult { return LocCheckResult::NOT_EXIST; };
         std::vector<std::string> prune_loc_ids;
         CacheLocationConstPtr location = policy.SelectForMatch(location_map, stale_check, prune_loc_ids);
         ASSERT_TRUE(location->location_specs().empty());
@@ -130,8 +132,9 @@ TEST_F(SelectLocationPolicyTest, TestStaticWeightSLPolicySelectForMatchWithStale
         auto location_map = GenLocationMap(
             {{CLS_SERVING, D_3FS, "3fs_01"}, {CLS_SERVING, D_NFS, "nfs_01"}, {CLS_SERVING, D_MEMPOOL, "pace_01"}});
         // 3fs is stale, nfs and mempool are valid
-        auto stale_check = [](const CacheLocation &loc) -> bool {
-            return loc.type() != DataStorageType::DATA_STORAGE_TYPE_HF3FS;
+        auto stale_check = [](const CacheLocation &loc) -> LocCheckResult {
+            return loc.type() == DataStorageType::DATA_STORAGE_TYPE_HF3FS ? LocCheckResult::NOT_EXIST
+                                                                          : LocCheckResult::EXIST;
         };
         for (int i = 0; i < 100; ++i) {
             std::vector<std::string> prune_loc_ids;
@@ -147,7 +150,7 @@ TEST_F(SelectLocationPolicyTest, TestStaticWeightSLPolicySelectForMatchWithStale
     {
         auto location_map = GenLocationMap(
             {{CLS_WRITING, D_3FS, "3fs_01"}, {CLS_NOT_FOUND, D_NFS, "nfs_01"}, {CLS_SERVING, D_MEMPOOL, "pace_01"}});
-        auto stale_check = [](const CacheLocation &) -> bool { return false; };
+        auto stale_check = [](const CacheLocation &) -> LocCheckResult { return LocCheckResult::NOT_EXIST; };
         std::vector<std::string> prune_loc_ids;
         CacheLocationConstPtr location = policy.SelectForMatch(location_map, stale_check, prune_loc_ids);
         // only the CLS_SERVING entry is checked; it is stale and pruned
@@ -159,7 +162,7 @@ TEST_F(SelectLocationPolicyTest, TestStaticWeightSLPolicySelectForMatchWithStale
     //     pruned, returns nullptr
     {
         auto location_map = GenLocationMap({{CLS_SERVING, D_3FS, "3fs_01"}});
-        auto stale_check = [](const CacheLocation &) -> bool { return false; };
+        auto stale_check = [](const CacheLocation &) -> LocCheckResult { return LocCheckResult::NOT_EXIST; };
         std::vector<std::string> prune_loc_ids;
         CacheLocationConstPtr location = policy.SelectForMatch(location_map, stale_check, prune_loc_ids);
         ASSERT_TRUE(location->location_specs().empty());
@@ -203,7 +206,7 @@ TEST_F(SelectLocationPolicyTest, TestStaticWeightSLPolicyExistsForWriteWithStale
     //     prune list populated, returns false
     {
         auto location_map = GenLocationMap({{CLS_SERVING, D_3FS, "3fs_01"}});
-        auto stale_check = [](const CacheLocation &) -> bool { return false; };
+        auto stale_check = [](const CacheLocation &) -> LocCheckResult { return LocCheckResult::NOT_EXIST; };
         std::vector<std::string> prune_loc_ids;
         ASSERT_FALSE(policy.ExistsForWrite(location_map, stale_check, prune_loc_ids));
         ASSERT_EQ(prune_loc_ids.size(), 1u);
@@ -213,7 +216,7 @@ TEST_F(SelectLocationPolicyTest, TestStaticWeightSLPolicyExistsForWriteWithStale
     //     all pruned, returns false
     {
         auto location_map = GenLocationMap({{CLS_SERVING, D_3FS, "3fs_01"}, {CLS_SERVING, D_NFS, "nfs_01"}});
-        auto stale_check = [](const CacheLocation &) -> bool { return false; };
+        auto stale_check = [](const CacheLocation &) -> LocCheckResult { return LocCheckResult::NOT_EXIST; };
         std::vector<std::string> prune_loc_ids;
         ASSERT_FALSE(policy.ExistsForWrite(location_map, stale_check, prune_loc_ids));
         ASSERT_EQ(prune_loc_ids.size(), 2u);
@@ -222,7 +225,7 @@ TEST_F(SelectLocationPolicyTest, TestStaticWeightSLPolicyExistsForWriteWithStale
     //     not pruned, bypasses stale check, returns true
     {
         auto location_map = GenLocationMap({{CLS_WRITING, D_3FS, "3fs_01"}});
-        auto stale_check = [](const CacheLocation &) -> bool { return false; };
+        auto stale_check = [](const CacheLocation &) -> LocCheckResult { return LocCheckResult::NOT_EXIST; };
         std::vector<std::string> prune_loc_ids;
         ASSERT_TRUE(policy.ExistsForWrite(location_map, stale_check, prune_loc_ids));
         ASSERT_TRUE(prune_loc_ids.empty());
@@ -232,7 +235,7 @@ TEST_F(SelectLocationPolicyTest, TestStaticWeightSLPolicyExistsForWriteWithStale
     {
         auto location_map = GenLocationMap(
             {{CLS_SERVING, D_3FS, "3fs_01"}, {CLS_SERVING, D_NFS, "nfs_01"}, {CLS_NOT_FOUND, D_MEMPOOL, "pace_01"}});
-        auto stale_check = [](const CacheLocation &) -> bool { return false; };
+        auto stale_check = [](const CacheLocation &) -> LocCheckResult { return LocCheckResult::NOT_EXIST; };
         std::vector<std::string> prune_loc_ids;
         ASSERT_FALSE(policy.ExistsForWrite(location_map, stale_check, prune_loc_ids));
         ASSERT_EQ(prune_loc_ids.size(), 2u);
@@ -243,7 +246,7 @@ TEST_F(SelectLocationPolicyTest, TestStaticWeightSLPolicyExistsForWriteWithStale
     {
         auto location_map = GenLocationMap(
             {{CLS_SERVING, D_NFS, "nfs_01"}, {CLS_SERVING, D_MEMPOOL, "pace_01"}, {CLS_WRITING, D_3FS, "3fs_01"}});
-        auto stale_check = [](const CacheLocation &) -> bool { return false; };
+        auto stale_check = [](const CacheLocation &) -> LocCheckResult { return LocCheckResult::NOT_EXIST; };
         std::vector<std::string> prune_loc_ids;
         ASSERT_TRUE(policy.ExistsForWrite(location_map, stale_check, prune_loc_ids));
         ASSERT_EQ(prune_loc_ids.size(), 2u);
@@ -255,8 +258,9 @@ TEST_F(SelectLocationPolicyTest, TestStaticWeightSLPolicyExistsForWriteWithStale
     //     stale entry pruned, returns true, prune list complete
     {
         auto location_map = GenLocationMap({{CLS_SERVING, D_3FS, "3fs_01"}, {CLS_SERVING, D_NFS, "nfs_01"}});
-        auto stale_check = [](const CacheLocation &loc) -> bool {
-            return loc.type() != DataStorageType::DATA_STORAGE_TYPE_HF3FS;
+        auto stale_check = [](const CacheLocation &loc) -> LocCheckResult {
+            return loc.type() == DataStorageType::DATA_STORAGE_TYPE_HF3FS ? LocCheckResult::NOT_EXIST
+                                                                          : LocCheckResult::EXIST;
         };
         std::vector<std::string> prune_loc_ids;
         ASSERT_TRUE(policy.ExistsForWrite(location_map, stale_check, prune_loc_ids));
@@ -322,7 +326,7 @@ TEST_F(SelectLocationPolicyTest, TestDynamicWeightSLPolicySelectForMatchWithStal
     //     all pruned, returns nullptr
     {
         auto location_map = GenLocationMap({{CLS_SERVING, D_3FS, "3fs_01"}, {CLS_SERVING, D_MOONCAKE, "mooncake_01"}});
-        auto stale_check = [](const CacheLocation &) -> bool { return false; };
+        auto stale_check = [](const CacheLocation &) -> LocCheckResult { return LocCheckResult::NOT_EXIST; };
         std::vector<std::string> prune_loc_ids;
         CacheLocationConstPtr location = policy.SelectForMatch(location_map, stale_check, prune_loc_ids);
         ASSERT_TRUE(location->location_specs().empty());
@@ -335,8 +339,9 @@ TEST_F(SelectLocationPolicyTest, TestDynamicWeightSLPolicySelectForMatchWithStal
                                             {CLS_SERVING, D_MOONCAKE, "mooncake_01"},
                                             {CLS_SERVING, D_MEMPOOL, "pace_01"}});
         // 3fs is stale, mooncake and mempool are valid
-        auto stale_check = [](const CacheLocation &loc) -> bool {
-            return loc.type() != DataStorageType::DATA_STORAGE_TYPE_HF3FS;
+        auto stale_check = [](const CacheLocation &loc) -> LocCheckResult {
+            return loc.type() == DataStorageType::DATA_STORAGE_TYPE_HF3FS ? LocCheckResult::NOT_EXIST
+                                                                          : LocCheckResult::EXIST;
         };
         for (int i = 0; i < 100; ++i) {
             std::vector<std::string> prune_loc_ids;
@@ -351,7 +356,7 @@ TEST_F(SelectLocationPolicyTest, TestDynamicWeightSLPolicySelectForMatchWithStal
     //     not selected, only CLS_SERVING pruned
     {
         auto location_map = GenLocationMap({{CLS_WRITING, D_3FS, "3fs_01"}, {CLS_SERVING, D_MOONCAKE, "mooncake_01"}});
-        auto stale_check = [](const CacheLocation &) -> bool { return false; };
+        auto stale_check = [](const CacheLocation &) -> LocCheckResult { return LocCheckResult::NOT_EXIST; };
         std::vector<std::string> prune_loc_ids;
         CacheLocationConstPtr location = policy.SelectForMatch(location_map, stale_check, prune_loc_ids);
         ASSERT_TRUE(location->location_specs().empty());
@@ -363,7 +368,7 @@ TEST_F(SelectLocationPolicyTest, TestDynamicWeightSLPolicySelectForMatchWithStal
     //     still pruned
     {
         auto location_map = GenLocationMap({{CLS_SERVING, D_NFS, "nfs_01"}, {CLS_SERVING, D_3FS, "3fs_01"}});
-        auto stale_check = [](const CacheLocation &) -> bool { return false; };
+        auto stale_check = [](const CacheLocation &) -> LocCheckResult { return LocCheckResult::NOT_EXIST; };
         std::vector<std::string> prune_loc_ids;
         CacheLocationConstPtr location = policy.SelectForMatch(location_map, stale_check, prune_loc_ids);
         ASSERT_TRUE(location->location_specs().empty());
@@ -425,7 +430,7 @@ TEST_F(SelectLocationPolicyTest, TestDynamicWeightSLPolicyExistsForWriteWithStal
     //     pruned, returns false
     {
         auto location_map = GenLocationMap({{CLS_SERVING, D_3FS, "3fs_01"}});
-        auto stale_check = [](const CacheLocation &) -> bool { return false; };
+        auto stale_check = [](const CacheLocation &) -> LocCheckResult { return LocCheckResult::NOT_EXIST; };
         std::vector<std::string> prune_loc_ids;
         ASSERT_FALSE(policy.ExistsForWrite(location_map, stale_check, prune_loc_ids));
         ASSERT_EQ(prune_loc_ids.size(), 1u);
@@ -434,7 +439,7 @@ TEST_F(SelectLocationPolicyTest, TestDynamicWeightSLPolicyExistsForWriteWithStal
     //     all pruned, returns false
     {
         auto location_map = GenLocationMap({{CLS_SERVING, D_3FS, "3fs_01"}, {CLS_SERVING, D_MOONCAKE, "mooncake_01"}});
-        auto stale_check = [](const CacheLocation &) -> bool { return false; };
+        auto stale_check = [](const CacheLocation &) -> LocCheckResult { return LocCheckResult::NOT_EXIST; };
         std::vector<std::string> prune_loc_ids;
         ASSERT_FALSE(policy.ExistsForWrite(location_map, stale_check, prune_loc_ids));
         ASSERT_EQ(prune_loc_ids.size(), 2u);
@@ -443,7 +448,7 @@ TEST_F(SelectLocationPolicyTest, TestDynamicWeightSLPolicyExistsForWriteWithStal
     //     bypasses stale check, not pruned, returns true
     {
         auto location_map = GenLocationMap({{CLS_WRITING, D_3FS, "3fs_01"}});
-        auto stale_check = [](const CacheLocation &) -> bool { return false; };
+        auto stale_check = [](const CacheLocation &) -> LocCheckResult { return LocCheckResult::NOT_EXIST; };
         std::vector<std::string> prune_loc_ids;
         ASSERT_TRUE(policy.ExistsForWrite(location_map, stale_check, prune_loc_ids));
         ASSERT_TRUE(prune_loc_ids.empty());
@@ -454,7 +459,7 @@ TEST_F(SelectLocationPolicyTest, TestDynamicWeightSLPolicyExistsForWriteWithStal
         auto location_map = GenLocationMap({{CLS_SERVING, D_MOONCAKE, "mooncake_01"},
                                             {CLS_SERVING, D_3FS, "3fs_01"},
                                             {CLS_WRITING, D_MEMPOOL, "pace_01"}});
-        auto stale_check = [](const CacheLocation &) -> bool { return false; };
+        auto stale_check = [](const CacheLocation &) -> LocCheckResult { return LocCheckResult::NOT_EXIST; };
         std::vector<std::string> prune_loc_ids;
         ASSERT_TRUE(policy.ExistsForWrite(location_map, stale_check, prune_loc_ids));
         ASSERT_EQ(prune_loc_ids.size(), 2u);
@@ -466,8 +471,9 @@ TEST_F(SelectLocationPolicyTest, TestDynamicWeightSLPolicyExistsForWriteWithStal
     //     stale entry pruned, returns true, prune list complete
     {
         auto location_map = GenLocationMap({{CLS_SERVING, D_3FS, "3fs_01"}, {CLS_SERVING, D_MOONCAKE, "mooncake_01"}});
-        auto stale_check = [](const CacheLocation &loc) -> bool {
-            return loc.type() != DataStorageType::DATA_STORAGE_TYPE_HF3FS;
+        auto stale_check = [](const CacheLocation &loc) -> LocCheckResult {
+            return loc.type() == DataStorageType::DATA_STORAGE_TYPE_HF3FS ? LocCheckResult::NOT_EXIST
+                                                                          : LocCheckResult::EXIST;
         };
         std::vector<std::string> prune_loc_ids;
         ASSERT_TRUE(policy.ExistsForWrite(location_map, stale_check, prune_loc_ids));
@@ -519,7 +525,7 @@ TEST_F(SelectLocationPolicyTest, TestNamedStorageWeightedSLPolicySelectForMatchW
     //     all pruned, returns nullptr
     {
         auto location_map = GenLocationMap({{CLS_SERVING, D_3FS, "3fs_01"}, {CLS_SERVING, D_NFS, "nfs_01"}});
-        auto stale_check = [](const CacheLocation &) -> bool { return false; };
+        auto stale_check = [](const CacheLocation &) -> LocCheckResult { return LocCheckResult::NOT_EXIST; };
         std::vector<std::string> prune_loc_ids;
         CacheLocationConstPtr location = policy.SelectForMatch(location_map, stale_check, prune_loc_ids);
         ASSERT_TRUE(location->location_specs().empty());
@@ -531,8 +537,9 @@ TEST_F(SelectLocationPolicyTest, TestNamedStorageWeightedSLPolicySelectForMatchW
         auto location_map = GenLocationMap(
             {{CLS_SERVING, D_3FS, "3fs_01"}, {CLS_SERVING, D_NFS, "nfs_01"}, {CLS_SERVING, D_MEMPOOL, "pace_01"}});
         // 3fs is stale, nfs and mempool are valid
-        auto stale_check = [](const CacheLocation &loc) -> bool {
-            return loc.type() != DataStorageType::DATA_STORAGE_TYPE_HF3FS;
+        auto stale_check = [](const CacheLocation &loc) -> LocCheckResult {
+            return loc.type() == DataStorageType::DATA_STORAGE_TYPE_HF3FS ? LocCheckResult::NOT_EXIST
+                                                                          : LocCheckResult::EXIST;
         };
         for (int i = 0; i < 100; ++i) {
             std::vector<std::string> prune_loc_ids;
@@ -547,7 +554,7 @@ TEST_F(SelectLocationPolicyTest, TestNamedStorageWeightedSLPolicySelectForMatchW
     //     stale CLS_SERVING pruned
     {
         auto location_map = GenLocationMap({{CLS_WRITING, D_3FS, "3fs_01"}, {CLS_SERVING, D_NFS, "nfs_01"}});
-        auto stale_check = [](const CacheLocation &) -> bool { return false; };
+        auto stale_check = [](const CacheLocation &) -> LocCheckResult { return LocCheckResult::NOT_EXIST; };
         std::vector<std::string> prune_loc_ids;
         CacheLocationConstPtr location = policy.SelectForMatch(location_map, stale_check, prune_loc_ids);
         ASSERT_TRUE(location->location_specs().empty());
@@ -559,7 +566,7 @@ TEST_F(SelectLocationPolicyTest, TestNamedStorageWeightedSLPolicySelectForMatchW
     //     still pruned (stale-data check runs before the weight check)
     {
         auto location_map = GenLocationMap({{CLS_SERVING, D_3FS, "3fs_02"}, {CLS_SERVING, D_3FS, "3fs_01"}});
-        auto stale_check = [](const CacheLocation &) -> bool { return false; };
+        auto stale_check = [](const CacheLocation &) -> LocCheckResult { return LocCheckResult::NOT_EXIST; };
         std::vector<std::string> prune_loc_ids;
         CacheLocationConstPtr location = policy.SelectForMatch(location_map, stale_check, prune_loc_ids);
         ASSERT_TRUE(location->location_specs().empty());
@@ -607,7 +614,7 @@ TEST_F(SelectLocationPolicyTest, TestNamedStorageWeightedSLPolicyExistsForWriteW
     //     pruned, returns false
     {
         auto location_map = GenLocationMap({{CLS_SERVING, D_3FS, "3fs_01"}});
-        auto stale_check = [](const CacheLocation &) -> bool { return false; };
+        auto stale_check = [](const CacheLocation &) -> LocCheckResult { return LocCheckResult::NOT_EXIST; };
         std::vector<std::string> prune_loc_ids;
         ASSERT_FALSE(policy.ExistsForWrite(location_map, stale_check, prune_loc_ids));
         ASSERT_EQ(prune_loc_ids.size(), 1u);
@@ -616,7 +623,7 @@ TEST_F(SelectLocationPolicyTest, TestNamedStorageWeightedSLPolicyExistsForWriteW
     //     all pruned, returns false
     {
         auto location_map = GenLocationMap({{CLS_SERVING, D_3FS, "3fs_01"}, {CLS_SERVING, D_NFS, "nfs_01"}});
-        auto stale_check = [](const CacheLocation &) -> bool { return false; };
+        auto stale_check = [](const CacheLocation &) -> LocCheckResult { return LocCheckResult::NOT_EXIST; };
         std::vector<std::string> prune_loc_ids;
         ASSERT_FALSE(policy.ExistsForWrite(location_map, stale_check, prune_loc_ids));
         ASSERT_EQ(prune_loc_ids.size(), 2u);
@@ -625,7 +632,7 @@ TEST_F(SelectLocationPolicyTest, TestNamedStorageWeightedSLPolicyExistsForWriteW
     //     bypasses stale check, not pruned, returns true
     {
         auto location_map = GenLocationMap({{CLS_WRITING, D_3FS, "3fs_01"}});
-        auto stale_check = [](const CacheLocation &) -> bool { return false; };
+        auto stale_check = [](const CacheLocation &) -> LocCheckResult { return LocCheckResult::NOT_EXIST; };
         std::vector<std::string> prune_loc_ids;
         ASSERT_TRUE(policy.ExistsForWrite(location_map, stale_check, prune_loc_ids));
         ASSERT_TRUE(prune_loc_ids.empty());
@@ -634,7 +641,7 @@ TEST_F(SelectLocationPolicyTest, TestNamedStorageWeightedSLPolicyExistsForWriteW
     //     does not make ExistsForWrite return true
     {
         auto location_map = GenLocationMap({{CLS_WRITING, D_MEMPOOL, "pace_01"}});
-        auto stale_check = [](const CacheLocation &) -> bool { return false; };
+        auto stale_check = [](const CacheLocation &) -> LocCheckResult { return LocCheckResult::NOT_EXIST; };
         std::vector<std::string> prune_loc_ids;
         ASSERT_FALSE(policy.ExistsForWrite(location_map, stale_check, prune_loc_ids));
         ASSERT_TRUE(prune_loc_ids.empty());
@@ -644,7 +651,7 @@ TEST_F(SelectLocationPolicyTest, TestNamedStorageWeightedSLPolicyExistsForWriteW
     {
         auto location_map = GenLocationMap(
             {{CLS_SERVING, D_3FS, "3fs_01"}, {CLS_SERVING, D_NFS, "nfs_01"}, {CLS_WRITING, D_3FS, "3fs_01"}});
-        auto stale_check = [](const CacheLocation &) -> bool { return false; };
+        auto stale_check = [](const CacheLocation &) -> LocCheckResult { return LocCheckResult::NOT_EXIST; };
         std::vector<std::string> prune_loc_ids;
         ASSERT_TRUE(policy.ExistsForWrite(location_map, stale_check, prune_loc_ids));
         ASSERT_EQ(prune_loc_ids.size(), 2u);
@@ -656,8 +663,9 @@ TEST_F(SelectLocationPolicyTest, TestNamedStorageWeightedSLPolicyExistsForWriteW
     //     stale entry pruned, returns true, prune list complete
     {
         auto location_map = GenLocationMap({{CLS_SERVING, D_3FS, "3fs_01"}, {CLS_SERVING, D_NFS, "nfs_01"}});
-        auto stale_check = [](const CacheLocation &loc) -> bool {
-            return loc.type() != DataStorageType::DATA_STORAGE_TYPE_HF3FS;
+        auto stale_check = [](const CacheLocation &loc) -> LocCheckResult {
+            return loc.type() == DataStorageType::DATA_STORAGE_TYPE_HF3FS ? LocCheckResult::NOT_EXIST
+                                                                          : LocCheckResult::EXIST;
         };
         std::vector<std::string> prune_loc_ids;
         ASSERT_TRUE(policy.ExistsForWrite(location_map, stale_check, prune_loc_ids));

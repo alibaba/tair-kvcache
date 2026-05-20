@@ -5,6 +5,7 @@
 #include <utility>
 #include <vector>
 
+#include "kv_cache_manager/common/env_util.h"
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
@@ -24,9 +25,12 @@
 #define API_CALL_GUARD(api_name, is_leader_only)                                                                       \
     request_context->set_api_name(api_name);                                                                           \
     response->mutable_header()->set_request_id(request_context->request_id());                                         \
-    std::string request_debug;                                                                                         \
-    ProtoMessageJsonUtil::ToJson(request, request_debug);                                                              \
-    request_context->set_request_debug(request_debug);                                                                 \
+    static const bool kAccessLogWithPayload = EnvUtil::GetEnv<bool>("KVCM_ACCESS_LOG_WITH_PAYLOAD", true);             \
+    if (kAccessLogWithPayload) {                                                                                       \
+        std::string request_debug;                                                                                     \
+        ProtoMessageJsonUtil::ToJson(request, request_debug);                                                          \
+        request_context->set_request_debug(request_debug);                                                             \
+    }                                                                                                                  \
     if (!CheckAndIncrementRequestCount(is_leader_only)) {                                                              \
         auto *header = response->mutable_header();                                                                     \
         auto *status = header->mutable_status();                                                                       \
@@ -39,9 +43,11 @@
     }                                                                                                                  \
     ServiceCallGuard service_call_guard(                                                                               \
         cache_manager_.get(), request_context, metrics_reporter_.get(), [request_context, response, this]() {          \
-            std::string response_debug;                                                                                \
-            ProtoMessageJsonUtil::ToJson(response, response_debug);                                                    \
-            request_context->set_response_debug(response_debug);                                                       \
+            if (kAccessLogWithPayload) {                                                                               \
+                std::string response_debug;                                                                            \
+                ProtoMessageJsonUtil::ToJson(response, response_debug);                                                \
+                request_context->set_response_debug(response_debug);                                                   \
+            }                                                                                                          \
             DecrementRequestCount(is_leader_only);                                                                     \
         });
 
@@ -466,6 +472,70 @@ void MetaServiceImpl::StartWriteCache(RequestContext *request_context,
         KVCM_LOG_INFO("[traceId: %s] StartWriteCache succeeded, writeSessionId: %s, returned %d locations",
                       request->trace_id().c_str(),
                       write_session_id_res.c_str(),
+                      response->locations_size());
+    }
+    SET_SPAN_TRACER_STR_IN_HEADER(request_context);
+}
+
+void MetaServiceImpl::StartEvictWriteCache(RequestContext *request_context,
+                                           const proto::meta::StartEvictWriteCacheRequest *request,
+                                           proto::meta::StartWriteCacheResponse *response) {
+    SPAN_TRACER(request_context);
+    API_CALL_GUARD("StartEvictWriteCache", true);
+    auto *header = response->mutable_header();
+    auto *status = header->mutable_status();
+    std::string invalid_fields = "missing or invalid fields: ";
+
+    if (request->instance_id().empty()) {
+        CHECK_REQUIRED_FIELDS_VALIDATION("StartEvictWriteCache", "instance_id", true);
+        SET_SPAN_TRACER_STR_IN_HEADER(request_context);
+        return;
+    }
+    if (request->block_keys().empty() && request->token_ids().empty()) {
+        CHECK_REQUIRED_FIELDS_VALIDATION("StartEvictWriteCache", "block_keys and token_ids", true);
+        SET_SPAN_TRACER_STR_IN_HEADER(request_context);
+        return;
+    }
+
+    std::vector<std::string> location_spec_group_names;
+    location_spec_group_names.reserve(request->location_spec_group_names_size());
+    for (const auto &name : request->location_spec_group_names()) {
+        location_spec_group_names.push_back(name);
+    }
+
+    int32_t min_replica_count = request->min_replica_count();
+    if (min_replica_count <= 0) {
+        min_replica_count = 2;
+    }
+
+    auto [ec_info, start_write_info] = cache_manager_->StartEvictWriteCache(
+        request_context,
+        request->instance_id(),
+        std::vector<int64_t>(request->block_keys().begin(), request->block_keys().end()),
+        std::vector<int64_t>(request->token_ids().begin(), request->token_ids().end()),
+        location_spec_group_names,
+        request->write_timeout_seconds(),
+        min_replica_count);
+
+    if (ec_info != EC_OK) {
+        status->set_code(ToMetaPbError(ec_info));
+        request_context->set_status_code(status->code());
+        status->set_message("Failed to start evict write cache : " + request_context->error_tracer()->ToJsonString());
+        KVCM_LOG_ERROR("[traceId: %s] StartEvictWriteCache failed", request->trace_id().c_str());
+    } else {
+        response->set_write_session_id(start_write_info.write_session_id());
+        auto *block_mask_meta = response->mutable_block_mask();
+        ProtoConvert::BlockMaskToProto(start_write_info.block_mask(), block_mask_meta);
+        CacheLocationViewVecWrapper cache_locations_res(std::move(start_write_info.locations_mut()));
+        for (const auto &cache_location : cache_locations_res.cache_locations_view()) {
+            auto *location_meta = response->add_locations();
+            ProtoConvert::CacheLocationViewToProto(cache_location, location_meta);
+        }
+        status->set_code(proto::meta::OK);
+        request_context->set_status_code(status->code());
+        KVCM_LOG_INFO("[traceId: %s] StartEvictWriteCache succeeded, writeSessionId: %s, returned %d locations",
+                      request->trace_id().c_str(),
+                      start_write_info.write_session_id().c_str(),
                       response->locations_size());
     }
     SET_SPAN_TRACER_STR_IN_HEADER(request_context);
