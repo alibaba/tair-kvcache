@@ -6,6 +6,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -20,6 +21,7 @@
 #include "kv_cache_manager/config/meta_cache_policy_config.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
+#include "kv_cache_manager/data_storage/vineyard_backend.h"
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/event/spec_events/optimizer_event.h"
 #include "kv_cache_manager/manager/cache_manager_metrics_recorder.h"
@@ -34,6 +36,7 @@
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
+#include "kv_cache_manager/meta/types.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/protocol/protobuf/meta_service.pb.h"
@@ -1101,6 +1104,439 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
         new_locations.push_back(std::move(cache_location));
     }
     return EC_OK;
+}
+
+// --------------------------------------------------------------------------
+// ReportEvent implementation (V8: batch + heartbeat + medium-aware)
+// --------------------------------------------------------------------------
+
+namespace {
+
+// Storage unique_name convention for V6D: "v6d_{instance_id}".
+std::string VineyardStorageNameFromInstance(const std::string &instance_id) { return "v6d_" + instance_id; }
+
+// V8 location_id format: "kvs#v6d#{medium}#{host_ip_port}".
+std::string BuildVineyardLocationId(const std::string &medium, const std::string &host_ip_port) {
+    std::string id;
+    id.reserve(8 + medium.size() + 1 + host_ip_port.size());
+    id.append("kvs#v6d#");
+    id.append(medium);
+    id.push_back('#');
+    id.append(host_ip_port);
+    return id;
+}
+
+// Tail used to identify all V6D locations belonging to one host (any medium).
+std::string VineyardHostSuffix(const std::string &host_ip_port) { return "#" + host_ip_port; }
+
+bool ParseInt64(const std::string &s, int64_t &out) {
+    try {
+        size_t consumed = 0;
+        int64_t v = std::stoll(s, &consumed);
+        if (consumed != s.size()) {
+            return false;
+        }
+        out = v;
+        return true;
+    } catch (...) { return false; }
+}
+
+VineyardBackend *LookupVineyardBackend(const std::shared_ptr<RegistryManager> &registry_manager,
+                                       const std::string &instance_id) {
+    if (!registry_manager || !registry_manager->data_storage_manager()) {
+        return nullptr;
+    }
+    auto backend =
+        registry_manager->data_storage_manager()->GetDataStorageBackend(VineyardStorageNameFromInstance(instance_id));
+    if (!backend) {
+        return nullptr;
+    }
+    return dynamic_cast<VineyardBackend *>(backend.get());
+}
+
+} // anonymous namespace
+
+ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
+                                    const proto::meta::ReportEventRequest *request,
+                                    proto::meta::ReportEventResponse *response) {
+    SPAN_TRACER(request_context);
+    const std::string &trace_id = request_context->trace_id();
+    const std::string &instance_id = request->instance_id();
+    const std::string &host_ip_port = request->host_ip_port();
+    auto *response_status = response->mutable_header()->mutable_status();
+
+    if (instance_id.empty() || host_ip_port.empty()) {
+        KVCM_LOG_WARN("trace_id [%s] | ReportEvent: empty instance_id or host_ip_port", trace_id.c_str());
+        response_status->set_code(proto::meta::INVALID_ARGUMENT);
+        response_status->set_message("empty instance_id or host_ip_port");
+        return EC_BADARGS;
+    }
+    if (request->events_size() == 0) {
+        response_status->set_code(proto::meta::OK);
+        return EC_OK;
+    }
+
+    auto *vineyard_backend = LookupVineyardBackend(registry_manager_, instance_id);
+    if (!vineyard_backend) {
+        KVCM_LOG_WARN(
+            "trace_id [%s] | ReportEvent: VineyardBackend [v6d_%s] not found", trace_id.c_str(), instance_id.c_str());
+        response_status->set_code(proto::meta::INSTANCE_NOT_EXIST);
+        response_status->set_message("VineyardBackend not found for instance: " + instance_id);
+        return EC_INSTANCE_NOT_EXIST;
+    }
+
+    // Ensure the LivenessCheckerLoop knows how to drive cleanup. Setting the
+    // callback every time is cheap (a function copy) and avoids a chicken-and-
+    // egg problem -- VineyardBackend::DoOpen runs before CacheManager exists,
+    // so we can only inject this hook lazily from here.
+    vineyard_backend->SetCleanupCallback([this, instance_id](const std::string &down_host) {
+        if (this->schedule_plan_executor_) {
+            this->schedule_plan_executor_->SubmitTask(
+                [this, instance_id, down_host] { this->CleanupHostLocations(instance_id, down_host); });
+        } else {
+            std::thread([this, instance_id, down_host] {
+                this->CleanupHostLocations(instance_id, down_host);
+            }).detach();
+        }
+    });
+
+    MetaSearcher *meta_searcher = meta_searcher_manager_->GetMetaSearcher(instance_id);
+    if (!meta_searcher) {
+        KVCM_LOG_WARN("trace_id [%s] | ReportEvent: meta searcher not found for instance [%s]",
+                      trace_id.c_str(),
+                      instance_id.c_str());
+        response_status->set_code(proto::meta::INSTANCE_NOT_EXIST);
+        response_status->set_message("meta searcher not found for instance: " + instance_id);
+        return EC_INSTANCE_NOT_EXIST;
+    }
+
+    const int events_size = request->events_size();
+    std::vector<ErrorCode> per_item_ec(events_size, EC_OK);
+
+    // Aggregation buckets per V8 §2.3.2:
+    //   - register_mediums:  union of mediums across all NODE_REGISTER items
+    //   - heartbeat_status:  most recent system_status payload (HEARTBEAT items)
+    //   - block_add_*:       parallel arrays of (block_key, location) for batch upsert
+    //   - block_del_*:       parallel arrays of (block_key, location_id) for batch delete
+    //   - host_down:         bool flag; triggers SetNodeUnavailable + CleanupHostLocations once
+    //   - has_register / has_heartbeat: gate optional follow-up calls
+    bool has_register = false;
+    bool has_heartbeat = false;
+    bool has_host_down = false;
+    std::vector<std::string> register_mediums;
+    std::map<std::string, std::string> heartbeat_status;
+
+    // Per-block aggregation:
+    //   block_to_add[block_key] = vector<BlockAddEntry>   # upsert
+    //   block_to_del[block_key] = vector<BlockDelEntry>   # remove
+    // The same block_key + same medium repeated within a batch will get the
+    // last-writer-wins semantics inside the modifier.
+    struct BlockAddEntry {
+        std::string location_id;
+        std::vector<LocationSpec> specs;
+        int event_index;
+    };
+    struct BlockDelEntry {
+        std::string location_id;
+        int event_index;
+    };
+    std::map<int64_t, std::vector<BlockAddEntry>> block_to_add;
+    std::map<int64_t, std::vector<BlockDelEntry>> block_to_del;
+
+    for (int i = 0; i < events_size; ++i) {
+        const auto &item = request->events(i);
+        switch (item.event_type()) {
+        case proto::meta::EVENT_NODE_REGISTER: {
+            has_register = true;
+            if (item.has_node_register()) {
+                for (const auto &m : item.node_register().mediums()) {
+                    if (std::find(register_mediums.begin(), register_mediums.end(), m) == register_mediums.end()) {
+                        register_mediums.push_back(m);
+                    }
+                }
+            }
+            break;
+        }
+        case proto::meta::EVENT_HEARTBEAT: {
+            has_heartbeat = true;
+            if (item.has_heartbeat()) {
+                // Last-writer-wins inside the batch: KVCM only needs the latest payload.
+                heartbeat_status.clear();
+                for (const auto &kv : item.heartbeat().system_status()) {
+                    heartbeat_status[kv.first] = kv.second;
+                }
+            }
+            break;
+        }
+        case proto::meta::EVENT_HOST_DOWN: {
+            has_host_down = true;
+            break;
+        }
+        case proto::meta::EVENT_BLOCK_ADD: {
+            if (!item.has_block_add()) {
+                per_item_ec[i] = EC_BADARGS;
+                break;
+            }
+            const auto &p = item.block_add();
+            int64_t block_key = 0;
+            if (!ParseInt64(p.block_key(), block_key)) {
+                KVCM_LOG_WARN(
+                    "trace_id [%s] | EVENT_BLOCK_ADD: invalid block_key [%s]", trace_id.c_str(), p.block_key().c_str());
+                per_item_ec[i] = EC_BADARGS;
+                break;
+            }
+            if (p.medium().empty()) {
+                KVCM_LOG_WARN(
+                    "trace_id [%s] | EVENT_BLOCK_ADD: empty medium for block_key [%ld]", trace_id.c_str(), block_key);
+                per_item_ec[i] = EC_BADARGS;
+                break;
+            }
+            if (p.specs_size() == 0) {
+                KVCM_LOG_WARN(
+                    "trace_id [%s] | EVENT_BLOCK_ADD: empty specs for block_key [%ld]", trace_id.c_str(), block_key);
+                per_item_ec[i] = EC_BADARGS;
+                break;
+            }
+            std::string location_id = BuildVineyardLocationId(p.medium(), host_ip_port);
+            std::vector<LocationSpec> entry_specs;
+            entry_specs.reserve(p.specs_size());
+            for (const auto &s : p.specs()) {
+                entry_specs.emplace_back(s.name(), s.uri());
+            }
+            block_to_add[block_key].push_back(BlockAddEntry{std::move(location_id), std::move(entry_specs), i});
+            break;
+        }
+        case proto::meta::EVENT_BLOCK_DELETE: {
+            if (!item.has_block_delete()) {
+                per_item_ec[i] = EC_BADARGS;
+                break;
+            }
+            const auto &p = item.block_delete();
+            int64_t block_key = 0;
+            if (!ParseInt64(p.block_key(), block_key)) {
+                KVCM_LOG_WARN("trace_id [%s] | EVENT_BLOCK_DELETE: invalid block_key [%s]",
+                              trace_id.c_str(),
+                              p.block_key().c_str());
+                per_item_ec[i] = EC_BADARGS;
+                break;
+            }
+            if (p.medium().empty()) {
+                KVCM_LOG_WARN("trace_id [%s] | EVENT_BLOCK_DELETE: empty medium for block_key [%ld]",
+                              trace_id.c_str(),
+                              block_key);
+                per_item_ec[i] = EC_BADARGS;
+                break;
+            }
+            block_to_del[block_key].push_back(BlockDelEntry{BuildVineyardLocationId(p.medium(), host_ip_port), i});
+            break;
+        }
+        default:
+            KVCM_LOG_WARN("trace_id [%s] | ReportEvent: unknown event_type %d at index %d (ignored)",
+                          trace_id.c_str(),
+                          static_cast<int>(item.event_type()),
+                          i);
+            per_item_ec[i] = EC_BADARGS;
+            break;
+        }
+    }
+
+    // Apply NODE_REGISTER first so subsequent BLOCK_ADD/HEARTBEAT see a
+    // registered node entry. Idempotent re-registration also resurrects an
+    // unavailable node, matching the "register implies the node is up" intent.
+    if (has_register) {
+        auto ec = vineyard_backend->RegisterNode(host_ip_port, register_mediums);
+        if (ec != EC_OK) {
+            for (int i = 0; i < events_size; ++i) {
+                if (request->events(i).event_type() == proto::meta::EVENT_NODE_REGISTER) {
+                    per_item_ec[i] = ec;
+                }
+            }
+        } else {
+            KVCM_LOG_INFO("trace_id [%s] | NODE_REGISTER: host [%s] mediums=%zu in instance [%s]",
+                          trace_id.c_str(),
+                          host_ip_port.c_str(),
+                          register_mediums.size(),
+                          instance_id.c_str());
+        }
+    }
+
+    if (has_heartbeat) {
+        vineyard_backend->OnHeartbeat(host_ip_port, heartbeat_status);
+    }
+
+    // BLOCK_ADD / BLOCK_DELETE go through MetaSearcher::BatchUpsertLocations
+    // and BatchDeleteLocations: the searcher owns the indexer-facing modifier
+    // and storage-usage bookkeeping, while CacheManager keeps event-level
+    // concerns (per-item ec mapping, V6D ReportEvent sub-collectors).
+    auto find_sub_collector = [&request_context](const std::string &api_name) -> ServiceMetricsCollector * {
+        for (const auto &mc : request_context->GetMetricsCollectorsVehicle().GetMetricsCollectors()) {
+            auto *smc = dynamic_cast<ServiceMetricsCollector *>(mc.get());
+            if (smc) {
+                const auto &tags = smc->GetMetricsTags();
+                auto it = tags.find("api_name");
+                if (it != tags.end() && it->second == api_name) {
+                    return smc;
+                }
+            }
+        }
+        return nullptr;
+    };
+
+    if (!block_to_add.empty()) {
+        KeyVector add_keys_aggr;
+        std::vector<const std::vector<BlockAddEntry> *> add_entries_aggr;
+        add_keys_aggr.reserve(block_to_add.size());
+        add_entries_aggr.reserve(block_to_add.size());
+        for (const auto &kv : block_to_add) {
+            add_keys_aggr.push_back(kv.first);
+            add_entries_aggr.push_back(&kv.second);
+        }
+
+        std::vector<std::vector<MetaSearcher::UpsertLocation>> upserts(add_keys_aggr.size());
+        for (size_t i = 0; i < add_keys_aggr.size(); ++i) {
+            const auto &entries = *add_entries_aggr[i];
+            upserts[i].reserve(entries.size());
+            for (const auto &entry : entries) {
+                upserts[i].push_back(MetaSearcher::UpsertLocation{
+                    entry.location_id,
+                    DataStorageType::DATA_STORAGE_TYPE_VINEYARD,
+                    CacheLocationStatus::CLS_SERVING,
+                    entry.specs,
+                });
+            }
+        }
+
+        std::vector<ErrorCode> per_key_ec;
+        meta_searcher->BatchUpsertLocations(request_context, add_keys_aggr, upserts, per_key_ec);
+
+        for (size_t k = 0; k < add_keys_aggr.size(); ++k) {
+            ErrorCode key_ec = (k < per_key_ec.size()) ? per_key_ec[k] : EC_ERROR;
+            if (key_ec == EC_OK) {
+                continue;
+            }
+            for (const auto &entry : *add_entries_aggr[k]) {
+                if (per_item_ec[entry.event_index] == EC_OK) {
+                    per_item_ec[entry.event_index] = key_ec;
+                }
+            }
+        }
+        if (auto *add_mc = find_sub_collector("EventBlockAdd")) {
+            KVCM_METRICS_COLLECTOR_SET_METRICS(add_mc, manager, request_key_count, add_keys_aggr.size());
+            KVCM_METRICS_COLLECTOR_SET_METRICS(add_mc, meta_indexer, query_key_count, add_keys_aggr.size());
+        }
+    }
+
+    if (!block_to_del.empty()) {
+        KeyVector del_keys_aggr;
+        std::vector<const std::vector<BlockDelEntry> *> del_entries_aggr;
+        del_keys_aggr.reserve(block_to_del.size());
+        del_entries_aggr.reserve(block_to_del.size());
+        for (const auto &kv : block_to_del) {
+            del_keys_aggr.push_back(kv.first);
+            del_entries_aggr.push_back(&kv.second);
+        }
+
+        LocationIdsPerKey del_location_ids(del_keys_aggr.size());
+        for (size_t i = 0; i < del_keys_aggr.size(); ++i) {
+            for (const auto &entry : *del_entries_aggr[i]) {
+                del_location_ids[i].push_back(entry.location_id);
+            }
+        }
+
+        std::vector<std::vector<ErrorCode>> per_location_ec;
+        meta_searcher->BatchDeleteLocations(request_context, del_keys_aggr, del_location_ids, per_location_ec);
+
+        for (size_t k = 0; k < del_keys_aggr.size(); ++k) {
+            ErrorCode key_ec = EC_OK;
+            if (k < per_location_ec.size()) {
+                for (const auto &loc_ec : per_location_ec[k]) {
+                    if (loc_ec != EC_OK && loc_ec != EC_NOENT) {
+                        key_ec = loc_ec;
+                        break;
+                    }
+                }
+            } else {
+                key_ec = EC_ERROR;
+            }
+            if (key_ec == EC_OK) {
+                continue;
+            }
+            for (const auto &entry : *del_entries_aggr[k]) {
+                if (per_item_ec[entry.event_index] == EC_OK) {
+                    per_item_ec[entry.event_index] = key_ec;
+                }
+            }
+        }
+        if (auto *del_mc = find_sub_collector("EventBlockDelete")) {
+            KVCM_METRICS_COLLECTOR_SET_METRICS(del_mc, manager, request_key_count, del_keys_aggr.size());
+            KVCM_METRICS_COLLECTOR_SET_METRICS(del_mc, meta_indexer, query_key_count, del_keys_aggr.size());
+        }
+    }
+
+    if (has_host_down) {
+        vineyard_backend->SetNodeUnavailable(host_ip_port);
+        // Long-running scan; offload off the RPC thread.
+        if (schedule_plan_executor_) {
+            auto inst = instance_id;
+            auto host = host_ip_port;
+            schedule_plan_executor_->SubmitTask([this, inst, host] { this->CleanupHostLocations(inst, host); });
+        } else {
+            std::thread([this, instance_id, host_ip_port] {
+                this->CleanupHostLocations(instance_id, host_ip_port);
+            }).detach();
+        }
+        vineyard_backend->UnregisterNode(host_ip_port);
+        KVCM_LOG_INFO("trace_id [%s] | HOST_DOWN: host [%s] cleanup scheduled and removed from node table",
+                      trace_id.c_str(),
+                      host_ip_port.c_str());
+    }
+
+    bool any_failure = false;
+    for (auto ec : per_item_ec) {
+        if (ec != EC_OK) {
+            any_failure = true;
+            break;
+        }
+    }
+    if (any_failure) {
+        // Per V8 §2.3.1, item_results is opaque to KVCM beyond the OK/error
+        // distinction; we only collapse to a small set of proto codes that
+        // match what the V6D client needs to retry vs. abort.
+        for (auto ec : per_item_ec) {
+            proto::meta::ErrorCode mapped = proto::meta::OK;
+            if (ec == EC_OK) {
+                mapped = proto::meta::OK;
+            } else if (ec == EC_BADARGS) {
+                mapped = proto::meta::INVALID_ARGUMENT;
+            } else if (ec == EC_INSTANCE_NOT_EXIST) {
+                mapped = proto::meta::INSTANCE_NOT_EXIST;
+            } else {
+                mapped = proto::meta::INTERNAL_ERROR;
+            }
+            response->add_item_results(mapped);
+        }
+        response_status->set_code(proto::meta::INTERNAL_ERROR);
+        response_status->set_message("ReportEvent partially failed; see item_results");
+        return EC_PARTIAL_OK;
+    }
+    response_status->set_code(proto::meta::OK);
+    return EC_OK;
+}
+
+void CacheManager::CleanupHostLocations(const std::string &instance_id, const std::string &host_ip_port) {
+    MetaSearcher *meta_searcher = meta_searcher_manager_->GetMetaSearcher(instance_id);
+    if (!meta_searcher) {
+        KVCM_LOG_WARN("CleanupHostLocations: meta searcher not found for instance [%s]", instance_id.c_str());
+        return;
+    }
+
+    RequestContext cleanup_ctx("cleanup_host_" + host_ip_port);
+    const std::string host_suffix = VineyardHostSuffix(host_ip_port);
+    meta_searcher->CleanupLocationsByHost(&cleanup_ctx, host_suffix);
+
+    KVCM_LOG_INFO("CleanupHostLocations: finished cleaning host [%s] from instance [%s]",
+                  host_ip_port.c_str(),
+                  instance_id.c_str());
 }
 
 ErrorCode CacheManager::TryCreateMetaSearcher(RequestContext *request_context, const std::string &instance_id) {

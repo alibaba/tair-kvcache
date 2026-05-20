@@ -55,6 +55,10 @@ public:
                                 const proto::meta::GetClusterInfoRequest *request,
                                 proto::meta::GetClusterInfoResponse *response) override;
 
+    grpc::Status ReportEvent(grpc::ServerContext *context,
+                             const proto::meta::ReportEventRequest *request,
+                             proto::meta::ReportEventResponse *response) override;
+
 private:
     std::shared_ptr<MetaServiceImpl> meta_service_impl_;
 };
