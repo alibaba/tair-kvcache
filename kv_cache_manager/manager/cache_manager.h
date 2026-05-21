@@ -28,6 +28,8 @@ class ReclaimerTaskSupervisor;
 class StartupConfigLoader;
 class EventManager;
 class CacheManagerMetricsRecorder;
+class CacheAffinityManager;
+struct WriteHints;
 constexpr unsigned int DEFAULT_SCHEDULE_PLAN_EXECUTOR_THREAD_COUNT = 2;
 
 class CacheManager {
@@ -58,7 +60,9 @@ public:
     using UriType = std::string;
     using UriVector = std::vector<UriType>;
 
-    CacheManager(std::shared_ptr<MetricsRegistry> metrics_registry, std::shared_ptr<RegistryManager> registry_manager);
+    CacheManager(std::shared_ptr<MetricsRegistry> metrics_registry,
+                 std::shared_ptr<RegistryManager> registry_manager,
+                 std::shared_ptr<CacheAffinityManager> affinity_manager = nullptr);
     ~CacheManager();
 
     bool Init(int32_t schedule_plan_executor_thread_count = DEFAULT_SCHEDULE_PLAN_EXECUTOR_THREAD_COUNT,
@@ -80,7 +84,8 @@ public:
                                                        int32_t block_size,
                                                        const std::vector<LocationSpecInfo> &location_spec_infos,
                                                        const ModelDeployment &model_deployment,
-                                                       const std::vector<LocationSpecGroup> &location_spec_groups);
+                                                       const std::vector<LocationSpecGroup> &location_spec_groups,
+                                                       const std::string &affinity_strategy_json = {});
 
     ErrorCode
     RemoveInstance(RequestContext *request_context, const std::string &instance_group, const std::string &instance_id);
@@ -221,6 +226,23 @@ private:
     SubmitDelReqFunc GetSubmitDelReqFunc(const std::string &instance_id) const;
     void ClearVineyardCleanupCallbacks();
 
+    // Build write hints for the upcoming DataStorageManager::Create call.
+    // Returns empty hints (no preference) when no affinity manager is wired,
+    // when there are no candidate nodes, or when the strategy yields nothing.
+    // A strategy abort (e.g. strict prefer_local with caller missing) is
+    // logged and silently degraded to empty hints in v1; CacheManager keeps
+    // writing through the legacy path. We can promote abort to a hard error
+    // later once policies that rely on it are deployed.
+    //
+    // The InstanceInfo carries the per-instance strategy JSON; the
+    // per-instance-group strategy is fetched from registry_manager_ by name.
+    // CacheAffinityManager picks the highest-priority non-empty tier
+    // (instance > instance_group > process).
+    WriteHints ResolveAffinityHints(RequestContext *request_context,
+                                    const std::shared_ptr<const InstanceInfo> &instance_info,
+                                    std::size_t block_count,
+                                    std::size_t bytes_per_block) const;
+
 private:
     /***
      * === 成员变量清理说明 ===
@@ -242,6 +264,8 @@ private:
     std::shared_ptr<MetricsRegistry> metrics_registry_;
     // 无需清理 - RegistryManager单独进行了清理，不由CacheManager负责
     std::shared_ptr<RegistryManager> registry_manager_;
+    // 无需清理 - 注入的依赖，由外部生命周期管理；可空表示未启用亲和性
+    std::shared_ptr<CacheAffinityManager> affinity_manager_;
     // 无需清理 - 让遗留的Plan自行跑完
     std::shared_ptr<SchedulePlanExecutor> schedule_plan_executor_;
     // 无需清理 - 仅需要暂停

@@ -35,6 +35,11 @@ public:
     const int64_t request_begin_time_us() const { return request_begin_time_us_; }
     const std::string &api_name() const { return api_name_; }
     const std::string &client_ip() const { return client_ip_; }
+    // Inference-side node IP self-declared by the client in the request body.
+    // Distinct from client_ip_ (gRPC peer IP, which may be a LB / proxy in
+    // front of the inference fleet). Used by the affinity layer to decide
+    // which storage node the request should prefer.
+    const std::string &caller_node_ip() const { return caller_node_ip_; }
     const int status_code() const { return status_code_; }
     const std::string &request_debug() const { return request_debug_; }
     const std::string &response_debug() const { return response_debug_; }
@@ -43,6 +48,7 @@ public:
     std::string EndAndGetSpanTracerDebugStr() const;
     void set_api_name(const std::string &value) { api_name_ = value; }
     void set_client_ip(const std::string &value) { client_ip_ = value; }
+    void set_caller_node_ip(const std::string &value) { caller_node_ip_ = value; }
     void set_status_code(int value) { status_code_ = value; }
     void set_request_debug(const std::string &value) { request_debug_ = value; }
     void set_response_debug(const std::string &value) { response_debug_ = value; }
@@ -56,6 +62,7 @@ private:
     int64_t request_begin_time_us_;
     std::string api_name_; // 调用的接口名称
     std::string client_ip_;
+    std::string caller_node_ip_;
     int status_code_{0};
     std::string request_debug_;
     std::string response_debug_;

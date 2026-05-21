@@ -177,7 +177,8 @@ void MetaServiceImpl::RegisterInstance(RequestContext *request_context,
                                                                        request->block_size(),
                                                                        location_spec_infos,
                                                                        model_deployment_req,
-                                                                       location_spec_groups);
+                                                                       location_spec_groups,
+                                                                       request->affinity_strategy_json());
 
     if (ec_info != EC_OK) {
         status->set_code(ToMetaPbError(ec_info));
@@ -434,6 +435,11 @@ void MetaServiceImpl::StartWriteCache(RequestContext *request_context,
     for (const auto &name : request->location_spec_group_names()) {
         location_spec_group_names.push_back(name);
     }
+
+    // 把调用方推理节点 IP 透传到 RequestContext，CacheManager 在调
+    // ResolveAffinityHints 时会读它。空字符串 = 老客户端 / 未启用 affinity，
+    // 后端会退化为无亲和性的写放置（行为完全等价于改造前）。
+    request_context->set_caller_node_ip(request->caller_node_ip());
 
     std::pair<ErrorCode, StartWriteCacheInfo> start_write_cache = cache_manager_->StartWriteCache(
         request_context,

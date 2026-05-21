@@ -42,6 +42,28 @@ public:
                                                              size_t size_per_key,
                                                              std::function<void()> cb);
 
+    // Affinity-aware overload.
+    //
+    // `hints` carries the preferred placement (which nodes to favor); `strict`
+    // carries the enforcement policy:
+    //   strict=true  -> the backend MUST allocate on `hints.preferred_node_ids`
+    //                   only. If none of them can serve the request, the
+    //                   corresponding key is returned with an error rather
+    //                   than silently routed elsewhere.
+    //   strict=false -> hints are advisory; the backend may fall back to any
+    //                   other node when the preferred ones are unavailable.
+    //
+    // When `hints.preferred_node_ids` is empty, `strict` is meaningless and is
+    // ignored by the backend. Equivalent to the legacy Create() above when
+    // hints is default-constructed and strict=false.
+    std::vector<std::pair<ErrorCode, DataStorageUri>> Create(RequestContext *request_context,
+                                                             const std::string &unique_name,
+                                                             const std::vector<std::string> &keys,
+                                                             size_t size_per_key,
+                                                             const WriteHints &hints,
+                                                             bool strict,
+                                                             std::function<void()> cb);
+
     std::vector<ErrorCode> Delete(RequestContext *request_context,
                                   const std::string &unique_name,
                                   const std::vector<DataStorageUri> &storage_uris,

@@ -185,6 +185,16 @@ std::vector<std::pair<ErrorCode, DataStorageUri>> DataStorageManager::Create(Req
                                                                              const std::vector<std::string> &keys,
                                                                              size_t size_per_key,
                                                                              std::function<void()> cb) {
+    return Create(request_context, unique_name, keys, size_per_key, WriteHints{}, /*strict=*/false, std::move(cb));
+}
+
+std::vector<std::pair<ErrorCode, DataStorageUri>> DataStorageManager::Create(RequestContext *request_context,
+                                                                             const std::string &unique_name,
+                                                                             const std::vector<std::string> &keys,
+                                                                             size_t size_per_key,
+                                                                             const WriteHints &hints,
+                                                                             bool strict,
+                                                                             std::function<void()> cb) {
     SPAN_TRACER(request_context);
     std::shared_lock<std::shared_mutex> lock(rw_lock_);
     const std::string &trace_id = request_context->trace_id();
@@ -197,7 +207,7 @@ std::vector<std::pair<ErrorCode, DataStorageUri>> DataStorageManager::Create(Req
     const auto dsmc = storage_backend->GetMetricsCollector();
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(dsmc, DataStorageCreate);
     std::vector<std::pair<ErrorCode, DataStorageUri>> create_result =
-        storage_backend->Create(keys, size_per_key, trace_id, cb);
+        storage_backend->CreateWithHints(keys, size_per_key, hints, strict, trace_id, cb);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(dsmc, DataStorageCreate);
     KVCM_METRICS_COLLECTOR_SET_METRICS(dsmc, data_storage, create_keys_qps, keys.size());
     if (request_context) {

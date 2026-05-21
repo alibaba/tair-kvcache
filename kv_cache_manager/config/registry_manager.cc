@@ -275,7 +275,8 @@ ErrorCode RegistryManager::RegisterInstance(RequestContext *request_context,
                                             int32_t block_size,
                                             const std::vector<LocationSpecInfo> &location_spec_infos,
                                             const ModelDeployment &model_deployment,
-                                            const std::vector<LocationSpecGroup> &location_spec_groups) {
+                                            const std::vector<LocationSpecGroup> &location_spec_groups,
+                                            const std::string &affinity_strategy_json) {
     const auto &trace_id = request_context->trace_id();
     std::unique_lock<std::shared_mutex> lock(mutex_);
     auto instance_group_iter = instance_group_configs_.find(instance_group);
@@ -309,6 +310,7 @@ ErrorCode RegistryManager::RegisterInstance(RequestContext *request_context,
                                                         location_spec_infos,
                                                         model_deployment,
                                                         location_spec_groups);
+    instance_info->set_affinity_strategy_json(affinity_strategy_json);
     // save the instance info to storage backend in such a way that one key corresponds to one instance
     auto ec = LoadAndSave(instance_id, instance_id, instance_info.get());
     if (ec != EC_OK) {

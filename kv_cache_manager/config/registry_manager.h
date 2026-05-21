@@ -56,13 +56,16 @@ public:
                                                                                 const std::string &name);
     std::pair<ErrorCode, std::vector<std::shared_ptr<const InstanceGroup>>>
     ListInstanceGroup(RequestContext *request_context) const; // list all the instance_groups
+    // affinity_strategy_json: 实例级 cache affinity 策略 JSON，空串表示未覆盖；
+    // 由 CacheAffinityManager 与 instance_group/process 级别一同选取生效项。
     ErrorCode RegisterInstance(RequestContext *request_context,
                                const std::string &instance_group,
                                const std::string &instance_id,
                                int32_t block_size,
                                const std::vector<LocationSpecInfo> &location_spec_infos,
                                const ModelDeployment &model_deployment,
-                               const std::vector<LocationSpecGroup> &location_spec_groups = {});
+                               const std::vector<LocationSpecGroup> &location_spec_groups = {},
+                               const std::string &affinity_strategy_json = {});
 
     ErrorCode
     RemoveInstance(RequestContext *request_context, const std::string &instance_group, const std::string &instance_id);

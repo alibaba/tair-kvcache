@@ -369,6 +369,8 @@ ProtoConvert::InstanceInfoToProto(const InstanceInfo &instance_info, T *proto_in
     // 添加location_spec_groups字段
     LocationSpecGroupsToProto(instance_info.location_spec_groups(),
                               proto_instance_info->mutable_location_spec_groups());
+
+    proto_instance_info->set_affinity_strategy_json(instance_info.affinity_strategy_json());
 }
 
 template <typename T>
@@ -392,6 +394,8 @@ ProtoConvert::InstanceInfoFromProto(const T *proto_instance_info, InstanceInfo &
     std::vector<LocationSpecGroup> location_spec_groups;
     LocationSpecGroupsFromProto(proto_instance_info->location_spec_groups(), location_spec_groups);
     instance_info.set_location_spec_groups(location_spec_groups);
+
+    instance_info.set_affinity_strategy_json(proto_instance_info->affinity_strategy_json());
 }
 
 template <typename T>

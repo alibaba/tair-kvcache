@@ -25,6 +25,8 @@ cc_library(
         ":reclaimer_task_supervisor",
         ":startup_config_loader",
         ":write_location_manager",
+        "//kv_cache_manager/affinity",
+        "//kv_cache_manager/affinity:node_metrics",
         "//kv_cache_manager/common",
         "//kv_cache_manager/config",
         "//kv_cache_manager/data_storage",
