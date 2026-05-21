@@ -88,6 +88,9 @@ ErrorCode CoordinationRedisBackend::Init(const StandardUri &standard_uri) noexce
     std::string base_prefix = "kvcm_";
     if (!cluster_name.empty()) {
         base_prefix += cluster_name + "_";
+    } else {
+        KVCM_LOG_WARN("cluster_name not set for coordination backend, keys will use global namespace. "
+                      "Consider setting cluster_name to avoid conflicts in shared-Redis deployments.");
     }
     lock_key_prefix_ = base_prefix + "lock:";
     kv_key_prefix_ = base_prefix + "kv:";
