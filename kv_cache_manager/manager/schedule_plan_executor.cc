@@ -20,7 +20,7 @@ namespace kv_cache_manager {
     DEFINE_METRICS_NAME_(SchedulePlanExecutor, schedule_plan_executor, name)
 
 #define REGISTER_METRICS_FOR_SCHEDULE_PLAN_EXECUTOR(name)                                                              \
-    REGISTER_METRICS_COUNTER_(metrics_registry_, schedule_plan_executor, name)
+    REGISTER_METRICS_GAUGE_(metrics_registry_, schedule_plan_executor, name)
 
 namespace {
 template <typename ResultType, typename... Args>
@@ -109,10 +109,10 @@ void SchedulePlanExecutor::WorkerRoutine() {
         }
 
         if (task) {
-            --METRICS_(schedule_plan_executor, waiting_task_count);
-            ++METRICS_(schedule_plan_executor, executing_task_count);
+            METRICS_(schedule_plan_executor, waiting_task_count) -= 1;
+            METRICS_(schedule_plan_executor, executing_task_count) += 1;
             task();
-            --METRICS_(schedule_plan_executor, executing_task_count);
+            METRICS_(schedule_plan_executor, executing_task_count) -= 1;
         }
     }
 }
@@ -241,7 +241,7 @@ bool SchedulePlanExecutor::SubmitRaw(const std::function<void()> &task, std::chr
         uint64_t sequence_id = sequence_counter_.fetch_add(1, std::memory_order_relaxed);
         tasks_.emplace(ScheduledTask{task, execute_time, sequence_id});
     }
-    ++METRICS_(schedule_plan_executor, waiting_task_count);
+    METRICS_(schedule_plan_executor, waiting_task_count) += 1;
 
     condition_.notify_one();
     return true;

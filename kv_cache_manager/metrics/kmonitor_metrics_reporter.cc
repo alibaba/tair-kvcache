@@ -523,15 +523,15 @@ void KmonitorMetricsReporter::ReportInterval() {
             break;
         }
 
-        std::uint64_t w_task_count_v;
-        std::uint64_t e_task_count_v;
+        double w_task_count_v;
+        double e_task_count_v;
 
         GET_METRICS_(spe, schedule_plan_executor, waiting_task_count, w_task_count_v);
         GET_METRICS_(spe, schedule_plan_executor, executing_task_count, e_task_count_v);
 
         const kmonitor::MetricsTags tags;
-        REPORT_METRICS(scheduler_plan_executor, waiting_task_count, static_cast<double>(w_task_count_v));
-        REPORT_METRICS(scheduler_plan_executor, executing_task_count, static_cast<double>(e_task_count_v));
+        REPORT_METRICS(scheduler_plan_executor, waiting_task_count, w_task_count_v);
+        REPORT_METRICS(scheduler_plan_executor, executing_task_count, e_task_count_v);
     } while (false);
 
     do {
