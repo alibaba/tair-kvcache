@@ -22,6 +22,7 @@ bool InstanceGroup::FromRapidValue(const rapidjson::Value &rapid_value) {
     std::string buckets_str;
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "revisit_interval_buckets", buckets_str, std::string(""));
     set_revisit_interval_buckets(buckets_str);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "affinity_strategy_json", affinity_strategy_json_, std::string(""));
     return true;
 }
 
@@ -37,6 +38,7 @@ void InstanceGroup::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &wr
     Put(writer, "extra_info", extra_info_);
     Put(writer, "event_report_storage_candidates", event_report_storage_candidates_);
     Put(writer, "revisit_interval_buckets", revisit_interval_buckets_str_);
+    Put(writer, "affinity_strategy_json", affinity_strategy_json_);
 }
 
 bool InstanceGroup::ValidateRequiredFields(std::string &invalid_fields) const {

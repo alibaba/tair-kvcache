@@ -27,6 +27,7 @@ public:
     CacheConfigConstPtr cache_config() const { return cache_config_; }
     const std::string &user_data() const { return user_data_; }
     int64_t version() const { return version_; }
+    const std::string &affinity_strategy_json() const { return affinity_strategy_json_; }
     // Setters
     void set_name(const std::string &name) { name_ = name; }
     void set_storage_candidates(const std::vector<std::string> &storage_candidates) {
@@ -57,6 +58,9 @@ public:
 
     // Raw string for JSON serialization (preserves original config text).
     const std::string &revisit_interval_buckets_raw() const { return revisit_interval_buckets_str_; }
+    void set_affinity_strategy_json(const std::string &affinity_strategy_json) {
+        affinity_strategy_json_ = affinity_strategy_json;
+    }
 
 private:
     std::string name_;
@@ -71,6 +75,7 @@ private:
     std::vector<std::string> event_report_storage_candidates_;
     std::string revisit_interval_buckets_str_;            // raw string for JSON wire format
     std::vector<double> parsed_revisit_interval_buckets_; // parsed, validated boundaries
+    std::string affinity_strategy_json_;
 };
 
 } // namespace kv_cache_manager

@@ -336,6 +336,10 @@ message InstanceGroup {
     string extra_info = 9; // opaque JSON passed through to clients
     repeated string event_report_storage_candidates = 10; // backends that handle ReportEvent
     string revisit_interval_buckets = 11; // comma-separated bucket boundaries in seconds (e.g. "1,5,30,60")
+    // 实例组级 cache affinity 策略 JSON。空串表示该级未配置，
+    // 解析与优先级处理由 server 端 CacheAffinityManager 完成
+    // (instance > instance_group > process)。
+    string affinity_strategy_json = 12;
 }
 
 message CreateInstanceGroupRequest {
@@ -482,6 +486,9 @@ message InstanceInfo {
     ModelDeployment model_deployment = 6;
     repeated LocationSpecGroup location_spec_groups = 7; // 一个group包含多个spec name。用于简化StartWriteCache时指定可以提供哪些location spec。
     QueryType default_query_type = 8; // 请求未显式指定 query_type 时使用的 instance 级默认值
+    // 实例级 cache affinity 策略 JSON。空串表示未覆盖；
+    // 与 instance_group/process 级别一同由 CacheAffinityManager 选取生效项。
+    string affinity_strategy_json = 9;
 }
 
 message RegisterInstanceRequest {
@@ -493,6 +500,8 @@ message RegisterInstanceRequest {
     ModelDeployment model_deployment = 6;
     repeated LocationSpecGroup location_spec_groups = 7; // 一个group包含多个spec name。用于简化StartWriteCache时指定可以提供哪些location spec。
     QueryType default_query_type = 8; // 请求未显式指定 query_type 时使用的 instance 级默认值
+    // 实例级 cache affinity 策略 JSON，空串表示由 instance_group/process 级回退。
+    string affinity_strategy_json = 9;
 }
 
 message RemoveInstanceRequest {

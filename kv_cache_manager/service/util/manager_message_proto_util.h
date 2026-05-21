@@ -399,6 +399,7 @@ ProtoConvert::InstanceInfoToProto(const InstanceInfo &instance_info, T *proto_in
         proto_instance_info->set_default_query_type(
             static_cast<proto::admin::QueryType>(instance_info.default_query_type()));
     }
+    proto_instance_info->set_affinity_strategy_json(instance_info.affinity_strategy_json());
 }
 
 template <typename T>
@@ -424,6 +425,7 @@ ProtoConvert::InstanceInfoFromProto(const T *proto_instance_info, InstanceInfo &
     instance_info.set_location_spec_groups(location_spec_groups);
 
     instance_info.set_default_query_type(static_cast<int32_t>(proto_instance_info->default_query_type()));
+    instance_info.set_affinity_strategy_json(proto_instance_info->affinity_strategy_json());
 }
 
 template <typename T>
