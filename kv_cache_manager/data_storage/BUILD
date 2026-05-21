@@ -39,6 +39,7 @@ cc_library(
         "data_storage_backend.h",
         "data_storage_uri.h",
         "storage_config.h",
+        "write_hints.h",
     ],
     deps = [
         "//kv_cache_manager/common",

@@ -240,6 +240,10 @@ message InstanceGroup {
     CacheConfig cache_config = 6; // 后面改成instance级别的
     string user_data = 7;
     int64 version = 8;
+    // 实例组级 cache affinity 策略 JSON。空串表示该级未配置，
+    // 解析与优先级处理由 server 端 CacheAffinityManager 完成
+    // (instance > instance_group > process)。
+    string affinity_strategy_json = 9;
 }
 
 message CreateInstanceGroupRequest {
@@ -346,6 +350,9 @@ message InstanceInfo {
     repeated LocationSpecInfo location_spec_infos = 5; // 一个location内的所有spec，StartWriteCache时会按照这个进行分配
     ModelDeployment model_deployment = 6;
     repeated LocationSpecGroup location_spec_groups = 7; // 一个group包含多个spec name。用于简化StartWriteCache时指定可以提供哪些location spec。
+    // 实例级 cache affinity 策略 JSON。空串表示未覆盖；
+    // 与 instance_group/process 级别一同由 CacheAffinityManager 选取生效项。
+    string affinity_strategy_json = 8;
 }
 
 message RegisterInstanceRequest {
@@ -356,6 +363,8 @@ message RegisterInstanceRequest {
     repeated LocationSpecInfo location_spec_infos = 5; // 一个location内的所有spec，StartWriteCache时会按照这个进行分配
     ModelDeployment model_deployment = 6;
     repeated LocationSpecGroup location_spec_groups = 7; // 一个group包含多个spec name。用于简化StartWriteCache时指定可以提供哪些location spec。
+    // 实例级 cache affinity 策略 JSON，空串表示由 instance_group/process 级回退。
+    string affinity_strategy_json = 8;
 }
 
 message RemoveInstanceRequest {

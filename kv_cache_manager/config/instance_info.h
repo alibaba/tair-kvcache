@@ -146,6 +146,10 @@ public:
     const std::vector<LocationSpecInfo> &location_spec_infos() const { return location_spec_infos_; }
     const ModelDeployment &model_deployment() const { return model_deployment_; }
     const std::vector<LocationSpecGroup> &location_spec_groups() const { return location_spec_groups_; }
+    const std::string &affinity_strategy_json() const { return affinity_strategy_json_; }
+    void set_affinity_strategy_json(const std::string &affinity_strategy_json) {
+        affinity_strategy_json_ = affinity_strategy_json;
+    }
     void set_quota_group_name(const std::string &quota_group_name) { quota_group_name_ = quota_group_name; }
     void set_instance_group_name(const std::string &instance_group_name) { instance_group_name_ = instance_group_name; }
     void set_instance_id(const std::string &instance_id) { instance_id_ = instance_id; }
@@ -161,10 +165,11 @@ public:
 
     // Returns field names that differ from the given values.
     // Returns empty vector if all fields match.
-    [[nodiscard]] std::vector<std::string> MismatchFields(int32_t block_size,
-                                            const std::vector<LocationSpecInfo> &location_spec_infos,
-                                            const ModelDeployment &model_deployment,
-                                            const std::vector<LocationSpecGroup> &location_spec_groups) const {
+    [[nodiscard]] std::vector<std::string>
+    MismatchFields(int32_t block_size,
+                   const std::vector<LocationSpecInfo> &location_spec_infos,
+                   const ModelDeployment &model_deployment,
+                   const std::vector<LocationSpecGroup> &location_spec_groups) const {
         std::vector<std::string> mismatched;
         if (block_size_ != block_size) {
             mismatched.emplace_back("block_size");
@@ -192,6 +197,7 @@ private:
     std::vector<LocationSpecInfo> location_spec_infos_;
     ModelDeployment model_deployment_;
     std::vector<LocationSpecGroup> location_spec_groups_;
+    std::string affinity_strategy_json_;
 };
 
 using InstanceInfoConstPtr = std::shared_ptr<const InstanceInfo>;

@@ -10,6 +10,8 @@
 #include <utility>
 #include <vector>
 
+#include "kv_cache_manager/affinity/cache_affinity_manager.h"
+#include "kv_cache_manager/affinity/node_metrics.h"
 #include "kv_cache_manager/common/env_util.h"
 #include "kv_cache_manager/common/jsonizable.h"
 #include "kv_cache_manager/common/logger.h"
@@ -20,6 +22,7 @@
 #include "kv_cache_manager/config/meta_cache_policy_config.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
+#include "kv_cache_manager/data_storage/write_hints.h"
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/event/spec_events/optimizer_event.h"
 #include "kv_cache_manager/manager/cache_manager_metrics_recorder.h"
@@ -122,15 +125,75 @@ IsSpecNameInSpecGroup(const std::string &trace_id,
 } // namespace
 
 CacheManager::CacheManager(std::shared_ptr<MetricsRegistry> metrics_registry,
-                           std::shared_ptr<RegistryManager> registry_manager)
+                           std::shared_ptr<RegistryManager> registry_manager,
+                           std::shared_ptr<CacheAffinityManager> affinity_manager)
     : meta_indexer_manager_(std::make_shared<MetaIndexerManager>())
     , write_location_manager_(std::make_shared<WriteLocationManager>())
     , meta_searcher_manager_(std::make_shared<MetaSearcherManager>(registry_manager, meta_indexer_manager_))
     , data_storage_selector_(std::make_unique<DataStorageSelector>(meta_indexer_manager_, registry_manager))
     , metrics_registry_(std::move(metrics_registry))
     , registry_manager_(std::move(registry_manager))
+    , affinity_manager_(std::move(affinity_manager))
     , metrics_recorder_(std::make_shared<CacheManagerMetricsRecorder>(
           meta_indexer_manager_, write_location_manager_, registry_manager_)) {}
+
+WriteHints CacheManager::ResolveAffinityHints(RequestContext *request_context,
+                                              const std::shared_ptr<const InstanceInfo> &instance_info,
+                                              std::size_t block_count,
+                                              std::size_t bytes_per_block) const {
+    if (!affinity_manager_) {
+        return WriteHints{};
+    }
+
+    auto nodes = affinity_manager_->SnapshotNodes();
+    if (nodes.empty()) {
+        return WriteHints{};
+    }
+
+    std::vector<std::string> candidates;
+    candidates.reserve(nodes.size());
+    for (const auto &n : nodes) {
+        candidates.push_back(n.node_id);
+    }
+
+    CacheAffinityManager::ResolveContext rctx;
+    if (request_context != nullptr) {
+        rctx.caller_node_ip = request_context->caller_node_ip();
+        rctx.trace_id = request_context->trace_id();
+    }
+    rctx.block_count = block_count;
+    rctx.bytes_per_block = bytes_per_block;
+
+    if (instance_info) {
+        rctx.instance_id = instance_info->instance_id();
+        rctx.instance_group_name = instance_info->instance_group_name();
+        rctx.instance_strategy_json = instance_info->affinity_strategy_json();
+
+        // Fetch the per-instance-group JSON. Missing group is treated as
+        // "no override at that tier" -- we leave the field empty and let the
+        // affinity manager fall through to the process-level strategy.
+        if (registry_manager_ && !rctx.instance_group_name.empty()) {
+            auto [ec, group] = registry_manager_->GetInstanceGroup(request_context, rctx.instance_group_name);
+            if (ec == EC_OK && group) {
+                rctx.instance_group_strategy_json = group->affinity_strategy_json();
+            }
+        }
+    }
+
+    WriteHints hints;
+    auto ec = affinity_manager_->Resolve(rctx, candidates, hints);
+    if (ec != EC_OK) {
+        // v1: a strict-strategy abort silently degrades to no-affinity. Once
+        // policies that genuinely depend on abort semantics ship, promote
+        // this to an actual write failure.
+        KVCM_LOG_WARN("[traceId: %s] affinity strategy aborted (ec=%d), "
+                      "falling back to no-affinity write",
+                      rctx.trace_id.c_str(),
+                      static_cast<int>(ec));
+        return WriteHints{};
+    }
+    return hints;
+}
 
 CacheManager::~CacheManager() {
     StopRecoverRetryLoop();
@@ -193,7 +256,8 @@ CacheManager::RegisterInstance(RequestContext *request_context,
                                int32_t block_size,
                                const std::vector<LocationSpecInfo> &location_spec_infos,
                                const ModelDeployment &model_deployment,
-                               const std::vector<LocationSpecGroup> &location_spec_groups) {
+                               const std::vector<LocationSpecGroup> &location_spec_groups,
+                               const std::string &affinity_strategy_json) {
     SPAN_TRACER(request_context);
     // TODO : not thread safe now
     const auto &trace_id = request_context->trace_id();
@@ -221,7 +285,8 @@ CacheManager::RegisterInstance(RequestContext *request_context,
                                                   block_size,
                                                   location_spec_infos,
                                                   model_deployment,
-                                                  location_spec_groups);
+                                                  location_spec_groups,
+                                                  affinity_strategy_json);
     RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, std::string, "register instance failed with errorcode: %d", ec);
     ec = TryCreateMetaSearcher(request_context, instance_id);
     RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, std::string, "register instance failed with errorcode: %d", ec);
@@ -901,8 +966,18 @@ CacheManager::CreateInSingleBatch(RequestContext *request_context,
         }
     }
 
-    std::vector<std::pair<ErrorCode, DataStorageUri>> results = data_storage_manager->Create(
-        request_context, unique_name, merged_block_keys, common_size, []() { /* do nothing */ });
+    WriteHints write_hints = ResolveAffinityHints(
+        request_context, instance_info, merged_block_keys.size(), static_cast<std::size_t>(common_size));
+    // v1: no caller-driven strict yet -- the affinity layer signals "must"
+    // via Abort -> empty hints, so the backend never sees strict=true. Plumb
+    // the parameter through so future callers can opt in.
+    std::vector<std::pair<ErrorCode, DataStorageUri>> results = data_storage_manager->Create(request_context,
+                                                                                             unique_name,
+                                                                                             merged_block_keys,
+                                                                                             common_size,
+                                                                                             write_hints,
+                                                                                             /*strict=*/false,
+                                                                                             []() { /* do nothing */ });
 
     for (size_t i = 0; i < results.size(); i++) {
         if (results[i].first == ErrorCode::EC_OK) {
@@ -969,8 +1044,16 @@ ErrorCode CacheManager::CreateBySpec(RequestContext *request_context,
             }
         }
 
-        std::vector<std::pair<ErrorCode, DataStorageUri>> results = data_storage_manager->Create(
-            request_context, unique_name, block_keys, spec_info.size(), []() { /* do nothing */ });
+        WriteHints write_hints = ResolveAffinityHints(
+            request_context, instance_info, block_keys.size(), static_cast<std::size_t>(spec_info.size()));
+        std::vector<std::pair<ErrorCode, DataStorageUri>> results =
+            data_storage_manager->Create(request_context,
+                                         unique_name,
+                                         block_keys,
+                                         spec_info.size(),
+                                         write_hints,
+                                         /*strict=*/false,
+                                         []() { /* do nothing */ });
 
         for (size_t i = 0; i < results.size(); i++) {
             if (results[i].first == ErrorCode::EC_OK) {
@@ -1278,7 +1361,8 @@ ErrorCode CacheManager::DoRecoverOnce() {
                                                       instance_info->block_size(),
                                                       instance_info->location_spec_infos(),
                                                       instance_info->model_deployment(),
-                                                      instance_info->location_spec_groups());
+                                                      instance_info->location_spec_groups(),
+                                                      instance_info->affinity_strategy_json());
             if (ec3 != EC_OK && ec3 != EC_DUPLICATE_ENTITY) {
                 KVCM_LOG_WARN("CacheManager RegisterInstance failed when recover, skip. ec[%d] instance_group "
                               "name[%s] instance_id[%s]",

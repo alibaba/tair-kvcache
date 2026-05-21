@@ -26,6 +26,7 @@ public:
     CacheConfigConstPtr cache_config() const { return cache_config_; }
     const std::string &user_data() const { return user_data_; }
     int64_t version() const { return version_; }
+    const std::string &affinity_strategy_json() const { return affinity_strategy_json_; }
     // Setters
     void set_name(const std::string &name) { name_ = name; }
     void set_storage_candidates(const std::vector<std::string> &storage_candidates) {
@@ -39,6 +40,9 @@ public:
     void set_cache_config(const std::shared_ptr<CacheConfig> &cache_config) { cache_config_ = cache_config; }
     void set_user_data(const std::string &user_data) { user_data_ = user_data; }
     void set_version(int64_t version) { version_ = version; }
+    void set_affinity_strategy_json(const std::string &affinity_strategy_json) {
+        affinity_strategy_json_ = affinity_strategy_json;
+    }
 
 private:
     std::string name_;
@@ -49,6 +53,7 @@ private:
     std::shared_ptr<CacheConfig> cache_config_;
     std::string user_data_;
     int64_t version_;
+    std::string affinity_strategy_json_;
 };
 
 } // namespace kv_cache_manager

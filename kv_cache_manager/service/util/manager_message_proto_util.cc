@@ -275,6 +275,7 @@ void ProtoConvert::InstanceGroupToProto(const InstanceGroup &instance_group_info
 
     proto_instance_group->set_user_data(instance_group_info.user_data());
     proto_instance_group->set_version(instance_group_info.version());
+    proto_instance_group->set_affinity_strategy_json(instance_group_info.affinity_strategy_json());
 }
 void ProtoConvert::InstanceGroupFromProto(const proto::admin::InstanceGroup *proto_instance_group,
                                           InstanceGroup &instance_group_info) {
@@ -312,6 +313,7 @@ void ProtoConvert::InstanceGroupFromProto(const proto::admin::InstanceGroup *pro
 
     instance_group_info.set_user_data(proto_instance_group->user_data());
     instance_group_info.set_version(proto_instance_group->version());
+    instance_group_info.set_affinity_strategy_json(proto_instance_group->affinity_strategy_json());
 }
 
 void ProtoConvert::AccountFromProto(const proto::admin::Account *proto_account, Account &account_info) {

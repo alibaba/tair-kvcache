@@ -90,6 +90,9 @@ message InstanceInfo {
     repeated LocationSpecInfo location_spec_infos = 5; // 一个location内的所有spec，StartWriteCache时会按照这个进行分配
     ModelDeployment model_deployment = 6;
     repeated LocationSpecGroup location_spec_groups = 7; // 一个group包含多个spec name。用于简化StartWriteCache时指定可以提供哪些location spec。
+    // 实例级 cache affinity 策略 JSON。空串表示未覆盖；
+    // 由 server 端 CacheAffinityManager 与 instance_group/process 级别一并选取。
+    string affinity_strategy_json = 8;
 }
 
 message LocalStorageSpec {}
@@ -169,6 +172,8 @@ message RegisterInstanceRequest {
     repeated LocationSpecInfo location_spec_infos = 5; // 一个location内的所有spec，StartWriteCache时会按照这个进行分配
     ModelDeployment model_deployment = 6;
     repeated LocationSpecGroup location_spec_groups = 7; // 一个group包含多个spec name。用于简化StartWriteCache时指定可以提供哪些location spec。
+    // 实例级 cache affinity 策略 JSON，空串表示由 instance_group/process 级回退。
+    string affinity_strategy_json = 8;
 }
 
 message RegisterInstanceResponse {
@@ -261,6 +266,11 @@ message StartWriteCacheRequest {
     repeated string location_spec_group_names = 5;
     int32 write_timeout_seconds = 6; // seconds, 要在指定timeout内调用FinishWriteCacheRequest，否则服务端会将本次 Request 相关的 Meta 全释放掉
     // 看情况添加一个已匹配block数量，提升metaservice性能，针对流式存储场景
+
+    // 调用方推理节点自报的 IP/hostname，给服务端 affinity 决策用
+    // (cache_affinity_manager + write_hints 路径)。空字符串 = 老客户端，
+    // 退化为无亲和性的写放置（与未启用 affinity 行为完全一致）。
+    string caller_node_ip = 7;
 }
 
 message StartWriteCacheResponse {

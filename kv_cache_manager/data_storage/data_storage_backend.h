@@ -8,6 +8,7 @@
 
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/data_storage/common_define.h"
+#include "kv_cache_manager/data_storage/write_hints.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
@@ -47,6 +48,38 @@ public:
                                                                      size_t size_per_key,
                                                                      const std::string &trace_id,
                                                                      std::function<void()> cb) = 0;
+
+    // Affinity-aware Create.
+    //
+    // `hints` carries the preferred placement; `strict` controls how the
+    // backend treats those hints:
+    //   strict=true  -> backend MUST allocate on hints.preferred_node_ids only
+    //                   and must surface an error for keys it cannot place
+    //                   there (no silent fallback to other nodes).
+    //   strict=false -> hints are advisory; backend may fall back to any node
+    //                   when the preferred ones are unavailable.
+    // When hints.preferred_node_ids is empty, `strict` is meaningless.
+    //
+    // Backends that can route keys to specific storage nodes should override
+    // this. The default implementation ignores both `hints` and `strict` and
+    // forwards to the legacy Create(), which keeps every existing backend a
+    // one-line fallthrough until it actually wants to honor affinity.
+    //
+    // SupportsAffinity() lets the manager layer (and DataStorageSelector in
+    // future) detect at runtime whether a backend will act on hints; defaults
+    // to false.
+    virtual std::vector<std::pair<ErrorCode, DataStorageUri>> CreateWithHints(const std::vector<std::string> &keys,
+                                                                              size_t size_per_key,
+                                                                              const WriteHints &hints,
+                                                                              bool strict,
+                                                                              const std::string &trace_id,
+                                                                              std::function<void()> cb) {
+        (void)hints;
+        (void)strict;
+        return Create(keys, size_per_key, trace_id, std::move(cb));
+    }
+
+    virtual bool SupportsAffinity() const { return false; }
     virtual std::vector<ErrorCode>
     Delete(const std::vector<DataStorageUri> &storage_uris, const std::string &trace_id, std::function<void()> cb) = 0;
     virtual std::vector<bool> Exist(const std::vector<DataStorageUri> &storage_uris) = 0;
