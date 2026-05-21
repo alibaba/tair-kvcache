@@ -569,13 +569,15 @@ TEST_F(MetaLocalBackendTest, TestLruTimeUpdatedByReadWriteOps) {
     int64_t lru_after_getall = getLruTime(1);
     ASSERT_GE(lru_after_getall - lru_after_get, kMinTimeDiffUs) << "GetAllFields should update LRU time by >= 1000us";
 
-    // --- Exists updates LRU time ---
+    // --- Exists does NOT update LRU time (read-only probe) ---
     usleep(1000);
     std::vector<bool> exist_vec;
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_storage_backend_->Exists(nullptr, {1}, exist_vec));
     ASSERT_TRUE(exist_vec[0]);
     int64_t lru_after_exists = getLruTime(1);
-    ASSERT_GE(lru_after_exists - lru_after_getall, kMinTimeDiffUs) << "Exists should update LRU time by >= 1000us";
+    // lru_after_exists reflects the previous getLruTime probe's TouchAccessTime,
+    // NOT the usleep gap, proving Exists didn't update it.
+    ASSERT_LT(lru_after_exists - lru_after_getall, kMinTimeDiffUs) << "Exists should NOT update LRU time";
 
     // --- Upsert updates LRU time ---
     usleep(1000);

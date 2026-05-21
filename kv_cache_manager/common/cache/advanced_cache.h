@@ -331,10 +331,15 @@ public: // functions
     // REQUIRES: handle must have been returned by a method on *this.
     virtual ObjectPtr Value(Handle *handle) = 0;
 
+    // Returns true if the key exists in the cache, false otherwise.
+    // Does NOT modify LRU order or acquire a reference.
+    virtual bool Exists(const std::string_view &key) = 0;
+
     // If the cache contains the entry for the key, erase it.  Note that the
     // underlying entry will be kept around until all existing handles
     // to it have been released.
-    virtual void Erase(const std::string_view &key) = 0;
+    // Returns true if the key was found (and erased), false otherwise.
+    virtual bool Erase(const std::string_view &key) = 0;
     // Return a new numeric id.  May be used by multiple clients who are
     // sharding the same cache to partition the key space.  Typically the
     // client will allocate a new id at startup and prepend the id to
@@ -644,7 +649,8 @@ public:
 
     ObjectPtr Value(Handle *handle) override { return target_->Value(handle); }
 
-    void Erase(const std::string_view &key) override { target_->Erase(key); }
+    bool Exists(const std::string_view &key) override { return target_->Exists(key); }
+    bool Erase(const std::string_view &key) override { return target_->Erase(key); }
     uint64_t NewId() override { return target_->NewId(); }
 
     void SetCapacity(size_t capacity) override { target_->SetCapacity(capacity); }

@@ -380,6 +380,7 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::Put(RequestContext *request_contex
                                                   const KeyTypeVec &keys,
                                                   const CacheLocationMapVector &locations,
                                                   const PropertyMapVector &properties) noexcept {
+    const int64_t serde_begin = TimestampUtil::GetCurrentTimeUs();
     WriteOp op;
     op.type = WriteOpType::kPut;
     op.keys = keys;
@@ -387,6 +388,10 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::Put(RequestContext *request_contex
     for (size_t i = 0; i < keys.size(); ++i) {
         op.field_maps[i] = SerializeToFieldMap(locations[i], properties[i]);
     }
+    const int64_t serde_us = TimestampUtil::GetCurrentTimeUs() - serde_begin;
+    auto *service_metrics_collector =
+        request_context ? dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector()) : nullptr;
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_searcher, index_serialize_time_us, serde_us);
     return EnqueueWriteOp(request_context, std::move(op));
 }
 
@@ -394,6 +399,7 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::Upsert(RequestContext *request_con
                                                      const KeyTypeVec &keys,
                                                      const CacheLocationMapVector &locations,
                                                      const PropertyMapVector &properties) noexcept {
+    const int64_t serde_begin = TimestampUtil::GetCurrentTimeUs();
     WriteOp op;
     op.type = WriteOpType::kUpsert;
     op.keys = keys;
@@ -401,6 +407,10 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::Upsert(RequestContext *request_con
     for (size_t i = 0; i < keys.size(); ++i) {
         op.field_maps[i] = SerializeToFieldMap(locations[i], properties[i]);
     }
+    const int64_t serde_us = TimestampUtil::GetCurrentTimeUs() - serde_begin;
+    auto *service_metrics_collector =
+        request_context ? dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector()) : nullptr;
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_searcher, index_serialize_time_us, serde_us);
     return EnqueueWriteOp(request_context, std::move(op));
 }
 
@@ -432,7 +442,7 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::DeleteLocations(RequestContext *re
 
 // ==================== Read Operations (sync passthrough) ====================
 
-std::vector<ErrorCode> MetaAsyncRedisBackend::Get(RequestContext * /*request_context*/,
+std::vector<ErrorCode> MetaAsyncRedisBackend::Get(RequestContext *request_context,
                                                   const KeyTypeVec &keys,
                                                   CacheLocationMapVector &out_locations,
                                                   PropertyMapVector &out_properties) noexcept {
@@ -446,6 +456,7 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::Get(RequestContext * /*request_con
     FieldMapVec field_maps;
     std::vector<ErrorCode> results = handle->GetAllFields(full_keys, field_maps);
 
+    const int64_t serde_begin = TimestampUtil::GetCurrentTimeUs();
     out_locations.resize(keys.size());
     out_properties.resize(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -458,10 +469,14 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::Get(RequestContext * /*request_con
             results[i] = ec;
         }
     }
+    const int64_t serde_us = TimestampUtil::GetCurrentTimeUs() - serde_begin;
+    auto *service_metrics_collector =
+        request_context ? dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector()) : nullptr;
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_searcher, index_deserialize_time_us, serde_us);
     return results;
 }
 
-std::vector<ErrorCode> MetaAsyncRedisBackend::GetLocations(RequestContext * /*request_context*/,
+std::vector<ErrorCode> MetaAsyncRedisBackend::GetLocations(RequestContext *request_context,
                                                            const KeyTypeVec &keys,
                                                            CacheLocationMapVector &out_locations) noexcept {
     auto handle = read_client_pool_->AcquireClient(timeout_ms_);
@@ -474,6 +489,7 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::GetLocations(RequestContext * /*re
     FieldMapVec field_maps;
     std::vector<ErrorCode> results = handle->GetAllFields(full_keys, field_maps);
 
+    const int64_t serde_begin = TimestampUtil::GetCurrentTimeUs();
     out_locations.resize(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
         if (results[i] != EC_OK) {
@@ -486,11 +502,15 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::GetLocations(RequestContext * /*re
             results[i] = ec;
         }
     }
+    const int64_t serde_us = TimestampUtil::GetCurrentTimeUs() - serde_begin;
+    auto *service_metrics_collector =
+        request_context ? dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector()) : nullptr;
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_searcher, index_deserialize_time_us, serde_us);
     return results;
 }
 
 std::vector<std::vector<ErrorCode>>
-MetaAsyncRedisBackend::GetLocations(RequestContext * /*request_context*/,
+MetaAsyncRedisBackend::GetLocations(RequestContext *request_context,
                                     const KeyTypeVec &keys,
                                     const LocationIdsPerKey &location_ids,
                                     LocationsPerKey &out_locations) noexcept {
@@ -516,6 +536,7 @@ MetaAsyncRedisBackend::GetLocations(RequestContext * /*request_context*/,
     FieldMapVec field_maps;
     std::vector<ErrorCode> key_results = handle->Get(full_keys, field_names_vec, field_maps);
 
+    const int64_t serde_begin = TimestampUtil::GetCurrentTimeUs();
     std::vector<std::vector<ErrorCode>> results(keys.size());
     out_locations.resize(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -540,6 +561,10 @@ MetaAsyncRedisBackend::GetLocations(RequestContext * /*request_context*/,
             results[i][j] = EC_OK;
         }
     }
+    const int64_t serde_us = TimestampUtil::GetCurrentTimeUs() - serde_begin;
+    auto *service_metrics_collector =
+        request_context ? dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector()) : nullptr;
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_searcher, index_deserialize_time_us, serde_us);
     return results;
 }
 

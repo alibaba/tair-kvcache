@@ -114,7 +114,7 @@ ErrorCode MetaLocalBackend::Close() noexcept {
 // Private helpers
 // ---------------------------------------------------------------------------
 
-ErrorCode MetaLocalBackend::CreateAndInsert(const std::string &key_str,
+ErrorCode MetaLocalBackend::CreateAndInsert(std::string_view key_sv,
                                             const CacheLocationMap &locations,
                                             const PropertyMap &properties) {
     MetaMemCacheItem *item = MetaMemCacheItem::Create(locations, properties);
@@ -124,7 +124,7 @@ ErrorCode MetaLocalBackend::CreateAndInsert(const std::string &key_str,
     // is enabled and capacity is exceeded, Insert returns EC_NOSPC instead
     // of silently discarding the entry with EC_OK.
     Cache::Handle *handle = nullptr;
-    ErrorCode ret = cache_->Insert(key_str, item, cache_item_helper_.get(), charge, &handle);
+    ErrorCode ret = cache_->Insert(key_sv, item, cache_item_helper_.get(), charge, &handle);
     if (ret != EC_OK) {
         MetaMemCacheItem::Deleter(item, nullptr);
     } else if (handle) {
@@ -133,14 +133,14 @@ ErrorCode MetaLocalBackend::CreateAndInsert(const std::string &key_str,
     return ret;
 }
 
-ErrorCode MetaLocalBackend::CreateAndInsertIfAbsent(const std::string &key_str,
+ErrorCode MetaLocalBackend::CreateAndInsertIfAbsent(std::string_view key_sv,
                                                     const CacheLocationMap &locations,
                                                     const PropertyMap &properties) {
     MetaMemCacheItem *item = MetaMemCacheItem::Create(locations, properties);
     item->TouchAccessTime();
     size_t charge = item->Size();
     Cache::Handle *handle = nullptr;
-    ErrorCode ret = cache_->InsertIfAbsent(key_str, item, cache_item_helper_.get(), charge, &handle);
+    ErrorCode ret = cache_->InsertIfAbsent(key_sv, item, cache_item_helper_.get(), charge, &handle);
     if (ret != EC_OK && ret != EC_EXIST) {
         MetaMemCacheItem::Deleter(item, nullptr);
     } else if (handle) {
@@ -149,10 +149,10 @@ ErrorCode MetaLocalBackend::CreateAndInsertIfAbsent(const std::string &key_str,
     return ret;
 }
 
-ErrorCode MetaLocalBackend::UpdateInPlace(const std::string &key_str,
+ErrorCode MetaLocalBackend::UpdateInPlace(std::string_view key_sv,
                                           const CacheLocationMap &locations,
                                           const PropertyMap &properties) {
-    Cache::Handle *handle = cache_->Lookup(key_str);
+    Cache::Handle *handle = cache_->Lookup(key_sv);
     if (!handle) {
         return EC_NOENT;
     }
@@ -200,8 +200,8 @@ ErrorCode MetaLocalBackend::UpdateInPlace(const std::string &key_str,
 
 ErrorCode
 MetaLocalBackend::UpsertForOneKey(KeyType key, const CacheLocationMap &locations, const PropertyMap &properties) {
-    std::string key_str = std::to_string(key);
-    ErrorCode update_ec = UpdateInPlace(key_str, locations, properties);
+    std::string_view key_sv = KeyToView(key);
+    ErrorCode update_ec = UpdateInPlace(key_sv, locations, properties);
     if (update_ec != EC_OK && update_ec != EC_NOENT) {
         KVCM_LOG_ERROR("local backend fail to update key[%ld] in upsert, ec[%d]", key, update_ec);
         return update_ec;
@@ -209,7 +209,7 @@ MetaLocalBackend::UpsertForOneKey(KeyType key, const CacheLocationMap &locations
     if (update_ec == EC_OK) {
         return EC_OK;
     }
-    ErrorCode insert_ec = CreateAndInsert(key_str, locations, properties);
+    ErrorCode insert_ec = CreateAndInsert(key_sv, locations, properties);
     if (insert_ec != EC_OK) {
         KVCM_LOG_ERROR("local backend fail to insert key[%ld] in upsert, ec[%d]", key, insert_ec);
         return insert_ec;
@@ -218,19 +218,12 @@ MetaLocalBackend::UpsertForOneKey(KeyType key, const CacheLocationMap &locations
 }
 
 ErrorCode MetaLocalBackend::DeleteForOneKey(KeyType key) {
-    std::string key_str = std::to_string(key);
-    Cache::Handle *handle = cache_->Lookup(key_str);
-    if (!handle) {
-        return EC_NOENT;
-    }
-    cache_->Release(handle);
-    cache_->Erase(key_str);
-    return EC_OK;
+    return cache_->Erase(KeyToView(key)) ? EC_OK : EC_NOENT;
 }
 
 ErrorCode MetaLocalBackend::DeleteLocationsForOneKey(KeyType key, const std::vector<LocationId> &location_ids) {
-    std::string key_str = std::to_string(key);
-    Cache::Handle *handle = cache_->Lookup(key_str);
+    std::string_view key_sv = KeyToView(key);
+    Cache::Handle *handle = cache_->Lookup(key_sv);
     if (!handle) {
         return EC_NOENT;
     }
@@ -266,7 +259,7 @@ std::vector<ErrorCode> MetaLocalBackend::Put(RequestContext * /*request_context*
                                              const PropertyMapVector &properties) noexcept {
     std::vector<ErrorCode> results(keys.size(), EC_OK);
     for (size_t i = 0; i < keys.size(); ++i) {
-        results[i] = CreateAndInsert(std::to_string(keys[i]), locations[i], properties[i]);
+        results[i] = CreateAndInsert(KeyToView(keys[i]), locations[i], properties[i]);
     }
     return results;
 }
@@ -277,7 +270,7 @@ std::vector<ErrorCode> MetaLocalBackend::PutIfAbsent(RequestContext * /*request_
                                                      const PropertyMapVector &properties) noexcept {
     std::vector<ErrorCode> results(keys.size(), EC_OK);
     for (size_t i = 0; i < keys.size(); ++i) {
-        results[i] = CreateAndInsertIfAbsent(std::to_string(keys[i]), locations[i], properties[i]);
+        results[i] = CreateAndInsertIfAbsent(KeyToView(keys[i]), locations[i], properties[i]);
     }
     return results;
 }
@@ -326,7 +319,7 @@ std::vector<ErrorCode> MetaLocalBackend::Put(RequestContext *request_context,
     std::vector<ErrorCode> results(keys.size(), EC_OK);
     for (size_t i = 0; i < keys.size(); ++i) {
         results[i] = (previous_error_codes[i] == EC_OK)
-                         ? CreateAndInsert(std::to_string(keys[i]), locations[i], properties[i])
+                         ? CreateAndInsert(KeyToView(keys[i]), locations[i], properties[i])
                          : previous_error_codes[i];
     }
     return results;
@@ -340,7 +333,7 @@ std::vector<ErrorCode> MetaLocalBackend::PutIfAbsent(RequestContext *request_con
     std::vector<ErrorCode> results(keys.size(), EC_OK);
     for (size_t i = 0; i < keys.size(); ++i) {
         results[i] = (previous_error_codes[i] == EC_OK)
-                         ? CreateAndInsertIfAbsent(std::to_string(keys[i]), locations[i], properties[i])
+                         ? CreateAndInsertIfAbsent(KeyToView(keys[i]), locations[i], properties[i])
                          : previous_error_codes[i];
     }
     return results;
@@ -394,8 +387,8 @@ ErrorCode MetaLocalBackend::GetForOneKey(KeyType key,
                                          CacheLocationMap *out_location_map,
                                          PropertyMap *out_property_map,
                                          std::vector<LocationId> *out_location_ids) {
-    std::string key_str = std::to_string(key);
-    Cache::Handle *handle = cache_->Lookup(key_str);
+    std::string_view key_sv = KeyToView(key);
+    Cache::Handle *handle = cache_->Lookup(key_sv);
     if (!handle) {
         return EC_NOENT;
     }
@@ -474,8 +467,8 @@ std::vector<std::vector<ErrorCode>> MetaLocalBackend::GetLocations(RequestContex
     for (size_t i = 0; i < keys.size(); ++i) {
         out_locations[i].resize(location_ids[i].size());
 
-        std::string key_str = std::to_string(keys[i]);
-        Cache::Handle *handle = cache_->Lookup(key_str);
+        std::string_view key_sv = KeyToView(keys[i]);
+        Cache::Handle *handle = cache_->Lookup(key_sv);
         if (!handle) {
             results[i].assign(location_ids[i].size(), EC_NOENT);
             continue;
@@ -531,14 +524,7 @@ std::vector<ErrorCode> MetaLocalBackend::Exists(RequestContext * /*request_conte
     out_is_exist_vec.resize(keys.size(), false);
 
     for (size_t i = 0; i < keys.size(); ++i) {
-        std::string key_str = std::to_string(keys[i]);
-        Cache::Handle *handle = cache_->Lookup(key_str);
-        out_is_exist_vec[i] = (handle != nullptr);
-        if (handle) {
-            auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
-            item->TouchAccessTime();
-            cache_->Release(handle);
-        }
+        out_is_exist_vec[i] = cache_->Exists(KeyToView(keys[i]));
     }
     return results;
 }
@@ -549,14 +535,13 @@ std::vector<ErrorCode> MetaLocalBackend::ExistsLocation(RequestContext * /*reque
     std::vector<ErrorCode> results(keys.size(), EC_OK);
     out_exists.resize(keys.size(), false);
     for (size_t i = 0; i < keys.size(); ++i) {
-        std::string key_str = std::to_string(keys[i]);
-        Cache::Handle *handle = cache_->Lookup(key_str);
+        std::string_view key_sv = KeyToView(keys[i]);
+        Cache::Handle *handle = cache_->Lookup(key_sv);
         if (!handle) {
             results[i] = EC_NOENT;
             continue;
         }
         auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
-        item->TouchAccessTime();
         {
             std::shared_lock lock(item->GetMutex());
             out_exists[i] = !item->GetLocations().empty();
@@ -586,9 +571,8 @@ ErrorCode MetaLocalBackend::ListKeys(RequestContext * /*request_context*/,
                                        Cache::ObjectPtr /*value*/,
                                        size_t /*charge*/,
                                        const Cache::CacheItemHelper * /*helper*/) {
-                                       KeyType parsed_key = 0;
-                                       if (StringUtil::StrToInt64(std::string(key).c_str(), parsed_key)) {
-                                           out_keys.push_back(parsed_key);
+                                       if (key.size() == sizeof(KeyType)) {
+                                           out_keys.push_back(ViewToKey(key));
                                            ++collected;
                                        }
                                    });
@@ -691,10 +675,9 @@ size_t MetaLocalBackend::CollectOldestKeysFromShard(uint32_t shard_id, size_t co
     std::vector<std::string> string_keys;
     string_keys.reserve(count);
     cache_->GetOldestKeysInShard(shard_id, count, string_keys);
-    KeyType parsed_key = 0;
     for (const auto &key_str : string_keys) {
-        if (StringUtil::StrToInt64(key_str.c_str(), parsed_key)) {
-            out_keys.push_back(parsed_key);
+        if (key_str.size() == sizeof(KeyType)) {
+            out_keys.push_back(ViewToKey(key_str));
         }
     }
     return string_keys.size();
