@@ -17,14 +17,14 @@
 
 namespace kv_cache_manager {
 
-#ifndef KVCM_METRICS_FOR_SCHEDULE_PLAN_EXECUTOR
-#define KVCM_METRICS_FOR_SCHEDULE_PLAN_EXECUTOR(name)                                                                  \
+#ifndef KVCM_GAUGE_METRICS_FOR_SCHEDULE_PLAN_EXECUTOR
+#define KVCM_GAUGE_METRICS_FOR_SCHEDULE_PLAN_EXECUTOR(name)                                                            \
 public:                                                                                                                \
     DECLARE_METRICS_NAME_(schedule_plan_executor, name);                                                               \
-    DEFINE_GET_METRICS_COUNTER_(schedule_plan_executor, name)                                                          \
+    DEFINE_GET_METRICS_GAUGE_(schedule_plan_executor, name)                                                            \
                                                                                                                        \
 private:                                                                                                               \
-    DECLARE_METRICS_COUNTER_(schedule_plan_executor, name);
+    DECLARE_METRICS_GAUGE_(schedule_plan_executor, name);
 #endif
 
 class MetaIndexerManager;
@@ -100,10 +100,10 @@ private:
     void DoLocationDelTask(const std::shared_ptr<std::promise<PlanExecuteResult>> &promise,
                            const CacheLocationDelRequest &task);
 
-    KVCM_METRICS_FOR_SCHEDULE_PLAN_EXECUTOR(waiting_task_count)
-    KVCM_METRICS_FOR_SCHEDULE_PLAN_EXECUTOR(executing_task_count)
+    KVCM_GAUGE_METRICS_FOR_SCHEDULE_PLAN_EXECUTOR(waiting_task_count)
+    KVCM_GAUGE_METRICS_FOR_SCHEDULE_PLAN_EXECUTOR(executing_task_count)
 };
 
-#undef KVCM_METRICS_FOR_SCHEDULE_PLAN_EXECUTOR
+#undef KVCM_GAUGE_METRICS_FOR_SCHEDULE_PLAN_EXECUTOR
 
 } // namespace kv_cache_manager
