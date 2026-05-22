@@ -57,7 +57,11 @@ class QwenBailianConverter(BaseConverter):
                     # 提取字段
                     timestamp = data.get('timestamp', 0.0)
                     hash_ids = data.get('hash_ids', [])
-                    input_length = data.get('input_length', 0)
+                    if 'input_length' not in data:
+                        raise ValueError("missing input_length")
+                    input_length = int(data['input_length'])
+                    if input_length <= 0:
+                        raise ValueError("input_length must be positive")
                     output_length = data.get('output_length', 0)
 
                     # 应用前缀哈希转换
@@ -114,14 +118,16 @@ class QwenBailianConverter(BaseConverter):
         get_trace = self._create_get_trace(
             timestamp_ns=base_timestamp_ns,
             keys=block_keys,
-            instance_id=self.default_instance_id
+            instance_id=self.default_instance_id,
+            input_len=input_length,
         )
 
         # Write trace (prefill阶段, 时间戳+1纳秒) - 显式使用default_instance_id
         write_trace = self._create_write_trace(
             timestamp_ns=base_timestamp_ns + 1,
             keys=block_keys,
-            instance_id=self.default_instance_id
+            instance_id=self.default_instance_id,
+            input_len=input_length,
         )
 
         return [get_trace, write_trace]

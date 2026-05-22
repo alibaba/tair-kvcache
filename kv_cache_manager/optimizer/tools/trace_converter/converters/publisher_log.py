@@ -98,6 +98,18 @@ class PublisherLogConverter(BaseConverter):
 
         return None
 
+    def _resolve_input_len(self, data: dict, instance_id: str) -> int:
+        for key in ('input_len', 'input_length', 'input_tokens'):
+            if key in data:
+                value = int(data[key])
+                if value <= 0:
+                    raise ValueError(f"{key} must be positive")
+                return value
+        tokens = data.get('tokens', [])
+        if tokens:
+            return len(tokens)
+        raise ValueError(f"missing input_len for instance {instance_id}")
+
     def _convert_get_location_event(self, data: dict):
         """转换GetCacheLocation事件"""
         # 从日志中提取instance_id
@@ -114,6 +126,7 @@ class PublisherLogConverter(BaseConverter):
             'timestamp_ns': int(data.get('trigger_time_us', 0)) * 1000,
             'keys': data.get('keys', []),
             'tokens': data.get('tokens', []),  # 提取tokens字段
+            'input_len': self._resolve_input_len(data, instance_id),
             'query_type': data.get('query_type', 'prefix_match'),
             'location_spec_names': data.get('location_spec_names', []),
             'block_mask': data.get('block_mask', []),
@@ -141,6 +154,7 @@ class PublisherLogConverter(BaseConverter):
             'timestamp_ns': int(data.get('trigger_time_us', 0)) * 1000,
             'keys': data.get('keys', []),
             'tokens': data.get('tokens', []),
+            'input_len': self._resolve_input_len(data, instance_id),
         }
 
         if write_session_id:
@@ -219,6 +233,7 @@ class PublisherLogConverter(BaseConverter):
             keys=get_trace['keys'],
             instance_id=instance_id,
             tokens=get_trace.get('tokens', []),
+            input_len=get_trace['input_len'],
             query_type=get_trace.get('query_type', 'prefix_match'),
             block_mask=get_trace.get('block_mask', []),
             sw_size=get_trace.get('sw_size', 0),
@@ -230,7 +245,8 @@ class PublisherLogConverter(BaseConverter):
             timestamp_ns=write_trace['timestamp_ns'],
             keys=write_trace['keys'],
             instance_id=instance_id,
-            tokens=write_trace.get('tokens', [])
+            tokens=write_trace.get('tokens', []),
+            input_len=write_trace['input_len'],
         )
 
         return [get_result, write_result]
@@ -256,7 +272,8 @@ class PublisherLogConverter(BaseConverter):
                     timestamp_ns=write_trace['timestamp_ns'],
                     keys=write_trace['keys'],
                     instance_id=write_trace['instance_id'],
-                    tokens=write_trace.get('tokens', [])
+                    tokens=write_trace.get('tokens', []),
+                    input_len=write_trace['input_len'],
                 )
                 traces.append(write_only)
 
@@ -273,6 +290,7 @@ class PublisherLogConverter(BaseConverter):
                 keys=get_trace['keys'],
                 instance_id=instance_id,
                 tokens=get_trace.get('tokens', []),
+                input_len=get_trace['input_len'],
                 query_type=get_trace.get('query_type', 'prefix_match'),
                 block_mask=get_trace.get('block_mask', []),
                 sw_size=get_trace.get('sw_size', 0),

@@ -101,6 +101,12 @@ class BaseConverter(ABC):
         # 分配无冲突的时间戳
         timestamp_ns = self._allocate_timestamp(instance_id, timestamp_ns)
 
+        if 'input_len' not in kwargs:
+            raise ValueError("optimizer get trace requires input_len")
+        input_len = int(kwargs['input_len'])
+        if input_len <= 0:
+            raise ValueError("optimizer get trace input_len must be positive")
+
         # tokens字段处理: 根据keep_tokens决定是否保留
         tokens = kwargs.get('tokens', []) if self.keep_tokens else []
         
@@ -112,6 +118,7 @@ class BaseConverter(ABC):
             'timestamp_ns': timestamp_ns,
             'tokens': tokens,
             'keys': keys,
+            'input_len': input_len,
 
             # GetLocationSchemaTrace 字段
             'query_type': kwargs.get('query_type', 'prefix_match'),
@@ -148,6 +155,12 @@ class BaseConverter(ABC):
         # 分配无冲突的时间戳
         timestamp_ns = self._allocate_timestamp(instance_id, timestamp_ns)
 
+        if 'input_len' not in kwargs:
+            raise ValueError("optimizer write trace requires input_len")
+        input_len = int(kwargs['input_len'])
+        if input_len <= 0:
+            raise ValueError("optimizer write trace input_len must be positive")
+
         # tokens字段处理: 根据keep_tokens决定是否保留
         tokens = kwargs.get('tokens', []) if self.keep_tokens else []
         
@@ -159,6 +172,7 @@ class BaseConverter(ABC):
             'timestamp_ns': timestamp_ns,
             'tokens': tokens,
             'keys': keys,
+            'input_len': input_len,
         }
 
         return trace
