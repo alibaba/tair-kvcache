@@ -10,8 +10,13 @@
             "group_name": "instance_group_01",
             "quota_capacity": 240,
             "used_percentage": 1.0,
-            "hierarchical_eviction_enabled": true,
-            "tier_write_mode": "write_through",
+            "tier_strategy": {
+                "hierarchical_eviction_enabled": true,
+                "write_mode": "write_through",
+                "access_propagation_enabled": true,
+                "promote_enabled": true,
+                "selective_write_threshold": 2
+            },
             "default_block_ttl_seconds": 0,
             "ttl_refresh_on_read": true,
             "storages": [

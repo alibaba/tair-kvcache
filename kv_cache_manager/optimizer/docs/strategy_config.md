@@ -162,10 +162,13 @@ Write trace：
   "group_name": "instance-a",
   "quota_capacity": 178,
   "used_percentage": 1.0,
-  "hierarchical_eviction_enabled": true,
-  "tier_write_mode": "write_through",
-  "selective_write_threshold": 2,
-  "enable_promote": true,
+  "tier_strategy": {
+    "hierarchical_eviction_enabled": true,
+    "write_mode": "write_through",
+    "access_propagation_enabled": true,
+    "promote_enabled": true,
+    "selective_write_threshold": 2
+  },
   "default_block_ttl_seconds": 0,
   "ttl_refresh_on_read": true,
   "storages": [],
@@ -178,25 +181,40 @@ Write trace：
 | `group_name` | string | 必填 | 实例组名称。multi-instance replay 中通常等于 instance 的 `instance_id` |
 | `quota_capacity` | number | 必填 | group 总容量，单位 GB。非分层模式按该字段驱逐 |
 | `used_percentage` | number | 必填 | 容量水位比例，实际阈值为 capacity × used_percentage |
-| `hierarchical_eviction_enabled` | bool | 必填 | 是否启用分层容量和分层驱逐 |
-| `tier_write_mode` | string | `write_through` | 多 tier 写入和层间流动策略 |
-| `selective_write_threshold` | int | `2` | `write_through_selective` 下命中层访问次数达到该阈值后复制到下一层；必须为正整数 |
-| `enable_promote` | bool | `true` | 低层命中后是否逐层复制回经过的高优先级层 |
+| `tier_strategy` | object | 必填 | 多层读写策略包，见下表 |
 | `default_block_ttl_seconds` | int | `0` | group 默认 TTL 秒数，`0` 表示组级禁用 TTL |
 | `ttl_refresh_on_read` | bool | `true` | TTL 策略下读命中是否刷新 TTL 锚点 |
 | `storages` | array | 必填 | tier 列表，按 `priority` 从小到大排序 |
 | `instances` | array | 必填 | 该 group 下的 optimizer instance 列表 |
 
-### tier_write_mode
+### tier_strategy
+
+| 字段 | 类型 | 默认 | 标准语义 |
+|---|---:|---:|---|
+| `hierarchical_eviction_enabled` | bool | 必填 | 是否启用分层容量和分层驱逐；`false` 时所有 tier 共享一个 `shared` 策略与 `quota_capacity` 配额 |
+| `write_mode` | string | `write_through` | 多 tier 写入和层间流动策略 |
+| `access_propagation_enabled` | bool | `true` | 读命中高优先级 tier 时，是否刷新后续持有副本 tier 的访问时间；`false` 表示只刷新命中 tier |
+| `promote_enabled` | bool | `true` | 低层命中后是否逐层复制回经过的高优先级层 |
+| `selective_write_threshold` | int | `2` | `write_through_selective` 下命中层访问次数达到该阈值后复制到下一层；必须为正整数 |
+
+### write_mode
 
 | 值 | 写入行为 | 驱逐行为 | 适用场景 |
 |---|---|---|---|
 | `write_through` | 写入时同时落所有 tier | 各 tier 独立按自身容量驱逐 | 基线、全量副本、多层独立命中率分析 |
 | `cascading` | 写入时只落 tier 0 | tier i 驱逐出的 block 降级到 tier i+1，最后一层驱逐后丢弃 | HBM→DRAM→SSD 逐级下沉 |
-| `write_through_selective` | 初始只落 tier 0 | 命中层访问次数达到 `selective_write_threshold` 后复制到下一层 | 控制低层写放大，只让热块下沉 |
-| `cascading_no_access_propagation` | 与 `cascading` 相同 | 上层命中不刷新低层访问时间 | 评估低层独立冷热衰减 |
+| `write_through_selective` | 初始只落 tier 0 | 命中层访问次数达到 `tier_strategy.selective_write_threshold` 后复制到下一层 | 控制低层写放大，只让热块下沉 |
 
-`enable_promote=true` 时，低优先级 tier 命中会触发向更高优先级 tier 逐层复制。比如 L3 命中会补齐 L2 和 L1，L2 命中只补 L1，不会额外写入更低层。复制动作会走容量检查，可能立刻触发对应 tier 的驱逐。
+`tier_strategy.write_mode` 只接受上表三个值，其他值会导致 config 解析失败。
+
+### access_propagation_enabled
+
+这个开关与 `tier_strategy.write_mode` 正交：
+
+- `true`：一个 block 在多个 tier 有副本时，读命中最高优先级 tier 后，也刷新后续副本 tier 的访问时间。这是默认行为。
+- `false`：只刷新实际命中的最高优先级 tier，不刷新下层副本的访问时间。适用于评估 write-through 或 cascading/promote 后多副本场景下的下层独立冷热衰减。
+
+`promote_enabled=true` 时，低优先级 tier 命中会触发向更高优先级 tier 逐层复制。比如 L3 命中会补齐 L2 和 L1，L2 命中只补 L1，不会额外写入更低层。复制动作会走容量检查，可能立刻触发对应 tier 的驱逐。
 
 ## storage 配置
 

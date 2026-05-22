@@ -68,10 +68,19 @@ def parse_args():
                             "write_through",
                             "cascading",
                             "write_through_selective",
-                            "cascading_no_access_propagation",
                         ])
     parser.add_argument("--selective-write-threshold", type=int, default=2,
                         help="Access-count threshold for write_through_selective tier writes")
+    access_group = parser.add_mutually_exclusive_group()
+    access_group.add_argument("--enable-tier-access-propagation",
+                              dest="tier_access_propagation_enabled",
+                              action="store_true",
+                              default=True,
+                              help="Refresh lower-tier access metadata when an upper-tier copy is hit")
+    access_group.add_argument("--disable-tier-access-propagation",
+                              dest="tier_access_propagation_enabled",
+                              action="store_false",
+                              help="Refresh only the hit tier when a block has copies in multiple tiers")
     promote_group = parser.add_mutually_exclusive_group()
     promote_group.add_argument("--enable-promote", dest="enable_promote", action="store_true", default=True)
     promote_group.add_argument("--disable-promote", dest="enable_promote", action="store_false")
@@ -398,10 +407,13 @@ def _make_single_instance_config(args, trace_file: str, output_dir: str, instanc
                 "group_name": instance_id,
                 "quota_capacity": args.l1_capacity + max(args.l2_capacity, 0.0),
                 "used_percentage": args.used_percentage,
-                "hierarchical_eviction_enabled": not args.disable_hierarchical_eviction,
-                "tier_write_mode": args.tier_write_mode,
-                "selective_write_threshold": args.selective_write_threshold,
-                "enable_promote": args.enable_promote,
+                "tier_strategy": {
+                    "hierarchical_eviction_enabled": not args.disable_hierarchical_eviction,
+                    "write_mode": args.tier_write_mode,
+                    "access_propagation_enabled": args.tier_access_propagation_enabled,
+                    "promote_enabled": args.enable_promote,
+                    "selective_write_threshold": args.selective_write_threshold,
+                },
                 "default_block_ttl_seconds": args.default_block_ttl_seconds,
                 "ttl_refresh_on_read": args.ttl_refresh_on_read,
                 "storages": storages,

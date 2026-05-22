@@ -186,7 +186,8 @@ bool OptimizerManager::CreateRadixTreeIndex(const OptInstanceConfig &instance_co
                                             group_it->second.hierarchical_eviction_enabled(),
                                             group_it->second.tier_write_mode(),
                                             default_ttl_ns,
-                                            static_cast<size_t>(group_it->second.selective_write_threshold()))) {
+                                            static_cast<size_t>(group_it->second.selective_write_threshold()),
+                                            group_it->second.tier_access_propagation_enabled())) {
         KVCM_LOG_ERROR("Failed to create optimizer indexer for instance_id: %s", instance_config.instance_id().c_str());
         return false;
     }

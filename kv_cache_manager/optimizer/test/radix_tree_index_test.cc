@@ -165,6 +165,48 @@ TEST_F(RadixTreeIndexTest, PromoteDoesNotCopyToLowerTiers) {
     EXPECT_TRUE(index->ConsumeReadTriggeredTierWrite());
 }
 
+TEST_F(RadixTreeIndexTest, WriteThroughPropagatesAccessToLowerTierByDefault) {
+    LruParams params;
+    params.sample_rate = 1.0;
+    std::vector<std::shared_ptr<EvictionPolicy>> policies = {
+        std::make_shared<LruEvictionPolicy>("l1", params),
+        std::make_shared<LruEvictionPolicy>("l2", params),
+    };
+    auto index = std::make_shared<RadixTreeIndex>("test_instance", policies, TierWriteMode::WRITE_THROUGH);
+    index->InsertOnly({30}, 1000);
+
+    auto *block = index->GetRoot()->children.at(30)->blocks[0].get();
+    ASSERT_EQ(block->location_map.count("l1"), 1);
+    ASSERT_EQ(block->location_map.count("l2"), 1);
+
+    BlockMask block_mask = std::vector<bool>{false};
+    index->PrefixQuery({30}, block_mask, 2000);
+
+    EXPECT_EQ(block->location_map.at("l1").last_access_time, 2000);
+    EXPECT_EQ(block->location_map.at("l2").last_access_time, 2000);
+}
+
+TEST_F(RadixTreeIndexTest, WriteThroughCanDisableAccessPropagationToLowerTier) {
+    LruParams params;
+    params.sample_rate = 1.0;
+    std::vector<std::shared_ptr<EvictionPolicy>> policies = {
+        std::make_shared<LruEvictionPolicy>("l1", params),
+        std::make_shared<LruEvictionPolicy>("l2", params),
+    };
+    auto index = std::make_shared<RadixTreeIndex>("test_instance", policies, TierWriteMode::WRITE_THROUGH, 0, 2, false);
+    index->InsertOnly({40}, 1000);
+
+    auto *block = index->GetRoot()->children.at(40)->blocks[0].get();
+    ASSERT_EQ(block->location_map.count("l1"), 1);
+    ASSERT_EQ(block->location_map.count("l2"), 1);
+
+    BlockMask block_mask = std::vector<bool>{false};
+    index->PrefixQuery({40}, block_mask, 2000);
+
+    EXPECT_EQ(block->location_map.at("l1").last_access_time, 2000);
+    EXPECT_EQ(block->location_map.at("l2").last_access_time, 1000);
+}
+
 TEST_F(RadixTreeIndexTest, MultipleInsertions) {
     std::vector<int64_t> block_keys1 = {1, 2, 3};
     index_->InsertOnly(block_keys1, 1000);

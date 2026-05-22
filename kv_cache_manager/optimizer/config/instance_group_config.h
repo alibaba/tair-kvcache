@@ -9,6 +9,39 @@
 #include "kv_cache_manager/optimizer/config/types.h"
 namespace kv_cache_manager {
 
+class OptTierStrategyConfig : public Jsonizable {
+public:
+    OptTierStrategyConfig() = default;
+    ~OptTierStrategyConfig() override = default;
+    bool FromRapidValue(const rapidjson::Value &rapid_value) override;
+    bool FromLegacyGroupRapidValue(const rapidjson::Value &rapid_value);
+    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
+
+    [[nodiscard]] bool hierarchical_eviction_enabled() const { return hierarchical_eviction_enabled_; }
+    [[nodiscard]] TierWriteMode write_mode() const { return write_mode_; }
+    [[nodiscard]] bool access_propagation_enabled() const { return access_propagation_enabled_; }
+    [[nodiscard]] bool promote_enabled() const { return promote_enabled_; }
+    [[nodiscard]] int64_t selective_write_threshold() const { return selective_write_threshold_; }
+
+    void set_hierarchical_eviction_enabled(bool enabled) { hierarchical_eviction_enabled_ = enabled; }
+    void set_write_mode(TierWriteMode mode) { write_mode_ = mode; }
+    void set_access_propagation_enabled(bool enabled) { access_propagation_enabled_ = enabled; }
+    void set_promote_enabled(bool enabled) { promote_enabled_ = enabled; }
+    void set_selective_write_threshold(int64_t threshold) { selective_write_threshold_ = threshold; }
+
+private:
+    bool ParseFields(const rapidjson::Value &rapid_value,
+                     const char *write_mode_key,
+                     const char *access_propagation_key,
+                     const char *promote_key);
+
+    bool hierarchical_eviction_enabled_ = false;
+    TierWriteMode write_mode_ = TierWriteMode::WRITE_THROUGH;
+    bool access_propagation_enabled_ = true;
+    bool promote_enabled_ = true;
+    int64_t selective_write_threshold_ = 2;
+};
+
 class OptInstanceGroupConfig : public Jsonizable {
 public:
     OptInstanceGroupConfig() = default;
@@ -20,10 +53,12 @@ public:
     [[nodiscard]] const std::string &group_name() const { return group_name_; }
     [[nodiscard]] int64_t quota_capacity() const { return quota_capacity_; }
     [[nodiscard]] double used_percentage() const { return used_percentage_; }
-    [[nodiscard]] bool hierarchical_eviction_enabled() const { return hierarchical_eviction_enabled_; }
-    [[nodiscard]] TierWriteMode tier_write_mode() const { return tier_write_mode_; }
-    [[nodiscard]] bool enable_promote() const { return enable_promote_; }
-    [[nodiscard]] int64_t selective_write_threshold() const { return selective_write_threshold_; }
+    [[nodiscard]] const OptTierStrategyConfig &tier_strategy() const { return tier_strategy_; }
+    [[nodiscard]] bool hierarchical_eviction_enabled() const { return tier_strategy_.hierarchical_eviction_enabled(); }
+    [[nodiscard]] TierWriteMode tier_write_mode() const { return tier_strategy_.write_mode(); }
+    [[nodiscard]] bool tier_access_propagation_enabled() const { return tier_strategy_.access_propagation_enabled(); }
+    [[nodiscard]] bool enable_promote() const { return tier_strategy_.promote_enabled(); }
+    [[nodiscard]] int64_t selective_write_threshold() const { return tier_strategy_.selective_write_threshold(); }
     [[nodiscard]] int64_t default_block_ttl_seconds() const { return default_block_ttl_seconds_; }
     [[nodiscard]] bool ttl_refresh_on_read() const { return ttl_refresh_on_read_; }
     [[nodiscard]] const std::vector<OptTierConfig> &storages() const { return storages_; }
@@ -33,10 +68,12 @@ public:
     void set_group_name(const std::string &name) { group_name_ = name; }
     void set_quota_capacity(int64_t capacity) { quota_capacity_ = capacity; }
     void set_used_percentage(double percentage) { used_percentage_ = percentage; }
-    void set_hierarchical_eviction_enabled(bool enabled) { hierarchical_eviction_enabled_ = enabled; }
-    void set_tier_write_mode(TierWriteMode mode) { tier_write_mode_ = mode; }
-    void set_enable_promote(bool enable) { enable_promote_ = enable; }
-    void set_selective_write_threshold(int64_t threshold) { selective_write_threshold_ = threshold; }
+    void set_tier_strategy(const OptTierStrategyConfig &tier_strategy) { tier_strategy_ = tier_strategy; }
+    void set_hierarchical_eviction_enabled(bool enabled) { tier_strategy_.set_hierarchical_eviction_enabled(enabled); }
+    void set_tier_write_mode(TierWriteMode mode) { tier_strategy_.set_write_mode(mode); }
+    void set_tier_access_propagation_enabled(bool enabled) { tier_strategy_.set_access_propagation_enabled(enabled); }
+    void set_enable_promote(bool enable) { tier_strategy_.set_promote_enabled(enable); }
+    void set_selective_write_threshold(int64_t threshold) { tier_strategy_.set_selective_write_threshold(threshold); }
     void set_default_block_ttl_seconds(int64_t ttl) { default_block_ttl_seconds_ = ttl; }
     void set_ttl_refresh_on_read(bool enabled) { ttl_refresh_on_read_ = enabled; }
     void set_storages(const std::vector<OptTierConfig> &storages) { storages_ = storages; }
@@ -46,10 +83,7 @@ private:
     std::string group_name_;
     int64_t quota_capacity_ = 0;
     double used_percentage_ = 0.0;
-    bool hierarchical_eviction_enabled_ = false;
-    TierWriteMode tier_write_mode_ = TierWriteMode::WRITE_THROUGH;
-    bool enable_promote_ = true;
-    int64_t selective_write_threshold_ = 2;
+    OptTierStrategyConfig tier_strategy_;
     int64_t default_block_ttl_seconds_ = 0; // 0 = TTL 关闭
     bool ttl_refresh_on_read_ = true;
 

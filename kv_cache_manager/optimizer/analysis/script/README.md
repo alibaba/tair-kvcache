@@ -102,11 +102,13 @@ bazel run //kv_cache_manager/optimizer/analysis/script:multi_instance_replay -- 
 | `--eviction-policy-params` | — | 策略默认值 | JSON object，覆盖策略参数，例如 `'{"sample_rate": 0.5}'` |
 | `--eviction-mode` | — | 3 | optimizer eviction mode：`1=group rough`，`2=instance rough`，`3=instance precise` |
 | `--eviction-batch-size` | — | 100 | 每个 instance 单次驱逐批大小 |
-| `--tier-write-mode` | — | `write_through` | 分层写入策略；可选 `write_through` / `cascading` / `write_through_selective` / `cascading_no_access_propagation` |
-| `--selective-write-threshold` | — | 2 | `write_through_selective` 下，命中层访问次数达到该阈值后复制到下一层；必须为正整数 |
-| `--enable-promote` | — | true | 开启从低层级向高层级 promote；与 `--disable-promote` 互斥 |
-| `--disable-promote` | — | false | 关闭 promote；与 `--enable-promote` 互斥 |
-| `--disable-hierarchical-eviction` | — | false | 关闭分层驱逐；默认生成分层配置 |
+| `--tier-write-mode` | — | `write_through` | 写入 `tier_strategy.write_mode`；可选 `write_through` / `cascading` / `write_through_selective` |
+| `--enable-tier-access-propagation` | — | true | 写入 `tier_strategy.access_propagation_enabled=true`；命中上层副本时，同时刷新后续持有副本 tier 的访问时间；与 `--disable-tier-access-propagation` 互斥 |
+| `--disable-tier-access-propagation` | — | false | 写入 `tier_strategy.access_propagation_enabled=false`；命中上层副本时，只刷新命中 tier，不刷新下层冷热；与 `--enable-tier-access-propagation` 互斥 |
+| `--selective-write-threshold` | — | 2 | 写入 `tier_strategy.selective_write_threshold`；`write_through_selective` 下，命中层访问次数达到该阈值后复制到下一层；必须为正整数 |
+| `--enable-promote` | — | true | 写入 `tier_strategy.promote_enabled=true`；开启从低层级向高层级 promote；与 `--disable-promote` 互斥 |
+| `--disable-promote` | — | false | 写入 `tier_strategy.promote_enabled=false`；关闭 promote；与 `--enable-promote` 互斥 |
+| `--disable-hierarchical-eviction` | — | false | 写入 `tier_strategy.hierarchical_eviction_enabled=false`；默认生成分层配置 |
 | `--used-percentage` | — | 1.0 | 写入 config 的 group `used_percentage` |
 | `--default-block-ttl-seconds` | — | 0 | 默认 block TTL 秒数；主要用于 `--eviction-policy ttl` |
 | `--ttl-refresh-on-read` | — | true | TTL 策略下读命中刷新 last access time；与 `--no-ttl-refresh-on-read` 互斥 |
@@ -148,7 +150,7 @@ bazel run //kv_cache_manager/optimizer/analysis/script:multi_instance_replay -- 
 
 在多个容量点上运行 optimizer，绘制容量-命中率权衡曲线。自动判断单策略/多策略模式。
 
-> **适用范围**：Tradeoff 分析仅适用于非分层模式。在分层模式（`hierarchical_eviction_enabled=true`）下，容量扫描仅修改 `quota_capacity`，而驱逐决策依据各 tier 独立的 `storages[i].capacity`，因此扫描结果无法反映真实的容量-性能权衡关系。
+> **适用范围**：Tradeoff 分析仅适用于非分层模式。在分层模式（`tier_strategy.hierarchical_eviction_enabled=true`）下，容量扫描仅修改 `quota_capacity`，而驱逐决策依据各 tier 独立的 `storages[i].capacity`，因此扫描结果无法反映真实的容量-性能权衡关系。
 
 ### 单策略模式
 
@@ -356,14 +358,14 @@ bazel run //kv_cache_manager/optimizer/analysis/script:analyze_lifecycle -- \
 
 ## 6. 多层存储 Per-Tier 输出
 
-启用多层存储（`hierarchical_eviction_enabled=true` 且至少 2 个 `storages`）时，标准 `*_hit_rates.csv` 会包含：
+启用多层存储（`tier_strategy.hierarchical_eviction_enabled=true` 且至少 2 个 `storages`）时，标准 `*_hit_rates.csv` 会包含：
 
 - `Tier<N>(<tier_name>)_HitTokens`
 - `Tier<N>(<tier_name>)_HitRate`
 - `AccTier<N>(<tier_name>)_HitRate`
 - `Tier<N>(<tier_name>)_BlockNum`
 
-`optimizer_run --draw-chart` 仅在存在 `hierarchical_eviction_enabled=true` 且至少 2 个 `storages` 的 group 时生成 `timeseries/per_tier_timeseries.png`。所有 `HitRate` / `AccHitRate` / `AccTier*_HitRate` 均为 token hit rate。
+`optimizer_run --draw-chart` 仅在存在 `tier_strategy.hierarchical_eviction_enabled=true` 且至少 2 个 `storages` 的 group 时生成 `timeseries/per_tier_timeseries.png`。所有 `HitRate` / `AccHitRate` / `AccTier*_HitRate` 均为 token hit rate。
 
 ---
 

@@ -79,9 +79,7 @@ std::unordered_map<std::string, std::vector<BlockEntry *>> OptEvictionManager::E
     }
 
     const bool hierarchical = instance_group_config.hierarchical_eviction_enabled();
-    const bool cascading =
-        hierarchical && (instance_group_config.tier_write_mode() == TierWriteMode::CASCADING ||
-                         instance_group_config.tier_write_mode() == TierWriteMode::CASCADING_NO_ACCESS_PROPAGATION);
+    const bool cascading = hierarchical && instance_group_config.tier_write_mode() == TierWriteMode::CASCADING;
 
     if (cascading) {
         // 级联模式：tier 0 → tier_{N-1} 串行，每层执行后即时降级到下一层，再重算下一层 excess

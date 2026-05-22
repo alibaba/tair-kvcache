@@ -189,7 +189,12 @@ OptimizerConfig (顶层配置)
         ├── group_name (组名)
         ├── quota_capacity (配额容量)
         ├── used_percentage (使用百分比)
-        ├── hierarchical_eviction_enabled (分层驱逐)
+        ├── tier_strategy (多层读写策略)
+        │   ├── hierarchical_eviction_enabled (分层驱逐)
+        │   ├── write_mode (多层写入模式)
+        │   ├── access_propagation_enabled (读访问传播)
+        │   ├── promote_enabled (低层命中回填高层)
+        │   └── selective_write_threshold (选择性下写阈值)
         ├── storages[] (存储层数组)
         └── instances[] (实例数组)
             ├── instance_id (实例ID)
@@ -213,7 +218,13 @@ OptimizerConfig (顶层配置)
             "group_name": "instance_group_01",
             "quota_capacity": 12000,
             "used_percentage": 1.0,
-            "hierarchical_eviction_enabled": false,
+            "tier_strategy": {
+                "hierarchical_eviction_enabled": false,
+                "write_mode": "write_through",
+                "access_propagation_enabled": true,
+                "promote_enabled": true,
+                "selective_write_threshold": 2
+            },
             "storages": [
                 {
                     "unique_name": "pace_00",
@@ -509,7 +520,7 @@ bazel run //kv_cache_manager/optimizer/analysis/script:visualize_tree -- \
 
 **功能**：生成在不同容量配置下的多个 instance 命中率曲线，用于评估容量与命中率的权衡关系，仅使用配置中的驱逐策略。
 
-> **适用范围**：Trade-off 分析仅适用于非分层模式。在分层模式（`hierarchical_eviction_enabled=true`）下，容量扫描仅修改 `quota_capacity`，不影响各 tier 独立的 `storages[i].capacity`，因此无法产生有意义的容量-性能权衡结果。
+> **适用范围**：Trade-off 分析仅适用于非分层模式。在分层模式（`tier_strategy.hierarchical_eviction_enabled=true`）下，容量扫描仅修改 `quota_capacity`，不影响各 tier 独立的 `storages[i].capacity`，因此无法产生有意义的容量-性能权衡结果。
 
 **运行方式**：
 ```bash

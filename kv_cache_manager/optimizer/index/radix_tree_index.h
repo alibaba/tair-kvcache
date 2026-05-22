@@ -25,7 +25,8 @@ public:
                    std::vector<std::shared_ptr<EvictionPolicy>> tier_policies,
                    TierWriteMode write_mode = TierWriteMode::WRITE_THROUGH,
                    int64_t default_ttl_ns = 0,
-                   size_t selective_write_threshold = 2);
+                   size_t selective_write_threshold = 2,
+                   bool tier_access_propagation_enabled = true);
     // 兼容构造函数 (单 policy)
     RadixTreeIndex(const std::string &instance_id,
                    const std::shared_ptr<EvictionPolicy> &eviction_policy,
@@ -91,12 +92,12 @@ private:
     // 写入模式：
     // WRITE_THROUGH = 所有 tier 都写
     // CASCADING = 仅写 tier 0，超出的通过 EvictionManager 级联降级
-    // CASCADING_NO_ACCESS_PROPAGATION = CASCADING，但上层命中不刷新更低 tier 访问时间
     // WRITE_THROUGH_SELECTIVE = 仅写 tier 0，命中热度达到阈值后复制到下一层
     TierWriteMode write_mode_ = TierWriteMode::WRITE_THROUGH;
+    // true 时命中最高优先级 tier 后也刷新后续持有副本的 tier 访问时间；false 时只刷新命中层。
+    bool tier_access_propagation_enabled_ = true;
     // 写入流量应落地的 tier 数，构造时结合 write_mode_ 与 tier 数一次性确定
-    // WRITE_THROUGH=全部层，CASCADING/CASCADING_NO_ACCESS_PROPAGATION/WRITE_THROUGH_SELECTIVE=仅 tier
-    // 0（单层退化为全部）
+    // WRITE_THROUGH=全部层，CASCADING/WRITE_THROUGH_SELECTIVE=仅 tier 0（单层退化为全部）
     size_t write_tier_count_ = 0;
     std::string instance_id_;
     int64_t default_ttl_ns_ = 0;

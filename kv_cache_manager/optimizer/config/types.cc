@@ -36,11 +36,13 @@ TierWriteMode ToTierWriteMode(const std::string &str) {
         return TierWriteMode::CASCADING;
     } else if (str == "write_through_selective") {
         return TierWriteMode::WRITE_THROUGH_SELECTIVE;
-    } else if (str == "cascading_no_access_propagation") {
-        return TierWriteMode::CASCADING_NO_ACCESS_PROPAGATION;
     }
     // 非法/缺省值回退到 WRITE_THROUGH，保证向后兼容
     return TierWriteMode::WRITE_THROUGH;
+}
+
+bool IsValidTierWriteMode(const std::string &str) {
+    return str == "write_through" || str == "cascading" || str == "write_through_selective";
 }
 
 std::string ToString(const TierWriteMode &mode) {
@@ -51,8 +53,6 @@ std::string ToString(const TierWriteMode &mode) {
         return "cascading";
     case TierWriteMode::WRITE_THROUGH_SELECTIVE:
         return "write_through_selective";
-    case TierWriteMode::CASCADING_NO_ACCESS_PROPAGATION:
-        return "cascading_no_access_propagation";
     default:
         return "write_through";
     }

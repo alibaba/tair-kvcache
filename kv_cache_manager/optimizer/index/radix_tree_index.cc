@@ -16,7 +16,8 @@ RadixTreeIndex::RadixTreeIndex(const std::string &instance_id,
                                std::vector<std::shared_ptr<EvictionPolicy>> tier_policies,
                                TierWriteMode write_mode,
                                int64_t default_ttl_ns,
-                               size_t selective_write_threshold) {
+                               size_t selective_write_threshold,
+                               bool tier_access_propagation_enabled) {
     root_ = std::make_unique<RadixTreeNode>();
     tier_policies_ = std::move(tier_policies);
     for (auto &p : tier_policies_) {
@@ -25,14 +26,14 @@ RadixTreeIndex::RadixTreeIndex(const std::string &instance_id,
     write_mode_ = write_mode;
     // 级联/选择性写入模式且多层时初始仅落 tier 0；其余情形落全部。
     write_tier_count_ =
-        ((write_mode_ == TierWriteMode::CASCADING || write_mode_ == TierWriteMode::WRITE_THROUGH_SELECTIVE ||
-          write_mode_ == TierWriteMode::CASCADING_NO_ACCESS_PROPAGATION) &&
+        ((write_mode_ == TierWriteMode::CASCADING || write_mode_ == TierWriteMode::WRITE_THROUGH_SELECTIVE) &&
          tier_policies_.size() > 1)
             ? 1
             : tier_policies_.size();
     instance_id_ = instance_id;
     default_ttl_ns_ = default_ttl_ns;
     selective_write_threshold_ = selective_write_threshold;
+    tier_access_propagation_enabled_ = tier_access_propagation_enabled;
 }
 
 // 兼容构造函数 (单 policy)
@@ -377,11 +378,11 @@ void RadixTreeIndex::OnBlockAccessed(BlockEntry *block, int64_t timestamp, bool 
     block->access_count += 1;
     block->last_access_time = timestamp;
 
-    // 遍历所有 tier：last_access_time 对所有持有副本的 tier 都刷新（冷热信号）。
-    // cascading_no_access_propagation 只刷新命中层，避免上层命中给低层续热。
+    // 遍历所有 tier：tier_access_propagation_enabled=true 时，所有持有副本的 tier 都刷新
+    // last_access_time；否则只刷新命中层，避免上层命中给下层续热。
     // access_count 仅对"首个命中层"+1（分层读优先读快层，tier 索引最小的持有层视为命中层）
     bool first_hit = true;
-    bool propagate_access = write_mode_ != TierWriteMode::CASCADING_NO_ACCESS_PROPAGATION;
+    bool propagate_access = tier_access_propagation_enabled_;
     size_t hit_tier_idx = tier_policies_.size();
     size_t hit_tier_access_count = 0;
     for (size_t i = 0; i < tier_policies_.size(); ++i) {

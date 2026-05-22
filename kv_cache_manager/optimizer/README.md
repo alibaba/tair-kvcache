@@ -153,7 +153,13 @@ bazel build //kv_cache_manager/optimizer:optimizer_main
             "group_name": "instance_group_01", // 需要分析的实例组名称
             "quota_capacity": 12000,
             "used_percentage": 1.0,
-            "hierarchical_eviction_enabled": false,
+            "tier_strategy": {
+                "hierarchical_eviction_enabled": false,
+                "write_mode": "write_through",
+                "access_propagation_enabled": true,
+                "promote_enabled": true,
+                "selective_write_threshold": 2
+            },
             "default_block_ttl_seconds": 0, // 0=关闭TTL, >0=默认TTL秒数
             "storages": [
                 {
@@ -314,10 +320,7 @@ optimizer.ClearAllCachesAndResetStats()           # 清空所有实例并重置�
 |------|------|
 | eviction_mode | 驱逐模式：1=GROUP_ROUGH, 2=INSTANCE_ROUGH, 3=INSTANCE_PRECISE |
 | eviction_policy_type | 驱逐策略类型：lru、random_lru、leaf_aware_lru、ttl |
-| hierarchical_eviction_enabled | 是否开启分层驱逐（各 tier 独立容量与独立驱逐策略）；`false` 时所有 tier 共享一个 `shared` 策略与 `quota_capacity` 配额（GB） |
-| tier_write_mode | 仅在 `hierarchical_eviction_enabled=true` 时生效。可选值：`write_through`、`cascading`、`write_through_selective`、`cascading_no_access_propagation` |
-| selective_write_threshold | `write_through_selective` 下命中层访问次数达到该阈值后复制到下一层，默认 2，必须为正整数 |
-| enable_promote | 低层命中后是否逐层复制回经过的高优先级层，默认 true |
+| tier_strategy | 多层读写策略包，包含分层驱逐开关、写入模式、读访问传播、promote 和 selective write 阈值 |
 | default_block_ttl_seconds | instance group 级别的默认 TTL（秒），0 = 关闭 TTL |
 | ttl_refresh_on_read | instance group 级别 TTL 续命开关：true=读续命，false=固定窗口 |
 | fallback_on_pressure | TTL 策略参数：过期不够时是否按 LRU 兜底（默认 true） |
@@ -353,7 +356,13 @@ python trace_converter.py \
             "group_name": "instance_group_01",
             "quota_capacity" : 120000,
             "used_percentage" : 1.0,
-            "hierarchical_eviction_enabled": false,
+            "tier_strategy": {
+                "hierarchical_eviction_enabled": false,
+                "write_mode": "write_through",
+                "access_propagation_enabled": true,
+                "promote_enabled": true,
+                "selective_write_threshold": 2
+            },
             "storages": [
                         {
                             "unique_name": "pace_00",
