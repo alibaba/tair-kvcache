@@ -83,8 +83,15 @@ ErrorCode CoordinationRedisBackend::Init(const StandardUri &standard_uri) noexce
         return EC_IO_ERROR;
     }
 
-    // 设置键前缀（从公共前缀 kvcm_ 派生，lock 前缀保持与旧版本一致）
+    // 从URI参数中获取cluster_name，用于多KVCM实例共享同一Redis时的key隔离
+    std::string cluster_name = standard_uri.GetParam("cluster_name");
     std::string base_prefix = "kvcm_";
+    if (!cluster_name.empty()) {
+        base_prefix += cluster_name + "_";
+    } else {
+        KVCM_LOG_WARN("cluster_name not set for coordination backend, keys will use global namespace. "
+                      "Consider setting cluster_name to avoid conflicts in shared-Redis deployments.");
+    }
     lock_key_prefix_ = base_prefix + "lock:";
     kv_key_prefix_ = base_prefix + "kv:";
 
@@ -123,9 +130,10 @@ ErrorCode CoordinationRedisBackend::Init(const StandardUri &standard_uri) noexce
     client_pool_ = client_pool;
     initialized_.store(true, std::memory_order_release);
 
-    KVCM_LOG_INFO("Redis lock backend initialized successfully with script caching, client pool min[%d], max[%d]",
-                  client_min_pool_size,
-                  client_max_pool_size);
+    KVCM_LOG_INFO("Redis coordination backend initialized, cluster_name[%s], lock_prefix[%s], kv_prefix[%s], "
+                  "client pool min[%d], max[%d]",
+                  cluster_name.c_str(), lock_key_prefix_.c_str(), kv_key_prefix_.c_str(),
+                  client_min_pool_size, client_max_pool_size);
     return EC_OK;
 }
 
