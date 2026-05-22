@@ -14,7 +14,7 @@ Applicability:
 用法:
   # 单策略（默认使用配置文件中的策略）
   python run/tradeoff.py -c config.json
-  python run/tradeoff.py -c config.json --skip-run --csv-output-dir /path/to/csvs
+  python run/tradeoff.py -c config.json --skip-run
 
   # 多策略对比
   python run/tradeoff.py -c config.json --eviction-policies lru leaf_aware_lru random_lru
@@ -28,7 +28,13 @@ from collections import defaultdict
 
 from kv_cache_manager.optimizer.pybind import kvcm_py_optimizer
 
-from utils.optimizer_runner import init_kvcm_logger, warmup_pass, run_experiments_parallel, extract_bytes_per_block_map, extract_config_quota_gb_map
+from utils.optimizer_runner import (
+    init_kvcm_logger,
+    warmup_pass,
+    run_experiments_parallel,
+    extract_bytes_per_block_map,
+    extract_config_quota_gb_map,
+)
 from utils.csv_loader import generate_capacity_list, load_results_from_csv_dir
 from utils.plot_utils import plot_single_policy_curves, plot_multi_policy_subplots
 from plot.hit_rate_plot import plot_multi_instance_analysis
@@ -169,8 +175,6 @@ def main():
     parser.add_argument("--max-workers", type=int, default=4)
     parser.add_argument("--save-csv", action="store_true",
                         help="保留每次运行的 CSV 文件")
-    parser.add_argument("--csv-output-dir", default=None,
-                        help="CSV 保存目录（默认: <output_result_path>/csv_results）")
     parser.add_argument("--skip-run", action="store_true",
                         help="跳过实验，从已有 CSV 目录加载数据")
     parser.add_argument("--plot-timeseries", action="store_true",
@@ -219,12 +223,13 @@ def main():
     print(mode_name)
     print("=" * 60)
     print("Config:   {}".format(args.config))
+    print("Trace:    {}".format(config.trace_file_path()))
     if multi_policy:
         print("Policies: {}".format(", ".join(p for p in policies if p)))
     print("Output:   {}".format(config.output_result_path()))
     print()
 
-    csv_save_dir = args.csv_output_dir or os.path.join(config.output_result_path(), "csv_results")
+    csv_save_dir = os.path.join(config.output_result_path(), "csv_results")
 
     # ----------------------------------------------------------------
     # 数据获取：运行实验 or 加载已有 CSV
@@ -232,7 +237,7 @@ def main():
     if args.skip_run:
         results_by_policy = load_results_from_csv_dir(csv_save_dir, bytes_per_block_map)
         if not results_by_policy:
-            print("Error: No data loaded. Check --csv-output-dir path.")
+            print("Error: No data loaded. Check csv_results path: {}".format(csv_save_dir))
             sys.exit(1)
         if multi_policy and policies[0] is not None:
             results_by_policy = {p: results_by_policy[p] for p in policies if p in results_by_policy}
@@ -292,7 +297,6 @@ def main():
     print("\n" + "=" * 60)
     print("Plotting Results")
     print("=" * 60)
-    output_dir = config.output_result_path()
     axis_limits = {"x_min": args.x_min, "x_max": args.x_max, "y_min": args.y_min, "y_max": args.y_max}
     hit_types = ["total", "local", "remote"] if args.hit_rate_type == "all" else [args.hit_rate_type]
 

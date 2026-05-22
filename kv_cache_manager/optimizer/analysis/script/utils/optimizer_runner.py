@@ -13,6 +13,7 @@ import gc
 import json
 import os
 import shutil
+import sys
 import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -28,7 +29,19 @@ from .csv_loader import collect_instance_csvs, parse_instance_metrics
 # ============================================================================
 
 def init_kvcm_logger(log_level: int = 4):
-    """初始化 KVCM 日志系统"""
+    """初始化 KVCM 日志系统。
+
+    Python analysis targets are usually run through `bazel run`, where users
+    expect progress and KVCM C++ logs to be visible in the terminal.  The C++
+    default logger writes to logs/kv_cache_manager.log, so analysis scripts
+    opt into console logging unless the caller explicitly sets
+    KVCM_LOG_TO_CONSOLE=0.
+    """
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(line_buffering=True)
+    os.environ.setdefault("KVCM_LOG_TO_CONSOLE", "1")
     kvcm_py_optimizer.LoggerBroker.InitLogger("", False)
     kvcm_py_optimizer.LoggerBroker.SetLogLevel(log_level)
 
@@ -163,6 +176,23 @@ def extract_bytes_per_block_map(config_path: str) -> Dict[str, int]:
     return result
 
 
+def has_hierarchical_storage(config_path: str) -> bool:
+    """
+    Return whether the optimizer config enables real multi-tier storage.
+
+    A single storage entry can still produce Tier0 diagnostic columns in CSV,
+    but per-tier comparison charts are only meaningful when a group has at
+    least two configured tiers and hierarchical eviction is enabled.
+    """
+    with open(config_path, "r") as f:
+        config_json = json.load(f)
+
+    for group in config_json.get("instance_groups", []):
+        if group.get("hierarchical_eviction_enabled", False) and len(group.get("storages", [])) > 1:
+            return True
+    return False
+
+
 def extract_config_quota_gb_map(config_path: str) -> Dict[str, float]:
     """
     从 config JSON 提取每个 instance 所属 group 的 quota_capacity（单位：GB）。
@@ -222,13 +252,12 @@ def warmup_pass(
 
         first_csv = next(iter(csv_map.values()))
         df = pd.read_csv(first_csv)
-        max_blocks = int(df["CachedBlocksAllInstance"].max())
+        max_blocks = int(df["CachedBlocks"].max())
 
         rep_bpb = next(iter(bytes_per_block_map.values()), 0)
         max_gb = max_blocks * rep_bpb / (1024 ** 3) if rep_bpb > 0 else 0
-        acc_read = int(df["AccReadBlocks"].iloc[-1]) if "AccReadBlocks" in df.columns else 0
         acc_write = int(df["AccWriteBlocks"].iloc[-1]) if "AccWriteBlocks" in df.columns else 0
-        print(f"Warmup done. Max cached: {max_gb:.2f} GB ({max_blocks} blocks), AccReadBlocks: {acc_read}, AccWriteBlocks: {acc_write}")
+        print(f"Warmup done. Max cached: {max_gb:.2f} GB ({max_blocks} blocks), AccWriteBlocks: {acc_write}")
 
         return max_blocks
     finally:

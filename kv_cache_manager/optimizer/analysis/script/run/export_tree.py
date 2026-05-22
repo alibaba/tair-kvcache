@@ -63,7 +63,6 @@ Examples:
         """,
     )
     parser.add_argument("-c", "--config", required=True, help="Optimizer config file")
-    parser.add_argument("-o", "--output-dir", default=None, help="Output directory")
     parser.add_argument("--hot-nodes", type=int, default=10)
     parser.add_argument("--show-hot-paths", action="store_true",
                         help="只可视化热点路径（推荐大树使用）")
@@ -84,7 +83,7 @@ Examples:
         sys.exit(1)
     config = config_loader.config()
 
-    root_dir = Path(args.output_dir) if args.output_dir else Path(config.output_result_path())
+    root_dir = Path(config.output_result_path())
     output_dir = root_dir / "radix_tree"
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -92,6 +91,7 @@ Examples:
     print("Radix Tree Export and Visualization")
     print("=" * 80)
     print("Config: {}".format(args.config))
+    print("Trace: {}".format(config.trace_file_path()))
     print("Output: {}".format(root_dir))
     print()
 

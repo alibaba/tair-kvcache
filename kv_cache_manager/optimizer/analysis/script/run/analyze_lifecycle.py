@@ -7,7 +7,7 @@ Block Lifecycle 分析入口
 
 用法:
   python run/analyze_lifecycle.py -i lifecycle.csv
-  python run/analyze_lifecycle.py -i output_dir/ -o results/
+  python run/analyze_lifecycle.py -i output_dir/
   python run/analyze_lifecycle.py -i lifecycle.csv --stats-only
 """
 
@@ -73,21 +73,18 @@ def main():
         epilog="""
 示例:
   python run/analyze_lifecycle.py -i lifecycle.csv
-  python run/analyze_lifecycle.py -i output_dir/ -o results/
+  python run/analyze_lifecycle.py -i output_dir/
   python run/analyze_lifecycle.py -i lifecycle.csv --stats-only
         """,
     )
     parser.add_argument("-i", "--input", required=True,
                         help="lifecycle CSV 文件或包含 *_lifecycle.csv 的目录")
-    parser.add_argument("-o", "--output-dir", default=None,
-                        help="图表输出目录 (默认: 输入文件所在目录)")
     parser.add_argument("--stats-only", action="store_true",
                         help="只打印统计信息，不生成图表")
     args = parser.parse_args()
 
-    if args.output_dir is None:
-        input_path = Path(args.input)
-        args.output_dir = str(input_path if input_path.is_dir() else input_path.parent)
+    input_path = Path(args.input)
+    output_dir = str(input_path if input_path.is_dir() else input_path.parent)
 
     csvs = find_lifecycle_csvs(args.input)
     if not csvs:
@@ -97,7 +94,7 @@ def main():
     print(f"找到 {len(csvs)} 个 lifecycle 文件")
 
     for csv_path in csvs:
-        analyze_single(csv_path, args.output_dir, args.stats_only)
+        analyze_single(csv_path, output_dir, args.stats_only)
 
     print(f"\n完成!")
 

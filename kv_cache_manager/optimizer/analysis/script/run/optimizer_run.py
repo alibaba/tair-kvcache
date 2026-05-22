@@ -14,7 +14,11 @@ import time
 
 from kv_cache_manager.optimizer.pybind import kvcm_py_optimizer
 
-from utils.optimizer_runner import init_kvcm_logger, extract_bytes_per_block_map
+from utils.optimizer_runner import (
+    init_kvcm_logger,
+    extract_bytes_per_block_map,
+    has_hierarchical_storage,
+)
 from plot.hit_rate_plot import plot_multi_instance_analysis, plot_per_tier_timeseries
 
 
@@ -74,7 +78,11 @@ def main():
     t3 = time.time()
     print("\n[3/4] Running simulation...")
     print("      Trace: {}".format(config.trace_file_path()))
-    manager.DirectRun()
+    try:
+        manager.DirectRun()
+    except Exception as exc:
+        print("      Simulation failed: {}".format(exc))
+        sys.exit(1)
     dur_run = time.time() - t3
     print("      Simulation done: {:.2f}s".format(dur_run))
 
@@ -93,7 +101,10 @@ def main():
             show_template=args.enable_template_analysis,
             bytes_per_block_map=bytes_per_block_map,
         )
-        plot_per_tier_timeseries(output_path, output_path)
+        if has_hierarchical_storage(args.config):
+            plot_per_tier_timeseries(output_path, output_path)
+        else:
+            print("      Per-tier chart skipped: hierarchical storage is not enabled")
         print("      Charts done: {:.2f}s".format(time.time() - t5))
     else:
         print("\n[5/5] Skipping chart generation.")

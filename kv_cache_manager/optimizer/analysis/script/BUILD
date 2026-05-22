@@ -17,6 +17,7 @@ py_library(
         "utils/csv_loader.py",
         "utils/optimizer_runner.py",
         "utils/plot_utils.py",
+        "utils/window_aggregator.py",
     ],
     imports = ["."],
     deps = [PYBIND_DEP],
@@ -76,4 +77,12 @@ py_binary(
     srcs = ["run/analyze_lifecycle.py"],
     main = "run/analyze_lifecycle.py",
     deps = [":analysis_lib", ":plot_lib"],
+)
+
+# Per-instance replay: one optimizer process per instance trace plus token-hit-rate aggregation
+py_binary(
+    name = "multi_instance_replay",
+    srcs = ["run/multi_instance_replay.py"],
+    main = "run/multi_instance_replay.py",
+    deps = [":utils_lib"],
 )

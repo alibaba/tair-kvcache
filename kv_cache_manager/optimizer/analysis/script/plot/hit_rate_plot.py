@@ -89,7 +89,6 @@ def plot_multi_instance_analysis(
     Args:
         csv_dir:             CSV 数据目录
         output_dir:          图表根输出目录，图表保存至 output_dir/timeseries/
-                             默认为 csv_dir（向后兼容）
         show_template:       是否在图上显示 SP 累计命中率线（需要 template_prefix_traces.csv）
         bytes_per_block_map: {instance_id: bytes_per_block}，不提供时存储量以 blocks 显示
     """
@@ -110,7 +109,16 @@ def plot_multi_instance_analysis(
         df = _ensure_hit_rate_timestamp_ns(df)
 
         # 数值化 + 排序
-        for c in ['CachedBlocksAllInstance', 'AccHitRate', 'AccRemoteHitRate', 'AccReadBlocks']:
+        for c in [
+            'CachedBlocks',
+            'AccReadBlocks',
+            'AccHitBlocks',
+            'AccHitRate',
+            'AccRemoteHitRate',
+            'AccInputTokens',
+            'AccHitTokens',
+            'AccRemoteHitTokens',
+        ]:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
 
@@ -136,7 +144,17 @@ def plot_multi_instance_analysis(
         print("Error: No valid CSV data could be loaded")
         return
 
-    required_cols = ['TimestampNs', 'CachedBlocksAllInstance', 'AccHitRate', 'AccRemoteHitRate', 'AccReadBlocks']
+    required_cols = [
+        'TimestampNs',
+        'CachedBlocks',
+        'AccReadBlocks',
+        'AccHitBlocks',
+        'AccHitRate',
+        'AccRemoteHitRate',
+        'AccInputTokens',
+        'AccHitTokens',
+        'AccRemoteHitTokens',
+    ]
     for i, df in enumerate(dataframes):
         missing = [c for c in required_cols if c not in df.columns]
         if missing:
@@ -155,8 +173,8 @@ def plot_multi_instance_analysis(
 
     all_acc_sp_hit = []
     all_acc_hit, all_acc_remote_hit, all_time_ranges = [], [], []
-    # 用于瞬时命中率计算：累积读块数 / 累积命中块数（反推）
-    all_acc_read_blocks, all_acc_hit_blocks, all_acc_remote_hit_blocks = [], [], []
+    # 用于瞬时命中率计算：累积输入 token 数 / 累积命中 token 数
+    all_acc_input_tokens, all_acc_hit_tokens, all_acc_remote_hit_tokens = [], [], []
     all_acc_sp_hit = []
 
     global_updates_list = []
@@ -167,11 +185,7 @@ def plot_multi_instance_analysis(
         d["t"] = (d["TimestampNs"] - min_timestamp) / 1e9
         d = d.sort_values('t')
 
-        # 反推累积命中块数：AccHitBlocks = AccHitRate × AccReadBlocks
-        d['AccHitBlocks']       = d['AccHitRate']       * d['AccReadBlocks']
-        d['AccRemoteHitBlocks'] = d['AccRemoteHitRate'] * d['AccReadBlocks']
-
-        global_updates_list.append(d[['t', 'CachedBlocksAllInstance']])
+        global_updates_list.append(d[['t', 'CachedBlocks']])
 
         # 收集 per-tier 数据
         for col in tier_block_cols:
@@ -184,7 +198,7 @@ def plot_multi_instance_analysis(
         aligned = pd.merge_asof(
             base,
             d[['t', 'AccHitRate', 'AccRemoteHitRate',
-               'AccReadBlocks', 'AccHitBlocks', 'AccRemoteHitBlocks']],
+               'AccInputTokens', 'AccHitTokens', 'AccRemoteHitTokens']],
             on='t',
             direction='backward',
             allow_exact_matches=True
@@ -192,14 +206,14 @@ def plot_multi_instance_analysis(
 
         mask_out = (aligned['t'] < t0)
         acc_cols = ['AccHitRate', 'AccRemoteHitRate',
-                    'AccReadBlocks', 'AccHitBlocks', 'AccRemoteHitBlocks']
+                    'AccInputTokens', 'AccHitTokens', 'AccRemoteHitTokens']
         aligned.loc[mask_out, acc_cols] = np.nan
 
         all_acc_hit.append(aligned['AccHitRate'].to_numpy(float))
         all_acc_remote_hit.append(aligned['AccRemoteHitRate'].to_numpy(float))
-        all_acc_read_blocks.append(aligned['AccReadBlocks'].to_numpy(float))
-        all_acc_hit_blocks.append(aligned['AccHitBlocks'].to_numpy(float))
-        all_acc_remote_hit_blocks.append(aligned['AccRemoteHitBlocks'].to_numpy(float))
+        all_acc_input_tokens.append(aligned['AccInputTokens'].to_numpy(float))
+        all_acc_hit_tokens.append(aligned['AccHitTokens'].to_numpy(float))
+        all_acc_remote_hit_tokens.append(aligned['AccRemoteHitTokens'].to_numpy(float))
 
     # ---- SP 累积命中率对齐 ----
     if show_template:
@@ -221,11 +235,11 @@ def plot_multi_instance_analysis(
         all_acc_sp_hit = [None] * len(instance_names)
 
     global_updates = pd.concat(global_updates_list, ignore_index=True)
-    global_updates = global_updates.dropna(subset=['t', 'CachedBlocksAllInstance']).sort_values('t')
+    global_updates = global_updates.dropna(subset=['t', 'CachedBlocks']).sort_values('t')
 
     # 同一时刻可能多个instance都写了全局容量：聚合成一个值（median更稳健）
     global_updates = (global_updates
-                    .groupby('t', as_index=False)['CachedBlocksAllInstance']
+                    .groupby('t', as_index=False)['CachedBlocks']
                     .median())
 
     # 对齐到base：在两次更新之间保持最后值（全局容量是状态量）
@@ -237,7 +251,7 @@ def plot_multi_instance_analysis(
         allow_exact_matches=True
     )
 
-    total_storage = global_aligned['CachedBlocksAllInstance'].to_numpy(float)
+    total_storage = global_aligned['CachedBlocks'].to_numpy(float)
     rep_bpb = None
     if bytes_per_block_map:
         rep_bpb = next(iter(bytes_per_block_map.values()))
@@ -310,7 +324,7 @@ def plot_multi_instance_analysis(
         axr.tick_params(axis='y', labelcolor='#d62728')
         return axr
     
-    def window_hit_rate(timestamps, acc_hit_blocks, acc_read_blocks, window_seconds=60):
+    def window_hit_rate(timestamps, acc_hit_tokens, acc_input_tokens, window_seconds=60):
         """
         基于累积量差值计算时间窗口内的真实命中率。
 
@@ -326,8 +340,8 @@ def plot_multi_instance_analysis(
         相较逐点 for-loop 版本加速约 50 倍。
         """
         ts       = np.asarray(timestamps,      dtype=float)
-        hit_arr  = np.asarray(acc_hit_blocks,  dtype=float)
-        read_arr = np.asarray(acc_read_blocks, dtype=float)
+        hit_arr  = np.asarray(acc_hit_tokens,  dtype=float)
+        read_arr = np.asarray(acc_input_tokens, dtype=float)
 
         # 只保留真实上报点（非 nan）
         real_mask = ~np.isnan(read_arr)
@@ -411,14 +425,14 @@ def plot_multi_instance_analysis(
         # 基于累积量差值计算窗口命中率（正确权重 = 请求数，而非上报次数）
         hit_sm = window_hit_rate(
             base_timestamps,
-            all_acc_hit_blocks[i],
-            all_acc_read_blocks[i],
+            all_acc_hit_tokens[i],
+            all_acc_input_tokens[i],
             window_seconds,
         )
         remote_sm = window_hit_rate(
             base_timestamps,
-            all_acc_remote_hit_blocks[i],
-            all_acc_read_blocks[i],
+            all_acc_remote_hit_tokens[i],
+            all_acc_input_tokens[i],
             window_seconds,
         )
 
