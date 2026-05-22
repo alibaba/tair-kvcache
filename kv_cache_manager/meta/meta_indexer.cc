@@ -775,6 +775,8 @@ size_t MetaIndexer::GetMaxKeyCount() const noexcept { return max_key_count_; }
 
 size_t MetaIndexer::GetMemUsage() const noexcept { return backend_manager_->GetMemUsage(); }
 
+int64_t MetaIndexer::GetOldestAccessTime() const noexcept { return backend_manager_->GetOldestAccessTime(); }
+
 std::uint64_t MetaIndexer::GetStorageUsage() const noexcept { return storage_usage_data_.GetStorageUsage(); }
 
 std::uint64_t MetaIndexer::GetStorageUsageByType(const DataStorageType &type) const noexcept {

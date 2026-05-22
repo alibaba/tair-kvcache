@@ -113,6 +113,19 @@ DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_lru_batch_duration_us);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_lru_filter_duration_us);
 DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_lru_submit_duration_us);
 
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_batch_lru_age_min_us);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_batch_lru_age_max_us);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_batch_lru_age_avg_us);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_batch_create_age_min_us);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_batch_create_age_max_us);
+DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(reclaim_batch_create_age_avg_us);
+
+void CacheReclaimer::AgeStats::Clear() {
+    min_us = 0;
+    max_us = 0;
+    avg_us = 0;
+}
+
 const std::string CacheReclaimer::kTraceIDPrefix{"cache_reclaimer_internal_trace_"};
 
 inline std::string CacheReclaimer::GenTraceID() {
@@ -330,6 +343,13 @@ ErrorCode CacheReclaimer::Start() noexcept {
     REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_lru_batch_duration_us);
     REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_lru_filter_duration_us);
     REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_lru_submit_duration_us);
+
+    REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_batch_lru_age_min_us);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_batch_lru_age_max_us);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_batch_lru_age_avg_us);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_batch_create_age_min_us);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_batch_create_age_max_us);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_batch_create_age_avg_us);
 
     {
         std::unique_lock<std::mutex> lock(job_state_mutex_);
@@ -591,7 +611,8 @@ void CacheReclaimer::ReclaimByLRU(const std::shared_ptr<RequestContext> &request
 
     // 2. constitute the batch based on the LRU timestamp info
     const std::int64_t begin_tp_batch = TimestampUtil::GetSteadyTimeUs();
-    if (!MakeBatchByLRU(request_context.get(), instance_info, keys, maps, request.block_keys)) {
+    AgeStats lru_age_stats;
+    if (!MakeBatchByLRU(request_context.get(), instance_info, keys, maps, request.block_keys, lru_age_stats)) {
         LOG_WITH_ID(DEBUG, "make batch failed");
         return;
     }
@@ -601,19 +622,30 @@ void CacheReclaimer::ReclaimByLRU(const std::shared_ptr<RequestContext> &request
     if (request.block_keys.empty()) {
         return;
     }
+    METRICS_(cache_reclaimer, reclaim_batch_lru_age_min_us) = static_cast<double>(lru_age_stats.min_us);
+    METRICS_(cache_reclaimer, reclaim_batch_lru_age_max_us) = static_cast<double>(lru_age_stats.max_us);
+    METRICS_(cache_reclaimer, reclaim_batch_lru_age_avg_us) = static_cast<double>(lru_age_stats.avg_us);
 
     // 3. inspect the cache location status for every blocks so that:
     //    a) cache locations in CLS_SERVING status
     //    b) cache locations in CLS_WRITING status *and* is orphaned
     //    are submitted to be deleted
     const std::int64_t begin_tp_filter = TimestampUtil::GetSteadyTimeUs();
-    if (!FilterLocID(
-            request_context.get(), instance_info, request.block_keys, water_level_exceed, request.location_ids)) {
+    AgeStats create_age_stats;
+    if (!FilterLocID(request_context.get(),
+                     instance_info,
+                     request.block_keys,
+                     water_level_exceed,
+                     request.location_ids,
+                     create_age_stats)) {
         LOG_WITH_ID(DEBUG, "filter location ID failed");
         return;
     }
     METRICS_(cache_reclaimer, reclaim_lru_filter_duration_us) =
         static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp_filter);
+    METRICS_(cache_reclaimer, reclaim_batch_create_age_min_us) = static_cast<double>(create_age_stats.min_us);
+    METRICS_(cache_reclaimer, reclaim_batch_create_age_max_us) = static_cast<double>(create_age_stats.max_us);
+    METRICS_(cache_reclaimer, reclaim_batch_create_age_avg_us) = static_cast<double>(create_age_stats.avg_us);
 
     // 4. submit the final deleting request to the executor
     const std::int64_t begin_tp_submit = TimestampUtil::GetSteadyTimeUs();
@@ -731,9 +763,7 @@ bool CacheReclaimer::DoKeySampling(RequestContext *request_context,
         sampling_sz_per_task = total_sampling_sz;
     }
 
-    const std::size_t batching_size = batching_size_.load();
-    bool need_get_properties = total_sampling_sz > batching_size;
-    auto sample = [request_context, &ins_id, &ins_gr, &meta_indexer, &need_get_properties](
+    auto sample = [request_context, &ins_id, &ins_gr, &meta_indexer](
                       std::size_t sampling_sz,
                       std::vector<std::int64_t> &keys,
                       std::vector<std::map<std::string, std::string>> &maps) -> ErrorCode {
@@ -749,19 +779,19 @@ bool CacheReclaimer::DoKeySampling(RequestContext *request_context,
         if (keys.size() != sampling_sz) {
             LOG_WITH_ID(DEBUG, "random sample key size mismatch, expect: [%zu], got: [%zu]", sampling_sz, keys.size());
         }
-        if (!need_get_properties) {
-            return ErrorCode::EC_OK;
-        }
 
         if (const auto res = meta_indexer->GetProperties(request_context, keys, {PROPERTY_LRU_TIME}, maps);
             res.ec != ErrorCode::EC_OK) {
-            LOG_WITH_ID(WARN, "get properties failed, error code: [%d]", static_cast<std::int32_t>(res.ec));
-            return res.ec;
-        }
-        if (keys.size() != maps.size()) {
+            LOG_WITH_ID(WARN,
+                        "get properties failed, error code: [%d], proceed with empty lru_time",
+                        static_cast<std::int32_t>(res.ec));
+            maps.clear();
+            maps.resize(keys.size());
+        } else if (keys.size() != maps.size()) {
             LOG_WITH_ID(
                 WARN, "num of sampled keys [%zu] and property maps [%zu] do not match", keys.size(), maps.size());
-            return ErrorCode::EC_MISMATCH;
+            maps.clear();
+            maps.resize(keys.size());
         }
         return ErrorCode::EC_OK;
     };
@@ -828,15 +858,12 @@ bool CacheReclaimer::MakeBatchByLRU(const RequestContext *request_context,
                                     const std::shared_ptr<const InstanceInfo> &instance_info,
                                     const std::vector<std::int64_t> &sampled_keys,
                                     const std::vector<std::map<std::string, std::string>> &property_maps,
-                                    std::vector<std::int64_t> &out_batch) const noexcept {
+                                    std::vector<std::int64_t> &out_batch,
+                                    AgeStats &out_lru_age_stats) const noexcept {
     const std::size_t batching_size = batching_size_.load();
     if (batching_size == 0) {
         out_batch.clear();
-        return true;
-    }
-    if (sampled_keys.size() <= batching_size) {
-        std::unordered_set<std::int64_t> deduped_batch(sampled_keys.begin(), sampled_keys.end());
-        out_batch.assign(deduped_batch.begin(), deduped_batch.end());
+        out_lru_age_stats.Clear();
         return true;
     }
 
@@ -872,45 +899,69 @@ bool CacheReclaimer::MakeBatchByLRU(const RequestContext *request_context,
         key_tp_vec.emplace_back(k, lru_ts);
     }
 
-    std::sort(key_tp_vec.begin(),
-              key_tp_vec.end(),
-              [](const std::pair<std::int64_t, std::int64_t> &a,
-                 const std::pair<std::int64_t, std::int64_t> &b) -> bool { return a.second < b.second; });
+    if (sampled_keys.size() > batching_size) {
+        std::sort(key_tp_vec.begin(),
+                  key_tp_vec.end(),
+                  [](const std::pair<std::int64_t, std::int64_t> &a,
+                     const std::pair<std::int64_t, std::int64_t> &b) -> bool { return a.second < b.second; });
+    }
 
     // constitute the batch to be submitted for deleting
     // the first N timestamp would be picked out
+    const std::size_t effective_batch_size = std::min(batching_size, sampled_keys.size());
     std::unordered_set<std::int64_t> deduped_batch;
+    const int64_t now_us = TimestampUtil::GetCurrentTimeUs();
+    int64_t age_sum = 0;
+    int64_t age_count = 0;
     for (const auto &[key, tp] : key_tp_vec) {
         if (auto [_, r] = deduped_batch.insert(key); r) {
-            if (deduped_batch.size() == batching_size) {
-                // the batch is successfully constituted
-                out_batch.assign(deduped_batch.begin(), deduped_batch.end());
-                return true;
+            if (tp > 0) {
+                const int64_t age = now_us - tp;
+                out_lru_age_stats.min_us = std::min(out_lru_age_stats.min_us, age);
+                out_lru_age_stats.max_us = std::max(out_lru_age_stats.max_us, age);
+                age_sum += age;
+                ++age_count;
+            }
+            if (deduped_batch.size() == effective_batch_size) {
+                break;
             }
         }
     }
 
-    if (deduped_batch.size() != sampled_keys.size()) {
-        // sampled_keys contains duplicated keys, log the event
-        LOG_WITH_ID(DEBUG,
-                    "shortened batch size (likely duplicated keys sampled), final batch size: [%zu], "
-                    "sampled keys size: [%zu], intended batching size: [%zu]",
-                    deduped_batch.size(),
-                    sampled_keys.size(),
-                    batching_size);
-    } else {
-        // the batch size is equal to the size of sampled keys;
-        // * possibility 1: not enough keys sampled
-        // * possibility 2: sampling_size_ < batching_size_
-        LOG_WITH_ID(DEBUG,
-                    "shortened batch size, final batch size: [%zu], "
-                    "sampled keys size: [%zu], intended batching size: [%zu]",
-                    deduped_batch.size(),
-                    sampled_keys.size(),
-                    batching_size);
+    if (deduped_batch.empty()) {
+        out_batch.clear();
+        out_lru_age_stats.Clear();
+        return true;
     }
 
-    // permit a no-full-sized batch
+    if (age_count > 0) {
+        out_lru_age_stats.avg_us = age_sum / age_count;
+    } else {
+        out_lru_age_stats.Clear();
+    }
+
+    if (deduped_batch.size() < batching_size) {
+        if (deduped_batch.size() != sampled_keys.size()) {
+            // sampled_keys contains duplicated keys, log the event
+            LOG_WITH_ID(DEBUG,
+                        "shortened batch size (likely duplicated keys sampled), final batch size: [%zu], "
+                        "sampled keys size: [%zu], intended batching size: [%zu]",
+                        deduped_batch.size(),
+                        sampled_keys.size(),
+                        batching_size);
+        } else {
+            // the batch size is equal to the size of sampled keys;
+            // * possibility 1: not enough keys sampled
+            // * possibility 2: sampling_size_ < batching_size_
+            LOG_WITH_ID(DEBUG,
+                        "shortened batch size, final batch size: [%zu], "
+                        "sampled keys size: [%zu], intended batching size: [%zu]",
+                        deduped_batch.size(),
+                        sampled_keys.size(),
+                        batching_size);
+        }
+    }
+
     out_batch.assign(deduped_batch.begin(), deduped_batch.end());
     return true;
 }
@@ -919,7 +970,8 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
                                  const std::shared_ptr<const InstanceInfo> &instance_info,
                                  const std::vector<std::int64_t> &batch,
                                  const WaterLevelExceed &water_level_exceed,
-                                 std::vector<std::vector<std::string>> &out_loc_ids) const noexcept {
+                                 std::vector<std::vector<std::string>> &out_loc_ids,
+                                 AgeStats &out_create_age_stats) const noexcept {
     const std::string &ins_id = instance_info->instance_id();
     const std::string &ins_gr = instance_info->instance_group_name();
 
@@ -950,6 +1002,9 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
     // inspect the cache location status of each block and get the
     // filtered location ID vecs
     out_loc_ids.reserve(loc_maps.size());
+    const int64_t now_us = TimestampUtil::GetCurrentTimeUs();
+    int64_t create_age_sum = 0;
+    int64_t create_age_count = 0;
     for (const auto &loc_map : loc_maps) {
         std::vector<std::string> loc_id_vec;
         for (const auto &[_, loc_ptr] : loc_map) {
@@ -965,6 +1020,7 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
                                              write_location_manager_ != nullptr &&
                                              !write_location_manager_->HasLocationId(loc.id());
             if (loc.status() == CacheLocationStatus::CLS_SERVING || is_orphaned_writing) {
+                bool selected = false;
                 if (water_level_exceed.CheckStorageTypeWaterLevelExceed()) {
                     // some storage type water level exceeded; only
                     // collect the location with matched type but
@@ -972,6 +1028,7 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
                     // TODO (rui): implement the fair eviction
                     if (water_level_exceed.GetWaterLevelExceedByType(loc.type())) {
                         loc_id_vec.emplace_back(loc.id());
+                        selected = true;
                     }
                 } else {
                     // there's no storage type water level exceeded
@@ -979,11 +1036,24 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
                     // usage water level must be exceeded; ignore the
                     // type detection
                     loc_id_vec.emplace_back(loc.id());
+                    selected = true;
+                }
+                if (selected && loc.create_time() > 0) {
+                    const int64_t age = now_us - loc.create_time();
+                    out_create_age_stats.min_us = std::min(out_create_age_stats.min_us, age);
+                    out_create_age_stats.max_us = std::max(out_create_age_stats.max_us, age);
+                    create_age_sum += age;
+                    ++create_age_count;
                 }
             }
         }
         out_loc_ids.emplace_back(std::move(loc_id_vec));
     }
+    if (create_age_count == 0) {
+        out_create_age_stats.Clear();
+        return true;
+    }
+    out_create_age_stats.avg_us = create_age_sum / create_age_count;
     return true;
 }
 

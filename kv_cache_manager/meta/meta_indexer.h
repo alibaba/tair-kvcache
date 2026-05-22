@@ -106,6 +106,7 @@ public:
     size_t GetKeyCount() const noexcept;
     size_t GetMaxKeyCount() const noexcept;
     size_t GetMemUsage() const noexcept;
+    int64_t GetOldestAccessTime() const noexcept;
 
     // storage usage interfaces
     [[nodiscard]] std::uint64_t GetStorageUsage() const noexcept;

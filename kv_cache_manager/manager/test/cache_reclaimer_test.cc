@@ -2924,8 +2924,7 @@ TEST_F(CacheReclaimerTest, TestDoKeySampling) {
         std::vector<std::map<std::string, std::string>> maps;
         ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_.get(), instance_infos.front(), keys, maps));
         ASSERT_EQ(1, keys.size());
-        // sampling_size_ <= delete_batch_size, will not get properties
-        ASSERT_EQ(0, maps.size());
+        ASSERT_EQ(1, maps.size());
     }
 
     {
@@ -2988,9 +2987,18 @@ TEST_F(CacheReclaimerTest, TestDupKeys) {
         std::vector<std::int64_t> keys(sample_reclaim_keys);
         std::vector<std::map<std::string, std::string>> maps(get_out_properties);
         std::vector<std::int64_t> batch;
+        CacheReclaimer::AgeStats lru_age_stats;
         ASSERT_TRUE(
-            cache_reclaimer_->MakeBatchByLRU(request_context_.get(), instance_infos.front(), keys, maps, batch));
+            cache_reclaimer_->MakeBatchByLRU(request_context_.get(), instance_infos.front(), keys, maps, batch, lru_age_stats));
         ASSERT_EQ(9, batch.size());
+        // keys 1..10 unique, lru_times 0..9; tp=0 excluded from stats, tp=1..9 included (9 entries)
+        // ages: now_us-1, now_us-2, ..., now_us-9 → min=now_us-9, max=now_us-1, diff=8
+        EXPECT_GT(lru_age_stats.min_us, 0);
+        EXPECT_GT(lru_age_stats.max_us, 0);
+        EXPECT_GT(lru_age_stats.avg_us, 0);
+        EXPECT_LE(lru_age_stats.min_us, lru_age_stats.avg_us);
+        EXPECT_LE(lru_age_stats.avg_us, lru_age_stats.max_us);
+        EXPECT_EQ(lru_age_stats.max_us - lru_age_stats.min_us, 8);
     }
 
     {
@@ -3035,9 +3043,15 @@ TEST_F(CacheReclaimerTest, TestDupKeys) {
         std::vector<std::int64_t> keys(sample_reclaim_keys);
         std::vector<std::map<std::string, std::string>> maps(get_out_properties);
         std::vector<std::int64_t> batch;
+        CacheReclaimer::AgeStats lru_age_stats;
         ASSERT_TRUE(
-            cache_reclaimer_->MakeBatchByLRU(request_context_.get(), instance_infos.front(), keys, maps, batch));
+            cache_reclaimer_->MakeBatchByLRU(request_context_.get(), instance_infos.front(), keys, maps, batch, lru_age_stats));
         ASSERT_EQ(1, batch.size());
+        // all keys are 1 (only 1 unique key), first occurrence has tp=0 → excluded
+        // age_count=0 → Clear() called → all stats zeroed
+        EXPECT_EQ(lru_age_stats.min_us, 0);
+        EXPECT_EQ(lru_age_stats.max_us, 0);
+        EXPECT_EQ(lru_age_stats.avg_us, 0);
     }
 
     {
@@ -3082,9 +3096,18 @@ TEST_F(CacheReclaimerTest, TestDupKeys) {
         std::vector<std::int64_t> keys(sample_reclaim_keys);
         std::vector<std::map<std::string, std::string>> maps(get_out_properties);
         std::vector<std::int64_t> batch;
+        CacheReclaimer::AgeStats lru_age_stats;
         ASSERT_TRUE(
-            cache_reclaimer_->MakeBatchByLRU(request_context_.get(), instance_infos.front(), keys, maps, batch));
+            cache_reclaimer_->MakeBatchByLRU(request_context_.get(), instance_infos.front(), keys, maps, batch, lru_age_stats));
         ASSERT_EQ(2, batch.size());
+        // keys={1*7,2,1,1}, tp={9*7,10,9,9}; sorted → key=1(tp=9) then key=2(tp=10)
+        // ages: now_us-9 and now_us-10 → min=now_us-10, max=now_us-9, diff=1
+        EXPECT_GT(lru_age_stats.min_us, 0);
+        EXPECT_GT(lru_age_stats.max_us, 0);
+        EXPECT_GT(lru_age_stats.avg_us, 0);
+        EXPECT_LE(lru_age_stats.min_us, lru_age_stats.avg_us);
+        EXPECT_LE(lru_age_stats.avg_us, lru_age_stats.max_us);
+        EXPECT_EQ(lru_age_stats.max_us - lru_age_stats.min_us, 1);
     }
 }
 

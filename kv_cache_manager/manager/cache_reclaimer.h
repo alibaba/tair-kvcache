@@ -2,6 +2,7 @@
 
 #include <array>
 #include <atomic>
+#include <climits>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -82,6 +83,13 @@ struct PlanExecuteResult;
  */
 class CacheReclaimer {
 public:
+    struct AgeStats {
+        int64_t min_us = INT64_MAX;
+        int64_t max_us = 0;
+        int64_t avg_us = 0;
+        void Clear();
+    };
+
     /**
      * @brief Delete default constructor
      */
@@ -478,13 +486,15 @@ private:
                         const std::shared_ptr<const InstanceInfo> &instance_info,
                         const std::vector<std::int64_t> &sampled_keys,
                         const std::vector<std::map<std::string, std::string>> &property_maps,
-                        std::vector<std::int64_t> &out_batch) const noexcept;
+                        std::vector<std::int64_t> &out_batch,
+                        AgeStats &out_lru_age_stats) const noexcept;
 
     bool FilterLocID(RequestContext *request_context,
                      const std::shared_ptr<const InstanceInfo> &instance_info,
                      const std::vector<std::int64_t> &batch,
                      const WaterLevelExceed &water_level_exceed,
-                     std::vector<std::vector<std::string>> &out_loc_ids) const noexcept;
+                     std::vector<std::vector<std::string>> &out_loc_ids,
+                     AgeStats &out_create_age_stats) const noexcept;
 
     void SubmitDelReq(const std::shared_ptr<RequestContext> &request_context,
                       const std::shared_ptr<const InstanceInfo> &instance_info,
@@ -511,6 +521,13 @@ private:
     KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_lru_batch_duration_us)
     KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_lru_filter_duration_us)
     KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_lru_submit_duration_us)
+
+    KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_batch_lru_age_min_us)
+    KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_batch_lru_age_max_us)
+    KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_batch_lru_age_avg_us)
+    KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_batch_create_age_min_us)
+    KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_batch_create_age_max_us)
+    KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_batch_create_age_avg_us)
 };
 
 #undef KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER

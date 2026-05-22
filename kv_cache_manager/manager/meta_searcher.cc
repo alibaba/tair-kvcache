@@ -8,6 +8,7 @@
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/string_util.h"
+#include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
 
@@ -390,8 +391,9 @@ ErrorCode MetaSearcher::BatchAddLocation(RequestContext *request_context,
     out_location_ids.resize(keys.size());
     std::vector<std::pair<DataStorageType, std::uint64_t>> loc_sz(keys.size());
 
+    const int64_t batch_create_time = TimestampUtil::GetCurrentTimeUs();
     auto modifier =
-        [&locations, &out_location_ids, &keys, &loc_sz](const LocationIdVector &existing_location_ids,
+        [&locations, &out_location_ids, &keys, &loc_sz, batch_create_time](const LocationIdVector &existing_location_ids,
                                                         ErrorCode get_ec,
                                                         size_t index,
                                                         PropertyMap &upsert_property_map,
@@ -419,6 +421,7 @@ ErrorCode MetaSearcher::BatchAddLocation(RequestContext *request_context,
         auto new_loc = std::make_shared<CacheLocation>(*locations[index]);
         new_loc->set_id(location_id);
         new_loc->set_status(CLS_WRITING);
+        new_loc->set_create_time(batch_create_time);
         out_new_locations[location_id] = std::move(new_loc);
 
         // compute storage size for usage tracking

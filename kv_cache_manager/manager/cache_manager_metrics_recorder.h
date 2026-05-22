@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -22,6 +23,7 @@ public:
     struct InstanceMetric {
         size_t key_count = 0;
         size_t byte_size = 0;
+        int64_t max_lru_age_us = 0;
     };
     using GroupUsageRatioMap = std::map<std::string, double>;
     using GroupInstanceIdMetricMap = std::map<std::string, std::unordered_map<std::string, InstanceMetric>>;
