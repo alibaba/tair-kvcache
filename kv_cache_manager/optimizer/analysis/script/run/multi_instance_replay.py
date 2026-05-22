@@ -10,6 +10,7 @@ standard token hit-rate semantics.
 
 import argparse
 import gc
+import hashlib
 import json
 import os
 import re
@@ -211,7 +212,7 @@ def _prepare_tasks(args, trace_files: List[str], config_dir: str, output_dir: st
             continue
 
         config = _make_single_instance_config(args, trace_file, output_dir, instance_id, policy_params)
-        config_path = os.path.join(config_dir, f"{_safe_name(instance_id)}.json")
+        config_path = os.path.join(config_dir, f"{_config_file_name(instance_id)}.json")
         with open(config_path, "w") as f:
             json.dump(config, f, indent=2)
 
@@ -451,6 +452,11 @@ def _resolve_window_ns(args) -> Optional[int]:
 def _safe_name(value: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
     return safe or "instance"
+
+
+def _config_file_name(instance_id: str) -> str:
+    digest = hashlib.sha256(instance_id.encode("utf-8")).hexdigest()[:12]
+    return f"{_safe_name(instance_id)}-{digest}"
 
 
 if __name__ == "__main__":
