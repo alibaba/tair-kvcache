@@ -86,12 +86,11 @@ public:
 
 private:
     struct EnqueueStats {
-        int64_t enqueue_timeout_count = 0;
+        int64_t enqueue_timeout_key_count = 0;
         int64_t enqueue_time_us = 0;
-        int64_t wait_for_queue_time_us = 0;
     };
     std::vector<ErrorCode> EnqueueWriteOp(RequestContext *request_context, WriteOp op);
-    bool WaitForQueueCapacity(int queue_id, int64_t &out_wait_time_us);
+    bool WaitForQueueCapacity(int queue_id);
     void ConsumerLoop(int queue_id);
     void BatchFlush(int queue_id, std::vector<QueueItem> &items, int64_t total_keys);
     void DrainQueue(int queue_id);

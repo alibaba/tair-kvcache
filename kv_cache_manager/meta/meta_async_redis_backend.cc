@@ -290,22 +290,18 @@ int MetaAsyncRedisBackend::GetQueueIndexForKey(KeyType key) const noexcept {
 
 // ==================== Write Operations (async enqueue) ====================
 
-bool MetaAsyncRedisBackend::WaitForQueueCapacity(int queue_id, int64_t &out_wait_time_us) {
-    out_wait_time_us = 0;
+bool MetaAsyncRedisBackend::WaitForQueueCapacity(int queue_id) {
     if (queues_[queue_id]->GetKeySize() < queue_max_size_) {
         return true;
     }
-    const int64_t begin_us = TimestampUtil::GetSteadyTimeUs();
     int64_t waited_us = 0;
     while (waited_us < enqueue_timeout_ms_ * 1000) {
         std::this_thread::sleep_for(std::chrono::microseconds(enqueue_retry_interval_us_));
         waited_us += enqueue_retry_interval_us_;
         if (queues_[queue_id]->GetKeySize() < queue_max_size_) {
-            out_wait_time_us = TimestampUtil::GetSteadyTimeUs() - begin_us;
             return true;
         }
     }
-    out_wait_time_us = TimestampUtil::GetSteadyTimeUs() - begin_us;
     KVCM_INTERVAL_LOG_WARN(10,
                            "async redis enqueue timeout, queue[%d] key_size[%ld], instance[%s]",
                            queue_id,
@@ -327,7 +323,6 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::EnqueueWriteOp(RequestContext *req
 
     EnqueueStats stats;
     std::vector<ErrorCode> error_codes(op.keys.size(), EC_OK);
-    int64_t total_wait_time_us = 0;
     for (auto &[qi, indices] : queue_to_indices) {
         WriteOp sub_op;
         sub_op.type = op.type;
@@ -348,29 +343,22 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::EnqueueWriteOp(RequestContext *req
             }
         }
 
-        int64_t wait_time_us = 0;
-        if (!WaitForQueueCapacity(qi, wait_time_us)) {
-            total_wait_time_us += wait_time_us;
-            stats.enqueue_timeout_count += static_cast<int64_t>(indices.size());
+        if (!WaitForQueueCapacity(qi)) {
+            stats.enqueue_timeout_key_count += static_cast<int64_t>(indices.size());
             for (size_t idx : indices) {
                 error_codes[idx] = EC_TIMEOUT;
             }
             continue;
         }
-        total_wait_time_us += wait_time_us;
         queues_[qi]->Push(QueueItem{std::move(sub_op)});
     }
 
-    stats.wait_for_queue_time_us = total_wait_time_us;
     stats.enqueue_time_us = TimestampUtil::GetSteadyTimeUs() - enqueue_begin_us;
 
     if (request_context) {
         auto *mc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
-        if (mc) {
-            KVCM_METRICS_COLLECTOR_SET_METRICS(mc, meta_indexer, async_enqueue_timeout_count, stats.enqueue_timeout_count);
-            KVCM_METRICS_COLLECTOR_SET_METRICS(mc, meta_indexer, async_enqueue_time_us, stats.enqueue_time_us);
-            KVCM_METRICS_COLLECTOR_SET_METRICS(mc, meta_indexer, async_wait_for_queue_time_us, stats.wait_for_queue_time_us);
-        }
+        KVCM_METRICS_COLLECTOR_SET_METRICS(mc, meta_indexer, async_enqueue_timeout_key_count, stats.enqueue_timeout_key_count);
+        KVCM_METRICS_COLLECTOR_SET_METRICS(mc, meta_indexer, async_enqueue_time_us, stats.enqueue_time_us);
     }
 
     return error_codes;

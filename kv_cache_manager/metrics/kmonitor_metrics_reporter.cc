@@ -89,9 +89,11 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(meta_indexer, read_modify_write_update_key_count);
     DECLARE_METRICS(meta_indexer, read_modify_write_skip_key_count);
     DECLARE_METRICS(meta_indexer, read_modify_write_delete_key_count);
-    DECLARE_METRICS(meta_indexer, async_enqueue_timeout_count);
+    DECLARE_METRICS(meta_indexer, async_enqueue_timeout_key_count);
     DECLARE_METRICS(meta_indexer, async_enqueue_time_us);
-    DECLARE_METRICS(meta_indexer, async_wait_for_queue_time_us);
+    DECLARE_METRICS(meta_indexer, cache_backend_put_time_us);
+    DECLARE_METRICS(meta_indexer, cache_backend_upsert_time_us);
+    DECLARE_METRICS(meta_indexer, cache_backend_delete_time_us);
 
     // data storage metrics
     DECLARE_METRICS(data_storage, create_qps);
@@ -326,9 +328,11 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(meta_indexer, read_modify_write_update_key_count);
     REGISTER_GAUGE_METRIC(meta_indexer, read_modify_write_skip_key_count);
     REGISTER_GAUGE_METRIC(meta_indexer, read_modify_write_delete_key_count);
-    REGISTER_GAUGE_METRIC(meta_indexer, async_enqueue_timeout_count);
+    REGISTER_GAUGE_METRIC(meta_indexer, async_enqueue_timeout_key_count);
     REGISTER_GAUGE_METRIC(meta_indexer, async_enqueue_time_us);
-    REGISTER_GAUGE_METRIC(meta_indexer, async_wait_for_queue_time_us);
+    REGISTER_GAUGE_METRIC(meta_indexer, cache_backend_put_time_us);
+    REGISTER_GAUGE_METRIC(meta_indexer, cache_backend_upsert_time_us);
+    REGISTER_GAUGE_METRIC(meta_indexer, cache_backend_delete_time_us);
 
     // data storage metrics
     REGISTER_QPS_METRIC(data_storage, create_qps);
@@ -486,9 +490,11 @@ void KmonitorMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
         REPORT_COLLECTED_METRICS(meta_indexer, read_modify_write_update_key_count);
         REPORT_COLLECTED_METRICS(meta_indexer, read_modify_write_skip_key_count);
         REPORT_COLLECTED_METRICS(meta_indexer, read_modify_write_delete_key_count);
-        REPORT_STEAL_METRICS(meta_indexer, async_enqueue_timeout_count);
+        REPORT_STEAL_METRICS(meta_indexer, async_enqueue_timeout_key_count);
         REPORT_STEAL_METRICS(meta_indexer, async_enqueue_time_us);
-        REPORT_STEAL_METRICS(meta_indexer, async_wait_for_queue_time_us);
+        REPORT_STEAL_METRICS(meta_indexer, cache_backend_put_time_us);
+        REPORT_STEAL_METRICS(meta_indexer, cache_backend_upsert_time_us);
+        REPORT_STEAL_METRICS(meta_indexer, cache_backend_delete_time_us);
     } else if (dynamic_cast<DataStorageMetricsCollector *>(collector)) {
         const auto *p = dynamic_cast<DataStorageMetricsCollector *>(collector);
         const kmonitor::MetricsTags tags = ctx_->GetKmonitorTags(p->GetMetricsTags());

@@ -87,15 +87,21 @@ TEST_F(MetricsCollectorTest, MetaIndexerMetricsTest) {
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, read_modify_write_delete_key_count), 10.);
 
     // async enqueue per-query metrics
-    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, async_enqueue_timeout_count), 0.);
+    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, async_enqueue_timeout_key_count), 0.);
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, async_enqueue_time_us), 0.);
-    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, async_wait_for_queue_time_us), 0.);
-    SET_METRICS_(p, meta_indexer, async_enqueue_timeout_count, 5.);
+    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, cache_backend_put_time_us), 0.);
+    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, cache_backend_upsert_time_us), 0.);
+    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, cache_backend_delete_time_us), 0.);
+    SET_METRICS_(p, meta_indexer, async_enqueue_timeout_key_count, 5.);
     SET_METRICS_(p, meta_indexer, async_enqueue_time_us, 800.);
-    SET_METRICS_(p, meta_indexer, async_wait_for_queue_time_us, 300.);
-    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, async_enqueue_timeout_count), 5.);
+    SET_METRICS_(p, meta_indexer, cache_backend_put_time_us, 400.);
+    SET_METRICS_(p, meta_indexer, cache_backend_upsert_time_us, 500.);
+    SET_METRICS_(p, meta_indexer, cache_backend_delete_time_us, 300.);
+    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, async_enqueue_timeout_key_count), 5.);
     EXPECT_DOUBLE_EQ(GET(p, meta_indexer, async_enqueue_time_us), 800.);
-    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, async_wait_for_queue_time_us), 300.);
+    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, cache_backend_put_time_us), 400.);
+    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, cache_backend_upsert_time_us), 500.);
+    EXPECT_DOUBLE_EQ(GET(p, meta_indexer, cache_backend_delete_time_us), 300.);
 }
 
 // Test MetaSearcher metrics functionality

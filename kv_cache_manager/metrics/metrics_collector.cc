@@ -102,9 +102,11 @@ DEFINE_METRICS_NAME_FOR_META_INDEXER(read_modify_write_put_key_count);
 DEFINE_METRICS_NAME_FOR_META_INDEXER(read_modify_write_update_key_count);
 DEFINE_METRICS_NAME_FOR_META_INDEXER(read_modify_write_skip_key_count);
 DEFINE_METRICS_NAME_FOR_META_INDEXER(read_modify_write_delete_key_count);
-DEFINE_METRICS_NAME_FOR_META_INDEXER(async_enqueue_timeout_count);
+DEFINE_METRICS_NAME_FOR_META_INDEXER(async_enqueue_timeout_key_count);
 DEFINE_METRICS_NAME_FOR_META_INDEXER(async_enqueue_time_us);
-DEFINE_METRICS_NAME_FOR_META_INDEXER(async_wait_for_queue_time_us);
+DEFINE_METRICS_NAME_FOR_META_INDEXER(cache_backend_put_time_us);
+DEFINE_METRICS_NAME_FOR_META_INDEXER(cache_backend_upsert_time_us);
+DEFINE_METRICS_NAME_FOR_META_INDEXER(cache_backend_delete_time_us);
 
 ServiceMetricsCollector::ServiceMetricsCollector(std::shared_ptr<MetricsRegistry> metrics_registry) noexcept
     : MetricsCollector(std::move(metrics_registry)) {}
@@ -165,9 +167,11 @@ bool ServiceMetricsCollector::Init() {
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER(read_modify_write_update_key_count);
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER(read_modify_write_skip_key_count);
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER(read_modify_write_delete_key_count);
-    REGISTER_GAUGE_METRICS_FOR_META_INDEXER(async_enqueue_timeout_count);
+    REGISTER_GAUGE_METRICS_FOR_META_INDEXER(async_enqueue_timeout_key_count);
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER(async_enqueue_time_us);
-    REGISTER_GAUGE_METRICS_FOR_META_INDEXER(async_wait_for_queue_time_us);
+    REGISTER_GAUGE_METRICS_FOR_META_INDEXER(cache_backend_put_time_us);
+    REGISTER_GAUGE_METRICS_FOR_META_INDEXER(cache_backend_upsert_time_us);
+    REGISTER_GAUGE_METRICS_FOR_META_INDEXER(cache_backend_delete_time_us);
 
     return true;
 }
