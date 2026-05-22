@@ -54,14 +54,15 @@ class OptimizerManagerPyTest(unittest.TestCase):
     def test_get_cache_location(self):
         instance_id = "3780643326877293460"
         trace_id = "test_trace_002"
+        block_size = 16
         write_timestamp = 1234567890
         write_block_ids = [1 ,2 ,3]
-        write_token_ids = [60, 70, 80, 90, 100]
+        write_token_ids = list(range(block_size * len(write_block_ids)))
         self.manager.WriteCache(instance_id, trace_id, write_timestamp, write_block_ids, write_token_ids)
 
         read_timestamp = 1234567900
         read_block_ids = [1, 2, 4]
-        read_token_ids = [60, 70, 110]
+        read_token_ids = list(range(block_size * len(read_block_ids)))
         mask_offset = 0
         res = self.manager.GetCacheLocation(instance_id, trace_id, read_timestamp, read_block_ids, read_token_ids, mask_offset)
 

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <unordered_set>
+#include <utility>
 
 #include "kv_cache_manager/common/logger.h"
 namespace kv_cache_manager {
@@ -14,7 +15,8 @@ bool OptIndexerManager::CreateOptIndexer(const OptInstanceConfig &instance_confi
                                          TierWriteMode tier_write_mode,
                                          int64_t default_ttl_ns,
                                          size_t selective_write_threshold,
-                                         bool tier_access_propagation_enabled) {
+                                         bool tier_access_propagation_enabled,
+                                         std::vector<TierFlowStrategy> tier_flow_strategies) {
 
     std::string instance_id = instance_config.instance_id();
     auto indexer = GetOptIndexer(instance_id);
@@ -30,7 +32,7 @@ bool OptIndexerManager::CreateOptIndexer(const OptInstanceConfig &instance_confi
         return false;
     }
 
-    // 传递策略列表与写入模式给 RadixTreeIndex
+    // 传递策略列表与层间流动策略给 RadixTreeIndex。
     // 非分层模式下 tier_write_mode 被忽略（tier_policies_ 中仅含单个 "shared" 策略，全层写等同单层写）
     const TieredPolicyGroup *group_ptr = policy_group;
     const TierWriteMode effective_mode = hierarchical_eviction_enabled ? tier_write_mode : TierWriteMode::WRITE_THROUGH;
@@ -39,7 +41,8 @@ bool OptIndexerManager::CreateOptIndexer(const OptInstanceConfig &instance_confi
                                                effective_mode,
                                                default_ttl_ns,
                                                selective_write_threshold,
-                                               tier_access_propagation_enabled);
+                                               tier_access_propagation_enabled,
+                                               std::move(tier_flow_strategies));
 
     opt_indexer_map_[instance_id] = indexer;
     KVCM_LOG_INFO("Create optimizer indexer success, instance_id: %s", instance_id.c_str());
@@ -117,7 +120,7 @@ OptIndexerManager::EvictedBlocks OptIndexerManager::CheckAndEvict(const std::str
     }
     const auto &group_config = group_it->second;
 
-    // 统一驱逐入口：内部根据 hierarchical_eviction_enabled 与 tier_write_mode 决定分支
+    // 统一驱逐入口：内部根据 hierarchical_eviction_enabled 与 tier edge write_mode 决定分支
     return eviction_manager_->EvictByMode(instance_id, group_config, eviction_timestamp);
 }
 

@@ -24,6 +24,36 @@ from typing import List, Optional
 from utils.window_aggregator import aggregate_and_write, collect_hit_rate_csvs
 
 
+def _parse_tier_flow_config_arg(parser, raw_value):
+    if not raw_value:
+        return []
+    config_text = Path(raw_value).read_text() if os.path.exists(raw_value) else raw_value
+    try:
+        tier_flows = json.loads(config_text)
+    except json.JSONDecodeError as exc:
+        parser.error(f"--tier-flow-config must be a JSON array or a path to one: {exc}")
+    if not isinstance(tier_flows, list):
+        parser.error("--tier-flow-config must be a JSON array")
+    valid_write_modes = {"write_through", "cascading", "write_through_selective"}
+    for idx, flow in enumerate(tier_flows):
+        if not isinstance(flow, dict):
+            parser.error(f"--tier-flow-config[{idx}] must be an object")
+        if not isinstance(flow.get("from_tier"), str) or not flow["from_tier"]:
+            parser.error(f"--tier-flow-config[{idx}] must contain non-empty from_tier")
+        if not isinstance(flow.get("to_tier"), str) or not flow["to_tier"]:
+            parser.error(f"--tier-flow-config[{idx}] must contain non-empty to_tier")
+        if "write_mode" in flow and flow["write_mode"] not in valid_write_modes:
+            parser.error(f"--tier-flow-config[{idx}].write_mode must be one of {sorted(valid_write_modes)}")
+        for bool_key in ("access_propagation_enabled", "promote_enabled"):
+            if bool_key in flow and type(flow[bool_key]) is not bool:
+                parser.error(f"--tier-flow-config[{idx}].{bool_key} must be a boolean")
+        if "selective_write_threshold" in flow:
+            threshold = flow["selective_write_threshold"]
+            if type(threshold) is not int or threshold <= 0:
+                parser.error(f"--tier-flow-config[{idx}].selective_write_threshold must be a positive integer")
+    return tier_flows
+
+
 def _configure_bazel_run_output():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(line_buffering=True)
@@ -63,14 +93,17 @@ def parse_args():
                         help="1=group rough, 2=instance rough, 3=instance precise")
     parser.add_argument("--eviction-batch-size", type=int, default=100,
                         help="Eviction batch size per instance")
-    parser.add_argument("--tier-write-mode", default="write_through",
+    parser.add_argument("--default-tier-write-mode", dest="default_tier_write_mode", default="write_through",
                         choices=[
                             "write_through",
                             "cascading",
                             "write_through_selective",
-                        ])
+                        ],
+                        help="Default tier_strategy.write_mode for adjacent tier edges")
     parser.add_argument("--selective-write-threshold", type=int, default=2,
                         help="Access-count threshold for write_through_selective tier writes")
+    parser.add_argument("--tier-flow-config", default=None,
+                        help="JSON array or file path for tier_strategy.tier_flows edge overrides")
     access_group = parser.add_mutually_exclusive_group()
     access_group.add_argument("--enable-tier-access-propagation",
                               dest="tier_access_propagation_enabled",
@@ -105,6 +138,7 @@ def parse_args():
         parser.error("one of --trace-dir or --trace-files is required")
     if args.selective_write_threshold <= 0:
         parser.error("--selective-write-threshold must be positive")
+    args.tier_flow_config = _parse_tier_flow_config_arg(parser, args.tier_flow_config)
     return args
 
 
@@ -131,7 +165,7 @@ def main():
         print(f"  Instance traces: {len(trace_files)}")
 
     if not args.aggregate_only:
-        tasks = _prepare_tasks(args, trace_files, config_dir, output_dir)
+        tasks, csv_files = _prepare_tasks(args, trace_files, config_dir, output_dir)
         if tasks:
             max_workers = args.max_workers if args.max_workers > 0 else min(os.cpu_count() or 1, len(tasks))
             max_workers = max(1, max_workers)
@@ -142,12 +176,13 @@ def main():
             print("No multi-instance replay tasks to run.")
     else:
         print("\n[1/2] Skipping replay.")
+        csv_files = collect_hit_rate_csvs(output_dir)
 
     print("\n[2/2] Aggregating instance hit-rate CSVs...")
-    csv_files = collect_hit_rate_csvs(output_dir)
     if not csv_files:
         print(f"No *_hit_rates.csv files found in {output_dir}")
         sys.exit(1)
+    _validate_hit_rate_csvs(csv_files)
 
     result = aggregate_and_write(
         csv_files=csv_files,
@@ -199,8 +234,9 @@ def _default_bucket_name(args) -> str:
     return ""
 
 
-def _prepare_tasks(args, trace_files: List[str], config_dir: str, output_dir: str) -> List[dict]:
+def _prepare_tasks(args, trace_files: List[str], config_dir: str, output_dir: str) -> tuple:
     tasks = []
+    csv_files = {}
     seen_instance_ids = {}
     policy_params = _resolve_policy_params(args.eviction_policy, args.eviction_policy_params)
 
@@ -216,9 +252,14 @@ def _prepare_tasks(args, trace_files: List[str], config_dir: str, output_dir: st
         seen_instance_ids[instance_id] = trace_file
 
         csv_path = os.path.join(output_dir, f"{instance_id}_hit_rates.csv")
-        if args.skip_existing and os.path.exists(csv_path):
+        csv_files[instance_id] = csv_path
+        if args.skip_existing and os.path.isfile(csv_path):
             print(f"  skip existing: {instance_id} -> {csv_path}")
             continue
+        if os.path.exists(csv_path):
+            if not os.path.isfile(csv_path):
+                raise SystemExit(f"Expected hit-rate CSV path is not a file: {csv_path}")
+            os.remove(csv_path)
 
         config = _make_single_instance_config(args, trace_file, output_dir, instance_id, policy_params)
         config_path = os.path.join(config_dir, f"{_config_file_name(instance_id)}.json")
@@ -244,7 +285,7 @@ def _prepare_tasks(args, trace_files: List[str], config_dir: str, output_dir: st
                 task["csv_path"],
             ))
     print(f"  Task manifest: {task_csv}")
-    return tasks
+    return tasks, csv_files
 
 
 def _run_tasks(tasks: List[dict], max_workers: int) -> None:
@@ -312,6 +353,8 @@ def _run_instance_worker(task: dict) -> dict:
             raise RuntimeError(f"OptimizerManager.Init failed: {task['config_path']}")
         manager.DirectRun()
         manager.AnalyzeResults()
+        if not os.path.isfile(task["csv_path"]):
+            raise RuntimeError(f"Expected hit-rate CSV was not produced: {task['csv_path']}")
         manager.ClearAllCachesAndResetStats()
         del manager
         gc.collect()
@@ -335,6 +378,16 @@ def _run_instance_worker(task: dict) -> dict:
             "elapsed_seconds": time.time() - start,
             "error": "{}\n{}".format(repr(exc), traceback.format_exc()),
         }
+
+
+def _validate_hit_rate_csvs(csv_files: dict) -> None:
+    missing = [
+        f"{instance_id}: {csv_path}"
+        for instance_id, csv_path in sorted(csv_files.items())
+        if not os.path.isfile(csv_path)
+    ]
+    if missing:
+        raise SystemExit("Missing expected hit-rate CSV(s):\n  " + "\n  ".join(missing))
 
 
 def _inspect_optimizer_trace(trace_file: str) -> str:
@@ -395,6 +448,16 @@ def _make_single_instance_config(args, trace_file: str, output_dir: str, instanc
             "capacity": args.l2_capacity,
         })
 
+    tier_strategy = {
+        "hierarchical_eviction_enabled": not args.disable_hierarchical_eviction,
+        "write_mode": args.default_tier_write_mode,
+        "access_propagation_enabled": args.tier_access_propagation_enabled,
+        "promote_enabled": args.enable_promote,
+        "selective_write_threshold": args.selective_write_threshold,
+    }
+    if args.tier_flow_config:
+        tier_strategy["tier_flows"] = args.tier_flow_config
+
     return {
         "trace_file_path": trace_file,
         "output_result_path": output_dir,
@@ -407,13 +470,7 @@ def _make_single_instance_config(args, trace_file: str, output_dir: str, instanc
                 "group_name": instance_id,
                 "quota_capacity": args.l1_capacity + max(args.l2_capacity, 0.0),
                 "used_percentage": args.used_percentage,
-                "tier_strategy": {
-                    "hierarchical_eviction_enabled": not args.disable_hierarchical_eviction,
-                    "write_mode": args.tier_write_mode,
-                    "access_propagation_enabled": args.tier_access_propagation_enabled,
-                    "promote_enabled": args.enable_promote,
-                    "selective_write_threshold": args.selective_write_threshold,
-                },
+                "tier_strategy": tier_strategy,
                 "default_block_ttl_seconds": args.default_block_ttl_seconds,
                 "ttl_refresh_on_read": args.ttl_refresh_on_read,
                 "storages": storages,

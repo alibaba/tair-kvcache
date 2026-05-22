@@ -68,7 +68,7 @@ bazel run //kv_cache_manager/optimizer/analysis/script:multi_instance_replay -- 
     --block-size 16 \
     --bytes-per-token 512 \
     --eviction-policy lru \
-    --tier-write-mode write_through \
+    --default-tier-write-mode write_through \
     --max-workers 32
 ```
 
@@ -82,11 +82,12 @@ bazel run //kv_cache_manager/optimizer/analysis/script:multi_instance_replay -- 
 | `--recursive` | — | false | 仅配合 `--trace-dir` 使用，递归扫描子目录 |
 | `--output-dir` | ✅ | — | 输出目录；回放结果、生成 config、聚合 CSV 都写到这里 |
 | `--bucket-name` | — | 见下 | 写入聚合 CSV 的 `Bucket` 列；只用于标记实验来源，不影响回放和 hit rate 计算 |
-| `--skip-existing` | — | false | 如果 `<output-dir>/<instance_id>_hit_rates.csv` 已存在，则跳过该 instance 的 replay |
+| `--skip-existing` | — | false | 如果 `<output-dir>/<instance_id>_hit_rates.csv` 已存在，则跳过该 instance 的 replay，并在本轮聚合中使用该 CSV |
 | `--max-workers` | — | `min(cpu_count, instance_count)` | 并发 optimizer 进程数；`0` 表示使用默认值 |
 | `--log-level` | — | 4 | 子进程 KVCM logger 等级 |
 
 `--bucket-name` 默认值：使用 `--trace-dir` 时为 trace 目录名；`--aggregate-only` 时为 output 目录名；使用 `--trace-files` 时默认为空。
+非 `--aggregate-only` 模式只聚合本轮 `--trace-dir` / `--trace-files` 选中的 instance CSV，不会扫描并混入 `--output-dir` 下的其他历史 CSV；未使用 `--skip-existing` 时，脚本会先删除本轮 instance 的旧 CSV，避免 worker 成功检查误读旧结果。
 
 ### 回放配置参数
 
@@ -102,7 +103,8 @@ bazel run //kv_cache_manager/optimizer/analysis/script:multi_instance_replay -- 
 | `--eviction-policy-params` | — | 策略默认值 | JSON object，覆盖策略参数，例如 `'{"sample_rate": 0.5}'` |
 | `--eviction-mode` | — | 3 | optimizer eviction mode：`1=group rough`，`2=instance rough`，`3=instance precise` |
 | `--eviction-batch-size` | — | 100 | 每个 instance 单次驱逐批大小 |
-| `--tier-write-mode` | — | `write_through` | 写入 `tier_strategy.write_mode`；可选 `write_through` / `cascading` / `write_through_selective` |
+| `--default-tier-write-mode` | — | `write_through` | 写入 `tier_strategy.write_mode`，作为所有相邻 tier edge 的默认写入策略；可选 `write_through` / `cascading` / `write_through_selective` |
+| `--tier-flow-config` | — | 空 | JSON array 或 JSON 文件路径，写入 `tier_strategy.tier_flows`，用于覆盖相邻 tier edge 的策略 |
 | `--enable-tier-access-propagation` | — | true | 写入 `tier_strategy.access_propagation_enabled=true`；命中上层副本时，同时刷新后续持有副本 tier 的访问时间；与 `--disable-tier-access-propagation` 互斥 |
 | `--disable-tier-access-propagation` | — | false | 写入 `tier_strategy.access_propagation_enabled=false`；命中上层副本时，只刷新命中 tier，不刷新下层冷热；与 `--enable-tier-access-propagation` 互斥 |
 | `--selective-write-threshold` | — | 2 | 写入 `tier_strategy.selective_write_threshold`；`write_through_selective` 下，命中层访问次数达到该阈值后复制到下一层；必须为正整数 |

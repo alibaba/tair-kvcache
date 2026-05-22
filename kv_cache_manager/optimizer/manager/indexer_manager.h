@@ -24,7 +24,8 @@ public:
                           TierWriteMode tier_write_mode = TierWriteMode::WRITE_THROUGH,
                           int64_t default_ttl_ns = 0,
                           size_t selective_write_threshold = 2,
-                          bool tier_access_propagation_enabled = true);
+                          bool tier_access_propagation_enabled = true,
+                          std::vector<TierFlowStrategy> tier_flow_strategies = {});
 
     std::shared_ptr<RadixTreeIndex> GetOptIndexer(const std::string &instance_id) const;
     std::unordered_map<std::string, std::shared_ptr<RadixTreeIndex>> GetAllOptIndexers() const;

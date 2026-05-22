@@ -26,7 +26,8 @@ public:
                    TierWriteMode write_mode = TierWriteMode::WRITE_THROUGH,
                    int64_t default_ttl_ns = 0,
                    size_t selective_write_threshold = 2,
-                   bool tier_access_propagation_enabled = true);
+                   bool tier_access_propagation_enabled = true,
+                   std::vector<TierFlowStrategy> tier_flow_strategies = {});
     // 兼容构造函数 (单 policy)
     RadixTreeIndex(const std::string &instance_id,
                    const std::shared_ptr<EvictionPolicy> &eviction_policy,
@@ -78,7 +79,12 @@ public:
     RadixTreeExport ExportForVisualization() const;
 
     const RadixTreeNode *GetRoot() const { return root_.get(); }
-    void set_enable_promote(bool enable) { enable_promote_ = enable; }
+    void set_enable_promote(bool enable) {
+        enable_promote_ = enable;
+        for (auto &strategy : tier_flow_strategies_) {
+            strategy.promote_enabled = enable;
+        }
+    }
     bool ConsumeReadTriggeredTierWrite() {
         bool triggered = read_triggered_tier_write_;
         read_triggered_tier_write_ = false;
@@ -96,6 +102,7 @@ private:
     TierWriteMode write_mode_ = TierWriteMode::WRITE_THROUGH;
     // true 时命中最高优先级 tier 后也刷新后续持有副本的 tier 访问时间；false 时只刷新命中层。
     bool tier_access_propagation_enabled_ = true;
+    std::vector<TierFlowStrategy> tier_flow_strategies_;
     // 写入流量应落地的 tier 数，构造时结合 write_mode_ 与 tier 数一次性确定
     // WRITE_THROUGH=全部层，CASCADING/WRITE_THROUGH_SELECTIVE=仅 tier 0（单层退化为全部）
     size_t write_tier_count_ = 0;
@@ -131,5 +138,10 @@ private:
     void RecordTieredHit(BlockEntry *block, bool is_remote, QueryHit *query_hit, bool count_for_hit_rate) const;
     void PromoteToHigherTiers(BlockEntry *block, int64_t timestamp);
     void SelectiveWriteToNextTier(BlockEntry *block, size_t hit_tier_idx, int64_t timestamp);
+    bool AppendBlockToTierAndWriteThrough(BlockEntry *block, size_t tier_idx, int64_t timestamp);
+    void InitTierFlowStrategies(TierWriteMode write_mode,
+                                size_t selective_write_threshold,
+                                bool tier_access_propagation_enabled,
+                                std::vector<TierFlowStrategy> tier_flow_strategies);
 };
 } // namespace kv_cache_manager

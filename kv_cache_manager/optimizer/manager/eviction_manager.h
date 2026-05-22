@@ -52,7 +52,7 @@ public:
                                                        const std::vector<OptTierConfig> &storage_configs,
                                                        bool hierarchical_eviction_enabled = false);
 
-    // 统一驱逐入口，内部根据 hierarchical_eviction_enabled 与 tier_write_mode 处理分层/非分层逻辑
+    // 统一驱逐入口，内部根据 hierarchical_eviction_enabled 与 tier edge write_mode 处理分层/非分层逻辑
     // eviction_timestamp 仅在 cascading 降级时用来写入新 tier 的 TierStat，其他分支不使用
     std::unordered_map<std::string, std::vector<BlockEntry *>>
     EvictByMode(const std::string &instance_id,
@@ -84,7 +84,8 @@ public:
     void DemoteToNextTier(const std::string &instance_id,
                           size_t next_tier_idx,
                           const std::vector<BlockEntry *> &blocks,
-                          int64_t timestamp);
+                          int64_t timestamp,
+                          const std::vector<TierFlowStrategy> &tier_flow_strategies);
 
 private:
     // 驱逐模式分发：根据 eviction_mode 调用对应的驱逐实现

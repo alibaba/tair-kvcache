@@ -28,6 +28,12 @@ enum class TierWriteMode {
     CASCADING = 1,               // 只写 tier 0，tier_i 驱逐出的 block 级联降级到 tier_{i+1}
     WRITE_THROUGH_SELECTIVE = 2, // 初始只写 tier 0，命中热度达到阈值后复制到下一层
 };
+struct TierFlowStrategy {
+    TierWriteMode write_mode = TierWriteMode::WRITE_THROUGH;
+    bool access_propagation_enabled = true;
+    bool promote_enabled = false;
+    size_t selective_write_threshold = 2;
+};
 struct TierStat {
     size_t access_count = 0;
     int64_t last_access_time = -1;

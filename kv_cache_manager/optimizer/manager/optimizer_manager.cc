@@ -187,15 +187,10 @@ bool OptimizerManager::CreateRadixTreeIndex(const OptInstanceConfig &instance_co
                                             group_it->second.tier_write_mode(),
                                             default_ttl_ns,
                                             static_cast<size_t>(group_it->second.selective_write_threshold()),
-                                            group_it->second.tier_access_propagation_enabled())) {
+                                            group_it->second.tier_access_propagation_enabled(),
+                                            group_it->second.tier_flow_strategies())) {
         KVCM_LOG_ERROR("Failed to create optimizer indexer for instance_id: %s", instance_config.instance_id().c_str());
         return false;
-    }
-    if (group_it->second.enable_promote()) {
-        auto indexer = indexer_manager_->GetOptIndexer(instance_config.instance_id());
-        if (indexer) {
-            indexer->set_enable_promote(true);
-        }
     }
     KVCM_LOG_INFO("Created optimizer indexer for instance_id: %s", instance_config.instance_id().c_str());
     return true;

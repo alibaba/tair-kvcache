@@ -321,6 +321,7 @@ optimizer.ClearAllCachesAndResetStats()           # 清空所有实例并重置�
 | eviction_mode | 驱逐模式：1=GROUP_ROUGH, 2=INSTANCE_ROUGH, 3=INSTANCE_PRECISE |
 | eviction_policy_type | 驱逐策略类型：lru、random_lru、leaf_aware_lru、ttl |
 | tier_strategy | 多层读写策略包，包含分层驱逐开关、写入模式、读访问传播、promote 和 selective write 阈值 |
+| tier_strategy.tier_flows | 相邻 tier edge 的策略覆盖；未覆盖 edge 继承 `tier_strategy` 默认策略 |
 | default_block_ttl_seconds | instance group 级别的默认 TTL（秒），0 = 关闭 TTL |
 | ttl_refresh_on_read | instance group 级别 TTL 续命开关：true=读续命，false=固定窗口 |
 | fallback_on_pressure | TTL 策略参数：过期不够时是否按 LRU 兜底（默认 true） |

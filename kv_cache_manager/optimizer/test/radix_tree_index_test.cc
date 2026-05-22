@@ -207,6 +207,129 @@ TEST_F(RadixTreeIndexTest, WriteThroughCanDisableAccessPropagationToLowerTier) {
     EXPECT_EQ(block->location_map.at("l2").last_access_time, 1000);
 }
 
+TEST_F(RadixTreeIndexTest, CascadingCanDisableAccessPropagationToLowerTier) {
+    LruParams params;
+    params.sample_rate = 1.0;
+    std::vector<std::shared_ptr<EvictionPolicy>> policies = {
+        std::make_shared<LruEvictionPolicy>("l1", params),
+        std::make_shared<LruEvictionPolicy>("l2", params),
+    };
+    auto index = std::make_shared<RadixTreeIndex>("test_instance", policies, TierWriteMode::CASCADING, 0, 2, false);
+    index->InsertOnly({45}, 1000);
+
+    auto *block = index->GetRoot()->children.at(45)->blocks[0].get();
+    ASSERT_EQ(block->location_map.count("l1"), 1);
+    AppendBlockLocation(block, "l2", 1000);
+    ASSERT_EQ(block->location_map.count("l2"), 1);
+
+    BlockMask block_mask = std::vector<bool>{false};
+    index->PrefixQuery({45}, block_mask, 2000);
+
+    EXPECT_EQ(block->location_map.at("l1").last_access_time, 2000);
+    EXPECT_EQ(block->location_map.at("l2").last_access_time, 1000);
+}
+
+TEST_F(RadixTreeIndexTest, SelectiveWriteToNextTierAfterThreshold) {
+    LruParams params;
+    params.sample_rate = 1.0;
+    std::vector<std::shared_ptr<EvictionPolicy>> policies = {
+        std::make_shared<LruEvictionPolicy>("l1", params),
+        std::make_shared<LruEvictionPolicy>("l2", params),
+    };
+    auto index =
+        std::make_shared<RadixTreeIndex>("test_instance", policies, TierWriteMode::WRITE_THROUGH_SELECTIVE, 0, 2, true);
+    index->InsertOnly({46}, 1000);
+
+    auto *block = index->GetRoot()->children.at(46)->blocks[0].get();
+    ASSERT_EQ(block->location_map.count("l1"), 1);
+    ASSERT_EQ(block->location_map.count("l2"), 0);
+
+    BlockMask block_mask = std::vector<bool>{false};
+    index->PrefixQuery({46}, block_mask, 2000);
+    EXPECT_EQ(block->location_map.count("l2"), 0);
+    EXPECT_FALSE(index->ConsumeReadTriggeredTierWrite());
+
+    index->PrefixQuery({46}, block_mask, 3000);
+    EXPECT_EQ(block->location_map.count("l2"), 1);
+    EXPECT_TRUE(index->ConsumeReadTriggeredTierWrite());
+}
+
+TEST_F(RadixTreeIndexTest, TierFlowsControlInitialWritePerEdge) {
+    LruParams params;
+    params.sample_rate = 1.0;
+    std::vector<std::shared_ptr<EvictionPolicy>> policies = {
+        std::make_shared<LruEvictionPolicy>("l1", params),
+        std::make_shared<LruEvictionPolicy>("l2", params),
+        std::make_shared<LruEvictionPolicy>("l3", params),
+    };
+    std::vector<TierFlowStrategy> flows(2);
+    flows[0].write_mode = TierWriteMode::WRITE_THROUGH;
+    flows[1].write_mode = TierWriteMode::CASCADING;
+    auto index =
+        std::make_shared<RadixTreeIndex>("test_instance", policies, TierWriteMode::WRITE_THROUGH, 0, 2, true, flows);
+    index->InsertOnly({50}, 1000);
+
+    auto *block = index->GetRoot()->children.at(50)->blocks[0].get();
+    EXPECT_EQ(block->location_map.count("l1"), 1);
+    EXPECT_EQ(block->location_map.count("l2"), 1);
+    EXPECT_EQ(block->location_map.count("l3"), 0);
+}
+
+TEST_F(RadixTreeIndexTest, TierFlowsStopAccessPropagationAtDisabledEdge) {
+    LruParams params;
+    params.sample_rate = 1.0;
+    std::vector<std::shared_ptr<EvictionPolicy>> policies = {
+        std::make_shared<LruEvictionPolicy>("l1", params),
+        std::make_shared<LruEvictionPolicy>("l2", params),
+        std::make_shared<LruEvictionPolicy>("l3", params),
+    };
+    std::vector<TierFlowStrategy> flows(2);
+    flows[0].write_mode = TierWriteMode::WRITE_THROUGH;
+    flows[1].write_mode = TierWriteMode::WRITE_THROUGH;
+    flows[1].access_propagation_enabled = false;
+    auto index =
+        std::make_shared<RadixTreeIndex>("test_instance", policies, TierWriteMode::WRITE_THROUGH, 0, 2, true, flows);
+    index->InsertOnly({60}, 1000);
+
+    auto *block = index->GetRoot()->children.at(60)->blocks[0].get();
+    BlockMask block_mask = std::vector<bool>{false};
+    index->PrefixQuery({60}, block_mask, 2000);
+
+    EXPECT_EQ(block->location_map.at("l1").last_access_time, 2000);
+    EXPECT_EQ(block->location_map.at("l2").last_access_time, 2000);
+    EXPECT_EQ(block->location_map.at("l3").last_access_time, 1000);
+}
+
+TEST_F(RadixTreeIndexTest, TierFlowsPromoteOnlyAcrossEnabledEdges) {
+    LruParams params;
+    params.sample_rate = 1.0;
+    std::vector<std::shared_ptr<EvictionPolicy>> policies = {
+        std::make_shared<LruEvictionPolicy>("l1", params),
+        std::make_shared<LruEvictionPolicy>("l2", params),
+        std::make_shared<LruEvictionPolicy>("l3", params),
+    };
+    std::vector<TierFlowStrategy> flows(2);
+    flows[0].write_mode = TierWriteMode::CASCADING;
+    flows[0].promote_enabled = false;
+    flows[1].write_mode = TierWriteMode::CASCADING;
+    flows[1].promote_enabled = true;
+    auto index =
+        std::make_shared<RadixTreeIndex>("test_instance", policies, TierWriteMode::CASCADING, 0, 2, true, flows);
+    index->InsertOnly({70}, 1000);
+
+    auto *block = index->GetRoot()->children.at(70)->blocks[0].get();
+    block->location_map.clear();
+    AppendBlockLocation(block, "l3", 1000);
+
+    QueryHit query_hit;
+    BlockMask block_mask = std::vector<bool>{false};
+    index->PrefixQuery({70}, block_mask, 2000, &query_hit);
+
+    EXPECT_EQ(block->location_map.count("l1"), 0);
+    EXPECT_EQ(block->location_map.count("l2"), 1);
+    EXPECT_EQ(block->location_map.count("l3"), 1);
+}
+
 TEST_F(RadixTreeIndexTest, MultipleInsertions) {
     std::vector<int64_t> block_keys1 = {1, 2, 3};
     index_->InsertOnly(block_keys1, 1000);

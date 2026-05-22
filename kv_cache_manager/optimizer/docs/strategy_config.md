@@ -167,7 +167,8 @@ Write trace：
     "write_mode": "write_through",
     "access_propagation_enabled": true,
     "promote_enabled": true,
-    "selective_write_threshold": 2
+    "selective_write_threshold": 2,
+    "tier_flows": []
   },
   "default_block_ttl_seconds": 0,
   "ttl_refresh_on_read": true,
@@ -196,6 +197,7 @@ Write trace：
 | `access_propagation_enabled` | bool | `true` | 读命中高优先级 tier 时，是否刷新后续持有副本 tier 的访问时间；`false` 表示只刷新命中 tier |
 | `promote_enabled` | bool | `true` | 低层命中后是否逐层复制回经过的高优先级层 |
 | `selective_write_threshold` | int | `2` | `write_through_selective` 下命中层访问次数达到该阈值后复制到下一层；必须为正整数 |
+| `tier_flows` | array | `[]` | 相邻 tier edge 的策略覆盖。未覆盖的 edge 继承 `tier_strategy` 的默认策略 |
 
 ### write_mode
 
@@ -206,6 +208,48 @@ Write trace：
 | `write_through_selective` | 初始只落 tier 0 | 命中层访问次数达到 `tier_strategy.selective_write_threshold` 后复制到下一层 | 控制低层写放大，只让热块下沉 |
 
 `tier_strategy.write_mode` 只接受上表三个值，其他值会导致 config 解析失败。
+
+### tier_flows
+
+`tier_flows` 用于覆盖相邻 tier 之间的读写流动策略。每个 flow 必须引用 `storages` 中相邻的两个 `unique_name`，不支持跨层跳配，也不允许重复配置同一条 edge。
+配置加载时会按 `storages[*].priority` 排序后校验 edge。未知 tier、非相邻 edge、重复 edge、重复 `unique_name` 或重复 `priority` 都会直接报错并拒绝加载。
+
+```json
+{
+  "tier_strategy": {
+    "hierarchical_eviction_enabled": true,
+    "write_mode": "write_through",
+    "access_propagation_enabled": true,
+    "promote_enabled": true,
+    "selective_write_threshold": 2,
+    "tier_flows": [
+      {
+        "from_tier": "hbm",
+        "to_tier": "dram",
+        "write_mode": "write_through",
+        "access_propagation_enabled": false
+      },
+      {
+        "from_tier": "dram",
+        "to_tier": "ssd",
+        "write_mode": "cascading",
+        "promote_enabled": false
+      }
+    ]
+  }
+}
+```
+
+单条 flow 的字段：
+
+| 字段 | 类型 | 默认 | 标准语义 |
+|---|---:|---:|---|
+| `from_tier` | string | 必填 | edge 的高优先级 tier 名称，必须等于某个 `storages[i].unique_name` |
+| `to_tier` | string | 必填 | edge 的低优先级 tier 名称，必须等于相邻的 `storages[i+1].unique_name` |
+| `write_mode` | string | 继承默认 | 这条 edge 的写入/驱逐下沉策略 |
+| `access_propagation_enabled` | bool | 继承默认 | 访问命中高层后，是否跨这条 edge 刷新下层访问时间 |
+| `promote_enabled` | bool | 继承默认 | 低层命中后，是否允许跨这条 edge 回填到高层 |
+| `selective_write_threshold` | int | 继承默认 | 这条 edge 使用 `write_through_selective` 时的下写阈值 |
 
 ### access_propagation_enabled
 
@@ -317,7 +361,7 @@ bazel run //kv_cache_manager/optimizer/analysis/script:multi_instance_replay -- 
   --block-size 16 \
   --bytes-per-token 512 \
   --eviction-policy lru \
-  --tier-write-mode write_through \
+  --default-tier-write-mode write_through \
   --max-workers 32
 ```
 

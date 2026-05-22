@@ -17,19 +17,16 @@ RadixTreeIndex::RadixTreeIndex(const std::string &instance_id,
                                TierWriteMode write_mode,
                                int64_t default_ttl_ns,
                                size_t selective_write_threshold,
-                               bool tier_access_propagation_enabled) {
+                               bool tier_access_propagation_enabled,
+                               std::vector<TierFlowStrategy> tier_flow_strategies) {
     root_ = std::make_unique<RadixTreeNode>();
     tier_policies_ = std::move(tier_policies);
     for (auto &p : tier_policies_) {
         tier_names_.push_back(p->name());
     }
     write_mode_ = write_mode;
-    // 级联/选择性写入模式且多层时初始仅落 tier 0；其余情形落全部。
-    write_tier_count_ =
-        ((write_mode_ == TierWriteMode::CASCADING || write_mode_ == TierWriteMode::WRITE_THROUGH_SELECTIVE) &&
-         tier_policies_.size() > 1)
-            ? 1
-            : tier_policies_.size();
+    InitTierFlowStrategies(
+        write_mode, selective_write_threshold, tier_access_propagation_enabled, std::move(tier_flow_strategies));
     instance_id_ = instance_id;
     default_ttl_ns_ = default_ttl_ns;
     selective_write_threshold_ = selective_write_threshold;
@@ -46,6 +43,36 @@ RadixTreeIndex::RadixTreeIndex(const std::string &instance_id,
     write_tier_count_ = 1;
     instance_id_ = instance_id;
     default_ttl_ns_ = default_ttl_ns;
+}
+
+void RadixTreeIndex::InitTierFlowStrategies(TierWriteMode write_mode,
+                                            size_t selective_write_threshold,
+                                            bool tier_access_propagation_enabled,
+                                            std::vector<TierFlowStrategy> tier_flow_strategies) {
+    const size_t edge_count = tier_policies_.size() > 0 ? tier_policies_.size() - 1 : 0;
+    if (tier_flow_strategies.size() == edge_count) {
+        tier_flow_strategies_ = std::move(tier_flow_strategies);
+    } else {
+        TierFlowStrategy default_strategy;
+        default_strategy.write_mode = write_mode;
+        default_strategy.access_propagation_enabled = tier_access_propagation_enabled;
+        default_strategy.promote_enabled = false;
+        default_strategy.selective_write_threshold = selective_write_threshold;
+        tier_flow_strategies_.assign(edge_count, default_strategy);
+    }
+
+    write_tier_count_ = tier_policies_.empty() ? 0 : 1;
+    while (write_tier_count_ < tier_policies_.size() &&
+           tier_flow_strategies_[write_tier_count_ - 1].write_mode == TierWriteMode::WRITE_THROUGH) {
+        ++write_tier_count_;
+    }
+    enable_promote_ = false;
+    for (const auto &strategy : tier_flow_strategies_) {
+        if (strategy.promote_enabled) {
+            enable_promote_ = true;
+            break;
+        }
+    }
 }
 
 // TODO 后续改为 记录需要更新信息的node和blockentry，然后统一用一个接口更新
@@ -378,14 +405,17 @@ void RadixTreeIndex::OnBlockAccessed(BlockEntry *block, int64_t timestamp, bool 
     block->access_count += 1;
     block->last_access_time = timestamp;
 
-    // 遍历所有 tier：tier_access_propagation_enabled=true 时，所有持有副本的 tier 都刷新
-    // last_access_time；否则只刷新命中层，避免上层命中给下层续热。
+    // 遍历所有 tier：按相邻 edge 的 access_propagation_enabled 决定访问是否继续向下层传播。
     // access_count 仅对"首个命中层"+1（分层读优先读快层，tier 索引最小的持有层视为命中层）
     bool first_hit = true;
-    bool propagate_access = tier_access_propagation_enabled_;
+    bool propagate_access = true;
     size_t hit_tier_idx = tier_policies_.size();
     size_t hit_tier_access_count = 0;
     for (size_t i = 0; i < tier_policies_.size(); ++i) {
+        if (!first_hit && i > 0 && i - 1 < tier_flow_strategies_.size() &&
+            !tier_flow_strategies_[i - 1].access_propagation_enabled) {
+            propagate_access = false;
+        }
         const auto &tier_name = tier_names_[i];
         auto loc_it = block->location_map.find(tier_name);
         if (loc_it != block->location_map.end()) {
@@ -402,7 +432,9 @@ void RadixTreeIndex::OnBlockAccessed(BlockEntry *block, int64_t timestamp, bool 
             }
         }
     }
-    if (write_mode_ == TierWriteMode::WRITE_THROUGH_SELECTIVE && hit_tier_access_count >= selective_write_threshold_) {
+    if (hit_tier_idx < tier_flow_strategies_.size() &&
+        tier_flow_strategies_[hit_tier_idx].write_mode == TierWriteMode::WRITE_THROUGH_SELECTIVE &&
+        hit_tier_access_count >= tier_flow_strategies_[hit_tier_idx].selective_write_threshold) {
         SelectiveWriteToNextTier(block, hit_tier_idx, timestamp);
     }
 }
@@ -445,30 +477,53 @@ void RadixTreeIndex::PromoteToHigherTiers(BlockEntry *block, int64_t timestamp) 
     if (current_highest_tier == 0 || current_highest_tier == tier_policies_.size()) {
         return;
     }
-    for (size_t i = 0; i < current_highest_tier; ++i) {
-        if (!block->location_map.count(tier_names_[i])) {
-            AppendBlockLocation(block, tier_names_[i], timestamp);
-            tier_policies_[i]->OnBlockWritten(block);
+    for (size_t i = current_highest_tier; i > 0; --i) {
+        const size_t higher_tier_idx = i - 1;
+        if (higher_tier_idx >= tier_flow_strategies_.size() ||
+            !tier_flow_strategies_[higher_tier_idx].promote_enabled) {
+            break;
+        }
+        if (!block->location_map.count(tier_names_[higher_tier_idx])) {
+            AppendBlockLocation(block, tier_names_[higher_tier_idx], timestamp);
+            tier_policies_[higher_tier_idx]->OnBlockWritten(block);
             read_triggered_tier_write_ = true;
         }
     }
 }
 
 void RadixTreeIndex::SelectiveWriteToNextTier(BlockEntry *block, size_t hit_tier_idx, int64_t timestamp) {
-    if (write_mode_ != TierWriteMode::WRITE_THROUGH_SELECTIVE || !block) {
+    if (!block || hit_tier_idx >= tier_flow_strategies_.size() ||
+        tier_flow_strategies_[hit_tier_idx].write_mode != TierWriteMode::WRITE_THROUGH_SELECTIVE) {
         return;
     }
     const size_t next_tier_idx = hit_tier_idx + 1;
     if (next_tier_idx >= tier_policies_.size()) {
         return;
     }
-    const std::string &next_tier_name = tier_names_[next_tier_idx];
-    if (block->location_map.find(next_tier_name) != block->location_map.end()) {
-        return;
+    read_triggered_tier_write_ =
+        AppendBlockToTierAndWriteThrough(block, next_tier_idx, timestamp) || read_triggered_tier_write_;
+}
+
+bool RadixTreeIndex::AppendBlockToTierAndWriteThrough(BlockEntry *block, size_t tier_idx, int64_t timestamp) {
+    if (!block || tier_idx >= tier_policies_.size()) {
+        return false;
     }
-    AppendBlockLocation(block, next_tier_name, timestamp);
-    tier_policies_[next_tier_idx]->OnBlockWritten(block);
-    read_triggered_tier_write_ = true;
+    bool wrote_tier = false;
+    size_t current_tier = tier_idx;
+    while (current_tier < tier_policies_.size()) {
+        const std::string &tier_name = tier_names_[current_tier];
+        if (block->location_map.find(tier_name) == block->location_map.end()) {
+            AppendBlockLocation(block, tier_name, timestamp);
+            tier_policies_[current_tier]->OnBlockWritten(block);
+            wrote_tier = true;
+        }
+        if (current_tier >= tier_flow_strategies_.size() ||
+            tier_flow_strategies_[current_tier].write_mode != TierWriteMode::WRITE_THROUGH) {
+            break;
+        }
+        ++current_tier;
+    }
+    return wrote_tier;
 }
 
 // block 逻辑上空了：location 全空（被驱逐）
