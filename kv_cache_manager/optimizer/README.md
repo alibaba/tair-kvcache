@@ -31,6 +31,8 @@ KVCacheManager Optimizer 是一个独立的缓存优化分析模块，通过回�
 - **灵活配置**：通过 JSON 配置文件灵活配置实例、存储和策略
 - **可视化分析**：支持 Radix Tree 可视化和命中率图表生成
 
+标准策略配置、multi-instance replay、trace schema 和命中率口径见 [docs/strategy_config.md](docs/strategy_config.md)。标准版中 `HitRate` 统一表示整体 token hit rate，即 `HitTokens / InputTokens`；local/remote 只作为 trace `block_mask` 与 optimizer 模拟命中的诊断拆分，不作为标准结论维度。传入 optimizer config 的 Python 入口统一使用配置中的 `output_result_path`；`multi_instance_replay` 不读取完整 config，使用显式 `--output-dir`。标准 trace 必须包含 `input_len`，其他来源日志需要先转换为 optimizer schema。
+
 ### 架构设计
 
 ```
@@ -313,7 +315,8 @@ optimizer.ClearAllCachesAndResetStats()           # 清空所有实例并重置�
 | eviction_mode | 驱逐模式：1=GROUP_ROUGH, 2=INSTANCE_ROUGH, 3=INSTANCE_PRECISE |
 | eviction_policy_type | 驱逐策略类型：lru、random_lru、leaf_aware_lru、ttl |
 | hierarchical_eviction_enabled | 是否开启分层驱逐（各 tier 独立容量与独立驱逐策略）；`false` 时所有 tier 共享一个 `shared` 策略与 `quota_capacity` 配额（GB） |
-| tier_write_mode | 仅在 `hierarchical_eviction_enabled=true` 时生效。可选值：`write_through`（默认）一次写所有 tier，各层独立驱逐；`cascading` 仅写 tier 0，tier_i 驱逐的 block 自动降级到 tier_{i+1}，最后一层驱逐即丢弃 |
+| tier_write_mode | 仅在 `hierarchical_eviction_enabled=true` 时生效。可选值：`write_through`、`cascading`、`write_through_selective`、`cascading_no_access_propagation` |
+| enable_promote | 低层命中后是否逐层复制回经过的高优先级层，默认 true |
 | default_block_ttl_seconds | instance group 级别的默认 TTL（秒），0 = 关闭 TTL |
 | ttl_refresh_on_read | instance group 级别 TTL 续命开关：true=读续命，false=固定窗口 |
 | fallback_on_pressure | TTL 策略参数：过期不够时是否按 LRU 兜底（默认 true） |
@@ -339,7 +342,7 @@ python trace_converter.py \
 ```json
 {
     "trace_file_path" : "/path/to/qwen_traceA_optimizer.jsonl",
-    "output_result_path": "/mnt/baiyi/KVCacheManager/kv_cache_manager/optimizer/analysis/result/qwen_bailian",
+    "output_result_path": "/path/to/output",
     "eviction_params": {
         "eviction_mode": 1,
         "eviction_batch_size_per_instance": 100

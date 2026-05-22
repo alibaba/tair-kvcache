@@ -1070,7 +1070,7 @@ class MockHiCacheStorage:
         self.storage_manager.Init()
 
         # Multi-instance not supported yet; using a single shared instance_id.
-        self.instance_id = "3780643326877293460"
+        self.instance_id = "test_instance"
 
     def tearDown(self):
         if hasattr(self, "temp_dir"):

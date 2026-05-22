@@ -1,0 +1,277 @@
+# Optimizer 标准策略配置说明
+
+本文档定义标准版 optimizer 的策略配置、multi-instance replay 入口和命中率口径。后续新增实验脚本应复用这里的字段语义，避免在脚本里引入另一套配置命名。
+
+## 指标口径
+
+标准版只对外暴露一种命中率口径：
+
+```text
+HitRate = HitTokens / InputTokens
+AccHitRate = AccHitTokens / AccInputTokens
+```
+
+相关约定：
+
+- `HitRate`、`AccHitRate`、`LocalHitRate`、`RemoteHitRate` 和 `Tier*_HitRate` 都是 token hit rate。
+- 标准命中率只按 token 计算，但 CSV 保留 block 读/命中计数，便于核对读放大、命中规模和容量行为。
+- 标准分析不把 local/remote 当作独立结论维度。`local` 只表示 trace `block_mask` 带进来的已有本地命中 block，例如 optimizer 作为单独 L3 模拟并和 HiSim 结合时，或直接分析 KVCacheManager event log 时，日志里已经包含的本地命中 block key；`remote` 表示 optimizer 模拟层贡献的命中。当前标准报告直接按请求输入计算整体 `HitRate`，不依赖 local/remote 拆分。
+- 标准 optimizer trace 必须包含 `input_len`，`InputTokens` 直接使用 `input_len`。
+- 不再兼容缺失 `input_len` 的旧 trace。其他来源的日志需要先转换成 optimizer schema。
+- 不完整尾 block 不计入 `HitTokens`。例如 `block_size=16`、`input_len=33` 时，最多只有前 2 个完整 block 计入命中 token，尾部 1 个 token 仍计入 `InputTokens`。
+
+标准 `*_hit_rates.csv` 的核心列：
+
+| 列 | 说明 |
+|---|---|
+| `TimestampNs` | trace 时间戳，单位 ns |
+| `CachedBlocks` | 当前 instance group 的总缓存 block 数 |
+| `ReadBlocks` / `HitBlocks` | 当前请求读取 / 命中的 block 数 |
+| `LocalHitBlocks` / `RemoteHitBlocks` | 诊断字段：trace `block_mask` 带入的已有本地命中 / optimizer 模拟层命中 |
+| `InputTokens` / `HitTokens` | 当前请求的输入 token 数 / 命中 token 数 |
+| `LocalHitTokens` / `RemoteHitTokens` | 诊断字段：本地 / optimizer 模拟层命中 token 数 |
+| `HitRate` | 当前请求整体 token hit rate |
+| `LocalHitRate` / `RemoteHitRate` | 诊断字段，不作为标准分析主口径 |
+| `AccReadBlocks` / `AccHitBlocks` | 累计读取 / 命中的 block 数 |
+| `AccInputTokens` / `AccHitTokens` | 累计输入 token 数 / 累计命中 token 数 |
+| `AccLocalHitTokens` / `AccRemoteHitTokens` | 诊断字段：累计本地 / optimizer 模拟层命中 token 数 |
+| `AccHitRate` | 累计整体 token hit rate |
+| `AccLocalHitRate` / `AccRemoteHitRate` | 诊断字段，不作为标准分析主口径 |
+| `AccWriteBlocks` | 截至当前时间的累计写入 block 数 |
+| `Tier<N>(name)_HitTokens` | 当前请求在某个 tier 的命中 token 数 |
+| `Tier<N>(name)_HitRate` / `AccTier<N>(name)_HitRate` | 当前 / 累计 tier token hit rate |
+| `Tier<N>(name)_BlockNum` | 当前 tier 的缓存 block 数 |
+
+## 顶层配置
+
+```json
+{
+  "trace_file_path": "/path/to/optimizer_trace.jsonl",
+  "output_result_path": "/path/to/output",
+  "eviction_params": {
+    "eviction_mode": 3,
+    "eviction_batch_size_per_instance": 100
+  },
+  "instance_groups": []
+}
+```
+
+`output_result_path` 是所有 config 驱动入口的结果输出目录，包括 `optimizer_main`、`optimizer_run`、`tradeoff` 和 `export_tree`。`export_tree` 会写到该目录下的 `radix_tree/`。`multi_instance_replay` 不读取完整 optimizer config，需要通过 `--output-dir` 显式指定输出目录。
+
+### eviction_params
+
+| 字段 | 类型 | 默认 | 说明 |
+|---|---:|---:|---|
+| `eviction_mode` | int | 必填 | `1`=`GROUP_ROUGH`，`2`=`INSTANCE_ROUGH`，`3`=`INSTANCE_PRECISE` |
+| `eviction_batch_size_per_instance` | int | 必填 | 每轮每实例最多驱逐的 block 数。rough 模式必须大于 0 |
+
+推荐标准实验使用 `eviction_mode=3`，因为它按剩余超额容量截断最后一轮驱逐，容量点更稳定。
+
+## 标准 trace schema
+
+optimizer 回放输入只接受 JSONL，每行一条标准 trace。字段不完整时直接失败，不做旧格式推断。
+
+Get trace：
+
+```json
+{
+  "type": "get",
+  "instance_id": "instance-a",
+  "trace_id": "trace_instance-a_1000",
+  "timestamp_ns": 1000,
+  "keys": [101, 102, 103],
+  "tokens": [],
+  "input_len": 33,
+  "query_type": "prefix_match",
+  "block_mask": [],
+  "sw_size": 0,
+  "location_spec_names": []
+}
+```
+
+Write trace：
+
+```json
+{
+  "type": "write",
+  "instance_id": "instance-a",
+  "trace_id": "trace_instance-a_1001",
+  "timestamp_ns": 1001,
+  "keys": [101, 102, 103],
+  "tokens": [],
+  "input_len": 33,
+  "ttl_us": 0
+}
+```
+
+必填字段：
+
+| 字段 | 说明 |
+|---|---|
+| `type` | 只能是 `get` 或 `write` |
+| `instance_id` | 必须匹配配置中的 instance |
+| `timestamp_ns` | ns 时间戳；不再接受 `timestamp_us` |
+| `keys` | block key 列表，不能为空 |
+| `input_len` | 输入 token 数，必须为正整数 |
+
+`tokens` 可为空，用于减小 trace 文件体积；命中率以 `input_len` 为准。
+
+`block_mask` 只用于标记 trace 已经知道的本地命中 block，不是标准报告的分组依据。直接分析请求输入时通常可传空数组，此时整体 `HitRate` 仍按 `HitTokens / InputTokens` 计算。
+
+## instance group 配置
+
+```json
+{
+  "group_name": "instance-a",
+  "quota_capacity": 178,
+  "used_percentage": 1.0,
+  "hierarchical_eviction_enabled": true,
+  "tier_write_mode": "write_through",
+  "enable_promote": true,
+  "default_block_ttl_seconds": 0,
+  "ttl_refresh_on_read": true,
+  "storages": [],
+  "instances": []
+}
+```
+
+| 字段 | 类型 | 默认 | 标准语义 |
+|---|---:|---:|---|
+| `group_name` | string | 必填 | 实例组名称。multi-instance replay 中通常等于 instance 的 `instance_id` |
+| `quota_capacity` | number | 必填 | group 总容量，单位 GB。非分层模式按该字段驱逐 |
+| `used_percentage` | number | 必填 | 容量水位比例，实际阈值为 capacity × used_percentage |
+| `hierarchical_eviction_enabled` | bool | 必填 | 是否启用分层容量和分层驱逐 |
+| `tier_write_mode` | string | `write_through` | 多 tier 写入和层间流动策略 |
+| `enable_promote` | bool | `true` | 低层命中后是否逐层复制回经过的高优先级层 |
+| `default_block_ttl_seconds` | int | `0` | group 默认 TTL 秒数，`0` 表示组级禁用 TTL |
+| `ttl_refresh_on_read` | bool | `true` | TTL 策略下读命中是否刷新 TTL 锚点 |
+| `storages` | array | 必填 | tier 列表，按 `priority` 从小到大排序 |
+| `instances` | array | 必填 | 该 group 下的 optimizer instance 列表 |
+
+### tier_write_mode
+
+| 值 | 写入行为 | 驱逐行为 | 适用场景 |
+|---|---|---|---|
+| `write_through` | 写入时同时落所有 tier | 各 tier 独立按自身容量驱逐 | 基线、全量副本、多层独立命中率分析 |
+| `cascading` | 写入时只落 tier 0 | tier i 驱逐出的 block 降级到 tier i+1，最后一层驱逐后丢弃 | HBM→DRAM→SSD 逐级下沉 |
+| `write_through_selective` | 初始只落 tier 0 | 命中层访问次数达到阈值后复制到下一层 | 控制低层写放大，只让热块下沉 |
+| `cascading_no_access_propagation` | 与 `cascading` 相同 | 上层命中不刷新低层访问时间 | 评估低层独立冷热衰减 |
+
+`enable_promote=true` 时，低优先级 tier 命中会触发向更高优先级 tier 逐层复制。比如 L3 命中会补齐 L2 和 L1，L2 命中只补 L1，不会额外写入更低层。复制动作会走容量检查，可能立刻触发对应 tier 的驱逐。
+
+## storage 配置
+
+```json
+{
+  "unique_name": "hbm",
+  "storage_type": "pace",
+  "band_width_mbps": 20000,
+  "priority": 0,
+  "capacity": 50
+}
+```
+
+| 字段 | 类型 | 说明 |
+|---|---:|---|
+| `unique_name` | string | tier 名称，会进入 CSV 的 `Tier<N>(name)_*` 列 |
+| `storage_type` | string | 存储类型标签，当前主要用于配置记录 |
+| `band_width_mbps` | number | 带宽标签，当前主要用于分析记录 |
+| `priority` | int | tier 优先级，越小越靠近计算侧 |
+| `capacity` | number | tier 容量，单位 GB |
+
+## instance 配置
+
+```json
+{
+  "instance_id": "instance-a",
+  "block_size": 16,
+  "bytes_per_token": 512,
+  "eviction_policy_type": "lru",
+  "eviction_policy_params": {}
+}
+```
+
+| 字段 | 类型 | 说明 |
+|---|---:|---|
+| `instance_id` | string | trace 中的实例 ID，必须与 trace 行内 `instance_id` 匹配 |
+| `block_size` | int | 每个 block 的 token 数。token hit rate 会用它把命中 block 转为命中 token |
+| `bytes_per_token` | int | 单 token KV 大小。`bytes_per_block = block_size * bytes_per_token` |
+| `eviction_policy_type` | string | `lru`、`random_lru`、`leaf_aware_lru`、`ttl` |
+| `eviction_policy_params` | object | 策略参数，见下文 |
+
+## eviction_policy_params
+
+### lru / leaf_aware_lru
+
+```json
+{
+  "sample_rate": 1.0,
+  "shard_count": 1,
+  "sample_times": 32,
+  "eviction_amplification_factor": 1.0
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `sample_rate` | 采样比例。`1.0` 表示完整 LRU |
+| `shard_count` | LRU 分片数 |
+| `sample_times` | 每次采样次数 |
+| `eviction_amplification_factor` | 驱逐放大系数 |
+
+### random_lru
+
+```json
+{
+  "sample_rate": 1.0
+}
+```
+
+`random_lru` 只要求 `sample_rate`，用于控制采样范围。
+
+### ttl
+
+```json
+{
+  "fallback_on_pressure": true
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `fallback_on_pressure=true` | 先清理 TTL 过期 block；容量仍超限时按 LRU 兜底 |
+| `fallback_on_pressure=false` | 纯 TTL，只清理过期 block；容量压力不会触发 LRU 兜底 |
+
+TTL 只在 `eviction_policy_type="ttl"` 时执行。非 TTL 策略会忽略 `default_block_ttl_seconds` 和 `ttl_refresh_on_read` 的过期清理语义。
+
+## 标准多实例回放
+
+标准版保留 `multi_instance_replay`，不再把 multi-machine scheduler 作为默认回放入口。
+脚本完整参数以 [analysis/script/README.md](../analysis/script/README.md) 为准；这里给出标准回放配置示例和输出约定。
+
+```bash
+bazel run //kv_cache_manager/optimizer/analysis/script:multi_instance_replay -- \
+  --trace-dir /path/to/instance_traces \
+  --trace-glob "*.jsonl" \
+  --output-dir /path/to/output \
+  --bucket-name bucket-a \
+  --l1-capacity 50 \
+  --l2-capacity 128 \
+  --block-size 16 \
+  --bytes-per-token 512 \
+  --eviction-policy lru \
+  --tier-write-mode write_through \
+  --max-workers 32
+```
+
+输出：
+
+- 输出根目录为 `--output-dir`。
+- `configs/<instance_id>.json`：每个 instance 的生成配置。
+- `<instance_id>_hit_rates.csv`：每个 instance 的标准 token hit-rate 时序。
+- `aggregate/instance_aggregate.csv`：每个 instance 的聚合结果。
+- `aggregate/global_aggregate.csv`：所有 instance 汇总后的全局结果。
+- `aggregate/global_window_hit_rates.csv`：指定 `--window-ns` 或 `--window-seconds` 时生成的窗口结果。
+
+multi-instance replay 聚合后的 `HitRate` 仍然是 token hit rate，计算方式为所有 instance 的 `HitTokens` 总和除以 `InputTokens` 总和。
+`--bucket-name` 只写入聚合 CSV 的 `Bucket` 列，用于标记实验来源；`--trace-glob` 和 `--recursive` 只在使用 `--trace-dir` 扫描输入文件时生效。

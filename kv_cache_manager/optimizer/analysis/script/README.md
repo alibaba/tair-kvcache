@@ -8,6 +8,10 @@ Bazel target 前缀：
 //kv_cache_manager/optimizer/analysis/script
 ```
 
+标准 Python 入口的输出规则：凡是传入 optimizer config 的入口都只使用 config 中的 `output_result_path`；`multi_instance_replay` 不读取完整 config，必须通过 `--output-dir` 指定输出目录。
+
+标准报告直接按请求输入计算整体 `HitRate = HitTokens / InputTokens`。CSV 中的 local/remote 字段只是诊断拆分：local 来自 trace `block_mask` 带入的已有本地命中 block，remote 来自 optimizer 模拟层命中；标准分析结论不按 local/remote 分组。
+
 ---
 
 ## 1. 单次运行 — `optimizer_run`
@@ -32,22 +36,114 @@ bazel run //kv_cache_manager/optimizer/analysis/script:optimizer_run -- -c confi
 | `-c, --config` | ✅ | — | optimizer 配置文件路径（JSON） |
 | `--draw-chart` | — | false | 生成命中率时序图 |
 | `--export-lifecycle` | — | false | 导出 lifecycle CSV（内存消耗大） |
+| `--enable-template-analysis` | — | false | 启用模板前缀分析；会拖慢回放速度，开启后才会生成模板前缀相关 CSV |
 
 ### 输出
 
 ```
 <output_result_path>/
 ├── *_hit_rates.csv                       # 每个 instance 的命中率时序数据
-├── *_template_prefix_traces.csv          # per-trace 模板归属明细
-├── *_template_prefix_summary.csv         # 模板级汇总
+├── *_template_prefix_traces.csv          # per-trace 模板归属明细（需 --enable-template-analysis）
+├── *_template_prefix_summary.csv         # 模板级汇总（需 --enable-template-analysis）
 ├── *_lifecycle.csv                       # block 生命周期数据（需 --export-lifecycle）
 └── timeseries/
     └── multi_instance_cache_analysis.png # 命中率时序图（需 --draw-chart）
 ```
 
+`optimizer_run --draw-chart` 在分层配置下还会生成 `timeseries/per_tier_timeseries.png`；非分层配置会跳过该图。
+
 ---
 
-## 2. Pareto 曲线分析 — `tradeoff`
+## 2. 多实例回放 — `multi_instance_replay`
+
+按 instance trace 并行运行 optimizer，并聚合 token hit rate。每个输入 JSONL 必须是标准 optimizer schema，且一个文件只能包含一个 `instance_id`。
+
+```bash
+bazel run //kv_cache_manager/optimizer/analysis/script:multi_instance_replay -- \
+    --trace-dir /path/to/instance_traces \
+    --trace-glob "*.jsonl" \
+    --output-dir /path/to/output \
+    --l1-capacity 50 \
+    --l2-capacity 128 \
+    --block-size 16 \
+    --bytes-per-token 512 \
+    --eviction-policy lru \
+    --tier-write-mode write_through \
+    --max-workers 32
+```
+
+### 输入与输出参数
+
+| 参数 | 必需 | 默认 | 说明 |
+|------|------|------|------|
+| `--trace-dir` | 条件必需 | — | instance trace 目录；与 `--trace-files` 互斥。非 `--aggregate-only` 模式下二选一 |
+| `--trace-files` | 条件必需 | — | 显式传入多个 per-instance JSONL trace 文件；与 `--trace-dir` 互斥 |
+| `--trace-glob` | — | `*.jsonl` | 仅配合 `--trace-dir` 使用，控制扫描哪些文件 |
+| `--recursive` | — | false | 仅配合 `--trace-dir` 使用，递归扫描子目录 |
+| `--output-dir` | ✅ | — | 输出目录；回放结果、生成 config、聚合 CSV 都写到这里 |
+| `--bucket-name` | — | 见下 | 写入聚合 CSV 的 `Bucket` 列；只用于标记实验来源，不影响回放和 hit rate 计算 |
+| `--skip-existing` | — | false | 如果 `<output-dir>/<instance_id>_hit_rates.csv` 已存在，则跳过该 instance 的 replay |
+| `--max-workers` | — | `min(cpu_count, instance_count)` | 并发 optimizer 进程数；`0` 表示使用默认值 |
+| `--log-level` | — | 4 | 子进程 KVCM logger 等级 |
+
+`--bucket-name` 默认值：使用 `--trace-dir` 时为 trace 目录名；`--aggregate-only` 时为 output 目录名；使用 `--trace-files` 时默认为空。
+
+### 回放配置参数
+
+这些参数会写入脚本为每个 instance 生成的 optimizer config。
+
+| 参数 | 必需 | 默认 | 说明 |
+|------|------|------|------|
+| `--l1-capacity` | — | 50.0 | tier 0 容量，单位 GB |
+| `--l2-capacity` | — | 128.0 | tier 1 容量，单位 GB；`0` 表示关闭 L2，只保留 L1 |
+| `--block-size` | — | 16 | 每个 block 的 token 数 |
+| `--bytes-per-token` | — | 512 | 单 token KV 大小；用于生成 config 和容量换算 |
+| `--eviction-policy` | — | `lru` | 每个 instance 的驱逐策略；可选 `lru` / `random_lru` / `leaf_aware_lru` / `ttl` |
+| `--eviction-policy-params` | — | 策略默认值 | JSON object，覆盖策略参数，例如 `'{"sample_rate": 0.5}'` |
+| `--eviction-mode` | — | 3 | optimizer eviction mode：`1=group rough`，`2=instance rough`，`3=instance precise` |
+| `--eviction-batch-size` | — | 100 | 每个 instance 单次驱逐批大小 |
+| `--tier-write-mode` | — | `write_through` | 分层写入策略；可选 `write_through` / `cascading` / `write_through_selective` / `cascading_no_access_propagation` |
+| `--enable-promote` | — | true | 开启从低层级向高层级 promote；与 `--disable-promote` 互斥 |
+| `--disable-promote` | — | false | 关闭 promote；与 `--enable-promote` 互斥 |
+| `--disable-hierarchical-eviction` | — | false | 关闭分层驱逐；默认生成分层配置 |
+| `--used-percentage` | — | 1.0 | 写入 config 的 group `used_percentage` |
+| `--default-block-ttl-seconds` | — | 0 | 默认 block TTL 秒数；主要用于 `--eviction-policy ttl` |
+| `--ttl-refresh-on-read` | — | true | TTL 策略下读命中刷新 last access time；与 `--no-ttl-refresh-on-read` 互斥 |
+| `--no-ttl-refresh-on-read` | — | false | TTL 策略下读命中不刷新 last access time；与 `--ttl-refresh-on-read` 互斥 |
+
+未显式传 `--eviction-policy-params` 时，脚本按策略生成默认参数：`random_lru` 使用 `{"sample_rate": 1.0}`；`ttl` 使用 `{"fallback_on_pressure": true}`；其他策略使用 leaf-aware/random-lru 兼容参数。
+
+### 聚合参数
+
+| 参数 | 必需 | 默认 | 说明 |
+|------|------|------|------|
+| `--aggregate-only` | — | false | 跳过 replay，只聚合 `--output-dir` 下已有的 `*_hit_rates.csv`；此时不需要 `--trace-dir` / `--trace-files` |
+| `--start-ns` | — | — | 聚合时间范围起点，纳秒；区间语义为 `[start_ns, end_ns)` |
+| `--end-ns` | — | — | 聚合时间范围终点，纳秒；区间语义为 `[start_ns, end_ns)` |
+| `--window-ns` | — | — | 窗口大小，纳秒；与 `--window-seconds` 互斥，设置后生成窗口级聚合 |
+| `--window-seconds` | — | — | 窗口大小，秒；与 `--window-ns` 互斥，设置后生成窗口级聚合 |
+| `--include-instance-windows` | — | false | 生成 per-instance 窗口聚合；只有设置窗口大小时才有输出 |
+| `--aggregation-chunksize` | — | 1000000 | 聚合读取 hit-rate CSV 的 pandas chunk 行数，调大可提速但占更多内存 |
+
+### 输出
+
+```
+<output_dir>/
+├── configs/
+│   └── <instance_id>.json                 # 每个 instance 的生成配置
+├── <instance_id>_hit_rates.csv            # 每个 instance 的 token hit-rate 时序
+├── multi_instance_replay_tasks.csv         # 任务清单：InstanceId / TraceFile / ConfigPath / CsvPath
+├── multi_instance_replay_summary.csv       # 子进程执行结果：成功状态、耗时、错误信息
+└── aggregate/
+    ├── instance_aggregate.csv
+    ├── global_aggregate.csv
+    ├── global_window_hit_rates.csv        # 需 --window-ns 或 --window-seconds
+    └── instance_window_hit_rates.csv      # 需窗口参数 + --include-instance-windows
+```
+
+---
+
+## 3. Pareto 曲线分析 — `tradeoff`
 
 在多个容量点上运行 optimizer，绘制容量-命中率权衡曲线。自动判断单策略/多策略模式。
 
@@ -67,7 +163,7 @@ bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- -c config.jso
 # 保存 CSV + 生成每个容量点的时序图
 bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- -c config.json --save-csv --plot-timeseries
 
-# 从已有 CSV 加载（跳过实验）
+# 从 <output_result_path>/csv_results 加载（跳过实验）
 bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- -c config.json --skip-run
 
 # 自定义坐标轴范围
@@ -98,21 +194,21 @@ bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
 | 参数 | 必需 | 默认 | 说明 |
 |------|------|------|------|
 | `-c, --config` | ✅ | — | 配置文件路径 |
-| `--eviction-policies` | — | 配置默认 | 驱逐策略列表（空格分隔） |
-| `--warmup-capacity` | — | 10000 | warmup 阶段容量（GB） |
-| `--num-points` | — | 40 | 容量采样点数（指数分布） |
-| `--hit-rate-type` | — | total | 命中率类型：total / internal / external / all |
+| `--eviction-policies` | — | 配置默认 | 驱逐策略列表（空格分隔）；不传时使用 config 中的策略 |
+| `--warmup-capacity` | — | 10000.0 | warmup 阶段容量上限，单位 GB；应足够容纳全量 trace 数据 |
+| `--num-points` | — | 40 | 容量采样点数；实际容量点按指数分布生成，并过滤过小容量 |
+| `--hit-rate-type` | — | `total` | 绘制命中率类型；可选 `total` / `local` / `remote` / `all` |
 | `--max-workers` | — | 4 | 并行实验线程数 |
 | `--save-csv` | — | false | 保留每次运行的 CSV 文件 |
-| `--csv-output-dir` | — | `<output>/csv_results` | CSV 保存目录 |
-| `--export-lifecycle` | — | false | 导出 lifecycle CSV |
-| `--skip-run` | — | false | 跳过实验，从已有 CSV 加载 |
-| `--plot-timeseries` | — | false | 为容量点生成时序图（需 `--save-csv` 或 `--skip-run`） |
-| `--plot-capacity` | — | 全部 | 只为指定容量点生成时序图（空格分隔） |
-| `--plot-per-tier` | — | false | 绘制 per-tier 命中率对比曲线（所有层放在一起） |
-| `--plot-per-tier-timeseries` | — | false | 绘制 per-tier 命中率时序图（所有层放在一起） |
-| `--x-min/--x-max` | — | 自动 | X 轴（容量）范围 |
-| `--y-min/--y-max` | — | 0~1 | Y 轴（命中率）范围 |
+| `--skip-run` | — | false | 跳过实验，从 `<output_result_path>/csv_results` 加载已有 `cap_<capacity>_<policy>/` 结果 |
+| `--plot-timeseries` | — | false | 为容量点生成时序图；必须配合 `--save-csv` 或 `--skip-run` 才有 CSV 可画 |
+| `--plot-capacity` | — | 全部 | 只为指定容量点生成时序图；传入的是 `cap_<capacity>_<policy>` 里的 block 容量整数 |
+| `--x-min` | — | 自动 | Pareto 图 X 轴最小值 |
+| `--x-max` | — | 自动 | Pareto 图 X 轴最大值 |
+| `--y-min` | — | 自动 | Pareto 图 Y 轴最小值 |
+| `--y-max` | — | 自动 | Pareto 图 Y 轴最大值 |
+
+`--hit-rate-type all` 会分别输出 total/local/remote 三类图。标准结论看 total token hit rate；local/remote 仅作为诊断拆分。
 
 ### 输出
 
@@ -121,10 +217,8 @@ bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
 ├── pareto/
 │   ├── pareto_curve_<type>.png           # 单策略 Pareto 散点图
 │   ├── multi_policy_<type>.png           # 多策略对比子图
-│   └── per_tier_curves.png               # Per-Tier 命中率对比曲线（需 --plot-per-tier）
 ├── timeseries/
-│   ├── multi_instance_cache_analysis.png # 时序图（需 --plot-timeseries）
-│   └── per_tier_timeseries.png           # Per-Tier 命中率时序图（需 --plot-per-tier-timeseries）
+│   └── multi_instance_cache_analysis.png # 时序图（需 --plot-timeseries）
 └── csv_results/                          # 需 --save-csv
     └── cap_<capacity>_<policy>/
         ├── *_hit_rates.csv
@@ -134,7 +228,7 @@ bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
 
 ---
 
-## 3. 前缀树可视化 — `export_tree`
+## 4. 前缀树可视化 — `export_tree`
 
 运行 optimizer 后导出 RadixTree 结构为 JSON，并生成可视化图。
 
@@ -159,7 +253,6 @@ bazel run //kv_cache_manager/optimizer/analysis/script:export_tree -- \
 | 参数 | 必需 | 默认 | 说明 |
 |------|------|------|------|
 | `-c, --config` | ✅ | — | 配置文件路径 |
-| `-o, --output-dir` | — | `<output_result_path>` | 输出目录 |
 | `--hot-nodes` | — | 10 | Top K 热点节点数 |
 | `--show-hot-paths` | — | false | 只可视化热点路径（推荐大树使用） |
 | `--show-blocks` | — | false | 打印热点路径的 block 序列 |
@@ -212,7 +305,7 @@ python kv_cache_manager/optimizer/analysis/script/plot/radix_tree_plot.py \
 
 ---
 
-## 4. Block Lifecycle 分析 — `analyze_lifecycle`
+## 5. Block Lifecycle 分析 — `analyze_lifecycle`
 
 分析 block 的生命周期数据，产出统计报告 + CDF 图 + Access Count 直方图。
 
@@ -221,13 +314,9 @@ python kv_cache_manager/optimizer/analysis/script/plot/radix_tree_plot.py \
 bazel run //kv_cache_manager/optimizer/analysis/script:analyze_lifecycle -- \
     -i instance_lifecycle.csv
 
-# 分析单个文件，输出到指定目录
-bazel run //kv_cache_manager/optimizer/analysis/script:analyze_lifecycle -- \
-    -i instance_lifecycle.csv -o results/
-
 # 批量分析目录下所有 *_lifecycle.csv
 bazel run //kv_cache_manager/optimizer/analysis/script:analyze_lifecycle -- \
-    -i output_dir/ -o results/
+    -i output_dir/
 
 # 只看统计信息（不生成图表）
 bazel run //kv_cache_manager/optimizer/analysis/script:analyze_lifecycle -- \
@@ -239,7 +328,6 @@ bazel run //kv_cache_manager/optimizer/analysis/script:analyze_lifecycle -- \
 | 参数 | 必需 | 默认 | 说明 |
 |------|------|------|------|
 | `-i, --input` | ✅ | — | lifecycle CSV 文件或包含 `*_lifecycle.csv` 的目录 |
-| `-o, --output-dir` | — | 输入文件所在目录 | 图表输出目录 |
 | `--stats-only` | — | false | 只打印统计信息，不生成图表 |
 
 ### 统计报告内容
@@ -254,7 +342,7 @@ bazel run //kv_cache_manager/optimizer/analysis/script:analyze_lifecycle -- \
 ### 输出
 
 ```
-<output_result_path>/
+<input_dir>/
 └── lifecycle/
     ├── <instance>_physical_lifespan_cdf.png  # Physical Lifespan CDF（全量 + Evicted）
     ├── <instance>_active_lifespan_cdf.png    # Active Lifespan CDF
@@ -265,64 +353,16 @@ bazel run //kv_cache_manager/optimizer/analysis/script:analyze_lifecycle -- \
 
 ---
 
-## 5. 多层存储 Per-Tier 分析
+## 6. 多层存储 Per-Tier 输出
 
-分析多层存储（tiered storage）配置下各层的命中率表现。适用于启用了 `hierarchical_eviction_enabled` 的多层缓存场景。
+启用多层存储（`hierarchical_eviction_enabled=true` 且至少 2 个 `storages`）时，标准 `*_hit_rates.csv` 会包含：
 
-### 5.1 Per-Tier Pareto 曲线
+- `Tier<N>(<tier_name>)_HitTokens`
+- `Tier<N>(<tier_name>)_HitRate`
+- `AccTier<N>(<tier_name>)_HitRate`
+- `Tier<N>(<tier_name>)_BlockNum`
 
-绘制不同存储层（L1/L2/L3等）的容量-命中率权衡曲线，在一张图上对比所有层。
-
-```bash
-# 单策略 + per-tier 对比曲线
-bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
-    -c config.json --plot-per-tier
-
-# 多策略 + per-tier 对比曲线（为每个策略生成独立图）
-bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
-    -c config.json --eviction-policies lru leaf_aware_lru --plot-per-tier
-
-# 从已有 CSV 加载 + 生成 per-tier 图
-bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
-    -c config.json --skip-run --plot-per-tier
-```
-
-### 5.2 Per-Tier 时序图
-
-绘制随时间变化的各层命中率时序曲线，观察不同层在仿真过程中的动态表现。
-
-```bash
-# 为所有容量点生成 per-tier 时序图
-bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
-    -c config.json --save-csv --plot-per-tier-timeseries
-
-# 只为特定容量点生成 per-tier 时序图
-bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
-    -c config.json --save-csv --plot-per-tier-timeseries --plot-capacity 5000000 10000000
-
-# 从已有 CSV 加载 + 生成 per-tier 时序图
-bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
-    -c config.json --skip-run --plot-per-tier-timeseries
-```
-
-### Per-Tier 参数说明
-
-| 参数 | 必需 | 默认 | 说明 |
-|------|------|------|------|
-| `--plot-per-tier` | — | false | 绘制 per-tier Pareto 对比曲线 |
-| `--plot-per-tier-timeseries` | — | false | 绘制 per-tier 时序图 |
-
-**注意**：per-tier 分析需要配置文件中使用多层存储（`hierarchical_eviction_enabled: true`），并且 CSV 中包含 `AccTier<N>(<tier_name>)_HitRate` 列。
-
-### 输出
-
-```
-<output_result_path>/
-├── pareto/
-│   └── per_tier_curves.png               # Per-Tier Pareto 对比曲线
-└── timeseries/
-    └── per_tier_timeseries.png           # Per-Tier 时序图（每个容量点一张）
-```
+`optimizer_run --draw-chart` 仅在存在 `hierarchical_eviction_enabled=true` 且至少 2 个 `storages` 的 group 时生成 `timeseries/per_tier_timeseries.png`。所有 `HitRate` / `AccHitRate` / `AccTier*_HitRate` 均为 token hit rate。
 
 ---
 
@@ -341,7 +381,7 @@ bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
 | 模块 | 说明 |
 |------|------|
 | `hit_rate_plot.py` | 命中率时序图绘制：读取 `*_hit_rates.csv`，绘制多 instance 双子图（命中率 + 缓存块数 ZOH 对齐）；per-tier 时序图。被 `optimizer_run` 和 `tradeoff` 调用 |
-| `radix_tree_plot.py` | RadixTree 可视化：完整树 / 热点路径绘图、热点节点统计。**可独立运行**（见第 3 节） |
+| `radix_tree_plot.py` | RadixTree 可视化：完整树 / 热点路径绘图、热点节点统计。**可独立运行**（见第 4 节） |
 | `lifecycle_plot.py` | Physical/Active Lifespan CDF + Access Count 直方图（全量 + 去零两张子图）。被 `analyze_lifecycle` 调用 |
 
 ### utils/
@@ -351,6 +391,7 @@ bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
 | `optimizer_runner.py` | optimizer 运行封装：配置加载、warmup pass、并行实验框架（ThreadPoolExecutor）。被 `optimizer_run`、`tradeoff`、`export_tree` 调用 |
 | `csv_loader.py` | CSV 结果加载、容量列表生成（指数分布采样）、`--skip-run` 模式的数据加载。被 `tradeoff` 调用 |
 | `plot_utils.py` | 统一绘图风格（`setup_plot_style`）、Pareto 曲线绘图、多策略子图绘图、per-tier 对比曲线。被 `tradeoff` 调用 |
+| `window_aggregator.py` | 多实例结果聚合：全局/单实例汇总、时间窗口聚合。被 `multi_instance_replay` 调用 |
 
 ---
 
@@ -363,7 +404,8 @@ script/
 │   ├── optimizer_run.py          # 单次运行
 │   ├── tradeoff.py               # Pareto 曲线 + per-tier 分析
 │   ├── export_tree.py            # 前缀树导出
-│   └── analyze_lifecycle.py      # Lifecycle 分析
+│   ├── analyze_lifecycle.py      # Lifecycle 分析
+│   └── multi_instance_replay.py  # 多实例并行回放 + 聚合
 │
 ├── analysis/                     # 分析层
 │   └── lifecycle_analysis.py     # 读取 + 统计 + 数据提取
@@ -376,33 +418,33 @@ script/
 └── utils/                        # 工具层
     ├── optimizer_runner.py       # optimizer 运行封装
     ├── csv_loader.py             # CSV 加载 + 容量列表
-    └── plot_utils.py             # 绘图风格 + Pareto 绘图 + per-tier 曲线
+    ├── plot_utils.py             # 绘图风格 + Pareto 绘图 + per-tier 曲线
+    └── window_aggregator.py      # 多实例聚合
 ```
 
 ---
 
 ## 输出目录总览
 
-所有脚本共享同一个根目录 `<output_result_path>`（来自 config.json `output_result_path` 字段）。
+标准 Python 入口共享输出规则：config 驱动入口使用 `<output_result_path>`；`multi_instance_replay` 使用 `--output-dir`；`analyze_lifecycle` 不读取 config，图表固定输出到输入 lifecycle CSV 所在目录或输入目录下的 `lifecycle/`。
 
 ```
-<output_result_path>/
+<output_result_path 或 output_dir>/
 │
 │  # ── C++ optimizer 原始数据输出 ──────────────────────────────
 ├── *_hit_rates.csv                           # 命中率时序（每条 trace 上报）
-├── *_template_prefix_traces.csv              # per-trace 模板归属明细
-├── *_template_prefix_summary.csv             # 模板级汇总
+├── *_template_prefix_traces.csv              # per-trace 模板归属明细（需模板分析）
+├── *_template_prefix_summary.csv             # 模板级汇总（需模板分析）
 ├── *_lifecycle.csv                           # block 生命周期（需 --export-lifecycle）
 │
 │  # ── Python 图表输出 ────────────────────────────────────────
 ├── pareto/                                   # tradeoff
 │   ├── pareto_curve_<type>.png
 │   ├── multi_policy_<type>.png
-│   └── per_tier_curves.png                   # per-tier 对比曲线
 │
 ├── timeseries/                               # optimizer_run --draw-chart
 │   ├── multi_instance_cache_analysis.png     # tradeoff --plot-timeseries
-│   └── per_tier_timeseries.png               # per-tier 时序图
+│   └── per_tier_timeseries.png               # per-tier 时序图（仅分层配置）
 │
 ├── lifecycle/                                # analyze_lifecycle
 │   ├── *_physical_lifespan_cdf.png
@@ -413,6 +455,12 @@ script/
 │   ├── *_radix_tree.json
 │   ├── *_radix_tree.png
 │   └── *_hot_paths.png
+│
+├── aggregate/                                # multi_instance_replay
+│   ├── instance_aggregate.csv
+│   ├── global_aggregate.csv
+│   ├── global_window_hit_rates.csv           # 需窗口参数
+│   └── instance_window_hit_rates.csv         # 需窗口参数 + --include-instance-windows
 │
 │  # ── tradeoff --save-csv 实验中间数据 ─────────────────────────
 └── csv_results/

@@ -243,7 +243,7 @@ OptimizerConfig (顶层配置)
 | 参数 | 说明 |
 |------|------|
 | trace_file_path | Trace 文件路径 |
-| output_result_path | 结果输出目录 |
+| output_result_path | 结果输出目录；所有 config 驱动入口都使用该目录，`export_tree` 输出到其下的 `radix_tree/` |
 | eviction_mode | 驱逐模式：1=GROUP_ROUGH, 2=INSTANCE_ROUGH, 3=INSTANCE_PRECISE |
 | eviction_batch_size_per_instance | 粗粒度驱逐时的批量大小 |
 | group_name | 实例组唯一标识 |
@@ -418,6 +418,7 @@ struct ResultCounters {
 
 struct ReadRecord {
     int64_t timestamp_ns;
+    // local = trace block_mask 带入的已有本地命中；remote = optimizer 模拟层命中
     size_t remote_read_blocks;
     size_t remote_hit_blocks;
     size_t local_read_blocks;
@@ -442,11 +443,18 @@ struct Result {
 
 **主要列**：
 - `TimestampNs` - 时间戳（纳秒）
-- `CachedBlocksCurrentInstance` - 当前实例的缓存块数
-- `CachedBlocksAllInstance` - 所有实例的总缓存块数
-- `HitRate` - 当前命中率
-- `AccHitRate` - 累积总命中率
-- `AccLocalHitRate` / `AccRemoteHitRate` - 本地/远端累积命中率
+- `CachedBlocks` - 当前 instance group 的总缓存块数
+- `ReadBlocks` / `HitBlocks` - 当前请求读取和命中的 block 数
+- `LocalHitBlocks` / `RemoteHitBlocks` - 诊断字段：trace `block_mask` 带入的已有本地命中 / optimizer 模拟层命中
+- `InputTokens` / `HitTokens` - 当前请求的输入 token 数和命中 token 数
+- `HitRate` - 当前 token 命中率，`HitTokens / InputTokens`
+- `LocalHitTokens` / `RemoteHitTokens` - 诊断字段：本地 / optimizer 模拟层命中 token 数
+- `AccReadBlocks` / `AccHitBlocks` - 累计读取和命中的 block 数
+- `AccHitRate` - 累积 token 命中率，`AccHitTokens / AccInputTokens`
+- `AccLocalHitRate` / `AccRemoteHitRate` - 诊断字段，不作为标准分析主口径
+- `Tier<N>(name)_HitTokens` / `Tier<N>(name)_HitRate` / `AccTier<N>(name)_HitRate` - 分层命中 token 指标
+
+标准分析直接按请求输入计算整体 `HitRate`，不把 local/remote 作为独立结论维度。local/remote 只用于兼容 optimizer 作为单独 L3 模拟并和 HiSim 结合、或直接分析 KVCacheManager event log 时已有的本地命中信息。
 
 ---
 
@@ -517,7 +525,7 @@ bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff_analysis_run_by_
 - `-c, --config` - 配置文件路径
 - `--warmup-capacity` - Warmup 阶段使用的大容量，单位 GB（默认 10000）
 - `--num-points` - 容量采样点数量（默认 40）
-- `--hit-rate-type` - 命中率类型：total/local/remote/all（默认 total）
+- `--hit-rate-type` - 命中率类型，标准分析使用 total；local/remote/all 仅作诊断拆分（默认 total）
 - `--max-workers` - 并行执行的最大线程数（默认 4）
 
 **输出**：`{output_result_path}/pareto_curve_{hit_rate_type}.png`
@@ -546,7 +554,7 @@ bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff_analysis_run_by_
 - `--warmup-capacity` - Warmup 阶段使用的大容量，单位 GB（默认 10000）
 - `--eviction-policies` - 要对比的驱逐策略列表（默认 lru random_lru leaf_aware_lru）
 - `--num-points` - 容量采样点数量（默认 40）
-- `--hit-rate-type` - 命中率类型：total/local/remote/all（默认 total）
+- `--hit-rate-type` - 命中率类型，标准分析使用 total；local/remote/all 仅作诊断拆分（默认 total）
 - `--max-workers` - 并行执行的最大线程数（默认 4）
 
 **输出**：`{output_result_path}/multi_policy_{hit_rate_type}.png`
