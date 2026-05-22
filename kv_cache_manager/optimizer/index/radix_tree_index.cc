@@ -22,9 +22,13 @@ RadixTreeIndex::RadixTreeIndex(const std::string &instance_id,
         tier_names_.push_back(p->name());
     }
     write_mode_ = write_mode;
-    // CASCADING 且多层时仅落 tier 0；其余情形（WRITE_THROUGH 或单层）落全部
+    // 级联/选择性写入模式且多层时初始仅落 tier 0；其余情形落全部。
     write_tier_count_ =
-        (write_mode_ == TierWriteMode::CASCADING && tier_policies_.size() > 1) ? 1 : tier_policies_.size();
+        ((write_mode_ == TierWriteMode::CASCADING || write_mode_ == TierWriteMode::WRITE_THROUGH_SELECTIVE ||
+          write_mode_ == TierWriteMode::CASCADING_NO_ACCESS_PROPAGATION) &&
+         tier_policies_.size() > 1)
+            ? 1
+            : tier_policies_.size();
     instance_id_ = instance_id;
     default_ttl_ns_ = default_ttl_ns;
 }
@@ -162,19 +166,13 @@ void RadixTreeIndex::PrefixQuery(const std::vector<int64_t> &block_keys,
                                  const BlockMask &block_mask,
                                  const int64_t timestamp,
                                  QueryHit *query_hit,
-                                 bool refresh_ttl_on_read) {
+                                 bool refresh_ttl_on_read,
+                                 size_t hit_countable_blocks) {
+    read_triggered_tier_write_ = false;
     if (block_keys.empty()) {
         return;
     }
-    std::unordered_set<int64_t> query_keys;
-    std::unordered_set<int64_t> mask_keys;
-    for (size_t idx = 0; idx < block_keys.size(); idx++) {
-        if (IsIndexInMaskRange(block_mask, idx)) {
-            mask_keys.insert(block_keys[idx]);
-        } else {
-            query_keys.insert(block_keys[idx]);
-        }
-    }
+    const size_t hit_limit = std::min(hit_countable_blocks, block_keys.size());
 
     RadixTreeNode *current_node = root_.get();
     size_t key_idx = 0;
@@ -195,14 +193,18 @@ void RadixTreeIndex::PrefixQuery(const std::vector<int64_t> &block_keys,
                 break;
             }
             BlockEntry *blk = child->blocks[match_len].get();
-            if (query_keys.count(block_keys[key_idx + match_len])) {
-                has_remote_hit = true;
-                RecordTieredHit(blk, true, query_hit);
-                OnBlockAccessed(blk, timestamp, refresh_ttl_on_read);
-            } else if (mask_keys.count(block_keys[key_idx + match_len])) {
+            const bool is_local = IsIndexInMaskRange(block_mask, key_idx + match_len);
+            const bool count_for_hit_rate = (key_idx + match_len) < hit_limit;
+            if (is_local) {
                 has_local_hit = true;
-                RecordTieredHit(blk, false, query_hit);
-                OnBlockAccessed(blk, timestamp, refresh_ttl_on_read);
+                RecordTieredHit(blk, false, query_hit, count_for_hit_rate);
+            } else {
+                has_remote_hit = true;
+                RecordTieredHit(blk, true, query_hit, count_for_hit_rate);
+            }
+            OnBlockAccessed(blk, timestamp, refresh_ttl_on_read);
+            if (enable_promote_) {
+                PromoteToHigherTiers(blk, timestamp);
             }
             match_len++;
         }
@@ -295,7 +297,7 @@ std::vector<BlockEntry *> RadixTreeIndex::AppendNewBlocks(RadixTreeNode *node,
         entry->ttl_ns = ttl_ns;
         entry->owner_node = node;
         BlockEntry *entry_ptr = entry.get();
-        // 根据写入模式落到对应 tier：WRITE_THROUGH=全部层，CASCADING=仅 tier 0
+        // 根据写入模式落到对应 tier：WRITE_THROUGH=全部层，级联/选择性写入=仅 tier 0
         for (size_t t = 0; t < write_tier_count_; ++t) {
             AppendBlockLocation(entry_ptr, tier_names_[t], timestamp);
         }
@@ -333,7 +335,7 @@ RadixTreeIndex::WriteModify RadixTreeIndex::AppendEvictBlocks(std::unordered_map
                     block->writing_time = timestamp;
                     block->last_access_time = timestamp;
                     block->ttl_ns = ttl_ns;
-                    // 根据写入模式恢复到对应 tier：WRITE_THROUGH=全部层，CASCADING=仅 tier 0
+                    // 根据写入模式恢复到对应 tier：WRITE_THROUGH=全部层，级联/选择性写入=仅 tier 0
                     for (size_t t = 0; t < write_tier_count_; ++t) {
                         AppendBlockLocation(block, tier_names_[t], timestamp);
                     }
@@ -362,7 +364,7 @@ void RadixTreeIndex::WriteToTier(RadixTreeNode *node,
         inserted_blocks = cb(block_keys, timestamp);
     }
     node->stat.last_access_time = timestamp;
-    // 根据写入模式注册到对应 tier 的驱逐队列：WRITE_THROUGH=所有层，CASCADING=仅 tier 0
+    // 根据写入模式注册到对应 tier 的驱逐队列：WRITE_THROUGH=所有层，级联/选择性写入=仅 tier 0
     for (size_t t = 0; t < write_tier_count_; ++t) {
         tier_policies_[t]->OnNodeWritten(inserted_blocks);
     }
@@ -373,34 +375,46 @@ void RadixTreeIndex::OnBlockAccessed(BlockEntry *block, int64_t timestamp, bool 
     block->access_count += 1;
     block->last_access_time = timestamp;
 
-    // 遍历所有 tier：last_access_time 对所有持有副本的 tier 都刷新（冷热信号）
+    // 遍历所有 tier：last_access_time 对所有持有副本的 tier 都刷新（冷热信号）。
+    // cascading_no_access_propagation 只刷新命中层，避免上层命中给低层续热。
     // access_count 仅对"首个命中层"+1（分层读优先读快层，tier 索引最小的持有层视为命中层）
     bool first_hit = true;
+    bool propagate_access = write_mode_ != TierWriteMode::CASCADING_NO_ACCESS_PROPAGATION;
+    size_t hit_tier_idx = tier_policies_.size();
+    size_t hit_tier_access_count = 0;
     for (size_t i = 0; i < tier_policies_.size(); ++i) {
         const auto &tier_name = tier_names_[i];
         auto loc_it = block->location_map.find(tier_name);
         if (loc_it != block->location_map.end()) {
-            tier_policies_[i]->OnBlockAccessedWithOptions(block, timestamp, refresh_ttl_on_read);
-            loc_it->second.last_access_time = timestamp;
             if (first_hit) {
+                tier_policies_[i]->OnBlockAccessedWithOptions(block, timestamp, refresh_ttl_on_read);
+                loc_it->second.last_access_time = timestamp;
                 loc_it->second.access_count += 1;
+                hit_tier_idx = i;
+                hit_tier_access_count = loc_it->second.access_count;
                 first_hit = false;
+            } else if (propagate_access) {
+                tier_policies_[i]->OnBlockAccessedWithOptions(block, timestamp, refresh_ttl_on_read);
+                loc_it->second.last_access_time = timestamp;
             }
         }
     }
+    if (hit_tier_access_count >= 2) {
+        SelectiveWriteToNextTier(block, hit_tier_idx, timestamp);
+    }
 }
 
-void RadixTreeIndex::RecordTieredHit(BlockEntry *block, bool is_remote, QueryHit *query_hit) const {
-    if (!query_hit) {
+void RadixTreeIndex::RecordTieredHit(BlockEntry *block,
+                                     bool is_remote,
+                                     QueryHit *query_hit,
+                                     bool count_for_hit_rate) const {
+    if (!query_hit || !count_for_hit_rate) {
         return;
     }
     if (is_remote) {
         query_hit->remote_hit_block_num++;
     } else {
         query_hit->local_hit_block_num++;
-    }
-    if (tier_names_.size() <= 1) {
-        return;
     }
     // 按 priority 从高到低检查，命中最高优先级的那一层
     if (query_hit->per_tier_hit_block_num.size() < tier_names_.size()) {
@@ -412,6 +426,46 @@ void RadixTreeIndex::RecordTieredHit(BlockEntry *block, bool is_remote, QueryHit
             break;
         }
     }
+}
+
+void RadixTreeIndex::PromoteToHigherTiers(BlockEntry *block, int64_t timestamp) {
+    if (!block || tier_policies_.empty()) {
+        return;
+    }
+    size_t current_highest_tier = tier_policies_.size();
+    for (size_t i = 0; i < tier_policies_.size(); ++i) {
+        if (block->location_map.count(tier_names_[i])) {
+            current_highest_tier = i;
+            break;
+        }
+    }
+    if (current_highest_tier == 0 || current_highest_tier == tier_policies_.size()) {
+        return;
+    }
+    for (size_t i = 0; i < current_highest_tier; ++i) {
+        if (!block->location_map.count(tier_names_[i])) {
+            AppendBlockLocation(block, tier_names_[i], timestamp);
+            tier_policies_[i]->OnBlockWritten(block);
+            read_triggered_tier_write_ = true;
+        }
+    }
+}
+
+void RadixTreeIndex::SelectiveWriteToNextTier(BlockEntry *block, size_t hit_tier_idx, int64_t timestamp) {
+    if (write_mode_ != TierWriteMode::WRITE_THROUGH_SELECTIVE || !block) {
+        return;
+    }
+    const size_t next_tier_idx = hit_tier_idx + 1;
+    if (next_tier_idx >= tier_policies_.size()) {
+        return;
+    }
+    const std::string &next_tier_name = tier_names_[next_tier_idx];
+    if (block->location_map.find(next_tier_name) != block->location_map.end()) {
+        return;
+    }
+    AppendBlockLocation(block, next_tier_name, timestamp);
+    tier_policies_[next_tier_idx]->OnBlockWritten(block);
+    read_triggered_tier_write_ = true;
 }
 
 // block 逻辑上空了：location 全空（被驱逐）

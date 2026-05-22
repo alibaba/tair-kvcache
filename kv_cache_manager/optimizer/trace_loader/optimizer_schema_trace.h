@@ -1,8 +1,40 @@
 #pragma once
+#include <algorithm>
+
 #include "kv_cache_manager/common/jsonizable.h"
 #include "kv_cache_manager/meta/cache_location.h"
 
 namespace kv_cache_manager {
+inline bool ParseOptimizerInt64VectorAllowUint64(const rapidjson::Value &rapid_value,
+                                                 const char *key,
+                                                 std::vector<int64_t> &values,
+                                                 const std::vector<int64_t> &default_values = {}) {
+    if (!rapid_value.HasMember(key)) {
+        values = default_values;
+        return true;
+    }
+    const auto &array_value = rapid_value[key];
+    if (!array_value.IsArray()) {
+        return false;
+    }
+    values.clear();
+    values.reserve(array_value.Size());
+    for (const auto &value : array_value.GetArray()) {
+        if (value.IsInt64()) {
+            values.push_back(value.GetInt64());
+        } else if (value.IsUint64()) {
+            values.push_back(static_cast<int64_t>(value.GetUint64()));
+        } else if (value.IsInt()) {
+            values.push_back(static_cast<int64_t>(value.GetInt()));
+        } else if (value.IsUint()) {
+            values.push_back(static_cast<int64_t>(value.GetUint()));
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
 // 基础的Optimizer Schema Trace
 class OptimizerSchemaTrace : public Jsonizable {
 public:
@@ -11,25 +43,36 @@ public:
     bool FromRapidValue(const rapidjson::Value &rapid_value) override {
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "instance_id", instance_id_, std::string(""));
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "trace_id", trace_id_, std::string(""));
-        // Optimizer 读 trace 入口：可含 timestamp_ns，或旧数据 timestamp_us（微秒→×1000）；之后全用纳秒
         timestamp_ns_ = 0;
-        if (rapid_value.HasMember("timestamp_ns")) {
-            const auto &v = rapid_value["timestamp_ns"];
-            if (v.IsInt64()) {
-                timestamp_ns_ = v.GetInt64();
-            } else if (v.IsUint64()) {
-                timestamp_ns_ = static_cast<int64_t>(v.GetUint64());
-            }
-        } else if (rapid_value.HasMember("timestamp_us")) {
-            const auto &v = rapid_value["timestamp_us"];
-            if (v.IsInt64()) {
-                timestamp_ns_ = v.GetInt64() * 1000;
-            } else if (v.IsUint64()) {
-                timestamp_ns_ = static_cast<int64_t>(v.GetUint64()) * 1000;
-            }
+        if (!rapid_value.HasMember("timestamp_ns")) {
+            return false;
         }
-        KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "tokens", tokens_, std::vector<int64_t>{});
-        KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "keys", keys_, std::vector<int64_t>{});
+        const auto &timestamp_value = rapid_value["timestamp_ns"];
+        if (timestamp_value.IsInt64()) {
+            timestamp_ns_ = timestamp_value.GetInt64();
+        } else if (timestamp_value.IsUint64()) {
+            timestamp_ns_ = static_cast<int64_t>(timestamp_value.GetUint64());
+        } else {
+            return false;
+        }
+        if (!ParseOptimizerInt64VectorAllowUint64(rapid_value, "tokens", tokens_)) {
+            return false;
+        }
+        if (!ParseOptimizerInt64VectorAllowUint64(rapid_value, "keys", keys_)) {
+            return false;
+        }
+        input_len_ = -1;
+        if (!rapid_value.HasMember("input_len")) {
+            return false;
+        }
+        const auto &input_len_value = rapid_value["input_len"];
+        if (input_len_value.IsInt64()) {
+            input_len_ = input_len_value.GetInt64();
+        } else if (input_len_value.IsUint64()) {
+            input_len_ = static_cast<int64_t>(input_len_value.GetUint64());
+        } else {
+            return false;
+        }
         return true;
     };
     void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override {
@@ -38,6 +81,9 @@ public:
         Put(writer, "timestamp_ns", timestamp_ns_);
         Put(writer, "tokens", tokens_);
         Put(writer, "keys", keys_);
+        if (input_len_ >= 0) {
+            Put(writer, "input_len", input_len_);
+        }
     };
 
 public:
@@ -46,11 +92,25 @@ public:
     int64_t timestamp_ns() const { return timestamp_ns_; }
     const std::vector<int64_t> &keys() const { return keys_; }
     const std::vector<int64_t> &tokens() const { return tokens_; }
+    int64_t input_len() const { return input_len_; }
+    size_t full_block_count(size_t block_size) const {
+        if (input_len_ >= 0 && block_size > 0) {
+            return static_cast<size_t>(std::min<int64_t>(static_cast<int64_t>(keys_.size()), input_len_ / block_size));
+        }
+        return keys_.size();
+    }
+    size_t input_token_count(size_t block_size) const {
+        if (input_len_ >= 0) {
+            return static_cast<size_t>(std::max<int64_t>(input_len_, 0));
+        }
+        return keys_.size() * block_size;
+    }
     void set_instance_id(const std::string &instance_id) { instance_id_ = instance_id; }
     void set_trace_id(const std::string &trace_id) { trace_id_ = trace_id; }
     void set_timestamp_ns(int64_t timestamp_ns) { timestamp_ns_ = timestamp_ns; }
     void set_keys(const std::vector<int64_t> &keys) { keys_ = keys; }
     void set_tokens(const std::vector<int64_t> &tokens) { tokens_ = tokens; }
+    void set_input_len(int64_t input_len) { input_len_ = input_len; }
 
 private:
     std::string instance_id_;
@@ -58,6 +118,7 @@ private:
     int64_t timestamp_ns_;
     std::vector<int64_t> keys_;
     std::vector<int64_t> tokens_;
+    int64_t input_len_ = -1;
 };
 // GetCacheLocation事件的Trace
 // 只包含读取缓存相关的信息

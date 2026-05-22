@@ -16,11 +16,15 @@ struct BlockEntry;
 
 struct ReadRecord {
     int64_t timestamp_ns;
+    // local = trace block_mask 带入的已有本地命中；remote = optimizer 模拟层命中。
+    // 标准分析口径不按 local/remote 拆分，只用请求级 InputTokens/HitTokens。
     size_t remote_read_blocks;
     size_t remote_hit_blocks;
     size_t local_read_blocks;
     size_t local_hit_blocks;
     size_t current_cache_blocks;
+    size_t input_tokens = 0;
+    size_t block_size_tokens = 0;
     std::vector<size_t> per_tier_hit_blocks; // per-tier hit block num, indexed by tier priority
     std::vector<std::string> tier_names;     // tier names for CSV column headers
     std::vector<size_t> per_tier_blocks;     // per-tier block num for current instance

@@ -38,15 +38,24 @@ protected:
         }
     }
 
-    // 读取 block 在"本策略所属 tier"上的最近访问时间
-    // 驱逐排序 / 尾部比较均基于此，实现各层 LRU 独立（不被跨层 block 级统计污染）
-    // 若 block 未注册到本层，回退到 block 级 last_access_time
+    // 读取 block 在"本策略所属 tier"上的最近访问时间。
+    // 驱逐排序 / 尾部比较均基于此，实现各层 LRU 独立（不被跨层 block 级统计污染）。
+    // shared 模式会创建默认 TierStat；其 tier 时间未初始化时回退到 block 级写入/访问时间。
     int64_t GetTierAccessTime(const BlockEntry *block) const {
         if (block == nullptr) {
             return INT64_MAX;
         }
         auto it = block->location_map.find(name_);
-        return (it != block->location_map.end()) ? it->second.last_access_time : INT64_MAX;
+        if (it == block->location_map.end()) {
+            return INT64_MAX;
+        }
+        if (it->second.last_access_time >= 0) {
+            return it->second.last_access_time;
+        }
+        if (block->last_access_time >= 0) {
+            return block->last_access_time;
+        }
+        return block->writing_time >= 0 ? block->writing_time : INT64_MAX;
     }
 
 private:

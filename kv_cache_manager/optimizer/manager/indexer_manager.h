@@ -25,6 +25,7 @@ public:
 
     std::shared_ptr<RadixTreeIndex> GetOptIndexer(const std::string &instance_id) const;
     std::unordered_map<std::string, std::shared_ptr<RadixTreeIndex>> GetAllOptIndexers() const;
+    size_t GetInstanceBlockSize(const std::string &instance_id) const;
 
     size_t GetOptIndexerSize() const;
 

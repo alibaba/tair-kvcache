@@ -1,6 +1,7 @@
 #include "kv_cache_manager/optimizer/manager/indexer_manager.h"
 
 #include <algorithm>
+#include <unordered_set>
 
 #include "kv_cache_manager/common/logger.h"
 namespace kv_cache_manager {
@@ -50,6 +51,14 @@ std::unordered_map<std::string, std::shared_ptr<RadixTreeIndex>> OptIndexerManag
 }
 
 size_t OptIndexerManager::GetOptIndexerSize() const { return opt_indexer_map_.size(); }
+
+size_t OptIndexerManager::GetInstanceBlockSize(const std::string &instance_id) const {
+    auto it = instance_configs_.find(instance_id);
+    if (it == instance_configs_.end() || it->second.block_size() <= 0) {
+        return 0;
+    }
+    return static_cast<size_t>(it->second.block_size());
+}
 
 void OptIndexerManager::RegisterInstanceGroups(
     const std::unordered_map<std::string, OptInstanceGroupConfig> &instance_groups) {
@@ -117,8 +126,9 @@ void OptIndexerManager::CleanEvictedBlocks(const EvictedBlocks &evicted_blocks,
             continue;
         }
         std::vector<BlockEntry *> truly_evicted;
+        std::unordered_set<BlockEntry *> seen;
         for (auto *block : blocks) {
-            if (block->location_map.empty()) {
+            if (block != nullptr && block->location_map.empty() && seen.insert(block).second) {
                 truly_evicted.push_back(block);
             }
         }

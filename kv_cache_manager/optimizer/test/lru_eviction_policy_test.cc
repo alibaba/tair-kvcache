@@ -5,6 +5,7 @@
 #include "kv_cache_manager/optimizer/config/eviction_config.h"
 #include "kv_cache_manager/optimizer/config/types.h"
 #include "kv_cache_manager/optimizer/eviction_policy/lru.h"
+#include "kv_cache_manager/optimizer/eviction_policy/random_lru.h"
 
 using namespace kv_cache_manager;
 
@@ -22,6 +23,15 @@ protected:
         block.key = key;
         block.last_access_time = last_access_time;
         block.location_map[policy_->name()] = TierStat{0, last_access_time, -1};
+        return block;
+    }
+
+    BlockEntry CreateSharedBlock(int64_t key, int64_t timestamp) {
+        BlockEntry block;
+        block.key = key;
+        block.writing_time = timestamp;
+        block.last_access_time = timestamp;
+        block.location_map["shared"] = TierStat{};
         return block;
     }
 
@@ -86,6 +96,35 @@ TEST_F(LruEvictionPolicyTest, EvictBlocks) {
 
     // 剩余1个块
     EXPECT_EQ(policy_->size(), 1);
+}
+
+TEST_F(LruEvictionPolicyTest, SharedModeUsesBlockAccessTimeWhenTierTimeIsUninitialized) {
+    LruParams params;
+    params.sample_rate = 1.0;
+    params.shard_count = 1;
+    auto policy = std::make_shared<LruEvictionPolicy>("shared", params);
+
+    auto old_block = CreateSharedBlock(1, 1000);
+    auto new_block = CreateSharedBlock(2, 2000);
+
+    policy->OnBlockWritten(&old_block);
+    policy->OnBlockWritten(&new_block);
+
+    auto evicted = policy->EvictBlocks(1);
+    ASSERT_EQ(evicted.size(), 1);
+    EXPECT_EQ(evicted[0]->key, 1);
+}
+
+TEST_F(LruEvictionPolicyTest, RandomLruSharedModeStoresBlockAccessTimeWhenTierTimeIsUninitialized) {
+    RandomLruParams params;
+    params.sample_rate = 1.0;
+    RandomLruEvictionPolicy policy("shared", params, 10);
+
+    auto block = CreateSharedBlock(1, 1234);
+    policy.OnBlockWritten(&block);
+
+    ASSERT_EQ(policy.timestamps_.size(), 1);
+    EXPECT_EQ(policy.timestamps_[0], 1234);
 }
 
 TEST_F(LruEvictionPolicyTest, EvictAllBlocks) {

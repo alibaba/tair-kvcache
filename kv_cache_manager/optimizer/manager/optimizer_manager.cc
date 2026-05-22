@@ -189,6 +189,12 @@ bool OptimizerManager::CreateRadixTreeIndex(const OptInstanceConfig &instance_co
         KVCM_LOG_ERROR("Failed to create optimizer indexer for instance_id: %s", instance_config.instance_id().c_str());
         return false;
     }
+    if (group_it->second.enable_promote()) {
+        auto indexer = indexer_manager_->GetOptIndexer(instance_config.instance_id());
+        if (indexer) {
+            indexer->set_enable_promote(true);
+        }
+    }
     KVCM_LOG_INFO("Created optimizer indexer for instance_id: %s", instance_config.instance_id().c_str());
     return true;
 }

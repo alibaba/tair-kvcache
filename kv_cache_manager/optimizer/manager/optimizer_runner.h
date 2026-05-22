@@ -40,7 +40,9 @@ private:
                           const QueryHit &query_hit,
                           const std::shared_ptr<RadixTreeIndex> &indexer,
                           size_t local_read_block_num,
-                          size_t remote_read_block_num);
+                          size_t remote_read_block_num,
+                          size_t input_tokens,
+                          size_t block_size_tokens);
 
     std::shared_ptr<OptIndexerManager> indexer_manager_;
     std::shared_ptr<OptEvictionManager> eviction_manager_;

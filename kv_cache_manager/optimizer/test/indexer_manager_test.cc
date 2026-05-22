@@ -2,6 +2,8 @@
 #include <vector>
 
 #include "kv_cache_manager/common/unittest.h"
+#include "kv_cache_manager/optimizer/analysis/stats_collector.h"
+#include "kv_cache_manager/optimizer/analysis/stats_tracker.h"
 #include "kv_cache_manager/optimizer/config/eviction_config.h"
 #include "kv_cache_manager/optimizer/config/instance_config.h"
 #include "kv_cache_manager/optimizer/config/instance_group_config.h"
@@ -31,6 +33,20 @@ protected:
     OptInstanceConfig CreateTestInstanceConfig(const std::string &instance_id);
     std::vector<OptTierConfig> CreateTestTierConfigs();
     OptInstanceGroupConfig CreateTestInstanceGroupConfig();
+};
+
+class CountingEvictionTracker : public StatsTracker {
+public:
+    CountingEvictionTracker() : StatsTracker("CountingEvictionTracker") {}
+
+    void OnBlockEviction(const std::string &instance_id, BlockEntry *block, int64_t timestamp) override {
+        (void)instance_id;
+        (void)block;
+        (void)timestamp;
+        eviction_count++;
+    }
+
+    size_t eviction_count = 0;
 };
 
 OptInstanceConfig OptIndexerManagerTest::CreateTestInstanceConfig(const std::string &instance_id) {
@@ -246,6 +262,29 @@ TEST_F(OptIndexerManagerTest, CheckAndEvictNonExistentInstance) {
 
     // 不应该崩溃
     SUCCEED();
+}
+
+TEST_F(OptIndexerManagerTest, CleanEvictedBlocksDeduplicatesEmptyBlocks) {
+    auto instance_config = CreateTestInstanceConfig("instance1");
+    auto tier_configs = CreateTestTierConfigs();
+
+    ASSERT_TRUE(indexer_manager_->CreateOptIndexer(instance_config, tier_configs, false));
+    auto indexer = indexer_manager_->GetOptIndexer("instance1");
+    ASSERT_NE(indexer, nullptr);
+
+    auto collector = std::make_shared<StatsCollector>();
+    auto *tracker = collector->EmplaceTracker<CountingEvictionTracker>();
+    indexer->SetStatsCollector(collector);
+
+    indexer->InsertOnly({1}, 1000);
+    auto *block = indexer->root_->children.at(1)->blocks[0].get();
+    block->location_map.clear();
+
+    OptIndexerManager::EvictedBlocks evicted_blocks;
+    evicted_blocks["instance1"] = {block, block};
+    indexer_manager_->CleanEvictedBlocks(evicted_blocks, 2000);
+
+    EXPECT_EQ(tracker->eviction_count, 1);
 }
 
 TEST_F(OptIndexerManagerTest, GetCurrentInstanceUsageNonExistent) {

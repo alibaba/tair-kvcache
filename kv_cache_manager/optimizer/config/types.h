@@ -23,8 +23,10 @@ enum class EvictionMode {
 // Tier 写入模式：仅在 hierarchical_eviction_enabled=true 时生效。
 // 控制 block 在多 tier 间的流动方式，与分层开关正交。
 enum class TierWriteMode {
-    WRITE_THROUGH = 0, // 默认：写入时落所有 tier，各层独立驱逐
-    CASCADING = 1,     // 只写 tier 0，tier_i 驱逐出的 block 级联降级到 tier_{i+1}
+    WRITE_THROUGH = 0,                   // 默认：写入时落所有 tier，各层独立驱逐
+    CASCADING = 1,                       // 只写 tier 0，tier_i 驱逐出的 block 级联降级到 tier_{i+1}
+    WRITE_THROUGH_SELECTIVE = 2,         // 初始只写 tier 0，命中热度达到阈值后复制到下一层
+    CASCADING_NO_ACCESS_PROPAGATION = 3, // CASCADING 写入/驱逐语义，但读命中不刷新更低 tier 访问时间
 };
 struct TierStat {
     size_t access_count = 0;

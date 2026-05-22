@@ -1,5 +1,6 @@
 #pragma once
 #include <functional>
+#include <limits>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -40,7 +41,8 @@ public:
                      const BlockMask &block_mask,
                      const int64_t timestamp,
                      QueryHit *query_hit = nullptr,
-                     bool refresh_ttl_on_read = true);
+                     bool refresh_ttl_on_read = true,
+                     size_t hit_countable_blocks = std::numeric_limits<size_t>::max());
 
     void CleanEmptyBlocks(const std::vector<BlockEntry *> &blocks,
                           int64_t eviction_timestamp,
@@ -73,19 +75,32 @@ public:
     RadixTreeExport ExportForVisualization() const;
 
     const RadixTreeNode *GetRoot() const { return root_.get(); }
+    void set_enable_promote(bool enable) { enable_promote_ = enable; }
+    bool ConsumeReadTriggeredTierWrite() {
+        bool triggered = read_triggered_tier_write_;
+        read_triggered_tier_write_ = false;
+        return triggered;
+    }
 
 private:
     std::unique_ptr<RadixTreeNode> root_;
     std::vector<std::shared_ptr<EvictionPolicy>> tier_policies_; // 按 tier priority 排序
     std::vector<std::string> tier_names_;                        // 缓存 policy name
-    // 写入模式：WRITE_THROUGH = 所有 tier 都写，CASCADING = 仅写 tier 0，超出的通过 EvictionManager 级联降级
+    // 写入模式：
+    // WRITE_THROUGH = 所有 tier 都写
+    // CASCADING = 仅写 tier 0，超出的通过 EvictionManager 级联降级
+    // CASCADING_NO_ACCESS_PROPAGATION = CASCADING，但上层命中不刷新更低 tier 访问时间
+    // WRITE_THROUGH_SELECTIVE = 仅写 tier 0，命中热度达到阈值后复制到下一层
     TierWriteMode write_mode_ = TierWriteMode::WRITE_THROUGH;
     // 写入流量应落地的 tier 数，构造时结合 write_mode_ 与 tier 数一次性确定
-    // WRITE_THROUGH=全部层，CASCADING=仅 tier 0（单层退化为全部）
+    // WRITE_THROUGH=全部层，CASCADING/CASCADING_NO_ACCESS_PROPAGATION/WRITE_THROUGH_SELECTIVE=仅 tier
+    // 0（单层退化为全部）
     size_t write_tier_count_ = 0;
     std::string instance_id_;
     int64_t default_ttl_ns_ = 0;
     std::shared_ptr<StatsCollector> stats_collector_;
+    bool enable_promote_ = false;
+    bool read_triggered_tier_write_ = false;
 
 private:
     std::vector<BlockEntry *>
@@ -109,6 +124,8 @@ private:
     bool IsBlockEvict(BlockEntry *block, int64_t timestamp) const;
 
     // per-tier 命中检测辅助方法
-    void RecordTieredHit(BlockEntry *block, bool is_remote, QueryHit *query_hit) const;
+    void RecordTieredHit(BlockEntry *block, bool is_remote, QueryHit *query_hit, bool count_for_hit_rate) const;
+    void PromoteToHigherTiers(BlockEntry *block, int64_t timestamp);
+    void SelectiveWriteToNextTier(BlockEntry *block, size_t hit_tier_idx, int64_t timestamp);
 };
 } // namespace kv_cache_manager

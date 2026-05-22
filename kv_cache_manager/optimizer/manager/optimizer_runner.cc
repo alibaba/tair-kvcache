@@ -69,7 +69,9 @@ void OptimizerRunner::SubmitReadRecord(const std::string &instance_id,
                                        const QueryHit &query_hit,
                                        const std::shared_ptr<RadixTreeIndex> &indexer,
                                        size_t local_read_block_num,
-                                       size_t remote_read_block_num) {
+                                       size_t remote_read_block_num,
+                                       size_t input_tokens,
+                                       size_t block_size_tokens) {
     ReadRecord record{};
     record.timestamp_ns = timestamp_ns;
     record.trace_id = trace_id;
@@ -87,6 +89,8 @@ void OptimizerRunner::SubmitReadRecord(const std::string &instance_id,
     record.remote_hit_blocks = query_hit.remote_hit_block_num;
     record.local_hit_blocks = query_hit.local_hit_block_num;
     record.per_tier_hit_blocks = query_hit.per_tier_hit_block_num;
+    record.input_tokens = input_tokens;
+    record.block_size_tokens = block_size_tokens;
     record.tier_names = indexer->GetTierNames();
     record.per_tier_blocks = eviction_manager_->GetCurrentInstanceUsagePerTier(instance_id);
     record.local_read_blocks = local_read_block_num;
@@ -113,16 +117,28 @@ void OptimizerRunner::HandleGetLocation(const GetLocationSchemaTrace &trace) {
     }
 
     QueryHit query_hit;
-    indexer->PrefixQuery(trace.keys(), trace.block_mask(), trace.timestamp_ns(), &query_hit, refresh_ttl_on_read);
+    const size_t block_size = indexer_manager_->GetInstanceBlockSize(instance_id);
+    indexer->PrefixQuery(trace.keys(),
+                         trace.block_mask(),
+                         trace.timestamp_ns(),
+                         &query_hit,
+                         refresh_ttl_on_read,
+                         trace.full_block_count(block_size));
+    if (indexer->ConsumeReadTriggeredTierWrite()) {
+        auto capacity_evicted_blocks = indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_ns());
+        indexer_manager_->CleanEvictedBlocks(capacity_evicted_blocks, trace.timestamp_ns());
+    }
 
     size_t local_read_block_num = 0;
     if (std::holds_alternative<BlockMaskVector>(trace.block_mask())) {
         const auto &mask_vector = std::get<BlockMaskVector>(trace.block_mask());
-        local_read_block_num = std::count(mask_vector.begin(), mask_vector.end(), true);
+        const size_t n = std::min(mask_vector.size(), trace.keys().size());
+        local_read_block_num = std::count(mask_vector.begin(), mask_vector.begin() + n, true);
     } else if (std::holds_alternative<BlockMaskOffset>(trace.block_mask())) {
-        local_read_block_num = std::get<BlockMaskOffset>(trace.block_mask());
+        local_read_block_num = std::min(std::get<BlockMaskOffset>(trace.block_mask()), trace.keys().size());
     }
     size_t remote_read_block_num = trace.keys().size() - local_read_block_num;
+    const size_t input_tokens = trace.input_token_count(block_size);
 
     SubmitReadRecord(instance_id,
                      trace.trace_id(),
@@ -131,7 +147,9 @@ void OptimizerRunner::HandleGetLocation(const GetLocationSchemaTrace &trace) {
                      query_hit,
                      indexer,
                      local_read_block_num,
-                     remote_read_block_num);
+                     remote_read_block_num,
+                     input_tokens,
+                     block_size);
 }
 
 void OptimizerRunner::HandleWriteCache(const WriteCacheSchemaTrace &trace) {

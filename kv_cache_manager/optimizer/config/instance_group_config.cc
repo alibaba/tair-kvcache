@@ -19,6 +19,7 @@ bool OptInstanceGroupConfig::FromRapidValue(const rapidjson::Value &rapid_value)
     std::string tier_write_mode_str;
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "tier_write_mode", tier_write_mode_str, std::string("write_through"));
     tier_write_mode_ = ToTierWriteMode(tier_write_mode_str);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "enable_promote", enable_promote_, true);
     return true;
 };
 
@@ -30,6 +31,7 @@ void OptInstanceGroupConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBu
     Put(writer, "used_percentage", used_percentage_);
     Put(writer, "hierarchical_eviction_enabled", hierarchical_eviction_enabled_);
     Put(writer, "tier_write_mode", ToString(tier_write_mode_));
+    Put(writer, "enable_promote", enable_promote_);
     Put(writer, "default_block_ttl_seconds", default_block_ttl_seconds_);
     Put(writer, "ttl_refresh_on_read", ttl_refresh_on_read_);
     Put(writer, "storages", storages_);

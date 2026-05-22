@@ -3,6 +3,7 @@
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <stdexcept>
 
 #include "kv_cache_manager/common/jsonizable.h"
 #include "kv_cache_manager/common/logger.h"
@@ -16,11 +17,16 @@ StandardTraceLoader::LoadFromFile(const std::string &trace_file_path) {
 
     if (!file.is_open()) {
         KVCM_LOG_ERROR("Failed to open trace file: %s", trace_file_path.c_str());
-        return traces;
+        throw std::runtime_error("Failed to open trace file: " + trace_file_path);
     }
 
     std::string line;
     int64_t line_number = 0;
+    auto fail = [&](const std::string &message) {
+        std::string full_message = trace_file_path + ":" + std::to_string(line_number) + ": " + message;
+        KVCM_LOG_ERROR("%s", full_message.c_str());
+        throw std::runtime_error(full_message);
+    };
     while (std::getline(file, line)) {
         line_number++;
 
@@ -33,65 +39,65 @@ StandardTraceLoader::LoadFromFile(const std::string &trace_file_path) {
         rapidjson::Document doc;
         if (doc.Parse(line.c_str()).HasParseError() || !doc.IsObject()) {
             std::string line_preview = line.length() > 100 ? line.substr(0, 100) + "..." : line;
-            KVCM_LOG_WARN("Failed to parse JSON at line %ld in file %s: %s",
-                          line_number,
-                          trace_file_path.c_str(),
-                          line_preview.c_str());
-            continue;
+            fail("failed to parse JSON: " + line_preview);
         }
 
-        // 根据type字段或字段推断来识别trace类型
         bool has_type_field = doc.HasMember("type") && doc["type"].IsString();
         std::string type_str = has_type_field ? doc["type"].GetString() : "";
-
         std::shared_ptr<OptimizerSchemaTrace> trace = nullptr;
 
-        // 优先使用type字段
-        if (has_type_field) {
-            if (type_str == "get") {
-                auto get_trace = std::make_shared<GetLocationSchemaTrace>();
-                if (get_trace->FromJsonString(line)) {
-                    trace = get_trace;
-                }
-            } else if (type_str == "write") {
-                auto write_trace = std::make_shared<WriteCacheSchemaTrace>();
-                if (write_trace->FromJsonString(line)) {
-                    trace = write_trace;
-                }
-            } else {
-                KVCM_LOG_WARN("Unknown trace type '%s' at line %ld", type_str.c_str(), line_number);
+        if (!has_type_field) {
+            const bool looks_like_legacy_dialog =
+                (doc.HasMember("query_type") || doc.HasMember("block_mask")) &&
+                (doc.HasMember("total_keys") || doc.HasMember("output_len") || doc.HasMember("output_length"));
+            if (looks_like_legacy_dialog) {
+                fail("legacy dialog-style trace without type is not supported; convert it to optimizer schema with "
+                     "explicit get/write rows");
             }
+            fail("missing string field: type");
+        }
+        if (!doc.HasMember("instance_id") || !doc["instance_id"].IsString() ||
+            std::string(doc["instance_id"].GetString()).empty()) {
+            fail("missing non-empty string field: instance_id");
+        }
+        if (!doc.HasMember("timestamp_ns") || !(doc["timestamp_ns"].IsInt64() || doc["timestamp_ns"].IsUint64())) {
+            fail("missing integer field: timestamp_ns");
+        }
+        if (!doc.HasMember("input_len") || !(doc["input_len"].IsInt64() || doc["input_len"].IsUint64())) {
+            fail("missing integer field: input_len");
+        }
+        if (!doc.HasMember("keys") || !doc["keys"].IsArray() || doc["keys"].Empty()) {
+            fail("missing non-empty array field: keys");
+        }
+        if (type_str == "get") {
+            auto get_trace = std::make_shared<GetLocationSchemaTrace>();
+            if (!get_trace->FromJsonString(line)) {
+                fail("failed to parse get trace");
+            }
+            trace = get_trace;
+        } else if (type_str == "write") {
+            auto write_trace = std::make_shared<WriteCacheSchemaTrace>();
+            if (!write_trace->FromJsonString(line)) {
+                fail("failed to parse write trace");
+            }
+            trace = write_trace;
         } else {
-            // Fallback: 使用字段推断
-            bool has_query_type = doc.HasMember("query_type");
-            bool has_block_mask = doc.HasMember("block_mask");
-
-            // GetLocationSchemaTrace: 有 query_type 和 block_mask
-            if (has_query_type && has_block_mask) {
-                auto get_trace = std::make_shared<GetLocationSchemaTrace>();
-                if (get_trace->FromJsonString(line)) {
-                    trace = get_trace;
-                }
-            }
-            // WriteCacheSchemaTrace: 只有基础字段
-            else {
-                auto write_trace = std::make_shared<WriteCacheSchemaTrace>();
-                if (write_trace->FromJsonString(line)) {
-                    trace = write_trace;
-                }
-            }
+            fail("unknown trace type: " + type_str);
         }
 
-        // 验证并添加trace
         if (trace && ValidateTrace(*trace)) {
             traces.push_back(trace);
         } else {
             std::string line_preview = line.length() > 100 ? line.substr(0, 100) + "..." : line;
-            KVCM_LOG_WARN("Failed to parse or validate trace at line %ld: %s", line_number, line_preview.c_str());
+            fail("failed to validate trace: " + line_preview);
         }
     }
 
     file.close();
+    if (traces.empty()) {
+        KVCM_LOG_ERROR("No optimizer traces loaded from file: %s", trace_file_path.c_str());
+        throw std::runtime_error("No optimizer traces loaded from file: " + trace_file_path);
+    }
     KVCM_LOG_INFO("Loaded %zu traces from file: %s", traces.size(), trace_file_path.c_str());
     return traces;
 }
@@ -104,6 +110,10 @@ bool StandardTraceLoader::ValidateTrace(const OptimizerSchemaTrace &trace) {
     }
     if (trace.timestamp_ns() <= 0) {
         KVCM_LOG_ERROR("Validation failed: invalid timestamp_ns");
+        return false;
+    }
+    if (trace.input_len() <= 0) {
+        KVCM_LOG_ERROR("Validation failed: invalid input_len");
         return false;
     }
     if (trace.keys().empty()) {
