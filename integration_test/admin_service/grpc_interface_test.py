@@ -12,6 +12,7 @@ from kv_cache_manager.protocol.protobuf.admin_service_pb2 import (
     UpdateInstanceGroupRequest,
     RemoveInstanceGroupRequest,
     GetInstanceGroupRequest,
+    ListInstanceGroupRequest,
     GetCacheMetaRequest,
     RemoveCacheRequest,
     RegisterInstanceRequest,
@@ -145,6 +146,17 @@ class AdminServiceGrpcClient(cases.AdminServiceClientBase):
             if not header or header['status']['code'] != "OK":
                 msg = header['status']['message'] if header else "no header"
                 raise AssertionError(f"get_instance_group failed: {msg}")
+        return response_dict
+
+    def list_instance_group(self, data, check_response=True):
+        request = self._convert_dict_to_proto(ListInstanceGroupRequest, data)
+        response = self._stub.ListInstanceGroup(request, timeout=self._timeout)
+        response_dict = self._convert_proto_to_dict(response)
+        if check_response:
+            header = response_dict.get('header')
+            if not header or header['status']['code'] != "OK":
+                msg = header['status']['message'] if header else "no header"
+                raise AssertionError(f"list_instance_group failed: {msg}")
         return response_dict
 
     def get_cache_meta(self, data, check_response=True):

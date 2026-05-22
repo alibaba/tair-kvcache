@@ -132,10 +132,13 @@ message MooncakeStorageSpec {
 }
 
 message TairMemPoolStorageSpec {
-    string domain = 1; // tair mempool的 meta service挂载的域名
+    string domain = 1; // tair mempool 的 meta service 挂载的域名（service_discovery_url 为空时直接用此 domain）
     int32 timeout = 2; // 单位超时时间
-    bool enable_vipserver = 3;
-    string vipserver_domain = 4;
+    reserved 3, 4; // 历史字段：enable_vipserver / vipserver_domain
+    reserved "enable_vipserver", "vipserver_domain";
+    // 服务发现 URL，统一抽象不同发现机制；空字符串表示不使用服务发现。
+    // 与 admin_service.proto 中 TairMemPoolStorageSpec.service_discovery_url 字段含义一致。
+    string service_discovery_url = 5;
 }
 
 message NfsStorageSpec {

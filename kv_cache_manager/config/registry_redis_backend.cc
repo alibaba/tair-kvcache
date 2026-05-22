@@ -20,6 +20,11 @@ ErrorCode RegistryRedisBackend::Init(const StandardUri &standard_uri) noexcept {
         return EC_CONFIG_ERROR;
     }
     config_key_prefix_ = "kvcache_registry:" + cluster_name + ":";
+
+    int64_t db_index = 0;
+    standard_uri.GetParamAs("db", db_index);
+    KVCM_LOG_INFO(
+        "registry redis backend init successfully, cluster[%s], redis db[%ld]", cluster_name.c_str(), db_index);
     return EC_OK;
 }
 

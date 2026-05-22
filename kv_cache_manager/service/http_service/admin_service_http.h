@@ -55,6 +55,9 @@ public:
     void GetInstanceGroup(coro_http::coro_http_connection *http_conn,
                           proto::admin::GetInstanceGroupRequest *request,
                           proto::admin::GetInstanceGroupResponse *response);
+    void ListInstanceGroup(coro_http::coro_http_connection *http_conn,
+                           proto::admin::ListInstanceGroupRequest *request,
+                           proto::admin::ListInstanceGroupResponse *response);
 
     void GetCacheMeta(coro_http::coro_http_connection *http_conn,
                       proto::admin::GetCacheMetaRequest *request,
@@ -136,6 +139,7 @@ private:
     KVCM_DECLARE_METRICS_COLLECTOR_(UpdateInstanceGroup);
     KVCM_DECLARE_METRICS_COLLECTOR_(RemoveInstanceGroup);
     KVCM_DECLARE_METRICS_COLLECTOR_(GetInstanceGroup);
+    KVCM_DECLARE_METRICS_COLLECTOR_(ListInstanceGroup);
 
     // for cache APIs
     KVCM_DECLARE_METRICS_COLLECTOR_(GetCacheMeta);

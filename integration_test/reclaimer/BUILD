@@ -27,3 +27,17 @@ py_test(
         "//integration_test/meta_service:http_interface_test",
     ],
 )
+
+py_test(
+    name = "multi_location_test",
+    srcs = ["multi_location_test.py"],
+    tags = ["no-remote-exec"],
+    data = [
+        "//kv_cache_manager:kv_cache_manager_bin",
+    ],
+    deps = [
+        "//integration_test/testlib:test_base",
+        "//integration_test/admin_service:http_interface_test",
+        "//integration_test/meta_service:http_interface_test",
+    ],
+)

@@ -133,6 +133,7 @@ CacheManager::CacheManager(std::shared_ptr<MetricsRegistry> metrics_registry,
           meta_indexer_manager_, write_location_manager_, registry_manager_)) {}
 
 CacheManager::~CacheManager() {
+    StopRecoverRetryLoop();
     if (write_location_manager_) {
         write_location_manager_->Stop();
         write_location_manager_.reset();
@@ -294,16 +295,15 @@ std::pair<ErrorCode, CacheMetaVecWrapper> CacheManager::GetCacheMeta(RequestCont
     std::map<std::string, std::string> meta;
     for (CacheLocationMap &location_map : location_maps) {
         auto iter = location_map.begin();
-        if (iter != location_map.end()) {
-            auto nh = location_map.extract(iter);
-            cache_locations.push_back(std::move(nh.mapped()));
-            meta["id"] = cache_locations.back().id();
+        if (iter != location_map.end() && iter->second) {
+            cache_locations.push_back(iter->second);
+            meta["id"] = cache_locations.back()->id();
         } else {
-            CacheLocation cache_location;
-            cache_location.set_status(CacheLocationStatus::CLS_NOT_FOUND);
-            cache_locations.push_back(std::move(cache_location));
+            auto not_found_loc = std::make_shared<CacheLocation>();
+            not_found_loc->set_status(CacheLocationStatus::CLS_NOT_FOUND);
+            cache_locations.push_back(std::move(not_found_loc));
         }
-        meta["status"] = CacheLocation::CacheLocationStatusToString(cache_locations.back().status());
+        meta["status"] = CacheLocation::CacheLocationStatusToString(cache_locations.back()->status());
         metas.push_back(Jsonizable::ToJsonString(meta));
     }
 
@@ -418,9 +418,12 @@ std::pair<ErrorCode, int64_t> CacheManager::GetCacheLocationLen(RequestContext *
     switch (query_type) {
     case QueryType::QT_BATCH_GET:
     case QueryType::QT_REVERSE_ROLL_SW_MATCH: {
-        for (const auto &location : cache_locations) {
+        for (const auto &loc_ptr : cache_locations) {
+            if (!loc_ptr) {
+                continue;
+            }
             bool has_valid_uri = false;
-            for (const auto &spec : location.location_specs()) {
+            for (const auto &spec : loc_ptr->location_specs()) {
                 if (!spec.uri().empty()) {
                     has_valid_uri = true;
                     break;
@@ -530,6 +533,7 @@ CacheManager::StartWriteCache(RequestContext *request_context,
                                      new_location_spec_group_names,
                                      block_mask);
     }
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, ManagerFilterWriteCache);
     RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, filter_ec, StartWriteCacheInfo, "filter write cache failed");
 
     std::vector<std::string> location_ids;
@@ -538,7 +542,6 @@ CacheManager::StartWriteCache(RequestContext *request_context,
         // if no new keys, delete this write_session_id as soon as possible
         write_timeout_seconds = 10; // seconds
     } else {
-        KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, ManagerFilterWriteCache);
         RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, StartWriteCacheInfo, "start write cache failed");
         KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, GenWriteLocation);
         ec = GenWriteLocation(request_context, instance_id, new_keys, new_location_spec_group_names, new_locations);
@@ -707,7 +710,7 @@ ErrorCode CacheManager::TrimCache(RequestContext *request_context,
         CacheMetaDelRequest request;
         request.instance_id = instance_id;
 
-        if (const auto ec = meta_indexer->Scan(cursor, limit, next_cursor, request.block_keys);
+        if (const ErrorCode ec = meta_indexer->Scan(request_context, cursor, limit, next_cursor, request.block_keys);
             ec != ErrorCode::EC_OK) {
             // TODO (rui): cache reclaimer should reclaim the dangling blocks
             RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "trim cache failed");
@@ -729,15 +732,21 @@ void CacheManager::FilterLocationSpecByName(CacheLocationVector &locations,
     }
 
     const std::unordered_set<std::string> names_set(location_spec_names.begin(), location_spec_names.end());
-    for (auto &location : locations) {
+    for (auto &loc_ptr : locations) {
+        if (!loc_ptr) {
+            continue;
+        }
         std::vector<LocationSpec> new_specs;
-        for (auto &spec : location.location_specs()) {
+        for (const auto &spec : loc_ptr->location_specs()) {
             if (names_set.count(spec.name()) == 0) {
                 continue;
             }
             new_specs.push_back(spec);
         }
-        location.set_location_specs(std::move(new_specs));
+        // COW: copy, modify, replace
+        auto new_loc = std::make_shared<CacheLocation>(*loc_ptr);
+        new_loc->set_location_specs(std::move(new_specs));
+        loc_ptr = std::move(new_loc);
     }
 }
 
@@ -1088,15 +1097,15 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
     }
 
     for (const auto &uris : key_to_uris) {
-        CacheLocation cache_location;
-        cache_location.set_type(select_result.type);
+        auto cache_location = std::make_shared<CacheLocation>();
+        cache_location->set_type(select_result.type);
         for (const auto &[data_storage_uri_idx, location_spec_info] : uris) {
             LocationSpec location_spec;
             location_spec.set_name(location_spec_info->name());
             location_spec.set_uri(allocated_uris[data_storage_uri_idx].ToUriString());
-            cache_location.push_location_spec(std::move(location_spec));
+            cache_location->push_location_spec(std::move(location_spec));
         }
-        cache_location.set_spec_size(uris.size());
+        cache_location->set_spec_size(uris.size());
         new_locations.push_back(std::move(cache_location));
     }
     return EC_OK;
@@ -1225,37 +1234,42 @@ ErrorCode CacheManager::GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
             request_context->error_tracer()->AddErrorMsg("instance not found");
             RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_INSTANCE_NOT_EXIST, "instance not found");
         }
-        for (auto &location : cache_locations) {
-            if (location.spec_size() == 0) {
-                location.set_spec_size(instance_info->location_spec_infos().size());
+        for (auto &loc_ptr : cache_locations) {
+            if (!loc_ptr || loc_ptr->spec_size() == 0) {
+                // COW: create or copy, then modify
+                auto new_loc = loc_ptr ? std::make_shared<CacheLocation>(*loc_ptr) : std::make_shared<CacheLocation>();
+                new_loc->set_spec_size(instance_info->location_spec_infos().size());
                 for (auto &spec_info : instance_info->location_spec_infos()) {
-                    location.push_location_spec(LocationSpec(spec_info.name(), ""));
+                    new_loc->push_location_spec(LocationSpec(spec_info.name(), ""));
                 }
+                loc_ptr = std::move(new_loc);
             }
         }
     }
     return ec;
 }
 
-ErrorCode CacheManager::DoRecover() {
+ErrorCode CacheManager::DoRecoverOnce() {
     if (!registry_manager_) {
         KVCM_LOG_ERROR("CacheManager do recover failed, registry_manager is nullptr");
         return EC_ERROR;
     }
+    size_t error_count = 0;
     auto request_context = std::make_shared<RequestContext>("cache_manager_recover_trace");
     auto [ec1, instance_groups] = registry_manager_->ListInstanceGroup(request_context.get());
     if (ec1 != EC_OK) {
-        KVCM_LOG_ERROR("CacheManager ListInstanceGroup failed when recover, ec[%d]", ec1);
-        return ec1;
+        KVCM_LOG_WARN("CacheManager ListInstanceGroup failed when recover, ec[%d], will retry later", ec1);
+        return EC_ERROR;
     }
     for (const auto &instance_group : instance_groups) {
         std::string group_name = instance_group->name();
         auto [ec2, instance_infos] = registry_manager_->ListInstanceInfo(request_context.get(), group_name);
         if (ec2 != EC_OK) {
-            KVCM_LOG_ERROR("CacheManager ListInstanceInfo failed when recover, ec[%d] instance_group name[%s]",
-                           ec2,
-                           group_name.c_str());
-            return ec2;
+            KVCM_LOG_WARN("CacheManager ListInstanceInfo failed when recover, skip. ec[%d] instance_group name[%s]",
+                          ec2,
+                          group_name.c_str());
+            ++error_count;
+            continue;
         }
         for (const auto &instance_info : instance_infos) {
             auto [ec3, config_str] = RegisterInstance(request_context.get(),
@@ -1265,28 +1279,86 @@ ErrorCode CacheManager::DoRecover() {
                                                       instance_info->location_spec_infos(),
                                                       instance_info->model_deployment(),
                                                       instance_info->location_spec_groups());
-            if (ec3 != EC_OK) {
-                KVCM_LOG_ERROR("CacheManager RegisterInstance failed when recover, ec[%d] instance_group "
-                               "name[%s] instance_id[%s]",
-                               ec3,
-                               group_name.c_str(),
-                               instance_info->instance_id().c_str());
-                return ec3;
+            if (ec3 != EC_OK && ec3 != EC_DUPLICATE_ENTITY) {
+                KVCM_LOG_WARN("CacheManager RegisterInstance failed when recover, skip. ec[%d] instance_group "
+                              "name[%s] instance_id[%s]",
+                              ec3,
+                              group_name.c_str(),
+                              instance_info->instance_id().c_str());
+                ++error_count;
+                continue;
             }
             KVCM_LOG_INFO("CacheManager RegisterInstance success when recover, instance_id[%s], storage_config[%s]",
                           instance_info->instance_id().c_str(),
                           config_str.c_str());
         }
     }
+
+    // CacheManager recover is only complete when RegistryManager recover is also complete
+    if (!registry_manager_->IsRecoverComplete()) {
+        KVCM_LOG_WARN("CacheManager recover waiting for RegistryManager recover to complete");
+        ++error_count;
+    }
+
+    KVCM_LOG_INFO("CacheManager do recover once done, error_count[%lu]", error_count);
+    return error_count > 0 ? EC_ERROR : EC_OK;
+}
+
+ErrorCode CacheManager::DoRecover() {
+    auto ec = DoRecoverOnce();
+    if (ec == EC_OK) {
+        return EC_OK;
+    }
+    KVCM_LOG_WARN("CacheManager DoRecover partially failed, starting retry loop in background");
+    StartRecoverRetryLoop();
     return EC_OK;
 }
+
+void CacheManager::StartRecoverRetryLoop() {
+    StopRecoverRetryLoop();
+    recover_retry_stop_.store(false);
+    recover_retry_thread_ = std::thread([this]() {
+        while (!recover_retry_stop_.load()) {
+            for (int i = 0; i < 100 && !recover_retry_stop_.load(); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            if (recover_retry_stop_.load()) {
+                break;
+            }
+            KVCM_LOG_INFO("CacheManager recover retry loop executing...");
+            auto ec = DoRecoverOnce();
+            if (ec == EC_OK) {
+                KVCM_LOG_INFO("CacheManager recover retry loop completed successfully, stopping retry");
+                break;
+            }
+        }
+    });
+}
+
+void CacheManager::StopRecoverRetryLoop() {
+    recover_retry_stop_.store(true);
+    if (recover_retry_thread_.joinable()) {
+        recover_retry_thread_.join();
+    }
+}
 ErrorCode CacheManager::DoCleanup() {
+    StopRecoverRetryLoop();
     // aborting write session need meta indexer
-    write_location_manager_->DoCleanup();
-    meta_searcher_manager_->DoCleanup();
-    meta_indexer_manager_->DoCleanup();
-    metrics_recorder_->DoCleanup();
-    data_storage_selector_->DoCleanup();
+    if (write_location_manager_) {
+        write_location_manager_->DoCleanup();
+    }
+    if (meta_searcher_manager_) {
+        meta_searcher_manager_->DoCleanup();
+    }
+    if (meta_indexer_manager_) {
+        meta_indexer_manager_->DoCleanup();
+    }
+    if (metrics_recorder_) {
+        metrics_recorder_->DoCleanup();
+    }
+    if (data_storage_selector_) {
+        data_storage_selector_->DoCleanup();
+    }
 
     return EC_OK;
 }

@@ -1,9 +1,11 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <shared_mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -29,8 +31,13 @@ class Jsonizable;
 class RegistryManager {
 public:
     RegistryManager(const std::string &registry_uri, std::shared_ptr<MetricsRegistry> metrics_registry);
+    ~RegistryManager();
     bool Init();
     ErrorCode DoRecover();
+    ErrorCode DoRecoverOnce();
+    void StartRecoverRetryLoop();
+    void StopRecoverRetryLoop();
+    bool IsRecoverComplete() const;
     ErrorCode DoCleanup();
 
 public:
@@ -82,6 +89,11 @@ private:
     ErrorCode LoadAndSave(const std::string &key, const std::string &id, const Jsonizable *jsonizable);
     ErrorCode LoadAndDelete(const std::string &key, const std::string &id);
     ErrorCode UpdateStorageAvailableStatus(const std::string &global_unique_name, bool is_available);
+    // return error count (0 means success)
+    size_t RecoverStorageUnsafe();
+    size_t RecoverAccountUnsafe();
+    size_t RecoverInstanceGroupUnsafe();
+    size_t RecoverInstanceInfoUnsafe();
 
 private:
     /***
@@ -108,6 +120,11 @@ private:
     std::unique_ptr<RegistryStorageBackend> storage_;
     // 无需清理 - 不包含数据
     mutable std::shared_mutex mutex_;
+
+    // 需要清理 - recover 重试线程相关，在DoCleanup()中StopRecoverRetryLoop()
+    std::thread recover_retry_thread_;
+    std::atomic<bool> recover_retry_stop_{false};
+    std::atomic<bool> recover_complete_{false};
 };
 
 } // namespace kv_cache_manager

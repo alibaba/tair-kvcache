@@ -252,16 +252,17 @@ TEST_F(MetaRedisBackendTest, TestSimple) {
     ASSERT_EQ(EC_OK, meta_redis_backend_->Init("instance_0", meta_storage_backend_config_));
     ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
-              meta_redis_backend_->Put({1, 2}, {{{"f1", "v1-1"}}, {{"f1", "v2-1"}}}));
+              PutWithFieldMaps(meta_redis_backend_.get(), {1, 2}, {{{"f1", "v1-1"}}, {{"f1", "v2-1"}}}));
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_NOENT}),
-              meta_redis_backend_->UpdateFields({1, 2, 3}, {{{"f2", "v1-2"}}, {{"f2", "v2-2"}}, {{"f3", "v3-2"}}}));
+              UpdateWithFieldMaps(
+                  meta_redis_backend_.get(), {1, 2, 3}, {{{"f2", "v1-2"}}, {{"f2", "v2-2"}}, {{"f3", "v3-2"}}}));
 
     AssertExists(meta_redis_backend_.get(), {1, 2, 4}, {EC_OK, EC_OK, EC_OK}, /*is_exist*/ {true, true, false});
-    AssertGet(meta_redis_backend_.get(),
-              {1, 2},
-              {"f1", "f2"},
-              {EC_OK, EC_OK},
-              {{{"f1", "v1-1"}, {"f2", "v1-2"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}});
+    AssertGetProperties(meta_redis_backend_.get(),
+                        {1, 2},
+                        {"f1", "f2"},
+                        {EC_OK, EC_OK},
+                        {{{"f1", "v1-1"}, {"f2", "v1-2"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}});
     AssertGetAllFields(meta_redis_backend_.get(),
                        {1, 2},
                        {EC_OK, EC_OK},
@@ -272,12 +273,12 @@ TEST_F(MetaRedisBackendTest, TestSimple) {
 
     // test upsert
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
-              meta_redis_backend_->Upsert({2, 3}, {{{"f1", "v2-1-2"}}, {{"f1", "v3-1"}}}));
-    AssertGet(meta_redis_backend_.get(),
-              {2, 3},
-              {"f1", "f2"},
-              {EC_OK, EC_OK},
-              {{{"f1", "v2-1-2"}, {"f2", "v2-2"}}, {{"f1", "v3-1"}}});
+              UpsertWithFieldMaps(meta_redis_backend_.get(), {2, 3}, {{{"f1", "v2-1-2"}}, {{"f1", "v3-1"}}}));
+    AssertGetProperties(meta_redis_backend_.get(),
+                        {2, 3},
+                        {"f1", "f2"},
+                        {EC_OK, EC_OK},
+                        {{{"f1", "v2-1-2"}, {"f2", "v2-2"}}, {{"f1", "v3-1"}}});
 
     ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
 }
@@ -294,27 +295,32 @@ TEST_F(MetaRedisBackendTest, TestRedisError) {
     ASSERT_EQ(EC_OK, meta_redis_backend_->Init("instance_0", meta_storage_backend_config_));
     ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
     ASSERT_EQ((std::vector<ErrorCode>{EC_ERROR, EC_ERROR}),
-              meta_redis_backend_->Put({1, 2}, {{{"f1", "v1-1"}}, {{"f1", "v2-1"}}}));
+              PutWithFieldMaps(meta_redis_backend_.get(), {1, 2}, {{{"f1", "v1-1"}}, {{"f1", "v2-1"}}}));
     ASSERT_EQ((std::vector<ErrorCode>{EC_ERROR, EC_ERROR, EC_ERROR}),
-              meta_redis_backend_->UpdateFields({1, 2, 3}, {{{"f2", "v1-2"}}, {{"f2", "v2-2"}}, {{"f3", "v3-2"}}}));
+              UpdateWithFieldMaps(
+                  meta_redis_backend_.get(), {1, 2, 3}, {{{"f2", "v1-2"}}, {{"f2", "v2-2"}}, {{"f3", "v3-2"}}}));
 
     std::vector<bool> is_exist_vec;
-    ASSERT_EQ((std::vector<ErrorCode>{EC_ERROR, EC_ERROR}), meta_redis_backend_->Exists({1, 2}, is_exist_vec));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_ERROR, EC_ERROR}), meta_redis_backend_->Exists(nullptr, {1, 2}, is_exist_vec));
     ASSERT_EQ(std::vector<bool>(2, false), is_exist_vec);
 
-    FieldMapVec field_maps;
-    ASSERT_EQ((std::vector<ErrorCode>{EC_ERROR, EC_ERROR}), meta_redis_backend_->Get({1, 2}, {"f1", "f2"}, field_maps));
-    ASSERT_EQ(std::vector<FieldMap>(2), field_maps);
-    ASSERT_EQ((std::vector<ErrorCode>{EC_ERROR, EC_ERROR}), meta_redis_backend_->GetAllFields({1, 2}, field_maps));
-    ASSERT_EQ(std::vector<FieldMap>(2), field_maps);
+    PropertyMapVector prop_maps;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_ERROR, EC_ERROR}),
+              meta_redis_backend_->GetProperties(nullptr, {1, 2}, std::vector<std::string>{"f1", "f2"}, prop_maps));
+    ASSERT_EQ(PropertyMapVector(2), prop_maps);
+    CacheLocationMapVector out_locs;
+    PropertyMapVector out_props;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_ERROR, EC_ERROR}),
+              meta_redis_backend_->Get(nullptr, {1, 2}, out_locs, out_props));
+    ASSERT_EQ(PropertyMapVector(2), out_props);
 
     std::string next_cursor;
     KeyTypeVec keys;
-    ASSERT_EQ(EC_ERROR, meta_redis_backend_->ListKeys(SCAN_BASE_CURSOR, /*limit*/ 5, next_cursor, keys));
+    ASSERT_EQ(EC_ERROR, meta_redis_backend_->ListKeys(nullptr, SCAN_BASE_CURSOR, /*limit*/ 5, next_cursor, keys));
     ASSERT_TRUE(next_cursor.empty());
     ASSERT_TRUE(keys.empty());
 
-    ASSERT_EQ(EC_ERROR, meta_redis_backend_->SampleReclaimKeys(/*count*/ 5, keys));
+    ASSERT_EQ(EC_ERROR, meta_redis_backend_->SampleReclaimKeys(nullptr, /*count*/ 5, keys));
     ASSERT_TRUE(keys.empty());
 
     ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
@@ -349,11 +355,11 @@ TEST_F(MetaRedisBackendTest, TestMultiThreadSimple) {
     ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
 
     auto get_task = [this]() {
-        AssertGet(meta_redis_backend_.get(),
-                  {1, 2},
-                  {"f1", "f2"},
-                  {EC_OK, EC_OK},
-                  {{{"f1", "v1-1"}, {"f2", "v1-2"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}});
+        AssertGetProperties(meta_redis_backend_.get(),
+                            {1, 2},
+                            {"f1", "f2"},
+                            {EC_OK, EC_OK},
+                            {{{"f1", "v1-1"}, {"f2", "v1-2"}}, {{"f1", "v2-1"}, {"f2", "v2-2"}}});
     };
     std::vector<std::thread> threads;
     for (int i = 0; i < 10; ++i) {
@@ -363,6 +369,225 @@ TEST_F(MetaRedisBackendTest, TestMultiThreadSimple) {
     for (auto &thread : threads) {
         thread.join();
     }
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
+}
+
+TEST_F(MetaRedisBackendTest, TestDeleteFields) {
+    EXPECT_CALL(*meta_redis_backend_, CreateRedisClient()).WillOnce(Invoke([]() {
+        StandardUri empty_storage_uri;
+        auto mock_redis_client = std::make_unique<MockRedisClient>(empty_storage_uri);
+        EXPECT_CALL(*mock_redis_client, IsContextOk()).WillRepeatedly(Return(true));
+        EXPECT_CALL(*mock_redis_client, Reconnect()).WillRepeatedly(Return(true));
+
+        // key 1: HDEL removes 2 fields -> EC_OK; key 2: removes 0 -> EC_NOENT.
+        std::vector<ReplyUPtr> replies;
+        replies.emplace_back(MakeFakeReplyInteger(2));
+        replies.emplace_back(MakeFakeReplyInteger(0));
+        EXPECT_CALL(*mock_redis_client,
+                    TryExecPipeline(ElementsAre(
+                        ElementsAre(StrEq("HDEL"),
+                                    StrEq("kvcache:instance_instance_0:cache_1"),
+                                    StrEq("__loc__f1"),
+                                    StrEq("__loc__f2")),
+                        ElementsAre(StrEq("HDEL"), StrEq("kvcache:instance_instance_0:cache_2"), StrEq("__loc__f3")))))
+            .WillOnce(Return(ByMove(std::move(replies))));
+        return mock_redis_client;
+    }));
+
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Init("instance_0", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
+
+    // HDEL returning 0 (no field actually removed) is now idempotent EC_OK.
+    AssertDeleteLocations(meta_redis_backend_.get(),
+                          {1, 2},
+                          /*location_ids*/ {{"f1", "f2"}, {"f3"}},
+                          {EC_OK, EC_OK});
+
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
+}
+
+TEST_F(MetaRedisBackendTest, TestExistsFieldWithPrefix) {
+    EXPECT_CALL(*meta_redis_backend_, CreateRedisClient()).WillOnce(Invoke([]() {
+        StandardUri empty_storage_uri;
+        auto mock_redis_client = std::make_unique<MockRedisClient>(empty_storage_uri);
+        EXPECT_CALL(*mock_redis_client, IsContextOk()).WillRepeatedly(Return(true));
+        EXPECT_CALL(*mock_redis_client, Reconnect()).WillRepeatedly(Return(true));
+
+        // Step 1: EXISTS check — both keys exist.
+        std::vector<ReplyUPtr> exists_replies;
+        exists_replies.emplace_back(MakeFakeReplyInteger(1));
+        exists_replies.emplace_back(MakeFakeReplyInteger(1));
+        EXPECT_CALL(
+            *mock_redis_client,
+            TryExecPipeline(ElementsAre(ElementsAre(StrEq("EXISTS"), StrEq("kvcache:instance_instance_0:cache_1")),
+                                        ElementsAre(StrEq("EXISTS"), StrEq("kvcache:instance_instance_0:cache_2")))))
+            .WillOnce(Return(ByMove(std::move(exists_replies))));
+
+        // Step 2: HSCAN — key 1 has matching field, key 2 has empty list.
+        std::vector<ReplyUPtr> replies;
+        replies.emplace_back(MakeFakeReplyScan(/*next_cursor*/ "0", {LOCATION_PREFIX + "a", "la"}));
+        replies.emplace_back(MakeFakeReplyScan(/*next_cursor*/ "0", {}));
+        EXPECT_CALL(*mock_redis_client,
+                    TryExecPipeline(ElementsAre(ElementsAre(StrEq("HSCAN"),
+                                                            StrEq("kvcache:instance_instance_0:cache_1"),
+                                                            StrEq("0"),
+                                                            StrEq("MATCH"),
+                                                            StrEq(LOCATION_PREFIX + "*"),
+                                                            StrEq("COUNT"),
+                                                            StrEq("1000")),
+                                                ElementsAre(StrEq("HSCAN"),
+                                                            StrEq("kvcache:instance_instance_0:cache_2"),
+                                                            StrEq("0"),
+                                                            StrEq("MATCH"),
+                                                            StrEq(LOCATION_PREFIX + "*"),
+                                                            StrEq("COUNT"),
+                                                            StrEq("1000")))))
+            .WillOnce(Return(ByMove(std::move(replies))));
+        return mock_redis_client;
+    }));
+
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Init("instance_0", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
+
+    AssertExistsLocation(meta_redis_backend_.get(), {1, 2}, {EC_OK, EC_OK}, {true, false});
+
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
+}
+
+// Tombstone: HSCAN returns field with empty value → not treated as valid location.
+TEST_F(MetaRedisBackendTest, TestExistsFieldWithPrefixIgnoresTombstone) {
+    EXPECT_CALL(*meta_redis_backend_, CreateRedisClient()).WillOnce(Invoke([]() {
+        StandardUri empty_storage_uri;
+        auto mock_redis_client = std::make_unique<MockRedisClient>(empty_storage_uri);
+        EXPECT_CALL(*mock_redis_client, IsContextOk()).WillRepeatedly(Return(true));
+        EXPECT_CALL(*mock_redis_client, Reconnect()).WillRepeatedly(Return(true));
+
+        testing::InSequence seq;
+
+        // Step 1: EXISTS check — both keys exist.
+        std::vector<ReplyUPtr> exists_replies;
+        exists_replies.emplace_back(MakeFakeReplyInteger(1));
+        exists_replies.emplace_back(MakeFakeReplyInteger(1));
+        EXPECT_CALL(*mock_redis_client, TryExecPipeline(testing::_))
+            .WillOnce(Return(ByMove(std::move(exists_replies))));
+
+        // Step 2: HSCAN — key 1 has tombstone (empty value), key 2 has valid field.
+        std::vector<ReplyUPtr> replies;
+        replies.emplace_back(MakeFakeReplyScan("0", {LOCATION_PREFIX + "tomb", ""}));
+        replies.emplace_back(MakeFakeReplyScan("0", {LOCATION_PREFIX + "real", "valid"}));
+        EXPECT_CALL(*mock_redis_client, TryExecPipeline(testing::_)).WillOnce(Return(ByMove(std::move(replies))));
+        return mock_redis_client;
+    }));
+
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Init("instance_0", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
+
+    AssertExistsLocation(meta_redis_backend_.get(), {1, 2}, {EC_OK, EC_OK}, {false, true});
+
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
+}
+
+// ExistsFieldWithPrefix with a non-existent key should return EC_NOENT.
+TEST_F(MetaRedisBackendTest, TestExistsFieldWithPrefixKeyNotExist) {
+    EXPECT_CALL(*meta_redis_backend_, CreateRedisClient()).WillOnce(Invoke([]() {
+        StandardUri empty_storage_uri;
+        auto mock_redis_client = std::make_unique<MockRedisClient>(empty_storage_uri);
+        EXPECT_CALL(*mock_redis_client, IsContextOk()).WillRepeatedly(Return(true));
+        EXPECT_CALL(*mock_redis_client, Reconnect()).WillRepeatedly(Return(true));
+
+        // EXISTS check — key 1 exists, key 2 does not exist.
+        // No HSCAN should be issued for key 2.
+        std::vector<ReplyUPtr> exists_replies;
+        exists_replies.emplace_back(MakeFakeReplyInteger(1));
+        exists_replies.emplace_back(MakeFakeReplyInteger(0));
+        EXPECT_CALL(
+            *mock_redis_client,
+            TryExecPipeline(ElementsAre(ElementsAre(StrEq("EXISTS"), StrEq("kvcache:instance_instance_0:cache_1")),
+                                        ElementsAre(StrEq("EXISTS"), StrEq("kvcache:instance_instance_0:cache_2")))))
+            .WillOnce(Return(ByMove(std::move(exists_replies))));
+
+        // HSCAN only for key 1.
+        std::vector<ReplyUPtr> hscan_replies;
+        hscan_replies.emplace_back(MakeFakeReplyScan("0", {LOCATION_PREFIX + "a", "la"}));
+        EXPECT_CALL(*mock_redis_client,
+                    TryExecPipeline(ElementsAre(ElementsAre(StrEq("HSCAN"),
+                                                            StrEq("kvcache:instance_instance_0:cache_1"),
+                                                            StrEq("0"),
+                                                            StrEq("MATCH"),
+                                                            StrEq(LOCATION_PREFIX + "*"),
+                                                            StrEq("COUNT"),
+                                                            StrEq("1000")))))
+            .WillOnce(Return(ByMove(std::move(hscan_replies))));
+        return mock_redis_client;
+    }));
+
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Init("instance_0", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
+
+    AssertExistsLocation(meta_redis_backend_.get(), {1, 2}, {EC_OK, EC_NOENT}, {true, false});
+
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
+}
+
+// DeleteFields with empty field list should not issue HDEL and return EC_OK.
+TEST_F(MetaRedisBackendTest, TestDeleteFieldsEmptyFieldList) {
+    EXPECT_CALL(*meta_redis_backend_, CreateRedisClient()).WillOnce(Invoke([]() {
+        StandardUri empty_storage_uri;
+        auto mock_redis_client = std::make_unique<MockRedisClient>(empty_storage_uri);
+        EXPECT_CALL(*mock_redis_client, IsContextOk()).WillRepeatedly(Return(true));
+        EXPECT_CALL(*mock_redis_client, Reconnect()).WillRepeatedly(Return(true));
+
+        // No HDEL should be issued — TryExecPipeline must not be called.
+        EXPECT_CALL(*mock_redis_client, TryExecPipeline(testing::_)).Times(0);
+        return mock_redis_client;
+    }));
+
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Init("instance_0", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
+
+    AssertDeleteLocations(meta_redis_backend_.get(), {1, 2}, {{}, {}}, {EC_OK, EC_OK});
+
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
+}
+
+TEST_F(MetaRedisBackendTest, TestGet) {
+    EXPECT_CALL(*meta_redis_backend_, CreateRedisClient()).WillOnce(Invoke([]() {
+        StandardUri empty_storage_uri;
+        auto mock_redis_client = std::make_unique<MockRedisClient>(empty_storage_uri);
+        EXPECT_CALL(*mock_redis_client, IsContextOk()).WillRepeatedly(Return(true));
+        EXPECT_CALL(*mock_redis_client, Reconnect()).WillRepeatedly(Return(true));
+
+        // Each GetProperties call creates a separate pipeline request.
+        // Call 1: key 1 asks {f1} -> "v1-1"
+        std::vector<ReplyUPtr> replies1;
+        replies1.emplace_back(MakeFakeReplyArrayString({"v1-1"}));
+        EXPECT_CALL(*mock_redis_client,
+                    TryExecPipeline(ElementsAre(
+                        ElementsAre(StrEq("HMGET"), StrEq("kvcache:instance_instance_0:cache_1"), StrEq("f1")))))
+            .WillOnce(Return(ByMove(std::move(replies1))));
+
+        // Call 2: key 2 asks {f2, f3} -> "v2-2", null (f3 missing)
+        std::vector<ReplyUPtr> replies2;
+        replies2.emplace_back(MakeFakeReplyArrayString({"v2-2", std::nullopt}));
+        EXPECT_CALL(*mock_redis_client,
+                    TryExecPipeline(ElementsAre(ElementsAre(
+                        StrEq("HMGET"), StrEq("kvcache:instance_instance_0:cache_2"), StrEq("f2"), StrEq("f3")))))
+            .WillOnce(Return(ByMove(std::move(replies2))));
+        return mock_redis_client;
+    }));
+
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Init("instance_0", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
+
+    // Each GetProperties call sends a separate pipeline to Redis.
+    PropertyMapVector props1;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_redis_backend_->GetProperties(nullptr, {1}, {"f1"}, props1));
+    ASSERT_EQ("v1-1", props1[0]["f1"]);
+    PropertyMapVector props2;
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), meta_redis_backend_->GetProperties(nullptr, {2}, {"f2", "f3"}, props2));
+    ASSERT_EQ("v2-2", props2[0]["f2"]);
+    ASSERT_TRUE(props2[0].find("f3") == props2[0].end());
+
     ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
 }
 

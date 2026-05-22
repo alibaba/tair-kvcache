@@ -27,6 +27,22 @@ cc_test(
 )
 
 cc_test(
+    name = "CrashHandlerTest",
+    srcs = [
+        "crash_handler_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    linkopts = [
+        "-rdynamic",
+    ],
+    data = [],
+    deps = [
+        "//kv_cache_manager/common:crash_handler",
+        "//kv_cache_manager/common:unittest",
+    ],
+)
+
+cc_test(
     name = "JsonizableTest",
     srcs = [
         "jsonizable_test.cc",
@@ -160,6 +176,33 @@ cc_test(
     copts = ["-fno-access-control"],
     deps = [
         "//kv_cache_manager/common:client_pool",
+        "//kv_cache_manager/common:unittest",
+    ],
+)
+
+cc_test(
+    name = "service_discovery_factory_test",
+    srcs = [
+        "service_discovery_factory_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:service_discovery",
+        "//kv_cache_manager/common:service_discovery_factory",
+        "//stub_source/kv_cache_manager/common:spectrum_service_discovery",
+        "//kv_cache_manager/common:static_service_discovery",
+        "//kv_cache_manager/common:unittest",
+    ],
+)
+
+cc_test(
+    name = "service_discovery_test",
+    srcs = [
+        "service_discovery_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:service_discovery",
         "//kv_cache_manager/common:unittest",
     ],
 )

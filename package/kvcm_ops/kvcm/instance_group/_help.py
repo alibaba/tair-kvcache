@@ -4,6 +4,10 @@ instance_group module:
         python3 -m kvcm_ops get_instance_group --help
         python3 -m kvcm_ops get_instance_group -n default
         python3 -m kvcm_ops get_instance_group -H http://localhost:56040 -n default
+    list instance_group info:
+        python3 -m kvcm_ops list_instance_group --help
+        python3 -m kvcm_ops list_instance_group
+        python3 -m kvcm_ops list_instance_group -H http://localhost:56040
     create new instance_group:
         python3 -m kvcm_ops create_instance_group --help
         python3 -m kvcm_ops create_instance_group -n test_group -s nfs_01

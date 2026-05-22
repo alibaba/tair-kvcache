@@ -6,11 +6,13 @@
 
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
+#include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/metrics/prometheus_exporter.h"
 #include "kv_cache_manager/protocol/protobuf/admin_service.pb.h"
 #include "kv_cache_manager/service/admin_service_impl.h"
 #include "kv_cache_manager/service/util/common.h"
+#include "kv_cache_manager/service/util/proto_message_json_util.h"
 
 namespace kv_cache_manager {
 
@@ -41,6 +43,7 @@ void AdminServiceHttp::Init() {
     MAKE_SERVICE_METRICS_COLLECTOR(UpdateInstanceGroup);
     MAKE_SERVICE_METRICS_COLLECTOR(RemoveInstanceGroup);
     MAKE_SERVICE_METRICS_COLLECTOR(GetInstanceGroup);
+    MAKE_SERVICE_METRICS_COLLECTOR(ListInstanceGroup);
 
     // for cache APIs
     MAKE_SERVICE_METRICS_COLLECTOR(GetCacheMeta);
@@ -93,6 +96,8 @@ void AdminServiceHttp::RegisterHandler() {
         Post, removeInstanceGroup, RemoveInstanceGroup, Common, RemoveInstanceGroup);
     REGISTER_HTTP_HANDLER_FOR_ADMIN_SERVICE(
         Post, getInstanceGroup, GetInstanceGroup, GetInstanceGroup, GetInstanceGroup);
+    REGISTER_HTTP_HANDLER_FOR_ADMIN_SERVICE(
+        Post, listInstanceGroup, ListInstanceGroup, ListInstanceGroup, ListInstanceGroup);
 
     // Cache APIs
     REGISTER_HTTP_HANDLER_FOR_ADMIN_SERVICE(Post, getCacheMeta, GetCacheMeta, GetCacheMeta, GetCacheMeta);
@@ -128,6 +133,37 @@ void AdminServiceHttp::RegisterHandler() {
                                co_return;
                            });
     }
+
+    // Health check endpoint (GET /api/healthy)
+    // 内部生成临时 trace_id，复用 AdminServiceHttp::CheckHealth 的真实健康判定逻辑。
+    // 健康时返回 200 + {"status":"OK"}，不健康时返回 503 + 完整 CheckHealthResponse JSON。
+    RegisterGetHandler("/api/healthy",
+                       [this](coro_http::coro_http_request &req,
+                              coro_http::coro_http_response &res) -> async_simple::coro::Lazy<void> {
+                           proto::admin::CheckHealthRequest request;
+                           request.set_trace_id("kvcm-healthy-" +
+                                                std::to_string(TimestampUtil::GetCurrentTimeMs()));
+                           proto::admin::CheckHealthResponse response;
+
+                           this->CheckHealth(req.get_conn(), &request, &response);
+
+                           res.add_header("Content-Type", "application/json");
+
+                           const bool healthy =
+                               response.header().status().code() == proto::admin::OK && response.is_health();
+                           if (healthy) {
+                               res.set_status_and_content(coro_http::status_type::ok, R"({"status":"OK"})");
+                               co_return;
+                           }
+
+                           std::string body;
+                           if (!ProtoMessageJsonUtil::ToJson(&response, body)) {
+                               body = R"({"status":"FAIL"})";
+                           }
+                           res.set_status_and_content(coro_http::status_type::service_unavailable,
+                                                      std::move(body));
+                           co_return;
+                       });
 
     // High Availability APIs
     REGISTER_HTTP_HANDLER_FOR_ADMIN_SERVICE(Post, checkHealth, CheckHealth, CheckHealth, CheckHealth);
@@ -236,6 +272,14 @@ void AdminServiceHttp::GetInstanceGroup(coro_http::coro_http_connection *http_co
     API_CONTEXT_INIT_HTTP(GetInstanceGroup)
     KVCM_LOG_INFO("[traceId: %s] GetInstanceGroup [%s] called.", request->trace_id().c_str(), request->name().c_str());
     admin_service_impl_->GetInstanceGroup(request_context, request, response);
+}
+
+void AdminServiceHttp::ListInstanceGroup(coro_http::coro_http_connection *http_conn,
+                                         proto::admin::ListInstanceGroupRequest *request,
+                                         proto::admin::ListInstanceGroupResponse *response) {
+    API_CONTEXT_INIT_HTTP(ListInstanceGroup)
+    KVCM_LOG_INFO("[traceId: %s] ListInstanceGroup called.", request->trace_id().c_str());
+    admin_service_impl_->ListInstanceGroup(request_context, request, response);
 }
 
 void AdminServiceHttp::GetCacheMeta(coro_http::coro_http_connection *http_conn,
@@ -359,7 +403,7 @@ void AdminServiceHttp::CheckHealth(coro_http::coro_http_connection *http_conn,
                                    proto::admin::CheckHealthRequest *request,
                                    proto::admin::CheckHealthResponse *response) {
     API_CONTEXT_INIT_HTTP(CheckHealth)
-    KVCM_LOG_INFO("[traceId: %s] CheckHealth called.", request->trace_id().c_str());
+    KVCM_LOG_DEBUG("[traceId: %s] CheckHealth called.", request->trace_id().c_str());
     admin_service_impl_->CheckHealth(request_context, request, response);
 }
 

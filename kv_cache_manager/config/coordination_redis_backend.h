@@ -1,8 +1,11 @@
 #pragma once
 
+#include <atomic>
 #include <memory>
+#include <mutex>
 #include <string>
 
+#include "kv_cache_manager/common/client_pool.h"
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/redis_client_ext.h"
 #include "kv_cache_manager/common/standard_uri.h"
@@ -15,13 +18,11 @@ public:
     CoordinationRedisBackend();
     ~CoordinationRedisBackend() override;
 
-    // 禁止拷贝和赋值
+    // 禁止拷贝、赋值和移动
     CoordinationRedisBackend(const CoordinationRedisBackend &) = delete;
     CoordinationRedisBackend &operator=(const CoordinationRedisBackend &) = delete;
-
-    // 允许移动
-    CoordinationRedisBackend(CoordinationRedisBackend &&) = default;
-    CoordinationRedisBackend &operator=(CoordinationRedisBackend &&) = default;
+    CoordinationRedisBackend(CoordinationRedisBackend &&) = delete;
+    CoordinationRedisBackend &operator=(CoordinationRedisBackend &&) = delete;
 
 public:
     ErrorCode Init(const StandardUri &standard_uri) noexcept override;
@@ -33,12 +34,22 @@ public:
     ErrorCode SetValue(const std::string &key, const std::string &value) override;
     ErrorCode GetValue(const std::string &key, std::string &out_value) override;
 
+protected:
+    virtual std::shared_ptr<RedisClientExt> CreateRedisClient(const StandardUri &storage_uri) const;
+
 private:
+    using RedisClientPool = DynamicClientPool<RedisClientExt>;
+    using RedisClientHandle = RedisClientPool::ClientHandle;
+
     // 生成Redis锁键名
     std::string GetRedisLockKey(const std::string &lock_key) const;
 
     // 生成Redis KV键名
     std::string GetRedisKVKey(const std::string &key) const;
+
+    RedisClientHandle AcquireClient();
+    std::string GetCachedScriptSha1(const std::string &cached_sha1) const;
+    void UpdateCachedScriptSha1(std::string &cached_sha1, const std::string &new_sha1);
 
     // Lua脚本：尝试获取锁（原子操作）
     static constexpr const char *LUA_TRY_LOCK = R"(
@@ -115,12 +126,15 @@ private:
     )";
 
 private:
-    std::unique_ptr<RedisClientExt> redis_client_;
+    std::shared_ptr<RedisClientPool> client_pool_;
+    StandardUri storage_uri_;
     std::string lock_key_prefix_;
     std::string kv_key_prefix_;
-    bool initialized_{false};
+    int64_t timeout_ms_{1000};
+    std::atomic<bool> initialized_{false};
 
     // Lua脚本的SHA1缓存
+    mutable std::mutex script_sha_mutex_;
     std::string try_lock_sha1_;
     std::string renew_lock_sha1_;
     std::string unlock_sha1_;

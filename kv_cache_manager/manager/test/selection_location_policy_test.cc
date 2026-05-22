@@ -31,15 +31,14 @@ public:
         return location_map;
     }
 
-    CacheLocation GenFakeLocation(const std::string &id, const FakeLocationMeta &meta) const {
-
+    CacheLocationConstPtr GenFakeLocation(const std::string &id, const FakeLocationMeta &meta) const {
         std::string uri = ToString(meta.type) + "://" + meta.unique_name + "/" + id;
-        CacheLocation location;
-        location.set_id(id);
-        location.set_status(meta.status);
-        location.set_type(meta.type);
-        location.set_spec_size(1000);
-        location.set_location_specs({LocationSpec("tp0", uri)});
+        auto location = std::make_shared<CacheLocation>();
+        location->set_id(id);
+        location->set_status(meta.status);
+        location->set_type(meta.type);
+        location->set_spec_size(1000);
+        location->set_location_specs({LocationSpec("tp0", uri)});
         return location;
     }
 
@@ -50,18 +49,18 @@ public:
         std::vector<std::string> spec_names;
     };
 
-    CacheLocation GenFakeLocationWithSpecs(const std::string &id, const FakeLocationMetaWithSpecs &meta) const {
-        CacheLocation location;
-        location.set_id(id);
-        location.set_status(meta.status);
-        location.set_type(meta.type);
-        location.set_spec_size(meta.spec_names.size());
+    CacheLocationConstPtr GenFakeLocationWithSpecs(const std::string &id, const FakeLocationMetaWithSpecs &meta) const {
+        auto location = std::make_shared<CacheLocation>();
+        location->set_id(id);
+        location->set_status(meta.status);
+        location->set_type(meta.type);
+        location->set_spec_size(meta.spec_names.size());
         std::vector<LocationSpec> specs;
         for (const auto &name : meta.spec_names) {
             std::string uri = ToString(meta.type) + "://" + meta.unique_name + "/" + id + "/" + name;
             specs.emplace_back(name, uri);
         }
-        location.set_location_specs(std::move(specs));
+        location->set_location_specs(std::move(specs));
         return location;
     }
 
@@ -81,7 +80,8 @@ TEST_F(SelectLocationPolicyTest, TestStaticWeightSLPolicySelectForMatch) {
         auto location_map = GenLocationMap(
             {{CLS_SERVING, D_MEMPOOL, "pace_01"}, {CLS_SERVING, D_3FS, "3fs_01"}, {CLS_SERVING, D_NFS, "nfs_01"}});
         for (int i = 0; i < 100; ++i) {
-            CacheLocation *location = policy.SelectForMatch(location_map, dummy_check_loc_data_exist, dummy_loc_ids);
+            CacheLocationConstPtr location =
+                policy.SelectForMatch(location_map, dummy_check_loc_data_exist, dummy_loc_ids);
             ASSERT_THAT(location->type(), AnyOf(D_MEMPOOL, D_3FS, D_NFS));
         }
     }
@@ -89,7 +89,8 @@ TEST_F(SelectLocationPolicyTest, TestStaticWeightSLPolicySelectForMatch) {
         auto location_map = GenLocationMap(
             {{CLS_WRITING, D_MEMPOOL, "pace_01"}, {CLS_SERVING, D_3FS, "3fs_01"}, {CLS_SERVING, D_NFS, "nfs_01"}});
         for (int i = 0; i < 100; ++i) {
-            CacheLocation *location = policy.SelectForMatch(location_map, dummy_check_loc_data_exist, dummy_loc_ids);
+            CacheLocationConstPtr location =
+                policy.SelectForMatch(location_map, dummy_check_loc_data_exist, dummy_loc_ids);
             ASSERT_THAT(location->type(), AnyOf(D_3FS, D_NFS));
         }
     }
@@ -99,7 +100,8 @@ TEST_F(SelectLocationPolicyTest, TestStaticWeightSLPolicySelectForMatch) {
                                             {CLS_SERVING, D_3FS, "3fs_02"},
                                             {CLS_SERVING, D_NFS, "nfs_01"}});
         for (int i = 0; i < 100; ++i) {
-            CacheLocation *location = policy.SelectForMatch(location_map, dummy_check_loc_data_exist, dummy_loc_ids);
+            CacheLocationConstPtr location =
+                policy.SelectForMatch(location_map, dummy_check_loc_data_exist, dummy_loc_ids);
             ASSERT_THAT(location->type(), AnyOf(D_3FS, D_NFS));
             ASSERT_THAT(location->location_specs().front().uri(),
                         AnyOf(HasSubstr("3fs_01"), HasSubstr("3fs_02"), HasSubstr("nfs_01")));
@@ -115,11 +117,11 @@ TEST_F(SelectLocationPolicyTest, TestStaticWeightSLPolicySelectForMatchWithStale
         auto location_map = GenLocationMap({{CLS_SERVING, D_3FS, "3fs_01"}, {CLS_SERVING, D_NFS, "nfs_01"}});
         auto stale_check = [](const CacheLocation &) -> bool { return false; };
         std::vector<std::string> prune_loc_ids;
-        CacheLocation *location = policy.SelectForMatch(location_map, stale_check, prune_loc_ids);
-        ASSERT_EQ(location, nullptr);
+        CacheLocationConstPtr location = policy.SelectForMatch(location_map, stale_check, prune_loc_ids);
+        ASSERT_TRUE(location->location_specs().empty());
         ASSERT_EQ(prune_loc_ids.size(), 2u);
         for (const auto &id : prune_loc_ids) {
-            ASSERT_EQ(location_map.at(id).status(), CLS_SERVING);
+            ASSERT_EQ(location_map.at(id)->status(), CLS_SERVING);
         }
     }
     // (b) mix of stale and valid CLS_SERVING ->
@@ -133,11 +135,11 @@ TEST_F(SelectLocationPolicyTest, TestStaticWeightSLPolicySelectForMatchWithStale
         };
         for (int i = 0; i < 100; ++i) {
             std::vector<std::string> prune_loc_ids;
-            CacheLocation *location = policy.SelectForMatch(location_map, stale_check, prune_loc_ids);
-            ASSERT_NE(location, nullptr);
+            CacheLocationConstPtr location = policy.SelectForMatch(location_map, stale_check, prune_loc_ids);
+            ASSERT_FALSE(location->location_specs().empty());
             ASSERT_THAT(location->type(), AnyOf(D_NFS, D_MEMPOOL));
             ASSERT_EQ(prune_loc_ids.size(), 1u);
-            ASSERT_EQ(location_map.at(prune_loc_ids[0]).type(), D_3FS);
+            ASSERT_EQ(location_map.at(prune_loc_ids[0])->type(), D_3FS);
         }
     }
     // (c) non-CLS_SERVING entries are ignored entirely ->
@@ -147,11 +149,11 @@ TEST_F(SelectLocationPolicyTest, TestStaticWeightSLPolicySelectForMatchWithStale
             {{CLS_WRITING, D_3FS, "3fs_01"}, {CLS_NOT_FOUND, D_NFS, "nfs_01"}, {CLS_SERVING, D_MEMPOOL, "pace_01"}});
         auto stale_check = [](const CacheLocation &) -> bool { return false; };
         std::vector<std::string> prune_loc_ids;
-        CacheLocation *location = policy.SelectForMatch(location_map, stale_check, prune_loc_ids);
+        CacheLocationConstPtr location = policy.SelectForMatch(location_map, stale_check, prune_loc_ids);
         // only the CLS_SERVING entry is checked; it is stale and pruned
-        ASSERT_EQ(location, nullptr);
+        ASSERT_TRUE(location->location_specs().empty());
         ASSERT_EQ(prune_loc_ids.size(), 1u);
-        ASSERT_EQ(location_map.at(prune_loc_ids[0]).status(), CLS_SERVING);
+        ASSERT_EQ(location_map.at(prune_loc_ids[0])->status(), CLS_SERVING);
     }
     // (d) single stale CLS_SERVING entry ->
     //     pruned, returns nullptr
@@ -159,8 +161,8 @@ TEST_F(SelectLocationPolicyTest, TestStaticWeightSLPolicySelectForMatchWithStale
         auto location_map = GenLocationMap({{CLS_SERVING, D_3FS, "3fs_01"}});
         auto stale_check = [](const CacheLocation &) -> bool { return false; };
         std::vector<std::string> prune_loc_ids;
-        CacheLocation *location = policy.SelectForMatch(location_map, stale_check, prune_loc_ids);
-        ASSERT_EQ(location, nullptr);
+        CacheLocationConstPtr location = policy.SelectForMatch(location_map, stale_check, prune_loc_ids);
+        ASSERT_TRUE(location->location_specs().empty());
         ASSERT_EQ(prune_loc_ids.size(), 1u);
     }
 }
@@ -246,7 +248,7 @@ TEST_F(SelectLocationPolicyTest, TestStaticWeightSLPolicyExistsForWriteWithStale
         ASSERT_TRUE(policy.ExistsForWrite(location_map, stale_check, prune_loc_ids));
         ASSERT_EQ(prune_loc_ids.size(), 2u);
         for (const auto &id : prune_loc_ids) {
-            ASSERT_EQ(location_map.at(id).status(), CLS_SERVING);
+            ASSERT_EQ(location_map.at(id)->status(), CLS_SERVING);
         }
     }
     // (f) mix of stale and valid CLS_SERVING ->
@@ -259,7 +261,7 @@ TEST_F(SelectLocationPolicyTest, TestStaticWeightSLPolicyExistsForWriteWithStale
         std::vector<std::string> prune_loc_ids;
         ASSERT_TRUE(policy.ExistsForWrite(location_map, stale_check, prune_loc_ids));
         ASSERT_EQ(prune_loc_ids.size(), 1u);
-        ASSERT_EQ(location_map.at(prune_loc_ids[0]).type(), D_3FS);
+        ASSERT_EQ(location_map.at(prune_loc_ids[0])->type(), D_3FS);
     }
 }
 
@@ -275,7 +277,8 @@ TEST_F(SelectLocationPolicyTest, TestDynamicWeightSLPolicySelectForMatch) {
         auto location_map = GenLocationMap(
             {{CLS_SERVING, D_MEMPOOL, "pace_01"}, {CLS_SERVING, D_3FS, "3fs_01"}, {CLS_SERVING, D_NFS, "nfs_01"}});
         for (int i = 0; i < 100; ++i) {
-            CacheLocation *location = policy.SelectForMatch(location_map, dummy_check_loc_data_exist, dummy_loc_ids);
+            CacheLocationConstPtr location =
+                policy.SelectForMatch(location_map, dummy_check_loc_data_exist, dummy_loc_ids);
             ASSERT_THAT(location->type(), AnyOf(D_MEMPOOL, D_3FS));
         }
     }
@@ -285,7 +288,8 @@ TEST_F(SelectLocationPolicyTest, TestDynamicWeightSLPolicySelectForMatch) {
                                             {CLS_SERVING, D_MOONCAKE, "mooncake_01"},
                                             {CLS_SERVING, D_NFS, "nfs_01"}});
         for (int i = 0; i < 100; ++i) {
-            CacheLocation *location = policy.SelectForMatch(location_map, dummy_check_loc_data_exist, dummy_loc_ids);
+            CacheLocationConstPtr location =
+                policy.SelectForMatch(location_map, dummy_check_loc_data_exist, dummy_loc_ids);
             ASSERT_THAT(location->type(), AnyOf(D_3FS, D_MOONCAKE));
         }
     }
@@ -297,7 +301,8 @@ TEST_F(SelectLocationPolicyTest, TestDynamicWeightSLPolicySelectForMatch) {
                                             {CLS_SERVING, D_NFS, "nfs_01"},
                                             {CLS_SERVING, D_NFS, "nfs_02"}});
         for (int i = 0; i < 100; ++i) {
-            CacheLocation *location = policy.SelectForMatch(location_map, dummy_check_loc_data_exist, dummy_loc_ids);
+            CacheLocationConstPtr location =
+                policy.SelectForMatch(location_map, dummy_check_loc_data_exist, dummy_loc_ids);
             ASSERT_THAT(location->type(), AnyOf(D_3FS, D_MOONCAKE));
             ASSERT_THAT(location->location_specs().front().uri(),
                         AnyOf(HasSubstr("3fs_01"), HasSubstr("mooncake_01"), HasSubstr("mooncake_02")));
@@ -319,8 +324,8 @@ TEST_F(SelectLocationPolicyTest, TestDynamicWeightSLPolicySelectForMatchWithStal
         auto location_map = GenLocationMap({{CLS_SERVING, D_3FS, "3fs_01"}, {CLS_SERVING, D_MOONCAKE, "mooncake_01"}});
         auto stale_check = [](const CacheLocation &) -> bool { return false; };
         std::vector<std::string> prune_loc_ids;
-        CacheLocation *location = policy.SelectForMatch(location_map, stale_check, prune_loc_ids);
-        ASSERT_EQ(location, nullptr);
+        CacheLocationConstPtr location = policy.SelectForMatch(location_map, stale_check, prune_loc_ids);
+        ASSERT_TRUE(location->location_specs().empty());
         ASSERT_EQ(prune_loc_ids.size(), 2u);
     }
     // (b) mix of stale and valid ->
@@ -335,11 +340,11 @@ TEST_F(SelectLocationPolicyTest, TestDynamicWeightSLPolicySelectForMatchWithStal
         };
         for (int i = 0; i < 100; ++i) {
             std::vector<std::string> prune_loc_ids;
-            CacheLocation *location = policy.SelectForMatch(location_map, stale_check, prune_loc_ids);
-            ASSERT_NE(location, nullptr);
+            CacheLocationConstPtr location = policy.SelectForMatch(location_map, stale_check, prune_loc_ids);
+            ASSERT_FALSE(location->location_specs().empty());
             ASSERT_THAT(location->type(), AnyOf(D_MOONCAKE, D_MEMPOOL));
             ASSERT_EQ(prune_loc_ids.size(), 1u);
-            ASSERT_EQ(location_map.at(prune_loc_ids[0]).type(), D_3FS);
+            ASSERT_EQ(location_map.at(prune_loc_ids[0])->type(), D_3FS);
         }
     }
     // (c) non-CLS_SERVING entries are ignored entirely ->
@@ -348,11 +353,11 @@ TEST_F(SelectLocationPolicyTest, TestDynamicWeightSLPolicySelectForMatchWithStal
         auto location_map = GenLocationMap({{CLS_WRITING, D_3FS, "3fs_01"}, {CLS_SERVING, D_MOONCAKE, "mooncake_01"}});
         auto stale_check = [](const CacheLocation &) -> bool { return false; };
         std::vector<std::string> prune_loc_ids;
-        CacheLocation *location = policy.SelectForMatch(location_map, stale_check, prune_loc_ids);
-        ASSERT_EQ(location, nullptr);
+        CacheLocationConstPtr location = policy.SelectForMatch(location_map, stale_check, prune_loc_ids);
+        ASSERT_TRUE(location->location_specs().empty());
         // only the CLS_SERVING mooncake entry is pruned
         ASSERT_EQ(prune_loc_ids.size(), 1u);
-        ASSERT_EQ(location_map.at(prune_loc_ids[0]).status(), CLS_SERVING);
+        ASSERT_EQ(location_map.at(prune_loc_ids[0])->status(), CLS_SERVING);
     }
     // (d) stale CLS_SERVING entry with weight 0 (nfs) ->
     //     still pruned
@@ -360,8 +365,8 @@ TEST_F(SelectLocationPolicyTest, TestDynamicWeightSLPolicySelectForMatchWithStal
         auto location_map = GenLocationMap({{CLS_SERVING, D_NFS, "nfs_01"}, {CLS_SERVING, D_3FS, "3fs_01"}});
         auto stale_check = [](const CacheLocation &) -> bool { return false; };
         std::vector<std::string> prune_loc_ids;
-        CacheLocation *location = policy.SelectForMatch(location_map, stale_check, prune_loc_ids);
-        ASSERT_EQ(location, nullptr);
+        CacheLocationConstPtr location = policy.SelectForMatch(location_map, stale_check, prune_loc_ids);
+        ASSERT_TRUE(location->location_specs().empty());
         // both are CLS_SERVING and stale, both pruned (weight check
         // happens after the stale-data check)
         ASSERT_EQ(prune_loc_ids.size(), 2u);
@@ -454,7 +459,7 @@ TEST_F(SelectLocationPolicyTest, TestDynamicWeightSLPolicyExistsForWriteWithStal
         ASSERT_TRUE(policy.ExistsForWrite(location_map, stale_check, prune_loc_ids));
         ASSERT_EQ(prune_loc_ids.size(), 2u);
         for (const auto &id : prune_loc_ids) {
-            ASSERT_EQ(location_map.at(id).status(), CLS_SERVING);
+            ASSERT_EQ(location_map.at(id)->status(), CLS_SERVING);
         }
     }
     // (e) mix of stale and valid CLS_SERVING ->
@@ -467,7 +472,7 @@ TEST_F(SelectLocationPolicyTest, TestDynamicWeightSLPolicyExistsForWriteWithStal
         std::vector<std::string> prune_loc_ids;
         ASSERT_TRUE(policy.ExistsForWrite(location_map, stale_check, prune_loc_ids));
         ASSERT_EQ(prune_loc_ids.size(), 1u);
-        ASSERT_EQ(location_map.at(prune_loc_ids[0]).type(), D_3FS);
+        ASSERT_EQ(location_map.at(prune_loc_ids[0])->type(), D_3FS);
     }
 }
 
@@ -477,7 +482,8 @@ TEST_F(SelectLocationPolicyTest, TestNamedStorageWeightedSLPolicySelectForMatch)
         auto location_map = GenLocationMap(
             {{CLS_SERVING, D_MEMPOOL, "pace_01"}, {CLS_SERVING, D_3FS, "3fs_01"}, {CLS_SERVING, D_NFS, "nfs_01"}});
         for (int i = 0; i < 100; ++i) {
-            CacheLocation *location = policy.SelectForMatch(location_map, dummy_check_loc_data_exist, dummy_loc_ids);
+            CacheLocationConstPtr location =
+                policy.SelectForMatch(location_map, dummy_check_loc_data_exist, dummy_loc_ids);
             ASSERT_THAT(location->type(), AnyOf(D_MEMPOOL, D_3FS, D_NFS));
             ASSERT_THAT(location->location_specs().front().uri(),
                         AnyOf(HasSubstr("pace_01"), HasSubstr("3fs_01"), HasSubstr("nfs_01")));
@@ -487,7 +493,8 @@ TEST_F(SelectLocationPolicyTest, TestNamedStorageWeightedSLPolicySelectForMatch)
         auto location_map = GenLocationMap(
             {{CLS_WRITING, D_MEMPOOL, "pace_01"}, {CLS_SERVING, D_3FS, "3fs_01"}, {CLS_SERVING, D_NFS, "nfs_01"}});
         for (int i = 0; i < 100; ++i) {
-            CacheLocation *location = policy.SelectForMatch(location_map, dummy_check_loc_data_exist, dummy_loc_ids);
+            CacheLocationConstPtr location =
+                policy.SelectForMatch(location_map, dummy_check_loc_data_exist, dummy_loc_ids);
             ASSERT_THAT(location->type(), AnyOf(D_3FS, D_NFS));
             ASSERT_THAT(location->location_specs().front().uri(), AnyOf(HasSubstr("3fs_01"), HasSubstr("nfs_01")));
         }
@@ -498,7 +505,8 @@ TEST_F(SelectLocationPolicyTest, TestNamedStorageWeightedSLPolicySelectForMatch)
                                             {CLS_SERVING, D_3FS, "3fs_02"},
                                             {CLS_SERVING, D_NFS, "nfs_01"}});
         for (int i = 0; i < 100; ++i) {
-            CacheLocation *location = policy.SelectForMatch(location_map, dummy_check_loc_data_exist, dummy_loc_ids);
+            CacheLocationConstPtr location =
+                policy.SelectForMatch(location_map, dummy_check_loc_data_exist, dummy_loc_ids);
             ASSERT_THAT(location->type(), AnyOf(D_3FS, D_NFS));
             ASSERT_THAT(location->location_specs().front().uri(), AnyOf(HasSubstr("3fs_01"), HasSubstr("nfs_01")));
         }
@@ -513,8 +521,8 @@ TEST_F(SelectLocationPolicyTest, TestNamedStorageWeightedSLPolicySelectForMatchW
         auto location_map = GenLocationMap({{CLS_SERVING, D_3FS, "3fs_01"}, {CLS_SERVING, D_NFS, "nfs_01"}});
         auto stale_check = [](const CacheLocation &) -> bool { return false; };
         std::vector<std::string> prune_loc_ids;
-        CacheLocation *location = policy.SelectForMatch(location_map, stale_check, prune_loc_ids);
-        ASSERT_EQ(location, nullptr);
+        CacheLocationConstPtr location = policy.SelectForMatch(location_map, stale_check, prune_loc_ids);
+        ASSERT_TRUE(location->location_specs().empty());
         ASSERT_EQ(prune_loc_ids.size(), 2u);
     }
     // (b) mix of stale and valid ->
@@ -528,11 +536,11 @@ TEST_F(SelectLocationPolicyTest, TestNamedStorageWeightedSLPolicySelectForMatchW
         };
         for (int i = 0; i < 100; ++i) {
             std::vector<std::string> prune_loc_ids;
-            CacheLocation *location = policy.SelectForMatch(location_map, stale_check, prune_loc_ids);
-            ASSERT_NE(location, nullptr);
+            CacheLocationConstPtr location = policy.SelectForMatch(location_map, stale_check, prune_loc_ids);
+            ASSERT_FALSE(location->location_specs().empty());
             ASSERT_THAT(location->type(), AnyOf(D_NFS, D_MEMPOOL));
             ASSERT_EQ(prune_loc_ids.size(), 1u);
-            ASSERT_EQ(location_map.at(prune_loc_ids[0]).type(), D_3FS);
+            ASSERT_EQ(location_map.at(prune_loc_ids[0])->type(), D_3FS);
         }
     }
     // (c) non-CLS_SERVING entries ignored ->
@@ -541,11 +549,11 @@ TEST_F(SelectLocationPolicyTest, TestNamedStorageWeightedSLPolicySelectForMatchW
         auto location_map = GenLocationMap({{CLS_WRITING, D_3FS, "3fs_01"}, {CLS_SERVING, D_NFS, "nfs_01"}});
         auto stale_check = [](const CacheLocation &) -> bool { return false; };
         std::vector<std::string> prune_loc_ids;
-        CacheLocation *location = policy.SelectForMatch(location_map, stale_check, prune_loc_ids);
-        ASSERT_EQ(location, nullptr);
+        CacheLocationConstPtr location = policy.SelectForMatch(location_map, stale_check, prune_loc_ids);
+        ASSERT_TRUE(location->location_specs().empty());
         // only the CLS_SERVING nfs entry is pruned
         ASSERT_EQ(prune_loc_ids.size(), 1u);
-        ASSERT_EQ(location_map.at(prune_loc_ids[0]).status(), CLS_SERVING);
+        ASSERT_EQ(location_map.at(prune_loc_ids[0])->status(), CLS_SERVING);
     }
     // (d) stale entry with weight 0 (3fs_02) ->
     //     still pruned (stale-data check runs before the weight check)
@@ -553,8 +561,8 @@ TEST_F(SelectLocationPolicyTest, TestNamedStorageWeightedSLPolicySelectForMatchW
         auto location_map = GenLocationMap({{CLS_SERVING, D_3FS, "3fs_02"}, {CLS_SERVING, D_3FS, "3fs_01"}});
         auto stale_check = [](const CacheLocation &) -> bool { return false; };
         std::vector<std::string> prune_loc_ids;
-        CacheLocation *location = policy.SelectForMatch(location_map, stale_check, prune_loc_ids);
-        ASSERT_EQ(location, nullptr);
+        CacheLocationConstPtr location = policy.SelectForMatch(location_map, stale_check, prune_loc_ids);
+        ASSERT_TRUE(location->location_specs().empty());
         ASSERT_EQ(prune_loc_ids.size(), 2u);
     }
 }
@@ -641,7 +649,7 @@ TEST_F(SelectLocationPolicyTest, TestNamedStorageWeightedSLPolicyExistsForWriteW
         ASSERT_TRUE(policy.ExistsForWrite(location_map, stale_check, prune_loc_ids));
         ASSERT_EQ(prune_loc_ids.size(), 2u);
         for (const auto &id : prune_loc_ids) {
-            ASSERT_EQ(location_map.at(id).status(), CLS_SERVING);
+            ASSERT_EQ(location_map.at(id)->status(), CLS_SERVING);
         }
     }
     // (f) mix of stale and valid CLS_SERVING ->
@@ -654,7 +662,7 @@ TEST_F(SelectLocationPolicyTest, TestNamedStorageWeightedSLPolicyExistsForWriteW
         std::vector<std::string> prune_loc_ids;
         ASSERT_TRUE(policy.ExistsForWrite(location_map, stale_check, prune_loc_ids));
         ASSERT_EQ(prune_loc_ids.size(), 1u);
-        ASSERT_EQ(location_map.at(prune_loc_ids[0]).type(), D_3FS);
+        ASSERT_EQ(location_map.at(prune_loc_ids[0])->type(), D_3FS);
     }
 }
 

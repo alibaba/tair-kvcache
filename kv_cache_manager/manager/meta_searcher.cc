@@ -1,14 +1,14 @@
 #include "kv_cache_manager/manager/meta_searcher.h"
 
+#include <algorithm>
 #include <map>
+#include <set>
 #include <utility>
 
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/string_util.h"
-#include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
-#include "kv_cache_manager/meta/meta_indexer_manager.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
 
 namespace kv_cache_manager {
@@ -32,65 +32,68 @@ void LogErrorCodes(const std::string &operation_name,
     }
 }
 
-CacheLocation SelectAndMergeForMatch(SelectLocationPolicy *policy,
-                                     CacheLocationMap &location_map,
-                                     CheckLocDataExistFunc check_loc_data_exist,
-                                     std::vector<std::string> &out_prune_loc_ids) {
+CacheLocationConstPtr SelectAndMergeForMatch(SelectLocationPolicy *policy,
+                                             CacheLocationMap &location_map,
+                                             CheckLocDataExistFunc check_loc_data_exist,
+                                             std::vector<std::string> &out_prune_loc_ids) {
     // Filter valid locations into a shared map.
     CacheLocationMap valid_map;
-    for (auto &[id, loc] : location_map) {
-        if (loc.status() != CacheLocationStatus::CLS_SERVING) {
+    for (auto &[id, loc_ptr] : location_map) {
+        if (!loc_ptr) {
             continue;
         }
-        if (check_loc_data_exist && !check_loc_data_exist(loc)) {
+        if (loc_ptr->status() != CacheLocationStatus::CLS_SERVING) {
+            continue;
+        }
+        if (check_loc_data_exist && !check_loc_data_exist(*loc_ptr)) {
             out_prune_loc_ids.push_back(id);
             continue;
         }
-        valid_map.try_emplace(id, loc);
+        valid_map.try_emplace(id, loc_ptr);
     }
     if (valid_map.empty()) {
-        return {};
+        return std::make_shared<CacheLocation>();
     }
 
     // Use the policy to select one winning location, which determines the
     // target storage backend instance.
     std::vector<std::string> unused_prune_ids;
-    CacheLocation *winner = policy->SelectForMatch(valid_map, nullptr, unused_prune_ids);
+    CacheLocationConstPtr winner = policy->SelectForMatch(valid_map, nullptr, unused_prune_ids);
     if (!winner || winner->location_specs().empty()) {
-        return {};
+        return std::make_shared<CacheLocation>();
     }
 
     // Collect all specs from every valid location that belongs to the same
     // storage backend as the winner, dedup by spec name.
     std::map<std::string, LocationSpec> merged_specs;
-    for (auto &[id, loc] : valid_map) {
-        if (!policy->IsSameDataStorage(loc, *winner)) {
+    for (const auto &[id, loc_ptr] : valid_map) {
+        if (!loc_ptr || !policy->IsSameDataStorage(*loc_ptr, *winner)) {
             continue;
         }
-        for (const auto &spec : loc.location_specs()) {
+        for (const auto &spec : loc_ptr->location_specs()) {
             merged_specs.try_emplace(spec.name(), spec);
         }
     }
 
     if (merged_specs.empty()) {
-        return {};
+        return std::make_shared<CacheLocation>();
     }
 
     // NOTE: this is an aggregated view merging
     // specs from multiple locations, not a real stored entity. Downstream
     // CacheLocationView / proto serialization never accesses id either.
     std::string representative_id = winner->id() + "merged";
-    CacheLocation result;
-    result.set_id(std::move(representative_id));
-    result.set_status(CacheLocationStatus::CLS_SERVING);
-    result.set_type(winner->type());
+    auto result = std::make_shared<CacheLocation>();
+    result->set_id(std::move(representative_id));
+    result->set_status(CacheLocationStatus::CLS_SERVING);
+    result->set_type(winner->type());
     std::vector<LocationSpec> specs;
     specs.reserve(merged_specs.size());
     for (auto &[name, spec] : merged_specs) {
         specs.push_back(std::move(spec));
     }
-    result.set_spec_size(specs.size());
-    result.set_location_specs(std::move(specs));
+    result->set_spec_size(specs.size());
+    result->set_location_specs(std::move(specs));
     return result;
 }
 
@@ -137,10 +140,9 @@ ErrorCode MetaSearcher::PrefixMatchBestLocationImpl(RequestContext *request_cont
 
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerGet);
-    UriVector uris;
-    auto result = meta_indexer_->Get(request_context, keys, uris);
+    CacheLocationMapVector location_maps;
+    auto result = meta_indexer_->GetLocations(request_context, keys, location_maps);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerGet);
-    int64_t index_deserialize_time_us = 0;
 
     KeyVector prune_keys;
     std::vector<std::vector<std::string>> prune_loc_ids_vec;
@@ -151,26 +153,19 @@ ErrorCode MetaSearcher::PrefixMatchBestLocationImpl(RequestContext *request_cont
             break;
         }
 
-        int64_t begin_deserialize_time = TimestampUtil::GetCurrentTimeUs();
-        BlockCacheLocationsMeta meta;
-        if (!meta.FromJsonString(uris[i])) {
-            KVCM_LOG_WARN("location json parse failed, key[%lu](%lu), content: %s", i, keys[i], uris[i].c_str());
-            break;
-        }
-        index_deserialize_time_us += (TimestampUtil::GetCurrentTimeUs() - begin_deserialize_time);
-
-        auto &location_map = meta.location_map();
+        auto &location_map = location_maps[i];
         if (location_map.empty()) {
             KVCM_LOG_DEBUG("prefix match end because keys[%lu](%lu) no location", i, keys[i]);
             break;
         }
         std::vector<std::string> prune_loc_ids;
-        CacheLocation merged = SelectAndMergeForMatch(policy, location_map, check_loc_data_exist_func_, prune_loc_ids);
+        CacheLocationConstPtr merged =
+            SelectAndMergeForMatch(policy, location_map, check_loc_data_exist_func_, prune_loc_ids);
         if (!prune_loc_ids.empty()) {
             prune_keys.emplace_back(keys[i]);
             prune_loc_ids_vec.emplace_back(prune_loc_ids);
         }
-        if (merged.location_specs().empty()) {
+        if (merged->location_specs().empty()) {
             KVCM_LOG_DEBUG("prefix match end because keys[%lu] no serving location", i);
             break;
         }
@@ -182,13 +177,7 @@ ErrorCode MetaSearcher::PrefixMatchBestLocationImpl(RequestContext *request_cont
             if (result.error_codes[i] != ErrorCode::EC_OK) {
                 continue;
             }
-            int64_t begin_deserialize_time = TimestampUtil::GetCurrentTimeUs();
-            BlockCacheLocationsMeta meta;
-            if (!meta.FromJsonString(uris[i])) {
-                continue;
-            }
-            index_deserialize_time_us += (TimestampUtil::GetCurrentTimeUs() - begin_deserialize_time);
-            auto &location_map = meta.location_map();
+            auto &location_map = location_maps[i];
             if (location_map.empty()) {
                 continue;
             }
@@ -200,9 +189,6 @@ ErrorCode MetaSearcher::PrefixMatchBestLocationImpl(RequestContext *request_cont
             }
         }
     }
-
-    KVCM_METRICS_COLLECTOR_SET_METRICS(
-        service_metrics_collector, meta_searcher, index_deserialize_time_us, index_deserialize_time_us);
 
     if (!prune_keys.empty() && submit_del_req_func_) {
         submit_del_req_func_(prune_keys, prune_loc_ids_vec);
@@ -248,15 +234,14 @@ ErrorCode MetaSearcher::BatchGetBestLocation(RequestContext *request_context,
     out_locations.reserve(keys.size());
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerGet);
-    UriVector uris;
-    auto result = meta_indexer_->Get(request_context, keys, uris);
+    CacheLocationMapVector location_maps;
+    auto result = meta_indexer_->GetLocations(request_context, keys, location_maps);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerGet);
-    int64_t index_deserialize_time_us = 0;
     KeyVector prune_keys;
     std::vector<std::vector<std::string>> prune_loc_ids_vec;
     for (size_t i = 0; i < keys.size(); ++i) {
         if (result.error_codes[i] == ErrorCode::EC_NOENT) {
-            out_locations.push_back({});
+            out_locations.push_back(std::make_shared<CacheLocation>());
             continue;
         }
         if (result.error_codes[i] != ErrorCode::EC_OK) {
@@ -264,33 +249,24 @@ ErrorCode MetaSearcher::BatchGetBestLocation(RequestContext *request_context,
             break;
         }
 
-        int64_t begin_deserialize_time = TimestampUtil::GetCurrentTimeUs();
-        BlockCacheLocationsMeta meta;
-        if (!meta.FromJsonString(uris[i])) {
-            KVCM_LOG_WARN("location json parse failed, key[%lu](%lu), content: %s", i, keys[i], uris[i].c_str());
-            break;
-        }
-        index_deserialize_time_us += (TimestampUtil::GetCurrentTimeUs() - begin_deserialize_time);
-
-        auto &location_map = meta.location_map();
+        auto &location_map = location_maps[i];
         if (location_map.empty()) {
-            out_locations.push_back({});
+            out_locations.push_back(std::make_shared<CacheLocation>());
             continue;
         }
         std::vector<std::string> prune_loc_ids;
-        CacheLocation merged = SelectAndMergeForMatch(policy, location_map, check_loc_data_exist_func_, prune_loc_ids);
+        CacheLocationConstPtr merged =
+            SelectAndMergeForMatch(policy, location_map, check_loc_data_exist_func_, prune_loc_ids);
         if (!prune_loc_ids.empty()) {
             prune_keys.emplace_back(keys[i]);
             prune_loc_ids_vec.emplace_back(prune_loc_ids);
         }
-        if (merged.location_specs().empty()) {
-            out_locations.push_back({});
+        if (merged->location_specs().empty()) {
+            out_locations.push_back(std::make_shared<CacheLocation>());
             continue;
         }
         out_locations.push_back(std::move(merged));
     }
-    KVCM_METRICS_COLLECTOR_SET_METRICS(
-        service_metrics_collector, meta_searcher, index_deserialize_time_us, index_deserialize_time_us);
 
     if (!prune_keys.empty() && submit_del_req_func_) {
         submit_del_req_func_(prune_keys, prune_loc_ids_vec);
@@ -310,16 +286,18 @@ ErrorCode MetaSearcher::ReverseRollSlideWindowMatch(RequestContext *request_cont
     assert(sw_size > 0);
     // TODO: error handle
     out_locations.clear();
-    out_locations.assign(keys.size(), {});
+    out_locations.clear();
+    out_locations.reserve(keys.size());
+    for (size_t idx = 0; idx < keys.size(); ++idx) {
+        out_locations.push_back(std::make_shared<CacheLocation>());
+    }
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerGet);
-    UriVector uris;
-    // TODO : optimize batch get
-    auto result = meta_indexer_->Get(request_context, keys, uris);
+    CacheLocationMapVector location_maps;
+    auto result = meta_indexer_->GetLocations(request_context, keys, location_maps);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerGet);
-    int64_t index_deserialize_time_us = 0;
     bool is_match = false;
-    std::vector<CacheLocation> temp_sw_locations;
+    CacheLocationVector temp_sw_locations;
     temp_sw_locations.reserve(sw_size);
     KeyVector prune_keys;
     std::vector<std::vector<std::string>> prune_loc_ids_vec;
@@ -336,17 +314,7 @@ ErrorCode MetaSearcher::ReverseRollSlideWindowMatch(RequestContext *request_cont
             continue;
         }
         for (size_t offset = 0; offset < sw_size; ++offset) {
-            int64_t begin_deserialize_time = TimestampUtil::GetCurrentTimeUs();
-            BlockCacheLocationsMeta meta;
-            if (!meta.FromJsonString(uris[base + offset])) {
-                temp_sw_locations.clear();
-                base -= sw_size - offset;
-                is_match = false;
-                break;
-            }
-            index_deserialize_time_us += (TimestampUtil::GetCurrentTimeUs() - begin_deserialize_time);
-
-            auto &location_map = meta.location_map();
+            auto &location_map = location_maps[base + offset];
             if (location_map.empty()) {
                 temp_sw_locations.clear();
                 base -= sw_size - offset;
@@ -354,13 +322,13 @@ ErrorCode MetaSearcher::ReverseRollSlideWindowMatch(RequestContext *request_cont
                 break;
             }
             std::vector<std::string> prune_loc_ids;
-            CacheLocation merged =
+            CacheLocationConstPtr merged =
                 SelectAndMergeForMatch(policy, location_map, check_loc_data_exist_func_, prune_loc_ids);
             if (!prune_loc_ids.empty()) {
                 prune_keys.emplace_back(keys[base + offset]);
                 prune_loc_ids_vec.emplace_back(prune_loc_ids);
             }
-            if (merged.location_specs().empty()) {
+            if (!merged || merged->location_specs().empty()) {
                 temp_sw_locations.clear();
                 base -= sw_size - offset;
                 is_match = false;
@@ -373,8 +341,6 @@ ErrorCode MetaSearcher::ReverseRollSlideWindowMatch(RequestContext *request_cont
             break;
         }
     }
-    KVCM_METRICS_COLLECTOR_SET_METRICS(
-        service_metrics_collector, meta_searcher, index_deserialize_time_us, index_deserialize_time_us);
 
     if (!prune_keys.empty() && submit_del_req_func_) {
         submit_del_req_func_(prune_keys, prune_loc_ids_vec);
@@ -389,7 +355,6 @@ ErrorCode MetaSearcher::BatchGetLocation(RequestContext *request_context,
                                          std::vector<CacheLocationMap> &out_location_maps) {
     out_location_maps.clear();
 
-    UriVector out_uris;
     KeyVector query_keys;
     for (size_t idx = 0; idx < keys.size(); idx++) {
         if (IsIndexInMaskRange(input_mask, idx)) {
@@ -403,27 +368,13 @@ ErrorCode MetaSearcher::BatchGetLocation(RequestContext *request_context,
 
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerGet);
-    auto result = meta_indexer_->Get(request_context, query_keys, out_uris);
+    auto result = meta_indexer_->GetLocations(request_context, query_keys, out_location_maps);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerGet);
-
     for (size_t idx = 0; idx < query_keys.size(); idx++) {
-        if (result.error_codes[idx] == ErrorCode::EC_NOENT) {
-            out_location_maps.emplace_back();
-            continue;
+        if (result.error_codes[idx] != ErrorCode::EC_OK && result.error_codes[idx] != ErrorCode::EC_NOENT) {
+            KVCM_LOG_WARN(
+                "get key failed, key[%lu](%lu), error_code: %d", idx, query_keys[idx], result.error_codes[idx]);
         }
-        if (result.error_codes[idx] != ErrorCode::EC_OK) {
-            KVCM_LOG_WARN("get key failed, key[%lu](%lu), error_code: %d", idx, keys[idx], result.error_codes[idx]);
-            out_location_maps.emplace_back();
-            continue;
-            ;
-        }
-        BlockCacheLocationsMeta meta;
-        bool success = meta.FromJsonString(out_uris[idx]);
-        if (!success) {
-            out_location_maps.emplace_back();
-            continue;
-        }
-        out_location_maps.push_back(meta.location_map());
     }
     return EC_OK;
 }
@@ -437,72 +388,58 @@ ErrorCode MetaSearcher::BatchAddLocation(RequestContext *request_context,
     }
     out_location_ids.clear();
     out_location_ids.resize(keys.size());
-
-    // record each location's storage type and total size between block
-    // cache location metadata deserialize and serialize
     std::vector<std::pair<DataStorageType, std::uint64_t>> loc_sz(keys.size());
 
-    MetaSearcherMetrics metrics;
-    auto modifier = [&locations, &out_location_ids, &keys, &metrics, &loc_sz](
-                        std::string &uri,
-                        ErrorCode get_ec,
-                        size_t index,
-                        MetaIndexer::PropertyMap &upsert_property_map) -> MetaIndexer::ModifierResult {
-        BlockCacheLocationsMeta meta;
-        std::string location_id;
+    auto modifier =
+        [&locations, &out_location_ids, &keys, &loc_sz](const LocationIdVector &existing_location_ids,
+                                                        ErrorCode get_ec,
+                                                        size_t index,
+                                                        PropertyMap &upsert_property_map,
+                                                        CacheLocationMap &out_new_locations) -> ModifierResult {
         if (get_ec != ErrorCode::EC_OK && get_ec != ErrorCode::EC_NOENT) {
             KVCM_LOG_WARN("load location failed, key[%lu](%lu) return %d", index, keys[index], get_ec);
-            return {MetaIndexer::MA_FAIL, get_ec};
-        }
-        int64_t begin_deserialize_time = TimestampUtil::GetCurrentTimeUs();
-        if (get_ec == ErrorCode::EC_OK && !meta.FromJsonString(uri)) {
-            KVCM_LOG_WARN("location json parse failed, key[%lu](%lu), content: %s", index, keys[index], uri.c_str());
-            return {MetaIndexer::MA_FAIL, ErrorCode::EC_ERROR};
-        }
-        if (get_ec == EC_NOENT) {
-            std::string prev_key;
-            if (index > 0) {
-                prev_key = std::to_string(keys[index - 1]);
-            }
-            upsert_property_map[PROPERTY_PREV_BLOCK_KEY] = prev_key;
-        }
-        metrics.index_deserialize_time_us += (TimestampUtil::GetCurrentTimeUs() - begin_deserialize_time);
-        meta.AddNewLocation(locations[index], location_id);
-        ErrorCode ec = meta.UpdateLocationStatus(location_id, CLS_WRITING);
-        if (ec != ErrorCode::EC_OK) {
-            KVCM_LOG_WARN("add location failed, keys[%lu](%lu), location id: %s, return: %d",
-                          index,
-                          keys[index],
-                          location_id.c_str(),
-                          ec);
-            return {MetaIndexer::MA_FAIL, ErrorCode::EC_ERROR};
+            return {ModifierAction::MA_FAIL, get_ec};
         }
 
-        // save the storage type and size of this location
+        // first time this block_key is created: record prev_key
+        if (get_ec == EC_NOENT) {
+            std::string prev_key = index > 0 ? std::to_string(keys[index - 1]) : std::string();
+            upsert_property_map[PROPERTY_PREV_BLOCK_KEY] = prev_key;
+        }
+
+        // generate a unique location_id that does not collide with existing ones
+        const std::unordered_set<std::string> existing_id_set(existing_location_ids.begin(),
+                                                              existing_location_ids.end());
+        std::string location_id;
+        do {
+            location_id = StringUtil::GenerateRandomString(8);
+        } while (existing_id_set.count(location_id) > 0);
+
+        // build the new CacheLocation with status = CLS_WRITING
+        auto new_loc = std::make_shared<CacheLocation>(*locations[index]);
+        new_loc->set_id(location_id);
+        new_loc->set_status(CLS_WRITING);
+        out_new_locations[location_id] = std::move(new_loc);
+
+        // compute storage size for usage tracking
         std::uint64_t sz = 0;
-        for (const auto &loc_spec : locations[index].location_specs()) {
+        for (const auto &loc_spec : locations[index]->location_specs()) {
             if (DataStorageUri ds_uri(loc_spec.uri()); ds_uri.Valid()) {
                 std::uint64_t spec_sz;
                 ds_uri.GetParamAs<std::uint64_t>("size", spec_sz);
                 sz += spec_sz;
             }
         }
-        loc_sz[index] = std::make_pair(locations[index].type(), sz);
+        loc_sz[index] = std::make_pair(locations[index]->type(), sz);
 
-        int64_t begin_serialize_time = TimestampUtil::GetCurrentTimeUs();
-        uri = meta.ToJsonString();
-        metrics.index_serialize_time_us += (TimestampUtil::GetCurrentTimeUs() - begin_serialize_time);
         out_location_ids[index] = std::move(location_id);
-        return {MetaIndexer::MA_OK, ErrorCode::EC_OK};
+        return {ModifierAction::MA_OK, ErrorCode::EC_OK};
     };
+
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
-    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerReadModifyWrite);
-    auto result = meta_indexer_->ReadModifyWrite(request_context, keys, modifier);
-    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWrite);
-    KVCM_METRICS_COLLECTOR_SET_METRICS(
-        service_metrics_collector, meta_searcher, index_deserialize_time_us, metrics.index_deserialize_time_us);
-    KVCM_METRICS_COLLECTOR_SET_METRICS(
-        service_metrics_collector, meta_searcher, index_serialize_time_us, metrics.index_serialize_time_us);
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerReadModifyWriteBlock);
+    auto result = meta_indexer_->ReadModifyWriteBlock(request_context, keys, modifier);
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWriteBlock);
 
     // update the usage of each storage type
     for (std::size_t i = 0; i < keys.size(); i++) {
@@ -512,7 +449,7 @@ ErrorCode MetaSearcher::BatchAddLocation(RequestContext *request_context,
     }
 
     if (result.ec != ErrorCode::EC_OK) {
-        LogErrorCodes("meta_indexer_->ReadModifyWrite", result.error_codes, keys);
+        LogErrorCodes("meta_indexer_->ReadModifyWriteBlock", result.error_codes, keys);
     }
     return result.ec;
 }
@@ -528,70 +465,60 @@ ErrorCode MetaSearcher::BatchUpdateLocationStatus(RequestContext *request_contex
     out_batch_results.clear();
     out_batch_results.resize(keys.size());
 
-    MetaSearcherMetrics metrics;
-    auto modifier = [&batch_tasks, &keys, &metrics, &out_batch_results](
-                        std::string &uri,
-                        ErrorCode get_ec,
-                        size_t index,
-                        MetaIndexer::PropertyMap &upsert_property_map) -> MetaIndexer::ModifierResult {
-        // 获取当前处理的键
-        const int64_t current_key = keys[index];
-        const auto &tasks = batch_tasks[index];
-        auto &result = out_batch_results[index];
-
-        if (get_ec != ErrorCode::EC_OK) {
-            KVCM_LOG_WARN("load location failed, key[%lu](%lu) return %d", index, current_key, get_ec);
-            result.assign(tasks.size(), get_ec);
-            return {MetaIndexer::MA_FAIL, get_ec};
+    LocationIdsPerKey location_ids_per_key(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        location_ids_per_key[i].reserve(batch_tasks[i].size());
+        for (const auto &task : batch_tasks[i]) {
+            location_ids_per_key[i].push_back(task.location_id);
         }
+    }
 
-        BlockCacheLocationsMeta meta;
-        int64_t begin_deserialize_time = TimestampUtil::GetCurrentTimeUs();
-        if (!meta.FromJsonString(uri)) {
-            KVCM_LOG_WARN("location json parse failed, key[%lu](%lu), content: %s", index, keys[index], uri.c_str());
-            result.assign(tasks.size(), ErrorCode::EC_CORRUPTION);
-            return {MetaIndexer::MA_FAIL, ErrorCode::EC_CORRUPTION};
-        }
-        metrics.index_deserialize_time_us += (TimestampUtil::GetCurrentTimeUs() - begin_deserialize_time);
+    // Per-key modifier: OK slots flip to new_status and report EC_OK so the
+    // upsert ec eventually lands on them; NOENT slots are reported as EC_OK
+    // (idempotent no-op); hard errors are surfaced verbatim per slot.
+    auto modifier = [&keys, &batch_tasks](const std::vector<ErrorCode> &get_ecs,
+                                          const LocationIdVector &loc_ids,
+                                          size_t key_index,
+                                          CacheLocationVector &locs,
+                                          PropertyMap &upsert_property_map) -> LocationModifierResult {
+        (void)upsert_property_map;
+        std::vector<ErrorCode> modifier_ecs(loc_ids.size(), ErrorCode::EC_OK);
         bool updated = false;
-        // 更新该键对应的所有location的status
-        for (const auto &task : tasks) {
-            ErrorCode ec = meta.UpdateLocationStatus(task.location_id, task.new_status);
+        for (size_t loc_index = 0; loc_index < loc_ids.size(); ++loc_index) {
+            const ErrorCode ec = get_ecs[loc_index];
+            const std::string &loc_id = loc_ids[loc_index];
             if (ec != ErrorCode::EC_OK) {
-                KVCM_LOG_INFO(
-                    "update location status failed, keys[%lu](%lu), location id: %s, new status: %d, return: %d",
-                    index,
-                    current_key,
-                    task.location_id.c_str(),
-                    task.new_status,
-                    ec);
-                result.push_back(ec);
-            } else {
-                updated = true;
-                result.push_back(ErrorCode::EC_OK);
+                modifier_ecs[loc_index] = ec;
+                if (ec != ErrorCode::EC_NOENT) {
+                    KVCM_LOG_WARN("load location failed, key[%lu](%lu), location_id: %s, return %d",
+                                  key_index,
+                                  keys[key_index],
+                                  loc_id.c_str(),
+                                  ec);
+                }
+                continue;
             }
+            updated = true;
+            // COW: copy the location, modify the copy, replace the pointer
+            auto new_loc = std::make_shared<CacheLocation>(*locs[loc_index]);
+            new_loc->set_status(batch_tasks[key_index][loc_index].new_status);
+            locs[loc_index] = std::move(new_loc);
         }
-
         if (!updated) {
             // do not need to update status, skip and return ok
-            return {MetaIndexer::MA_SKIP, ErrorCode::EC_OK};
+            return {ModifierAction::MA_SKIP, std::move(modifier_ecs)};
         }
-        int64_t begin_serialize_time = TimestampUtil::GetCurrentTimeUs();
-        uri = meta.ToJsonString();
-        metrics.index_serialize_time_us += (TimestampUtil::GetCurrentTimeUs() - begin_serialize_time);
-        return {MetaIndexer::MA_OK, ErrorCode::EC_OK};
+        return {ModifierAction::MA_OK, std::move(modifier_ecs)};
     };
 
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
-    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerReadModifyWrite);
-    auto result = meta_indexer_->ReadModifyWrite(request_context, keys, modifier);
-    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWrite);
-    KVCM_METRICS_COLLECTOR_SET_METRICS(
-        service_metrics_collector, meta_searcher, index_deserialize_time_us, metrics.index_deserialize_time_us);
-    KVCM_METRICS_COLLECTOR_SET_METRICS(
-        service_metrics_collector, meta_searcher, index_serialize_time_us, metrics.index_serialize_time_us);
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
+    auto result = meta_indexer_->ReadModifyWriteLocation(request_context, keys, location_ids_per_key, modifier);
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
+    out_batch_results = std::move(result.per_location_error_codes);
+
     if (result.ec != ErrorCode::EC_OK) {
-        LogErrorCodes("meta_indexer_->ReadModifyWrite", result.error_codes, keys);
+        KVCM_LOG_WARN("meta_indexer_->ReadModifyWriteLocation failed, ec: %d", result.ec);
     }
     return result.ec;
 }
@@ -607,84 +534,65 @@ ErrorCode MetaSearcher::BatchCASLocationStatus(RequestContext *request_context,
     out_batch_results.clear();
     out_batch_results.resize(keys.size());
 
-    MetaSearcherMetrics metrics;
-    auto modifier = [&keys, &batch_tasks, &metrics, &out_batch_results](
-                        std::string &uri,
-                        ErrorCode get_ec,
-                        size_t index,
-                        MetaIndexer::PropertyMap &upsert_property_map) -> MetaIndexer::ModifierResult {
-        // 获取当前处理的键
-        const int64_t current_key = keys[index];
-        const auto &tasks = batch_tasks[index];
-        auto &result = out_batch_results[index];
-
-        if (get_ec != ErrorCode::EC_OK) {
-            KVCM_LOG_WARN("load location failed, key[%lu](%lu) return %d", index, current_key, get_ec);
-            result.assign(tasks.size(), get_ec);
-            return {MetaIndexer::MA_FAIL, ErrorCode::EC_IO_ERROR};
+    LocationIdsPerKey location_ids_per_key(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        location_ids_per_key[i].reserve(batch_tasks[i].size());
+        for (const auto &task : batch_tasks[i]) {
+            location_ids_per_key[i].push_back(task.location_id);
         }
+    }
 
-        BlockCacheLocationsMeta meta;
-        int64_t begin_deserialize_time = TimestampUtil::GetCurrentTimeUs();
-        if (!meta.FromJsonString(uri)) {
-            KVCM_LOG_WARN("location json parse failed, key[%lu](%lu), content: %s", index, keys[index], uri.c_str());
-            result.assign(tasks.size(), ErrorCode::EC_CORRUPTION);
-            return {MetaIndexer::MA_FAIL, ErrorCode::EC_CORRUPTION};
-        }
-        metrics.index_deserialize_time_us += (TimestampUtil::GetCurrentTimeUs() - begin_deserialize_time);
+    // Per-key CAS modifier: OK slot whose status matches old_status flips to
+    // new_status (slot ec EC_OK -> participates in upsert); status mismatch
+    // yields EC_MISMATCH; NOENT is idempotent EC_OK; hard errors surface as-is.
+    auto modifier = [&keys, &batch_tasks](const std::vector<ErrorCode> &get_ecs,
+                                          const LocationIdVector &loc_ids,
+                                          size_t key_index,
+                                          CacheLocationVector &locs,
+                                          PropertyMap &upsert_property_map) -> LocationModifierResult {
+        (void)upsert_property_map;
+        std::vector<ErrorCode> modifier_ecs(loc_ids.size(), ErrorCode::EC_OK);
         bool updated = false;
-        // 更新该键对应的所有location的status
-        for (const auto &task : tasks) {
-            CacheLocationStatus status;
-            ErrorCode ec = meta.GetLocationStatus(task.location_id, status);
+        for (size_t loc_index = 0; loc_index < loc_ids.size(); ++loc_index) {
+            const ErrorCode ec = get_ecs[loc_index];
+            const std::string &loc_id = loc_ids[loc_index];
             if (ec != ErrorCode::EC_OK) {
-                KVCM_LOG_DEBUG("get location status failed, keys[%lu](%lu), location id: %s, return: %d",
-                               index,
-                               current_key,
-                               task.location_id.c_str(),
-                               ec);
-                result.push_back(ec);
+                modifier_ecs[loc_index] = ec;
+                if (ec != ErrorCode::EC_NOENT) {
+                    KVCM_LOG_WARN("load location failed, key[%lu](%lu), location_id: %s, return %d",
+                                  key_index,
+                                  keys[key_index],
+                                  loc_id.c_str(),
+                                  ec);
+                }
                 continue;
             }
-            if (status != task.old_status) {
-                result.push_back(ErrorCode::EC_MISMATCH);
-                continue;
-            }
-            ec = meta.UpdateLocationStatus(task.location_id, task.new_status);
-            if (ec != ErrorCode::EC_OK) {
-                KVCM_LOG_INFO("update location status failed, keys[%lu](%lu), location id: %s, old status: %d, new "
-                              "status: %d, return: %d",
-                              index,
-                              current_key,
-                              task.location_id.c_str(),
-                              task.old_status,
-                              task.new_status,
-                              ec);
-                result.push_back(ec);
+            const auto &task = batch_tasks[key_index][loc_index];
+            if (locs[loc_index]->status() != task.old_status) {
+                modifier_ecs[loc_index] = ErrorCode::EC_MISMATCH;
             } else {
                 updated = true;
-                result.push_back(ErrorCode::EC_OK);
+                // COW: copy the location, modify the copy, replace the pointer
+                auto new_loc = std::make_shared<CacheLocation>(*locs[loc_index]);
+                new_loc->set_status(task.new_status);
+                locs[loc_index] = std::move(new_loc);
             }
         }
-
         if (!updated) {
             // do not need to update status, skip and return ok
-            return {MetaIndexer::MA_SKIP, ErrorCode::EC_OK};
+            return {ModifierAction::MA_SKIP, std::move(modifier_ecs)};
         }
-        int64_t begin_serialize_time = TimestampUtil::GetCurrentTimeUs();
-        uri = meta.ToJsonString();
-        metrics.index_serialize_time_us += (TimestampUtil::GetCurrentTimeUs() - begin_serialize_time);
-        return {MetaIndexer::MA_OK, ErrorCode::EC_OK};
+        return {ModifierAction::MA_OK, std::move(modifier_ecs)};
     };
 
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
-    auto result = meta_indexer_->ReadModifyWrite(request_context, keys, modifier);
-    KVCM_METRICS_COLLECTOR_SET_METRICS(
-        service_metrics_collector, meta_searcher, index_deserialize_time_us, metrics.index_deserialize_time_us);
-    KVCM_METRICS_COLLECTOR_SET_METRICS(
-        service_metrics_collector, meta_searcher, index_serialize_time_us, metrics.index_serialize_time_us);
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
+    auto result = meta_indexer_->ReadModifyWriteLocation(request_context, keys, location_ids_per_key, modifier);
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
+    out_batch_results = std::move(result.per_location_error_codes);
+
     if (result.ec != ErrorCode::EC_OK) {
-        LogErrorCodes("meta_indexer_->ReadModifyWrite", result.error_codes, keys);
+        KVCM_LOG_WARN("meta_indexer_->ReadModifyWriteLocation failed, ec: %d", result.ec);
     }
     return result.ec;
 }
@@ -696,121 +604,85 @@ ErrorCode MetaSearcher::BatchCADLocationStatus(RequestContext *request_context,
     if (keys.size() != batch_tasks.size()) {
         return EC_BADARGS;
     }
-
     out_batch_results.clear();
     out_batch_results.resize(keys.size());
 
-    // record multiple locations' storage type and total size between
-    // block cache location metadata deserialize and serialize
     std::vector<std::vector<std::pair<DataStorageType, std::uint64_t>>> locs_sz(keys.size());
-
-    MetaSearcherMetrics metrics;
-    auto modifier = [&batch_tasks, &keys, &metrics, &out_batch_results, &locs_sz](
-                        std::string &uri,
-                        ErrorCode get_ec,
-                        size_t index,
-                        MetaIndexer::PropertyMap &upsert_property_map) -> MetaIndexer::ModifierResult {
-        // 获取当前处理的键
-        const int64_t current_key = keys[index];
-        const auto &tasks = batch_tasks[index];
-        auto &result = out_batch_results[index];
-        locs_sz[index].clear();
-
-        if (get_ec != ErrorCode::EC_OK) {
-            KVCM_LOG_WARN("load location failed, key[%lu](%lu) return %d", index, current_key, get_ec);
-            result.assign(tasks.size(), get_ec);
-            return {MetaIndexer::MA_FAIL, ErrorCode::EC_ERROR};
+    LocationIdsPerKey location_ids_per_key(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        locs_sz[i].resize(batch_tasks[i].size());
+        location_ids_per_key[i].reserve(batch_tasks[i].size());
+        for (const auto &task : batch_tasks[i]) {
+            location_ids_per_key[i].push_back(task.location_id);
         }
-        BlockCacheLocationsMeta meta;
-        int64_t begin_deserialize_time = TimestampUtil::GetCurrentTimeUs();
-        if (!meta.FromJsonString(uri)) {
-            KVCM_LOG_WARN("location json parse failed, key[%lu](%lu), content: %s", index, keys[index], uri.c_str());
-            result.assign(tasks.size(), ErrorCode::EC_CORRUPTION);
-            return {MetaIndexer::MA_FAIL, ErrorCode::EC_ERROR};
-        }
-        metrics.index_deserialize_time_us += (TimestampUtil::GetCurrentTimeUs() - begin_deserialize_time);
+    }
 
+    // Per-key CAD modifier: each slot is gated by a status match. Matching
+    // OK slots stay EC_OK (delete will be dispatched, payload size captured
+    // for usage replay); mismatches yield EC_MISMATCH; NOENT is EC_OK
+    // (idempotent); hard errors surface verbatim.
+    auto modifier = [&keys, &batch_tasks, &locs_sz](const std::vector<ErrorCode> &get_ecs,
+                                                    const LocationIdVector &loc_ids,
+                                                    size_t key_index,
+                                                    CacheLocationVector &locs,
+                                                    PropertyMap &upsert_property_map) -> LocationModifierResult {
+        (void)upsert_property_map;
+        std::vector<ErrorCode> modifier_ecs(loc_ids.size(), ErrorCode::EC_OK);
         bool updated = false;
-        for (const auto &task : tasks) {
-            // save the storage type and size of this location
-            std::uint64_t sz = 0;
-            auto type{DataStorageType::DATA_STORAGE_TYPE_UNKNOWN};
-            const auto &loc_map = meta.location_map();
-            if (auto it = loc_map.find(task.location_id); it != loc_map.end()) {
-                type = it->second.type();
-                for (const auto &loc_spec : it->second.location_specs()) {
-                    if (DataStorageUri ds_uri(loc_spec.uri()); ds_uri.Valid()) {
-                        std::uint64_t spec_sz;
-                        ds_uri.GetParamAs<std::uint64_t>("size", spec_sz);
-                        sz += spec_sz;
-                    }
+        for (size_t loc_index = 0; loc_index < loc_ids.size(); ++loc_index) {
+            const ErrorCode ec = get_ecs[loc_index];
+            const std::string &loc_id = loc_ids[loc_index];
+            if (ec != ErrorCode::EC_OK) {
+                modifier_ecs[loc_index] = ec;
+                if (ec != ErrorCode::EC_NOENT) {
+                    KVCM_LOG_WARN("load location failed, key[%lu](%lu), location_id: %s, return %d",
+                                  key_index,
+                                  keys[key_index],
+                                  loc_id.c_str(),
+                                  ec);
                 }
-            }
-            locs_sz[index].emplace_back(std::make_pair(type, sz));
-
-            CacheLocationStatus status;
-            ErrorCode ec = meta.GetLocationStatus(task.location_id, status);
-            if (ec != ErrorCode::EC_OK) {
-                KVCM_LOG_WARN("get location status failed, keys[%lu](%lu), location id: %s, return: %d",
-                              index,
-                              current_key,
-                              task.location_id.c_str(),
-                              ec);
-                result.push_back(ec);
                 continue;
             }
-            if (status != task.expect_status) {
-                result.push_back(ErrorCode::EC_MISMATCH);
-                continue;
-            }
-            ec = meta.DeleteLocation(task.location_id);
-            if (ec != ErrorCode::EC_OK) {
-                KVCM_LOG_WARN("delete location status failed, keys[%lu](%lu), location id: %s, return: %d",
-                              index,
-                              current_key,
-                              task.location_id.c_str(),
-                              ec);
-                result.push_back(ec);
+            if (!locs[loc_index] || locs[loc_index]->status() != batch_tasks[key_index][loc_index].expect_status) {
+                modifier_ecs[loc_index] = ErrorCode::EC_MISMATCH;
                 continue;
             }
             updated = true;
-            result.push_back(ErrorCode::EC_OK);
-        }
-        if (meta.GetLocationCount() == 0) {
-            KVCM_LOG_DEBUG("all location deleted so delete keys[%lu](%lu)", index, current_key);
-            return {MetaIndexer::MA_DELETE, ErrorCode::EC_OK};
+            // compute storage size before deletion for usage tracking
+            std::uint64_t sz = 0;
+            for (const auto &loc_spec : locs[loc_index]->location_specs()) {
+                if (DataStorageUri ds_uri(loc_spec.uri()); ds_uri.Valid()) {
+                    std::uint64_t spec_sz = 0;
+                    ds_uri.GetParamAs<std::uint64_t>("size", spec_sz);
+                    sz += spec_sz;
+                }
+            }
+            locs_sz[key_index][loc_index] = std::make_pair(locs[loc_index]->type(), sz);
         }
         if (!updated) {
             // do not need to update status, skip and return ok
-            return {MetaIndexer::MA_SKIP, ErrorCode::EC_OK};
+            return {ModifierAction::MA_SKIP, std::move(modifier_ecs)};
         }
-        int64_t begin_serialize_time = TimestampUtil::GetCurrentTimeUs();
-        uri = meta.ToJsonString();
-        metrics.index_serialize_time_us += (TimestampUtil::GetCurrentTimeUs() - begin_serialize_time);
-
-        return {MetaIndexer::MA_OK, ErrorCode::EC_OK};
+        return {ModifierAction::MA_DELETE, std::move(modifier_ecs)};
     };
 
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
-    auto result = meta_indexer_->ReadModifyWrite(request_context, keys, modifier);
-    KVCM_METRICS_COLLECTOR_SET_METRICS(
-        service_metrics_collector, meta_searcher, index_deserialize_time_us, metrics.index_deserialize_time_us);
-    KVCM_METRICS_COLLECTOR_SET_METRICS(
-        service_metrics_collector, meta_searcher, index_serialize_time_us, metrics.index_serialize_time_us);
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
+    auto result = meta_indexer_->ReadModifyWriteLocation(request_context, keys, location_ids_per_key, modifier);
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
+    out_batch_results = std::move(result.per_location_error_codes);
 
     // update the usage of each storage type
-    for (std::size_t i = 0; i != keys.size(); ++i) {
-        if (result.error_codes[i] == ErrorCode::EC_OK) {
-            for (std::size_t j = 0; j != batch_tasks[i].size(); ++j) {
-                if (out_batch_results[i][j] == ErrorCode::EC_OK) {
-                    meta_indexer_->SubStorageUsageByType(locs_sz[i][j].first, locs_sz[i][j].second);
-                }
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        for (std::size_t j = 0; j < batch_tasks[i].size(); ++j) {
+            if (j < out_batch_results[i].size() && out_batch_results[i][j] == ErrorCode::EC_OK) {
+                meta_indexer_->SubStorageUsageByType(locs_sz[i][j].first, locs_sz[i][j].second);
             }
         }
     }
 
     if (result.ec != ErrorCode::EC_OK) {
-        LogErrorCodes("meta_indexer_->ReadModifyWrite", result.error_codes, keys);
+        KVCM_LOG_WARN("meta_indexer_->ReadModifyWriteLocation failed, ec: %d", result.ec);
     }
     return result.ec;
 }
@@ -824,85 +696,83 @@ ErrorCode MetaSearcher::BatchDeleteLocation(RequestContext *request_context,
         return EC_BADARGS;
     }
     results.clear();
-    results.reserve(keys.size());
+    results.resize(keys.size(), ErrorCode::EC_OK);
 
-    // record each location's storage type and total size between block
-    // cache location metadata deserialize and serialize
     std::vector<std::pair<DataStorageType, std::uint64_t>> loc_sz(keys.size());
+    LocationIdsPerKey location_ids_per_key(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        location_ids_per_key[i].push_back(location_ids[i]);
+    }
 
-    MetaSearcherMetrics metrics;
-    auto modifier = [&location_ids, &keys, &metrics, &loc_sz](
-                        std::string &uri,
-                        ErrorCode get_ec,
-                        size_t index,
-                        MetaIndexer::PropertyMap &upsert_property_map) -> MetaIndexer::ModifierResult {
-        if (get_ec == ErrorCode::EC_NOENT) {
-            // do not need to delete, skip and return ok
-            return {MetaIndexer::MA_SKIP, ErrorCode::EC_OK};
-        }
-        if (get_ec != ErrorCode::EC_OK) {
-            KVCM_LOG_WARN("load location failed, key[%lu](%lu) return %d", index, keys[index], get_ec);
-            return {MetaIndexer::MA_FAIL, get_ec};
-        }
-        BlockCacheLocationsMeta meta;
-        int64_t begin_deserialize_time = TimestampUtil::GetCurrentTimeUs();
-        if (!meta.FromJsonString(uri)) {
-            KVCM_LOG_WARN("location json parse failed, key[%lu](%lu), content: %s", index, keys[index], uri.c_str());
-            return {MetaIndexer::MA_FAIL, ErrorCode::EC_ERROR};
-        }
-        metrics.index_deserialize_time_us += (TimestampUtil::GetCurrentTimeUs() - begin_deserialize_time);
-
-        // save the storage type and size of this location
-        std::uint64_t sz = 0;
-        auto type{DataStorageType::DATA_STORAGE_TYPE_UNKNOWN};
-        const auto &loc_map = meta.location_map();
-        if (auto it = loc_map.find(location_ids[index]); it != loc_map.end()) {
-            type = it->second.type();
-            for (const auto &loc_spec : it->second.location_specs()) {
+    // Per-key modifier: each key carries exactly one target location. OK
+    // slot's payload size is captured for usage replay and ec stays EC_OK
+    // (delete will be dispatched); NOENT is idempotent; errors surface as-is.
+    auto modifier = [&keys, &loc_sz](const std::vector<ErrorCode> &get_ecs,
+                                     const LocationIdVector &loc_ids,
+                                     size_t key_index,
+                                     CacheLocationVector &locs,
+                                     PropertyMap &upsert_property_map) -> LocationModifierResult {
+        (void)upsert_property_map;
+        std::vector<ErrorCode> modifier_ecs(loc_ids.size(), ErrorCode::EC_OK);
+        bool updated = false;
+        for (size_t loc_index = 0; loc_index < loc_ids.size(); ++loc_index) {
+            const ErrorCode ec = get_ecs[loc_index];
+            const std::string &loc_id = loc_ids[loc_index];
+            if (ec != ErrorCode::EC_OK) {
+                modifier_ecs[loc_index] = ec;
+                if (ec != ErrorCode::EC_NOENT) {
+                    KVCM_LOG_ERROR("load location failed, key[%lu](%lu), location_id: %s, return %d",
+                                   key_index,
+                                   keys[key_index],
+                                   loc_id.c_str(),
+                                   ec);
+                }
+                continue;
+            }
+            if (!locs[loc_index]) {
+                modifier_ecs[loc_index] = ErrorCode::EC_NOENT;
+                continue;
+            }
+            updated = true;
+            std::uint64_t sz = 0;
+            for (const auto &loc_spec : locs[loc_index]->location_specs()) {
                 if (DataStorageUri ds_uri(loc_spec.uri()); ds_uri.Valid()) {
-                    std::uint64_t spec_sz;
+                    std::uint64_t spec_sz = 0;
                     ds_uri.GetParamAs<std::uint64_t>("size", spec_sz);
                     sz += spec_sz;
                 }
             }
+            loc_sz[key_index] = std::make_pair(locs[loc_index]->type(), sz);
         }
-        loc_sz[index] = std::make_pair(type, sz);
-
-        ErrorCode ec = meta.DeleteLocation(location_ids[index]);
-        if (ec != ErrorCode::EC_OK) {
-            KVCM_LOG_WARN("delete location failed, keys[%lu](%lu), location id: %s, return: %d",
-                          index,
-                          keys[index],
-                          location_ids[index].c_str(),
-                          ec);
-            return {MetaIndexer::MA_FAIL, ec};
+        if (!updated) {
+            // do not need to update status, skip and return ok
+            return {ModifierAction::MA_SKIP, std::move(modifier_ecs)};
         }
-
-        int64_t begin_serialize_time = TimestampUtil::GetCurrentTimeUs();
-        uri = meta.ToJsonString();
-        metrics.index_serialize_time_us += (TimestampUtil::GetCurrentTimeUs() - begin_serialize_time);
-        return {MetaIndexer::MA_OK, ErrorCode::EC_OK};
+        return {ModifierAction::MA_DELETE, std::move(modifier_ecs)};
     };
+
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
-    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerReadModifyWrite);
-    auto result = meta_indexer_->ReadModifyWrite(request_context, keys, modifier);
-    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWrite);
-    KVCM_METRICS_COLLECTOR_SET_METRICS(
-        service_metrics_collector, meta_searcher, index_deserialize_time_us, metrics.index_deserialize_time_us);
-    KVCM_METRICS_COLLECTOR_SET_METRICS(
-        service_metrics_collector, meta_searcher, index_serialize_time_us, metrics.index_serialize_time_us);
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
+    auto result = meta_indexer_->ReadModifyWriteLocation(request_context, keys, location_ids_per_key, modifier);
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerReadModifyWriteLocation);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (i >= result.per_location_error_codes.size() || result.per_location_error_codes[i].size() != 1) {
+            results[i] = ErrorCode::EC_MISMATCH;
+            continue;
+        }
+        results[i] = result.per_location_error_codes[i].front();
+    }
 
     // update the usage of each storage type
-    for (std::size_t i = 0; i < keys.size(); i++) {
-        if (result.error_codes[i] == ErrorCode::EC_OK) {
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        if (results[i] == ErrorCode::EC_OK) {
             meta_indexer_->SubStorageUsageByType(loc_sz[i].first, loc_sz[i].second);
         }
     }
 
     if (result.ec != ErrorCode::EC_OK) {
-        LogErrorCodes("meta_indexer_->ReadModifyWrite", result.error_codes, keys);
+        KVCM_LOG_WARN("meta_indexer_->ReadModifyWriteLocation failed, ec: %d", result.ec);
     }
-    results = std::move(result.error_codes);
     return result.ec;
 }
 

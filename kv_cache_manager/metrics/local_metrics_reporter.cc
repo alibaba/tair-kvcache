@@ -137,7 +137,7 @@ void LocalMetricsReporter::ReportInterval() {
         for (auto &[_, indexer] : indexer_map) {
             if (indexer) {
                 total_key_count_v += indexer->GetKeyCount();
-                total_cache_usage_v += indexer->GetCacheUsage();
+                total_cache_usage_v += indexer->GetMemUsage();
             }
         }
 

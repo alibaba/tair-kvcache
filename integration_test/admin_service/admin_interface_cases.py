@@ -62,6 +62,10 @@ class AdminServiceClientBase(abc.ABC):
         return {}
 
     @abc.abstractmethod
+    def list_instance_group(self, data, check_response=True) -> Dict:
+        return {}
+
+    @abc.abstractmethod
     def get_cache_meta(self, data, check_response=True) -> Dict:
         return {}
 
@@ -254,11 +258,18 @@ class AdminServiceTestBase(abc.ABC, TestBase, unittest.TestCase):
         found = any(s["global_unique_name"] == add_req["storage"]["global_unique_name"] for s in list_resp["storage"])
         self.assertTrue(found, "not found storage after added.")
 
-    def test_create_update_get_remove_instance_group(self):
+    def test_create_update_get_list_remove_instance_group(self):
         ig = self.make_sample_instance_group()
         create_req = {"trace_id": self._trace_id, "instance_group": ig}
         create_resp = self._client.create_instance_group(create_req)
         self.assertEqual(create_resp["header"]["status"]["code"], "OK")
+
+        list_resp = self._client.list_instance_group({"trace_id": self._trace_id})
+        self.assertEqual(list_resp["header"]["status"]["code"], "OK")
+        self.assertIn("instance_group", list_resp)
+        self.assertTrue(
+            any(instance_group["name"] == ig["name"] for instance_group in list_resp["instance_group"]),
+            "not found instance group after created.")
 
         # Update some field
         ig_updated = ig.copy()
@@ -272,6 +283,12 @@ class AdminServiceTestBase(abc.ABC, TestBase, unittest.TestCase):
         get_resp = self._client.get_instance_group(get_req)
         self.assertEqual(get_resp["header"]["status"]["code"], "OK")
         self.assertEqual(get_resp["instance_group"]["user_data"], "updated_data")
+
+        list_resp = self._client.list_instance_group({"trace_id": self._trace_id})
+        self.assertEqual(list_resp["header"]["status"]["code"], "OK")
+        listed_groups = {instance_group["name"]: instance_group for instance_group in list_resp["instance_group"]}
+        self.assertIn(ig["name"], listed_groups)
+        self.assertEqual(listed_groups[ig["name"]]["user_data"], "updated_data")
 
         remove_req = {"trace_id": self._trace_id, "name": ig["name"]}
         remove_resp = self._client.remove_instance_group(remove_req)

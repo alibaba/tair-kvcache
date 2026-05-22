@@ -1,7 +1,9 @@
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
@@ -66,6 +68,9 @@ public:
               uint32_t cache_reclaimer_idle_interval_ms = 100,
               uint32_t cache_reclaimer_worker_size = 16);
     ErrorCode DoRecover();
+    ErrorCode DoRecoverOnce();
+    void StartRecoverRetryLoop();
+    void StopRecoverRetryLoop();
     ErrorCode DoCleanup();
     std::shared_ptr<RegistryManager> GetRegistryManager() { return registry_manager_; }
 
@@ -239,6 +244,10 @@ private:
     std::shared_ptr<EventManager> event_manager_;
     // 需要清理 - 避免有metrics遗留
     std::shared_ptr<CacheManagerMetricsRecorder> metrics_recorder_;
+
+    // 需要清理 - recover 重试线程相关，在DoCleanup()中StopRecoverRetryLoop()
+    std::thread recover_retry_thread_;
+    std::atomic<bool> recover_retry_stop_{false};
 };
 
 } // namespace kv_cache_manager

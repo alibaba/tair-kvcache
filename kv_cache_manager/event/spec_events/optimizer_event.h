@@ -3,7 +3,7 @@
 #include <string>
 
 #include "kv_cache_manager/event/base_event.h"
-#include "kv_cache_manager/manager/cache_location.h"
+#include "kv_cache_manager/meta/cache_location.h"
 
 namespace kv_cache_manager {
 namespace optimizer_event {

@@ -8,7 +8,7 @@ namespace kv_cache_manager {
 class MetaCachePolicyConfig : public Jsonizable {
 public:
     static constexpr const char *kDefaultCacheType = "lru";
-    static constexpr size_t kDefaultCacheCapacity = 1024; // MB
+    static constexpr size_t kDefaultCacheCapacity = 0; // MB
     static constexpr int32_t kDefaultCacheShardBits = 6;
     static constexpr double kDefaultHighPriPoolRatio = 0.0;
 

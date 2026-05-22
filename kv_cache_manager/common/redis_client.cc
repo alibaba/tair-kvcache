@@ -18,6 +18,11 @@ namespace kv_cache_manager {
 
 RedisClient::RedisClient(const StandardUri &storage_uri)
     : user_info_(storage_uri.GetUserInfo()), host_(storage_uri.GetHostName()), port_(storage_uri.GetPort()) {
+    int64_t tmp_db = 0;
+    storage_uri.GetParamAs("db", tmp_db);
+    if (tmp_db >= 0) {
+        db_ = tmp_db;
+    }
     int64_t tmp_timeout_ms = 0;
     storage_uri.GetParamAs("timeout_ms", tmp_timeout_ms);
     if (tmp_timeout_ms > 0) {
@@ -137,7 +142,15 @@ bool RedisClient::Connect() {
         }
     }
 
-    KVCM_REDIS_LOG_INFO("connect to redis timeout_ms[%ld] retry_count[%ld]", timeout_ms_, retry_count_);
+    if (db_ > 0) {
+        ReplyUPtr select_reply((redisReply *)redisCommand(context_, "SELECT %ld", db_), freeReplyObject);
+        if (!IsReplyOk(select_reply.get())) {
+            KVCM_REDIS_LOG_WARN("fail to select redis db[%ld]", db_);
+            return false;
+        }
+    }
+
+    KVCM_REDIS_LOG_INFO("connect to redis db[%ld] timeout_ms[%ld] retry_count[%ld]", db_, timeout_ms_, retry_count_);
     return true;
 }
 
@@ -418,9 +431,64 @@ std::vector<ErrorCode> RedisClient::Delete(const std::vector<std::string> &keys)
     return ec_per_key;
 }
 
+std::vector<ErrorCode> RedisClient::DeleteFields(const std::vector<std::string> &keys,
+                                                 const std::vector<std::vector<std::string>> &field_names_vec) {
+    if (keys.size() != field_names_vec.size()) {
+        KVCM_REDIS_LOG_ERROR("redis delete fields fail, keys.size[%lu] != field_names_vec.size[%lu]",
+                             keys.size(),
+                             field_names_vec.size());
+        return std::vector<ErrorCode>(keys.size(), EC_BADARGS);
+    }
+
+    std::vector<CmdArgs> hdel_cmds;
+    std::vector<size_t> original_indexes;
+    std::vector<ErrorCode> ec_per_key(keys.size(), EC_OK);
+    hdel_cmds.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (field_names_vec[i].empty()) {
+            // Nothing to delete — idempotent success.
+            continue;
+        }
+        CmdArgs hdel_cmd;
+        hdel_cmd.reserve(field_names_vec[i].size() + 2);
+        hdel_cmd.emplace_back("HDEL");
+        hdel_cmd.emplace_back(keys[i]);
+        for (const auto &field_name : field_names_vec[i]) {
+            hdel_cmd.emplace_back(field_name);
+        }
+        hdel_cmds.emplace_back(std::move(hdel_cmd));
+        original_indexes.emplace_back(i);
+    }
+    if (hdel_cmds.empty()) {
+        return ec_per_key;
+    }
+
+    std::vector<ReplyUPtr> hdel_replies = CommandPipeline(hdel_cmds);
+    if (hdel_cmds.size() != hdel_replies.size()) {
+        KVCM_REDIS_LOG_ERROR("redis delete fields fail, pipeline hdel_cmds.size[%lu] != hdel_replies.size[%lu]",
+                             hdel_cmds.size(),
+                             hdel_replies.size());
+        return std::vector<ErrorCode>(keys.size(), EC_ERROR);
+    }
+    assert(original_indexes.size() == hdel_replies.size());
+    for (size_t i = 0; i < original_indexes.size(); ++i) {
+        const size_t original_idx = original_indexes[i];
+        const ReplyUPtr &hdel_reply = hdel_replies[i];
+        if (!IsReplyOk(hdel_reply.get()) || !CheckReplyInteger(hdel_reply.get())) {
+            KVCM_REDIS_LOG_ERROR("redis delete fields fail, key[%s] HDEL fail", keys[original_idx].c_str());
+            ec_per_key[original_idx] = EC_ERROR;
+        }
+    }
+    return ec_per_key;
+}
+
 std::vector<ErrorCode> RedisClient::Get(const std::vector<std::string> &keys,
                                         const std::vector<std::string> &field_names,
                                         std::vector<std::map<std::string, std::string>> &out_field_maps) {
+    if (field_names.empty()) {
+        KVCM_REDIS_LOG_ERROR("invalid empty field names");
+        return std::vector<ErrorCode>(keys.size(), EC_BADARGS);
+    }
     out_field_maps = std::vector<std::map<std::string, std::string>>(keys.size());
 
     std::vector<CmdArgs> hmget_cmds;
@@ -482,6 +550,88 @@ std::vector<ErrorCode> RedisClient::Get(const std::vector<std::string> &keys,
             ec_per_key.emplace_back(EC_ERROR);
         } else if (out_field_map.empty()) {
             // All fields are nil: key does not exist or has no matching fields
+            ec_per_key.emplace_back(EC_NOENT);
+        } else {
+            ec_per_key.emplace_back(EC_OK);
+        }
+    }
+    return ec_per_key;
+}
+
+std::vector<ErrorCode> RedisClient::Get(const std::vector<std::string> &keys,
+                                        const std::vector<std::vector<std::string>> &field_names_vec,
+                                        std::vector<std::map<std::string, std::string>> &out_field_maps) {
+    if (keys.size() != field_names_vec.size()) {
+        KVCM_REDIS_LOG_ERROR(
+            "redis get fail, keys.size[%lu] != field_names_vec.size[%lu]", keys.size(), field_names_vec.size());
+        return std::vector<ErrorCode>(keys.size(), EC_BADARGS);
+    }
+
+    out_field_maps = std::vector<std::map<std::string, std::string>>(keys.size());
+
+    std::vector<CmdArgs> hmget_cmds;
+    hmget_cmds.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const std::vector<std::string> &field_names = field_names_vec[i];
+        if (field_names.empty()) {
+            KVCM_REDIS_LOG_ERROR("invalid empty field names for key[%s]", keys[i].c_str());
+            return std::vector<ErrorCode>(keys.size(), EC_BADARGS);
+        }
+        CmdArgs hmget_cmd;
+        hmget_cmd.reserve(field_names.size() + 2);
+        hmget_cmd.emplace_back("HMGET");
+        hmget_cmd.emplace_back(keys[i]);
+        for (const auto &field_name : field_names) {
+            hmget_cmd.emplace_back(field_name);
+        }
+        hmget_cmds.emplace_back(std::move(hmget_cmd));
+    }
+    std::vector<ReplyUPtr> hmget_replies = CommandPipeline(hmget_cmds);
+    if (keys.size() != hmget_replies.size()) {
+        KVCM_REDIS_LOG_ERROR(
+            "redis get fail, pipeline keys.size[%lu] != hmget_replies.size[%lu]", keys.size(), hmget_replies.size());
+        return std::vector<ErrorCode>(keys.size(), EC_ERROR);
+    }
+
+    std::vector<ErrorCode> ec_per_key;
+    ec_per_key.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const std::vector<std::string> &field_names = field_names_vec[i];
+        const ReplyUPtr &hmget_reply = hmget_replies[i];
+        if (!IsReplyOk(hmget_reply.get()) || !CheckReplyArray(hmget_reply.get())) {
+            KVCM_REDIS_LOG_ERROR("redis get fail, key[%s] HMGET fail", keys[i].c_str());
+            ec_per_key.emplace_back(EC_ERROR);
+            continue;
+        }
+        if (hmget_reply->elements != field_names.size()) {
+            KVCM_REDIS_LOG_ERROR("redis get fail, key[%s] HMGET reply elements[%lu] != field_names[%lu]",
+                                 keys[i].c_str(),
+                                 hmget_reply->elements,
+                                 field_names.size());
+            ec_per_key.emplace_back(EC_ERROR);
+            continue;
+        }
+
+        bool hasError = false;
+        std::map<std::string, std::string> &out_field_map = out_field_maps[i];
+        for (size_t j = 0; j < hmget_reply->elements; ++j) {
+            const std::string &field_name = field_names[j];
+            const redisReply *field_value_reply = hmget_reply->element[j];
+            std::string field_value;
+            if (!GetReplyStrOrNil(field_value_reply, field_value)) {
+                KVCM_REDIS_LOG_ERROR(
+                    "redis get fail, key[%s] field_name[%s] get reply str fail", keys[i].c_str(), field_name.c_str());
+                out_field_map.clear();
+                hasError = true;
+                break;
+            }
+            if (!field_value.empty()) {
+                out_field_map.emplace(field_name, std::move(field_value));
+            }
+        }
+        if (hasError) {
+            ec_per_key.emplace_back(EC_ERROR);
+        } else if (out_field_map.empty()) {
             ec_per_key.emplace_back(EC_NOENT);
         } else {
             ec_per_key.emplace_back(EC_OK);
@@ -558,7 +708,7 @@ std::vector<ErrorCode> RedisClient::GetAllFields(const std::vector<std::string> 
 }
 
 std::vector<ErrorCode> RedisClient::Exists(const std::vector<std::string> &keys, std::vector<bool> &out_is_exist_vec) {
-    out_is_exist_vec.resize(keys.size(), false);
+    out_is_exist_vec.assign(keys.size(), false);
 
     std::vector<CmdArgs> exists_cmds;
     exists_cmds.reserve(keys.size());
@@ -587,6 +737,193 @@ std::vector<ErrorCode> RedisClient::Exists(const std::vector<std::string> &keys,
             ec_per_key.emplace_back(EC_OK);
             out_is_exist_vec[i] = (exists_reply->integer > 0);
         }
+    }
+    return ec_per_key;
+}
+
+std::vector<ErrorCode> RedisClient::ExistsFieldWithPrefix(const std::vector<std::string> &keys,
+                                                          const std::string &field_prefix,
+                                                          std::vector<bool> &out_exists_vec) {
+    out_exists_vec.assign(keys.size(), false);
+
+    // First check which keys exist. Non-existent keys get EC_NOENT immediately.
+    std::vector<bool> key_exists_vec;
+    std::vector<ErrorCode> ec_per_key = Exists(keys, key_exists_vec);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (ec_per_key[i] == EC_OK && !key_exists_vec[i]) {
+            ec_per_key[i] = EC_NOENT;
+        }
+    }
+
+    const std::string pattern = field_prefix + "*";
+    const std::string count_hint = "1000";
+    struct PendingKey {
+        size_t original_index;
+        std::string cursor;
+    };
+    std::vector<PendingKey> pending;
+    pending.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (ec_per_key[i] == EC_OK) {
+            pending.push_back({i, "0"});
+        }
+    }
+    while (!pending.empty()) {
+        std::vector<CmdArgs> hscan_cmds;
+        hscan_cmds.reserve(pending.size());
+        for (const auto &entry : pending) {
+            hscan_cmds.push_back(
+                {"HSCAN", keys[entry.original_index], entry.cursor, "MATCH", pattern, "COUNT", count_hint});
+        }
+
+        std::vector<ReplyUPtr> replies = CommandPipeline(hscan_cmds);
+        if (replies.size() != hscan_cmds.size()) {
+            KVCM_REDIS_LOG_ERROR(
+                "redis exists field with prefix fail, pipeline hscan_cmds.size[%lu] != replies.size[%lu]",
+                hscan_cmds.size(),
+                replies.size());
+            for (auto &entry : pending) {
+                ec_per_key[entry.original_index] = EC_ERROR;
+            }
+            break;
+        }
+
+        std::vector<PendingKey> next_pending;
+        for (size_t i = 0; i < pending.size(); ++i) {
+            size_t original_idx = pending[i].original_index;
+            const ReplyUPtr &hscan_reply = replies[i];
+            if (!IsReplyOk(hscan_reply.get()) || !CheckReplyArray(hscan_reply.get()) || hscan_reply->elements != 2) {
+                KVCM_REDIS_LOG_ERROR("redis exists field with prefix fail, key[%s] HSCAN fail",
+                                     keys[original_idx].c_str());
+                ec_per_key[original_idx] = EC_ERROR;
+                continue;
+            }
+
+            const redisReply *next_cursor_reply = hscan_reply->element[0];
+            const redisReply *fields_reply = hscan_reply->element[1];
+            std::string next_cursor;
+            if (!GetReplyStrOrNil(next_cursor_reply, next_cursor)) {
+                KVCM_REDIS_LOG_ERROR("redis exists field with prefix fail, key[%s] get next cursor fail",
+                                     keys[original_idx].c_str());
+                ec_per_key[original_idx] = EC_ERROR;
+                continue;
+            }
+            if (!CheckReplyArray(fields_reply)) {
+                KVCM_REDIS_LOG_ERROR("redis exists field with prefix fail, key[%s] check fields reply fail",
+                                     keys[original_idx].c_str());
+                ec_per_key[original_idx] = EC_ERROR;
+                continue;
+            }
+            // HSCAN returns [field1, value1, field2, value2, ...].
+            // Skip tombstones (empty value) — they are not valid locations.
+            bool found_non_empty = false;
+            for (size_t j = 0; j + 1 < fields_reply->elements; j += 2) {
+                std::string value;
+                if (GetReplyStrOrNil(fields_reply->element[j + 1], value) && !value.empty()) {
+                    found_non_empty = true;
+                    break;
+                }
+            }
+            if (found_non_empty) {
+                out_exists_vec[original_idx] = true;
+            } else if (next_cursor != "0") {
+                next_pending.push_back({original_idx, std::move(next_cursor)});
+            }
+        }
+        pending = std::move(next_pending);
+    }
+    return ec_per_key;
+}
+
+std::vector<ErrorCode>
+RedisClient::GetFieldNamesWithPrefix(const std::vector<std::string> &keys,
+                                     const std::string &field_prefix,
+                                     std::vector<std::vector<std::string>> &out_field_names_vec) {
+    out_field_names_vec.resize(keys.size());
+
+    // First check which keys exist. Non-existent keys get EC_NOENT immediately.
+    std::vector<bool> key_exists_vec;
+    std::vector<ErrorCode> ec_per_key = Exists(keys, key_exists_vec);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (ec_per_key[i] == EC_OK && !key_exists_vec[i]) {
+            ec_per_key[i] = EC_NOENT;
+        }
+    }
+
+    const std::string pattern = field_prefix + "*";
+    const std::string count_hint = "1000";
+    struct PendingKey {
+        size_t original_index;
+        std::string cursor;
+    };
+    std::vector<PendingKey> pending;
+    pending.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (ec_per_key[i] == EC_OK) {
+            pending.push_back({i, "0"});
+        }
+    }
+    while (!pending.empty()) {
+        std::vector<CmdArgs> hscan_cmds;
+        hscan_cmds.reserve(pending.size());
+        for (const auto &entry : pending) {
+            hscan_cmds.push_back(
+                {"HSCAN", keys[entry.original_index], entry.cursor, "MATCH", pattern, "COUNT", count_hint});
+        }
+
+        std::vector<ReplyUPtr> replies = CommandPipeline(hscan_cmds);
+        if (replies.size() != hscan_cmds.size()) {
+            KVCM_REDIS_LOG_ERROR(
+                "redis list field names with prefix fail, pipeline hscan_cmds.size[%lu] != replies.size[%lu]",
+                hscan_cmds.size(),
+                replies.size());
+            for (auto &entry : pending) {
+                ec_per_key[entry.original_index] = EC_ERROR;
+            }
+            break;
+        }
+
+        std::vector<PendingKey> next_pending;
+        for (size_t i = 0; i < pending.size(); ++i) {
+            size_t original_idx = pending[i].original_index;
+            const ReplyUPtr &hscan_reply = replies[i];
+            if (!IsReplyOk(hscan_reply.get()) || !CheckReplyArray(hscan_reply.get()) || hscan_reply->elements != 2) {
+                KVCM_REDIS_LOG_ERROR("redis list field names with prefix fail, key[%s] HSCAN fail",
+                                     keys[original_idx].c_str());
+                ec_per_key[original_idx] = EC_ERROR;
+                continue;
+            }
+
+            const redisReply *next_cursor_reply = hscan_reply->element[0];
+            const redisReply *fields_reply = hscan_reply->element[1];
+            std::string next_cursor;
+            if (!GetReplyStrOrNil(next_cursor_reply, next_cursor)) {
+                KVCM_REDIS_LOG_ERROR("redis list field names with prefix fail, key[%s] get next cursor fail",
+                                     keys[original_idx].c_str());
+                ec_per_key[original_idx] = EC_ERROR;
+                continue;
+            }
+            if (!CheckReplyArray(fields_reply)) {
+                KVCM_REDIS_LOG_ERROR("redis list field names with prefix fail, key[%s] check fields reply fail",
+                                     keys[original_idx].c_str());
+                ec_per_key[original_idx] = EC_ERROR;
+                continue;
+            }
+            // HSCAN returns [field1, value1, field2, value2, ...]; collect only
+            // field names (even indices) whose value is non-empty (skip tombstones).
+            for (size_t j = 0; j + 1 < fields_reply->elements; j += 2) {
+                std::string field_name;
+                std::string field_value;
+                if (GetReplyStrOrNil(fields_reply->element[j], field_name) && !field_name.empty() &&
+                    GetReplyStrOrNil(fields_reply->element[j + 1], field_value) && !field_value.empty()) {
+                    out_field_names_vec[original_idx].emplace_back(std::move(field_name));
+                }
+            }
+            if (next_cursor != "0") {
+                next_pending.push_back({original_idx, std::move(next_cursor)});
+            }
+        }
+        pending = std::move(next_pending);
     }
     return ec_per_key;
 }

@@ -86,6 +86,22 @@ cc_library(
 )
 
 cc_library(
+    name = "crash_handler",
+    srcs = [
+        "crash_handler.cc",
+    ],
+    hdrs = [
+        "crash_handler.h",
+    ],
+    linkopts = [
+        "-rdynamic",
+    ],
+    deps = [
+        ":build_version",
+    ],
+)
+
+cc_library(
     name = "jsonizable",
     srcs = [
         "jsonizable.cc",
@@ -267,5 +283,63 @@ cc_library(
     name = "client_pool",
     hdrs = [
         "client_pool.h",
+    ],
+)
+
+cc_library(
+    name = "service_discovery",
+    srcs = [
+        "service_discovery.cc",
+    ],
+    hdrs = [
+        "service_discovery.h",
+    ],
+    deps = [
+        ":logger",
+    ],
+)
+
+cc_library(
+    name = "service_discovery_url",
+    srcs = [
+        "service_discovery_url.cc",
+    ],
+    hdrs = [
+        "service_discovery_url.h",
+    ],
+    deps = [
+        ":logger",
+    ],
+)
+
+cc_library(
+    name = "static_service_discovery",
+    srcs = [
+        "static_service_discovery.cc",
+    ],
+    hdrs = [
+        "static_service_discovery.h",
+    ],
+    deps = [
+        ":logger",
+        ":service_discovery",
+    ],
+)
+
+cc_library(
+    name = "service_discovery_factory",
+    srcs = [
+        "service_discovery_factory.cc",
+    ],
+    hdrs = [
+        "service_discovery_factory.h",
+    ],
+    deps = [
+        ":logger",
+        ":service_discovery",
+        ":service_discovery_url",
+        "//stub_source/kv_cache_manager/common:spectrum_service_discovery",
+        ":static_service_discovery",
+        "//stub_source/kv_cache_manager/common:vipserver_service_discovery",
     ],
 )

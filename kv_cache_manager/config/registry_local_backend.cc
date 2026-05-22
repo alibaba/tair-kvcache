@@ -55,8 +55,9 @@ ErrorCode RegistryLocalBackend::Recover() {
     for (auto &pair : tmp_table) {
         std::map<std::string, std::string> tmp_field_table;
         if (!Jsonizable::FromJsonString(pair.second, tmp_field_table)) {
-            KVCM_LOG_ERROR("fail to parse field map json, file[%s] content[%s]", path_.c_str(), pair.second.c_str());
-            return EC_ERROR;
+            KVCM_LOG_WARN(
+                "skip unparseable field map json during recover, file[%s] key[%s]", path_.c_str(), pair.first.c_str());
+            continue;
         }
         table_.Emplace(pair.first, std::move(tmp_field_table));
     }

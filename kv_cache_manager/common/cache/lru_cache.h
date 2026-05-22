@@ -260,6 +260,7 @@ public:
     // alive in Cache.
     LRUCacheShard(size_t capacity,
                   bool strict_capacity_limit,
+                  bool no_evict_on_insert,
                   double high_pri_pool_ratio,
                   double low_pri_pool_ratio,
                   bool use_adaptive_mutex,
@@ -328,6 +329,11 @@ public: // Function definitions expected as parameter to ShardedCache
     bool Release(LRUHandle *handle, bool useful, bool erase_if_last_ref);
     bool Ref(LRUHandle *handle);
     void Erase(const std::string_view &key, uint32_t hash);
+
+    // Adjust the charge of a referenced handle by `delta` (may be negative).
+    // The caller must hold an external reference to `handle`.
+    // Does NOT trigger eviction even if usage exceeds capacity.
+    void AdjustCharge(LRUHandle *handle, ssize_t delta);
 
     // Although in some platforms the update of size_t is atomic, to make sure
     // GetUsage() and GetPinnedUsage() work correctly under any platform, we'll
@@ -420,6 +426,9 @@ private:
 
     // Whether to reject insertion if cache reaches its full capacity.
     bool strict_capacity_limit_;
+
+    // If true, Insert() skips LRU eviction and fails immediately when full.
+    bool no_evict_on_insert_;
 
     // Ratio of capacity reserved for high priority cache entries.
     double high_pri_pool_ratio_;

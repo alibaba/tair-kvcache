@@ -26,11 +26,16 @@ TEST_F(WriteLocationManagerPerf, RandomTest) {
     constexpr size_t kCount = 1000;
     constexpr size_t kTimeout = 3;
     auto st = TimestampUtil::GetCurrentTimeMs();
-    manager_.Put(std::to_string(0), {}, {}, kTimeout, []() {});
+    using WriteLocationInfoPtr = std::unique_ptr<WriteLocationManager::WriteLocationInfo>;
+    manager_.Put(std::to_string(0), {}, {}, kTimeout, [](WriteLocationInfoPtr) {});
     std::thread provider([&]() {
         for (size_t i = 1; i < kCount; i++) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            manager_.Put(std::to_string(i), {}, {}, kTimeout + TimestampUtil::GetCurrentTimeUs() % 10, []() {});
+            manager_.Put(std::to_string(i),
+                         {},
+                         {},
+                         kTimeout + TimestampUtil::GetCurrentTimeUs() % 10,
+                         [](WriteLocationInfoPtr) {});
         }
     });
     size_t expire_size = 0;
@@ -51,11 +56,12 @@ TEST_F(WriteLocationManagerPerf, BurstTest) {
     constexpr size_t kCount = 1000;
     constexpr size_t kTimeout = 3;
     auto st = TimestampUtil::GetCurrentTimeMs();
-    manager_.Put(std::to_string(0), {}, {}, kTimeout, []() {});
+    using WriteLocationInfoPtr = std::unique_ptr<WriteLocationManager::WriteLocationInfo>;
+    manager_.Put(std::to_string(0), {}, {}, kTimeout, [](WriteLocationInfoPtr) {});
     std::thread provider([&]() {
         for (size_t i = 1; i < kCount; i++) {
             std::this_thread::sleep_for(std::chrono::microseconds(1));
-            manager_.Put(std::to_string(i), {}, {}, kTimeout, []() {});
+            manager_.Put(std::to_string(i), {}, {}, kTimeout, [](WriteLocationInfoPtr) {});
         }
     });
     size_t expire_size = 0;
@@ -73,18 +79,27 @@ TEST_F(WriteLocationManagerPerf, BurstTest) {
 TEST_F(WriteLocationManagerPerf, MultiProviderConsumerTest) {
     manager_.Start();
 
+    using WriteLocationInfoPtr = std::unique_ptr<WriteLocationManager::WriteLocationInfo>;
     constexpr size_t kCount = 1000;
     constexpr size_t kTimeout = 3;
     for (size_t i = 0; i < kCount; i++) {
         std::this_thread::sleep_for(std::chrono::microseconds(1));
-        manager_.Put(std::to_string(i), {}, {}, kTimeout + TimestampUtil::GetCurrentTimeUs() % 3, []() {});
+        manager_.Put(std::to_string(i),
+                     {},
+                     {},
+                     kTimeout + TimestampUtil::GetCurrentTimeUs() % 3,
+                     [](WriteLocationInfoPtr) {});
     }
     auto st = TimestampUtil::GetCurrentTimeMs();
     auto provider_fcn = [this](int id) {
         size_t base = id * 100000;
         for (size_t i = 1 + base; i < base + kCount; i++) {
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
-            manager_.Put(std::to_string(i), {}, {}, kTimeout + TimestampUtil::GetCurrentTimeUs() % 3, []() {});
+            manager_.Put(std::to_string(i),
+                         {},
+                         {},
+                         kTimeout + TimestampUtil::GetCurrentTimeUs() % 3,
+                         [](WriteLocationInfoPtr) {});
         }
     };
     std::vector<std::thread> threads;

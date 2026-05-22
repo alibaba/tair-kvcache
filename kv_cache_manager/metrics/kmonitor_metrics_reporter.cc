@@ -64,7 +64,8 @@ struct KmonitorMetricsReporter::Context {
 
     // meta searcher metrics
     DECLARE_METRICS(meta_searcher, indexer_get_time_us);
-    DECLARE_METRICS(meta_searcher, indexer_read_modify_write_time_us);
+    DECLARE_METRICS(meta_searcher, indexer_read_modify_write_block_time_us);
+    DECLARE_METRICS(meta_searcher, indexer_read_modify_write_location_time_us);
     DECLARE_METRICS(meta_searcher, index_serialize_time_us);
     DECLARE_METRICS(meta_searcher, index_deserialize_time_us);
     DECLARE_METRICS(meta_searcher, indexer_query_times);
@@ -80,9 +81,11 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(meta_indexer, put_io_time_us);
     DECLARE_METRICS(meta_indexer, update_io_time_us);
     DECLARE_METRICS(meta_indexer, upsert_io_time_us);
+    DECLARE_METRICS(meta_indexer, lock_wait_time_us);
     DECLARE_METRICS(meta_indexer, delete_io_time_us);
     DECLARE_METRICS(meta_indexer, get_io_time_us);
     DECLARE_METRICS(meta_indexer, rand_io_time_us);
+    DECLARE_METRICS(meta_indexer, rmw_get_io_time_us);
     DECLARE_METRICS(meta_indexer, read_modify_write_put_key_count);
     DECLARE_METRICS(meta_indexer, read_modify_write_update_key_count);
     DECLARE_METRICS(meta_indexer, read_modify_write_skip_key_count);
@@ -282,7 +285,8 @@ bool KmonitorMetricsReporter::InitMetrics() {
 
     // meta searcher metrics
     REGISTER_GAUGE_METRIC(meta_searcher, indexer_get_time_us);
-    REGISTER_GAUGE_METRIC(meta_searcher, indexer_read_modify_write_time_us);
+    REGISTER_GAUGE_METRIC(meta_searcher, indexer_read_modify_write_block_time_us);
+    REGISTER_GAUGE_METRIC(meta_searcher, indexer_read_modify_write_location_time_us);
     REGISTER_GAUGE_METRIC(meta_searcher, index_serialize_time_us);
     REGISTER_GAUGE_METRIC(meta_searcher, index_deserialize_time_us);
     REGISTER_GAUGE_METRIC(meta_searcher, indexer_query_times);
@@ -298,9 +302,11 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(meta_indexer, put_io_time_us);
     REGISTER_GAUGE_METRIC(meta_indexer, update_io_time_us);
     REGISTER_GAUGE_METRIC(meta_indexer, upsert_io_time_us);
+    REGISTER_GAUGE_METRIC(meta_indexer, lock_wait_time_us);
     REGISTER_GAUGE_METRIC(meta_indexer, delete_io_time_us);
     REGISTER_GAUGE_METRIC(meta_indexer, get_io_time_us);
     REGISTER_GAUGE_METRIC(meta_indexer, rand_io_time_us);
+    REGISTER_GAUGE_METRIC(meta_indexer, rmw_get_io_time_us);
     REGISTER_GAUGE_METRIC(meta_indexer, read_modify_write_put_key_count);
     REGISTER_GAUGE_METRIC(meta_indexer, read_modify_write_update_key_count);
     REGISTER_GAUGE_METRIC(meta_indexer, read_modify_write_skip_key_count);
@@ -424,7 +430,8 @@ void KmonitorMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
 
         // meta searcher metrics
         REPORT_COLLECTED_METRICS(meta_searcher, indexer_get_time_us);
-        REPORT_STEAL_METRICS(meta_searcher, indexer_read_modify_write_time_us);
+        REPORT_STEAL_METRICS(meta_searcher, indexer_read_modify_write_block_time_us);
+        REPORT_STEAL_METRICS(meta_searcher, indexer_read_modify_write_location_time_us);
         REPORT_STEAL_METRICS(meta_searcher, index_serialize_time_us);
         REPORT_COLLECTED_METRICS(meta_searcher, index_deserialize_time_us);
         REPORT_COLLECTED_METRICS(meta_searcher, indexer_query_times);
@@ -440,9 +447,11 @@ void KmonitorMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
         REPORT_COLLECTED_METRICS(meta_indexer, put_io_time_us);
         REPORT_COLLECTED_METRICS(meta_indexer, update_io_time_us);
         REPORT_STEAL_METRICS(meta_indexer, upsert_io_time_us);
+        REPORT_STEAL_METRICS(meta_indexer, lock_wait_time_us);
         REPORT_COLLECTED_METRICS(meta_indexer, delete_io_time_us);
         REPORT_COLLECTED_METRICS(meta_indexer, get_io_time_us);
         REPORT_COLLECTED_METRICS(meta_indexer, rand_io_time_us);
+        REPORT_COLLECTED_METRICS(meta_indexer, rmw_get_io_time_us);
         REPORT_STEAL_METRICS(meta_indexer, read_modify_write_put_key_count);
         REPORT_COLLECTED_METRICS(meta_indexer, read_modify_write_update_key_count);
         REPORT_COLLECTED_METRICS(meta_indexer, read_modify_write_skip_key_count);

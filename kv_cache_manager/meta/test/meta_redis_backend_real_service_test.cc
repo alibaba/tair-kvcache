@@ -93,7 +93,8 @@ TEST_F(MetaRedisBackendRealServiceTest, TestMultiThreadSimple) {
     std::atomic<int> put_index = 0;
     auto put_task = [&, this]() {
         int i = put_index++;
-        auto ec_per_key = meta_redis_backend_->Put(keys_vec[i], field_maps_vec[i]);
+        auto ec_per_key = meta_redis_backend_->Put(
+            nullptr, keys_vec[i], CacheLocationMapVector(keys_vec[i].size()), field_maps_vec[i]);
         ASSERT_EQ(std::vector<ErrorCode>(keys_vec[i].size(), EC_OK), ec_per_key);
     };
     std::vector<std::thread> put_threads;
@@ -109,7 +110,8 @@ TEST_F(MetaRedisBackendRealServiceTest, TestMultiThreadSimple) {
     auto get_task = [&, this]() {
         int i = get_index++;
         FieldMapVec out_field_map;
-        auto ec_per_key = meta_redis_backend_->Get(keys_vec[i], {"f1", "f2"}, out_field_map);
+        auto ec_per_key = meta_redis_backend_->GetProperties(
+            nullptr, keys_vec[i], std::vector<std::string>{"f1", "f2"}, out_field_map);
         ASSERT_EQ(std::vector<ErrorCode>(keys_vec[i].size(), EC_OK), ec_per_key);
         ASSERT_EQ(field_maps_vec[i], out_field_map);
     };
@@ -141,7 +143,7 @@ TEST_F(MetaRedisBackendRealServiceTest, TestConcurrentMixedOperations) {
     for (int i = 0; i < COUNT; ++i) {
         keys_vec.emplace_back(KeyTypeVec{MyKey(i), MyKey(i + 1000)});
         field_maps_vec.emplace_back(FieldMapVec{MyMap(i), MyMap(i + 1000)});
-        auto ec_per_key = meta_redis_backend_->Delete(keys_vec.back());
+        auto ec_per_key = meta_redis_backend_->Delete(nullptr, keys_vec.back());
         for (const auto &ec : ec_per_key) {
             ASSERT_TRUE(ec == EC_OK || ec == EC_NOENT);
         }
@@ -158,14 +160,14 @@ TEST_F(MetaRedisBackendRealServiceTest, TestConcurrentMixedOperations) {
         switch (op_id % 4) {
         case 0: // PUT
         {
-            auto ec_per_key = meta_redis_backend_->Put(keys, field_maps);
+            auto ec_per_key = meta_redis_backend_->Put(nullptr, keys, CacheLocationMapVector(keys.size()), field_maps);
             ASSERT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK), ec_per_key);
         } break;
         case 1: // GET
         {
             FieldMapVec out_field_maps;
             std::vector<std::string> field_names = {"name", "value", "updated", "ts"};
-            auto ec_per_key = meta_redis_backend_->Get(keys, field_names, out_field_maps);
+            auto ec_per_key = meta_redis_backend_->GetProperties(nullptr, keys, field_names, out_field_maps);
             ASSERT_EQ(keys.size(), ec_per_key.size());
             ASSERT_EQ(keys.size(), out_field_maps.size());
             for (int i = 0; i < ec_per_key.size(); ++i) {
@@ -193,7 +195,8 @@ TEST_F(MetaRedisBackendRealServiceTest, TestConcurrentMixedOperations) {
         {
             FieldMap update_map = {{"updated", "true"}, {"ts", "1234"}};
             FieldMapVec update_maps(keys.size(), update_map);
-            auto ec_per_key = meta_redis_backend_->UpdateFields(keys, update_maps);
+            auto ec_per_key =
+                meta_redis_backend_->Update(nullptr, keys, CacheLocationMapVector(keys.size()), update_maps);
             ASSERT_EQ(keys.size(), ec_per_key.size());
             for (auto ec : ec_per_key) {
                 ASSERT_TRUE(ec == EC_OK || ec == EC_NOENT) << ec;
@@ -202,7 +205,7 @@ TEST_F(MetaRedisBackendRealServiceTest, TestConcurrentMixedOperations) {
         case 3: // EXISTS
         {
             std::vector<bool> out_is_exist_vec;
-            auto ec_per_key = meta_redis_backend_->Exists(keys, out_is_exist_vec);
+            auto ec_per_key = meta_redis_backend_->Exists(nullptr, keys, out_is_exist_vec);
             ASSERT_EQ(keys.size(), out_is_exist_vec.size());
             ASSERT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK), ec_per_key);
         } break;
@@ -234,7 +237,7 @@ TEST_F(MetaRedisBackendRealServiceTest, TestConcurrentListAndRandomOperations) {
     for (int i = 0; i < COUNT; ++i) {
         KeyTypeVec keys = {MyKey(i), MyKey(i + COUNT)};
         FieldMapVec field_maps = {MyMap(i), MyMap(i + COUNT)};
-        auto ec_per_key = meta_redis_backend_->Put(keys, field_maps);
+        auto ec_per_key = meta_redis_backend_->Put(nullptr, keys, CacheLocationMapVector(keys.size()), field_maps);
         ASSERT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK), ec_per_key);
     }
 
@@ -244,14 +247,14 @@ TEST_F(MetaRedisBackendRealServiceTest, TestConcurrentListAndRandomOperations) {
         if (op_id % 2 == 0) {
             std::string next_cursor;
             KeyTypeVec out_keys;
-            ErrorCode ec = meta_redis_backend_->ListKeys(SCAN_BASE_CURSOR, 10, next_cursor, out_keys);
+            ErrorCode ec = meta_redis_backend_->ListKeys(nullptr, SCAN_BASE_CURSOR, 10, next_cursor, out_keys);
             ASSERT_EQ(EC_OK, ec);
             for (const KeyType &key : out_keys) {
                 ASSERT_TRUE(key >= 0 && key <= COUNT * 2);
             }
         } else {
             std::vector<KeyType> out_keys;
-            ErrorCode ec = meta_redis_backend_->SampleReclaimKeys(5, out_keys);
+            ErrorCode ec = meta_redis_backend_->SampleReclaimKeys(nullptr, 5, out_keys);
             ASSERT_EQ(EC_OK, ec);
             for (const KeyType &key : out_keys) {
                 ASSERT_TRUE(key >= 0 && key <= COUNT * 2);
@@ -292,7 +295,8 @@ TEST_F(MetaRedisBackendRealServiceTest, TestScanUntilBaseCursor) {
 
     // Put all keys
     for (int i = 0; i < COUNT; ++i) {
-        auto ec_per_key = meta_redis_backend_->Put(keys_vec[i], field_maps_vec[i]);
+        auto ec_per_key = meta_redis_backend_->Put(
+            nullptr, keys_vec[i], CacheLocationMapVector(keys_vec[i].size()), field_maps_vec[i]);
         ASSERT_EQ(std::vector<ErrorCode>(keys_vec[i].size(), EC_OK), ec_per_key);
     }
 
@@ -305,7 +309,7 @@ TEST_F(MetaRedisBackendRealServiceTest, TestScanUntilBaseCursor) {
 
     do {
         KeyTypeVec batch_keys;
-        auto ec = meta_redis_backend_->ListKeys(current_cursor, /*limit*/ 50, next_cursor, batch_keys);
+        auto ec = meta_redis_backend_->ListKeys(nullptr, current_cursor, /*limit*/ 50, next_cursor, batch_keys);
         ASSERT_EQ(EC_OK, ec);
 
         // Check that batch_keys doesn't contain any keys that are already in all_listed_keys
@@ -339,7 +343,7 @@ TEST_F(MetaRedisBackendRealServiceTest, TestScanUntilBaseCursor) {
 
     // Clean up: delete all keys
     for (int i = 0; i < COUNT; ++i) {
-        auto ec_per_key = meta_redis_backend_->Delete(keys_vec[i]);
+        auto ec_per_key = meta_redis_backend_->Delete(nullptr, keys_vec[i]);
         ASSERT_EQ(std::vector<ErrorCode>(keys_vec[i].size(), EC_OK), ec_per_key);
     }
 
@@ -368,7 +372,8 @@ TEST_F(MetaRedisBackendRealServiceTest, TestMultiOpen) {
     std::atomic<int> put_index = 0;
     auto put_task = [&, this]() {
         int i = put_index++;
-        auto ec_per_key = meta_redis_backend_->Put(keys_vec[i], field_maps_vec[i]);
+        auto ec_per_key = meta_redis_backend_->Put(
+            nullptr, keys_vec[i], CacheLocationMapVector(keys_vec[i].size()), field_maps_vec[i]);
         ASSERT_EQ(std::vector<ErrorCode>(keys_vec[i].size(), EC_OK), ec_per_key);
     };
     std::vector<std::thread> put_threads;
@@ -396,7 +401,8 @@ TEST_F(MetaRedisBackendRealServiceTest, TestMultiOpen) {
     auto get_task = [&, this]() {
         int i = get_index++;
         FieldMapVec out_field_map;
-        auto ec_per_key = meta_redis_backend_->Get(keys_vec[i], {"f1", "f2"}, out_field_map);
+        auto ec_per_key = meta_redis_backend_->GetProperties(
+            nullptr, keys_vec[i], std::vector<std::string>{"f1", "f2"}, out_field_map);
         ASSERT_EQ(std::vector<ErrorCode>(keys_vec[i].size(), EC_OK), ec_per_key);
         ASSERT_EQ(field_maps_vec[i], out_field_map);
     };

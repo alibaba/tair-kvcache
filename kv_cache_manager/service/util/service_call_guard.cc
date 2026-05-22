@@ -106,7 +106,7 @@ ServiceCallGuard::ServiceCallGuard(CacheManager *cache_manager,
                                    MetricsReporter *metrics_reporter)
     : cache_manager_(cache_manager), request_context_(request_context), metrics_reporter_(metrics_reporter) {
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
-    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, ServiceQuery);
+    query_scope_ = KVCM_METRICS_COLLECTOR_CHRONO_SCOPE(service_metrics_collector, ServiceQuery);
 }
 
 ServiceCallGuard::ServiceCallGuard(CacheManager *cache_manager,
@@ -118,14 +118,17 @@ ServiceCallGuard::ServiceCallGuard(CacheManager *cache_manager,
     , metrics_reporter_(metrics_reporter)
     , response_debug_setter_(std::move(response_debug_setter)) {
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
-    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, ServiceQuery);
+    query_scope_ = KVCM_METRICS_COLLECTOR_CHRONO_SCOPE(service_metrics_collector, ServiceQuery);
 }
 
 ServiceCallGuard::~ServiceCallGuard() {
     assert(cache_manager_);
     assert(request_context_);
+    // Member destructors run after this function body, so we explicitly end the
+    // scope here to flush query_rt_us into the Gauge; otherwise the subsequent
+    // ReportPerQuery would read the stale value from the previous request.
+    query_scope_ = ChronoScopeGuard{};
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context_->metrics_collector());
-    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, ServiceQuery);
     if (response_debug_setter_) {
         response_debug_setter_();
     }

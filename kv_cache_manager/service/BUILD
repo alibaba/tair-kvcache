@@ -25,6 +25,7 @@ cc_library(
         "//kv_cache_manager/common:build_version",
         ":grpc_wrapper",
         "//kv_cache_manager/common",
+        "//kv_cache_manager/common:crash_handler",
         "//kv_cache_manager/common:loop_thread",
         "//kv_cache_manager/config:coordination_backend",
         "//kv_cache_manager/config:leader_elector_base",

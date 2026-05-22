@@ -43,3 +43,18 @@ py_test(
         "@pip_cpu//protobuf",
     ],
 )
+
+py_test(
+    name = "recover_test",
+    srcs = ["recover_test.py"],
+    data = [
+        "//kv_cache_manager:kv_cache_manager_bin",
+    ],
+    tags = ["no-remote-exec"],
+    deps = [
+        ":http_interface_test",
+        "//integration_test/testlib:test_base",
+        "//integration_test/meta_service:http_interface_test",
+        "@pip_cpu//requests",
+    ],
+)

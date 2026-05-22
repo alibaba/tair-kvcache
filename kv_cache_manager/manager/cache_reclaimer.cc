@@ -35,11 +35,11 @@
 #include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/event/spec_events/cache_reclaim_event.h"
-#include "kv_cache_manager/manager/cache_location.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
 #include "kv_cache_manager/manager/meta_searcher_manager.h"
 #include "kv_cache_manager/manager/schedule_plan_executor.h"
 #include "kv_cache_manager/manager/write_location_manager.h"
+#include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
@@ -77,6 +77,16 @@ namespace kv_cache_manager {
                          ins_id.c_str(),                                                                               \
                          ins_gr.c_str(),                                                                               \
                          ##args);                                                                                      \
+    } while (0)
+
+#define INTERVAL_LOG_WITH_ID(LEVEL, interval, format, args...)                                                         \
+    do {                                                                                                               \
+        KVCM_INTERVAL_LOG_##LEVEL(interval,                                                                            \
+                                  "trace_id [%s] | instance_id [%s] | instance_group [%s] | " format,                  \
+                                  request_context->trace_id().c_str(),                                                 \
+                                  ins_id.c_str(),                                                                      \
+                                  ins_gr.c_str(),                                                                      \
+                                  ##args);                                                                             \
     } while (0)
 
 #define DEFINE_METRICS_NAME_FOR_CACHE_RECLAIMER(name) DEFINE_METRICS_NAME_(CacheReclaimer, cache_reclaimer, name)
@@ -845,20 +855,21 @@ bool CacheReclaimer::MakeBatchByLRU(const RequestContext *request_context,
     for (std::size_t i = 0; i != sampled_keys.size(); ++i) {
         const auto &k = sampled_keys[i];
         const auto &m = property_maps[i];
+        int64_t lru_ts = 0;
+        // if PROPERTY_LRU_TIME is not found, use 0 as the timestamp, the reclaim strategy will degrade
         if (const auto it = m.find(PROPERTY_LRU_TIME); it != m.end()) {
             // the PROPERTY_LRU_TIME value is represented as an int64_t type
             // timepoint string; parse them into integers
             const auto &lru_ts_str = it->second;
-            std::int64_t lru_ts;
             if (!StringUtil::StrToInt64(lru_ts_str.c_str(), lru_ts)) {
-                LOG_WITH_ID(WARN, "lru_time str [%s] to int64 failed", lru_ts_str.c_str());
-                return false;
+                INTERVAL_LOG_WITH_ID(
+                    WARN, 10000, "lru_time str [%s] to int64 failed, use 0 instead", lru_ts_str.c_str());
+                lru_ts = 0;
             }
-            key_tp_vec.emplace_back(k, lru_ts);
         } else {
-            LOG_WITH_ID(WARN, "PROPERTY_LRU_TIME not found");
-            return false;
+            INTERVAL_LOG_WITH_ID(WARN, 10000, "PROPERTY_LRU_TIME not found, use 0 instead");
         }
+        key_tp_vec.emplace_back(k, lru_ts);
     }
 
     std::sort(key_tp_vec.begin(),
@@ -941,7 +952,11 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
     out_loc_ids.reserve(loc_maps.size());
     for (const auto &loc_map : loc_maps) {
         std::vector<std::string> loc_id_vec;
-        for (const auto &[_, loc] : loc_map) {
+        for (const auto &[_, loc_ptr] : loc_map) {
+            if (!loc_ptr) {
+                continue;
+            }
+            const auto &loc = *loc_ptr;
             // a location is eligible for eviction if:
             // 1. it is in CLS_SERVING status, OR
             // 2. it is in CLS_WRITING status but its write session is
@@ -1037,21 +1052,7 @@ std::shared_ptr<CacheReclaimer::GroupUsageData> CacheReclaimer::GetGroupUsageDat
         const std::size_t ins_used_key_cnt = meta_indexer->GetKeyCount();
         const std::size_t ins_max_key_cnt = meta_indexer->GetMaxKeyCount();
 
-        std::size_t ins_used_byte_size = 0;
-        if (meta_indexer->GetVersion() == MetaIndexer::InstanceVersion::VERSION_0) {
-            std::size_t byte_size_per_key = 0;
-            for (auto &location_spec_info : instance_info->location_spec_infos()) {
-                byte_size_per_key += location_spec_info.size();
-            }
-            ins_used_byte_size = byte_size_per_key * ins_used_key_cnt;
-        } else if (meta_indexer->GetVersion() == MetaIndexer::InstanceVersion::VERSION_1) {
-            ins_used_byte_size = meta_indexer->GetStorageUsage();
-        } else {
-            LOG_WITH_ID(WARN,
-                        "unknown meta_indexer version: [%" PRIu8 "]",
-                        static_cast<std::uint8_t>(meta_indexer->GetVersion()));
-            continue;
-        }
+        const std::size_t ins_used_byte_size = meta_indexer->GetStorageUsage();
 
         data->grp_used_key_cnt_ += ins_used_key_cnt;
         data->grp_max_key_cnt_ += ins_max_key_cnt;
@@ -1084,7 +1085,7 @@ void CacheReclaimer::HandleDelRes() noexcept {
             it = delete_handlers_.erase_after(it_pre);
         } else if (const auto fs = it->fut_.wait_for(std::chrono::seconds::zero()); fs == std::future_status::ready) {
             try {
-                if (const auto [ec, err_msg, _] = it->fut_.get(); ec != ErrorCode::EC_OK) {
+                if (const auto [ec, err_msg] = it->fut_.get(); ec != ErrorCode::EC_OK) {
                     LOG_WITH_ID(WARN,
                                 "reclaim request execute failed, error_code: [%d], error message: [%s]",
                                 static_cast<std::int32_t>(ec),

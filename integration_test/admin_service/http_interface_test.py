@@ -66,6 +66,9 @@ class AdminServiceHttpClient(cases.AdminServiceClientBase):
     def get_instance_group(self, data, check_response=True):
         return self._make_api_request('/api/getInstanceGroup', data, check_response)
 
+    def list_instance_group(self, data, check_response=True):
+        return self._make_api_request('/api/listInstanceGroup', data, check_response)
+
     def get_cache_meta(self, data, check_response=True):
         return self._make_api_request('/api/getCacheMeta', data, check_response)
 

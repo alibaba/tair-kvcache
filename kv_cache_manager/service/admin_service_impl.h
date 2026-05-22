@@ -55,6 +55,9 @@ public:
     void GetInstanceGroup(RequestContext *request_context,
                           const proto::admin::GetInstanceGroupRequest *request,
                           proto::admin::GetInstanceGroupResponse *response);
+    void ListInstanceGroup(RequestContext *request_context,
+                           const proto::admin::ListInstanceGroupRequest *request,
+                           proto::admin::ListInstanceGroupResponse *response);
 
     void GetCacheMeta(RequestContext *request_context,
                       const proto::admin::GetCacheMetaRequest *request,

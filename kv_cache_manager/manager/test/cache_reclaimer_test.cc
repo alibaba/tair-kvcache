@@ -30,11 +30,11 @@
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/event/event_manager.h"
-#include "kv_cache_manager/manager/cache_location.h"
 #include "kv_cache_manager/manager/cache_reclaimer.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
 #include "kv_cache_manager/manager/meta_searcher_manager.h"
 #include "kv_cache_manager/manager/schedule_plan_executor.h"
+#include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
@@ -198,34 +198,32 @@ std::shared_ptr<MetaIndexer> MetaIndexerManager_GetMetaIndexer_stub(void *obj, c
 
 std::chrono::milliseconds mi_getprop_delay{0};
 ErrorCode get_result;
-MetaIndexer::PropertyMapVector get_out_properties;
+PropertyMapVector get_out_properties;
 
 MetaIndexer::Result MetaIndexer_GetProperties_stub(void *obj,
                                                    RequestContext *rc,
-                                                   const MetaIndexer::KeyVector &k,
+                                                   const KeyVector &k,
                                                    const std::vector<std::string> &p,
-                                                   MetaIndexer::PropertyMapVector &out_properties) noexcept {
+                                                   PropertyMapVector &out_properties) noexcept {
     if (get_result == ErrorCode::EC_OK) {
         if (k.size() == get_out_properties.size()) {
             out_properties = get_out_properties;
         } else {
-            out_properties = MetaIndexer::PropertyMapVector(k.size());
+            out_properties = PropertyMapVector(k.size());
         }
     }
     std::this_thread::sleep_for(mi_getprop_delay);
-    return {get_result};
+    return MetaIndexer::Result(get_result);
 }
 
 /* ---------------- MetaIndexer_RandomSample_stub ---------------- */
 
 std::chrono::milliseconds mi_randsample_delay{0};
 ErrorCode random_sample_result;
-MetaIndexer::KeyVector random_sample_keys;
+KeyVector random_sample_keys;
 
-ErrorCode MetaIndexer_RandomSample_stub(void *obj,
-                                        RequestContext *rc,
-                                        const std::size_t c,
-                                        MetaIndexer::KeyVector &out_keys) noexcept {
+ErrorCode
+MetaIndexer_RandomSample_stub(void *obj, RequestContext *rc, const std::size_t c, KeyVector &out_keys) noexcept {
     if (random_sample_result == ErrorCode::EC_OK) {
         if (c == random_sample_keys.size()) {
             out_keys = random_sample_keys;
@@ -233,7 +231,7 @@ ErrorCode MetaIndexer_RandomSample_stub(void *obj,
             // special case
             out_keys = random_sample_keys;
         } else {
-            out_keys = MetaIndexer::KeyVector(c);
+            out_keys = KeyVector(c);
         }
     }
     std::this_thread::sleep_for(mi_randsample_delay);
@@ -244,12 +242,10 @@ ErrorCode MetaIndexer_RandomSample_stub(void *obj,
 
 std::chrono::milliseconds mi_sample_reclaim_delay{0};
 ErrorCode sample_reclaim_result;
-MetaIndexer::KeyVector sample_reclaim_keys;
+KeyVector sample_reclaim_keys;
 
-ErrorCode MetaIndexer_SampleReclaimKeys_stub(void *obj,
-                                             RequestContext *rc,
-                                             const std::int64_t c,
-                                             MetaIndexer::KeyVector &out_keys) noexcept {
+ErrorCode
+MetaIndexer_SampleReclaimKeys_stub(void *obj, RequestContext *rc, const std::int64_t c, KeyVector &out_keys) noexcept {
     if (sample_reclaim_result == ErrorCode::EC_OK) {
         if (c == static_cast<std::int64_t>(sample_reclaim_keys.size())) {
             out_keys = sample_reclaim_keys;
@@ -257,7 +253,7 @@ ErrorCode MetaIndexer_SampleReclaimKeys_stub(void *obj,
             // special case
             out_keys = sample_reclaim_keys;
         } else {
-            out_keys = MetaIndexer::KeyVector(c);
+            out_keys = KeyVector(c);
         }
     }
     std::this_thread::sleep_for(mi_sample_reclaim_delay);
@@ -3110,14 +3106,17 @@ TEST_F(CacheReclaimerTest, TestPerf) {
 
     for (int i = 0; i != sampling_sz_per_task; ++i) {
         sample_reclaim_keys.emplace_back(i);
-        get_out_properties.emplace_back(MetaIndexer::PropertyMap{{PROPERTY_LRU_TIME, "9"}});
+        get_out_properties.emplace_back(PropertyMap{{PROPERTY_LRU_TIME, "9"}});
     }
 
     batch_get_loc_out_maps = std::vector<CacheLocationMap>(
         batching_sz,
-        CacheLocationMap{
-            {"foo",
-             CacheLocation{"foo", CacheLocationStatus::CLS_SERVING, DataStorageType::DATA_STORAGE_TYPE_NFS, 8, {}}}});
+        CacheLocationMap{{"foo",
+                          std::make_shared<CacheLocation>("foo",
+                                                          CacheLocationStatus::CLS_SERVING,
+                                                          DataStorageType::DATA_STORAGE_TYPE_NFS,
+                                                          8,
+                                                          std::vector<LocationSpec>{})}});
 
     cache_reclaimer_->job_state_flag_ = true;
 

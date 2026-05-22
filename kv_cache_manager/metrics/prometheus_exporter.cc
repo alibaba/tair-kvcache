@@ -103,31 +103,50 @@ std::string PrometheusExporter::Expose(MetricsRegistry &registry, const std::str
     // GetAllMetrics returns entries ordered by name (the underlying
     // map is std::map<string, ...>), so consecutive entries with the
     // same name belong to the same family.
+    //
+    // Untouched series are skipped: the Service collector registers
+    // every (manager.*, meta_searcher.*, meta_indexer.*) series for
+    // every api_name, but most combinations are never written. Without
+    // filtering, /metrics is dominated by zero-valued series that
+    // mostly inflate Prometheus cardinality. A series becomes touched
+    // the first time any write path on Counter/Gauge runs against it.
+    // If every series in a family is untouched, the # HELP / # TYPE
+    // header is omitted as well.
     std::ostringstream ss;
 
     std::string prev_name;
+    bool family_header_written = false;
     for (const auto &[name, tags, val] : all_metrics) {
+        if (val == nullptr || !val->touched.load(std::memory_order_relaxed)) {
+            continue;
+        }
+
         std::string prom_name = SanitizeName(prefix, name);
 
         if (name != prev_name) {
+            family_header_written = false;
+            prev_name = name;
+        }
+
+        if (!family_header_written) {
             const char *type_str = "untyped";
-            if (std::holds_alternative<CounterValue>(*val)) {
+            if (std::holds_alternative<CounterValue>(val->value)) {
                 type_str = "counter";
-            } else if (std::holds_alternative<GaugeValue>(*val)) {
+            } else if (std::holds_alternative<GaugeValue>(val->value)) {
                 type_str = "gauge";
             }
             ss << "# HELP " << prom_name << ' ' << name << '\n';
             ss << "# TYPE " << prom_name << ' ' << type_str << '\n';
-            prev_name = name;
+            family_header_written = true;
         }
 
         ss << prom_name;
         WriteLabels(ss, tags);
 
-        if (std::holds_alternative<CounterValue>(*val)) {
-            ss << ' ' << std::get<CounterValue>(*val).load(std::memory_order_relaxed);
-        } else if (std::holds_alternative<GaugeValue>(*val)) {
-            double gv = std::get<GaugeValue>(*val).load(std::memory_order_relaxed);
+        if (std::holds_alternative<CounterValue>(val->value)) {
+            ss << ' ' << std::get<CounterValue>(val->value).load(std::memory_order_relaxed);
+        } else if (std::holds_alternative<GaugeValue>(val->value)) {
+            double gv = std::get<GaugeValue>(val->value).load(std::memory_order_relaxed);
             if (std::isnan(gv)) {
                 ss << " NaN";
             } else if (std::isinf(gv)) {

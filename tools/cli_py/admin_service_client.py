@@ -20,6 +20,8 @@ from kv_cache_manager.protocol.protobuf.admin_service_pb2 import (
     UpdateStorageRequest,
     ListStorageRequest,
     ListStorageResponse,
+    ListInstanceGroupRequest,
+    ListInstanceGroupResponse,
 )
 
 from kv_cache_manager.protocol.protobuf.admin_service_pb2_grpc import AdminServiceStub
@@ -63,4 +65,12 @@ class AdminServiceClient(object):
             request = ListStorageRequest(trace_id="trace-123456")
         response = stub.ListStorage(request)
         print("[ListStorageReponse]:", str(response))
+        return response
+
+    def list_instance_group(self, request: Optional[ListInstanceGroupRequest] = None) -> ListInstanceGroupResponse:
+        stub = AdminServiceStub(self._channel)
+        if request is None:
+            request = ListInstanceGroupRequest(trace_id="trace-123456")
+        response = stub.ListInstanceGroup(request)
+        print("[ListInstanceGroupReponse]:", str(response))
         return response
