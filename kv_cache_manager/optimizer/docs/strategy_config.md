@@ -71,6 +71,14 @@ AccHitRate = AccHitTokens / AccInputTokens
 
 optimizer 回放输入只接受 JSONL，每行一条标准 trace。字段不完整时直接失败，不做旧格式推断。
 
+所有整数都按 optimizer 当前 C++ 类型解析：`timestamp_ns`、`input_len`、`keys`、`tokens`、`block_mask` offset 和 `ttl_us` 必须落在 `int64_t` 范围内：
+
+```text
+[-9223372036854775808, 9223372036854775807]
+```
+
+JSON 中的非负整数可以写成 signed/unsigned number，但超过 `INT64_MAX=9223372036854775807` 会被拒绝，不会被截断或 wrap 成负数。使用 64-bit hash 作为 block key 时，应按有符号 `int64_t` 结果写入 trace。
+
 Get trace：
 
 ```json
@@ -106,17 +114,46 @@ Write trace：
 
 必填字段：
 
-| 字段 | 说明 |
-|---|---|
-| `type` | 只能是 `get` 或 `write` |
-| `instance_id` | 必须匹配配置中的 instance |
-| `timestamp_ns` | ns 时间戳；不再接受 `timestamp_us` |
-| `keys` | block key 列表，不能为空 |
-| `input_len` | 输入 token 数，必须为正整数 |
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `type` | string | 只能是 `get` 或 `write` |
+| `instance_id` | string | 非空，必须匹配配置中的 instance |
+| `timestamp_ns` | int64 | ns 时间戳，必须为正整数；不再接受 `timestamp_us` |
+| `keys` | int64 array | block key 列表，不能为空；每个 key 必须在 `int64_t` 范围内 |
+| `input_len` | int64 | 输入 token 数，必须为正整数；`InputTokens` 直接使用该值 |
 
-`tokens` 可为空，用于减小 trace 文件体积；命中率以 `input_len` 为准。
+可选公共字段：
+
+| 字段 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `trace_id` | string | 空字符串 | 请求标识，用于调试和模板分析 |
+| `tokens` | int64 array | 空数组 | token id 列表，可为空以减小 trace 文件体积；命中率以 `input_len` 为准 |
+
+`get` 专用字段：
+
+| 字段 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `query_type` | string | `prefix_match` | 当前只支持 `prefix_match`；其他值会被跳过 |
+| `block_mask` | bool array 或非负 int64 | 空数组 | trace 已经知道的本地命中 block。数组形式逐 block 标记；整数形式表示从前缀开始的本地命中 block 数 |
+| `sw_size` | int32 | 0 | 滑窗参数，当前标准前缀匹配通常为 0 |
+| `location_spec_names` | string array | 空数组 | 兼容字段，标准分析通常为空 |
+
+`write` 专用字段：
+
+| 字段 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `ttl_us` | int64 | 0 | 请求级 TTL，单位微秒；`0` 使用 group 默认 TTL，`-1` 表示禁用 TTL |
 
 `block_mask` 只用于标记 trace 已经知道的本地命中 block，不是标准报告的分组依据。直接分析请求输入时通常可传空数组，此时整体 `HitRate` 仍按 `HitTokens / InputTokens` 计算。
+
+旧格式或不合法输入会失败，包括：
+
+- 缺少 `type`、`instance_id`、`timestamp_ns`、`keys` 或 `input_len`。
+- `input_len <= 0`、`timestamp_ns <= 0` 或 `keys` 为空。
+- 使用 `timestamp_us` 但没有 `timestamp_ns`。
+- `keys` / `tokens` 中存在非整数，或存在超过 `INT64_MAX` 的 unsigned number。
+- `block_mask` 数组中存在非 bool 值，或 offset 为负数 / 超过 `INT64_MAX`。
+- legacy dialog-style trace 只有 `query_type` / `block_mask` / decode metadata 但没有显式 `type=get/write`。
 
 ## instance group 配置
 
@@ -127,6 +164,7 @@ Write trace：
   "used_percentage": 1.0,
   "hierarchical_eviction_enabled": true,
   "tier_write_mode": "write_through",
+  "selective_write_threshold": 2,
   "enable_promote": true,
   "default_block_ttl_seconds": 0,
   "ttl_refresh_on_read": true,
@@ -142,6 +180,7 @@ Write trace：
 | `used_percentage` | number | 必填 | 容量水位比例，实际阈值为 capacity × used_percentage |
 | `hierarchical_eviction_enabled` | bool | 必填 | 是否启用分层容量和分层驱逐 |
 | `tier_write_mode` | string | `write_through` | 多 tier 写入和层间流动策略 |
+| `selective_write_threshold` | int | `2` | `write_through_selective` 下命中层访问次数达到该阈值后复制到下一层；必须为正整数 |
 | `enable_promote` | bool | `true` | 低层命中后是否逐层复制回经过的高优先级层 |
 | `default_block_ttl_seconds` | int | `0` | group 默认 TTL 秒数，`0` 表示组级禁用 TTL |
 | `ttl_refresh_on_read` | bool | `true` | TTL 策略下读命中是否刷新 TTL 锚点 |
@@ -154,7 +193,7 @@ Write trace：
 |---|---|---|---|
 | `write_through` | 写入时同时落所有 tier | 各 tier 独立按自身容量驱逐 | 基线、全量副本、多层独立命中率分析 |
 | `cascading` | 写入时只落 tier 0 | tier i 驱逐出的 block 降级到 tier i+1，最后一层驱逐后丢弃 | HBM→DRAM→SSD 逐级下沉 |
-| `write_through_selective` | 初始只落 tier 0 | 命中层访问次数达到阈值后复制到下一层 | 控制低层写放大，只让热块下沉 |
+| `write_through_selective` | 初始只落 tier 0 | 命中层访问次数达到 `selective_write_threshold` 后复制到下一层 | 控制低层写放大，只让热块下沉 |
 | `cascading_no_access_propagation` | 与 `cascading` 相同 | 上层命中不刷新低层访问时间 | 评估低层独立冷热衰减 |
 
 `enable_promote=true` 时，低优先级 tier 命中会触发向更高优先级 tier 逐层复制。比如 L3 命中会补齐 L2 和 L1，L2 命中只补 L1，不会额外写入更低层。复制动作会走容量检查，可能立刻触发对应 tier 的驱逐。

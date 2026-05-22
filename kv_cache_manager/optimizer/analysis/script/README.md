@@ -103,6 +103,7 @@ bazel run //kv_cache_manager/optimizer/analysis/script:multi_instance_replay -- 
 | `--eviction-mode` | — | 3 | optimizer eviction mode：`1=group rough`，`2=instance rough`，`3=instance precise` |
 | `--eviction-batch-size` | — | 100 | 每个 instance 单次驱逐批大小 |
 | `--tier-write-mode` | — | `write_through` | 分层写入策略；可选 `write_through` / `cascading` / `write_through_selective` / `cascading_no_access_propagation` |
+| `--selective-write-threshold` | — | 2 | `write_through_selective` 下，命中层访问次数达到该阈值后复制到下一层；必须为正整数 |
 | `--enable-promote` | — | true | 开启从低层级向高层级 promote；与 `--disable-promote` 互斥 |
 | `--disable-promote` | — | false | 关闭 promote；与 `--enable-promote` 互斥 |
 | `--disable-hierarchical-eviction` | — | false | 关闭分层驱逐；默认生成分层配置 |

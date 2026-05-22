@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <stdexcept>
 
 #include "kv_cache_manager/common/logger.h"
 
@@ -54,6 +55,15 @@ void HitRateTracker::Export(const std::string &instance_id, const OptimizerConfi
 void HitRateTracker::ExportHitRates(const std::string &instance_id,
                                     const InstanceData &data,
                                     const OptimizerConfig &config) {
+    for (const auto &record : data.read_records) {
+        if (record.block_size_tokens == 0) {
+            std::string message =
+                "Cannot export hit rates for instance " + instance_id + ": block_size must be set to a positive value";
+            KVCM_LOG_ERROR("%s", message.c_str());
+            throw std::runtime_error(message);
+        }
+    }
+
     std::string file_dir = config.output_result_path();
     std::filesystem::create_directories(file_dir);
 
@@ -122,7 +132,7 @@ void HitRateTracker::ExportHitRates(const std::string &instance_id,
         const auto &r = data.read_records[i];
         size_t read_blocks = r.local_read_blocks + r.remote_read_blocks;
         size_t current_hit = r.local_hit_blocks + r.remote_hit_blocks;
-        size_t block_size_tokens = r.block_size_tokens > 0 ? r.block_size_tokens : 1;
+        size_t block_size_tokens = r.block_size_tokens;
         size_t input_tokens = r.input_tokens;
         size_t local_hit_tokens = r.local_hit_blocks * block_size_tokens;
         size_t remote_hit_tokens = r.remote_hit_blocks * block_size_tokens;

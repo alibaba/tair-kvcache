@@ -69,6 +69,8 @@ def parse_args():
                             "write_through_selective",
                             "cascading_no_access_propagation",
                         ])
+    parser.add_argument("--selective-write-threshold", type=int, default=2,
+                        help="Access-count threshold for write_through_selective tier writes")
     promote_group = parser.add_mutually_exclusive_group()
     promote_group.add_argument("--enable-promote", dest="enable_promote", action="store_true", default=True)
     promote_group.add_argument("--disable-promote", dest="enable_promote", action="store_false")
@@ -91,6 +93,8 @@ def parse_args():
     args = parser.parse_args()
     if not args.aggregate_only and not args.trace_dir and not args.trace_files:
         parser.error("one of --trace-dir or --trace-files is required")
+    if args.selective_write_threshold <= 0:
+        parser.error("--selective-write-threshold must be positive")
     return args
 
 
@@ -395,6 +399,7 @@ def _make_single_instance_config(args, trace_file: str, output_dir: str, instanc
                 "used_percentage": args.used_percentage,
                 "hierarchical_eviction_enabled": not args.disable_hierarchical_eviction,
                 "tier_write_mode": args.tier_write_mode,
+                "selective_write_threshold": args.selective_write_threshold,
                 "enable_promote": args.enable_promote,
                 "default_block_ttl_seconds": args.default_block_ttl_seconds,
                 "ttl_refresh_on_read": args.ttl_refresh_on_read,

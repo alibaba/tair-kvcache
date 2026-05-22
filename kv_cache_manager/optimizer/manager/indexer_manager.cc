@@ -12,7 +12,8 @@ bool OptIndexerManager::CreateOptIndexer(const OptInstanceConfig &instance_confi
                                          const std::vector<OptTierConfig> &storage_configs,
                                          bool hierarchical_eviction_enabled,
                                          TierWriteMode tier_write_mode,
-                                         int64_t default_ttl_ns) {
+                                         int64_t default_ttl_ns,
+                                         size_t selective_write_threshold) {
 
     std::string instance_id = instance_config.instance_id();
     auto indexer = GetOptIndexer(instance_id);
@@ -32,7 +33,8 @@ bool OptIndexerManager::CreateOptIndexer(const OptInstanceConfig &instance_confi
     // 非分层模式下 tier_write_mode 被忽略（tier_policies_ 中仅含单个 "shared" 策略，全层写等同单层写）
     const TieredPolicyGroup *group_ptr = policy_group;
     const TierWriteMode effective_mode = hierarchical_eviction_enabled ? tier_write_mode : TierWriteMode::WRITE_THROUGH;
-    indexer = std::make_shared<RadixTreeIndex>(instance_id, group_ptr->policies, effective_mode, default_ttl_ns);
+    indexer = std::make_shared<RadixTreeIndex>(
+        instance_id, group_ptr->policies, effective_mode, default_ttl_ns, selective_write_threshold);
 
     opt_indexer_map_[instance_id] = indexer;
     KVCM_LOG_INFO("Create optimizer indexer success, instance_id: %s", instance_id.c_str());

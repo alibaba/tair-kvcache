@@ -27,13 +27,17 @@ StandardTraceLoader::LoadFromFile(const std::string &trace_file_path) {
         KVCM_LOG_ERROR("%s", full_message.c_str());
         throw std::runtime_error(full_message);
     };
+    size_t physical_line_count = 0;
+    size_t non_empty_line_count = 0;
     while (std::getline(file, line)) {
+        physical_line_count++;
         line_number++;
 
         // 跳过空行
-        if (line.empty()) {
+        if (line.find_first_not_of(" \t\r\n") == std::string::npos) {
             continue;
         }
+        non_empty_line_count++;
 
         // 解析 JSON 以检查字段
         rapidjson::Document doc;
@@ -95,6 +99,14 @@ StandardTraceLoader::LoadFromFile(const std::string &trace_file_path) {
 
     file.close();
     if (traces.empty()) {
+        if (physical_line_count == 0) {
+            KVCM_LOG_ERROR("Optimizer trace file is empty: %s", trace_file_path.c_str());
+            throw std::runtime_error("Optimizer trace file is empty: " + trace_file_path);
+        }
+        if (non_empty_line_count == 0) {
+            KVCM_LOG_ERROR("Optimizer trace file contains only blank lines: %s", trace_file_path.c_str());
+            throw std::runtime_error("Optimizer trace file contains only blank lines: " + trace_file_path);
+        }
         KVCM_LOG_ERROR("No optimizer traces loaded from file: %s", trace_file_path.c_str());
         throw std::runtime_error("No optimizer traces loaded from file: " + trace_file_path);
     }

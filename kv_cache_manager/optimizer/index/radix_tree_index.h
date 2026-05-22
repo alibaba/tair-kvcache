@@ -1,4 +1,5 @@
 #pragma once
+#include <cstddef>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -23,7 +24,8 @@ public:
     RadixTreeIndex(const std::string &instance_id,
                    std::vector<std::shared_ptr<EvictionPolicy>> tier_policies,
                    TierWriteMode write_mode = TierWriteMode::WRITE_THROUGH,
-                   int64_t default_ttl_ns = 0);
+                   int64_t default_ttl_ns = 0,
+                   size_t selective_write_threshold = 2);
     // 兼容构造函数 (单 policy)
     RadixTreeIndex(const std::string &instance_id,
                    const std::shared_ptr<EvictionPolicy> &eviction_policy,
@@ -98,6 +100,7 @@ private:
     size_t write_tier_count_ = 0;
     std::string instance_id_;
     int64_t default_ttl_ns_ = 0;
+    size_t selective_write_threshold_ = 2;
     std::shared_ptr<StatsCollector> stats_collector_;
     bool enable_promote_ = false;
     bool read_triggered_tier_write_ = false;

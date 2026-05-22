@@ -15,7 +15,8 @@ namespace kv_cache_manager {
 RadixTreeIndex::RadixTreeIndex(const std::string &instance_id,
                                std::vector<std::shared_ptr<EvictionPolicy>> tier_policies,
                                TierWriteMode write_mode,
-                               int64_t default_ttl_ns) {
+                               int64_t default_ttl_ns,
+                               size_t selective_write_threshold) {
     root_ = std::make_unique<RadixTreeNode>();
     tier_policies_ = std::move(tier_policies);
     for (auto &p : tier_policies_) {
@@ -31,6 +32,7 @@ RadixTreeIndex::RadixTreeIndex(const std::string &instance_id,
             : tier_policies_.size();
     instance_id_ = instance_id;
     default_ttl_ns_ = default_ttl_ns;
+    selective_write_threshold_ = selective_write_threshold;
 }
 
 // 兼容构造函数 (单 policy)
@@ -399,7 +401,7 @@ void RadixTreeIndex::OnBlockAccessed(BlockEntry *block, int64_t timestamp, bool 
             }
         }
     }
-    if (hit_tier_access_count >= 2) {
+    if (write_mode_ == TierWriteMode::WRITE_THROUGH_SELECTIVE && hit_tier_access_count >= selective_write_threshold_) {
         SelectiveWriteToNextTier(block, hit_tier_idx, timestamp);
     }
 }

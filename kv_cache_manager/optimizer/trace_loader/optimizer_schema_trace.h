@@ -1,10 +1,36 @@
 #pragma once
 #include <algorithm>
+#include <cstdint>
+#include <limits>
 
 #include "kv_cache_manager/common/jsonizable.h"
 #include "kv_cache_manager/meta/cache_location.h"
 
 namespace kv_cache_manager {
+inline bool ParseOptimizerInt64AllowUint64(const rapidjson::Value &value, int64_t &parsed_value) {
+    if (value.IsInt64()) {
+        parsed_value = value.GetInt64();
+        return true;
+    }
+    if (value.IsUint64()) {
+        const auto unsigned_value = value.GetUint64();
+        if (unsigned_value > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+            return false;
+        }
+        parsed_value = static_cast<int64_t>(unsigned_value);
+        return true;
+    }
+    if (value.IsInt()) {
+        parsed_value = static_cast<int64_t>(value.GetInt());
+        return true;
+    }
+    if (value.IsUint()) {
+        parsed_value = static_cast<int64_t>(value.GetUint());
+        return true;
+    }
+    return false;
+}
+
 inline bool ParseOptimizerInt64VectorAllowUint64(const rapidjson::Value &rapid_value,
                                                  const char *key,
                                                  std::vector<int64_t> &values,
@@ -20,17 +46,11 @@ inline bool ParseOptimizerInt64VectorAllowUint64(const rapidjson::Value &rapid_v
     values.clear();
     values.reserve(array_value.Size());
     for (const auto &value : array_value.GetArray()) {
-        if (value.IsInt64()) {
-            values.push_back(value.GetInt64());
-        } else if (value.IsUint64()) {
-            values.push_back(static_cast<int64_t>(value.GetUint64()));
-        } else if (value.IsInt()) {
-            values.push_back(static_cast<int64_t>(value.GetInt()));
-        } else if (value.IsUint()) {
-            values.push_back(static_cast<int64_t>(value.GetUint()));
-        } else {
+        int64_t parsed_value = 0;
+        if (!ParseOptimizerInt64AllowUint64(value, parsed_value)) {
             return false;
         }
+        values.push_back(parsed_value);
     }
     return true;
 }
@@ -48,11 +68,7 @@ public:
             return false;
         }
         const auto &timestamp_value = rapid_value["timestamp_ns"];
-        if (timestamp_value.IsInt64()) {
-            timestamp_ns_ = timestamp_value.GetInt64();
-        } else if (timestamp_value.IsUint64()) {
-            timestamp_ns_ = static_cast<int64_t>(timestamp_value.GetUint64());
-        } else {
+        if (!ParseOptimizerInt64AllowUint64(timestamp_value, timestamp_ns_)) {
             return false;
         }
         if (!ParseOptimizerInt64VectorAllowUint64(rapid_value, "tokens", tokens_)) {
@@ -66,11 +82,7 @@ public:
             return false;
         }
         const auto &input_len_value = rapid_value["input_len"];
-        if (input_len_value.IsInt64()) {
-            input_len_ = input_len_value.GetInt64();
-        } else if (input_len_value.IsUint64()) {
-            input_len_ = static_cast<int64_t>(input_len_value.GetUint64());
-        } else {
+        if (!ParseOptimizerInt64AllowUint64(input_len_value, input_len_)) {
             return false;
         }
         return true;
@@ -97,11 +109,17 @@ public:
         if (input_len_ >= 0 && block_size > 0) {
             return static_cast<size_t>(std::min<int64_t>(static_cast<int64_t>(keys_.size()), input_len_ / block_size));
         }
+        if (!tokens_.empty() && block_size > 0) {
+            return std::min(keys_.size(), tokens_.size() / block_size);
+        }
         return keys_.size();
     }
     size_t input_token_count(size_t block_size) const {
         if (input_len_ >= 0) {
             return static_cast<size_t>(std::max<int64_t>(input_len_, 0));
+        }
+        if (!tokens_.empty()) {
+            return tokens_.size();
         }
         return keys_.size() * block_size;
     }
@@ -151,16 +169,18 @@ public:
             if (block_mask_value.IsArray()) {
                 BlockMaskVector block_mask_vector;
                 for (const auto &val : block_mask_value.GetArray()) {
-                    if (val.IsBool()) {
-                        block_mask_vector.push_back(val.GetBool());
+                    if (!val.IsBool()) {
+                        return false;
                     }
+                    block_mask_vector.push_back(val.GetBool());
                 }
                 block_mask_ = block_mask_vector;
-            } else if (block_mask_value.IsInt64()) {
-                block_mask_ = BlockMaskOffset(block_mask_value.GetInt64());
             } else {
-                // 默认为空的BlockMaskVector
-                block_mask_ = BlockMaskVector{};
+                int64_t block_mask_offset = 0;
+                if (!ParseOptimizerInt64AllowUint64(block_mask_value, block_mask_offset) || block_mask_offset < 0) {
+                    return false;
+                }
+                block_mask_ = BlockMaskOffset(block_mask_offset);
             }
         } else {
             // 默认为空的BlockMaskVector
@@ -194,7 +214,10 @@ public:
         if (!OptimizerSchemaTrace::FromRapidValue(rapid_value)) {
             return false;
         }
-        KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "ttl_us", ttl_us_, int64_t(0));
+        ttl_us_ = 0;
+        if (rapid_value.HasMember("ttl_us") && !ParseOptimizerInt64AllowUint64(rapid_value["ttl_us"], ttl_us_)) {
+            return false;
+        }
         return true;
     }
     void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override {

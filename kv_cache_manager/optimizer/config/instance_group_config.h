@@ -23,6 +23,7 @@ public:
     [[nodiscard]] bool hierarchical_eviction_enabled() const { return hierarchical_eviction_enabled_; }
     [[nodiscard]] TierWriteMode tier_write_mode() const { return tier_write_mode_; }
     [[nodiscard]] bool enable_promote() const { return enable_promote_; }
+    [[nodiscard]] int64_t selective_write_threshold() const { return selective_write_threshold_; }
     [[nodiscard]] int64_t default_block_ttl_seconds() const { return default_block_ttl_seconds_; }
     [[nodiscard]] bool ttl_refresh_on_read() const { return ttl_refresh_on_read_; }
     [[nodiscard]] const std::vector<OptTierConfig> &storages() const { return storages_; }
@@ -35,6 +36,7 @@ public:
     void set_hierarchical_eviction_enabled(bool enabled) { hierarchical_eviction_enabled_ = enabled; }
     void set_tier_write_mode(TierWriteMode mode) { tier_write_mode_ = mode; }
     void set_enable_promote(bool enable) { enable_promote_ = enable; }
+    void set_selective_write_threshold(int64_t threshold) { selective_write_threshold_ = threshold; }
     void set_default_block_ttl_seconds(int64_t ttl) { default_block_ttl_seconds_ = ttl; }
     void set_ttl_refresh_on_read(bool enabled) { ttl_refresh_on_read_ = enabled; }
     void set_storages(const std::vector<OptTierConfig> &storages) { storages_ = storages; }
@@ -47,6 +49,7 @@ private:
     bool hierarchical_eviction_enabled_ = false;
     TierWriteMode tier_write_mode_ = TierWriteMode::WRITE_THROUGH;
     bool enable_promote_ = true;
+    int64_t selective_write_threshold_ = 2;
     int64_t default_block_ttl_seconds_ = 0; // 0 = TTL 关闭
     bool ttl_refresh_on_read_ = true;
 
