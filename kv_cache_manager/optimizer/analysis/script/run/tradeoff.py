@@ -231,6 +231,7 @@ def main():
     print("Output:   {}".format(config.output_result_path()))
     print()
 
+    output_dir = config.output_result_path()
     csv_save_dir = os.path.join(config.output_result_path(), "csv_results")
 
     # ----------------------------------------------------------------

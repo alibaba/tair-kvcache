@@ -1,6 +1,5 @@
 load("@rules_python//python:py_binary.bzl", "py_binary")
 load("@rules_python//python:py_library.bzl", "py_library")
-load("@rules_python//python:py_test.bzl", "py_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -88,14 +87,11 @@ py_binary(
     deps = [":utils_lib"],
 )
 
-py_test(
-    name = "multi_instance_replay_test",
+py_library(
+    name = "multi_instance_replay_lib",
     srcs = [
         "run/__init__.py",
         "run/multi_instance_replay.py",
-        "run/multi_instance_replay_test.py",
     ],
-    main = "run/multi_instance_replay_test.py",
     imports = ["."],
-    deps = [":utils_lib"],
 )

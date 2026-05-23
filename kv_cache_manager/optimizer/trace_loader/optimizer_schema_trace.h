@@ -15,10 +15,11 @@ inline bool ParseOptimizerInt64AllowUint64(const rapidjson::Value &value, int64_
     }
     if (value.IsUint64()) {
         const auto unsigned_value = value.GetUint64();
-        if (unsigned_value > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
-            return false;
+        if (unsigned_value <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+            parsed_value = static_cast<int64_t>(unsigned_value);
+            return true;
         }
-        parsed_value = static_cast<int64_t>(unsigned_value);
+        parsed_value = std::numeric_limits<int64_t>::min() + static_cast<int64_t>(unsigned_value - (uint64_t{1} << 63));
         return true;
     }
     if (value.IsInt()) {
@@ -79,12 +80,11 @@ public:
             return false;
         }
         input_len_ = -1;
-        if (!rapid_value.HasMember("input_len")) {
-            return false;
-        }
-        const auto &input_len_value = rapid_value["input_len"];
-        if (!ParseOptimizerInt64AllowUint64(input_len_value, input_len_)) {
-            return false;
+        if (rapid_value.HasMember("input_len")) {
+            const auto &input_len_value = rapid_value["input_len"];
+            if (!ParseOptimizerInt64AllowUint64(input_len_value, input_len_)) {
+                return false;
+            }
         }
         return true;
     };
@@ -155,6 +155,9 @@ public:
         if (!OptimizerSchemaTrace::FromRapidValue(rapid_value)) {
             return false;
         }
+        if (input_len() <= 0) {
+            return false;
+        }
         // 解析自己的字段
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "query_type", query_type_, std::string("prefix_match"));
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "sw_size", sw_size_, int32_t(0));
@@ -211,6 +214,9 @@ public:
     bool FromRapidValue(const rapidjson::Value &rapid_value) override {
         if (!OptimizerSchemaTrace::FromRapidValue(rapid_value)) {
             return false;
+        }
+        if (input_len() <= 0) {
+            set_input_len(std::max<int64_t>(1, static_cast<int64_t>(keys().size())));
         }
         ttl_us_ = 0;
         if (rapid_value.HasMember("ttl_us") && !ParseOptimizerInt64AllowUint64(rapid_value["ttl_us"], ttl_us_)) {

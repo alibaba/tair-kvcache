@@ -113,6 +113,17 @@ py_binary(
 )
 
 py_test(
+    name = "MultiInstanceReplayPyTest",
+    srcs = [
+        "multi_instance_replay_py_test.py",
+    ],
+    main = "multi_instance_replay_py_test.py",
+    deps = [
+        "//kv_cache_manager/optimizer/analysis/script:multi_instance_replay_lib",
+    ],
+)
+
+py_test(
     name = "optimizer_manager_py_test",
     size = "small",
     main = "asan_runner.py",

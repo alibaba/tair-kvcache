@@ -21,9 +21,6 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Optional
 
-from utils.window_aggregator import aggregate_and_write, collect_hit_rate_csvs
-
-
 def _parse_tier_flow_config_arg(parser, raw_value):
     if not raw_value:
         return []
@@ -143,6 +140,8 @@ def parse_args():
 
 
 def main():
+    from utils.window_aggregator import aggregate_and_write, collect_hit_rate_csvs
+
     _configure_bazel_run_output()
     args = parse_args()
     total_start = time.time()
@@ -419,8 +418,11 @@ def _inspect_optimizer_trace(trace_file: str) -> str:
                 )
             if "timestamp_ns" not in obj or type(obj["timestamp_ns"]) is not int:
                 raise SystemExit(f"{trace_file}:{line_no} must contain integer timestamp_ns")
-            if "input_len" not in obj or type(obj["input_len"]) is not int or obj["input_len"] <= 0:
-                raise SystemExit(f"{trace_file}:{line_no} must contain positive integer input_len")
+            if trace_type == "get":
+                if "input_len" not in obj or type(obj["input_len"]) is not int or obj["input_len"] <= 0:
+                    raise SystemExit(f"{trace_file}:{line_no} get trace must contain positive integer input_len")
+            elif "input_len" in obj and (type(obj["input_len"]) is not int or obj["input_len"] <= 0):
+                raise SystemExit(f"{trace_file}:{line_no} write trace input_len must be a positive integer when set")
             keys = obj.get("keys")
             # Keep this aligned with StandardTraceLoader: short requests with
             # 0 < input_len < block_size are valid and use keys=[].

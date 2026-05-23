@@ -71,13 +71,13 @@ AccHitRate = AccHitTokens / AccInputTokens
 
 optimizer 回放输入只接受 JSONL，每行一条标准 trace。字段不完整时直接失败，不做旧格式推断。
 
-所有整数都按 optimizer 当前 C++ 类型解析：`timestamp_ns`、`input_len`、`keys`、`tokens`、`block_mask` offset 和 `ttl_us` 必须落在 `int64_t` 范围内：
+`timestamp_ns`、`input_len`、`block_mask` offset 和 `ttl_us` 必须落在 `int64_t` 范围内：
 
 ```text
 [-9223372036854775808, 9223372036854775807]
 ```
 
-JSON 中的非负整数可以写成 signed/unsigned number，但超过 `INT64_MAX=9223372036854775807` 会被拒绝，不会被截断或 wrap 成负数。使用 64-bit hash 作为 block key 时，应按有符号 `int64_t` 结果写入 trace。
+`keys` 和 `tokens` 支持 JSON signed/unsigned 整数。超过 `INT64_MAX=9223372036854775807` 的 unsigned 64-bit 值会按补码稳定映射到内部 `int64_t`，例如 `9223372036854775808 -> -9223372036854775808`、`18446744073709551615 -> -1`。
 
 Get trace：
 
@@ -107,7 +107,6 @@ Write trace：
   "timestamp_ns": 1001,
   "keys": [101, 102, 103],
   "tokens": [],
-  "input_len": 33,
   "ttl_us": 0
 }
 ```
@@ -119,8 +118,7 @@ Write trace：
 | `type` | string | 只能是 `get` 或 `write` |
 | `instance_id` | string | 非空，必须匹配配置中的 instance |
 | `timestamp_ns` | int64 | ns 时间戳，必须为正整数；不再接受 `timestamp_us` |
-| `keys` | int64 array | block key 列表，可为空；每个 key 必须在 `int64_t` 范围内 |
-| `input_len` | int64 | 输入 token 数，必须为正整数；`InputTokens` 直接使用该值 |
+| `keys` | int64/uint64 array | block key 列表，可为空 |
 
 可选公共字段：
 
@@ -133,6 +131,7 @@ Write trace：
 
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
+| `input_len` | int64 | 必填 | 输入 token 数，必须为正整数；`InputTokens` 直接使用该值 |
 | `query_type` | string | `prefix_match` | 当前只支持 `prefix_match`；其他值会被跳过 |
 | `block_mask` | bool array 或非负 int64 | 空数组 | trace 已经知道的本地命中 block。数组形式逐 block 标记；整数形式表示从前缀开始的本地命中 block 数 |
 | `sw_size` | int32 | 0 | 滑窗参数，当前标准前缀匹配通常为 0 |
@@ -142,16 +141,17 @@ Write trace：
 
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
+| `input_len` | int64 | 可省略 | 写入不参与 token hit-rate 分母；若提供则必须为正整数 |
 | `ttl_us` | int64 | 0 | 请求级 TTL，单位微秒；`0` 使用 group 默认 TTL，`-1` 表示禁用 TTL |
 
 `block_mask` 只用于标记 trace 已经知道的本地命中 block，不是标准报告的分组依据。直接分析请求输入时通常可传空数组，此时整体 `HitRate` 仍按 `HitTokens / InputTokens` 计算。
 
 旧格式或不合法输入会失败，包括：
 
-- 缺少 `type`、`instance_id`、`timestamp_ns`、`keys` 或 `input_len`。
-- `input_len <= 0`、`timestamp_ns <= 0`，或 `keys` 不是数组。
+- 缺少 `type`、`instance_id`、`timestamp_ns`、`keys`，或 `get` trace 缺少 `input_len`。
+- `get.input_len <= 0`、`timestamp_ns <= 0`，或 `keys` 不是数组。
 - 使用 `timestamp_us` 但没有 `timestamp_ns`。
-- `keys` / `tokens` 中存在非整数，或存在超过 `INT64_MAX` 的 unsigned number。
+- `keys` / `tokens` 中存在非整数，或 `write.input_len` 存在但不是正整数。
 - `block_mask` 数组中存在非 bool 值，或 offset 为负数 / 超过 `INT64_MAX`。
 - legacy dialog-style trace 只有 `query_type` / `block_mask` / decode metadata 但没有显式 `type=get/write`。
 

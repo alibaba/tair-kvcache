@@ -101,11 +101,12 @@ TEST_F(LruEvictionPolicyTest, EvictBlocks) {
 TEST_F(LruEvictionPolicyTest, SharedModeUsesBlockAccessTimeWhenTierTimeIsUninitialized) {
     LruParams params;
     params.sample_rate = 1.0;
-    params.shard_count = 1;
+    params.shard_count = 2;
+    params.sample_times = 2;
     auto policy = std::make_shared<LruEvictionPolicy>("shared", params);
 
-    auto old_block = CreateSharedBlock(1, 1000);
-    auto new_block = CreateSharedBlock(2, 2000);
+    auto old_block = CreateSharedBlock(1, 1000); // shard 1
+    auto new_block = CreateSharedBlock(2, 2000); // shard 0
 
     policy->OnBlockWritten(&old_block);
     policy->OnBlockWritten(&new_block);
