@@ -196,13 +196,11 @@ void RadixTreeIndex::PrefixQuery(const std::vector<int64_t> &block_keys,
                                  const BlockMask &block_mask,
                                  const int64_t timestamp,
                                  QueryHit *query_hit,
-                                 bool refresh_ttl_on_read,
-                                 size_t hit_countable_blocks) {
+                                 bool refresh_ttl_on_read) {
     read_triggered_tier_write_ = false;
     if (block_keys.empty()) {
         return;
     }
-    const size_t hit_limit = std::min(hit_countable_blocks, block_keys.size());
 
     RadixTreeNode *current_node = root_.get();
     size_t key_idx = 0;
@@ -224,13 +222,12 @@ void RadixTreeIndex::PrefixQuery(const std::vector<int64_t> &block_keys,
             }
             BlockEntry *blk = child->blocks[match_len].get();
             const bool is_local = IsIndexInMaskRange(block_mask, key_idx + match_len);
-            const bool count_for_hit_rate = (key_idx + match_len) < hit_limit;
             if (is_local) {
                 has_local_hit = true;
-                RecordTieredHit(blk, false, query_hit, count_for_hit_rate);
+                RecordTieredHit(blk, false, query_hit);
             } else {
                 has_remote_hit = true;
-                RecordTieredHit(blk, true, query_hit, count_for_hit_rate);
+                RecordTieredHit(blk, true, query_hit);
             }
             OnBlockAccessed(blk, timestamp, refresh_ttl_on_read);
             if (enable_promote_) {
@@ -439,11 +436,8 @@ void RadixTreeIndex::OnBlockAccessed(BlockEntry *block, int64_t timestamp, bool 
     }
 }
 
-void RadixTreeIndex::RecordTieredHit(BlockEntry *block,
-                                     bool is_remote,
-                                     QueryHit *query_hit,
-                                     bool count_for_hit_rate) const {
-    if (!query_hit || !count_for_hit_rate) {
+void RadixTreeIndex::RecordTieredHit(BlockEntry *block, bool is_remote, QueryHit *query_hit) const {
+    if (!query_hit) {
         return;
     }
     if (is_remote) {

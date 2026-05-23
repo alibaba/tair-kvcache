@@ -155,24 +155,13 @@ class BaseConverter(ABC):
         # 分配无冲突的时间戳
         timestamp_ns = self._allocate_timestamp(instance_id, timestamp_ns)
 
-        if 'input_len' not in kwargs:
-            raise ValueError("optimizer write trace requires input_len")
-        input_len = int(kwargs['input_len'])
-        if input_len <= 0:
-            raise ValueError("optimizer write trace input_len must be positive")
-
-        # tokens字段处理: 根据keep_tokens决定是否保留
-        tokens = kwargs.get('tokens', []) if self.keep_tokens else []
-        
         trace = {
             'type': 'write',  # 显式标记为Write trace
             # OptimizerSchemaTrace 基础字段
             'instance_id': instance_id,
             'trace_id': f"trace_{instance_id}_{timestamp_ns}",
             'timestamp_ns': timestamp_ns,
-            'tokens': tokens,
             'keys': keys,
-            'input_len': input_len,
         }
 
         return trace

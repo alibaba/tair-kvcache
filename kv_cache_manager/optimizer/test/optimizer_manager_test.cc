@@ -90,7 +90,7 @@ TEST_F(OptimizerManagerTest, WriteCacheTtlSecondsUsesNanosecondTimestamps) {
     ASSERT_TRUE(manager.Init());
 
     const int64_t write_ts_ns = 1'000'000'000;
-    manager.WriteCache("instance1", "write", write_ts_ns, {1}, {}, 1, 1024);
+    manager.WriteCache("instance1", "write", write_ts_ns, {1}, {}, 1);
 
     BlockMask remote_read_mask = std::vector<bool>{false};
     auto hit_before_expire = manager.GetCacheLocation(
@@ -108,7 +108,7 @@ TEST_F(OptimizerManagerTest, TemplateAnalysisReadRecordKeepsTraceIdAndKeys) {
     ASSERT_NE(manager.template_prefix_tracker_, nullptr);
 
     const std::vector<int64_t> keys = {1, 2, 3};
-    manager.WriteCache("instance1", "write_trace", 1000, keys, {}, 0, 3 * 1024);
+    manager.WriteCache("instance1", "write_trace", 1000, keys, {}, 0);
 
     BlockMask remote_read_mask = std::vector<bool>{false, false, false};
     manager.GetCacheLocation("instance1", "read_trace", 2000, keys, {}, remote_read_mask, 3 * 1024);
@@ -121,18 +121,18 @@ TEST_F(OptimizerManagerTest, TemplateAnalysisReadRecordKeepsTraceIdAndKeys) {
     EXPECT_EQ(data_it->second.trace_reads[0].keys, keys);
 }
 
-TEST_F(OptimizerManagerTest, WriteRequiresInputLen) {
+TEST_F(OptimizerManagerTest, WriteDoesNotRequireInputLen) {
     OptimizerManager manager(config_);
     ASSERT_TRUE(manager.Init());
 
-    EXPECT_THROW(manager.WriteCache("instance1", "write_trace", 1000, {1}, {10}), std::runtime_error);
+    EXPECT_NO_THROW(manager.WriteCache("instance1", "write_trace", 1000, {1}, {10}));
 }
 
 TEST_F(OptimizerManagerTest, ReadRequiresInputLen) {
     OptimizerManager manager(config_);
     ASSERT_TRUE(manager.Init());
 
-    manager.WriteCache("instance1", "write_trace", 1000, {1}, {}, 0, 1024);
+    manager.WriteCache("instance1", "write_trace", 1000, {1}, {}, 0);
 
     BlockMask remote_read_mask = std::vector<bool>{false};
     EXPECT_THROW(manager.GetCacheLocation("instance1", "read_trace", 2000, {1}, {10}, remote_read_mask),
@@ -143,10 +143,10 @@ TEST_F(OptimizerManagerTest, ReadUsesExplicitInputLen) {
     OptimizerManager manager(config_);
     ASSERT_TRUE(manager.Init());
 
-    const std::vector<int64_t> keys = {1, 2};
-    manager.WriteCache("instance1", "write_trace", 1000, keys, {}, 0, 1537);
+    const std::vector<int64_t> keys = {1};
+    manager.WriteCache("instance1", "write_trace", 1000, keys, {}, 0);
 
-    BlockMask remote_read_mask = std::vector<bool>{false, false};
+    BlockMask remote_read_mask = std::vector<bool>{false};
     auto res = manager.GetCacheLocation("instance1", "read_trace", 2000, keys, {}, remote_read_mask, 1537);
     EXPECT_EQ(res.kvcm_hit_length, 1);
 

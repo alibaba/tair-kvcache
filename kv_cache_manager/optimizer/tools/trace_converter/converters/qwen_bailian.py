@@ -127,7 +127,6 @@ class QwenBailianConverter(BaseConverter):
             timestamp_ns=base_timestamp_ns + 1,
             keys=block_keys,
             instance_id=self.default_instance_id,
-            input_len=input_length,
         )
 
         return [get_trace, write_trace]

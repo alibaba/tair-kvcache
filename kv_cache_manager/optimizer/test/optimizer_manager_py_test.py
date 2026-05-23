@@ -45,7 +45,7 @@ class OptimizerManagerPyTest(unittest.TestCase):
         timestamp = 1234567890
         block_ids = [1, 2]
         token_ids = [10, 20, 30, 40, 50]
-        res = self.manager.WriteCache(instance_id, trace_id, timestamp, block_ids, token_ids, input_len=len(token_ids))
+        res = self.manager.WriteCache(instance_id, trace_id, timestamp, block_ids, token_ids)
 
         self.assertEqual(res.trace_id, trace_id)
         self.assertEqual(res.kvcm_write_length, 2)
@@ -58,9 +58,7 @@ class OptimizerManagerPyTest(unittest.TestCase):
         write_timestamp = 1234567890
         write_block_ids = [1 ,2 ,3]
         write_token_ids = list(range(block_size * len(write_block_ids)))
-        self.manager.WriteCache(
-            instance_id, trace_id, write_timestamp, write_block_ids, write_token_ids, input_len=len(write_token_ids)
-        )
+        self.manager.WriteCache(instance_id, trace_id, write_timestamp, write_block_ids, write_token_ids)
 
         read_timestamp = 1234567900
         read_block_ids = [1, 2, 4]
@@ -90,7 +88,7 @@ class OptimizerManagerPyTest(unittest.TestCase):
         input_len = len(block_ids) * 16
         ttl_seconds = 1
 
-        self.manager.WriteCache(instance_id, trace_id, write_timestamp, block_ids, [], ttl_seconds, input_len)
+        self.manager.WriteCache(instance_id, trace_id, write_timestamp, block_ids, [], ttl_seconds)
 
         # 过期前查询（1 秒内）
         before_expire = self.manager.GetCacheLocation(
@@ -110,9 +108,7 @@ class OptimizerManagerPyTest(unittest.TestCase):
         instance_id = "3780643326877293460"
         # 写入一些数据
         for i in range(5):
-            self.manager.WriteCache(
-                instance_id, f"trace_{i}", i * 1000, [i, i + 1, i + 2], [], input_len=3 * 16
-            )
+            self.manager.WriteCache(instance_id, f"trace_{i}", i * 1000, [i, i + 1, i + 2], [])
 
         # 查询应该有命中
         res = self.manager.GetCacheLocation(instance_id, "query_1", 10000, [0, 1, 2], [], 0, input_len=3 * 16)
@@ -131,7 +127,7 @@ class OptimizerManagerPyTest(unittest.TestCase):
         instance_id = "3780643326877293460"
         # 写入数据
         for i in range(3):
-            self.manager.WriteCache(instance_id, f"trace_{i}", i * 1000, [i, i + 1], [], input_len=2 * 16)
+            self.manager.WriteCache(instance_id, f"trace_{i}", i * 1000, [i, i + 1], [])
 
         # 清空所有缓存
         self.manager.ClearAllCaches()
@@ -145,7 +141,7 @@ class OptimizerManagerPyTest(unittest.TestCase):
         instance_id = "3780643326877293460"
         # 写入数据
         for i in range(5):
-            self.manager.WriteCache(instance_id, f"trace_{i}", i * 1000, [i, i + 1], [], input_len=2 * 16)
+            self.manager.WriteCache(instance_id, f"trace_{i}", i * 1000, [i, i + 1], [])
 
         # 清空缓存并重置统计
         success = self.manager.ClearCacheAndResetStats(instance_id)
@@ -160,9 +156,7 @@ class OptimizerManagerPyTest(unittest.TestCase):
         instance_id = "3780643326877293460"
         # 写入数据
         for i in range(3):
-            self.manager.WriteCache(
-                instance_id, f"trace_{i}", i * 1000, [i * 2, i * 2 + 1], [], input_len=2 * 16
-            )
+            self.manager.WriteCache(instance_id, f"trace_{i}", i * 1000, [i * 2, i * 2 + 1], [])
 
         # 清空所有缓存并重置统计
         self.manager.ClearAllCachesAndResetStats()

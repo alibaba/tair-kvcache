@@ -99,20 +99,6 @@ TEST_F(RadixTreeIndexTest, PrefixQueryCountsMixedLocalRemoteNodeOnce) {
     EXPECT_EQ(query_hit.per_tier_hit_block_num[0], 3);
 }
 
-TEST_F(RadixTreeIndexTest, PrefixQuerySkipsTailBlockForHitRate) {
-    std::vector<int64_t> block_keys = {1, 2, 3};
-    index_->InsertOnly(block_keys, 1000);
-
-    BlockMask block_mask = std::vector<bool>{false, false, false};
-    QueryHit query_hit;
-    index_->PrefixQuery(block_keys, block_mask, 2000, &query_hit, true, 2);
-
-    EXPECT_EQ(query_hit.local_hit_block_num, 0);
-    EXPECT_EQ(query_hit.remote_hit_block_num, 2);
-    ASSERT_EQ(query_hit.per_tier_hit_block_num.size(), 1);
-    EXPECT_EQ(query_hit.per_tier_hit_block_num[0], 2);
-}
-
 TEST_F(RadixTreeIndexTest, PromoteCopiesThroughIntermediateHigherTiers) {
     LruParams params;
     params.sample_rate = 1.0;

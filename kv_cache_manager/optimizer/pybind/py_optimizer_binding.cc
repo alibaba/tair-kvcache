@@ -133,8 +133,7 @@ PYBIND11_MODULE(kvcm_py_optimizer, module) {
              py::arg("timestamp"),
              py::arg("block_ids"),
              py::arg("token_ids"),
-             py::arg("ttl_seconds") = int64_t(0),
-             py::arg("input_len") = int64_t(-1))
+             py::arg("ttl_seconds") = int64_t(0))
         .def(
             "GetCacheLocation",
             [](kvcm::OptimizerManager &self,

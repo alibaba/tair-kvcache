@@ -218,15 +218,13 @@ WriteCacheRes OptimizerManager::WriteCache(const std::string &instance_id,
                                            const int64_t timestamp,
                                            const std::vector<int64_t> &block_ids,
                                            const std::vector<int64_t> &token_ids,
-                                           const int64_t ttl_seconds,
-                                           const int64_t input_len) {
+                                           const int64_t ttl_seconds) {
+    (void)token_ids;
     WriteCacheSchemaTrace trace;
     trace.set_instance_id(instance_id);
     trace.set_trace_id(trace_id);
     trace.set_timestamp_ns(timestamp);
     trace.set_keys(block_ids);
-    trace.set_tokens(token_ids);
-    trace.set_input_len(RequirePositiveInputLen("WriteCache", input_len));
 
     int64_t ttl_us = (ttl_seconds > 0) ? ttl_seconds * 1000000 : ttl_seconds;
 

@@ -1,7 +1,6 @@
 #pragma once
 #include <cstddef>
 #include <functional>
-#include <limits>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -45,8 +44,7 @@ public:
                      const BlockMask &block_mask,
                      const int64_t timestamp,
                      QueryHit *query_hit = nullptr,
-                     bool refresh_ttl_on_read = true,
-                     size_t hit_countable_blocks = std::numeric_limits<size_t>::max());
+                     bool refresh_ttl_on_read = true);
 
     void CleanEmptyBlocks(const std::vector<BlockEntry *> &blocks,
                           int64_t eviction_timestamp,
@@ -135,7 +133,7 @@ private:
     bool IsBlockEvict(BlockEntry *block, int64_t timestamp) const;
 
     // per-tier 命中检测辅助方法
-    void RecordTieredHit(BlockEntry *block, bool is_remote, QueryHit *query_hit, bool count_for_hit_rate) const;
+    void RecordTieredHit(BlockEntry *block, bool is_remote, QueryHit *query_hit) const;
     void PromoteToHigherTiers(BlockEntry *block, int64_t timestamp);
     void SelectiveWriteToNextTier(BlockEntry *block, size_t hit_tier_idx, int64_t timestamp);
     bool AppendBlockToTierAndWriteThrough(BlockEntry *block, size_t tier_idx, int64_t timestamp);

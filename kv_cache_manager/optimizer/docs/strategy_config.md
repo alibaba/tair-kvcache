@@ -16,9 +16,9 @@ AccHitRate = AccHitTokens / AccInputTokens
 - `HitRate`、`AccHitRate`、`LocalHitRate`、`RemoteHitRate` 和 `Tier*_HitRate` 都是 token hit rate。
 - 标准命中率只按 token 计算，但 CSV 保留 block 读/命中计数，便于核对读放大、命中规模和容量行为。
 - 标准分析不把 local/remote 当作独立结论维度。`local` 只表示 trace `block_mask` 带进来的已有本地命中 block，例如 optimizer 作为单独 L3 模拟并和 HiSim 结合时，或直接分析 KVCacheManager event log 时，日志里已经包含的本地命中 block key；`remote` 表示 optimizer 模拟层贡献的命中。当前标准报告直接按请求输入计算整体 `HitRate`，不依赖 local/remote 拆分。
-- 标准 optimizer trace 必须包含 `input_len`，`InputTokens` 直接使用 `input_len`。
-- 不再兼容缺失 `input_len` 的旧 trace。其他来源的日志需要先转换成 optimizer schema。
-- 不完整尾 block 不计入 `HitTokens`。例如 `block_size=16`、`input_len=33` 时，最多只有前 2 个完整 block 计入命中 token，尾部 1 个 token 仍计入 `InputTokens`。
+- 标准 `get` trace 必须包含 `input_len`，`InputTokens` 直接使用 `input_len`。
+- 不再兼容缺失 `input_len` 的旧 `get` trace。其他来源的日志需要先转换成 optimizer schema。
+- `keys` 只包含完整 block key；不足一个 block 的尾部 token 不写入 `keys`，但仍计入 `InputTokens`。例如 `block_size=16`、`input_len=33` 时，`keys` 最多包含 2 个完整 block，尾部 1 个 token 只进入分母。
 
 标准 `*_hit_rates.csv` 的核心列：
 
@@ -71,7 +71,7 @@ AccHitRate = AccHitTokens / AccInputTokens
 
 optimizer 回放输入只接受 JSONL，每行一条标准 trace。字段不完整时直接失败，不做旧格式推断。
 
-`timestamp_ns`、`input_len`、`block_mask` offset 和 `ttl_us` 必须落在 `int64_t` 范围内：
+`timestamp_ns`、`get.input_len`、`block_mask` offset 和 `ttl_us` 必须落在 `int64_t` 范围内：
 
 ```text
 [-9223372036854775808, 9223372036854775807]
@@ -106,7 +106,6 @@ Write trace：
   "trace_id": "trace_instance-a_1001",
   "timestamp_ns": 1001,
   "keys": [101, 102, 103],
-  "tokens": [],
   "ttl_us": 0
 }
 ```
@@ -125,7 +124,7 @@ Write trace：
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | `trace_id` | string | 空字符串 | 请求标识，用于调试和模板分析 |
-| `tokens` | int64 array | 空数组 | token id 列表，可为空以减小 trace 文件体积；命中率以 `input_len` 为准 |
+| `tokens` | int64 array | 空数组 | get 的 token id 列表，可为空以减小 trace 文件体积；命中率以 `input_len` 为准 |
 
 `get` 专用字段：
 
@@ -141,17 +140,16 @@ Write trace：
 
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
-| `input_len` | int64 | 可省略 | 写入不参与 token hit-rate 分母；若提供则必须为正整数 |
 | `ttl_us` | int64 | 0 | 请求级 TTL，单位微秒；`0` 使用 group 默认 TTL，`-1` 表示禁用 TTL |
 
-`block_mask` 只用于标记 trace 已经知道的本地命中 block，不是标准报告的分组依据。直接分析请求输入时通常可传空数组，此时整体 `HitRate` 仍按 `HitTokens / InputTokens` 计算。
+`write` 只读取 `type`、`instance_id`、`trace_id`、`timestamp_ns`、`keys` 和 `ttl_us`；其他字段包括 `input_len`、`tokens`、`block_mask` 都忽略。`block_mask` 只用于标记 trace 已经知道的本地命中 block，不是标准报告的分组依据。直接分析请求输入时通常可传空数组，此时整体 `HitRate` 仍按 `HitTokens / InputTokens` 计算。
 
 旧格式或不合法输入会失败，包括：
 
 - 缺少 `type`、`instance_id`、`timestamp_ns`、`keys`，或 `get` trace 缺少 `input_len`。
 - `get.input_len <= 0`、`timestamp_ns <= 0`，或 `keys` 不是数组。
 - 使用 `timestamp_us` 但没有 `timestamp_ns`。
-- `keys` / `tokens` 中存在非整数，或 `write.input_len` 存在但不是正整数。
+- `keys` / `tokens` 中存在非整数。
 - `block_mask` 数组中存在非 bool 值，或 offset 为负数 / 超过 `INT64_MAX`。
 - legacy dialog-style trace 只有 `query_type` / `block_mask` / decode metadata 但没有显式 `type=get/write`。
 

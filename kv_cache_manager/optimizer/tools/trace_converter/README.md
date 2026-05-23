@@ -493,15 +493,15 @@ self._create_get_trace(
     timestamp_ns=timestamp_ns,
     keys=block_keys,
     instance_id=instance_id,
-    tokens=token_ids  # 可选
+    tokens=token_ids,  # 可选
+    input_len=input_len
 )
 
 # 创建 Write trace
 self._create_write_trace(
     timestamp_ns=timestamp_ns,
     keys=block_keys,
-    instance_id=instance_id,
-    tokens=token_ids  # 可选
+    instance_id=instance_id
 )
 
 # 获取 instance 的 block_size

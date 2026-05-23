@@ -120,8 +120,6 @@ def _process_chunk_text(
                 timestamp_ns=timestamp_ns + 1,
                 keys=block_ids,
                 instance_id=default_instance_id,
-                tokens=token_ids,
-                input_len=len(token_ids),
             )
             traces.extend([get_trace, write_trace])
         
@@ -296,8 +294,6 @@ class TextTraceConverter(BaseConverter):
             timestamp_ns=timestamp_ns + 1,
             keys=block_ids,
             instance_id=self.default_instance_id,
-            tokens=tokens,
-            input_len=len(tokens),
         )
 
         return [get_trace, write_trace]

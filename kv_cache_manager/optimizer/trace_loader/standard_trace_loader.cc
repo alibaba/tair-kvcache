@@ -67,15 +67,15 @@ StandardTraceLoader::LoadFromFile(const std::string &trace_file_path) {
         if (!doc.HasMember("timestamp_ns") || !(doc["timestamp_ns"].IsInt64() || doc["timestamp_ns"].IsUint64())) {
             fail("missing integer field: timestamp_ns");
         }
-        if (doc.HasMember("input_len") && !(doc["input_len"].IsInt64() || doc["input_len"].IsUint64())) {
-            fail("non-integer field: input_len");
-        }
         if (!doc.HasMember("keys") || !doc["keys"].IsArray()) {
             fail("missing array field: keys");
         }
         if (type_str == "get") {
             if (!doc.HasMember("input_len")) {
                 fail("missing integer field: input_len");
+            }
+            if (!(doc["input_len"].IsInt64() || doc["input_len"].IsUint64())) {
+                fail("non-integer field: input_len");
             }
             auto get_trace = std::make_shared<GetLocationSchemaTrace>();
             if (!get_trace->FromJsonString(line)) {
@@ -127,7 +127,7 @@ bool StandardTraceLoader::ValidateTrace(const OptimizerSchemaTrace &trace) {
         KVCM_LOG_ERROR("Validation failed: invalid timestamp_ns");
         return false;
     }
-    if (trace.input_len() <= 0) {
+    if (dynamic_cast<const GetLocationSchemaTrace *>(&trace) != nullptr && trace.input_len() <= 0) {
         KVCM_LOG_ERROR("Validation failed: invalid input_len");
         return false;
     }

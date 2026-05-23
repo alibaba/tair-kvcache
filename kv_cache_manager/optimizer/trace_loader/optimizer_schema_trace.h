@@ -1,5 +1,4 @@
 #pragma once
-#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -80,12 +79,6 @@ public:
             return false;
         }
         input_len_ = -1;
-        if (rapid_value.HasMember("input_len")) {
-            const auto &input_len_value = rapid_value["input_len"];
-            if (!ParseOptimizerInt64AllowUint64(input_len_value, input_len_)) {
-                return false;
-            }
-        }
         return true;
     };
     void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override {
@@ -106,13 +99,6 @@ public:
     const std::vector<int64_t> &keys() const { return keys_; }
     const std::vector<int64_t> &tokens() const { return tokens_; }
     int64_t input_len() const { return input_len_; }
-    size_t full_block_count(size_t block_size) const {
-        if (input_len_ > 0 && block_size > 0) {
-            return static_cast<size_t>(std::min<int64_t>(static_cast<int64_t>(keys_.size()), input_len_ / block_size));
-        }
-        throw std::runtime_error(
-            "optimizer trace missing positive input_len; cannot infer full block count from block keys");
-    }
     size_t input_token_count(size_t block_size) const {
         (void)block_size;
         if (input_len_ > 0) {
@@ -155,6 +141,15 @@ public:
         if (!OptimizerSchemaTrace::FromRapidValue(rapid_value)) {
             return false;
         }
+        if (!rapid_value.HasMember("input_len")) {
+            return false;
+        }
+        const auto &input_len_value = rapid_value["input_len"];
+        int64_t parsed_input_len = -1;
+        if (!ParseOptimizerInt64AllowUint64(input_len_value, parsed_input_len)) {
+            return false;
+        }
+        set_input_len(parsed_input_len);
         if (input_len() <= 0) {
             return false;
         }
@@ -212,12 +207,33 @@ public:
     void set_ttl_us(int64_t ttl_us) { ttl_us_ = ttl_us; }
 
     bool FromRapidValue(const rapidjson::Value &rapid_value) override {
-        if (!OptimizerSchemaTrace::FromRapidValue(rapid_value)) {
+        std::string instance_id;
+        if (!Get(rapid_value, "instance_id", instance_id, std::string(""))) {
             return false;
         }
-        if (input_len() <= 0) {
-            set_input_len(std::max<int64_t>(1, static_cast<int64_t>(keys().size())));
+        set_instance_id(instance_id);
+
+        std::string trace_id;
+        if (!Get(rapid_value, "trace_id", trace_id, std::string(""))) {
+            return false;
         }
+        set_trace_id(trace_id);
+
+        int64_t timestamp_ns = 0;
+        if (!rapid_value.HasMember("timestamp_ns") ||
+            !ParseOptimizerInt64AllowUint64(rapid_value["timestamp_ns"], timestamp_ns)) {
+            return false;
+        }
+        set_timestamp_ns(timestamp_ns);
+
+        std::vector<int64_t> keys;
+        if (!ParseOptimizerInt64VectorAllowUint64(rapid_value, "keys", keys)) {
+            return false;
+        }
+        set_keys(keys);
+        set_tokens({});
+        set_input_len(-1);
+
         ttl_us_ = 0;
         if (rapid_value.HasMember("ttl_us") && !ParseOptimizerInt64AllowUint64(rapid_value["ttl_us"], ttl_us_)) {
             return false;
@@ -225,7 +241,10 @@ public:
         return true;
     }
     void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override {
-        OptimizerSchemaTrace::ToRapidWriter(writer);
+        Put(writer, "instance_id", instance_id());
+        Put(writer, "trace_id", trace_id());
+        Put(writer, "timestamp_ns", timestamp_ns());
+        Put(writer, "keys", keys());
         Put(writer, "ttl_us", ttl_us_);
     }
 

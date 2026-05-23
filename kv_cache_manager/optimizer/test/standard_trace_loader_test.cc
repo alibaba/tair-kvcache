@@ -30,7 +30,7 @@ TEST_F(StandardTraceLoaderTest, AllowsEmptyKeysWithPositiveInputLen) {
     std::ofstream out(path);
     out << R"({"type":"get","instance_id":"instance-a","trace_id":"short-read","timestamp_ns":1000,"keys":[],"tokens":[],"input_len":128,"query_type":"prefix_match","block_mask":[]})"
         << "\n";
-    out << R"({"type":"write","instance_id":"instance-a","trace_id":"short-write","timestamp_ns":1001,"keys":[],"tokens":[],"input_len":128})"
+    out << R"({"type":"write","instance_id":"instance-a","trace_id":"short-write","timestamp_ns":1001,"keys":[],"tokens":[]})"
         << "\n";
     out.close();
 
@@ -39,7 +39,7 @@ TEST_F(StandardTraceLoaderTest, AllowsEmptyKeysWithPositiveInputLen) {
     EXPECT_TRUE(traces[0]->keys().empty());
     EXPECT_EQ(traces[0]->input_len(), 128);
     EXPECT_TRUE(traces[1]->keys().empty());
-    EXPECT_EQ(traces[1]->input_len(), 128);
+    EXPECT_EQ(traces[1]->input_len(), -1);
 }
 
 TEST_F(StandardTraceLoaderTest, AllowsWriteTraceWithoutInputLen) {
@@ -52,7 +52,20 @@ TEST_F(StandardTraceLoaderTest, AllowsWriteTraceWithoutInputLen) {
     const auto traces = StandardTraceLoader::LoadFromFile(path);
     ASSERT_EQ(traces.size(), 1);
     EXPECT_EQ(traces[0]->keys().size(), 2);
-    EXPECT_EQ(traces[0]->input_len(), 2);
+    EXPECT_EQ(traces[0]->input_len(), -1);
+}
+
+TEST_F(StandardTraceLoaderTest, IgnoresWriteTraceInputLen) {
+    const std::string path = GetTestTempRootPath() + "/write_with_input_len.jsonl";
+    std::ofstream out(path);
+    out << R"({"type":"write","instance_id":"instance-a","trace_id":"write","timestamp_ns":1000,"keys":[1,2],"tokens":"ignored","input_len":"ignored"})"
+        << "\n";
+    out.close();
+
+    const auto traces = StandardTraceLoader::LoadFromFile(path);
+    ASSERT_EQ(traces.size(), 1);
+    EXPECT_EQ(traces[0]->keys().size(), 2);
+    EXPECT_EQ(traces[0]->input_len(), -1);
 }
 
 TEST_F(StandardTraceLoaderTest, MapsFullRangeUint64KeysToStableInt64Values) {

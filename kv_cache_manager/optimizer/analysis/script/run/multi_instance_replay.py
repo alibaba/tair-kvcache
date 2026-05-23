@@ -421,8 +421,6 @@ def _inspect_optimizer_trace(trace_file: str) -> str:
             if trace_type == "get":
                 if "input_len" not in obj or type(obj["input_len"]) is not int or obj["input_len"] <= 0:
                     raise SystemExit(f"{trace_file}:{line_no} get trace must contain positive integer input_len")
-            elif "input_len" in obj and (type(obj["input_len"]) is not int or obj["input_len"] <= 0):
-                raise SystemExit(f"{trace_file}:{line_no} write trace input_len must be a positive integer when set")
             keys = obj.get("keys")
             # Keep this aligned with StandardTraceLoader: short requests with
             # 0 < input_len < block_size are valid and use keys=[].

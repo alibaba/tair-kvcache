@@ -118,12 +118,7 @@ void OptimizerRunner::HandleGetLocation(const GetLocationSchemaTrace &trace) {
 
     QueryHit query_hit;
     const size_t block_size = indexer_manager_->GetInstanceBlockSize(instance_id);
-    indexer->PrefixQuery(trace.keys(),
-                         trace.block_mask(),
-                         trace.timestamp_ns(),
-                         &query_hit,
-                         refresh_ttl_on_read,
-                         trace.full_block_count(block_size));
+    indexer->PrefixQuery(trace.keys(), trace.block_mask(), trace.timestamp_ns(), &query_hit, refresh_ttl_on_read);
     if (indexer->ConsumeReadTriggeredTierWrite()) {
         auto capacity_evicted_blocks = indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_ns());
         indexer_manager_->CleanEvictedBlocks(capacity_evicted_blocks, trace.timestamp_ns());

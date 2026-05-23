@@ -154,7 +154,6 @@ class PublisherLogConverter(BaseConverter):
             'timestamp_ns': int(data.get('trigger_time_us', 0)) * 1000,
             'keys': data.get('keys', []),
             'tokens': data.get('tokens', []),
-            'input_len': self._resolve_input_len(data, instance_id),
         }
 
         if write_session_id:
@@ -245,8 +244,6 @@ class PublisherLogConverter(BaseConverter):
             timestamp_ns=write_trace['timestamp_ns'],
             keys=write_trace['keys'],
             instance_id=instance_id,
-            tokens=write_trace.get('tokens', []),
-            input_len=write_trace['input_len'],
         )
 
         return [get_result, write_result]
@@ -272,8 +269,6 @@ class PublisherLogConverter(BaseConverter):
                     timestamp_ns=write_trace['timestamp_ns'],
                     keys=write_trace['keys'],
                     instance_id=write_trace['instance_id'],
-                    tokens=write_trace.get('tokens', []),
-                    input_len=write_trace['input_len'],
                 )
                 traces.append(write_only)
 
