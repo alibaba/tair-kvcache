@@ -422,8 +422,10 @@ def _inspect_optimizer_trace(trace_file: str) -> str:
             if "input_len" not in obj or type(obj["input_len"]) is not int or obj["input_len"] <= 0:
                 raise SystemExit(f"{trace_file}:{line_no} must contain positive integer input_len")
             keys = obj.get("keys")
-            if not isinstance(keys, list) or not keys:
-                raise SystemExit(f"{trace_file}:{line_no} must contain non-empty keys")
+            # Keep this aligned with StandardTraceLoader: short requests with
+            # 0 < input_len < block_size are valid and use keys=[].
+            if not isinstance(keys, list):
+                raise SystemExit(f"{trace_file}:{line_no} must contain keys array")
     if row_count == 0 or instance_id is None:
         raise SystemExit(f"{trace_file} has no valid optimizer trace rows")
     return instance_id
