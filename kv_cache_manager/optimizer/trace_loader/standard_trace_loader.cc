@@ -70,8 +70,8 @@ StandardTraceLoader::LoadFromFile(const std::string &trace_file_path) {
         if (!doc.HasMember("input_len") || !(doc["input_len"].IsInt64() || doc["input_len"].IsUint64())) {
             fail("missing integer field: input_len");
         }
-        if (!doc.HasMember("keys") || !doc["keys"].IsArray() || doc["keys"].Empty()) {
-            fail("missing non-empty array field: keys");
+        if (!doc.HasMember("keys") || !doc["keys"].IsArray()) {
+            fail("missing array field: keys");
         }
         if (type_str == "get") {
             auto get_trace = std::make_shared<GetLocationSchemaTrace>();
@@ -128,11 +128,6 @@ bool StandardTraceLoader::ValidateTrace(const OptimizerSchemaTrace &trace) {
         KVCM_LOG_ERROR("Validation failed: invalid input_len");
         return false;
     }
-    if (trace.keys().empty()) {
-        KVCM_LOG_ERROR("Validation failed: empty keys");
-        return false;
-    }
-
     return true;
 }
 

@@ -119,7 +119,7 @@ Write trace：
 | `type` | string | 只能是 `get` 或 `write` |
 | `instance_id` | string | 非空，必须匹配配置中的 instance |
 | `timestamp_ns` | int64 | ns 时间戳，必须为正整数；不再接受 `timestamp_us` |
-| `keys` | int64 array | block key 列表，不能为空；每个 key 必须在 `int64_t` 范围内 |
+| `keys` | int64 array | block key 列表，可为空；每个 key 必须在 `int64_t` 范围内 |
 | `input_len` | int64 | 输入 token 数，必须为正整数；`InputTokens` 直接使用该值 |
 
 可选公共字段：
@@ -149,7 +149,7 @@ Write trace：
 旧格式或不合法输入会失败，包括：
 
 - 缺少 `type`、`instance_id`、`timestamp_ns`、`keys` 或 `input_len`。
-- `input_len <= 0`、`timestamp_ns <= 0` 或 `keys` 为空。
+- `input_len <= 0`、`timestamp_ns <= 0`，或 `keys` 不是数组。
 - 使用 `timestamp_us` 但没有 `timestamp_ns`。
 - `keys` / `tokens` 中存在非整数，或存在超过 `INT64_MAX` 的 unsigned number。
 - `block_mask` 数组中存在非 bool 值，或 offset 为负数 / 超过 `INT64_MAX`。

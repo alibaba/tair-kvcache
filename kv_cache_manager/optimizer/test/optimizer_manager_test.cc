@@ -155,3 +155,20 @@ TEST_F(OptimizerManagerTest, ReadUsesExplicitInputLen) {
     EXPECT_EQ(last_read->input_tokens, 1537);
     EXPECT_EQ(last_read->remote_hit_blocks, 1);
 }
+
+TEST_F(OptimizerManagerTest, ReadWithoutFullBlocksCountsInputTokens) {
+    OptimizerManager manager(config_);
+    ASSERT_TRUE(manager.Init());
+
+    BlockMask remote_read_mask = std::vector<bool>{};
+    auto res = manager.GetCacheLocation("instance1", "short_read", 1000, {}, {}, remote_read_mask, 128);
+    EXPECT_EQ(res.kvcm_hit_length, 0);
+
+    const auto *last_read = manager.hit_rate_tracker_->LastReadRecord("instance1");
+    ASSERT_NE(last_read, nullptr);
+    EXPECT_EQ(last_read->input_tokens, 128);
+    EXPECT_EQ(last_read->local_read_blocks, 0);
+    EXPECT_EQ(last_read->remote_read_blocks, 0);
+    EXPECT_EQ(last_read->local_hit_blocks, 0);
+    EXPECT_EQ(last_read->remote_hit_blocks, 0);
+}

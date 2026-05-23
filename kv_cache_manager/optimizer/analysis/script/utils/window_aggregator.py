@@ -103,7 +103,8 @@ def aggregate_and_write(
                     if instance_windows is not None:
                         _update_counter_from_sums(instance_windows[(instance_id, int(window_start))], row)
 
-        per_instance[instance_id] = instance_counter
+        if instance_counter["request_count"] > 0:
+            per_instance[instance_id] = instance_counter
 
     instance_rows = [
         _counter_to_row(counter, bucket_name, instance_id, start_ns, end_ns)
@@ -114,8 +115,9 @@ def aggregate_and_write(
 
     instance_summary_path = os.path.join(aggregate_dir, "instance_aggregate.csv")
     global_summary_path = os.path.join(aggregate_dir, "global_aggregate.csv")
-    pd.DataFrame(instance_rows).to_csv(instance_summary_path, index=False)
-    pd.DataFrame([global_row]).to_csv(global_summary_path, index=False)
+    pd.DataFrame(instance_rows, columns=_row_columns()).to_csv(instance_summary_path, index=False)
+    pd.DataFrame([global_row], columns=_row_columns(include_instance_count=True)).to_csv(
+        global_summary_path, index=False)
 
     result = {
         "instance_summary_path": instance_summary_path,
@@ -138,7 +140,8 @@ def aggregate_and_write(
             for window_start, counter in sorted(global_windows.items())
         ]
         global_window_path = os.path.join(aggregate_dir, "global_window_hit_rates.csv")
-        pd.DataFrame(global_window_rows).to_csv(global_window_path, index=False)
+        pd.DataFrame(global_window_rows, columns=_row_columns(include_window=True)).to_csv(
+            global_window_path, index=False)
         result["global_window_path"] = global_window_path
 
         if instance_windows is not None:
@@ -155,10 +158,39 @@ def aggregate_and_write(
                 for (instance_id, window_start), counter in sorted(instance_windows.items())
             ]
             instance_window_path = os.path.join(aggregate_dir, "instance_window_hit_rates.csv")
-            pd.DataFrame(instance_window_rows).to_csv(instance_window_path, index=False)
+            pd.DataFrame(instance_window_rows, columns=_row_columns(include_window=True)).to_csv(
+                instance_window_path, index=False)
             result["instance_window_path"] = instance_window_path
 
     return result
+
+
+def _row_columns(include_window: bool = False, include_instance_count: bool = False) -> list:
+    columns = [
+        "Bucket",
+        "InstanceId",
+        "StartNs",
+        "EndNs",
+        "FirstTimestampNs",
+        "LastTimestampNs",
+        "RequestCount",
+        "ReadBlocks",
+        "LocalHitBlocks",
+        "RemoteHitBlocks",
+        "HitBlocks",
+        "LocalHitTokens",
+        "RemoteHitTokens",
+        "InputTokens",
+        "HitTokens",
+        "LocalHitRate",
+        "RemoteHitRate",
+        "HitRate",
+    ]
+    if include_window:
+        columns.extend(["WindowStartNs", "WindowEndNs"])
+    if include_instance_count:
+        columns.append("InstanceCount")
+    return columns
 
 
 def _iter_normalized_chunks(csv_path: str, chunksize: int) -> Iterable[pd.DataFrame]:
