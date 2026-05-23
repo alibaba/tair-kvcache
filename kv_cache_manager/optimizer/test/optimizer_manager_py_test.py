@@ -45,7 +45,7 @@ class OptimizerManagerPyTest(unittest.TestCase):
         timestamp = 1234567890
         block_ids = [1, 2]
         token_ids = [10, 20, 30, 40, 50]
-        res = self.manager.WriteCache(instance_id, trace_id, timestamp, block_ids, token_ids)
+        res = self.manager.WriteCache(instance_id, trace_id, timestamp, block_ids, token_ids, input_len=len(token_ids))
 
         self.assertEqual(res.trace_id, trace_id)
         self.assertEqual(res.kvcm_write_length, 2)
@@ -58,13 +58,18 @@ class OptimizerManagerPyTest(unittest.TestCase):
         write_timestamp = 1234567890
         write_block_ids = [1 ,2 ,3]
         write_token_ids = list(range(block_size * len(write_block_ids)))
-        self.manager.WriteCache(instance_id, trace_id, write_timestamp, write_block_ids, write_token_ids)
+        self.manager.WriteCache(
+            instance_id, trace_id, write_timestamp, write_block_ids, write_token_ids, input_len=len(write_token_ids)
+        )
 
         read_timestamp = 1234567900
         read_block_ids = [1, 2, 4]
         read_token_ids = list(range(block_size * len(read_block_ids)))
         mask_offset = 0
-        res = self.manager.GetCacheLocation(instance_id, trace_id, read_timestamp, read_block_ids, read_token_ids, mask_offset)
+        res = self.manager.GetCacheLocation(
+            instance_id, trace_id, read_timestamp, read_block_ids, read_token_ids, mask_offset,
+            input_len=len(read_token_ids)
+        )
 
         self.assertEqual(res.trace_id, trace_id)
         self.assertEqual(res.kvcm_hit_length, 2)
@@ -82,20 +87,21 @@ class OptimizerManagerPyTest(unittest.TestCase):
         trace_id = "test_ttl_trace"
         write_timestamp = 1_000_000
         block_ids = [101, 102]
+        input_len = len(block_ids) * 16
         ttl_seconds = 1
 
-        self.manager.WriteCache(instance_id, trace_id, write_timestamp, block_ids, [], ttl_seconds)
+        self.manager.WriteCache(instance_id, trace_id, write_timestamp, block_ids, [], ttl_seconds, input_len)
 
         # 过期前查询（1 秒内）
         before_expire = self.manager.GetCacheLocation(
-            instance_id, trace_id, write_timestamp + 500_000, block_ids, [], 0
+            instance_id, trace_id, write_timestamp + 500_000, block_ids, [], 0, input_len
         )
         self.assertEqual(before_expire.kvcm_hit_length, 2, "Should hit before TTL expiration")
 
         # TTL 是滑动窗口：上一次访问会刷新 last_access_time，因此要基于 before_expire 的时间继续推进
         after_expire_timestamp = (write_timestamp + 500_000) + ttl_seconds * 1_000_000 + 1
         after_expire = self.manager.GetCacheLocation(
-            instance_id, trace_id, after_expire_timestamp, block_ids, [], 0
+            instance_id, trace_id, after_expire_timestamp, block_ids, [], 0, input_len
         )
         self.assertEqual(after_expire.kvcm_hit_length, 0, "Should miss after TTL expiration")
 
@@ -104,18 +110,20 @@ class OptimizerManagerPyTest(unittest.TestCase):
         instance_id = "3780643326877293460"
         # 写入一些数据
         for i in range(5):
-            self.manager.WriteCache(instance_id, f"trace_{i}", i * 1000, [i, i+1, i+2], [])
-        
+            self.manager.WriteCache(
+                instance_id, f"trace_{i}", i * 1000, [i, i + 1, i + 2], [], input_len=3 * 16
+            )
+
         # 查询应该有命中
-        res = self.manager.GetCacheLocation(instance_id, "query_1", 10000, [0, 1, 2], [], 0)
+        res = self.manager.GetCacheLocation(instance_id, "query_1", 10000, [0, 1, 2], [], 0, input_len=3 * 16)
         self.assertGreater(res.kvcm_hit_length, 0, "Should have cache hits before clear")
-        
+
         # 清空缓存
         success = self.manager.ClearCache(instance_id)
         self.assertTrue(success, "Clear cache should succeed")
-        
+
         # 查询应该没有命中
-        res = self.manager.GetCacheLocation(instance_id, "query_2", 11000, [0, 1, 2], [], 0)
+        res = self.manager.GetCacheLocation(instance_id, "query_2", 11000, [0, 1, 2], [], 0, input_len=3 * 16)
         self.assertEqual(res.kvcm_hit_length, 0, "Should have no cache hits after clear")
 
     def test_clear_all_caches(self):
@@ -123,13 +131,13 @@ class OptimizerManagerPyTest(unittest.TestCase):
         instance_id = "3780643326877293460"
         # 写入数据
         for i in range(3):
-            self.manager.WriteCache(instance_id, f"trace_{i}", i * 1000, [i, i+1], [])
-        
+            self.manager.WriteCache(instance_id, f"trace_{i}", i * 1000, [i, i + 1], [], input_len=2 * 16)
+
         # 清空所有缓存
         self.manager.ClearAllCaches()
-        
+
         # 验证缓存已清空
-        res = self.manager.GetCacheLocation(instance_id, "query_3", 5000, [0, 1, 2], [], 0)
+        res = self.manager.GetCacheLocation(instance_id, "query_3", 5000, [0, 1, 2], [], 0, input_len=3 * 16)
         self.assertEqual(res.kvcm_hit_length, 0, "All caches should be cleared")
 
     def test_clear_cache_and_reset_stats(self):
@@ -137,14 +145,14 @@ class OptimizerManagerPyTest(unittest.TestCase):
         instance_id = "3780643326877293460"
         # 写入数据
         for i in range(5):
-            self.manager.WriteCache(instance_id, f"trace_{i}", i * 1000, [i, i+1], [])
-        
+            self.manager.WriteCache(instance_id, f"trace_{i}", i * 1000, [i, i + 1], [], input_len=2 * 16)
+
         # 清空缓存并重置统计
         success = self.manager.ClearCacheAndResetStats(instance_id)
         self.assertTrue(success, "Clear cache and reset stats should succeed")
-        
+
         # 验证缓存已清空
-        res = self.manager.GetCacheLocation(instance_id, "query_4", 10000, [0, 1], [], 0)
+        res = self.manager.GetCacheLocation(instance_id, "query_4", 10000, [0, 1], [], 0, input_len=2 * 16)
         self.assertEqual(res.kvcm_hit_length, 0, "Cache should be cleared")
 
     def test_clear_all_caches_and_reset_stats(self):
@@ -152,13 +160,15 @@ class OptimizerManagerPyTest(unittest.TestCase):
         instance_id = "3780643326877293460"
         # 写入数据
         for i in range(3):
-            self.manager.WriteCache(instance_id, f"trace_{i}", i * 1000, [i*2, i*2+1], [])
-        
+            self.manager.WriteCache(
+                instance_id, f"trace_{i}", i * 1000, [i * 2, i * 2 + 1], [], input_len=2 * 16
+            )
+
         # 清空所有缓存并重置统计
         self.manager.ClearAllCachesAndResetStats()
-        
+
         # 验证缓存已清空
-        res = self.manager.GetCacheLocation(instance_id, "query_5", 5000, [0, 2, 4], [], 0)
+        res = self.manager.GetCacheLocation(instance_id, "query_5", 5000, [0, 2, 4], [], 0, input_len=3 * 16)
         self.assertEqual(res.kvcm_hit_length, 0, "All caches should be cleared")
 
 if __name__ == '__main__':

@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <stdexcept>
 
 #include "kv_cache_manager/common/jsonizable.h"
 #include "kv_cache_manager/meta/cache_location.h"
@@ -106,22 +107,19 @@ public:
     const std::vector<int64_t> &tokens() const { return tokens_; }
     int64_t input_len() const { return input_len_; }
     size_t full_block_count(size_t block_size) const {
-        if (input_len_ >= 0 && block_size > 0) {
+        if (input_len_ > 0 && block_size > 0) {
             return static_cast<size_t>(std::min<int64_t>(static_cast<int64_t>(keys_.size()), input_len_ / block_size));
         }
-        if (!tokens_.empty() && block_size > 0) {
-            return std::min(keys_.size(), tokens_.size() / block_size);
-        }
-        return keys_.size();
+        throw std::runtime_error(
+            "optimizer trace missing positive input_len; cannot infer full block count from block keys");
     }
     size_t input_token_count(size_t block_size) const {
-        if (input_len_ >= 0) {
-            return static_cast<size_t>(std::max<int64_t>(input_len_, 0));
+        (void)block_size;
+        if (input_len_ > 0) {
+            return static_cast<size_t>(input_len_);
         }
-        if (!tokens_.empty()) {
-            return tokens_.size();
-        }
-        return keys_.size() * block_size;
+        throw std::runtime_error(
+            "optimizer trace missing positive input_len; cannot infer token count from block keys");
     }
     void set_instance_id(const std::string &instance_id) { instance_id_ = instance_id; }
     void set_trace_id(const std::string &trace_id) { trace_id_ = trace_id; }
