@@ -20,7 +20,7 @@ protected:
         config.set_trace_file_path(root + "/trace.jsonl");
         config.set_output_result_path(root + "/combined");
         config.set_engine_config(
-            CreateOptimizerConfig("engine_group", {"engine_a", "engine_b"}, {"hbm", "dram"}, root + "/engine"));
+            CreateEngineOptimizerConfig("engine_group", {"engine_a", "engine_b"}, {"hbm", "dram"}, root + "/engine"));
         config.set_pool_config(CreateOptimizerConfig("pool_group", {"model_l3"}, {"l3"}, root + "/pool"));
 
         EngineToPoolMappingConfig map_a;
@@ -33,6 +33,24 @@ protected:
         return config;
     }
 
+    OptimizerConfig CreateEngineOptimizerConfig(const std::string &group_prefix,
+                                                const std::vector<std::string> &instance_ids,
+                                                const std::vector<std::string> &tier_names,
+                                                const std::string &output_path) {
+        OptimizerConfig config;
+        config.set_trace_file_path("/tmp/unused_trace.jsonl");
+        config.set_output_result_path(output_path);
+        config.set_eviction_params(CreateEvictionConfig());
+
+        std::vector<OptInstanceGroupConfig> groups;
+        groups.reserve(instance_ids.size());
+        for (const auto &instance_id : instance_ids) {
+            groups.push_back(CreateInstanceGroup(group_prefix + "_" + instance_id, {instance_id}, tier_names));
+        }
+        config.set_instance_groups(groups);
+        return config;
+    }
+
     OptimizerConfig CreateOptimizerConfig(const std::string &group_name,
                                           const std::vector<std::string> &instance_ids,
                                           const std::vector<std::string> &tier_names,
@@ -40,12 +58,21 @@ protected:
         OptimizerConfig config;
         config.set_trace_file_path("/tmp/unused_trace.jsonl");
         config.set_output_result_path(output_path);
+        config.set_eviction_params(CreateEvictionConfig());
+        config.set_instance_groups({CreateInstanceGroup(group_name, instance_ids, tier_names)});
+        return config;
+    }
 
+    EvictionConfig CreateEvictionConfig() {
         EvictionConfig eviction_config;
         eviction_config.set_eviction_mode(EvictionMode::EVICTION_MODE_INSTANCE_PRECISE);
         eviction_config.set_eviction_batch_size_per_instance(10);
-        config.set_eviction_params(eviction_config);
+        return eviction_config;
+    }
 
+    OptInstanceGroupConfig CreateInstanceGroup(const std::string &group_name,
+                                               const std::vector<std::string> &instance_ids,
+                                               const std::vector<std::string> &tier_names) {
         OptInstanceGroupConfig group;
         group.set_group_name(group_name);
         group.set_quota_capacity(1LL << 30);
@@ -78,8 +105,7 @@ protected:
             instances.push_back(instance);
         }
         group.set_instances(instances);
-        config.set_instance_groups({group});
-        return config;
+        return group;
     }
 };
 
@@ -112,6 +138,16 @@ TEST_F(HierarchicalReplayManagerTest, LinksEngineInstancesToSharedPool) {
 
     manager.AnalyzeResults();
     EXPECT_TRUE(std::filesystem::exists(root + "/combined/hierarchical_hit_rates.csv"));
+}
+
+TEST_F(HierarchicalReplayManagerTest, RejectsSharedEngineInstanceGroup) {
+    const std::string root = GetTestTempRootPath() + "/hierarchical_replay_shared_engine_group";
+    HierarchicalReplayConfig config = CreateHierarchicalConfig(root);
+    config.set_engine_config(
+        CreateOptimizerConfig("engine_group", {"engine_a", "engine_b"}, {"hbm", "dram"}, root + "/engine"));
+
+    HierarchicalReplayManager manager(config);
+    EXPECT_FALSE(manager.Init());
 }
 
 TEST_F(HierarchicalReplayManagerTest, ReplaysStandardTraceThroughEngineAndPool) {
@@ -217,7 +253,7 @@ TEST_F(HierarchicalReplayManagerTest, SeparatesIndependentPoolInstances) {
     config.set_trace_file_path(root + "/trace.jsonl");
     config.set_output_result_path(root + "/combined");
     config.set_engine_config(
-        CreateOptimizerConfig("engine_group", {"engine_a", "engine_b"}, {"hbm", "dram"}, root + "/engine"));
+        CreateEngineOptimizerConfig("engine_group", {"engine_a", "engine_b"}, {"hbm", "dram"}, root + "/engine"));
     config.set_pool_config(CreateOptimizerConfig("pool_group", {"model_a_l3", "model_b_l3"}, {"l3"}, root + "/pool"));
 
     EngineToPoolMappingConfig map_a;

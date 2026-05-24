@@ -26,6 +26,19 @@ size_t PositiveBlockSizeOrZero(const OptInstanceConfig &instance) {
     return instance.block_size() > 0 ? static_cast<size_t>(instance.block_size()) : 0;
 }
 
+bool ValidateEngineInstanceIsolation(const OptimizerConfig &config) {
+    for (const auto &group : config.instance_groups()) {
+        if (group.instances().size() != 1) {
+            KVCM_LOG_ERROR("Hierarchical replay engine_config group '%s' has %zu instances; each engine instance must "
+                           "use a dedicated group so L1/L2 capacities are independent.",
+                           group.group_name().c_str(),
+                           group.instances().size());
+            return false;
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 HierarchicalReplayManager::HierarchicalReplayManager(const HierarchicalReplayConfig &config) : config_(config) {}
@@ -62,6 +75,9 @@ bool HierarchicalReplayManager::ValidateAndBuildMappings() {
     }
     if (pool_instances.empty()) {
         KVCM_LOG_ERROR("Hierarchical replay pool_config has no instances.");
+        return false;
+    }
+    if (!ValidateEngineInstanceIsolation(config_.engine_config())) {
         return false;
     }
 

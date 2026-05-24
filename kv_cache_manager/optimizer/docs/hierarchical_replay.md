@@ -10,6 +10,8 @@ bazel run //kv_cache_manager/optimizer:hierarchical_replay_main -- /path/to/hier
 
 - `engine_config` 是推理引擎侧模拟，用同一套 optimizer 组件模拟每个 engine instance 独立的 L1/L2。
 - `pool_config` 是 L3 池化模拟，用同一套 optimizer 组件模拟全局池化实例。
+- `engine_config` 中每个 instance group 只能放一个 engine instance，保证 HBM/DRAM 容量不会跨 engine 共享；多个 engine instance 用多个同构 group 表达。
+- `pool_config` 可以在一个 instance group 下放多个 L3 instance，用 group 级 storage 表达全局池化容量。
 - `engine_scheduling_strategy=preserve_trace` 时，标准 trace 的 `instance_id` 表示 engine instance。
 - `engine_scheduling_strategy=round_robin` 时，回放前按 get/write pair 轮询分配到 `engine_to_pool` 中的 engine instance；write 跟随前一个 get。
 - `engine_scheduling_strategy=prefix_hit` 时，每个 get 选择当前 L1/L2 前缀命中最长的 engine instance；冷启动或并列时按确定性轮询分配，write 跟随前一个 get。
@@ -31,7 +33,7 @@ bazel run //kv_cache_manager/optimizer:hierarchical_replay_main -- /path/to/hier
   "trace_file_path": "/path/to/standard_trace.jsonl",
   "output_result_path": "/tmp/hierarchical/combined",
   "engine_scheduling_strategy": "preserve_trace",
-  "engine_config": { "...": "普通 optimizer config，定义 engine instances 和 L1/L2 storages" },
+  "engine_config": { "...": "普通 optimizer config；每个 engine instance 使用单独 instance group 定义 L1/L2 storages" },
   "pool_config": { "...": "普通 optimizer config，定义 L3 pool instances 和 L3 storages" },
   "engine_to_pool": [
     {
