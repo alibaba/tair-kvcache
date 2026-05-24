@@ -220,14 +220,20 @@ WriteCacheRes OptimizerManager::WriteCache(const std::string &instance_id,
                                            const int64_t timestamp,
                                            const std::vector<int64_t> &block_ids,
                                            const int64_t ttl_seconds) {
+    int64_t ttl_us = (ttl_seconds > 0) ? ttl_seconds * 1000000 : ttl_seconds;
+    return WriteCacheWithTtlUs(instance_id, trace_id, timestamp, block_ids, ttl_us);
+}
+
+WriteCacheRes OptimizerManager::WriteCacheWithTtlUs(const std::string &instance_id,
+                                                    const std::string &trace_id,
+                                                    const int64_t timestamp,
+                                                    const std::vector<int64_t> &block_ids,
+                                                    const int64_t ttl_us) {
     WriteCacheSchemaTrace trace;
     trace.set_instance_id(instance_id);
     trace.set_trace_id(trace_id);
     trace.set_timestamp_ns(timestamp);
     trace.set_keys(block_ids);
-
-    int64_t ttl_us = (ttl_seconds > 0) ? ttl_seconds * 1000000 : ttl_seconds;
-
     trace.set_ttl_us(ttl_us);
     optimizer_runner_->HandleWriteCache(trace);
     stats_collector_->UpdateTimestamp(instance_id, timestamp);
@@ -260,6 +266,33 @@ GetCacheLocationRes OptimizerManager::GetCacheLocation(const std::string &instan
     trace.set_input_len(RequirePositiveInputLen("GetCacheLocation", input_len));
     trace.set_block_mask(block_mask);
     optimizer_runner_->HandleGetLocation(trace);
+    stats_collector_->UpdateTimestamp(instance_id, timestamp);
+
+    GetCacheLocationRes res;
+    res.trace_id = trace_id;
+    res.kvcm_hit_length = 0;
+
+    const auto *last_read = hit_rate_tracker_->LastReadRecord(instance_id);
+    if (last_read) {
+        res.kvcm_hit_length = last_read->remote_hit_blocks;
+    }
+    return res;
+}
+
+GetCacheLocationRes OptimizerManager::GetCacheLocationAfterPrefix(const std::string &instance_id,
+                                                                  const std::string &trace_id,
+                                                                  const int64_t timestamp,
+                                                                  const std::vector<int64_t> &block_ids,
+                                                                  size_t prefix_block_count,
+                                                                  const int64_t input_len) {
+    GetLocationSchemaTrace trace;
+    trace.set_instance_id(instance_id);
+    trace.set_trace_id(trace_id);
+    trace.set_timestamp_ns(timestamp);
+    trace.set_keys(block_ids);
+    trace.set_input_len(RequirePositiveInputLen("GetCacheLocationAfterPrefix", input_len));
+    trace.set_block_mask(BlockMaskVector{});
+    optimizer_runner_->HandleGetLocation(trace, prefix_block_count);
     stats_collector_->UpdateTimestamp(instance_id, timestamp);
 
     GetCacheLocationRes res;

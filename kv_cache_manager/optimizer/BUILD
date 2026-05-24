@@ -13,6 +13,18 @@ cc_binary(
         "//kv_cache_manager/common:logger"
     ],
 )
+
+cc_binary(
+    name = "hierarchical_replay_main",
+    srcs = [
+        "hierarchical_replay_main.cc",
+    ],
+    deps = [
+        "//kv_cache_manager/common:logger",
+        "//kv_cache_manager/optimizer/config",
+        "//kv_cache_manager/optimizer/manager",
+    ],
+)
 cc_library(
     name = "config",
     hdrs = [

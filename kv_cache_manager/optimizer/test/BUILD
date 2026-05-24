@@ -106,6 +106,20 @@ cc_test(
     ],
 )
 
+cc_test(
+    name = "HierarchicalReplayManagerTest",
+    srcs = [
+        "hierarchical_replay_manager_test.cc",
+    ],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/data_storage:common_define",
+        "//kv_cache_manager/meta:cache_location",
+        "//kv_cache_manager/optimizer/config",
+        "//kv_cache_manager/optimizer/manager",
+    ],
+)
+
 py_binary(
     name = "asan_runner",
     srcs = ["asan_runner.py"],

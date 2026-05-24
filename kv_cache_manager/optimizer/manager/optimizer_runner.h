@@ -31,7 +31,7 @@ public:
     void RunTrace(std::shared_ptr<OptimizerSchemaTrace> trace);
 
 public:
-    void HandleGetLocation(const GetLocationSchemaTrace &trace);
+    void HandleGetLocation(const GetLocationSchemaTrace &trace, size_t access_start_offset = 0);
     void HandleWriteCache(const WriteCacheSchemaTrace &trace);
 
 private:

@@ -5,6 +5,8 @@ cc_library(
     srcs = [
         "types.cc",
         "optimizer_config.cc",
+        "hierarchical_replay_config.cc",
+        "hierarchical_replay_config_loader.cc",
         "tier_config.cc",
         "eviction_config.cc",
         "instance_config.cc",
@@ -14,6 +16,8 @@ cc_library(
     hdrs = [
         "types.h",
         "optimizer_config.h",
+        "hierarchical_replay_config.h",
+        "hierarchical_replay_config_loader.h",
         "tier_config.h",
         "eviction_config.h",
         "instance_config.h",

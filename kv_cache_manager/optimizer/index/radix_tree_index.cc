@@ -203,7 +203,8 @@ bool RadixTreeIndex::PrefixQuery(const std::vector<int64_t> &block_keys,
                                  const BlockMask &block_mask,
                                  const int64_t timestamp,
                                  QueryHit *query_hit,
-                                 bool refresh_ttl_on_read) {
+                                 bool refresh_ttl_on_read,
+                                 size_t access_start_offset) {
     bool read_triggered_tier_write = false;
     if (block_keys.empty()) {
         return false;
@@ -227,8 +228,13 @@ bool RadixTreeIndex::PrefixQuery(const std::vector<int64_t> &block_keys,
             if (IsBlockEvict(child->blocks[match_len].get(), timestamp)) {
                 break;
             }
+            const size_t block_idx = key_idx + match_len;
+            if (block_idx < access_start_offset) {
+                match_len++;
+                continue;
+            }
             BlockEntry *blk = child->blocks[match_len].get();
-            const bool is_local = IsIndexInMaskRange(block_mask, key_idx + match_len);
+            const bool is_local = IsIndexInMaskRange(block_mask, block_idx);
             if (is_local) {
                 has_local_hit = true;
                 RecordTieredHit(blk, false, query_hit);

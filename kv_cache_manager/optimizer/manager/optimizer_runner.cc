@@ -193,7 +193,7 @@ void OptimizerRunner::SubmitReadRecord(const std::string &instance_id,
     stats_collector_->OnReadComplete(instance_id, record);
 }
 
-void OptimizerRunner::HandleGetLocation(const GetLocationSchemaTrace &trace) {
+void OptimizerRunner::HandleGetLocation(const GetLocationSchemaTrace &trace, size_t access_start_offset) {
     std::string instance_id = trace.instance_id();
     auto indexer = GetIndexer(instance_id);
     if (!indexer) {
@@ -214,22 +214,32 @@ void OptimizerRunner::HandleGetLocation(const GetLocationSchemaTrace &trace) {
     }
 
     QueryHit query_hit;
-    const bool read_triggered_tier_write =
-        indexer->PrefixQuery(trace.keys(), trace.block_mask(), trace.timestamp_ns(), &query_hit, refresh_ttl_on_read);
+    const size_t read_start_offset = std::min(access_start_offset, trace.keys().size());
+    const bool read_triggered_tier_write = indexer->PrefixQuery(trace.keys(),
+                                                               trace.block_mask(),
+                                                               trace.timestamp_ns(),
+                                                               &query_hit,
+                                                               refresh_ttl_on_read,
+                                                               read_start_offset);
     if (read_triggered_tier_write) {
         auto capacity_evicted_blocks = indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_ns());
         indexer_manager_->CleanEvictedBlocks(capacity_evicted_blocks, trace.timestamp_ns());
     }
 
     size_t local_read_block_num = 0;
-    if (std::holds_alternative<BlockMaskVector>(trace.block_mask())) {
-        const auto &mask_vector = std::get<BlockMaskVector>(trace.block_mask());
-        const size_t n = std::min(mask_vector.size(), trace.keys().size());
-        local_read_block_num = std::count(mask_vector.begin(), mask_vector.begin() + n, true);
-    } else if (std::holds_alternative<BlockMaskOffset>(trace.block_mask())) {
-        local_read_block_num = std::min(std::get<BlockMaskOffset>(trace.block_mask()), trace.keys().size());
+    size_t remote_read_block_num = trace.keys().size();
+    if (read_start_offset > 0) {
+        remote_read_block_num -= read_start_offset;
+    } else {
+        if (std::holds_alternative<BlockMaskVector>(trace.block_mask())) {
+            const auto &mask_vector = std::get<BlockMaskVector>(trace.block_mask());
+            const size_t n = std::min(mask_vector.size(), trace.keys().size());
+            local_read_block_num = std::count(mask_vector.begin(), mask_vector.begin() + n, true);
+        } else if (std::holds_alternative<BlockMaskOffset>(trace.block_mask())) {
+            local_read_block_num = std::min(std::get<BlockMaskOffset>(trace.block_mask()), trace.keys().size());
+        }
+        remote_read_block_num = trace.keys().size() - local_read_block_num;
     }
-    size_t remote_read_block_num = trace.keys().size() - local_read_block_num;
 
     SubmitReadRecord(instance_id,
                      trace.trace_id(),
