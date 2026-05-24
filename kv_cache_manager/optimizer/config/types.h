@@ -46,8 +46,7 @@ struct RadixTreeNode;
 
 struct BlockEntry {
     int64_t key;
-    LocationStatMap location_map;   // key对应的块所在的层级位置以及对应的访问信息
-    std::vector<int64_t> token_ids; // 可选
+    LocationStatMap location_map; // key对应的块所在的层级位置以及对应的访问信息
     int64_t writing_time = -1;
     int64_t last_access_time = -1;
     // TTL 续命锚点（与访问统计时间 last_access_time 解耦）。

@@ -77,7 +77,7 @@ optimizer 回放输入只接受 JSONL，每行一条标准 trace。字段不完�
 [-9223372036854775808, 9223372036854775807]
 ```
 
-`keys` 和 `tokens` 支持 JSON signed/unsigned 整数。超过 `INT64_MAX=9223372036854775807` 的 unsigned 64-bit 值会按补码稳定映射到内部 `int64_t`，例如 `9223372036854775808 -> -9223372036854775808`、`18446744073709551615 -> -1`。
+`keys` 支持 JSON signed/unsigned 整数。超过 `INT64_MAX=9223372036854775807` 的 unsigned 64-bit 值会按补码稳定映射到内部 `int64_t`，例如 `9223372036854775808 -> -9223372036854775808`、`18446744073709551615 -> -1`。
 
 Get trace：
 
@@ -88,7 +88,6 @@ Get trace：
   "trace_id": "trace_instance-a_1000",
   "timestamp_ns": 1000,
   "keys": [101, 102, 103],
-  "tokens": [],
   "input_len": 33,
   "query_type": "prefix_match",
   "block_mask": [],
@@ -124,7 +123,6 @@ Write trace：
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | `trace_id` | string | 空字符串 | 请求标识，用于调试和模板分析 |
-| `tokens` | int64 array | 空数组 | get 的 token id 列表，可为空以减小 trace 文件体积；命中率以 `input_len` 为准 |
 
 `get` 专用字段：
 
@@ -142,14 +140,14 @@ Write trace：
 |---|---|---|---|
 | `ttl_us` | int64 | 0 | 请求级 TTL，单位微秒；`0` 使用 group 默认 TTL，`-1` 表示禁用 TTL |
 
-`write` 只读取 `type`、`instance_id`、`trace_id`、`timestamp_ns`、`keys` 和 `ttl_us`；其他字段包括 `input_len`、`tokens`、`block_mask` 都忽略。`block_mask` 只用于标记 trace 已经知道的本地命中 block，不是标准报告的分组依据。直接分析请求输入时通常可传空数组，此时整体 `HitRate` 仍按 `HitTokens / InputTokens` 计算。
+`write` 只读取 `type`、`instance_id`、`trace_id`、`timestamp_ns`、`keys` 和 `ttl_us`；其他字段包括 `input_len` 和 `block_mask` 都忽略。`block_mask` 只用于标记 trace 已经知道的本地命中 block，不是标准报告的分组依据。直接分析请求输入时通常可传空数组，此时整体 `HitRate` 仍按 `HitTokens / InputTokens` 计算。
 
 旧格式或不合法输入会失败，包括：
 
 - 缺少 `type`、`instance_id`、`timestamp_ns`、`keys`，或 `get` trace 缺少 `input_len`。
 - `get.input_len <= 0`、`timestamp_ns <= 0`，或 `keys` 不是数组。
 - 使用 `timestamp_us` 但没有 `timestamp_ns`。
-- `keys` / `tokens` 中存在非整数。
+- `keys` 中存在非整数。
 - `block_mask` 数组中存在非 bool 值，或 offset 为负数 / 超过 `INT64_MAX`。
 - legacy dialog-style trace 只有 `query_type` / `block_mask` / decode metadata 但没有显式 `type=get/write`。
 

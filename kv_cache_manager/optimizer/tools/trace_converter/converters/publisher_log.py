@@ -26,9 +26,8 @@ class PublisherLogConverter(BaseConverter):
     def __init__(self, default_instance_id: str = 'instance',
                  instance_block_sizes: Dict[str, int] = None,
                  mode: str = 'optimizer',
-                 keep_tokens: bool = False,
                  **kwargs):  # 忽略其他参数
-        super().__init__(default_instance_id, instance_block_sizes, mode, keep_tokens)
+        super().__init__(default_instance_id, instance_block_sizes, mode)
         # 动态发现的instance -> block_size映射
         self.discovered_instances = {}
         self.pending_write_sessions = {}
@@ -105,9 +104,6 @@ class PublisherLogConverter(BaseConverter):
                 if value <= 0:
                     raise ValueError(f"{key} must be positive")
                 return value
-        tokens = data.get('tokens', [])
-        if tokens:
-            return len(tokens)
         raise ValueError(f"missing input_len for instance {instance_id}")
 
     def _convert_get_location_event(self, data: dict):
@@ -125,7 +121,6 @@ class PublisherLogConverter(BaseConverter):
             'instance_id': instance_id,
             'timestamp_ns': int(data.get('trigger_time_us', 0)) * 1000,
             'keys': data.get('keys', []),
-            'tokens': data.get('tokens', []),  # 提取tokens字段
             'input_len': self._resolve_input_len(data, instance_id),
             'query_type': data.get('query_type', 'prefix_match'),
             'location_spec_names': data.get('location_spec_names', []),
@@ -153,7 +148,6 @@ class PublisherLogConverter(BaseConverter):
             'instance_id': instance_id,
             'timestamp_ns': int(data.get('trigger_time_us', 0)) * 1000,
             'keys': data.get('keys', []),
-            'tokens': data.get('tokens', []),
         }
 
         if write_session_id:
@@ -231,7 +225,6 @@ class PublisherLogConverter(BaseConverter):
             timestamp_ns=get_trace['timestamp_ns'],
             keys=get_trace['keys'],
             instance_id=instance_id,
-            tokens=get_trace.get('tokens', []),
             input_len=get_trace['input_len'],
             query_type=get_trace.get('query_type', 'prefix_match'),
             block_mask=get_trace.get('block_mask', []),
@@ -284,7 +277,6 @@ class PublisherLogConverter(BaseConverter):
                 timestamp_ns=get_trace['timestamp_ns'],
                 keys=get_trace['keys'],
                 instance_id=instance_id,
-                tokens=get_trace.get('tokens', []),
                 input_len=get_trace['input_len'],
                 query_type=get_trace.get('query_type', 'prefix_match'),
                 block_mask=get_trace.get('block_mask', []),

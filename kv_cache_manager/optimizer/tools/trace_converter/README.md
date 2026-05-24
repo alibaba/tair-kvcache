@@ -228,7 +228,6 @@ JSON格式,每行一个事件:
   "instance_id": "instance",
   "trace_id": "trace_instance_1704110400000000000",
   "timestamp_ns": 1704110400000000000,
-  "tokens": [],
   "keys": [123, 456, 789],
   "query_type": "prefix_match",
   "block_mask": [],
@@ -243,7 +242,6 @@ JSON格式,每行一个事件:
   "instance_id": "instance",
   "trace_id": "trace_instance_1704110400000000001",
   "timestamp_ns": 1704110400000000001,
-  "tokens": [],
   "keys": [123, 456, 789, 1011]
 }
 ```
@@ -493,7 +491,6 @@ self._create_get_trace(
     timestamp_ns=timestamp_ns,
     keys=block_keys,
     instance_id=instance_id,
-    tokens=token_ids,  # 可选
     input_len=input_len
 )
 

@@ -132,7 +132,6 @@ PYBIND11_MODULE(kvcm_py_optimizer, module) {
              py::arg("trace_id"),
              py::arg("timestamp"),
              py::arg("block_ids"),
-             py::arg("token_ids"),
              py::arg("ttl_seconds") = int64_t(0))
         .def(
             "GetCacheLocation",
@@ -141,7 +140,6 @@ PYBIND11_MODULE(kvcm_py_optimizer, module) {
                const std::string &trace_id,
                const int64_t timestamp,
                const std::vector<int64_t> &block_ids,
-               const std::vector<int64_t> &token_ids,
                const py::object &block_mask_obj,
                const int64_t input_len) {
                 kvcm::BlockMask block_mask;
@@ -152,17 +150,15 @@ PYBIND11_MODULE(kvcm_py_optimizer, module) {
                 } else {
                     throw std::invalid_argument("block_mask must be either a list of bools or an integer bitmask.");
                 }
-                return self.GetCacheLocation(
-                    instance_id, trace_id, timestamp, block_ids, token_ids, block_mask, input_len);
+                return self.GetCacheLocation(instance_id, trace_id, timestamp, block_ids, block_mask, input_len);
             },
             py::call_guard<py::gil_scoped_release>(),
             py::arg("instance_id"),
             py::arg("trace_id"),
             py::arg("timestamp"),
             py::arg("block_ids"),
-            py::arg("token_ids"),
             py::arg("block_mask"),
-            py::arg("input_len") = int64_t(-1))
+            py::arg("input_len"))
         .def("ClearCache",
              &kvcm::OptimizerManager::ClearCache,
              py::call_guard<py::gil_scoped_release>(),

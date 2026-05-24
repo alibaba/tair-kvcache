@@ -90,15 +90,15 @@ TEST_F(OptimizerManagerTest, WriteCacheTtlSecondsUsesNanosecondTimestamps) {
     ASSERT_TRUE(manager.Init());
 
     const int64_t write_ts_ns = 1'000'000'000;
-    manager.WriteCache("instance1", "write", write_ts_ns, {1}, {}, 1);
+    manager.WriteCache("instance1", "write", write_ts_ns, {1}, 1);
 
     BlockMask remote_read_mask = std::vector<bool>{false};
     auto hit_before_expire = manager.GetCacheLocation(
-        "instance1", "read_before_expire", write_ts_ns + 1'000'000, {1}, {}, remote_read_mask, 1024);
+        "instance1", "read_before_expire", write_ts_ns + 1'000'000, {1}, remote_read_mask, 1024);
     EXPECT_EQ(hit_before_expire.kvcm_hit_length, 1);
 
     auto hit_after_expire = manager.GetCacheLocation(
-        "instance1", "read_after_expire", write_ts_ns + 2'000'000'000, {1}, {}, remote_read_mask, 1024);
+        "instance1", "read_after_expire", write_ts_ns + 2'000'000'000, {1}, remote_read_mask, 1024);
     EXPECT_EQ(hit_after_expire.kvcm_hit_length, 0);
 }
 
@@ -108,10 +108,10 @@ TEST_F(OptimizerManagerTest, TemplateAnalysisReadRecordKeepsTraceIdAndKeys) {
     ASSERT_NE(manager.template_prefix_tracker_, nullptr);
 
     const std::vector<int64_t> keys = {1, 2, 3};
-    manager.WriteCache("instance1", "write_trace", 1000, keys, {}, 0);
+    manager.WriteCache("instance1", "write_trace", 1000, keys);
 
     BlockMask remote_read_mask = std::vector<bool>{false, false, false};
-    manager.GetCacheLocation("instance1", "read_trace", 2000, keys, {}, remote_read_mask, 3 * 1024);
+    manager.GetCacheLocation("instance1", "read_trace", 2000, keys, remote_read_mask, 3 * 1024);
 
     auto data_it = manager.template_prefix_tracker_->instance_data_.find("instance1");
     ASSERT_NE(data_it, manager.template_prefix_tracker_->instance_data_.end());
@@ -121,33 +121,15 @@ TEST_F(OptimizerManagerTest, TemplateAnalysisReadRecordKeepsTraceIdAndKeys) {
     EXPECT_EQ(data_it->second.trace_reads[0].keys, keys);
 }
 
-TEST_F(OptimizerManagerTest, WriteDoesNotRequireInputLen) {
-    OptimizerManager manager(config_);
-    ASSERT_TRUE(manager.Init());
-
-    EXPECT_NO_THROW(manager.WriteCache("instance1", "write_trace", 1000, {1}, {10}));
-}
-
-TEST_F(OptimizerManagerTest, ReadRequiresInputLen) {
-    OptimizerManager manager(config_);
-    ASSERT_TRUE(manager.Init());
-
-    manager.WriteCache("instance1", "write_trace", 1000, {1}, {}, 0);
-
-    BlockMask remote_read_mask = std::vector<bool>{false};
-    EXPECT_THROW(manager.GetCacheLocation("instance1", "read_trace", 2000, {1}, {10}, remote_read_mask),
-                 std::runtime_error);
-}
-
 TEST_F(OptimizerManagerTest, ReadUsesExplicitInputLen) {
     OptimizerManager manager(config_);
     ASSERT_TRUE(manager.Init());
 
     const std::vector<int64_t> keys = {1};
-    manager.WriteCache("instance1", "write_trace", 1000, keys, {}, 0);
+    manager.WriteCache("instance1", "write_trace", 1000, keys);
 
     BlockMask remote_read_mask = std::vector<bool>{false};
-    auto res = manager.GetCacheLocation("instance1", "read_trace", 2000, keys, {}, remote_read_mask, 1537);
+    auto res = manager.GetCacheLocation("instance1", "read_trace", 2000, keys, remote_read_mask, 1537);
     EXPECT_EQ(res.kvcm_hit_length, 1);
 
     const auto *last_read = manager.hit_rate_tracker_->LastReadRecord("instance1");
@@ -161,7 +143,7 @@ TEST_F(OptimizerManagerTest, ReadWithoutFullBlocksCountsInputTokens) {
     ASSERT_TRUE(manager.Init());
 
     BlockMask remote_read_mask = std::vector<bool>{};
-    auto res = manager.GetCacheLocation("instance1", "short_read", 1000, {}, {}, remote_read_mask, 128);
+    auto res = manager.GetCacheLocation("instance1", "short_read", 1000, {}, remote_read_mask, 128);
     EXPECT_EQ(res.kvcm_hit_length, 0);
 
     const auto *last_read = manager.hit_rate_tracker_->LastReadRecord("instance1");

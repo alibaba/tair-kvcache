@@ -222,8 +222,6 @@ def main():
     parser.add_argument('--num-workers', type=int, default=4, help='Number of parallel workers for tokenization')
     parser.add_argument('--no-sort', action='store_true', 
                         help='Disable timestamp sorting (faster but unsorted output)')
-    parser.add_argument('--keep-tokens', action='store_true',
-                        help='Keep tokens field in output (for debugging, increases file size significantly)')
     parser.add_argument('--ignore-response', action='store_true',
                         help='Ignore response when computing block IDs; write trace covers prompt only (useful when response is unavailable or irrelevant)')
     parser.add_argument('--no-truncate', action='store_true',
@@ -295,7 +293,6 @@ def main():
             time_field=args.time_field,
             content_field=args.content_field,
             num_workers=args.num_workers,
-            keep_tokens=args.keep_tokens,
             ignore_response=args.ignore_response,
             truncate=not args.no_truncate
         )
@@ -305,8 +302,6 @@ def main():
         # ============================================
         print(f"🔄 Converting {len(input_files)} file(s) → {output_path}")
         print(f"   Format: {args.format}, Mode: {args.mode}")
-        if args.keep_tokens:
-            print(f"   ⚠️  Warning: --keep-tokens enabled, output file will be large!")
         if args.ignore_response:
             print(f"   ℹ️  --ignore-response: block IDs computed from prompt only")
         if args.no_truncate:

@@ -133,7 +133,7 @@ void OptimizerRunner::HandleGetLocation(const GetLocationSchemaTrace &trace) {
         local_read_block_num = std::min(std::get<BlockMaskOffset>(trace.block_mask()), trace.keys().size());
     }
     size_t remote_read_block_num = trace.keys().size() - local_read_block_num;
-    const size_t input_tokens = trace.input_token_count(block_size);
+    const size_t input_tokens = trace.input_token_count();
 
     SubmitReadRecord(instance_id,
                      trace.trace_id(),

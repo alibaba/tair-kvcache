@@ -10,20 +10,17 @@ class BaseConverter(ABC):
     def __init__(self, default_instance_id: str = 'instance',
                  instance_block_sizes: Dict[str, int] = None,
                  mode: str = 'optimizer',
-                 keep_tokens: bool = False,
                  **kwargs):
         """
         Args:
             default_instance_id: 默认实例ID (当输入格式没有instance信息时使用)
             instance_block_sizes: 每个instance的block_size映射 {instance_id: block_size}
             mode: 输出模式 ('optimizer')
-            keep_tokens: 是否保留tokens字段（默认False以减少文件大小，调试时可设为True）
         """
         self.default_instance_id = default_instance_id
         self.default_block_size = 16  # 硬编码默认值
         self.instance_block_sizes = instance_block_sizes or {}
         self.mode = mode
-        self.keep_tokens = keep_tokens
         # 按instance分组管理时间戳,避免不同instance间的冲突
         self.used_timestamps: Dict[str, Set[int]] = {}
 
@@ -107,16 +104,12 @@ class BaseConverter(ABC):
         if input_len <= 0:
             raise ValueError("optimizer get trace input_len must be positive")
 
-        # tokens字段处理: 根据keep_tokens决定是否保留
-        tokens = kwargs.get('tokens', []) if self.keep_tokens else []
-        
         trace = {
             'type': 'get',  # 显式标记为Get trace
             # OptimizerSchemaTrace 基础字段
             'instance_id': instance_id,
             'trace_id': f"trace_{instance_id}_{timestamp_ns}",
             'timestamp_ns': timestamp_ns,
-            'tokens': tokens,
             'keys': keys,
             'input_len': input_len,
 

@@ -1,8 +1,6 @@
 #include "kv_cache_manager/optimizer/trace_loader/standard_trace_loader.h"
 
 #include <fstream>
-#include <iostream>
-#include <sstream>
 #include <stdexcept>
 
 #include "kv_cache_manager/common/jsonizable.h"
@@ -27,19 +25,13 @@ StandardTraceLoader::LoadFromFile(const std::string &trace_file_path) {
         KVCM_LOG_ERROR("%s", full_message.c_str());
         throw std::runtime_error(full_message);
     };
-    size_t physical_line_count = 0;
-    size_t non_empty_line_count = 0;
     while (std::getline(file, line)) {
-        physical_line_count++;
         line_number++;
 
-        // 跳过空行
         if (line.find_first_not_of(" \t\r\n") == std::string::npos) {
             continue;
         }
-        non_empty_line_count++;
 
-        // 解析 JSON 以检查字段
         rapidjson::Document doc;
         if (doc.Parse(line.c_str()).HasParseError() || !doc.IsObject()) {
             std::string line_preview = line.length() > 100 ? line.substr(0, 100) + "..." : line;
@@ -51,13 +43,6 @@ StandardTraceLoader::LoadFromFile(const std::string &trace_file_path) {
         std::shared_ptr<OptimizerSchemaTrace> trace = nullptr;
 
         if (!has_type_field) {
-            const bool looks_like_legacy_dialog =
-                (doc.HasMember("query_type") || doc.HasMember("block_mask")) &&
-                (doc.HasMember("total_keys") || doc.HasMember("output_len") || doc.HasMember("output_length"));
-            if (looks_like_legacy_dialog) {
-                fail("legacy dialog-style trace without type is not supported; convert it to optimizer schema with "
-                     "explicit get/write rows");
-            }
             fail("missing string field: type");
         }
         if (!doc.HasMember("instance_id") || !doc["instance_id"].IsString() ||
@@ -102,14 +87,6 @@ StandardTraceLoader::LoadFromFile(const std::string &trace_file_path) {
 
     file.close();
     if (traces.empty()) {
-        if (physical_line_count == 0) {
-            KVCM_LOG_ERROR("Optimizer trace file is empty: %s", trace_file_path.c_str());
-            throw std::runtime_error("Optimizer trace file is empty: " + trace_file_path);
-        }
-        if (non_empty_line_count == 0) {
-            KVCM_LOG_ERROR("Optimizer trace file contains only blank lines: %s", trace_file_path.c_str());
-            throw std::runtime_error("Optimizer trace file contains only blank lines: " + trace_file_path);
-        }
         KVCM_LOG_ERROR("No optimizer traces loaded from file: %s", trace_file_path.c_str());
         throw std::runtime_error("No optimizer traces loaded from file: " + trace_file_path);
     }
@@ -118,7 +95,6 @@ StandardTraceLoader::LoadFromFile(const std::string &trace_file_path) {
 }
 
 bool StandardTraceLoader::ValidateTrace(const OptimizerSchemaTrace &trace) {
-    // 验证必需字段
     if (trace.instance_id().empty()) {
         KVCM_LOG_ERROR("Validation failed: empty instance_id");
         return false;

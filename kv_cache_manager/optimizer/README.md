@@ -294,16 +294,16 @@ optimizer.DirectRun()
 optimizer.AnalyzeResults()
 
 # 单次读写操作（需要指定instance_id）
-write_res = optimizer.WriteCache("instance_id", "trace_001", timestamp, block_ids, token_ids)
-read_res = optimizer.GetCacheLocation("instance_id", "trace_002", timestamp, block_ids, token_ids, block_mask,
+write_res = optimizer.WriteCache("instance_id", "trace_001", timestamp, block_ids)
+read_res = optimizer.GetCacheLocation("instance_id", "trace_002", timestamp, block_ids, block_mask,
                                       input_len=real_prompt_tokens)
 
 # 写入时指定 TTL（可选）
-write_res = optimizer.WriteCache("instance_id", "trace_003", timestamp, block_ids, token_ids,
+write_res = optimizer.WriteCache("instance_id", "trace_003", timestamp, block_ids,
                                   ttl_seconds=0)     # 使用 group 默认
-write_res = optimizer.WriteCache("instance_id", "trace_004", timestamp, block_ids, token_ids,
+write_res = optimizer.WriteCache("instance_id", "trace_004", timestamp, block_ids,
                                   ttl_seconds=-1)    # 禁用 TTL，永不过期
-write_res = optimizer.WriteCache("instance_id", "trace_005", timestamp, block_ids, token_ids,
+write_res = optimizer.WriteCache("instance_id", "trace_005", timestamp, block_ids,
                                   ttl_seconds=300)   # 自定义 300 秒
 
 # 清空缓存（保留统计）

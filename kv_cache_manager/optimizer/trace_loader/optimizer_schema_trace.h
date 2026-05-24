@@ -7,7 +7,24 @@
 #include "kv_cache_manager/meta/cache_location.h"
 
 namespace kv_cache_manager {
-inline bool ParseOptimizerInt64AllowUint64(const rapidjson::Value &value, int64_t &parsed_value) {
+inline bool ParseOptimizerInt64(const rapidjson::Value &value, int64_t &parsed_value) {
+    if (value.IsInt64()) {
+        parsed_value = value.GetInt64();
+        return true;
+    }
+    if (value.IsUint64()) {
+        const auto unsigned_value = value.GetUint64();
+        if (unsigned_value > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+            return false;
+        }
+        parsed_value = static_cast<int64_t>(unsigned_value);
+        return true;
+    }
+
+    return false;
+}
+
+inline bool ParseOptimizerKey(const rapidjson::Value &value, int64_t &parsed_value) {
     if (value.IsInt64()) {
         parsed_value = value.GetInt64();
         return true;
@@ -16,29 +33,19 @@ inline bool ParseOptimizerInt64AllowUint64(const rapidjson::Value &value, int64_
         const auto unsigned_value = value.GetUint64();
         if (unsigned_value <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
             parsed_value = static_cast<int64_t>(unsigned_value);
-            return true;
+        } else {
+            parsed_value =
+                std::numeric_limits<int64_t>::min() + static_cast<int64_t>(unsigned_value - (uint64_t{1} << 63));
         }
-        parsed_value = std::numeric_limits<int64_t>::min() + static_cast<int64_t>(unsigned_value - (uint64_t{1} << 63));
-        return true;
-    }
-    if (value.IsInt()) {
-        parsed_value = static_cast<int64_t>(value.GetInt());
-        return true;
-    }
-    if (value.IsUint()) {
-        parsed_value = static_cast<int64_t>(value.GetUint());
         return true;
     }
     return false;
 }
 
-inline bool ParseOptimizerInt64VectorAllowUint64(const rapidjson::Value &rapid_value,
-                                                 const char *key,
-                                                 std::vector<int64_t> &values,
-                                                 const std::vector<int64_t> &default_values = {}) {
+inline bool
+ParseOptimizerKeyVector(const rapidjson::Value &rapid_value, const char *key, std::vector<int64_t> &values) {
     if (!rapid_value.HasMember(key)) {
-        values = default_values;
-        return true;
+        return false;
     }
     const auto &array_value = rapid_value[key];
     if (!array_value.IsArray()) {
@@ -48,7 +55,7 @@ inline bool ParseOptimizerInt64VectorAllowUint64(const rapidjson::Value &rapid_v
     values.reserve(array_value.Size());
     for (const auto &value : array_value.GetArray()) {
         int64_t parsed_value = 0;
-        if (!ParseOptimizerInt64AllowUint64(value, parsed_value)) {
+        if (!ParseOptimizerKey(value, parsed_value)) {
             return false;
         }
         values.push_back(parsed_value);
@@ -61,7 +68,19 @@ class OptimizerSchemaTrace : public Jsonizable {
 public:
     OptimizerSchemaTrace() = default;
     ~OptimizerSchemaTrace() override = default;
-    bool FromRapidValue(const rapidjson::Value &rapid_value) override {
+    bool FromRapidValue(const rapidjson::Value &rapid_value) override { return ParseBaseFields(rapid_value); };
+    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override {
+        Put(writer, "instance_id", instance_id_);
+        Put(writer, "trace_id", trace_id_);
+        Put(writer, "timestamp_ns", timestamp_ns_);
+        Put(writer, "keys", keys_);
+        if (input_len_ >= 0) {
+            Put(writer, "input_len", input_len_);
+        }
+    };
+
+protected:
+    bool ParseBaseFields(const rapidjson::Value &rapid_value) {
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "instance_id", instance_id_, std::string(""));
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "trace_id", trace_id_, std::string(""));
         timestamp_ns_ = 0;
@@ -69,27 +88,14 @@ public:
             return false;
         }
         const auto &timestamp_value = rapid_value["timestamp_ns"];
-        if (!ParseOptimizerInt64AllowUint64(timestamp_value, timestamp_ns_)) {
+        if (!ParseOptimizerInt64(timestamp_value, timestamp_ns_)) {
             return false;
         }
-        if (!ParseOptimizerInt64VectorAllowUint64(rapid_value, "tokens", tokens_)) {
-            return false;
-        }
-        if (!ParseOptimizerInt64VectorAllowUint64(rapid_value, "keys", keys_)) {
+        if (!ParseOptimizerKeyVector(rapid_value, "keys", keys_)) {
             return false;
         }
         input_len_ = -1;
         return true;
-    };
-    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override {
-        Put(writer, "instance_id", instance_id_);
-        Put(writer, "trace_id", trace_id_);
-        Put(writer, "timestamp_ns", timestamp_ns_);
-        Put(writer, "tokens", tokens_);
-        Put(writer, "keys", keys_);
-        if (input_len_ >= 0) {
-            Put(writer, "input_len", input_len_);
-        }
     };
 
 public:
@@ -97,21 +103,17 @@ public:
     const std::string &trace_id() const { return trace_id_; }
     int64_t timestamp_ns() const { return timestamp_ns_; }
     const std::vector<int64_t> &keys() const { return keys_; }
-    const std::vector<int64_t> &tokens() const { return tokens_; }
     int64_t input_len() const { return input_len_; }
-    size_t input_token_count(size_t block_size) const {
-        (void)block_size;
+    size_t input_token_count() const {
         if (input_len_ > 0) {
             return static_cast<size_t>(input_len_);
         }
-        throw std::runtime_error(
-            "optimizer trace missing positive input_len; cannot infer token count from block keys");
+        throw std::runtime_error("optimizer get trace requires positive input_len");
     }
     void set_instance_id(const std::string &instance_id) { instance_id_ = instance_id; }
     void set_trace_id(const std::string &trace_id) { trace_id_ = trace_id; }
     void set_timestamp_ns(int64_t timestamp_ns) { timestamp_ns_ = timestamp_ns; }
     void set_keys(const std::vector<int64_t> &keys) { keys_ = keys; }
-    void set_tokens(const std::vector<int64_t> &tokens) { tokens_ = tokens; }
     void set_input_len(int64_t input_len) { input_len_ = input_len; }
 
 private:
@@ -119,7 +121,6 @@ private:
     std::string trace_id_;
     int64_t timestamp_ns_;
     std::vector<int64_t> keys_;
-    std::vector<int64_t> tokens_;
     int64_t input_len_ = -1;
 };
 // GetCacheLocation事件的Trace
@@ -137,7 +138,6 @@ public:
     void set_block_mask(const BlockMask &block_mask) { block_mask_ = block_mask; }
     void set_sw_size(int32_t sw_size) { sw_size_ = sw_size; }
     bool FromRapidValue(const rapidjson::Value &rapid_value) override {
-        // 先调用基类的FromRapidValue
         if (!OptimizerSchemaTrace::FromRapidValue(rapid_value)) {
             return false;
         }
@@ -146,20 +146,18 @@ public:
         }
         const auto &input_len_value = rapid_value["input_len"];
         int64_t parsed_input_len = -1;
-        if (!ParseOptimizerInt64AllowUint64(input_len_value, parsed_input_len)) {
+        if (!ParseOptimizerInt64(input_len_value, parsed_input_len)) {
             return false;
         }
         set_input_len(parsed_input_len);
         if (input_len() <= 0) {
             return false;
         }
-        // 解析自己的字段
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "query_type", query_type_, std::string("prefix_match"));
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "sw_size", sw_size_, int32_t(0));
         KVCM_JSON_GET_DEFAULT_MACRO(
             rapid_value, "location_spec_names", location_spec_names_, std::vector<std::string>{});
 
-        // 解析block_mask字段
         if (rapid_value.HasMember("block_mask")) {
             const auto &block_mask_value = rapid_value["block_mask"];
             if (block_mask_value.IsArray()) {
@@ -173,13 +171,12 @@ public:
                 block_mask_ = block_mask_vector;
             } else {
                 int64_t block_mask_offset = 0;
-                if (!ParseOptimizerInt64AllowUint64(block_mask_value, block_mask_offset) || block_mask_offset < 0) {
+                if (!ParseOptimizerInt64(block_mask_value, block_mask_offset) || block_mask_offset < 0) {
                     return false;
                 }
                 block_mask_ = BlockMaskOffset(block_mask_offset);
             }
         } else {
-            // 默认为空的BlockMaskVector
             block_mask_ = BlockMaskVector{};
         }
         return true;
@@ -207,35 +204,11 @@ public:
     void set_ttl_us(int64_t ttl_us) { ttl_us_ = ttl_us; }
 
     bool FromRapidValue(const rapidjson::Value &rapid_value) override {
-        std::string instance_id;
-        if (!Get(rapid_value, "instance_id", instance_id, std::string(""))) {
+        if (!ParseBaseFields(rapid_value)) {
             return false;
         }
-        set_instance_id(instance_id);
-
-        std::string trace_id;
-        if (!Get(rapid_value, "trace_id", trace_id, std::string(""))) {
-            return false;
-        }
-        set_trace_id(trace_id);
-
-        int64_t timestamp_ns = 0;
-        if (!rapid_value.HasMember("timestamp_ns") ||
-            !ParseOptimizerInt64AllowUint64(rapid_value["timestamp_ns"], timestamp_ns)) {
-            return false;
-        }
-        set_timestamp_ns(timestamp_ns);
-
-        std::vector<int64_t> keys;
-        if (!ParseOptimizerInt64VectorAllowUint64(rapid_value, "keys", keys)) {
-            return false;
-        }
-        set_keys(keys);
-        set_tokens({});
-        set_input_len(-1);
-
         ttl_us_ = 0;
-        if (rapid_value.HasMember("ttl_us") && !ParseOptimizerInt64AllowUint64(rapid_value["ttl_us"], ttl_us_)) {
+        if (rapid_value.HasMember("ttl_us") && !ParseOptimizerInt64(rapid_value["ttl_us"], ttl_us_)) {
             return false;
         }
         return true;

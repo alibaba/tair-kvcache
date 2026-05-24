@@ -33,9 +33,8 @@ class QwenBailianConverter(BaseConverter):
     def __init__(self, default_instance_id: str = 'instance',
                  instance_block_sizes: Dict[str, int] = None,
                  mode: str = 'optimizer',
-                 keep_tokens: bool = False,
                  **kwargs):  # 忽略其他参数
-        super().__init__(default_instance_id, instance_block_sizes, mode, keep_tokens)
+        super().__init__(default_instance_id, instance_block_sizes, mode)
 
     def convert_to_traces(self, input_file: str) -> list:
         """转换Qwen Bailian数据为traces列表"""

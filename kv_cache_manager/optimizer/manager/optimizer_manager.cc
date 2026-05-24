@@ -217,9 +217,7 @@ WriteCacheRes OptimizerManager::WriteCache(const std::string &instance_id,
                                            const std::string &trace_id,
                                            const int64_t timestamp,
                                            const std::vector<int64_t> &block_ids,
-                                           const std::vector<int64_t> &token_ids,
                                            const int64_t ttl_seconds) {
-    (void)token_ids;
     WriteCacheSchemaTrace trace;
     trace.set_instance_id(instance_id);
     trace.set_trace_id(trace_id);
@@ -250,7 +248,6 @@ GetCacheLocationRes OptimizerManager::GetCacheLocation(const std::string &instan
                                                        const std::string &trace_id,
                                                        const int64_t timestamp,
                                                        const std::vector<int64_t> &block_ids,
-                                                       const std::vector<int64_t> &token_ids,
                                                        const BlockMask &block_mask,
                                                        const int64_t input_len) {
     GetLocationSchemaTrace trace;
@@ -258,7 +255,6 @@ GetCacheLocationRes OptimizerManager::GetCacheLocation(const std::string &instan
     trace.set_trace_id(trace_id);
     trace.set_timestamp_ns(timestamp);
     trace.set_keys(block_ids);
-    trace.set_tokens(token_ids);
     trace.set_input_len(RequirePositiveInputLen("GetCacheLocation", input_len));
     trace.set_block_mask(block_mask);
     optimizer_runner_->HandleGetLocation(trace);

@@ -369,7 +369,6 @@ struct NodeStat {
 struct BlockEntry {
     int64_t key;
     LocationStatMap location_map;
-    std::vector<int64_t> token_ids;
     int64_t writing_time = -1;
     int64_t last_access_time = -1;
     size_t access_count = 0;
