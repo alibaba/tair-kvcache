@@ -52,6 +52,7 @@ public:
                      QueryHit *query_hit = nullptr,
                      bool refresh_ttl_on_read = true,
                      size_t access_start_offset = 0);
+    size_t PrefixMatchCount(const std::vector<int64_t> &block_keys, int64_t timestamp) const;
 
     void CleanEmptyBlocks(const std::vector<BlockEntry *> &blocks,
                           int64_t eviction_timestamp,

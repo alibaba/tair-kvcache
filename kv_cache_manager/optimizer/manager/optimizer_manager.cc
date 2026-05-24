@@ -306,6 +306,16 @@ GetCacheLocationRes OptimizerManager::GetCacheLocationAfterPrefix(const std::str
     return res;
 }
 
+size_t OptimizerManager::PrefixMatchCount(const std::string &instance_id,
+                                          const std::vector<int64_t> &block_ids,
+                                          int64_t timestamp) const {
+    auto indexer = indexer_manager_ ? indexer_manager_->GetOptIndexer(instance_id) : nullptr;
+    if (!indexer) {
+        return 0;
+    }
+    return indexer->PrefixMatchCount(block_ids, timestamp);
+}
+
 void OptimizerManager::AnalyzeResults() {
     for (const auto &[instance_id, _] : instance_configs_) {
         int64_t final_timestamp = stats_collector_->GetLastTimestamp(instance_id);

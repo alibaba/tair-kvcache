@@ -264,6 +264,39 @@ bool RadixTreeIndex::PrefixQuery(const std::vector<int64_t> &block_keys,
     return read_triggered_tier_write;
 }
 
+size_t RadixTreeIndex::PrefixMatchCount(const std::vector<int64_t> &block_keys, int64_t timestamp) const {
+    if (block_keys.empty()) {
+        return 0;
+    }
+
+    const RadixTreeNode *current_node = root_.get();
+    size_t key_idx = 0;
+    size_t matched = 0;
+
+    while (key_idx < block_keys.size()) {
+        auto child_it = current_node->children.find(block_keys[key_idx]);
+        if (child_it == current_node->children.end()) {
+            break;
+        }
+        const RadixTreeNode *child = child_it->second.get();
+        size_t match_len = 0;
+        while (match_len < child->blocks.size() && (key_idx + match_len) < block_keys.size() &&
+               child->blocks[match_len]->key == block_keys[key_idx + match_len]) {
+            if (IsBlockEvict(child->blocks[match_len].get(), timestamp)) {
+                return matched;
+            }
+            match_len++;
+            matched++;
+        }
+        if (match_len < child->blocks.size() || key_idx + match_len == block_keys.size()) {
+            break;
+        }
+        current_node = child;
+        key_idx += match_len;
+    }
+    return matched;
+}
+
 void RadixTreeIndex::CleanEmptyBlocks(const std::vector<BlockEntry *> &blocks,
                                       int64_t eviction_timestamp,
                                       bool use_logical_expire_time) {

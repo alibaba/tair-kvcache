@@ -180,6 +180,37 @@ TEST_F(HierarchicalReplayManagerTest, RoundRobinSchedulesTraceRequestsToEngineIn
     EXPECT_THAT(content, HasSubstr("pool_hit,engine_b,model_l3,1,0,1,1"));
 }
 
+TEST_F(HierarchicalReplayManagerTest, PrefixHitSchedulesToCachedEngineInstance) {
+    const std::string root = GetTestTempRootPath() + "/hierarchical_replay_prefix_hit";
+    std::filesystem::create_directories(root);
+    HierarchicalReplayConfig config = CreateHierarchicalConfig(root);
+    config.set_engine_scheduling_strategy("prefix_hit");
+
+    std::ofstream trace(config.trace_file_path());
+    trace
+        << R"({"type":"get","instance_id":"logical_source","trace_id":"cold","timestamp_ns":1000,"keys":[401],"input_len":16,"block_mask":[]})"
+        << "\n";
+    trace << R"({"type":"write","instance_id":"logical_source","trace_id":"write_a","timestamp_ns":1001,"keys":[401]})"
+          << "\n";
+    trace
+        << R"({"type":"get","instance_id":"logical_source","trace_id":"engine_hit","timestamp_ns":2000,"keys":[401],"input_len":16,"block_mask":[]})"
+        << "\n";
+    trace.close();
+
+    HierarchicalReplayManager manager(config);
+    ASSERT_TRUE(manager.Init());
+    manager.DirectRun();
+    manager.AnalyzeResults();
+
+    std::ifstream csv(root + "/combined/hierarchical_hit_rates.csv");
+    ASSERT_TRUE(csv.is_open());
+    std::ostringstream buffer;
+    buffer << csv.rdbuf();
+    const std::string content = buffer.str();
+    EXPECT_THAT(content, HasSubstr("cold,engine_a,model_l3,1,0,0,0"));
+    EXPECT_THAT(content, HasSubstr("engine_hit,engine_a,model_l3,1,1,0,1"));
+}
+
 TEST_F(HierarchicalReplayManagerTest, SeparatesIndependentPoolInstances) {
     const std::string root = GetTestTempRootPath() + "/hierarchical_replay_multi_pool";
     HierarchicalReplayConfig config;

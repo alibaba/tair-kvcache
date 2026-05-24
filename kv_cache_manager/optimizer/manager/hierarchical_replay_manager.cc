@@ -115,12 +115,17 @@ const std::string &HierarchicalReplayManager::PoolInstanceForEngine(const std::s
 
 void HierarchicalReplayManager::DirectRun() {
     auto traces = StandardTraceLoader::LoadFromFile(config_.trace_file_path());
+    if (config_.engine_scheduling_strategy() == "prefix_hit") {
+        RunTracesWithPrefixHitScheduling(traces);
+        return;
+    }
     ScheduleTraces(traces);
     RunTraces(traces);
 }
 
 void HierarchicalReplayManager::ScheduleTraces(std::vector<std::shared_ptr<OptimizerSchemaTrace>> &traces) const {
-    if (config_.engine_scheduling_strategy() == "preserve_trace") {
+    if (config_.engine_scheduling_strategy() == "preserve_trace" ||
+        config_.engine_scheduling_strategy() == "prefix_hit") {
         return;
     }
     if (config_.engine_scheduling_strategy() != "round_robin") {
@@ -144,6 +149,54 @@ void HierarchicalReplayManager::ScheduleTraces(std::vector<std::shared_ptr<Optim
         }
         trace->set_instance_id(current_engine_instance_id);
     }
+}
+
+void HierarchicalReplayManager::RunTracesWithPrefixHitScheduling(
+    const std::vector<std::shared_ptr<OptimizerSchemaTrace>> &traces) {
+    if (sorted_engine_instance_ids_.empty()) {
+        throw std::runtime_error("prefix_hit scheduling requires at least one engine instance");
+    }
+
+    size_t request_idx = 0;
+    std::string current_engine_instance_id = sorted_engine_instance_ids_.front();
+    for (const auto &trace : traces) {
+        if (!trace) {
+            continue;
+        }
+        if (auto get_trace = std::dynamic_pointer_cast<GetLocationSchemaTrace>(trace)) {
+            current_engine_instance_id =
+                ChoosePrefixHitEngineInstance(get_trace->keys(), get_trace->timestamp_ns(), request_idx);
+            get_trace->set_instance_id(current_engine_instance_id);
+            request_idx++;
+        } else if (auto write_trace = std::dynamic_pointer_cast<WriteCacheSchemaTrace>(trace)) {
+            write_trace->set_instance_id(current_engine_instance_id);
+        }
+        RunTrace(trace);
+    }
+}
+
+std::string HierarchicalReplayManager::ChoosePrefixHitEngineInstance(const std::vector<int64_t> &block_ids,
+                                                                     int64_t timestamp,
+                                                                     size_t request_idx) const {
+    size_t best_match = 0;
+    std::vector<std::string> candidates;
+    for (const auto &instance_id : sorted_engine_instance_ids_) {
+        const size_t match = engine_manager_->PrefixMatchCount(instance_id, block_ids, timestamp);
+        if (match > best_match) {
+            best_match = match;
+            candidates.clear();
+            candidates.push_back(instance_id);
+        } else if (match == best_match) {
+            candidates.push_back(instance_id);
+        }
+    }
+    if (candidates.empty()) {
+        throw std::runtime_error("prefix_hit scheduling has no engine candidates");
+    }
+    if (candidates.size() == 1) {
+        return candidates.front();
+    }
+    return candidates[request_idx % candidates.size()];
 }
 
 void HierarchicalReplayManager::RunTraces(const std::vector<std::shared_ptr<OptimizerSchemaTrace>> &traces) {

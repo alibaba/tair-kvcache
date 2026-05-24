@@ -21,7 +21,8 @@ bool HierarchicalReplayConfig::FromRapidValue(const rapidjson::Value &rapid_valu
     KVCM_JSON_GET_MACRO(rapid_value, "engine_to_pool", engine_to_pool_);
     KVCM_JSON_GET_DEFAULT_MACRO(
         rapid_value, "engine_scheduling_strategy", engine_scheduling_strategy_, std::string("preserve_trace"));
-    if (engine_scheduling_strategy_ != "preserve_trace" && engine_scheduling_strategy_ != "round_robin") {
+    if (engine_scheduling_strategy_ != "preserve_trace" && engine_scheduling_strategy_ != "round_robin" &&
+        engine_scheduling_strategy_ != "prefix_hit") {
         return false;
     }
     return !trace_file_path_.empty() && !output_result_path_.empty() && !engine_to_pool_.empty();

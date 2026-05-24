@@ -12,6 +12,7 @@ bazel run //kv_cache_manager/optimizer:hierarchical_replay_main -- /path/to/hier
 - `pool_config` 是 L3 池化模拟，用同一套 optimizer 组件模拟全局池化实例。
 - `engine_scheduling_strategy=preserve_trace` 时，标准 trace 的 `instance_id` 表示 engine instance。
 - `engine_scheduling_strategy=round_robin` 时，回放前按 get/write pair 轮询分配到 `engine_to_pool` 中的 engine instance；write 跟随前一个 get。
+- `engine_scheduling_strategy=prefix_hit` 时，每个 get 选择当前 L1/L2 前缀命中最长的 engine instance；冷启动或并列时按确定性轮询分配，write 跟随前一个 get。
 - `engine_to_pool` 显式定义每个 engine instance 对应哪个 L3 pool instance；缺失、重复、未知 instance、block_size 不一致都会初始化失败。
 - 多个 engine instance 可以映射到同一个 L3 pool instance；不同 pool instance 之间互相隔离。
 - `get` 先查 engine L1/L2，未命中的后缀再查 L3；engine 已命中的前缀只用于穿过 L3 前缀树，不记录 L3 命中，也不刷新 L3 访问时间。

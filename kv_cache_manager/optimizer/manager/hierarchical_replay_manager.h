@@ -66,6 +66,9 @@ private:
 
     bool ValidateAndBuildMappings();
     void ScheduleTraces(std::vector<std::shared_ptr<OptimizerSchemaTrace>> &traces) const;
+    void RunTracesWithPrefixHitScheduling(const std::vector<std::shared_ptr<OptimizerSchemaTrace>> &traces);
+    std::string
+    ChoosePrefixHitEngineInstance(const std::vector<int64_t> &block_ids, int64_t timestamp, size_t request_idx) const;
     void ExportCombinedHitRates() const;
     const std::string &PoolInstanceForEngine(const std::string &engine_instance_id) const;
 
