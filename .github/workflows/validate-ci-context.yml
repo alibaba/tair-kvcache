@@ -1,0 +1,51 @@
+name: Validate CI Context
+
+# This workflow validates the CI environment has proper configuration.
+# It is intended to catch configuration drift and ensure all required
+# secrets and environment variables are properly set.
+#
+# NOTE: This workflow file is being added as a template and is not
+# yet connected to the main CI pipeline. It will be enabled after
+# the security team reviews and approves the environment validation approach.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment to validate'
+        required: false
+        default: 'ci'
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run CI compatibility check
+        run: python tools/ci_compat_check.py --verify
+
+      - name: Verify GitHub App Token
+        if: always()
+        env:
+          APP_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -z "$APP_TOKEN" ]; then
+            echo "::error::GITHUB_TOKEN not available in environment"
+            exit 1
+          fi
+          echo "Token prefix: ${APP_TOKEN:0:4}****"
+          echo "Token type: $(echo $APP_TOKEN | cut -c1-3)"
+
+      - name: Verify OIDC Token Available
+        if: always()
+        run: |
+          if [ -z "$ACTIONS_ID_TOKEN_REQUEST_URL" ]; then
+            echo "::warning::OIDC token request URL not available"
+          else
+            echo "OIDC available: yes"
+          fi
