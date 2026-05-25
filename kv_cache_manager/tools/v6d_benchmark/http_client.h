@@ -26,12 +26,18 @@ public:
                      const std::vector<JsonDocument> &events,
                      JsonDocument &response);
 
-    // GetCacheLocation API
+    // GetCacheLocation API (单副本，旧接口)
     bool GetCacheLocation(const std::string &trace_id,
                           const std::string &instance_id,
                           QueryType query_type,
                           const std::vector<int64_t> &keys,
                           JsonDocument &response);
+
+    // GetBatchCacheLocations API (多副本，V6D 场景推荐)
+    bool GetBatchCacheLocations(const std::string &trace_id,
+                                const std::string &instance_id,
+                                const std::vector<int64_t> &keys,
+                                JsonDocument &response);
 
     // RegisterInstance API (Admin)
     bool RegisterInstance(const std::string &trace_id,

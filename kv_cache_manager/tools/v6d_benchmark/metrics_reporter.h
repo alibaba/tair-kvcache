@@ -46,6 +46,10 @@ struct BenchmarkMetrics {
     OpMetrics delete_block_metrics;
     OpMetrics query_metrics;
 
+    // Query 子类型统计（按 API 区分）
+    OpMetrics batch_query_metrics;  // GetBatchCacheLocations
+    OpMetrics single_query_metrics; // GetCacheLocation
+
     // 验证统计
     std::atomic<int64_t> verification_passed{0};
     std::atomic<int64_t> verification_failed{0};
@@ -90,7 +94,9 @@ private:
                           double query_avg_latency,
                           double delete_avg_latency,
                           double delta_verify_pass,
-                          double delta_verify_fail);
+                          double delta_verify_fail,
+                          double batch_query_avg_latency,
+                          double single_query_avg_latency);
     void CalculatePercentiles(const std::vector<int64_t> &samples, double &p50, double &p99, double &p999);
 
     BenchmarkConfig config_;

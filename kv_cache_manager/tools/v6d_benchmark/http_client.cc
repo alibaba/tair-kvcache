@@ -140,10 +140,10 @@ bool KVCMHttpClient::GetCacheLocation(const std::string &trace_id,
     }
     request.AddMember("query_type", rapidjson::Value(query_type_str.c_str(), allocator), allocator);
 
-    // Keys (应该是block_keys)
+    // block_keys: proto repeated int64, JSON 中用 int64 数值表达
     rapidjson::Value keys_array(rapidjson::kArrayType);
     for (int64_t key : keys) {
-        keys_array.PushBack(rapidjson::Value(std::to_string(key).c_str(), allocator), allocator);
+        keys_array.PushBack(rapidjson::Value(key), allocator);
     }
     request.AddMember("block_keys", keys_array, allocator);
 
@@ -153,6 +153,33 @@ bool KVCMHttpClient::GetCacheLocation(const std::string &trace_id,
     request.AddMember("block_mask", block_mask, allocator);
 
     return PostJson("/api/getCacheLocation", request, response);
+}
+
+bool KVCMHttpClient::GetBatchCacheLocations(const std::string &trace_id,
+                                            const std::string &instance_id,
+                                            const std::vector<int64_t> &keys,
+                                            JsonDocument &response) {
+    JsonDocument request;
+    request.SetObject();
+    auto &allocator = request.GetAllocator();
+
+    request.AddMember("trace_id", rapidjson::Value(trace_id.c_str(), allocator), allocator);
+    request.AddMember("instance_id", rapidjson::Value(instance_id.c_str(), allocator), allocator);
+    request.AddMember("query_type", rapidjson::Value("QT_BATCH_GET", allocator), allocator);
+
+    // block_keys: repeated int64
+    rapidjson::Value keys_array(rapidjson::kArrayType);
+    for (int64_t key : keys) {
+        keys_array.PushBack(rapidjson::Value(key), allocator);
+    }
+    request.AddMember("block_keys", keys_array, allocator);
+
+    // block_mask (必需字段)
+    rapidjson::Value block_mask(rapidjson::kObjectType);
+    block_mask.AddMember("offset", 0, allocator);
+    request.AddMember("block_mask", block_mask, allocator);
+
+    return PostJson("/api/getBatchCacheLocations", request, response);
 }
 
 bool KVCMHttpClient::RegisterInstance(const std::string &trace_id,

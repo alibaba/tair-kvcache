@@ -682,8 +682,12 @@ void V6DBenchmark::WorkerThread(int thread_id) {
         } else if (operation == "query") {
             std::vector<DatasetEntry *> entries;
             PickRandomEntriesInRange(config_.query_batch_size, start, stride, entries);
-            success = QueryLocationWithEntries(client, entries);
+            // 按 batch_query_ratio 随机决定使用 GetBatchCacheLocations 还是 GetCacheLocation
+            bool use_batch = (op_dist(gen) < config_.batch_query_ratio);
+            success = QueryLocationWithEntries(client, entries, use_batch);
             bytes = 0;
+            // 细分 query 子类型，用于独立的 metrics 上报
+            operation = use_batch ? "query_batch" : "query_single";
         } else if (operation == "delete") {
             std::vector<DatasetEntry *> entries;
             PickRandomEntriesInRangeByExist(config_.batch_size, start, stride, /*want_exists=*/true, entries);
@@ -807,7 +811,9 @@ bool V6DBenchmark::QueryLocation(KVCMHttpClient &client) {
     return QueryLocationWithEntries(client, entries);
 }
 
-bool V6DBenchmark::QueryLocationWithEntries(KVCMHttpClient &client, const std::vector<DatasetEntry *> &entries) {
+bool V6DBenchmark::QueryLocationWithEntries(KVCMHttpClient &client,
+                                            const std::vector<DatasetEntry *> &entries,
+                                            bool use_batch) {
     if (entries.empty()) {
         return true;
     }
@@ -818,9 +824,10 @@ bool V6DBenchmark::QueryLocationWithEntries(KVCMHttpClient &client, const std::v
     }
 
     rapidjson::Document response;
-    std::string trace_id = "query_batch_" + std::to_string(query_keys[0]);
-    bool success =
-        client.GetCacheLocation(trace_id, config_.instance_id, QueryType::QT_BATCH_GET, query_keys, response);
+    std::string trace_id = (use_batch ? "query_batch_" : "query_single_") + std::to_string(query_keys[0]);
+    bool success = use_batch
+                       ? client.GetBatchCacheLocations(trace_id, config_.instance_id, query_keys, response)
+                       : client.GetCacheLocation(trace_id, config_.instance_id, QueryType::QT_BATCH_GET, query_keys, response);
 
     if (!success && ShouldEmitFailLog(config_.max_fail_log_per_sec)) {
         if (config_.verbose_fail_log) {
@@ -924,8 +931,17 @@ void V6DBenchmark::BuildBlockAddEvent(rapidjson::Document &event,
 
     rapidjson::Value params(rapidjson::kObjectType);
     params.AddMember("block_key", rapidjson::Value(std::to_string(block_key).c_str(), allocator), allocator);
-    params.AddMember("uri", rapidjson::Value(uri.c_str(), allocator), allocator);
     params.AddMember("medium", rapidjson::Value(medium.c_str(), allocator), allocator);
+
+    // specs 字段：服务端要求非空（uri 字段已 deprecated）。
+    // 按 RegisterInstance 注册的 location_spec_infos 生成对应的 spec 列表。
+    rapidjson::Value specs_array(rapidjson::kArrayType);
+    rapidjson::Value spec(rapidjson::kObjectType);
+    spec.AddMember("name", rapidjson::Value("tp0", allocator), allocator);
+    spec.AddMember("uri", rapidjson::Value(uri.c_str(), allocator), allocator);
+    specs_array.PushBack(spec, allocator);
+    params.AddMember("specs", specs_array, allocator);
+
     event.AddMember("block_add", params, allocator);
 }
 

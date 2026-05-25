@@ -213,7 +213,8 @@ void BenchmarkMetricsReporter::RecordRequest(const std::string &op_type,
             std::unique_lock lock(metrics_.add_block_metrics.latency_mutex);
             metrics_.add_block_metrics.latency_samples.push_back(latency_us);
         }
-    } else if (op_type == "query") {
+    } else if (op_type == "query_batch" || op_type == "query_single") {
+        // 总 query 统计（两种子类型合并）
         metrics_.query_metrics.count.fetch_add(1);
         if (success)
             metrics_.query_metrics.success.fetch_add(1);
@@ -223,6 +224,18 @@ void BenchmarkMetricsReporter::RecordRequest(const std::string &op_type,
         {
             std::unique_lock lock(metrics_.query_metrics.latency_mutex);
             metrics_.query_metrics.latency_samples.push_back(latency_us);
+        }
+        // 分 query 子类型统计
+        auto &sub_metrics = (op_type == "query_batch") ? metrics_.batch_query_metrics : metrics_.single_query_metrics;
+        sub_metrics.count.fetch_add(1);
+        if (success)
+            sub_metrics.success.fetch_add(1);
+        else
+            sub_metrics.failed.fetch_add(1);
+        sub_metrics.total_latency_us.fetch_add(latency_us);
+        {
+            std::unique_lock lock(sub_metrics.latency_mutex);
+            sub_metrics.latency_samples.push_back(latency_us);
         }
     } else if (op_type == "delete") {
         metrics_.delete_block_metrics.count.fetch_add(1);
@@ -306,6 +319,10 @@ void BenchmarkMetricsReporter::ReportLoop() {
     int64_t last_add_latency_us = 0;
     int64_t last_query_latency_us = 0;
     int64_t last_delete_latency_us = 0;
+    int64_t last_batch_query_count = 0;
+    int64_t last_single_query_count = 0;
+    int64_t last_batch_query_latency_us = 0;
+    int64_t last_single_query_latency_us = 0;
 
     while (running_.load()) {
         // 等待报告间隔
@@ -364,7 +381,21 @@ void BenchmarkMetricsReporter::ReportLoop() {
         double query_avg_latency = delta_query > 0 ? static_cast<double>(delta_query_latency) / delta_query : 0;
         double delete_avg_latency = delta_delete > 0 ? static_cast<double>(delta_delete_latency) / delta_delete : 0;
 
-        // 上报到 Kmonitor（传递 per-interval 值，含分算子 RT）
+        // Query 子类型增量
+        int64_t cur_batch_query = snapshot.batch_query_metrics.count.load();
+        int64_t cur_single_query = snapshot.single_query_metrics.count.load();
+        int64_t delta_batch_query = cur_batch_query - last_batch_query_count;
+        int64_t delta_single_query = cur_single_query - last_single_query_count;
+        int64_t cur_batch_query_latency = snapshot.batch_query_metrics.total_latency_us.load();
+        int64_t cur_single_query_latency = snapshot.single_query_metrics.total_latency_us.load();
+        int64_t delta_batch_query_latency = cur_batch_query_latency - last_batch_query_latency_us;
+        int64_t delta_single_query_latency = cur_single_query_latency - last_single_query_latency_us;
+        double batch_query_qps = elapsed > 0 ? static_cast<double>(delta_batch_query) / elapsed : 0;
+        double single_query_qps = elapsed > 0 ? static_cast<double>(delta_single_query) / elapsed : 0;
+        double batch_query_avg_latency = delta_batch_query > 0 ? static_cast<double>(delta_batch_query_latency) / delta_batch_query : 0;
+        double single_query_avg_latency = delta_single_query > 0 ? static_cast<double>(delta_single_query_latency) / delta_single_query : 0;
+
+        // 上报到 Kmonitor
         ReportToKmonitor(snapshot,
                          elapsed,
                          current_qps,
@@ -378,11 +409,13 @@ void BenchmarkMetricsReporter::ReportLoop() {
                          query_avg_latency,
                          delete_avg_latency,
                          static_cast<double>(delta_vpass),
-                         static_cast<double>(delta_vfail));
+                         static_cast<double>(delta_vfail),
+                         batch_query_avg_latency,
+                         single_query_avg_latency);
 
         // 打印日志
         KVCM_LOG_INFO("[Metrics] QPS=%.2f, AvgLatency=%.0fus, SuccessRate=%.2f%%, Bandwidth=%.2fMbps, "
-                      "AddQPS=%.2f, QueryQPS=%.2f, DeleteQPS=%.2f, "
+                      "AddQPS=%.2f, QueryQPS=%.2f(batch=%.2f,single=%.2f), DeleteQPS=%.2f, "
                       "Verification: Passed=%ld, Failed=%ld",
                       current_qps,
                       avg_latency,
@@ -390,6 +423,8 @@ void BenchmarkMetricsReporter::ReportLoop() {
                       bandwidth_mbps,
                       add_qps,
                       query_qps,
+                      batch_query_qps,
+                      single_query_qps,
                       delete_qps,
                       delta_vpass,
                       delta_vfail);
@@ -408,6 +443,10 @@ void BenchmarkMetricsReporter::ReportLoop() {
         last_add_latency_us = cur_add_latency;
         last_query_latency_us = cur_query_latency;
         last_delete_latency_us = cur_delete_latency;
+        last_batch_query_count = cur_batch_query;
+        last_single_query_count = cur_single_query;
+        last_batch_query_latency_us = cur_batch_query_latency;
+        last_single_query_latency_us = cur_single_query_latency;
     }
 }
 
@@ -424,7 +463,9 @@ void BenchmarkMetricsReporter::ReportToKmonitor(const BenchmarkMetrics &snapshot
                                                 double query_avg_latency,
                                                 double delete_avg_latency,
                                                 double delta_verify_pass,
-                                                double delta_verify_fail) {
+                                                double delta_verify_fail,
+                                                double batch_query_avg_latency,
+                                                double single_query_avg_latency) {
     if (!kmonitor_ || !config_.enable_kmonitor) {
         return;
     }
@@ -467,31 +508,46 @@ void BenchmarkMetricsReporter::ReportToKmonitor(const BenchmarkMetrics &snapshot
         static const kmonitor::MetricsTags tags = make_tags(nullptr);
         static const kmonitor::MetricsTags tags_add = make_tags("add");
         static const kmonitor::MetricsTags tags_getLocation = make_tags("getLocation");
+        static const kmonitor::MetricsTags tags_getBatchLocations = make_tags("getBatchLocations");
         static const kmonitor::MetricsTags tags_delete = make_tags("delete");
+
+        // Query 子类型延迟百分位
+        auto op_batch_query_samples = get_op_samples(snapshot.batch_query_metrics);
+        auto op_single_query_samples = get_op_samples(snapshot.single_query_metrics);
+        double batch_query_p50 = 0, batch_query_p99 = 0, batch_query_p999 = 0;
+        double single_query_p50 = 0, single_query_p99 = 0, single_query_p999 = 0;
+        if (!op_batch_query_samples.empty())
+            CalculatePercentiles(op_batch_query_samples, batch_query_p50, batch_query_p99, batch_query_p999);
+        if (!op_single_query_samples.empty())
+            CalculatePercentiles(op_single_query_samples, single_query_p50, single_query_p99, single_query_p999);
 
         // 总QPS
         if (qps_metrics)
             qps_metrics->Report(&tags, current_qps);
-        // 分算子平均时延（RT按 op_type 区分）
+        // 分算子平均时延（RT按 op_type 区分，query 拆分为 getLocation + getBatchLocations）
         if (avg_latency_metrics) {
             avg_latency_metrics->Report(&tags_add, add_avg_latency);
-            avg_latency_metrics->Report(&tags_getLocation, query_avg_latency);
+            avg_latency_metrics->Report(&tags_getLocation, single_query_avg_latency);
+            avg_latency_metrics->Report(&tags_getBatchLocations, batch_query_avg_latency);
             avg_latency_metrics->Report(&tags_delete, delete_avg_latency);
         }
         // 分算子 p50/p99/p999（RT按 op_type 区分）
         if (p50_latency_metrics) {
             p50_latency_metrics->Report(&tags_add, add_p50);
-            p50_latency_metrics->Report(&tags_getLocation, query_p50);
+            p50_latency_metrics->Report(&tags_getLocation, single_query_p50);
+            p50_latency_metrics->Report(&tags_getBatchLocations, batch_query_p50);
             p50_latency_metrics->Report(&tags_delete, delete_p50);
         }
         if (p99_latency_metrics) {
             p99_latency_metrics->Report(&tags_add, add_p99);
-            p99_latency_metrics->Report(&tags_getLocation, query_p99);
+            p99_latency_metrics->Report(&tags_getLocation, single_query_p99);
+            p99_latency_metrics->Report(&tags_getBatchLocations, batch_query_p99);
             p99_latency_metrics->Report(&tags_delete, delete_p99);
         }
         if (p999_latency_metrics) {
             p999_latency_metrics->Report(&tags_add, add_p999);
-            p999_latency_metrics->Report(&tags_getLocation, query_p999);
+            p999_latency_metrics->Report(&tags_getLocation, single_query_p999);
+            p999_latency_metrics->Report(&tags_getBatchLocations, batch_query_p999);
             p999_latency_metrics->Report(&tags_delete, delete_p999);
         }
         // 通用指标
@@ -533,6 +589,14 @@ void BenchmarkMetricsReporter::ReportToKmonitor(const BenchmarkMetrics &snapshot
         {
             std::unique_lock lock(const_cast<std::shared_mutex &>(snapshot.delete_block_metrics.latency_mutex));
             const_cast<BenchmarkMetrics::OpMetrics &>(snapshot.delete_block_metrics).latency_samples.clear();
+        }
+        {
+            std::unique_lock lock(const_cast<std::shared_mutex &>(snapshot.batch_query_metrics.latency_mutex));
+            const_cast<BenchmarkMetrics::OpMetrics &>(snapshot.batch_query_metrics).latency_samples.clear();
+        }
+        {
+            std::unique_lock lock(const_cast<std::shared_mutex &>(snapshot.single_query_metrics.latency_mutex));
+            const_cast<BenchmarkMetrics::OpMetrics &>(snapshot.single_query_metrics).latency_samples.clear();
         }
     } catch (const std::exception &e) { KVCM_LOG_WARN("Failed to report metrics to kmonitor: %s", e.what()); }
 }
