@@ -42,6 +42,10 @@ public:
                                    const KeyVector &keys,
                                    CacheLocationVector &out_locations,
                                    SelectLocationPolicy *policy) const;
+    ErrorCode BatchGetMultiLocations(RequestContext *request_context,
+                                     const KeyVector &keys,
+                                     LocationsPerKey &out_locations,
+                                     SelectLocationPolicy *policy) const;
     ErrorCode ReverseRollSlideWindowMatch(RequestContext *request_context,
                                           const KeyVector &keys,
                                           int32_t sw_size,

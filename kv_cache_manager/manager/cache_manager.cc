@@ -397,6 +397,85 @@ CacheManager::GetCacheLocation(RequestContext *request_context,
     return {ec, CacheLocationViewVecWrapper(std::move(cache_locations))};
 }
 
+void CacheManager::FillEmptyLocationSpecs(RequestContext *request_context,
+                                          const std::string &instance_id,
+                                          CacheLocationVector &locations) {
+    auto instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
+    if (instance_info == nullptr) {
+        return;
+    }
+    for (auto &location : locations) {
+        if (location.spec_size() == 0) {
+            location.set_spec_size(instance_info->location_spec_infos().size());
+            for (auto &spec_info : instance_info->location_spec_infos()) {
+                location.push_location_spec(LocationSpec(spec_info.name(), ""));
+            }
+        }
+    }
+}
+
+std::pair<ErrorCode, BatchLocationsView>
+CacheManager::GetBatchCacheLocations(RequestContext *request_context,
+                                     const std::string &instance_id,
+                                     QueryType query_type,
+                                     const KeyVector &keys,
+                                     const TokenIdsVector &tokens,
+                                     const BlockMask &block_mask,
+                                     int32_t sw_size,
+                                     const std::vector<std::string> &location_spec_names) {
+    SPAN_TRACER(request_context);
+    const std::string &trace_id = request_context->trace_id();
+    auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+    auto [ec, meta_searcher] = CheckInputAndGetMetaSearcher(request_context, instance_id, keys, tokens);
+    RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, BatchLocationsView, "check input or get meta searcher failed");
+    if (query_type != QueryType::QT_BATCH_GET) {
+        RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, EC_BADARGS, BatchLocationsView, "GetBatchCacheLocations only supports QT_BATCH_GET");
+    }
+
+    auto policy = genSelectLocationPolicy(request_context, instance_id);
+    if (policy == nullptr) {
+        RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, EC_ERROR, BatchLocationsView, "gen select location policy failed");
+    }
+
+    KeyVector query_keys = keys;
+    if (keys.empty()) {
+        auto [ec_temp, block_size] = GetBlockSize(request_context, instance_id);
+        RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec_temp, BatchLocationsView, "get block_size failed");
+        query_keys = GenKeyVector(tokens, block_size);
+    }
+
+    auto query_scope = KVCM_METRICS_COLLECTOR_CHRONO_SCOPE(service_metrics_collector, ManagerBatchGet);
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, request_key_count, query_keys.size());
+
+    LocationsPerKey locations_per_key;
+    ec = meta_searcher->BatchGetMultiLocations(request_context, query_keys, locations_per_key, policy.get());
+    query_scope = ChronoScopeGuard{};
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, prefix_match_len, locations_per_key.size());
+    RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, BatchLocationsView, "batch get multi locations failed");
+
+    for (auto &key_locs : locations_per_key) {
+        FillEmptyLocationSpecs(request_context, instance_id, key_locs);
+    }
+    for (auto &key_locs : locations_per_key) {
+        FilterLocationSpecByName(key_locs, location_spec_names);
+    }
+
+    auto cache_get_event = std::make_shared<CacheGetEvent>(instance_id);
+    cache_get_event->SetEventTriggerTime();
+    cache_get_event->SetAddtionalArgs(
+        QueryTypeToString(query_type), query_keys, tokens, block_mask, sw_size, location_spec_names);
+    if (event_manager_) {
+        event_manager_->Publish(cache_get_event);
+    }
+
+    BatchLocationsView result;
+    result.reserve(locations_per_key.size());
+    for (auto &key_locs : locations_per_key) {
+        result.emplace_back(std::move(key_locs));
+    }
+    return {EC_OK, std::move(result)};
+}
+
 std::pair<ErrorCode, int64_t> CacheManager::GetCacheLocationLen(RequestContext *request_context,
                                                                 const std::string &instance_id,
                                                                 QueryType query_type,
