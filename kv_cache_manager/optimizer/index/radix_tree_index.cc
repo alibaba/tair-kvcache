@@ -297,6 +297,34 @@ size_t RadixTreeIndex::PrefixMatchCount(const std::vector<int64_t> &block_keys, 
     return matched;
 }
 
+std::vector<int64_t> RadixTreeIndex::PrefixPathForBlock(const BlockEntry *block) const {
+    if (!block || !block->owner_node) {
+        return {};
+    }
+
+    std::vector<const RadixTreeNode *> nodes;
+    const RadixTreeNode *node = block->owner_node;
+    while (node && node->parent) {
+        nodes.push_back(node);
+        node = node->parent;
+    }
+    std::reverse(nodes.begin(), nodes.end());
+
+    std::vector<int64_t> path;
+    for (const auto *path_node : nodes) {
+        for (const auto &entry : path_node->blocks) {
+            if (!entry) {
+                continue;
+            }
+            path.push_back(entry->key);
+            if (entry.get() == block) {
+                return path;
+            }
+        }
+    }
+    return path;
+}
+
 void RadixTreeIndex::CleanEmptyBlocks(const std::vector<BlockEntry *> &blocks,
                                       int64_t eviction_timestamp,
                                       bool use_logical_expire_time) {

@@ -71,6 +71,11 @@ private:
     ChoosePrefixHitEngineInstance(const std::vector<int64_t> &block_ids, int64_t timestamp, size_t request_idx) const;
     void ExportCombinedHitRates() const;
     const std::string &PoolInstanceForEngine(const std::string &engine_instance_id) const;
+    void WriteL2L3Sequence(const std::string &pool_instance_id,
+                           const std::string &trace_id,
+                           int64_t timestamp,
+                           const std::vector<int64_t> &block_ids,
+                           int64_t ttl_us);
 
     HierarchicalReplayConfig config_;
     std::unique_ptr<OptimizerManager> engine_manager_;
@@ -80,6 +85,7 @@ private:
     std::vector<std::string> sorted_engine_instance_ids_;
     std::vector<CombinedReadRecord> combined_read_records_;
     std::vector<CombinedWriteRecord> combined_write_records_;
+    std::unordered_map<std::string, std::unordered_map<int64_t, size_t>> l2_l3_access_counts_;
 };
 
 } // namespace kv_cache_manager

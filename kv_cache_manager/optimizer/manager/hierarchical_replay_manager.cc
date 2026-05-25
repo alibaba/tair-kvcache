@@ -129,6 +129,16 @@ const std::string &HierarchicalReplayManager::PoolInstanceForEngine(const std::s
     return it->second;
 }
 
+void HierarchicalReplayManager::WriteL2L3Sequence(const std::string &pool_instance_id,
+                                                  const std::string &trace_id,
+                                                  int64_t timestamp,
+                                                  const std::vector<int64_t> &block_ids,
+                                                  int64_t ttl_us) {
+    if (!block_ids.empty()) {
+        pool_manager_->WriteCacheWithTtlUs(pool_instance_id, trace_id, timestamp, block_ids, ttl_us);
+    }
+}
+
 void HierarchicalReplayManager::DirectRun() {
     auto traces = StandardTraceLoader::LoadFromFile(config_.trace_file_path());
     if (config_.engine_scheduling_strategy() == "prefix_hit") {
@@ -262,12 +272,45 @@ HierarchicalGetCacheLocationRes HierarchicalReplayManager::GetCacheLocation(cons
     const size_t engine_hit_blocks =
         std::min(static_cast<size_t>(std::max<int64_t>(engine_res.kvcm_hit_length, 0)), block_ids.size());
 
+    const auto &l2_l3_strategy = config_.l2_l3_strategy();
+    if (engine_hit_blocks > 0) {
+        std::vector<int64_t> engine_hit_prefix(block_ids.begin(), block_ids.begin() + engine_hit_blocks);
+        if (l2_l3_strategy.access_propagation_enabled()) {
+            pool_manager_->TouchCacheLocation(pool_instance_id, timestamp, engine_hit_prefix);
+        }
+        if (l2_l3_strategy.write_mode() == TierWriteMode::WRITE_THROUGH_SELECTIVE) {
+            size_t selected_prefix_len = 0;
+            auto &access_counts = l2_l3_access_counts_[engine_instance_id];
+            for (size_t i = 0; i < engine_hit_blocks; ++i) {
+                const size_t count = ++access_counts[block_ids[i]];
+                if (count == l2_l3_strategy.selective_write_threshold()) {
+                    selected_prefix_len = i + 1;
+                }
+            }
+            if (selected_prefix_len > 0) {
+                std::vector<int64_t> selected_prefix(block_ids.begin(), block_ids.begin() + selected_prefix_len);
+                WriteL2L3Sequence(pool_instance_id, trace_id, timestamp, selected_prefix, 0);
+            }
+        }
+    }
+
     size_t pool_hit_blocks = 0;
     if (engine_hit_blocks < block_ids.size()) {
         const auto pool_res = pool_manager_->GetCacheLocationAfterPrefix(
             pool_instance_id, trace_id, timestamp, block_ids, engine_hit_blocks, input_len);
         pool_hit_blocks = std::min(static_cast<size_t>(std::max<int64_t>(pool_res.kvcm_hit_length, 0)),
                                    block_ids.size() - engine_hit_blocks);
+        if (pool_hit_blocks > 0 && l2_l3_strategy.promote_enabled()) {
+            std::vector<int64_t> promoted_prefix(block_ids.begin(),
+                                                 block_ids.begin() + engine_hit_blocks + pool_hit_blocks);
+            auto promote_res =
+                engine_manager_->WriteCacheWithTtlUs(engine_instance_id, trace_id, timestamp, promoted_prefix, 0);
+            if (l2_l3_strategy.write_mode() == TierWriteMode::CASCADING) {
+                for (const auto &sequence : promote_res.evicted_key_sequences) {
+                    WriteL2L3Sequence(pool_instance_id, trace_id, timestamp, sequence, 0);
+                }
+            }
+        }
     }
 
     CombinedReadRecord record;
@@ -310,7 +353,14 @@ WriteCacheRes HierarchicalReplayManager::WriteCacheWithTtlUs(const std::string &
     const std::string &pool_instance_id = PoolInstanceForEngine(engine_instance_id);
 
     auto engine_res = engine_manager_->WriteCacheWithTtlUs(engine_instance_id, trace_id, timestamp, block_ids, ttl_us);
-    pool_manager_->WriteCacheWithTtlUs(pool_instance_id, trace_id, timestamp, block_ids, ttl_us);
+    const auto &l2_l3_strategy = config_.l2_l3_strategy();
+    if (l2_l3_strategy.write_mode() == TierWriteMode::WRITE_THROUGH) {
+        WriteL2L3Sequence(pool_instance_id, trace_id, timestamp, block_ids, ttl_us);
+    } else if (l2_l3_strategy.write_mode() == TierWriteMode::CASCADING) {
+        for (const auto &sequence : engine_res.evicted_key_sequences) {
+            WriteL2L3Sequence(pool_instance_id, trace_id, timestamp, sequence, ttl_us);
+        }
+    }
 
     CombinedWriteRecord record;
     record.timestamp_ns = timestamp;

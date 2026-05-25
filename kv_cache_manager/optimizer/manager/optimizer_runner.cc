@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <limits>
+#include <set>
 #include <stdexcept>
 #include <utility>
 #include <variant>
@@ -253,11 +254,41 @@ void OptimizerRunner::HandleGetLocation(const GetLocationSchemaTrace &trace, siz
                      block_size);
 }
 
-void OptimizerRunner::HandleWriteCache(const WriteCacheSchemaTrace &trace) {
-    std::string instance_id = trace.instance_id();
+void OptimizerRunner::TouchGetLocation(const std::string &instance_id,
+                                       int64_t timestamp,
+                                       const std::vector<int64_t> &block_ids) {
+    if (block_ids.empty()) {
+        return;
+    }
     auto indexer = GetIndexer(instance_id);
     if (!indexer) {
         return;
+    }
+
+    auto expired_evicted_blocks = indexer_manager_->EvictExpiredBeforeAccess(instance_id, timestamp);
+    indexer_manager_->CleanEvictedBlocks(expired_evicted_blocks, timestamp, true);
+
+    bool refresh_ttl_on_read = true;
+    auto it = instance_ttl_refresh_on_read_.find(instance_id);
+    if (it != instance_ttl_refresh_on_read_.end()) {
+        refresh_ttl_on_read = it->second;
+    }
+    indexer->PrefixQuery(block_ids, BlockMaskVector{}, timestamp, nullptr, refresh_ttl_on_read);
+    if (indexer->ConsumeReadTriggeredTierWrite()) {
+        auto capacity_evicted_blocks = indexer_manager_->CheckAndEvict(instance_id, timestamp);
+        indexer_manager_->CleanEvictedBlocks(capacity_evicted_blocks, timestamp);
+    }
+}
+
+WriteRecord OptimizerRunner::HandleWriteCache(const WriteCacheSchemaTrace &trace) {
+    WriteRecord record;
+    record.timestamp_ns = trace.timestamp_ns();
+    record.trace_id = trace.trace_id();
+
+    std::string instance_id = trace.instance_id();
+    auto indexer = GetIndexer(instance_id);
+    if (!indexer) {
+        return record;
     }
 
     // 写请求前统一清理过期 block，并做节点清理（TTL 使用逻辑过期时刻记录）
@@ -272,6 +303,15 @@ void OptimizerRunner::HandleWriteCache(const WriteCacheSchemaTrace &trace) {
 
     auto result = indexer->InsertOnly(trace.keys(), trace.timestamp_ns(), effective_ttl_ns);
     auto capacity_evicted_blocks = indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_ns());
+    std::set<std::vector<int64_t>> evicted_paths;
+    for (const auto &[_, blocks] : capacity_evicted_blocks) {
+        for (auto *block : blocks) {
+            auto path = indexer->PrefixPathForBlock(block);
+            if (!path.empty()) {
+                evicted_paths.insert(std::move(path));
+            }
+        }
+    }
     indexer_manager_->CleanEvictedBlocks(capacity_evicted_blocks, trace.timestamp_ns());
     bool evicted = !capacity_evicted_blocks.empty();
     if (evicted) {
@@ -280,11 +320,10 @@ void OptimizerRunner::HandleWriteCache(const WriteCacheSchemaTrace &trace) {
                        instance_id.c_str());
     }
 
-    WriteRecord record;
-    record.timestamp_ns = trace.timestamp_ns();
     record.write_blocks = trace.keys().size();
     record.newly_inserted_blocks = result.inserted_keys.size();
-    record.trace_id = trace.trace_id();
+    record.evicted_key_sequences.assign(evicted_paths.begin(), evicted_paths.end());
     stats_collector_->OnWriteComplete(instance_id, record);
+    return record;
 }
 } // namespace kv_cache_manager

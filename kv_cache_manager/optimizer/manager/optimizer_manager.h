@@ -50,6 +50,8 @@ public:
                                                     const std::vector<int64_t> &block_ids,
                                                     size_t prefix_block_count,
                                                     const int64_t input_len);
+    void
+    TouchCacheLocation(const std::string &instance_id, const int64_t timestamp, const std::vector<int64_t> &block_ids);
     size_t
     PrefixMatchCount(const std::string &instance_id, const std::vector<int64_t> &block_ids, int64_t timestamp) const;
     void AnalyzeResults();

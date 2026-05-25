@@ -64,6 +64,7 @@ public:
     void SetStatsCollector(std::shared_ptr<StatsCollector> collector) { stats_collector_ = collector; }
 
     const std::vector<std::string> &GetTierNames() const { return tier_names_; }
+    std::vector<int64_t> PrefixPathForBlock(const BlockEntry *block) const;
 
     // 导出前缀树用于可视化
     struct RadixTreeExportNode {

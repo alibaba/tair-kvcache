@@ -34,9 +34,10 @@ struct ReadRecord {
 };
 
 struct WriteRecord {
-    int64_t timestamp_ns;
-    size_t write_blocks;          // 请求写入的 block 总数（含已存在的）
-    size_t newly_inserted_blocks; // 实际新插入的 block 数（不含已存在的）
+    int64_t timestamp_ns = 0;
+    size_t write_blocks = 0;          // 请求写入的 block 总数（含已存在的）
+    size_t newly_inserted_blocks = 0; // 实际新插入的 block 数（不含已存在的）
+    std::vector<std::vector<int64_t>> evicted_key_sequences;
 
     std::string trace_id; // 当前 trace 标识
 };

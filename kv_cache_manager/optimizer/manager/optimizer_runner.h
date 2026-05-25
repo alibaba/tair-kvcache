@@ -32,7 +32,8 @@ public:
 
 public:
     void HandleGetLocation(const GetLocationSchemaTrace &trace, size_t access_start_offset = 0);
-    void HandleWriteCache(const WriteCacheSchemaTrace &trace);
+    void TouchGetLocation(const std::string &instance_id, int64_t timestamp, const std::vector<int64_t> &block_ids);
+    WriteRecord HandleWriteCache(const WriteCacheSchemaTrace &trace);
 
 private:
     struct PendingWrite {
