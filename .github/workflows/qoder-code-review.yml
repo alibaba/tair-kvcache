@@ -68,6 +68,31 @@ jobs:
           # The PR diff is read through GitHub MCP in the Qoder review step.
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
+
+      - name: Prepare Qoder MCP config
+        shell: bash
+        env:
+          QODER_MCP_CONFIG: ${{ runner.temp }}/qoder-mcp.json
+        run: |
+          set -euo pipefail
+
+          jq -n \
+            --arg cmd "${HOME}/.local/bin/qoder-github-mcp-server" \
+            '{
+              mcpServers: {
+                qoder_github: {
+                  command: $cmd,
+                  args: ["stdio"],
+                  env: {
+                    GITHUB_TOKEN: "${GITHUB_TOKEN}",
+                    GITHUB_REPOSITORY: "${GITHUB_REPOSITORY}"
+                  },
+                  type: "stdio"
+                }
+              }
+            }' > "${QODER_MCP_CONFIG}"
+          chmod 600 "${QODER_MCP_CONFIG}"
+
       - name: Run Qoder Code Review
         id: qoder
         timeout-minutes: 30
@@ -90,6 +115,8 @@ jobs:
             - If a previous Review Summary already exists and this review has no substantial new findings beyond what was already covered, you may skip the full Summary template entirely. In this case, either omit the summary or provide just 1-2 sentences briefly noting any incremental observations.
           enable_qoder_github_mcp: true
           flags: |
+            --mcp-config ${{ runner.temp }}/qoder-mcp.json
+            --strict-mcp-config
             --permission-mode bypass_permissions
             ${{ runner.debug == '1' && '--debug' || '' }}
 
