@@ -79,7 +79,7 @@ private:
     // 旧版：在全 dataset 中随机抽 query keys；保留作为向后兼容入口，但 worker 不应再调用它。
     bool QueryLocation(KVCMHttpClient &http_client);
     // 新版：worker 把自己子集中抽好的 entries 传进来，避免跨 worker 撞 key。
-    bool QueryLocationWithEntries(KVCMHttpClient &http_client, const std::vector<DatasetEntry *> &entries);
+    bool QueryLocationWithEntries(KVCMHttpClient &http_client, const std::vector<DatasetEntry *> &entries, bool use_batch = true);
 
     // 辅助函数
     void BuildNodeRegisterEvent(rapidjson::Document &event);

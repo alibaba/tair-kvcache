@@ -520,12 +520,12 @@ ErrorCode MetaSearcher::BatchAddLocation(RequestContext *request_context,
     std::vector<std::pair<DataStorageType, std::uint64_t>> loc_sz(keys.size());
 
     const int64_t batch_create_time = TimestampUtil::GetCurrentTimeUs();
-    auto modifier =
-        [&locations, &out_location_ids, &keys, &loc_sz, batch_create_time](const LocationIdVector &existing_location_ids,
-                                                        ErrorCode get_ec,
-                                                        size_t index,
-                                                        PropertyMap &upsert_property_map,
-                                                        CacheLocationMap &out_new_locations) -> ModifierResult {
+    auto modifier = [&locations, &out_location_ids, &keys, &loc_sz, batch_create_time](
+                        const LocationIdVector &existing_location_ids,
+                        ErrorCode get_ec,
+                        size_t index,
+                        PropertyMap &upsert_property_map,
+                        CacheLocationMap &out_new_locations) -> ModifierResult {
         if (get_ec != ErrorCode::EC_OK && get_ec != ErrorCode::EC_NOENT) {
             KVCM_LOG_WARN("load location failed, key[%lu](%lu) return %d", index, keys[index], get_ec);
             return {ModifierAction::MA_FAIL, get_ec};
@@ -594,13 +594,15 @@ ErrorCode MetaSearcher::BatchUpsertLocations(RequestContext *request_context,
     }
     out_per_key_ec.assign(keys.size(), ErrorCode::EC_OK);
 
+    const int64_t batch_create_time = TimestampUtil::GetCurrentTimeUs();
     std::vector<std::pair<DataStorageType, std::uint64_t>> loc_sz(keys.size());
 
-    auto modifier = [&new_locations_per_key, &keys, &loc_sz](const LocationIdVector & /*existing_ids*/,
-                                                             ErrorCode get_ec,
-                                                             size_t index,
-                                                             PropertyMap & /*upsert_property_map*/,
-                                                             CacheLocationMap &out_new_locations) -> ModifierResult {
+    auto modifier = [&new_locations_per_key, &keys, &loc_sz, batch_create_time](
+                        const LocationIdVector & /*existing_ids*/,
+                        ErrorCode get_ec,
+                        size_t index,
+                        PropertyMap & /*upsert_property_map*/,
+                        CacheLocationMap &out_new_locations) -> ModifierResult {
         if (get_ec != ErrorCode::EC_OK && get_ec != ErrorCode::EC_NOENT) {
             KVCM_LOG_WARN("load location failed, key[%lu](%lu) return %d", index, keys[index], get_ec);
             return {ModifierAction::MA_FAIL, get_ec};
@@ -613,6 +615,7 @@ ErrorCode MetaSearcher::BatchUpsertLocations(RequestContext *request_context,
             loc.set_type(entry.type);
             loc.set_status(entry.status);
             loc.set_spec_size(entry.specs.size());
+            loc.set_create_time(batch_create_time);
             for (const auto &ls : entry.specs) {
                 loc.push_location_spec(LocationSpec(ls.name(), ls.uri()));
                 if (DataStorageUri ds_uri(ls.uri()); ds_uri.Valid()) {

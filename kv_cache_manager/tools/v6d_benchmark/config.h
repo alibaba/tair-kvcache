@@ -45,6 +45,9 @@ struct BenchmarkConfig {
     int batch_size = 50;       // BATCH_SIZE
     int query_batch_size = 50; // 由 ParseConfigFromEnv 同步为 batch_size，QUERY_BATCH_SIZE 可单独覆写
 
+    // Query API 比例：[0.0, 1.0]，表示使用 GetBatchCacheLocations 的比例，剩余使用 GetCacheLocation
+    double batch_query_ratio = 0.8; // BATCH_QUERY_RATIO
+
     // 操作比例配置 (仅full模式)
     double add_ratio = 0.7;    // ADD_RATIO
     double query_ratio = 0.2;  // QUERY_RATIO
@@ -175,6 +178,11 @@ inline BenchmarkConfig ParseConfigFromEnv() {
         config.query_batch_size = 1;
     }
 
+    // Query API 比例
+    config.batch_query_ratio = GetEnvDouble("BATCH_QUERY_RATIO", 0.8);
+    if (config.batch_query_ratio < 0.0) config.batch_query_ratio = 0.0;
+    if (config.batch_query_ratio > 1.0) config.batch_query_ratio = 1.0;
+
     // 操作比例配置
     config.add_ratio = GetEnvDouble("ADD_RATIO", 0.7);
     config.query_ratio = GetEnvDouble("QUERY_RATIO", 0.2);
@@ -226,6 +234,7 @@ inline BenchmarkConfig ParseConfigFromEnv() {
     KVCM_LOG_INFO("Batch Size: %d (add/delete RPC keys), Query Batch Size: %d (query RPC keys)",
                   config.batch_size,
                   config.query_batch_size);
+    KVCM_LOG_INFO("Batch Query Ratio (GetBatchCacheLocations): %.2f", config.batch_query_ratio);
     KVCM_LOG_INFO("Enable Verification: %s (strict=%s)",
                   config.enable_verification ? "true" : "false",
                   config.strict_verification ? "true" : "false");
