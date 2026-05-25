@@ -273,6 +273,26 @@ message GetCacheLocationRequest {
     repeated string location_spec_names = 8; // 用于仅返回部分spec。不传则全返回。
 }
 
+message CacheLocationVector {
+    repeated CacheLocation locations = 1;
+}
+
+message GetBatchCacheLocationsRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    QueryType query_type = 3;              // 当前仅支持 QT_BATCH_GET
+    repeated int64 block_keys = 4;
+    repeated int64 token_ids = 5;
+    BlockMask block_mask = 6;
+    int32 sw_size = 7;
+    repeated string location_spec_names = 8;
+}
+
+message GetBatchCacheLocationsResponse {
+    CommonResponseHeader header = 1;
+    repeated CacheLocationVector key_locations = 2;
+}
+
 message GetCacheLocationLenRequest {
     string trace_id = 1;
     string instance_id = 2;
@@ -430,4 +450,6 @@ service MetaService {
     rpc StartEvictWriteCache(StartEvictWriteCacheRequest) returns (StartWriteCacheResponse);
     // V6D 上报事件（节点注册、Block 增删、节点宕机）
     rpc ReportEvent(ReportEventRequest) returns (ReportEventResponse);
+    // 返回每个 key 的多个 Cache 位置（所有 v6d + 最多 1 个非 v6d）
+    rpc GetBatchCacheLocations(GetBatchCacheLocationsRequest) returns (GetBatchCacheLocationsResponse);
 }

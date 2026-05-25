@@ -30,6 +30,8 @@ void MetaServiceHttp::RegisterHandler() {
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, getCacheMeta, GetCacheMeta, GetCacheMeta, GetCacheMeta);
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(
         Post, getCacheLocation, GetCacheLocation, GetCacheLocation, GetCacheLocation);
+    REGISTER_HTTP_HANDLER_FOR_META_SERVICE(
+        Post, getBatchCacheLocations, GetBatchCacheLocations, GetBatchCacheLocations, GetBatchCacheLocations);
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, startWriteCache, StartWriteCache, StartWriteCache, StartWriteCache);
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(
         Post, startEvictWriteCache, StartEvictWriteCache, StartWriteCache, StartEvictWriteCache);
@@ -69,6 +71,13 @@ void MetaServiceHttp::GetCacheLocation(coro_http::coro_http_connection *http_con
                                        proto::meta::GetCacheLocationResponse *response) {
     API_CONTEXT_GET_COLLECTOR_AND_INIT_HTTP(GetCacheLocation, __NOTHING__);
     meta_service_impl_->GetCacheLocation(request_context, request, response);
+}
+
+void MetaServiceHttp::GetBatchCacheLocations(coro_http::coro_http_connection *http_conn,
+                                             proto::meta::GetBatchCacheLocationsRequest *request,
+                                             proto::meta::GetBatchCacheLocationsResponse *response) {
+    API_CONTEXT_GET_COLLECTOR_AND_INIT_HTTP(GetBatchCacheLocations, __NOTHING__);
+    meta_service_impl_->GetBatchCacheLocations(request_context, request, response);
 }
 
 void MetaServiceHttp::GetCacheMeta(coro_http::coro_http_connection *http_conn,
