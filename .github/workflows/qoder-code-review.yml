@@ -91,8 +91,6 @@ jobs:
             - If a previous Review Summary already exists and this review has no substantial new findings beyond what was already covered, you may skip the full Summary template entirely. In this case, either omit the summary or provide just 1-2 sentences briefly noting any incremental observations.
           enable_qoder_github_mcp: true
           flags: |
-            --mcp-config /home/runner/.qoder.json
-            --strict-mcp-config
             --allowed-mcp-server-names qoder_github
             --permission-mode bypass_permissions
             --tools TodoWrite
