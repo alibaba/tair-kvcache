@@ -69,6 +69,7 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
       - name: Run Qoder Code Review
+        id: qoder
         timeout-minutes: 30
         # uses: QoderAI/qoder-action@v0
         uses: QoderAI/qoder-action@0881d27d15a7a93778ebc5c942d11da313ee8b7e
@@ -91,6 +92,41 @@ jobs:
             - Do NOT generate duplicate inline comments. If an issue has already been mentioned in existing comments/reviews, skip it.
             - If a previous Review Summary already exists and this review has no substantial new findings beyond what was already covered, you may skip the full Summary template entirely. In this case, either omit the summary or provide just 1-2 sentences briefly noting any incremental observations.
           enable_qoder_github_mcp: true
+          flags: ${{ runner.debug == '1' && '--debug' || '' }}
+
+      - name: Dump Qoder debug trace
+        if: ${{ always() && runner.debug == '1' }}
+        shell: bash
+        env:
+          QODER_OUTPUT_FILE: ${{ steps.qoder.outputs.output_file }}
+          QODER_ERROR: ${{ steps.qoder.outputs.error }}
+        run: |
+          set -euo pipefail
+
+          redact_stream() {
+            sed -E \
+              -e 's|github_pat_[A-Za-z0-9_]+|[REDACTED_GITHUB_PAT]|g' \
+              -e 's|gh[pousr]_[A-Za-z0-9_]{20,}|[REDACTED_GITHUB_TOKEN]|g' \
+              -e 's|sk-[A-Za-z0-9_-]{20,}|[REDACTED_API_KEY]|g' \
+              -e 's|Bearer [A-Za-z0-9._~+/-]{20,}|Bearer [REDACTED]|g' \
+              -e 's|A[KS]IA[0-9A-Z]{16}|[REDACTED_AWS_KEY]|g'
+          }
+
+          echo "::group::Qoder raw stream-json trace"
+          if [[ -n "${QODER_OUTPUT_FILE}" && -f "${QODER_OUTPUT_FILE}" ]]; then
+            echo "Trace file: ${QODER_OUTPUT_FILE}"
+            echo "Trace bytes: $(wc -c < "${QODER_OUTPUT_FILE}")"
+            redact_stream < "${QODER_OUTPUT_FILE}"
+          else
+            echo "No Qoder output file found: ${QODER_OUTPUT_FILE:-<empty>}"
+          fi
+          echo "::endgroup::"
+
+          if [[ -n "${QODER_ERROR}" ]]; then
+            echo "::group::Qoder stderr"
+            printf '%s\n' "${QODER_ERROR}" | redact_stream
+            echo "::endgroup::"
+          fi
 
       - name: Add ai reviewed label
         uses: actions/github-script@v8
