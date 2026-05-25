@@ -104,6 +104,80 @@ CacheLocationConstPtr SelectAndMergeForMatch(SelectLocationPolicy *policy,
     return result;
 }
 
+CacheLocationVector SelectMultiLocationsForMatch(SelectLocationPolicy *policy,
+                                                 CacheLocationMap &location_map,
+                                                 CheckLocDataExistFunc check_loc_data_exist,
+                                                 std::vector<std::string> &out_prune_loc_ids) {
+    CacheLocationMap valid_map;
+    for (auto &[id, loc] : location_map) {
+        if (!loc) {
+            continue;
+        }
+        if (loc->status() != CacheLocationStatus::CLS_SERVING) {
+            continue;
+        }
+        if (check_loc_data_exist) {
+            auto result = check_loc_data_exist(*loc);
+            if (result == LocCheckResult::NOT_EXIST) {
+                out_prune_loc_ids.push_back(id);
+                continue;
+            }
+            if (result == LocCheckResult::TEMPORARILY_UNREACHABLE) {
+                continue;
+            }
+        }
+        valid_map.try_emplace(id, loc);
+    }
+    if (valid_map.empty()) {
+        return {};
+    }
+
+    CacheLocationVector result;
+
+    // Vineyard locations: 每个独立返回，不合并
+    CacheLocationMap non_vineyard_map;
+    for (auto &[id, loc] : valid_map) {
+        if (loc->type() == DataStorageType::DATA_STORAGE_TYPE_VINEYARD) {
+            result.push_back(loc);
+        } else {
+            non_vineyard_map.try_emplace(id, loc);
+        }
+    }
+
+    // 非 Vineyard: 最多选 1 个（通过策略选择 + merge 同 storage 的 specs）
+    if (!non_vineyard_map.empty()) {
+        std::vector<std::string> unused_prune_ids;
+        auto winner = policy->SelectForMatch(non_vineyard_map, nullptr, unused_prune_ids);
+        if (winner && !winner->id().empty() && !winner->location_specs().empty()) {
+            std::map<std::string, LocationSpec> merged_specs;
+            for (auto &[id, loc] : non_vineyard_map) {
+                if (!policy->IsSameDataStorage(*loc, *winner)) {
+                    continue;
+                }
+                for (const auto &spec : loc->location_specs()) {
+                    merged_specs.try_emplace(spec.name(), spec);
+                }
+            }
+            if (!merged_specs.empty()) {
+                auto merged = std::make_shared<CacheLocation>();
+                merged->set_id(winner->id() + "merged");
+                merged->set_status(CacheLocationStatus::CLS_SERVING);
+                merged->set_type(winner->type());
+                std::vector<LocationSpec> specs;
+                specs.reserve(merged_specs.size());
+                for (auto &[name, spec] : merged_specs) {
+                    specs.push_back(std::move(spec));
+                }
+                merged->set_spec_size(specs.size());
+                merged->set_location_specs(std::move(specs));
+                result.push_back(merged);
+            }
+        }
+    }
+
+    return result;
+}
+
 } // namespace
 
 MetaSearcher::MetaSearcher(const std::shared_ptr<MetaIndexer> &meta_indexer) : meta_indexer_(meta_indexer) {}
@@ -273,6 +347,53 @@ ErrorCode MetaSearcher::BatchGetBestLocation(RequestContext *request_context,
             continue;
         }
         out_locations.push_back(std::move(merged));
+    }
+
+    if (!prune_keys.empty() && submit_del_req_func_) {
+        submit_del_req_func_(prune_keys, prune_loc_ids_vec);
+    }
+
+    return out_locations.size() == keys.size() ? EC_OK : EC_ERROR;
+}
+
+ErrorCode MetaSearcher::BatchGetMultiLocations(RequestContext *request_context,
+                                               const KeyVector &keys,
+                                               LocationsPerKey &out_locations,
+                                               SelectLocationPolicy *policy) const {
+    assert(policy != nullptr);
+    SPAN_TRACER(request_context);
+    out_locations.clear();
+    out_locations.reserve(keys.size());
+    auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerGet);
+    CacheLocationMapVector location_maps;
+    auto result = meta_indexer_->GetLocations(request_context, keys, location_maps);
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerGet);
+    KeyVector prune_keys;
+    std::vector<std::vector<std::string>> prune_loc_ids_vec;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (result.error_codes[i] == ErrorCode::EC_NOENT) {
+            out_locations.push_back({});
+            continue;
+        }
+        if (result.error_codes[i] != ErrorCode::EC_OK) {
+            KVCM_LOG_WARN("get key failed, key[%lu](%lu), error_code: %d", i, keys[i], result.error_codes[i]);
+            break;
+        }
+
+        auto &location_map = location_maps[i];
+        if (location_map.empty()) {
+            out_locations.push_back({});
+            continue;
+        }
+        std::vector<std::string> prune_loc_ids;
+        CacheLocationVector multi_locs =
+            SelectMultiLocationsForMatch(policy, location_map, check_loc_data_exist_func_, prune_loc_ids);
+        if (!prune_loc_ids.empty()) {
+            prune_keys.emplace_back(keys[i]);
+            prune_loc_ids_vec.emplace_back(prune_loc_ids);
+        }
+        out_locations.push_back(std::move(multi_locs));
     }
 
     if (!prune_keys.empty() && submit_del_req_func_) {

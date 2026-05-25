@@ -105,6 +105,16 @@ public:
                      int32_t sw_size,
                      const std::vector<std::string> &location_spec_names);
 
+    std::pair<ErrorCode, BatchLocationsView>
+    GetBatchCacheLocations(RequestContext *request_context,
+                           const std::string &instance_id,
+                           QueryType query_type,
+                           const KeyVector &keys,
+                           const TokenIdsVector &tokens,
+                           const BlockMask &block_mask,
+                           int32_t sw_size,
+                           const std::vector<std::string> &location_spec_names);
+
     std::pair<ErrorCode, int64_t> GetCacheLocationLen(RequestContext *request_context,
                                                       const std::string &instance_id,
                                                       QueryType query_type,
@@ -214,6 +224,9 @@ private:
                                                                       const TokenIdsVector &tokens) const;
     std::pair<ErrorCode, int64_t> GetBlockSize(RequestContext *request_context, const std::string &instance_id) const;
     void FilterLocationSpecByName(CacheLocationVector &locations, const std::vector<std::string> &location_spec_names);
+    void FillEmptyLocationSpecs(RequestContext *request_context,
+                                const std::string &instance_id,
+                                CacheLocationVector &locations);
     std::string GetStorageConfigStr(RequestContext *request_context, const std::string &instance_id) const;
 
     // Skips if node re-registered (generation mismatch).

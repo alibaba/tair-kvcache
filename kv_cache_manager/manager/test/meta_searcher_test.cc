@@ -1318,3 +1318,121 @@ TEST_F(MetaSearcherTest, TestBatchGetMergesSpecsByStorageType) {
         EXPECT_EQ(loc->type(), DataStorageType::DATA_STORAGE_TYPE_MOONCAKE);
     }
 }
+
+TEST_F(MetaSearcherTest, TestBatchGetMultiLocations) {
+    MetaSearcher::KeyVector keys = {70000, 70001, 70002};
+
+    // Key 70000: 2 vineyard locations + 1 NFS location
+    std::vector<LocationSpec> v6d_specs_a = {MetaSearcherTestHelper::CreateLocationSpec("tp0", "v6d:///a/tp0")};
+    std::vector<LocationSpec> v6d_specs_b = {MetaSearcherTestHelper::CreateLocationSpec("tp1", "v6d:///b/tp1")};
+    std::vector<LocationSpec> nfs_specs = {MetaSearcherTestHelper::CreateLocationSpec("tp0", "nfs:///c/tp0")};
+
+    auto v6d_loc_a =
+        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_VINEYARD, 1, v6d_specs_a);
+    auto v6d_loc_b =
+        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_VINEYARD, 1, v6d_specs_b);
+    auto nfs_loc = MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, nfs_specs);
+
+    // Key 70001: only 1 NFS location (no vineyard)
+    std::vector<LocationSpec> nfs_specs2 = {MetaSearcherTestHelper::CreateLocationSpec("tp0", "nfs:///d/tp0")};
+    auto nfs_loc2 = MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, nfs_specs2);
+
+    // Key 70002: only vineyard, no non-vineyard
+    std::vector<LocationSpec> v6d_specs_c = {MetaSearcherTestHelper::CreateLocationSpec("tp2", "v6d:///e/tp2")};
+    auto v6d_loc_c =
+        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_VINEYARD, 1, v6d_specs_c);
+
+    // Add locations
+    {
+        // Key 70000: add v6d_loc_a
+        std::vector<std::string> out_ids;
+        ErrorCode ec = meta_searcher_->BatchAddLocation(request_context_.get(), {70000}, {v6d_loc_a}, out_ids);
+        ASSERT_EQ(ec, ErrorCode::EC_OK);
+        std::vector<std::vector<MetaSearcher::LocationUpdateTask>> tasks = {{{out_ids[0], CLS_SERVING}}};
+        std::vector<std::vector<ErrorCode>> results;
+        meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), {70000}, tasks, results);
+    }
+    {
+        // Key 70000: add v6d_loc_b
+        std::vector<std::string> out_ids;
+        ErrorCode ec = meta_searcher_->BatchAddLocation(request_context_.get(), {70000}, {v6d_loc_b}, out_ids);
+        ASSERT_EQ(ec, ErrorCode::EC_OK);
+        std::vector<std::vector<MetaSearcher::LocationUpdateTask>> tasks = {{{out_ids[0], CLS_SERVING}}};
+        std::vector<std::vector<ErrorCode>> results;
+        meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), {70000}, tasks, results);
+    }
+    {
+        // Key 70000: add nfs_loc
+        std::vector<std::string> out_ids;
+        ErrorCode ec = meta_searcher_->BatchAddLocation(request_context_.get(), {70000}, {nfs_loc}, out_ids);
+        ASSERT_EQ(ec, ErrorCode::EC_OK);
+        std::vector<std::vector<MetaSearcher::LocationUpdateTask>> tasks = {{{out_ids[0], CLS_SERVING}}};
+        std::vector<std::vector<ErrorCode>> results;
+        meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), {70000}, tasks, results);
+    }
+    {
+        // Key 70001: add nfs_loc2
+        std::vector<std::string> out_ids;
+        ErrorCode ec = meta_searcher_->BatchAddLocation(request_context_.get(), {70001}, {nfs_loc2}, out_ids);
+        ASSERT_EQ(ec, ErrorCode::EC_OK);
+        std::vector<std::vector<MetaSearcher::LocationUpdateTask>> tasks = {{{out_ids[0], CLS_SERVING}}};
+        std::vector<std::vector<ErrorCode>> results;
+        meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), {70001}, tasks, results);
+    }
+    {
+        // Key 70002: add v6d_loc_c
+        std::vector<std::string> out_ids;
+        ErrorCode ec = meta_searcher_->BatchAddLocation(request_context_.get(), {70002}, {v6d_loc_c}, out_ids);
+        ASSERT_EQ(ec, ErrorCode::EC_OK);
+        std::vector<std::vector<MetaSearcher::LocationUpdateTask>> tasks = {{{out_ids[0], CLS_SERVING}}};
+        std::vector<std::vector<ErrorCode>> results;
+        meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), {70002}, tasks, results);
+    }
+
+    // Call BatchGetMultiLocations
+    LocationsPerKey out_locations;
+    ErrorCode ec = meta_searcher_->BatchGetMultiLocations(request_context_.get(), keys, out_locations, &policy_);
+    ASSERT_EQ(ec, ErrorCode::EC_OK);
+    ASSERT_EQ(out_locations.size(), 3);
+
+    // Key 70000: should have 2 vineyard + 1 non-vineyard = 3 locations
+    {
+        const auto &locs = out_locations[0];
+        ASSERT_EQ(locs.size(), 3);
+        int vineyard_count = 0;
+        int non_vineyard_count = 0;
+        for (const auto &loc : locs) {
+            if (loc->type() == DataStorageType::DATA_STORAGE_TYPE_VINEYARD) {
+                vineyard_count++;
+            } else {
+                non_vineyard_count++;
+                EXPECT_EQ(loc->type(), DataStorageType::DATA_STORAGE_TYPE_NFS);
+            }
+        }
+        EXPECT_EQ(vineyard_count, 2);
+        EXPECT_EQ(non_vineyard_count, 1);
+    }
+
+    // Key 70001: only 1 non-vineyard location
+    {
+        const auto &locs = out_locations[1];
+        ASSERT_EQ(locs.size(), 1);
+        EXPECT_EQ(locs[0]->type(), DataStorageType::DATA_STORAGE_TYPE_NFS);
+    }
+
+    // Key 70002: only 1 vineyard location
+    {
+        const auto &locs = out_locations[2];
+        ASSERT_EQ(locs.size(), 1);
+        EXPECT_EQ(locs[0]->type(), DataStorageType::DATA_STORAGE_TYPE_VINEYARD);
+    }
+
+    // Test with a key that has no locations
+    MetaSearcher::KeyVector keys_with_miss = {70000, 99999};
+    LocationsPerKey out_locations2;
+    ec = meta_searcher_->BatchGetMultiLocations(request_context_.get(), keys_with_miss, out_locations2, &policy_);
+    ASSERT_EQ(ec, ErrorCode::EC_OK);
+    ASSERT_EQ(out_locations2.size(), 2);
+    EXPECT_EQ(out_locations2[0].size(), 3);
+    EXPECT_TRUE(out_locations2[1].empty());
+}
