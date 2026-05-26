@@ -1,0 +1,30 @@
+# Order is important; the last matching pattern takes the most
+# precedence. When someone opens a pull request that only
+# modifies JS files, only @js-owner and not the global
+# owner(s) will be requested for a review.
+
+# These owners will be the default owners for everything in
+# the repo. Unless a later match takes precedence,
+# @global-owner1 and @global-owner2 will be requested for
+# review when someone opens a pull request.
+* @charpty @oldsharp @PerryZZ @wangxiyu191 @xiqi-lq
+
+/.github/CODEOWNERS @charpty @oldsharp @PerryZZ @wangxiyu191 @xiqi-lq
+
+/hisim/ @LinSiyuan814 @littlefatfat
+
+/kv_cache_manager/ @charpty @oldsharp @PerryZZ @wangxiyu191 @xiqi-lq
+/kv_cache_manager/client/ @charpty @lucky-zzz @MMeecatfish
+/kv_cache_manager/common/ @charpty @oldsharp @PerryZZ @wangxiyu191 @xiqi-lq
+/kv_cache_manager/config/ @charpty @oldsharp @PerryZZ @wangxiyu191 @xiqi-lq
+/kv_cache_manager/data_storage/ @charpty @oldsharp @PerryZZ @wangxiyu191 @xiqi-lq
+/kv_cache_manager/event/ @oldsharp @Tyndalllll
+/kv_cache_manager/manager/ @charpty @MMeecatfish @oldsharp @Tyndalllll @wangxiyu191
+/kv_cache_manager/meta/ @DWAE86 @PerryZZ @wangxiyu191 @YoungRX
+/kv_cache_manager/metrics/ @oldsharp @wangxiyu191
+/kv_cache_manager/optimizer/ @Tyndalllll @wangxiyu191
+/kv_cache_manager/protocol/ @charpty @wangxiyu191
+/kv_cache_manager/py_connector/ @charpty @wangxiyu191
+/kv_cache_manager/service/ @charpty @wangxiyu191
+/kv_cache_manager/service/grpc_service/ @charpty @MMeecatfish
+/kv_cache_manager/service/http_service/ @Tyndalllll @wangxiyu191
