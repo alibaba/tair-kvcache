@@ -171,28 +171,63 @@ def plot_multi_instance_analysis(
     base_timestamps = np.unique(np.concatenate(all_t))
     base = pd.DataFrame({'t': base_timestamps})  # 用于merge_asof
 
+    def _instance_id_from_csv_name(instance_name: str) -> str:
+        suffix = "_hit_rates"
+        if instance_name.endswith(suffix):
+            return instance_name[:-len(suffix)]
+        return instance_name
+
+    def _lookup_bytes_per_block(instance_name: str):
+        if not bytes_per_block_map:
+            return None
+        instance_id = _instance_id_from_csv_name(instance_name)
+        for key in (instance_name, instance_id):
+            if key in bytes_per_block_map and bytes_per_block_map[key] > 0:
+                return bytes_per_block_map[key]
+        positive_values = {v for v in bytes_per_block_map.values() if v and v > 0}
+        if len(positive_values) == 1:
+            return next(iter(positive_values))
+        return None
+
+    def _align_state_series(d: pd.DataFrame, col: str, t0: float) -> np.ndarray:
+        updates = d[['t', col]].dropna(subset=['t', col]).sort_values('t')
+        if updates.empty:
+            return np.zeros(len(base_timestamps), dtype=float)
+        aligned = pd.merge_asof(
+            base,
+            updates,
+            on='t',
+            direction='backward',
+            allow_exact_matches=True,
+        )
+        arr = aligned[col].to_numpy(float)
+        # 该 instance 首次上报前不应继承其他 instance 的状态，容量贡献为 0。
+        arr[base_timestamps < t0] = 0.0
+        return np.nan_to_num(arr, nan=0.0)
+
     all_acc_sp_hit = []
     all_acc_hit, all_acc_remote_hit, all_time_ranges = [], [], []
     # 用于瞬时命中率计算：累积输入 token 数 / 累积命中 token 数
     all_acc_input_tokens, all_acc_hit_tokens, all_acc_remote_hit_tokens = [], [], []
     all_acc_sp_hit = []
 
-    global_updates_list = []
-    tier_updates_lists = {col: [] for col in tier_block_cols}  # per-tier 更新列表
+    instance_storage_series = []
+    instance_bytes_per_block = []
+    tier_storage_series = {col: [] for col in tier_block_cols}
 
-    for df in dataframes:
+    for df, instance_name in zip(dataframes, instance_names):
         d = df.copy()
         d["t"] = (d["TimestampNs"] - min_timestamp) / 1e9
         d = d.sort_values('t')
-
-        global_updates_list.append(d[['t', 'CachedBlocks']])
-
-        # 收集 per-tier 数据
-        for col in tier_block_cols:
-            if col in d.columns:
-                tier_updates_lists[col].append(d[['t', col]])
         t0, t1 = d['t'].iloc[0], d['t'].iloc[-1]
         all_time_ranges.append((t0, t1))
+        bpb = _lookup_bytes_per_block(instance_name)
+        instance_storage_series.append(_align_state_series(d, 'CachedBlocks', t0))
+        instance_bytes_per_block.append(bpb)
+
+        for col in tier_block_cols:
+            if col in d.columns:
+                tier_storage_series[col].append((_align_state_series(d, col, t0), bpb))
 
         # 真实对齐：取 <=t 的最后一次上报（ZOH），不插值
         aligned = pd.merge_asof(
@@ -234,51 +269,33 @@ def plot_multi_instance_analysis(
     else:
         all_acc_sp_hit = [None] * len(instance_names)
 
-    global_updates = pd.concat(global_updates_list, ignore_index=True)
-    global_updates = global_updates.dropna(subset=['t', 'CachedBlocks']).sort_values('t')
-
-    # 同一时刻可能多个instance都写了全局容量：聚合成一个值（median更稳健）
-    global_updates = (global_updates
-                    .groupby('t', as_index=False)['CachedBlocks']
-                    .median())
-
-    # 对齐到base：在两次更新之间保持最后值（全局容量是状态量）
-    global_aligned = pd.merge_asof(
-        base,
-        global_updates,
-        on='t',
-        direction='backward',
-        allow_exact_matches=True
+    storage_in_gb = (
+        bool(bytes_per_block_map)
+        and bool(instance_storage_series)
+        and all(bpb is not None and bpb > 0 for bpb in instance_bytes_per_block)
     )
-
-    total_storage = global_aligned['CachedBlocks'].to_numpy(float)
-    rep_bpb = None
-    if bytes_per_block_map:
-        rep_bpb = next(iter(bytes_per_block_map.values()))
-        if rep_bpb and rep_bpb > 0:
-            total_storage = total_storage * rep_bpb / (1024 ** 3)
-            storage_label = 'InstanceGroup Storage (GB)'
-        else:
-            rep_bpb = None
-            storage_label = 'InstanceGroup Storage (blocks)'
+    if storage_in_gb:
+        total_storage = np.sum(
+            [arr * bpb / (1024 ** 3) for arr, bpb in zip(instance_storage_series, instance_bytes_per_block)],
+            axis=0,
+        )
+        storage_label = 'InstanceGroup Storage (GB)'
     else:
+        total_storage = np.sum(instance_storage_series, axis=0)
         storage_label = 'InstanceGroup Storage (blocks)'
 
     # ---- per-tier 存储对齐 ----
     tier_storage = {}  # {tier_name: aligned_array}
     for col, tier_name in tier_block_cols.items():
-        if col not in tier_updates_lists or not tier_updates_lists[col]:
+        if col not in tier_storage_series or not tier_storage_series[col]:
             continue
-        tier_updates = pd.concat(tier_updates_lists[col], ignore_index=True)
-        tier_updates = tier_updates.dropna(subset=['t', col]).sort_values('t')
-        tier_updates = tier_updates.groupby('t', as_index=False)[col].median()
-        tier_aligned = pd.merge_asof(
-            base, tier_updates, on='t',
-            direction='backward', allow_exact_matches=True
-        )
-        arr = tier_aligned[col].to_numpy(float)
-        if rep_bpb and rep_bpb > 0:
-            arr = arr * rep_bpb / (1024 ** 3)
+        if storage_in_gb:
+            arr = np.sum(
+                [series * bpb / (1024 ** 3) for series, bpb in tier_storage_series[col]],
+                axis=0,
+            )
+        else:
+            arr = np.sum([series for series, _ in tier_storage_series[col]], axis=0)
         tier_storage[tier_name] = arr
 
     # ---- 画图 ----
@@ -312,7 +329,8 @@ def plot_multi_instance_analysis(
                 colors=[TIER_COLORS[i % len(TIER_COLORS)] for i in range(len(tier_names_ordered))],
                 alpha=0.35, step='post',
             )
-        y_upper = np.nanmax(total_storage) * 1.15 if np.any(~np.isnan(total_storage)) else 1
+        max_storage = np.nanmax(total_storage) if np.any(~np.isnan(total_storage)) else 0
+        y_upper = max(max_storage * 1.15, 1)
         ax.set_ylim(0, y_upper)
         ax.tick_params(axis='y', labelcolor='#1f77b4')
         ax.grid(True, alpha=0.3, linestyle='-', linewidth=0.5)
