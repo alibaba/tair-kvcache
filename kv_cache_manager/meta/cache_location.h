@@ -105,6 +105,7 @@ public:
         Put(writer, "status", status_);
         Put(writer, "type", type_);
         Put(writer, "spec_size", spec_size_);
+        Put(writer, "create_time", create_time_);
         Put(writer, "location_specs", location_specs_);
     }
 
@@ -113,6 +114,7 @@ public:
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "status", status_, CacheLocationStatus::CLS_NOT_FOUND);
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "type", type_, DataStorageType::DATA_STORAGE_TYPE_UNKNOWN);
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "spec_size", spec_size_, size_t{0});
+        KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "create_time", create_time_, int64_t{0});
         KVCM_JSON_GET_MACRO(rapid_value, "location_specs", location_specs_);
         return true;
     }
@@ -121,6 +123,7 @@ public:
     void set_type(DataStorageType type) { type_ = type; }
     void set_id(const std::string &id) { id_ = id; }
     void set_spec_size(size_t spec_size) { spec_size_ = spec_size; }
+    void set_create_time(int64_t create_time) { create_time_ = create_time; }
     void push_location_spec(LocationSpec &&location_spec) { location_specs_.push_back(std::move(location_spec)); }
     void set_location_specs(std::vector<LocationSpec> &&location_specs) { location_specs_ = location_specs; }
 
@@ -129,6 +132,7 @@ public:
     [[nodiscard]] CacheLocationStatus status() const { return status_; }
     [[nodiscard]] DataStorageType type() const { return type_; }
     [[nodiscard]] size_t spec_size() const { return spec_size_; }
+    [[nodiscard]] int64_t create_time() const { return create_time_; }
     [[nodiscard]] size_t EstimateMemUsage() const {
         size_t usage = sizeof(CacheLocation) + id_.size();
         for (const auto &spec : location_specs_) {
@@ -142,6 +146,7 @@ private:
     CacheLocationStatus status_ = CacheLocationStatus::CLS_NEW;
     DataStorageType type_ = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
     size_t spec_size_ = 0;
+    int64_t create_time_ = 0;
     std::vector<LocationSpec> location_specs_;
 };
 

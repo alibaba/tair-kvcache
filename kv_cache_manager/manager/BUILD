@@ -27,6 +27,7 @@ cc_library(
         ":write_location_manager",
         "//kv_cache_manager/common",
         "//kv_cache_manager/config",
+        "//kv_cache_manager/data_storage",
         "//kv_cache_manager/event:event_publisher",
         "//kv_cache_manager/metrics:metrics_collector",
         "//kv_cache_manager/metrics:metrics_registry",

@@ -59,6 +59,10 @@ void ProtoConvert::StorageConfigToProto(const StorageConfig &storage_config,
         auto *dummy = proto_storage_config->mutable_dummy();
         dummy->set_root_path(dummy_storage.root_path());
         dummy->set_key_count_per_file(dummy_storage.key_count_per_file());
+    } else if (type == DataStorageType::DATA_STORAGE_TYPE_VINEYARD) {
+        const auto &vineyard_storage = *std::dynamic_pointer_cast<VineyardStorageSpec>(storage_config.storage_spec());
+        auto *vineyard = proto_storage_config->mutable_vineyard();
+        vineyard->set_cluster_name(vineyard_storage.cluster_name());
     }
 }
 
@@ -128,6 +132,13 @@ void ProtoConvert::StorageFromProto(const proto::admin::StorageConfig *proto_sto
         spec.set_key_count_per_file(proto_storage_config->dummy().key_count_per_file());
         storage_config.set_storage_spec(std::make_shared<DummyStorageSpec>(spec));
         storage_config.set_type(DataStorageType::DATA_STORAGE_TYPE_DUMMY);
+        break;
+    }
+    case proto::admin::StorageConfig::kVineyard: {
+        VineyardStorageSpec spec;
+        spec.set_cluster_name(proto_storage_config->vineyard().cluster_name());
+        storage_config.set_storage_spec(std::make_shared<VineyardStorageSpec>(spec));
+        storage_config.set_type(DataStorageType::DATA_STORAGE_TYPE_VINEYARD);
         break;
     }
     default:

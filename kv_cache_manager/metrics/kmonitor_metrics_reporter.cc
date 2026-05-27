@@ -128,11 +128,19 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(cache_reclaimer, reclaim_lru_filter_duration_us);
     DECLARE_METRICS(cache_reclaimer, reclaim_lru_submit_duration_us);
 
+    DECLARE_METRICS(cache_reclaimer, reclaim_batch_lru_age_min_us);
+    DECLARE_METRICS(cache_reclaimer, reclaim_batch_lru_age_max_us);
+    DECLARE_METRICS(cache_reclaimer, reclaim_batch_lru_age_avg_us);
+    DECLARE_METRICS(cache_reclaimer, reclaim_batch_create_age_min_us);
+    DECLARE_METRICS(cache_reclaimer, reclaim_batch_create_age_max_us);
+    DECLARE_METRICS(cache_reclaimer, reclaim_batch_create_age_avg_us);
+
     // cache manager
     DECLARE_METRICS(cache_manager, write_location_expire_size);
     DECLARE_METRICS(cache_manager_group, usage_ratio);
     DECLARE_METRICS(cache_manager_instance, key_count);
     DECLARE_METRICS(cache_manager_instance, byte_size);
+    DECLARE_METRICS(cache_manager_instance, max_lru_age_us);
 
     struct MapHashFunc {
         size_t operator()(const std::map<std::string, std::string> &m) const noexcept {
@@ -349,11 +357,19 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_lru_filter_duration_us);
     REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_lru_submit_duration_us);
 
+    REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_batch_lru_age_min_us);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_batch_lru_age_max_us);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_batch_lru_age_avg_us);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_batch_create_age_min_us);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_batch_create_age_max_us);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_batch_create_age_avg_us);
+
     // cache manager
     REGISTER_GAUGE_METRIC(cache_manager, write_location_expire_size);
     REGISTER_GAUGE_METRIC(cache_manager_group, usage_ratio);
     REGISTER_GAUGE_METRIC(cache_manager_instance, key_count);
     REGISTER_GAUGE_METRIC(cache_manager_instance, byte_size);
+    REGISTER_GAUGE_METRIC(cache_manager_instance, max_lru_age_us);
 
     return true;
 }
@@ -559,6 +575,13 @@ void KmonitorMetricsReporter::ReportInterval() {
         double reclaim_lru_filter_duration_us_v;
         double reclaim_lru_submit_duration_us_v;
 
+        double reclaim_batch_lru_age_min_us_v;
+        double reclaim_batch_lru_age_max_us_v;
+        double reclaim_batch_lru_age_avg_us_v;
+        double reclaim_batch_create_age_min_us_v;
+        double reclaim_batch_create_age_max_us_v;
+        double reclaim_batch_create_age_avg_us_v;
+
         GET_METRICS_(cr, cache_reclaimer, reclaim_cron_count, reclaim_cron_count_v);
         GET_METRICS_(cr, cache_reclaimer, reclaim_job_count, reclaim_job_count_v);
         GET_METRICS_(cr, cache_reclaimer, block_submit_count, blk_submit_count_v);
@@ -574,6 +597,13 @@ void KmonitorMetricsReporter::ReportInterval() {
         GET_METRICS_(cr, cache_reclaimer, reclaim_lru_batch_duration_us, reclaim_lru_batch_duration_us_v);
         GET_METRICS_(cr, cache_reclaimer, reclaim_lru_filter_duration_us, reclaim_lru_filter_duration_us_v);
         GET_METRICS_(cr, cache_reclaimer, reclaim_lru_submit_duration_us, reclaim_lru_submit_duration_us_v);
+
+        GET_METRICS_(cr, cache_reclaimer, reclaim_batch_lru_age_min_us, reclaim_batch_lru_age_min_us_v);
+        GET_METRICS_(cr, cache_reclaimer, reclaim_batch_lru_age_max_us, reclaim_batch_lru_age_max_us_v);
+        GET_METRICS_(cr, cache_reclaimer, reclaim_batch_lru_age_avg_us, reclaim_batch_lru_age_avg_us_v);
+        GET_METRICS_(cr, cache_reclaimer, reclaim_batch_create_age_min_us, reclaim_batch_create_age_min_us_v);
+        GET_METRICS_(cr, cache_reclaimer, reclaim_batch_create_age_max_us, reclaim_batch_create_age_max_us_v);
+        GET_METRICS_(cr, cache_reclaimer, reclaim_batch_create_age_avg_us, reclaim_batch_create_age_avg_us_v);
 
         const kmonitor::MetricsTags tags;
         REPORT_METRICS(cache_reclaimer, reclaim_cron_count, static_cast<double>(reclaim_cron_count_v));
@@ -591,6 +621,13 @@ void KmonitorMetricsReporter::ReportInterval() {
         REPORT_METRICS(cache_reclaimer, reclaim_lru_batch_duration_us, reclaim_lru_batch_duration_us_v);
         REPORT_METRICS(cache_reclaimer, reclaim_lru_filter_duration_us, reclaim_lru_filter_duration_us_v);
         REPORT_METRICS(cache_reclaimer, reclaim_lru_submit_duration_us, reclaim_lru_submit_duration_us_v);
+
+        REPORT_METRICS(cache_reclaimer, reclaim_batch_lru_age_min_us, reclaim_batch_lru_age_min_us_v);
+        REPORT_METRICS(cache_reclaimer, reclaim_batch_lru_age_max_us, reclaim_batch_lru_age_max_us_v);
+        REPORT_METRICS(cache_reclaimer, reclaim_batch_lru_age_avg_us, reclaim_batch_lru_age_avg_us_v);
+        REPORT_METRICS(cache_reclaimer, reclaim_batch_create_age_min_us, reclaim_batch_create_age_min_us_v);
+        REPORT_METRICS(cache_reclaimer, reclaim_batch_create_age_max_us, reclaim_batch_create_age_max_us_v);
+        REPORT_METRICS(cache_reclaimer, reclaim_batch_create_age_avg_us, reclaim_batch_create_age_avg_us_v);
     } while (false);
 
     do {
@@ -623,11 +660,13 @@ void KmonitorMetricsReporter::ReportInterval() {
             for (const auto &mc : vec) {
                 if (const auto p = std::dynamic_pointer_cast<CacheManagerInstanceMetricsCollector>(mc); p != nullptr) {
                     const kmonitor::MetricsTags tags = ctx_->GetKmonitorTags(p->GetMetricsTags());
-                    double key_count_v, byte_size_v;
+                    double key_count_v, byte_size_v, max_lru_age_us_v;
                     GET_METRICS_(p, cache_manager_instance, key_count, key_count_v);
                     REPORT_METRICS(cache_manager_instance, key_count, key_count_v);
                     GET_METRICS_(p, cache_manager_instance, byte_size, byte_size_v);
                     REPORT_METRICS(cache_manager_instance, byte_size, byte_size_v);
+                    GET_METRICS_(p, cache_manager_instance, max_lru_age_us, max_lru_age_us_v);
+                    REPORT_METRICS(cache_manager_instance, max_lru_age_us, max_lru_age_us_v);
                 }
             }
         }

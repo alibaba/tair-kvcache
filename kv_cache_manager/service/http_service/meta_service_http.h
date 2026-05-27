@@ -51,6 +51,10 @@ public:
                         proto::meta::GetClusterInfoRequest *request,
                         proto::meta::GetClusterInfoResponse *response);
 
+    void ReportEvent(coro_http::coro_http_connection *http_conn,
+                     proto::meta::ReportEventRequest *request,
+                     proto::meta::ReportEventResponse *response);
+
 private:
     std::shared_ptr<MetaServiceImpl> meta_service_impl_;
 };

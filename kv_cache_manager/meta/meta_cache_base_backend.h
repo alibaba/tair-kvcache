@@ -20,6 +20,7 @@ public:
     using MetaStorageBackend::Upsert;
 
     virtual size_t GetMemUsage() const noexcept = 0;
+    virtual int64_t GetOldestAccessTime() const noexcept = 0;
 
     // 写入 locations + properties，仅当 key 在 cache 中不存在时才写入。
     // 若 key 已存在，返回 EC_OK 且不修改已有数据（幂等）。

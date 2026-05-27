@@ -8,6 +8,7 @@ cc_library(
         "hf3fs_backend.cc",
         "mooncake_backend.cc",
         "nfs_backend.cc",
+        "vineyard_backend.cc",
     ],
     hdrs = [
         "data_storage_backend.h",
@@ -16,6 +17,7 @@ cc_library(
         "hf3fs_backend.h",
         "mooncake_backend.h",
         "nfs_backend.h",
+        "vineyard_backend.h",
     ],
     deps = [
         # 不一定用

@@ -647,4 +647,30 @@ void MetaServiceImpl::GetClusterInfo(RequestContext *request_context,
     SET_SPAN_TRACER_STR_IN_HEADER(request_context);
 }
 
+void MetaServiceImpl::ReportEvent(RequestContext *request_context,
+                                  const proto::meta::ReportEventRequest *request,
+                                  proto::meta::ReportEventResponse *response) {
+    SPAN_TRACER(request_context);
+    API_CALL_GUARD("ReportEvent", true);
+    auto *header = response->mutable_header();
+
+    KVCM_LOG_INFO("[traceId: %s] ReportEvent called, instance_id: %s, host_ip_port: %s, event_count: %d",
+                  request->trace_id().c_str(),
+                  request->instance_id().c_str(),
+                  request->host_ip_port().c_str(),
+                  request->events_size());
+
+    auto ec = cache_manager_->ReportEvent(request_context, request, response);
+    if (ec != EC_OK) {
+        KVCM_LOG_WARN("[traceId: %s] ReportEvent %s, ec=%d",
+                      request->trace_id().c_str(),
+                      (ec == EC_PARTIAL_OK) ? "partially failed" : "failed",
+                      ec);
+    }
+    auto *smc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+    KVCM_METRICS_COLLECTOR_SET_METRICS(smc, service, error_code, (ec != EC_OK) ? 1.0 : 0.0);
+    request_context->set_status_code(header->status().code());
+    SET_SPAN_TRACER_STR_IN_HEADER(request_context);
+}
+
 } // namespace kv_cache_manager

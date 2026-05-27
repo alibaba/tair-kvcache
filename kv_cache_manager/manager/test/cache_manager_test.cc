@@ -1479,7 +1479,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_NullRegistryManager) {
     auto saved = cache_manager_->registry_manager_;
     cache_manager_->registry_manager_ = nullptr;
 
-    auto func = cache_manager_->GetCheckLocDataExistFunc();
+    auto func = cache_manager_->GetCheckLocDataExistFunc("test_instance");
 
     CacheLocation loc;
     loc.set_status(CLS_SERVING);
@@ -1496,7 +1496,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_NullDataStorageManager) {
     auto saved = registry_manager_->data_storage_manager_;
     registry_manager_->data_storage_manager_ = nullptr;
 
-    auto func = cache_manager_->GetCheckLocDataExistFunc();
+    auto func = cache_manager_->GetCheckLocDataExistFunc("test_instance");
 
     CacheLocation loc;
     loc.set_status(CLS_SERVING);
@@ -1509,7 +1509,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_NullDataStorageManager) {
 
 TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_EmptyLocationSpecs) {
     // no location specs -> no URIs to check -> returns true
-    auto func = cache_manager_->GetCheckLocDataExistFunc();
+    auto func = cache_manager_->GetCheckLocDataExistFunc("test_instance");
 
     CacheLocation loc;
     loc.set_status(CLS_SERVING);
@@ -1520,7 +1520,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_EmptyLocationSpecs) {
 TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_InvalidUri) {
     // invalid URI string (no protocol) -> DataStorageUri::Valid() is
     // false -> no valid URIs collected -> returns true
-    auto func = cache_manager_->GetCheckLocDataExistFunc();
+    auto func = cache_manager_->GetCheckLocDataExistFunc("test_instance");
 
     CacheLocation loc;
     loc.set_status(CLS_SERVING);
@@ -1541,7 +1541,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_AllExist) {
     auto dsm = registry_manager_->data_storage_manager_;
     dsm->storage_map_["mock_store"] = mock_backend;
 
-    auto func = cache_manager_->GetCheckLocDataExistFunc();
+    auto func = cache_manager_->GetCheckLocDataExistFunc("test_instance");
 
     CacheLocation loc;
     loc.set_status(CLS_SERVING);
@@ -1565,7 +1565,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_NoneExist) {
     auto dsm = registry_manager_->data_storage_manager_;
     dsm->storage_map_["mock_store"] = mock_backend;
 
-    auto func = cache_manager_->GetCheckLocDataExistFunc();
+    auto func = cache_manager_->GetCheckLocDataExistFunc("test_instance");
 
     CacheLocation loc;
     loc.set_status(CLS_SERVING);
@@ -1592,7 +1592,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_PartialExist) {
     auto dsm = registry_manager_->data_storage_manager_;
     dsm->storage_map_["mock_store"] = mock_backend;
 
-    auto func = cache_manager_->GetCheckLocDataExistFunc();
+    auto func = cache_manager_->GetCheckLocDataExistFunc("test_instance");
 
     CacheLocation loc;
     loc.set_status(CLS_SERVING);
@@ -1622,7 +1622,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_VerifiesUriPassthrough) {
     auto dsm = registry_manager_->data_storage_manager_;
     dsm->storage_map_["mock_store"] = mock_backend;
 
-    auto func = cache_manager_->GetCheckLocDataExistFunc();
+    auto func = cache_manager_->GetCheckLocDataExistFunc("test_instance");
 
     CacheLocation loc;
     loc.set_status(CLS_SERVING);
@@ -1641,7 +1641,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_UnregisteredBackend) {
     // valid URIs whose hostname does not match any registered backend;
     // DataStorageManager::Exist returns an empty vector, and
     // std::all_of on an empty range is true -> functor returns true
-    auto func = cache_manager_->GetCheckLocDataExistFunc();
+    auto func = cache_manager_->GetCheckLocDataExistFunc("test_instance");
 
     CacheLocation loc;
     loc.set_status(CLS_SERVING);

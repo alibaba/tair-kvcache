@@ -130,6 +130,10 @@ public:
                           const KeyVector &keys,
                           const TokenIdsVector &tokens,
                           const BlockMask &block_mask /*TODO*/);
+
+    ErrorCode ReportEvent(RequestContext *request_context,
+                          const proto::meta::ReportEventRequest *request,
+                          proto::meta::ReportEventResponse *response);
     ErrorCode TrimCache(RequestContext *request_context,
                         const std::string &instance_id,
                         const proto::meta::TrimStrategy &trim_strategy,
@@ -189,6 +193,9 @@ private:
     std::pair<ErrorCode, int64_t> GetBlockSize(RequestContext *request_context, const std::string &instance_id) const;
     void FilterLocationSpecByName(CacheLocationVector &locations, const std::vector<std::string> &location_spec_names);
     std::string GetStorageConfigStr(RequestContext *request_context, const std::string &instance_id) const;
+
+    void
+    CleanupHostLocations(const std::string &instance_id, const std::string &host_ip_port, uint64_t cleanup_generation);
     ErrorCode GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
                                           RequestContext *request_context,
                                           const std::string &instance_id,
@@ -210,8 +217,9 @@ private:
                                         CacheLocationVector &cache_locations) const;
     std::unique_ptr<SelectLocationPolicy> genSelectLocationPolicy(RequestContext *request_context,
                                                                   const std::string &instance_id) const;
-    CheckLocDataExistFunc GetCheckLocDataExistFunc() const;
+    CheckLocDataExistFunc GetCheckLocDataExistFunc(const std::string &instance_id) const;
     SubmitDelReqFunc GetSubmitDelReqFunc(const std::string &instance_id) const;
+    void ClearVineyardCleanupCallbacks();
 
 private:
     /***

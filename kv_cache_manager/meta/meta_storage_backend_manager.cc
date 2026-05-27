@@ -1,6 +1,7 @@
 #include "kv_cache_manager/meta/meta_storage_backend_manager.h"
 
 #include <cassert>
+#include <climits>
 #include <utility>
 
 #include "kv_cache_manager/common/error_code.h"
@@ -725,6 +726,13 @@ size_t MetaStorageBackendManager::GetMemUsage() const noexcept {
         return cache_backend_->GetMemUsage();
     }
     return 0;
+}
+
+int64_t MetaStorageBackendManager::GetOldestAccessTime() const noexcept {
+    if (cache_backend_) {
+        return cache_backend_->GetOldestAccessTime();
+    }
+    return INT64_MAX;
 }
 
 } // namespace kv_cache_manager

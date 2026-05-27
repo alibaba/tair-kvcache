@@ -1,3 +1,4 @@
+#include <atomic>
 #include <memory>
 #include <thread>
 #include <unistd.h>
@@ -335,6 +336,10 @@ TEST_F(MetricsCollectorTest, ChronoScopeAutoFinishOnDestruct) {
 // MarkBegin() would overwrite thread A's begin_, causing A to compute
 // ~3 ms instead of ~5 ms.  Per-scope begin_us_ on the stack keeps each
 // measurement independent.
+//
+// Uses an atomic flag so that thread A's scope destruction (gauge write)
+// is guaranteed to happen AFTER thread B's, removing the scheduler-
+// dependent race on which thread writes last.
 TEST_F(MetricsCollectorTest, ChronoScopeAsymmetricConcurrentTest) {
     constexpr int kIterations = 20;
     constexpr int kLongSleepUs = 5000;  // 5 ms – thread A
@@ -347,25 +352,34 @@ TEST_F(MetricsCollectorTest, ChronoScopeAsymmetricConcurrentTest) {
         auto p = std::dynamic_pointer_cast<ServiceMetricsCollector>(metrics_collector_);
         ASSERT_NE(nullptr, p);
 
-        // Thread A: starts immediately, sleeps 5 ms (finishes last → last writer to Gauge)
-        std::thread t_long([&p]() {
+        std::atomic<bool> short_done{false};
+
+        // Thread A: starts immediately, sleeps 5 ms, then waits for B's scope
+        // to be destroyed before letting its own scope destruct.
+        std::thread t_long([&p, &short_done]() {
             auto scope = KVCM_METRICS_COLLECTOR_CHRONO_SCOPE(p, MetaSearcherIndexerGet);
             usleep(kLongSleepUs);
+            while (!short_done.load(std::memory_order_acquire)) {
+                usleep(50);
+            }
         });
 
         // Stagger: wait 2 ms so thread B's MarkBegin timestamp differs from A's
         usleep(kStaggerUs);
 
-        // Thread B: starts 2 ms later, sleeps 1 ms (finishes at ~3 ms, before A at ~5 ms)
-        std::thread t_short([&p]() {
-            auto scope = KVCM_METRICS_COLLECTOR_CHRONO_SCOPE(p, MetaSearcherIndexerGet);
-            usleep(kShortSleepUs);
+        // Thread B: starts 2 ms later, sleeps 1 ms, scope destructs, then signals.
+        std::thread t_short([&p, &short_done]() {
+            {
+                auto scope = KVCM_METRICS_COLLECTOR_CHRONO_SCOPE(p, MetaSearcherIndexerGet);
+                usleep(kShortSleepUs);
+            }
+            short_done.store(true, std::memory_order_release);
         });
 
         t_short.join();
         t_long.join();
 
-        // Thread A finishes last and overwrites the Gauge.
+        // Thread A's scope destructs last → Gauge reflects A's measurement.
         // Correct per-scope: Gauge ≈ 5 ms (A's own begin_us_)
         // Broken shared begin_: Gauge ≈ 3 ms (A would use B's begin_)
         double val = GET(p, meta_searcher, indexer_get_time_us);

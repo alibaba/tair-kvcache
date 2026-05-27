@@ -28,16 +28,16 @@ TEST_F(LoopThreadTest, TestCreateAndStop) {
     auto loop_thread = LoopThread::CreateLoopThread([&count]() { count++; }, 1000); // 1ms间隔
     EXPECT_NE(loop_thread, nullptr);
 
-    // 等待一段时间让循环执行几次
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (count.load() == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
     int count_before_stop = count.load();
     EXPECT_GT(count_before_stop, 0);
 
     loop_thread->Stop();
 
-    // 停止后计数应该不再增加
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
     int count_after_stop = count.load();
     EXPECT_EQ(count_before_stop, count_after_stop);
 }

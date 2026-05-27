@@ -703,6 +703,15 @@ ErrorCode MetaLocalBackend::GetMetaData(FieldMap & /*field_maps*/) noexcept { re
 
 size_t MetaLocalBackend::GetMemUsage() const noexcept { return cache_->GetUsage(); }
 
+int64_t MetaLocalBackend::GetOldestAccessTime() const noexcept {
+    int64_t oldest = INT64_MAX;
+    size_t num_shards = shard_mask_ + 1;
+    for (size_t s = 0; s < num_shards; ++s) {
+        oldest = std::min(oldest, shard_oldest_access_time_[s].load(std::memory_order_relaxed));
+    }
+    return oldest;
+}
+
 size_t MetaLocalBackend::CollectOldestKeysFromShard(uint32_t shard_id, size_t count, std::vector<KeyType> &out_keys) {
     std::vector<std::string> string_keys;
     string_keys.reserve(count);

@@ -76,6 +76,8 @@ public:
     bool SubmitNonBlocking(const CacheMetaDelRequest &req);
     bool SubmitNonBlocking(const CacheLocationDelRequest &req);
 
+    bool SubmitTask(std::function<void()> task, std::chrono::microseconds delay = std::chrono::microseconds(0));
+
 private:
     std::shared_ptr<MetaIndexerManager> meta_manager_;
     std::shared_ptr<DataStorageManager> data_storage_manager_;

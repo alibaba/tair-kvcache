@@ -304,6 +304,7 @@ bool CacheManagerGroupMetricsCollector::Init() {
 
 DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector, cache_manager_instance, key_count);
 DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector, cache_manager_instance, byte_size);
+DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector, cache_manager_instance, max_lru_age_us);
 
 CacheManagerInstanceMetricsCollector::CacheManagerInstanceMetricsCollector(
     std::shared_ptr<MetricsRegistry> metrics_registry) noexcept
@@ -320,6 +321,7 @@ bool CacheManagerInstanceMetricsCollector::Init() {
 
     REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, key_count);
     REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, byte_size);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, max_lru_age_us);
 
     return true;
 }

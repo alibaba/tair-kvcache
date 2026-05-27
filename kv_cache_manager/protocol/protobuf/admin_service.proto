@@ -43,6 +43,7 @@ enum StorageType {
     ST_NFS = 4;
     ST_VCNS_3FS = 5;
     ST_DUMMY = 6;
+    ST_VINEYARD = 7;
 }
 
 message LocalStorageSpec {}
@@ -101,7 +102,10 @@ message NfsStorageSpec {
     int32 key_count_per_file = 2;
 }
 
-// 允许一个meta service服务对接多种存储系统
+message VineyardStorageSpec {
+    string cluster_name = 1;
+}
+
 message StorageConfig {
     string global_unique_name = 1;
     oneof storage_spec {
@@ -112,6 +116,7 @@ message StorageConfig {
         NfsStorageSpec nfs = 6;
         VcnsThreeFSStorageSpec vcnsthreefs = 7;
         DummyStorageSpec dummy = 9;
+        VineyardStorageSpec vineyard = 10;
     }
     bool check_storage_available_when_open = 8;
 }

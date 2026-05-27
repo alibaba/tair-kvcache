@@ -88,6 +88,7 @@ public:
     ErrorCode GetMetaData(FieldMap &field_maps) noexcept;
 
     size_t GetMemUsage() const noexcept;
+    int64_t GetOldestAccessTime() const noexcept;
 
 private:
     void AsyncRecoverTask() noexcept;
