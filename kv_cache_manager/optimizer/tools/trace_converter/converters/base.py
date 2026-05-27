@@ -36,6 +36,12 @@ class BaseConverter(ABC):
         """
         return self.instance_block_sizes.get(instance_id, self.default_block_size)
 
+    def _truncate_keys_to_full_blocks(self, keys: list, input_len: int, instance_id: str) -> list:
+        block_size = self.get_block_size(instance_id)
+        if block_size <= 0:
+            raise ValueError(f"block_size must be positive for instance {instance_id}")
+        return list(keys[:input_len // block_size])
+
     @abstractmethod
     def convert_to_traces(self, input_file: str) -> list:
         """
@@ -103,6 +109,10 @@ class BaseConverter(ABC):
         input_len = int(kwargs['input_len'])
         if input_len <= 0:
             raise ValueError("optimizer get trace input_len must be positive")
+        keys = self._truncate_keys_to_full_blocks(keys, input_len, instance_id)
+        block_mask = kwargs.get('block_mask', [])
+        if isinstance(block_mask, list) and len(block_mask) > len(keys):
+            block_mask = block_mask[:len(keys)]
 
         trace = {
             'type': 'get',  # 显式标记为Get trace
@@ -115,7 +125,7 @@ class BaseConverter(ABC):
 
             # GetLocationSchemaTrace 字段
             'query_type': kwargs.get('query_type', 'prefix_match'),
-            'block_mask': kwargs.get('block_mask', []),
+            'block_mask': block_mask,
             'sw_size': kwargs.get('sw_size', 0),
             'location_spec_names': kwargs.get('location_spec_names', []),
         }

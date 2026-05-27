@@ -63,6 +63,10 @@ class QwenBailianConverter(BaseConverter):
                         raise ValueError("input_length must be positive")
                     output_length = data.get('output_length', 0)
 
+                    # 只保留完整 block；input_len 仍保留真实 token 数作为命中率分母。
+                    block_size = self.get_block_size(self.default_instance_id)
+                    hash_ids = hash_ids[:input_length // block_size]
+
                     # 应用前缀哈希转换
                     block_keys = apply_prefix_hash(hash_ids)
 
@@ -103,8 +107,8 @@ class QwenBailianConverter(BaseConverter):
 
         Args:
             timestamp: 原始时间戳(秒)
-            block_keys: block keys (hash_ids已经是input部分,直接使用)
-            input_length: 输入token数 (未使用,仅作记录)
+            block_keys: block keys
+            input_length: 输入token数
             output_length: 输出token数 (未使用,仅作记录)
 
         Returns:
@@ -112,7 +116,6 @@ class QwenBailianConverter(BaseConverter):
         """
         base_timestamp_ns = int(timestamp * 1_000_000_000)
 
-        # hash_ids本身就是input的完整block keys,直接使用
         # Get trace (prefill阶段) - 显式使用default_instance_id
         get_trace = self._create_get_trace(
             timestamp_ns=base_timestamp_ns,

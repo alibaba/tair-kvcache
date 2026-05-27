@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <stdexcept>
 #include <variant>
 
 #include "kv_cache_manager/common/logger.h"
@@ -11,6 +12,25 @@
 namespace kv_cache_manager {
 namespace {
 int64_t TtlUsToNs(int64_t ttl_us) { return ttl_us > 0 ? ttl_us * 1000 : ttl_us; }
+
+size_t ValidateFullBlockTrace(const GetLocationSchemaTrace &trace, size_t block_size) {
+    if (block_size == 0) {
+        throw std::runtime_error("GetCacheLocation requires positive instance block_size");
+    }
+
+    const size_t input_tokens = trace.input_token_count();
+    const size_t max_full_blocks = input_tokens / block_size;
+    if (trace.keys().size() <= max_full_blocks) {
+        return input_tokens;
+    }
+
+    throw std::runtime_error(
+        "GetCacheLocation trace contains partial tail block keys: instance_id=" + trace.instance_id() +
+        ", trace_id=" + trace.trace_id() + ", keys=" + std::to_string(trace.keys().size()) +
+        ", input_len=" + std::to_string(input_tokens) + ", block_size=" + std::to_string(block_size) +
+        ", max_full_blocks=" + std::to_string(max_full_blocks) +
+        ". Standard optimizer traces must drop incomplete tail blocks before replay.");
+}
 } // namespace
 
 void OptimizerRunner::Run(OptimizerConfig &config) {
@@ -106,6 +126,9 @@ void OptimizerRunner::HandleGetLocation(const GetLocationSchemaTrace &trace) {
         return;
     }
 
+    const size_t block_size = indexer_manager_->GetInstanceBlockSize(instance_id);
+    const size_t input_tokens = ValidateFullBlockTrace(trace, block_size);
+
     // 读请求前统一清理过期 block，并做节点清理（TTL 使用逻辑过期时刻记录）
     auto expired_evicted_blocks = indexer_manager_->EvictExpiredBeforeAccess(instance_id, trace.timestamp_ns());
     indexer_manager_->CleanEvictedBlocks(expired_evicted_blocks, trace.timestamp_ns(), true);
@@ -117,7 +140,6 @@ void OptimizerRunner::HandleGetLocation(const GetLocationSchemaTrace &trace) {
     }
 
     QueryHit query_hit;
-    const size_t block_size = indexer_manager_->GetInstanceBlockSize(instance_id);
     const bool read_triggered_tier_write =
         indexer->PrefixQuery(trace.keys(), trace.block_mask(), trace.timestamp_ns(), &query_hit, refresh_ttl_on_read);
     if (read_triggered_tier_write) {
@@ -134,7 +156,6 @@ void OptimizerRunner::HandleGetLocation(const GetLocationSchemaTrace &trace) {
         local_read_block_num = std::min(std::get<BlockMaskOffset>(trace.block_mask()), trace.keys().size());
     }
     size_t remote_read_block_num = trace.keys().size() - local_read_block_num;
-    const size_t input_tokens = trace.input_token_count();
 
     SubmitReadRecord(instance_id,
                      trace.trace_id(),

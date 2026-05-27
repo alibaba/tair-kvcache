@@ -138,6 +138,18 @@ TEST_F(OptimizerManagerTest, ReadUsesExplicitInputLen) {
     EXPECT_EQ(last_read->remote_hit_blocks, 1);
 }
 
+TEST_F(OptimizerManagerTest, ReadRejectsPartialTailBlockKeys) {
+    OptimizerManager manager(config_);
+    ASSERT_TRUE(manager.Init());
+
+    const std::vector<int64_t> keys = {1, 2};
+    manager.WriteCache("instance1", "write_trace", 1000, keys);
+
+    BlockMask remote_read_mask = std::vector<bool>{false, false};
+    EXPECT_THROW(manager.GetCacheLocation("instance1", "read_trace", 2000, keys, remote_read_mask, 1537),
+                 std::runtime_error);
+}
+
 TEST_F(OptimizerManagerTest, ReadWithoutFullBlocksCountsInputTokens) {
     OptimizerManager manager(config_);
     ASSERT_TRUE(manager.Init());
