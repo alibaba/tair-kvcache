@@ -31,6 +31,26 @@ void TtlEvictionPolicy::OnNodeWritten(std::vector<BlockEntry *> &blocks) {
     }
 }
 
+void TtlEvictionPolicy::OnBlockCopied(BlockEntry *block) {
+    if (!block || node_map_.find(block) != node_map_.end()) {
+        return;
+    }
+    auto *node = new ListNode();
+    node->payload_ = block;
+    auto compare = [this](const LinkedListNode *a, const LinkedListNode *b) {
+        const auto *na = static_cast<const ListNode *>(a);
+        const auto *nb = static_cast<const ListNode *>(b);
+        return GetTierAccessTime(na->payload_) <= GetTierAccessTime(nb->payload_);
+    };
+    list_.insert_sorted(node, compare);
+    node_map_[block] = node;
+    if (block->last_access_time > last_known_timestamp_) {
+        last_known_timestamp_ = block->last_access_time;
+    }
+    block->ttl_anchor_time = block->last_access_time;
+    PushExpireEvent(block);
+}
+
 void TtlEvictionPolicy::OnBlockAccessed(BlockEntry *block, int64_t timestamp) {
     OnBlockAccessedWithOptions(block, timestamp, true);
 }

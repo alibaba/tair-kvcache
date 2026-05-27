@@ -46,6 +46,11 @@ PYBIND11_MODULE(kvcm_py_optimizer, module) {
         .value("TTL", kvcm::EvictionPolicyType::POLICY_TTL)
         .finalize();
 
+    py::native_enum<kvcm::HitRatePerspective>(module, "HitRatePerspective", "enum.Enum")
+        .value("KVCM_L3", kvcm::HitRatePerspective::KVCM_L3)
+        .value("ENGINE_LOCAL", kvcm::HitRatePerspective::ENGINE_LOCAL)
+        .finalize();
+
     py::native_enum<kvcm::DataStorageType>(module, "DataStorageType", "enum.Enum")
         .value("DATA_STORAGE_TYPE_UNKNOWN", kvcm::DataStorageType::DATA_STORAGE_TYPE_UNKNOWN)
         .value("DATA_STORAGE_TYPE_HF3FS", kvcm::DataStorageType::DATA_STORAGE_TYPE_HF3FS)
@@ -113,10 +118,11 @@ PYBIND11_MODULE(kvcm_py_optimizer, module) {
 
     // 绑定OptimizerManager类
     py::class_<kvcm::OptimizerManager>(module, "OptimizerManager")
-        .def(py::init<const kvcm::OptimizerConfig &, bool, bool>(),
+        .def(py::init<const kvcm::OptimizerConfig &, bool, bool, kvcm::HitRatePerspective>(),
              py::arg("config"),
              py::arg("enable_lifecycle_tracking") = false,
              py::arg("enable_template_analysis") = false,
+             py::arg("hit_rate_perspective") = kvcm::HitRatePerspective::KVCM_L3,
              "Initialize OptimizerManager. Set enable_lifecycle_tracking=True to track block lifecycle (uses ~10GB "
              "more memory). Set enable_template_analysis=True to enable template prefix analysis (slower replay)")
         .def("Init", &kvcm::OptimizerManager::Init, py::call_guard<py::gil_scoped_release>())

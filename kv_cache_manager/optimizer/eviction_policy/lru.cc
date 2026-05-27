@@ -48,6 +48,25 @@ void LruEvictionPolicy::OnNodeWritten(std::vector<BlockEntry *> &blocks) {
     }
 }
 
+void LruEvictionPolicy::OnBlockCopied(BlockEntry *block) {
+    if (block == nullptr) {
+        return;
+    }
+    if (node_map_.find(block) != node_map_.end()) {
+        return;
+    }
+    int32_t shard_index = GetShardIndex(block);
+    auto *node = new LRUListNode();
+    node->payload_ = block;
+    auto compare = [this](const LinkedListNode *a, const LinkedListNode *b) {
+        const auto *na = static_cast<const LRUListNode *>(a);
+        const auto *nb = static_cast<const LRUListNode *>(b);
+        return GetTierAccessTime(na->payload_) <= GetTierAccessTime(nb->payload_);
+    };
+    shard_lists_[shard_index].insert_sorted(node, compare);
+    node_map_[block] = node;
+}
+
 void LruEvictionPolicy::OnBlockAccessed(BlockEntry *block, int64_t timestamp) {
     auto it = node_map_.find(block);
     if (it == node_map_.end()) {

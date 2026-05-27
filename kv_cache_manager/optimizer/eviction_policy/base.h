@@ -16,6 +16,7 @@ public:
 
     virtual void OnBlockWritten(BlockEntry *block) = 0;
     virtual void OnNodeWritten(std::vector<BlockEntry *> &blocks) = 0;
+    virtual void OnBlockCopied(BlockEntry *block) { OnBlockWritten(block); }
     virtual void OnBlockAccessedWithOptions(BlockEntry *block, int64_t timestamp, bool refresh_ttl_on_read) {
         (void)refresh_ttl_on_read;
         OnBlockAccessed(block, timestamp);

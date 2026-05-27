@@ -22,6 +22,7 @@ public:
 
     void OnBlockWritten(BlockEntry *block) override;
     void OnNodeWritten(std::vector<BlockEntry *> &blocks) override;
+    void OnBlockCopied(BlockEntry *block) override;
     void OnBlockAccessedWithOptions(BlockEntry *block, int64_t timestamp, bool refresh_ttl_on_read) override;
     std::vector<BlockEntry *> EvictBlocks(size_t count) override;
     std::vector<BlockEntry *> EvictExpired() override;

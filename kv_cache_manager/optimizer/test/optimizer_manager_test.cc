@@ -151,6 +151,23 @@ TEST_F(OptimizerManagerTest, ReadRejectsPartialTailBlockKeys) {
                  std::runtime_error);
 }
 
+TEST_F(OptimizerManagerTest, EngineLocalPerspectiveReportsSimulatedHitsAsLocal) {
+    OptimizerManager manager(config_, false, false, HitRatePerspective::ENGINE_LOCAL);
+    ASSERT_TRUE(manager.Init());
+
+    const std::vector<int64_t> keys = {1};
+    manager.WriteCache("instance1", "write_trace", 1000, keys);
+
+    BlockMask remote_read_mask = std::vector<bool>{false};
+    auto res = manager.GetCacheLocation("instance1", "read_trace", 2000, keys, remote_read_mask, 1024);
+    EXPECT_EQ(res.kvcm_hit_length, 1);
+
+    const auto *last_read = manager.hit_rate_tracker_->LastReadRecord("instance1");
+    ASSERT_NE(last_read, nullptr);
+    EXPECT_EQ(last_read->local_hit_blocks, 1);
+    EXPECT_EQ(last_read->remote_hit_blocks, 0);
+}
+
 TEST_F(OptimizerManagerTest, ReadWithoutFullBlocksCountsInputTokens) {
     OptimizerManager manager(config_);
     ASSERT_TRUE(manager.Init());

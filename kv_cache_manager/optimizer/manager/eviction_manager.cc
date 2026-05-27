@@ -7,13 +7,6 @@
 #include "kv_cache_manager/optimizer/eviction_policy/policy_factory.h"
 #include "kv_cache_manager/optimizer/index/radix_tree_index.h"
 namespace kv_cache_manager {
-namespace {
-bool IsCascadingEdge(const std::vector<TierFlowStrategy> &tier_flow_strategies, size_t edge_idx) {
-    return edge_idx < tier_flow_strategies.size() &&
-           tier_flow_strategies[edge_idx].write_mode == TierWriteMode::CASCADING;
-}
-} // namespace
-
 bool OptEvictionManager::Init(const EvictionConfig &eviction_config) {
     eviction_config_ = eviction_config;
     if (eviction_config_.eviction_mode() == EvictionMode::EVICTION_MODE_UNSPECIFIED) {
@@ -56,6 +49,7 @@ OptEvictionManager::CreateAndRegisterEvictionPolicy(const OptInstanceConfig &ins
                 return nullptr;
             }
             group.policies.push_back(std::move(policy));
+            group.tier_configs.push_back(storage_configs[i]);
         }
     } else {
         // 非分层: 单 "shared" 策略
@@ -75,13 +69,14 @@ OptEvictionManager::CreateAndRegisterEvictionPolicy(const OptInstanceConfig &ins
     return &inserted_it->second;
 }
 
-std::unordered_map<std::string, std::vector<BlockEntry *>> OptEvictionManager::EvictByMode(
-    const std::string &instance_id, const OptInstanceGroupConfig &instance_group_config, int64_t eviction_timestamp) {
-    std::unordered_map<std::string, std::vector<BlockEntry *>> all_evicted;
+OptEvictionManager::EvictionResult OptEvictionManager::EvictByMode(const std::string &instance_id,
+                                                                   const OptInstanceGroupConfig &instance_group_config,
+                                                                   int64_t eviction_timestamp) {
+    EvictionResult result;
 
     if (eviction_config_.eviction_mode() == EvictionMode::EVICTION_MODE_UNSPECIFIED) {
         KVCM_LOG_WARN("Eviction mode is unspecified, no eviction performed for instance: %s", instance_id.c_str());
-        return all_evicted;
+        return result;
     }
 
     const bool hierarchical = instance_group_config.hierarchical_eviction_enabled();
@@ -99,17 +94,30 @@ std::unordered_map<std::string, std::vector<BlockEntry *>> OptEvictionManager::E
             KVCM_LOG_DEBUG("Hierarchical eviction: tier %zu excess: %zu bytes", tier_idx, excess);
             auto tier_evicted = DispatchEviction(instance_id, instance_group_config, tier_idx, excess);
 
-            const bool demote_to_next_tier =
-                tier_idx + 1 < num_tiers && IsCascadingEdge(tier_flow_strategies, tier_idx);
+            const bool has_next_tier = (tier_idx + 1 < num_tiers);
+            const bool demote_to_next_tier = has_next_tier && tier_idx < tier_flow_strategies.size() &&
+                                             tier_flow_strategies[tier_idx].write_mode == TierWriteMode::CASCADING;
             for (auto &[inst_id, blocks] : tier_evicted) {
-                if (demote_to_next_tier && !blocks.empty()) {
-                    DemoteBlocksToTierChain(inst_id, tier_idx + 1, blocks, eviction_timestamp, tier_flow_strategies);
+                const std::string from_tier = instance_group_config.storages()[tier_idx].unique_name();
+                for (auto *block : blocks) {
+                    result.tier_flow.RecordLeave(
+                        inst_id, block, from_tier, TierFlowEventReason::CAPACITY_EVICTION, eviction_timestamp);
                 }
-                auto &vec = all_evicted[inst_id];
+                if (demote_to_next_tier && !blocks.empty()) {
+                    DemoteToNextTier(
+                        inst_id, tier_idx + 1, blocks, eviction_timestamp, tier_flow_strategies, &result.tier_flow);
+                }
+                for (auto *block : blocks) {
+                    if (block != nullptr && block->location_map.empty()) {
+                        result.tier_flow.RecordFinalEvict(
+                            inst_id, block, TierFlowEventReason::CAPACITY_EVICTION, eviction_timestamp);
+                    }
+                }
+                auto &vec = result.evicted_blocks[inst_id];
                 vec.insert(vec.end(), blocks.begin(), blocks.end());
             }
         }
-        return all_evicted;
+        return result;
     }
 
     // 非分层分支：shared 策略按 group quota 驱逐
@@ -123,34 +131,68 @@ std::unordered_map<std::string, std::vector<BlockEntry *>> OptEvictionManager::E
     for (const auto &[tier_idx, excess] : tasks) {
         auto tier_evicted = DispatchEviction(instance_id, instance_group_config, tier_idx, excess);
         for (auto &[inst_id, blocks] : tier_evicted) {
-            auto &vec = all_evicted[inst_id];
+            for (auto *block : blocks) {
+                result.tier_flow.RecordLeave(
+                    inst_id, block, "shared", TierFlowEventReason::CAPACITY_EVICTION, eviction_timestamp);
+                if (block != nullptr && block->location_map.empty()) {
+                    result.tier_flow.RecordFinalEvict(
+                        inst_id, block, TierFlowEventReason::CAPACITY_EVICTION, eviction_timestamp);
+                }
+            }
+            auto &vec = result.evicted_blocks[inst_id];
             vec.insert(vec.end(), blocks.begin(), blocks.end());
         }
     }
 
-    return all_evicted;
+    return result;
 }
 
-void OptEvictionManager::DemoteBlocksToTierChain(const std::string &instance_id,
-                                                 size_t start_tier_idx,
-                                                 const std::vector<BlockEntry *> &blocks,
-                                                 int64_t timestamp,
-                                                 const std::vector<TierFlowStrategy> &tier_flow_strategies) {
+void OptEvictionManager::DemoteToNextTier(const std::string &instance_id,
+                                          size_t next_tier_idx,
+                                          const std::vector<BlockEntry *> &blocks,
+                                          int64_t timestamp,
+                                          const std::vector<TierFlowStrategy> &tier_flow_strategies,
+                                          TierFlowRecorder *tier_flow) {
     auto it = instance_tiered_policy_map_.find(instance_id);
     if (it == instance_tiered_policy_map_.end()) {
-        KVCM_LOG_WARN("DemoteBlocksToTierChain: eviction policy not found for instance: %s", instance_id.c_str());
+        KVCM_LOG_WARN("DemoteToNextTier: eviction policy not found for instance: %s", instance_id.c_str());
         return;
     }
-    if (start_tier_idx >= it->second.policies.size()) {
-        // 没有下一层 → 彻底丢弃，Demote 无操作
+    if (next_tier_idx >= it->second.policies.size()) {
         return;
     }
     for (BlockEntry *block : blocks) {
-        AppendBlockToTierChain(block, start_tier_idx, it->second.policies, tier_flow_strategies, timestamp);
+        if (block == nullptr) {
+            continue;
+        }
+        size_t current_tier_idx = next_tier_idx;
+        while (current_tier_idx < it->second.policies.size()) {
+            auto &policy = it->second.policies[current_tier_idx];
+            const std::string &tier_name = policy->name();
+            if (block->location_map.find(tier_name) == block->location_map.end()) {
+                CopyBlockLocation(block, tier_name, timestamp, 0);
+                policy->OnBlockCopied(block);
+                if (tier_flow != nullptr) {
+                    const std::string from_tier =
+                        current_tier_idx > 0 ? it->second.policies[current_tier_idx - 1]->name() : "";
+                    tier_flow->RecordEnter(
+                        instance_id, block, from_tier, tier_name, TierFlowEventReason::CASCADING_DEMOTE, timestamp);
+                }
+            }
+            if (current_tier_idx >= tier_flow_strategies.size()) {
+                break;
+            }
+            const auto &flow = tier_flow_strategies[current_tier_idx];
+            const bool continue_write_through = flow.write_mode == TierWriteMode::WRITE_THROUGH;
+            if (!continue_write_through) {
+                break;
+            }
+            ++current_tier_idx;
+        }
     }
 }
 
-std::unordered_map<std::string, std::vector<BlockEntry *>>
+OptEvictionManager::EvictedBlocks
 OptEvictionManager::DispatchEviction(const std::string &instance_id,
                                      const OptInstanceGroupConfig &instance_group_config,
                                      std::optional<size_t> tier_idx,
@@ -167,9 +209,9 @@ OptEvictionManager::DispatchEviction(const std::string &instance_id,
     }
 }
 
-std::unordered_map<std::string, std::vector<BlockEntry *>> OptEvictionManager::EvictByGroupRough(
+OptEvictionManager::EvictedBlocks OptEvictionManager::EvictByGroupRough(
     const OptInstanceGroupConfig &instance_group_config, std::optional<size_t> tier_idx, size_t excess) {
-    std::unordered_map<std::string, std::vector<BlockEntry *>> evict_blocks;
+    EvictedBlocks evict_blocks;
     auto group_name = instance_group_config.group_name();
 
     if (tier_idx.has_value()) {
@@ -240,13 +282,13 @@ std::unordered_map<std::string, std::vector<BlockEntry *>> OptEvictionManager::E
     return evict_blocks;
 }
 
-std::unordered_map<std::string, std::vector<BlockEntry *>>
+OptEvictionManager::EvictedBlocks
 OptEvictionManager::EvictByInstance(const std::string &instance_id,
                                     const OptInstanceGroupConfig &instance_group_config,
                                     std::optional<size_t> tier_idx,
                                     size_t excess,
                                     bool precise) {
-    std::unordered_map<std::string, std::vector<BlockEntry *>> evict_blocks;
+    EvictedBlocks evict_blocks;
 
     if (tier_idx.has_value()) {
         KVCM_LOG_DEBUG("Instance%s eviction: instance %s, tier %zu, excess: %zu bytes",

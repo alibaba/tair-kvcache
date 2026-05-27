@@ -18,6 +18,9 @@ LeafAwareLruEvictionPolicy::~LeafAwareLruEvictionPolicy() {
 }
 
 void LeafAwareLruEvictionPolicy::OnBlockWritten(BlockEntry *block) {
+    if (block == nullptr) {
+        return;
+    }
     LeafLRUListNode *node = new LeafLRUListNode();
     node->payload_ = block;
     node_map_[block] = node;
@@ -33,6 +36,24 @@ void LeafAwareLruEvictionPolicy::OnBlockWritten(BlockEntry *block) {
 void LeafAwareLruEvictionPolicy::OnNodeWritten(std::vector<BlockEntry *> &blocks) {
     for (auto *block : blocks) {
         OnBlockWritten(block);
+    }
+}
+
+void LeafAwareLruEvictionPolicy::OnBlockCopied(BlockEntry *block) {
+    if (block == nullptr || node_map_.find(block) != node_map_.end()) {
+        return;
+    }
+    auto *node = new LeafLRUListNode();
+    node->payload_ = block;
+    node_map_[block] = node;
+    if (block->owner_node != nullptr && block->owner_node->isLeaf()) {
+        auto compare = [this](const LinkedListNode *a, const LinkedListNode *b) {
+            const auto *na = static_cast<const LeafLRUListNode *>(a);
+            const auto *nb = static_cast<const LeafLRUListNode *>(b);
+            return GetTierAccessTime(na->payload_) <= GetTierAccessTime(nb->payload_);
+        };
+        leaf_lru_list_.insert_sorted(node, compare);
+        leaf_blocks_.insert(block);
     }
 }
 

@@ -60,6 +60,18 @@ TEST_F(LruEvictionPolicyTest, OnBlockWritten) {
     EXPECT_EQ(policy_->size(), 2);
 }
 
+TEST_F(LruEvictionPolicyTest, OnBlockCopiedUsesInheritedAccessTime) {
+    auto newer_block = CreateBlock(1, 3000);
+    auto copied_old_block = CreateBlock(2, 1000);
+
+    policy_->OnBlockWritten(&newer_block);
+    policy_->OnBlockCopied(&copied_old_block);
+
+    auto evicted = policy_->EvictBlocks(1);
+    ASSERT_EQ(evicted.size(), 1);
+    EXPECT_EQ(evicted[0]->key, 2);
+}
+
 TEST_F(LruEvictionPolicyTest, OnBlockAccessed) {
     auto block1 = CreateBlock(1, 1000);
     auto block2 = CreateBlock(2, 2000);

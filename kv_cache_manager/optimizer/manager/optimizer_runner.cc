@@ -216,13 +216,9 @@ void OptimizerRunner::HandleGetLocation(const GetLocationSchemaTrace &trace, siz
 
     QueryHit query_hit;
     const size_t read_start_offset = std::min(access_start_offset, trace.keys().size());
-    const bool read_triggered_tier_write = indexer->PrefixQuery(trace.keys(),
-                                                               trace.block_mask(),
-                                                               trace.timestamp_ns(),
-                                                               &query_hit,
-                                                               refresh_ttl_on_read,
-                                                               read_start_offset);
-    if (read_triggered_tier_write) {
+    indexer->PrefixQuery(
+        trace.keys(), trace.block_mask(), trace.timestamp_ns(), &query_hit, refresh_ttl_on_read, read_start_offset);
+    if (indexer->ConsumeReadTriggeredTierWrite()) {
         auto capacity_evicted_blocks = indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_ns());
         indexer_manager_->CleanEvictedBlocks(capacity_evicted_blocks, trace.timestamp_ns());
     }
@@ -280,7 +276,7 @@ void OptimizerRunner::TouchGetLocation(const std::string &instance_id,
     }
 }
 
-WriteRecord OptimizerRunner::HandleWriteCache(const WriteCacheSchemaTrace &trace) {
+WriteRecord OptimizerRunner::HandleWriteCache(const WriteCacheSchemaTrace &trace, bool touch_existing) {
     WriteRecord record;
     record.timestamp_ns = trace.timestamp_ns();
     record.trace_id = trace.trace_id();
@@ -301,7 +297,7 @@ WriteRecord OptimizerRunner::HandleWriteCache(const WriteCacheSchemaTrace &trace
         effective_ttl_ns = -1;
     }
 
-    auto result = indexer->InsertOnly(trace.keys(), trace.timestamp_ns(), effective_ttl_ns);
+    auto result = indexer->InsertOnly(trace.keys(), trace.timestamp_ns(), effective_ttl_ns, touch_existing);
     auto capacity_evicted_blocks = indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_ns());
     std::set<std::vector<int64_t>> evicted_paths;
     for (const auto &[_, blocks] : capacity_evicted_blocks) {

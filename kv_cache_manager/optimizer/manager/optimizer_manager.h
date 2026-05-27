@@ -21,7 +21,8 @@ class OptimizerManager {
 public:
     OptimizerManager(const OptimizerConfig &config,
                      bool enable_lifecycle_tracking = false,
-                     bool enable_template_analysis = false);
+                     bool enable_template_analysis = false,
+                     HitRatePerspective hit_rate_perspective = HitRatePerspective::KVCM_L3);
     ~OptimizerManager() = default;
     bool Init();
 
@@ -37,7 +38,8 @@ public:
                                       const std::string &trace_id,
                                       const int64_t timestamp,
                                       const std::vector<int64_t> &block_ids,
-                                      const int64_t ttl_us);
+                                      const int64_t ttl_us,
+                                      bool touch_existing = true);
     GetCacheLocationRes GetCacheLocation(const std::string &instance_id,
                                          const std::string &trace_id,
                                          const int64_t timestamp,
@@ -93,5 +95,6 @@ private:
 
     bool enable_lifecycle_tracking_ = false;
     bool enable_template_analysis_ = false;
+    HitRatePerspective hit_rate_perspective_ = HitRatePerspective::KVCM_L3;
 };
 } // namespace kv_cache_manager

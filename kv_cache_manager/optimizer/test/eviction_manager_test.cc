@@ -371,6 +371,43 @@ TEST_F(OptEvictionManagerTest, HierarchicalEvictionEnabled) {
     EXPECT_NE(policy, nullptr);
 }
 
+TEST_F(OptEvictionManagerTest, DemoteToNextTierInheritsBlockHeat) {
+    auto instance_config = CreateTestInstanceConfig("instance1");
+    std::vector<OptTierConfig> tier_configs;
+    OptTierConfig tier1;
+    tier1.set_unique_name("tier1");
+    tier1.set_capacity(1024);
+    tier1.set_priority(1);
+    tier_configs.push_back(tier1);
+    OptTierConfig tier2;
+    tier2.set_unique_name("tier2");
+    tier2.set_capacity(1024);
+    tier2.set_priority(2);
+    tier_configs.push_back(tier2);
+
+    auto *policy_group = manager_->CreateAndRegisterEvictionPolicy(instance_config, tier_configs, true);
+    ASSERT_NE(policy_group, nullptr);
+
+    BlockEntry block;
+    block.key = 1;
+    block.last_access_time = 1000;
+    block.writing_time = 1000;
+    block.location_map["tier1"] = TierStat{0, 1000, 1000};
+    policy_group->GetPolicyByIndex(0)->OnBlockWritten(&block);
+
+    auto evicted = policy_group->GetPolicyByIndex(0)->EvictBlocks(1);
+    ASSERT_EQ(evicted.size(), 1);
+    ASSERT_EQ(block.location_map.count("tier1"), 0);
+
+    std::vector<TierFlowStrategy> flows(1);
+    flows[0].write_mode = TierWriteMode::CASCADING;
+    manager_->DemoteToNextTier("instance1", 1, evicted, 9000, flows);
+
+    ASSERT_EQ(block.location_map.count("tier2"), 1);
+    EXPECT_EQ(block.location_map.at("tier2").last_access_time, 1000);
+    EXPECT_EQ(block.location_map.at("tier2").writing_time, 1000);
+}
+
 TEST_F(OptEvictionManagerTest, ActiveEvictExpiredShouldNotTriggerFallbackEviction) {
     OptInstanceConfig ttl_instance;
     ttl_instance.set_instance_id("ttl_instance");

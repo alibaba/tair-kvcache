@@ -27,10 +27,12 @@ int64_t RequirePositiveInputLen(const char *api_name, int64_t input_len) {
 
 OptimizerManager::OptimizerManager(const OptimizerConfig &config,
                                    bool enable_lifecycle_tracking,
-                                   bool enable_template_analysis)
+                                   bool enable_template_analysis,
+                                   HitRatePerspective hit_rate_perspective)
     : config_(config)
     , enable_lifecycle_tracking_(enable_lifecycle_tracking)
-    , enable_template_analysis_(enable_template_analysis) {}
+    , enable_template_analysis_(enable_template_analysis)
+    , hit_rate_perspective_(hit_rate_perspective) {}
 
 bool OptimizerManager::Init() {
     eviction_manager_.reset(new OptEvictionManager());
@@ -47,7 +49,7 @@ bool OptimizerManager::Init() {
 
     // ---- 初始化 StatsCollector 并注册子 Tracker ----
     stats_collector_ = std::make_shared<StatsCollector>();
-    hit_rate_tracker_ = stats_collector_->EmplaceTracker<HitRateTracker>();
+    hit_rate_tracker_ = stats_collector_->EmplaceTracker<HitRateTracker>(hit_rate_perspective_);
 
     if (enable_template_analysis_) {
         template_prefix_tracker_ = stats_collector_->EmplaceTracker<TemplatePrefixTracker>();
@@ -228,14 +230,15 @@ WriteCacheRes OptimizerManager::WriteCacheWithTtlUs(const std::string &instance_
                                                     const std::string &trace_id,
                                                     const int64_t timestamp,
                                                     const std::vector<int64_t> &block_ids,
-                                                    const int64_t ttl_us) {
+                                                    const int64_t ttl_us,
+                                                    bool touch_existing) {
     WriteCacheSchemaTrace trace;
     trace.set_instance_id(instance_id);
     trace.set_trace_id(trace_id);
     trace.set_timestamp_ns(timestamp);
     trace.set_keys(block_ids);
     trace.set_ttl_us(ttl_us);
-    const auto write_record = optimizer_runner_->HandleWriteCache(trace);
+    const auto write_record = optimizer_runner_->HandleWriteCache(trace, touch_existing);
     stats_collector_->UpdateTimestamp(instance_id, timestamp);
 
     WriteCacheRes res;
@@ -271,7 +274,9 @@ GetCacheLocationRes OptimizerManager::GetCacheLocation(const std::string &instan
 
     const auto *last_read = hit_rate_tracker_->LastReadRecord(instance_id);
     if (last_read) {
-        res.kvcm_hit_length = last_read->remote_hit_blocks;
+        res.kvcm_hit_length = (hit_rate_perspective_ == HitRatePerspective::ENGINE_LOCAL)
+                                  ? last_read->local_hit_blocks
+                                  : last_read->remote_hit_blocks;
     }
     return res;
 }
@@ -298,7 +303,9 @@ GetCacheLocationRes OptimizerManager::GetCacheLocationAfterPrefix(const std::str
 
     const auto *last_read = hit_rate_tracker_->LastReadRecord(instance_id);
     if (last_read) {
-        res.kvcm_hit_length = last_read->remote_hit_blocks;
+        res.kvcm_hit_length = (hit_rate_perspective_ == HitRatePerspective::ENGINE_LOCAL)
+                                  ? last_read->local_hit_blocks
+                                  : last_read->remote_hit_blocks;
     }
     return res;
 }

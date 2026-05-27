@@ -23,6 +23,7 @@ public:
     ~LeafAwareLruEvictionPolicy() override;
     void OnBlockWritten(BlockEntry *block) override;
     void OnNodeWritten(std::vector<BlockEntry *> &blocks) override;
+    void OnBlockCopied(BlockEntry *block) override;
     std::vector<BlockEntry *> EvictBlocks(size_t count) override;
     void Clear() override;
     size_t size() const override { return node_map_.size(); }

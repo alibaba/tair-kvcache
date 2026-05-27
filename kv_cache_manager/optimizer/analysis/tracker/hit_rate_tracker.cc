@@ -14,13 +14,14 @@ namespace {
 }
 } // namespace
 
-HitRateTracker::HitRateTracker() : StatsTracker("HitRateTracker") {}
+HitRateTracker::HitRateTracker(HitRatePerspective perspective)
+    : StatsTracker("HitRateTracker"), perspective_(perspective) {}
 
 // ============================================================================
 // 事件处理
 // ============================================================================
 void HitRateTracker::OnReadComplete(const std::string &instance_id, const ReadRecord &record) {
-    instance_data_[instance_id].read_records.push_back(record);
+    instance_data_[instance_id].read_records.push_back(NormalizeReadRecord(record));
 }
 
 void HitRateTracker::OnWriteComplete(const std::string &instance_id, const WriteRecord &record) {
@@ -44,6 +45,19 @@ const WriteRecord *HitRateTracker::LastWriteRecord(const std::string &instance_i
         return nullptr;
     }
     return &it->second.write_records.back();
+}
+
+ReadRecord HitRateTracker::NormalizeReadRecord(const ReadRecord &record) const {
+    if (perspective_ != HitRatePerspective::ENGINE_LOCAL) {
+        return record;
+    }
+
+    ReadRecord normalized = record;
+    normalized.local_read_blocks = record.local_read_blocks + record.remote_read_blocks;
+    normalized.remote_read_blocks = 0;
+    normalized.local_hit_blocks = record.local_hit_blocks + record.remote_hit_blocks;
+    normalized.remote_hit_blocks = 0;
+    return normalized;
 }
 
 // ============================================================================
@@ -97,7 +111,7 @@ void HitRateTracker::ExportHitRates(const std::string &instance_id,
     bool has_tiered_data = (num_tiers > 0);
 
     // ---- 写入 CSV ----
-    file << "TimestampNs,CachedBlocks,CachedBlocksAllInstances,ReadBlocks,LocalHitBlocks,RemoteHitBlocks,HitBlocks,"
+    file << "TimestampNs,TraceId,CachedBlocks,CachedBlocksAllInstances,ReadBlocks,LocalHitBlocks,RemoteHitBlocks,HitBlocks,"
             "InputTokens,LocalHitTokens,RemoteHitTokens,HitTokens,LocalHitRate,RemoteHitRate,HitRate,"
             "AccReadBlocks,AccHitBlocks,AccInputTokens,AccLocalHitTokens,AccRemoteHitTokens,AccHitTokens,"
             "AccLocalHitRate,AccRemoteHitRate,AccHitRate,AccWriteBlocks";
@@ -153,9 +167,10 @@ void HitRateTracker::ExportHitRates(const std::string &instance_id,
             write_index++;
         }
 
-        file << r.timestamp_ns << "," << r.current_cache_blocks << "," << SumVecSizeT(r.blocks_per_instance) << ","
-             << read_blocks << "," << r.local_hit_blocks << "," << r.remote_hit_blocks << "," << current_hit << ","
-             << input_tokens << "," << local_hit_tokens << "," << remote_hit_tokens << "," << hit_tokens << ","
+        file << r.timestamp_ns << "," << r.trace_id << "," << r.current_cache_blocks << ","
+             << SumVecSizeT(r.blocks_per_instance) << "," << read_blocks << "," << r.local_hit_blocks << ","
+             << r.remote_hit_blocks << "," << current_hit << "," << input_tokens << "," << local_hit_tokens << ","
+             << remote_hit_tokens << "," << hit_tokens << ","
              << (input_tokens > 0 ? static_cast<double>(local_hit_tokens) / input_tokens : 0.0) << ","
              << (input_tokens > 0 ? static_cast<double>(remote_hit_tokens) / input_tokens : 0.0) << ","
              << (input_tokens > 0 ? static_cast<double>(hit_tokens) / input_tokens : 0.0) << "," << acc_read_blocks

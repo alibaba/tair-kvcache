@@ -16,8 +16,8 @@ struct BlockEntry;
 
 struct ReadRecord {
     int64_t timestamp_ns;
-    // local = trace block_mask 带入的已有本地命中；remote = optimizer 模拟层命中。
-    // 标准分析口径不按 local/remote 拆分，只用请求级 InputTokens/HitTokens。
+    // KVCM/L3-only: local = trace block_mask 带入的 engine 本地命中；remote = KVCM/L3 模拟命中。
+    // hierarchical replay 在 combined 输出中复用 local/remote 表示 engine L1/L2 命中与 L3 pool 命中。
     size_t remote_read_blocks;
     size_t remote_hit_blocks;
     size_t local_read_blocks;

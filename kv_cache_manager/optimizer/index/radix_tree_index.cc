@@ -4,24 +4,42 @@
 #include <iostream>
 #include <queue>
 #include <sstream>
+#include <stdexcept>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/optimizer/analysis/stats_collector.h"
 
 namespace kv_cache_manager {
+
 namespace {
-bool AppendBlockToSingleTier(BlockEntry *block, const std::shared_ptr<EvictionPolicy> &tier_policy, int64_t timestamp) {
-    if (!block || !tier_policy) {
-        return false;
+void SetBlockWriteState(BlockEntry *block, int64_t timestamp, int64_t ttl_ns) {
+    if (block == nullptr) {
+        return;
     }
-    const std::string &tier_name = tier_policy->name();
-    if (block->location_map.find(tier_name) != block->location_map.end()) {
-        return false;
+    block->writing_time = timestamp;
+    block->last_access_time = timestamp;
+    block->ttl_ns = ttl_ns;
+}
+
+bool ShouldMaterializeBlock(const std::vector<bool> *materialized_blocks, size_t index) {
+    return materialized_blocks == nullptr || (index < materialized_blocks->size() && (*materialized_blocks)[index]);
+}
+
+std::vector<int64_t> MaterializedKeys(const std::vector<int64_t> &block_keys,
+                                      const std::vector<bool> *materialized_blocks,
+                                      size_t materialized_offset) {
+    if (materialized_blocks == nullptr) {
+        return block_keys;
     }
-    AppendBlockLocation(block, tier_name, timestamp);
-    tier_policy->OnBlockWritten(block);
-    return true;
+    std::vector<int64_t> keys;
+    for (size_t i = 0; i < block_keys.size(); ++i) {
+        if (ShouldMaterializeBlock(materialized_blocks, materialized_offset + i)) {
+            keys.push_back(block_keys[i]);
+        }
+    }
+    return keys;
 }
 } // namespace
 
@@ -67,93 +85,135 @@ void RadixTreeIndex::InitTierFlowStrategies(TierWriteMode write_mode,
         TierFlowStrategy default_strategy;
         default_strategy.write_mode = write_mode;
         default_strategy.access_propagation_enabled = tier_access_propagation_enabled;
-        default_strategy.promote_enabled = false;
         default_strategy.selective_write_threshold = selective_write_threshold;
         tier_flow_strategies_.assign(edge_count, default_strategy);
     }
 
-    write_tier_count_ = CountInitialWriteTiers(tier_policies_.size(), tier_flow_strategies_);
-    enable_promote_ = false;
-    for (const auto &strategy : tier_flow_strategies_) {
-        if (strategy.promote_enabled) {
-            enable_promote_ = true;
-            break;
-        }
+    write_tier_count_ = tier_policies_.empty() ? 0 : 1;
+    while (write_tier_count_ < tier_policies_.size() && IsWriteThroughEdge(write_tier_count_ - 1)) {
+        ++write_tier_count_;
     }
 }
 
-// TODO 后续改为 记录需要更新信息的node和blockentry，然后统一用一个接口更新
-// 这样可以做到反向更新lru链表，避免同一时间戳下先驱逐前缀
 RadixTreeIndex::InsertResult
 RadixTreeIndex::InsertOnly(const std::vector<int64_t> &block_keys, int64_t timestamp, int64_t ttl_ns) {
     if (block_keys.empty()) {
         return {block_keys};
     }
+    current_tier_flow_.Clear();
     // 0 = 使用 default_ttl_ns_, -1 = 禁用(永不过期), >0 = 自定义
     int64_t resolved_ttl = (ttl_ns > 0) ? ttl_ns : (ttl_ns == 0) ? default_ttl_ns_ : 0;
-    return InsertNode(root_.get(), block_keys, timestamp, resolved_ttl);
+    auto result = InsertNode(root_.get(), block_keys, timestamp, resolved_ttl, true, true);
+    result.tier_flow = ConsumeTierFlow();
+    return result;
+}
+
+RadixTreeIndex::InsertResult RadixTreeIndex::FillPathOnly(const std::vector<int64_t> &block_keys,
+                                                          const std::vector<size_t> &materialized_indices,
+                                                          int64_t timestamp,
+                                                          int64_t ttl_ns) {
+    if (block_keys.empty() || materialized_indices.empty()) {
+        return {};
+    }
+    current_tier_flow_.Clear();
+    int64_t resolved_ttl = (ttl_ns > 0) ? ttl_ns : (ttl_ns == 0) ? default_ttl_ns_ : 0;
+    std::vector<bool> materialized_blocks(block_keys.size(), false);
+    for (const size_t idx : materialized_indices) {
+        if (idx >= materialized_blocks.size()) {
+            throw std::out_of_range("materialized index out of range");
+        }
+        materialized_blocks[idx] = true;
+    }
+    auto result = InsertNode(root_.get(), block_keys, timestamp, resolved_ttl, false, false, &materialized_blocks, 0);
+    result.tier_flow = ConsumeTierFlow();
+    return result;
 }
 // 先返回键值，后续看需要location或是针对block的access信息的需求之后再返回BlockEntry指针
 // 目前还没有热数据fetch的功能
 RadixTreeIndex::InsertResult RadixTreeIndex::InsertNode(RadixTreeNode *node,
                                                         const std::vector<int64_t> &block_keys,
                                                         int64_t timestamp,
-                                                        int64_t ttl_ns) {
+                                                        int64_t ttl_ns,
+                                                        bool touch_existing,
+                                                        bool count_new_tier_write_touch,
+                                                        const std::vector<bool> *materialized_blocks,
+                                                        size_t materialized_offset) {
     if (block_keys.empty()) {
         return {block_keys};
     }
     // 叶子追加 = 严格前缀包含（树结构保证 B 走完了 A 的全部 blocks）
     if (node->isLeaf() && node->parent != nullptr) {
-        WriteToTier(node, block_keys, timestamp, ttl_ns, nullptr);
-        return {block_keys};
+        WriteToTier(
+            node, block_keys, timestamp, ttl_ns, count_new_tier_write_touch, materialized_blocks, materialized_offset);
+        return {MaterializedKeys(block_keys, materialized_blocks, materialized_offset), {}};
     }
     int64_t current_key = block_keys.front();
     auto child_it = node->children.find(current_key);
     if (child_it == node->children.end()) {
         auto new_node = std::make_unique<RadixTreeNode>();
         new_node->parent = node;
-        WriteToTier(new_node.get(), block_keys, timestamp, ttl_ns, nullptr);
+        WriteToTier(new_node.get(),
+                    block_keys,
+                    timestamp,
+                    ttl_ns,
+                    count_new_tier_write_touch,
+                    materialized_blocks,
+                    materialized_offset);
         node->children[current_key] = std::move(new_node);
-        return InsertResult{block_keys};
+        return InsertResult{MaterializedKeys(block_keys, materialized_blocks, materialized_offset), {}};
     } else {
         // 情况2:找到对应子节点，继续匹配插入
         RadixTreeNode *child = child_it->second.get();
         std::vector<int64_t> insert_keys;
-        std::unordered_map<int64_t, BlockEntry *> evicted_blocks;
         size_t match_len = 0;
         // 找到最长匹配前缀
         while (match_len < child->blocks.size() && match_len < block_keys.size() &&
                child->blocks[match_len]->key == block_keys[match_len]) {
-            if (IsBlockEvict(child->blocks[match_len].get(), timestamp)) {
-                insert_keys.push_back(block_keys[match_len]);
-                evicted_blocks[block_keys[match_len]] = child->blocks[match_len].get();
+            BlockEntry *matched_block = child->blocks[match_len].get();
+            const bool materialize = ShouldMaterializeBlock(materialized_blocks, materialized_offset + match_len);
+            if (materialize && IsBlockEvict(matched_block, timestamp)) {
+                if (MaterializeExistingBlockOnWrite(matched_block, timestamp, ttl_ns, count_new_tier_write_touch)) {
+                    insert_keys.push_back(block_keys[match_len]);
+                }
+            } else if (materialize && touch_existing) {
+                RefreshExistingBlockOnWrite(matched_block, timestamp);
             }
             match_len++;
         }
-        // 处理被驱逐的blocks，block存在但location为空，需要重新写入location
-        if (!evicted_blocks.empty()) {
-            WriteToTier(child, insert_keys, timestamp, ttl_ns, AppendEvictBlocks(std::move(evicted_blocks), ttl_ns));
-        }
         if (match_len == child->blocks.size()) {
             // 完全匹配，递归向下
-            auto remain_result = InsertNode(
-                child, std::vector<int64_t>(block_keys.begin() + match_len, block_keys.end()), timestamp, ttl_ns);
+            std::vector<int64_t> remain_keys(block_keys.begin() + match_len, block_keys.end());
+            auto remain_result = InsertNode(child,
+                                            remain_keys,
+                                            timestamp,
+                                            ttl_ns,
+                                            touch_existing,
+                                            count_new_tier_write_touch,
+                                            materialized_blocks,
+                                            materialized_offset + match_len);
             insert_keys.insert(
                 insert_keys.end(), remain_result.inserted_keys.begin(), remain_result.inserted_keys.end());
-            return InsertResult{insert_keys};
+            return InsertResult{insert_keys, {}};
         } else if (match_len == block_keys.size()) {
             // keys 完全匹配到子节点的部分前缀
-            return InsertResult{insert_keys};
+            return InsertResult{insert_keys, {}};
         } else {
             // 部分匹配 → SplitNode
+            std::vector<int64_t> right_keys(block_keys.begin() + match_len, block_keys.end());
             SplitNode(child,
                       match_len,
-                      std::vector<int64_t>(block_keys.begin() + match_len, block_keys.end()),
+                      right_keys,
                       timestamp,
-                      ttl_ns);
-            auto remain_results = std::vector<int64_t>(block_keys.begin() + match_len, block_keys.end());
-            insert_keys.insert(insert_keys.end(), remain_results.begin(), remain_results.end());
-            return InsertResult{insert_keys};
+                      ttl_ns,
+                      count_new_tier_write_touch,
+                      materialized_blocks,
+                      materialized_offset + match_len);
+            for (size_t i = 0; i < right_keys.size(); ++i) {
+                if (ShouldMaterializeBlock(materialized_blocks, materialized_offset + match_len + i)) {
+                    insert_keys.push_back(right_keys[i]);
+                }
+            }
+            return InsertResult{insert_keys, {}};
         }
     }
 }
@@ -162,7 +222,10 @@ void RadixTreeIndex::SplitNode(RadixTreeNode *existing_node,
                                size_t split_pos,
                                const std::vector<int64_t> &right_keys,
                                int64_t timestamp,
-                               int64_t ttl_ns) {
+                               int64_t ttl_ns,
+                               bool count_new_tier_write_touch,
+                               const std::vector<bool> *materialized_blocks,
+                               size_t materialized_offset) {
     if (split_pos == 0)
         return;
 
@@ -192,22 +255,30 @@ void RadixTreeIndex::SplitNode(RadixTreeNode *existing_node,
     if (!right_keys.empty()) {
         auto new_leaf = std::make_unique<RadixTreeNode>();
         new_leaf->parent = middle_ptr;
-        WriteToTier(new_leaf.get(), right_keys, timestamp, ttl_ns, nullptr);
+        WriteToTier(new_leaf.get(),
+                    right_keys,
+                    timestamp,
+                    ttl_ns,
+                    count_new_tier_write_touch,
+                    materialized_blocks,
+                    materialized_offset);
         middle_ptr->children[right_keys.front()] = std::move(new_leaf);
     }
 
     original_parent->children[edge_key] = std::move(middle_node);
 }
 // 同样，这里的PrefixQuery只返回命中key，后续看需求再返回BlockEntry指针等信息
-bool RadixTreeIndex::PrefixQuery(const std::vector<int64_t> &block_keys,
+void RadixTreeIndex::PrefixQuery(const std::vector<int64_t> &block_keys,
                                  const BlockMask &block_mask,
                                  const int64_t timestamp,
                                  QueryHit *query_hit,
                                  bool refresh_ttl_on_read,
-                                 size_t access_start_offset) {
-    bool read_triggered_tier_write = false;
+                                 bool touch_local_hits,
+                                 bool local_hits_are_reads) {
+    current_tier_flow_.Clear();
+    read_triggered_tier_write_ = false;
     if (block_keys.empty()) {
-        return false;
+        return;
     }
 
     RadixTreeNode *current_node = root_.get();
@@ -221,36 +292,44 @@ bool RadixTreeIndex::PrefixQuery(const std::vector<int64_t> &block_keys,
         }
         RadixTreeNode *child = child_it->second.get();
         size_t match_len = 0;
-        bool has_remote_hit = false;
-        bool has_local_hit = false;
+        bool has_touched_hit = false;
+        bool has_read_hit = false;
         while (match_len < child->blocks.size() && (key_idx + match_len) < block_keys.size() &&
                child->blocks[match_len]->key == block_keys[key_idx + match_len]) {
             if (IsBlockEvict(child->blocks[match_len].get(), timestamp)) {
+                const size_t block_idx = key_idx + match_len;
+                if (IsIndexInMaskRange(block_mask, block_idx)) {
+                    match_len++;
+                    continue;
+                }
                 break;
             }
             const size_t block_idx = key_idx + match_len;
-            if (block_idx < access_start_offset) {
-                match_len++;
-                continue;
-            }
             BlockEntry *blk = child->blocks[match_len].get();
             const bool is_local = IsIndexInMaskRange(block_mask, block_idx);
-            if (is_local) {
-                has_local_hit = true;
-                RecordTieredHit(blk, false, query_hit);
-            } else {
-                has_remote_hit = true;
-                RecordTieredHit(blk, true, query_hit);
+            const bool hit_is_read = !is_local || local_hits_are_reads;
+            if (hit_is_read && is_local) {
+                RecordTieredHit(blk, block_idx, false, query_hit);
+            } else if (hit_is_read) {
+                RecordTieredHit(blk, block_idx, true, query_hit);
             }
-            read_triggered_tier_write =
-                OnBlockAccessed(blk, timestamp, refresh_ttl_on_read) || read_triggered_tier_write;
-            if (enable_promote_) {
-                read_triggered_tier_write = PromoteToHigherTiers(blk, timestamp) || read_triggered_tier_write;
+            const bool touch_hit = hit_is_read || touch_local_hits;
+            if (touch_hit) {
+                if (hit_is_read) {
+                    OnBlockAccessed(blk, timestamp, refresh_ttl_on_read);
+                    PromoteToHigherTiers(blk, timestamp);
+                    has_read_hit = true;
+                } else {
+                    TouchBlock(blk, timestamp);
+                }
+                has_touched_hit = true;
             }
             match_len++;
         }
-        if (has_remote_hit || has_local_hit) {
+        if (has_touched_hit) {
             child->stat.last_access_time = timestamp;
+        }
+        if (has_read_hit) {
             child->stat.access_count += 1;
         }
         if (match_len < child->blocks.size()) {
@@ -261,7 +340,82 @@ bool RadixTreeIndex::PrefixQuery(const std::vector<int64_t> &block_keys,
         current_node = child;
         key_idx += match_len;
     }
-    return read_triggered_tier_write;
+}
+
+void RadixTreeIndex::BatchQuery(const std::vector<int64_t> &block_keys,
+                                const BlockMask &block_mask,
+                                const int64_t timestamp,
+                                QueryHit *query_hit,
+                                bool refresh_ttl_on_read,
+                                bool touch_local_hits,
+                                bool local_hits_are_reads) {
+    current_tier_flow_.Clear();
+    read_triggered_tier_write_ = false;
+    if (block_keys.empty()) {
+        return;
+    }
+
+    for (size_t block_idx = 0; block_idx < block_keys.size(); ++block_idx) {
+        auto block_it = block_index_.find(block_keys[block_idx]);
+        if (block_it == block_index_.end() || block_it->second == nullptr ||
+            IsBlockEvict(block_it->second, timestamp)) {
+            continue;
+        }
+
+        BlockEntry *block = block_it->second;
+        const bool is_local = IsIndexInMaskRange(block_mask, block_idx);
+        const bool hit_is_read = !is_local || local_hits_are_reads;
+        if (hit_is_read && is_local) {
+            RecordTieredHit(block, block_idx, false, query_hit);
+        } else if (hit_is_read) {
+            RecordTieredHit(block, block_idx, true, query_hit);
+        }
+
+        const bool touch_hit = hit_is_read || touch_local_hits;
+        if (!touch_hit) {
+            continue;
+        }
+        if (hit_is_read) {
+            OnBlockAccessed(block, timestamp, refresh_ttl_on_read);
+            PromoteToHigherTiers(block, timestamp);
+            if (block->owner_node != nullptr) {
+                block->owner_node->stat.access_count += 1;
+                block->owner_node->stat.last_access_time = timestamp;
+            }
+        } else {
+            TouchBlock(block, timestamp);
+            if (block->owner_node != nullptr) {
+                block->owner_node->stat.last_access_time = timestamp;
+            }
+        }
+    }
+}
+
+void RadixTreeIndex::TouchKeysAtTier(const std::vector<int64_t> &block_keys,
+                                     const std::string &tier_name,
+                                     int64_t timestamp,
+                                     bool refresh_ttl_on_read) {
+    current_tier_flow_.Clear();
+    auto tier_it = std::find(tier_names_.begin(), tier_names_.end(), tier_name);
+    if (tier_it == tier_names_.end()) {
+        throw std::runtime_error("Unknown tier for TouchKeysAtTier: " + tier_name);
+    }
+    const size_t tier_idx = static_cast<size_t>(std::distance(tier_names_.begin(), tier_it));
+    for (const int64_t key : block_keys) {
+        auto block_it = block_index_.find(key);
+        if (block_it == block_index_.end() || block_it->second == nullptr ||
+            IsBlockEvict(block_it->second, timestamp)) {
+            continue;
+        }
+        BlockEntry *block = block_it->second;
+        if (block->location_map.find(tier_name) == block->location_map.end()) {
+            continue;
+        }
+        block->access_count += 1;
+        block->last_access_time = timestamp;
+        TouchTierLocation(block, tier_idx, timestamp, refresh_ttl_on_read, false, true);
+        current_tier_flow_.RecordReadTouch(instance_id_, block, tier_name, TierFlowEventReason::READ, timestamp);
+    }
 }
 
 size_t RadixTreeIndex::PrefixMatchCount(const std::vector<int64_t> &block_keys, int64_t timestamp) const {
@@ -295,6 +449,38 @@ size_t RadixTreeIndex::PrefixMatchCount(const std::vector<int64_t> &block_keys, 
         key_idx += match_len;
     }
     return matched;
+}
+
+std::vector<int64_t> RadixTreeIndex::PoolSourceWriteTouchKeysAtLeast(const std::vector<int64_t> &block_keys,
+                                                                     size_t threshold,
+                                                                     int64_t timestamp) const {
+    std::vector<int64_t> keys;
+    if (block_keys.empty() || threshold == 0 || tier_names_.empty()) {
+        return keys;
+    }
+
+    const bool tiered = tier_names_.size() > 1;
+    const std::string &source_tier = tier_names_.back();
+    for (const int64_t key : block_keys) {
+        auto block_it = block_index_.find(key);
+        if (block_it == block_index_.end() || IsBlockEvict(block_it->second, timestamp)) {
+            continue;
+        }
+        const BlockEntry *block = block_it->second;
+        const TierStat *source_stat = nullptr;
+        if (tiered) {
+            auto loc_it = block->location_map.find(source_tier);
+            if (loc_it != block->location_map.end()) {
+                source_stat = &loc_it->second;
+            }
+        } else if (!block->location_map.empty()) {
+            source_stat = &block->location_map.begin()->second;
+        }
+        if (source_stat != nullptr && source_stat->write_touch_count >= threshold) {
+            keys.push_back(key);
+        }
+    }
+    return keys;
 }
 
 std::vector<int64_t> RadixTreeIndex::PrefixPathForBlock(const BlockEntry *block) const {
@@ -348,6 +534,10 @@ void RadixTreeIndex::CleanEmptyBlocks(const std::vector<BlockEntry *> &blocks,
                 stats_collector_->OnBlockEviction(instance_id_, block, effective_eviction_timestamp);
             }
 
+            auto indexed = block_index_.find(block->key);
+            if (indexed != block_index_.end() && indexed->second == block) {
+                block_index_.erase(indexed);
+            }
             block->ResetAccess();
             auto owner_node = block->owner_node;
             if (owner_node && owner_node->parent) {
@@ -386,180 +576,280 @@ void RadixTreeIndex::CleanEmptyBlocks(const std::vector<BlockEntry *> &blocks,
     }
 }
 
-std::vector<BlockEntry *> RadixTreeIndex::AppendNewBlocks(RadixTreeNode *node,
-                                                          const std::vector<int64_t> &block_keys,
-                                                          int64_t timestamp,
-                                                          int64_t ttl_ns) {
+std::vector<BlockEntry *> RadixTreeIndex::AppendPathBlocks(RadixTreeNode *node,
+                                                           const std::vector<int64_t> &block_keys,
+                                                           int64_t timestamp,
+                                                           int64_t ttl_ns,
+                                                           bool count_new_tier_write_touch,
+                                                           const std::vector<bool> *materialized_blocks,
+                                                           size_t materialized_offset) {
     std::vector<BlockEntry *> inserted_blocks;
     inserted_blocks.reserve(block_keys.size());
     for (size_t i = 0; i < block_keys.size(); ++i) {
         auto entry = std::make_unique<BlockEntry>();
         entry->key = block_keys[i];
-        entry->writing_time = timestamp;
-        entry->last_access_time = timestamp;
-        entry->ttl_ns = ttl_ns;
         entry->owner_node = node;
         BlockEntry *entry_ptr = entry.get();
-        AppendInitialBlockLocations(entry_ptr, timestamp);
-        node->blocks.emplace_back(std::move(entry));
-        inserted_blocks.push_back(entry_ptr);
-
-        if (stats_collector_) {
-            stats_collector_->OnBlockBirth(instance_id_, entry_ptr, timestamp);
+        if (ShouldMaterializeBlock(materialized_blocks, materialized_offset + i)) {
+            block_index_[entry_ptr->key] = entry_ptr;
+            SetBlockWriteState(entry_ptr, timestamp, ttl_ns);
+            PlaceBlockOnWriteTiers(entry_ptr, timestamp, count_new_tier_write_touch);
+            inserted_blocks.push_back(entry_ptr);
+            if (stats_collector_) {
+                stats_collector_->OnBlockBirth(instance_id_, entry_ptr, timestamp);
+            }
         }
+        node->blocks.emplace_back(std::move(entry));
     }
     return inserted_blocks;
 }
 
-void RadixTreeIndex::AppendInitialBlockLocations(BlockEntry *block, int64_t timestamp) const {
-    if (!block) {
+void AppendBlockLocation(BlockEntry *block,
+                         const std::string &unique_name,
+                         int64_t timestamp,
+                         size_t write_touch_count) {
+    if (block == nullptr) {
         return;
     }
-    for (size_t tier_idx = 0; tier_idx < write_tier_count_; ++tier_idx) {
-        AppendBlockLocation(block, tier_names_[tier_idx], timestamp);
-    }
+    block->location_map[unique_name] = TierStat{0, timestamp, timestamp, write_touch_count};
 }
 
-void AppendBlockLocation(BlockEntry *block, const std::string &unique_name, int64_t timestamp) {
-    if (unique_name == "shared") {
-        // 全局驱逐策略，不区分tier，使用统一的location记录
-        block->location_map[unique_name] = TierStat();
-    } else {
-        // 分层驱逐策略，记录具体tier的location信息
-        block->location_map[unique_name] = TierStat{0, timestamp, timestamp};
+void CopyBlockLocation(BlockEntry *block, const std::string &unique_name, int64_t timestamp, size_t write_touch_count) {
+    if (block == nullptr) {
+        return;
     }
+    block->location_map[unique_name] = TierStat{0, timestamp, timestamp, write_touch_count};
 }
 
-size_t CountInitialWriteTiers(size_t tier_count, const std::vector<TierFlowStrategy> &tier_flow_strategies) {
-    if (tier_count == 0) {
-        return 0;
-    }
-    size_t write_tier_count = 1;
-    while (write_tier_count < tier_count && write_tier_count - 1 < tier_flow_strategies.size() &&
-           tier_flow_strategies[write_tier_count - 1].write_mode == TierWriteMode::WRITE_THROUGH) {
-        ++write_tier_count;
-    }
-    return write_tier_count;
-}
-
-bool AppendBlockToTierChain(BlockEntry *block,
-                            size_t start_tier_idx,
-                            const std::vector<std::shared_ptr<EvictionPolicy>> &tier_policies,
-                            const std::vector<TierFlowStrategy> &tier_flow_strategies,
-                            int64_t timestamp) {
-    if (!block || start_tier_idx >= tier_policies.size()) {
+bool RadixTreeIndex::MaterializeExistingBlockOnWrite(BlockEntry *block,
+                                                     int64_t timestamp,
+                                                     int64_t ttl_ns,
+                                                     bool count_new_tier_write_touch) {
+    if (block == nullptr || !block->location_map.empty()) {
         return false;
     }
-
-    bool wrote_tier = false;
-    size_t current_tier_idx = start_tier_idx;
-    while (current_tier_idx < tier_policies.size()) {
-        wrote_tier = AppendBlockToSingleTier(block, tier_policies[current_tier_idx], timestamp) || wrote_tier;
-        if (current_tier_idx >= tier_flow_strategies.size() ||
-            tier_flow_strategies[current_tier_idx].write_mode != TierWriteMode::WRITE_THROUGH) {
-            break;
-        }
-        ++current_tier_idx;
+    SetBlockWriteState(block, timestamp, ttl_ns);
+    block_index_[block->key] = block;
+    PlaceBlockOnWriteTiers(block, timestamp, count_new_tier_write_touch);
+    RegisterBlocksToWriteTiers({block});
+    if (stats_collector_) {
+        stats_collector_->OnBlockBirth(instance_id_, block, timestamp);
     }
-    return wrote_tier;
-}
-
-RadixTreeIndex::WriteModify RadixTreeIndex::AppendEvictBlocks(std::unordered_map<int64_t, BlockEntry *> blocks_map,
-                                                              int64_t ttl_ns) {
-    return
-        [this, blocks_map = std::move(blocks_map), ttl_ns](const std::vector<int64_t> &block_keys, int64_t timestamp) {
-            std::vector<BlockEntry *> revived_blocks;
-            revived_blocks.reserve(block_keys.size());
-
-            for (int64_t key : block_keys) {
-                auto it = blocks_map.find(key);
-                if (it != blocks_map.end()) {
-                    BlockEntry *block = it->second;
-                    block->writing_time = timestamp;
-                    block->last_access_time = timestamp;
-                    block->ttl_ns = ttl_ns;
-                    AppendInitialBlockLocations(block, timestamp);
-                    revived_blocks.push_back(block);
-
-                    if (stats_collector_) {
-                        stats_collector_->OnBlockBirth(instance_id_, block, timestamp);
-                    }
-                }
-            }
-            return revived_blocks;
-        };
+    return true;
 }
 
 void RadixTreeIndex::WriteToTier(RadixTreeNode *node,
                                  const std::vector<int64_t> &block_keys,
                                  int64_t timestamp,
                                  int64_t ttl_ns,
-                                 RadixTreeIndex::WriteModify cb) {
-    std::vector<BlockEntry *> inserted_blocks;
-    if (!cb) {
-        // 节点直接添加新blocks
-        inserted_blocks = AppendNewBlocks(node, block_keys, timestamp, ttl_ns);
-    } else {
-        // 节点填充空block 的 location
-        inserted_blocks = cb(block_keys, timestamp);
-    }
+                                 bool count_new_tier_write_touch,
+                                 const std::vector<bool> *materialized_blocks,
+                                 size_t materialized_offset) {
+    std::vector<BlockEntry *> inserted_blocks = AppendPathBlocks(
+        node, block_keys, timestamp, ttl_ns, count_new_tier_write_touch, materialized_blocks, materialized_offset);
     node->stat.last_access_time = timestamp;
-    // 根据写入模式注册到对应 tier 的驱逐队列：WRITE_THROUGH=所有层，级联/选择性写入=仅 tier 0
+    RegisterBlocksToWriteTiers(inserted_blocks);
+}
+
+void RadixTreeIndex::PlaceBlockOnWriteTiers(BlockEntry *block, int64_t timestamp, bool count_write_touch) {
+    if (block == nullptr) {
+        return;
+    }
     for (size_t t = 0; t < write_tier_count_; ++t) {
-        tier_policies_[t]->OnNodeWritten(inserted_blocks);
+        const TierFlowEventReason reason =
+            count_write_touch ? (t == 0 ? TierFlowEventReason::WRITE : TierFlowEventReason::WRITE_THROUGH)
+                              : TierFlowEventReason::PROMOTE;
+        if (t == 0) {
+            AppendBlockLocation(block, tier_names_[t], timestamp, count_write_touch ? 1 : 0);
+            RecordTierEnter(block, t, "", reason, timestamp);
+        } else {
+            CopyBlockLocation(block, tier_names_[t], timestamp, 0);
+            RecordTierEnter(block, t, tier_names_[t - 1], reason, timestamp);
+        }
+        if (t == 0 && count_write_touch) {
+            MaybeSelectiveWriteToNextTier(block, t, timestamp);
+        }
     }
 }
 
-bool RadixTreeIndex::OnBlockAccessed(BlockEntry *block, int64_t timestamp, bool refresh_ttl_on_read) {
-    // block 级别的统计只更新一次，避免多 tier 场景下重复递增
-    block->access_count += 1;
+void RadixTreeIndex::RecordTierEnter(
+    BlockEntry *block, size_t tier_idx, const std::string &from_tier, TierFlowEventReason reason, int64_t timestamp) {
+    if (block != nullptr && tier_idx < tier_names_.size()) {
+        current_tier_flow_.RecordEnter(instance_id_, block, from_tier, tier_names_[tier_idx], reason, timestamp);
+    }
+}
+
+void RadixTreeIndex::RegisterBlockToWriteTier(BlockEntry *block, size_t tier_idx) {
+    if (block == nullptr || tier_idx >= write_tier_count_ || tier_idx >= tier_policies_.size()) {
+        return;
+    }
+    if (tier_idx == 0) {
+        tier_policies_[tier_idx]->OnBlockWritten(block);
+    } else {
+        tier_policies_[tier_idx]->OnBlockCopied(block);
+    }
+}
+
+void RadixTreeIndex::RegisterBlocksToWriteTiers(const std::vector<BlockEntry *> &blocks) {
+    for (size_t t = 0; t < write_tier_count_; ++t) {
+        for (auto *block : blocks) {
+            RegisterBlockToWriteTier(block, t);
+        }
+    }
+}
+
+void RadixTreeIndex::RefreshExistingBlockOnWrite(BlockEntry *block, int64_t timestamp) {
+    if (block == nullptr || write_tier_count_ == 0 || tier_policies_.empty()) {
+        return;
+    }
+    std::vector<bool> had_location(tier_names_.size(), false);
+    for (size_t i = 0; i < tier_names_.size(); ++i) {
+        had_location[i] = block->location_map.find(tier_names_[i]) != block->location_map.end();
+    }
+
+    block->last_access_time = timestamp;
+
+    size_t write_hit_tier = tier_names_.size();
+    for (size_t i = 0; i < had_location.size(); ++i) {
+        if (had_location[i]) {
+            write_hit_tier = i;
+            break;
+        }
+    }
+    if (write_hit_tier == tier_names_.size()) {
+        return;
+    }
+
+    TouchExistingTierOnWrite(block, write_hit_tier, timestamp, true);
+
+    bool propagate_write = true;
+    for (size_t i = write_hit_tier + 1; i < tier_policies_.size(); ++i) {
+        if (!ShouldPropagateWriteAcrossEdge(i - 1)) {
+            propagate_write = false;
+        }
+        if (!propagate_write) {
+            continue;
+        }
+        if (had_location[i]) {
+            TouchExistingTierOnWrite(block, i, timestamp, false);
+        }
+    }
+}
+
+void RadixTreeIndex::TouchExistingTierOnWrite(BlockEntry *block,
+                                              size_t tier_idx,
+                                              int64_t timestamp,
+                                              bool count_write_touch) {
+    if (block == nullptr || tier_idx >= tier_policies_.size() || tier_idx >= tier_names_.size()) {
+        return;
+    }
+    auto loc_it = block->location_map.find(tier_names_[tier_idx]);
+    if (loc_it == block->location_map.end()) {
+        return;
+    }
+
+    TouchTierLocation(block, tier_idx, timestamp, false, false, false);
+    const auto reason = count_write_touch ? TierFlowEventReason::WRITE : TierFlowEventReason::WRITE_PROPAGATION;
+    current_tier_flow_.RecordWriteTouch(instance_id_, block, tier_names_[tier_idx], reason, timestamp);
+    if (count_write_touch) {
+        loc_it->second.write_touch_count += 1;
+        MaybeSelectiveWriteToNextTier(block, tier_idx, timestamp);
+    }
+}
+
+void RadixTreeIndex::TouchTierLocation(BlockEntry *block,
+                                       size_t tier_idx,
+                                       int64_t timestamp,
+                                       bool refresh_ttl_on_read,
+                                       bool update_writing_time,
+                                       bool increase_access_count) {
+    if (block == nullptr || tier_idx >= tier_policies_.size() || tier_idx >= tier_names_.size()) {
+        return;
+    }
+    auto loc_it = block->location_map.find(tier_names_[tier_idx]);
+    if (loc_it == block->location_map.end()) {
+        return;
+    }
+    if (update_writing_time) {
+        loc_it->second.writing_time = timestamp;
+    }
+    loc_it->second.last_access_time = timestamp;
+    if (increase_access_count) {
+        loc_it->second.access_count += 1;
+    }
+    tier_policies_[tier_idx]->OnBlockAccessedWithOptions(block, timestamp, refresh_ttl_on_read);
+}
+
+bool RadixTreeIndex::ShouldPropagateReadAcrossEdge(size_t edge_idx) const {
+    return edge_idx >= tier_flow_strategies_.size() || tier_flow_strategies_[edge_idx].access_propagation_enabled;
+}
+
+bool RadixTreeIndex::ShouldPropagateWriteAcrossEdge(size_t edge_idx) const {
+    return edge_idx >= tier_flow_strategies_.size() || tier_flow_strategies_[edge_idx].write_propagation_enabled;
+}
+
+bool RadixTreeIndex::IsWriteThroughEdge(size_t edge_idx) const {
+    return edge_idx < tier_flow_strategies_.size() &&
+           tier_flow_strategies_[edge_idx].write_mode == TierWriteMode::WRITE_THROUGH;
+}
+
+void RadixTreeIndex::OnBlockAccessed(BlockEntry *block, int64_t timestamp, bool refresh_ttl_on_read) {
+    TouchBlockLocations(block, timestamp, refresh_ttl_on_read, true);
+}
+
+void RadixTreeIndex::TouchBlock(BlockEntry *block, int64_t timestamp) {
+    TouchBlockLocations(block, timestamp, false, false);
+}
+
+void RadixTreeIndex::TouchBlockLocations(BlockEntry *block,
+                                         int64_t timestamp,
+                                         bool refresh_ttl_on_read,
+                                         bool count_read) {
+    if (block == nullptr) {
+        return;
+    }
+    if (count_read) {
+        block->access_count += 1;
+    }
     block->last_access_time = timestamp;
 
     // 遍历所有 tier：按相邻 edge 的 access_propagation_enabled 决定访问是否继续向下层传播。
     // access_count 仅对"首个命中层"+1（分层读优先读快层，tier 索引最小的持有层视为命中层）
     bool first_hit = true;
     bool propagate_access = true;
-    size_t hit_tier_idx = tier_policies_.size();
-    size_t hit_tier_access_count = 0;
     for (size_t i = 0; i < tier_policies_.size(); ++i) {
-        if (!first_hit && i > 0 && i - 1 < tier_flow_strategies_.size() &&
-            !tier_flow_strategies_[i - 1].access_propagation_enabled) {
+        if (!first_hit && i > 0 && !ShouldPropagateReadAcrossEdge(i - 1)) {
             propagate_access = false;
         }
         const auto &tier_name = tier_names_[i];
         auto loc_it = block->location_map.find(tier_name);
         if (loc_it != block->location_map.end()) {
             if (first_hit) {
-                tier_policies_[i]->OnBlockAccessedWithOptions(block, timestamp, refresh_ttl_on_read);
-                loc_it->second.last_access_time = timestamp;
-                loc_it->second.access_count += 1;
-                hit_tier_idx = i;
-                hit_tier_access_count = loc_it->second.access_count;
+                TouchTierLocation(block, i, timestamp, refresh_ttl_on_read, false, count_read);
+                current_tier_flow_.RecordReadTouch(
+                    instance_id_, block, tier_name, TierFlowEventReason::READ, timestamp);
                 first_hit = false;
             } else if (propagate_access) {
-                tier_policies_[i]->OnBlockAccessedWithOptions(block, timestamp, refresh_ttl_on_read);
-                loc_it->second.last_access_time = timestamp;
+                TouchTierLocation(block, i, timestamp, refresh_ttl_on_read, false, false);
+                current_tier_flow_.RecordReadTouch(
+                    instance_id_, block, tier_name, TierFlowEventReason::READ, timestamp);
             }
         }
     }
-    if (hit_tier_idx < tier_flow_strategies_.size() &&
-        tier_flow_strategies_[hit_tier_idx].write_mode == TierWriteMode::WRITE_THROUGH_SELECTIVE &&
-        hit_tier_access_count >= tier_flow_strategies_[hit_tier_idx].selective_write_threshold) {
-        return SelectiveWriteToNextTier(block, hit_tier_idx, timestamp);
-    }
-    return false;
 }
 
-void RadixTreeIndex::RecordTieredHit(BlockEntry *block, bool is_remote, QueryHit *query_hit) const {
+void RadixTreeIndex::RecordTieredHit(BlockEntry *block, size_t block_idx, bool is_remote, QueryHit *query_hit) const {
     if (!query_hit) {
         return;
     }
     if (is_remote) {
         query_hit->remote_hit_block_num++;
+        query_hit->remote_hit_indices.push_back(block_idx);
     } else {
         query_hit->local_hit_block_num++;
+        query_hit->local_hit_indices.push_back(block_idx);
     }
-    // 按 priority 从高到低检查，命中最高优先级的那一层
+    // 按 tier 顺序从高到低检查，命中最高层
     if (query_hit->per_tier_hit_block_num.size() < tier_names_.size()) {
         query_hit->per_tier_hit_block_num.resize(tier_names_.size(), 0);
     }
@@ -571,9 +861,9 @@ void RadixTreeIndex::RecordTieredHit(BlockEntry *block, bool is_remote, QueryHit
     }
 }
 
-bool RadixTreeIndex::PromoteToHigherTiers(BlockEntry *block, int64_t timestamp) {
+void RadixTreeIndex::PromoteToHigherTiers(BlockEntry *block, int64_t timestamp) {
     if (!block || tier_policies_.empty()) {
-        return false;
+        return;
     }
     size_t current_highest_tier = tier_policies_.size();
     for (size_t i = 0; i < tier_policies_.size(); ++i) {
@@ -583,39 +873,74 @@ bool RadixTreeIndex::PromoteToHigherTiers(BlockEntry *block, int64_t timestamp) 
         }
     }
     if (current_highest_tier == 0 || current_highest_tier == tier_policies_.size()) {
+        return;
+    }
+    for (size_t i = current_highest_tier; i > 0; --i) {
+        const size_t higher_tier_idx = i - 1;
+        if (!block->location_map.count(tier_names_[higher_tier_idx])) {
+            AppendBlockLocation(block, tier_names_[higher_tier_idx], timestamp, 0);
+            tier_policies_[higher_tier_idx]->OnBlockWritten(block);
+            RecordTierEnter(block, higher_tier_idx, tier_names_[i], TierFlowEventReason::PROMOTE, timestamp);
+            read_triggered_tier_write_ = true;
+        }
+    }
+}
+
+void RadixTreeIndex::MaybeSelectiveWriteToNextTier(BlockEntry *block, size_t tier_idx, int64_t timestamp) {
+    if (!block || tier_idx >= tier_flow_strategies_.size()) {
+        return;
+    }
+    if (tier_flow_strategies_[tier_idx].write_mode != TierWriteMode::WRITE_THROUGH_SELECTIVE) {
+        return;
+    }
+    auto loc_it = block->location_map.find(tier_names_[tier_idx]);
+    if (loc_it == block->location_map.end()) {
+        return;
+    }
+    if (loc_it->second.write_touch_count >= tier_flow_strategies_[tier_idx].selective_write_threshold) {
+        SelectiveWriteToNextTier(block, tier_idx, timestamp);
+    }
+}
+
+void RadixTreeIndex::SelectiveWriteToNextTier(BlockEntry *block, size_t hit_tier_idx, int64_t timestamp) {
+    if (!block || hit_tier_idx >= tier_flow_strategies_.size() ||
+        tier_flow_strategies_[hit_tier_idx].write_mode != TierWriteMode::WRITE_THROUGH_SELECTIVE) {
+        return;
+    }
+    const size_t next_tier_idx = hit_tier_idx + 1;
+    if (next_tier_idx >= tier_policies_.size()) {
+        return;
+    }
+    AppendBlockToTierAndWriteThrough(block, next_tier_idx, timestamp);
+}
+
+bool RadixTreeIndex::AppendBlockToTierAndWriteThrough(BlockEntry *block, size_t tier_idx, int64_t timestamp) {
+    (void)timestamp;
+    if (!block || tier_idx >= tier_policies_.size()) {
         return false;
     }
     bool wrote_tier = false;
-    for (size_t i = current_highest_tier; i > 0; --i) {
-        const size_t higher_tier_idx = i - 1;
-        if (higher_tier_idx >= tier_flow_strategies_.size() ||
-            !tier_flow_strategies_[higher_tier_idx].promote_enabled) {
+    size_t current_tier = tier_idx;
+    while (current_tier < tier_policies_.size()) {
+        const std::string &tier_name = tier_names_[current_tier];
+        if (block->location_map.find(tier_name) == block->location_map.end()) {
+            CopyBlockLocation(block, tier_name, timestamp, 0);
+            tier_policies_[current_tier]->OnBlockCopied(block);
+            const std::string from_tier = current_tier > 0 ? tier_names_[current_tier - 1] : "";
+            RecordTierEnter(block, current_tier, from_tier, TierFlowEventReason::WRITE_THROUGH_SELECTIVE, timestamp);
+            wrote_tier = true;
+        }
+        if (!IsWriteThroughEdge(current_tier)) {
             break;
         }
-        if (!block->location_map.count(tier_names_[higher_tier_idx])) {
-            wrote_tier = AppendBlockToSingleTier(block, tier_policies_[higher_tier_idx], timestamp) || wrote_tier;
-        }
+        ++current_tier;
     }
     return wrote_tier;
 }
 
-bool RadixTreeIndex::SelectiveWriteToNextTier(BlockEntry *block, size_t hit_tier_idx, int64_t timestamp) {
-    if (!block || hit_tier_idx >= tier_flow_strategies_.size() ||
-        tier_flow_strategies_[hit_tier_idx].write_mode != TierWriteMode::WRITE_THROUGH_SELECTIVE) {
-        return false;
-    }
-    const size_t next_tier_idx = hit_tier_idx + 1;
-    if (next_tier_idx >= tier_policies_.size()) {
-        return false;
-    }
-    return AppendBlockToTierChain(block, next_tier_idx, tier_policies_, tier_flow_strategies_, timestamp);
-}
-
-// block 逻辑上空了：location 全空（被驱逐）
-// V1 语义：
-// 1) POLICY_TTL：过期块在读写前通过 EvictExpiredBeforeAccess 物理清理
-// 2) 非 TTL 策略：不启用 TTL（既不做前置物理清理，也不做逻辑过期判定）
-bool RadixTreeIndex::IsBlockEvict(BlockEntry *block, int64_t timestamp) const {
+// block 逻辑上空了：location 全空（被驱逐）。读写前只移除过期 location，
+// 空 block/空叶子节点在本次请求结尾统一清理。
+bool RadixTreeIndex::IsBlockEvict(const BlockEntry *block, int64_t timestamp) const {
     (void)timestamp;
     return block->location_map.empty();
 }
@@ -761,6 +1086,7 @@ void RadixTreeIndex::Clear() {
     }
 
     // 重新创建根节点，清空整个树
+    block_index_.clear();
     root_ = std::make_unique<RadixTreeNode>();
 }
 

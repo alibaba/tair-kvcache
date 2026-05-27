@@ -9,6 +9,11 @@
 
 namespace kv_cache_manager {
 
+enum class HitRatePerspective {
+    KVCM_L3 = 0,
+    ENGINE_LOCAL = 1,
+};
+
 // ============================================================================
 // 命中率追踪器
 //
@@ -16,7 +21,7 @@ namespace kv_cache_manager {
 // ============================================================================
 class HitRateTracker : public StatsTracker {
 public:
-    HitRateTracker();
+    explicit HitRateTracker(HitRatePerspective perspective = HitRatePerspective::KVCM_L3);
 
     void OnReadComplete(const std::string &instance_id, const ReadRecord &record) override;
     void OnWriteComplete(const std::string &instance_id, const WriteRecord &record) override;
@@ -34,8 +39,10 @@ private:
         std::vector<WriteRecord> write_records;
     };
 
+    ReadRecord NormalizeReadRecord(const ReadRecord &record) const;
     void ExportHitRates(const std::string &instance_id, const InstanceData &data, const OptimizerConfig &config);
 
+    HitRatePerspective perspective_ = HitRatePerspective::KVCM_L3;
     std::unordered_map<std::string, InstanceData> instance_data_;
 };
 
