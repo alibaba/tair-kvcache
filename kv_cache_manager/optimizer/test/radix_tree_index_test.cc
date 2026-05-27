@@ -117,12 +117,12 @@ TEST_F(RadixTreeIndexTest, PromoteCopiesThroughIntermediateHigherTiers) {
 
     QueryHit query_hit;
     BlockMask block_mask = std::vector<bool>{false};
-    index->PrefixQuery({10}, block_mask, 2000, &query_hit);
+    const bool read_triggered_tier_write = index->PrefixQuery({10}, block_mask, 2000, &query_hit);
 
     EXPECT_EQ(block->location_map.count("l1"), 1);
     EXPECT_EQ(block->location_map.count("l2"), 1);
     EXPECT_EQ(block->location_map.count("l3"), 1);
-    EXPECT_TRUE(index->ConsumeReadTriggeredTierWrite());
+    EXPECT_TRUE(read_triggered_tier_write);
 }
 
 TEST_F(RadixTreeIndexTest, PromoteDoesNotCopyToLowerTiers) {
@@ -143,12 +143,12 @@ TEST_F(RadixTreeIndexTest, PromoteDoesNotCopyToLowerTiers) {
 
     QueryHit query_hit;
     BlockMask block_mask = std::vector<bool>{false};
-    index->PrefixQuery({20}, block_mask, 2000, &query_hit);
+    const bool read_triggered_tier_write = index->PrefixQuery({20}, block_mask, 2000, &query_hit);
 
     EXPECT_EQ(block->location_map.count("l1"), 1);
     EXPECT_EQ(block->location_map.count("l2"), 1);
     EXPECT_EQ(block->location_map.count("l3"), 0);
-    EXPECT_TRUE(index->ConsumeReadTriggeredTierWrite());
+    EXPECT_TRUE(read_triggered_tier_write);
 }
 
 TEST_F(RadixTreeIndexTest, WriteThroughPropagatesAccessToLowerTierByDefault) {
@@ -231,13 +231,12 @@ TEST_F(RadixTreeIndexTest, SelectiveWriteToNextTierAfterThreshold) {
     ASSERT_EQ(block->location_map.count("l2"), 0);
 
     BlockMask block_mask = std::vector<bool>{false};
-    index->PrefixQuery({46}, block_mask, 2000);
+    EXPECT_FALSE(index->PrefixQuery({46}, block_mask, 2000));
     EXPECT_EQ(block->location_map.count("l2"), 0);
-    EXPECT_FALSE(index->ConsumeReadTriggeredTierWrite());
 
-    index->PrefixQuery({46}, block_mask, 3000);
+    const bool read_triggered_tier_write = index->PrefixQuery({46}, block_mask, 3000);
     EXPECT_EQ(block->location_map.count("l2"), 1);
-    EXPECT_TRUE(index->ConsumeReadTriggeredTierWrite());
+    EXPECT_TRUE(read_triggered_tier_write);
 }
 
 TEST_F(RadixTreeIndexTest, TierFlowsControlInitialWritePerEdge) {

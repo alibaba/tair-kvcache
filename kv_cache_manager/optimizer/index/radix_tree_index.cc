@@ -192,14 +192,14 @@ void RadixTreeIndex::SplitNode(RadixTreeNode *existing_node,
     original_parent->children[edge_key] = std::move(middle_node);
 }
 // 同样，这里的PrefixQuery只返回命中key，后续看需求再返回BlockEntry指针等信息
-void RadixTreeIndex::PrefixQuery(const std::vector<int64_t> &block_keys,
+bool RadixTreeIndex::PrefixQuery(const std::vector<int64_t> &block_keys,
                                  const BlockMask &block_mask,
                                  const int64_t timestamp,
                                  QueryHit *query_hit,
                                  bool refresh_ttl_on_read) {
-    read_triggered_tier_write_ = false;
+    bool read_triggered_tier_write = false;
     if (block_keys.empty()) {
-        return;
+        return false;
     }
 
     RadixTreeNode *current_node = root_.get();
@@ -229,9 +229,10 @@ void RadixTreeIndex::PrefixQuery(const std::vector<int64_t> &block_keys,
                 has_remote_hit = true;
                 RecordTieredHit(blk, true, query_hit);
             }
-            OnBlockAccessed(blk, timestamp, refresh_ttl_on_read);
+            read_triggered_tier_write =
+                OnBlockAccessed(blk, timestamp, refresh_ttl_on_read) || read_triggered_tier_write;
             if (enable_promote_) {
-                PromoteToHigherTiers(blk, timestamp);
+                read_triggered_tier_write = PromoteToHigherTiers(blk, timestamp) || read_triggered_tier_write;
             }
             match_len++;
         }
@@ -247,6 +248,7 @@ void RadixTreeIndex::PrefixQuery(const std::vector<int64_t> &block_keys,
         current_node = child;
         key_idx += match_len;
     }
+    return read_triggered_tier_write;
 }
 
 void RadixTreeIndex::CleanEmptyBlocks(const std::vector<BlockEntry *> &blocks,
@@ -397,7 +399,7 @@ void RadixTreeIndex::WriteToTier(RadixTreeNode *node,
     }
 }
 
-void RadixTreeIndex::OnBlockAccessed(BlockEntry *block, int64_t timestamp, bool refresh_ttl_on_read) {
+bool RadixTreeIndex::OnBlockAccessed(BlockEntry *block, int64_t timestamp, bool refresh_ttl_on_read) {
     // block 级别的统计只更新一次，避免多 tier 场景下重复递增
     block->access_count += 1;
     block->last_access_time = timestamp;
@@ -432,8 +434,9 @@ void RadixTreeIndex::OnBlockAccessed(BlockEntry *block, int64_t timestamp, bool 
     if (hit_tier_idx < tier_flow_strategies_.size() &&
         tier_flow_strategies_[hit_tier_idx].write_mode == TierWriteMode::WRITE_THROUGH_SELECTIVE &&
         hit_tier_access_count >= tier_flow_strategies_[hit_tier_idx].selective_write_threshold) {
-        SelectiveWriteToNextTier(block, hit_tier_idx, timestamp);
+        return SelectiveWriteToNextTier(block, hit_tier_idx, timestamp);
     }
+    return false;
 }
 
 void RadixTreeIndex::RecordTieredHit(BlockEntry *block, bool is_remote, QueryHit *query_hit) const {
@@ -457,9 +460,9 @@ void RadixTreeIndex::RecordTieredHit(BlockEntry *block, bool is_remote, QueryHit
     }
 }
 
-void RadixTreeIndex::PromoteToHigherTiers(BlockEntry *block, int64_t timestamp) {
+bool RadixTreeIndex::PromoteToHigherTiers(BlockEntry *block, int64_t timestamp) {
     if (!block || tier_policies_.empty()) {
-        return;
+        return false;
     }
     size_t current_highest_tier = tier_policies_.size();
     for (size_t i = 0; i < tier_policies_.size(); ++i) {
@@ -469,8 +472,9 @@ void RadixTreeIndex::PromoteToHigherTiers(BlockEntry *block, int64_t timestamp) 
         }
     }
     if (current_highest_tier == 0 || current_highest_tier == tier_policies_.size()) {
-        return;
+        return false;
     }
+    bool wrote_tier = false;
     for (size_t i = current_highest_tier; i > 0; --i) {
         const size_t higher_tier_idx = i - 1;
         if (higher_tier_idx >= tier_flow_strategies_.size() ||
@@ -480,22 +484,22 @@ void RadixTreeIndex::PromoteToHigherTiers(BlockEntry *block, int64_t timestamp) 
         if (!block->location_map.count(tier_names_[higher_tier_idx])) {
             AppendBlockLocation(block, tier_names_[higher_tier_idx], timestamp);
             tier_policies_[higher_tier_idx]->OnBlockWritten(block);
-            read_triggered_tier_write_ = true;
+            wrote_tier = true;
         }
     }
+    return wrote_tier;
 }
 
-void RadixTreeIndex::SelectiveWriteToNextTier(BlockEntry *block, size_t hit_tier_idx, int64_t timestamp) {
+bool RadixTreeIndex::SelectiveWriteToNextTier(BlockEntry *block, size_t hit_tier_idx, int64_t timestamp) {
     if (!block || hit_tier_idx >= tier_flow_strategies_.size() ||
         tier_flow_strategies_[hit_tier_idx].write_mode != TierWriteMode::WRITE_THROUGH_SELECTIVE) {
-        return;
+        return false;
     }
     const size_t next_tier_idx = hit_tier_idx + 1;
     if (next_tier_idx >= tier_policies_.size()) {
-        return;
+        return false;
     }
-    read_triggered_tier_write_ =
-        AppendBlockToTierAndWriteThrough(block, next_tier_idx, timestamp) || read_triggered_tier_write_;
+    return AppendBlockToTierAndWriteThrough(block, next_tier_idx, timestamp);
 }
 
 bool RadixTreeIndex::AppendBlockToTierAndWriteThrough(BlockEntry *block, size_t tier_idx, int64_t timestamp) {

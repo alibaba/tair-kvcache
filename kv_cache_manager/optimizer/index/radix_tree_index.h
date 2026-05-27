@@ -40,7 +40,7 @@ public:
 
     // ttl_ns: 0 = 使用 default_ttl_ns_，-1 = 禁用 TTL，>0 = 自定义纳秒
     InsertResult InsertOnly(const std::vector<int64_t> &block_keys, int64_t timestamp, int64_t ttl_ns = 0);
-    void PrefixQuery(const std::vector<int64_t> &block_keys,
+    bool PrefixQuery(const std::vector<int64_t> &block_keys,
                      const BlockMask &block_mask,
                      const int64_t timestamp,
                      QueryHit *query_hit = nullptr,
@@ -83,11 +83,6 @@ public:
             strategy.promote_enabled = enable;
         }
     }
-    bool ConsumeReadTriggeredTierWrite() {
-        bool triggered = read_triggered_tier_write_;
-        read_triggered_tier_write_ = false;
-        return triggered;
-    }
 
 private:
     std::unique_ptr<RadixTreeNode> root_;
@@ -109,7 +104,6 @@ private:
     size_t selective_write_threshold_ = 2;
     std::shared_ptr<StatsCollector> stats_collector_;
     bool enable_promote_ = false;
-    bool read_triggered_tier_write_ = false;
 
 private:
     std::vector<BlockEntry *>
@@ -129,13 +123,13 @@ private:
     void WriteToTier(
         RadixTreeNode *node, const std::vector<int64_t> &block_keys, int64_t timestamp, int64_t ttl_ns, WriteModify cb);
 
-    void OnBlockAccessed(BlockEntry *block, int64_t timestamp, bool refresh_ttl_on_read = true);
+    bool OnBlockAccessed(BlockEntry *block, int64_t timestamp, bool refresh_ttl_on_read = true);
     bool IsBlockEvict(BlockEntry *block, int64_t timestamp) const;
 
     // per-tier 命中检测辅助方法
     void RecordTieredHit(BlockEntry *block, bool is_remote, QueryHit *query_hit) const;
-    void PromoteToHigherTiers(BlockEntry *block, int64_t timestamp);
-    void SelectiveWriteToNextTier(BlockEntry *block, size_t hit_tier_idx, int64_t timestamp);
+    bool PromoteToHigherTiers(BlockEntry *block, int64_t timestamp);
+    bool SelectiveWriteToNextTier(BlockEntry *block, size_t hit_tier_idx, int64_t timestamp);
     bool AppendBlockToTierAndWriteThrough(BlockEntry *block, size_t tier_idx, int64_t timestamp);
     void InitTierFlowStrategies(TierWriteMode write_mode,
                                 size_t selective_write_threshold,

@@ -79,13 +79,13 @@ public:
     // Instance per-tier 用量明细
     std::vector<size_t> GetCurrentInstanceUsagePerTier(const std::string &instance_id) const;
 
-    // 级联降级：将 blocks 写入 tier_{next_idx} 的 location_map + LRU 队列
+    // 级联降级：先将 blocks 写入 tier_{next_idx}，再按后续连续 write-through edge 继续写穿。
     // 只跟 tier 级统计打交道，不触碰 BlockEntry 的跨层连续字段（access_count / last_access_time / writing_time）
-    void DemoteToNextTier(const std::string &instance_id,
-                          size_t next_tier_idx,
-                          const std::vector<BlockEntry *> &blocks,
-                          int64_t timestamp,
-                          const std::vector<TierFlowStrategy> &tier_flow_strategies);
+    void DemoteToNextTierAndApplyWriteThrough(const std::string &instance_id,
+                                              size_t next_tier_idx,
+                                              const std::vector<BlockEntry *> &blocks,
+                                              int64_t timestamp,
+                                              const std::vector<TierFlowStrategy> &tier_flow_strategies);
 
 private:
     // 驱逐模式分发：根据 eviction_mode 调用对应的驱逐实现

@@ -98,7 +98,8 @@ std::unordered_map<std::string, std::vector<BlockEntry *>> OptEvictionManager::E
                                              tier_flow_strategies[tier_idx].write_mode == TierWriteMode::CASCADING;
             for (auto &[inst_id, blocks] : tier_evicted) {
                 if (demote_to_next_tier && !blocks.empty()) {
-                    DemoteToNextTier(inst_id, tier_idx + 1, blocks, eviction_timestamp, tier_flow_strategies);
+                    DemoteToNextTierAndApplyWriteThrough(
+                        inst_id, tier_idx + 1, blocks, eviction_timestamp, tier_flow_strategies);
                 }
                 auto &vec = all_evicted[inst_id];
                 vec.insert(vec.end(), blocks.begin(), blocks.end());
@@ -126,14 +127,16 @@ std::unordered_map<std::string, std::vector<BlockEntry *>> OptEvictionManager::E
     return all_evicted;
 }
 
-void OptEvictionManager::DemoteToNextTier(const std::string &instance_id,
-                                          size_t next_tier_idx,
-                                          const std::vector<BlockEntry *> &blocks,
-                                          int64_t timestamp,
-                                          const std::vector<TierFlowStrategy> &tier_flow_strategies) {
+void OptEvictionManager::DemoteToNextTierAndApplyWriteThrough(
+    const std::string &instance_id,
+    size_t next_tier_idx,
+    const std::vector<BlockEntry *> &blocks,
+    int64_t timestamp,
+    const std::vector<TierFlowStrategy> &tier_flow_strategies) {
     auto it = instance_tiered_policy_map_.find(instance_id);
     if (it == instance_tiered_policy_map_.end()) {
-        KVCM_LOG_WARN("DemoteToNextTier: eviction policy not found for instance: %s", instance_id.c_str());
+        KVCM_LOG_WARN("DemoteToNextTierAndApplyWriteThrough: eviction policy not found for instance: %s",
+                      instance_id.c_str());
         return;
     }
     if (next_tier_idx >= it->second.policies.size()) {
