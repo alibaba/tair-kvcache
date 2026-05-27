@@ -32,6 +32,7 @@ class PublisherLogConverter(BaseConverter):
         self.discovered_instances = {}
         self.pending_write_sessions = {}
         self.pending_get_location_traces = []
+        self._warned_input_len_fallback_instances = set()
 
     def convert_to_traces(self, input_file: str) -> list:
         """转换Publisher日志为traces列表"""
@@ -104,7 +105,21 @@ class PublisherLogConverter(BaseConverter):
                 if value <= 0:
                     raise ValueError(f"{key} must be positive")
                 return value
-        raise ValueError(f"missing input_len for instance {instance_id}")
+        tokens = data.get('tokens', [])
+        if tokens:
+            return len(tokens)
+        keys = data.get('keys', [])
+        if keys:
+            if instance_id not in self._warned_input_len_fallback_instances:
+                block_size = self.get_block_size(instance_id)
+                print(
+                    f"Warning: GetCacheLocation for instance {instance_id} is missing input_len; "
+                    f"falling back to len(keys) * block_size ({block_size}). "
+                    "Token hit rate may overestimate prompts with partial tail blocks."
+                )
+                self._warned_input_len_fallback_instances.add(instance_id)
+            return len(keys) * self.get_block_size(instance_id)
+        raise ValueError(f"missing input_len and keys for instance {instance_id}")
 
     def _convert_get_location_event(self, data: dict):
         """转换GetCacheLocation事件"""
