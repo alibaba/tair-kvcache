@@ -5,10 +5,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from run.multi_instance_replay import _inspect_optimizer_trace
+from run.multi_infer_replay import _inspect_optimizer_trace
 
 
-class MultiInstanceReplayTest(unittest.TestCase):
+class MultiInferReplayTest(unittest.TestCase):
     def test_inspect_accepts_standard_trace(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             trace_path = Path(temp_dir) / "instance_a.jsonl"

@@ -8,9 +8,9 @@ Bazel target 前缀：
 //kv_cache_manager/optimizer/analysis/script
 ```
 
-标准 Python 入口的输出规则：凡是传入 optimizer config 的入口都只使用 config 中的 `output_result_path`；`multi_instance_replay` 不读取完整 config，必须通过 `--output-dir` 指定输出目录。
+标准 Python 入口的输出规则：凡是传入 optimizer config 的入口都只使用 config 中的 `output_result_path`；`multi_infer_replay` 不读取完整 config，必须通过 `--output-dir` 指定输出目录。
 
-标准报告直接按请求输入计算整体 `HitRate = HitTokens / InputTokens`。CSV 中的 local/remote 字段只是诊断拆分：local 来自 trace `block_mask` 带入的已有本地命中 block，remote 来自 optimizer 模拟层命中；标准分析结论不按 local/remote 分组。
+标准报告直接按请求输入计算整体 `HitRate = HitTokens / InputTokens`。`LocalHit*` 表示 engine 本地命中，`RemoteHit*` 表示 KVCM/L3 命中；在 KVCM/L3-only 模式下，engine 本地命中来自 trace `block_mask`。
 
 ## 使用场景速查
 
@@ -77,12 +77,12 @@ bazel run //kv_cache_manager/optimizer/analysis/script:optimizer_run -- -c confi
 
 ---
 
-## 2. 多实例回放 — `multi_instance_replay`
+## 2. 多推理实例回放 — `multi_infer_replay`
 
-按 instance trace 并行运行 optimizer，并聚合 token hit rate。每个输入 JSONL 必须是标准 optimizer schema，且一个文件只能包含一个 `instance_id`。
+按推理 instance trace 并行运行 optimizer，并聚合 token hit rate。这个入口只模拟 engine-local L1/L2，不接 L3 pool；需要 engine-local + L3 pool 时使用 `hierarchical_replay_main`。每个输入 JSONL 必须是标准 optimizer schema，且一个文件只能包含一个 `instance_id`。
 
 ```bash
-bazel run //kv_cache_manager/optimizer/analysis/script:multi_instance_replay -- \
+bazel run //kv_cache_manager/optimizer/analysis/script:multi_infer_replay -- \
     --trace-dir /path/to/instance_traces \
     --trace-glob "*.jsonl" \
     --output-dir /path/to/output \
@@ -110,7 +110,7 @@ bazel run //kv_cache_manager/optimizer/analysis/script:multi_instance_replay -- 
 | `--log-level` | — | 4 | 子进程 KVCM logger 等级 |
 
 `--bucket-name` 默认值：使用 `--trace-dir` 时为 trace 目录名；`--aggregate-only` 时为 output 目录名；使用 `--trace-files` 时默认为空。
-非 `--aggregate-only` 模式只聚合本轮 `--trace-dir` / `--trace-files` 选中的 instance CSV，不会扫描并混入 `--output-dir` 下的其他历史 CSV；未使用 `--skip-existing` 时，脚本会先删除本轮 instance 的旧 CSV，避免 worker 成功检查误读旧结果。
+非 `--aggregate-only` 模式只聚合本轮 `--trace-dir` / `--trace-files` 选中的推理 instance CSV，不会扫描并混入 `--output-dir` 下的其他历史 CSV；未使用 `--skip-existing` 时，脚本会先删除本轮 instance 的旧 CSV，避免 worker 成功检查误读旧结果。
 
 ### 回放配置参数
 
@@ -127,14 +127,13 @@ bazel run //kv_cache_manager/optimizer/analysis/script:multi_instance_replay -- 
 | `--eviction-policy-params` | — | 策略默认值 | JSON object，覆盖策略参数，例如 `'{"sample_rate": 0.5}'` |
 | `--eviction-mode` | — | 3 | optimizer eviction mode：`1=group rough`，`2=instance rough`，`3=instance precise` |
 | `--eviction-batch-size` | — | 100 | 每个 instance 单次驱逐批大小 |
-| `--default-tier-write-mode` | — | `write_through` | 写入 `tier_strategy.write_mode`，作为所有相邻 tier edge 的默认写入策略；可选 `write_through` / `cascading` / `write_through_selective` |
-| `--tier-flow-config` | — | 空 | JSON array 或 JSON 文件路径，写入 `tier_strategy.tier_flows`，用于覆盖相邻 tier edge 的策略 |
-| `--enable-tier-access-propagation` | — | true | 写入 `tier_strategy.access_propagation_enabled=true`；命中上层副本时，同时刷新后续持有副本 tier 的访问时间；与 `--disable-tier-access-propagation` 互斥 |
-| `--disable-tier-access-propagation` | — | false | 写入 `tier_strategy.access_propagation_enabled=false`；命中上层副本时，只刷新命中 tier，不刷新下层冷热；与 `--enable-tier-access-propagation` 互斥 |
-| `--selective-write-threshold` | — | 2 | 写入 `tier_strategy.selective_write_threshold`；`write_through_selective` 下，命中层访问次数达到该阈值后复制到下一层；必须为正整数 |
-| `--enable-promote` | — | true | 写入 `tier_strategy.promote_enabled=true`；开启从低层级向高层级 promote；与 `--disable-promote` 互斥 |
-| `--disable-promote` | — | false | 写入 `tier_strategy.promote_enabled=false`；关闭 promote；与 `--enable-promote` 互斥 |
-| `--disable-hierarchical-eviction` | — | false | 写入 `tier_strategy.hierarchical_eviction_enabled=false`；默认生成分层配置 |
+| `--default-tier-write-mode` | — | `write_through` | 自动生成 `tier_flows` 时使用的相邻 edge `write_mode`；可选 `write_through` / `cascading` / `write_through_selective` |
+| `--tier-flow-config` | — | 空 | JSON array 或 JSON 文件路径；传入后直接作为完整 `tier_flows` 使用，必须覆盖所有相邻 edge |
+| `--enable-tier-access-propagation` | — | true | 自动生成 `tier_flows` 时设置 `access_propagation_enabled=true`；命中上层副本时，同时刷新后续持有副本 tier 的访问时间 |
+| `--disable-tier-access-propagation` | — | false | 自动生成 `tier_flows` 时设置 `access_propagation_enabled=false`；命中上层副本时，只刷新命中 tier，不刷新下层冷热 |
+| `--selective-write-threshold` | — | 2 | 自动生成 `tier_flows` 时设置 `selective_write_threshold`；`write_through_selective` 下，命中层访问次数达到该阈值后复制到下一层 |
+| `--enable-promote` | — | true | 自动生成 `tier_flows` 时设置 `promote_enabled=true`；开启从低层级向高层级 promote |
+| `--disable-promote` | — | false | 自动生成 `tier_flows` 时设置 `promote_enabled=false`；关闭 promote |
 | `--used-percentage` | — | 1.0 | 写入 config 的 group `used_percentage` |
 | `--default-block-ttl-seconds` | — | 0 | 默认 block TTL 秒数；主要用于 `--eviction-policy ttl` |
 | `--ttl-refresh-on-read` | — | true | TTL 策略下读命中刷新 last access time；与 `--no-ttl-refresh-on-read` 互斥 |
@@ -161,8 +160,8 @@ bazel run //kv_cache_manager/optimizer/analysis/script:multi_instance_replay -- 
 ├── configs/
 │   └── <instance_id>.json                 # 每个 instance 的生成配置
 ├── <instance_id>_hit_rates.csv            # 每个 instance 的 token hit-rate 时序
-├── multi_instance_replay_tasks.csv         # 任务清单：InstanceId / TraceFile / ConfigPath / CsvPath
-├── multi_instance_replay_summary.csv       # 子进程执行结果：成功状态、耗时、错误信息
+├── multi_infer_replay_tasks.csv            # 任务清单：InstanceId / TraceFile / ConfigPath / CsvPath
+├── multi_infer_replay_summary.csv          # 子进程执行结果：成功状态、耗时、错误信息
 └── aggregate/
     ├── instance_aggregate.csv
     ├── global_aggregate.csv
@@ -176,7 +175,7 @@ bazel run //kv_cache_manager/optimizer/analysis/script:multi_instance_replay -- 
 
 在多个容量点上运行 optimizer，绘制容量-命中率 Pareto 曲线。自动判断单策略/多策略模式。
 
-> **适用范围**：Tradeoff 分析仅适用于非分层模式。在分层模式（`tier_strategy.hierarchical_eviction_enabled=true`）下，容量扫描仅修改 `quota_capacity`，而驱逐决策依据各 tier 独立的 `storages[i].capacity`，因此扫描结果无法反映真实的容量-性能权衡关系。
+> **适用范围**：Tradeoff 分析仅适用于单层模式。多层模式下，容量扫描仅修改 `quota_capacity`，而驱逐决策依据各 tier 独立的 `storages[i].capacity`，因此扫描结果无法反映真实的容量-性能权衡关系。
 
 运行流程：
 
@@ -407,14 +406,14 @@ bazel run //kv_cache_manager/optimizer/analysis/script:analyze_lifecycle -- \
 
 ## 6. 多层存储 Per-Tier 输出
 
-启用多层存储（`tier_strategy.hierarchical_eviction_enabled=true` 且至少 2 个 `storages`）时，标准 `*_hit_rates.csv` 会包含：
+启用多层存储（至少 2 个 `storages` 且配置完整 `tier_flows`）时，标准 `*_hit_rates.csv` 会包含：
 
 - `Tier<N>(<tier_name>)_HitTokens`
 - `Tier<N>(<tier_name>)_HitRate`
 - `AccTier<N>(<tier_name>)_HitRate`
 - `Tier<N>(<tier_name>)_BlockNum`
 
-`optimizer_run --draw-chart` 仅在存在 `tier_strategy.hierarchical_eviction_enabled=true` 且至少 2 个 `storages` 的 group 时生成 `timeseries/per_tier_timeseries.png`。所有 `HitRate` / `AccHitRate` / `AccTier*_HitRate` 均为 token hit rate。
+`optimizer_run --draw-chart` 仅在存在至少 2 个 `storages` 的 group 时生成 `timeseries/per_tier_timeseries.png`。所有 `HitRate` / `AccHitRate` / `AccTier*_HitRate` 均为 token hit rate。
 
 ---
 
@@ -440,10 +439,10 @@ bazel run //kv_cache_manager/optimizer/analysis/script:analyze_lifecycle -- \
 
 | 模块 | 说明 |
 |------|------|
-| `optimizer_runner.py` | optimizer 运行封装：配置加载、无限容量 warmup、并行实验框架（ThreadPoolExecutor）。被 `optimizer_run`、`tradeoff`、`export_tree` 调用 |
-| `csv_loader.py` | CSV 结果加载、容量列表生成（基于最大缓存 block 数的指数分布采样）、`--skip-run` 模式的数据加载。被 `tradeoff` 调用 |
-| `plot_utils.py` | 统一绘图风格（`setup_plot_style`）、Pareto 曲线绘图、多策略图、95%/99% 理论命中标注、下降点剔除日志、per-tier 对比曲线。被 `tradeoff` 调用 |
-| `window_aggregator.py` | 多实例结果聚合：全局/单实例汇总、时间窗口聚合。被 `multi_instance_replay` 调用 |
+| `optimizer_runner.py` | optimizer 运行封装：配置加载、warmup pass、并行实验框架（ThreadPoolExecutor）。被 `optimizer_run`、`tradeoff`、`export_tree` 调用 |
+| `csv_loader.py` | CSV 结果加载、容量列表生成（指数分布采样）、`--skip-run` 模式的数据加载。被 `tradeoff` 调用 |
+| `plot_utils.py` | 统一绘图风格（`setup_plot_style`）、Pareto 曲线绘图、多策略子图绘图、per-tier 对比曲线。被 `tradeoff` 调用 |
+| `window_aggregator.py` | 多推理实例结果聚合：全局/单实例汇总、时间窗口聚合。被 `multi_infer_replay` 调用 |
 
 ---
 
@@ -457,7 +456,7 @@ script/
 │   ├── tradeoff.py               # Pareto 曲线 + per-tier 分析
 │   ├── export_tree.py            # 前缀树导出
 │   ├── analyze_lifecycle.py      # Lifecycle 分析
-│   └── multi_instance_replay.py  # 多实例并行回放 + 聚合
+│   └── multi_infer_replay.py     # 多推理实例并行回放 + 聚合
 │
 ├── analysis/                     # 分析层
 │   └── lifecycle_analysis.py     # 读取 + 统计 + 数据提取
@@ -478,7 +477,7 @@ script/
 
 ## 输出目录总览
 
-标准 Python 入口共享输出规则：config 驱动入口使用 `<output_result_path>`；`multi_instance_replay` 使用 `--output-dir`；`analyze_lifecycle` 不读取 config，图表固定输出到输入 lifecycle CSV 所在目录或输入目录下的 `lifecycle/`。
+标准 Python 入口共享输出规则：config 驱动入口使用 `<output_result_path>`；`multi_infer_replay` 使用 `--output-dir`；`analyze_lifecycle` 不读取 config，图表固定输出到输入 lifecycle CSV 所在目录或输入目录下的 `lifecycle/`。
 
 ```
 <output_result_path 或 output_dir>/
@@ -508,7 +507,7 @@ script/
 │   ├── *_radix_tree.png
 │   └── *_hot_paths.png
 │
-├── aggregate/                                # multi_instance_replay
+├── aggregate/                                # multi_infer_replay
 │   ├── instance_aggregate.csv
 │   ├── global_aggregate.csv
 │   ├── global_window_hit_rates.csv           # 需窗口参数

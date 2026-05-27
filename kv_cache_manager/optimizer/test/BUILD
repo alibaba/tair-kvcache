@@ -127,13 +127,13 @@ py_binary(
 )
 
 py_test(
-    name = "MultiInstanceReplayPyTest",
+    name = "MultiInferReplayPyTest",
     srcs = [
-        "multi_instance_replay_py_test.py",
+        "multi_infer_replay_py_test.py",
     ],
-    main = "multi_instance_replay_py_test.py",
+    main = "multi_infer_replay_py_test.py",
     deps = [
-        "//kv_cache_manager/optimizer/analysis/script:multi_instance_replay_lib",
+        "//kv_cache_manager/optimizer/analysis/script:multi_infer_replay_lib",
     ],
 )
 

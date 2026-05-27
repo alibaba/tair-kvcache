@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Replay per-instance optimizer traces with one optimizer process per instance.
+Replay per-inference-instance optimizer traces with one optimizer process per inference instance.
 
-Each input JSONL must contain traces for one optimizer instance.
-The script writes one generated optimizer config per instance, runs each instance in a
-separate process, and aggregates the emitted *_hit_rates.csv files with the
-standard token hit-rate semantics.
+Each input JSONL must contain traces for one inference instance. The script writes one generated
+optimizer config per inference instance, runs each instance in a separate process, and aggregates
+the emitted *_hit_rates.csv files with the standard token hit-rate semantics.
 """
 
 import argparse
@@ -39,15 +38,14 @@ def _parse_tier_flow_config_arg(parser, raw_value):
             parser.error(f"--tier-flow-config[{idx}] must contain non-empty from_tier")
         if not isinstance(flow.get("to_tier"), str) or not flow["to_tier"]:
             parser.error(f"--tier-flow-config[{idx}] must contain non-empty to_tier")
-        if "write_mode" in flow and flow["write_mode"] not in valid_write_modes:
+        if flow.get("write_mode") not in valid_write_modes:
             parser.error(f"--tier-flow-config[{idx}].write_mode must be one of {sorted(valid_write_modes)}")
-        for bool_key in ("access_propagation_enabled", "promote_enabled"):
-            if bool_key in flow and type(flow[bool_key]) is not bool:
+        for bool_key in ("access_propagation_enabled", "write_propagation_enabled", "promote_enabled"):
+            if type(flow.get(bool_key)) is not bool:
                 parser.error(f"--tier-flow-config[{idx}].{bool_key} must be a boolean")
-        if "selective_write_threshold" in flow:
-            threshold = flow["selective_write_threshold"]
-            if type(threshold) is not int or threshold <= 0:
-                parser.error(f"--tier-flow-config[{idx}].selective_write_threshold must be a positive integer")
+        threshold = flow.get("selective_write_threshold")
+        if type(threshold) is not int or threshold <= 0:
+            parser.error(f"--tier-flow-config[{idx}].selective_write_threshold must be a positive integer")
     return tier_flows
 
 
@@ -61,11 +59,11 @@ def _configure_bazel_run_output():
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Replay per-instance optimizer traces with one process per instance"
+        description="Replay per-inference-instance optimizer traces with one process per inference instance"
     )
     inputs = parser.add_mutually_exclusive_group()
-    inputs.add_argument("--trace-dir", help="Directory containing per-instance JSONL trace files")
-    inputs.add_argument("--trace-files", nargs="+", help="Explicit per-instance JSONL trace files")
+    inputs.add_argument("--trace-dir", help="Directory containing per-inference-instance JSONL trace files")
+    inputs.add_argument("--trace-files", nargs="+", help="Explicit per-inference-instance JSONL trace files")
     parser.add_argument("--trace-glob", default="*.jsonl", help="Glob used with --trace-dir")
     parser.add_argument("--recursive", action="store_true", help="Use recursive glob under --trace-dir")
     parser.add_argument("--output-dir", required=True, help="Output directory")
@@ -96,11 +94,11 @@ def parse_args():
                             "cascading",
                             "write_through_selective",
                         ],
-                        help="Default tier_strategy.write_mode for adjacent tier edges")
+                        help="write_mode used when generating tier_flows for adjacent tier edges")
     parser.add_argument("--selective-write-threshold", type=int, default=2,
                         help="Access-count threshold for write_through_selective tier writes")
     parser.add_argument("--tier-flow-config", default=None,
-                        help="JSON array or file path for tier_strategy.tier_flows edge overrides")
+                        help="JSON array or file path for explicit tier_flows")
     access_group = parser.add_mutually_exclusive_group()
     access_group.add_argument("--enable-tier-access-propagation",
                               dest="tier_access_propagation_enabled",
@@ -111,10 +109,19 @@ def parse_args():
                               dest="tier_access_propagation_enabled",
                               action="store_false",
                               help="Refresh only the hit tier when a block has copies in multiple tiers")
+    write_access_group = parser.add_mutually_exclusive_group()
+    write_access_group.add_argument("--enable-tier-write-propagation",
+                                    dest="tier_write_propagation_enabled",
+                                    action="store_true",
+                                    default=False,
+                                    help="Refresh lower-tier write metadata when an upper-tier copy is touched by write")
+    write_access_group.add_argument("--disable-tier-write-propagation",
+                                    dest="tier_write_propagation_enabled",
+                                    action="store_false",
+                                    help="Refresh only the written tier when a block has copies in multiple tiers")
     promote_group = parser.add_mutually_exclusive_group()
     promote_group.add_argument("--enable-promote", dest="enable_promote", action="store_true", default=True)
     promote_group.add_argument("--disable-promote", dest="enable_promote", action="store_false")
-    parser.add_argument("--disable-hierarchical-eviction", action="store_true")
     parser.add_argument("--used-percentage", type=float, default=1.0)
     parser.add_argument("--default-block-ttl-seconds", type=int, default=0)
     ttl_group = parser.add_mutually_exclusive_group()
@@ -159,13 +166,13 @@ def main():
     bucket_name = args.bucket_name or _default_bucket_name(args)
 
     print("\n" + "=" * 80)
-    print("  Multi-Instance Replay")
+    print("  Multi-Infer Replay")
     print("=" * 80)
     print(f"  Output:       {output_dir}")
     print(f"  Bucket:       {bucket_name}")
     print(f"  Mode:         {'aggregate-only' if args.aggregate_only else 'replay'}")
     if not args.aggregate_only:
-        print(f"  Instance traces: {len(trace_files)}")
+        print(f"  Infer traces: {len(trace_files)}")
 
     if not args.aggregate_only:
         tasks, csv_files = _prepare_tasks(args, trace_files, config_dir, output_dir)
@@ -173,10 +180,10 @@ def main():
             max_workers = args.max_workers if args.max_workers > 0 else min(os.cpu_count() or 1, len(tasks))
             max_workers = max(1, max_workers)
             print(f"  Workers:      {max_workers}")
-            print("\n[1/2] Running instance optimizer processes...")
+            print("\n[1/2] Running inference-instance optimizer processes...")
             _run_tasks(tasks, max_workers)
         else:
-            print("No multi-instance replay tasks to run.")
+            print("No multi-infer replay tasks to run.")
     else:
         print("\n[1/2] Skipping replay.")
         csv_files = collect_hit_rate_csvs(output_dir)
@@ -277,7 +284,7 @@ def _prepare_tasks(args, trace_files: List[str], config_dir: str, output_dir: st
             "log_level": args.log_level,
         })
 
-    task_csv = os.path.join(output_dir, "multi_instance_replay_tasks.csv")
+    task_csv = os.path.join(output_dir, "multi_infer_replay_tasks.csv")
     with open(task_csv, "w") as f:
         f.write("InstanceId,TraceFile,ConfigPath,CsvPath\n")
         for task in tasks:
@@ -292,7 +299,7 @@ def _prepare_tasks(args, trace_files: List[str], config_dir: str, output_dir: st
 
 
 def _run_tasks(tasks: List[dict], max_workers: int) -> None:
-    summary_path = os.path.join(os.path.dirname(os.path.dirname(tasks[0]["config_path"])), "multi_instance_replay_summary.csv")
+    summary_path = os.path.join(os.path.dirname(os.path.dirname(tasks[0]["config_path"])), "multi_infer_replay_summary.csv")
     results = []
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(_run_instance_worker, task): task for task in tasks}
@@ -334,7 +341,7 @@ def _run_tasks(tasks: List[dict], max_workers: int) -> None:
 
     failed = [r for r in results if not r["success"]]
     if failed:
-        raise SystemExit(f"{len(failed)}/{len(results)} multi-instance replay tasks failed")
+        raise SystemExit(f"{len(failed)}/{len(results)} multi-infer replay tasks failed")
 
 
 def _run_instance_worker(task: dict) -> dict:
@@ -351,7 +358,10 @@ def _run_instance_worker(task: dict) -> dict:
             raise RuntimeError(f"Failed to load config: {task['config_path']}")
         config = config_loader.config()
 
-        manager = kvcm_py_optimizer.OptimizerManager(config)
+        manager = kvcm_py_optimizer.OptimizerManager(
+            config,
+            hit_rate_perspective=kvcm_py_optimizer.HitRatePerspective.ENGINE_LOCAL,
+        )
         if not manager.Init():
             raise RuntimeError(f"OptimizerManager.Init failed: {task['config_path']}")
         manager.DirectRun()
@@ -453,15 +463,29 @@ def _make_single_instance_config(args, trace_file: str, output_dir: str, instanc
             "capacity": args.l2_capacity,
         })
 
-    tier_strategy = {
-        "hierarchical_eviction_enabled": not args.disable_hierarchical_eviction,
-        "write_mode": args.default_tier_write_mode,
-        "access_propagation_enabled": args.tier_access_propagation_enabled,
-        "promote_enabled": args.enable_promote,
-        "selective_write_threshold": args.selective_write_threshold,
+    tier_flows = args.tier_flow_config or _make_adjacent_tier_flows(args, storages)
+
+    group = {
+        "group_name": instance_id,
+        "quota_capacity": args.l1_capacity + max(args.l2_capacity, 0.0),
+        "used_percentage": args.used_percentage,
+        "ttl_config": {
+            "default_block_ttl_seconds": args.default_block_ttl_seconds,
+            "refresh_on_read": args.ttl_refresh_on_read,
+        },
+        "storages": storages,
+        "instances": [
+            {
+                "instance_id": instance_id,
+                "block_size": args.block_size,
+                "bytes_per_token": args.bytes_per_token,
+                "eviction_policy_type": args.eviction_policy,
+                "eviction_policy_params": policy_params,
+            }
+        ],
     }
-    if args.tier_flow_config:
-        tier_strategy["tier_flows"] = args.tier_flow_config
+    if tier_flows:
+        group["tier_flows"] = tier_flows
 
     return {
         "trace_file_path": trace_file,
@@ -473,27 +497,23 @@ def _make_single_instance_config(args, trace_file: str, output_dir: str, instanc
         "trace_replay": {
             "write_delay_ns": args.write_delay_ns,
         },
-        "instance_groups": [
-            {
-                "group_name": instance_id,
-                "quota_capacity": args.l1_capacity + max(args.l2_capacity, 0.0),
-                "used_percentage": args.used_percentage,
-                "tier_strategy": tier_strategy,
-                "default_block_ttl_seconds": args.default_block_ttl_seconds,
-                "ttl_refresh_on_read": args.ttl_refresh_on_read,
-                "storages": storages,
-                "instances": [
-                    {
-                        "instance_id": instance_id,
-                        "block_size": args.block_size,
-                        "bytes_per_token": args.bytes_per_token,
-                        "eviction_policy_type": args.eviction_policy,
-                        "eviction_policy_params": policy_params,
-                    }
-                ],
-            }
-        ],
+        "instance_groups": [group],
     }
+
+
+def _make_adjacent_tier_flows(args, storages: List[dict]) -> List[dict]:
+    flows = []
+    for idx in range(len(storages) - 1):
+        flows.append({
+            "from_tier": storages[idx]["unique_name"],
+            "to_tier": storages[idx + 1]["unique_name"],
+            "write_mode": args.default_tier_write_mode,
+            "access_propagation_enabled": args.tier_access_propagation_enabled,
+            "write_propagation_enabled": args.tier_write_propagation_enabled,
+            "promote_enabled": args.enable_promote,
+            "selective_write_threshold": args.selective_write_threshold,
+        })
+    return flows
 
 
 def _resolve_policy_params(policy: str, override_json: str) -> dict:

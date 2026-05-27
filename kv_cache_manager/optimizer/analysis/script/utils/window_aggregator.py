@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Windowed aggregation for per-instance optimizer replay outputs.
+Windowed aggregation for per-inference-instance optimizer replay outputs.
 
 The standard metric is token hit rate:
 
@@ -30,7 +30,7 @@ COUNTER_COLUMNS = [
 
 
 def collect_hit_rate_csvs(output_dir: str) -> Dict[str, str]:
-    """Collect per-instance hit-rate CSVs from an optimizer output directory."""
+    """Collect per-inference-instance hit-rate CSVs from an optimizer output directory."""
     if not os.path.isdir(output_dir):
         return {}
     result = {}
@@ -53,7 +53,7 @@ def aggregate_and_write(
     include_instance_windows: bool = False,
 ) -> dict:
     """
-    Aggregate instance hit-rate CSVs and write summary/window CSV files.
+    Aggregate inference instance hit-rate CSVs and write summary/window CSV files.
 
     Time interval semantics are [start_ns, end_ns).  Windows are aligned to
     absolute timestamp 0 so independent runs aggregate consistently.

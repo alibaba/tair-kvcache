@@ -79,19 +79,19 @@ py_binary(
     deps = [":analysis_lib", ":plot_lib"],
 )
 
-# Per-instance replay: one optimizer process per instance trace plus token-hit-rate aggregation
+# Per-inference-instance replay: one optimizer process per inference trace plus token-hit-rate aggregation
 py_binary(
-    name = "multi_instance_replay",
-    srcs = ["run/multi_instance_replay.py"],
-    main = "run/multi_instance_replay.py",
+    name = "multi_infer_replay",
+    srcs = ["run/multi_infer_replay.py"],
+    main = "run/multi_infer_replay.py",
     deps = [":utils_lib"],
 )
 
 py_library(
-    name = "multi_instance_replay_lib",
+    name = "multi_infer_replay_lib",
     srcs = [
         "run/__init__.py",
-        "run/multi_instance_replay.py",
+        "run/multi_infer_replay.py",
     ],
     imports = ["."],
 )
