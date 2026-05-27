@@ -12,6 +12,7 @@ bool CacheReclaimStrategy::FromRapidValue(const rapidjson::Value &rapid_value) {
     KVCM_JSON_GET_MACRO(rapid_value, "reclaim_step_size", reclaim_step_size_);
     KVCM_JSON_GET_MACRO(rapid_value, "reclaim_step_percentage", reclaim_step_percentage_);
     KVCM_JSON_GET_MACRO(rapid_value, "delay_before_delete_ms", delay_before_delete_ms_);
+    KVCM_JSON_GET_MACRO(rapid_value, "enable_instance_fairness", enable_instance_fairness_);
     return true;
 }
 
@@ -23,6 +24,7 @@ void CacheReclaimStrategy::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuff
     Put(writer, "reclaim_step_size", reclaim_step_size_);
     Put(writer, "reclaim_step_percentage", reclaim_step_percentage_);
     Put(writer, "delay_before_delete_ms", delay_before_delete_ms_);
+    Put(writer, "enable_instance_fairness", enable_instance_fairness_);
 }
 
 bool CacheReclaimStrategy::ValidateRequiredFields(std::string &invalid_fields) const {

@@ -166,6 +166,8 @@ void ProtoConvert::CacheConfigToProto(const CacheConfig &cache_config_info,
     reclaim_strategy->set_reclaim_step_size(cache_config_info.reclaim_strategy()->reclaim_step_size());
     reclaim_strategy->set_reclaim_step_percentage(cache_config_info.reclaim_strategy()->reclaim_step_percentage());
     reclaim_strategy->set_delay_before_delete_ms(cache_config_info.reclaim_strategy()->delay_before_delete_ms());
+    reclaim_strategy->set_enable_instance_fairness(
+        cache_config_info.reclaim_strategy()->enable_instance_fairness());
 
     // 转换data_storage_strategy (cache_prefer_strategy)
     proto_cache_config->set_data_storage_strategy(
@@ -219,6 +221,8 @@ void ProtoConvert::CacheConfigFromProto(const proto::admin::CacheConfig *proto_c
     reclaim_strategy->set_reclaim_step_size(proto_cache_config->reclaim_strategy().reclaim_step_size());
     reclaim_strategy->set_reclaim_step_percentage(proto_cache_config->reclaim_strategy().reclaim_step_percentage());
     reclaim_strategy->set_delay_before_delete_ms(proto_cache_config->reclaim_strategy().delay_before_delete_ms());
+    reclaim_strategy->set_enable_instance_fairness(
+        proto_cache_config->reclaim_strategy().enable_instance_fairness());
 
     cache_config_info.set_reclaim_strategy(reclaim_strategy);
 

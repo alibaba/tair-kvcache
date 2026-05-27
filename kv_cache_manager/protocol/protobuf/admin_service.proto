@@ -186,6 +186,9 @@ message CacheReclaimStrategy {
     int32 reclaim_step_size = 5;       // 每次回收的步长绝对值,如100GiB
     int32 reclaim_step_percentage = 6; // 每次回收的步长相对比例,如回收5%的数据量
     int32 delay_before_delete_ms = 7; // Location设置为Deleting状态后等待多少毫秒再调用Storage删除
+    // when true (default), distribute eviction across instances by
+    // absolute usage so heavy contributors are evicted more
+    bool enable_instance_fairness = 8;
 }
 
 enum CachePreferStrategy {

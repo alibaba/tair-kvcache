@@ -78,6 +78,7 @@ TEST_F(StartupConfigLoaderTest, TestStartupConfigJsonize) {
     ASSERT_EQ(reclaim1.reclaim_step_size(), reclaim2.reclaim_step_size());
     ASSERT_EQ(reclaim1.reclaim_step_percentage(), reclaim2.reclaim_step_percentage());
     ASSERT_EQ(reclaim1.delay_before_delete_ms(), reclaim2.delay_before_delete_ms());
+    ASSERT_EQ(reclaim1.enable_instance_fairness(), reclaim2.enable_instance_fairness());
 
     // Compare TriggerStrategy
     const TriggerStrategy &trigger1 = reclaim1.trigger_strategy();
@@ -189,6 +190,7 @@ InstanceGroup StartupConfigLoaderTest::MakeInstanceGroup() {
     reclaim_strategy->set_reclaim_step_size(1073741824); // 1GB
     reclaim_strategy->set_reclaim_step_percentage(10);
     reclaim_strategy->set_delay_before_delete_ms(1000);
+    reclaim_strategy->set_enable_instance_fairness(false);
 
     // Create meta storage backend config
     auto meta_storage_backend_config = std::make_shared<MetaStorageBackendConfig>();

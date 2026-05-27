@@ -30,14 +30,16 @@ public:
                          int32_t trigger_period_seconds,
                          int32_t reclaim_step_size,
                          int32_t reclaim_step_percentage,
-                         int32_t delay_before_delete_ms = 0)
+                         int32_t delay_before_delete_ms = 0,
+                         bool enable_instance_fairness = true)
         : storage_unique_name_(storage_unique_name)
         , reclaim_policy_(reclaim_policy)
         , trigger_strategy_(trigger_strategy)
         , trigger_period_seconds_(trigger_period_seconds)
         , reclaim_step_size_(reclaim_step_size)
         , reclaim_step_percentage_(reclaim_step_percentage)
-        , delay_before_delete_ms_(delay_before_delete_ms) {}
+        , delay_before_delete_ms_(delay_before_delete_ms)
+        , enable_instance_fairness_(enable_instance_fairness) {}
 
     ~CacheReclaimStrategy() override;
 
@@ -52,6 +54,7 @@ public:
     int32_t reclaim_step_size() const { return reclaim_step_size_; }
     int32_t reclaim_step_percentage() const { return reclaim_step_percentage_; }
     int32_t delay_before_delete_ms() const { return delay_before_delete_ms_; }
+    bool enable_instance_fairness() const { return enable_instance_fairness_; }
 
     // Setters
     void set_storage_unique_name(const std::string &storage_unique_name) { storage_unique_name_ = storage_unique_name; }
@@ -66,6 +69,9 @@ public:
     }
     void set_delay_before_delete_ms(int32_t delay_before_delete_ms) {
         delay_before_delete_ms_ = delay_before_delete_ms;
+    }
+    void set_enable_instance_fairness(bool enable_instance_fairness) {
+        enable_instance_fairness_ = enable_instance_fairness;
     }
 
 public:
@@ -82,6 +88,7 @@ private:
     int32_t reclaim_step_size_;
     int32_t reclaim_step_percentage_;
     int32_t delay_before_delete_ms_;
+    bool enable_instance_fairness_ = true;
 };
 
 } // namespace kv_cache_manager

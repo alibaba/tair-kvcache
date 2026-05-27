@@ -377,6 +377,40 @@ private:
         array_t_ water_level_exceed_by_type_;
     };
 
+    // instance group key & storage usage data, with a per-instance
+    // breakdown so ComputeInstanceReclaimPlan can weight eviction by
+    // absolute usage without doing a second MetaIndexer pass
+    struct GroupUsageData {
+        struct InstanceUsage {
+            std::shared_ptr<const InstanceInfo> instance_info;
+            std::size_t used_key_cnt = 0;
+            std::size_t max_key_cnt = 0;
+            std::size_t used_byte_sz = 0;
+            std::array<std::size_t, static_cast<std::size_t>(DataStorageType::COUNT)> used_byte_sz_by_type{};
+        };
+
+        std::size_t grp_used_key_cnt_;
+        std::size_t grp_max_key_cnt_;
+        std::size_t grp_used_byte_sz_;
+        std::vector<InstanceUsage> per_instance_;
+
+        GroupUsageData();
+        ~GroupUsageData() = default;
+
+        [[nodiscard]] std::size_t GetGroupUsageByType(const DataStorageType &type) const noexcept;
+        void AddGroupUsageByType(const DataStorageType &type, std::size_t value) noexcept;
+
+        // group storage usage data array aggregated by storage type
+        // slot 0: DATA_STORAGE_TYPE_UNKNOWN **UNUSED**
+        // slot 1: DATA_STORAGE_TYPE_HF3FS usage data
+        // slot 2: DATA_STORAGE_TYPE_MOONCAKE usage data
+        // slot 3: DATA_STORAGE_TYPE_TAIR_MEMPOOL usage data
+        // slot 4: DATA_STORAGE_TYPE_NFS usage data
+        // slot 5: DATA_STORAGE_TYPE_VCNS_HF3FS **UNUSED** (merged into HF3FS)
+        // slot 6: DATA_STORAGE_TYPE_DUMMY usage data (testing only)
+        std::array<std::size_t, static_cast<std::size_t>(DataStorageType::COUNT)> grp_storage_usage_by_type_;
+    };
+
     /**
      * @brief Calculate the group's WaterLevelExceed data
      *
@@ -384,7 +418,7 @@ private:
      * @param instance_group_name Name of the instance group to check
      * @param instance_group_quota Quota info for the instance group
      * @param reclaim_strategy Strategy to use for reclamation decisions
-     * @param instance_infos Vector of instance information
+     * @param group_usage_data Pre-computed group usage data
      * @return shared pointer to the result WaterLevelExceed data
      */
     [[nodiscard]] std::shared_ptr<WaterLevelExceed>
@@ -392,7 +426,7 @@ private:
                         const std::string &instance_group_name,
                         const InstanceGroupQuota &instance_group_quota,
                         const std::shared_ptr<CacheReclaimStrategy> &reclaim_strategy,
-                        const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) noexcept;
+                        const GroupUsageData &group_usage_data) noexcept;
 
     /**
      * @brief Determine if a reclamation should be triggered for an
@@ -425,7 +459,8 @@ private:
     void ReclaimByLRU(const std::shared_ptr<RequestContext> &request_context,
                       const std::shared_ptr<const InstanceInfo> &instance_info,
                       const WaterLevelExceed &water_level_exceed,
-                      std::int32_t delay_before_delete_ms) noexcept;
+                      std::int32_t delay_before_delete_ms,
+                      std::size_t batch_size_override = 0) noexcept;
 
     /**
      * @brief Reclaim cache entries using LFU (Least Frequently Used)
@@ -438,11 +473,14 @@ private:
      * @param instance_info Instance information to process
      * @param water_level_exceed the detailed trigger result
      * @param delay_before_delete_ms delay milliseconds for executor
+     * @param batch_size_override per-instance batch size (0 means use
+     * the atomic batching_size_); set by the fair-eviction planner
      */
     void ReclaimByLFU(const std::shared_ptr<RequestContext> &request_context,
                       const std::shared_ptr<const InstanceInfo> &instance_info,
                       const WaterLevelExceed &water_level_exceed,
-                      std::int32_t delay_before_delete_ms) noexcept;
+                      std::int32_t delay_before_delete_ms,
+                      std::size_t batch_size_override = 0) noexcept;
 
     /**
      * @brief Reclaim cache entries using TTL (Time To Live) strategy
@@ -454,11 +492,14 @@ private:
      * @param instance_info Instance information to process
      * @param water_level_exceed the detailed trigger result
      * @param delay_before_delete_ms delay milliseconds for executor
+     * @param batch_size_override per-instance batch size (0 means use
+     * the atomic batching_size_); set by the fair-eviction planner
      */
     void ReclaimByTTL(const std::shared_ptr<RequestContext> &request_context,
                       const std::shared_ptr<const InstanceInfo> &instance_info,
                       const WaterLevelExceed &water_level_exceed,
-                      std::int32_t delay_before_delete_ms) noexcept;
+                      std::int32_t delay_before_delete_ms,
+                      std::size_t batch_size_override = 0) noexcept;
 
     bool TryReclaimOnGroup(const std::shared_ptr<RequestContext> &request_context,
                            const std::shared_ptr<const InstanceGroup> &instance_group) noexcept;
@@ -487,7 +528,8 @@ private:
                         const std::vector<std::int64_t> &sampled_keys,
                         const std::vector<std::map<std::string, std::string>> &property_maps,
                         std::vector<std::int64_t> &out_batch,
-                        AgeStats &out_lru_age_stats) const noexcept;
+                        AgeStats &out_lru_age_stats,
+                        std::size_t batch_size_override = 0) const noexcept;
 
     bool FilterLocID(RequestContext *request_context,
                      const std::shared_ptr<const InstanceInfo> &instance_info,
@@ -500,11 +542,33 @@ private:
                       const std::shared_ptr<const InstanceInfo> &instance_info,
                       const CacheLocationDelRequest &req) noexcept;
 
-    struct GroupUsageData;
-
     [[nodiscard]] std::shared_ptr<GroupUsageData>
     GetGroupUsageData(const RequestContext *request_context,
                       const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) const noexcept;
+
+    // per-instance batch plan returned by ComputeInstanceReclaimPlan
+    struct InstanceReclaimPlan {
+        std::shared_ptr<const InstanceInfo> instance_info;
+        std::size_t batch_size = 0; // 0 means skip this instance
+    };
+
+    /**
+     * @brief Build a per-instance reclaim plan that biases eviction
+     * toward instances contributing more to the over-watermark state
+     *
+     * When fairness is disabled in the strategy, returns one plan per
+     * instance with batch_size = batching_size_ (legacy behavior).
+     * When enabled, allocates a global budget of batching_size_ * N
+     * keys across instances proportionally to their absolute usage.
+     * Instances with zero usage are skipped; non-zero contributors are
+     * floored at one batch.
+     */
+    [[nodiscard]] std::vector<InstanceReclaimPlan>
+    ComputeInstanceReclaimPlan(const std::shared_ptr<CacheReclaimStrategy> &reclaim_strategy,
+                               const GroupUsageData &group_usage_data,
+                               const WaterLevelExceed &water_level_exceed,
+                               const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos)
+        const noexcept;
 
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(reclaim_cron_count)
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(reclaim_job_count)

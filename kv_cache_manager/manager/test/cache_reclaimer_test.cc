@@ -904,7 +904,8 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming00) {
                                                      ins_group->name(),
                                                      ins_group->quota(),
                                                      ins_group->cache_config()->reclaim_strategy(),
-                                                     instance_infos);
+                                                     *cache_reclaimer_->GetGroupUsageData(
+                                                         request_context_.get(), instance_infos));
     ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
 }
 
@@ -925,7 +926,8 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming01) {
                                                      ins_group->name(),
                                                      ins_group->quota(),
                                                      ins_group->cache_config()->reclaim_strategy(),
-                                                     instance_infos);
+                                                     *cache_reclaimer_->GetGroupUsageData(
+                                                         request_context_.get(), instance_infos));
     ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
 }
 
@@ -946,7 +948,8 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming02) {
                                                      ins_group->name(),
                                                      ins_group->quota(),
                                                      ins_group->cache_config()->reclaim_strategy(),
-                                                     instance_infos);
+                                                     *cache_reclaimer_->GetGroupUsageData(
+                                                         request_context_.get(), instance_infos));
     ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
 }
 
@@ -970,7 +973,8 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming03) {
                                                      ins_group->name(),
                                                      ins_group->quota(),
                                                      ins_group->cache_config()->reclaim_strategy(),
-                                                     instance_infos);
+                                                     *cache_reclaimer_->GetGroupUsageData(
+                                                         request_context_.get(), instance_infos));
     ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
 }
 
@@ -995,7 +999,8 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming04) {
                                                      ins_group->name(),
                                                      ins_group->quota(),
                                                      ins_group->cache_config()->reclaim_strategy(),
-                                                     instance_infos);
+                                                     *cache_reclaimer_->GetGroupUsageData(
+                                                         request_context_.get(), instance_infos));
     ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
     ASSERT_TRUE(wle->CheckGroupWaterLevelExceed());
     ASSERT_FALSE(wle->CheckStorageTypeWaterLevelExceed());
@@ -1023,7 +1028,8 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming05) {
                                                      ins_group->name(),
                                                      ins_group->quota(),
                                                      ins_group->cache_config()->reclaim_strategy(),
-                                                     instance_infos);
+                                                     *cache_reclaimer_->GetGroupUsageData(
+                                                         request_context_.get(), instance_infos));
     ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
 }
 
@@ -1043,7 +1049,8 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming06) {
                                                      ins_group->name(),
                                                      ins_group->quota(),
                                                      ins_group->cache_config()->reclaim_strategy(),
-                                                     instance_infos);
+                                                     *cache_reclaimer_->GetGroupUsageData(
+                                                         request_context_.get(), instance_infos));
     ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
     ASSERT_TRUE(wle->CheckGroupWaterLevelExceed());
     ASSERT_FALSE(wle->CheckStorageTypeWaterLevelExceed());
@@ -1078,7 +1085,8 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming07) {
                                                      ins_group->name(),
                                                      ins_group->quota(),
                                                      ins_group->cache_config()->reclaim_strategy(),
-                                                     instance_infos);
+                                                     *cache_reclaimer_->GetGroupUsageData(
+                                                         request_context_.get(), instance_infos));
     ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
 }
 
@@ -1113,7 +1121,8 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming08) {
                                                      ins_group->name(),
                                                      ins_group->quota(),
                                                      ins_group->cache_config()->reclaim_strategy(),
-                                                     instance_infos);
+                                                     *cache_reclaimer_->GetGroupUsageData(
+                                                         request_context_.get(), instance_infos));
     ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
     ASSERT_TRUE(wle->CheckGroupWaterLevelExceed());
     ASSERT_FALSE(wle->CheckStorageTypeWaterLevelExceed());
@@ -1148,7 +1157,8 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming09) {
                                                      ins_group->name(),
                                                      ins_group->quota(),
                                                      ins_group->cache_config()->reclaim_strategy(),
-                                                     instance_infos);
+                                                     *cache_reclaimer_->GetGroupUsageData(
+                                                         request_context_.get(), instance_infos));
     ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
 }
 
@@ -1175,7 +1185,8 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming10) {
                                                      ins_group->name(),
                                                      ins_group->quota(),
                                                      ins_group->cache_config()->reclaim_strategy(),
-                                                     instance_infos);
+                                                     *cache_reclaimer_->GetGroupUsageData(
+                                                         request_context_.get(), instance_infos));
     ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
     ASSERT_TRUE(wle->CheckGroupWaterLevelExceed());
     ASSERT_FALSE(wle->CheckStorageTypeWaterLevelExceed());
@@ -1210,7 +1221,8 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming11) {
                                                      ins_group->name(),
                                                      ins_group->quota(),
                                                      ins_group->cache_config()->reclaim_strategy(),
-                                                     instance_infos);
+                                                     *cache_reclaimer_->GetGroupUsageData(
+                                                         request_context_.get(), instance_infos));
     ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
     ASSERT_TRUE(wle->CheckGroupWaterLevelExceed());
     ASSERT_FALSE(wle->CheckStorageTypeWaterLevelExceed());
@@ -1235,7 +1247,8 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming15) {
                                                      ins_group->name(),
                                                      ins_group->quota(),
                                                      ins_group->cache_config()->reclaim_strategy(),
-                                                     instance_infos);
+                                                     *cache_reclaimer_->GetGroupUsageData(
+                                                         request_context_.get(), instance_infos));
     ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
 }
 
@@ -1266,7 +1279,8 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
                                                          ins_group->name(),
                                                          ins_group->quota(),
                                                          ins_group->cache_config()->reclaim_strategy(),
-                                                         instance_infos);
+                                                         *cache_reclaimer_->GetGroupUsageData(
+                                                             request_context_.get(), instance_infos));
         ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
         ASSERT_TRUE(wle->CheckGroupWaterLevelExceed());
         ASSERT_FALSE(wle->CheckStorageTypeWaterLevelExceed());
@@ -1294,7 +1308,8 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
                                                          ins_group->name(),
                                                          ins_group->quota(),
                                                          ins_group->cache_config()->reclaim_strategy(),
-                                                         instance_infos);
+                                                         *cache_reclaimer_->GetGroupUsageData(
+                                                             request_context_.get(), instance_infos));
         ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
     }
 
@@ -1314,7 +1329,8 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
                                                          ins_group->name(),
                                                          ins_group->quota(),
                                                          ins_group->cache_config()->reclaim_strategy(),
-                                                         instance_infos);
+                                                         *cache_reclaimer_->GetGroupUsageData(
+                                                             request_context_.get(), instance_infos));
         ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
         ASSERT_TRUE(wle->CheckGroupWaterLevelExceed());
         ASSERT_FALSE(wle->CheckStorageTypeWaterLevelExceed());
@@ -1343,7 +1359,8 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
                                                          ins_group->name(),
                                                          ins_group->quota(),
                                                          ins_group->cache_config()->reclaim_strategy(),
-                                                         instance_infos);
+                                                         *cache_reclaimer_->GetGroupUsageData(
+                                                             request_context_.get(), instance_infos));
         ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
     }
 
@@ -1363,7 +1380,8 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
                                                          ins_group->name(),
                                                          ins_group->quota(),
                                                          ins_group->cache_config()->reclaim_strategy(),
-                                                         instance_infos);
+                                                         *cache_reclaimer_->GetGroupUsageData(
+                                                             request_context_.get(), instance_infos));
         ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
         ASSERT_TRUE(wle->CheckGroupWaterLevelExceed());
         ASSERT_FALSE(wle->CheckStorageTypeWaterLevelExceed());
@@ -1392,7 +1410,8 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
                                                          ins_group->name(),
                                                          ins_group->quota(),
                                                          ins_group->cache_config()->reclaim_strategy(),
-                                                         instance_infos);
+                                                         *cache_reclaimer_->GetGroupUsageData(
+                                                             request_context_.get(), instance_infos));
         ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
     }
 }
@@ -1429,7 +1448,8 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming17) {
                                                          ins_group->name(),
                                                          ins_group->quota(),
                                                          ins_group->cache_config()->reclaim_strategy(),
-                                                         instance_infos);
+                                                         *cache_reclaimer_->GetGroupUsageData(
+                                                             request_context_.get(), instance_infos));
         ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
         ASSERT_TRUE(wle->CheckGroupWaterLevelExceed());
         ASSERT_TRUE(wle->CheckStorageTypeWaterLevelExceed());
@@ -1461,7 +1481,8 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming17) {
                                                          ins_group->name(),
                                                          ins_group->quota(),
                                                          ins_group->cache_config()->reclaim_strategy(),
-                                                         instance_infos);
+                                                         *cache_reclaimer_->GetGroupUsageData(
+                                                             request_context_.get(), instance_infos));
         ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
     }
 
@@ -1490,7 +1511,8 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming17) {
                                                          ins_group->name(),
                                                          ins_group->quota(),
                                                          ins_group->cache_config()->reclaim_strategy(),
-                                                         instance_infos);
+                                                         *cache_reclaimer_->GetGroupUsageData(
+                                                             request_context_.get(), instance_infos));
         ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
         ASSERT_TRUE(wle->CheckGroupWaterLevelExceed());
         ASSERT_TRUE(wle->CheckStorageTypeWaterLevelExceed());
@@ -3201,4 +3223,198 @@ TEST_F(CacheReclaimerTest, TestPerf) {
     KVCM_LOG_INFO("run time: 60 sec, reclaim job qps: [%f], loc del qps: [%f]",
                   static_cast<double>(reclaim_job_count_v) / 60.0,
                   static_cast<double>(loc_submit_count_v) / 60.0);
+}
+
+namespace {
+
+std::shared_ptr<InstanceInfo> MakeInstance(const std::string &id) {
+    auto info = InstanceInfoFactory();
+    info->set_instance_id(id);
+    return info;
+}
+
+// build a GroupUsageData entry for one instance keyed by id; the
+// instance_info is referenced from instance_infos so the planner's
+// id-based lookup works on it
+CacheReclaimer::GroupUsageData::InstanceUsage
+MakeUsage(const std::shared_ptr<const InstanceInfo> &info,
+          std::size_t used_bytes,
+          std::size_t used_keys,
+          DataStorageType type = DataStorageType::DATA_STORAGE_TYPE_NFS) {
+    CacheReclaimer::GroupUsageData::InstanceUsage u;
+    u.instance_info = info;
+    u.used_byte_sz = used_bytes;
+    u.used_key_cnt = used_keys;
+    u.max_key_cnt = 0;
+    if (used_bytes > 0 && static_cast<std::size_t>(type) < u.used_byte_sz_by_type.size()) {
+        u.used_byte_sz_by_type[static_cast<std::size_t>(type)] = used_bytes;
+    }
+    return u;
+}
+
+} // namespace
+
+TEST_F(CacheReclaimerTest, ComputeInstanceReclaimPlan_FairnessSkipsZeroUsage) {
+    // a non-zero contributor must always get a batch; a zero-usage
+    // instance must be skipped entirely
+    auto a = MakeInstance("inst_a");
+    auto b = MakeInstance("inst_b");
+
+    CacheReclaimer::GroupUsageData usage;
+    usage.per_instance_.push_back(MakeUsage(a, 9ULL << 30, 1024));
+    usage.per_instance_.push_back(MakeUsage(b, 0, 0));
+
+    CacheReclaimer::WaterLevelExceed wle;
+    wle.SetGeneralWaterLevelExceed(true);
+
+    const auto strategy = std::make_shared<CacheReclaimStrategy>();
+    strategy->set_enable_instance_fairness(true);
+
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 4));
+    const auto plan = cache_reclaimer_->ComputeInstanceReclaimPlan(
+        strategy, usage, wle, std::vector<std::shared_ptr<const InstanceInfo>>{a, b});
+
+    ASSERT_EQ(2u, plan.size());
+    EXPECT_EQ("inst_a", plan[0].instance_info->instance_id());
+    EXPECT_GT(plan[0].batch_size, 0u);
+    EXPECT_EQ("inst_b", plan[1].instance_info->instance_id());
+    EXPECT_EQ(0u, plan[1].batch_size);
+}
+
+TEST_F(CacheReclaimerTest, ComputeInstanceReclaimPlan_FairnessProportionalBatchSize) {
+    // the batch sizes for two non-zero contributors should be
+    // proportional to their absolute byte usage
+    auto a = MakeInstance("inst_a");
+    auto b = MakeInstance("inst_b");
+
+    CacheReclaimer::GroupUsageData usage;
+    usage.per_instance_.push_back(MakeUsage(a, 7ULL << 30, 7000));
+    usage.per_instance_.push_back(MakeUsage(b, 2ULL << 30, 2000));
+
+    CacheReclaimer::WaterLevelExceed wle;
+    wle.SetGeneralWaterLevelExceed(true);
+
+    const auto strategy = std::make_shared<CacheReclaimStrategy>();
+    strategy->set_enable_instance_fairness(true);
+
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 100));
+    const auto plan = cache_reclaimer_->ComputeInstanceReclaimPlan(
+        strategy, usage, wle, std::vector<std::shared_ptr<const InstanceInfo>>{a, b});
+
+    ASSERT_EQ(2u, plan.size());
+    // global_budget = 100 * 2 = 200, ratio 7:2 -> ~155.6 / ~44.4
+    EXPECT_NEAR(static_cast<double>(plan[0].batch_size), 155.6, 1.5);
+    EXPECT_NEAR(static_cast<double>(plan[1].batch_size), 44.4, 1.5);
+    // total stays close to the global budget (within rounding)
+    EXPECT_LE(plan[0].batch_size + plan[1].batch_size, 201u);
+    EXPECT_GE(plan[0].batch_size + plan[1].batch_size, 199u);
+}
+
+TEST_F(CacheReclaimerTest, ComputeInstanceReclaimPlan_FairnessOnlyTypeExceeded) {
+    // when only one storage type is over-watermark, weight by that
+    // type's per-instance bytes -- a heavy instance on a non-exceeded
+    // type must not be charged
+    auto a = MakeInstance("inst_a");
+    auto b = MakeInstance("inst_b");
+
+    CacheReclaimer::GroupUsageData usage;
+    // a is heavy on the *exceeded* NFS type
+    usage.per_instance_.push_back(MakeUsage(a, 4ULL << 30, 100, DataStorageType::DATA_STORAGE_TYPE_NFS));
+    // b is heavy on a *non-exceeded* type (mooncake) only; its NFS
+    // bytes are zero
+    auto b_usage = MakeUsage(b, 0, 100);
+    b_usage.used_byte_sz = 8ULL << 30;
+    b_usage.used_byte_sz_by_type[static_cast<std::size_t>(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE)] = 8ULL << 30;
+    usage.per_instance_.push_back(b_usage);
+
+    CacheReclaimer::WaterLevelExceed wle;
+    // general not exceeded -- only the NFS type
+    wle.SetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_NFS, true);
+
+    const auto strategy = std::make_shared<CacheReclaimStrategy>();
+    strategy->set_enable_instance_fairness(true);
+
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 8));
+    const auto plan = cache_reclaimer_->ComputeInstanceReclaimPlan(
+        strategy, usage, wle, std::vector<std::shared_ptr<const InstanceInfo>>{a, b});
+
+    ASSERT_EQ(2u, plan.size());
+    EXPECT_GT(plan[0].batch_size, 0u);
+    EXPECT_EQ(0u, plan[1].batch_size);
+}
+
+TEST_F(CacheReclaimerTest, ComputeInstanceReclaimPlan_FairnessDisabledMatchesLegacy) {
+    // with the fairness flag off, every instance gets the legacy
+    // uniform per-instance batch -- regardless of usage skew
+    auto a = MakeInstance("inst_a");
+    auto b = MakeInstance("inst_b");
+
+    CacheReclaimer::GroupUsageData usage;
+    usage.per_instance_.push_back(MakeUsage(a, 9ULL << 30, 9000));
+    usage.per_instance_.push_back(MakeUsage(b, 0, 0));
+
+    CacheReclaimer::WaterLevelExceed wle;
+    wle.SetGeneralWaterLevelExceed(true);
+
+    const auto strategy = std::make_shared<CacheReclaimStrategy>();
+    strategy->set_enable_instance_fairness(false);
+
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 7));
+    const auto plan = cache_reclaimer_->ComputeInstanceReclaimPlan(
+        strategy, usage, wle, std::vector<std::shared_ptr<const InstanceInfo>>{a, b});
+
+    ASSERT_EQ(2u, plan.size());
+    EXPECT_EQ(7u, plan[0].batch_size);
+    EXPECT_EQ(7u, plan[1].batch_size);
+}
+
+TEST_F(CacheReclaimerTest, ComputeInstanceReclaimPlan_FairnessFloorAtOneForNonZero) {
+    // non-zero contributor must always receive at least one batch
+    // even when its proportional share rounds to zero
+    auto a = MakeInstance("inst_a");
+    auto b = MakeInstance("inst_b");
+
+    CacheReclaimer::GroupUsageData usage;
+    usage.per_instance_.push_back(MakeUsage(a, 1ULL << 40, 1000)); // dominant
+    usage.per_instance_.push_back(MakeUsage(b, 1, 1));             // tiny
+
+    CacheReclaimer::WaterLevelExceed wle;
+    wle.SetGeneralWaterLevelExceed(true);
+
+    const auto strategy = std::make_shared<CacheReclaimStrategy>();
+    strategy->set_enable_instance_fairness(true);
+
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 2));
+    const auto plan = cache_reclaimer_->ComputeInstanceReclaimPlan(
+        strategy, usage, wle, std::vector<std::shared_ptr<const InstanceInfo>>{a, b});
+
+    ASSERT_EQ(2u, plan.size());
+    EXPECT_GE(plan[0].batch_size, 1u);
+    // tiny but non-zero contributor must still make progress
+    EXPECT_EQ(1u, plan[1].batch_size);
+}
+
+TEST_F(CacheReclaimerTest, ComputeInstanceReclaimPlan_FairnessZeroSumFallsBack) {
+    // when no instance has any usage data, the planner falls back to
+    // the legacy uniform plan rather than producing all zeros
+    auto a = MakeInstance("inst_a");
+    auto b = MakeInstance("inst_b");
+
+    CacheReclaimer::GroupUsageData usage;
+    usage.per_instance_.push_back(MakeUsage(a, 0, 0));
+    usage.per_instance_.push_back(MakeUsage(b, 0, 0));
+
+    CacheReclaimer::WaterLevelExceed wle;
+    wle.SetGeneralWaterLevelExceed(true);
+
+    const auto strategy = std::make_shared<CacheReclaimStrategy>();
+    strategy->set_enable_instance_fairness(true);
+
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 5));
+    const auto plan = cache_reclaimer_->ComputeInstanceReclaimPlan(
+        strategy, usage, wle, std::vector<std::shared_ptr<const InstanceInfo>>{a, b});
+
+    ASSERT_EQ(2u, plan.size());
+    EXPECT_EQ(5u, plan[0].batch_size);
+    EXPECT_EQ(5u, plan[1].batch_size);
 }

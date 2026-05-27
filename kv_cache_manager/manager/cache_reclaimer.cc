@@ -144,31 +144,7 @@ inline std::string CacheReclaimer::GenTraceID() {
 }
 
 // instance group key & storage usage data
-struct CacheReclaimer::GroupUsageData {
-    std::size_t grp_used_key_cnt_;
-    std::size_t grp_max_key_cnt_;
-    std::size_t grp_used_byte_sz_;
-
-    GroupUsageData();
-    ~GroupUsageData() = default;
-
-    [[nodiscard]] std::size_t GetGroupUsageByType(const DataStorageType &type) const noexcept;
-    void AddGroupUsageByType(const DataStorageType &type, std::size_t value) noexcept;
-
-private:
-    using array_t_ = std::array<std::size_t, static_cast<std::size_t>(DataStorageType::COUNT)>;
-    using size_t_ = array_t_::size_type;
-
-    // group storage usage data array aggregated by storage type
-    // slot 0: DATA_STORAGE_TYPE_UNKNOWN **UNUSED**
-    // slot 1: DATA_STORAGE_TYPE_HF3FS usage data
-    // slot 2: DATA_STORAGE_TYPE_MOONCAKE usage data
-    // slot 3: DATA_STORAGE_TYPE_TAIR_MEMPOOL usage data
-    // slot 4: DATA_STORAGE_TYPE_NFS usage data
-    // slot 5: DATA_STORAGE_TYPE_VCNS_HF3FS **UNUSED** (merged into HF3FS)
-    // slot 6: DATA_STORAGE_TYPE_DUMMY usage data (testing only)
-    array_t_ grp_storage_usage_by_type_;
-};
+// (definition moved to cache_reclaimer.h so tests can construct one)
 
 CacheReclaimer::GroupUsageData::GroupUsageData()
     : grp_used_key_cnt_(0), grp_max_key_cnt_(0), grp_used_byte_sz_(0), grp_storage_usage_by_type_{} {
@@ -176,7 +152,7 @@ CacheReclaimer::GroupUsageData::GroupUsageData()
 }
 
 std::size_t CacheReclaimer::GroupUsageData::GetGroupUsageByType(const DataStorageType &type) const noexcept {
-    const size_t_ idx = ToIndex(ToBaseType(type));
+    const std::size_t idx = ToIndex(ToBaseType(type));
     if (idx >= grp_storage_usage_by_type_.size()) {
         KVCM_LOG_WARN("data storage type to index out of range, array size: [%zu], type as index: [%zu]",
                       grp_storage_usage_by_type_.size(),
@@ -188,7 +164,7 @@ std::size_t CacheReclaimer::GroupUsageData::GetGroupUsageByType(const DataStorag
 
 void CacheReclaimer::GroupUsageData::AddGroupUsageByType(const DataStorageType &type,
                                                          const std::size_t value) noexcept {
-    const size_t_ idx = ToIndex(ToBaseType(type));
+    const std::size_t idx = ToIndex(ToBaseType(type));
     if (idx >= grp_storage_usage_by_type_.size()) {
         KVCM_LOG_WARN("data storage type to index out of range, array size: [%zu], type as index: [%zu]",
                       grp_storage_usage_by_type_.size(),
@@ -452,7 +428,7 @@ CacheReclaimer::GetWaterLevelExceed(const RequestContext *request_context,
                                     const std::string &ins_gr,
                                     const InstanceGroupQuota &instance_group_quota,
                                     const std::shared_ptr<CacheReclaimStrategy> &reclaim_strategy,
-                                    const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) noexcept {
+                                    const GroupUsageData &group_usage_data) noexcept {
     if (!IsRunning() || IsPaused()) {
         // fast exiting in the middle of one job round
         return nullptr;
@@ -469,13 +445,7 @@ CacheReclaimer::GetWaterLevelExceed(const RequestContext *request_context,
     //       2. storage type usage and capacity quota for this group
 
     const auto water_level_exceed = std::make_shared<WaterLevelExceed>();
-
-    // 1. calculate the key count and used byte size of this group
-    const auto data = GetGroupUsageData(request_context, instance_infos);
-    if (data == nullptr) {
-        LOG_WITH_GR(ERROR, "group usage data is nullptr");
-        return nullptr;
-    }
+    const GroupUsageData *data = &group_usage_data;
 
     // 2. generate the result water level exceeding array
     const double threshold_used_percentage = reclaim_strategy->trigger_strategy().used_percentage();
@@ -574,7 +544,8 @@ bool CacheReclaimer::IsTriggerReclaiming(const std::shared_ptr<WaterLevelExceed>
 void CacheReclaimer::ReclaimByLRU(const std::shared_ptr<RequestContext> &request_context,
                                   const InstanceInfoConstPtr &instance_info,
                                   const WaterLevelExceed &water_level_exceed,
-                                  const std::int32_t delay_before_delete_ms) noexcept {
+                                  const std::int32_t delay_before_delete_ms,
+                                  const std::size_t batch_size_override) noexcept {
     if (!IsRunning() || IsPaused()) {
         // fast exiting in the middle of one job round
         return;
@@ -612,7 +583,13 @@ void CacheReclaimer::ReclaimByLRU(const std::shared_ptr<RequestContext> &request
     // 2. constitute the batch based on the LRU timestamp info
     const std::int64_t begin_tp_batch = TimestampUtil::GetSteadyTimeUs();
     AgeStats lru_age_stats;
-    if (!MakeBatchByLRU(request_context.get(), instance_info, keys, maps, request.block_keys, lru_age_stats)) {
+    if (!MakeBatchByLRU(request_context.get(),
+                        instance_info,
+                        keys,
+                        maps,
+                        request.block_keys,
+                        lru_age_stats,
+                        batch_size_override)) {
         LOG_WITH_ID(DEBUG, "make batch failed");
         return;
     }
@@ -659,7 +636,8 @@ void CacheReclaimer::ReclaimByLRU(const std::shared_ptr<RequestContext> &request
 void CacheReclaimer::ReclaimByLFU(const std::shared_ptr<RequestContext> &request_context,
                                   const InstanceInfoConstPtr &instance_info,
                                   const WaterLevelExceed &water_level_exceed,
-                                  const std::int32_t delay_before_delete_ms) noexcept {
+                                  const std::int32_t delay_before_delete_ms,
+                                  const std::size_t batch_size_override) noexcept {
     if (!IsRunning() || IsPaused()) {
         // fast exiting in the middle of one job round
         return;
@@ -667,13 +645,14 @@ void CacheReclaimer::ReclaimByLFU(const std::shared_ptr<RequestContext> &request
 
     // TODO: impl LFU policy
     LOG_WITH_TRACE(WARN, "LFU reclaim policy not supported yet; fall back to LRU policy");
-    ReclaimByLRU(request_context, instance_info, water_level_exceed, delay_before_delete_ms);
+    ReclaimByLRU(request_context, instance_info, water_level_exceed, delay_before_delete_ms, batch_size_override);
 }
 
 void CacheReclaimer::ReclaimByTTL(const std::shared_ptr<RequestContext> &request_context,
                                   const InstanceInfoConstPtr &instance_info,
                                   const WaterLevelExceed &water_level_exceed,
-                                  const std::int32_t delay_before_delete_ms) noexcept {
+                                  const std::int32_t delay_before_delete_ms,
+                                  const std::size_t batch_size_override) noexcept {
     if (!IsRunning() || IsPaused()) {
         // fast exiting in the middle of one job round
         return;
@@ -681,7 +660,7 @@ void CacheReclaimer::ReclaimByTTL(const std::shared_ptr<RequestContext> &request
 
     // TODO: impl TTL policy
     LOG_WITH_TRACE(WARN, "TTL reclaim policy not supported yet; fall back to LRU policy");
-    ReclaimByLRU(request_context, instance_info, water_level_exceed, delay_before_delete_ms);
+    ReclaimByLRU(request_context, instance_info, water_level_exceed, delay_before_delete_ms, batch_size_override);
 }
 
 void CacheReclaimer::ReclaimCron() noexcept {
@@ -859,8 +838,9 @@ bool CacheReclaimer::MakeBatchByLRU(const RequestContext *request_context,
                                     const std::vector<std::int64_t> &sampled_keys,
                                     const std::vector<std::map<std::string, std::string>> &property_maps,
                                     std::vector<std::int64_t> &out_batch,
-                                    AgeStats &out_lru_age_stats) const noexcept {
-    const std::size_t batching_size = batching_size_.load();
+                                    AgeStats &out_lru_age_stats,
+                                    std::size_t batch_size_override) const noexcept {
+    const std::size_t batching_size = batch_size_override > 0 ? batch_size_override : batching_size_.load();
     if (batching_size == 0) {
         out_batch.clear();
         out_lru_age_stats.Clear();
@@ -1023,9 +1003,9 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
                 bool selected = false;
                 if (water_level_exceed.CheckStorageTypeWaterLevelExceed()) {
                     // some storage type water level exceeded; only
-                    // collect the location with matched type but
-                    // fairness is ignored
-                    // TODO (rui): implement the fair eviction
+                    // collect the location with matched type
+                    // per-instance fairness is enforced upstream by
+                    // ComputeInstanceReclaimPlan
                     if (water_level_exceed.GetWaterLevelExceedByType(loc.type())) {
                         loc_id_vec.emplace_back(loc.id());
                         selected = true;
@@ -1104,6 +1084,7 @@ std::shared_ptr<CacheReclaimer::GroupUsageData> CacheReclaimer::GetGroupUsageDat
     const RequestContext *request_context,
     const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) const noexcept {
     const auto data = std::make_shared<GroupUsageData>();
+    data->per_instance_.reserve(instance_infos.size());
     for (const auto &instance_info : instance_infos) {
         if (instance_info == nullptr) {
             LOG_WITH_TRACE(WARN, "instance is nullptr");
@@ -1128,18 +1109,133 @@ std::shared_ptr<CacheReclaimer::GroupUsageData> CacheReclaimer::GetGroupUsageDat
         data->grp_max_key_cnt_ += ins_max_key_cnt;
         data->grp_used_byte_sz_ += ins_used_byte_size;
 
+        GroupUsageData::InstanceUsage ins_usage;
+        ins_usage.instance_info = instance_info;
+        ins_usage.used_key_cnt = ins_used_key_cnt;
+        ins_usage.max_key_cnt = ins_max_key_cnt;
+        ins_usage.used_byte_sz = ins_used_byte_size;
+
         // calc the usage size of each storage type of this instance
-        auto calc_sz = [&meta_indexer, &data](const DataStorageType &type) -> void {
+        auto calc_sz = [&meta_indexer, &data, &ins_usage](const DataStorageType &type) -> void {
             const std::uint64_t sz = meta_indexer->GetStorageUsageByType(type);
             data->AddGroupUsageByType(type, sz);
+            const auto idx = static_cast<std::size_t>(ToIndex(ToBaseType(type)));
+            if (idx < ins_usage.used_byte_sz_by_type.size()) {
+                ins_usage.used_byte_sz_by_type[idx] += sz;
+            }
         };
         calc_sz(DataStorageType::DATA_STORAGE_TYPE_HF3FS);
         calc_sz(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE);
         calc_sz(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL);
         calc_sz(DataStorageType::DATA_STORAGE_TYPE_NFS);
         // vcns_hf3fs is merged into hf3fs, no need to calc the size
+
+        data->per_instance_.emplace_back(std::move(ins_usage));
     }
     return data;
+}
+
+std::vector<CacheReclaimer::InstanceReclaimPlan> CacheReclaimer::ComputeInstanceReclaimPlan(
+    const std::shared_ptr<CacheReclaimStrategy> &reclaim_strategy,
+    const GroupUsageData &group_usage_data,
+    const WaterLevelExceed &water_level_exceed,
+    const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) const noexcept {
+    const std::size_t batching_size = batching_size_.load();
+    std::vector<InstanceReclaimPlan> plan;
+    plan.reserve(instance_infos.size());
+
+    // build a fast lookup from instance_id to per-instance usage so the
+    // returned plan preserves the caller's instance_infos ordering even
+    // when GetGroupUsageData skipped null/missing meta indexers
+    std::map<std::string, const GroupUsageData::InstanceUsage *> usage_by_id;
+    for (const auto &usage : group_usage_data.per_instance_) {
+        if (usage.instance_info != nullptr) {
+            usage_by_id.emplace(usage.instance_info->instance_id(), &usage);
+        }
+    }
+
+    // legacy behavior: every instance receives the atomic batching size
+    if (reclaim_strategy == nullptr || !reclaim_strategy->enable_instance_fairness()) {
+        for (const auto &instance_info : instance_infos) {
+            plan.push_back({instance_info, batching_size});
+        }
+        return plan;
+    }
+
+    // pick the weight source based on which watermark dimension is
+    // exceeded; per-storage-type exceed uses the matching type's
+    // bytes (summed across exceeded types) so eviction concentrates on
+    // the instances responsible for that type's pressure
+    const bool only_type_exceed =
+        !water_level_exceed.GetGeneralWaterLevelExceed() && water_level_exceed.CheckStorageTypeWaterLevelExceed();
+
+    auto weight_of = [&](const GroupUsageData::InstanceUsage &usage) -> std::size_t {
+        if (only_type_exceed) {
+            std::size_t w = 0;
+            for (std::size_t idx = 0; idx < usage.used_byte_sz_by_type.size(); ++idx) {
+                const auto type = static_cast<DataStorageType>(idx);
+                if (water_level_exceed.GetWaterLevelExceedByType(type)) {
+                    w += usage.used_byte_sz_by_type[idx];
+                }
+            }
+            return w;
+        }
+        // general exceed: prefer absolute byte usage; if bytes are not
+        // tracked (all zero) fall back to key count so the planner is
+        // still meaningful for key-count-driven watermarks
+        return usage.used_byte_sz > 0 ? usage.used_byte_sz : usage.used_key_cnt;
+    };
+
+    // first pass: compute weights per instance_info
+    std::vector<std::size_t> weights(instance_infos.size(), 0);
+    long double sum_w = 0;
+    for (std::size_t i = 0; i < instance_infos.size(); ++i) {
+        const auto &instance_info = instance_infos[i];
+        if (instance_info == nullptr) {
+            continue;
+        }
+        const auto it = usage_by_id.find(instance_info->instance_id());
+        if (it == usage_by_id.end() || it->second == nullptr) {
+            continue;
+        }
+        const std::size_t w = weight_of(*it->second);
+        weights[i] = w;
+        sum_w += static_cast<long double>(w);
+    }
+
+    // degenerate case: no usage data available; fall back to legacy
+    // uniform plan so the reclaimer still makes forward progress
+    if (sum_w <= 0) {
+        for (const auto &instance_info : instance_infos) {
+            plan.push_back({instance_info, batching_size});
+        }
+        return plan;
+    }
+
+    const std::size_t global_budget = batching_size * instance_infos.size();
+    constexpr std::size_t kBatchCap = kSizeLimit - 1;
+
+    for (std::size_t i = 0; i < instance_infos.size(); ++i) {
+        const auto &instance_info = instance_infos[i];
+        const std::size_t w = weights[i];
+        if (instance_info == nullptr || w == 0) {
+            // skip instances with zero contribution; nothing to evict
+            plan.push_back({instance_info, 0});
+            continue;
+        }
+        const long double share =
+            static_cast<long double>(global_budget) * static_cast<long double>(w) / sum_w;
+        std::size_t batch = static_cast<std::size_t>(share + 0.5L);
+        if (batch == 0) {
+            // floor at 1 so a non-zero contributor still makes progress
+            batch = 1;
+        }
+        if (batch > kBatchCap) {
+            batch = kBatchCap;
+        }
+        plan.push_back({instance_info, batch});
+    }
+    return plan;
 }
 
 void CacheReclaimer::HandleDelRes() noexcept {
@@ -1224,12 +1320,17 @@ bool CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &re
 
     // do we need to reclaim the storage for this instance group?
     const std::int64_t quota_begin_tp = TimestampUtil::GetSteadyTimeUs();
+    const auto group_usage_data = GetGroupUsageData(request_context.get(), instance_infos);
+    if (group_usage_data == nullptr) {
+        LOG_WITH_GR(ERROR, "group usage data is nullptr");
+        return false;
+    }
     const auto water_level_exceed =
         GetWaterLevelExceed(request_context.get(),
                             ins_gr,
                             instance_group->quota(), // TODO (rui): validate the quota is valid
                             reclaim_strategy,
-                            instance_infos);
+                            *group_usage_data);
     METRICS_(cache_reclaimer, reclaim_quota_duration_us) =
         static_cast<double>(TimestampUtil::GetSteadyTimeUs() - quota_begin_tp);
 
@@ -1240,13 +1341,26 @@ bool CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &re
 
     LOG_WITH_GR(DEBUG, "instance group trigger reclaiming");
 
+    // build the per-instance reclaim plan; with fairness enabled this
+    // biases eviction toward the heaviest contributors and skips
+    // instances whose contribution is zero
+    const auto reclaim_plan =
+        ComputeInstanceReclaimPlan(reclaim_strategy, *group_usage_data, *water_level_exceed, instance_infos);
+
     // run the reclaiming algorithm with the chosen policy
     switch (reclaim_strategy->reclaim_policy()) {
     case ReclaimPolicy::POLICY_LRU:
         LOG_WITH_GR(DEBUG, "start to run the LRU reclaim policy");
-        for (const auto &instance_info : instance_infos) {
+        for (const auto &entry : reclaim_plan) {
+            if (entry.instance_info == nullptr || entry.batch_size == 0) {
+                continue;
+            }
             const std::int64_t begin_tp = TimestampUtil::GetSteadyTimeUs();
-            ReclaimByLRU(request_context, instance_info, *water_level_exceed, delay_before_delete_ms);
+            ReclaimByLRU(request_context,
+                         entry.instance_info,
+                         *water_level_exceed,
+                         delay_before_delete_ms,
+                         entry.batch_size);
             METRICS_(cache_reclaimer, reclaim_job_duration_us) =
                 static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp);
         }
@@ -1254,9 +1368,16 @@ bool CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &re
 
     case ReclaimPolicy::POLICY_LFU:
         LOG_WITH_GR(DEBUG, "start to run the LFU reclaim policy");
-        for (const auto &instance_info : instance_infos) {
+        for (const auto &entry : reclaim_plan) {
+            if (entry.instance_info == nullptr || entry.batch_size == 0) {
+                continue;
+            }
             const std::int64_t begin_tp = TimestampUtil::GetSteadyTimeUs();
-            ReclaimByLFU(request_context, instance_info, *water_level_exceed, delay_before_delete_ms);
+            ReclaimByLFU(request_context,
+                         entry.instance_info,
+                         *water_level_exceed,
+                         delay_before_delete_ms,
+                         entry.batch_size);
             METRICS_(cache_reclaimer, reclaim_job_duration_us) =
                 static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp);
         }
@@ -1264,9 +1385,16 @@ bool CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &re
 
     case ReclaimPolicy::POLICY_TTL:
         LOG_WITH_GR(DEBUG, "start to run the TTL reclaim policy");
-        for (const auto &instance_info : instance_infos) {
+        for (const auto &entry : reclaim_plan) {
+            if (entry.instance_info == nullptr || entry.batch_size == 0) {
+                continue;
+            }
             const std::int64_t begin_tp = TimestampUtil::GetSteadyTimeUs();
-            ReclaimByTTL(request_context, instance_info, *water_level_exceed, delay_before_delete_ms);
+            ReclaimByTTL(request_context,
+                         entry.instance_info,
+                         *water_level_exceed,
+                         delay_before_delete_ms,
+                         entry.batch_size);
             METRICS_(cache_reclaimer, reclaim_job_duration_us) =
                 static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp);
         }
@@ -1277,9 +1405,16 @@ bool CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &re
         // break; skipped intentionally
 
     default:
-        for (const auto &instance_info : instance_infos) {
+        for (const auto &entry : reclaim_plan) {
+            if (entry.instance_info == nullptr || entry.batch_size == 0) {
+                continue;
+            }
             const std::int64_t begin_tp = TimestampUtil::GetSteadyTimeUs();
-            ReclaimByLRU(request_context, instance_info, *water_level_exceed, delay_before_delete_ms);
+            ReclaimByLRU(request_context,
+                         entry.instance_info,
+                         *water_level_exceed,
+                         delay_before_delete_ms,
+                         entry.batch_size);
             METRICS_(cache_reclaimer, reclaim_job_duration_us) =
                 static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp);
         }
