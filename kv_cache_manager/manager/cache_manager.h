@@ -22,6 +22,7 @@ class RegistryManager;
 class MetaSearcherManager;
 class MetaIndexerManager;
 class MetricsRegistry;
+class CacheGarbageCollector;
 class CacheReclaimer;
 class SchedulePlanExecutor;
 class ReclaimerTaskSupervisor;
@@ -246,6 +247,8 @@ private:
     std::shared_ptr<SchedulePlanExecutor> schedule_plan_executor_;
     // 无需清理 - 仅需要暂停
     std::shared_ptr<CacheReclaimer> cache_reclaimer_;
+    // 无需清理 - 仅需要暂停
+    std::shared_ptr<CacheGarbageCollector> cache_garbage_collector_;
     // 无需清理 - SchedulePlanExecutor遗留的Plan会继续跑完
     std::unique_ptr<ReclaimerTaskSupervisor> reclaimer_task_supervisor_;
     // 无需清理 - 不包含运行时状态

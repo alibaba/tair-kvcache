@@ -26,6 +26,7 @@
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/event/spec_events/optimizer_event.h"
 #include "kv_cache_manager/manager/cache_manager_metrics_recorder.h"
+#include "kv_cache_manager/manager/cache_garbage_collector.h"
 #include "kv_cache_manager/manager/cache_reclaimer.h"
 #include "kv_cache_manager/manager/data_storage_selector.h"
 #include "kv_cache_manager/manager/hash_util.h"
@@ -143,6 +144,10 @@ CacheManager::~CacheManager() {
         write_location_manager_->Stop();
         write_location_manager_.reset();
     }
+    if (cache_garbage_collector_) {
+        cache_garbage_collector_->Stop();
+        cache_garbage_collector_.reset();
+    }
     if (cache_reclaimer_) {
         cache_reclaimer_->Stop();
         cache_reclaimer_.reset();
@@ -182,6 +187,16 @@ bool CacheManager::Init(int32_t schedule_plan_executor_thread_count,
     if (cache_reclaimer_->Start() != EC_OK) {
         KVCM_LOG_ERROR("CacheManager init failed");
         return false;
+    }
+    cache_garbage_collector_ = std::make_shared<CacheGarbageCollector>(CacheGarbageCollector::Config{},
+                                                                       registry_manager_,
+                                                                       meta_indexer_manager_,
+                                                                       schedule_plan_executor_,
+                                                                       metrics_registry_,
+                                                                       event_manager_,
+                                                                       write_location_manager_);
+    if (cache_garbage_collector_->Start() != EC_OK) {
+        KVCM_LOG_WARN("cache garbage collector start failed, continuing without GC");
     }
     reclaimer_task_supervisor_ = std::make_unique<ReclaimerTaskSupervisor>(schedule_plan_executor_);
     reclaimer_task_supervisor_->Start();
@@ -727,8 +742,18 @@ ErrorCode CacheManager::TrimCache(RequestContext *request_context,
 
     return ErrorCode::EC_OK;
 }
-void CacheManager::PauseReclaimer() { cache_reclaimer_->Pause(); }
-void CacheManager::ResumeReclaimer() { cache_reclaimer_->Resume(); }
+void CacheManager::PauseReclaimer() {
+    cache_reclaimer_->Pause();
+    if (cache_garbage_collector_) {
+        cache_garbage_collector_->Pause();
+    }
+}
+void CacheManager::ResumeReclaimer() {
+    cache_reclaimer_->Resume();
+    if (cache_garbage_collector_) {
+        cache_garbage_collector_->Resume();
+    }
+}
 
 void CacheManager::FilterLocationSpecByName(CacheLocationVector &locations,
                                             const std::vector<std::string> &location_spec_names) {

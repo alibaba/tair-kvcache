@@ -16,6 +16,21 @@ cc_test(
 )
 
 cc_test(
+    name = "CacheGarbageCollectorTest",
+    srcs = [
+        "cache_garbage_collector_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    data = [],
+    linkstatic = True,
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/manager:cache_garbage_collector",
+        "@cpp_stub",
+    ],
+)
+
+cc_test(
     name = "DataStorageSelectorTest",
     srcs = [
         "data_storage_selector_test.cc",
