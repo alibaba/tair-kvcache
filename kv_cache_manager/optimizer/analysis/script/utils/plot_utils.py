@@ -7,9 +7,8 @@
 - 单策略 Pareto 曲线（每个 instance 一条线）
 - 多策略对比子图（每个 instance 一个子图）
 
-Note: Tradeoff（Pareto 曲线）分析仅适用于非分层模式
-（hierarchical_eviction_enabled=false）。分层模式下各 tier
-独立容量构成多维搜索空间，quota_capacity 扫描无意义。
+Note: Tradeoff（Pareto 曲线）分析仅适用于单层模式。多层模式下各
+tier 独立容量构成多维搜索空间，quota_capacity 扫描无意义。
 """
 
 import os

@@ -7,7 +7,7 @@ Pareto 曲线分析（统一入口）
 
 Applicability:
   This analysis is designed for NON-TIERED mode. In tiered mode
-  (tier_strategy.hierarchical_eviction_enabled=true), the capacity sweep
+  (multiple storages), the capacity sweep
   only modifies quota_capacity, which does not affect per-tier eviction
   decisions. Each tier's eviction is governed by its independent
   storages[i].capacity.
@@ -35,7 +35,7 @@ from utils.optimizer_runner import (
     run_experiments_parallel,
     extract_bytes_per_block_map,
     extract_config_quota_gb_map,
-    group_hierarchical_eviction_enabled,
+    group_has_multi_tier_storage,
 )
 from utils.csv_loader import generate_capacity_list, load_results_from_csv_dir
 from utils.plot_utils import plot_single_policy_curves, plot_multi_policy_subplots
@@ -247,10 +247,10 @@ def main():
     with open(args.config, "r") as _f:
         _raw_config = _json.load(_f)
     for group in _raw_config.get("instance_groups", []):
-        if group_hierarchical_eviction_enabled(group):
+        if group_has_multi_tier_storage(group):
             print("\n" + "="*70)
             print("WARNING: Tradeoff analysis is designed for non-tiered mode.")
-            print("In tiered mode (tier_strategy.hierarchical_eviction_enabled=true), each tier's")
+            print("In tiered mode, each tier's")
             print("capacity is fixed in the config. The capacity sweep only modifies")
             print("quota_capacity, which does not affect per-tier eviction decisions.")
             print("Results may not reflect meaningful capacity-performance tradeoffs.")

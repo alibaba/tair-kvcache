@@ -10,15 +10,21 @@
             "group_name": "instance_group_01",
             "quota_capacity": 240,
             "used_percentage": 1.0,
-            "tier_strategy": {
-                "hierarchical_eviction_enabled": true,
-                "write_mode": "write_through",
-                "access_propagation_enabled": true,
-                "promote_enabled": true,
-                "selective_write_threshold": 2
+            "tier_flows": [
+                {
+                    "from_tier": "pace_00",
+                    "to_tier": "hf3fs_00",
+                    "write_mode": "write_through",
+                    "access_propagation_enabled": true,
+                    "write_propagation_enabled": false,
+                    "promote_enabled": true,
+                    "selective_write_threshold": 2
+                }
+            ],
+            "ttl_config": {
+                "default_block_ttl_seconds": 0,
+                "refresh_on_read": true
             },
-            "default_block_ttl_seconds": 0,
-            "ttl_refresh_on_read": true,
             "storages": [
                 {
                     "unique_name": "pace_00",

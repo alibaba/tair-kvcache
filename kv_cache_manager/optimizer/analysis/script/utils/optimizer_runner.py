@@ -90,9 +90,8 @@ def run_optimizer_with_config_explicit(
 
     # 设置容量 / 策略
     for group in config_json.get("instance_groups", []):
-        # NOTE: In tiered mode (tier_strategy.hierarchical_eviction_enabled=true),
-        # eviction decisions are based on each tier's independent storages[i].capacity,
-        # not quota_capacity.
+        # In tiered mode, eviction decisions are based on each tier's independent
+        # storages[i].capacity, not quota_capacity.
         # This function only modifies quota_capacity, so capacity sweeps in tradeoff
         # analysis are ineffective for tiered configurations.
         # quota_capacity in config is GB; convert blocks -> GB for C++ FromRapidValue (bytes internally)
@@ -140,11 +139,8 @@ def run_optimizer_with_config_explicit(
 # 配置工具
 # ============================================================================
 
-def group_hierarchical_eviction_enabled(group: dict) -> bool:
-    tier_strategy = group.get("tier_strategy", {})
-    if isinstance(tier_strategy, dict) and "hierarchical_eviction_enabled" in tier_strategy:
-        return bool(tier_strategy.get("hierarchical_eviction_enabled", False))
-    return bool(group.get("hierarchical_eviction_enabled", False))
+def group_has_multi_tier_storage(group: dict) -> bool:
+    return len(group.get("storages", [])) > 1
 
 
 def extract_bytes_per_block_map(config_path: str) -> Dict[str, int]:
@@ -196,7 +192,7 @@ def has_hierarchical_storage(config_path: str) -> bool:
         config_json = json.load(f)
 
     for group in config_json.get("instance_groups", []):
-        if group_hierarchical_eviction_enabled(group) and len(group.get("storages", [])) > 1:
+        if group_has_multi_tier_storage(group):
             return True
     return False
 

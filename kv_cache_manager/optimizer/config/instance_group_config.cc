@@ -39,50 +39,40 @@ std::string JoinExpectedEdges(const std::vector<OptTierConfig> &storages) {
     }
     return oss.str();
 }
+
 } // namespace
 
 bool OptTierFlowConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
     if (!rapid_value.IsObject()) {
-        KVCM_LOG_ERROR("tier_strategy.tier_flows item must be an object");
+        KVCM_LOG_ERROR("tier_flows item must be an object");
         return false;
     }
     KVCM_JSON_GET_MACRO(rapid_value, "from_tier", from_tier_);
     KVCM_JSON_GET_MACRO(rapid_value, "to_tier", to_tier_);
     if (from_tier_.empty() || to_tier_.empty()) {
-        KVCM_LOG_ERROR("tier_strategy.tier_flows item has empty from_tier or to_tier");
+        KVCM_LOG_ERROR("tier_flows item has empty from_tier or to_tier");
         return false;
     }
-    if (rapid_value.HasMember("write_mode")) {
-        std::string write_mode_str;
-        KVCM_JSON_GET_MACRO(rapid_value, "write_mode", write_mode_str);
-        if (!IsValidTierWriteMode(write_mode_str)) {
-            KVCM_LOG_ERROR("tier_strategy.tier_flows edge %s->%s has invalid write_mode: %s",
-                           from_tier_.c_str(),
-                           to_tier_.c_str(),
-                           write_mode_str.c_str());
-            return false;
-        }
-        write_mode_ = ToTierWriteMode(write_mode_str);
-        has_write_mode_ = true;
+    std::string write_mode_str;
+    KVCM_JSON_GET_MACRO(rapid_value, "write_mode", write_mode_str);
+    if (!IsValidTierWriteMode(write_mode_str)) {
+        KVCM_LOG_ERROR("tier_flows edge %s->%s has invalid write_mode: %s",
+                       from_tier_.c_str(),
+                       to_tier_.c_str(),
+                       write_mode_str.c_str());
+        return false;
     }
-    if (rapid_value.HasMember("access_propagation_enabled")) {
-        KVCM_JSON_GET_MACRO(rapid_value, "access_propagation_enabled", access_propagation_enabled_);
-        has_access_propagation_enabled_ = true;
-    }
-    if (rapid_value.HasMember("promote_enabled")) {
-        KVCM_JSON_GET_MACRO(rapid_value, "promote_enabled", promote_enabled_);
-        has_promote_enabled_ = true;
-    }
-    if (rapid_value.HasMember("selective_write_threshold")) {
-        KVCM_JSON_GET_MACRO(rapid_value, "selective_write_threshold", selective_write_threshold_);
-        if (selective_write_threshold_ <= 0) {
-            KVCM_LOG_ERROR("tier_strategy.tier_flows edge %s->%s has invalid selective_write_threshold: %lld",
-                           from_tier_.c_str(),
-                           to_tier_.c_str(),
-                           static_cast<long long>(selective_write_threshold_));
-            return false;
-        }
-        has_selective_write_threshold_ = true;
+    write_mode_ = ToTierWriteMode(write_mode_str);
+    KVCM_JSON_GET_MACRO(rapid_value, "access_propagation_enabled", access_propagation_enabled_);
+    KVCM_JSON_GET_MACRO(rapid_value, "write_propagation_enabled", write_propagation_enabled_);
+    KVCM_JSON_GET_MACRO(rapid_value, "promote_enabled", promote_enabled_);
+    KVCM_JSON_GET_MACRO(rapid_value, "selective_write_threshold", selective_write_threshold_);
+    if (selective_write_threshold_ <= 0) {
+        KVCM_LOG_ERROR("tier_flows edge %s->%s has invalid selective_write_threshold: %lld",
+                       from_tier_.c_str(),
+                       to_tier_.c_str(),
+                       static_cast<long long>(selective_write_threshold_));
+        return false;
     }
     return true;
 }
@@ -90,84 +80,50 @@ bool OptTierFlowConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
 void OptTierFlowConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
     Put(writer, "from_tier", from_tier_);
     Put(writer, "to_tier", to_tier_);
-    if (has_write_mode_) {
-        Put(writer, "write_mode", ToString(write_mode_));
-    }
-    if (has_access_propagation_enabled_) {
-        Put(writer, "access_propagation_enabled", access_propagation_enabled_);
-    }
-    if (has_promote_enabled_) {
-        Put(writer, "promote_enabled", promote_enabled_);
-    }
-    if (has_selective_write_threshold_) {
-        Put(writer, "selective_write_threshold", selective_write_threshold_);
-    }
+    Put(writer, "write_mode", ToString(write_mode_));
+    Put(writer, "access_propagation_enabled", access_propagation_enabled_);
+    Put(writer, "write_propagation_enabled", write_propagation_enabled_);
+    Put(writer, "promote_enabled", promote_enabled_);
+    Put(writer, "selective_write_threshold", selective_write_threshold_);
 }
 
 TierFlowStrategy OptTierFlowConfig::Resolve(const TierFlowStrategy &default_strategy) const {
     TierFlowStrategy strategy = default_strategy;
-    if (has_write_mode_) {
-        strategy.write_mode = write_mode_;
-    }
-    if (has_access_propagation_enabled_) {
-        strategy.access_propagation_enabled = access_propagation_enabled_;
-    }
-    if (has_promote_enabled_) {
-        strategy.promote_enabled = promote_enabled_;
-    }
-    if (has_selective_write_threshold_) {
-        strategy.selective_write_threshold = static_cast<size_t>(selective_write_threshold_);
-    }
-    return strategy;
-}
-
-bool OptTierStrategyConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
-    if (!rapid_value.IsObject()) {
-        KVCM_LOG_ERROR("tier_strategy must be an object");
-        return false;
-    }
-    KVCM_JSON_GET_MACRO(rapid_value, "hierarchical_eviction_enabled", hierarchical_eviction_enabled_);
-    std::string write_mode_str;
-    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "write_mode", write_mode_str, std::string("write_through"));
-    if (!IsValidTierWriteMode(write_mode_str)) {
-        KVCM_LOG_ERROR("tier_strategy.write_mode is invalid: %s", write_mode_str.c_str());
-        return false;
-    }
-    write_mode_ = ToTierWriteMode(write_mode_str);
-    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "access_propagation_enabled", access_propagation_enabled_, true);
-    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "promote_enabled", promote_enabled_, true);
-    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "selective_write_threshold", selective_write_threshold_, int64_t(2));
-    if (selective_write_threshold_ <= 0) {
-        KVCM_LOG_ERROR("tier_strategy.selective_write_threshold must be > 0, got %lld",
-                       static_cast<long long>(selective_write_threshold_));
-        return false;
-    }
-    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "tier_flows", tier_flows_, std::vector<OptTierFlowConfig>{});
-    return true;
-}
-
-void OptTierStrategyConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
-    Put(writer, "hierarchical_eviction_enabled", hierarchical_eviction_enabled_);
-    Put(writer, "write_mode", ToString(write_mode_));
-    Put(writer, "access_propagation_enabled", access_propagation_enabled_);
-    Put(writer, "promote_enabled", promote_enabled_);
-    Put(writer, "selective_write_threshold", selective_write_threshold_);
-    if (!tier_flows_.empty()) {
-        Put(writer, "tier_flows", tier_flows_);
-    }
-}
-
-TierFlowStrategy OptTierStrategyConfig::DefaultFlowStrategy() const {
-    TierFlowStrategy strategy;
     strategy.write_mode = write_mode_;
     strategy.access_propagation_enabled = access_propagation_enabled_;
+    strategy.write_propagation_enabled = write_propagation_enabled_;
     strategy.promote_enabled = promote_enabled_;
     strategy.selective_write_threshold = static_cast<size_t>(selective_write_threshold_);
     return strategy;
 }
 
-size_t OptTierStrategyConfig::ResolveFlowEdgeIndex(const OptTierFlowConfig &flow,
-                                                   const std::vector<OptTierConfig> &storages) const {
+OptTierFlowPolicyConfig OptTierFlowPolicyConfig::FromTierFlows(const std::vector<OptTierConfig> &storages,
+                                                               const std::vector<OptTierFlowConfig> &flows) {
+    OptTierFlowPolicyConfig policy;
+    policy.set_hierarchical_eviction_enabled(storages.size() > 1);
+    policy.set_tier_flows(flows);
+    if (!flows.empty()) {
+        policy.set_write_mode(flows.front().write_mode());
+        policy.set_access_propagation_enabled(flows.front().access_propagation_enabled());
+        policy.set_write_propagation_enabled(flows.front().write_propagation_enabled());
+        policy.set_promote_enabled(flows.front().promote_enabled());
+        policy.set_selective_write_threshold(flows.front().selective_write_threshold());
+    }
+    return policy;
+}
+
+TierFlowStrategy OptTierFlowPolicyConfig::DefaultFlowStrategy() const {
+    TierFlowStrategy strategy;
+    strategy.write_mode = write_mode_;
+    strategy.access_propagation_enabled = access_propagation_enabled_;
+    strategy.write_propagation_enabled = write_propagation_enabled_;
+    strategy.promote_enabled = promote_enabled_;
+    strategy.selective_write_threshold = static_cast<size_t>(selective_write_threshold_);
+    return strategy;
+}
+
+size_t OptTierFlowPolicyConfig::ResolveFlowEdgeIndex(const OptTierFlowConfig &flow,
+                                                     const std::vector<OptTierConfig> &storages) const {
     if (storages.size() < 2) {
         return storages.size();
     }
@@ -179,15 +135,20 @@ size_t OptTierStrategyConfig::ResolveFlowEdgeIndex(const OptTierFlowConfig &flow
     return storages.size();
 }
 
-bool OptTierStrategyConfig::ValidateFlowConfigs(const std::vector<OptTierConfig> &storages) const {
-    if (tier_flows_.empty()) {
-        return true;
-    }
+bool OptTierFlowPolicyConfig::ValidateFlowConfigs(const std::vector<OptTierConfig> &storages) const {
     const std::vector<OptTierConfig> sorted_storages = SortStoragesByPriority(storages);
     if (sorted_storages.size() < 2) {
-        KVCM_LOG_ERROR("tier_strategy.tier_flows is configured but instance group has %zu storage tier(s); "
-                       "at least 2 tiers are required",
-                       sorted_storages.size());
+        if (!tier_flows_.empty()) {
+            KVCM_LOG_ERROR("tier_flows is configured but instance group has %zu storage tier(s)",
+                           sorted_storages.size());
+            return false;
+        }
+        return true;
+    }
+    if (tier_flows_.size() != sorted_storages.size() - 1) {
+        KVCM_LOG_ERROR("tier_flows must define exactly %zu adjacent edge(s), got %zu",
+                       sorted_storages.size() - 1,
+                       tier_flows_.size());
         return false;
     }
 
@@ -197,15 +158,13 @@ bool OptTierStrategyConfig::ValidateFlowConfigs(const std::vector<OptTierConfig>
         const auto &storage = sorted_storages[i];
         const auto name_insert_result = tier_index.emplace(storage.unique_name(), i);
         if (!name_insert_result.second) {
-            KVCM_LOG_ERROR("storages contains duplicate unique_name '%s'; tier_strategy.tier_flows cannot be matched "
-                           "unambiguously",
+            KVCM_LOG_ERROR("storages contains duplicate unique_name '%s'; tier_flows cannot be matched unambiguously",
                            storage.unique_name().c_str());
             return false;
         }
         const auto priority_insert_result = priorities.emplace(storage.priority());
         if (!priority_insert_result.second) {
-            KVCM_LOG_ERROR("storages contains duplicate priority %zu; tier_strategy.tier_flows edge order is "
-                           "ambiguous",
+            KVCM_LOG_ERROR("storages contains duplicate priority %zu; tier_flows edge order is ambiguous",
                            storage.priority());
             return false;
         }
@@ -216,7 +175,7 @@ bool OptTierStrategyConfig::ValidateFlowConfigs(const std::vector<OptTierConfig>
         const auto from_it = tier_index.find(flow.from_tier());
         const auto to_it = tier_index.find(flow.to_tier());
         if (from_it == tier_index.end() || to_it == tier_index.end()) {
-            KVCM_LOG_ERROR("tier_strategy.tier_flows edge %s->%s references unknown tier; configured tiers by "
+            KVCM_LOG_ERROR("tier_flows edge %s->%s references unknown tier; configured tiers by "
                            "priority: [%s]",
                            flow.from_tier().c_str(),
                            flow.to_tier().c_str(),
@@ -226,7 +185,7 @@ bool OptTierStrategyConfig::ValidateFlowConfigs(const std::vector<OptTierConfig>
 
         const size_t edge_idx = from_it->second;
         if (edge_idx + 1 != to_it->second) {
-            KVCM_LOG_ERROR("tier_strategy.tier_flows edge %s->%s is not an adjacent priority edge; expected one of "
+            KVCM_LOG_ERROR("tier_flows edge %s->%s is not an adjacent priority edge; expected one of "
                            "[%s]",
                            flow.from_tier().c_str(),
                            flow.to_tier().c_str(),
@@ -235,7 +194,7 @@ bool OptTierStrategyConfig::ValidateFlowConfigs(const std::vector<OptTierConfig>
         }
 
         if (edge_idx >= seen.size()) {
-            KVCM_LOG_ERROR("tier_strategy.tier_flows edge %s->%s starts from the last storage tier; expected one of "
+            KVCM_LOG_ERROR("tier_flows edge %s->%s starts from the last storage tier; expected one of "
                            "[%s]",
                            flow.from_tier().c_str(),
                            flow.to_tier().c_str(),
@@ -244,18 +203,25 @@ bool OptTierStrategyConfig::ValidateFlowConfigs(const std::vector<OptTierConfig>
         }
 
         if (seen[edge_idx]) {
-            KVCM_LOG_ERROR("tier_strategy.tier_flows contains duplicate edge %s->%s",
-                           flow.from_tier().c_str(),
-                           flow.to_tier().c_str());
+            KVCM_LOG_ERROR(
+                "tier_flows contains duplicate edge %s->%s", flow.from_tier().c_str(), flow.to_tier().c_str());
             return false;
         }
         seen[edge_idx] = true;
+    }
+    for (size_t idx = 0; idx < seen.size(); ++idx) {
+        if (!seen[idx]) {
+            KVCM_LOG_ERROR("tier_flows missing adjacent edge %s->%s",
+                           sorted_storages[idx].unique_name().c_str(),
+                           sorted_storages[idx + 1].unique_name().c_str());
+            return false;
+        }
     }
     return true;
 }
 
 std::vector<TierFlowStrategy>
-OptTierStrategyConfig::BuildFlowStrategies(const std::vector<OptTierConfig> &storages) const {
+OptTierFlowPolicyConfig::BuildFlowStrategies(const std::vector<OptTierConfig> &storages) const {
     if (storages.size() < 2) {
         return {};
     }
@@ -270,11 +236,41 @@ OptTierStrategyConfig::BuildFlowStrategies(const std::vector<OptTierConfig> &sto
     return strategies;
 }
 
+bool OptTtlConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
+    if (!rapid_value.IsObject()) {
+        KVCM_LOG_ERROR("ttl_config must be an object");
+        return false;
+    }
+    KVCM_JSON_GET_MACRO(rapid_value, "default_block_ttl_seconds", default_block_ttl_seconds_);
+    KVCM_JSON_GET_MACRO(rapid_value, "refresh_on_read", refresh_on_read_);
+    if (default_block_ttl_seconds_ < 0) {
+        KVCM_LOG_ERROR("ttl_config.default_block_ttl_seconds must be >= 0, got %lld",
+                       static_cast<long long>(default_block_ttl_seconds_));
+        return false;
+    }
+    return true;
+}
+
+void OptTtlConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
+    Put(writer, "default_block_ttl_seconds", default_block_ttl_seconds_);
+    Put(writer, "refresh_on_read", refresh_on_read_);
+}
+
 bool OptInstanceGroupConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
+    if (rapid_value.HasMember("tier_strategy") || rapid_value.HasMember("hierarchical_eviction_enabled") ||
+        rapid_value.HasMember("write_mode") || rapid_value.HasMember("access_propagation_enabled") ||
+        rapid_value.HasMember("write_propagation_enabled") || rapid_value.HasMember("promote_enabled") ||
+        rapid_value.HasMember("selective_write_threshold") || rapid_value.HasMember("default_block_ttl_seconds") ||
+        rapid_value.HasMember("ttl_refresh_on_read")) {
+        KVCM_LOG_ERROR("instance_group '%s' must use tier_flows; legacy tier strategy fields are not supported",
+                       rapid_value.HasMember("group_name") && rapid_value["group_name"].IsString()
+                           ? rapid_value["group_name"].GetString()
+                           : "<unknown>");
+        return false;
+    }
     KVCM_JSON_GET_MACRO(rapid_value, "group_name", group_name_);
     KVCM_JSON_GET_MACRO(rapid_value, "used_percentage", used_percentage_);
-    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "default_block_ttl_seconds", default_block_ttl_seconds_, int64_t(0));
-    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "ttl_refresh_on_read", ttl_refresh_on_read_, true);
+    KVCM_JSON_GET_MACRO(rapid_value, "ttl_config", ttl_config_);
     KVCM_JSON_GET_MACRO(rapid_value, "instances", instances_);
     // quota_capacity in config is in GB; convert to bytes
     double quota_capacity_gb = 0.0;
@@ -283,16 +279,11 @@ bool OptInstanceGroupConfig::FromRapidValue(const rapidjson::Value &rapid_value)
         quota_capacity_gb < 0 ? -1 : static_cast<int64_t>(quota_capacity_gb * static_cast<double>(1LL << 30));
     // Parse storages; tier capacity is in GB in config, OptTierConfig::FromRapidValue handles conversion
     KVCM_JSON_GET_MACRO(rapid_value, "storages", storages_);
-    if (!rapid_value.HasMember("tier_strategy")) {
-        KVCM_LOG_ERROR("instance_group '%s' is missing required tier_strategy", group_name_.c_str());
-        return false;
-    }
-    if (!tier_strategy_.FromRapidValue(rapid_value["tier_strategy"])) {
-        KVCM_LOG_ERROR("instance_group '%s' has invalid tier_strategy", group_name_.c_str());
-        return false;
-    }
-    if (!tier_strategy_.ValidateFlowConfigs(storages_)) {
-        KVCM_LOG_ERROR("instance_group '%s' has invalid tier_strategy.tier_flows", group_name_.c_str());
+    std::vector<OptTierFlowConfig> tier_flows;
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "tier_flows", tier_flows, std::vector<OptTierFlowConfig>{});
+    tier_flow_policy_ = OptTierFlowPolicyConfig::FromTierFlows(storages_, tier_flows);
+    if (!tier_flow_policy_.ValidateFlowConfigs(storages_)) {
+        KVCM_LOG_ERROR("instance_group '%s' has invalid tier_flows", group_name_.c_str());
         return false;
     }
     return true;
@@ -305,9 +296,10 @@ void OptInstanceGroupConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBu
         quota_capacity_ < 0 ? -1.0 : static_cast<double>(quota_capacity_) / static_cast<double>(1LL << 30);
     Put(writer, "quota_capacity", quota_gb);
     Put(writer, "used_percentage", used_percentage_);
-    Put(writer, "tier_strategy", tier_strategy_);
-    Put(writer, "default_block_ttl_seconds", default_block_ttl_seconds_);
-    Put(writer, "ttl_refresh_on_read", ttl_refresh_on_read_);
+    if (!tier_flow_policy_.tier_flows().empty()) {
+        Put(writer, "tier_flows", tier_flow_policy_.tier_flows());
+    }
+    Put(writer, "ttl_config", ttl_config_);
     Put(writer, "storages", storages_);
     Put(writer, "instances", instances_);
 };

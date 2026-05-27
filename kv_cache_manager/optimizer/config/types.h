@@ -20,9 +20,9 @@ enum class EvictionMode {
     EVICTION_MODE_INSTANCE_PRECISE = 3
 };
 
-// Tier 写入模式：仅在 hierarchical_eviction_enabled=true 时生效。
-// 只控制 block 在多 tier 间的写入与驱逐流动方式；读访问是否刷新下层由
-// tier_strategy.access_propagation_enabled 单独控制。
+// Tier 写入模式：每条相邻 tier_flows edge 独立配置。
+// 只控制 block 在多 tier 间的写入与驱逐流动方式；读/写 touch 是否刷新下层由
+// tier_flows[].access_propagation_enabled / write_propagation_enabled 单独控制。
 enum class TierWriteMode {
     WRITE_THROUGH = 0,           // 默认：写入时落所有 tier，各层独立驱逐
     CASCADING = 1,               // 只写 tier 0，tier_i 驱逐出的 block 级联降级到 tier_{i+1}
@@ -31,6 +31,7 @@ enum class TierWriteMode {
 struct TierFlowStrategy {
     TierWriteMode write_mode = TierWriteMode::WRITE_THROUGH;
     bool access_propagation_enabled = true;
+    bool write_propagation_enabled = false;
     bool promote_enabled = false;
     size_t selective_write_threshold = 2;
 };
