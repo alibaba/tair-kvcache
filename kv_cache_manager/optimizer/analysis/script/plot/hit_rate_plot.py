@@ -114,13 +114,18 @@ def plot_multi_instance_analysis(
             'AccReadBlocks',
             'AccHitBlocks',
             'AccHitRate',
+            'AccLocalHitRate',
             'AccRemoteHitRate',
             'AccInputTokens',
+            'AccLocalHitTokens',
             'AccHitTokens',
             'AccRemoteHitTokens',
         ]:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
+
+        if 'CachedBlocks' not in df.columns:
+            df['CachedBlocks'] = 0
 
         # 收集 per-tier BlockNum 列
         if not tier_block_cols:
@@ -150,8 +155,10 @@ def plot_multi_instance_analysis(
         'AccReadBlocks',
         'AccHitBlocks',
         'AccHitRate',
+        'AccLocalHitRate',
         'AccRemoteHitRate',
         'AccInputTokens',
+        'AccLocalHitTokens',
         'AccHitTokens',
         'AccRemoteHitTokens',
     ]
@@ -206,9 +213,9 @@ def plot_multi_instance_analysis(
         return np.nan_to_num(arr, nan=0.0)
 
     all_acc_sp_hit = []
-    all_acc_hit, all_acc_remote_hit, all_time_ranges = [], [], []
+    all_acc_hit, all_acc_local_hit, all_acc_remote_hit, all_time_ranges = [], [], [], []
     # 用于瞬时命中率计算：累积输入 token 数 / 累积命中 token 数
-    all_acc_input_tokens, all_acc_hit_tokens, all_acc_remote_hit_tokens = [], [], []
+    all_acc_input_tokens, all_acc_local_hit_tokens, all_acc_hit_tokens, all_acc_remote_hit_tokens = [], [], [], []
     all_acc_sp_hit = []
 
     instance_storage_series = []
@@ -232,21 +239,23 @@ def plot_multi_instance_analysis(
         # 真实对齐：取 <=t 的最后一次上报（ZOH），不插值
         aligned = pd.merge_asof(
             base,
-            d[['t', 'AccHitRate', 'AccRemoteHitRate',
-               'AccInputTokens', 'AccHitTokens', 'AccRemoteHitTokens']],
+            d[['t', 'AccHitRate', 'AccLocalHitRate', 'AccRemoteHitRate',
+               'AccInputTokens', 'AccLocalHitTokens', 'AccHitTokens', 'AccRemoteHitTokens']],
             on='t',
             direction='backward',
             allow_exact_matches=True
         )
 
         mask_out = (aligned['t'] < t0)
-        acc_cols = ['AccHitRate', 'AccRemoteHitRate',
-                    'AccInputTokens', 'AccHitTokens', 'AccRemoteHitTokens']
+        acc_cols = ['AccHitRate', 'AccLocalHitRate', 'AccRemoteHitRate',
+                    'AccInputTokens', 'AccLocalHitTokens', 'AccHitTokens', 'AccRemoteHitTokens']
         aligned.loc[mask_out, acc_cols] = np.nan
 
         all_acc_hit.append(aligned['AccHitRate'].to_numpy(float))
+        all_acc_local_hit.append(aligned['AccLocalHitRate'].to_numpy(float))
         all_acc_remote_hit.append(aligned['AccRemoteHitRate'].to_numpy(float))
         all_acc_input_tokens.append(aligned['AccInputTokens'].to_numpy(float))
+        all_acc_local_hit_tokens.append(aligned['AccLocalHitTokens'].to_numpy(float))
         all_acc_hit_tokens.append(aligned['AccHitTokens'].to_numpy(float))
         all_acc_remote_hit_tokens.append(aligned['AccRemoteHitTokens'].to_numpy(float))
 
@@ -421,6 +430,10 @@ def plot_multi_instance_analysis(
         ax_top_r.plot(base_timestamps[valid], np.array(all_acc_hit[i])[valid],
                      color=colors[i], label=f'{name} - AccHitRate',
                      linewidth=2, alpha=0.85, drawstyle='steps-post')
+        ax_top_r.plot(base_timestamps[valid], np.array(all_acc_local_hit[i])[valid],
+                     color=colors[i], linestyle='-.', alpha=0.6,
+                     label=f'{name} - AccLocalHitRate',
+                     linewidth=1.5, drawstyle='steps-post')
         ax_top_r.plot(base_timestamps[valid], np.array(all_acc_remote_hit[i])[valid],
                      color=colors[i], linestyle='--', alpha=0.6,
                      label=f'{name} - AccRemoteHitRate',
@@ -447,6 +460,12 @@ def plot_multi_instance_analysis(
             all_acc_input_tokens[i],
             window_seconds,
         )
+        local_sm = window_hit_rate(
+            base_timestamps,
+            all_acc_local_hit_tokens[i],
+            all_acc_input_tokens[i],
+            window_seconds,
+        )
         remote_sm = window_hit_rate(
             base_timestamps,
             all_acc_remote_hit_tokens[i],
@@ -470,6 +489,10 @@ def plot_multi_instance_analysis(
         ax_bot_r.plot(base_timestamps[idx], hit_sm[idx],
                      color=colors[i], label=f'{name} - HitRate',
                      linewidth=2, alpha=0.85)
+        ax_bot_r.plot(base_timestamps[idx], local_sm[idx],
+                     color=colors[i], linestyle='-.', alpha=0.6,
+                     label=f'{name} - LocalHitRate',
+                     linewidth=1.5)
         ax_bot_r.plot(base_timestamps[idx], remote_sm[idx],
                      color=colors[i], linestyle='--', alpha=0.6,
                      label=f'{name} - RemoteHitRate',

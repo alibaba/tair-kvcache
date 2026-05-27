@@ -75,7 +75,8 @@ private:
                            const std::string &trace_id,
                            int64_t timestamp,
                            const std::vector<int64_t> &block_ids,
-                           int64_t ttl_us);
+                           int64_t ttl_us,
+                           bool touch_existing);
 
     HierarchicalReplayConfig config_;
     std::unique_ptr<OptimizerManager> engine_manager_;

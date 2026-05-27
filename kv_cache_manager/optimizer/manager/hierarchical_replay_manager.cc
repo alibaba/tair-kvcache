@@ -7,6 +7,7 @@
 
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/optimizer/trace_loader/standard_trace_loader.h"
+#include "kv_cache_manager/optimizer/trace_loader/trace_util.h"
 
 namespace kv_cache_manager {
 namespace {
@@ -48,13 +49,15 @@ bool HierarchicalReplayManager::Init() {
         return false;
     }
 
-    engine_manager_ = std::make_unique<OptimizerManager>(config_.engine_config());
+    const bool enable_lifecycle_tracking = config_.enable_lifecycle_tracking();
+    engine_manager_ = std::make_unique<OptimizerManager>(
+        config_.engine_config(), enable_lifecycle_tracking, false, HitRatePerspective::ENGINE_LOCAL);
     if (!engine_manager_->Init()) {
         KVCM_LOG_ERROR("Hierarchical replay failed to initialize engine manager.");
         return false;
     }
 
-    pool_manager_ = std::make_unique<OptimizerManager>(config_.pool_config());
+    pool_manager_ = std::make_unique<OptimizerManager>(config_.pool_config(), enable_lifecycle_tracking, false);
     if (!pool_manager_->Init()) {
         KVCM_LOG_ERROR("Hierarchical replay failed to initialize pool manager.");
         return false;
@@ -107,6 +110,12 @@ bool HierarchicalReplayManager::ValidateAndBuildMappings() {
                            pool_instance_id.c_str());
             return false;
         }
+        if (engine_it->second.bytes_per_token() != pool_it->second.bytes_per_token()) {
+            KVCM_LOG_ERROR("engine/pool bytes_per_token mismatch for engine=%s pool=%s",
+                           engine_instance_id.c_str(),
+                           pool_instance_id.c_str());
+            return false;
+        }
 
         engine_to_pool_[engine_instance_id] = pool_instance_id;
         engine_block_size_[engine_instance_id] = engine_block_size;
@@ -133,15 +142,17 @@ void HierarchicalReplayManager::WriteL2L3Sequence(const std::string &pool_instan
                                                   const std::string &trace_id,
                                                   int64_t timestamp,
                                                   const std::vector<int64_t> &block_ids,
-                                                  int64_t ttl_us) {
+                                                  int64_t ttl_us,
+                                                  bool touch_existing) {
     if (!block_ids.empty()) {
-        pool_manager_->WriteCacheWithTtlUs(pool_instance_id, trace_id, timestamp, block_ids, ttl_us);
+        pool_manager_->WriteCacheWithTtlUs(pool_instance_id, trace_id, timestamp, block_ids, ttl_us, touch_existing);
     }
 }
 
 void HierarchicalReplayManager::DirectRun() {
     auto traces = StandardTraceLoader::LoadFromFile(config_.trace_file_path());
-    if (config_.engine_scheduling_strategy() == "prefix_hit") {
+    TraceTimeSorter::SortTracesByTimestamp(traces);
+    if (config_.infer_scheduling_strategy() == "prefix_hit") {
         RunTracesWithPrefixHitScheduling(traces);
         return;
     }
@@ -150,12 +161,12 @@ void HierarchicalReplayManager::DirectRun() {
 }
 
 void HierarchicalReplayManager::ScheduleTraces(std::vector<std::shared_ptr<OptimizerSchemaTrace>> &traces) const {
-    if (config_.engine_scheduling_strategy() == "preserve_trace" ||
-        config_.engine_scheduling_strategy() == "prefix_hit") {
+    if (config_.infer_scheduling_strategy() == "preserve_trace" ||
+        config_.infer_scheduling_strategy() == "prefix_hit") {
         return;
     }
-    if (config_.engine_scheduling_strategy() != "round_robin") {
-        throw std::runtime_error("Unknown engine_scheduling_strategy: " + config_.engine_scheduling_strategy());
+    if (config_.infer_scheduling_strategy() != "round_robin") {
+        throw std::runtime_error("Unknown infer_scheduling_strategy: " + config_.infer_scheduling_strategy());
     }
     if (sorted_engine_instance_ids_.empty()) {
         throw std::runtime_error("round_robin scheduling requires at least one engine instance");
@@ -289,7 +300,7 @@ HierarchicalGetCacheLocationRes HierarchicalReplayManager::GetCacheLocation(cons
             }
             if (selected_prefix_len > 0) {
                 std::vector<int64_t> selected_prefix(block_ids.begin(), block_ids.begin() + selected_prefix_len);
-                WriteL2L3Sequence(pool_instance_id, trace_id, timestamp, selected_prefix, 0);
+                WriteL2L3Sequence(pool_instance_id, trace_id, timestamp, selected_prefix, 0, false);
             }
         }
     }
@@ -307,7 +318,7 @@ HierarchicalGetCacheLocationRes HierarchicalReplayManager::GetCacheLocation(cons
                 engine_manager_->WriteCacheWithTtlUs(engine_instance_id, trace_id, timestamp, promoted_prefix, 0);
             if (l2_l3_strategy.write_mode() == TierWriteMode::CASCADING) {
                 for (const auto &sequence : promote_res.evicted_key_sequences) {
-                    WriteL2L3Sequence(pool_instance_id, trace_id, timestamp, sequence, 0);
+                    WriteL2L3Sequence(pool_instance_id, trace_id, timestamp, sequence, 0, false);
                 }
             }
         }
@@ -355,10 +366,11 @@ WriteCacheRes HierarchicalReplayManager::WriteCacheWithTtlUs(const std::string &
     auto engine_res = engine_manager_->WriteCacheWithTtlUs(engine_instance_id, trace_id, timestamp, block_ids, ttl_us);
     const auto &l2_l3_strategy = config_.l2_l3_strategy();
     if (l2_l3_strategy.write_mode() == TierWriteMode::WRITE_THROUGH) {
-        WriteL2L3Sequence(pool_instance_id, trace_id, timestamp, block_ids, ttl_us);
+        WriteL2L3Sequence(
+            pool_instance_id, trace_id, timestamp, block_ids, ttl_us, l2_l3_strategy.write_propagation_enabled());
     } else if (l2_l3_strategy.write_mode() == TierWriteMode::CASCADING) {
         for (const auto &sequence : engine_res.evicted_key_sequences) {
-            WriteL2L3Sequence(pool_instance_id, trace_id, timestamp, sequence, ttl_us);
+            WriteL2L3Sequence(pool_instance_id, trace_id, timestamp, sequence, ttl_us, false);
         }
     }
 
@@ -387,13 +399,16 @@ void HierarchicalReplayManager::ExportCombinedHitRates() const {
         throw std::runtime_error("Failed to open hierarchical hit-rate CSV: " + filename);
     }
 
-    file << "TimestampNs,TraceId,EngineInstanceId,PoolInstanceId,ReadBlocks,EngineHitBlocks,PoolHitBlocks,HitBlocks,"
-            "InputTokens,EngineHitTokens,PoolHitTokens,HitTokens,EngineHitRate,PoolHitRate,HitRate,"
-            "AccReadBlocks,AccHitBlocks,AccInputTokens,AccHitTokens,AccHitRate,AccWriteBlocks\n";
+    file << "TimestampNs,TraceId,EngineInstanceId,PoolInstanceId,ReadBlocks,LocalHitBlocks,RemoteHitBlocks,HitBlocks,"
+            "InputTokens,LocalHitTokens,RemoteHitTokens,HitTokens,LocalHitRate,RemoteHitRate,HitRate,"
+            "AccReadBlocks,AccHitBlocks,AccInputTokens,AccLocalHitTokens,AccRemoteHitTokens,AccHitTokens,"
+            "AccLocalHitRate,AccRemoteHitRate,AccHitRate,AccWriteBlocks\n";
 
     size_t acc_read_blocks = 0;
     size_t acc_hit_blocks = 0;
     size_t acc_input_tokens = 0;
+    size_t acc_local_hit_tokens = 0;
+    size_t acc_remote_hit_tokens = 0;
     size_t acc_hit_tokens = 0;
     size_t acc_write_blocks = 0;
     size_t write_index = 0;
@@ -406,23 +421,28 @@ void HierarchicalReplayManager::ExportCombinedHitRates() const {
         }
 
         const size_t hit_blocks = record.engine_hit_blocks + record.pool_hit_blocks;
-        const size_t engine_hit_tokens = record.engine_hit_blocks * record.block_size_tokens;
-        const size_t pool_hit_tokens = record.pool_hit_blocks * record.block_size_tokens;
+        const size_t local_hit_tokens = record.engine_hit_blocks * record.block_size_tokens;
+        const size_t remote_hit_tokens = record.pool_hit_blocks * record.block_size_tokens;
         const size_t hit_tokens = hit_blocks * record.block_size_tokens;
 
         acc_read_blocks += record.read_blocks;
         acc_hit_blocks += hit_blocks;
         acc_input_tokens += record.input_tokens;
+        acc_local_hit_tokens += local_hit_tokens;
+        acc_remote_hit_tokens += remote_hit_tokens;
         acc_hit_tokens += hit_tokens;
 
         file << record.timestamp_ns << "," << record.trace_id << "," << record.engine_instance_id << ","
              << record.pool_instance_id << "," << record.read_blocks << "," << record.engine_hit_blocks << ","
-             << record.pool_hit_blocks << "," << hit_blocks << "," << record.input_tokens << "," << engine_hit_tokens
-             << "," << pool_hit_tokens << "," << hit_tokens << ","
-             << (record.input_tokens > 0 ? static_cast<double>(engine_hit_tokens) / record.input_tokens : 0.0) << ","
-             << (record.input_tokens > 0 ? static_cast<double>(pool_hit_tokens) / record.input_tokens : 0.0) << ","
+             << record.pool_hit_blocks << "," << hit_blocks << "," << record.input_tokens << "," << local_hit_tokens
+             << "," << remote_hit_tokens << "," << hit_tokens << ","
+             << (record.input_tokens > 0 ? static_cast<double>(local_hit_tokens) / record.input_tokens : 0.0) << ","
+             << (record.input_tokens > 0 ? static_cast<double>(remote_hit_tokens) / record.input_tokens : 0.0) << ","
              << (record.input_tokens > 0 ? static_cast<double>(hit_tokens) / record.input_tokens : 0.0) << ","
-             << acc_read_blocks << "," << acc_hit_blocks << "," << acc_input_tokens << "," << acc_hit_tokens << ","
+             << acc_read_blocks << "," << acc_hit_blocks << "," << acc_input_tokens << "," << acc_local_hit_tokens
+             << "," << acc_remote_hit_tokens << "," << acc_hit_tokens << ","
+             << (acc_input_tokens > 0 ? static_cast<double>(acc_local_hit_tokens) / acc_input_tokens : 0.0) << ","
+             << (acc_input_tokens > 0 ? static_cast<double>(acc_remote_hit_tokens) / acc_input_tokens : 0.0) << ","
              << (acc_input_tokens > 0 ? static_cast<double>(acc_hit_tokens) / acc_input_tokens : 0.0) << ","
              << acc_write_blocks << "\n";
     }

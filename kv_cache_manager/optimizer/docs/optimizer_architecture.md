@@ -196,12 +196,12 @@ OptimizerConfig (顶层配置)
         ├── group_name (组名)
         ├── quota_capacity (配额容量)
         ├── used_percentage (使用百分比)
-        ├── tier_strategy (多层读写策略)
-        │   ├── hierarchical_eviction_enabled (分层驱逐)
-        │   ├── write_mode (多层写入模式)
-        │   ├── access_propagation_enabled (读访问传播)
-        │   ├── promote_enabled (低层命中回填高层)
-        │   └── selective_write_threshold (选择性下写阈值)
+        ├── tier_flows[] (多层相邻 edge 读写策略)
+        │   ├── from_tier / to_tier
+        │   ├── write_mode
+        │   ├── access_propagation_enabled
+        │   ├── promote_enabled
+        │   └── selective_write_threshold
         ├── storages[] (存储层数组)
         └── instances[] (实例数组)
             ├── instance_id (实例ID)
@@ -225,13 +225,6 @@ OptimizerConfig (顶层配置)
             "group_name": "instance_group_01",
             "quota_capacity": 12000,
             "used_percentage": 1.0,
-            "tier_strategy": {
-                "hierarchical_eviction_enabled": false,
-                "write_mode": "write_through",
-                "access_propagation_enabled": true,
-                "promote_enabled": true,
-                "selective_write_threshold": 2
-            },
             "storages": [
                 {
                     "unique_name": "pace_00",
@@ -329,7 +322,7 @@ public:
   - 不做前置 TTL 物理清理
   - 也不做 TTL 逻辑过期判定
 - `POLICY_TTL` 下保证先清理过期块，再进入读写流程
-- `default_block_ttl_seconds = 0` 表示组级禁用 TTL：
+- `ttl_config.default_block_ttl_seconds = 0` 表示组级禁用 TTL：
   - 写入路径会将 TTL 解析为“不过期”
   - 若 `fallback_on_pressure = false`，则不会发生 TTL 过期驱逐，也不会触发容量兜底驱逐
   - 若 `fallback_on_pressure = true`，则仅在容量压力时走链表尾部兜底驱逐（行为等价于 LRU）
@@ -431,7 +424,7 @@ OptimizerSchemaTrace (基类)
 ```cpp
 struct ReadRecord {
     int64_t timestamp_ns;
-    // local = trace block_mask 带入的已有本地命中；remote = optimizer 模拟层命中
+    // KVCM/L3-only: local = trace block_mask 带入的 engine 本地命中；remote = KVCM/L3 模拟命中
     size_t remote_read_blocks;
     size_t remote_hit_blocks;
     size_t local_read_blocks;
@@ -456,16 +449,16 @@ struct ReadRecord {
 - `CachedBlocks` - 当前 CSV 对应 instance 的缓存 block 数
 - `CachedBlocksAllInstances` - 同一 optimizer 进程内所有 instance 的总缓存 block 数
 - `ReadBlocks` / `HitBlocks` - 当前请求读取和命中的 block 数
-- `LocalHitBlocks` / `RemoteHitBlocks` - 诊断字段：trace `block_mask` 带入的已有本地命中 / optimizer 模拟层命中
+- `LocalHitBlocks` / `RemoteHitBlocks` - engine 本地命中 / KVCM 或 L3 pool 命中 block 数
 - `InputTokens` / `HitTokens` - 当前请求的输入 token 数和命中 token 数
 - `HitRate` - 当前 token 命中率，`HitTokens / InputTokens`
-- `LocalHitTokens` / `RemoteHitTokens` - 诊断字段：本地 / optimizer 模拟层命中 token 数
+- `LocalHitTokens` / `RemoteHitTokens` - engine 本地命中 / KVCM 或 L3 pool 命中 token 数
 - `AccReadBlocks` / `AccHitBlocks` - 累计读取和命中的 block 数
 - `AccHitRate` - 累积 token 命中率，`AccHitTokens / AccInputTokens`
-- `AccLocalHitRate` / `AccRemoteHitRate` - 诊断字段，不作为标准分析主口径
+- `AccLocalHitRate` / `AccRemoteHitRate` - 累计 local / remote token hit rate
 - `Tier<N>(name)_HitTokens` / `Tier<N>(name)_HitRate` / `AccTier<N>(name)_HitRate` - 分层命中 token 指标
 
-标准分析直接按请求输入计算整体 `HitRate`，不把 local/remote 作为独立结论维度。local/remote 只用于兼容 optimizer 作为单独 L3 模拟并和 HiSim 结合、或直接分析 KVCacheManager event log 时已有的本地命中信息。
+标准分析直接按请求输入计算整体 `HitRate`。`LocalHit*` / `RemoteHit*` 是组成拆分：在 KVCM/L3-only 模式下，local 来自 trace `block_mask`，remote 来自 KVCM/L3 模拟命中；在 hierarchical replay 中，local 来自 engine L1/L2，remote 来自 L3 pool。
 
 ---
 
@@ -522,7 +515,7 @@ bazel run //kv_cache_manager/optimizer/analysis/script:export_tree -- \
 
 **功能**：在不同容量配置下回放 optimizer，绘制容量与 token 命中率的 Pareto 曲线。不给 `--eviction-policies` 时使用配置文件中的策略；给出多个策略时生成多策略对比图。
 
-> **适用范围**：Trade-off 分析仅适用于非分层模式。在分层模式（`tier_strategy.hierarchical_eviction_enabled=true`）下，容量扫描仅修改 `quota_capacity`，不影响各 tier 独立的 `storages[i].capacity`，因此无法产生有意义的容量-性能权衡结果。
+> **适用范围**：Trade-off 分析仅适用于单层模式。多层模式下，容量扫描仅修改 `quota_capacity`，不影响各 tier 独立的 `storages[i].capacity`，因此无法产生有意义的容量-性能权衡结果。
 
 **运行流程**：
 

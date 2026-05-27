@@ -20,7 +20,7 @@ protected:
         config.set_trace_file_path(root + "/trace.jsonl");
         config.set_output_result_path(root + "/combined");
         config.set_engine_config(
-            CreateEngineOptimizerConfig("engine_group", {"engine_a", "engine_b"}, {"hbm", "dram"}, root + "/engine"));
+            CreateEngineOptimizerConfig("engine_group", {"engine_a", "engine_b"}, {"hbm", "dram"}, root + "/infer"));
         config.set_pool_config(CreateOptimizerConfig("pool_group", {"model_l3"}, {"l3"}, root + "/pool"));
 
         EngineToPoolMappingConfig map_a;
@@ -144,6 +144,135 @@ TEST_F(HierarchicalReplayManagerTest, LinksEngineInstancesToSharedPool) {
     EXPECT_TRUE(std::filesystem::exists(root + "/combined/hierarchical_hit_rates.csv"));
 }
 
+TEST_F(HierarchicalReplayManagerTest, ParsesCompactClusterConfig) {
+    const std::string root = GetTestTempRootPath() + "/hierarchical_replay_compact_config";
+    std::ostringstream json;
+    json << R"({
+        "trace_file_path": ")"
+         << root << R"(/trace.jsonl",
+        "output_result_path": ")"
+         << root << R"(/output",
+        "infer_scheduling_strategy": "preserve_trace",
+        "enable_lifecycle_tracking": true,
+        "infer_clusters": [
+            {
+                "pool_instance_id": "model_l3",
+                "model": {
+                    "block_size": 16,
+                    "bytes_per_token": 1,
+                    "eviction_policy_type": "lru",
+                    "eviction_policy_params": {
+                        "sample_rate": 1.0,
+                        "shard_count": 1,
+                        "sample_times": 32,
+                        "eviction_amplification_factor": 1.0
+                    }
+                },
+                "instance_ids": ["engine_a", "engine_b"],
+                "ttl_config": {
+                    "default_block_ttl_seconds": 0,
+                    "refresh_on_read": true
+                },
+                "tiers": [
+                    {"name": "hbm", "capacity": 1.0},
+                    {"name": "dram", "capacity": 1.0}
+                ],
+                "tier_flows": [
+                    {
+                        "from_tier": "hbm",
+                        "to_tier": "dram",
+                        "write_mode": "write_through",
+                        "access_propagation_enabled": false,
+                        "write_propagation_enabled": false,
+                        "promote_enabled": true,
+                        "selective_write_threshold": 2
+                    }
+                ]
+            }
+        ],
+        "l2_l3_strategy": {
+            "write_mode": "cascading",
+            "access_propagation_enabled": false,
+            "write_propagation_enabled": false,
+            "promote_enabled": true,
+            "selective_write_threshold": 2
+        },
+        "pool_config": {
+            "trace_file_path": ")"
+         << root << R"(/trace.jsonl",
+            "output_result_path": ")"
+         << root << R"(/output/pool",
+            "eviction_params": {
+                "eviction_mode": 3,
+                "eviction_batch_size_per_instance": 10
+            },
+            "instance_groups": [
+                {
+                    "group_name": "pool_group",
+                    "quota_capacity": 2.0,
+                    "used_percentage": 1.0,
+                    "ttl_config": {
+                        "default_block_ttl_seconds": 0,
+                        "refresh_on_read": true
+                    },
+                    "storages": [
+                        {
+                            "unique_name": "l3",
+                            "storage_type": "dummy",
+                            "band_width_mbps": 1000,
+                            "priority": 0,
+                            "capacity": 2.0
+                        }
+                    ],
+                    "instances": [
+                        {
+                            "instance_id": "model_l3",
+                            "block_size": 16,
+                            "bytes_per_token": 1,
+                            "instance_group_name": "pool_group",
+                            "eviction_policy_type": "lru",
+                            "eviction_policy_params": {
+                                "sample_rate": 1.0,
+                                "shard_count": 1,
+                                "sample_times": 32,
+                                "eviction_amplification_factor": 1.0
+                            }
+                        }
+                    ]
+                }
+            ]
+        }
+    })";
+
+    HierarchicalReplayConfig config;
+    ASSERT_TRUE(config.FromJsonString(json.str()));
+    EXPECT_EQ(config.engine_config().instance_groups().size(), 2);
+    EXPECT_EQ(config.pool_config().instance_groups().size(), 1);
+    EXPECT_EQ(config.engine_to_pool().size(), 2);
+    EXPECT_EQ(config.engine_config().output_result_path(), root + "/output/infer");
+    EXPECT_EQ(config.pool_config().output_result_path(), root + "/output/pool");
+
+    HierarchicalReplayManager manager(config);
+    EXPECT_TRUE(manager.Init());
+}
+
+TEST_F(HierarchicalReplayManagerTest, ExportsLifecycleForEngineAndPoolWhenEnabled) {
+    const std::string root = GetTestTempRootPath() + "/hierarchical_replay_lifecycle";
+    HierarchicalReplayConfig config = CreateHierarchicalConfig(root);
+    config.set_enable_lifecycle_tracking(true);
+
+    HierarchicalReplayManager manager(config);
+    ASSERT_TRUE(manager.Init());
+
+    const std::vector<int64_t> keys = {901, 902};
+    manager.WriteCache("engine_a", "write_a", 1000, keys);
+    manager.GetCacheLocation("engine_b", "pool_hit", 2000, keys, 32);
+    manager.AnalyzeResults();
+
+    EXPECT_TRUE(std::filesystem::exists(root + "/infer/engine_a_lifecycle.csv"));
+    EXPECT_TRUE(std::filesystem::exists(root + "/pool/model_l3_lifecycle.csv"));
+}
+
 TEST_F(HierarchicalReplayManagerTest, SelectiveL2L3WriteUsesEngineHitThreshold) {
     const std::string root = GetTestTempRootPath() + "/hierarchical_replay_selective_l2_l3";
     HierarchicalReplayConfig config = CreateHierarchicalConfig(root);
@@ -175,7 +304,7 @@ TEST_F(HierarchicalReplayManagerTest, CascadingL2L3WriteMovesEngineEvictionsToPo
     const std::string root = GetTestTempRootPath() + "/hierarchical_replay_cascading_l2_l3";
     HierarchicalReplayConfig config = CreateHierarchicalConfig(root);
     config.set_engine_config(
-        CreateEngineOptimizerConfig("engine_group", {"engine_a", "engine_b"}, {"hbm", "dram"}, root + "/engine", 16));
+        CreateEngineOptimizerConfig("engine_group", {"engine_a", "engine_b"}, {"hbm", "dram"}, root + "/infer", 16));
     L2L3StrategyConfig strategy;
     strategy.set_write_mode(TierWriteMode::CASCADING);
     config.set_l2_l3_strategy(strategy);
@@ -247,11 +376,63 @@ TEST_F(HierarchicalReplayManagerTest, EngineHitPropagatesAccessToL3WhenEnabled) 
     EXPECT_EQ(second_evicted_from_l3.total_hit_length, 0);
 }
 
+TEST_F(HierarchicalReplayManagerTest, WriteThroughDoesNotTouchExistingL3WhenDisabled) {
+    const std::string root = GetTestTempRootPath() + "/hierarchical_replay_l3_write_no_propagation";
+    HierarchicalReplayConfig config = CreateHierarchicalConfig(root);
+    OptimizerConfig pool_config = CreateOptimizerConfig("pool_group", {"model_l3"}, {"l3"}, root + "/pool");
+    pool_config.mutable_instance_groups()[0].set_quota_capacity(32);
+    config.set_pool_config(pool_config);
+    L2L3StrategyConfig strategy;
+    strategy.set_write_mode(TierWriteMode::WRITE_THROUGH);
+    strategy.set_write_propagation_enabled(false);
+    config.set_l2_l3_strategy(strategy);
+
+    HierarchicalReplayManager manager(config);
+    ASSERT_TRUE(manager.Init());
+
+    const std::vector<int64_t> first = {811};
+    const std::vector<int64_t> second = {812};
+    const std::vector<int64_t> third = {813};
+    manager.WriteCache("engine_a", "write_first", 1000, first);
+    manager.WriteCache("engine_a", "write_second", 1100, second);
+    manager.WriteCache("engine_a", "rewrite_first", 1200, first);
+    manager.WriteCache("engine_a", "write_third", 1300, third);
+
+    auto first_from_other_engine = manager.GetCacheLocation("engine_b", "read_first", 1400, first, 16);
+    EXPECT_EQ(first_from_other_engine.pool_hit_length, 0);
+}
+
+TEST_F(HierarchicalReplayManagerTest, WriteThroughTouchesExistingL3WhenEnabled) {
+    const std::string root = GetTestTempRootPath() + "/hierarchical_replay_l3_write_propagation";
+    HierarchicalReplayConfig config = CreateHierarchicalConfig(root);
+    OptimizerConfig pool_config = CreateOptimizerConfig("pool_group", {"model_l3"}, {"l3"}, root + "/pool");
+    pool_config.mutable_instance_groups()[0].set_quota_capacity(32);
+    config.set_pool_config(pool_config);
+    L2L3StrategyConfig strategy;
+    strategy.set_write_mode(TierWriteMode::WRITE_THROUGH);
+    strategy.set_write_propagation_enabled(true);
+    config.set_l2_l3_strategy(strategy);
+
+    HierarchicalReplayManager manager(config);
+    ASSERT_TRUE(manager.Init());
+
+    const std::vector<int64_t> first = {821};
+    const std::vector<int64_t> second = {822};
+    const std::vector<int64_t> third = {823};
+    manager.WriteCache("engine_a", "write_first", 1000, first);
+    manager.WriteCache("engine_a", "write_second", 1100, second);
+    manager.WriteCache("engine_a", "rewrite_first", 1200, first);
+    manager.WriteCache("engine_a", "write_third", 1300, third);
+
+    auto first_from_other_engine = manager.GetCacheLocation("engine_b", "read_first", 1400, first, 16);
+    EXPECT_EQ(first_from_other_engine.pool_hit_length, 1);
+}
+
 TEST_F(HierarchicalReplayManagerTest, RejectsSharedEngineInstanceGroup) {
     const std::string root = GetTestTempRootPath() + "/hierarchical_replay_shared_engine_group";
     HierarchicalReplayConfig config = CreateHierarchicalConfig(root);
     config.set_engine_config(
-        CreateOptimizerConfig("engine_group", {"engine_a", "engine_b"}, {"hbm", "dram"}, root + "/engine"));
+        CreateOptimizerConfig("engine_group", {"engine_a", "engine_b"}, {"hbm", "dram"}, root + "/infer"));
 
     HierarchicalReplayManager manager(config);
     EXPECT_FALSE(manager.Init());
@@ -288,15 +469,42 @@ TEST_F(HierarchicalReplayManagerTest, ReplaysStandardTraceThroughEngineAndPool) 
     std::ostringstream buffer;
     buffer << csv.rdbuf();
     const std::string content = buffer.str();
+    EXPECT_THAT(content, HasSubstr("LocalHitBlocks,RemoteHitBlocks,HitBlocks"));
+    EXPECT_THAT(content, HasSubstr("AccLocalHitTokens,AccRemoteHitTokens,AccHitTokens"));
     EXPECT_THAT(content, HasSubstr("pool_hit,engine_b,model_l3,2,0,2,2"));
     EXPECT_THAT(content, HasSubstr("engine_hit,engine_b,model_l3,2,2,0,2"));
+}
+
+TEST_F(HierarchicalReplayManagerTest, DirectRunSortsTraceByTimestamp) {
+    const std::string root = GetTestTempRootPath() + "/hierarchical_replay_sort";
+    std::filesystem::create_directories(root);
+    HierarchicalReplayConfig config = CreateHierarchicalConfig(root);
+
+    std::ofstream trace(config.trace_file_path());
+    trace
+        << R"({"type":"get","instance_id":"engine_a","trace_id":"late_get","timestamp_ns":2000,"keys":[501],"input_len":16,"block_mask":[]})"
+        << "\n";
+    trace << R"({"type":"write","instance_id":"engine_a","trace_id":"early_write","timestamp_ns":1000,"keys":[501]})"
+          << "\n";
+    trace.close();
+
+    HierarchicalReplayManager manager(config);
+    ASSERT_TRUE(manager.Init());
+    manager.DirectRun();
+    manager.AnalyzeResults();
+
+    std::ifstream csv(root + "/combined/hierarchical_hit_rates.csv");
+    ASSERT_TRUE(csv.is_open());
+    std::ostringstream buffer;
+    buffer << csv.rdbuf();
+    EXPECT_THAT(buffer.str(), HasSubstr("late_get,engine_a,model_l3,1,1,0,1"));
 }
 
 TEST_F(HierarchicalReplayManagerTest, RoundRobinSchedulesTraceRequestsToEngineInstances) {
     const std::string root = GetTestTempRootPath() + "/hierarchical_replay_round_robin";
     std::filesystem::create_directories(root);
     HierarchicalReplayConfig config = CreateHierarchicalConfig(root);
-    config.set_engine_scheduling_strategy("round_robin");
+    config.set_infer_scheduling_strategy("round_robin");
 
     std::ofstream trace(config.trace_file_path());
     trace
@@ -327,7 +535,7 @@ TEST_F(HierarchicalReplayManagerTest, PrefixHitSchedulesToCachedEngineInstance) 
     const std::string root = GetTestTempRootPath() + "/hierarchical_replay_prefix_hit";
     std::filesystem::create_directories(root);
     HierarchicalReplayConfig config = CreateHierarchicalConfig(root);
-    config.set_engine_scheduling_strategy("prefix_hit");
+    config.set_infer_scheduling_strategy("prefix_hit");
 
     std::ofstream trace(config.trace_file_path());
     trace
@@ -360,7 +568,7 @@ TEST_F(HierarchicalReplayManagerTest, SeparatesIndependentPoolInstances) {
     config.set_trace_file_path(root + "/trace.jsonl");
     config.set_output_result_path(root + "/combined");
     config.set_engine_config(
-        CreateEngineOptimizerConfig("engine_group", {"engine_a", "engine_b"}, {"hbm", "dram"}, root + "/engine"));
+        CreateEngineOptimizerConfig("engine_group", {"engine_a", "engine_b"}, {"hbm", "dram"}, root + "/infer"));
     config.set_pool_config(CreateOptimizerConfig("pool_group", {"model_a_l3", "model_b_l3"}, {"l3"}, root + "/pool"));
 
     EngineToPoolMappingConfig map_a;
