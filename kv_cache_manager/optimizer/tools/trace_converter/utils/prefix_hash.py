@@ -78,7 +78,7 @@ def apply_prefix_hash(hash_ids: List[int]) -> List[int]:
 def tokens_to_block_ids(
     token_ids: List[int],
     block_size: int = 16,
-    truncate: bool = False
+    truncate: bool = True
 ) -> List[int]:
     """
     将token IDs转换为带前缀依赖的block IDs

@@ -50,6 +50,7 @@ def _process_chunk_text(
     tokenizer_path: str,
     model_name: Optional[str],
     block_size: int,
+    truncate: bool,
     default_instance_id: str,
     time_field: str,
     content_field: str
@@ -106,7 +107,7 @@ def _process_chunk_text(
             token_ids = smart_tokenize(tokenizer, content, use_chat_template=True)
             
             # 转换为block IDs
-            block_ids = tokens_to_block_ids(token_ids, block_size=block_size)
+            block_ids = tokens_to_block_ids(token_ids, block_size=block_size, truncate=truncate)
             
             # 生成Get+Write traces
             get_trace = converter._create_get_trace(
@@ -154,6 +155,7 @@ class TextTraceConverter(BaseConverter):
         self.block_size = self.get_block_size(default_instance_id)  # 获取该instance的block_size
         self.time_field = time_field
         self.content_field = content_field
+        self.truncate = kwargs.get('truncate', True)
         self.tokenizer_path = tokenizer_path
         self.model_name = model_name
         
@@ -195,6 +197,7 @@ class TextTraceConverter(BaseConverter):
             tokenizer_path=self.tokenizer_path,
             model_name=self.model_name,
             block_size=self.block_size,
+            truncate=self.truncate,
             default_instance_id=self.default_instance_id,
             time_field=self.time_field,
             content_field=self.content_field
