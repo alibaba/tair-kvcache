@@ -101,11 +101,17 @@ cc_library(
 
 cc_library(
     name = "utils",
+    srcs = [
+        "utils.cc",
+    ],
     hdrs = [
         "utils.h",
     ],
     deps = [
+        ":cache_location",
+        ":common",
         ":types",
+        "//kv_cache_manager/common",
         "//kv_cache_manager/common/hash",
     ],
 )
@@ -223,6 +229,7 @@ cc_library(
     deps = [
         ":common",
         ":meta_storage_backend",
+        ":utils",
         "//kv_cache_manager/common:client_pool",
         "//kv_cache_manager/common:redis_client",
     ],

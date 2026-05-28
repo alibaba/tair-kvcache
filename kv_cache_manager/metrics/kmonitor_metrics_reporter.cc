@@ -1,5 +1,6 @@
 #include "kv_cache_manager/metrics/kmonitor_metrics_reporter.h"
 
+#include <atomic>
 #include <limits>
 #include <unordered_map>
 
@@ -417,6 +418,12 @@ bool KmonitorMetricsReporter::InitMetrics() {
 
 #define REPORT_STEAL_METRICS(group, name)                                                                              \
     do {                                                                                                               \
+        Gauge gauge;                                                                                                   \
+        COPY_METRICS_(p, group, name, gauge);                                                                          \
+        const auto raw_metrics_value = gauge.GetRaw();                                                                 \
+        if (raw_metrics_value == nullptr || !raw_metrics_value->touched.load(std::memory_order_relaxed)) {             \
+            break;                                                                                                     \
+        }                                                                                                              \
         double v;                                                                                                      \
         STEAL_METRICS_(p, group, name, v);                                                                             \
         if (!(std::isnan(v))) {                                                                                        \
@@ -473,23 +480,23 @@ void KmonitorMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
 
         // meta indexer metrics
         REPORT_COLLECTED_METRICS(meta_indexer, query_key_count);
-        REPORT_COLLECTED_METRICS(meta_indexer, get_not_exist_key_count);
+        REPORT_STEAL_METRICS(meta_indexer, get_not_exist_key_count);
         REPORT_STEAL_METRICS(meta_indexer, query_batch_num);
-        REPORT_COLLECTED_METRICS(meta_indexer, search_cache_hit_count);
-        REPORT_COLLECTED_METRICS(meta_indexer, search_cache_miss_count);
-        REPORT_COLLECTED_METRICS(meta_indexer, search_cache_hit_ratio);
-        REPORT_COLLECTED_METRICS(meta_indexer, io_data_size);
-        REPORT_COLLECTED_METRICS(meta_indexer, put_io_time_us);
+        REPORT_STEAL_METRICS(meta_indexer, search_cache_hit_count);
+        REPORT_STEAL_METRICS(meta_indexer, search_cache_miss_count);
+        REPORT_STEAL_METRICS(meta_indexer, search_cache_hit_ratio);
+        REPORT_STEAL_METRICS(meta_indexer, io_data_size);
+        REPORT_STEAL_METRICS(meta_indexer, put_io_time_us);
         REPORT_STEAL_METRICS(meta_indexer, upsert_io_time_us);
         REPORT_STEAL_METRICS(meta_indexer, lock_wait_time_us);
-        REPORT_COLLECTED_METRICS(meta_indexer, delete_io_time_us);
-        REPORT_COLLECTED_METRICS(meta_indexer, get_io_time_us);
-        REPORT_COLLECTED_METRICS(meta_indexer, rand_io_time_us);
-        REPORT_COLLECTED_METRICS(meta_indexer, rmw_get_io_time_us);
+        REPORT_STEAL_METRICS(meta_indexer, delete_io_time_us);
+        REPORT_STEAL_METRICS(meta_indexer, get_io_time_us);
+        REPORT_STEAL_METRICS(meta_indexer, rand_io_time_us);
+        REPORT_STEAL_METRICS(meta_indexer, rmw_get_io_time_us);
         REPORT_STEAL_METRICS(meta_indexer, read_modify_write_put_key_count);
-        REPORT_COLLECTED_METRICS(meta_indexer, read_modify_write_update_key_count);
-        REPORT_COLLECTED_METRICS(meta_indexer, read_modify_write_skip_key_count);
-        REPORT_COLLECTED_METRICS(meta_indexer, read_modify_write_delete_key_count);
+        REPORT_STEAL_METRICS(meta_indexer, read_modify_write_update_key_count);
+        REPORT_STEAL_METRICS(meta_indexer, read_modify_write_skip_key_count);
+        REPORT_STEAL_METRICS(meta_indexer, read_modify_write_delete_key_count);
         REPORT_STEAL_METRICS(meta_indexer, async_enqueue_timeout_key_count);
         REPORT_STEAL_METRICS(meta_indexer, async_enqueue_time_us);
         REPORT_STEAL_METRICS(meta_indexer, cache_backend_put_time_us);

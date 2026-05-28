@@ -3,12 +3,12 @@
 #include <algorithm>
 #include <chrono>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
-#include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/meta/cache_location.h"
@@ -21,99 +21,6 @@ namespace kv_cache_manager {
 MetaAsyncRedisBackend::~MetaAsyncRedisBackend() { [[maybe_unused]] ErrorCode _ = Close(); }
 
 std::string MetaAsyncRedisBackend::GetStorageType() noexcept { return META_ASYNC_REDIS_BACKEND_TYPE_STR; }
-
-// ---------------------------------------------------------------------------
-// Key prefix helpers
-// ---------------------------------------------------------------------------
-
-std::vector<std::string> MetaAsyncRedisBackend::AppendPrefixToKeys(const KeyTypeVec &keys) const {
-    std::vector<std::string> keys_with_prefix;
-    keys_with_prefix.reserve(keys.size());
-    for (const KeyType &key : keys) {
-        keys_with_prefix.emplace_back(cache_key_prefix_ + std::to_string(key));
-    }
-    return keys_with_prefix;
-}
-
-bool MetaAsyncRedisBackend::StripPrefixInKeys(const std::vector<std::string> &keys_with_prefix,
-                                              KeyTypeVec &out_keys) const {
-    out_keys.clear();
-    out_keys.reserve(keys_with_prefix.size());
-    for (const std::string &key_with_prefix : keys_with_prefix) {
-        if (key_with_prefix.size() < cache_key_prefix_.size() ||
-            key_with_prefix.compare(0, cache_key_prefix_.size(), cache_key_prefix_) != 0) {
-            KVCM_LOG_ERROR("async redis strip prefix invalid key[%s], expected prefix[%s], instance[%s]",
-                           key_with_prefix.c_str(),
-                           cache_key_prefix_.c_str(),
-                           instance_id_.c_str());
-            out_keys.clear();
-            return false;
-        }
-        const std::string keyStr = key_with_prefix.substr(cache_key_prefix_.size());
-        KeyType key = 0;
-        if (!StringUtil::StrToInt64(keyStr.c_str(), key)) {
-            KVCM_LOG_ERROR("async redis strip prefix invalid key[%s], can not convert to int64, instance[%s]",
-                           key_with_prefix.c_str(),
-                           instance_id_.c_str());
-            out_keys.clear();
-            return false;
-        }
-        out_keys.emplace_back(key);
-    }
-    return true;
-}
-
-// ---------------------------------------------------------------------------
-// Serialization helpers (same logic as MetaRedisBackend)
-// ---------------------------------------------------------------------------
-
-FieldMap MetaAsyncRedisBackend::SerializeToFieldMap(const CacheLocationMap &locations, const PropertyMap &properties) {
-    FieldMap field_map;
-    for (const auto &[loc_id, loc_ptr] : locations) {
-        field_map[LOCATION_PREFIX + loc_id] = loc_ptr ? loc_ptr->ToJsonString() : "";
-    }
-    for (const auto &[key, value] : properties) {
-        field_map[key] = value;
-    }
-    return field_map;
-}
-
-ErrorCode MetaAsyncRedisBackend::DeserializeFieldMap(const FieldMap &field_map,
-                                                     CacheLocationMap &out_locations,
-                                                     PropertyMap &out_properties) {
-    for (const auto &[field_name, field_value] : field_map) {
-        if (field_name.rfind(LOCATION_PREFIX, 0) == 0) {
-            std::string loc_id = field_name.substr(LOCATION_PREFIX.size());
-            auto location = std::make_shared<CacheLocation>();
-            if (field_value.empty()) {
-                location->set_id(loc_id);
-            } else if (!location->FromJsonString(field_value)) {
-                return EC_CORRUPTION;
-            }
-            out_locations[loc_id] = std::move(location);
-        } else {
-            out_properties[field_name] = field_value;
-        }
-    }
-    return EC_OK;
-}
-
-ErrorCode MetaAsyncRedisBackend::DeserializeLocations(const FieldMap &field_map, CacheLocationMap &out_locations) {
-    for (const auto &[field_name, field_value] : field_map) {
-        if (field_name.rfind(LOCATION_PREFIX, 0) != 0) {
-            continue;
-        }
-        std::string loc_id = field_name.substr(LOCATION_PREFIX.size());
-        auto location = std::make_shared<CacheLocation>();
-        if (field_value.empty()) {
-            location->set_id(loc_id);
-        } else if (!location->FromJsonString(field_value)) {
-            return EC_CORRUPTION;
-        }
-        out_locations[loc_id] = std::move(location);
-    }
-    return EC_OK;
-}
 
 // ---------------------------------------------------------------------------
 // Init / Open / Close
@@ -145,61 +52,47 @@ ErrorCode MetaAsyncRedisBackend::Init(const std::string &instance_id,
 
     storage_uri_ = StandardUri::FromUri(config->GetStorageUri());
 
-    int64_t tmp = 0;
-    storage_uri_.GetParamAs("timeout_ms", tmp);
-    if (tmp > 0) {
-        timeout_ms_ = tmp;
-    }
+    auto parse_config_param = [&](const char *key, auto &target) {
+        int64_t value = static_cast<int64_t>(target);
+        storage_uri_.GetParamAs(key, value);
+        target = static_cast<std::remove_reference_t<decltype(target)>>(value);
+    };
+    parse_config_param("timeout_ms", timeout_ms_);
+    parse_config_param("async_queue_count", queue_count_);
+    parse_config_param("async_max_batch", max_batch_size_);
+    parse_config_param("async_wait_us", batch_wait_timeout_us_);
+    parse_config_param("async_max_size", queue_max_size_);
+    parse_config_param("async_enqueue_timeout_ms", enqueue_timeout_ms_);
+    parse_config_param("async_sync_timeout_ms", sync_timeout_ms_);
+    parse_config_param("async_drain_ms", drain_timeout_ms_);
 
-    tmp = 0;
-    storage_uri_.GetParamAs("async_queue_count", tmp);
-    if (tmp > 0) {
-        queue_count_ = static_cast<int32_t>(tmp);
-    }
-
-    tmp = 0;
-    storage_uri_.GetParamAs("async_max_batch", tmp);
-    if (tmp > 0) {
-        max_batch_size_ = tmp;
-    }
-
-    tmp = 0;
-    storage_uri_.GetParamAs("async_wait_us", tmp);
-    if (tmp > 0) {
-        batch_wait_timeout_us_ = tmp;
-    }
-
-    tmp = 0;
-    storage_uri_.GetParamAs("async_max_size", tmp);
-    if (tmp > 0) {
-        queue_max_size_ = tmp;
-    }
-
-    tmp = 0;
-    storage_uri_.GetParamAs("async_enqueue_retry_us", tmp);
-    if (tmp > 0) {
-        enqueue_retry_interval_us_ = tmp;
-    }
-
-    tmp = 0;
-    storage_uri_.GetParamAs("async_enqueue_timeout_ms", tmp);
-    if (tmp > 0) {
-        enqueue_timeout_ms_ = tmp;
-    }
-
-    tmp = 0;
-    storage_uri_.GetParamAs("async_drain_ms", tmp);
-    if (tmp > 0) {
-        drain_timeout_ms_ = tmp;
+    constexpr int32_t kMaxQueueCount = 2048;
+    if (queue_count_ <= 0 || queue_count_ > kMaxQueueCount || max_batch_size_ <= 0 || batch_wait_timeout_us_ <= 0 ||
+        queue_max_size_ <= 0 || enqueue_timeout_ms_ < 0 || sync_timeout_ms_ <= 0 || drain_timeout_ms_ <= 0) {
+        KVCM_LOG_ERROR("fail to init meta async redis backend, invalid async config, instance[%s], queue_count[%d], "
+                       "max_batch[%ld], wait_timeout_us[%ld], max_size[%ld], enqueue_timeout_ms[%ld], "
+                       "sync_timeout_ms[%ld], drain_timeout_ms[%ld]",
+                       instance_id_.c_str(),
+                       queue_count_,
+                       max_batch_size_,
+                       batch_wait_timeout_us_,
+                       queue_max_size_,
+                       enqueue_timeout_ms_,
+                       sync_timeout_ms_,
+                       drain_timeout_ms_);
+        return EC_BADARGS;
     }
 
     KVCM_LOG_INFO("meta async redis backend init ok, instance[%s], queue_count[%d], max_batch[%ld], "
-                  "wait_us[%ld], max_size[%ld], drain_ms[%ld]",
+                  "wait_timeout_us[%ld], max_size[%ld], enqueue_timeout_ms[%ld], sync_timeout_ms[%ld], "
+                  "drain_timeout_ms[%ld]",
                   instance_id_.c_str(),
                   queue_count_,
                   max_batch_size_,
                   batch_wait_timeout_us_,
                   queue_max_size_,
+                  enqueue_timeout_ms_,
+                  sync_timeout_ms_,
                   drain_timeout_ms_);
     return EC_OK;
 }
@@ -212,13 +105,26 @@ ErrorCode MetaAsyncRedisBackend::Open() noexcept {
             KVCM_LOG_ERROR("async redis backend open failed, cannot create consumer client[%d], instance[%s]",
                            i,
                            instance_id_.c_str());
+            CleanupResources();
             return EC_ERROR;
         }
         consumer_clients_[i] = std::move(client);
     }
 
-    constexpr int32_t kReadPoolMin = 1;
-    constexpr int32_t kReadPoolMax = 16;
+    constexpr int32_t DEFAULT_CLIENT_MAX_POOL_SIZE = 16;
+    constexpr int32_t DEFAULT_CLIENT_MIN_POOL_SIZE = 0;
+    int32_t client_max_pool_size = DEFAULT_CLIENT_MAX_POOL_SIZE;
+    int32_t client_min_pool_size = DEFAULT_CLIENT_MIN_POOL_SIZE;
+    int64_t tmp_client_max_pool_size = 0;
+    storage_uri_.GetParamAs("client_max_pool_size", tmp_client_max_pool_size);
+    if (tmp_client_max_pool_size > 0) {
+        client_max_pool_size = tmp_client_max_pool_size;
+    }
+    int64_t tmp_client_min_pool_size = 0;
+    storage_uri_.GetParamAs("client_min_pool_size", tmp_client_min_pool_size);
+    if (tmp_client_min_pool_size > 0) {
+        client_min_pool_size = tmp_client_min_pool_size;
+    }
     read_client_pool_ = std::make_shared<DynamicClientPool<RedisClient>>(
         [this]() -> std::shared_ptr<RedisClient> {
             auto client = this->CreateRedisClient();
@@ -227,11 +133,12 @@ ErrorCode MetaAsyncRedisBackend::Open() noexcept {
             }
             return client;
         },
-        kReadPoolMin,
-        kReadPoolMax);
+        client_min_pool_size,
+        client_max_pool_size);
     if (!read_client_pool_->Initialize()) {
         KVCM_LOG_ERROR("async redis backend open failed, read_client_pool init failed, instance[%s]",
                        instance_id_.c_str());
+        CleanupResources();
         return EC_ERROR;
     }
 
@@ -246,9 +153,12 @@ ErrorCode MetaAsyncRedisBackend::Open() noexcept {
         consumer_threads_.emplace_back(&MetaAsyncRedisBackend::ConsumerLoop, this, i);
     }
 
-    KVCM_LOG_INFO("meta async redis backend open ok, instance[%s], %d consumer threads started",
+    KVCM_LOG_INFO("meta async redis backend open ok, instance[%s], %d consumer threads started, "
+                  "read client pool size min[%d], max[%d]",
                   instance_id_.c_str(),
-                  queue_count_);
+                  queue_count_,
+                  client_min_pool_size,
+                  client_max_pool_size);
     return EC_OK;
 }
 
@@ -270,6 +180,13 @@ ErrorCode MetaAsyncRedisBackend::Close() noexcept {
     }
     consumer_threads_.clear();
 
+    CleanupResources();
+
+    KVCM_LOG_INFO("meta async redis backend closed, instance[%s]", instance_id_.c_str());
+    return EC_OK;
+}
+
+void MetaAsyncRedisBackend::CleanupResources() noexcept {
     for (auto &client : consumer_clients_) {
         if (client) {
             client->Close();
@@ -279,9 +196,6 @@ ErrorCode MetaAsyncRedisBackend::Close() noexcept {
 
     read_client_pool_.reset();
     queues_.clear();
-
-    KVCM_LOG_INFO("meta async redis backend closed, instance[%s]", instance_id_.c_str());
-    return EC_OK;
 }
 
 int MetaAsyncRedisBackend::GetQueueIndexForKey(KeyType key) const noexcept {
@@ -290,22 +204,15 @@ int MetaAsyncRedisBackend::GetQueueIndexForKey(KeyType key) const noexcept {
 
 // ==================== Write Operations (async enqueue) ====================
 
-bool MetaAsyncRedisBackend::WaitForQueueCapacity(int queue_id) {
-    if (queues_[queue_id]->GetKeySize() < queue_max_size_) {
+bool MetaAsyncRedisBackend::WaitForQueueCapacity(int queue_id, int64_t incoming_key_count) {
+    if (queues_[queue_id]->WaitForCapacity(queue_max_size_, incoming_key_count, enqueue_timeout_ms_ * 1000)) {
         return true;
     }
-    int64_t waited_us = 0;
-    while (waited_us < enqueue_timeout_ms_ * 1000) {
-        std::this_thread::sleep_for(std::chrono::microseconds(enqueue_retry_interval_us_));
-        waited_us += enqueue_retry_interval_us_;
-        if (queues_[queue_id]->GetKeySize() < queue_max_size_) {
-            return true;
-        }
-    }
     KVCM_INTERVAL_LOG_WARN(10,
-                           "async redis enqueue timeout, queue[%d] key_size[%ld], instance[%s]",
+                           "async redis enqueue timeout, queue[%d] key_size[%ld] incoming_keys[%ld], instance[%s]",
                            queue_id,
                            queues_[queue_id]->GetKeySize(),
+                           incoming_key_count,
                            instance_id_.c_str());
     return false;
 }
@@ -321,7 +228,7 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::EnqueueWriteOp(RequestContext *req
         queue_to_indices[GetQueueIndexForKey(op.keys[i])].push_back(i);
     }
 
-    EnqueueStats stats;
+    int64_t enqueue_timeout_key_count = 0;
     std::vector<ErrorCode> error_codes(op.keys.size(), EC_OK);
     for (auto &[qi, indices] : queue_to_indices) {
         WriteOp sub_op;
@@ -343,8 +250,9 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::EnqueueWriteOp(RequestContext *req
             }
         }
 
-        if (!WaitForQueueCapacity(qi)) {
-            stats.enqueue_timeout_key_count += static_cast<int64_t>(indices.size());
+        const int64_t incoming_key_count = static_cast<int64_t>(indices.size());
+        if (!WaitForQueueCapacity(qi, incoming_key_count)) {
+            enqueue_timeout_key_count += incoming_key_count;
             for (size_t idx : indices) {
                 error_codes[idx] = EC_TIMEOUT;
             }
@@ -353,12 +261,13 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::EnqueueWriteOp(RequestContext *req
         queues_[qi]->Push(QueueItem{std::move(sub_op)});
     }
 
-    stats.enqueue_time_us = TimestampUtil::GetSteadyTimeUs() - enqueue_begin_us;
+    const int64_t enqueue_time_us = TimestampUtil::GetSteadyTimeUs() - enqueue_begin_us;
 
     if (request_context) {
         auto *mc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
-        KVCM_METRICS_COLLECTOR_SET_METRICS(mc, meta_indexer, async_enqueue_timeout_key_count, stats.enqueue_timeout_key_count);
-        KVCM_METRICS_COLLECTOR_SET_METRICS(mc, meta_indexer, async_enqueue_time_us, stats.enqueue_time_us);
+        KVCM_METRICS_COLLECTOR_SET_METRICS(
+            mc, meta_indexer, async_enqueue_timeout_key_count, enqueue_timeout_key_count);
+        KVCM_METRICS_COLLECTOR_SET_METRICS(mc, meta_indexer, async_enqueue_time_us, enqueue_time_us);
     }
 
     return error_codes;
@@ -402,8 +311,7 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::Upsert(RequestContext *request_con
     return EnqueueWriteOp(request_context, std::move(op));
 }
 
-std::vector<ErrorCode> MetaAsyncRedisBackend::Delete(RequestContext *request_context,
-                                                     const KeyTypeVec &keys) noexcept {
+std::vector<ErrorCode> MetaAsyncRedisBackend::Delete(RequestContext *request_context, const KeyTypeVec &keys) noexcept {
     WriteOp op;
     op.type = WriteOpType::kDelete;
     op.keys = keys;
@@ -440,7 +348,7 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::Get(RequestContext *request_contex
             10, "async redis get fail, fail to acquire read client, instance[%s]", instance_id_.c_str());
         return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
     }
-    std::vector<std::string> full_keys = AppendPrefixToKeys(keys);
+    std::vector<std::string> full_keys = AppendPrefixToKeys(cache_key_prefix_, keys);
     FieldMapVec field_maps;
     std::vector<ErrorCode> results = handle->GetAllFields(full_keys, field_maps);
 
@@ -473,7 +381,7 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::GetLocations(RequestContext *reque
             10, "async redis get locations fail, fail to acquire read client, instance[%s]", instance_id_.c_str());
         return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
     }
-    std::vector<std::string> full_keys = AppendPrefixToKeys(keys);
+    std::vector<std::string> full_keys = AppendPrefixToKeys(cache_key_prefix_, keys);
     FieldMapVec field_maps;
     std::vector<ErrorCode> results = handle->GetAllFields(full_keys, field_maps);
 
@@ -497,11 +405,10 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::GetLocations(RequestContext *reque
     return results;
 }
 
-std::vector<std::vector<ErrorCode>>
-MetaAsyncRedisBackend::GetLocations(RequestContext *request_context,
-                                    const KeyTypeVec &keys,
-                                    const LocationIdsPerKey &location_ids,
-                                    LocationsPerKey &out_locations) noexcept {
+std::vector<std::vector<ErrorCode>> MetaAsyncRedisBackend::GetLocations(RequestContext *request_context,
+                                                                        const KeyTypeVec &keys,
+                                                                        const LocationIdsPerKey &location_ids,
+                                                                        LocationsPerKey &out_locations) noexcept {
     std::vector<std::vector<std::string>> field_names_vec(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
         field_names_vec[i].reserve(location_ids[i].size());
@@ -512,15 +419,16 @@ MetaAsyncRedisBackend::GetLocations(RequestContext *request_context,
 
     auto handle = read_client_pool_->AcquireClient(timeout_ms_);
     if (!handle) {
-        KVCM_INTERVAL_LOG_WARN(
-            10, "async redis get locations by id fail, fail to acquire read client, instance[%s]", instance_id_.c_str());
+        KVCM_INTERVAL_LOG_WARN(10,
+                               "async redis get locations by id fail, fail to acquire read client, instance[%s]",
+                               instance_id_.c_str());
         std::vector<std::vector<ErrorCode>> results(keys.size());
         for (size_t i = 0; i < keys.size(); ++i) {
             results[i].assign(location_ids[i].size(), EC_TIMEOUT);
         }
         return results;
     }
-    std::vector<std::string> full_keys = AppendPrefixToKeys(keys);
+    std::vector<std::string> full_keys = AppendPrefixToKeys(cache_key_prefix_, keys);
     FieldMapVec field_maps;
     std::vector<ErrorCode> key_results = handle->Get(full_keys, field_names_vec, field_maps);
 
@@ -565,7 +473,7 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::GetLocationIds(RequestContext * /*
             10, "async redis get location ids fail, fail to acquire read client, instance[%s]", instance_id_.c_str());
         return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
     }
-    std::vector<std::string> full_keys = AppendPrefixToKeys(keys);
+    std::vector<std::string> full_keys = AppendPrefixToKeys(cache_key_prefix_, keys);
     std::vector<std::vector<std::string>> raw_field_names_vec;
     std::vector<ErrorCode> results = handle->GetFieldNamesWithPrefix(full_keys, LOCATION_PREFIX, raw_field_names_vec);
 
@@ -594,7 +502,7 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::GetProperties(RequestContext * /*r
             10, "async redis get properties fail, fail to acquire read client, instance[%s]", instance_id_.c_str());
         return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
     }
-    std::vector<std::string> full_keys = AppendPrefixToKeys(keys);
+    std::vector<std::string> full_keys = AppendPrefixToKeys(cache_key_prefix_, keys);
     FieldMapVec field_maps;
     std::vector<ErrorCode> results = handle->Get(full_keys, field_names, field_maps);
 
@@ -617,7 +525,7 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::Exists(RequestContext * /*request_
             10, "async redis exists fail, fail to acquire read client, instance[%s]", instance_id_.c_str());
         return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
     }
-    std::vector<std::string> full_keys = AppendPrefixToKeys(keys);
+    std::vector<std::string> full_keys = AppendPrefixToKeys(cache_key_prefix_, keys);
     return handle->Exists(full_keys, out_is_exist_vec);
 }
 
@@ -630,7 +538,7 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::ExistsLocation(RequestContext * /*
             10, "async redis exists location fail, fail to acquire read client, instance[%s]", instance_id_.c_str());
         return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
     }
-    std::vector<std::string> full_keys = AppendPrefixToKeys(keys);
+    std::vector<std::string> full_keys = AppendPrefixToKeys(cache_key_prefix_, keys);
     return handle->ExistsFieldWithPrefix(full_keys, LOCATION_PREFIX, out_exists);
 }
 
@@ -651,7 +559,7 @@ ErrorCode MetaAsyncRedisBackend::ListKeys(RequestContext * /*request_context*/,
     if (ec != EC_OK) {
         return ec;
     }
-    if (!StripPrefixInKeys(full_keys, out_keys)) {
+    if (!StripPrefixInKeys(cache_key_prefix_, instance_id_, full_keys, out_keys)) {
         out_keys.clear();
         return EC_ERROR;
     }
@@ -673,7 +581,7 @@ ErrorCode MetaAsyncRedisBackend::RandomSample(RequestContext * /*request_context
     if (ec != EC_OK) {
         return ec;
     }
-    if (!StripPrefixInKeys(full_keys, out_keys)) {
+    if (!StripPrefixInKeys(cache_key_prefix_, instance_id_, full_keys, out_keys)) {
         out_keys.clear();
         return EC_ERROR;
     }
@@ -742,7 +650,7 @@ bool MetaAsyncRedisBackend::Sync(const KeyTypeVec &keys) noexcept {
         queues_[qi]->Push(QueueItem{std::move(item)});
     }
 
-    return barrier_ctx->Wait();
+    return barrier_ctx->Wait(std::chrono::milliseconds{sync_timeout_ms_});
 }
 
 // ==================== Metrics ====================
@@ -765,7 +673,9 @@ MetaStorageBackend::AsyncWriteStats MetaAsyncRedisBackend::GetAsyncWriteStats() 
 
     // CAS reset: read and reset accumulated counters
     stats.flush_key_count = stats_flush_key_count_.exchange(0, std::memory_order_relaxed);
-    stats.batch_flush_time_us = stats_batch_flush_time_us_.exchange(0, std::memory_order_relaxed);
+    int64_t flush_count = stats_batch_flush_count_.exchange(0, std::memory_order_relaxed);
+    int64_t total_flush_time_us = stats_batch_flush_time_us_.exchange(0, std::memory_order_relaxed);
+    stats.batch_flush_time_us = flush_count > 0 ? total_flush_time_us / flush_count : 0;
     stats.pipeline_error_count = stats_pipeline_error_count_.exchange(0, std::memory_order_relaxed);
     return stats;
 }
@@ -789,7 +699,7 @@ void MetaAsyncRedisBackend::ConsumerLoop(int queue_id) {
 }
 
 void MetaAsyncRedisBackend::CompileWriteOp(const WriteOp &op, std::vector<CmdArgs> &cmds) {
-    std::vector<std::string> full_keys = AppendPrefixToKeys(op.keys);
+    std::vector<std::string> full_keys = AppendPrefixToKeys(cache_key_prefix_, op.keys);
 
     switch (op.type) {
     case WriteOpType::kPut:
@@ -817,19 +727,26 @@ void MetaAsyncRedisBackend::BatchFlush(int queue_id, std::vector<QueueItem> &ite
         std::shared_ptr<BarrierContext> ctx;
         size_t cmd_begin;
         size_t cmd_end;
+        int64_t key_count;
     };
     std::vector<BarrierRecord> barriers;
     size_t segment_cmd_begin = 0;
+    int64_t segment_key_count = 0;
 
     for (auto &item : items) {
         if (std::holds_alternative<WriteOp>(item)) {
+            segment_key_count += static_cast<int64_t>(std::get<WriteOp>(item).keys.size());
             CompileWriteOp(std::get<WriteOp>(item), all_cmds);
         } else {
             auto &barrier = std::get<SyncBarrierItem>(item);
-            barriers.push_back({barrier.barrier_ctx, segment_cmd_begin, all_cmds.size()});
+            barriers.push_back({barrier.barrier_ctx, segment_cmd_begin, all_cmds.size(), segment_key_count});
             segment_cmd_begin = all_cmds.size();
+            segment_key_count = 0;
         }
     }
+    // trailing_key_count: keys from WriteOps after the last barrier
+    const int64_t trailing_key_count = segment_key_count;
+    const size_t trailing_cmd_begin = segment_cmd_begin;
 
     if (all_cmds.empty()) {
         for (auto &b : barriers) {
@@ -840,47 +757,62 @@ void MetaAsyncRedisBackend::BatchFlush(int queue_id, std::vector<QueueItem> &ite
         return;
     }
 
-    auto replies = client->BatchExecute(all_cmds);
+    bool all_ok = false;
+    auto error_codes = client->BatchWrite(all_cmds, all_ok);
 
-    if (replies.size() != all_cmds.size()) {
-        KVCM_LOG_ERROR("async redis consumer[%d] pipeline failed, cmds[%zu] replies[%zu], instance[%s]",
+    if (!all_ok) {
+        KVCM_LOG_ERROR("async redis consumer[%d] pipeline fail, cmds[%zu], instance[%s]",
                        queue_id,
                        all_cmds.size(),
-                       replies.size(),
                        instance_id_.c_str());
         stats_pipeline_error_count_.fetch_add(1, std::memory_order_relaxed);
+
+        if (error_codes.size() != all_cmds.size()) {
+            for (auto &b : barriers) {
+                if (b.ctx) {
+                    b.ctx->SetFailed();
+                }
+            }
+        } else {
+            auto segment_all_ok = [&](size_t begin, size_t end) {
+                for (size_t i = begin; i < end; ++i) {
+                    if (error_codes[i] != EC_OK) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+
+            int64_t ok_key_count = 0;
+            for (auto &b : barriers) {
+                if (!b.ctx) {
+                    continue;
+                }
+                if (segment_all_ok(b.cmd_begin, b.cmd_end)) {
+                    b.ctx->Fence();
+                    ok_key_count += b.key_count;
+                } else {
+                    b.ctx->SetFailed();
+                }
+            }
+            if (segment_all_ok(trailing_cmd_begin, all_cmds.size())) {
+                ok_key_count += trailing_key_count;
+            }
+            if (ok_key_count > 0) {
+                stats_flush_key_count_.fetch_add(ok_key_count, std::memory_order_relaxed);
+            }
+        }
+    } else {
+        stats_flush_key_count_.fetch_add(total_keys, std::memory_order_relaxed);
         for (auto &b : barriers) {
             if (b.ctx) {
-                b.ctx->SetFailed();
+                b.ctx->Fence();
             }
-        }
-        stats_batch_flush_time_us_.fetch_add(TimestampUtil::GetSteadyTimeUs() - flush_begin_us,
-                                             std::memory_order_relaxed);
-        return;
-    }
-
-    stats_flush_key_count_.fetch_add(total_keys, std::memory_order_relaxed);
-
-    for (auto &b : barriers) {
-        if (!b.ctx) {
-            continue;
-        }
-        bool segment_ok = true;
-        for (size_t i = b.cmd_begin; i < b.cmd_end; ++i) {
-            if (replies[i] && replies[i]->type == REDIS_REPLY_ERROR) {
-                segment_ok = false;
-                break;
-            }
-        }
-        if (segment_ok) {
-            b.ctx->Fence();
-        } else {
-            b.ctx->SetFailed();
         }
     }
 
-    stats_batch_flush_time_us_.fetch_add(TimestampUtil::GetSteadyTimeUs() - flush_begin_us,
-                                         std::memory_order_relaxed);
+    stats_batch_flush_count_.fetch_add(1, std::memory_order_relaxed);
+    stats_batch_flush_time_us_.fetch_add(TimestampUtil::GetSteadyTimeUs() - flush_begin_us, std::memory_order_relaxed);
 }
 
 void MetaAsyncRedisBackend::DrainQueue(int queue_id) {
@@ -895,20 +827,35 @@ void MetaAsyncRedisBackend::DrainQueue(int queue_id) {
         BatchFlush(queue_id, items, taken_keys);
     }
 
-    int64_t remaining_keys = 0;
-    auto remaining = queues_[queue_id]->PopBatch(queue_max_size_, remaining_keys);
-    for (auto &item : remaining) {
-        if (std::holds_alternative<SyncBarrierItem>(item)) {
+    size_t dropped_write_op_count = 0;
+    size_t dropped_key_count = 0;
+    size_t dropped_barrier_count = 0;
+    while (true) {
+        int64_t remaining_keys = 0;
+        auto remaining = queues_[queue_id]->PopBatch(queue_max_size_, remaining_keys);
+        if (remaining.empty()) {
+            break;
+        }
+        for (auto &item : remaining) {
+            if (std::holds_alternative<WriteOp>(item)) {
+                ++dropped_write_op_count;
+                dropped_key_count += std::get<WriteOp>(item).keys.size();
+                continue;
+            }
+            ++dropped_barrier_count;
             auto &barrier = std::get<SyncBarrierItem>(item);
             if (barrier.barrier_ctx) {
                 barrier.barrier_ctx->SetFailed();
             }
         }
     }
-    if (!remaining.empty()) {
-        KVCM_LOG_WARN("async redis consumer[%d] drain timeout, dropped %zu items, instance[%s]",
+    if (dropped_write_op_count > 0 || dropped_barrier_count > 0) {
+        KVCM_LOG_WARN("async redis consumer[%d] drain timeout, dropped write ops[%zu] keys[%zu], "
+                      "sync barriers[%zu], instance[%s]",
                       queue_id,
-                      remaining.size(),
+                      dropped_write_op_count,
+                      dropped_key_count,
+                      dropped_barrier_count,
                       instance_id_.c_str());
     }
 }

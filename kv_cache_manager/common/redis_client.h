@@ -57,9 +57,11 @@ public:
     using ReplyUPtr = std::unique_ptr<redisReply, void (*)(void *)>;
     using CmdArgs = std::vector<std::string>;
 
-    // Public pipeline interface for batch command execution.
-    // Returns per-command replies; empty vector on total connection failure.
-    std::vector<ReplyUPtr> BatchExecute(const std::vector<CmdArgs> &cmds) { return CommandPipeline(cmds); }
+    // Batch-execute write commands (DEL/HSET/HDEL) via pipeline.
+    // All commands are expected to return REDIS_REPLY_INTEGER.
+    // Returns per-command ErrorCode; empty vector on total connection failure.
+    // Sets all_ok to true if every command succeeded.
+    std::vector<ErrorCode> BatchWrite(const std::vector<CmdArgs> &cmds, bool &out_all_ok);
 
     // --- Static command builders ---
     // Pure utility functions that construct Redis CmdArgs without any connection or state.

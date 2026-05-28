@@ -709,7 +709,7 @@ ErrorCode CacheManager::TrimCache(RequestContext *request_context,
 
     std::string cursor = SCAN_BASE_CURSOR;
     do {
-        constexpr std::size_t limit = 1024;
+        constexpr std::size_t limit = 256;
         std::string next_cursor;
 
         CacheMetaDelRequest request;

@@ -83,25 +83,6 @@ public:
     ErrorCode GetMetaData(FieldMap &field_maps) noexcept override;
 
 private:
-    // ----- Key helpers -----
-    std::vector<std::string> AppendPrefixToKeys(const KeyTypeVec &keys) const;
-    bool StripPrefixInKeys(const std::vector<std::string> &keys_with_prefix, std::vector<KeyType> &out_keys) const;
-
-    // ----- Serialization helpers -----
-    // Serialize CacheLocationMap + PropertyMap into a single FieldMap for Redis storage.
-    static FieldMap SerializeToFieldMap(const CacheLocationMap &locations, const PropertyMap &properties);
-
-    // Deserialize a FieldMap from Redis into CacheLocationMap + PropertyMap.
-    // Returns EC_OK on success, EC_CORRUPTION if any location JSON is invalid.
-    static ErrorCode
-    DeserializeFieldMap(const FieldMap &field_map, CacheLocationMap &out_locations, PropertyMap &out_properties);
-
-    // Deserialize a FieldMap into CacheLocationMap only (ignores properties).
-    static ErrorCode DeserializeLocations(const FieldMap &field_map, CacheLocationMap &out_locations);
-
-    // Extract location ids from field names that start with LOCATION_PREFIX.
-    static void ExtractLocationIds(const FieldMap &field_map, std::vector<LocationId> &out_location_ids);
-
     // virtual for test
     virtual std::shared_ptr<RedisClient> CreateRedisClient() const;
 

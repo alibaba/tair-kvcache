@@ -51,7 +51,7 @@ struct BarrierContext {
         cv.notify_all();
     }
 
-    bool Wait(std::chrono::milliseconds timeout = std::chrono::milliseconds{5000}) {
+    bool Wait(std::chrono::milliseconds timeout) {
         std::unique_lock<std::mutex> lock(mu);
         bool completed = cv.wait_for(lock, timeout, [this] {
             return remain.load(std::memory_order_acquire) == 0 || failed.load(std::memory_order_acquire);
@@ -83,6 +83,11 @@ public:
     int64_t GetKeySize() const { return key_size_.load(std::memory_order_relaxed); }
     void NotifyConsumer();
 
+    // Producer waits until the queue has capacity for the incoming keys, or timeout.
+    // A single oversized item is allowed when the queue is empty to avoid permanent blocking.
+    // Returns true if capacity is available, false on timeout.
+    bool WaitForCapacity(int64_t capacity_threshold, int64_t incoming_key_count, int64_t timeout_us);
+
 private:
     struct Node {
         QueueItem item;
@@ -99,6 +104,10 @@ private:
 
     std::mutex wait_mutex_;
     std::condition_variable wait_cv_;
+
+    // For producer backpressure: notified when consumer pops items
+    std::mutex capacity_mutex_;
+    std::condition_variable capacity_cv_;
 };
 
 } // namespace kv_cache_manager

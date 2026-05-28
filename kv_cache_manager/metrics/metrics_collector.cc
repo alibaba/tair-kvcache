@@ -312,11 +312,21 @@ bool CacheManagerGroupMetricsCollector::Init() {
 
 DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector, cache_manager_instance, key_count);
 DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector, cache_manager_instance, byte_size);
-DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector, cache_manager_instance, async_queue_max_size);
-DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector, cache_manager_instance, async_queue_avg_size);
-DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector, cache_manager_instance, async_flush_key_count);
-DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector, cache_manager_instance, async_batch_flush_time_us);
-DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector, cache_manager_instance, async_pipeline_error_count);
+DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector,
+                                      cache_manager_instance,
+                                      async_queue_max_size);
+DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector,
+                                      cache_manager_instance,
+                                      async_queue_avg_size);
+DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector,
+                                      cache_manager_instance,
+                                      async_flush_key_count);
+DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector,
+                                      cache_manager_instance,
+                                      async_batch_flush_time_us);
+DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector,
+                                      cache_manager_instance,
+                                      async_pipeline_error_count);
 DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector, cache_manager_instance, max_lru_age_us);
 
 CacheManagerInstanceMetricsCollector::CacheManagerInstanceMetricsCollector(

@@ -25,7 +25,7 @@ public:
     // URI with persistent=redis + cache=local forces dual-backend mode.
     static std::shared_ptr<MetaStorageBackendConfig> MakeDualConfig() {
         auto config = std::make_shared<MetaStorageBackendConfig>();
-        config->SetStorageType(META_REDIS_BACKEND_TYPE_STR);
+        config->SetStorageType(META_CACHED_BACKEND_TYPE_STR);
         config->SetStorageUri("redis://test_redis_user:test_redis_password@localhost:6379/"
                               "?client_max_pool_size=4&persistent_type=redis&cache_type=local");
         return config;
@@ -35,7 +35,7 @@ public:
     // with asynchronous writes to redis.
     static std::shared_ptr<MetaStorageBackendConfig> MakeAsyncDualConfig() {
         auto config = std::make_shared<MetaStorageBackendConfig>();
-        config->SetStorageType(META_REDIS_BACKEND_TYPE_STR);
+        config->SetStorageType(META_CACHED_BACKEND_TYPE_STR);
         config->SetStorageUri("redis://test_redis_user:test_redis_password@localhost:6379/"
                               "?client_max_pool_size=4&persistent_type=async_redis&cache_type=local"
                               "&async_queue_count=2&async_max_batch=64&async_wait_us=1000"

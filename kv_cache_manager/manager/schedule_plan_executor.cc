@@ -281,7 +281,6 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::Submit(const CacheMetaDelRe
 
     std::vector<int64_t> batch_cas_block_keys;
     std::vector<std::vector<MetaSearcher::LocationCASTask>> batch_cas_tasks;
-    std::vector<int64_t> empty_location_keys;
     for (size_t block_key_idx = 0; block_key_idx < task.block_keys.size(); ++block_key_idx) {
         std::vector<MetaSearcher::LocationCASTask> cas_tasks;
         for (const auto &loc_kv : location_maps[block_key_idx]) {
@@ -291,19 +290,10 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::Submit(const CacheMetaDelRe
             cas_tasks.push_back({loc_kv.first, loc_kv.second->status(), CLS_DELETING});
         }
         if (cas_tasks.empty()) {
-            empty_location_keys.emplace_back(task.block_keys[block_key_idx]);
             continue;
         }
         batch_cas_block_keys.emplace_back(task.block_keys[block_key_idx]);
         batch_cas_tasks.emplace_back(std::move(cas_tasks));
-    }
-
-    if (!empty_location_keys.empty()) {
-        auto del_result = indexer->Delete(request_context.get(), empty_location_keys);
-        KVCM_LOG_INFO("TrimCache: deleted %zu empty-location keys from instance[%s], ec=%d",
-                      empty_location_keys.size(),
-                      task.instance_id.c_str(),
-                      static_cast<int>(del_result.ec));
     }
 
     if (batch_cas_block_keys.empty()) {
@@ -331,10 +321,10 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::Submit(const CacheMetaDelRe
 
     // Sync: ensure CAS(→DELETING) is persisted before scheduling Phase 2.
     if (!indexer->Sync(actual_task.block_keys)) {
-        KVCM_LOG_WARN("Sync failed or timed out for location delete, instance[%s], "
-                      "skipping Phase 2, CacheReclaimer will retry",
-                      task.instance_id.c_str());
-        promise->set_value(PlanExecuteResult{ErrorCode::EC_OK, ""});
+        HandleErrorPromise(promise,
+                           ErrorCode::EC_ERROR,
+                           "Sync failed or timed out for location delete, instance[%s]",
+                           task.instance_id.c_str());
         return future;
     }
 
@@ -469,10 +459,10 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::Submit(const CacheLocationD
 
     // Sync: ensure CAS(→DELETING) is persisted before scheduling Phase 2.
     if (!indexer->Sync(actual_task.block_keys)) {
-        KVCM_LOG_WARN("Sync failed or timed out for location delete, instance[%s], "
-                      "skipping Phase 2, CacheReclaimer will retry",
-                      task.instance_id.c_str());
-        promise->set_value(PlanExecuteResult{ErrorCode::EC_OK, ""});
+        HandleErrorPromise(promise,
+                           ErrorCode::EC_ERROR,
+                           "Sync failed or timed out for location delete, instance[%s]",
+                           task.instance_id.c_str());
         return future;
     }
 
