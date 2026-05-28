@@ -18,8 +18,6 @@ public:
     TtlEvictionPolicy(const std::string &name, bool fallback_on_pressure = true);
     ~TtlEvictionPolicy() override;
 
-    std::string name() const override { return name_; }
-    void set_name(const std::string &name) override { name_ = name; }
     size_t size() const override { return node_map_.size(); }
 
     void OnBlockWritten(BlockEntry *block) override;
@@ -55,7 +53,6 @@ private:
         BlockEntry *payload_ = nullptr;
     };
 
-    std::string name_;
     bool fallback_on_pressure_;
     LinkedList list_;
     std::unordered_map<BlockEntry *, ListNode *> node_map_;

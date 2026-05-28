@@ -14,7 +14,7 @@ public:
     static std::pair<int64_t, int64_t>
     GetTraceTimeRange(const std::vector<std::shared_ptr<OptimizerSchemaTrace>> &traces);
     static std::vector<std::shared_ptr<OptimizerSchemaTrace>> FilterTracesByTimeRange(
-        const std::vector<std::shared_ptr<OptimizerSchemaTrace>> &traces, int64_t start_time_us, int64_t end_time_us);
+        const std::vector<std::shared_ptr<OptimizerSchemaTrace>> &traces, int64_t start_time_ns, int64_t end_time_ns);
 
 private:
     static bool CompareByTimestamp(const std::shared_ptr<OptimizerSchemaTrace> &a,

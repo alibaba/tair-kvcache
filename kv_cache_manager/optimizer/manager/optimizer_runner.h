@@ -30,10 +30,17 @@ public:
 public:
     void HandleGetLocation(const GetLocationSchemaTrace &trace);
     void HandleWriteCache(const WriteCacheSchemaTrace &trace);
-    void HandleDialogTurn(const DialogTurnSchemaTrace &trace);
 
 private:
-    ReadRecord BuildReadRecord(const std::string &instance_id, int64_t timestamp_us);
+    std::shared_ptr<RadixTreeIndex> GetIndexer(const std::string &instance_id);
+    void SubmitReadRecord(const std::string &instance_id,
+                          const std::string &trace_id,
+                          const std::vector<int64_t> &keys,
+                          int64_t timestamp_ns,
+                          const QueryHit &query_hit,
+                          const std::shared_ptr<RadixTreeIndex> &indexer,
+                          size_t local_read_block_num,
+                          size_t remote_read_block_num);
 
     std::shared_ptr<OptIndexerManager> indexer_manager_;
     std::shared_ptr<OptEvictionManager> eviction_manager_;

@@ -6,7 +6,7 @@
 #include <pybind11/stl_bind.h>
 
 #include "kv_cache_manager/common/logger.h"
-#include "kv_cache_manager/manager/cache_location.h"
+#include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/optimizer/config/insight_simulator_types.h"
 #include "kv_cache_manager/optimizer/config/instance_config.h"
 #include "kv_cache_manager/optimizer/config/instance_group_config.h"
@@ -112,11 +112,12 @@ PYBIND11_MODULE(kvcm_py_optimizer, module) {
 
     // 绑定OptimizerManager类
     py::class_<kvcm::OptimizerManager>(module, "OptimizerManager")
-        .def(py::init<const kvcm::OptimizerConfig &, bool>(),
+        .def(py::init<const kvcm::OptimizerConfig &, bool, bool>(),
              py::arg("config"),
              py::arg("enable_lifecycle_tracking") = false,
+             py::arg("enable_template_analysis") = false,
              "Initialize OptimizerManager. Set enable_lifecycle_tracking=True to track block lifecycle (uses ~10GB "
-             "more memory)")
+             "more memory). Set enable_template_analysis=True to enable template prefix analysis (slower replay)")
         .def("Init", &kvcm::OptimizerManager::Init, py::call_guard<py::gil_scoped_release>())
         .def("DirectRun", &kvcm::OptimizerManager::DirectRun, py::call_guard<py::gil_scoped_release>())
         .def("AnalyzeResults",

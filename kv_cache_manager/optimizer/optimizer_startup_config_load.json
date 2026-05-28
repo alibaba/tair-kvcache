@@ -8,10 +8,11 @@
     "instance_groups": [
         {
             "group_name": "instance_group_01",
-            "quota_capacity": 120000,
+            "quota_capacity": 240,
             "used_percentage": 1.0,
-            "hierarchical_eviction_enabled": false,
-            "default_block_ttl_seconds": 3600,
+            "hierarchical_eviction_enabled": true,
+            "tier_write_mode": "write_through",
+            "default_block_ttl_seconds": 0,
             "ttl_refresh_on_read": true,
             "storages": [
                 {
@@ -19,20 +20,21 @@
                     "storage_type": "pace",
                     "band_width_mbps": 20000,
                     "priority": 0,
-                    "capacity": 100000
+                    "capacity": 200
                 },
                 {
                     "unique_name": "hf3fs_00",
                     "storage_type": "hf3fs",
                     "band_width_mbps": 20000,
                     "priority": 1,
-                    "capacity": 20000
+                    "capacity": 40
                 }
             ],
             "instances": [
                 {
                     "instance_id": "instance",
-                    "block_size": 16,
+                    "block_size": 64,
+                    "bytes_per_token": 32768,
                     "eviction_policy_type": "lru",
                     "eviction_policy_params": {
                         "sample_rate": 0.1

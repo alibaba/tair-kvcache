@@ -52,7 +52,7 @@ TEST_F(RedisClientRealServiceTest, TestSimple) {
 
     std::vector<std::map<std::string, std::string>> expected_field_maps = field_maps;
     std::vector<std::map<std::string, std::string>> out_field_maps;
-    ec_per_key = redis_client_->Get(keys, /*field_names*/ {"f1", "f2"}, out_field_maps);
+    ec_per_key = redis_client_->Get(keys, /*field_names*/ std::vector<std::string>{"f1", "f2"}, out_field_maps);
     ASSERT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK), ec_per_key);
     ASSERT_EQ(expected_field_maps, out_field_maps);
 
@@ -63,7 +63,7 @@ TEST_F(RedisClientRealServiceTest, TestSimple) {
 
     expected_field_maps = std::vector<std::map<std::string, std::string>>{{{"f1", "v1-1-0"}, {"f2", "v1-2-1"}},
                                                                           {{"f1", "v2-1-1"}, {"f2", "v2-2-0"}}};
-    ec_per_key = redis_client_->Get(keys, /*field_names*/ {"f1", "f2"}, out_field_maps);
+    ec_per_key = redis_client_->Get(keys, /*field_names*/ std::vector<std::string>{"f1", "f2"}, out_field_maps);
     ASSERT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK), ec_per_key);
     ASSERT_EQ(expected_field_maps, out_field_maps);
 
@@ -149,7 +149,7 @@ TEST_F(RedisClientRealServiceTest, TestNotExistKey) {
     expected_field_maps.emplace_back(std::map<std::string, std::string>{}); // key4 not exist
     std::vector<ErrorCode> expected_ec_per_key = {EC_OK, EC_OK, EC_NOENT, EC_NOENT};
     std::vector<std::map<std::string, std::string>> out_field_maps;
-    ec_per_key = redis_client_->Get(all_keys, /*field_names*/ {"f1", "f2", "f3"}, out_field_maps);
+    ec_per_key = redis_client_->Get(all_keys, /*field_names*/ std::vector<std::string>{"f1", "f2", "f3"}, out_field_maps);
     ASSERT_EQ(expected_ec_per_key, ec_per_key);
     ASSERT_EQ(expected_field_maps, out_field_maps);
 
@@ -229,7 +229,8 @@ TEST_F(RedisClientRealServiceTest, TestKeyAndFieldWithSpace) {
 
     std::vector<std::map<std::string, std::string>> expected_field_maps = field_maps;
     std::vector<std::map<std::string, std::string>> out_field_maps;
-    ec_per_key = redis_client_->Get(keys, /*field_names*/ {field_with_space1, field_with_space2}, out_field_maps);
+    ec_per_key = redis_client_->Get(
+        keys, /*field_names*/ std::vector<std::string>{field_with_space1, field_with_space2}, out_field_maps);
     ASSERT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK), ec_per_key);
     ASSERT_EQ(expected_field_maps, out_field_maps);
 
@@ -244,7 +245,8 @@ TEST_F(RedisClientRealServiceTest, TestKeyAndFieldWithSpace) {
         {{field_with_space1, "value 1-1"}, {field_with_space2, "updated value 1-2"}},
         {{field_with_space1, "updated value 2-1"}, {field_with_space2, "value 2-2"}}};
 
-    ec_per_key = redis_client_->Get(keys, /*field_names*/ {field_with_space1, field_with_space2}, out_field_maps);
+    ec_per_key = redis_client_->Get(
+        keys, /*field_names*/ std::vector<std::string>{field_with_space1, field_with_space2}, out_field_maps);
     ASSERT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK), ec_per_key);
     ASSERT_EQ(expected_field_maps, out_field_maps);
 
@@ -303,6 +305,52 @@ TEST_F(RedisClientRealServiceTest, TestKeyAndFieldWithSpace) {
     ASSERT_EQ(std::vector<bool>(keys.size(), false), out_is_exist_vec);
 
     redis_client_->Close();
+}
+
+TEST_F(RedisClientRealServiceTest, TestSelectDb) {
+    // build two clients connecting to different redis dbs with the same key
+    auto make_client = [](int64_t db) {
+        StandardUri storage_uri;
+        storage_uri.user_info_ = "test_user:test_password";
+        storage_uri.hostname_ = "localhost";
+        storage_uri.port_ = 6379;
+        storage_uri.params_["timeout_ms"] = "2000";
+        storage_uri.params_["retry_count"] = "2";
+        storage_uri.params_["db"] = std::to_string(db);
+        return std::make_unique<RedisClient>(storage_uri);
+    };
+
+    auto client_db0 = make_client(0);
+    auto client_db1 = make_client(1);
+    ASSERT_TRUE(client_db0->Open());
+    ASSERT_TRUE(client_db1->Open());
+
+    // use prefix to avoid key name conflict
+    std::string key = "redis_client_test_select_db_key";
+    std::vector<std::string> keys{key};
+    std::vector<std::map<std::string, std::string>> field_maps{{{"f1", "v1"}}};
+
+    // ensure clean state in both dbs
+    client_db0->Delete(keys);
+    client_db1->Delete(keys);
+
+    // write only to db1, the same key in db0 should remain absent
+    auto ec_per_key = client_db1->Set(keys, field_maps);
+    ASSERT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK), ec_per_key);
+
+    std::vector<bool> out_is_exist_vec;
+    ec_per_key = client_db1->Exists(keys, out_is_exist_vec);
+    ASSERT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK), ec_per_key);
+    ASSERT_EQ(std::vector<bool>{true}, out_is_exist_vec);
+
+    ec_per_key = client_db0->Exists(keys, out_is_exist_vec);
+    ASSERT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK), ec_per_key);
+    ASSERT_EQ(std::vector<bool>{false}, out_is_exist_vec);
+
+    // cleanup
+    client_db1->Delete(keys);
+    client_db0->Close();
+    client_db1->Close();
 }
 
 } // namespace kv_cache_manager

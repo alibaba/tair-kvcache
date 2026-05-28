@@ -5,7 +5,7 @@ namespace kv_cache_manager {
 RandomLruEvictionPolicy::RandomLruEvictionPolicy(const std::string &name,
                                                  const RandomLruParams &params,
                                                  const int32_t batch_size)
-    : name_(name) {
+    : EvictionPolicy(name) {
     auto sample_rate = params.sample_rate;
     if (sample_rate <= 0.0) {
         sample_rate = 0.1;
@@ -16,7 +16,8 @@ RandomLruEvictionPolicy::~RandomLruEvictionPolicy() { block_to_index_.clear(); }
 
 void RandomLruEvictionPolicy::OnBlockWritten(BlockEntry *block) {
     blocks_.push_back(block);
-    timestamps_.push_back(block->last_access_time);
+    // 读取本 tier 的 TierStat.last_access_time，各层独立
+    timestamps_.push_back(GetTierAccessTime(block));
     block_to_index_[block] = blocks_.size() - 1;
 }
 void RandomLruEvictionPolicy::OnNodeWritten(std::vector<BlockEntry *> &blocks) {
@@ -27,9 +28,6 @@ void RandomLruEvictionPolicy::OnNodeWritten(std::vector<BlockEntry *> &blocks) {
 void RandomLruEvictionPolicy::OnBlockAccessed(BlockEntry *block, int64_t timestamp) {
     auto it = block_to_index_.find(block);
     if (it != block_to_index_.end()) {
-
-        block->last_access_time = timestamp;
-        block->access_count += 1;
         timestamps_[it->second] = timestamp;
     }
 }
@@ -92,26 +90,13 @@ void RandomLruEvictionPolicy::RemoveBlock(BlockEntry *block) {
         blocks_.pop_back();
         timestamps_.pop_back();
         block_to_index_.erase(it);
-        if (name_ == "shared") {
-            // 全局驱逐时，清空所有location信息
-            block->location_map.clear();
-        } else {
-            // 分层驱逐时，仅清除当前tier的location信息
-            block->location_map.erase(name_); // 清空block的location信息
-        }
+        ClearBlockLocation(block);
     }
 }
 
 void RandomLruEvictionPolicy::Clear() {
-    // 清空所有blocks的location信息
     for (auto *block : blocks_) {
-        if (name_ == "shared") {
-            // 全局驱逐时，清空所有location信息
-            block->location_map.clear();
-        } else {
-            // 分层驱逐时，仅清除当前tier的location信息
-            block->location_map.erase(name_);
-        }
+        ClearBlockLocation(block);
     }
     // 清空所有容器
     blocks_.clear();

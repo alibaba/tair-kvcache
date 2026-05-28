@@ -33,6 +33,7 @@ public:
         cache_ = static_cast<LRUCacheShard *>(port::cacheline_aligned_alloc(sizeof(LRUCacheShard)));
         new (cache_) LRUCacheShard(capacity,
                                    /*strict_capacity_limit=*/false,
+                                   /*no_evict_on_insert=*/false,
                                    high_pri_pool_ratio,
                                    low_pri_pool_ratio,
                                    use_adaptive_mutex,

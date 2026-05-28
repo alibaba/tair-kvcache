@@ -81,12 +81,12 @@ TEST_F(MetaSearcherRealServiceTest, TestBatchAddAndGetLocation) {
 
     // 创建CacheLocation对象
     auto location_specs = MetaSearcherRedisTestHelper::CreateDefaultLocationSpecs();
-    CacheLocation location1 =
-        MetaSearcherRedisTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, location_specs);
-    CacheLocation location2 =
-        MetaSearcherRedisTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 2, location_specs);
-    CacheLocation location3 = MetaSearcherRedisTestHelper::CreateCacheLocation(
-        DataStorageType::DATA_STORAGE_TYPE_MOONCAKE, 3, location_specs);
+    auto location1 = std::make_shared<const CacheLocation>(
+        MetaSearcherRedisTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, location_specs));
+    auto location2 = std::make_shared<const CacheLocation>(
+        MetaSearcherRedisTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 2, location_specs));
+    auto location3 = std::make_shared<const CacheLocation>(MetaSearcherRedisTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_MOONCAKE, 3, location_specs));
 
     CacheLocationVector locations = {location1, location2, location3};
 
@@ -119,12 +119,12 @@ TEST_F(MetaSearcherRealServiceTest, TestBatchUpdateLocationStatus) {
 
     // 创建CacheLocation对象
     auto location_specs = MetaSearcherRedisTestHelper::CreateDefaultLocationSpecs();
-    CacheLocation location1 =
-        MetaSearcherRedisTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, location_specs);
-    CacheLocation location2 =
-        MetaSearcherRedisTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 2, location_specs);
-    CacheLocation location3 = MetaSearcherRedisTestHelper::CreateCacheLocation(
-        DataStorageType::DATA_STORAGE_TYPE_MOONCAKE, 3, location_specs);
+    auto location1 = std::make_shared<const CacheLocation>(
+        MetaSearcherRedisTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, location_specs));
+    auto location2 = std::make_shared<const CacheLocation>(
+        MetaSearcherRedisTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 2, location_specs));
+    auto location3 = std::make_shared<const CacheLocation>(MetaSearcherRedisTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_MOONCAKE, 3, location_specs));
 
     CacheLocationVector locations = {location1, location2, location3};
 
@@ -169,8 +169,7 @@ TEST_F(MetaSearcherRealServiceTest, TestBatchUpdateLocationStatus) {
         EXPECT_NE(it, location_map.end());
 
         if (it != location_map.end()) {
-            const CacheLocation &location = it->second;
-            EXPECT_EQ(location.status(), new_statuses[i]); // 状态应已更新
+            EXPECT_EQ(it->second->status(), new_statuses[i]); // 状态应已更新
         }
     }
 }
@@ -181,12 +180,12 @@ TEST_F(MetaSearcherRealServiceTest, TestPrefixMatchWithServingStatus) {
 
     // 创建CacheLocation对象
     auto location_specs = MetaSearcherRedisTestHelper::CreateDefaultLocationSpecs();
-    CacheLocation location1 =
-        MetaSearcherRedisTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, location_specs);
-    CacheLocation location2 =
-        MetaSearcherRedisTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 2, location_specs);
-    CacheLocation location3 = MetaSearcherRedisTestHelper::CreateCacheLocation(
-        DataStorageType::DATA_STORAGE_TYPE_MOONCAKE, 3, location_specs);
+    auto location1 = std::make_shared<const CacheLocation>(
+        MetaSearcherRedisTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, location_specs));
+    auto location2 = std::make_shared<const CacheLocation>(
+        MetaSearcherRedisTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_HF3FS, 2, location_specs));
+    auto location3 = std::make_shared<const CacheLocation>(MetaSearcherRedisTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_MOONCAKE, 3, location_specs));
 
     CacheLocationVector locations = {location1, location2, location3};
 
@@ -224,7 +223,7 @@ TEST_F(MetaSearcherRealServiceTest, TestPrefixMatchWithServingStatus) {
 
     // 验证返回的 locations（PrefixMatch 合并视图的 id 无单一元数据语义，不测 id）
     for (size_t i = 0; i < out_locations.size(); i++) {
-        EXPECT_EQ(out_locations[i].status(), CLS_SERVING);
+        EXPECT_EQ(out_locations[i]->status(), CLS_SERVING);
     }
 }
 
@@ -239,12 +238,12 @@ TEST_F(MetaSearcherRealServiceTest, TestConcurrentOperations) {
 
             // 创建CacheLocation对象
             auto location_specs = MetaSearcherRedisTestHelper::CreateDefaultLocationSpecs();
-            CacheLocation location1 = MetaSearcherRedisTestHelper::CreateCacheLocation(
-                DataStorageType::DATA_STORAGE_TYPE_NFS, 1, location_specs);
-            CacheLocation location2 = MetaSearcherRedisTestHelper::CreateCacheLocation(
-                DataStorageType::DATA_STORAGE_TYPE_HF3FS, 2, location_specs);
-            CacheLocation location3 = MetaSearcherRedisTestHelper::CreateCacheLocation(
-                DataStorageType::DATA_STORAGE_TYPE_MOONCAKE, 3, location_specs);
+            auto location1 = std::make_shared<const CacheLocation>(MetaSearcherRedisTestHelper::CreateCacheLocation(
+                DataStorageType::DATA_STORAGE_TYPE_NFS, 1, location_specs));
+            auto location2 = std::make_shared<const CacheLocation>(MetaSearcherRedisTestHelper::CreateCacheLocation(
+                DataStorageType::DATA_STORAGE_TYPE_HF3FS, 2, location_specs));
+            auto location3 = std::make_shared<const CacheLocation>(MetaSearcherRedisTestHelper::CreateCacheLocation(
+                DataStorageType::DATA_STORAGE_TYPE_MOONCAKE, 3, location_specs));
 
             CacheLocationVector locations = {location1, location2, location3};
 
@@ -302,8 +301,8 @@ TEST_F(MetaSearcherRealServiceTest, TestBatchVsSequentialPerformance) {
         keys.push_back(10000 + i);
 
         auto location_specs = MetaSearcherRedisTestHelper::CreateDefaultLocationSpecs();
-        CacheLocation location =
-            MetaSearcherRedisTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, location_specs);
+        auto location = std::make_shared<const CacheLocation>(MetaSearcherRedisTestHelper::CreateCacheLocation(
+            DataStorageType::DATA_STORAGE_TYPE_NFS, 1, location_specs));
         locations.push_back(location);
     }
 

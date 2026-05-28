@@ -91,6 +91,7 @@ cc_library(
     ],
     deps = [
         "//kv_cache_manager/common",
+        "//kv_cache_manager/common:client_pool",
         "//kv_cache_manager/common:redis_client_ext",
         "//kv_cache_manager/common:standard_uri",
     ],

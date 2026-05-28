@@ -67,3 +67,55 @@ TEST_F(OptimizerManagerTest, BasicInitialization) {
     OptimizerManager manager(config_);
     EXPECT_TRUE(manager.Init());
 }
+
+TEST_F(OptimizerManagerTest, WriteCacheTtlSecondsUsesNanosecondTimestamps) {
+    auto config = CreateTestOptimizerConfig();
+    auto instance_groups = config.instance_groups();
+    ASSERT_EQ(instance_groups.size(), 1);
+
+    auto group = instance_groups[0];
+    group.set_default_block_ttl_seconds(3600);
+    auto instances = group.instances();
+    ASSERT_EQ(instances.size(), 1);
+
+    TtlParams ttl_params;
+    ttl_params.fallback_on_pressure = false;
+    instances[0].set_eviction_policy_type(EvictionPolicyType::POLICY_TTL);
+    instances[0].set_eviction_policy_param(ttl_params);
+    group.set_instances(instances);
+    config.set_instance_groups({group});
+
+    OptimizerManager manager(config);
+    ASSERT_TRUE(manager.Init());
+
+    const int64_t write_ts_ns = 1'000'000'000;
+    manager.WriteCache("instance1", "write", write_ts_ns, {1}, {}, 1);
+
+    BlockMask remote_read_mask = std::vector<bool>{false};
+    auto hit_before_expire =
+        manager.GetCacheLocation("instance1", "read_before_expire", write_ts_ns + 1'000'000, {1}, {}, remote_read_mask);
+    EXPECT_EQ(hit_before_expire.kvcm_hit_length, 1);
+
+    auto hit_after_expire = manager.GetCacheLocation(
+        "instance1", "read_after_expire", write_ts_ns + 2'000'000'000, {1}, {}, remote_read_mask);
+    EXPECT_EQ(hit_after_expire.kvcm_hit_length, 0);
+}
+
+TEST_F(OptimizerManagerTest, TemplateAnalysisReadRecordKeepsTraceIdAndKeys) {
+    OptimizerManager manager(config_, false, true);
+    ASSERT_TRUE(manager.Init());
+    ASSERT_NE(manager.template_prefix_tracker_, nullptr);
+
+    const std::vector<int64_t> keys = {1, 2, 3};
+    manager.WriteCache("instance1", "write_trace", 1000, keys, {});
+
+    BlockMask remote_read_mask = std::vector<bool>{false, false, false};
+    manager.GetCacheLocation("instance1", "read_trace", 2000, keys, {}, remote_read_mask);
+
+    auto data_it = manager.template_prefix_tracker_->instance_data_.find("instance1");
+    ASSERT_NE(data_it, manager.template_prefix_tracker_->instance_data_.end());
+    ASSERT_EQ(data_it->second.trace_reads.size(), 1);
+
+    EXPECT_EQ(data_it->second.trace_reads[0].trace_id, "read_trace");
+    EXPECT_EQ(data_it->second.trace_reads[0].keys, keys);
+}

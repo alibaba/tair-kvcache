@@ -10,6 +10,8 @@
 #include <thread>
 #include <vector>
 
+#include "kv_cache_manager/common/logger.h"
+
 namespace kv_cache_manager {
 
 template <typename ClientType>
@@ -148,18 +150,19 @@ public:
         }
         if (client == nullptr) {
             if (static_cast<int32_t>(this->pool_state_->AllClientSize()) < max_pool_size_) {
-                {
-                    std::unique_lock lock(acq_mux_);
-                    // double check
-                    if (static_cast<int32_t>(this->pool_state_->AllClientSize()) < max_pool_size_) {
-                        auto temp_client = this->cb_();
-                        if (temp_client != nullptr) {
-                            this->pool_state_->ReleaseClient(temp_client, true);
-                        }
+                std::unique_lock lock(acq_mux_);
+                // double check
+                if (static_cast<int32_t>(this->pool_state_->AllClientSize()) < max_pool_size_) {
+                    auto temp_client = this->cb_();
+                    if (temp_client != nullptr) {
+                        this->pool_state_->ReleaseClient(temp_client, true);
+                    } else {
+                        KVCM_LOG_WARN("DynamicClientPool: failed to create new client, current pool size: %zu",
+                                      this->pool_state_->AllClientSize());
                     }
                 }
-                client = this->pool_state_->AcquireClient(timeout_ms);
             }
+            client = this->pool_state_->AcquireClient(timeout_ms);
         }
 
         return typename Base::ClientHandle(this->pool_state_, std::move(client));

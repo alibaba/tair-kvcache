@@ -1,7 +1,11 @@
 #include "kv_cache_manager/optimizer/manager/eviction_manager.h"
 
+#include <algorithm>
+#include <unordered_set>
+
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/optimizer/eviction_policy/policy_factory.h"
+#include "kv_cache_manager/optimizer/index/radix_tree_index.h"
 namespace kv_cache_manager {
 bool OptEvictionManager::Init(const EvictionConfig &eviction_config) {
     eviction_config_ = eviction_config;
@@ -19,94 +23,198 @@ bool OptEvictionManager::Init(const EvictionConfig &eviction_config) {
     return true;
 }
 
-std::shared_ptr<EvictionPolicy>
+TieredPolicyGroup *
 OptEvictionManager::CreateAndRegisterEvictionPolicy(const OptInstanceConfig &instance_config,
                                                     const std::vector<OptTierConfig> &storage_configs,
                                                     bool hierarchical_eviction_enabled) {
-    // 提供开启多层的配置：hierarchical_eviction_enabled
-    // 开启时：目前只对第一层创建驱逐策略实例，后续层级不逐出
-    // 关闭时：所有层级共享同一个驱逐队列，即只创建一个驱逐策略实例
-    if (instance_eviction_policy_map_.find(instance_config.instance_id()) != instance_eviction_policy_map_.end()) {
+    auto it = instance_tiered_policy_map_.find(instance_config.instance_id());
+    if (it != instance_tiered_policy_map_.end()) {
         KVCM_LOG_WARN("Eviction policy already exists for instance_id: %s", instance_config.instance_id().c_str());
-        return instance_eviction_policy_map_[instance_config.instance_id()];
+        return &it->second;
     }
-    std::shared_ptr<EvictionPolicy> eviction_policy;
+
+    TieredPolicyGroup group;
+
     if (hierarchical_eviction_enabled) {
-        // 分层驱逐，每层单独创建驱逐策略
-        // 目前仅创建第一层的驱逐策略，后续层级不逐出
-        eviction_policy = EvictionPolicyFactory::CreatePolicy(instance_config.eviction_policy_type(),
-                                                              storage_configs.front().unique_name(),
+        // 分层：为每个 tier 各创建独立驱逐策略
+        size_t num_tiers = storage_configs.size();
+        for (size_t i = 0; i < num_tiers; ++i) {
+            auto policy = EvictionPolicyFactory::CreatePolicy(instance_config.eviction_policy_type(),
+                                                              storage_configs[i].unique_name(),
                                                               eviction_config_.eviction_batch_size_per_instance(),
                                                               instance_config.eviction_policy_param());
+            if (!policy) {
+                KVCM_LOG_ERROR("Failed to create eviction policy for tier: %s",
+                               storage_configs[i].unique_name().c_str());
+                return nullptr;
+            }
+            group.policies.push_back(std::move(policy));
+            group.tier_configs.push_back(storage_configs[i]);
+        }
     } else {
-        // 非分层驱逐，所有层级共享同一个驱逐队列
-        // 只创建一个驱逐策略实例
-        eviction_policy = EvictionPolicyFactory::CreatePolicy(instance_config.eviction_policy_type(),
-                                                              "shared",
-                                                              eviction_config_.eviction_batch_size_per_instance(),
-                                                              instance_config.eviction_policy_param());
+        // 非分层: 单 "shared" 策略
+        auto policy = EvictionPolicyFactory::CreatePolicy(instance_config.eviction_policy_type(),
+                                                          "shared",
+                                                          eviction_config_.eviction_batch_size_per_instance(),
+                                                          instance_config.eviction_policy_param());
+        if (!policy) {
+            KVCM_LOG_ERROR("Failed to create eviction policy for instance_id: %s",
+                           instance_config.instance_id().c_str());
+            return nullptr;
+        }
+        group.policies.push_back(std::move(policy));
     }
-    if (!eviction_policy) {
-        KVCM_LOG_ERROR("Failed to create eviction policy for instance_id: %s", instance_config.instance_id().c_str());
-        return nullptr;
-    }
-    instance_eviction_policy_map_[instance_config.instance_id()] = eviction_policy;
-    return eviction_policy;
+
+    auto [inserted_it, success] = instance_tiered_policy_map_.emplace(instance_config.instance_id(), std::move(group));
+    return &inserted_it->second;
 }
 
-std::unordered_map<std::string, std::vector<BlockEntry *>>
-OptEvictionManager::EvictByMode(const std::string &instance_id, const OptInstanceGroupConfig &instance_group_config) {
-    std::unordered_map<std::string, std::vector<BlockEntry *>> evict_blocks;
+std::unordered_map<std::string, std::vector<BlockEntry *>> OptEvictionManager::EvictByMode(
+    const std::string &instance_id, const OptInstanceGroupConfig &instance_group_config, int64_t eviction_timestamp) {
+    std::unordered_map<std::string, std::vector<BlockEntry *>> all_evicted;
 
-    switch (eviction_config_.eviction_mode()) {
-    case EvictionMode::EVICTION_MODE_UNSPECIFIED: {
+    if (eviction_config_.eviction_mode() == EvictionMode::EVICTION_MODE_UNSPECIFIED) {
         KVCM_LOG_WARN("Eviction mode is unspecified, no eviction performed for instance: %s", instance_id.c_str());
-        break;
+        return all_evicted;
     }
-    case EvictionMode::EVICTION_MODE_GROUP_ROUGH: {
-        // 基于实例组的粗略驱逐
-        evict_blocks = EvictByGroupRough(instance_id, instance_group_config);
-        break;
+
+    const bool hierarchical = instance_group_config.hierarchical_eviction_enabled();
+    const bool cascading = hierarchical && instance_group_config.tier_write_mode() == TierWriteMode::CASCADING;
+
+    if (cascading) {
+        // 级联模式：tier 0 → tier_{N-1} 串行，每层执行后即时降级到下一层，再重算下一层 excess
+        const size_t num_tiers = instance_group_config.storages().size();
+        for (size_t tier_idx = 0; tier_idx < num_tiers; ++tier_idx) {
+            size_t excess = GetExcessUsage(instance_group_config, tier_idx);
+            if (excess == 0) {
+                continue;
+            }
+            KVCM_LOG_DEBUG("Cascading eviction: tier %zu excess: %zu bytes", tier_idx, excess);
+            auto tier_evicted = DispatchEviction(instance_id, instance_group_config, tier_idx, excess);
+
+            const bool has_next_tier = (tier_idx + 1 < num_tiers);
+            for (auto &[inst_id, blocks] : tier_evicted) {
+                if (has_next_tier && !blocks.empty()) {
+                    DemoteToNextTier(inst_id, tier_idx + 1, blocks, eviction_timestamp);
+                }
+                auto &vec = all_evicted[inst_id];
+                vec.insert(vec.end(), blocks.begin(), blocks.end());
+            }
+        }
+        return all_evicted;
     }
-    case EvictionMode::EVICTION_MODE_INSTANCE_ROUGH: {
-        // 基于实例的粗略驱逐
-        evict_blocks = EvictByInstanceRough(instance_id, instance_group_config);
-        break;
+
+    // 非级联分支：write-through 分层 或 非分层均汇聚到任务列表后批量执行
+    std::vector<std::pair<std::optional<size_t>, size_t>> tasks;
+    if (hierarchical) {
+        size_t num_tiers = instance_group_config.storages().size();
+        for (size_t tier_idx = 0; tier_idx < num_tiers; ++tier_idx) {
+            size_t excess = GetExcessUsage(instance_group_config, tier_idx);
+            if (excess > 0) {
+                KVCM_LOG_DEBUG("Hierarchical eviction: tier %zu excess: %zu bytes", tier_idx, excess);
+                tasks.emplace_back(tier_idx, excess);
+            }
+        }
+    } else {
+        size_t excess = GetExcessUsage(instance_group_config, std::nullopt);
+        if (excess > 0) {
+            KVCM_LOG_DEBUG("Non-hierarchical eviction: excess: %zu bytes", excess);
+            tasks.emplace_back(std::nullopt, excess);
+        }
     }
-    case EvictionMode::EVICTION_MODE_INSTANCE_PRECISE: {
-        // 基于实例的精确驱逐
-        evict_blocks = EvictByInstancePrecise(instance_id, instance_group_config);
-        break;
+
+    for (const auto &[tier_idx, excess] : tasks) {
+        auto tier_evicted = DispatchEviction(instance_id, instance_group_config, tier_idx, excess);
+        for (auto &[inst_id, blocks] : tier_evicted) {
+            auto &vec = all_evicted[inst_id];
+            vec.insert(vec.end(), blocks.begin(), blocks.end());
+        }
     }
+
+    return all_evicted;
+}
+
+void OptEvictionManager::DemoteToNextTier(const std::string &instance_id,
+                                          size_t next_tier_idx,
+                                          const std::vector<BlockEntry *> &blocks,
+                                          int64_t timestamp) {
+    auto it = instance_tiered_policy_map_.find(instance_id);
+    if (it == instance_tiered_policy_map_.end()) {
+        KVCM_LOG_WARN("DemoteToNextTier: eviction policy not found for instance: %s", instance_id.c_str());
+        return;
     }
-    return evict_blocks;
+    if (next_tier_idx >= it->second.policies.size()) {
+        // 没有下一层 → 彻底丢弃，Demote 无操作
+        return;
+    }
+    auto &next_policy = it->second.policies[next_tier_idx];
+    const std::string &next_tier_name = next_policy->name();
+    for (BlockEntry *block : blocks) {
+        if (block == nullptr) {
+            continue;
+        }
+        // 幂等保护：若 block 已在目标层（模式切换/恢复等边界场景），跳过以避免 LRU 双插入
+        // 正常 CASCADING 链路下 EvictBlocks 已将上层 location 清除，不应出现此分支
+        if (block->location_map.find(next_tier_name) != block->location_map.end()) {
+            KVCM_LOG_WARN("DemoteToNextTier: block already exists in tier %s, skip demote", next_tier_name.c_str());
+            continue;
+        }
+        // tier 级统计：在新 tier 的 location_map 新建条目，TierStat 从零开始
+        AppendBlockLocation(block, next_tier_name, timestamp);
+        // 进入新层 LRU：等价于在新 tier 被写入一次（push_front 给一次复用机会）
+        // 先下沉的批次会被后续批次推向 tail，从而先被驱逐
+        next_policy->OnBlockWritten(block);
+    }
 }
 
 std::unordered_map<std::string, std::vector<BlockEntry *>>
-OptEvictionManager::EvictByGroupRough(const std::string &instance_id,
-                                      const OptInstanceGroupConfig &instance_group_config) {
-    (void)instance_id;
+OptEvictionManager::DispatchEviction(const std::string &instance_id,
+                                     const OptInstanceGroupConfig &instance_group_config,
+                                     std::optional<size_t> tier_idx,
+                                     size_t excess) {
+    switch (eviction_config_.eviction_mode()) {
+    case EvictionMode::EVICTION_MODE_GROUP_ROUGH:
+        return EvictByGroupRough(instance_group_config, tier_idx, excess);
+    case EvictionMode::EVICTION_MODE_INSTANCE_ROUGH:
+        return EvictByInstance(instance_id, instance_group_config, tier_idx, excess, false);
+    case EvictionMode::EVICTION_MODE_INSTANCE_PRECISE:
+        return EvictByInstance(instance_id, instance_group_config, tier_idx, excess, true);
+    default:
+        return {};
+    }
+}
+
+std::unordered_map<std::string, std::vector<BlockEntry *>> OptEvictionManager::EvictByGroupRough(
+    const OptInstanceGroupConfig &instance_group_config, std::optional<size_t> tier_idx, size_t excess) {
     std::unordered_map<std::string, std::vector<BlockEntry *>> evict_blocks;
     auto group_name = instance_group_config.group_name();
-    size_t excess = GetExcessUsageForInstanceInGroup(instance_group_config);
-    if (excess == 0) {
-        // 不需要驱逐
-        return evict_blocks;
+
+    if (tier_idx.has_value()) {
+        KVCM_LOG_DEBUG("GroupRough eviction: tier %zu, excess: %zu bytes", tier_idx.value(), excess);
+    } else {
+        KVCM_LOG_DEBUG("GroupRough eviction: group %s, excess: %zu bytes", group_name.c_str(), excess);
     }
-    KVCM_LOG_DEBUG("Evicting blocks for group: %s, excess: %zu", group_name.c_str(), excess);
-    // 循环驱逐直到达到 excess 数量
-    size_t total_evicted = 0;
+
+    // 循环驱逐直到达到 excess 字节数，轮询所有实例
+    size_t total_evicted_bytes = 0;
     size_t round = 0;
-    while (total_evicted < excess) {
+    while (total_evicted_bytes < excess) {
         round++;
         bool any_evicted_this_round = false;
         for (const auto &instance_config : instance_group_config.instances()) {
-
             auto instance_id_in_group = instance_config.instance_id();
-            auto eviction_policy = GetPolicyOrLog(instance_id_in_group, "EvictByGroupRough");
-            if (!eviction_policy) {
+            auto it = instance_tiered_policy_map_.find(instance_id_in_group);
+            if (it == instance_tiered_policy_map_.end()) {
+                KVCM_LOG_WARN("Eviction policy not found for instance: %s", instance_id_in_group.c_str());
                 continue;
             }
+
+            // 根据 tier_idx 选择策略：有值用分层策略，无值用 shared_policy
+            if (tier_idx.has_value() && tier_idx.value() >= it->second.policies.size()) {
+                continue; // 该实例没有这个 tier 的策略
+            }
+            auto &eviction_policy =
+                tier_idx.has_value() ? it->second.policies[tier_idx.value()] : it->second.shared_policy();
             if (!eviction_policy->NeedCapacityEviction()) {
                 continue;
             }
@@ -116,121 +224,112 @@ OptEvictionManager::EvictByGroupRough(const std::string &instance_id,
                 eviction_policy->EvictBlocks(eviction_config_.eviction_batch_size_per_instance());
             if (!instance_evicted_blocks.empty()) {
                 any_evicted_this_round = true;
-                total_evicted += instance_evicted_blocks.size();
+                const size_t evicted_bytes =
+                    instance_evicted_blocks.size() * static_cast<size_t>(instance_config.bytes_per_block());
+                total_evicted_bytes += evicted_bytes;
                 evict_blocks[instance_id_in_group].insert(evict_blocks[instance_id_in_group].end(),
                                                           instance_evicted_blocks.begin(),
                                                           instance_evicted_blocks.end());
-                KVCM_LOG_DEBUG("Round %zu: Evicted %zu blocks from instance: %s (total: %zu/%zu)",
+                KVCM_LOG_DEBUG("Round %zu: Evicted %zu blocks (%zu bytes) from instance: %s (total: %zu/%zu bytes)",
                                round,
                                instance_evicted_blocks.size(),
+                               evicted_bytes,
                                instance_id_in_group.c_str(),
-                               total_evicted,
+                               total_evicted_bytes,
                                excess);
             }
         }
         // 如果这一轮没有任何实例驱逐到块，说明已经无可驱逐的块了，退出循环
         if (!any_evicted_this_round) {
-            KVCM_LOG_WARN("No more blocks can be evicted from any instance in group: %s (evicted: %zu, required: %zu)",
+            KVCM_LOG_WARN("No more blocks can be evicted from any instance in group: %s (evicted: %zu bytes, required: "
+                          "%zu bytes)",
                           group_name.c_str(),
-                          total_evicted,
+                          total_evicted_bytes,
                           excess);
             break;
         }
     }
-    KVCM_LOG_DEBUG("Eviction completed for group: %s, total evicted: %zu, required: %zu, rounds: %zu",
+    KVCM_LOG_DEBUG("Eviction completed for group: %s, total evicted: %zu bytes, required: %zu bytes, rounds: %zu",
                    group_name.c_str(),
-                   total_evicted,
+                   total_evicted_bytes,
                    excess,
                    round);
     return evict_blocks;
 }
 
 std::unordered_map<std::string, std::vector<BlockEntry *>>
-OptEvictionManager::EvictByInstanceRough(const std::string &instance_id,
-                                         const OptInstanceGroupConfig &instance_group_config) {
+OptEvictionManager::EvictByInstance(const std::string &instance_id,
+                                    const OptInstanceGroupConfig &instance_group_config,
+                                    std::optional<size_t> tier_idx,
+                                    size_t excess,
+                                    bool precise) {
     std::unordered_map<std::string, std::vector<BlockEntry *>> evict_blocks;
-    size_t excess = GetExcessUsageForInstanceInGroup(instance_group_config);
-    if (excess == 0) {
-        // 不需要驱逐
-        return evict_blocks;
-    }
-    KVCM_LOG_DEBUG("Evicting blocks for instance: %s, excess: %zu", instance_id.c_str(), excess);
-    // 循环驱逐直到达到 excess 数量
-    size_t total_evicted = 0;
-    size_t round = 0;
-    auto eviction_policy = GetPolicyOrLog(instance_id, "EvictByInstanceRough");
-    if (!eviction_policy) {
-        return evict_blocks;
-    }
-    if (!eviction_policy->NeedCapacityEviction()) {
-        return evict_blocks;
-    }
-    while (total_evicted < excess) {
-        round++;
-        // 每轮驱逐 eviction_batch_size_per_instance_ 个块
-        auto round_evicted_blocks = eviction_policy->EvictBlocks(eviction_config_.eviction_batch_size_per_instance());
-        if (round_evicted_blocks.empty()) {
-            // 无法驱逐更多块了
-            KVCM_LOG_WARN("No more blocks can be evicted from instance: %s (evicted: %zu, required: %zu)",
-                          instance_id.c_str(),
-                          total_evicted,
-                          excess);
-            break;
-        }
-        evict_blocks[instance_id].insert(
-            evict_blocks[instance_id].end(), round_evicted_blocks.begin(), round_evicted_blocks.end());
-        total_evicted += round_evicted_blocks.size();
-        KVCM_LOG_DEBUG("Round %zu: Evicted %zu blocks from instance: %s (total: %zu/%zu)",
-                       round,
-                       round_evicted_blocks.size(),
+
+    if (tier_idx.has_value()) {
+        KVCM_LOG_DEBUG("Instance%s eviction: instance %s, tier %zu, excess: %zu bytes",
+                       precise ? "Precise" : "Rough",
                        instance_id.c_str(),
-                       total_evicted,
+                       tier_idx.value(),
+                       excess);
+    } else {
+        KVCM_LOG_DEBUG("Instance%s eviction: instance %s, excess: %zu bytes",
+                       precise ? "Precise" : "Rough",
+                       instance_id.c_str(),
                        excess);
     }
-    return evict_blocks;
-}
 
-std::unordered_map<std::string, std::vector<BlockEntry *>>
-OptEvictionManager::EvictByInstancePrecise(const std::string &instance_id,
-                                           const OptInstanceGroupConfig &instance_group_config) {
-    std::unordered_map<std::string, std::vector<BlockEntry *>> evict_blocks;
-    size_t excess = GetExcessUsageForInstanceInGroup(instance_group_config);
-    if (excess == 0) {
-        // 不需要驱逐
+    auto it = instance_tiered_policy_map_.find(instance_id);
+    if (it == instance_tiered_policy_map_.end()) {
+        KVCM_LOG_ERROR("Eviction policy not found for instance: %s", instance_id.c_str());
         return evict_blocks;
     }
-    KVCM_LOG_DEBUG("Evicting blocks for instance: %s, excess: %zu", instance_id.c_str(), excess);
-    auto eviction_policy = GetPolicyOrLog(instance_id, "EvictByInstancePrecise");
-    if (!eviction_policy) {
+    if (tier_idx.has_value() && tier_idx.value() >= it->second.policies.size()) {
+        KVCM_LOG_ERROR("Tier index %zu out of range for instance: %s", tier_idx.value(), instance_id.c_str());
         return evict_blocks;
     }
+
+    // 根据 tier_idx 选择策略：有值用分层策略，无值用 shared_policy
+    auto &eviction_policy = tier_idx.has_value() ? it->second.policies[tier_idx.value()] : it->second.shared_policy();
     if (!eviction_policy->NeedCapacityEviction()) {
         return evict_blocks;
     }
-    size_t total_evicted = 0;
+
+    // Find bytes_per_block for the target instance
+    int64_t bpb = 1;
+    for (const auto &ic : instance_group_config.instances()) {
+        if (ic.instance_id() == instance_id) {
+            bpb = ic.bytes_per_block();
+            break;
+        }
+    }
+
+    size_t total_evicted_bytes = 0;
     size_t round = 0;
-    while (total_evicted < excess) {
+    while (total_evicted_bytes < excess) {
         round++;
-        auto evict_count =
-            std::min(eviction_config_.eviction_batch_size_per_instance(), static_cast<int32_t>(excess - total_evicted));
-        // 每轮驱逐 eviction_batch_size_per_instance_ 个块
+        int32_t evict_count = eviction_config_.eviction_batch_size_per_instance();
+        if (precise) {
+            const size_t remaining_bytes = excess - total_evicted_bytes;
+            const size_t remaining_blocks = (remaining_bytes + static_cast<size_t>(bpb) - 1) / static_cast<size_t>(bpb);
+            evict_count = static_cast<int32_t>(
+                std::min(static_cast<size_t>(eviction_config_.eviction_batch_size_per_instance()), remaining_blocks));
+        }
         auto round_evicted_blocks = eviction_policy->EvictBlocks(evict_count);
         if (round_evicted_blocks.empty()) {
-            // 无法驱逐更多块了
-            KVCM_LOG_WARN("No more blocks can be evicted from instance: %s (evicted: %zu, required: %zu)",
+            KVCM_LOG_WARN("No more blocks can be evicted from instance: %s (evicted: %zu bytes, required: %zu bytes)",
                           instance_id.c_str(),
-                          total_evicted,
+                          total_evicted_bytes,
                           excess);
             break;
         }
         evict_blocks[instance_id].insert(
             evict_blocks[instance_id].end(), round_evicted_blocks.begin(), round_evicted_blocks.end());
-        total_evicted += round_evicted_blocks.size();
-        KVCM_LOG_DEBUG("Round %zu: Evicted %zu blocks from instance: %s (total: %zu/%zu)",
+        total_evicted_bytes += round_evicted_blocks.size() * static_cast<size_t>(bpb);
+        KVCM_LOG_DEBUG("Round %zu: Evicted %zu blocks from instance: %s (total: %zu/%zu bytes)",
                        round,
                        round_evicted_blocks.size(),
                        instance_id.c_str(),
-                       total_evicted,
+                       total_evicted_bytes,
                        excess);
     }
     return evict_blocks;
@@ -240,75 +339,112 @@ std::unordered_map<std::string, std::vector<BlockEntry *>>
 OptEvictionManager::ActiveEvictExpired(const OptInstanceGroupConfig &instance_group_config, int64_t current_timestamp) {
     std::unordered_map<std::string, std::vector<BlockEntry *>> result;
 
-    // 显式过期驱逐入口：由策略实现决定是否有过期语义（非 TTL 默认返回空）
+    // TTL 是 block 级属性，过期时从所有 tier 中清除。
+    // 遍历所有 tier policies 调用 EvictExpired()（各自从内部结构移除），去重后统一 clear location_map。
     for (const auto &instance_config : instance_group_config.instances()) {
         auto instance_id = instance_config.instance_id();
-        auto policy = GetPolicyOrLog(instance_id, "ActiveEvictExpired");
-        if (!policy) {
+        auto it = instance_tiered_policy_map_.find(instance_id);
+        if (it == instance_tiered_policy_map_.end()) {
+            KVCM_LOG_WARN("[ActiveEvictExpired] Eviction policy not found for instance: %s", instance_id.c_str());
             continue;
         }
-        policy->AdvanceClock(current_timestamp);
-        if (policy->size() == 0) {
+        auto &policies = it->second.policies;
+
+        // 从所有 tier 收集过期 block（去重）
+        std::unordered_set<BlockEntry *> expired_set;
+        for (auto &policy : policies) {
+            policy->AdvanceClock(current_timestamp);
+            if (policy->size() == 0) {
+                continue;
+            }
+            auto evicted = policy->EvictExpired();
+            for (auto *block : evicted) {
+                expired_set.insert(block);
+            }
+        }
+
+        if (expired_set.empty()) {
             continue;
         }
-        auto evicted = policy->EvictExpired();
-        if (!evicted.empty()) {
-            result[instance_id] = evicted;
-            KVCM_LOG_DEBUG(
-                "Actively evicted %zu expired blocks from instance: %s", evicted.size(), instance_id.c_str());
+
+        // block 级 TTL 过期：清除所有 tier 的 location
+        for (auto *block : expired_set) {
+            block->location_map.clear();
         }
+
+        result[instance_id] = std::vector<BlockEntry *>(expired_set.begin(), expired_set.end());
+        KVCM_LOG_DEBUG(
+            "Actively evicted %zu expired blocks from instance: %s", expired_set.size(), instance_id.c_str());
     }
 
     return result;
 }
 
-size_t OptEvictionManager::GetCurrentGroupUsage(const OptInstanceGroupConfig &instance_group_config) const {
-    size_t current_group_used = 0;
-
+size_t OptEvictionManager::GetCurrentGroupUsageBytes(const OptInstanceGroupConfig &instance_group_config,
+                                                     std::optional<size_t> tier_idx) const {
+    size_t total_bytes = 0;
     for (const auto &instance_config : instance_group_config.instances()) {
-        current_group_used += instance_eviction_policy_map_.at(instance_config.instance_id())->size();
+        auto it = instance_tiered_policy_map_.find(instance_config.instance_id());
+        if (it == instance_tiered_policy_map_.end())
+            continue;
+        if (tier_idx.has_value()) {
+            // 分层模式：累加指定 tier 的用量(bytes)
+            if (tier_idx.value() < it->second.policies.size()) {
+                total_bytes += it->second.policies[tier_idx.value()]->size() *
+                               static_cast<size_t>(instance_config.bytes_per_block());
+            }
+        } else {
+            // 非分层模式：累加 shared_policy 的用量(bytes)
+            total_bytes += it->second.shared_policy()->size() * static_cast<size_t>(instance_config.bytes_per_block());
+        }
     }
-    return current_group_used;
+    return total_bytes;
 }
 
-size_t OptEvictionManager::GetExcessUsageForInstanceInGroup(const OptInstanceGroupConfig &instance_group_config) const {
-    size_t excess = 0;
-
-    int64_t group_capacity = 0;
-    // TODO 多层容量计算的简单实现，后续优化
-    if (instance_group_config.hierarchical_eviction_enabled()) {
-        group_capacity = instance_group_config.storages().front().capacity();
+size_t OptEvictionManager::GetExcessUsage(const OptInstanceGroupConfig &instance_group_config,
+                                          std::optional<size_t> tier_idx) const {
+    // group_capacity and tier capacity are stored in bytes
+    int64_t capacity = 0;
+    if (tier_idx.has_value()) {
+        // 分层模式：该 tier 的独立容量
+        if (tier_idx.value() >= instance_group_config.storages().size()) {
+            return 0;
+        }
+        capacity = instance_group_config.storages()[tier_idx.value()].capacity();
     } else {
-        group_capacity = instance_group_config.quota_capacity();
+        // 非分层模式：group 整体配额
+        capacity = instance_group_config.quota_capacity();
     }
-    auto used_percentage = instance_group_config.used_percentage();
-    size_t current_group_used = GetCurrentGroupUsage(instance_group_config);
-    size_t projected_used = current_group_used;
-    size_t quota = static_cast<size_t>(group_capacity * used_percentage);
-    if (projected_used > quota) {
-        excess = projected_used - quota;
-    }
-    return excess;
+    size_t current_used_bytes = GetCurrentGroupUsageBytes(instance_group_config, tier_idx);
+    size_t quota_bytes = static_cast<size_t>(capacity * instance_group_config.used_percentage());
+    return current_used_bytes > quota_bytes ? current_used_bytes - quota_bytes : 0;
 }
 
 size_t OptEvictionManager::GetCurrentInstanceUsage(const std::string &instance_id) const {
-    size_t current_instance_used = 0;
-    auto policy = GetPolicyOrLog(instance_id, "GetCurrentInstanceUsage");
-    if (!policy) {
-        return current_instance_used;
+    auto it = instance_tiered_policy_map_.find(instance_id);
+    if (it == instance_tiered_policy_map_.end()) {
+        KVCM_LOG_ERROR("Instance eviction policy not found for instance_id: %s", instance_id.c_str());
+        return 0;
     }
-    current_instance_used = policy->size();
-    return current_instance_used;
+    // 物理存储总占用：累加所有 tier 的 block 数
+    // 非分层模式下只有一个 shared policy，效果等同于原实现
+    size_t total = 0;
+    for (const auto &policy : it->second.policies) {
+        total += policy->size();
+    }
+    return total;
 }
 
-std::shared_ptr<EvictionPolicy> OptEvictionManager::GetPolicyOrLog(const std::string &instance_id,
-                                                                   const char *context) const {
-    auto it = instance_eviction_policy_map_.find(instance_id);
-    if (it == instance_eviction_policy_map_.end()) {
-        KVCM_LOG_WARN("[%s] Eviction policy not found for instance: %s", context, instance_id.c_str());
-        return nullptr;
+std::vector<size_t> OptEvictionManager::GetCurrentInstanceUsagePerTier(const std::string &instance_id) const {
+    auto it = instance_tiered_policy_map_.find(instance_id);
+    if (it == instance_tiered_policy_map_.end())
+        return {};
+    std::vector<size_t> result;
+    result.reserve(it->second.policies.size());
+    for (const auto &policy : it->second.policies) {
+        result.push_back(policy->size());
     }
-    return it->second;
+    return result;
 }
 
 } // namespace kv_cache_manager

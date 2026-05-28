@@ -460,6 +460,11 @@ public: // functions
         return EC_UNIMPLEMENTED;
     }
 
+    // Adjust the charge of a referenced handle by `delta` (may be negative).
+    // The caller must hold an external reference (from Lookup) to the handle.
+    // Does NOT trigger eviction even if usage exceeds capacity after adjustment.
+    virtual void AdjustCharge(Handle * /*handle*/, ssize_t /*delta*/) {}
+
     // Apply a callback to a cache handle. The Cache must ensure the lifetime
     // of the key passed to the callback is valid for the duration of the
     // callback. The handle may not belong to the cache, but is guaranteed to

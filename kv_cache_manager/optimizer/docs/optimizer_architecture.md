@@ -130,7 +130,7 @@ public:
 
 ### 2. OptimizerRunner（优化器运行器）
 
-**职责**：执行 Trace 回放和模拟，处理三种 Trace 类型（GetLocationSchemaTrace、WriteCacheSchemaTrace、DialogTurnSchemaTrace），支持读写分离模式。
+**职责**：执行 Trace 回放和模拟，处理两种 Trace 类型（GetLocationSchemaTrace、WriteCacheSchemaTrace），支持读写分离模式。
 
 ### 3. OptEvictionManager（驱逐管理器）
 
@@ -247,7 +247,7 @@ OptimizerConfig (顶层配置)
 | eviction_mode | 驱逐模式：1=GROUP_ROUGH, 2=INSTANCE_ROUGH, 3=INSTANCE_PRECISE |
 | eviction_batch_size_per_instance | 粗粒度驱逐时的批量大小 |
 | group_name | 实例组唯一标识 |
-| quota_capacity | 组的总容量（blocks） |
+| quota_capacity | 组的总容量（GB） |
 | used_percentage | 实际使用的配额百分比 |
 | instance_id | 实例唯一标识 |
 | block_size | 每个 block 包含的 token 数量 |
@@ -336,8 +336,7 @@ public:
 **核心操作**：
 1. `InsertOnly()` - 仅插入块，不查询
 2. `PrefixQuery()` - 前缀匹配查询
-3. `InsertWithQuery()` - 插入并查询（组合操作）
-4. `ExportForVisualization()` - 导出前缀树用于可视化
+3. `ExportForVisualization()` - 导出前缀树用于可视化
 
 ### Radix Tree 数据结构
 
@@ -386,7 +385,6 @@ struct BlockEntry {
 ```
 OptimizerSchemaTrace (基类)
     ├── GetLocationSchemaTrace (读操作)
-    │   └── DialogTurnSchemaTrace (对话轮次)
     └── WriteCacheSchemaTrace (写操作)
 ```
 
@@ -394,7 +392,7 @@ OptimizerSchemaTrace (基类)
 
 **支持的格式**：
 - **Publisher Log**：转换 KVCacheManager Event Publisher 日志，区分读和写请求
-- **Qwen Bailian**：转换 Qwen Bailian 数据集格式，直接创建 DialogTurnSchemaTrace
+- **Qwen Bailian**：转换 Qwen Bailian 数据集格式，输出读写分离 trace
 
 **转换流程**：
 1. 根据配置文件选择转换器
@@ -419,12 +417,15 @@ struct ResultCounters {
 };
 
 struct ReadRecord {
-    int64_t timestamp_us;
-    size_t external_read_blocks;
-    size_t external_hit_blocks;
-    size_t internal_read_blocks;
-    size_t internal_hit_blocks;
+    int64_t timestamp_ns;
+    size_t remote_read_blocks;
+    size_t remote_hit_blocks;
+    size_t local_read_blocks;
+    size_t local_hit_blocks;
     size_t current_cache_blocks;
+    std::vector<size_t> per_tier_hit_blocks;
+    std::vector<std::string> tier_names;
+    std::vector<size_t> per_tier_blocks;
     std::vector<size_t> blocks_per_instance;
 };
 
@@ -440,12 +441,12 @@ struct Result {
 **文件名**：`{instance_id}_hit_rates.csv`
 
 **主要列**：
-- `TimestampUs` - 时间戳（微秒）
+- `TimestampNs` - 时间戳（纳秒）
 - `CachedBlocksCurrentInstance` - 当前实例的缓存块数
 - `CachedBlocksAllInstance` - 所有实例的总缓存块数
 - `HitRate` - 当前命中率
 - `AccHitRate` - 累积总命中率
-- `InternalHitRate` / `ExternalHitRate` - 内部/外部命中率
+- `AccLocalHitRate` / `AccRemoteHitRate` - 本地/远端累积命中率
 
 ---
 
@@ -500,11 +501,13 @@ bazel run //kv_cache_manager/optimizer/analysis/script:visualize_tree -- \
 
 **功能**：生成在不同容量配置下的多个 instance 命中率曲线，用于评估容量与命中率的权衡关系，仅使用配置中的驱逐策略。
 
+> **适用范围**：Trade-off 分析仅适用于非分层模式。在分层模式（`hierarchical_eviction_enabled=true`）下，容量扫描仅修改 `quota_capacity`，不影响各 tier 独立的 `storages[i].capacity`，因此无法产生有意义的容量-性能权衡结果。
+
 **运行方式**：
 ```bash
 bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff_analysis_run_by_instances -- \
     -c /path/to/config.json \
-    --warmup-capacity 30000000 \
+    --warmup-capacity 10000 \
     --num-points 40 \
     --hit-rate-type total \
     --max-workers 4
@@ -512,9 +515,9 @@ bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff_analysis_run_by_
 
 **参数说明**：
 - `-c, --config` - 配置文件路径
-- `--warmup-capacity` - Warmup 阶段使用的大容量（默认 30000000）
+- `--warmup-capacity` - Warmup 阶段使用的大容量，单位 GB（默认 10000）
 - `--num-points` - 容量采样点数量（默认 40）
-- `--hit-rate-type` - 命中率类型：total/internal/external/all（默认 total）
+- `--hit-rate-type` - 命中率类型：total/local/remote/all（默认 total）
 - `--max-workers` - 并行执行的最大线程数（默认 4）
 
 **输出**：`{output_result_path}/pareto_curve_{hit_rate_type}.png`
@@ -525,11 +528,13 @@ bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff_analysis_run_by_
 
 **功能**：对比每个 instance 多个驱逐策略在不同容量配置下的性能表现，所有 instance 统一用一种类型的驱逐策略。
 
+> **适用范围**：同单策略 Trade-off 分析，仅适用于非分层模式。
+
 **运行方式**：
 ```bash
 bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff_analysis_run_by_policies -- \
     -c /path/to/config.json \
-    --warmup-capacity 30000000 \
+    --warmup-capacity 10000 \
     --eviction-policies lru random_lru leaf_aware_lru \
     --num-points 40 \
     --hit-rate-type total \
@@ -538,10 +543,10 @@ bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff_analysis_run_by_
 
 **参数说明**：
 - `-c, --config` - 配置文件路径
-- `--warmup-capacity` - Warmup 阶段使用的大容量（默认 30000000）
+- `--warmup-capacity` - Warmup 阶段使用的大容量，单位 GB（默认 10000）
 - `--eviction-policies` - 要对比的驱逐策略列表（默认 lru random_lru leaf_aware_lru）
 - `--num-points` - 容量采样点数量（默认 40）
-- `--hit-rate-type` - 命中率类型：total/internal/external/all（默认 total）
+- `--hit-rate-type` - 命中率类型：total/local/remote/all（默认 total）
 - `--max-workers` - 并行执行的最大线程数（默认 4）
 
 **输出**：`{output_result_path}/multi_policy_{hit_rate_type}.png`

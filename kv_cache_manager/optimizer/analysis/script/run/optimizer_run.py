@@ -14,8 +14,8 @@ import time
 
 from kv_cache_manager.optimizer.pybind import kvcm_py_optimizer
 
-from utils.optimizer_runner import init_kvcm_logger
-from plot.hit_rate_plot import plot_multi_instance_analysis
+from utils.optimizer_runner import init_kvcm_logger, extract_bytes_per_block_map
+from plot.hit_rate_plot import plot_multi_instance_analysis, plot_per_tier_timeseries
 
 
 def parse_args():
@@ -26,6 +26,8 @@ def parse_args():
                         help="是否生成时序命中率图表 (默认: 不生成)")
     parser.add_argument("--export-lifecycle", action="store_true", default=False,
                         help="导出 lifecycle CSV（警告：可能生成超大文件）")
+    parser.add_argument("--enable-template-analysis", action="store_true", default=False,
+                        help="启用模板前缀分析（会拖慢回放速度）")
     return parser.parse_args()
 
 
@@ -53,7 +55,10 @@ def main():
     t2 = time.time()
     print("\n[2/4] Creating OptimizerManager...")
     # 关键: 如果要导出lifecycle，必须在构造时开启tracking
-    manager = kvcm_py_optimizer.OptimizerManager(config, enable_lifecycle_tracking=args.export_lifecycle)
+    manager = kvcm_py_optimizer.OptimizerManager(
+        config,
+        enable_lifecycle_tracking=args.export_lifecycle,
+        enable_template_analysis=args.enable_template_analysis)
     if manager is None:
         print("Failed to create OptimizerManager")
         sys.exit(1)
@@ -63,6 +68,8 @@ def main():
     print("      Output: {}".format(output_path))
     if args.export_lifecycle:
         print("      ⚠️  Lifecycle tracking enabled (will use ~10GB extra memory)")
+    if args.enable_template_analysis:
+        print("      ⚠️  Template prefix analysis enabled (slower replay)")
 
     t3 = time.time()
     print("\n[3/4] Running simulation...")
@@ -80,7 +87,13 @@ def main():
     if args.draw_chart:
         t5 = time.time()
         print("\n[5/5] Generating charts...")
-        plot_multi_instance_analysis(output_path, output_path)
+        bytes_per_block_map = extract_bytes_per_block_map(args.config)
+        plot_multi_instance_analysis(
+            output_path, output_path,
+            show_template=args.enable_template_analysis,
+            bytes_per_block_map=bytes_per_block_map,
+        )
+        plot_per_tier_timeseries(output_path, output_path)
         print("      Charts done: {:.2f}s".format(time.time() - t5))
     else:
         print("\n[5/5] Skipping chart generation.")

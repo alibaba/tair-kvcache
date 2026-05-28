@@ -30,12 +30,23 @@ public:
     std::vector<ErrorCode> Upsert(const std::vector<std::string> &keys,
                                   const std::vector<std::map<std::string, std::string>> &field_maps);
     std::vector<ErrorCode> Delete(const std::vector<std::string> &keys);
+    std::vector<ErrorCode> DeleteFields(const std::vector<std::string> &keys,
+                                        const std::vector<std::vector<std::string>> &field_names_vec);
     std::vector<ErrorCode> Get(const std::vector<std::string> &keys,
                                const std::vector<std::string> &field_names,
+                               std::vector<std::map<std::string, std::string>> &out_field_maps);
+    std::vector<ErrorCode> Get(const std::vector<std::string> &keys,
+                               const std::vector<std::vector<std::string>> &field_names_vec,
                                std::vector<std::map<std::string, std::string>> &out_field_maps);
     std::vector<ErrorCode> GetAllFields(const std::vector<std::string> &keys,
                                         std::vector<std::map<std::string, std::string>> &out_field_maps);
     std::vector<ErrorCode> Exists(const std::vector<std::string> &keys, std::vector<bool> &out_is_exist_vec);
+    std::vector<ErrorCode> ExistsFieldWithPrefix(const std::vector<std::string> &keys,
+                                                 const std::string &field_prefix,
+                                                 std::vector<bool> &out_exists_vec);
+    std::vector<ErrorCode> GetFieldNamesWithPrefix(const std::vector<std::string> &keys,
+                                                   const std::string &field_prefix,
+                                                   std::vector<std::vector<std::string>> &out_field_names_vec);
     ErrorCode Scan(const std::string &matching_prefix,
                    const std::string &cursor,
                    const int64_t limit,
@@ -65,6 +76,7 @@ private:
     std::string user_info_;
     std::string host_;
     int64_t port_ = 0;
+    int64_t db_ = 0;
     int64_t timeout_ms_ = 2000;
     int64_t retry_count_ = 2;
     int64_t randomkey_batch_num_ = 20;

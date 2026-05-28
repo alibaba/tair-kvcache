@@ -16,8 +16,8 @@
 #include "kv_cache_manager/config/trigger_strategy.h"
 #include "kv_cache_manager/data_storage/common_define.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
-#include "kv_cache_manager/manager/cache_location.h"
 #include "kv_cache_manager/manager/cache_location_view.h"
+#include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/protocol/protobuf/admin_service.pb.h"
 #include "kv_cache_manager/protocol/protobuf/meta_service.pb.h"
 namespace kv_cache_manager {
@@ -298,6 +298,10 @@ void ProtoConvert::DataStorageTypeToProto(const DataStorageType &data_storage_ty
         *proto_data_storage_type = T::ST_DUMMY;
         break;
     }
+    case DataStorageType::DATA_STORAGE_TYPE_VINEYARD: {
+        *proto_data_storage_type = T::ST_VINEYARD;
+        break;
+    }
     default: {
         // Handle unknown storage type case if necessary
         break;
@@ -336,6 +340,10 @@ void ProtoConvert::DataStorageTypeFromProto(const T proto_data_storage_type, Dat
     }
     case T::ST_DUMMY: {
         data_storage_type_info = DataStorageType::DATA_STORAGE_TYPE_DUMMY;
+        break;
+    }
+    case T::ST_VINEYARD: {
+        data_storage_type_info = DataStorageType::DATA_STORAGE_TYPE_VINEYARD;
         break;
     }
     default: {

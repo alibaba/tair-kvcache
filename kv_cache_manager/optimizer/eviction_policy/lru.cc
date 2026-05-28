@@ -5,7 +5,7 @@
 namespace kv_cache_manager {
 
 LruEvictionPolicy::LruEvictionPolicy(const std::string &name, const LruParams &params)
-    : name_(name)
+    : EvictionPolicy(name)
     , shard_count_(params.shard_count > 0 ? params.shard_count : 1)
     , sample_times_(params.sample_times > 0 ? params.sample_times : 1)
     , amplification_factor_(params.eviction_amplification_factor > 1.0 ? params.eviction_amplification_factor : 1.0)
@@ -28,7 +28,7 @@ int64_t LruEvictionPolicy::GetShardTailTime(int32_t shard_index) const {
         return INT64_MAX;
     }
     auto *lru_node = static_cast<const LRUListNode *>(tail);
-    return lru_node->payload_ ? lru_node->payload_->last_access_time : INT64_MAX;
+    return lru_node->payload_ ? GetTierAccessTime(lru_node->payload_) : INT64_MAX;
 }
 
 void LruEvictionPolicy::OnBlockWritten(BlockEntry *block) {
@@ -53,9 +53,9 @@ void LruEvictionPolicy::OnBlockAccessed(BlockEntry *block, int64_t timestamp) {
     if (it == node_map_.end()) {
         return;
     }
+    // block 级 / tier 级 last_access_time 由 RadixTreeIndex::OnBlockAccessed 统一写入；
+    // 本函数仅负责将 block 在 LRU 链表中的物理位置刷新到头部
     LRUListNode *node = it->second;
-    block->last_access_time = timestamp;
-    block->access_count += 1;
     shard_lists_[GetShardIndex(block)].move_to_front(node);
 }
 
@@ -91,13 +91,7 @@ void LruEvictionPolicy::CommitEviction(const std::vector<CandidateEntry> &candid
         BlockEntry *block = entry.block;
         evicted_blocks.push_back(block);
         node_map_.erase(block);
-        if (name_ == "shared") {
-            // 全局驱逐时，清空所有location信息
-            block->location_map.clear();
-        } else {
-            // 分层驱逐时，仅清除当前tier的location信息
-            block->location_map.erase(name_); // 驱逐时清除该tier的location信息
-        }
+        ClearBlockLocation(block);
         delete entry.node;
     }
 }
@@ -147,8 +141,8 @@ std::vector<BlockEntry *> LruEvictionPolicy::EvictBlocks(size_t count) {
         std::partial_sort(candidates.begin(),
                           candidates.begin() + count,
                           candidates.end(),
-                          [](const CandidateEntry &a, const CandidateEntry &b) {
-                              return a.block->last_access_time < b.block->last_access_time;
+                          [this](const CandidateEntry &a, const CandidateEntry &b) {
+                              return GetTierAccessTime(a.block) < GetTierAccessTime(b.block);
                           });
 
         std::vector<CandidateEntry> to_evict(candidates.begin(), candidates.begin() + count);
@@ -162,15 +156,8 @@ std::vector<BlockEntry *> LruEvictionPolicy::EvictBlocks(size_t count) {
 }
 
 void LruEvictionPolicy::Clear() {
-    // 清空所有blocks的location信息
     for (auto &[block, node] : node_map_) {
-        if (name_ == "shared") {
-            // 全局驱逐时，清空所有location信息
-            block->location_map.clear();
-        } else {
-            // 分层驱逐时，仅清除当前tier的location信息
-            block->location_map.erase(name_);
-        }
+        ClearBlockLocation(block);
     }
     // 清空LRU链表和映射
     for (auto &shard_list : shard_lists_) {

@@ -104,8 +104,7 @@ bool MooncakeStorageSpec::ValidateRequiredFields(std::string &invalid_fields) co
 }
 std::string TairMemPoolStorageSpec::ToString() const {
     std::ostringstream oss;
-    oss << "enable_vipserver: " << enable_vipserver_ << ", domain: " << domain_
-        << ", vipserver_domain: " << vipserver_domain_ << ", timeout: " << timeout_;
+    oss << "domain: " << domain_ << ", timeout: " << timeout_ << ", service_discovery_url: " << service_discovery_url_;
     return oss.str();
 }
 bool TairMemPoolStorageSpec::ValidateRequiredFields(std::string &invalid_fields) const {
@@ -162,6 +161,8 @@ std::string ToString(const DataStorageType &type) {
         return "file";
     case DataStorageType::DATA_STORAGE_TYPE_DUMMY:
         return "dummy";
+    case DataStorageType::DATA_STORAGE_TYPE_VINEYARD:
+        return "vineyard";
     default:
         return "unrecognized";
     }
@@ -180,6 +181,8 @@ DataStorageType ToDataStorageType(const std::string &type) {
         return DataStorageType::DATA_STORAGE_TYPE_NFS;
     } else if (type == "dummy") {
         return DataStorageType::DATA_STORAGE_TYPE_DUMMY;
+    } else if (type == "vineyard") {
+        return DataStorageType::DATA_STORAGE_TYPE_VINEYARD;
     } else {
         return DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
     }
@@ -250,18 +253,31 @@ void MooncakeStorageSpec::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffe
 
 // TairMemPoolStorageSpec
 bool TairMemPoolStorageSpec::FromRapidValue(const rapidjson::Value &rapid_value) {
-    KVCM_JSON_GET_MACRO(rapid_value, "enable_vipserver", enable_vipserver_);
-    KVCM_JSON_GET_MACRO(rapid_value, "vipserver_domain", vipserver_domain_);
     KVCM_JSON_GET_MACRO(rapid_value, "domain", domain_);
     KVCM_JSON_GET_MACRO(rapid_value, "timeout", timeout_);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "service_discovery_url", service_discovery_url_, std::string(""));
+
+    // 向后兼容：把已废弃的 enable_vipserver / vipserver_domain 自动迁移成 service_discovery_url，
+    // 兼容旧 admin 工具 / 旧持久化数据。新字段 service_discovery_url 优先级更高，
+    // 已显式指定时不会被旧字段覆盖。
+    if (service_discovery_url_.empty()) {
+        bool legacy_enable_vipserver = false;
+        std::string legacy_vipserver_domain;
+        if (!Get(rapid_value, "enable_vipserver", legacy_enable_vipserver, false) ||
+            !Get(rapid_value, "vipserver_domain", legacy_vipserver_domain, std::string(""))) {
+            return false;
+        }
+        if (legacy_enable_vipserver && !legacy_vipserver_domain.empty()) {
+            service_discovery_url_ = "vipserver://" + legacy_vipserver_domain;
+        }
+    }
     return true;
 }
 
 void TairMemPoolStorageSpec::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
-    Put(writer, "enable_vipserver", enable_vipserver_);
-    Put(writer, "vipserver_domain", vipserver_domain_);
     Put(writer, "domain", domain_);
     Put(writer, "timeout", timeout_);
+    Put(writer, "service_discovery_url", service_discovery_url_);
 }
 
 bool NfsStorageSpec::FromRapidValue(const rapidjson::Value &rapid_value) {
@@ -335,6 +351,8 @@ bool StorageConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
         storage_spec_ = tmp;
     } else if (type_ == DataStorageType::DATA_STORAGE_TYPE_DUMMY) {
         auto tmp = std::make_shared<DummyStorageSpec>();
+    } else if (type_ == DataStorageType::DATA_STORAGE_TYPE_VINEYARD) {
+        auto tmp = std::make_shared<VineyardStorageSpec>();
         KVCM_JSON_GET_MACRO(rapid_value, "storage_spec", tmp);
         storage_spec_ = tmp;
     } else {
@@ -369,4 +387,59 @@ bool StorageConfig::ValidateRequiredFields(std::string &invalid_fields) const {
     }
     return valid;
 }
+
+// VineyardStorageSpec
+bool VineyardStorageSpec::FromRapidValue(const rapidjson::Value &rapid_value) {
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "cluster_name", cluster_name_, std::string(""));
+    KVCM_JSON_GET_DEFAULT_MACRO(
+        rapid_value, "heartbeat_timeout_ms", heartbeat_timeout_ms_, static_cast<int64_t>(kDefaultHeartbeatTimeoutMs));
+    KVCM_JSON_GET_DEFAULT_MACRO(
+        rapid_value, "cleanup_grace_ms", cleanup_grace_ms_, static_cast<int64_t>(kDefaultCleanupGraceMs));
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value,
+                                "liveness_check_interval_ms",
+                                liveness_check_interval_ms_,
+                                static_cast<int64_t>(kDefaultLivenessCheckIntervalMs));
+    return true;
+}
+
+void VineyardStorageSpec::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
+    Put(writer, "cluster_name", cluster_name_);
+    Put(writer, "heartbeat_timeout_ms", heartbeat_timeout_ms_);
+    Put(writer, "cleanup_grace_ms", cleanup_grace_ms_);
+    Put(writer, "liveness_check_interval_ms", liveness_check_interval_ms_);
+}
+
+bool VineyardStorageSpec::ValidateRequiredFields(std::string &invalid_fields) const {
+    bool valid = true;
+    std::string local_invalid_fields;
+    if (cluster_name_.empty()) {
+        valid = false;
+        local_invalid_fields += "{cluster_name}";
+    }
+    if (heartbeat_timeout_ms_ <= 0) {
+        valid = false;
+        local_invalid_fields += "{heartbeat_timeout_ms}";
+    }
+    if (cleanup_grace_ms_ <= 0) {
+        valid = false;
+        local_invalid_fields += "{cleanup_grace_ms}";
+    }
+    if (liveness_check_interval_ms_ <= 0) {
+        valid = false;
+        local_invalid_fields += "{liveness_check_interval_ms}";
+    }
+    if (!valid) {
+        invalid_fields += "{VineyardStorageSpec: " + local_invalid_fields + "}";
+    }
+    return valid;
+}
+
+std::string VineyardStorageSpec::ToString() const {
+    std::ostringstream oss;
+    oss << "cluster_name: " << cluster_name_ << ", heartbeat_timeout_ms: " << heartbeat_timeout_ms_
+        << ", cleanup_grace_ms: " << cleanup_grace_ms_
+        << ", liveness_check_interval_ms: " << liveness_check_interval_ms_;
+    return oss.str();
+}
+
 } // namespace kv_cache_manager

@@ -76,3 +76,27 @@ TEST_F(ServerConfigTest, TestSimple) {
         ASSERT_EQ(3, config.GetLogLevel());
     }
 }
+
+TEST_F(ServerConfigTest, TestUnderscoreEnvFallback) {
+    // 仅设置下划线版本，验证 fallback 生效
+    {
+        ServerConfig config;
+        std::unordered_map<std::string, std::string> environ;
+        ScopedEnv env1("kvcm_registry_storage_uri", "redis://127.0.0.1:6379?auth=abc");
+        ScopedEnv env2("kvcm_service_rpc_port", "7381");
+        ASSERT_TRUE(config.Parse("", environ));
+        ASSERT_TRUE(config.Check());
+        ASSERT_EQ("redis://127.0.0.1:6379?auth=abc", config.GetRegistryStorageUri());
+        ASSERT_EQ(7381, config.GetServiceRpcPort());
+    }
+    // 同时设置 dotted 和 underscore 版本，验证 dotted 优先
+    {
+        ServerConfig config;
+        std::unordered_map<std::string, std::string> environ;
+        ScopedEnv env1("kvcm.registry_storage.uri", "redis://dotted-wins");
+        ScopedEnv env2("kvcm_registry_storage_uri", "redis://underscore-loses");
+        ASSERT_TRUE(config.Parse("", environ));
+        ASSERT_TRUE(config.Check());
+        ASSERT_EQ("redis://dotted-wins", config.GetRegistryStorageUri());
+    }
+}

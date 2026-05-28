@@ -12,7 +12,6 @@ namespace kv_cache_manager {
 
 class LruEvictionPolicy : public EvictionPolicy {
 private:
-    std::string name_;
     int32_t shard_count_ = 1;
     int32_t sample_times_ = 1;
     double amplification_factor_ = 1.0;
@@ -43,10 +42,6 @@ private:
 public:
     explicit LruEvictionPolicy(const std::string &name, const LruParams &params);
     ~LruEvictionPolicy() override;
-
-    std::string name() const override { return name_; }
-    void set_name(const std::string &name) override { name_ = name; }
-    // TODO 应该根据块的last_access_time来维护LRU顺序
     void OnBlockWritten(BlockEntry *block) override;
     void OnNodeWritten(std::vector<BlockEntry *> &blocks) override;
     std::vector<BlockEntry *> EvictBlocks(size_t count) override;

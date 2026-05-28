@@ -9,7 +9,7 @@
 namespace kv_cache_manager {
 
 // StandardTraceLoader 加载标准格式的trace文件
-// 支持三种trace类型的自动识别: GetLocationSchemaTrace, WriteCacheSchemaTrace, DialogTurnSchemaTrace
+// 支持两种trace类型的自动识别: GetLocationSchemaTrace, WriteCacheSchemaTrace
 class StandardTraceLoader {
 public:
     StandardTraceLoader() = default;

@@ -47,9 +47,8 @@ void ProtoConvert::StorageConfigToProto(const StorageConfig &storage_config,
         // proto_storage_config->set_global_unique_name(tair_mem_pool_storage.get_global_unique_name());
         auto *tair_mem_pool = proto_storage_config->mutable_tair_mem_pool();
         tair_mem_pool->set_domain(tair_mem_pool_storage.domain());
-        tair_mem_pool->set_vipserver_domain(tair_mem_pool_storage.vipserver_domain());
         tair_mem_pool->set_timeout(tair_mem_pool_storage.timeout());
-        tair_mem_pool->set_enable_vipserver(tair_mem_pool_storage.enable_vipserver());
+        tair_mem_pool->set_service_discovery_url(tair_mem_pool_storage.service_discovery_url());
     } else if (type == DataStorageType::DATA_STORAGE_TYPE_NFS) {
         const auto &nfs_storage = *std::dynamic_pointer_cast<NfsStorageSpec>(storage_config.storage_spec());
         auto *nfs = proto_storage_config->mutable_nfs();
@@ -60,6 +59,10 @@ void ProtoConvert::StorageConfigToProto(const StorageConfig &storage_config,
         auto *dummy = proto_storage_config->mutable_dummy();
         dummy->set_root_path(dummy_storage.root_path());
         dummy->set_key_count_per_file(dummy_storage.key_count_per_file());
+    } else if (type == DataStorageType::DATA_STORAGE_TYPE_VINEYARD) {
+        const auto &vineyard_storage = *std::dynamic_pointer_cast<VineyardStorageSpec>(storage_config.storage_spec());
+        auto *vineyard = proto_storage_config->mutable_vineyard();
+        vineyard->set_cluster_name(vineyard_storage.cluster_name());
     }
 }
 
@@ -109,9 +112,8 @@ void ProtoConvert::StorageFromProto(const proto::admin::StorageConfig *proto_sto
     case proto::admin::StorageConfig::kTairMemPool: {
         TairMemPoolStorageSpec spec;
         spec.set_domain(proto_storage_config->tair_mem_pool().domain());
-        spec.set_vipserver_domain(proto_storage_config->tair_mem_pool().vipserver_domain());
         spec.set_timeout(proto_storage_config->tair_mem_pool().timeout());
-        spec.set_enable_vipserver(proto_storage_config->tair_mem_pool().enable_vipserver());
+        spec.set_service_discovery_url(proto_storage_config->tair_mem_pool().service_discovery_url());
         storage_config.set_storage_spec(std::make_shared<TairMemPoolStorageSpec>(spec));
         storage_config.set_type(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL);
         break;
@@ -130,6 +132,13 @@ void ProtoConvert::StorageFromProto(const proto::admin::StorageConfig *proto_sto
         spec.set_key_count_per_file(proto_storage_config->dummy().key_count_per_file());
         storage_config.set_storage_spec(std::make_shared<DummyStorageSpec>(spec));
         storage_config.set_type(DataStorageType::DATA_STORAGE_TYPE_DUMMY);
+        break;
+    }
+    case proto::admin::StorageConfig::kVineyard: {
+        VineyardStorageSpec spec;
+        spec.set_cluster_name(proto_storage_config->vineyard().cluster_name());
+        storage_config.set_storage_spec(std::make_shared<VineyardStorageSpec>(spec));
+        storage_config.set_type(DataStorageType::DATA_STORAGE_TYPE_VINEYARD);
         break;
     }
     default:
@@ -235,16 +244,16 @@ void ProtoConvert::CacheConfigFromProto(const proto::admin::CacheConfig *proto_c
         proto_cache_config->meta_indexer_config().meta_storage_backend_config().storage_uri());
     meta_indexer_config->SetMetaStorageBackendConfig(meta_storage_backend_config);
 
-    // 转换meta_cache_policy_config
-    auto meta_cache_policy_config = std::make_shared<MetaCachePolicyConfig>();
-    meta_cache_policy_config->SetCapacity(
-        proto_cache_config->meta_indexer_config().meta_cache_policy_config().capacity());
-    meta_cache_policy_config->SetType(proto_cache_config->meta_indexer_config().meta_cache_policy_config().type());
-    meta_cache_policy_config->SetCacheShardBits(
-        proto_cache_config->meta_indexer_config().meta_cache_policy_config().cache_shard_bits());
-    meta_cache_policy_config->SetHighPriPoolRatio(
-        proto_cache_config->meta_indexer_config().meta_cache_policy_config().high_pri_pool_ratio());
-    meta_indexer_config->SetMetaCachePolicyConfig(meta_cache_policy_config);
+    // 转换meta_cache_policy_config（仅当 proto 中实际配置了时才填充）
+    const auto &proto_cache_policy = proto_cache_config->meta_indexer_config().meta_cache_policy_config();
+    if (!proto_cache_policy.type().empty()) {
+        auto meta_cache_policy_config = std::make_shared<MetaCachePolicyConfig>();
+        meta_cache_policy_config->SetCapacity(proto_cache_policy.capacity());
+        meta_cache_policy_config->SetType(proto_cache_policy.type());
+        meta_cache_policy_config->SetCacheShardBits(proto_cache_policy.cache_shard_bits());
+        meta_cache_policy_config->SetHighPriPoolRatio(proto_cache_policy.high_pri_pool_ratio());
+        meta_indexer_config->SetMetaCachePolicyConfig(meta_cache_policy_config);
+    }
 
     cache_config_info.set_meta_indexer_config(meta_indexer_config);
 }

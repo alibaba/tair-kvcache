@@ -297,6 +297,26 @@ TEST_F(DummyBackendTest, TestLockAndUnLockReturnOk) {
     }
 }
 
+TEST_F(DummyBackendTest, TestMetricsCollectorTagsAfterOpen) {
+    DummyBackend backend(metrics_registry_);
+    auto config = MakeConfig(test_root_);
+    ASSERT_EQ(EC_OK, backend.Open(config, "trace_1"));
+
+    auto collector = backend.GetMetricsCollector();
+    ASSERT_NE(nullptr, collector);
+
+    const auto &tags = collector->GetMetricsTags();
+    ASSERT_EQ(2u, tags.size());
+
+    auto type_it = tags.find("type");
+    ASSERT_NE(tags.end(), type_it);
+    EXPECT_EQ(ToString(DataStorageType::DATA_STORAGE_TYPE_DUMMY), type_it->second);
+
+    auto unique_it = tags.find("unique_name");
+    ASSERT_NE(tags.end(), unique_it);
+    EXPECT_EQ("test_dummy", unique_it->second);
+}
+
 TEST_F(DummyBackendTest, TestCreateThenExistRoundTrip) {
     // end-to-end: Create produces URIs, then Exist and MightExist
     // confirm the files were NOT actually written (Create does not

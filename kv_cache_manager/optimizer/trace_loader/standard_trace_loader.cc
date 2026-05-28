@@ -48,12 +48,7 @@ StandardTraceLoader::LoadFromFile(const std::string &trace_file_path) {
 
         // 优先使用type字段
         if (has_type_field) {
-            if (type_str == "dialog") {
-                auto dialog_trace = std::make_shared<DialogTurnSchemaTrace>();
-                if (dialog_trace->FromJsonString(line)) {
-                    trace = dialog_trace;
-                }
-            } else if (type_str == "get") {
+            if (type_str == "get") {
                 auto get_trace = std::make_shared<GetLocationSchemaTrace>();
                 if (get_trace->FromJsonString(line)) {
                     trace = get_trace;
@@ -68,21 +63,11 @@ StandardTraceLoader::LoadFromFile(const std::string &trace_file_path) {
             }
         } else {
             // Fallback: 使用字段推断
-            bool has_input_len = doc.HasMember("input_len");
-            bool has_output_len = doc.HasMember("output_len");
-            bool has_total_keys = doc.HasMember("total_keys");
             bool has_query_type = doc.HasMember("query_type");
             bool has_block_mask = doc.HasMember("block_mask");
 
-            // DialogTurnSchemaTrace: 有 input_len, output_len, total_keys
-            if (has_input_len && has_output_len && has_total_keys) {
-                auto dialog_trace = std::make_shared<DialogTurnSchemaTrace>();
-                if (dialog_trace->FromJsonString(line)) {
-                    trace = dialog_trace;
-                }
-            }
-            // GetLocationSchemaTrace: 有 query_type 和 block_mask，但没有 input_len
-            else if (has_query_type && has_block_mask && !has_input_len) {
+            // GetLocationSchemaTrace: 有 query_type 和 block_mask
+            if (has_query_type && has_block_mask) {
                 auto get_trace = std::make_shared<GetLocationSchemaTrace>();
                 if (get_trace->FromJsonString(line)) {
                     trace = get_trace;
@@ -117,29 +102,13 @@ bool StandardTraceLoader::ValidateTrace(const OptimizerSchemaTrace &trace) {
         KVCM_LOG_ERROR("Validation failed: empty instance_id");
         return false;
     }
-    if (trace.timestamp_us() <= 0) {
-        KVCM_LOG_ERROR("Validation failed: invalid timestamp_us");
+    if (trace.timestamp_ns() <= 0) {
+        KVCM_LOG_ERROR("Validation failed: invalid timestamp_ns");
         return false;
     }
     if (trace.keys().empty()) {
         KVCM_LOG_ERROR("Validation failed: empty keys");
         return false;
-    }
-
-    // 对于DialogTurnSchemaTrace,额外验证
-    if (auto dialog_trace = dynamic_cast<const DialogTurnSchemaTrace *>(&trace)) {
-        if (dialog_trace->input_len() <= 0) {
-            KVCM_LOG_ERROR("Validation failed: invalid input_len");
-            return false;
-        }
-        if (dialog_trace->output_len() < 0) {
-            KVCM_LOG_ERROR("Validation failed: negative output_len");
-            return false;
-        }
-        if (dialog_trace->total_keys().empty()) {
-            KVCM_LOG_ERROR("Validation failed: empty total_keys");
-            return false;
-        }
     }
 
     return true;

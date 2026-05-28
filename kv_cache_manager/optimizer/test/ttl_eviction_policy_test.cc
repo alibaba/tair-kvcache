@@ -11,12 +11,12 @@ class TtlEvictionPolicyTest : public TESTBASE {
 protected:
     void SetUp() override { policy_ = std::make_shared<TtlEvictionPolicy>("shared", false); }
 
-    BlockEntry MakeBlock(int64_t key, int64_t last_access = 0, int64_t ttl_us = 0, bool with_location = false) {
+    BlockEntry MakeBlock(int64_t key, int64_t last_access = 0, int64_t ttl_ns = 0, bool with_location = false) {
         BlockEntry b;
         b.key = key;
         b.last_access_time = last_access;
         b.ttl_anchor_time = last_access;
-        b.ttl_us = ttl_us;
+        b.ttl_ns = ttl_ns;
         if (with_location) {
             b.location_map["shared"] = TierStat{};
         }
@@ -141,10 +141,13 @@ TEST_F(TtlEvictionPolicyTest, AccessRefreshesTtl) {
 
     EXPECT_FALSE(b.IsExpired(1400));
 
+    // 模拟 RadixTreeIndex::OnBlockAccessed 的 block 级字段更新
+    // （生产路径中 block 级统计由 RadixTreeIndex 统一负责，策略层不写）
+    b.last_access_time = 1400;
     policy_->OnBlockAccessedWithOptions(&b, 1400, true);
     EXPECT_EQ(b.last_access_time, 1400);
 
-    // t=1800: 距新 last_access 400us，仍未过期
+    // t=1800: 距新 ttl_anchor 400us，仍未过期
     EXPECT_FALSE(b.IsExpired(1800));
 
     // t=1901: 超过 1400+500=1900，过期

@@ -29,4 +29,25 @@ std::string ToString(const EvictionPolicyType &type) {
     }
 }
 
+TierWriteMode ToTierWriteMode(const std::string &str) {
+    if (str == "write_through") {
+        return TierWriteMode::WRITE_THROUGH;
+    } else if (str == "cascading") {
+        return TierWriteMode::CASCADING;
+    }
+    // 非法/缺省值回退到 WRITE_THROUGH，保证向后兼容
+    return TierWriteMode::WRITE_THROUGH;
+}
+
+std::string ToString(const TierWriteMode &mode) {
+    switch (mode) {
+    case TierWriteMode::WRITE_THROUGH:
+        return "write_through";
+    case TierWriteMode::CASCADING:
+        return "cascading";
+    default:
+        return "write_through";
+    }
+}
+
 } // namespace kv_cache_manager

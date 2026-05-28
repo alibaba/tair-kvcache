@@ -3,7 +3,7 @@
 namespace kv_cache_manager {
 
 TtlEvictionPolicy::TtlEvictionPolicy(const std::string &name, bool fallback_on_pressure)
-    : name_(name), fallback_on_pressure_(fallback_on_pressure) {}
+    : EvictionPolicy(name), fallback_on_pressure_(fallback_on_pressure) {}
 
 TtlEvictionPolicy::~TtlEvictionPolicy() {
     list_.clear();
@@ -40,8 +40,8 @@ void TtlEvictionPolicy::OnBlockAccessedWithOptions(BlockEntry *block, int64_t ti
     if (it == node_map_.end()) {
         return;
     }
-    block->last_access_time = timestamp;
-    block->access_count += 1;
+    // 注意：block->access_count / last_access_time 由 RadixTreeIndex::OnBlockAccessed 统一更新，
+    // 此处不再重复递增 access_count，避免多层/多策略场景下双重计数
     if (timestamp > last_known_timestamp_) {
         last_known_timestamp_ = timestamp;
     }
@@ -60,12 +60,12 @@ void TtlEvictionPolicy::AdvanceClock(int64_t timestamp) {
 }
 
 void TtlEvictionPolicy::PushExpireEvent(BlockEntry *block) {
-    if (!block || block->ttl_us <= 0) {
+    if (!block || block->ttl_ns <= 0) {
         return;
     }
     auto &version = expire_event_version_[block];
     ++version;
-    expire_min_heap_.push(ExpireEvent{block->ttl_anchor_time + block->ttl_us, version, block});
+    expire_min_heap_.push(ExpireEvent{block->ttl_anchor_time + block->ttl_ns, version, block});
     MaybeCompactExpireHeap();
 }
 
@@ -128,14 +128,14 @@ void TtlEvictionPolicy::RebuildExpireHeap() {
     decltype(expire_min_heap_) new_heap;
     for (const auto &[block, node] : node_map_) {
         (void)node;
-        if (!block || block->ttl_us <= 0) {
+        if (!block || block->ttl_ns <= 0) {
             continue;
         }
         auto version_it = expire_event_version_.find(block);
         if (version_it == expire_event_version_.end()) {
             continue;
         }
-        new_heap.push(ExpireEvent{block->ttl_anchor_time + block->ttl_us, version_it->second, block});
+        new_heap.push(ExpireEvent{block->ttl_anchor_time + block->ttl_ns, version_it->second, block});
     }
     expire_min_heap_.swap(new_heap);
 }
@@ -174,21 +174,11 @@ std::vector<BlockEntry *> TtlEvictionPolicy::EvictBlocks(size_t count) {
 
 std::vector<BlockEntry *> TtlEvictionPolicy::EvictExpired() { return HarvestExpiredBlocks(); }
 
-void TtlEvictionPolicy::EvictOne(BlockEntry *block) {
-    if (name_ == "shared") {
-        block->location_map.clear();
-    } else {
-        block->location_map.erase(name_);
-    }
-}
+void TtlEvictionPolicy::EvictOne(BlockEntry *block) { ClearBlockLocation(block); }
 
 void TtlEvictionPolicy::Clear() {
     for (auto &[block, node] : node_map_) {
-        if (name_ == "shared") {
-            block->location_map.clear();
-        } else {
-            block->location_map.erase(name_);
-        }
+        ClearBlockLocation(block);
     }
     list_.clear();
     node_map_.clear();

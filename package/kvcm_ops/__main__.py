@@ -11,6 +11,7 @@ COMMANDS = {
     "remove_instance": "kvcm_ops.kvcm.instance.remove_instance",
 
     "get_instance_group": "kvcm_ops.kvcm.instance_group.get_instance_group",
+    "list_instance_group": "kvcm_ops.kvcm.instance_group.list_instance_group",
     "create_instance_group": "kvcm_ops.kvcm.instance_group.create_instance_group",
     "update_instance_group": "kvcm_ops.kvcm.instance_group.update_instance_group",
     "remove_instance_group": "kvcm_ops.kvcm.instance_group.remove_instance_group",
@@ -61,6 +62,7 @@ def main():
     remove_instance
   instance_group:
     get_instance_group
+    list_instance_group
     create_instance_group
     update_instance_group
     remove_instance_group

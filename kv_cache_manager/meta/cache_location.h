@@ -1,5 +1,6 @@
 #pragma once
 
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <variant>
@@ -104,6 +105,7 @@ public:
         Put(writer, "status", status_);
         Put(writer, "type", type_);
         Put(writer, "spec_size", spec_size_);
+        Put(writer, "create_time", create_time_);
         Put(writer, "location_specs", location_specs_);
     }
 
@@ -112,6 +114,7 @@ public:
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "status", status_, CacheLocationStatus::CLS_NOT_FOUND);
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "type", type_, DataStorageType::DATA_STORAGE_TYPE_UNKNOWN);
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "spec_size", spec_size_, size_t{0});
+        KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "create_time", create_time_, int64_t{0});
         KVCM_JSON_GET_MACRO(rapid_value, "location_specs", location_specs_);
         return true;
     }
@@ -120,6 +123,7 @@ public:
     void set_type(DataStorageType type) { type_ = type; }
     void set_id(const std::string &id) { id_ = id; }
     void set_spec_size(size_t spec_size) { spec_size_ = spec_size; }
+    void set_create_time(int64_t create_time) { create_time_ = create_time; }
     void push_location_spec(LocationSpec &&location_spec) { location_specs_.push_back(std::move(location_spec)); }
     void set_location_specs(std::vector<LocationSpec> &&location_specs) { location_specs_ = location_specs; }
 
@@ -128,55 +132,27 @@ public:
     [[nodiscard]] CacheLocationStatus status() const { return status_; }
     [[nodiscard]] DataStorageType type() const { return type_; }
     [[nodiscard]] size_t spec_size() const { return spec_size_; }
+    [[nodiscard]] int64_t create_time() const { return create_time_; }
+    [[nodiscard]] size_t EstimateMemUsage() const {
+        size_t usage = sizeof(CacheLocation) + id_.size();
+        for (const auto &spec : location_specs_) {
+            usage += sizeof(LocationSpec) + spec.name().size() + spec.uri().size();
+        }
+        return usage;
+    }
 
 private:
     std::string id_;
     CacheLocationStatus status_ = CacheLocationStatus::CLS_NEW;
     DataStorageType type_ = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
     size_t spec_size_ = 0;
+    int64_t create_time_ = 0;
     std::vector<LocationSpec> location_specs_;
 };
 
-using CacheLocationVector = std::vector<CacheLocation>;
-using CacheLocationMap = std::unordered_map<std::string, CacheLocation>;
-
-class BlockCacheLocationsMeta : public Jsonizable {
-public:
-    BlockCacheLocationsMeta();
-    ~BlockCacheLocationsMeta() override;
-
-    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override {
-        for (auto &location_kv : location_map_) {
-            Put(writer, location_kv.first, location_kv.second);
-        }
-    }
-
-    bool FromRapidValue(const rapidjson::Value &rapid_value) override {
-        if (!rapid_value.IsObject()) {
-            return false;
-        }
-        for (auto itr = rapid_value.MemberBegin(); itr != rapid_value.MemberEnd(); ++itr) {
-            const std::string key = itr->name.GetString();
-            CacheLocation location;
-            if (location.FromRapidValue(itr->value)) {
-                location_map_[key] = location;
-            } else {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    [[nodiscard]] CacheLocationMap &location_map() { return location_map_; }
-
-    void AddNewLocation(const CacheLocation &location, std::string &out_location_id);
-    ErrorCode UpdateLocationStatus(const std::string &location_id, CacheLocationStatus status);
-    ErrorCode DeleteLocation(const std::string &location_id);
-    ErrorCode GetLocationStatus(const std::string &location_id, CacheLocationStatus &out_status);
-    size_t GetLocationCount() const;
-
-private:
-    CacheLocationMap location_map_;
-};
+using CacheLocationConstPtr = std::shared_ptr<const CacheLocation>;
+using CacheLocationVector = std::vector<CacheLocationConstPtr>;
+using CacheLocationMap = std::unordered_map<std::string, CacheLocationConstPtr>;
+using CacheLocationMapVector = std::vector<CacheLocationMap>;
 
 } // namespace kv_cache_manager

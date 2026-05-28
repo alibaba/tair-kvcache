@@ -12,7 +12,7 @@ pybind_extension(
     deps = [
         "//kv_cache_manager/optimizer/manager",
         "//kv_cache_manager/optimizer/config",
-        "//kv_cache_manager/manager:cache_location",
+        "//kv_cache_manager/meta:cache_location",
         "//kv_cache_manager/common:logger",
     ],
     visibility = ["//visibility:public"],

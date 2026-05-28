@@ -8,8 +8,8 @@
 #include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
-#include "kv_cache_manager/manager/cache_location.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
+#include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
@@ -20,7 +20,7 @@ namespace kv_cache_manager {
     DEFINE_METRICS_NAME_(SchedulePlanExecutor, schedule_plan_executor, name)
 
 #define REGISTER_METRICS_FOR_SCHEDULE_PLAN_EXECUTOR(name)                                                              \
-    REGISTER_METRICS_COUNTER_(metrics_registry_, schedule_plan_executor, name)
+    REGISTER_METRICS_GAUGE_(metrics_registry_, schedule_plan_executor, name)
 
 namespace {
 template <typename ResultType, typename... Args>
@@ -32,7 +32,6 @@ void HandleErrorPromise(const std::shared_ptr<std::promise<ResultType>> &promise
     promise->set_value(ResultType{
         .status = error_code,
         .error_message = std::move(error_message),
-        .fail_metas = {},
     });
 }
 } // namespace
@@ -110,10 +109,10 @@ void SchedulePlanExecutor::WorkerRoutine() {
         }
 
         if (task) {
-            --METRICS_(schedule_plan_executor, waiting_task_count);
-            ++METRICS_(schedule_plan_executor, executing_task_count);
+            METRICS_(schedule_plan_executor, waiting_task_count) -= 1;
+            METRICS_(schedule_plan_executor, executing_task_count) += 1;
             task();
-            --METRICS_(schedule_plan_executor, executing_task_count);
+            METRICS_(schedule_plan_executor, executing_task_count) -= 1;
         }
     }
 }
@@ -162,13 +161,13 @@ void SchedulePlanExecutor::DoLocationDelTask(const std::shared_ptr<std::promise<
 
         for (auto &location_id : need_delete_location_ids) {
             auto iter = location_map.find(location_id);
-            if (iter == location_map.end()) {
+            if (iter == location_map.end() || !iter->second) {
                 continue;
             }
-            if (iter->second.status() != CacheLocationStatus::CLS_DELETING) {
+            if (iter->second->status() != CacheLocationStatus::CLS_DELETING) {
                 continue;
             }
-            for (const auto &loc_spec : iter->second.location_specs()) {
+            for (const auto &loc_spec : iter->second->location_specs()) {
                 DataStorageUri uri(loc_spec.uri());
                 if (uri.Valid()) {
                     std::string storage_unique_name = uri.GetHostName();
@@ -198,9 +197,11 @@ void SchedulePlanExecutor::DoLocationDelTask(const std::shared_ptr<std::promise<
             if (delete_results[i] != ErrorCode::EC_OK) {
                 // 这里存储删除报错暂且不管，报个warn表示哪个storageUri删失败了
                 result.status = ErrorCode::EC_PARTIAL_OK;
-                KVCM_LOG_WARN("Failed to delete kvcache from storage %s, uri: %s",
+                KVCM_LOG_WARN("storage delete failed, instance[%s] storage[%s] uri[%s] ec[%d]",
+                              task.instance_id.c_str(),
                               storage_unique_name.c_str(),
-                              storage_uris[i].ToUriString().c_str());
+                              storage_uris[i].ToUriString().c_str(),
+                              static_cast<int>(delete_results[i]));
             }
         }
     }
@@ -211,26 +212,16 @@ void SchedulePlanExecutor::DoLocationDelTask(const std::shared_ptr<std::promise<
         ErrorCode delete_meta_ec =
             meta_searcher.BatchCADLocationStatus(ctx.get(), block_keys_to_delete, batch_cad_tasks, delete_meta_results);
         (void)delete_meta_ec; // 忽略返回值
-        std::vector<ErrorCode> status_vec;
-        std::vector<std::string> location_ids;
         for (size_t block_key_idx = 0; block_key_idx < delete_meta_results.size(); ++block_key_idx) {
             auto &results = delete_meta_results[block_key_idx];
             for (size_t location_idx = 0; location_idx < results.size(); location_idx++) {
                 if (results[location_idx] != ErrorCode::EC_OK) {
-                    status_vec.push_back(results[location_idx]);
-                    location_ids.push_back(batch_cad_tasks[block_key_idx][location_idx].location_id);
                     result.status = ErrorCode::EC_PARTIAL_OK;
                     KVCM_LOG_WARN("Failed to CAD meta key %ld, location: %s, error_code: %d",
                                   block_keys_to_delete[block_key_idx],
                                   batch_cad_tasks[block_key_idx][location_idx].location_id.c_str(),
                                   results[location_idx]);
                 }
-            }
-            if (!status_vec.empty()) {
-                result.fail_metas.push_back(PlanExecuteResultFailMeta{
-                    block_keys_to_delete[block_key_idx], std::move(status_vec), std::move(location_ids)});
-                status_vec.clear();
-                location_ids.clear();
             }
         }
     }
@@ -250,7 +241,7 @@ bool SchedulePlanExecutor::SubmitRaw(const std::function<void()> &task, std::chr
         uint64_t sequence_id = sequence_counter_.fetch_add(1, std::memory_order_relaxed);
         tasks_.emplace(ScheduledTask{task, execute_time, sequence_id});
     }
-    ++METRICS_(schedule_plan_executor, waiting_task_count);
+    METRICS_(schedule_plan_executor, waiting_task_count) += 1;
 
     condition_.notify_one();
     return true;
@@ -293,7 +284,10 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::Submit(const CacheMetaDelRe
     for (size_t block_key_idx = 0; block_key_idx < task.block_keys.size(); ++block_key_idx) {
         std::vector<MetaSearcher::LocationCASTask> cas_tasks;
         for (const auto &loc_kv : location_maps[block_key_idx]) {
-            cas_tasks.push_back({loc_kv.first, loc_kv.second.status(), CLS_DELETING});
+            if (!loc_kv.second) {
+                continue;
+            }
+            cas_tasks.push_back({loc_kv.first, loc_kv.second->status(), CLS_DELETING});
         }
         if (cas_tasks.empty()) {
             continue;
@@ -303,7 +297,7 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::Submit(const CacheMetaDelRe
     }
 
     if (batch_cas_block_keys.empty()) {
-        promise->set_value(PlanExecuteResult{ErrorCode::EC_OK, "", {}});
+        promise->set_value({ErrorCode::EC_OK, ""});
         return future;
     }
 
@@ -321,7 +315,7 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::Submit(const CacheMetaDelRe
         return future;
     }
     if (actual_task.block_keys.empty()) {
-        promise->set_value(PlanExecuteResult{ErrorCode::EC_OK, "", {}});
+        promise->set_value(PlanExecuteResult{ErrorCode::EC_OK, ""});
         return future;
     }
     KVCM_LOG_DEBUG("Location statuses updated, submitting task to worker pool with delay: %lld microseconds",
@@ -411,7 +405,10 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::Submit(const CacheLocationD
         auto &location_map = location_maps[block_key_idx];
         std::vector<MetaSearcher::LocationCASTask> location_cas_tasks;
         for (const auto &loc_kv : location_map) {
-            const auto &location = loc_kv.second;
+            if (!loc_kv.second) {
+                continue;
+            }
+            const auto &location = *loc_kv.second;
             if (location.status() == CacheLocationStatus::CLS_DELETING) {
                 continue; // ignore already deleting
             }
@@ -427,7 +424,7 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::Submit(const CacheLocationD
         batch_cas_tasks.emplace_back(std::move(location_cas_tasks));
     }
     if (batch_cas_block_keys.empty()) {
-        promise->set_value(PlanExecuteResult{ErrorCode::EC_OK, "", {}});
+        promise->set_value(PlanExecuteResult{ErrorCode::EC_OK, ""});
         return future;
     }
 
@@ -445,7 +442,7 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::Submit(const CacheLocationD
         return future;
     }
     if (actual_task.block_keys.empty()) {
-        promise->set_value(PlanExecuteResult{ErrorCode::EC_OK, "", {}});
+        promise->set_value(PlanExecuteResult{ErrorCode::EC_OK, ""});
         return future;
     }
 
@@ -468,6 +465,13 @@ bool SchedulePlanExecutor::SubmitNonBlocking(const CacheMetaDelRequest &req) {
 
 bool SchedulePlanExecutor::SubmitNonBlocking(const CacheLocationDelRequest &req) {
     return SubmitRaw([this, req]() { Submit(req); }, std::chrono::microseconds{0});
+}
+
+bool SchedulePlanExecutor::SubmitTask(std::function<void()> task, std::chrono::microseconds delay) {
+    if (!task) {
+        return false;
+    }
+    return SubmitRaw(std::move(task), delay);
 }
 
 } // namespace kv_cache_manager

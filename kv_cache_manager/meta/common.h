@@ -10,6 +10,8 @@ static const std::string META_REDIS_BACKEND_TYPE_STR = "redis";
 static const std::string META_CACHED_BACKEND_TYPE_STR = "cached";
 
 static const std::string PROPERTY_INNER_PREFIX = "__";
+static const std::string LOCATION_PREFIX = "__loc__";
+static const std::string LOCATION_PROPERTY_PREFIX = "__loc_property__";
 static const std::string PROPERTY_URI = "__uri__";
 static const std::string PROPERTY_TTL = "__ttl__";
 static const std::string PROPERTY_HIT_COUNT = "__hit_count__";

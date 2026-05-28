@@ -1,3 +1,4 @@
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <functional>
@@ -5,6 +6,7 @@
 #include <gtest/gtest.h>
 #include <memory>
 #include <thread>
+#include <vector>
 
 #include "kv_cache_manager/common/standard_uri.h"
 #include "kv_cache_manager/common/unittest.h"
@@ -19,8 +21,7 @@ struct CoordinationBackendTestConfig {
     std::function<void(CoordinationBackendTest *test_base)> tear_down_;
 };
 
-class CoordinationBackendTest : public TESTBASE,
-                                   public testing::WithParamInterface<CoordinationBackendTestConfig> {
+class CoordinationBackendTest : public TESTBASE, public testing::WithParamInterface<CoordinationBackendTestConfig> {
 protected:
     void SetUp() override {
         GetParam().set_up_(this);
@@ -428,6 +429,36 @@ TEST_P(CoordinationBackendTest, TestSetGetMultipleKeys) {
 
     EXPECT_EQ(EC_OK, backend_->GetValue("key3", out));
     EXPECT_EQ("val3", out);
+}
+
+TEST_P(CoordinationBackendTest, TestConcurrentGetValue) {
+    const std::string key = "concurrent_get_value_key";
+    const std::string value = R"({"node_id":"node-1","host":"127.0.0.1","meta_rpc_port":8080})";
+    ASSERT_EQ(EC_OK, backend_->SetValue(key, value));
+
+    std::atomic<int> error_count{0};
+    std::vector<std::thread> threads;
+    constexpr int32_t THREAD_NUM = 8;
+    constexpr int32_t ITERATION_NUM = 50;
+    threads.reserve(THREAD_NUM);
+
+    for (int32_t i = 0; i < THREAD_NUM; ++i) {
+        threads.emplace_back([&]() {
+            for (int32_t j = 0; j < ITERATION_NUM; ++j) {
+                std::string out_value;
+                ErrorCode ec = backend_->GetValue(key, out_value);
+                if (ec != EC_OK || out_value != value) {
+                    error_count.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+
+    for (auto &thread : threads) {
+        thread.join();
+    }
+
+    EXPECT_EQ(0, error_count.load(std::memory_order_relaxed));
 }
 
 // 测试 SetValue 空值

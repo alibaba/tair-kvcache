@@ -1,5 +1,6 @@
 #include "kv_cache_manager/service/server_config.h"
 
+#include <algorithm>
 #include <fstream>
 #include <stdio.h>
 
@@ -8,6 +9,7 @@
 
 namespace kv_cache_manager {
 
+// clang-format off
 std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSettingsMap = {
     {"kvcm.registry_storage.uri",
      [](const std::string &value, ServerConfig *config) {
@@ -152,6 +154,7 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
          config->prometheus_prefix_ = value;
          return true;
      }}};
+// clang-format on
 
 bool ServerConfig::Parse(const std::string &config_file, const EnvironMap &environ) {
     // 1. 默认配置
@@ -258,8 +261,18 @@ bool ServerConfig::ParseFromEnviron(const EnvironMap &environ) {
 void ServerConfig::UpdateEnviron(EnvironMap &environ) {
     // TODO 环境变量和原始ENV的覆盖关系
     // 系统环境变量具有最高优先级，覆盖了传入的environ中的同名配置项
+    // 优先查带 `.` 的 key（如 kvcm.registry_storage.uri），查不到再尝试将 `.`
+    // 替换为 `_` 后查（如 kvcm_registry_storage_uri），兼容 bash 等不支持
+    // 变量名包含 `.` 的场景。
     for (const auto &[key, _] : kSettingsMap) {
         std::string value = EnvUtil::GetEnv(key, "");
+        if (value.empty()) {
+            std::string underscore_key = key;
+            std::replace(underscore_key.begin(), underscore_key.end(), '.', '_');
+            if (underscore_key != key) {
+                value = EnvUtil::GetEnv(underscore_key, "");
+            }
+        }
         if (!value.empty()) {
             environ[key] = value;
         }

@@ -6,6 +6,13 @@ namespace kv_cache_manager {
 bool OptInstanceConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
     KVCM_JSON_GET_MACRO(rapid_value, "instance_id", instance_id_);
     KVCM_JSON_GET_MACRO(rapid_value, "block_size", block_size_);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "bytes_per_token", bytes_per_token_, int64_t(0));
+    if (bytes_per_token_ <= 0) {
+        KVCM_LOG_ERROR(
+            "bytes_per_token is required and must be > 0 (got %lld), capacity eviction cannot function without it",
+            static_cast<long long>(bytes_per_token_));
+        return false;
+    }
     KVCM_JSON_GET_MACRO(rapid_value, "instance_group_name", instance_group_name_);
     std::string eviction_policy_type_str;
     KVCM_JSON_GET_MACRO(rapid_value, "eviction_policy_type", eviction_policy_type_str);
@@ -32,6 +39,9 @@ bool OptInstanceConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
 void OptInstanceConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
     Put(writer, "instance_id", instance_id_);
     Put(writer, "block_size", block_size_);
+    if (bytes_per_token_ > 0) {
+        Put(writer, "bytes_per_token", bytes_per_token_);
+    }
     Put(writer, "instance_group_name", instance_group_name_);
     Put(writer, "eviction_policy_type", ToString(eviction_policy_type_));
     if (eviction_policy_type_ == EvictionPolicyType::POLICY_LRU ||

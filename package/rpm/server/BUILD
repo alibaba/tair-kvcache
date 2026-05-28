@@ -49,7 +49,9 @@ pkg_files(
 pkg_files(
     name = "rpm_script",
     srcs = [
+        "//package/script:decode_stack_trace_script",
         "//package/script:start_server_script",
+        "//package/script:start_server_spectrum_script",
     ],
     attributes = pkg_attributes(
         mode = "0755",

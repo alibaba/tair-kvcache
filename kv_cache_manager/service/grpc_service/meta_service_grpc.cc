@@ -103,4 +103,29 @@ grpc::Status MetaServiceGRpc::GetClusterInfo(grpc::ServerContext *context,
     return grpc::Status::OK;
 }
 
+grpc::Status MetaServiceGRpc::ReportEvent(grpc::ServerContext *context,
+                                          const proto::meta::ReportEventRequest *request,
+                                          proto::meta::ReportEventResponse *response) {
+    API_CONTEXT_GET_COLLECTOR_AND_INIT_GRPC(ReportEvent, grpc::Status::OK);
+    bool has_block_add = false, has_block_delete = false;
+    for (int i = 0; i < request->events_size(); ++i) {
+        if (request->events(i).event_type() == proto::meta::EVENT_BLOCK_ADD)
+            has_block_add = true;
+        if (request->events(i).event_type() == proto::meta::EVENT_BLOCK_DELETE)
+            has_block_delete = true;
+    }
+    if (has_block_add && !request->instance_id().empty()) {
+        auto mc = get_metrics_collector_from_map_for_EventBlockAdd(request->instance_id());
+        if (mc)
+            request_context->GetMetricsCollectorsVehicle().AddMetricsCollector(mc);
+    }
+    if (has_block_delete && !request->instance_id().empty()) {
+        auto mc = get_metrics_collector_from_map_for_EventBlockDelete(request->instance_id());
+        if (mc)
+            request_context->GetMetricsCollectorsVehicle().AddMetricsCollector(mc);
+    }
+    meta_service_impl_->ReportEvent(request_context, request, response);
+    return grpc::Status::OK;
+}
+
 } // namespace kv_cache_manager

@@ -64,3 +64,17 @@ cc_test(
         "//kv_cache_manager/data_storage",
     ],
 )
+
+cc_test(
+    name = "VineyardBackendTest",
+    srcs = [
+        "vineyard_backend_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    data = [],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/data_storage",
+    ],
+)
+

@@ -20,7 +20,8 @@ public:
     bool CreateOptIndexer(const OptInstanceConfig &instance_config,
                           const std::vector<OptTierConfig> &storage_configs,
                           bool hierarchical_eviction_enabled = false,
-                          int64_t default_ttl_us = 0);
+                          TierWriteMode tier_write_mode = TierWriteMode::WRITE_THROUGH,
+                          int64_t default_ttl_ns = 0);
 
     std::shared_ptr<RadixTreeIndex> GetOptIndexer(const std::string &instance_id) const;
     std::unordered_map<std::string, std::shared_ptr<RadixTreeIndex>> GetAllOptIndexers() const;
@@ -35,7 +36,7 @@ public:
     EvictedBlocks EvictExpiredBeforeAccess(const std::string &instance_id, int64_t current_timestamp);
 
     // 仅做容量驱逐；返回待清理的 block 列表
-    EvictedBlocks CheckAndEvict(const std::string &instance_id);
+    EvictedBlocks CheckAndEvict(const std::string &instance_id, int64_t eviction_timestamp = 0);
 
     // 统一清理驱逐后的 block，并触发节点清理
     void CleanEvictedBlocks(const EvictedBlocks &evicted_blocks,

@@ -1,7 +1,9 @@
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
@@ -66,6 +68,9 @@ public:
               uint32_t cache_reclaimer_idle_interval_ms = 100,
               uint32_t cache_reclaimer_worker_size = 16);
     ErrorCode DoRecover();
+    ErrorCode DoRecoverOnce();
+    void StartRecoverRetryLoop();
+    void StopRecoverRetryLoop();
     ErrorCode DoCleanup();
     std::shared_ptr<RegistryManager> GetRegistryManager() { return registry_manager_; }
 
@@ -125,6 +130,10 @@ public:
                           const KeyVector &keys,
                           const TokenIdsVector &tokens,
                           const BlockMask &block_mask /*TODO*/);
+
+    ErrorCode ReportEvent(RequestContext *request_context,
+                          const proto::meta::ReportEventRequest *request,
+                          proto::meta::ReportEventResponse *response);
     ErrorCode TrimCache(RequestContext *request_context,
                         const std::string &instance_id,
                         const proto::meta::TrimStrategy &trim_strategy,
@@ -184,6 +193,9 @@ private:
     std::pair<ErrorCode, int64_t> GetBlockSize(RequestContext *request_context, const std::string &instance_id) const;
     void FilterLocationSpecByName(CacheLocationVector &locations, const std::vector<std::string> &location_spec_names);
     std::string GetStorageConfigStr(RequestContext *request_context, const std::string &instance_id) const;
+
+    void
+    CleanupHostLocations(const std::string &instance_id, const std::string &host_ip_port, uint64_t cleanup_generation);
     ErrorCode GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
                                           RequestContext *request_context,
                                           const std::string &instance_id,
@@ -205,8 +217,9 @@ private:
                                         CacheLocationVector &cache_locations) const;
     std::unique_ptr<SelectLocationPolicy> genSelectLocationPolicy(RequestContext *request_context,
                                                                   const std::string &instance_id) const;
-    CheckLocDataExistFunc GetCheckLocDataExistFunc() const;
+    CheckLocDataExistFunc GetCheckLocDataExistFunc(const std::string &instance_id) const;
     SubmitDelReqFunc GetSubmitDelReqFunc(const std::string &instance_id) const;
+    void ClearVineyardCleanupCallbacks();
 
 private:
     /***
@@ -239,6 +252,10 @@ private:
     std::shared_ptr<EventManager> event_manager_;
     // 需要清理 - 避免有metrics遗留
     std::shared_ptr<CacheManagerMetricsRecorder> metrics_recorder_;
+
+    // 需要清理 - recover 重试线程相关，在DoCleanup()中StopRecoverRetryLoop()
+    std::thread recover_retry_thread_;
+    std::atomic<bool> recover_retry_stop_{false};
 };
 
 } // namespace kv_cache_manager

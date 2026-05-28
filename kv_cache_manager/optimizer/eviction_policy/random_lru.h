@@ -12,8 +12,7 @@ namespace kv_cache_manager {
 
 class RandomLruEvictionPolicy : public EvictionPolicy {
 private:
-    std::string name_;
-    std::vector<BlockEntry *> blocks_; // 当前所有块
+    std::vector<BlockEntry *> blocks_;
     std::vector<int64_t> timestamps_;
     std::unordered_map<BlockEntry *, size_t> block_to_index_; // 映射：块 -> index
     uint64_t xor_state_ = 0x12345678ABCDEF01ULL;              // 随机数状态
@@ -23,8 +22,6 @@ private:
 public:
     explicit RandomLruEvictionPolicy(const std::string &name, const RandomLruParams &params, const int32_t batch_size);
     ~RandomLruEvictionPolicy() override;
-    std::string name() const override { return name_; }
-    void set_name(const std::string &name) override { name_ = name; }
     void OnBlockWritten(BlockEntry *block) override;
 
     void OnNodeWritten(std::vector<BlockEntry *> &blocks) override;

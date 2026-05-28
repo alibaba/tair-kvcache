@@ -16,7 +16,7 @@ import shutil
 import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from kv_cache_manager.optimizer.pybind import kvcm_py_optimizer
 
@@ -43,6 +43,7 @@ def run_optimizer_with_config(
     policy: str = None,
     save_csv_to: str = None,
     enable_lifecycle_tracking: bool = False,
+    enable_template_analysis: bool = False,
 ) -> str:
     """
     运行 optimizer，返回临时输出目录路径。
@@ -51,7 +52,7 @@ def run_optimizer_with_config(
     """
     temp_dir, _ = run_optimizer_with_config_explicit(
         config_path, capacity, policy, save_csv_to,
-        enable_lifecycle_tracking,
+        enable_lifecycle_tracking, enable_template_analysis,
     )
     return temp_dir
 
@@ -62,6 +63,7 @@ def run_optimizer_with_config_explicit(
     policy: str = None,
     save_csv_to: str = None,
     enable_lifecycle_tracking: bool = False,
+    enable_template_analysis: bool = False,
 ) -> Tuple[str, object]:
     """
     运行 optimizer，返回 (临时目录路径, OptimizerManager对象)。
@@ -75,7 +77,19 @@ def run_optimizer_with_config_explicit(
 
     # 设置容量 / 策略
     for group in config_json.get("instance_groups", []):
-        group["quota_capacity"] = capacity
+        # NOTE: In tiered mode (hierarchical_eviction_enabled=true), eviction decisions
+        # are based on each tier's independent storages[i].capacity, not quota_capacity.
+        # This function only modifies quota_capacity, so capacity sweeps in tradeoff
+        # analysis are ineffective for tiered configurations.
+        # quota_capacity in config is GB; convert blocks -> GB for C++ FromRapidValue (bytes internally)
+        # Use instances[0] as representative for bytes_per_block calculation.
+        # Assumption: all instances in the same group serve the same model and
+        # therefore share identical block_size (enforced by C++ MismatchFields check
+        # in RegisterInstance) and bytes_per_token (Python-only annotation field,
+        # not validated by C++, but expected to be consistent within a group).
+        inst = group.get("instances", [{}])[0] if group.get("instances") else {}
+        bpb = inst.get("bytes_per_token", 0) * inst.get("block_size", 0)
+        group["quota_capacity"] = capacity * bpb / (1024 ** 3) if bpb > 0 else capacity
         if policy is not None:
             for instance in group.get("instances", []):
                 instance["eviction_policy_type"] = policy
@@ -91,7 +105,7 @@ def run_optimizer_with_config_explicit(
         raise RuntimeError(f"Failed to load config: {temp_config_path}")
     config = config_loader.config()
 
-    manager = kvcm_py_optimizer.OptimizerManager(config, enable_lifecycle_tracking)
+    manager = kvcm_py_optimizer.OptimizerManager(config, enable_lifecycle_tracking, enable_template_analysis)
     manager.Init()
     manager.DirectRun()
     manager.AnalyzeResults()
@@ -109,14 +123,82 @@ def run_optimizer_with_config_explicit(
 
 
 # ============================================================================
+# 配置工具
+# ============================================================================
+
+def extract_bytes_per_block_map(config_path: str) -> Dict[str, int]:
+    """
+    从 config JSON 提取每个 instance 的 bytes_per_block。
+
+    bytes_per_block = block_size × bytes_per_token
+
+    Note:
+        bytes_per_token 是 Python 侧的配置注解字段，C++ 层（OptInstanceConfig）不解析该字段。
+        block_size 在 KVCM C++ 层由 RegisterInstance/MismatchFields 强制要求同一 group 内一致；
+        bytes_per_token 无 C++ 层强制约束，依赖配置人员保证同一 group 内的值一致（通常
+        同一 group 服务同一模型，bytes_per_token 自然相同）。
+
+    缺少配置时打印 warning 并将该 instance 的值设为 0（调用方需检查）。
+
+    Returns:
+        {instance_id: bytes_per_block}
+    """
+    with open(config_path, "r") as f:
+        config_json = json.load(f)
+
+    result: Dict[str, int] = {}
+    for group in config_json.get("instance_groups", []):
+        for inst in group.get("instances", []):
+            bpt = inst.get("bytes_per_token", 0)
+            bs = inst.get("block_size", 0)
+            iid = inst.get("instance_id", "<unknown>")
+            if bpt <= 0 or bs <= 0:
+                print(
+                    f"Warning: Instance '{iid}' is missing bytes_per_token or block_size "
+                    "configuration. Storage will be displayed in blocks instead of GB."
+                )
+                result[iid] = 0
+            else:
+                result[iid] = bs * bpt
+    return result
+
+
+def extract_config_quota_gb_map(config_path: str) -> Dict[str, float]:
+    """
+    从 config JSON 提取每个 instance 所属 group 的 quota_capacity（单位：GB）。
+
+    quota_capacity 是 group 级别的共享配额，同一 group 内所有 instances 共享该值。
+    用于在 tradeoff 曲线上标注当前配置的实际部署容量位置（竖线参考线）。
+
+    Returns:
+        {instance_id: quota_capacity_gb}
+        若某 group 未配置 quota_capacity，则其 instances 不会出现在结果中。
+    """
+    with open(config_path, "r") as f:
+        config_json = json.load(f)
+
+    result: Dict[str, float] = {}
+    for group in config_json.get("instance_groups", []):
+        quota_gb = group.get("quota_capacity")
+        if quota_gb is None:
+            continue
+        for inst in group.get("instances", []):
+            iid = inst.get("instance_id", "<unknown>")
+            result[iid] = float(quota_gb)
+    return result
+
+
+# ============================================================================
 # Warmup Pass
 # ============================================================================
 
 def warmup_pass(
     config_path: str,
     warmup_capacity: int,
+    bytes_per_block_map: Dict[str, int],
     policy: str = None,
     enable_lifecycle_tracking: bool = False,
+    enable_template_analysis: bool = False,
 ) -> int:
     """
     用大容量跑一遍，获取 group 内最大 block 数。
@@ -130,6 +212,7 @@ def warmup_pass(
     temp_dir, manager = run_optimizer_with_config_explicit(
         config_path, warmup_capacity, policy,
         enable_lifecycle_tracking=enable_lifecycle_tracking,
+        enable_template_analysis=enable_template_analysis,
     )
 
     try:
@@ -141,9 +224,11 @@ def warmup_pass(
         df = pd.read_csv(first_csv)
         max_blocks = int(df["CachedBlocksAllInstance"].max())
 
+        rep_bpb = next(iter(bytes_per_block_map.values()), 0)
+        max_gb = max_blocks * rep_bpb / (1024 ** 3) if rep_bpb > 0 else 0
         acc_read = int(df["AccReadBlocks"].iloc[-1]) if "AccReadBlocks" in df.columns else 0
         acc_write = int(df["AccWriteBlocks"].iloc[-1]) if "AccWriteBlocks" in df.columns else 0
-        print(f"Warmup done. Max cached: {max_blocks}, AccReadBlocks: {acc_read}, AccWriteBlocks: {acc_write}")
+        print(f"Warmup done. Max cached: {max_gb:.2f} GB ({max_blocks} blocks), AccReadBlocks: {acc_read}, AccWriteBlocks: {acc_write}")
 
         return max_blocks
     finally:
@@ -164,8 +249,10 @@ def run_single_experiment(
     policy: str,
     exp_id: int,
     total_exps: int,
+    bytes_per_block_map: Dict[str, int],
     save_csv_to: str = None,
     enable_lifecycle_tracking: bool = False,
+    enable_template_analysis: bool = False,
 ) -> dict:
     """
     运行单个实验，返回结果字典。
@@ -174,8 +261,8 @@ def run_single_experiment(
         {
             "policy": str,
             "capacity": int,
-            "instances": {instance_id: {"total": float, "internal": float,
-                                        "external": float, "cached_blocks_all": int}},
+            "instances": {instance_id: {"total": float, "local": float,
+                                        "remote": float, "cached_gb": float}},
             "success": bool,
             "error": str | None,
         }
@@ -195,7 +282,7 @@ def run_single_experiment(
 
         temp_dir, manager = run_optimizer_with_config_explicit(
             config_path, capacity, policy, save_csv_to,
-            enable_lifecycle_tracking,
+            enable_lifecycle_tracking, enable_template_analysis,
         )
         csv_map = collect_instance_csvs(temp_dir)
         if not csv_map:
@@ -204,14 +291,15 @@ def run_single_experiment(
 
         instance_metrics = {}
         for iid, csv_file in csv_map.items():
-            metrics = parse_instance_metrics(csv_file)
+            bpb = bytes_per_block_map.get(iid, 0)
+            metrics = parse_instance_metrics(csv_file, bpb)
             if metrics is None:
                 continue
             instance_metrics[iid] = {
                 "total": metrics["acc_total_hit_rate"],
-                "internal": metrics["acc_internal_hit_rate"],
-                "external": metrics["acc_external_hit_rate"],
-                "cached_blocks_all": metrics["cached_blocks_all"],
+                "local": metrics["acc_local_hit_rate"],
+                "remote": metrics["acc_remote_hit_rate"],
+                "cached_gb": metrics["cached_gb"],
             }
 
         result["instances"] = instance_metrics
@@ -236,9 +324,11 @@ def run_single_experiment(
 def run_experiments_parallel(
     config_path: str,
     experiments: List[tuple],
+    bytes_per_block_map: Dict[str, int],
     max_workers: int = 4,
     save_csv_dir: str = None,
     enable_lifecycle_tracking: bool = False,
+    enable_template_analysis: bool = False,
 ) -> List[dict]:
     """
     并行运行实验列表。
@@ -262,7 +352,9 @@ def run_experiments_parallel(
         tasks.append((
             config_path, capacity, policy,
             i + 1, len(experiments),
+            bytes_per_block_map,
             csv_subdir, enable_lifecycle_tracking,
+            enable_template_analysis,
         ))
 
     results = []

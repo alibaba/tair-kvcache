@@ -99,10 +99,11 @@ TEST_F(OptIndexerManagerTest, CreateOptIndexer) {
     auto result = indexer->InsertOnly(block_keys, 1000);
     EXPECT_EQ(result.inserted_keys.size(), 5);
 
-    std::vector<std::vector<int64_t>> hits;
-    auto inserted2 = indexer->InsertWithQuery(block_keys, 2000, hits);
-    EXPECT_EQ(inserted2.size(), 0); // 已存在
-    EXPECT_EQ(hits.size(), 1);      // 命中
+    // 验证 PrefixQuery 可以查询到之前插入的数据
+    QueryHit query_hit;
+    BlockMask block_mask = std::vector<bool>(block_keys.size(), true);
+    indexer->PrefixQuery(block_keys, block_mask, 2000, &query_hit);
+    EXPECT_EQ(query_hit.local_hit_block_num, 5);
 }
 
 TEST_F(OptIndexerManagerTest, CreateMultipleOptIndexers) {
@@ -263,7 +264,7 @@ TEST_F(OptIndexerManagerTest, EvictExpiredBeforeAccessOnlyExpiresLocationWithout
     ttl_instance.set_eviction_policy_param(ttl_params);
 
     auto tier_configs = CreateTestTierConfigs();
-    ASSERT_TRUE(indexer_manager_->CreateOptIndexer(ttl_instance, tier_configs, false, 0));
+    ASSERT_TRUE(indexer_manager_->CreateOptIndexer(ttl_instance, tier_configs, false));
 
     OptInstanceGroupConfig ttl_group;
     ttl_group.set_group_name("ttl_group");

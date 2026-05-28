@@ -7,15 +7,19 @@
 #include <iostream>
 
 #include "kv_cache_manager/common/logger.h"
-#include "kv_cache_manager/manager/cache_location.h"
+#include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/optimizer/analysis/tracker/block_lifecycle_tracker.h"
 #include "kv_cache_manager/optimizer/config/tier_config.h"
 #include "kv_cache_manager/optimizer/eviction_policy/policy_factory.h"
 #include "kv_cache_manager/optimizer/trace_loader/trace_util.h"
 namespace kv_cache_manager {
 
-OptimizerManager::OptimizerManager(const OptimizerConfig &config, bool enable_lifecycle_tracking)
-    : config_(config), enable_lifecycle_tracking_(enable_lifecycle_tracking) {}
+OptimizerManager::OptimizerManager(const OptimizerConfig &config,
+                                   bool enable_lifecycle_tracking,
+                                   bool enable_template_analysis)
+    : config_(config)
+    , enable_lifecycle_tracking_(enable_lifecycle_tracking)
+    , enable_template_analysis_(enable_template_analysis) {}
 
 bool OptimizerManager::Init() {
     eviction_manager_.reset(new OptEvictionManager());
@@ -33,7 +37,13 @@ bool OptimizerManager::Init() {
     // ---- 初始化 StatsCollector 并注册子 Tracker ----
     stats_collector_ = std::make_shared<StatsCollector>();
     hit_rate_tracker_ = stats_collector_->EmplaceTracker<HitRateTracker>();
-    template_prefix_tracker_ = stats_collector_->EmplaceTracker<TemplatePrefixTracker>();
+
+    if (enable_template_analysis_) {
+        template_prefix_tracker_ = stats_collector_->EmplaceTracker<TemplatePrefixTracker>();
+        KVCM_LOG_INFO("Template analysis enabled");
+    } else {
+        KVCM_LOG_DEBUG("Template analysis disabled (replay performance optimization)");
+    }
 
     if (enable_lifecycle_tracking_) {
         stats_collector_->EmplaceTracker<BlockLifecycleTracker>();
@@ -164,15 +174,18 @@ bool OptimizerManager::CreateRadixTreeIndex(const OptInstanceConfig &instance_co
         return false;
     }
 
-    int64_t default_ttl_us = group_it->second.default_block_ttl_seconds() * 1000000;
-    if (default_ttl_us > 0 && instance_config.eviction_policy_type() != EvictionPolicyType::POLICY_TTL) {
+    int64_t default_ttl_ns = group_it->second.default_block_ttl_seconds() * 1000000000;
+    if (default_ttl_ns > 0 && instance_config.eviction_policy_type() != EvictionPolicyType::POLICY_TTL) {
         KVCM_LOG_WARN("default_block_ttl_seconds=%ld is set but eviction_policy_type is not TTL; "
                       "TTL will not be enforced for instance %s",
                       group_it->second.default_block_ttl_seconds(),
                       instance_config.instance_id().c_str());
     }
-    if (!indexer_manager_->CreateOptIndexer(
-            instance_config, storage_configs, group_it->second.hierarchical_eviction_enabled(), default_ttl_us)) {
+    if (!indexer_manager_->CreateOptIndexer(instance_config,
+                                            storage_configs,
+                                            group_it->second.hierarchical_eviction_enabled(),
+                                            group_it->second.tier_write_mode(),
+                                            default_ttl_ns)) {
         KVCM_LOG_ERROR("Failed to create optimizer indexer for instance_id: %s", instance_config.instance_id().c_str());
         return false;
     }
@@ -197,7 +210,7 @@ WriteCacheRes OptimizerManager::WriteCache(const std::string &instance_id,
     WriteCacheSchemaTrace trace;
     trace.set_instance_id(instance_id);
     trace.set_trace_id(trace_id);
-    trace.set_timestamp_us(timestamp);
+    trace.set_timestamp_ns(timestamp);
     trace.set_keys(block_ids);
     trace.set_tokens(token_ids);
 
@@ -230,7 +243,7 @@ GetCacheLocationRes OptimizerManager::GetCacheLocation(const std::string &instan
     GetLocationSchemaTrace trace;
     trace.set_instance_id(instance_id);
     trace.set_trace_id(trace_id);
-    trace.set_timestamp_us(timestamp);
+    trace.set_timestamp_ns(timestamp);
     trace.set_keys(block_ids);
     trace.set_tokens(token_ids);
     trace.set_block_mask(block_mask);
@@ -243,7 +256,7 @@ GetCacheLocationRes OptimizerManager::GetCacheLocation(const std::string &instan
 
     const auto *last_read = hit_rate_tracker_->LastReadRecord(instance_id);
     if (last_read) {
-        res.kvcm_hit_length = last_read->external_hit_blocks;
+        res.kvcm_hit_length = last_read->remote_hit_blocks;
     }
     return res;
 }

@@ -370,6 +370,34 @@ void AdminServiceImpl::GetInstanceGroup(RequestContext *request_context,
     }
 }
 
+void AdminServiceImpl::ListInstanceGroup(RequestContext *request_context,
+                                         const proto::admin::ListInstanceGroupRequest *request,
+                                         proto::admin::ListInstanceGroupResponse *response) {
+    API_CALL_GUARD("ListInstanceGroup", true);
+    auto *header = response->mutable_header();
+    auto *status = header->mutable_status();
+
+    auto list_instance_group = registry_manager_->ListInstanceGroup(request_context);
+    ErrorCode ec_info = list_instance_group.first;
+    const auto &instance_groups = list_instance_group.second;
+    if (ec_info != EC_OK) {
+        status->set_code(ToAdminPbError(ec_info));
+        request_context->set_status_code(status->code());
+        status->set_message("Failed to list instance group");
+        KVCM_LOG_ERROR("[traceId: %s] ListInstanceGroup failed", request->trace_id().c_str());
+        return;
+    }
+
+    for (const auto &instance_group : instance_groups) {
+        auto *instance_group_config = response->add_instance_group();
+        ProtoConvert::InstanceGroupToProto(*instance_group, instance_group_config);
+    }
+    status->set_code(proto::admin::OK);
+    request_context->set_status_code(status->code());
+    status->set_message("Instance group listed successfully");
+    KVCM_LOG_INFO("[traceId: %s] ListInstanceGroup succeeded", request->trace_id().c_str());
+}
+
 // Cache相关接口实现
 void AdminServiceImpl::GetCacheMeta(RequestContext *request_context,
                                     const proto::admin::GetCacheMetaRequest *request,
@@ -787,11 +815,11 @@ void AdminServiceImpl::GetMetrics(RequestContext *request_context,
         }
 
         // value
-        if (std::holds_alternative<CounterValue>(*val)) {
+        if (std::holds_alternative<CounterValue>(val->value)) {
             pb_data->mutable_metric_value()->set_int_value(
-                static_cast<std::int64_t>(std::get<CounterValue>(*val).load()));
-        } else if (std::holds_alternative<GaugeValue>(*val)) {
-            pb_data->mutable_metric_value()->set_float_value(std::get<GaugeValue>(*val).load());
+                static_cast<std::int64_t>(std::get<CounterValue>(val->value).load()));
+        } else if (std::holds_alternative<GaugeValue>(val->value)) {
+            pb_data->mutable_metric_value()->set_float_value(std::get<GaugeValue>(val->value).load());
         }
     }
 
@@ -824,7 +852,7 @@ void AdminServiceImpl::CheckHealth(RequestContext *request_context,
     status->set_code(proto::admin::OK);
     request_context->set_status_code(status->code());
     status->set_message("Health check completed");
-    KVCM_LOG_INFO("[traceId: %s] CheckHealth succeeded", request->trace_id().c_str());
+    KVCM_LOG_DEBUG("[traceId: %s] CheckHealth succeeded", request->trace_id().c_str());
 }
 
 void AdminServiceImpl::GetManagerClusterInfo(RequestContext *request_context,

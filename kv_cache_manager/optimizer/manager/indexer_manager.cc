@@ -10,7 +10,8 @@ OptIndexerManager::OptIndexerManager(const std::shared_ptr<OptEvictionManager> &
 bool OptIndexerManager::CreateOptIndexer(const OptInstanceConfig &instance_config,
                                          const std::vector<OptTierConfig> &storage_configs,
                                          bool hierarchical_eviction_enabled,
-                                         int64_t default_ttl_us) {
+                                         TierWriteMode tier_write_mode,
+                                         int64_t default_ttl_ns) {
 
     std::string instance_id = instance_config.instance_id();
     auto indexer = GetOptIndexer(instance_id);
@@ -19,13 +20,18 @@ bool OptIndexerManager::CreateOptIndexer(const OptInstanceConfig &instance_confi
         return false;
     }
     // 每个index实例对应一个instance_config，以及包含多层
-    auto eviction_policy = eviction_manager_->CreateAndRegisterEvictionPolicy(
+    auto *policy_group = eviction_manager_->CreateAndRegisterEvictionPolicy(
         instance_config, storage_configs, hierarchical_eviction_enabled);
-    if (!eviction_policy) {
+    if (!policy_group) {
         KVCM_LOG_ERROR("Failed to create eviction policy for instance_id: %s", instance_id.c_str());
         return false;
     }
-    indexer = std::make_shared<RadixTreeIndex>(instance_id, eviction_policy, default_ttl_us);
+
+    // 传递策略列表与写入模式给 RadixTreeIndex
+    // 非分层模式下 tier_write_mode 被忽略（tier_policies_ 中仅含单个 "shared" 策略，全层写等同单层写）
+    const TieredPolicyGroup *group_ptr = policy_group;
+    const TierWriteMode effective_mode = hierarchical_eviction_enabled ? tier_write_mode : TierWriteMode::WRITE_THROUGH;
+    indexer = std::make_shared<RadixTreeIndex>(instance_id, group_ptr->policies, effective_mode, default_ttl_ns);
 
     opt_indexer_map_[instance_id] = indexer;
     KVCM_LOG_INFO("Create optimizer indexer success, instance_id: %s", instance_id.c_str());
@@ -74,7 +80,8 @@ OptIndexerManager::EvictedBlocks OptIndexerManager::EvictExpiredBeforeAccess(con
     return eviction_manager_->ActiveEvictExpired(group_config, current_timestamp);
 }
 
-OptIndexerManager::EvictedBlocks OptIndexerManager::CheckAndEvict(const std::string &instance_id) {
+OptIndexerManager::EvictedBlocks OptIndexerManager::CheckAndEvict(const std::string &instance_id,
+                                                                  int64_t eviction_timestamp) {
     EvictedBlocks empty_result;
 
     auto instance_it = instance_configs_.find(instance_id);
@@ -94,8 +101,8 @@ OptIndexerManager::EvictedBlocks OptIndexerManager::CheckAndEvict(const std::str
     }
     const auto &group_config = group_it->second;
 
-    // ---- 容量压力驱逐（是否需要由 eviction_manager 内部统一判定） ----
-    return eviction_manager_->EvictByMode(instance_id, group_config);
+    // 统一驱逐入口：内部根据 hierarchical_eviction_enabled 与 tier_write_mode 决定分支
+    return eviction_manager_->EvictByMode(instance_id, group_config, eviction_timestamp);
 }
 
 void OptIndexerManager::CleanEvictedBlocks(const EvictedBlocks &evicted_blocks,
@@ -104,12 +111,21 @@ void OptIndexerManager::CleanEvictedBlocks(const EvictedBlocks &evicted_blocks,
     if (evicted_blocks.empty()) {
         return;
     }
-    for (const auto &evicted_block : evicted_blocks) {
-        auto indexer = GetOptIndexer(evicted_block.first);
-        KVCM_LOG_DEBUG(
-            "Evicted %zu blocks from instance_id: %s", evicted_block.second.size(), evicted_block.first.c_str());
-        if (indexer) {
-            indexer->CleanEmptyBlocks(evicted_block.second, eviction_timestamp, use_logical_expire_time);
+    for (const auto &[inst_id, blocks] : evicted_blocks) {
+        auto indexer = GetOptIndexer(inst_id);
+        if (!indexer) {
+            continue;
+        }
+        std::vector<BlockEntry *> truly_evicted;
+        for (auto *block : blocks) {
+            if (block->location_map.empty()) {
+                truly_evicted.push_back(block);
+            }
+        }
+        if (!truly_evicted.empty()) {
+            // 传入 eviction_timestamp + use_logical_expire_time 标志，
+            // 由 CleanEmptyBlocks 内部 per-block 计算各自的 logical expire time，
+            indexer->CleanEmptyBlocks(truly_evicted, eviction_timestamp, use_logical_expire_time);
         }
     }
 }

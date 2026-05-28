@@ -19,7 +19,9 @@ namespace kv_cache_manager {
 
 class OptimizerManager {
 public:
-    OptimizerManager(const OptimizerConfig &config, bool enable_lifecycle_tracking = false);
+    OptimizerManager(const OptimizerConfig &config,
+                     bool enable_lifecycle_tracking = false,
+                     bool enable_template_analysis = false);
     ~OptimizerManager() = default;
     bool Init();
 
@@ -77,5 +79,6 @@ private:
     TemplatePrefixTracker *template_prefix_tracker_ = nullptr;
 
     bool enable_lifecycle_tracking_ = false;
+    bool enable_template_analysis_ = false;
 };
 } // namespace kv_cache_manager

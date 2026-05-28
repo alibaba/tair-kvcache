@@ -23,8 +23,8 @@ TemplatePrefixTracker::TemplatePrefixTracker(const Config &config)
 
 void TemplatePrefixTracker::OnReadComplete(const std::string &instance_id, const ReadRecord &record) {
     auto &data = instance_data_[instance_id];
-    size_t total = record.external_read_blocks + record.internal_read_blocks;
-    size_t hit = record.external_hit_blocks + record.internal_hit_blocks;
+    size_t total = record.remote_read_blocks + record.local_read_blocks;
+    size_t hit = record.remote_hit_blocks + record.local_hit_blocks;
 
     TraceReadInfo info;
     info.trace_id = record.trace_id;

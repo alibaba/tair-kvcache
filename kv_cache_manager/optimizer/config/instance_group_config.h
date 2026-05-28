@@ -6,6 +6,7 @@
 #include "kv_cache_manager/common/jsonizable.h"
 #include "kv_cache_manager/optimizer/config/instance_config.h"
 #include "kv_cache_manager/optimizer/config/tier_config.h"
+#include "kv_cache_manager/optimizer/config/types.h"
 namespace kv_cache_manager {
 
 class OptInstanceGroupConfig : public Jsonizable {
@@ -20,6 +21,7 @@ public:
     [[nodiscard]] int64_t quota_capacity() const { return quota_capacity_; }
     [[nodiscard]] double used_percentage() const { return used_percentage_; }
     [[nodiscard]] bool hierarchical_eviction_enabled() const { return hierarchical_eviction_enabled_; }
+    [[nodiscard]] TierWriteMode tier_write_mode() const { return tier_write_mode_; }
     [[nodiscard]] int64_t default_block_ttl_seconds() const { return default_block_ttl_seconds_; }
     [[nodiscard]] bool ttl_refresh_on_read() const { return ttl_refresh_on_read_; }
     [[nodiscard]] const std::vector<OptTierConfig> &storages() const { return storages_; }
@@ -30,6 +32,7 @@ public:
     void set_quota_capacity(int64_t capacity) { quota_capacity_ = capacity; }
     void set_used_percentage(double percentage) { used_percentage_ = percentage; }
     void set_hierarchical_eviction_enabled(bool enabled) { hierarchical_eviction_enabled_ = enabled; }
+    void set_tier_write_mode(TierWriteMode mode) { tier_write_mode_ = mode; }
     void set_default_block_ttl_seconds(int64_t ttl) { default_block_ttl_seconds_ = ttl; }
     void set_ttl_refresh_on_read(bool enabled) { ttl_refresh_on_read_ = enabled; }
     void set_storages(const std::vector<OptTierConfig> &storages) { storages_ = storages; }
@@ -40,6 +43,7 @@ private:
     int64_t quota_capacity_ = 0;
     double used_percentage_ = 0.0;
     bool hierarchical_eviction_enabled_ = false;
+    TierWriteMode tier_write_mode_ = TierWriteMode::WRITE_THROUGH;
     int64_t default_block_ttl_seconds_ = 0; // 0 = TTL 关闭
     bool ttl_refresh_on_read_ = true;
 

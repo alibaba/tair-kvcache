@@ -73,7 +73,8 @@ DEFINE_METRICS_NAME_FOR_MANAGER(batch_update_location_time_us);
     REGISTER_METRICS_W_TAGS_GAUGE_(metrics_registry_, meta_searcher, name, metrics_tags_)
 
 DEFINE_METRICS_NAME_FOR_META_SEARCHER(indexer_get_time_us);
-DEFINE_METRICS_NAME_FOR_META_SEARCHER(indexer_read_modify_write_time_us);
+DEFINE_METRICS_NAME_FOR_META_SEARCHER(indexer_read_modify_write_block_time_us);
+DEFINE_METRICS_NAME_FOR_META_SEARCHER(indexer_read_modify_write_location_time_us);
 DEFINE_METRICS_NAME_FOR_META_SEARCHER(index_serialize_time_us);
 DEFINE_METRICS_NAME_FOR_META_SEARCHER(index_deserialize_time_us);
 DEFINE_METRICS_NAME_FOR_META_SEARCHER(indexer_query_times);
@@ -93,9 +94,11 @@ DEFINE_METRICS_NAME_FOR_META_INDEXER(io_data_size);
 DEFINE_METRICS_NAME_FOR_META_INDEXER(put_io_time_us);
 DEFINE_METRICS_NAME_FOR_META_INDEXER(update_io_time_us);
 DEFINE_METRICS_NAME_FOR_META_INDEXER(upsert_io_time_us);
+DEFINE_METRICS_NAME_FOR_META_INDEXER(lock_wait_time_us);
 DEFINE_METRICS_NAME_FOR_META_INDEXER(delete_io_time_us);
 DEFINE_METRICS_NAME_FOR_META_INDEXER(get_io_time_us);
 DEFINE_METRICS_NAME_FOR_META_INDEXER(rand_io_time_us);
+DEFINE_METRICS_NAME_FOR_META_INDEXER(rmw_get_io_time_us);
 DEFINE_METRICS_NAME_FOR_META_INDEXER(read_modify_write_put_key_count);
 DEFINE_METRICS_NAME_FOR_META_INDEXER(read_modify_write_update_key_count);
 DEFINE_METRICS_NAME_FOR_META_INDEXER(read_modify_write_skip_key_count);
@@ -135,7 +138,8 @@ bool ServiceMetricsCollector::Init() {
 
     // meta searcher metrics
     REGISTER_GAUGE_METRICS_FOR_META_SEARCHER(indexer_get_time_us);
-    REGISTER_GAUGE_METRICS_FOR_META_SEARCHER(indexer_read_modify_write_time_us);
+    REGISTER_GAUGE_METRICS_FOR_META_SEARCHER(indexer_read_modify_write_block_time_us);
+    REGISTER_GAUGE_METRICS_FOR_META_SEARCHER(indexer_read_modify_write_location_time_us);
     REGISTER_GAUGE_METRICS_FOR_META_SEARCHER(index_serialize_time_us);
     REGISTER_GAUGE_METRICS_FOR_META_SEARCHER(index_deserialize_time_us);
     REGISTER_GAUGE_METRICS_FOR_META_SEARCHER(indexer_query_times);
@@ -151,9 +155,11 @@ bool ServiceMetricsCollector::Init() {
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER(put_io_time_us);
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER(update_io_time_us);
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER(upsert_io_time_us);
+    REGISTER_GAUGE_METRICS_FOR_META_INDEXER(lock_wait_time_us);
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER(delete_io_time_us);
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER(get_io_time_us);
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER(rand_io_time_us);
+    REGISTER_GAUGE_METRICS_FOR_META_INDEXER(rmw_get_io_time_us);
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER(read_modify_write_put_key_count);
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER(read_modify_write_update_key_count);
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER(read_modify_write_skip_key_count);
@@ -298,6 +304,7 @@ bool CacheManagerGroupMetricsCollector::Init() {
 
 DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector, cache_manager_instance, key_count);
 DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector, cache_manager_instance, byte_size);
+DEFINE_METRICS_NAME_FOR_CACHE_MANAGER(CacheManagerInstanceMetricsCollector, cache_manager_instance, max_lru_age_us);
 
 CacheManagerInstanceMetricsCollector::CacheManagerInstanceMetricsCollector(
     std::shared_ptr<MetricsRegistry> metrics_registry) noexcept
@@ -314,6 +321,7 @@ bool CacheManagerInstanceMetricsCollector::Init() {
 
     REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, key_count);
     REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, byte_size);
+    REGISTER_GAUGE_METRICS_FOR_CACHE_MANAGER(cache_manager_instance, max_lru_age_us);
 
     return true;
 }

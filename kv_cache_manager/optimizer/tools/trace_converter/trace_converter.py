@@ -205,12 +205,12 @@ def main():
 
     parser.add_argument('-i', '--input', required=True, nargs='+',
                         help='Input trace file path(s) (supports multiple files)')
-    parser.add_argument('-o', '--output', default=None, 
-                        help='Output file path (default: auto-generate based on input filename and mode)')
+    parser.add_argument('-o', '--output', default=None,
+                        help='Output file path (default: auto-generate based on input filename)')
     parser.add_argument('-f', '--format', required=True, choices=available_formats,
                         help=f'Input trace format (available: {", ".join(sorted(available_formats))})')
-    parser.add_argument('--mode', default='optimizer', choices=['optimizer', 'inference'],
-                        help='Output mode: optimizer (Get+Write) or inference (DialogTurn)')
+    parser.add_argument('--mode', default='optimizer', choices=['optimizer'],
+                        help='Output mode: optimizer (Get+Write)')
     parser.add_argument('--instance-id', default='instance', help='Default instance ID')
     parser.add_argument('--instance-block-sizes', default=None,
                         help='Per-instance block sizes (format: instance1:16,instance2:32)')
@@ -249,7 +249,7 @@ def main():
             input_dir = input_files[0].parent
             input_stem = "merged"
         
-        suffix = '_optimizer' if args.mode == 'optimizer' else '_inference'
+        suffix = '_optimizer'
         output_filename = f"{input_stem}{suffix}.jsonl"
         output_path = input_dir / output_filename
         print(f"📝 Auto-generated output file: {output_path}")
@@ -350,7 +350,7 @@ def main():
                 print(f"   Direct output to: {individual_output.name}")
             else:
                 input_path = Path(input_file)
-                suffix = '_optimizer' if args.mode == 'optimizer' else '_inference'
+                suffix = '_optimizer'
                 individual_output = input_path.parent / f"{input_path.stem}{suffix}.jsonl"
             
             # 断点续传：检查是否已存在
@@ -395,7 +395,7 @@ def main():
         if args.no_sort:
             print("   Mode: No sorting")
         else:
-            print("   Mode: Sort by timestamp_us")
+            print("   Mode: Sort by timestamp_ns")
         
         merged_count = merge_jsonl_files(
             input_files=converted_files,

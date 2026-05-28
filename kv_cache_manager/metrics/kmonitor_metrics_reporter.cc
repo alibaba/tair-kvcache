@@ -64,7 +64,8 @@ struct KmonitorMetricsReporter::Context {
 
     // meta searcher metrics
     DECLARE_METRICS(meta_searcher, indexer_get_time_us);
-    DECLARE_METRICS(meta_searcher, indexer_read_modify_write_time_us);
+    DECLARE_METRICS(meta_searcher, indexer_read_modify_write_block_time_us);
+    DECLARE_METRICS(meta_searcher, indexer_read_modify_write_location_time_us);
     DECLARE_METRICS(meta_searcher, index_serialize_time_us);
     DECLARE_METRICS(meta_searcher, index_deserialize_time_us);
     DECLARE_METRICS(meta_searcher, indexer_query_times);
@@ -80,9 +81,11 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(meta_indexer, put_io_time_us);
     DECLARE_METRICS(meta_indexer, update_io_time_us);
     DECLARE_METRICS(meta_indexer, upsert_io_time_us);
+    DECLARE_METRICS(meta_indexer, lock_wait_time_us);
     DECLARE_METRICS(meta_indexer, delete_io_time_us);
     DECLARE_METRICS(meta_indexer, get_io_time_us);
     DECLARE_METRICS(meta_indexer, rand_io_time_us);
+    DECLARE_METRICS(meta_indexer, rmw_get_io_time_us);
     DECLARE_METRICS(meta_indexer, read_modify_write_put_key_count);
     DECLARE_METRICS(meta_indexer, read_modify_write_update_key_count);
     DECLARE_METRICS(meta_indexer, read_modify_write_skip_key_count);
@@ -125,11 +128,19 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(cache_reclaimer, reclaim_lru_filter_duration_us);
     DECLARE_METRICS(cache_reclaimer, reclaim_lru_submit_duration_us);
 
+    DECLARE_METRICS(cache_reclaimer, reclaim_batch_lru_age_min_us);
+    DECLARE_METRICS(cache_reclaimer, reclaim_batch_lru_age_max_us);
+    DECLARE_METRICS(cache_reclaimer, reclaim_batch_lru_age_avg_us);
+    DECLARE_METRICS(cache_reclaimer, reclaim_batch_create_age_min_us);
+    DECLARE_METRICS(cache_reclaimer, reclaim_batch_create_age_max_us);
+    DECLARE_METRICS(cache_reclaimer, reclaim_batch_create_age_avg_us);
+
     // cache manager
     DECLARE_METRICS(cache_manager, write_location_expire_size);
     DECLARE_METRICS(cache_manager_group, usage_ratio);
     DECLARE_METRICS(cache_manager_instance, key_count);
     DECLARE_METRICS(cache_manager_instance, byte_size);
+    DECLARE_METRICS(cache_manager_instance, max_lru_age_us);
 
     struct MapHashFunc {
         size_t operator()(const std::map<std::string, std::string> &m) const noexcept {
@@ -282,7 +293,8 @@ bool KmonitorMetricsReporter::InitMetrics() {
 
     // meta searcher metrics
     REGISTER_GAUGE_METRIC(meta_searcher, indexer_get_time_us);
-    REGISTER_GAUGE_METRIC(meta_searcher, indexer_read_modify_write_time_us);
+    REGISTER_GAUGE_METRIC(meta_searcher, indexer_read_modify_write_block_time_us);
+    REGISTER_GAUGE_METRIC(meta_searcher, indexer_read_modify_write_location_time_us);
     REGISTER_GAUGE_METRIC(meta_searcher, index_serialize_time_us);
     REGISTER_GAUGE_METRIC(meta_searcher, index_deserialize_time_us);
     REGISTER_GAUGE_METRIC(meta_searcher, indexer_query_times);
@@ -298,9 +310,11 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(meta_indexer, put_io_time_us);
     REGISTER_GAUGE_METRIC(meta_indexer, update_io_time_us);
     REGISTER_GAUGE_METRIC(meta_indexer, upsert_io_time_us);
+    REGISTER_GAUGE_METRIC(meta_indexer, lock_wait_time_us);
     REGISTER_GAUGE_METRIC(meta_indexer, delete_io_time_us);
     REGISTER_GAUGE_METRIC(meta_indexer, get_io_time_us);
     REGISTER_GAUGE_METRIC(meta_indexer, rand_io_time_us);
+    REGISTER_GAUGE_METRIC(meta_indexer, rmw_get_io_time_us);
     REGISTER_GAUGE_METRIC(meta_indexer, read_modify_write_put_key_count);
     REGISTER_GAUGE_METRIC(meta_indexer, read_modify_write_update_key_count);
     REGISTER_GAUGE_METRIC(meta_indexer, read_modify_write_skip_key_count);
@@ -343,11 +357,19 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_lru_filter_duration_us);
     REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_lru_submit_duration_us);
 
+    REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_batch_lru_age_min_us);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_batch_lru_age_max_us);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_batch_lru_age_avg_us);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_batch_create_age_min_us);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_batch_create_age_max_us);
+    REGISTER_GAUGE_METRIC(cache_reclaimer, reclaim_batch_create_age_avg_us);
+
     // cache manager
     REGISTER_GAUGE_METRIC(cache_manager, write_location_expire_size);
     REGISTER_GAUGE_METRIC(cache_manager_group, usage_ratio);
     REGISTER_GAUGE_METRIC(cache_manager_instance, key_count);
     REGISTER_GAUGE_METRIC(cache_manager_instance, byte_size);
+    REGISTER_GAUGE_METRIC(cache_manager_instance, max_lru_age_us);
 
     return true;
 }
@@ -424,7 +446,8 @@ void KmonitorMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
 
         // meta searcher metrics
         REPORT_COLLECTED_METRICS(meta_searcher, indexer_get_time_us);
-        REPORT_STEAL_METRICS(meta_searcher, indexer_read_modify_write_time_us);
+        REPORT_STEAL_METRICS(meta_searcher, indexer_read_modify_write_block_time_us);
+        REPORT_STEAL_METRICS(meta_searcher, indexer_read_modify_write_location_time_us);
         REPORT_STEAL_METRICS(meta_searcher, index_serialize_time_us);
         REPORT_COLLECTED_METRICS(meta_searcher, index_deserialize_time_us);
         REPORT_COLLECTED_METRICS(meta_searcher, indexer_query_times);
@@ -440,9 +463,11 @@ void KmonitorMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
         REPORT_COLLECTED_METRICS(meta_indexer, put_io_time_us);
         REPORT_COLLECTED_METRICS(meta_indexer, update_io_time_us);
         REPORT_STEAL_METRICS(meta_indexer, upsert_io_time_us);
+        REPORT_STEAL_METRICS(meta_indexer, lock_wait_time_us);
         REPORT_COLLECTED_METRICS(meta_indexer, delete_io_time_us);
         REPORT_COLLECTED_METRICS(meta_indexer, get_io_time_us);
         REPORT_COLLECTED_METRICS(meta_indexer, rand_io_time_us);
+        REPORT_COLLECTED_METRICS(meta_indexer, rmw_get_io_time_us);
         REPORT_STEAL_METRICS(meta_indexer, read_modify_write_put_key_count);
         REPORT_COLLECTED_METRICS(meta_indexer, read_modify_write_update_key_count);
         REPORT_COLLECTED_METRICS(meta_indexer, read_modify_write_skip_key_count);
@@ -514,15 +539,15 @@ void KmonitorMetricsReporter::ReportInterval() {
             break;
         }
 
-        std::uint64_t w_task_count_v;
-        std::uint64_t e_task_count_v;
+        double w_task_count_v;
+        double e_task_count_v;
 
         GET_METRICS_(spe, schedule_plan_executor, waiting_task_count, w_task_count_v);
         GET_METRICS_(spe, schedule_plan_executor, executing_task_count, e_task_count_v);
 
         const kmonitor::MetricsTags tags;
-        REPORT_METRICS(scheduler_plan_executor, waiting_task_count, static_cast<double>(w_task_count_v));
-        REPORT_METRICS(scheduler_plan_executor, executing_task_count, static_cast<double>(e_task_count_v));
+        REPORT_METRICS(scheduler_plan_executor, waiting_task_count, w_task_count_v);
+        REPORT_METRICS(scheduler_plan_executor, executing_task_count, e_task_count_v);
     } while (false);
 
     do {
@@ -550,6 +575,13 @@ void KmonitorMetricsReporter::ReportInterval() {
         double reclaim_lru_filter_duration_us_v;
         double reclaim_lru_submit_duration_us_v;
 
+        double reclaim_batch_lru_age_min_us_v;
+        double reclaim_batch_lru_age_max_us_v;
+        double reclaim_batch_lru_age_avg_us_v;
+        double reclaim_batch_create_age_min_us_v;
+        double reclaim_batch_create_age_max_us_v;
+        double reclaim_batch_create_age_avg_us_v;
+
         GET_METRICS_(cr, cache_reclaimer, reclaim_cron_count, reclaim_cron_count_v);
         GET_METRICS_(cr, cache_reclaimer, reclaim_job_count, reclaim_job_count_v);
         GET_METRICS_(cr, cache_reclaimer, block_submit_count, blk_submit_count_v);
@@ -565,6 +597,13 @@ void KmonitorMetricsReporter::ReportInterval() {
         GET_METRICS_(cr, cache_reclaimer, reclaim_lru_batch_duration_us, reclaim_lru_batch_duration_us_v);
         GET_METRICS_(cr, cache_reclaimer, reclaim_lru_filter_duration_us, reclaim_lru_filter_duration_us_v);
         GET_METRICS_(cr, cache_reclaimer, reclaim_lru_submit_duration_us, reclaim_lru_submit_duration_us_v);
+
+        GET_METRICS_(cr, cache_reclaimer, reclaim_batch_lru_age_min_us, reclaim_batch_lru_age_min_us_v);
+        GET_METRICS_(cr, cache_reclaimer, reclaim_batch_lru_age_max_us, reclaim_batch_lru_age_max_us_v);
+        GET_METRICS_(cr, cache_reclaimer, reclaim_batch_lru_age_avg_us, reclaim_batch_lru_age_avg_us_v);
+        GET_METRICS_(cr, cache_reclaimer, reclaim_batch_create_age_min_us, reclaim_batch_create_age_min_us_v);
+        GET_METRICS_(cr, cache_reclaimer, reclaim_batch_create_age_max_us, reclaim_batch_create_age_max_us_v);
+        GET_METRICS_(cr, cache_reclaimer, reclaim_batch_create_age_avg_us, reclaim_batch_create_age_avg_us_v);
 
         const kmonitor::MetricsTags tags;
         REPORT_METRICS(cache_reclaimer, reclaim_cron_count, static_cast<double>(reclaim_cron_count_v));
@@ -582,6 +621,13 @@ void KmonitorMetricsReporter::ReportInterval() {
         REPORT_METRICS(cache_reclaimer, reclaim_lru_batch_duration_us, reclaim_lru_batch_duration_us_v);
         REPORT_METRICS(cache_reclaimer, reclaim_lru_filter_duration_us, reclaim_lru_filter_duration_us_v);
         REPORT_METRICS(cache_reclaimer, reclaim_lru_submit_duration_us, reclaim_lru_submit_duration_us_v);
+
+        REPORT_METRICS(cache_reclaimer, reclaim_batch_lru_age_min_us, reclaim_batch_lru_age_min_us_v);
+        REPORT_METRICS(cache_reclaimer, reclaim_batch_lru_age_max_us, reclaim_batch_lru_age_max_us_v);
+        REPORT_METRICS(cache_reclaimer, reclaim_batch_lru_age_avg_us, reclaim_batch_lru_age_avg_us_v);
+        REPORT_METRICS(cache_reclaimer, reclaim_batch_create_age_min_us, reclaim_batch_create_age_min_us_v);
+        REPORT_METRICS(cache_reclaimer, reclaim_batch_create_age_max_us, reclaim_batch_create_age_max_us_v);
+        REPORT_METRICS(cache_reclaimer, reclaim_batch_create_age_avg_us, reclaim_batch_create_age_avg_us_v);
     } while (false);
 
     do {
@@ -614,11 +660,13 @@ void KmonitorMetricsReporter::ReportInterval() {
             for (const auto &mc : vec) {
                 if (const auto p = std::dynamic_pointer_cast<CacheManagerInstanceMetricsCollector>(mc); p != nullptr) {
                     const kmonitor::MetricsTags tags = ctx_->GetKmonitorTags(p->GetMetricsTags());
-                    double key_count_v, byte_size_v;
+                    double key_count_v, byte_size_v, max_lru_age_us_v;
                     GET_METRICS_(p, cache_manager_instance, key_count, key_count_v);
                     REPORT_METRICS(cache_manager_instance, key_count, key_count_v);
                     GET_METRICS_(p, cache_manager_instance, byte_size, byte_size_v);
                     REPORT_METRICS(cache_manager_instance, byte_size, byte_size_v);
+                    GET_METRICS_(p, cache_manager_instance, max_lru_age_us, max_lru_age_us_v);
+                    REPORT_METRICS(cache_manager_instance, max_lru_age_us, max_lru_age_us_v);
                 }
             }
         }

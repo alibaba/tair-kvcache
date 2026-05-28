@@ -4,6 +4,7 @@
 #include <cstdint>
 
 #include "kv_cache_manager/common/jsonizable.h"
+#include "kv_cache_manager/common/service_discovery.h"
 
 namespace kv_cache_manager {
 
@@ -15,7 +16,8 @@ enum class DataStorageType : uint8_t {
     DATA_STORAGE_TYPE_NFS = 4,
     DATA_STORAGE_TYPE_VCNS_HF3FS = 5,
     DATA_STORAGE_TYPE_DUMMY = 6,
-    COUNT, // as sentinel
+    DATA_STORAGE_TYPE_VINEYARD = 7,
+    COUNT, // as sentinel, must be last
 };
 
 std::string ToString(const DataStorageType &type);
@@ -132,6 +134,13 @@ private:
     std::string master_server_entry_{"localhost:50051"}; // master server
 };
 
+/**
+ * Tair MemPool（PACE）存储 spec。
+ *
+ * 服务发现配置统一通过 service_discovery_url_ 表达，URL 解析与具体实现选择由
+ * kv_cache_manager::CreateServiceDiscovery() 工厂负责。空字符串表示不使用服务发现，
+ * 直接使用 domain_。具体支持的 URL 形式见 service_discovery_factory.h。
+ */
 class TairMemPoolStorageSpec : public StorageSpec {
 public:
     bool FromRapidValue(const rapidjson::Value &rapid_value) override;
@@ -140,21 +149,19 @@ public:
     std::string ToString() const override;
     const std::string &cluster_name() const { return cluster_name_; }
     const std::string &domain() const { return domain_; }
-    const std::string &vipserver_domain() const { return vipserver_domain_; }
     int64_t timeout() const { return timeout_; }
-    const bool enable_vipserver() const { return enable_vipserver_; }
+    const std::string &service_discovery_url() const { return service_discovery_url_; }
+
     void set_domain(const std::string &domain) { domain_ = domain; }
-    void set_vipserver_domain(const std::string &vipserver_domain) { vipserver_domain_ = vipserver_domain; }
     void set_cluster_name(const std::string &cluster_name) { cluster_name_ = cluster_name; }
     void set_timeout(int64_t timeout) { timeout_ = timeout; }
-    void set_enable_vipserver(bool enable_vipserver) { enable_vipserver_ = enable_vipserver; }
+    void set_service_discovery_url(const std::string &url) { service_discovery_url_ = url; }
 
 private:
-    std::string domain_;            // 统一接入
-    std::string vipserver_domain_;  // vipserver
-    int64_t timeout_{0};            // 目前连接超时、请求超时时间的值一样
-    bool enable_vipserver_ = false; // 是否使用vipserver
-    std::string cluster_name_;      // TODO proto中没有这个字段并且未使用，考虑删除
+    std::string domain_;                // 统一接入
+    int64_t timeout_{0};                // 目前连接超时、请求超时时间的值一样
+    std::string service_discovery_url_; // 见类注释
+    std::string cluster_name_;          // TODO proto中没有这个字段并且未使用，考虑删除
 };
 
 class NfsStorageSpec : public StorageSpec {
@@ -189,6 +196,34 @@ public:
 private:
     std::string root_path_;
     int32_t key_count_per_file_ = 0;
+};
+
+class VineyardStorageSpec : public StorageSpec {
+public:
+    static constexpr int64_t kDefaultHeartbeatTimeoutMs = 30 * 1000;
+    static constexpr int64_t kDefaultCleanupGraceMs = 5 * 60 * 1000;
+    static constexpr int64_t kDefaultLivenessCheckIntervalMs = 5 * 1000;
+
+    bool FromRapidValue(const rapidjson::Value &rapid_value) override;
+    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
+    bool ValidateRequiredFields(std::string &invalid_fields) const override;
+    std::string ToString() const override;
+
+    const std::string &cluster_name() const { return cluster_name_; }
+    int64_t heartbeat_timeout_ms() const { return heartbeat_timeout_ms_; }
+    int64_t cleanup_grace_ms() const { return cleanup_grace_ms_; }
+    int64_t liveness_check_interval_ms() const { return liveness_check_interval_ms_; }
+
+    void set_cluster_name(const std::string &cluster_name) { cluster_name_ = cluster_name; }
+    void set_heartbeat_timeout_ms(int64_t v) { heartbeat_timeout_ms_ = v; }
+    void set_cleanup_grace_ms(int64_t v) { cleanup_grace_ms_ = v; }
+    void set_liveness_check_interval_ms(int64_t v) { liveness_check_interval_ms_ = v; }
+
+private:
+    std::string cluster_name_;
+    int64_t heartbeat_timeout_ms_ = kDefaultHeartbeatTimeoutMs;
+    int64_t cleanup_grace_ms_ = kDefaultCleanupGraceMs;
+    int64_t liveness_check_interval_ms_ = kDefaultLivenessCheckIntervalMs;
 };
 
 class StorageConfig : public Jsonizable {

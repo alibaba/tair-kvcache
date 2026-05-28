@@ -1,7 +1,10 @@
 #include "kv_cache_manager/manager/cache_manager_metrics_recorder.h"
 
+#include <climits>
+
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
+#include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/instance_info.h"
 #include "kv_cache_manager/config/registry_manager.h"
@@ -97,22 +100,15 @@ void CacheManagerMetricsRecorder::RecorderLoop() {
                 }
                 meta_indexer->PersistMetaData();
                 const std::size_t key_cnt = meta_indexer->GetKeyCount();
-                std::size_t byte_size = 0;
-                if (meta_indexer->GetVersion() == MetaIndexer::InstanceVersion::VERSION_0) {
-                    std::size_t byte_size_per_key = 0;
-                    for (auto &location_spec_info : instance_info->location_spec_infos()) {
-                        byte_size_per_key += location_spec_info.size();
-                    }
-                    byte_size = byte_size_per_key * key_cnt;
-                } else if (meta_indexer->GetVersion() == MetaIndexer::InstanceVersion::VERSION_1) {
-                    byte_size = meta_indexer->GetStorageUsage();
-                } else {
-                    KVCM_LOG_WARN("unknown meta_indexer version: [%" PRIu8 "]",
-                                  static_cast<std::uint8_t>(meta_indexer->GetVersion()));
-                    continue;
-                }
+                const std::size_t byte_size = meta_indexer->GetStorageUsage();
                 group_byte_size += byte_size;
-                group_instance_id_metric_map[instance_group_name][instance_id] = InstanceMetric({key_cnt, byte_size});
+                const int64_t oldest_access_time = meta_indexer->GetOldestAccessTime();
+                int64_t max_lru_age_us = 0;
+                if (oldest_access_time < INT64_MAX) {
+                    max_lru_age_us = TimestampUtil::GetCurrentTimeUs() - oldest_access_time;
+                }
+                group_instance_id_metric_map[instance_group_name][instance_id] =
+                    InstanceMetric({key_cnt, byte_size, max_lru_age_us});
             }
             int64_t capacity = instance_group->quota().capacity();
             group_usage_ratio_map[instance_group_name] =

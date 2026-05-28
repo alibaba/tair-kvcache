@@ -8,7 +8,7 @@ Trace 文件合并与排序工具
 - 流式归并：利用已排序文件，内存O(k)
 - 直接拼接：无排序，更快
 
-前提: converter保证输出文件已按timestamp_us排序
+前提: JSONL 每行须含 timestamp_ns（由 trace_converter 产出）；各文件内该字段单调非降。
 """
 
 import json
@@ -20,16 +20,21 @@ from typing import List, Iterator, Tuple, Any
 
 
 def _trace_iterator(file_path: Path) -> Iterator[Tuple[int, dict]]:
-    """生成 (timestamp_us, trace) 元组"""
+    """生成 (timestamp_ns, trace)。"""
     with open(file_path, 'r', encoding='utf-8') as f:
-        for line in f:
+        for line_no, line in enumerate(f, 1):
             line = line.strip()
             if not line:
                 continue
-            
+
             trace = json.loads(line)
-            timestamp = trace.get('timestamp_us', 0)
-            yield (timestamp, trace)
+            if "timestamp_ns" not in trace:
+                raise ValueError(
+                    f"Missing 'timestamp_ns' in {file_path}:{line_no} — "
+                    f"this field is required (produced by trace_converter). "
+                    f"If using legacy trace with 'timestamp_us', run trace_converter first."
+                )
+            yield (int(trace["timestamp_ns"]), trace)
 
 
 def _sorted_merge_impl(input_files: List[Path], output_file: Path) -> int:
@@ -127,7 +132,7 @@ def merge_jsonl_files(
     """
     合并JSONL文件
     
-    前提（sort模式）: 所有input文件已按timestamp_us排序
+    前提（sort模式）: 各文件内 timestamp_ns 已单调非降
     """
     if not input_files:
         raise ValueError("input_files cannot be empty")

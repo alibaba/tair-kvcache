@@ -63,19 +63,11 @@ class QwenBailianConverter(BaseConverter):
                     # 应用前缀哈希转换
                     block_keys = apply_prefix_hash(hash_ids)
 
-                    # 根据模式生成不同格式
-                    if self.mode == 'optimizer':
-                        # Optimizer模式: 生成Get+Write
-                        batch_traces = self._generate_optimizer_traces(
-                            timestamp, block_keys, input_length, output_length
-                        )
-                        traces.extend(batch_traces)
-                    else:
-                        # Inference模式: 生成DialogTurn
-                        trace = self._generate_inference_trace(
-                            timestamp, block_keys, input_length, output_length
-                        )
-                        traces.append(trace)
+                    # 生成Get+Write traces
+                    batch_traces = self._generate_optimizer_traces(
+                        timestamp, block_keys, input_length, output_length
+                    )
+                    traces.extend(batch_traces)
 
                 except json.JSONDecodeError as e:
                     # 提供更详细的错误诊断
@@ -92,7 +84,7 @@ class QwenBailianConverter(BaseConverter):
                     continue
 
         # 按timestamp排序（保证输出有序）
-        traces.sort(key=lambda t: t.get('timestamp_us', 0))
+        traces.sort(key=lambda t: t.get("timestamp_ns", 0))
 
         return traces
 
@@ -115,55 +107,21 @@ class QwenBailianConverter(BaseConverter):
         Returns:
             [Get trace, Write trace]
         """
-        base_timestamp_us = int(timestamp * 1000000)
+        base_timestamp_ns = int(timestamp * 1_000_000_000)
 
         # hash_ids本身就是input的完整block keys,直接使用
         # Get trace (prefill阶段) - 显式使用default_instance_id
         get_trace = self._create_get_trace(
-            timestamp_us=base_timestamp_us,
+            timestamp_ns=base_timestamp_ns,
             keys=block_keys,
             instance_id=self.default_instance_id
         )
 
-        # Write trace (prefill阶段, 时间戳+1微秒) - 显式使用default_instance_id
+        # Write trace (prefill阶段, 时间戳+1纳秒) - 显式使用default_instance_id
         write_trace = self._create_write_trace(
-            timestamp_us=base_timestamp_us + 1,
+            timestamp_ns=base_timestamp_ns + 1,
             keys=block_keys,
             instance_id=self.default_instance_id
         )
 
         return [get_trace, write_trace]
-
-    def _generate_inference_trace(
-        self,
-        timestamp: float,
-        block_keys: list,
-        input_length: int,
-        output_length: int
-    ) -> dict:
-        """
-        生成Inference格式的DialogTurn trace
-
-        Args:
-            timestamp: 原始时间戳(秒)
-            block_keys: block keys (hash_ids已经是input部分)
-            input_length: 输入token数
-            output_length: 输出token数
-
-        Returns:
-            DialogTurn trace
-        """
-        base_timestamp_us = int(timestamp * 1000000)
-
-        # hash_ids本身就是input的完整block keys,直接使用
-        # DialogTurn trace - 显式使用default_instance_id
-        dialog_trace = self._create_dialog_trace(
-            timestamp_us=base_timestamp_us,
-            keys=block_keys,
-            input_len=input_length,
-            output_len=output_length,
-            total_keys=block_keys,
-            instance_id=self.default_instance_id
-        )
-
-        return dialog_trace

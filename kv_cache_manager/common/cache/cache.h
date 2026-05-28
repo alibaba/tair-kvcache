@@ -152,6 +152,11 @@ struct ShardedCacheOptions {
     // (default), Insert() never fails.
     bool strict_capacity_limit = false;
 
+    // If true, Insert() will NOT evict existing entries to make room for the
+    // new entry. If capacity is exceeded, Insert() returns EC_NOSPC (requires
+    // strict_capacity_limit to also be true for the error to propagate).
+    bool no_evict_on_insert = false;
+
     // If non-nullptr, RocksDB will use this allocator instead of system
     // allocator when allocating memory for cache blocks.
     //
@@ -200,11 +205,13 @@ struct ShardedCacheOptions {
     ShardedCacheOptions(size_t _capacity,
                         int _num_shard_bits,
                         bool _strict_capacity_limit,
+                        bool _no_evict_on_insert = false,
                         std::shared_ptr<MemoryAllocator> _memory_allocator = nullptr,
                         CacheMetadataChargePolicy _metadata_charge_policy = kDefaultCacheMetadataChargePolicy)
         : capacity(_capacity)
         , num_shard_bits(_num_shard_bits)
         , strict_capacity_limit(_strict_capacity_limit)
+        , no_evict_on_insert(_no_evict_on_insert)
         , memory_allocator(std::move(_memory_allocator))
         , metadata_charge_policy(_metadata_charge_policy) {}
     // Make ShardedCacheOptions polymorphic
@@ -254,13 +261,18 @@ struct LRUCacheOptions : public ShardedCacheOptions {
     LRUCacheOptions(size_t _capacity,
                     int _num_shard_bits,
                     bool _strict_capacity_limit,
+                    bool _no_evict_on_insert,
                     double _high_pri_pool_ratio,
                     std::shared_ptr<MemoryAllocator> _memory_allocator = nullptr,
                     bool _use_adaptive_mutex = kDefaultToAdaptiveMutex,
                     CacheMetadataChargePolicy _metadata_charge_policy = kDefaultCacheMetadataChargePolicy,
                     double _low_pri_pool_ratio = 0.0)
-        : ShardedCacheOptions(
-              _capacity, _num_shard_bits, _strict_capacity_limit, std::move(_memory_allocator), _metadata_charge_policy)
+        : ShardedCacheOptions(_capacity,
+                              _num_shard_bits,
+                              _strict_capacity_limit,
+                              _no_evict_on_insert,
+                              std::move(_memory_allocator),
+                              _metadata_charge_policy)
         , high_pri_pool_ratio(_high_pri_pool_ratio)
         , low_pri_pool_ratio(_low_pri_pool_ratio)
         , use_adaptive_mutex(_use_adaptive_mutex) {}
@@ -278,6 +290,7 @@ inline std::shared_ptr<Cache>
 NewLRUCache(size_t capacity,
             int num_shard_bits = -1,
             bool strict_capacity_limit = false,
+            bool no_evict_on_insert = false,
             double high_pri_pool_ratio = 0.5,
             std::shared_ptr<MemoryAllocator> memory_allocator = nullptr,
             bool use_adaptive_mutex = kDefaultToAdaptiveMutex,
@@ -286,6 +299,7 @@ NewLRUCache(size_t capacity,
     return LRUCacheOptions(capacity,
                            num_shard_bits,
                            strict_capacity_limit,
+                           no_evict_on_insert,
                            high_pri_pool_ratio,
                            memory_allocator,
                            use_adaptive_mutex,
@@ -340,6 +354,7 @@ struct CompressedSecondaryCacheOptions : LRUCacheOptions {
         : LRUCacheOptions(_capacity,
                           _num_shard_bits,
                           _strict_capacity_limit,
+                          /*_no_evict_on_insert=*/false,
                           _high_pri_pool_ratio,
                           std::move(_memory_allocator),
                           _use_adaptive_mutex,
@@ -504,8 +519,12 @@ struct HyperClockCacheOptions : public ShardedCacheOptions {
                            bool _strict_capacity_limit = false,
                            std::shared_ptr<MemoryAllocator> _memory_allocator = nullptr,
                            CacheMetadataChargePolicy _metadata_charge_policy = kDefaultCacheMetadataChargePolicy)
-        : ShardedCacheOptions(
-              _capacity, _num_shard_bits, _strict_capacity_limit, std::move(_memory_allocator), _metadata_charge_policy)
+        : ShardedCacheOptions(_capacity,
+                              _num_shard_bits,
+                              _strict_capacity_limit,
+                              /*_no_evict_on_insert=*/false,
+                              std::move(_memory_allocator),
+                              _metadata_charge_policy)
         , estimated_entry_charge(_estimated_entry_charge) {}
 
     // Construct an instance of HyperClockCache using these options

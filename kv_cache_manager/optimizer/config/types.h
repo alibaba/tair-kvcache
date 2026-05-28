@@ -19,6 +19,13 @@ enum class EvictionMode {
     EVICTION_MODE_INSTANCE_ROUGH = 2,
     EVICTION_MODE_INSTANCE_PRECISE = 3
 };
+
+// Tier 写入模式：仅在 hierarchical_eviction_enabled=true 时生效。
+// 控制 block 在多 tier 间的流动方式，与分层开关正交。
+enum class TierWriteMode {
+    WRITE_THROUGH = 0, // 默认：写入时落所有 tier，各层独立驱逐
+    CASCADING = 1,     // 只写 tier 0，tier_i 驱逐出的 block 级联降级到 tier_{i+1}
+};
 struct TierStat {
     size_t access_count = 0;
     int64_t last_access_time = -1;
@@ -36,10 +43,10 @@ struct BlockEntry {
     int64_t writing_time = -1;
     int64_t last_access_time = -1;
     // TTL 续命锚点（与访问统计时间 last_access_time 解耦）。
-    // 不变式：仅在 ttl_us > 0 时有意义；IsExpired 已守卫 ttl_us <= 0，anchor = -1 不会误判。
+    // 不变式：仅在 ttl_ns > 0 时有意义；IsExpired 已守卫 ttl_ns <= 0，anchor = -1 不会误判。
     int64_t ttl_anchor_time = -1;
     size_t access_count = 0;
-    int64_t ttl_us = 0;                  // TTL 微秒，0 = 永不过期
+    int64_t ttl_ns = 0;                  // TTL 纳秒，0 = 永不过期
     RadixTreeNode *owner_node = nullptr; // 所属节点指针
 
     void ResetAccess() {
@@ -47,11 +54,11 @@ struct BlockEntry {
         last_access_time = -1;
         ttl_anchor_time = -1;
         writing_time = -1;
-        ttl_us = 0;
+        ttl_ns = 0;
     }
 
     bool IsExpired(int64_t current_timestamp) const {
-        return ttl_us > 0 && current_timestamp > ttl_anchor_time + ttl_us;
+        return ttl_ns > 0 && current_timestamp > ttl_anchor_time + ttl_ns;
     }
 };
 
@@ -80,6 +87,15 @@ struct RadixTreeNode {
     }
 };
 
+struct QueryHit {
+    size_t local_hit_block_num = 0;
+    size_t remote_hit_block_num = 0;
+    std::vector<size_t> per_tier_hit_block_num; // indexed by tier priority order
+};
+
 EvictionPolicyType ToEvictionPolicyType(const std::string &str);
 std::string ToString(const EvictionPolicyType &type);
+
+TierWriteMode ToTierWriteMode(const std::string &str);
+std::string ToString(const TierWriteMode &mode);
 } // namespace kv_cache_manager

@@ -51,6 +51,8 @@ bazel run //kv_cache_manager/optimizer/analysis/script:optimizer_run -- -c confi
 
 在多个容量点上运行 optimizer，绘制容量-命中率权衡曲线。自动判断单策略/多策略模式。
 
+> **适用范围**：Tradeoff 分析仅适用于非分层模式。在分层模式（`hierarchical_eviction_enabled=true`）下，容量扫描仅修改 `quota_capacity`，而驱逐决策依据各 tier 独立的 `storages[i].capacity`，因此扫描结果无法反映真实的容量-性能权衡关系。
+
 ### 单策略模式
 
 不指定 `--eviction-policies`，使用配置文件中的默认策略。每个 instance 一条曲线。
@@ -97,7 +99,7 @@ bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
 |------|------|------|------|
 | `-c, --config` | ✅ | — | 配置文件路径 |
 | `--eviction-policies` | — | 配置默认 | 驱逐策略列表（空格分隔） |
-| `--warmup-capacity` | — | 30000000 | warmup 阶段容量 |
+| `--warmup-capacity` | — | 10000 | warmup 阶段容量（GB） |
 | `--num-points` | — | 40 | 容量采样点数（指数分布） |
 | `--hit-rate-type` | — | total | 命中率类型：total / internal / external / all |
 | `--max-workers` | — | 4 | 并行实验线程数 |
@@ -107,6 +109,8 @@ bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
 | `--skip-run` | — | false | 跳过实验，从已有 CSV 加载 |
 | `--plot-timeseries` | — | false | 为容量点生成时序图（需 `--save-csv` 或 `--skip-run`） |
 | `--plot-capacity` | — | 全部 | 只为指定容量点生成时序图（空格分隔） |
+| `--plot-per-tier` | — | false | 绘制 per-tier 命中率对比曲线（所有层放在一起） |
+| `--plot-per-tier-timeseries` | — | false | 绘制 per-tier 命中率时序图（所有层放在一起） |
 | `--x-min/--x-max` | — | 自动 | X 轴（容量）范围 |
 | `--y-min/--y-max` | — | 0~1 | Y 轴（命中率）范围 |
 
@@ -116,9 +120,11 @@ bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
 <output_result_path>/
 ├── pareto/
 │   ├── pareto_curve_<type>.png           # 单策略 Pareto 散点图
-│   └── multi_policy_<type>.png           # 多策略对比子图
+│   ├── multi_policy_<type>.png           # 多策略对比子图
+│   └── per_tier_curves.png               # Per-Tier 命中率对比曲线（需 --plot-per-tier）
 ├── timeseries/
-│   └── multi_instance_cache_analysis.png # 时序图（需 --plot-timeseries）
+│   ├── multi_instance_cache_analysis.png # 时序图（需 --plot-timeseries）
+│   └── per_tier_timeseries.png           # Per-Tier 命中率时序图（需 --plot-per-tier-timeseries）
 └── csv_results/                          # 需 --save-csv
     └── cap_<capacity>_<policy>/
         ├── *_hit_rates.csv
@@ -259,6 +265,67 @@ bazel run //kv_cache_manager/optimizer/analysis/script:analyze_lifecycle -- \
 
 ---
 
+## 5. 多层存储 Per-Tier 分析
+
+分析多层存储（tiered storage）配置下各层的命中率表现。适用于启用了 `hierarchical_eviction_enabled` 的多层缓存场景。
+
+### 5.1 Per-Tier Pareto 曲线
+
+绘制不同存储层（L1/L2/L3等）的容量-命中率权衡曲线，在一张图上对比所有层。
+
+```bash
+# 单策略 + per-tier 对比曲线
+bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
+    -c config.json --plot-per-tier
+
+# 多策略 + per-tier 对比曲线（为每个策略生成独立图）
+bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
+    -c config.json --eviction-policies lru leaf_aware_lru --plot-per-tier
+
+# 从已有 CSV 加载 + 生成 per-tier 图
+bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
+    -c config.json --skip-run --plot-per-tier
+```
+
+### 5.2 Per-Tier 时序图
+
+绘制随时间变化的各层命中率时序曲线，观察不同层在仿真过程中的动态表现。
+
+```bash
+# 为所有容量点生成 per-tier 时序图
+bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
+    -c config.json --save-csv --plot-per-tier-timeseries
+
+# 只为特定容量点生成 per-tier 时序图
+bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
+    -c config.json --save-csv --plot-per-tier-timeseries --plot-capacity 5000000 10000000
+
+# 从已有 CSV 加载 + 生成 per-tier 时序图
+bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
+    -c config.json --skip-run --plot-per-tier-timeseries
+```
+
+### Per-Tier 参数说明
+
+| 参数 | 必需 | 默认 | 说明 |
+|------|------|------|------|
+| `--plot-per-tier` | — | false | 绘制 per-tier Pareto 对比曲线 |
+| `--plot-per-tier-timeseries` | — | false | 绘制 per-tier 时序图 |
+
+**注意**：per-tier 分析需要配置文件中使用多层存储（`hierarchical_eviction_enabled: true`），并且 CSV 中包含 `AccTier<N>(<tier_name>)_HitRate` 列。
+
+### 输出
+
+```
+<output_result_path>/
+├── pareto/
+│   └── per_tier_curves.png               # Per-Tier Pareto 对比曲线
+└── timeseries/
+    └── per_tier_timeseries.png           # Per-Tier 时序图（每个容量点一张）
+```
+
+---
+
 ## 库模块说明
 
 以下模块被 `run/` 入口脚本调用，不直接运行（`radix_tree_plot.py` 除外，见上文）。
@@ -273,7 +340,7 @@ bazel run //kv_cache_manager/optimizer/analysis/script:analyze_lifecycle -- \
 
 | 模块 | 说明 |
 |------|------|
-| `hit_rate_plot.py` | 命中率时序图绘制：读取 `*_hit_rates.csv`，绘制多 instance 双子图（命中率 + 缓存块数 ZOH 对齐）。被 `optimizer_run` 和 `tradeoff` 调用 |
+| `hit_rate_plot.py` | 命中率时序图绘制：读取 `*_hit_rates.csv`，绘制多 instance 双子图（命中率 + 缓存块数 ZOH 对齐）；per-tier 时序图。被 `optimizer_run` 和 `tradeoff` 调用 |
 | `radix_tree_plot.py` | RadixTree 可视化：完整树 / 热点路径绘图、热点节点统计。**可独立运行**（见第 3 节） |
 | `lifecycle_plot.py` | Physical/Active Lifespan CDF + Access Count 直方图（全量 + 去零两张子图）。被 `analyze_lifecycle` 调用 |
 
@@ -283,7 +350,7 @@ bazel run //kv_cache_manager/optimizer/analysis/script:analyze_lifecycle -- \
 |------|------|
 | `optimizer_runner.py` | optimizer 运行封装：配置加载、warmup pass、并行实验框架（ThreadPoolExecutor）。被 `optimizer_run`、`tradeoff`、`export_tree` 调用 |
 | `csv_loader.py` | CSV 结果加载、容量列表生成（指数分布采样）、`--skip-run` 模式的数据加载。被 `tradeoff` 调用 |
-| `plot_utils.py` | 统一绘图风格（`setup_plot_style`）、Pareto 曲线绘图、多策略子图绘图。被 `tradeoff` 调用 |
+| `plot_utils.py` | 统一绘图风格（`setup_plot_style`）、Pareto 曲线绘图、多策略子图绘图、per-tier 对比曲线。被 `tradeoff` 调用 |
 
 ---
 
@@ -294,7 +361,7 @@ script/
 ├── BUILD                         # Bazel 构建定义
 ├── run/                          # 入口层
 │   ├── optimizer_run.py          # 单次运行
-│   ├── tradeoff.py               # Pareto 曲线
+│   ├── tradeoff.py               # Pareto 曲线 + per-tier 分析
 │   ├── export_tree.py            # 前缀树导出
 │   └── analyze_lifecycle.py      # Lifecycle 分析
 │
@@ -302,14 +369,14 @@ script/
 │   └── lifecycle_analysis.py     # 读取 + 统计 + 数据提取
 │
 ├── plot/                         # 可视化层
-│   ├── hit_rate_plot.py          # 命中率时序图
+│   ├── hit_rate_plot.py          # 命中率时序图 + per-tier 时序图
 │   ├── radix_tree_plot.py        # 前缀树可视化
 │   └── lifecycle_plot.py         # CDF + 直方图
 │
 └── utils/                        # 工具层
     ├── optimizer_runner.py       # optimizer 运行封装
     ├── csv_loader.py             # CSV 加载 + 容量列表
-    └── plot_utils.py             # 绘图风格 + Pareto 绘图
+    └── plot_utils.py             # 绘图风格 + Pareto 绘图 + per-tier 曲线
 ```
 
 ---
@@ -330,10 +397,12 @@ script/
 │  # ── Python 图表输出 ────────────────────────────────────────
 ├── pareto/                                   # tradeoff
 │   ├── pareto_curve_<type>.png
-│   └── multi_policy_<type>.png
+│   ├── multi_policy_<type>.png
+│   └── per_tier_curves.png                   # per-tier 对比曲线
 │
 ├── timeseries/                               # optimizer_run --draw-chart
-│   └── multi_instance_cache_analysis.png     # tradeoff --plot-timeseries
+│   ├── multi_instance_cache_analysis.png     # tradeoff --plot-timeseries
+│   └── per_tier_timeseries.png               # per-tier 时序图
 │
 ├── lifecycle/                                # analyze_lifecycle
 │   ├── *_physical_lifespan_cdf.png
