@@ -2636,4 +2636,292 @@ TEST_F(CacheManagerTest, TestRecoverRetryLoopLifecycle) {
     ASSERT_EQ(EC_OK, cache_manager_->DoCleanup());
 }
 
+TEST_F(CacheManagerTest, TestGetBatchCacheLocations) {
+    auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    ASSERT_EQ(expected,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               "test_instance",
+                                               64,
+                                               createLocationSpecInfos(),
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>()));
+
+    // --- Scenario 1: query_type != QT_BATCH_GET → EC_BADARGS ---
+    {
+        std::vector<int64_t> keys{1};
+        BlockMask block_mask = static_cast<size_t>(0);
+        auto [ec, batch_locs] = cache_manager_->GetBatchCacheLocations(request_context_.get(),
+                                                                       "test_instance",
+                                                                       CacheManager::QueryType::QT_PREFIX_MATCH,
+                                                                       keys,
+                                                                       {},
+                                                                       block_mask,
+                                                                       0,
+                                                                       {});
+        ASSERT_EQ(EC_BADARGS, ec);
+    }
+
+    // --- Scenario 2: NFS-only, basic read/write ---
+    {
+        std::vector<int64_t> keys{1, 2, 3, 4};
+        auto [ec1, swci] =
+            cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 100000000);
+        ASSERT_EQ(EC_OK, ec1);
+
+        // before finish: all CLS_WRITING → 0 locations per key
+        {
+            BlockMask block_mask = static_cast<size_t>(0);
+            auto [ec, batch_locs] = cache_manager_->GetBatchCacheLocations(request_context_.get(),
+                                                                           "test_instance",
+                                                                           CacheManager::QueryType::QT_BATCH_GET,
+                                                                           keys,
+                                                                           {},
+                                                                           block_mask,
+                                                                           0,
+                                                                           {});
+            ASSERT_EQ(EC_OK, ec);
+            ASSERT_EQ(4u, batch_locs.size());
+            for (auto &key_locs : batch_locs) {
+                ASSERT_EQ(0u, key_locs.cache_locations_view().size());
+            }
+        }
+
+        // finish first 3 keys
+        {
+            BlockMask block_mask = static_cast<size_t>(3);
+            ASSERT_EQ(EC_OK,
+                      cache_manager_->FinishWriteCache(
+                          request_context_.get(), "test_instance", swci.write_session_id(), block_mask));
+        }
+
+        // keys 1-3 → 1 NFS location each; key 4 → 0
+        {
+            BlockMask block_mask = static_cast<size_t>(0);
+            auto [ec, batch_locs] = cache_manager_->GetBatchCacheLocations(request_context_.get(),
+                                                                           "test_instance",
+                                                                           CacheManager::QueryType::QT_BATCH_GET,
+                                                                           keys,
+                                                                           {},
+                                                                           block_mask,
+                                                                           0,
+                                                                           {});
+            ASSERT_EQ(EC_OK, ec);
+            ASSERT_EQ(4u, batch_locs.size());
+            for (size_t i = 0; i < 3; ++i) {
+                const auto &locs = batch_locs[i].cache_locations_view();
+                ASSERT_EQ(1u, locs.size());
+                ASSERT_EQ(4u, locs[0].location_specs().size());
+                expectNonEmptySpec(locs[0].location_specs());
+            }
+            ASSERT_EQ(0u, batch_locs[3].cache_locations_view().size());
+        }
+
+        // location_spec_names filter
+        {
+            BlockMask block_mask = static_cast<size_t>(0);
+            auto [ec, batch_locs] = cache_manager_->GetBatchCacheLocations(request_context_.get(),
+                                                                           "test_instance",
+                                                                           CacheManager::QueryType::QT_BATCH_GET,
+                                                                           keys,
+                                                                           {},
+                                                                           block_mask,
+                                                                           0,
+                                                                           {"tp0", "tp2"});
+            ASSERT_EQ(EC_OK, ec);
+            for (size_t i = 0; i < 3; ++i) {
+                const auto &locs = batch_locs[i].cache_locations_view();
+                ASSERT_EQ(1u, locs.size());
+                ASSERT_EQ(2u, locs[0].location_specs().size());
+            }
+        }
+
+        // mixed existing / non-existing keys
+        {
+            std::vector<int64_t> mixed_keys{1, 999, 2, 888};
+            BlockMask block_mask = static_cast<size_t>(0);
+            auto [ec, batch_locs] = cache_manager_->GetBatchCacheLocations(request_context_.get(),
+                                                                           "test_instance",
+                                                                           CacheManager::QueryType::QT_BATCH_GET,
+                                                                           mixed_keys,
+                                                                           {},
+                                                                           block_mask,
+                                                                           0,
+                                                                           {});
+            ASSERT_EQ(EC_OK, ec);
+            ASSERT_EQ(4u, batch_locs.size());
+            ASSERT_EQ(1u, batch_locs[0].cache_locations_view().size());
+            ASSERT_EQ(0u, batch_locs[1].cache_locations_view().size());
+            ASSERT_EQ(1u, batch_locs[2].cache_locations_view().size());
+            ASSERT_EQ(0u, batch_locs[3].cache_locations_view().size());
+        }
+    }
+
+    // --- Scenario 3: multiple NFS locations per key → merged into 1 ---
+    {
+        std::vector<int64_t> evict_keys{1};
+        auto [ec_evict, evict_info] = cache_manager_->StartEvictWriteCache(
+            request_context_.get(), "test_instance", evict_keys, {}, {}, 100000000, 2);
+        ASSERT_EQ(EC_OK, ec_evict);
+        ASSERT_EQ(0u, std::get<BlockMaskOffset>(evict_info.block_mask()));
+        ASSERT_EQ(1u, evict_info.locations().cache_locations_view().size());
+
+        BlockMask bm = static_cast<size_t>(1);
+        ASSERT_EQ(EC_OK,
+                  cache_manager_->FinishWriteCache(
+                      request_context_.get(), "test_instance", evict_info.write_session_id(), bm));
+
+        // key 1 now has 2 NFS replicas, but GetBatchCacheLocations should still return 1
+        BlockMask block_mask = static_cast<size_t>(0);
+        auto [ec, batch_locs] = cache_manager_->GetBatchCacheLocations(request_context_.get(),
+                                                                       "test_instance",
+                                                                       CacheManager::QueryType::QT_BATCH_GET,
+                                                                       evict_keys,
+                                                                       {},
+                                                                       block_mask,
+                                                                       0,
+                                                                       {});
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(1u, batch_locs.size());
+        const auto &locs = batch_locs[0].cache_locations_view();
+        ASSERT_EQ(1u, locs.size());
+        ASSERT_EQ(DataStorageType::DATA_STORAGE_TYPE_NFS, locs[0].type());
+    }
+
+    // --- Scenario 4: multiple v6d + multiple NFS → all v6d + 1 NFS ---
+    {
+        // Set up VineyardBackend
+        auto metrics_registry = cache_manager_->metrics_registry_;
+        auto vineyard_backend = std::make_shared<VineyardBackend>(metrics_registry);
+        {
+            StorageConfig v6d_config;
+            v6d_config.set_global_unique_name("v6d_test_instance");
+            v6d_config.set_type(DataStorageType::DATA_STORAGE_TYPE_VINEYARD);
+            v6d_config.set_storage_spec(std::make_shared<VineyardStorageSpec>());
+            vineyard_backend->Open(v6d_config, "test_trace");
+        }
+        auto dsm = registry_manager_->data_storage_manager_;
+        dsm->storage_map_["v6d_test_instance"] = vineyard_backend;
+
+        // Write NFS locations for keys {100, 200}
+        std::vector<int64_t> v6d_keys{100, 200};
+        {
+            auto [ec_w, swci_w] =
+                cache_manager_->StartWriteCache(request_context_.get(), "test_instance", v6d_keys, {}, {}, 100000000);
+            ASSERT_EQ(EC_OK, ec_w);
+            BlockMask bm = static_cast<size_t>(v6d_keys.size());
+            ASSERT_EQ(EC_OK,
+                      cache_manager_->FinishWriteCache(
+                          request_context_.get(), "test_instance", swci_w.write_session_id(), bm));
+        }
+        // Create second NFS replica
+        {
+            auto [ec_e, evict_info] = cache_manager_->StartEvictWriteCache(
+                request_context_.get(), "test_instance", v6d_keys, {}, {}, 100000000, 2);
+            ASSERT_EQ(EC_OK, ec_e);
+            ASSERT_EQ(0u, std::get<BlockMaskOffset>(evict_info.block_mask()));
+            ASSERT_EQ(2u, evict_info.locations().cache_locations_view().size());
+            BlockMask bm = static_cast<size_t>(v6d_keys.size());
+            ASSERT_EQ(EC_OK,
+                      cache_manager_->FinishWriteCache(
+                          request_context_.get(), "test_instance", evict_info.write_session_id(), bm));
+        }
+
+        // Inject vineyard locations via ReportEvent (EVENT_BLOCK_ADD) from 3 nodes
+        std::vector<std::string> node_hosts = {"192.168.1.100:8080", "192.168.1.200:8080", "192.168.1.300:8080"};
+        for (const auto &host : node_hosts) {
+            proto::meta::ReportEventRequest req;
+            req.set_instance_id("test_instance");
+            req.set_host_ip_port(host);
+
+            auto *reg_event = req.add_events();
+            reg_event->set_event_type(proto::meta::EVENT_NODE_REGISTER);
+            reg_event->mutable_node_register()->add_mediums("mem");
+
+            for (auto key : v6d_keys) {
+                auto *add_event = req.add_events();
+                add_event->set_event_type(proto::meta::EVENT_BLOCK_ADD);
+                auto *block_add = add_event->mutable_block_add();
+                block_add->set_block_key(std::to_string(key));
+                block_add->set_medium("mem");
+                auto *spec = block_add->add_specs();
+                spec->set_name("tp0");
+                spec->set_uri("vineyard://" + host + "/mem");
+            }
+
+            proto::meta::ReportEventResponse resp;
+            auto ec = cache_manager_->ReportEvent(request_context_.get(), &req, &resp);
+            ASSERT_EQ(EC_OK, ec);
+        }
+
+        // Verify: each key → 3 vineyard (1 spec each) + 1 NFS (4 specs) = 4 locations
+        {
+            BlockMask block_mask = static_cast<size_t>(0);
+            auto [ec, batch_locs] = cache_manager_->GetBatchCacheLocations(request_context_.get(),
+                                                                           "test_instance",
+                                                                           CacheManager::QueryType::QT_BATCH_GET,
+                                                                           v6d_keys,
+                                                                           {},
+                                                                           block_mask,
+                                                                           0,
+                                                                           {});
+            ASSERT_EQ(EC_OK, ec);
+            ASSERT_EQ(2u, batch_locs.size());
+            for (size_t i = 0; i < v6d_keys.size(); ++i) {
+                const auto &locs = batch_locs[i].cache_locations_view();
+                ASSERT_EQ(4u, locs.size()) << "key " << v6d_keys[i] << " should have 4 locations";
+
+                int vineyard_count = 0;
+                int nfs_count = 0;
+                for (const auto &loc : locs) {
+                    if (loc.type() == DataStorageType::DATA_STORAGE_TYPE_VINEYARD) {
+                        ++vineyard_count;
+                        ASSERT_EQ(1u, loc.location_specs().size());
+                    } else {
+                        ++nfs_count;
+                        ASSERT_EQ(4u, loc.location_specs().size());
+                    }
+                }
+                ASSERT_EQ(3, vineyard_count) << "key " << v6d_keys[i];
+                ASSERT_EQ(1, nfs_count) << "key " << v6d_keys[i];
+            }
+        }
+
+        // --- Scenario 5: 2 vineyard nodes unavailable → only 1 v6d + 1 NFS ---
+        vineyard_backend->SetNodeUnavailable(node_hosts[1]);
+        vineyard_backend->SetNodeUnavailable(node_hosts[2]);
+        {
+            BlockMask block_mask = static_cast<size_t>(0);
+            auto [ec, batch_locs] = cache_manager_->GetBatchCacheLocations(request_context_.get(),
+                                                                           "test_instance",
+                                                                           CacheManager::QueryType::QT_BATCH_GET,
+                                                                           v6d_keys,
+                                                                           {},
+                                                                           block_mask,
+                                                                           0,
+                                                                           {});
+            ASSERT_EQ(EC_OK, ec);
+            ASSERT_EQ(2u, batch_locs.size());
+            for (size_t i = 0; i < v6d_keys.size(); ++i) {
+                const auto &locs = batch_locs[i].cache_locations_view();
+                ASSERT_EQ(2u, locs.size()) << "key " << v6d_keys[i] << " should have 2 locations";
+
+                int vineyard_count = 0;
+                int nfs_count = 0;
+                for (const auto &loc : locs) {
+                    if (loc.type() == DataStorageType::DATA_STORAGE_TYPE_VINEYARD) {
+                        ++vineyard_count;
+                    } else {
+                        ++nfs_count;
+                    }
+                }
+                ASSERT_EQ(1, vineyard_count) << "key " << v6d_keys[i];
+                ASSERT_EQ(1, nfs_count) << "key " << v6d_keys[i];
+            }
+        }
+
+        dsm->storage_map_.erase("v6d_test_instance");
+    }
+}
+
 } // namespace kv_cache_manager

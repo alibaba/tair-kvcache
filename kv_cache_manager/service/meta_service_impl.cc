@@ -5,6 +5,7 @@
 #include <utility>
 #include <vector>
 
+#include "kv_cache_manager/common/env_util.h"
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
@@ -24,9 +25,12 @@
 #define API_CALL_GUARD(api_name, is_leader_only)                                                                       \
     request_context->set_api_name(api_name);                                                                           \
     response->mutable_header()->set_request_id(request_context->request_id());                                         \
-    std::string request_debug;                                                                                         \
-    ProtoMessageJsonUtil::ToJson(request, request_debug);                                                              \
-    request_context->set_request_debug(request_debug);                                                                 \
+    static const bool kAccessLogWithPayload = EnvUtil::GetEnv<bool>("KVCM_ACCESS_LOG_WITH_PAYLOAD", true);             \
+    if (kAccessLogWithPayload) {                                                                                       \
+        std::string request_debug;                                                                                     \
+        ProtoMessageJsonUtil::ToJson(request, request_debug);                                                          \
+        request_context->set_request_debug(request_debug);                                                             \
+    }                                                                                                                  \
     if (!CheckAndIncrementRequestCount(is_leader_only)) {                                                              \
         auto *header = response->mutable_header();                                                                     \
         auto *status = header->mutable_status();                                                                       \
@@ -39,9 +43,11 @@
     }                                                                                                                  \
     ServiceCallGuard service_call_guard(                                                                               \
         cache_manager_.get(), request_context, metrics_reporter_.get(), [request_context, response, this]() {          \
-            std::string response_debug;                                                                                \
-            ProtoMessageJsonUtil::ToJson(response, response_debug);                                                    \
-            request_context->set_response_debug(response_debug);                                                       \
+            if (kAccessLogWithPayload) {                                                                               \
+                std::string response_debug;                                                                            \
+                ProtoMessageJsonUtil::ToJson(response, response_debug);                                                \
+                request_context->set_response_debug(response_debug);                                                   \
+            }                                                                                                          \
             DecrementRequestCount(is_leader_only);                                                                     \
         });
 
@@ -302,6 +308,63 @@ void MetaServiceImpl::GetCacheLocation(RequestContext *request_context,
         KVCM_LOG_INFO("[traceId: %s] GetCacheLocation succeeded, returned %d locations",
                       request->trace_id().c_str(),
                       response->locations_size());
+    }
+    SET_SPAN_TRACER_STR_IN_HEADER(request_context);
+}
+
+void MetaServiceImpl::GetBatchCacheLocations(RequestContext *request_context,
+                                             const proto::meta::GetBatchCacheLocationsRequest *request,
+                                             proto::meta::GetBatchCacheLocationsResponse *response) {
+    SPAN_TRACER(request_context);
+    API_CALL_GUARD("GetBatchCacheLocations", true);
+    auto *header = response->mutable_header();
+    auto *status = header->mutable_status();
+    std::string invalid_fields = "missing or invalid fields: ";
+    if (request->instance_id().empty()) {
+        CHECK_REQUIRED_FIELDS_VALIDATION("GetBatchCacheLocations", "instance_id", true);
+        SET_SPAN_TRACER_STR_IN_HEADER(request_context);
+        return;
+    }
+    if (request->block_keys().empty() && request->token_ids().empty()) {
+        CHECK_REQUIRED_FIELDS_VALIDATION("GetBatchCacheLocations", "block_keys and token_ids", true);
+        SET_SPAN_TRACER_STR_IN_HEADER(request_context);
+        return;
+    }
+    BlockMask block_mask_req;
+    ProtoConvert::BlockMaskFromProto(&request->block_mask(), block_mask_req);
+    std::vector<std::string> location_spec_names;
+    location_spec_names.reserve(request->location_spec_names_size());
+    for (const auto &name : request->location_spec_names()) {
+        location_spec_names.push_back(name);
+    }
+
+    auto [ec_info, batch_result] = cache_manager_->GetBatchCacheLocations(
+        request_context,
+        request->instance_id(),
+        static_cast<CacheManager::QueryType>(request->query_type()),
+        std::vector<int64_t>(request->block_keys().begin(), request->block_keys().end()),
+        std::vector<int64_t>(request->token_ids().begin(), request->token_ids().end()),
+        block_mask_req,
+        request->sw_size(),
+        location_spec_names);
+    if (ec_info != EC_OK) {
+        status->set_code(ToMetaPbError(ec_info));
+        request_context->set_status_code(status->code());
+        status->set_message("Failed to get batch cache locations : " + request_context->error_tracer()->ToJsonString());
+        KVCM_LOG_ERROR("[traceId: %s] GetBatchCacheLocations failed, ec: %d", request->trace_id().c_str(), ec_info);
+    } else {
+        for (const auto &wrapper : batch_result) {
+            auto *key_locs_proto = response->add_key_locations();
+            for (const auto &view : wrapper.cache_locations_view()) {
+                ProtoConvert::CacheLocationViewToProto(view, key_locs_proto->add_locations());
+            }
+        }
+        status->set_code(proto::meta::OK);
+        request_context->set_status_code(status->code());
+        status->set_message("Batch cache locations retrieved successfully");
+        KVCM_LOG_INFO("[traceId: %s] GetBatchCacheLocations succeeded, returned %zu keys",
+                      request->trace_id().c_str(),
+                      batch_result.size());
     }
     SET_SPAN_TRACER_STR_IN_HEADER(request_context);
 }
