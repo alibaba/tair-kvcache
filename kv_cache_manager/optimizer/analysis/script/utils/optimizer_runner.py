@@ -299,7 +299,9 @@ def warmup_pass_with_metrics(
             df = pd.read_csv(csv_file)
             if df.empty:
                 continue
-            max_blocks = max(max_blocks, int(df["CachedBlocks"].max()))
+            if "CachedBlocksAllInstances" not in df.columns:
+                raise RuntimeError(f"{csv_file} missing required CachedBlocksAllInstances column")
+            max_blocks = max(max_blocks, int(df["CachedBlocksAllInstances"].max()))
             total_acc_write = max(total_acc_write, int(df["AccWriteBlocks"].iloc[-1]) if "AccWriteBlocks" in df.columns else 0)
             bpb = bytes_per_block_map.get(iid, 0)
             metrics = parse_instance_metrics(csv_file, bpb)

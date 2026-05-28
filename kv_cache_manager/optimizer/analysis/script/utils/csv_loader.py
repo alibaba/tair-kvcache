@@ -54,14 +54,24 @@ def parse_instance_metrics(csv_file: str, bytes_per_block: int) -> Optional[dict
     df = pd.read_csv(csv_file)
     if df.empty:
         return None
+    required = [
+        "CachedBlocks",
+        "CachedBlocksAllInstances",
+        "AccHitRate",
+        "AccLocalHitRate",
+        "AccRemoteHitRate",
+    ]
+    missing = [col for col in required if col not in df.columns]
+    if missing:
+        raise ValueError(f"{csv_file} missing columns: {missing}")
     last = df.iloc[-1]
-    cached_blocks = int(last["CachedBlocks"])
+    cached_blocks_all = int(last["CachedBlocksAllInstances"])
     result = {
         "acc_total_hit_rate": float(last["AccHitRate"]),
         "acc_local_hit_rate": float(last["AccLocalHitRate"]),
         "acc_remote_hit_rate": float(last["AccRemoteHitRate"]),
-        "cached_blocks_all": cached_blocks,
-        "cached_gb": cached_blocks * bytes_per_block / (1024 ** 3) if bytes_per_block > 0 else 0,
+        "cached_blocks_all": cached_blocks_all,
+        "cached_gb": cached_blocks_all * bytes_per_block / (1024 ** 3) if bytes_per_block > 0 else 0,
     }
     
     # 解析 per-tier 数据
@@ -111,18 +121,24 @@ def _read_hit_rates_from_csv(csv_path: str, bytes_per_block: int) -> Optional[di
             return None
         last = df.iloc[-1]
 
-        required = ["CachedBlocks", "AccHitRate", "AccLocalHitRate", "AccRemoteHitRate"]
+        required = [
+            "CachedBlocks",
+            "CachedBlocksAllInstances",
+            "AccHitRate",
+            "AccLocalHitRate",
+            "AccRemoteHitRate",
+        ]
         missing = [col for col in required if col not in df.columns]
         if missing:
             raise ValueError(f"missing columns: {missing}")
 
-        cached = int(last["CachedBlocks"])
+        cached_all = int(last["CachedBlocksAllInstances"])
         return {
             "total": float(last["AccHitRate"]),
             "local": float(last["AccLocalHitRate"]),
             "remote": float(last["AccRemoteHitRate"]),
-            "cached_blocks_all": cached,
-            "cached_gb": cached * bytes_per_block / (1024 ** 3) if bytes_per_block > 0 else 0,
+            "cached_blocks_all": cached_all,
+            "cached_gb": cached_all * bytes_per_block / (1024 ** 3) if bytes_per_block > 0 else 0,
         }
     except Exception as e:
         print(f"  Warning: Failed to read {csv_path}: {e}")

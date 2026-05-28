@@ -25,7 +25,8 @@ AccHitRate = AccHitTokens / AccInputTokens
 | 列 | 说明 |
 |---|---|
 | `TimestampNs` | trace 时间戳，单位 ns |
-| `CachedBlocks` | 当前 instance group 的总缓存 block 数 |
+| `CachedBlocks` | 当前 CSV 对应 instance 的缓存 block 数 |
+| `CachedBlocksAllInstances` | 同一 optimizer 进程内所有 instance 的总缓存 block 数 |
 | `ReadBlocks` / `HitBlocks` | 当前请求读取 / 命中的 block 数 |
 | `LocalHitBlocks` / `RemoteHitBlocks` | 诊断字段：trace `block_mask` 带入的已有本地命中 / optimizer 模拟层命中 |
 | `InputTokens` / `HitTokens` | 当前请求的输入 token 数 / 命中 token 数 |

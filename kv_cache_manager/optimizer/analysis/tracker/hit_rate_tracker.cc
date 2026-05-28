@@ -94,7 +94,7 @@ void HitRateTracker::ExportHitRates(const std::string &instance_id,
     bool has_tiered_data = (num_tiers > 0);
 
     // ---- 写入 CSV ----
-    file << "TimestampNs,CachedBlocks,ReadBlocks,LocalHitBlocks,RemoteHitBlocks,HitBlocks,"
+    file << "TimestampNs,CachedBlocks,CachedBlocksAllInstances,ReadBlocks,LocalHitBlocks,RemoteHitBlocks,HitBlocks,"
             "InputTokens,LocalHitTokens,RemoteHitTokens,HitTokens,LocalHitRate,RemoteHitRate,HitRate,"
             "AccReadBlocks,AccHitBlocks,AccInputTokens,AccLocalHitTokens,AccRemoteHitTokens,AccHitTokens,"
             "AccLocalHitRate,AccRemoteHitRate,AccHitRate,AccWriteBlocks";
@@ -150,9 +150,9 @@ void HitRateTracker::ExportHitRates(const std::string &instance_id,
             write_index++;
         }
 
-        file << r.timestamp_ns << "," << SumVecSizeT(r.blocks_per_instance) << "," << read_blocks << ","
-             << r.local_hit_blocks << "," << r.remote_hit_blocks << "," << current_hit << "," << input_tokens << ","
-             << local_hit_tokens << "," << remote_hit_tokens << "," << hit_tokens << ","
+        file << r.timestamp_ns << "," << r.current_cache_blocks << "," << SumVecSizeT(r.blocks_per_instance) << ","
+             << read_blocks << "," << r.local_hit_blocks << "," << r.remote_hit_blocks << "," << current_hit << ","
+             << input_tokens << "," << local_hit_tokens << "," << remote_hit_tokens << "," << hit_tokens << ","
              << (input_tokens > 0 ? static_cast<double>(local_hit_tokens) / input_tokens : 0.0) << ","
              << (input_tokens > 0 ? static_cast<double>(remote_hit_tokens) / input_tokens : 0.0) << ","
              << (input_tokens > 0 ? static_cast<double>(hit_tokens) / input_tokens : 0.0) << "," << acc_read_blocks
