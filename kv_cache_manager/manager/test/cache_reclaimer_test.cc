@@ -1601,13 +1601,9 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDPredictedKeys) {
     // build a CacheLocation with a URI that carries ``size=N'' so
     // that ``compute_loc_size'' returns a non-zero value (matches the
     // production path used by MetaSearcher::BatchDeleteLocation)
-    auto make_loc = [](const std::string &id,
-                       CacheLocationStatus status,
-                       DataStorageType type,
-                       std::uint64_t size) {
+    auto make_loc = [](const std::string &id, CacheLocationStatus status, DataStorageType type, std::uint64_t size) {
         std::vector<LocationSpec> specs;
-        specs.emplace_back("spec",
-                           "file://reclaimer_test/" + id + "?size=" + std::to_string(size));
+        specs.emplace_back("spec", "file://reclaimer_test/" + id + "?size=" + std::to_string(size));
         return std::make_shared<CacheLocation>(id, status, type, /*spec_size=*/1, specs);
     };
 
@@ -3003,7 +2999,9 @@ TEST_F(CacheReclaimerTest, TestHandleDelRes03) {
 
     try {
         throw std::runtime_error("test exception");
-    } catch (...) { promise->set_exception(std::current_exception()); }
+    } catch (...) {
+        promise->set_exception(std::current_exception());
+    }
 
     cache_reclaimer_->HandleDelRes();
     ASSERT_TRUE(cache_reclaimer_->delete_handlers_.empty());

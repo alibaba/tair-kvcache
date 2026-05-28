@@ -357,8 +357,7 @@ private:
     // thread (ReclaimCron and HandleDelRes both run there), so no mutex
     // is required; if this invariant changes, the access must be made
     // thread-safe
-    std::unordered_map<std::string,
-                       std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)>>
+    std::unordered_map<std::string, std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)>>
         in_flight_del_bytes_by_group_;
 
     void AddInFlightDelBytes(
@@ -531,15 +530,13 @@ private:
                      const std::vector<std::int64_t> &batch,
                      const WaterLevelExceed &water_level_exceed,
                      std::vector<std::vector<std::string>> &out_loc_ids,
-                     std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)>
-                         &out_bytes_by_type,
+                     std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> &out_bytes_by_type,
                      std::uint64_t &out_predicted_keys) const noexcept;
 
     void SubmitDelReq(const std::shared_ptr<RequestContext> &request_context,
                       const std::shared_ptr<const InstanceInfo> &instance_info,
                       const CacheLocationDelRequest &req,
-                      const std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)>
-                          &bytes_by_type,
+                      const std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> &bytes_by_type,
                       std::uint64_t predicted_keys) noexcept;
 
     struct GroupUsageData;

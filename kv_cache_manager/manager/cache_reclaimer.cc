@@ -191,8 +191,7 @@ void CacheReclaimer::AddInFlightDelBytes(
     const std::string &instance_group_name,
     const std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> &by_type) noexcept {
     auto [it, _] = in_flight_del_bytes_by_group_.try_emplace(
-        instance_group_name,
-        std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)>{});
+        instance_group_name, std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)>{});
     auto &slot = it->second;
     std::uint64_t total = 0;
     for (std::size_t i = 0; i != slot.size(); ++i) {
@@ -242,8 +241,7 @@ CacheReclaimer::GetInFlightDelBytes(const std::string &instance_group_name) cons
     return it->second;
 }
 
-void CacheReclaimer::AddInFlightDelKeys(const std::string &instance_group_name,
-                                        const std::uint64_t keys) noexcept {
+void CacheReclaimer::AddInFlightDelKeys(const std::string &instance_group_name, const std::uint64_t keys) noexcept {
     auto [it, _] = in_flight_del_keys_by_group_.try_emplace(instance_group_name, std::uint64_t{0});
     it->second += keys;
 
@@ -255,8 +253,7 @@ void CacheReclaimer::AddInFlightDelKeys(const std::string &instance_group_name,
     METRICS_(cache_reclaimer, in_flight_del_keys) = static_cast<double>(total);
 }
 
-void CacheReclaimer::SubInFlightDelKeys(const std::string &instance_group_name,
-                                        const std::uint64_t keys) noexcept {
+void CacheReclaimer::SubInFlightDelKeys(const std::string &instance_group_name, const std::uint64_t keys) noexcept {
     const auto it = in_flight_del_keys_by_group_.find(instance_group_name);
     if (it == in_flight_del_keys_by_group_.end()) {
         return;
@@ -594,8 +591,7 @@ CacheReclaimer::GetWaterLevelExceed(const RequestContext *request_context,
 
         const std::size_t type_idx = ToIndex(ToBaseType(type));
         const std::uint64_t in_flight_for_type = type_idx < in_flight.size() ? in_flight[type_idx] : 0;
-        const std::size_t adjusted_storage_usage =
-            saturating_sub(data->GetGroupUsageByType(type), in_flight_for_type);
+        const std::size_t adjusted_storage_usage = saturating_sub(data->GetGroupUsageByType(type), in_flight_for_type);
 
         if (storage_quota.capacity() <= 0) {
             LOG_WITH_GR(DEBUG,
@@ -1050,14 +1046,14 @@ bool CacheReclaimer::MakeBatchByLRU(const RequestContext *request_context,
     return true;
 }
 
-bool CacheReclaimer::FilterLocID(RequestContext *request_context,
-                                 const std::shared_ptr<const InstanceInfo> &instance_info,
-                                 const std::vector<std::int64_t> &batch,
-                                 const WaterLevelExceed &water_level_exceed,
-                                 std::vector<std::vector<std::string>> &out_loc_ids,
-                                 std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)>
-                                     &out_bytes_by_type,
-                                 std::uint64_t &out_predicted_keys) const noexcept {
+bool CacheReclaimer::FilterLocID(
+    RequestContext *request_context,
+    const std::shared_ptr<const InstanceInfo> &instance_info,
+    const std::vector<std::int64_t> &batch,
+    const WaterLevelExceed &water_level_exceed,
+    std::vector<std::vector<std::string>> &out_loc_ids,
+    std::array<std::uint64_t, static_cast<std::size_t>(DataStorageType::COUNT)> &out_bytes_by_type,
+    std::uint64_t &out_predicted_keys) const noexcept {
     out_bytes_by_type.fill(0);
     out_predicted_keys = 0;
 
