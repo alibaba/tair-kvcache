@@ -55,7 +55,9 @@ CacheLocationConstPtr WeightSLPolicy::SelectForMatch(CacheLocationMap &location_
         }
         if (kv.second->status() == CacheLocationStatus::CLS_SERVING) {
             if (check_loc_data_exist && !check_loc_data_exist(*kv.second)) {
-                out_prune_loc_ids.emplace_back(kv.first);
+                if (kv.second->type() != DataStorageType::DATA_STORAGE_TYPE_VINEYARD) {
+                    out_prune_loc_ids.emplace_back(kv.first);
+                }
                 continue;
             }
             if (int32_t weight = GetWeight(kv); weight > 0) {
@@ -83,7 +85,9 @@ bool WeightSLPolicy::ExistsForWrite(const CacheLocationMap &location_map,
         if (kv.second->status() != CacheLocationStatus::CLS_NOT_FOUND) {
             if (kv.second->status() == CacheLocationStatus::CLS_SERVING && check_loc_data_exist &&
                 !check_loc_data_exist(*kv.second)) {
-                out_prune_loc_ids.emplace_back(kv.first);
+                if (kv.second->type() != DataStorageType::DATA_STORAGE_TYPE_VINEYARD) {
+                    out_prune_loc_ids.emplace_back(kv.first);
+                }
                 continue;
             }
             if (!exists && GetWeight(kv) > 0) {
@@ -116,7 +120,9 @@ bool WeightSLPolicy::ExistsForWrite(const CacheLocationMap &location_map,
         }
         if (kv.second->status() == CacheLocationStatus::CLS_SERVING && check_loc_data_exist &&
             !check_loc_data_exist(*kv.second)) {
-            out_prune_loc_ids.emplace_back(kv.first);
+            if (kv.second->type() != DataStorageType::DATA_STORAGE_TYPE_VINEYARD) {
+                out_prune_loc_ids.emplace_back(kv.first);
+            }
             continue;
         }
         if (exists) {
@@ -136,6 +142,46 @@ bool WeightSLPolicy::ExistsForWrite(const CacheLocationMap &location_map,
         }
     }
     return exists;
+}
+
+bool WeightSLPolicy::ExistsForWriteWithMinCount(const CacheLocationMap &location_map,
+                                                int32_t min_count,
+                                                const std::vector<std::string> &requested_spec_names,
+                                                CheckLocDataExistFunc check_loc_data_exist,
+                                                std::vector<std::string> &out_prune_loc_ids) const {
+    out_prune_loc_ids.clear();
+    int32_t count = 0;
+    for (const auto &kv : location_map) {
+        if (!kv.second) {
+            continue;
+        }
+        if (kv.second->status() == CacheLocationStatus::CLS_NOT_FOUND) {
+            continue;
+        }
+        if (check_loc_data_exist && kv.second->status() == CacheLocationStatus::CLS_SERVING &&
+            !check_loc_data_exist(*kv.second)) {
+            if (kv.second->type() != DataStorageType::DATA_STORAGE_TYPE_VINEYARD) {
+                out_prune_loc_ids.emplace_back(kv.first);
+            }
+            continue;
+        }
+        if (count >= min_count) {
+            continue;
+        }
+        if (GetWeight(kv) == 0) {
+            continue;
+        }
+        const auto &loc_specs = kv.second->location_specs();
+        bool covers_all = std::all_of(
+            requested_spec_names.begin(), requested_spec_names.end(), [&loc_specs](const std::string &name) {
+                return std::any_of(
+                    loc_specs.begin(), loc_specs.end(), [&name](const auto &spec) { return spec.name() == name; });
+            });
+        if (covers_all) {
+            ++count;
+        }
+    }
+    return count >= min_count;
 }
 
 uint32_t StaticWeightSLPolicy::GetWeight(CacheLocationMap::const_reference kv) const {

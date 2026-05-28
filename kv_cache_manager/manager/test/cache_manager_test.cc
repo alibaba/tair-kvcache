@@ -11,6 +11,7 @@
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_backend.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
+#include "kv_cache_manager/data_storage/vineyard_backend.h"
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/manager/cache_location_view.h"
 #include "kv_cache_manager/manager/cache_manager.h"
@@ -381,6 +382,160 @@ TEST_F(CacheManagerTest, TestStartWriteDuplicateCache) {
         ASSERT_EQ(BlockMaskVector({true, false, false, true}),
                   std::get<BlockMaskVector>(start_write_cache_info.block_mask()));
         ASSERT_EQ(2, cache_locations_view.size());
+    }
+}
+
+// StartEvictWriteCache requires n_total >= min_replica_count to skip,
+// whereas StartWriteCache skips with any 1 replica.
+// Also tests spec-group-aware filtering with location_spec_group_names.
+TEST_F(CacheManagerTest, TestStartEvictWriteCache) {
+    auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    ASSERT_EQ(expected,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               "test_instance",
+                                               64,
+                                               createLocationSpecInfos(),
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>()));
+
+    std::vector<int64_t> keys{1};
+
+    // Scenario A: 0 replicas -> evict writes a new replica.
+    std::string evict_session_a;
+    {
+        auto [ec, info] = cache_manager_->StartEvictWriteCache(
+            request_context_.get(), "test_instance", keys, {}, {}, 100000000, /*min_replica_count=*/2);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(0u, std::get<BlockMaskOffset>(info.block_mask()));
+        ASSERT_EQ(1u, info.locations().cache_locations_view().size());
+        evict_session_a = info.write_session_id();
+    }
+    {
+        BlockMask bm = static_cast<std::size_t>(1);
+        ASSERT_EQ(EC_OK,
+                  cache_manager_->FinishWriteCache(request_context_.get(), "test_instance", evict_session_a, bm));
+    }
+    // Scenario B: 1 replica -> StartWriteCache skips, StartEvictWriteCache(min=2) still writes.
+    {
+        auto [ec, info] =
+            cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 100000000);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(1u, std::get<BlockMaskOffset>(info.block_mask()));
+        ASSERT_EQ(0u, info.locations().cache_locations_view().size());
+    }
+    std::string evict_session_b;
+    {
+        auto [ec, info] = cache_manager_->StartEvictWriteCache(
+            request_context_.get(), "test_instance", keys, {}, {}, 100000000, /*min_replica_count=*/2);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(0u, std::get<BlockMaskOffset>(info.block_mask()));
+        ASSERT_EQ(1u, info.locations().cache_locations_view().size());
+        evict_session_b = info.write_session_id();
+    }
+    {
+        BlockMask bm = static_cast<std::size_t>(1);
+        ASSERT_EQ(EC_OK,
+                  cache_manager_->FinishWriteCache(request_context_.get(), "test_instance", evict_session_b, bm));
+    }
+
+    // Scenario C: 2 replicas -> both skip; min<=0 defaults to 2.
+    for (int32_t min_replica_count : {2, 0}) {
+        auto [ec, info] = cache_manager_->StartEvictWriteCache(
+            request_context_.get(), "test_instance", keys, {}, {}, 100000000, min_replica_count);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(1u, std::get<BlockMaskOffset>(info.block_mask()));
+        ASSERT_EQ(0u, info.locations().cache_locations_view().size());
+    }
+
+    // --- Spec-group-aware filtering ---
+
+    std::vector<LocationSpecInfo> location_spec_infos = {
+        LocationSpecInfo("tp0_F0", 512),
+        LocationSpecInfo("tp1_F0", 512),
+        LocationSpecInfo("tp0_L1", 512),
+        LocationSpecInfo("tp1_L1", 512),
+    };
+    std::vector<LocationSpecGroup> location_spec_groups = {
+        LocationSpecGroup("F0L1", {"tp0_F0", "tp1_F0", "tp0_L1", "tp1_L1"}),
+        LocationSpecGroup("F0", {"tp0_F0", "tp1_F0"}),
+    };
+    ASSERT_EQ(expected,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               "test_instance3",
+                                               64,
+                                               location_spec_infos,
+                                               createModelDeployment(),
+                                               location_spec_groups));
+
+    // Scenario D: fresh key, evict with group "F0", min=2 -> needs write; returned location has only F0 specs.
+    std::vector<int64_t> keys_sg2{100};
+    {
+        auto [ec, info] = cache_manager_->StartEvictWriteCache(
+            request_context_.get(), "test_instance3", keys_sg2, {}, {"F0"}, 100000000, 2);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(1u, info.locations().cache_locations_view().size());
+        const auto &loc = info.locations().cache_locations_view()[0];
+        ASSERT_EQ(2, loc.spec_size());
+        BlockMask bm = static_cast<std::size_t>(1);
+        ASSERT_EQ(EC_OK,
+                  cache_manager_->FinishWriteCache(
+                      request_context_.get(), "test_instance3", info.write_session_id(), bm));
+    }
+
+    // Scenario E: empty group name falls back to block-level check.
+    // key 100 now has 1 replica. evict with empty group, min=2 -> needs 1 more.
+    {
+        auto [ec, info] = cache_manager_->StartEvictWriteCache(
+            request_context_.get(), "test_instance3", keys_sg2, {}, {}, 100000000, 2);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(1u, info.locations().cache_locations_view().size());
+    }
+
+    // Scenario F: replicas cover F0 only, query F0L1 -> spec coverage insufficient.
+    // Write 2 replicas with group "F0" for key 200 (each covers tp0_F0, tp1_F0 only).
+    std::vector<int64_t> keys_sg3{200};
+    {
+        auto [ec, info] = cache_manager_->StartWriteCache(
+            request_context_.get(), "test_instance3", keys_sg3, {}, {"F0"}, 100000000);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(1u, info.locations().cache_locations_view().size());
+        ASSERT_EQ(2, info.locations().cache_locations_view()[0].spec_size());
+        BlockMask bm = static_cast<std::size_t>(1);
+        ASSERT_EQ(EC_OK,
+                  cache_manager_->FinishWriteCache(
+                      request_context_.get(), "test_instance3", info.write_session_id(), bm));
+    }
+    {
+        auto [ec, info] = cache_manager_->StartEvictWriteCache(
+            request_context_.get(), "test_instance3", keys_sg3, {}, {"F0"}, 100000000, 2);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(1u, info.locations().cache_locations_view().size());
+        ASSERT_EQ(2, info.locations().cache_locations_view()[0].spec_size());
+        BlockMask bm = static_cast<std::size_t>(1);
+        ASSERT_EQ(EC_OK,
+                  cache_manager_->FinishWriteCache(
+                      request_context_.get(), "test_instance3", info.write_session_id(), bm));
+    }
+    // Now key 200 has 2 replicas, each covering F0 (tp0_F0, tp1_F0).
+    // evict with group "F0", min=2 -> satisfied, no write needed.
+    {
+        auto [ec, info] = cache_manager_->StartEvictWriteCache(
+            request_context_.get(), "test_instance3", keys_sg3, {}, {"F0"}, 100000000, 2);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(0u, info.locations().cache_locations_view().size());
+    }
+    // evict with group "F0L1", min=2 -> NOT satisfied.
+    // Both replicas only cover tp0_F0 and tp1_F0, missing tp0_L1 and tp1_L1.
+    // Even though total replica count is 2 >= min, spec coverage is insufficient.
+    {
+        auto [ec, info] = cache_manager_->StartEvictWriteCache(
+            request_context_.get(), "test_instance3", keys_sg3, {}, {"F0L1"}, 100000000, 2);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(1u, info.locations().cache_locations_view().size());
+        const auto &loc = info.locations().cache_locations_view()[0];
+        ASSERT_EQ(4, loc.spec_size());
     }
 }
 
@@ -1474,8 +1629,6 @@ TEST_F(CacheManagerTest, TestGetCacheLocationLen) {
 }
 
 TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_NullRegistryManager) {
-    // when registry_manager_ is null, the functor should return true
-    // (assume data exists as a safe fallback)
     auto saved = cache_manager_->registry_manager_;
     cache_manager_->registry_manager_ = nullptr;
 
@@ -1485,14 +1638,13 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_NullRegistryManager) {
     loc.set_status(CLS_SERVING);
     loc.set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
     loc.set_location_specs({LocationSpec("tp0", "file://mock_store/path")});
-    ASSERT_TRUE(func(loc));
+    ASSERT_EQ(func(loc), true);
 
     cache_manager_->registry_manager_ = saved;
 }
 
 TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_NullDataStorageManager) {
-    // when data_storage_manager() is null, the functor should return
-    // true
+    // when data_storage_manager() is null, the functor should return true
     auto saved = registry_manager_->data_storage_manager_;
     registry_manager_->data_storage_manager_ = nullptr;
 
@@ -1502,7 +1654,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_NullDataStorageManager) {
     loc.set_status(CLS_SERVING);
     loc.set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
     loc.set_location_specs({LocationSpec("tp0", "file://mock_store/path")});
-    ASSERT_TRUE(func(loc));
+    ASSERT_EQ(func(loc), true);
 
     registry_manager_->data_storage_manager_ = saved;
 }
@@ -1514,7 +1666,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_EmptyLocationSpecs) {
     CacheLocation loc;
     loc.set_status(CLS_SERVING);
     loc.set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
-    ASSERT_TRUE(func(loc));
+    ASSERT_EQ(func(loc), true);
 }
 
 TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_InvalidUri) {
@@ -1526,7 +1678,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_InvalidUri) {
     loc.set_status(CLS_SERVING);
     loc.set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
     loc.set_location_specs({LocationSpec("tp0", "no_protocol_here")});
-    ASSERT_TRUE(func(loc));
+    ASSERT_EQ(func(loc), true);
 }
 
 TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_AllExist) {
@@ -1548,7 +1700,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_AllExist) {
     loc.set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
     loc.set_location_specs(
         {LocationSpec("tp0", "file://mock_store/path_a"), LocationSpec("tp1", "file://mock_store/path_b")});
-    ASSERT_TRUE(func(loc));
+    ASSERT_EQ(func(loc), true);
 
     dsm->storage_map_.erase("mock_store");
 }
@@ -1572,7 +1724,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_NoneExist) {
     loc.set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
     loc.set_location_specs(
         {LocationSpec("tp0", "file://mock_store/path_a"), LocationSpec("tp1", "file://mock_store/path_b")});
-    ASSERT_FALSE(func(loc));
+    ASSERT_EQ(func(loc), false);
 
     dsm->storage_map_.erase("mock_store");
 }
@@ -1599,7 +1751,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_PartialExist) {
     loc.set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
     loc.set_location_specs(
         {LocationSpec("tp0", "file://mock_store/path_a"), LocationSpec("tp1", "file://mock_store/path_b")});
-    ASSERT_FALSE(func(loc));
+    ASSERT_EQ(func(loc), false);
 
     dsm->storage_map_.erase("mock_store");
 }
@@ -1632,7 +1784,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_VerifiesUriPassthrough) {
     loc.set_location_specs({LocationSpec("tp0", "no_protocol"),
                             LocationSpec("tp1", "file://mock_store/path_a"),
                             LocationSpec("tp2", "file://mock_store/path_b")});
-    ASSERT_TRUE(func(loc));
+    ASSERT_EQ(func(loc), true);
 
     dsm->storage_map_.erase("mock_store");
 }
@@ -1647,7 +1799,105 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_UnregisteredBackend) {
     loc.set_status(CLS_SERVING);
     loc.set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
     loc.set_location_specs({LocationSpec("tp0", "file://nonexistent_backend/path")});
-    ASSERT_TRUE(func(loc));
+    ASSERT_EQ(func(loc), true);
+}
+
+TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_VineyardFallbackLookup) {
+    // Vineyard URI hostname is a node IP, not the global_unique_name.
+    // The functor should fall back to "v6d_{instance_id}" for lookup.
+    const std::string instance_id = "my_cluster";
+    const std::string v6d_storage_name = "v6d_" + instance_id;
+    const std::string node_host = "192.168.1.100:8080";
+
+    auto metrics_registry = cache_manager_->metrics_registry_;
+    auto vineyard_backend = std::make_shared<VineyardBackend>(metrics_registry);
+
+    StorageConfig config;
+    config.set_global_unique_name(v6d_storage_name);
+    config.set_type(DataStorageType::DATA_STORAGE_TYPE_VINEYARD);
+    auto spec = std::make_shared<VineyardStorageSpec>();
+    config.set_storage_spec(spec);
+    vineyard_backend->Open(config, "test_trace");
+
+    vineyard_backend->RegisterNode(node_host, {"mem"});
+
+    auto dsm = registry_manager_->data_storage_manager_;
+    dsm->storage_map_[v6d_storage_name] = vineyard_backend;
+
+    auto func = cache_manager_->GetCheckLocDataExistFunc(instance_id);
+
+    CacheLocation loc;
+    loc.set_status(CLS_SERVING);
+    loc.set_type(DataStorageType::DATA_STORAGE_TYPE_VINEYARD);
+    loc.set_location_specs({LocationSpec("tp0", "vineyard://192.168.1.100:8080/mem?gpu=A100")});
+    ASSERT_EQ(func(loc), true);
+
+    dsm->storage_map_.erase(v6d_storage_name);
+}
+
+TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_VineyardNodeUnavailable) {
+    // When a vineyard node is registered but unavailable (grace period),
+    // the functor should return false (not reachable).
+    const std::string instance_id = "my_cluster";
+    const std::string v6d_storage_name = "v6d_" + instance_id;
+    const std::string node_host = "192.168.1.200:8080";
+
+    auto metrics_registry = cache_manager_->metrics_registry_;
+    auto vineyard_backend = std::make_shared<VineyardBackend>(metrics_registry);
+
+    StorageConfig config;
+    config.set_global_unique_name(v6d_storage_name);
+    config.set_type(DataStorageType::DATA_STORAGE_TYPE_VINEYARD);
+    auto spec = std::make_shared<VineyardStorageSpec>();
+    config.set_storage_spec(spec);
+    vineyard_backend->Open(config, "test_trace");
+
+    vineyard_backend->RegisterNode(node_host, {"mem"});
+    vineyard_backend->SetNodeUnavailable(node_host);
+
+    auto dsm = registry_manager_->data_storage_manager_;
+    dsm->storage_map_[v6d_storage_name] = vineyard_backend;
+
+    auto func = cache_manager_->GetCheckLocDataExistFunc(instance_id);
+
+    CacheLocation loc;
+    loc.set_status(CLS_SERVING);
+    loc.set_type(DataStorageType::DATA_STORAGE_TYPE_VINEYARD);
+    loc.set_location_specs({LocationSpec("tp0", "vineyard://192.168.1.200:8080/mem")});
+    ASSERT_EQ(func(loc), false);
+
+    dsm->storage_map_.erase(v6d_storage_name);
+}
+
+TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_VineyardNodeUnregistered) {
+    // When a vineyard node has been unregistered (dead, past grace period),
+    // MightExist returns false -> the functor should return false.
+    const std::string instance_id = "my_cluster";
+    const std::string v6d_storage_name = "v6d_" + instance_id;
+    const std::string node_host = "192.168.1.200:8080";
+
+    auto metrics_registry = cache_manager_->metrics_registry_;
+    auto vineyard_backend = std::make_shared<VineyardBackend>(metrics_registry);
+
+    StorageConfig config;
+    config.set_global_unique_name(v6d_storage_name);
+    config.set_type(DataStorageType::DATA_STORAGE_TYPE_VINEYARD);
+    auto spec = std::make_shared<VineyardStorageSpec>();
+    config.set_storage_spec(spec);
+    vineyard_backend->Open(config, "test_trace");
+
+    auto dsm = registry_manager_->data_storage_manager_;
+    dsm->storage_map_[v6d_storage_name] = vineyard_backend;
+
+    auto func = cache_manager_->GetCheckLocDataExistFunc(instance_id);
+
+    CacheLocation loc;
+    loc.set_status(CLS_SERVING);
+    loc.set_type(DataStorageType::DATA_STORAGE_TYPE_VINEYARD);
+    loc.set_location_specs({LocationSpec("tp0", "vineyard://192.168.1.200:8080/mem")});
+    ASSERT_EQ(func(loc), false);
+
+    dsm->storage_map_.erase(v6d_storage_name);
 }
 
 TEST_F(CacheManagerTest, TestGetSubmitDelReqFunc_NullExecutor) {

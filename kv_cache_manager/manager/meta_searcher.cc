@@ -14,7 +14,7 @@
 
 namespace kv_cache_manager {
 
-const std::string MetaSearcher::PROPERTY_PREV_BLOCK_KEY = "_prev_key_";
+const std::string MetaSearcher::PROPERTY_PREV_BLOCK_KEY = "BP#prev_key";
 
 namespace {
 
@@ -47,7 +47,9 @@ CacheLocationConstPtr SelectAndMergeForMatch(SelectLocationPolicy *policy,
             continue;
         }
         if (check_loc_data_exist && !check_loc_data_exist(*loc_ptr)) {
-            out_prune_loc_ids.push_back(id);
+            if (loc_ptr->type() != DataStorageType::DATA_STORAGE_TYPE_VINEYARD) {
+                out_prune_loc_ids.push_back(id);
+            }
             continue;
         }
         valid_map.try_emplace(id, loc_ptr);

@@ -40,12 +40,9 @@ public:
 
     ErrorCode UnregisterNode(const std::string &host_ip_port);
 
-    void OnHeartbeat(const std::string &host_ip_port, const std::map<std::string, std::string> &system_status);
+    ErrorCode OnHeartbeat(const std::string &host_ip_port, const std::map<std::string, std::string> &system_status);
     void SetNodeUnavailable(const std::string &host_ip_port);
     bool IsNodeAvailable(const std::string &host_ip_port) const;
-    bool IsNodeRegistered(const std::string &host_ip_port) const;
-
-    bool IsLocationAvailable(const std::string &location_id) const;
 
     uint64_t GetNodeGeneration(const std::string &host_ip_port) const;
 

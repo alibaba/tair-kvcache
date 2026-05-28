@@ -38,6 +38,10 @@ public:
                          proto::meta::StartWriteCacheRequest *request,
                          proto::meta::StartWriteCacheResponse *response);
 
+    void StartEvictWriteCache(coro_http::coro_http_connection *http_conn,
+                              proto::meta::StartEvictWriteCacheRequest *request,
+                              proto::meta::StartWriteCacheResponse *response);
+
     void FinishWriteCache(coro_http::coro_http_connection *http_conn,
                           proto::meta::FinishWriteCacheRequest *request,
                           proto::meta::CommonResponse *response);

@@ -140,13 +140,15 @@ ErrorCode VineyardBackend::UnregisterNode(const std::string &host_ip_port) {
     return EC_OK;
 }
 
-void VineyardBackend::OnHeartbeat(const std::string &host_ip_port,
-                                  const std::map<std::string, std::string> &system_status) {
+// kvcm重启nodes_信息会丢失，v6d侧发送心跳会收到EC_NODE_NOT_REGISTERED，触发v6d re-register
+ErrorCode VineyardBackend::OnHeartbeat(const std::string &host_ip_port,
+                                       const std::map<std::string, std::string> &system_status) {
     std::shared_lock<std::shared_mutex> lock(nodes_mutex_);
     auto it = nodes_.find(host_ip_port);
     if (it == nodes_.end()) {
-        KVCM_LOG_WARN("VineyardBackend: heartbeat from unregistered node [%s], skipped", host_ip_port.c_str());
-        return;
+        KVCM_LOG_WARN("VineyardBackend: heartbeat from unregistered node [%s], returning NODE_NOT_REGISTERED",
+                      host_ip_port.c_str());
+        return EC_NODE_NOT_REGISTERED;
     }
     auto &info = *it->second;
     int64_t now_ms = NowMillis();
@@ -157,6 +159,7 @@ void VineyardBackend::OnHeartbeat(const std::string &host_ip_port,
         KVCM_LOG_INFO("VineyardBackend: node [%s] recovered from unavailable", host_ip_port.c_str());
     }
     info.last_system_status = system_status;
+    return EC_OK;
 }
 
 void VineyardBackend::SetNodeUnavailable(const std::string &host_ip_port) {
@@ -179,19 +182,6 @@ bool VineyardBackend::IsNodeAvailable(const std::string &host_ip_port) const {
         return false;
     }
     return it->second->available.load(std::memory_order_relaxed);
-}
-
-bool VineyardBackend::IsNodeRegistered(const std::string &host_ip_port) const {
-    std::shared_lock<std::shared_mutex> lock(nodes_mutex_);
-    return nodes_.count(host_ip_port) > 0;
-}
-
-bool VineyardBackend::IsLocationAvailable(const std::string &location_id) const {
-    auto pos = location_id.rfind('#');
-    if (pos == std::string::npos || pos + 1 >= location_id.size()) {
-        return false;
-    }
-    return IsNodeAvailable(location_id.substr(pos + 1));
 }
 
 uint64_t VineyardBackend::GetNodeGeneration(const std::string &host_ip_port) const {
@@ -289,7 +279,7 @@ std::vector<bool> VineyardBackend::MightExist(const std::vector<DataStorageUri> 
             if (uri.GetPort() > 0) {
                 host_ip_port += ":" + std::to_string(uri.GetPort());
             }
-            result.push_back(IsNodeRegistered(host_ip_port));
+            result.push_back(IsNodeAvailable(host_ip_port));
         } else {
             result.push_back(true);
         }
