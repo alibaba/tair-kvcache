@@ -279,7 +279,8 @@ bool OptInstanceGroupConfig::FromRapidValue(const rapidjson::Value &rapid_value)
     // quota_capacity in config is in GB; convert to bytes
     double quota_capacity_gb = 0.0;
     KVCM_JSON_GET_MACRO(rapid_value, "quota_capacity", quota_capacity_gb);
-    quota_capacity_ = static_cast<int64_t>(quota_capacity_gb * static_cast<double>(1LL << 30));
+    quota_capacity_ =
+        quota_capacity_gb < 0 ? -1 : static_cast<int64_t>(quota_capacity_gb * static_cast<double>(1LL << 30));
     // Parse storages; tier capacity is in GB in config, OptTierConfig::FromRapidValue handles conversion
     KVCM_JSON_GET_MACRO(rapid_value, "storages", storages_);
     if (!rapid_value.HasMember("tier_strategy")) {
@@ -300,7 +301,8 @@ bool OptInstanceGroupConfig::FromRapidValue(const rapidjson::Value &rapid_value)
 void OptInstanceGroupConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
     Put(writer, "group_name", group_name_);
     // Write quota_capacity in GB
-    const double quota_gb = static_cast<double>(quota_capacity_) / static_cast<double>(1LL << 30);
+    const double quota_gb =
+        quota_capacity_ < 0 ? -1.0 : static_cast<double>(quota_capacity_) / static_cast<double>(1LL << 30);
     Put(writer, "quota_capacity", quota_gb);
     Put(writer, "used_percentage", used_percentage_);
     Put(writer, "tier_strategy", tier_strategy_);

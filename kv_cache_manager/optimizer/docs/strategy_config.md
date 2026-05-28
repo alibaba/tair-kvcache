@@ -146,6 +146,7 @@ Write trace：
 
 - 缺少 `type`、`instance_id`、`timestamp_ns`、`keys`，或 `get` trace 缺少 `input_len`。
 - `get.input_len <= 0`、`timestamp_ns <= 0`，或 `keys` 不是数组。
+- `get.keys.size() > input_len / block_size`。标准 trace 的 `keys` 只能包含完整 block，不允许把不足一个 block 的尾部 key 写入 trace。
 - 使用 `timestamp_us` 但没有 `timestamp_ns`。
 - `keys` 中存在非整数。
 - `block_mask` 数组中存在非 bool 值，或 offset 为负数 / 超过 `INT64_MAX`。
@@ -176,7 +177,7 @@ Write trace：
 | 字段 | 类型 | 默认 | 标准语义 |
 |---|---:|---:|---|
 | `group_name` | string | 必填 | 实例组名称。multi-instance replay 中通常等于 instance 的 `instance_id` |
-| `quota_capacity` | number | 必填 | group 总容量，单位 GB。非分层模式按该字段驱逐 |
+| `quota_capacity` | number | 必填 | group 总容量，单位 GB。非分层模式按该字段驱逐；`-1` 表示无限容量，不触发容量驱逐，主要用于全局池化理论命中和 Pareto warmup |
 | `used_percentage` | number | 必填 | 容量水位比例，实际阈值为 capacity × used_percentage |
 | `tier_strategy` | object | 必填 | 多层读写策略包，见下表 |
 | `default_block_ttl_seconds` | int | `0` | group 默认 TTL 秒数，`0` 表示组级禁用 TTL |
@@ -185,6 +186,8 @@ Write trace：
 | `instances` | array | 必填 | 该 group 下的 optimizer instance 列表 |
 
 ### tier_strategy
+
+`tier_strategy` 顶层字段是所有相邻 tier edge 的默认策略；`tier_flows` 只用于覆盖特定相邻 edge。若所有层间策略一致，可以只配置顶层字段并省略 `tier_flows`，它们不是两套重复配置。
 
 | 字段 | 类型 | 默认 | 标准语义 |
 |---|---:|---:|---|
@@ -204,6 +207,7 @@ Write trace：
 | `write_through_selective` | 初始只落 tier 0 | 命中层访问次数达到 `tier_strategy.selective_write_threshold` 后复制到下一层 | 控制低层写放大，只让热块下沉 |
 
 `tier_strategy.write_mode` 只接受上表三个值，其他值会导致 config 解析失败。
+`access_propagation_enabled` 不是一种 `write_mode`，而是读命中后是否刷新下层副本访问时间的独立开关。
 
 ### tier_flows
 
@@ -274,7 +278,7 @@ Write trace：
 | `storage_type` | string | 存储类型标签，当前主要用于配置记录 |
 | `band_width_mbps` | number | 带宽标签，当前主要用于分析记录 |
 | `priority` | int | tier 优先级，越小越靠近计算侧 |
-| `capacity` | number | tier 容量，单位 GB |
+| `capacity` | number | tier 容量，单位 GB；`-1` 表示该 tier 无限容量，不触发该 tier 的容量驱逐 |
 
 ## instance 配置
 
@@ -345,6 +349,7 @@ TTL 只在 `eviction_policy_type="ttl"` 时执行。非 TTL 策略会忽略 `def
 
 标准版保留 `multi_instance_replay`，不再把 multi-machine scheduler 作为默认回放入口。
 脚本完整参数以 [analysis/script/README.md](../analysis/script/README.md) 为准；这里给出标准回放配置示例和输出约定。
+`multi_instance_replay` 不读取完整 optimizer config；它根据 CLI 参数为每个 pod/instance 生成单实例 config，然后并行运行 optimizer。当前 CLI 直接支持 L1/L2 两层容量；需要 L3 或更复杂 tier 拓扑时，需要使用完整 optimizer config 跑单次回放，或扩展该脚本的 config 生成逻辑。
 
 ```bash
 bazel run //kv_cache_manager/optimizer/analysis/script:multi_instance_replay -- \
@@ -372,3 +377,4 @@ bazel run //kv_cache_manager/optimizer/analysis/script:multi_instance_replay -- 
 
 multi-instance replay 聚合后的 `HitRate` 仍然是 token hit rate，计算方式为所有 instance 的 `HitTokens` 总和除以 `InputTokens` 总和。
 `--bucket-name` 只写入聚合 CSV 的 `Bucket` 列，用于标记实验来源；`--trace-glob` 和 `--recursive` 只在使用 `--trace-dir` 扫描输入文件时生效。
+`--default-tier-write-mode`、`--tier-flow-config`、`--enable/disable-tier-access-propagation`、`--enable/disable-promote` 和 `--selective-write-threshold` 会写入生成 config 的 `tier_strategy`，语义与上文一致。

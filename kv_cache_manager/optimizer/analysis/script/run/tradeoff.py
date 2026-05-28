@@ -31,7 +31,7 @@ from kv_cache_manager.optimizer.pybind import kvcm_py_optimizer
 
 from utils.optimizer_runner import (
     init_kvcm_logger,
-    warmup_pass,
+    warmup_pass_with_metrics,
     run_experiments_parallel,
     extract_bytes_per_block_map,
     extract_config_quota_gb_map,
@@ -42,24 +42,70 @@ from utils.plot_utils import plot_single_policy_curves, plot_multi_policy_subplo
 from plot.hit_rate_plot import plot_multi_instance_analysis
 
 
-# ============================================================================
-# 结果整理
-# ============================================================================
+def _policy_name(policy):
+    return policy or "default_policy"
 
-def _group_by_policy(raw_results):
-    """将 run_experiments_parallel 原始结果按策略分组"""
-    by_policy = defaultdict(list)
-    for r in raw_results:
-        if not r["success"]:
-            continue
-        pol = r.get("policy") or "default_policy"
-        by_policy[pol].append({
-            "capacity": r["capacity"],
-            "instances": r["instances"],
-        })
-    for pol in by_policy:
-        by_policy[pol].sort(key=lambda x: x["capacity"])
-    return dict(by_policy)
+
+def _result_reaches_theoretical_target(result, theoretical_instances, hit_rate_type, ratio=0.99):
+    if not result.get("success") or not result.get("instances") or not theoretical_instances:
+        return False
+    for iid in theoretical_instances:
+        metrics = result["instances"].get(iid)
+        if metrics is None:
+            return False
+        theory = theoretical_instances.get(iid, {}).get(hit_rate_type)
+        if theory is None:
+            return False
+        if float(metrics[hit_rate_type]) < float(theory) * ratio:
+            return False
+    return True
+
+
+def _run_policy_until_target(
+    args,
+    policy,
+    capacities,
+    theoretical_instances,
+    bytes_per_block_map,
+    csv_save_dir,
+    hit_rate_type,
+):
+    policy_name = _policy_name(policy)
+    results = []
+    batch_size = max(1, args.max_workers)
+    csv_dir_arg = csv_save_dir if args.save_csv else None
+    for start in range(0, len(capacities), batch_size):
+        batch = capacities[start:start + batch_size]
+        raw_results = run_experiments_parallel(
+            args.config,
+            [(cap, policy) for cap in batch],
+            bytes_per_block_map,
+            max_workers=min(batch_size, len(batch)),
+            save_csv_dir=csv_dir_arg,
+        )
+        for raw in sorted(raw_results, key=lambda r: r["capacity"]):
+            if not raw.get("success"):
+                print("  tradeoff failed capacity={}: {}".format(raw.get("capacity"), raw.get("error")))
+                continue
+            results.append({
+                "capacity": raw["capacity"],
+                "instances": raw["instances"],
+            })
+            if _result_reaches_theoretical_target(raw, theoretical_instances, hit_rate_type, ratio=0.99):
+                print(
+                    "{} reached 99% theoretical {} hit rate at capacity={}".format(
+                        policy_name, hit_rate_type, raw["capacity"]
+                    )
+                )
+                break
+        if results and _result_reaches_theoretical_target(
+            {"success": True, "instances": results[-1]["instances"]},
+            theoretical_instances,
+            hit_rate_type,
+            ratio=0.99,
+        ):
+            break
+    return results
 
 
 # ============================================================================
@@ -169,9 +215,10 @@ def main():
     parser.add_argument("-c", "--config", required=True, help="Config file path")
     parser.add_argument("--eviction-policies", nargs="+", default=None,
                         help="驱逐策略列表（不指定则使用配置中的默认策略）")
-    parser.add_argument("--warmup-capacity", type=float, default=10000.0,
-                        help="Warmup 容量上限，单位 GB（应足够大以容纳全量 trace 数据，默认 10000 GB）")
-    parser.add_argument("--num-points", type=int, default=40)
+    parser.add_argument("--num-points", type=int, default=30,
+                        help="Maximum capacity points before early stopping at 99% theoretical hit rate")
+    parser.add_argument("--min-capacity-ratio", type=float, default=1e-4,
+                        help="Relative lower bound for generated capacity points, as a ratio of max cached blocks")
     parser.add_argument("--hit-rate-type", default="total",
                         choices=["total", "local", "remote", "all"])
     parser.add_argument("--max-workers", type=int, default=4)
@@ -187,6 +234,8 @@ def main():
     parser.add_argument("--x-max", type=float, default=None)
     parser.add_argument("--y-min", type=float, default=None)
     parser.add_argument("--y-max", type=float, default=None)
+    parser.add_argument("--plot-title", default=None,
+                        help="Override Pareto plot title")
     args = parser.parse_args()
 
     init_kvcm_logger()
@@ -233,6 +282,7 @@ def main():
 
     output_dir = config.output_result_path()
     csv_save_dir = os.path.join(config.output_result_path(), "csv_results")
+    theoretical_by_policy = {}
 
     # ----------------------------------------------------------------
     # 数据获取：运行实验 or 加载已有 CSV
@@ -245,36 +295,47 @@ def main():
         if multi_policy and policies[0] is not None:
             results_by_policy = {p: results_by_policy[p] for p in policies if p in results_by_policy}
     else:
-        # Use first instance's bytes_per_block as a representative value to convert
-        # warmup_capacity (GB) to blocks. This assumes all instances share the same
-        # bytes_per_block (i.e., same model / same block_size and bytes_per_token).
-        # If instances have heterogeneous bytes_per_block, the conversion is approximate
-        # but acceptable since warmup only needs a sufficiently large upper bound.
+        # Use first instance's bytes_per_block as a representative value for
+        # printing the capacity range. Plotting still uses per-instance
+        # bytes_per_block from bytes_per_block_map.
         rep_bpb = next(iter(bytes_per_block_map.values()))
-        warmup_blocks = int(args.warmup_capacity * (1024 ** 3) / rep_bpb)
-        max_blocks = warmup_pass(args.config, warmup_blocks, bytes_per_block_map)
-        capacities = generate_capacity_list(max_blocks, args.num_points)
-        if not capacities:
-            print("Error: No valid capacity points generated (max_blocks={})".format(max_blocks))
-            sys.exit(1)
-        print("\nGenerated {} capacity points: {:.2f} GB to {:.2f} GB".format(
-            len(capacities),
-            capacities[0] * rep_bpb / (1024 ** 3),
-            capacities[-1] * rep_bpb / (1024 ** 3)))
-
         if args.save_csv:
             print("CSV files will be saved to: {}\n".format(csv_save_dir))
 
         # NOTE: The capacity sweep modifies quota_capacity only. In tiered mode,
         # eviction is driven by each tier's independent storages[i].capacity,
         # so these experiments do not produce meaningful tradeoff data.
-        experiments = [(cap, pol) for pol in policies for cap in capacities]
-        csv_dir_arg = csv_save_dir if args.save_csv else None
-        raw = run_experiments_parallel(
-            args.config, experiments, bytes_per_block_map, args.max_workers,
-            csv_dir_arg,
-        )
-        results_by_policy = _group_by_policy(raw)
+        results_by_policy = {}
+        primary_hit_rate_type = "total" if args.hit_rate_type == "all" else args.hit_rate_type
+        for policy in policies:
+            policy_name = _policy_name(policy)
+            print("\n" + "=" * 60)
+            print("Warmup and capacity sweep: {}".format(policy_name))
+            print("=" * 60)
+            warmup = warmup_pass_with_metrics(args.config, -1, bytes_per_block_map, policy)
+            theoretical_by_policy[policy_name] = warmup["instances"]
+            max_blocks = int(warmup["max_blocks"])
+            capacities = generate_capacity_list(
+                max_blocks, args.num_points, min_capacity_ratio=args.min_capacity_ratio)
+            if max_blocks not in capacities:
+                capacities.append(max_blocks)
+            capacities = sorted(set(capacities))
+            if not capacities:
+                print("Error: No valid capacity points generated (max_blocks={})".format(max_blocks))
+                sys.exit(1)
+            print("\nGenerated up to {} capacity points: {:.2f} GB to {:.2f} GB".format(
+                len(capacities),
+                capacities[0] * rep_bpb / (1024 ** 3),
+                capacities[-1] * rep_bpb / (1024 ** 3)))
+            results_by_policy[policy_name] = _run_policy_until_target(
+                args,
+                policy,
+                capacities,
+                warmup["instances"],
+                bytes_per_block_map,
+                csv_save_dir,
+                primary_hit_rate_type,
+            )
 
     # ----------------------------------------------------------------
     # 打印命中率表格
@@ -304,15 +365,30 @@ def main():
     hit_types = ["total", "local", "remote"] if args.hit_rate_type == "all" else [args.hit_rate_type]
 
     if len(actual_policies) == 1:
+        policy_name = actual_policies[0]
         for ht in hit_types:
             plot_single_policy_curves(
-                results_by_policy[actual_policies[0]], output_dir, bytes_per_block_map, ht,
-                axis_limits=axis_limits, config_quota_gb_map=config_quota_gb_map)
+                results_by_policy[policy_name],
+                output_dir,
+                bytes_per_block_map,
+                ht,
+                title=args.plot_title,
+                axis_limits=axis_limits,
+                config_quota_gb_map=config_quota_gb_map,
+                theoretical_hit_rates=theoretical_by_policy.get(policy_name),
+            )
     else:
         for ht in hit_types:
             plot_multi_policy_subplots(
-                results_by_policy, output_dir, bytes_per_block_map, ht,
-                config_quota_gb_map=config_quota_gb_map)
+                results_by_policy,
+                output_dir,
+                bytes_per_block_map,
+                ht,
+                title=args.plot_title,
+                axis_limits=axis_limits,
+                config_quota_gb_map=config_quota_gb_map,
+                theoretical_hit_rates_by_policy=theoretical_by_policy,
+            )
 
     # ----------------------------------------------------------------
     # 可选：时序图

@@ -103,7 +103,7 @@ def run_optimizer_with_config_explicit(
         # not validated by C++, but expected to be consistent within a group).
         inst = group.get("instances", [{}])[0] if group.get("instances") else {}
         bpb = inst.get("bytes_per_token", 0) * inst.get("block_size", 0)
-        group["quota_capacity"] = capacity * bpb / (1024 ** 3) if bpb > 0 else capacity
+        group["quota_capacity"] = -1 if capacity < 0 else capacity * bpb / (1024 ** 3) if bpb > 0 else capacity
         if policy is not None:
             for instance in group.get("instances", []):
                 instance["eviction_policy_type"] = policy
@@ -244,6 +244,40 @@ def warmup_pass(
     Returns:
         max_blocks (int)
     """
+    return warmup_pass_with_metrics(
+        config_path,
+        warmup_capacity,
+        bytes_per_block_map,
+        policy,
+        enable_lifecycle_tracking,
+        enable_template_analysis,
+    )["max_blocks"]
+
+
+def warmup_pass_with_metrics(
+    config_path: str,
+    warmup_capacity: int,
+    bytes_per_block_map: Dict[str, int],
+    policy: str = None,
+    enable_lifecycle_tracking: bool = False,
+    enable_template_analysis: bool = False,
+) -> dict:
+    """
+    用大容量跑一遍，获取全量缓存容量和无限容量理论命中率。
+
+    Returns:
+        {
+            "max_blocks": int,
+            "instances": {
+                instance_id: {
+                    "total": float,
+                    "local": float,
+                    "remote": float,
+                    "cached_gb": float,
+                }
+            },
+        }
+    """
     import pandas as pd
 
     print(f"Running warmup with capacity={warmup_capacity}...")
@@ -258,16 +292,34 @@ def warmup_pass(
         if not csv_map:
             raise RuntimeError("No CSV files found after warmup")
 
-        first_csv = next(iter(csv_map.values()))
-        df = pd.read_csv(first_csv)
-        max_blocks = int(df["CachedBlocks"].max())
+        max_blocks = 0
+        instance_metrics = {}
+        total_acc_write = 0
+        for iid, csv_file in csv_map.items():
+            df = pd.read_csv(csv_file)
+            if df.empty:
+                continue
+            max_blocks = max(max_blocks, int(df["CachedBlocks"].max()))
+            total_acc_write = max(total_acc_write, int(df["AccWriteBlocks"].iloc[-1]) if "AccWriteBlocks" in df.columns else 0)
+            bpb = bytes_per_block_map.get(iid, 0)
+            metrics = parse_instance_metrics(csv_file, bpb)
+            if metrics is None:
+                continue
+            instance_metrics[iid] = {
+                "total": metrics["acc_total_hit_rate"],
+                "local": metrics["acc_local_hit_rate"],
+                "remote": metrics["acc_remote_hit_rate"],
+                "cached_gb": metrics["cached_gb"],
+            }
 
         rep_bpb = next(iter(bytes_per_block_map.values()), 0)
         max_gb = max_blocks * rep_bpb / (1024 ** 3) if rep_bpb > 0 else 0
-        acc_write = int(df["AccWriteBlocks"].iloc[-1]) if "AccWriteBlocks" in df.columns else 0
-        print(f"Warmup done. Max cached: {max_gb:.2f} GB ({max_blocks} blocks), AccWriteBlocks: {acc_write}")
+        print(f"Warmup done. Max cached: {max_gb:.2f} GB ({max_blocks} blocks), AccWriteBlocks: {total_acc_write}")
 
-        return max_blocks
+        return {
+            "max_blocks": max_blocks,
+            "instances": instance_metrics,
+        }
     finally:
         if manager is not None:
             manager.ClearAllCachesAndResetStats()

@@ -93,13 +93,20 @@ kv_cache_manager/optimizer/
 │   ├── result_structure.h        # 结果结构定义
 │   ├── result_analysis.h/cc      # 命中率分析
 │   └── script/                   # 分析脚本
-│       ├── optimizer_run.py      # 运行脚本
-│       ├── plot_hit_rate_with_storage.py  # 命中率随时间变化图表
-│       ├── export_and_visualize_tree.py   # Radix Tree 可视化
-│       ├── plot_radix_tree.py            # Radix Tree 绘图
-│       ├── tradeoff_curve_by_instances.py # 单策略 Trade-off 曲线
-│       ├── tradeoff_curve_by_policies.py  # 多策略对比分析
-│       └── optimizer_analysis_utils.py    # 分析工具函数
+│       ├── run/
+│       │   ├── optimizer_run.py          # 单次回放 + 可选时序图
+│       │   ├── tradeoff.py               # Pareto 曲线，单策略/多策略统一入口
+│       │   ├── export_tree.py            # RadixTree 导出 + 可视化
+│       │   ├── analyze_lifecycle.py      # Block lifecycle 统计
+│       │   └── multi_instance_replay.py  # 多实例并行回放 + 聚合
+│       ├── plot/
+│       │   ├── hit_rate_plot.py          # 命中率时序图
+│       │   ├── radix_tree_plot.py        # RadixTree 绘图
+│       │   └── lifecycle_plot.py         # Lifecycle CDF/直方图
+│       └── utils/
+│           ├── optimizer_runner.py       # optimizer 运行封装
+│           ├── csv_loader.py             # CSV 加载 + 容量点生成
+│           └── plot_utils.py             # Pareto/per-tier 绘图工具
 ├── pybind/               # Python 绑定
 │   └── py_optimizer_binding.cc   # Python 接口
 ├── main.cc               # 程序入口
@@ -238,6 +245,7 @@ OptimizerConfig (顶层配置)
                 {
                     "instance_id": "instance",
                     "block_size": 16,
+                    "bytes_per_token": 512,
                     "eviction_policy_type": "random_lru",
                     "eviction_policy_params": {
                         "sample_rate": 0.1
@@ -258,10 +266,11 @@ OptimizerConfig (顶层配置)
 | eviction_mode | 驱逐模式：1=GROUP_ROUGH, 2=INSTANCE_ROUGH, 3=INSTANCE_PRECISE |
 | eviction_batch_size_per_instance | 粗粒度驱逐时的批量大小 |
 | group_name | 实例组唯一标识 |
-| quota_capacity | 组的总容量（GB） |
+| quota_capacity | 组的总容量（GB）；`-1` 表示无限容量，不触发容量驱逐 |
 | used_percentage | 实际使用的配额百分比 |
 | instance_id | 实例唯一标识 |
 | block_size | 每个 block 包含的 token 数量 |
+| bytes_per_token | 单 token KV 大小；Python 分析脚本用它和 `block_size` 将 block 容量换算为 GB |
 | eviction_policy_type | 驱逐策略类型：lru、random_lru、leaf_aware_lru |
 
 ---
@@ -406,9 +415,11 @@ OptimizerSchemaTrace (基类)
 
 **转换流程**：
 1. 根据配置文件选择转换器
-2. 解析日志文件并转换为标准 Trace
+2. 解析日志文件并转换为标准 Trace；标准 `get` 必须带 `input_len`
 3. 按时间戳排序 Trace
 4. 分配唯一 Trace ID
+
+标准 trace 只接受显式 `type=get/write` 的 JSONL。`get.keys` 只能包含完整 block key，不足一个 block 的尾部 token 不写入 `keys`，但仍通过 `input_len` 计入 token 命中率分母。缺少 `input_len`、时间戳非法、`keys` 超过 `input_len / block_size` 等输入会在回放前失败。
 
 ---
 
@@ -417,15 +428,6 @@ OptimizerSchemaTrace (基类)
 ### 结果结构
 
 ```cpp
-struct ResultCounters {
-    uint64_t total_blocks = 0;
-    uint64_t total_write_blocks = 0;
-    uint64_t total_read_blocks = 0;
-    uint64_t total_hit_blocks = 0;
-    uint64_t total_read_requests = 0;
-    uint64_t total_requests = 0;
-};
-
 struct ReadRecord {
     int64_t timestamp_ns;
     // local = trace block_mask 带入的已有本地命中；remote = optimizer 模拟层命中
@@ -434,16 +436,13 @@ struct ReadRecord {
     size_t local_read_blocks;
     size_t local_hit_blocks;
     size_t current_cache_blocks;
+    size_t input_tokens;
+    size_t block_size_tokens;
     std::vector<size_t> per_tier_hit_blocks;
     std::vector<std::string> tier_names;
     std::vector<size_t> per_tier_blocks;
     std::vector<size_t> blocks_per_instance;
-};
-
-struct Result {
-    ResultCounters counters;
-    std::vector<ReadRecord> read_results;
-    std::vector<WriteRecord> write_results;
+    std::string trace_id;
 };
 ```
 
@@ -472,7 +471,7 @@ struct Result {
 
 ### 1. 命中率随时间变化图表
 
-**脚本**：`plot_hit_rate_with_storage.py`
+**脚本**：`optimizer_run.py --draw-chart`，绘图实现位于 `plot/hit_rate_plot.py`
 
 **功能**：绘制多实例缓存分析图表，展示所有 instance 的存储容量总和以及各自命中率随时间的变化。
 
@@ -484,7 +483,8 @@ bazel run //kv_cache_manager/optimizer/analysis/script:optimizer_run -- \
 ```
 
 **输出**：
-- `{output_result_path}/multi_instance_cache_analysis.png`
+- `{output_result_path}/timeseries/multi_instance_cache_analysis.png`
+- 分层配置额外输出 `{output_result_path}/timeseries/per_tier_timeseries.png`
 
 **图表内容**：
 - 上图：累计命中率随时间变化
@@ -492,19 +492,20 @@ bazel run //kv_cache_manager/optimizer/analysis/script:optimizer_run -- \
 
 ### 2. Radix Tree 可视化
 
-**脚本**：`export_and_visualize_tree.py`
+**脚本**：`export_tree.py`，绘图实现位于 `plot/radix_tree_plot.py`
 
 **功能**：导出并可视化前缀树结构，统计并展示热节点以及所属节点的前缀路径。
 
 **运行方式**：
 ```bash
-bazel run //kv_cache_manager/optimizer/analysis/script:visualize_tree -- \
+bazel run //kv_cache_manager/optimizer/analysis/script:export_tree -- \
     -c /path/to/config.json
 ```
 
 **输出**：
-- `{output_result_path}/radix_tree_{instance_id}.json` - Radix Tree 导出数据
-- `{output_result_path}/radix_tree_{instance_id}.png` - Radix Tree 可视化图表
+- `{output_result_path}/radix_tree/{instance_id}_radix_tree.json` - Radix Tree 导出数据
+- `{output_result_path}/radix_tree/{instance_id}_radix_tree.png` - Radix Tree 可视化图表
+- `{output_result_path}/radix_tree/{instance_id}_hot_paths.png` - 热点路径图（传 `--show-hot-paths` 时）
 
 **可视化内容**：
 - 节点访问次数
@@ -513,61 +514,70 @@ bazel run //kv_cache_manager/optimizer/analysis/script:visualize_tree -- \
 - 缓存的块数量
 - 节点层级关系
 
-### 3. 单策略 Trade-off 曲线分析
+### 3. Pareto 容量-命中率曲线分析
 
-**脚本**：`tradeoff_curve_by_instances.py`
+**脚本**：`tradeoff.py`
 
-**功能**：生成在不同容量配置下的多个 instance 命中率曲线，用于评估容量与命中率的权衡关系，仅使用配置中的驱逐策略。
+**功能**：在不同容量配置下回放 optimizer，绘制容量与 token 命中率的 Pareto 曲线。不给 `--eviction-policies` 时使用配置文件中的策略；给出多个策略时生成多策略对比图。
 
 > **适用范围**：Trade-off 分析仅适用于非分层模式。在分层模式（`tier_strategy.hierarchical_eviction_enabled=true`）下，容量扫描仅修改 `quota_capacity`，不影响各 tier 独立的 `storages[i].capacity`，因此无法产生有意义的容量-性能权衡结果。
 
+**运行流程**：
+
+1. 用无限容量 warmup 跑完整 trace。实现上会将 `quota_capacity` 写为 `-1`，C++ optimizer 将负容量视作无限容量。
+2. 从 warmup 读取理论命中率和最大缓存 block 数。
+3. 基于最大缓存 block 数按指数分布生成最多 `--num-points` 个容量点，并用 `--min-capacity-ratio` 过滤过小点。
+4. 对每个容量点运行 optimizer；达到 99% 理论命中率后停止继续扫更大容量。
+5. 画图时补 `(0 GB, 0%)` 起点，只保留命中率上升段。下降点会从图上剔除，并在 stdout 打印 `Drop descending Pareto point ...`；原始 CSV 保留。
+
 **运行方式**：
 ```bash
-bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff_analysis_run_by_instances -- \
+bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
     -c /path/to/config.json \
-    --warmup-capacity 10000 \
-    --num-points 40 \
+    --num-points 30 \
+    --min-capacity-ratio 1e-4 \
     --hit-rate-type total \
     --max-workers 4
 ```
 
 **参数说明**：
 - `-c, --config` - 配置文件路径
-- `--warmup-capacity` - Warmup 阶段使用的大容量，单位 GB（默认 10000）
-- `--num-points` - 容量采样点数量（默认 40）
+- `--num-points` - 每个策略最多运行的容量采样点数量（默认 30），达到 99% 理论命中后提前停止
+- `--min-capacity-ratio` - 最小容量点相对阈值（默认 `1e-4`）
 - `--hit-rate-type` - 命中率类型，标准分析使用 total；local/remote/all 仅作诊断拆分（默认 total）
 - `--max-workers` - 并行执行的最大线程数（默认 4）
+- `--plot-title` - 覆盖图标题
 
-**输出**：`{output_result_path}/pareto_curve_{hit_rate_type}.png`
+**输出**：`{output_result_path}/pareto/pareto_curve_{hit_rate_type}.png`
 
 ### 4. 多策略对比分析
 
-**脚本**：`tradeoff_curve_by_policies.py`
+**脚本**：`tradeoff.py --eviction-policies ...`
 
-**功能**：对比每个 instance 多个驱逐策略在不同容量配置下的性能表现，所有 instance 统一用一种类型的驱逐策略。
+**功能**：对比多个驱逐策略在不同容量配置下的表现。所有 instance 使用同一个给定策略进行一轮回放；每个策略独立 warmup、独立计算理论命中率，并独立提前停止。
 
 > **适用范围**：同单策略 Trade-off 分析，仅适用于非分层模式。
 
 **运行方式**：
 ```bash
-bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff_analysis_run_by_policies -- \
+bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
     -c /path/to/config.json \
-    --warmup-capacity 10000 \
     --eviction-policies lru random_lru leaf_aware_lru \
-    --num-points 40 \
+    --num-points 30 \
     --hit-rate-type total \
     --max-workers 4
 ```
 
 **参数说明**：
 - `-c, --config` - 配置文件路径
-- `--warmup-capacity` - Warmup 阶段使用的大容量，单位 GB（默认 10000）
 - `--eviction-policies` - 要对比的驱逐策略列表（默认 lru random_lru leaf_aware_lru）
-- `--num-points` - 容量采样点数量（默认 40）
+- `--num-points` - 每个策略最多运行的容量采样点数量（默认 30），达到 99% 理论命中后提前停止
 - `--hit-rate-type` - 命中率类型，标准分析使用 total；local/remote/all 仅作诊断拆分（默认 total）
 - `--max-workers` - 并行执行的最大线程数（默认 4）
 
-**输出**：`{output_result_path}/multi_policy_{hit_rate_type}.png`
+**输出**：`{output_result_path}/pareto/multi_policy_{hit_rate_type}.png`
+
+图形规则：X 轴是 `Capacity (GB)`，Y 轴是 `HitRate (%)`；95%/99% 理论命中率会按相邻 sweep 点线性插值后标出容量和命中率。`--skip-run` 只从已有 `csv_results` 画图，不重新 warmup，因此不会生成理论 95%/99% 标注。
 
 ---
 
@@ -681,13 +691,14 @@ optimizer.AnalyzeResults()
 **分析**：
 - result_structure.h - 结果结构定义
 - result_analysis.h/cc - 命中率分析
-- script/optimizer_run.py - 运行脚本
-- script/plot_hit_rate_with_storage.py - 命中率图表
-- script/export_and_visualize_tree.py - Radix Tree 可视化
-- script/plot_radix_tree.py - Radix Tree 绘图
-- script/tradeoff_curve_by_instances.py - 单策略 Trade-off 曲线
-- script/tradeoff_curve_by_policies.py - 多策略对比分析
-- script/optimizer_analysis_utils.py - 分析工具函数
+- script/run/optimizer_run.py - 单次回放 + 可选时序图
+- script/run/tradeoff.py - Pareto 曲线，单策略/多策略统一入口
+- script/run/export_tree.py - Radix Tree 导出 + 可视化
+- script/run/analyze_lifecycle.py - Block lifecycle 分析
+- script/run/multi_instance_replay.py - 多实例并行回放 + 聚合
+- script/plot/hit_rate_plot.py - 命中率时序图
+- script/plot/radix_tree_plot.py - Radix Tree 绘图
+- script/utils/optimizer_runner.py - optimizer 运行封装
 
 **Python 绑定**：
 - pybind/py_optimizer_binding.cc - Python 接口

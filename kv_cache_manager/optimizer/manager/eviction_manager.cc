@@ -415,6 +415,9 @@ size_t OptEvictionManager::GetExcessUsage(const OptInstanceGroupConfig &instance
         // 非分层模式：group 整体配额
         capacity = instance_group_config.quota_capacity();
     }
+    if (capacity < 0) {
+        return 0;
+    }
     size_t current_used_bytes = GetCurrentGroupUsageBytes(instance_group_config, tier_idx);
     size_t quota_bytes = static_cast<size_t>(capacity * instance_group_config.used_percentage());
     return current_used_bytes > quota_bytes ? current_used_bytes - quota_bytes : 0;

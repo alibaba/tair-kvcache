@@ -136,22 +136,25 @@ def _read_hit_rates_from_csv(csv_path: str, bytes_per_block: int) -> Optional[di
 def generate_capacity_list(
     max_blocks: int,
     num_points: int,
-    min_capacity: int = 2000,
+    min_capacity_ratio: float = 1e-4,
 ) -> List[int]:
     """
     指数分布采样容量列表，从小到大排序。
 
     Args:
-        max_blocks:   warmup 获取的最大 block 数
-        num_points:   采样点数
-        min_capacity: 最小容量阈值（小于此值的点丢弃）
+        max_blocks:          warmup 获取的最大 block 数
+        num_points:          采样点数
+        min_capacity_ratio:  最小容量相对阈值（小于 max_blocks * ratio 的点丢弃）
     """
+    if max_blocks <= 0 or num_points <= 0:
+        return []
+    min_capacity = max(1, int(max_blocks * min_capacity_ratio))
     x = np.linspace(-4, 4, num_points)
     ratios = np.exp(x) / np.exp(4)
     return sorted({
         int(max_blocks * r)
         for r in ratios
-        if int(max_blocks * r) > min_capacity
+        if int(max_blocks * r) >= min_capacity
     })
 
 

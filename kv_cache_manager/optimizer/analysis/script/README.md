@@ -12,6 +12,29 @@ Bazel target 前缀：
 
 标准报告直接按请求输入计算整体 `HitRate = HitTokens / InputTokens`。CSV 中的 local/remote 字段只是诊断拆分：local 来自 trace `block_mask` 带入的已有本地命中 block，remote 来自 optimizer 模拟层命中；标准分析结论不按 local/remote 分组。
 
+## 使用场景速查
+
+| 场景 | 命令入口 | 关键参数 / 配置 | 主要输出 |
+|---|---|---|---|
+| 单次回放 | `optimizer_run` | `-c config.json` | `<output_result_path>/*_hit_rates.csv` |
+| 单次回放并画时序图 | `optimizer_run` | `--draw-chart` | `timeseries/multi_instance_cache_analysis.png` |
+| 无限容量理论命中 | `optimizer_run` | 非分层 `quota_capacity=-1`；分层 tier `capacity=-1` | CSV 最后一行 `AccHitRate` |
+| 分层 HBM/DRAM/SSD 回放 | `optimizer_run` | `tier_strategy.hierarchical_eviction_enabled=true` + `storages[]` | per-tier CSV 列、`per_tier_timeseries.png` |
+| 每个 pod 独立缓存回放 | `multi_instance_replay` | `--trace-dir` / `--trace-files`、`--l1-capacity`、`--l2-capacity` | `aggregate/global_aggregate.csv` |
+| 窗口级分 pod 聚合命中率 | `multi_instance_replay` | `--window-seconds` 或 `--window-ns` | `aggregate/global_window_hit_rates.csv` |
+| 非分层容量 Pareto | `tradeoff` | `--num-points`、`--min-capacity-ratio`、`--max-workers` | `pareto/pareto_curve_<type>.png` |
+| 多驱逐策略 Pareto | `tradeoff` | `--eviction-policies lru random_lru leaf_aware_lru ttl` | `pareto/multi_policy_<type>.png` |
+| 导出 lifecycle | `optimizer_run` | `--export-lifecycle` | `<instance_id>_lifecycle.csv` |
+| 分析 lifecycle | `analyze_lifecycle` | `-i <csv_or_dir>` | `lifecycle/*_cdf.png`、`*_access_count.png` |
+| RadixTree 热点路径 | `export_tree` | `--show-hot-paths --hot-nodes N --show-blocks` | `radix_tree/*_hot_paths.png` |
+
+常用配置选择：
+
+- 全局池化理论命中率：一个 service 一个 config，所有请求使用同一个 `instance_id`，非分层 `quota_capacity=-1`。
+- 线上 pod 独立缓存：每个 pod 一个 JSONL，使用 `multi_instance_replay` 分别回放后聚合 token 命中。
+- 分层策略分析：用完整 optimizer config 配 `tier_strategy` 和 `storages[]`，再用 `optimizer_run`；不要用 `tradeoff` 扫分层容量。
+- 容量规划：先用 `tradeoff` 跑非分层 Pareto，图上 95%/99% 理论命中容量由相邻 sweep 点线性插值得到。
+
 ---
 
 ## 1. 单次运行 — `optimizer_run`
@@ -92,6 +115,7 @@ bazel run //kv_cache_manager/optimizer/analysis/script:multi_instance_replay -- 
 ### 回放配置参数
 
 这些参数会写入脚本为每个 instance 生成的 optimizer config。
+`multi_instance_replay` 不读取完整 optimizer config；它根据 CLI 参数为每个 pod/instance 生成单实例 config，再并行调用 optimizer。当前 CLI 直接暴露 L1/L2 两层容量；需要 L3 或更复杂分层拓扑时，应使用完整 optimizer config 跑单次回放，或先扩展该脚本的 config 生成逻辑。
 
 | 参数 | 必需 | 默认 | 说明 |
 |------|------|------|------|
@@ -116,7 +140,7 @@ bazel run //kv_cache_manager/optimizer/analysis/script:multi_instance_replay -- 
 | `--ttl-refresh-on-read` | — | true | TTL 策略下读命中刷新 last access time；与 `--no-ttl-refresh-on-read` 互斥 |
 | `--no-ttl-refresh-on-read` | — | false | TTL 策略下读命中不刷新 last access time；与 `--ttl-refresh-on-read` 互斥 |
 
-未显式传 `--eviction-policy-params` 时，脚本按策略生成默认参数：`random_lru` 使用 `{"sample_rate": 1.0}`；`ttl` 使用 `{"fallback_on_pressure": true}`；其他策略使用 leaf-aware/random-lru 兼容参数。
+未显式传 `--eviction-policy-params` 时，脚本按策略生成默认参数：`random_lru` 使用 `{"sample_rate": 1.0}`；`ttl` 使用 `{"fallback_on_pressure": true}`；`lru` / `leaf_aware_lru` 使用 `{"sample_rate": 1.0, "shard_count": 1, "sample_times": 32, "eviction_amplification_factor": 1.0}`。
 
 ### 聚合参数
 
@@ -150,20 +174,39 @@ bazel run //kv_cache_manager/optimizer/analysis/script:multi_instance_replay -- 
 
 ## 3. Pareto 曲线分析 — `tradeoff`
 
-在多个容量点上运行 optimizer，绘制容量-命中率权衡曲线。自动判断单策略/多策略模式。
+在多个容量点上运行 optimizer，绘制容量-命中率 Pareto 曲线。自动判断单策略/多策略模式。
 
 > **适用范围**：Tradeoff 分析仅适用于非分层模式。在分层模式（`tier_strategy.hierarchical_eviction_enabled=true`）下，容量扫描仅修改 `quota_capacity`，而驱逐决策依据各 tier 独立的 `storages[i].capacity`，因此扫描结果无法反映真实的容量-性能权衡关系。
+
+运行流程：
+
+1. 先用无限容量 warmup 跑完整 trace。Python 侧会把 `quota_capacity` 写成 `-1`，C++ optimizer 将负容量解释为无限容量，不触发驱逐。
+2. 从 warmup 结果读取理论命中率和最大缓存 block 数。
+3. 基于最大缓存 block 数生成最多 `--num-points` 个指数分布容量点；过小容量点按 `--min-capacity-ratio` 过滤。
+4. 逐容量点回放 optimizer；某个策略达到自身 99% 理论命中率后停止继续跑更大容量。
+5. 画图时补一个 `(0 GB, 0%)` 起点，只保留命中率单调上升段。若某个容量点比之前最佳点更低，会从图上剔除并在 stdout 打印 `Drop descending Pareto point ...`；原始 CSV 不会被改写。
+
+理论命中率来自无限容量 warmup，图上的 95%/99% 目标为：
+
+- `Target95HitRate = TheoreticalHitRate * 0.95`
+- `Target99HitRate = TheoreticalHitRate * 0.99`
+
+95%/99% 对应容量使用相邻 sweep 点做线性插值，并用横向/纵向虚线、空心大圆圈和容量/命中率标签标出。
 
 ### 单策略模式
 
 不指定 `--eviction-policies`，使用配置文件中的默认策略。每个 instance 一条曲线。
 
 ```bash
-# 默认 40 个容量点
+# 默认最多 30 个容量点，到 99% 理论命中后提前停止
 bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- -c config.json
 
 # 自定义采样点数
 bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- -c config.json --num-points 30
+
+# 调整最小容量点的相对阈值
+bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
+    -c config.json --num-points 30 --min-capacity-ratio 1e-4
 
 # 保存 CSV + 生成每个容量点的时序图
 bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- -c config.json --save-csv --plot-timeseries
@@ -171,13 +214,14 @@ bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- -c config.jso
 # 从 <output_result_path>/csv_results 加载（跳过实验）
 bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- -c config.json --skip-run
 
-# 自定义坐标轴范围
-bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- -c config.json --x-min 1000000 --y-min 0.5
+# 自定义标题和坐标轴范围
+bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
+    -c config.json --plot-title "service-a Pareto" --x-min 0 --y-min 0 --y-max 100
 ```
 
 ### 多策略对比模式
 
-指定 `--eviction-policies`，每个 instance 一个子图，每个策略一条曲线。
+指定 `--eviction-policies`，每个 instance 一个子图，每个策略一条曲线。每个策略会独立 warmup、独立计算理论命中率，并按该策略自身的 99% 理论命中提前停止。
 
 ```bash
 # 对比三种策略
@@ -200,28 +244,31 @@ bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
 |------|------|------|------|
 | `-c, --config` | ✅ | — | 配置文件路径 |
 | `--eviction-policies` | — | 配置默认 | 驱逐策略列表（空格分隔）；不传时使用 config 中的策略 |
-| `--warmup-capacity` | — | 10000.0 | warmup 阶段容量上限，单位 GB；应足够容纳全量 trace 数据 |
-| `--num-points` | — | 40 | 容量采样点数；实际容量点按指数分布生成，并过滤过小容量 |
+| `--num-points` | — | 30 | 每个策略最多运行的容量采样点数；实际容量点按指数分布生成，并在达到 99% 理论命中后提前停止 |
+| `--min-capacity-ratio` | — | `1e-4` | 最小容量点相对阈值；低于 `max_cached_blocks * ratio` 的容量点会被过滤 |
 | `--hit-rate-type` | — | `total` | 绘制命中率类型；可选 `total` / `local` / `remote` / `all` |
 | `--max-workers` | — | 4 | 并行实验线程数 |
 | `--save-csv` | — | false | 保留每次运行的 CSV 文件 |
-| `--skip-run` | — | false | 跳过实验，从 `<output_result_path>/csv_results` 加载已有 `cap_<capacity>_<policy>/` 结果 |
+| `--skip-run` | — | false | 跳过实验，从 `<output_result_path>/csv_results` 加载已有 `cap_<capacity>_<policy>/` 结果；该模式不重新 warmup，因此不会生成 95%/99% 理论命中标注 |
 | `--plot-timeseries` | — | false | 为容量点生成时序图；必须配合 `--save-csv` 或 `--skip-run` 才有 CSV 可画 |
 | `--plot-capacity` | — | 全部 | 只为指定容量点生成时序图；传入的是 `cap_<capacity>_<policy>` 里的 block 容量整数 |
 | `--x-min` | — | 自动 | Pareto 图 X 轴最小值 |
 | `--x-max` | — | 自动 | Pareto 图 X 轴最大值 |
 | `--y-min` | — | 自动 | Pareto 图 Y 轴最小值 |
 | `--y-max` | — | 自动 | Pareto 图 Y 轴最大值 |
+| `--plot-title` | — | 自动 | 覆盖 Pareto 图标题 |
 
 `--hit-rate-type all` 会分别输出 total/local/remote 三类图。标准结论看 total token hit rate；local/remote 仅作为诊断拆分。
+
+图的 X 轴为 `Capacity (GB)`，由容量点 block 数乘以该 instance 的 `block_size * bytes_per_token` 换算；Y 轴为 `HitRate (%)`，默认从 0 到 100。
 
 ### 输出
 
 ```
 <output_result_path>/
 ├── pareto/
-│   ├── pareto_curve_<type>.png           # 单策略 Pareto 散点图
-│   ├── multi_policy_<type>.png           # 多策略对比子图
+│   ├── pareto_curve_<type>.png           # 单策略 Pareto 曲线
+│   ├── multi_policy_<type>.png           # 多策略 Pareto 对比图
 ├── timeseries/
 │   └── multi_instance_cache_analysis.png # 时序图（需 --plot-timeseries）
 └── csv_results/                          # 需 --save-csv
@@ -393,9 +440,9 @@ bazel run //kv_cache_manager/optimizer/analysis/script:analyze_lifecycle -- \
 
 | 模块 | 说明 |
 |------|------|
-| `optimizer_runner.py` | optimizer 运行封装：配置加载、warmup pass、并行实验框架（ThreadPoolExecutor）。被 `optimizer_run`、`tradeoff`、`export_tree` 调用 |
-| `csv_loader.py` | CSV 结果加载、容量列表生成（指数分布采样）、`--skip-run` 模式的数据加载。被 `tradeoff` 调用 |
-| `plot_utils.py` | 统一绘图风格（`setup_plot_style`）、Pareto 曲线绘图、多策略子图绘图、per-tier 对比曲线。被 `tradeoff` 调用 |
+| `optimizer_runner.py` | optimizer 运行封装：配置加载、无限容量 warmup、并行实验框架（ThreadPoolExecutor）。被 `optimizer_run`、`tradeoff`、`export_tree` 调用 |
+| `csv_loader.py` | CSV 结果加载、容量列表生成（基于最大缓存 block 数的指数分布采样）、`--skip-run` 模式的数据加载。被 `tradeoff` 调用 |
+| `plot_utils.py` | 统一绘图风格（`setup_plot_style`）、Pareto 曲线绘图、多策略图、95%/99% 理论命中标注、下降点剔除日志、per-tier 对比曲线。被 `tradeoff` 调用 |
 | `window_aggregator.py` | 多实例结果聚合：全局/单实例汇总、时间窗口聚合。被 `multi_instance_replay` 调用 |
 
 ---

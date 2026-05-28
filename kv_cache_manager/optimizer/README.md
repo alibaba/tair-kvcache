@@ -130,15 +130,17 @@ python trace_converter.py \
     --mode optimizer
 ```
 
-### 步骤2: 编译Optimizer
+### 步骤2: 编译 Optimizer
 
 ```bash
-bazel build //kv_cache_manager/optimizer:optimizer_main
+bazel build \
+    //kv_cache_manager/optimizer:optimizer_main \
+    //kv_cache_manager/optimizer/analysis/script:optimizer_run
 ```
 
 ### 步骤3: 创建配置文件
 
-创建 JSON 配置文件（参考 `optimizer_startup_config_load.json`）：
+创建 JSON 配置文件。下面是非分层 LRU 的最小可用配置；trace 中的 `instance_id` 必须能匹配这里的 `instances[].instance_id`。
 
 ```json
 {
@@ -150,7 +152,7 @@ bazel build //kv_cache_manager/optimizer:optimizer_main
     },
     "instance_groups": [
         {
-            "group_name": "instance_group_01", // 需要分析的实例组名称
+            "group_name": "instance_group_01",
             "quota_capacity": 12000,
             "used_percentage": 1.0,
             "tier_strategy": {
@@ -160,23 +162,20 @@ bazel build //kv_cache_manager/optimizer:optimizer_main
                 "promote_enabled": true,
                 "selective_write_threshold": 2
             },
-            "default_block_ttl_seconds": 0, // 0=关闭TTL, >0=默认TTL秒数
-            "storages": [
-                {
-                    "unique_name": "pace_00",
-                    "storage_type": "pace",
-                    "band_width_mbps": 20000,
-                    "priority": 0,
-                    "capacity": 100000
-                }
-            ],
+            "default_block_ttl_seconds": 0,
+            "ttl_refresh_on_read": true,
+            "storages": [],
             "instances": [
                 {
-                    "instance_id": "instance", //需要分析的实例名称
+                    "instance_id": "instance-a",
                     "block_size": 16,
-                    "eviction_policy_type": "random_lru",
+                    "bytes_per_token": 512,
+                    "eviction_policy_type": "lru",
                     "eviction_policy_params": {
-                        "sample_rate": 0.1
+                        "sample_rate": 1.0,
+                        "shard_count": 1,
+                        "sample_times": 32,
+                        "eviction_amplification_factor": 1.0
                     }
                 }
             ]
@@ -189,12 +188,35 @@ bazel build //kv_cache_manager/optimizer:optimizer_main
 ### 步骤4: 运行Optimizer
 
 ```bash
-bazel run //kv_cache_manager/optimizer:optimizer_main -- /path/to/config.json
+bazel run //kv_cache_manager/optimizer/analysis/script:optimizer_run -- \
+    -c /path/to/config.json
 ```
 
 运行完成后，会在 `output_result_path` 指定的目录下生成：
 
 - `{instance_id}_hit_rates.csv` - 每个 instance 的命中率数据
+
+需要画命中率时序图时加 `--draw-chart`：
+
+```bash
+bazel run //kv_cache_manager/optimizer/analysis/script:optimizer_run -- \
+    -c /path/to/config.json \
+    --draw-chart
+```
+
+常见入口速查：
+
+| 需求 | 推荐入口 |
+|---|---|
+| 单次回放、输出 `*_hit_rates.csv` | `optimizer_run -c config.json` |
+| 单次回放并画时序图 | `optimizer_run -c config.json --draw-chart` |
+| 无限容量理论命中率 | config 中将 `quota_capacity` 或 tier `capacity` 设为 `-1` 后运行 `optimizer_run` |
+| 非分层容量 Pareto | `tradeoff -c config.json --num-points 30` |
+| 多驱逐策略 Pareto | `tradeoff -c config.json --eviction-policies lru random_lru leaf_aware_lru ttl` |
+| 每个 pod/instance 独立缓存回放 | `multi_instance_replay --trace-dir ... --output-dir ...` |
+| 导出生命周期 CSV | `optimizer_run -c config.json --export-lifecycle` |
+| 分析 lifecycle 图表 | `analyze_lifecycle -i <lifecycle.csv 或目录>` |
+| 导出/可视化 RadixTree | `export_tree -c config.json --show-hot-paths` |
 
 ### 可视化分析
 
@@ -212,67 +234,70 @@ bazel run //kv_cache_manager/optimizer/analysis/script:optimizer_run -- \
     --draw-chart
 ```
 
-**输出**：`{output_result_path}/multi_instance_cache_analysis.png`
+**输出**：`{output_result_path}/timeseries/multi_instance_cache_analysis.png`
 
 #### Radix Tree 可视化
 
 导出并可视化前缀树结构，统计并展示热节点以及所属节点的前缀路径。
-具体配置见 analysis/scripts 中 export_and_visualize_tree.py
+具体配置见 `analysis/script/run/export_tree.py`。
 
 ```bash
-bazel run //kv_cache_manager/optimizer/analysis/script:visualize_tree -- \
+bazel run //kv_cache_manager/optimizer/analysis/script:export_tree -- \
     -c /path/to/config.json
 ```
 
 **输出**：
-- `{output_result_path}/radix_tree_{instance_id}.json` - Radix Tree 导出数据
-- `{output_result_path}/radix_tree_{instance_id}.png` - Radix Tree 可视化图表
+- `{output_result_path}/radix_tree/{instance_id}_radix_tree.json` - Radix Tree 导出数据
+- `{output_result_path}/radix_tree/{instance_id}_radix_tree.png` - Radix Tree 可视化图表
 
-#### 单策略 Trade-off 曲线分析
+#### Pareto 容量-命中率曲线分析
 
-生成在不同容量配置下的多个instance命中率曲线，用于评估容量与命中率的权衡关系，仅使用配置中的驱逐策略。
+统一入口是 `tradeoff`。它先用无限容量 warmup 获取理论命中率和最大缓存量，然后按容量点回放 optimizer，绘制容量与命中率的 Pareto 曲线。
+
+> **适用范围**：Tradeoff 只适用于非分层模式。在分层模式下，容量扫描只修改 `quota_capacity`，不会修改各 tier 的 `storages[i].capacity`，因此不能代表真实分层容量权衡。
 
 ```bash
-bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff_analysis_run_by_instances -- \
+bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
     -c /path/to/config.json \
-    --warmup-capacity 10000 \
-    --num-points 40 \
+    --num-points 30 \
+    --min-capacity-ratio 1e-4 \
     --hit-rate-type total \
     --max-workers 4
 ```
 
 **参数说明**：
 - `-c, --config` - 配置文件路径
-- `--warmup-capacity` - Warmup 阶段使用的大容量，单位 GB（默认 10000）
-- `--num-points` - 容量采样点数量（默认 40）
-- `--hit-rate-type` - 命中率类型：total/internal/external/all（默认 total）
+- `--num-points` - 每个策略最多运行的容量采样点数量（默认 30），达到 99% 理论命中率后提前停止
+- `--min-capacity-ratio` - 最小容量点相对阈值（默认 `1e-4`）
+- `--hit-rate-type` - 命中率类型：total/local/remote/all（默认 total）
 - `--max-workers` - 并行执行的最大线程数（默认 4）
+- `--plot-title` - 覆盖图标题
 
-**输出**：`{output_result_path}/pareto_curve_{hit_rate_type}.png`
+**输出**：`{output_result_path}/pareto/pareto_curve_{hit_rate_type}.png`
 
 #### 多策略对比分析
 
-对比每个instance多个驱逐策略在不同容量配置下的性能表现，所有instance统一用一种类型的驱逐策略。
+通过 `--eviction-policies` 对比多个驱逐策略。每个策略独立 warmup、独立计算理论命中率，并独立在达到 99% 理论命中后停止。
 
 ```bash
-bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff_analysis_run_by_policies -- \
+bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
     -c /path/to/config.json \
-    --warmup-capacity 10000 \
     --eviction-policies lru random_lru leaf_aware_lru ttl \
-    --num-points 40 \
+    --num-points 30 \
     --hit-rate-type total \
     --max-workers 4
 ```
 
 **参数说明**：
 - `-c, --config` - 配置文件路径
-- `--warmup-capacity` - Warmup 阶段使用的大容量，单位 GB（默认 10000）
 - `--eviction-policies` - 要对比的驱逐策略列表（默认 lru random_lru leaf_aware_lru ttl）
-- `--num-points` - 容量采样点数量（默认 40）
-- `--hit-rate-type` - 命中率类型：total/internal/external/all（默认 total）
+- `--num-points` - 每个策略最多运行的容量采样点数量（默认 30），达到 99% 理论命中率后提前停止
+- `--hit-rate-type` - 命中率类型：total/local/remote/all（默认 total）
 - `--max-workers` - 并行执行的最大线程数（默认 4）
 
-**输出**：`{output_result_path}/multi_policy_{hit_rate_type}.png`
+**输出**：`{output_result_path}/pareto/multi_policy_{hit_rate_type}.png`
+
+图形规则：X 轴为 `Capacity (GB)`，Y 轴为 `HitRate (%)`；曲线从 `(0 GB, 0%)` 开始，只画上升段；95% 和 99% 理论命中率用插值交点、虚线和标签标出。若某个容量点出现下降，会从图上剔除并在日志中打印，原始 CSV 保留。
 
 ### Python 接口示例
 
@@ -321,123 +346,299 @@ optimizer.ClearAllCachesAndResetStats()           # 清空所有实例并重置�
 |------|------|
 | eviction_mode | 驱逐模式：1=GROUP_ROUGH, 2=INSTANCE_ROUGH, 3=INSTANCE_PRECISE |
 | eviction_policy_type | 驱逐策略类型：lru、random_lru、leaf_aware_lru、ttl |
-| tier_strategy | 多层读写策略包，包含分层驱逐开关、写入模式、读访问传播、promote 和 selective write 阈值 |
+| quota_capacity | 非分层模式下的 group 总容量，单位 GB；`-1` 表示无限容量，不触发容量驱逐 |
+| storages[].capacity | 分层模式下单个 tier 的容量，单位 GB；`-1` 表示该 tier 无限容量 |
+| tier_strategy | 多层读写策略包，包含分层驱逐开关、写入模式、读访问传播、promote 和 selective write 阈值；顶层字段是所有相邻 tier edge 的默认策略 |
+| tier_strategy.write_mode | 写入/下沉模式：`write_through`、`cascading`、`write_through_selective` |
+| tier_strategy.access_propagation_enabled | 读命中上层副本时是否刷新下层副本访问时间；它不是写入模式 |
 | tier_strategy.tier_flows | 相邻 tier edge 的策略覆盖；未覆盖 edge 继承 `tier_strategy` 默认策略 |
+| bytes_per_token | 单 token KV 大小；Python 分析脚本用它和 `block_size` 将 block 容量换算为 GB |
 | default_block_ttl_seconds | instance group 级别的默认 TTL（秒），0 = 关闭 TTL |
 | ttl_refresh_on_read | instance group 级别 TTL 续命开关：true=读续命，false=固定窗口 |
 | fallback_on_pressure | TTL 策略参数：过期不够时是否按 LRU 兜底（默认 true） |
 
-### 示例
+## 使用案例
 
-以 [Qwen-Bailian 开源数据集](https://github.com/alibaba-edu/qwen-bailian-usagetraces-anon) 为例：
+下面的案例都假设输入已经是标准 optimizer JSONL trace。标准结论使用 token hit rate，即 CSV 最后一行的 `AccHitRate = AccHitTokens / AccInputTokens`。示例中的 JSON 多数只展示 `instance_groups[]` 中的一项，完整 config 仍需要顶层 `trace_file_path`、`output_result_path` 和 `eviction_params`。
 
-#### 1. 转换trace
+### 案例 1：全局池化无限容量理论命中率
 
-```bash
-cd tools/trace_converter
-python trace_converter.py \
-    -i /path/to/qwen_traceA_blksz_16.jsonl \
-    -o /path/to/qwen_traceA_optimizer.jsonl \
-    -f qwen_bailian \
-    --mode optimizer \
-    --block-size 16
-```
-
-#### 2. 配置文件
+用于回答“如果容量无限，当前 trace 理论上最多能命中多少”。非分层全局池化配置中把 `quota_capacity` 设为 `-1`：
 
 ```json
 {
-    "trace_file_path" : "/path/to/qwen_traceA_optimizer.jsonl",
-    "output_result_path": "/path/to/output",
-    "eviction_params": {
-        "eviction_mode": 1,
-        "eviction_batch_size_per_instance": 100
+    "group_name": "global_pool",
+    "quota_capacity": -1,
+    "used_percentage": 1.0,
+    "tier_strategy": {
+        "hierarchical_eviction_enabled": false,
+        "write_mode": "write_through",
+        "access_propagation_enabled": true,
+        "promote_enabled": true,
+        "selective_write_threshold": 2
     },
-    "instance_groups" : [
+    "storages": [],
+    "instances": [
         {
-            "group_name": "instance_group_01",
-            "quota_capacity" : 120000,
-            "used_percentage" : 1.0,
-            "tier_strategy": {
-                "hierarchical_eviction_enabled": false,
-                "write_mode": "write_through",
-                "access_propagation_enabled": true,
-                "promote_enabled": true,
-                "selective_write_threshold": 2
-            },
-            "storages": [
-                        {
-                            "unique_name": "pace_00",
-                            "storage_type": "pace",
-                            "band_width_mbps": 20000,
-                            "priority": 0,
-                            "capacity": 100000
-                        },
-                        {
-                            "unique_name": "hf3fs_00",
-                            "storage_type": "hf3fs",
-                            "band_width_mbps": 20000,
-                            "priority": 1,
-                            "capacity": 20000
-                        }
-                    ],
-            "instances": [
-                {
-                    "instance_id": "instance",
-                    "block_size": 16,
-                    "eviction_policy_type": "lru",
-                    "eviction_policy_params": {
-                                "sample_rate": 0.1
-                            }
-
-                }
-            ]
+            "instance_id": "global",
+            "block_size": 256,
+            "bytes_per_token": 512,
+            "eviction_policy_type": "lru",
+            "eviction_policy_params": {
+                "sample_rate": 1.0,
+                "shard_count": 1,
+                "sample_times": 32,
+                "eviction_amplification_factor": 1.0
+            }
         }
     ]
 }
 ```
-#### 命中率随时间变化图
+
+运行：
+
 ```bash
 bazel run //kv_cache_manager/optimizer/analysis/script:optimizer_run -- \
-    -c /path/to/KVCacheManager/kv_cache_manager/optimizer/optimizer_startup_config_load.json \
+    -c /path/to/global_pool_unlimited.json
+```
+
+结果看 `{output_result_path}/global_hit_rates.csv` 最后一行的 `AccHitRate`、`AccInputTokens`、`AccHitTokens`。
+如果 trace 中使用真实 pod 名作为 `instance_id`，需要把上面示例里的 `instances[].instance_id` 同步改成对应名称。
+
+### 案例 2：单层有限容量回放
+
+用于评估给定容量下的实际 token 命中率。非分层模式只需要设置 `quota_capacity`，单位是 GB：
+
+```json
+{
+    "group_name": "finite_pool",
+    "quota_capacity": 742.18,
+    "used_percentage": 1.0,
+    "tier_strategy": {
+        "hierarchical_eviction_enabled": false,
+        "write_mode": "write_through",
+        "access_propagation_enabled": true,
+        "promote_enabled": true,
+        "selective_write_threshold": 2
+    },
+    "storages": []
+}
+```
+
+`block_size * bytes_per_token` 决定一个 block 对应的 KV 容量；Pareto 图和容量输出都依赖这个换算。
+
+```bash
+bazel run //kv_cache_manager/optimizer/analysis/script:optimizer_run -- \
+    -c /path/to/finite_pool.json \
     --draw-chart
 ```
-脚本会先运行optimizer回放trace生成命中率csv，随后调用plot脚本；
-上子图为整个trace的累积命中率变化，下子图为每个trace的smooth命中率变化
 
+输出：
 
-<img src="docs/pictures/multi_instance_cache_analysis.png" alt="cache_analysis" width="600">
+- `{output_result_path}/*_hit_rates.csv`
+- `{output_result_path}/timeseries/multi_instance_cache_analysis.png`
 
+### 案例 3：HBM + DRAM 分层回放，write-through，读不更新下层
 
-#### 前缀树可视化
-```bash
-bazel run //kv_cache_manager/optimizer/analysis/script:visualize_tree -- -c /path/to/KVCacheManager/kv_cache_manager/optimizer/optimizer_startup_config_load.json --show-hot-paths --hot-nodes 50 --show-blocks
+用于模拟线上多层缓存。`hierarchical_eviction_enabled=true` 时，每层按 `storages[].capacity` 独立驱逐；此时 `quota_capacity` 只是保留字段，不用于每层驱逐。
+
+```json
+{
+    "group_name": "tiered_pool",
+    "quota_capacity": 1,
+    "used_percentage": 1.0,
+    "tier_strategy": {
+        "hierarchical_eviction_enabled": true,
+        "write_mode": "write_through",
+        "access_propagation_enabled": false,
+        "promote_enabled": true,
+        "selective_write_threshold": 2
+    },
+    "storages": [
+        {
+            "unique_name": "hbm",
+            "storage_type": "hbm",
+            "band_width_mbps": 20000,
+            "priority": 0,
+            "capacity": 1167
+        },
+        {
+            "unique_name": "dram",
+            "storage_type": "dram",
+            "band_width_mbps": 20000,
+            "priority": 1,
+            "capacity": 1070.4
+        }
+    ]
+}
 ```
-脚本会先运行optimizer回放trace生成前缀树结构json，随后调用plot脚本；
-节点过多，只展示最热的50个节点,其中 0/14 表示当前节点包含14个blocks，但实际只存在0个，14个blocks被驱逐
 
-![radix tree](docs/pictures/instance_hot_paths.png)
+运行：
 
-具体统计信息见终端输出
-
-#### 单策略 Trade-off 曲线分析
 ```bash
-bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff_analysis_run_by_instances -- \
-    -c /path/to/KVCacheManager/kv_cache_manager/optimizer/optimizer_startup_config_load.json
+bazel run //kv_cache_manager/optimizer/analysis/script:optimizer_run -- \
+    -c /path/to/tiered_hbm_dram.json \
+    --draw-chart
 ```
-脚本会先预热统计整个trace的block数量，随后自动选取容量quota列表来循环回放trace，并获取每个instance的最终命中率对比散点图
 
-<img src="docs/pictures/tradeoff_curve_total.png" alt="cache_analysis" width="600">
+分层结果看 `Tier<N>(name)_HitTokens`、`AccTier<N>(name)_HitRate` 和 `Tier<N>(name)_BlockNum`，图在 `{output_result_path}/timeseries/per_tier_timeseries.png`。
 
-#### 多策略对比分析
+### 案例 4：三层 HBM + DRAM + L3，前两层 write-through，DRAM 到 L3 cascading
+
+当每条 edge 策略不一致时，用 `tier_flows` 覆盖默认策略：
+
+```json
+{
+    "tier_strategy": {
+        "hierarchical_eviction_enabled": true,
+        "write_mode": "write_through",
+        "access_propagation_enabled": false,
+        "promote_enabled": true,
+        "selective_write_threshold": 2,
+        "tier_flows": [
+            {
+                "from_tier": "hbm",
+                "to_tier": "dram",
+                "write_mode": "write_through",
+                "access_propagation_enabled": false,
+                "promote_enabled": true
+            },
+            {
+                "from_tier": "dram",
+                "to_tier": "l3",
+                "write_mode": "cascading",
+                "access_propagation_enabled": false,
+                "promote_enabled": true
+            }
+        ]
+    },
+    "storages": [
+        {"unique_name": "hbm", "storage_type": "hbm", "band_width_mbps": 20000, "priority": 0, "capacity": 1167},
+        {"unique_name": "dram", "storage_type": "dram", "band_width_mbps": 20000, "priority": 1, "capacity": 960},
+        {"unique_name": "l3", "storage_type": "ssd", "band_width_mbps": 20000, "priority": 2, "capacity": 2048}
+    ]
+}
+```
+
+`tier_strategy` 顶层字段是默认 edge 策略；`tier_flows` 只覆盖指定相邻 edge。
+
+### 案例 5：每个 pod 独立缓存回放并聚合全局命中率
+
+当线上每个 pod/实例独立缓存时，用 `multi_instance_replay`。输入目录下每个 JSONL 文件只能包含一个 `instance_id`。
+
 ```bash
-bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff_analysis_run_by_policies -- \
-    -c /path/to/KVCacheManager/kv_cache_manager/optimizer/optimizer_startup_config_load.json
+bazel run //kv_cache_manager/optimizer/analysis/script:multi_instance_replay -- \
+    --trace-dir /path/to/pod_traces \
+    --trace-glob "*.jsonl" \
+    --output-dir /path/to/pod_replay_output \
+    --l1-capacity 349.52 \
+    --l2-capacity 614.4 \
+    --block-size 1024 \
+    --bytes-per-token 163840 \
+    --eviction-policy lru \
+    --default-tier-write-mode write_through \
+    --disable-tier-access-propagation \
+    --enable-promote \
+    --max-workers 16 \
+    --window-seconds 60
 ```
-脚本会先预热统计整个trace的block数量，随后自动选取容量quota列表以及遍历给定驱逐策略来循环回放trace；
-值得注意的是给定的驱逐策略针对所有instance；
-每个instance都会生成一张子图来对比不同驱逐策略对命中率的影响
-<img src="docs/pictures/multi_policy_total.png" alt="cache_analysis" width="600">
+
+输出：
+
+- `<output_dir>/<instance_id>_hit_rates.csv`：每个 pod 的回放结果
+- `<output_dir>/aggregate/instance_aggregate.csv`：每个 pod 汇总
+- `<output_dir>/aggregate/global_aggregate.csv`：所有 pod 聚合后的整体命中率
+- `<output_dir>/aggregate/global_window_hit_rates.csv`：窗口级整体命中率
+
+当前 `multi_instance_replay` CLI 直接支持 L1/L2 两层。需要 L3 或更复杂拓扑时，使用完整 optimizer config 或扩展脚本。
+
+### 案例 6：容量 Pareto 图
+
+非分层容量扫描使用 `tradeoff`。脚本先跑无限容量 warmup 获取理论命中率，再生成容量点；达到 99% 理论命中后停止。
+
+```bash
+bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
+    -c /path/to/global_pool_config.json \
+    --num-points 30 \
+    --min-capacity-ratio 1e-4 \
+    --hit-rate-type total \
+    --max-workers 8 \
+    --plot-title "service-a Pareto"
+```
+
+多策略对比：
+
+```bash
+bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff -- \
+    -c /path/to/global_pool_config.json \
+    --eviction-policies lru random_lru leaf_aware_lru ttl \
+    --num-points 30 \
+    --hit-rate-type total \
+    --max-workers 8
+```
+
+输出：
+
+- `{output_result_path}/pareto/pareto_curve_total.png`
+- `{output_result_path}/pareto/multi_policy_total.png`
+
+图上会标出 95%/99% 理论命中对应容量；下降点只从图上剔除，原始 CSV 不改。
+
+### 案例 7：Block 生命周期分析
+
+先在回放时导出 lifecycle CSV：
+
+```bash
+bazel run //kv_cache_manager/optimizer/analysis/script:optimizer_run -- \
+    -c /path/to/config.json \
+    --export-lifecycle
+```
+
+再生成生命周期统计和图：
+
+```bash
+bazel run //kv_cache_manager/optimizer/analysis/script:analyze_lifecycle -- \
+    -i /path/to/output_result_path
+```
+
+只打印统计、不画图：
+
+```bash
+bazel run //kv_cache_manager/optimizer/analysis/script:analyze_lifecycle -- \
+    -i /path/to/output_result_path \
+    --stats-only
+```
+
+### 案例 8：RadixTree 热点路径排查
+
+用于看热点前缀、叶子节点和已缓存/已驱逐 block：
+
+```bash
+bazel run //kv_cache_manager/optimizer/analysis/script:export_tree -- \
+    -c /path/to/config.json \
+    --show-hot-paths \
+    --hot-nodes 50 \
+    --show-blocks
+```
+
+输出：
+
+- `{output_result_path}/radix_tree/{instance_id}_radix_tree.json`
+- `{output_result_path}/radix_tree/{instance_id}_hot_paths.png`
+
+### 案例 9：结果读取口径
+
+标准报告只看 token hit rate：
+
+| 指标 | 说明 |
+|---|---|
+| `InputTokens` / `AccInputTokens` | 当前 / 累计输入 token 数 |
+| `HitTokens` / `AccHitTokens` | 当前 / 累计命中 token 数 |
+| `HitRate` | 当前请求 token 命中率 |
+| `AccHitRate` | 累计 token 命中率，主要结论看这一列 |
+| `ReadBlocks` / `HitBlocks` | block 级诊断字段，不作为最终命中率口径 |
+| `Tier<N>(name)_HitTokens` | 分层命中 token 数 |
+| `AccTier<N>(name)_HitRate` | 分层累计 token 命中率 |
 
 
 ## Trace 输入格式
@@ -448,13 +649,13 @@ Optimizer 只接受标准格式的trace文件。使用独立的Python工具将�
 
 ### 标准格式
 
-Optimizer支持三种标准trace类型:
+Optimizer 支持两种标准 trace 类型：
 
 - **GetLocationSchemaTrace**: 读操作 (prefill阶段)
 - **WriteCacheSchemaTrace**: 写操作 (decode阶段)
 
 **推荐**: 所有Optimizer输入统一使用Get+Write格式以保留精确的读写时序。
-
+标准 `get` trace 必须包含 `input_len`；`keys` 只能包含完整 block key，不足一个 block 的尾部 token 不写入 `keys`，但仍计入 `InputTokens`。
 
 ---
 
@@ -515,11 +716,21 @@ python3 trace_converter.py -i input.jsonl -o output.jsonl -f custom \
         {
             "group_name": "instance_group_01",
             "quota_capacity": 12000,
+            "used_percentage": 1.0,
+            "tier_strategy": {
+                "hierarchical_eviction_enabled": false,
+                "write_mode": "write_through",
+                "access_propagation_enabled": true,
+                "promote_enabled": true,
+                "selective_write_threshold": 2
+            },
             "default_block_ttl_seconds": 0,
+            "storages": [],
             "instances": [
                 {
                     "instance_id": "instance",
                     "block_size": 16,
+                    "bytes_per_token": 512,
                     "eviction_policy_type": "lru"
                 }
             ]

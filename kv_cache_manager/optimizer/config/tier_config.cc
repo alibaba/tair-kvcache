@@ -10,7 +10,7 @@ bool OptTierConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
     // capacity in config is in GB; convert to bytes
     double capacity_gb = 0.0;
     KVCM_JSON_GET_MACRO(rapid_value, "capacity", capacity_gb);
-    capacity_ = static_cast<int64_t>(capacity_gb * static_cast<double>(1LL << 30));
+    capacity_ = capacity_gb < 0 ? -1 : static_cast<int64_t>(capacity_gb * static_cast<double>(1LL << 30));
     return true;
 };
 
@@ -20,7 +20,7 @@ void OptTierConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &wr
     Put(writer, "band_width_mbps", band_width_mbps_);
     Put(writer, "priority", priority_);
     // Write capacity in GB
-    const double cap_gb = static_cast<double>(capacity_) / static_cast<double>(1LL << 30);
+    const double cap_gb = capacity_ < 0 ? -1.0 : static_cast<double>(capacity_) / static_cast<double>(1LL << 30);
     Put(writer, "capacity", cap_gb);
 };
 } // namespace kv_cache_manager
