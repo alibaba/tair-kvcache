@@ -15,6 +15,7 @@ enum ErrorCode {
     REACH_MAX_ENTITY_CAPACITY = 7;
     INSTANCE_NOT_EXIST = 8;
     SERVER_NOT_LEADER = 9; // 高可用部署模式下，请求的接口只能在leader执行但请求的节点不是leader
+    NODE_NOT_REGISTERED = 10;
 
     IO_ERROR = 20;
     UNKNOWN_ERROR = 100;
@@ -343,6 +344,17 @@ message FinishWriteCacheRequest {
     repeated CacheLocation locations = 5;
 }
 
+// V6D 驱逐前写远端，要求可用副本数 >= min_replica_count 才跳过写入。
+message StartEvictWriteCacheRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    repeated int64 block_keys = 3;
+    repeated int64 token_ids = 4;
+    repeated string location_spec_group_names = 5;
+    int32 write_timeout_seconds = 6;
+    int32 min_replica_count = 7; // 0 or unset defaults to 2
+}
+
 // 删除指定 blockKeys，用于修复线上用户反馈case说某些提示词会胡言乱语的情况
 message RemoveCacheRequest {
     string trace_id = 1;
@@ -413,6 +425,8 @@ service MetaService {
     rpc TrimCache(TrimCacheRequest) returns (CommonResponse);
     // 查询集群信息（leader发现），任意节点均可处理
     rpc GetClusterInfo(GetClusterInfoRequest) returns (GetClusterInfoResponse);
+    // V6D 驱逐前写远端（需要 >= min_replica_count 份才跳过）
+    rpc StartEvictWriteCache(StartEvictWriteCacheRequest) returns (StartWriteCacheResponse);
     // V6D 上报事件（节点注册、Block 增删、节点宕机）
     rpc ReportEvent(ReportEventRequest) returns (ReportEventResponse);
 }
