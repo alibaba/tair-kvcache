@@ -25,6 +25,7 @@ enum [[nodiscard]] ErrorCode : int32_t{
     EC_MISMATCH = 16,
     EC_NOSCRIPT = 17,
     EC_SERVICE_NOT_LEADER = 18,
+    EC_NODE_NOT_REGISTERED = 19,
     EC_UNKNOWN = 127,
     EC_KVCM_MAX,
 };

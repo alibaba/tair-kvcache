@@ -50,8 +50,13 @@ def handle_3fs(args):
     data = create_update_storage_data(args, "threefs", storage_spec)
     http_post_and_print(args.host, data, args.verbose)
 
+def handle_vineyard(args):
+    storage_spec = gen_vineyard_config_data(args)
+    data = create_update_storage_data(args, "vineyard", storage_spec)
+    http_post_and_print(args.host, data, args.verbose)
+
 def main():
-    add_or_update_main("update_storage", handle_nfs, handle_pace, handle_3fs)
+    add_or_update_main("update_storage", handle_nfs, handle_pace, handle_3fs, handle_vineyard)
 
 if __name__ == "__main__":
     main()

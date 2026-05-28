@@ -1316,3 +1316,266 @@ TEST_F(MetaSearcherTest, TestBatchGetMergesSpecsByStorageType) {
         EXPECT_EQ(loc->type(), DataStorageType::DATA_STORAGE_TYPE_MOONCAKE);
     }
 }
+
+// ============================================================
+// BatchGetBestLocationByBackend tests
+// ============================================================
+
+// Setup 5 keys across 3 V6D peers + 1 Tair peer:
+//   key 80000: v6d peer_a, peer_b    + tair host_t
+//   key 80001: v6d peer_a, peer_b    + tair host_t
+//   key 80002: v6d peer_b            + tair host_t
+//   key 80003: v6d peer_a, peer_b    + tair host_t
+//   key 80004: (no v6d)              + tair host_t
+//
+// PREFIX (from key[0]): peer_a covers [80000,80001] then misses 80002 → prefix len 2
+//                       peer_b covers [80000,80001,80002,80003] → prefix len 4  → winner = peer_b
+// COVERAGE: peer_b covers 4 keys (80000-80003), peer_a covers 3 → winner = peer_b
+
+class BatchGetBestLocationByBackendTest : public MetaSearcherTest {
+protected:
+    void SetUp() override {
+        MetaSearcherTest::SetUp();
+
+        // V6D locations
+        std::vector<std::vector<MetaSearcher::UpsertLocation>> v6d_upserts = {
+            // key 80000: peer_a + peer_b
+            {
+                {"kvs#v6d#mem#peer_a:8080",
+                 DataStorageType::DATA_STORAGE_TYPE_VINEYARD,
+                 CLS_SERVING,
+                 {LocationSpec("tp0", "v6d://peer_a:8080/tp0")}},
+                {"kvs#v6d#mem#peer_b:8080",
+                 DataStorageType::DATA_STORAGE_TYPE_VINEYARD,
+                 CLS_SERVING,
+                 {LocationSpec("tp0", "v6d://peer_b:8080/tp0")}},
+            },
+            // key 80001: peer_a + peer_b
+            {
+                {"kvs#v6d#mem#peer_a:8080",
+                 DataStorageType::DATA_STORAGE_TYPE_VINEYARD,
+                 CLS_SERVING,
+                 {LocationSpec("tp0", "v6d://peer_a:8080/tp0")}},
+                {"kvs#v6d#mem#peer_b:8080",
+                 DataStorageType::DATA_STORAGE_TYPE_VINEYARD,
+                 CLS_SERVING,
+                 {LocationSpec("tp0", "v6d://peer_b:8080/tp0")}},
+            },
+            // key 80002: peer_b only
+            {
+                {"kvs#v6d#mem#peer_b:8080",
+                 DataStorageType::DATA_STORAGE_TYPE_VINEYARD,
+                 CLS_SERVING,
+                 {LocationSpec("tp0", "v6d://peer_b:8080/tp0")}},
+            },
+            // key 80003: peer_a + peer_b
+            {
+                {"kvs#v6d#mem#peer_a:8080",
+                 DataStorageType::DATA_STORAGE_TYPE_VINEYARD,
+                 CLS_SERVING,
+                 {LocationSpec("tp0", "v6d://peer_a:8080/tp0")}},
+                {"kvs#v6d#mem#peer_b:8080",
+                 DataStorageType::DATA_STORAGE_TYPE_VINEYARD,
+                 CLS_SERVING,
+                 {LocationSpec("tp0", "v6d://peer_b:8080/tp0")}},
+            },
+        };
+        std::vector<ErrorCode> per_key_ec;
+        ErrorCode ec = meta_searcher_->BatchUpsertLocations(
+            request_context_.get(), {80000, 80001, 80002, 80003}, v6d_upserts, per_key_ec);
+        ASSERT_EQ(ec, ErrorCode::EC_OK);
+
+        // Tair locations for all 5 keys
+        MetaSearcher::KeyVector tair_keys = {80000, 80001, 80002, 80003, 80004};
+        for (int64_t key : tair_keys) {
+            auto tair_loc = MetaSearcherTestHelper::CreateCacheLocation(
+                DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
+                1,
+                {MetaSearcherTestHelper::CreateLocationSpec("tp0", "tair://host_t:6379/tp0")});
+            std::vector<std::string> out_ids;
+            ec = meta_searcher_->BatchAddLocation(request_context_.get(), {key}, {tair_loc}, out_ids);
+            ASSERT_EQ(ec, ErrorCode::EC_OK);
+            std::vector<std::vector<MetaSearcher::LocationUpdateTask>> tasks = {{{out_ids[0], CLS_SERVING}}};
+            std::vector<std::vector<ErrorCode>> results;
+            meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), {key}, tasks, results);
+        }
+    }
+};
+
+TEST_F(BatchGetBestLocationByBackendTest, V6DPrefixStrategy) {
+    MetaSearcher::KeyVector keys = {80000, 80001, 80002, 80003, 80004};
+    std::vector<BackendSelector> selectors = {
+        {DataStorageType::DATA_STORAGE_TYPE_VINEYARD, LocationSelectStrategy::LSS_V6D_PREFIX},
+    };
+
+    LocationsPerKey out;
+    ErrorCode ec =
+        meta_searcher_->BatchGetBestLocationByBackend(request_context_.get(), keys, out, &policy_, selectors);
+    ASSERT_EQ(ec, ErrorCode::EC_OK);
+    ASSERT_EQ(out.size(), 5);
+
+    // peer_b covers the longest prefix: keys 80000-80003 (4 keys).
+    // peer_a only covers 80000-80001 (2 keys, breaks at 80002).
+    for (size_t i = 0; i < 4; ++i) {
+        ASSERT_EQ(out[i].size(), 1) << "key index " << i << " should have 1 V6D location";
+        EXPECT_EQ(out[i][0]->type(), DataStorageType::DATA_STORAGE_TYPE_VINEYARD);
+        // URI should contain peer_b
+        EXPECT_NE(out[i][0]->location_specs()[0].uri().find("peer_b"), std::string::npos)
+            << "key index " << i << " should be served by peer_b";
+    }
+    // key 80004 has no V6D location
+    EXPECT_TRUE(out[4].empty());
+}
+
+TEST_F(BatchGetBestLocationByBackendTest, V6DCoverageStrategy) {
+    MetaSearcher::KeyVector keys = {80000, 80001, 80002, 80003, 80004};
+    std::vector<BackendSelector> selectors = {
+        {DataStorageType::DATA_STORAGE_TYPE_VINEYARD, LocationSelectStrategy::LSS_V6D_COVERAGE},
+    };
+
+    LocationsPerKey out;
+    ErrorCode ec =
+        meta_searcher_->BatchGetBestLocationByBackend(request_context_.get(), keys, out, &policy_, selectors);
+    ASSERT_EQ(ec, ErrorCode::EC_OK);
+    ASSERT_EQ(out.size(), 5);
+
+    // peer_b covers 4 keys (80000-80003), peer_a covers 3 → winner = peer_b
+    for (size_t i = 0; i < 4; ++i) {
+        ASSERT_EQ(out[i].size(), 1) << "key index " << i;
+        EXPECT_NE(out[i][0]->location_specs()[0].uri().find("peer_b"), std::string::npos);
+    }
+    EXPECT_TRUE(out[4].empty());
+}
+
+TEST_F(BatchGetBestLocationByBackendTest, PrefixStopsAtGap) {
+    // key 80002 has only peer_b, not peer_a.
+    // If we query keys in order [80000, 80002, 80003]:
+    //   peer_a: covers 80000, then misses 80002 → prefix = 1
+    //   peer_b: covers 80000, 80002, 80003 → prefix = 3  → winner = peer_b
+    MetaSearcher::KeyVector keys = {80000, 80002, 80003};
+    std::vector<BackendSelector> selectors = {
+        {DataStorageType::DATA_STORAGE_TYPE_VINEYARD, LocationSelectStrategy::LSS_V6D_PREFIX},
+    };
+
+    LocationsPerKey out;
+    ErrorCode ec =
+        meta_searcher_->BatchGetBestLocationByBackend(request_context_.get(), keys, out, &policy_, selectors);
+    ASSERT_EQ(ec, ErrorCode::EC_OK);
+    ASSERT_EQ(out.size(), 3);
+    for (size_t i = 0; i < 3; ++i) {
+        ASSERT_EQ(out[i].size(), 1);
+        EXPECT_NE(out[i][0]->location_specs()[0].uri().find("peer_b"), std::string::npos);
+    }
+}
+
+TEST_F(BatchGetBestLocationByBackendTest, PrefixStopsWhenNoV6D) {
+    // key 80004 has no V6D. If it's the first key, PREFIX should stop immediately.
+    MetaSearcher::KeyVector keys = {80004, 80000, 80001};
+    std::vector<BackendSelector> selectors = {
+        {DataStorageType::DATA_STORAGE_TYPE_VINEYARD, LocationSelectStrategy::LSS_V6D_PREFIX},
+    };
+
+    LocationsPerKey out;
+    ErrorCode ec =
+        meta_searcher_->BatchGetBestLocationByBackend(request_context_.get(), keys, out, &policy_, selectors);
+    ASSERT_EQ(ec, ErrorCode::EC_OK);
+    ASSERT_EQ(out.size(), 3);
+    // All empty because first key has no V6D, PREFIX stops
+    for (size_t i = 0; i < 3; ++i) {
+        EXPECT_TRUE(out[i].empty()) << "key index " << i << " should be empty";
+    }
+}
+
+TEST_F(BatchGetBestLocationByBackendTest, CoverageSkipsGap) {
+    // COVERAGE skips keys with no V6D and picks from the rest.
+    MetaSearcher::KeyVector keys = {80004, 80000, 80001};
+    std::vector<BackendSelector> selectors = {
+        {DataStorageType::DATA_STORAGE_TYPE_VINEYARD, LocationSelectStrategy::LSS_V6D_COVERAGE},
+    };
+
+    LocationsPerKey out;
+    ErrorCode ec =
+        meta_searcher_->BatchGetBestLocationByBackend(request_context_.get(), keys, out, &policy_, selectors);
+    ASSERT_EQ(ec, ErrorCode::EC_OK);
+    ASSERT_EQ(out.size(), 3);
+    EXPECT_TRUE(out[0].empty()); // 80004 has no V6D
+    EXPECT_EQ(out[1].size(), 1); // 80000
+    EXPECT_EQ(out[2].size(), 1); // 80001
+}
+
+TEST_F(BatchGetBestLocationByBackendTest, WeightedRandomTair) {
+    MetaSearcher::KeyVector keys = {80000, 80001, 80002, 80003, 80004};
+    std::vector<BackendSelector> selectors = {
+        {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, LocationSelectStrategy::LSS_WEIGHTED_RANDOM},
+    };
+
+    LocationsPerKey out;
+    ErrorCode ec =
+        meta_searcher_->BatchGetBestLocationByBackend(request_context_.get(), keys, out, &policy_, selectors);
+    ASSERT_EQ(ec, ErrorCode::EC_OK);
+    ASSERT_EQ(out.size(), 5);
+    // All 5 keys have Tair locations
+    for (size_t i = 0; i < 5; ++i) {
+        ASSERT_EQ(out[i].size(), 1) << "key index " << i;
+        EXPECT_EQ(out[i][0]->type(), DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL);
+    }
+}
+
+TEST_F(BatchGetBestLocationByBackendTest, MixedV6DAndTair) {
+    MetaSearcher::KeyVector keys = {80000, 80001, 80002, 80003, 80004};
+    std::vector<BackendSelector> selectors = {
+        {DataStorageType::DATA_STORAGE_TYPE_VINEYARD, LocationSelectStrategy::LSS_V6D_PREFIX},
+        {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, LocationSelectStrategy::LSS_WEIGHTED_RANDOM},
+    };
+
+    LocationsPerKey out;
+    ErrorCode ec =
+        meta_searcher_->BatchGetBestLocationByBackend(request_context_.get(), keys, out, &policy_, selectors);
+    ASSERT_EQ(ec, ErrorCode::EC_OK);
+    ASSERT_EQ(out.size(), 5);
+
+    // Keys 80000-80003: 1 V6D (peer_b) + 1 Tair = 2 locations
+    for (size_t i = 0; i < 4; ++i) {
+        ASSERT_EQ(out[i].size(), 2) << "key index " << i;
+        int v6d_count = 0, tair_count = 0;
+        for (const auto &loc : out[i]) {
+            if (loc->type() == DataStorageType::DATA_STORAGE_TYPE_VINEYARD)
+                v6d_count++;
+            if (loc->type() == DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL)
+                tair_count++;
+        }
+        EXPECT_EQ(v6d_count, 1);
+        EXPECT_EQ(tair_count, 1);
+    }
+    // Key 80004: only Tair (no V6D)
+    ASSERT_EQ(out[4].size(), 1);
+    EXPECT_EQ(out[4][0]->type(), DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL);
+}
+
+TEST_F(BatchGetBestLocationByBackendTest, EmptySelectorsBackwardCompat) {
+    MetaSearcher::KeyVector keys = {80000};
+    std::vector<BackendSelector> selectors = {};
+
+    LocationsPerKey out;
+    ErrorCode ec =
+        meta_searcher_->BatchGetBestLocationByBackend(request_context_.get(), keys, out, &policy_, selectors);
+    ASSERT_EQ(ec, ErrorCode::EC_OK);
+    ASSERT_EQ(out.size(), 1);
+    // No selectors → no backend processing → empty result per key
+    EXPECT_TRUE(out[0].empty());
+}
+
+TEST_F(BatchGetBestLocationByBackendTest, NoLocationsAtAll) {
+    MetaSearcher::KeyVector keys = {99999}; // nonexistent key
+    std::vector<BackendSelector> selectors = {
+        {DataStorageType::DATA_STORAGE_TYPE_VINEYARD, LocationSelectStrategy::LSS_V6D_PREFIX},
+        {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, LocationSelectStrategy::LSS_WEIGHTED_RANDOM},
+    };
+
+    LocationsPerKey out;
+    ErrorCode ec =
+        meta_searcher_->BatchGetBestLocationByBackend(request_context_.get(), keys, out, &policy_, selectors);
+    ASSERT_EQ(ec, ErrorCode::EC_OK);
+    ASSERT_EQ(out.size(), 1);
+    EXPECT_TRUE(out[0].empty());
+}

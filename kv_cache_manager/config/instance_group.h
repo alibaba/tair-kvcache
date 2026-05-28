@@ -39,6 +39,8 @@ public:
     void set_cache_config(const std::shared_ptr<CacheConfig> &cache_config) { cache_config_ = cache_config; }
     void set_user_data(const std::string &user_data) { user_data_ = user_data; }
     void set_version(int64_t version) { version_ = version; }
+    const std::string &extra_info() const { return extra_info_; }
+    void set_extra_info(const std::string &extra_info) { extra_info_ = extra_info; }
 
 private:
     std::string name_;
@@ -49,6 +51,7 @@ private:
     std::shared_ptr<CacheConfig> cache_config_;
     std::string user_data_;
     int64_t version_;
+    std::string extra_info_;
 };
 
 } // namespace kv_cache_manager

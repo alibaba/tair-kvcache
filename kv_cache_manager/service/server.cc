@@ -222,6 +222,11 @@ bool Server::StartHttpServer() {
     int32_t http_port = config_.GetServiceHttpPort();
     int32_t admin_http_port = config_.GetServiceAdminHttpPort();
 
+    const int32_t configured_io_thread_num = config_.GetServiceIoThreadNum();
+    const size_t io_thread_num = configured_io_thread_num > 0 ? static_cast<size_t>(configured_io_thread_num)
+                                                              : std::thread::hardware_concurrency();
+    KVCM_LOG_INFO("HTTP server io_thread_num=%zu (configured=%d)", io_thread_num, configured_io_thread_num);
+
     meta_http_service_ = std::make_shared<MetaServiceHttp>(metrics_registry_, meta_impl_, registry_manager_);
     admin_http_service_ = std::make_shared<AdminServiceHttp>(
         metrics_registry_, admin_impl_, config_.enable_prometheus(), config_.prometheus_prefix());
@@ -240,9 +245,9 @@ bool Server::StartHttpServer() {
     }
 
     // 在单独的线程中启动HTTP服务
-    meta_http_thread_ = std::thread([this, http_port]() {
+    meta_http_thread_ = std::thread([this, http_port, io_thread_num]() {
         KVCM_LOG_INFO("Meta http server starting on port %d", http_port);
-        bool meta_started = meta_http_service_->Start(http_port);
+        bool meta_started = meta_http_service_->Start(http_port, io_thread_num);
 
         if (!meta_started) {
             KVCM_LOG_ERROR("Failed to start meta http server on port %d", http_port);
@@ -250,9 +255,9 @@ bool Server::StartHttpServer() {
             KVCM_LOG_INFO("Meta HTTP server exited on port %d", http_port);
         }
     });
-    admin_http_thread_ = std::thread([this, admin_http_port]() {
+    admin_http_thread_ = std::thread([this, admin_http_port, io_thread_num]() {
         KVCM_LOG_INFO("Admin http server starting on port %d", admin_http_port);
-        bool admin_started = admin_http_service_->Start(admin_http_port); // 使用不同端口启动admin服务
+        bool admin_started = admin_http_service_->Start(admin_http_port, io_thread_num); // 使用不同端口启动admin服务
         if (!admin_started) {
             KVCM_LOG_ERROR("Failed to start admin http server on port %d", admin_http_port);
         } else {
@@ -263,10 +268,10 @@ bool Server::StartHttpServer() {
     // 可以考虑把三个HTTP服务合并到一个端口上，重复的API只注册一次
     // 如果有同名的不同API，可以通过特殊字段区分
     if (config_.IsEnableDebugService()) {
-        debug_http_thread_ = std::thread([this, http_port]() {
+        debug_http_thread_ = std::thread([this, http_port, io_thread_num]() {
             int32_t debug_http_port = http_port + 3000;
             KVCM_LOG_INFO("Debug http server starting on port %d", debug_http_port);
-            bool debug_started = debug_http_service_->Start(debug_http_port);
+            bool debug_started = debug_http_service_->Start(debug_http_port, io_thread_num);
             if (!debug_started) {
                 KVCM_LOG_ERROR("Failed to start debug http server on port %d", debug_http_port);
             } else {

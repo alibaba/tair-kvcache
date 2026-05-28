@@ -22,6 +22,7 @@ cc_library(
         ":data_storage_selector",
         ":hash_util",
         ":meta_searcher",
+
         ":reclaimer_task_supervisor",
         ":startup_config_loader",
         ":write_location_manager",
@@ -157,3 +158,4 @@ cc_library(
         "//kv_cache_manager/meta:meta_indexer_manager",
     ],
 )
+

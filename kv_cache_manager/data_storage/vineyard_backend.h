@@ -40,12 +40,9 @@ public:
 
     ErrorCode UnregisterNode(const std::string &host_ip_port);
 
-    void OnHeartbeat(const std::string &host_ip_port, const std::map<std::string, std::string> &system_status);
+    ErrorCode OnHeartbeat(const std::string &host_ip_port, const std::map<std::string, std::string> &system_status);
     void SetNodeUnavailable(const std::string &host_ip_port);
     bool IsNodeAvailable(const std::string &host_ip_port) const;
-    bool IsNodeRegistered(const std::string &host_ip_port) const;
-
-    bool IsLocationAvailable(const std::string &location_id) const;
 
     uint64_t GetNodeGeneration(const std::string &host_ip_port) const;
 
@@ -78,6 +75,7 @@ private:
 
         std::vector<std::string> mediums;
         std::map<std::string, std::string> last_system_status;
+        MetricsTags metrics_tags;
     };
 
     VineyardStorageSpec spec_;
@@ -93,6 +91,8 @@ private:
     int64_t heartbeat_timeout_ms_ = VineyardStorageSpec::kDefaultHeartbeatTimeoutMs;
     int64_t cleanup_grace_ms_ = VineyardStorageSpec::kDefaultCleanupGraceMs;
     int64_t liveness_check_interval_ms_ = VineyardStorageSpec::kDefaultLivenessCheckIntervalMs;
+
+    void ClearNodeGauges(const NodeInfo &info);
 
     mutable std::mutex cleanup_cb_mutex_;
     CleanupCallback cleanup_callback_;

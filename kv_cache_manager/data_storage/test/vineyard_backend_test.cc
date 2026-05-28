@@ -101,22 +101,7 @@ TEST_F(VineyardBackendTest, RegisterNodeWithMediums) {
     ASSERT_EQ(EC_OK, backend.Close());
 }
 
-// (3) IsLocationAvailable
-TEST_F(VineyardBackendTest, IsLocationAvailableParsesHostFromLocationId) {
-    VineyardBackend backend(metrics_registry_);
-    ASSERT_EQ(EC_OK, backend.Open(MakeConfig(), "trace"));
-    ASSERT_EQ(EC_OK, backend.RegisterNode("10.0.0.2:8080", {"mem"}));
-
-    EXPECT_TRUE(backend.IsLocationAvailable("kvs#v6d#mem#10.0.0.2:8080"));
-    EXPECT_TRUE(backend.IsLocationAvailable("kvs#v6d#disk#10.0.0.2:8080"));
-    EXPECT_FALSE(backend.IsLocationAvailable("kvs#v6d#mem#192.168.99.99:8080"));
-    EXPECT_FALSE(backend.IsLocationAvailable("not_a_location_id"));
-    EXPECT_FALSE(backend.IsLocationAvailable("kvs#v6d#mem#"));
-
-    ASSERT_EQ(EC_OK, backend.Close());
-}
-
-// (4) OnHeartbeat
+// (3) OnHeartbeat
 TEST_F(VineyardBackendTest, OnHeartbeatRefreshesAndRevivesNode) {
     VineyardBackend backend(metrics_registry_);
     ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 200, /*grace*/ 5000, /*tick*/ 50), "trace"));
@@ -131,7 +116,7 @@ TEST_F(VineyardBackendTest, OnHeartbeatRefreshesAndRevivesNode) {
     }
 
     std::this_thread::sleep_for(20ms);
-    backend.OnHeartbeat("10.0.0.3:8080", {{"version", "v6d-0.18"}});
+    ASSERT_EQ(EC_OK, backend.OnHeartbeat("10.0.0.3:8080", {{"version", "v6d-0.18"}}));
     {
         auto it = backend.nodes_.find("10.0.0.3:8080");
         ASSERT_GT(it->second->last_heartbeat_ms.load(), initial_hb);
@@ -140,14 +125,14 @@ TEST_F(VineyardBackendTest, OnHeartbeatRefreshesAndRevivesNode) {
 
     backend.SetNodeUnavailable("10.0.0.3:8080");
     ASSERT_FALSE(backend.IsNodeAvailable("10.0.0.3:8080"));
-    backend.OnHeartbeat("10.0.0.3:8080", {});
+    ASSERT_EQ(EC_OK, backend.OnHeartbeat("10.0.0.3:8080", {}));
     {
         auto it = backend.nodes_.find("10.0.0.3:8080");
         ASSERT_TRUE(it->second->available.load());
         ASSERT_EQ(it->second->unavailable_since_ms.load(), 0);
     }
 
-    backend.OnHeartbeat("99.99.99.99:8080", {{"x", "y"}});
+    ASSERT_EQ(EC_NODE_NOT_REGISTERED, backend.OnHeartbeat("99.99.99.99:8080", {{"x", "y"}}));
     ASSERT_EQ(backend.nodes_.count("99.99.99.99:8080"), 0u);
 
     ASSERT_EQ(EC_OK, backend.Close());
@@ -195,7 +180,7 @@ TEST_F(VineyardBackendTest, HeartbeatWithinGraceWindowRecovers) {
     std::this_thread::sleep_for(140ms);
     ASSERT_FALSE(backend.IsNodeAvailable("10.0.0.5:8080"));
 
-    backend.OnHeartbeat("10.0.0.5:8080", {});
+    ASSERT_EQ(EC_OK, backend.OnHeartbeat("10.0.0.5:8080", {}));
     ASSERT_TRUE(backend.IsNodeAvailable("10.0.0.5:8080"));
 
     std::this_thread::sleep_for(60ms);
@@ -294,6 +279,114 @@ TEST_F(VineyardBackendTest, LivenessLoopPassesGenerationToCallback) {
         std::this_thread::sleep_for(20ms);
     }
     EXPECT_EQ(received_gen.load(), expected_gen);
+
+    ASSERT_EQ(EC_OK, backend.Close());
+}
+
+TEST_F(VineyardBackendTest, OnHeartbeatPublishesMetricsGauges) {
+    VineyardBackend backend(metrics_registry_);
+    ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 5000, /*grace*/ 10000, /*tick*/ 50), "trace"));
+    ASSERT_EQ(EC_OK, backend.RegisterNode("10.0.0.10:9600", {"mem"}));
+
+    backend.OnHeartbeat("10.0.0.10:9600", {
+        {"hit_rate", "0.85"},
+        {"active_leases", "5"},
+        {"non_numeric_field", "BOTH_OK"},
+    });
+
+    auto hit_rate_data = metrics_registry_->GetMetricsData("v6d.hit_rate");
+    ASSERT_NE(hit_rate_data, nullptr);
+    MetricsTags expected_tags = {{"instance_id", "v6d_cluster_test"}, {"host", "10.0.0.10:9600"}};
+    auto gauge = hit_rate_data->GetOrCreateGauge(expected_tags);
+    ASSERT_DOUBLE_EQ(0.85, gauge.Get());
+
+    auto leases_data = metrics_registry_->GetMetricsData("v6d.active_leases");
+    ASSERT_NE(leases_data, nullptr);
+    auto leases_gauge = leases_data->GetOrCreateGauge(expected_tags);
+    ASSERT_DOUBLE_EQ(5.0, leases_gauge.Get());
+
+    auto non_numeric = metrics_registry_->GetMetricsData("v6d.non_numeric_field");
+    ASSERT_EQ(non_numeric, nullptr);
+
+    backend.OnHeartbeat("10.0.0.10:9600", {
+        {"hit_rate", "0.90"},
+        {"brand_new_metric", "42"},
+    });
+
+    auto new_data = metrics_registry_->GetMetricsData("v6d.brand_new_metric");
+    ASSERT_NE(new_data, nullptr);
+    auto new_gauge = new_data->GetOrCreateGauge(expected_tags);
+    ASSERT_DOUBLE_EQ(42.0, new_gauge.Get());
+    ASSERT_DOUBLE_EQ(0.90, gauge.Get());
+
+    ASSERT_EQ(EC_OK, backend.Close());
+}
+
+TEST_F(VineyardBackendTest, SetNodeUnavailableZerosGauges) {
+    VineyardBackend backend(metrics_registry_);
+    ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 5000, /*grace*/ 10000, /*tick*/ 50), "trace"));
+
+    ASSERT_EQ(EC_OK, backend.RegisterNode("10.0.0.30:9600", {"mem"}));
+    ASSERT_EQ(EC_OK, backend.RegisterNode("10.0.0.31:9600", {"mem"}));
+
+    backend.OnHeartbeat("10.0.0.30:9600", {{"hit_rate", "0.90"}, {"mem_used", "8192"}});
+    backend.OnHeartbeat("10.0.0.31:9600", {{"hit_rate", "0.80"}, {"mem_used", "4096"}});
+
+    MetricsTags tags_30 = {{"instance_id", "v6d_cluster_test"}, {"host", "10.0.0.30:9600"}};
+    MetricsTags tags_31 = {{"instance_id", "v6d_cluster_test"}, {"host", "10.0.0.31:9600"}};
+
+    auto hr_data = metrics_registry_->GetMetricsData("v6d.hit_rate");
+    ASSERT_NE(hr_data, nullptr);
+    ASSERT_DOUBLE_EQ(0.90, hr_data->GetOrCreateGauge(tags_30).Get());
+    ASSERT_DOUBLE_EQ(0.80, hr_data->GetOrCreateGauge(tags_31).Get());
+
+    backend.SetNodeUnavailable("10.0.0.30:9600");
+
+    ASSERT_DOUBLE_EQ(0.0, hr_data->GetOrCreateGauge(tags_30).Get());
+    auto mu_data = metrics_registry_->GetMetricsData("v6d.mem_used");
+    ASSERT_DOUBLE_EQ(0.0, mu_data->GetOrCreateGauge(tags_30).Get());
+
+    ASSERT_DOUBLE_EQ(0.80, hr_data->GetOrCreateGauge(tags_31).Get());
+    ASSERT_DOUBLE_EQ(4096, mu_data->GetOrCreateGauge(tags_31).Get());
+
+    backend.SetNodeUnavailable("10.0.0.30:9600");
+    ASSERT_DOUBLE_EQ(0.0, hr_data->GetOrCreateGauge(tags_30).Get());
+
+    ASSERT_EQ(EC_OK, backend.Close());
+}
+
+TEST_F(VineyardBackendTest, UnregisterNodeCleansUpGauges) {
+    VineyardBackend backend(metrics_registry_);
+    ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 5000, /*grace*/ 10000, /*tick*/ 50), "trace"));
+
+    ASSERT_EQ(EC_OK, backend.RegisterNode("10.0.0.20:9600", {"mem"}));
+    ASSERT_EQ(EC_OK, backend.RegisterNode("10.0.0.21:9600", {"mem"}));
+
+    backend.OnHeartbeat("10.0.0.20:9600", {{"hit_rate", "0.75"}, {"mem_used", "4096"}});
+    backend.OnHeartbeat("10.0.0.21:9600", {{"hit_rate", "0.60"}, {"mem_used", "2048"}});
+
+    MetricsTags tags_20 = {{"instance_id", "v6d_cluster_test"}, {"host", "10.0.0.20:9600"}};
+    MetricsTags tags_21 = {{"instance_id", "v6d_cluster_test"}, {"host", "10.0.0.21:9600"}};
+
+    auto hr_data = metrics_registry_->GetMetricsData("v6d.hit_rate");
+    ASSERT_NE(hr_data, nullptr);
+    ASSERT_DOUBLE_EQ(0.75, hr_data->GetOrCreateGauge(tags_20).Get());
+    ASSERT_DOUBLE_EQ(0.60, hr_data->GetOrCreateGauge(tags_21).Get());
+
+    ASSERT_EQ(EC_OK, backend.UnregisterNode("10.0.0.20:9600"));
+
+    auto hr_values = hr_data->GetMetricsValues();
+    for (const auto &[tags, val] : hr_values) {
+        ASSERT_NE(tags, tags_20) << "node 20 gauge should have been removed";
+    }
+    auto mu_data = metrics_registry_->GetMetricsData("v6d.mem_used");
+    auto mu_values = mu_data->GetMetricsValues();
+    for (const auto &[tags, val] : mu_values) {
+        ASSERT_NE(tags, tags_20) << "node 20 gauge should have been removed";
+    }
+
+    ASSERT_DOUBLE_EQ(0.60, hr_data->GetOrCreateGauge(tags_21).Get());
+    ASSERT_DOUBLE_EQ(2048, mu_data->GetOrCreateGauge(tags_21).Get());
 
     ASSERT_EQ(EC_OK, backend.Close());
 }

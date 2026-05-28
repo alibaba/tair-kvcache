@@ -375,13 +375,11 @@ TEST_F(MetaRedisBackendTest, TestDeleteFields) {
         std::vector<ReplyUPtr> replies;
         replies.emplace_back(MakeFakeReplyInteger(2));
         replies.emplace_back(MakeFakeReplyInteger(0));
-        EXPECT_CALL(*mock_redis_client,
-                    TryExecPipeline(ElementsAre(
-                        ElementsAre(StrEq("HDEL"),
-                                    StrEq("kvcache:instance_instance_0:cache_1"),
-                                    StrEq("__loc__f1"),
-                                    StrEq("__loc__f2")),
-                        ElementsAre(StrEq("HDEL"), StrEq("kvcache:instance_instance_0:cache_2"), StrEq("__loc__f3")))))
+        EXPECT_CALL(
+            *mock_redis_client,
+            TryExecPipeline(ElementsAre(
+                ElementsAre(StrEq("HDEL"), StrEq("kvcache:instance_instance_0:cache_1"), StrEq("L#f1"), StrEq("L#f2")),
+                ElementsAre(StrEq("HDEL"), StrEq("kvcache:instance_instance_0:cache_2"), StrEq("L#f3")))))
             .WillOnce(Return(ByMove(std::move(replies))));
         return mock_redis_client;
     }));
@@ -417,21 +415,21 @@ TEST_F(MetaRedisBackendTest, TestExistsFieldWithPrefix) {
 
         // Step 2: HSCAN — key 1 has matching field, key 2 has empty list.
         std::vector<ReplyUPtr> replies;
-        replies.emplace_back(MakeFakeReplyScan(/*next_cursor*/ "0", {LOCATION_PREFIX + "a", "la"}));
+        replies.emplace_back(MakeFakeReplyScan(/*next_cursor*/ "0", {PROPERTY_LOCATION_PREFIX + "a", "la"}));
         replies.emplace_back(MakeFakeReplyScan(/*next_cursor*/ "0", {}));
         EXPECT_CALL(*mock_redis_client,
                     TryExecPipeline(ElementsAre(ElementsAre(StrEq("HSCAN"),
                                                             StrEq("kvcache:instance_instance_0:cache_1"),
                                                             StrEq("0"),
                                                             StrEq("MATCH"),
-                                                            StrEq(LOCATION_PREFIX + "*"),
+                                                            StrEq(PROPERTY_LOCATION_PREFIX + "*"),
                                                             StrEq("COUNT"),
                                                             StrEq("1000")),
                                                 ElementsAre(StrEq("HSCAN"),
                                                             StrEq("kvcache:instance_instance_0:cache_2"),
                                                             StrEq("0"),
                                                             StrEq("MATCH"),
-                                                            StrEq(LOCATION_PREFIX + "*"),
+                                                            StrEq(PROPERTY_LOCATION_PREFIX + "*"),
                                                             StrEq("COUNT"),
                                                             StrEq("1000")))))
             .WillOnce(Return(ByMove(std::move(replies))));
@@ -465,8 +463,8 @@ TEST_F(MetaRedisBackendTest, TestExistsFieldWithPrefixIgnoresTombstone) {
 
         // Step 2: HSCAN — key 1 has tombstone (empty value), key 2 has valid field.
         std::vector<ReplyUPtr> replies;
-        replies.emplace_back(MakeFakeReplyScan("0", {LOCATION_PREFIX + "tomb", ""}));
-        replies.emplace_back(MakeFakeReplyScan("0", {LOCATION_PREFIX + "real", "valid"}));
+        replies.emplace_back(MakeFakeReplyScan("0", {PROPERTY_LOCATION_PREFIX + "tomb", ""}));
+        replies.emplace_back(MakeFakeReplyScan("0", {PROPERTY_LOCATION_PREFIX + "real", "valid"}));
         EXPECT_CALL(*mock_redis_client, TryExecPipeline(testing::_)).WillOnce(Return(ByMove(std::move(replies))));
         return mock_redis_client;
     }));
@@ -500,13 +498,13 @@ TEST_F(MetaRedisBackendTest, TestExistsFieldWithPrefixKeyNotExist) {
 
         // HSCAN only for key 1.
         std::vector<ReplyUPtr> hscan_replies;
-        hscan_replies.emplace_back(MakeFakeReplyScan("0", {LOCATION_PREFIX + "a", "la"}));
+        hscan_replies.emplace_back(MakeFakeReplyScan("0", {PROPERTY_LOCATION_PREFIX + "a", "la"}));
         EXPECT_CALL(*mock_redis_client,
                     TryExecPipeline(ElementsAre(ElementsAre(StrEq("HSCAN"),
                                                             StrEq("kvcache:instance_instance_0:cache_1"),
                                                             StrEq("0"),
                                                             StrEq("MATCH"),
-                                                            StrEq(LOCATION_PREFIX + "*"),
+                                                            StrEq(PROPERTY_LOCATION_PREFIX + "*"),
                                                             StrEq("COUNT"),
                                                             StrEq("1000")))))
             .WillOnce(Return(ByMove(std::move(hscan_replies))));

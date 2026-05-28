@@ -25,9 +25,11 @@
 #define API_CALL_GUARD(api_name, is_leader_only)                                                                       \
     request_context->set_api_name(api_name);                                                                           \
     response->mutable_header()->set_request_id(request_context->request_id());                                         \
-    std::string request_debug;                                                                                         \
-    ProtoMessageJsonUtil::ToJson(request, request_debug);                                                              \
-    request_context->set_request_debug(request_debug);                                                                 \
+    {                                                                                                                  \
+        std::string request_debug;                                                                                     \
+        ProtoMessageJsonUtil::ToJson(request, request_debug);                                                          \
+        request_context->set_request_debug(request_debug);                                                             \
+    }                                                                                                                  \
     if (!CheckAndIncrementRequestCount(is_leader_only)) {                                                              \
         auto *header = response->mutable_header();                                                                     \
         auto *status = header->mutable_status();                                                                       \

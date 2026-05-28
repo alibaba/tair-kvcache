@@ -74,6 +74,8 @@ public:
     ErrorCode DoCleanup();
     std::shared_ptr<RegistryManager> GetRegistryManager() { return registry_manager_; }
 
+    std::string GetExtraInfo(RequestContext *request_context, const std::string &instance_id);
+
     std::pair<ErrorCode, std::string> RegisterInstance(RequestContext *request_context,
                                                        const std::string &instance_group,
                                                        const std::string &instance_id,
@@ -105,6 +107,17 @@ public:
                      int32_t sw_size,
                      const std::vector<std::string> &location_spec_names);
 
+    std::pair<ErrorCode, BatchLocationsView>
+    GetCacheLocationsByBackend(RequestContext *request_context,
+                               const std::string &instance_id,
+                               QueryType query_type,
+                               const KeyVector &keys,
+                               const TokenIdsVector &tokens,
+                               const BlockMask &block_mask,
+                               int32_t sw_size,
+                               const std::vector<std::string> &location_spec_names,
+                               const std::vector<BackendSelector> &backend_selectors = {});
+
     std::pair<ErrorCode, int64_t> GetCacheLocationLen(RequestContext *request_context,
                                                       const std::string &instance_id,
                                                       QueryType query_type,
@@ -117,7 +130,8 @@ public:
                                                               const KeyVector &keys,
                                                               const TokenIdsVector &tokens,
                                                               const std::vector<std::string> &location_spec_group_names,
-                                                              int64_t write_timeout_seconds);
+                                                              int64_t write_timeout_seconds,
+                                                              int32_t min_replica_count = 1);
     ErrorCode
     FinishWriteCache(RequestContext *request_context,
                      const std::string &instance_id,
@@ -157,7 +171,17 @@ private:
                                KeyVector &new_keys,
                                const std::vector<std::string> &location_spec_group_names,
                                std::vector<std::string_view> &new_location_spec_group_names,
-                               BlockMask &block_mask);
+                               BlockMask &block_mask,
+                               int32_t min_replica_count);
+    ErrorCode FilterWriteCacheWithMinReplica(RequestContext *request_context,
+                                             const std::string &instance_id,
+                                             MetaSearcher *meta_searcher,
+                                             const KeyVector &keys,
+                                             KeyVector &new_keys,
+                                             const std::vector<std::string> &location_spec_group_names,
+                                             std::vector<std::string_view> &new_location_spec_group_names,
+                                             BlockMask &block_mask,
+                                             int32_t min_replica_count);
     ErrorCode GenWriteLocation(RequestContext *request_context,
                                const std::string &instance_id,
                                const CacheManager::KeyVector &keys,
@@ -192,6 +216,12 @@ private:
                                                                       const TokenIdsVector &tokens) const;
     std::pair<ErrorCode, int64_t> GetBlockSize(RequestContext *request_context, const std::string &instance_id) const;
     void FilterLocationSpecByName(CacheLocationVector &locations, const std::vector<std::string> &location_spec_names);
+    ErrorCode CheckLocationSpecGroupNames(RequestContext *request_context,
+                                          const std::string &instance_id,
+                                          size_t key_count,
+                                          const std::vector<std::string> &location_spec_group_names);
+    static void FillEmptyLocationSpecs(const std::vector<LocationSpecInfo> &location_spec_infos,
+                                       CacheLocationVector &locations);
     std::string GetStorageConfigStr(RequestContext *request_context, const std::string &instance_id) const;
 
     void

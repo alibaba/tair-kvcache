@@ -32,8 +32,6 @@ ADMIN_URL = ""
 INSTANCE_ID = "v6d_cluster_0"
 SKIP_BENCH = False
 ONLY_BENCH = False
-# Enables strict assertion in test_17_priority_then_random_activation.
-REQUIRE_PRIORITY_THEN_RANDOM = False
 # Requires small heartbeat_timeout_ms/cleanup_grace_ms in addStorage spec.
 ENABLE_LIVENESS_TIMING_TESTS = False
 HEARTBEAT_TIMEOUT_MS = 1000
@@ -87,14 +85,14 @@ class KVCMClient:
         resp.raise_for_status()
         return resp.json()
 
-    def start_evict_write_cache(self, data, check_response=True):
-        url = f"{self.base_url}/api/startEvictWriteCache"
+    def start_write_cache_with_min_replica(self, data, check_response=True):
+        url = f"{self.base_url}/api/startWriteCacheWithMinReplica"
         resp = self.session.post(url, json=data)
         resp.raise_for_status()
         body = resp.json()
         if check_response:
             code = body.get("header", {}).get("status", {}).get("code")
-            assert code == "OK", f"startEvictWriteCache failed: {json.dumps(body)}"
+            assert code == "OK", f"startWriteCacheWithMinReplica failed: {json.dumps(body)}"
         return body
 
     def finish_write_cache(self, data, check_response=True):
@@ -468,19 +466,8 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
         )
         self.assertIn("header", body)
 
-    # 11. HEARTBEAT for unregistered host: KVCM logs a warning, returns OK
-    def test_11_heartbeat_unregistered(self):
-        body = self.client.report_event(
-            _make_request(
-                self.instance_id, "10.10.10.10:8080",
-                [_ev_heartbeat({})],
-                trace_id="t11",
-            )
-        )
-        self.assertIn("header", body)
-
-    # 12. Mixed batch: register + add + heartbeat in a single RPC
-    def test_12_mixed_batch(self):
+    # 11. Mixed batch: register + add + heartbeat in a single RPC
+    def test_11_mixed_batch(self):
         host = "192.168.1.230:8080"
         block_key = 9030
         events = [
@@ -489,35 +476,35 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
             _ev_heartbeat({"phase": "boot"}),
         ]
         body = self.client.report_event(
-            _make_request(self.instance_id, host, events, trace_id="t12")
+            _make_request(self.instance_id, host, events, trace_id="t11")
         )
         self.assertIn("header", body)
 
-    # 13. Empty events array: should be a no-op success
-    def test_13_empty_batch(self):
+    # 12. Empty events array: should be a no-op success
+    def test_12_empty_batch(self):
         body = self.client.report_event(
-            _make_request(self.instance_id, self.HOST, [], trace_id="t13")
+            _make_request(self.instance_id, self.HOST, [], trace_id="t12")
         )
         self.assertIn("header", body)
 
-    # 14. Missing block_add params: server must surface a per-item failure
-    def test_14_block_add_missing_params(self):
+    # 13. Missing block_add params: server must surface a per-item failure
+    def test_13_block_add_missing_params(self):
         body = self.client.report_event(
             _make_request(
                 self.instance_id, self.HOST,
                 [{"event_type": "EVENT_BLOCK_ADD"}],
-                trace_id="t14",
+                trace_id="t13",
             ),
             check_ok=False,
         )
         self.assertIn("header", body)
         self.assertIn("item_results", body)
 
-    # 15. Empty top-level host_ip_port: request-level validation must reject
-    def test_15_missing_host_ip_port(self):
+    # 14. Empty top-level host_ip_port: request-level validation must reject
+    def test_14_missing_host_ip_port(self):
         body = self.client.report_event(
             {
-                "trace_id": "t15",
+                "trace_id": "t14",
                 "instance_id": self.instance_id,
                 "host_ip_port": "",
                 "events": [_ev_node_register(["mem"])],
@@ -526,57 +513,57 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
         )
         self.assertIn("header", body)
 
-    # 16. StartEvictWriteCache: V6D eviction with min_replica_count=2
-    # def test_16_startevict_write_cache(self):
-    #     block_key = 8001
-    #     uri = _build_vineyard_uri(self.HOST, "mem")
+    # 15. StartWriteCacheWithMinReplica: V6D eviction with min_replica_count=2
+    def test_15_start_write_cache_with_min_replica(self):
+        block_key = 8001
+        uri = _build_vineyard_uri(self.HOST, "mem")
 
-    #     # Step 1: 1 VINEYARD replica only.
-    #     self.client.report_event(
-    #         _make_request(
-    #             self.instance_id, self.HOST,
-    #             [_ev_block_add(block_key, "mem", _make_single_spec("spec_4096", uri))],
-    #             trace_id="t16_add",
-    #         )
-    #     )
+        # Step 1: 1 VINEYARD replica only.
+        self.client.report_event(
+            _make_request(
+                self.instance_id, self.HOST,
+                [_ev_block_add(block_key, "mem", _make_single_spec("spec_4096", uri))],
+                trace_id="t15_add",
+            )
+        )
 
-    #     # Step 2: ask for evict; with only 1 replica we expect a remote write.
-    #     resp = self.client.start_evict_write_cache({
-    #         "trace_id": "t16_evict_1",
-    #         "instance_id": self.instance_id,
-    #         "block_keys": [block_key],
-    #         "write_timeout_seconds": 30,
-    #         "min_replica_count": 2,
-    #     })
-    #     self.assertIn("write_session_id", resp)
-    #     write_session_id = resp["write_session_id"]
-    #     self.assertTrue(write_session_id, "Expected non-empty write_session_id")
-    #     locations = resp.get("locations", [])
-    #     self.assertGreater(len(locations), 0,
-    #                        "Expected remote write locations since only 1 replica exists")
+        # Step 2: ask for evict; with only 1 replica we expect a remote write.
+        resp = self.client.start_write_cache_with_min_replica({
+            "trace_id": "t15_evict_1",
+            "instance_id": self.instance_id,
+            "block_keys": [block_key],
+            "write_timeout_seconds": 30,
+            "min_replica_count": 2,
+        })
+        self.assertIn("write_session_id", resp)
+        write_session_id = resp["write_session_id"]
+        self.assertTrue(write_session_id, "Expected non-empty write_session_id")
+        locations = resp.get("locations", [])
+        self.assertGreater(len(locations), 0,
+                           "Expected remote write locations since only 1 replica exists")
 
-    #     # Step 3: Finish the write to bring up replica count to 2.
-    #     self.client.finish_write_cache({
-    #         "trace_id": "t16_evict_finish",
-    #         "instance_id": self.instance_id,
-    #         "write_session_id": write_session_id,
-    #         "success_blocks": {"bool_masks": {"values": [True]}},
-    #     })
+        # Step 3: Finish the write to bring up replica count to 2.
+        self.client.finish_write_cache({
+            "trace_id": "t15_evict_finish",
+            "instance_id": self.instance_id,
+            "write_session_id": write_session_id,
+            "success_blocks": {"bool_masks": {"values": [True]}},
+        })
 
-    #     # Step 4: Now n_total=2; evict should skip remote allocation.
-    #     resp2 = self.client.start_evict_write_cache({
-    #         "trace_id": "t16_evict_2",
-    #         "instance_id": self.instance_id,
-    #         "block_keys": [block_key],
-    #         "write_timeout_seconds": 30,
-    #         "min_replica_count": 2,
-    #     })
-    #     locations2 = resp2.get("locations", [])
-    #     self.assertEqual(len(locations2), 0,
-    #                      "Expected no write locations since 2 replicas already exist")
+        # Step 4: Now n_total=2; evict should skip remote allocation.
+        resp2 = self.client.start_write_cache_with_min_replica({
+            "trace_id": "t15_evict_2",
+            "instance_id": self.instance_id,
+            "block_keys": [block_key],
+            "write_timeout_seconds": 30,
+            "min_replica_count": 2,
+        })
+        locations2 = resp2.get("locations", [])
+        self.assertEqual(len(locations2), 0,
+                         "Expected no write locations since 2 replicas already exist")
 
-    # 17a. Heartbeat timeout -> location filtered out, then recovery on heartbeat resume.
-    def test_17a_heartbeat_timeout_then_recovery(self):
+    # 16a. Heartbeat timeout -> location filtered out, then recovery on heartbeat resume.
+    def test_16a_heartbeat_timeout_then_recovery(self):
         if not ENABLE_LIVENESS_TIMING_TESTS:
             self.skipTest("--enable-liveness-timing-tests not set; skipping")
 
@@ -587,11 +574,11 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
             _make_request(self.instance_id, host, [
                 _ev_node_register(["mem"]),
                 _ev_block_add(block_key, "mem", _make_single_spec("spec_4096", _build_vineyard_uri(host, "mem"))),
-            ], trace_id="t17a_setup")
+            ], trace_id="t16a_setup")
         )
         # Confirm the replica is queryable.
         resp = self.client.get_cache_location({
-            "trace_id": "t17a_q1",
+            "trace_id": "t16a_q1",
             "instance_id": self.instance_id,
             "query_type": "QT_BATCH_GET",
             "block_keys": [block_key],
@@ -602,7 +589,7 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
         # Step 2: skip heartbeat past heartbeat_timeout_ms (within cleanup_grace_ms).
         time.sleep((HEARTBEAT_TIMEOUT_MS + 500) / 1000.0)
         resp_after_timeout = self.client.get_cache_location({
-            "trace_id": "t17a_q2",
+            "trace_id": "t16a_q2",
             "instance_id": self.instance_id,
             "query_type": "QT_BATCH_GET",
             "block_keys": [block_key],
@@ -612,10 +599,10 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
 
         # Step 3: heartbeat resumes within grace -> node recovers.
         self.client.report_event(
-            _make_request(self.instance_id, host, [_ev_heartbeat({})], trace_id="t17a_hb")
+            _make_request(self.instance_id, host, [_ev_heartbeat({})], trace_id="t16a_hb")
         )
         resp_recovered = self.client.get_cache_location({
-            "trace_id": "t17a_q3",
+            "trace_id": "t16a_q3",
             "instance_id": self.instance_id,
             "query_type": "QT_BATCH_GET",
             "block_keys": [block_key],
@@ -624,8 +611,8 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
         self.assertGreater(len(resp_recovered.get("locations", [])), 0,
                            "Replica must be queryable again after heartbeat resumed within grace")
 
-    # 17b. Heartbeat timeout exceeds cleanup_grace_ms -> CleanupHostLocations triggered.
-    def test_17b_heartbeat_exceeds_grace_triggers_cleanup(self):
+    # 16b. Heartbeat timeout exceeds cleanup_grace_ms -> CleanupHostLocations triggered.
+    def test_16b_heartbeat_exceeds_grace_triggers_cleanup(self):
         if not ENABLE_LIVENESS_TIMING_TESTS:
             self.skipTest("--enable-liveness-timing-tests not set; skipping")
 
@@ -635,7 +622,7 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
             _make_request(self.instance_id, host, [
                 _ev_node_register(["mem"]),
                 _ev_block_add(block_key, "mem", _make_single_spec("spec_4096", _build_vineyard_uri(host, "mem"))),
-            ], trace_id="t17b_setup")
+            ], trace_id="t16b_setup")
         )
 
         # Wait past hb_timeout + cleanup_grace + scheduler slack.
@@ -644,7 +631,7 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
 
         # Soft check: MetaSearchCache TTL may delay eviction.
         resp = self.client.get_cache_location({
-            "trace_id": "t17b_q",
+            "trace_id": "t16b_q",
             "instance_id": self.instance_id,
             "query_type": "QT_BATCH_GET",
             "block_keys": [block_key],
@@ -656,48 +643,6 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
                 self.assertNotIn(host, spec.get("uri", ""),
                                  f"Cleanup should have removed host [{host}] from results")
 
-    # 17. PriorityThenRandomSLPolicy: 3 same-weight replicas should rotate uniformly.
-    # Requires --require-priority-then-random and KVCM_SELECT_LOCATION_POLICY=priority_then_random.
-    def test_17_priority_then_random_activation(self):
-        if not REQUIRE_PRIORITY_THEN_RANDOM:
-            self.skipTest("--require-priority-then-random not set; skipping activation check")
-
-        block_key = 8100
-        hosts = ["192.168.1.240:8080", "192.168.1.241:8080", "192.168.1.242:8080"]
-
-        # Pre-register hosts and add 3 replicas of the same block_key.
-        for h in hosts:
-            self.client.report_event(
-                _make_request(self.instance_id, h, [_ev_node_register(["mem"])], trace_id=f"t17_reg_{h}")
-            )
-            self.client.report_event(
-                _make_request(
-                    self.instance_id, h,
-                    [_ev_block_add(block_key, "mem", _make_single_spec("spec_4096", _build_vineyard_uri(h, "mem")))],
-                    trace_id=f"t17_add_{h}",
-                )
-            )
-
-        seen_uris = set()
-        # 200 draws: P(miss one of three) ≈ (2/3)^200 ≈ 0.
-        for i in range(200):
-            resp = self.client.get_cache_location({
-                "trace_id": f"t17_q_{i}",
-                "instance_id": self.instance_id,
-                "query_type": "QT_BATCH_GET",
-                "block_keys": [block_key],
-                "block_mask": {"offset": 0},
-            })
-            locations = resp.get("locations", [])
-            self.assertGreater(len(locations), 0)
-            specs = locations[0].get("location_specs", [])
-            self.assertGreater(len(specs), 0)
-            seen_uris.add(specs[0]["uri"])
-
-        # Every host should appear at least once.
-        self.assertEqual(len(seen_uris), 3,
-                         f"Expected all 3 V6D hosts to be selected at least once; "
-                         f"saw {len(seen_uris)}: {seen_uris}")
 
 
 # ---------------------------------------------------------------------------
@@ -861,13 +806,6 @@ def main():
     parser.add_argument("--skip-bench", action="store_true", help="Skip benchmark tests")
     parser.add_argument("--only-bench", action="store_true", help="Run only benchmark tests")
     parser.add_argument(
-        "--require-priority-then-random",
-        action="store_true",
-        help=("Assert the PriorityThenRandomSLPolicy activation path. Pass this only when KVCM was "
-              "launched with KVCM_SELECT_LOCATION_POLICY=priority_then_random; the matching test "
-              "self-skips otherwise."),
-    )
-    parser.add_argument(
         "--enable-liveness-timing-tests",
         action="store_true",
         help=("Run heartbeat/cleanup timing tests. Requires the Vineyard storage to be opened with "
@@ -881,14 +819,13 @@ def main():
     admin_port = args.admin_http_port or args.http_port
 
     global BASE_URL, ADMIN_URL, INSTANCE_ID, SKIP_BENCH, ONLY_BENCH
-    global REQUIRE_PRIORITY_THEN_RANDOM, ENABLE_LIVENESS_TIMING_TESTS
+    global ENABLE_LIVENESS_TIMING_TESTS
     global HEARTBEAT_TIMEOUT_MS, CLEANUP_GRACE_MS
     BASE_URL = f"http://{args.host}:{args.http_port}"
     ADMIN_URL = f"http://{args.host}:{admin_port}"
     INSTANCE_ID = args.instance_id
     SKIP_BENCH = args.skip_bench
     ONLY_BENCH = args.only_bench
-    REQUIRE_PRIORITY_THEN_RANDOM = args.require_priority_then_random
     ENABLE_LIVENESS_TIMING_TESTS = args.enable_liveness_timing_tests
     HEARTBEAT_TIMEOUT_MS = args.heartbeat_timeout_ms
     CLEANUP_GRACE_MS = args.cleanup_grace_ms

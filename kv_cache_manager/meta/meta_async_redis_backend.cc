@@ -325,7 +325,7 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::DeleteLocations(RequestContext *re
     for (size_t i = 0; i < keys.size(); ++i) {
         field_names_vec[i].reserve(location_ids[i].size());
         for (const auto &loc_id : location_ids[i]) {
-            field_names_vec[i].push_back(LOCATION_PREFIX + loc_id);
+            field_names_vec[i].push_back(PROPERTY_LOCATION_PREFIX + loc_id);
         }
     }
 
@@ -413,7 +413,7 @@ std::vector<std::vector<ErrorCode>> MetaAsyncRedisBackend::GetLocations(RequestC
     for (size_t i = 0; i < keys.size(); ++i) {
         field_names_vec[i].reserve(location_ids[i].size());
         for (const auto &loc_id : location_ids[i]) {
-            field_names_vec[i].push_back(LOCATION_PREFIX + loc_id);
+            field_names_vec[i].push_back(PROPERTY_LOCATION_PREFIX + loc_id);
         }
     }
 
@@ -475,7 +475,8 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::GetLocationIds(RequestContext * /*
     }
     std::vector<std::string> full_keys = AppendPrefixToKeys(cache_key_prefix_, keys);
     std::vector<std::vector<std::string>> raw_field_names_vec;
-    std::vector<ErrorCode> results = handle->GetFieldNamesWithPrefix(full_keys, LOCATION_PREFIX, raw_field_names_vec);
+    std::vector<ErrorCode> results =
+        handle->GetFieldNamesWithPrefix(full_keys, PROPERTY_LOCATION_PREFIX, raw_field_names_vec);
 
     out_location_ids.resize(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -484,8 +485,9 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::GetLocationIds(RequestContext * /*
         }
         out_location_ids[i].reserve(raw_field_names_vec[i].size());
         for (const auto &field_name : raw_field_names_vec[i]) {
-            if (field_name.size() > LOCATION_PREFIX.size() && field_name.rfind(LOCATION_PREFIX, 0) == 0) {
-                out_location_ids[i].push_back(field_name.substr(LOCATION_PREFIX.size()));
+            if (field_name.size() > PROPERTY_LOCATION_PREFIX.size() &&
+                field_name.rfind(PROPERTY_LOCATION_PREFIX, 0) == 0) {
+                out_location_ids[i].push_back(field_name.substr(PROPERTY_LOCATION_PREFIX.size()));
             }
         }
     }
@@ -539,7 +541,7 @@ std::vector<ErrorCode> MetaAsyncRedisBackend::ExistsLocation(RequestContext * /*
         return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
     }
     std::vector<std::string> full_keys = AppendPrefixToKeys(cache_key_prefix_, keys);
-    return handle->ExistsFieldWithPrefix(full_keys, LOCATION_PREFIX, out_exists);
+    return handle->ExistsFieldWithPrefix(full_keys, PROPERTY_LOCATION_PREFIX, out_exists);
 }
 
 ErrorCode MetaAsyncRedisBackend::ListKeys(RequestContext * /*request_context*/,

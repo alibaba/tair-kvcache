@@ -47,7 +47,7 @@ def split_storage_quotas_value(value: str):
 class InstanceGroupQuota(JsonData):
     def __init__(self,
                  capacity: int,
-                 storage_qoutas: list[StorageQuota]):
+                 storage_qoutas):
         self._capacity = capacity
         self._storage_qoutas = storage_qoutas
         self.check()
@@ -296,13 +296,14 @@ class CacheConfig(JsonData):
 class InstanceGroup(JsonData):
     def __init__(self,
                  name: str,
-                 storage_candidates: list[str],
+                 storage_candidates,
                  instance_group_quota: InstanceGroupQuota,
                  quota_group_name: str,
                  max_instance_count: int = 100,
                  cache_config: CacheConfig = CacheConfig(),
                  user_data: str = "",
-                 version: int = 1
+                 version: int = 1,
+                 extra_info: str = "",
                  ):
         self._name = name
         self._storage_candidates = storage_candidates
@@ -312,11 +313,18 @@ class InstanceGroup(JsonData):
         self._cache_config = cache_config
         self._user_data = user_data
         self._version = version
+        self._extra_info = extra_info
         self.check()
 
     def check(self):
         if not is_list_of_str(self._storage_candidates):
             raise RuntimeError(f"storage_candidates expect List[Str], real '{type(self._storage_candidates)}'")
+        if self._extra_info:
+            import json
+            try:
+                json.loads(self._extra_info)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"extra_info must be valid JSON, got: '{self._extra_info}'") from exc
         self._instance_group_quota.check()
         self._cache_config.check()
 
@@ -329,7 +337,8 @@ class InstanceGroup(JsonData):
             "quota" : self._instance_group_quota.to_json_data(),
             "cache_config" : self._cache_config.to_json_data(),
             "user_data" : self._user_data,
-            "version" : self._version
+            "version" : self._version,
+            "extra_info" : self._extra_info,
         }
     
     @classmethod
@@ -350,7 +359,8 @@ class InstanceGroup(JsonData):
             user_data = json_data["user_data"]
         if JsonData.expect_exist("version", json_data, (str, int)):
             version = int(json_data["version"])
-        return cls(name, storage_candidates, instance_group_quota, quota_group_name, max_instance_count, cache_config, user_data, version)
+        extra_info = json_data.get("extra_info", "")
+        return cls(name, storage_candidates, instance_group_quota, quota_group_name, max_instance_count, cache_config, user_data, version, extra_info)
     
 # create or update
 def parse_instance_group_args(is_create: bool):
@@ -472,6 +482,16 @@ def parse_instance_group_args(is_create: bool):
         type=int,
         default=6 if is_create else argparse.SUPPRESS,
         help="search_cache_shard_bits"
+    )
+
+    parser.add_argument(
+        "--extra_info",
+        type=str,
+        default="" if is_create else argparse.SUPPRESS,
+        help=(
+            "Opaque JSON string passed through to clients (e.g. V6D). "
+            "On update, the provided JSON is merged into existing extra_info."
+        )
     )
 
     args = parser.parse_args()

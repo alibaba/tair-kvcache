@@ -81,6 +81,8 @@ class PublisherLogConverter(BaseConverter):
                 return self._convert_get_location_event(data)
             elif event_type == 'StartWriteCache':
                 return self._convert_start_write_cache_event(data)
+            elif event_type == 'StartWriteCacheWithMinReplica':
+                return None
             elif event_type == 'FinishWriteCache':
                 return self._convert_finish_write_cache_event(data)
 

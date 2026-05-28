@@ -56,6 +56,7 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(manager, get_cache_location_query_block_counter);
     DECLARE_METRICS(manager, get_cache_location_hit_block_counter);
     DECLARE_METRICS(manager, prefix_match_time_us);
+    DECLARE_METRICS(manager, batch_get_time_us);
     DECLARE_METRICS(manager, lock_write_location_retry_times);
     DECLARE_METRICS(manager, write_cache_io_cost_us);
     DECLARE_METRICS(manager, filter_write_cache_time_us);
@@ -300,6 +301,7 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(manager, get_cache_location_query_block_counter);
     REGISTER_GAUGE_METRIC(manager, get_cache_location_hit_block_counter);
     REGISTER_GAUGE_METRIC(manager, prefix_match_time_us);
+    REGISTER_GAUGE_METRIC(manager, batch_get_time_us);
     REGISTER_GAUGE_METRIC(manager, lock_write_location_retry_times);
     REGISTER_GAUGE_METRIC(manager, write_cache_io_cost_us);
     REGISTER_GAUGE_METRIC(manager, filter_write_cache_time_us);
@@ -470,6 +472,7 @@ void KmonitorMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
         REPORT_COLLECTED_METRICS(manager, get_cache_location_query_block_counter);
         REPORT_COLLECTED_METRICS(manager, get_cache_location_hit_block_counter);
         REPORT_COLLECTED_METRICS(manager, prefix_match_time_us);
+        REPORT_COLLECTED_METRICS(manager, batch_get_time_us);
         REPORT_COLLECTED_METRICS(manager, lock_write_location_retry_times);
         REPORT_COLLECTED_METRICS(manager, write_cache_io_cost_us);
         REPORT_COLLECTED_METRICS(manager, filter_write_cache_time_us);

@@ -88,7 +88,7 @@ public:
             for (const auto &[loc_id, loc_ptr] : batch.batch_locations[i]) {
                 if (!loc_ptr)
                     continue;
-                batch.batch_properties[i][LOCATION_PREFIX + loc_ptr->id()] = loc_ptr->ToJsonString();
+                batch.batch_properties[i][PROPERTY_LOCATION_PREFIX + loc_ptr->id()] = loc_ptr->ToJsonString();
             }
         }
     }

@@ -63,6 +63,9 @@ void ProtoConvert::StorageConfigToProto(const StorageConfig &storage_config,
         const auto &vineyard_storage = *std::dynamic_pointer_cast<VineyardStorageSpec>(storage_config.storage_spec());
         auto *vineyard = proto_storage_config->mutable_vineyard();
         vineyard->set_cluster_name(vineyard_storage.cluster_name());
+        vineyard->set_heartbeat_timeout_ms(vineyard_storage.heartbeat_timeout_ms());
+        vineyard->set_cleanup_grace_ms(vineyard_storage.cleanup_grace_ms());
+        vineyard->set_liveness_check_interval_ms(vineyard_storage.liveness_check_interval_ms());
     }
 }
 
@@ -136,7 +139,14 @@ void ProtoConvert::StorageFromProto(const proto::admin::StorageConfig *proto_sto
     }
     case proto::admin::StorageConfig::kVineyard: {
         VineyardStorageSpec spec;
-        spec.set_cluster_name(proto_storage_config->vineyard().cluster_name());
+        const auto &v = proto_storage_config->vineyard();
+        spec.set_cluster_name(v.cluster_name());
+        if (v.heartbeat_timeout_ms() > 0)
+            spec.set_heartbeat_timeout_ms(v.heartbeat_timeout_ms());
+        if (v.cleanup_grace_ms() > 0)
+            spec.set_cleanup_grace_ms(v.cleanup_grace_ms());
+        if (v.liveness_check_interval_ms() > 0)
+            spec.set_liveness_check_interval_ms(v.liveness_check_interval_ms());
         storage_config.set_storage_spec(std::make_shared<VineyardStorageSpec>(spec));
         storage_config.set_type(DataStorageType::DATA_STORAGE_TYPE_VINEYARD);
         break;
@@ -286,6 +296,7 @@ void ProtoConvert::InstanceGroupToProto(const InstanceGroup &instance_group_info
 
     proto_instance_group->set_user_data(instance_group_info.user_data());
     proto_instance_group->set_version(instance_group_info.version());
+    proto_instance_group->set_extra_info(instance_group_info.extra_info());
 }
 void ProtoConvert::InstanceGroupFromProto(const proto::admin::InstanceGroup *proto_instance_group,
                                           InstanceGroup &instance_group_info) {
@@ -323,6 +334,7 @@ void ProtoConvert::InstanceGroupFromProto(const proto::admin::InstanceGroup *pro
 
     instance_group_info.set_user_data(proto_instance_group->user_data());
     instance_group_info.set_version(proto_instance_group->version());
+    instance_group_info.set_extra_info(proto_instance_group->extra_info());
 }
 
 void ProtoConvert::AccountFromProto(const proto::admin::Account *proto_account, Account &account_info) {
