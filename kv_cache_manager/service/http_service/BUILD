@@ -1,4 +1,7 @@
-package(default_visibility = ["//kv_cache_manager/service:__subpackages__"])
+package(default_visibility = [
+    "//kv_cache_manager/service:__subpackages__",
+    "//stub_source:__subpackages__",
+])
 
 cc_library(
     name = "http_service",
