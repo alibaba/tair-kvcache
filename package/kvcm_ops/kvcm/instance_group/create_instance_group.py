@@ -89,7 +89,8 @@ def create_instance_group(args) -> InstanceGroup:
                                    max_instance_count = args.max_instance_count,
                                    cache_config = cache_config,
                                    user_data = args.user_data,
-                                   version=1)
+                                   version=1,
+                                   extra_info=args.extra_info)
     return instance_group
     
 

@@ -6,6 +6,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -50,6 +51,12 @@ namespace kv_cache_manager {
 #define REGISTER_METRICS_W_TAGS_GAUGE_(metrics_registry, group, name, tags)                                            \
     do {                                                                                                               \
         METRICS_(group, name) = (metrics_registry)->GetGauge(METRICS_NAME_(group, name), tags);                        \
+    } while (0)
+
+#define REPORT_DYNAMIC_GAUGE_(metrics_registry, name, tags, value)                                                     \
+    do {                                                                                                               \
+        auto gauge = (metrics_registry)->GetGauge((name), (tags));                                                     \
+        gauge = (value);                                                                                               \
     } while (0)
 
 #define DEFINE_COPY_METRICS_COUNTER_(group, name)                                                                      \
@@ -201,6 +208,8 @@ public:
 
     Counter GetOrCreateCounter(const MetricsTags &tags);
     Gauge GetOrCreateGauge(const MetricsTags &tags);
+    std::optional<Gauge> GetGauge(const MetricsTags &tags);
+    bool RemoveByTags(const MetricsTags &tags);
 
 private:
     std::mutex mutex_;

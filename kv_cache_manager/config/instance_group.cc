@@ -13,6 +13,7 @@ bool InstanceGroup::FromRapidValue(const rapidjson::Value &rapid_value) {
     KVCM_JSON_GET_MACRO(rapid_value, "cache_config", cache_config_);
     KVCM_JSON_GET_MACRO(rapid_value, "user_data", user_data_);
     KVCM_JSON_GET_MACRO(rapid_value, "version", version_);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "extra_info", extra_info_, std::string(""));
     return true;
 }
 
@@ -25,6 +26,7 @@ void InstanceGroup::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &wr
     Put(writer, "cache_config", cache_config_);
     Put(writer, "user_data", user_data_);
     Put(writer, "version", version_);
+    Put(writer, "extra_info", extra_info_);
 }
 
 bool InstanceGroup::ValidateRequiredFields(std::string &invalid_fields) const {

@@ -3,18 +3,18 @@
 #include <algorithm>
 #include <map>
 #include <set>
+#include <unordered_map>
 #include <utility>
 
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
+#include "kv_cache_manager/common/standard_uri.h"
 #include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
 
 namespace kv_cache_manager {
-
-const std::string MetaSearcher::PROPERTY_PREV_BLOCK_KEY = "_prev_key_";
 
 namespace {
 
@@ -47,7 +47,9 @@ CacheLocationConstPtr SelectAndMergeForMatch(SelectLocationPolicy *policy,
             continue;
         }
         if (check_loc_data_exist && !check_loc_data_exist(*loc_ptr)) {
-            out_prune_loc_ids.push_back(id);
+            if (loc_ptr->type() != DataStorageType::DATA_STORAGE_TYPE_VINEYARD) {
+                out_prune_loc_ids.push_back(id);
+            }
             continue;
         }
         valid_map.try_emplace(id, loc_ptr);
@@ -83,7 +85,7 @@ CacheLocationConstPtr SelectAndMergeForMatch(SelectLocationPolicy *policy,
     // NOTE: this is an aggregated view merging
     // specs from multiple locations, not a real stored entity. Downstream
     // CacheLocationView / proto serialization never accesses id either.
-    std::string representative_id = winner->id() + "merged";
+    std::string representative_id = winner->id() + "_merged";
     auto result = std::make_shared<CacheLocation>();
     result->set_id(std::move(representative_id));
     result->set_status(CacheLocationStatus::CLS_SERVING);
@@ -96,6 +98,101 @@ CacheLocationConstPtr SelectAndMergeForMatch(SelectLocationPolicy *policy,
     result->set_spec_size(specs.size());
     result->set_location_specs(std::move(specs));
     return result;
+}
+
+std::string ExtractPeerAddrFromLocation(const CacheLocation &loc) {
+    if (loc.location_specs().empty()) {
+        return {};
+    }
+    StandardUri uri(loc.location_specs().front().uri());
+    if (!uri.Valid() || uri.GetHostName().empty()) {
+        return {};
+    }
+    return uri.GetHostName() + ":" + std::to_string(uri.GetPort());
+}
+
+struct V6DPeerSelection {
+    std::string peer_addr;
+    std::vector<size_t> covered_indices;
+};
+
+V6DPeerSelection SelectV6DByPrefix(const std::vector<size_t> &candidate_indices,
+                                   const std::unordered_map<size_t, std::vector<std::string>> &remote_peer_candidates) {
+    if (candidate_indices.empty()) {
+        return {};
+    }
+    size_t first_idx = candidate_indices[0];
+    auto it = remote_peer_candidates.find(first_idx);
+    if (it == remote_peer_candidates.end()) {
+        return {};
+    }
+
+    V6DPeerSelection best;
+    for (const auto &addr : it->second) {
+        std::vector<size_t> prefix_covered;
+        for (size_t ci : candidate_indices) {
+            auto ci_it = remote_peer_candidates.find(ci);
+            if (ci_it == remote_peer_candidates.end()) {
+                break;
+            }
+            const auto &addrs = ci_it->second;
+            if (std::find(addrs.begin(), addrs.end(), addr) == addrs.end()) {
+                break;
+            }
+            prefix_covered.push_back(ci);
+        }
+        if (prefix_covered.size() > best.covered_indices.size()) {
+            best.peer_addr = addr;
+            best.covered_indices = std::move(prefix_covered);
+        }
+    }
+    return best;
+}
+
+V6DPeerSelection
+SelectV6DByCoverage(const std::vector<size_t> &candidate_indices,
+                    const std::unordered_map<size_t, std::vector<std::string>> &remote_peer_candidates) {
+    std::unordered_map<std::string, std::vector<size_t>> addr_to_indices;
+    for (size_t ci : candidate_indices) {
+        auto it = remote_peer_candidates.find(ci);
+        if (it == remote_peer_candidates.end()) {
+            continue;
+        }
+        for (const auto &addr : it->second) {
+            addr_to_indices[addr].push_back(ci);
+        }
+    }
+    if (addr_to_indices.empty()) {
+        return {};
+    }
+    V6DPeerSelection best;
+    for (auto &[addr, indices] : addr_to_indices) {
+        if (indices.size() > best.covered_indices.size()) {
+            best.peer_addr = addr;
+            best.covered_indices = indices;
+        }
+    }
+    return best;
+}
+
+CacheLocationMap FilterValidLocations(const CacheLocationMap &location_map,
+                                      CheckLocDataExistFunc check_loc_data_exist,
+                                      std::vector<std::string> &out_prune_loc_ids) {
+    CacheLocationMap valid;
+    for (const auto &[id, loc] : location_map) {
+        if (!loc)
+            continue;
+        if (loc->status() != CacheLocationStatus::CLS_SERVING)
+            continue;
+        if (check_loc_data_exist && !check_loc_data_exist(*loc)) {
+            if (loc->type() != DataStorageType::DATA_STORAGE_TYPE_VINEYARD) {
+                out_prune_loc_ids.push_back(id);
+            }
+            continue;
+        }
+        valid.try_emplace(id, loc);
+    }
+    return valid;
 }
 
 } // namespace
@@ -276,6 +373,166 @@ ErrorCode MetaSearcher::BatchGetBestLocation(RequestContext *request_context,
     return out_locations.size() == keys.size() ? EC_OK : EC_ERROR;
 }
 
+ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_context,
+                                                      const KeyVector &keys,
+                                                      LocationsPerKey &out_locations,
+                                                      SelectLocationPolicy *policy,
+                                                      const std::vector<BackendSelector> &selectors) const {
+    assert(policy != nullptr);
+    SPAN_TRACER(request_context);
+    out_locations.clear();
+    out_locations.resize(keys.size());
+    auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerGet);
+    CacheLocationMapVector location_maps;
+    auto result = meta_indexer_->GetLocations(request_context, keys, location_maps);
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerGet);
+    KeyVector prune_keys;
+    std::vector<std::vector<std::string>> prune_loc_ids_vec;
+    std::vector<CacheLocationMap> valid_maps(keys.size());
+    bool has_error = false;
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (result.error_codes[i] == ErrorCode::EC_NOENT) {
+            continue;
+        }
+        if (result.error_codes[i] != ErrorCode::EC_OK) {
+            KVCM_LOG_WARN("get key failed, key[%lu](%lu), error_code: %d", i, keys[i], result.error_codes[i]);
+            has_error = true;
+            break;
+        }
+        if (location_maps[i].empty()) {
+            continue;
+        }
+        std::vector<std::string> prune_loc_ids;
+        valid_maps[i] = FilterValidLocations(location_maps[i], check_loc_data_exist_func_, prune_loc_ids);
+        if (!prune_loc_ids.empty()) {
+            prune_keys.emplace_back(keys[i]);
+            prune_loc_ids_vec.emplace_back(std::move(prune_loc_ids));
+        }
+    }
+
+    for (const auto &selector : selectors) {
+        DataStorageType target_type = selector.backend_type;
+
+        if (target_type == DataStorageType::DATA_STORAGE_TYPE_VINEYARD &&
+            (selector.strategy == LocationSelectStrategy::LSS_V6D_PREFIX ||
+             selector.strategy == LocationSelectStrategy::LSS_V6D_COVERAGE)) {
+            // --- V6D cross-key selection ---
+            bool is_prefix = (selector.strategy == LocationSelectStrategy::LSS_V6D_PREFIX);
+
+            // Candidate enumeration
+            std::vector<size_t> candidate_indices;
+            std::unordered_map<size_t, std::vector<std::string>> remote_peer_candidates;
+            // key_idx -> peer_addr -> CacheLocationConstPtr (for reverse lookup)
+            std::unordered_map<size_t, std::unordered_map<std::string, CacheLocationConstPtr>> key_peer_to_location;
+
+            bool stop_vineyard = false;
+            for (size_t i = 0; i < keys.size(); ++i) {
+                if (stop_vineyard)
+                    break;
+
+                const auto &vmap = valid_maps[i];
+                std::vector<std::string> vineyard_addrs;
+
+                for (const auto &[id, loc] : vmap) {
+                    if (loc->type() != DataStorageType::DATA_STORAGE_TYPE_VINEYARD)
+                        continue;
+                    std::string addr = ExtractPeerAddrFromLocation(*loc);
+                    if (addr.empty())
+                        continue;
+                    // Dedup: only add if not already present
+                    if (key_peer_to_location[i].find(addr) == key_peer_to_location[i].end()) {
+                        vineyard_addrs.push_back(addr);
+                        key_peer_to_location[i][addr] = loc;
+                    }
+                }
+
+                if (vineyard_addrs.empty()) {
+                    if (is_prefix) {
+                        stop_vineyard = true;
+                    }
+                    continue;
+                }
+
+                remote_peer_candidates[i] = std::move(vineyard_addrs);
+                candidate_indices.push_back(i);
+            }
+
+            // Select best peer
+            V6DPeerSelection selection;
+            if (is_prefix) {
+                selection = SelectV6DByPrefix(candidate_indices, remote_peer_candidates);
+            } else {
+                selection = SelectV6DByCoverage(candidate_indices, remote_peer_candidates);
+            }
+
+            // Populate results for covered keys
+            if (!selection.peer_addr.empty()) {
+                for (size_t idx : selection.covered_indices) {
+                    auto peer_it = key_peer_to_location.find(idx);
+                    if (peer_it == key_peer_to_location.end())
+                        continue;
+                    auto loc_it = peer_it->second.find(selection.peer_addr);
+                    if (loc_it == peer_it->second.end())
+                        continue;
+                    out_locations[idx].push_back(loc_it->second);
+                }
+            }
+
+        } else {
+            // --- Per-key independent selection (WEIGHTED_RANDOM or other non-V6D) ---
+            for (size_t i = 0; i < keys.size(); ++i) {
+                const auto &vmap = valid_maps[i];
+                CacheLocationMap filtered;
+                for (const auto &[id, loc] : vmap) {
+                    if (loc->type() == target_type) {
+                        filtered.try_emplace(id, loc);
+                    }
+                }
+                if (filtered.empty())
+                    continue;
+
+                std::vector<std::string> unused_prune_ids;
+                auto winner = policy->SelectForMatch(filtered, nullptr, unused_prune_ids);
+                if (!winner || winner->id().empty() || winner->location_specs().empty())
+                    continue;
+
+                // Merge specs from same data storage (same logic as SelectAndMergeForMatch)
+                std::map<std::string, LocationSpec> merged_specs;
+                for (const auto &[id, loc] : filtered) {
+                    if (!policy->IsSameDataStorage(*loc, *winner))
+                        continue;
+                    for (const auto &spec : loc->location_specs()) {
+                        merged_specs.try_emplace(spec.name(), spec);
+                    }
+                }
+                if (merged_specs.empty())
+                    continue;
+
+                auto merged = std::make_shared<CacheLocation>();
+                merged->set_id(winner->id() + "_merged");
+                merged->set_status(CacheLocationStatus::CLS_SERVING);
+                merged->set_type(winner->type());
+                std::vector<LocationSpec> specs;
+                specs.reserve(merged_specs.size());
+                for (auto &[name, spec] : merged_specs) {
+                    specs.push_back(std::move(spec));
+                }
+                merged->set_spec_size(specs.size());
+                merged->set_location_specs(std::move(specs));
+                out_locations[i].push_back(std::move(merged));
+            }
+        }
+    }
+
+    if (!prune_keys.empty() && submit_del_req_func_) {
+        submit_del_req_func_(prune_keys, prune_loc_ids_vec);
+    }
+
+    return has_error ? EC_ERROR : EC_OK;
+}
+
 ErrorCode MetaSearcher::ReverseRollSlideWindowMatch(RequestContext *request_context,
                                                     const KeyVector &keys,
                                                     int32_t sw_size,
@@ -392,12 +649,12 @@ ErrorCode MetaSearcher::BatchAddLocation(RequestContext *request_context,
     std::vector<std::pair<DataStorageType, std::uint64_t>> loc_sz(keys.size());
 
     const int64_t batch_create_time = TimestampUtil::GetCurrentTimeUs();
-    auto modifier =
-        [&locations, &out_location_ids, &keys, &loc_sz, batch_create_time](const LocationIdVector &existing_location_ids,
-                                                        ErrorCode get_ec,
-                                                        size_t index,
-                                                        PropertyMap &upsert_property_map,
-                                                        CacheLocationMap &out_new_locations) -> ModifierResult {
+    auto modifier = [&locations, &out_location_ids, &keys, &loc_sz, batch_create_time](
+                        const LocationIdVector &existing_location_ids,
+                        ErrorCode get_ec,
+                        size_t index,
+                        PropertyMap &upsert_property_map,
+                        CacheLocationMap &out_new_locations) -> ModifierResult {
         if (get_ec != ErrorCode::EC_OK && get_ec != ErrorCode::EC_NOENT) {
             KVCM_LOG_WARN("load location failed, key[%lu](%lu) return %d", index, keys[index], get_ec);
             return {ModifierAction::MA_FAIL, get_ec};
@@ -467,12 +724,14 @@ ErrorCode MetaSearcher::BatchUpsertLocations(RequestContext *request_context,
     out_per_key_ec.assign(keys.size(), ErrorCode::EC_OK);
 
     std::vector<std::pair<DataStorageType, std::uint64_t>> loc_sz(keys.size());
+    const int64_t batch_create_time = TimestampUtil::GetCurrentTimeUs();
 
-    auto modifier = [&new_locations_per_key, &keys, &loc_sz](const LocationIdVector & /*existing_ids*/,
-                                                             ErrorCode get_ec,
-                                                             size_t index,
-                                                             PropertyMap & /*upsert_property_map*/,
-                                                             CacheLocationMap &out_new_locations) -> ModifierResult {
+    auto modifier = [&new_locations_per_key, &keys, &loc_sz, batch_create_time](
+                        const LocationIdVector & /*existing_ids*/,
+                        ErrorCode get_ec,
+                        size_t index,
+                        PropertyMap & /*upsert_property_map*/,
+                        CacheLocationMap &out_new_locations) -> ModifierResult {
         if (get_ec != ErrorCode::EC_OK && get_ec != ErrorCode::EC_NOENT) {
             KVCM_LOG_WARN("load location failed, key[%lu](%lu) return %d", index, keys[index], get_ec);
             return {ModifierAction::MA_FAIL, get_ec};
@@ -485,6 +744,7 @@ ErrorCode MetaSearcher::BatchUpsertLocations(RequestContext *request_context,
             loc.set_type(entry.type);
             loc.set_status(entry.status);
             loc.set_spec_size(entry.specs.size());
+            loc.set_create_time(batch_create_time);
             for (const auto &ls : entry.specs) {
                 loc.push_location_spec(LocationSpec(ls.name(), ls.uri()));
                 if (DataStorageUri ds_uri(ls.uri()); ds_uri.Valid()) {

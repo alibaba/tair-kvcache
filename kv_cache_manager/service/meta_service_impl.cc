@@ -24,9 +24,11 @@
 #define API_CALL_GUARD(api_name, is_leader_only)                                                                       \
     request_context->set_api_name(api_name);                                                                           \
     response->mutable_header()->set_request_id(request_context->request_id());                                         \
-    std::string request_debug;                                                                                         \
-    ProtoMessageJsonUtil::ToJson(request, request_debug);                                                              \
-    request_context->set_request_debug(request_debug);                                                                 \
+    {                                                                                                                  \
+        std::string request_debug;                                                                                     \
+        ProtoMessageJsonUtil::ToJson(request, request_debug);                                                          \
+        request_context->set_request_debug(request_debug);                                                             \
+    }                                                                                                                  \
     if (!CheckAndIncrementRequestCount(is_leader_only)) {                                                              \
         auto *header = response->mutable_header();                                                                     \
         auto *status = header->mutable_status();                                                                       \
@@ -195,7 +197,10 @@ void MetaServiceImpl::RegisterInstance(RequestContext *request_context,
         request_context->set_status_code(status->code());
         status->set_message("Instance registered successfully");
         response->set_storage_configs(storage_configs);
-        KVCM_LOG_INFO("[traceId: %s] RegisterInstance succeeded", request->trace_id().c_str());
+        response->set_extra_info(cache_manager_->GetExtraInfo(request_context, request->instance_id()));
+        KVCM_LOG_INFO("[traceId: %s] RegisterInstance succeeded, extra_info=%s",
+                      request->trace_id().c_str(),
+                      response->extra_info().c_str());
     }
     SET_SPAN_TRACER_STR_IN_HEADER(request_context);
 }
@@ -264,10 +269,8 @@ void MetaServiceImpl::GetCacheLocation(RequestContext *request_context,
         SET_SPAN_TRACER_STR_IN_HEADER(request_context);
         return;
     }
-    // 调用Manager层获取缓存位置信息
     BlockMask block_mask_req;
     ProtoConvert::BlockMaskFromProto(&request->block_mask(), block_mask_req);
-    // 处理location_spec_names参数
     std::vector<std::string> location_spec_names;
     location_spec_names.reserve(request->location_spec_names_size());
     for (const auto &name : request->location_spec_names()) {
@@ -302,6 +305,72 @@ void MetaServiceImpl::GetCacheLocation(RequestContext *request_context,
         KVCM_LOG_INFO("[traceId: %s] GetCacheLocation succeeded, returned %d locations",
                       request->trace_id().c_str(),
                       response->locations_size());
+    }
+    SET_SPAN_TRACER_STR_IN_HEADER(request_context);
+}
+
+void MetaServiceImpl::GetCacheLocationsByBackend(RequestContext *request_context,
+                                                 const proto::meta::GetCacheLocationsByBackendRequest *request,
+                                                 proto::meta::GetCacheLocationsByBackendResponse *response) {
+    SPAN_TRACER(request_context);
+    API_CALL_GUARD("GetCacheLocationsByBackend", true);
+    auto *header = response->mutable_header();
+    auto *status = header->mutable_status();
+    std::string invalid_fields = "missing or invalid fields: ";
+    if (request->instance_id().empty()) {
+        CHECK_REQUIRED_FIELDS_VALIDATION("GetCacheLocationsByBackend", "instance_id", true);
+        SET_SPAN_TRACER_STR_IN_HEADER(request_context);
+        return;
+    }
+    if (request->block_keys().empty() && request->token_ids().empty()) {
+        CHECK_REQUIRED_FIELDS_VALIDATION("GetCacheLocationsByBackend", "block_keys and token_ids", true);
+        SET_SPAN_TRACER_STR_IN_HEADER(request_context);
+        return;
+    }
+    BlockMask block_mask_req;
+    ProtoConvert::BlockMaskFromProto(&request->block_mask(), block_mask_req);
+    std::vector<std::string> location_spec_names;
+    location_spec_names.reserve(request->location_spec_names_size());
+    for (const auto &name : request->location_spec_names()) {
+        location_spec_names.push_back(name);
+    }
+    std::vector<BackendSelector> backend_selectors;
+    backend_selectors.reserve(request->backend_selectors_size());
+    for (const auto &sel : request->backend_selectors()) {
+        backend_selectors.push_back({
+            static_cast<DataStorageType>(sel.backend_type()),
+            static_cast<LocationSelectStrategy>(sel.strategy()),
+        });
+    }
+
+    auto [ec_info, batch_result] = cache_manager_->GetCacheLocationsByBackend(
+        request_context,
+        request->instance_id(),
+        static_cast<CacheManager::QueryType>(request->query_type()),
+        std::vector<int64_t>(request->block_keys().begin(), request->block_keys().end()),
+        std::vector<int64_t>(request->token_ids().begin(), request->token_ids().end()),
+        block_mask_req,
+        request->sw_size(),
+        location_spec_names,
+        backend_selectors);
+    if (ec_info != EC_OK) {
+        status->set_code(ToMetaPbError(ec_info));
+        request_context->set_status_code(status->code());
+        status->set_message("Failed to get batch cache locations : " + request_context->error_tracer()->ToJsonString());
+        KVCM_LOG_ERROR("[traceId: %s] GetCacheLocationsByBackend failed, ec: %d", request->trace_id().c_str(), ec_info);
+    } else {
+        for (const auto &wrapper : batch_result) {
+            auto *key_locs_proto = response->add_key_locations();
+            for (const auto &view : wrapper.cache_locations_view()) {
+                ProtoConvert::CacheLocationViewToProto(view, key_locs_proto->add_locations());
+            }
+        }
+        status->set_code(proto::meta::OK);
+        request_context->set_status_code(status->code());
+        status->set_message("Batch cache locations retrieved successfully");
+        KVCM_LOG_INFO("[traceId: %s] GetCacheLocationsByBackend succeeded, returned %zu keys",
+                      request->trace_id().c_str(),
+                      batch_result.size());
     }
     SET_SPAN_TRACER_STR_IN_HEADER(request_context);
 }
@@ -441,7 +510,8 @@ void MetaServiceImpl::StartWriteCache(RequestContext *request_context,
         std::vector<int64_t>(request->block_keys().begin(), request->block_keys().end()),
         std::vector<int64_t>(request->token_ids().begin(), request->token_ids().end()),
         location_spec_group_names,
-        request->write_timeout_seconds());
+        request->write_timeout_seconds(),
+        request->min_replica_count());
     ErrorCode ec_info = start_write_cache.first;
     std::string write_session_id_res = start_write_cache.second.write_session_id();
     BlockMask block_mask_res = start_write_cache.second.block_mask();
@@ -666,6 +736,9 @@ void MetaServiceImpl::ReportEvent(RequestContext *request_context,
                       request->trace_id().c_str(),
                       (ec == EC_PARTIAL_OK) ? "partially failed" : "failed",
                       ec);
+    }
+    if (!request->instance_id().empty()) {
+        response->set_extra_info(cache_manager_->GetExtraInfo(request_context, request->instance_id()));
     }
     auto *smc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_SET_METRICS(smc, service, error_code, (ec != EC_OK) ? 1.0 : 0.0);

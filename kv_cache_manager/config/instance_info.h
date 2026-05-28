@@ -158,7 +158,6 @@ public:
         location_spec_groups_ = location_spec_groups;
         SortLocationSpecGroups();
     }
-
     // Returns field names that differ from the given values.
     // Returns empty vector if all fields match.
     [[nodiscard]] std::vector<std::string>

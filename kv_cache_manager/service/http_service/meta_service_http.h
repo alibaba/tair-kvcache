@@ -34,6 +34,9 @@ public:
     void GetCacheLocation(coro_http::coro_http_connection *http_conn,
                           proto::meta::GetCacheLocationRequest *request,
                           proto::meta::GetCacheLocationResponse *response);
+    void GetCacheLocationsByBackend(coro_http::coro_http_connection *http_conn,
+                                    proto::meta::GetCacheLocationsByBackendRequest *request,
+                                    proto::meta::GetCacheLocationsByBackendResponse *response);
     void StartWriteCache(coro_http::coro_http_connection *http_conn,
                          proto::meta::StartWriteCacheRequest *request,
                          proto::meta::StartWriteCacheResponse *response);

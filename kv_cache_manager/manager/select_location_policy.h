@@ -49,6 +49,11 @@ public:
                         const std::vector<std::string> &requested_spec_names,
                         CheckLocDataExistFunc check_loc_data_exist,
                         std::vector<std::string> &out_prune_loc_ids) const override;
+    bool ExistsForWriteWithMinCount(const CacheLocationMap &location_map,
+                                    int32_t min_count,
+                                    const std::vector<std::string> &requested_spec_names,
+                                    CheckLocDataExistFunc check_loc_data_exist,
+                                    std::vector<std::string> &out_prune_loc_ids) const;
 
 protected:
     virtual uint32_t GetWeight(CacheLocationMap::const_reference kv) const = 0;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -18,13 +19,24 @@ using SubmitDelReqFunc = std::function<void(const std::vector<std::int64_t> &blk
 
 class MetaIndexer;
 
+enum class LocationSelectStrategy : int32_t {
+    LSS_UNSPECIFIED = 0,
+    LSS_V6D_PREFIX = 1,   // 对应v6d侧，best_effort = false
+    LSS_V6D_COVERAGE = 2, // 对应v6d侧，best_effort = true
+    LSS_WEIGHTED_RANDOM = 3,
+};
+
+struct BackendSelector {
+    DataStorageType backend_type;
+    LocationSelectStrategy strategy;
+};
+
 class MetaSearcher {
 public:
     using KeyType = int64_t;
     using KeyVector = std::vector<KeyType>;
     using UriType = std::string;
     using UriVector = std::vector<UriType>;
-    static const std::string PROPERTY_PREV_BLOCK_KEY;
 
     explicit MetaSearcher(const std::shared_ptr<MetaIndexer> &meta_manager);
     MetaSearcher(const std::shared_ptr<MetaIndexer> &meta_indexer,
@@ -43,6 +55,11 @@ public:
                                    const KeyVector &keys,
                                    CacheLocationVector &out_locations,
                                    SelectLocationPolicy *policy) const;
+    ErrorCode BatchGetBestLocationByBackend(RequestContext *request_context,
+                                            const KeyVector &keys,
+                                            LocationsPerKey &out_locations,
+                                            SelectLocationPolicy *policy,
+                                            const std::vector<BackendSelector> &selectors) const;
     ErrorCode ReverseRollSlideWindowMatch(RequestContext *request_context,
                                           const KeyVector &keys,
                                           int32_t sw_size,

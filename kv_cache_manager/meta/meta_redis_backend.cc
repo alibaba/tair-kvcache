@@ -162,12 +162,12 @@ std::vector<ErrorCode> MetaRedisBackend::Delete(RequestContext * /*request_conte
 std::vector<ErrorCode> MetaRedisBackend::DeleteLocations(RequestContext * /*request_context*/,
                                                          const KeyTypeVec &keys,
                                                          const LocationIdsPerKey &location_ids) noexcept {
-    // Convert location ids to field names with LOCATION_PREFIX for Redis DeleteFields.
+    // Convert location ids to field names with PROPERTY_LOCATION_PREFIX for Redis DeleteFields.
     std::vector<std::vector<std::string>> field_names_vec(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
         field_names_vec[i].reserve(location_ids[i].size());
         for (const auto &loc_id : location_ids[i]) {
-            field_names_vec[i].push_back(LOCATION_PREFIX + loc_id);
+            field_names_vec[i].push_back(PROPERTY_LOCATION_PREFIX + loc_id);
         }
     }
 
@@ -261,7 +261,7 @@ std::vector<std::vector<ErrorCode>> MetaRedisBackend::GetLocations(RequestContex
     for (size_t i = 0; i < keys.size(); ++i) {
         field_names_vec[i].reserve(location_ids[i].size());
         for (const auto &loc_id : location_ids[i]) {
-            field_names_vec[i].push_back(LOCATION_PREFIX + loc_id);
+            field_names_vec[i].push_back(PROPERTY_LOCATION_PREFIX + loc_id);
         }
     }
 
@@ -322,7 +322,8 @@ std::vector<ErrorCode> MetaRedisBackend::GetLocationIds(RequestContext * /*reque
     }
     std::vector<std::string> full_keys = AppendPrefixToKeys(cache_key_prefix_, keys);
     std::vector<std::vector<std::string>> raw_field_names_vec;
-    std::vector<ErrorCode> results = handle->GetFieldNamesWithPrefix(full_keys, LOCATION_PREFIX, raw_field_names_vec);
+    std::vector<ErrorCode> results =
+        handle->GetFieldNamesWithPrefix(full_keys, PROPERTY_LOCATION_PREFIX, raw_field_names_vec);
 
     out_location_ids.resize(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -331,8 +332,9 @@ std::vector<ErrorCode> MetaRedisBackend::GetLocationIds(RequestContext * /*reque
         }
         out_location_ids[i].reserve(raw_field_names_vec[i].size());
         for (const auto &field_name : raw_field_names_vec[i]) {
-            if (field_name.size() > LOCATION_PREFIX.size() && field_name.rfind(LOCATION_PREFIX, 0) == 0) {
-                out_location_ids[i].push_back(field_name.substr(LOCATION_PREFIX.size()));
+            if (field_name.size() > PROPERTY_LOCATION_PREFIX.size() &&
+                field_name.rfind(PROPERTY_LOCATION_PREFIX, 0) == 0) {
+                out_location_ids[i].push_back(field_name.substr(PROPERTY_LOCATION_PREFIX.size()));
             }
         }
     }
@@ -358,7 +360,7 @@ std::vector<ErrorCode> MetaRedisBackend::GetProperties(RequestContext * /*reques
         if (results[i] != EC_OK) {
             continue;
         }
-        // Properties are stored as plain fields (no LOCATION_PREFIX).
+        // Properties are stored as plain fields (no PROPERTY_LOCATION_PREFIX).
         out_properties[i] = std::move(field_maps[i]);
     }
     return results;
@@ -390,7 +392,7 @@ std::vector<ErrorCode> MetaRedisBackend::ExistsLocation(RequestContext * /*reque
         return std::vector<ErrorCode>(keys.size(), EC_TIMEOUT);
     }
     std::vector<std::string> full_keys = AppendPrefixToKeys(cache_key_prefix_, keys);
-    return handle->ExistsFieldWithPrefix(full_keys, LOCATION_PREFIX, out_exists);
+    return handle->ExistsFieldWithPrefix(full_keys, PROPERTY_LOCATION_PREFIX, out_exists);
 }
 
 ErrorCode MetaRedisBackend::ListKeys(RequestContext * /*request_context*/,

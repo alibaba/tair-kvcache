@@ -33,6 +33,10 @@ public:
                           const proto::meta::GetCacheLocationRequest *request,
                           proto::meta::GetCacheLocationResponse *response);
 
+    void GetCacheLocationsByBackend(RequestContext *request_context,
+                                    const proto::meta::GetCacheLocationsByBackendRequest *request,
+                                    proto::meta::GetCacheLocationsByBackendResponse *response);
+
     void GetCacheLocationLen(RequestContext *request_context,
                              const proto::meta::GetCacheLocationLenRequest *request,
                              proto::meta::GetCacheLocationLenResponse *response);
