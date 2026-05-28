@@ -85,28 +85,16 @@ public:
     AsyncWriteStats GetAsyncWriteStats() noexcept override;
 
 private:
-    struct EnqueueStats {
-        int64_t enqueue_timeout_key_count = 0;
-        int64_t enqueue_time_us = 0;
-    };
     std::vector<ErrorCode> EnqueueWriteOp(RequestContext *request_context, WriteOp op);
-    bool WaitForQueueCapacity(int queue_id);
+    bool WaitForQueueCapacity(int queue_id, int64_t incoming_key_count);
     void ConsumerLoop(int queue_id);
+    void CleanupResources() noexcept;
     void BatchFlush(int queue_id, std::vector<QueueItem> &items, int64_t total_keys);
     void DrainQueue(int queue_id);
     int GetQueueIndexForKey(KeyType key) const noexcept;
 
     using CmdArgs = std::vector<std::string>;
     void CompileWriteOp(const WriteOp &op, std::vector<CmdArgs> &cmds);
-
-    std::vector<std::string> AppendPrefixToKeys(const KeyTypeVec &keys) const;
-    bool StripPrefixInKeys(const std::vector<std::string> &keys_with_prefix, KeyTypeVec &out_keys) const;
-
-    // Serialization helpers (same logic as MetaRedisBackend)
-    static FieldMap SerializeToFieldMap(const CacheLocationMap &locations, const PropertyMap &properties);
-    static ErrorCode
-    DeserializeFieldMap(const FieldMap &field_map, CacheLocationMap &out_locations, PropertyMap &out_properties);
-    static ErrorCode DeserializeLocations(const FieldMap &field_map, CacheLocationMap &out_locations);
 
     // virtual for test
     virtual std::shared_ptr<RedisClient> CreateRedisClient() const;
@@ -123,9 +111,9 @@ private:
     int64_t max_batch_size_ = 51200;
     int64_t batch_wait_timeout_us_ = 1000;
     int64_t queue_max_size_ = 102400;
-    int64_t enqueue_retry_interval_us_ = 100;
     int64_t enqueue_timeout_ms_ = 100;
-    int64_t drain_timeout_ms_ = 5000;
+    int64_t sync_timeout_ms_ = 1000;
+    int64_t drain_timeout_ms_ = 30000;
 
     // Runtime state
     std::atomic<bool> is_running_{false};
@@ -140,6 +128,7 @@ private:
 
     // Consumer-thread write stats (atomics, reset on read via CAS)
     std::atomic<int64_t> stats_flush_key_count_{0};
+    std::atomic<int64_t> stats_batch_flush_count_{0};
     std::atomic<int64_t> stats_batch_flush_time_us_{0};
     std::atomic<int64_t> stats_pipeline_error_count_{0};
 };

@@ -237,6 +237,27 @@ std::vector<RedisClient::ReplyUPtr> RedisClient::CommandPipeline(const std::vect
     return replies;
 }
 
+std::vector<ErrorCode> RedisClient::BatchWrite(const std::vector<CmdArgs> &cmds, bool &out_all_ok) {
+    out_all_ok = false;
+    auto replies = CommandPipeline(cmds);
+    if (replies.size() != cmds.size()) {
+        return std::vector<ErrorCode>(cmds.size(), EC_ERROR);
+    }
+    std::vector<ErrorCode> error_codes;
+    error_codes.reserve(replies.size());
+    bool has_error = false;
+    for (auto &reply : replies) {
+        if (!IsReplyOk(reply.get()) || !CheckReplyInteger(reply.get())) {
+            error_codes.push_back(EC_ERROR);
+            has_error = true;
+        } else {
+            error_codes.push_back(EC_OK);
+        }
+    }
+    out_all_ok = !has_error;
+    return error_codes;
+}
+
 bool RedisClient::Open() {
     if (!Reconnect()) {
         KVCM_REDIS_LOG_ERROR("fail to connect in open");
@@ -375,6 +396,8 @@ std::vector<ErrorCode> RedisClient::Update(const std::vector<std::string> &keys,
             KVCM_REDIS_LOG_ERROR("redis update fail, key[%s] fail in exists", keys[i].c_str());
         } else if (!is_exist_vec[i]) {
             ec_per_key[i] = EC_NOENT;
+        } else if (field_maps[i].empty()) {
+            // nothing to update
         } else {
             const std::map<std::string, std::string> &field_map = field_maps[i];
             CmdArgs hset_cmd;
@@ -403,7 +426,7 @@ std::vector<ErrorCode> RedisClient::Update(const std::vector<std::string> &keys,
 
     size_t hset_reply_index = 0;
     for (size_t i = 0; i < keys.size(); ++i) {
-        if (ec_per_key[i] != EC_OK) {
+        if (ec_per_key[i] != EC_OK || field_maps[i].empty()) {
             continue;
         }
         const ReplyUPtr &hset_reply = hset_replies[hset_reply_index++];
@@ -436,8 +459,13 @@ std::vector<ErrorCode> RedisClient::Upsert(const std::vector<std::string> &keys,
     }
     std::vector<ErrorCode> ec_per_key;
     ec_per_key.reserve(keys.size());
+    size_t reply_idx = 0;
     for (size_t i = 0; i < keys.size(); ++i) {
-        const ReplyUPtr &hset_reply = hset_replies[i];
+        if (field_maps[i].empty()) {
+            ec_per_key.emplace_back(EC_OK);
+            continue;
+        }
+        const ReplyUPtr &hset_reply = hset_replies[reply_idx++];
         if (!IsReplyOk(hset_reply.get()) || !CheckReplyInteger(hset_reply.get())) {
             KVCM_REDIS_LOG_ERROR("redis upsert fail, key[%s] HSET fail", keys[i].c_str());
             ec_per_key.emplace_back(EC_ERROR);

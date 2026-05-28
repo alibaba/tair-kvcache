@@ -1,3 +1,4 @@
+#include <atomic>
 #include <thread>
 
 #include "kv_cache_manager/common/redis_client.h"
@@ -9,6 +10,7 @@
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_async_redis_backend.h"
 #include "kv_cache_manager/meta/test/meta_storage_backend_test_base.h"
+#include "kv_cache_manager/meta/utils.h"
 
 namespace kv_cache_manager {
 
@@ -37,7 +39,7 @@ protected:
         config_ = std::make_shared<MetaStorageBackendConfig>();
         config_->SetStorageType(META_ASYNC_REDIS_BACKEND_TYPE_STR);
         config_->SetStorageUri("redis://user:pass@host:6379/?async_queue_count=2&async_max_batch=64&async_wait_us=1000"
-                               "&async_max_size=1000&async_drain_ms=2000&async_max_retry=3");
+                               "&async_max_size=1000&async_drain_ms=2000");
     }
 
     void SetupMockRedisClients() {
@@ -100,6 +102,15 @@ TEST_F(MetaAsyncRedisBackendTest, TestInitParams) {
     ASSERT_EQ(1000, backend_->batch_wait_timeout_us_);
     ASSERT_EQ(1000, backend_->queue_max_size_);
     ASSERT_EQ(2000, backend_->drain_timeout_ms_);
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestInitInvalidAsyncConfig) {
+    config_->SetStorageUri("redis://user:pass@host:6379/?async_queue_count=0&async_max_batch=64");
+    ASSERT_EQ(EC_BADARGS, backend_->Init("test_instance", config_));
+
+    ConstructBackend();
+    config_->SetStorageUri("redis://user:pass@host:6379/?async_queue_count=2&async_max_batch=0");
+    ASSERT_EQ(EC_BADARGS, backend_->Init("test_instance", config_));
 }
 
 // ==================== Open/Close Tests ====================
@@ -366,23 +377,29 @@ TEST_F(MetaAsyncRedisBackendTest, TestGetQueueIndexForKey) {
 TEST_F(MetaAsyncRedisBackendTest, TestAppendAndStripPrefix) {
     ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
 
+    const std::string &prefix = backend_->cache_key_prefix_;
+    const std::string &instance_id = backend_->instance_id_;
+
     KeyTypeVec keys = {100, 200, 300};
-    auto full_keys = backend_->AppendPrefixToKeys(keys);
+    auto full_keys = AppendPrefixToKeys(prefix, keys);
     ASSERT_EQ(3, full_keys.size());
     for (const auto &fk : full_keys) {
         ASSERT_TRUE(fk.find("kvcache:instance_test_instance:cache_") == 0);
     }
 
     KeyTypeVec out_keys;
-    ASSERT_TRUE(backend_->StripPrefixInKeys(full_keys, out_keys));
+    ASSERT_TRUE(StripPrefixInKeys(prefix, instance_id, full_keys, out_keys));
     ASSERT_EQ(keys, out_keys);
 }
 
 TEST_F(MetaAsyncRedisBackendTest, TestStripPrefixInvalid) {
     ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
 
+    const std::string &prefix = backend_->cache_key_prefix_;
+    const std::string &instance_id = backend_->instance_id_;
+
     KeyTypeVec out_keys;
-    ASSERT_FALSE(backend_->StripPrefixInKeys({"invalid_key"}, out_keys));
+    ASSERT_FALSE(StripPrefixInKeys(prefix, instance_id, {"invalid_key"}, out_keys));
     ASSERT_TRUE(out_keys.empty());
 }
 
@@ -425,15 +442,20 @@ TEST_F(MetaAsyncRedisBackendTest, TestEndToEndMultipleOpTypes) {
 
 TEST_F(MetaAsyncRedisBackendTest, TestBackpressureEnqueue) {
     config_->SetStorageUri("redis://user:pass@host:6379/?async_queue_count=1&async_max_size=5"
-                           "&async_enqueue_timeout_ms=100&async_enqueue_retry_us=1000");
+                           "&async_enqueue_timeout_ms=100");
 
-    EXPECT_CALL(*backend_, CreateRedisClient()).WillRepeatedly(Invoke([]() {
+    std::atomic<bool> pipeline_entered{false};
+    std::atomic<bool> can_proceed{false};
+    EXPECT_CALL(*backend_, CreateRedisClient()).WillRepeatedly(Invoke([&]() {
         StandardUri empty_uri;
         auto mock = std::make_shared<::testing::NiceMock<MockRedisClient>>(empty_uri);
         ON_CALL(*mock, IsContextOk()).WillByDefault(Return(true));
         ON_CALL(*mock, Reconnect()).WillByDefault(Return(true));
-        ON_CALL(*mock, TryExecPipeline(_)).WillByDefault(Invoke([](const std::vector<CmdArgs> &cmds) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        ON_CALL(*mock, TryExecPipeline(_)).WillByDefault(Invoke([&](const std::vector<CmdArgs> &cmds) {
+            pipeline_entered.store(true, std::memory_order_release);
+            while (!can_proceed.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
             std::vector<RedisClient::ReplyUPtr> replies;
             for (size_t i = 0; i < cmds.size(); ++i) {
                 redisReply *r = (redisReply *)malloc(sizeof(redisReply));
@@ -450,8 +472,18 @@ TEST_F(MetaAsyncRedisBackendTest, TestBackpressureEnqueue) {
     ASSERT_EQ(EC_OK, backend_->Init("bp_test", config_));
     ASSERT_EQ(EC_OK, backend_->Open());
 
+    // Seed: consumer picks this up and blocks in pipeline
+    CacheLocationMapVector seed_locs(1);
+    PropertyMapVector seed_props = {{{"f", "v"}}};
+    backend_->Put(nullptr, {0}, seed_locs, seed_props);
+
+    while (!pipeline_entered.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+
+    // Consumer is blocked — queue will fill up, causing enqueue timeouts
     int timeout_count = 0;
-    for (int i = 0; i < 50; ++i) {
+    for (int i = 1; i <= 50; ++i) {
         CacheLocationMapVector locs(1);
         PropertyMapVector props = {{{"f", "v"}}};
         auto results = backend_->Put(nullptr, {(KeyType)i}, locs, props);
@@ -459,18 +491,22 @@ TEST_F(MetaAsyncRedisBackendTest, TestBackpressureEnqueue) {
             ++timeout_count;
         }
     }
-    ASSERT_GT(timeout_count, 0);
+    ASSERT_EQ(timeout_count, 45);
+
+    can_proceed.store(true, std::memory_order_release);
     ASSERT_EQ(EC_OK, backend_->Close());
 }
 
 // ==================== MetaData Passthrough Tests ====================
 
-TEST_F(MetaAsyncRedisBackendTest, TestPutAndGetMetaData) {
+TEST_F(MetaAsyncRedisBackendTest, TestPutMetaData) {
     ASSERT_EQ(EC_OK, InitAndOpen());
 
     FieldMap meta = {{"version", "1"}, {"created_at", "2024-01-01"}};
-    ErrorCode ec = backend_->PutMetaData(meta);
-    ASSERT_EQ(EC_OK, ec);
+    ASSERT_EQ(EC_OK, backend_->PutMetaData(meta));
+
+    FieldMap out_meta;
+    backend_->GetMetaData(out_meta);
 }
 
 // ==================== Metrics Tests ====================
@@ -493,15 +529,21 @@ TEST_F(MetaAsyncRedisBackendTest, TestGetAsyncWriteStatsQueueSizes) {
 
     ASSERT_EQ(EC_OK, backend_->Close());
 
-    config_->SetStorageUri("redis://user:pass@host:6379/?async_queue_count=2&async_max_batch=1"
+    // Use 1 queue with a blocking mock: consumer blocks in pipeline so subsequent keys stay in queue
+    config_->SetStorageUri("redis://user:pass@host:6379/?async_queue_count=1&async_max_batch=64"
                            "&async_wait_us=500000&async_max_size=10000");
-    EXPECT_CALL(*backend_, CreateRedisClient()).WillRepeatedly(Invoke([]() {
+    std::atomic<bool> pipeline_entered{false};
+    std::atomic<bool> can_proceed{false};
+    EXPECT_CALL(*backend_, CreateRedisClient()).WillRepeatedly(Invoke([&]() {
         StandardUri empty_uri;
         auto mock = std::make_shared<::testing::NiceMock<MockRedisClient>>(empty_uri);
         ON_CALL(*mock, IsContextOk()).WillByDefault(Return(true));
         ON_CALL(*mock, Reconnect()).WillByDefault(Return(true));
-        ON_CALL(*mock, TryExecPipeline(_)).WillByDefault(Invoke([](const std::vector<CmdArgs> &cmds) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        ON_CALL(*mock, TryExecPipeline(_)).WillByDefault(Invoke([&](const std::vector<CmdArgs> &cmds) {
+            pipeline_entered.store(true, std::memory_order_release);
+            while (!can_proceed.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
             std::vector<RedisClient::ReplyUPtr> replies;
             for (size_t i = 0; i < cmds.size(); ++i) {
                 redisReply *r = (redisReply *)malloc(sizeof(redisReply));
@@ -517,12 +559,17 @@ TEST_F(MetaAsyncRedisBackendTest, TestGetAsyncWriteStatsQueueSizes) {
     ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
     ASSERT_EQ(EC_OK, backend_->Open());
 
+    // Seed put: consumer picks it up and blocks in pipeline
     CacheLocationMapVector seed_locs(1);
     PropertyMapVector seed_props = {{{"f", "v"}}};
     backend_->Put(nullptr, {0}, seed_locs, seed_props);
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    // Deterministic handshake: wait until consumer enters pipeline
+    while (!pipeline_entered.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
 
+    // Consumer is blocked in pipeline — new keys stay in queue
     KeyTypeVec keys;
     CacheLocationMapVector locations;
     PropertyMapVector properties;
@@ -535,9 +582,11 @@ TEST_F(MetaAsyncRedisBackendTest, TestGetAsyncWriteStatsQueueSizes) {
 
     {
         auto stats = backend_->GetAsyncWriteStats();
-        EXPECT_GT(stats.max_async_queue_size + stats.avg_async_queue_size, 0);
+        EXPECT_GT(stats.max_async_queue_size, 0);
+        EXPECT_GT(stats.avg_async_queue_size, 0);
     }
 
+    can_proceed.store(true, std::memory_order_release);
     ASSERT_EQ(EC_OK, backend_->Close());
 }
 
@@ -553,7 +602,6 @@ TEST_F(MetaAsyncRedisBackendTest, TestGetAsyncWriteStats) {
     SetupMockRedisClients();
     ASSERT_EQ(EC_OK, backend_->Open());
 
-    // Put some keys and wait for flush
     KeyTypeVec keys = {1, 2, 3};
     CacheLocationMapVector locations(3);
     PropertyMapVector properties = {{{"f", "v"}}, {{"f", "v"}}, {{"f", "v"}}};
@@ -562,7 +610,7 @@ TEST_F(MetaAsyncRedisBackendTest, TestGetAsyncWriteStats) {
         EXPECT_EQ(EC_OK, ec);
     }
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    ASSERT_TRUE(backend_->Sync(keys));
 
     {
         auto stats = backend_->GetAsyncWriteStats();
@@ -581,17 +629,22 @@ TEST_F(MetaAsyncRedisBackendTest, TestGetAsyncWriteStats) {
 
     ASSERT_EQ(EC_OK, backend_->Close());
 
-    // Test enqueue timeout: tiny queue capacity
+    // Test enqueue timeout: tiny queue capacity with blocked consumer
     config_->SetStorageUri("redis://user:pass@host:6379/?async_queue_count=1&async_max_batch=1"
                            "&async_wait_us=500000&async_max_size=1&async_enqueue_timeout_ms=1");
     ConstructBackend();
-    EXPECT_CALL(*backend_, CreateRedisClient()).WillRepeatedly(Invoke([]() {
+    std::atomic<bool> timeout_pipeline_entered{false};
+    std::atomic<bool> timeout_can_proceed{false};
+    EXPECT_CALL(*backend_, CreateRedisClient()).WillRepeatedly(Invoke([&]() {
         StandardUri empty_uri;
         auto mock = std::make_shared<::testing::NiceMock<MockRedisClient>>(empty_uri);
         ON_CALL(*mock, IsContextOk()).WillByDefault(Return(true));
         ON_CALL(*mock, Reconnect()).WillByDefault(Return(true));
-        ON_CALL(*mock, TryExecPipeline(_)).WillByDefault(Invoke([](const std::vector<CmdArgs> &cmds) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        ON_CALL(*mock, TryExecPipeline(_)).WillByDefault(Invoke([&](const std::vector<CmdArgs> &cmds) {
+            timeout_pipeline_entered.store(true, std::memory_order_release);
+            while (!timeout_can_proceed.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
             std::vector<RedisClient::ReplyUPtr> replies;
             for (size_t i = 0; i < cmds.size(); ++i) {
                 redisReply *r = (redisReply *)malloc(sizeof(redisReply));
@@ -607,42 +660,55 @@ TEST_F(MetaAsyncRedisBackendTest, TestGetAsyncWriteStats) {
     ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
     ASSERT_EQ(EC_OK, backend_->Open());
 
-    // First put fills the queue, subsequent puts should timeout
+    // Seed: consumer picks this up and blocks in pipeline
     CacheLocationMapVector locs1(1);
     PropertyMapVector props1 = {{{"f", "v"}}};
     backend_->Put(nullptr, {100}, locs1, props1);
 
-    // Give consumer time to pick up but it sleeps 500ms in pipeline
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    while (!timeout_pipeline_entered.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
 
-    // Now queue should be blocked, more puts will timeout
-    KeyTypeVec timeout_keys;
-    CacheLocationMapVector timeout_locs;
-    PropertyMapVector timeout_props;
+    // Consumer is blocked — queue will fill up (max_size=1), enqueue will timeout
+    // Must put keys one-by-one: WaitForCapacity is checked once per EnqueueWriteOp per queue,
+    // so a batch put would pass the check (key_size_=0 < 1) and push all keys at once.
+    int timeout_count = 0;
     for (int i = 200; i < 210; ++i) {
-        timeout_keys.push_back(i);
-        timeout_locs.push_back({});
-        timeout_props.push_back({{"f", "v"}});
+        CacheLocationMapVector locs(1);
+        PropertyMapVector props = {{{"f", "v"}}};
+        auto results = backend_->Put(nullptr, {(KeyType)i}, locs, props);
+        if (!results.empty() && results[0] == EC_TIMEOUT) {
+            ++timeout_count;
+        }
     }
-    auto timeout_results = backend_->Put(nullptr, timeout_keys, timeout_locs, timeout_props);
-    for (auto ec : timeout_results) {
-        EXPECT_TRUE(ec == EC_OK || ec == EC_TIMEOUT);
-    }
+    ASSERT_EQ(timeout_count, 9);
 
+    timeout_can_proceed.store(true, std::memory_order_release);
     ASSERT_EQ(EC_OK, backend_->Close());
 }
 
 TEST_F(MetaAsyncRedisBackendTest, TestGetAsyncWriteStatsPipelineError) {
-    // Setup a backend with pipeline that always fails
     config_->SetStorageUri("redis://user:pass@host:6379/?async_queue_count=1&async_max_batch=64&async_wait_us=1000"
-                           "&async_max_size=1000");
+                           "&async_max_size=1000&async_sync_timeout_ms=5000");
     ConstructBackend();
-    EXPECT_CALL(*backend_, CreateRedisClient()).WillRepeatedly(Invoke([]() {
+
+    std::atomic<int> pipeline_call_count{0};
+    std::atomic<bool> first_pipeline_entered{false};
+    std::atomic<bool> can_proceed{false};
+
+    EXPECT_CALL(*backend_, CreateRedisClient()).WillRepeatedly(Invoke([&]() {
         StandardUri empty_uri;
         auto mock = std::make_shared<::testing::NiceMock<MockRedisClient>>(empty_uri);
         ON_CALL(*mock, IsContextOk()).WillByDefault(Return(true));
         ON_CALL(*mock, Reconnect()).WillByDefault(Return(true));
-        ON_CALL(*mock, TryExecPipeline(_)).WillByDefault(Invoke([](const std::vector<CmdArgs> &) {
+        ON_CALL(*mock, TryExecPipeline(_)).WillByDefault(Invoke([&](const std::vector<CmdArgs> &) {
+            int n = pipeline_call_count.fetch_add(1, std::memory_order_acq_rel);
+            if (n == 0) {
+                first_pipeline_entered.store(true, std::memory_order_release);
+                while (!can_proceed.load(std::memory_order_acquire)) {
+                    std::this_thread::yield();
+                }
+            }
             return std::vector<RedisClient::ReplyUPtr>{};
         }));
         return mock;
@@ -650,19 +716,223 @@ TEST_F(MetaAsyncRedisBackendTest, TestGetAsyncWriteStatsPipelineError) {
     ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
     ASSERT_EQ(EC_OK, backend_->Open());
 
+    // Seed: consumer picks this up and blocks in pipeline
+    CacheLocationMapVector seed_locs(1);
+    PropertyMapVector seed_props = {{{"f", "v"}}};
+    backend_->Put(nullptr, {0}, seed_locs, seed_props);
+
+    while (!first_pipeline_entered.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+
+    // Consumer is blocked. Push WriteOp + barrier deterministically.
     KeyTypeVec keys = {1, 2, 3};
     CacheLocationMapVector locations(3);
     PropertyMapVector properties = {{{"f", "v"}}, {{"f", "v"}}, {{"f", "v"}}};
     backend_->Put(nullptr, keys, locations, properties);
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    auto barrier = std::make_shared<BarrierContext>();
+    barrier->remain.store(1, std::memory_order_release);
+    backend_->queues_[0]->Push(QueueItem{SyncBarrierItem{barrier}});
+
+    can_proceed.store(true, std::memory_order_release);
+
+    ASSERT_FALSE(barrier->Wait(std::chrono::milliseconds{5000}));
+
+    ASSERT_EQ(EC_OK, backend_->Close());
 
     auto stats = backend_->GetAsyncWriteStats();
     EXPECT_GT(stats.pipeline_error_count, 0);
     EXPECT_EQ(0, stats.flush_key_count);
     EXPECT_GT(stats.batch_flush_time_us, 0);
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestSyncPartialPipelineFailure) {
+    config_->SetStorageUri("redis://user:pass@host:6379/?async_queue_count=1&async_max_batch=64&async_wait_us=1000"
+                           "&async_max_size=1000&async_sync_timeout_ms=5000");
+    ConstructBackend();
+
+    std::atomic<int> pipeline_call_count{0};
+    std::atomic<bool> first_pipeline_entered{false};
+    std::atomic<bool> can_proceed{false};
+
+    EXPECT_CALL(*backend_, CreateRedisClient()).WillRepeatedly(Invoke([&]() {
+        StandardUri empty_uri;
+        auto mock = std::make_shared<::testing::NiceMock<MockRedisClient>>(empty_uri);
+        ON_CALL(*mock, IsContextOk()).WillByDefault(Return(true));
+        ON_CALL(*mock, Reconnect()).WillByDefault(Return(true));
+        ON_CALL(*mock, TryExecPipeline(_))
+            .WillByDefault(Invoke([&](const std::vector<CmdArgs> &cmds) {
+                int n = pipeline_call_count.fetch_add(1, std::memory_order_acq_rel);
+                if (n == 0) {
+                    first_pipeline_entered.store(true, std::memory_order_release);
+                    while (!can_proceed.load(std::memory_order_acquire)) {
+                        std::this_thread::yield();
+                    }
+                    std::vector<RedisClient::ReplyUPtr> replies;
+                    for (size_t i = 0; i < cmds.size(); ++i) {
+                        redisReply *r = (redisReply *)malloc(sizeof(redisReply));
+                        memset(r, 0, sizeof(redisReply));
+                        r->type = REDIS_REPLY_INTEGER;
+                        r->integer = 1;
+                        replies.emplace_back(r, freeReplyObject);
+                    }
+                    return replies;
+                }
+                std::vector<RedisClient::ReplyUPtr> replies;
+                for (size_t i = 0; i < cmds.size(); ++i) {
+                    redisReply *r = (redisReply *)malloc(sizeof(redisReply));
+                    memset(r, 0, sizeof(redisReply));
+                    if (i == cmds.size() - 1) {
+                        r->type = REDIS_REPLY_ERROR;
+                        r->str = strdup("ERR partial failure");
+                        r->len = static_cast<int>(strlen(r->str));
+                    } else {
+                        r->type = REDIS_REPLY_INTEGER;
+                        r->integer = 1;
+                    }
+                    replies.emplace_back(r, freeReplyObject);
+                }
+                return replies;
+            }));
+        return mock;
+    }));
+
+    ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
+    ASSERT_EQ(EC_OK, backend_->Open());
+
+    // Seed: consumer picks this up and blocks in pipeline
+    CacheLocationMapVector seed_locs(1);
+    PropertyMapVector seed_props = {{{"f", "v"}}};
+    backend_->Put(nullptr, {0}, seed_locs, seed_props);
+
+    while (!first_pipeline_entered.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+
+    // Consumer is blocked. Push WriteOp + barrier deterministically.
+    KeyTypeVec keys = {1, 2, 3};
+    CacheLocationMapVector locations(3);
+    PropertyMapVector properties = {{{"f1", "v1"}}, {{"f2", "v2"}}, {{"f3", "v3"}}};
+    backend_->Put(nullptr, keys, locations, properties);
+
+    auto barrier = std::make_shared<BarrierContext>();
+    barrier->remain.store(1, std::memory_order_release);
+    backend_->queues_[0]->Push(QueueItem{SyncBarrierItem{barrier}});
+
+    can_proceed.store(true, std::memory_order_release);
+
+    // Barrier segment covers all 6 commands; last command fails → segment_ok = false
+    ASSERT_FALSE(barrier->Wait(std::chrono::milliseconds{5000}));
 
     ASSERT_EQ(EC_OK, backend_->Close());
+
+    auto stats = backend_->GetAsyncWriteStats();
+    EXPECT_EQ(1, stats.pipeline_error_count);
+    // Seed batch flushed 1 key; partial failure batch flushed 0 (segment containing error)
+    EXPECT_EQ(1, stats.flush_key_count);
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestBatchFlushMultiSegmentPartialFailure) {
+    config_->SetStorageUri(
+        "redis://user:pass@host:6379/?async_queue_count=1&async_max_batch=1024&async_wait_us=500000"
+        "&async_max_size=10000&async_sync_timeout_ms=5000");
+    ConstructBackend();
+
+    std::atomic<int> pipeline_call_count{0};
+    std::atomic<bool> first_pipeline_entered{false};
+    std::atomic<bool> can_proceed{false};
+
+    EXPECT_CALL(*backend_, CreateRedisClient()).WillRepeatedly(Invoke([&]() {
+        StandardUri empty_uri;
+        auto mock = std::make_shared<::testing::NiceMock<MockRedisClient>>(empty_uri);
+        ON_CALL(*mock, IsContextOk()).WillByDefault(Return(true));
+        ON_CALL(*mock, Reconnect()).WillByDefault(Return(true));
+        ON_CALL(*mock, TryExecPipeline(_))
+            .WillByDefault(Invoke([&](const std::vector<CmdArgs> &cmds) {
+                int call_num = pipeline_call_count.fetch_add(1, std::memory_order_acq_rel);
+
+                if (call_num == 0) {
+                    first_pipeline_entered.store(true, std::memory_order_release);
+                    while (!can_proceed.load(std::memory_order_acquire)) {
+                        std::this_thread::yield();
+                    }
+                    std::vector<RedisClient::ReplyUPtr> replies;
+                    for (size_t i = 0; i < cmds.size(); ++i) {
+                        redisReply *r = (redisReply *)malloc(sizeof(redisReply));
+                        memset(r, 0, sizeof(redisReply));
+                        r->type = REDIS_REPLY_INTEGER;
+                        r->integer = 1;
+                        replies.emplace_back(r, freeReplyObject);
+                    }
+                    return replies;
+                }
+
+                // Second call: fail last 2 commands (second segment's DEL + HSET)
+                std::vector<RedisClient::ReplyUPtr> replies;
+                for (size_t i = 0; i < cmds.size(); ++i) {
+                    redisReply *r = (redisReply *)malloc(sizeof(redisReply));
+                    memset(r, 0, sizeof(redisReply));
+                    if (i >= cmds.size() - 2) {
+                        r->type = REDIS_REPLY_ERROR;
+                        r->str = strdup("ERR partial");
+                        r->len = static_cast<int>(strlen(r->str));
+                    } else {
+                        r->type = REDIS_REPLY_INTEGER;
+                        r->integer = 1;
+                    }
+                    replies.emplace_back(r, freeReplyObject);
+                }
+                return replies;
+            }));
+        return mock;
+    }));
+
+    ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
+    ASSERT_EQ(EC_OK, backend_->Open());
+
+    // Seed: consumer picks this up and blocks in first pipeline call
+    CacheLocationMapVector seed_locs(1);
+    PropertyMapVector seed_props = {{{"f", "v"}}};
+    backend_->Put(nullptr, {0}, seed_locs, seed_props);
+
+    while (!first_pipeline_entered.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+
+    // Consumer is blocked. Push items for a multi-segment batch:
+    //   WriteOp({1,2}) → 4 cmds | Barrier1 | WriteOp({3}) → 2 cmds | Barrier2
+    // Mock will fail last 2 cmds → segment 1 ok, segment 2 fail
+
+    CacheLocationMapVector locs1(2);
+    PropertyMapVector props1 = {{{"f1", "v1"}}, {{"f2", "v2"}}};
+    backend_->Put(nullptr, {1, 2}, locs1, props1);
+
+    auto barrier1 = std::make_shared<BarrierContext>();
+    barrier1->remain.store(1, std::memory_order_release);
+    backend_->queues_[0]->Push(QueueItem{SyncBarrierItem{barrier1}});
+
+    CacheLocationMapVector locs2(1);
+    PropertyMapVector props2 = {{{"f3", "v3"}}};
+    backend_->Put(nullptr, {3}, locs2, props2);
+
+    auto barrier2 = std::make_shared<BarrierContext>();
+    barrier2->remain.store(1, std::memory_order_release);
+    backend_->queues_[0]->Push(QueueItem{SyncBarrierItem{barrier2}});
+
+    // Release consumer — first batch (seed) succeeds, second batch has partial failure
+    can_proceed.store(true, std::memory_order_release);
+
+    ASSERT_TRUE(barrier1->Wait(std::chrono::milliseconds{5000}));
+    ASSERT_FALSE(barrier2->Wait(std::chrono::milliseconds{5000}));
+
+    // Close joins consumer thread, ensuring all stats are flushed
+    ASSERT_EQ(EC_OK, backend_->Close());
+
+    auto stats = backend_->GetAsyncWriteStats();
+    EXPECT_EQ(1, stats.pipeline_error_count);
+    // seed batch: 1 key (all_ok path) + segment 1: 2 keys (partial ok) = 3
+    EXPECT_EQ(3, stats.flush_key_count);
 }
 
 } // namespace kv_cache_manager

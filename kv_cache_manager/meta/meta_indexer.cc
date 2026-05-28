@@ -316,32 +316,48 @@ void MetaIndexer::EmitRmwMetrics(MetricsCollector *metrics_collector,
                                  const RmwStats &stats,
                                  size_t total_key_count) const noexcept {
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(metrics_collector);
+    const bool has_upsert = stats.put_key_count + stats.update_key_count > 0;
+    const bool has_delete = stats.delete_key_count > 0;
+
     KVCM_METRICS_COLLECTOR_SET_METRICS(
         service_metrics_collector, meta_indexer, rmw_get_io_time_us, stats.get_io_time_us);
     KVCM_METRICS_COLLECTOR_SET_METRICS(
-        service_metrics_collector, meta_indexer, upsert_io_time_us, stats.upsert_io_time_us);
-    KVCM_METRICS_COLLECTOR_SET_METRICS(
-        service_metrics_collector, meta_indexer, delete_io_time_us, stats.delete_io_time_us);
-    KVCM_METRICS_COLLECTOR_SET_METRICS(
         service_metrics_collector, meta_indexer, lock_wait_time_us, stats.lock_wait_time_us);
-    KVCM_METRICS_COLLECTOR_SET_METRICS(
-        service_metrics_collector, meta_indexer, async_enqueue_timeout_key_count, stats.async_enqueue_timeout_key_count);
-    KVCM_METRICS_COLLECTOR_SET_METRICS(
-        service_metrics_collector, meta_indexer, async_enqueue_time_us, stats.async_enqueue_time_us);
-    KVCM_METRICS_COLLECTOR_SET_METRICS(
-        service_metrics_collector, meta_indexer, cache_backend_upsert_time_us, stats.cache_backend_upsert_time_us);
-    KVCM_METRICS_COLLECTOR_SET_METRICS(
-        service_metrics_collector, meta_indexer, cache_backend_delete_time_us, stats.cache_backend_delete_time_us);
-    KVCM_METRICS_COLLECTOR_SET_METRICS(
-        service_metrics_collector, meta_searcher, index_serialize_time_us, stats.index_serialize_time_us);
-    KVCM_METRICS_COLLECTOR_SET_METRICS(
-        service_metrics_collector, meta_searcher, index_deserialize_time_us, stats.index_deserialize_time_us);
-    KVCM_METRICS_COLLECTOR_SET_METRICS(
-        service_metrics_collector, meta_indexer, read_modify_write_update_key_count, stats.update_key_count);
-    KVCM_METRICS_COLLECTOR_SET_METRICS(
-        service_metrics_collector, meta_indexer, read_modify_write_put_key_count, stats.put_key_count);
-    KVCM_METRICS_COLLECTOR_SET_METRICS(
-        service_metrics_collector, meta_indexer, read_modify_write_delete_key_count, stats.delete_key_count);
+
+    if (has_upsert) {
+        KVCM_METRICS_COLLECTOR_SET_METRICS(
+            service_metrics_collector, meta_indexer, upsert_io_time_us, stats.upsert_io_time_us);
+        KVCM_METRICS_COLLECTOR_SET_METRICS(
+            service_metrics_collector, meta_indexer, cache_backend_upsert_time_us, stats.cache_backend_upsert_time_us);
+        KVCM_METRICS_COLLECTOR_SET_METRICS(
+            service_metrics_collector, meta_searcher, index_serialize_time_us, stats.index_serialize_time_us);
+        KVCM_METRICS_COLLECTOR_SET_METRICS(
+            service_metrics_collector, meta_indexer, read_modify_write_update_key_count, stats.update_key_count);
+        KVCM_METRICS_COLLECTOR_SET_METRICS(
+            service_metrics_collector, meta_indexer, read_modify_write_put_key_count, stats.put_key_count);
+    }
+
+    if (has_delete) {
+        KVCM_METRICS_COLLECTOR_SET_METRICS(
+            service_metrics_collector, meta_indexer, delete_io_time_us, stats.delete_io_time_us);
+        KVCM_METRICS_COLLECTOR_SET_METRICS(
+            service_metrics_collector, meta_indexer, cache_backend_delete_time_us, stats.cache_backend_delete_time_us);
+        KVCM_METRICS_COLLECTOR_SET_METRICS(
+            service_metrics_collector, meta_indexer, read_modify_write_delete_key_count, stats.delete_key_count);
+    }
+
+    if (has_upsert || has_delete) {
+        KVCM_METRICS_COLLECTOR_SET_METRICS(
+            service_metrics_collector, meta_indexer, async_enqueue_timeout_key_count, stats.async_enqueue_timeout_key_count);
+        KVCM_METRICS_COLLECTOR_SET_METRICS(
+            service_metrics_collector, meta_indexer, async_enqueue_time_us, stats.async_enqueue_time_us);
+    }
+
+    if (stats.has_index_deserialize) {
+        KVCM_METRICS_COLLECTOR_SET_METRICS(
+            service_metrics_collector, meta_searcher, index_deserialize_time_us, stats.index_deserialize_time_us);
+    }
+
     const int64_t skip_key_count =
         static_cast<int64_t>(total_key_count) - stats.update_key_count - stats.put_key_count - stats.delete_key_count;
     KVCM_METRICS_COLLECTOR_SET_METRICS(
@@ -487,6 +503,7 @@ MetaIndexer::LocationResult MetaIndexer::ReadModifyWriteLocation(RequestContext 
         KVCM_METRICS_COLLECTOR_GET_METRICS(
             ephemeral_service_metrics_collector, meta_searcher, index_deserialize_time_us, v);
         stats.index_deserialize_time_us += v;
+        stats.has_index_deserialize = true;
 
         // 2. Per-key modifier dispatch -> bucket each key into the upsert sub-batch or the delete sub-batch.
         BatchMetaData upsert_batch;

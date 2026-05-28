@@ -192,6 +192,7 @@ cc_test(
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/common/test:redis_client_testlib",
         "//kv_cache_manager/meta:meta_async_redis_backend",
+        "//kv_cache_manager/meta:utils",
     ],
 )
 

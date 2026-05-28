@@ -21,14 +21,6 @@ protected:
         return op;
     }
 
-    WriteOp MakeWriteOpWithFields(WriteOpType type, const KeyTypeVec &keys, const FieldMapVec &field_maps) {
-        WriteOp op;
-        op.type = type;
-        op.keys = keys;
-        op.field_maps = field_maps;
-        return op;
-    }
-
     std::unique_ptr<MpscWriteQueue> queue_;
     int64_t taken_keys_ = 0;
 };
@@ -67,17 +59,43 @@ TEST_F(MpscWriteQueueTest, TestPopBatchLimited) {
     queue_->Push(QueueItem{MakeWriteOp(WriteOpType::kPut, {3})});
     ASSERT_EQ(3, queue_->GetKeySize());
 
-    // Pop with limit 2 — remaining item moves to consumer-local buffer, not counted in GetKeySize
+    // Pop with limit 2 — remaining item stays in consumer-local buffer, still counted in GetKeySize
     auto items = queue_->PopBatch(2, taken_keys_);
     ASSERT_EQ(2, items.size());
     ASSERT_EQ(2, taken_keys_);
-    ASSERT_EQ(0, queue_->GetKeySize());
+    ASSERT_EQ(1, queue_->GetKeySize());
 
     // Pop remaining
     auto remaining = queue_->PopBatch(10, taken_keys_);
     ASSERT_EQ(1, remaining.size());
     ASSERT_EQ(1, taken_keys_);
     ASSERT_EQ(0, queue_->GetKeySize());
+}
+
+TEST_F(MpscWriteQueueTest, TestRepeatedPopBatchClearsConsumerLeftover) {
+    for (int i = 0; i < 6; ++i) {
+        queue_->Push(QueueItem{MakeWriteOp(WriteOpType::kPut, {i})});
+    }
+    ASSERT_EQ(6, queue_->GetKeySize());
+
+    auto first_items = queue_->PopBatch(2, taken_keys_);
+    ASSERT_EQ(2, first_items.size());
+    ASSERT_EQ(2, taken_keys_);
+    ASSERT_EQ(4, queue_->GetKeySize());
+
+    auto second_items = queue_->PopBatch(2, taken_keys_);
+    ASSERT_EQ(2, second_items.size());
+    ASSERT_EQ(2, taken_keys_);
+    ASSERT_EQ(2, queue_->GetKeySize());
+
+    auto remaining_items = queue_->PopBatch(2, taken_keys_);
+    ASSERT_EQ(2, remaining_items.size());
+    ASSERT_EQ(2, taken_keys_);
+    ASSERT_EQ(0, queue_->GetKeySize());
+
+    auto empty_items = queue_->PopBatch(2, taken_keys_);
+    ASSERT_TRUE(empty_items.empty());
+    ASSERT_EQ(0, taken_keys_);
 }
 
 TEST_F(MpscWriteQueueTest, TestPopBatchWaitTimeout) {
@@ -249,6 +267,60 @@ TEST_F(MpscWriteQueueTest, TestBarrierContextSetFailed) {
     bool result = ctx->Wait(std::chrono::milliseconds{5000});
     ASSERT_FALSE(result);
     t.join();
+}
+
+// --- WaitForCapacity tests ---
+
+TEST_F(MpscWriteQueueTest, TestWaitForCapacityImmediate) {
+    ASSERT_TRUE(queue_->WaitForCapacity(10, 1, 100000));
+}
+
+TEST_F(MpscWriteQueueTest, TestWaitForCapacityConsidersIncomingKeys) {
+    queue_->Push(QueueItem{MakeWriteOp(WriteOpType::kPut, {1, 2, 3, 4, 5, 6, 7, 8})});
+    ASSERT_EQ(8, queue_->GetKeySize());
+
+    ASSERT_TRUE(queue_->WaitForCapacity(10, 2, 100000));
+    ASSERT_FALSE(queue_->WaitForCapacity(10, 3, 1000));
+}
+
+TEST_F(MpscWriteQueueTest, TestWaitForCapacityAllowsOversizedItemWhenEmpty) {
+    ASSERT_TRUE(queue_->WaitForCapacity(3, 10, 100000));
+}
+
+TEST_F(MpscWriteQueueTest, TestWaitForCapacityTimeout) {
+    for (int i = 0; i < 5; ++i) {
+        queue_->Push(QueueItem{MakeWriteOp(WriteOpType::kPut, {i})});
+    }
+    ASSERT_EQ(5, queue_->GetKeySize());
+
+    auto start = std::chrono::steady_clock::now();
+    ASSERT_FALSE(queue_->WaitForCapacity(3, 1, 50000));
+    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - start)
+                          .count();
+    ASSERT_GE(elapsed_ms, 40);
+}
+
+TEST_F(MpscWriteQueueTest, TestWaitForCapacityWakeup) {
+    for (int i = 0; i < 10; ++i) {
+        queue_->Push(QueueItem{MakeWriteOp(WriteOpType::kPut, {i})});
+    }
+    ASSERT_EQ(10, queue_->GetKeySize());
+
+    std::atomic<bool> got_capacity{false};
+    std::thread producer([&] {
+        got_capacity.store(queue_->WaitForCapacity(5, 1, 5000000));
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    ASSERT_FALSE(got_capacity.load());
+
+    int64_t tk = 0;
+    auto items = queue_->PopBatch(10, tk);
+    ASSERT_EQ(10, items.size());
+
+    producer.join();
+    ASSERT_TRUE(got_capacity.load());
 }
 
 } // namespace kv_cache_manager

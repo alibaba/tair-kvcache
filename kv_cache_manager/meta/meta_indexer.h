@@ -147,6 +147,7 @@ private:
         int64_t delete_io_time_us = 0;
         int64_t index_serialize_time_us = 0;
         int64_t index_deserialize_time_us = 0;
+        bool has_index_deserialize = false;
         int64_t lock_wait_time_us = 0; // accumulated time waiting for shard locks
         int64_t async_enqueue_timeout_key_count = 0;
         int64_t async_enqueue_time_us = 0;
