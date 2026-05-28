@@ -100,6 +100,75 @@ CacheLocationConstPtr SelectAndMergeForMatch(SelectLocationPolicy *policy,
     return result;
 }
 
+// TODO: vineyard locations are not merged currently since each write produces a complete location.
+CacheLocationVector SelectMultiLocationsForMatch(SelectLocationPolicy *policy,
+                                                 CacheLocationMap &location_map,
+                                                 CheckLocDataExistFunc check_loc_data_exist,
+                                                 std::vector<std::string> &out_prune_loc_ids) {
+    CacheLocationMap valid_map;
+    for (auto &[id, loc] : location_map) {
+        if (!loc) {
+            continue;
+        }
+        if (loc->status() != CacheLocationStatus::CLS_SERVING) {
+            continue;
+        }
+        if (check_loc_data_exist && !check_loc_data_exist(*loc)) {
+            if (loc->type() != DataStorageType::DATA_STORAGE_TYPE_VINEYARD) {
+                out_prune_loc_ids.push_back(id);
+            }
+            continue;
+        }
+        valid_map.try_emplace(id, loc);
+    }
+    if (valid_map.empty()) {
+        return {};
+    }
+
+    CacheLocationVector result;
+
+    CacheLocationMap non_vineyard_map;
+    for (auto &[id, loc] : valid_map) {
+        if (loc->type() == DataStorageType::DATA_STORAGE_TYPE_VINEYARD) {
+            result.push_back(loc);
+        } else {
+            non_vineyard_map.try_emplace(id, loc);
+        }
+    }
+
+    if (!non_vineyard_map.empty()) {
+        std::vector<std::string> unused_prune_ids;
+        auto winner = policy->SelectForMatch(non_vineyard_map, nullptr, unused_prune_ids);
+        if (winner && !winner->id().empty() && !winner->location_specs().empty()) {
+            std::map<std::string, LocationSpec> merged_specs;
+            for (auto &[id, loc] : non_vineyard_map) {
+                if (!policy->IsSameDataStorage(*loc, *winner)) {
+                    continue;
+                }
+                for (const auto &spec : loc->location_specs()) {
+                    merged_specs.try_emplace(spec.name(), spec);
+                }
+            }
+            if (!merged_specs.empty()) {
+                auto merged = std::make_shared<CacheLocation>();
+                merged->set_id(winner->id() + "merged");
+                merged->set_status(CacheLocationStatus::CLS_SERVING);
+                merged->set_type(winner->type());
+                std::vector<LocationSpec> specs;
+                specs.reserve(merged_specs.size());
+                for (auto &[name, spec] : merged_specs) {
+                    specs.push_back(std::move(spec));
+                }
+                merged->set_spec_size(specs.size());
+                merged->set_location_specs(std::move(specs));
+                result.push_back(merged);
+            }
+        }
+    }
+
+    return result;
+}
+
 } // namespace
 
 MetaSearcher::MetaSearcher(const std::shared_ptr<MetaIndexer> &meta_indexer) : meta_indexer_(meta_indexer) {}
@@ -278,6 +347,53 @@ ErrorCode MetaSearcher::BatchGetBestLocation(RequestContext *request_context,
     return out_locations.size() == keys.size() ? EC_OK : EC_ERROR;
 }
 
+ErrorCode MetaSearcher::BatchGetMultiLocations(RequestContext *request_context,
+                                               const KeyVector &keys,
+                                               LocationsPerKey &out_locations,
+                                               SelectLocationPolicy *policy) const {
+    assert(policy != nullptr);
+    SPAN_TRACER(request_context);
+    out_locations.clear();
+    out_locations.reserve(keys.size());
+    auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerGet);
+    CacheLocationMapVector location_maps;
+    auto result = meta_indexer_->GetLocations(request_context, keys, location_maps);
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerGet);
+    KeyVector prune_keys;
+    std::vector<std::vector<std::string>> prune_loc_ids_vec;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (result.error_codes[i] == ErrorCode::EC_NOENT) {
+            out_locations.push_back({});
+            continue;
+        }
+        if (result.error_codes[i] != ErrorCode::EC_OK) {
+            KVCM_LOG_WARN("get key failed, key[%lu](%lu), error_code: %d", i, keys[i], result.error_codes[i]);
+            break;
+        }
+
+        auto &location_map = location_maps[i];
+        if (location_map.empty()) {
+            out_locations.push_back({});
+            continue;
+        }
+        std::vector<std::string> prune_loc_ids;
+        CacheLocationVector multi_locs =
+            SelectMultiLocationsForMatch(policy, location_map, check_loc_data_exist_func_, prune_loc_ids);
+        if (!prune_loc_ids.empty()) {
+            prune_keys.emplace_back(keys[i]);
+            prune_loc_ids_vec.emplace_back(prune_loc_ids);
+        }
+        out_locations.push_back(std::move(multi_locs));
+    }
+
+    if (!prune_keys.empty() && submit_del_req_func_) {
+        submit_del_req_func_(prune_keys, prune_loc_ids_vec);
+    }
+
+    return out_locations.size() == keys.size() ? EC_OK : EC_ERROR;
+}
+
 ErrorCode MetaSearcher::ReverseRollSlideWindowMatch(RequestContext *request_context,
                                                     const KeyVector &keys,
                                                     int32_t sw_size,
@@ -394,12 +510,12 @@ ErrorCode MetaSearcher::BatchAddLocation(RequestContext *request_context,
     std::vector<std::pair<DataStorageType, std::uint64_t>> loc_sz(keys.size());
 
     const int64_t batch_create_time = TimestampUtil::GetCurrentTimeUs();
-    auto modifier =
-        [&locations, &out_location_ids, &keys, &loc_sz, batch_create_time](const LocationIdVector &existing_location_ids,
-                                                        ErrorCode get_ec,
-                                                        size_t index,
-                                                        PropertyMap &upsert_property_map,
-                                                        CacheLocationMap &out_new_locations) -> ModifierResult {
+    auto modifier = [&locations, &out_location_ids, &keys, &loc_sz, batch_create_time](
+                        const LocationIdVector &existing_location_ids,
+                        ErrorCode get_ec,
+                        size_t index,
+                        PropertyMap &upsert_property_map,
+                        CacheLocationMap &out_new_locations) -> ModifierResult {
         if (get_ec != ErrorCode::EC_OK && get_ec != ErrorCode::EC_NOENT) {
             KVCM_LOG_WARN("load location failed, key[%lu](%lu) return %d", index, keys[index], get_ec);
             return {ModifierAction::MA_FAIL, get_ec};

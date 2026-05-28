@@ -35,6 +35,10 @@ public:
                                   const proto::meta::GetCacheLocationRequest *request,
                                   proto::meta::GetCacheLocationResponse *response) override;
 
+    grpc::Status GetBatchCacheLocations(grpc::ServerContext *context,
+                                        const proto::meta::GetBatchCacheLocationsRequest *request,
+                                        proto::meta::GetBatchCacheLocationsResponse *response) override;
+
     grpc::Status GetCacheLocationLen(grpc::ServerContext *context,
                                      const proto::meta::GetCacheLocationLenRequest *request,
                                      proto::meta::GetCacheLocationLenResponse *response) override;
