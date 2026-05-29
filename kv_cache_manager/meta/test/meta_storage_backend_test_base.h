@@ -19,7 +19,7 @@ protected:
 
     // ---- Compatibility wrappers ----
     // Split a legacy FieldMapVec into CacheLocationMapVector + PropertyMapVector.
-    // Fields starting with LOCATION_PREFIX are treated as locations (value = raw string
+    // Fields starting with PROPERTY_LOCATION_PREFIX are treated as locations (value = raw string
     // stored as-is in a minimal CacheLocation), others go to properties.
     static void SplitFieldMaps(const FieldMapVec &field_maps,
                                CacheLocationMapVector &out_locations,

@@ -14,8 +14,6 @@
 
 namespace kv_cache_manager {
 
-const std::string MetaSearcher::PROPERTY_PREV_BLOCK_KEY = "BP#prev_key";
-
 namespace {
 
 void LogErrorCodes(const std::string &operation_name,
@@ -585,8 +583,9 @@ ErrorCode MetaSearcher::BatchUpsertLocations(RequestContext *request_context,
     out_per_key_ec.assign(keys.size(), ErrorCode::EC_OK);
 
     std::vector<std::pair<DataStorageType, std::uint64_t>> loc_sz(keys.size());
+    const int64_t batch_create_time = TimestampUtil::GetCurrentTimeUs();
 
-    auto modifier = [&new_locations_per_key, &keys, &loc_sz](const LocationIdVector & /*existing_ids*/,
+    auto modifier = [&new_locations_per_key, &keys, &loc_sz, batch_create_time](const LocationIdVector & /*existing_ids*/,
                                                              ErrorCode get_ec,
                                                              size_t index,
                                                              PropertyMap & /*upsert_property_map*/,
@@ -603,6 +602,7 @@ ErrorCode MetaSearcher::BatchUpsertLocations(RequestContext *request_context,
             loc.set_type(entry.type);
             loc.set_status(entry.status);
             loc.set_spec_size(entry.specs.size());
+            loc.set_create_time(batch_create_time);
             for (const auto &ls : entry.specs) {
                 loc.push_location_spec(LocationSpec(ls.name(), ls.uri()));
                 if (DataStorageUri ds_uri(ls.uri()); ds_uri.Valid()) {

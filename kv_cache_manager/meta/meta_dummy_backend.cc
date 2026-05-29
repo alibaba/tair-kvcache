@@ -104,8 +104,8 @@ ErrorCode MetaDummyBackend::Open() noexcept {
         }
         DummyItem item;
         for (auto &[field_name, field_value] : parsed_v) {
-            if (field_name.rfind(LOCATION_PREFIX, 0) == 0) {
-                std::string loc_id = field_name.substr(LOCATION_PREFIX.size());
+            if (field_name.rfind(PROPERTY_LOCATION_PREFIX, 0) == 0) {
+                std::string loc_id = field_name.substr(PROPERTY_LOCATION_PREFIX.size());
                 auto loc = std::make_shared<CacheLocation>();
                 if (loc->FromJsonString(field_value)) {
                     item.locations[loc_id] = std::move(loc);
@@ -137,7 +137,7 @@ ErrorCode MetaDummyBackend::PersistToPath() {
     table_.ForEachKV([&](const KeyType &key, const DummyItem &item) {
         FieldMap serialized;
         for (const auto &[loc_id, loc_ptr] : item.locations) {
-            serialized[LOCATION_PREFIX + loc_id] = loc_ptr ? loc_ptr->ToJsonString() : "";
+            serialized[PROPERTY_LOCATION_PREFIX + loc_id] = loc_ptr ? loc_ptr->ToJsonString() : "";
         }
         for (const auto &[prop_name, prop_value] : item.properties) {
             serialized[prop_name] = prop_value;

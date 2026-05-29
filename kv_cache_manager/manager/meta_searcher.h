@@ -24,7 +24,6 @@ public:
     using KeyVector = std::vector<KeyType>;
     using UriType = std::string;
     using UriVector = std::vector<UriType>;
-    static const std::string PROPERTY_PREV_BLOCK_KEY;
 
     explicit MetaSearcher(const std::shared_ptr<MetaIndexer> &meta_manager);
     MetaSearcher(const std::shared_ptr<MetaIndexer> &meta_indexer,

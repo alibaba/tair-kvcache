@@ -103,7 +103,7 @@ private:
     // Deserialize a FieldMap into CacheLocationMap only (ignores properties).
     static ErrorCode DeserializeLocations(const FieldMap &field_map, CacheLocationMap &out_locations);
 
-    // Extract location ids from field names that start with LOCATION_PREFIX.
+    // Extract location ids from field names that start with PROPERTY_LOCATION_PREFIX.
     static void ExtractLocationIds(const FieldMap &field_map, std::vector<LocationId> &out_location_ids);
 
     // virtual for test

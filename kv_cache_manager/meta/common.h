@@ -14,10 +14,7 @@ static const std::string PROPERTY_BLOCK_PREFIX = "BP#";
 static const std::string PROPERTY_LOCATION_PREFIX = "L#";
 static const std::string PROPERTY_LOC_SUB_PREFIX = "P#";
 
-// Legacy "__"-prefixed names; still recognised on the read path.
 static const std::string PROPERTY_INNER_PREFIX = "__";
-static const std::string LOCATION_PREFIX = "__loc__";
-static const std::string LOCATION_PROPERTY_PREFIX = "__loc_property__";
 
 // Synthetic in-process key; not a real Redis field. Kept for API compatibility.
 static const std::string PROPERTY_URI = "__uri__";
@@ -25,6 +22,7 @@ static const std::string PROPERTY_URI = "__uri__";
 static const std::string PROPERTY_TTL = "BP#ttl";
 static const std::string PROPERTY_HIT_COUNT = "BP#hit_count";
 static const std::string PROPERTY_LRU_TIME = "BP#lru_time";
+static const std::string PROPERTY_PREV_BLOCK_KEY = "BP#prev_key";
 
 // Instance-level metadata (under "metadata" key, not per-block hashes).
 static const std::string METADATA_PROPERTY_KEY_COUNT = "__key_count__";
