@@ -79,20 +79,35 @@ bazel run //kv_cache_manager/optimizer/analysis/script:optimizer_run -- -c confi
 
 ## 2. 多推理实例回放 — `multi_infer_replay`
 
-按推理 instance trace 并行运行 optimizer，并聚合 token hit rate。这个入口只模拟 engine-local L1/L2，不接 L3 pool；需要 engine-local + L3 pool 时使用 `hierarchical_replay_main`。每个输入 JSONL 必须是标准 optimizer schema，且一个文件只能包含一个 `instance_id`。
+按推理 instance trace 并行运行 optimizer，并聚合 token hit rate。这个入口只模拟 engine-local 本地缓存，不接 storage pool；需要 engine-local + storage pool 时使用 `hierarchical_replay_main`。每个输入 JSONL 必须是标准 optimizer schema，且一个文件只能包含一个 `instance_id`。
 
 ```bash
 bazel run //kv_cache_manager/optimizer/analysis/script:multi_infer_replay -- \
     --trace-dir /path/to/instance_traces \
     --trace-glob "*.jsonl" \
     --output-dir /path/to/output \
-    --l1-capacity 50 \
-    --l2-capacity 128 \
+    --tiers hbm:50,dram:128 \
     --block-size 16 \
     --bytes-per-token 512 \
     --eviction-policy lru \
-    --default-tier-write-mode write_through \
+    --tier-flow-config /path/to/tier_flows.json \
     --max-workers 32
+```
+
+多层 `--tiers` 必须显式提供完整 `--tier-flow-config`，单层不传。示例：
+
+```json
+[
+  {
+    "from_tier": "hbm",
+    "to_tier": "dram",
+    "write_mode": "write_through",
+    "access_propagation_enabled": false,
+    "write_propagation_enabled": false,
+    "promote_enabled": true,
+    "selective_write_threshold": 2
+  }
+]
 ```
 
 ### 输入与输出参数
@@ -119,21 +134,14 @@ bazel run //kv_cache_manager/optimizer/analysis/script:multi_infer_replay -- \
 
 | 参数 | 必需 | 默认 | 说明 |
 |------|------|------|------|
-| `--l1-capacity` | — | 50.0 | tier 0 容量，单位 GB |
-| `--l2-capacity` | — | 128.0 | tier 1 容量，单位 GB；`0` 表示关闭 L2，只保留 L1 |
+| `--tiers` | ✅ | — | 按从高到低顺序定义本地 tier，格式为 `name:capacity_gb[,name:capacity_gb...]`，例如 `hbm:50,dram:128`；单层直接写 `hbm:50` |
 | `--block-size` | — | 16 | 每个 block 的 token 数 |
 | `--bytes-per-token` | — | 512 | 单 token KV 大小；用于生成 config 和容量换算 |
 | `--eviction-policy` | — | `lru` | 每个 instance 的驱逐策略；可选 `lru` / `random_lru` / `leaf_aware_lru` / `ttl` |
 | `--eviction-policy-params` | — | 策略默认值 | JSON object，覆盖策略参数，例如 `'{"sample_rate": 0.5}'` |
 | `--eviction-mode` | — | 3 | optimizer eviction mode：`1=group rough`，`2=instance rough`，`3=instance precise` |
 | `--eviction-batch-size` | — | 100 | 每个 instance 单次驱逐批大小 |
-| `--default-tier-write-mode` | — | `write_through` | 自动生成 `tier_flows` 时使用的相邻 edge `write_mode`；可选 `write_through` / `cascading` / `write_through_selective` |
-| `--tier-flow-config` | — | 空 | JSON array 或 JSON 文件路径；传入后直接作为完整 `tier_flows` 使用，必须覆盖所有相邻 edge |
-| `--enable-tier-access-propagation` | — | true | 自动生成 `tier_flows` 时设置 `access_propagation_enabled=true`；命中上层副本时，同时刷新后续持有副本 tier 的访问时间 |
-| `--disable-tier-access-propagation` | — | false | 自动生成 `tier_flows` 时设置 `access_propagation_enabled=false`；命中上层副本时，只刷新命中 tier，不刷新下层冷热 |
-| `--selective-write-threshold` | — | 2 | 自动生成 `tier_flows` 时设置 `selective_write_threshold`；`write_through_selective` 下，命中层访问次数达到该阈值后复制到下一层 |
-| `--enable-promote` | — | true | 自动生成 `tier_flows` 时设置 `promote_enabled=true`；开启从低层级向高层级 promote |
-| `--disable-promote` | — | false | 自动生成 `tier_flows` 时设置 `promote_enabled=false`；关闭 promote |
+| `--tier-flow-config` | 多层必需 | — | JSON array 或 JSON 文件路径；直接作为完整 `tier_flows` 使用，必须覆盖所有相邻 edge；单层不传 |
 | `--used-percentage` | — | 1.0 | 写入 config 的 group `used_percentage` |
 | `--default-block-ttl-seconds` | — | 0 | 默认 block TTL 秒数；主要用于 `--eviction-policy ttl` |
 | `--ttl-refresh-on-read` | — | true | TTL 策略下读命中刷新 last access time；与 `--no-ttl-refresh-on-read` 互斥 |

@@ -20,6 +20,31 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Optional
 
+
+def _parse_tiers_arg(parser, raw_value):
+    if not raw_value:
+        return []
+    tiers = []
+    seen_names = set()
+    for idx, raw_item in enumerate(raw_value.split(",")):
+        item = raw_item.strip()
+        parts = item.split(":")
+        if len(parts) != 2 or not parts[0]:
+            parser.error("--tiers must use ordered name:capacity_gb items, for example hbm:50,dram:128")
+        name = parts[0]
+        if name in seen_names:
+            parser.error(f"--tiers contains duplicate tier name: {name}")
+        try:
+            capacity = float(parts[1])
+        except ValueError:
+            parser.error(f"--tiers[{idx}] capacity must be a number: {parts[1]!r}")
+        if capacity <= 0.0:
+            parser.error(f"--tiers[{idx}] capacity must be positive")
+        seen_names.add(name)
+        tiers.append({"unique_name": name, "capacity": capacity})
+    return tiers
+
+
 def _parse_tier_flow_config_arg(parser, raw_value):
     if not raw_value:
         return []
@@ -49,6 +74,29 @@ def _parse_tier_flow_config_arg(parser, raw_value):
     return tier_flows
 
 
+def _validate_tier_flows_match_tiers(parser, tiers, tier_flows):
+    expected_flow_count = max(len(tiers) - 1, 0)
+    if expected_flow_count == 0 and tier_flows:
+        parser.error("--tier-flow-config is only valid when --tiers has multiple tiers")
+    if expected_flow_count > 0 and not tier_flows:
+        parser.error("--tier-flow-config is required when --tiers has multiple tiers")
+    if tier_flows and len(tier_flows) != expected_flow_count:
+        parser.error(
+            "--tier-flow-config must define exactly {} adjacent edge(s), got {}".format(
+                expected_flow_count, len(tier_flows)
+            )
+        )
+    for idx, flow in enumerate(tier_flows):
+        expected_from = tiers[idx]["unique_name"]
+        expected_to = tiers[idx + 1]["unique_name"]
+        if flow["from_tier"] != expected_from or flow["to_tier"] != expected_to:
+            parser.error(
+                "--tier-flow-config[{}] must be adjacent edge {}->{}, got {}->{}".format(
+                    idx, expected_from, expected_to, flow["from_tier"], flow["to_tier"]
+                )
+            )
+
+
 def _configure_bazel_run_output():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(line_buffering=True)
@@ -73,10 +121,8 @@ def parse_args():
     parser.add_argument("--skip-existing", action="store_true",
                         help="Skip an instance if its hit_rates CSV already exists")
 
-    parser.add_argument("--l1-capacity", type=float, default=50.0,
-                        help="Tier 0 capacity per instance in GB")
-    parser.add_argument("--l2-capacity", type=float, default=128.0,
-                        help="Tier 1 capacity per instance in GB. Use 0 to disable")
+    parser.add_argument("--tiers", default="",
+                        help="Ordered local tiers as name:capacity_gb[,name:capacity_gb...], e.g. hbm:50,dram:128")
     parser.add_argument("--block-size", type=int, default=16, help="Block size in tokens")
     parser.add_argument("--bytes-per-token", type=int, default=512, help="Bytes per token")
     parser.add_argument("--eviction-policy", default="lru",
@@ -88,40 +134,8 @@ def parse_args():
                         help="1=group rough, 2=instance rough, 3=instance precise")
     parser.add_argument("--eviction-batch-size", type=int, default=100,
                         help="Eviction batch size per instance")
-    parser.add_argument("--default-tier-write-mode", dest="default_tier_write_mode", default="write_through",
-                        choices=[
-                            "write_through",
-                            "cascading",
-                            "write_through_selective",
-                        ],
-                        help="write_mode used when generating tier_flows for adjacent tier edges")
-    parser.add_argument("--selective-write-threshold", type=int, default=2,
-                        help="Access-count threshold for write_through_selective tier writes")
     parser.add_argument("--tier-flow-config", default=None,
-                        help="JSON array or file path for explicit tier_flows")
-    access_group = parser.add_mutually_exclusive_group()
-    access_group.add_argument("--enable-tier-access-propagation",
-                              dest="tier_access_propagation_enabled",
-                              action="store_true",
-                              default=True,
-                              help="Refresh lower-tier access metadata when an upper-tier copy is hit")
-    access_group.add_argument("--disable-tier-access-propagation",
-                              dest="tier_access_propagation_enabled",
-                              action="store_false",
-                              help="Refresh only the hit tier when a block has copies in multiple tiers")
-    write_access_group = parser.add_mutually_exclusive_group()
-    write_access_group.add_argument("--enable-tier-write-propagation",
-                                    dest="tier_write_propagation_enabled",
-                                    action="store_true",
-                                    default=False,
-                                    help="Refresh lower-tier write metadata when an upper-tier copy is touched by write")
-    write_access_group.add_argument("--disable-tier-write-propagation",
-                                    dest="tier_write_propagation_enabled",
-                                    action="store_false",
-                                    help="Refresh only the written tier when a block has copies in multiple tiers")
-    promote_group = parser.add_mutually_exclusive_group()
-    promote_group.add_argument("--enable-promote", dest="enable_promote", action="store_true", default=True)
-    promote_group.add_argument("--disable-promote", dest="enable_promote", action="store_false")
+                        help="JSON array or file path for explicit tier_flows; required when --tiers has multiple tiers")
     parser.add_argument("--used-percentage", type=float, default=1.0)
     parser.add_argument("--default-block-ttl-seconds", type=int, default=0)
     ttl_group = parser.add_mutually_exclusive_group()
@@ -142,11 +156,16 @@ def parse_args():
     args = parser.parse_args()
     if not args.aggregate_only and not args.trace_dir and not args.trace_files:
         parser.error("one of --trace-dir or --trace-files is required")
+    if not args.aggregate_only and not args.tiers:
+        parser.error("--tiers is required outside --aggregate-only")
+    args.tiers = _parse_tiers_arg(parser, args.tiers)
     if args.selective_write_threshold <= 0:
         parser.error("--selective-write-threshold must be positive")
     if args.write_delay_ns <= 0:
         parser.error("--write-delay-ns must be positive")
     args.tier_flow_config = _parse_tier_flow_config_arg(parser, args.tier_flow_config)
+    if not args.aggregate_only:
+        _validate_tier_flows_match_tiers(parser, args.tiers, args.tier_flow_config)
     return args
 
 
@@ -447,27 +466,19 @@ def _inspect_optimizer_trace(trace_file: str) -> str:
 def _make_single_instance_config(args, trace_file: str, output_dir: str, instance_id: str, policy_params: dict) -> dict:
     storages = [
         {
-            "unique_name": "hbm",
-            "storage_type": "pace",
-            "band_width_mbps": 20000,
-            "priority": 0,
-            "capacity": args.l1_capacity,
+            "unique_name": tier["unique_name"],
+            "storage_type": "dummy",
+            "band_width_mbps": 0,
+            "capacity": tier["capacity"],
         }
+        for tier in args.tiers
     ]
-    if args.l2_capacity > 0:
-        storages.append({
-            "unique_name": "dram",
-            "storage_type": "hf3fs",
-            "band_width_mbps": 20000,
-            "priority": 1,
-            "capacity": args.l2_capacity,
-        })
 
-    tier_flows = args.tier_flow_config or _make_adjacent_tier_flows(args, storages)
+    tier_flows = args.tier_flow_config
 
     group = {
         "group_name": instance_id,
-        "quota_capacity": args.l1_capacity + max(args.l2_capacity, 0.0),
+        "quota_capacity": sum(tier["capacity"] for tier in args.tiers),
         "used_percentage": args.used_percentage,
         "ttl_config": {
             "default_block_ttl_seconds": args.default_block_ttl_seconds,
@@ -499,22 +510,6 @@ def _make_single_instance_config(args, trace_file: str, output_dir: str, instanc
         },
         "instance_groups": [group],
     }
-
-
-def _make_adjacent_tier_flows(args, storages: List[dict]) -> List[dict]:
-    flows = []
-    for idx in range(len(storages) - 1):
-        flows.append({
-            "from_tier": storages[idx]["unique_name"],
-            "to_tier": storages[idx + 1]["unique_name"],
-            "write_mode": args.default_tier_write_mode,
-            "access_propagation_enabled": args.tier_access_propagation_enabled,
-            "write_propagation_enabled": args.tier_write_propagation_enabled,
-            "promote_enabled": args.enable_promote,
-            "selective_write_threshold": args.selective_write_threshold,
-        })
-    return flows
-
 
 def _resolve_policy_params(policy: str, override_json: str) -> dict:
     if override_json:
