@@ -1,4 +1,4 @@
-#include "kv_cache_manager/affinity/strategy.h"
+#include "kv_cache_manager/affinity/pipeline/candidate_pipeline.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -8,7 +8,7 @@
 #include <string_view>
 #include <utility>
 
-#include "kv_cache_manager/affinity/metric_registry.h"
+#include "kv_cache_manager/affinity/pipeline/metric_catalog.h"
 
 namespace kv_cache_manager {
 
@@ -119,7 +119,7 @@ bool ParseSort(const rapidjson::Value &v, std::vector<SortTerm> *out, std::strin
             return false;
         }
         std::string metric = m_it->value.GetString();
-        if (!MetricRegistry::IsKnown(metric)) {
+        if (!MetricCatalog::IsKnown(metric)) {
             SetError(err, "sort.metric \"" + metric + "\" is not a registered metric");
             return false;
         }
@@ -141,7 +141,7 @@ uint64_t HashTraceId(const std::string &trace_id) {
 void ApplyPreferLocal(const PreferLocalSpec &spec,
                       const std::vector<std::string> &input,
                       const std::string &caller_node_ip,
-                      Strategy::ApplyResult *result) {
+                      CandidatePipeline::ApplyResult *result) {
     bool found = false;
     std::vector<std::string> locals;
     locals.reserve(input.size());
@@ -156,7 +156,7 @@ void ApplyPreferLocal(const PreferLocalSpec &spec,
         return;
     }
     if (spec.on_miss == PreferLocalSpec::OnMiss::kAbort) {
-        result->status = Strategy::Status::kAbort;
+        result->status = CandidatePipeline::Status::kAbort;
         result->nodes.clear();
         return;
     }
@@ -213,7 +213,7 @@ void ApplySort(const std::vector<SortTerm> &terms,
         double score = 0.0;
         if (m != nullptr) {
             for (const auto &t : terms) {
-                auto v = MetricRegistry::Extract(t.metric, *m);
+                auto v = MetricCatalog::Extract(t.metric, *m);
                 if (v.has_value()) {
                     score += *v * t.weight;
                 }
@@ -233,7 +233,7 @@ void ApplySort(const std::vector<SortTerm> &terms,
 
 } // namespace
 
-std::unique_ptr<Strategy> Strategy::Parse(const rapidjson::Value &value, std::string *err) {
+std::unique_ptr<CandidatePipeline> CandidatePipeline::Parse(const rapidjson::Value &value, std::string *err) {
     if (!value.IsObject()) {
         SetError(err, "strategy must be a JSON object");
         return nullptr;
@@ -254,7 +254,7 @@ std::unique_ptr<Strategy> Strategy::Parse(const rapidjson::Value &value, std::st
         }
     }
 
-    auto strat = std::make_unique<Strategy>();
+    auto strat = std::make_unique<CandidatePipeline>();
 
     if (auto it = value.FindMember("filter"); it != value.MemberEnd()) {
         auto cond = FilterCond::Parse(it->value, err);
@@ -316,17 +316,17 @@ const rapidjson::Value *UnwrapEnvelope(const rapidjson::Document &doc) {
 }
 } // namespace
 
-std::unique_ptr<Strategy> Strategy::ParseJsonString(const std::string &json, std::string *err) {
+std::unique_ptr<CandidatePipeline> CandidatePipeline::ParseJsonString(const std::string &json, std::string *err) {
     rapidjson::Document doc;
     doc.Parse(json.c_str());
     if (doc.HasParseError()) {
         SetError(err, "JSON parse error");
         return nullptr;
     }
-    return Strategy::Parse(*UnwrapEnvelope(doc), err);
+    return CandidatePipeline::Parse(*UnwrapEnvelope(doc), err);
 }
 
-Strategy::ApplyResult Strategy::Apply(const std::vector<std::string> &candidates,
+CandidatePipeline::ApplyResult CandidatePipeline::Apply(const std::vector<std::string> &candidates,
                                       const std::function<const NodeMetrics *(const std::string &)> &find_metrics,
                                       const std::string &caller_node_ip,
                                       const std::string &trace_id) const {

@@ -15,6 +15,7 @@ public:
 
     inline const std::string &name() const { return raw_location_spec_.name(); }
     inline const std::string &uri() const { return raw_location_spec_.uri(); }
+    inline const std::string &node_id() const { return raw_location_spec_.node_id(); }
 
 private:
     const LocationSpec &raw_location_spec_;

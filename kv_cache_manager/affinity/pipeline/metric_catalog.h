@@ -8,7 +8,7 @@
 namespace kv_cache_manager {
 
 // Registry of metric names that may appear in `filter` / `sort` slots of a
-// Strategy.
+// CandidatePipeline.
 //
 // The v1 metric set is the four placeholder fields on NodeMetrics:
 //
@@ -24,10 +24,10 @@ namespace kv_cache_manager {
 //   - filter leaf with missing metric -> evaluates to true (permissive)
 //   - sort term with missing metric -> contributes 0 to the score
 //
-// Strategy parsing rejects any metric name that is not registered, so an
+// CandidatePipeline parsing rejects any metric name that is not registered, so an
 // undefined metric in a config file fails fast at load time rather than
 // silently returning all-missing.
-class MetricRegistry {
+class MetricCatalog {
 public:
     // True if `name` is a registered metric.
     static bool IsKnown(const std::string &name);

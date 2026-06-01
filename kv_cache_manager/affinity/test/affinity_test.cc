@@ -5,12 +5,10 @@
 #include <vector>
 
 #include "kv_cache_manager/affinity/cache_affinity_manager.h"
-#include "kv_cache_manager/affinity/filter_cond.h"
+#include "kv_cache_manager/affinity/pipeline/filter_cond.h"
 #include "kv_cache_manager/affinity/node_metrics.h"
-#include "kv_cache_manager/affinity/strategy.h"
-#include "kv_cache_manager/common/error_code.h"
+#include "kv_cache_manager/affinity/pipeline/candidate_pipeline.h"
 #include "kv_cache_manager/common/unittest.h"
-#include "kv_cache_manager/data_storage/write_hints.h"
 
 using namespace kv_cache_manager;
 
@@ -54,8 +52,8 @@ std::unique_ptr<FilterCond> ParseCond(const std::string &json, std::string *err 
     return FilterCond::Parse(doc, err);
 }
 
-std::unique_ptr<Strategy> ParseStrategy(const std::string &json, std::string *err = nullptr) {
-    return Strategy::ParseJsonString(json, err);
+std::unique_ptr<CandidatePipeline> ParseStrategy(const std::string &json, std::string *err = nullptr) {
+    return CandidatePipeline::ParseJsonString(json, err);
 }
 
 } // namespace
@@ -230,7 +228,7 @@ TEST_F(FilterCondTest, ApplyKeepsMatchingDropsOthers) {
     EXPECT_EQ(kept[1], "unknown");
 }
 
-// ============================ Strategy ===================================
+// ============================ CandidatePipeline ===================================
 
 class StrategyParseTest : public TESTBASE {};
 
@@ -317,7 +315,7 @@ TEST_F(StrategyParseTest, EmptyStrategyParsesAndIsIdentity) {
     ASSERT_NE(s, nullptr);
     MetricsBag bag;
     auto r = s->Apply({"a", "b", "c"}, bag.AsFinder(), "", "");
-    EXPECT_EQ(r.status, Strategy::Status::kOk);
+    EXPECT_EQ(r.status, CandidatePipeline::Status::kOk);
     ASSERT_EQ(r.nodes.size(), 3u);
     EXPECT_EQ(r.nodes[0], "a");
     EXPECT_EQ(r.nodes[1], "b");
@@ -382,7 +380,7 @@ TEST_F(StrategyApplyTest, PreferLocalPassthroughOnMiss) {
     ASSERT_NE(s, nullptr);
     MetricsBag bag;
     auto r = s->Apply({"10.0.0.1", "10.0.0.2"}, bag.AsFinder(), /*caller=*/"10.0.0.99", "");
-    EXPECT_EQ(r.status, Strategy::Status::kOk);
+    EXPECT_EQ(r.status, CandidatePipeline::Status::kOk);
     EXPECT_EQ(r.nodes.size(), 2u);
 }
 
@@ -391,7 +389,7 @@ TEST_F(StrategyApplyTest, PreferLocalAbortOnMiss) {
     ASSERT_NE(s, nullptr);
     MetricsBag bag;
     auto r = s->Apply({"10.0.0.1", "10.0.0.2"}, bag.AsFinder(), /*caller=*/"10.0.0.99", "");
-    EXPECT_EQ(r.status, Strategy::Status::kAbort);
+    EXPECT_EQ(r.status, CandidatePipeline::Status::kAbort);
     EXPECT_TRUE(r.nodes.empty());
 }
 
@@ -401,7 +399,7 @@ TEST_F(StrategyApplyTest, PreferLocalDefaultsToPassthrough) {
     ASSERT_NE(s, nullptr);
     MetricsBag bag;
     auto r = s->Apply({"a", "b"}, bag.AsFinder(), "missing", "");
-    EXPECT_EQ(r.status, Strategy::Status::kOk);
+    EXPECT_EQ(r.status, CandidatePipeline::Status::kOk);
     EXPECT_EQ(r.nodes.size(), 2u);
 }
 
@@ -563,52 +561,13 @@ TEST_F(StrategyApplyTest, AbortShortCircuitsPipeline) {
     MetricsBag bag;
     bag.Put(MakeNode("a", "n", 100));
     auto r = s->Apply({"a"}, bag.AsFinder(), /*caller=*/"missing", "");
-    EXPECT_EQ(r.status, Strategy::Status::kAbort);
+    EXPECT_EQ(r.status, CandidatePipeline::Status::kAbort);
     EXPECT_TRUE(r.nodes.empty());
 }
 
 // ============================ CacheAffinityManager ======================
 
 class CacheAffinityManagerTest : public TESTBASE {};
-
-TEST_F(CacheAffinityManagerTest, ResolveWithoutStrategyReturnsEmptyHints) {
-    CacheAffinityManager mgr;
-    WriteHints hints;
-    auto ec = mgr.Resolve({}, {"ip-a"}, hints);
-    EXPECT_EQ(ec, EC_OK);
-    EXPECT_TRUE(hints.preferred_node_ids.empty());
-}
-
-TEST_F(CacheAffinityManagerTest, ResolveAppliesPreferLocal) {
-    CacheAffinityManager mgr;
-    std::string err;
-    ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonString(R"({
-        "strategy": {"prefer_local": {"on_miss": "passthrough"}}
-    })",
-                                                      &err))
-        << err;
-    mgr.UpsertNodeMetrics(MakeNode("10.0.0.7", "node-7"));
-    mgr.UpsertNodeMetrics(MakeNode("10.0.0.8", "node-8"));
-    CacheAffinityManager::ResolveContext ctx;
-    ctx.caller_node_ip = "10.0.0.7";
-    WriteHints hints;
-    auto ec = mgr.Resolve(ctx, {"10.0.0.8", "10.0.0.7"}, hints);
-    EXPECT_EQ(ec, EC_OK);
-    ASSERT_EQ(hints.preferred_node_ids.size(), 1u);
-    EXPECT_EQ(hints.preferred_node_ids[0], "10.0.0.7");
-}
-
-TEST_F(CacheAffinityManagerTest, ResolveReturnsErrorOnAbort) {
-    CacheAffinityManager mgr;
-    ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonString(R"({
-        "strategy": {"prefer_local": {"on_miss": "abort"}}
-    })"));
-    CacheAffinityManager::ResolveContext ctx;
-    ctx.caller_node_ip = "10.0.0.99";
-    WriteHints hints;
-    auto ec = mgr.Resolve(ctx, {"10.0.0.7"}, hints);
-    EXPECT_EQ(ec, EC_ERROR);
-}
 
 TEST_F(CacheAffinityManagerTest, UpsertAndRemoveNode) {
     CacheAffinityManager mgr;
@@ -619,95 +578,4 @@ TEST_F(CacheAffinityManagerTest, UpsertAndRemoveNode) {
     auto snap = mgr.SnapshotNodes();
     ASSERT_EQ(snap.size(), 1u);
     EXPECT_EQ(snap[0].node_id, "10.0.0.2");
-}
-
-// ----- 3-tier priority ----------------------------------------------------
-
-namespace {
-// Build a strategy that only lets through nodes whose name matches a regex,
-// then sorts by node_id descending so the result order is well-defined.
-std::string OnlyNameMatching(const std::string &regex) {
-    return std::string(R"({"filter":{"node_name":{"include":[")") + regex + "\"]}}}";
-}
-} // namespace
-
-TEST_F(CacheAffinityManagerTest, ResolveInstanceTierWinsOverGroupAndProcess) {
-    CacheAffinityManager mgr;
-    ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonString(OnlyNameMatching("^proc-.*$")));
-    mgr.UpsertNodeMetrics(MakeNode("10.0.0.1", "inst-a"));
-    mgr.UpsertNodeMetrics(MakeNode("10.0.0.2", "grp-b"));
-    mgr.UpsertNodeMetrics(MakeNode("10.0.0.3", "proc-c"));
-
-    CacheAffinityManager::ResolveContext ctx;
-    ctx.instance_strategy_json = OnlyNameMatching("^inst-.*$");
-    ctx.instance_group_strategy_json = OnlyNameMatching("^grp-.*$");
-    WriteHints hints;
-    auto ec = mgr.Resolve(ctx, {"10.0.0.1", "10.0.0.2", "10.0.0.3"}, hints);
-    EXPECT_EQ(ec, EC_OK);
-    ASSERT_EQ(hints.preferred_node_ids.size(), 1u);
-    EXPECT_EQ(hints.preferred_node_ids[0], "10.0.0.1");
-}
-
-TEST_F(CacheAffinityManagerTest, ResolveGroupTierWinsWhenNoInstanceOverride) {
-    CacheAffinityManager mgr;
-    ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonString(OnlyNameMatching("^proc-.*$")));
-    mgr.UpsertNodeMetrics(MakeNode("10.0.0.2", "grp-b"));
-    mgr.UpsertNodeMetrics(MakeNode("10.0.0.3", "proc-c"));
-
-    CacheAffinityManager::ResolveContext ctx;
-    ctx.instance_group_strategy_json = OnlyNameMatching("^grp-.*$");
-    WriteHints hints;
-    auto ec = mgr.Resolve(ctx, {"10.0.0.2", "10.0.0.3"}, hints);
-    EXPECT_EQ(ec, EC_OK);
-    ASSERT_EQ(hints.preferred_node_ids.size(), 1u);
-    EXPECT_EQ(hints.preferred_node_ids[0], "10.0.0.2");
-}
-
-TEST_F(CacheAffinityManagerTest, ResolveProcessTierWhenNoOverride) {
-    CacheAffinityManager mgr;
-    ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonString(OnlyNameMatching("^proc-.*$")));
-    mgr.UpsertNodeMetrics(MakeNode("10.0.0.2", "grp-b"));
-    mgr.UpsertNodeMetrics(MakeNode("10.0.0.3", "proc-c"));
-
-    CacheAffinityManager::ResolveContext ctx;
-    WriteHints hints;
-    auto ec = mgr.Resolve(ctx, {"10.0.0.2", "10.0.0.3"}, hints);
-    EXPECT_EQ(ec, EC_OK);
-    ASSERT_EQ(hints.preferred_node_ids.size(), 1u);
-    EXPECT_EQ(hints.preferred_node_ids[0], "10.0.0.3");
-}
-
-TEST_F(CacheAffinityManagerTest, ResolveBadOverrideJsonFallsThroughToNextTier) {
-    CacheAffinityManager mgr;
-    ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonString(OnlyNameMatching("^proc-.*$")));
-    mgr.UpsertNodeMetrics(MakeNode("10.0.0.2", "grp-b"));
-    mgr.UpsertNodeMetrics(MakeNode("10.0.0.3", "proc-c"));
-
-    CacheAffinityManager::ResolveContext ctx;
-    ctx.instance_strategy_json = "{this is not json";
-    ctx.instance_group_strategy_json = OnlyNameMatching("^grp-.*$");
-    WriteHints hints;
-    auto ec = mgr.Resolve(ctx, {"10.0.0.2", "10.0.0.3"}, hints);
-    EXPECT_EQ(ec, EC_OK);
-    ASSERT_EQ(hints.preferred_node_ids.size(), 1u);
-    EXPECT_EQ(hints.preferred_node_ids[0], "10.0.0.2");
-}
-
-TEST_F(CacheAffinityManagerTest, ResolveCachesParsedOverrideStrategy) {
-    CacheAffinityManager mgr;
-    mgr.UpsertNodeMetrics(MakeNode("10.0.0.2", "grp-b"));
-
-    CacheAffinityManager::ResolveContext ctx;
-    ctx.instance_group_strategy_json = OnlyNameMatching("^grp-.*$");
-
-    WriteHints hints;
-    EXPECT_EQ(mgr.Resolve(ctx, {"10.0.0.2"}, hints), EC_OK);
-    EXPECT_EQ(mgr.parsed_strategy_cache_.size(), 1u);
-
-    EXPECT_EQ(mgr.Resolve(ctx, {"10.0.0.2"}, hints), EC_OK);
-    EXPECT_EQ(mgr.parsed_strategy_cache_.size(), 1u);
-
-    ctx.instance_group_strategy_json = OnlyNameMatching("^.*$");
-    EXPECT_EQ(mgr.Resolve(ctx, {"10.0.0.2"}, hints), EC_OK);
-    EXPECT_EQ(mgr.parsed_strategy_cache_.size(), 2u);
 }

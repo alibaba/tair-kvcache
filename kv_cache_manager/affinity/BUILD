@@ -6,45 +6,67 @@ cc_library(
 )
 
 cc_library(
-    name = "metric_registry",
-    srcs = ["metric_registry.cc"],
-    hdrs = ["metric_registry.h"],
-    deps = [
-        ":node_metrics",
-    ],
-)
-
-cc_library(
-    name = "filter_cond",
-    srcs = ["filter_cond.cc"],
-    hdrs = ["filter_cond.h"],
-    deps = [
-        ":metric_registry",
-        ":node_metrics",
-        "@rapidjson",
-    ],
-)
-
-cc_library(
-    name = "strategy",
-    srcs = ["strategy.cc"],
-    hdrs = ["strategy.h"],
-    deps = [
-        ":filter_cond",
-        ":metric_registry",
-        ":node_metrics",
-        "@rapidjson",
-    ],
-)
-
-cc_library(
     name = "affinity",
     srcs = ["cache_affinity_manager.cc"],
     hdrs = ["cache_affinity_manager.h"],
     deps = [
+        ":affinity_strategy",
+        ":frequency_sketch",
         ":node_metrics",
-        ":strategy",
+        ":strategy_factory",
+        "//kv_cache_manager/affinity/pipeline:candidate_pipeline",
+        "//kv_cache_manager/common",
+        # Needed for metrics pull loop (SnapshotPerNodeMetrics)
+        "//kv_cache_manager/data_storage",
+        "//kv_cache_manager/data_storage:common_define",
+    ],
+)
+
+# AffinityStrategy abstract interface (header-only) + NoopStrategy fallback.
+cc_library(
+    name = "affinity_strategy",
+    hdrs = [
+        "affinity_strategy.h",
+        "noop_strategy.h",
+    ],
+    deps = [
+        ":node_metrics",
         "//kv_cache_manager/common",
         "//kv_cache_manager/data_storage:common_define",
+        "//kv_cache_manager/meta:cache_location",
+    ],
+)
+
+# Per-(caller, key) frequency sketch for read-triggered replication.
+cc_library(
+    name = "frequency_sketch",
+    srcs = ["frequency_sketch.cc"],
+    hdrs = ["frequency_sketch.h"],
+)
+
+# LocalReplicaAffinityStrategy: multi-replica strategy implementing
+# ResolveWrite / ResolveRead / ResolveEviction.
+cc_library(
+    name = "local_replica_strategy",
+    srcs = ["local_replica_strategy.cc"],
+    hdrs = ["local_replica_strategy.h"],
+    deps = [
+        ":affinity_strategy",
+        ":frequency_sketch",  # ResolveRead 内部需要 FrequencySketch 完整类型
+        "//kv_cache_manager/affinity/pipeline:candidate_pipeline",  # v0 5 段算法作 candidate_pipeline 实现
+    ],
+)
+
+# StrategyFactory: parse JSON config into an AffinityStrategy instance.
+cc_library(
+    name = "strategy_factory",
+    srcs = ["strategy_factory.cc"],
+    hdrs = ["strategy_factory.h"],
+    deps = [
+        ":affinity_strategy",
+        ":local_replica_strategy",
+        "//kv_cache_manager/affinity/pipeline:candidate_pipeline",  # 解析 5 段流水线
+        "//kv_cache_manager/common",
+        "@rapidjson",
     ],
 )

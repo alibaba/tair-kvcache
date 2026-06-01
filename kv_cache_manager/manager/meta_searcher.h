@@ -17,6 +17,10 @@
 
 namespace kv_cache_manager {
 
+class CacheAffinityManager;
+struct AffinityResolveContext;
+struct ReadSideEffect;
+
 using SubmitDelReqFunc = std::function<void(const std::vector<std::int64_t> &blk_keys,
                                             const std::vector<std::vector<std::string>> &loc_ids,
                                             const std::vector<std::vector<std::string>> &expected_location_values,
@@ -86,11 +90,17 @@ public:
                           const KeyVector &keys,
                           const BlockMask &input_mask,
                           CacheLocationVector &out_locations,
-                          SelectLocationPolicy *policy) const;
+                          SelectLocationPolicy *policy,
+                          CacheAffinityManager *affinity_manager = nullptr,
+                          std::vector<std::unique_ptr<ReadSideEffect>> *out_side_effects = nullptr,
+                          const AffinityResolveContext *resolve_ctx = nullptr) const;
     ErrorCode BatchGetBestLocation(RequestContext *request_context,
                                    const KeyVector &keys,
                                    CacheLocationVector &out_locations,
-                                   SelectLocationPolicy *policy) const;
+                                   SelectLocationPolicy *policy,
+                                   CacheAffinityManager *affinity_manager = nullptr,
+                                   std::vector<std::unique_ptr<ReadSideEffect>> *out_side_effects = nullptr,
+                                   const AffinityResolveContext *resolve_ctx = nullptr) const;
     ErrorCode BatchGetBestLocationByBackend(RequestContext *request_context,
                                             const KeyVector &keys,
                                             LocationsPerKey &out_locations,
@@ -102,7 +112,10 @@ public:
                                           const KeyVector &keys,
                                           int32_t sw_size,
                                           CacheLocationVector &out_locations,
-                                          SelectLocationPolicy *policy) const;
+                                          SelectLocationPolicy *policy,
+                                          CacheAffinityManager *affinity_manager = nullptr,
+                                          std::vector<std::unique_ptr<ReadSideEffect>> *out_side_effects = nullptr,
+                                          const AffinityResolveContext *resolve_ctx = nullptr) const;
     ErrorCode PrefixMatchByHost(RequestContext *request_context,
                                 const KeyVector &keys,
                                 bool use_eagle_pop,
@@ -392,7 +405,10 @@ private:
     ErrorCode PrefixMatchBestLocationImpl(RequestContext *request_context,
                                           const KeyVector &keys,
                                           CacheLocationVector &out_locations,
-                                          SelectLocationPolicy *policy) const;
+                                          SelectLocationPolicy *policy,
+                                          CacheAffinityManager *affinity_manager,
+                                          std::vector<std::unique_ptr<ReadSideEffect>> *out_side_effects,
+                                          const AffinityResolveContext *resolve_ctx) const;
 
     std::shared_ptr<MetaIndexer> meta_indexer_;
     CheckLocDataExistFunc check_loc_data_exist_func_;

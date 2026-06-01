@@ -577,7 +577,8 @@ CacheReclaimer::CacheReclaimer(const std::size_t sampling_size_total,
                                std::shared_ptr<WriteLocationManager> write_location_manager,
                                CacheReclaimerAsyncDeleteConfig async_delete_config,
                                std::shared_ptr<MigrationManager> migration_manager,
-                               CacheReclaimerGroupLruConfig group_lru_config)
+                               CacheReclaimerGroupLruConfig group_lru_config,
+                               std::shared_ptr<CacheAffinityManager> affinity_manager)
     : registry_manager_(std::move(registry_manager))
     , meta_indexer_manager_(std::move(meta_indexer_manager))
     , meta_searcher_manager_(std::move(meta_searcher_manager))
@@ -587,6 +588,7 @@ CacheReclaimer::CacheReclaimer(const std::size_t sampling_size_total,
     , write_location_manager_(std::move(write_location_manager))
     , migration_manager_(std::move(migration_manager))
     , group_lru_config_(group_lru_config)
+    , affinity_manager_(std::move(affinity_manager))
     , job_state_flag_(false)
     , pause_flag_(false)
     , sampling_size_(sampling_size_total)
