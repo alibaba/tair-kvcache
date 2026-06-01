@@ -12,7 +12,7 @@ static const std::string META_CACHED_BACKEND_TYPE_STR = "cached";
 
 // Hash field prefixes: BP#{prop}, L#{location_id}, P#{location_id}#{prop}.
 static const std::string PROPERTY_BLOCK_PREFIX = "BP#";
-static const std::string PROPERTY_LOCATION_PREFIX = "L#";
+static const std::string LOCATION_PREFIX = "__loc__";
 static const std::string PROPERTY_LOC_SUB_PREFIX = "P#";
 
 static const std::string PROPERTY_INNER_PREFIX = "__";
@@ -32,7 +32,7 @@ static const std::string METADATA_PROPERTY_STORAGE_USAGE_DATA = "__storage_usage
 static const std::string SCAN_BASE_CURSOR = "0";
 
 inline bool IsInternalPropertyName(const std::string &name) noexcept {
-    return name.rfind(PROPERTY_BLOCK_PREFIX, 0) == 0 || name.rfind(PROPERTY_LOCATION_PREFIX, 0) == 0 ||
+    return name.rfind(PROPERTY_BLOCK_PREFIX, 0) == 0 || name.rfind(LOCATION_PREFIX, 0) == 0 ||
            name.rfind(PROPERTY_LOC_SUB_PREFIX, 0) == 0 || name.rfind(PROPERTY_INNER_PREFIX, 0) == 0;
 }
 
