@@ -12,7 +12,7 @@
 
 namespace kv_cache_manager {
 
-// Recursive condition tree used by Strategy.filter.
+// Recursive condition tree used by CandidatePipeline.filter.
 //
 // Grammar (one object per node, one of `and / or / metric / node_name` is
 // the dispatch key):

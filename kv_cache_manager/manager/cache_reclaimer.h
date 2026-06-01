@@ -50,6 +50,7 @@ private:                                                                        
 
 class CacheReclaimStrategy;
 class CacheLocation;
+class CacheAffinityManager;
 class EventManager;
 class InstanceGroup;
 class InstanceGroupQuota;
@@ -173,7 +174,8 @@ public:
                    std::shared_ptr<WriteLocationManager> write_location_manager,
                    CacheReclaimerAsyncDeleteConfig async_delete_config = {},
                    std::shared_ptr<MigrationManager> migration_manager = nullptr,
-                   CacheReclaimerGroupLruConfig group_lru_config = {});
+                   CacheReclaimerGroupLruConfig group_lru_config = {},
+                   std::shared_ptr<CacheAffinityManager> affinity_manager = nullptr);
 
     /**
      * @brief Delete copy constructor
@@ -335,6 +337,7 @@ private:
     const std::shared_ptr<MigrationManager> migration_manager_;
     // Startup-only configuration; no public mutation API.
     CacheReclaimerGroupLruConfig group_lru_config_;
+    const std::shared_ptr<CacheAffinityManager> affinity_manager_;
 
     // represents the object of the associated working thread
     std::thread reclaimer_;

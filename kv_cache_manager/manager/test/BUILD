@@ -100,6 +100,10 @@ cc_test(
     copts = ["-fno-access-control"],
     data = [],
     deps = [
+        # Tests use CacheAffinityManager facade to verify ResolveRead integration
+        "//kv_cache_manager/affinity",
+        "//kv_cache_manager/affinity:affinity_strategy",
+        "//kv_cache_manager/affinity:local_replica_strategy",
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/config:instance_info",
         "//kv_cache_manager/manager:meta_searcher",
@@ -149,6 +153,9 @@ cc_test(
     linkstatic = True,
     shard_count = 10,
     deps = [
+        "//kv_cache_manager/affinity",
+        "//kv_cache_manager/affinity:local_replica_strategy",
+        "//kv_cache_manager/affinity:node_metrics",
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/manager:cache_manager",
         "@cpp_stub",

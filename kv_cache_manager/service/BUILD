@@ -24,6 +24,8 @@ cc_library(
     deps = [
         "//kv_cache_manager/common:build_version",
         ":grpc_wrapper",
+        "//kv_cache_manager/affinity",
+        "//kv_cache_manager/affinity:local_replica_strategy",
         "//kv_cache_manager/common",
         "//kv_cache_manager/common:crash_handler",
         "//kv_cache_manager/common:loop_thread",

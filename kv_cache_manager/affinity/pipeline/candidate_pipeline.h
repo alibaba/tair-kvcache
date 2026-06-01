@@ -8,7 +8,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "kv_cache_manager/affinity/filter_cond.h"
+#include "kv_cache_manager/affinity/pipeline/filter_cond.h"
 #include "kv_cache_manager/affinity/node_metrics.h"
 #include "rapidjson/document.h"
 
@@ -16,7 +16,7 @@ namespace kv_cache_manager {
 
 // Top-level affinity strategy, parsed from JSON.
 //
-// A Strategy is five named, optional slots evaluated in a fixed order:
+// A CandidatePipeline is five named, optional slots evaluated in a fixed order:
 //
 //     filter -> prefer_local -> sample -> sort -> limit
 //
@@ -37,7 +37,7 @@ namespace kv_cache_manager {
 //   }
 //
 // The wrapper `{ "strategy": { ... } }` is also accepted; the unwrapping is
-// done by CacheAffinityManager before calling Strategy::Parse.
+// done by CacheAffinityManager before calling CandidatePipeline::Parse.
 
 struct PreferLocalSpec {
     enum class OnMiss {
@@ -63,23 +63,23 @@ struct SortTerm {
     double weight = 0.0; // negative weight = ascending sort
 };
 
-struct Strategy {
+struct CandidatePipeline {
     std::optional<std::unique_ptr<FilterCond>> filter;
     std::optional<PreferLocalSpec> prefer_local;
     std::optional<SampleSpec> sample;
     std::optional<std::vector<SortTerm>> sort;
     std::optional<int> limit;
 
-    // Parse a Strategy from a rapidjson value (must be an object with any
+    // Parse a CandidatePipeline from a rapidjson value (must be an object with any
     // subset of the five known keys). Returns nullptr on parse failure with
     // `error_msg` populated when non-null.
-    static std::unique_ptr<Strategy> Parse(const rapidjson::Value &value, std::string *error_msg);
+    static std::unique_ptr<CandidatePipeline> Parse(const rapidjson::Value &value, std::string *error_msg);
 
     // Convenience: parse a top-level JSON string. Accepts either bare
     // `{ ... }` or wrapped `{ "strategy": { ... } }`.
-    static std::unique_ptr<Strategy> ParseJsonString(const std::string &json, std::string *error_msg);
+    static std::unique_ptr<CandidatePipeline> ParseJsonString(const std::string &json, std::string *error_msg);
 
-    // Result of Apply(): kAbort signals Strategy aborted (e.g. prefer_local
+    // Result of Apply(): kAbort signals CandidatePipeline aborted (e.g. prefer_local
     // with on_miss=abort missed). kOk -> nodes is the surviving candidate
     // ordering (may be empty, meaning "no preference").
     enum class Status {

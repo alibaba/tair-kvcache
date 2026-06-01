@@ -109,6 +109,51 @@ TEST_F(SelectLocationPolicyTest, TestStaticWeightSLPolicySelectForMatch) {
     }
 }
 
+// With replicas the same type may have multiple locs. Type weight must use max
+// (not sum over locs), otherwise "1 mempool + 1 3fs" 50/50 shifts to 75/25.
+// Verify NFS(weight=5) + 3FS(weight=3) ratio stays 5:3 regardless of loc count.
+TEST_F(SelectLocationPolicyTest, BackendDedupByHostname) {
+    StaticWeightSLPolicy policy;
+    constexpr int kIters = 2000;
+
+    auto count_nfs = [&](CacheLocationMap &m) {
+        int nfs = 0;
+        for (int i = 0; i < kIters; ++i) {
+            auto loc = policy.SelectForMatch(m, dummy_check_loc_data_exist, dummy_loc_ids);
+            if (loc->type() == D_NFS) {
+                ++nfs;
+            }
+        }
+        return nfs;
+    };
+
+    // Case 1: 同一 backend 的多个副本（hostname 相同）应去重，比例不变
+    {
+        auto baseline = GenLocationMap({{CLS_SERVING, D_NFS, "nfs_01"}, {CLS_SERVING, D_3FS, "3fs_01"}});
+        auto with_replicas = GenLocationMap({{CLS_SERVING, D_NFS, "nfs_01"},
+                                              {CLS_SERVING, D_3FS, "3fs_01"},
+                                              {CLS_SERVING, D_3FS, "3fs_01"},
+                                              {CLS_SERVING, D_3FS, "3fs_01"}});
+        int baseline_nfs = count_nfs(baseline);
+        int replicas_nfs = count_nfs(with_replicas);
+        EXPECT_GE(baseline_nfs, 1000);
+        EXPECT_LE(baseline_nfs, 1500);
+        EXPECT_NEAR(replicas_nfs, baseline_nfs, 0.10 * kIters);
+    }
+
+    // Case 2: 不同 backend（hostname 不同）不去重，各自贡献权重
+    {
+        auto m = GenLocationMap({{CLS_SERVING, D_NFS, "nfs_01"},
+                                  {CLS_SERVING, D_3FS, "3fs_01"},
+                                  {CLS_SERVING, D_3FS, "3fs_02"},
+                                  {CLS_SERVING, D_3FS, "3fs_03"}});
+        int nfs = count_nfs(m);
+        // NFS=5, 3FS×3=9, 期望 NFS ≈ 5/14 ≈ 714
+        EXPECT_GE(nfs, 500);
+        EXPECT_LE(nfs, 950);
+    }
+}
+
 TEST_F(SelectLocationPolicyTest, TestStaticWeightSLPolicySelectForMatchWithStaleCheck) {
     StaticWeightSLPolicy policy;
     // (a) all CLS_SERVING stale ->
