@@ -1,7 +1,10 @@
 #pragma once
+#include <cstdint>
 #include <memory>
+#include <queue>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "kv_cache_manager/optimizer/analysis/stats_collector.h"
 #include "kv_cache_manager/optimizer/config/optimizer_config.h"
@@ -32,7 +35,27 @@ public:
     void HandleWriteCache(const WriteCacheSchemaTrace &trace);
 
 private:
+    struct PendingWrite {
+        int64_t timestamp_ns = 0;
+        uint64_t sequence = 0;
+        WriteCacheSchemaTrace trace;
+    };
+
+    struct PendingWriteCompare {
+        bool operator()(const PendingWrite &lhs, const PendingWrite &rhs) const {
+            if (lhs.timestamp_ns != rhs.timestamp_ns) {
+                return lhs.timestamp_ns > rhs.timestamp_ns;
+            }
+            return lhs.sequence > rhs.sequence;
+        }
+    };
+
     std::shared_ptr<RadixTreeIndex> GetIndexer(const std::string &instance_id);
+    void HandleRequest(const RequestSchemaTrace &trace);
+    void ScheduleRequestWrite(const RequestSchemaTrace &trace);
+    void FlushPendingWritesThrough(int64_t timestamp_ns);
+    void FlushAllPendingWrites();
+    void RunPendingWrite(const WriteCacheSchemaTrace &trace);
     void SubmitReadRecord(const std::string &instance_id,
                           const std::string &trace_id,
                           const std::vector<int64_t> &keys,
@@ -49,5 +72,8 @@ private:
     std::shared_ptr<StatsCollector> stats_collector_;
     std::unordered_map<std::string, bool> instance_group_ttl_disabled_;
     std::unordered_map<std::string, bool> instance_ttl_refresh_on_read_;
+    int64_t write_delay_ns_ = 1;
+    uint64_t next_pending_write_sequence_ = 0;
+    std::priority_queue<PendingWrite, std::vector<PendingWrite>, PendingWriteCompare> pending_writes_;
 };
 } // namespace kv_cache_manager

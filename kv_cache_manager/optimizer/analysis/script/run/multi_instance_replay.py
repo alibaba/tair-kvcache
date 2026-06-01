@@ -120,6 +120,8 @@ def parse_args():
     ttl_group = parser.add_mutually_exclusive_group()
     ttl_group.add_argument("--ttl-refresh-on-read", dest="ttl_refresh_on_read", action="store_true", default=True)
     ttl_group.add_argument("--no-ttl-refresh-on-read", dest="ttl_refresh_on_read", action="store_false")
+    parser.add_argument("--write-delay-ns", type=int, default=1,
+                        help="Delay from request read timestamp to generated write timestamp for type=request traces")
 
     parser.add_argument("--aggregate-only", action="store_true",
                         help="Skip replay and aggregate existing hit_rates CSVs")
@@ -135,6 +137,8 @@ def parse_args():
         parser.error("one of --trace-dir or --trace-files is required")
     if args.selective_write_threshold <= 0:
         parser.error("--selective-write-threshold must be positive")
+    if args.write_delay_ns <= 0:
+        parser.error("--write-delay-ns must be positive")
     args.tier_flow_config = _parse_tier_flow_config_arg(parser, args.tier_flow_config)
     return args
 
@@ -404,7 +408,7 @@ def _inspect_optimizer_trace(trace_file: str) -> str:
 
             row_count += 1
             trace_type = obj.get("type")
-            if trace_type not in {"get", "write"}:
+            if trace_type not in {"get", "write", "request"}:
                 raise SystemExit(f"{trace_file}:{line_no} has invalid type={trace_type!r}")
             current_instance_id = obj.get("instance_id")
             if not isinstance(current_instance_id, str) or not current_instance_id:
@@ -418,9 +422,10 @@ def _inspect_optimizer_trace(trace_file: str) -> str:
                 )
             if "timestamp_ns" not in obj or type(obj["timestamp_ns"]) is not int:
                 raise SystemExit(f"{trace_file}:{line_no} must contain integer timestamp_ns")
-            if trace_type == "get":
+            if trace_type in {"get", "request"}:
                 if "input_len" not in obj or type(obj["input_len"]) is not int or obj["input_len"] <= 0:
-                    raise SystemExit(f"{trace_file}:{line_no} get trace must contain positive integer input_len")
+                    raise SystemExit(
+                        f"{trace_file}:{line_no} {trace_type} trace must contain positive integer input_len")
             keys = obj.get("keys")
             if not isinstance(keys, list):
                 raise SystemExit(f"{trace_file}:{line_no} must contain keys array")
@@ -464,6 +469,9 @@ def _make_single_instance_config(args, trace_file: str, output_dir: str, instanc
         "eviction_params": {
             "eviction_mode": args.eviction_mode,
             "eviction_batch_size_per_instance": args.eviction_batch_size,
+        },
+        "trace_replay": {
+            "write_delay_ns": args.write_delay_ns,
         },
         "instance_groups": [
             {

@@ -31,7 +31,7 @@ KVCacheManager Optimizer 是一个独立的缓存优化分析模块，通过回�
 - **灵活配置**：通过 JSON 配置文件灵活配置实例、存储和策略
 - **可视化分析**：支持 Radix Tree 可视化和命中率图表生成
 
-标准策略配置、multi-instance replay、trace schema 和命中率口径见 [docs/strategy_config.md](docs/strategy_config.md)。标准版中 `HitRate` 统一表示整体 token hit rate，即 `HitTokens / InputTokens`；local/remote 只作为 trace `block_mask` 与 optimizer 模拟命中的诊断拆分，不作为标准结论维度。传入 optimizer config 的 Python 入口统一使用配置中的 `output_result_path`；`multi_instance_replay` 不读取完整 config，使用显式 `--output-dir`。标准 `get` trace 必须包含 `input_len`，其他来源日志需要先转换为 optimizer schema。
+标准策略配置、multi-instance replay、trace schema 和命中率口径见 [docs/strategy_config.md](docs/strategy_config.md)。标准版中 `HitRate` 统一表示整体 token hit rate，即 `HitTokens / InputTokens`；local/remote 只作为 trace `block_mask` 与 optimizer 模拟命中的诊断拆分，不作为标准结论维度。传入 optimizer config 的 Python 入口统一使用配置中的 `output_result_path`；`multi_instance_replay` 不读取完整 config，使用显式 `--output-dir`。标准 `get` trace 必须包含 `input_len`；外部只有请求级日志时可使用 `type=request`，optimizer 会按 `trace_replay.write_delay_ns` 在内部调度 delayed write；已经拆分好的 `get` / `write` trace 仍然支持。
 
 ### 架构设计
 

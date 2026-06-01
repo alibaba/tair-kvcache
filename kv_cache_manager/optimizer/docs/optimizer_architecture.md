@@ -404,6 +404,7 @@ struct BlockEntry {
 ```
 OptimizerSchemaTrace (基类)
     ├── GetLocationSchemaTrace (读操作)
+    ├── RequestSchemaTrace (请求级操作，内部调度读和延迟写)
     └── WriteCacheSchemaTrace (写操作)
 ```
 
@@ -419,7 +420,7 @@ OptimizerSchemaTrace (基类)
 3. 按时间戳排序 Trace
 4. 分配唯一 Trace ID
 
-标准 trace 只接受显式 `type=get/write` 的 JSONL。`get.keys` 只能包含完整 block key，不足一个 block 的尾部 token 不写入 `keys`，但仍通过 `input_len` 计入 token 命中率分母。缺少 `input_len`、时间戳非法、`keys` 超过 `input_len / block_size` 等输入会在回放前失败。
+标准 trace 接受显式 `type=get/write/request` 的 JSONL。`request` 用于外部只有请求级记录的场景，optimizer 会按 `trace_replay.write_delay_ns` 在内部调度 delayed write。`get/request.keys` 只能包含完整 block key，不足一个 block 的尾部 token 不写入 `keys`，但仍通过 `input_len` 计入 token 命中率分母。缺少 `input_len`、时间戳非法、`keys` 超过 `input_len / block_size` 等输入会在回放前失败。
 
 ---
 

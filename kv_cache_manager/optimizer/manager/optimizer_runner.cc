@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <limits>
 #include <stdexcept>
+#include <utility>
 #include <variant>
 
 #include "kv_cache_manager/common/logger.h"
@@ -34,6 +36,13 @@ size_t ValidateFullBlockTrace(const GetLocationSchemaTrace &trace, size_t block_
 } // namespace
 
 void OptimizerRunner::Run(OptimizerConfig &config) {
+    write_delay_ns_ = config.trace_replay_config().write_delay_ns();
+    if (write_delay_ns_ <= 0) {
+        throw std::runtime_error("trace_replay.write_delay_ns must be positive");
+    }
+    pending_writes_ = {};
+    next_pending_write_sequence_ = 0;
+
     auto starting_time = std::chrono::high_resolution_clock::now();
     auto traces = OptimizerLoader::LoadTrace(config);
     auto ending_time = std::chrono::high_resolution_clock::now();
@@ -49,9 +58,15 @@ void OptimizerRunner::Run(OptimizerConfig &config) {
 }
 
 void OptimizerRunner::RunTraces(const std::vector<std::shared_ptr<OptimizerSchemaTrace>> &traces) {
+    pending_writes_ = {};
+    next_pending_write_sequence_ = 0;
     for (const auto &trace : traces) {
+        if (trace) {
+            FlushPendingWritesThrough(trace->timestamp_ns());
+        }
         RunTrace(trace);
     }
+    FlushAllPendingWrites();
 }
 
 void OptimizerRunner::RunTrace(std::shared_ptr<OptimizerSchemaTrace> trace) {
@@ -59,7 +74,9 @@ void OptimizerRunner::RunTrace(std::shared_ptr<OptimizerSchemaTrace> trace) {
         return;
     }
 
-    if (auto get_trace = std::dynamic_pointer_cast<GetLocationSchemaTrace>(trace)) {
+    if (auto request_trace = std::dynamic_pointer_cast<RequestSchemaTrace>(trace)) {
+        HandleRequest(*request_trace);
+    } else if (auto get_trace = std::dynamic_pointer_cast<GetLocationSchemaTrace>(trace)) {
         if (get_trace->query_type() != "prefix_match") {
             KVCM_LOG_WARN("Unsupported query type: %s", get_trace->query_type().c_str());
             return;
@@ -80,6 +97,53 @@ std::shared_ptr<RadixTreeIndex> OptimizerRunner::GetIndexer(const std::string &i
         KVCM_LOG_ERROR("Optimizer indexer not found for instance_id: %s", instance_id.c_str());
     }
     return indexer;
+}
+
+void OptimizerRunner::HandleRequest(const RequestSchemaTrace &trace) {
+    if (trace.query_type() != "prefix_match") {
+        KVCM_LOG_WARN("Unsupported query type: %s", trace.query_type().c_str());
+        return;
+    }
+    HandleGetLocation(trace);
+    stats_collector_->UpdateTimestamp(trace.instance_id(), trace.timestamp_ns());
+    ScheduleRequestWrite(trace);
+}
+
+void OptimizerRunner::ScheduleRequestWrite(const RequestSchemaTrace &trace) {
+    if (trace.timestamp_ns() > std::numeric_limits<int64_t>::max() - write_delay_ns_) {
+        throw std::runtime_error("request write timestamp overflows int64: instance_id=" + trace.instance_id() +
+                                 ", trace_id=" + trace.trace_id());
+    }
+
+    WriteCacheSchemaTrace write_trace;
+    write_trace.set_instance_id(trace.instance_id());
+    write_trace.set_trace_id(trace.trace_id() + ":write");
+    write_trace.set_timestamp_ns(trace.timestamp_ns() + write_delay_ns_);
+    write_trace.set_keys(trace.keys());
+    write_trace.set_ttl_us(trace.ttl_us());
+    pending_writes_.push(
+        PendingWrite{write_trace.timestamp_ns(), next_pending_write_sequence_++, std::move(write_trace)});
+}
+
+void OptimizerRunner::FlushPendingWritesThrough(int64_t timestamp_ns) {
+    while (!pending_writes_.empty() && pending_writes_.top().timestamp_ns <= timestamp_ns) {
+        auto pending = pending_writes_.top();
+        pending_writes_.pop();
+        RunPendingWrite(pending.trace);
+    }
+}
+
+void OptimizerRunner::FlushAllPendingWrites() {
+    while (!pending_writes_.empty()) {
+        auto pending = pending_writes_.top();
+        pending_writes_.pop();
+        RunPendingWrite(pending.trace);
+    }
+}
+
+void OptimizerRunner::RunPendingWrite(const WriteCacheSchemaTrace &trace) {
+    HandleWriteCache(trace);
+    stats_collector_->UpdateTimestamp(trace.instance_id(), trace.timestamp_ns());
 }
 
 void OptimizerRunner::SubmitReadRecord(const std::string &instance_id,

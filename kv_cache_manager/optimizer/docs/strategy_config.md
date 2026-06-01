@@ -53,6 +53,9 @@ AccHitRate = AccHitTokens / AccInputTokens
     "eviction_mode": 3,
     "eviction_batch_size_per_instance": 100
   },
+  "trace_replay": {
+    "write_delay_ns": 1
+  },
   "instance_groups": []
 }
 ```
@@ -67,6 +70,12 @@ AccHitRate = AccHitTokens / AccInputTokens
 | `eviction_batch_size_per_instance` | int | 必填 | 每轮每实例最多驱逐的 block 数。rough 模式必须大于 0 |
 
 推荐标准实验使用 `eviction_mode=3`，因为它按剩余超额容量截断最后一轮驱逐，容量点更稳定。
+
+### trace_replay
+
+| 字段 | 类型 | 默认 | 说明 |
+|---|---:|---:|---|
+| `write_delay_ns` | int64 | `1` | `type=request` trace 的内部写入延迟。回放时先在 `timestamp_ns` 执行读，再在 `timestamp_ns + write_delay_ns` 调度写入。必须大于 0 |
 
 ## 标准 trace schema
 
@@ -97,6 +106,29 @@ Get trace：
 }
 ```
 
+Request trace：
+
+当外部 trace 只有请求级记录、没有显式拆成读写两行时，使用 `request`。它等价于：
+
+- 在 `timestamp_ns` 执行一次 `get`
+- 在 `timestamp_ns + trace_replay.write_delay_ns` 执行一次 `write`
+
+```json
+{
+  "type": "request",
+  "instance_id": "instance-a",
+  "trace_id": "trace_instance-a_1000",
+  "timestamp_ns": 1000,
+  "keys": [101, 102, 103],
+  "input_len": 33,
+  "query_type": "prefix_match",
+  "block_mask": [],
+  "sw_size": 0,
+  "location_spec_names": [],
+  "ttl_us": 0
+}
+```
+
 Write trace：
 
 ```json
@@ -114,7 +146,7 @@ Write trace：
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `type` | string | 只能是 `get` 或 `write` |
+| `type` | string | 只能是 `get`、`write` 或 `request` |
 | `instance_id` | string | 非空，必须匹配配置中的 instance |
 | `timestamp_ns` | int64 | ns 时间戳，必须为正整数；不再接受 `timestamp_us` |
 | `keys` | int64/uint64 array | block key 列表，可为空 |
@@ -141,13 +173,17 @@ Write trace：
 |---|---|---|---|
 | `ttl_us` | int64 | 0 | 请求级 TTL，单位微秒；`0` 使用 group 默认 TTL，`-1` 表示禁用 TTL |
 
+`request` 字段：
+
+`request` 复用 `get` 的所有字段，并额外支持 `write.ttl_us`。`request` 内部生成的写入会使用同一组 `keys` 和该 `ttl_us`。
+
 `write` 只读取 `type`、`instance_id`、`trace_id`、`timestamp_ns`、`keys` 和 `ttl_us`；其他字段包括 `input_len` 和 `block_mask` 都忽略。`block_mask` 只用于标记 trace 已经知道的本地命中 block，不是标准报告的分组依据。直接分析请求输入时通常可传空数组，此时整体 `HitRate` 仍按 `HitTokens / InputTokens` 计算。
 
 旧格式或不合法输入会失败，包括：
 
-- 缺少 `type`、`instance_id`、`timestamp_ns`、`keys`，或 `get` trace 缺少 `input_len`。
-- `get.input_len <= 0`、`timestamp_ns <= 0`，或 `keys` 不是数组。
-- `get.keys.size() > input_len / block_size`。标准 trace 的 `keys` 只能包含完整 block，不允许把不足一个 block 的尾部 key 写入 trace。
+- 缺少 `type`、`instance_id`、`timestamp_ns`、`keys`，或 `get` / `request` trace 缺少 `input_len`。
+- `get/request.input_len <= 0`、`timestamp_ns <= 0`，或 `keys` 不是数组。
+- `get/request.keys.size() > input_len / block_size`。标准 trace 的 `keys` 只能包含完整 block，不允许把不足一个 block 的尾部 key 写入 trace。
 - 使用 `timestamp_us` 但没有 `timestamp_ns`。
 - `keys` 中存在非整数。
 - `block_mask` 数组中存在非 bool 值，或 offset 为负数 / 超过 `INT64_MAX`。

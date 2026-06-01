@@ -55,5 +55,21 @@ class MultiInstanceReplayTest(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "must contain keys array"):
                 _inspect_optimizer_trace(str(trace_path))
 
+    def test_inspect_accepts_request_trace(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            trace_path = Path(temp_dir) / "instance_a.jsonl"
+            row = {
+                "type": "request",
+                "instance_id": "instance-a",
+                "trace_id": "request",
+                "timestamp_ns": 1000,
+                "keys": [1],
+                "input_len": 128,
+                "block_mask": [],
+            }
+            trace_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+            self.assertEqual(_inspect_optimizer_trace(str(trace_path)), "instance-a")
+
 if __name__ == "__main__":
     unittest.main()

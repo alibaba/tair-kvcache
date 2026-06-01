@@ -55,18 +55,26 @@ StandardTraceLoader::LoadFromFile(const std::string &trace_file_path) {
         if (!doc.HasMember("keys") || !doc["keys"].IsArray()) {
             fail("missing array field: keys");
         }
-        if (type_str == "get") {
+        if (type_str == "get" || type_str == "request") {
             if (!doc.HasMember("input_len")) {
                 fail("missing integer field: input_len");
             }
             if (!(doc["input_len"].IsInt64() || doc["input_len"].IsUint64())) {
                 fail("non-integer field: input_len");
             }
-            auto get_trace = std::make_shared<GetLocationSchemaTrace>();
-            if (!get_trace->FromJsonString(line)) {
-                fail("failed to parse get trace");
+            if (type_str == "request") {
+                auto request_trace = std::make_shared<RequestSchemaTrace>();
+                if (!request_trace->FromJsonString(line)) {
+                    fail("failed to parse request trace");
+                }
+                trace = request_trace;
+            } else {
+                auto get_trace = std::make_shared<GetLocationSchemaTrace>();
+                if (!get_trace->FromJsonString(line)) {
+                    fail("failed to parse get trace");
+                }
+                trace = get_trace;
             }
-            trace = get_trace;
         } else if (type_str == "write") {
             auto write_trace = std::make_shared<WriteCacheSchemaTrace>();
             if (!write_trace->FromJsonString(line)) {

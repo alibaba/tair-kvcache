@@ -224,4 +224,30 @@ public:
 private:
     int64_t ttl_us_ = 0; // 0 = 使用 group 默认, -1 = 禁用
 };
+
+// 外部只提供请求级 trace 时使用。回放时先执行读，再按 trace_replay.write_delay_ns 调度写。
+class RequestSchemaTrace : public GetLocationSchemaTrace {
+public:
+    int64_t ttl_us() const { return ttl_us_; }
+    void set_ttl_us(int64_t ttl_us) { ttl_us_ = ttl_us; }
+
+    bool FromRapidValue(const rapidjson::Value &rapid_value) override {
+        if (!GetLocationSchemaTrace::FromRapidValue(rapid_value)) {
+            return false;
+        }
+        ttl_us_ = 0;
+        if (rapid_value.HasMember("ttl_us") && !ParseOptimizerInt64(rapid_value["ttl_us"], ttl_us_)) {
+            return false;
+        }
+        return true;
+    }
+
+    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override {
+        GetLocationSchemaTrace::ToRapidWriter(writer);
+        Put(writer, "ttl_us", ttl_us_);
+    }
+
+private:
+    int64_t ttl_us_ = 0;
+};
 } // namespace kv_cache_manager
