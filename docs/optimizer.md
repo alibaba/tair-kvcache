@@ -29,7 +29,6 @@ bazel build //kv_cache_manager/optimizer:optimizer_main
 ```json
 {
     "trace_file_path": "/path/to/trace_file", // trace文件路径
-    "trace_type": "qwen_bailian", // trace类型，目前包含2种
     "output_result_path": "/path/to/output/result/", //输出文件路径
     "eviction_params": {
         "eviction_mode": 1, //驱逐模式，目前包含3种
@@ -40,13 +39,15 @@ bazel build //kv_cache_manager/optimizer:optimizer_main
             "group_name": "instance_group_01",
             "quota_capacity": 12000, //实例组容量配额
             "used_percentage": 1.0,  // quota可供使用百分比
-            "hierarchical_eviction_enabled": false, //开启多层存储，目前不可用
+            "ttl_config": {
+                "default_block_ttl_seconds": 0,
+                "refresh_on_read": true
+            },
             "storages": [ // 各层存储配置
                 {
                     "unique_name": "pace_00",
                     "storage_type": "pace",
                     "band_width_mbps": 20000,
-                    "priority": 0,
                     "capacity": 100000
                 }
             ],
@@ -66,9 +67,9 @@ bazel build //kv_cache_manager/optimizer:optimizer_main
 ```
 
 **可选配置项**：
-- `trace_type`: publisher_log, qwen_bailian
 - `eviction_mode`: 1=GROUP_ROUGH, 2=INSTANCE_ROUGH, 3=INSTANCE_PRECISE
 - `eviction_policy_type`: lru、random_lru、leaf_aware_lru、ttl
+- `tier_flows`: 多层时必填，按 `storages` 数组顺序配置相邻 tier edge；单层不配置
 
 ### TTL 时间语义说明
 

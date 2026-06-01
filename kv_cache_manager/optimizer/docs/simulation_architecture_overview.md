@@ -52,7 +52,7 @@ multi_infer_replay
   模拟多个推理实例各自的本地缓存，不接共享 L3。
 
 hierarchical_replay_main
-  同时模拟推理实例本地缓存和共享 L3 pool。
+  同时模拟推理实例本地缓存和共享 storage pool。
 ```
 
 其中 `hierarchical_replay_main` 是完整链路仿真的主入口。
@@ -63,7 +63,7 @@ hierarchical_replay_main
 
 ```text
 Inference Local Cache
-Shared L3 Pool
+Shared Storage Pool
 ```
 
 `Inference Local Cache` 表示推理实例本地缓存。一个推理实例可以包含多层本地缓存，例如：
@@ -75,7 +75,7 @@ L2 DRAM
 
 多个推理实例之间的本地缓存相互独立，各自维护缓存内容、访问时间和驱逐状态。
 
-`Shared L3 Pool` 表示 KVCM / L3 的共享缓存池。多个推理实例可以共同访问同一个 L3 pool，用来模拟跨推理实例的缓存复用。
+`Shared Storage Pool` 表示 KVCM / L3 的共享缓存池。多个推理实例可以共同访问同一个 storage pool，用来模拟跨推理实例的缓存复用。
 
 ### Analysis Output
 
@@ -84,7 +84,7 @@ L2 DRAM
 ```text
 全局端到端命中率
 每个推理实例的本地缓存命中率
-共享 L3 pool 的命中率
+共享 storage pool 的命中率
 各层容量变化
 block 生命周期
 ```
@@ -134,14 +134,14 @@ Trace
 
 ### 分层完整链路仿真
 
-该模式同时模拟推理实例本地缓存和共享 L3 pool，是完整链路分析入口。
+该模式同时模拟推理实例本地缓存和共享 storage pool，是完整链路分析入口。
 
 适合场景：
 
 ```text
-评估 engine-local + L3 pool 的整体收益
-比较不同 L1/L2/L3 流动策略
-分析 L3 池化对多个推理实例的全局影响
+评估 engine-local + storage pool 的整体收益
+比较推理本地层级和 storage pool 之间的流动策略
+分析 storage pool 池化对多个推理实例的全局影响
 ```
 
 架构图可以画成：
@@ -150,10 +150,10 @@ Trace
 Trace
   -> HierarchicalReplayManager
   -> Infer Cluster
-       -> Infer Instance A: L1 + L2
-       -> Infer Instance B: L1 + L2
-       -> Infer Instance N: L1 + L2
-  -> Shared L3 Pool
+       -> Infer Instance A: local tiers
+       -> Infer Instance B: local tiers
+       -> Infer Instance N: local tiers
+  -> Shared Storage Pool
   -> Combined Analysis Output
 ```
 
@@ -166,7 +166,7 @@ Trace
 ```text
 按时间顺序回放请求
 决定请求进入哪个推理实例
-编排本地缓存和 L3 pool 的读写路径
+编排本地缓存和 storage pool 的读写路径
 汇总 Local / Remote / Total 命中结果
 ```
 
@@ -179,11 +179,13 @@ Trace
 ```text
 Infer Cluster
   -> Infer Instance A
-       -> L1 HBM
-       -> L2 DRAM
+       -> HBM
+       -> DRAM
+       -> optional local tiers
   -> Infer Instance B
-       -> L1 HBM
-       -> L2 DRAM
+       -> HBM
+       -> DRAM
+       -> optional local tiers
 ```
 
 图中需要强调：
@@ -192,19 +194,19 @@ Infer Cluster
 推理实例之间本地缓存互相独立。
 ```
 
-### Shared L3 Pool
+### Shared Storage Pool
 
-`Shared L3 Pool` 表示 KVCM / L3 的共享池化缓存。多个推理实例可以访问同一个 L3 pool。
+`Shared Storage Pool` 表示 KVCM 的共享池化缓存。多个推理实例可以访问同一个 storage pool。
 
 图中需要强调：
 
 ```text
-L3 是多个推理实例共享的远端缓存层。
+Storage pool 是多个推理实例共享的远端缓存池。
 ```
 
-### KVCM / L3 组织结构
+### KVCM / Storage Pool 组织结构
 
-Optimizer 最初就是用来模拟 KVCM 的 L3 缓存管理行为。因此在 L3 这一侧，仿真结构沿用了 KVCM 原本的组织方式：
+Optimizer 最初就是用来模拟 KVCM 的缓存管理行为。因此在 storage pool 这一侧，仿真结构沿用了 KVCM 原本的组织方式：
 
 ```text
 OptimizerManager
@@ -215,62 +217,63 @@ OptimizerManager
        -> RadixTreeIndex
 ```
 
-这些概念在 L3 侧的含义如下。
+这些概念在 storage pool 侧的含义如下。
 
-`OptimizerManager` 表示一个完整的 KVCM / L3 管理器。它负责管理 L3 里的 instance、缓存索引、驱逐策略和统计输出。
+`OptimizerManager` 表示一个完整的 KVCM / storage pool 管理器。它负责管理 pool 里的 instance、缓存索引、驱逐策略和统计输出。
 
-`Instance Group` 表示一组共享配额和存储层级配置的 L3 实例集合。容量配额、存储层、层间策略和驱逐配置都挂在这个层级上。
+`Instance Group` 表示一组共享配额和存储层级配置的 storage pool 实例集合。容量配额、存储层、层间策略和驱逐配置都挂在这个层级上。
 
-`Instance` 是 KVCM 内部的缓存隔离单元。KV cache 只能在同一个 instance 内复用，不同 instance 之间不会互相命中。对于 L3 pool 场景，多个推理实例可以映射到同一个 L3 instance，从而形成共享池化；如果映射到不同 L3 instance，则它们在 L3 侧也是隔离的。
+`Instance` 是 KVCM 内部的缓存隔离单元。KV cache 只能在同一个 instance 内复用，不同 instance 之间不会互相命中。对于 storage pool 场景，多个推理实例可以映射到同一个 storage pool instance，从而形成共享池化；如果映射到不同 storage pool instance，则它们在 pool 侧也是隔离的。
 
-`Storage / Tier` 表示 L3 内部的存储层。最简单的 L3 pool 可以只有一层，例如一个共享的 L3 存储池；如果要模拟 L3 内部还有多层介质，也可以继续组织成多个 tier。
+`Storage / Tier` 表示 storage pool 内部的存储层。最简单的 storage pool 可以只有一层；如果要模拟 pool 内部还有多层介质，也可以继续组织成多个 tier。
 
-`RadixTreeIndex` 是 L3 内部的 block key 索引结构。读请求在 L3 侧会通过它做前缀匹配，写请求会把 block key 插入到对应 instance 的索引中。
+`RadixTreeIndex` 是 storage pool 内部的 block key 索引结构。读请求在 pool 侧会通过它做前缀匹配，写请求会把 block key 插入到对应 instance 的索引中。
 
-`Eviction Policy` 控制 L3 容量不足时如何驱逐，例如 LRU、RandomLRU、TTL 等。驱逐策略作用在 L3 instance 的缓存内容上。
+`Eviction Policy` 控制 storage pool 容量不足时如何驱逐，例如 LRU、RandomLRU、TTL 等。驱逐策略作用在 storage pool instance 的缓存内容上。
 
-因此，在完整链路图里，Shared L3 Pool 不只是一个抽象的大缓存，它内部可以展开成：
+因此，在完整链路图里，Shared Storage Pool 不只是一个抽象的大缓存，它内部可以展开成：
 
 ```text
-Shared L3 Pool
-  -> L3 OptimizerManager
-       -> L3 Instance Group
-            -> L3 Instance
+Shared Storage Pool
+  -> OptimizerManager
+       -> Instance Group
+            -> Storage Pool Instance
                  -> RadixTreeIndex
                  -> Eviction Policy
-            -> L3 Storage Tier
+            -> Storage / Tier
 ```
 
 对于最常见的全局池化仿真，可以画成：
 
 ```text
 Infer Instance A \
-Infer Instance B  -> same L3 Instance -> same L3 Storage Pool
+Infer Instance B  -> same Storage Pool Instance -> same Storage Pool
 Infer Instance N /
 ```
 
 这个结构表达的是：
 
 ```text
-多个推理实例本地缓存独立，但它们在远端共享同一个 KVCM / L3 instance。
+多个推理实例本地缓存独立，但它们在远端共享同一个 KVCM storage pool instance。
 ```
 
 如果需要表达多池隔离，也可以画成：
 
 ```text
-Infer Cluster A -> L3 Instance A
-Infer Cluster B -> L3 Instance B
+Infer Cluster A -> Storage Pool Instance A
+Infer Cluster B -> Storage Pool Instance B
 ```
 
-这表示不同集群在 L3 侧不会互相复用缓存。
+这表示不同集群在 storage pool 侧不会互相复用缓存。
 
 ### Tier Flow Policy
 
 `Tier Flow Policy` 是缓存层级之间的数据流动策略。它控制数据如何在以下边上流动：
 
 ```text
-L1 -> L2
-L2 -> L3
+本地 tier -> 本地 tier
+本地最后一层 -> storage pool
+storage pool tier -> storage pool tier
 ```
 
 架构图里可以把它画成连接缓存层级的策略框，而不是画成具体配置字段。
@@ -291,7 +294,7 @@ L2 -> L3
 ```text
 Request
   -> Infer Local Cache
-  -> Shared L3 Pool
+  -> Shared Storage Pool
   -> Optional Promote
   -> Hit Rate Record
 ```
@@ -301,19 +304,19 @@ Request
 ```text
 1. 请求先进入某个推理实例。
 2. 先查询推理实例本地缓存。
-3. 本地未命中的部分继续查询共享 L3 pool。
-4. 如果 L3 命中，可以根据策略选择是否提升回本地缓存。
-5. 最后记录本地命中、L3 命中和总命中。
+3. 本地未命中的部分继续查询共享 storage pool。
+4. 如果 storage pool 命中，可以根据策略选择是否提升回本地缓存。
+5. 最后记录本地命中、storage pool 命中和总命中。
 ```
 
 命中统计含义：
 
 ```text
 LocalHit
-  推理实例本地 L1 / L2 命中。
+  推理实例本地缓存命中。
 
 RemoteHit
-  共享 L3 pool 命中。
+  共享 storage pool 命中。
 
 TotalHit
   LocalHit + RemoteHit。
@@ -327,16 +330,16 @@ TotalHit
 Write Request
   -> Infer Local Cache
   -> Tier Flow Policy
-  -> Shared L3 Pool
+  -> Shared Storage Pool
 ```
 
 语义如下：
 
 ```text
 1. 写请求先进入推理实例本地缓存。
-2. 本地 L1 / L2 之间按策略流动。
-3. 本地缓存到 L3 pool 之间也按策略流动。
-4. L3 是否立即写入、延迟写入或只接收驱逐数据，由策略决定。
+2. 本地多层缓存之间按策略流动。
+3. 本地缓存到 storage pool 之间也按策略流动。
+4. Storage pool 是否立即写入、延迟写入或只接收驱逐数据，由策略决定。
 ```
 
 ## 输出视角
@@ -350,8 +353,8 @@ Combined Output
 Infer Output
   每个推理实例本地缓存的结果。
 
-L3 Pool Output
-  共享 L3 pool 的结果。
+Storage Pool Output
+  共享 storage pool 的结果。
 ```
 
 架构图中可以把输出画成：
@@ -360,7 +363,7 @@ L3 Pool Output
 Analysis Output
   -> Global Hit Rate
   -> Per Infer Instance Stats
-  -> L3 Pool Stats
+  -> Storage Pool Stats
   -> Lifecycle Analysis
 ```
 
@@ -375,16 +378,16 @@ Analysis 层用于把一次回放结果转成可比较的指标，判断缓存�
   端到端 TokenHitRate，以及 LocalHit / RemoteHit / TotalHit 的贡献拆分。
 
 容量占用分析
-  观察每个推理实例、L3 pool、每个 tier 的缓存占用随时间变化。
+  观察每个推理实例、storage pool、每个 tier 的缓存占用随时间变化。
 
 层间数据流动分析
-  统计 L1 -> L2、L2 -> L3、L3 -> L1/L2 promote 的数据流动量，用于评估写入放大、远端写入压力和层间策略成本。
+  统计本地层级之间、本地到 storage pool、storage pool promote 回本地的数据流动量，用于评估写入放大、远端写入压力和层间策略成本。
 
 扩缩容影响分析
-  比较推理实例数量、本地 HBM/DRAM 容量、L3 pool 容量变化后，对命中率、容量占用和层间流量的影响。
+  比较推理实例数量、本地 HBM/DRAM 容量、storage pool 容量变化后，对命中率、容量占用和层间流量的影响。
 
 池化收益分析
-  对比不接 L3、共享一个 L3 pool、多个 L3 pool 隔离等模式，评估 L3 池化带来的增益。
+  对比不接 storage pool、共享一个 storage pool、多个 storage pool 隔离等模式，评估 storage pool 池化带来的增益。
 
 策略对比分析
   对比 write_through、cascading、selective write、promote、access propagation 和不同驱逐策略的效果。
@@ -419,14 +422,14 @@ Analysis 层用于把一次回放结果转成可比较的指标，判断缓存�
 │                                         │
 │  ┌──────────────┐   ┌──────────────┐   │
 │  │ Infer Inst A │   │ Infer Inst B │   │
-│  │ L1 + L2      │   │ L1 + L2      │   │
+│  │ local tiers  │   │ local tiers  │   │
 │  └──────┬───────┘   └──────┬───────┘   │
 │         │                  │           │
 │         └────────┬─────────┘           │
 │                  v                     │
 │          ┌──────────────┐              │
-│          │ Shared L3    │              │
-│          │ Pool         │              │
+│          │ Shared       │              │
+│          │ Storage Pool │              │
 │          └──────────────┘              │
 └─────────────────┬──────────────────────┘
                   │
@@ -441,9 +444,9 @@ Analysis 层用于把一次回放结果转成可比较的指标，判断缓存�
 
 ```text
 Tier Flow Policy
-  controls data movement between L1, L2 and L3
+  controls data movement between local tiers and storage pool tiers
 ```
 
 ## 一句话总结
 
-Optimizer 通过离线回放标准 trace，模拟推理实例本地缓存和共享 L3 pool 在不同层级流动策略下的读写行为，最终输出端到端命中率、各层缓存状态和生命周期分析结果。
+Optimizer 通过离线回放标准 trace，模拟推理实例本地缓存和共享 storage pool 在不同层级流动策略下的读写行为，最终输出端到端命中率、各层缓存状态和生命周期分析结果。

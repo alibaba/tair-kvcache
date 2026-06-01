@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Optimizer Write Path Semantics</title>
+  <style>
+    body {
+      margin: 32px;
+      color: #172033;
+      background: #f7f8fb;
+      font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 24px;
+      line-height: 1.25;
+    }
+    .note {
+      margin: 0 0 20px;
+      color: #5b6475;
+    }
+    .section {
+      margin-top: 24px;
+    }
+    .wrap {
+      overflow-x: auto;
+      background: #fff;
+      border: 1px solid #d9deea;
+      border-radius: 8px;
+    }
+    table {
+      width: 100%;
+      min-width: 1160px;
+      border-collapse: collapse;
+    }
+    th,
+    td {
+      padding: 12px 14px;
+      border-bottom: 1px solid #e6e9f1;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      position: sticky;
+      top: 0;
+      color: #111827;
+      background: #eef2f8;
+      font-weight: 650;
+      white-space: nowrap;
+    }
+    tr:last-child td {
+      border-bottom: 0;
+    }
+    code {
+      padding: 1px 5px;
+      border-radius: 4px;
+      color: #0f3b75;
+      background: #eef5ff;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+    }
+    .phase {
+      font-weight: 650;
+      color: #0f172a;
+      white-space: nowrap;
+    }
+  </style>
+</head>
+<body>
+  <h1>Optimizer 写路径层间流动语义</h1>
+  <p class="note">
+    本表描述 write/insert、write touch、驱逐下沉、selective 下写，以及 hierarchical engine 到 storage pool 的写入流动。
+  </p>
+
+  <div class="wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>阶段</th>
+          <th>条件</th>
+          <th>状态更新</th>
+          <th>层间行为</th>
+          <th>统计/后续处理</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="phase">写前清理</td>
+          <td>每次 write 开始前</td>
+          <td>清理 TTL 过期 block 和空 location</td>
+          <td>只删除已过期数据</td>
+          <td>进入本次写入</td>
+        </tr>
+        <tr>
+          <td class="phase">写入新 block</td>
+          <td>radix tree 中不存在该 key，或该 block 已被完全驱逐</td>
+          <td>初始化 block <code>writing_time</code>、<code>last_access_time</code>、TTL；入口 tier 初始化 tier stat</td>
+          <td>按相邻 edge 的 <code>write_mode</code> 决定初始落哪些 tier</td>
+          <td>计入 newly inserted blocks，记录 block birth</td>
+        </tr>
+        <tr>
+          <td class="phase">write_through 初始写</td>
+          <td>相邻 edge <code>write_mode = write_through</code></td>
+          <td>入口 tier 是新写入；后续 tier 是 copy 语义，按当前时间初始化 tier stat</td>
+          <td>沿连续 write-through edge 写到所有经过的低层</td>
+          <td>每个落地 tier 注册到自己的 eviction policy</td>
+        </tr>
+        <tr>
+          <td class="phase">cascading 初始写</td>
+          <td>相邻 edge <code>write_mode = cascading</code></td>
+          <td>只在入口 tier 初始化写入状态</td>
+          <td>不在写入时落下一层；后续由容量驱逐触发下沉</td>
+          <td>低层没有副本时不会占用容量</td>
+        </tr>
+        <tr>
+          <td class="phase">write_through_selective 初始写</td>
+          <td>相邻 edge <code>write_mode = write_through_selective</code></td>
+          <td>只在入口 tier 初始化写入状态</td>
+          <td>不在初始写入时落下一层；后续由 write touch 阈值触发下写</td>
+          <td>下写阈值由 <code>selective_write_threshold</code> 控制</td>
+        </tr>
+        <tr>
+          <td class="phase">写命中已有 block</td>
+          <td>写入 key 已存在且仍有 location</td>
+          <td>block <code>last_access_time = now</code>；命中的已有 tier 执行 write touch</td>
+          <td>入口 tier 已有副本时 touch 入口 tier；入口 tier 不存在时重新写入入口 tier</td>
+          <td>计入 write hit，不计 newly inserted</td>
+        </tr>
+        <tr>
+          <td class="phase">write touch</td>
+          <td>某 tier 已有该 block，并且本次写路径触达该 tier</td>
+          <td>该 tier <code>last_access_time = now</code>，<code>write_touch_count += 1</code></td>
+          <td>刷新 eviction policy 中该 tier 的冷热位置</td>
+          <td>write touch 不改变 <code>writing_time</code></td>
+        </tr>
+        <tr>
+          <td class="phase">向下 write propagation</td>
+          <td>低层已有副本，且相邻 edge 的 <code>write_propagation_enabled = true</code></td>
+          <td>对所有连续可达的低层已有副本做 write touch</td>
+          <td>只 touch 已有副本，不创建低层新副本</td>
+          <td>某条 edge 关闭后，更低层也不再传播</td>
+        </tr>
+        <tr>
+          <td class="phase">selective 下写</td>
+          <td>某 tier 的 <code>write_touch_count &gt;= selective_write_threshold</code>，且该 edge 是 selective</td>
+          <td>被复制到下一层的 tier 使用当前时间初始化，<code>write_touch_count = 1</code></td>
+          <td>复制到下一层；若后续 edge 是 write-through，则继续写穿到连续低层</td>
+          <td>由 write touch 触发，不由 read 触发</td>
+        </tr>
+        <tr>
+          <td class="phase">写后容量检查</td>
+          <td>本次 write/下写结束后</td>
+          <td>驱逐策略按各 tier 当前冷热选择 victim</td>
+          <td>分层模式按 tier 顺序从高层到低层检查容量</td>
+          <td>驱逐出的路径进入 eviction bookkeeping</td>
+        </tr>
+        <tr>
+          <td class="phase">cascading 驱逐下沉</td>
+          <td>某 tier 发生容量驱逐，且到下一层 edge 是 cascading</td>
+          <td>下一层不存在该 block 时复制到下一层；已有则保持已有副本</td>
+          <td>下沉后若后续 edge 是 write-through，可继续写穿到连续低层</td>
+          <td>最后一层驱逐后 location 为空，才进入真正淘汰清理</td>
+        </tr>
+        <tr>
+          <td class="phase">写穿/ selective edge 上的驱逐</td>
+          <td>某 tier 发生容量驱逐，edge 不是 cascading</td>
+          <td>只删除被驱逐 tier 的 location</td>
+          <td>不做驱逐下沉</td>
+          <td>block 仍可能在其他 tier 存活</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 class="section">Hierarchical engine → storage pool</h2>
+  <div class="wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>storage_pool_flow.write_mode</th>
+          <th>engine 写入</th>
+          <th>storage pool 写入</th>
+          <th>storage pool 已有副本</th>
+          <th>说明</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="phase"><code>write_through</code></td>
+          <td>trace write 先写 engine</td>
+          <td>本次写入实际传到多层 engine 最后一层，或非分层 engine shared 层的 block 写入 storage pool；包含直接写穿和 engine 内部驱逐下沉到最后一层的 block</td>
+          <td><code>shadow_write_touch_enabled</code> 控制是否对 pool 已有副本做 write touch</td>
+          <td>用于模拟 engine 写入同时进入 pool 的场景</td>
+        </tr>
+        <tr>
+          <td class="phase"><code>cascading</code></td>
+          <td>trace write 只写 engine</td>
+          <td>engine 侧完全驱逐出去的 block 写入 storage pool</td>
+          <td>驱逐下沉写入 pool 时不做已有副本 touch</td>
+          <td>用于模拟 engine 本地缓存先承接，淘汰后再进入 pool</td>
+        </tr>
+        <tr>
+          <td class="phase"><code>write_through_selective</code></td>
+          <td>trace write 只写 engine</td>
+          <td>本次写入触达到 engine pool-source 层，且写触达次数达到阈值后，将对应 prefix 写入 storage pool</td>
+          <td><code>shadow_write_touch_enabled</code> 控制写入 pool 时已有副本是否 write touch</td>
+          <td>用于减少直接写入 pool 的放大，只让重复写触达的 block 进入 pool</td>
+        </tr>
+        <tr>
+          <td class="phase">pool 内部多层</td>
+          <td>engine 只决定哪些 keys 进入 pool 写路径</td>
+          <td>pool 内部按自己的 <code>tier_flows</code> 决定写穿、驱逐下沉和 selective</td>
+          <td>pool 内部已有副本的 write touch 仍由 pool 自己的写路径执行</td>
+          <td>engine → pool 的 flow 不替代 pool 内部多层 flow</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</body>
+</html>

@@ -230,7 +230,6 @@ OptimizerConfig (顶层配置)
                     "unique_name": "pace_00",
                     "storage_type": "pace",
                     "band_width_mbps": 20000,
-                    "priority": 0,
                     "capacity": 100000
                 }
             ],
@@ -449,16 +448,16 @@ struct ReadRecord {
 - `CachedBlocks` - 当前 CSV 对应 instance 的缓存 block 数
 - `CachedBlocksAllInstances` - 同一 optimizer 进程内所有 instance 的总缓存 block 数
 - `ReadBlocks` / `HitBlocks` - 当前请求读取和命中的 block 数
-- `LocalHitBlocks` / `RemoteHitBlocks` - engine 本地命中 / KVCM 或 L3 pool 命中 block 数
+- `LocalHitBlocks` / `RemoteHitBlocks` - engine 本地命中 / KVCM 或 storage pool 命中 block 数
 - `InputTokens` / `HitTokens` - 当前请求的输入 token 数和命中 token 数
 - `HitRate` - 当前 token 命中率，`HitTokens / InputTokens`
-- `LocalHitTokens` / `RemoteHitTokens` - engine 本地命中 / KVCM 或 L3 pool 命中 token 数
+- `LocalHitTokens` / `RemoteHitTokens` - engine 本地命中 / KVCM 或 storage pool 命中 token 数
 - `AccReadBlocks` / `AccHitBlocks` - 累计读取和命中的 block 数
 - `AccHitRate` - 累积 token 命中率，`AccHitTokens / AccInputTokens`
 - `AccLocalHitRate` / `AccRemoteHitRate` - 累计 local / remote token hit rate
 - `Tier<N>(name)_HitTokens` / `Tier<N>(name)_HitRate` / `AccTier<N>(name)_HitRate` - 分层命中 token 指标
 
-标准分析直接按请求输入计算整体 `HitRate`。`LocalHit*` / `RemoteHit*` 是组成拆分：在 KVCM/L3-only 模式下，local 来自 trace `block_mask`，remote 来自 KVCM/L3 模拟命中；在 hierarchical replay 中，local 来自 engine L1/L2，remote 来自 L3 pool。
+标准分析直接按请求输入计算整体 `HitRate`。`LocalHit*` / `RemoteHit*` 是组成拆分：在 KVCM/L3-only 模式下，local 来自 trace `block_mask`，remote 来自 KVCM/L3 模拟命中；在 hierarchical replay 中，local 来自推理实例本地缓存，remote 来自 storage pool。
 
 ---
 

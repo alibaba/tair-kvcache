@@ -162,7 +162,6 @@ bazel build //kv_cache_manager/optimizer:optimizer_main
                     "unique_name": "pace_00",
                     "storage_type": "pace",
                     "band_width_mbps": 20000,
-                    "priority": 0,
                     "capacity": 100000
                 }
             ],
@@ -368,14 +367,12 @@ python trace_converter.py \
                             "unique_name": "pace_00",
                             "storage_type": "pace",
                             "band_width_mbps": 20000,
-                            "priority": 0,
                             "capacity": 100000
                         },
                         {
                             "unique_name": "hf3fs_00",
                             "storage_type": "hf3fs",
                             "band_width_mbps": 20000,
-                            "priority": 1,
                             "capacity": 20000
                         }
                     ],
