@@ -1,8 +1,8 @@
-#include "kv_cache_manager/affinity/filter_cond.h"
+#include "kv_cache_manager/affinity/pipeline/filter_cond.h"
 
 #include <utility>
 
-#include "kv_cache_manager/affinity/metric_registry.h"
+#include "kv_cache_manager/affinity/pipeline/metric_catalog.h"
 
 namespace kv_cache_manager {
 
@@ -81,7 +81,7 @@ std::unique_ptr<FilterCond> ParseMetric(const rapidjson::Value &obj, std::string
         return nullptr;
     }
     std::string name = it->value.GetString();
-    if (!MetricRegistry::IsKnown(name)) {
+    if (!MetricCatalog::IsKnown(name)) {
         SetError(err, "filter.metric \"" + name + "\" is not a registered metric");
         return nullptr;
     }
@@ -195,7 +195,7 @@ bool MetricCond::Eval(const NodeMetrics *m) const {
     if (m == nullptr) {
         return true; // missing-metric => permissive
     }
-    auto v = MetricRegistry::Extract(metric_, *m);
+    auto v = MetricCatalog::Extract(metric_, *m);
     if (!v.has_value()) {
         return true;
     }

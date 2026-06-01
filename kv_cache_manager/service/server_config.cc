@@ -153,6 +153,16 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
      [](const std::string &value, ServerConfig *config) {
          config->prometheus_prefix_ = value;
          return true;
+     }},
+    {"kvcm.affinity.enabled",
+     [](const std::string &value, ServerConfig *config) {
+         config->affinity_enabled_ = value == "true";
+         return true;
+     }},
+    {"kvcm.affinity.strategy_file",
+     [](const std::string &value, ServerConfig *config) {
+         config->affinity_strategy_file_ = value;
+         return true;
      }}};
 // clang-format on
 

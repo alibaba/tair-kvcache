@@ -1,12 +1,12 @@
-#include "kv_cache_manager/affinity/metric_registry.h"
+#include "kv_cache_manager/affinity/pipeline/metric_catalog.h"
 
 namespace kv_cache_manager {
 
-bool MetricRegistry::IsKnown(const std::string &name) {
+bool MetricCatalog::IsKnown(const std::string &name) {
     return name == "free_bytes" || name == "load_ratio" || name == "rx_mbps" || name == "tx_mbps";
 }
 
-std::optional<double> MetricRegistry::Extract(const std::string &name, const NodeMetrics &node) {
+std::optional<double> MetricCatalog::Extract(const std::string &name, const NodeMetrics &node) {
     if (name == "free_bytes") {
         return static_cast<double>(node.free_bytes);
     }

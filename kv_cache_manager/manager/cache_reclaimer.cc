@@ -1,5 +1,8 @@
 #include "kv_cache_manager/manager/cache_reclaimer.h"
 
+#include "kv_cache_manager/affinity/affinity_strategy.h"
+#include "kv_cache_manager/affinity/cache_affinity_manager.h"
+
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -249,7 +252,8 @@ CacheReclaimer::CacheReclaimer(const std::size_t sampling_size_total,
                                std::shared_ptr<SchedulePlanExecutor> sched_plan_executor,
                                std::shared_ptr<MetricsRegistry> metrics_registry,
                                std::shared_ptr<EventManager> event_manager,
-                               std::shared_ptr<WriteLocationManager> write_location_manager)
+                               std::shared_ptr<WriteLocationManager> write_location_manager,
+                               std::shared_ptr<CacheAffinityManager> affinity_manager)
     : registry_manager_(std::move(registry_manager))
     , meta_indexer_manager_(std::move(meta_indexer_manager))
     , meta_searcher_manager_(std::move(meta_searcher_manager))
@@ -257,6 +261,7 @@ CacheReclaimer::CacheReclaimer(const std::size_t sampling_size_total,
     , metrics_registry_(std::move(metrics_registry))
     , event_manager_(std::move(event_manager))
     , write_location_manager_(std::move(write_location_manager))
+    , affinity_manager_(std::move(affinity_manager))
     , job_state_flag_(false)
     , pause_flag_(false)
     , sampling_size_(sampling_size_total)
@@ -544,16 +549,18 @@ CacheReclaimer::GetWaterLevelExceed(const RequestContext *request_context,
     return water_level_exceed;
 }
 
-bool CacheReclaimer::IsTriggerReclaiming(const std::shared_ptr<WaterLevelExceed> &water_level_exceed) {
-    if (water_level_exceed == nullptr || !water_level_exceed->CheckGroupWaterLevelExceed()) {
-        return false;
+bool CacheReclaimer::IsTriggerReclaiming(const std::shared_ptr<WaterLevelExceed> &water_level_exceed,
+                                         const std::unordered_set<std::string> &exceeded_node_ids) {
+    if (water_level_exceed != nullptr && water_level_exceed->CheckGroupWaterLevelExceed()) {
+        return true;
     }
-    return true;
+    return !exceeded_node_ids.empty();
 }
 
 void CacheReclaimer::ReclaimByLRU(const std::shared_ptr<RequestContext> &request_context,
                                   const InstanceInfoConstPtr &instance_info,
                                   const WaterLevelExceed &water_level_exceed,
+                                  const std::unordered_set<std::string> &exceeded_node_ids,
                                   const std::int32_t delay_before_delete_ms) noexcept {
     if (!IsRunning() || IsPaused()) {
         // fast exiting in the middle of one job round
@@ -608,7 +615,8 @@ void CacheReclaimer::ReclaimByLRU(const std::shared_ptr<RequestContext> &request
     //    are submitted to be deleted
     const std::int64_t begin_tp_filter = TimestampUtil::GetSteadyTimeUs();
     if (!FilterLocID(
-            request_context.get(), instance_info, request.block_keys, water_level_exceed, request.location_ids)) {
+            request_context.get(), instance_info, request.block_keys, water_level_exceed, exceeded_node_ids,
+            request.location_ids)) {
         LOG_WITH_ID(DEBUG, "filter location ID failed");
         return;
     }
@@ -627,6 +635,7 @@ void CacheReclaimer::ReclaimByLRU(const std::shared_ptr<RequestContext> &request
 void CacheReclaimer::ReclaimByLFU(const std::shared_ptr<RequestContext> &request_context,
                                   const InstanceInfoConstPtr &instance_info,
                                   const WaterLevelExceed &water_level_exceed,
+                                  const std::unordered_set<std::string> &exceeded_node_ids,
                                   const std::int32_t delay_before_delete_ms) noexcept {
     if (!IsRunning() || IsPaused()) {
         // fast exiting in the middle of one job round
@@ -635,12 +644,13 @@ void CacheReclaimer::ReclaimByLFU(const std::shared_ptr<RequestContext> &request
 
     // TODO: impl LFU policy
     LOG_WITH_TRACE(WARN, "LFU reclaim policy not supported yet; fall back to LRU policy");
-    ReclaimByLRU(request_context, instance_info, water_level_exceed, delay_before_delete_ms);
+    ReclaimByLRU(request_context, instance_info, water_level_exceed, exceeded_node_ids, delay_before_delete_ms);
 }
 
 void CacheReclaimer::ReclaimByTTL(const std::shared_ptr<RequestContext> &request_context,
                                   const InstanceInfoConstPtr &instance_info,
                                   const WaterLevelExceed &water_level_exceed,
+                                  const std::unordered_set<std::string> &exceeded_node_ids,
                                   const std::int32_t delay_before_delete_ms) noexcept {
     if (!IsRunning() || IsPaused()) {
         // fast exiting in the middle of one job round
@@ -649,7 +659,7 @@ void CacheReclaimer::ReclaimByTTL(const std::shared_ptr<RequestContext> &request
 
     // TODO: impl TTL policy
     LOG_WITH_TRACE(WARN, "TTL reclaim policy not supported yet; fall back to LRU policy");
-    ReclaimByLRU(request_context, instance_info, water_level_exceed, delay_before_delete_ms);
+    ReclaimByLRU(request_context, instance_info, water_level_exceed, exceeded_node_ids, delay_before_delete_ms);
 }
 
 void CacheReclaimer::ReclaimCron() noexcept {
@@ -919,6 +929,7 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
                                  const std::shared_ptr<const InstanceInfo> &instance_info,
                                  const std::vector<std::int64_t> &batch,
                                  const WaterLevelExceed &water_level_exceed,
+                                 const std::unordered_set<std::string> &exceeded_node_ids,
                                  std::vector<std::vector<std::string>> &out_loc_ids) const noexcept {
     const std::string &ins_id = instance_info->instance_id();
     const std::string &ins_gr = instance_info->instance_group_name();
@@ -964,23 +975,48 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
             const bool is_orphaned_writing = loc.status() == CacheLocationStatus::CLS_WRITING &&
                                              write_location_manager_ != nullptr &&
                                              !write_location_manager_->HasLocationId(loc.id());
-            if (loc.status() == CacheLocationStatus::CLS_SERVING || is_orphaned_writing) {
-                if (water_level_exceed.CheckStorageTypeWaterLevelExceed()) {
-                    // some storage type water level exceeded; only
-                    // collect the location with matched type but
-                    // fairness is ignored
-                    // TODO (rui): implement the fair eviction
-                    if (water_level_exceed.GetWaterLevelExceedByType(loc.type())) {
-                        loc_id_vec.emplace_back(loc.id());
+            if (loc.status() != CacheLocationStatus::CLS_SERVING && !is_orphaned_writing) {
+                continue;
+            }
+            bool matched = false;
+            // path 1: general quota exceeded → any loc is candidate
+            if (water_level_exceed.GetGeneralWaterLevelExceed()) {
+                matched = true;
+            }
+            // path 2: this loc's storage type exceeded
+            if (!matched && water_level_exceed.GetWaterLevelExceedByType(loc.type())) {
+                matched = true;
+            }
+            // path 3: exceeded_node_ids non-empty → only locs with spec on those nodes
+            if (!matched && !exceeded_node_ids.empty()) {
+                for (const auto &spec : loc.location_specs()) {
+                    if (exceeded_node_ids.count(spec.node_id())) {
+                        matched = true;
+                        break;
                     }
-                } else {
-                    // there's no storage type water level exceeded
-                    // and since the reclaiming is triggered, the total
-                    // usage water level must be exceeded; ignore the
-                    // type detection
-                    loc_id_vec.emplace_back(loc.id());
                 }
             }
+            if (!matched) {
+                continue;
+            }
+            // TODO: ReportEvictedBytes is called before SubmitDelReq, so if
+            // deletion partially fails the hysteresis accumulator will be too
+            // high (biased towards over-eviction). Acceptable for v1.
+            if (affinity_manager_ && !exceeded_node_ids.empty()) {
+                for (const auto &spec : loc.location_specs()) {
+                    if (exceeded_node_ids.count(spec.node_id())) {
+                        int64_t bytes_per_spec = 0;
+                        for (const auto &info : instance_info->location_spec_infos()) {
+                            if (info.name() == spec.name()) {
+                                bytes_per_spec = info.size();
+                                break;
+                            }
+                        }
+                        affinity_manager_->ReportEvictedBytes(spec.node_id(), bytes_per_spec);
+                    }
+                }
+            }
+            loc_id_vec.emplace_back(loc.id());
         }
         out_loc_ids.emplace_back(std::move(loc_id_vec));
     }
@@ -1163,7 +1199,19 @@ bool CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &re
     METRICS_(cache_reclaimer, reclaim_quota_duration_us) =
         static_cast<double>(TimestampUtil::GetSteadyTimeUs() - quota_begin_tp);
 
-    if (!IsTriggerReclaiming(water_level_exceed)) {
+    // Node-level eviction: get exceeded node IDs from affinity manager
+    std::unordered_set<std::string> exceeded_node_ids;
+    if (affinity_manager_) {
+        std::string group_json;
+        if (registry_manager_) {
+            group_json = registry_manager_->GetGroupAffinityStrategyJson(request_context.get(), ins_gr);
+        }
+        AffinityResolveContext resolve_ctx;
+        resolve_ctx.group_strategy_json = std::move(group_json);
+        exceeded_node_ids = affinity_manager_->ResolveEviction(resolve_ctx);
+    }
+
+    if (!IsTriggerReclaiming(water_level_exceed, exceeded_node_ids)) {
         LOG_WITH_GR(DEBUG, "instance group does not trigger reclaiming");
         return false;
     }
@@ -1176,7 +1224,8 @@ bool CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &re
         LOG_WITH_GR(DEBUG, "start to run the LRU reclaim policy");
         for (const auto &instance_info : instance_infos) {
             const std::int64_t begin_tp = TimestampUtil::GetSteadyTimeUs();
-            ReclaimByLRU(request_context, instance_info, *water_level_exceed, delay_before_delete_ms);
+            ReclaimByLRU(request_context, instance_info, *water_level_exceed, exceeded_node_ids,
+                         delay_before_delete_ms);
             METRICS_(cache_reclaimer, reclaim_job_duration_us) =
                 static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp);
         }
@@ -1186,7 +1235,8 @@ bool CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &re
         LOG_WITH_GR(DEBUG, "start to run the LFU reclaim policy");
         for (const auto &instance_info : instance_infos) {
             const std::int64_t begin_tp = TimestampUtil::GetSteadyTimeUs();
-            ReclaimByLFU(request_context, instance_info, *water_level_exceed, delay_before_delete_ms);
+            ReclaimByLFU(request_context, instance_info, *water_level_exceed, exceeded_node_ids,
+                         delay_before_delete_ms);
             METRICS_(cache_reclaimer, reclaim_job_duration_us) =
                 static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp);
         }
@@ -1196,7 +1246,8 @@ bool CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &re
         LOG_WITH_GR(DEBUG, "start to run the TTL reclaim policy");
         for (const auto &instance_info : instance_infos) {
             const std::int64_t begin_tp = TimestampUtil::GetSteadyTimeUs();
-            ReclaimByTTL(request_context, instance_info, *water_level_exceed, delay_before_delete_ms);
+            ReclaimByTTL(request_context, instance_info, *water_level_exceed, exceeded_node_ids,
+                         delay_before_delete_ms);
             METRICS_(cache_reclaimer, reclaim_job_duration_us) =
                 static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp);
         }
@@ -1209,7 +1260,8 @@ bool CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &re
     default:
         for (const auto &instance_info : instance_infos) {
             const std::int64_t begin_tp = TimestampUtil::GetSteadyTimeUs();
-            ReclaimByLRU(request_context, instance_info, *water_level_exceed, delay_before_delete_ms);
+            ReclaimByLRU(request_context, instance_info, *water_level_exceed, exceeded_node_ids,
+                         delay_before_delete_ms);
             METRICS_(cache_reclaimer, reclaim_job_duration_us) =
                 static_cast<double>(TimestampUtil::GetSteadyTimeUs() - begin_tp);
         }

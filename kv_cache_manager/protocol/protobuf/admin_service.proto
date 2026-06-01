@@ -297,6 +297,8 @@ message GetCacheMetaRequest {
 message LocationSpec {
     string name = 1; // 对应LocationSpecInfo中的name
     string uri = 2;
+    // Physical node this spec resides on. Empty = not reported.
+    string node_id = 3;
 }
 
 message CacheLocation {

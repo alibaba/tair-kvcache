@@ -42,6 +42,8 @@ cc_library(
         "write_hints.h",
     ],
     deps = [
+        # data_storage_backend.h references NodeMetrics (header-only, no circular dep)
+        "//kv_cache_manager/affinity:node_metrics",
         "//kv_cache_manager/common",
         "//kv_cache_manager/common:service_discovery",
         "//kv_cache_manager/common:standard_uri",

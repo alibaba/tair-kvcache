@@ -52,6 +52,9 @@ enum StorageType {
 message LocationSpec {
     string name = 1; // 对应LocationSpecInfo中的name
     string uri = 2;
+    // Storage node this spec resides on. Empty = backend not affinity-aware.
+    // Used by read path for local-preference and eviction for per-node load.
+    string node_id = 3;
 }
 
 message CacheLocation {
@@ -216,6 +219,14 @@ message GetCacheLocationRequest {
     BlockMask block_mask = 6; // 按前缀mask或者bool矩阵mask
     int32 sw_size = 7;        // slide window size, for QT_REVERSE_ROLL_SW_MATCH
     repeated string location_spec_names = 8; // 用于仅返回部分spec。不传则全返回。
+
+    // Caller's inference node IP. Used for local-preference in read path
+    // and replication trigger. Empty = old client / affinity not enabled.
+    string caller_node_ip = 9;
+
+    // Caller's super-node ID (self-reported). Used for hierarchical locality:
+    // same node (cheapest) > same supernode > remote. Empty = unknown.
+    string caller_supernode_id = 10;
 }
 
 message GetCacheLocationLenRequest {
@@ -227,9 +238,20 @@ message GetCacheLocationLenRequest {
     int32 sw_size = 6;        // slide window size, for QT_REVERSE_ROLL_SW_MATCH
 }
 
+// Replication hint: server tells the SDK that a block_key is frequently read
+// from a remote node and suggests creating a local replica asynchronously.
+// source_uri is the data source; target_node_id is the desired replica node.
+message ReplicationHint {
+    int64 block_key = 1;
+    string source_uri = 2;
+    string target_node_id = 3;
+}
+
 message GetCacheLocationResponse {
     CommonResponseHeader header = 1;
     repeated CacheLocation locations = 2; // 多个key的列表
+    // Replication hints from server. Old SDKs ignore unknown fields (proto3).
+    repeated ReplicationHint hints = 3;
 }
 
 message GetCacheLocationLenResponse {
@@ -271,6 +293,16 @@ message StartWriteCacheRequest {
     // (cache_affinity_manager + write_hints 路径)。空字符串 = 老客户端，
     // 退化为无亲和性的写放置（与未启用 affinity 行为完全一致）。
     string caller_node_ip = 7;
+
+    // Replication write flag.
+    //   false = normal write: global dedup via ExistsForWrite, strict=false
+    //   true  = replication write: dedup only on caller node, strict=true
+    // Server derives the strict parameter from this flag automatically.
+    bool is_replication = 8;
+
+    // Caller's super-node ID (self-reported). Same semantics as in
+    // GetCacheLocationRequest.caller_supernode_id.
+    string caller_supernode_id = 9;
 }
 
 message StartWriteCacheResponse {

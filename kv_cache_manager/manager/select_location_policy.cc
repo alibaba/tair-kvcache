@@ -1,6 +1,7 @@
 #include "select_location_policy.h"
 
 #include <random>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -49,6 +50,7 @@ CacheLocationConstPtr WeightSLPolicy::SelectForMatch(CacheLocationMap &location_
     serving_locations.reserve(location_map.size());
     weights.reserve(location_map.size());
     out_prune_loc_ids.clear();
+    std::set<std::pair<DataStorageType, std::string>> seen_backends;
     for (const auto &kv : location_map) {
         if (!kv.second) {
             continue;
@@ -56,6 +58,13 @@ CacheLocationConstPtr WeightSLPolicy::SelectForMatch(CacheLocationMap &location_
         if (kv.second->status() == CacheLocationStatus::CLS_SERVING) {
             if (check_loc_data_exist && !check_loc_data_exist(*kv.second)) {
                 out_prune_loc_ids.emplace_back(kv.first);
+                continue;
+            }
+            std::string host;
+            if (!kv.second->location_specs().empty()) {
+                host = std::string(ExtractHostName(kv.second->location_specs().front().uri()));
+            }
+            if (!seen_backends.emplace(kv.second->type(), std::move(host)).second) {
                 continue;
             }
             if (int32_t weight = GetWeight(kv); weight > 0) {

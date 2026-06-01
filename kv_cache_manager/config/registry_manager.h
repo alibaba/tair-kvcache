@@ -88,6 +88,9 @@ public:
     std::shared_ptr<DataStorageManager> data_storage_manager() const;
     std::string GetInstanceGroupName(const std::string &instance_id) const;
 
+    // Returns the per-group affinity strategy JSON (empty if not configured).
+    std::string GetGroupAffinityStrategyJson(RequestContext *request_context, const std::string &group_name);
+
 private:
     ErrorCode LoadAndSave(const std::string &key, const std::string &id, const Jsonizable *jsonizable);
     ErrorCode LoadAndDelete(const std::string &key, const std::string &id);

@@ -214,6 +214,7 @@ void ProtoConvert::CacheLocationViewToProto(const CacheLocationView &cache_locat
         auto *proto_spec = proto_cache_location->add_location_specs();
         proto_spec->set_name(location_spec.name());
         proto_spec->set_uri(location_spec.uri());
+        proto_spec->set_node_id(location_spec.node_id());
     }
 }
 // DONE
@@ -476,12 +477,14 @@ std::enable_if_t<std::is_same_v<T, proto::meta::LocationSpec> || std::is_same_v<
 ProtoConvert::LocationSpecToProto(const LocationSpec &location_spec_info, T *proto_location_spec) {
     proto_location_spec->set_name(location_spec_info.name());
     proto_location_spec->set_uri(location_spec_info.uri());
+    proto_location_spec->set_node_id(location_spec_info.node_id());
 }
 template <typename T>
 std::enable_if_t<std::is_same_v<T, proto::meta::LocationSpec> || std::is_same_v<T, proto::admin::LocationSpec>>
 ProtoConvert::LocationSpecFromProto(const T *proto_location_spec, LocationSpec &location_spec_info) {
     location_spec_info.set_name(proto_location_spec->name());
     location_spec_info.set_uri(proto_location_spec->uri());
+    location_spec_info.set_node_id(proto_location_spec->node_id());
 }
 template <typename T>
 std::enable_if_t<std::is_same_v<T, proto::meta::LocationSpec> || std::is_same_v<T, proto::admin::LocationSpec>>
