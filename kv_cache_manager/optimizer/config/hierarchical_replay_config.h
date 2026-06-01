@@ -9,51 +9,54 @@
 
 namespace kv_cache_manager {
 
-class L2L3StrategyConfig : public Jsonizable {
+class StoragePoolFlowConfig : public Jsonizable {
 public:
-    L2L3StrategyConfig() = default;
-    ~L2L3StrategyConfig() override = default;
+    StoragePoolFlowConfig() = default;
+    ~StoragePoolFlowConfig() override = default;
 
     bool FromRapidValue(const rapidjson::Value &rapid_value) override;
     void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
 
     [[nodiscard]] TierWriteMode write_mode() const { return write_mode_; }
-    [[nodiscard]] bool access_propagation_enabled() const { return access_propagation_enabled_; }
-    [[nodiscard]] bool write_propagation_enabled() const { return write_propagation_enabled_; }
+    [[nodiscard]] bool local_read_touch_enabled() const { return local_read_touch_enabled_; }
+    [[nodiscard]] bool shadow_write_touch_enabled() const { return shadow_write_touch_enabled_; }
     [[nodiscard]] bool promote_enabled() const { return promote_enabled_; }
     [[nodiscard]] size_t selective_write_threshold() const { return selective_write_threshold_; }
 
     void set_write_mode(TierWriteMode mode) { write_mode_ = mode; }
-    void set_access_propagation_enabled(bool enabled) { access_propagation_enabled_ = enabled; }
-    void set_write_propagation_enabled(bool enabled) { write_propagation_enabled_ = enabled; }
+    void set_local_read_touch_enabled(bool enabled) { local_read_touch_enabled_ = enabled; }
+    void set_shadow_write_touch_enabled(bool enabled) { shadow_write_touch_enabled_ = enabled; }
     void set_promote_enabled(bool enabled) { promote_enabled_ = enabled; }
     void set_selective_write_threshold(size_t threshold) { selective_write_threshold_ = threshold; }
 
 private:
     TierWriteMode write_mode_ = TierWriteMode::WRITE_THROUGH;
-    bool access_propagation_enabled_ = false;
-    bool write_propagation_enabled_ = false;
+    bool local_read_touch_enabled_ = false;
+    bool shadow_write_touch_enabled_ = false;
     bool promote_enabled_ = false;
     size_t selective_write_threshold_ = 2;
 };
 
-class EngineToPoolMappingConfig : public Jsonizable {
+class EngineToStoragePoolMappingConfig : public Jsonizable {
 public:
-    EngineToPoolMappingConfig() = default;
-    ~EngineToPoolMappingConfig() override = default;
+    EngineToStoragePoolMappingConfig() = default;
+    ~EngineToStoragePoolMappingConfig() override = default;
 
     bool FromRapidValue(const rapidjson::Value &rapid_value) override;
     void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
 
     [[nodiscard]] const std::string &engine_instance_id() const { return engine_instance_id_; }
-    [[nodiscard]] const std::string &pool_instance_id() const { return pool_instance_id_; }
+    [[nodiscard]] const std::string &storage_pool_instance_id() const { return storage_pool_instance_id_; }
+    [[nodiscard]] const StoragePoolFlowConfig &storage_pool_flow() const { return storage_pool_flow_; }
 
     void set_engine_instance_id(const std::string &instance_id) { engine_instance_id_ = instance_id; }
-    void set_pool_instance_id(const std::string &instance_id) { pool_instance_id_ = instance_id; }
+    void set_storage_pool_instance_id(const std::string &instance_id) { storage_pool_instance_id_ = instance_id; }
+    void set_storage_pool_flow(const StoragePoolFlowConfig &flow) { storage_pool_flow_ = flow; }
 
 private:
     std::string engine_instance_id_;
-    std::string pool_instance_id_;
+    std::string storage_pool_instance_id_;
+    StoragePoolFlowConfig storage_pool_flow_;
 };
 
 class HierarchicalModelConfig : public Jsonizable {
@@ -100,20 +103,22 @@ public:
     bool FromRapidValue(const rapidjson::Value &rapid_value) override;
     void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
 
-    [[nodiscard]] const std::string &pool_instance_id() const { return pool_instance_id_; }
+    [[nodiscard]] const std::string &storage_pool_instance_id() const { return storage_pool_instance_id_; }
     [[nodiscard]] const HierarchicalModelConfig &model() const { return model_; }
-    [[nodiscard]] const std::vector<std::string> &instance_ids() const { return instance_ids_; }
+    [[nodiscard]] const std::vector<std::string> &infer_ids() const { return infer_ids_; }
     [[nodiscard]] const OptTtlConfig &ttl_config() const { return ttl_config_; }
     [[nodiscard]] const std::vector<HierarchicalTierConfig> &tiers() const { return tiers_; }
     [[nodiscard]] const std::vector<OptTierFlowConfig> &tier_flows() const { return tier_flows_; }
+    [[nodiscard]] const StoragePoolFlowConfig &storage_pool_flow() const { return storage_pool_flow_; }
 
 private:
-    std::string pool_instance_id_;
+    std::string storage_pool_instance_id_;
     HierarchicalModelConfig model_;
-    std::vector<std::string> instance_ids_;
+    std::vector<std::string> infer_ids_;
     OptTtlConfig ttl_config_;
     std::vector<HierarchicalTierConfig> tiers_;
     std::vector<OptTierFlowConfig> tier_flows_;
+    StoragePoolFlowConfig storage_pool_flow_;
 };
 
 class HierarchicalReplayConfig : public Jsonizable {
@@ -127,20 +132,24 @@ public:
     [[nodiscard]] const std::string &trace_file_path() const { return trace_file_path_; }
     [[nodiscard]] const std::string &output_result_path() const { return output_result_path_; }
     [[nodiscard]] const OptimizerConfig &engine_config() const { return engine_config_; }
-    [[nodiscard]] const OptimizerConfig &pool_config() const { return pool_config_; }
-    [[nodiscard]] const std::vector<EngineToPoolMappingConfig> &engine_to_pool() const { return engine_to_pool_; }
+    [[nodiscard]] const OptimizerConfig &storage_pool_config() const { return storage_pool_config_; }
+    [[nodiscard]] const EvictionConfig &infer_eviction_config() const { return infer_eviction_config_; }
+    [[nodiscard]] const std::vector<EngineToStoragePoolMappingConfig> &engine_to_storage_pool() const {
+        return engine_to_storage_pool_;
+    }
     [[nodiscard]] const std::string &infer_scheduling_strategy() const { return infer_scheduling_strategy_; }
-    [[nodiscard]] const L2L3StrategyConfig &l2_l3_strategy() const { return l2_l3_strategy_; }
     [[nodiscard]] bool enable_lifecycle_tracking() const { return enable_lifecycle_tracking_; }
     [[nodiscard]] const std::vector<InferClusterConfig> &infer_clusters() const { return infer_clusters_; }
 
     void set_trace_file_path(const std::string &path) { trace_file_path_ = path; }
     void set_output_result_path(const std::string &path) { output_result_path_ = path; }
+    void set_infer_eviction_config(const EvictionConfig &config) { infer_eviction_config_ = config; }
     void set_engine_config(const OptimizerConfig &config) { engine_config_ = config; }
-    void set_pool_config(const OptimizerConfig &config) { pool_config_ = config; }
-    void set_engine_to_pool(const std::vector<EngineToPoolMappingConfig> &mapping) { engine_to_pool_ = mapping; }
+    void set_storage_pool_config(const OptimizerConfig &config) { storage_pool_config_ = config; }
+    void set_engine_to_storage_pool(const std::vector<EngineToStoragePoolMappingConfig> &mapping) {
+        engine_to_storage_pool_ = mapping;
+    }
     void set_infer_scheduling_strategy(const std::string &strategy) { infer_scheduling_strategy_ = strategy; }
-    void set_l2_l3_strategy(const L2L3StrategyConfig &strategy) { l2_l3_strategy_ = strategy; }
     void set_enable_lifecycle_tracking(bool enabled) { enable_lifecycle_tracking_ = enabled; }
 
 private:
@@ -148,12 +157,12 @@ private:
 
     std::string trace_file_path_;
     std::string output_result_path_;
+    EvictionConfig infer_eviction_config_;
     std::vector<InferClusterConfig> infer_clusters_;
     OptimizerConfig engine_config_;
-    OptimizerConfig pool_config_;
-    std::vector<EngineToPoolMappingConfig> engine_to_pool_;
+    OptimizerConfig storage_pool_config_;
+    std::vector<EngineToStoragePoolMappingConfig> engine_to_storage_pool_;
     std::string infer_scheduling_strategy_ = "preserve_trace";
-    L2L3StrategyConfig l2_l3_strategy_;
     bool enable_lifecycle_tracking_ = false;
 };
 

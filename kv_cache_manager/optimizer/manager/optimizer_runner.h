@@ -31,9 +31,12 @@ public:
     void RunTrace(std::shared_ptr<OptimizerSchemaTrace> trace);
 
 public:
-    void HandleGetLocation(const GetLocationSchemaTrace &trace, size_t access_start_offset = 0);
-    void TouchGetLocation(const std::string &instance_id, int64_t timestamp, const std::vector<int64_t> &block_ids);
-    WriteRecord HandleWriteCache(const WriteCacheSchemaTrace &trace, bool touch_existing = true);
+    void HandleGetLocation(const GetLocationSchemaTrace &trace,
+                           bool touch_local_hits = true,
+                           bool local_hits_are_reads = true);
+    WriteRecord HandleWriteCache(const WriteCacheSchemaTrace &trace,
+                                 bool touch_existing = true,
+                                 const std::vector<size_t> *materialized_indices = nullptr);
 
 private:
     struct PendingWrite {

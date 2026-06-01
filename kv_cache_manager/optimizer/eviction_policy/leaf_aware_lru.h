@@ -31,7 +31,7 @@ public:
 private:
     // NVI hook：外部统一通过基类 OnBlockAccessedWithOptions 入口调用。
     void OnBlockAccessed(BlockEntry *block, int64_t timestamp) override;
-    void insert_sorted_by_priority(LeafLRUListNode *node);
+    void insert_sorted_by_access_time(LeafLRUListNode *node);
     // 返回 true 表示真正处理了（是 data leaf 且插入了 blocks）
     bool UpdateNodeState(RadixTreeNode *node);
 };

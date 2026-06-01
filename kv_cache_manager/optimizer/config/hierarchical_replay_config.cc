@@ -6,7 +6,12 @@ namespace kv_cache_manager {
 namespace {
 
 constexpr double kBytesPerGb = static_cast<double>(1LL << 30);
-constexpr int32_t kDefaultEvictionBatchSizePerInstance = 100;
+
+struct JsonAccess : public Jsonizable {
+    using Jsonizable::Get;
+    using Jsonizable::Put;
+    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override { (void)writer; }
+};
 
 int64_t GbToBytes(double gb) { return static_cast<int64_t>(gb * kBytesPerGb); }
 
@@ -17,12 +22,11 @@ std::string JoinPath(const std::string &base, const std::string &name) {
     return base + "/" + name;
 }
 
-OptTierConfig BuildOptimizerTier(const std::string &name, double capacity, size_t priority) {
+OptTierConfig BuildOptimizerTier(const std::string &name, double capacity) {
     OptTierConfig tier;
     tier.set_unique_name(name);
     tier.set_storage_type(DataStorageType::DATA_STORAGE_TYPE_DUMMY);
     tier.set_band_width_mbps(0);
-    tier.set_priority(priority);
     tier.set_capacity(GbToBytes(capacity));
     return tier;
 }
@@ -40,16 +44,35 @@ OptInstanceConfig BuildOptimizerInstance(const std::string &instance_id,
     return instance;
 }
 
-EvictionConfig BuildDefaultEvictionConfig() {
+bool ParseStoragePoolConfig(const rapidjson::Value &rapid_value,
+                            const std::string &trace_file_path,
+                            OptimizerConfig &config) {
+    std::string output_result_path;
     EvictionConfig eviction_config;
-    eviction_config.set_eviction_mode(EvictionMode::EVICTION_MODE_GROUP_ROUGH);
-    eviction_config.set_eviction_batch_size_per_instance(kDefaultEvictionBatchSizePerInstance);
-    return eviction_config;
+    std::vector<OptInstanceGroupConfig> instance_groups;
+    if (!JsonAccess::Get(rapid_value, "output_result_path", output_result_path) ||
+        !JsonAccess::Get(rapid_value, "eviction_params", eviction_config) ||
+        !JsonAccess::Get(rapid_value, "instance_groups", instance_groups)) {
+        return false;
+    }
+    config.set_trace_file_path(trace_file_path);
+    config.set_output_result_path(output_result_path);
+    config.set_eviction_params(eviction_config);
+    config.set_instance_groups(instance_groups);
+    return true;
+}
+
+void WriteStoragePoolConfig(rapidjson::Writer<rapidjson::StringBuffer> &writer, const OptimizerConfig &config) {
+    writer.StartObject();
+    JsonAccess::Put(writer, "output_result_path", config.output_result_path());
+    JsonAccess::Put(writer, "eviction_params", config.eviction_config());
+    JsonAccess::Put(writer, "instance_groups", config.instance_groups());
+    writer.EndObject();
 }
 
 } // namespace
 
-bool L2L3StrategyConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
+bool StoragePoolFlowConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
     if (!rapid_value.IsObject()) {
         return false;
     }
@@ -60,8 +83,8 @@ bool L2L3StrategyConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
     }
     write_mode_ = ToTierWriteMode(write_mode_str);
 
-    KVCM_JSON_GET_MACRO(rapid_value, "access_propagation_enabled", access_propagation_enabled_);
-    KVCM_JSON_GET_MACRO(rapid_value, "write_propagation_enabled", write_propagation_enabled_);
+    KVCM_JSON_GET_MACRO(rapid_value, "local_read_touch_enabled", local_read_touch_enabled_);
+    KVCM_JSON_GET_MACRO(rapid_value, "shadow_write_touch_enabled", shadow_write_touch_enabled_);
     KVCM_JSON_GET_MACRO(rapid_value, "promote_enabled", promote_enabled_);
 
     int64_t threshold = 0;
@@ -73,23 +96,26 @@ bool L2L3StrategyConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
     return true;
 }
 
-void L2L3StrategyConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
+void StoragePoolFlowConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
     Put(writer, "write_mode", ToString(write_mode_));
-    Put(writer, "access_propagation_enabled", access_propagation_enabled_);
-    Put(writer, "write_propagation_enabled", write_propagation_enabled_);
+    Put(writer, "local_read_touch_enabled", local_read_touch_enabled_);
+    Put(writer, "shadow_write_touch_enabled", shadow_write_touch_enabled_);
     Put(writer, "promote_enabled", promote_enabled_);
     Put(writer, "selective_write_threshold", static_cast<int64_t>(selective_write_threshold_));
 }
 
-bool EngineToPoolMappingConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
+bool EngineToStoragePoolMappingConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
     KVCM_JSON_GET_MACRO(rapid_value, "engine_instance_id", engine_instance_id_);
-    KVCM_JSON_GET_MACRO(rapid_value, "pool_instance_id", pool_instance_id_);
-    return !engine_instance_id_.empty() && !pool_instance_id_.empty();
+    KVCM_JSON_GET_MACRO(rapid_value, "storage_pool_instance_id", storage_pool_instance_id_);
+    KVCM_JSON_GET_MACRO(rapid_value, "storage_pool_flow", storage_pool_flow_);
+    return !engine_instance_id_.empty() && !storage_pool_instance_id_.empty();
 }
 
-void EngineToPoolMappingConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
+void EngineToStoragePoolMappingConfig::ToRapidWriter(
+    rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
     Put(writer, "engine_instance_id", engine_instance_id_);
-    Put(writer, "pool_instance_id", pool_instance_id_);
+    Put(writer, "storage_pool_instance_id", storage_pool_instance_id_);
+    Put(writer, "storage_pool_flow", storage_pool_flow_);
 }
 
 bool HierarchicalModelConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
@@ -136,9 +162,6 @@ void HierarchicalModelConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringB
 }
 
 bool HierarchicalTierConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
-    if (rapid_value.HasMember("flow_to_next")) {
-        return false;
-    }
     KVCM_JSON_GET_MACRO(rapid_value, "name", name_);
     KVCM_JSON_GET_MACRO(rapid_value, "capacity", capacity_);
     return !name_.empty() && capacity_ > 0.0;
@@ -150,47 +173,43 @@ void HierarchicalTierConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBu
 }
 
 bool InferClusterConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
-    if (rapid_value.HasMember("tier_strategy") || rapid_value.HasMember("flow_to_pool") ||
-        rapid_value.HasMember("engine_instance_ids") || rapid_value.HasMember("default_block_ttl_seconds") ||
-        rapid_value.HasMember("ttl_refresh_on_read")) {
-        return false;
-    }
-    KVCM_JSON_GET_MACRO(rapid_value, "pool_instance_id", pool_instance_id_);
+    KVCM_JSON_GET_MACRO(rapid_value, "storage_pool_instance_id", storage_pool_instance_id_);
     KVCM_JSON_GET_MACRO(rapid_value, "model", model_);
-    KVCM_JSON_GET_MACRO(rapid_value, "instance_ids", instance_ids_);
+    KVCM_JSON_GET_MACRO(rapid_value, "infer_ids", infer_ids_);
     KVCM_JSON_GET_MACRO(rapid_value, "ttl_config", ttl_config_);
     KVCM_JSON_GET_MACRO(rapid_value, "tiers", tiers_);
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "tier_flows", tier_flows_, std::vector<OptTierFlowConfig>{});
-    return !pool_instance_id_.empty() && !instance_ids_.empty() && !tiers_.empty();
+    KVCM_JSON_GET_MACRO(rapid_value, "storage_pool_flow", storage_pool_flow_);
+    return !storage_pool_instance_id_.empty() && !infer_ids_.empty() && !tiers_.empty();
 }
 
 void InferClusterConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
-    Put(writer, "pool_instance_id", pool_instance_id_);
+    Put(writer, "storage_pool_instance_id", storage_pool_instance_id_);
     Put(writer, "model", model_);
-    Put(writer, "instance_ids", instance_ids_);
+    Put(writer, "infer_ids", infer_ids_);
     Put(writer, "ttl_config", ttl_config_);
     Put(writer, "tiers", tiers_);
     if (!tier_flows_.empty()) {
         Put(writer, "tier_flows", tier_flows_);
     }
+    Put(writer, "storage_pool_flow", storage_pool_flow_);
 }
 
 bool HierarchicalReplayConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
-    if (rapid_value.HasMember("engine_clusters") || rapid_value.HasMember("engine_scheduling_strategy") ||
-        rapid_value.HasMember("infer_instance_groups")) {
-        return false;
-    }
     KVCM_JSON_GET_MACRO(rapid_value, "trace_file_path", trace_file_path_);
     KVCM_JSON_GET_MACRO(rapid_value, "output_result_path", output_result_path_);
+    KVCM_JSON_GET_MACRO(rapid_value, "infer_eviction_params", infer_eviction_config_);
     KVCM_JSON_GET_MACRO(rapid_value, "infer_clusters", infer_clusters_);
-    KVCM_JSON_GET_MACRO(rapid_value, "pool_config", pool_config_);
+    if (!rapid_value.HasMember("storage_pool_config") ||
+        !ParseStoragePoolConfig(rapid_value["storage_pool_config"], trace_file_path_, storage_pool_config_)) {
+        return false;
+    }
     KVCM_JSON_GET_DEFAULT_MACRO(
         rapid_value, "infer_scheduling_strategy", infer_scheduling_strategy_, std::string("preserve_trace"));
     if (infer_scheduling_strategy_ != "preserve_trace" && infer_scheduling_strategy_ != "round_robin" &&
         infer_scheduling_strategy_ != "prefix_hit") {
         return false;
     }
-    KVCM_JSON_GET_MACRO(rapid_value, "l2_l3_strategy", l2_l3_strategy_);
     KVCM_JSON_GET_DEFAULT_MACRO(
         rapid_value, "enable_lifecycle_tracking", enable_lifecycle_tracking_, enable_lifecycle_tracking_);
     return !trace_file_path_.empty() && !output_result_path_.empty() && BuildOptimizerConfigs();
@@ -199,16 +218,17 @@ bool HierarchicalReplayConfig::FromRapidValue(const rapidjson::Value &rapid_valu
 void HierarchicalReplayConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
     Put(writer, "trace_file_path", trace_file_path_);
     Put(writer, "output_result_path", output_result_path_);
+    Put(writer, "infer_eviction_params", infer_eviction_config_);
     Put(writer, "infer_scheduling_strategy", infer_scheduling_strategy_);
-    Put(writer, "l2_l3_strategy", l2_l3_strategy_);
     Put(writer, "enable_lifecycle_tracking", enable_lifecycle_tracking_);
     Put(writer, "infer_clusters", infer_clusters_);
-    Put(writer, "pool_config", pool_config_);
+    writer.Key("storage_pool_config");
+    WriteStoragePoolConfig(writer, storage_pool_config_);
 }
 
 bool HierarchicalReplayConfig::BuildOptimizerConfigs() {
     std::unordered_set<std::string> pool_ids;
-    for (const auto &group : pool_config_.instance_groups()) {
+    for (const auto &group : storage_pool_config_.instance_groups()) {
         for (const auto &instance : group.instances()) {
             if (!pool_ids.insert(instance.instance_id()).second) {
                 return false;
@@ -222,13 +242,13 @@ bool HierarchicalReplayConfig::BuildOptimizerConfigs() {
     OptimizerConfig engine_config;
     engine_config.set_trace_file_path(trace_file_path_);
     engine_config.set_output_result_path(JoinPath(output_result_path_, "infer"));
-    engine_config.set_eviction_params(BuildDefaultEvictionConfig());
+    engine_config.set_eviction_params(infer_eviction_config_);
 
     std::vector<OptInstanceGroupConfig> engine_groups;
-    engine_to_pool_.clear();
+    engine_to_storage_pool_.clear();
     std::unordered_set<std::string> engine_ids;
     for (const auto &infer_group : infer_clusters_) {
-        if (pool_ids.find(infer_group.pool_instance_id()) == pool_ids.end()) {
+        if (pool_ids.find(infer_group.storage_pool_instance_id()) == pool_ids.end()) {
             return false;
         }
 
@@ -237,7 +257,7 @@ bool HierarchicalReplayConfig::BuildOptimizerConfigs() {
         double total_capacity = 0.0;
         for (size_t idx = 0; idx < infer_group.tiers().size(); ++idx) {
             const auto &tier = infer_group.tiers()[idx];
-            tiers.push_back(BuildOptimizerTier(tier.name(), tier.capacity(), idx));
+            tiers.push_back(BuildOptimizerTier(tier.name(), tier.capacity()));
             total_capacity += tier.capacity();
         }
         OptTierFlowPolicyConfig tier_flow_policy =
@@ -246,25 +266,26 @@ bool HierarchicalReplayConfig::BuildOptimizerConfigs() {
             return false;
         }
 
-        for (const auto &engine_instance_id : infer_group.instance_ids()) {
-            if (engine_instance_id.empty() || !engine_ids.insert(engine_instance_id).second) {
+        for (const auto &infer_id : infer_group.infer_ids()) {
+            if (infer_id.empty() || !engine_ids.insert(infer_id).second) {
                 return false;
             }
 
             OptInstanceGroupConfig group;
-            group.set_group_name(engine_instance_id);
+            group.set_group_name(infer_id);
             group.set_quota_capacity(GbToBytes(total_capacity));
             group.set_used_percentage(1.0);
             group.set_tier_flow_policy(tier_flow_policy);
             group.set_ttl_config(infer_group.ttl_config());
             group.set_storages(tiers);
-            group.set_instances({BuildOptimizerInstance(engine_instance_id, engine_instance_id, infer_group.model())});
+            group.set_instances({BuildOptimizerInstance(infer_id, infer_id, infer_group.model())});
             engine_groups.push_back(group);
 
-            EngineToPoolMappingConfig mapping;
-            mapping.set_engine_instance_id(engine_instance_id);
-            mapping.set_pool_instance_id(infer_group.pool_instance_id());
-            engine_to_pool_.push_back(mapping);
+            EngineToStoragePoolMappingConfig mapping;
+            mapping.set_engine_instance_id(infer_id);
+            mapping.set_storage_pool_instance_id(infer_group.storage_pool_instance_id());
+            mapping.set_storage_pool_flow(infer_group.storage_pool_flow());
+            engine_to_storage_pool_.push_back(mapping);
         }
     }
     if (engine_groups.empty()) {

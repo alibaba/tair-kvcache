@@ -7,6 +7,7 @@
 
 #include "kv_cache_manager/optimizer/config/hierarchical_replay_config.h"
 #include "kv_cache_manager/optimizer/config/insight_simulator_types.h"
+#include "kv_cache_manager/optimizer/manager/engine_storage_pool_connector.h"
 #include "kv_cache_manager/optimizer/manager/optimizer_manager.h"
 #include "kv_cache_manager/optimizer/trace_loader/optimizer_schema_trace.h"
 
@@ -15,7 +16,7 @@ namespace kv_cache_manager {
 struct HierarchicalGetCacheLocationRes {
     std::string trace_id;
     int64_t engine_hit_length = 0;
-    int64_t pool_hit_length = 0;
+    int64_t storage_pool_hit_length = 0;
     int64_t total_hit_length = 0;
 };
 
@@ -50,11 +51,11 @@ private:
     struct CombinedReadRecord {
         std::string trace_id;
         std::string engine_instance_id;
-        std::string pool_instance_id;
+        std::string storage_pool_instance_id;
         int64_t timestamp_ns = 0;
         size_t read_blocks = 0;
         size_t engine_hit_blocks = 0;
-        size_t pool_hit_blocks = 0;
+        size_t storage_pool_hit_blocks = 0;
         size_t input_tokens = 0;
         size_t block_size_tokens = 0;
     };
@@ -70,23 +71,19 @@ private:
     std::string
     ChoosePrefixHitEngineInstance(const std::vector<int64_t> &block_ids, int64_t timestamp, size_t request_idx) const;
     void ExportCombinedHitRates() const;
-    const std::string &PoolInstanceForEngine(const std::string &engine_instance_id) const;
-    void WriteL2L3Sequence(const std::string &pool_instance_id,
-                           const std::string &trace_id,
-                           int64_t timestamp,
-                           const std::vector<int64_t> &block_ids,
-                           int64_t ttl_us,
-                           bool touch_existing);
+    const std::string &StoragePoolInstanceForEngine(const std::string &engine_instance_id) const;
+    const StoragePoolFlowConfig &StoragePoolFlowForEngine(const std::string &engine_instance_id) const;
 
     HierarchicalReplayConfig config_;
     std::unique_ptr<OptimizerManager> engine_manager_;
-    std::unique_ptr<OptimizerManager> pool_manager_;
-    std::unordered_map<std::string, std::string> engine_to_pool_;
+    std::unique_ptr<OptimizerManager> storage_pool_manager_;
+    std::unique_ptr<EngineStoragePoolConnector> engine_storage_pool_connector_;
+    std::unordered_map<std::string, std::string> engine_to_storage_pool_;
+    std::unordered_map<std::string, StoragePoolFlowConfig> engine_storage_pool_flow_;
     std::unordered_map<std::string, size_t> engine_block_size_;
     std::vector<std::string> sorted_engine_instance_ids_;
     std::vector<CombinedReadRecord> combined_read_records_;
     std::vector<CombinedWriteRecord> combined_write_records_;
-    std::unordered_map<std::string, std::unordered_map<int64_t, size_t>> l2_l3_access_counts_;
 };
 
 } // namespace kv_cache_manager

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -26,7 +28,7 @@ enum class EvictionMode {
 enum class TierWriteMode {
     WRITE_THROUGH = 0,           // 默认：写入时落所有 tier，各层独立驱逐
     CASCADING = 1,               // 只写 tier 0，tier_i 驱逐出的 block 级联降级到 tier_{i+1}
-    WRITE_THROUGH_SELECTIVE = 2, // 初始只写 tier 0，命中热度达到阈值后复制到下一层
+    WRITE_THROUGH_SELECTIVE = 2, // 初始只写 tier 0，写 touch 次数达到阈值后复制到下一层
 };
 struct TierFlowStrategy {
     TierWriteMode write_mode = TierWriteMode::WRITE_THROUGH;
@@ -37,8 +39,9 @@ struct TierFlowStrategy {
 };
 struct TierStat {
     size_t access_count = 0;
-    int64_t last_access_time = -1;
-    int64_t writing_time = -1;
+    int64_t last_access_time = -1; // 该 tier 副本最近一次 read/touch 时间
+    int64_t writing_time = -1;     // 该 tier 副本进入本层的时间
+    size_t write_touch_count = 0;
 };
 using LocationStatMap = std::unordered_map<std::string, TierStat>;
 
@@ -98,7 +101,12 @@ struct RadixTreeNode {
 struct QueryHit {
     size_t local_hit_block_num = 0;
     size_t remote_hit_block_num = 0;
-    std::vector<size_t> per_tier_hit_block_num; // indexed by tier priority order
+    std::vector<size_t> per_tier_hit_block_num; // indexed by tier order
+};
+
+struct MaterializedKeySequence {
+    std::vector<int64_t> keys;
+    std::vector<size_t> materialized_indices;
 };
 
 EvictionPolicyType ToEvictionPolicyType(const std::string &str);

@@ -72,7 +72,6 @@ std::vector<OptTierConfig> OptIndexerManagerTest::CreateTestTierConfigs() {
     tier1.set_capacity(1024 * 1024 * 10); // 10MB
     tier1.set_storage_type(DataStorageType::DATA_STORAGE_TYPE_HF3FS);
     tier1.set_band_width_mbps(1000);
-    tier1.set_priority(1);
     configs.push_back(tier1);
 
     return configs;
@@ -90,7 +89,6 @@ OptInstanceGroupConfig OptIndexerManagerTest::CreateTestInstanceGroupConfig() {
     tier1.set_capacity(1024 * 1024 * 10);
     tier1.set_storage_type(DataStorageType::DATA_STORAGE_TYPE_HF3FS);
     tier1.set_band_width_mbps(1000);
-    tier1.set_priority(1);
     config.set_storages({tier1});
 
     return config;
@@ -194,7 +192,7 @@ TEST_F(OptIndexerManagerTest, CheckAndEvict) {
 
     // 检查并触发驱逐，传入测试时间戳
     auto evicted_blocks = indexer_manager_->CheckAndEvict("instance1");
-    indexer_manager_->CleanEvictedBlocks(evicted_blocks, 1000);
+    indexer_manager_->CleanEvictedBlocks(evicted_blocks.evicted_blocks, 1000);
 
     // 不应该崩溃
     SUCCEED();
@@ -258,7 +256,7 @@ TEST_F(OptIndexerManagerTest, RegisterInstanceGroupsAndInstances) {
 TEST_F(OptIndexerManagerTest, CheckAndEvictNonExistentInstance) {
     // 检查不存在的实例
     auto evicted_blocks = indexer_manager_->CheckAndEvict("non_existent_instance");
-    indexer_manager_->CleanEvictedBlocks(evicted_blocks, 1000);
+    indexer_manager_->CleanEvictedBlocks(evicted_blocks.evicted_blocks, 1000);
 
     // 不应该崩溃
     SUCCEED();

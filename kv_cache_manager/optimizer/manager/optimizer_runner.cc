@@ -194,7 +194,9 @@ void OptimizerRunner::SubmitReadRecord(const std::string &instance_id,
     stats_collector_->OnReadComplete(instance_id, record);
 }
 
-void OptimizerRunner::HandleGetLocation(const GetLocationSchemaTrace &trace, size_t access_start_offset) {
+void OptimizerRunner::HandleGetLocation(const GetLocationSchemaTrace &trace,
+                                        bool touch_local_hits,
+                                        bool local_hits_are_reads) {
     std::string instance_id = trace.instance_id();
     auto indexer = GetIndexer(instance_id);
     if (!indexer) {
@@ -215,28 +217,30 @@ void OptimizerRunner::HandleGetLocation(const GetLocationSchemaTrace &trace, siz
     }
 
     QueryHit query_hit;
-    const size_t read_start_offset = std::min(access_start_offset, trace.keys().size());
-    indexer->PrefixQuery(
-        trace.keys(), trace.block_mask(), trace.timestamp_ns(), &query_hit, refresh_ttl_on_read, read_start_offset);
+    indexer->PrefixQuery(trace.keys(),
+                         trace.block_mask(),
+                         trace.timestamp_ns(),
+                         &query_hit,
+                         refresh_ttl_on_read,
+                         touch_local_hits,
+                         local_hits_are_reads);
     if (indexer->ConsumeReadTriggeredTierWrite()) {
-        auto capacity_evicted_blocks = indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_ns());
-        indexer_manager_->CleanEvictedBlocks(capacity_evicted_blocks, trace.timestamp_ns());
+        auto capacity_eviction = indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_ns());
+        indexer_manager_->CleanEvictedBlocks(capacity_eviction.evicted_blocks, trace.timestamp_ns());
     }
 
     size_t local_read_block_num = 0;
     size_t remote_read_block_num = trace.keys().size();
-    if (read_start_offset > 0) {
-        remote_read_block_num -= read_start_offset;
-    } else {
-        if (std::holds_alternative<BlockMaskVector>(trace.block_mask())) {
-            const auto &mask_vector = std::get<BlockMaskVector>(trace.block_mask());
-            const size_t n = std::min(mask_vector.size(), trace.keys().size());
-            local_read_block_num = std::count(mask_vector.begin(), mask_vector.begin() + n, true);
-        } else if (std::holds_alternative<BlockMaskOffset>(trace.block_mask())) {
-            local_read_block_num = std::min(std::get<BlockMaskOffset>(trace.block_mask()), trace.keys().size());
-        }
-        remote_read_block_num = trace.keys().size() - local_read_block_num;
+    size_t local_mask_block_num = 0;
+    if (std::holds_alternative<BlockMaskVector>(trace.block_mask())) {
+        const auto &mask_vector = std::get<BlockMaskVector>(trace.block_mask());
+        const size_t n = std::min(mask_vector.size(), trace.keys().size());
+        local_mask_block_num = std::count(mask_vector.begin(), mask_vector.begin() + n, true);
+    } else if (std::holds_alternative<BlockMaskOffset>(trace.block_mask())) {
+        local_mask_block_num = std::min(std::get<BlockMaskOffset>(trace.block_mask()), trace.keys().size());
     }
+    local_read_block_num = local_hits_are_reads ? local_mask_block_num : 0;
+    remote_read_block_num = trace.keys().size() - local_mask_block_num;
 
     SubmitReadRecord(instance_id,
                      trace.trace_id(),
@@ -250,33 +254,9 @@ void OptimizerRunner::HandleGetLocation(const GetLocationSchemaTrace &trace, siz
                      block_size);
 }
 
-void OptimizerRunner::TouchGetLocation(const std::string &instance_id,
-                                       int64_t timestamp,
-                                       const std::vector<int64_t> &block_ids) {
-    if (block_ids.empty()) {
-        return;
-    }
-    auto indexer = GetIndexer(instance_id);
-    if (!indexer) {
-        return;
-    }
-
-    auto expired_evicted_blocks = indexer_manager_->EvictExpiredBeforeAccess(instance_id, timestamp);
-    indexer_manager_->CleanEvictedBlocks(expired_evicted_blocks, timestamp, true);
-
-    bool refresh_ttl_on_read = true;
-    auto it = instance_ttl_refresh_on_read_.find(instance_id);
-    if (it != instance_ttl_refresh_on_read_.end()) {
-        refresh_ttl_on_read = it->second;
-    }
-    indexer->PrefixQuery(block_ids, BlockMaskVector{}, timestamp, nullptr, refresh_ttl_on_read);
-    if (indexer->ConsumeReadTriggeredTierWrite()) {
-        auto capacity_evicted_blocks = indexer_manager_->CheckAndEvict(instance_id, timestamp);
-        indexer_manager_->CleanEvictedBlocks(capacity_evicted_blocks, timestamp);
-    }
-}
-
-WriteRecord OptimizerRunner::HandleWriteCache(const WriteCacheSchemaTrace &trace, bool touch_existing) {
+WriteRecord OptimizerRunner::HandleWriteCache(const WriteCacheSchemaTrace &trace,
+                                              bool touch_existing,
+                                              const std::vector<size_t> *materialized_indices) {
     WriteRecord record;
     record.timestamp_ns = trace.timestamp_ns();
     record.trace_id = trace.trace_id();
@@ -297,15 +277,35 @@ WriteRecord OptimizerRunner::HandleWriteCache(const WriteCacheSchemaTrace &trace
         effective_ttl_ns = -1;
     }
 
-    auto result = indexer->InsertOnly(trace.keys(), trace.timestamp_ns(), effective_ttl_ns, touch_existing);
-    auto capacity_evicted_blocks = indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_ns());
-    std::set<std::vector<int64_t>> evicted_paths;
+    RadixTreeIndex::InsertResult result;
+    if (materialized_indices) {
+        result = indexer->InsertOnlyMaterialized(
+            trace.keys(), *materialized_indices, trace.timestamp_ns(), effective_ttl_ns, touch_existing);
+    } else {
+        result = indexer->InsertOnly(trace.keys(), trace.timestamp_ns(), effective_ttl_ns, touch_existing);
+    }
+    auto pool_source_write_sequences = indexer->MaterializedSequencesForBlocks(result.pool_source_written_blocks);
+
+    auto capacity_eviction = indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_ns());
+    const auto &capacity_evicted_blocks = capacity_eviction.evicted_blocks;
+    auto last_tier_writes_it = capacity_eviction.last_tier_write_blocks.find(instance_id);
+    if (last_tier_writes_it != capacity_eviction.last_tier_write_blocks.end()) {
+        auto source_write_sequences = indexer->MaterializedSequencesForBlocks(last_tier_writes_it->second);
+        for (auto &sequence : source_write_sequences) {
+            pool_source_write_sequences.push_back(std::move(sequence));
+        }
+    }
+    std::vector<MaterializedKeySequence> evicted_materialized_sequences;
     for (const auto &[_, blocks] : capacity_evicted_blocks) {
+        std::vector<BlockEntry *> fully_evicted_blocks;
         for (auto *block : blocks) {
-            auto path = indexer->PrefixPathForBlock(block);
-            if (!path.empty()) {
-                evicted_paths.insert(std::move(path));
+            if (block != nullptr && block->location_map.empty()) {
+                fully_evicted_blocks.push_back(block);
             }
+        }
+        auto materialized_sequences = indexer->MaterializedSequencesForBlocks(fully_evicted_blocks);
+        for (auto &sequence : materialized_sequences) {
+            evicted_materialized_sequences.push_back(std::move(sequence));
         }
     }
     indexer_manager_->CleanEvictedBlocks(capacity_evicted_blocks, trace.timestamp_ns());
@@ -316,9 +316,10 @@ WriteRecord OptimizerRunner::HandleWriteCache(const WriteCacheSchemaTrace &trace
                        instance_id.c_str());
     }
 
-    record.write_blocks = trace.keys().size();
+    record.write_blocks = materialized_indices ? materialized_indices->size() : trace.keys().size();
     record.newly_inserted_blocks = result.inserted_keys.size();
-    record.evicted_key_sequences.assign(evicted_paths.begin(), evicted_paths.end());
+    record.pool_source_write_sequences = std::move(pool_source_write_sequences);
+    record.evicted_materialized_sequences = std::move(evicted_materialized_sequences);
     stats_collector_->OnWriteComplete(instance_id, record);
     return record;
 }

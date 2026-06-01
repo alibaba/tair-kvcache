@@ -30,14 +30,12 @@
                             "unique_name": "pace_00",
                             "storage_type": "pace",
                             "band_width_mbps": 20000,
-                            "priority": 0,
                             "capacity": 10000000000
                         },
                         {
                             "unique_name": "hf3fs_00",
                             "storage_type": "hf3fs",
                             "band_width_mbps": 20000,
-                            "priority": 1,
                             "capacity": 5000000000
                         }
                     ],

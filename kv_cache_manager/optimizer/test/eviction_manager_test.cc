@@ -54,7 +54,6 @@ std::vector<OptTierConfig> OptEvictionManagerTest::CreateTestTierConfigs() {
     tier1.set_capacity(1024 * 1024 * 10); // 10MB
     tier1.set_storage_type(DataStorageType::DATA_STORAGE_TYPE_HF3FS);
     tier1.set_band_width_mbps(1000);
-    tier1.set_priority(1);
     configs.push_back(tier1);
 
     return configs;
@@ -71,7 +70,6 @@ OptInstanceGroupConfig OptEvictionManagerTest::CreateTestInstanceGroupConfig() {
     tier1.set_capacity(1024 * 1024 * 10);
     tier1.set_storage_type(DataStorageType::DATA_STORAGE_TYPE_HF3FS);
     tier1.set_band_width_mbps(1000);
-    tier1.set_priority(1);
     config.set_storages({tier1});
 
     // 添加实例配置
@@ -355,7 +353,8 @@ TEST_F(OptEvictionManagerTest, EvictFromNonExistentInstance) {
     try {
         auto evicted = manager_->EvictByMode("non_existent_instance", instance_group_config, 0);
         // 如果没有抛出异常,检查返回值
-        EXPECT_TRUE(evicted.empty());
+        EXPECT_TRUE(evicted.evicted_blocks.empty());
+        EXPECT_TRUE(evicted.last_tier_write_blocks.empty());
     } catch (...) {
         // 如果抛出异常,也是可以接受的
         SUCCEED();
@@ -371,18 +370,16 @@ TEST_F(OptEvictionManagerTest, HierarchicalEvictionEnabled) {
     EXPECT_NE(policy, nullptr);
 }
 
-TEST_F(OptEvictionManagerTest, DemoteToNextTierInheritsBlockHeat) {
+TEST_F(OptEvictionManagerTest, DemoteToNextTierCreatesNewTierLocationAtDemoteTime) {
     auto instance_config = CreateTestInstanceConfig("instance1");
     std::vector<OptTierConfig> tier_configs;
     OptTierConfig tier1;
     tier1.set_unique_name("tier1");
     tier1.set_capacity(1024);
-    tier1.set_priority(1);
     tier_configs.push_back(tier1);
     OptTierConfig tier2;
     tier2.set_unique_name("tier2");
     tier2.set_capacity(1024);
-    tier2.set_priority(2);
     tier_configs.push_back(tier2);
 
     auto *policy_group = manager_->CreateAndRegisterEvictionPolicy(instance_config, tier_configs, true);
@@ -390,6 +387,7 @@ TEST_F(OptEvictionManagerTest, DemoteToNextTierInheritsBlockHeat) {
 
     BlockEntry block;
     block.key = 1;
+    block.access_count = 7;
     block.last_access_time = 1000;
     block.writing_time = 1000;
     block.location_map["tier1"] = TierStat{0, 1000, 1000};
@@ -404,8 +402,10 @@ TEST_F(OptEvictionManagerTest, DemoteToNextTierInheritsBlockHeat) {
     manager_->DemoteToNextTier("instance1", 1, evicted, 9000, flows);
 
     ASSERT_EQ(block.location_map.count("tier2"), 1);
-    EXPECT_EQ(block.location_map.at("tier2").last_access_time, 1000);
-    EXPECT_EQ(block.location_map.at("tier2").writing_time, 1000);
+    EXPECT_EQ(block.location_map.at("tier2").access_count, 0);
+    EXPECT_EQ(block.location_map.at("tier2").last_access_time, 9000);
+    EXPECT_EQ(block.location_map.at("tier2").writing_time, 9000);
+    EXPECT_EQ(block.location_map.at("tier2").write_touch_count, 1);
 }
 
 TEST_F(OptEvictionManagerTest, ActiveEvictExpiredShouldNotTriggerFallbackEviction) {

@@ -1,6 +1,5 @@
 #include "kv_cache_manager/optimizer/manager/optimizer_manager.h"
 
-#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -77,16 +76,10 @@ bool OptimizerManager::Init() {
             continue;
         }
 
-        auto &storage_configs = group.mutable_storages();
-
-        if (storage_configs.empty()) {
+        if (group.storages().empty()) {
             KVCM_LOG_WARN("No storage configs found for group: %s", group_name.c_str());
             continue;
         }
-
-        std::sort(storage_configs.begin(), storage_configs.end(), [](const OptTierConfig &a, const OptTierConfig &b) {
-            return a.priority() < b.priority();
-        });
 
         instance_group_configs_[group_name] = group;
 
@@ -131,7 +124,7 @@ bool OptimizerManager::Init() {
                 }
             }
 
-            if (!CreateRadixTreeIndex(instance_config, storage_configs)) {
+            if (!CreateRadixTreeIndex(instance_config, group.storages())) {
                 KVCM_LOG_ERROR("Failed to create RadixTreeIndex for instance: %s", instance_id.c_str());
                 failed_instances++;
                 failed_instance_ids.push_back(instance_id);
@@ -248,7 +241,33 @@ WriteCacheRes OptimizerManager::WriteCacheWithTtlUs(const std::string &instance_
     res.kvcm_write_length = write_record.newly_inserted_blocks;
     // write_hit = 请求写入数 - 实际新插入数（即已存在、未被驱逐的 block 数）
     res.kvcm_write_hit_length = write_record.write_blocks - write_record.newly_inserted_blocks;
-    res.evicted_key_sequences = write_record.evicted_key_sequences;
+    res.pool_source_write_sequences = write_record.pool_source_write_sequences;
+    res.evicted_materialized_sequences = write_record.evicted_materialized_sequences;
+    return res;
+}
+
+WriteCacheRes OptimizerManager::WriteCacheWithMaterializedIndices(const std::string &instance_id,
+                                                                  const std::string &trace_id,
+                                                                  const int64_t timestamp,
+                                                                  const std::vector<int64_t> &block_ids,
+                                                                  const std::vector<size_t> &materialized_indices,
+                                                                  const int64_t ttl_us,
+                                                                  bool touch_existing) {
+    WriteCacheSchemaTrace trace;
+    trace.set_instance_id(instance_id);
+    trace.set_trace_id(trace_id);
+    trace.set_timestamp_ns(timestamp);
+    trace.set_keys(block_ids);
+    trace.set_ttl_us(ttl_us);
+    const auto write_record = optimizer_runner_->HandleWriteCache(trace, touch_existing, &materialized_indices);
+    stats_collector_->UpdateTimestamp(instance_id, timestamp);
+
+    WriteCacheRes res;
+    res.trace_id = trace_id;
+    res.kvcm_write_length = write_record.newly_inserted_blocks;
+    res.kvcm_write_hit_length = write_record.write_blocks - write_record.newly_inserted_blocks;
+    res.pool_source_write_sequences = write_record.pool_source_write_sequences;
+    res.evicted_materialized_sequences = write_record.evicted_materialized_sequences;
     return res;
 }
 
@@ -257,7 +276,9 @@ GetCacheLocationRes OptimizerManager::GetCacheLocation(const std::string &instan
                                                        const int64_t timestamp,
                                                        const std::vector<int64_t> &block_ids,
                                                        const BlockMask &block_mask,
-                                                       const int64_t input_len) {
+                                                       const int64_t input_len,
+                                                       bool touch_local_hits,
+                                                       bool local_hits_are_reads) {
     GetLocationSchemaTrace trace;
     trace.set_instance_id(instance_id);
     trace.set_trace_id(trace_id);
@@ -265,7 +286,7 @@ GetCacheLocationRes OptimizerManager::GetCacheLocation(const std::string &instan
     trace.set_keys(block_ids);
     trace.set_input_len(RequirePositiveInputLen("GetCacheLocation", input_len));
     trace.set_block_mask(block_mask);
-    optimizer_runner_->HandleGetLocation(trace);
+    optimizer_runner_->HandleGetLocation(trace, touch_local_hits, local_hits_are_reads);
     stats_collector_->UpdateTimestamp(instance_id, timestamp);
 
     GetCacheLocationRes res;
@@ -279,42 +300,6 @@ GetCacheLocationRes OptimizerManager::GetCacheLocation(const std::string &instan
                                   : last_read->remote_hit_blocks;
     }
     return res;
-}
-
-GetCacheLocationRes OptimizerManager::GetCacheLocationAfterPrefix(const std::string &instance_id,
-                                                                  const std::string &trace_id,
-                                                                  const int64_t timestamp,
-                                                                  const std::vector<int64_t> &block_ids,
-                                                                  size_t prefix_block_count,
-                                                                  const int64_t input_len) {
-    GetLocationSchemaTrace trace;
-    trace.set_instance_id(instance_id);
-    trace.set_trace_id(trace_id);
-    trace.set_timestamp_ns(timestamp);
-    trace.set_keys(block_ids);
-    trace.set_input_len(RequirePositiveInputLen("GetCacheLocationAfterPrefix", input_len));
-    trace.set_block_mask(BlockMaskVector{});
-    optimizer_runner_->HandleGetLocation(trace, prefix_block_count);
-    stats_collector_->UpdateTimestamp(instance_id, timestamp);
-
-    GetCacheLocationRes res;
-    res.trace_id = trace_id;
-    res.kvcm_hit_length = 0;
-
-    const auto *last_read = hit_rate_tracker_->LastReadRecord(instance_id);
-    if (last_read) {
-        res.kvcm_hit_length = (hit_rate_perspective_ == HitRatePerspective::ENGINE_LOCAL)
-                                  ? last_read->local_hit_blocks
-                                  : last_read->remote_hit_blocks;
-    }
-    return res;
-}
-
-void OptimizerManager::TouchCacheLocation(const std::string &instance_id,
-                                          const int64_t timestamp,
-                                          const std::vector<int64_t> &block_ids) {
-    optimizer_runner_->TouchGetLocation(instance_id, timestamp, block_ids);
-    stats_collector_->UpdateTimestamp(instance_id, timestamp);
 }
 
 size_t OptimizerManager::PrefixMatchCount(const std::string &instance_id,
@@ -325,6 +310,17 @@ size_t OptimizerManager::PrefixMatchCount(const std::string &instance_id,
         return 0;
     }
     return indexer->PrefixMatchCount(block_ids, timestamp);
+}
+
+std::vector<size_t> OptimizerManager::PoolSourceWriteTouchIndicesAtLeast(const std::string &instance_id,
+                                                                         const std::vector<int64_t> &block_ids,
+                                                                         size_t threshold,
+                                                                         int64_t timestamp) const {
+    auto indexer = indexer_manager_ ? indexer_manager_->GetOptIndexer(instance_id) : nullptr;
+    if (!indexer) {
+        return {};
+    }
+    return indexer->PoolSourceWriteTouchIndicesAtLeast(block_ids, threshold, timestamp);
 }
 
 void OptimizerManager::AnalyzeResults() {

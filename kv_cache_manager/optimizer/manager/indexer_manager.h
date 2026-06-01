@@ -40,8 +40,8 @@ public:
     // 仅做过期清理，不做容量驱逐；返回待清理的 block 列表
     EvictedBlocks EvictExpiredBeforeAccess(const std::string &instance_id, int64_t current_timestamp);
 
-    // 仅做容量驱逐；返回待清理的 block 列表
-    EvictedBlocks CheckAndEvict(const std::string &instance_id, int64_t eviction_timestamp = 0);
+    // 仅做容量驱逐；返回待清理的 block 列表与驱逐过程中写入到下层的 block
+    OptEvictionManager::EvictionResult CheckAndEvict(const std::string &instance_id, int64_t eviction_timestamp = 0);
 
     // 统一清理驱逐后的 block，并触发节点清理
     void CleanEvictedBlocks(const EvictedBlocks &evicted_blocks,

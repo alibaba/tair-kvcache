@@ -5,6 +5,7 @@ cc_library(
     srcs = [
         "optimizer_manager.cc",
         "optimizer_runner.cc",
+        "engine_storage_pool_connector.cc",
         "hierarchical_replay_manager.cc",
         "eviction_manager.cc",
         "optimizer_loader.cc",
@@ -13,6 +14,7 @@ cc_library(
     hdrs = [
         "optimizer_manager.h",
         "optimizer_runner.h",
+        "engine_storage_pool_connector.h",
         "hierarchical_replay_manager.h",
         "eviction_manager.h",
         "optimizer_loader.h",

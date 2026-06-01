@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <stdexcept>
 
 #include "kv_cache_manager/common/logger.h"
@@ -57,96 +58,101 @@ bool HierarchicalReplayManager::Init() {
         return false;
     }
 
-    pool_manager_ = std::make_unique<OptimizerManager>(config_.pool_config(), enable_lifecycle_tracking, false);
-    if (!pool_manager_->Init()) {
-        KVCM_LOG_ERROR("Hierarchical replay failed to initialize pool manager.");
+    storage_pool_manager_ =
+        std::make_unique<OptimizerManager>(config_.storage_pool_config(), enable_lifecycle_tracking, false);
+    if (!storage_pool_manager_->Init()) {
+        KVCM_LOG_ERROR("Hierarchical replay failed to initialize storage pool manager.");
         return false;
     }
+    engine_storage_pool_connector_ =
+        std::make_unique<EngineStoragePoolConnector>(engine_manager_.get(), storage_pool_manager_.get());
     return true;
 }
 
 bool HierarchicalReplayManager::ValidateAndBuildMappings() {
-    engine_to_pool_.clear();
+    engine_to_storage_pool_.clear();
+    engine_storage_pool_flow_.clear();
     engine_block_size_.clear();
     sorted_engine_instance_ids_.clear();
 
     const auto engine_instances = CollectInstances(config_.engine_config());
-    const auto pool_instances = CollectInstances(config_.pool_config());
+    const auto storage_pool_instances = CollectInstances(config_.storage_pool_config());
     if (engine_instances.empty()) {
         KVCM_LOG_ERROR("Hierarchical replay engine_config has no instances.");
         return false;
     }
-    if (pool_instances.empty()) {
-        KVCM_LOG_ERROR("Hierarchical replay pool_config has no instances.");
+    if (storage_pool_instances.empty()) {
+        KVCM_LOG_ERROR("Hierarchical replay storage_pool_config has no instances.");
         return false;
     }
     if (!ValidateEngineInstanceIsolation(config_.engine_config())) {
         return false;
     }
 
-    for (const auto &mapping : config_.engine_to_pool()) {
+    for (const auto &mapping : config_.engine_to_storage_pool()) {
         const auto &engine_instance_id = mapping.engine_instance_id();
-        const auto &pool_instance_id = mapping.pool_instance_id();
+        const auto &storage_pool_instance_id = mapping.storage_pool_instance_id();
         auto engine_it = engine_instances.find(engine_instance_id);
         if (engine_it == engine_instances.end()) {
-            KVCM_LOG_ERROR("engine_to_pool references unknown engine instance: %s", engine_instance_id.c_str());
+            KVCM_LOG_ERROR("engine_to_storage_pool references unknown engine instance: %s", engine_instance_id.c_str());
             return false;
         }
-        auto pool_it = pool_instances.find(pool_instance_id);
-        if (pool_it == pool_instances.end()) {
-            KVCM_LOG_ERROR("engine_to_pool references unknown pool instance: %s", pool_instance_id.c_str());
+        auto storage_pool_it = storage_pool_instances.find(storage_pool_instance_id);
+        if (storage_pool_it == storage_pool_instances.end()) {
+            KVCM_LOG_ERROR("engine_to_storage_pool references unknown storage pool instance: %s",
+                           storage_pool_instance_id.c_str());
             return false;
         }
-        if (engine_to_pool_.find(engine_instance_id) != engine_to_pool_.end()) {
+        if (engine_to_storage_pool_.find(engine_instance_id) != engine_to_storage_pool_.end()) {
             KVCM_LOG_ERROR("engine instance is mapped more than once: %s", engine_instance_id.c_str());
             return false;
         }
 
         const size_t engine_block_size = PositiveBlockSizeOrZero(engine_it->second);
-        const size_t pool_block_size = PositiveBlockSizeOrZero(pool_it->second);
-        if (engine_block_size == 0 || pool_block_size == 0 || engine_block_size != pool_block_size) {
-            KVCM_LOG_ERROR("engine/pool block_size mismatch for engine=%s pool=%s",
+        const size_t storage_pool_block_size = PositiveBlockSizeOrZero(storage_pool_it->second);
+        if (engine_block_size == 0 || storage_pool_block_size == 0 || engine_block_size != storage_pool_block_size) {
+            KVCM_LOG_ERROR("engine/storage_pool block_size mismatch for engine=%s storage_pool=%s",
                            engine_instance_id.c_str(),
-                           pool_instance_id.c_str());
+                           storage_pool_instance_id.c_str());
             return false;
         }
-        if (engine_it->second.bytes_per_token() != pool_it->second.bytes_per_token()) {
-            KVCM_LOG_ERROR("engine/pool bytes_per_token mismatch for engine=%s pool=%s",
+        if (engine_it->second.bytes_per_token() != storage_pool_it->second.bytes_per_token()) {
+            KVCM_LOG_ERROR("engine/storage_pool bytes_per_token mismatch for engine=%s storage_pool=%s",
                            engine_instance_id.c_str(),
-                           pool_instance_id.c_str());
+                           storage_pool_instance_id.c_str());
             return false;
         }
 
-        engine_to_pool_[engine_instance_id] = pool_instance_id;
+        engine_to_storage_pool_[engine_instance_id] = storage_pool_instance_id;
+        engine_storage_pool_flow_[engine_instance_id] = mapping.storage_pool_flow();
         engine_block_size_[engine_instance_id] = engine_block_size;
         sorted_engine_instance_ids_.push_back(engine_instance_id);
     }
 
-    if (engine_to_pool_.size() != engine_instances.size()) {
-        KVCM_LOG_ERROR("Every engine instance must have exactly one engine_to_pool mapping.");
+    if (engine_to_storage_pool_.size() != engine_instances.size()) {
+        KVCM_LOG_ERROR("Every engine instance must have exactly one engine_to_storage_pool mapping.");
         return false;
     }
     std::sort(sorted_engine_instance_ids_.begin(), sorted_engine_instance_ids_.end());
     return true;
 }
 
-const std::string &HierarchicalReplayManager::PoolInstanceForEngine(const std::string &engine_instance_id) const {
-    auto it = engine_to_pool_.find(engine_instance_id);
-    if (it == engine_to_pool_.end()) {
-        throw std::runtime_error("No pool instance mapping for engine instance: " + engine_instance_id);
+const std::string &
+HierarchicalReplayManager::StoragePoolInstanceForEngine(const std::string &engine_instance_id) const {
+    auto it = engine_to_storage_pool_.find(engine_instance_id);
+    if (it == engine_to_storage_pool_.end()) {
+        throw std::runtime_error("No storage pool instance mapping for engine instance: " + engine_instance_id);
     }
     return it->second;
 }
 
-void HierarchicalReplayManager::WriteL2L3Sequence(const std::string &pool_instance_id,
-                                                  const std::string &trace_id,
-                                                  int64_t timestamp,
-                                                  const std::vector<int64_t> &block_ids,
-                                                  int64_t ttl_us,
-                                                  bool touch_existing) {
-    if (!block_ids.empty()) {
-        pool_manager_->WriteCacheWithTtlUs(pool_instance_id, trace_id, timestamp, block_ids, ttl_us, touch_existing);
+const StoragePoolFlowConfig &
+HierarchicalReplayManager::StoragePoolFlowForEngine(const std::string &engine_instance_id) const {
+    auto it = engine_storage_pool_flow_.find(engine_instance_id);
+    if (it == engine_storage_pool_flow_.end()) {
+        throw std::runtime_error("No storage pool flow for engine instance: " + engine_instance_id);
     }
+    return it->second;
 }
 
 void HierarchicalReplayManager::DirectRun() {
@@ -268,7 +274,7 @@ HierarchicalGetCacheLocationRes HierarchicalReplayManager::GetCacheLocation(cons
                                                                             int64_t timestamp,
                                                                             const std::vector<int64_t> &block_ids,
                                                                             int64_t input_len) {
-    if (!engine_manager_ || !pool_manager_) {
+    if (!engine_manager_ || !storage_pool_manager_ || !engine_storage_pool_connector_) {
         throw std::runtime_error("HierarchicalReplayManager is not initialized");
     }
     auto block_size_it = engine_block_size_.find(engine_instance_id);
@@ -276,62 +282,32 @@ HierarchicalGetCacheLocationRes HierarchicalReplayManager::GetCacheLocation(cons
         throw std::runtime_error("Unknown engine instance: " + engine_instance_id);
     }
 
-    const std::string &pool_instance_id = PoolInstanceForEngine(engine_instance_id);
+    const std::string &storage_pool_instance_id = StoragePoolInstanceForEngine(engine_instance_id);
     const BlockMask empty_mask = BlockMaskVector{};
     const auto engine_res =
         engine_manager_->GetCacheLocation(engine_instance_id, trace_id, timestamp, block_ids, empty_mask, input_len);
     const size_t engine_hit_blocks =
         std::min(static_cast<size_t>(std::max<int64_t>(engine_res.kvcm_hit_length, 0)), block_ids.size());
 
-    const auto &l2_l3_strategy = config_.l2_l3_strategy();
-    if (engine_hit_blocks > 0) {
-        std::vector<int64_t> engine_hit_prefix(block_ids.begin(), block_ids.begin() + engine_hit_blocks);
-        if (l2_l3_strategy.access_propagation_enabled()) {
-            pool_manager_->TouchCacheLocation(pool_instance_id, timestamp, engine_hit_prefix);
-        }
-        if (l2_l3_strategy.write_mode() == TierWriteMode::WRITE_THROUGH_SELECTIVE) {
-            size_t selected_prefix_len = 0;
-            auto &access_counts = l2_l3_access_counts_[engine_instance_id];
-            for (size_t i = 0; i < engine_hit_blocks; ++i) {
-                const size_t count = ++access_counts[block_ids[i]];
-                if (count == l2_l3_strategy.selective_write_threshold()) {
-                    selected_prefix_len = i + 1;
-                }
-            }
-            if (selected_prefix_len > 0) {
-                std::vector<int64_t> selected_prefix(block_ids.begin(), block_ids.begin() + selected_prefix_len);
-                WriteL2L3Sequence(pool_instance_id, trace_id, timestamp, selected_prefix, 0, false);
-            }
-        }
-    }
-
-    size_t pool_hit_blocks = 0;
-    if (engine_hit_blocks < block_ids.size()) {
-        const auto pool_res = pool_manager_->GetCacheLocationAfterPrefix(
-            pool_instance_id, trace_id, timestamp, block_ids, engine_hit_blocks, input_len);
-        pool_hit_blocks = std::min(static_cast<size_t>(std::max<int64_t>(pool_res.kvcm_hit_length, 0)),
-                                   block_ids.size() - engine_hit_blocks);
-        if (pool_hit_blocks > 0 && l2_l3_strategy.promote_enabled()) {
-            std::vector<int64_t> promoted_prefix(block_ids.begin(),
-                                                 block_ids.begin() + engine_hit_blocks + pool_hit_blocks);
-            auto promote_res =
-                engine_manager_->WriteCacheWithTtlUs(engine_instance_id, trace_id, timestamp, promoted_prefix, 0);
-            if (l2_l3_strategy.write_mode() == TierWriteMode::CASCADING) {
-                for (const auto &sequence : promote_res.evicted_key_sequences) {
-                    WriteL2L3Sequence(pool_instance_id, trace_id, timestamp, sequence, 0, false);
-                }
-            }
-        }
-    }
+    const auto &storage_pool_flow = StoragePoolFlowForEngine(engine_instance_id);
+    const auto storage_pool_read = engine_storage_pool_connector_->ApplyReadFlow(engine_instance_id,
+                                                                                 storage_pool_instance_id,
+                                                                                 trace_id,
+                                                                                 timestamp,
+                                                                                 block_ids,
+                                                                                 engine_hit_blocks,
+                                                                                 input_len,
+                                                                                 storage_pool_flow);
+    const size_t storage_pool_hit_blocks = storage_pool_read.storage_pool_hit_blocks;
 
     CombinedReadRecord record;
     record.trace_id = trace_id;
     record.engine_instance_id = engine_instance_id;
-    record.pool_instance_id = pool_instance_id;
+    record.storage_pool_instance_id = storage_pool_instance_id;
     record.timestamp_ns = timestamp;
     record.read_blocks = block_ids.size();
     record.engine_hit_blocks = engine_hit_blocks;
-    record.pool_hit_blocks = pool_hit_blocks;
+    record.storage_pool_hit_blocks = storage_pool_hit_blocks;
     record.input_tokens = static_cast<size_t>(input_len);
     record.block_size_tokens = block_size_it->second;
     combined_read_records_.push_back(record);
@@ -339,8 +315,8 @@ HierarchicalGetCacheLocationRes HierarchicalReplayManager::GetCacheLocation(cons
     HierarchicalGetCacheLocationRes res;
     res.trace_id = trace_id;
     res.engine_hit_length = static_cast<int64_t>(engine_hit_blocks);
-    res.pool_hit_length = static_cast<int64_t>(pool_hit_blocks);
-    res.total_hit_length = static_cast<int64_t>(engine_hit_blocks + pool_hit_blocks);
+    res.storage_pool_hit_length = static_cast<int64_t>(storage_pool_hit_blocks);
+    res.total_hit_length = static_cast<int64_t>(engine_hit_blocks + storage_pool_hit_blocks);
     return res;
 }
 
@@ -358,21 +334,21 @@ WriteCacheRes HierarchicalReplayManager::WriteCacheWithTtlUs(const std::string &
                                                              int64_t timestamp,
                                                              const std::vector<int64_t> &block_ids,
                                                              int64_t ttl_us) {
-    if (!engine_manager_ || !pool_manager_) {
+    if (!engine_manager_ || !storage_pool_manager_ || !engine_storage_pool_connector_) {
         throw std::runtime_error("HierarchicalReplayManager is not initialized");
     }
-    const std::string &pool_instance_id = PoolInstanceForEngine(engine_instance_id);
+    const std::string &storage_pool_instance_id = StoragePoolInstanceForEngine(engine_instance_id);
 
     auto engine_res = engine_manager_->WriteCacheWithTtlUs(engine_instance_id, trace_id, timestamp, block_ids, ttl_us);
-    const auto &l2_l3_strategy = config_.l2_l3_strategy();
-    if (l2_l3_strategy.write_mode() == TierWriteMode::WRITE_THROUGH) {
-        WriteL2L3Sequence(
-            pool_instance_id, trace_id, timestamp, block_ids, ttl_us, l2_l3_strategy.write_propagation_enabled());
-    } else if (l2_l3_strategy.write_mode() == TierWriteMode::CASCADING) {
-        for (const auto &sequence : engine_res.evicted_key_sequences) {
-            WriteL2L3Sequence(pool_instance_id, trace_id, timestamp, sequence, ttl_us, false);
-        }
-    }
+    const auto &storage_pool_flow = StoragePoolFlowForEngine(engine_instance_id);
+    engine_storage_pool_connector_->ApplyWriteFlow(engine_instance_id,
+                                                   storage_pool_instance_id,
+                                                   trace_id,
+                                                   timestamp,
+                                                   block_ids,
+                                                   ttl_us,
+                                                   storage_pool_flow,
+                                                   engine_res);
 
     CombinedWriteRecord record;
     record.timestamp_ns = timestamp;
@@ -386,8 +362,8 @@ void HierarchicalReplayManager::AnalyzeResults() {
     if (engine_manager_) {
         engine_manager_->AnalyzeResults();
     }
-    if (pool_manager_) {
-        pool_manager_->AnalyzeResults();
+    if (storage_pool_manager_) {
+        storage_pool_manager_->AnalyzeResults();
     }
 }
 
@@ -399,7 +375,8 @@ void HierarchicalReplayManager::ExportCombinedHitRates() const {
         throw std::runtime_error("Failed to open hierarchical hit-rate CSV: " + filename);
     }
 
-    file << "TimestampNs,TraceId,EngineInstanceId,PoolInstanceId,ReadBlocks,LocalHitBlocks,RemoteHitBlocks,HitBlocks,"
+    file << "TimestampNs,TraceId,EngineInstanceId,StoragePoolInstanceId,ReadBlocks,LocalHitBlocks,RemoteHitBlocks,"
+            "HitBlocks,"
             "InputTokens,LocalHitTokens,RemoteHitTokens,HitTokens,LocalHitRate,RemoteHitRate,HitRate,"
             "AccReadBlocks,AccHitBlocks,AccInputTokens,AccLocalHitTokens,AccRemoteHitTokens,AccHitTokens,"
             "AccLocalHitRate,AccRemoteHitRate,AccHitRate,AccWriteBlocks\n";
@@ -420,9 +397,9 @@ void HierarchicalReplayManager::ExportCombinedHitRates() const {
             write_index++;
         }
 
-        const size_t hit_blocks = record.engine_hit_blocks + record.pool_hit_blocks;
+        const size_t hit_blocks = record.engine_hit_blocks + record.storage_pool_hit_blocks;
         const size_t local_hit_tokens = record.engine_hit_blocks * record.block_size_tokens;
-        const size_t remote_hit_tokens = record.pool_hit_blocks * record.block_size_tokens;
+        const size_t remote_hit_tokens = record.storage_pool_hit_blocks * record.block_size_tokens;
         const size_t hit_tokens = hit_blocks * record.block_size_tokens;
 
         acc_read_blocks += record.read_blocks;
@@ -433,9 +410,9 @@ void HierarchicalReplayManager::ExportCombinedHitRates() const {
         acc_hit_tokens += hit_tokens;
 
         file << record.timestamp_ns << "," << record.trace_id << "," << record.engine_instance_id << ","
-             << record.pool_instance_id << "," << record.read_blocks << "," << record.engine_hit_blocks << ","
-             << record.pool_hit_blocks << "," << hit_blocks << "," << record.input_tokens << "," << local_hit_tokens
-             << "," << remote_hit_tokens << "," << hit_tokens << ","
+             << record.storage_pool_instance_id << "," << record.read_blocks << "," << record.engine_hit_blocks << ","
+             << record.storage_pool_hit_blocks << "," << hit_blocks << "," << record.input_tokens << ","
+             << local_hit_tokens << "," << remote_hit_tokens << "," << hit_tokens << ","
              << (record.input_tokens > 0 ? static_cast<double>(local_hit_tokens) / record.input_tokens : 0.0) << ","
              << (record.input_tokens > 0 ? static_cast<double>(remote_hit_tokens) / record.input_tokens : 0.0) << ","
              << (record.input_tokens > 0 ? static_cast<double>(hit_tokens) / record.input_tokens : 0.0) << ","

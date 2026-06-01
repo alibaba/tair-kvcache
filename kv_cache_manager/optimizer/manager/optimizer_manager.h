@@ -40,22 +40,27 @@ public:
                                       const std::vector<int64_t> &block_ids,
                                       const int64_t ttl_us,
                                       bool touch_existing = true);
+    WriteCacheRes WriteCacheWithMaterializedIndices(const std::string &instance_id,
+                                                    const std::string &trace_id,
+                                                    const int64_t timestamp,
+                                                    const std::vector<int64_t> &block_ids,
+                                                    const std::vector<size_t> &materialized_indices,
+                                                    const int64_t ttl_us,
+                                                    bool touch_existing = true);
     GetCacheLocationRes GetCacheLocation(const std::string &instance_id,
                                          const std::string &trace_id,
                                          const int64_t timestamp,
                                          const std::vector<int64_t> &block_ids,
                                          const BlockMask &block_mask,
-                                         const int64_t input_len);
-    GetCacheLocationRes GetCacheLocationAfterPrefix(const std::string &instance_id,
-                                                    const std::string &trace_id,
-                                                    const int64_t timestamp,
-                                                    const std::vector<int64_t> &block_ids,
-                                                    size_t prefix_block_count,
-                                                    const int64_t input_len);
-    void
-    TouchCacheLocation(const std::string &instance_id, const int64_t timestamp, const std::vector<int64_t> &block_ids);
+                                         const int64_t input_len,
+                                         bool touch_local_hits = true,
+                                         bool local_hits_are_reads = true);
     size_t
     PrefixMatchCount(const std::string &instance_id, const std::vector<int64_t> &block_ids, int64_t timestamp) const;
+    std::vector<size_t> PoolSourceWriteTouchIndicesAtLeast(const std::string &instance_id,
+                                                           const std::vector<int64_t> &block_ids,
+                                                           size_t threshold,
+                                                           int64_t timestamp) const;
     void AnalyzeResults();
 
     // 导出前缀树用于可视化

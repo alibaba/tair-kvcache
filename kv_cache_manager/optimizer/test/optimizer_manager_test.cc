@@ -43,7 +43,6 @@ OptimizerConfig OptimizerManagerTest::CreateTestOptimizerConfig() {
     tier1.set_capacity(1024 * 1024 * 10);
     tier1.set_storage_type(DataStorageType::DATA_STORAGE_TYPE_HF3FS);
     tier1.set_band_width_mbps(1000);
-    tier1.set_priority(1);
     instance_group.set_storages({tier1});
 
     // 添加实例配置到实例组
@@ -101,6 +100,25 @@ TEST_F(OptimizerManagerTest, WriteCacheTtlSecondsUsesNanosecondTimestamps) {
     auto hit_after_expire = manager.GetCacheLocation(
         "instance1", "read_after_expire", write_ts_ns + 2'000'000'000, {1}, remote_read_mask, 1024);
     EXPECT_EQ(hit_after_expire.kvcm_hit_length, 0);
+}
+
+TEST_F(OptimizerManagerTest, MaterializedWriteKeepsStructuralPrefixUncached) {
+    OptimizerManager manager(config_);
+    ASSERT_TRUE(manager.Init());
+
+    const std::vector<int64_t> keys = {11, 12};
+    auto write_res = manager.WriteCacheWithMaterializedIndices("instance1", "write_suffix", 1000, keys, {1}, 0);
+    EXPECT_EQ(write_res.kvcm_write_length, 1);
+
+    BlockMask no_local_mask = std::vector<bool>{false, false};
+    auto miss_without_prefix =
+        manager.GetCacheLocation("instance1", "miss_without_prefix", 2000, keys, no_local_mask, 2 * 1024);
+    EXPECT_EQ(miss_without_prefix.kvcm_hit_length, 0);
+
+    BlockMask local_prefix_mask = std::vector<bool>{true, false};
+    auto hit_with_prefix =
+        manager.GetCacheLocation("instance1", "hit_with_prefix", 3000, keys, local_prefix_mask, 2 * 1024);
+    EXPECT_EQ(hit_with_prefix.kvcm_hit_length, 1);
 }
 
 TEST_F(OptimizerManagerTest, TemplateAnalysisReadRecordKeepsTraceIdAndKeys) {

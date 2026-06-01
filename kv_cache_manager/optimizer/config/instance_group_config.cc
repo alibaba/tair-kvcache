@@ -1,23 +1,13 @@
 #include "kv_cache_manager/optimizer/config/instance_group_config.h"
 
-#include <algorithm>
 #include <sstream>
 #include <unordered_map>
-#include <unordered_set>
 
 #include "kv_cache_manager/common/logger.h"
 
 namespace kv_cache_manager {
 
 namespace {
-std::vector<OptTierConfig> SortStoragesByPriority(const std::vector<OptTierConfig> &storages) {
-    std::vector<OptTierConfig> sorted_storages = storages;
-    std::sort(sorted_storages.begin(), sorted_storages.end(), [](const OptTierConfig &a, const OptTierConfig &b) {
-        return a.priority() < b.priority();
-    });
-    return sorted_storages;
-}
-
 std::string JoinTierNames(const std::vector<OptTierConfig> &storages) {
     std::ostringstream oss;
     for (size_t i = 0; i < storages.size(); ++i) {
@@ -38,6 +28,26 @@ std::string JoinExpectedEdges(const std::vector<OptTierConfig> &storages) {
         oss << storages[i].unique_name() << "->" << storages[i + 1].unique_name();
     }
     return oss.str();
+}
+
+bool ParseStoragesByArrayOrder(const rapidjson::Value &rapid_value, std::vector<OptTierConfig> &storages) {
+    if (!rapid_value.HasMember("storages") || !rapid_value["storages"].IsArray()) {
+        KVCM_LOG_ERROR("instance_group storages must be an array");
+        return false;
+    }
+
+    const auto &storage_array = rapid_value["storages"].GetArray();
+    storages.clear();
+    storages.reserve(storage_array.Size());
+    for (rapidjson::SizeType idx = 0; idx < storage_array.Size(); ++idx) {
+        OptTierConfig tier;
+        if (!tier.FromRapidValue(storage_array[idx])) {
+            KVCM_LOG_ERROR("failed to parse storages[%u]", idx);
+            return false;
+        }
+        storages.push_back(tier);
+    }
+    return true;
 }
 
 } // namespace
@@ -136,60 +146,48 @@ size_t OptTierFlowPolicyConfig::ResolveFlowEdgeIndex(const OptTierFlowConfig &fl
 }
 
 bool OptTierFlowPolicyConfig::ValidateFlowConfigs(const std::vector<OptTierConfig> &storages) const {
-    const std::vector<OptTierConfig> sorted_storages = SortStoragesByPriority(storages);
-    if (sorted_storages.size() < 2) {
+    if (storages.size() < 2) {
         if (!tier_flows_.empty()) {
-            KVCM_LOG_ERROR("tier_flows is configured but instance group has %zu storage tier(s)",
-                           sorted_storages.size());
+            KVCM_LOG_ERROR("tier_flows is configured but instance group has %zu storage tier(s)", storages.size());
             return false;
         }
         return true;
     }
-    if (tier_flows_.size() != sorted_storages.size() - 1) {
-        KVCM_LOG_ERROR("tier_flows must define exactly %zu adjacent edge(s), got %zu",
-                       sorted_storages.size() - 1,
-                       tier_flows_.size());
+    if (tier_flows_.size() != storages.size() - 1) {
+        KVCM_LOG_ERROR(
+            "tier_flows must define exactly %zu adjacent edge(s), got %zu", storages.size() - 1, tier_flows_.size());
         return false;
     }
 
     std::unordered_map<std::string, size_t> tier_index;
-    std::unordered_set<size_t> priorities;
-    for (size_t i = 0; i < sorted_storages.size(); ++i) {
-        const auto &storage = sorted_storages[i];
+    for (size_t i = 0; i < storages.size(); ++i) {
+        const auto &storage = storages[i];
         const auto name_insert_result = tier_index.emplace(storage.unique_name(), i);
         if (!name_insert_result.second) {
             KVCM_LOG_ERROR("storages contains duplicate unique_name '%s'; tier_flows cannot be matched unambiguously",
                            storage.unique_name().c_str());
             return false;
         }
-        const auto priority_insert_result = priorities.emplace(storage.priority());
-        if (!priority_insert_result.second) {
-            KVCM_LOG_ERROR("storages contains duplicate priority %zu; tier_flows edge order is ambiguous",
-                           storage.priority());
-            return false;
-        }
     }
 
-    std::vector<bool> seen(sorted_storages.size() - 1, false);
+    std::vector<bool> seen(storages.size() - 1, false);
     for (const auto &flow : tier_flows_) {
         const auto from_it = tier_index.find(flow.from_tier());
         const auto to_it = tier_index.find(flow.to_tier());
         if (from_it == tier_index.end() || to_it == tier_index.end()) {
-            KVCM_LOG_ERROR("tier_flows edge %s->%s references unknown tier; configured tiers by "
-                           "priority: [%s]",
+            KVCM_LOG_ERROR("tier_flows edge %s->%s references unknown tier; configured tiers by order: [%s]",
                            flow.from_tier().c_str(),
                            flow.to_tier().c_str(),
-                           JoinTierNames(sorted_storages).c_str());
+                           JoinTierNames(storages).c_str());
             return false;
         }
 
         const size_t edge_idx = from_it->second;
         if (edge_idx + 1 != to_it->second) {
-            KVCM_LOG_ERROR("tier_flows edge %s->%s is not an adjacent priority edge; expected one of "
-                           "[%s]",
+            KVCM_LOG_ERROR("tier_flows edge %s->%s is not an adjacent tier edge; expected one of [%s]",
                            flow.from_tier().c_str(),
                            flow.to_tier().c_str(),
-                           JoinExpectedEdges(sorted_storages).c_str());
+                           JoinExpectedEdges(storages).c_str());
             return false;
         }
 
@@ -198,7 +196,7 @@ bool OptTierFlowPolicyConfig::ValidateFlowConfigs(const std::vector<OptTierConfi
                            "[%s]",
                            flow.from_tier().c_str(),
                            flow.to_tier().c_str(),
-                           JoinExpectedEdges(sorted_storages).c_str());
+                           JoinExpectedEdges(storages).c_str());
             return false;
         }
 
@@ -212,8 +210,8 @@ bool OptTierFlowPolicyConfig::ValidateFlowConfigs(const std::vector<OptTierConfi
     for (size_t idx = 0; idx < seen.size(); ++idx) {
         if (!seen[idx]) {
             KVCM_LOG_ERROR("tier_flows missing adjacent edge %s->%s",
-                           sorted_storages[idx].unique_name().c_str(),
-                           sorted_storages[idx + 1].unique_name().c_str());
+                           storages[idx].unique_name().c_str(),
+                           storages[idx + 1].unique_name().c_str());
             return false;
         }
     }
@@ -225,10 +223,9 @@ OptTierFlowPolicyConfig::BuildFlowStrategies(const std::vector<OptTierConfig> &s
     if (storages.size() < 2) {
         return {};
     }
-    const std::vector<OptTierConfig> sorted_storages = SortStoragesByPriority(storages);
-    std::vector<TierFlowStrategy> strategies(sorted_storages.size() - 1, DefaultFlowStrategy());
+    std::vector<TierFlowStrategy> strategies(storages.size() - 1, DefaultFlowStrategy());
     for (const auto &flow : tier_flows_) {
-        const size_t edge_idx = ResolveFlowEdgeIndex(flow, sorted_storages);
+        const size_t edge_idx = ResolveFlowEdgeIndex(flow, storages);
         if (edge_idx < strategies.size()) {
             strategies[edge_idx] = flow.Resolve(strategies[edge_idx]);
         }
@@ -257,17 +254,6 @@ void OptTtlConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &wri
 }
 
 bool OptInstanceGroupConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
-    if (rapid_value.HasMember("tier_strategy") || rapid_value.HasMember("hierarchical_eviction_enabled") ||
-        rapid_value.HasMember("write_mode") || rapid_value.HasMember("access_propagation_enabled") ||
-        rapid_value.HasMember("write_propagation_enabled") || rapid_value.HasMember("promote_enabled") ||
-        rapid_value.HasMember("selective_write_threshold") || rapid_value.HasMember("default_block_ttl_seconds") ||
-        rapid_value.HasMember("ttl_refresh_on_read")) {
-        KVCM_LOG_ERROR("instance_group '%s' must use tier_flows; legacy tier strategy fields are not supported",
-                       rapid_value.HasMember("group_name") && rapid_value["group_name"].IsString()
-                           ? rapid_value["group_name"].GetString()
-                           : "<unknown>");
-        return false;
-    }
     KVCM_JSON_GET_MACRO(rapid_value, "group_name", group_name_);
     KVCM_JSON_GET_MACRO(rapid_value, "used_percentage", used_percentage_);
     KVCM_JSON_GET_MACRO(rapid_value, "ttl_config", ttl_config_);
@@ -277,8 +263,9 @@ bool OptInstanceGroupConfig::FromRapidValue(const rapidjson::Value &rapid_value)
     KVCM_JSON_GET_MACRO(rapid_value, "quota_capacity", quota_capacity_gb);
     quota_capacity_ =
         quota_capacity_gb < 0 ? -1 : static_cast<int64_t>(quota_capacity_gb * static_cast<double>(1LL << 30));
-    // Parse storages; tier capacity is in GB in config, OptTierConfig::FromRapidValue handles conversion
-    KVCM_JSON_GET_MACRO(rapid_value, "storages", storages_);
+    if (!ParseStoragesByArrayOrder(rapid_value, storages_)) {
+        return false;
+    }
     std::vector<OptTierFlowConfig> tier_flows;
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "tier_flows", tier_flows, std::vector<OptTierFlowConfig>{});
     tier_flow_policy_ = OptTierFlowPolicyConfig::FromTierFlows(storages_, tier_flows);

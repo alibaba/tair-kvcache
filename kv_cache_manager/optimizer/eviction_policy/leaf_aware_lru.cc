@@ -68,15 +68,14 @@ void LeafAwareLruEvictionPolicy::OnBlockAccessed(BlockEntry *block, int64_t time
     }
 }
 
-void LeafAwareLruEvictionPolicy::insert_sorted_by_priority(LeafLRUListNode *node) {
+void LeafAwareLruEvictionPolicy::insert_sorted_by_access_time(LeafLRUListNode *node) {
     if (leaf_lru_list_.empty()) {
         leaf_lru_list_.push_back(node);
         return;
     }
 
-    // 排序基于本 tier 的 TierStat.last_access_time，各层独立（不读跨层的 block 级字段）
-    // 链表语义：head = 最新 (priority 最大)，tail = 最旧 (priority 最小)
-    // priority = -tier_access_time ，所以 access_time 越大 priority 越大 → 在 head 端
+    // 排序基于本 tier 的 TierStat.last_access_time，各层独立（不读跨层的 block 级字段）。
+    // 链表语义：head = 最新，tail = 最旧；access_time 越大越靠近 head。
     auto compare = [this](const LinkedListNode *a, const LinkedListNode *b) {
         const auto *na = static_cast<const LeafLRUListNode *>(a);
         const auto *nb = static_cast<const LeafLRUListNode *>(b);
@@ -169,7 +168,7 @@ bool LeafAwareLruEvictionPolicy::UpdateNodeState(RadixTreeNode *node) {
         BlockEntry *block_ptr = block.get();
         auto it = node_map_.find(block_ptr);
         if (it != node_map_.end() && leaf_blocks_.find(block_ptr) == leaf_blocks_.end()) {
-            insert_sorted_by_priority(it->second);
+            insert_sorted_by_access_time(it->second);
             leaf_blocks_.insert(block_ptr);
             inserted_any = true;
         }

@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 
+#include "kv_cache_manager/optimizer/config/types.h"
+
 namespace kv_cache_manager {
 
 struct BlockEntry;
@@ -25,7 +27,7 @@ struct ReadRecord {
     size_t current_cache_blocks;
     size_t input_tokens = 0;
     size_t block_size_tokens = 0;
-    std::vector<size_t> per_tier_hit_blocks; // per-tier hit block num, indexed by tier priority
+    std::vector<size_t> per_tier_hit_blocks; // per-tier hit block num, indexed by tier order
     std::vector<std::string> tier_names;     // tier names for CSV column headers
     std::vector<size_t> per_tier_blocks;     // per-tier block num for current instance
     std::vector<size_t> blocks_per_instance;
@@ -37,7 +39,8 @@ struct WriteRecord {
     int64_t timestamp_ns = 0;
     size_t write_blocks = 0;          // 请求写入的 block 总数（含已存在的）
     size_t newly_inserted_blocks = 0; // 实际新插入的 block 数（不含已存在的）
-    std::vector<std::vector<int64_t>> evicted_key_sequences;
+    std::vector<MaterializedKeySequence> pool_source_write_sequences;
+    std::vector<MaterializedKeySequence> evicted_materialized_sequences;
 
     std::string trace_id; // 当前 trace 标识
 };
