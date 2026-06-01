@@ -54,6 +54,20 @@ cc_test(
     ],
 )
 
+# LocationSpec.node_id round-trip
+cc_test(
+    name = "cache_location_node_id_test",
+    srcs = [
+        "cache_location_node_id_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    data = [],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/meta:cache_location",
+    ],
+)
+
 cc_library(
     name = "meta_storage_backend_testlib",
     srcs = [

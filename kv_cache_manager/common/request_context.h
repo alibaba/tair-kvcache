@@ -40,6 +40,11 @@ public:
     // front of the inference fleet). Used by the affinity layer to decide
     // which storage node the request should prefer.
     const std::string &caller_node_ip() const { return caller_node_ip_; }
+    const std::string &caller_supernode_id() const { return caller_supernode_id_; }
+    // Whether the current request is a replication write. When true,
+    // ExistsForWrite checks only the caller node (instead of global dedup)
+    // and backend.Create is called with strict=true.
+    bool is_replication() const { return is_replication_; }
     const int status_code() const { return status_code_; }
     const std::string &request_debug() const { return request_debug_; }
     const std::string &response_debug() const { return response_debug_; }
@@ -49,6 +54,8 @@ public:
     void set_api_name(const std::string &value) { api_name_ = value; }
     void set_client_ip(const std::string &value) { client_ip_ = value; }
     void set_caller_node_ip(const std::string &value) { caller_node_ip_ = value; }
+    void set_caller_supernode_id(const std::string &value) { caller_supernode_id_ = value; }
+    void set_is_replication(bool value) { is_replication_ = value; }
     void set_status_code(int value) { status_code_ = value; }
     void set_request_debug(const std::string &value) { request_debug_ = value; }
     void set_response_debug(const std::string &value) { response_debug_ = value; }
@@ -63,6 +70,8 @@ private:
     std::string api_name_; // 调用的接口名称
     std::string client_ip_;
     std::string caller_node_ip_;
+    std::string caller_supernode_id_;
+    bool is_replication_{false};
     int status_code_{0};
     std::string request_debug_;
     std::string response_debug_;

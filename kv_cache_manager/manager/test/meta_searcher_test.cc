@@ -1,5 +1,8 @@
 #include <filesystem>
 
+#include "kv_cache_manager/affinity/cache_affinity_manager.h"
+#include "kv_cache_manager/affinity/noop_strategy.h"
+#include "kv_cache_manager/affinity/local_replica_strategy.h"
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/meta_indexer_config.h"
@@ -1315,4 +1318,127 @@ TEST_F(MetaSearcherTest, TestBatchGetMergesSpecsByStorageType) {
         EXPECT_EQ(loc->location_specs()[0].name(), "tp0");
         EXPECT_EQ(loc->type(), DataStorageType::DATA_STORAGE_TYPE_MOONCAKE);
     }
+}
+
+// When caller_node_ip is set, merge step prefers the local spec among
+// same-name candidates. Without caller_node_ip (old client) it degrades
+// to first-seen insertion order (non-deterministic, not asserted here).
+TEST_F(MetaSearcherTest, LocalReplicaSpecAtMergeStep) {
+    MetaSearcher::KeyVector keys = {70001};
+
+    // 两个 mempool location 各自有同名 spec "tp0"，但一个在 node_local，
+    // 一个在 node_remote。caller 传 node_local → 期望 merge 后 spec 来自本地。
+    LocationSpec local_spec("tp0", "pace://cluster/local", "node_local");
+    LocationSpec remote_spec("tp0", "pace://cluster/remote", "node_remote");
+
+    CacheLocationConstPtr loc_local = MetaSearcherTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, 1, {local_spec});
+    CacheLocationConstPtr loc_remote = MetaSearcherTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, 1, {remote_spec});
+
+    std::vector<std::string> ids_local;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchAddLocation(request_context_.get(), keys, {loc_local}, ids_local));
+    std::vector<std::string> ids_remote;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchAddLocation(request_context_.get(), keys, {loc_remote}, ids_remote));
+
+    std::vector<std::vector<MetaSearcher::LocationUpdateTask>> batch_tasks = {{
+        {ids_local[0], CLS_SERVING},
+        {ids_remote[0], CLS_SERVING},
+    }};
+    std::vector<std::vector<ErrorCode>> upd;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), keys, batch_tasks, upd));
+
+    // 模拟 caller 在 node_local 上
+    request_context_->set_caller_node_ip("node_local");
+
+    CacheLocationVector out;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->PrefixMatch(request_context_.get(), keys, mask, out, &policy_));
+    ASSERT_EQ(1u, out.size());
+    ASSERT_EQ(1u, out[0]->location_specs().size());
+    EXPECT_EQ("node_local", out[0]->location_specs()[0].node_id())
+        << "merge step must prefer local spec when caller_node_ip matches";
+}
+
+// With LocalReplicaStrategy, read path goes through PickReadSpec
+TEST_F(MetaSearcherTest, ReadSelectionViaStrategyPicksLocal) {
+    MetaSearcher::KeyVector keys = {70010};
+
+    LocationSpec local("tp0", "uri_a", "node_local");
+    LocationSpec remote("tp0", "uri_b", "node_remote");
+    CacheLocationConstPtr loc_local = MetaSearcherTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, 1, {local});
+    CacheLocationConstPtr loc_remote = MetaSearcherTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, 1, {remote});
+
+    std::vector<std::string> ids_local;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchAddLocation(request_context_.get(), keys, {loc_local}, ids_local));
+    std::vector<std::string> ids_remote;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchAddLocation(request_context_.get(), keys, {loc_remote}, ids_remote));
+
+    std::vector<std::vector<MetaSearcher::LocationUpdateTask>> batch_tasks = {{
+        {ids_local[0], CLS_SERVING},
+        {ids_remote[0], CLS_SERVING},
+    }};
+    std::vector<std::vector<ErrorCode>> upd;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), keys, batch_tasks, upd));
+
+    request_context_->set_caller_node_ip("node_local");
+
+    CacheAffinityManager mgr;
+    mgr.LoadProcessStrategyFromJsonString(R"({"type":"local_replica"})");
+    AffinityResolveContext resolve_ctx;
+
+    CacheLocationVector out;
+    BlockMask mask;
+    ASSERT_EQ(
+        EC_OK,
+        meta_searcher_->PrefixMatch(request_context_.get(), keys, mask, out, &policy_, &mgr, nullptr, &resolve_ctx));
+    ASSERT_EQ(1u, out.size());
+    ASSERT_EQ(1u, out[0]->location_specs().size());
+    EXPECT_EQ("node_local", out[0]->location_specs()[0].node_id());
+}
+
+// Noop strategy: IsReadEnabled=false, degrades to first-seen insertion
+// (no local-preference even if caller_node_ip is set).
+TEST_F(MetaSearcherTest, ReadSelectionWithNoopStrategyDegradesToFirstSeen) {
+    MetaSearcher::KeyVector keys = {70020};
+
+    LocationSpec local("tp0", "uri_a", "node_local");
+    LocationSpec remote("tp0", "uri_b", "node_remote");
+    CacheLocationConstPtr loc_local = MetaSearcherTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, 1, {local});
+    CacheLocationConstPtr loc_remote = MetaSearcherTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, 1, {remote});
+
+    std::vector<std::string> ids_local;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchAddLocation(request_context_.get(), keys, {loc_local}, ids_local));
+    std::vector<std::string> ids_remote;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchAddLocation(request_context_.get(), keys, {loc_remote}, ids_remote));
+
+    std::vector<std::vector<MetaSearcher::LocationUpdateTask>> batch_tasks = {{
+        {ids_local[0], CLS_SERVING},
+        {ids_remote[0], CLS_SERVING},
+    }};
+    std::vector<std::vector<ErrorCode>> upd;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), keys, batch_tasks, upd));
+
+    request_context_->set_caller_node_ip("node_local");
+
+    CacheAffinityManager mgr;
+    mgr.LoadProcessStrategyFromJsonString(R"({"type":"noop"})");
+    AffinityResolveContext resolve_ctx;
+
+    CacheLocationVector out;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->PrefixMatch(request_context_.get(), keys, mask, out, &policy_, &mgr, nullptr, &resolve_ctx));
+    ASSERT_EQ(1u, out.size());
+    ASSERT_EQ(1u, out[0]->location_specs().size());
+    // Noop: IsReadEnabled=false, ResolveRead returns empty picked_specs,
+    // degrades to candidates.front(), no local vs remote distinction.
+    const std::string &nid = out[0]->location_specs()[0].node_id();
+    EXPECT_TRUE(nid == "node_local" || nid == "node_remote");
 }

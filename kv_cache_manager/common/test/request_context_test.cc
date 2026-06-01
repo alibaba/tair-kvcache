@@ -26,6 +26,34 @@ TEST_F(RequestContextTest, TestSimple) {
     ASSERT_EQ(nullptr, request_context.metrics_collector());
 }
 
+// is_replication defaults to false; setter flips it
+TEST_F(RequestContextTest, IsReplicationDefaultAndSetter) {
+    RequestContext rc("trace_v1_c4");
+    EXPECT_FALSE(rc.is_replication());
+    rc.set_is_replication(true);
+    EXPECT_TRUE(rc.is_replication());
+    rc.set_is_replication(false);
+    EXPECT_FALSE(rc.is_replication());
+}
+
+// caller_supernode_id defaults to empty; setter round-trips
+TEST_F(RequestContextTest, CallerSupernodeIdDefaultAndSetter) {
+    RequestContext rc("trace_supernode");
+    EXPECT_TRUE(rc.caller_supernode_id().empty());
+    rc.set_caller_supernode_id("sn-42");
+    EXPECT_EQ("sn-42", rc.caller_supernode_id());
+}
+
+// caller_node_ip and is_replication are independent fields
+TEST_F(RequestContextTest, CallerNodeIpIndependentOfReplicationFlag) {
+    RequestContext rc("trace_v1_c4_2");
+    rc.set_caller_node_ip("worker.7");
+    EXPECT_EQ("worker.7", rc.caller_node_ip());
+    EXPECT_FALSE(rc.is_replication());
+    rc.set_is_replication(true);
+    EXPECT_EQ("worker.7", rc.caller_node_ip()); // 不被 set_is_replication 改写
+}
+
 class SpanTracerTest {
 public:
     void Function1(RequestContext *request_context) {

@@ -45,6 +45,8 @@ public:
     const std::string &event_publishers_configs() { return event_publishers_configs_; }
     const std::string &GetAdvertisedHost() const { return advertised_host_; }
     const std::string &GetCustomInfo() const { return custom_info_; }
+    bool IsAffinityEnabled() const { return affinity_enabled_; }
+    const std::string &GetAffinityStrategyFile() const { return affinity_strategy_file_; }
 
 private:
     void UpdateDefaultConfig();
@@ -80,6 +82,8 @@ private:
     std::string event_publishers_configs_;
     std::string advertised_host_;
     std::string custom_info_;
+    bool affinity_enabled_ = false;
+    std::string affinity_strategy_file_;
 
 private:
     using SettingFunction = std::function<bool(const std::string &, ServerConfig *config)>;

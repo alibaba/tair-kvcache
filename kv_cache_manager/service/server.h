@@ -19,6 +19,7 @@ class CoordinationBackend;
 class LeaderElector;
 class RegistryManager;
 class CacheManager;
+class CacheAffinityManager;
 
 class MetaServiceGRpc;
 class AdminServiceGRpc;
@@ -76,6 +77,7 @@ private:
     std::shared_ptr<LeaderElector> leader_elector_;
     std::shared_ptr<RegistryManager> registry_manager_;
     std::shared_ptr<CacheManager> cache_manager_;
+    std::shared_ptr<CacheAffinityManager> affinity_manager_;
 
     std::shared_ptr<MetricsRegistry> metrics_registry_;
     std::shared_ptr<MetricsReporterFactory> metrics_reporter_factory_;

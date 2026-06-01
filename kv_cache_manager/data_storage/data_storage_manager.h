@@ -56,13 +56,16 @@ public:
     // When `hints.preferred_node_ids` is empty, `strict` is meaningless and is
     // ignored by the backend. Equivalent to the legacy Create() above when
     // hints is default-constructed and strict=false.
-    std::vector<std::pair<ErrorCode, DataStorageUri>> Create(RequestContext *request_context,
-                                                             const std::string &unique_name,
-                                                             const std::vector<std::string> &keys,
-                                                             size_t size_per_key,
-                                                             const WriteHints &hints,
-                                                             bool strict,
-                                                             std::function<void()> cb);
+    //
+    // Returns LocationDescriptor per key: {ec, uri, node_id}.
+    // node_id is persisted into LocationSpec for later affinity decisions.
+    std::vector<LocationDescriptor> Create(RequestContext *request_context,
+                                           const std::string &unique_name,
+                                           const std::vector<std::string> &keys,
+                                           size_t size_per_key,
+                                           const WriteHints &hints,
+                                           bool strict,
+                                           std::function<void()> cb);
 
     std::vector<ErrorCode> Delete(RequestContext *request_context,
                                   const std::string &unique_name,

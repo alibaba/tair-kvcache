@@ -15,6 +15,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
@@ -45,6 +46,7 @@ private:                                                                        
 #endif
 
 class CacheReclaimStrategy;
+class CacheAffinityManager;
 class EventManager;
 class InstanceGroup;
 class InstanceGroupQuota;
@@ -130,7 +132,8 @@ public:
                    std::shared_ptr<SchedulePlanExecutor> sched_plan_executor,
                    std::shared_ptr<MetricsRegistry> metrics_registry,
                    std::shared_ptr<EventManager> event_manager,
-                   std::shared_ptr<WriteLocationManager> write_location_manager);
+                   std::shared_ptr<WriteLocationManager> write_location_manager,
+                   std::shared_ptr<CacheAffinityManager> affinity_manager = nullptr);
 
     /**
      * @brief Delete copy constructor
@@ -288,6 +291,8 @@ private:
     const std::shared_ptr<EventManager> event_manager_;
     // to detect orphaned CLS_WRITING locations during reclaiming
     const std::shared_ptr<WriteLocationManager> write_location_manager_;
+    // affinity
+    const std::shared_ptr<CacheAffinityManager> affinity_manager_;
 
     // represents the object of the associated working thread
     std::thread reclaimer_;
@@ -373,9 +378,6 @@ private:
         // group general water level exceed flag
         bool general_water_level_exceed_;
 
-        using array_t_ = std::array<bool, static_cast<std::size_t>(DataStorageType::COUNT)>;
-        using size_t_ = array_t_::size_type;
-
         // group water level exceed flag array by storage type
         // slot 0: DATA_STORAGE_TYPE_UNKNOWN **UNUSED**
         // slot 1: DATA_STORAGE_TYPE_HF3FS exceed flag
@@ -384,6 +386,9 @@ private:
         // slot 4: DATA_STORAGE_TYPE_NFS exceed flag
         // slot 5: DATA_STORAGE_TYPE_VCNS_HF3FS **UNUSED** (merged into HF3FS)
         // slot 6: DATA_STORAGE_TYPE_DUMMY exceed flag (testing only)
+        using array_t_ = std::array<bool, static_cast<std::size_t>(DataStorageType::COUNT)>;
+        using size_t_ = array_t_::size_type;
+
         array_t_ water_level_exceed_by_type_;
     };
 
@@ -416,7 +421,8 @@ private:
      * @param water_level_exceed shared pointer to WaterLevelExceed
      * @return true for trigger and verse visa
      */
-    static bool IsTriggerReclaiming(const std::shared_ptr<WaterLevelExceed> &water_level_exceed);
+    static bool IsTriggerReclaiming(const std::shared_ptr<WaterLevelExceed> &water_level_exceed,
+                                    const std::unordered_set<std::string> &exceeded_node_ids);
 
     /**
      * @brief Reclaim cache entries using LRU (Least Recently Used)
@@ -435,6 +441,7 @@ private:
     void ReclaimByLRU(const std::shared_ptr<RequestContext> &request_context,
                       const std::shared_ptr<const InstanceInfo> &instance_info,
                       const WaterLevelExceed &water_level_exceed,
+                      const std::unordered_set<std::string> &exceeded_node_ids,
                       std::int32_t delay_before_delete_ms) noexcept;
 
     /**
@@ -452,6 +459,7 @@ private:
     void ReclaimByLFU(const std::shared_ptr<RequestContext> &request_context,
                       const std::shared_ptr<const InstanceInfo> &instance_info,
                       const WaterLevelExceed &water_level_exceed,
+                      const std::unordered_set<std::string> &exceeded_node_ids,
                       std::int32_t delay_before_delete_ms) noexcept;
 
     /**
@@ -468,6 +476,7 @@ private:
     void ReclaimByTTL(const std::shared_ptr<RequestContext> &request_context,
                       const std::shared_ptr<const InstanceInfo> &instance_info,
                       const WaterLevelExceed &water_level_exceed,
+                      const std::unordered_set<std::string> &exceeded_node_ids,
                       std::int32_t delay_before_delete_ms) noexcept;
 
     bool TryReclaimOnGroup(const std::shared_ptr<RequestContext> &request_context,
@@ -503,6 +512,7 @@ private:
                      const std::shared_ptr<const InstanceInfo> &instance_info,
                      const std::vector<std::int64_t> &batch,
                      const WaterLevelExceed &water_level_exceed,
+                     const std::unordered_set<std::string> &exceeded_node_ids,
                      std::vector<std::vector<std::string>> &out_loc_ids,
                      AgeStats &out_create_age_stats) const noexcept;
 

@@ -16,7 +16,7 @@ namespace kv_cache_manager {
 // The scalar metric fields below are the v1 placeholder set referenced by the
 // metric registry. They are zeroed out until a real metrics source is wired
 // up; filter / sort over them currently degrades to the missing-metric
-// semantics documented at MetricRegistry / FilterCond.
+// semantics documented at MetricCatalog / FilterCond.
 struct NodeMetrics {
     std::string node_id;
     std::string node_name;

@@ -365,6 +365,18 @@ RegistryManager::GetInstanceGroup(RequestContext *request_context, const std::st
     return {EC_OK, instance_group};
 }
 
+std::string RegistryManager::GetGroupAffinityStrategyJson(RequestContext *request_context,
+                                                          const std::string &group_name) {
+    if (group_name.empty()) {
+        return {};
+    }
+    auto [ec, group] = GetInstanceGroup(request_context, group_name);
+    if (ec == EC_OK && group) {
+        return group->affinity_strategy_json();
+    }
+    return {};
+}
+
 InstanceInfoConstPtr RegistryManager::GetInstanceInfo(RequestContext *request_context, const std::string &instance_id) {
     const auto &trace_id = request_context->trace_id();
     std::shared_lock<std::shared_mutex> lock(mutex_);

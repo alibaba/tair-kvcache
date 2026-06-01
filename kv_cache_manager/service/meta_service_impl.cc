@@ -5,6 +5,7 @@
 #include <utility>
 #include <vector>
 
+#include "kv_cache_manager/affinity/local_replica_strategy.h"
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
@@ -274,8 +275,11 @@ void MetaServiceImpl::GetCacheLocation(RequestContext *request_context,
     for (const auto &name : request->location_spec_names()) {
         location_spec_names.push_back(name);
     }
+    request_context->set_caller_node_ip(request->caller_node_ip());
+    request_context->set_caller_supernode_id(request->caller_supernode_id());
 
-    std::pair<ErrorCode, CacheLocationViewVecWrapper> get_cache_meta = cache_manager_->GetCacheLocation(
+    std::vector<ReplicationHint> hints;
+    auto [ec_info, cache_location_view_vec_wrapper] = cache_manager_->GetCacheLocation(
         request_context,
         request->instance_id(),
         static_cast<CacheManager::QueryType>(request->query_type()),
@@ -283,9 +287,8 @@ void MetaServiceImpl::GetCacheLocation(RequestContext *request_context,
         std::vector<int64_t>(request->token_ids().begin(), request->token_ids().end()),
         block_mask_req,
         request->sw_size(),
-        location_spec_names);
-    ErrorCode ec_info = get_cache_meta.first;
-    CacheLocationViewVecWrapper cache_location_view_vec_wrapper(std::move(get_cache_meta.second));
+        location_spec_names,
+        &hints);
     CacheLocationViewVec cache_locations_res = cache_location_view_vec_wrapper.cache_locations_view();
     if (ec_info != EC_OK) {
         status->set_code(ToMetaPbError(ec_info));
@@ -297,12 +300,19 @@ void MetaServiceImpl::GetCacheLocation(RequestContext *request_context,
             auto *location_meta = response->add_locations();
             ProtoConvert::CacheLocationViewToProto(cache_location, location_meta);
         }
+        for (const auto &h : hints) {
+            auto *pb_hint = response->add_hints();
+            pb_hint->set_block_key(h.block_key);
+            pb_hint->set_source_uri(h.source_uri);
+            pb_hint->set_target_node_id(h.target_node_id);
+        }
         status->set_code(proto::meta::OK);
         request_context->set_status_code(status->code());
         status->set_message("Cache locations retrieved successfully");
-        KVCM_LOG_INFO("[traceId: %s] GetCacheLocation succeeded, returned %d locations",
+        KVCM_LOG_INFO("[traceId: %s] GetCacheLocation succeeded, returned %d locations, %zu hints",
                       request->trace_id().c_str(),
-                      response->locations_size());
+                      response->locations_size(),
+                      hints.size());
     }
     SET_SPAN_TRACER_STR_IN_HEADER(request_context);
 }
@@ -436,10 +446,12 @@ void MetaServiceImpl::StartWriteCache(RequestContext *request_context,
         location_spec_group_names.push_back(name);
     }
 
-    // 把调用方推理节点 IP 透传到 RequestContext，CacheManager 在调
-    // ResolveAffinityHints 时会读它。空字符串 = 老客户端 / 未启用 affinity，
+    // 把调用方推理节点 IP 透传到 RequestContext，CacheManager 写路径在构建
+    // AffinityResolveContext 时会读它。空字符串 = 老客户端 / 未启用 affinity，
     // 后端会退化为无亲和性的写放置（行为完全等价于改造前）。
     request_context->set_caller_node_ip(request->caller_node_ip());
+    request_context->set_caller_supernode_id(request->caller_supernode_id());
+    request_context->set_is_replication(request->is_replication());
 
     std::pair<ErrorCode, StartWriteCacheInfo> start_write_cache = cache_manager_->StartWriteCache(
         request_context,

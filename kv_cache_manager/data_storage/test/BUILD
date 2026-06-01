@@ -78,3 +78,16 @@ cc_test(
     ],
 )
 
+# LocationDescriptor + SnapshotPerNodeMetrics default implementation round-trip
+cc_test(
+    name = "LocationDescriptorTest",
+    srcs = [
+        "location_descriptor_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    data = [],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/data_storage",
+    ],
+)

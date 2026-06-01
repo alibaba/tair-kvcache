@@ -30,6 +30,8 @@ class EventManager;
 class CacheManagerMetricsRecorder;
 class CacheAffinityManager;
 struct WriteHints;
+struct AffinityResolveContext;
+struct ReplicationHint;
 constexpr unsigned int DEFAULT_SCHEDULE_PLAN_EXECUTOR_THREAD_COUNT = 2;
 
 class CacheManager {
@@ -108,7 +110,8 @@ public:
                      const TokenIdsVector &tokens,
                      const BlockMask &block_mask,
                      int32_t sw_size,
-                     const std::vector<std::string> &location_spec_names);
+                     const std::vector<std::string> &location_spec_names,
+                     std::vector<ReplicationHint> *out_hints = nullptr);
 
     std::pair<ErrorCode, int64_t> GetCacheLocationLen(RequestContext *request_context,
                                                       const std::string &instance_id,
@@ -176,9 +179,12 @@ private:
                                   const std::shared_ptr<DataStorageManager> &data_storage_manager,
                                   const std::string &unique_name,
                                   std::vector<DataStorageUri> &allocated_uris,
+                                  // node_id reported by backend, parallel to allocated_uris
+                                  std::vector<std::string> &allocated_node_ids,
                                   std::vector<std::vector<std::pair<size_t, const LocationSpecInfo *>>> &key_to_uris,
                                   bool &is_create_success,
-                                  int64_t common_size);
+                                  int64_t common_size,
+                                  const AffinityResolveContext *resolve_ctx);
     ErrorCode CreateBySpec(RequestContext *request_context,
                            const std::string &instance_id,
                            const CacheManager::KeyVector &keys,
@@ -187,8 +193,11 @@ private:
                            const std::shared_ptr<DataStorageManager> &data_storage_manager,
                            const std::string &unique_name,
                            std::vector<DataStorageUri> &allocated_uris,
+                           // node_id reported by backend, parallel to allocated_uris
+                           std::vector<std::string> &allocated_node_ids,
                            std::vector<std::vector<std::pair<size_t, const LocationSpecInfo *>>> &key_to_uris,
-                           bool &is_create_success);
+                           bool &is_create_success,
+                           const AffinityResolveContext *resolve_ctx);
 
     ErrorCode TryCreateMetaSearcher(RequestContext *request_context, const std::string &instance_id);
     std::pair<ErrorCode, MetaSearcher *> CheckInputAndGetMetaSearcher(RequestContext *request_context,
@@ -208,7 +217,10 @@ private:
                                           const KeyVector &keys,
                                           const BlockMask &block_mask,
                                           int32_t sw_size,
-                                          CacheLocationVector &cache_locations) const;
+                                          CacheLocationVector &cache_locations,
+                                          // Read side effects accumulated by meta_searcher;
+                                          // caller downcasts to concrete types (e.g. ReplicationHint).
+                                          std::vector<std::unique_ptr<ReadSideEffect>> *out_side_effects = nullptr) const;
     ErrorCode PerformCacheLocationQuery(RequestContext *request_context,
                                         ServiceMetricsCollector *service_metrics_collector,
                                         MetaSearcher *meta_searcher,
@@ -219,29 +231,13 @@ private:
                                         const BlockMask &block_mask,
                                         int32_t sw_size,
                                         KeyVector &query_keys,
-                                        CacheLocationVector &cache_locations) const;
+                                        CacheLocationVector &cache_locations,
+                                        std::vector<std::unique_ptr<ReadSideEffect>> *out_side_effects = nullptr) const;
     std::unique_ptr<SelectLocationPolicy> genSelectLocationPolicy(RequestContext *request_context,
                                                                   const std::string &instance_id) const;
     CheckLocDataExistFunc GetCheckLocDataExistFunc(const std::string &instance_id) const;
     SubmitDelReqFunc GetSubmitDelReqFunc(const std::string &instance_id) const;
     void ClearVineyardCleanupCallbacks();
-
-    // Build write hints for the upcoming DataStorageManager::Create call.
-    // Returns empty hints (no preference) when no affinity manager is wired,
-    // when there are no candidate nodes, or when the strategy yields nothing.
-    // A strategy abort (e.g. strict prefer_local with caller missing) is
-    // logged and silently degraded to empty hints in v1; CacheManager keeps
-    // writing through the legacy path. We can promote abort to a hard error
-    // later once policies that rely on it are deployed.
-    //
-    // The InstanceInfo carries the per-instance strategy JSON; the
-    // per-instance-group strategy is fetched from registry_manager_ by name.
-    // CacheAffinityManager picks the highest-priority non-empty tier
-    // (instance > instance_group > process).
-    WriteHints ResolveAffinityHints(RequestContext *request_context,
-                                    const std::shared_ptr<const InstanceInfo> &instance_info,
-                                    std::size_t block_count,
-                                    std::size_t bytes_per_block) const;
 
 private:
     /***

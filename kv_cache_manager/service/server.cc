@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <grpcpp/grpcpp.h>
 
+#include "kv_cache_manager/affinity/cache_affinity_manager.h"
 #include "kv_cache_manager/common/loop_thread.h"
 #include "kv_cache_manager/common/net_util.h"
 #include "kv_cache_manager/config/coordination_backend.h"
@@ -45,7 +46,25 @@ bool Server::Init(const ServerConfig &config) {
     registry_manager_.reset(new RegistryManager(registry_storage_uri, metrics_registry_));
     registry_manager_->Init();
 
-    cache_manager_.reset(new CacheManager(metrics_registry_, registry_manager_));
+    // Create CacheAffinityManager; when kvcm.affinity.enabled is false, all
+    // strategy lookups return Noop (no-op affinity, equivalent to legacy).
+    affinity_manager_ = std::make_shared<CacheAffinityManager>();
+    if (!config_.IsAffinityEnabled()) {
+        affinity_manager_->SetGloballyDisabled(true);
+        KVCM_LOG_INFO("kvcm.affinity.enabled=false, affinity globally disabled (forces Noop)");
+    } else {
+        const std::string &strategy_file = config_.GetAffinityStrategyFile();
+        if (!strategy_file.empty()) {
+            std::string err;
+            if (!affinity_manager_->LoadProcessStrategyFromJsonFile(strategy_file, &err)) {
+                KVCM_LOG_WARN("load process affinity strategy file[%s] failed: %s", strategy_file.c_str(),
+                              err.c_str());
+            } else {
+                KVCM_LOG_INFO("loaded process affinity strategy from file[%s]", strategy_file.c_str());
+            }
+        }
+    }
+    cache_manager_.reset(new CacheManager(metrics_registry_, registry_manager_, affinity_manager_));
     cache_manager_->Init(config_.GetSchedulePlanExecutorThreadCount(),
                          config_.GetCacheReclaimerKeySamplingSizeTotal(),
                          config_.GetCacheReclaimerKeySamplingSizePerTask(),

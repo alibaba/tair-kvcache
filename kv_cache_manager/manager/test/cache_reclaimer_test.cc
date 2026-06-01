@@ -905,7 +905,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming00) {
                                                      ins_group->quota(),
                                                      ins_group->cache_config()->reclaim_strategy(),
                                                      instance_infos);
-    ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
+    ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle, {}));
 }
 
 TEST_F(CacheReclaimerTest, TestTriggerReclaiming01) {
@@ -926,7 +926,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming01) {
                                                      ins_group->quota(),
                                                      ins_group->cache_config()->reclaim_strategy(),
                                                      instance_infos);
-    ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
+    ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle, {}));
 }
 
 TEST_F(CacheReclaimerTest, TestTriggerReclaiming02) {
@@ -947,7 +947,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming02) {
                                                      ins_group->quota(),
                                                      ins_group->cache_config()->reclaim_strategy(),
                                                      instance_infos);
-    ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
+    ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle, {}));
 }
 
 TEST_F(CacheReclaimerTest, TestTriggerReclaiming03) {
@@ -971,7 +971,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming03) {
                                                      ins_group->quota(),
                                                      ins_group->cache_config()->reclaim_strategy(),
                                                      instance_infos);
-    ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
+    ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle, {}));
 }
 
 TEST_F(CacheReclaimerTest, TestTriggerReclaiming04) {
@@ -996,7 +996,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming04) {
                                                      ins_group->quota(),
                                                      ins_group->cache_config()->reclaim_strategy(),
                                                      instance_infos);
-    ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
+    ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle, {}));
     ASSERT_TRUE(wle->CheckGroupWaterLevelExceed());
     ASSERT_FALSE(wle->CheckStorageTypeWaterLevelExceed());
     ASSERT_TRUE(wle->GetGeneralWaterLevelExceed());
@@ -1024,7 +1024,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming05) {
                                                      ins_group->quota(),
                                                      ins_group->cache_config()->reclaim_strategy(),
                                                      instance_infos);
-    ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
+    ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle, {}));
 }
 
 TEST_F(CacheReclaimerTest, TestTriggerReclaiming06) {
@@ -1044,7 +1044,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming06) {
                                                      ins_group->quota(),
                                                      ins_group->cache_config()->reclaim_strategy(),
                                                      instance_infos);
-    ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
+    ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle, {}));
     ASSERT_TRUE(wle->CheckGroupWaterLevelExceed());
     ASSERT_FALSE(wle->CheckStorageTypeWaterLevelExceed());
     ASSERT_TRUE(wle->GetGeneralWaterLevelExceed());
@@ -1079,7 +1079,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming07) {
                                                      ins_group->quota(),
                                                      ins_group->cache_config()->reclaim_strategy(),
                                                      instance_infos);
-    ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
+    ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle, {}));
 }
 
 TEST_F(CacheReclaimerTest, TestTriggerReclaiming08) {
@@ -1114,7 +1114,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming08) {
                                                      ins_group->quota(),
                                                      ins_group->cache_config()->reclaim_strategy(),
                                                      instance_infos);
-    ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
+    ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle, {}));
     ASSERT_TRUE(wle->CheckGroupWaterLevelExceed());
     ASSERT_FALSE(wle->CheckStorageTypeWaterLevelExceed());
     ASSERT_TRUE(wle->GetGeneralWaterLevelExceed());
@@ -1149,7 +1149,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming09) {
                                                      ins_group->quota(),
                                                      ins_group->cache_config()->reclaim_strategy(),
                                                      instance_infos);
-    ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
+    ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle, {}));
 }
 
 TEST_F(CacheReclaimerTest, TestTriggerReclaiming10) {
@@ -1176,7 +1176,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming10) {
                                                      ins_group->quota(),
                                                      ins_group->cache_config()->reclaim_strategy(),
                                                      instance_infos);
-    ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
+    ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle, {}));
     ASSERT_TRUE(wle->CheckGroupWaterLevelExceed());
     ASSERT_FALSE(wle->CheckStorageTypeWaterLevelExceed());
     ASSERT_TRUE(wle->GetGeneralWaterLevelExceed());
@@ -1211,7 +1211,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming11) {
                                                      ins_group->quota(),
                                                      ins_group->cache_config()->reclaim_strategy(),
                                                      instance_infos);
-    ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
+    ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle, {}));
     ASSERT_TRUE(wle->CheckGroupWaterLevelExceed());
     ASSERT_FALSE(wle->CheckStorageTypeWaterLevelExceed());
     ASSERT_TRUE(wle->GetGeneralWaterLevelExceed());
@@ -1236,7 +1236,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming15) {
                                                      ins_group->quota(),
                                                      ins_group->cache_config()->reclaim_strategy(),
                                                      instance_infos);
-    ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
+    ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle, {}));
 }
 
 TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
@@ -1267,7 +1267,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
                                                          ins_group->quota(),
                                                          ins_group->cache_config()->reclaim_strategy(),
                                                          instance_infos);
-        ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
+        ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle, {}));
         ASSERT_TRUE(wle->CheckGroupWaterLevelExceed());
         ASSERT_FALSE(wle->CheckStorageTypeWaterLevelExceed());
         ASSERT_TRUE(wle->GetGeneralWaterLevelExceed());
@@ -1295,7 +1295,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
                                                          ins_group->quota(),
                                                          ins_group->cache_config()->reclaim_strategy(),
                                                          instance_infos);
-        ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
+        ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle, {}));
     }
 
     {
@@ -1315,7 +1315,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
                                                          ins_group->quota(),
                                                          ins_group->cache_config()->reclaim_strategy(),
                                                          instance_infos);
-        ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
+        ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle, {}));
         ASSERT_TRUE(wle->CheckGroupWaterLevelExceed());
         ASSERT_FALSE(wle->CheckStorageTypeWaterLevelExceed());
         ASSERT_TRUE(wle->GetGeneralWaterLevelExceed());
@@ -1344,7 +1344,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
                                                          ins_group->quota(),
                                                          ins_group->cache_config()->reclaim_strategy(),
                                                          instance_infos);
-        ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
+        ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle, {}));
     }
 
     {
@@ -1364,7 +1364,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
                                                          ins_group->quota(),
                                                          ins_group->cache_config()->reclaim_strategy(),
                                                          instance_infos);
-        ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
+        ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle, {}));
         ASSERT_TRUE(wle->CheckGroupWaterLevelExceed());
         ASSERT_FALSE(wle->CheckStorageTypeWaterLevelExceed());
         ASSERT_TRUE(wle->GetGeneralWaterLevelExceed());
@@ -1393,7 +1393,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming16) {
                                                          ins_group->quota(),
                                                          ins_group->cache_config()->reclaim_strategy(),
                                                          instance_infos);
-        ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
+        ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle, {}));
     }
 }
 
@@ -1430,7 +1430,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming17) {
                                                          ins_group->quota(),
                                                          ins_group->cache_config()->reclaim_strategy(),
                                                          instance_infos);
-        ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
+        ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle, {}));
         ASSERT_TRUE(wle->CheckGroupWaterLevelExceed());
         ASSERT_TRUE(wle->CheckStorageTypeWaterLevelExceed());
         ASSERT_FALSE(wle->GetGeneralWaterLevelExceed());
@@ -1462,7 +1462,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming17) {
                                                          ins_group->quota(),
                                                          ins_group->cache_config()->reclaim_strategy(),
                                                          instance_infos);
-        ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
+        ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle, {}));
     }
 
     {
@@ -1491,7 +1491,7 @@ TEST_F(CacheReclaimerTest, TestTriggerReclaiming17) {
                                                          ins_group->quota(),
                                                          ins_group->cache_config()->reclaim_strategy(),
                                                          instance_infos);
-        ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle));
+        ASSERT_TRUE(CacheReclaimer::IsTriggerReclaiming(wle, {}));
         ASSERT_TRUE(wle->CheckGroupWaterLevelExceed());
         ASSERT_TRUE(wle->CheckStorageTypeWaterLevelExceed());
         ASSERT_TRUE(wle->GetGeneralWaterLevelExceed());
@@ -3340,7 +3340,7 @@ TEST_F(CacheReclaimerTest, TestPerf) {
     auto start_tp = std::chrono::steady_clock::now();
     while (true) {
         cache_reclaimer_->ReclaimByLRU(
-            request_context_, instance_infos.front(), CacheReclaimer::WaterLevelExceed{}, 1000);
+            request_context_, instance_infos.front(), CacheReclaimer::WaterLevelExceed{}, {}, 1000);
         if (std::chrono::steady_clock::now() - start_tp >= std::chrono::milliseconds(60 * 1000)) {
             break;
         }

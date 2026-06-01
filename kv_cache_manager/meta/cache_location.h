@@ -18,28 +18,37 @@ public:
 
     LocationSpec(const std::string &name, const std::string &uri) : name_(name), uri_(uri) {}
 
+    LocationSpec(const std::string &name, const std::string &uri, const std::string &node_id)
+        : name_(name), uri_(uri), node_id_(node_id) {}
+
     ~LocationSpec() override;
 
     void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override {
         Put(writer, "name", name_);
         Put(writer, "uri", uri_);
+        Put(writer, "node_id", node_id_);
     }
 
     bool FromRapidValue(const rapidjson::Value &rapid_value) override {
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "name", name_, std::string(""));
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "uri", uri_, std::string(""));
+        // node_id may be absent in legacy JSON; defaults to empty.
+        KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "node_id", node_id_, std::string(""));
         return true;
     }
 
     void set_name(const std::string &name) { name_ = name; }
     void set_uri(const std::string &uri) { uri_ = uri; }
+    void set_node_id(const std::string &node_id) { node_id_ = node_id; }
 
     inline const std::string &name() const { return name_; }
     inline const std::string &uri() const { return uri_; }
+    inline const std::string &node_id() const { return node_id_; }
 
 private:
-    std::string name_; // 对应LocationSpecInfo中的name
-    std::string uri_;  // URI
+    std::string name_;    // 对应LocationSpecInfo中的name
+    std::string uri_;     // URI
+    std::string node_id_; // storage node; empty = not reported
 };
 
 enum CacheLocationStatus : int32_t {
