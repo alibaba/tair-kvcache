@@ -30,6 +30,9 @@ build --workspace_status_command=bazel/workspace_status.sh
 | `STABLE_GIT_COMMIT_FULL` | `2cd6c5a9...` | git 完整 commit hash |
 | `STABLE_GIT_REPO` | `git@github.com:alibaba/tair-kvcache.git` | 远程仓库地址 |
 | `STABLE_KVCM_VERSION` | `0.0.1` | 语义版本号 |
+| `STABLE_INTERNAL_GIT_COMMIT` | `f3a1b2c0` | 内部仓库 short commit hash（仅 submodule 构建时存在） |
+| `STABLE_INTERNAL_GIT_COMMIT_FULL` | `f3a1b2c0...` | 内部仓库完整 commit hash（仅 submodule 构建时存在） |
+| `STABLE_INTERNAL_VERSION_SUFFIX` | `.i-f3a1b2c0` | 预格式化后缀，供 py_wheel version 拼接（独立构建时为空） |
 | `BUILD_DATE` | `20260409` | 构建日期 |
 | `BUILD_TIME` | `2026-04-09 11:38:26` | 构建时间 |
 
@@ -52,13 +55,13 @@ Python wheel 包的版本号通过 `py_wheel` 规则的 `stamp` 属性注入。`
 ```python
 py_wheel(
     name = "my_wheel",
-    version = "{STABLE_KVCM_VERSION}+{BUILD_DATE}.{STABLE_GIT_COMMIT}",
+    version = "{STABLE_KVCM_VERSION}+{BUILD_DATE}.{STABLE_GIT_COMMIT}{STABLE_INTERNAL_VERSION_SUFFIX}",
     stamp = 1,
     ...
 )
 ```
 
-最终 wheel 内部的版本号为 `0.0.1+20260409.2cd6c5a9`（符合 [PEP 440](https://peps.python.org/pep-0440/) local version 规范）。
+最终 wheel 内部的版本号为 `0.0.1+20260409.2cd6c5a9`（开源独立构建）或 `0.0.1+20260409.2cd6c5a9.i-f3a1b2c0`（内部 submodule 构建），均符合 [PEP 440](https://peps.python.org/pep-0440/) local version 规范。
 
 > **注意**：Bazel 输出路径中的文件名在分析阶段确定，仍包含字面占位符。使用 `.dist` 后缀目标（如 `bazel build :my_wheel.dist`）可在 `dist/` 目录下获得正确文件名的 wheel 文件。
 
@@ -67,14 +70,22 @@ py_wheel(
 最终的完整版本号格式为：
 
 ```
+# 开源独立构建
 {STABLE_KVCM_VERSION}+{BUILD_DATE}.{STABLE_GIT_COMMIT}
+
+# 内部 submodule 构建
+{STABLE_KVCM_VERSION}+{BUILD_DATE}.{STABLE_GIT_COMMIT}.i-{STABLE_INTERNAL_GIT_COMMIT}
 ```
 
-示例：`0.0.1+20260409.2cd6c5a9`
+示例：
+- 开源：`0.0.1+20260409.2cd6c5a9`
+- 内部：`0.0.1+20260409.2cd6c5a9.i-f3a1b2c0`
 
+各段含义：
 - `0.0.1`：语义版本号，在 `bazel/workspace_status.sh` 中定义
 - `20260409`：构建日期
-- `2cd6c5a9`：git commit 短 hash
+- `2cd6c5a9`：开源仓库（tair-kvcache）git commit 短 hash
+- `i-f3a1b2c0`：内部仓库 git commit 短 hash（`i-` 前缀区分），仅内部构建时出现
 
 ## 文件结构
 
@@ -121,7 +132,9 @@ logger.info("version: %s (commit: %s, build: %s)", FULL_VERSION, GIT_COMMIT, BUI
 | `GIT_REPO` | str | `"git@github.com:..."` | 远程仓库地址 |
 | `BUILD_DATE` | str | `"20260409"` | 构建日期 |
 | `BUILD_TIME` | str | `"2026-04-09 11:38:26"` | 构建时间 |
-| `FULL_VERSION` | str | `"0.0.1+20260409.2cd6c5a9"` | 完整版本号 |
+| `INTERNAL_GIT_COMMIT` | str | `"f3a1b2c0"` | 内部仓库短 commit hash（仅内部构建时存在） |
+| `INTERNAL_GIT_COMMIT_FULL` | str | `"f3a1b2c0..."` | 内部仓库完整 commit hash（仅内部构建时存在） |
+| `FULL_VERSION` | str | `"0.0.1+20260409.2cd6c5a9"` | 完整版本号（内部构建时含 `.i-` 后缀） |
 
 ### 为 C++ 组件接入版本信息
 
@@ -145,25 +158,27 @@ cc_library(
 #include "my_package/build_version.h"
 
 // 可用的宏定义：
-// KVCM_VERSION        - "0.0.1"
-// KVCM_GIT_COMMIT     - "2cd6c5a9"
-// KVCM_GIT_COMMIT_FULL - "2cd6c5a9..."
-// KVCM_GIT_REPO       - "git@github.com:..."
-// KVCM_BUILD_DATE     - "20260409"
-// KVCM_BUILD_TIME     - "2026-04-09 11:38:26"
-// KVCM_FULL_VERSION   - "0.0.1+20260409.2cd6c5a9"
+// KVCM_VERSION              - "0.0.1"
+// KVCM_GIT_COMMIT           - "2cd6c5a9"
+// KVCM_GIT_COMMIT_FULL      - "2cd6c5a9..."
+// KVCM_GIT_REPO             - "git@github.com:..."
+// KVCM_BUILD_DATE           - "20260409"
+// KVCM_BUILD_TIME           - "2026-04-09 11:38:26"
+// KVCM_INTERNAL_GIT_COMMIT      - "f3a1b2c0"  (仅内部构建)
+// KVCM_INTERNAL_GIT_COMMIT_FULL - "f3a1b2c0..." (仅内部构建)
+// KVCM_FULL_VERSION         - "0.0.1+20260409.2cd6c5a9.i-f3a1b2c0"
 
 std::cout << "Version: " << KVCM_FULL_VERSION << std::endl;
 ```
 
 ### 为 py_wheel 包添加版本号
 
-在 `py_wheel` 规则中启用 stamp：
+在 `py_wheel` 规则中启用 stamp，使用 `{STABLE_INTERNAL_VERSION_SUFFIX}` 拼接内部 commit（独立构建时该值为空，不影响版本号）：
 
 ```python
 py_wheel(
     name = "my_package",
-    version = "{STABLE_KVCM_VERSION}+{BUILD_DATE}.{STABLE_GIT_COMMIT}",
+    version = "{STABLE_KVCM_VERSION}+{BUILD_DATE}.{STABLE_GIT_COMMIT}{STABLE_INTERNAL_VERSION_SUFFIX}",
     stamp = 1,
     ...
 )
@@ -178,7 +193,8 @@ bazel build //path/to:my_package
 # 推荐：使用 .dist 目标获取正确文件名
 bazel build //path/to:my_package.dist
 # 输出位于 bazel-bin/path/to/my_package.dist/
-# 文件名示例：my_package-0.0.1+20260409.2cd6c5a9-cp310-cp310-linux_x86_64.whl
+# 文件名示例（开源）：my_package-0.0.1+20260409.2cd6c5a9-cp310-cp310-linux_x86_64.whl
+# 文件名示例（内部）：my_package-0.0.1+20260409.2cd6c5a9.i-f3a1b2c0-cp310-cp310-linux_x86_64.whl
 ```
 
 ## 当前接入组件

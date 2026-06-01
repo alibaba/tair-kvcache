@@ -40,7 +40,7 @@ py_wheel(
     python_requires = ">=3.9",
     python_tag = python_abi(),
     stamp = 1,
-    version = "{STABLE_KVCM_VERSION}+{BUILD_DATE}.{STABLE_GIT_COMMIT}",
+    version = "{STABLE_KVCM_VERSION}+{BUILD_DATE}.{STABLE_GIT_COMMIT}{STABLE_INTERNAL_VERSION_SUFFIX}",
     deps = [
         ":vllm_connector_pkg",
     ],
