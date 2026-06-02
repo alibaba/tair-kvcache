@@ -296,7 +296,7 @@ TEST_F(HierarchicalReplayManagerTest, ExportsLifecycleForEngineAndPoolWhenEnable
     EXPECT_TRUE(std::filesystem::exists(root + "/pool/model_l3_lifecycle.csv"));
 }
 
-TEST_F(HierarchicalReplayManagerTest, SelectiveStoragePoolWriteUsesInferWriteTouchThreshold) {
+TEST_F(HierarchicalReplayManagerTest, SelectiveStoragePoolWriteIgnoresInferWritePropagation) {
     const std::string root = GetTestTempRootPath() + "/hierarchical_replay_selective_storage_pool";
     HierarchicalReplayConfig config = CreateHierarchicalConfig(root);
     OptimizerConfig engine_config =
@@ -332,12 +332,12 @@ TEST_F(HierarchicalReplayManagerTest, SelectiveStoragePoolWriteUsesInferWriteTou
     manager.WriteCache("engine_a", "first_write_touch", 1400, keys);
     auto after_first_write_touch = manager.GetCacheLocation("engine_b", "after_first_write_touch", 1450, keys, 16);
     EXPECT_EQ(after_first_write_touch.engine_hit_length, 0);
-    EXPECT_EQ(after_first_write_touch.storage_pool_hit_length, 1);
+    EXPECT_EQ(after_first_write_touch.storage_pool_hit_length, 0);
 
     manager.WriteCache("engine_a", "second_write_touch", 1500, keys);
     auto pool_hit_after_hot = manager.GetCacheLocation("engine_b", "pool_hit_after_hot", 1600, keys, 16);
     EXPECT_EQ(pool_hit_after_hot.engine_hit_length, 0);
-    EXPECT_EQ(pool_hit_after_hot.storage_pool_hit_length, 1);
+    EXPECT_EQ(pool_hit_after_hot.storage_pool_hit_length, 0);
 }
 
 TEST_F(HierarchicalReplayManagerTest, SelectiveStoragePoolWriteUsesUntieredInferBlockState) {
@@ -382,6 +382,35 @@ TEST_F(HierarchicalReplayManagerTest, SelectiveStoragePoolWriteRequiresInferSour
 
     auto from_other_engine = manager.GetCacheLocation("engine_b", "from_other_engine", 1200, keys, 16);
     EXPECT_EQ(from_other_engine.total_hit_length, 0);
+}
+
+TEST_F(HierarchicalReplayManagerTest, SelectiveStoragePoolWriteIgnoresDemotedSourceWithoutWriteTouch) {
+    const std::string root = GetTestTempRootPath() + "/hierarchical_replay_selective_materialized_sequences";
+    HierarchicalReplayConfig config = CreateHierarchicalConfig(root);
+    OptimizerConfig engine_config =
+        CreateEngineOptimizerConfig("engine_group", {"engine_a", "engine_b"}, {"hbm", "dram"}, root + "/infer", 16);
+    for (auto &group : engine_config.mutable_instance_groups()) {
+        OptTierFlowPolicyConfig policy = group.tier_flow_policy();
+        policy.set_write_mode(TierWriteMode::CASCADING);
+        group.set_tier_flow_policy(policy);
+    }
+    config.set_engine_config(engine_config);
+    StoragePoolFlowConfig flow = CreateStoragePoolFlow();
+    flow.set_write_mode(TierWriteMode::WRITE_THROUGH_SELECTIVE);
+    flow.set_selective_write_threshold(1);
+    SetStoragePoolFlow(config, flow);
+
+    HierarchicalReplayManager manager(config);
+    ASSERT_TRUE(manager.Init());
+
+    const std::vector<int64_t> first = {541};
+    const std::vector<int64_t> second = {542};
+    manager.WriteCache("engine_a", "write_first", 1000, first);
+    manager.WriteCache("engine_a", "write_second", 1100, second);
+
+    auto from_other_engine = manager.GetCacheLocation("engine_b", "from_other_engine", 1200, first, 16);
+    EXPECT_EQ(from_other_engine.engine_hit_length, 0);
+    EXPECT_EQ(from_other_engine.storage_pool_hit_length, 0);
 }
 
 TEST_F(HierarchicalReplayManagerTest, CascadingStoragePoolWriteMovesInferEvictionsToPool) {
@@ -459,6 +488,39 @@ TEST_F(HierarchicalReplayManagerTest, L3HitPromotesToEngineWhenEnabled) {
     auto promoted_engine_hit = manager.GetCacheLocation("engine_b", "promoted_engine_hit", 3000, keys, 16);
     EXPECT_EQ(promoted_engine_hit.engine_hit_length, 1);
     EXPECT_EQ(promoted_engine_hit.storage_pool_hit_length, 0);
+}
+
+TEST_F(HierarchicalReplayManagerTest, PoolPromoteEvictionWritesBackToPoolWhenCascading) {
+    const std::string root = GetTestTempRootPath() + "/hierarchical_replay_pool_promote_writeback";
+    HierarchicalReplayConfig config = CreateHierarchicalConfig(root);
+    OptimizerConfig engine_config =
+        CreateEngineOptimizerConfig("engine_group", {"engine_a", "engine_b"}, {"hbm"}, root + "/infer", 16);
+    for (auto &group : engine_config.mutable_instance_groups()) {
+        group.set_quota_capacity(16);
+    }
+    config.set_engine_config(engine_config);
+    StoragePoolFlowConfig flow = CreateStoragePoolFlow();
+    flow.set_write_mode(TierWriteMode::CASCADING);
+    flow.set_promote_enabled(true);
+    SetStoragePoolFlow(config, flow);
+
+    HierarchicalReplayManager manager(config);
+    ASSERT_TRUE(manager.Init());
+
+    const std::vector<int64_t> remote = {711};
+    const std::vector<int64_t> filler = {712};
+    const std::vector<int64_t> victim = {713};
+    manager.WriteCache("engine_a", "write_remote", 1000, remote);
+    manager.WriteCache("engine_a", "evict_remote_to_pool", 1100, filler);
+    manager.WriteCache("engine_b", "write_victim", 1200, victim);
+
+    auto remote_pool_hit = manager.GetCacheLocation("engine_b", "remote_pool_hit", 1300, remote, 16);
+    EXPECT_EQ(remote_pool_hit.engine_hit_length, 0);
+    EXPECT_EQ(remote_pool_hit.storage_pool_hit_length, 1);
+
+    auto victim_check = manager.GetCacheLocation("engine_a", "victim_check", 1400, victim, 16);
+    EXPECT_EQ(victim_check.engine_hit_length, 0);
+    EXPECT_EQ(victim_check.storage_pool_hit_length, 1);
 }
 
 TEST_F(HierarchicalReplayManagerTest, StoragePoolUsesFullKeysAfterEnginePrefixHit) {
@@ -560,7 +622,7 @@ TEST_F(HierarchicalReplayManagerTest, WriteThroughDoesNotTouchExistingL3WhenDisa
     EXPECT_EQ(first_from_other_engine.storage_pool_hit_length, 0);
 }
 
-TEST_F(HierarchicalReplayManagerTest, WriteThroughTouchesExistingL3WhenEnabled) {
+TEST_F(HierarchicalReplayManagerTest, WritePropagationDoesNotTouchExistingL3) {
     const std::string root = GetTestTempRootPath() + "/hierarchical_replay_l3_write_propagation";
     HierarchicalReplayConfig config = CreateHierarchicalConfig(root);
     OptimizerConfig engine_config =
@@ -591,7 +653,7 @@ TEST_F(HierarchicalReplayManagerTest, WriteThroughTouchesExistingL3WhenEnabled) 
     manager.WriteCache("engine_a", "write_third", 1300, third);
 
     auto first_from_other_engine = manager.GetCacheLocation("engine_b", "read_first", 1400, first, 16);
-    EXPECT_EQ(first_from_other_engine.storage_pool_hit_length, 1);
+    EXPECT_EQ(first_from_other_engine.storage_pool_hit_length, 0);
 }
 
 TEST_F(HierarchicalReplayManagerTest, RejectsSharedEngineInstanceGroup) {

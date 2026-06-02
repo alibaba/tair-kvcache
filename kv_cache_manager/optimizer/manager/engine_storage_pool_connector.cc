@@ -46,10 +46,10 @@ EngineStoragePoolReadResult EngineStoragePoolConnector::ApplyReadFlow(const std:
                  block_ids.size() - engine_hit_blocks);
 
     if (result.storage_pool_hit_blocks > 0 && flow.promote_enabled()) {
-        std::vector<int64_t> promoted_prefix(block_ids.begin(),
-                                             block_ids.begin() + engine_hit_blocks + result.storage_pool_hit_blocks);
-        auto promote_res =
-            engine_manager_->WriteCacheWithTtlUs(engine_instance_id, trace_id, timestamp, promoted_prefix, 0);
+        const size_t promoted_prefix_len = engine_hit_blocks + result.storage_pool_hit_blocks;
+        std::vector<int64_t> promoted_prefix(block_ids.begin(), block_ids.begin() + promoted_prefix_len);
+        auto promote_res = engine_manager_->WriteCacheWithTtlUs(
+            engine_instance_id, trace_id, timestamp, promoted_prefix, 0, false, false);
         ApplyCascadingEvictions(storage_pool_instance_id, trace_id, timestamp, 0, flow, promote_res);
     }
     return result;
@@ -63,9 +63,8 @@ void EngineStoragePoolConnector::ApplyWriteFlow(const std::string &engine_instan
                                                 int64_t ttl_us,
                                                 const StoragePoolFlowConfig &flow,
                                                 const WriteCacheRes &engine_write_res) {
+    (void)block_ids;
     if (flow.write_mode() == TierWriteMode::WRITE_THROUGH) {
-        (void)engine_instance_id;
-        (void)block_ids;
         WriteMaterializedSequences(storage_pool_instance_id,
                                    trace_id,
                                    timestamp,
@@ -75,30 +74,25 @@ void EngineStoragePoolConnector::ApplyWriteFlow(const std::string &engine_instan
     } else if (flow.write_mode() == TierWriteMode::CASCADING) {
         ApplyCascadingEvictions(storage_pool_instance_id, trace_id, timestamp, ttl_us, flow, engine_write_res);
     } else if (flow.write_mode() == TierWriteMode::WRITE_THROUGH_SELECTIVE) {
-        std::unordered_set<size_t> source_write_indices;
         for (const auto &sequence : engine_write_res.pool_source_write_sequences) {
+            const auto threshold_indices = engine_manager_->PoolSourceWriteTouchIndicesAtLeast(
+                engine_instance_id, sequence.keys, flow.selective_write_threshold(), timestamp);
+            const std::unordered_set<size_t> threshold_index_set(threshold_indices.begin(), threshold_indices.end());
+            std::vector<size_t> selected_indices;
             for (const size_t idx : sequence.materialized_indices) {
-                source_write_indices.insert(idx);
+                if (threshold_index_set.count(idx) > 0) {
+                    selected_indices.push_back(idx);
+                }
             }
-        }
-        std::vector<size_t> threshold_indices = engine_manager_->PoolSourceWriteTouchIndicesAtLeast(
-            engine_instance_id, block_ids, flow.selective_write_threshold(), timestamp);
-        std::vector<size_t> materialized_indices;
-        for (const size_t idx : threshold_indices) {
-            if (source_write_indices.count(idx) > 0) {
-                materialized_indices.push_back(idx);
+            if (!selected_indices.empty()) {
+                WriteMaterializedSequence(storage_pool_instance_id,
+                                          trace_id,
+                                          timestamp,
+                                          sequence.keys,
+                                          selected_indices,
+                                          ttl_us,
+                                          flow.shadow_write_touch_enabled());
             }
-        }
-        if (!materialized_indices.empty()) {
-            const size_t selected_prefix_len = materialized_indices.back() + 1;
-            std::vector<int64_t> selected_prefix(block_ids.begin(), block_ids.begin() + selected_prefix_len);
-            WriteMaterializedSequence(storage_pool_instance_id,
-                                      trace_id,
-                                      timestamp,
-                                      selected_prefix,
-                                      materialized_indices,
-                                      ttl_us,
-                                      flow.shadow_write_touch_enabled());
         }
     }
 }
