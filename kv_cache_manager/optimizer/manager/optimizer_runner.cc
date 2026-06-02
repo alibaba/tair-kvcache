@@ -16,14 +16,66 @@ namespace kv_cache_manager {
 namespace {
 int64_t TtlUsToNs(int64_t ttl_us) { return ttl_us > 0 ? ttl_us * 1000 : ttl_us; }
 
-[[noreturn]] void LogAndThrowReplayError(const std::string &message) {
-    KVCM_LOG_ERROR("%s", message.c_str());
-    throw std::runtime_error(message);
+void ValidateSupportedQueryTypeOrThrow(const std::string &query_type) {
+    if (!IsSupportedQueryType(query_type)) {
+        throw std::runtime_error("Unsupported optimizer query_type: " + query_type);
+    }
+}
+
+void MergeEvictedBlocks(OptIndexerManager::EvictedBlocks *dst, const OptIndexerManager::EvictedBlocks &src) {
+    if (dst == nullptr) {
+        return;
+    }
+    for (const auto &[instance_id, blocks] : src) {
+        auto &merged = (*dst)[instance_id];
+        merged.insert(merged.end(), blocks.begin(), blocks.end());
+    }
+}
+
+std::vector<int64_t> KeysForTierEvents(const std::shared_ptr<RadixTreeIndex> &indexer,
+                                       const std::string &instance_id,
+                                       const TierFlowRecorder &tier_flow,
+                                       const std::vector<TierFlowEventKind> &kinds,
+                                       const std::vector<TierFlowEventReason> &excluded_reasons = {}) {
+    if (!indexer) {
+        return {};
+    }
+    std::vector<int64_t> keys;
+    for (const auto *block :
+         tier_flow.BlocksForTier(instance_id, indexer->PoolSourceTierName(), kinds, excluded_reasons)) {
+        if (block != nullptr) {
+            keys.push_back(block->key);
+        }
+    }
+    return keys;
+}
+
+std::vector<int64_t> KeysForSourceTierWrites(const std::shared_ptr<RadixTreeIndex> &indexer,
+                                             const std::string &instance_id,
+                                             const TierFlowRecorder &tier_flow) {
+    const std::vector<TierFlowEventKind> source_write_kinds = {
+        TierFlowEventKind::ENTER_TIER,
+        TierFlowEventKind::WRITE_TOUCH,
+    };
+    const std::vector<TierFlowEventReason> excluded_source_write_reasons = {
+        TierFlowEventReason::WRITE_PROPAGATION,
+        TierFlowEventReason::PROMOTE,
+    };
+    return KeysForTierEvents(indexer, instance_id, tier_flow, source_write_kinds, excluded_source_write_reasons);
+}
+
+std::vector<int64_t> KeysForSourceTierEvictions(const std::shared_ptr<RadixTreeIndex> &indexer,
+                                                const std::string &instance_id,
+                                                const TierFlowRecorder &tier_flow) {
+    const std::vector<TierFlowEventKind> source_eviction_kinds = {
+        TierFlowEventKind::LEAVE_TIER,
+    };
+    return KeysForTierEvents(indexer, instance_id, tier_flow, source_eviction_kinds);
 }
 
 size_t ValidateFullBlockTrace(const GetLocationSchemaTrace &trace, size_t block_size) {
     if (block_size == 0) {
-        LogAndThrowReplayError("GetCacheLocation requires positive instance block_size");
+        throw std::runtime_error("GetCacheLocation requires positive instance block_size");
     }
 
     const size_t input_tokens = trace.input_token_count();
@@ -32,7 +84,7 @@ size_t ValidateFullBlockTrace(const GetLocationSchemaTrace &trace, size_t block_
         return input_tokens;
     }
 
-    LogAndThrowReplayError(
+    throw std::runtime_error(
         "GetCacheLocation trace contains partial tail block keys: instance_id=" + trace.instance_id() +
         ", trace_id=" + trace.trace_id() + ", keys=" + std::to_string(trace.keys().size()) +
         ", input_len=" + std::to_string(input_tokens) + ", block_size=" + std::to_string(block_size) +
@@ -44,7 +96,7 @@ size_t ValidateFullBlockTrace(const GetLocationSchemaTrace &trace, size_t block_
 void OptimizerRunner::Run(OptimizerConfig &config) {
     write_delay_ns_ = config.trace_replay_config().write_delay_ns();
     if (write_delay_ns_ <= 0) {
-        LogAndThrowReplayError("trace_replay.write_delay_ns must be positive");
+        throw std::runtime_error("trace_replay.write_delay_ns must be positive");
     }
     pending_writes_ = {};
     next_pending_write_sequence_ = 0;
@@ -67,17 +119,12 @@ void OptimizerRunner::RunTraces(const std::vector<std::shared_ptr<OptimizerSchem
     pending_writes_ = {};
     next_pending_write_sequence_ = 0;
     for (const auto &trace : traces) {
-        ReplayTraceWithPendingWrites(trace);
+        if (trace) {
+            FlushPendingWritesThrough(trace->timestamp_ns());
+        }
+        RunTrace(trace);
     }
     FlushAllPendingWrites();
-}
-
-void OptimizerRunner::ReplayTraceWithPendingWrites(const std::shared_ptr<OptimizerSchemaTrace> &trace) {
-    if (!trace) {
-        return;
-    }
-    FlushPendingWritesThrough(trace->timestamp_ns());
-    RunTrace(trace);
 }
 
 void OptimizerRunner::RunTrace(std::shared_ptr<OptimizerSchemaTrace> trace) {
@@ -88,10 +135,7 @@ void OptimizerRunner::RunTrace(std::shared_ptr<OptimizerSchemaTrace> trace) {
     if (auto request_trace = std::dynamic_pointer_cast<RequestSchemaTrace>(trace)) {
         HandleRequest(*request_trace);
     } else if (auto get_trace = std::dynamic_pointer_cast<GetLocationSchemaTrace>(trace)) {
-        if (get_trace->query_type() != "prefix_match") {
-            KVCM_LOG_WARN("Unsupported query type: %s", get_trace->query_type().c_str());
-            return;
-        }
+        ValidateSupportedQueryTypeOrThrow(get_trace->query_type());
         HandleGetLocation(*get_trace);
         stats_collector_->UpdateTimestamp(get_trace->instance_id(), get_trace->timestamp_ns());
     } else if (auto write_trace = std::dynamic_pointer_cast<WriteCacheSchemaTrace>(trace)) {
@@ -111,10 +155,7 @@ std::shared_ptr<RadixTreeIndex> OptimizerRunner::GetIndexer(const std::string &i
 }
 
 void OptimizerRunner::HandleRequest(const RequestSchemaTrace &trace) {
-    if (trace.query_type() != "prefix_match") {
-        KVCM_LOG_WARN("Unsupported query type: %s", trace.query_type().c_str());
-        return;
-    }
+    ValidateSupportedQueryTypeOrThrow(trace.query_type());
     HandleGetLocation(trace);
     stats_collector_->UpdateTimestamp(trace.instance_id(), trace.timestamp_ns());
     ScheduleRequestWrite(trace);
@@ -122,8 +163,8 @@ void OptimizerRunner::HandleRequest(const RequestSchemaTrace &trace) {
 
 void OptimizerRunner::ScheduleRequestWrite(const RequestSchemaTrace &trace) {
     if (trace.timestamp_ns() > std::numeric_limits<int64_t>::max() - write_delay_ns_) {
-        LogAndThrowReplayError("request write timestamp overflows int64: instance_id=" + trace.instance_id() +
-                               ", trace_id=" + trace.trace_id());
+        throw std::runtime_error("request write timestamp overflows int64: instance_id=" + trace.instance_id() +
+                                 ", trace_id=" + trace.trace_id());
     }
 
     WriteCacheSchemaTrace write_trace;
@@ -157,16 +198,16 @@ void OptimizerRunner::RunPendingWrite(const WriteCacheSchemaTrace &trace) {
     stats_collector_->UpdateTimestamp(trace.instance_id(), trace.timestamp_ns());
 }
 
-void OptimizerRunner::SubmitReadRecord(const std::string &instance_id,
-                                       const std::string &trace_id,
-                                       const std::vector<int64_t> &keys,
-                                       int64_t timestamp_ns,
-                                       const QueryHit &query_hit,
-                                       const std::shared_ptr<RadixTreeIndex> &indexer,
-                                       size_t local_read_block_num,
-                                       size_t remote_read_block_num,
-                                       size_t input_tokens,
-                                       size_t block_size_tokens) {
+ReadRecord OptimizerRunner::SubmitReadRecord(const std::string &instance_id,
+                                             const std::string &trace_id,
+                                             const std::vector<int64_t> &keys,
+                                             int64_t timestamp_ns,
+                                             const QueryHit &query_hit,
+                                             const std::shared_ptr<RadixTreeIndex> &indexer,
+                                             size_t local_read_block_num,
+                                             size_t remote_read_block_num,
+                                             size_t input_tokens,
+                                             size_t block_size_tokens) {
     ReadRecord record{};
     record.timestamp_ns = timestamp_ns;
     record.trace_id = trace_id;
@@ -183,6 +224,8 @@ void OptimizerRunner::SubmitReadRecord(const std::string &instance_id,
 
     record.remote_hit_blocks = query_hit.remote_hit_block_num;
     record.local_hit_blocks = query_hit.local_hit_block_num;
+    record.remote_hit_indices = query_hit.remote_hit_indices;
+    record.local_hit_indices = query_hit.local_hit_indices;
     record.per_tier_hit_blocks = query_hit.per_tier_hit_block_num;
     record.input_tokens = input_tokens;
     record.block_size_tokens = block_size_tokens;
@@ -192,23 +235,23 @@ void OptimizerRunner::SubmitReadRecord(const std::string &instance_id,
     record.remote_read_blocks = remote_read_block_num;
 
     stats_collector_->OnReadComplete(instance_id, record);
+    return record;
 }
 
-void OptimizerRunner::HandleGetLocation(const GetLocationSchemaTrace &trace,
-                                        bool touch_local_hits,
-                                        bool local_hits_are_reads) {
+ReadRecord OptimizerRunner::HandleGetLocation(const GetLocationSchemaTrace &trace,
+                                              bool touch_local_hits,
+                                              bool local_hits_are_reads) {
+    ReadRecord record{};
     std::string instance_id = trace.instance_id();
     auto indexer = GetIndexer(instance_id);
     if (!indexer) {
-        return;
+        return record;
     }
 
     const size_t block_size = indexer_manager_->GetInstanceBlockSize(instance_id);
     const size_t input_tokens = ValidateFullBlockTrace(trace, block_size);
 
-    // 读请求前统一清理过期 block，并做节点清理（TTL 使用逻辑过期时刻记录）
-    auto expired_evicted_blocks = indexer_manager_->EvictExpiredBeforeAccess(instance_id, trace.timestamp_ns());
-    indexer_manager_->CleanEvictedBlocks(expired_evicted_blocks, trace.timestamp_ns(), true);
+    auto pending_evicted_blocks = indexer_manager_->EvictExpiredBeforeAccess(instance_id, trace.timestamp_ns());
 
     bool refresh_ttl_on_read = true;
     auto it = instance_ttl_refresh_on_read_.find(instance_id);
@@ -217,16 +260,30 @@ void OptimizerRunner::HandleGetLocation(const GetLocationSchemaTrace &trace,
     }
 
     QueryHit query_hit;
-    indexer->PrefixQuery(trace.keys(),
-                         trace.block_mask(),
-                         trace.timestamp_ns(),
-                         &query_hit,
-                         refresh_ttl_on_read,
-                         touch_local_hits,
-                         local_hits_are_reads);
+    if (IsPrefixMatchQueryType(trace.query_type())) {
+        indexer->PrefixQuery(trace.keys(),
+                             trace.block_mask(),
+                             trace.timestamp_ns(),
+                             &query_hit,
+                             refresh_ttl_on_read,
+                             touch_local_hits,
+                             local_hits_are_reads);
+    } else if (IsBatchGetQueryType(trace.query_type())) {
+        indexer->BatchQuery(trace.keys(),
+                            trace.block_mask(),
+                            trace.timestamp_ns(),
+                            &query_hit,
+                            refresh_ttl_on_read,
+                            touch_local_hits,
+                            local_hits_are_reads);
+    } else {
+        ValidateSupportedQueryTypeOrThrow(trace.query_type());
+    }
+    TierFlowRecorder request_tier_flow = indexer->ConsumeTierFlow();
     if (indexer->ConsumeReadTriggeredTierWrite()) {
         auto capacity_eviction = indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_ns());
-        indexer_manager_->CleanEvictedBlocks(capacity_eviction.evicted_blocks, trace.timestamp_ns());
+        MergeEvictedBlocks(&pending_evicted_blocks, capacity_eviction.evicted_blocks);
+        request_tier_flow.MergeFrom(capacity_eviction.tier_flow);
     }
 
     size_t local_read_block_num = 0;
@@ -242,21 +299,34 @@ void OptimizerRunner::HandleGetLocation(const GetLocationSchemaTrace &trace,
     local_read_block_num = local_hits_are_reads ? local_mask_block_num : 0;
     remote_read_block_num = trace.keys().size() - local_mask_block_num;
 
-    SubmitReadRecord(instance_id,
-                     trace.trace_id(),
-                     trace.keys(),
-                     trace.timestamp_ns(),
-                     query_hit,
-                     indexer,
-                     local_read_block_num,
-                     remote_read_block_num,
-                     input_tokens,
-                     block_size);
+    record = SubmitReadRecord(instance_id,
+                              trace.trace_id(),
+                              trace.keys(),
+                              trace.timestamp_ns(),
+                              query_hit,
+                              indexer,
+                              local_read_block_num,
+                              remote_read_block_num,
+                              input_tokens,
+                              block_size);
+    record.evicted_keys = KeysForSourceTierEvictions(indexer, instance_id, request_tier_flow);
+    record.tier_flow_events = request_tier_flow.KeyEvents();
+    indexer_manager_->CleanEvictedBlocks(pending_evicted_blocks, trace.timestamp_ns(), true);
+    return record;
 }
 
-WriteRecord OptimizerRunner::HandleWriteCache(const WriteCacheSchemaTrace &trace,
-                                              bool touch_existing,
-                                              const std::vector<size_t> *materialized_indices) {
+WriteRecord OptimizerRunner::HandleWriteCache(const WriteCacheSchemaTrace &trace) {
+    return HandleCacheInsert(trace, true, nullptr);
+}
+
+WriteRecord OptimizerRunner::HandleFillCachePath(const WriteCacheSchemaTrace &trace,
+                                                 const std::vector<size_t> &materialized_indices) {
+    return HandleCacheInsert(trace, false, &materialized_indices);
+}
+
+WriteRecord OptimizerRunner::HandleCacheInsert(const WriteCacheSchemaTrace &trace,
+                                               bool count_new_tier_write_touch,
+                                               const std::vector<size_t> *materialized_indices) {
     WriteRecord record;
     record.timestamp_ns = trace.timestamp_ns();
     record.trace_id = trace.trace_id();
@@ -267,9 +337,7 @@ WriteRecord OptimizerRunner::HandleWriteCache(const WriteCacheSchemaTrace &trace
         return record;
     }
 
-    // 写请求前统一清理过期 block，并做节点清理（TTL 使用逻辑过期时刻记录）
-    auto expired_evicted_blocks = indexer_manager_->EvictExpiredBeforeAccess(instance_id, trace.timestamp_ns());
-    indexer_manager_->CleanEvictedBlocks(expired_evicted_blocks, trace.timestamp_ns(), true);
+    auto pending_evicted_blocks = indexer_manager_->EvictExpiredBeforeAccess(instance_id, trace.timestamp_ns());
 
     int64_t effective_ttl_ns = TtlUsToNs(trace.ttl_us());
     auto ttl_disabled_it = instance_group_ttl_disabled_.find(instance_id);
@@ -278,37 +346,21 @@ WriteRecord OptimizerRunner::HandleWriteCache(const WriteCacheSchemaTrace &trace
     }
 
     RadixTreeIndex::InsertResult result;
-    if (materialized_indices) {
-        result = indexer->InsertOnlyMaterialized(
-            trace.keys(), *materialized_indices, trace.timestamp_ns(), effective_ttl_ns, touch_existing);
+    if (count_new_tier_write_touch) {
+        result = indexer->InsertOnly(trace.keys(), trace.timestamp_ns(), effective_ttl_ns);
+    } else if (materialized_indices != nullptr) {
+        result = indexer->FillPathOnly(trace.keys(), *materialized_indices, trace.timestamp_ns(), effective_ttl_ns);
     } else {
-        result = indexer->InsertOnly(trace.keys(), trace.timestamp_ns(), effective_ttl_ns, touch_existing);
+        throw std::runtime_error("HandleCacheInsert fill requires materialized indices");
     }
-    auto pool_source_write_sequences = indexer->MaterializedSequencesForBlocks(result.pool_source_written_blocks);
-
     auto capacity_eviction = indexer_manager_->CheckAndEvict(instance_id, trace.timestamp_ns());
     const auto &capacity_evicted_blocks = capacity_eviction.evicted_blocks;
-    auto last_tier_writes_it = capacity_eviction.last_tier_write_blocks.find(instance_id);
-    if (last_tier_writes_it != capacity_eviction.last_tier_write_blocks.end()) {
-        auto source_write_sequences = indexer->MaterializedSequencesForBlocks(last_tier_writes_it->second);
-        for (auto &sequence : source_write_sequences) {
-            pool_source_write_sequences.push_back(std::move(sequence));
-        }
-    }
-    std::vector<MaterializedKeySequence> evicted_materialized_sequences;
-    for (const auto &[_, blocks] : capacity_evicted_blocks) {
-        std::vector<BlockEntry *> fully_evicted_blocks;
-        for (auto *block : blocks) {
-            if (block != nullptr && block->location_map.empty()) {
-                fully_evicted_blocks.push_back(block);
-            }
-        }
-        auto materialized_sequences = indexer->MaterializedSequencesForBlocks(fully_evicted_blocks);
-        for (auto &sequence : materialized_sequences) {
-            evicted_materialized_sequences.push_back(std::move(sequence));
-        }
-    }
-    indexer_manager_->CleanEvictedBlocks(capacity_evicted_blocks, trace.timestamp_ns());
+    MergeEvictedBlocks(&pending_evicted_blocks, capacity_evicted_blocks);
+    TierFlowRecorder request_tier_flow = std::move(result.tier_flow);
+    request_tier_flow.MergeFrom(capacity_eviction.tier_flow);
+
+    auto pool_source_write_keys = KeysForSourceTierWrites(indexer, instance_id, request_tier_flow);
+    std::vector<int64_t> evicted_keys = KeysForSourceTierEvictions(indexer, instance_id, request_tier_flow);
     bool evicted = !capacity_evicted_blocks.empty();
     if (evicted) {
         KVCM_LOG_DEBUG("Eviction at ts=%lld for instance_id: %s",
@@ -316,11 +368,25 @@ WriteRecord OptimizerRunner::HandleWriteCache(const WriteCacheSchemaTrace &trace
                        instance_id.c_str());
     }
 
-    record.write_blocks = materialized_indices ? materialized_indices->size() : trace.keys().size();
+    size_t write_blocks = trace.keys().size();
+    if (materialized_indices != nullptr) {
+        std::vector<bool> selected(trace.keys().size(), false);
+        for (const size_t idx : *materialized_indices) {
+            if (idx < selected.size()) {
+                selected[idx] = true;
+            }
+        }
+        write_blocks = std::count(selected.begin(), selected.end(), true);
+    }
+    record.write_blocks = write_blocks;
     record.newly_inserted_blocks = result.inserted_keys.size();
-    record.pool_source_write_sequences = std::move(pool_source_write_sequences);
-    record.evicted_materialized_sequences = std::move(evicted_materialized_sequences);
-    stats_collector_->OnWriteComplete(instance_id, record);
+    record.pool_source_write_keys = std::move(pool_source_write_keys);
+    record.evicted_keys = std::move(evicted_keys);
+    record.tier_flow_events = request_tier_flow.KeyEvents();
+    if (count_new_tier_write_touch) {
+        stats_collector_->OnWriteComplete(instance_id, record);
+    }
+    indexer_manager_->CleanEvictedBlocks(pending_evicted_blocks, trace.timestamp_ns(), true);
     return record;
 }
 } // namespace kv_cache_manager

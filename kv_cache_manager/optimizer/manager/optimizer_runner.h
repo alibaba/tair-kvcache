@@ -36,7 +36,8 @@ public:
                            bool local_hits_are_reads = true);
     WriteRecord HandleWriteCache(const WriteCacheSchemaTrace &trace,
                                  bool touch_existing = true,
-                                 const std::vector<size_t> *materialized_indices = nullptr);
+                                 const std::vector<size_t> *materialized_indices = nullptr,
+                                 bool count_new_tier_write_touch = true);
 
 private:
     struct PendingWrite {

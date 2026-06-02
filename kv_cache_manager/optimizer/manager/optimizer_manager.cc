@@ -224,14 +224,16 @@ WriteCacheRes OptimizerManager::WriteCacheWithTtlUs(const std::string &instance_
                                                     const int64_t timestamp,
                                                     const std::vector<int64_t> &block_ids,
                                                     const int64_t ttl_us,
-                                                    bool touch_existing) {
+                                                    bool touch_existing,
+                                                    bool count_new_tier_write_touch) {
     WriteCacheSchemaTrace trace;
     trace.set_instance_id(instance_id);
     trace.set_trace_id(trace_id);
     trace.set_timestamp_ns(timestamp);
     trace.set_keys(block_ids);
     trace.set_ttl_us(ttl_us);
-    const auto write_record = optimizer_runner_->HandleWriteCache(trace, touch_existing);
+    const auto write_record =
+        optimizer_runner_->HandleWriteCache(trace, touch_existing, nullptr, count_new_tier_write_touch);
     stats_collector_->UpdateTimestamp(instance_id, timestamp);
 
     WriteCacheRes res;
@@ -252,14 +254,16 @@ WriteCacheRes OptimizerManager::WriteCacheWithMaterializedIndices(const std::str
                                                                   const std::vector<int64_t> &block_ids,
                                                                   const std::vector<size_t> &materialized_indices,
                                                                   const int64_t ttl_us,
-                                                                  bool touch_existing) {
+                                                                  bool touch_existing,
+                                                                  bool count_new_tier_write_touch) {
     WriteCacheSchemaTrace trace;
     trace.set_instance_id(instance_id);
     trace.set_trace_id(trace_id);
     trace.set_timestamp_ns(timestamp);
     trace.set_keys(block_ids);
     trace.set_ttl_us(ttl_us);
-    const auto write_record = optimizer_runner_->HandleWriteCache(trace, touch_existing, &materialized_indices);
+    const auto write_record =
+        optimizer_runner_->HandleWriteCache(trace, touch_existing, &materialized_indices, count_new_tier_write_touch);
     stats_collector_->UpdateTimestamp(instance_id, timestamp);
 
     WriteCacheRes res;

@@ -354,7 +354,7 @@ TEST_F(OptEvictionManagerTest, EvictFromNonExistentInstance) {
         auto evicted = manager_->EvictByMode("non_existent_instance", instance_group_config, 0);
         // 如果没有抛出异常,检查返回值
         EXPECT_TRUE(evicted.evicted_blocks.empty());
-        EXPECT_TRUE(evicted.last_tier_write_blocks.empty());
+        EXPECT_TRUE(evicted.tier_flow.empty());
     } catch (...) {
         // 如果抛出异常,也是可以接受的
         SUCCEED();
@@ -405,7 +405,47 @@ TEST_F(OptEvictionManagerTest, DemoteToNextTierCreatesNewTierLocationAtDemoteTim
     EXPECT_EQ(block.location_map.at("tier2").access_count, 0);
     EXPECT_EQ(block.location_map.at("tier2").last_access_time, 9000);
     EXPECT_EQ(block.location_map.at("tier2").writing_time, 9000);
-    EXPECT_EQ(block.location_map.at("tier2").write_touch_count, 1);
+    EXPECT_EQ(block.location_map.at("tier2").write_touch_count, 0);
+}
+
+TEST_F(OptEvictionManagerTest, DemoteWriteThroughContinuesWhenTargetTierExists) {
+    auto instance_config = CreateTestInstanceConfig("instance1");
+    std::vector<OptTierConfig> tier_configs;
+    OptTierConfig tier1;
+    tier1.set_unique_name("tier1");
+    tier1.set_capacity(1024);
+    tier_configs.push_back(tier1);
+    OptTierConfig tier2;
+    tier2.set_unique_name("tier2");
+    tier2.set_capacity(1024);
+    tier_configs.push_back(tier2);
+    OptTierConfig tier3;
+    tier3.set_unique_name("tier3");
+    tier3.set_capacity(1024);
+    tier_configs.push_back(tier3);
+
+    auto *policy_group = manager_->CreateAndRegisterEvictionPolicy(instance_config, tier_configs, true);
+    ASSERT_NE(policy_group, nullptr);
+
+    BlockEntry block;
+    block.key = 1;
+    block.location_map["tier1"] = TierStat{0, 1000, 1000};
+    block.location_map["tier2"] = TierStat{0, 1000, 1000};
+    policy_group->GetPolicyByIndex(0)->OnBlockWritten(&block);
+
+    auto evicted = policy_group->GetPolicyByIndex(0)->EvictBlocks(1);
+    ASSERT_EQ(evicted.size(), 1);
+    ASSERT_EQ(block.location_map.count("tier1"), 0);
+    ASSERT_EQ(block.location_map.count("tier2"), 1);
+
+    std::vector<TierFlowStrategy> flows(2);
+    flows[0].write_mode = TierWriteMode::CASCADING;
+    flows[1].write_mode = TierWriteMode::WRITE_THROUGH;
+    manager_->DemoteToNextTier("instance1", 1, evicted, 9000, flows);
+
+    EXPECT_EQ(block.location_map.count("tier2"), 1);
+    EXPECT_EQ(block.location_map.count("tier3"), 1);
+    EXPECT_EQ(block.location_map.at("tier3").write_touch_count, 0);
 }
 
 TEST_F(OptEvictionManagerTest, ActiveEvictExpiredShouldNotTriggerFallbackEviction) {

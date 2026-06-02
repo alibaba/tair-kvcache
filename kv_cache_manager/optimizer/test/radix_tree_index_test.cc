@@ -135,6 +135,31 @@ TEST_F(RadixTreeIndexTest, InsertOnlyWriteThroughRefreshesOnlyEntryTier) {
     EXPECT_EQ(block->location_map.at("l2").last_access_time, 1000);
 }
 
+TEST_F(RadixTreeIndexTest, InsertOnlyTouchesHighestExistingTierWhenEntryTierMissing) {
+    LruParams params;
+    params.sample_rate = 1.0;
+    std::vector<std::shared_ptr<EvictionPolicy>> policies = {
+        std::make_shared<LruEvictionPolicy>("l1", params),
+        std::make_shared<LruEvictionPolicy>("l2", params),
+    };
+    auto index = std::make_shared<RadixTreeIndex>("test_instance", policies, TierWriteMode::WRITE_THROUGH);
+    index->InsertOnly({1}, 1000);
+
+    auto *block = index->GetRoot()->children.at(1)->blocks[0].get();
+    ASSERT_EQ(block->location_map.count("l1"), 1);
+    ASSERT_EQ(block->location_map.count("l2"), 1);
+    EXPECT_EQ(block->location_map.at("l2").write_touch_count, 0);
+
+    block->location_map.erase("l1");
+    auto result = index->InsertOnly({1}, 2000);
+
+    EXPECT_TRUE(result.inserted_keys.empty());
+    EXPECT_EQ(block->location_map.count("l1"), 0);
+    ASSERT_EQ(block->location_map.count("l2"), 1);
+    EXPECT_EQ(block->location_map.at("l2").last_access_time, 2000);
+    EXPECT_EQ(block->location_map.at("l2").write_touch_count, 1);
+}
+
 TEST_F(RadixTreeIndexTest, InsertOnlyWriteCanPropagateTouchToLowerTier) {
     LruParams params;
     params.sample_rate = 1.0;
@@ -157,6 +182,8 @@ TEST_F(RadixTreeIndexTest, InsertOnlyWriteCanPropagateTouchToLowerTier) {
 
     EXPECT_EQ(block->location_map.at("l1").last_access_time, 2000);
     EXPECT_EQ(block->location_map.at("l2").last_access_time, 2000);
+    EXPECT_EQ(block->location_map.at("l1").write_touch_count, 2);
+    EXPECT_EQ(block->location_map.at("l2").write_touch_count, 0);
 }
 
 TEST_F(RadixTreeIndexTest, InsertOnlyCanSkipExistingBlockTouch) {
@@ -380,8 +407,69 @@ TEST_F(RadixTreeIndexTest, SelectiveWriteToNextTierAfterWriteTouchThreshold) {
     EXPECT_EQ(block->location_map.count("l2"), 1);
     EXPECT_EQ(block->location_map.at("l2").access_count, 0);
     EXPECT_EQ(block->location_map.at("l1").write_touch_count, 2);
-    EXPECT_EQ(block->location_map.at("l2").write_touch_count, 1);
+    EXPECT_EQ(block->location_map.at("l2").write_touch_count, 0);
     EXPECT_FALSE(index->ConsumeReadTriggeredTierWrite());
+}
+
+TEST_F(RadixTreeIndexTest, WritePropagationDoesNotTriggerLowerSelectiveWrite) {
+    LruParams params;
+    params.sample_rate = 1.0;
+    std::vector<std::shared_ptr<EvictionPolicy>> policies = {
+        std::make_shared<LruEvictionPolicy>("l1", params),
+        std::make_shared<LruEvictionPolicy>("l2", params),
+        std::make_shared<LruEvictionPolicy>("l3", params),
+    };
+    std::vector<TierFlowStrategy> flows(2);
+    flows[0].write_mode = TierWriteMode::WRITE_THROUGH;
+    flows[0].write_propagation_enabled = true;
+    flows[1].write_mode = TierWriteMode::WRITE_THROUGH_SELECTIVE;
+    flows[1].selective_write_threshold = 2;
+    auto index =
+        std::make_shared<RadixTreeIndex>("test_instance", policies, TierWriteMode::WRITE_THROUGH, 0, 2, true, flows);
+    index->InsertOnly({47}, 1000);
+
+    auto *block = index->GetRoot()->children.at(47)->blocks[0].get();
+    ASSERT_EQ(block->location_map.count("l1"), 1);
+    ASSERT_EQ(block->location_map.count("l2"), 1);
+    ASSERT_EQ(block->location_map.count("l3"), 0);
+    EXPECT_EQ(block->location_map.at("l2").write_touch_count, 0);
+
+    index->InsertOnly({47}, 2000);
+
+    EXPECT_EQ(block->location_map.at("l1").write_touch_count, 2);
+    EXPECT_EQ(block->location_map.at("l2").last_access_time, 2000);
+    EXPECT_EQ(block->location_map.at("l2").write_touch_count, 0);
+    EXPECT_EQ(block->location_map.count("l3"), 0);
+}
+
+TEST_F(RadixTreeIndexTest, SelectiveWriteThroughContinuesWhenTargetTierExists) {
+    LruParams params;
+    params.sample_rate = 1.0;
+    std::vector<std::shared_ptr<EvictionPolicy>> policies = {
+        std::make_shared<LruEvictionPolicy>("l1", params),
+        std::make_shared<LruEvictionPolicy>("l2", params),
+        std::make_shared<LruEvictionPolicy>("l3", params),
+    };
+    std::vector<TierFlowStrategy> flows(2);
+    flows[0].write_mode = TierWriteMode::WRITE_THROUGH_SELECTIVE;
+    flows[0].selective_write_threshold = 2;
+    flows[1].write_mode = TierWriteMode::WRITE_THROUGH;
+    auto index =
+        std::make_shared<RadixTreeIndex>("test_instance", policies, TierWriteMode::WRITE_THROUGH, 0, 2, true, flows);
+    index->InsertOnly({48}, 1000);
+
+    auto *block = index->GetRoot()->children.at(48)->blocks[0].get();
+    ASSERT_EQ(block->location_map.count("l1"), 1);
+    AppendBlockLocation(block, "l2", 1000, 0);
+    ASSERT_EQ(block->location_map.count("l2"), 1);
+    ASSERT_EQ(block->location_map.count("l3"), 0);
+
+    index->InsertOnly({48}, 2000);
+
+    EXPECT_EQ(block->location_map.at("l1").write_touch_count, 2);
+    EXPECT_EQ(block->location_map.count("l2"), 1);
+    EXPECT_EQ(block->location_map.count("l3"), 1);
+    EXPECT_EQ(block->location_map.at("l3").write_touch_count, 0);
 }
 
 TEST_F(RadixTreeIndexTest, TierFlowsControlInitialWritePerEdge) {

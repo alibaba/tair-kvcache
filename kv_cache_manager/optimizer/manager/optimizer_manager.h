@@ -39,14 +39,16 @@ public:
                                       const int64_t timestamp,
                                       const std::vector<int64_t> &block_ids,
                                       const int64_t ttl_us,
-                                      bool touch_existing = true);
+                                      bool touch_existing = true,
+                                      bool count_new_tier_write_touch = true);
     WriteCacheRes WriteCacheWithMaterializedIndices(const std::string &instance_id,
                                                     const std::string &trace_id,
                                                     const int64_t timestamp,
                                                     const std::vector<int64_t> &block_ids,
                                                     const std::vector<size_t> &materialized_indices,
                                                     const int64_t ttl_us,
-                                                    bool touch_existing = true);
+                                                    bool touch_existing = true,
+                                                    bool count_new_tier_write_touch = true);
     GetCacheLocationRes GetCacheLocation(const std::string &instance_id,
                                          const std::string &trace_id,
                                          const int64_t timestamp,
