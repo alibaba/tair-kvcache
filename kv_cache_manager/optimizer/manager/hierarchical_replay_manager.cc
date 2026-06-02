@@ -290,6 +290,10 @@ HierarchicalGetCacheLocationRes HierarchicalReplayManager::GetCacheLocation(cons
         std::min(static_cast<size_t>(std::max<int64_t>(engine_res.kvcm_hit_length, 0)), block_ids.size());
 
     const auto &storage_pool_flow = StoragePoolFlowForEngine(engine_instance_id);
+    WriteCacheRes engine_read_evictions;
+    engine_read_evictions.evicted_materialized_sequences = engine_res.evicted_materialized_sequences;
+    engine_storage_pool_connector_->ApplyCascadingEvictions(
+        storage_pool_instance_id, trace_id, timestamp, 0, storage_pool_flow, engine_read_evictions);
     const auto storage_pool_read = engine_storage_pool_connector_->ApplyReadFlow(engine_instance_id,
                                                                                  storage_pool_instance_id,
                                                                                  trace_id,

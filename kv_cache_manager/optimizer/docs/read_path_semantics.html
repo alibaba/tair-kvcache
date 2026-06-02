@@ -119,7 +119,7 @@
           <td class="phase">read promote</td>
           <td>block 命中低层，且向高层 edge 的 <code>promote_enabled = true</code></td>
           <td>新高层副本初始化 tier stat，<code>write_touch_count = 0</code></td>
-          <td>copy 到经过的高层并记录 <code>ENTER_TIER</code>；容量驱逐记录 <code>LEAVE_TIER</code>/<code>FINAL_EVICT</code></td>
+          <td>copy 到经过的高层并记录 <code>ENTER_TIER</code>；容量驱逐记录 <code>LEAVE_TIER</code>/<code>FINAL_EVICT</code>，engine pool-source 层驱逐可触发 cascading 写 pool</td>
           <td>命中统计保持为本次原始 read hit</td>
         </tr>
         <tr>

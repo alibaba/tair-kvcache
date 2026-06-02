@@ -31,6 +31,7 @@ struct ReadRecord {
     std::vector<std::string> tier_names;     // tier names for CSV column headers
     std::vector<size_t> per_tier_blocks;     // per-tier block num for current instance
     std::vector<size_t> blocks_per_instance;
+    std::vector<MaterializedKeySequence> evicted_materialized_sequences;
     std::string trace_id;
     const std::vector<int64_t> *keys_ptr = nullptr; // 借用，仅 OnReadComplete 期间有效
 };

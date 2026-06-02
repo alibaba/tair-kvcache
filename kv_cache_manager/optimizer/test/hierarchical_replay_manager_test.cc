@@ -556,6 +556,39 @@ TEST_F(HierarchicalReplayManagerTest, PoolPromoteEvictionWritesBackToPoolWhenCas
     EXPECT_EQ(victim_check.storage_pool_hit_length, 1);
 }
 
+TEST_F(HierarchicalReplayManagerTest, EngineReadPromoteSourceTierEvictionWritesBackToPoolWhenCascading) {
+    const std::string root = GetTestTempRootPath() + "/hierarchical_replay_engine_promote_source_writeback";
+    HierarchicalReplayConfig config = CreateHierarchicalConfig(root);
+    OptimizerConfig engine_config =
+        CreateEngineOptimizerConfig("engine_group", {"engine_a", "engine_b"}, {"hbm", "dram"}, root + "/infer", 16);
+    for (auto &group : engine_config.mutable_instance_groups()) {
+        OptTierFlowPolicyConfig policy = group.tier_flow_policy();
+        policy.set_write_mode(TierWriteMode::CASCADING);
+        policy.set_promote_enabled(true);
+        group.set_tier_flow_policy(policy);
+    }
+    config.set_engine_config(engine_config);
+    StoragePoolFlowConfig flow = CreateStoragePoolFlow();
+    flow.set_write_mode(TierWriteMode::CASCADING);
+    SetStoragePoolFlow(config, flow);
+
+    HierarchicalReplayManager manager(config);
+    ASSERT_TRUE(manager.Init());
+
+    const std::vector<int64_t> first = {721};
+    const std::vector<int64_t> second = {722};
+    manager.WriteCache("engine_a", "write_first", 1000, first);
+    manager.WriteCache("engine_a", "demote_first_to_source", 1100, second);
+
+    auto first_engine_hit = manager.GetCacheLocation("engine_a", "promote_first", 1200, first, 16);
+    EXPECT_EQ(first_engine_hit.engine_hit_length, 1);
+    EXPECT_EQ(first_engine_hit.storage_pool_hit_length, 0);
+
+    auto first_pool_hit = manager.GetCacheLocation("engine_b", "read_first_from_pool", 1300, first, 16);
+    auto second_pool_hit = manager.GetCacheLocation("engine_b", "read_second_from_pool", 1400, second, 16);
+    EXPECT_GE(first_pool_hit.storage_pool_hit_length + second_pool_hit.storage_pool_hit_length, 1);
+}
+
 TEST_F(HierarchicalReplayManagerTest, StoragePoolUsesFullKeysAfterEnginePrefixHit) {
     const std::string root = GetTestTempRootPath() + "/hierarchical_replay_full_keys_to_pool";
     HierarchicalReplayConfig config = CreateHierarchicalConfig(root);

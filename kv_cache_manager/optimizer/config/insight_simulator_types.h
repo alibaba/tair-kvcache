@@ -10,6 +10,7 @@ namespace kv_cache_manager {
 struct GetCacheLocationRes {
     std::string trace_id;
     int64_t kvcm_hit_length;
+    std::vector<MaterializedKeySequence> evicted_materialized_sequences;
 };
 
 struct WriteCacheRes {

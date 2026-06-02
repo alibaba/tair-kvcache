@@ -290,7 +290,7 @@ GetCacheLocationRes OptimizerManager::GetCacheLocation(const std::string &instan
     trace.set_keys(block_ids);
     trace.set_input_len(RequirePositiveInputLen("GetCacheLocation", input_len));
     trace.set_block_mask(block_mask);
-    optimizer_runner_->HandleGetLocation(trace, touch_local_hits, local_hits_are_reads);
+    const auto read_record = optimizer_runner_->HandleGetLocation(trace, touch_local_hits, local_hits_are_reads);
     stats_collector_->UpdateTimestamp(instance_id, timestamp);
 
     GetCacheLocationRes res;
@@ -303,6 +303,7 @@ GetCacheLocationRes OptimizerManager::GetCacheLocation(const std::string &instan
                                   ? last_read->local_hit_blocks
                                   : last_read->remote_hit_blocks;
     }
+    res.evicted_materialized_sequences = read_record.evicted_materialized_sequences;
     return res;
 }
 
