@@ -81,10 +81,10 @@
       </thead>
       <tbody>
         <tr>
-          <td class="phase">读前清理</td>
+          <td class="phase">读前 TTL 处理</td>
           <td>每次 read/get 开始前</td>
-          <td>清理 TTL 过期 block 和空 location</td>
-          <td>只删除已过期数据</td>
+          <td>移除 TTL 过期 location</td>
+          <td>只做逻辑过期；空节点物理清理延迟到本次请求结尾</td>
           <td>进入后续前缀查询</td>
         </tr>
         <tr>
@@ -105,21 +105,21 @@
           <td class="phase">命中最高层 tier</td>
           <td>按 tier 顺序找到第一个持有该 block 的 tier</td>
           <td>该 tier <code>access_count += 1</code>，<code>last_access_time = now</code></td>
-          <td>touch 该 tier 的 eviction policy</td>
+          <td>touch 该 tier 的 eviction policy，并记录 <code>READ_TOUCH</code></td>
           <td>计入该 tier hit</td>
         </tr>
         <tr>
           <td class="phase">向下 access propagation</td>
           <td>低层已有副本，且相邻 edge 的 <code>access_propagation_enabled = true</code></td>
           <td>低层 tier <code>last_access_time = now</code></td>
-          <td>只刷新已有低层副本冷热，不创建新副本</td>
+          <td>只刷新已有低层副本冷热，不创建新副本，并记录 <code>READ_TOUCH</code></td>
           <td>命中归属保持为最高命中 tier</td>
         </tr>
         <tr>
           <td class="phase">read promote</td>
           <td>block 命中低层，且向高层 edge 的 <code>promote_enabled = true</code></td>
-          <td>新高层副本初始化 tier stat</td>
-          <td>copy 到经过的高层，可能触发容量检查和驱逐</td>
+          <td>新高层副本初始化 tier stat，<code>write_touch_count = 0</code></td>
+          <td>copy 到经过的高层并记录 <code>ENTER_TIER</code>；容量驱逐记录 <code>LEAVE_TIER</code>/<code>FINAL_EVICT</code></td>
           <td>命中统计保持为本次原始 read hit</td>
         </tr>
         <tr>
@@ -139,9 +139,16 @@
         <tr>
           <td class="phase">storage pool hit 回填 engine</td>
           <td>storage pool hit，且 <code>storage_pool_flow.promote_enabled = true</code></td>
-          <td>engine 写入新副本</td>
-          <td>回填 engine；若 engine eviction 且 storage pool flow 是 <code>cascading</code>，evicted sequence 写入 pool</td>
+          <td>以完整命中 prefix 回填 engine，已有 engine prefix 不做 write touch，新回填 suffix 的 <code>write_touch_count = 0</code></td>
+          <td>回填 engine 最高层；若回填触发 engine 最终驱逐，且 storage pool flow 是 <code>cascading</code>，evicted sequence 写入 pool</td>
           <td>命中统计保持为 storage pool <code>RemoteHit</code></td>
+        </tr>
+        <tr>
+          <td class="phase">读后统一清理</td>
+          <td>本次 read/promote 结束后</td>
+          <td>清理本次 TTL/容量驱逐后已经没有 location 的 block</td>
+          <td>统一裁剪空 block 和空叶子节点</td>
+          <td>生命周期淘汰信息在最终驱逐时记录</td>
         </tr>
       </tbody>
     </table>
