@@ -30,6 +30,8 @@ public:
     bool Start(int32_t port, size_t thread_num = std::thread::hardware_concurrency());
     void Stop();
 
+    void MergeFrom(const CoroHttpService &other);
+
     static std::string GetHttpClientIp(const coro_http::coro_http_connection *http_conn);
 
 protected:
