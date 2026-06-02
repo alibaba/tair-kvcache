@@ -25,13 +25,16 @@ COMMANDS = {
 
     "trace_key": "kvcm_ops.trace.trace_key",
     "trace_uri": "kvcm_ops.trace.trace_uri",
+
+    "config_server": "kvcm_ops.config_server",
 }
 
 HELP_MODULE = [
     "kvcm_ops.kvcm.instance._help",
     "kvcm_ops.kvcm.instance_group._help",
     "kvcm_ops.kvcm.storage._help",
-    "kvcm_ops.trace._help"
+    "kvcm_ops.trace._help",
+    "kvcm_ops.config_server._help",
 ]
 
 def main():
@@ -76,6 +79,12 @@ def main():
   trace:
     trace_key
     trace_uri
+  config_server:           (use: python3 -m kvcm_ops config_server <sub> ...)
+    create-zone              create a new zone
+    delete-zone              delete an existing zone
+    list-zones               list all zones on the server
+    instance_pin            (instance_pin mode)
+    server_capability       (detect server routing mode)
         '''
     )
     parser.add_argument(

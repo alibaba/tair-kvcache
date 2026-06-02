@@ -9,6 +9,7 @@ py_library(
         "kvcm/**/*.py",
         "trace/**/*.py",
         "util/**/*.py",
+        "config_server/**/*.py",
         "*.py",
     ]),
 )
