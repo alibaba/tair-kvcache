@@ -136,6 +136,15 @@ ErrorCode VineyardBackend::UnregisterNode(const std::string &host_ip_port) {
         KVCM_LOG_WARN("VineyardBackend: node [%s] not found for unregister", host_ip_port.c_str());
         return EC_NOENT;
     }
+    if (metrics_registry_) {
+        auto &info = *it->second;
+        for (const auto &kv : info.last_system_status) {
+            auto data = metrics_registry_->GetMetricsData("v6d." + kv.first);
+            if (data) {
+                data->RemoveByTags(info.metrics_tags);
+            }
+        }
+    }
     nodes_.erase(it);
     KVCM_LOG_INFO("VineyardBackend: node [%s] unregistered from cluster [%s]",
                   host_ip_port.c_str(),
@@ -187,6 +196,20 @@ void VineyardBackend::SetNodeUnavailable(const std::string &host_ip_port) {
     bool prev = info.available.exchange(false, std::memory_order_relaxed);
     if (prev) {
         info.unavailable_since_ms.store(NowMillis(), std::memory_order_relaxed);
+        ZeroNodeGauges(info);
+    }
+}
+
+void VineyardBackend::ZeroNodeGauges(const NodeInfo &info) {
+    if (!metrics_registry_) {
+        return;
+    }
+    for (const auto &kv : info.last_system_status) {
+        auto data = metrics_registry_->GetMetricsData("v6d." + kv.first);
+        if (data) {
+            auto gauge = data->GetOrCreateGauge(info.metrics_tags);
+            gauge = 0.0;
+        }
     }
 }
 
@@ -247,6 +270,7 @@ void VineyardBackend::LivenessCheckerLoop() {
                     KVCM_LOG_WARN("VineyardBackend: node [%s] timed out (no hb for %ldms), marked unavailable",
                                   kv.first.c_str(),
                                   now_ms - last_hb);
+                    ZeroNodeGauges(info);
                 }
                 int64_t unavailable_since = info.unavailable_since_ms.load(std::memory_order_relaxed);
                 if (unavailable_since > 0 && now_ms - unavailable_since >= cleanup_grace_ms_) {

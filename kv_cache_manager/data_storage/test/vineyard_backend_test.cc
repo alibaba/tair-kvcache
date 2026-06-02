@@ -344,3 +344,77 @@ TEST_F(VineyardBackendTest, OnHeartbeatPublishesMetricsGauges) {
 
     ASSERT_EQ(EC_OK, backend.Close());
 }
+
+TEST_F(VineyardBackendTest, SetNodeUnavailableZerosGauges) {
+    VineyardBackend backend(metrics_registry_);
+    ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 5000, /*grace*/ 10000, /*tick*/ 50), "trace"));
+
+    ASSERT_EQ(EC_OK, backend.RegisterNode("10.0.0.30:9600", {"mem"}));
+    ASSERT_EQ(EC_OK, backend.RegisterNode("10.0.0.31:9600", {"mem"}));
+
+    backend.OnHeartbeat("10.0.0.30:9600", {{"hit_rate", "0.90"}, {"mem_used", "8192"}});
+    backend.OnHeartbeat("10.0.0.31:9600", {{"hit_rate", "0.80"}, {"mem_used", "4096"}});
+
+    MetricsTags tags_30 = {{"instance_id", "v6d_cluster_test"}, {"host", "10.0.0.30:9600"}};
+    MetricsTags tags_31 = {{"instance_id", "v6d_cluster_test"}, {"host", "10.0.0.31:9600"}};
+
+    auto hr_data = metrics_registry_->GetMetricsData("v6d.hit_rate");
+    ASSERT_NE(hr_data, nullptr);
+    ASSERT_DOUBLE_EQ(0.90, hr_data->GetOrCreateGauge(tags_30).Get());
+    ASSERT_DOUBLE_EQ(0.80, hr_data->GetOrCreateGauge(tags_31).Get());
+
+    backend.SetNodeUnavailable("10.0.0.30:9600");
+
+    // node 30's gauges should be zeroed
+    ASSERT_DOUBLE_EQ(0.0, hr_data->GetOrCreateGauge(tags_30).Get());
+    auto mu_data = metrics_registry_->GetMetricsData("v6d.mem_used");
+    ASSERT_DOUBLE_EQ(0.0, mu_data->GetOrCreateGauge(tags_30).Get());
+
+    // node 31's gauges should be untouched
+    ASSERT_DOUBLE_EQ(0.80, hr_data->GetOrCreateGauge(tags_31).Get());
+    ASSERT_DOUBLE_EQ(4096, mu_data->GetOrCreateGauge(tags_31).Get());
+
+    // calling SetNodeUnavailable again should be a no-op (already unavailable)
+    backend.SetNodeUnavailable("10.0.0.30:9600");
+    ASSERT_DOUBLE_EQ(0.0, hr_data->GetOrCreateGauge(tags_30).Get());
+
+    ASSERT_EQ(EC_OK, backend.Close());
+}
+
+TEST_F(VineyardBackendTest, UnregisterNodeCleansUpGauges) {
+    VineyardBackend backend(metrics_registry_);
+    ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 5000, /*grace*/ 10000, /*tick*/ 50), "trace"));
+
+    ASSERT_EQ(EC_OK, backend.RegisterNode("10.0.0.20:9600", {"mem"}));
+    ASSERT_EQ(EC_OK, backend.RegisterNode("10.0.0.21:9600", {"mem"}));
+
+    backend.OnHeartbeat("10.0.0.20:9600", {{"hit_rate", "0.75"}, {"mem_used", "4096"}});
+    backend.OnHeartbeat("10.0.0.21:9600", {{"hit_rate", "0.60"}, {"mem_used", "2048"}});
+
+    MetricsTags tags_20 = {{"instance_id", "v6d_cluster_test"}, {"host", "10.0.0.20:9600"}};
+    MetricsTags tags_21 = {{"instance_id", "v6d_cluster_test"}, {"host", "10.0.0.21:9600"}};
+
+    auto hr_data = metrics_registry_->GetMetricsData("v6d.hit_rate");
+    ASSERT_NE(hr_data, nullptr);
+    ASSERT_DOUBLE_EQ(0.75, hr_data->GetOrCreateGauge(tags_20).Get());
+    ASSERT_DOUBLE_EQ(0.60, hr_data->GetOrCreateGauge(tags_21).Get());
+
+    ASSERT_EQ(EC_OK, backend.UnregisterNode("10.0.0.20:9600"));
+
+    // node 20's gauges should be removed
+    auto hr_values = hr_data->GetMetricsValues();
+    for (const auto &[tags, val] : hr_values) {
+        ASSERT_NE(tags, tags_20) << "node 20 gauge should have been removed";
+    }
+    auto mu_data = metrics_registry_->GetMetricsData("v6d.mem_used");
+    auto mu_values = mu_data->GetMetricsValues();
+    for (const auto &[tags, val] : mu_values) {
+        ASSERT_NE(tags, tags_20) << "node 20 gauge should have been removed";
+    }
+
+    // node 21's gauges should still be present
+    ASSERT_DOUBLE_EQ(0.60, hr_data->GetOrCreateGauge(tags_21).Get());
+    ASSERT_DOUBLE_EQ(2048, mu_data->GetOrCreateGauge(tags_21).Get());
+
+    ASSERT_EQ(EC_OK, backend.Close());
+}

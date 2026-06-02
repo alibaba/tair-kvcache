@@ -201,6 +201,7 @@ public:
 
     Counter GetOrCreateCounter(const MetricsTags &tags);
     Gauge GetOrCreateGauge(const MetricsTags &tags);
+    bool RemoveByTags(const MetricsTags &tags);
 
 private:
     std::mutex mutex_;

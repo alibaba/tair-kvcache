@@ -95,6 +95,8 @@ private:
     int64_t cleanup_grace_ms_ = VineyardStorageSpec::kDefaultCleanupGraceMs;
     int64_t liveness_check_interval_ms_ = VineyardStorageSpec::kDefaultLivenessCheckIntervalMs;
 
+    void ZeroNodeGauges(const NodeInfo &info);
+
     mutable std::mutex cleanup_cb_mutex_;
     CleanupCallback cleanup_callback_;
     std::atomic<bool> cleanup_cb_set_{false};

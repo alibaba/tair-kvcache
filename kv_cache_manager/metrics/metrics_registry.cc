@@ -229,6 +229,11 @@ Gauge MetricsData::GetOrCreateGauge(const MetricsTags &tags) {
     return Gauge{it->second};
 }
 
+bool MetricsData::RemoveByTags(const MetricsTags &tags) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return metrics_data_.erase(tags) > 0;
+}
+
 /* ---------------------------- Registry ---------------------------- */
 
 std::size_t MetricsRegistry::GetSize() noexcept {
