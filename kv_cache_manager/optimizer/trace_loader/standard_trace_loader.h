@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 
+#include "kv_cache_manager/optimizer/config/types.h"
 #include "kv_cache_manager/optimizer/trace_loader/optimizer_schema_trace.h"
 
 namespace kv_cache_manager {
@@ -13,7 +14,8 @@ public:
     StandardTraceLoader() = default;
     ~StandardTraceLoader() = default;
 
-    static std::vector<std::shared_ptr<OptimizerSchemaTrace>> LoadFromFile(const std::string &trace_file_path);
+    static std::vector<std::shared_ptr<OptimizerSchemaTrace>>
+    LoadFromFile(const std::string &trace_file_path, TraceReplayMode replay_mode = TraceReplayMode::READ_WRITE);
 
 private:
     static bool ValidateTrace(const OptimizerSchemaTrace &trace);

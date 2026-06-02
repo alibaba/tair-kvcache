@@ -175,6 +175,10 @@ TEST_F(HierarchicalReplayManagerTest, ParsesCompactClusterConfig) {
             "eviction_mode": 3,
             "eviction_batch_size_per_instance": 10
         },
+        "trace_replay": {
+            "mode": "request",
+            "write_delay_ns": 1000
+        },
         "infer_scheduling_strategy": "preserve_trace",
         "enable_lifecycle_tracking": true,
         "infer_clusters": [
@@ -272,6 +276,8 @@ TEST_F(HierarchicalReplayManagerTest, ParsesCompactClusterConfig) {
     EXPECT_EQ(config.engine_config().output_result_path(), root + "/output/infer");
     EXPECT_EQ(config.engine_config().eviction_config().eviction_mode(), EvictionMode::EVICTION_MODE_INSTANCE_PRECISE);
     EXPECT_EQ(config.engine_config().eviction_config().eviction_batch_size_per_instance(), 10);
+    EXPECT_EQ(config.trace_replay_config().mode(), TraceReplayMode::REQUEST);
+    EXPECT_EQ(config.trace_replay_config().write_delay_ns(), 1000);
     EXPECT_EQ(config.storage_pool_config().trace_file_path(), root + "/trace.jsonl");
     EXPECT_EQ(config.storage_pool_config().output_result_path(), root + "/output/pool");
 
@@ -767,6 +773,37 @@ TEST_F(HierarchicalReplayManagerTest, ReplaysStandardTraceThroughEngineAndPool) 
     EXPECT_THAT(content, HasSubstr("AccLocalHitTokens,AccRemoteHitTokens,AccHitTokens"));
     EXPECT_THAT(content, HasSubstr("pool_hit,engine_b,model_l3,2,0,2,2"));
     EXPECT_THAT(content, HasSubstr("engine_hit,engine_b,model_l3,2,2,0,2"));
+}
+
+TEST_F(HierarchicalReplayManagerTest, ReplaysRequestTraceWithDelayedWrite) {
+    const std::string root = GetTestTempRootPath() + "/hierarchical_replay_request";
+    std::filesystem::create_directories(root);
+    HierarchicalReplayConfig config = CreateHierarchicalConfig(root);
+    OptTraceReplayConfig trace_replay_config;
+    trace_replay_config.set_mode(TraceReplayMode::REQUEST);
+    config.set_trace_replay_config(trace_replay_config);
+
+    std::ofstream trace(config.trace_file_path());
+    trace
+        << R"({"type":"request","instance_id":"engine_a","trace_id":"cold","timestamp_ns":1000,"keys":[101,102],"input_len":32,"block_mask":[]})"
+        << "\n";
+    trace
+        << R"({"type":"request","instance_id":"engine_a","trace_id":"engine_hit","timestamp_ns":2000,"keys":[101,102],"input_len":32,"block_mask":[]})"
+        << "\n";
+    trace.close();
+
+    HierarchicalReplayManager manager(config);
+    ASSERT_TRUE(manager.Init());
+    manager.DirectRun();
+    manager.AnalyzeResults();
+
+    std::ifstream csv(root + "/combined/hierarchical_hit_rates.csv");
+    ASSERT_TRUE(csv.is_open());
+    std::ostringstream buffer;
+    buffer << csv.rdbuf();
+    const std::string content = buffer.str();
+    EXPECT_THAT(content, HasSubstr("cold,engine_a,model_l3,2,0,0,0"));
+    EXPECT_THAT(content, HasSubstr("engine_hit,engine_a,model_l3,2,2,0,2"));
 }
 
 TEST_F(HierarchicalReplayManagerTest, DirectRunSortsTraceByTimestamp) {

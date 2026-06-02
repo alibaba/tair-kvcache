@@ -19,9 +19,9 @@ Bazel target 前缀：
 | 单次回放 | `optimizer_run` | `-c config.json` | `<output_result_path>/*_hit_rates.csv` |
 | 单次回放并画时序图 | `optimizer_run` | `--draw-chart` | `timeseries/multi_instance_cache_analysis.png` |
 | 无限容量理论命中 | `optimizer_run` | 非分层 `quota_capacity=-1`；分层 tier `capacity=-1` | CSV 最后一行 `AccHitRate` |
-| 分层 HBM/DRAM/SSD 回放 | `optimizer_run` | `tier_strategy.hierarchical_eviction_enabled=true` + `storages[]` | per-tier CSV 列、`per_tier_timeseries.png` |
-| 每个 pod 独立缓存回放 | `multi_instance_replay` | `--trace-dir` / `--trace-files`、`--l1-capacity`、`--l2-capacity` | `aggregate/global_aggregate.csv` |
-| 窗口级分 pod 聚合命中率 | `multi_instance_replay` | `--window-seconds` 或 `--window-ns` | `aggregate/global_window_hit_rates.csv` |
+| 分层 HBM/DRAM/SSD 回放 | `optimizer_run` | `storages[]` + `tier_flows[]` | per-tier CSV 列、`per_tier_timeseries.png` |
+| 每个推理实例独立缓存回放 | `multi_infer_replay` | `--trace-dir` / `--trace-files`、`--tiers` | `aggregate/global_aggregate.csv` |
+| 窗口级分推理实例聚合命中率 | `multi_infer_replay` | `--window-seconds` 或 `--window-ns` | `aggregate/global_window_hit_rates.csv` |
 | 非分层容量 Pareto | `tradeoff` | `--num-points`、`--min-capacity-ratio`、`--max-workers` | `pareto/pareto_curve_<type>.png` |
 | 多驱逐策略 Pareto | `tradeoff` | `--eviction-policies lru random_lru leaf_aware_lru ttl` | `pareto/multi_policy_<type>.png` |
 | 导出 lifecycle | `optimizer_run` | `--export-lifecycle` | `<instance_id>_lifecycle.csv` |
@@ -31,8 +31,8 @@ Bazel target 前缀：
 常用配置选择：
 
 - 全局池化理论命中率：一个 service 一个 config，所有请求使用同一个 `instance_id`，非分层 `quota_capacity=-1`。
-- 线上 pod 独立缓存：每个 pod 一个 JSONL，使用 `multi_instance_replay` 分别回放后聚合 token 命中。
-- 分层策略分析：用完整 optimizer config 配 `tier_strategy` 和 `storages[]`，再用 `optimizer_run`；不要用 `tradeoff` 扫分层容量。
+- 推理实例独立缓存：每个推理实例一个 JSONL，使用 `multi_infer_replay` 分别回放后聚合 token 命中。
+- 分层策略分析：用完整 optimizer config 配 `storages[]` 和 `tier_flows[]`，再用 `optimizer_run`；不要用 `tradeoff` 扫分层容量。
 - 容量规划：先用 `tradeoff` 跑非分层 Pareto，图上 95%/99% 理论命中容量由相邻 sweep 点线性插值得到。
 
 ---
@@ -130,7 +130,7 @@ bazel run //kv_cache_manager/optimizer/analysis/script:multi_infer_replay -- \
 ### 回放配置参数
 
 这些参数会写入脚本为每个 instance 生成的 optimizer config。
-`multi_instance_replay` 不读取完整 optimizer config；它根据 CLI 参数为每个 pod/instance 生成单实例 config，再并行调用 optimizer。当前 CLI 直接暴露 L1/L2 两层容量；需要 L3 或更复杂分层拓扑时，应使用完整 optimizer config 跑单次回放，或先扩展该脚本的 config 生成逻辑。
+`multi_infer_replay` 不读取完整 optimizer config；它根据 CLI 参数为每个推理 instance 生成单实例 config，再并行调用 optimizer。需要 engine-local + storage pool 时使用 `hierarchical_replay_main`。
 
 | 参数 | 必需 | 默认 | 说明 |
 |------|------|------|------|
@@ -146,6 +146,8 @@ bazel run //kv_cache_manager/optimizer/analysis/script:multi_infer_replay -- \
 | `--default-block-ttl-seconds` | — | 0 | 默认 block TTL 秒数；主要用于 `--eviction-policy ttl` |
 | `--ttl-refresh-on-read` | — | true | TTL 策略下读命中刷新 last access time；与 `--no-ttl-refresh-on-read` 互斥 |
 | `--no-ttl-refresh-on-read` | — | false | TTL 策略下读命中不刷新 last access time；与 `--ttl-refresh-on-read` 互斥 |
+| `--trace-replay-mode` | — | `read_write` | 写入生成 config 的 `trace_replay.mode`；`read_write` 接受 `type=get/write`，`request` 接受 `type=request` |
+| `--write-delay-ns` | — | 1 | 写入生成 config 的 `trace_replay.write_delay_ns`，仅 `request` 模式用于内部 delayed write |
 
 未显式传 `--eviction-policy-params` 时，脚本按策略生成默认参数：`random_lru` 使用 `{"sample_rate": 1.0}`；`ttl` 使用 `{"fallback_on_pressure": true}`；`lru` / `leaf_aware_lru` 使用 `{"sample_rate": 1.0, "shard_count": 1, "sample_times": 32, "eviction_amplification_factor": 1.0}`。
 

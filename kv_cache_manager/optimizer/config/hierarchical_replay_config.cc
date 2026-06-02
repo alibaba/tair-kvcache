@@ -199,6 +199,13 @@ bool HierarchicalReplayConfig::FromRapidValue(const rapidjson::Value &rapid_valu
     KVCM_JSON_GET_MACRO(rapid_value, "trace_file_path", trace_file_path_);
     KVCM_JSON_GET_MACRO(rapid_value, "output_result_path", output_result_path_);
     KVCM_JSON_GET_MACRO(rapid_value, "infer_eviction_params", infer_eviction_config_);
+    trace_replay_config_ = OptTraceReplayConfig();
+    if (rapid_value.HasMember("trace_replay")) {
+        if (!rapid_value["trace_replay"].IsObject() ||
+            !trace_replay_config_.FromRapidValue(rapid_value["trace_replay"])) {
+            return false;
+        }
+    }
     KVCM_JSON_GET_MACRO(rapid_value, "infer_clusters", infer_clusters_);
     if (!rapid_value.HasMember("storage_pool_config") ||
         !ParseStoragePoolConfig(rapid_value["storage_pool_config"], trace_file_path_, storage_pool_config_)) {
@@ -219,6 +226,7 @@ void HierarchicalReplayConfig::ToRapidWriter(rapidjson::Writer<rapidjson::String
     Put(writer, "trace_file_path", trace_file_path_);
     Put(writer, "output_result_path", output_result_path_);
     Put(writer, "infer_eviction_params", infer_eviction_config_);
+    Put(writer, "trace_replay", trace_replay_config_);
     Put(writer, "infer_scheduling_strategy", infer_scheduling_strategy_);
     Put(writer, "enable_lifecycle_tracking", enable_lifecycle_tracking_);
     Put(writer, "infer_clusters", infer_clusters_);
@@ -243,6 +251,7 @@ bool HierarchicalReplayConfig::BuildOptimizerConfigs() {
     engine_config.set_trace_file_path(trace_file_path_);
     engine_config.set_output_result_path(JoinPath(output_result_path_, "infer"));
     engine_config.set_eviction_params(infer_eviction_config_);
+    engine_config.set_trace_replay_config(trace_replay_config_);
 
     std::vector<OptInstanceGroupConfig> engine_groups;
     engine_to_storage_pool_.clear();

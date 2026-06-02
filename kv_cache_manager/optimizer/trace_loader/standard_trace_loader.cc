@@ -8,8 +8,8 @@
 
 namespace kv_cache_manager {
 
-std::vector<std::shared_ptr<OptimizerSchemaTrace>>
-StandardTraceLoader::LoadFromFile(const std::string &trace_file_path) {
+std::vector<std::shared_ptr<OptimizerSchemaTrace>> StandardTraceLoader::LoadFromFile(const std::string &trace_file_path,
+                                                                                     TraceReplayMode replay_mode) {
     std::vector<std::shared_ptr<OptimizerSchemaTrace>> traces;
     std::ifstream file(trace_file_path);
 
@@ -83,6 +83,12 @@ StandardTraceLoader::LoadFromFile(const std::string &trace_file_path) {
             trace = write_trace;
         } else {
             fail("unknown trace type: " + type_str);
+        }
+        if (replay_mode == TraceReplayMode::REQUEST && type_str != "request") {
+            fail("trace_replay.mode=request only accepts type=request, got: " + type_str);
+        }
+        if (replay_mode == TraceReplayMode::READ_WRITE && type_str == "request") {
+            fail("trace_replay.mode=read_write accepts only type=get/write, got: request");
         }
 
         if (trace && ValidateTrace(*trace)) {

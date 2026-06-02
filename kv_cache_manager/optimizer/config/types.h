@@ -30,6 +30,11 @@ enum class TierWriteMode {
     CASCADING = 1,               // 只写 tier 0，tier_i 驱逐出的 block 级联降级到 tier_{i+1}
     WRITE_THROUGH_SELECTIVE = 2, // 初始只写 tier 0，写 touch 次数达到阈值后复制到下一层
 };
+
+enum class TraceReplayMode {
+    READ_WRITE = 0, // 输入 trace 只能包含显式 get/write
+    REQUEST = 1,    // 输入 trace 只能包含 request，由 optimizer 内部生成 delayed write
+};
 struct TierFlowStrategy {
     TierWriteMode write_mode = TierWriteMode::WRITE_THROUGH;
     bool access_propagation_enabled = true;
@@ -115,4 +120,7 @@ std::string ToString(const EvictionPolicyType &type);
 TierWriteMode ToTierWriteMode(const std::string &str);
 bool IsValidTierWriteMode(const std::string &str);
 std::string ToString(const TierWriteMode &mode);
+TraceReplayMode ToTraceReplayMode(const std::string &str);
+bool IsValidTraceReplayMode(const std::string &str);
+std::string ToString(const TraceReplayMode &mode);
 } // namespace kv_cache_manager

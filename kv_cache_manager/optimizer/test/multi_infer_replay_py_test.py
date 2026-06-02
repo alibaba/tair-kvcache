@@ -69,7 +69,7 @@ class MultiInferReplayTest(unittest.TestCase):
             }
             trace_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
 
-            self.assertEqual(_inspect_optimizer_trace(str(trace_path)), "instance-a")
+            self.assertEqual(_inspect_optimizer_trace(str(trace_path), "request"), "instance-a")
 
 if __name__ == "__main__":
     unittest.main()

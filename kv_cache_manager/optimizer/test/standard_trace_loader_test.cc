@@ -27,6 +27,26 @@ TEST_F(StandardTraceLoaderTest, ParsesStandardGetAndWriteRows) {
     EXPECT_EQ(traces[1]->input_len(), -1);
 }
 
+TEST_F(StandardTraceLoaderTest, EnforcesTraceReplayMode) {
+    const std::string request_path = GetTestTempRootPath() + "/request_trace_mode.jsonl";
+    std::ofstream request_out(request_path);
+    request_out
+        << R"({"type":"request","instance_id":"instance-a","trace_id":"request","timestamp_ns":1000,"keys":[1],"input_len":128,"block_mask":[]})"
+        << "\n";
+    request_out.close();
+
+    EXPECT_THROW(StandardTraceLoader::LoadFromFile(request_path, TraceReplayMode::READ_WRITE), std::runtime_error);
+
+    const std::string read_write_path = GetTestTempRootPath() + "/read_write_trace_mode.jsonl";
+    std::ofstream read_write_out(read_write_path);
+    read_write_out
+        << R"({"type":"get","instance_id":"instance-a","trace_id":"get","timestamp_ns":1000,"keys":[1],"input_len":128,"block_mask":[]})"
+        << "\n";
+    read_write_out.close();
+
+    EXPECT_THROW(StandardTraceLoader::LoadFromFile(read_write_path, TraceReplayMode::REQUEST), std::runtime_error);
+}
+
 TEST_F(StandardTraceLoaderTest, ParsesRequestRows) {
     const std::string path = GetTestTempRootPath() + "/request_trace.jsonl";
     std::ofstream out(path);
@@ -34,7 +54,7 @@ TEST_F(StandardTraceLoaderTest, ParsesRequestRows) {
         << "\n";
     out.close();
 
-    const auto traces = StandardTraceLoader::LoadFromFile(path);
+    const auto traces = StandardTraceLoader::LoadFromFile(path, TraceReplayMode::REQUEST);
     ASSERT_EQ(traces.size(), 1);
     auto request_trace = std::dynamic_pointer_cast<RequestSchemaTrace>(traces[0]);
     ASSERT_NE(request_trace, nullptr);

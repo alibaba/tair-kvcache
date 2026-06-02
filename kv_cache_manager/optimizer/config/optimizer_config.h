@@ -18,10 +18,13 @@ public:
     bool FromRapidValue(const rapidjson::Value &rapid_value) override;
     void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
 
+    [[nodiscard]] TraceReplayMode mode() const { return mode_; }
     [[nodiscard]] int64_t write_delay_ns() const { return write_delay_ns_; }
+    void set_mode(TraceReplayMode mode) { mode_ = mode; }
     void set_write_delay_ns(int64_t delay_ns) { write_delay_ns_ = delay_ns; }
 
 private:
+    TraceReplayMode mode_ = TraceReplayMode::READ_WRITE;
     int64_t write_delay_ns_ = 1;
 };
 

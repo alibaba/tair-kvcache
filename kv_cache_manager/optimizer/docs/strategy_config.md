@@ -76,6 +76,7 @@ AccHitRate = AccHitTokens / AccInputTokens
     "eviction_batch_size_per_instance": 100
   },
   "trace_replay": {
+    "mode": "read_write",
     "write_delay_ns": 1
   },
   "instance_groups": []
@@ -97,6 +98,7 @@ AccHitRate = AccHitTokens / AccInputTokens
 
 | 字段 | 类型 | 默认 | 说明 |
 |---|---:|---:|---|
+| `mode` | string | `read_write` | `read_write` 只接受 `type=get/write`；`request` 只接受 `type=request` |
 | `write_delay_ns` | int64 | `1` | `type=request` trace 的内部写入延迟。回放时先在 `timestamp_ns` 执行读，再在 `timestamp_ns + write_delay_ns` 调度写入。必须大于 0 |
 
 ## 标准 trace schema
@@ -410,7 +412,7 @@ TTL 只在 `eviction_policy_type="ttl"` 时执行。非 TTL 策略会忽略 `ttl
 
 标准版保留 `multi_infer_replay` 作为 engine-local-only 入口，不再把 multi-machine scheduler 作为默认回放入口；需要模拟调度或 storage pool 时使用 `hierarchical_replay_main`。
 脚本完整参数以 [analysis/script/README.md](../analysis/script/README.md) 为准；这里给出标准回放配置示例和输出约定。
-`multi_instance_replay` 不读取完整 optimizer config；它根据 CLI 参数为每个 pod/instance 生成单实例 config，然后并行运行 optimizer。当前 CLI 直接支持 L1/L2 两层容量；需要 L3 或更复杂 tier 拓扑时，需要使用完整 optimizer config 跑单次回放，或扩展该脚本的 config 生成逻辑。
+`multi_infer_replay` 不读取完整 optimizer config；它根据 CLI 参数为每个推理 instance 生成单实例 config，然后并行运行 optimizer。当前 CLI 支持本地多层容量；需要 storage pool 时使用 `hierarchical_replay_main`。
 
 ```bash
 bazel run //kv_cache_manager/optimizer/analysis/script:multi_infer_replay -- \
@@ -437,4 +439,4 @@ bazel run //kv_cache_manager/optimizer/analysis/script:multi_infer_replay -- \
 
 multi-infer replay 聚合后的 `HitRate` 仍然是 token hit rate，计算方式为所有推理 instance 的 `HitTokens` 总和除以 `InputTokens` 总和。
 `--bucket-name` 只写入聚合 CSV 的 `Bucket` 列，用于标记实验来源；`--trace-glob` 和 `--recursive` 只在使用 `--trace-dir` 扫描输入文件时生效。
-`--default-tier-write-mode`、`--tier-flow-config`、`--enable/disable-tier-access-propagation`、`--enable/disable-promote` 和 `--selective-write-threshold` 会写入生成 config 的 `tier_strategy`，语义与上文一致。
+`--tier-flow-config` 会写入生成 config 的 `tier_flows`，语义与上文一致；`--trace-replay-mode` 和 `--write-delay-ns` 会写入生成 config 的 `trace_replay`。

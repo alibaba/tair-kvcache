@@ -209,6 +209,7 @@ TEST_F(OptimizerManagerTest, RequestTraceSchedulesDelayedWrite) {
     config.set_output_result_path(GetTestTempRootPath() + "/request_trace_result");
 
     OptTraceReplayConfig trace_replay_config;
+    trace_replay_config.set_mode(TraceReplayMode::REQUEST);
     trace_replay_config.set_write_delay_ns(1000);
     config.set_trace_replay_config(trace_replay_config);
 

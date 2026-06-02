@@ -4,6 +4,12 @@
 
 namespace kv_cache_manager {
 bool OptTraceReplayConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
+    std::string mode_str = "read_write";
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "mode", mode_str, std::string("read_write"));
+    if (!IsValidTraceReplayMode(mode_str)) {
+        return false;
+    }
+    mode_ = ToTraceReplayMode(mode_str);
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "write_delay_ns", write_delay_ns_, int64_t(1));
     if (write_delay_ns_ <= 0) {
         KVCM_LOG_ERROR("trace_replay.write_delay_ns must be positive, got %ld", write_delay_ns_);
@@ -13,6 +19,7 @@ bool OptTraceReplayConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
 }
 
 void OptTraceReplayConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
+    Put(writer, "mode", ToString(mode_));
     Put(writer, "write_delay_ns", write_delay_ns_);
 }
 

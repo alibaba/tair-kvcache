@@ -1,6 +1,8 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
+#include <queue>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -65,11 +67,31 @@ private:
         size_t write_blocks = 0;
     };
 
+    struct PendingWrite {
+        int64_t timestamp_ns = 0;
+        uint64_t sequence = 0;
+        WriteCacheSchemaTrace trace;
+    };
+
+    struct PendingWriteCompare {
+        bool operator()(const PendingWrite &lhs, const PendingWrite &rhs) const {
+            if (lhs.timestamp_ns != rhs.timestamp_ns) {
+                return lhs.timestamp_ns > rhs.timestamp_ns;
+            }
+            return lhs.sequence > rhs.sequence;
+        }
+    };
+
     bool ValidateAndBuildMappings();
     void ScheduleTraces(std::vector<std::shared_ptr<OptimizerSchemaTrace>> &traces) const;
     void RunTracesWithPrefixHitScheduling(const std::vector<std::shared_ptr<OptimizerSchemaTrace>> &traces);
     std::string
     ChoosePrefixHitEngineInstance(const std::vector<int64_t> &block_ids, int64_t timestamp, size_t request_idx) const;
+    void HandleRequest(const RequestSchemaTrace &trace);
+    void ScheduleRequestWrite(const RequestSchemaTrace &trace);
+    void FlushPendingWritesThrough(int64_t timestamp_ns);
+    void FlushAllPendingWrites();
+    void RunPendingWrite(const WriteCacheSchemaTrace &trace);
     void ExportCombinedHitRates() const;
     const std::string &StoragePoolInstanceForEngine(const std::string &engine_instance_id) const;
     const StoragePoolFlowConfig &StoragePoolFlowForEngine(const std::string &engine_instance_id) const;
@@ -84,6 +106,9 @@ private:
     std::vector<std::string> sorted_engine_instance_ids_;
     std::vector<CombinedReadRecord> combined_read_records_;
     std::vector<CombinedWriteRecord> combined_write_records_;
+    int64_t write_delay_ns_ = 1;
+    uint64_t next_pending_write_sequence_ = 0;
+    std::priority_queue<PendingWrite, std::vector<PendingWrite>, PendingWriteCompare> pending_writes_;
 };
 
 } // namespace kv_cache_manager

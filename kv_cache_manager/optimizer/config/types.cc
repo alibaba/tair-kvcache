@@ -58,4 +58,25 @@ std::string ToString(const TierWriteMode &mode) {
     }
 }
 
+TraceReplayMode ToTraceReplayMode(const std::string &str) {
+    if (str == "read_write") {
+        return TraceReplayMode::READ_WRITE;
+    } else if (str == "request") {
+        return TraceReplayMode::REQUEST;
+    }
+    return TraceReplayMode::READ_WRITE;
+}
+
+bool IsValidTraceReplayMode(const std::string &str) { return str == "read_write" || str == "request"; }
+
+std::string ToString(const TraceReplayMode &mode) {
+    switch (mode) {
+    case TraceReplayMode::REQUEST:
+        return "request";
+    case TraceReplayMode::READ_WRITE:
+    default:
+        return "read_write";
+    }
+}
+
 } // namespace kv_cache_manager

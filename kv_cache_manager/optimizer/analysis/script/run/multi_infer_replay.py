@@ -141,6 +141,8 @@ def parse_args():
     ttl_group = parser.add_mutually_exclusive_group()
     ttl_group.add_argument("--ttl-refresh-on-read", dest="ttl_refresh_on_read", action="store_true", default=True)
     ttl_group.add_argument("--no-ttl-refresh-on-read", dest="ttl_refresh_on_read", action="store_false")
+    parser.add_argument("--trace-replay-mode", default="read_write", choices=["read_write", "request"],
+                        help="Optimizer trace replay mode: read_write accepts type=get/write, request accepts type=request")
     parser.add_argument("--write-delay-ns", type=int, default=1,
                         help="Delay from request read timestamp to generated write timestamp for type=request traces")
 
@@ -159,8 +161,6 @@ def parse_args():
     if not args.aggregate_only and not args.tiers:
         parser.error("--tiers is required outside --aggregate-only")
     args.tiers = _parse_tiers_arg(parser, args.tiers)
-    if args.selective_write_threshold <= 0:
-        parser.error("--selective-write-threshold must be positive")
     if args.write_delay_ns <= 0:
         parser.error("--write-delay-ns must be positive")
     args.tier_flow_config = _parse_tier_flow_config_arg(parser, args.tier_flow_config)
@@ -270,7 +270,7 @@ def _prepare_tasks(args, trace_files: List[str], config_dir: str, output_dir: st
     policy_params = _resolve_policy_params(args.eviction_policy, args.eviction_policy_params)
 
     for trace_file in trace_files:
-        instance_id = _inspect_optimizer_trace(trace_file)
+        instance_id = _inspect_optimizer_trace(trace_file, args.trace_replay_mode)
         if "/" in instance_id or "\\" in instance_id:
             raise SystemExit(f"instance_id {instance_id!r} contains a path separator")
         if instance_id in seen_instance_ids:
@@ -422,7 +422,7 @@ def _validate_hit_rate_csvs(csv_files: dict) -> None:
         raise SystemExit("Missing expected hit-rate CSV(s):\n  " + "\n  ".join(missing))
 
 
-def _inspect_optimizer_trace(trace_file: str) -> str:
+def _inspect_optimizer_trace(trace_file: str, replay_mode: str = "read_write") -> str:
     instance_id = None
     row_count = 0
     with open(trace_file, "r") as f:
@@ -439,6 +439,12 @@ def _inspect_optimizer_trace(trace_file: str) -> str:
             trace_type = obj.get("type")
             if trace_type not in {"get", "write", "request"}:
                 raise SystemExit(f"{trace_file}:{line_no} has invalid type={trace_type!r}")
+            if replay_mode == "request" and trace_type != "request":
+                raise SystemExit(
+                    f"{trace_file}:{line_no} trace_replay.mode=request only accepts type=request, got {trace_type!r}")
+            if replay_mode == "read_write" and trace_type == "request":
+                raise SystemExit(
+                    f"{trace_file}:{line_no} trace_replay.mode=read_write accepts only type=get/write, got request")
             current_instance_id = obj.get("instance_id")
             if not isinstance(current_instance_id, str) or not current_instance_id:
                 raise SystemExit(f"{trace_file}:{line_no} has no non-empty instance_id")
@@ -506,6 +512,7 @@ def _make_single_instance_config(args, trace_file: str, output_dir: str, instanc
             "eviction_batch_size_per_instance": args.eviction_batch_size,
         },
         "trace_replay": {
+            "mode": args.trace_replay_mode,
             "write_delay_ns": args.write_delay_ns,
         },
         "instance_groups": [group],

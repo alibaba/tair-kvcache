@@ -13,6 +13,7 @@ cc_library(
     ],
     deps = [
         "//kv_cache_manager/common",
+        "//kv_cache_manager/optimizer/config",
         "//kv_cache_manager/meta:cache_location",
     ],
 )

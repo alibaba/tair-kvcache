@@ -134,6 +134,7 @@ public:
     [[nodiscard]] const OptimizerConfig &engine_config() const { return engine_config_; }
     [[nodiscard]] const OptimizerConfig &storage_pool_config() const { return storage_pool_config_; }
     [[nodiscard]] const EvictionConfig &infer_eviction_config() const { return infer_eviction_config_; }
+    [[nodiscard]] const OptTraceReplayConfig &trace_replay_config() const { return trace_replay_config_; }
     [[nodiscard]] const std::vector<EngineToStoragePoolMappingConfig> &engine_to_storage_pool() const {
         return engine_to_storage_pool_;
     }
@@ -144,6 +145,7 @@ public:
     void set_trace_file_path(const std::string &path) { trace_file_path_ = path; }
     void set_output_result_path(const std::string &path) { output_result_path_ = path; }
     void set_infer_eviction_config(const EvictionConfig &config) { infer_eviction_config_ = config; }
+    void set_trace_replay_config(const OptTraceReplayConfig &config) { trace_replay_config_ = config; }
     void set_engine_config(const OptimizerConfig &config) { engine_config_ = config; }
     void set_storage_pool_config(const OptimizerConfig &config) { storage_pool_config_ = config; }
     void set_engine_to_storage_pool(const std::vector<EngineToStoragePoolMappingConfig> &mapping) {
@@ -158,6 +160,7 @@ private:
     std::string trace_file_path_;
     std::string output_result_path_;
     EvictionConfig infer_eviction_config_;
+    OptTraceReplayConfig trace_replay_config_;
     std::vector<InferClusterConfig> infer_clusters_;
     OptimizerConfig engine_config_;
     OptimizerConfig storage_pool_config_;

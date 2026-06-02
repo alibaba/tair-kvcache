@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
+#include <utility>
 
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/optimizer/trace_loader/standard_trace_loader.h"
@@ -49,6 +51,12 @@ bool HierarchicalReplayManager::Init() {
     if (!ValidateAndBuildMappings()) {
         return false;
     }
+    write_delay_ns_ = config_.trace_replay_config().write_delay_ns();
+    if (write_delay_ns_ <= 0) {
+        throw std::runtime_error("trace_replay.write_delay_ns must be positive");
+    }
+    pending_writes_ = {};
+    next_pending_write_sequence_ = 0;
 
     const bool enable_lifecycle_tracking = config_.enable_lifecycle_tracking();
     engine_manager_ = std::make_unique<OptimizerManager>(
@@ -156,7 +164,7 @@ HierarchicalReplayManager::StoragePoolFlowForEngine(const std::string &engine_in
 }
 
 void HierarchicalReplayManager::DirectRun() {
-    auto traces = StandardTraceLoader::LoadFromFile(config_.trace_file_path());
+    auto traces = StandardTraceLoader::LoadFromFile(config_.trace_file_path(), config_.trace_replay_config().mode());
     TraceTimeSorter::SortTracesByTimestamp(traces);
     if (config_.infer_scheduling_strategy() == "prefix_hit") {
         RunTracesWithPrefixHitScheduling(traces);
@@ -200,13 +208,21 @@ void HierarchicalReplayManager::RunTracesWithPrefixHitScheduling(
         throw std::runtime_error("prefix_hit scheduling requires at least one engine instance");
     }
 
+    pending_writes_ = {};
+    next_pending_write_sequence_ = 0;
     size_t request_idx = 0;
     std::string current_engine_instance_id = sorted_engine_instance_ids_.front();
     for (const auto &trace : traces) {
         if (!trace) {
             continue;
         }
-        if (auto get_trace = std::dynamic_pointer_cast<GetLocationSchemaTrace>(trace)) {
+        FlushPendingWritesThrough(trace->timestamp_ns());
+        if (auto request_trace = std::dynamic_pointer_cast<RequestSchemaTrace>(trace)) {
+            current_engine_instance_id =
+                ChoosePrefixHitEngineInstance(request_trace->keys(), request_trace->timestamp_ns(), request_idx);
+            request_trace->set_instance_id(current_engine_instance_id);
+            request_idx++;
+        } else if (auto get_trace = std::dynamic_pointer_cast<GetLocationSchemaTrace>(trace)) {
             current_engine_instance_id =
                 ChoosePrefixHitEngineInstance(get_trace->keys(), get_trace->timestamp_ns(), request_idx);
             get_trace->set_instance_id(current_engine_instance_id);
@@ -216,6 +232,7 @@ void HierarchicalReplayManager::RunTracesWithPrefixHitScheduling(
         }
         RunTrace(trace);
     }
+    FlushAllPendingWrites();
 }
 
 std::string HierarchicalReplayManager::ChoosePrefixHitEngineInstance(const std::vector<int64_t> &block_ids,
@@ -243,16 +260,24 @@ std::string HierarchicalReplayManager::ChoosePrefixHitEngineInstance(const std::
 }
 
 void HierarchicalReplayManager::RunTraces(const std::vector<std::shared_ptr<OptimizerSchemaTrace>> &traces) {
+    pending_writes_ = {};
+    next_pending_write_sequence_ = 0;
     for (const auto &trace : traces) {
+        if (trace) {
+            FlushPendingWritesThrough(trace->timestamp_ns());
+        }
         RunTrace(trace);
     }
+    FlushAllPendingWrites();
 }
 
 void HierarchicalReplayManager::RunTrace(const std::shared_ptr<OptimizerSchemaTrace> &trace) {
     if (!trace) {
         return;
     }
-    if (auto get_trace = std::dynamic_pointer_cast<GetLocationSchemaTrace>(trace)) {
+    if (auto request_trace = std::dynamic_pointer_cast<RequestSchemaTrace>(trace)) {
+        HandleRequest(*request_trace);
+    } else if (auto get_trace = std::dynamic_pointer_cast<GetLocationSchemaTrace>(trace)) {
         GetCacheLocation(get_trace->instance_id(),
                          get_trace->trace_id(),
                          get_trace->timestamp_ns(),
@@ -267,6 +292,51 @@ void HierarchicalReplayManager::RunTrace(const std::shared_ptr<OptimizerSchemaTr
     } else {
         KVCM_LOG_WARN("Hierarchical replay skips unknown trace type.");
     }
+}
+
+void HierarchicalReplayManager::HandleRequest(const RequestSchemaTrace &trace) {
+    if (trace.query_type() != "prefix_match") {
+        KVCM_LOG_WARN("Unsupported query type: %s", trace.query_type().c_str());
+        return;
+    }
+    GetCacheLocation(trace.instance_id(), trace.trace_id(), trace.timestamp_ns(), trace.keys(), trace.input_len());
+    ScheduleRequestWrite(trace);
+}
+
+void HierarchicalReplayManager::ScheduleRequestWrite(const RequestSchemaTrace &trace) {
+    if (trace.timestamp_ns() > std::numeric_limits<int64_t>::max() - write_delay_ns_) {
+        throw std::runtime_error("request write timestamp overflows int64: instance_id=" + trace.instance_id() +
+                                 ", trace_id=" + trace.trace_id());
+    }
+
+    WriteCacheSchemaTrace write_trace;
+    write_trace.set_instance_id(trace.instance_id());
+    write_trace.set_trace_id(trace.trace_id() + ":write");
+    write_trace.set_timestamp_ns(trace.timestamp_ns() + write_delay_ns_);
+    write_trace.set_keys(trace.keys());
+    write_trace.set_ttl_us(trace.ttl_us());
+    pending_writes_.push(
+        PendingWrite{write_trace.timestamp_ns(), next_pending_write_sequence_++, std::move(write_trace)});
+}
+
+void HierarchicalReplayManager::FlushPendingWritesThrough(int64_t timestamp_ns) {
+    while (!pending_writes_.empty() && pending_writes_.top().timestamp_ns <= timestamp_ns) {
+        auto pending = pending_writes_.top();
+        pending_writes_.pop();
+        RunPendingWrite(pending.trace);
+    }
+}
+
+void HierarchicalReplayManager::FlushAllPendingWrites() {
+    while (!pending_writes_.empty()) {
+        auto pending = pending_writes_.top();
+        pending_writes_.pop();
+        RunPendingWrite(pending.trace);
+    }
+}
+
+void HierarchicalReplayManager::RunPendingWrite(const WriteCacheSchemaTrace &trace) {
+    WriteCacheWithTtlUs(trace.instance_id(), trace.trace_id(), trace.timestamp_ns(), trace.keys(), trace.ttl_us());
 }
 
 HierarchicalGetCacheLocationRes HierarchicalReplayManager::GetCacheLocation(const std::string &engine_instance_id,

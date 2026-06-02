@@ -13,7 +13,7 @@
 namespace kv_cache_manager {
 std::vector<std::shared_ptr<OptimizerSchemaTrace>> OptimizerLoader::LoadTrace(OptimizerConfig &config) {
     // 直接加载标准格式trace文件
-    auto traces = StandardTraceLoader::LoadFromFile(config.trace_file_path());
+    auto traces = StandardTraceLoader::LoadFromFile(config.trace_file_path(), config.trace_replay_config().mode());
 
     // 后处理: 排序和生成trace_id
     TraceTimeSorter::SortTracesByTimestamp(traces);
