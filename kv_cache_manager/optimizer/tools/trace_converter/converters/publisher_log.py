@@ -250,7 +250,7 @@ class PublisherLogConverter(BaseConverter):
         # Write trace (保留原始时间戳和instance_id)
         write_result = self._create_write_trace(
             timestamp_ns=write_trace['timestamp_ns'],
-            keys=write_trace['keys'],
+            keys=get_result['keys'],
             instance_id=instance_id,
         )
 

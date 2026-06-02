@@ -487,17 +487,17 @@ python3 trace_converter.py -i input.jsonl -o output.jsonl -f my
 
 ```python
 # 创建 Get trace
-self._create_get_trace(
+get_trace = self._create_get_trace(
     timestamp_ns=timestamp_ns,
     keys=block_keys,
     instance_id=instance_id,
     input_len=input_len
 )
 
-# 创建 Write trace
+# 创建 paired Write trace；使用 get_trace["keys"]，保证 partial tail block 已按 input_len 截掉
 self._create_write_trace(
     timestamp_ns=timestamp_ns,
-    keys=block_keys,
+    keys=get_trace["keys"],
     instance_id=instance_id
 )
 

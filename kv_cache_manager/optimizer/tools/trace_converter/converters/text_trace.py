@@ -118,7 +118,7 @@ def _process_chunk_text(
             )
             write_trace = converter._create_write_trace(
                 timestamp_ns=timestamp_ns + 1,
-                keys=block_ids,
+                keys=get_trace['keys'],
                 instance_id=default_instance_id,
             )
             traces.extend([get_trace, write_trace])

@@ -127,7 +127,7 @@ class QwenBailianConverter(BaseConverter):
         # Write trace (prefill阶段, 时间戳+1纳秒) - 显式使用default_instance_id
         write_trace = self._create_write_trace(
             timestamp_ns=base_timestamp_ns + 1,
-            keys=block_keys,
+            keys=get_trace['keys'],
             instance_id=self.default_instance_id,
         )
 
