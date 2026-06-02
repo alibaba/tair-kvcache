@@ -78,6 +78,7 @@ private:
 
         std::vector<std::string> mediums;
         std::map<std::string, std::string> last_system_status;
+        MetricsTags metrics_tags;
     };
 
     VineyardStorageSpec spec_;

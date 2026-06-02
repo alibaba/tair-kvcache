@@ -297,3 +297,50 @@ TEST_F(VineyardBackendTest, LivenessLoopPassesGenerationToCallback) {
 
     ASSERT_EQ(EC_OK, backend.Close());
 }
+
+// OnHeartbeat publishes numeric system_status as prometheus gauges
+TEST_F(VineyardBackendTest, OnHeartbeatPublishesMetricsGauges) {
+    VineyardBackend backend(metrics_registry_);
+    ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 5000, /*grace*/ 10000, /*tick*/ 50), "trace"));
+    ASSERT_EQ(EC_OK, backend.RegisterNode("10.0.0.10:9600", {"mem"}));
+
+    // Round 1: send initial metrics
+    backend.OnHeartbeat("10.0.0.10:9600", {
+        {"hit_rate", "0.85"},
+        {"active_leases", "5"},
+        {"non_numeric_field", "BOTH_OK"},
+    });
+
+    // Verify numeric gauges registered
+    auto hit_rate_data = metrics_registry_->GetMetricsData("v6d.hit_rate");
+    ASSERT_NE(hit_rate_data, nullptr);
+    MetricsTags expected_tags = {{"instance_id", "v6d_cluster_test"}, {"host", "10.0.0.10:9600"}};
+    auto gauge = hit_rate_data->GetOrCreateGauge(expected_tags);
+    ASSERT_DOUBLE_EQ(0.85, gauge.Get());
+
+    auto leases_data = metrics_registry_->GetMetricsData("v6d.active_leases");
+    ASSERT_NE(leases_data, nullptr);
+    auto leases_gauge = leases_data->GetOrCreateGauge(expected_tags);
+    ASSERT_DOUBLE_EQ(5.0, leases_gauge.Get());
+
+    // Verify non-numeric field NOT registered
+    auto non_numeric = metrics_registry_->GetMetricsData("v6d.non_numeric_field");
+    ASSERT_EQ(non_numeric, nullptr);
+
+    // Round 2: dynamically add a new metric
+    backend.OnHeartbeat("10.0.0.10:9600", {
+        {"hit_rate", "0.90"},
+        {"brand_new_metric", "42"},
+    });
+
+    // New metric should appear
+    auto new_data = metrics_registry_->GetMetricsData("v6d.brand_new_metric");
+    ASSERT_NE(new_data, nullptr);
+    auto new_gauge = new_data->GetOrCreateGauge(expected_tags);
+    ASSERT_DOUBLE_EQ(42.0, new_gauge.Get());
+
+    // Existing metric should be updated
+    ASSERT_DOUBLE_EQ(0.90, gauge.Get());
+
+    ASSERT_EQ(EC_OK, backend.Close());
+}

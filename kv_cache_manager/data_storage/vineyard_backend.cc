@@ -1,6 +1,7 @@
 #include "kv_cache_manager/data_storage/vineyard_backend.h"
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <memory>
 #include <mutex>
@@ -104,6 +105,7 @@ ErrorCode VineyardBackend::RegisterNode(const std::string &host_ip_port, const s
         info.last_heartbeat_ms.store(now_ms, std::memory_order_relaxed);
         info.available.store(true, std::memory_order_relaxed);
         info.unavailable_since_ms.store(0, std::memory_order_relaxed);
+        info.metrics_tags = {{"instance_id", spec_.cluster_name()}, {"host", host_ip_port}};
         KVCM_LOG_INFO("VineyardBackend: node [%s] already registered, mediums=%zu (refreshed heartbeat, gen=%lu)",
                       host_ip_port.c_str(),
                       info.mediums.size(),
@@ -116,6 +118,7 @@ ErrorCode VineyardBackend::RegisterNode(const std::string &host_ip_port, const s
     info->available.store(true, std::memory_order_relaxed);
     info->unavailable_since_ms.store(0, std::memory_order_relaxed);
     info->mediums = mediums;
+    info->metrics_tags = {{"instance_id", spec_.cluster_name()}, {"host", host_ip_port}};
     nodes_[host_ip_port] = std::move(info);
 
     KVCM_LOG_INFO("VineyardBackend: node [%s] registered in cluster [%s], mediums=%zu, gen=%lu",
@@ -157,6 +160,21 @@ void VineyardBackend::OnHeartbeat(const std::string &host_ip_port,
         KVCM_LOG_INFO("VineyardBackend: node [%s] recovered from unavailable", host_ip_port.c_str());
     }
     info.last_system_status = system_status;
+
+    // Publish numeric system_status entries as prometheus gauges.
+    if (metrics_registry_) {
+        const auto &tags = info.metrics_tags;
+        for (const auto &kv : system_status) {
+            const auto &s = kv.second;
+            if (s.empty()) continue;
+            double val = 0;
+            auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), val);
+            if (ec == std::errc{} && ptr == s.data() + s.size()) {
+                auto gauge = metrics_registry_->GetGauge("v6d." + kv.first, tags);
+                gauge = val;
+            }
+        }
+    }
 }
 
 void VineyardBackend::SetNodeUnavailable(const std::string &host_ip_port) {
