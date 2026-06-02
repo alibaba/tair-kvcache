@@ -160,7 +160,7 @@
           <td>某 tier 发生容量驱逐，且到下一层 edge 是 cascading</td>
           <td>下一层不存在该 block 时复制到下一层，<code>write_touch_count = 0</code>；已有则保持已有副本</td>
           <td>已存在的目标层不重复建副本；后续 write-through edge 仍继续向下流动</td>
-          <td>最后一层驱逐后记录 <code>FINAL_EVICT</code></td>
+          <td>block 没有任何 location 后记录 <code>FINAL_EVICT</code></td>
         </tr>
         <tr>
           <td class="phase">写穿/ selective edge 上的驱逐</td>
@@ -202,8 +202,8 @@
         </tr>
         <tr>
           <td class="phase"><code>cascading</code></td>
-          <td>engine 发生最终驱逐</td>
-          <td>engine 侧产生 <code>FINAL_EVICT</code> 的 block 写入 storage pool</td>
+          <td>engine pool-source 层发生驱逐</td>
+          <td>engine pool-source 层产生 <code>LEAVE_TIER</code> 的 block 写入 storage pool</td>
           <td>驱逐下沉写入 pool 时不做已有副本 touch</td>
           <td>驱逐写由 eviction 驱动，不限定触发 eviction 的请求类型</td>
         </tr>

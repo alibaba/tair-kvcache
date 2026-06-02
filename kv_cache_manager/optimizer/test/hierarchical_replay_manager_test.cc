@@ -438,6 +438,39 @@ TEST_F(HierarchicalReplayManagerTest, CascadingStoragePoolWriteMovesInferEvictio
     EXPECT_EQ(pool_hit_after_eviction.storage_pool_hit_length, 1);
 }
 
+TEST_F(HierarchicalReplayManagerTest, CascadingStoragePoolWriteUsesInferSourceTierEvictions) {
+    const std::string root = GetTestTempRootPath() + "/hierarchical_replay_cascading_source_tier_eviction";
+    HierarchicalReplayConfig config = CreateHierarchicalConfig(root);
+    OptimizerConfig engine_config =
+        CreateEngineOptimizerConfig("engine_group", {"engine_a", "engine_b"}, {"hbm", "dram"}, root + "/infer", 16);
+    for (auto &group : engine_config.mutable_instance_groups()) {
+        auto &tiers = group.mutable_storages();
+        ASSERT_EQ(tiers.size(), 2);
+        tiers[0].set_capacity(32);
+        tiers[1].set_capacity(16);
+    }
+    config.set_engine_config(engine_config);
+    StoragePoolFlowConfig flow = CreateStoragePoolFlow();
+    flow.set_write_mode(TierWriteMode::CASCADING);
+    SetStoragePoolFlow(config, flow);
+
+    HierarchicalReplayManager manager(config);
+    ASSERT_TRUE(manager.Init());
+
+    const std::vector<int64_t> first = {611};
+    const std::vector<int64_t> second = {612};
+    manager.WriteCache("engine_a", "write_first", 1000, first);
+    manager.WriteCache("engine_a", "evict_first_from_source_tier", 1100, second);
+
+    auto engine_a_hit = manager.GetCacheLocation("engine_a", "engine_a_still_has_first", 1200, first, 16);
+    EXPECT_EQ(engine_a_hit.engine_hit_length, 1);
+    EXPECT_EQ(engine_a_hit.storage_pool_hit_length, 0);
+
+    auto pool_hit = manager.GetCacheLocation("engine_b", "pool_hit_after_source_tier_eviction", 1300, first, 16);
+    EXPECT_EQ(pool_hit.engine_hit_length, 0);
+    EXPECT_EQ(pool_hit.storage_pool_hit_length, 1);
+}
+
 TEST_F(HierarchicalReplayManagerTest, WriteThroughStoragePoolUsesInferLastTierWriteEvents) {
     const std::string root = GetTestTempRootPath() + "/hierarchical_replay_write_through_source_events";
     HierarchicalReplayConfig config = CreateHierarchicalConfig(root);

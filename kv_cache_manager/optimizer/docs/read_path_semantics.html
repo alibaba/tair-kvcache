@@ -140,7 +140,7 @@
           <td class="phase">storage pool hit 回填 engine</td>
           <td>storage pool hit，且 <code>storage_pool_flow.promote_enabled = true</code></td>
           <td>以完整命中 prefix 回填 engine，已有 engine prefix 不做 write touch，新回填 suffix 的 <code>write_touch_count = 0</code></td>
-          <td>回填 engine 最高层；若回填触发 engine 最终驱逐，且 storage pool flow 是 <code>cascading</code>，evicted sequence 写入 pool</td>
+          <td>回填 engine 最高层；若回填触发 engine pool-source 层驱逐，且 storage pool flow 是 <code>cascading</code>，evicted sequence 写入 pool</td>
           <td>命中统计保持为 storage pool <code>RemoteHit</code></td>
         </tr>
         <tr>
