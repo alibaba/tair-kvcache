@@ -52,6 +52,7 @@ class CacheLocationViewVecWrapper {
 public:
     CacheLocationViewVecWrapper();
     CacheLocationViewVecWrapper(CacheLocationViewVecWrapper &&other);
+    CacheLocationViewVecWrapper &operator=(CacheLocationViewVecWrapper &&other);
     explicit CacheLocationViewVecWrapper(CacheLocationVector &&raw_cache_locations);
     inline const CacheLocationViewVec &cache_locations_view() const { return cache_locations_view_; }
 

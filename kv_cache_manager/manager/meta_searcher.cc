@@ -195,7 +195,7 @@ CacheLocationConstPtr SelectAndMergeForMatch(SelectLocationPolicy *policy,
                                              CacheLocationMap &location_map,
                                              CheckLocDataExistFunc check_loc_data_exist,
                                              std::vector<std::string> &out_prune_loc_ids,
-                                             const std::string &caller_node_ip = "",
+                                             const std::string &caller_node_id = "",
                                              CacheAffinityManager *affinity_manager = nullptr,
                                              int64_t block_key = 0,
                                              std::vector<std::unique_ptr<ReadSideEffect>> *out_side_effects = nullptr,
@@ -267,9 +267,9 @@ CacheLocationConstPtr SelectAndMergeForMatch(SelectLocationPolicy *policy,
             }
             for (const auto &spec : loc_ptr->location_specs()) {
                 auto [it, inserted] = merged_specs.try_emplace(spec.name(), spec);
-                if (!inserted && !caller_node_ip.empty()) {
-                    const bool incumbent_local = (it->second.node_id() == caller_node_ip);
-                    const bool challenger_local = (spec.node_id() == caller_node_ip);
+                if (!inserted && !caller_node_id.empty()) {
+                    const bool incumbent_local = (it->second.node_id() == caller_node_id);
+                    const bool challenger_local = (spec.node_id() == caller_node_id);
                     if (challenger_local && !incumbent_local) {
                         it->second = spec;
                     }
@@ -1477,7 +1477,7 @@ ErrorCode MetaSearcher::PrefixMatchBestLocationImpl(RequestContext *request_cont
                                                               location_map,
                                                               check_loc_data_exist_func_,
                                                               prune_loc_ids,
-                                                              request_context->caller_node_ip(),
+                                                              request_context->caller_node_id(),
                                                               affinity_manager,
                                                               keys[i],
                                                               out_side_effects,
@@ -1587,7 +1587,7 @@ ErrorCode MetaSearcher::BatchGetBestLocation(RequestContext *request_context,
                                                               location_map,
                                                               check_loc_data_exist_func_,
                                                               prune_loc_ids,
-                                                              request_context->caller_node_ip(),
+                                                              request_context->caller_node_id(),
                                                               affinity_manager,
                                                               keys[i],
                                                               out_side_effects,
@@ -1877,7 +1877,7 @@ ErrorCode MetaSearcher::ReverseRollSlideWindowMatch(RequestContext *request_cont
                                                                   location_map,
                                                                   check_loc_data_exist_func_,
                                                                   prune_loc_ids,
-                                                                  request_context->caller_node_ip(),
+                                                                  request_context->caller_node_id(),
                                                                   affinity_manager,
                                                                   keys[base + offset],
                                                                   out_side_effects,

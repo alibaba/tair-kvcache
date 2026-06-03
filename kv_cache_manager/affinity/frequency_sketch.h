@@ -2,7 +2,7 @@
 
 // affinity v1 §15.1: F3 频率反馈机制层。
 //
-// Per-(caller_node_ip, block_key) LRU counter，统计 caller 最近对 key 的
+// Per-(caller_node_id, block_key) LRU counter，统计 caller 最近对 key 的
 // 远端命中次数。每次 GetCacheLocation 处理完一个 key：
 //   - 如果 winner 没有 caller 本地的 spec  ⇒ counter += 1
 //   - 如果有                              ⇒ 不变（本地已命中）
@@ -29,13 +29,13 @@ public:
     explicit FrequencySketch(size_t capacity = 1000000) : capacity_(capacity) {}
 
     // 记录一次远端命中：counter += 1；若不存在则 init 为 1。
-    void Observe(const std::string &caller_node_ip, int64_t block_key);
+    void Observe(const std::string &caller_node_id, int64_t block_key);
 
     // 查询当前 counter 值，不存在返回 0。
-    uint32_t RemoteCount(const std::string &caller_node_ip, int64_t block_key) const;
+    uint32_t RemoteCount(const std::string &caller_node_id, int64_t block_key) const;
 
     // 显式重置某 entry（例如 hint 已发出 + 进入 dedup 窗口）。
-    void Reset(const std::string &caller_node_ip, int64_t block_key);
+    void Reset(const std::string &caller_node_id, int64_t block_key);
 
     // 测试 / 调试用
     size_t Size() const;
