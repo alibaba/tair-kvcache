@@ -103,7 +103,7 @@ void AdminServiceImpl::AddStorage(RequestContext *request_context,
     ErrorCode ec_info = registry_manager_->AddStorage(request_context, storage_req);
 
     if (ec_info != EC_OK) {
-        status->set_code(proto::admin::INTERNAL_ERROR);
+        status->set_code(ToAdminPbError(ec_info));
         status->set_message("Failed to add storage");
         request_context->set_status_code(status->code());
         KVCM_LOG_ERROR("[traceId: %s] AddStorage failed", request->trace_id().c_str());
@@ -128,7 +128,7 @@ void AdminServiceImpl::EnableStorage(RequestContext *request_context,
     }
     ErrorCode ec_info = registry_manager_->EnableStorage(request_context, request->storage_unique_name());
     if (ec_info != EC_OK) {
-        status->set_code(proto::admin::INTERNAL_ERROR);
+        status->set_code(ToAdminPbError(ec_info));
         request_context->set_status_code(status->code());
         status->set_message("Failed to enable storage");
         KVCM_LOG_ERROR("[traceId: %s] EnableStorage failed", request->trace_id().c_str());
@@ -153,7 +153,7 @@ void AdminServiceImpl::DisableStorage(RequestContext *request_context,
     }
     ErrorCode ec_info = registry_manager_->DisableStorage(request_context, request->storage_unique_name());
     if (ec_info != EC_OK) {
-        status->set_code(proto::admin::INTERNAL_ERROR);
+        status->set_code(ToAdminPbError(ec_info));
         request_context->set_status_code(status->code());
         status->set_message("Failed to disable storage");
         KVCM_LOG_ERROR("[traceId: %s] DisableStorage failed", request->trace_id().c_str());
@@ -178,7 +178,7 @@ void AdminServiceImpl::RemoveStorage(RequestContext *request_context,
     }
     ErrorCode ec_info = registry_manager_->RemoveStorage(request_context, request->storage_unique_name());
     if (ec_info != EC_OK) {
-        status->set_code(proto::admin::INTERNAL_ERROR);
+        status->set_code(ToAdminPbError(ec_info));
         request_context->set_status_code(status->code());
         status->set_message("Failed to remove storage");
         KVCM_LOG_ERROR("[traceId: %s] RemoveStorage failed", request->trace_id().c_str());
@@ -209,7 +209,7 @@ void AdminServiceImpl::UpdateStorage(RequestContext *request_context,
     }
     ErrorCode ec_info = registry_manager_->UpdateStorage(request_context, storage_req, request->force_update());
     if (ec_info != EC_OK) {
-        status->set_code(proto::admin::INTERNAL_ERROR);
+        status->set_code(ToAdminPbError(ec_info));
         request_context->set_status_code(status->code());
         status->set_message("Failed to update storage");
         KVCM_LOG_ERROR("[traceId: %s] UpdateStorage failed", request->trace_id().c_str());
@@ -232,7 +232,7 @@ void AdminServiceImpl::ListStorage(RequestContext *request_context,
     ErrorCode ec_info = list_storage.first;
     std::vector<StorageConfig> list_storage_res = list_storage.second;
     if (ec_info != EC_OK) {
-        status->set_code(proto::admin::INTERNAL_ERROR);
+        status->set_code(ToAdminPbError(ec_info));
         request_context->set_status_code(status->code());
         status->set_message("Failed to list storage");
         KVCM_LOG_ERROR("[traceId: %s] ListStorage failed", request->trace_id().c_str());
@@ -269,7 +269,7 @@ void AdminServiceImpl::CreateInstanceGroup(RequestContext *request_context,
     }
     ErrorCode ec_info = registry_manager_->CreateInstanceGroup(request_context, instance_group_req);
     if (ec_info != EC_OK) {
-        status->set_code(proto::admin::INTERNAL_ERROR);
+        status->set_code(ToAdminPbError(ec_info));
         request_context->set_status_code(status->code());
         status->set_message("Failed to create instance group");
         KVCM_LOG_ERROR("[traceId: %s] CreateInstanceGroup failed", request->trace_id().c_str());
@@ -301,7 +301,7 @@ void AdminServiceImpl::UpdateInstanceGroup(RequestContext *request_context,
     ErrorCode ec_info =
         registry_manager_->UpdateInstanceGroup(request_context, instance_group_req, request->current_version());
     if (ec_info != EC_OK) {
-        status->set_code(proto::admin::INTERNAL_ERROR);
+        status->set_code(ToAdminPbError(ec_info));
         request_context->set_status_code(status->code());
         status->set_message("Failed to update instance group");
         KVCM_LOG_ERROR("[traceId: %s] UpdateInstanceGroup failed", request->trace_id().c_str());
@@ -326,7 +326,7 @@ void AdminServiceImpl::RemoveInstanceGroup(RequestContext *request_context,
     }
     ErrorCode ec_info = registry_manager_->RemoveInstanceGroup(request_context, request->name());
     if (ec_info != EC_OK) {
-        status->set_code(proto::admin::INTERNAL_ERROR);
+        status->set_code(ToAdminPbError(ec_info));
         request_context->set_status_code(status->code());
         status->set_message("Failed to remove instance group");
         KVCM_LOG_ERROR("[traceId: %s] RemoveInstanceGroup failed", request->trace_id().c_str());
@@ -355,7 +355,7 @@ void AdminServiceImpl::GetInstanceGroup(RequestContext *request_context,
     ErrorCode ec_info = get_instance_group.first;
     std::shared_ptr<const InstanceGroup> instance_group_res = get_instance_group.second;
     if (ec_info != EC_OK) {
-        status->set_code(proto::admin::INTERNAL_ERROR);
+        status->set_code(ToAdminPbError(ec_info));
         request_context->set_status_code(status->code());
         status->set_message("Failed to get instance group");
         KVCM_LOG_ERROR("[traceId: %s] GetInstanceGroup failed", request->trace_id().c_str());
@@ -428,7 +428,7 @@ void AdminServiceImpl::GetCacheMeta(RequestContext *request_context,
     std::vector<std::string> metas_res = cache_meta_vec_wrapper.metas();
 
     if (ec_info != EC_OK) {
-        status->set_code(proto::admin::INTERNAL_ERROR);
+        status->set_code(ToAdminPbError(ec_info));
         request_context->set_status_code(status->code());
         status->set_message("Failed to get cache metadata");
         KVCM_LOG_ERROR("[traceId: %s] GetCacheMeta failed", request->trace_id().c_str());
@@ -474,7 +474,7 @@ void AdminServiceImpl::RemoveCache(RequestContext *request_context,
                                     std::vector<int64_t>(request->token_ids().begin(), request->token_ids().end()),
                                     block_mask_req);
     if (ec_info != EC_OK) {
-        status->set_code(proto::admin::INTERNAL_ERROR);
+        status->set_code(ToAdminPbError(ec_info));
         request_context->set_status_code(status->code());
         status->set_message("Failed to remove cache");
         KVCM_LOG_ERROR("[traceId: %s] RemoveCache failed", request->trace_id().c_str());
@@ -605,7 +605,7 @@ void AdminServiceImpl::GetInstanceInfo(RequestContext *request_context,
     std::shared_ptr<const InstanceInfo> get_instance_info_res =
         registry_manager_->GetInstanceInfo(request_context, request->instance_id());
     if (!get_instance_info_res) {
-        status->set_code(proto::admin::INTERNAL_ERROR);
+        status->set_code(proto::admin::INSTANCE_NOT_EXIST);
         request_context->set_status_code(status->code());
         status->set_message("Failed to get instance info");
         KVCM_LOG_ERROR("[traceId: %s] GetInstanceInfo failed", request->trace_id().c_str());
@@ -632,7 +632,7 @@ void AdminServiceImpl::ListInstanceInfo(RequestContext *request_context,
     ErrorCode ec_info = list_instance_info.first;
     std::vector<std::shared_ptr<const InstanceInfo>> list_instance_info_res = list_instance_info.second;
     if (ec_info != EC_OK) {
-        status->set_code(proto::admin::INTERNAL_ERROR);
+        status->set_code(ToAdminPbError(ec_info));
         request_context->set_status_code(status->code());
         KVCM_LOG_ERROR("[traceId: %s] ListInstanceInfo failed", request->trace_id().c_str());
         return;
@@ -677,7 +677,7 @@ void AdminServiceImpl::AddAccount(RequestContext *request_context,
         registry_manager_->AddAccount(request_context, request->user_name(), request->password(), role_req);
 
     if (ec_info != EC_OK) {
-        status->set_code(proto::admin::INTERNAL_ERROR);
+        status->set_code(ToAdminPbError(ec_info));
         request_context->set_status_code(status->code());
         status->set_message("Failed to add account");
         KVCM_LOG_ERROR("[traceId: %s] AddAccount failed", request->trace_id().c_str());
@@ -701,7 +701,7 @@ void AdminServiceImpl::DeleteAccount(RequestContext *request_context,
     }
     ErrorCode ec_info = registry_manager_->DeleteAccount(request_context, request->user_name());
     if (ec_info != EC_OK) {
-        status->set_code(proto::admin::INTERNAL_ERROR);
+        status->set_code(ToAdminPbError(ec_info));
         request_context->set_status_code(status->code());
         status->set_message("Failed to delete account");
         KVCM_LOG_ERROR("[traceId: %s] DeleteAccount failed", request->trace_id().c_str());
@@ -724,7 +724,7 @@ void AdminServiceImpl::ListAccount(RequestContext *request_context,
     auto *header = response->mutable_header();
     auto *status = header->mutable_status();
     if (ec_info != EC_OK) {
-        status->set_code(proto::admin::INTERNAL_ERROR);
+        status->set_code(ToAdminPbError(ec_info));
         request_context->set_status_code(status->code());
         status->set_message("Failed to list account");
         KVCM_LOG_ERROR("[traceId: %s] ListAccount failed", request->trace_id().c_str());
@@ -755,7 +755,7 @@ void AdminServiceImpl::GenConfigSnapshot(RequestContext *request_context,
     ErrorCode ec_info = gen_config_snapshot.first;
     std::string gen_config_snapshot_res = gen_config_snapshot.second;
     if (ec_info != EC_OK) {
-        status->set_code(proto::admin::INTERNAL_ERROR);
+        status->set_code(ToAdminPbError(ec_info));
         request_context->set_status_code(status->code());
         status->set_message("Failed to generate config snapshot");
         KVCM_LOG_ERROR("[traceId: %s] GenConfigSnapshot failed", request->trace_id().c_str());
@@ -778,7 +778,7 @@ void AdminServiceImpl::LoadConfigSnapshot(RequestContext *request_context,
     auto *status = header->mutable_status();
     ErrorCode ec_info = registry_manager_->LoadConfigSnapshot(request_context, request->config_snapshot());
     if (ec_info != EC_OK) {
-        status->set_code(proto::admin::INTERNAL_ERROR);
+        status->set_code(ToAdminPbError(ec_info));
         request_context->set_status_code(status->code());
         status->set_message("Failed to load config snapshot");
         KVCM_LOG_ERROR("[traceId: %s] LoadConfigSnapshot failed", request->trace_id().c_str());
