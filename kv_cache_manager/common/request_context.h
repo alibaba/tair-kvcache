@@ -20,6 +20,16 @@
 
 namespace kv_cache_manager {
 
+// The caller's self-reported node, mirrors proto meta::CallerNode but kept
+// proto-free so the common layer does not depend on generated pb code.
+//   node_id      : inference node identity (IP / hostname). Same notion as
+//                  LocationSpec.node_id — a single physical machine.
+//   supernode_id : super-node (e.g. same rack / switch domain) the node lives in.
+struct CallerNode {
+    std::string node_id;
+    std::string supernode_id;
+};
+
 class RequestContext : std::enable_shared_from_this<RequestContext> {
 public:
     RequestContext() = delete;
@@ -35,12 +45,14 @@ public:
     const int64_t request_begin_time_us() const { return request_begin_time_us_; }
     const std::string &api_name() const { return api_name_; }
     const std::string &client_ip() const { return client_ip_; }
-    // Inference-side node IP self-declared by the client in the request body.
-    // Distinct from client_ip_ (gRPC peer IP, which may be a LB / proxy in
-    // front of the inference fleet). Used by the affinity layer to decide
-    // which storage node the request should prefer.
-    const std::string &caller_node_ip() const { return caller_node_ip_; }
-    const std::string &caller_supernode_id() const { return caller_supernode_id_; }
+    // The caller's self-reported node (inference node + super-node), declared by
+    // the client in the request body. Distinct from client_ip_ (gRPC peer IP,
+    // which may be a LB / proxy in front of the inference fleet). Used by the
+    // affinity layer to decide which storage node the request should prefer.
+    const CallerNode &caller_node() const { return caller_node_; }
+    // Convenience accessors delegating to caller_node_.
+    const std::string &caller_node_id() const { return caller_node_.node_id; }
+    const std::string &caller_supernode_id() const { return caller_node_.supernode_id; }
     // Whether the current request is a replication write. When true,
     // ExistsForWrite checks only the caller node (instead of global dedup)
     // and backend.Create is called with strict=true.
@@ -53,8 +65,9 @@ public:
     std::string EndAndGetSpanTracerDebugStr() const;
     void set_api_name(const std::string &value) { api_name_ = value; }
     void set_client_ip(const std::string &value) { client_ip_ = value; }
-    void set_caller_node_ip(const std::string &value) { caller_node_ip_ = value; }
-    void set_caller_supernode_id(const std::string &value) { caller_supernode_id_ = value; }
+    void set_caller_node(const CallerNode &value) { caller_node_ = value; }
+    void set_caller_node_id(const std::string &value) { caller_node_.node_id = value; }
+    void set_caller_supernode_id(const std::string &value) { caller_node_.supernode_id = value; }
     void set_is_replication(bool value) { is_replication_ = value; }
     void set_status_code(int value) { status_code_ = value; }
     void set_request_debug(const std::string &value) { request_debug_ = value; }
@@ -69,8 +82,7 @@ private:
     int64_t request_begin_time_us_;
     std::string api_name_; // 调用的接口名称
     std::string client_ip_;
-    std::string caller_node_ip_;
-    std::string caller_supernode_id_;
+    CallerNode caller_node_;
     bool is_replication_{false};
     int status_code_{0};
     std::string request_debug_;

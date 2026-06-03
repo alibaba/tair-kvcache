@@ -102,16 +102,16 @@ public:
                                                            const BlockMask &block_mask,
                                                            int32_t detail_level /*TODO*/);
 
-    std::pair<ErrorCode, CacheLocationViewVecWrapper>
-    GetCacheLocation(RequestContext *request_context,
-                     const std::string &instance_id,
-                     QueryType query_type,
-                     const KeyVector &keys,
-                     const TokenIdsVector &tokens,
-                     const BlockMask &block_mask,
-                     int32_t sw_size,
-                     const std::vector<std::string> &location_spec_names,
-                     std::vector<ReplicationHint> *out_hints = nullptr);
+    ErrorCode GetCacheLocation(RequestContext *request_context,
+                               const std::string &instance_id,
+                               QueryType query_type,
+                               const KeyVector &keys,
+                               const TokenIdsVector &tokens,
+                               const BlockMask &block_mask,
+                               int32_t sw_size,
+                               const std::vector<std::string> &location_spec_names,
+                               CacheLocationViewVecWrapper *out_locations = nullptr,
+                               std::vector<ReplicationHint> *out_hints = nullptr);
 
     std::pair<ErrorCode, int64_t> GetCacheLocationLen(RequestContext *request_context,
                                                       const std::string &instance_id,
@@ -210,17 +210,18 @@ private:
 
     void
     CleanupHostLocations(const std::string &instance_id, const std::string &host_ip_port, uint64_t cleanup_generation);
-    ErrorCode GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
-                                          RequestContext *request_context,
-                                          const std::string &instance_id,
-                                          QueryType query_type,
-                                          const KeyVector &keys,
-                                          const BlockMask &block_mask,
-                                          int32_t sw_size,
-                                          CacheLocationVector &cache_locations,
-                                          // Read side effects accumulated by meta_searcher;
-                                          // caller downcasts to concrete types (e.g. ReplicationHint).
-                                          std::vector<std::unique_ptr<ReadSideEffect>> *out_side_effects = nullptr) const;
+    ErrorCode
+    GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
+                                RequestContext *request_context,
+                                const std::string &instance_id,
+                                QueryType query_type,
+                                const KeyVector &keys,
+                                const BlockMask &block_mask,
+                                int32_t sw_size,
+                                CacheLocationVector &cache_locations,
+                                // Read side effects accumulated by meta_searcher;
+                                // caller downcasts to concrete types (e.g. ReplicationHint).
+                                std::vector<std::unique_ptr<ReadSideEffect>> *out_side_effects = nullptr) const;
     ErrorCode PerformCacheLocationQuery(RequestContext *request_context,
                                         ServiceMetricsCollector *service_metrics_collector,
                                         MetaSearcher *meta_searcher,

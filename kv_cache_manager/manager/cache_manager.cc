@@ -132,9 +132,7 @@ IsSpecNameInSpecGroup(const std::string &trace_id,
 // the same (instance, spec_name, block_key) produce distinct physical paths.
 // Without this, replication writes (which bypass ExistsForWrite dedup) would
 // silently overwrite the original allocation.
-inline std::string MakeStorageKey(const std::string &instance_id,
-                                  const std::string &spec_name,
-                                  int64_t block_key) {
+inline std::string MakeStorageKey(const std::string &instance_id, const std::string &spec_name, int64_t block_key) {
     return instance_id + "/" + spec_name + "/" + StringUtil::Uint64ToHex(block_key) + "/" +
            StringUtil::GenerateRandomString(8);
 }
@@ -341,54 +339,73 @@ std::pair<ErrorCode, CacheMetaVecWrapper> CacheManager::GetCacheMeta(RequestCont
     return {ec, CacheMetaVecWrapper(std::move(metas), std::move(cache_locations))};
 }
 
-ErrorCode CacheManager::PerformCacheLocationQuery(RequestContext *request_context,
-                                                  ServiceMetricsCollector *service_metrics_collector,
-                                                  MetaSearcher *meta_searcher,
-                                                  const std::string &instance_id,
-                                                  QueryType query_type,
-                                                  const KeyVector &keys,
-                                                  const TokenIdsVector &tokens,
-                                                  const BlockMask &block_mask,
-                                                  int32_t sw_size,
-                                                  KeyVector &query_keys,
-                                                  CacheLocationVector &cache_locations,
-                                                  std::vector<std::unique_ptr<ReadSideEffect>> *out_side_effects) const {
+ErrorCode
+CacheManager::PerformCacheLocationQuery(RequestContext *request_context,
+                                        ServiceMetricsCollector *service_metrics_collector,
+                                        MetaSearcher *meta_searcher,
+                                        const std::string &instance_id,
+                                        QueryType query_type,
+                                        const KeyVector &keys,
+                                        const TokenIdsVector &tokens,
+                                        const BlockMask &block_mask,
+                                        int32_t sw_size,
+                                        KeyVector &query_keys,
+                                        CacheLocationVector &cache_locations,
+                                        std::vector<std::unique_ptr<ReadSideEffect>> *out_side_effects) const {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
     ErrorCode ec = EC_ERROR;
     if (!keys.empty()) {
         KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, request_key_count, keys.size());
-        ec = GetCacheLocationByQueryType(meta_searcher, request_context, instance_id, query_type, keys, block_mask,
-                                         sw_size, cache_locations, out_side_effects);
+        ec = GetCacheLocationByQueryType(meta_searcher,
+                                         request_context,
+                                         instance_id,
+                                         query_type,
+                                         keys,
+                                         block_mask,
+                                         sw_size,
+                                         cache_locations,
+                                         out_side_effects);
     } else {
         auto [ec_temp, block_size] = GetBlockSize(request_context, instance_id);
         RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec_temp, "get block_size failed");
         auto gen_keys = GenKeyVector(tokens, block_size);
         KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, request_key_count, gen_keys.size());
         query_keys = gen_keys;
-        ec = GetCacheLocationByQueryType(meta_searcher, request_context, instance_id, query_type, gen_keys, block_mask,
-                                         sw_size, cache_locations, out_side_effects);
+        ec = GetCacheLocationByQueryType(meta_searcher,
+                                         request_context,
+                                         instance_id,
+                                         query_type,
+                                         gen_keys,
+                                         block_mask,
+                                         sw_size,
+                                         cache_locations,
+                                         out_side_effects);
     }
     return ec;
 }
 
-std::pair<ErrorCode, CacheLocationViewVecWrapper>
-CacheManager::GetCacheLocation(RequestContext *request_context,
-                               const std::string &instance_id,
-                               QueryType query_type,
-                               const KeyVector &keys,
-                               const TokenIdsVector &tokens,
-                               const BlockMask &block_mask,
-                               int32_t sw_size,
-                               const std::vector<std::string> &location_spec_names,
-                               std::vector<ReplicationHint> *out_hints) {
+ErrorCode CacheManager::GetCacheLocation(RequestContext *request_context,
+                                         const std::string &instance_id,
+                                         QueryType query_type,
+                                         const KeyVector &keys,
+                                         const TokenIdsVector &tokens,
+                                         const BlockMask &block_mask,
+                                         int32_t sw_size,
+                                         const std::vector<std::string> &location_spec_names,
+                                         CacheLocationViewVecWrapper *out_locations,
+                                         std::vector<ReplicationHint> *out_hints) {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     auto [ec, meta_searcher] = CheckInputAndGetMetaSearcher(request_context, instance_id, keys, tokens);
-    RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, CacheLocationViewVecWrapper, "check input or get meta searcher failed");
+    if (ec != EC_OK) {
+        KVCM_LOG_WARN("[traceId: %s] check input or get meta searcher failed, ec: %d", trace_id.c_str(), ec);
+        return ec;
+    }
     if (query_type == QueryType::QT_UNSPECIFIED) {
-        RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, EC_ERROR, CacheLocationViewVecWrapper, "unknown query type");
+        KVCM_LOG_WARN("[traceId: %s] unknown query type", trace_id.c_str());
+        return EC_ERROR;
     }
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, ManagerPrefixMatch);
     CacheLocationVector cache_locations;
@@ -446,7 +463,10 @@ CacheManager::GetCacheLocation(RequestContext *request_context,
             }
         }
     }
-    return {ec, CacheLocationViewVecWrapper(std::move(cache_locations))};
+    if (out_locations != nullptr) {
+        *out_locations = CacheLocationViewVecWrapper(std::move(cache_locations));
+    }
+    return ec;
 }
 
 std::pair<ErrorCode, int64_t> CacheManager::GetCacheLocationLen(RequestContext *request_context,
@@ -851,13 +871,12 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
     if (!location_spec_group_names.empty() || is_replication) {
         instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
     }
-    const std::string &caller_node_ip = request_context->caller_node_ip();
-    auto existsOnCallerNode = [&caller_node_ip, &check_loc_data_exist, &instance_info,
-                               &location_spec_group_names](
-                                  size_t i, const CacheLocationMap &m,
-                                  std::vector<std::string> &out_prune_loc_ids) -> bool {
+    const std::string &caller_node_id = request_context->caller_node_id();
+    auto existsOnCallerNode =
+        [&caller_node_id, &check_loc_data_exist, &instance_info, &location_spec_group_names](
+            size_t i, const CacheLocationMap &m, std::vector<std::string> &out_prune_loc_ids) -> bool {
         out_prune_loc_ids.clear();
-        if (caller_node_ip.empty()) {
+        if (caller_node_id.empty()) {
             return false;
         }
 
@@ -893,7 +912,7 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
                 continue;
             }
             for (const auto &spec : kv.second->location_specs()) {
-                if (spec.node_id() == caller_node_ip) {
+                if (spec.node_id() == caller_node_id) {
                     local_specs.insert(spec.name());
                 }
             }
@@ -1043,13 +1062,8 @@ CacheManager::CreateInSingleBatch(RequestContext *request_context,
         }
     }
     const bool strict = request_context->is_replication();
-    std::vector<LocationDescriptor> results = data_storage_manager->Create(request_context,
-                                                                           unique_name,
-                                                                           merged_block_keys,
-                                                                           common_size,
-                                                                           write_hints,
-                                                                           strict,
-                                                                           []() { /* do nothing */ });
+    std::vector<LocationDescriptor> results = data_storage_manager->Create(
+        request_context, unique_name, merged_block_keys, common_size, write_hints, strict, []() { /* do nothing */ });
 
     for (size_t i = 0; i < results.size(); i++) {
         if (results[i].ec == ErrorCode::EC_OK) {
@@ -1132,13 +1146,8 @@ ErrorCode CacheManager::CreateBySpec(RequestContext *request_context,
             }
         }
         const bool strict = request_context->is_replication();
-        std::vector<LocationDescriptor> results = data_storage_manager->Create(request_context,
-                                                                               unique_name,
-                                                                               block_keys,
-                                                                               spec_info.size(),
-                                                                               write_hints,
-                                                                               strict,
-                                                                               []() { /* do nothing */ });
+        std::vector<LocationDescriptor> results = data_storage_manager->Create(
+            request_context, unique_name, block_keys, spec_info.size(), write_hints, strict, []() { /* do nothing */ });
 
         for (size_t i = 0; i < results.size(); i++) {
             if (results[i].ec == ErrorCode::EC_OK) {
@@ -1238,7 +1247,7 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
             }
         }
         if (request_context) {
-            resolve_ctx.caller_node_ip = request_context->caller_node_ip();
+            resolve_ctx.caller_node_id = request_context->caller_node_id();
             resolve_ctx.caller_supernode_id = request_context->caller_supernode_id();
         }
         resolve_ctx_ptr = &resolve_ctx;
@@ -1341,9 +1350,7 @@ bool ParseInt64(const std::string &s, int64_t &out) {
         }
         out = v;
         return true;
-    } catch (...) {
-        return false;
-    }
+    } catch (...) { return false; }
 }
 
 std::shared_ptr<VineyardBackend> LookupVineyardBackend(const std::shared_ptr<RegistryManager> &registry_manager,
@@ -1821,15 +1828,16 @@ std::string CacheManager::GetStorageConfigStr(RequestContext *request_context, c
     return Jsonizable::ToJsonString(result);
 }
 
-ErrorCode CacheManager::GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
-                                                    RequestContext *request_context,
-                                                    const std::string &instance_id,
-                                                    QueryType query_type,
-                                                    const KeyVector &keys,
-                                                    const BlockMask &block_mask,
-                                                    int32_t sw_size,
-                                                    CacheLocationVector &cache_locations,
-                                                    std::vector<std::unique_ptr<ReadSideEffect>> *out_side_effects) const {
+ErrorCode
+CacheManager::GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
+                                          RequestContext *request_context,
+                                          const std::string &instance_id,
+                                          QueryType query_type,
+                                          const KeyVector &keys,
+                                          const BlockMask &block_mask,
+                                          int32_t sw_size,
+                                          CacheLocationVector &cache_locations,
+                                          std::vector<std::unique_ptr<ReadSideEffect>> *out_side_effects) const {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
     auto policy = genSelectLocationPolicy(request_context, instance_id);
@@ -1848,7 +1856,7 @@ ErrorCode CacheManager::GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
                 registry_manager_->GetGroupAffinityStrategyJson(request_context, info->instance_group_name());
         }
         if (request_context) {
-            resolve_ctx.caller_node_ip = request_context->caller_node_ip();
+            resolve_ctx.caller_node_id = request_context->caller_node_id();
             resolve_ctx.caller_supernode_id = request_context->caller_supernode_id();
         }
     }
@@ -1862,9 +1870,14 @@ ErrorCode CacheManager::GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
         break;
     }
     case QueryType::QT_PREFIX_MATCH: {
-        ec = meta_searcher->PrefixMatch(
-            request_context, keys, block_mask, cache_locations, policy.get(), manager_ptr, out_side_effects,
-            resolve_ctx_ptr);
+        ec = meta_searcher->PrefixMatch(request_context,
+                                        keys,
+                                        block_mask,
+                                        cache_locations,
+                                        policy.get(),
+                                        manager_ptr,
+                                        out_side_effects,
+                                        resolve_ctx_ptr);
         break;
     }
     case QueryType::QT_REVERSE_ROLL_SW_MATCH: {
@@ -1872,9 +1885,14 @@ ErrorCode CacheManager::GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
             request_context->error_tracer()->AddErrorMsg("QT_REVERSE_ROLL_SW_MATCH bad args");
             RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_BADARGS, "bad keys size: %zu, %d", keys.size(), sw_size);
         }
-        ec = meta_searcher->ReverseRollSlideWindowMatch(
-            request_context, keys, sw_size, cache_locations, policy.get(), manager_ptr, out_side_effects,
-            resolve_ctx_ptr);
+        ec = meta_searcher->ReverseRollSlideWindowMatch(request_context,
+                                                        keys,
+                                                        sw_size,
+                                                        cache_locations,
+                                                        policy.get(),
+                                                        manager_ptr,
+                                                        out_side_effects,
+                                                        resolve_ctx_ptr);
         break;
     }
     default:

@@ -270,6 +270,18 @@ enum QueryType {
     QT_REVERSE_ROLL_SW_MATCH = 3;
 }
 
+// The caller's self-reported node, used by the affinity layer.
+//   node_id      : the inference node identity (IP / hostname). Same notion as
+//                  LocationSpec.node_id / NodeMetrics.node_id — a single
+//                  physical machine. Empty = unknown / affinity not enabled.
+//   supernode_id : the super-node (e.g. same rack / switch domain) the node
+//                  belongs to. Used for hierarchical locality:
+//                  same node (cheapest) > same supernode > remote.
+message CallerNode {
+    string node_id = 1;
+    string supernode_id = 2;
+}
+
 message GetCacheLocationRequest {
     string trace_id = 1;
     string instance_id = 2;
@@ -280,13 +292,10 @@ message GetCacheLocationRequest {
     int32 sw_size = 7;        // slide window size, for QT_REVERSE_ROLL_SW_MATCH
     repeated string location_spec_names = 8; // 用于仅返回部分spec。不传则全返回。
 
-    // Caller's inference node IP. Used for local-preference in read path
-    // and replication trigger. Empty = old client / affinity not enabled.
-    string caller_node_ip = 9;
-
-    // Caller's super-node ID (self-reported). Used for hierarchical locality:
-    // same node (cheapest) > same supernode > remote. Empty = unknown.
-    string caller_supernode_id = 10;
+    // The caller's self-reported node (inference node + super-node). Used for
+    // local-preference in read path, replication trigger, and hierarchical
+    // locality. Empty / unset = old client / affinity not enabled.
+    CallerNode caller = 9;
 }
 
 message GetCacheLocationLenRequest {
@@ -349,21 +358,17 @@ message StartWriteCacheRequest {
     int32 write_timeout_seconds = 6; // seconds, 要在指定timeout内调用FinishWriteCacheRequest，否则服务端会将本次 Request 相关的 Meta 全释放掉
     // 看情况添加一个已匹配block数量，提升metaservice性能，针对流式存储场景
 
-    // 调用方推理节点自报的 IP/hostname，给服务端 affinity 决策用
-    // (cache_affinity_manager + write_hints 路径)。空字符串 = 老客户端，
-    // 退化为无亲和性的写放置（与未启用 affinity 行为完全一致）。
-    string caller_node_ip = 7;
+    // 调用方自报的节点（推理节点 + 超节点），给服务端 affinity 决策用
+    // (cache_affinity_manager + write_hints 路径)。unset = 老客户端，
+    // 退化为无亲和性的写放置（行为完全等价于改造前）。
+    CallerNode caller = 7;
 
     // Replication write flag.
     //   false = normal write: global dedup via ExistsForWrite, strict=false
     //   true  = replication write: dedup only on caller node, strict=true
     // Server derives the strict parameter from this flag automatically.
     bool is_replication = 8;
-
-    // Caller's super-node ID (self-reported). Same semantics as in
-    // GetCacheLocationRequest.caller_supernode_id.
-    string caller_supernode_id = 9;
-}
+}}
 
 message StartWriteCacheResponse {
     CommonResponseHeader header = 1;

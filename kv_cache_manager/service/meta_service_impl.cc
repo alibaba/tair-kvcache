@@ -275,11 +275,11 @@ void MetaServiceImpl::GetCacheLocation(RequestContext *request_context,
     for (const auto &name : request->location_spec_names()) {
         location_spec_names.push_back(name);
     }
-    request_context->set_caller_node_ip(request->caller_node_ip());
-    request_context->set_caller_supernode_id(request->caller_supernode_id());
+    request_context->set_caller_node(CallerNode{request->caller().node_id(), request->caller().supernode_id()});
 
     std::vector<ReplicationHint> hints;
-    auto [ec_info, cache_location_view_vec_wrapper] = cache_manager_->GetCacheLocation(
+    CacheLocationViewVecWrapper cache_location_view_vec_wrapper;
+    ErrorCode ec_info = cache_manager_->GetCacheLocation(
         request_context,
         request->instance_id(),
         static_cast<CacheManager::QueryType>(request->query_type()),
@@ -288,6 +288,7 @@ void MetaServiceImpl::GetCacheLocation(RequestContext *request_context,
         block_mask_req,
         request->sw_size(),
         location_spec_names,
+        &cache_location_view_vec_wrapper,
         &hints);
     CacheLocationViewVec cache_locations_res = cache_location_view_vec_wrapper.cache_locations_view();
     if (ec_info != EC_OK) {
@@ -449,8 +450,7 @@ void MetaServiceImpl::StartWriteCache(RequestContext *request_context,
     // 把调用方推理节点 IP 透传到 RequestContext，CacheManager 写路径在构建
     // AffinityResolveContext 时会读它。空字符串 = 老客户端 / 未启用 affinity，
     // 后端会退化为无亲和性的写放置（行为完全等价于改造前）。
-    request_context->set_caller_node_ip(request->caller_node_ip());
-    request_context->set_caller_supernode_id(request->caller_supernode_id());
+    request_context->set_caller_node(CallerNode{request->caller().node_id(), request->caller().supernode_id()});
     request_context->set_is_replication(request->is_replication());
 
     std::pair<ErrorCode, StartWriteCacheInfo> start_write_cache = cache_manager_->StartWriteCache(

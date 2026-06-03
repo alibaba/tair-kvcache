@@ -549,14 +549,16 @@ TEST_F(CacheManagerTest, TestGetCacheLocationPrefixMatch) {
 
     {
         BlockMask block_mask = static_cast<size_t>(0);
-        auto [ec, cache_locations] = cache_manager_->GetCacheLocation(request_context_.get(),
-                                                                      "test_instance",
-                                                                      CacheManager::QueryType::QT_PREFIX_MATCH,
-                                                                      keys,
-                                                                      {},
-                                                                      block_mask,
-                                                                      0,
-                                                                      {});
+        CacheLocationViewVecWrapper cache_locations;
+        auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
+                                                   "test_instance",
+                                                   CacheManager::QueryType::QT_PREFIX_MATCH,
+                                                   keys,
+                                                   {},
+                                                   block_mask,
+                                                   0,
+                                                   {},
+                                                   &cache_locations);
         ASSERT_EQ(EC_OK, ec);
         const auto &cache_locations_view = cache_locations.cache_locations_view();
         ASSERT_EQ(0, cache_locations_view.size());
@@ -569,14 +571,16 @@ TEST_F(CacheManagerTest, TestGetCacheLocationPrefixMatch) {
     }
     {
         BlockMask block_mask = static_cast<size_t>(0);
-        auto [ec, cache_locations] = cache_manager_->GetCacheLocation(request_context_.get(),
-                                                                      "test_instance",
-                                                                      CacheManager::QueryType::QT_PREFIX_MATCH,
-                                                                      keys,
-                                                                      {},
-                                                                      block_mask,
-                                                                      0,
-                                                                      {});
+        CacheLocationViewVecWrapper cache_locations;
+        auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
+                                                   "test_instance",
+                                                   CacheManager::QueryType::QT_PREFIX_MATCH,
+                                                   keys,
+                                                   {},
+                                                   block_mask,
+                                                   0,
+                                                   {},
+                                                   &cache_locations);
         ASSERT_EQ(EC_OK, ec);
         const auto &cache_locations_view = cache_locations.cache_locations_view();
         ASSERT_EQ(3, cache_locations_view.size());
@@ -584,28 +588,32 @@ TEST_F(CacheManagerTest, TestGetCacheLocationPrefixMatch) {
     {
         std::vector<int64_t> keys{1, 2, 4, 3};
         BlockMask block_mask = static_cast<size_t>(0);
-        auto [ec, cache_locations] = cache_manager_->GetCacheLocation(request_context_.get(),
-                                                                      "test_instance",
-                                                                      CacheManager::QueryType::QT_PREFIX_MATCH,
-                                                                      keys,
-                                                                      {},
-                                                                      block_mask,
-                                                                      0,
-                                                                      {});
+        CacheLocationViewVecWrapper cache_locations;
+        auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
+                                                   "test_instance",
+                                                   CacheManager::QueryType::QT_PREFIX_MATCH,
+                                                   keys,
+                                                   {},
+                                                   block_mask,
+                                                   0,
+                                                   {},
+                                                   &cache_locations);
         ASSERT_EQ(EC_OK, ec);
         const auto &cache_locations_view = cache_locations.cache_locations_view();
         ASSERT_EQ(2, cache_locations_view.size());
     }
     {
         BlockMask block_mask = static_cast<size_t>(0);
-        auto [ec, cache_locations] = cache_manager_->GetCacheLocation(request_context_.get(),
-                                                                      "test_instance",
-                                                                      CacheManager::QueryType::QT_PREFIX_MATCH,
-                                                                      keys,
-                                                                      {},
-                                                                      block_mask,
-                                                                      0,
-                                                                      {"tp0", "tp1", "tp2"});
+        CacheLocationViewVecWrapper cache_locations;
+        auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
+                                                   "test_instance",
+                                                   CacheManager::QueryType::QT_PREFIX_MATCH,
+                                                   keys,
+                                                   {},
+                                                   block_mask,
+                                                   0,
+                                                   {"tp0", "tp1", "tp2"},
+                                                   &cache_locations);
         ASSERT_EQ(EC_OK, ec);
         const auto &cache_locations_view = cache_locations.cache_locations_view();
         ASSERT_EQ(3, cache_locations_view.size());
@@ -771,14 +779,16 @@ TEST_F(CacheManagerTest, TestGetCacheLocationBatchGet) {
     ASSERT_EQ(EC_OK, ec1);
     {
         BlockMask block_mask = static_cast<size_t>(0);
-        auto [ec, cache_locations] = cache_manager_->GetCacheLocation(request_context_.get(),
-                                                                      "test_instance",
-                                                                      CacheManager::QueryType::QT_BATCH_GET,
-                                                                      keys,
-                                                                      {},
-                                                                      block_mask,
-                                                                      0,
-                                                                      {});
+        CacheLocationViewVecWrapper cache_locations;
+        auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
+                                                   "test_instance",
+                                                   CacheManager::QueryType::QT_BATCH_GET,
+                                                   keys,
+                                                   {},
+                                                   block_mask,
+                                                   0,
+                                                   {},
+                                                   &cache_locations);
         ASSERT_EQ(EC_OK, ec);
         const auto &cache_locations_view = cache_locations.cache_locations_view();
         ASSERT_EQ(4, cache_locations_view.size());
@@ -794,14 +804,16 @@ TEST_F(CacheManagerTest, TestGetCacheLocationBatchGet) {
     }
     {
         BlockMask block_mask = static_cast<size_t>(0);
-        auto [ec, cache_locations] = cache_manager_->GetCacheLocation(request_context_.get(),
-                                                                      "test_instance",
-                                                                      CacheManager::QueryType::QT_BATCH_GET,
-                                                                      {1, 2, 3, 4},
-                                                                      {},
-                                                                      block_mask,
-                                                                      0,
-                                                                      {});
+        CacheLocationViewVecWrapper cache_locations;
+        auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
+                                                   "test_instance",
+                                                   CacheManager::QueryType::QT_BATCH_GET,
+                                                   {1, 2, 3, 4},
+                                                   {},
+                                                   block_mask,
+                                                   0,
+                                                   {},
+                                                   &cache_locations);
         ASSERT_EQ(EC_OK, ec);
         const auto &cache_locations_view = cache_locations.cache_locations_view();
         ASSERT_EQ(4, cache_locations_view.size());
@@ -816,14 +828,16 @@ TEST_F(CacheManagerTest, TestGetCacheLocationBatchGet) {
     }
     {
         BlockMask block_mask = static_cast<size_t>(0);
-        auto [ec, cache_locations] = cache_manager_->GetCacheLocation(request_context_.get(),
-                                                                      "test_instance",
-                                                                      CacheManager::QueryType::QT_BATCH_GET,
-                                                                      {1, 2, 111, 4},
-                                                                      {},
-                                                                      block_mask,
-                                                                      0,
-                                                                      {});
+        CacheLocationViewVecWrapper cache_locations;
+        auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
+                                                   "test_instance",
+                                                   CacheManager::QueryType::QT_BATCH_GET,
+                                                   {1, 2, 111, 4},
+                                                   {},
+                                                   block_mask,
+                                                   0,
+                                                   {},
+                                                   &cache_locations);
         ASSERT_EQ(EC_OK, ec);
         const auto &cache_locations_view = cache_locations.cache_locations_view();
         ASSERT_EQ(4, cache_locations_view.size());
@@ -856,14 +870,16 @@ TEST_F(CacheManagerTest, TestGetCacheLocationReverseRollSlideWindowMatch) {
     ASSERT_EQ(EC_OK, ec1);
     {
         BlockMask block_mask = static_cast<size_t>(0);
-        auto [ec, cache_locations] = cache_manager_->GetCacheLocation(request_context_.get(),
-                                                                      "test_instance",
-                                                                      CacheManager::QueryType::QT_REVERSE_ROLL_SW_MATCH,
-                                                                      keys,
-                                                                      {},
-                                                                      block_mask,
-                                                                      2,
-                                                                      {});
+        CacheLocationViewVecWrapper cache_locations;
+        auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
+                                                   "test_instance",
+                                                   CacheManager::QueryType::QT_REVERSE_ROLL_SW_MATCH,
+                                                   keys,
+                                                   {},
+                                                   block_mask,
+                                                   2,
+                                                   {},
+                                                   &cache_locations);
         ASSERT_EQ(EC_OK, ec);
         const auto &cache_locations_view = cache_locations.cache_locations_view();
         ASSERT_EQ(6, cache_locations_view.size());
@@ -882,14 +898,16 @@ TEST_F(CacheManagerTest, TestGetCacheLocationReverseRollSlideWindowMatch) {
     }
     {
         BlockMask block_mask = static_cast<size_t>(0);
-        auto [ec, cache_locations] = cache_manager_->GetCacheLocation(request_context_.get(),
-                                                                      "test_instance",
-                                                                      CacheManager::QueryType::QT_REVERSE_ROLL_SW_MATCH,
-                                                                      keys,
-                                                                      {},
-                                                                      block_mask,
-                                                                      3,
-                                                                      {});
+        CacheLocationViewVecWrapper cache_locations;
+        auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
+                                                   "test_instance",
+                                                   CacheManager::QueryType::QT_REVERSE_ROLL_SW_MATCH,
+                                                   keys,
+                                                   {},
+                                                   block_mask,
+                                                   3,
+                                                   {},
+                                                   &cache_locations);
         ASSERT_EQ(EC_OK, ec);
         const auto &cache_locations_view = cache_locations.cache_locations_view();
         ASSERT_EQ(6, cache_locations_view.size());
@@ -902,14 +920,16 @@ TEST_F(CacheManagerTest, TestGetCacheLocationReverseRollSlideWindowMatch) {
     }
     {
         BlockMask block_mask = static_cast<size_t>(0);
-        auto [ec, cache_locations] = cache_manager_->GetCacheLocation(request_context_.get(),
-                                                                      "test_instance",
-                                                                      CacheManager::QueryType::QT_REVERSE_ROLL_SW_MATCH,
-                                                                      {1, 2, 3, 4, 5, 6, 7},
-                                                                      {},
-                                                                      block_mask,
-                                                                      2,
-                                                                      {});
+        CacheLocationViewVecWrapper cache_locations;
+        auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
+                                                   "test_instance",
+                                                   CacheManager::QueryType::QT_REVERSE_ROLL_SW_MATCH,
+                                                   {1, 2, 3, 4, 5, 6, 7},
+                                                   {},
+                                                   block_mask,
+                                                   2,
+                                                   {},
+                                                   &cache_locations);
         ASSERT_EQ(EC_OK, ec);
         const auto &cache_locations_view = cache_locations.cache_locations_view();
         ASSERT_EQ(7, cache_locations_view.size());
@@ -931,14 +951,16 @@ TEST_F(CacheManagerTest, TestGetCacheLocationReverseRollSlideWindowMatch) {
     }
     {
         BlockMask block_mask = static_cast<size_t>(0);
-        auto [ec, cache_locations] = cache_manager_->GetCacheLocation(request_context_.get(),
-                                                                      "test_instance",
-                                                                      CacheManager::QueryType::QT_REVERSE_ROLL_SW_MATCH,
-                                                                      {1, 2, 3, 10, 5, 6, 7},
-                                                                      {},
-                                                                      block_mask,
-                                                                      2,
-                                                                      {});
+        CacheLocationViewVecWrapper cache_locations;
+        auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
+                                                   "test_instance",
+                                                   CacheManager::QueryType::QT_REVERSE_ROLL_SW_MATCH,
+                                                   {1, 2, 3, 10, 5, 6, 7},
+                                                   {},
+                                                   block_mask,
+                                                   2,
+                                                   {},
+                                                   &cache_locations);
         ASSERT_EQ(EC_OK, ec);
         const auto &cache_locations_view = cache_locations.cache_locations_view();
         ASSERT_EQ(7, cache_locations_view.size());
@@ -983,14 +1005,16 @@ TEST_F(CacheManagerTest, TestGetCacheNotExistLocation) {
     {
         std::vector<int64_t> keys{1, 2, 3, 12212};
         BlockMask block_mask = static_cast<size_t>(0);
-        auto [ec, cache_locations] = cache_manager_->GetCacheLocation(request_context_.get(),
-                                                                      "test_instance",
-                                                                      CacheManager::QueryType::QT_PREFIX_MATCH,
-                                                                      keys,
-                                                                      {},
-                                                                      block_mask,
-                                                                      0,
-                                                                      {});
+        CacheLocationViewVecWrapper cache_locations;
+        auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
+                                                   "test_instance",
+                                                   CacheManager::QueryType::QT_PREFIX_MATCH,
+                                                   keys,
+                                                   {},
+                                                   block_mask,
+                                                   0,
+                                                   {},
+                                                   &cache_locations);
         ASSERT_EQ(EC_OK, ec);
         const auto &cache_locations_view = cache_locations.cache_locations_view();
         ASSERT_EQ(3, cache_locations_view.size());
@@ -1015,14 +1039,16 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheWithBlockMask) {
 
         {
             BlockMask block_mask = static_cast<size_t>(0);
-            auto [ec, cache_locations] = cache_manager_->GetCacheLocation(request_context_.get(),
-                                                                          "test_instance",
-                                                                          CacheManager::QueryType::QT_PREFIX_MATCH,
-                                                                          keys,
-                                                                          {},
-                                                                          block_mask,
-                                                                          0,
-                                                                          {});
+            CacheLocationViewVecWrapper cache_locations;
+            auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
+                                                       "test_instance",
+                                                       CacheManager::QueryType::QT_PREFIX_MATCH,
+                                                       keys,
+                                                       {},
+                                                       block_mask,
+                                                       0,
+                                                       {},
+                                                       &cache_locations);
             ASSERT_EQ(EC_OK, ec);
             const auto &cache_locations_view = cache_locations.cache_locations_view();
             ASSERT_EQ(0, cache_locations_view.size());
@@ -1037,14 +1063,16 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheWithBlockMask) {
 
         {
             BlockMask block_mask = static_cast<size_t>(0);
-            auto [ec, cache_locations] = cache_manager_->GetCacheLocation(request_context_.get(),
-                                                                          "test_instance",
-                                                                          CacheManager::QueryType::QT_PREFIX_MATCH,
-                                                                          keys,
-                                                                          {},
-                                                                          block_mask,
-                                                                          0,
-                                                                          {});
+            CacheLocationViewVecWrapper cache_locations;
+            auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
+                                                       "test_instance",
+                                                       CacheManager::QueryType::QT_PREFIX_MATCH,
+                                                       keys,
+                                                       {},
+                                                       block_mask,
+                                                       0,
+                                                       {},
+                                                       &cache_locations);
             ASSERT_EQ(EC_OK, ec);
             const auto &cache_locations_view = cache_locations.cache_locations_view();
             ASSERT_EQ(2, cache_locations_view.size());
@@ -1074,14 +1102,16 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheWithBlockMask) {
 
         {
             BlockMask block_mask = static_cast<size_t>(0);
-            auto [ec, cache_locations] = cache_manager_->GetCacheLocation(request_context_.get(),
-                                                                          "test_instance",
-                                                                          CacheManager::QueryType::QT_PREFIX_MATCH,
-                                                                          keys,
-                                                                          {},
-                                                                          block_mask,
-                                                                          0,
-                                                                          {});
+            CacheLocationViewVecWrapper cache_locations;
+            auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
+                                                       "test_instance",
+                                                       CacheManager::QueryType::QT_PREFIX_MATCH,
+                                                       keys,
+                                                       {},
+                                                       block_mask,
+                                                       0,
+                                                       {},
+                                                       &cache_locations);
             ASSERT_EQ(EC_OK, ec);
             const auto &cache_locations_view = cache_locations.cache_locations_view();
             ASSERT_EQ(0, cache_locations_view.size());
@@ -1096,14 +1126,16 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheWithBlockMask) {
 
         {
             BlockMask block_mask = static_cast<size_t>(0);
-            auto [ec, cache_locations] = cache_manager_->GetCacheLocation(request_context_.get(),
-                                                                          "test_instance",
-                                                                          CacheManager::QueryType::QT_PREFIX_MATCH,
-                                                                          keys,
-                                                                          {},
-                                                                          block_mask,
-                                                                          0,
-                                                                          {});
+            CacheLocationViewVecWrapper cache_locations;
+            auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
+                                                       "test_instance",
+                                                       CacheManager::QueryType::QT_PREFIX_MATCH,
+                                                       keys,
+                                                       {},
+                                                       block_mask,
+                                                       0,
+                                                       {},
+                                                       &cache_locations);
             ASSERT_EQ(EC_OK, ec);
             const auto &cache_locations_view = cache_locations.cache_locations_view();
             ASSERT_EQ(2, cache_locations_view.size());
@@ -1443,71 +1475,76 @@ TEST_F(CacheManagerTest, TestUnavailableStorage) {
                                                createModelDeployment(),
                                                std::vector<LocationSpecGroup>()));
 
-    auto test_write_and_find_location = [this](int start,
-                                               DataStorageType expect_type,
-                                               const std::string &expect_sub_path) {
-        for (int i = start; i < start + 10; ++i) {
-            std::vector<int64_t> keys{i * 10 + 1, i * 10 + 2, i * 10 + 3, i * 10 + 4};
-            auto [ec1, start_write_cache_info] = cache_manager_->StartWriteCache(
-                request_context_.get(), "test_group2_instance", keys, {}, {}, 100000000);
-            ASSERT_EQ(EC_OK, ec1);
-            ASSERT_EQ(4, start_write_cache_info.locations().cache_locations_view().size());
-            for (const auto &start_write_location : start_write_cache_info.locations().cache_locations_view()) {
-                ASSERT_EQ(expect_type, start_write_location.type());
-                const auto &location_spec = start_write_location.location_specs().front();
-                ASSERT_THAT(location_spec.uri(), HasSubstr(expect_sub_path));
+    auto test_write_and_find_location =
+        [this](int start, DataStorageType expect_type, const std::string &expect_sub_path) {
+            for (int i = start; i < start + 10; ++i) {
+                std::vector<int64_t> keys{i * 10 + 1, i * 10 + 2, i * 10 + 3, i * 10 + 4};
+                auto [ec1, start_write_cache_info] = cache_manager_->StartWriteCache(
+                    request_context_.get(), "test_group2_instance", keys, {}, {}, 100000000);
+                ASSERT_EQ(EC_OK, ec1);
+                ASSERT_EQ(4, start_write_cache_info.locations().cache_locations_view().size());
+                for (const auto &start_write_location : start_write_cache_info.locations().cache_locations_view()) {
+                    ASSERT_EQ(expect_type, start_write_location.type());
+                    const auto &location_spec = start_write_location.location_specs().front();
+                    ASSERT_THAT(location_spec.uri(), HasSubstr(expect_sub_path));
+                }
+                {
+                    BlockMask block_mask = static_cast<size_t>(0);
+                    CacheLocationViewVecWrapper cache_locations;
+                    auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
+                                                               "test_group2_instance",
+                                                               CacheManager::QueryType::QT_PREFIX_MATCH,
+                                                               keys,
+                                                               {},
+                                                               block_mask,
+                                                               0,
+                                                               {},
+                                                               &cache_locations);
+                    ASSERT_EQ(EC_OK, ec);
+                    const auto &cache_locations_view = cache_locations.cache_locations_view();
+                    ASSERT_EQ(0, cache_locations_view.size());
+                }
+                {
+                    BlockMask block_mask = static_cast<size_t>(4);
+                    auto ec = cache_manager_->FinishWriteCache(request_context_.get(),
+                                                               "test_group2_instance",
+                                                               start_write_cache_info.write_session_id(),
+                                                               block_mask);
+                    ASSERT_EQ(EC_OK, ec);
+                }
+                {
+                    BlockMask block_mask = static_cast<size_t>(0);
+                    CacheLocationViewVecWrapper cache_locations;
+                    auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
+                                                               "test_group2_instance",
+                                                               CacheManager::QueryType::QT_PREFIX_MATCH,
+                                                               keys,
+                                                               {},
+                                                               block_mask,
+                                                               0,
+                                                               {},
+                                                               &cache_locations);
+                    ASSERT_EQ(EC_OK, ec);
+                    const auto &cache_locations_view = cache_locations.cache_locations_view();
+                    ASSERT_EQ(4, cache_locations_view.size());
+                }
             }
-            {
-                BlockMask block_mask = static_cast<size_t>(0);
-                auto [ec, cache_locations] = cache_manager_->GetCacheLocation(request_context_.get(),
-                                                                              "test_group2_instance",
-                                                                              CacheManager::QueryType::QT_PREFIX_MATCH,
-                                                                              keys,
-                                                                              {},
-                                                                              block_mask,
-                                                                              0,
-                                                                              {});
-                ASSERT_EQ(EC_OK, ec);
-                const auto &cache_locations_view = cache_locations.cache_locations_view();
-                ASSERT_EQ(0, cache_locations_view.size());
-            }
-            {
-                BlockMask block_mask = static_cast<size_t>(4);
-                auto ec = cache_manager_->FinishWriteCache(request_context_.get(),
-                                                           "test_group2_instance",
-                                                           start_write_cache_info.write_session_id(),
-                                                           block_mask);
-                ASSERT_EQ(EC_OK, ec);
-            }
-            {
-                BlockMask block_mask = static_cast<size_t>(0);
-                auto [ec, cache_locations] = cache_manager_->GetCacheLocation(request_context_.get(),
-                                                                              "test_group2_instance",
-                                                                              CacheManager::QueryType::QT_PREFIX_MATCH,
-                                                                              keys,
-                                                                              {},
-                                                                              block_mask,
-                                                                              0,
-                                                                              {});
-                ASSERT_EQ(EC_OK, ec);
-                const auto &cache_locations_view = cache_locations.cache_locations_view();
-                ASSERT_EQ(4, cache_locations_view.size());
-            }
-        }
-    };
+        };
 
     auto test_match_location = [this](int start, size_t expect_location_size, const std::string &expect_sub_path = "") {
         for (int i = start; i < start + 10; ++i) {
             std::vector<int64_t> keys{i * 10 + 1, i * 10 + 2, i * 10 + 3, i * 10 + 4};
             BlockMask block_mask = static_cast<size_t>(0);
-            auto [ec, cache_locations] = cache_manager_->GetCacheLocation(request_context_.get(),
-                                                                          "test_group2_instance",
-                                                                          CacheManager::QueryType::QT_PREFIX_MATCH,
-                                                                          keys,
-                                                                          {},
-                                                                          block_mask,
-                                                                          0,
-                                                                          {});
+            CacheLocationViewVecWrapper cache_locations;
+            auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
+                                                       "test_group2_instance",
+                                                       CacheManager::QueryType::QT_PREFIX_MATCH,
+                                                       keys,
+                                                       {},
+                                                       block_mask,
+                                                       0,
+                                                       {},
+                                                       &cache_locations);
             ASSERT_EQ(EC_OK, ec);
             const auto &cache_locations_view = cache_locations.cache_locations_view();
             ASSERT_EQ(expect_location_size, cache_locations_view.size());
@@ -2405,14 +2442,16 @@ TEST_F(CacheManagerTest, TestWriteThenReadRoundTripWithSpecGroups) {
     // Read back via QT_PREFIX_MATCH
     {
         BlockMask block_mask = static_cast<size_t>(0);
-        auto [ec, cache_locations] = cache_manager_->GetCacheLocation(request_context_.get(),
-                                                                      "test_roundtrip",
-                                                                      CacheManager::QueryType::QT_PREFIX_MATCH,
-                                                                      keys,
-                                                                      {},
-                                                                      block_mask,
-                                                                      0,
-                                                                      {});
+        CacheLocationViewVecWrapper cache_locations;
+        auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
+                                                   "test_roundtrip",
+                                                   CacheManager::QueryType::QT_PREFIX_MATCH,
+                                                   keys,
+                                                   {},
+                                                   block_mask,
+                                                   0,
+                                                   {},
+                                                   &cache_locations);
         ASSERT_EQ(EC_OK, ec);
         const auto &views = cache_locations.cache_locations_view();
         ASSERT_EQ(3, views.size());
@@ -2430,14 +2469,16 @@ TEST_F(CacheManagerTest, TestWriteThenReadRoundTripWithSpecGroups) {
     // Read with spec name filter: only F0 specs
     {
         BlockMask block_mask = static_cast<size_t>(0);
-        auto [ec, cache_locations] = cache_manager_->GetCacheLocation(request_context_.get(),
-                                                                      "test_roundtrip",
-                                                                      CacheManager::QueryType::QT_PREFIX_MATCH,
-                                                                      keys,
-                                                                      {},
-                                                                      block_mask,
-                                                                      0,
-                                                                      {"tp0_F0", "tp1_F0"});
+        CacheLocationViewVecWrapper cache_locations;
+        auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
+                                                   "test_roundtrip",
+                                                   CacheManager::QueryType::QT_PREFIX_MATCH,
+                                                   keys,
+                                                   {},
+                                                   block_mask,
+                                                   0,
+                                                   {"tp0_F0", "tp1_F0"},
+                                                   &cache_locations);
         ASSERT_EQ(EC_OK, ec);
         const auto &views = cache_locations.cache_locations_view();
         ASSERT_EQ(3, views.size());
@@ -2576,8 +2617,7 @@ public:
         meta_indexer_config->meta_cache_policy_config_ = cache_policy_config;
 
         auto instance_info = std::make_shared<InstanceInfo>(
-            "test_quota_group", "default", "test_instance", 64,
-            createLocationSpecInfos(), createModelDeployment());
+            "test_quota_group", "default", "test_instance", 64, createLocationSpecInfos(), createModelDeployment());
         registry_manager_->instance_group_configs_["test_group"] = instance_group;
         registry_manager_->instance_infos_["test_instance"] = instance_info;
         registry_manager_->Init();
@@ -2616,22 +2656,26 @@ public:
 
     void registerAndWriteKeys(const std::vector<int64_t> &keys) {
         auto expected = std::pair<ErrorCode, std::string>(
-            EC_OK, "[{\"type\":\"file\",\"is_available\":true,\"global_unique_name\":\"nfs_01\","
-                   "\"storage_spec\":{\"root_path\":\"/tmp/nfs/\",\"key_count_per_file\":8}}]");
+            EC_OK,
+            "[{\"type\":\"file\",\"is_available\":true,\"global_unique_name\":\"nfs_01\","
+            "\"storage_spec\":{\"root_path\":\"/tmp/nfs/\",\"key_count_per_file\":8}}]");
         ASSERT_EQ(expected,
-                  cache_manager_->RegisterInstance(
-                      request_context_.get(), "default", "test_instance", 64,
-                      createLocationSpecInfos(), createModelDeployment(),
-                      std::vector<LocationSpecGroup>()));
+                  cache_manager_->RegisterInstance(request_context_.get(),
+                                                   "default",
+                                                   "test_instance",
+                                                   64,
+                                                   createLocationSpecInfos(),
+                                                   createModelDeployment(),
+                                                   std::vector<LocationSpecGroup>()));
 
-        auto [ec, info] = cache_manager_->StartWriteCache(
-            request_context_.get(), "test_instance", keys, {}, {}, 100000000);
+        auto [ec, info] =
+            cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 100000000);
         ASSERT_EQ(EC_OK, ec);
         write_session_id_ = info.write_session_id();
 
         BlockMask mask = static_cast<size_t>(keys.size());
-        ASSERT_EQ(EC_OK, cache_manager_->FinishWriteCache(
-            request_context_.get(), "test_instance", write_session_id_, mask));
+        ASSERT_EQ(EC_OK,
+                  cache_manager_->FinishWriteCache(request_context_.get(), "test_instance", write_session_id_, mask));
     }
 
     std::shared_ptr<CacheAffinityManager> affinity_manager_;
@@ -2646,7 +2690,7 @@ TEST_F(CacheManagerAffinityTest, ReplicationHintEmittedAfterFrequencyThreshold) 
     std::vector<int64_t> keys{100, 101, 102};
     registerAndWriteKeys(keys);
 
-    request_context_->set_caller_node_ip("node_a");
+    request_context_->set_caller_node_id("node_a");
     BlockMask block_mask = static_cast<size_t>(0);
 
     // threshold=3: hint should appear on the 3rd read of each key.
@@ -2656,9 +2700,17 @@ TEST_F(CacheManagerAffinityTest, ReplicationHintEmittedAfterFrequencyThreshold) 
     bool found_hints = false;
     for (int read_num = 1; read_num <= 4; ++read_num) {
         std::vector<ReplicationHint> hints;
-        auto [ec, wrapper] = cache_manager_->GetCacheLocation(
-            request_context_.get(), "test_instance",
-            CacheManager::QueryType::QT_BATCH_GET, keys, {}, block_mask, 0, {}, &hints);
+        CacheLocationViewVecWrapper wrapper;
+        auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
+                                                   "test_instance",
+                                                   CacheManager::QueryType::QT_BATCH_GET,
+                                                   keys,
+                                                   {},
+                                                   block_mask,
+                                                   0,
+                                                   {},
+                                                   &wrapper,
+                                                   &hints);
         ASSERT_EQ(EC_OK, ec);
 
         if (!hints.empty()) {
@@ -2672,8 +2724,7 @@ TEST_F(CacheManagerAffinityTest, ReplicationHintEmittedAfterFrequencyThreshold) 
             break;
         }
     }
-    EXPECT_TRUE(found_hints)
-        << "ReplicationHint should be emitted after reaching threshold=3";
+    EXPECT_TRUE(found_hints) << "ReplicationHint should be emitted after reaching threshold=3";
 }
 
 // Test 2: is_replication=true bypasses global dedup
@@ -2683,29 +2734,26 @@ TEST_F(CacheManagerAffinityTest, ReplicationWriteBypassesGlobalDedup) {
 
     // Normal duplicate write: should be deduped (all keys already exist)
     {
-        auto [ec, info] = cache_manager_->StartWriteCache(
-            request_context_.get(), "test_instance", keys, {}, {}, 100000000);
+        auto [ec, info] =
+            cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 100000000);
         ASSERT_EQ(EC_OK, ec);
         auto mask_offset = std::get<BlockMaskOffset>(info.block_mask());
-        EXPECT_EQ(keys.size(), mask_offset)
-            << "Normal duplicate write should be fully deduped";
-        EXPECT_TRUE(info.locations().cache_locations_view().empty())
-            << "No new locations for fully deduped write";
+        EXPECT_EQ(keys.size(), mask_offset) << "Normal duplicate write should be fully deduped";
+        EXPECT_TRUE(info.locations().cache_locations_view().empty()) << "No new locations for fully deduped write";
     }
 
     // Replication write with is_replication=true: should NOT be globally deduped.
     // File backend doesn't fill node_id, so existsOnCallerNode always returns
-    // false (no spec matches caller_node_ip) → replication write proceeds.
+    // false (no spec matches caller_node_id) → replication write proceeds.
     {
         request_context_->set_is_replication(true);
-        request_context_->set_caller_node_ip("node_a");
-        auto [ec, info] = cache_manager_->StartWriteCache(
-            request_context_.get(), "test_instance", keys, {}, {}, 100000000);
+        request_context_->set_caller_node_id("node_a");
+        auto [ec, info] =
+            cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 100000000);
         ASSERT_EQ(EC_OK, ec);
 
         auto mask_offset = std::get<BlockMaskOffset>(info.block_mask());
-        EXPECT_EQ(0u, mask_offset)
-            << "Replication write should bypass global dedup (no local replica found)";
+        EXPECT_EQ(0u, mask_offset) << "Replication write should bypass global dedup (no local replica found)";
         EXPECT_EQ(keys.size(), info.locations().cache_locations_view().size())
             << "All keys should get new locations for replication write";
 
@@ -2716,35 +2764,45 @@ TEST_F(CacheManagerAffinityTest, ReplicationWriteBypassesGlobalDedup) {
 
 // Test 3: CacheManager with affinity_manager doesn't crash on write path
 TEST_F(CacheManagerAffinityTest, WritePathWithAffinityManagerNoCrash) {
-    request_context_->set_caller_node_ip("node_a");
+    request_context_->set_caller_node_id("node_a");
 
-    auto expected = std::pair<ErrorCode, std::string>(
-        EC_OK, "[{\"type\":\"file\",\"is_available\":true,\"global_unique_name\":\"nfs_01\","
-               "\"storage_spec\":{\"root_path\":\"/tmp/nfs/\",\"key_count_per_file\":8}}]");
+    auto expected =
+        std::pair<ErrorCode, std::string>(EC_OK,
+                                          "[{\"type\":\"file\",\"is_available\":true,\"global_unique_name\":\"nfs_01\","
+                                          "\"storage_spec\":{\"root_path\":\"/tmp/nfs/\",\"key_count_per_file\":8}}]");
     ASSERT_EQ(expected,
-              cache_manager_->RegisterInstance(
-                  request_context_.get(), "default", "test_instance", 64,
-                  createLocationSpecInfos(), createModelDeployment(),
-                  std::vector<LocationSpecGroup>()));
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               "test_instance",
+                                               64,
+                                               createLocationSpecInfos(),
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>()));
 
     // GenWriteLocation should build AffinityResolveContext and call
     // ResolveWrite on the affinity_manager. File backend ignores hints
     // but the path should not crash.
     std::vector<int64_t> keys{300, 301, 302};
-    auto [ec, info] = cache_manager_->StartWriteCache(
-        request_context_.get(), "test_instance", keys, {}, {}, 100000000);
+    auto [ec, info] = cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 100000000);
     ASSERT_EQ(EC_OK, ec);
     EXPECT_EQ(keys.size(), info.locations().cache_locations_view().size());
 
     // Finish and verify data is readable
     BlockMask mask = static_cast<size_t>(keys.size());
-    ASSERT_EQ(EC_OK, cache_manager_->FinishWriteCache(
-        request_context_.get(), "test_instance", info.write_session_id(), mask));
+    ASSERT_EQ(EC_OK,
+              cache_manager_->FinishWriteCache(request_context_.get(), "test_instance", info.write_session_id(), mask));
 
     BlockMask read_mask = static_cast<size_t>(0);
-    auto [ec2, wrapper] = cache_manager_->GetCacheLocation(
-        request_context_.get(), "test_instance",
-        CacheManager::QueryType::QT_BATCH_GET, keys, {}, read_mask, 0, {});
+    CacheLocationViewVecWrapper wrapper;
+    auto ec2 = cache_manager_->GetCacheLocation(request_context_.get(),
+                                                "test_instance",
+                                                CacheManager::QueryType::QT_BATCH_GET,
+                                                keys,
+                                                {},
+                                                read_mask,
+                                                0,
+                                                {},
+                                                &wrapper);
     ASSERT_EQ(EC_OK, ec2);
     EXPECT_EQ(keys.size(), wrapper.cache_locations_view().size());
     for (const auto &loc : wrapper.cache_locations_view()) {
