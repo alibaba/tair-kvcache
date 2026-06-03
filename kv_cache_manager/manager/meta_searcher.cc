@@ -14,6 +14,10 @@
 
 namespace kv_cache_manager {
 
+namespace {
+const CacheLocationConstPtr kNotFoundLocation = std::make_shared<const CacheLocation>();
+} // namespace
+
 const std::string MetaSearcher::PROPERTY_PREV_BLOCK_KEY = "_prev_key_";
 
 namespace {
@@ -53,7 +57,7 @@ CacheLocationConstPtr SelectAndMergeForMatch(SelectLocationPolicy *policy,
         valid_map.try_emplace(id, loc_ptr);
     }
     if (valid_map.empty()) {
-        return std::make_shared<CacheLocation>();
+        return kNotFoundLocation;
     }
 
     // Use the policy to select one winning location, which determines the
@@ -61,7 +65,7 @@ CacheLocationConstPtr SelectAndMergeForMatch(SelectLocationPolicy *policy,
     std::vector<std::string> unused_prune_ids;
     CacheLocationConstPtr winner = policy->SelectForMatch(valid_map, nullptr, unused_prune_ids);
     if (!winner || winner->location_specs().empty()) {
-        return std::make_shared<CacheLocation>();
+        return kNotFoundLocation;
     }
 
     // Collect all specs from every valid location that belongs to the same
@@ -77,7 +81,7 @@ CacheLocationConstPtr SelectAndMergeForMatch(SelectLocationPolicy *policy,
     }
 
     if (merged_specs.empty()) {
-        return std::make_shared<CacheLocation>();
+        return kNotFoundLocation;
     }
 
     // NOTE: this is an aggregated view merging
@@ -242,7 +246,7 @@ ErrorCode MetaSearcher::BatchGetBestLocation(RequestContext *request_context,
     std::vector<std::vector<std::string>> prune_loc_ids_vec;
     for (size_t i = 0; i < keys.size(); ++i) {
         if (result.error_codes[i] == ErrorCode::EC_NOENT) {
-            out_locations.push_back(std::make_shared<CacheLocation>());
+            out_locations.push_back(kNotFoundLocation);
             continue;
         }
         if (result.error_codes[i] != ErrorCode::EC_OK) {
@@ -252,7 +256,7 @@ ErrorCode MetaSearcher::BatchGetBestLocation(RequestContext *request_context,
 
         auto &location_map = location_maps[i];
         if (location_map.empty()) {
-            out_locations.push_back(std::make_shared<CacheLocation>());
+            out_locations.push_back(kNotFoundLocation);
             continue;
         }
         std::vector<std::string> prune_loc_ids;
@@ -263,7 +267,7 @@ ErrorCode MetaSearcher::BatchGetBestLocation(RequestContext *request_context,
             prune_loc_ids_vec.emplace_back(prune_loc_ids);
         }
         if (merged->location_specs().empty()) {
-            out_locations.push_back(std::make_shared<CacheLocation>());
+            out_locations.push_back(kNotFoundLocation);
             continue;
         }
         out_locations.push_back(std::move(merged));
@@ -290,7 +294,7 @@ ErrorCode MetaSearcher::ReverseRollSlideWindowMatch(RequestContext *request_cont
     out_locations.clear();
     out_locations.reserve(keys.size());
     for (size_t idx = 0; idx < keys.size(); ++idx) {
-        out_locations.push_back(std::make_shared<CacheLocation>());
+        out_locations.push_back(kNotFoundLocation);
     }
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerGet);
