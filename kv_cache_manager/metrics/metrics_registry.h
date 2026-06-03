@@ -73,7 +73,6 @@ namespace kv_cache_manager {
 #define DEFINE_STEAL_METRICS_GAUGE_(group, name)                                                                       \
     double steal_##group##_##name##_metrics() { return METRICS_(group, name).Steal(); }
 
-
 #define COPY_METRICS_(ptr, group, name, value)                                                                         \
     do {                                                                                                               \
         (ptr)->copy_##group##_##name##_metrics(value);                                                                 \
@@ -93,7 +92,6 @@ namespace kv_cache_manager {
     do {                                                                                                               \
         (value) = (ptr)->steal_##group##_##name##_metrics();                                                           \
     } while (0)
-
 
 #endif
 

@@ -242,7 +242,6 @@ public:                                                                         
     }
 #endif
 
-
 /* ------------------- ServiceMetricsCollector ---------------------- */
 
 #ifndef KVCM_SERVICE_METRICS_COLLECTOR_PTR

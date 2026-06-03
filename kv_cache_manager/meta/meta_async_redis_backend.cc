@@ -111,8 +111,20 @@ ErrorCode MetaAsyncRedisBackend::Open() noexcept {
         consumer_clients_[i] = std::move(client);
     }
 
-    constexpr int32_t kReadPoolMin = 1;
-    constexpr int32_t kReadPoolMax = 16;
+    constexpr int32_t DEFAULT_CLIENT_MAX_POOL_SIZE = 16;
+    constexpr int32_t DEFAULT_CLIENT_MIN_POOL_SIZE = 0;
+    int32_t client_max_pool_size = DEFAULT_CLIENT_MAX_POOL_SIZE;
+    int32_t client_min_pool_size = DEFAULT_CLIENT_MIN_POOL_SIZE;
+    int64_t tmp_client_max_pool_size = 0;
+    storage_uri_.GetParamAs("client_max_pool_size", tmp_client_max_pool_size);
+    if (tmp_client_max_pool_size > 0) {
+        client_max_pool_size = tmp_client_max_pool_size;
+    }
+    int64_t tmp_client_min_pool_size = 0;
+    storage_uri_.GetParamAs("client_min_pool_size", tmp_client_min_pool_size);
+    if (tmp_client_min_pool_size > 0) {
+        client_min_pool_size = tmp_client_min_pool_size;
+    }
     read_client_pool_ = std::make_shared<DynamicClientPool<RedisClient>>(
         [this]() -> std::shared_ptr<RedisClient> {
             auto client = this->CreateRedisClient();
@@ -121,8 +133,8 @@ ErrorCode MetaAsyncRedisBackend::Open() noexcept {
             }
             return client;
         },
-        kReadPoolMin,
-        kReadPoolMax);
+        client_min_pool_size,
+        client_max_pool_size);
     if (!read_client_pool_->Initialize()) {
         KVCM_LOG_ERROR("async redis backend open failed, read_client_pool init failed, instance[%s]",
                        instance_id_.c_str());
@@ -141,9 +153,12 @@ ErrorCode MetaAsyncRedisBackend::Open() noexcept {
         consumer_threads_.emplace_back(&MetaAsyncRedisBackend::ConsumerLoop, this, i);
     }
 
-    KVCM_LOG_INFO("meta async redis backend open ok, instance[%s], %d consumer threads started",
+    KVCM_LOG_INFO("meta async redis backend open ok, instance[%s], %d consumer threads started, "
+                  "read client pool size min[%d], max[%d]",
                   instance_id_.c_str(),
-                  queue_count_);
+                  queue_count_,
+                  client_min_pool_size,
+                  client_max_pool_size);
     return EC_OK;
 }
 
