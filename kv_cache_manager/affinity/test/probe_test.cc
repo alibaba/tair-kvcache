@@ -55,7 +55,7 @@ TEST_F(AffinityProbeTest, TlsStaleMetricsInWriteFilter) {
     mgr.UpsertNodeMetrics({"node_b", "node_b", 800000, 0.30, 0, 0, 1});
 
     AffinityResolveContext ctx;
-    ctx.caller_node_ip = "node_a";
+    ctx.caller_node_id = "node_a";
     ctx.trace_id = "tls-probe-1";
 
     // First resolve: node_a at 0.50, passes filter → preferred
@@ -112,7 +112,7 @@ TEST_F(AffinityProbeTest, TlsStaleMetricsInReadCapacityGate) {
     winner.push_location_spec(LocationSpec("tp0", "tair://node_b/x", "node_b"));
 
     AffinityResolveContext ctx;
-    ctx.caller_node_ip = "node_a";
+    ctx.caller_node_id = "node_a";
     ctx.trace_id = "tls-read-probe";
 
     // First read: threshold=1, load=0.30 < gate=0.80 → hint emitted
@@ -137,9 +137,8 @@ TEST_F(AffinityProbeTest, TlsStaleMetricsInReadCapacityGate) {
         req.spec_candidates["tp0"] = {&remote};
         req.winner_tier = &winner;
         ReadDecision dec = mgr.ResolveRead(req, ctx);
-        EXPECT_TRUE(dec.side_effects.empty())
-            << "BUG: hint emitted despite caller load 0.90 > gate 0.80."
-               " TLS returned stale load=0.30.";
+        EXPECT_TRUE(dec.side_effects.empty()) << "BUG: hint emitted despite caller load 0.90 > gate 0.80."
+                                                 " TLS returned stale load=0.30.";
     }
 }
 
@@ -183,9 +182,8 @@ TEST_F(AffinityProbeTest, HysteresisResetsOnMetricsRefresh) {
     mgr.UpsertNodeMetrics({"node_a", "node_a", 100000, 0.90, 0, 0, 200});
     {
         auto ex = mgr.ResolveEviction(ctx);
-        EXPECT_EQ(1u, ex.size())
-            << "After metrics refresh, evicted_bytes should be cleared."
-               " Node raw load 0.90 > threshold 0.85 → exceeded again.";
+        EXPECT_EQ(1u, ex.size()) << "After metrics refresh, evicted_bytes should be cleared."
+                                    " Node raw load 0.90 > threshold 0.85 → exceeded again.";
     }
 }
 
@@ -235,9 +233,8 @@ TEST_F(AffinityProbeTest, HysteresisWithZeroTimestamp) {
         // If this is empty, it means evicted_bytes were NOT cleared
         // (the hysteresis "sticks" forever with timestamp=0).
         // Whether this is a bug depends on design intent.
-        EXPECT_TRUE(ex.empty())
-            << "With updated_at_us=0, evicted_bytes should NOT be cleared"
-               " (0 > 0 is false). Document this known edge case.";
+        EXPECT_TRUE(ex.empty()) << "With updated_at_us=0, evicted_bytes should NOT be cleared"
+                                   " (0 > 0 is false). Document this known edge case.";
     }
 }
 
@@ -262,7 +259,7 @@ TEST_F(AffinityProbeTest, SketchSurvivesStrategyReload) {
     winner.push_location_spec(LocationSpec("tp0", "uri_b", "node_b"));
 
     AffinityResolveContext ctx;
-    ctx.caller_node_ip = "node_a";
+    ctx.caller_node_id = "node_a";
     ctx.trace_id = "sketch-reload";
 
     // Accumulate 2 reads (count=2, below threshold=3)
@@ -290,9 +287,8 @@ TEST_F(AffinityProbeTest, SketchSurvivesStrategyReload) {
         req.spec_candidates["tp0"] = {&remote};
         req.winner_tier = &winner;
         ReadDecision dec = mgr.ResolveRead(req, ctx);
-        EXPECT_EQ(1u, dec.side_effects.size())
-            << "Sketch count should survive strategy reload."
-               " count was 2, new threshold=2, 3rd read → hint.";
+        EXPECT_EQ(1u, dec.side_effects.size()) << "Sketch count should survive strategy reload."
+                                                  " count was 2, new threshold=2, 3rd read → hint.";
     }
 }
 
@@ -337,7 +333,7 @@ TEST_F(AffinityProbeTest, ReadMultipleSpecNamesPickIndependently) {
     })"));
 
     AffinityResolveContext ctx;
-    ctx.caller_node_ip = "node_a";
+    ctx.caller_node_id = "node_a";
     ctx.trace_id = "multi-spec";
 
     LocationSpec tp0_remote("tp0", "uri_b", "node_b");
@@ -346,7 +342,7 @@ TEST_F(AffinityProbeTest, ReadMultipleSpecNamesPickIndependently) {
 
     ReadRequest req;
     req.block_key = 1;
-    req.spec_candidates["tp0"] = {&tp0_remote};           // only remote
+    req.spec_candidates["tp0"] = {&tp0_remote};             // only remote
     req.spec_candidates["tp1"] = {&tp1_remote, &tp1_local}; // local available
     CacheLocation winner;
     req.winner_tier = &winner;
@@ -378,7 +374,7 @@ TEST_F(AffinityProbeTest, WriteReflectsNodeAddRemove) {
     mgr.UpsertNodeMetrics({"node_b", "node_b", 800000, 0.20, 0, 0, 1});
 
     AffinityResolveContext ctx;
-    ctx.caller_node_ip = "node_a";
+    ctx.caller_node_id = "node_a";
     ctx.trace_id = "node-remove";
 
     // Both nodes present: node_a preferred
@@ -483,11 +479,11 @@ TEST_F(AffinityProbeTest, StrategyMemoizationSharesParsedInstance) {
     // Two resolves with identical instance_strategy_json
     AffinityResolveContext ctx1;
     ctx1.instance_strategy_json = json;
-    ctx1.caller_node_ip = "node_a";
+    ctx1.caller_node_id = "node_a";
 
     AffinityResolveContext ctx2;
     ctx2.instance_strategy_json = json;
-    ctx2.caller_node_ip = "node_a";
+    ctx2.caller_node_id = "node_a";
 
     WriteDecision d1 = mgr.ResolveWrite(ctx1);
     WriteDecision d2 = mgr.ResolveWrite(ctx2);

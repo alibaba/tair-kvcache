@@ -34,7 +34,7 @@ namespace kv_cache_manager {
 
 // 3 个一级行为共用的上下文信号（只含通用信号，不含任何算法特有机制）。
 struct StrategyContext {
-    std::string caller_node_ip;
+    std::string caller_node_id;
     std::string caller_supernode_id;
     std::string instance_id;
     std::string instance_group_name;
@@ -76,7 +76,10 @@ struct ReadDecision {
 //   kOk    ⇒ hints 为最终偏好（可空 = 无偏好，backend 自由放置）
 //   kAbort ⇒ 策略主动中止（如 prefer_local on_miss=abort 找不到本地候选），
 //            调用方据此降级（v1 退化为无 hint 写）。
-enum class AffinityStatus { kOk, kAbort };
+enum class AffinityStatus {
+    kOk,
+    kAbort
+};
 struct WriteDecision {
     AffinityStatus status = AffinityStatus::kOk;
     WriteHints hints;
@@ -93,7 +96,7 @@ public:
     // 一级 toggle 是算法内部细节（如 LocalReplica 的 Params.enable_*），不暴露到
     // 接口；关闭的行为由对应 method 内部 short-circuit 成 no-op 决策。
 
-    // 写一级：把 caller_node_ip 等信号转换为 WriteHints.preferred_node_ids。
+    // 写一级：把 caller_node_id 等信号转换为 WriteHints.preferred_node_ids。
     virtual WriteDecision ResolveWrite(const std::vector<std::string> &candidates,
                                        const StrategyContext &ctx) const = 0;
 

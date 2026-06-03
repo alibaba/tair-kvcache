@@ -147,16 +147,16 @@ public:
                                                            const BlockMask &block_mask,
                                                            int32_t detail_level /*TODO*/);
 
-    std::pair<ErrorCode, CacheLocationViewVecWrapper>
-    GetCacheLocation(RequestContext *request_context,
-                     const std::string &instance_id,
-                     QueryType query_type,
-                     const KeyVector &keys,
-                     const TokenIdsVector &tokens,
-                     const BlockMask &block_mask,
-                     int32_t sw_size,
-                     const std::vector<std::string> &location_spec_names,
-                     std::vector<ReplicationHint> *out_hints = nullptr);
+    ErrorCode GetCacheLocation(RequestContext *request_context,
+                               const std::string &instance_id,
+                               QueryType query_type,
+                               const KeyVector &keys,
+                               const TokenIdsVector &tokens,
+                               const BlockMask &block_mask,
+                               int32_t sw_size,
+                               const std::vector<std::string> &location_spec_names,
+                               CacheLocationViewVecWrapper *out_locations = nullptr,
+                               std::vector<ReplicationHint> *out_hints = nullptr);
 
     std::pair<ErrorCode, BatchLocationsView>
     GetCacheLocationsByBackend(RequestContext *request_context,

@@ -33,6 +33,14 @@ CacheLocationViewVecWrapper::CacheLocationViewVecWrapper(CacheLocationViewVecWra
     : cache_locations_view_(std::move(other.cache_locations_view_))
     , raw_cache_locations_(std::move(other.raw_cache_locations_)) {}
 
+CacheLocationViewVecWrapper &CacheLocationViewVecWrapper::operator=(CacheLocationViewVecWrapper &&other) {
+    if (this != &other) {
+        cache_locations_view_ = std::move(other.cache_locations_view_);
+        raw_cache_locations_ = std::move(other.raw_cache_locations_);
+    }
+    return *this;
+}
+
 CacheLocationViewVecWrapper::CacheLocationViewVecWrapper(CacheLocationVector &&raw_cache_locations)
     : raw_cache_locations_(std::move(raw_cache_locations)) {
 

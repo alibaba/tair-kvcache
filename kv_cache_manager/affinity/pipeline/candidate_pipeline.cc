@@ -140,13 +140,13 @@ uint64_t HashTraceId(const std::string &trace_id) {
 
 void ApplyPreferLocal(const PreferLocalSpec &spec,
                       const std::vector<std::string> &input,
-                      const std::string &caller_node_ip,
+                      const std::string &caller_node_id,
                       CandidatePipeline::ApplyResult *result) {
     bool found = false;
     std::vector<std::string> locals;
     locals.reserve(input.size());
     for (const auto &id : input) {
-        if (!caller_node_ip.empty() && id == caller_node_ip) {
+        if (!caller_node_id.empty() && id == caller_node_id) {
             locals.push_back(id);
             found = true;
         }
@@ -326,10 +326,11 @@ std::unique_ptr<CandidatePipeline> CandidatePipeline::ParseJsonString(const std:
     return CandidatePipeline::Parse(*UnwrapEnvelope(doc), err);
 }
 
-CandidatePipeline::ApplyResult CandidatePipeline::Apply(const std::vector<std::string> &candidates,
-                                      const std::function<const NodeMetrics *(const std::string &)> &find_metrics,
-                                      const std::string &caller_node_ip,
-                                      const std::string &trace_id) const {
+CandidatePipeline::ApplyResult
+CandidatePipeline::Apply(const std::vector<std::string> &candidates,
+                         const std::function<const NodeMetrics *(const std::string &)> &find_metrics,
+                         const std::string &caller_node_id,
+                         const std::string &trace_id) const {
     ApplyResult r;
     r.nodes = candidates;
 
@@ -338,7 +339,7 @@ CandidatePipeline::ApplyResult CandidatePipeline::Apply(const std::vector<std::s
     }
 
     if (prefer_local.has_value()) {
-        ApplyPreferLocal(*prefer_local, r.nodes, caller_node_ip, &r);
+        ApplyPreferLocal(*prefer_local, r.nodes, caller_node_id, &r);
         if (r.status == Status::kAbort) {
             return r;
         }

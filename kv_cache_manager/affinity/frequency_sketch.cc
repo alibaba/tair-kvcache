@@ -20,11 +20,11 @@ void FrequencySketch::EvictIfFullLocked() {
     }
 }
 
-void FrequencySketch::Observe(const std::string &caller_node_ip, int64_t block_key) {
-    if (caller_node_ip.empty()) {
+void FrequencySketch::Observe(const std::string &caller_node_id, int64_t block_key) {
+    if (caller_node_id.empty()) {
         return; // 空 caller 不参与 F3
     }
-    Key k{caller_node_ip, block_key};
+    Key k{caller_node_id, block_key};
     std::lock_guard<std::mutex> lock(mu_);
     auto it = table_.find(k);
     if (it == table_.end()) {
@@ -43,18 +43,18 @@ void FrequencySketch::Observe(const std::string &caller_node_ip, int64_t block_k
     }
 }
 
-uint32_t FrequencySketch::RemoteCount(const std::string &caller_node_ip, int64_t block_key) const {
-    if (caller_node_ip.empty()) {
+uint32_t FrequencySketch::RemoteCount(const std::string &caller_node_id, int64_t block_key) const {
+    if (caller_node_id.empty()) {
         return 0;
     }
-    Key k{caller_node_ip, block_key};
+    Key k{caller_node_id, block_key};
     std::lock_guard<std::mutex> lock(mu_);
     auto it = table_.find(k);
     return it == table_.end() ? 0 : it->second.count;
 }
 
-void FrequencySketch::Reset(const std::string &caller_node_ip, int64_t block_key) {
-    Key k{caller_node_ip, block_key};
+void FrequencySketch::Reset(const std::string &caller_node_id, int64_t block_key) {
+    Key k{caller_node_id, block_key};
     std::lock_guard<std::mutex> lock(mu_);
     auto it = table_.find(k);
     if (it == table_.end()) {

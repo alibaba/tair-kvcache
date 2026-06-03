@@ -71,9 +71,7 @@ static const char *kFullStrategyJson = R"({
 })";
 
 // Helper: build a ReadRequest with a single spec on a given node.
-static ReadRequest MakeRemoteReadRequest(int64_t block_key,
-                                         LocationSpec *spec,
-                                         CacheLocation *winner) {
+static ReadRequest MakeRemoteReadRequest(int64_t block_key, LocationSpec *spec, CacheLocation *winner) {
     ReadRequest req;
     req.block_key = block_key;
     req.spec_candidates["tp0"] = {spec};
@@ -98,7 +96,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, AdaptiveHotKeyRetentionLoop) {
     mgr.UpsertNodeMetrics({"node_c", "node_c", 600000, 0.30, 5, 5, 1});
 
     AffinityResolveContext ctx;
-    ctx.caller_node_ip = "node_a";
+    ctx.caller_node_id = "node_a";
     ctx.instance_id = "inst-001";
     ctx.trace_id = "adaptive-loop";
 
@@ -124,8 +122,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, AdaptiveHotKeyRetentionLoop) {
         ReadDecision dec = mgr.ResolveRead(req, ctx);
         ASSERT_EQ(1u, dec.picked_specs.count("tp0"));
         EXPECT_EQ("node_b", dec.picked_specs["tp0"]->node_id());
-        EXPECT_TRUE(dec.side_effects.empty()) << "read #" << (i + 1)
-            << ": count < threshold, no hint expected";
+        EXPECT_TRUE(dec.side_effects.empty()) << "read #" << (i + 1) << ": count < threshold, no hint expected";
     }
 
     // Read 3: sketch count reaches threshold → ReplicationHint emitted
@@ -164,8 +161,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, AdaptiveHotKeyRetentionLoop) {
 
         ReadDecision dec = mgr.ResolveRead(req, ctx);
         EXPECT_EQ("node_a", dec.picked_specs["tp0"]->node_id());
-        EXPECT_TRUE(dec.side_effects.empty())
-            << "stable local read #" << (i + 1) << " should never emit hint";
+        EXPECT_TRUE(dec.side_effects.empty()) << "stable local read #" << (i + 1) << " should never emit hint";
     }
 }
 
@@ -190,7 +186,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, WritePipelineFilterSortLimit) {
     mgr.UpsertNodeMetrics({"node_d", "node_d", 500000, 0.50, 0, 0, 1});
 
     AffinityResolveContext ctx;
-    ctx.caller_node_ip = "node_a"; // caller is on the overloaded node
+    ctx.caller_node_id = "node_a"; // caller is on the overloaded node
     ctx.trace_id = "pipeline-test";
 
     WriteDecision dec = mgr.ResolveWrite(ctx);
@@ -221,7 +217,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, WritePipelinePreferLocalWithFilter) 
     mgr.UpsertNodeMetrics({"node_b", "node_b", 800000, 0.30, 0, 0, 1});
 
     AffinityResolveContext ctx;
-    ctx.caller_node_ip = "node_a";
+    ctx.caller_node_id = "node_a";
     ctx.trace_id = "prefer-local-filter";
 
     WriteDecision dec = mgr.ResolveWrite(ctx);
@@ -248,7 +244,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, ReadOnMissCallerCapacityGateBlocksHi
     mgr.UpsertNodeMetrics({"node_b", "node_b", 800000, 0.20, 0, 0, 1});
 
     AffinityResolveContext ctx;
-    ctx.caller_node_ip = "node_a";
+    ctx.caller_node_id = "node_a";
     ctx.trace_id = "capacity-gate";
 
     LocationSpec remote("tp0", "tair://node_b/block/99", "node_b");
@@ -260,8 +256,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, ReadOnMissCallerCapacityGateBlocksHi
         auto req = MakeRemoteReadRequest(99, &remote, &winner);
         ReadDecision dec = mgr.ResolveRead(req, ctx);
         EXPECT_TRUE(dec.side_effects.empty())
-            << "read #" << (i + 1)
-            << ": caller load 0.82 > gate 0.80, hint suppressed";
+            << "read #" << (i + 1) << ": caller load 0.82 > gate 0.80, hint suppressed";
     }
 }
 
@@ -335,7 +330,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, MultiCallerBothGetReplicationHints) 
     // Caller A reads 3 times → hint targets node_a
     {
         AffinityResolveContext ctx_a;
-        ctx_a.caller_node_ip = "node_a";
+        ctx_a.caller_node_id = "node_a";
         ctx_a.trace_id = "multi-caller-a";
 
         for (int i = 0; i < 2; ++i) {
@@ -354,7 +349,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, MultiCallerBothGetReplicationHints) 
     // Caller B reads 3 times → independent sketch → hint targets node_b
     {
         AffinityResolveContext ctx_b;
-        ctx_b.caller_node_ip = "node_b";
+        ctx_b.caller_node_id = "node_b";
         ctx_b.trace_id = "multi-caller-b";
 
         for (int i = 0; i < 2; ++i) {
@@ -386,7 +381,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, HintDedupRequiresReaccumulation) {
     mgr.UpsertNodeMetrics({"node_b", "node_b", 800000, 0.20, 0, 0, 1});
 
     AffinityResolveContext ctx;
-    ctx.caller_node_ip = "node_a";
+    ctx.caller_node_id = "node_a";
     ctx.trace_id = "dedup";
 
     LocationSpec remote("tp0", "tair://node_b/block/55", "node_b");
@@ -448,7 +443,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, ThreeTierPriorityRealisticOverrides)
     // ---- Tier: process (threshold=3) — 3 reads → hint ----
     {
         AffinityResolveContext ctx;
-        ctx.caller_node_ip = "node_a";
+        ctx.caller_node_id = "node_a";
         ctx.trace_id = "tier-process";
 
         for (int i = 0; i < 2; ++i) {
@@ -464,7 +459,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, ThreeTierPriorityRealisticOverrides)
     // ---- Tier: group overrides threshold to 100 ----
     {
         AffinityResolveContext ctx;
-        ctx.caller_node_ip = "node_a";
+        ctx.caller_node_id = "node_a";
         ctx.trace_id = "tier-group";
         ctx.group_strategy_json = R"({
             "type": "local_replica",
@@ -475,15 +470,14 @@ TEST_F(CacheAffinityManagerIntegrationTest, ThreeTierPriorityRealisticOverrides)
         for (int i = 0; i < 10; ++i) {
             auto req = MakeRemoteReadRequest(200, &remote, &winner);
             ReadDecision dec = mgr.ResolveRead(req, ctx);
-            EXPECT_TRUE(dec.side_effects.empty())
-                << "group threshold=100, read #" << (i + 1) << " should not hint";
+            EXPECT_TRUE(dec.side_effects.empty()) << "group threshold=100, read #" << (i + 1) << " should not hint";
         }
     }
 
     // ---- Tier: instance overrides to noop ----
     {
         AffinityResolveContext ctx;
-        ctx.caller_node_ip = "node_a";
+        ctx.caller_node_id = "node_a";
         ctx.trace_id = "tier-instance";
         ctx.instance_strategy_json = R"({"type":"noop"})";
         ctx.group_strategy_json = kFullStrategyJson;
@@ -521,7 +515,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, GlobalKillSwitchMidFlight) {
     // After: everything noop
     {
         AffinityResolveContext ctx;
-        ctx.caller_node_ip = "node_a";
+        ctx.caller_node_id = "node_a";
 
         WriteDecision wdec = mgr.ResolveWrite(ctx);
         EXPECT_TRUE(wdec.hints.preferred_node_ids.empty());
@@ -535,7 +529,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, GlobalKillSwitchMidFlight) {
     // Recovery: decisions resume
     {
         AffinityResolveContext ctx;
-        ctx.caller_node_ip = "node_a";
+        ctx.caller_node_id = "node_a";
 
         WriteDecision wdec = mgr.ResolveWrite(ctx);
         ASSERT_FALSE(wdec.hints.preferred_node_ids.empty());
@@ -562,7 +556,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, LoadFullStrategyFromFile) {
     mgr.UpsertNodeMetrics({"node_b", "node_b", 200000, 0.30, 0, 0, 1});
 
     AffinityResolveContext ctx;
-    ctx.caller_node_ip = "node_a";
+    ctx.caller_node_id = "node_a";
     ctx.trace_id = "file-load";
 
     WriteDecision dec = mgr.ResolveWrite(ctx);
@@ -580,7 +574,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, NoNodesGracefulDegradation) {
     ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonString(kFullStrategyJson));
 
     AffinityResolveContext ctx;
-    ctx.caller_node_ip = "node_a";
+    ctx.caller_node_id = "node_a";
     ctx.trace_id = "no-nodes";
 
     WriteDecision wdec = mgr.ResolveWrite(ctx);
@@ -613,7 +607,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, WriteAspectDisabledReadEvictionOn) {
     mgr.UpsertNodeMetrics({"node_b", "node_b", 100000, 0.90, 0, 0, 1});
 
     AffinityResolveContext ctx;
-    ctx.caller_node_ip = "node_a";
+    ctx.caller_node_id = "node_a";
     ctx.trace_id = "toggle-test";
 
     // Write disabled: empty hints even though nodes are present

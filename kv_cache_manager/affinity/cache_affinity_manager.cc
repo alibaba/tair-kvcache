@@ -113,7 +113,7 @@ CacheAffinityManager::GetStrategy(const std::string &instance_strategy_json,
 
 StrategyContext CacheAffinityManager::BuildStrategyContext(const AffinityResolveContext &ctx) const {
     StrategyContext sctx;
-    sctx.caller_node_ip = ctx.caller_node_ip;
+    sctx.caller_node_id = ctx.caller_node_id;
     sctx.caller_supernode_id = ctx.caller_supernode_id;
     sctx.instance_id = ctx.instance_id;
     sctx.instance_group_name = ctx.instance_group_name;
@@ -137,8 +137,7 @@ WriteDecision CacheAffinityManager::ResolveWrite(const AffinityResolveContext &c
     return strategy->ResolveWrite(candidates, sctx);
 }
 
-ReadDecision CacheAffinityManager::ResolveRead(const ReadRequest &req,
-                                               const AffinityResolveContext &ctx) {
+ReadDecision CacheAffinityManager::ResolveRead(const ReadRequest &req, const AffinityResolveContext &ctx) {
     auto strategy = GetStrategy(ctx.instance_strategy_json, ctx.group_strategy_json);
     auto sctx = BuildStrategyContext(ctx);
     return strategy->ResolveRead(req, sctx);
@@ -219,8 +218,8 @@ void CacheAffinityManager::StartMetricsPullLoop(std::shared_ptr<DataStorageManag
                 }
             }
             std::unique_lock<std::mutex> lock(metrics_cv_mu_);
-            metrics_cv_.wait_for(lock, std::chrono::seconds(metrics_interval_seconds_),
-                                 [this]() { return metrics_stop_.load(); });
+            metrics_cv_.wait_for(
+                lock, std::chrono::seconds(metrics_interval_seconds_), [this]() { return metrics_stop_.load(); });
         }
         KVCM_LOG_INFO("affinity metrics pull loop exited");
     });

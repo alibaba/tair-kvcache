@@ -25,7 +25,7 @@ class DataStorageManager;
 struct AffinityResolveContext {
     std::string instance_strategy_json;
     std::string group_strategy_json;
-    std::string caller_node_ip;
+    std::string caller_node_id;
     std::string caller_supernode_id;
     std::string instance_id;
     std::string instance_group_name;
@@ -73,8 +73,7 @@ public:
 
     WriteDecision ResolveWrite(const AffinityResolveContext &ctx);
 
-    ReadDecision ResolveRead(const ReadRequest &req,
-                             const AffinityResolveContext &ctx);
+    ReadDecision ResolveRead(const ReadRequest &req, const AffinityResolveContext &ctx);
 
     // Returns the set of node IDs whose load exceeds the high-water threshold
     // (with hysteresis applied). Empty set means no node-level eviction needed.

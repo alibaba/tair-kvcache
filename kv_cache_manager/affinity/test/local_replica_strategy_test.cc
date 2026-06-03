@@ -30,7 +30,7 @@ TEST_F(LocalReplicaStrategyTest, ResolveWriteNoPipelineReturnsEmpty) {
 
 TEST_F(LocalReplicaStrategyTest, ResolveWriteDelegatesToV0Pipeline) {
     // 配 v0 prefer_local on_miss=passthrough：caller 在 candidates 内时排前。
-    // 这是 v0 写时亲和（caller_node_ip → preferred_node_ids）的完整继承，但
+    // 这是 v0 写时亲和（caller_node_id → preferred_node_ids）的完整继承，但
     // 通过 v1 新接口 strategy.ResolveWrite。
     auto v0 = CandidatePipeline::ParseJsonString(R"({"prefer_local":{"on_miss":"passthrough"}})", nullptr);
     ASSERT_NE(nullptr, v0);
@@ -40,7 +40,7 @@ TEST_F(LocalReplicaStrategyTest, ResolveWriteDelegatesToV0Pipeline) {
     LocalReplicaAffinityStrategy s(std::move(p));
 
     StrategyContext ctx;
-    ctx.caller_node_ip = "node_b";
+    ctx.caller_node_id = "node_b";
     WriteDecision dec = s.ResolveWrite({"node_a", "node_b", "node_c"}, ctx);
     ASSERT_EQ(AffinityStatus::kOk, dec.status);
     ASSERT_FALSE(dec.hints.preferred_node_ids.empty());
@@ -56,7 +56,7 @@ TEST_F(LocalReplicaStrategyTest, ResolveWriteAbortPropagates) {
     LocalReplicaAffinityStrategy s(std::move(p));
 
     StrategyContext ctx;
-    ctx.caller_node_ip = "node_X"; // 不在候选列表
+    ctx.caller_node_id = "node_X"; // 不在候选列表
     WriteDecision dec = s.ResolveWrite({"node_a", "node_b"}, ctx);
     EXPECT_EQ(AffinityStatus::kAbort, dec.status);
 }
@@ -66,7 +66,7 @@ TEST_F(LocalReplicaStrategyTest, ResolveWriteAbortPropagates) {
 TEST_F(LocalReplicaStrategyTest, ResolveReadPicksLocalSpec) {
     LocalReplicaAffinityStrategy s;
     StrategyContext ctx;
-    ctx.caller_node_ip = "node_a";
+    ctx.caller_node_id = "node_a";
 
     LocationSpec remote("tp0", "uri_b", "node_b");
     LocationSpec local("tp0", "uri_a", "node_a");
@@ -89,7 +89,7 @@ TEST_F(LocalReplicaStrategyTest, ResolveReadPicksLocalSpec) {
 TEST_F(LocalReplicaStrategyTest, ResolveReadFallsBackWhenNoLocal) {
     LocalReplicaAffinityStrategy s;
     StrategyContext ctx;
-    ctx.caller_node_ip = "node_x"; // 没有 caller 本地候选
+    ctx.caller_node_id = "node_x"; // 没有 caller 本地候选
 
     LocationSpec a("tp0", "u1", "node_a");
     LocationSpec b("tp0", "u2", "node_b");
@@ -120,7 +120,7 @@ TEST_F(LocalReplicaStrategyTest, ResolveReadEmitsReplicationHintWhenHot) {
     LocalReplicaAffinityStrategy s(std::move(p));
 
     StrategyContext ctx;
-    ctx.caller_node_ip = "node_a";
+    ctx.caller_node_id = "node_a";
 
     LocationSpec remote("tp0", "uri_remote", "node_b");
     ReadRequest req;
@@ -150,7 +150,7 @@ TEST_F(LocalReplicaStrategyTest, ResolveReadNoHintWhenOnMissDisabled) {
     LocalReplicaAffinityStrategy s(std::move(p));
 
     StrategyContext ctx;
-    ctx.caller_node_ip = "node_a";
+    ctx.caller_node_id = "node_a";
 
     LocationSpec remote("tp0", "uri_remote", "node_b");
     ReadRequest req;
@@ -178,10 +178,8 @@ TEST_F(LocalReplicaStrategyTest, ResolveReadNoHintWhenCallerLoadHigh) {
     m.load_ratio = 0.90; // 超 gate
 
     StrategyContext ctx;
-    ctx.caller_node_ip = "node_a";
-    ctx.get_node_metrics = [&](const std::string &id) -> const NodeMetrics * {
-        return id == "node_a" ? &m : nullptr;
-    };
+    ctx.caller_node_id = "node_a";
+    ctx.get_node_metrics = [&](const std::string &id) -> const NodeMetrics * { return id == "node_a" ? &m : nullptr; };
 
     LocationSpec remote("tp0", "uri_r", "node_b");
     ReadRequest req;
