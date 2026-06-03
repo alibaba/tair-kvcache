@@ -487,7 +487,7 @@ std::shared_ptr<proto::meta::MetaService::Stub> GrpcStub::GetStub() const {
     if (stubs_.empty()) {
         return nullptr;
     }
-    size_t current_stub = (next_stub_++) % stubs_.size();
+    size_t current_stub = next_stub_.fetch_add(1, std::memory_order_relaxed) % stubs_.size();
     return stubs_[current_stub];
 }
 

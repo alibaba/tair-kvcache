@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <deque>
 #include <shared_mutex>
 
@@ -82,7 +83,7 @@ private:
     mutable std::shared_mutex stubs_mutex_;
     // TODO : add stub proxy to manage stub
     std::deque<std::shared_ptr<proto::meta::MetaService::Stub>> stubs_;
-    mutable size_t next_stub_ = 0;
+    mutable std::atomic<size_t> next_stub_{0};
 };
 
 } // namespace kv_cache_manager
