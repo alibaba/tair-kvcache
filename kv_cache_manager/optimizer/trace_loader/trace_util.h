@@ -1,6 +1,7 @@
 #pragma once
 #include <algorithm>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "kv_cache_manager/optimizer/trace_loader/optimizer_schema_trace.h"
@@ -21,5 +22,7 @@ private:
                                    const std::shared_ptr<OptimizerSchemaTrace> &b);
 };
 
+std::string DefaultTraceId(const OptimizerSchemaTrace &trace);
+void EnsureTraceId(const std::shared_ptr<OptimizerSchemaTrace> &trace);
 void AddTraceId(std::vector<std::shared_ptr<OptimizerSchemaTrace>> &traces);
 } // namespace kv_cache_manager

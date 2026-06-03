@@ -7,6 +7,12 @@
 #include "kv_cache_manager/common/logger.h"
 
 namespace kv_cache_manager {
+namespace {
+[[noreturn]] void LogAndThrowHitRateExportError(const std::string &message) {
+    KVCM_LOG_ERROR("%s", message.c_str());
+    throw std::runtime_error(message);
+}
+} // namespace
 
 HitRateTracker::HitRateTracker() : StatsTracker("HitRateTracker") {}
 
@@ -57,10 +63,8 @@ void HitRateTracker::ExportHitRates(const std::string &instance_id,
                                     const OptimizerConfig &config) {
     for (const auto &record : data.read_records) {
         if (record.block_size_tokens == 0) {
-            std::string message =
-                "Cannot export hit rates for instance " + instance_id + ": block_size must be set to a positive value";
-            KVCM_LOG_ERROR("%s", message.c_str());
-            throw std::runtime_error(message);
+            LogAndThrowHitRateExportError("Cannot export hit rates for instance " + instance_id +
+                                          ": block_size must be set to a positive value");
         }
     }
 
@@ -70,8 +74,7 @@ void HitRateTracker::ExportHitRates(const std::string &instance_id,
     std::string filename = file_dir + "/" + instance_id + "_hit_rates.csv";
     std::ofstream file(filename);
     if (!file.is_open()) {
-        KVCM_LOG_ERROR("Failed to open file for writing hit rates: %s", filename.c_str());
-        return;
+        LogAndThrowHitRateExportError("Failed to open file for writing hit rates: " + filename);
     }
 
     auto SumVecSizeT = [](const std::vector<size_t> &v) -> size_t {

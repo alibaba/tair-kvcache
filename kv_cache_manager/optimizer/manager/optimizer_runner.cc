@@ -15,9 +15,14 @@ namespace kv_cache_manager {
 namespace {
 int64_t TtlUsToNs(int64_t ttl_us) { return ttl_us > 0 ? ttl_us * 1000 : ttl_us; }
 
+[[noreturn]] void LogAndThrowReplayError(const std::string &message) {
+    KVCM_LOG_ERROR("%s", message.c_str());
+    throw std::runtime_error(message);
+}
+
 size_t ValidateFullBlockTrace(const GetLocationSchemaTrace &trace, size_t block_size) {
     if (block_size == 0) {
-        throw std::runtime_error("GetCacheLocation requires positive instance block_size");
+        LogAndThrowReplayError("GetCacheLocation requires positive instance block_size");
     }
 
     const size_t input_tokens = trace.input_token_count();
@@ -26,7 +31,7 @@ size_t ValidateFullBlockTrace(const GetLocationSchemaTrace &trace, size_t block_
         return input_tokens;
     }
 
-    throw std::runtime_error(
+    LogAndThrowReplayError(
         "GetCacheLocation trace contains partial tail block keys: instance_id=" + trace.instance_id() +
         ", trace_id=" + trace.trace_id() + ", keys=" + std::to_string(trace.keys().size()) +
         ", input_len=" + std::to_string(input_tokens) + ", block_size=" + std::to_string(block_size) +
@@ -38,7 +43,7 @@ size_t ValidateFullBlockTrace(const GetLocationSchemaTrace &trace, size_t block_
 void OptimizerRunner::Run(OptimizerConfig &config) {
     write_delay_ns_ = config.trace_replay_config().write_delay_ns();
     if (write_delay_ns_ <= 0) {
-        throw std::runtime_error("trace_replay.write_delay_ns must be positive");
+        LogAndThrowReplayError("trace_replay.write_delay_ns must be positive");
     }
     pending_writes_ = {};
     next_pending_write_sequence_ = 0;
@@ -61,12 +66,17 @@ void OptimizerRunner::RunTraces(const std::vector<std::shared_ptr<OptimizerSchem
     pending_writes_ = {};
     next_pending_write_sequence_ = 0;
     for (const auto &trace : traces) {
-        if (trace) {
-            FlushPendingWritesThrough(trace->timestamp_ns());
-        }
-        RunTrace(trace);
+        ReplayTraceWithPendingWrites(trace);
     }
     FlushAllPendingWrites();
+}
+
+void OptimizerRunner::ReplayTraceWithPendingWrites(const std::shared_ptr<OptimizerSchemaTrace> &trace) {
+    if (!trace) {
+        return;
+    }
+    FlushPendingWritesThrough(trace->timestamp_ns());
+    RunTrace(trace);
 }
 
 void OptimizerRunner::RunTrace(std::shared_ptr<OptimizerSchemaTrace> trace) {
@@ -111,8 +121,8 @@ void OptimizerRunner::HandleRequest(const RequestSchemaTrace &trace) {
 
 void OptimizerRunner::ScheduleRequestWrite(const RequestSchemaTrace &trace) {
     if (trace.timestamp_ns() > std::numeric_limits<int64_t>::max() - write_delay_ns_) {
-        throw std::runtime_error("request write timestamp overflows int64: instance_id=" + trace.instance_id() +
-                                 ", trace_id=" + trace.trace_id());
+        LogAndThrowReplayError("request write timestamp overflows int64: instance_id=" + trace.instance_id() +
+                               ", trace_id=" + trace.trace_id());
     }
 
     WriteCacheSchemaTrace write_trace;

@@ -10,6 +10,20 @@
 #include "kv_cache_manager/optimizer/analysis/stats_collector.h"
 
 namespace kv_cache_manager {
+namespace {
+bool AppendBlockToSingleTier(BlockEntry *block, const std::shared_ptr<EvictionPolicy> &tier_policy, int64_t timestamp) {
+    if (!block || !tier_policy) {
+        return false;
+    }
+    const std::string &tier_name = tier_policy->name();
+    if (block->location_map.find(tier_name) != block->location_map.end()) {
+        return false;
+    }
+    AppendBlockLocation(block, tier_name, timestamp);
+    tier_policy->OnBlockWritten(block);
+    return true;
+}
+} // namespace
 
 // 新构造函数 (多 tier)
 RadixTreeIndex::RadixTreeIndex(const std::string &instance_id,
@@ -24,13 +38,10 @@ RadixTreeIndex::RadixTreeIndex(const std::string &instance_id,
     for (auto &p : tier_policies_) {
         tier_names_.push_back(p->name());
     }
-    write_mode_ = write_mode;
     InitTierFlowStrategies(
         write_mode, selective_write_threshold, tier_access_propagation_enabled, std::move(tier_flow_strategies));
     instance_id_ = instance_id;
     default_ttl_ns_ = default_ttl_ns;
-    selective_write_threshold_ = selective_write_threshold;
-    tier_access_propagation_enabled_ = tier_access_propagation_enabled;
 }
 
 // 兼容构造函数 (单 policy)
@@ -61,11 +72,7 @@ void RadixTreeIndex::InitTierFlowStrategies(TierWriteMode write_mode,
         tier_flow_strategies_.assign(edge_count, default_strategy);
     }
 
-    write_tier_count_ = tier_policies_.empty() ? 0 : 1;
-    while (write_tier_count_ < tier_policies_.size() &&
-           tier_flow_strategies_[write_tier_count_ - 1].write_mode == TierWriteMode::WRITE_THROUGH) {
-        ++write_tier_count_;
-    }
+    write_tier_count_ = CountInitialWriteTiers(tier_policies_.size(), tier_flow_strategies_);
     enable_promote_ = false;
     for (const auto &strategy : tier_flow_strategies_) {
         if (strategy.promote_enabled) {
@@ -326,10 +333,7 @@ std::vector<BlockEntry *> RadixTreeIndex::AppendNewBlocks(RadixTreeNode *node,
         entry->ttl_ns = ttl_ns;
         entry->owner_node = node;
         BlockEntry *entry_ptr = entry.get();
-        // 根据写入模式落到对应 tier：WRITE_THROUGH=全部层，级联/选择性写入=仅 tier 0
-        for (size_t t = 0; t < write_tier_count_; ++t) {
-            AppendBlockLocation(entry_ptr, tier_names_[t], timestamp);
-        }
+        AppendInitialBlockLocations(entry_ptr, timestamp);
         node->blocks.emplace_back(std::move(entry));
         inserted_blocks.push_back(entry_ptr);
 
@@ -340,6 +344,15 @@ std::vector<BlockEntry *> RadixTreeIndex::AppendNewBlocks(RadixTreeNode *node,
     return inserted_blocks;
 }
 
+void RadixTreeIndex::AppendInitialBlockLocations(BlockEntry *block, int64_t timestamp) const {
+    if (!block) {
+        return;
+    }
+    for (size_t tier_idx = 0; tier_idx < write_tier_count_; ++tier_idx) {
+        AppendBlockLocation(block, tier_names_[tier_idx], timestamp);
+    }
+}
+
 void AppendBlockLocation(BlockEntry *block, const std::string &unique_name, int64_t timestamp) {
     if (unique_name == "shared") {
         // 全局驱逐策略，不区分tier，使用统一的location记录
@@ -348,6 +361,40 @@ void AppendBlockLocation(BlockEntry *block, const std::string &unique_name, int6
         // 分层驱逐策略，记录具体tier的location信息
         block->location_map[unique_name] = TierStat{0, timestamp, timestamp};
     }
+}
+
+size_t CountInitialWriteTiers(size_t tier_count, const std::vector<TierFlowStrategy> &tier_flow_strategies) {
+    if (tier_count == 0) {
+        return 0;
+    }
+    size_t write_tier_count = 1;
+    while (write_tier_count < tier_count && write_tier_count - 1 < tier_flow_strategies.size() &&
+           tier_flow_strategies[write_tier_count - 1].write_mode == TierWriteMode::WRITE_THROUGH) {
+        ++write_tier_count;
+    }
+    return write_tier_count;
+}
+
+bool AppendBlockToTierChain(BlockEntry *block,
+                            size_t start_tier_idx,
+                            const std::vector<std::shared_ptr<EvictionPolicy>> &tier_policies,
+                            const std::vector<TierFlowStrategy> &tier_flow_strategies,
+                            int64_t timestamp) {
+    if (!block || start_tier_idx >= tier_policies.size()) {
+        return false;
+    }
+
+    bool wrote_tier = false;
+    size_t current_tier_idx = start_tier_idx;
+    while (current_tier_idx < tier_policies.size()) {
+        wrote_tier = AppendBlockToSingleTier(block, tier_policies[current_tier_idx], timestamp) || wrote_tier;
+        if (current_tier_idx >= tier_flow_strategies.size() ||
+            tier_flow_strategies[current_tier_idx].write_mode != TierWriteMode::WRITE_THROUGH) {
+            break;
+        }
+        ++current_tier_idx;
+    }
+    return wrote_tier;
 }
 
 RadixTreeIndex::WriteModify RadixTreeIndex::AppendEvictBlocks(std::unordered_map<int64_t, BlockEntry *> blocks_map,
@@ -364,10 +411,7 @@ RadixTreeIndex::WriteModify RadixTreeIndex::AppendEvictBlocks(std::unordered_map
                     block->writing_time = timestamp;
                     block->last_access_time = timestamp;
                     block->ttl_ns = ttl_ns;
-                    // 根据写入模式恢复到对应 tier：WRITE_THROUGH=全部层，级联/选择性写入=仅 tier 0
-                    for (size_t t = 0; t < write_tier_count_; ++t) {
-                        AppendBlockLocation(block, tier_names_[t], timestamp);
-                    }
+                    AppendInitialBlockLocations(block, timestamp);
                     revived_blocks.push_back(block);
 
                     if (stats_collector_) {
@@ -482,9 +526,7 @@ bool RadixTreeIndex::PromoteToHigherTiers(BlockEntry *block, int64_t timestamp) 
             break;
         }
         if (!block->location_map.count(tier_names_[higher_tier_idx])) {
-            AppendBlockLocation(block, tier_names_[higher_tier_idx], timestamp);
-            tier_policies_[higher_tier_idx]->OnBlockWritten(block);
-            wrote_tier = true;
+            wrote_tier = AppendBlockToSingleTier(block, tier_policies_[higher_tier_idx], timestamp) || wrote_tier;
         }
     }
     return wrote_tier;
@@ -499,29 +541,7 @@ bool RadixTreeIndex::SelectiveWriteToNextTier(BlockEntry *block, size_t hit_tier
     if (next_tier_idx >= tier_policies_.size()) {
         return false;
     }
-    return AppendBlockToTierAndWriteThrough(block, next_tier_idx, timestamp);
-}
-
-bool RadixTreeIndex::AppendBlockToTierAndWriteThrough(BlockEntry *block, size_t tier_idx, int64_t timestamp) {
-    if (!block || tier_idx >= tier_policies_.size()) {
-        return false;
-    }
-    bool wrote_tier = false;
-    size_t current_tier = tier_idx;
-    while (current_tier < tier_policies_.size()) {
-        const std::string &tier_name = tier_names_[current_tier];
-        if (block->location_map.find(tier_name) == block->location_map.end()) {
-            AppendBlockLocation(block, tier_name, timestamp);
-            tier_policies_[current_tier]->OnBlockWritten(block);
-            wrote_tier = true;
-        }
-        if (current_tier >= tier_flow_strategies_.size() ||
-            tier_flow_strategies_[current_tier].write_mode != TierWriteMode::WRITE_THROUGH) {
-            break;
-        }
-        ++current_tier;
-    }
-    return wrote_tier;
+    return AppendBlockToTierChain(block, next_tier_idx, tier_policies_, tier_flow_strategies_, timestamp);
 }
 
 // block 逻辑上空了：location 全空（被驱逐）

@@ -58,6 +58,8 @@ public:
     void ClearAllCaches();
 
 private:
+    const OptInstanceGroupConfig *FindInstanceGroupConfig(const std::string &instance_id) const;
+
     std::unordered_map<std::string, std::shared_ptr<RadixTreeIndex>> opt_indexer_map_;
     std::shared_ptr<OptEvictionManager> eviction_manager_;
 

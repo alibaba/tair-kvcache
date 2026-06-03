@@ -19,7 +19,9 @@ int64_t RequirePositiveInputLen(const char *api_name, int64_t input_len) {
     if (input_len > 0) {
         return input_len;
     }
-    throw std::runtime_error(std::string(api_name) + " requires positive input_len");
+    std::string message = std::string(api_name) + " requires positive input_len";
+    KVCM_LOG_ERROR("%s", message.c_str());
+    throw std::runtime_error(message);
 }
 } // namespace
 

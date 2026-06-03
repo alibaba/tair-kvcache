@@ -17,6 +17,12 @@ namespace kv_cache_manager {
 class StatsCollector;
 
 void AppendBlockLocation(BlockEntry *block, const std::string &unique_name, int64_t timestamp);
+size_t CountInitialWriteTiers(size_t tier_count, const std::vector<TierFlowStrategy> &tier_flow_strategies);
+bool AppendBlockToTierChain(BlockEntry *block,
+                            size_t start_tier_idx,
+                            const std::vector<std::shared_ptr<EvictionPolicy>> &tier_policies,
+                            const std::vector<TierFlowStrategy> &tier_flow_strategies,
+                            int64_t timestamp);
 class RadixTreeIndex {
 public:
     // 新构造函数 (多 tier)
@@ -88,20 +94,12 @@ private:
     std::unique_ptr<RadixTreeNode> root_;
     std::vector<std::shared_ptr<EvictionPolicy>> tier_policies_; // 按 tier priority 排序
     std::vector<std::string> tier_names_;                        // 缓存 policy name
-    // 写入模式：
-    // WRITE_THROUGH = 所有 tier 都写
-    // CASCADING = 仅写 tier 0，超出的通过 EvictionManager 级联降级
-    // WRITE_THROUGH_SELECTIVE = 仅写 tier 0，命中热度达到阈值后复制到下一层
-    TierWriteMode write_mode_ = TierWriteMode::WRITE_THROUGH;
-    // true 时命中最高优先级 tier 后也刷新后续持有副本的 tier 访问时间；false 时只刷新命中层。
-    bool tier_access_propagation_enabled_ = true;
     std::vector<TierFlowStrategy> tier_flow_strategies_;
-    // 写入流量应落地的 tier 数，构造时结合 write_mode_ 与 tier 数一次性确定
+    // 写入流量应落地的 tier 数，构造时结合 tier_flow_strategies_ 与 tier 数一次性确定
     // WRITE_THROUGH=全部层，CASCADING/WRITE_THROUGH_SELECTIVE=仅 tier 0（单层退化为全部）
     size_t write_tier_count_ = 0;
     std::string instance_id_;
     int64_t default_ttl_ns_ = 0;
-    size_t selective_write_threshold_ = 2;
     std::shared_ptr<StatsCollector> stats_collector_;
     bool enable_promote_ = false;
 
@@ -119,6 +117,7 @@ private:
 
     using WriteModify = std::function<std::vector<BlockEntry *>(const std::vector<int64_t> &, int64_t)>;
     WriteModify AppendEvictBlocks(std::unordered_map<int64_t, BlockEntry *> blocks_map, int64_t ttl_ns);
+    void AppendInitialBlockLocations(BlockEntry *block, int64_t timestamp) const;
 
     void WriteToTier(
         RadixTreeNode *node, const std::vector<int64_t> &block_keys, int64_t timestamp, int64_t ttl_ns, WriteModify cb);
@@ -130,7 +129,6 @@ private:
     void RecordTieredHit(BlockEntry *block, bool is_remote, QueryHit *query_hit) const;
     bool PromoteToHigherTiers(BlockEntry *block, int64_t timestamp);
     bool SelectiveWriteToNextTier(BlockEntry *block, size_t hit_tier_idx, int64_t timestamp);
-    bool AppendBlockToTierAndWriteThrough(BlockEntry *block, size_t tier_idx, int64_t timestamp);
     void InitTierFlowStrategies(TierWriteMode write_mode,
                                 size_t selective_write_threshold,
                                 bool tier_access_propagation_enabled,

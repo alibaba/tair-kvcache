@@ -51,6 +51,7 @@ private:
     };
 
     std::shared_ptr<RadixTreeIndex> GetIndexer(const std::string &instance_id);
+    void ReplayTraceWithPendingWrites(const std::shared_ptr<OptimizerSchemaTrace> &trace);
     void HandleRequest(const RequestSchemaTrace &trace);
     void ScheduleRequestWrite(const RequestSchemaTrace &trace);
     void FlushPendingWritesThrough(int64_t timestamp_ns);

@@ -43,9 +43,19 @@ bool TraceTimeSorter::CompareByTimestamp(const std::shared_ptr<OptimizerSchemaTr
     return a->timestamp_ns() < b->timestamp_ns();
 }
 
+std::string DefaultTraceId(const OptimizerSchemaTrace &trace) {
+    return "trace_" + trace.instance_id() + "_" + std::to_string(trace.timestamp_ns());
+}
+
+void EnsureTraceId(const std::shared_ptr<OptimizerSchemaTrace> &trace) {
+    if (trace && trace->trace_id().empty()) {
+        trace->set_trace_id(DefaultTraceId(*trace));
+    }
+}
+
 void AddTraceId(std::vector<std::shared_ptr<OptimizerSchemaTrace>> &traces) {
     for (const auto &trace : traces) {
-        trace->set_trace_id("trace_" + trace->instance_id() + "_" + std::to_string(trace->timestamp_ns()));
+        EnsureTraceId(trace);
     }
 }
 } // namespace kv_cache_manager

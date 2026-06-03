@@ -7,6 +7,13 @@
 #include "kv_cache_manager/optimizer/eviction_policy/policy_factory.h"
 #include "kv_cache_manager/optimizer/index/radix_tree_index.h"
 namespace kv_cache_manager {
+namespace {
+bool IsCascadingEdge(const std::vector<TierFlowStrategy> &tier_flow_strategies, size_t edge_idx) {
+    return edge_idx < tier_flow_strategies.size() &&
+           tier_flow_strategies[edge_idx].write_mode == TierWriteMode::CASCADING;
+}
+} // namespace
+
 bool OptEvictionManager::Init(const EvictionConfig &eviction_config) {
     eviction_config_ = eviction_config;
     if (eviction_config_.eviction_mode() == EvictionMode::EVICTION_MODE_UNSPECIFIED) {
@@ -49,7 +56,6 @@ OptEvictionManager::CreateAndRegisterEvictionPolicy(const OptInstanceConfig &ins
                 return nullptr;
             }
             group.policies.push_back(std::move(policy));
-            group.tier_configs.push_back(storage_configs[i]);
         }
     } else {
         // 非分层: 单 "shared" 策略
@@ -93,13 +99,11 @@ std::unordered_map<std::string, std::vector<BlockEntry *>> OptEvictionManager::E
             KVCM_LOG_DEBUG("Hierarchical eviction: tier %zu excess: %zu bytes", tier_idx, excess);
             auto tier_evicted = DispatchEviction(instance_id, instance_group_config, tier_idx, excess);
 
-            const bool has_next_tier = (tier_idx + 1 < num_tiers);
-            const bool demote_to_next_tier = has_next_tier && tier_idx < tier_flow_strategies.size() &&
-                                             tier_flow_strategies[tier_idx].write_mode == TierWriteMode::CASCADING;
+            const bool demote_to_next_tier =
+                tier_idx + 1 < num_tiers && IsCascadingEdge(tier_flow_strategies, tier_idx);
             for (auto &[inst_id, blocks] : tier_evicted) {
                 if (demote_to_next_tier && !blocks.empty()) {
-                    DemoteToNextTierAndApplyWriteThrough(
-                        inst_id, tier_idx + 1, blocks, eviction_timestamp, tier_flow_strategies);
+                    DemoteBlocksToTierChain(inst_id, tier_idx + 1, blocks, eviction_timestamp, tier_flow_strategies);
                 }
                 auto &vec = all_evicted[inst_id];
                 vec.insert(vec.end(), blocks.begin(), blocks.end());
@@ -127,43 +131,22 @@ std::unordered_map<std::string, std::vector<BlockEntry *>> OptEvictionManager::E
     return all_evicted;
 }
 
-void OptEvictionManager::DemoteToNextTierAndApplyWriteThrough(
-    const std::string &instance_id,
-    size_t next_tier_idx,
-    const std::vector<BlockEntry *> &blocks,
-    int64_t timestamp,
-    const std::vector<TierFlowStrategy> &tier_flow_strategies) {
+void OptEvictionManager::DemoteBlocksToTierChain(const std::string &instance_id,
+                                                 size_t start_tier_idx,
+                                                 const std::vector<BlockEntry *> &blocks,
+                                                 int64_t timestamp,
+                                                 const std::vector<TierFlowStrategy> &tier_flow_strategies) {
     auto it = instance_tiered_policy_map_.find(instance_id);
     if (it == instance_tiered_policy_map_.end()) {
-        KVCM_LOG_WARN("DemoteToNextTierAndApplyWriteThrough: eviction policy not found for instance: %s",
-                      instance_id.c_str());
+        KVCM_LOG_WARN("DemoteBlocksToTierChain: eviction policy not found for instance: %s", instance_id.c_str());
         return;
     }
-    if (next_tier_idx >= it->second.policies.size()) {
+    if (start_tier_idx >= it->second.policies.size()) {
         // 没有下一层 → 彻底丢弃，Demote 无操作
         return;
     }
     for (BlockEntry *block : blocks) {
-        if (block == nullptr) {
-            continue;
-        }
-        size_t current_tier_idx = next_tier_idx;
-        while (current_tier_idx < it->second.policies.size()) {
-            auto &policy = it->second.policies[current_tier_idx];
-            const std::string &tier_name = policy->name();
-            if (block->location_map.find(tier_name) == block->location_map.end()) {
-                // tier 级统计：在新 tier 的 location_map 新建条目，TierStat 从零开始
-                AppendBlockLocation(block, tier_name, timestamp);
-                // 进入新层 LRU：等价于在新 tier 被写入一次（push_front 给一次复用机会）
-                // 先下沉的批次会被后续批次推向 tail，从而先被驱逐
-                policy->OnBlockWritten(block);
-            }
-            if (current_tier_idx >= tier_flow_strategies.size() ||
-                tier_flow_strategies[current_tier_idx].write_mode != TierWriteMode::WRITE_THROUGH) {
-                break;
-            }
-            ++current_tier_idx;
-        }
+        AppendBlockToTierChain(block, start_tier_idx, it->second.policies, tier_flow_strategies, timestamp);
     }
 }
 

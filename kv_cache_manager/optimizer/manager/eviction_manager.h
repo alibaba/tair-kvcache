@@ -18,7 +18,6 @@ struct TieredPolicyGroup {
     // - 非分层模式: 仅包含一个 name="shared" 的策略，通过 shared_policy() 访问。
     // - 分层模式:   每个 tier 各一个策略，通过 policies[tier_idx] 访问。
     std::vector<std::shared_ptr<EvictionPolicy>> policies;
-    std::vector<OptTierConfig> tier_configs; // 对应的 tier 配置
 
     size_t tier_count() const { return policies.size(); }
 
@@ -28,18 +27,6 @@ struct TieredPolicyGroup {
 
     // 非分层模式下的唯一策略。仅在 policies 包含单个 "shared" 策略时使用。
     const std::shared_ptr<EvictionPolicy> &shared_policy() const { return policies.front(); }
-
-    // 测试及外部便捷入口：委托给所有层策略
-    void OnBlockWritten(BlockEntry *block) {
-        for (auto &p : policies) {
-            p->OnBlockWritten(block);
-        }
-    }
-    void OnBlockAccessedWithOptions(BlockEntry *block, int64_t timestamp, bool refresh_ttl_on_read) {
-        for (auto &p : policies) {
-            p->OnBlockAccessedWithOptions(block, timestamp, refresh_ttl_on_read);
-        }
-    }
 };
 
 class OptEvictionManager {
@@ -79,15 +66,15 @@ public:
     // Instance per-tier 用量明细
     std::vector<size_t> GetCurrentInstanceUsagePerTier(const std::string &instance_id) const;
 
-    // 级联降级：先将 blocks 写入 tier_{next_idx}，再按后续连续 write-through edge 继续写穿。
-    // 只跟 tier 级统计打交道，不触碰 BlockEntry 的跨层连续字段（access_count / last_access_time / writing_time）
-    void DemoteToNextTierAndApplyWriteThrough(const std::string &instance_id,
-                                              size_t next_tier_idx,
-                                              const std::vector<BlockEntry *> &blocks,
-                                              int64_t timestamp,
-                                              const std::vector<TierFlowStrategy> &tier_flow_strategies);
-
 private:
+    // 级联降级：先将 blocks 写入 start_tier_idx，再按后续连续 write-through edge 继续写穿。
+    // 只跟 tier 级统计打交道，不触碰 BlockEntry 的跨层连续字段（access_count / last_access_time / writing_time）
+    void DemoteBlocksToTierChain(const std::string &instance_id,
+                                 size_t start_tier_idx,
+                                 const std::vector<BlockEntry *> &blocks,
+                                 int64_t timestamp,
+                                 const std::vector<TierFlowStrategy> &tier_flow_strategies);
+
     // 驱逐模式分发：根据 eviction_mode 调用对应的驱逐实现
     std::unordered_map<std::string, std::vector<BlockEntry *>>
     DispatchEviction(const std::string &instance_id,
