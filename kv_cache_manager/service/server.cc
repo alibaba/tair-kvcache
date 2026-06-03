@@ -179,6 +179,12 @@ bool Server::StartRpcServer() {
 
     grpc::ServerBuilder builder;
     builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
+    builder.SetMaxReceiveMessageSize(16 * 1024 * 1024);
+    builder.SetMaxSendMessageSize(64 * 1024 * 1024);
+    builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_TIME_MS, 30000);
+    builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, 10000);
+    builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
+    builder.AddChannelArgument(GRPC_ARG_HTTP2_MIN_RECV_PING_INTERVAL_WITHOUT_DATA_MS, 5000);
     builder.RegisterService(meta_service_.get());
     if (!use_separate_admin_server) {
         builder.RegisterService(admin_service_.get());
@@ -204,6 +210,12 @@ bool Server::StartSeparateAdminRpcServer() {
     std::string server_address = "0.0.0.0:" + std::to_string(rpc_port);
     grpc::ServerBuilder builder;
     builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
+    builder.SetMaxReceiveMessageSize(16 * 1024 * 1024);
+    builder.SetMaxSendMessageSize(64 * 1024 * 1024);
+    builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_TIME_MS, 30000);
+    builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, 10000);
+    builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
+    builder.AddChannelArgument(GRPC_ARG_HTTP2_MIN_RECV_PING_INTERVAL_WITHOUT_DATA_MS, 5000);
     builder.RegisterService(admin_service_.get());
     if (config_.IsEnableDebugService()) {
         builder.RegisterService(debug_service_.get());
