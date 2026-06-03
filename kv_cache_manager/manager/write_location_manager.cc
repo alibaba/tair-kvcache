@@ -25,12 +25,12 @@ void WriteLocationManager::SessionIdMap::RemoveFromLocationIndexUnsafe(const std
 }
 
 size_t WriteLocationManager::SessionIdMap::Size() const {
-    std::unique_lock lock(mux_);
+    std::shared_lock lock(mux_);
     return unit_map_.size();
 }
 
 bool WriteLocationManager::SessionIdMap::Empty() const {
-    std::unique_lock lock(mux_);
+    std::shared_lock lock(mux_);
     return unit_map_.empty();
 }
 
@@ -55,7 +55,7 @@ int64_t WriteLocationManager::SessionIdMap::DropByExpirePoint(int64_t cur_point)
         unit->callback(std::move(write_location_info));
     }
     {
-        std::unique_lock lock(mux_);
+        std::shared_lock lock(mux_);
         if (unit_map_.empty()) {
             return 0;
         }
@@ -197,7 +197,7 @@ bool WriteLocationManager::GetAndDelete(const std::string &write_session_id, Wri
 }
 
 bool WriteLocationManager::SessionIdMap::HasLocationId(const std::string &location_id) const {
-    std::unique_lock lock(mux_);
+    std::shared_lock lock(mux_);
     return location_id_index_.find(location_id) != location_id_index_.end();
 }
 

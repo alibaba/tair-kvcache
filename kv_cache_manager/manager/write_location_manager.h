@@ -7,6 +7,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -61,7 +62,7 @@ private:
         void AddToLocationIndexUnsafe(const std::vector<std::string> &location_ids);
         void RemoveFromLocationIndexUnsafe(const std::vector<std::string> &location_ids);
 
-        mutable std::mutex mux_;
+        mutable std::shared_mutex mux_;
         std::unordered_map<std::string, int64_t> session_id_map_impl_;
         std::map<int64_t, ExpireUnitPtr> unit_map_;
 
