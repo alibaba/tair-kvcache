@@ -105,10 +105,11 @@ bool LeaderElector::WorkLoop() {
 
 void LeaderElector::DoWorkLoop(int64_t current_time) {
     int64_t begin_time = TimestampUtil::GetCurrentTimeUs();
-    if (begin_time - last_loop_time_ < 0 || (begin_time - last_loop_time_ > loop_interval_us_ * 2)) {
-        KVCM_LOG_WARN("LeaderElector workloop begin timeout, current[%ld] last[%ld]", begin_time, last_loop_time_);
+    int64_t prev_loop_time = last_loop_time_.load(std::memory_order_relaxed);
+    if (begin_time - prev_loop_time < 0 || (begin_time - prev_loop_time > loop_interval_us_ * 2)) {
+        KVCM_LOG_WARN("LeaderElector workloop begin timeout, current[%ld] last[%ld]", begin_time, prev_loop_time);
     }
-    last_loop_time_ = begin_time;
+    last_loop_time_.store(begin_time, std::memory_order_relaxed);
 
     if (!lock_acquired_.load()) {
         CampaignLeader(current_time);
@@ -534,7 +535,9 @@ void LeaderElector::SetForbidCampaignLeaderTimeMs(int64_t forbid_time) { forbid_
 
 int64_t LeaderElector::GetForbidCampaignLeaderTimeMs() const { return forbid_campaign_time_ms_; }
 
-int64_t LeaderElector::GetLastLoopTimeUs() const { return last_loop_time_; }
+int64_t LeaderElector::GetLastLoopTimeUs() const { return last_loop_time_.load(std::memory_order_relaxed); }
+
+int64_t LeaderElector::GetLoopIntervalUs() const { return loop_interval_us_; }
 
 std::string LeaderElector::GetLeaderNodeID() const {
     std::unique_lock guard(current_lock_holder_mutex_);

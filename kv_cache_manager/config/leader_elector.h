@@ -80,6 +80,7 @@ public:
     void SetForbidCampaignLeaderTimeMs(int64_t forbid_time);
     int64_t GetForbidCampaignLeaderTimeMs() const;
     int64_t GetLastLoopTimeUs() const;
+    int64_t GetLoopIntervalUs() const;
     static const char *RoleStateToString(const RoleState state);
 
 private:
@@ -137,7 +138,7 @@ private:
     std::unique_ptr<std::thread> state_transition_thread_; // 状态转换线程
 
     std::atomic<bool> stop_flag_{false};
-    int64_t last_loop_time_ = -1;
+    std::atomic<int64_t> last_loop_time_{-1};
 
     // === 回调函数 ===
     HandlerFuncType become_leader_handler_;

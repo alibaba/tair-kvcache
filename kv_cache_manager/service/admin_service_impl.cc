@@ -1,5 +1,6 @@
 #include "kv_cache_manager/service/admin_service_impl.h"
 
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <utility>
@@ -846,8 +847,22 @@ void AdminServiceImpl::CheckHealth(RequestContext *request_context,
     }
 
     response->set_is_leader(leader_elector_->IsLeader());
-    response->set_is_health(true); // TODO: 实现健康检查逻辑，如IOHang探测、elector长时间不loop等
-    response->set_elector_last_loop_time_ms(leader_elector_->GetLastLoopTimeUs() / 1000);
+    int64_t last_loop_us = leader_elector_->GetLastLoopTimeUs();
+    response->set_elector_last_loop_time_ms(last_loop_us / 1000);
+
+    bool is_healthy = true;
+    if (last_loop_us > 0) {
+        int64_t now_us = TimestampUtil::GetCurrentTimeUs();
+        int64_t staleness_threshold_us = std::max(leader_elector_->GetLoopIntervalUs() * 100,
+                                                  static_cast<int64_t>(2000000));
+        if (now_us - last_loop_us > staleness_threshold_us) {
+            is_healthy = false;
+            KVCM_LOG_WARN("[traceId: %s] CheckHealth: elector loop stale, last_loop=%ldus ago, threshold=%ldus",
+                          request->trace_id().c_str(), now_us - last_loop_us, staleness_threshold_us);
+        }
+    }
+
+    response->set_is_health(is_healthy);
 
     status->set_code(proto::admin::OK);
     request_context->set_status_code(status->code());
