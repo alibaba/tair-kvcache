@@ -23,8 +23,12 @@ scrape_configs:
 # 服务 QPS（1 分钟速率）
 rate(kvcm_service_query_counter[1m])
 
-# 缓存命中率
+# 搜索缓存命中率
 kvcm_meta_indexer_search_cache_hit_ratio
+
+# GetCacheLocation Block 级命中率（5 分钟窗口）
+rate(kvcm_manager_get_cache_location_hit_block_counter[5m])
+  / rate(kvcm_manager_get_cache_location_query_block_counter[5m])
 
 # 每个后端的存储使用率
 kvcm_data_storage_storage_usage_ratio
@@ -122,6 +126,8 @@ kvcm_data_storage_storage_usage_ratio{type="nfs",unique_name="store_02"} 0.3
 | `service.request_queue_size` | gauge | 请求队列大小 |
 | `manager.request_key_count` | gauge | 每次请求的 key 数量 |
 | `manager.prefix_match_len` | gauge | 前缀匹配长度 |
+| `manager.get_cache_location_query_block_counter` | counter | GetCacheLocation 查询的 Block 总数（累计） |
+| `manager.get_cache_location_hit_block_counter` | counter | GetCacheLocation 命中的 Block 总数（累计） |
 | `manager.prefix_match_time_us` | gauge | 前缀匹配延迟（微秒） |
 | `meta_indexer.search_cache_hit_ratio` | gauge | 搜索缓存命中率 |
 | `data_storage.create_keys_counter` | counter | 已创建 key 总数 |

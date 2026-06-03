@@ -149,6 +149,8 @@ TEST_F(MetricsCollectorTest, ManagerMetricsTest) {
 
     EXPECT_DOUBLE_EQ(GET(p, manager, request_key_count), 0.);
     EXPECT_DOUBLE_EQ(GET(p, manager, prefix_match_len), 0.);
+    EXPECT_EQ(GET(p, manager, get_cache_location_query_block_counter), 0u);
+    EXPECT_EQ(GET(p, manager, get_cache_location_hit_block_counter), 0u);
     EXPECT_DOUBLE_EQ(GET(p, manager, prefix_match_time_us), 0.);
     EXPECT_DOUBLE_EQ(GET(p, manager, lock_write_location_retry_times), 0.);
     EXPECT_DOUBLE_EQ(GET(p, manager, write_cache_io_cost_us), 0.);
@@ -165,6 +167,16 @@ TEST_F(MetricsCollectorTest, ManagerMetricsTest) {
     EXPECT_DOUBLE_EQ(GET(p, manager, prefix_match_len), 10.);
     EXPECT_DOUBLE_EQ(GET(p, manager, lock_write_location_retry_times), 5.);
     EXPECT_DOUBLE_EQ(GET(p, manager, write_cache_io_cost_us), 2000.);
+
+    // Test counter accumulation (counter members are public, direct += works)
+    p->manager_get_cache_location_query_block_counter_metrics_ += 100;
+    p->manager_get_cache_location_hit_block_counter_metrics_ += 60;
+    EXPECT_EQ(GET(p, manager, get_cache_location_query_block_counter), 100u);
+    EXPECT_EQ(GET(p, manager, get_cache_location_hit_block_counter), 60u);
+    p->manager_get_cache_location_query_block_counter_metrics_ += 50;
+    p->manager_get_cache_location_hit_block_counter_metrics_ += 30;
+    EXPECT_EQ(GET(p, manager, get_cache_location_query_block_counter), 150u);
+    EXPECT_EQ(GET(p, manager, get_cache_location_hit_block_counter), 90u);
 
     // Test time measurement
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(p, ManagerPrefixMatch);

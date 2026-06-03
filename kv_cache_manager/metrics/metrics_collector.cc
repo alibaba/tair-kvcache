@@ -52,11 +52,15 @@ DEFINE_METRICS_NAME_FOR_SERVICE(request_queue_size);
 
 // manager metrics
 #define DEFINE_METRICS_NAME_FOR_MANAGER(name) DEFINE_METRICS_NAME_(ServiceMetricsCollector, manager, name)
+#define REGISTER_COUNTER_METRICS_FOR_MANAGER(name)                                                                     \
+    REGISTER_METRICS_W_TAGS_COUNTER_(metrics_registry_, manager, name, metrics_tags_)
 #define REGISTER_GAUGE_METRICS_FOR_MANAGER(name)                                                                       \
     REGISTER_METRICS_W_TAGS_GAUGE_(metrics_registry_, manager, name, metrics_tags_)
 
 DEFINE_METRICS_NAME_FOR_MANAGER(request_key_count);
 DEFINE_METRICS_NAME_FOR_MANAGER(prefix_match_len);
+DEFINE_METRICS_NAME_FOR_MANAGER(get_cache_location_query_block_counter);
+DEFINE_METRICS_NAME_FOR_MANAGER(get_cache_location_hit_block_counter);
 DEFINE_METRICS_NAME_FOR_MANAGER(prefix_match_time_us);
 DEFINE_METRICS_NAME_FOR_MANAGER(lock_write_location_retry_times);
 DEFINE_METRICS_NAME_FOR_MANAGER(write_cache_io_cost_us);
@@ -130,6 +134,8 @@ bool ServiceMetricsCollector::Init() {
     // manager metrics
     REGISTER_GAUGE_METRICS_FOR_MANAGER(request_key_count);
     REGISTER_GAUGE_METRICS_FOR_MANAGER(prefix_match_len);
+    REGISTER_COUNTER_METRICS_FOR_MANAGER(get_cache_location_query_block_counter);
+    REGISTER_COUNTER_METRICS_FOR_MANAGER(get_cache_location_hit_block_counter);
     REGISTER_GAUGE_METRICS_FOR_MANAGER(prefix_match_time_us);
     REGISTER_GAUGE_METRICS_FOR_MANAGER(lock_write_location_retry_times);
     REGISTER_GAUGE_METRICS_FOR_MANAGER(write_cache_io_cost_us);

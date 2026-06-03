@@ -262,6 +262,8 @@ class ServiceMetricsCollector final : public MetricsCollector {
     // manager metrics
     KVCM_GAUGE_METRICS(manager, request_key_count)
     KVCM_GAUGE_METRICS(manager, prefix_match_len)
+    KVCM_COUNTER_METRICS(manager, get_cache_location_query_block_counter)
+    KVCM_COUNTER_METRICS(manager, get_cache_location_hit_block_counter)
     KVCM_CHRONO_METRICS(manager, prefix_match_time_us, ManagerPrefixMatch)
     KVCM_GAUGE_METRICS(manager, lock_write_location_retry_times)
     KVCM_GAUGE_METRICS(manager, write_cache_io_cost_us)
