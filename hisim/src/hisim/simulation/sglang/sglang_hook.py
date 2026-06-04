@@ -41,7 +41,6 @@ from hisim.simulation.sglang.version import VersionDispatcher
 
 logger = get_logger("hisim")
 
-
 class C_EngineHook(BaseHook):
     HOOK_CLASS_NAME = "Engine"
     HOOK_MODULE_NAME = "sglang.srt.entrypoints.engine"
@@ -269,13 +268,13 @@ class C_HiCacheController(BaseHook):
     @staticmethod
     def calc_prefetch_pages(
         required_pages: int, page_size_byte: int, max_dur: float, bandwidth: float
-    ) -> tuple[float, float]:
+    ) -> tuple[int, float]:
         _prefetch_dur = required_pages * page_size_byte / bandwidth
         if _prefetch_dur > max_dur:
             _completed_pages = max(max_dur * bandwidth / page_size_byte, 1)
-            return _completed_pages, max_dur
+            return int(_completed_pages), max_dur
         else:
-            return required_pages, _prefetch_dur
+            return int(required_pages), _prefetch_dur
 
     @classmethod
     def hook(cls, target):
@@ -584,6 +583,7 @@ class C_SchedulerHook(BaseHook):
 
     SCHEDULE_REQ_STATS = []
 
+
     @classmethod
     def hook(cls, target):
         original_init = target.__init__
@@ -611,6 +611,11 @@ class C_SchedulerHook(BaseHook):
             )
 
             original_init(self, *args, **kwargs)
+
+            self.hit_exceeded_prefetched_count = 0
+            self.hit_but_not_prefetched_count = 0
+            self.prefetched_exceeded_hit_count = 0
+            self.no_hit_count = 0
 
             try:
                 model = ConfigManager.get_model_info(
@@ -705,7 +710,23 @@ class C_SchedulerHook(BaseHook):
                         return extra_requests
                 else:
                     # Extra requests include: flush request, abort request, etc.
-                    recv_reqs.extend(original_recv_requests(self, *args, **kwargs))
+                    gen_requests = []
+                    extra_requests = []
+                    reqs = original_recv_requests(self, *args, **kwargs)
+                    for req in reqs:
+                        if req.__class__.__name__ == "TokenizedGenerateReqInput":
+                            gen_requests.append(req)
+                        else:
+                            extra_requests.append(req)
+                    
+                    for req in gen_requests:
+                        if req.sampling_params.custom_params and "simulation" in req.sampling_params.custom_params:
+                            sim_params = req.sampling_params.custom_params["simulation"]
+                            heapq.heappush(C_SchedulerHook.FUTURE_QUEUE, (sim_params["created_time"], time.time_ns(), req))
+                        else:
+                            recv_reqs.append(req)
+                            
+                    recv_reqs.extend(extra_requests)
 
                 # Process the arrived requests only after all requests have been added to the future queue
                 current_timestamp = StateManager.get_global_clock()
@@ -762,6 +783,30 @@ class C_SchedulerHook(BaseHook):
                 for req in new_batch.reqs:
                     req_stats = C_SchedulerHook.REQUEST_STATS[req.rid]
                     req_stats.final_reused_tokens = req.cached_tokens
+                    # ===== 新增调试代码 =====
+                    prefetched = getattr(req_stats, "prefetch_complete_tokens", 0)
+                    if prefetched > 0 and req.cached_tokens < prefetched:
+                        if not getattr(req, "debug_gap_printed", False):
+                            self.prefetched_exceeded_hit_count += 1
+                            print(f"[Gap Detected] Req: {req.rid} | Disk fetched: {prefetched} | Finally GPU Reused: {req.cached_tokens} | Host hit was: {req.host_hit_length} | prefetched exceeded hit count: {self.prefetched_exceeded_hit_count}")
+                            req.debug_gap_printed = True
+                    elif req.cached_tokens > 0:
+                        if prefetched == 0:
+                            if not getattr(req, "debug_gap_printed", False):
+                                self.hit_but_not_prefetched_count += 1
+                                print(f"[Gap Detected] Req: {req.rid} | Disk fetched: {prefetched} | Finally GPU Reused: {req.cached_tokens} | Host hit was: {req.host_hit_length} | hit but not prefetched count: {self.hit_but_not_prefetched_count}")
+                                req.debug_gap_printed = True
+                        else:
+                            if not getattr(req, "debug_gap_printed", False):
+                                self.hit_exceeded_prefetched_count += 1
+                                print(f"[Gap Detected] Req: {req.rid} | Disk fetched: {prefetched} | Finally GPU Reused: {req.cached_tokens} | Host hit was: {req.host_hit_length} | hit exceeded prefetched count: {self.hit_exceeded_prefetched_count}")
+                                req.debug_gap_printed = True    
+                    elif req.cached_tokens == 0:
+                        if not getattr(req, "debug_gap_printed", False):
+                            self.no_hit_count += 1
+                            print(f"[Gap Detected] Req: {req.rid} | Disk fetched: {prefetched} | Finally GPU Reused: {req.cached_tokens} | Host hit was: {req.host_hit_length} | no hit count: {self.no_hit_count}")
+                            req.debug_gap_printed = True    
+                    # ===== 结束调试代码 =====
                     if req_stats.queue_end == -1:
                         if C_SchedulerHook.SIM_MODE == MockSimulationMode.BLOCKING:
                             req_stats.queue_end = now
@@ -844,15 +889,10 @@ class C_SchedulerHook(BaseHook):
             return ret
 
         def wrapped_process_batch_result(self, *args, **kwargs):
-            ret = original_process_batch_result(self, *args, **kwargs)
-
             batch = get_obj_from_args(
                 "sglang.srt.managers.schedule_batch.ScheduleBatch", *args, **kwargs
             )
-            if batch is not None:
-                if len(batch.reqs) == 0:
-                    return ret
-
+            if batch is not None and len(batch.reqs) > 0:
                 hicache_l2_load_dur = StateManager.pop_hicache_l2_load_dur()
                 hicache_l2_backup_dur = StateManager.pop_hicache_l2_backup_dur()
                 current_inference_dur = StateManager.get_current_inference_dur()
@@ -875,7 +915,8 @@ class C_SchedulerHook(BaseHook):
                         + hicache_l2_backup_dur
                     )
                     request_response_time = StateManager.get_global_clock()
-                # Request statistics
+
+                sim_finish_times = {}
                 for req in batch.reqs:
                     if req.is_chunked == 0:
                         req_stats = C_SchedulerHook.REQUEST_STATS[req.rid]
@@ -884,10 +925,8 @@ class C_SchedulerHook(BaseHook):
                             - req_stats.last_event_time  # queue duration
                         )
                         req_stats.last_event_time = request_response_time
-                    else:
-                        # Chunked request: nothing to do
-                        pass
-                # Iteration statistics
+                        sim_finish_times[req.rid] = request_response_time
+
                 C_SchedulerHook.ITERATION_STATS.append(
                     {
                         "requests": C_SchedulerHook.HISIM_BATCH.request_info(),
@@ -896,6 +935,43 @@ class C_SchedulerHook(BaseHook):
                         "l2_backup_latency": hicache_l2_backup_dur,
                     }
                 )
+
+                original_send_output_tok = getattr(self, "send_to_tokenizer", None)
+                original_send_output_detok = getattr(self, "send_to_detokenizer", None)
+                
+                orig_send_tok = original_send_output_tok.send_output if original_send_output_tok else None
+                orig_send_detok = original_send_output_detok.send_output if original_send_output_detok else None
+
+                def wrapped_send_output_tok(output, *send_args, **send_kwargs):
+                    if hasattr(output, "rids"):
+                        setattr(output, "hisim_finish_times", sim_finish_times)
+                        # print(f"HISIM_DEBUG [Scheduler]: attached hisim_finish_times {list(sim_finish_times.keys())} to {type(output).__name__} (tok)", flush=True)
+                    if orig_send_tok:
+                        orig_send_tok(output, *send_args, **send_kwargs)
+
+                def wrapped_send_output_detok(output, *send_args, **send_kwargs):
+                    if hasattr(output, "rids"):
+                        setattr(output, "hisim_finish_times", sim_finish_times)
+                        # print(f"HISIM_DEBUG [Scheduler]: attached hisim_finish_times {list(sim_finish_times.keys())} to {type(output).__name__} (detok)", flush=True)
+                    if orig_send_detok:
+                        orig_send_detok(output, *send_args, **send_kwargs)
+
+                try:
+                    if original_send_output_tok:
+                        original_send_output_tok.send_output = wrapped_send_output_tok
+                    if original_send_output_detok:
+                        original_send_output_detok.send_output = wrapped_send_output_detok
+                    ret = original_process_batch_result(self, *args, **kwargs)
+                finally:
+                    if original_send_output_tok:
+                        original_send_output_tok.send_output = orig_send_tok
+                    if original_send_output_detok:
+                        original_send_output_detok.send_output = orig_send_detok
+
+                C_SchedulerHook.LAST_CPU_TS = time.time()
+                return ret
+
+            ret = original_process_batch_result(self, *args, **kwargs)
             C_SchedulerHook.LAST_CPU_TS = time.time()
             return ret
 
@@ -972,3 +1048,57 @@ class C_SchedulerHook(BaseHook):
         target.run_batch = wrapped_run_batch
         target.process_batch_result = wrapped_process_batch_result
         target.profile = wrapped_profile
+
+
+class C_TokenizerManagerHook(BaseHook):
+    HOOK_CLASS_NAME = "TokenizerManager"
+    HOOK_MODULE_NAME = "sglang.srt.managers.tokenizer_manager"
+
+    @classmethod
+    def hook(cls, target):
+        original_handle_batch_output = target._handle_batch_output
+
+        def wrapped_handle_batch_output(self, recv_obj):
+            # Save states before original_handle_batch_output deletes them if finished
+            states = [self.rid_to_state.get(rid, None) for rid in recv_obj.rids]
+            original_handle_batch_output(self, recv_obj)
+            
+            sim_finish_times = getattr(recv_obj, "hisim_finish_times", {})
+            # print(f"HISIM_DEBUG [Tok]: received hisim_finish_times {list(sim_finish_times.keys())} from {type(recv_obj).__name__}", flush=True)
+            for i, rid in enumerate(recv_obj.rids):
+                state = states[i]
+                if state is None:
+                    print(f"HISIM DEBUG: State is None for rid {rid}")
+                else:
+                    try:
+                        if len(state.out_list) > 0:
+                            out_dict = state.out_list[-1]
+                            if "meta_info" not in out_dict:
+                                out_dict["meta_info"] = {}
+                            if rid in sim_finish_times:
+                                out_dict["meta_info"]["simulation_finish_time"] = sim_finish_times[rid]
+                    except Exception as e:
+                        logger.error(f"Failed to inject simulation finish time: {e}")
+
+        target._handle_batch_output = wrapped_handle_batch_output
+
+
+class C_DetokenizerManagerHook(BaseHook):
+    HOOK_CLASS_NAME = "DetokenizerManager"
+    HOOK_MODULE_NAME = "sglang.srt.managers.detokenizer_manager"
+
+    @classmethod
+    def hook(cls, target):
+        original_handle_batch_token_id_out = target.handle_batch_token_id_out
+
+        def wrapped_handle_batch_token_id_out(self, recv_obj):
+            ret = original_handle_batch_token_id_out(self, recv_obj)
+            sim_finish_times = getattr(recv_obj, "hisim_finish_times", None)
+            if sim_finish_times is not None:
+                setattr(ret, "hisim_finish_times", sim_finish_times)
+                # print(f"HISIM_DEBUG [Detok]: propagated hisim_finish_times {list(sim_finish_times.keys())} to {type(ret).__name__}", flush=True)
+            # else:
+                # print(f"HISIM_DEBUG [Detok]: NO hisim_finish_times found on {type(recv_obj).__name__}", flush=True)
+            return ret
+
+        target.handle_batch_token_id_out = wrapped_handle_batch_token_id_out

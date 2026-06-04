@@ -2816,6 +2816,13 @@ if __name__ == "__main__":
         help="Range of sampled ratio of input/output length, "
         "used only for random and image dataset.",
     )
+    # parser.add_argument(
+    #     "--prefix-hit-rate",
+    #     type=float,
+    #     default=None,
+    #     help="Simulate a specific KV cache hit rate by enforcing shared prefixes across consecutive requests. "
+    #     "Provides an end-to-end equivalent of PrefixCacheDecorator for standard datasets.",
+    # )
     # image dataset args
     parser.add_argument(
         "--image-count",

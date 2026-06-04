@@ -1,5 +1,6 @@
 import os
 import json
+import logging
 import sys
 import argparse
 import torch
@@ -18,6 +19,7 @@ hisim_hook.install_class_hooks(
         sglang_hook.C_SchedulerHook,
         sglang_hook.C_ModelRunnerHook,
         sglang_hook.C_TokenizerManagerHook,
+        sglang_hook.C_DetokenizerManagerHook,
         sglang_hook.C_StorageBackendFactory,
         sglang_hook.C_HiCacheController,
         sglang_hook.C_HiRadixCacheHook,
@@ -53,6 +55,10 @@ if __name__ == "__main__":
     raw_args = parser.parse_args(sys.argv[1:])
     server_args = ServerArgs.from_cli_args(raw_args)
     simulation_args = SimulationArgs.from_cli_args(raw_args)
+
+    # Set hisim logger level to match sglang log level
+    if server_args.log_level:
+        logging.getLogger("hisim").setLevel(server_args.log_level.upper())
 
     config_path = os.getenv("HISIM_CONFIG_PATH")
     if config_path and os.path.exists(config_path):

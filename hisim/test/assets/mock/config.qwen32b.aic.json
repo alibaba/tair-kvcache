@@ -3,15 +3,15 @@
         "accelerator": {
             "name": "H20"
         },
-        "disk_read_bandwidth_gb": 4,
-        "disk_write_bandwidth_gb": 4,
-        "memory_read_bandwidth_gb": 64,
-        "memory_write_bandwidth_gb": 64,
+        "disk_read_bandwidth_gb": 1600,
+        "disk_write_bandwidth_gb": 1600,
+        "memory_read_bandwidth_gb": 3200,
+        "memory_write_bandwidth_gb": 3200,
         "num_device_per_node": 8
     },
     "predictor": {
         "name": "aiconfigurator",
-        "database_path": "download_path/Hisim/Data/aic",
+        "database_path": "/workspace/download/aic",
         "device_name": "h20_sxm",
         "prefill_scale_factor": 1.045,
         "decode_scale_factor": 1.011

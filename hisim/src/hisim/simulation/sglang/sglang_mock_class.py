@@ -916,8 +916,11 @@ class MockTokenToKVPoolHost:
         assert len(host_indices) == len(device_indices)
         num_indices = len(host_indices)
 
-        host = np.asarray(host_indices, dtype=np.int64)
-        dev = np.asarray(device_indices, dtype=np.int64)
+        def _to_numpy(x):
+            return x.cpu().numpy() if hasattr(x, "cpu") else np.asarray(x)
+            
+        host = _to_numpy(host_indices).astype(np.int64)
+        dev = _to_numpy(device_indices).astype(np.int64)
         cont = (np.diff(host) == 1) & (np.diff(dev) == 1)
         cut = np.flatnonzero(~cont) + 1
         starts = np.r_[0, cut]
@@ -944,8 +947,11 @@ class MockTokenToKVPoolHost:
         # update global clock
         num_indices = len(host_indices)
 
-        host = np.asarray(host_indices, dtype=np.int64)
-        dev = np.asarray(device_indices, dtype=np.int64)
+        def _to_numpy(x):
+            return x.cpu().numpy() if hasattr(x, "cpu") else np.asarray(x)
+            
+        host = _to_numpy(host_indices).astype(np.int64)
+        dev = _to_numpy(device_indices).astype(np.int64)
         cont = (np.diff(host) == 1) & (np.diff(dev) == 1)
         cut = np.flatnonzero(~cont) + 1
         starts = np.r_[0, cut]
@@ -1129,6 +1135,31 @@ class MockHiCacheStorage:
                 if not self.set(key, value):
                     return False
             return True
+
+    def batch_set_v1(
+        self,
+        keys: List[str],
+        values: Optional[Any] = None,
+        extra_info: Optional[Any] = None,
+    ) -> List[bool]:
+        success = self.batch_set(keys, values, extra_info=extra_info)
+        return [success] * len(keys)
+
+    def batch_get_v1(
+        self,
+        keys: List[str],
+        values: Optional[Any] = None,
+        extra_info: Optional[Any] = None,
+    ) -> List[bool]:
+        return [True] * len(keys)
+
+    def batch_get(
+        self,
+        keys: List[str],
+        target_locations: Optional[Any] = None,
+        target_sizes: Optional[Any] = None,
+    ) -> List[Any]:
+        return target_locations if target_locations is not None else [None] * len(keys)
 
     def exists(self, key: str) -> bool:
         return key in self.storage
