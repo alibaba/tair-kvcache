@@ -177,64 +177,6 @@ void MetaIndexerTestBase::DoPutTest() {
     ASSERT_EQ(0, meta_indexer_->GetKeyCount());
 }
 
-void MetaIndexerTestBase::DoUpdateTest() {
-    KVData data;
-    const int32_t key_count = 3;
-    MakeKVData(/*start*/ 0, /*end*/ 3, data);
-
-    // 1. Update against NOENT keys -> every key returns EC_NOENT.
-    ASSERT_EQ(0, meta_indexer_->GetKeyCount());
-    KVData update_data;
-    MakeKVData(0, 3, update_data);
-    for (auto &m : update_data.properties) {
-        m["p0"] = m["p0"] + "_new";
-    }
-    PropertyMapVector keep_properties = update_data.properties;
-    CacheLocationMapVector keep_locations;
-    for (const auto &m : update_data.location_maps) {
-        keep_locations.emplace_back(m);
-    }
-
-    Result expect_result(key_count);
-    expect_result.ec = EC_ERROR;
-    expect_result.error_codes = {EC_NOENT, EC_NOENT, EC_NOENT};
-    auto result = meta_indexer_->Update(
-        request_context_.get(), update_data.keys, update_data.location_maps, update_data.properties);
-    ASSERT_EQ(expect_result.ec, result.ec);
-    ASSERT_EQ(expect_result.error_codes, result.error_codes);
-
-    // 2. Put then Update: new locations + new properties take effect.
-    result = meta_indexer_->Put(request_context_.get(), data.keys, data.location_maps, data.properties);
-    ASSERT_EQ(EC_OK, result.ec);
-    ASSERT_EQ(key_count, meta_indexer_->GetKeyCount());
-
-    // Re-materialise update payload since the previous Update may have moved some of it.
-    update_data = {};
-    MakeKVData(0, 3, update_data);
-    for (auto &m : update_data.properties) {
-        m["p0"] = m["p0"] + "_new";
-    }
-    keep_properties = update_data.properties;
-    keep_locations.clear();
-    for (const auto &m : update_data.location_maps) {
-        keep_locations.emplace_back(m);
-    }
-    expect_result = Result(key_count);
-    result = meta_indexer_->Update(
-        request_context_.get(), update_data.keys, update_data.location_maps, update_data.properties);
-    ASSERT_EQ(expect_result.ec, result.ec);
-    ASSERT_EQ(expect_result.error_codes, result.error_codes);
-
-    AssertGet(data.keys, keep_locations, expect_result);
-    AssertGet(data.keys, keep_locations, keep_properties, expect_result);
-    PropertyMapVector expect_p0 = {{{"p0", "p0_0_new"}}, {{"p0", "p0_1_new"}}, {{"p0", "p0_2_new"}}};
-    AssertGetProperties(data.keys, {"p0"}, expect_p0, expect_result);
-
-    // 3. Cleanup
-    meta_indexer_->Delete(request_context_.get(), data.keys);
-    ASSERT_EQ(0, meta_indexer_->GetKeyCount());
-}
-
 void MetaIndexerTestBase::DoDeleteAndExistTest() {
     KVData data;
     const int32_t key_count = 3;
@@ -512,7 +454,6 @@ void MetaIndexerTestBase::DoReadModifyWriteLocationTest() {
 
 void MetaIndexerTestBase::DoSimpleTest() {
     DoPutTest();
-    DoUpdateTest();
     DoDeleteAndExistTest();
     DoScanAndSampleReclaimKeysTest();
     DoReadModifyWriteBlockTest();

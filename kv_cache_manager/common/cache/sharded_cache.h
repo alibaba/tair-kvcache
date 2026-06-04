@@ -212,9 +212,14 @@ public:
         return static_cast<Handle *>(result);
     }
 
-    void Erase(const std::string_view &key) override {
+    bool Exists(const std::string_view &key) override {
         HashVal hash = CacheShard::ComputeHash(key, hash_seed_);
-        GetShard(hash).Erase(key, hash);
+        return GetShard(hash).Exists(key, hash);
+    }
+
+    bool Erase(const std::string_view &key) override {
+        HashVal hash = CacheShard::ComputeHash(key, hash_seed_);
+        return GetShard(hash).Erase(key, hash);
     }
 
     void AdjustCharge(Handle *handle, ssize_t delta) override {

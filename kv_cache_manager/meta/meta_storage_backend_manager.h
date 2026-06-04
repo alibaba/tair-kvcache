@@ -44,8 +44,8 @@ public:
     RecoverState GetRecoverState() const noexcept { return recover_state_.load(std::memory_order_acquire); }
 
     // ----- Write APIs -----
+    // Put / Upsert merge CacheLocations into batch.batch_properties in place.
     std::vector<ErrorCode> Put(RequestContext *request_context, BatchMetaData &batch) noexcept;
-    std::vector<ErrorCode> UpdateFields(RequestContext *request_context, BatchMetaData &batch) noexcept;
     std::vector<ErrorCode> Upsert(RequestContext *request_context, BatchMetaData &batch) noexcept;
     std::vector<ErrorCode> Delete(RequestContext *request_context, const KeyVector &keys) noexcept;
     std::vector<ErrorCode> Delete(RequestContext *request_context,
@@ -86,6 +86,13 @@ public:
 
     ErrorCode PutMetaData(const FieldMap &field_maps) noexcept;
     ErrorCode GetMetaData(FieldMap &field_maps) noexcept;
+
+    // Synchronously flush pending writes for the given keys to persistent storage.
+    // Returns true on success, false on failure/timeout.
+    bool Sync(const KeyVector &keys) noexcept;
+
+    // Returns async write stats from persistent backend.
+    MetaStorageBackend::AsyncWriteStats GetAsyncWriteStats() noexcept;
 
     size_t GetMemUsage() const noexcept;
     int64_t GetOldestAccessTime() const noexcept;

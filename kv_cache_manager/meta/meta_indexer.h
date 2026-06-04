@@ -61,10 +61,6 @@ public:
                const KeyVector &keys,
                CacheLocationMapVector &location_maps,
                PropertyMapVector &properties) noexcept;
-    Result Update(RequestContext *request_context,
-                  const KeyVector &keys,
-                  CacheLocationMapVector &location_maps,
-                  PropertyMapVector &properties) noexcept;
     Result Delete(RequestContext *request_context, const KeyVector &keys) noexcept;
     // Block-level RMW: modifier sees only existing location id list per key.
     Result ReadModifyWriteBlock(RequestContext *request_context,
@@ -108,6 +104,12 @@ public:
     size_t GetMemUsage() const noexcept;
     int64_t GetOldestAccessTime() const noexcept;
 
+    // Synchronously flush pending writes for the given keys to persistent storage.
+    bool Sync(const KeyVector &keys) noexcept;
+
+    // Returns async write path stats from async backend.
+    MetaStorageBackend::AsyncWriteStats GetAsyncWriteStats() noexcept;
+
     // storage usage interfaces
     [[nodiscard]] std::uint64_t GetStorageUsage() const noexcept;
     [[nodiscard]] std::uint64_t GetStorageUsageByType(const DataStorageType &type) const noexcept;
@@ -145,7 +147,12 @@ private:
         int64_t delete_io_time_us = 0;
         int64_t index_serialize_time_us = 0;
         int64_t index_deserialize_time_us = 0;
+        bool has_index_deserialize = false;
         int64_t lock_wait_time_us = 0; // accumulated time waiting for shard locks
+        int64_t async_enqueue_timeout_key_count = 0;
+        int64_t async_enqueue_time_us = 0;
+        int64_t cache_backend_upsert_time_us = 0;
+        int64_t cache_backend_delete_time_us = 0;
         int64_t put_key_count = 0;     // brand-new keys created by upsert
         int64_t update_key_count = 0;  // existing keys updated by upsert
         int64_t delete_key_count = 0;  // keys deleted by whole-key delete

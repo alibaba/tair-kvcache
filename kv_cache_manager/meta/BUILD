@@ -74,7 +74,7 @@ cc_library(
     deps = [
         ":cache_location",
         ":common",
-        ":meta_cache_base_backend",
+        ":meta_async_redis_backend",
         ":meta_dummy_backend",
         ":meta_local_backend",
         ":meta_redis_backend",
@@ -101,11 +101,17 @@ cc_library(
 
 cc_library(
     name = "utils",
+    srcs = [
+        "utils.cc",
+    ],
     hdrs = [
         "utils.h",
     ],
     deps = [
+        ":cache_location",
+        ":common",
         ":types",
+        "//kv_cache_manager/common",
         "//kv_cache_manager/common/hash",
     ],
 )
@@ -223,8 +229,44 @@ cc_library(
     deps = [
         ":common",
         ":meta_storage_backend",
+        ":utils",
         "//kv_cache_manager/common:client_pool",
         "//kv_cache_manager/common:redis_client",
+    ],
+)
+
+cc_library(
+    name = "mpsc_write_queue",
+    srcs = [
+        "mpsc_write_queue.cc",
+    ],
+    hdrs = [
+        "mpsc_write_queue.h",
+    ],
+    deps = [
+        ":types",
+    ],
+)
+
+cc_library(
+    name = "meta_async_redis_backend",
+    srcs = [
+        "meta_async_redis_backend.cc",
+    ],
+    hdrs = [
+        "meta_async_redis_backend.h",
+    ],
+    deps = [
+        ":common",
+        ":meta_storage_backend",
+        ":mpsc_write_queue",
+        ":utils",
+        "//kv_cache_manager/common",
+        "//kv_cache_manager/common:client_pool",
+        "//kv_cache_manager/common:redis_client",
+        "//kv_cache_manager/common:standard_uri",
+        "//kv_cache_manager/common:string_util",
+        "//kv_cache_manager/config",
     ],
 )
 

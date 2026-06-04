@@ -184,6 +184,11 @@ void LocalMetricsReporter::ReportInterval() {
                     SET_METRICS_(p, cache_manager_instance, key_count, static_cast<double>(instance_metric.key_count));
                     SET_METRICS_(p, cache_manager_instance, byte_size, static_cast<double>(instance_metric.byte_size));
                     SET_METRICS_(p, cache_manager_instance, max_lru_age_us, static_cast<double>(instance_metric.max_lru_age_us));
+                    SET_METRICS_(p, cache_manager_instance, async_queue_max_size, static_cast<double>(instance_metric.async_queue_max_size));
+                    SET_METRICS_(p, cache_manager_instance, async_queue_avg_size, static_cast<double>(instance_metric.async_queue_avg_size));
+                    SET_METRICS_(p, cache_manager_instance, async_flush_key_count, static_cast<double>(instance_metric.async_flush_key_count));
+                    SET_METRICS_(p, cache_manager_instance, async_batch_flush_time_us, static_cast<double>(instance_metric.async_batch_flush_time_us));
+                    SET_METRICS_(p, cache_manager_instance, async_pipeline_error_count, static_cast<double>(instance_metric.async_pipeline_error_count));
                 }
             }
         }

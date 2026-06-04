@@ -79,22 +79,6 @@ public:
                                           const CacheLocationMapVector &locations,
                                           const PropertyMapVector &properties) noexcept = 0;
 
-    // 增量更新：仅更新传入的 locations 和 properties 字段，不影响 key 中其他已有字段。
-    // @param request_context  请求上下文；可为 nullptr
-    // @param keys             待更新的 key 列表
-    // @param locations        每个 key 要更新的 CacheLocationMap，大小必须等于 keys.size()；
-    //                         空 map 表示不更新该 key 的 location
-    // @param properties       每个 key 要更新的 PropertyMap，大小必须等于 keys.size()；
-    //                         空 map 表示不更新该 key 的 property
-    // @return 每个 key 的错误码：
-    //   - EC_OK:    更新成功
-    //   - EC_NOENT: key 不存在
-    //   - EC_ERROR: 更新失败
-    virtual std::vector<ErrorCode> Update(RequestContext *request_context,
-                                          const KeyTypeVec &keys,
-                                          const CacheLocationMapVector &locations,
-                                          const PropertyMapVector &properties) noexcept = 0;
-
     // 删除整个 key 及其所有 locations 和 properties。
     // @param request_context  请求上下文；可为 nullptr
     // @param keys  待删除的 key 列表
@@ -258,5 +242,19 @@ public:
     // @param field_maps [out] 读到的元数据
     // @return EC_OK 成功；EC_NOENT 无元数据；EC_ERROR 读取失败
     virtual ErrorCode GetMetaData(FieldMap &field_maps) noexcept = 0;
+
+    // Synchronously flush pending writes for the given keys.
+    // Returns true if all writes persisted successfully, false on failure/timeout.
+    // Default: no-op (sync backends have no pending writes).
+    virtual bool Sync(const KeyTypeVec & /*keys*/) noexcept { return true; }
+
+    struct AsyncWriteStats {
+        int64_t max_async_queue_size = 0;
+        int64_t avg_async_queue_size = 0;
+        int64_t flush_key_count = 0;
+        int64_t batch_flush_time_us = 0;
+        int64_t pipeline_error_count = 0;
+    };
+    virtual AsyncWriteStats GetAsyncWriteStats() noexcept { return {}; }
 };
 } // namespace kv_cache_manager

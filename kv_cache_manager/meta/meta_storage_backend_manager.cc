@@ -12,6 +12,7 @@
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_storage_backend_factory.h"
+#include "kv_cache_manager/metrics/metrics_collector.h"
 
 namespace kv_cache_manager {
 
@@ -299,28 +300,14 @@ std::vector<ErrorCode> MetaStorageBackendManager::Put(RequestContext *request_co
     if (!cache_backend_) {
         return persistent_results;
     }
-    return cache_backend_->Put(request_context, keys, locations, properties, persistent_results);
-}
-
-std::vector<ErrorCode> MetaStorageBackendManager::UpdateFields(RequestContext *request_context,
-                                                               BatchMetaData &batch) noexcept {
-    const KeyVector &keys = batch.batch_keys;
-    batch.EnsureLocationsAndPropertiesResized();
-    CacheLocationMapVector &locations = batch.batch_locations;
-    PropertyMapVector &properties = batch.batch_properties;
-
-    // Partial-update during Recover: hydrate cache from persistent first so
-    // the conditional mirror write below has the full pre-restart field set
-    // to update against (and async backfill cannot later overwrite us).
-    if (cache_backend_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRecover) {
-        EnsureKeyInCache(request_context, keys);
+    const int64_t cache_begin = TimestampUtil::GetCurrentTimeUs();
+    auto results = cache_backend_->Put(request_context, keys, locations, properties, persistent_results);
+    if (request_context) {
+        auto *mc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+        KVCM_METRICS_COLLECTOR_SET_METRICS(mc, meta_indexer, cache_backend_put_time_us,
+                                           TimestampUtil::GetCurrentTimeUs() - cache_begin);
     }
-    std::vector<ErrorCode> persistent_results =
-        persistent_backend_->Update(request_context, keys, locations, properties);
-    if (!cache_backend_) {
-        return persistent_results;
-    }
-    return cache_backend_->Update(request_context, keys, locations, properties, persistent_results);
+    return results;
 }
 
 std::vector<ErrorCode> MetaStorageBackendManager::Upsert(RequestContext *request_context,
@@ -330,8 +317,8 @@ std::vector<ErrorCode> MetaStorageBackendManager::Upsert(RequestContext *request
     CacheLocationMapVector &locations = batch.batch_locations;
     PropertyMapVector &properties = batch.batch_properties;
 
-    // See UpdateFields(): Upsert may also touch only a subset of fields, so
-    // the same Recover-time hydration is needed.
+    // Upsert may touch only a subset of fields, so Recover-time hydration
+    // is needed to avoid overwriting unmentioned fields with empty values.
     if (cache_backend_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRecover) {
         EnsureKeyInCache(request_context, keys);
     }
@@ -340,7 +327,14 @@ std::vector<ErrorCode> MetaStorageBackendManager::Upsert(RequestContext *request
     if (!cache_backend_) {
         return persistent_results;
     }
-    return cache_backend_->Upsert(request_context, keys, locations, properties, persistent_results);
+    const int64_t cache_begin = TimestampUtil::GetCurrentTimeUs();
+    auto results = cache_backend_->Upsert(request_context, keys, locations, properties, persistent_results);
+    if (request_context) {
+        auto *mc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+        KVCM_METRICS_COLLECTOR_SET_METRICS(mc, meta_indexer, cache_backend_upsert_time_us,
+                                           TimestampUtil::GetCurrentTimeUs() - cache_begin);
+    }
+    return results;
 }
 
 std::vector<ErrorCode> MetaStorageBackendManager::Delete(RequestContext *request_context,
@@ -356,7 +350,14 @@ std::vector<ErrorCode> MetaStorageBackendManager::Delete(RequestContext *request
             deleted_keys_.insert(key);
         }
     }
-    return cache_backend_->Delete(request_context, keys, persistent_results);
+    const int64_t cache_begin = TimestampUtil::GetCurrentTimeUs();
+    auto results = cache_backend_->Delete(request_context, keys, persistent_results);
+    if (request_context) {
+        auto *mc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+        KVCM_METRICS_COLLECTOR_SET_METRICS(mc, meta_indexer, cache_backend_delete_time_us,
+                                           TimestampUtil::GetCurrentTimeUs() - cache_begin);
+    }
+    return results;
 }
 
 std::vector<ErrorCode> MetaStorageBackendManager::Delete(RequestContext *request_context,
@@ -382,7 +383,13 @@ std::vector<ErrorCode> MetaStorageBackendManager::Delete(RequestContext *request
     if (!cache_backend_) {
         results = std::move(persistent_results);
     } else {
+        const int64_t cache_begin = TimestampUtil::GetCurrentTimeUs();
         results = cache_backend_->DeleteLocations(request_context, keys, location_ids, persistent_results);
+        if (request_context) {
+            auto *mc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+            KVCM_METRICS_COLLECTOR_SET_METRICS(mc, meta_indexer, cache_backend_delete_time_us,
+                                               TimestampUtil::GetCurrentTimeUs() - cache_begin);
+        }
     }
 
     out_reclaimed_count = MaybeReclaimEmptyKeys(request_context, keys, results);
@@ -719,6 +726,20 @@ ErrorCode MetaStorageBackendManager::PutMetaData(const FieldMap &field_maps) noe
 
 ErrorCode MetaStorageBackendManager::GetMetaData(FieldMap &field_maps) noexcept {
     return persistent_backend_->GetMetaData(field_maps);
+}
+
+bool MetaStorageBackendManager::Sync(const KeyVector &keys) noexcept {
+    if (!persistent_backend_) {
+        return true;
+    }
+    return persistent_backend_->Sync(keys);
+}
+
+MetaStorageBackend::AsyncWriteStats MetaStorageBackendManager::GetAsyncWriteStats() noexcept {
+    if (!persistent_backend_) {
+        return {};
+    }
+    return persistent_backend_->GetAsyncWriteStats();
 }
 
 size_t MetaStorageBackendManager::GetMemUsage() const noexcept {

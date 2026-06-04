@@ -23,6 +23,11 @@ public:
     struct InstanceMetric {
         size_t key_count = 0;
         size_t byte_size = 0;
+        int64_t async_queue_max_size = 0;
+        int64_t async_queue_avg_size = 0;
+        int64_t async_flush_key_count = 0;
+        int64_t async_batch_flush_time_us = 0;
+        int64_t async_pipeline_error_count = 0;
         int64_t max_lru_age_us = 0;
     };
     using GroupUsageRatioMap = std::map<std::string, double>;

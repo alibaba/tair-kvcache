@@ -269,6 +269,8 @@ public:
 private:
     static constexpr double kEpsilon = 1e-9;
     static constexpr std::size_t kSizeLimit = 1 << 16;
+    // timeout for key sampling worker futures to prevent indefinite blocking
+    static constexpr std::uint32_t kFutureTimeoutMs = 60000;
     static const std::string kTraceIDPrefix;
     static std::string GenTraceID();
 
@@ -318,6 +320,10 @@ private:
     // default to 100
     std::atomic<std::uint32_t> sleep_interval_ms_;
 
+    // controls the maximum wait time for key sampling worker futures
+    // default to kFutureTimeoutMs
+    std::atomic<std::uint32_t> future_timeout_ms_;
+
     std::mutex task_queue_mutex_;
     std::condition_variable cv_task_queue_;
     std::deque<std::function<void()>> task_queue_;
@@ -325,6 +331,10 @@ private:
     std::vector<std::thread> workers_;
     void WorkerRoutine();
     void SubmitTask(const std::function<void()> &task);
+
+    // tracks the number of sampling tasks currently executing on
+    // workers; incremented on submit, decremented on task completion
+    std::atomic<std::size_t> in_flight_sampling_tasks_{0};
 
     // a singly-linked list to help inspect the deleting result in a
     // non-blocking way
@@ -477,7 +487,7 @@ private:
     void ReclaimCron() noexcept;
 
     // below are helper routines for internal usage
-    bool DoKeySampling(RequestContext *request_context,
+    bool DoKeySampling(const std::shared_ptr<RequestContext> &request_context,
                        const std::shared_ptr<const InstanceInfo> &instance_info,
                        std::vector<std::int64_t> &out_keys,
                        std::vector<std::map<std::string, std::string>> &out_maps) noexcept;

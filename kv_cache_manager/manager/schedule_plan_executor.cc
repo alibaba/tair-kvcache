@@ -318,6 +318,16 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::Submit(const CacheMetaDelRe
         promise->set_value(PlanExecuteResult{ErrorCode::EC_OK, ""});
         return future;
     }
+
+    // Sync: ensure CAS(→DELETING) is persisted before scheduling Phase 2.
+    if (!indexer->Sync(actual_task.block_keys)) {
+        HandleErrorPromise(promise,
+                           ErrorCode::EC_ERROR,
+                           "Sync failed or timed out for location delete, instance[%s]",
+                           task.instance_id.c_str());
+        return future;
+    }
+
     KVCM_LOG_DEBUG("Location statuses updated, submitting task to worker pool with delay: %lld microseconds",
                    static_cast<long long>(task.delay.count()));
 
@@ -329,6 +339,7 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::Submit(const CacheMetaDelRe
     }
     return future;
 }
+
 bool SchedulePlanExecutor::FillActualTask(
     const std::vector<int64_t> &batch_cas_block_keys,
     const std::vector<std::vector<MetaSearcher::LocationCASTask>> &batch_cas_tasks,
@@ -443,6 +454,15 @@ std::future<PlanExecuteResult> SchedulePlanExecutor::Submit(const CacheLocationD
     }
     if (actual_task.block_keys.empty()) {
         promise->set_value(PlanExecuteResult{ErrorCode::EC_OK, ""});
+        return future;
+    }
+
+    // Sync: ensure CAS(→DELETING) is persisted before scheduling Phase 2.
+    if (!indexer->Sync(actual_task.block_keys)) {
+        HandleErrorPromise(promise,
+                           ErrorCode::EC_ERROR,
+                           "Sync failed or timed out for location delete, instance[%s]",
+                           task.instance_id.c_str());
         return future;
     }
 
