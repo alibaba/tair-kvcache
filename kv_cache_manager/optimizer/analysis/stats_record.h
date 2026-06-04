@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "kv_cache_manager/optimizer/config/types.h"
+#include "kv_cache_manager/optimizer/tier_flow/tier_flow_recorder.h"
 
 namespace kv_cache_manager {
 
@@ -34,6 +35,7 @@ struct ReadRecord {
     std::vector<size_t> per_tier_blocks;     // per-tier block num for current instance
     std::vector<size_t> blocks_per_instance;
     std::vector<int64_t> evicted_keys;
+    std::vector<TierFlowKeyEvent> tier_flow_events;
     std::string trace_id;
     const std::vector<int64_t> *keys_ptr = nullptr; // 借用，仅 OnReadComplete 期间有效
 };
@@ -44,6 +46,7 @@ struct WriteRecord {
     size_t newly_inserted_blocks = 0; // 实际新插入的 block 数（不含已存在的）
     std::vector<int64_t> pool_source_write_keys;
     std::vector<int64_t> evicted_keys;
+    std::vector<TierFlowKeyEvent> tier_flow_events;
 
     std::string trace_id; // 当前 trace 标识
 };

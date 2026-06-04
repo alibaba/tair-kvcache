@@ -56,6 +56,10 @@ public:
                                          const std::string &query_type = "prefix_match");
     size_t
     PrefixMatchCount(const std::string &instance_id, const std::vector<int64_t> &block_ids, int64_t timestamp) const;
+    std::vector<TierFlowKeyEvent> TouchCacheKeysAtTier(const std::string &instance_id,
+                                                       const std::vector<int64_t> &block_ids,
+                                                       const std::string &tier_name,
+                                                       int64_t timestamp);
     std::vector<int64_t> PoolSourceWriteTouchKeysAtLeast(const std::string &instance_id,
                                                          const std::vector<int64_t> &block_ids,
                                                          size_t threshold,

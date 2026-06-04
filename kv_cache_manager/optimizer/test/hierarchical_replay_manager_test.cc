@@ -47,6 +47,40 @@ protected:
         return flow;
     }
 
+    InferClusterConfig CreateInferClusterConfig(const StoragePoolFlowConfig &storage_pool_flow,
+                                                const std::vector<P2PReadFlowConfig> &p2p_read_flows = {}) {
+        LruParams params;
+        params.sample_rate = 1.0;
+
+        HierarchicalModelConfig model;
+        model.set_block_size(16);
+        model.set_bytes_per_token(1);
+        model.set_eviction_policy_type(EvictionPolicyType::POLICY_LRU);
+        model.set_eviction_policy_param(params);
+
+        OptTtlConfig ttl_config;
+        ttl_config.set_default_block_ttl_seconds(0);
+        ttl_config.set_refresh_on_read(true);
+
+        HierarchicalTierConfig hbm;
+        hbm.set_name("hbm");
+        hbm.set_capacity(1.0);
+        HierarchicalTierConfig dram;
+        dram.set_name("dram");
+        dram.set_capacity(1.0);
+
+        InferClusterConfig cluster;
+        cluster.set_storage_pool_id("model_l3");
+        cluster.set_engine_read_query_type("batch_get");
+        cluster.set_model(model);
+        cluster.set_infer_ids({"engine_a", "engine_b"});
+        cluster.set_ttl_config(ttl_config);
+        cluster.set_tiers({hbm, dram});
+        cluster.set_p2p_read_flows(p2p_read_flows);
+        cluster.set_storage_pool_flow(storage_pool_flow);
+        return cluster;
+    }
+
     void SetStoragePoolFlow(HierarchicalReplayConfig &config, const StoragePoolFlowConfig &flow) {
         std::vector<EngineToStoragePoolMappingConfig> mappings = config.engine_to_storage_pool();
         for (auto &mapping : mappings) {
@@ -197,6 +231,47 @@ TEST_F(HierarchicalReplayManagerTest, LinksEngineInstancesToSharedPool) {
 
     manager.AnalyzeResults();
     EXPECT_TRUE(std::filesystem::exists(root + "/combined/hierarchical_hit_rates.csv"));
+}
+
+TEST_F(HierarchicalReplayManagerTest, P2PReadHitsPeerAndFillsCurrentEngine) {
+    const std::string root = GetTestTempRootPath() + "/hierarchical_replay_p2p";
+    HierarchicalReplayConfig config = CreateHierarchicalConfig(root);
+
+    StoragePoolFlowConfig flow = CreateStoragePoolFlow();
+    flow.set_write_mode(TierWriteMode::CASCADING);
+    SetStoragePoolFlow(config, flow);
+
+    P2PReadFlowConfig p2p_flow;
+    p2p_flow.set_tier("dram");
+    p2p_flow.set_peer_read_touch_enabled(true);
+    config.set_infer_clusters({CreateInferClusterConfig(flow, {p2p_flow})});
+
+    HierarchicalReplayManager manager(config);
+    ASSERT_TRUE(manager.Init());
+
+    const std::vector<int64_t> keys = {1001, 1002};
+    manager.WriteCache("engine_a", "write_peer", 1000, keys);
+
+    auto peer_hit = manager.GetCacheLocation("engine_b", "peer_hit", 2000, keys, 32, "batch_get");
+    EXPECT_EQ(peer_hit.engine_hit_length, 0);
+    EXPECT_EQ(peer_hit.peer_hit_length, 2);
+    EXPECT_EQ(peer_hit.storage_pool_hit_length, 0);
+    EXPECT_EQ(peer_hit.total_hit_length, 2);
+
+    auto local_hit = manager.GetCacheLocation("engine_b", "local_after_peer", 3000, keys, 32, "batch_get");
+    EXPECT_EQ(local_hit.engine_hit_length, 2);
+    EXPECT_EQ(local_hit.peer_hit_length, 0);
+    EXPECT_EQ(local_hit.storage_pool_hit_length, 0);
+    EXPECT_EQ(local_hit.total_hit_length, 2);
+
+    manager.AnalyzeResults();
+    std::ifstream csv(root + "/combined/hierarchical_hit_rates.csv");
+    ASSERT_TRUE(csv.is_open());
+    std::ostringstream buffer;
+    buffer << csv.rdbuf();
+    const std::string content = buffer.str();
+    EXPECT_THAT(content, HasSubstr("peer_hit,engine_b,model_l3,2,0,2,0,2"));
+    EXPECT_THAT(content, HasSubstr("local_after_peer,engine_b,model_l3,2,2,0,0,2"));
 }
 
 TEST_F(HierarchicalReplayManagerTest, EngineReadUsesBatchGetAndPoolPrefixSkipsEngineHits) {
@@ -916,10 +991,10 @@ TEST_F(HierarchicalReplayManagerTest, ReplaysStandardTraceThroughEngineAndPool) 
     std::ostringstream buffer;
     buffer << csv.rdbuf();
     const std::string content = buffer.str();
-    EXPECT_THAT(content, HasSubstr("LocalHitBlocks,RemoteHitBlocks,HitBlocks"));
-    EXPECT_THAT(content, HasSubstr("AccLocalHitTokens,AccRemoteHitTokens,AccHitTokens"));
-    EXPECT_THAT(content, HasSubstr("pool_hit,engine_b,model_l3,2,0,2,2"));
-    EXPECT_THAT(content, HasSubstr("engine_hit,engine_b,model_l3,2,2,0,2"));
+    EXPECT_THAT(content, HasSubstr("LocalHitBlocks,PeerHitBlocks,RemoteHitBlocks,HitBlocks"));
+    EXPECT_THAT(content, HasSubstr("AccLocalHitTokens,AccPeerHitTokens,AccRemoteHitTokens,AccHitTokens"));
+    EXPECT_THAT(content, HasSubstr("pool_hit,engine_b,model_l3,2,0,0,2,2"));
+    EXPECT_THAT(content, HasSubstr("engine_hit,engine_b,model_l3,2,2,0,0,2"));
 }
 
 TEST_F(HierarchicalReplayManagerTest, ReplaysRequestTraceWithDelayedWrite) {
@@ -949,8 +1024,8 @@ TEST_F(HierarchicalReplayManagerTest, ReplaysRequestTraceWithDelayedWrite) {
     std::ostringstream buffer;
     buffer << csv.rdbuf();
     const std::string content = buffer.str();
-    EXPECT_THAT(content, HasSubstr("cold,engine_a,model_l3,2,0,0,0"));
-    EXPECT_THAT(content, HasSubstr("engine_hit,engine_a,model_l3,2,2,0,2"));
+    EXPECT_THAT(content, HasSubstr("cold,engine_a,model_l3,2,0,0,0,0"));
+    EXPECT_THAT(content, HasSubstr("engine_hit,engine_a,model_l3,2,2,0,0,2"));
 }
 
 TEST_F(HierarchicalReplayManagerTest, DirectRunSortsTraceByTimestamp) {
@@ -975,7 +1050,7 @@ TEST_F(HierarchicalReplayManagerTest, DirectRunSortsTraceByTimestamp) {
     ASSERT_TRUE(csv.is_open());
     std::ostringstream buffer;
     buffer << csv.rdbuf();
-    EXPECT_THAT(buffer.str(), HasSubstr("late_get,engine_a,model_l3,1,1,0,1"));
+    EXPECT_THAT(buffer.str(), HasSubstr("late_get,engine_a,model_l3,1,1,0,0,1"));
 }
 
 TEST_F(HierarchicalReplayManagerTest, RoundRobinSchedulesTraceRequestsToEngineInstances) {
@@ -1005,8 +1080,8 @@ TEST_F(HierarchicalReplayManagerTest, RoundRobinSchedulesTraceRequestsToEngineIn
     std::ostringstream buffer;
     buffer << csv.rdbuf();
     const std::string content = buffer.str();
-    EXPECT_THAT(content, HasSubstr("cold,engine_a,model_l3,1,0,0,0"));
-    EXPECT_THAT(content, HasSubstr("pool_hit,engine_b,model_l3,1,0,1,1"));
+    EXPECT_THAT(content, HasSubstr("cold,engine_a,model_l3,1,0,0,0,0"));
+    EXPECT_THAT(content, HasSubstr("pool_hit,engine_b,model_l3,1,0,0,1,1"));
 }
 
 TEST_F(HierarchicalReplayManagerTest, PrefixHitSchedulesToCachedEngineInstance) {
@@ -1036,8 +1111,8 @@ TEST_F(HierarchicalReplayManagerTest, PrefixHitSchedulesToCachedEngineInstance) 
     std::ostringstream buffer;
     buffer << csv.rdbuf();
     const std::string content = buffer.str();
-    EXPECT_THAT(content, HasSubstr("cold,engine_a,model_l3,1,0,0,0"));
-    EXPECT_THAT(content, HasSubstr("engine_hit,engine_a,model_l3,1,1,0,1"));
+    EXPECT_THAT(content, HasSubstr("cold,engine_a,model_l3,1,0,0,0,0"));
+    EXPECT_THAT(content, HasSubstr("engine_hit,engine_a,model_l3,1,1,0,0,1"));
 }
 
 TEST_F(HierarchicalReplayManagerTest, SeparatesIndependentPoolInstances) {

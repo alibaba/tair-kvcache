@@ -176,6 +176,18 @@ void HierarchicalStoragePoolConfig::ToRapidWriter(rapidjson::Writer<rapidjson::S
     Put(writer, "pools", pools_);
 }
 
+bool P2PReadFlowConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
+    KVCM_JSON_GET_MACRO(rapid_value, "tier", tier_);
+    KVCM_JSON_GET_DEFAULT_MACRO(
+        rapid_value, "peer_read_touch_enabled", peer_read_touch_enabled_, peer_read_touch_enabled_);
+    return !tier_.empty();
+}
+
+void P2PReadFlowConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
+    Put(writer, "tier", tier_);
+    Put(writer, "peer_read_touch_enabled", peer_read_touch_enabled_);
+}
+
 bool InferClusterConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
     KVCM_JSON_GET_MACRO(rapid_value, "storage_pool_id", storage_pool_id_);
     KVCM_JSON_GET_MACRO(rapid_value, "engine_read_query_type", engine_read_query_type_);
@@ -184,6 +196,7 @@ bool InferClusterConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
     KVCM_JSON_GET_MACRO(rapid_value, "ttl_config", ttl_config_);
     KVCM_JSON_GET_MACRO(rapid_value, "tiers", tiers_);
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "tier_flows", tier_flows_, std::vector<OptTierFlowConfig>{});
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "p2p_read_flows", p2p_read_flows_, std::vector<P2PReadFlowConfig>{});
     KVCM_JSON_GET_MACRO(rapid_value, "storage_pool_flow", storage_pool_flow_);
     return !storage_pool_id_.empty() && IsEngineReadQueryTypeValid(engine_read_query_type_) && !infer_ids_.empty() &&
            !tiers_.empty();
@@ -198,6 +211,9 @@ void InferClusterConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer
     Put(writer, "tiers", tiers_);
     if (!tier_flows_.empty()) {
         Put(writer, "tier_flows", tier_flows_);
+    }
+    if (!p2p_read_flows_.empty()) {
+        Put(writer, "p2p_read_flows", p2p_read_flows_);
     }
     Put(writer, "storage_pool_flow", storage_pool_flow_);
 }
@@ -260,6 +276,18 @@ bool HierarchicalReplayConfig::BuildOptimizerConfigs() {
     for (const auto &infer_group : infer_clusters_) {
         if (pool_ids.find(infer_group.storage_pool_id()) == pool_ids.end()) {
             return false;
+        }
+        std::unordered_set<std::string> tier_names;
+        for (const auto &tier : infer_group.tiers()) {
+            if (!tier_names.insert(tier.name()).second) {
+                return false;
+            }
+        }
+        std::unordered_set<std::string> p2p_tiers;
+        for (const auto &flow : infer_group.p2p_read_flows()) {
+            if (tier_names.find(flow.tier()) == tier_names.end() || !p2p_tiers.insert(flow.tier()).second) {
+                return false;
+            }
         }
 
         std::vector<OptTierConfig> tiers;

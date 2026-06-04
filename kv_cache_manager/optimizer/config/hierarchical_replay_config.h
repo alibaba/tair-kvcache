@@ -153,6 +153,25 @@ private:
     std::vector<HierarchicalStoragePoolEntryConfig> pools_;
 };
 
+class P2PReadFlowConfig : public Jsonizable {
+public:
+    P2PReadFlowConfig() = default;
+    ~P2PReadFlowConfig() override = default;
+
+    bool FromRapidValue(const rapidjson::Value &rapid_value) override;
+    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
+
+    [[nodiscard]] const std::string &tier() const { return tier_; }
+    [[nodiscard]] bool peer_read_touch_enabled() const { return peer_read_touch_enabled_; }
+
+    void set_tier(const std::string &tier) { tier_ = tier; }
+    void set_peer_read_touch_enabled(bool enabled) { peer_read_touch_enabled_ = enabled; }
+
+private:
+    std::string tier_;
+    bool peer_read_touch_enabled_ = true;
+};
+
 class InferClusterConfig : public Jsonizable {
 public:
     InferClusterConfig() = default;
@@ -168,7 +187,18 @@ public:
     [[nodiscard]] const OptTtlConfig &ttl_config() const { return ttl_config_; }
     [[nodiscard]] const std::vector<HierarchicalTierConfig> &tiers() const { return tiers_; }
     [[nodiscard]] const std::vector<OptTierFlowConfig> &tier_flows() const { return tier_flows_; }
+    [[nodiscard]] const std::vector<P2PReadFlowConfig> &p2p_read_flows() const { return p2p_read_flows_; }
     [[nodiscard]] const StoragePoolFlowConfig &storage_pool_flow() const { return storage_pool_flow_; }
+
+    void set_storage_pool_id(const std::string &storage_pool_id) { storage_pool_id_ = storage_pool_id; }
+    void set_engine_read_query_type(const std::string &query_type) { engine_read_query_type_ = query_type; }
+    void set_model(const HierarchicalModelConfig &model) { model_ = model; }
+    void set_infer_ids(const std::vector<std::string> &infer_ids) { infer_ids_ = infer_ids; }
+    void set_ttl_config(const OptTtlConfig &ttl_config) { ttl_config_ = ttl_config; }
+    void set_tiers(const std::vector<HierarchicalTierConfig> &tiers) { tiers_ = tiers; }
+    void set_tier_flows(const std::vector<OptTierFlowConfig> &tier_flows) { tier_flows_ = tier_flows; }
+    void set_p2p_read_flows(const std::vector<P2PReadFlowConfig> &flows) { p2p_read_flows_ = flows; }
+    void set_storage_pool_flow(const StoragePoolFlowConfig &flow) { storage_pool_flow_ = flow; }
 
 private:
     std::string storage_pool_id_;
@@ -178,6 +208,7 @@ private:
     OptTtlConfig ttl_config_;
     std::vector<HierarchicalTierConfig> tiers_;
     std::vector<OptTierFlowConfig> tier_flows_;
+    std::vector<P2PReadFlowConfig> p2p_read_flows_;
     StoragePoolFlowConfig storage_pool_flow_;
 };
 
@@ -208,6 +239,7 @@ public:
     void set_trace_replay_config(const OptTraceReplayConfig &config) { trace_replay_config_ = config; }
     void set_engine_config(const OptimizerConfig &config) { engine_config_ = config; }
     void set_storage_pool(const HierarchicalStoragePoolConfig &config) { storage_pool_ = config; }
+    void set_infer_clusters(const std::vector<InferClusterConfig> &clusters) { infer_clusters_ = clusters; }
     void set_engine_to_storage_pool(const std::vector<EngineToStoragePoolMappingConfig> &mapping) {
         engine_to_storage_pool_ = mapping;
     }

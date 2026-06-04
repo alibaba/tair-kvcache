@@ -40,7 +40,7 @@ bazel run //kv_cache_manager/optimizer:hierarchical_replay_main -- /path/to/hier
 
 输出：
 
-- `output_result_path/hierarchical_hit_rates.csv`：端到端 combined 结果，包含 `LocalHitBlocks` / `RemoteHitBlocks` / `HitBlocks`、对应 token 字段、当前与累计 token hit rate。
+- `output_result_path/hierarchical_hit_rates.csv`：端到端 combined 结果，包含 `LocalHitBlocks` / `PeerHitBlocks` / `RemoteHitBlocks` / `HitBlocks`、对应 token 字段、当前与累计 token hit rate。
 - `output_result_path/infer/`：推理侧独立统计，用于分析每个推理实例本地缓存；开启 `enable_lifecycle_tracking` 后也会输出 `*_lifecycle.csv`。
 - `storage_pool.output_result_path`：storage pool 侧独立统计，用于分析 KVCM/storage pool 池化层；开启 `enable_lifecycle_tracking` 后也会输出 `*_lifecycle.csv`。
 

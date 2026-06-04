@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "kv_cache_manager/optimizer/config/types.h"
+#include "kv_cache_manager/optimizer/tier_flow/tier_flow_recorder.h"
 
 namespace kv_cache_manager {
 
@@ -13,6 +14,7 @@ struct GetCacheLocationRes {
     int64_t kvcm_hit_length;
     std::vector<size_t> hit_indices;
     std::vector<int64_t> evicted_keys;
+    std::vector<TierFlowKeyEvent> tier_flow_events;
 };
 
 struct WriteCacheRes {
@@ -21,6 +23,7 @@ struct WriteCacheRes {
     int64_t kvcm_write_hit_length;
     std::vector<int64_t> pool_source_write_keys;
     std::vector<int64_t> evicted_keys;
+    std::vector<TierFlowKeyEvent> tier_flow_events;
 };
 
 } // namespace kv_cache_manager

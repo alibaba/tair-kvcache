@@ -16,5 +16,6 @@ cc_library(
         "//kv_cache_manager/common:logger",
         "//kv_cache_manager/optimizer/analysis",
         "//kv_cache_manager/optimizer/config",
+        "//kv_cache_manager/optimizer/tier_flow",
     ],
 )

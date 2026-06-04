@@ -447,7 +447,7 @@ struct ReadRecord {
 - `CachedBlocks` - 当前 CSV 对应 instance 的缓存 block 数
 - `CachedBlocksAllInstances` - 同一 optimizer 进程内所有 instance 的总缓存 block 数
 - `ReadBlocks` / `HitBlocks` - 当前请求读取和命中的 block 数
-- `LocalHitBlocks` / `RemoteHitBlocks` - engine 本地命中 / KVCM 或 storage pool 命中 block 数
+- `LocalHitBlocks` / `PeerHitBlocks` / `RemoteHitBlocks` - engine 本地命中 / 同集群 peer 命中 / KVCM 或 storage pool 命中 block 数
 - `InputTokens` / `HitTokens` - 当前请求的输入 token 数和命中 token 数
 - `HitRate` - 当前 token 命中率，`HitTokens / InputTokens`
 - `LocalHitTokens` / `RemoteHitTokens` - engine 本地命中 / KVCM 或 storage pool 命中 token 数

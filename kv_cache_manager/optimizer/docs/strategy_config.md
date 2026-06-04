@@ -52,16 +52,16 @@ AccHitRate = AccHitTokens / AccInputTokens
 | `CachedBlocks` | 当前 CSV 对应 instance 的缓存 block 数 |
 | `CachedBlocksAllInstances` | 同一 optimizer 进程内所有 instance 的总缓存 block 数 |
 | `ReadBlocks` / `HitBlocks` | 当前请求读取 / 命中的 block 数 |
-| `LocalHitBlocks` / `RemoteHitBlocks` | engine 本地命中 / KVCM 或 storage pool 命中 block 数 |
+| `LocalHitBlocks` / `PeerHitBlocks` / `RemoteHitBlocks` | engine 本地命中 / 同集群 peer 命中 / KVCM 或 storage pool 命中 block 数 |
 | `InputTokens` / `HitTokens` | 当前请求的输入 token 数 / 命中 token 数 |
-| `LocalHitTokens` / `RemoteHitTokens` | engine 本地命中 / KVCM 或 storage pool 命中 token 数 |
+| `LocalHitTokens` / `PeerHitTokens` / `RemoteHitTokens` | engine 本地命中 / 同集群 peer 命中 / KVCM 或 storage pool 命中 token 数 |
 | `HitRate` | 当前请求整体 token hit rate |
-| `LocalHitRate` / `RemoteHitRate` | 当前请求 local / remote token hit rate |
+| `LocalHitRate` / `PeerHitRate` / `RemoteHitRate` | 当前请求 local / peer / remote token hit rate |
 | `AccReadBlocks` / `AccHitBlocks` | 累计读取 / 命中的 block 数 |
 | `AccInputTokens` / `AccHitTokens` | 累计输入 token 数 / 累计命中 token 数 |
-| `AccLocalHitTokens` / `AccRemoteHitTokens` | 累计 local / remote 命中 token 数 |
+| `AccLocalHitTokens` / `AccPeerHitTokens` / `AccRemoteHitTokens` | 累计 local / peer / remote 命中 token 数 |
 | `AccHitRate` | 累计整体 token hit rate |
-| `AccLocalHitRate` / `AccRemoteHitRate` | 累计 local / remote token hit rate |
+| `AccLocalHitRate` / `AccPeerHitRate` / `AccRemoteHitRate` | 累计 local / peer / remote token hit rate |
 | `AccWriteBlocks` | 截至当前时间的累计写入 block 数 |
 | `Tier<N>(name)_HitTokens` | 当前请求在某个 tier 的命中 token 数 |
 | `Tier<N>(name)_HitRate` / `AccTier<N>(name)_HitRate` | 当前 / 累计 tier token hit rate |

@@ -242,6 +242,7 @@ WriteCacheRes OptimizerManager::WriteCacheWithTtlUs(const std::string &instance_
     res.kvcm_write_hit_length = write_record.write_blocks - write_record.newly_inserted_blocks;
     res.pool_source_write_keys = write_record.pool_source_write_keys;
     res.evicted_keys = write_record.evicted_keys;
+    res.tier_flow_events = write_record.tier_flow_events;
     return res;
 }
 
@@ -266,6 +267,7 @@ WriteCacheRes OptimizerManager::FillCachePathWithTtlUs(const std::string &instan
     res.kvcm_write_hit_length = write_record.write_blocks - write_record.newly_inserted_blocks;
     res.pool_source_write_keys = write_record.pool_source_write_keys;
     res.evicted_keys = write_record.evicted_keys;
+    res.tier_flow_events = write_record.tier_flow_events;
     return res;
 }
 
@@ -302,6 +304,7 @@ GetCacheLocationRes OptimizerManager::GetCacheLocation(const std::string &instan
         res.hit_indices = read_record.remote_hit_indices;
     }
     res.evicted_keys = read_record.evicted_keys;
+    res.tier_flow_events = read_record.tier_flow_events;
     return res;
 }
 
@@ -313,6 +316,23 @@ size_t OptimizerManager::PrefixMatchCount(const std::string &instance_id,
         return 0;
     }
     return indexer->PrefixMatchCount(block_ids, timestamp);
+}
+
+std::vector<TierFlowKeyEvent> OptimizerManager::TouchCacheKeysAtTier(const std::string &instance_id,
+                                                                     const std::vector<int64_t> &block_ids,
+                                                                     const std::string &tier_name,
+                                                                     int64_t timestamp) {
+    auto indexer = indexer_manager_ ? indexer_manager_->GetOptIndexer(instance_id) : nullptr;
+    if (!indexer) {
+        return {};
+    }
+    bool refresh_ttl_on_read = true;
+    auto it = instance_ttl_refresh_on_read_.find(instance_id);
+    if (it != instance_ttl_refresh_on_read_.end()) {
+        refresh_ttl_on_read = it->second;
+    }
+    indexer->TouchKeysAtTier(block_ids, tier_name, timestamp, refresh_ttl_on_read);
+    return indexer->ConsumeTierFlow().KeyEvents();
 }
 
 std::vector<int64_t> OptimizerManager::PoolSourceWriteTouchKeysAtLeast(const std::string &instance_id,

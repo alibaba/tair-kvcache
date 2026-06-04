@@ -39,11 +39,38 @@ struct TierFlowEvent {
     int64_t timestamp_ns = 0;
 };
 
+struct TierFlowKeyEvent {
+    TierFlowEventKind kind = TierFlowEventKind::ENTER_TIER;
+    TierFlowEventReason reason = TierFlowEventReason::UNKNOWN;
+    std::string instance_id;
+    int64_t block_key = 0;
+    std::string from_tier;
+    std::string to_tier;
+    int64_t timestamp_ns = 0;
+};
+
 class TierFlowRecorder {
 public:
     void Clear() { events_.clear(); }
     [[nodiscard]] bool empty() const { return events_.empty(); }
     [[nodiscard]] const std::vector<TierFlowEvent> &events() const { return events_; }
+    [[nodiscard]] std::vector<TierFlowKeyEvent> KeyEvents() const {
+        std::vector<TierFlowKeyEvent> key_events;
+        key_events.reserve(events_.size());
+        for (const auto &event : events_) {
+            if (event.block == nullptr) {
+                continue;
+            }
+            key_events.push_back(TierFlowKeyEvent{event.kind,
+                                                  event.reason,
+                                                  event.instance_id,
+                                                  event.block->key,
+                                                  event.from_tier,
+                                                  event.to_tier,
+                                                  event.timestamp_ns});
+        }
+        return key_events;
+    }
 
     void RecordEnter(const std::string &instance_id,
                      BlockEntry *block,

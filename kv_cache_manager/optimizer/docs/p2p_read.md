@@ -61,21 +61,20 @@ P2P 配在 `infer_clusters[].p2p_read_flows`：
 
 ## Read 流程
 
-配置 P2P 后，一个 get 按本地 tier 顺序分阶段执行：
+配置 P2P 后，一个 get 按三个阶段执行：
 
 ```text
-local tier[0]
-  -> P2P read for tier[0], if configured
-local tier[1]
-  -> P2P read for tier[1], if configured
-...
-storage pool
+engine local read
+  -> P2P read flows, in config order
+  -> storage pool
 ```
 
-例如本地层级是 `hbm -> dram`，只配置 `tier=dram`，读顺序为：
+engine local read 先按 `infer_clusters[].engine_read_query_type` 完成当前推理实例本地查询。然后 P2P 依次处理 `p2p_read_flows`，每条 flow 只查配置的 peer source tier。
+
+例如只配置 `tier=dram`，读顺序为：
 
 ```text
-local hbm -> local dram -> peer dram -> storage pool
+engine local -> peer dram -> storage pool
 ```
 
 整个 read path 维护四组 mask：
@@ -87,7 +86,7 @@ remote_hit_mask
 satisfied_mask = local_hit_mask | peer_hit_mask | remote_hit_mask
 ```
 
-local / peer / remote hit 可以是不连续的。最终统计只统计 `satisfied_mask` 的连续前缀范围。
+`query_type=prefix_match` 时，storage pool 按 prefix 语义处理剩余缺口；`query_type=batch_get` 时，各 block 独立处理。
 
 ## P2P Tracker
 
@@ -175,15 +174,7 @@ storage pool 只补仍未满足的 block。`query_type=prefix_match` 时，local
 HitTokens = LocalHitTokens + PeerHitTokens + RemoteHitTokens
 ```
 
-统计方式：
-
-```text
-final_prefix_len = longest consecutive true in satisfied_mask
-
-LocalHitBlocks  = count(local_hit_mask  within final_prefix_len)
-PeerHitBlocks   = count(peer_hit_mask   within final_prefix_len)
-RemoteHitBlocks = count(remote_hit_mask within final_prefix_len)
-```
+`LocalHitBlocks`、`PeerHitBlocks`、`RemoteHitBlocks` 分别来自 engine、P2P、storage pool 阶段实际接受的命中 index。`prefix_match` 和 `batch_get` 的差异由各阶段查询语义决定。
 
 示例：
 
@@ -193,7 +184,7 @@ local:  Y N Y N
 peer:     Y
 ```
 
-P2P 补上 `B` 后，最终连续前缀是 `A/B/C`：
+P2P 补上 `B` 后：
 
 ```text
 LocalHit  = A, C
