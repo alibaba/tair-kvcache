@@ -10,12 +10,12 @@
 #include "kv_cache_manager/common/standard_uri.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/coordination_file_backend.h"
-#include "kv_cache_manager/config/leader_elector.h"
+#include "kv_cache_manager/config/lease_lock_leader_elector.h"
 #include "kv_cache_manager/config/node_endpoint_info.h"
 
 using namespace kv_cache_manager;
 
-class LeaderElectorTest : public TESTBASE {
+class LeaseLockLeaderElectorTest : public TESTBASE {
 protected:
     void SetUp() override {
         // 创建临时目录用于锁文件
@@ -44,9 +44,9 @@ protected:
     }
 
     // 创建新的选举器实例
-    std::shared_ptr<LeaderElector> CreateElector(const std::string &custom_value = "") {
+    std::shared_ptr<LeaseLockLeaderElector> CreateElector(const std::string &custom_value = "") {
         std::string value = custom_value.empty() ? lock_value_ : custom_value;
-        return std::make_shared<LeaderElector>(coordination_backend_, lock_key_, value, lease_ms_, loop_interval_ms_);
+        return std::make_shared<LeaseLockLeaderElector>(coordination_backend_, lock_key_, value, lease_ms_, loop_interval_ms_);
     }
 
 protected:
@@ -59,7 +59,7 @@ protected:
 };
 
 // 测试基本构造和析构
-TEST_F(LeaderElectorTest, ConstructorAndDestructor) {
+TEST_F(LeaseLockLeaderElectorTest, ConstructorAndDestructor) {
     auto elector = CreateElector();
     EXPECT_NE(elector, nullptr);
 
@@ -69,7 +69,7 @@ TEST_F(LeaderElectorTest, ConstructorAndDestructor) {
 }
 
 // 测试设置回调函数
-TEST_F(LeaderElectorTest, SetHandlers) {
+TEST_F(LeaseLockLeaderElectorTest, SetHandlers) {
     auto elector = CreateElector();
 
     std::atomic<bool> become_leader_called{false};
@@ -85,7 +85,7 @@ TEST_F(LeaderElectorTest, SetHandlers) {
 }
 
 // 测试启动和停止（无回调）
-TEST_F(LeaderElectorTest, StartStopWithoutHandlers) {
+TEST_F(LeaseLockLeaderElectorTest, StartStopWithoutHandlers) {
     auto elector = CreateElector();
 
     // 未设置回调，Start应该失败
@@ -107,7 +107,7 @@ TEST_F(LeaderElectorTest, StartStopWithoutHandlers) {
 }
 
 // 测试单个选举器成为领导者
-TEST_F(LeaderElectorTest, SingleElectorBecomesLeader) {
+TEST_F(LeaseLockLeaderElectorTest, SingleElectorBecomesLeader) {
     auto elector = CreateElector();
 
     std::atomic<bool> become_leader_called{false};
@@ -139,7 +139,7 @@ TEST_F(LeaderElectorTest, SingleElectorBecomesLeader) {
 }
 
 // 测试手动降级
-TEST_F(LeaderElectorTest, ManualDemote) {
+TEST_F(LeaseLockLeaderElectorTest, ManualDemote) {
     auto elector = CreateElector();
 
     std::atomic<bool> become_leader_called{false};
@@ -180,7 +180,7 @@ TEST_F(LeaderElectorTest, ManualDemote) {
 }
 
 // 测试两个选举器竞争，只有一个能成为领导者
-TEST_F(LeaderElectorTest, TwoElectorsCompetition) {
+TEST_F(LeaseLockLeaderElectorTest, TwoElectorsCompetition) {
     auto elector1 = CreateElector("instance1");
     auto elector2 = CreateElector("instance2");
 
@@ -243,7 +243,7 @@ TEST_F(LeaderElectorTest, TwoElectorsCompetition) {
 }
 
 // 测试领导者失去锁后自动降级
-TEST_F(LeaderElectorTest, LeaderLosesLock) {
+TEST_F(LeaseLockLeaderElectorTest, LeaderLosesLock) {
     auto elector = CreateElector();
 
     std::atomic<bool> become_leader_called{false};
@@ -280,7 +280,7 @@ TEST_F(LeaderElectorTest, LeaderLosesLock) {
 }
 
 // 测试禁止竞选时间
-TEST_F(LeaderElectorTest, ForbidCampaignTime) {
+TEST_F(LeaseLockLeaderElectorTest, ForbidCampaignTime) {
     auto elector = CreateElector();
 
     // 设置禁止竞选时间为500ms
@@ -315,7 +315,7 @@ TEST_F(LeaderElectorTest, ForbidCampaignTime) {
 }
 
 // 测试 WorkLoop 方法
-TEST_F(LeaderElectorTest, WorkLoopMethod) {
+TEST_F(LeaseLockLeaderElectorTest, WorkLoopMethod) {
     auto elector = CreateElector();
 
     // 不启动后台线程，直接调用 WorkLoop
@@ -332,9 +332,9 @@ TEST_F(LeaderElectorTest, WorkLoopMethod) {
 }
 
 // 测试租约过期检测
-TEST_F(LeaderElectorTest, LeaseExpiration) {
+TEST_F(LeaseLockLeaderElectorTest, LeaseExpiration) {
     // 指定租约时间
-    auto elector = std::make_shared<LeaderElector>(coordination_backend_, lock_key_, lock_value_, 50, 10);
+    auto elector = std::make_shared<LeaseLockLeaderElector>(coordination_backend_, lock_key_, lock_value_, 50, 10);
 
     std::atomic<bool> become_leader_called{false};
     std::atomic<bool> no_longer_leader_called{false};
@@ -365,7 +365,7 @@ TEST_F(LeaderElectorTest, LeaseExpiration) {
 }
 
 // 测试重复启动和停止
-TEST_F(LeaderElectorTest, RepeatedStartStop) {
+TEST_F(LeaseLockLeaderElectorTest, RepeatedStartStop) {
     auto elector = CreateElector();
 
     elector->SetBecomeLeaderHandler([]() {});
@@ -381,7 +381,7 @@ TEST_F(LeaderElectorTest, RepeatedStartStop) {
 }
 
 // 测试在停止状态下调用方法
-TEST_F(LeaderElectorTest, MethodsWhenStopped) {
+TEST_F(LeaseLockLeaderElectorTest, MethodsWhenStopped) {
     auto elector = CreateElector();
 
     // 未启动状态下调用方法
@@ -393,9 +393,9 @@ TEST_F(LeaderElectorTest, MethodsWhenStopped) {
 }
 
 // 测试多个选举器使用不同的锁键
-TEST_F(LeaderElectorTest, MultipleElectorsDifferentKeys) {
-    auto elector1 = std::make_shared<LeaderElector>(coordination_backend_, "key1", "instance1", lease_ms_, loop_interval_ms_);
-    auto elector2 = std::make_shared<LeaderElector>(coordination_backend_, "key2", "instance2", lease_ms_, loop_interval_ms_);
+TEST_F(LeaseLockLeaderElectorTest, MultipleElectorsDifferentKeys) {
+    auto elector1 = std::make_shared<LeaseLockLeaderElector>(coordination_backend_, "key1", "instance1", lease_ms_, loop_interval_ms_);
+    auto elector2 = std::make_shared<LeaseLockLeaderElector>(coordination_backend_, "key2", "instance2", lease_ms_, loop_interval_ms_);
 
     std::atomic<bool> elector1_leader{false};
     std::atomic<bool> elector2_leader{false};
@@ -428,9 +428,9 @@ TEST_F(LeaderElectorTest, MultipleElectorsDifferentKeys) {
 }
 
 // 测试边界条件：极短的租约时间
-TEST_F(LeaderElectorTest, VeryShortLease) {
+TEST_F(LeaseLockLeaderElectorTest, VeryShortLease) {
     // 租约时间小于循环间隔的10倍，应该产生警告但正常工作
-    auto elector = std::make_shared<LeaderElector>(coordination_backend_, lock_key_, lock_value_, 5, 2); // 5ms租约，2ms循环
+    auto elector = std::make_shared<LeaseLockLeaderElector>(coordination_backend_, lock_key_, lock_value_, 5, 2); // 5ms租约，2ms循环
 
     elector->SetBecomeLeaderHandler([]() {});
     elector->SetNoLongerLeaderHandler([]() {});
@@ -444,7 +444,7 @@ TEST_F(LeaderElectorTest, VeryShortLease) {
 }
 
 // 测试线程安全：从多个线程调用 IsLeader
-TEST_F(LeaderElectorTest, ThreadSafeIsLeader) {
+TEST_F(LeaseLockLeaderElectorTest, ThreadSafeIsLeader) {
     auto elector = CreateElector();
 
     elector->SetBecomeLeaderHandler([]() {});
@@ -477,7 +477,7 @@ TEST_F(LeaderElectorTest, ThreadSafeIsLeader) {
 }
 
 // 测试两个选举器竞争时，原领导者长期未续约，另一个选举器能正常获得租约
-TEST_F(LeaderElectorTest, LeaseExpirationWithCompetition) {
+TEST_F(LeaseLockLeaderElectorTest, LeaseExpirationWithCompetition) {
     // 创建两个选举器，使用不同的锁值
     auto elector1 = CreateElector("instance1");
     auto elector2 = CreateElector("instance2");
@@ -534,7 +534,7 @@ TEST_F(LeaderElectorTest, LeaseExpirationWithCompetition) {
 }
 
 // 测试 SetSelfNodeInfo / GetNodeInfo 基本功能
-TEST_F(LeaderElectorTest, SetSelfNodeInfoAndGetNodeInfo) {
+TEST_F(LeaseLockLeaderElectorTest, SetSelfNodeInfoAndGetNodeInfo) {
     auto elector = CreateElector();
 
     std::string self_node_id = elector->GetSelfNodeID();
@@ -560,7 +560,7 @@ TEST_F(LeaderElectorTest, SetSelfNodeInfoAndGetNodeInfo) {
 }
 
 // 测试读取不存在的节点信息
-TEST_F(LeaderElectorTest, ReadNonExistentNodeInfo) {
+TEST_F(LeaseLockLeaderElectorTest, ReadNonExistentNodeInfo) {
     auto elector = CreateElector();
 
     NodeEndpointInfo read_info;
@@ -569,7 +569,7 @@ TEST_F(LeaderElectorTest, ReadNonExistentNodeInfo) {
 }
 
 // 测试 Leader 写入节点信息后，通过 GetLeaderNodeInfo 可查到 Leader 连接方式
-TEST_F(LeaderElectorTest, LeaderDiscoveryEndToEnd) {
+TEST_F(LeaseLockLeaderElectorTest, LeaderDiscoveryEndToEnd) {
     const std::string advertised_host = "10.0.0.42";
     const int32_t meta_rpc_port = 50051;
     const int32_t meta_http_port = 8080;
@@ -622,7 +622,7 @@ TEST_F(LeaderElectorTest, LeaderDiscoveryEndToEnd) {
 }
 
 // 测试两个选举器竞争时，Leader 的节点信息可被另一个节点读取
-TEST_F(LeaderElectorTest, LeaderDiscoveryTwoNodes) {
+TEST_F(LeaseLockLeaderElectorTest, LeaderDiscoveryTwoNodes) {
     const std::string host1 = "10.0.0.1";
     const std::string host2 = "10.0.0.2";
 
@@ -661,7 +661,7 @@ TEST_F(LeaderElectorTest, LeaderDiscoveryTwoNodes) {
     EXPECT_FALSE(leader_id.empty());
 
     // 用非 leader 的 elector 读取 leader 的节点信息（模拟从 follower 查询 leader）
-    LeaderElector *follower = elector1->IsLeader() ? elector2.get() : elector1.get();
+    LeaseLockLeaderElector *follower = elector1->IsLeader() ? elector2.get() : elector1.get();
     NodeEndpointInfo leader_info;
     ErrorCode ec = follower->GetNodeInfo(leader_id, leader_info);
     ASSERT_EQ(EC_OK, ec);
@@ -689,7 +689,7 @@ TEST_F(LeaderElectorTest, LeaderDiscoveryTwoNodes) {
 }
 
 // 测试 NodeEndpointInfo 覆盖写入（模拟节点重启后更新端口）
-TEST_F(LeaderElectorTest, NodeInfoOverwrite) {
+TEST_F(LeaseLockLeaderElectorTest, NodeInfoOverwrite) {
     auto elector = CreateElector();
 
     std::string self_node_id = elector->GetSelfNodeID();

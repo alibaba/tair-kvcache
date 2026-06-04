@@ -1,4 +1,4 @@
-#include "kv_cache_manager/config/leader_elector.h"
+#include "kv_cache_manager/config/lease_lock_leader_elector.h"
 
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/logger.h"
@@ -9,7 +9,7 @@
 
 namespace kv_cache_manager {
 
-LeaderElector::LeaderElector(const std::shared_ptr<CoordinationBackend> &coordination_backend,
+LeaseLockLeaderElector::LeaseLockLeaderElector(const std::shared_ptr<CoordinationBackend> &coordination_backend,
                              const std::string &lock_key,
                              const std::string &lock_value,
                              int64_t lease_ms,
@@ -24,10 +24,10 @@ LeaderElector::LeaderElector(const std::shared_ptr<CoordinationBackend> &coordin
     }
 }
 
-LeaderElector::~LeaderElector() { Stop(); }
+LeaseLockLeaderElector::~LeaseLockLeaderElector() { Stop(); }
 
-bool LeaderElector::Start() {
-    KVCM_LOG_INFO("start LeaderElector lock_key=[%s], lease_ms=[%ld], loop_interval_ms=[%ld]",
+bool LeaseLockLeaderElector::Start() {
+    KVCM_LOG_INFO("start LeaseLockLeaderElector lock_key=[%s], lease_ms=[%ld], loop_interval_ms=[%ld]",
                   lock_key_.c_str(),
                   lease_timeout_us_ / 1000,
                   loop_interval_us_ / 1000);
@@ -40,7 +40,7 @@ bool LeaderElector::Start() {
     stop_flag_ = false;
 
     // 启动状态转换线程
-    state_transition_thread_ = std::make_unique<std::thread>(&LeaderElector::StateTransitionWorker, this);
+    state_transition_thread_ = std::make_unique<std::thread>(&LeaseLockLeaderElector::StateTransitionWorker, this);
 
     // 启动选主和续约线程
     leader_lock_thread_ptr_ =
@@ -55,16 +55,16 @@ bool LeaderElector::Start() {
         return false;
     }
 
-    KVCM_LOG_INFO("LeaderElector started successfully");
+    KVCM_LOG_INFO("LeaseLockLeaderElector started successfully");
     return true;
 }
 
-void LeaderElector::Stop() {
+void LeaseLockLeaderElector::Stop() {
     if (!leader_lock_thread_ptr_ && !lease_check_thread_ptr_ && !state_transition_thread_) {
         return;
     }
 
-    KVCM_LOG_INFO("stopping LeaderElector...");
+    KVCM_LOG_INFO("stopping LeaseLockLeaderElector...");
 
     stop_flag_ = true;
 
@@ -92,21 +92,21 @@ void LeaderElector::Stop() {
     }
     state_transition_thread_.reset();
 
-    KVCM_LOG_INFO("LeaderElector stopped");
+    KVCM_LOG_INFO("LeaseLockLeaderElector stopped");
 }
 
 // ==================== 选主逻辑 ====================
 
-bool LeaderElector::WorkLoop() {
+bool LeaseLockLeaderElector::WorkLoop() {
     int64_t current_time = TimestampUtil::GetCurrentTimeUs();
     DoWorkLoop(current_time);
     return lock_acquired_.load();
 }
 
-void LeaderElector::DoWorkLoop(int64_t current_time) {
+void LeaseLockLeaderElector::DoWorkLoop(int64_t current_time) {
     int64_t begin_time = TimestampUtil::GetCurrentTimeUs();
     if (begin_time - last_loop_time_ < 0 || (begin_time - last_loop_time_ > loop_interval_us_ * 2)) {
-        KVCM_LOG_WARN("LeaderElector workloop begin timeout, current[%ld] last[%ld]", begin_time, last_loop_time_);
+        KVCM_LOG_WARN("LeaseLockLeaderElector workloop begin timeout, current[%ld] last[%ld]", begin_time, last_loop_time_);
     }
     last_loop_time_ = begin_time;
 
@@ -124,7 +124,7 @@ void LeaderElector::DoWorkLoop(int64_t current_time) {
     }
 }
 
-void LeaderElector::CampaignLeader(int64_t current_time) {
+void LeaseLockLeaderElector::CampaignLeader(int64_t current_time) {
     if (current_time < next_can_campaign_time_us_.load()) {
         return;
     }
@@ -166,7 +166,7 @@ void LeaderElector::CampaignLeader(int64_t current_time) {
     }
 }
 
-void LeaderElector::HoldLeader(int64_t current_time) {
+void LeaseLockLeaderElector::HoldLeader(int64_t current_time) {
     if (!lock_acquired_.load()) {
         return;
     }
@@ -189,11 +189,11 @@ void LeaderElector::HoldLeader(int64_t current_time) {
     }
 }
 
-void LeaderElector::CheckLeaseTimeout() {
+void LeaseLockLeaderElector::CheckLeaseTimeout() {
     int64_t current_time = TimestampUtil::GetCurrentTimeUs();
     DoCheckLeaseTimeout(current_time);
 }
-bool LeaderElector::DoCheckLeaseTimeout(int64_t current_time) {
+bool LeaseLockLeaderElector::DoCheckLeaseTimeout(int64_t current_time) {
     if (!lock_acquired_.load()) {
         return false;
     }
@@ -207,12 +207,12 @@ bool LeaderElector::DoCheckLeaseTimeout(int64_t current_time) {
     return true;
 }
 
-void LeaderElector::Demote() {
+void LeaseLockLeaderElector::Demote() {
     int64_t current_time = TimestampUtil::GetCurrentTimeUs();
     DoDemote(current_time);
 }
 
-void LeaderElector::DoDemote(int64_t current_time) {
+void LeaseLockLeaderElector::DoDemote(int64_t current_time) {
     if (!lock_acquired_.load()) {
         KVCM_LOG_INFO("not holding lock, no need to demote");
         return;
@@ -239,7 +239,7 @@ void LeaderElector::DoDemote(int64_t current_time) {
 
 // ==================== 状态机逻辑 ====================
 
-void LeaderElector::UpdateLockStatus(int64_t current_time, bool acquired, int64_t lease_expiration_time) {
+void LeaseLockLeaderElector::UpdateLockStatus(int64_t current_time, bool acquired, int64_t lease_expiration_time) {
     bool old_acquired = lock_acquired_.load();
 
     // 先设置延迟选主时间，保证抢主能按预期delay
@@ -277,7 +277,7 @@ void LeaderElector::UpdateLockStatus(int64_t current_time, bool acquired, int64_
     }
 }
 
-void LeaderElector::RequestPromoteToLeader() {
+void LeaseLockLeaderElector::RequestPromoteToLeader() {
     std::unique_lock<std::mutex> lock(transition_mutex_);
 
     RoleState current = role_state_.load();
@@ -310,7 +310,7 @@ void LeaderElector::RequestPromoteToLeader() {
     KVCM_LOG_INFO("promote request queued, version=%lu", new_version);
 }
 
-void LeaderElector::RequestDemoteToFollower() {
+void LeaseLockLeaderElector::RequestDemoteToFollower() {
     std::unique_lock<std::mutex> lock(transition_mutex_);
 
     RoleState current = role_state_.load();
@@ -344,7 +344,7 @@ void LeaderElector::RequestDemoteToFollower() {
     KVCM_LOG_INFO("demote request queued, version=%lu", new_version);
 }
 
-void LeaderElector::StateTransitionWorker() {
+void LeaseLockLeaderElector::StateTransitionWorker() {
     KVCM_LOG_INFO("state transition worker thread started");
 
     while (!stop_flag_) {
@@ -372,7 +372,7 @@ void LeaderElector::StateTransitionWorker() {
     KVCM_LOG_INFO("state transition worker thread exited");
 }
 
-void LeaderElector::ProcessStateTransitionsForTest() {
+void LeaseLockLeaderElector::ProcessStateTransitionsForTest() {
     // 处理所有待处理的状态转换任务，仅用于未启动后台线程的单元测试
     while (true) {
         RoleTransitionTask task;
@@ -393,7 +393,7 @@ void LeaderElector::ProcessStateTransitionsForTest() {
     }
 }
 
-void LeaderElector::ExecuteTransitionTask(const RoleTransitionTask &task) {
+void LeaseLockLeaderElector::ExecuteTransitionTask(const RoleTransitionTask &task) {
     is_transitioning_.store(true);
 
     RoleState current = role_state_.load();
@@ -450,7 +450,7 @@ void LeaderElector::ExecuteTransitionTask(const RoleTransitionTask &task) {
     transition_cv_.notify_all();
 }
 
-bool LeaderElector::TransitionToState(RoleState target_state) {
+bool LeaseLockLeaderElector::TransitionToState(RoleState target_state) {
     RoleState current = role_state_.load();
 
     // 验证状态转换的合法性
@@ -483,11 +483,11 @@ bool LeaderElector::TransitionToState(RoleState target_state) {
 
 // ==================== 查询接口 ====================
 
-bool LeaderElector::IsLeader() const { return lock_acquired_.load(); }
+bool LeaseLockLeaderElector::IsLeader() const { return lock_acquired_.load(); }
 
-RoleState LeaderElector::GetRoleState() const { return role_state_.load(); }
+RoleState LeaseLockLeaderElector::GetRoleState() const { return role_state_.load(); }
 
-const char *LeaderElector::RoleStateToString(const RoleState state) {
+const char *LeaseLockLeaderElector::RoleStateToString(const RoleState state) {
     switch (state) {
     case RoleState::FOLLOWER:
         return "FOLLOWER";
@@ -502,12 +502,12 @@ const char *LeaderElector::RoleStateToString(const RoleState state) {
     }
 }
 
-bool LeaderElector::IsStableState() const {
+bool LeaseLockLeaderElector::IsStableState() const {
     RoleState state = role_state_.load();
     return (state == RoleState::LEADER || state == RoleState::FOLLOWER) && !is_transitioning_.load();
 }
 
-bool LeaderElector::WaitForStableState(int64_t timeout_ms) {
+bool LeaseLockLeaderElector::WaitForStableState(int64_t timeout_ms) {
     if (IsStableState()) {
         return true;
     }
@@ -522,33 +522,33 @@ bool LeaderElector::WaitForStableState(int64_t timeout_ms) {
     }
 }
 
-int64_t LeaderElector::GetLeaseExpirationTime() const { return lease_expiration_time_us_.load(); }
+int64_t LeaseLockLeaderElector::GetLeaseExpirationTime() const { return lease_expiration_time_us_.load(); }
 
 // ==================== 配置接口 ====================
 
-void LeaderElector::SetNoLongerLeaderHandler(const HandlerFuncType &handler) { no_longer_leader_handler_ = handler; }
+void LeaseLockLeaderElector::SetNoLongerLeaderHandler(const HandlerFuncType &handler) { no_longer_leader_handler_ = handler; }
 
-void LeaderElector::SetBecomeLeaderHandler(const HandlerFuncType &handler) { become_leader_handler_ = handler; }
+void LeaseLockLeaderElector::SetBecomeLeaderHandler(const HandlerFuncType &handler) { become_leader_handler_ = handler; }
 
-void LeaderElector::SetForbidCampaignLeaderTimeMs(int64_t forbid_time) { forbid_campaign_time_ms_ = forbid_time; }
+void LeaseLockLeaderElector::SetForbidCampaignLeaderTimeMs(int64_t forbid_time) { forbid_campaign_time_ms_ = forbid_time; }
 
-int64_t LeaderElector::GetForbidCampaignLeaderTimeMs() const { return forbid_campaign_time_ms_; }
+int64_t LeaseLockLeaderElector::GetForbidCampaignLeaderTimeMs() const { return forbid_campaign_time_ms_; }
 
-int64_t LeaderElector::GetLastLoopTimeUs() const { return last_loop_time_; }
+int64_t LeaseLockLeaderElector::GetLastLoopTimeUs() const { return last_loop_time_; }
 
-std::string LeaderElector::GetLeaderNodeID() const {
+std::string LeaseLockLeaderElector::GetLeaderNodeID() const {
     std::unique_lock guard(current_lock_holder_mutex_);
     return current_lock_holder_;
 }
 
-std::string LeaderElector::GetSelfNodeID() const { return lock_value_; }
+std::string LeaseLockLeaderElector::GetSelfNodeID() const { return lock_value_; }
 
-ErrorCode LeaderElector::SetNodeInfo(const std::string &node_id, const NodeEndpointInfo &node_info) {
+ErrorCode LeaseLockLeaderElector::SetNodeInfo(const std::string &node_id, const NodeEndpointInfo &node_info) {
     std::string key = "_TAIR_KVCM_NODE_INFO_" + node_id;
     return coordination_backend_->SetValue(key, node_info.ToJsonString());
 }
 
-ErrorCode LeaderElector::SetSelfNodeInfo(const NodeEndpointInfo &node_info) {
+ErrorCode LeaseLockLeaderElector::SetSelfNodeInfo(const NodeEndpointInfo &node_info) {
     ErrorCode ec = SetNodeInfo(GetSelfNodeID(), node_info);
     if (ec == EC_OK) {
         std::lock_guard<std::mutex> guard(self_node_info_mutex_);
@@ -557,7 +557,7 @@ ErrorCode LeaderElector::SetSelfNodeInfo(const NodeEndpointInfo &node_info) {
     return ec;
 }
 
-ErrorCode LeaderElector::GetSelfNodeInfo(NodeEndpointInfo &out_node_info) const {
+ErrorCode LeaseLockLeaderElector::GetSelfNodeInfo(NodeEndpointInfo &out_node_info) const {
     std::lock_guard<std::mutex> guard(self_node_info_mutex_);
     if (!self_node_info_cache_) {
         return EC_NOENT;
@@ -566,7 +566,7 @@ ErrorCode LeaderElector::GetSelfNodeInfo(NodeEndpointInfo &out_node_info) const 
     return EC_OK;
 }
 
-ErrorCode LeaderElector::GetNodeInfo(const std::string &node_id, NodeEndpointInfo &out_node_info) {
+ErrorCode LeaseLockLeaderElector::GetNodeInfo(const std::string &node_id, NodeEndpointInfo &out_node_info) {
     std::string key = "_TAIR_KVCM_NODE_INFO_" + node_id;
     std::string json_str;
     ErrorCode ec = coordination_backend_->GetValue(key, json_str);
@@ -580,7 +580,7 @@ ErrorCode LeaderElector::GetNodeInfo(const std::string &node_id, NodeEndpointInf
     return EC_OK;
 }
 
-ErrorCode LeaderElector::GetLeaderNodeInfo(NodeEndpointInfo &out_node_info) {
+ErrorCode LeaseLockLeaderElector::GetLeaderNodeInfo(NodeEndpointInfo &out_node_info) {
     std::string leader_node_id = GetLeaderNodeID();
     if (leader_node_id.empty()) {
         return EC_NOENT;

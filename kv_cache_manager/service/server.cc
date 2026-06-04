@@ -7,7 +7,7 @@
 #include "kv_cache_manager/common/net_util.h"
 #include "kv_cache_manager/config/coordination_backend.h"
 #include "kv_cache_manager/config/coordination_backend_factory.h"
-#include "kv_cache_manager/config/leader_elector.h"
+#include "kv_cache_manager/config/lease_lock_leader_elector.h"
 #include "kv_cache_manager/config/node_endpoint_info.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/event/event_manager.h"
@@ -322,7 +322,7 @@ bool Server::CreateLeaderElector() {
         return false;
     }
 
-    leader_elector_ = std::make_shared<LeaderElector>(coordination_backend_,
+    leader_elector_ = std::make_shared<LeaseLockLeaderElector>(coordination_backend_,
                                                       kLeaderLockKey,
                                                       node_id,
                                                       config_.GetLeaderElectorLeaseMs(),

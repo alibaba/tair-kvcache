@@ -11,7 +11,7 @@
 #include "kv_cache_manager/common/standard_uri.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/coordination_memory_backend.h"
-#include "kv_cache_manager/config/leader_elector.h"
+#include "kv_cache_manager/config/lease_lock_leader_elector.h"
 #include "kv_cache_manager/config/model_deployment.h"
 #include "kv_cache_manager/config/node_endpoint_info.h"
 #include "kv_cache_manager/config/registry_manager.h"
@@ -884,7 +884,7 @@ TEST_F(GrpcStubTest, TestGetClusterInfoWithLeaderElector) {
     StandardUri uri("memory://");
     ASSERT_EQ(EC_OK, backend->Init(uri));
 
-    auto leader_elector = std::make_shared<LeaderElector>(backend, "test_lock", "node1", 1000, 10);
+    auto leader_elector = std::make_shared<LeaseLockLeaderElector>(backend, "test_lock", "node1", 1000, 10);
     leader_elector->SetBecomeLeaderHandler([]() {});
     leader_elector->SetNoLongerLeaderHandler([]() {});
     ASSERT_TRUE(leader_elector->Start());

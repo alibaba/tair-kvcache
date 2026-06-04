@@ -33,16 +33,16 @@ struct RoleTransitionTask {
     std::function<void()> action;
 };
 
-class LeaderElector : public ILeaderElector {
+class LeaseLockLeaderElector : public ILeaderElector {
 public:
-    LeaderElector(const std::shared_ptr<CoordinationBackend> &coordination_backend,
+    LeaseLockLeaderElector(const std::shared_ptr<CoordinationBackend> &coordination_backend,
                   const std::string &lock_key,
                   const std::string &lock_value,
                   int64_t lease_ms = 60,
                   int64_t loop_interval_ms = 6);
-    ~LeaderElector() override;
-    LeaderElector(const LeaderElector &) = delete;
-    LeaderElector &operator=(const LeaderElector &) = delete;
+    ~LeaseLockLeaderElector() override;
+    LeaseLockLeaderElector(const LeaseLockLeaderElector &) = delete;
+    LeaseLockLeaderElector &operator=(const LeaseLockLeaderElector &) = delete;
 
     bool Start() override;
     void Stop() override;
@@ -152,6 +152,6 @@ private:
     mutable std::mutex self_node_info_mutex_;
 };
 
-typedef std::shared_ptr<LeaderElector> LeaderElectorPtr;
+typedef std::shared_ptr<LeaseLockLeaderElector> LeaseLockLeaderElectorPtr;
 
 } // namespace kv_cache_manager

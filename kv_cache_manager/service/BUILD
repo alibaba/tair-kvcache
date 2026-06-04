@@ -28,7 +28,7 @@ cc_library(
         "//kv_cache_manager/common:crash_handler",
         "//kv_cache_manager/common:loop_thread",
         "//kv_cache_manager/config:coordination_backend",
-        "//kv_cache_manager/config:leader_elector_base",
+        "//kv_cache_manager/config:lease_lock_leader_elector",
         "//kv_cache_manager/event:event_publisher",
         "//kv_cache_manager/manager:cache_location_view",
         "//kv_cache_manager/manager:cache_manager",

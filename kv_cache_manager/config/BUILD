@@ -12,12 +12,12 @@ cc_library(
 )
 
 cc_library(
-    name = "leader_elector_base",
+    name = "lease_lock_leader_elector",
     srcs = [
-        "leader_elector.cc",
+        "lease_lock_leader_elector.cc",
     ],
     hdrs = [
-        "leader_elector.h",
+        "lease_lock_leader_elector.h",
         "node_endpoint_info.h",
     ],
     deps = [
