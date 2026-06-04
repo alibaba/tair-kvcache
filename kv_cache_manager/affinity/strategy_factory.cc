@@ -2,8 +2,9 @@
 
 #include <string>
 
-#include "kv_cache_manager/affinity/noop_strategy.h"
+#include "kv_cache_manager/affinity/hint_suppressor.h"
 #include "kv_cache_manager/affinity/local_replica_strategy.h"
+#include "kv_cache_manager/affinity/noop_strategy.h"
 #include "kv_cache_manager/affinity/pipeline/candidate_pipeline.h"
 #include "kv_cache_manager/common/logger.h"
 #include "rapidjson/document.h"
@@ -19,11 +20,11 @@ constexpr const char *kTypeNoop = "noop";
 constexpr const char *kTypeLocalReplica = "local_replica";
 constexpr const char *kFieldStrategy = "strategy";
 constexpr const char *kFieldEnabledAspects = "enabled_aspects";
-constexpr const char *kFieldWrite = "write";        // 写一级配置块
-constexpr const char *kFieldRead = "read";          // 读一级配置块
-constexpr const char *kFieldEviction = "eviction";  // 淘汰一级配置块
-constexpr const char *kFieldOps = "ops";            // op 链
-constexpr const char *kFieldOnMiss = "on_miss";     // 读子项
+constexpr const char *kFieldWrite = "write";       // 写一级配置块
+constexpr const char *kFieldRead = "read";         // 读一级配置块
+constexpr const char *kFieldEviction = "eviction"; // 淘汰一级配置块
+constexpr const char *kFieldOps = "ops";           // op 链
+constexpr const char *kFieldOnMiss = "on_miss";    // 读子项
 
 void SetErr(std::string *out, const std::string &msg) {
     if (out) {
@@ -69,6 +70,7 @@ void ApplyOnMiss(const rapidjson::Value &on_miss, LocalReplicaAffinityStrategy::
     ReadUIntField(on_miss, "replication_hot_threshold", p.replication_hot_threshold);
     ReadDoubleField(on_miss, "caller_capacity_threshold", p.caller_capacity_threshold);
     ReadDoubleField(on_miss, "caller_capacity_buffer", p.caller_capacity_buffer);
+    ReadUIntField(on_miss, "suppression_window_ms", p.suppression_window_ms);
 }
 
 // 解析 eviction 一级 ops 参数（v1 只有 node_water）。
@@ -95,9 +97,11 @@ void ApplyEvictionOps(const rapidjson::Value &eviction_block, LocalReplicaAffini
 //       "write":     { "ops": <5 段流水线对象> },
 //       "read":      { "on_miss": { "replication_hot_threshold": 3, ... } },
 //       "eviction":  { "ops": [{"op":"node_water_level","threshold":0.85}, ...] } }
-LocalReplicaAffinityStrategy::Params BuildLocalReplicaParams(const rapidjson::Value &target, FrequencySketch *sketch) {
+LocalReplicaAffinityStrategy::Params
+BuildLocalReplicaParams(const rapidjson::Value &target, FrequencySketch *sketch, HintSuppressor *suppressor) {
     LocalReplicaAffinityStrategy::Params p;
     p.sketch = sketch;
+    p.suppressor = suppressor;
 
     // enabled_aspects
     if (target.HasMember(kFieldEnabledAspects) && target[kFieldEnabledAspects].IsObject()) {
@@ -129,8 +133,10 @@ LocalReplicaAffinityStrategy::Params BuildLocalReplicaParams(const rapidjson::Va
 
 } // namespace
 
-std::shared_ptr<AffinityStrategy>
-StrategyFactory::ParseJsonString(const std::string &json, FrequencySketch *sketch, std::string *error_msg) {
+std::shared_ptr<AffinityStrategy> StrategyFactory::ParseJsonString(const std::string &json,
+                                                                   FrequencySketch *sketch,
+                                                                   HintSuppressor *suppressor,
+                                                                   std::string *error_msg) {
     if (json.empty()) {
         SetErr(error_msg, "empty json");
         return nullptr;
@@ -162,7 +168,7 @@ StrategyFactory::ParseJsonString(const std::string &json, FrequencySketch *sketc
         return std::make_shared<NoopAffinityStrategy>();
     }
     if (type == kTypeLocalReplica) {
-        return std::make_shared<LocalReplicaAffinityStrategy>(BuildLocalReplicaParams(*target, sketch));
+        return std::make_shared<LocalReplicaAffinityStrategy>(BuildLocalReplicaParams(*target, sketch, suppressor));
     }
 
     SetErr(error_msg, std::string("unknown strategy type: ") + type);

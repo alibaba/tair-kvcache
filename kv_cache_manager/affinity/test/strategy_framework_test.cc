@@ -46,7 +46,7 @@ TEST_F(StrategyFrameworkTest, NoopMethodsReturnSafeDefaults) {
 
 TEST_F(StrategyFrameworkTest, FactoryParsesNoop) {
     std::string err;
-    auto s = StrategyFactory::ParseJsonString(R"({"type":"noop"})", nullptr, &err);
+    auto s = StrategyFactory::ParseJsonString(R"({"type":"noop"})", nullptr, nullptr, &err);
     ASSERT_NE(nullptr, s);
     EXPECT_EQ("noop", s->Name());
     EXPECT_TRUE(err.empty());
@@ -60,21 +60,21 @@ TEST_F(StrategyFrameworkTest, FactoryAcceptsWrappedNoop) {
 
 TEST_F(StrategyFrameworkTest, FactoryReturnsNullOnEmpty) {
     std::string err;
-    auto s = StrategyFactory::ParseJsonString("", nullptr, &err);
+    auto s = StrategyFactory::ParseJsonString("", nullptr, nullptr, &err);
     EXPECT_EQ(nullptr, s);
     EXPECT_FALSE(err.empty());
 }
 
 TEST_F(StrategyFrameworkTest, FactoryReturnsNullOnBadJson) {
     std::string err;
-    auto s = StrategyFactory::ParseJsonString("not_json_at_all", nullptr, &err);
+    auto s = StrategyFactory::ParseJsonString("not_json_at_all", nullptr, nullptr, &err);
     EXPECT_EQ(nullptr, s);
     EXPECT_FALSE(err.empty());
 }
 
 TEST_F(StrategyFrameworkTest, FactoryReturnsNullOnUnknownType) {
     std::string err;
-    auto s = StrategyFactory::ParseJsonString(R"({"type":"unicorn"})", nullptr, &err);
+    auto s = StrategyFactory::ParseJsonString(R"({"type":"unicorn"})", nullptr, nullptr, &err);
     EXPECT_EQ(nullptr, s);
     EXPECT_NE(std::string::npos, err.find("unknown"));
 }
@@ -139,6 +139,36 @@ TEST_F(StrategyFrameworkTest, FactoryParsesOnMissDisabled) {
     EXPECT_TRUE(p->enable_read); // 一级仍 on
     EXPECT_FALSE(p->enable_on_miss);
     // 子开关在 Params 内，行为另见 LocalReplicaStrategyTest
+}
+
+TEST_F(StrategyFrameworkTest, FactoryParsesSuppressionWindow) {
+    {
+        auto s = StrategyFactory::ParseJsonString(R"({"type":"local_replica"})");
+        ASSERT_NE(nullptr, s);
+        const auto *p = LocalReplicaParams(s);
+        ASSERT_NE(nullptr, p);
+        EXPECT_EQ(60000u, p->suppression_window_ms);
+    }
+    {
+        auto s = StrategyFactory::ParseJsonString(R"({
+            "type": "local_replica",
+            "read": { "on_miss": { "suppression_window_ms": 30000 } }
+        })");
+        ASSERT_NE(nullptr, s);
+        const auto *p = LocalReplicaParams(s);
+        ASSERT_NE(nullptr, p);
+        EXPECT_EQ(30000u, p->suppression_window_ms);
+    }
+    {
+        auto s = StrategyFactory::ParseJsonString(R"({
+            "type": "local_replica",
+            "read": { "on_miss": { "suppression_window_ms": 0 } }
+        })");
+        ASSERT_NE(nullptr, s);
+        const auto *p = LocalReplicaParams(s);
+        ASSERT_NE(nullptr, p);
+        EXPECT_EQ(0u, p->suppression_window_ms);
+    }
 }
 
 } // namespace kv_cache_manager

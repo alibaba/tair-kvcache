@@ -14,6 +14,7 @@
 
 #include "kv_cache_manager/affinity/affinity_strategy.h"
 #include "kv_cache_manager/affinity/frequency_sketch.h"
+#include "kv_cache_manager/affinity/hint_suppressor.h"
 #include "kv_cache_manager/affinity/node_metrics.h"
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/data_storage/write_hints.h"
@@ -107,6 +108,7 @@ private:
     // Per-(caller, key) frequency sketch; mutable because read path updates it
     // even through const methods (GetStrategy etc. remain logically const).
     mutable FrequencySketch sketch_;
+    mutable HintSuppressor suppressor_;
 
     // NodeMetrics pull background thread
     std::thread metrics_thread_;

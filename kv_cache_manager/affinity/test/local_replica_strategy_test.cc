@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "kv_cache_manager/affinity/frequency_sketch.h"
+#include "kv_cache_manager/affinity/hint_suppressor.h"
 #include "kv_cache_manager/affinity/local_replica_strategy.h"
 #include "kv_cache_manager/affinity/node_metrics.h"
 #include "kv_cache_manager/affinity/pipeline/candidate_pipeline.h"
@@ -137,8 +138,43 @@ TEST_F(LocalReplicaStrategyTest, ResolveReadEmitsReplicationHintWhenHot) {
     EXPECT_EQ(42, hint->block_key);
     EXPECT_EQ("node_a", hint->target_node_id);
     EXPECT_EQ("uri_remote", hint->source_uri);
-    // 发完后 sketch 应被 Reset
-    EXPECT_EQ(0u, sketch.RemoteCount("node_a", 42));
+    // sketch 不再被 hint emit 清零；本次 ResolveRead Observe 一次 ⇒ 总数 4。
+    EXPECT_EQ(4u, sketch.RemoteCount("node_a", 42));
+}
+
+TEST_F(LocalReplicaStrategyTest, ResolveReadSuppressorBlocksWithinWindow) {
+    FrequencySketch sketch;
+    int64_t mock_now_us = 1'000'000;
+    HintSuppressor suppressor(100, [&mock_now_us]() { return mock_now_us; });
+
+    LocalReplicaAffinityStrategy::Params p;
+    p.replication_hot_threshold = 1;
+    p.sketch = &sketch;
+    p.suppressor = &suppressor;
+    p.suppression_window_ms = 60000;
+    LocalReplicaAffinityStrategy s(std::move(p));
+
+    StrategyContext ctx;
+    ctx.caller_node_id = "node_a";
+
+    LocationSpec remote("tp0", "uri_remote", "node_b");
+    ReadRequest req;
+    req.block_key = 42;
+    req.spec_candidates["tp0"] = {&remote};
+    CacheLocation winner;
+    winner.push_location_spec(LocationSpec("tp0", "uri_remote", "node_b"));
+    req.winner_tier = &winner;
+
+    ReadDecision dec1 = s.ResolveRead(req, ctx);
+    EXPECT_EQ(1u, dec1.side_effects.size());
+
+    mock_now_us += 1'000'000;
+    ReadDecision dec2 = s.ResolveRead(req, ctx);
+    EXPECT_TRUE(dec2.side_effects.empty());
+
+    mock_now_us = 1'000'000 + 60'000'000;
+    ReadDecision dec3 = s.ResolveRead(req, ctx);
+    EXPECT_EQ(1u, dec3.side_effects.size());
 }
 
 TEST_F(LocalReplicaStrategyTest, ResolveReadNoHintWhenOnMissDisabled) {

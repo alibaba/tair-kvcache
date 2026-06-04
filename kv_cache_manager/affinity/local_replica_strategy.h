@@ -22,6 +22,7 @@
 namespace kv_cache_manager {
 
 class FrequencySketch;
+class HintSuppressor;
 
 // 复制提示：LocalReplica 算法特有的读副作用。read-miss 且远端命中超阈值时
 // 由 ResolveRead 产出，随响应回传给 client，由 client 异步在本地写一份副本。
@@ -45,14 +46,18 @@ public:
         std::shared_ptr<CandidatePipeline> write_pipeline;
 
         // === 读一级 on_miss 子项 (read.on_miss)：复制触发参数 ===
-        bool enable_on_miss = true;                // 子开关：关闭后 ResolveRead 不再产出 hints
-        uint32_t replication_hot_threshold = 3;    // 远端命中次数阈值
-        double caller_capacity_threshold = 0.85;   // caller 节点 load_ratio 上限
-        double caller_capacity_buffer = 0.05;      // 缓冲带
+        bool enable_on_miss = true;              // 子开关：关闭后 ResolveRead 不再产出 hints
+        uint32_t replication_hot_threshold = 3;  // 远端命中次数阈值
+        double caller_capacity_threshold = 0.85; // caller 节点 load_ratio 上限
+        double caller_capacity_buffer = 0.05;    // 缓冲带
 
         // 频率反馈机制层，构造期由 affinity_manager 注入（manager 持有，
         // 重解析策略后状态不丢）。nullptr ⇒ 算法保守不产复制提示。
         FrequencySketch *sketch = nullptr;
+
+        // suppressor == nullptr ⇒ 不做时间抑制；window == 0 ⇒ 同上。
+        HintSuppressor *suppressor = nullptr;
+        uint32_t suppression_window_ms = 60000;
 
         // === 淘汰一级 (eviction.ops)：节点水位 ===
         double node_water_threshold = 0.85;

@@ -1,6 +1,7 @@
 #include "kv_cache_manager/affinity/local_replica_strategy.h"
 
 #include "kv_cache_manager/affinity/frequency_sketch.h"
+#include "kv_cache_manager/affinity/hint_suppressor.h"
 
 namespace kv_cache_manager {
 
@@ -71,15 +72,16 @@ ReadDecision LocalReplicaAffinityStrategy::ResolveRead(const ReadRequest &req, c
             }
         }
         if (!source_uri.empty()) {
-            auto h = std::make_unique<ReplicationHint>();
-            h->block_key = req.block_key;
-            h->source_uri = std::move(source_uri);
-            h->target_node_id = ctx.caller_node_id;
-            dec.side_effects.push_back(std::move(h));
-            // 简单 dedup：hint 发出后清零，等下次再攒到阈值再发
-            // (C10 完成后由 server 端 (key, target_node) 60s 窗口接管 §15.5)
-            if (params_.sketch != nullptr) {
-                params_.sketch->Reset(ctx.caller_node_id, req.block_key);
+            const bool allow =
+                params_.suppressor == nullptr
+                    ? true
+                    : params_.suppressor->TryEmit(req.block_key, ctx.caller_node_id, params_.suppression_window_ms);
+            if (allow) {
+                auto h = std::make_unique<ReplicationHint>();
+                h->block_key = req.block_key;
+                h->source_uri = std::move(source_uri);
+                h->target_node_id = ctx.caller_node_id;
+                dec.side_effects.push_back(std::move(h));
             }
         }
     }
