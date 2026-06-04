@@ -7,6 +7,7 @@
 #include "kv_cache_manager/meta/meta_dummy_backend.h"
 #include "kv_cache_manager/meta/meta_local_backend.h"
 #include "kv_cache_manager/meta/meta_redis_backend.h"
+#include "kv_cache_manager/meta/raft/meta_raft_backend.h"
 
 namespace kv_cache_manager {
 
@@ -43,9 +44,12 @@ MetaStorageBackendFactory::CreatePersistentBackend(const std::string &instance_i
         backend = std::make_unique<MetaAsyncRedisBackend>();
     } else if (storage_type == META_DUMMY_BACKEND_TYPE_STR) {
         backend = std::make_unique<MetaDummyBackend>();
+    } else if (storage_type == META_RAFT_BACKEND_TYPE_STR) {
+        backend = std::make_unique<raft_meta::MetaRaftBackend>();
     } else {
-        KVCM_LOG_ERROR("create persistent backend failed, unsupported type[%s], expect redis/async_redis or dummy",
-                       storage_type.c_str());
+        KVCM_LOG_ERROR(
+            "create persistent backend failed, unsupported type[%s], expect redis/async_redis/raft or dummy",
+            storage_type.c_str());
         return nullptr;
     }
     if (backend->Init(instance_id, config) != EC_OK) {

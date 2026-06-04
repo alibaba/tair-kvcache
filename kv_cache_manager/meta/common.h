@@ -9,6 +9,7 @@ static const std::string META_LOCAL_BACKEND_TYPE_STR = "local";
 static const std::string META_REDIS_BACKEND_TYPE_STR = "redis";
 static const std::string META_ASYNC_REDIS_BACKEND_TYPE_STR = "async_redis";
 static const std::string META_CACHED_BACKEND_TYPE_STR = "cached";
+static const std::string META_RAFT_BACKEND_TYPE_STR = "raft";
 
 static const std::string PROPERTY_INNER_PREFIX = "__";
 static const std::string LOCATION_PREFIX = "__loc__";

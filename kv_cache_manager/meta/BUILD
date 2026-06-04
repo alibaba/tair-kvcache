@@ -58,6 +58,7 @@ cc_library(
         "//kv_cache_manager/common",
         "//kv_cache_manager/common:utils",
         "//kv_cache_manager/config",
+        "//kv_cache_manager/meta/raft:meta_raft_backend",
     ],
 )
 
@@ -84,6 +85,7 @@ cc_library(
         "//kv_cache_manager/common:standard_uri",
         "//kv_cache_manager/common:timestamp_util",
         "//kv_cache_manager/config",
+        "//kv_cache_manager/meta/raft:meta_raft_backend",
         "//kv_cache_manager/metrics:metrics_collector",
     ],
 )
