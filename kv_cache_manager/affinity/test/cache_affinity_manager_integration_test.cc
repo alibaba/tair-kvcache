@@ -366,32 +366,34 @@ TEST_F(CacheAffinityManagerIntegrationTest, MultiCallerBothGetReplicationHints) 
     }
 }
 
-// ---------------------------------------------------------------------------
-// Test 7: Hint dedup — after hint emitted, sketch resets, must re-accumulate
-//
-// Verifies the dedup mechanism: hint fires once, sketch count resets to 0.
-// Subsequent reads must re-accumulate to threshold before another hint fires.
-// ---------------------------------------------------------------------------
-
-TEST_F(CacheAffinityManagerIntegrationTest, HintDedupRequiresReaccumulation) {
+TEST_F(CacheAffinityManagerIntegrationTest, HintDedupSuppressionWindow) {
     auto &mgr = NewManager();
-    ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonString(kFullStrategyJson));
+    ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonString(R"({
+        "type": "local_replica",
+        "read": {
+            "on_miss": {
+                "enabled": true,
+                "replication_hot_threshold": 3,
+                "suppression_window_ms": 60000
+            }
+        }
+    })"));
 
     mgr.UpsertNodeMetrics({"node_a", "node_a", 500000, 0.30, 0, 0, 1});
     mgr.UpsertNodeMetrics({"node_b", "node_b", 800000, 0.20, 0, 0, 1});
 
     AffinityResolveContext ctx;
     ctx.caller_node_id = "node_a";
-    ctx.trace_id = "dedup";
+    ctx.trace_id = "dedup-window";
 
     LocationSpec remote("tp0", "tair://node_b/block/55", "node_b");
     CacheLocation winner;
     winner.push_location_spec(LocationSpec("tp0", "tair://node_b/block/55", "node_b"));
 
-    // First round: 3 reads → hint on 3rd, sketch resets
     for (int i = 0; i < 2; ++i) {
         auto req = MakeRemoteReadRequest(55, &remote, &winner);
-        mgr.ResolveRead(req, ctx);
+        ReadDecision dec = mgr.ResolveRead(req, ctx);
+        EXPECT_TRUE(dec.side_effects.empty());
     }
     {
         auto req = MakeRemoteReadRequest(55, &remote, &winner);
@@ -399,25 +401,24 @@ TEST_F(CacheAffinityManagerIntegrationTest, HintDedupRequiresReaccumulation) {
         ASSERT_EQ(1u, dec.side_effects.size()) << "3rd read should trigger first hint";
     }
 
-    // Post-reset: next read count=1, no hint
-    {
+    for (int i = 0; i < 10; ++i) {
         auto req = MakeRemoteReadRequest(55, &remote, &winner);
         ReadDecision dec = mgr.ResolveRead(req, ctx);
-        EXPECT_TRUE(dec.side_effects.empty()) << "post-reset: count=1 < 3";
+        EXPECT_TRUE(dec.side_effects.empty()) << "read #" << (i + 4) << " within suppression window must not emit hint";
     }
 
-    // Second round: re-accumulate to threshold
-    // count=2 (no hint)
-    {
-        auto req = MakeRemoteReadRequest(55, &remote, &winner);
+    LocationSpec remote56("tp0", "tair://node_b/block/56", "node_b");
+    CacheLocation winner56;
+    winner56.push_location_spec(LocationSpec("tp0", "tair://node_b/block/56", "node_b"));
+    for (int i = 0; i < 2; ++i) {
+        auto req = MakeRemoteReadRequest(56, &remote56, &winner56);
         ReadDecision dec = mgr.ResolveRead(req, ctx);
-        EXPECT_TRUE(dec.side_effects.empty()) << "re-accumulate: count=2 < 3";
+        EXPECT_TRUE(dec.side_effects.empty());
     }
-    // count=3 → second hint
     {
-        auto req = MakeRemoteReadRequest(55, &remote, &winner);
+        auto req = MakeRemoteReadRequest(56, &remote56, &winner56);
         ReadDecision dec = mgr.ResolveRead(req, ctx);
-        ASSERT_EQ(1u, dec.side_effects.size()) << "re-accumulated to threshold, should hint again";
+        ASSERT_EQ(1u, dec.side_effects.size()) << "different block key: independent suppressor entry";
     }
 }
 

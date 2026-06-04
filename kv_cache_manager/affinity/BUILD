@@ -12,6 +12,7 @@ cc_library(
     deps = [
         ":affinity_strategy",
         ":frequency_sketch",
+        ":hint_suppressor",
         ":node_metrics",
         ":strategy_factory",
         "//kv_cache_manager/affinity/pipeline:candidate_pipeline",
@@ -44,6 +45,15 @@ cc_library(
     hdrs = ["frequency_sketch.h"],
 )
 
+cc_library(
+    name = "hint_suppressor",
+    srcs = ["hint_suppressor.cc"],
+    hdrs = ["hint_suppressor.h"],
+    deps = [
+        "//kv_cache_manager/common",
+    ],
+)
+
 # LocalReplicaAffinityStrategy: multi-replica strategy implementing
 # ResolveWrite / ResolveRead / ResolveEviction.
 cc_library(
@@ -53,6 +63,7 @@ cc_library(
     deps = [
         ":affinity_strategy",
         ":frequency_sketch",  # ResolveRead 内部需要 FrequencySketch 完整类型
+        ":hint_suppressor",
         "//kv_cache_manager/affinity/pipeline:candidate_pipeline",  # v0 5 段算法作 candidate_pipeline 实现
     ],
 )
@@ -64,6 +75,7 @@ cc_library(
     hdrs = ["strategy_factory.h"],
     deps = [
         ":affinity_strategy",
+        ":hint_suppressor",
         ":local_replica_strategy",
         "//kv_cache_manager/affinity/pipeline:candidate_pipeline",  # 解析 5 段流水线
         "//kv_cache_manager/common",
