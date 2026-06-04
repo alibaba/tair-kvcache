@@ -368,7 +368,7 @@ message StartWriteCacheRequest {
     //   true  = replication write: dedup only on caller node, strict=true
     // Server derives the strict parameter from this flag automatically.
     bool is_replication = 8;
-}}
+}
 
 message StartWriteCacheResponse {
     CommonResponseHeader header = 1;
