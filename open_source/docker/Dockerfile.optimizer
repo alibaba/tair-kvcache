@@ -1,0 +1,24 @@
+FROM alibaba-cloud-linux-3-registry.cn-hangzhou.cr.aliyuncs.com/alinux3/alinux3:latest
+
+ARG BINARY_PACKAGE_TAR
+
+LABEL org.opencontainers.image.source=https://github.com/alibaba/tair-kvcache
+LABEL org.opencontainers.image.description="Tair KVCache Online Optimizer Production Container"
+LABEL org.opencontainers.image.licenses=Apache-2.0
+
+USER root
+
+RUN sed -i.bak 's|http://mirrors\.cloud\.aliyuncs\.com|http://mirrors.aliyun.com|g' /etc/yum.repos.d/*.repo && \
+    yum install -y --setopt=timeout=3 procps-ng iproute tar && \
+    yum clean all && \
+    rm -rf /var/cache/yum
+
+RUN mkdir -p /home/admin/online_optimizer
+
+COPY $BINARY_PACKAGE_TAR /home/admin/online_optimizer/$BINARY_PACKAGE_TAR
+
+RUN cd /home/admin/online_optimizer && tar -zxvf $BINARY_PACKAGE_TAR
+
+ENTRYPOINT ["/home/admin/online_optimizer/bin/start_optimizer_server.sh"]
+
+RUN echo "****** Tair KVCache Online Optimizer Production Image Ready ******"
