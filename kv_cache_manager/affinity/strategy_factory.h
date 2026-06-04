@@ -16,14 +16,17 @@
 namespace kv_cache_manager {
 
 class FrequencySketch;
+class HintSuppressor;
 
 class StrategyFactory {
 public:
     // 解析顶层 JSON。失败时返回 nullptr 并填 error_msg（非空时）。
-    // sketch：manager 持有的频率反馈机制层，构造期注入需要它的算法
-    //         （如 LocalReplica）；不需要的算法忽略。可空。
-    static std::shared_ptr<AffinityStrategy>
-    ParseJsonString(const std::string &json, FrequencySketch *sketch = nullptr, std::string *error_msg = nullptr);
+    // sketch / suppressor：由 manager 持有，注入需要它们的算法（如
+    // LocalReplica）；不需要的算法忽略。可空。
+    static std::shared_ptr<AffinityStrategy> ParseJsonString(const std::string &json,
+                                                             FrequencySketch *sketch = nullptr,
+                                                             HintSuppressor *suppressor = nullptr,
+                                                             std::string *error_msg = nullptr);
 };
 
 } // namespace kv_cache_manager

@@ -26,7 +26,7 @@ void SetError(std::string *out, std::string msg) {
 
 bool CacheAffinityManager::LoadProcessStrategyFromJsonString(const std::string &json, std::string *error_msg) {
     std::string aff_err;
-    auto aff = StrategyFactory::ParseJsonString(json, &sketch_, &aff_err);
+    auto aff = StrategyFactory::ParseJsonString(json, &sketch_, &suppressor_, &aff_err);
     if (!aff) {
         if (error_msg != nullptr) {
             *error_msg = aff_err.empty() ? std::string("strategy json parse failed") : aff_err;
@@ -74,7 +74,7 @@ std::shared_ptr<AffinityStrategy> CacheAffinityManager::ParseOrCacheAffinityLock
     if (it != affinity_strategy_cache_.end()) {
         return it->second;
     }
-    auto parsed = StrategyFactory::ParseJsonString(json, &sketch_, nullptr);
+    auto parsed = StrategyFactory::ParseJsonString(json, &sketch_, &suppressor_, nullptr);
     if (!parsed) {
         return nullptr;
     }

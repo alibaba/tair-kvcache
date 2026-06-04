@@ -9,8 +9,8 @@ cc_test(
     deps = [
         "//kv_cache_manager/affinity",
         "//kv_cache_manager/affinity:node_metrics",
-        "//kv_cache_manager/affinity/pipeline:filter_cond",
         "//kv_cache_manager/affinity/pipeline:candidate_pipeline",
+        "//kv_cache_manager/affinity/pipeline:filter_cond",
         "//kv_cache_manager/common",
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/data_storage:common_define",
@@ -35,12 +35,12 @@ cc_test(
     copts = ["-fno-access-control"],
     deps = [
         "//kv_cache_manager/affinity:frequency_sketch",
+        "//kv_cache_manager/affinity:hint_suppressor",
         "//kv_cache_manager/affinity:local_replica_strategy",
         "//kv_cache_manager/affinity/pipeline:candidate_pipeline",
         "//kv_cache_manager/common:unittest",
     ],
 )
-
 
 cc_test(
     name = "CacheAffinityManagerStrategyTest",
@@ -60,6 +60,16 @@ cc_test(
     copts = ["-fno-access-control"],
     deps = [
         "//kv_cache_manager/affinity:frequency_sketch",
+        "//kv_cache_manager/common:unittest",
+    ],
+)
+
+cc_test(
+    name = "HintSuppressorTest",
+    srcs = ["hint_suppressor_test.cc"],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/affinity:hint_suppressor",
         "//kv_cache_manager/common:unittest",
     ],
 )
