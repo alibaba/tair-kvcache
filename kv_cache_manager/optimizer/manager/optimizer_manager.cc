@@ -223,17 +223,14 @@ WriteCacheRes OptimizerManager::WriteCacheWithTtlUs(const std::string &instance_
                                                     const std::string &trace_id,
                                                     const int64_t timestamp,
                                                     const std::vector<int64_t> &block_ids,
-                                                    const int64_t ttl_us,
-                                                    bool touch_existing,
-                                                    bool count_new_tier_write_touch) {
+                                                    const int64_t ttl_us) {
     WriteCacheSchemaTrace trace;
     trace.set_instance_id(instance_id);
     trace.set_trace_id(trace_id);
     trace.set_timestamp_ns(timestamp);
     trace.set_keys(block_ids);
     trace.set_ttl_us(ttl_us);
-    const auto write_record =
-        optimizer_runner_->HandleWriteCache(trace, touch_existing, nullptr, count_new_tier_write_touch);
+    const auto write_record = optimizer_runner_->HandleWriteCache(trace);
     stats_collector_->UpdateTimestamp(instance_id, timestamp);
 
     WriteCacheRes res;
@@ -243,35 +240,32 @@ WriteCacheRes OptimizerManager::WriteCacheWithTtlUs(const std::string &instance_
     res.kvcm_write_length = write_record.newly_inserted_blocks;
     // write_hit = 请求写入数 - 实际新插入数（即已存在、未被驱逐的 block 数）
     res.kvcm_write_hit_length = write_record.write_blocks - write_record.newly_inserted_blocks;
-    res.pool_source_write_sequences = write_record.pool_source_write_sequences;
-    res.evicted_materialized_sequences = write_record.evicted_materialized_sequences;
+    res.pool_source_write_keys = write_record.pool_source_write_keys;
+    res.evicted_keys = write_record.evicted_keys;
     return res;
 }
 
-WriteCacheRes OptimizerManager::WriteCacheWithMaterializedIndices(const std::string &instance_id,
-                                                                  const std::string &trace_id,
-                                                                  const int64_t timestamp,
-                                                                  const std::vector<int64_t> &block_ids,
-                                                                  const std::vector<size_t> &materialized_indices,
-                                                                  const int64_t ttl_us,
-                                                                  bool touch_existing,
-                                                                  bool count_new_tier_write_touch) {
+WriteCacheRes OptimizerManager::FillCachePathWithTtlUs(const std::string &instance_id,
+                                                       const std::string &trace_id,
+                                                       const int64_t timestamp,
+                                                       const std::vector<int64_t> &block_ids,
+                                                       const std::vector<size_t> &materialized_indices,
+                                                       const int64_t ttl_us) {
     WriteCacheSchemaTrace trace;
     trace.set_instance_id(instance_id);
     trace.set_trace_id(trace_id);
     trace.set_timestamp_ns(timestamp);
     trace.set_keys(block_ids);
     trace.set_ttl_us(ttl_us);
-    const auto write_record =
-        optimizer_runner_->HandleWriteCache(trace, touch_existing, &materialized_indices, count_new_tier_write_touch);
+    const auto write_record = optimizer_runner_->HandleFillCachePath(trace, materialized_indices);
     stats_collector_->UpdateTimestamp(instance_id, timestamp);
 
     WriteCacheRes res;
     res.trace_id = trace_id;
     res.kvcm_write_length = write_record.newly_inserted_blocks;
     res.kvcm_write_hit_length = write_record.write_blocks - write_record.newly_inserted_blocks;
-    res.pool_source_write_sequences = write_record.pool_source_write_sequences;
-    res.evicted_materialized_sequences = write_record.evicted_materialized_sequences;
+    res.pool_source_write_keys = write_record.pool_source_write_keys;
+    res.evicted_keys = write_record.evicted_keys;
     return res;
 }
 
@@ -282,13 +276,15 @@ GetCacheLocationRes OptimizerManager::GetCacheLocation(const std::string &instan
                                                        const BlockMask &block_mask,
                                                        const int64_t input_len,
                                                        bool touch_local_hits,
-                                                       bool local_hits_are_reads) {
+                                                       bool local_hits_are_reads,
+                                                       const std::string &query_type) {
     GetLocationSchemaTrace trace;
     trace.set_instance_id(instance_id);
     trace.set_trace_id(trace_id);
     trace.set_timestamp_ns(timestamp);
     trace.set_keys(block_ids);
     trace.set_input_len(RequirePositiveInputLen("GetCacheLocation", input_len));
+    trace.set_query_type(query_type);
     trace.set_block_mask(block_mask);
     const auto read_record = optimizer_runner_->HandleGetLocation(trace, touch_local_hits, local_hits_are_reads);
     stats_collector_->UpdateTimestamp(instance_id, timestamp);
@@ -296,14 +292,16 @@ GetCacheLocationRes OptimizerManager::GetCacheLocation(const std::string &instan
     GetCacheLocationRes res;
     res.trace_id = trace_id;
     res.kvcm_hit_length = 0;
-
-    const auto *last_read = hit_rate_tracker_->LastReadRecord(instance_id);
-    if (last_read) {
-        res.kvcm_hit_length = (hit_rate_perspective_ == HitRatePerspective::ENGINE_LOCAL)
-                                  ? last_read->local_hit_blocks
-                                  : last_read->remote_hit_blocks;
+    if (hit_rate_perspective_ == HitRatePerspective::ENGINE_LOCAL) {
+        res.kvcm_hit_length = read_record.local_hit_blocks + read_record.remote_hit_blocks;
+        res.hit_indices = read_record.local_hit_indices;
+        res.hit_indices.insert(
+            res.hit_indices.end(), read_record.remote_hit_indices.begin(), read_record.remote_hit_indices.end());
+    } else {
+        res.kvcm_hit_length = read_record.remote_hit_blocks;
+        res.hit_indices = read_record.remote_hit_indices;
     }
-    res.evicted_materialized_sequences = read_record.evicted_materialized_sequences;
+    res.evicted_keys = read_record.evicted_keys;
     return res;
 }
 
@@ -317,15 +315,15 @@ size_t OptimizerManager::PrefixMatchCount(const std::string &instance_id,
     return indexer->PrefixMatchCount(block_ids, timestamp);
 }
 
-std::vector<size_t> OptimizerManager::PoolSourceWriteTouchIndicesAtLeast(const std::string &instance_id,
-                                                                         const std::vector<int64_t> &block_ids,
-                                                                         size_t threshold,
-                                                                         int64_t timestamp) const {
+std::vector<int64_t> OptimizerManager::PoolSourceWriteTouchKeysAtLeast(const std::string &instance_id,
+                                                                       const std::vector<int64_t> &block_ids,
+                                                                       size_t threshold,
+                                                                       int64_t timestamp) const {
     auto indexer = indexer_manager_ ? indexer_manager_->GetOptIndexer(instance_id) : nullptr;
     if (!indexer) {
         return {};
     }
-    return indexer->PoolSourceWriteTouchIndicesAtLeast(block_ids, threshold, timestamp);
+    return indexer->PoolSourceWriteTouchKeysAtLeast(block_ids, threshold, timestamp);
 }
 
 void OptimizerManager::AnalyzeResults() {

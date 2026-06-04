@@ -7,12 +7,6 @@ namespace {
 
 constexpr double kBytesPerGb = static_cast<double>(1LL << 30);
 
-struct JsonAccess : public Jsonizable {
-    using Jsonizable::Get;
-    using Jsonizable::Put;
-    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override { (void)writer; }
-};
-
 int64_t GbToBytes(double gb) { return static_cast<int64_t>(gb * kBytesPerGb); }
 
 std::string JoinPath(const std::string &base, const std::string &name) {
@@ -44,30 +38,8 @@ OptInstanceConfig BuildOptimizerInstance(const std::string &instance_id,
     return instance;
 }
 
-bool ParseStoragePoolConfig(const rapidjson::Value &rapid_value,
-                            const std::string &trace_file_path,
-                            OptimizerConfig &config) {
-    std::string output_result_path;
-    EvictionConfig eviction_config;
-    std::vector<OptInstanceGroupConfig> instance_groups;
-    if (!JsonAccess::Get(rapid_value, "output_result_path", output_result_path) ||
-        !JsonAccess::Get(rapid_value, "eviction_params", eviction_config) ||
-        !JsonAccess::Get(rapid_value, "instance_groups", instance_groups)) {
-        return false;
-    }
-    config.set_trace_file_path(trace_file_path);
-    config.set_output_result_path(output_result_path);
-    config.set_eviction_params(eviction_config);
-    config.set_instance_groups(instance_groups);
-    return true;
-}
-
-void WriteStoragePoolConfig(rapidjson::Writer<rapidjson::StringBuffer> &writer, const OptimizerConfig &config) {
-    writer.StartObject();
-    JsonAccess::Put(writer, "output_result_path", config.output_result_path());
-    JsonAccess::Put(writer, "eviction_params", config.eviction_config());
-    JsonAccess::Put(writer, "instance_groups", config.instance_groups());
-    writer.EndObject();
+bool IsEngineReadQueryTypeValid(const std::string &query_type) {
+    return query_type == "prefix_match" || query_type == "batch_get";
 }
 
 } // namespace
@@ -85,7 +57,6 @@ bool StoragePoolFlowConfig::FromRapidValue(const rapidjson::Value &rapid_value) 
 
     KVCM_JSON_GET_MACRO(rapid_value, "local_read_touch_enabled", local_read_touch_enabled_);
     KVCM_JSON_GET_MACRO(rapid_value, "shadow_write_touch_enabled", shadow_write_touch_enabled_);
-    KVCM_JSON_GET_MACRO(rapid_value, "promote_enabled", promote_enabled_);
 
     int64_t threshold = 0;
     KVCM_JSON_GET_MACRO(rapid_value, "selective_write_threshold", threshold);
@@ -100,21 +71,23 @@ void StoragePoolFlowConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuf
     Put(writer, "write_mode", ToString(write_mode_));
     Put(writer, "local_read_touch_enabled", local_read_touch_enabled_);
     Put(writer, "shadow_write_touch_enabled", shadow_write_touch_enabled_);
-    Put(writer, "promote_enabled", promote_enabled_);
     Put(writer, "selective_write_threshold", static_cast<int64_t>(selective_write_threshold_));
 }
 
 bool EngineToStoragePoolMappingConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
     KVCM_JSON_GET_MACRO(rapid_value, "engine_instance_id", engine_instance_id_);
-    KVCM_JSON_GET_MACRO(rapid_value, "storage_pool_instance_id", storage_pool_instance_id_);
+    KVCM_JSON_GET_MACRO(rapid_value, "storage_pool_id", storage_pool_id_);
+    KVCM_JSON_GET_MACRO(rapid_value, "engine_read_query_type", engine_read_query_type_);
     KVCM_JSON_GET_MACRO(rapid_value, "storage_pool_flow", storage_pool_flow_);
-    return !engine_instance_id_.empty() && !storage_pool_instance_id_.empty();
+    return !engine_instance_id_.empty() && !storage_pool_id_.empty() &&
+           IsEngineReadQueryTypeValid(engine_read_query_type_);
 }
 
 void EngineToStoragePoolMappingConfig::ToRapidWriter(
     rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
     Put(writer, "engine_instance_id", engine_instance_id_);
-    Put(writer, "storage_pool_instance_id", storage_pool_instance_id_);
+    Put(writer, "storage_pool_id", storage_pool_id_);
+    Put(writer, "engine_read_query_type", engine_read_query_type_);
     Put(writer, "storage_pool_flow", storage_pool_flow_);
 }
 
@@ -172,19 +145,53 @@ void HierarchicalTierConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBu
     Put(writer, "capacity", capacity_);
 }
 
+bool HierarchicalStoragePoolEntryConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
+    KVCM_JSON_GET_MACRO(rapid_value, "pool_id", pool_id_);
+    KVCM_JSON_GET_MACRO(rapid_value, "model", model_);
+    return !pool_id_.empty();
+}
+
+void HierarchicalStoragePoolEntryConfig::ToRapidWriter(
+    rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
+    Put(writer, "pool_id", pool_id_);
+    Put(writer, "model", model_);
+}
+
+bool HierarchicalStoragePoolConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
+    KVCM_JSON_GET_MACRO(rapid_value, "output_result_path", output_result_path_);
+    KVCM_JSON_GET_MACRO(rapid_value, "storage_name", storage_name_);
+    KVCM_JSON_GET_MACRO(rapid_value, "capacity", capacity_);
+    KVCM_JSON_GET_MACRO(rapid_value, "eviction_params", eviction_config_);
+    KVCM_JSON_GET_MACRO(rapid_value, "ttl_config", ttl_config_);
+    KVCM_JSON_GET_MACRO(rapid_value, "pools", pools_);
+    return !output_result_path_.empty() && !storage_name_.empty() && capacity_ > 0.0 && !pools_.empty();
+}
+
+void HierarchicalStoragePoolConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
+    Put(writer, "output_result_path", output_result_path_);
+    Put(writer, "storage_name", storage_name_);
+    Put(writer, "capacity", capacity_);
+    Put(writer, "eviction_params", eviction_config_);
+    Put(writer, "ttl_config", ttl_config_);
+    Put(writer, "pools", pools_);
+}
+
 bool InferClusterConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
-    KVCM_JSON_GET_MACRO(rapid_value, "storage_pool_instance_id", storage_pool_instance_id_);
+    KVCM_JSON_GET_MACRO(rapid_value, "storage_pool_id", storage_pool_id_);
+    KVCM_JSON_GET_MACRO(rapid_value, "engine_read_query_type", engine_read_query_type_);
     KVCM_JSON_GET_MACRO(rapid_value, "model", model_);
     KVCM_JSON_GET_MACRO(rapid_value, "infer_ids", infer_ids_);
     KVCM_JSON_GET_MACRO(rapid_value, "ttl_config", ttl_config_);
     KVCM_JSON_GET_MACRO(rapid_value, "tiers", tiers_);
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "tier_flows", tier_flows_, std::vector<OptTierFlowConfig>{});
     KVCM_JSON_GET_MACRO(rapid_value, "storage_pool_flow", storage_pool_flow_);
-    return !storage_pool_instance_id_.empty() && !infer_ids_.empty() && !tiers_.empty();
+    return !storage_pool_id_.empty() && IsEngineReadQueryTypeValid(engine_read_query_type_) && !infer_ids_.empty() &&
+           !tiers_.empty();
 }
 
 void InferClusterConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
-    Put(writer, "storage_pool_instance_id", storage_pool_instance_id_);
+    Put(writer, "storage_pool_id", storage_pool_id_);
+    Put(writer, "engine_read_query_type", engine_read_query_type_);
     Put(writer, "model", model_);
     Put(writer, "infer_ids", infer_ids_);
     Put(writer, "ttl_config", ttl_config_);
@@ -207,10 +214,7 @@ bool HierarchicalReplayConfig::FromRapidValue(const rapidjson::Value &rapid_valu
         }
     }
     KVCM_JSON_GET_MACRO(rapid_value, "infer_clusters", infer_clusters_);
-    if (!rapid_value.HasMember("storage_pool_config") ||
-        !ParseStoragePoolConfig(rapid_value["storage_pool_config"], trace_file_path_, storage_pool_config_)) {
-        return false;
-    }
+    KVCM_JSON_GET_MACRO(rapid_value, "storage_pool", storage_pool_);
     KVCM_JSON_GET_DEFAULT_MACRO(
         rapid_value, "infer_scheduling_strategy", infer_scheduling_strategy_, std::string("preserve_trace"));
     if (infer_scheduling_strategy_ != "preserve_trace" && infer_scheduling_strategy_ != "round_robin" &&
@@ -230,17 +234,14 @@ void HierarchicalReplayConfig::ToRapidWriter(rapidjson::Writer<rapidjson::String
     Put(writer, "infer_scheduling_strategy", infer_scheduling_strategy_);
     Put(writer, "enable_lifecycle_tracking", enable_lifecycle_tracking_);
     Put(writer, "infer_clusters", infer_clusters_);
-    writer.Key("storage_pool_config");
-    WriteStoragePoolConfig(writer, storage_pool_config_);
+    Put(writer, "storage_pool", storage_pool_);
 }
 
 bool HierarchicalReplayConfig::BuildOptimizerConfigs() {
     std::unordered_set<std::string> pool_ids;
-    for (const auto &group : storage_pool_config_.instance_groups()) {
-        for (const auto &instance : group.instances()) {
-            if (!pool_ids.insert(instance.instance_id()).second) {
-                return false;
-            }
+    for (const auto &pool : storage_pool_.pools()) {
+        if (!pool_ids.insert(pool.pool_id()).second) {
+            return false;
         }
     }
     if (pool_ids.empty()) {
@@ -257,7 +258,7 @@ bool HierarchicalReplayConfig::BuildOptimizerConfigs() {
     engine_to_storage_pool_.clear();
     std::unordered_set<std::string> engine_ids;
     for (const auto &infer_group : infer_clusters_) {
-        if (pool_ids.find(infer_group.storage_pool_instance_id()) == pool_ids.end()) {
+        if (pool_ids.find(infer_group.storage_pool_id()) == pool_ids.end()) {
             return false;
         }
 
@@ -292,7 +293,8 @@ bool HierarchicalReplayConfig::BuildOptimizerConfigs() {
 
             EngineToStoragePoolMappingConfig mapping;
             mapping.set_engine_instance_id(infer_id);
-            mapping.set_storage_pool_instance_id(infer_group.storage_pool_instance_id());
+            mapping.set_storage_pool_id(infer_group.storage_pool_id());
+            mapping.set_engine_read_query_type(infer_group.engine_read_query_type());
             mapping.set_storage_pool_flow(infer_group.storage_pool_flow());
             engine_to_storage_pool_.push_back(mapping);
         }

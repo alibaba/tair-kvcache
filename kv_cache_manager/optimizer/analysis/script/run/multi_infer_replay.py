@@ -65,7 +65,7 @@ def _parse_tier_flow_config_arg(parser, raw_value):
             parser.error(f"--tier-flow-config[{idx}] must contain non-empty to_tier")
         if flow.get("write_mode") not in valid_write_modes:
             parser.error(f"--tier-flow-config[{idx}].write_mode must be one of {sorted(valid_write_modes)}")
-        for bool_key in ("access_propagation_enabled", "write_propagation_enabled", "promote_enabled"):
+        for bool_key in ("access_propagation_enabled", "write_propagation_enabled"):
             if type(flow.get(bool_key)) is not bool:
                 parser.error(f"--tier-flow-config[{idx}].{bool_key} must be a boolean")
         threshold = flow.get("selective_write_threshold")

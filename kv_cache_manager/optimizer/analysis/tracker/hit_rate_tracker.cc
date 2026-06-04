@@ -57,6 +57,9 @@ ReadRecord HitRateTracker::NormalizeReadRecord(const ReadRecord &record) const {
     normalized.remote_read_blocks = 0;
     normalized.local_hit_blocks = record.local_hit_blocks + record.remote_hit_blocks;
     normalized.remote_hit_blocks = 0;
+    normalized.local_hit_indices.insert(
+        normalized.local_hit_indices.end(), record.remote_hit_indices.begin(), record.remote_hit_indices.end());
+    normalized.remote_hit_indices.clear();
     return normalized;
 }
 

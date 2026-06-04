@@ -34,10 +34,9 @@ public:
     ReadRecord HandleGetLocation(const GetLocationSchemaTrace &trace,
                                  bool touch_local_hits = true,
                                  bool local_hits_are_reads = true);
-    WriteRecord HandleWriteCache(const WriteCacheSchemaTrace &trace,
-                                 bool touch_existing = true,
-                                 const std::vector<size_t> *materialized_indices = nullptr,
-                                 bool count_new_tier_write_touch = true);
+    WriteRecord HandleWriteCache(const WriteCacheSchemaTrace &trace);
+    WriteRecord HandleFillCachePath(const WriteCacheSchemaTrace &trace,
+                                    const std::vector<size_t> &materialized_indices);
 
 private:
     struct PendingWrite {
@@ -62,6 +61,9 @@ private:
     void FlushPendingWritesThrough(int64_t timestamp_ns);
     void FlushAllPendingWrites();
     void RunPendingWrite(const WriteCacheSchemaTrace &trace);
+    WriteRecord HandleCacheInsert(const WriteCacheSchemaTrace &trace,
+                                  bool count_new_tier_write_touch,
+                                  const std::vector<size_t> *materialized_indices);
     ReadRecord SubmitReadRecord(const std::string &instance_id,
                                 const std::string &trace_id,
                                 const std::vector<int64_t> &keys,

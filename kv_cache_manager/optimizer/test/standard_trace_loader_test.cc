@@ -63,6 +63,20 @@ TEST_F(StandardTraceLoaderTest, ParsesRequestRows) {
     EXPECT_EQ(request_trace->ttl_us(), 100);
 }
 
+TEST_F(StandardTraceLoaderTest, ParsesBatchGetQueryType) {
+    const std::string path = GetTestTempRootPath() + "/batch_get_trace.jsonl";
+    std::ofstream out(path);
+    out << R"({"type":"get","instance_id":"instance-a","trace_id":"batch-get","timestamp_ns":1000,"keys":[1,2],"input_len":128,"query_type":"batch_get","block_mask":[]})"
+        << "\n";
+    out.close();
+
+    const auto traces = StandardTraceLoader::LoadFromFile(path);
+    ASSERT_EQ(traces.size(), 1);
+    auto get_trace = std::dynamic_pointer_cast<GetLocationSchemaTrace>(traces[0]);
+    ASSERT_NE(get_trace, nullptr);
+    EXPECT_EQ(get_trace->query_type(), "batch_get");
+}
+
 TEST_F(StandardTraceLoaderTest, MapsFullRangeUint64KeysToStableInt64Values) {
     const std::string path = GetTestTempRootPath() + "/uint64_keys_trace.jsonl";
     std::ofstream out(path);

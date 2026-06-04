@@ -75,7 +75,6 @@ bool OptTierFlowConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
     write_mode_ = ToTierWriteMode(write_mode_str);
     KVCM_JSON_GET_MACRO(rapid_value, "access_propagation_enabled", access_propagation_enabled_);
     KVCM_JSON_GET_MACRO(rapid_value, "write_propagation_enabled", write_propagation_enabled_);
-    KVCM_JSON_GET_MACRO(rapid_value, "promote_enabled", promote_enabled_);
     KVCM_JSON_GET_MACRO(rapid_value, "selective_write_threshold", selective_write_threshold_);
     if (selective_write_threshold_ <= 0) {
         KVCM_LOG_ERROR("tier_flows edge %s->%s has invalid selective_write_threshold: %lld",
@@ -93,7 +92,6 @@ void OptTierFlowConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer>
     Put(writer, "write_mode", ToString(write_mode_));
     Put(writer, "access_propagation_enabled", access_propagation_enabled_);
     Put(writer, "write_propagation_enabled", write_propagation_enabled_);
-    Put(writer, "promote_enabled", promote_enabled_);
     Put(writer, "selective_write_threshold", selective_write_threshold_);
 }
 
@@ -102,7 +100,6 @@ TierFlowStrategy OptTierFlowConfig::Resolve(const TierFlowStrategy &default_stra
     strategy.write_mode = write_mode_;
     strategy.access_propagation_enabled = access_propagation_enabled_;
     strategy.write_propagation_enabled = write_propagation_enabled_;
-    strategy.promote_enabled = promote_enabled_;
     strategy.selective_write_threshold = static_cast<size_t>(selective_write_threshold_);
     return strategy;
 }
@@ -116,7 +113,6 @@ OptTierFlowPolicyConfig OptTierFlowPolicyConfig::FromTierFlows(const std::vector
         policy.set_write_mode(flows.front().write_mode());
         policy.set_access_propagation_enabled(flows.front().access_propagation_enabled());
         policy.set_write_propagation_enabled(flows.front().write_propagation_enabled());
-        policy.set_promote_enabled(flows.front().promote_enabled());
         policy.set_selective_write_threshold(flows.front().selective_write_threshold());
     }
     return policy;
@@ -127,7 +123,6 @@ TierFlowStrategy OptTierFlowPolicyConfig::DefaultFlowStrategy() const {
     strategy.write_mode = write_mode_;
     strategy.access_propagation_enabled = access_propagation_enabled_;
     strategy.write_propagation_enabled = write_propagation_enabled_;
-    strategy.promote_enabled = promote_enabled_;
     strategy.selective_write_threshold = static_cast<size_t>(selective_write_threshold_);
     return strategy;
 }

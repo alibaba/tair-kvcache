@@ -39,7 +39,6 @@ struct TierFlowStrategy {
     TierWriteMode write_mode = TierWriteMode::WRITE_THROUGH;
     bool access_propagation_enabled = true;
     bool write_propagation_enabled = false;
-    bool promote_enabled = false;
     size_t selective_write_threshold = 2;
 };
 struct TierStat {
@@ -107,11 +106,8 @@ struct QueryHit {
     size_t local_hit_block_num = 0;
     size_t remote_hit_block_num = 0;
     std::vector<size_t> per_tier_hit_block_num; // indexed by tier order
-};
-
-struct MaterializedKeySequence {
-    std::vector<int64_t> keys;
-    std::vector<size_t> materialized_indices;
+    std::vector<size_t> local_hit_indices;
+    std::vector<size_t> remote_hit_indices;
 };
 
 EvictionPolicyType ToEvictionPolicyType(const std::string &str);

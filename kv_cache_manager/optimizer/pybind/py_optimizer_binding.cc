@@ -62,7 +62,8 @@ PYBIND11_MODULE(kvcm_py_optimizer, module) {
     // 绑定insight_simulator_types.h中的结构体
     py::class_<kvcm::GetCacheLocationRes>(module, "GetCacheLocationRes")
         .def_readonly("trace_id", &kvcm::GetCacheLocationRes::trace_id)
-        .def_readonly("kvcm_hit_length", &kvcm::GetCacheLocationRes::kvcm_hit_length);
+        .def_readonly("kvcm_hit_length", &kvcm::GetCacheLocationRes::kvcm_hit_length)
+        .def_readonly("hit_indices", &kvcm::GetCacheLocationRes::hit_indices);
 
     py::class_<kvcm::WriteCacheRes>(module, "WriteCacheRes")
         .def_readonly("trace_id", &kvcm::WriteCacheRes::trace_id)
@@ -147,7 +148,8 @@ PYBIND11_MODULE(kvcm_py_optimizer, module) {
                const int64_t timestamp,
                const std::vector<int64_t> &block_ids,
                const py::object &block_mask_obj,
-               const int64_t input_len) {
+               const int64_t input_len,
+               const std::string &query_type) {
                 kvcm::BlockMask block_mask;
                 if (py::isinstance<std::vector<bool>>(block_mask_obj)) {
                     block_mask = block_mask_obj.cast<std::vector<bool>>();
@@ -156,7 +158,8 @@ PYBIND11_MODULE(kvcm_py_optimizer, module) {
                 } else {
                     throw std::invalid_argument("block_mask must be either a list of bools or an integer bitmask.");
                 }
-                return self.GetCacheLocation(instance_id, trace_id, timestamp, block_ids, block_mask, input_len);
+                return self.GetCacheLocation(
+                    instance_id, trace_id, timestamp, block_ids, block_mask, input_len, true, true, query_type);
             },
             py::call_guard<py::gil_scoped_release>(),
             py::arg("instance_id"),
@@ -164,7 +167,8 @@ PYBIND11_MODULE(kvcm_py_optimizer, module) {
             py::arg("timestamp"),
             py::arg("block_ids"),
             py::arg("block_mask"),
-            py::arg("input_len"))
+            py::arg("input_len"),
+            py::arg("query_type") = "prefix_match")
         .def("ClearCache",
              &kvcm::OptimizerManager::ClearCache,
              py::call_guard<py::gil_scoped_release>(),

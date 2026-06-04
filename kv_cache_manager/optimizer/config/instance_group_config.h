@@ -21,7 +21,6 @@ public:
     [[nodiscard]] TierWriteMode write_mode() const { return write_mode_; }
     [[nodiscard]] bool access_propagation_enabled() const { return access_propagation_enabled_; }
     [[nodiscard]] bool write_propagation_enabled() const { return write_propagation_enabled_; }
-    [[nodiscard]] bool promote_enabled() const { return promote_enabled_; }
     [[nodiscard]] int64_t selective_write_threshold() const { return selective_write_threshold_; }
     [[nodiscard]] TierFlowStrategy Resolve(const TierFlowStrategy &default_strategy) const;
 
@@ -31,7 +30,6 @@ private:
     TierWriteMode write_mode_ = TierWriteMode::WRITE_THROUGH;
     bool access_propagation_enabled_ = true;
     bool write_propagation_enabled_ = false;
-    bool promote_enabled_ = true;
     int64_t selective_write_threshold_ = 2;
 };
 
@@ -47,7 +45,6 @@ public:
     [[nodiscard]] TierWriteMode write_mode() const { return write_mode_; }
     [[nodiscard]] bool access_propagation_enabled() const { return access_propagation_enabled_; }
     [[nodiscard]] bool write_propagation_enabled() const { return write_propagation_enabled_; }
-    [[nodiscard]] bool promote_enabled() const { return promote_enabled_; }
     [[nodiscard]] int64_t selective_write_threshold() const { return selective_write_threshold_; }
     [[nodiscard]] const std::vector<OptTierFlowConfig> &tier_flows() const { return tier_flows_; }
     [[nodiscard]] std::vector<TierFlowStrategy> BuildFlowStrategies(const std::vector<OptTierConfig> &storages) const;
@@ -57,7 +54,6 @@ public:
     void set_write_mode(TierWriteMode mode) { write_mode_ = mode; }
     void set_access_propagation_enabled(bool enabled) { access_propagation_enabled_ = enabled; }
     void set_write_propagation_enabled(bool enabled) { write_propagation_enabled_ = enabled; }
-    void set_promote_enabled(bool enabled) { promote_enabled_ = enabled; }
     void set_selective_write_threshold(int64_t threshold) { selective_write_threshold_ = threshold; }
     void set_tier_flows(const std::vector<OptTierFlowConfig> &flows) { tier_flows_ = flows; }
 
@@ -70,7 +66,6 @@ private:
     TierWriteMode write_mode_ = TierWriteMode::WRITE_THROUGH;
     bool access_propagation_enabled_ = true;
     bool write_propagation_enabled_ = false;
-    bool promote_enabled_ = true;
     int64_t selective_write_threshold_ = 2;
     std::vector<OptTierFlowConfig> tier_flows_;
 };
@@ -112,7 +107,6 @@ public:
     [[nodiscard]] bool tier_access_propagation_enabled() const {
         return tier_flow_policy_.access_propagation_enabled();
     }
-    [[nodiscard]] bool enable_promote() const { return tier_flow_policy_.promote_enabled(); }
     [[nodiscard]] int64_t selective_write_threshold() const { return tier_flow_policy_.selective_write_threshold(); }
     [[nodiscard]] std::vector<TierFlowStrategy> tier_flow_strategies() const {
         return tier_flow_policy_.BuildFlowStrategies(storages_);
@@ -135,7 +129,6 @@ public:
     void set_tier_access_propagation_enabled(bool enabled) {
         tier_flow_policy_.set_access_propagation_enabled(enabled);
     }
-    void set_enable_promote(bool enable) { tier_flow_policy_.set_promote_enabled(enable); }
     void set_selective_write_threshold(int64_t threshold) {
         tier_flow_policy_.set_selective_write_threshold(threshold);
     }

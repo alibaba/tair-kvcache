@@ -2,11 +2,21 @@
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 #include "kv_cache_manager/common/jsonizable.h"
 #include "kv_cache_manager/meta/cache_location.h"
 
 namespace kv_cache_manager {
+inline bool IsPrefixMatchQueryType(const std::string &query_type) { return query_type == "prefix_match"; }
+
+inline bool IsBatchGetQueryType(const std::string &query_type) { return query_type == "batch_get"; }
+
+inline bool IsSupportedQueryType(const std::string &query_type) {
+    return IsPrefixMatchQueryType(query_type) || IsBatchGetQueryType(query_type);
+}
+
 inline bool ParseOptimizerInt64(const rapidjson::Value &value, int64_t &parsed_value) {
     if (value.IsInt64()) {
         parsed_value = value.GetInt64();
@@ -154,6 +164,9 @@ public:
             return false;
         }
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "query_type", query_type_, std::string("prefix_match"));
+        if (!IsSupportedQueryType(query_type_)) {
+            return false;
+        }
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "sw_size", sw_size_, int32_t(0));
         KVCM_JSON_GET_DEFAULT_MACRO(
             rapid_value, "location_spec_names", location_spec_names_, std::vector<std::string>{});

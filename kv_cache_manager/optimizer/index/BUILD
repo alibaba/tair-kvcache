@@ -3,9 +3,11 @@ package(default_visibility = ["//visibility:public"])
 cc_library(
     name = "index",
     srcs = [
+        "hash_table_index.cc",
         "radix_tree_index.cc",
     ],
     hdrs = [
+        "hash_table_index.h",
         "radix_tree_index.h",
     ],
     deps = [

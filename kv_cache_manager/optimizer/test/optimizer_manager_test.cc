@@ -102,23 +102,22 @@ TEST_F(OptimizerManagerTest, WriteCacheTtlSecondsUsesNanosecondTimestamps) {
     EXPECT_EQ(hit_after_expire.kvcm_hit_length, 0);
 }
 
-TEST_F(OptimizerManagerTest, MaterializedWriteKeepsStructuralPrefixUncached) {
+TEST_F(OptimizerManagerTest, BatchGetMatchesIndexedBlocksWithoutPrefix) {
     OptimizerManager manager(config_);
     ASSERT_TRUE(manager.Init());
 
-    const std::vector<int64_t> keys = {11, 12};
-    auto write_res = manager.WriteCacheWithMaterializedIndices("instance1", "write_suffix", 1000, keys, {1}, 0);
-    EXPECT_EQ(write_res.kvcm_write_length, 1);
+    const std::vector<int64_t> path = {21, 22};
+    manager.WriteCache("instance1", "write_path", 1000, path);
 
-    BlockMask no_local_mask = std::vector<bool>{false, false};
-    auto miss_without_prefix =
-        manager.GetCacheLocation("instance1", "miss_without_prefix", 2000, keys, no_local_mask, 2 * 1024);
-    EXPECT_EQ(miss_without_prefix.kvcm_hit_length, 0);
+    BlockMask remote_read_mask = std::vector<bool>{false};
+    auto prefix_miss = manager.GetCacheLocation("instance1", "prefix_miss", 2000, {22}, remote_read_mask, 1024);
+    EXPECT_EQ(prefix_miss.kvcm_hit_length, 0);
 
-    BlockMask local_prefix_mask = std::vector<bool>{true, false};
-    auto hit_with_prefix =
-        manager.GetCacheLocation("instance1", "hit_with_prefix", 3000, keys, local_prefix_mask, 2 * 1024);
-    EXPECT_EQ(hit_with_prefix.kvcm_hit_length, 1);
+    auto batch_hit =
+        manager.GetCacheLocation("instance1", "batch_hit", 3000, {22}, remote_read_mask, 1024, true, true, "batch_get");
+    EXPECT_EQ(batch_hit.kvcm_hit_length, 1);
+    ASSERT_EQ(batch_hit.hit_indices.size(), 1);
+    EXPECT_EQ(batch_hit.hit_indices[0], 0);
 }
 
 TEST_F(OptimizerManagerTest, TemplateAnalysisReadRecordKeepsTraceIdAndKeys) {

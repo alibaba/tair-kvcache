@@ -1,4 +1,5 @@
 #pragma once
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <vector>
@@ -10,15 +11,16 @@ namespace kv_cache_manager {
 struct GetCacheLocationRes {
     std::string trace_id;
     int64_t kvcm_hit_length;
-    std::vector<MaterializedKeySequence> evicted_materialized_sequences;
+    std::vector<size_t> hit_indices;
+    std::vector<int64_t> evicted_keys;
 };
 
 struct WriteCacheRes {
     std::string trace_id;
     int64_t kvcm_write_length;
     int64_t kvcm_write_hit_length;
-    std::vector<MaterializedKeySequence> pool_source_write_sequences;
-    std::vector<MaterializedKeySequence> evicted_materialized_sequences;
+    std::vector<int64_t> pool_source_write_keys;
+    std::vector<int64_t> evicted_keys;
 };
 
 } // namespace kv_cache_manager

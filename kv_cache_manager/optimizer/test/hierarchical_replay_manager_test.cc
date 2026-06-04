@@ -9,6 +9,7 @@
 #include "kv_cache_manager/optimizer/config/instance_group_config.h"
 #include "kv_cache_manager/optimizer/config/optimizer_config.h"
 #include "kv_cache_manager/optimizer/config/tier_config.h"
+#include "kv_cache_manager/optimizer/manager/hash_storage_pool_manager.h"
 #include "kv_cache_manager/optimizer/manager/hierarchical_replay_manager.h"
 
 using namespace kv_cache_manager;
@@ -21,15 +22,17 @@ protected:
         config.set_output_result_path(root + "/combined");
         config.set_engine_config(
             CreateEngineOptimizerConfig("engine_group", {"engine_a", "engine_b"}, {"hbm", "dram"}, root + "/infer"));
-        config.set_storage_pool_config(CreateOptimizerConfig("pool_group", {"model_l3"}, {"l3"}, root + "/pool"));
+        config.set_storage_pool(CreateStoragePoolConfig({"model_l3"}, root + "/pool"));
 
         EngineToStoragePoolMappingConfig map_a;
         map_a.set_engine_instance_id("engine_a");
-        map_a.set_storage_pool_instance_id("model_l3");
+        map_a.set_storage_pool_id("model_l3");
+        map_a.set_engine_read_query_type("batch_get");
         map_a.set_storage_pool_flow(CreateStoragePoolFlow());
         EngineToStoragePoolMappingConfig map_b;
         map_b.set_engine_instance_id("engine_b");
-        map_b.set_storage_pool_instance_id("model_l3");
+        map_b.set_storage_pool_id("model_l3");
+        map_b.set_engine_read_query_type("batch_get");
         map_b.set_storage_pool_flow(CreateStoragePoolFlow());
         config.set_engine_to_storage_pool({map_a, map_b});
         return config;
@@ -40,7 +43,6 @@ protected:
         flow.set_write_mode(TierWriteMode::WRITE_THROUGH);
         flow.set_local_read_touch_enabled(false);
         flow.set_shadow_write_touch_enabled(false);
-        flow.set_promote_enabled(false);
         flow.set_selective_write_threshold(2);
         return flow;
     }
@@ -83,6 +85,40 @@ protected:
         config.set_output_result_path(output_path);
         config.set_eviction_params(CreateEvictionConfig());
         config.set_instance_groups({CreateInstanceGroup(group_name, instance_ids, tier_names, tier_capacity)});
+        return config;
+    }
+
+    HierarchicalStoragePoolConfig CreateStoragePoolConfig(const std::vector<std::string> &pool_ids,
+                                                          const std::string &output_path,
+                                                          int64_t capacity_bytes = 1LL << 30) {
+        HierarchicalStoragePoolConfig config;
+        config.set_output_result_path(output_path);
+        config.set_storage_name("l3");
+        config.set_capacity(static_cast<double>(capacity_bytes) / static_cast<double>(1LL << 30));
+        config.set_eviction_config(CreateEvictionConfig());
+
+        OptTtlConfig ttl_config;
+        ttl_config.set_default_block_ttl_seconds(0);
+        ttl_config.set_refresh_on_read(true);
+        config.set_ttl_config(ttl_config);
+
+        std::vector<HierarchicalStoragePoolEntryConfig> pools;
+        pools.reserve(pool_ids.size());
+        for (const auto &pool_id : pool_ids) {
+            LruParams params;
+            params.sample_rate = 1.0;
+            HierarchicalModelConfig model;
+            model.set_block_size(16);
+            model.set_bytes_per_token(1);
+            model.set_eviction_policy_type(EvictionPolicyType::POLICY_LRU);
+            model.set_eviction_policy_param(params);
+
+            HierarchicalStoragePoolEntryConfig pool;
+            pool.set_pool_id(pool_id);
+            pool.set_model(model);
+            pools.push_back(pool);
+        }
+        config.set_pools(pools);
         return config;
     }
 
@@ -163,6 +199,66 @@ TEST_F(HierarchicalReplayManagerTest, LinksEngineInstancesToSharedPool) {
     EXPECT_TRUE(std::filesystem::exists(root + "/combined/hierarchical_hit_rates.csv"));
 }
 
+TEST_F(HierarchicalReplayManagerTest, EngineReadUsesBatchGetAndPoolPrefixSkipsEngineHits) {
+    const std::string root = GetTestTempRootPath() + "/hierarchical_replay_engine_batch_get";
+    HierarchicalReplayConfig config = CreateHierarchicalConfig(root);
+
+    std::vector<EngineToStoragePoolMappingConfig> mappings = config.engine_to_storage_pool();
+    for (auto &mapping : mappings) {
+        if (mapping.engine_instance_id() == "engine_b") {
+            StoragePoolFlowConfig flow = mapping.storage_pool_flow();
+            flow.set_write_mode(TierWriteMode::CASCADING);
+            mapping.set_storage_pool_flow(flow);
+        }
+    }
+    config.set_engine_to_storage_pool(mappings);
+
+    HierarchicalReplayManager manager(config);
+    ASSERT_TRUE(manager.Init());
+
+    manager.WriteCache("engine_a", "pool_first", 1000, {811});
+    manager.WriteCache("engine_a", "pool_last", 1010, {813});
+    manager.WriteCache("engine_b", "engine_middle", 1020, {812});
+
+    const std::vector<int64_t> keys = {811, 812, 813};
+    auto mixed_hit = manager.GetCacheLocation("engine_b", "mixed_hit", 2000, keys, 48, "prefix_match");
+    EXPECT_EQ(mixed_hit.engine_hit_length, 1);
+    EXPECT_EQ(mixed_hit.storage_pool_hit_length, 2);
+    EXPECT_EQ(mixed_hit.total_hit_length, 3);
+
+    auto promoted = manager.GetCacheLocation("engine_b", "promoted", 3000, keys, 48, "prefix_match");
+    EXPECT_EQ(promoted.engine_hit_length, 3);
+    EXPECT_EQ(promoted.storage_pool_hit_length, 0);
+    EXPECT_EQ(promoted.total_hit_length, 3);
+}
+
+TEST_F(HierarchicalReplayManagerTest, EngineReadQueryTypeCanUsePrefixMatch) {
+    const std::string root = GetTestTempRootPath() + "/hierarchical_replay_engine_prefix_match";
+    HierarchicalReplayConfig config = CreateHierarchicalConfig(root);
+
+    std::vector<EngineToStoragePoolMappingConfig> mappings = config.engine_to_storage_pool();
+    for (auto &mapping : mappings) {
+        if (mapping.engine_instance_id() == "engine_b") {
+            mapping.set_engine_read_query_type("prefix_match");
+            StoragePoolFlowConfig flow = mapping.storage_pool_flow();
+            flow.set_write_mode(TierWriteMode::CASCADING);
+            mapping.set_storage_pool_flow(flow);
+        }
+    }
+    config.set_engine_to_storage_pool(mappings);
+
+    HierarchicalReplayManager manager(config);
+    ASSERT_TRUE(manager.Init());
+
+    manager.WriteCache("engine_b", "engine_first", 1000, {821});
+    manager.WriteCache("engine_b", "engine_third", 1010, {823});
+
+    auto prefix_hit = manager.GetCacheLocation("engine_b", "prefix_hit", 2000, {821, 822, 823}, 48, "prefix_match");
+    EXPECT_EQ(prefix_hit.engine_hit_length, 1);
+    EXPECT_EQ(prefix_hit.storage_pool_hit_length, 0);
+    EXPECT_EQ(prefix_hit.total_hit_length, 1);
+}
+
 TEST_F(HierarchicalReplayManagerTest, ParsesCompactClusterConfig) {
     const std::string root = GetTestTempRootPath() + "/hierarchical_replay_compact_config";
     std::ostringstream json;
@@ -183,7 +279,8 @@ TEST_F(HierarchicalReplayManagerTest, ParsesCompactClusterConfig) {
         "enable_lifecycle_tracking": true,
         "infer_clusters": [
             {
-                "storage_pool_instance_id": "model_l3",
+                "storage_pool_id": "model_l3",
+                "engine_read_query_type": "batch_get",
                 "model": {
                     "block_size": 16,
                     "bytes_per_token": 1,
@@ -211,7 +308,6 @@ TEST_F(HierarchicalReplayManagerTest, ParsesCompactClusterConfig) {
                         "write_mode": "write_through",
                         "access_propagation_enabled": false,
                         "write_propagation_enabled": false,
-                        "promote_enabled": true,
                         "selective_write_threshold": 2
                     }
                 ],
@@ -219,50 +315,37 @@ TEST_F(HierarchicalReplayManagerTest, ParsesCompactClusterConfig) {
                     "write_mode": "cascading",
                     "local_read_touch_enabled": false,
                     "shadow_write_touch_enabled": false,
-                    "promote_enabled": true,
                     "selective_write_threshold": 2
                 }
             }
         ],
-        "storage_pool_config": {
+        "storage_pool": {
             "output_result_path": ")"
          << root << R"(/output/pool",
+            "storage_name": "l3",
+            "capacity": 2.0,
             "eviction_params": {
                 "eviction_mode": 3,
                 "eviction_batch_size_per_instance": 10
             },
-            "instance_groups": [
+            "ttl_config": {
+                "default_block_ttl_seconds": 0,
+                "refresh_on_read": true
+            },
+            "pools": [
                 {
-                    "group_name": "pool_group",
-                    "quota_capacity": 2.0,
-                    "used_percentage": 1.0,
-                    "ttl_config": {
-                        "default_block_ttl_seconds": 0,
-                        "refresh_on_read": true
-                    },
-                    "storages": [
-                        {
-                            "unique_name": "l3",
-                            "storage_type": "dummy",
-                            "band_width_mbps": 1000,
-                            "capacity": 2.0
+                    "pool_id": "model_l3",
+                    "model": {
+                        "block_size": 16,
+                        "bytes_per_token": 1,
+                        "eviction_policy_type": "lru",
+                        "eviction_policy_params": {
+                            "sample_rate": 1.0,
+                            "shard_count": 1,
+                            "sample_times": 32,
+                            "eviction_amplification_factor": 1.0
                         }
-                    ],
-                    "instances": [
-                        {
-                            "instance_id": "model_l3",
-                            "block_size": 16,
-                            "bytes_per_token": 1,
-                            "instance_group_name": "pool_group",
-                            "eviction_policy_type": "lru",
-                            "eviction_policy_params": {
-                                "sample_rate": 1.0,
-                                "shard_count": 1,
-                                "sample_times": 32,
-                                "eviction_amplification_factor": 1.0
-                            }
-                        }
-                    ]
+                    }
                 }
             ]
         }
@@ -271,15 +354,14 @@ TEST_F(HierarchicalReplayManagerTest, ParsesCompactClusterConfig) {
     HierarchicalReplayConfig config;
     ASSERT_TRUE(config.FromJsonString(json.str()));
     EXPECT_EQ(config.engine_config().instance_groups().size(), 2);
-    EXPECT_EQ(config.storage_pool_config().instance_groups().size(), 1);
+    EXPECT_EQ(config.storage_pool().pools().size(), 1);
     EXPECT_EQ(config.engine_to_storage_pool().size(), 2);
     EXPECT_EQ(config.engine_config().output_result_path(), root + "/output/infer");
     EXPECT_EQ(config.engine_config().eviction_config().eviction_mode(), EvictionMode::EVICTION_MODE_INSTANCE_PRECISE);
     EXPECT_EQ(config.engine_config().eviction_config().eviction_batch_size_per_instance(), 10);
     EXPECT_EQ(config.trace_replay_config().mode(), TraceReplayMode::REQUEST);
     EXPECT_EQ(config.trace_replay_config().write_delay_ns(), 1000);
-    EXPECT_EQ(config.storage_pool_config().trace_file_path(), root + "/trace.jsonl");
-    EXPECT_EQ(config.storage_pool_config().output_result_path(), root + "/output/pool");
+    EXPECT_EQ(config.storage_pool().output_result_path(), root + "/output/pool");
 
     HierarchicalReplayManager manager(config);
     EXPECT_TRUE(manager.Init());
@@ -391,7 +473,7 @@ TEST_F(HierarchicalReplayManagerTest, SelectiveStoragePoolWriteRequiresInferSour
 }
 
 TEST_F(HierarchicalReplayManagerTest, SelectiveStoragePoolWriteIgnoresDemotedSourceWithoutWriteTouch) {
-    const std::string root = GetTestTempRootPath() + "/hierarchical_replay_selective_materialized_sequences";
+    const std::string root = GetTestTempRootPath() + "/hierarchical_replay_selective_source_keys";
     HierarchicalReplayConfig config = CreateHierarchicalConfig(root);
     OptimizerConfig engine_config =
         CreateEngineOptimizerConfig("engine_group", {"engine_a", "engine_b"}, {"hbm", "dram"}, root + "/infer", 16);
@@ -477,6 +559,42 @@ TEST_F(HierarchicalReplayManagerTest, CascadingStoragePoolWriteUsesInferSourceTi
     EXPECT_EQ(pool_hit.storage_pool_hit_length, 1);
 }
 
+TEST_F(HierarchicalReplayManagerTest, CascadingStoragePoolWriteTouchExistingFollowsConfig) {
+    auto first_survives_after_pool_pressure = [this](bool shadow_write_touch_enabled) {
+        const std::string root = GetTestTempRootPath() + "/hierarchical_replay_cascading_shadow_touch_" +
+                                 (shadow_write_touch_enabled ? "enabled" : "disabled");
+        HierarchicalReplayConfig config = CreateHierarchicalConfig(root);
+        OptimizerConfig engine_config =
+            CreateEngineOptimizerConfig("engine_group", {"engine_a", "engine_b"}, {"hbm"}, root + "/infer", 16);
+        for (auto &group : engine_config.mutable_instance_groups()) {
+            group.set_quota_capacity(16);
+        }
+        config.set_engine_config(engine_config);
+        config.set_storage_pool(CreateStoragePoolConfig({"model_l3"}, root + "/pool", 32));
+        StoragePoolFlowConfig flow = CreateStoragePoolFlow();
+        flow.set_write_mode(TierWriteMode::CASCADING);
+        flow.set_shadow_write_touch_enabled(shadow_write_touch_enabled);
+        SetStoragePoolFlow(config, flow);
+
+        HierarchicalReplayManager manager(config);
+        EXPECT_TRUE(manager.Init());
+
+        const std::vector<int64_t> first = {621};
+        manager.WriteCache("engine_a", "write_first", 1000, first);
+        manager.WriteCache("engine_a", "evict_first_to_pool", 1100, {622});
+        manager.WriteCache("engine_a", "evict_second_to_pool", 1200, {623});
+        manager.WriteCache("engine_b", "write_existing_first_locally", 1300, first);
+        manager.WriteCache("engine_b", "evict_first_to_existing_pool_block", 1400, {624});
+        manager.WriteCache("engine_b", "insert_new_pool_block", 1500, {625});
+
+        auto first_read = manager.GetCacheLocation("engine_b", "read_first", 1600, first, 16);
+        return first_read.storage_pool_hit_length == 1;
+    };
+
+    EXPECT_FALSE(first_survives_after_pool_pressure(false));
+    EXPECT_TRUE(first_survives_after_pool_pressure(true));
+}
+
 TEST_F(HierarchicalReplayManagerTest, WriteThroughStoragePoolUsesInferLastTierWriteEvents) {
     const std::string root = GetTestTempRootPath() + "/hierarchical_replay_write_through_source_events";
     HierarchicalReplayConfig config = CreateHierarchicalConfig(root);
@@ -507,12 +625,9 @@ TEST_F(HierarchicalReplayManagerTest, WriteThroughStoragePoolUsesInferLastTierWr
     EXPECT_EQ(after_demote.storage_pool_hit_length, 1);
 }
 
-TEST_F(HierarchicalReplayManagerTest, L3HitPromotesToEngineWhenEnabled) {
+TEST_F(HierarchicalReplayManagerTest, L3HitPromotesToEngine) {
     const std::string root = GetTestTempRootPath() + "/hierarchical_replay_l3_promote";
     HierarchicalReplayConfig config = CreateHierarchicalConfig(root);
-    StoragePoolFlowConfig flow = CreateStoragePoolFlow();
-    flow.set_promote_enabled(true);
-    SetStoragePoolFlow(config, flow);
 
     HierarchicalReplayManager manager(config);
     ASSERT_TRUE(manager.Init());
@@ -540,7 +655,6 @@ TEST_F(HierarchicalReplayManagerTest, PoolPromoteEvictionWritesBackToPoolWhenCas
     config.set_engine_config(engine_config);
     StoragePoolFlowConfig flow = CreateStoragePoolFlow();
     flow.set_write_mode(TierWriteMode::CASCADING);
-    flow.set_promote_enabled(true);
     SetStoragePoolFlow(config, flow);
 
     HierarchicalReplayManager manager(config);
@@ -570,7 +684,6 @@ TEST_F(HierarchicalReplayManagerTest, EngineReadPromoteSourceTierEvictionWritesB
     for (auto &group : engine_config.mutable_instance_groups()) {
         OptTierFlowPolicyConfig policy = group.tier_flow_policy();
         policy.set_write_mode(TierWriteMode::CASCADING);
-        policy.set_promote_enabled(true);
         group.set_tier_flow_policy(policy);
     }
     config.set_engine_config(engine_config);
@@ -613,12 +726,52 @@ TEST_F(HierarchicalReplayManagerTest, StoragePoolUsesFullKeysAfterEnginePrefixHi
     EXPECT_EQ(read_full.total_hit_length, 2);
 }
 
+TEST_F(HierarchicalReplayManagerTest, HashStoragePoolReadsFromEngineMissOffset) {
+    const std::string root = GetTestTempRootPath() + "/hash_storage_pool_prefix_read";
+    HierarchicalStoragePoolConfig pool_config = CreateStoragePoolConfig({"model_l3"}, root + "/pool");
+
+    HashStoragePoolManager pool(pool_config);
+    ASSERT_TRUE(pool.Init());
+
+    const std::vector<int64_t> keys = {741, 742, 743};
+    pool.WriteKeys("model_l3", "write_tail_only", 1000, {743}, 0, false);
+
+    auto cold_prefix =
+        pool.Read(HashStoragePoolReadRequest("model_l3", "cold_prefix", 1100, keys, {}, 48, "prefix_match", false));
+    EXPECT_EQ(cold_prefix.hit_blocks, 0);
+
+    auto suffix_after_engine_prefix =
+        pool.Read(HashStoragePoolReadRequest("model_l3", "suffix", 1200, keys, {0, 1}, 48, "prefix_match", false));
+    EXPECT_EQ(suffix_after_engine_prefix.hit_blocks, 1);
+
+    auto batch_tail =
+        pool.Read(HashStoragePoolReadRequest("model_l3", "batch_tail", 1300, keys, {}, 48, "batch_get", false));
+    EXPECT_EQ(batch_tail.hit_blocks, 1);
+    ASSERT_EQ(batch_tail.hit_indices.size(), 1);
+    EXPECT_EQ(batch_tail.hit_indices[0], 2);
+}
+
+TEST_F(HierarchicalReplayManagerTest, BatchGetSkipsEngineHitIndicesWhenReadingPool) {
+    const std::string root = GetTestTempRootPath() + "/hierarchical_replay_batch_get";
+    HierarchicalReplayConfig config = CreateHierarchicalConfig(root);
+
+    HierarchicalReplayManager manager(config);
+    ASSERT_TRUE(manager.Init());
+
+    const std::vector<int64_t> full_keys = {751, 752};
+    manager.WriteCache("engine_a", "write_full_to_pool", 1000, full_keys);
+    manager.WriteCache("engine_b", "write_engine_tail", 1100, {752});
+
+    auto batch_read = manager.GetCacheLocation("engine_b", "batch_read", 1200, full_keys, 32, "batch_get");
+    EXPECT_EQ(batch_read.engine_hit_length, 1);
+    EXPECT_EQ(batch_read.storage_pool_hit_length, 1);
+    EXPECT_EQ(batch_read.total_hit_length, 2);
+}
+
 TEST_F(HierarchicalReplayManagerTest, EngineHitUpdatesStoragePoolAccess) {
     const std::string root = GetTestTempRootPath() + "/hierarchical_replay_l3_access_propagation";
     HierarchicalReplayConfig config = CreateHierarchicalConfig(root);
-    OptimizerConfig pool_config = CreateOptimizerConfig("pool_group", {"model_l3"}, {"l3"}, root + "/pool");
-    pool_config.mutable_instance_groups()[0].set_quota_capacity(32);
-    config.set_storage_pool_config(pool_config);
+    config.set_storage_pool(CreateStoragePoolConfig({"model_l3"}, root + "/pool", 32));
     StoragePoolFlowConfig flow = CreateStoragePoolFlow();
     flow.set_local_read_touch_enabled(true);
     SetStoragePoolFlow(config, flow);
@@ -645,9 +798,7 @@ TEST_F(HierarchicalReplayManagerTest, EngineHitUpdatesStoragePoolAccess) {
 TEST_F(HierarchicalReplayManagerTest, EngineHitDoesNotUpdateStoragePoolAccessWhenDisabled) {
     const std::string root = GetTestTempRootPath() + "/hierarchical_replay_l3_access_no_propagation";
     HierarchicalReplayConfig config = CreateHierarchicalConfig(root);
-    OptimizerConfig pool_config = CreateOptimizerConfig("pool_group", {"model_l3"}, {"l3"}, root + "/pool");
-    pool_config.mutable_instance_groups()[0].set_quota_capacity(32);
-    config.set_storage_pool_config(pool_config);
+    config.set_storage_pool(CreateStoragePoolConfig({"model_l3"}, root + "/pool", 32));
 
     HierarchicalReplayManager manager(config);
     ASSERT_TRUE(manager.Init());
@@ -671,9 +822,7 @@ TEST_F(HierarchicalReplayManagerTest, EngineHitDoesNotUpdateStoragePoolAccessWhe
 TEST_F(HierarchicalReplayManagerTest, WriteThroughDoesNotTouchExistingL3WhenDisabled) {
     const std::string root = GetTestTempRootPath() + "/hierarchical_replay_l3_write_no_propagation";
     HierarchicalReplayConfig config = CreateHierarchicalConfig(root);
-    OptimizerConfig pool_config = CreateOptimizerConfig("pool_group", {"model_l3"}, {"l3"}, root + "/pool");
-    pool_config.mutable_instance_groups()[0].set_quota_capacity(32);
-    config.set_storage_pool_config(pool_config);
+    config.set_storage_pool(CreateStoragePoolConfig({"model_l3"}, root + "/pool", 32));
     StoragePoolFlowConfig flow = CreateStoragePoolFlow();
     flow.set_write_mode(TierWriteMode::WRITE_THROUGH);
     flow.set_shadow_write_touch_enabled(false);
@@ -705,9 +854,7 @@ TEST_F(HierarchicalReplayManagerTest, WritePropagationDoesNotTouchExistingL3) {
         group.set_tier_flow_policy(policy);
     }
     config.set_engine_config(engine_config);
-    OptimizerConfig pool_config = CreateOptimizerConfig("pool_group", {"model_l3"}, {"l3"}, root + "/pool");
-    pool_config.mutable_instance_groups()[0].set_quota_capacity(32);
-    config.set_storage_pool_config(pool_config);
+    config.set_storage_pool(CreateStoragePoolConfig({"model_l3"}, root + "/pool", 32));
     StoragePoolFlowConfig flow = CreateStoragePoolFlow();
     flow.set_write_mode(TierWriteMode::WRITE_THROUGH);
     flow.set_shadow_write_touch_enabled(true);
@@ -900,16 +1047,17 @@ TEST_F(HierarchicalReplayManagerTest, SeparatesIndependentPoolInstances) {
     config.set_output_result_path(root + "/combined");
     config.set_engine_config(
         CreateEngineOptimizerConfig("engine_group", {"engine_a", "engine_b"}, {"hbm", "dram"}, root + "/infer"));
-    config.set_storage_pool_config(
-        CreateOptimizerConfig("pool_group", {"model_a_l3", "model_b_l3"}, {"l3"}, root + "/pool"));
+    config.set_storage_pool(CreateStoragePoolConfig({"model_a_l3", "model_b_l3"}, root + "/pool"));
 
     EngineToStoragePoolMappingConfig map_a;
     map_a.set_engine_instance_id("engine_a");
-    map_a.set_storage_pool_instance_id("model_a_l3");
+    map_a.set_storage_pool_id("model_a_l3");
+    map_a.set_engine_read_query_type("batch_get");
     map_a.set_storage_pool_flow(CreateStoragePoolFlow());
     EngineToStoragePoolMappingConfig map_b;
     map_b.set_engine_instance_id("engine_b");
-    map_b.set_storage_pool_instance_id("model_b_l3");
+    map_b.set_storage_pool_id("model_b_l3");
+    map_b.set_engine_read_query_type("batch_get");
     map_b.set_storage_pool_flow(CreateStoragePoolFlow());
     config.set_engine_to_storage_pool({map_a, map_b});
 

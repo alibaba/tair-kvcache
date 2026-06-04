@@ -9,7 +9,7 @@
 
 #include "kv_cache_manager/optimizer/config/hierarchical_replay_config.h"
 #include "kv_cache_manager/optimizer/config/insight_simulator_types.h"
-#include "kv_cache_manager/optimizer/manager/engine_storage_pool_connector.h"
+#include "kv_cache_manager/optimizer/manager/hash_storage_pool_manager.h"
 #include "kv_cache_manager/optimizer/manager/optimizer_manager.h"
 #include "kv_cache_manager/optimizer/trace_loader/optimizer_schema_trace.h"
 
@@ -37,7 +37,8 @@ public:
                                                      const std::string &trace_id,
                                                      int64_t timestamp,
                                                      const std::vector<int64_t> &block_ids,
-                                                     int64_t input_len);
+                                                     int64_t input_len,
+                                                     const std::string &query_type = "prefix_match");
     WriteCacheRes WriteCache(const std::string &engine_instance_id,
                              const std::string &trace_id,
                              int64_t timestamp,
@@ -53,7 +54,7 @@ private:
     struct CombinedReadRecord {
         std::string trace_id;
         std::string engine_instance_id;
-        std::string storage_pool_instance_id;
+        std::string storage_pool_id;
         int64_t timestamp_ns = 0;
         size_t read_blocks = 0;
         size_t engine_hit_blocks = 0;
@@ -93,14 +94,43 @@ private:
     void FlushAllPendingWrites();
     void RunPendingWrite(const WriteCacheSchemaTrace &trace);
     void ExportCombinedHitRates() const;
-    const std::string &StoragePoolInstanceForEngine(const std::string &engine_instance_id) const;
+    const std::string &StoragePoolForEngine(const std::string &engine_instance_id) const;
+    const std::string &EngineReadQueryTypeForEngine(const std::string &engine_instance_id) const;
     const StoragePoolFlowConfig &StoragePoolFlowForEngine(const std::string &engine_instance_id) const;
+    HashStoragePoolReadResult ReadStoragePool(const std::string &engine_instance_id,
+                                              const std::string &storage_pool_id,
+                                              const std::string &trace_id,
+                                              int64_t timestamp,
+                                              const std::vector<int64_t> &block_ids,
+                                              const std::vector<size_t> &engine_hit_indices,
+                                              int64_t input_len,
+                                              const std::string &query_type,
+                                              const StoragePoolFlowConfig &flow);
+    void WriteStoragePoolKeys(const std::string &storage_pool_id,
+                              const std::string &trace_id,
+                              int64_t timestamp,
+                              const std::vector<int64_t> &keys,
+                              int64_t ttl_us,
+                              bool touch_existing);
+    void ApplyStoragePoolWriteFlow(const std::string &engine_instance_id,
+                                   const std::string &storage_pool_id,
+                                   const std::string &trace_id,
+                                   int64_t timestamp,
+                                   int64_t ttl_us,
+                                   const StoragePoolFlowConfig &flow,
+                                   const WriteCacheRes &engine_write_res);
+    void ApplyStoragePoolCascadingEvictions(const std::string &storage_pool_id,
+                                            const std::string &trace_id,
+                                            int64_t timestamp,
+                                            int64_t ttl_us,
+                                            const StoragePoolFlowConfig &flow,
+                                            const std::vector<int64_t> &evicted_keys);
 
     HierarchicalReplayConfig config_;
     std::unique_ptr<OptimizerManager> engine_manager_;
-    std::unique_ptr<OptimizerManager> storage_pool_manager_;
-    std::unique_ptr<EngineStoragePoolConnector> engine_storage_pool_connector_;
+    std::unique_ptr<HashStoragePoolManager> storage_pool_manager_;
     std::unordered_map<std::string, std::string> engine_to_storage_pool_;
+    std::unordered_map<std::string, std::string> engine_read_query_type_;
     std::unordered_map<std::string, StoragePoolFlowConfig> engine_storage_pool_flow_;
     std::unordered_map<std::string, size_t> engine_block_size_;
     std::vector<std::string> sorted_engine_instance_ids_;
