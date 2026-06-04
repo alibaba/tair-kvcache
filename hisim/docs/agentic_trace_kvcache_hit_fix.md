@@ -103,14 +103,6 @@ Ensure `output_token_ids` is packed into `custom_params.simulation` in
 `get_request()` alongside `created_time` / `total_request`, and that
 `C_SchedulerHook` / `C_ModelRunnerHook` pass it down to the batch.
 
-## Files to Modify
-
-| File | Change |
-|------|--------|
-| `bench_serving.py` | Add `output_token_ids` to `DatasetRow`; pack into `custom_params` in `get_request()` |
-| `sglang_hook.py` | `C_ModelRunnerHook.wrapped_sample` reads per-request token ids from batch |
-| `sglang_hook.py` | `C_SchedulerHook` propagates `output_token_ids` from `custom_params` to the running batch |
-
 ## Expected Outcome
 
 After the fix, Request 2's prefix match becomes:
