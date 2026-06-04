@@ -358,7 +358,6 @@ python trace_converter.py \
                     "write_mode": "write_through",
                     "access_propagation_enabled": true,
                     "write_propagation_enabled": false,
-                    "promote_enabled": true,
                     "selective_write_threshold": 2
                 }
             ],

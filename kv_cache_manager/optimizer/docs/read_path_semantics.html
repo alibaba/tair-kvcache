@@ -117,7 +117,7 @@
         </tr>
         <tr>
           <td class="phase">read promote</td>
-          <td>block 命中低层，且向高层 edge 的 <code>promote_enabled = true</code></td>
+          <td>block 命中低层</td>
           <td>新高层副本初始化 tier stat，<code>write_touch_count = 0</code></td>
           <td>copy 到经过的高层并记录 <code>ENTER_TIER</code>；容量驱逐记录 <code>LEAVE_TIER</code>/<code>FINAL_EVICT</code>，engine pool-source 层驱逐可触发 cascading 写 pool</td>
           <td>命中统计保持为本次原始 read hit</td>
@@ -125,21 +125,21 @@
         <tr>
           <td class="phase">hierarchical engine hit</td>
           <td>hierarchical read 先查 engine-local 且命中</td>
-          <td>engine 内部按普通 optimizer read 更新</td>
-          <td>engine 命中 prefix 作为 local mask 传入 storage pool</td>
+          <td>engine 内部按 <code>engine_read_query_type</code> 查询并更新</td>
+          <td>engine 命中 index 集合作为 local mask 传入 storage pool</td>
           <td>计入 <code>LocalHit</code></td>
         </tr>
         <tr>
           <td class="phase">storage pool read</td>
           <td>hierarchical read 的完整 <code>keys</code> 进入 storage pool</td>
-          <td>engine miss suffix 按普通 optimizer read 更新；engine hit prefix 由 <code>local_read_touch_enabled</code> 决定是否刷新 pool 访问时间</td>
-          <td>engine hit prefix 使用 local mask；engine miss suffix 在 pool 中查询</td>
-          <td>suffix 命中计入 <code>RemoteHit</code></td>
+          <td>engine miss block 按 trace <code>query_type</code> 在 pool 中查询；engine hit block 由 <code>local_read_touch_enabled</code> 决定是否刷新 pool 访问时间</td>
+          <td><code>prefix_match</code> 下 engine hit index 可让 prefix 继续向后推进，但不重复计 pool hit；<code>batch_get</code> 下逐 block 独立查询</td>
+          <td>pool 命中计入 <code>RemoteHit</code></td>
         </tr>
         <tr>
           <td class="phase">storage pool hit 回填 engine</td>
-          <td>storage pool hit，且 <code>storage_pool_flow.promote_enabled = true</code></td>
-          <td>以完整命中 prefix 回填 engine，已有 engine prefix 不做 write touch，新回填 suffix 的 <code>write_touch_count = 0</code></td>
+          <td>storage pool hit</td>
+          <td>以完整命中 prefix 回填 engine，已有 engine block 不做 write touch，新回填 block 的 <code>write_touch_count = 0</code></td>
           <td>回填 engine 最高层；若回填触发 engine pool-source 层驱逐，且 storage pool flow 是 <code>cascading</code>，evicted sequence 写入 pool</td>
           <td>命中统计保持为 storage pool <code>RemoteHit</code></td>
         </tr>

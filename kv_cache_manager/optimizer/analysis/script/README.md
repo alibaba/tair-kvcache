@@ -104,7 +104,6 @@ bazel run //kv_cache_manager/optimizer/analysis/script:multi_infer_replay -- \
     "write_mode": "write_through",
     "access_propagation_enabled": false,
     "write_propagation_enabled": false,
-    "promote_enabled": true,
     "selective_write_threshold": 2
   }
 ]

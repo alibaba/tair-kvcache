@@ -10,18 +10,20 @@ optimizer 按仿真问题分为三个标准入口：
 |---|---|---|---|---|
 | KVCM/L3-only | `optimizer_main` / `optimizer_run` | 只模拟 KVCM/L3，或直接回放 KVCM 日志 | KVCM instance | `local` = trace `block_mask` 中 engine 已命中的 block；`remote` = KVCM/L3 模拟命中 |
 | engine-local-only | `multi_infer_replay` | 只模拟一个或多个推理实例本地缓存，trace 已确定请求归属 | 推理实例 | `local` = engine 本地命中；`remote` 通常为 0 |
-| engine-local + storage pool | `hierarchical_replay_main` | 需要完整模拟推理实例本地多层缓存与 KVCM/storage pool 池化；trace 可指定推理实例，也可由 scheduler 分配 | `engine_instance` = 推理实例；`storage_pool_instance` = KVCM/storage pool instance | `local` = engine 本地命中；`remote` = storage pool 命中 |
+| engine-local + storage pool | `hierarchical_replay_main` | 需要完整模拟推理实例本地多层缓存、同集群 P2P 读与 KVCM/storage pool 池化；trace 可指定推理实例，也可由 scheduler 分配 | `engine_instance` = 推理实例；`storage_pool_instance` = KVCM/storage pool instance | `local` = engine 本地命中；`peer` = 同集群 peer 命中；`remote` = storage pool 命中 |
 
 `hierarchical_replay_main` 是否使用调度器由 `infer_scheduling_strategy` 决定：trace 已指定推理实例时使用 `preserve_trace`；需要模拟调度时使用 `round_robin` 或 `prefix_hit`。
-hierarchical 模式使用 `infer_clusters + storage_pool_config` 描述拓扑：同一个 storage pool 下的同构推理实例只写一份 model、tier 列表和层间 flow，再列出 `infer_ids`；`infer_eviction_params` 单独定义推理侧本地缓存的驱逐模式；`infer_clusters[].tiers` 的数组顺序就是推理实例本地层级顺序，第一项是写入口；`infer_clusters[].storage_pool_flow` 描述该推理实例集群写入 storage pool 的边策略。storage pool 配置不需要重复写 `trace_file_path`，可表达单层或多层，并通过 pool instance 自己的 `eviction_policy_type/eviction_policy_params` 定义驱逐策略。开启 `enable_lifecycle_tracking=true` 后，推理侧输出到 `output_result_path/infer`，storage pool 输出到 `storage_pool_config.output_result_path`。
+hierarchical 模式使用 `infer_clusters + storage_pool` 描述拓扑：同一个 storage pool 下的同构推理实例只写一份 model、tier 列表和层间 flow，再列出 `infer_ids`；`infer_eviction_params` 单独定义推理侧本地缓存的驱逐模式；`infer_clusters[].engine_read_query_type` 定义 engine-local 本地读语义，必须显式配置为 `prefix_match` 或 `batch_get`；`infer_clusters[].tiers` 的数组顺序就是推理实例本地层级顺序，第一项是写入口；`infer_clusters[].p2p_read_flows` 可选定义同集群 peer read；`infer_clusters[].storage_pool_flow` 描述该推理实例集群写入 storage pool 的边策略。`storage_pool` 是单层 hash pool 专用配置，不复用普通 optimizer 的 `instance_groups/storages` 形态。开启 `enable_lifecycle_tracking=true` 后，推理侧输出到 `output_result_path/infer`，storage pool 输出到 `storage_pool.output_result_path`。
 
-hierarchical 写 storage pool 时，三种策略都以 engine pool-source 层为准：多层 engine 使用最后一层，非分层 engine 使用 shared 层。write-through materialize 本次写入实际传到 source 层的 block，包含直接写穿和 engine 内部驱逐下沉到 source 层的 block；cascading materialize 从 engine 完全驱逐出去的 block；selective materialize 本次写入触达到 source 层且 write touch 达阈值的 block。写入时仍传完整 prefix path，未 materialize 的 prefix 只建前缀树结构，不占容量、不算命中。
+hierarchical 写 storage pool 时，三种策略都以 engine pool-source 层为准：多层 engine 使用最后一层，非分层 engine 使用 shared 层。write-through 写入本次实际传到 source 层的 block，包含直接写穿和 engine 内部驱逐下沉到 source 层的 block；cascading 写入从 engine 完全驱逐出去的 block；selective 写入本次触达到 source 层且 write touch 达阈值的 block。storage pool 只记录真实进入 pool 的 block key。
+
+hierarchical 读 engine-local 时按 `infer_clusters[].engine_read_query_type` 查询；配置 P2P 后，在 engine-local 和 storage pool 之间按 `p2p_read_flows` 查询同集群 peer。完整 `keys` 仍会传给 storage pool：`prefix_match` 下，engine/P2P 已命中的 index 不计入 pool hit，但允许 prefix 继续向后匹配，直到某个 block 在 engine、P2P 和 pool 都未命中；`batch_get` 下，storage pool 也逐 block 独立查询。
 
 `storage_pool_flow` 是跨 manager 的 engine → storage pool 边，不复用 `tier_flows` 的 propagation 命名：
 
 | 字段 | 说明 |
 |---|---|
-| `local_read_touch_enabled` | engine 已命中的 prefix 传入 storage pool 后，pool 中对应已有副本是否刷新读访问时间 |
+| `local_read_touch_enabled` | engine 已命中的 block 传入 storage pool 后，pool 中对应已有副本是否刷新读访问时间 |
 | `shadow_write_touch_enabled` | engine 写 pool 时，pool 已有副本是否做 write touch；只刷新冷热，不更新 writing_time |
 
 ## 指标口径
@@ -186,7 +188,7 @@ Write trace：
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | `input_len` | int64 | 必填 | 输入 token 数，必须为正整数；`InputTokens` 直接使用该值 |
-| `query_type` | string | `prefix_match` | 当前只支持 `prefix_match`；其他值会被跳过 |
+| `query_type` | string | `prefix_match` | 查询语义，支持 `prefix_match` 和 `batch_get` |
 | `block_mask` | bool array 或非负 int64 | 空数组 | trace 已经知道的本地命中 block。数组形式逐 block 标记；整数形式表示从前缀开始的本地命中 block 数 |
 | `sw_size` | int32 | 0 | 滑窗参数，当前标准前缀匹配通常为 0 |
 | `location_spec_names` | string array | 空数组 | 兼容字段，标准分析通常为空 |
@@ -200,6 +202,8 @@ Write trace：
 `request` 字段：
 
 `request` 复用 `get` 的所有字段，并额外支持 `write.ttl_us`。`request` 内部生成的写入会使用同一组 `keys` 和该 `ttl_us`。
+
+`query_type=prefix_match` 时按连续前缀查询，遇到第一个未命中 block 停止；`query_type=batch_get` 时逐 block 独立查询，不要求前缀连续。
 
 `write` 只读取 `type`、`instance_id`、`trace_id`、`timestamp_ns`、`keys` 和 `ttl_us`；其他字段包括 `input_len` 和 `block_mask` 都忽略。`block_mask` 只用于 `get/request`，表示请求进入 KVCM/L3 前 engine 本地已命中的 block。直接分析请求输入时通常可传空数组，此时整体 `HitRate` 仍按 `HitTokens / InputTokens` 计算。
 
@@ -227,7 +231,6 @@ Write trace：
       "write_mode": "write_through",
       "access_propagation_enabled": false,
       "write_propagation_enabled": false,
-      "promote_enabled": true,
       "selective_write_threshold": 2
     }
   ],
@@ -288,7 +291,6 @@ Write trace：
       "write_mode": "write_through",
       "access_propagation_enabled": false,
       "write_propagation_enabled": false,
-      "promote_enabled": true,
       "selective_write_threshold": 2
     },
     {
@@ -297,7 +299,6 @@ Write trace：
       "write_mode": "cascading",
       "access_propagation_enabled": false,
       "write_propagation_enabled": false,
-      "promote_enabled": false,
       "selective_write_threshold": 2
     }
   ]
@@ -313,7 +314,6 @@ Write trace：
 | `write_mode` | string | 必填 | 这条 edge 的写入/驱逐下沉策略 |
 | `access_propagation_enabled` | bool | 必填 | 访问命中高层后，是否跨这条 edge 刷新下层访问时间 |
 | `write_propagation_enabled` | bool | 必填 | 写 touch 命中高层已有副本后，是否跨这条 edge 刷新下层已有副本访问时间 |
-| `promote_enabled` | bool | 必填 | 低层命中后，是否允许跨这条 edge 回填到高层 |
 | `selective_write_threshold` | int | 必填 | 这条 edge 使用 `write_through_selective` 时的写 touch 下写阈值，必须为正整数 |
 
 ### access_propagation_enabled
@@ -323,7 +323,7 @@ Write trace：
 - `true`：一个 block 在多个 tier 有副本时，读命中最高优先级 tier 后，也刷新后续副本 tier 的访问时间。这是默认行为。
 - `false`：只刷新实际命中的最高优先级 tier，不刷新下层副本的访问时间。适用于评估 write-through 或 cascading/promote 后多副本场景下的下层独立冷热衰减。
 
-`promote_enabled=true` 时，低优先级 tier 命中会触发向更高优先级 tier 逐层复制。比如 L3 命中会补齐 L2 和 L1，L2 命中只补 L1，不会额外写入更低层。复制动作会走容量检查，可能立刻触发对应 tier 的驱逐。
+低优先级 tier 命中会固定触发向更高优先级 tier 逐层复制。比如 L3 命中会补齐 L2 和 L1，L2 命中只补 L1，不会额外写入更低层。复制动作会走容量检查，可能立刻触发对应 tier 的驱逐。
 
 ## storage 配置
 

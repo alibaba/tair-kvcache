@@ -200,7 +200,6 @@ OptimizerConfig (顶层配置)
         │   ├── from_tier / to_tier
         │   ├── write_mode
         │   ├── access_propagation_enabled
-        │   ├── promote_enabled
         │   └── selective_write_threshold
         ├── storages[] (存储层数组)
         └── instances[] (实例数组)

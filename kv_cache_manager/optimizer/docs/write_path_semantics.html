@@ -204,22 +204,22 @@
           <td class="phase"><code>cascading</code></td>
           <td>engine pool-source 层发生驱逐</td>
           <td>engine pool-source 层产生 <code>LEAVE_TIER</code> 的 block 写入 storage pool</td>
-          <td>驱逐下沉写入 pool 时不做已有副本 touch</td>
+          <td><code>shadow_write_touch_enabled</code> 控制写入 pool 时已有副本是否 write touch</td>
           <td>驱逐写由 eviction 驱动，不限定触发 eviction 的请求类型</td>
         </tr>
         <tr>
           <td class="phase"><code>write_through_selective</code></td>
           <td>trace write 只写 engine</td>
-          <td>本次写入在 engine pool-source 层产生 <code>ENTER_TIER</code>/真实 <code>WRITE_TOUCH</code>，且写触达次数达到阈值后，将对应 prefix 写入 storage pool</td>
+          <td>本次写入在 engine pool-source 层产生 <code>ENTER_TIER</code>/真实 <code>WRITE_TOUCH</code>，且写触达次数达到阈值后，将对应 block key 写入 storage pool</td>
           <td><code>shadow_write_touch_enabled</code> 控制写入 pool 时已有副本是否 write touch</td>
           <td>传播 touch 不累加阈值，也不触发 selective pool 写入</td>
         </tr>
         <tr>
           <td class="phase">统一写入形态</td>
           <td>所有 engine → pool 写入策略</td>
-          <td>写入 storage pool 时传完整 prefix path，并用 <code>materialized_indices</code> 标识真正落地的 block</td>
-          <td>未 materialize 的 prefix key 只作为 radix tree anchor</td>
-          <td>适配写穿、selective、驱逐下沉产生的非当前请求 block</td>
+          <td>写入 storage pool 时只传真实进入 pool 的 block key</td>
+          <td>storage pool 使用 hash table，只保存真实进入 pool 的 block key</td>
+          <td>写穿、selective、驱逐下沉都复用同一套真实 key 写入</td>
         </tr>
         <tr>
           <td class="phase">pool 内部多层</td>
