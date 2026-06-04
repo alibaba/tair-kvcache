@@ -867,6 +867,13 @@ def get_dataset(args, tokenizer, model_id=None):
         input_requests = sample_hisim_collection_requests(
             args.dataset_path, args.num_prompts, tokenizer=tokenizer
         )
+    elif args.dataset_name == "codex_swebenchpro_traces":
+        input_requests = sample_agentic_trace_requests(
+            args.dataset_path,
+            args.num_prompts,
+            tokenizer=tokenizer,
+            context_len=args.agentic_trace_context_len,
+        )
     else:
         raise ValueError(f"Unknown dataset: {args.dataset_name}")
     return input_requests
@@ -1712,6 +1719,89 @@ def sample_generated_shared_prefix_requests(
     with open(cache_path, "wb") as f:
         pickle.dump(input_requests, f)
 
+    return input_requests
+
+
+def sample_agentic_trace_requests(
+    dataset_path: str,
+    num_requests: int,
+    tokenizer: PreTrainedTokenizerBase,
+    context_len: Optional[int] = None,
+) -> List[DatasetRow]:
+    """Unfold multi-turn agentic traces into one request per assistant turn.
+
+    Source: https://huggingface.co/datasets/Inferact/codex_swebenchpro_traces
+    Loads from local JSONL (--dataset-path) if provided, otherwise pulls from HuggingFace.
+
+    Each assistant turn becomes one request: input is the accumulated chat history
+    apply_chat_template'd up to (but not including) that turn; output_len is the
+    token count of the assistant response. "human" turns carry tool observations
+    (bash output, file contents, etc.) already flattened into plain text.
+
+    NOTE: hisim's mock sampler outputs token id=1 for all positions, so KV cache
+    hits only cover the human-turn prefix — not the assistant response tokens stored
+    in cache from prior turns. See hisim/docs/agentic_trace_kvcache_hit_fix.md.
+    """
+    HF_DATASET_NAME = "Inferact/codex_swebenchpro_traces"
+
+    if dataset_path and os.path.exists(dataset_path):
+        print(f"Loading codex_swebenchpro_traces from local file: {dataset_path}")
+        with open(dataset_path, "r") as f:
+            raw_conversations = [json.loads(line) for line in f if line.strip()]
+    else:
+        print(f"Loading codex_swebenchpro_traces from HuggingFace: {HF_DATASET_NAME}")
+        from datasets import load_dataset as hf_load_dataset
+        hf_ds = hf_load_dataset(HF_DATASET_NAME)
+        raw_conversations = list(hf_ds["train"])
+
+    input_requests: List[DatasetRow] = []
+    for conv_data in raw_conversations:
+        if len(input_requests) >= num_requests:
+            break
+        turns = conv_data.get("conversations", conv_data.get("conversation", []))
+        messages: List[dict] = []
+        for turn in turns:
+            role = "user" if turn["from"] == "human" else "assistant"
+            if role == "assistant":
+                try:
+                    prompt = tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True
+                    )
+                except Exception:
+                    prompt = "\n".join(
+                        f"{m['role']}: {m['content']}" for m in messages
+                    )
+                input_ids = tokenizer.encode(prompt)
+                output_ids = tokenizer.encode(turn["value"])
+                input_len = len(input_ids)
+                output_len = len(output_ids)
+                # Prune too short sequences (copied from sharegpt).
+                if input_len < 2 or output_len < 2:
+                    messages.append({"role": role, "content": turn["value"]})
+                    continue
+                if context_len and input_len + output_len > context_len:
+                    messages.append({"role": role, "content": turn["value"]})
+                    continue
+                input_requests.append(
+                    DatasetRow(
+                        prompt=prompt,
+                        prompt_len=input_len,
+                        output_len=output_len,
+                    )
+                )
+                if len(input_requests) >= num_requests:
+                    break
+            messages.append({"role": role, "content": turn["value"]})
+
+    if not input_requests:
+        raise ValueError(
+            "No valid requests could be unfolded from the codex_swebenchpro_traces dataset. "
+            "Check that conversations have at least one assistant turn within context_len."
+        )
+
+    print(f"#codex_swebenchpro_traces requests unfolded: {len(input_requests)}")
+    print(f"#Input tokens (total):  {np.sum([x.prompt_len for x in input_requests])}")
+    print(f"#Output tokens (total): {np.sum([x.output_len for x in input_requests])}")
     return input_requests
 
 
@@ -2758,6 +2848,7 @@ if __name__ == "__main__":
             "image",
             "mooncake",
             "hisim-collection",
+            "codex_swebenchpro_traces",
         ],
         help="Name of the dataset to benchmark on.",
     )
@@ -3079,6 +3170,15 @@ if __name__ == "__main__":
             "toolagent",
         ],
         help="Underlying workload for the mooncake dataset.",
+    )
+    agentic_group = parser.add_argument_group("codex_swebenchpro_traces dataset arguments")
+    agentic_group.add_argument(
+        "--agentic-trace-context-len",
+        type=int,
+        default=None,
+        help="The context length of the model for the codex_swebenchpro_traces dataset. "
+        "Turns where input+output exceeds this limit are dropped. "
+        "If not set, no filtering is applied.",
     )
     parser.add_argument(
         "--tag", type=str, default=None, help="The tag to be dumped to output."
