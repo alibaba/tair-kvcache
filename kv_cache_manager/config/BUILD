@@ -1,6 +1,17 @@
 package(default_visibility = ["//visibility:public"])
 
 cc_library(
+    name = "leader_elector_interface",
+    hdrs = [
+        "leader_elector_interface.h",
+        "node_endpoint_info.h",
+    ],
+    deps = [
+        "//kv_cache_manager/common",
+    ],
+)
+
+cc_library(
     name = "leader_elector_base",
     srcs = [
         "leader_elector.cc",
@@ -11,6 +22,7 @@ cc_library(
     ],
     deps = [
         ":coordination_backend",
+        ":leader_elector_interface",
         "//kv_cache_manager/common",
         "//kv_cache_manager/common:loop_thread",
     ],

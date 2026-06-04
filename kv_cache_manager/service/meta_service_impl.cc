@@ -9,7 +9,7 @@
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/config/instance_info.h"
-#include "kv_cache_manager/config/leader_elector.h"
+#include "kv_cache_manager/config/leader_elector_interface.h"
 #include "kv_cache_manager/config/node_endpoint_info.h"
 #include "kv_cache_manager/manager/cache_location_view.h"
 #include "kv_cache_manager/manager/cache_manager.h"
@@ -102,7 +102,7 @@ namespace kv_cache_manager {
 
 MetaServiceImpl::MetaServiceImpl(std::shared_ptr<CacheManager> cache_manager,
                                  std::shared_ptr<MetricsReporter> metrics_reporter,
-                                 std::shared_ptr<LeaderElector> leader_elector)
+                                 std::shared_ptr<ILeaderElector> leader_elector)
     : ServiceImplBase()
     , cache_manager_(std::move(cache_manager))
     , metrics_reporter_(std::move(metrics_reporter))

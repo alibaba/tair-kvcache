@@ -16,7 +16,7 @@ class DebugServiceImpl;
 class AdminServiceImpl;
 class MetaServiceImpl;
 class CoordinationBackend;
-class LeaderElector;
+class ILeaderElector;
 class RegistryManager;
 class CacheManager;
 
@@ -73,7 +73,7 @@ private:
     std::thread debug_http_thread_;
 
     std::shared_ptr<CoordinationBackend> coordination_backend_;
-    std::shared_ptr<LeaderElector> leader_elector_;
+    std::shared_ptr<ILeaderElector> leader_elector_;
     std::shared_ptr<RegistryManager> registry_manager_;
     std::shared_ptr<CacheManager> cache_manager_;
 

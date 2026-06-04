@@ -10,6 +10,7 @@
 #include <thread>
 
 #include "kv_cache_manager/common/error_code.h"
+#include "kv_cache_manager/config/leader_elector_interface.h"
 
 namespace kv_cache_manager {
 
@@ -32,24 +33,22 @@ struct RoleTransitionTask {
     std::function<void()> action;
 };
 
-class LeaderElector {
+class LeaderElector : public ILeaderElector {
 public:
-    using HandlerFuncType = std::function<void()>;
-
     LeaderElector(const std::shared_ptr<CoordinationBackend> &coordination_backend,
                   const std::string &lock_key,
                   const std::string &lock_value,
                   int64_t lease_ms = 60,
                   int64_t loop_interval_ms = 6);
-    ~LeaderElector();
+    ~LeaderElector() override;
     LeaderElector(const LeaderElector &) = delete;
     LeaderElector &operator=(const LeaderElector &) = delete;
 
-    bool Start();
-    void Stop();
+    bool Start() override;
+    void Stop() override;
 
     // 角色状态查询
-    bool IsLeader() const;
+    bool IsLeader() const override;
     RoleState GetRoleState() const;
     bool IsStableState() const;
 
@@ -57,29 +56,29 @@ public:
     bool WaitForStableState(int64_t timeout_ms = -1);
 
     // 租约信息
-    int64_t GetLeaseExpirationTime() const;
+    int64_t GetLeaseExpirationTime() const override;
 
     // 主动降级
-    void Demote();
+    void Demote() override;
 
     // 设置回调（必须在 Start 之前调用）
-    void SetNoLongerLeaderHandler(const HandlerFuncType &handler);
-    void SetBecomeLeaderHandler(const HandlerFuncType &handler);
+    void SetNoLongerLeaderHandler(const HandlerFuncType &handler) override;
+    void SetBecomeLeaderHandler(const HandlerFuncType &handler) override;
 
     // Leader 信息
-    std::string GetLeaderNodeID() const;
-    std::string GetSelfNodeID() const;
+    std::string GetLeaderNodeID() const override;
+    std::string GetSelfNodeID() const override;
 
     // 节点连接信息存储（通过 CoordinationBackend KV）
-    ErrorCode SetSelfNodeInfo(const NodeEndpointInfo &node_info);
-    ErrorCode GetSelfNodeInfo(NodeEndpointInfo &out_node_info) const;
-    ErrorCode GetNodeInfo(const std::string &node_id, NodeEndpointInfo &out_node_info);
-    ErrorCode GetLeaderNodeInfo(NodeEndpointInfo &out_node_info);
+    ErrorCode SetSelfNodeInfo(const NodeEndpointInfo &node_info) override;
+    ErrorCode GetSelfNodeInfo(NodeEndpointInfo &out_node_info) const override;
+    ErrorCode GetNodeInfo(const std::string &node_id, NodeEndpointInfo &out_node_info) override;
+    ErrorCode GetLeaderNodeInfo(NodeEndpointInfo &out_node_info) override;
 
     // 选主控制
-    void SetForbidCampaignLeaderTimeMs(int64_t forbid_time);
-    int64_t GetForbidCampaignLeaderTimeMs() const;
-    int64_t GetLastLoopTimeUs() const;
+    void SetForbidCampaignLeaderTimeMs(int64_t forbid_time) override;
+    int64_t GetForbidCampaignLeaderTimeMs() const override;
+    int64_t GetLastLoopTimeUs() const override;
     static const char *RoleStateToString(const RoleState state);
 
 private:

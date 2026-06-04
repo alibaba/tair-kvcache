@@ -6,7 +6,7 @@
 #include "kv_cache_manager/service/service_impl_base.h"
 
 namespace kv_cache_manager {
-class LeaderElector;
+class ILeaderElector;
 
 class CacheManager;
 class MetricsReporter;
@@ -20,7 +20,7 @@ public:
                      std::shared_ptr<MetricsReporter> metrics_reporter,
                      std::shared_ptr<MetricsRegistry> metrics_registry,
                      std::shared_ptr<RegistryManager> registry_manager,
-                     std::shared_ptr<LeaderElector> leader_elector);
+                     std::shared_ptr<ILeaderElector> leader_elector);
     ~AdminServiceImpl() override = default;
 
     // 实现所有ConfigService的接口方法
@@ -126,7 +126,7 @@ private:
     std::shared_ptr<MetricsReporter> metrics_reporter_;
     std::shared_ptr<MetricsRegistry> metrics_registry_; // for the GetMetrics API
     std::shared_ptr<RegistryManager> registry_manager_;
-    std::shared_ptr<LeaderElector> leader_elector_;
+    std::shared_ptr<ILeaderElector> leader_elector_;
 };
 
 } // namespace kv_cache_manager
