@@ -2,7 +2,7 @@
 
 ## Background
 
-The `codex_swebenchpro_traces` dataset mode unfolds multi-turn conversations into
+The `codex-swebenchpro-traces` dataset mode unfolds multi-turn conversations into
 one request per assistant turn:
 
 ```

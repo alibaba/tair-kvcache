@@ -867,7 +867,7 @@ def get_dataset(args, tokenizer, model_id=None):
         input_requests = sample_hisim_collection_requests(
             args.dataset_path, args.num_prompts, tokenizer=tokenizer
         )
-    elif args.dataset_name == "codex_swebenchpro_traces":
+    elif args.dataset_name == "codex-swebenchpro-traces":
         input_requests = sample_agentic_trace_requests(
             args.dataset_path,
             args.num_prompts,
@@ -1745,11 +1745,11 @@ def sample_agentic_trace_requests(
     HF_DATASET_NAME = "Inferact/codex_swebenchpro_traces"
 
     if dataset_path and os.path.exists(dataset_path):
-        print(f"Loading codex_swebenchpro_traces from local file: {dataset_path}")
+        print(f"Loading codex-swebenchpro-traces from local file: {dataset_path}")
         with open(dataset_path, "r") as f:
             raw_conversations = [json.loads(line) for line in f if line.strip()]
     else:
-        print(f"Loading codex_swebenchpro_traces from HuggingFace: {HF_DATASET_NAME}")
+        print(f"Loading codex-swebenchpro-traces from HuggingFace: {HF_DATASET_NAME}")
         from datasets import load_dataset as hf_load_dataset
         hf_ds = hf_load_dataset(HF_DATASET_NAME)
         raw_conversations = list(hf_ds["train"])
@@ -1795,11 +1795,11 @@ def sample_agentic_trace_requests(
 
     if not input_requests:
         raise ValueError(
-            "No valid requests could be unfolded from the codex_swebenchpro_traces dataset. "
+            "No valid requests could be unfolded from the codex-swebenchpro-traces dataset. "
             "Check that conversations have at least one assistant turn within context_len."
         )
 
-    print(f"#codex_swebenchpro_traces requests unfolded: {len(input_requests)}")
+    print(f"#codex-swebenchpro-traces requests unfolded: {len(input_requests)}")
     print(f"#Input tokens (total):  {np.sum([x.prompt_len for x in input_requests])}")
     print(f"#Output tokens (total): {np.sum([x.output_len for x in input_requests])}")
     return input_requests
@@ -2848,7 +2848,7 @@ if __name__ == "__main__":
             "image",
             "mooncake",
             "hisim-collection",
-            "codex_swebenchpro_traces",
+            "codex-swebenchpro-traces",
         ],
         help="Name of the dataset to benchmark on.",
     )
@@ -3171,12 +3171,12 @@ if __name__ == "__main__":
         ],
         help="Underlying workload for the mooncake dataset.",
     )
-    agentic_group = parser.add_argument_group("codex_swebenchpro_traces dataset arguments")
+    agentic_group = parser.add_argument_group("codex-swebenchpro-traces dataset arguments")
     agentic_group.add_argument(
         "--agentic-trace-context-len",
         type=int,
         default=None,
-        help="The context length of the model for the codex_swebenchpro_traces dataset. "
+        help="The context length of the model for the codex-swebenchpro-traces dataset. "
         "Turns where input+output exceeds this limit are dropped. "
         "If not set, no filtering is applied.",
     )
