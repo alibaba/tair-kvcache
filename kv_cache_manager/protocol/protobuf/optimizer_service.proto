@@ -1,0 +1,218 @@
+syntax = "proto3";
+
+package kv_cache_manager.proto.optimizer;
+
+option cc_generic_services = false;
+
+enum ErrorCode {
+    UNSPECIFIED = 0;
+    OK = 1;
+    UNSUPPORTED = 2;
+    INTERNAL_ERROR = 3;
+    SERVICE_NOT_READY = 4;
+    INVALID_ARGUMENT = 5;
+    DUPLICATE_ENTITY = 6;
+    REACH_MAX_ENTITY_CAPACITY = 7;
+    INSTANCE_NOT_EXIST = 8;
+    SERVER_NOT_LEADER = 9;
+
+    IO_ERROR = 20;
+    UNKNOWN_ERROR = 100;
+    ERROR_MAX = 65535;
+}
+
+message Status {
+    ErrorCode code = 1;
+    string message = 2;
+}
+
+message CommonResponseHeader {
+    Status status = 1;
+    string request_id = 2;
+    string tracer_result = 3;
+}
+
+message CommonResponse { CommonResponseHeader header = 1; }
+
+message LocationSpecInfo {
+    string name = 1;
+    int64 size = 2;
+}
+
+message LocationSpecGroup {
+    string name = 1;
+    repeated string spec_names = 2;
+}
+
+// OptimizerInstanceGroup 配置，控制在线优化器的缓存模拟行为
+message OptimizerInstanceGroupProto {
+    string name = 1;                    // group 唯一名称
+    bool enabled = 2;                   // 是否启用该 group 的在线优化
+    repeated double capacity_gb = 3;    // 模拟的缓存容量列表，单位 GB，可配多档
+    string indexer_type = 4;            // indexer 类型: 默认 "lru"
+    int64 max_key_count = 5;            // indexer 最大 key 数量，0 表示不限制
+    int64 ttl_seconds = 6;             // TTL 秒数，0 表示不启用 TTL 淘汰
+}
+
+// InstanceGroup 增删改查
+
+message CreateInstanceGroupRequest {
+    string trace_id = 1;
+    OptimizerInstanceGroupProto instance_group = 2;
+}
+
+message UpdateInstanceGroupRequest {
+    string trace_id = 1;
+    OptimizerInstanceGroupProto instance_group = 2;
+}
+
+message RemoveInstanceGroupRequest {
+    string trace_id = 1;
+    string name = 2; // group 名称
+}
+
+message GetInstanceGroupRequest {
+    string trace_id = 1;
+    string name = 2; // group 名称
+}
+
+message GetInstanceGroupResponse {
+    CommonResponseHeader header = 1;
+    OptimizerInstanceGroupProto instance_group = 2;
+}
+
+message ListInstanceGroupsRequest {
+    string trace_id = 1;
+}
+
+message ListInstanceGroupsResponse {
+    CommonResponseHeader header = 1;
+    repeated OptimizerInstanceGroupProto instance_groups = 2;
+}
+
+// Instance 注册/删除（注册前 group 必须已存在）
+
+message OptimizerRegisterInstanceRequest {
+    string trace_id = 1;
+    string instance_group = 2;   // 所属 group 名称
+    string instance_id = 3;      // 实例唯一标识，代表一个模型的具体部署
+    int32 block_size = 4;        // 一个 block 包含多少 token
+    repeated LocationSpecInfo location_spec_infos = 5;   // block 内各 spec 的大小定义
+    repeated LocationSpecGroup location_spec_groups = 6; // spec 分组，用于混合部署场景
+    int32 linear_step = 7;       // 线性步长，>=1 表示 full+linear 混合部署模式
+    string full_group_name = 8;  // 混合部署时 full spec group 的名称
+}
+
+message OptimizerRegisterInstanceResponse {
+    CommonResponseHeader header = 1;
+    repeated int64 capacity_blocks = 2; // 各档容量对应的 block 数
+    int64 avg_bytes_per_block = 3;      // 平均每个 block 的字节数
+    int64 size_full_only = 4;           // 仅 full spec 的单 block 字节数
+    int64 size_full_linear = 5;         // full+linear 混合的单 block 字节数
+}
+
+message OptimizerRemoveInstanceRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+}
+
+message OptimizerRemoveInstanceResponse {
+    CommonResponseHeader header = 1;
+}
+
+message OptimizerGetInstanceRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+}
+
+message OptimizerGetInstanceResponse {
+    CommonResponseHeader header = 1;
+    string instance_group = 2;
+    string instance_id = 3;
+    int32 block_size = 4;
+    repeated LocationSpecInfo location_spec_infos = 5;
+    repeated LocationSpecGroup location_spec_groups = 6;
+    int32 linear_step = 7;
+    string full_group_name = 8;
+}
+
+// TraceQuery：模拟 block 级缓存命中
+
+message TraceQueryRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    repeated int64 block_keys = 3;  // 本次请求的 block key 序列（有序，前缀匹配）
+    repeated int64 token_ids = 4;   // 预留：token 粒度追踪
+}
+
+message TraceQueryResponse {
+    CommonResponseHeader header = 1;
+    int64 cache_hit_count = 2; // 命中的 block 数（前缀连续命中长度）
+    int64 total_blocks = 3;    // 本次请求的总 block 数
+    int64 current_unique_keys = 4; // 当前 unique key 数（容量占用）
+    int64 max_hit_count = 5;       // 最大理论命中数（-1 表示未启用）
+}
+
+// Instance 列表/统计重置
+
+message OptimizerListInstancesRequest {
+    string trace_id = 1;
+    string instance_group = 2; // 为空时返回所有 instance
+}
+
+message PerCapacityHitRate {
+    double capacity_gb = 1;
+    int64 total_hits = 2;
+    double hit_rate = 3;
+}
+
+message OptimizerInstanceSummary {
+    string instance_id = 1;
+    string instance_group = 2;
+    int32 block_size = 3;
+    int64 total_queries = 4;        // 累计查询次数
+    int64 total_blocks_queried = 5; // 累计查询 block 数
+    int64 total_max_hits = 6;       // 累计最大理论命中 block 数（max_key_count<=0 时有效）
+    double max_hit_rate = 7;        // 最大理论命中率
+    int64 unique_keys = 8;          // 当前去重后的 key 数量
+    int64 avg_bytes_per_block = 9;  // 平均每个 block 字节数
+    int32 linear_step = 10;         // 线性步长
+    int64 eviction_count = 11;       // 累计驱逐次数
+    int64 memory_usage_bytes = 12;   // indexer 内部数据结构的估算内存占用
+    int64 kv_cache_usage_bytes = 13;  // 当前追踪的所有 key 对应的 kv cache 总大小
+    int64 ttl_eviction_count = 14;    // 因 TTL 过期而驱逐的 key 数量
+    repeated PerCapacityHitRate per_capacity_hit_rates = 15; // 各容量档位的累积命中率
+}
+
+message OptimizerListInstancesResponse {
+    CommonResponseHeader header = 1;
+    repeated OptimizerInstanceSummary instances = 2;
+}
+
+message OptimizerResetStatsRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+}
+
+message OptimizerResetStatsResponse {
+    CommonResponseHeader header = 1;
+}
+
+service OptimizerService {
+    // InstanceGroup 管理
+    rpc CreateInstanceGroup(CreateInstanceGroupRequest) returns (CommonResponse);
+    rpc UpdateInstanceGroup(UpdateInstanceGroupRequest) returns (CommonResponse);
+    rpc RemoveInstanceGroup(RemoveInstanceGroupRequest) returns (CommonResponse);
+    rpc GetInstanceGroup(GetInstanceGroupRequest) returns (GetInstanceGroupResponse);
+    rpc ListInstanceGroups(ListInstanceGroupsRequest) returns (ListInstanceGroupsResponse);
+
+    // Instance 管理
+    rpc RegisterInstance(OptimizerRegisterInstanceRequest) returns (OptimizerRegisterInstanceResponse);
+    rpc RemoveInstance(OptimizerRemoveInstanceRequest) returns (OptimizerRemoveInstanceResponse);
+    rpc GetInstance(OptimizerGetInstanceRequest) returns (OptimizerGetInstanceResponse);
+    rpc ListInstances(OptimizerListInstancesRequest) returns (OptimizerListInstancesResponse);
+
+    // 在线 TraceQuery
+    rpc TraceQuery(TraceQueryRequest) returns (TraceQueryResponse);
+    rpc ResetStats(OptimizerResetStatsRequest) returns (OptimizerResetStatsResponse);
+}
