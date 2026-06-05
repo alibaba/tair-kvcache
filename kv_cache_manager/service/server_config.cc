@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <fstream>
+#include <sstream>
 #include <stdio.h>
 
 #include "kv_cache_manager/common/env_util.h"
@@ -153,6 +154,73 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
      [](const std::string &value, ServerConfig *config) {
          config->prometheus_prefix_ = value;
          return true;
+     }},
+    {"kvcm.raft.server_id",
+     [](const std::string &value, ServerConfig *config) {
+         config->raft_server_id_ = std::stoi(value);
+         return true;
+     }},
+    {"kvcm.raft.host",
+     [](const std::string &value, ServerConfig *config) {
+         config->raft_host_ = value;
+         return true;
+     }},
+    {"kvcm.raft.port",
+     [](const std::string &value, ServerConfig *config) {
+         config->raft_port_ = std::stoi(value);
+         return true;
+     }},
+    {"kvcm.raft.peers",
+     [](const std::string &value, ServerConfig *config) {
+         // Format: "id1:host1:port1,id2:host2:port2,..."
+         config->raft_peers_.clear();
+         if (value.empty()) {
+             return true;
+         }
+         std::istringstream ss(value);
+         std::string token;
+         while (std::getline(ss, token, ',')) {
+             StringUtil::Trim(token);
+             if (token.empty()) continue;
+             // Split by ':'
+             auto pos1 = token.find(':');
+             auto pos2 = token.find(':', pos1 + 1);
+             if (pos1 == std::string::npos || pos2 == std::string::npos) {
+                 fprintf(stderr, "Invalid raft peer format: %s (expected id:host:port)\n", token.c_str());
+                 return false;
+             }
+             ServerConfig::RaftPeer peer;
+             peer.server_id = std::stoi(token.substr(0, pos1));
+             peer.host = token.substr(pos1 + 1, pos2 - pos1 - 1);
+             peer.port = std::stoi(token.substr(pos2 + 1));
+             config->raft_peers_.push_back(peer);
+         }
+         return true;
+     }},
+    {"kvcm.raft.data_dir",
+     [](const std::string &value, ServerConfig *config) {
+         config->raft_data_dir_ = value;
+         return true;
+     }},
+    {"kvcm.raft.snapshot_distance",
+     [](const std::string &value, ServerConfig *config) {
+         config->raft_snapshot_distance_ = std::stoi(value);
+         return true;
+     }},
+    {"kvcm.raft.election_timeout_lower",
+     [](const std::string &value, ServerConfig *config) {
+         config->raft_election_timeout_lower_ = std::stoi(value);
+         return true;
+     }},
+    {"kvcm.raft.election_timeout_upper",
+     [](const std::string &value, ServerConfig *config) {
+         config->raft_election_timeout_upper_ = std::stoi(value);
+         return true;
+     }},
+    {"kvcm.raft.heart_beat_interval",
+     [](const std::string &value, ServerConfig *config) {
+         config->raft_heart_beat_interval_ = std::stoi(value);
+         return true;
      }}};
 // clang-format on
 
@@ -283,6 +351,16 @@ bool ServerConfig::Check() {
     if (registry_storage_uri_.empty()) {
         fprintf(stderr, "registry_storage_uri must be set\n");
         return false;
+    }
+    if (IsRaftEnabled()) {
+        if (raft_server_id_ <= 0) {
+            fprintf(stderr, "kvcm.raft.server_id must be > 0 when raft is enabled\n");
+            return false;
+        }
+        if (raft_port_ <= 0) {
+            fprintf(stderr, "kvcm.raft.port must be > 0 when raft is enabled\n");
+            return false;
+        }
     }
     return true;
 }

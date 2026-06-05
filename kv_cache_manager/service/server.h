@@ -12,6 +12,11 @@ class Server;
 }
 
 namespace kv_cache_manager {
+
+namespace raft_meta {
+class RaftCoordinator;
+} // namespace raft_meta
+
 class DebugServiceImpl;
 class AdminServiceImpl;
 class MetaServiceImpl;
@@ -46,6 +51,8 @@ private:
     bool StartMetricsReportThread();
     void CreateAndRegisterEventPublisher();
     bool CreateLeaderElector();
+    bool CreateRaftLeaderElector();
+    bool CreateLeaseLockLeaderElector();
 
     void OnBecomeLeader();
     void OnNoLongerLeader();
@@ -81,5 +88,7 @@ private:
     std::shared_ptr<MetricsReporterFactory> metrics_reporter_factory_;
     std::shared_ptr<MetricsReporter> metrics_reporter_;
     std::shared_ptr<LoopThread> metrics_report_thread_;
+
+    std::shared_ptr<raft_meta::RaftCoordinator> raft_coordinator_;
 };
 } // namespace kv_cache_manager

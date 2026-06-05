@@ -77,6 +77,56 @@ TEST_F(ServerConfigTest, TestSimple) {
     }
 }
 
+TEST_F(ServerConfigTest, RaftConfigParsing) {
+    ServerConfig config;
+    std::unordered_map<std::string, std::string> environ;
+    environ["kvcm.registry_storage.uri"] = "redis://127.0.0.1:6379";
+    environ["kvcm.raft.server_id"] = "3";
+    environ["kvcm.raft.host"] = "10.0.0.1";
+    environ["kvcm.raft.port"] = "9100";
+    environ["kvcm.raft.peers"] = "1:10.0.0.1:9100,2:10.0.0.2:9100,3:10.0.0.3:9100";
+    environ["kvcm.raft.data_dir"] = "/data/raft";
+    environ["kvcm.raft.snapshot_distance"] = "50000";
+    environ["kvcm.raft.election_timeout_lower"] = "500";
+    environ["kvcm.raft.election_timeout_upper"] = "1000";
+    environ["kvcm.raft.heart_beat_interval"] = "200";
+    ASSERT_TRUE(config.Parse("", environ));
+    ASSERT_TRUE(config.Check());
+    ASSERT_TRUE(config.IsRaftEnabled());
+    ASSERT_EQ(3, config.GetRaftServerId());
+    ASSERT_EQ("10.0.0.1", config.GetRaftHost());
+    ASSERT_EQ(9100, config.GetRaftPort());
+    ASSERT_EQ(3u, config.GetRaftPeers().size());
+    EXPECT_EQ(1, config.GetRaftPeers()[0].server_id);
+    EXPECT_EQ("10.0.0.1", config.GetRaftPeers()[0].host);
+    EXPECT_EQ(9100, config.GetRaftPeers()[0].port);
+    EXPECT_EQ(2, config.GetRaftPeers()[1].server_id);
+    ASSERT_EQ("/data/raft", config.GetRaftDataDir());
+    ASSERT_EQ(50000, config.GetRaftSnapshotDistance());
+    ASSERT_EQ(500, config.GetRaftElectionTimeoutLower());
+    ASSERT_EQ(1000, config.GetRaftElectionTimeoutUpper());
+    ASSERT_EQ(200, config.GetRaftHeartBeatInterval());
+}
+
+TEST_F(ServerConfigTest, RaftDisabledByDefault) {
+    ServerConfig config;
+    std::unordered_map<std::string, std::string> environ;
+    environ["kvcm.registry_storage.uri"] = "redis://127.0.0.1:6379";
+    ASSERT_TRUE(config.Parse("", environ));
+    ASSERT_FALSE(config.IsRaftEnabled());
+}
+
+TEST_F(ServerConfigTest, RaftCheckFailsWithInvalidServerId) {
+    ServerConfig config;
+    std::unordered_map<std::string, std::string> environ;
+    environ["kvcm.registry_storage.uri"] = "redis://127.0.0.1:6379";
+    environ["kvcm.raft.data_dir"] = "/data/raft";
+    environ["kvcm.raft.port"] = "9100";
+    // server_id defaults to 0 which is invalid
+    ASSERT_TRUE(config.Parse("", environ));
+    ASSERT_FALSE(config.Check());
+}
+
 TEST_F(ServerConfigTest, TestUnderscoreEnvFallback) {
     // 仅设置下划线版本，验证 fallback 生效
     {

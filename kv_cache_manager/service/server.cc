@@ -9,7 +9,9 @@
 #include "kv_cache_manager/config/coordination_backend_factory.h"
 #include "kv_cache_manager/config/lease_lock_leader_elector.h"
 #include "kv_cache_manager/config/node_endpoint_info.h"
+#include "kv_cache_manager/config/raft_leader_elector.h"
 #include "kv_cache_manager/config/registry_manager.h"
+#include "kv_cache_manager/meta/raft/raft_coordinator.h"
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/event/log_event_publisher.h"
 #include "kv_cache_manager/manager/cache_manager.h"
@@ -306,6 +308,84 @@ void Server::CreateAndRegisterEventPublisher() {
     KVCM_LOG_INFO("create and register event publisher OK");
 }
 bool Server::CreateLeaderElector() {
+    if (config_.IsRaftEnabled()) {
+        return CreateRaftLeaderElector();
+    }
+    return CreateLeaseLockLeaderElector();
+}
+
+bool Server::CreateRaftLeaderElector() {
+    std::string host = config_.GetAdvertisedHost();
+    if (host.empty()) {
+        host = NetUtil::GetLocalIp();
+    }
+    std::string raft_host = config_.GetRaftHost();
+    if (raft_host.empty()) {
+        raft_host = host;
+    }
+
+    std::string node_id = config_.GetLeaderElectorNodeId();
+    if (node_id.empty()) {
+        node_id = raft_host + ":" + std::to_string(config_.GetServiceAdminHttpPort())
+                  + "_" + StringUtil::GenerateRandomString(16);
+    }
+
+    NodeEndpointInfo node_info(node_id,
+                               host,
+                               config_.GetServiceRpcPort(),
+                               config_.GetServiceHttpPort(),
+                               config_.GetServiceAdminRpcPort(),
+                               config_.GetServiceAdminHttpPort(),
+                               config_.GetCustomInfo());
+
+    // Build RaftCoordinator::Config.
+    raft_meta::RaftCoordinator::Config raft_cfg;
+    raft_cfg.server_id = config_.GetRaftServerId();
+    raft_cfg.port = config_.GetRaftPort();
+    raft_cfg.self_endpoint = raft_host + ":" + std::to_string(raft_cfg.port);
+    raft_cfg.self_aux = node_info.ToJsonString();
+    raft_cfg.data_dir = config_.GetRaftDataDir();
+    raft_cfg.snapshot_distance = config_.GetRaftSnapshotDistance();
+    raft_cfg.election_timeout_lower = config_.GetRaftElectionTimeoutLower();
+    raft_cfg.election_timeout_upper = config_.GetRaftElectionTimeoutUpper();
+    raft_cfg.heart_beat_interval = config_.GetRaftHeartBeatInterval();
+
+    for (const auto &p : config_.GetRaftPeers()) {
+        raft_meta::RaftCoordinator::PeerSpec ps;
+        ps.server_id = p.server_id;
+        ps.endpoint = p.host + ":" + std::to_string(p.port);
+        raft_cfg.peers.push_back(ps);
+    }
+
+    // Create and start the coordinator before the elector, because the
+    // elector's Start() installs a leadership callback that must be
+    // captured at coordinator Start() time.
+    raft_coordinator_ = std::make_shared<raft_meta::RaftCoordinator>();
+
+    auto elector = std::make_shared<RaftLeaderElector>(node_id);
+    elector->SetBecomeLeaderHandler([this]() { OnBecomeLeader(); });
+    elector->SetNoLongerLeaderHandler([this]() { OnNoLongerLeader(); });
+
+    if (!elector->Start()) {
+        KVCM_LOG_ERROR("RaftLeaderElector Start failed");
+        return false;
+    }
+    elector->SetSelfNodeInfo(node_info);
+
+    ErrorCode rc = raft_coordinator_->Start(raft_cfg);
+    if (rc != EC_OK) {
+        KVCM_LOG_ERROR("RaftCoordinator Start failed, rc=%d", rc);
+        return false;
+    }
+    raft_meta::RaftCoordinator::SetInstance(raft_coordinator_.get());
+
+    leader_elector_ = elector;
+    KVCM_LOG_INFO("Raft leader elector created, server_id[%d] node_id[%s]",
+                  raft_cfg.server_id, node_id.c_str());
+    return true;
+}
+
+bool Server::CreateLeaseLockLeaderElector() {
     auto coordination_uri = config_.GetCoordinationUri();
     std::string node_id = config_.GetLeaderElectorNodeId();
     std::string host = config_.GetAdvertisedHost();
@@ -330,7 +410,6 @@ bool Server::CreateLeaderElector() {
     leader_elector_->SetBecomeLeaderHandler([this]() { OnBecomeLeader(); });
     leader_elector_->SetNoLongerLeaderHandler([this]() { OnNoLongerLeader(); });
 
-    // 写入本节点的连接信息到协调后端
     {
         NodeEndpointInfo node_info(node_id,
                                    host,
@@ -391,6 +470,12 @@ void Server::Stop() {
         KVCM_LOG_INFO("metrics reporter stopped.");
     }
     KVCM_LOG_INFO("admin http server stopped.");
+    if (raft_coordinator_) {
+        raft_meta::RaftCoordinator::SetInstance(nullptr);
+        raft_coordinator_->Stop();
+        raft_coordinator_.reset();
+        KVCM_LOG_INFO("raft coordinator stopped.");
+    }
     KVCM_LOG_INFO("kvcm server stopped, goodbye!");
 }
 

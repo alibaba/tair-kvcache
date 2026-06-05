@@ -4,6 +4,7 @@
 #include <functional>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace kv_cache_manager {
 
@@ -46,6 +47,23 @@ public:
     const std::string &GetAdvertisedHost() const { return advertised_host_; }
     const std::string &GetCustomInfo() const { return custom_info_; }
 
+    // Raft section. Empty raft_data_dir_ means raft is disabled.
+    struct RaftPeer {
+        int32_t server_id = 0;
+        std::string host;
+        int32_t port = 0;
+    };
+    bool IsRaftEnabled() const { return !raft_data_dir_.empty(); }
+    int32_t GetRaftServerId() const { return raft_server_id_; }
+    const std::string &GetRaftHost() const { return raft_host_; }
+    int32_t GetRaftPort() const { return raft_port_; }
+    const std::vector<RaftPeer> &GetRaftPeers() const { return raft_peers_; }
+    const std::string &GetRaftDataDir() const { return raft_data_dir_; }
+    int32_t GetRaftSnapshotDistance() const { return raft_snapshot_distance_; }
+    int32_t GetRaftElectionTimeoutLower() const { return raft_election_timeout_lower_; }
+    int32_t GetRaftElectionTimeoutUpper() const { return raft_election_timeout_upper_; }
+    int32_t GetRaftHeartBeatInterval() const { return raft_heart_beat_interval_; }
+
 private:
     void UpdateDefaultConfig();
     bool ParseFromFile(const std::string &config_file);
@@ -80,6 +98,17 @@ private:
     std::string event_publishers_configs_;
     std::string advertised_host_;
     std::string custom_info_;
+
+    // Raft
+    int32_t raft_server_id_ = 0;
+    std::string raft_host_;
+    int32_t raft_port_ = 0;
+    std::vector<RaftPeer> raft_peers_;
+    std::string raft_data_dir_;
+    int32_t raft_snapshot_distance_ = 100000;
+    int32_t raft_election_timeout_lower_ = 300;
+    int32_t raft_election_timeout_upper_ = 600;
+    int32_t raft_heart_beat_interval_ = 100;
 
 private:
     using SettingFunction = std::function<bool(const std::string &, ServerConfig *config)>;
