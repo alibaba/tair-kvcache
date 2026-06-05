@@ -5,13 +5,15 @@
 #include <queue>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "kv_cache_manager/optimizer/config/hierarchical_replay_config.h"
 #include "kv_cache_manager/optimizer/config/insight_simulator_types.h"
 #include "kv_cache_manager/optimizer/manager/hash_storage_pool_manager.h"
+#include "kv_cache_manager/optimizer/manager/infer_engine_scheduler.h"
 #include "kv_cache_manager/optimizer/manager/optimizer_manager.h"
+#include "kv_cache_manager/optimizer/manager/tier_global_tracker.h"
 #include "kv_cache_manager/optimizer/trace_loader/optimizer_schema_trace.h"
 
 namespace kv_cache_manager {
@@ -64,11 +66,23 @@ private:
         size_t storage_pool_hit_blocks = 0;
         size_t input_tokens = 0;
         size_t block_size_tokens = 0;
+        std::string peer_source_infer_id;
     };
 
     struct CombinedWriteRecord {
         int64_t timestamp_ns = 0;
         size_t write_blocks = 0;
+    };
+
+    struct PoolWriteIoRecord {
+        std::string trace_id;
+        std::string engine_instance_id;
+        std::string storage_pool_id;
+        std::string reason;
+        int64_t timestamp_ns = 0;
+        size_t inserted_blocks = 0;
+        size_t existing_blocks = 0;
+        size_t block_size_tokens = 0;
     };
 
     struct PendingWrite {
@@ -86,38 +100,16 @@ private:
         }
     };
 
-    class TierGlobalTracker {
-    public:
-        void Add(const std::string &cluster_id, const std::string &tier, int64_t key, const std::string &infer_id);
-        void Remove(const std::string &cluster_id, const std::string &tier, int64_t key, const std::string &infer_id);
-        void RemoveFromAllTiers(const std::string &cluster_id, int64_t key, const std::string &infer_id);
-        bool Contains(const std::string &cluster_id,
-                      const std::string &tier,
-                      int64_t key,
-                      const std::string &infer_id) const;
-
-    private:
-        static std::string ScopeKey(const std::string &cluster_id, const std::string &tier);
-
-        std::unordered_map<std::string, std::unordered_map<int64_t, std::unordered_set<std::string>>> holders_;
-    };
-
-    struct P2PReadResult {
-        std::string peer_infer_id;
-        std::vector<size_t> hit_indices;
-    };
-
     bool ValidateAndBuildMappings();
-    void ScheduleTraces(std::vector<std::shared_ptr<OptimizerSchemaTrace>> &traces) const;
     void RunTracesWithPrefixHitScheduling(const std::vector<std::shared_ptr<OptimizerSchemaTrace>> &traces);
-    std::string
-    ChoosePrefixHitEngineInstance(const std::vector<int64_t> &block_ids, int64_t timestamp, size_t request_idx) const;
     void HandleRequest(const RequestSchemaTrace &trace);
     void ScheduleRequestWrite(const RequestSchemaTrace &trace);
     void FlushPendingWritesThrough(int64_t timestamp_ns);
     void FlushAllPendingWrites();
     void RunPendingWrite(const WriteCacheSchemaTrace &trace);
     void ExportCombinedHitRates() const;
+    void ExportReadIo() const;
+    void ExportPoolWriteIo() const;
     const std::string &StoragePoolForEngine(const std::string &engine_instance_id) const;
     const std::string &EngineReadQueryTypeForEngine(const std::string &engine_instance_id) const;
     const StoragePoolFlowConfig &StoragePoolFlowForEngine(const std::string &engine_instance_id) const;
@@ -125,11 +117,6 @@ private:
     const std::vector<std::string> &InferIdsForCluster(const std::string &cluster_id) const;
     const std::vector<P2PReadFlowConfig> &P2PReadFlowsForCluster(const std::string &cluster_id) const;
     void ApplyEngineTierEvents(const std::vector<TierFlowKeyEvent> &events);
-    P2PReadResult SelectP2PPeer(const std::string &engine_instance_id,
-                                const std::string &cluster_id,
-                                const P2PReadFlowConfig &flow,
-                                const std::vector<int64_t> &block_ids,
-                                const std::vector<bool> &satisfied_mask) const;
     void FillEngineFromHitIndices(const std::string &engine_instance_id,
                                   const std::string &storage_pool_id,
                                   const std::string &trace_id,
@@ -137,14 +124,14 @@ private:
                                   const std::vector<int64_t> &block_ids,
                                   const std::vector<size_t> &hit_indices,
                                   const StoragePoolFlowConfig &flow);
-    P2PReadResult ApplyP2PReadFlow(const std::string &engine_instance_id,
-                                   const std::string &storage_pool_id,
-                                   const std::string &trace_id,
-                                   int64_t timestamp,
-                                   const std::vector<int64_t> &block_ids,
-                                   const P2PReadFlowConfig &flow,
-                                   const StoragePoolFlowConfig &storage_pool_flow,
-                                   std::vector<bool> *satisfied_mask);
+    TierGlobalPeerSelection ApplyP2PReadFlow(const std::string &engine_instance_id,
+                                             const std::string &storage_pool_id,
+                                             const std::string &trace_id,
+                                             int64_t timestamp,
+                                             const std::vector<int64_t> &block_ids,
+                                             const P2PReadFlowConfig &flow,
+                                             const StoragePoolFlowConfig &storage_pool_flow,
+                                             std::vector<bool> *satisfied_mask);
     HashStoragePoolReadResult ReadStoragePool(const std::string &engine_instance_id,
                                               const std::string &storage_pool_id,
                                               const std::string &trace_id,
@@ -154,12 +141,14 @@ private:
                                               int64_t input_len,
                                               const std::string &query_type,
                                               const StoragePoolFlowConfig &flow);
-    void WriteStoragePoolKeys(const std::string &storage_pool_id,
-                              const std::string &trace_id,
-                              int64_t timestamp,
-                              const std::vector<int64_t> &keys,
-                              int64_t ttl_us,
-                              bool touch_existing);
+    WriteCacheRes WriteStoragePoolKeys(const std::string &engine_instance_id,
+                                       const std::string &storage_pool_id,
+                                       const std::string &reason,
+                                       const std::string &trace_id,
+                                       int64_t timestamp,
+                                       const std::vector<int64_t> &keys,
+                                       int64_t ttl_us,
+                                       bool touch_existing);
     void ApplyStoragePoolWriteFlow(const std::string &engine_instance_id,
                                    const std::string &storage_pool_id,
                                    const std::string &trace_id,
@@ -168,6 +157,8 @@ private:
                                    const StoragePoolFlowConfig &flow,
                                    const WriteCacheRes &engine_write_res);
     void ApplyStoragePoolCascadingEvictions(const std::string &storage_pool_id,
+                                            const std::string &engine_instance_id,
+                                            const std::string &reason,
                                             const std::string &trace_id,
                                             int64_t timestamp,
                                             int64_t ttl_us,
@@ -184,10 +175,11 @@ private:
     std::unordered_map<std::string, std::string> engine_read_query_type_;
     std::unordered_map<std::string, StoragePoolFlowConfig> engine_storage_pool_flow_;
     std::unordered_map<std::string, size_t> engine_block_size_;
+    InferEngineScheduler infer_engine_scheduler_;
     TierGlobalTracker p2p_tracker_;
-    std::vector<std::string> sorted_engine_instance_ids_;
     std::vector<CombinedReadRecord> combined_read_records_;
     std::vector<CombinedWriteRecord> combined_write_records_;
+    std::vector<PoolWriteIoRecord> pool_write_io_records_;
     int64_t write_delay_ns_ = 1;
     uint64_t next_pending_write_sequence_ = 0;
     std::priority_queue<PendingWrite, std::vector<PendingWrite>, PendingWriteCompare> pending_writes_;

@@ -6,7 +6,6 @@
 #include <limits>
 #include <memory>
 #include <stdexcept>
-#include <unordered_set>
 #include <utility>
 
 #include "kv_cache_manager/common/logger.h"
@@ -83,67 +82,6 @@ std::vector<size_t> IndicesFromMask(const std::vector<bool> &mask) {
 
 HierarchicalReplayManager::HierarchicalReplayManager(const HierarchicalReplayConfig &config) : config_(config) {}
 
-std::string HierarchicalReplayManager::TierGlobalTracker::ScopeKey(const std::string &cluster_id,
-                                                                   const std::string &tier) {
-    return cluster_id + "\x1f" + tier;
-}
-
-void HierarchicalReplayManager::TierGlobalTracker::Add(const std::string &cluster_id,
-                                                       const std::string &tier,
-                                                       int64_t key,
-                                                       const std::string &infer_id) {
-    holders_[ScopeKey(cluster_id, tier)][key].insert(infer_id);
-}
-
-void HierarchicalReplayManager::TierGlobalTracker::Remove(const std::string &cluster_id,
-                                                          const std::string &tier,
-                                                          int64_t key,
-                                                          const std::string &infer_id) {
-    auto scope_it = holders_.find(ScopeKey(cluster_id, tier));
-    if (scope_it == holders_.end()) {
-        return;
-    }
-    auto key_it = scope_it->second.find(key);
-    if (key_it == scope_it->second.end()) {
-        return;
-    }
-    key_it->second.erase(infer_id);
-    if (key_it->second.empty()) {
-        scope_it->second.erase(key_it);
-    }
-}
-
-void HierarchicalReplayManager::TierGlobalTracker::RemoveFromAllTiers(const std::string &cluster_id,
-                                                                      int64_t key,
-                                                                      const std::string &infer_id) {
-    const std::string prefix = cluster_id + "\x1f";
-    for (auto &scope : holders_) {
-        if (scope.first.rfind(prefix, 0) != 0) {
-            continue;
-        }
-        auto key_it = scope.second.find(key);
-        if (key_it == scope.second.end()) {
-            continue;
-        }
-        key_it->second.erase(infer_id);
-        if (key_it->second.empty()) {
-            scope.second.erase(key_it);
-        }
-    }
-}
-
-bool HierarchicalReplayManager::TierGlobalTracker::Contains(const std::string &cluster_id,
-                                                            const std::string &tier,
-                                                            int64_t key,
-                                                            const std::string &infer_id) const {
-    auto scope_it = holders_.find(ScopeKey(cluster_id, tier));
-    if (scope_it == holders_.end()) {
-        return false;
-    }
-    auto key_it = scope_it->second.find(key);
-    return key_it != scope_it->second.end() && key_it->second.count(infer_id) > 0;
-}
-
 bool HierarchicalReplayManager::Init() {
     if (!ValidateAndBuildMappings()) {
         return false;
@@ -179,10 +117,10 @@ bool HierarchicalReplayManager::ValidateAndBuildMappings() {
     engine_read_query_type_.clear();
     engine_storage_pool_flow_.clear();
     engine_block_size_.clear();
-    sorted_engine_instance_ids_.clear();
 
     const auto engine_instances = CollectInstances(config_.engine_config());
     const auto storage_pools = CollectStoragePools(config_.storage_pool());
+    std::vector<InferEngineActiveWindow> active_windows;
     if (engine_instances.empty()) {
         KVCM_LOG_ERROR("Hierarchical replay engine_config has no instances.");
         return false;
@@ -201,6 +139,10 @@ bool HierarchicalReplayManager::ValidateAndBuildMappings() {
             const std::string cluster_id = "infer_cluster_" + std::to_string(cluster_idx);
             cluster_infer_ids_[cluster_id] = cluster.infer_ids();
             cluster_p2p_read_flows_[cluster_id] = cluster.p2p_read_flows();
+            for (const auto &window : cluster.active_windows()) {
+                active_windows.push_back(
+                    InferEngineActiveWindow{window.infer_id(), window.start_ns(), window.end_ns()});
+            }
             for (const auto &infer_id : cluster.infer_ids()) {
                 if (!engine_to_cluster_.emplace(infer_id, cluster_id).second) {
                     KVCM_LOG_ERROR("engine instance appears in more than one infer cluster: %s", infer_id.c_str());
@@ -222,6 +164,8 @@ bool HierarchicalReplayManager::ValidateAndBuildMappings() {
         }
     }
 
+    std::vector<std::string> engine_instance_ids;
+    engine_instance_ids.reserve(config_.engine_to_storage_pool().size());
     for (const auto &mapping : config_.engine_to_storage_pool()) {
         const auto &engine_instance_id = mapping.engine_instance_id();
         const auto &storage_pool_id = mapping.storage_pool_id();
@@ -265,14 +209,15 @@ bool HierarchicalReplayManager::ValidateAndBuildMappings() {
         engine_read_query_type_[engine_instance_id] = mapping.engine_read_query_type();
         engine_storage_pool_flow_[engine_instance_id] = mapping.storage_pool_flow();
         engine_block_size_[engine_instance_id] = engine_block_size;
-        sorted_engine_instance_ids_.push_back(engine_instance_id);
+        engine_instance_ids.push_back(engine_instance_id);
     }
 
     if (engine_to_storage_pool_.size() != engine_instances.size()) {
         KVCM_LOG_ERROR("Every engine instance must have exactly one engine_to_storage_pool mapping.");
         return false;
     }
-    std::sort(sorted_engine_instance_ids_.begin(), sorted_engine_instance_ids_.end());
+    infer_engine_scheduler_.SetEngineInstanceIds(std::move(engine_instance_ids));
+    infer_engine_scheduler_.SetActiveWindows(active_windows);
     return true;
 }
 
@@ -334,59 +279,8 @@ void HierarchicalReplayManager::ApplyEngineTierEvents(const std::vector<TierFlow
             continue;
         }
         const std::string &cluster_id = cluster_it->second;
-        if (event.kind == TierFlowEventKind::ENTER_TIER && !event.to_tier.empty()) {
-            p2p_tracker_.Add(cluster_id, event.to_tier, event.block_key, event.instance_id);
-        } else if (event.kind == TierFlowEventKind::LEAVE_TIER && !event.from_tier.empty()) {
-            p2p_tracker_.Remove(cluster_id, event.from_tier, event.block_key, event.instance_id);
-        } else if (event.kind == TierFlowEventKind::FINAL_EVICT) {
-            p2p_tracker_.RemoveFromAllTiers(cluster_id, event.block_key, event.instance_id);
-        }
+        p2p_tracker_.ApplyEvent(cluster_id, event);
     }
-}
-
-HierarchicalReplayManager::P2PReadResult
-HierarchicalReplayManager::SelectP2PPeer(const std::string &engine_instance_id,
-                                         const std::string &cluster_id,
-                                         const P2PReadFlowConfig &flow,
-                                         const std::vector<int64_t> &block_ids,
-                                         const std::vector<bool> &satisfied_mask) const {
-    std::vector<size_t> missing_indices;
-    for (size_t idx = 0; idx < block_ids.size(); ++idx) {
-        if (idx >= satisfied_mask.size() || !satisfied_mask[idx]) {
-            missing_indices.push_back(idx);
-        }
-    }
-    if (missing_indices.empty()) {
-        return {};
-    }
-
-    size_t best_len = 0;
-    std::string best_peer;
-    for (const auto &peer_id : InferIdsForCluster(cluster_id)) {
-        if (peer_id == engine_instance_id) {
-            continue;
-        }
-        size_t match_len = 0;
-        while (match_len < missing_indices.size()) {
-            const size_t block_idx = missing_indices[match_len];
-            if (!p2p_tracker_.Contains(cluster_id, flow.tier(), block_ids[block_idx], peer_id)) {
-                break;
-            }
-            ++match_len;
-        }
-        if (match_len > best_len) {
-            best_len = match_len;
-            best_peer = peer_id;
-        }
-    }
-    if (best_len == 0) {
-        return {};
-    }
-
-    P2PReadResult result;
-    result.peer_infer_id = std::move(best_peer);
-    result.hit_indices.assign(missing_indices.begin(), missing_indices.begin() + best_len);
-    return result;
 }
 
 void HierarchicalReplayManager::FillEngineFromHitIndices(const std::string &engine_instance_id,
@@ -404,23 +298,26 @@ void HierarchicalReplayManager::FillEngineFromHitIndices(const std::string &engi
     const auto promote_res =
         engine_manager_->FillCachePathWithTtlUs(engine_instance_id, trace_id, timestamp, promote_path, hit_indices, 0);
     ApplyEngineTierEvents(promote_res.tier_flow_events);
-    ApplyStoragePoolCascadingEvictions(storage_pool_id, trace_id, timestamp, 0, flow, promote_res.evicted_keys);
+    ApplyStoragePoolCascadingEvictions(
+        storage_pool_id, engine_instance_id, "fill_eviction", trace_id, timestamp, 0, flow, promote_res.evicted_keys);
 }
 
-HierarchicalReplayManager::P2PReadResult
-HierarchicalReplayManager::ApplyP2PReadFlow(const std::string &engine_instance_id,
-                                            const std::string &storage_pool_id,
-                                            const std::string &trace_id,
-                                            int64_t timestamp,
-                                            const std::vector<int64_t> &block_ids,
-                                            const P2PReadFlowConfig &flow,
-                                            const StoragePoolFlowConfig &storage_pool_flow,
-                                            std::vector<bool> *satisfied_mask) {
+TierGlobalPeerSelection HierarchicalReplayManager::ApplyP2PReadFlow(const std::string &engine_instance_id,
+                                                                    const std::string &storage_pool_id,
+                                                                    const std::string &trace_id,
+                                                                    int64_t timestamp,
+                                                                    const std::vector<int64_t> &block_ids,
+                                                                    const P2PReadFlowConfig &flow,
+                                                                    const StoragePoolFlowConfig &storage_pool_flow,
+                                                                    std::vector<bool> *satisfied_mask) {
     if (satisfied_mask == nullptr || block_ids.empty()) {
         return {};
     }
     const std::string &cluster_id = ClusterForEngine(engine_instance_id);
-    P2PReadResult result = SelectP2PPeer(engine_instance_id, cluster_id, flow, block_ids, *satisfied_mask);
+    const std::vector<std::string> active_infer_ids =
+        infer_engine_scheduler_.ActiveInferIds(InferIdsForCluster(cluster_id), timestamp);
+    TierGlobalPeerSelection result = p2p_tracker_.SelectPeer(
+        engine_instance_id, cluster_id, flow.tier(), active_infer_ids, block_ids, *satisfied_mask);
     if (result.hit_indices.empty()) {
         return result;
     }
@@ -445,65 +342,46 @@ HierarchicalReplayManager::ApplyP2PReadFlow(const std::string &engine_instance_i
 void HierarchicalReplayManager::DirectRun() {
     auto traces = StandardTraceLoader::LoadFromFile(config_.trace_file_path(), config_.trace_replay_config().mode());
     TraceTimeSorter::SortTracesByTimestamp(traces);
+    if (config_.infer_active_windows_from_trace() ||
+        (config_.infer_scheduling_strategy() == "preserve_trace" && !infer_engine_scheduler_.has_active_windows())) {
+        infer_engine_scheduler_.BuildTraceActiveWindows(traces, write_delay_ns_, true);
+    }
     if (config_.infer_scheduling_strategy() == "prefix_hit") {
         RunTracesWithPrefixHitScheduling(traces);
         return;
     }
-    ScheduleTraces(traces);
+    infer_engine_scheduler_.ScheduleTraces(config_.infer_scheduling_strategy(), traces);
     RunTraces(traces);
-}
-
-void HierarchicalReplayManager::ScheduleTraces(std::vector<std::shared_ptr<OptimizerSchemaTrace>> &traces) const {
-    if (config_.infer_scheduling_strategy() == "preserve_trace" ||
-        config_.infer_scheduling_strategy() == "prefix_hit") {
-        return;
-    }
-    if (config_.infer_scheduling_strategy() != "round_robin") {
-        throw std::runtime_error("Unknown infer_scheduling_strategy: " + config_.infer_scheduling_strategy());
-    }
-    if (sorted_engine_instance_ids_.empty()) {
-        throw std::runtime_error("round_robin scheduling requires at least one engine instance");
-    }
-
-    size_t request_idx = 0;
-    std::string current_engine_instance_id = sorted_engine_instance_ids_.front();
-    for (auto &trace : traces) {
-        if (!trace) {
-            continue;
-        }
-        if (std::dynamic_pointer_cast<GetLocationSchemaTrace>(trace)) {
-            current_engine_instance_id = sorted_engine_instance_ids_[request_idx % sorted_engine_instance_ids_.size()];
-            request_idx++;
-        } else if (request_idx == 0) {
-            current_engine_instance_id = sorted_engine_instance_ids_.front();
-        }
-        trace->set_instance_id(current_engine_instance_id);
-    }
 }
 
 void HierarchicalReplayManager::RunTracesWithPrefixHitScheduling(
     const std::vector<std::shared_ptr<OptimizerSchemaTrace>> &traces) {
-    if (sorted_engine_instance_ids_.empty()) {
+    const auto &engine_instance_ids = infer_engine_scheduler_.engine_instance_ids();
+    if (engine_instance_ids.empty()) {
         throw std::runtime_error("prefix_hit scheduling requires at least one engine instance");
     }
 
     pending_writes_ = {};
     next_pending_write_sequence_ = 0;
     size_t request_idx = 0;
-    std::string current_engine_instance_id = sorted_engine_instance_ids_.front();
+    std::string current_engine_instance_id = engine_instance_ids.front();
+    const auto prefix_match_count =
+        [this](const std::string &instance_id, const std::vector<int64_t> &block_ids, int64_t timestamp) {
+            return engine_manager_->PrefixMatchCount(instance_id, block_ids, timestamp);
+        };
     for (const auto &trace : traces) {
         if (!trace) {
             continue;
         }
         FlushPendingWritesThrough(trace->timestamp_ns());
         if (auto request_trace = std::dynamic_pointer_cast<RequestSchemaTrace>(trace)) {
-            current_engine_instance_id =
-                ChoosePrefixHitEngineInstance(request_trace->keys(), request_trace->timestamp_ns(), request_idx);
+            current_engine_instance_id = infer_engine_scheduler_.ChoosePrefixHitEngineInstance(
+                request_trace->keys(), request_trace->timestamp_ns(), request_idx, prefix_match_count);
             request_trace->set_instance_id(current_engine_instance_id);
             request_idx++;
         } else if (auto get_trace = std::dynamic_pointer_cast<GetLocationSchemaTrace>(trace)) {
-            current_engine_instance_id =
-                ChoosePrefixHitEngineInstance(get_trace->keys(), get_trace->timestamp_ns(), request_idx);
+            current_engine_instance_id = infer_engine_scheduler_.ChoosePrefixHitEngineInstance(
+                get_trace->keys(), get_trace->timestamp_ns(), request_idx, prefix_match_count);
             get_trace->set_instance_id(current_engine_instance_id);
             request_idx++;
         } else if (auto write_trace = std::dynamic_pointer_cast<WriteCacheSchemaTrace>(trace)) {
@@ -512,30 +390,6 @@ void HierarchicalReplayManager::RunTracesWithPrefixHitScheduling(
         RunTrace(trace);
     }
     FlushAllPendingWrites();
-}
-
-std::string HierarchicalReplayManager::ChoosePrefixHitEngineInstance(const std::vector<int64_t> &block_ids,
-                                                                     int64_t timestamp,
-                                                                     size_t request_idx) const {
-    size_t best_match = 0;
-    std::vector<std::string> candidates;
-    for (const auto &instance_id : sorted_engine_instance_ids_) {
-        const size_t match = engine_manager_->PrefixMatchCount(instance_id, block_ids, timestamp);
-        if (match > best_match) {
-            best_match = match;
-            candidates.clear();
-            candidates.push_back(instance_id);
-        } else if (match == best_match) {
-            candidates.push_back(instance_id);
-        }
-    }
-    if (candidates.empty()) {
-        throw std::runtime_error("prefix_hit scheduling has no engine candidates");
-    }
-    if (candidates.size() == 1) {
-        return candidates.front();
-    }
-    return candidates[request_idx % candidates.size()];
 }
 
 void HierarchicalReplayManager::RunTraces(const std::vector<std::shared_ptr<OptimizerSchemaTrace>> &traces) {
@@ -592,11 +446,15 @@ void HierarchicalReplayManager::ScheduleRequestWrite(const RequestSchemaTrace &t
         throw std::runtime_error("request write timestamp overflows int64: instance_id=" + trace.instance_id() +
                                  ", trace_id=" + trace.trace_id());
     }
+    const int64_t write_timestamp_ns = trace.timestamp_ns() + write_delay_ns_;
+    if (!infer_engine_scheduler_.IsInferActiveAt(trace.instance_id(), write_timestamp_ns)) {
+        throw std::runtime_error("request write targets inactive engine instance: " + trace.instance_id());
+    }
 
     WriteCacheSchemaTrace write_trace;
     write_trace.set_instance_id(trace.instance_id());
     write_trace.set_trace_id(trace.trace_id() + ":write");
-    write_trace.set_timestamp_ns(trace.timestamp_ns() + write_delay_ns_);
+    write_trace.set_timestamp_ns(write_timestamp_ns);
     write_trace.set_keys(trace.keys());
     write_trace.set_ttl_us(trace.ttl_us());
     pending_writes_.push(
@@ -652,11 +510,18 @@ HierarchicalGetCacheLocationRes HierarchicalReplayManager::GetCacheLocation(cons
     const size_t engine_hit_blocks = engine_hit_indices.size();
 
     const auto &storage_pool_flow = StoragePoolFlowForEngine(engine_instance_id);
-    ApplyStoragePoolCascadingEvictions(
-        storage_pool_id, trace_id, timestamp, 0, storage_pool_flow, engine_res.evicted_keys);
+    ApplyStoragePoolCascadingEvictions(storage_pool_id,
+                                       engine_instance_id,
+                                       "read_eviction",
+                                       trace_id,
+                                       timestamp,
+                                       0,
+                                       storage_pool_flow,
+                                       engine_res.evicted_keys);
     std::vector<bool> satisfied_mask(block_ids.size(), false);
     MarkIndices(engine_hit_indices, &satisfied_mask);
     std::vector<size_t> peer_hit_indices;
+    std::string peer_source_infer_id;
     for (const auto &flow : P2PReadFlowsForCluster(ClusterForEngine(engine_instance_id))) {
         const auto p2p_read = ApplyP2PReadFlow(engine_instance_id,
                                                storage_pool_id,
@@ -666,6 +531,13 @@ HierarchicalGetCacheLocationRes HierarchicalReplayManager::GetCacheLocation(cons
                                                flow,
                                                storage_pool_flow,
                                                &satisfied_mask);
+        if (!p2p_read.hit_indices.empty()) {
+            if (peer_source_infer_id.empty()) {
+                peer_source_infer_id = p2p_read.peer_infer_id;
+            } else if (peer_source_infer_id != p2p_read.peer_infer_id) {
+                throw std::runtime_error("P2P read selected multiple peer infer sources for trace: " + trace_id);
+            }
+        }
         peer_hit_indices.insert(peer_hit_indices.end(), p2p_read.hit_indices.begin(), p2p_read.hit_indices.end());
     }
     const std::vector<size_t> non_storage_hit_indices = IndicesFromMask(satisfied_mask);
@@ -692,6 +564,7 @@ HierarchicalGetCacheLocationRes HierarchicalReplayManager::GetCacheLocation(cons
     record.storage_pool_hit_blocks = storage_pool_hit_blocks;
     record.input_tokens = static_cast<size_t>(input_len);
     record.block_size_tokens = block_size_it->second;
+    record.peer_source_infer_id = std::move(peer_source_infer_id);
     combined_read_records_.push_back(record);
 
     HierarchicalGetCacheLocationRes res;
@@ -767,15 +640,37 @@ HashStoragePoolReadResult HierarchicalReplayManager::ReadStoragePool(const std::
     return result;
 }
 
-void HierarchicalReplayManager::WriteStoragePoolKeys(const std::string &storage_pool_id,
-                                                     const std::string &trace_id,
-                                                     int64_t timestamp,
-                                                     const std::vector<int64_t> &keys,
-                                                     int64_t ttl_us,
-                                                     bool touch_existing) {
-    if (!keys.empty()) {
-        storage_pool_manager_->WriteKeys(storage_pool_id, trace_id, timestamp, keys, ttl_us, touch_existing);
+WriteCacheRes HierarchicalReplayManager::WriteStoragePoolKeys(const std::string &engine_instance_id,
+                                                              const std::string &storage_pool_id,
+                                                              const std::string &reason,
+                                                              const std::string &trace_id,
+                                                              int64_t timestamp,
+                                                              const std::vector<int64_t> &keys,
+                                                              int64_t ttl_us,
+                                                              bool touch_existing) {
+    WriteCacheRes res;
+    res.trace_id = trace_id;
+    if (keys.empty()) {
+        return res;
     }
+
+    res = storage_pool_manager_->WriteKeys(storage_pool_id, trace_id, timestamp, keys, ttl_us, touch_existing);
+    auto block_size_it = engine_block_size_.find(engine_instance_id);
+    if (block_size_it == engine_block_size_.end()) {
+        throw std::runtime_error("Unknown engine instance: " + engine_instance_id);
+    }
+
+    PoolWriteIoRecord record;
+    record.trace_id = trace_id;
+    record.engine_instance_id = engine_instance_id;
+    record.storage_pool_id = storage_pool_id;
+    record.reason = reason;
+    record.timestamp_ns = timestamp;
+    record.inserted_blocks = static_cast<size_t>(res.kvcm_write_length);
+    record.existing_blocks = static_cast<size_t>(res.kvcm_write_hit_length);
+    record.block_size_tokens = block_size_it->second;
+    pool_write_io_records_.push_back(record);
+    return res;
 }
 
 void HierarchicalReplayManager::ApplyStoragePoolWriteFlow(const std::string &engine_instance_id,
@@ -786,24 +681,40 @@ void HierarchicalReplayManager::ApplyStoragePoolWriteFlow(const std::string &eng
                                                           const StoragePoolFlowConfig &flow,
                                                           const WriteCacheRes &engine_write_res) {
     if (flow.write_mode() == TierWriteMode::WRITE_THROUGH) {
-        WriteStoragePoolKeys(storage_pool_id,
+        WriteStoragePoolKeys(engine_instance_id,
+                             storage_pool_id,
+                             "write_through",
                              trace_id,
                              timestamp,
                              engine_write_res.pool_source_write_keys,
                              ttl_us,
                              flow.shadow_write_touch_enabled());
     } else if (flow.write_mode() == TierWriteMode::CASCADING) {
-        ApplyStoragePoolCascadingEvictions(
-            storage_pool_id, trace_id, timestamp, ttl_us, flow, engine_write_res.evicted_keys);
+        ApplyStoragePoolCascadingEvictions(storage_pool_id,
+                                           engine_instance_id,
+                                           "write_eviction",
+                                           trace_id,
+                                           timestamp,
+                                           ttl_us,
+                                           flow,
+                                           engine_write_res.evicted_keys);
     } else if (flow.write_mode() == TierWriteMode::WRITE_THROUGH_SELECTIVE) {
         const auto selected_keys = engine_manager_->PoolSourceWriteTouchKeysAtLeast(
             engine_instance_id, engine_write_res.pool_source_write_keys, flow.selective_write_threshold(), timestamp);
-        WriteStoragePoolKeys(
-            storage_pool_id, trace_id, timestamp, selected_keys, ttl_us, flow.shadow_write_touch_enabled());
+        WriteStoragePoolKeys(engine_instance_id,
+                             storage_pool_id,
+                             "write_through_selective",
+                             trace_id,
+                             timestamp,
+                             selected_keys,
+                             ttl_us,
+                             flow.shadow_write_touch_enabled());
     }
 }
 
 void HierarchicalReplayManager::ApplyStoragePoolCascadingEvictions(const std::string &storage_pool_id,
+                                                                   const std::string &engine_instance_id,
+                                                                   const std::string &reason,
                                                                    const std::string &trace_id,
                                                                    int64_t timestamp,
                                                                    int64_t ttl_us,
@@ -812,11 +723,20 @@ void HierarchicalReplayManager::ApplyStoragePoolCascadingEvictions(const std::st
     if (flow.write_mode() != TierWriteMode::CASCADING) {
         return;
     }
-    WriteStoragePoolKeys(storage_pool_id, trace_id, timestamp, evicted_keys, ttl_us, flow.shadow_write_touch_enabled());
+    WriteStoragePoolKeys(engine_instance_id,
+                         storage_pool_id,
+                         reason,
+                         trace_id,
+                         timestamp,
+                         evicted_keys,
+                         ttl_us,
+                         flow.shadow_write_touch_enabled());
 }
 
 void HierarchicalReplayManager::AnalyzeResults() {
     ExportCombinedHitRates();
+    ExportReadIo();
+    ExportPoolWriteIo();
     if (engine_manager_) {
         engine_manager_->AnalyzeResults();
     }
@@ -892,6 +812,52 @@ void HierarchicalReplayManager::ExportCombinedHitRates() const {
     }
 
     KVCM_LOG_INFO("Hierarchical hit rates exported to: %s", filename.c_str());
+}
+
+void HierarchicalReplayManager::ExportReadIo() const {
+    std::filesystem::create_directories(config_.output_result_path());
+    const std::string filename = config_.output_result_path() + "/hierarchical_read_io.csv";
+    std::ofstream file(filename);
+    if (!file.is_open()) {
+        throw std::runtime_error("Failed to open hierarchical read IO CSV: " + filename);
+    }
+
+    file << "TimestampNs,TraceId,EngineInstanceId,StoragePoolId,InputTokens,"
+            "LocalReadTokens,PeerTransferTokens,PoolTransferTokens,"
+            "PeerSourceInferId\n";
+
+    for (const auto &record : combined_read_records_) {
+        const size_t local_read_tokens = record.engine_hit_blocks * record.block_size_tokens;
+        const size_t peer_transfer_tokens = record.peer_hit_blocks * record.block_size_tokens;
+        const size_t pool_transfer_tokens = record.storage_pool_hit_blocks * record.block_size_tokens;
+
+        file << record.timestamp_ns << "," << record.trace_id << "," << record.engine_instance_id << ","
+             << record.storage_pool_id << "," << record.input_tokens << "," << local_read_tokens << ","
+             << peer_transfer_tokens << "," << pool_transfer_tokens << "," << record.peer_source_infer_id << "\n";
+    }
+
+    KVCM_LOG_INFO("Hierarchical read IO exported to: %s", filename.c_str());
+}
+
+void HierarchicalReplayManager::ExportPoolWriteIo() const {
+    std::filesystem::create_directories(config_.output_result_path());
+    const std::string filename = config_.output_result_path() + "/hierarchical_pool_write_io.csv";
+    std::ofstream file(filename);
+    if (!file.is_open()) {
+        throw std::runtime_error("Failed to open hierarchical pool write IO CSV: " + filename);
+    }
+
+    file << "TimestampNs,TraceId,EngineInstanceId,StoragePoolId,Reason,PoolWriteTokens,PoolExistingTokens\n";
+
+    for (const auto &record : pool_write_io_records_) {
+        const size_t inserted_tokens = record.inserted_blocks * record.block_size_tokens;
+        const size_t existing_tokens = record.existing_blocks * record.block_size_tokens;
+        file << record.timestamp_ns << "," << record.trace_id << "," << record.engine_instance_id << ","
+             << record.storage_pool_id << "," << record.reason << "," << inserted_tokens << "," << existing_tokens
+             << "\n";
+    }
+
+    KVCM_LOG_INFO("Hierarchical pool write IO exported to: %s", filename.c_str());
 }
 
 } // namespace kv_cache_manager

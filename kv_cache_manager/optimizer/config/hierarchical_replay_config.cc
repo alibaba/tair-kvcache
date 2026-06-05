@@ -188,6 +188,19 @@ void P2PReadFlowConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer>
     Put(writer, "peer_read_touch_enabled", peer_read_touch_enabled_);
 }
 
+bool InferActiveWindowConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
+    KVCM_JSON_GET_MACRO(rapid_value, "infer_id", infer_id_);
+    KVCM_JSON_GET_MACRO(rapid_value, "start_ns", start_ns_);
+    KVCM_JSON_GET_MACRO(rapid_value, "end_ns", end_ns_);
+    return !infer_id_.empty() && start_ns_ <= end_ns_;
+}
+
+void InferActiveWindowConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
+    Put(writer, "infer_id", infer_id_);
+    Put(writer, "start_ns", start_ns_);
+    Put(writer, "end_ns", end_ns_);
+}
+
 bool InferClusterConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
     KVCM_JSON_GET_MACRO(rapid_value, "storage_pool_id", storage_pool_id_);
     KVCM_JSON_GET_MACRO(rapid_value, "engine_read_query_type", engine_read_query_type_);
@@ -197,6 +210,7 @@ bool InferClusterConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
     KVCM_JSON_GET_MACRO(rapid_value, "tiers", tiers_);
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "tier_flows", tier_flows_, std::vector<OptTierFlowConfig>{});
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "p2p_read_flows", p2p_read_flows_, std::vector<P2PReadFlowConfig>{});
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "active_windows", active_windows_, std::vector<InferActiveWindowConfig>{});
     KVCM_JSON_GET_MACRO(rapid_value, "storage_pool_flow", storage_pool_flow_);
     return !storage_pool_id_.empty() && IsEngineReadQueryTypeValid(engine_read_query_type_) && !infer_ids_.empty() &&
            !tiers_.empty();
@@ -214,6 +228,9 @@ void InferClusterConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer
     }
     if (!p2p_read_flows_.empty()) {
         Put(writer, "p2p_read_flows", p2p_read_flows_);
+    }
+    if (!active_windows_.empty()) {
+        Put(writer, "active_windows", active_windows_);
     }
     Put(writer, "storage_pool_flow", storage_pool_flow_);
 }
@@ -238,6 +255,15 @@ bool HierarchicalReplayConfig::FromRapidValue(const rapidjson::Value &rapid_valu
         return false;
     }
     KVCM_JSON_GET_DEFAULT_MACRO(
+        rapid_value, "infer_active_windows_from_trace", infer_active_windows_from_trace_, false);
+    if (infer_active_windows_from_trace_) {
+        for (const auto &cluster : infer_clusters_) {
+            if (!cluster.active_windows().empty()) {
+                return false;
+            }
+        }
+    }
+    KVCM_JSON_GET_DEFAULT_MACRO(
         rapid_value, "enable_lifecycle_tracking", enable_lifecycle_tracking_, enable_lifecycle_tracking_);
     return !trace_file_path_.empty() && !output_result_path_.empty() && BuildOptimizerConfigs();
 }
@@ -248,6 +274,7 @@ void HierarchicalReplayConfig::ToRapidWriter(rapidjson::Writer<rapidjson::String
     Put(writer, "infer_eviction_params", infer_eviction_config_);
     Put(writer, "trace_replay", trace_replay_config_);
     Put(writer, "infer_scheduling_strategy", infer_scheduling_strategy_);
+    Put(writer, "infer_active_windows_from_trace", infer_active_windows_from_trace_);
     Put(writer, "enable_lifecycle_tracking", enable_lifecycle_tracking_);
     Put(writer, "infer_clusters", infer_clusters_);
     Put(writer, "storage_pool", storage_pool_);
@@ -277,6 +304,9 @@ bool HierarchicalReplayConfig::BuildOptimizerConfigs() {
         if (pool_ids.find(infer_group.storage_pool_id()) == pool_ids.end()) {
             return false;
         }
+        if (infer_active_windows_from_trace_ && !infer_group.active_windows().empty()) {
+            return false;
+        }
         std::unordered_set<std::string> tier_names;
         for (const auto &tier : infer_group.tiers()) {
             if (!tier_names.insert(tier.name()).second) {
@@ -286,6 +316,13 @@ bool HierarchicalReplayConfig::BuildOptimizerConfigs() {
         std::unordered_set<std::string> p2p_tiers;
         for (const auto &flow : infer_group.p2p_read_flows()) {
             if (tier_names.find(flow.tier()) == tier_names.end() || !p2p_tiers.insert(flow.tier()).second) {
+                return false;
+            }
+        }
+        std::unordered_set<std::string> cluster_infer_ids(infer_group.infer_ids().begin(),
+                                                          infer_group.infer_ids().end());
+        for (const auto &window : infer_group.active_windows()) {
+            if (cluster_infer_ids.find(window.infer_id()) == cluster_infer_ids.end()) {
                 return false;
             }
         }

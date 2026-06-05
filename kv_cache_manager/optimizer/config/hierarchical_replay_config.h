@@ -172,6 +172,28 @@ private:
     bool peer_read_touch_enabled_ = true;
 };
 
+class InferActiveWindowConfig : public Jsonizable {
+public:
+    InferActiveWindowConfig() = default;
+    ~InferActiveWindowConfig() override = default;
+
+    bool FromRapidValue(const rapidjson::Value &rapid_value) override;
+    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
+
+    [[nodiscard]] const std::string &infer_id() const { return infer_id_; }
+    [[nodiscard]] int64_t start_ns() const { return start_ns_; }
+    [[nodiscard]] int64_t end_ns() const { return end_ns_; }
+
+    void set_infer_id(const std::string &infer_id) { infer_id_ = infer_id; }
+    void set_start_ns(int64_t start_ns) { start_ns_ = start_ns; }
+    void set_end_ns(int64_t end_ns) { end_ns_ = end_ns; }
+
+private:
+    std::string infer_id_;
+    int64_t start_ns_ = 0;
+    int64_t end_ns_ = 0;
+};
+
 class InferClusterConfig : public Jsonizable {
 public:
     InferClusterConfig() = default;
@@ -188,6 +210,7 @@ public:
     [[nodiscard]] const std::vector<HierarchicalTierConfig> &tiers() const { return tiers_; }
     [[nodiscard]] const std::vector<OptTierFlowConfig> &tier_flows() const { return tier_flows_; }
     [[nodiscard]] const std::vector<P2PReadFlowConfig> &p2p_read_flows() const { return p2p_read_flows_; }
+    [[nodiscard]] const std::vector<InferActiveWindowConfig> &active_windows() const { return active_windows_; }
     [[nodiscard]] const StoragePoolFlowConfig &storage_pool_flow() const { return storage_pool_flow_; }
 
     void set_storage_pool_id(const std::string &storage_pool_id) { storage_pool_id_ = storage_pool_id; }
@@ -198,6 +221,7 @@ public:
     void set_tiers(const std::vector<HierarchicalTierConfig> &tiers) { tiers_ = tiers; }
     void set_tier_flows(const std::vector<OptTierFlowConfig> &tier_flows) { tier_flows_ = tier_flows; }
     void set_p2p_read_flows(const std::vector<P2PReadFlowConfig> &flows) { p2p_read_flows_ = flows; }
+    void set_active_windows(const std::vector<InferActiveWindowConfig> &windows) { active_windows_ = windows; }
     void set_storage_pool_flow(const StoragePoolFlowConfig &flow) { storage_pool_flow_ = flow; }
 
 private:
@@ -209,6 +233,7 @@ private:
     std::vector<HierarchicalTierConfig> tiers_;
     std::vector<OptTierFlowConfig> tier_flows_;
     std::vector<P2PReadFlowConfig> p2p_read_flows_;
+    std::vector<InferActiveWindowConfig> active_windows_;
     StoragePoolFlowConfig storage_pool_flow_;
 };
 
@@ -230,6 +255,7 @@ public:
         return engine_to_storage_pool_;
     }
     [[nodiscard]] const std::string &infer_scheduling_strategy() const { return infer_scheduling_strategy_; }
+    [[nodiscard]] bool infer_active_windows_from_trace() const { return infer_active_windows_from_trace_; }
     [[nodiscard]] bool enable_lifecycle_tracking() const { return enable_lifecycle_tracking_; }
     [[nodiscard]] const std::vector<InferClusterConfig> &infer_clusters() const { return infer_clusters_; }
 
@@ -244,6 +270,7 @@ public:
         engine_to_storage_pool_ = mapping;
     }
     void set_infer_scheduling_strategy(const std::string &strategy) { infer_scheduling_strategy_ = strategy; }
+    void set_infer_active_windows_from_trace(bool enabled) { infer_active_windows_from_trace_ = enabled; }
     void set_enable_lifecycle_tracking(bool enabled) { enable_lifecycle_tracking_ = enabled; }
 
 private:
@@ -258,6 +285,7 @@ private:
     HierarchicalStoragePoolConfig storage_pool_;
     std::vector<EngineToStoragePoolMappingConfig> engine_to_storage_pool_;
     std::string infer_scheduling_strategy_ = "preserve_trace";
+    bool infer_active_windows_from_trace_ = false;
     bool enable_lifecycle_tracking_ = false;
 };
 

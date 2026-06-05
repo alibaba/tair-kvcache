@@ -81,6 +81,14 @@ protected:
         return cluster;
     }
 
+    InferActiveWindowConfig CreateInferActiveWindow(const std::string &infer_id, int64_t start_ns, int64_t end_ns) {
+        InferActiveWindowConfig window;
+        window.set_infer_id(infer_id);
+        window.set_start_ns(start_ns);
+        window.set_end_ns(end_ns);
+        return window;
+    }
+
     void SetStoragePoolFlow(HierarchicalReplayConfig &config, const StoragePoolFlowConfig &flow) {
         std::vector<EngineToStoragePoolMappingConfig> mappings = config.engine_to_storage_pool();
         for (auto &mapping : mappings) {
@@ -272,6 +280,41 @@ TEST_F(HierarchicalReplayManagerTest, P2PReadHitsPeerAndFillsCurrentEngine) {
     const std::string content = buffer.str();
     EXPECT_THAT(content, HasSubstr("peer_hit,engine_b,model_l3,2,0,2,0,2"));
     EXPECT_THAT(content, HasSubstr("local_after_peer,engine_b,model_l3,2,2,0,0,2"));
+}
+
+TEST_F(HierarchicalReplayManagerTest, P2PReadSkipsInactivePeerFromTraceWindow) {
+    const std::string root = GetTestTempRootPath() + "/hierarchical_replay_p2p_active_window";
+    std::filesystem::create_directories(root);
+    HierarchicalReplayConfig config = CreateHierarchicalConfig(root);
+
+    StoragePoolFlowConfig flow = CreateStoragePoolFlow();
+    flow.set_write_mode(TierWriteMode::CASCADING);
+    SetStoragePoolFlow(config, flow);
+
+    P2PReadFlowConfig p2p_flow;
+    p2p_flow.set_tier("dram");
+    p2p_flow.set_peer_read_touch_enabled(false);
+    config.set_infer_clusters({CreateInferClusterConfig(flow, {p2p_flow})});
+
+    std::ofstream trace(config.trace_file_path());
+    trace << R"({"type":"write","instance_id":"engine_a","trace_id":"write_peer","timestamp_ns":100,"keys":[9001]})"
+          << "\n";
+    trace
+        << R"({"type":"get","instance_id":"engine_b","trace_id":"read_after_scaledown","timestamp_ns":200,"keys":[9001],"input_len":16,"query_type":"batch_get","block_mask":[]})"
+        << "\n";
+    trace.close();
+
+    HierarchicalReplayManager manager(config);
+    ASSERT_TRUE(manager.Init());
+    manager.DirectRun();
+    manager.AnalyzeResults();
+
+    std::ifstream csv(root + "/combined/hierarchical_hit_rates.csv");
+    ASSERT_TRUE(csv.is_open());
+    std::ostringstream buffer;
+    buffer << csv.rdbuf();
+    const std::string content = buffer.str();
+    EXPECT_THAT(content, HasSubstr("read_after_scaledown,engine_b,model_l3,1,0,0,0,0"));
 }
 
 TEST_F(HierarchicalReplayManagerTest, EngineReadUsesBatchGetAndPoolPrefixSkipsEngineHits) {
@@ -1082,6 +1125,79 @@ TEST_F(HierarchicalReplayManagerTest, RoundRobinSchedulesTraceRequestsToEngineIn
     const std::string content = buffer.str();
     EXPECT_THAT(content, HasSubstr("cold,engine_a,model_l3,1,0,0,0,0"));
     EXPECT_THAT(content, HasSubstr("pool_hit,engine_b,model_l3,1,0,0,1,1"));
+}
+
+TEST_F(HierarchicalReplayManagerTest, RoundRobinUsesConfiguredActiveWindows) {
+    const std::string root = GetTestTempRootPath() + "/hierarchical_replay_round_robin_windows";
+    std::filesystem::create_directories(root);
+    HierarchicalReplayConfig config = CreateHierarchicalConfig(root);
+    config.set_infer_scheduling_strategy("round_robin");
+
+    StoragePoolFlowConfig flow = CreateStoragePoolFlow();
+    auto cluster = CreateInferClusterConfig(flow);
+    cluster.set_active_windows(
+        {CreateInferActiveWindow("engine_a", 0, 999), CreateInferActiveWindow("engine_b", 1000, 3000)});
+    config.set_infer_clusters({cluster});
+
+    std::ofstream trace(config.trace_file_path());
+    trace
+        << R"({"type":"get","instance_id":"logical_source","trace_id":"first","timestamp_ns":100,"keys":[501],"input_len":16,"block_mask":[]})"
+        << "\n";
+    trace
+        << R"({"type":"get","instance_id":"logical_source","trace_id":"second","timestamp_ns":200,"keys":[502],"input_len":16,"block_mask":[]})"
+        << "\n";
+    trace
+        << R"({"type":"get","instance_id":"logical_source","trace_id":"third","timestamp_ns":1200,"keys":[503],"input_len":16,"block_mask":[]})"
+        << "\n";
+    trace.close();
+
+    HierarchicalReplayManager manager(config);
+    ASSERT_TRUE(manager.Init());
+    manager.DirectRun();
+    manager.AnalyzeResults();
+
+    std::ifstream csv(root + "/combined/hierarchical_hit_rates.csv");
+    ASSERT_TRUE(csv.is_open());
+    std::ostringstream buffer;
+    buffer << csv.rdbuf();
+    const std::string content = buffer.str();
+    EXPECT_THAT(content, HasSubstr("first,engine_a,model_l3,1,0,0,0,0"));
+    EXPECT_THAT(content, HasSubstr("second,engine_a,model_l3,1,0,0,0,0"));
+    EXPECT_THAT(content, HasSubstr("third,engine_b,model_l3,1,0,0,0,0"));
+}
+
+TEST_F(HierarchicalReplayManagerTest, RoundRobinCanUseTraceActiveWindows) {
+    const std::string root = GetTestTempRootPath() + "/hierarchical_replay_round_robin_trace_windows";
+    std::filesystem::create_directories(root);
+    HierarchicalReplayConfig config = CreateHierarchicalConfig(root);
+    config.set_infer_scheduling_strategy("round_robin");
+    config.set_infer_active_windows_from_trace(true);
+
+    std::ofstream trace(config.trace_file_path());
+    trace
+        << R"({"type":"get","instance_id":"engine_a","trace_id":"early_a","timestamp_ns":100,"keys":[601],"input_len":16,"block_mask":[]})"
+        << "\n";
+    trace
+        << R"({"type":"get","instance_id":"engine_a","trace_id":"early_b","timestamp_ns":200,"keys":[602],"input_len":16,"block_mask":[]})"
+        << "\n";
+    trace
+        << R"({"type":"get","instance_id":"engine_b","trace_id":"late","timestamp_ns":1200,"keys":[603],"input_len":16,"block_mask":[]})"
+        << "\n";
+    trace.close();
+
+    HierarchicalReplayManager manager(config);
+    ASSERT_TRUE(manager.Init());
+    manager.DirectRun();
+    manager.AnalyzeResults();
+
+    std::ifstream csv(root + "/combined/hierarchical_hit_rates.csv");
+    ASSERT_TRUE(csv.is_open());
+    std::ostringstream buffer;
+    buffer << csv.rdbuf();
+    const std::string content = buffer.str();
+    EXPECT_THAT(content, HasSubstr("early_a,engine_a,model_l3,1,0,0,0,0"));
+    EXPECT_THAT(content, HasSubstr("early_b,engine_a,model_l3,1,0,0,0,0"));
+    EXPECT_THAT(content, HasSubstr("late,engine_b,model_l3,1,0,0,0,0"));
 }
 
 TEST_F(HierarchicalReplayManagerTest, PrefixHitSchedulesToCachedEngineInstance) {
