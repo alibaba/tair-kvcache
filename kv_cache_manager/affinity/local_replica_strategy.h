@@ -18,20 +18,16 @@
 
 #include "kv_cache_manager/affinity/affinity_strategy.h"
 #include "kv_cache_manager/affinity/pipeline/candidate_pipeline.h" // v0 CandidatePipeline 作为 write 流水线实现
+#include "kv_cache_manager/common/affinity_types.h"
 
 namespace kv_cache_manager {
 
 class FrequencySketch;
 class HintSuppressor;
 
-// 复制提示：LocalReplica 算法特有的读副作用。read-miss 且远端命中超阈值时
-// 由 ResolveRead 产出，随响应回传给 client，由 client 异步在本地写一份副本。
-// 作为 ReadSideEffect 子类经 ReadDecision.side_effects 透传，调用方 downcast 取回。
-struct ReplicationHint : public ReadSideEffect {
-    int64_t block_key = 0;
-    std::string source_uri;
-    std::string target_node_id;
-};
+// LocalReplica 算法的读副作用包装：把纯数据 ReplicationHint 挂上多态基类
+// ReadSideEffect，透传到 ReadDecision.side_effects；调用方 downcast 后切片回数据基类。
+struct ReplicationHintSideEffect : public ReadSideEffect, public ReplicationHint {};
 
 class LocalReplicaAffinityStrategy : public AffinityStrategy {
 public:

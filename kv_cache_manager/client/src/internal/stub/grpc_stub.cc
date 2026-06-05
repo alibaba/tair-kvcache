@@ -327,7 +327,9 @@ std::pair<ClientErrorCode, Locations> GrpcStub::GetCacheLocation(const std::stri
                                                                  const TokenIdsVector &tokens,
                                                                  const BlockMask &block_mask,
                                                                  int32_t sw_size,
-                                                                 const std::vector<std::string> &location_spec_names) {
+                                                                 const std::vector<std::string> &location_spec_names,
+                                                                 const CallerNode &caller,
+                                                                 std::vector<ReplicationHint> &out_hints) {
     auto stub = GET_AND_CHECK_STUB_WITH_TYPE();
     proto::meta::GetCacheLocationRequest request;
     request.set_query_type(static_cast<proto::meta::QueryType>(query_type));
@@ -337,6 +339,11 @@ std::pair<ClientErrorCode, Locations> GrpcStub::GetCacheLocation(const std::stri
     for (const auto &name : location_spec_names) {
         request.add_location_spec_names(name);
     }
+    if (!caller.node_id.empty() || !caller.supernode_id.empty()) {
+        auto *proto_caller = request.mutable_caller();
+        proto_caller->set_node_id(caller.node_id);
+        proto_caller->set_supernode_id(caller.supernode_id);
+    }
 
     ProtoConvert::BlockMaskToProto(block_mask, request.mutable_block_mask());
     grpc::ClientContext context;
@@ -345,7 +352,18 @@ std::pair<ClientErrorCode, Locations> GrpcStub::GetCacheLocation(const std::stri
     CHECK_GRPC_STATUS_WITH_TYPE(grpc_status);
     CHECK_COMMON_HEADER_WITH_TYPE(response);
     auto locations = GenLocations(response.locations());
-    KVCM_LOG_DEBUG("get cache location success, locations: %s", DebugStringUtil::ToString(locations).c_str());
+    out_hints.clear();
+    out_hints.reserve(response.hints_size());
+    for (const auto &h : response.hints()) {
+        ReplicationHint hint;
+        hint.block_key = h.block_key();
+        hint.source_uri = h.source_uri();
+        hint.target_node_id = h.target_node_id();
+        out_hints.push_back(std::move(hint));
+    }
+    KVCM_LOG_DEBUG("get cache location success, locations: %s, hints: %d",
+                   DebugStringUtil::ToString(locations).c_str(),
+                   response.hints_size());
     return {ER_OK, locations};
 }
 
@@ -376,7 +394,8 @@ GrpcStub::StartWriteCache(const std::string &trace_id,
                           const KeyVector &keys,
                           const TokenIdsVector &tokens,
                           const std::vector<std::string> &location_spec_group_names,
-                          int64_t write_timeout_seconds) {
+                          int64_t write_timeout_seconds,
+                          const CallerNode &caller) {
     auto stub = GET_AND_CHECK_STUB_WITH_TYPE();
     proto::meta::StartWriteCacheRequest request;
     SetKeysAndTokens(request, trace_id, instance_id, keys, tokens);
@@ -385,6 +404,11 @@ GrpcStub::StartWriteCache(const std::string &trace_id,
         request.add_location_spec_group_names(name);
     }
     request.set_write_timeout_seconds(write_timeout_seconds);
+    if (!caller.node_id.empty() || !caller.supernode_id.empty()) {
+        auto *proto_caller = request.mutable_caller();
+        proto_caller->set_node_id(caller.node_id);
+        proto_caller->set_supernode_id(caller.supernode_id);
+    }
     grpc::ClientContext context;
     proto::meta::StartWriteCacheResponse response;
     auto grpc_status = stub->StartWriteCache(&context, request, &response);
@@ -456,7 +480,7 @@ bool GrpcStub::TrimCache() {
 }
 
 std::pair<ClientErrorCode, ClusterInfo> GrpcStub::GetClusterInfo(const std::string &trace_id,
-                                                                  const std::string &instance_id) {
+                                                                 const std::string &instance_id) {
     auto stub = GET_AND_CHECK_STUB_WITH_TYPE();
     proto::meta::GetClusterInfoRequest request;
     SetCommonInfo(request, trace_id, instance_id);
@@ -476,9 +500,8 @@ std::pair<ClientErrorCode, ClusterInfo> GrpcStub::GetClusterInfo(const std::stri
         info.leader_endpoint.meta_http_port = ep.meta_http_port();
         info.leader_endpoint.custom_info = ep.custom_info();
     }
-    KVCM_LOG_DEBUG("get cluster info success, self=%s, leader=%s",
-                   info.self_node_id.c_str(),
-                   info.leader_node_id.c_str());
+    KVCM_LOG_DEBUG(
+        "get cluster info success, self=%s, leader=%s", info.self_node_id.c_str(), info.leader_node_id.c_str());
     return {ER_OK, info};
 }
 

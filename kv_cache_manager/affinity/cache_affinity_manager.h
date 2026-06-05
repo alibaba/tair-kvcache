@@ -16,6 +16,7 @@
 #include "kv_cache_manager/affinity/frequency_sketch.h"
 #include "kv_cache_manager/affinity/hint_suppressor.h"
 #include "kv_cache_manager/affinity/node_metrics.h"
+#include "kv_cache_manager/common/affinity_types.h"
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/data_storage/write_hints.h"
 
@@ -24,10 +25,9 @@ namespace kv_cache_manager {
 class DataStorageManager;
 
 struct AffinityResolveContext {
+    CallerNode caller_node;
     std::string instance_strategy_json;
     std::string group_strategy_json;
-    std::string caller_node_id;
-    std::string caller_supernode_id;
     std::string instance_id;
     std::string instance_group_name;
     std::string trace_id;
@@ -99,6 +99,9 @@ private:
     StrategyContext BuildStrategyContext(const AffinityResolveContext &ctx) const;
 
     std::shared_ptr<AffinityStrategy> ParseOrCacheAffinityLocked(const std::string &json) const;
+
+    // 拉一次所有后端的 per-node metrics 并 Upsert; 启动循环前同步预热一次。
+    void PullMetricsOnce();
 
     mutable std::mutex mux_;
     std::shared_ptr<AffinityStrategy> process_affinity_strategy_;

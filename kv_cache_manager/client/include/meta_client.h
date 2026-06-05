@@ -16,14 +16,14 @@ public:
     virtual ~MetaClient() = default;
     static std::unique_ptr<MetaClient> Create(const std::string &config, const InitParams &init_params);
 
-    virtual std::pair<ClientErrorCode, Locations>
-    MatchLocation(const std::string &trace_id,
-                  QueryType query_type,
-                  const std::vector<int64_t> &keys,
-                  const std::vector<int64_t> &tokens,
-                  const BlockMask &block_mask,
-                  int32_t sw_size,
-                  const std::vector<std::string> &location_spec_names) = 0;
+    virtual std::pair<ClientErrorCode, Locations> MatchLocation(const std::string &trace_id,
+                                                                QueryType query_type,
+                                                                const std::vector<int64_t> &keys,
+                                                                const std::vector<int64_t> &tokens,
+                                                                const BlockMask &block_mask,
+                                                                int32_t sw_size,
+                                                                const std::vector<std::string> &location_spec_names,
+                                                                std::vector<ReplicationHint> &out_hints) = 0;
 
     virtual std::pair<ClientErrorCode, WriteLocation>
     StartWrite(const std::string &trace_id,

@@ -22,6 +22,7 @@ cc_library(
     deps = [
         "//kv_cache_manager/client:client_api",
         "//kv_cache_manager/client/src/internal/util",
+        "//kv_cache_manager/common:affinity_types",
         "//kv_cache_manager/common:logger",
         "//kv_cache_manager/config",
         "//kv_cache_manager/service/util:manager_message_proto_util",

@@ -96,7 +96,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, AdaptiveHotKeyRetentionLoop) {
     mgr.UpsertNodeMetrics({"node_c", "node_c", 600000, 0.30, 5, 5, 1});
 
     AffinityResolveContext ctx;
-    ctx.caller_node_id = "node_a";
+    ctx.caller_node.node_id = "node_a";
     ctx.instance_id = "inst-001";
     ctx.trace_id = "adaptive-loop";
 
@@ -130,7 +130,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, AdaptiveHotKeyRetentionLoop) {
         auto req = MakeRemoteReadRequest(42, &remote_spec, &winner);
         ReadDecision dec = mgr.ResolveRead(req, ctx);
         ASSERT_EQ(1u, dec.side_effects.size());
-        auto *hint = dynamic_cast<ReplicationHint *>(dec.side_effects[0].get());
+        auto *hint = dynamic_cast<ReplicationHintSideEffect *>(dec.side_effects[0].get());
         ASSERT_NE(nullptr, hint);
         EXPECT_EQ(42, hint->block_key);
         EXPECT_EQ("node_a", hint->target_node_id);
@@ -186,7 +186,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, WritePipelineFilterSortLimit) {
     mgr.UpsertNodeMetrics({"node_d", "node_d", 500000, 0.50, 0, 0, 1});
 
     AffinityResolveContext ctx;
-    ctx.caller_node_id = "node_a"; // caller is on the overloaded node
+    ctx.caller_node.node_id = "node_a"; // caller is on the overloaded node
     ctx.trace_id = "pipeline-test";
 
     WriteDecision dec = mgr.ResolveWrite(ctx);
@@ -217,7 +217,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, WritePipelinePreferLocalWithFilter) 
     mgr.UpsertNodeMetrics({"node_b", "node_b", 800000, 0.30, 0, 0, 1});
 
     AffinityResolveContext ctx;
-    ctx.caller_node_id = "node_a";
+    ctx.caller_node.node_id = "node_a";
     ctx.trace_id = "prefer-local-filter";
 
     WriteDecision dec = mgr.ResolveWrite(ctx);
@@ -244,7 +244,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, ReadOnMissCallerCapacityGateBlocksHi
     mgr.UpsertNodeMetrics({"node_b", "node_b", 800000, 0.20, 0, 0, 1});
 
     AffinityResolveContext ctx;
-    ctx.caller_node_id = "node_a";
+    ctx.caller_node.node_id = "node_a";
     ctx.trace_id = "capacity-gate";
 
     LocationSpec remote("tp0", "tair://node_b/block/99", "node_b");
@@ -330,7 +330,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, MultiCallerBothGetReplicationHints) 
     // Caller A reads 3 times → hint targets node_a
     {
         AffinityResolveContext ctx_a;
-        ctx_a.caller_node_id = "node_a";
+        ctx_a.caller_node.node_id = "node_a";
         ctx_a.trace_id = "multi-caller-a";
 
         for (int i = 0; i < 2; ++i) {
@@ -341,7 +341,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, MultiCallerBothGetReplicationHints) 
         auto req = MakeRemoteReadRequest(7, &remote, &winner);
         ReadDecision dec = mgr.ResolveRead(req, ctx_a);
         ASSERT_EQ(1u, dec.side_effects.size());
-        auto *hint = dynamic_cast<ReplicationHint *>(dec.side_effects[0].get());
+        auto *hint = dynamic_cast<ReplicationHintSideEffect *>(dec.side_effects[0].get());
         ASSERT_NE(nullptr, hint);
         EXPECT_EQ("node_a", hint->target_node_id);
     }
@@ -349,7 +349,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, MultiCallerBothGetReplicationHints) 
     // Caller B reads 3 times → independent sketch → hint targets node_b
     {
         AffinityResolveContext ctx_b;
-        ctx_b.caller_node_id = "node_b";
+        ctx_b.caller_node.node_id = "node_b";
         ctx_b.trace_id = "multi-caller-b";
 
         for (int i = 0; i < 2; ++i) {
@@ -360,7 +360,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, MultiCallerBothGetReplicationHints) 
         auto req = MakeRemoteReadRequest(7, &remote, &winner);
         ReadDecision dec = mgr.ResolveRead(req, ctx_b);
         ASSERT_EQ(1u, dec.side_effects.size());
-        auto *hint = dynamic_cast<ReplicationHint *>(dec.side_effects[0].get());
+        auto *hint = dynamic_cast<ReplicationHintSideEffect *>(dec.side_effects[0].get());
         ASSERT_NE(nullptr, hint);
         EXPECT_EQ("node_b", hint->target_node_id);
     }
@@ -383,7 +383,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, HintDedupSuppressionWindow) {
     mgr.UpsertNodeMetrics({"node_b", "node_b", 800000, 0.20, 0, 0, 1});
 
     AffinityResolveContext ctx;
-    ctx.caller_node_id = "node_a";
+    ctx.caller_node.node_id = "node_a";
     ctx.trace_id = "dedup-window";
 
     LocationSpec remote("tp0", "tair://node_b/block/55", "node_b");
@@ -444,7 +444,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, ThreeTierPriorityRealisticOverrides)
     // ---- Tier: process (threshold=3) — 3 reads → hint ----
     {
         AffinityResolveContext ctx;
-        ctx.caller_node_id = "node_a";
+        ctx.caller_node.node_id = "node_a";
         ctx.trace_id = "tier-process";
 
         for (int i = 0; i < 2; ++i) {
@@ -460,7 +460,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, ThreeTierPriorityRealisticOverrides)
     // ---- Tier: group overrides threshold to 100 ----
     {
         AffinityResolveContext ctx;
-        ctx.caller_node_id = "node_a";
+        ctx.caller_node.node_id = "node_a";
         ctx.trace_id = "tier-group";
         ctx.group_strategy_json = R"({
             "type": "local_replica",
@@ -478,7 +478,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, ThreeTierPriorityRealisticOverrides)
     // ---- Tier: instance overrides to noop ----
     {
         AffinityResolveContext ctx;
-        ctx.caller_node_id = "node_a";
+        ctx.caller_node.node_id = "node_a";
         ctx.trace_id = "tier-instance";
         ctx.instance_strategy_json = R"({"type":"noop"})";
         ctx.group_strategy_json = kFullStrategyJson;
@@ -516,7 +516,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, GlobalKillSwitchMidFlight) {
     // After: everything noop
     {
         AffinityResolveContext ctx;
-        ctx.caller_node_id = "node_a";
+        ctx.caller_node.node_id = "node_a";
 
         WriteDecision wdec = mgr.ResolveWrite(ctx);
         EXPECT_TRUE(wdec.hints.preferred_node_ids.empty());
@@ -530,7 +530,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, GlobalKillSwitchMidFlight) {
     // Recovery: decisions resume
     {
         AffinityResolveContext ctx;
-        ctx.caller_node_id = "node_a";
+        ctx.caller_node.node_id = "node_a";
 
         WriteDecision wdec = mgr.ResolveWrite(ctx);
         ASSERT_FALSE(wdec.hints.preferred_node_ids.empty());
@@ -557,7 +557,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, LoadFullStrategyFromFile) {
     mgr.UpsertNodeMetrics({"node_b", "node_b", 200000, 0.30, 0, 0, 1});
 
     AffinityResolveContext ctx;
-    ctx.caller_node_id = "node_a";
+    ctx.caller_node.node_id = "node_a";
     ctx.trace_id = "file-load";
 
     WriteDecision dec = mgr.ResolveWrite(ctx);
@@ -575,7 +575,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, NoNodesGracefulDegradation) {
     ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonString(kFullStrategyJson));
 
     AffinityResolveContext ctx;
-    ctx.caller_node_id = "node_a";
+    ctx.caller_node.node_id = "node_a";
     ctx.trace_id = "no-nodes";
 
     WriteDecision wdec = mgr.ResolveWrite(ctx);
@@ -608,7 +608,7 @@ TEST_F(CacheAffinityManagerIntegrationTest, WriteAspectDisabledReadEvictionOn) {
     mgr.UpsertNodeMetrics({"node_b", "node_b", 100000, 0.90, 0, 0, 1});
 
     AffinityResolveContext ctx;
-    ctx.caller_node_id = "node_a";
+    ctx.caller_node.node_id = "node_a";
     ctx.trace_id = "toggle-test";
 
     // Write disabled: empty hints even though nodes are present

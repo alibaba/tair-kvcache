@@ -38,12 +38,12 @@ void LogErrorCodes(const std::string &operation_name,
 CacheLocationConstPtr SelectAndMergeForMatch(SelectLocationPolicy *policy,
                                              CacheLocationMap &location_map,
                                              CheckLocDataExistFunc check_loc_data_exist,
+                                             const CallerNode &caller,
+                                             CacheAffinityManager *affinity_manager,
+                                             int64_t block_key,
+                                             const AffinityResolveContext *resolve_ctx,
                                              std::vector<std::string> &out_prune_loc_ids,
-                                             const std::string &caller_node_id = "",
-                                             CacheAffinityManager *affinity_manager = nullptr,
-                                             int64_t block_key = 0,
-                                             std::vector<std::unique_ptr<ReadSideEffect>> *out_side_effects = nullptr,
-                                             const AffinityResolveContext *resolve_ctx = nullptr) {
+                                             std::vector<std::unique_ptr<ReadSideEffect>> *out_side_effects) {
     // Filter valid locations into a shared map.
     CacheLocationMap valid_map;
     for (auto &[id, loc_ptr] : location_map) {
@@ -109,9 +109,9 @@ CacheLocationConstPtr SelectAndMergeForMatch(SelectLocationPolicy *policy,
             }
             for (const auto &spec : loc_ptr->location_specs()) {
                 auto [it, inserted] = merged_specs.try_emplace(spec.name(), spec);
-                if (!inserted && !caller_node_id.empty()) {
-                    const bool incumbent_local = (it->second.node_id() == caller_node_id);
-                    const bool challenger_local = (spec.node_id() == caller_node_id);
+                if (!inserted && !caller.node_id.empty()) {
+                    const bool incumbent_local = (it->second.node_id() == caller.node_id);
+                    const bool challenger_local = (spec.node_id() == caller.node_id);
                     if (challenger_local && !incumbent_local) {
                         it->second = spec;
                     }
@@ -176,13 +176,14 @@ std::string MetaSearcher::BatchErrorCodeToStr(const std::vector<std::vector<Erro
     return result_stream.str();
 }
 
-ErrorCode MetaSearcher::PrefixMatchBestLocationImpl(RequestContext *request_context,
-                                                    const KeyVector &keys,
-                                                    CacheLocationVector &out_locations,
-                                                    SelectLocationPolicy *policy,
-                                                    CacheAffinityManager *affinity_manager,
-                                                    std::vector<std::unique_ptr<ReadSideEffect>> *out_side_effects,
-                                                    const AffinityResolveContext *resolve_ctx) const {
+ErrorCode
+MetaSearcher::PrefixMatchBestLocationImpl(RequestContext *request_context,
+                                          const KeyVector &keys,
+                                          CacheLocationVector &out_locations,
+                                          SelectLocationPolicy *policy,
+                                          const std::shared_ptr<CacheAffinityManager> &affinity_manager,
+                                          const AffinityResolveContext *resolve_ctx,
+                                          std::vector<std::unique_ptr<ReadSideEffect>> &out_side_effects) const {
     out_locations.clear();
 
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
@@ -209,12 +210,12 @@ ErrorCode MetaSearcher::PrefixMatchBestLocationImpl(RequestContext *request_cont
         CacheLocationConstPtr merged = SelectAndMergeForMatch(policy,
                                                               location_map,
                                                               check_loc_data_exist_func_,
-                                                              prune_loc_ids,
-                                                              request_context->caller_node_id(),
-                                                              affinity_manager,
+                                                              request_context->caller_node(),
+                                                              affinity_manager.get(),
                                                               keys[i],
-                                                              out_side_effects,
-                                                              resolve_ctx);
+                                                              resolve_ctx,
+                                                              prune_loc_ids,
+                                                              &out_side_effects);
         if (!prune_loc_ids.empty()) {
             prune_keys.emplace_back(keys[i]);
             prune_loc_ids_vec.emplace_back(prune_loc_ids);
@@ -256,9 +257,9 @@ ErrorCode MetaSearcher::PrefixMatch(RequestContext *request_context,
                                     const BlockMask &input_mask,
                                     CacheLocationVector &out_locations,
                                     SelectLocationPolicy *policy,
-                                    CacheAffinityManager *affinity_manager,
-                                    std::vector<std::unique_ptr<ReadSideEffect>> *out_side_effects,
-                                    const AffinityResolveContext *resolve_ctx) const {
+                                    const std::shared_ptr<CacheAffinityManager> &affinity_manager,
+                                    const AffinityResolveContext *resolve_ctx,
+                                    std::vector<std::unique_ptr<ReadSideEffect>> &out_side_effects) const {
     assert(policy != nullptr);
     SPAN_TRACER(request_context);
     KeyVector query_keys;
@@ -275,7 +276,7 @@ ErrorCode MetaSearcher::PrefixMatch(RequestContext *request_context,
     // TODO: need to confirm shard lock range
     // TODO: use smaller batch if many prefix missed a lot
     ErrorCode ec = PrefixMatchBestLocationImpl(
-        request_context, query_keys, out_locations, policy, affinity_manager, out_side_effects, resolve_ctx);
+        request_context, query_keys, out_locations, policy, affinity_manager, resolve_ctx, out_side_effects);
     if (ec != EC_OK) {
         KVCM_LOG_DEBUG("PrefixMatchBestLocationImpl failed");
     }
@@ -286,9 +287,9 @@ ErrorCode MetaSearcher::BatchGetBestLocation(RequestContext *request_context,
                                              const KeyVector &keys,
                                              CacheLocationVector &out_locations,
                                              SelectLocationPolicy *policy,
-                                             CacheAffinityManager *affinity_manager,
-                                             std::vector<std::unique_ptr<ReadSideEffect>> *out_side_effects,
-                                             const AffinityResolveContext *resolve_ctx) const {
+                                             const std::shared_ptr<CacheAffinityManager> &affinity_manager,
+                                             const AffinityResolveContext *resolve_ctx,
+                                             std::vector<std::unique_ptr<ReadSideEffect>> &out_side_effects) const {
     assert(policy != nullptr);
     SPAN_TRACER(request_context);
     out_locations.clear();
@@ -319,12 +320,12 @@ ErrorCode MetaSearcher::BatchGetBestLocation(RequestContext *request_context,
         CacheLocationConstPtr merged = SelectAndMergeForMatch(policy,
                                                               location_map,
                                                               check_loc_data_exist_func_,
-                                                              prune_loc_ids,
-                                                              request_context->caller_node_id(),
-                                                              affinity_manager,
+                                                              request_context->caller_node(),
+                                                              affinity_manager.get(),
                                                               keys[i],
-                                                              out_side_effects,
-                                                              resolve_ctx);
+                                                              resolve_ctx,
+                                                              prune_loc_ids,
+                                                              &out_side_effects);
         if (!prune_loc_ids.empty()) {
             prune_keys.emplace_back(keys[i]);
             prune_loc_ids_vec.emplace_back(prune_loc_ids);
@@ -343,14 +344,15 @@ ErrorCode MetaSearcher::BatchGetBestLocation(RequestContext *request_context,
     return out_locations.size() == keys.size() ? EC_OK : EC_ERROR;
 }
 
-ErrorCode MetaSearcher::ReverseRollSlideWindowMatch(RequestContext *request_context,
-                                                    const KeyVector &keys,
-                                                    int32_t sw_size,
-                                                    CacheLocationVector &out_locations,
-                                                    SelectLocationPolicy *policy,
-                                                    CacheAffinityManager *affinity_manager,
-                                                    std::vector<std::unique_ptr<ReadSideEffect>> *out_side_effects,
-                                                    const AffinityResolveContext *resolve_ctx) const {
+ErrorCode
+MetaSearcher::ReverseRollSlideWindowMatch(RequestContext *request_context,
+                                          const KeyVector &keys,
+                                          int32_t sw_size,
+                                          CacheLocationVector &out_locations,
+                                          SelectLocationPolicy *policy,
+                                          const std::shared_ptr<CacheAffinityManager> &affinity_manager,
+                                          const AffinityResolveContext *resolve_ctx,
+                                          std::vector<std::unique_ptr<ReadSideEffect>> &out_side_effects) const {
     assert(policy != nullptr);
     SPAN_TRACER(request_context);
     assert(keys.size() >= sw_size);
@@ -396,12 +398,12 @@ ErrorCode MetaSearcher::ReverseRollSlideWindowMatch(RequestContext *request_cont
             CacheLocationConstPtr merged = SelectAndMergeForMatch(policy,
                                                                   location_map,
                                                                   check_loc_data_exist_func_,
-                                                                  prune_loc_ids,
-                                                                  request_context->caller_node_id(),
-                                                                  affinity_manager,
+                                                                  request_context->caller_node(),
+                                                                  affinity_manager.get(),
                                                                   keys[base + offset],
-                                                                  out_side_effects,
-                                                                  resolve_ctx);
+                                                                  resolve_ctx,
+                                                                  prune_loc_ids,
+                                                                  &out_side_effects);
             if (!prune_loc_ids.empty()) {
                 prune_keys.emplace_back(keys[base + offset]);
                 prune_loc_ids_vec.emplace_back(prune_loc_ids);

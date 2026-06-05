@@ -3,6 +3,7 @@
 #include <memory>
 #include <string>
 
+#include "kv_cache_manager/common/affinity_types.h"
 #include "kv_cache_manager/common/tracer.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
 
@@ -19,16 +20,6 @@
     }
 
 namespace kv_cache_manager {
-
-// The caller's self-reported node, mirrors proto meta::CallerNode but kept
-// proto-free so the common layer does not depend on generated pb code.
-//   node_id      : inference node identity (IP / hostname). Same notion as
-//                  LocationSpec.node_id — a single physical machine.
-//   supernode_id : super-node (e.g. same rack / switch domain) the node lives in.
-struct CallerNode {
-    std::string node_id;
-    std::string supernode_id;
-};
 
 class RequestContext : std::enable_shared_from_this<RequestContext> {
 public:

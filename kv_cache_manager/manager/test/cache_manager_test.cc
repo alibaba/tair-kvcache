@@ -48,6 +48,25 @@ public:
                 Create,
                 (const std::vector<std::string> &, size_t, const std::string &, std::function<void()>),
                 (override));
+    // CreateWithHints is pure virtual on the base; we don't actually drive it
+    // in any current test, so inline the legacy-Create() adapter directly to
+    // satisfy the override without setting up extra EXPECT_CALLs in callers.
+    std::vector<LocationDescriptor> CreateWithHints(const std::vector<std::string> &keys,
+                                                    size_t size_per_key,
+                                                    const WriteHints &hints,
+                                                    bool strict,
+                                                    const std::string &trace_id,
+                                                    std::function<void()> cb) override {
+        (void)hints;
+        (void)strict;
+        auto legacy = Create(keys, size_per_key, trace_id, std::move(cb));
+        std::vector<LocationDescriptor> out;
+        out.reserve(legacy.size());
+        for (auto &p : legacy) {
+            out.push_back(LocationDescriptor{p.first, std::move(p.second), /*node_id=*/""});
+        }
+        return out;
+    }
     MOCK_METHOD(std::vector<ErrorCode>,
                 Delete,
                 (const std::vector<DataStorageUri> &, const std::string &, std::function<void()>),
@@ -80,6 +99,18 @@ public:
     std::vector<std::pair<ErrorCode, DataStorageUri>>
     Create(const std::vector<std::string> &k, size_t s, const std::string &t, std::function<void()> cb) override {
         return delegate_->Create(k, s, t, std::move(cb));
+    }
+    // CreateWithHints is pure virtual on the base; delegate straight through
+    // to the wrapped backend so any caller_node_id / preferred_node_ids
+    // behaviour the real backend exposes is preserved through the
+    // interceptor (which only intercepts MightExist).
+    std::vector<LocationDescriptor> CreateWithHints(const std::vector<std::string> &k,
+                                                    size_t s,
+                                                    const WriteHints &h,
+                                                    bool strict,
+                                                    const std::string &t,
+                                                    std::function<void()> cb) override {
+        return delegate_->CreateWithHints(k, s, h, strict, t, std::move(cb));
     }
     std::vector<ErrorCode>
     Delete(const std::vector<DataStorageUri> &u, const std::string &t, std::function<void()> cb) override {
@@ -550,6 +581,7 @@ TEST_F(CacheManagerTest, TestGetCacheLocationPrefixMatch) {
     {
         BlockMask block_mask = static_cast<size_t>(0);
         CacheLocationViewVecWrapper cache_locations;
+        std::vector<ReplicationHint> hints;
         auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
                                                    "test_instance",
                                                    CacheManager::QueryType::QT_PREFIX_MATCH,
@@ -558,7 +590,8 @@ TEST_F(CacheManagerTest, TestGetCacheLocationPrefixMatch) {
                                                    block_mask,
                                                    0,
                                                    {},
-                                                   &cache_locations);
+                                                   cache_locations,
+                                                   hints);
         ASSERT_EQ(EC_OK, ec);
         const auto &cache_locations_view = cache_locations.cache_locations_view();
         ASSERT_EQ(0, cache_locations_view.size());
@@ -572,6 +605,7 @@ TEST_F(CacheManagerTest, TestGetCacheLocationPrefixMatch) {
     {
         BlockMask block_mask = static_cast<size_t>(0);
         CacheLocationViewVecWrapper cache_locations;
+        std::vector<ReplicationHint> hints;
         auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
                                                    "test_instance",
                                                    CacheManager::QueryType::QT_PREFIX_MATCH,
@@ -580,7 +614,8 @@ TEST_F(CacheManagerTest, TestGetCacheLocationPrefixMatch) {
                                                    block_mask,
                                                    0,
                                                    {},
-                                                   &cache_locations);
+                                                   cache_locations,
+                                                   hints);
         ASSERT_EQ(EC_OK, ec);
         const auto &cache_locations_view = cache_locations.cache_locations_view();
         ASSERT_EQ(3, cache_locations_view.size());
@@ -589,6 +624,7 @@ TEST_F(CacheManagerTest, TestGetCacheLocationPrefixMatch) {
         std::vector<int64_t> keys{1, 2, 4, 3};
         BlockMask block_mask = static_cast<size_t>(0);
         CacheLocationViewVecWrapper cache_locations;
+        std::vector<ReplicationHint> hints;
         auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
                                                    "test_instance",
                                                    CacheManager::QueryType::QT_PREFIX_MATCH,
@@ -597,7 +633,8 @@ TEST_F(CacheManagerTest, TestGetCacheLocationPrefixMatch) {
                                                    block_mask,
                                                    0,
                                                    {},
-                                                   &cache_locations);
+                                                   cache_locations,
+                                                   hints);
         ASSERT_EQ(EC_OK, ec);
         const auto &cache_locations_view = cache_locations.cache_locations_view();
         ASSERT_EQ(2, cache_locations_view.size());
@@ -605,6 +642,7 @@ TEST_F(CacheManagerTest, TestGetCacheLocationPrefixMatch) {
     {
         BlockMask block_mask = static_cast<size_t>(0);
         CacheLocationViewVecWrapper cache_locations;
+        std::vector<ReplicationHint> hints;
         auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
                                                    "test_instance",
                                                    CacheManager::QueryType::QT_PREFIX_MATCH,
@@ -613,7 +651,8 @@ TEST_F(CacheManagerTest, TestGetCacheLocationPrefixMatch) {
                                                    block_mask,
                                                    0,
                                                    {"tp0", "tp1", "tp2"},
-                                                   &cache_locations);
+                                                   cache_locations,
+                                                   hints);
         ASSERT_EQ(EC_OK, ec);
         const auto &cache_locations_view = cache_locations.cache_locations_view();
         ASSERT_EQ(3, cache_locations_view.size());
@@ -780,6 +819,7 @@ TEST_F(CacheManagerTest, TestGetCacheLocationBatchGet) {
     {
         BlockMask block_mask = static_cast<size_t>(0);
         CacheLocationViewVecWrapper cache_locations;
+        std::vector<ReplicationHint> hints;
         auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
                                                    "test_instance",
                                                    CacheManager::QueryType::QT_BATCH_GET,
@@ -788,7 +828,8 @@ TEST_F(CacheManagerTest, TestGetCacheLocationBatchGet) {
                                                    block_mask,
                                                    0,
                                                    {},
-                                                   &cache_locations);
+                                                   cache_locations,
+                                                   hints);
         ASSERT_EQ(EC_OK, ec);
         const auto &cache_locations_view = cache_locations.cache_locations_view();
         ASSERT_EQ(4, cache_locations_view.size());
@@ -805,6 +846,7 @@ TEST_F(CacheManagerTest, TestGetCacheLocationBatchGet) {
     {
         BlockMask block_mask = static_cast<size_t>(0);
         CacheLocationViewVecWrapper cache_locations;
+        std::vector<ReplicationHint> hints;
         auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
                                                    "test_instance",
                                                    CacheManager::QueryType::QT_BATCH_GET,
@@ -813,7 +855,8 @@ TEST_F(CacheManagerTest, TestGetCacheLocationBatchGet) {
                                                    block_mask,
                                                    0,
                                                    {},
-                                                   &cache_locations);
+                                                   cache_locations,
+                                                   hints);
         ASSERT_EQ(EC_OK, ec);
         const auto &cache_locations_view = cache_locations.cache_locations_view();
         ASSERT_EQ(4, cache_locations_view.size());
@@ -829,6 +872,7 @@ TEST_F(CacheManagerTest, TestGetCacheLocationBatchGet) {
     {
         BlockMask block_mask = static_cast<size_t>(0);
         CacheLocationViewVecWrapper cache_locations;
+        std::vector<ReplicationHint> hints;
         auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
                                                    "test_instance",
                                                    CacheManager::QueryType::QT_BATCH_GET,
@@ -837,7 +881,8 @@ TEST_F(CacheManagerTest, TestGetCacheLocationBatchGet) {
                                                    block_mask,
                                                    0,
                                                    {},
-                                                   &cache_locations);
+                                                   cache_locations,
+                                                   hints);
         ASSERT_EQ(EC_OK, ec);
         const auto &cache_locations_view = cache_locations.cache_locations_view();
         ASSERT_EQ(4, cache_locations_view.size());
@@ -871,6 +916,7 @@ TEST_F(CacheManagerTest, TestGetCacheLocationReverseRollSlideWindowMatch) {
     {
         BlockMask block_mask = static_cast<size_t>(0);
         CacheLocationViewVecWrapper cache_locations;
+        std::vector<ReplicationHint> hints;
         auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
                                                    "test_instance",
                                                    CacheManager::QueryType::QT_REVERSE_ROLL_SW_MATCH,
@@ -879,7 +925,8 @@ TEST_F(CacheManagerTest, TestGetCacheLocationReverseRollSlideWindowMatch) {
                                                    block_mask,
                                                    2,
                                                    {},
-                                                   &cache_locations);
+                                                   cache_locations,
+                                                   hints);
         ASSERT_EQ(EC_OK, ec);
         const auto &cache_locations_view = cache_locations.cache_locations_view();
         ASSERT_EQ(6, cache_locations_view.size());
@@ -899,6 +946,7 @@ TEST_F(CacheManagerTest, TestGetCacheLocationReverseRollSlideWindowMatch) {
     {
         BlockMask block_mask = static_cast<size_t>(0);
         CacheLocationViewVecWrapper cache_locations;
+        std::vector<ReplicationHint> hints;
         auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
                                                    "test_instance",
                                                    CacheManager::QueryType::QT_REVERSE_ROLL_SW_MATCH,
@@ -907,7 +955,8 @@ TEST_F(CacheManagerTest, TestGetCacheLocationReverseRollSlideWindowMatch) {
                                                    block_mask,
                                                    3,
                                                    {},
-                                                   &cache_locations);
+                                                   cache_locations,
+                                                   hints);
         ASSERT_EQ(EC_OK, ec);
         const auto &cache_locations_view = cache_locations.cache_locations_view();
         ASSERT_EQ(6, cache_locations_view.size());
@@ -921,6 +970,7 @@ TEST_F(CacheManagerTest, TestGetCacheLocationReverseRollSlideWindowMatch) {
     {
         BlockMask block_mask = static_cast<size_t>(0);
         CacheLocationViewVecWrapper cache_locations;
+        std::vector<ReplicationHint> hints;
         auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
                                                    "test_instance",
                                                    CacheManager::QueryType::QT_REVERSE_ROLL_SW_MATCH,
@@ -929,7 +979,8 @@ TEST_F(CacheManagerTest, TestGetCacheLocationReverseRollSlideWindowMatch) {
                                                    block_mask,
                                                    2,
                                                    {},
-                                                   &cache_locations);
+                                                   cache_locations,
+                                                   hints);
         ASSERT_EQ(EC_OK, ec);
         const auto &cache_locations_view = cache_locations.cache_locations_view();
         ASSERT_EQ(7, cache_locations_view.size());
@@ -952,6 +1003,7 @@ TEST_F(CacheManagerTest, TestGetCacheLocationReverseRollSlideWindowMatch) {
     {
         BlockMask block_mask = static_cast<size_t>(0);
         CacheLocationViewVecWrapper cache_locations;
+        std::vector<ReplicationHint> hints;
         auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
                                                    "test_instance",
                                                    CacheManager::QueryType::QT_REVERSE_ROLL_SW_MATCH,
@@ -960,7 +1012,8 @@ TEST_F(CacheManagerTest, TestGetCacheLocationReverseRollSlideWindowMatch) {
                                                    block_mask,
                                                    2,
                                                    {},
-                                                   &cache_locations);
+                                                   cache_locations,
+                                                   hints);
         ASSERT_EQ(EC_OK, ec);
         const auto &cache_locations_view = cache_locations.cache_locations_view();
         ASSERT_EQ(7, cache_locations_view.size());
@@ -1006,6 +1059,7 @@ TEST_F(CacheManagerTest, TestGetCacheNotExistLocation) {
         std::vector<int64_t> keys{1, 2, 3, 12212};
         BlockMask block_mask = static_cast<size_t>(0);
         CacheLocationViewVecWrapper cache_locations;
+        std::vector<ReplicationHint> hints;
         auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
                                                    "test_instance",
                                                    CacheManager::QueryType::QT_PREFIX_MATCH,
@@ -1014,7 +1068,8 @@ TEST_F(CacheManagerTest, TestGetCacheNotExistLocation) {
                                                    block_mask,
                                                    0,
                                                    {},
-                                                   &cache_locations);
+                                                   cache_locations,
+                                                   hints);
         ASSERT_EQ(EC_OK, ec);
         const auto &cache_locations_view = cache_locations.cache_locations_view();
         ASSERT_EQ(3, cache_locations_view.size());
@@ -1040,6 +1095,7 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheWithBlockMask) {
         {
             BlockMask block_mask = static_cast<size_t>(0);
             CacheLocationViewVecWrapper cache_locations;
+            std::vector<ReplicationHint> hints;
             auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
                                                        "test_instance",
                                                        CacheManager::QueryType::QT_PREFIX_MATCH,
@@ -1048,7 +1104,8 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheWithBlockMask) {
                                                        block_mask,
                                                        0,
                                                        {},
-                                                       &cache_locations);
+                                                       cache_locations,
+                                                       hints);
             ASSERT_EQ(EC_OK, ec);
             const auto &cache_locations_view = cache_locations.cache_locations_view();
             ASSERT_EQ(0, cache_locations_view.size());
@@ -1064,6 +1121,7 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheWithBlockMask) {
         {
             BlockMask block_mask = static_cast<size_t>(0);
             CacheLocationViewVecWrapper cache_locations;
+            std::vector<ReplicationHint> hints;
             auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
                                                        "test_instance",
                                                        CacheManager::QueryType::QT_PREFIX_MATCH,
@@ -1072,7 +1130,8 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheWithBlockMask) {
                                                        block_mask,
                                                        0,
                                                        {},
-                                                       &cache_locations);
+                                                       cache_locations,
+                                                       hints);
             ASSERT_EQ(EC_OK, ec);
             const auto &cache_locations_view = cache_locations.cache_locations_view();
             ASSERT_EQ(2, cache_locations_view.size());
@@ -1103,6 +1162,7 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheWithBlockMask) {
         {
             BlockMask block_mask = static_cast<size_t>(0);
             CacheLocationViewVecWrapper cache_locations;
+            std::vector<ReplicationHint> hints;
             auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
                                                        "test_instance",
                                                        CacheManager::QueryType::QT_PREFIX_MATCH,
@@ -1111,7 +1171,8 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheWithBlockMask) {
                                                        block_mask,
                                                        0,
                                                        {},
-                                                       &cache_locations);
+                                                       cache_locations,
+                                                       hints);
             ASSERT_EQ(EC_OK, ec);
             const auto &cache_locations_view = cache_locations.cache_locations_view();
             ASSERT_EQ(0, cache_locations_view.size());
@@ -1127,6 +1188,7 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheWithBlockMask) {
         {
             BlockMask block_mask = static_cast<size_t>(0);
             CacheLocationViewVecWrapper cache_locations;
+            std::vector<ReplicationHint> hints;
             auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
                                                        "test_instance",
                                                        CacheManager::QueryType::QT_PREFIX_MATCH,
@@ -1135,7 +1197,8 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheWithBlockMask) {
                                                        block_mask,
                                                        0,
                                                        {},
-                                                       &cache_locations);
+                                                       cache_locations,
+                                                       hints);
             ASSERT_EQ(EC_OK, ec);
             const auto &cache_locations_view = cache_locations.cache_locations_view();
             ASSERT_EQ(2, cache_locations_view.size());
@@ -1491,6 +1554,7 @@ TEST_F(CacheManagerTest, TestUnavailableStorage) {
                 {
                     BlockMask block_mask = static_cast<size_t>(0);
                     CacheLocationViewVecWrapper cache_locations;
+                    std::vector<ReplicationHint> hints;
                     auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
                                                                "test_group2_instance",
                                                                CacheManager::QueryType::QT_PREFIX_MATCH,
@@ -1499,7 +1563,8 @@ TEST_F(CacheManagerTest, TestUnavailableStorage) {
                                                                block_mask,
                                                                0,
                                                                {},
-                                                               &cache_locations);
+                                                               cache_locations,
+                                                               hints);
                     ASSERT_EQ(EC_OK, ec);
                     const auto &cache_locations_view = cache_locations.cache_locations_view();
                     ASSERT_EQ(0, cache_locations_view.size());
@@ -1515,6 +1580,7 @@ TEST_F(CacheManagerTest, TestUnavailableStorage) {
                 {
                     BlockMask block_mask = static_cast<size_t>(0);
                     CacheLocationViewVecWrapper cache_locations;
+                    std::vector<ReplicationHint> hints;
                     auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
                                                                "test_group2_instance",
                                                                CacheManager::QueryType::QT_PREFIX_MATCH,
@@ -1523,7 +1589,8 @@ TEST_F(CacheManagerTest, TestUnavailableStorage) {
                                                                block_mask,
                                                                0,
                                                                {},
-                                                               &cache_locations);
+                                                               cache_locations,
+                                                               hints);
                     ASSERT_EQ(EC_OK, ec);
                     const auto &cache_locations_view = cache_locations.cache_locations_view();
                     ASSERT_EQ(4, cache_locations_view.size());
@@ -1536,6 +1603,7 @@ TEST_F(CacheManagerTest, TestUnavailableStorage) {
             std::vector<int64_t> keys{i * 10 + 1, i * 10 + 2, i * 10 + 3, i * 10 + 4};
             BlockMask block_mask = static_cast<size_t>(0);
             CacheLocationViewVecWrapper cache_locations;
+            std::vector<ReplicationHint> hints;
             auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
                                                        "test_group2_instance",
                                                        CacheManager::QueryType::QT_PREFIX_MATCH,
@@ -1544,7 +1612,8 @@ TEST_F(CacheManagerTest, TestUnavailableStorage) {
                                                        block_mask,
                                                        0,
                                                        {},
-                                                       &cache_locations);
+                                                       cache_locations,
+                                                       hints);
             ASSERT_EQ(EC_OK, ec);
             const auto &cache_locations_view = cache_locations.cache_locations_view();
             ASSERT_EQ(expect_location_size, cache_locations_view.size());
@@ -2443,6 +2512,7 @@ TEST_F(CacheManagerTest, TestWriteThenReadRoundTripWithSpecGroups) {
     {
         BlockMask block_mask = static_cast<size_t>(0);
         CacheLocationViewVecWrapper cache_locations;
+        std::vector<ReplicationHint> hints;
         auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
                                                    "test_roundtrip",
                                                    CacheManager::QueryType::QT_PREFIX_MATCH,
@@ -2451,7 +2521,8 @@ TEST_F(CacheManagerTest, TestWriteThenReadRoundTripWithSpecGroups) {
                                                    block_mask,
                                                    0,
                                                    {},
-                                                   &cache_locations);
+                                                   cache_locations,
+                                                   hints);
         ASSERT_EQ(EC_OK, ec);
         const auto &views = cache_locations.cache_locations_view();
         ASSERT_EQ(3, views.size());
@@ -2470,6 +2541,7 @@ TEST_F(CacheManagerTest, TestWriteThenReadRoundTripWithSpecGroups) {
     {
         BlockMask block_mask = static_cast<size_t>(0);
         CacheLocationViewVecWrapper cache_locations;
+        std::vector<ReplicationHint> hints;
         auto ec = cache_manager_->GetCacheLocation(request_context_.get(),
                                                    "test_roundtrip",
                                                    CacheManager::QueryType::QT_PREFIX_MATCH,
@@ -2478,7 +2550,8 @@ TEST_F(CacheManagerTest, TestWriteThenReadRoundTripWithSpecGroups) {
                                                    block_mask,
                                                    0,
                                                    {"tp0_F0", "tp1_F0"},
-                                                   &cache_locations);
+                                                   cache_locations,
+                                                   hints);
         ASSERT_EQ(EC_OK, ec);
         const auto &views = cache_locations.cache_locations_view();
         ASSERT_EQ(3, views.size());
@@ -2709,8 +2782,8 @@ TEST_F(CacheManagerAffinityTest, ReplicationHintEmittedAfterFrequencyThreshold) 
                                                    block_mask,
                                                    0,
                                                    {},
-                                                   &wrapper,
-                                                   &hints);
+                                                   wrapper,
+                                                   hints);
         ASSERT_EQ(EC_OK, ec);
 
         if (!hints.empty()) {
@@ -2794,6 +2867,7 @@ TEST_F(CacheManagerAffinityTest, WritePathWithAffinityManagerNoCrash) {
 
     BlockMask read_mask = static_cast<size_t>(0);
     CacheLocationViewVecWrapper wrapper;
+    std::vector<ReplicationHint> hints;
     auto ec2 = cache_manager_->GetCacheLocation(request_context_.get(),
                                                 "test_instance",
                                                 CacheManager::QueryType::QT_BATCH_GET,
@@ -2802,7 +2876,8 @@ TEST_F(CacheManagerAffinityTest, WritePathWithAffinityManagerNoCrash) {
                                                 read_mask,
                                                 0,
                                                 {},
-                                                &wrapper);
+                                                wrapper,
+                                                hints);
     ASSERT_EQ(EC_OK, ec2);
     EXPECT_EQ(keys.size(), wrapper.cache_locations_view().size());
     for (const auto &loc : wrapper.cache_locations_view()) {

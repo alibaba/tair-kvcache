@@ -26,6 +26,24 @@ public:
                                                              size_t size_per_key,
                                                              const std::string &trace_id,
                                                              std::function<void()> cb) override;
+    // Hf3fs backend does not (yet) honor affinity hints; fall through to
+    // legacy Create() inline.
+    std::vector<LocationDescriptor> CreateWithHints(const std::vector<std::string> &keys,
+                                                    size_t size_per_key,
+                                                    const WriteHints &hints,
+                                                    bool strict,
+                                                    const std::string &trace_id,
+                                                    std::function<void()> cb) override {
+        (void)hints;
+        (void)strict;
+        auto legacy = Create(keys, size_per_key, trace_id, std::move(cb));
+        std::vector<LocationDescriptor> out;
+        out.reserve(legacy.size());
+        for (auto &p : legacy) {
+            out.push_back(LocationDescriptor{p.first, std::move(p.second), /*node_id=*/""});
+        }
+        return out;
+    }
     std::vector<ErrorCode> Delete(const std::vector<DataStorageUri> &storage_uris,
                                   const std::string &trace_id,
                                   std::function<void()> cb) override;

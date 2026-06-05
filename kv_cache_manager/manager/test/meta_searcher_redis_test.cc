@@ -1,5 +1,6 @@
 #include <thread>
 
+#include "kv_cache_manager/affinity/cache_affinity_manager.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/meta_indexer_config.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
@@ -214,8 +215,11 @@ TEST_F(MetaSearcherRealServiceTest, TestPrefixMatchWithServingStatus) {
     // 测试PrefixMatch
     CacheLocationVector out_locations;
     BlockMask mask; // 空mask，不跳过任何元素
+    std::shared_ptr<CacheAffinityManager> affinity_manager;
+    std::vector<std::unique_ptr<ReadSideEffect>> side_effects;
 
-    ec = meta_searcher_->PrefixMatch(request_context_.get(), keys, mask, out_locations, &policy_);
+    ec = meta_searcher_->PrefixMatch(
+        request_context_.get(), keys, mask, out_locations, &policy_, affinity_manager, nullptr, side_effects);
 
     // 验证结果
     EXPECT_EQ(ec, ErrorCode::EC_OK);
@@ -273,7 +277,10 @@ TEST_F(MetaSearcherRealServiceTest, TestConcurrentOperations) {
             // 测试PrefixMatch
             CacheLocationVector out_locations;
             BlockMask mask;
-            ec = meta_searcher_->PrefixMatch(request_context_.get(), keys, mask, out_locations, &policy_);
+            std::shared_ptr<CacheAffinityManager> affinity_manager;
+            std::vector<std::unique_ptr<ReadSideEffect>> side_effects;
+            ec = meta_searcher_->PrefixMatch(
+                request_context_.get(), keys, mask, out_locations, &policy_, affinity_manager, nullptr, side_effects);
             ASSERT_EQ(ec, ErrorCode::EC_OK);
             ASSERT_EQ(out_locations.size(), 3);
         }
@@ -332,7 +339,10 @@ TEST_F(MetaSearcherRealServiceTest, TestBatchVsSequentialPerformance) {
     for (size_t i = 0; i < 100; ++i) {
         CacheLocationVector out_locations;
         BlockMask mask; // 空mask，不跳过任何元素
-        ec = meta_searcher_->PrefixMatch(request_context_.get(), keys, mask, out_locations, &policy_);
+        std::shared_ptr<CacheAffinityManager> affinity_manager;
+        std::vector<std::unique_ptr<ReadSideEffect>> side_effects;
+        ec = meta_searcher_->PrefixMatch(
+            request_context_.get(), keys, mask, out_locations, &policy_, affinity_manager, nullptr, side_effects);
         // EXPECT_EQ(ec, ErrorCode::EC_OK);
         // EXPECT_EQ(out_locations.size(), num_keys);
     }

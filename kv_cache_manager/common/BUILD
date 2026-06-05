@@ -176,6 +176,13 @@ cc_library(
 )
 
 cc_library(
+    name = "affinity_types",
+    hdrs = [
+        "affinity_types.h",
+    ],
+)
+
+cc_library(
     name = "request_context",
     srcs = [
         "request_context.cc",
@@ -184,6 +191,7 @@ cc_library(
         "request_context.h",
     ],
     deps = [
+        ":affinity_types",
         ":string_util",
         ":tracer",
         "//kv_cache_manager/metrics:metrics_collector",

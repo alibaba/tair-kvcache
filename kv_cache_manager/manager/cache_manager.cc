@@ -351,7 +351,7 @@ CacheManager::PerformCacheLocationQuery(RequestContext *request_context,
                                         int32_t sw_size,
                                         KeyVector &query_keys,
                                         CacheLocationVector &cache_locations,
-                                        std::vector<std::unique_ptr<ReadSideEffect>> *out_side_effects) const {
+                                        std::vector<std::unique_ptr<ReadSideEffect>> &out_side_effects) const {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
     ErrorCode ec = EC_ERROR;
@@ -393,8 +393,8 @@ ErrorCode CacheManager::GetCacheLocation(RequestContext *request_context,
                                          const BlockMask &block_mask,
                                          int32_t sw_size,
                                          const std::vector<std::string> &location_spec_names,
-                                         CacheLocationViewVecWrapper *out_locations,
-                                         std::vector<ReplicationHint> *out_hints) {
+                                         CacheLocationViewVecWrapper &out_locations,
+                                         std::vector<ReplicationHint> &out_hints) {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
@@ -422,7 +422,7 @@ ErrorCode CacheManager::GetCacheLocation(RequestContext *request_context,
                                    sw_size,
                                    query_keys,
                                    cache_locations,
-                                   &side_effects);
+                                   side_effects);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, ManagerPrefixMatch);
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, prefix_match_len, cache_locations.size());
     RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, CacheLocationViewVecWrapper, "get cache location failed");
@@ -456,16 +456,13 @@ ErrorCode CacheManager::GetCacheLocation(RequestContext *request_context,
     if (event_manager_) {
         event_manager_->Publish(cache_get_event);
     }
-    if (out_hints != nullptr && !side_effects.empty()) {
-        for (auto &se : side_effects) {
-            if (auto *hint = dynamic_cast<ReplicationHint *>(se.get())) {
-                out_hints->push_back(std::move(*hint));
-            }
+    for (auto &se : side_effects) {
+        // 多重继承: downcast 到 SideEffect 子类后再切片回纯数据基类。
+        if (auto *hint = dynamic_cast<ReplicationHintSideEffect *>(se.get())) {
+            out_hints.push_back(std::move(static_cast<ReplicationHint &>(*hint)));
         }
     }
-    if (out_locations != nullptr) {
-        *out_locations = CacheLocationViewVecWrapper(std::move(cache_locations));
-    }
+    out_locations = CacheLocationViewVecWrapper(std::move(cache_locations));
     return ec;
 }
 
@@ -485,6 +482,7 @@ std::pair<ErrorCode, int64_t> CacheManager::GetCacheLocationLen(RequestContext *
     }
     CacheLocationVector cache_locations;
     KeyVector query_keys = keys;
+    std::vector<std::unique_ptr<ReadSideEffect>> side_effects;
     ec = PerformCacheLocationQuery(request_context,
                                    service_metrics_collector,
                                    meta_searcher,
@@ -495,7 +493,8 @@ std::pair<ErrorCode, int64_t> CacheManager::GetCacheLocationLen(RequestContext *
                                    BlockMask(),
                                    sw_size,
                                    query_keys,
-                                   cache_locations);
+                                   cache_locations,
+                                   side_effects);
     RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, int64_t, "get cache location length failed");
     int64_t cache_location_len = 0;
     switch (query_type) {
@@ -871,12 +870,12 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
     if (!location_spec_group_names.empty() || is_replication) {
         instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
     }
-    const std::string &caller_node_id = request_context->caller_node_id();
+    const CallerNode &caller_node = request_context->caller_node();
     auto existsOnCallerNode =
-        [&caller_node_id, &check_loc_data_exist, &instance_info, &location_spec_group_names](
+        [&caller_node, &check_loc_data_exist, &instance_info, &location_spec_group_names](
             size_t i, const CacheLocationMap &m, std::vector<std::string> &out_prune_loc_ids) -> bool {
         out_prune_loc_ids.clear();
-        if (caller_node_id.empty()) {
+        if (caller_node.node_id.empty()) {
             return false;
         }
 
@@ -912,7 +911,7 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
                 continue;
             }
             for (const auto &spec : kv.second->location_specs()) {
-                if (spec.node_id() == caller_node_id) {
+                if (spec.node_id() == caller_node.node_id) {
                     local_specs.insert(spec.name());
                 }
             }
@@ -1009,12 +1008,12 @@ CacheManager::CreateInSingleBatch(RequestContext *request_context,
                                   const std::shared_ptr<const InstanceInfo> &instance_info,
                                   const std::shared_ptr<DataStorageManager> &data_storage_manager,
                                   const std::string &unique_name,
+                                  const AffinityResolveContext *resolve_ctx,
+                                  int64_t common_size,
                                   std::vector<DataStorageUri> &allocated_uris,
                                   std::vector<std::string> &allocated_node_ids,
                                   std::vector<std::vector<std::pair<size_t, const LocationSpecInfo *>>> &key_to_uris,
-                                  bool &is_create_success,
-                                  int64_t common_size,
-                                  const AffinityResolveContext *resolve_ctx) {
+                                  bool &is_create_success) {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
     std::vector<std::string> merged_block_keys;
@@ -1097,11 +1096,11 @@ ErrorCode CacheManager::CreateBySpec(RequestContext *request_context,
                                      const std::shared_ptr<const InstanceInfo> &instance_info,
                                      const std::shared_ptr<DataStorageManager> &data_storage_manager,
                                      const std::string &unique_name,
+                                     const AffinityResolveContext *resolve_ctx,
                                      std::vector<DataStorageUri> &allocated_uris,
                                      std::vector<std::string> &allocated_node_ids,
                                      std::vector<std::vector<std::pair<size_t, const LocationSpecInfo *>>> &key_to_uris,
-                                     bool &is_create_success,
-                                     const AffinityResolveContext *resolve_ctx) {
+                                     bool &is_create_success) {
     // avoid use file across tp ranks
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
@@ -1247,8 +1246,7 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
             }
         }
         if (request_context) {
-            resolve_ctx.caller_node_id = request_context->caller_node_id();
-            resolve_ctx.caller_supernode_id = request_context->caller_supernode_id();
+            resolve_ctx.caller_node = request_context->caller_node();
         }
         resolve_ctx_ptr = &resolve_ctx;
     }
@@ -1261,12 +1259,12 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
                                       instance_info,
                                       data_storage_manager,
                                       select_result.name,
+                                      resolve_ctx_ptr,
+                                      common_size,
                                       allocated_uris,
                                       allocated_node_ids,
                                       key_to_uris,
-                                      is_create_success,
-                                      common_size,
-                                      resolve_ctx_ptr);
+                                      is_create_success);
         RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "CreateInSingleBatch failed");
     } else {
         auto ec = CreateBySpec(request_context,
@@ -1276,11 +1274,11 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
                                instance_info,
                                data_storage_manager,
                                select_result.name,
+                               resolve_ctx_ptr,
                                allocated_uris,
                                allocated_node_ids,
                                key_to_uris,
-                               is_create_success,
-                               resolve_ctx_ptr);
+                               is_create_success);
         RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "CreateBySpec failed");
     }
 
@@ -1837,7 +1835,7 @@ CacheManager::GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
                                           const BlockMask &block_mask,
                                           int32_t sw_size,
                                           CacheLocationVector &cache_locations,
-                                          std::vector<std::unique_ptr<ReadSideEffect>> *out_side_effects) const {
+                                          std::vector<std::unique_ptr<ReadSideEffect>> &out_side_effects) const {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
     auto policy = genSelectLocationPolicy(request_context, instance_id);
@@ -1856,17 +1854,15 @@ CacheManager::GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
                 registry_manager_->GetGroupAffinityStrategyJson(request_context, info->instance_group_name());
         }
         if (request_context) {
-            resolve_ctx.caller_node_id = request_context->caller_node_id();
-            resolve_ctx.caller_supernode_id = request_context->caller_supernode_id();
+            resolve_ctx.caller_node = request_context->caller_node();
         }
     }
-    CacheAffinityManager *manager_ptr = affinity_manager_.get();
-    const AffinityResolveContext *resolve_ctx_ptr = manager_ptr ? &resolve_ctx : nullptr;
+    const AffinityResolveContext *resolve_ctx_ptr = affinity_manager_ ? &resolve_ctx : nullptr;
     ErrorCode ec = EC_ERROR;
     switch (query_type) {
     case QueryType::QT_BATCH_GET: {
         ec = meta_searcher->BatchGetBestLocation(
-            request_context, keys, cache_locations, policy.get(), manager_ptr, out_side_effects, resolve_ctx_ptr);
+            request_context, keys, cache_locations, policy.get(), affinity_manager_, resolve_ctx_ptr, out_side_effects);
         break;
     }
     case QueryType::QT_PREFIX_MATCH: {
@@ -1875,9 +1871,9 @@ CacheManager::GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
                                         block_mask,
                                         cache_locations,
                                         policy.get(),
-                                        manager_ptr,
-                                        out_side_effects,
-                                        resolve_ctx_ptr);
+                                        affinity_manager_,
+                                        resolve_ctx_ptr,
+                                        out_side_effects);
         break;
     }
     case QueryType::QT_REVERSE_ROLL_SW_MATCH: {
@@ -1890,9 +1886,9 @@ CacheManager::GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
                                                         sw_size,
                                                         cache_locations,
                                                         policy.get(),
-                                                        manager_ptr,
-                                                        out_side_effects,
-                                                        resolve_ctx_ptr);
+                                                        affinity_manager_,
+                                                        resolve_ctx_ptr,
+                                                        out_side_effects);
         break;
     }
     default:

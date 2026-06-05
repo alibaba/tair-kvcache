@@ -1,6 +1,7 @@
 #pragma once
 
 #include "kv_cache_manager/client/include/common.h"
+#include "kv_cache_manager/common/affinity_types.h"
 #include "kv_cache_manager/config/instance_info.h"
 
 namespace kv_cache_manager {
@@ -39,15 +40,16 @@ public:
                                                            const BlockMask &block_mask,
                                                            int32_t detail_level) = 0;
 
-    virtual std::pair<ClientErrorCode, Locations>
-    GetCacheLocation(const std::string &trace_id,
-                     const std::string &instance_id,
-                     QueryType query_type,
-                     const KeyVector &keys,
-                     const TokenIdsVector &tokens,
-                     const BlockMask &block_mask,
-                     int32_t sw_size,
-                     const std::vector<std::string> &location_spec_names) = 0;
+    virtual std::pair<ClientErrorCode, Locations> GetCacheLocation(const std::string &trace_id,
+                                                                   const std::string &instance_id,
+                                                                   QueryType query_type,
+                                                                   const KeyVector &keys,
+                                                                   const TokenIdsVector &tokens,
+                                                                   const BlockMask &block_mask,
+                                                                   int32_t sw_size,
+                                                                   const std::vector<std::string> &location_spec_names,
+                                                                   const CallerNode &caller,
+                                                                   std::vector<ReplicationHint> &out_hints) = 0;
 
     virtual std::pair<ClientErrorCode, int64_t> GetCacheLocationLen(const std::string &trace_id,
                                                                     const std::string &instance_id,
@@ -62,7 +64,8 @@ public:
                     const KeyVector &keys,
                     const TokenIdsVector &tokens,
                     const std::vector<std::string> &location_spec_group_names,
-                    int64_t write_timeout_seconds) = 0;
+                    int64_t write_timeout_seconds,
+                    const CallerNode &caller) = 0;
     virtual ClientErrorCode FinishWriteCache(const std::string &trace_id,
                                              const std::string &instance_id,
                                              const std::string write_session_id,

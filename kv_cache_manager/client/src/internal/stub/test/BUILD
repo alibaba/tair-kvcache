@@ -8,8 +8,11 @@ cc_test(
     copts = ["-fno-access-control"],
     shard_count = 10,
     deps = [
+        "//kv_cache_manager/affinity:affinity",
         "//kv_cache_manager/client/src/internal/stub:grpc_stub",
+        "//kv_cache_manager/common:affinity_types",
         "//kv_cache_manager/common:logger",
+        "//kv_cache_manager/common:net_util",
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/config",
         "//kv_cache_manager/config:coordination_backend",

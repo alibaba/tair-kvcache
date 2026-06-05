@@ -288,8 +288,8 @@ void MetaServiceImpl::GetCacheLocation(RequestContext *request_context,
         block_mask_req,
         request->sw_size(),
         location_spec_names,
-        &cache_location_view_vec_wrapper,
-        &hints);
+        cache_location_view_vec_wrapper,
+        hints);
     CacheLocationViewVec cache_locations_res = cache_location_view_vec_wrapper.cache_locations_view();
     if (ec_info != EC_OK) {
         status->set_code(ToMetaPbError(ec_info));

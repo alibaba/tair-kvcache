@@ -32,6 +32,7 @@ cc_library(
         ":filter_cond",
         ":metric_catalog",
         "//kv_cache_manager/affinity:node_metrics",
+        "//kv_cache_manager/common:affinity_types",
         "@rapidjson",
     ],
 )

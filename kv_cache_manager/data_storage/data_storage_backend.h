@@ -70,36 +70,29 @@ public:
     //                   when the preferred ones are unavailable.
     // When hints.preferred_node_ids is empty, `strict` is meaningless.
     //
-    // Backends that can route keys to specific storage nodes should override
-    // this. The default implementation ignores both `hints` and `strict` and
-    // forwards to the legacy Create(), filling node_id with "" — every
-    // existing backend keeps working as a one-line fallthrough until it
-    // actually wants to honor affinity.
+    // Contract: this method is pure virtual; every backend MUST override it
+    // explicitly. Backends that don't yet honor affinity should inline the
+    // legacy-Create() adapter directly in their override (delegate to
+    // Create() and wrap each (ec, uri) into a LocationDescriptor with an
+    // empty node_id). Keeping the fallback inlined per backend — rather
+    // than sharing a base-class helper — makes the fact of fallthrough
+    // visible at the call site instead of behind an indirection. We
+    // deliberately do NOT provide a base-class default implementation,
+    // because silent fallthroughs hide which backends have actually been
+    // audited for affinity support.
     //
     // SupportsAffinity() lets the manager layer (and DataStorageSelector in
     // future) detect at runtime whether a backend will act on hints; defaults
     // to false.
     //
     // Returns LocationDescriptor (ec + uri + node_id) so the backend can
-    // report which node actually served the allocation. Default implementation
-    // forwards to the legacy Create(), which keeps every existing backend a
-    // one-line fallthrough until it actually wants to honor affinity.
+    // report which node actually served the allocation.
     virtual std::vector<LocationDescriptor> CreateWithHints(const std::vector<std::string> &keys,
                                                             size_t size_per_key,
                                                             const WriteHints &hints,
                                                             bool strict,
                                                             const std::string &trace_id,
-                                                            std::function<void()> cb) {
-        (void)hints;
-        (void)strict;
-        auto legacy = Create(keys, size_per_key, trace_id, std::move(cb));
-        std::vector<LocationDescriptor> out;
-        out.reserve(legacy.size());
-        for (auto &p : legacy) {
-            out.push_back(LocationDescriptor{p.first, std::move(p.second), /*node_id=*/""});
-        }
-        return out;
-    }
+                                                            std::function<void()> cb) = 0;
 
     virtual bool SupportsAffinity() const { return false; }
 

@@ -41,7 +41,7 @@ TEST_F(LocalReplicaStrategyTest, ResolveWriteDelegatesToV0Pipeline) {
     LocalReplicaAffinityStrategy s(std::move(p));
 
     StrategyContext ctx;
-    ctx.caller_node_id = "node_b";
+    ctx.caller_node.node_id = "node_b";
     WriteDecision dec = s.ResolveWrite({"node_a", "node_b", "node_c"}, ctx);
     ASSERT_EQ(AffinityStatus::kOk, dec.status);
     ASSERT_FALSE(dec.hints.preferred_node_ids.empty());
@@ -57,7 +57,7 @@ TEST_F(LocalReplicaStrategyTest, ResolveWriteAbortPropagates) {
     LocalReplicaAffinityStrategy s(std::move(p));
 
     StrategyContext ctx;
-    ctx.caller_node_id = "node_X"; // 不在候选列表
+    ctx.caller_node.node_id = "node_X"; // 不在候选列表
     WriteDecision dec = s.ResolveWrite({"node_a", "node_b"}, ctx);
     EXPECT_EQ(AffinityStatus::kAbort, dec.status);
 }
@@ -67,7 +67,7 @@ TEST_F(LocalReplicaStrategyTest, ResolveWriteAbortPropagates) {
 TEST_F(LocalReplicaStrategyTest, ResolveReadPicksLocalSpec) {
     LocalReplicaAffinityStrategy s;
     StrategyContext ctx;
-    ctx.caller_node_id = "node_a";
+    ctx.caller_node.node_id = "node_a";
 
     LocationSpec remote("tp0", "uri_b", "node_b");
     LocationSpec local("tp0", "uri_a", "node_a");
@@ -90,7 +90,7 @@ TEST_F(LocalReplicaStrategyTest, ResolveReadPicksLocalSpec) {
 TEST_F(LocalReplicaStrategyTest, ResolveReadFallsBackWhenNoLocal) {
     LocalReplicaAffinityStrategy s;
     StrategyContext ctx;
-    ctx.caller_node_id = "node_x"; // 没有 caller 本地候选
+    ctx.caller_node.node_id = "node_x"; // 没有 caller 本地候选
 
     LocationSpec a("tp0", "u1", "node_a");
     LocationSpec b("tp0", "u2", "node_b");
@@ -121,7 +121,7 @@ TEST_F(LocalReplicaStrategyTest, ResolveReadEmitsReplicationHintWhenHot) {
     LocalReplicaAffinityStrategy s(std::move(p));
 
     StrategyContext ctx;
-    ctx.caller_node_id = "node_a";
+    ctx.caller_node.node_id = "node_a";
 
     LocationSpec remote("tp0", "uri_remote", "node_b");
     ReadRequest req;
@@ -133,7 +133,7 @@ TEST_F(LocalReplicaStrategyTest, ResolveReadEmitsReplicationHintWhenHot) {
 
     ReadDecision dec = s.ResolveRead(req, ctx);
     ASSERT_EQ(1u, dec.side_effects.size());
-    auto *hint = dynamic_cast<ReplicationHint *>(dec.side_effects[0].get());
+    auto *hint = dynamic_cast<ReplicationHintSideEffect *>(dec.side_effects[0].get());
     ASSERT_NE(nullptr, hint);
     EXPECT_EQ(42, hint->block_key);
     EXPECT_EQ("node_a", hint->target_node_id);
@@ -155,7 +155,7 @@ TEST_F(LocalReplicaStrategyTest, ResolveReadSuppressorBlocksWithinWindow) {
     LocalReplicaAffinityStrategy s(std::move(p));
 
     StrategyContext ctx;
-    ctx.caller_node_id = "node_a";
+    ctx.caller_node.node_id = "node_a";
 
     LocationSpec remote("tp0", "uri_remote", "node_b");
     ReadRequest req;
@@ -186,7 +186,7 @@ TEST_F(LocalReplicaStrategyTest, ResolveReadNoHintWhenOnMissDisabled) {
     LocalReplicaAffinityStrategy s(std::move(p));
 
     StrategyContext ctx;
-    ctx.caller_node_id = "node_a";
+    ctx.caller_node.node_id = "node_a";
 
     LocationSpec remote("tp0", "uri_remote", "node_b");
     ReadRequest req;
@@ -214,7 +214,7 @@ TEST_F(LocalReplicaStrategyTest, ResolveReadNoHintWhenCallerLoadHigh) {
     m.load_ratio = 0.90; // 超 gate
 
     StrategyContext ctx;
-    ctx.caller_node_id = "node_a";
+    ctx.caller_node.node_id = "node_a";
     ctx.get_node_metrics = [&](const std::string &id) -> const NodeMetrics * { return id == "node_a" ? &m : nullptr; };
 
     LocationSpec remote("tp0", "uri_r", "node_b");

@@ -110,8 +110,8 @@ public:
                                const BlockMask &block_mask,
                                int32_t sw_size,
                                const std::vector<std::string> &location_spec_names,
-                               CacheLocationViewVecWrapper *out_locations = nullptr,
-                               std::vector<ReplicationHint> *out_hints = nullptr);
+                               CacheLocationViewVecWrapper &out_locations,
+                               std::vector<ReplicationHint> &out_hints);
 
     std::pair<ErrorCode, int64_t> GetCacheLocationLen(RequestContext *request_context,
                                                       const std::string &instance_id,
@@ -178,13 +178,13 @@ private:
                                   const std::shared_ptr<const InstanceInfo> &instance_info,
                                   const std::shared_ptr<DataStorageManager> &data_storage_manager,
                                   const std::string &unique_name,
+                                  const AffinityResolveContext *resolve_ctx,
+                                  int64_t common_size,
                                   std::vector<DataStorageUri> &allocated_uris,
                                   // node_id reported by backend, parallel to allocated_uris
                                   std::vector<std::string> &allocated_node_ids,
                                   std::vector<std::vector<std::pair<size_t, const LocationSpecInfo *>>> &key_to_uris,
-                                  bool &is_create_success,
-                                  int64_t common_size,
-                                  const AffinityResolveContext *resolve_ctx);
+                                  bool &is_create_success);
     ErrorCode CreateBySpec(RequestContext *request_context,
                            const std::string &instance_id,
                            const CacheManager::KeyVector &keys,
@@ -192,12 +192,12 @@ private:
                            const std::shared_ptr<const InstanceInfo> &instance_info,
                            const std::shared_ptr<DataStorageManager> &data_storage_manager,
                            const std::string &unique_name,
+                           const AffinityResolveContext *resolve_ctx,
                            std::vector<DataStorageUri> &allocated_uris,
                            // node_id reported by backend, parallel to allocated_uris
                            std::vector<std::string> &allocated_node_ids,
                            std::vector<std::vector<std::pair<size_t, const LocationSpecInfo *>>> &key_to_uris,
-                           bool &is_create_success,
-                           const AffinityResolveContext *resolve_ctx);
+                           bool &is_create_success);
 
     ErrorCode TryCreateMetaSearcher(RequestContext *request_context, const std::string &instance_id);
     std::pair<ErrorCode, MetaSearcher *> CheckInputAndGetMetaSearcher(RequestContext *request_context,
@@ -210,18 +210,17 @@ private:
 
     void
     CleanupHostLocations(const std::string &instance_id, const std::string &host_ip_port, uint64_t cleanup_generation);
-    ErrorCode
-    GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
-                                RequestContext *request_context,
-                                const std::string &instance_id,
-                                QueryType query_type,
-                                const KeyVector &keys,
-                                const BlockMask &block_mask,
-                                int32_t sw_size,
-                                CacheLocationVector &cache_locations,
-                                // Read side effects accumulated by meta_searcher;
-                                // caller downcasts to concrete types (e.g. ReplicationHint).
-                                std::vector<std::unique_ptr<ReadSideEffect>> *out_side_effects = nullptr) const;
+    ErrorCode GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
+                                          RequestContext *request_context,
+                                          const std::string &instance_id,
+                                          QueryType query_type,
+                                          const KeyVector &keys,
+                                          const BlockMask &block_mask,
+                                          int32_t sw_size,
+                                          CacheLocationVector &cache_locations,
+                                          // Read side effects accumulated by meta_searcher;
+                                          // caller downcasts to concrete types (e.g. ReplicationHint).
+                                          std::vector<std::unique_ptr<ReadSideEffect>> &out_side_effects) const;
     ErrorCode PerformCacheLocationQuery(RequestContext *request_context,
                                         ServiceMetricsCollector *service_metrics_collector,
                                         MetaSearcher *meta_searcher,
@@ -233,7 +232,7 @@ private:
                                         int32_t sw_size,
                                         KeyVector &query_keys,
                                         CacheLocationVector &cache_locations,
-                                        std::vector<std::unique_ptr<ReadSideEffect>> *out_side_effects = nullptr) const;
+                                        std::vector<std::unique_ptr<ReadSideEffect>> &out_side_effects) const;
     std::unique_ptr<SelectLocationPolicy> genSelectLocationPolicy(RequestContext *request_context,
                                                                   const std::string &instance_id) const;
     CheckLocDataExistFunc GetCheckLocDataExistFunc(const std::string &instance_id) const;

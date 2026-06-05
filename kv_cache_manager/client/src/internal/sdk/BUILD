@@ -46,9 +46,20 @@ cc_library(
     ],
 )
 
+# 仅暴露 CallerNodeProvider 抽象接口的头, 给 stub_source 下的具体 provider
+# (tair_mempool_caller_node_provider 等) 反向依赖, 避免与 :sdk 形成循环。
+cc_library(
+    name = "caller_node_provider",
+    hdrs = ["caller_node_provider.h"],
+    deps = [
+        "//kv_cache_manager/common:affinity_types",
+    ],
+)
+
 cc_library(
     name = "sdk",
     srcs = [
+        "caller_node_provider_factory.cc",
         "local_file_sdk.cc",
         "sdk_factory.cc",
         "sdk_interface.cc",
@@ -67,6 +78,7 @@ cc_library(
         "//conditions:default": [],
     }),
     hdrs = [
+        "caller_node_provider_factory.h",
         "local_file_sdk.h",
         "sdk_factory.h",
         "sdk_interface.h",
@@ -90,6 +102,7 @@ cc_library(
         "//conditions:default": [],
     }),
     deps = [
+        ":caller_node_provider",
         ":lock_free_thread_pool",
         "//kv_cache_manager/client:common",
         "//kv_cache_manager/client/src/internal/config",
@@ -119,6 +132,7 @@ cc_library(
         "//conditions:default": [],
     }) + select({
         ":enable_tair_mempool": [
+            "//stub_source/kv_cache_manager/client/src/internal/sdk:tair_mempool_caller_node_provider",
             "//stub_source/kv_cache_manager/client/src/internal/sdk:tair_mempool_sdk",
         ],
         "//conditions:default": [],
