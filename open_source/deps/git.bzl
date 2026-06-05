@@ -170,6 +170,19 @@ def git_deps():
         build_file = clean_dep("//3rdparty/yaml-cpp:BUILD"),
     )
 
+    # LMDB 0.9.33 — Lightning Memory-Mapped Database, used for persistent raft log store.
+    http_archive(
+        name = "lmdb",
+        sha256 = "9c352fa9bdad53d920128ac6a62296f2850c7e29862a610d3a72f5f49a1cd7ea",
+        strip_prefix = "lmdb-LMDB_0.9.33",
+        type = "tar.gz",
+        urls = [
+            "https://codeload.github.com/LMDB/lmdb/tar.gz/LMDB_0.9.33",
+            "https://github.com/LMDB/lmdb/archive/LMDB_0.9.33.tar.gz",
+        ],
+        build_file = clean_dep("//3rdparty/lmdb:lmdb.BUILD"),
+    )
+
     # NuRaft v3.0.0 — eBay Raft consensus library, used by phase-1 HA mode.
     http_archive(
         name = "nuraft",

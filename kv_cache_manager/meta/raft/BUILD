@@ -30,6 +30,21 @@ cc_library(
 )
 
 cc_library(
+    name = "lmdb_log_store",
+    srcs = [
+        "lmdb_log_store.cc",
+    ],
+    hdrs = [
+        "lmdb_log_store.h",
+    ],
+    deps = [
+        "//kv_cache_manager/common",
+        "@lmdb//:lmdb",
+        "@nuraft//:nuraft",
+    ],
+)
+
+cc_library(
     name = "meta_state_mgr",
     srcs = [
         "meta_state_mgr.cc",
@@ -70,7 +85,7 @@ cc_library(
         "raft_coordinator.h",
     ],
     deps = [
-        ":meta_log_store",
+        ":lmdb_log_store",
         ":meta_state_machine",
         ":meta_state_mgr",
         "//kv_cache_manager/common",

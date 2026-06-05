@@ -32,6 +32,16 @@ cc_test(
 )
 
 cc_test(
+    name = "lmdb_log_store_test",
+    srcs = ["lmdb_log_store_test.cc"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/meta/raft:lmdb_log_store",
+        "@nuraft//:nuraft",
+    ],
+)
+
+cc_test(
     name = "meta_state_machine_test",
     srcs = ["meta_state_machine_test.cc"],
     copts = ["-fno-access-control"],

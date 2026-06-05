@@ -14,7 +14,7 @@
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
-#include "kv_cache_manager/meta/raft/meta_log_store.h"
+#include "kv_cache_manager/meta/raft/lmdb_log_store.h"
 #include "kv_cache_manager/meta/raft/meta_state_machine.h"
 #include "kv_cache_manager/meta/raft/meta_state_mgr.h"
 
@@ -158,7 +158,7 @@ private:
     std::atomic<bool> running_{false};
 
     // Owned raft objects.
-    nuraft::ptr<MetaLogStore> log_store_;
+    nuraft::ptr<LmdbLogStore> log_store_;
     nuraft::ptr<MetaStateMachine> state_machine_;
     nuraft::ptr<MetaStateMgr> state_mgr_;
     std::unique_ptr<nuraft::raft_launcher> launcher_;

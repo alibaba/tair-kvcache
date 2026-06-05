@@ -94,7 +94,7 @@ ErrorCode RaftCoordinator::BuildInner() {
         return EC_BADARGS;
     }
 
-    log_store_ = cs_new<MetaLogStore>();
+    log_store_ = cs_new<LmdbLogStore>(config_.data_dir + "/raft_log");
 
     // State machine routes by instance_id; the factory closure pulls
     // tunables from the coordinator config, so per-Instance setup stays
