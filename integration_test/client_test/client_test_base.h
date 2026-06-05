@@ -138,8 +138,7 @@ protected:
     }
 
     // Create a client with a different model_name (for duplicate-with-diff-config testing)
-    std::string createClientConfigWithModel(const std::string &instance_id,
-                                            const std::string &model_name) const {
+    std::string createClientConfigWithModel(const std::string &instance_id, const std::string &model_name) const {
         std::array<char, 2048> buffer;
         int n = std::snprintf(buffer.data(),
                               buffer.size(),
@@ -259,6 +258,7 @@ protected:
     void TestGetCacheLocation(const std::string &prefix, const ClientPtr<ClientType> &client) {
         std::string write_session_id;
         Locations target_locations;
+        std::vector<ReplicationHint> hints; // 集成测试不消费 hints，复用一个出参变量满足必填契约
         {
             auto [success, write_location] = client->StartWrite(prefix + "_1", {1, 2, 3, 4}, {}, {}, 1000000);
             ASSERT_EQ(ER_OK, success);
@@ -267,7 +267,7 @@ protected:
         }
         {
             auto [success, locations] = client->MatchLocation(
-                prefix + "_2", QueryType::QT_PREFIX_MATCH, {1, 2, 3, 4}, {}, static_cast<size_t>(0), 0, {});
+                prefix + "_2", QueryType::QT_PREFIX_MATCH, {1, 2, 3, 4}, {}, static_cast<size_t>(0), 0, {}, hints);
             ASSERT_EQ(ER_OK, success);
             ASSERT_EQ(Locations({}), locations);
         }
@@ -277,28 +277,28 @@ protected:
         }
         {
             auto [success, locations] = client->MatchLocation(
-                prefix + "_3", QueryType::QT_PREFIX_MATCH, {1, 2, 3, 4}, {}, static_cast<size_t>(0), 0, {});
+                prefix + "_3", QueryType::QT_PREFIX_MATCH, {1, 2, 3, 4}, {}, static_cast<size_t>(0), 0, {}, hints);
             ASSERT_EQ(ER_OK, success);
             ExpectLocationsEq(Locations{target_locations[0], target_locations[1]}, locations);
             ASSERT_FALSE(HasFailure());
         }
         {
             auto [success, locations] = client->MatchLocation(
-                prefix + "_4", QueryType::QT_PREFIX_MATCH, {1, 2, 3}, {}, static_cast<size_t>(1), 0, {});
+                prefix + "_4", QueryType::QT_PREFIX_MATCH, {1, 2, 3}, {}, static_cast<size_t>(1), 0, {}, hints);
             ASSERT_EQ(ER_OK, success);
             ExpectLocationsEq(Locations{target_locations[1]}, locations);
             ASSERT_FALSE(HasFailure());
         }
         {
             auto [success, locations] = client->MatchLocation(
-                prefix + "_5", QueryType::QT_PREFIX_MATCH, {1, 2, 3}, {}, static_cast<size_t>(6), 0, {});
+                prefix + "_5", QueryType::QT_PREFIX_MATCH, {1, 2, 3}, {}, static_cast<size_t>(6), 0, {}, hints);
             ASSERT_EQ(ER_OK, success);
             ASSERT_EQ(Locations({}), locations);
         }
         {
             BlockMask block_mask = BlockMaskVector({true, false, false, false});
-            auto [success, locations] =
-                client->MatchLocation(prefix + "_6", QueryType::QT_PREFIX_MATCH, {1, 2, 3}, {}, block_mask, 0, {});
+            auto [success, locations] = client->MatchLocation(
+                prefix + "_6", QueryType::QT_PREFIX_MATCH, {1, 2, 3}, {}, block_mask, 0, {}, hints);
             ASSERT_EQ(ER_OK, success);
             ExpectLocationsEq(Locations{target_locations[1]}, locations);
             ASSERT_FALSE(HasFailure());

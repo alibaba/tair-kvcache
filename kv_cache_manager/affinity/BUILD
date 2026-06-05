@@ -17,6 +17,7 @@ cc_library(
         ":strategy_factory",
         "//kv_cache_manager/affinity/pipeline:candidate_pipeline",
         "//kv_cache_manager/common",
+        "//kv_cache_manager/common:affinity_types",
         # Needed for metrics pull loop (SnapshotPerNodeMetrics)
         "//kv_cache_manager/data_storage",
         "//kv_cache_manager/data_storage:common_define",
@@ -33,6 +34,7 @@ cc_library(
     deps = [
         ":node_metrics",
         "//kv_cache_manager/common",
+        "//kv_cache_manager/common:affinity_types",
         "//kv_cache_manager/data_storage:common_define",
         "//kv_cache_manager/meta:cache_location",
     ],

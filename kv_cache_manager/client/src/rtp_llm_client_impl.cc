@@ -24,7 +24,10 @@ std::pair<ClientErrorCode, Locations> RTPLLMClientImpl::Match(const std::string 
                                                               const std::vector<int64_t> &keys,
                                                               const BlockMask &block_mask,
                                                               const ForwardContext &forward_context) {
-    return manager_client_->MatchLocation(trace_id, query_type, keys, {}, block_mask, forward_context.sw_size, {});
+    // RTP-LLM 当前不消费 ReplicationHint，传入临时空 vector 满足必填出参契约。
+    std::vector<ReplicationHint> hints;
+    return manager_client_->MatchLocation(
+        trace_id, query_type, keys, {}, block_mask, forward_context.sw_size, {}, hints);
 }
 
 std::pair<ClientErrorCode, WriteLocation>

@@ -91,16 +91,16 @@ public:
                           const BlockMask &input_mask,
                           CacheLocationVector &out_locations,
                           SelectLocationPolicy *policy,
-                          CacheAffinityManager *affinity_manager = nullptr,
-                          std::vector<std::unique_ptr<ReadSideEffect>> *out_side_effects = nullptr,
-                          const AffinityResolveContext *resolve_ctx = nullptr) const;
+                          const std::shared_ptr<CacheAffinityManager> &affinity_manager,
+                          const AffinityResolveContext *resolve_ctx,
+                          std::vector<std::unique_ptr<ReadSideEffect>> &out_side_effects) const;
     ErrorCode BatchGetBestLocation(RequestContext *request_context,
                                    const KeyVector &keys,
                                    CacheLocationVector &out_locations,
                                    SelectLocationPolicy *policy,
-                                   CacheAffinityManager *affinity_manager = nullptr,
-                                   std::vector<std::unique_ptr<ReadSideEffect>> *out_side_effects = nullptr,
-                                   const AffinityResolveContext *resolve_ctx = nullptr) const;
+                                   const std::shared_ptr<CacheAffinityManager> &affinity_manager,
+                                   const AffinityResolveContext *resolve_ctx,
+                                   std::vector<std::unique_ptr<ReadSideEffect>> &out_side_effects) const;
     ErrorCode BatchGetBestLocationByBackend(RequestContext *request_context,
                                             const KeyVector &keys,
                                             LocationsPerKey &out_locations,
@@ -113,9 +113,9 @@ public:
                                           int32_t sw_size,
                                           CacheLocationVector &out_locations,
                                           SelectLocationPolicy *policy,
-                                          CacheAffinityManager *affinity_manager = nullptr,
-                                          std::vector<std::unique_ptr<ReadSideEffect>> *out_side_effects = nullptr,
-                                          const AffinityResolveContext *resolve_ctx = nullptr) const;
+                                          const std::shared_ptr<CacheAffinityManager> &affinity_manager,
+                                          const AffinityResolveContext *resolve_ctx,
+                                          std::vector<std::unique_ptr<ReadSideEffect>> &out_side_effects) const;
     ErrorCode PrefixMatchByHost(RequestContext *request_context,
                                 const KeyVector &keys,
                                 bool use_eagle_pop,
@@ -406,9 +406,9 @@ private:
                                           const KeyVector &keys,
                                           CacheLocationVector &out_locations,
                                           SelectLocationPolicy *policy,
-                                          CacheAffinityManager *affinity_manager,
-                                          std::vector<std::unique_ptr<ReadSideEffect>> *out_side_effects,
-                                          const AffinityResolveContext *resolve_ctx) const;
+                                          const std::shared_ptr<CacheAffinityManager> &affinity_manager,
+                                          const AffinityResolveContext *resolve_ctx,
+                                          std::vector<std::unique_ptr<ReadSideEffect>> &out_side_effects) const;
 
     std::shared_ptr<MetaIndexer> meta_indexer_;
     CheckLocDataExistFunc check_loc_data_exist_func_;

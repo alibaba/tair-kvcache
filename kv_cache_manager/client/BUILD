@@ -33,6 +33,9 @@ cc_library(
         "include/common.h",
     ],
     strip_include_prefix = "include",
+    deps = [
+        "//kv_cache_manager/common:affinity_types",
+    ],
     alwayslink = True,
 )
 
@@ -70,6 +73,7 @@ cc_library(
         "//kv_cache_manager/client/src/internal/config",
         "//kv_cache_manager/client/src/internal/sdk",
         "//kv_cache_manager/client/src/internal/stub:grpc_stub",
+        "//kv_cache_manager/common:affinity_types",
         "//kv_cache_manager/common:env_util",
         "//kv_cache_manager/common:string_util",
     ],

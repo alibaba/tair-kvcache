@@ -2,12 +2,15 @@
 
 #include <memory>
 #include <shared_mutex>
+#include <string>
 
 #include "kv_cache_manager/client/include/meta_client.h"
+#include "kv_cache_manager/common/affinity_types.h"
 
 namespace kv_cache_manager {
 class Stub;
 class ClientConfig;
+class CallerNodeProvider;
 
 class MetaClientImpl : public MetaClient {
 public:
@@ -20,7 +23,8 @@ public:
                                                         const std::vector<int64_t> &tokens,
                                                         const BlockMask &block_mask,
                                                         int32_t sw_size,
-                                                        const std::vector<std::string> &location_spec_names) override;
+                                                        const std::vector<std::string> &location_spec_names,
+                                                        std::vector<ReplicationHint> &out_hints) override;
 
     std::pair<ClientErrorCode, int64_t> MatchLocationLen(const std::string &trace_id,
                                                          QueryType query_type,
@@ -58,6 +62,7 @@ protected:
 private:
     ClientErrorCode IsValid(const std::unique_ptr<ClientConfig> &client_config) const;
     ClientErrorCode Connect(const std::string &address);
+    void InitCallerNodeProvider(const std::string &storage_config);
     const ClientConfig *GetClientConfig() const;
     const ClientConfig *GetClientConfigUnsafe() const;
     const std::string &GetInstanceId() const;
@@ -67,6 +72,8 @@ private:
     std::unique_ptr<ClientConfig> client_config_;
     std::unique_ptr<Stub> stub_;
     std::string storage_config_;
+    std::unique_ptr<CallerNodeProvider> caller_node_provider_;
+    CallerNode caller_node_;
     mutable std::shared_mutex config_mutex_;
 };
 } // namespace kv_cache_manager

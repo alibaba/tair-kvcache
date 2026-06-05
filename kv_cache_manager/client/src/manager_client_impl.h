@@ -16,7 +16,8 @@ public:
                                                         const std::vector<int64_t> &tokens,
                                                         const BlockMask &block_mask,
                                                         int32_t sw_size,
-                                                        const std::vector<std::string> &location_spec_names) override;
+                                                        const std::vector<std::string> &location_spec_names,
+                                                        std::vector<ReplicationHint> &out_hints) override;
 
     std::pair<ClientErrorCode, WriteLocation> StartWrite(const std::string &trace_id,
                                                          const std::vector<int64_t> &keys,

@@ -12,6 +12,7 @@ cc_test(
         "//kv_cache_manager/affinity/pipeline:candidate_pipeline",
         "//kv_cache_manager/affinity/pipeline:filter_cond",
         "//kv_cache_manager/common",
+        "//kv_cache_manager/common:affinity_types",
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/data_storage:common_define",
         "@rapidjson",

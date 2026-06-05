@@ -5,9 +5,10 @@
 #include <vector>
 
 #include "kv_cache_manager/affinity/cache_affinity_manager.h"
-#include "kv_cache_manager/affinity/pipeline/filter_cond.h"
 #include "kv_cache_manager/affinity/node_metrics.h"
 #include "kv_cache_manager/affinity/pipeline/candidate_pipeline.h"
+#include "kv_cache_manager/affinity/pipeline/filter_cond.h"
+#include "kv_cache_manager/common/affinity_types.h"
 #include "kv_cache_manager/common/unittest.h"
 
 using namespace kv_cache_manager;
@@ -314,7 +315,7 @@ TEST_F(StrategyParseTest, EmptyStrategyParsesAndIsIdentity) {
     auto s = ParseStrategy(R"({})");
     ASSERT_NE(s, nullptr);
     MetricsBag bag;
-    auto r = s->Apply({"a", "b", "c"}, bag.AsFinder(), "", "");
+    auto r = s->Apply({"a", "b", "c"}, bag.AsFinder(), CallerNode{}, "");
     EXPECT_EQ(r.status, CandidatePipeline::Status::kOk);
     ASSERT_EQ(r.nodes.size(), 3u);
     EXPECT_EQ(r.nodes[0], "a");
@@ -361,7 +362,7 @@ TEST_F(StrategyApplyTest, FilterSlotDropsAndKeeps) {
     MetricsBag bag;
     bag.Put(MakeNode("idle", "n", 0, /*load=*/0.1));
     bag.Put(MakeNode("busy", "n", 0, /*load=*/0.9));
-    auto r = s->Apply({"idle", "busy"}, bag.AsFinder(), "", "");
+    auto r = s->Apply({"idle", "busy"}, bag.AsFinder(), CallerNode{}, "");
     ASSERT_EQ(r.nodes.size(), 1u);
     EXPECT_EQ(r.nodes[0], "idle");
 }
@@ -370,7 +371,7 @@ TEST_F(StrategyApplyTest, PreferLocalKeepsLocal) {
     auto s = ParseStrategy(R"({"prefer_local": {"on_miss": "passthrough"}})");
     ASSERT_NE(s, nullptr);
     MetricsBag bag;
-    auto r = s->Apply({"10.0.0.1", "10.0.0.7", "10.0.0.8"}, bag.AsFinder(), /*caller=*/"10.0.0.7", "");
+    auto r = s->Apply({"10.0.0.1", "10.0.0.7", "10.0.0.8"}, bag.AsFinder(), /*caller=*/CallerNode{"10.0.0.7", ""}, "");
     ASSERT_EQ(r.nodes.size(), 1u);
     EXPECT_EQ(r.nodes[0], "10.0.0.7");
 }
@@ -379,7 +380,7 @@ TEST_F(StrategyApplyTest, PreferLocalPassthroughOnMiss) {
     auto s = ParseStrategy(R"({"prefer_local": {"on_miss": "passthrough"}})");
     ASSERT_NE(s, nullptr);
     MetricsBag bag;
-    auto r = s->Apply({"10.0.0.1", "10.0.0.2"}, bag.AsFinder(), /*caller=*/"10.0.0.99", "");
+    auto r = s->Apply({"10.0.0.1", "10.0.0.2"}, bag.AsFinder(), /*caller=*/CallerNode{"10.0.0.99", ""}, "");
     EXPECT_EQ(r.status, CandidatePipeline::Status::kOk);
     EXPECT_EQ(r.nodes.size(), 2u);
 }
@@ -388,7 +389,7 @@ TEST_F(StrategyApplyTest, PreferLocalAbortOnMiss) {
     auto s = ParseStrategy(R"({"prefer_local": {"on_miss": "abort"}})");
     ASSERT_NE(s, nullptr);
     MetricsBag bag;
-    auto r = s->Apply({"10.0.0.1", "10.0.0.2"}, bag.AsFinder(), /*caller=*/"10.0.0.99", "");
+    auto r = s->Apply({"10.0.0.1", "10.0.0.2"}, bag.AsFinder(), /*caller=*/CallerNode{"10.0.0.99", ""}, "");
     EXPECT_EQ(r.status, CandidatePipeline::Status::kAbort);
     EXPECT_TRUE(r.nodes.empty());
 }
@@ -398,7 +399,7 @@ TEST_F(StrategyApplyTest, PreferLocalDefaultsToPassthrough) {
     auto s = ParseStrategy(R"({"prefer_local": {}})");
     ASSERT_NE(s, nullptr);
     MetricsBag bag;
-    auto r = s->Apply({"a", "b"}, bag.AsFinder(), "missing", "");
+    auto r = s->Apply({"a", "b"}, bag.AsFinder(), CallerNode{"missing", ""}, "");
     EXPECT_EQ(r.status, CandidatePipeline::Status::kOk);
     EXPECT_EQ(r.nodes.size(), 2u);
 }
@@ -407,7 +408,7 @@ TEST_F(StrategyApplyTest, SampleNCapsCount) {
     auto s = ParseStrategy(R"({"sample": {"n": 2, "seed": "trace_id"}})");
     ASSERT_NE(s, nullptr);
     MetricsBag bag;
-    auto r = s->Apply({"a", "b", "c", "d"}, bag.AsFinder(), "", /*trace=*/"trace-1");
+    auto r = s->Apply({"a", "b", "c", "d"}, bag.AsFinder(), CallerNode{}, /*trace=*/"trace-1");
     EXPECT_EQ(r.nodes.size(), 2u);
 }
 
@@ -415,7 +416,7 @@ TEST_F(StrategyApplyTest, SampleReturnsAllWhenInputSmallerThanN) {
     auto s = ParseStrategy(R"({"sample": {"n": 10}})");
     ASSERT_NE(s, nullptr);
     MetricsBag bag;
-    auto r = s->Apply({"a", "b"}, bag.AsFinder(), "", "");
+    auto r = s->Apply({"a", "b"}, bag.AsFinder(), CallerNode{}, "");
     EXPECT_EQ(r.nodes.size(), 2u);
 }
 
@@ -426,7 +427,7 @@ TEST_F(StrategyApplyTest, SampleNodePatternFilters) {
     bag.Put(MakeNode("a", "gpu-1"));
     bag.Put(MakeNode("b", "cpu-1"));
     bag.Put(MakeNode("c", "gpu-2"));
-    auto r = s->Apply({"a", "b", "c"}, bag.AsFinder(), "", "");
+    auto r = s->Apply({"a", "b", "c"}, bag.AsFinder(), CallerNode{}, "");
     std::unordered_set<std::string> got(r.nodes.begin(), r.nodes.end());
     EXPECT_EQ(got.size(), 2u);
     EXPECT_TRUE(got.count("a"));
@@ -438,8 +439,8 @@ TEST_F(StrategyApplyTest, SampleTraceIdSeedDeterministic) {
     auto s = ParseStrategy(R"({"sample": {"n": 2, "seed": "trace_id"}})");
     ASSERT_NE(s, nullptr);
     MetricsBag bag;
-    auto r1 = s->Apply({"a", "b", "c", "d", "e"}, bag.AsFinder(), "", /*trace=*/"trace-X");
-    auto r2 = s->Apply({"a", "b", "c", "d", "e"}, bag.AsFinder(), "", /*trace=*/"trace-X");
+    auto r1 = s->Apply({"a", "b", "c", "d", "e"}, bag.AsFinder(), CallerNode{}, /*trace=*/"trace-X");
+    auto r2 = s->Apply({"a", "b", "c", "d", "e"}, bag.AsFinder(), CallerNode{}, /*trace=*/"trace-X");
     ASSERT_EQ(r1.nodes.size(), 2u);
     ASSERT_EQ(r2.nodes.size(), 2u);
     EXPECT_EQ(r1.nodes, r2.nodes);
@@ -452,7 +453,7 @@ TEST_F(StrategyApplyTest, SortDescendingByDefault) {
     bag.Put(MakeNode("a", "n", /*free=*/100));
     bag.Put(MakeNode("b", "n", /*free=*/300));
     bag.Put(MakeNode("c", "n", /*free=*/200));
-    auto r = s->Apply({"a", "b", "c"}, bag.AsFinder(), "", "");
+    auto r = s->Apply({"a", "b", "c"}, bag.AsFinder(), CallerNode{}, "");
     ASSERT_EQ(r.nodes.size(), 3u);
     EXPECT_EQ(r.nodes[0], "b");
     EXPECT_EQ(r.nodes[1], "c");
@@ -466,7 +467,7 @@ TEST_F(StrategyApplyTest, SortNegativeWeightAscending) {
     bag.Put(MakeNode("hot", "n", 0, /*load=*/0.9));
     bag.Put(MakeNode("warm", "n", 0, /*load=*/0.5));
     bag.Put(MakeNode("cold", "n", 0, /*load=*/0.1));
-    auto r = s->Apply({"hot", "warm", "cold"}, bag.AsFinder(), "", "");
+    auto r = s->Apply({"hot", "warm", "cold"}, bag.AsFinder(), CallerNode{}, "");
     ASSERT_EQ(r.nodes.size(), 3u);
     EXPECT_EQ(r.nodes[0], "cold");
     EXPECT_EQ(r.nodes[1], "warm");
@@ -480,7 +481,7 @@ TEST_F(StrategyApplyTest, SortMissingMetricContributesZero) {
     ASSERT_NE(s, nullptr);
     MetricsBag bag;
     bag.Put(MakeNode("known", "n", 0, 0, /*rx=*/10));
-    auto r = s->Apply({"unknown", "known"}, bag.AsFinder(), "", "");
+    auto r = s->Apply({"unknown", "known"}, bag.AsFinder(), CallerNode{}, "");
     ASSERT_EQ(r.nodes.size(), 2u);
     EXPECT_EQ(r.nodes[0], "known");
     EXPECT_EQ(r.nodes[1], "unknown");
@@ -497,7 +498,7 @@ TEST_F(StrategyApplyTest, SortMultiTermLinearCombination) {
     bag.Put(MakeNode("a", "n", 0, 0, /*rx=*/100, /*tx=*/100)); // 200
     bag.Put(MakeNode("b", "n", 0, 0, /*rx=*/50, /*tx=*/300));  // 350
     bag.Put(MakeNode("c", "n", 0, 0, /*rx=*/10, /*tx=*/10));   // 20
-    auto r = s->Apply({"a", "b", "c"}, bag.AsFinder(), "", "");
+    auto r = s->Apply({"a", "b", "c"}, bag.AsFinder(), CallerNode{}, "");
     ASSERT_EQ(r.nodes.size(), 3u);
     EXPECT_EQ(r.nodes[0], "b");
     EXPECT_EQ(r.nodes[1], "a");
@@ -508,7 +509,7 @@ TEST_F(StrategyApplyTest, LimitTruncatesTail) {
     auto s = ParseStrategy(R"({"limit": 2})");
     ASSERT_NE(s, nullptr);
     MetricsBag bag;
-    auto r = s->Apply({"a", "b", "c", "d"}, bag.AsFinder(), "", "");
+    auto r = s->Apply({"a", "b", "c", "d"}, bag.AsFinder(), CallerNode{}, "");
     ASSERT_EQ(r.nodes.size(), 2u);
     EXPECT_EQ(r.nodes[0], "a");
     EXPECT_EQ(r.nodes[1], "b");
@@ -530,7 +531,7 @@ TEST_F(StrategyApplyTest, FixedOrderFilterBeforeSort) {
     bag.Put(MakeNode("hot", "n", /*free=*/2000, /*load=*/0.9));
     bag.Put(MakeNode("warm", "n", /*free=*/2000, /*load=*/0.5));
     bag.Put(MakeNode("cold", "n", /*free=*/2000, /*load=*/0.1));
-    auto r = s->Apply({"small", "hot", "warm", "cold"}, bag.AsFinder(), "", "");
+    auto r = s->Apply({"small", "hot", "warm", "cold"}, bag.AsFinder(), CallerNode{}, "");
     ASSERT_EQ(r.nodes.size(), 1u);
     EXPECT_EQ(r.nodes[0], "cold");
 }
@@ -546,7 +547,7 @@ TEST_F(StrategyApplyTest, PreferLocalRunsBeforeSort) {
     MetricsBag bag;
     bag.Put(MakeNode("10.0.0.7", "local", /*free=*/100));
     bag.Put(MakeNode("10.0.0.8", "remote", /*free=*/9999));
-    auto r = s->Apply({"10.0.0.7", "10.0.0.8"}, bag.AsFinder(), /*caller=*/"10.0.0.7", "");
+    auto r = s->Apply({"10.0.0.7", "10.0.0.8"}, bag.AsFinder(), /*caller=*/CallerNode{"10.0.0.7", ""}, "");
     ASSERT_EQ(r.nodes.size(), 1u);
     EXPECT_EQ(r.nodes[0], "10.0.0.7");
 }
@@ -560,7 +561,7 @@ TEST_F(StrategyApplyTest, AbortShortCircuitsPipeline) {
     ASSERT_NE(s, nullptr);
     MetricsBag bag;
     bag.Put(MakeNode("a", "n", 100));
-    auto r = s->Apply({"a"}, bag.AsFinder(), /*caller=*/"missing", "");
+    auto r = s->Apply({"a"}, bag.AsFinder(), /*caller=*/CallerNode{"missing", ""}, "");
     EXPECT_EQ(r.status, CandidatePipeline::Status::kAbort);
     EXPECT_TRUE(r.nodes.empty());
 }

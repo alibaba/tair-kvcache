@@ -2925,8 +2925,11 @@ TEST_F(MetaSearcherTest, TestPrefixMatch) {
         // 改成serving之前match不到
         CacheLocationVector out_locations;
         BlockMask mask; // 空mask，不跳过任何元素
+        std::shared_ptr<CacheAffinityManager> affinity_manager;
+        std::vector<std::unique_ptr<ReadSideEffect>> side_effects;
 
-        ec = meta_searcher_->PrefixMatch(request_context_.get(), keys, mask, out_locations, &policy_);
+        ec = meta_searcher_->PrefixMatch(
+            request_context_.get(), keys, mask, out_locations, &policy_, affinity_manager, nullptr, side_effects);
         EXPECT_EQ(ec, ErrorCode::EC_OK);
         EXPECT_EQ(out_locations.size(), 0);
     }
@@ -2964,8 +2967,17 @@ TEST_F(MetaSearcherTest, TestPrefixMatch) {
         // 测试PrefixMatch
         CacheLocationVector out_locations;
         BlockMask mask; // 空mask，不跳过任何元素
+        std::shared_ptr<CacheAffinityManager> affinity_manager;
+        std::vector<std::unique_ptr<ReadSideEffect>> side_effects;
 
-        ec = meta_searcher_->PrefixMatch(request_context_.get(), test_data.keys, mask, out_locations, &policy_);
+        ec = meta_searcher_->PrefixMatch(request_context_.get(),
+                                         test_data.keys,
+                                         mask,
+                                         out_locations,
+                                         &policy_,
+                                         affinity_manager,
+                                         nullptr,
+                                         side_effects);
 
         // 验证结果
         EXPECT_EQ(ec, ErrorCode::EC_OK);
@@ -2985,7 +2997,10 @@ TEST_F(MetaSearcherTest, TestPrefixMatch) {
     for (auto &block_mask : mask_vectors) {
         CacheLocationVector out_locations;
         out_locations.clear();
-        ec = meta_searcher_->PrefixMatch(request_context_.get(), keys, block_mask, out_locations, &policy_);
+        std::shared_ptr<CacheAffinityManager> affinity_manager;
+        std::vector<std::unique_ptr<ReadSideEffect>> side_effects;
+        ec = meta_searcher_->PrefixMatch(
+            request_context_.get(), keys, block_mask, out_locations, &policy_, affinity_manager, nullptr, side_effects);
 
         // 验证结果 - 应该只返回后两个元素
         EXPECT_EQ(ec, ErrorCode::EC_OK);
@@ -3703,7 +3718,10 @@ TEST_F(MetaSearcherTest, TestBatchVsSequentialPerformance) {
     for (size_t i = 0; i <= 100; ++i) {
         CacheLocationVector out_locations;
         BlockMask mask; // 空mask，不跳过任何元素
-        ec = meta_searcher_->PrefixMatch(request_context_.get(), keys, mask, out_locations, &policy_);
+        std::shared_ptr<CacheAffinityManager> affinity_manager;
+        std::vector<std::unique_ptr<ReadSideEffect>> side_effects;
+        ec = meta_searcher_->PrefixMatch(
+            request_context_.get(), keys, mask, out_locations, &policy_, affinity_manager, nullptr, side_effects);
         EXPECT_EQ(ec, ErrorCode::EC_OK);
         EXPECT_EQ(out_locations.size(), num_keys);
     }
@@ -3716,10 +3734,19 @@ TEST_F(MetaSearcherTest, TestBatchVsSequentialPerformance) {
     for (size_t i = 0; i <= 100; ++i) {
         CacheLocationVector out_locations;
         BlockMask mask;
+        std::shared_ptr<CacheAffinityManager> affinity_manager;
+        std::vector<std::unique_ptr<ReadSideEffect>> side_effects;
         ErrorCode result_ec = ErrorCode::EC_OK;
         for (size_t j = 0; j < keys.size(); ++j) {
             MetaSearcher::KeyVector single_key = {keys[j]};
-            result_ec = meta_searcher_->PrefixMatch(request_context_.get(), single_key, mask, out_locations, &policy_);
+            result_ec = meta_searcher_->PrefixMatch(request_context_.get(),
+                                                    single_key,
+                                                    mask,
+                                                    out_locations,
+                                                    &policy_,
+                                                    affinity_manager,
+                                                    nullptr,
+                                                    side_effects);
             if (result_ec != ErrorCode::EC_OK) {
                 break;
             }
@@ -4274,7 +4301,10 @@ TEST_F(MetaSearcherTest, TestPrefixMatchMergesSpecsByStorageType) {
     // PrefixMatch should merge specs from all same-type locations
     CacheLocationVector out_locations;
     BlockMask mask;
-    ec = meta_searcher_->PrefixMatch(request_context_.get(), keys, mask, out_locations, &policy_);
+    std::shared_ptr<CacheAffinityManager> affinity_manager;
+    std::vector<std::unique_ptr<ReadSideEffect>> side_effects;
+    ec = meta_searcher_->PrefixMatch(
+        request_context_.get(), keys, mask, out_locations, &policy_, affinity_manager, nullptr, side_effects);
     ASSERT_EQ(ec, ErrorCode::EC_OK);
     ASSERT_EQ(out_locations.size(), 3);
 
@@ -4340,7 +4370,10 @@ TEST_F(MetaSearcherTest, TestBatchGetMergesSpecsByStorageType) {
 
     // BatchGetBestLocation
     CacheLocationVector out_locations;
-    ErrorCode ec = meta_searcher_->BatchGetBestLocation(request_context_.get(), keys, out_locations, &policy_);
+    std::shared_ptr<CacheAffinityManager> affinity_manager;
+    std::vector<std::unique_ptr<ReadSideEffect>> side_effects;
+    ErrorCode ec = meta_searcher_->BatchGetBestLocation(
+        request_context_.get(), keys, out_locations, &policy_, affinity_manager, nullptr, side_effects);
     ASSERT_EQ(ec, ErrorCode::EC_OK);
     ASSERT_EQ(out_locations.size(), 2);
 
@@ -5147,7 +5180,11 @@ TEST_F(MetaSearcherTest, LocalReplicaSpecAtMergeStep) {
 
     CacheLocationVector out;
     BlockMask mask;
-    ASSERT_EQ(EC_OK, meta_searcher_->PrefixMatch(request_context_.get(), keys, mask, out, &policy_));
+    std::shared_ptr<CacheAffinityManager> affinity_manager;
+    std::vector<std::unique_ptr<ReadSideEffect>> side_effects;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->PrefixMatch(
+                  request_context_.get(), keys, mask, out, &policy_, affinity_manager, nullptr, side_effects));
     ASSERT_EQ(1u, out.size());
     ASSERT_EQ(1u, out[0]->location_specs().size());
     EXPECT_EQ("node_local", out[0]->location_specs()[0].node_id())
@@ -5179,15 +5216,16 @@ TEST_F(MetaSearcherTest, ReadSelectionViaStrategyPicksLocal) {
 
     request_context_->set_caller_node_id("node_local");
 
-    CacheAffinityManager mgr;
-    mgr.LoadProcessStrategyFromJsonString(R"({"type":"local_replica"})");
+    auto mgr = std::make_shared<CacheAffinityManager>();
+    mgr->LoadProcessStrategyFromJsonString(R"({"type":"local_replica"})");
     AffinityResolveContext resolve_ctx;
 
     CacheLocationVector out;
     BlockMask mask;
-    ASSERT_EQ(
-        EC_OK,
-        meta_searcher_->PrefixMatch(request_context_.get(), keys, mask, out, &policy_, &mgr, nullptr, &resolve_ctx));
+    std::vector<std::unique_ptr<ReadSideEffect>> side_effects;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->PrefixMatch(
+                  request_context_.get(), keys, mask, out, &policy_, mgr, &resolve_ctx, side_effects));
     ASSERT_EQ(1u, out.size());
     ASSERT_EQ(1u, out[0]->location_specs().size());
     EXPECT_EQ("node_local", out[0]->location_specs()[0].node_id());
@@ -5219,15 +5257,16 @@ TEST_F(MetaSearcherTest, ReadSelectionWithNoopStrategyDegradesToFirstSeen) {
 
     request_context_->set_caller_node_id("node_local");
 
-    CacheAffinityManager mgr;
-    mgr.LoadProcessStrategyFromJsonString(R"({"type":"noop"})");
+    auto mgr = std::make_shared<CacheAffinityManager>();
+    mgr->LoadProcessStrategyFromJsonString(R"({"type":"noop"})");
     AffinityResolveContext resolve_ctx;
 
     CacheLocationVector out;
     BlockMask mask;
-    ASSERT_EQ(
-        EC_OK,
-        meta_searcher_->PrefixMatch(request_context_.get(), keys, mask, out, &policy_, &mgr, nullptr, &resolve_ctx));
+    std::vector<std::unique_ptr<ReadSideEffect>> side_effects;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->PrefixMatch(
+                  request_context_.get(), keys, mask, out, &policy_, mgr, &resolve_ctx, side_effects));
     ASSERT_EQ(1u, out.size());
     ASSERT_EQ(1u, out[0]->location_specs().size());
     // Noop: IsReadEnabled=false, ResolveRead returns empty picked_specs,
