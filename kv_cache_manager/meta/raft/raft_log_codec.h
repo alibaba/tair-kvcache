@@ -22,6 +22,8 @@ enum class OpType : uint8_t {
     kDeleteLocations = 4,
     kPutMetaData = 5,
     kPutIfAbsent = 6,
+    kRegistrySave = 7,
+    kRegistryDelete = 8,
 };
 
 // One write operation in the raft log. Single op per log entry — batch APIs
@@ -45,6 +47,10 @@ struct LogOp {
 
     // For PutMetaData.
     FieldMap meta_fields;
+
+    // For RegistrySave / RegistryDelete.
+    std::string registry_key;
+    std::map<std::string, std::string> registry_fields;
 };
 
 // Encode a LogOp into a NuRaft buffer ready to be wrapped in a log_entry.

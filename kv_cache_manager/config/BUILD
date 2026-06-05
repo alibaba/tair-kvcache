@@ -94,6 +94,18 @@ cc_library(
 )
 
 cc_library(
+    name = "registry_raft_backend",
+    srcs = ["registry_raft_backend.cc"],
+    hdrs = ["registry_raft_backend.h"],
+    deps = [
+        ":config",
+        "//kv_cache_manager/common",
+        "//kv_cache_manager/meta/raft:raft_coordinator",
+        "//kv_cache_manager/meta/raft:raft_log_codec",
+    ],
+)
+
+cc_library(
     name = "meta_cache_policy_config",
     srcs = ["meta_cache_policy_config.cc"],
     hdrs = ["meta_cache_policy_config.h"],

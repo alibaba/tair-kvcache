@@ -11,6 +11,8 @@
 #include "kv_cache_manager/config/node_endpoint_info.h"
 #include "kv_cache_manager/config/raft_leader_elector.h"
 #include "kv_cache_manager/config/registry_manager.h"
+#include "kv_cache_manager/config/registry_raft_backend.h"
+#include "kv_cache_manager/config/registry_storage_backend_factory.h"
 #include "kv_cache_manager/meta/raft/raft_coordinator.h"
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/event/log_event_publisher.h"
@@ -44,6 +46,12 @@ bool Server::Init(const ServerConfig &config) {
     }
 
     auto registry_storage_uri = config_.GetRegistryStorageUri();
+    if (config_.IsRaftEnabled()) {
+        RegistryStorageBackendFactory::RegisterType("raft", [] {
+            return std::make_unique<RegistryRaftBackend>();
+        });
+        registry_storage_uri = "raft://";
+    }
     registry_manager_.reset(new RegistryManager(registry_storage_uri, metrics_registry_));
     registry_manager_->Init();
 

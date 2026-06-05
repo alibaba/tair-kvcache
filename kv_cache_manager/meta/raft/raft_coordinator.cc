@@ -231,6 +231,14 @@ std::shared_ptr<MetaCacheBaseBackend> RaftCoordinator::GetOrCreateBackend(const 
     return state_machine_->GetOrCreateBackend(instance_id);
 }
 
+ErrorCode RaftCoordinator::RegistryLoad(const std::string &key,
+                                        std::map<std::string, std::string> &out) const {
+    if (!state_machine_) {
+        return EC_ERROR;
+    }
+    return state_machine_->RegistryLoad(key, out);
+}
+
 bool RaftCoordinator::IsLeader() const { return raft_server_ && raft_server_->is_leader(); }
 
 int32_t RaftCoordinator::LeaderId() const { return raft_server_ ? raft_server_->get_leader() : -1; }

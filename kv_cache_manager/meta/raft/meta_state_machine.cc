@@ -33,7 +33,9 @@ using nuraft::ulong;
 
 namespace {
 
-constexpr uint8_t kSnapshotVersion = 1;
+constexpr uint8_t kSnapshotVersionV1 = 1;
+constexpr uint8_t kSnapshotVersionV2 = 2;
+constexpr uint8_t kSnapshotVersionCurrent = kSnapshotVersionV2;
 
 }
 
@@ -110,6 +112,17 @@ ptr<buffer> MetaStateMachine::commit(const ulong log_idx, buffer &data) {
         return nullptr;
     }
 
+    if (op.type == OpType::kRegistrySave || op.type == OpType::kRegistryDelete) {
+        std::unique_lock<std::shared_mutex> g(registry_mu_);
+        if (op.type == OpType::kRegistrySave) {
+            registry_store_[op.registry_key] = std::move(op.registry_fields);
+        } else {
+            registry_store_.erase(op.registry_key);
+        }
+        last_commit_index_.store(log_idx);
+        return nullptr;
+    }
+
     auto backend = GetOrCreateBackend(op.instance_id);
     if (!backend) {
         KVCM_LOG_ERROR("MetaStateMachine: no backend for instance[%s] at idx[%lu]",
@@ -153,6 +166,8 @@ ptr<buffer> MetaStateMachine::commit(const ulong log_idx, buffer &data) {
         break;
     case OpType::kPutMetaData:
         backend->PutMetaData(op.meta_fields);
+        break;
+    default:
         break;
     }
 
@@ -301,7 +316,6 @@ bool ReadOneInstance(buffer_serializer &bs, MetaCacheBaseBackend *backend) {
 } // namespace
 
 ptr<buffer> MetaStateMachine::SerializeAll() const {
-    // Snapshot a stable view of the instance map under the shared lock.
     std::vector<std::pair<std::string, std::shared_ptr<MetaCacheBaseBackend>>> entries;
     {
         std::shared_lock<std::shared_mutex> g(backends_mu_);
@@ -311,18 +325,46 @@ ptr<buffer> MetaStateMachine::SerializeAll() const {
         }
     }
 
+    std::unordered_map<std::string, std::map<std::string, std::string>> registry_snapshot;
+    {
+        std::shared_lock<std::shared_mutex> g(registry_mu_);
+        registry_snapshot = registry_store_;
+    }
+
     size_t total = 1 /*ver*/ + sizeof(uint32_t) /*instance_count*/;
     for (const auto &[iid, b] : entries) {
         total += sizeof(uint32_t) + iid.size();
         total += EstimateOneInstanceSize(b.get());
     }
+    // Registry section size.
+    total += sizeof(uint32_t); // registry_entry_count
+    for (const auto &[key, fields] : registry_snapshot) {
+        total += sizeof(uint32_t) + key.size();
+        total += sizeof(uint32_t); // field_count
+        for (const auto &[fk, fv] : fields) {
+            total += sizeof(uint32_t) + fk.size();
+            total += sizeof(uint32_t) + fv.size();
+        }
+    }
+
     ptr<buffer> out = buffer::alloc(total);
     buffer_serializer bs(out);
-    bs.put_u8(kSnapshotVersion);
+    bs.put_u8(kSnapshotVersionCurrent);
     bs.put_u32(static_cast<uint32_t>(entries.size()));
     for (const auto &[iid, b] : entries) {
         bs.put_str(iid);
         WriteOneInstance(bs, b.get());
+    }
+
+    // Registry section.
+    bs.put_u32(static_cast<uint32_t>(registry_snapshot.size()));
+    for (const auto &[key, fields] : registry_snapshot) {
+        bs.put_str(key);
+        bs.put_u32(static_cast<uint32_t>(fields.size()));
+        for (const auto &[fk, fv] : fields) {
+            bs.put_str(fk);
+            bs.put_str(fv);
+        }
     }
     return out;
 }
@@ -330,7 +372,7 @@ ptr<buffer> MetaStateMachine::SerializeAll() const {
 bool MetaStateMachine::DeserializeAll(buffer &buf) {
     buffer_serializer bs(buf);
     uint8_t ver = bs.get_u8();
-    if (ver != kSnapshotVersion) {
+    if (ver != kSnapshotVersionV1 && ver != kSnapshotVersionV2) {
         KVCM_LOG_ERROR("MetaStateMachine: unknown snapshot version[%u]", ver);
         return false;
     }
@@ -343,6 +385,26 @@ bool MetaStateMachine::DeserializeAll(buffer &buf) {
         }
         if (!ReadOneInstance(bs, backend.get())) {
             return false;
+        }
+    }
+
+    // V2: registry section follows per-instance data.
+    {
+        std::unique_lock<std::shared_mutex> g(registry_mu_);
+        registry_store_.clear();
+        if (ver >= kSnapshotVersionV2) {
+            uint32_t reg_count = bs.get_u32();
+            for (uint32_t i = 0; i < reg_count; ++i) {
+                std::string key = bs.get_str();
+                uint32_t field_count = bs.get_u32();
+                std::map<std::string, std::string> fields;
+                for (uint32_t j = 0; j < field_count; ++j) {
+                    std::string fk = bs.get_str();
+                    std::string fv = bs.get_str();
+                    fields.emplace(std::move(fk), std::move(fv));
+                }
+                registry_store_.emplace(std::move(key), std::move(fields));
+            }
         }
     }
     return true;
@@ -472,6 +534,22 @@ ptr<snapshot> MetaStateMachine::last_snapshot() {
 }
 
 ulong MetaStateMachine::last_commit_index() { return last_commit_index_.load(); }
+
+ErrorCode MetaStateMachine::RegistryLoad(const std::string &key,
+                                         std::map<std::string, std::string> &out) const {
+    std::shared_lock<std::shared_mutex> g(registry_mu_);
+    auto it = registry_store_.find(key);
+    if (it == registry_store_.end()) {
+        return EC_NOENT;
+    }
+    out = it->second;
+    return EC_OK;
+}
+
+void MetaStateMachine::RegistryClear() {
+    std::unique_lock<std::shared_mutex> g(registry_mu_);
+    registry_store_.clear();
+}
 
 } // namespace raft_meta
 } // namespace kv_cache_manager

@@ -194,5 +194,44 @@ TEST_F(RaftLogCodecTest, CorruptUnknownOpType) {
     EXPECT_EQ(EC_CORRUPTION, Decode(*buf, out));
 }
 
+TEST_F(RaftLogCodecTest, RegistrySaveRoundTrip) {
+    LogOp op;
+    op.type = OpType::kRegistrySave;
+    op.registry_key = "instance_group";
+    op.registry_fields = {{"group-a", "{\"name\":\"a\"}"}, {"group-b", "{\"name\":\"b\"}"}};
+
+    auto buf = Encode(op);
+    LogOp decoded = DecodeBuffer(buf);
+    EXPECT_EQ(OpType::kRegistrySave, decoded.type);
+    EXPECT_EQ("instance_group", decoded.registry_key);
+    ASSERT_EQ(2u, decoded.registry_fields.size());
+    EXPECT_EQ("{\"name\":\"a\"}", decoded.registry_fields.at("group-a"));
+    EXPECT_EQ("{\"name\":\"b\"}", decoded.registry_fields.at("group-b"));
+}
+
+TEST_F(RaftLogCodecTest, RegistryDeleteRoundTrip) {
+    LogOp op;
+    op.type = OpType::kRegistryDelete;
+    op.registry_key = "storage";
+
+    auto buf = Encode(op);
+    LogOp decoded = DecodeBuffer(buf);
+    EXPECT_EQ(OpType::kRegistryDelete, decoded.type);
+    EXPECT_EQ("storage", decoded.registry_key);
+    EXPECT_TRUE(decoded.registry_fields.empty());
+}
+
+TEST_F(RaftLogCodecTest, RegistrySaveEmptyFieldsRoundTrip) {
+    LogOp op;
+    op.type = OpType::kRegistrySave;
+    op.registry_key = "empty";
+
+    auto buf = Encode(op);
+    LogOp decoded = DecodeBuffer(buf);
+    EXPECT_EQ(OpType::kRegistrySave, decoded.type);
+    EXPECT_EQ("empty", decoded.registry_key);
+    EXPECT_TRUE(decoded.registry_fields.empty());
+}
+
 } // namespace raft_meta
 } // namespace kv_cache_manager

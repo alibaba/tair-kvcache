@@ -61,6 +61,13 @@ size_t EstimateLogOpSize(const LogOp &op) {
     case OpType::kPutMetaData:
         total += EstimatePropertyMapSize(op.meta_fields);
         break;
+    case OpType::kRegistrySave:
+        total += sizeof(uint32_t) + op.registry_key.size();
+        total += EstimatePropertyMapSize(op.registry_fields);
+        break;
+    case OpType::kRegistryDelete:
+        total += sizeof(uint32_t) + op.registry_key.size();
+        break;
     }
     return total;
 }
@@ -140,6 +147,13 @@ nuraft::ptr<nuraft::buffer> Encode(const LogOp &op) {
     case OpType::kPutMetaData:
         WriteFieldMap(bs, op.meta_fields);
         break;
+    case OpType::kRegistrySave:
+        bs.put_str(op.registry_key);
+        WriteFieldMap(bs, op.registry_fields);
+        break;
+    case OpType::kRegistryDelete:
+        bs.put_str(op.registry_key);
+        break;
     }
     return buf;
 }
@@ -179,6 +193,13 @@ ErrorCode Decode(nuraft::buffer &buf, LogOp &out) {
         }
         case OpType::kPutMetaData:
             ReadFieldMap(bs, out.meta_fields);
+            break;
+        case OpType::kRegistrySave:
+            out.registry_key = bs.get_str();
+            ReadFieldMap(bs, out.registry_fields);
+            break;
+        case OpType::kRegistryDelete:
+            out.registry_key = bs.get_str();
             break;
         default:
             KVCM_LOG_ERROR("raft_log_codec: unknown op type[%u]", op_raw);

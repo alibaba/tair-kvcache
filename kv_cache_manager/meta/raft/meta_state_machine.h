@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -79,6 +80,10 @@ public:
     // by this state machine (e.g. a follower that just caught up).
     std::shared_ptr<MetaCacheBaseBackend> GetOrCreateBackend(const std::string &instance_id);
 
+    // Registry data access — used by RegistryRaftBackend.
+    ErrorCode RegistryLoad(const std::string &key, std::map<std::string, std::string> &out) const;
+    void RegistryClear();
+
 private:
     // Encode every per-instance backend into one buffer:
     //   u8  version
@@ -105,6 +110,12 @@ private:
     // Tracks the highest log index applied via commit(), exposed to raft via
     // last_commit_index() for catch-up bookkeeping.
     std::atomic<nuraft::ulong> last_commit_index_{0};
+
+    // Registry data: replicated KV pairs for InstanceGroup / Instance /
+    // Storage / Account configuration. Separate from per-instance meta
+    // backends — this is global config, not per-instance cache metadata.
+    mutable std::shared_mutex registry_mu_;
+    std::unordered_map<std::string, std::map<std::string, std::string>> registry_store_;
 };
 
 } // namespace raft_meta

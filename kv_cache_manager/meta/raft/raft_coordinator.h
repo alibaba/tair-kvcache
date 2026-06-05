@@ -4,7 +4,10 @@
 #include <libnuraft/raft_server.hxx>
 
 #include <atomic>
+#include <climits>
+#include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -72,7 +75,14 @@ public:
         // Default tunables passed to per-instance MetaLocalBackend created by
         // the state machine factory. Each Instance gets its own backend; the
         // coordinator holds the defaults.
-        size_t local_capacity = 32 * 1024;
+        //
+        // The state machine's MetaLocalBackend is the authoritative store (no
+        // Redis behind it), so capacity must be large enough that
+        // strict_capacity_limit never rejects a committed write. We default
+        // to SIZE_MAX / (1024*1024) so the LRU cache is effectively unbounded.
+        // TODO: replace MetaLocalBackend with a disk-backed store (e.g. LevelDB)
+        //       so state machine memory is bounded by disk rather than RAM.
+        size_t local_capacity = SIZE_MAX / (1024ULL * 1024);
         int32_t local_num_shard_bits = 10;
         int32_t local_sample_times = 10;
     };
@@ -105,6 +115,9 @@ public:
     // via the factory closure installed in Start(); GetOrCreateBackend either
     // returns an existing one or asks the state machine to materialise it.
     std::shared_ptr<MetaCacheBaseBackend> GetOrCreateBackend(const std::string &instance_id);
+
+    // Registry data read. Delegates to the state machine's RegistryLoad.
+    ErrorCode RegistryLoad(const std::string &key, std::map<std::string, std::string> &out) const;
 
     // Raft introspection.
     bool IsLeader() const;
