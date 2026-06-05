@@ -378,7 +378,8 @@ CacheManager::GetCacheLocation(RequestContext *request_context,
                                    cache_locations);
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, ManagerPrefixMatch);
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, prefix_match_len, cache_locations.size());
-    // accumulate hit/query block counters for hit-rate monitoring
+    RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, CacheLocationViewVecWrapper, "get cache location failed");
+    // accumulate hit/query block counters for hit-rate monitoring (only on success)
     if (service_metrics_collector) {
         size_t query_count = query_keys.size();
         size_t hit_count = 0;
@@ -399,7 +400,6 @@ CacheManager::GetCacheLocation(RequestContext *request_context,
         query_counter += query_count;
         hit_counter += hit_count;
     }
-    RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, CacheLocationViewVecWrapper, "get cache location failed");
     FilterLocationSpecByName(cache_locations, location_spec_names);
 
     auto cache_get_event = std::make_shared<CacheGetEvent>(instance_id);

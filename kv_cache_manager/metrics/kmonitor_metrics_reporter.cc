@@ -294,6 +294,9 @@ bool KmonitorMetricsReporter::InitMetrics() {
     // manager metrics
     REGISTER_GAUGE_METRIC(manager, request_key_count);
     REGISTER_GAUGE_METRIC(manager, prefix_match_len);
+    // Workaround: KMonitor only supports QPS and GAUGE metric types (no COUNTER).
+    // These are semantically cumulative counters; registered as GAUGE to match
+    // existing codebase convention (e.g. cache_reclaimer counters).
     REGISTER_GAUGE_METRIC(manager, get_cache_location_query_block_counter);
     REGISTER_GAUGE_METRIC(manager, get_cache_location_hit_block_counter);
     REGISTER_GAUGE_METRIC(manager, prefix_match_time_us);
