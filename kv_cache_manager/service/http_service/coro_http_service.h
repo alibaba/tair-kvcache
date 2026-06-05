@@ -8,6 +8,7 @@
 #include <unordered_map>
 
 #include "google/protobuf/message.h"
+#include "kv_cache_manager/service/http_service/auth/token_verifier.h"
 #include "kv_cache_manager/service/util/proto_message_json_util.h"
 #include "ylt/coro_http/coro_http_server.hpp"
 
@@ -30,12 +31,18 @@ public:
     bool Start(int32_t port, size_t thread_num = std::thread::hardware_concurrency());
     void Stop();
 
+    // attach a TokenVerifier; when set, every registered handler is
+    // guarded with Bearer-auth middleware before it runs.  must be
+    // called before Start()
+    void SetTokenVerifier(std::shared_ptr<TokenVerifier> verifier);
+
     static std::string GetHttpClientIp(const coro_http::coro_http_connection *http_conn);
 
 protected:
     void RegisterGetHandler(const std::string &api, HandlerType handler);
     void RegisterPostHandler(const std::string &api, HandlerType handler);
     HandlerType WrapWithLogger(const std::string &api, HandlerType handler);
+    HandlerType WrapWithAuth(const std::string &api, HandlerType handler);
 
     template <typename ServiceType, typename PbRequestMessage, typename PbResponseMessage>
     HandlerType GetHandler(
@@ -46,6 +53,7 @@ private:
     std::unordered_map<std::string, HandlerType> get_handlers_{};
     std::unordered_map<std::string, HandlerType> post_handlers_{};
     std::unique_ptr<coro_http::coro_http_server> server_{};
+    std::shared_ptr<TokenVerifier> token_verifier_{};
 };
 
 template <typename ServiceType, typename PbRequestMessage, typename PbResponseMessage>

@@ -69,6 +69,20 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
          config->service_admin_http_port_ = std::stoi(value);
          return true;
      }},
+    {"kvcm.service.admin_auth_token",
+     [](const std::string &value, ServerConfig *config) {
+         // accept a comma-separated list to allow staged rotation;
+         // a single token without commas works too.  empty entries
+         // are dropped so trailing commas are harmless
+         config->admin_auth_tokens_.clear();
+         for (auto token : StringUtil::Split(value, ",")) {
+             StringUtil::Trim(token);
+             if (!token.empty()) {
+                 config->admin_auth_tokens_.push_back(std::move(token));
+             }
+         }
+         return true;
+     }},
     {"kvcm.service.enable_debug_service",
      [](const std::string &value, ServerConfig *config) {
          config->enable_debug_service_ = value == "true";

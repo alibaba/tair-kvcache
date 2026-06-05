@@ -24,6 +24,7 @@
 #include "kv_cache_manager/service/grpc_service/debug_service_grpc.h"
 #include "kv_cache_manager/service/grpc_service/meta_service_grpc.h"
 #include "kv_cache_manager/service/http_service/admin_service_http.h"
+#include "kv_cache_manager/service/http_service/auth/static_bearer_token_verifier.h"
 #include "kv_cache_manager/service/http_service/debug_service_http.h"
 #include "kv_cache_manager/service/http_service/meta_service_http.h"
 #include "kv_cache_manager/service/meta_service_impl.h"
@@ -230,6 +231,21 @@ bool Server::StartHttpServer() {
     meta_http_service_->Init();
     admin_http_service_->Init();
     debug_http_service_->Init();
+
+    // wire Bearer auth on admin + debug only; meta is the data
+    // plane and intentionally stays open.  when no token is
+    // configured the services run unauthenticated — log a WARN so
+    // operators don't accidentally expose them on untrusted nets
+    const auto &admin_tokens = config_.GetAdminAuthTokens();
+    if (!admin_tokens.empty()) {
+        auto verifier = std::make_shared<StaticBearerTokenVerifier>(admin_tokens);
+        admin_http_service_->SetTokenVerifier(verifier);
+        debug_http_service_->SetTokenVerifier(verifier);
+        KVCM_LOG_INFO("admin/debug HTTP Bearer auth enabled, accepted_tokens=%zu", admin_tokens.size());
+    } else {
+        KVCM_LOG_WARN("admin/debug HTTP auth disabled (kvcm.service.admin_auth_token not set); "
+                      "do not expose admin/debug ports on untrusted networks");
+    }
 
     // 注册HTTP处理器
     meta_http_service_->RegisterHandler();

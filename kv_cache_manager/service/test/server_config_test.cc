@@ -39,6 +39,9 @@ TEST_F(ServerConfigTest, TestSimple) {
         ASSERT_EQ(6382, config.GetServiceHttpPort());
         ASSERT_EQ(2, config.GetServiceIoThreadNum());
         ASSERT_TRUE(config.IsEnableDebugService());
+        ASSERT_EQ(2u, config.GetAdminAuthTokens().size());
+        ASSERT_EQ("tok-old", config.GetAdminAuthTokens()[0]);
+        ASSERT_EQ("tok-new", config.GetAdminAuthTokens()[1]);
     }
     // from environ
     {
@@ -74,6 +77,48 @@ TEST_F(ServerConfigTest, TestSimple) {
         ASSERT_EQ(4, config.GetServiceIoThreadNum());
         ASSERT_TRUE(config.IsEnableDebugService());
         ASSERT_EQ(3, config.GetLogLevel());
+    }
+}
+
+TEST_F(ServerConfigTest, TestAdminAuthTokenParsing) {
+    // unset -> empty list (auth disabled)
+    {
+        ServerConfig config;
+        std::unordered_map<std::string, std::string> environ;
+        environ.insert({"kvcm.registry_storage.uri", "redis://127.0.0.1"});
+        ASSERT_TRUE(config.Parse("", environ));
+        ASSERT_TRUE(config.GetAdminAuthTokens().empty());
+    }
+    // single token
+    {
+        ServerConfig config;
+        std::unordered_map<std::string, std::string> environ;
+        environ.insert({"kvcm.registry_storage.uri", "redis://127.0.0.1"});
+        environ.insert({"kvcm.service.admin_auth_token", "single-token"});
+        ASSERT_TRUE(config.Parse("", environ));
+        ASSERT_EQ(1u, config.GetAdminAuthTokens().size());
+        ASSERT_EQ("single-token", config.GetAdminAuthTokens()[0]);
+    }
+    // multi-token with whitespace and trailing comma
+    {
+        ServerConfig config;
+        std::unordered_map<std::string, std::string> environ;
+        environ.insert({"kvcm.registry_storage.uri", "redis://127.0.0.1"});
+        environ.insert({"kvcm.service.admin_auth_token", " a, b ,  c , "});
+        ASSERT_TRUE(config.Parse("", environ));
+        ASSERT_EQ(3u, config.GetAdminAuthTokens().size());
+        ASSERT_EQ("a", config.GetAdminAuthTokens()[0]);
+        ASSERT_EQ("b", config.GetAdminAuthTokens()[1]);
+        ASSERT_EQ("c", config.GetAdminAuthTokens()[2]);
+    }
+    // value of only whitespace and commas -> empty list
+    {
+        ServerConfig config;
+        std::unordered_map<std::string, std::string> environ;
+        environ.insert({"kvcm.registry_storage.uri", "redis://127.0.0.1"});
+        environ.insert({"kvcm.service.admin_auth_token", " , , "});
+        ASSERT_TRUE(config.Parse("", environ));
+        ASSERT_TRUE(config.GetAdminAuthTokens().empty());
     }
 }
 

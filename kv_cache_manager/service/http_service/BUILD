@@ -4,6 +4,21 @@ package(default_visibility = [
 ])
 
 cc_library(
+    name = "auth",
+    srcs = [
+        "auth/auth_util.cc",
+        "auth/static_bearer_token_verifier.cc",
+    ],
+    hdrs = [
+        "auth/auth_util.h",
+        "auth/static_bearer_token_verifier.h",
+        "auth/token_verifier.h",
+    ],
+    copts = ["-std=c++20"],
+    include_prefix = "service/http_service",
+)
+
+cc_library(
     name = "http_service",
     srcs = [
         "admin_service_http.cc",
@@ -23,6 +38,7 @@ cc_library(
     ],
     include_prefix = "service/http_service",
     deps = [
+        ":auth",
         "//kv_cache_manager/common:logger",
         "//kv_cache_manager/common:request_context",
         "//kv_cache_manager/config",
