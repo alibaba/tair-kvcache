@@ -1,43 +1,32 @@
 #pragma once
 
-#include <libnuraft/launcher.hxx>
-#include <libnuraft/raft_server.hxx>
-
 #include <atomic>
 #include <memory>
 #include <string>
 #include <vector>
 
-#include "kv_cache_manager/meta/meta_local_backend.h"
 #include "kv_cache_manager/meta/meta_storage_backend.h"
-#include "kv_cache_manager/meta/raft/meta_log_store.h"
-#include "kv_cache_manager/meta/raft/meta_state_machine.h"
-#include "kv_cache_manager/meta/raft/meta_state_mgr.h"
+#include "kv_cache_manager/meta/raft/raft_coordinator.h"
 
 namespace kv_cache_manager {
 namespace raft_meta {
 
-// MetaRaftBackend — replicated MetaStorageBackend driven by NuRaft.
+// MetaRaftBackend — replicated MetaStorageBackend driven by the *process-wide*
+// raft cluster owned by RaftCoordinator. One kvcm process is one raft node;
+// every Instance hosted in the process shares the same raft group via
+// RaftCoordinator and is isolated by op.instance_id at the state machine
+// (Instance isolation, see CLAUDE.md / phase plan).
 //
-// The state-of-the-world for the meta layer lives in a single MetaLocalBackend
-// owned by the inner state machine. Every external write turns into one log
-// entry, gets append_entries() to NuRaft, and is applied to the backend via
-// state_machine::commit() once committed by the cluster. Reads bypass the
-// raft path and go directly to the local backend so the leader's serving
-// path stays cheap (Phase 1 only the leader serves traffic; followers are
-// HA backups — see CLAUDE.md / phase plan).
-//
-// URI format (passed via MetaStorageBackendConfig::storage_uri):
-//   raft://0.0.0.0:9201?server_id=1
-//                      &peers=1@10.0.0.1:9201,2@10.0.0.2:9201,3@10.0.0.3:9201
-//                      &data_dir=/var/lib/kvcm/raft
-//                      &snapshot_distance=100000
-//                      &election_timeout_lower=300
-//                      &election_timeout_upper=600
-//                      &heart_beat_interval=100
-//                      &local_capacity=32768
-//                      &local_num_shard_bits=10
-//                      &local_sample_times=10
+// MetaRaftBackend is a thin per-Instance proxy:
+//   * Init pulls the singleton RaftCoordinator (set up by Server::Init in
+//     the raft branch). It does *not* own a raft_server, log store, state
+//     machine, or per-instance MetaLocalBackend — those all live in the
+//     coordinator and the state machine respectively.
+//   * Writes encode a LogOp tagged with this backend's instance_id, then
+//     hand it to coordinator->AppendAndWait. The state machine routes by
+//     instance_id when the entry commits.
+//   * Reads delegate straight to the per-instance backend that the state
+//     machine materialises on demand via the coordinator's factory closure.
 class MetaRaftBackend : public MetaStorageBackend {
 public:
     MetaRaftBackend();
@@ -64,7 +53,7 @@ public:
                                            const KeyTypeVec &keys,
                                            const LocationIdsPerKey &location_ids) noexcept override;
 
-    // Reads — served from the inner backend directly.
+    // Reads — served from the per-instance backend in the coordinator.
     std::vector<ErrorCode> Get(RequestContext *request_context,
                                const KeyTypeVec &keys,
                                CacheLocationMapVector &out_locations,
@@ -105,48 +94,28 @@ public:
     ErrorCode PutMetaData(const FieldMap &field_maps) noexcept override;
     ErrorCode GetMetaData(FieldMap &field_maps) noexcept override;
 
-    // Raft introspection — needed by callers (RaftLeaderElector in PR 4).
+    // Raft introspection — proxies to the coordinator. Useful for tests and
+    // diagnostics; production callers should query the coordinator directly.
     bool IsLeader() const;
     int32_t LeaderId() const;
-    int32_t ServerId() const { return server_id_; }
 
-    // Test hook: drives the state machine without an asio service. Used by
-    // unit tests that want to verify commit() dispatch without spinning up
-    // the full RPC stack.
-    nuraft::ptr<MetaStateMachine> StateMachineForTest() const { return state_machine_; }
+    // Test hook: lets unit tests inject a stack-allocated coordinator instead
+    // of relying on the process singleton. Must be called *before* Init.
+    void SetCoordinatorForTest(RaftCoordinator *coordinator) { coordinator_override_ = coordinator; }
 
 private:
-    struct ParsedRaftConfig {
-        int32_t server_id = 0;
-        std::string self_endpoint;
-        std::vector<PeerEntry> peers;
-        std::string data_dir;
-        int port = 0;
-        int snapshot_distance = 100000;
-        int election_timeout_lower = 300;
-        int election_timeout_upper = 600;
-        int heart_beat_interval = 100;
-        // Inner MetaLocalBackend tunables.
-        size_t local_capacity = 32 * 1024;
-        int32_t local_num_shard_bits = 10;
-        int32_t local_sample_times = 10;
-    };
+    // Resolve the coordinator we should talk to. Returns the test override if
+    // one is set, else the process singleton. Logs at error level when both
+    // are missing.
+    RaftCoordinator *Coordinator() const;
 
-    static bool ParseRaftConfig(const std::string &uri, ParsedRaftConfig &out);
-
-    // Append one already-encoded log entry and wait for the result.
-    ErrorCode AppendOneAndWait(nuraft::ptr<nuraft::buffer> data);
+    // Look up the per-instance backend for read-side delegation. Returns
+    // nullptr if the coordinator isn't installed; reads fall back to a
+    // vector of EC_ERROR / empty results in that case.
+    std::shared_ptr<MetaCacheBaseBackend> InstanceBackend() const;
 
     std::string instance_id_;
-    int32_t server_id_ = 0;
-    ParsedRaftConfig parsed_;
-
-    std::shared_ptr<MetaLocalBackend> local_backend_;
-    nuraft::ptr<MetaLogStore> log_store_;
-    nuraft::ptr<MetaStateMachine> state_machine_;
-    nuraft::ptr<MetaStateMgr> state_mgr_;
-    std::unique_ptr<nuraft::raft_launcher> launcher_;
-    nuraft::ptr<nuraft::raft_server> raft_server_;
+    RaftCoordinator *coordinator_override_ = nullptr;
     std::atomic<bool> opened_{false};
 };
 

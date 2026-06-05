@@ -46,3 +46,16 @@ cc_test(
         "@nuraft//:nuraft",
     ],
 )
+
+cc_test(
+    name = "raft_coordinator_test",
+    srcs = ["raft_coordinator_test.cc"],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/meta:cache_location",
+        "//kv_cache_manager/meta/raft:raft_coordinator",
+        "//kv_cache_manager/meta/raft:raft_log_codec",
+        "@nuraft//:nuraft",
+    ],
+)
