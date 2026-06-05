@@ -1,0 +1,95 @@
+# 3-node Raft cluster for KVCM HA testing.
+# No external dependencies (Redis, Nacos, etc.) required.
+#
+# Usage:
+#   cd deploy/raft-cluster
+#   docker compose up -d        # start cluster
+#   docker compose logs -f      # watch logs
+#   docker compose down -v      # tear down
+#
+# First start will build the binary (~5 min with warm Bazel cache).
+# Subsequent starts reuse the cached binary.
+
+x-kvcm-common: &kvcm-common
+  image: ${KVCM_DEV_IMAGE:-hub.docker.alibaba-inc.com/isearch/kv_cache_manager_dev:0.0.1.6}
+  entrypoint: ["/bin/bash", "/conf/entrypoint.sh"]
+  working_dir: /src
+  volumes:
+    # Source code (read-only)
+    - ${KVCM_SRC_DIR:-../..}:/src:ro
+    # Shared Bazel cache across all nodes (read-write)
+    - bazel-cache:/root/.cache/bazel
+    # Configuration files
+    - ./conf:/conf:ro
+    - ./entrypoint.sh:/conf/entrypoint.sh:ro
+  networks:
+    - kvcm-raft-net
+  restart: unless-stopped
+
+services:
+  kvcm-node1:
+    <<: *kvcm-common
+    hostname: kvcm-node1
+    container_name: kvcm-node1
+    environment:
+      NODE_CONF: /conf/node1.conf
+    ports:
+      - "6381:6381"   # MetaService RPC
+      - "6382:6382"   # MetaService HTTP
+      - "6491:6491"   # AdminService RPC
+      - "6492:6492"   # AdminService HTTP
+      - "9001:9001"   # Raft RPC
+    volumes:
+      - ${KVCM_SRC_DIR:-../..}:/src:ro
+      - bazel-cache:/root/.cache/bazel
+      - ./conf:/conf:ro
+      - ./entrypoint.sh:/conf/entrypoint.sh:ro
+      - node1-data:/data
+
+  kvcm-node2:
+    <<: *kvcm-common
+    hostname: kvcm-node2
+    container_name: kvcm-node2
+    environment:
+      NODE_CONF: /conf/node2.conf
+    ports:
+      - "6383:6381"
+      - "6384:6382"
+      - "6493:6491"
+      - "6494:6492"
+      - "9002:9002"
+    volumes:
+      - ${KVCM_SRC_DIR:-../..}:/src:ro
+      - bazel-cache:/root/.cache/bazel
+      - ./conf:/conf:ro
+      - ./entrypoint.sh:/conf/entrypoint.sh:ro
+      - node2-data:/data
+
+  kvcm-node3:
+    <<: *kvcm-common
+    hostname: kvcm-node3
+    container_name: kvcm-node3
+    environment:
+      NODE_CONF: /conf/node3.conf
+    ports:
+      - "6385:6381"
+      - "6386:6382"
+      - "6495:6491"
+      - "6496:6492"
+      - "9003:9003"
+    volumes:
+      - ${KVCM_SRC_DIR:-../..}:/src:ro
+      - bazel-cache:/root/.cache/bazel
+      - ./conf:/conf:ro
+      - ./entrypoint.sh:/conf/entrypoint.sh:ro
+      - node3-data:/data
+
+volumes:
+  bazel-cache:
+  node1-data:
+  node2-data:
+  node3-data:
+
+networks:
+  kvcm-raft-net:
+    driver: bridge
