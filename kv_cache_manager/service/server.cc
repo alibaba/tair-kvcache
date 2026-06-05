@@ -13,11 +13,12 @@
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/config/registry_raft_backend.h"
 #include "kv_cache_manager/config/registry_storage_backend_factory.h"
-#include "kv_cache_manager/meta/raft/raft_coordinator.h"
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/event/log_event_publisher.h"
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/manager/startup_config_loader.h"
+#include "kv_cache_manager/meta/meta_storage_backend_factory.h"
+#include "kv_cache_manager/meta/raft/raft_coordinator.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/metrics/metrics_reporter.h"
 #include "kv_cache_manager/metrics/metrics_reporter_factory.h"
@@ -47,9 +48,8 @@ bool Server::Init(const ServerConfig &config) {
 
     auto registry_storage_uri = config_.GetRegistryStorageUri();
     if (config_.IsRaftEnabled()) {
-        RegistryStorageBackendFactory::RegisterType("raft", [] {
-            return std::make_unique<RegistryRaftBackend>();
-        });
+        RegistryStorageBackendFactory::RegisterType("raft", [] { return std::make_unique<RegistryRaftBackend>(); });
+        MetaStorageBackendFactory::SetRaftModeEnabled(true);
         registry_storage_uri = "raft://";
     }
     registry_manager_.reset(new RegistryManager(registry_storage_uri, metrics_registry_));
@@ -334,8 +334,8 @@ bool Server::CreateRaftLeaderElector() {
 
     std::string node_id = config_.GetLeaderElectorNodeId();
     if (node_id.empty()) {
-        node_id = raft_host + ":" + std::to_string(config_.GetServiceAdminHttpPort())
-                  + "_" + StringUtil::GenerateRandomString(16);
+        node_id = raft_host + ":" + std::to_string(config_.GetServiceAdminHttpPort()) + "_" +
+                  StringUtil::GenerateRandomString(16);
     }
 
     NodeEndpointInfo node_info(node_id,
@@ -388,8 +388,7 @@ bool Server::CreateRaftLeaderElector() {
     raft_meta::RaftCoordinator::SetInstance(raft_coordinator_.get());
 
     leader_elector_ = elector;
-    KVCM_LOG_INFO("Raft leader elector created, server_id[%d] node_id[%s]",
-                  raft_cfg.server_id, node_id.c_str());
+    KVCM_LOG_INFO("Raft leader elector created, server_id[%d] node_id[%s]", raft_cfg.server_id, node_id.c_str());
     return true;
 }
 
@@ -411,10 +410,10 @@ bool Server::CreateLeaseLockLeaderElector() {
     }
 
     leader_elector_ = std::make_shared<LeaseLockLeaderElector>(coordination_backend_,
-                                                      kLeaderLockKey,
-                                                      node_id,
-                                                      config_.GetLeaderElectorLeaseMs(),
-                                                      config_.GetLeaderElectorLoopIntervalMs());
+                                                               kLeaderLockKey,
+                                                               node_id,
+                                                               config_.GetLeaderElectorLeaseMs(),
+                                                               config_.GetLeaderElectorLoopIntervalMs());
     leader_elector_->SetBecomeLeaderHandler([this]() { OnBecomeLeader(); });
     leader_elector_->SetNoLongerLeaderHandler([this]() { OnNoLongerLeader(); });
 

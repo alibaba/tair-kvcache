@@ -1,5 +1,7 @@
 #include "kv_cache_manager/meta/meta_storage_backend_factory.h"
 
+#include <atomic>
+
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/meta/common.h"
@@ -11,23 +13,39 @@
 
 namespace kv_cache_manager {
 
+static std::atomic<bool> g_raft_mode_enabled{false};
+
+void MetaStorageBackendFactory::SetRaftModeEnabled(bool enabled) {
+    g_raft_mode_enabled.store(enabled, std::memory_order_release);
+}
+
 std::unique_ptr<MetaStorageBackend>
 MetaStorageBackendFactory::CreateAndInitStorageBackend(const std::string &instance_id,
                                                        const std::shared_ptr<MetaStorageBackendConfig> &config) {
+    std::string storage_type = config->GetStorageType();
+    if (g_raft_mode_enabled.load(std::memory_order_acquire) && storage_type != META_DUMMY_BACKEND_TYPE_STR &&
+        storage_type != META_RAFT_BACKEND_TYPE_STR) {
+        KVCM_LOG_INFO("raft mode enabled, overriding meta storage type[%s] -> raft for instance[%s]",
+                      storage_type.c_str(),
+                      instance_id.c_str());
+        storage_type = META_RAFT_BACKEND_TYPE_STR;
+    }
+
     std::unique_ptr<MetaStorageBackend> storage_backend;
-    if (config->GetStorageType() == META_REDIS_BACKEND_TYPE_STR) {
+    if (storage_type == META_REDIS_BACKEND_TYPE_STR) {
         storage_backend = std::make_unique<MetaRedisBackend>();
-    } else if (config->GetStorageType() == META_LOCAL_BACKEND_TYPE_STR) {
+    } else if (storage_type == META_LOCAL_BACKEND_TYPE_STR) {
         storage_backend = std::make_unique<MetaLocalBackend>();
-    } else if (config->GetStorageType() == META_DUMMY_BACKEND_TYPE_STR) {
+    } else if (storage_type == META_DUMMY_BACKEND_TYPE_STR) {
         storage_backend = std::make_unique<MetaDummyBackend>();
+    } else if (storage_type == META_RAFT_BACKEND_TYPE_STR) {
+        storage_backend = std::make_unique<raft_meta::MetaRaftBackend>();
     } else {
-        KVCM_LOG_ERROR("meta storage backend create failed, unknown meta storage type[%s]",
-                       config->GetStorageType().c_str());
+        KVCM_LOG_ERROR("meta storage backend create failed, unknown meta storage type[%s]", storage_type.c_str());
         return nullptr;
     }
     if (storage_backend->Init(instance_id, config) != EC_OK) {
-        KVCM_LOG_ERROR("meta storage backend init failed, type[%s]", config->GetStorageType().c_str());
+        KVCM_LOG_ERROR("meta storage backend init failed, type[%s]", storage_type.c_str());
         return nullptr;
     }
     return storage_backend;
@@ -36,7 +54,15 @@ MetaStorageBackendFactory::CreateAndInitStorageBackend(const std::string &instan
 std::unique_ptr<MetaStorageBackend>
 MetaStorageBackendFactory::CreatePersistentBackend(const std::string &instance_id,
                                                    const std::shared_ptr<MetaStorageBackendConfig> &config) {
-    const std::string &storage_type = config->GetStorageType();
+    std::string storage_type = config->GetStorageType();
+    if (g_raft_mode_enabled.load(std::memory_order_acquire) && storage_type != META_DUMMY_BACKEND_TYPE_STR &&
+        storage_type != META_RAFT_BACKEND_TYPE_STR) {
+        KVCM_LOG_INFO("raft mode enabled, overriding persistent meta type[%s] -> raft for instance[%s]",
+                      storage_type.c_str(),
+                      instance_id.c_str());
+        storage_type = META_RAFT_BACKEND_TYPE_STR;
+    }
+
     std::unique_ptr<MetaStorageBackend> backend;
     if (storage_type == META_REDIS_BACKEND_TYPE_STR) {
         backend = std::make_unique<MetaRedisBackend>();
@@ -47,9 +73,8 @@ MetaStorageBackendFactory::CreatePersistentBackend(const std::string &instance_i
     } else if (storage_type == META_RAFT_BACKEND_TYPE_STR) {
         backend = std::make_unique<raft_meta::MetaRaftBackend>();
     } else {
-        KVCM_LOG_ERROR(
-            "create persistent backend failed, unsupported type[%s], expect redis/async_redis/raft or dummy",
-            storage_type.c_str());
+        KVCM_LOG_ERROR("create persistent backend failed, unsupported type[%s], expect redis/async_redis/raft or dummy",
+                       storage_type.c_str());
         return nullptr;
     }
     if (backend->Init(instance_id, config) != EC_OK) {
