@@ -140,11 +140,12 @@ ErrorCode RaftCoordinator::Start(const Config &config) {
 
     asio_service::options asio_opts;
     raft_server::init_options init_opts;
-    // skip_initial_election_timeout_ == true tells NuRaft to NOT start the
-    // election timer, so the node stays follower until it hears from a
-    // leader. We want that when joining an existing cluster (peers > 1);
-    // a fresh / single-node cluster must campaign on its own timeout.
-    init_opts.skip_initial_election_timeout_ = (config_.peers.size() > 1);
+    // Phase 1: all clusters are fresh (no persistent state). Every node
+    // must be allowed to campaign so that an initial leader can emerge.
+    // skip_initial_election_timeout_ = true would prevent all nodes from
+    // starting elections in a fresh cluster (no existing leader to send
+    // heartbeats). Leave it false.
+    init_opts.skip_initial_election_timeout_ = false;
 
     // Capture leadership callback at launcher init time. NuRaft has no
     // post-init way to install raft_callback_, so we read leadership_cb_

@@ -59,3 +59,15 @@ cc_test(
         "@nuraft//:nuraft",
     ],
 )
+
+cc_test(
+    name = "multi_node_raft_test",
+    srcs = ["multi_node_raft_test.cc"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/meta:cache_location",
+        "//kv_cache_manager/meta/raft:raft_coordinator",
+        "//kv_cache_manager/meta/raft:raft_log_codec",
+        "@nuraft//:nuraft",
+    ],
+)
