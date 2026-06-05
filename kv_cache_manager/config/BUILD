@@ -12,6 +12,22 @@ cc_library(
 )
 
 cc_library(
+    name = "raft_leader_elector",
+    srcs = [
+        "raft_leader_elector.cc",
+    ],
+    hdrs = [
+        "raft_leader_elector.h",
+        "node_endpoint_info.h",
+    ],
+    deps = [
+        ":leader_elector_interface",
+        "//kv_cache_manager/common",
+        "//kv_cache_manager/meta/raft:raft_coordinator",
+    ],
+)
+
+cc_library(
     name = "lease_lock_leader_elector",
     srcs = [
         "lease_lock_leader_elector.cc",

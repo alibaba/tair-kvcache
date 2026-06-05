@@ -144,6 +144,19 @@ cc_test(
 )
 
 cc_test(
+    name = "raft_leader_elector_test",
+    srcs = [
+        "raft_leader_elector_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config:raft_leader_elector",
+        "//kv_cache_manager/meta/raft:raft_coordinator",
+    ],
+)
+
+cc_test(
     name = "lease_lock_leader_elector_test",
     srcs = [
         "lease_lock_leader_elector_test.cc",
