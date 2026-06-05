@@ -26,7 +26,7 @@ ReadDecision LocalReplicaAffinityStrategy::ResolveRead(const ReadRequest &req, c
         const auto &cands = kv.second;
         const LocationSpec *picked = PickLocalSpec(cands, ctx);
         dec.picked_specs[spec_name] = picked;
-        if (picked != nullptr && !ctx.caller_node_id.empty() && picked->node_id() == ctx.caller_node_id) {
+        if (picked != nullptr && !ctx.caller_node.node_id.empty() && picked->node_id() == ctx.caller_node.node_id) {
             any_local = true;
         }
     }
@@ -34,7 +34,7 @@ ReadDecision LocalReplicaAffinityStrategy::ResolveRead(const ReadRequest &req, c
     // ==== Step 2: on_miss 路径 —— 决定是否产出 ReplicationHint ====
     // 这里包含机制层（sketch.Observe）+ 策略层（4 gate 判定）。
     // 算法内部封装：调用方（meta_searcher / cache_manager）完全不知道复制怎么算的。
-    if (!params_.enable_on_miss || ctx.caller_node_id.empty()) {
+    if (!params_.enable_on_miss || ctx.caller_node.node_id.empty()) {
         return dec;
     }
     // TODO: 当前用 any_local（任意 spec 在本地即跳过），对多 spec 场景存在
@@ -52,7 +52,7 @@ ReadDecision LocalReplicaAffinityStrategy::ResolveRead(const ReadRequest &req, c
     }
     // 喂 sketch（机制层，永远 active；只在远端命中时累加）
     if (params_.sketch != nullptr) {
-        params_.sketch->Observe(ctx.caller_node_id, req.block_key);
+        params_.sketch->Observe(ctx.caller_node.node_id, req.block_key);
     }
     if (ShouldEmitReplicationHint(req.block_key, /*has_local=*/false, req.winner_tier, ctx)) {
         // TODO: 当前只取 winner_tier 的第一个非空 URI 作为触发信号。
@@ -72,15 +72,15 @@ ReadDecision LocalReplicaAffinityStrategy::ResolveRead(const ReadRequest &req, c
             }
         }
         if (!source_uri.empty()) {
-            const bool allow =
-                params_.suppressor == nullptr
-                    ? true
-                    : params_.suppressor->TryEmit(req.block_key, ctx.caller_node_id, params_.suppression_window_ms);
+            const bool allow = params_.suppressor == nullptr
+                                   ? true
+                                   : params_.suppressor->TryEmit(
+                                         req.block_key, ctx.caller_node.node_id, params_.suppression_window_ms);
             if (allow) {
-                auto h = std::make_unique<ReplicationHint>();
+                auto h = std::make_unique<ReplicationHintSideEffect>();
                 h->block_key = req.block_key;
                 h->source_uri = std::move(source_uri);
-                h->target_node_id = ctx.caller_node_id;
+                h->target_node_id = ctx.caller_node.node_id;
                 dec.side_effects.push_back(std::move(h));
             }
         }
@@ -127,7 +127,7 @@ WriteDecision LocalReplicaAffinityStrategy::RunWritePipeline(const std::vector<s
     if (!params_.write_pipeline) {
         return dec; // 未配 write.ops ⇒ kOk + 无偏好（backend 自由放置）
     }
-    auto result = params_.write_pipeline->Apply(candidates, ctx.get_node_metrics, ctx.caller_node_id, ctx.trace_id);
+    auto result = params_.write_pipeline->Apply(candidates, ctx.get_node_metrics, ctx.caller_node, ctx.trace_id);
     if (result.status == CandidatePipeline::Status::kAbort) {
         dec.status = AffinityStatus::kAbort;
         return dec;
@@ -141,11 +141,11 @@ const LocationSpec *LocalReplicaAffinityStrategy::PickLocalSpec(const std::vecto
     if (candidates.empty()) {
         return nullptr;
     }
-    if (ctx.caller_node_id.empty()) {
+    if (ctx.caller_node.node_id.empty()) {
         return candidates.front(); // 空 caller ⇒ 退化为首到
     }
     for (const LocationSpec *s : candidates) {
-        if (s != nullptr && s->node_id() == ctx.caller_node_id) {
+        if (s != nullptr && s->node_id() == ctx.caller_node.node_id) {
             return s;
         }
     }
@@ -156,8 +156,8 @@ bool LocalReplicaAffinityStrategy::ShouldEmitReplicationHint(int64_t block_key,
                                                              bool has_local_in_picked,
                                                              const CacheLocation * /*winner_tier*/,
                                                              const StrategyContext &ctx) const {
-    // gate 1: caller_node_id 非空（ResolveRead 已检过，这里 belt-and-suspender）
-    if (ctx.caller_node_id.empty()) {
+    // gate 1: caller_node.node_id 非空（ResolveRead 已检过，这里 belt-and-suspender）
+    if (ctx.caller_node.node_id.empty()) {
         return false;
     }
     // gate 2: 没有本地 spec（ResolveRead 已检过）
@@ -168,13 +168,13 @@ bool LocalReplicaAffinityStrategy::ShouldEmitReplicationHint(int64_t block_key,
     if (params_.sketch == nullptr) {
         return false; // 没 sketch 拿不到计数，保守不发
     }
-    uint32_t cnt = params_.sketch->RemoteCount(ctx.caller_node_id, block_key);
+    uint32_t cnt = params_.sketch->RemoteCount(ctx.caller_node.node_id, block_key);
     if (cnt < params_.replication_hot_threshold) {
         return false;
     }
     // gate 4: caller 节点容量允许
     if (ctx.get_node_metrics) {
-        const NodeMetrics *m = ctx.get_node_metrics(ctx.caller_node_id);
+        const NodeMetrics *m = ctx.get_node_metrics(ctx.caller_node.node_id);
         if (m != nullptr) {
             const double thr = params_.caller_capacity_threshold - params_.caller_capacity_buffer;
             if (m->load_ratio > thr) {

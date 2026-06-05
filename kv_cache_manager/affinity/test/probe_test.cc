@@ -55,7 +55,7 @@ TEST_F(AffinityProbeTest, TlsStaleMetricsInWriteFilter) {
     mgr.UpsertNodeMetrics({"node_b", "node_b", 800000, 0.30, 0, 0, 1});
 
     AffinityResolveContext ctx;
-    ctx.caller_node_id = "node_a";
+    ctx.caller_node.node_id = "node_a";
     ctx.trace_id = "tls-probe-1";
 
     // First resolve: node_a at 0.50, passes filter → preferred
@@ -112,7 +112,7 @@ TEST_F(AffinityProbeTest, TlsStaleMetricsInReadCapacityGate) {
     winner.push_location_spec(LocationSpec("tp0", "tair://node_b/x", "node_b"));
 
     AffinityResolveContext ctx;
-    ctx.caller_node_id = "node_a";
+    ctx.caller_node.node_id = "node_a";
     ctx.trace_id = "tls-read-probe";
 
     // First read: threshold=1, load=0.30 < gate=0.80 → hint emitted
@@ -259,7 +259,7 @@ TEST_F(AffinityProbeTest, SketchSurvivesStrategyReload) {
     winner.push_location_spec(LocationSpec("tp0", "uri_b", "node_b"));
 
     AffinityResolveContext ctx;
-    ctx.caller_node_id = "node_a";
+    ctx.caller_node.node_id = "node_a";
     ctx.trace_id = "sketch-reload";
 
     // Accumulate 2 reads (count=2, below threshold=3)
@@ -333,7 +333,7 @@ TEST_F(AffinityProbeTest, ReadMultipleSpecNamesPickIndependently) {
     })"));
 
     AffinityResolveContext ctx;
-    ctx.caller_node_id = "node_a";
+    ctx.caller_node.node_id = "node_a";
     ctx.trace_id = "multi-spec";
 
     LocationSpec tp0_remote("tp0", "uri_b", "node_b");
@@ -374,7 +374,7 @@ TEST_F(AffinityProbeTest, WriteReflectsNodeAddRemove) {
     mgr.UpsertNodeMetrics({"node_b", "node_b", 800000, 0.20, 0, 0, 1});
 
     AffinityResolveContext ctx;
-    ctx.caller_node_id = "node_a";
+    ctx.caller_node.node_id = "node_a";
     ctx.trace_id = "node-remove";
 
     // Both nodes present: node_a preferred
@@ -479,11 +479,11 @@ TEST_F(AffinityProbeTest, StrategyMemoizationSharesParsedInstance) {
     // Two resolves with identical instance_strategy_json
     AffinityResolveContext ctx1;
     ctx1.instance_strategy_json = json;
-    ctx1.caller_node_id = "node_a";
+    ctx1.caller_node.node_id = "node_a";
 
     AffinityResolveContext ctx2;
     ctx2.instance_strategy_json = json;
-    ctx2.caller_node_id = "node_a";
+    ctx2.caller_node.node_id = "node_a";
 
     WriteDecision d1 = mgr.ResolveWrite(ctx1);
     WriteDecision d2 = mgr.ResolveWrite(ctx2);

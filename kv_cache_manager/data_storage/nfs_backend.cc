@@ -3,8 +3,10 @@
 #include <memory>
 #include <utility>
 
+#include "kv_cache_manager/affinity/node_metrics.h"
 #include "kv_cache_manager/common/hash/hash.h"
 #include "kv_cache_manager/common/logger.h"
+#include "kv_cache_manager/common/net_util.h"
 #include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
@@ -26,7 +28,10 @@ ErrorCode NfsBackend::DoOpen(const StorageConfig &storage_config, const std::str
         KVCM_LOG_WARN("unexpected config type, storage config: [%s]", storage_config.ToString().c_str());
         return EC_ERROR;
     }
-    KVCM_LOG_INFO("open nfs backend success, config: [%s]", spec_.ToString().c_str());
+    local_node_id_ = NetUtil::GetLocalIp();
+    KVCM_LOG_INFO("open nfs backend success, config: [%s], local_node_id: [%s]",
+                  spec_.ToString().c_str(),
+                  local_node_id_.c_str());
     SetOpen(true);
     SetAvailable(true);
     return EC_OK;
@@ -76,6 +81,25 @@ std::vector<std::pair<ErrorCode, DataStorageUri>> NfsBackend::Create(const std::
     return result;
 }
 
+std::vector<LocationDescriptor> NfsBackend::CreateWithHints(const std::vector<std::string> &keys,
+                                                            size_t size_per_key,
+                                                            const WriteHints &hints,
+                                                            bool /*strict*/,
+                                                            const std::string &trace_id,
+                                                            std::function<void()> cb) {
+    auto legacy = Create(keys, size_per_key, trace_id, std::move(cb));
+    std::vector<LocationDescriptor> out;
+    out.reserve(legacy.size());
+    const std::string preferred = hints.preferred_node_ids.empty() ? std::string() : hints.preferred_node_ids.front();
+    for (auto &p : legacy) {
+        if (!preferred.empty()) {
+            p.second.SetParam("preferred_node", preferred);
+        }
+        out.push_back(LocationDescriptor{p.first, std::move(p.second), preferred});
+    }
+    return out;
+}
+
 std::vector<ErrorCode> NfsBackend::Delete(const std::vector<DataStorageUri> &storage_uris,
                                           const std::string &trace_id,
                                           std::function<void()> cb) {
@@ -97,6 +121,17 @@ std::vector<ErrorCode> NfsBackend::UnLock(const std::vector<DataStorageUri> &sto
     std::vector<ErrorCode> result(storage_uris.size(), EC_OK);
     // not supported yet
     return result;
+}
+
+std::vector<NodeMetrics> NfsBackend::SnapshotPerNodeMetrics() const {
+    // 仅在 backend 已打开且本机 IP 缓存成功时上报, 避免污染节点表。
+    if (!IsOpen() || local_node_id_.empty()) {
+        return {};
+    }
+    NodeMetrics m;
+    m.node_id = local_node_id_;
+    m.node_name = local_node_id_;
+    return {std::move(m)};
 }
 
 } // namespace kv_cache_manager

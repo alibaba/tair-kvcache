@@ -329,7 +329,7 @@ std::unique_ptr<CandidatePipeline> CandidatePipeline::ParseJsonString(const std:
 CandidatePipeline::ApplyResult
 CandidatePipeline::Apply(const std::vector<std::string> &candidates,
                          const std::function<const NodeMetrics *(const std::string &)> &find_metrics,
-                         const std::string &caller_node_id,
+                         const CallerNode &caller,
                          const std::string &trace_id) const {
     ApplyResult r;
     r.nodes = candidates;
@@ -339,7 +339,7 @@ CandidatePipeline::Apply(const std::vector<std::string> &candidates,
     }
 
     if (prefer_local.has_value()) {
-        ApplyPreferLocal(*prefer_local, r.nodes, caller_node_id, &r);
+        ApplyPreferLocal(*prefer_local, r.nodes, caller.node_id, &r);
         if (r.status == Status::kAbort) {
             return r;
         }

@@ -60,9 +60,11 @@ ManagerClientImpl::MatchLocation(const std::string &trace_id,
                                  const std::vector<int64_t> &tokens,
                                  const BlockMask &block_mask,
                                  int32_t sw_size,
-                                 const std::vector<std::string> &location_spec_names) {
+                                 const std::vector<std::string> &location_spec_names,
+                                 std::vector<ReplicationHint> &out_hints) {
     CHECK_CLIENT_WITH_TYPE(meta_client_);
-    return meta_client_->MatchLocation(trace_id, query_type, keys, tokens, block_mask, sw_size, location_spec_names);
+    return meta_client_->MatchLocation(
+        trace_id, query_type, keys, tokens, block_mask, sw_size, location_spec_names, out_hints);
 }
 
 std::pair<ClientErrorCode, WriteLocation>

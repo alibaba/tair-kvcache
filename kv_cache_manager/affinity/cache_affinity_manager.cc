@@ -113,8 +113,7 @@ CacheAffinityManager::GetStrategy(const std::string &instance_strategy_json,
 
 StrategyContext CacheAffinityManager::BuildStrategyContext(const AffinityResolveContext &ctx) const {
     StrategyContext sctx;
-    sctx.caller_node_id = ctx.caller_node_id;
-    sctx.caller_supernode_id = ctx.caller_supernode_id;
+    sctx.caller_node = ctx.caller_node;
     sctx.instance_id = ctx.instance_id;
     sctx.instance_group_name = ctx.instance_group_name;
     sctx.trace_id = ctx.trace_id;
@@ -193,6 +192,25 @@ std::function<const NodeMetrics *(const std::string &)> CacheAffinityManager::Ma
     };
 }
 
+void CacheAffinityManager::PullMetricsOnce() {
+    if (!metrics_dsm_) {
+        return;
+    }
+    auto backends = metrics_dsm_->GetAvailableStorages();
+    for (const auto &backend : backends) {
+        if (!backend) {
+            continue;
+        }
+        auto snap = backend->SnapshotPerNodeMetrics();
+        for (auto &m : snap) {
+            if (m.node_id.empty()) {
+                continue;
+            }
+            UpsertNodeMetrics(m);
+        }
+    }
+}
+
 void CacheAffinityManager::StartMetricsPullLoop(std::shared_ptr<DataStorageManager> dsm, uint32_t interval_seconds) {
     if (metrics_thread_.joinable()) {
         return; // idempotent
@@ -200,23 +218,11 @@ void CacheAffinityManager::StartMetricsPullLoop(std::shared_ptr<DataStorageManag
     metrics_dsm_ = std::move(dsm);
     metrics_interval_seconds_ = interval_seconds == 0 ? 1 : interval_seconds;
     metrics_stop_.store(false);
+    // 同步预热, 确保返回时节点表已含 backend 默认节点(如 NfsBackend 本机 IP)。
+    PullMetricsOnce();
     metrics_thread_ = std::thread([this]() {
         while (!metrics_stop_.load()) {
-            if (metrics_dsm_) {
-                auto backends = metrics_dsm_->GetAvailableStorages();
-                for (const auto &backend : backends) {
-                    if (!backend) {
-                        continue;
-                    }
-                    auto snap = backend->SnapshotPerNodeMetrics();
-                    for (auto &m : snap) {
-                        if (m.node_id.empty()) {
-                            continue;
-                        }
-                        UpsertNodeMetrics(m);
-                    }
-                }
-            }
+            PullMetricsOnce();
             std::unique_lock<std::mutex> lock(metrics_cv_mu_);
             metrics_cv_.wait_for(
                 lock, std::chrono::seconds(metrics_interval_seconds_), [this]() { return metrics_stop_.load(); });

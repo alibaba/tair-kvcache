@@ -6,6 +6,8 @@
 #include <variant>
 #include <vector>
 
+#include "kv_cache_manager/common/affinity_types.h"
+
 namespace kv_cache_manager {
 
 enum [[nodiscard]] ClientErrorCode : int32_t{

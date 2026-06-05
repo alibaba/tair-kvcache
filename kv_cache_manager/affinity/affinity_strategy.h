@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "kv_cache_manager/affinity/node_metrics.h"
+#include "kv_cache_manager/common/affinity_types.h"
 #include "kv_cache_manager/data_storage/write_hints.h"
 #include "kv_cache_manager/meta/cache_location.h"
 
@@ -34,8 +35,7 @@ namespace kv_cache_manager {
 
 // 3 个一级行为共用的上下文信号（只含通用信号，不含任何算法特有机制）。
 struct StrategyContext {
-    std::string caller_node_id;
-    std::string caller_supernode_id;
+    CallerNode caller_node;
     std::string instance_id;
     std::string instance_group_name;
     std::string trace_id;
@@ -96,7 +96,7 @@ public:
     // 一级 toggle 是算法内部细节（如 LocalReplica 的 Params.enable_*），不暴露到
     // 接口；关闭的行为由对应 method 内部 short-circuit 成 no-op 决策。
 
-    // 写一级：把 caller_node_id 等信号转换为 WriteHints.preferred_node_ids。
+    // 写一级：把 caller_node 等信号转换为 WriteHints.preferred_node_ids。
     virtual WriteDecision ResolveWrite(const std::vector<std::string> &candidates,
                                        const StrategyContext &ctx) const = 0;
 
