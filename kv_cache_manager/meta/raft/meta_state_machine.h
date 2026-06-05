@@ -5,9 +5,12 @@
 #include <libnuraft/state_machine.hxx>
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
+#include <unordered_map>
 
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/meta/meta_cache_base_backend.h"
@@ -15,24 +18,34 @@
 namespace kv_cache_manager {
 namespace raft_meta {
 
-// MetaStateMachine wraps the in-memory MetaLocalBackend that holds the
-// authoritative meta state for the Raft group. Every replicated log entry is
-// decoded by raft_log_codec and dispatched to the backend's write API; reads
-// served by MetaRaftBackend bypass raft and hit this same backend directly
-// (linearisable on the leader by virtue of all writes flowing through here).
+// MetaStateMachine routes every replicated log entry (decoded via
+// raft_log_codec into a LogOp) to a per-instance MetaCacheBaseBackend. The
+// state machine is shared by every Instance hosted in this kvcm process — one
+// raft group per process, one in-memory backend per Instance, keys never leak
+// across Instances (Instance isolation, see CLAUDE.md).
 //
-// Snapshots are full-state dumps of the MetaLocalBackend, serialised to a
-// single file at <snapshot_dir>/snapshot_<last_log_idx>_<term>. Logical
-// snapshot transport is implemented as a single object: object id 0 carries
-// the complete snapshot bytes — simpler than chunking and adequate for the
-// metadata sizes Phase 1 targets.
+// Backends are created on demand: the first commit() that names a previously
+// unseen instance_id calls the supplied factory closure to materialise its
+// inner backend. This keeps the state machine decoupled from how Instances
+// are configured or registered — the RaftCoordinator owns the closure.
+//
+// Reads served by MetaRaftBackend bypass raft and hit the same per-instance
+// backend directly (linearisable on the leader since all writes flow here).
+//
+// Snapshots are a full dump of every per-instance backend, serialised into
+// one file at <snapshot_dir>/snapshot_<last_log_idx>_<term>. Logical snapshot
+// transport uses a single object (id 1 carries the bytes; id 0 is a
+// sentinel). Phase 1 metadata fits comfortably in one chunk; chunking is
+// future work alongside LMDB-backed log.
 class MetaStateMachine : public nuraft::state_machine {
 public:
-    // `backend` must be already-initialised and Open()ed; this state machine
-    // takes shared ownership and dispatches all writes to it.
-    // `snapshot_dir` is the directory where snapshot files live; created if
-    // missing.
-    MetaStateMachine(std::shared_ptr<MetaCacheBaseBackend> backend, std::string snapshot_dir);
+    // Factory closure: maps an instance_id to a fully-initialised backend
+    // for that Instance. Called under the state machine's internal lock; must
+    // be reentrancy-safe enough that the caller can serialise creation by
+    // Instance (the state machine memoises the result).
+    using BackendFactory = std::function<std::shared_ptr<MetaCacheBaseBackend>(const std::string &)>;
+
+    MetaStateMachine(BackendFactory factory, std::string snapshot_dir);
     ~MetaStateMachine() override;
 
     nuraft::ptr<nuraft::buffer> commit(const nuraft::ulong log_idx, nuraft::buffer &data) override;
@@ -55,24 +68,36 @@ public:
     nuraft::ptr<nuraft::snapshot> last_snapshot() override;
     nuraft::ulong last_commit_index() override;
 
-    // Direct access to the underlying meta backend — MetaRaftBackend uses it
-    // to serve reads without going through raft.
-    MetaCacheBaseBackend *backend() const { return backend_.get(); }
+    // Read access for one Instance — used by MetaRaftBackend to serve reads
+    // without going through raft. Returns nullptr if the Instance has never
+    // received a write (i.e. has no commit applied yet).
+    std::shared_ptr<MetaCacheBaseBackend> GetBackend(const std::string &instance_id) const;
+
+    // Lookup-or-create: same as GetBackend but materialises via the factory
+    // closure on miss. MetaRaftBackend uses this when it must answer reads
+    // for Instances that exist on the leader but haven't yet been observed
+    // by this state machine (e.g. a follower that just caught up).
+    std::shared_ptr<MetaCacheBaseBackend> GetOrCreateBackend(const std::string &instance_id);
 
 private:
-    // Encode the entire MetaLocalBackend state to a single byte buffer using
-    // the same serialisation primitives as raft_log_codec (length-prefixed
-    // entries, JSON for CacheLocation). Separate format from log entries so
-    // we can evolve them independently.
-    nuraft::ptr<nuraft::buffer> SerializeBackend() const;
-    // Reverse of SerializeBackend — clears the backend then reinserts.
-    bool DeserializeIntoBackend(nuraft::buffer &buf);
+    // Encode every per-instance backend into one buffer:
+    //   u8  version
+    //   u32 instance_count
+    //   for each instance: str instance_id, then the per-instance dump
+    //     (u32 key_count, [i64 key, locations, properties]*).
+    // Format diverges from raft_log_codec on purpose so the two can evolve
+    // independently.
+    nuraft::ptr<nuraft::buffer> SerializeAll() const;
+    bool DeserializeAll(nuraft::buffer &buf);
 
     std::string SnapshotPath(nuraft::ulong last_log_idx, nuraft::ulong term) const;
     static bool EnsureDir(const std::string &dir);
 
-    std::shared_ptr<MetaCacheBaseBackend> backend_;
+    BackendFactory backend_factory_;
     std::string snapshot_dir_;
+
+    mutable std::shared_mutex backends_mu_;
+    std::unordered_map<std::string, std::shared_ptr<MetaCacheBaseBackend>> backends_;
 
     mutable std::mutex snapshot_mutex_;
     nuraft::ptr<nuraft::snapshot> last_snapshot_;

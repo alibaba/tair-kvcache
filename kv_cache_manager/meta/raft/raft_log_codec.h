@@ -28,8 +28,14 @@ enum class OpType : uint8_t {
 // at the MetaStorageBackend boundary expand into one entry per key when the
 // backend is the raft variant. This keeps replay simple and lets us treat
 // each entry's commit() as an atomic state-machine step.
+//
+// instance_id scopes the op to one logical Instance: the state machine routes
+// each commit to a per-instance MetaLocalBackend, so multiple Instances can
+// share a single raft group without leaking keys across Instance boundaries
+// (Instance isolation is a hard constraint — see CLAUDE.md).
 struct LogOp {
     OpType type = OpType::kPut;
+    std::string instance_id;
 
     // For per-key ops (Put / Upsert / Delete / DeleteLocations / PutIfAbsent).
     KeyType key = 0;

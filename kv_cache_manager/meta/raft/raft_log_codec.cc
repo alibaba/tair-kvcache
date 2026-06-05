@@ -39,7 +39,7 @@ size_t EstimateLocationMapSize(const CacheLocationMap &locs) {
 }
 
 size_t EstimateLogOpSize(const LogOp &op) {
-    size_t total = 1 /*ver*/ + 1 /*op*/;
+    size_t total = 1 /*ver*/ + 1 /*op*/ + sizeof(uint32_t) + op.instance_id.size();
     switch (op.type) {
     case OpType::kPut:
     case OpType::kUpsert:
@@ -118,6 +118,7 @@ nuraft::ptr<nuraft::buffer> Encode(const LogOp &op) {
     nuraft::buffer_serializer bs(buf);
     bs.put_u8(kCodecVersion);
     bs.put_u8(static_cast<uint8_t>(op.type));
+    bs.put_str(op.instance_id);
     switch (op.type) {
     case OpType::kPut:
     case OpType::kUpsert:
@@ -153,6 +154,7 @@ ErrorCode Decode(nuraft::buffer &buf, LogOp &out) {
         }
         uint8_t op_raw = bs.get_u8();
         out.type = static_cast<OpType>(op_raw);
+        out.instance_id = bs.get_str();
         switch (out.type) {
         case OpType::kPut:
         case OpType::kUpsert:

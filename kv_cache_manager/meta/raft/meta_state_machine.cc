@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <utility>
+#include <vector>
 
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/meta/cache_location.h"
@@ -36,8 +37,8 @@ constexpr uint8_t kSnapshotVersion = 1;
 
 }
 
-MetaStateMachine::MetaStateMachine(std::shared_ptr<MetaCacheBaseBackend> backend, std::string snapshot_dir)
-    : backend_(std::move(backend)), snapshot_dir_(std::move(snapshot_dir)) {
+MetaStateMachine::MetaStateMachine(BackendFactory factory, std::string snapshot_dir)
+    : backend_factory_(std::move(factory)), snapshot_dir_(std::move(snapshot_dir)) {
     if (!EnsureDir(snapshot_dir_)) {
         KVCM_LOG_ERROR("MetaStateMachine: failed to create snapshot dir[%s]", snapshot_dir_.c_str());
     }
@@ -68,10 +69,51 @@ std::string MetaStateMachine::SnapshotPath(ulong last_log_idx, ulong term) const
     return snapshot_dir_ + "/snapshot_" + std::to_string(last_log_idx) + "_" + std::to_string(term);
 }
 
+std::shared_ptr<MetaCacheBaseBackend> MetaStateMachine::GetBackend(const std::string &instance_id) const {
+    std::shared_lock<std::shared_mutex> g(backends_mu_);
+    auto it = backends_.find(instance_id);
+    return it == backends_.end() ? nullptr : it->second;
+}
+
+std::shared_ptr<MetaCacheBaseBackend> MetaStateMachine::GetOrCreateBackend(const std::string &instance_id) {
+    {
+        std::shared_lock<std::shared_mutex> g(backends_mu_);
+        auto it = backends_.find(instance_id);
+        if (it != backends_.end()) {
+            return it->second;
+        }
+    }
+    std::unique_lock<std::shared_mutex> g(backends_mu_);
+    auto it = backends_.find(instance_id);
+    if (it != backends_.end()) {
+        return it->second;
+    }
+    if (!backend_factory_) {
+        KVCM_LOG_ERROR("MetaStateMachine: backend factory not set, cannot materialise instance[%s]",
+                       instance_id.c_str());
+        return nullptr;
+    }
+    auto backend = backend_factory_(instance_id);
+    if (!backend) {
+        KVCM_LOG_ERROR("MetaStateMachine: backend factory returned null for instance[%s]", instance_id.c_str());
+        return nullptr;
+    }
+    backends_.emplace(instance_id, backend);
+    return backend;
+}
+
 ptr<buffer> MetaStateMachine::commit(const ulong log_idx, buffer &data) {
     LogOp op;
     if (Decode(data, op) != EC_OK) {
         KVCM_LOG_ERROR("MetaStateMachine: corrupt log entry at idx[%lu]", log_idx);
+        last_commit_index_.store(log_idx);
+        return nullptr;
+    }
+
+    auto backend = GetOrCreateBackend(op.instance_id);
+    if (!backend) {
+        KVCM_LOG_ERROR("MetaStateMachine: no backend for instance[%s] at idx[%lu]",
+                       op.instance_id.c_str(), log_idx);
         last_commit_index_.store(log_idx);
         return nullptr;
     }
@@ -86,31 +128,31 @@ ptr<buffer> MetaStateMachine::commit(const ulong log_idx, buffer &data) {
         keys.push_back(op.key);
         locations.push_back(std::move(op.locations));
         properties.push_back(std::move(op.properties));
-        backend_->Put(nullptr, keys, locations, properties);
+        backend->Put(nullptr, keys, locations, properties);
         break;
     case OpType::kPutIfAbsent:
         keys.push_back(op.key);
         locations.push_back(std::move(op.locations));
         properties.push_back(std::move(op.properties));
-        backend_->PutIfAbsent(nullptr, keys, locations, properties);
+        backend->PutIfAbsent(nullptr, keys, locations, properties);
         break;
     case OpType::kUpsert:
         keys.push_back(op.key);
         locations.push_back(std::move(op.locations));
         properties.push_back(std::move(op.properties));
-        backend_->Upsert(nullptr, keys, locations, properties);
+        backend->Upsert(nullptr, keys, locations, properties);
         break;
     case OpType::kDelete:
         keys.push_back(op.key);
-        backend_->Delete(nullptr, keys);
+        backend->Delete(nullptr, keys);
         break;
     case OpType::kDeleteLocations:
         keys.push_back(op.key);
         location_ids.push_back(std::move(op.location_ids));
-        backend_->DeleteLocations(nullptr, keys, location_ids);
+        backend->DeleteLocations(nullptr, keys, location_ids);
         break;
     case OpType::kPutMetaData:
-        backend_->PutMetaData(op.meta_fields);
+        backend->PutMetaData(op.meta_fields);
         break;
     }
 
@@ -118,22 +160,17 @@ ptr<buffer> MetaStateMachine::commit(const ulong log_idx, buffer &data) {
     return nullptr;
 }
 
-ptr<buffer> MetaStateMachine::SerializeBackend() const {
-    // Layout:
-    //   u8 version
-    //   u32 key_count
-    //   for each key:
-    //     i64 key
-    //     u32 location_count
-    //     for each location: str id, str json
-    //     u32 property_count
-    //     for each property: str name, str value
+namespace {
+
+// Encode one MetaLocalBackend's state in the same layout as the previous
+// single-instance snapshot. Caller has already written the instance_id.
+void WriteOneInstance(buffer_serializer &bs, MetaCacheBaseBackend *backend) {
     KeyVector all_keys;
     std::string cursor = SCAN_BASE_CURSOR;
     do {
         std::string next_cursor;
         KeyVector page;
-        ErrorCode ec = backend_->ListKeys(nullptr, cursor, /*limit=*/4096, next_cursor, page);
+        ErrorCode ec = backend->ListKeys(nullptr, cursor, /*limit=*/4096, next_cursor, page);
         if (ec != EC_OK) {
             KVCM_LOG_ERROR("MetaStateMachine: ListKeys failed in snapshot, ec[%d]", ec);
             break;
@@ -144,25 +181,8 @@ ptr<buffer> MetaStateMachine::SerializeBackend() const {
 
     CacheLocationMapVector locs(all_keys.size());
     PropertyMapVector props(all_keys.size());
-    backend_->Get(nullptr, all_keys, locs, props);
+    backend->Get(nullptr, all_keys, locs, props);
 
-    // Estimate buffer size.
-    size_t total = 1 + sizeof(uint32_t);
-    for (size_t i = 0; i < all_keys.size(); ++i) {
-        total += sizeof(int64_t) + sizeof(uint32_t);
-        for (const auto &[id, loc] : locs[i]) {
-            total += sizeof(uint32_t) + id.size();
-            total += sizeof(uint32_t) + (loc ? loc->ToJsonString().size() : 0);
-        }
-        total += sizeof(uint32_t);
-        for (const auto &[k, v] : props[i]) {
-            total += sizeof(uint32_t) + k.size();
-            total += sizeof(uint32_t) + v.size();
-        }
-    }
-    ptr<buffer> out = buffer::alloc(total);
-    buffer_serializer bs(out);
-    bs.put_u8(kSnapshotVersion);
     bs.put_u32(static_cast<uint32_t>(all_keys.size()));
     for (size_t i = 0; i < all_keys.size(); ++i) {
         bs.put_i64(all_keys[i]);
@@ -171,8 +191,6 @@ ptr<buffer> MetaStateMachine::SerializeBackend() const {
             bs.put_str(id);
             bs.put_str(loc ? loc->ToJsonString() : std::string());
         }
-        // Strip the synthetic PROPERTY_LRU_TIME (added by Get) so reload
-        // doesn't pollute backend properties with derived state.
         size_t real_props = 0;
         for (const auto &[k, v] : props[i]) {
             if (k != PROPERTY_LRU_TIME) {
@@ -188,32 +206,62 @@ ptr<buffer> MetaStateMachine::SerializeBackend() const {
             bs.put_str(v);
         }
     }
-    return out;
 }
 
-bool MetaStateMachine::DeserializeIntoBackend(buffer &buf) {
-    buffer_serializer bs(buf);
-    uint8_t ver = bs.get_u8();
-    if (ver != kSnapshotVersion) {
-        KVCM_LOG_ERROR("MetaStateMachine: unknown snapshot version[%u]", ver);
-        return false;
-    }
+size_t EstimateOneInstanceSize(MetaCacheBaseBackend *backend) {
+    // Walk the same path as WriteOneInstance, but only sum sizes. Doubles the
+    // ListKeys cost for snapshot creation; acceptable for Phase 1 sizes.
+    KeyVector all_keys;
+    std::string cursor = SCAN_BASE_CURSOR;
+    do {
+        std::string next_cursor;
+        KeyVector page;
+        if (backend->ListKeys(nullptr, cursor, /*limit=*/4096, next_cursor, page) != EC_OK) {
+            break;
+        }
+        all_keys.insert(all_keys.end(), page.begin(), page.end());
+        cursor = next_cursor;
+    } while (cursor != SCAN_BASE_CURSOR);
 
-    // Wipe current state. Cheapest way without an explicit Clear API is to
-    // drain via ListKeys + Delete.
+    CacheLocationMapVector locs(all_keys.size());
+    PropertyMapVector props(all_keys.size());
+    backend->Get(nullptr, all_keys, locs, props);
+
+    size_t total = sizeof(uint32_t);
+    for (size_t i = 0; i < all_keys.size(); ++i) {
+        total += sizeof(int64_t) + sizeof(uint32_t);
+        for (const auto &[id, loc] : locs[i]) {
+            total += sizeof(uint32_t) + id.size();
+            total += sizeof(uint32_t) + (loc ? loc->ToJsonString().size() : 0);
+        }
+        total += sizeof(uint32_t);
+        for (const auto &[k, v] : props[i]) {
+            if (k == PROPERTY_LRU_TIME) {
+                continue;
+            }
+            total += sizeof(uint32_t) + k.size();
+            total += sizeof(uint32_t) + v.size();
+        }
+    }
+    return total;
+}
+
+bool ReadOneInstance(buffer_serializer &bs, MetaCacheBaseBackend *backend) {
+    // Drain whatever was there before — apply_snapshot semantics replace
+    // the whole state.
     KeyVector to_delete;
     std::string cursor = SCAN_BASE_CURSOR;
     do {
         std::string next_cursor;
         KeyVector page;
-        if (backend_->ListKeys(nullptr, cursor, 4096, next_cursor, page) != EC_OK) {
+        if (backend->ListKeys(nullptr, cursor, 4096, next_cursor, page) != EC_OK) {
             return false;
         }
         to_delete.insert(to_delete.end(), page.begin(), page.end());
         cursor = next_cursor;
     } while (cursor != SCAN_BASE_CURSOR);
     if (!to_delete.empty()) {
-        backend_->Delete(nullptr, to_delete);
+        backend->Delete(nullptr, to_delete);
     }
 
     uint32_t key_count = bs.get_u32();
@@ -245,13 +293,63 @@ bool MetaStateMachine::DeserializeIntoBackend(buffer &buf) {
         KeyVector keys{key};
         CacheLocationMapVector locs{std::move(loc_map)};
         PropertyMapVector props{std::move(prop_map)};
-        backend_->Put(nullptr, keys, locs, props);
+        backend->Put(nullptr, keys, locs, props);
+    }
+    return true;
+}
+
+} // namespace
+
+ptr<buffer> MetaStateMachine::SerializeAll() const {
+    // Snapshot a stable view of the instance map under the shared lock.
+    std::vector<std::pair<std::string, std::shared_ptr<MetaCacheBaseBackend>>> entries;
+    {
+        std::shared_lock<std::shared_mutex> g(backends_mu_);
+        entries.reserve(backends_.size());
+        for (const auto &[iid, b] : backends_) {
+            entries.emplace_back(iid, b);
+        }
+    }
+
+    size_t total = 1 /*ver*/ + sizeof(uint32_t) /*instance_count*/;
+    for (const auto &[iid, b] : entries) {
+        total += sizeof(uint32_t) + iid.size();
+        total += EstimateOneInstanceSize(b.get());
+    }
+    ptr<buffer> out = buffer::alloc(total);
+    buffer_serializer bs(out);
+    bs.put_u8(kSnapshotVersion);
+    bs.put_u32(static_cast<uint32_t>(entries.size()));
+    for (const auto &[iid, b] : entries) {
+        bs.put_str(iid);
+        WriteOneInstance(bs, b.get());
+    }
+    return out;
+}
+
+bool MetaStateMachine::DeserializeAll(buffer &buf) {
+    buffer_serializer bs(buf);
+    uint8_t ver = bs.get_u8();
+    if (ver != kSnapshotVersion) {
+        KVCM_LOG_ERROR("MetaStateMachine: unknown snapshot version[%u]", ver);
+        return false;
+    }
+    uint32_t instance_count = bs.get_u32();
+    for (uint32_t i = 0; i < instance_count; ++i) {
+        std::string instance_id = bs.get_str();
+        auto backend = GetOrCreateBackend(instance_id);
+        if (!backend) {
+            return false;
+        }
+        if (!ReadOneInstance(bs, backend.get())) {
+            return false;
+        }
     }
     return true;
 }
 
 void MetaStateMachine::create_snapshot(snapshot &s, async_result<bool>::handler_type &when_done) {
-    ptr<buffer> body = SerializeBackend();
+    ptr<buffer> body = SerializeAll();
     std::string path = SnapshotPath(s.get_last_log_idx(), s.get_last_log_term());
     {
         std::ofstream out(path + ".tmp", std::ios::binary | std::ios::trunc);
@@ -265,9 +363,6 @@ void MetaStateMachine::create_snapshot(snapshot &s, async_result<bool>::handler_
 
     if (ok) {
         std::lock_guard<std::mutex> g(snapshot_mutex_);
-        // We hold the cluster_config from the snapshot ref directly; raft
-        // owns the lifetime of the passed snapshot during this call but
-        // last_log_idx/term/config are plain values we copy.
         last_snapshot_ = cs_new<snapshot>(s.get_last_log_idx(),
                                           s.get_last_log_term(),
                                           s.get_last_config(),
@@ -291,7 +386,7 @@ bool MetaStateMachine::apply_snapshot(snapshot &s) {
     std::string raw = ss.str();
     ptr<buffer> buf = buffer::alloc(raw.size());
     std::memcpy(buf->data_begin(), raw.data(), raw.size());
-    if (!DeserializeIntoBackend(*buf)) {
+    if (!DeserializeAll(*buf)) {
         return false;
     }
 

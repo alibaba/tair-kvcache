@@ -35,6 +35,7 @@ LogOp DecodeBuffer(nuraft::ptr<nuraft::buffer> buf) {
 TEST_F(RaftLogCodecTest, PutRoundTrip) {
     LogOp op;
     op.type = OpType::kPut;
+    op.instance_id = "inst-A";
     op.key = 12345;
     op.locations.emplace("loc-a", MakeLocation("storage-a"));
     op.locations.emplace("loc-b", MakeLocation("storage-b"));
@@ -45,6 +46,7 @@ TEST_F(RaftLogCodecTest, PutRoundTrip) {
     LogOp decoded = DecodeBuffer(buf);
 
     EXPECT_EQ(OpType::kPut, decoded.type);
+    EXPECT_EQ("inst-A", decoded.instance_id);
     EXPECT_EQ(op.key, decoded.key);
     ASSERT_EQ(2u, decoded.locations.size());
     ASSERT_EQ(2u, decoded.properties.size());
@@ -57,12 +59,14 @@ TEST_F(RaftLogCodecTest, PutRoundTrip) {
 TEST_F(RaftLogCodecTest, UpsertRoundTrip) {
     LogOp op;
     op.type = OpType::kUpsert;
+    op.instance_id = "inst-U";
     op.key = 7;
     op.locations.emplace("loc-1", MakeLocation("s1"));
 
     auto buf = Encode(op);
     LogOp decoded = DecodeBuffer(buf);
     EXPECT_EQ(OpType::kUpsert, decoded.type);
+    EXPECT_EQ("inst-U", decoded.instance_id);
     EXPECT_EQ(7, decoded.key);
     ASSERT_EQ(1u, decoded.locations.size());
     EXPECT_EQ("s1", decoded.locations.at("loc-1")->id());
@@ -71,12 +75,14 @@ TEST_F(RaftLogCodecTest, UpsertRoundTrip) {
 TEST_F(RaftLogCodecTest, PutIfAbsentRoundTrip) {
     LogOp op;
     op.type = OpType::kPutIfAbsent;
+    op.instance_id = "inst-P";
     op.key = 99;
     op.properties.emplace("k", "v");
 
     auto buf = Encode(op);
     LogOp decoded = DecodeBuffer(buf);
     EXPECT_EQ(OpType::kPutIfAbsent, decoded.type);
+    EXPECT_EQ("inst-P", decoded.instance_id);
     EXPECT_EQ(99, decoded.key);
     ASSERT_EQ(1u, decoded.properties.size());
     EXPECT_EQ("v", decoded.properties.at("k"));
@@ -85,11 +91,13 @@ TEST_F(RaftLogCodecTest, PutIfAbsentRoundTrip) {
 TEST_F(RaftLogCodecTest, DeleteRoundTrip) {
     LogOp op;
     op.type = OpType::kDelete;
+    op.instance_id = "inst-D";
     op.key = -42;
 
     auto buf = Encode(op);
     LogOp decoded = DecodeBuffer(buf);
     EXPECT_EQ(OpType::kDelete, decoded.type);
+    EXPECT_EQ("inst-D", decoded.instance_id);
     EXPECT_EQ(-42, decoded.key);
     EXPECT_TRUE(decoded.locations.empty());
 }
@@ -97,12 +105,14 @@ TEST_F(RaftLogCodecTest, DeleteRoundTrip) {
 TEST_F(RaftLogCodecTest, DeleteLocationsRoundTrip) {
     LogOp op;
     op.type = OpType::kDeleteLocations;
+    op.instance_id = "inst-DL";
     op.key = 100;
     op.location_ids = {"loc-1", "loc-2", "loc-3"};
 
     auto buf = Encode(op);
     LogOp decoded = DecodeBuffer(buf);
     EXPECT_EQ(OpType::kDeleteLocations, decoded.type);
+    EXPECT_EQ("inst-DL", decoded.instance_id);
     EXPECT_EQ(100, decoded.key);
     ASSERT_EQ(3u, decoded.location_ids.size());
     EXPECT_EQ("loc-1", decoded.location_ids[0]);
@@ -113,12 +123,14 @@ TEST_F(RaftLogCodecTest, DeleteLocationsRoundTrip) {
 TEST_F(RaftLogCodecTest, PutMetaDataRoundTrip) {
     LogOp op;
     op.type = OpType::kPutMetaData;
+    op.instance_id = "inst-M";
     op.meta_fields.emplace("__key_count__", "1024");
     op.meta_fields.emplace("custom", "value");
 
     auto buf = Encode(op);
     LogOp decoded = DecodeBuffer(buf);
     EXPECT_EQ(OpType::kPutMetaData, decoded.type);
+    EXPECT_EQ("inst-M", decoded.instance_id);
     ASSERT_EQ(2u, decoded.meta_fields.size());
     EXPECT_EQ("1024", decoded.meta_fields.at("__key_count__"));
     EXPECT_EQ("value", decoded.meta_fields.at("custom"));
@@ -127,15 +139,29 @@ TEST_F(RaftLogCodecTest, PutMetaDataRoundTrip) {
 TEST_F(RaftLogCodecTest, EmptyMapsRoundTrip) {
     LogOp op;
     op.type = OpType::kPut;
+    op.instance_id = "inst-E";
     op.key = 1;
     // locations and properties intentionally empty
 
     auto buf = Encode(op);
     LogOp decoded = DecodeBuffer(buf);
     EXPECT_EQ(OpType::kPut, decoded.type);
+    EXPECT_EQ("inst-E", decoded.instance_id);
     EXPECT_EQ(1, decoded.key);
     EXPECT_TRUE(decoded.locations.empty());
     EXPECT_TRUE(decoded.properties.empty());
+}
+
+TEST_F(RaftLogCodecTest, EmptyInstanceIdRoundTrip) {
+    LogOp op;
+    op.type = OpType::kDelete;
+    op.key = 7;
+
+    auto buf = Encode(op);
+    LogOp decoded = DecodeBuffer(buf);
+    EXPECT_EQ(OpType::kDelete, decoded.type);
+    EXPECT_TRUE(decoded.instance_id.empty());
+    EXPECT_EQ(7, decoded.key);
 }
 
 TEST_F(RaftLogCodecTest, CorruptUnknownVersion) {
@@ -148,10 +174,22 @@ TEST_F(RaftLogCodecTest, CorruptUnknownVersion) {
 }
 
 TEST_F(RaftLogCodecTest, CorruptUnknownOpType) {
-    auto buf = nuraft::buffer::alloc(4);
+    // Build version + op + empty instance_id, then truncate after op so the
+    // unknown-op branch exercises the explicit default in the switch (the
+    // bs.get_str() for instance_id is allowed because we wrote an empty one).
+    LogOp probe;
+    probe.type = OpType::kPut;
+    probe.instance_id = "";
+    auto sample = Encode(probe);
+    nuraft::buffer_serializer bs_in(*sample);
+    (void)bs_in.get_u8();
+    (void)bs_in.get_u8();
+    (void)bs_in.get_str();
+    auto buf = nuraft::buffer::alloc(64);
     nuraft::buffer_serializer bs(buf);
     bs.put_u8(1);
-    bs.put_u8(0xEE); // unknown op type
+    bs.put_u8(0xEE);
+    bs.put_str(std::string());
     LogOp out;
     EXPECT_EQ(EC_CORRUPTION, Decode(*buf, out));
 }

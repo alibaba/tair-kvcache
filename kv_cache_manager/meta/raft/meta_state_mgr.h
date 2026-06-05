@@ -14,11 +14,16 @@ namespace kv_cache_manager {
 namespace raft_meta {
 
 // Description of one peer learned from KVCM config (id, endpoint, optional
-// learner flag). `endpoint` is the host:port the raft RPC layer will bind
-// /connect on — distinct from KVCM's gRPC service port.
+// learner flag, opaque aux). `endpoint` is the host:port the raft RPC layer
+// will bind/connect on — distinct from KVCM's gRPC service port. `aux` is
+// stored verbatim into srv_config and gets replicated through cluster_config
+// like everything else; we use it to carry a JSON-serialised
+// NodeEndpointInfo (gRPC port, HTTP port, …) so any peer can answer
+// "where's the leader's gRPC?" by reading the leader's srv_config.aux.
 struct PeerEntry {
     int32_t server_id = 0;
     std::string endpoint;
+    std::string aux;
     bool is_learner = false;
 };
 
@@ -32,6 +37,7 @@ class MetaStateMgr : public nuraft::state_mgr {
 public:
     MetaStateMgr(int32_t server_id,
                  std::string self_endpoint,
+                 std::string self_aux,
                  std::vector<PeerEntry> initial_peers,
                  std::string state_dir,
                  nuraft::ptr<nuraft::log_store> log_store);
@@ -61,6 +67,7 @@ private:
 
     int32_t server_id_;
     std::string self_endpoint_;
+    std::string self_aux_;
     std::vector<PeerEntry> initial_peers_;
     std::string state_dir_;
     nuraft::ptr<nuraft::log_store> log_store_;

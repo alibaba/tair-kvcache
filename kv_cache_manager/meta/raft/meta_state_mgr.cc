@@ -27,11 +27,13 @@ using nuraft::srv_state;
 
 MetaStateMgr::MetaStateMgr(int32_t server_id,
                            std::string self_endpoint,
+                           std::string self_aux,
                            std::vector<PeerEntry> initial_peers,
                            std::string state_dir,
                            ptr<log_store> log_store_arg)
     : server_id_(server_id),
       self_endpoint_(std::move(self_endpoint)),
+      self_aux_(std::move(self_aux)),
       initial_peers_(std::move(initial_peers)),
       state_dir_(std::move(state_dir)),
       log_store_(std::move(log_store_arg)) {
@@ -98,7 +100,12 @@ ptr<cluster_config> MetaStateMgr::BuildDefaultConfig() const {
     auto cfg = cs_new<cluster_config>();
     bool found_self = false;
     for (const auto &peer : initial_peers_) {
-        auto srv = cs_new<srv_config>(peer.server_id, 0, peer.endpoint, "", peer.is_learner);
+        // For the local node, prefer self_aux_ (authoritative locally) over
+        // anything the operator wrote into the peers list — they may have
+        // forgotten or mistyped it. Other peers' aux is replicated to us
+        // later by the leader once the cluster forms.
+        std::string aux = (peer.server_id == server_id_) ? self_aux_ : peer.aux;
+        auto srv = cs_new<srv_config>(peer.server_id, 0, peer.endpoint, aux, peer.is_learner);
         cfg->get_servers().push_back(srv);
         if (peer.server_id == server_id_) {
             found_self = true;
@@ -107,7 +114,7 @@ ptr<cluster_config> MetaStateMgr::BuildDefaultConfig() const {
     if (!found_self) {
         // Always include self even if caller forgot — without this NuRaft
         // refuses to start.
-        cfg->get_servers().push_back(cs_new<srv_config>(server_id_, self_endpoint_));
+        cfg->get_servers().push_back(cs_new<srv_config>(server_id_, 0, self_endpoint_, self_aux_, false));
     }
     return cfg;
 }
