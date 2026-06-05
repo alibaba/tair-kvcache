@@ -99,4 +99,26 @@ TEST_F(InstanceInfoTest, TestLocationSpecGroupSort) {
     }
 }
 
+TEST_F(InstanceInfoTest, TestMismatchFieldsIgnoresLocationSpecGroupOrder) {
+    constexpr int32_t kBlockSize = 64;
+    std::vector<LocationSpecGroup> stored_location_spec_groups = {
+        LocationSpecGroup("group_b", {"spec_b", "spec_a"}),
+        LocationSpecGroup("group_a", {"spec_d", "spec_c"}),
+    };
+    InstanceInfo instance_info(
+        "quota_group", "instance_group", "instance_id", kBlockSize, {}, {}, stored_location_spec_groups);
+
+    std::vector<LocationSpecGroup> same_location_spec_groups = {
+        LocationSpecGroup("group_b", {"spec_a", "spec_b"}),
+        LocationSpecGroup("group_a", {"spec_c", "spec_d"}),
+    };
+    auto mismatched = instance_info.MismatchFields(kBlockSize, {}, {}, same_location_spec_groups);
+    EXPECT_TRUE(mismatched.empty());
+
+    same_location_spec_groups[0].set_spec_names({"spec_a", "unexpected_spec"});
+    mismatched = instance_info.MismatchFields(kBlockSize, {}, {}, same_location_spec_groups);
+    ASSERT_EQ(1, mismatched.size());
+    EXPECT_EQ("location_spec_groups", mismatched[0]);
+}
+
 } // namespace kv_cache_manager
