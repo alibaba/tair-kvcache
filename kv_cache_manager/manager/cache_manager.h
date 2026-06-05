@@ -72,6 +72,7 @@ public:
     void StartRecoverRetryLoop();
     void StopRecoverRetryLoop();
     ErrorCode DoCleanup();
+    void CleanupWriteSessions();
     std::shared_ptr<RegistryManager> GetRegistryManager() { return registry_manager_; }
 
     std::pair<ErrorCode, std::string> RegisterInstance(RequestContext *request_context,

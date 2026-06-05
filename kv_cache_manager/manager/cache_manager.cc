@@ -1803,6 +1803,12 @@ ErrorCode CacheManager::DoCleanup() {
     return EC_OK;
 }
 
+void CacheManager::CleanupWriteSessions() {
+    if (write_location_manager_) {
+        write_location_manager_->DoCleanup();
+    }
+}
+
 std::unique_ptr<SelectLocationPolicy> CacheManager::genSelectLocationPolicy(RequestContext *request_context,
                                                                             const std::string &instance_id) const {
     const auto &trace_id = request_context->trace_id();

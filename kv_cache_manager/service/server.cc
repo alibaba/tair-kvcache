@@ -81,6 +81,18 @@ bool Server::Init(const ServerConfig &config) {
 
 void Server::OnBecomeLeader() {
     KVCM_LOG_INFO("Server promoted to leader, starting recover...");
+
+    if (config_.IsRaftEnabled() && !is_first_leader_election_) {
+        // Raft 非首次选举：state machine 数据一直在本地同步，
+        // MetaIndexer/MetaSearcher/DataStorage 从上次 leader 任期保留至今，
+        // 只需恢复 reclaimer 和开放请求。
+        cache_manager_->ResumeReclaimer();
+        meta_impl_->EnableLeaderOnlyRequests();
+        admin_impl_->EnableLeaderOnlyRequests();
+        KVCM_LOG_INFO("raft mode fast recover end");
+        return;
+    }
+
     ErrorCode ec = registry_manager_->DoRecover();
     if (ec != EC_OK) {
         KVCM_LOG_ERROR("registry_manager recover failed");
@@ -105,6 +117,7 @@ void Server::OnBecomeLeader() {
 
     meta_impl_->EnableLeaderOnlyRequests();
     admin_impl_->EnableLeaderOnlyRequests();
+    is_first_leader_election_ = false;
     KVCM_LOG_INFO("recover end");
 }
 
@@ -117,6 +130,14 @@ void Server::OnNoLongerLeader() {
 
     meta_impl_->WaitForAllLeaderOnlyRequestsToComplete();
     admin_impl_->WaitForAllLeaderOnlyRequestsToComplete();
+
+    if (config_.IsRaftEnabled()) {
+        // Raft 模式：只清理 write sessions（进行中的写会话不能跨 leader 继续），
+        // MetaIndexer/DataStorage/Registry 内存结构保持不变，state machine 持续 apply。
+        cache_manager_->CleanupWriteSessions();
+        KVCM_LOG_INFO("raft mode lightweight cleanup completed");
+        return;
+    }
 
     ErrorCode ec = cache_manager_->DoCleanup();
     if (ec != EC_OK) {

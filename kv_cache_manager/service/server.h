@@ -62,6 +62,7 @@ private:
 
     std::atomic<bool> stop_{false};
     bool is_startup_loaded_ = false;
+    bool is_first_leader_election_ = true;
     ServerConfig config_;
     std::shared_ptr<MetaServiceImpl> meta_impl_;
     std::shared_ptr<AdminServiceImpl> admin_impl_;
