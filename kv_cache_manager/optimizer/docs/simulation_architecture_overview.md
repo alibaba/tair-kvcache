@@ -294,6 +294,7 @@ storage pool tier -> storage pool tier
 ```text
 Request
   -> Infer Local Cache
+  -> Peer Infer Cache
   -> Shared Storage Pool
   -> Optional Promote
   -> Hit Rate Record
@@ -304,9 +305,10 @@ Request
 ```text
 1. 请求先进入某个推理实例。
 2. 先查询推理实例本地缓存。
-3. 本地未命中的部分继续查询共享 storage pool。
-4. 如果 storage pool 命中，可以根据策略选择是否提升回本地缓存。
-5. 最后记录本地命中、storage pool 命中和总命中。
+3. 本地未命中的部分继续查询同集群 peer 推理实例。
+4. local 和 peer 都未命中的部分继续查询共享 storage pool。
+5. peer 或 storage pool 命中后回填当前推理实例本地缓存。
+6. 最后记录本地命中、peer 命中、storage pool 命中和总命中。
 ```
 
 命中统计含义：
@@ -315,11 +317,14 @@ Request
 LocalHit
   推理实例本地缓存命中。
 
+PeerHit
+  同集群其他推理实例命中。
+
 RemoteHit
   共享 storage pool 命中。
 
 TotalHit
-  LocalHit + RemoteHit。
+  LocalHit + PeerHit + RemoteHit。
 ```
 
 ## 写路径

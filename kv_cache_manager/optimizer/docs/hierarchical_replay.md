@@ -19,8 +19,11 @@ bazel run //kv_cache_manager/optimizer:hierarchical_replay_main -- /path/to/hier
 - `infer_clusters[].tier_flows` 写满本地相邻层级的流动策略。
 - `infer_clusters[].storage_pool_flow` 定义该推理实例集群本地最后一层到 storage pool 的流动策略。这条边跨 engine manager 和 storage pool manager，不属于单个 optimizer instance group 的 `tier_flows`。
 - `infer_clusters[].p2p_read_flows` 可选定义同一个推理集群内的 peer read。P2P 位于 engine-local read 和 storage pool read 之间，命中计入 `PeerHit`，设计细节见 `docs/p2p_read.md`。
+- `infer_clusters[].active_windows` 可选定义推理实例在线时间段，字段为 `infer_id/start_ns/end_ns`；同一个 infer 可以配置多个窗口。`round_robin` 和 `prefix_hit` 只会在当前时间活跃的 infer 中选择实例，P2P 也只会查询当前活跃 peer。
+- `infer_active_windows_from_trace=true` 时，trace 的 `instance_id` 只用于推导每个 infer 的在线窗口，请求仍按 `infer_scheduling_strategy` 重新调度。该字段不能和 `infer_clusters[].active_windows` 同时使用。
+- 没有配置 `active_windows` 且没有开启 `infer_active_windows_from_trace` 时，`round_robin` / `prefix_hit` 将认为该 cluster 内所有 infer 全程在线。
 - `storage_pool` 描述 KVCM/storage pool；当前只支持单层 hash pool，不再复用普通 optimizer 的 `instance_groups/storages` 配置形态。
-- `infer_scheduling_strategy=preserve_trace` 时，标准 trace 的 `instance_id` 表示推理实例。
+- `infer_scheduling_strategy=preserve_trace` 时，标准 trace 的 `instance_id` 表示推理实例；未配置 `active_windows` 时，P2P 的活跃实例窗口从 trace 中该实例第一次和最后一次出现的时间推导。
 - `infer_scheduling_strategy=round_robin` 时，回放前按 get/write pair 轮询分配到推理实例；write 跟随前一个 get。
 - `infer_scheduling_strategy=prefix_hit` 时，每个 get 选择当前本地前缀命中最长的推理实例；冷启动或并列时按确定性轮询分配，write 跟随前一个 get。
 - `tier_flows` / `storage_pool_flow` 的 `write_mode`：
@@ -32,7 +35,7 @@ bazel run //kv_cache_manager/optimizer:hierarchical_replay_main -- /path/to/hier
   - storage pool 命中会固定回填 engine，后续同 engine 访问可直接命中本地缓存。
 - 每个 `infer_clusters[]` 通过 `storage_pool_id` 显式绑定一个 storage pool；重复推理实例、未知 storage pool 都会初始化失败。
 - 多个推理实例可以映射到同一个 storage pool；不同 storage pool 之间互相隔离。
-- `get` 先按 `engine_read_query_type` 查 engine 本地缓存，然后将完整 keys 传入 storage pool。trace 的 `query_type` 不会改写 engine-local 语义；它只决定 storage pool 侧使用 `prefix_match` 还是 `batch_get`。`query_type=prefix_match` 时，storage pool 按 prefix 语义推进，engine 已命中的 index 会跳过 pool remote hit 计数但允许 prefix 继续向后匹配；遇到 engine 和 storage pool 都未命中的 block 才停止。`query_type=batch_get` 时，storage pool 也逐 block 独立查询，engine 已命中的 index 不会重复计成 pool remote hit。
+- `get` 固定按 local、peer、pool 顺序执行：先按 `engine_read_query_type` 查当前推理实例所有本地 tier；local 未命中的 block 再按 `p2p_read_flows` 查同集群 peer；local 和 peer 都未命中的 block 最后查 storage pool。trace 的 `query_type` 不会改写 engine-local 语义；它只决定 storage pool 侧使用 `prefix_match` 还是 `batch_get`。`query_type=prefix_match` 时，storage pool 按 prefix 语义推进，local/peer 已命中的 index 会跳过 pool remote hit 计数但允许 prefix 继续向后匹配；遇到 local、peer、storage pool 都未命中的 block 才停止。`query_type=batch_get` 时，storage pool 逐 block 独立查询，local/peer 已命中的 index 不会重复计成 pool remote hit。
 - `write` 总是先写 engine instance；是否写入对应的 storage pool 由当前 infer cluster 的 `storage_pool_flow.write_mode` 决定。
 - write-through/cascading/selective 写入 storage pool 时只写真实进入 pool 的 block key。
 - combined 统计中 `LocalHit*` 表示 engine 本地命中，`PeerHit*` 表示同集群 peer 命中，`RemoteHit*` 表示 storage pool 命中，`Hit* = LocalHit* + PeerHit* + RemoteHit*`。未开启 P2P 时 `PeerHit*` 为 0。
@@ -41,6 +44,8 @@ bazel run //kv_cache_manager/optimizer:hierarchical_replay_main -- /path/to/hier
 输出：
 
 - `output_result_path/hierarchical_hit_rates.csv`：端到端 combined 结果，包含 `LocalHitBlocks` / `PeerHitBlocks` / `RemoteHitBlocks` / `HitBlocks`、对应 token 字段、当前与累计 token hit rate。
+- `output_result_path/hierarchical_read_io.csv`：读侧 IO 结果。`PeerTransferTokens` / `PoolTransferTokens` 只统计真正从 peer / storage pool 迁移回当前推理实例的 token；`PeerSourceInferId` 表示本次 P2P 读取来源；`LocalReadTokens` 是本地 cache 命中的读取量，不是跨实例或跨 pool 迁移。
+- `output_result_path/hierarchical_pool_write_io.csv`：写入 storage pool 的 IO 结果。`PoolWriteTokens` 只统计真实新增写入 pool 的 token；`PoolExistingTokens` 表示写入时 pool 已有副本的 token，不计入新增写入带宽。
 - `output_result_path/infer/`：推理侧独立统计，用于分析每个推理实例本地缓存；开启 `enable_lifecycle_tracking` 后也会输出 `*_lifecycle.csv`。
 - `storage_pool.output_result_path`：storage pool 侧独立统计，用于分析 KVCM/storage pool 池化层；开启 `enable_lifecycle_tracking` 后也会输出 `*_lifecycle.csv`。
 
@@ -51,6 +56,7 @@ bazel run //kv_cache_manager/optimizer:hierarchical_replay_main -- /path/to/hier
   "trace_file_path": "/path/to/standard_trace.jsonl",
   "output_result_path": "/tmp/hierarchical",
   "infer_scheduling_strategy": "preserve_trace",
+  "infer_active_windows_from_trace": false,
   "enable_lifecycle_tracking": false,
   "infer_eviction_params": {
     "eviction_mode": 3,
@@ -96,6 +102,18 @@ bazel run //kv_cache_manager/optimizer:hierarchical_replay_main -- /path/to/hier
         {
           "tier": "dram",
           "peer_read_touch_enabled": true
+        }
+      ],
+      "active_windows": [
+        {
+          "infer_id": "infer_a",
+          "start_ns": 0,
+          "end_ns": 3600000000000
+        },
+        {
+          "infer_id": "infer_b",
+          "start_ns": 1800000000000,
+          "end_ns": 7200000000000
         }
       ],
       "tiers": [

@@ -126,14 +126,21 @@
           <td class="phase">hierarchical engine hit</td>
           <td>hierarchical read 先查 engine-local 且命中</td>
           <td>engine 内部按 <code>engine_read_query_type</code> 查询并更新</td>
-          <td>engine 命中 index 集合作为 local mask 传入 storage pool</td>
+          <td>engine 命中 index 集合作为 local mask，后续 P2P 和 storage pool 都不重复计这些 block</td>
           <td>计入 <code>LocalHit</code></td>
+        </tr>
+        <tr>
+          <td class="phase">P2P read</td>
+          <td>engine-local 未命中的 block，且配置了 <code>p2p_read_flows</code></td>
+          <td>按配置顺序查询同集群 peer 的指定 tier；可按 <code>peer_read_touch_enabled</code> 刷新 peer tier 访问时间</td>
+          <td>P2P 命中回填当前 engine；回填是 promote/fill，不产生 write touch</td>
+          <td>计入 <code>PeerHit</code></td>
         </tr>
         <tr>
           <td class="phase">storage pool read</td>
           <td>hierarchical read 的完整 <code>keys</code> 进入 storage pool</td>
-          <td>engine miss block 按 trace <code>query_type</code> 在 pool 中查询；engine hit block 由 <code>local_read_touch_enabled</code> 决定是否刷新 pool 访问时间</td>
-          <td><code>prefix_match</code> 下 engine hit index 可让 prefix 继续向后推进，但不重复计 pool hit；<code>batch_get</code> 下逐 block 独立查询</td>
+          <td>local/peer 都未命中的 block 按 trace <code>query_type</code> 在 pool 中查询；local/peer 已命中 block 由 <code>local_read_touch_enabled</code> 决定是否刷新 pool 访问时间</td>
+          <td><code>prefix_match</code> 下 local/peer hit index 可让 prefix 继续向后推进，但不重复计 pool hit；<code>batch_get</code> 下逐 block 独立查询</td>
           <td>pool 命中计入 <code>RemoteHit</code></td>
         </tr>
         <tr>
