@@ -75,6 +75,7 @@ def http_deps():
     http_archive(
         name = "boost",
         urls = [
+            "https://boostorg.jfrog.io/artifactory/main/release/1.70.0/source/boost_1_70_0.tar.gz",
             "https://downloads.sourceforge.net/project/boost/boost/1.70.0/boost_1_70_0.tar.gz",
             "https://archives.boost.io/release/1.70.0/source/boost_1_70_0.tar.gz",
         ],
