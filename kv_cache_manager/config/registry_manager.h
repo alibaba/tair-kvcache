@@ -40,6 +40,12 @@ public:
     bool IsRecoverComplete() const;
     ErrorCode DoCleanup();
 
+    // Incremental update from Raft commit callback. Keeps in-memory state
+    // in sync on all nodes so DoRecover is unnecessary on re-election.
+    void OnRegistryCommit(bool is_save,
+                          const std::string &key,
+                          const std::map<std::string, std::string> &fields);
+
 public:
     ErrorCode AddStorage(RequestContext *request_context, const StorageConfig &storage_config);
     ErrorCode EnableStorage(RequestContext *request_context, const std::string &global_unique_name);

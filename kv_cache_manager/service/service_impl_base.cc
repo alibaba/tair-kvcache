@@ -43,4 +43,8 @@ void ServiceImplBase::DecrementRequestCount(bool is_leader_only) {
     }
 }
 
+bool ServiceImplBase::IsLeaderReady() const {
+    return is_accepting_leader_only_requests_.load(std::memory_order_acquire);
+}
+
 } // namespace kv_cache_manager

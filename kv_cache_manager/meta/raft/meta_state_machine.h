@@ -84,6 +84,15 @@ public:
     ErrorCode RegistryLoad(const std::string &key, std::map<std::string, std::string> &out) const;
     void RegistryClear();
 
+    // Callback fired after every registry commit (kRegistrySave/kRegistryDelete)
+    // on ALL nodes (leader and followers). Used to keep RegistryManager's
+    // in-memory state in sync without requiring DoRecover on re-election.
+    // is_save=true: key was saved with the given fields.
+    // is_save=false: key was deleted (fields is empty).
+    using RegistryCommitCallback =
+        std::function<void(bool is_save, const std::string &key, const std::map<std::string, std::string> &fields)>;
+    void SetRegistryCommitCallback(RegistryCommitCallback cb);
+
 private:
     // Encode every per-instance backend into one buffer:
     //   u8  version
@@ -116,6 +125,9 @@ private:
     // backends — this is global config, not per-instance cache metadata.
     mutable std::shared_mutex registry_mu_;
     std::unordered_map<std::string, std::map<std::string, std::string>> registry_store_;
+
+    std::mutex registry_cb_mu_;
+    RegistryCommitCallback registry_commit_cb_;
 };
 
 } // namespace raft_meta

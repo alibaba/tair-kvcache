@@ -132,6 +132,11 @@ public:
     // at launcher init time. Calling this after Start() is a no-op.
     void SetLeadershipCallback(LeadershipCallback cb);
 
+    // Registry commit callback passthrough. Must be called AFTER Start()
+    // (state machine exists only after BuildInner). Fires on every registry
+    // commit on all nodes (leader and followers).
+    void SetRegistryCommitCallback(MetaStateMachine::RegistryCommitCallback cb);
+
     // Test hook: lets unit tests drive the state machine without bringing the
     // raft launcher up. Returns the same state machine that Start() will
     // hand to the launcher.

@@ -250,6 +250,12 @@ std::string RaftCoordinator::GetPeerAux(int32_t server_id) const {
     return raft_server_->get_aux(server_id);
 }
 
+void RaftCoordinator::SetRegistryCommitCallback(MetaStateMachine::RegistryCommitCallback cb) {
+    if (state_machine_) {
+        state_machine_->SetRegistryCommitCallback(std::move(cb));
+    }
+}
+
 void RaftCoordinator::SetInstance(RaftCoordinator *coord) { g_instance.store(coord); }
 
 RaftCoordinator *RaftCoordinator::GetInstance() { return g_instance.load(); }

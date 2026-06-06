@@ -113,11 +113,22 @@ ptr<buffer> MetaStateMachine::commit(const ulong log_idx, buffer &data) {
     }
 
     if (op.type == OpType::kRegistrySave || op.type == OpType::kRegistryDelete) {
-        std::unique_lock<std::shared_mutex> g(registry_mu_);
-        if (op.type == OpType::kRegistrySave) {
-            registry_store_[op.registry_key] = std::move(op.registry_fields);
-        } else {
-            registry_store_.erase(op.registry_key);
+        bool is_save = (op.type == OpType::kRegistrySave);
+        std::map<std::string, std::string> fields_copy;
+        {
+            std::unique_lock<std::shared_mutex> g(registry_mu_);
+            if (is_save) {
+                registry_store_[op.registry_key] = op.registry_fields;
+                fields_copy = std::move(op.registry_fields);
+            } else {
+                registry_store_.erase(op.registry_key);
+            }
+        }
+        {
+            std::lock_guard<std::mutex> g(registry_cb_mu_);
+            if (registry_commit_cb_) {
+                registry_commit_cb_(is_save, op.registry_key, fields_copy);
+            }
         }
         last_commit_index_.store(log_idx);
         return nullptr;
@@ -549,6 +560,11 @@ ErrorCode MetaStateMachine::RegistryLoad(const std::string &key,
 void MetaStateMachine::RegistryClear() {
     std::unique_lock<std::shared_mutex> g(registry_mu_);
     registry_store_.clear();
+}
+
+void MetaStateMachine::SetRegistryCommitCallback(RegistryCommitCallback cb) {
+    std::lock_guard<std::mutex> g(registry_cb_mu_);
+    registry_commit_cb_ = std::move(cb);
 }
 
 } // namespace raft_meta

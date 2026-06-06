@@ -55,6 +55,14 @@ bool Server::Init(const ServerConfig &config) {
     registry_manager_.reset(new RegistryManager(registry_storage_uri, metrics_registry_));
     registry_manager_->Init();
 
+    if (config_.IsRaftEnabled() && raft_coordinator_) {
+        auto *rm = registry_manager_.get();
+        raft_coordinator_->SetRegistryCommitCallback(
+            [rm](bool is_save, const std::string &key, const std::map<std::string, std::string> &fields) {
+                rm->OnRegistryCommit(is_save, key, fields);
+            });
+    }
+
     cache_manager_.reset(new CacheManager(metrics_registry_, registry_manager_));
     cache_manager_->Init(config_.GetSchedulePlanExecutorThreadCount(),
                          config_.GetCacheReclaimerKeySamplingSizeTotal(),
@@ -83,13 +91,12 @@ void Server::OnBecomeLeader() {
     KVCM_LOG_INFO("Server promoted to leader, starting recover...");
 
     if (config_.IsRaftEnabled() && !is_first_leader_election_) {
-        // Raft 非首次选举：state machine 数据一直在本地同步，
-        // MetaIndexer/MetaSearcher/DataStorage 从上次 leader 任期保留至今，
-        // 只需恢复 reclaimer 和开放请求。
+        // Raft 非首次选举：RegistryManager 的内存状态已通过 commit callback
+        // 在 follower 期间持续同步，无需 DoRecover。
         cache_manager_->ResumeReclaimer();
         meta_impl_->EnableLeaderOnlyRequests();
         admin_impl_->EnableLeaderOnlyRequests();
-        KVCM_LOG_INFO("raft mode fast recover end");
+        KVCM_LOG_INFO("raft mode fast recover end (zero-cost)");
         return;
     }
 
@@ -386,10 +393,8 @@ bool Server::CreateRaftLeaderElector() {
         raft_cfg.peers.push_back(ps);
     }
 
-    // Create and start the coordinator before the elector, because the
-    // elector's Start() installs a leadership callback that must be
-    // captured at coordinator Start() time.
     raft_coordinator_ = std::make_shared<raft_meta::RaftCoordinator>();
+    raft_meta::RaftCoordinator::SetInstance(raft_coordinator_.get());
 
     auto elector = std::make_shared<RaftLeaderElector>(node_id);
     elector->SetBecomeLeaderHandler([this]() { OnBecomeLeader(); });
@@ -397,6 +402,7 @@ bool Server::CreateRaftLeaderElector() {
 
     if (!elector->Start()) {
         KVCM_LOG_ERROR("RaftLeaderElector Start failed");
+        raft_meta::RaftCoordinator::SetInstance(nullptr);
         return false;
     }
     elector->SetSelfNodeInfo(node_info);
@@ -404,9 +410,9 @@ bool Server::CreateRaftLeaderElector() {
     ErrorCode rc = raft_coordinator_->Start(raft_cfg);
     if (rc != EC_OK) {
         KVCM_LOG_ERROR("RaftCoordinator Start failed, rc=%d", rc);
+        raft_meta::RaftCoordinator::SetInstance(nullptr);
         return false;
     }
-    raft_meta::RaftCoordinator::SetInstance(raft_coordinator_.get());
 
     leader_elector_ = elector;
     KVCM_LOG_INFO("Raft leader elector created, server_id[%d] node_id[%s]", raft_cfg.server_id, node_id.c_str());
