@@ -55,7 +55,7 @@
         if ((single_field)) {                                                                                          \
             invalid_fields += "{" api_name ": {" manager_req "}}";                                                     \
         } else {                                                                                                       \
-            /* invalid_fields 已在ValidateRequiredFields构造完成 */                                              \
+            /* invalid_fields 已在ValidateRequiredFields构造完成 */                                                    \
         }                                                                                                              \
         status->set_code(proto::admin::INVALID_ARGUMENT);                                                              \
         status->set_message(invalid_fields);                                                                           \
@@ -1014,9 +1014,7 @@ void AdminServiceImpl::SetAdminAuthTokens(RequestContext *request_context,
     }
     std::vector<std::string> tokens(request->tokens().begin(), request->tokens().end());
     // drop empty entries to match config-file parsing semantics
-    tokens.erase(std::remove_if(tokens.begin(),
-                                tokens.end(),
-                                [](const std::string &s) { return s.empty(); }),
+    tokens.erase(std::remove_if(tokens.begin(), tokens.end(), [](const std::string &s) { return s.empty(); }),
                  tokens.end());
     const std::size_t count = tokens.size();
     token_verifier_->SetTokens(std::move(tokens));
@@ -1066,9 +1064,7 @@ void AdminServiceImpl::RotateAdminAuthToken(RequestContext *request_context,
     status->set_code(proto::admin::OK);
     request_context->set_status_code(status->code());
     status->set_message("admin auth tokens rotated");
-    KVCM_LOG_INFO("[traceId: %s] RotateAdminAuthToken applied count=%zu",
-                  request->trace_id().c_str(),
-                  count);
+    KVCM_LOG_INFO("[traceId: %s] RotateAdminAuthToken applied count=%zu", request->trace_id().c_str(), count);
 }
 
 void AdminServiceImpl::ListAdminAuthTokens(RequestContext *request_context,

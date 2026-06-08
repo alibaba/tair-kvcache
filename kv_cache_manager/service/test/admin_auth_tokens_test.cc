@@ -70,7 +70,7 @@ TEST_F(AdminAuthTokensTest, SetAdminAuthTokens_AppliesAndDropsEmpty) {
     proto::admin::SetAdminAuthTokensRequest req;
     req.set_trace_id("t-set-1");
     req.add_tokens("alpha");
-    req.add_tokens("");      // dropped
+    req.add_tokens(""); // dropped
     req.add_tokens("beta");
     proto::admin::CommonResponse resp;
     auto ctx = MakeContext(req.trace_id());

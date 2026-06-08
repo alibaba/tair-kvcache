@@ -24,10 +24,10 @@ AdminServiceHttp::AdminServiceHttp(std::shared_ptr<MetricsRegistry> metrics_regi
                                    std::shared_ptr<AdminServiceImpl> admin_service_impl,
                                    bool enable_prometheus,
                                    const std::string &prometheus_prefix)
-    : metrics_registry_(std::move(metrics_registry)),
-      admin_service_impl_(std::move(admin_service_impl)),
-      enable_prometheus_(enable_prometheus),
-      prometheus_prefix_(prometheus_prefix) {}
+    : metrics_registry_(std::move(metrics_registry))
+    , admin_service_impl_(std::move(admin_service_impl))
+    , enable_prometheus_(enable_prometheus)
+    , prometheus_prefix_(prometheus_prefix) {}
 
 void AdminServiceHttp::Init() {
     // for storage APIs
@@ -146,8 +146,7 @@ void AdminServiceHttp::RegisterHandler() {
                        [this](coro_http::coro_http_request &req,
                               coro_http::coro_http_response &res) -> async_simple::coro::Lazy<void> {
                            proto::admin::CheckHealthRequest request;
-                           request.set_trace_id("kvcm-healthy-" +
-                                                std::to_string(TimestampUtil::GetCurrentTimeMs()));
+                           request.set_trace_id("kvcm-healthy-" + std::to_string(TimestampUtil::GetCurrentTimeMs()));
                            proto::admin::CheckHealthResponse response;
 
                            this->CheckHealth(req.get_conn(), &request, &response);
@@ -165,8 +164,7 @@ void AdminServiceHttp::RegisterHandler() {
                            if (!ProtoMessageJsonUtil::ToJson(&response, body)) {
                                body = R"({"status":"FAIL"})";
                            }
-                           res.set_status_and_content(coro_http::status_type::service_unavailable,
-                                                      std::move(body));
+                           res.set_status_and_content(coro_http::status_type::service_unavailable, std::move(body));
                            co_return;
                        });
 
@@ -184,8 +182,7 @@ void AdminServiceHttp::RegisterHandler() {
     REGISTER_HTTP_HANDLER_FOR_ADMIN_SERVICE(Post, updateLogger, UpdateLogger, Common, UpdateLogger);
 
     // admin auth token management APIs (runtime only)
-    REGISTER_HTTP_HANDLER_FOR_ADMIN_SERVICE(
-        Post, setAdminAuthTokens, SetAdminAuthTokens, Common, SetAdminAuthTokens);
+    REGISTER_HTTP_HANDLER_FOR_ADMIN_SERVICE(Post, setAdminAuthTokens, SetAdminAuthTokens, Common, SetAdminAuthTokens);
     REGISTER_HTTP_HANDLER_FOR_ADMIN_SERVICE(
         Post, rotateAdminAuthToken, RotateAdminAuthToken, Common, RotateAdminAuthToken);
     REGISTER_HTTP_HANDLER_FOR_ADMIN_SERVICE(
