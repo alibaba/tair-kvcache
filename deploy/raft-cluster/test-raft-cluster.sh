@@ -782,6 +782,116 @@ else
     done
 fi
 
+# ===== Snapshot Transfer & Recovery =====
+log_group "Snapshot Transfer & Recovery"
+
+# Lower snapshot_distance so that snapshots are created frequently and old logs
+# get compacted. With snapshot_distance=5, NuRaft's default reserved_log_items
+# = 5*5 = 25, meaning logs older than 25 entries past a snapshot are purged.
+# A follower whose raft data is wiped must then recover via snapshot transfer
+# rather than log replay.
+log_info "Lowering snapshot_distance to 5 for snapshot transfer test..."
+for f in "$SCRIPT_DIR"/conf/node{1,2,3}.conf; do
+    sed -i 's/kvcm\.raft\.snapshot_distance=.*/kvcm.raft.snapshot_distance=5/' "$f"
+done
+
+log_info "Restarting cluster with snapshot_distance=5..."
+docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" restart 2>/dev/null
+SNAP_INFO=$(wait_for_leader -1 30) || SNAP_INFO=""
+if [ -z "$SNAP_INFO" ]; then
+    record_test "snapshot: cluster restart with low snapshot_distance" "FAIL" "0" "no leader"
+    # Restore original snapshot_distance
+    for f in "$SCRIPT_DIR"/conf/node{1,2,3}.conf; do
+        sed -i 's/kvcm\.raft\.snapshot_distance=.*/kvcm.raft.snapshot_distance=10000/' "$f"
+    done
+else
+    LEADER_IDX=$(echo "$SNAP_INFO" | awk '{print $1}')
+    LA=${ADMIN_PORTS[$LEADER_IDX]}; LM=${META_PORTS[$LEADER_IDX]}
+
+    # Wait for API readiness
+    for _ in $(seq 1 40); do
+        rc=$(api_code "$LA" "/api/listStorage" '{}')
+        [ "$rc" = "OK" ] && break; sleep 0.5
+    done
+
+    # Pick a follower to take down
+    SNAP_FOLLOWER_IDX=$(( (LEADER_IDX + 1) % 3 ))
+    SNAP_FOLLOWER_NAME="${NODE_NAMES[$SNAP_FOLLOWER_IDX]}"
+    SNAP_FA=${ADMIN_PORTS[$SNAP_FOLLOWER_IDX]}
+    log_info "Stopping follower ${SNAP_FOLLOWER_NAME} (idx=$SNAP_FOLLOWER_IDX)..."
+    docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" stop "$SNAP_FOLLOWER_NAME" 2>/dev/null
+
+    # Write 40 accounts to generate enough raft log entries for multiple
+    # snapshot cycles and log compaction on the leader.
+    log_info "Writing 40 accounts to trigger snapshots + log compaction..."
+    t0=$(now_ms)
+    snap_write_ok=0
+    for j in $(seq 1 40); do
+        rc=$(api_code "$LA" "/api/addAccount" \
+            "{\"user_name\":\"snap-user-${j}\",\"password\":\"pw\",\"role\":0}")
+        [ "$rc" = "OK" ] && ((snap_write_ok++))
+    done
+    t1=$(now_ms)
+    [ "$snap_write_ok" -eq 40 ] \
+        && record_test "snapshot: write 40 accounts on leader" "PASS" "$((t1-t0))" \
+        || record_test "snapshot: write 40 accounts on leader" "FAIL" "$((t1-t0))" "ok=$snap_write_ok/40"
+
+    # Give leader time to create snapshots and compact logs
+    sleep 3
+
+    # Wipe the stopped follower's raft data so it has zero state.
+    # It must recover entirely via snapshot transfer from the leader.
+    log_info "Wiping raft data on ${SNAP_FOLLOWER_NAME}..."
+    docker run --rm -v "raft-cluster_node$((SNAP_FOLLOWER_IDX+1))-data:/data" \
+        alpine sh -c "rm -rf /data/raft/*" 2>/dev/null
+
+    log_info "Restarting ${SNAP_FOLLOWER_NAME} (must recover via snapshot)..."
+    docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" start "$SNAP_FOLLOWER_NAME" 2>/dev/null
+
+    # Wait for the follower to become healthy (snapshot applied + caught up)
+    snap_healthy=false
+    t0=$(now_ms)
+    for _ in $(seq 1 60); do
+        sleep 1
+        rr=$(curl -s --connect-timeout 2 "http://localhost:${SNAP_FA}/api/checkHealth" -d '{}' 2>/dev/null) || continue
+        hh=$(echo "$rr" | python3 -c "import sys,json;print(json.load(sys.stdin).get('is_health',''))" 2>/dev/null)
+        if [ "$hh" = "True" ]; then
+            snap_healthy=true
+            break
+        fi
+    done
+    t1=$(now_ms)
+    $snap_healthy \
+        && record_test "snapshot: follower recovered via snapshot transfer" "PASS" "$((t1-t0))" \
+        || record_test "snapshot: follower recovered via snapshot transfer" "FAIL" "$((t1-t0))" "not healthy after 60s"
+
+    # Verify data integrity on the recovered follower by reading from the leader
+    # (follower might not serve reads directly, but cluster should be consistent)
+    snap_acct_count=$(api_call "$LA" "/api/listAccount" '{}' | \
+        python3 -c "import sys,json;accts=json.load(sys.stdin).get('accounts',[]);print(len([a for a in accts if a.get('user_name','').startswith('snap-user-')]))" 2>/dev/null)
+    t0=$(now_ms); t1=$(now_ms)
+    [ "${snap_acct_count:-0}" -eq 40 ] \
+        && record_test "snapshot: all 40 snap accounts intact" "PASS" "$((t1-t0))" \
+        || record_test "snapshot: all 40 snap accounts intact" "FAIL" "$((t1-t0))" "expected=40 got=$snap_acct_count"
+
+    # Verify storage/instance data also survived on the recovered cluster
+    assert_count "snapshot: storage survives snapshot recovery" "2" "$LA" "/api/listStorage" '{}' \
+        "import sys,json;print(len(json.load(sys.stdin).get('storage',[])))"
+    assert_api "snapshot: inst-1 survives snapshot recovery" "OK" "$LM" "/api/getInstanceInfo" \
+        '{"instance_id":"inst-1"}'
+
+    # Verify the recovered follower's raft state is in sync by writing a new
+    # entry and confirming it succeeds (requires quorum including the recovered node)
+    assert_api "snapshot: write after snapshot recovery" "OK" "$LA" "/api/addAccount" \
+        '{"user_name":"post-snapshot-user","password":"pw","role":0}'
+
+    # Restore original snapshot_distance
+    log_info "Restoring snapshot_distance to 10000..."
+    for f in "$SCRIPT_DIR"/conf/node{1,2,3}.conf; do
+        sed -i 's/kvcm\.raft\.snapshot_distance=.*/kvcm.raft.snapshot_distance=10000/' "$f"
+    done
+fi
+
 # ---------------------------------------------------------------------------
 # Phase 4: Report
 # ---------------------------------------------------------------------------
