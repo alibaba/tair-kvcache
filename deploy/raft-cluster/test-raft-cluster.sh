@@ -436,6 +436,352 @@ else
     record_test "Third leader elected" "FAIL" "0" "skipped (no 2nd leader)"
 fi
 
+# ===== Restore Cluster for Advanced Tests =====
+log_group "Cluster Restore"
+log_info "Restarting all stopped nodes..."
+for i in 0 1 2; do
+    docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" start "${NODE_NAMES[$i]}" 2>/dev/null
+done
+sleep 5
+
+# Re-discover leader
+RESTORE_INFO=$(wait_for_leader -1 30) || RESTORE_INFO=""
+if [ -n "$RESTORE_INFO" ]; then
+    LEADER_IDX=$(echo "$RESTORE_INFO" | awk '{print $1}')
+    LA=${ADMIN_PORTS[$LEADER_IDX]}; LM=${META_PORTS[$LEADER_IDX]}
+
+    # Wait for leader API readiness
+    for _ in $(seq 1 40); do
+        resp=$(api_call "$LA" "/api/listStorage" '{}')
+        code=$(echo "$resp" | python3 -c "import sys,json;print(json.load(sys.stdin).get('header',{}).get('status',{}).get('code',''))" 2>/dev/null)
+        cnt=$(echo "$resp" | python3 -c "import sys,json;print(len(json.load(sys.stdin).get('storage',[])))" 2>/dev/null)
+        [ "$code" = "OK" ] && [ "${cnt:-0}" -ge 1 ] && break
+        sleep 0.5
+    done
+
+    healthy=0
+    for i in 0 1 2; do
+        rr=$(curl -s --connect-timeout 2 http://localhost:${ADMIN_PORTS[$i]}/api/checkHealth -d '{}' 2>/dev/null)
+        hh=$(echo "$rr" | python3 -c "import sys,json;print(json.load(sys.stdin).get('is_health',''))" 2>/dev/null)
+        [ "$hh" = "True" ] && ((healthy++))
+    done
+    t0=$(now_ms); t1=$(now_ms)
+    [ "$healthy" -eq 3 ] \
+        && record_test "3 nodes restored healthy" "PASS" "$((t1-t0))" \
+        || record_test "3 nodes restored healthy" "FAIL" "$((t1-t0))" "healthy=$healthy"
+else
+    record_test "3 nodes restored healthy" "FAIL" "0" "no leader after restore"
+fi
+
+# ===== Follower Write Rejection =====
+log_group "Follower Write Rejection"
+
+FOLLOWER_IDX=-1
+for i in 0 1 2; do
+    [ "$i" = "$LEADER_IDX" ] && continue
+    FOLLOWER_IDX=$i; break
+done
+
+if [ "$FOLLOWER_IDX" -ge 0 ]; then
+    FA=${ADMIN_PORTS[$FOLLOWER_IDX]}
+    FM=${META_PORTS[$FOLLOWER_IDX]}
+
+    # Write to follower admin port should be rejected
+    t0=$(now_ms)
+    fc=$(api_code "$FA" "/api/addStorage" \
+        '{"storage":{"global_unique_name":"follower_test","nfs":{"root_path":"/data/nfs_ftest/","key_count_per_file":8}}}')
+    t1=$(now_ms)
+    [ "$fc" != "OK" ] \
+        && record_test "follower rejects addStorage" "PASS" "$((t1-t0))" "code=$fc" \
+        || record_test "follower rejects addStorage" "FAIL" "$((t1-t0))" "should reject but got OK"
+
+    t0=$(now_ms)
+    fc=$(api_code "$FA" "/api/createInstanceGroup" \
+        '{"instance_group":{"name":"follower_group","storage_candidates":["nfs_01"],"global_quota_group_name":"ftest","max_instance_count":10,"quota":{"capacity":1000000},"cache_config":{"reclaim_strategy":{"storage_unique_name":"nfs_01","reclaim_policy":1,"trigger_strategy":{"used_percentage":0.9},"delay_before_delete_ms":1000},"data_storage_strategy":2,"meta_indexer_config":{"max_key_count":100000,"mutex_shard_num":4,"batch_key_size":8,"meta_storage_backend_config":{"storage_type":"local"},"meta_cache_policy_config":{"type":"LRU","capacity":1000}}}}}')
+    t1=$(now_ms)
+    [ "$fc" != "OK" ] \
+        && record_test "follower rejects createInstanceGroup" "PASS" "$((t1-t0))" "code=$fc" \
+        || record_test "follower rejects createInstanceGroup" "FAIL" "$((t1-t0))" "should reject but got OK"
+
+    t0=$(now_ms)
+    fc=$(api_code "$FM" "/api/registerInstance" \
+        '{"instance_group":"default","instance_id":"follower-inst","block_size":16,"location_spec_infos":[{"name":"TP0","size":512}],"model_deployment":{"model_name":"test","dtype":"FP16","tp_size":1,"dp_size":1}}')
+    t1=$(now_ms)
+    [ "$fc" != "OK" ] \
+        && record_test "follower rejects registerInstance" "PASS" "$((t1-t0))" "code=$fc" \
+        || record_test "follower rejects registerInstance" "FAIL" "$((t1-t0))" "should reject but got OK"
+
+    t0=$(now_ms)
+    fc=$(api_code "$FA" "/api/addAccount" '{"user_name":"ftest","password":"p","role":0}')
+    t1=$(now_ms)
+    [ "$fc" != "OK" ] \
+        && record_test "follower rejects addAccount" "PASS" "$((t1-t0))" "code=$fc" \
+        || record_test "follower rejects addAccount" "FAIL" "$((t1-t0))" "should reject but got OK"
+else
+    for desc in "follower rejects addStorage" "follower rejects createInstanceGroup" "follower rejects registerInstance" "follower rejects addAccount"; do
+        record_test "$desc" "FAIL" "0" "no follower found"
+    done
+fi
+
+# ===== Concurrent Writes =====
+log_group "Concurrent Writes"
+
+t0=$(now_ms)
+# Fire 5 addAccount requests in parallel
+for u in cw-user1 cw-user2 cw-user3 cw-user4 cw-user5; do
+    api_call "$LA" "/api/addAccount" "{\"user_name\":\"$u\",\"password\":\"pw\",\"role\":0}" &
+done
+wait
+t1=$(now_ms)
+# Count total accounts (admin + post-fo-user + 5 new = 7)
+actual_count=$(api_call "$LA" "/api/listAccount" '{}' | python3 -c "import sys,json;print(len(json.load(sys.stdin).get('accounts',[])))" 2>/dev/null)
+[ "$actual_count" = "7" ] \
+    && record_test "5 concurrent addAccount all committed" "PASS" "$((t1-t0))" \
+    || record_test "5 concurrent addAccount all committed" "FAIL" "$((t1-t0))" "expected=7 got=$actual_count"
+
+# ===== Log Replay (Follower Catch-up) =====
+log_group "Log Replay (Follower Catch-up)"
+
+# Find a follower to isolate
+CATCH_IDX=-1
+for i in 0 1 2; do
+    [ "$i" = "$LEADER_IDX" ] && continue
+    CATCH_IDX=$i; break
+done
+
+if [ "$CATCH_IDX" -ge 0 ]; then
+    log_info "Stopping follower ${NODE_NAMES[$CATCH_IDX]} for catch-up test..."
+    docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" stop "${NODE_NAMES[$CATCH_IDX]}" 2>/dev/null
+    sleep 2
+
+    # Write data while follower is down
+    assert_api "write while follower down: addStorage(catchup_nfs)" "OK" "$LA" "/api/addStorage" \
+        '{"storage":{"global_unique_name":"catchup_nfs","nfs":{"root_path":"/data/nfs_catchup/","key_count_per_file":8}}}'
+    assert_api "write while follower down: addAccount(catchup-user)" "OK" "$LA" "/api/addAccount" \
+        '{"user_name":"catchup-user","password":"pw","role":0}'
+
+    # Restart follower
+    log_info "Restarting follower ${NODE_NAMES[$CATCH_IDX]}..."
+    docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" start "${NODE_NAMES[$CATCH_IDX]}" 2>/dev/null
+    sleep 5
+
+    # Verify follower caught up — kill the leader to force the restarted node into the election
+    log_info "Killing leader ${NODE_NAMES[$LEADER_IDX]} to verify catch-up node has data..."
+    docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" stop "${NODE_NAMES[$LEADER_IDX]}" 2>/dev/null
+
+    CATCHUP_INFO=$(wait_for_leader "$LEADER_IDX" 15) || CATCHUP_INFO=""
+    if [ -n "$CATCHUP_INFO" ]; then
+        CU_IDX=$(echo "$CATCHUP_INFO" | awk '{print $1}')
+        CU_MS=$(echo "$CATCHUP_INFO" | awk '{print $2}')
+        CUA=${ADMIN_PORTS[$CU_IDX]}
+        record_test "catch-up node becomes leader" "PASS" "$CU_MS"
+
+        # Wait for API readiness
+        for _ in $(seq 1 40); do
+            resp=$(api_call "$CUA" "/api/listStorage" '{}')
+            code=$(echo "$resp" | python3 -c "import sys,json;print(json.load(sys.stdin).get('header',{}).get('status',{}).get('code',''))" 2>/dev/null)
+            [ "$code" = "OK" ] && break
+            sleep 0.5
+        done
+
+        assert_count "catch-up node has catchup_nfs" "1" "$CUA" "/api/listStorage" '{}' \
+            "import sys,json;print(len([s for s in json.load(sys.stdin).get('storage',[]) if s['global_unique_name']=='catchup_nfs']))"
+        assert_count "catch-up node has catchup-user" "1" "$CUA" "/api/listAccount" '{}' \
+            "import sys,json;print(len([a for a in json.load(sys.stdin).get('accounts',[]) if a['user_name']=='catchup-user']))"
+
+        # Update leader tracking
+        LEADER_IDX=$CU_IDX
+        LA=${ADMIN_PORTS[$LEADER_IDX]}; LM=${META_PORTS[$LEADER_IDX]}
+    else
+        record_test "catch-up node becomes leader" "FAIL" "15000" "timeout"
+    fi
+
+    # Restore all nodes
+    for i in 0 1 2; do
+        docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" start "${NODE_NAMES[$i]}" 2>/dev/null
+    done
+    sleep 5
+    # Re-discover leader
+    RL_INFO=$(wait_for_leader -1 20) || true
+    if [ -n "$RL_INFO" ]; then
+        LEADER_IDX=$(echo "$RL_INFO" | awk '{print $1}')
+        LA=${ADMIN_PORTS[$LEADER_IDX]}; LM=${META_PORTS[$LEADER_IDX]}
+        for _ in $(seq 1 40); do
+            resp=$(api_call "$LA" "/api/listStorage" '{}')
+            code=$(echo "$resp" | python3 -c "import sys,json;print(json.load(sys.stdin).get('header',{}).get('status',{}).get('code',''))" 2>/dev/null)
+            [ "$code" = "OK" ] && break; sleep 0.5
+        done
+    fi
+else
+    for desc in "write while follower down: addStorage(catchup_nfs)" "write while follower down: addAccount(catchup-user)" "catch-up node becomes leader" "catch-up node has catchup_nfs" "catch-up node has catchup-user"; do
+        record_test "$desc" "FAIL" "0" "no follower to isolate"
+    done
+fi
+
+# ===== Quorum Loss =====
+log_group "Quorum Loss"
+
+# Stop 2 nodes, only 1 remains — should NOT be able to write
+STOP1=-1; STOP2=-1
+for i in 0 1 2; do
+    [ "$i" = "$LEADER_IDX" ] && continue
+    [ "$STOP1" -eq -1 ] && { STOP1=$i; continue; }
+    STOP2=$i
+done
+log_info "Stopping ${NODE_NAMES[$STOP1]} and ${NODE_NAMES[$STOP2]} (quorum loss)..."
+docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" stop "${NODE_NAMES[$STOP1]}" 2>/dev/null
+docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" stop "${NODE_NAMES[$STOP2]}" 2>/dev/null
+sleep 3
+
+# Verify the remaining node cannot write (no quorum)
+t0=$(now_ms)
+qc=$(api_code "$LA" "/api/addAccount" '{"user_name":"quorum-test","password":"pw","role":0}')
+t1=$(now_ms)
+[ "$qc" != "OK" ] \
+    && record_test "write fails without quorum" "PASS" "$((t1-t0))" "code=$qc" \
+    || record_test "write fails without quorum" "FAIL" "$((t1-t0))" "should fail but got OK"
+
+# Restore one node to regain quorum
+log_info "Restarting ${NODE_NAMES[$STOP1]} to restore quorum..."
+docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" start "${NODE_NAMES[$STOP1]}" 2>/dev/null
+
+# Wait for leader (the remaining node may need to re-win election with the new quorum)
+Q_INFO=$(wait_for_leader "$STOP2" 20) || Q_INFO=""
+if [ -n "$Q_INFO" ]; then
+    Q_IDX=$(echo "$Q_INFO" | awk '{print $1}')
+    QA=${ADMIN_PORTS[$Q_IDX]}
+    for _ in $(seq 1 40); do
+        resp=$(api_call "$QA" "/api/listStorage" '{}')
+        code=$(echo "$resp" | python3 -c "import sys,json;print(json.load(sys.stdin).get('header',{}).get('status',{}).get('code',''))" 2>/dev/null)
+        [ "$code" = "OK" ] && break; sleep 0.5
+    done
+    t0=$(now_ms)
+    qc2=$(api_code "$QA" "/api/addAccount" '{"user_name":"quorum-restored","password":"pw","role":0}')
+    t1=$(now_ms)
+    [ "$qc2" = "OK" ] \
+        && record_test "write succeeds after quorum restore" "PASS" "$((t1-t0))" \
+        || record_test "write succeeds after quorum restore" "FAIL" "$((t1-t0))" "code=$qc2"
+    LEADER_IDX=$Q_IDX; LA=${ADMIN_PORTS[$LEADER_IDX]}; LM=${META_PORTS[$LEADER_IDX]}
+else
+    record_test "write succeeds after quorum restore" "FAIL" "20000" "no leader after quorum restore"
+fi
+
+# Restore all
+docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" start "${NODE_NAMES[$STOP2]}" 2>/dev/null
+sleep 3
+
+# ===== Rolling Restart =====
+log_group "Rolling Restart"
+
+# Restart each node one at a time, verify service continuity
+rolling_ok=true
+for i in 0 1 2; do
+    log_info "Rolling restart: stopping ${NODE_NAMES[$i]}..."
+    docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" stop "${NODE_NAMES[$i]}" 2>/dev/null
+    sleep 2
+
+    # Find leader among remaining nodes
+    RR_INFO=$(wait_for_leader "$i" 15) || RR_INFO=""
+    if [ -z "$RR_INFO" ]; then
+        record_test "rolling restart: service available after stop ${NODE_NAMES[$i]}" "FAIL" "15000" "no leader"
+        rolling_ok=false
+        docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" start "${NODE_NAMES[$i]}" 2>/dev/null
+        sleep 3
+        continue
+    fi
+    RR_IDX=$(echo "$RR_INFO" | awk '{print $1}')
+    RRA=${ADMIN_PORTS[$RR_IDX]}
+    for _ in $(seq 1 40); do
+        resp=$(api_call "$RRA" "/api/listStorage" '{}')
+        code=$(echo "$resp" | python3 -c "import sys,json;print(json.load(sys.stdin).get('header',{}).get('status',{}).get('code',''))" 2>/dev/null)
+        [ "$code" = "OK" ] && break; sleep 0.5
+    done
+    t0=$(now_ms)
+    rc=$(api_code "$RRA" "/api/listStorage" '{}')
+    t1=$(now_ms)
+    [ "$rc" = "OK" ] \
+        && record_test "rolling restart: service available after stop ${NODE_NAMES[$i]}" "PASS" "$((t1-t0))" \
+        || record_test "rolling restart: service available after stop ${NODE_NAMES[$i]}" "FAIL" "$((t1-t0))" "code=$rc"
+
+    log_info "Rolling restart: restarting ${NODE_NAMES[$i]}..."
+    docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" start "${NODE_NAMES[$i]}" 2>/dev/null
+    sleep 5
+done
+
+# Wait for cluster to stabilize after rolling restart
+ROLL_INFO=$(wait_for_leader -1 20) || ROLL_INFO=""
+if [ -n "$ROLL_INFO" ]; then
+    LEADER_IDX=$(echo "$ROLL_INFO" | awk '{print $1}')
+    LA=${ADMIN_PORTS[$LEADER_IDX]}; LM=${META_PORTS[$LEADER_IDX]}
+fi
+
+# Verify all data survived rolling restart
+if [ -n "$ROLL_INFO" ]; then
+    for _ in $(seq 1 40); do
+        resp=$(api_call "$LA" "/api/listStorage" '{}')
+        code=$(echo "$resp" | python3 -c "import sys,json;print(json.load(sys.stdin).get('header',{}).get('status',{}).get('code',''))" 2>/dev/null)
+        [ "$code" = "OK" ] && break; sleep 0.5
+    done
+    assert_count "data intact after rolling restart: storage" "2" "$LA" "/api/listStorage" '{}' \
+        "import sys,json;print(len(json.load(sys.stdin).get('storage',[])))"
+    assert_api "data intact after rolling restart: inst-1" "OK" "$LM" "/api/getInstanceInfo" \
+        '{"instance_id":"inst-1"}'
+fi
+
+# ===== Full Cluster Restart =====
+log_group "Full Cluster Restart"
+
+log_info "Stopping all 3 nodes..."
+docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" stop 2>/dev/null
+sleep 2
+
+log_info "Starting all 3 nodes..."
+docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" start 2>/dev/null
+
+FULL_INFO=$(wait_for_leader -1 30) || FULL_INFO=""
+if [ -n "$FULL_INFO" ]; then
+    FULL_IDX=$(echo "$FULL_INFO" | awk '{print $1}')
+    FULL_MS=$(echo "$FULL_INFO" | awk '{print $2}')
+    FULA=${ADMIN_PORTS[$FULL_IDX]}; FULM=${META_PORTS[$FULL_IDX]}
+    record_test "leader elected after full restart" "PASS" "$FULL_MS"
+
+    # Wait for API readiness
+    for _ in $(seq 1 40); do
+        resp=$(api_call "$FULA" "/api/listStorage" '{}')
+        code=$(echo "$resp" | python3 -c "import sys,json;print(json.load(sys.stdin).get('header',{}).get('status',{}).get('code',''))" 2>/dev/null)
+        cnt=$(echo "$resp" | python3 -c "import sys,json;print(len(json.load(sys.stdin).get('storage',[])))" 2>/dev/null)
+        [ "$code" = "OK" ] && [ "${cnt:-0}" -ge 1 ] && break
+        sleep 0.5
+    done
+
+    assert_count "persistent: storage survives full restart" "2" "$FULA" "/api/listStorage" '{}' \
+        "import sys,json;print(len(json.load(sys.stdin).get('storage',[])))"
+    assert_count "persistent: instance group survives" "1" "$FULA" "/api/listInstanceGroup" '{}' \
+        "import sys,json;print(len(json.load(sys.stdin).get('instance_group',[])))"
+    assert_api "persistent: inst-1 survives" "OK" "$FULM" "/api/getInstanceInfo" \
+        '{"instance_id":"inst-1"}'
+    assert_api "persistent: inst-2 survives" "OK" "$FULM" "/api/getInstanceInfo" \
+        '{"instance_id":"inst-2"}'
+    assert_api "persistent: cache meta survives" "OK" "$FULM" "/api/getCacheMeta" \
+        '{"instance_id":"inst-1","block_keys":[1001]}'
+
+    # Verify accounts survived (admin + post-fo-user + 5 concurrent + catchup-user + quorum-restored = 9)
+    acct_count=$(api_call "$FULA" "/api/listAccount" '{}' | python3 -c "import sys,json;print(len(json.load(sys.stdin).get('accounts',[])))" 2>/dev/null)
+    t0=$(now_ms); t1=$(now_ms)
+    [ "${acct_count:-0}" -ge 8 ] \
+        && record_test "persistent: accounts survive (>= 8)" "PASS" "$((t1-t0))" "count=$acct_count" \
+        || record_test "persistent: accounts survive (>= 8)" "FAIL" "$((t1-t0))" "expected>=8 got=$acct_count"
+
+    # Write after full restart still works
+    assert_api "write after full restart" "OK" "$FULA" "/api/addAccount" \
+        '{"user_name":"full-restart-user","password":"pw","role":0}'
+else
+    record_test "leader elected after full restart" "FAIL" "30000" "timeout"
+    for desc in "persistent: storage survives full restart" "persistent: instance group survives" "persistent: inst-1 survives" "persistent: inst-2 survives" "persistent: cache meta survives" "persistent: accounts survive (>= 8)" "write after full restart"; do
+        record_test "$desc" "FAIL" "0" "no leader"
+    done
+fi
+
 # ---------------------------------------------------------------------------
 # Phase 4: Report
 # ---------------------------------------------------------------------------
