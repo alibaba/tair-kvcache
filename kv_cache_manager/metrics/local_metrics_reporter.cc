@@ -6,6 +6,7 @@
 #include <utility>
 
 #include "kv_cache_manager/common/common_util.h"
+#include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
@@ -121,9 +122,44 @@ void LocalMetricsReporter::ReportInterval() {
 
     do {
         // for meta indexer accumulative metrics
+        const auto registry_manager = cache_manager_->GetRegistryManager();
         const auto meta_indexer_manager = cache_manager_->meta_indexer_manager();
-        if (!meta_indexer_manager) {
+        if (!registry_manager || !meta_indexer_manager) {
             break;
+        }
+
+        const auto request_context = std::make_shared<RequestContext>("trace_report_interval");
+        const auto [ec0, instance_groups] = registry_manager->ListInstanceGroup(request_context.get());
+        if (ec0 != ErrorCode::EC_OK) {
+            KVCM_LOG_WARN("list instance group failed, error code: [%d]", static_cast<std::int32_t>(ec0));
+            break;
+        }
+
+        std::size_t total_usage_byte_size_v = 0;
+        std::size_t total_capacity_byte_size_v = 0;
+        for (const auto &instance_group : instance_groups) {
+            total_capacity_byte_size_v += instance_group->quota().capacity();
+
+            const std::string &instance_group_name = instance_group->name();
+            const auto [ec1, instance_infos] =
+                registry_manager->ListInstanceInfo(request_context.get(), instance_group_name);
+            if (ec1 != ErrorCode::EC_OK) {
+                KVCM_LOG_WARN("list instances info failed, error code: [%d]", static_cast<std::int32_t>(ec1));
+                continue;
+            }
+            for (const auto &instance_info : instance_infos) {
+                if (instance_info == nullptr) {
+                    KVCM_LOG_WARN("instance is nullptr");
+                    continue;
+                }
+                const std::string &instance_id = instance_info->instance_id();
+                const auto meta_indexer = meta_indexer_manager->GetMetaIndexer(instance_id);
+                if (meta_indexer == nullptr) {
+                    KVCM_LOG_WARN("meta indexer is nullptr");
+                    continue;
+                }
+                total_usage_byte_size_v += meta_indexer->GetStorageUsage();
+            }
         }
 
         const auto p = KVCM_META_INDEXER_ACC_METRICS_COLLECTOR_PTR(MetaIndexerAccumulative);
@@ -133,16 +169,19 @@ void LocalMetricsReporter::ReportInterval() {
 
         const auto indexer_map = meta_indexer_manager->GetIndexers();
         std::size_t total_key_count_v = 0;
-        std::size_t total_cache_usage_v = 0;
         for (auto &[_, indexer] : indexer_map) {
             if (indexer) {
                 total_key_count_v += indexer->GetKeyCount();
-                total_cache_usage_v += indexer->GetMemUsage();
             }
         }
 
         SET_METRICS_(p, meta_indexer, total_key_count, static_cast<double>(total_key_count_v));
-        SET_METRICS_(p, meta_indexer, total_cache_usage, static_cast<double>(total_cache_usage_v));
+        SET_METRICS_(p,
+                     meta_indexer,
+                     total_cache_usage, // the semantics is: usage_ratio among all the known groups
+                     total_capacity_byte_size_v > 0 ? (static_cast<double>(total_usage_byte_size_v) /
+                                                       static_cast<double>(total_capacity_byte_size_v))
+                                                    : 1.0);
     } while (false);
 
     do {
