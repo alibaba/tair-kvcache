@@ -2,6 +2,8 @@
 
 #include <unordered_set>
 
+#include "kv_cache_manager/optimizer/scheduler/infer_scheduling_strategy.h"
+
 namespace kv_cache_manager {
 namespace {
 
@@ -250,8 +252,7 @@ bool HierarchicalReplayConfig::FromRapidValue(const rapidjson::Value &rapid_valu
     KVCM_JSON_GET_MACRO(rapid_value, "storage_pool", storage_pool_);
     KVCM_JSON_GET_DEFAULT_MACRO(
         rapid_value, "infer_scheduling_strategy", infer_scheduling_strategy_, std::string("preserve_trace"));
-    if (infer_scheduling_strategy_ != "preserve_trace" && infer_scheduling_strategy_ != "round_robin" &&
-        infer_scheduling_strategy_ != "prefix_hit") {
+    if (!IsSupportedInferSchedulingStrategy(infer_scheduling_strategy_)) {
         return false;
     }
     KVCM_JSON_GET_DEFAULT_MACRO(

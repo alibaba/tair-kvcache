@@ -9,8 +9,8 @@
 #include "kv_cache_manager/optimizer/config/instance_group_config.h"
 #include "kv_cache_manager/optimizer/config/optimizer_config.h"
 #include "kv_cache_manager/optimizer/config/tier_config.h"
-#include "kv_cache_manager/optimizer/manager/hash_storage_pool_manager.h"
 #include "kv_cache_manager/optimizer/manager/hierarchical_replay_manager.h"
+#include "kv_cache_manager/optimizer/storage_pool/hash_storage_pool_manager.h"
 
 using namespace kv_cache_manager;
 

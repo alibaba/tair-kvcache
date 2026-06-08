@@ -10,10 +10,10 @@
 
 #include "kv_cache_manager/optimizer/config/hierarchical_replay_config.h"
 #include "kv_cache_manager/optimizer/config/insight_simulator_types.h"
-#include "kv_cache_manager/optimizer/manager/hash_storage_pool_manager.h"
-#include "kv_cache_manager/optimizer/manager/infer_engine_scheduler.h"
 #include "kv_cache_manager/optimizer/manager/optimizer_manager.h"
-#include "kv_cache_manager/optimizer/manager/tier_global_tracker.h"
+#include "kv_cache_manager/optimizer/p2p/tier_global_tracker.h"
+#include "kv_cache_manager/optimizer/scheduler/infer_engine_scheduler.h"
+#include "kv_cache_manager/optimizer/storage_pool/hash_storage_pool_manager.h"
 #include "kv_cache_manager/optimizer/trace_loader/optimizer_schema_trace.h"
 
 namespace kv_cache_manager {

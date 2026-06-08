@@ -1,9 +1,10 @@
-#include "kv_cache_manager/optimizer/manager/infer_engine_scheduler.h"
+#include "kv_cache_manager/optimizer/scheduler/infer_engine_scheduler.h"
 
 #include <algorithm>
-#include <limits>
 #include <stdexcept>
 #include <utility>
+
+#include "kv_cache_manager/optimizer/scheduler/infer_scheduling_strategy.h"
 
 namespace kv_cache_manager {
 
@@ -18,42 +19,39 @@ void InferEngineScheduler::SetEngineInstanceIds(std::vector<std::string> engine_
         engine_instance_id_set_.insert(engine_instance_id);
     }
     engine_instance_ids_ = std::move(engine_instance_ids);
-    active_windows_.clear();
+    active_windows_.Clear();
 }
 
 void InferEngineScheduler::SetActiveWindows(const std::vector<InferEngineActiveWindow> &active_windows) {
-    active_windows_.clear();
-    for (const auto &window : active_windows) {
-        if (window.start_ns > window.end_ns) {
-            throw std::runtime_error("infer active window start_ns must be <= end_ns: " + window.infer_id);
-        }
-        if (engine_instance_id_set_.find(window.infer_id) == engine_instance_id_set_.end()) {
-            throw std::runtime_error("infer active window references unknown infer_id: " + window.infer_id);
-        }
-        active_windows_[window.infer_id].push_back(ActiveWindow{window.start_ns, window.end_ns});
-    }
-    for (auto &entry : active_windows_) {
-        std::sort(entry.second.begin(), entry.second.end(), [](const ActiveWindow &lhs, const ActiveWindow &rhs) {
-            if (lhs.first_timestamp_ns != rhs.first_timestamp_ns) {
-                return lhs.first_timestamp_ns < rhs.first_timestamp_ns;
-            }
-            return lhs.last_timestamp_ns < rhs.last_timestamp_ns;
-        });
-    }
+    active_windows_.SetConfiguredWindows(active_windows, engine_instance_id_set_);
 }
 
 void InferEngineScheduler::ScheduleTraces(const std::string &strategy,
                                           std::vector<std::shared_ptr<OptimizerSchemaTrace>> &traces) const {
-    if (strategy == "preserve_trace" || strategy == "prefix_hit") {
+    if (UsesTraceInferAssignment(strategy)) {
         return;
     }
-    if (strategy != "round_robin") {
-        throw std::runtime_error("Unknown infer_scheduling_strategy: " + strategy);
+    const auto &handlers = TraceSchedulingHandlers();
+    auto it = handlers.find(strategy);
+    if (it != handlers.end()) {
+        (this->*(it->second))(traces);
+        return;
     }
+    throw std::runtime_error("Unknown infer_scheduling_strategy: " + strategy);
+}
+
+const std::unordered_map<std::string, InferEngineScheduler::TraceSchedulingHandler> &
+InferEngineScheduler::TraceSchedulingHandlers() {
+    static const std::unordered_map<std::string, TraceSchedulingHandler> handlers = {
+        {"round_robin", &InferEngineScheduler::ScheduleRoundRobin},
+    };
+    return handlers;
+}
+
+void InferEngineScheduler::ScheduleRoundRobin(std::vector<std::shared_ptr<OptimizerSchemaTrace>> &traces) const {
     if (engine_instance_ids_.empty()) {
         throw std::runtime_error("round_robin scheduling requires at least one engine instance");
     }
-
     size_t request_idx = 0;
     std::string current_engine_instance_id = engine_instance_ids_.front();
     for (auto &trace : traces) {
@@ -75,7 +73,7 @@ void InferEngineScheduler::ScheduleTraces(const std::string &strategy,
                                          std::to_string(trace->timestamp_ns()));
             }
             current_engine_instance_id = active_engine_ids.front();
-        } else if (!IsActiveAt(current_engine_instance_id, trace->timestamp_ns())) {
+        } else if (!IsInferActiveAt(current_engine_instance_id, trace->timestamp_ns())) {
             throw std::runtime_error("round_robin scheduled write targets inactive engine instance: " +
                                      current_engine_instance_id);
         }
@@ -86,62 +84,20 @@ void InferEngineScheduler::ScheduleTraces(const std::string &strategy,
 void InferEngineScheduler::BuildTraceActiveWindows(const std::vector<std::shared_ptr<OptimizerSchemaTrace>> &traces,
                                                    int64_t write_delay_ns,
                                                    bool require_known_infer_id) {
-    active_windows_.clear();
-    for (const auto &trace : traces) {
-        if (!trace) {
-            continue;
-        }
-        if (require_known_infer_id &&
-            engine_instance_id_set_.find(trace->instance_id()) == engine_instance_id_set_.end()) {
-            throw std::runtime_error("trace active window references unknown infer_id: " + trace->instance_id());
-        }
-        RecordActivity(trace->instance_id(), trace->timestamp_ns());
-        if (std::dynamic_pointer_cast<RequestSchemaTrace>(trace)) {
-            if (trace->timestamp_ns() > std::numeric_limits<int64_t>::max() - write_delay_ns) {
-                throw std::runtime_error("request write timestamp overflows int64 while building active windows: " +
-                                         trace->trace_id());
-            }
-            RecordActivity(trace->instance_id(), trace->timestamp_ns() + write_delay_ns);
-        }
-    }
-    if (require_known_infer_id && active_windows_.empty()) {
-        throw std::runtime_error("trace active window source produced no infer activity");
-    }
+    active_windows_.BuildFromTrace(traces, write_delay_ns, require_known_infer_id, engine_instance_id_set_);
 }
 
 std::vector<std::string> InferEngineScheduler::ActiveInferIds(const std::vector<std::string> &infer_ids,
                                                               int64_t timestamp_ns) const {
-    if (active_windows_.empty()) {
-        return infer_ids;
-    }
-
-    std::vector<std::string> active_ids;
-    active_ids.reserve(infer_ids.size());
-    for (const auto &infer_id : infer_ids) {
-        if (IsActiveAt(infer_id, timestamp_ns)) {
-            active_ids.push_back(infer_id);
-        }
-    }
-    return active_ids;
+    return active_windows_.FilterActive(infer_ids, timestamp_ns);
 }
 
 bool InferEngineScheduler::IsInferActiveAt(const std::string &infer_id, int64_t timestamp_ns) const {
-    return IsActiveAt(infer_id, timestamp_ns);
+    return active_windows_.IsActiveAt(infer_id, timestamp_ns);
 }
 
 std::vector<std::string> InferEngineScheduler::ActiveEngineInstanceIds(int64_t timestamp_ns) const {
-    if (active_windows_.empty()) {
-        return engine_instance_ids_;
-    }
-
-    std::vector<std::string> active_ids;
-    active_ids.reserve(engine_instance_ids_.size());
-    for (const auto &engine_instance_id : engine_instance_ids_) {
-        if (IsActiveAt(engine_instance_id, timestamp_ns)) {
-            active_ids.push_back(engine_instance_id);
-        }
-    }
-    return active_ids;
+    return active_windows_.FilterActive(engine_instance_ids_, timestamp_ns);
 }
 
 std::string InferEngineScheduler::ChoosePrefixHitEngineInstance(
@@ -168,33 +124,6 @@ std::string InferEngineScheduler::ChoosePrefixHitEngineInstance(
         return candidates.front();
     }
     return candidates[request_idx % candidates.size()];
-}
-
-void InferEngineScheduler::RecordActivity(const std::string &engine_instance_id, int64_t timestamp_ns) {
-    if (engine_instance_id_set_.find(engine_instance_id) == engine_instance_id_set_.end()) {
-        return;
-    }
-    auto it = active_windows_.find(engine_instance_id);
-    if (it == active_windows_.end()) {
-        active_windows_.emplace(engine_instance_id, std::vector<ActiveWindow>{{timestamp_ns, timestamp_ns}});
-        return;
-    }
-    auto &window = it->second.front();
-    window.first_timestamp_ns = std::min(window.first_timestamp_ns, timestamp_ns);
-    window.last_timestamp_ns = std::max(window.last_timestamp_ns, timestamp_ns);
-}
-
-bool InferEngineScheduler::IsActiveAt(const std::string &engine_instance_id, int64_t timestamp_ns) const {
-    if (active_windows_.empty()) {
-        return true;
-    }
-    auto it = active_windows_.find(engine_instance_id);
-    if (it == active_windows_.end()) {
-        return false;
-    }
-    return std::any_of(it->second.begin(), it->second.end(), [timestamp_ns](const ActiveWindow &window) {
-        return timestamp_ns >= window.first_timestamp_ns && timestamp_ns <= window.last_timestamp_ns;
-    });
 }
 
 } // namespace kv_cache_manager

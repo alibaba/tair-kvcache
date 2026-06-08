@@ -1,4 +1,4 @@
-#include "kv_cache_manager/optimizer/manager/hash_storage_pool_manager.h"
+#include "kv_cache_manager/optimizer/storage_pool/hash_storage_pool_manager.h"
 
 #include <algorithm>
 #include <limits>

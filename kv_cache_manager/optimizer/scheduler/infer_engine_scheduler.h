@@ -8,15 +8,10 @@
 #include <unordered_set>
 #include <vector>
 
+#include "kv_cache_manager/optimizer/scheduler/infer_active_window.h"
 #include "kv_cache_manager/optimizer/trace_loader/optimizer_schema_trace.h"
 
 namespace kv_cache_manager {
-
-struct InferEngineActiveWindow {
-    std::string infer_id;
-    int64_t start_ns = 0;
-    int64_t end_ns = 0;
-};
 
 class InferEngineScheduler {
 public:
@@ -44,18 +39,17 @@ public:
     [[nodiscard]] bool has_active_windows() const { return !active_windows_.empty(); }
 
 private:
-    struct ActiveWindow {
-        int64_t first_timestamp_ns = 0;
-        int64_t last_timestamp_ns = 0;
-    };
+    using TraceSchedulingHandler =
+        void (InferEngineScheduler::*)(std::vector<std::shared_ptr<OptimizerSchemaTrace>> &) const;
 
+    [[nodiscard]] static const std::unordered_map<std::string, TraceSchedulingHandler> &TraceSchedulingHandlers();
+
+    void ScheduleRoundRobin(std::vector<std::shared_ptr<OptimizerSchemaTrace>> &traces) const;
     [[nodiscard]] std::vector<std::string> ActiveEngineInstanceIds(int64_t timestamp_ns) const;
-    void RecordActivity(const std::string &engine_instance_id, int64_t timestamp_ns);
-    [[nodiscard]] bool IsActiveAt(const std::string &engine_instance_id, int64_t timestamp_ns) const;
 
     std::vector<std::string> engine_instance_ids_;
     std::unordered_set<std::string> engine_instance_id_set_;
-    std::unordered_map<std::string, std::vector<ActiveWindow>> active_windows_;
+    InferActiveWindowSet active_windows_;
 };
 
 } // namespace kv_cache_manager
