@@ -24,8 +24,12 @@ Then query metrics with PromQL:
 # Service QPS (rate over 1 minute)
 rate(kvcm_service_query_counter[1m])
 
-# Cache hit ratio
+# Search cache hit ratio
 kvcm_meta_indexer_search_cache_hit_ratio
+
+# GetCacheLocation block-level hit rate (5-minute window)
+rate(kvcm_manager_get_cache_location_hit_block_counter[5m])
+  / rate(kvcm_manager_get_cache_location_query_block_counter[5m])
 
 # Storage usage per backend
 kvcm_data_storage_storage_usage_ratio
@@ -125,6 +129,8 @@ every `kvcm.metrics.report_interval_ms`, default 20s).
 | `service.request_queue_size` | gauge | Request queue size |
 | `manager.request_key_count` | gauge | Keys per request |
 | `manager.prefix_match_len` | gauge | Prefix match length |
+| `manager.get_cache_location_query_block_counter` | counter | Total blocks queried via GetCacheLocation (cumulative) |
+| `manager.get_cache_location_hit_block_counter` | counter | Total blocks hit via GetCacheLocation (cumulative) |
 | `manager.prefix_match_time_us` | gauge | Prefix match latency (us) |
 | `meta_indexer.search_cache_hit_ratio` | gauge | Search cache hit ratio |
 | `data_storage.create_keys_counter` | counter | Total created keys |
