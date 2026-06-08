@@ -2,6 +2,7 @@
 
 #include <libnuraft/buffer.hxx>
 #include <libnuraft/buffer_serializer.hxx>
+#include <libnuraft/cluster_config.hxx>
 #include <libnuraft/snapshot.hxx>
 
 #include <cstdio>
@@ -218,6 +219,247 @@ TEST_F(MetaStateMachineTest, RouteByInstanceIdIsolated) {
         ASSERT_EQ(1u, out_locs[0].size());
         EXPECT_EQ(1u, out_locs[0].count("loc-b"));
     }
+}
+
+// --- Registry field-level operations ---
+
+TEST_F(MetaStateMachineTest, RegistryFieldSaveMerge) {
+    LogOp op1;
+    op1.type = OpType::kRegistryFieldSave;
+    op1.registry_key = "account";
+    op1.registry_field_id = "alice";
+    op1.registry_field_value = "{\"role\":\"admin\"}";
+    Apply(op1);
+
+    LogOp op2;
+    op2.type = OpType::kRegistryFieldSave;
+    op2.registry_key = "account";
+    op2.registry_field_id = "bob";
+    op2.registry_field_value = "{\"role\":\"reader\"}";
+    Apply(op2);
+
+    std::map<std::string, std::string> out;
+    ASSERT_EQ(EC_OK, sm_->RegistryLoad("account", out));
+    ASSERT_EQ(2u, out.size());
+    EXPECT_EQ("{\"role\":\"admin\"}", out.at("alice"));
+    EXPECT_EQ("{\"role\":\"reader\"}", out.at("bob"));
+}
+
+TEST_F(MetaStateMachineTest, RegistryFieldDeleteRemovesField) {
+    LogOp save_a;
+    save_a.type = OpType::kRegistryFieldSave;
+    save_a.registry_key = "account";
+    save_a.registry_field_id = "alice";
+    save_a.registry_field_value = "v1";
+    Apply(save_a);
+
+    LogOp save_b;
+    save_b.type = OpType::kRegistryFieldSave;
+    save_b.registry_key = "account";
+    save_b.registry_field_id = "bob";
+    save_b.registry_field_value = "v2";
+    Apply(save_b);
+
+    LogOp del_a;
+    del_a.type = OpType::kRegistryFieldDelete;
+    del_a.registry_key = "account";
+    del_a.registry_field_id = "alice";
+    Apply(del_a);
+
+    std::map<std::string, std::string> out;
+    ASSERT_EQ(EC_OK, sm_->RegistryLoad("account", out));
+    ASSERT_EQ(1u, out.size());
+    EXPECT_EQ("v2", out.at("bob"));
+}
+
+TEST_F(MetaStateMachineTest, RegistryFieldDeleteLastFieldRemovesKey) {
+    LogOp save;
+    save.type = OpType::kRegistryFieldSave;
+    save.registry_key = "storage";
+    save.registry_field_id = "only-one";
+    save.registry_field_value = "data";
+    Apply(save);
+
+    LogOp del;
+    del.type = OpType::kRegistryFieldDelete;
+    del.registry_key = "storage";
+    del.registry_field_id = "only-one";
+    Apply(del);
+
+    std::map<std::string, std::string> out;
+    sm_->RegistryLoad("storage", out);
+    EXPECT_TRUE(out.empty());
+}
+
+TEST_F(MetaStateMachineTest, RegistryFieldSaveCallbackFired) {
+    std::string cb_key;
+    std::map<std::string, std::string> cb_fields;
+    bool cb_is_save = false;
+    int cb_count = 0;
+
+    sm_->SetRegistryCommitCallback([&](bool is_save, const std::string &key,
+                                       const std::map<std::string, std::string> &fields) {
+        cb_is_save = is_save;
+        cb_key = key;
+        cb_fields = fields;
+        ++cb_count;
+    });
+
+    LogOp op;
+    op.type = OpType::kRegistryFieldSave;
+    op.registry_key = "account";
+    op.registry_field_id = "alice";
+    op.registry_field_value = "v1";
+    Apply(op);
+
+    EXPECT_EQ(1, cb_count);
+    EXPECT_TRUE(cb_is_save);
+    EXPECT_EQ("account", cb_key);
+    ASSERT_EQ(1u, cb_fields.size());
+    EXPECT_EQ("v1", cb_fields.at("alice"));
+}
+
+// --- Snapshot round-trip ---
+
+TEST_F(MetaStateMachineTest, SnapshotRoundTripMetaData) {
+    LogOp op;
+    op.type = OpType::kPut;
+    op.instance_id = "inst-snap";
+    op.key = 42;
+    op.locations.emplace("loc-1", MakeLocation("loc-1"));
+    op.properties.emplace(PROPERTY_URI, "tair://snap");
+    Apply(op);
+
+    // Create snapshot.
+    auto snap = nuraft::cs_new<nuraft::snapshot>(commit_idx_, 1, nuraft::cs_new<nuraft::cluster_config>());
+    bool snap_ok = false;
+    nuraft::async_result<bool>::handler_type handler =
+        [&](bool result, nuraft::ptr<std::exception> &) { snap_ok = result; };
+    sm_->create_snapshot(*snap, handler);
+    ASSERT_TRUE(snap_ok);
+
+    // Build a new state machine and apply the snapshot.
+    auto sm2 = std::make_shared<MetaStateMachine>(
+        [this](const std::string &iid) -> std::shared_ptr<MetaCacheBaseBackend> {
+            std::lock_guard<std::mutex> g(backends_mu_);
+            auto b = std::make_shared<MetaLocalBackend>();
+            auto cfg = std::make_shared<MetaStorageBackendConfig>();
+            EXPECT_EQ(EC_OK, b->Init(iid, cfg));
+            EXPECT_EQ(EC_OK, b->Open());
+            backends_.emplace(iid, b);
+            return b;
+        },
+        snapshot_dir_);
+    ASSERT_TRUE(sm2->apply_snapshot(*snap));
+
+    auto backend2 = sm2->GetBackend("inst-snap");
+    ASSERT_NE(backend2, nullptr);
+    KeyVector keys{42};
+    CacheLocationMapVector out_locs(1);
+    PropertyMapVector out_props(1);
+    auto rcs = backend2->Get(nullptr, keys, out_locs, out_props);
+    ASSERT_EQ(1u, rcs.size());
+    EXPECT_EQ(EC_OK, rcs[0]);
+    ASSERT_EQ(1u, out_locs[0].size());
+    EXPECT_EQ("loc-1", out_locs[0].at("loc-1")->id());
+    EXPECT_EQ("tair://snap", out_props[0].at(PROPERTY_URI));
+}
+
+TEST_F(MetaStateMachineTest, SnapshotRoundTripRegistry) {
+    LogOp op;
+    op.type = OpType::kRegistrySave;
+    op.registry_key = "storage";
+    op.registry_fields = {{"backend-a", "{\"type\":\"nfs\"}"}, {"backend-b", "{\"type\":\"dummy\"}"}};
+    Apply(op);
+
+    auto snap = nuraft::cs_new<nuraft::snapshot>(commit_idx_, 1, nuraft::cs_new<nuraft::cluster_config>());
+    bool snap_ok = false;
+    nuraft::async_result<bool>::handler_type handler =
+        [&](bool result, nuraft::ptr<std::exception> &) { snap_ok = result; };
+    sm_->create_snapshot(*snap, handler);
+    ASSERT_TRUE(snap_ok);
+
+    auto sm2 = std::make_shared<MetaStateMachine>(
+        [](const std::string &) -> std::shared_ptr<MetaCacheBaseBackend> { return nullptr; },
+        snapshot_dir_);
+    ASSERT_TRUE(sm2->apply_snapshot(*snap));
+
+    std::map<std::string, std::string> out;
+    ASSERT_EQ(EC_OK, sm2->RegistryLoad("storage", out));
+    ASSERT_EQ(2u, out.size());
+    EXPECT_EQ("{\"type\":\"nfs\"}", out.at("backend-a"));
+    EXPECT_EQ("{\"type\":\"dummy\"}", out.at("backend-b"));
+}
+
+TEST_F(MetaStateMachineTest, SnapshotRoundTripFieldOps) {
+    LogOp op1;
+    op1.type = OpType::kRegistryFieldSave;
+    op1.registry_key = "account";
+    op1.registry_field_id = "alice";
+    op1.registry_field_value = "v1";
+    Apply(op1);
+
+    LogOp op2;
+    op2.type = OpType::kRegistryFieldSave;
+    op2.registry_key = "account";
+    op2.registry_field_id = "bob";
+    op2.registry_field_value = "v2";
+    Apply(op2);
+
+    LogOp del;
+    del.type = OpType::kRegistryFieldDelete;
+    del.registry_key = "account";
+    del.registry_field_id = "alice";
+    Apply(del);
+
+    auto snap = nuraft::cs_new<nuraft::snapshot>(commit_idx_, 1, nuraft::cs_new<nuraft::cluster_config>());
+    bool snap_ok = false;
+    nuraft::async_result<bool>::handler_type handler =
+        [&](bool result, nuraft::ptr<std::exception> &) { snap_ok = result; };
+    sm_->create_snapshot(*snap, handler);
+    ASSERT_TRUE(snap_ok);
+
+    auto sm2 = std::make_shared<MetaStateMachine>(
+        [](const std::string &) -> std::shared_ptr<MetaCacheBaseBackend> { return nullptr; },
+        snapshot_dir_);
+    ASSERT_TRUE(sm2->apply_snapshot(*snap));
+
+    std::map<std::string, std::string> out;
+    ASSERT_EQ(EC_OK, sm2->RegistryLoad("account", out));
+    ASSERT_EQ(1u, out.size());
+    EXPECT_EQ("v2", out.at("bob"));
+}
+
+TEST_F(MetaStateMachineTest, SnapshotPreservesLastCommitIndex) {
+    for (int i = 0; i < 5; ++i) {
+        LogOp op;
+        op.type = OpType::kRegistryFieldSave;
+        op.registry_key = "k";
+        op.registry_field_id = "f" + std::to_string(i);
+        op.registry_field_value = "v";
+        Apply(op);
+    }
+    EXPECT_EQ(5u, sm_->last_commit_index());
+
+    auto snap = nuraft::cs_new<nuraft::snapshot>(commit_idx_, 1, nuraft::cs_new<nuraft::cluster_config>());
+    bool snap_ok = false;
+    nuraft::async_result<bool>::handler_type handler =
+        [&](bool result, nuraft::ptr<std::exception> &) { snap_ok = result; };
+    sm_->create_snapshot(*snap, handler);
+    ASSERT_TRUE(snap_ok);
+
+    auto sm2 = std::make_shared<MetaStateMachine>(
+        [](const std::string &) -> std::shared_ptr<MetaCacheBaseBackend> { return nullptr; },
+        snapshot_dir_);
+    ASSERT_TRUE(sm2->apply_snapshot(*snap));
+    EXPECT_EQ(5u, sm2->last_commit_index());
+}
+
+TEST_F(MetaStateMachineTest, NoOpAdvancesIndex) {
+    LogOp op;
+    op.type = OpType::kNoOp;
+    Apply(op);
+    EXPECT_EQ(1u, sm_->last_commit_index());
 }
 
 } // namespace raft_meta

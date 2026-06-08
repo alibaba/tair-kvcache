@@ -233,5 +233,43 @@ TEST_F(RaftLogCodecTest, RegistrySaveEmptyFieldsRoundTrip) {
     EXPECT_TRUE(decoded.registry_fields.empty());
 }
 
+TEST_F(RaftLogCodecTest, RegistryFieldSaveRoundTrip) {
+    LogOp op;
+    op.type = OpType::kRegistryFieldSave;
+    op.registry_key = "account";
+    op.registry_field_id = "user-alice";
+    op.registry_field_value = "{\"name\":\"alice\",\"role\":\"admin\"}";
+
+    auto buf = Encode(op);
+    LogOp decoded = DecodeBuffer(buf);
+    EXPECT_EQ(OpType::kRegistryFieldSave, decoded.type);
+    EXPECT_EQ("account", decoded.registry_key);
+    EXPECT_EQ("user-alice", decoded.registry_field_id);
+    EXPECT_EQ("{\"name\":\"alice\",\"role\":\"admin\"}", decoded.registry_field_value);
+}
+
+TEST_F(RaftLogCodecTest, RegistryFieldDeleteRoundTrip) {
+    LogOp op;
+    op.type = OpType::kRegistryFieldDelete;
+    op.registry_key = "storage";
+    op.registry_field_id = "backend-x";
+
+    auto buf = Encode(op);
+    LogOp decoded = DecodeBuffer(buf);
+    EXPECT_EQ(OpType::kRegistryFieldDelete, decoded.type);
+    EXPECT_EQ("storage", decoded.registry_key);
+    EXPECT_EQ("backend-x", decoded.registry_field_id);
+    EXPECT_TRUE(decoded.registry_field_value.empty());
+}
+
+TEST_F(RaftLogCodecTest, NoOpRoundTrip) {
+    LogOp op;
+    op.type = OpType::kNoOp;
+
+    auto buf = Encode(op);
+    LogOp decoded = DecodeBuffer(buf);
+    EXPECT_EQ(OpType::kNoOp, decoded.type);
+}
+
 } // namespace raft_meta
 } // namespace kv_cache_manager
