@@ -5,6 +5,7 @@
 #include <thread>
 
 #include "kv_cache_manager/common/logger.h"
+#include "kv_cache_manager/meta/raft/raft_coordinator.h"
 #include "kv_cache_manager/service/server_config.h"
 
 namespace grpc {
@@ -12,10 +13,6 @@ class Server;
 }
 
 namespace kv_cache_manager {
-
-namespace raft_meta {
-class RaftCoordinator;
-} // namespace raft_meta
 
 class DebugServiceImpl;
 class AdminServiceImpl;
@@ -55,12 +52,14 @@ private:
     bool CreateLeaseLockLeaderElector();
 
     void OnBecomeLeader();
+    void OnBecomeLeaderWork(); // heavy recovery logic, runs on background thread in raft mode
     void OnNoLongerLeader();
 
 private:
     const std::string kLeaderLockKey = "_TAIR_KVCM_LEADER_KEY";
 
     std::atomic<bool> stop_{false};
+    std::atomic<bool> is_leader_{false};
     bool is_startup_loaded_ = false;
     bool is_first_leader_election_ = true;
     ServerConfig config_;
@@ -91,5 +90,6 @@ private:
     std::shared_ptr<LoopThread> metrics_report_thread_;
 
     std::shared_ptr<raft_meta::RaftCoordinator> raft_coordinator_;
+    raft_meta::RaftCoordinator::Config raft_cfg_;
 };
 } // namespace kv_cache_manager

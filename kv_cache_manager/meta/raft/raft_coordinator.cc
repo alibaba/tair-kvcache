@@ -14,6 +14,7 @@
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_local_backend.h"
+#include "kv_cache_manager/meta/raft/raft_mode.h"
 
 namespace kv_cache_manager {
 namespace raft_meta {
@@ -256,7 +257,10 @@ void RaftCoordinator::SetRegistryCommitCallback(MetaStateMachine::RegistryCommit
     }
 }
 
-void RaftCoordinator::SetInstance(RaftCoordinator *coord) { g_instance.store(coord); }
+void RaftCoordinator::SetInstance(RaftCoordinator *coord) {
+    g_instance.store(coord);
+    SetRaftModeActive(coord != nullptr);
+}
 
 RaftCoordinator *RaftCoordinator::GetInstance() { return g_instance.load(); }
 

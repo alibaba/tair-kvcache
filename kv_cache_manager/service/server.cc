@@ -55,14 +55,6 @@ bool Server::Init(const ServerConfig &config) {
     registry_manager_.reset(new RegistryManager(registry_storage_uri, metrics_registry_));
     registry_manager_->Init();
 
-    if (config_.IsRaftEnabled() && raft_coordinator_) {
-        auto *rm = registry_manager_.get();
-        raft_coordinator_->SetRegistryCommitCallback(
-            [rm](bool is_save, const std::string &key, const std::map<std::string, std::string> &fields) {
-                rm->OnRegistryCommit(is_save, key, fields);
-            });
-    }
-
     cache_manager_.reset(new CacheManager(metrics_registry_, registry_manager_));
     cache_manager_->Init(config_.GetSchedulePlanExecutorThreadCount(),
                          config_.GetCacheReclaimerKeySamplingSizeTotal(),
@@ -80,19 +72,15 @@ bool Server::Init(const ServerConfig &config) {
         cache_manager_, metrics_reporter_, metrics_registry_, registry_manager_, leader_elector_);
     debug_impl_ = std::make_shared<DebugServiceImpl>(cache_manager_);
 
-    meta_impl_->DisableLeaderOnlyRequests();
-    admin_impl_->DisableLeaderOnlyRequests();
-
     KVCM_LOG_INFO("server init success.");
     return true;
 }
 
 void Server::OnBecomeLeader() {
+    is_leader_.store(true);
     KVCM_LOG_INFO("Server promoted to leader, starting recover...");
 
     if (config_.IsRaftEnabled() && !is_first_leader_election_) {
-        // Raft 非首次选举：RegistryManager 的内存状态已通过 commit callback
-        // 在 follower 期间持续同步，无需 DoRecover。
         cache_manager_->ResumeReclaimer();
         meta_impl_->EnableLeaderOnlyRequests();
         admin_impl_->EnableLeaderOnlyRequests();
@@ -100,19 +88,43 @@ void Server::OnBecomeLeader() {
         return;
     }
 
+    if (config_.IsRaftEnabled()) {
+        // In raft mode, the first leader election requires startup loading
+        // which performs synchronous raft writes (AppendAndWait). Running
+        // this on the NuRaft callback thread would block heartbeats and
+        // cause re-elections. Dispatch to a background thread.
+        std::thread([this]() { OnBecomeLeaderWork(); }).detach();
+        return;
+    }
+
+    OnBecomeLeaderWork();
+}
+
+void Server::OnBecomeLeaderWork() {
     ErrorCode ec = registry_manager_->DoRecover();
     if (ec != EC_OK) {
         KVCM_LOG_ERROR("registry_manager recover failed");
         return;
     }
 
+    if (!is_leader_.load()) {
+        KVCM_LOG_WARN("lost leadership during recover, aborting");
+        return;
+    }
+
     if (!is_startup_loaded_) {
-        is_startup_loaded_ = true;
         StartupConfigLoader loader;
         loader.Init(registry_manager_);
         if (!loader.Load(config_.startup_config())) {
             KVCM_LOG_ERROR("Startup loader failed");
+        } else {
+            is_startup_loaded_ = true;
         }
+    }
+
+    if (!is_leader_.load()) {
+        KVCM_LOG_WARN("lost leadership during startup load, aborting");
+        return;
     }
 
     ec = cache_manager_->DoRecover();
@@ -129,6 +141,7 @@ void Server::OnBecomeLeader() {
 }
 
 void Server::OnNoLongerLeader() {
+    is_leader_.store(false);
     KVCM_LOG_INFO("Server demoted to standby, starting cleanup...");
     cache_manager_->PauseReclaimer();
 
@@ -174,6 +187,19 @@ bool Server::Start() {
     if (!leader_elector_->Start()) {
         KVCM_LOG_ERROR("leader_elector start failed");
         return false;
+    }
+    if (config_.IsRaftEnabled() && raft_coordinator_) {
+        ErrorCode rc = raft_coordinator_->Start(raft_cfg_);
+        if (rc != EC_OK) {
+            KVCM_LOG_ERROR("RaftCoordinator Start failed, rc=%d", rc);
+            raft_meta::RaftCoordinator::SetInstance(nullptr);
+            return false;
+        }
+        auto *rm = registry_manager_.get();
+        raft_coordinator_->SetRegistryCommitCallback(
+            [rm](bool is_save, const std::string &key, const std::map<std::string, std::string> &fields) {
+                rm->OnRegistryCommit(is_save, key, fields);
+            });
     }
     KVCM_LOG_INFO("\n%s\nkvcm server start OK!\nversion: %s\ncommit: %s\nbuild time: %s",
                   KVCM_ART,
@@ -407,13 +433,7 @@ bool Server::CreateRaftLeaderElector() {
     }
     elector->SetSelfNodeInfo(node_info);
 
-    ErrorCode rc = raft_coordinator_->Start(raft_cfg);
-    if (rc != EC_OK) {
-        KVCM_LOG_ERROR("RaftCoordinator Start failed, rc=%d", rc);
-        raft_meta::RaftCoordinator::SetInstance(nullptr);
-        return false;
-    }
-
+    raft_cfg_ = raft_cfg;
     leader_elector_ = elector;
     KVCM_LOG_INFO("Raft leader elector created, server_id[%d] node_id[%s]", raft_cfg.server_id, node_id.c_str());
     return true;

@@ -1,6 +1,12 @@
 package(default_visibility = ["//visibility:public"])
 
 cc_library(
+    name = "raft_mode",
+    srcs = ["raft_mode.cc"],
+    hdrs = ["raft_mode.h"],
+)
+
+cc_library(
     name = "raft_log_codec",
     srcs = [
         "raft_log_codec.cc",
@@ -88,6 +94,7 @@ cc_library(
         ":lmdb_log_store",
         ":meta_state_machine",
         ":meta_state_mgr",
+        ":raft_mode",
         "//kv_cache_manager/common",
         "//kv_cache_manager/config",
         "//kv_cache_manager/meta:common",

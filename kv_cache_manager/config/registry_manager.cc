@@ -12,7 +12,7 @@
 #include "kv_cache_manager/config/registry_storage_backend_factory.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
-#include "kv_cache_manager/meta/raft/raft_coordinator.h"
+#include "kv_cache_manager/meta/raft/raft_mode.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
 namespace kv_cache_manager {
@@ -145,25 +145,18 @@ ErrorCode RegistryManager::AddStorage(RequestContext *request_context, const Sto
     const auto &global_unique_name = storage_config.global_unique_name();
     auto ec = LoadAndSave(kRegistryStorageKey, global_unique_name, &storage_config);
     RETURN_IF_EC_NOT_OK_WITH_LOG_S(WARN, ec, "load and save storage failed");
-    if (raft_meta::RaftCoordinator::GetInstance()) {
-        // Raft mode: commit callback handles RegisterStorage on all nodes.
-        PREFIX_LOG_S(INFO, "add storage OK (raft)");
-        return EC_OK;
+    if (!data_storage_manager_->GetDataStorageBackend(global_unique_name)) {
+        ec = data_storage_manager_->RegisterStorage(request_context, global_unique_name, storage_config);
+        RETURN_IF_EC_NOT_OK_WITH_LOG_S(WARN, ec, "add storage failed");
     }
-    ec = data_storage_manager_->RegisterStorage(request_context, global_unique_name, storage_config);
-    RETURN_IF_EC_NOT_OK_WITH_LOG_S(WARN, ec, "add storage failed");
     PREFIX_LOG_S(INFO, "add storage OK");
-    return ec;
+    return EC_OK;
 }
 
 ErrorCode RegistryManager::EnableStorage(RequestContext *request_context, const std::string &global_unique_name) {
     const auto &trace_id = request_context->request_id();
     auto ec = UpdateStorageAvailableStatus(global_unique_name, /*is_available*/ true);
     RETURN_IF_EC_NOT_OK_WITH_LOG_S(WARN, ec, "update storage available status failed");
-    if (raft_meta::RaftCoordinator::GetInstance()) {
-        PREFIX_LOG_S(INFO, "enable storage OK (raft)");
-        return EC_OK;
-    }
     ec = data_storage_manager_->EnableStorage(global_unique_name);
     RETURN_IF_EC_NOT_OK_WITH_LOG_S(WARN, ec, "enable storage failed");
     PREFIX_LOG_S(INFO, "enable storage OK");
@@ -174,10 +167,6 @@ ErrorCode RegistryManager::DisableStorage(RequestContext *request_context, const
     const auto &trace_id = request_context->request_id();
     auto ec = UpdateStorageAvailableStatus(global_unique_name, /*is_available*/ false);
     RETURN_IF_EC_NOT_OK_WITH_LOG_S(WARN, ec, "update storage available status failed");
-    if (raft_meta::RaftCoordinator::GetInstance()) {
-        PREFIX_LOG_S(INFO, "disable storage OK (raft)");
-        return EC_OK;
-    }
     ec = data_storage_manager_->DisableStorage(global_unique_name);
     RETURN_IF_EC_NOT_OK_WITH_LOG_S(WARN, ec, "disable storage failed");
     PREFIX_LOG_S(INFO, "disable storage OK");
@@ -188,14 +177,12 @@ ErrorCode RegistryManager::RemoveStorage(RequestContext *request_context, const 
     const auto &trace_id = request_context->request_id();
     auto ec = LoadAndDelete(kRegistryStorageKey, global_unique_name);
     RETURN_IF_EC_NOT_OK_WITH_LOG_S(WARN, ec, "load and delete storage failed");
-    if (raft_meta::RaftCoordinator::GetInstance()) {
-        PREFIX_LOG_S(INFO, "remove storage OK (raft)");
-        return EC_OK;
+    if (data_storage_manager_->GetDataStorageBackend(global_unique_name)) {
+        ec = data_storage_manager_->UnRegisterStorage(global_unique_name);
+        RETURN_IF_EC_NOT_OK_WITH_LOG_S(WARN, ec, "remove storage failed");
     }
-    ec = data_storage_manager_->UnRegisterStorage(global_unique_name);
-    RETURN_IF_EC_NOT_OK_WITH_LOG_S(WARN, ec, "remove storage failed");
     PREFIX_LOG_S(INFO, "remove storage OK");
-    return ec;
+    return EC_OK;
 }
 
 ErrorCode RegistryManager::UpdateStorage(RequestContext *request_context,
@@ -203,15 +190,6 @@ ErrorCode RegistryManager::UpdateStorage(RequestContext *request_context,
                                          bool force_update) {
     const auto &trace_id = request_context->request_id();
     const auto &global_unique_name = storage_config.global_unique_name();
-    if (raft_meta::RaftCoordinator::GetInstance()) {
-        auto ec = RemoveStorage(request_context, global_unique_name);
-        RETURN_IF_EC_NOT_OK_WITH_LOG_S(WARN, ec, "update storage failed: remove storage failed");
-        ec = AddStorage(request_context, storage_config);
-        RETURN_IF_EC_NOT_OK_WITH_LOG_S(WARN, ec, "update storage failed: add storage failed");
-        PREFIX_LOG_S(INFO, "update storage OK (raft)");
-        return EC_OK;
-    }
-    std::unique_lock<std::shared_mutex> lock(mutex_);
     auto ec = RemoveStorage(request_context, global_unique_name);
     RETURN_IF_EC_NOT_OK_WITH_LOG_S(WARN, ec, "update storage failed: remove storage failed");
     ec = AddStorage(request_context, storage_config);
@@ -228,7 +206,7 @@ std::pair<ErrorCode, std::vector<StorageConfig>> RegistryManager::ListStorage(Re
 ErrorCode RegistryManager::CreateInstanceGroup(RequestContext *request_context, const InstanceGroup &instance_group) {
     const auto &trace_id = request_context->request_id();
     const auto &instance_group_name = instance_group.name();
-    if (raft_meta::RaftCoordinator::GetInstance()) {
+    if (raft_meta::IsRaftModeActive()) {
         {
             std::shared_lock<std::shared_mutex> lock(mutex_);
             if (instance_group_configs_.find(instance_group_name) != instance_group_configs_.end()) {
@@ -238,6 +216,10 @@ ErrorCode RegistryManager::CreateInstanceGroup(RequestContext *request_context, 
         }
         auto ec = LoadAndSave(kRegistryGroupKey, instance_group_name, &instance_group);
         RETURN_IF_EC_NOT_OK_WITH_LOG_G(WARN, ec, "load and save instance group failed");
+        {
+            std::unique_lock<std::shared_mutex> lock(mutex_);
+            instance_group_configs_[instance_group_name] = std::make_shared<InstanceGroup>(instance_group);
+        }
         PREFIX_LOG_G(INFO, "create instance group OK (raft)");
         return EC_OK;
     }
@@ -257,7 +239,7 @@ ErrorCode RegistryManager::UpdateInstanceGroup(RequestContext *request_context,
                                                int64_t current_version) {
     const auto &trace_id = request_context->request_id();
     const auto &instance_group_name = instance_group.name();
-    if (raft_meta::RaftCoordinator::GetInstance()) {
+    if (raft_meta::IsRaftModeActive()) {
         {
             std::shared_lock<std::shared_mutex> lock(mutex_);
             auto iter = instance_group_configs_.find(instance_group_name);
@@ -268,8 +250,9 @@ ErrorCode RegistryManager::UpdateInstanceGroup(RequestContext *request_context,
             if (current_version != iter->second->version() || instance_group.version() <= iter->second->version()) {
                 RETURN_IF_EC_NOT_OK_WITH_LOG_G(WARN,
                                                EC_ERROR,
-                                               "update instance group failed: version not match, current_version in "
-                                               "request: %ld, request version: %ld, current version: %ld",
+                                               "update instance group failed: instance group version not match, "
+                                               "current version in request: %ld, request version: %ld, current "
+                                               "version: %ld",
                                                current_version,
                                                instance_group.version(),
                                                iter->second->version());
@@ -277,6 +260,10 @@ ErrorCode RegistryManager::UpdateInstanceGroup(RequestContext *request_context,
         }
         auto ec = LoadAndSave(kRegistryGroupKey, instance_group_name, &instance_group);
         RETURN_IF_EC_NOT_OK_WITH_LOG_G(WARN, ec, "load and save instance group failed");
+        {
+            std::unique_lock<std::shared_mutex> lock(mutex_);
+            instance_group_configs_[instance_group_name] = std::make_shared<InstanceGroup>(instance_group);
+        }
         PREFIX_LOG_G(INFO, "update instance group OK (raft)");
         return EC_OK;
     }
@@ -304,7 +291,7 @@ ErrorCode RegistryManager::UpdateInstanceGroup(RequestContext *request_context,
 ErrorCode RegistryManager::RemoveInstanceGroup(RequestContext *request_context,
                                                const std::string &instance_group_name) {
     const auto &trace_id = request_context->request_id();
-    if (raft_meta::RaftCoordinator::GetInstance()) {
+    if (raft_meta::IsRaftModeActive()) {
         {
             std::shared_lock<std::shared_mutex> lock(mutex_);
             if (instance_group_configs_.find(instance_group_name) == instance_group_configs_.end()) {
@@ -314,6 +301,10 @@ ErrorCode RegistryManager::RemoveInstanceGroup(RequestContext *request_context,
         }
         auto ec = LoadAndDelete(kRegistryGroupKey, instance_group_name);
         RETURN_IF_EC_NOT_OK_WITH_LOG_G(WARN, ec, "load and delete instance group failed");
+        {
+            std::unique_lock<std::shared_mutex> lock(mutex_);
+            instance_group_configs_.erase(instance_group_name);
+        }
         PREFIX_LOG_G(INFO, "remove instance group OK (raft)");
         return EC_OK;
     }
@@ -347,7 +338,7 @@ ErrorCode RegistryManager::RegisterInstance(RequestContext *request_context,
                                             const ModelDeployment &model_deployment,
                                             const std::vector<LocationSpecGroup> &location_spec_groups) {
     const auto &trace_id = request_context->trace_id();
-    if (raft_meta::RaftCoordinator::GetInstance()) {
+    if (raft_meta::IsRaftModeActive()) {
         std::string global_quota_group_name;
         {
             std::shared_lock<std::shared_mutex> lock(mutex_);
@@ -397,6 +388,10 @@ ErrorCode RegistryManager::RegisterInstance(RequestContext *request_context,
                 "register instance failed: failed to persist instance id to storage backend");
         }
         RETURN_IF_EC_NOT_OK_WITH_LOG_I(WARN, ec, "load and save instance id failed");
+        {
+            std::unique_lock<std::shared_mutex> lock(mutex_);
+            instance_infos_[instance_id] = instance_info;
+        }
         PREFIX_LOG_I(INFO, "register instance OK (raft)");
         return EC_OK;
     }
@@ -453,7 +448,7 @@ ErrorCode RegistryManager::RemoveInstance(RequestContext *request_context,
                                           const std::string &instance_group,
                                           const std::string &instance_id) {
     const auto &trace_id = request_context->trace_id();
-    if (raft_meta::RaftCoordinator::GetInstance()) {
+    if (raft_meta::IsRaftModeActive()) {
         {
             std::shared_lock<std::shared_mutex> lock(mutex_);
             if (instance_infos_.find(instance_id) == instance_infos_.end()) {
@@ -465,6 +460,10 @@ ErrorCode RegistryManager::RemoveInstance(RequestContext *request_context,
         RETURN_IF_EC_NOT_OK_WITH_LOG_I(WARN, ec, "load and delete instance info failed");
         ec = LoadAndDelete(instance_id, instance_id);
         RETURN_IF_EC_NOT_OK_WITH_LOG_I(WARN, ec, "load and delete instance id failed");
+        {
+            std::unique_lock<std::shared_mutex> lock(mutex_);
+            instance_infos_.erase(instance_id);
+        }
         PREFIX_LOG_I(INFO, "remove instance OK (raft)");
         return EC_OK;
     }
@@ -523,16 +522,20 @@ ErrorCode RegistryManager::AddAccount(RequestContext *request_context,
                                       const std::string &password,
                                       const AccountRole &role) {
     const auto &trace_id = request_context->request_id();
-    if (raft_meta::RaftCoordinator::GetInstance()) {
+    if (raft_meta::IsRaftModeActive()) {
         {
             std::shared_lock<std::shared_mutex> lock(mutex_);
             if (accounts_.find(user_name) != accounts_.end()) {
                 RETURN_IF_EC_NOT_OK_WITH_LOG_A(WARN, EC_EXIST, "add account failed: account already existed");
             }
         }
-        std::shared_ptr<Account> account = std::make_shared<Account>(user_name, password, role);
+        auto account = std::make_shared<Account>(user_name, password, role);
         auto ec = LoadAndSave(kRegistryAccountKey, user_name, account.get());
         RETURN_IF_EC_NOT_OK_WITH_LOG_A(WARN, ec, "load and save account failed");
+        {
+            std::unique_lock<std::shared_mutex> lock(mutex_);
+            accounts_[user_name] = account;
+        }
         PREFIX_LOG_A(INFO, "add account OK (raft)");
         return EC_OK;
     }
@@ -550,7 +553,7 @@ ErrorCode RegistryManager::AddAccount(RequestContext *request_context,
 
 ErrorCode RegistryManager::DeleteAccount(RequestContext *request_context, const std::string &user_name) {
     const auto &trace_id = request_context->request_id();
-    if (raft_meta::RaftCoordinator::GetInstance()) {
+    if (raft_meta::IsRaftModeActive()) {
         {
             std::shared_lock<std::shared_mutex> lock(mutex_);
             if (accounts_.find(user_name) == accounts_.end()) {
@@ -559,6 +562,10 @@ ErrorCode RegistryManager::DeleteAccount(RequestContext *request_context, const 
         }
         auto ec = LoadAndDelete(kRegistryAccountKey, user_name);
         RETURN_IF_EC_NOT_OK_WITH_LOG_A(WARN, ec, "load and delete account failed");
+        {
+            std::unique_lock<std::shared_mutex> lock(mutex_);
+            accounts_.erase(user_name);
+        }
         PREFIX_LOG_A(INFO, "delete account OK (raft)");
         return EC_OK;
     }

@@ -28,7 +28,7 @@ protected:
 
 private:
     // 请求控制机制
-    std::atomic<bool> is_accepting_leader_only_requests_{true};
+    std::atomic<bool> is_accepting_leader_only_requests_{false};
     std::atomic<int> active_request_count_{0};
     std::atomic<int> active_leader_only_request_count_{0};
     std::condition_variable_any leader_only_request_done_cv_;

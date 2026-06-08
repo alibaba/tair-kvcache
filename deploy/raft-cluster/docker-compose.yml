@@ -14,30 +14,14 @@ x-kvcm-common: &kvcm-common
   image: ${KVCM_DEV_IMAGE:-hub.docker.alibaba-inc.com/isearch/kv_cache_manager_dev:0.0.1.6}
   entrypoint: ["/bin/bash", "/opt/entrypoint.sh"]
   volumes:
-    - kvcm-bin:/opt/kvcm:ro
+    - ./.kvcm-bin:/opt/kvcm:ro
     - ./conf:/conf:ro
     - ./entrypoint.sh:/opt/entrypoint.sh:ro
   networks:
     - kvcm-raft-net
   restart: unless-stopped
-  depends_on:
-    kvcm-builder:
-      condition: service_completed_successfully
 
 services:
-  kvcm-builder:
-    image: ${KVCM_DEV_IMAGE:-hub.docker.alibaba-inc.com/isearch/kv_cache_manager_dev:0.0.1.6}
-    entrypoint: ["/bin/bash", "/opt/build.sh"]
-    working_dir: /src
-    volumes:
-      - ${KVCM_SRC_DIR:-../..}:/src
-      - bazel-cache:/root/.cache/bazel
-      - kvcm-bin:/opt/kvcm
-      - ./build.sh:/opt/build.sh:ro
-    networks:
-      - kvcm-raft-net
-    restart: "no"
-
   kvcm-node1:
     <<: *kvcm-common
     hostname: kvcm-node1
@@ -51,7 +35,7 @@ services:
       - "6492:6492"   # AdminService HTTP
       - "9001:9001"   # Raft RPC
     volumes:
-      - kvcm-bin:/opt/kvcm:ro
+      - ./.kvcm-bin:/opt/kvcm:ro
       - ./conf:/conf:ro
       - ./entrypoint.sh:/opt/entrypoint.sh:ro
       - node1-data:/data
@@ -69,7 +53,7 @@ services:
       - "6494:6492"
       - "9002:9002"
     volumes:
-      - kvcm-bin:/opt/kvcm:ro
+      - ./.kvcm-bin:/opt/kvcm:ro
       - ./conf:/conf:ro
       - ./entrypoint.sh:/opt/entrypoint.sh:ro
       - node2-data:/data
@@ -87,14 +71,12 @@ services:
       - "6496:6492"
       - "9003:9003"
     volumes:
-      - kvcm-bin:/opt/kvcm:ro
+      - ./.kvcm-bin:/opt/kvcm:ro
       - ./conf:/conf:ro
       - ./entrypoint.sh:/opt/entrypoint.sh:ro
       - node3-data:/data
 
 volumes:
-  bazel-cache:
-  kvcm-bin:
   node1-data:
   node2-data:
   node3-data:

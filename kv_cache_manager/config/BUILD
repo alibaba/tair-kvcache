@@ -89,6 +89,7 @@ cc_library(
         "//kv_cache_manager/common:concurrent_hash_map",
         "//kv_cache_manager/common:redis_client",
         "//kv_cache_manager/data_storage",
+        "//kv_cache_manager/meta/raft:raft_mode",
         "//kv_cache_manager/protocol/protobuf:service_cc_proto",
     ],
 )

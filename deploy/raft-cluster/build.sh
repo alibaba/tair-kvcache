@@ -13,6 +13,7 @@ echo "=== Building kv_cache_manager_bin ==="
 cd /src
 bazelisk build //kv_cache_manager:kv_cache_manager_bin 2>&1
 
-cp -f bazel-bin/kv_cache_manager/kv_cache_manager_bin "$BINARY"
+BAZEL_BIN=$(bazelisk info bazel-bin 2>/dev/null)
+cp -f "${BAZEL_BIN}/kv_cache_manager/kv_cache_manager_bin" "$BINARY"
 chmod +x "$BINARY"
 echo "=== Build complete ==="
