@@ -14,6 +14,7 @@
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_local_backend.h"
+#include "kv_cache_manager/meta/raft/raft_log_codec.h"
 #include "kv_cache_manager/meta/raft/raft_mode.h"
 
 namespace kv_cache_manager {
@@ -223,6 +224,12 @@ ErrorCode RaftCoordinator::AppendAndWait(ptr<buffer> data) {
     }
     result->get();
     return CmdCodeToEc(result->get_result_code());
+}
+
+ErrorCode RaftCoordinator::Barrier() {
+    LogOp op;
+    op.type = OpType::kNoOp;
+    return AppendAndWait(Encode(op));
 }
 
 std::shared_ptr<MetaCacheBaseBackend> RaftCoordinator::GetOrCreateBackend(const std::string &instance_id) {

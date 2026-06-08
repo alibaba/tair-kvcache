@@ -101,6 +101,14 @@ void Server::OnBecomeLeader() {
 }
 
 void Server::OnBecomeLeaderWork() {
+    if (config_.IsRaftEnabled() && raft_coordinator_) {
+        ErrorCode bec = raft_coordinator_->Barrier();
+        if (bec != EC_OK) {
+            KVCM_LOG_ERROR("raft barrier failed (ec=%d), state machine may be stale", bec);
+            return;
+        }
+    }
+
     ErrorCode ec = registry_manager_->DoRecover();
     if (ec != EC_OK) {
         KVCM_LOG_ERROR("registry_manager recover failed");

@@ -68,9 +68,9 @@ public:
 
         // Raft tuning.
         int snapshot_distance = 100000;
-        int election_timeout_lower = 300;
-        int election_timeout_upper = 600;
-        int heart_beat_interval = 100;
+        int election_timeout_lower = 150;
+        int election_timeout_upper = 300;
+        int heart_beat_interval = 20;
 
         // Default tunables passed to per-instance MetaLocalBackend created by
         // the state machine factory. Each Instance gets its own backend; the
@@ -110,6 +110,12 @@ public:
     // Returns EC_OK on commit, EC_BADARGS if this node is not the leader,
     // EC_ERROR on raft transport / timeout failures.
     ErrorCode AppendAndWait(nuraft::ptr<nuraft::buffer> data);
+
+    // Append a kNoOp entry and block until it commits. Guarantees that all
+    // previously appended log entries have been applied to the state machine.
+    // Must be called from the leader after election to drain the log before
+    // reading state machine state.
+    ErrorCode Barrier();
 
     // Per-instance backend access. The state machine creates these on demand
     // via the factory closure installed in Start(); GetOrCreateBackend either

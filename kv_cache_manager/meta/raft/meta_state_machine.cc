@@ -112,6 +112,41 @@ ptr<buffer> MetaStateMachine::commit(const ulong log_idx, buffer &data) {
         return nullptr;
     }
 
+    if (op.type == OpType::kNoOp) {
+        last_commit_index_.store(log_idx);
+        return nullptr;
+    }
+
+    if (op.type == OpType::kRegistryFieldSave || op.type == OpType::kRegistryFieldDelete) {
+        bool is_field_save = (op.type == OpType::kRegistryFieldSave);
+        std::map<std::string, std::string> fields_copy;
+        {
+            std::unique_lock<std::shared_mutex> g(registry_mu_);
+            if (is_field_save) {
+                registry_store_[op.registry_key][op.registry_field_id] = op.registry_field_value;
+                fields_copy = registry_store_[op.registry_key];
+            } else {
+                auto it = registry_store_.find(op.registry_key);
+                if (it != registry_store_.end()) {
+                    it->second.erase(op.registry_field_id);
+                    if (it->second.empty()) {
+                        registry_store_.erase(it);
+                    } else {
+                        fields_copy = it->second;
+                    }
+                }
+            }
+        }
+        {
+            std::lock_guard<std::mutex> g(registry_cb_mu_);
+            if (registry_commit_cb_) {
+                registry_commit_cb_(true, op.registry_key, fields_copy);
+            }
+        }
+        last_commit_index_.store(log_idx);
+        return nullptr;
+    }
+
     if (op.type == OpType::kRegistrySave || op.type == OpType::kRegistryDelete) {
         bool is_save = (op.type == OpType::kRegistrySave);
         std::map<std::string, std::string> fields_copy;

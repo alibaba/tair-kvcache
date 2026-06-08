@@ -68,6 +68,17 @@ size_t EstimateLogOpSize(const LogOp &op) {
     case OpType::kRegistryDelete:
         total += sizeof(uint32_t) + op.registry_key.size();
         break;
+    case OpType::kNoOp:
+        break;
+    case OpType::kRegistryFieldSave:
+        total += sizeof(uint32_t) + op.registry_key.size();
+        total += sizeof(uint32_t) + op.registry_field_id.size();
+        total += sizeof(uint32_t) + op.registry_field_value.size();
+        break;
+    case OpType::kRegistryFieldDelete:
+        total += sizeof(uint32_t) + op.registry_key.size();
+        total += sizeof(uint32_t) + op.registry_field_id.size();
+        break;
     }
     return total;
 }
@@ -154,6 +165,17 @@ nuraft::ptr<nuraft::buffer> Encode(const LogOp &op) {
     case OpType::kRegistryDelete:
         bs.put_str(op.registry_key);
         break;
+    case OpType::kNoOp:
+        break;
+    case OpType::kRegistryFieldSave:
+        bs.put_str(op.registry_key);
+        bs.put_str(op.registry_field_id);
+        bs.put_str(op.registry_field_value);
+        break;
+    case OpType::kRegistryFieldDelete:
+        bs.put_str(op.registry_key);
+        bs.put_str(op.registry_field_id);
+        break;
     }
     return buf;
 }
@@ -200,6 +222,17 @@ ErrorCode Decode(nuraft::buffer &buf, LogOp &out) {
             break;
         case OpType::kRegistryDelete:
             out.registry_key = bs.get_str();
+            break;
+        case OpType::kNoOp:
+            break;
+        case OpType::kRegistryFieldSave:
+            out.registry_key = bs.get_str();
+            out.registry_field_id = bs.get_str();
+            out.registry_field_value = bs.get_str();
+            break;
+        case OpType::kRegistryFieldDelete:
+            out.registry_key = bs.get_str();
+            out.registry_field_id = bs.get_str();
             break;
         default:
             KVCM_LOG_ERROR("raft_log_codec: unknown op type[%u]", op_raw);
