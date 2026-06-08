@@ -97,6 +97,7 @@ cc_library(
         "//kv_cache_manager/config:leader_elector_base",
         "//kv_cache_manager/data_storage",
         "//kv_cache_manager/manager:cache_manager",
+        "//kv_cache_manager/service/http_service:auth",
         "//kv_cache_manager/service/util:manager_message_proto_util",
         "//kv_cache_manager/service/util:proto_message_json_util",
         "//kv_cache_manager/service/util:service_access_log",

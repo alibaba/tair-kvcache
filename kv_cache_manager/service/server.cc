@@ -233,14 +233,17 @@ bool Server::StartHttpServer() {
     debug_http_service_->Init();
 
     // wire Bearer auth on admin + debug only; meta is the data
-    // plane and intentionally stays open.  when no token is
-    // configured the services run unauthenticated — log a WARN so
-    // operators don't accidentally expose them on untrusted nets
+    // plane and intentionally stays open.  the verifier is always
+    // created so operators can lock the service down at runtime via
+    // SetAdminAuthTokens; an empty list means open mode (verifier
+    // returns kOk).  log a WARN when starting open so operators
+    // don't accidentally expose admin/debug on untrusted nets
     const auto &admin_tokens = config_.GetAdminAuthTokens();
+    auto verifier = std::make_shared<StaticBearerTokenVerifier>(admin_tokens);
+    admin_http_service_->SetTokenVerifier(verifier);
+    debug_http_service_->SetTokenVerifier(verifier);
+    admin_impl_->SetTokenVerifier(verifier);
     if (!admin_tokens.empty()) {
-        auto verifier = std::make_shared<StaticBearerTokenVerifier>(admin_tokens);
-        admin_http_service_->SetTokenVerifier(verifier);
-        debug_http_service_->SetTokenVerifier(verifier);
         KVCM_LOG_INFO("admin/debug HTTP Bearer auth enabled, accepted_tokens=%zu", admin_tokens.size());
     } else {
         KVCM_LOG_WARN("admin/debug HTTP auth disabled (kvcm.service.admin_auth_token not set); "

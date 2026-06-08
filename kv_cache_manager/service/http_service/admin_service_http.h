@@ -120,6 +120,17 @@ public:
                       proto::admin::UpdateLoggerRequest *request,
                       proto::admin::CommonResponse *response);
 
+    // admin auth token management APIs (runtime only)
+    void SetAdminAuthTokens(coro_http::coro_http_connection *http_conn,
+                            proto::admin::SetAdminAuthTokensRequest *request,
+                            proto::admin::CommonResponse *response);
+    void RotateAdminAuthToken(coro_http::coro_http_connection *http_conn,
+                              proto::admin::RotateAdminAuthTokenRequest *request,
+                              proto::admin::CommonResponse *response);
+    void ListAdminAuthTokens(coro_http::coro_http_connection *http_conn,
+                             proto::admin::ListAdminAuthTokensRequest *request,
+                             proto::admin::ListAdminAuthTokensResponse *response);
+
 private:
     std::shared_ptr<MetricsRegistry> metrics_registry_;
     std::shared_ptr<AdminServiceImpl> admin_service_impl_;
@@ -172,6 +183,11 @@ private:
 
     // for logging control APIs
     KVCM_DECLARE_METRICS_COLLECTOR_(UpdateLogger);
+
+    // for admin auth token management APIs
+    KVCM_DECLARE_METRICS_COLLECTOR_(SetAdminAuthTokens);
+    KVCM_DECLARE_METRICS_COLLECTOR_(RotateAdminAuthToken);
+    KVCM_DECLARE_METRICS_COLLECTOR_(ListAdminAuthTokens);
 };
 
 } // namespace kv_cache_manager

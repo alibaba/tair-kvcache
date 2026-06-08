@@ -59,10 +59,12 @@ TEST_F(StaticBearerTokenVerifierTest, MultiTokenRotation) {
     ASSERT_EQ(AuthOutcome::kInvalidToken, v.Verify("Bearer other"));
 }
 
-TEST_F(StaticBearerTokenVerifierTest, EmptyAcceptedListRejectsEverything) {
+TEST_F(StaticBearerTokenVerifierTest, EmptyAcceptedListIsOpenMode) {
     StaticBearerTokenVerifier v({});
-    ASSERT_EQ(AuthOutcome::kInvalidToken, v.Verify("Bearer anything"));
-    ASSERT_EQ(AuthOutcome::kMissingCredentials, v.Verify(""));
+    // open mode: every request passes, including a missing header
+    ASSERT_EQ(AuthOutcome::kOk, v.Verify(""));
+    ASSERT_EQ(AuthOutcome::kOk, v.Verify("Bearer anything"));
+    ASSERT_EQ(AuthOutcome::kOk, v.Verify("garbage"));
 }
 
 TEST_F(StaticBearerTokenVerifierTest, RealmDefaultsAndOverride) {
@@ -71,4 +73,41 @@ TEST_F(StaticBearerTokenVerifierTest, RealmDefaultsAndOverride) {
 
     StaticBearerTokenVerifier v_custom({"x"}, "admin-api");
     ASSERT_EQ("admin-api", v_custom.Realm());
+}
+
+TEST_F(StaticBearerTokenVerifierTest, SetTokensSwapsAtomically) {
+    StaticBearerTokenVerifier v({"a"});
+    ASSERT_EQ(AuthOutcome::kOk, v.Verify("Bearer a"));
+
+    v.SetTokens({"b", "c"});
+    ASSERT_EQ(AuthOutcome::kInvalidToken, v.Verify("Bearer a"));
+    ASSERT_EQ(AuthOutcome::kOk, v.Verify("Bearer b"));
+    ASSERT_EQ(AuthOutcome::kOk, v.Verify("Bearer c"));
+}
+
+TEST_F(StaticBearerTokenVerifierTest, OpenToEnforcingTransition) {
+    StaticBearerTokenVerifier v({});
+    // start in open mode
+    ASSERT_EQ(AuthOutcome::kOk, v.Verify(""));
+
+    // lock down
+    v.SetTokens({"secret"});
+    ASSERT_EQ(AuthOutcome::kMissingCredentials, v.Verify(""));
+    ASSERT_EQ(AuthOutcome::kOk, v.Verify("Bearer secret"));
+
+    // back to open
+    v.SetTokens({});
+    ASSERT_EQ(AuthOutcome::kOk, v.Verify(""));
+    ASSERT_EQ(AuthOutcome::kOk, v.Verify("Bearer something"));
+}
+
+TEST_F(StaticBearerTokenVerifierTest, SnapshotMatchesSet) {
+    StaticBearerTokenVerifier v({});
+    ASSERT_TRUE(v.SnapshotTokens().empty());
+
+    v.SetTokens({"x", "y"});
+    auto snap = v.SnapshotTokens();
+    ASSERT_EQ(2u, snap.size());
+    ASSERT_EQ("x", snap[0]);
+    ASSERT_EQ("y", snap[1]);
 }

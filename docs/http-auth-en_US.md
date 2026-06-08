@@ -88,7 +88,120 @@ downtime:
 2. Migrate clients to the new token.
 3. Redeploy with only `new` to retire the old token.
 
-A configuration reload requires a process restart.
+For online rotation without redeploying, see
+[Runtime Token Management](#runtime-token-management) below. Note that
+runtime changes are kept in memory only — operators must mirror them
+into the config file (or environment) for durability across restarts.
+
+## Runtime Token Management
+
+The Admin service exposes three RPCs to inspect and mutate the live
+accepted-token list without restarting the server. The endpoints are
+themselves served by the auth-protected Admin service, so:
+
+- An unauthenticated caller cannot lock the cluster down on themselves.
+- A caller holding the *current* token can install a new token and
+  revoke the old one in a single call.
+
+Changes are **in-memory only**. They survive across reconfigurations
+within the process but are reset to `kvcm.service.admin_auth_token` on
+restart. Persist intentional changes by editing the config file.
+
+### Endpoints
+
+| HTTP route (POST, port 6492) | gRPC method | Purpose |
+|---|---|---|
+| `/api/setAdminAuthTokens` | `AdminService.SetAdminAuthTokens` | Replace the accepted-token list wholesale |
+| `/api/rotateAdminAuthToken` | `AdminService.RotateAdminAuthToken` | Add a new token and (optionally) drop an old one atomically |
+| `/api/listAdminAuthTokens` | `AdminService.ListAdminAuthTokens` | Inspect count + per-token fingerprints |
+
+`Set` with an empty list flips the service back to **open mode**
+(equivalent to starting with no token configured). The first non-empty
+`Set` after that flips it back into enforcing mode — no restart
+needed.
+
+### `Set` — full replacement
+
+```bash
+# install a fresh list (replaces whatever is configured)
+curl -X POST \
+     -H 'Authorization: Bearer s3cret-token' \
+     -H 'Content-Type: application/json' \
+     -d '{"trace_id":"set-1","tokens":["new-token-1","new-token-2"]}' \
+     http://<host>:6492/api/setAdminAuthTokens
+
+# disable enforcement (open mode)
+curl -X POST \
+     -H 'Authorization: Bearer s3cret-token' \
+     -H 'Content-Type: application/json' \
+     -d '{"trace_id":"open","tokens":[]}' \
+     http://<host>:6492/api/setAdminAuthTokens
+```
+
+Empty entries (e.g. `["a","","b"]`) are silently dropped, matching the
+config-file parsing behaviour.
+
+### `Rotate` — atomic add-then-drop
+
+The typical zero-gap rotation:
+
+```bash
+# 1. add `new-token` (the operator's current token still works)
+curl -X POST \
+     -H 'Authorization: Bearer current-token' \
+     -H 'Content-Type: application/json' \
+     -d '{"trace_id":"rot-add","new_token":"new-token"}' \
+     http://<host>:6492/api/rotateAdminAuthToken
+
+# 2. switch your tooling to `new-token`, then drop the old one
+curl -X POST \
+     -H 'Authorization: Bearer new-token' \
+     -H 'Content-Type: application/json' \
+     -d '{"trace_id":"rot-drop","old_token":"current-token","new_token":"new-token"}' \
+     http://<host>:6492/api/rotateAdminAuthToken
+```
+
+| `old_token` | `new_token` | Effect |
+|---|---|---|
+| empty | non-empty | append `new_token` (additive) |
+| non-empty (matches an accepted token) | non-empty | append `new_token`, remove `old_token` |
+| non-empty (no match) | any | `INVALID_ARGUMENT` |
+| any | empty | `INVALID_ARGUMENT` |
+
+`Rotate` is a convenience over `Set`: it avoids the gap where
+`Set([new])` would be served by a node whose own caller is still
+authenticated with the old token.
+
+### `List` — inspect without leaking the secret
+
+```bash
+curl -X POST \
+     -H 'Authorization: Bearer s3cret-token' \
+     -H 'Content-Type: application/json' \
+     -d '{"trace_id":"list-1"}' \
+     http://<host>:6492/api/listAdminAuthTokens
+```
+
+The response reports an enforcing flag, the count, and an opaque
+8-hex-char fingerprint per token (FNV-1a 32-bit over the raw bytes).
+Fingerprints are stable across calls but non-reversible, suitable for
+visual diffing across replicas:
+
+```json
+{
+  "header": {"status": {"code": 0}},
+  "enforcing": true,
+  "token_count": 2,
+  "fingerprints": ["1a2b3c4d", "deadbeef"]
+}
+```
+
+### Multi-replica deployments
+
+Each replica keeps its own in-memory token list. After a runtime
+change, hit every leader and follower in turn (or script it) so the
+verifiers stay in sync. `listAdminAuthTokens` is the supported way to
+audit drift — compare the fingerprint sets across nodes.
 
 ## Prometheus Scraping
 
@@ -207,11 +320,23 @@ byte mismatches. This defeats naive timing oracles on the matching
 prefix. Token lengths should be kept bounded so that the length
 itself is not a useful side channel.
 
-### Zero-overhead opt-out
+### Always-on verifier on Admin & Debug
 
-If no token verifier is attached, `WrapWithAuth` returns the original
-handler unchanged. Disabling auth therefore costs nothing per
-request — it is exactly the previous code path.
+Server startup attaches a `StaticBearerTokenVerifier` to the Admin and
+Debug HTTP services unconditionally — even when
+`kvcm.service.admin_auth_token` is empty. "Open mode" is implemented
+inside the verifier itself: an empty accepted-token list returns
+`kOk` for every request. The cost is one shared-lock acquisition and
+an empty-vector check per request, which is negligible relative to
+admin/debug QPS.
+
+Wiring the verifier in unconditionally is what makes the runtime
+`Set`/`Rotate` endpoints able to flip the service from open to
+enforcing without restarting.
+
+The Meta HTTP service still keeps its truly-zero-overhead path: no
+verifier is attached, and `WrapWithAuth` returns the original handler
+unchanged.
 
 ### Out of scope
 
@@ -225,8 +350,10 @@ The following are intentionally not part of this feature:
   a single token list. There is no notion of read-only vs. admin
   tokens; if you need that, use separate deployments or front the
   service with a proxy that enforces it.
-- **Hot reload.** Tokens are read once at startup. Rotating a token
-  requires a restart with the new list.
+- **Runtime persistence.** The `SetAdminAuthTokens` and
+  `RotateAdminAuthToken` endpoints mutate the in-memory token list
+  only. To persist across restarts, mirror the change into the config
+  file or environment.
 - **Token issuance.** Tokens are operator-supplied opaque strings;
   this service does not mint them.
 
@@ -239,4 +366,5 @@ The following are intentionally not part of this feature:
 | `kv_cache_manager/service/http_service/auth/auth_util.{h,cc}` | constant-time and case-insensitive helpers |
 | `kv_cache_manager/service/http_service/coro_http_service.{h,cc}` | `WrapWithAuth` middleware and `SetTokenVerifier` |
 | `kv_cache_manager/service/server.cc` | wires the verifier onto Admin and Debug at startup |
+| `kv_cache_manager/service/admin_service_impl.{h,cc}` | implements `Set/Rotate/ListAdminAuthTokens` against the live verifier |
 | `kv_cache_manager/service/server_config.{h,cc}` | parses `kvcm.service.admin_auth_token` |

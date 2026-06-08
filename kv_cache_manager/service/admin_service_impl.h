@@ -13,6 +13,7 @@ class MetricsReporter;
 class MetricsRegistry;
 class RegistryManager;
 class RequestContext;
+class StaticBearerTokenVerifier;
 
 class AdminServiceImpl : public ServiceImplBase {
 public:
@@ -22,6 +23,14 @@ public:
                      std::shared_ptr<RegistryManager> registry_manager,
                      std::shared_ptr<LeaderElector> leader_elector);
     ~AdminServiceImpl() override = default;
+
+    // inject the live admin/debug token verifier so the runtime
+    // token management RPCs can mutate the in-memory accepted list.
+    // when null (e.g. unit tests not exercising auth) the management
+    // RPCs respond with UNSUPPORTED
+    void SetTokenVerifier(std::shared_ptr<StaticBearerTokenVerifier> verifier) {
+        token_verifier_ = std::move(verifier);
+    }
 
     // 实现所有ConfigService的接口方法
     void AddStorage(RequestContext *request_context,
@@ -121,12 +130,24 @@ public:
                       const proto::admin::UpdateLoggerRequest *request,
                       proto::admin::CommonResponse *response);
 
+    // admin auth token 在线管理相关接口
+    void SetAdminAuthTokens(RequestContext *request_context,
+                            const proto::admin::SetAdminAuthTokensRequest *request,
+                            proto::admin::CommonResponse *response);
+    void RotateAdminAuthToken(RequestContext *request_context,
+                              const proto::admin::RotateAdminAuthTokenRequest *request,
+                              proto::admin::CommonResponse *response);
+    void ListAdminAuthTokens(RequestContext *request_context,
+                             const proto::admin::ListAdminAuthTokensRequest *request,
+                             proto::admin::ListAdminAuthTokensResponse *response);
+
 private:
     std::shared_ptr<CacheManager> cache_manager_;
     std::shared_ptr<MetricsReporter> metrics_reporter_;
     std::shared_ptr<MetricsRegistry> metrics_registry_; // for the GetMetrics API
     std::shared_ptr<RegistryManager> registry_manager_;
     std::shared_ptr<LeaderElector> leader_elector_;
+    std::shared_ptr<StaticBearerTokenVerifier> token_verifier_;
 };
 
 } // namespace kv_cache_manager

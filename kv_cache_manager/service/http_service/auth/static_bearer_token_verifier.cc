@@ -25,6 +25,15 @@ StaticBearerTokenVerifier::StaticBearerTokenVerifier(std::vector<std::string> ac
     : tokens_(std::move(accepted_tokens)), realm_(std::move(realm)) {}
 
 AuthOutcome StaticBearerTokenVerifier::Verify(std::string_view authz_header) const {
+    std::shared_lock<std::shared_mutex> lock(mu_);
+
+    // open mode: an empty accepted-token list means auth is disabled.
+    // we still go through the wrapper so it can be flipped on at
+    // runtime by SetTokens; until then everything passes
+    if (tokens_.empty()) {
+        return AuthOutcome::kOk;
+    }
+
     // RFC 7235 §4.2: an absent Authorization header means "no
     // credentials supplied"
     auto h = TrimOWS(authz_header);
@@ -69,6 +78,16 @@ AuthOutcome StaticBearerTokenVerifier::Verify(std::string_view authz_header) con
         }
     }
     return AuthOutcome::kInvalidToken;
+}
+
+void StaticBearerTokenVerifier::SetTokens(std::vector<std::string> new_tokens) {
+    std::unique_lock<std::shared_mutex> lock(mu_);
+    tokens_ = std::move(new_tokens);
+}
+
+std::vector<std::string> StaticBearerTokenVerifier::SnapshotTokens() const {
+    std::shared_lock<std::shared_mutex> lock(mu_);
+    return tokens_;
 }
 
 } // namespace kv_cache_manager
