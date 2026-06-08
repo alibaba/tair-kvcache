@@ -312,13 +312,15 @@ without touching the HTTP service plumbing.
 - the resulting token is compared against the accepted list using
   constant-time equality
 
-### Constant-time comparison
+### Length-revealing byte-position-independent comparison
 
-`AuthUtil::ConstantTimeEquals` performs a length-revealing constant-
-time compare in `O(min(len(a), len(b)))` regardless of where the first
-byte mismatches. This defeats naive timing oracles on the matching
-prefix. Token lengths should be kept bounded so that the length
-itself is not a useful side channel.
+`AuthUtil::ConstantTimeEquals` early-rejects on size mismatch — so the
+length of an accepted token is leaked through timing — and when the
+sizes match it scans every byte of the token without short-circuiting
+on the first differing one. This defeats naive timing oracles that
+would otherwise reveal the length of the matching prefix. Token
+lengths should be kept bounded so that the length itself is not a
+useful side channel.
 
 ### Always-on verifier on Admin & Debug
 
