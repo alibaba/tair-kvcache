@@ -21,6 +21,9 @@ public:
     ErrorCode Load(const std::string &key, std::map<std::string, std::string> &out_value) noexcept override;
     ErrorCode Save(const std::string &key, const std::map<std::string, std::string> &value) noexcept override;
     ErrorCode Delete(const std::string &key) noexcept override;
+    ErrorCode SaveField(const std::string &key, const std::string &field_id,
+                        const std::string &value) noexcept override;
+    ErrorCode DeleteField(const std::string &key, const std::string &field_id) noexcept override;
 
     void SetCoordinatorForTest(raft_meta::RaftCoordinator *coord) { coordinator_override_ = coord; }
 

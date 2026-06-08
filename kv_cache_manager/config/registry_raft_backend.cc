@@ -58,4 +58,31 @@ ErrorCode RegistryRaftBackend::Delete(const std::string &key) noexcept {
     return coord->AppendAndWait(raft_meta::Encode(op));
 }
 
+ErrorCode RegistryRaftBackend::SaveField(const std::string &key, const std::string &field_id,
+                                         const std::string &value) noexcept {
+    auto *coord = Coordinator();
+    if (!coord) {
+        return EC_ERROR;
+    }
+    raft_meta::LogOp op;
+    op.type = raft_meta::OpType::kRegistryFieldSave;
+    op.registry_key = key;
+    op.registry_field_id = field_id;
+    op.registry_field_value = value;
+    return coord->AppendAndWait(raft_meta::Encode(op));
+}
+
+ErrorCode RegistryRaftBackend::DeleteField(const std::string &key,
+                                           const std::string &field_id) noexcept {
+    auto *coord = Coordinator();
+    if (!coord) {
+        return EC_ERROR;
+    }
+    raft_meta::LogOp op;
+    op.type = raft_meta::OpType::kRegistryFieldDelete;
+    op.registry_key = key;
+    op.registry_field_id = field_id;
+    return coord->AppendAndWait(raft_meta::Encode(op));
+}
+
 } // namespace kv_cache_manager

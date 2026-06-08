@@ -26,8 +26,6 @@ class InstanceInfo;
 class ModelDeployment;
 class StorageConfig;
 class RequestContext;
-class Jsonizable;
-
 class RegistryManager {
 public:
     RegistryManager(const std::string &registry_uri, std::shared_ptr<MetricsRegistry> metrics_registry);
@@ -92,8 +90,6 @@ public:
     std::string GetInstanceGroupName(const std::string &instance_id) const;
 
 private:
-    ErrorCode LoadAndSave(const std::string &key, const std::string &id, const Jsonizable *jsonizable);
-    ErrorCode LoadAndDelete(const std::string &key, const std::string &id);
     ErrorCode UpdateStorageAvailableStatus(const std::string &global_unique_name, bool is_available);
     // return error count (0 means success)
     size_t RecoverStorageUnsafe();
@@ -126,7 +122,6 @@ private:
     std::unique_ptr<RegistryStorageBackend> storage_;
     // 无需清理 - 不包含数据
     mutable std::shared_mutex mutex_;
-
     // 需要清理 - recover 重试线程相关，在DoCleanup()中StopRecoverRetryLoop()
     std::thread recover_retry_thread_;
     std::atomic<bool> recover_retry_stop_{false};
