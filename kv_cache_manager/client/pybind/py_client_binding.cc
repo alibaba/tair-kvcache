@@ -98,7 +98,8 @@ PYBIND11_MODULE(kvcm_py_client, module) {
     py::class_<kvcm::RegistSpan, py::smart_holder>(module, "RegistSpan")
         .def(py::init<>())
         .def_property("base", &kvcm::RegistSpan::base_as_uint64, &kvcm::RegistSpan::set_base_as_uint64)
-        .def_readwrite("size", &kvcm::RegistSpan::size);
+        .def_readwrite("size", &kvcm::RegistSpan::size)
+        .def_readwrite("fd", &kvcm::RegistSpan::fd);
 
     py::class_<kvcm::InitParams, py::smart_holder>(module, "InitParams")
         .def(py::init<>())
