@@ -501,7 +501,10 @@ class LocationPruningTest(abc.ABC, TestBase, unittest.TestCase):
         for (loc, key) in zip(locations, block_keys):
             for spec in loc.get("location_specs", []):
                 file_path = urlparse(spec["uri"]).path
-                self.assertEqual(int(os.path.basename(file_path), base=16), key)
+                # MakeStorageKey format: {instance_id}/{spec_name}/{hex(block_key)}/{random}
+                # The hex block_key is the second-to-last path component.
+                hex_part = os.path.basename(os.path.dirname(file_path))
+                self.assertEqual(int(hex_part, base=16), key)
 
     def _make_dummy_storage(self):
         dummy_root_path = f"{self.get_workdir()}/{self._storage_name}/data/"

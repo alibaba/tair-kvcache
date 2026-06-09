@@ -5,6 +5,8 @@
 
 namespace kv_cache_manager {
 
+enum class DataStorageType : uint8_t;
+
 // Runtime metrics describing a single node in the affinity pool.
 //
 // Under the v1 co-location assumption a single physical machine is both an
@@ -20,9 +22,10 @@ namespace kv_cache_manager {
 struct NodeMetrics {
     std::string node_id;
     std::string node_name;
+    DataStorageType storage_type{};
 
     // Storage capacity / load on the machine.
-    int64_t free_bytes = 0;
+    uint64_t free_bytes = 0;
     double load_ratio = 0.0;
 
     // Network throughput observed on the machine (Mbps).

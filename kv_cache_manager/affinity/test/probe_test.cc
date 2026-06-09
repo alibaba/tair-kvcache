@@ -51,8 +51,8 @@ TEST_F(AffinityProbeTest, TlsStaleMetricsInWriteFilter) {
     auto &mgr = NewManager();
     ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonString(kWriteFilterJson));
 
-    mgr.UpsertNodeMetrics({"node_a", "node_a", 300000, 0.50, 0, 0, 1});
-    mgr.UpsertNodeMetrics({"node_b", "node_b", 800000, 0.30, 0, 0, 1});
+    mgr.UpsertNodeMetrics({"node_a", "node_a", DataStorageType{}, 300000, 0.50, 0, 0, 1});
+    mgr.UpsertNodeMetrics({"node_b", "node_b", DataStorageType{}, 800000, 0.30, 0, 0, 1});
 
     AffinityResolveContext ctx;
     ctx.caller_node.node_id = "node_a";
@@ -66,7 +66,7 @@ TEST_F(AffinityProbeTest, TlsStaleMetricsInWriteFilter) {
     }
 
     // Update node_a to 0.95: should be filtered out on next resolve
-    mgr.UpsertNodeMetrics({"node_a", "node_a", 50000, 0.95, 0, 0, 2});
+    mgr.UpsertNodeMetrics({"node_a", "node_a", DataStorageType{}, 50000, 0.95, 0, 0, 2});
 
     // Second resolve: node_a should be filtered out (load 0.95 > max 0.90)
     // Expected: only node_b survives → preferred = [node_b]
@@ -104,8 +104,8 @@ TEST_F(AffinityProbeTest, TlsStaleMetricsInReadCapacityGate) {
     })"));
 
     // caller node_a starts at low load → capacity gate should pass
-    mgr.UpsertNodeMetrics({"node_a", "node_a", 500000, 0.30, 0, 0, 1});
-    mgr.UpsertNodeMetrics({"node_b", "node_b", 800000, 0.20, 0, 0, 1});
+    mgr.UpsertNodeMetrics({"node_a", "node_a", DataStorageType{}, 500000, 0.30, 0, 0, 1});
+    mgr.UpsertNodeMetrics({"node_b", "node_b", DataStorageType{}, 800000, 0.20, 0, 0, 1});
 
     LocationSpec remote("tp0", "tair://node_b/x", "node_b");
     CacheLocation winner;
@@ -126,7 +126,7 @@ TEST_F(AffinityProbeTest, TlsStaleMetricsInReadCapacityGate) {
     }
 
     // Now overload node_a: load 0.90 > gate 0.80
-    mgr.UpsertNodeMetrics({"node_a", "node_a", 100000, 0.90, 0, 0, 2});
+    mgr.UpsertNodeMetrics({"node_a", "node_a", DataStorageType{}, 100000, 0.90, 0, 0, 2});
 
     // Second read (different block_key to avoid dedup): caller overloaded,
     // hint should be suppressed.
@@ -160,7 +160,7 @@ TEST_F(AffinityProbeTest, HysteresisResetsOnMetricsRefresh) {
     })"));
 
     // node_a: load 0.90, free 100K → total ~1M
-    mgr.UpsertNodeMetrics({"node_a", "node_a", 100000, 0.90, 0, 0, 100});
+    mgr.UpsertNodeMetrics({"node_a", "node_a", DataStorageType{}, 100000, 0.90, 0, 0, 100});
 
     AffinityResolveContext ctx;
 
@@ -179,7 +179,7 @@ TEST_F(AffinityProbeTest, HysteresisResetsOnMetricsRefresh) {
 
     // Step 3: metrics refresh with same high load but new updated_at_us
     // This should clear evicted_bytes → estimated goes back to raw 0.90
-    mgr.UpsertNodeMetrics({"node_a", "node_a", 100000, 0.90, 0, 0, 200});
+    mgr.UpsertNodeMetrics({"node_a", "node_a", DataStorageType{}, 100000, 0.90, 0, 0, 200});
     {
         auto ex = mgr.ResolveEviction(ctx);
         EXPECT_EQ(1u, ex.size()) << "After metrics refresh, evicted_bytes should be cleared."
@@ -205,7 +205,7 @@ TEST_F(AffinityProbeTest, HysteresisWithZeroTimestamp) {
     })"));
 
     // All timestamps = 0
-    mgr.UpsertNodeMetrics({"node_a", "node_a", 100000, 0.90, 0, 0, 0});
+    mgr.UpsertNodeMetrics({"node_a", "node_a", DataStorageType{}, 100000, 0.90, 0, 0, 0});
 
     AffinityResolveContext ctx;
 
@@ -223,7 +223,7 @@ TEST_F(AffinityProbeTest, HysteresisWithZeroTimestamp) {
     }
 
     // Re-insert same metrics with timestamp still 0
-    mgr.UpsertNodeMetrics({"node_a", "node_a", 100000, 0.90, 0, 0, 0});
+    mgr.UpsertNodeMetrics({"node_a", "node_a", DataStorageType{}, 100000, 0.90, 0, 0, 0});
 
     // With timestamp=0: max_updated_at=0, last_reset=0 → 0 > 0 false
     // evicted_bytes NOT cleared → still not exceeded
@@ -252,7 +252,7 @@ TEST_F(AffinityProbeTest, SketchSurvivesStrategyReload) {
         "read": { "on_miss": { "enabled": true, "replication_hot_threshold": 3 } }
     })"));
 
-    mgr.UpsertNodeMetrics({"node_a", "node_a", 500000, 0.30, 0, 0, 1});
+    mgr.UpsertNodeMetrics({"node_a", "node_a", DataStorageType{}, 500000, 0.30, 0, 0, 1});
 
     LocationSpec remote("tp0", "uri_b", "node_b");
     CacheLocation winner;
@@ -311,7 +311,7 @@ TEST_F(AffinityProbeTest, EvictionContextHasNoGetNodeMetrics) {
         }
     })"));
 
-    mgr.UpsertNodeMetrics({"node_a", "node_a", 100000, 0.90, 0, 0, 1});
+    mgr.UpsertNodeMetrics({"node_a", "node_a", DataStorageType{}, 100000, 0.90, 0, 0, 1});
 
     AffinityResolveContext ctx;
     // No crash even though get_node_metrics is null in the StrategyContext
@@ -370,8 +370,8 @@ TEST_F(AffinityProbeTest, WriteReflectsNodeAddRemove) {
         "write": { "ops": { "prefer_local": {"on_miss": "passthrough"} } }
     })"));
 
-    mgr.UpsertNodeMetrics({"node_a", "node_a", 500000, 0.30, 0, 0, 1});
-    mgr.UpsertNodeMetrics({"node_b", "node_b", 800000, 0.20, 0, 0, 1});
+    mgr.UpsertNodeMetrics({"node_a", "node_a", DataStorageType{}, 500000, 0.30, 0, 0, 1});
+    mgr.UpsertNodeMetrics({"node_b", "node_b", DataStorageType{}, 800000, 0.20, 0, 0, 1});
 
     AffinityResolveContext ctx;
     ctx.caller_node.node_id = "node_a";
@@ -428,7 +428,7 @@ TEST_F(AffinityProbeTest, EvictionAtFullCapacity) {
     })"));
 
     // load_ratio = 1.0, free_bytes = 0 → total capacity = 0/0.01 = 0
-    mgr.UpsertNodeMetrics({"node_a", "node_a", 0, 1.0, 0, 0, 1});
+    mgr.UpsertNodeMetrics({"node_a", "node_a", DataStorageType{}, 0, 1.0, 0, 0, 1});
 
     AffinityResolveContext ctx;
 
@@ -472,7 +472,7 @@ TEST_F(AffinityProbeTest, StrategyMemoizationSharesParsedInstance) {
     auto &mgr = NewManager();
     ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonString(R"({"type":"noop"})"));
 
-    mgr.UpsertNodeMetrics({"node_a", "node_a", 500000, 0.30, 0, 0, 1});
+    mgr.UpsertNodeMetrics({"node_a", "node_a", DataStorageType{}, 500000, 0.30, 0, 0, 1});
 
     const char *json = R"({"type":"local_replica","write":{"ops":{"prefer_local":{"on_miss":"passthrough"}}}})";
 

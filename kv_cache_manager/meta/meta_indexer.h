@@ -191,6 +191,11 @@ public:
     // Directly constructed test/indexer instances without an executor retain
     // serial behavior.
     bool ParallelForQuery(std::size_t count, const QueryExecutor::RangeFunction &fn) const noexcept;
+    ErrorCode SampleReclaimKeys(RequestContext *request_context,
+                                const std::string &type,
+                                const std::unordered_set<std::string> &node_ids,
+                                const int64_t count,
+                                KeyVector &out_keys) const noexcept;
 
     void PersistMetaData() noexcept;
     size_t GetKeyCount() const noexcept;
