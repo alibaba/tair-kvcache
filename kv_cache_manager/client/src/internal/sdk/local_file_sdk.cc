@@ -10,6 +10,8 @@
 #include "kv_cache_manager/client/src/internal/sdk/cuda_util.h"
 #elif defined(USING_MUSA)
 #include "kv_cache_manager/client/src/internal/sdk/musa_util.h"
+#elif defined(USING_TPU)
+#include "kv_cache_manager/client/src/internal/sdk/tpu_client.h"
 #endif
 #include "kv_cache_manager/client/src/internal/util/debug_string_util.h"
 #include "kv_cache_manager/common/logger.h"
@@ -39,8 +41,20 @@ public:
         return kv_cache_manager::ER_OK;
     }
 
+#if defined(USING_TPU)
+    kv_cache_manager::ClientErrorCode RegisterTpu(kv_cache_manager::TpuClient *tpu_client) {
+        tpu_client_ = tpu_client;
+        auto ec = tpu_client_->DmaMap(file_mem_, file_size_);
+        if (ec != kv_cache_manager::ER_OK) {
+            return ec;
+        }
+        is_mem_registered = true;
+        return kv_cache_manager::ER_OK;
+    }
+#endif
+
     void SkipRegistration() {
-#if defined(USING_CUDA) || defined(USING_MUSA)
+#if defined(USING_CUDA) || defined(USING_MUSA) || defined(USING_TPU)
         is_mem_registered = false;
 #endif
     }
@@ -54,6 +68,10 @@ public:
         if (is_mem_registered) {
             CHECK_MUSA_ERROR(musaHostUnregister(file_mem_), "unregister host mem [%p] fail", file_mem_);
         }
+#elif defined(USING_TPU)
+        if (is_mem_registered && tpu_client_) {
+            tpu_client_->DmaUnmap(file_mem_);
+        }
 #endif
         munmap(file_mem_, file_size_);
         close(fd_);
@@ -65,6 +83,9 @@ private:
     size_t file_size_;
 #if defined(USING_CUDA) || defined(USING_MUSA)
     bool is_mem_registered = false;
+#elif defined(USING_TPU)
+    bool is_mem_registered = false;
+    kv_cache_manager::TpuClient *tpu_client_ = nullptr;
 #endif
 };
 
@@ -154,6 +175,8 @@ LocalFileSdk::~LocalFileSdk() {
     if (musa_stream_) {
         CHECK_MUSA_ERROR(musaStreamDestroy(musa_stream_), "destroy musa stream error");
     }
+#elif defined(USING_TPU)
+    tpu_client_.Destroy();
 #endif
 }
 
@@ -206,6 +229,13 @@ ClientErrorCode LocalFileSdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_
     // Check if GPUs support direct pageable memory access
     support_pageable_memory_access_ = allGpusSupportPageableMemoryAccess();
     KVCM_LOG_INFO("gpu support pageable memory access [%d]", static_cast<int>(support_pageable_memory_access_));
+#elif defined(USING_TPU)
+    auto tpu_ec = tpu_client_.Init();
+    if (tpu_ec != ER_OK) {
+        KVCM_LOG_ERROR("Init local file sdk failed, TPU PJRT client init failed");
+        return ER_TPU_PJRT_INIT_ERROR;
+    }
+    KVCM_LOG_INFO("TPU PJRT client initialized successfully");
 #endif
     return ER_OK;
 }
@@ -217,9 +247,13 @@ ClientErrorCode LocalFileSdk::Get(const std::vector<DataStorageUri> &remote_uris
         KVCM_LOG_ERROR("Get failed, remote_uris size not equal to local_buffers size");
         return ER_INVALID_PARAMS;
     }
-    auto group_map = SplitByPath(remote_uris, local_buffers);
+    // DoGet may modify iov.base for TPU buffers (output parameter semantics).
+    // const_cast is safe: Get fills destination buffers, similar to how read()
+    // writes to its output buffer despite the data being conceptually "const".
+    auto &mutable_buffers = const_cast<BlockBuffers &>(local_buffers);
+    auto group_map = SplitByPath(remote_uris, mutable_buffers);
     for (const auto &group : group_map) {
-        auto ec = DoGet(group.second.remote_uris, group.second.local_buffers);
+        auto ec = DoGet(group.second.remote_uris, mutable_buffers, group.second.buffer_indices);
         if (ec != ER_OK) {
             KVCM_LOG_ERROR("DoGet failed, errorcode: %d", ec);
             return ER_SDKREAD_ERROR;
@@ -283,9 +317,10 @@ ClientErrorCode LocalFileSdk::Alloc(const std::vector<DataStorageUri> &remote_ur
     return ER_OK;
 }
 
-ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers) {
-    if (remote_uris.size() != local_buffers.size() || remote_uris.empty()) {
-        KVCM_LOG_ERROR("Do Get failed, remote_uris size not equal to local_buffers size");
+ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_uris, BlockBuffers &local_buffers,
+                                     const std::vector<size_t> &buffer_indices) {
+    if (remote_uris.size() != buffer_indices.size() || remote_uris.empty()) {
+        KVCM_LOG_ERROR("Do Get failed, remote_uris size not equal to buffer_indices size");
         return ER_INVALID_PARAMS;
     }
 
@@ -312,9 +347,13 @@ ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_ur
                    file_size,
                    DebugStringUtil::ToString(local_buffers).c_str());
     int prot = PROT_READ;
+#if !defined(USING_TPU)
     if (!support_register_readonly_) {
         prot |= PROT_WRITE;
     }
+#else
+    prot |= PROT_WRITE; // TPU DmaMap may need write access
+#endif
     void *file_mem = mmap(nullptr, file_size, prot, MAP_PRIVATE, fd, 0);
     if (file_mem == MAP_FAILED) {
         KVCM_LOG_ERROR("Get failed, mmap file %s failed", file_path.c_str());
@@ -344,6 +383,18 @@ ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_ur
             return register_ec;
         }
     }
+#elif defined(USING_TPU)
+    [[maybe_unused]] bool exist_tpu_iov = false;
+    {
+        auto register_ec = helper.RegisterTpu(&tpu_client_);
+        if (register_ec != ER_OK) {
+            return register_ec;
+        }
+    }
+    std::vector<PJRT_Event*> tpu_events;
+    std::vector<PJRT_Buffer*> tpu_buffers;
+    std::vector<void**> tpu_iov_bases;  // iov.base pointers to assign after async completes
+    std::vector<std::vector<char>> tpu_temp_bufs;  // keep host buffers alive during async H2D
 #endif
 
     size_t offset = 0;
@@ -351,7 +402,7 @@ ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_ur
     // asume that url is sorted by blkid
     for (size_t i = 0; i < remote_uris.size(); ++i) {
         auto &remote_uri = remote_uris[i];
-        auto &local_buffer = local_buffers[i];
+        auto &local_buffer = local_buffers[buffer_indices[i]];
         if (remote_uri.GetPath().empty()) {
             KVCM_LOG_ERROR("Get failed, remote_uri is invalid");
             return ER_INVALID_PARAMS;
@@ -387,7 +438,7 @@ ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_ur
                 return ER_INVALID_PARAMS;
             }
 
-            if (!iov.ignore && iov.base && iov.size > 0) {
+            if (!iov.ignore && iov.size > 0 && (iov.base || iov.type == MemoryType::TPU)) {
                 if (iov.type == MemoryType::CPU) {
                     std::memcpy(iov.base, src + offset, iov.size);
                 } else if (iov.type == MemoryType::GPU) {
@@ -404,13 +455,45 @@ ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_ur
                         ER_CUDAMEMCPY_ERROR,
                         "musa memcpy async fail");
 #endif
+                } else if (iov.type == MemoryType::TPU) {
+#if defined(USING_TPU)
+                    exist_tpu_iov = true;
+                    tpu_temp_bufs.emplace_back(iov.size);
+                    std::memcpy(tpu_temp_bufs.back().data(), src + offset, iov.size);
+                    PJRT_Buffer* tpu_buffer = nullptr;
+                    PJRT_Event* event = nullptr;
+                    auto buf_ec = tpu_client_.BufferFromHostAsync(
+                        tpu_temp_bufs.back().data(), iov.size, tpu_buffer, event);
+                    if (buf_ec != ER_OK) {
+                        KVCM_LOG_ERROR("TPU BufferFromHostAsync failed in Get");
+                        for (auto* e : tpu_events) tpu_client_.DestroyEvent(e);
+                        for (auto* b : tpu_buffers) tpu_client_.DestroyBuffer(b);
+                        return buf_ec;
+                    }
+                    tpu_events.push_back(event);
+                    tpu_buffers.push_back(tpu_buffer);
+                    tpu_iov_bases.push_back(&iov.base);
+#endif
                 }
             }
             offset += iov.size;
         }
     }
 
-#if defined(USING_CUDA)
+#if defined(USING_TPU)
+    if (exist_tpu_iov) {
+        auto wait_ec = tpu_client_.WaitEvents(tpu_events);
+        if (wait_ec != ER_OK) {
+            KVCM_LOG_ERROR("TPU WaitEvents failed in Get");
+            for (auto* b : tpu_buffers) tpu_client_.DestroyBuffer(b);
+            return wait_ec;
+        }
+        // All async H2D completed; assign buffer handles to iovs
+        for (size_t j = 0; j < tpu_buffers.size(); ++j) {
+            *tpu_iov_bases[j] = reinterpret_cast<void*>(tpu_buffers[j]);
+        }
+    }
+#elif defined(USING_CUDA)
     if (exist_gpu_iov) {
         CHECK_CUDA_ERROR_RETURN(
             cudaStreamSynchronize(cuda_stream_), ER_CUDA_STREAM_SYNCHRONIZE_ERROR, "cuda stream synchronize fail");
@@ -515,6 +598,17 @@ ClientErrorCode LocalFileSdk::DoPut(const std::vector<DataStorageUri> &remote_ur
             return register_ec;
         }
     }
+#elif defined(USING_TPU)
+    [[maybe_unused]] bool exist_tpu_iov = false;
+    {
+        auto register_ec = helper.RegisterTpu(&tpu_client_);
+        if (register_ec != ER_OK) {
+            return register_ec;
+        }
+    }
+    std::vector<PJRT_Event*> tpu_events;
+    std::vector<std::vector<char>> tpu_temp_bufs;
+    std::vector<std::pair<char*, size_t>> tpu_d2h_dsts;  // (dst in file, size)
 #endif
 
     char *dst = static_cast<char *>(file_mem);
@@ -549,12 +643,45 @@ ClientErrorCode LocalFileSdk::DoPut(const std::vector<DataStorageUri> &remote_ur
                         ER_CUDAMEMCPY_ERROR,
                         "musa memcpy async fail");
 #endif
+                } else if (iov.type == MemoryType::TPU) {
+#if defined(USING_TPU)
+                    exist_tpu_iov = true;
+                    PJRT_Buffer* tpu_buffer = reinterpret_cast<PJRT_Buffer*>(iov.base);
+                    if (!tpu_buffer) {
+                        KVCM_LOG_ERROR("TPU buffer handle is null in Put");
+                        for (auto* e : tpu_events) tpu_client_.DestroyEvent(e);
+                        return ER_TPU_BUFFER_TRANSFER_ERROR;
+                    }
+                    tpu_temp_bufs.emplace_back(iov.size);
+                    PJRT_Event* event = nullptr;
+                    auto buf_ec = tpu_client_.BufferToHostAsync(
+                        tpu_buffer, tpu_temp_bufs.back().data(), iov.size, event);
+                    if (buf_ec != ER_OK) {
+                        KVCM_LOG_ERROR("TPU BufferToHostAsync failed in Put");
+                        for (auto* e : tpu_events) tpu_client_.DestroyEvent(e);
+                        return buf_ec;
+                    }
+                    tpu_events.push_back(event);
+                    tpu_d2h_dsts.emplace_back(dst + offset, iov.size);
+#endif
                 }
             }
             offset += iov.size;
         }
     }
-#if defined(USING_CUDA)
+#if defined(USING_TPU)
+    if (exist_tpu_iov) {
+        auto wait_ec = tpu_client_.WaitEvents(tpu_events);
+        if (wait_ec != ER_OK) {
+            KVCM_LOG_ERROR("TPU WaitEvents failed in Put");
+            return wait_ec;
+        }
+        // All async D2H completed; copy temp buffers to file
+        for (size_t j = 0; j < tpu_d2h_dsts.size(); ++j) {
+            std::memcpy(tpu_d2h_dsts[j].first, tpu_temp_bufs[j].data(), tpu_d2h_dsts[j].second);
+        }
+    }
+#elif defined(USING_CUDA)
     if (exist_gpu_iov) {
         CHECK_CUDA_ERROR_RETURN(
             cudaStreamSynchronize(cuda_stream_), ER_CUDA_STREAM_SYNCHRONIZE_ERROR, "cuda stream synchronize fail");

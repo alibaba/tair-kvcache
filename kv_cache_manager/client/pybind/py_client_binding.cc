@@ -69,11 +69,15 @@ PYBIND11_MODULE(kvcm_py_client, module) {
         .value("ER_CUDA_STREAM_SYNCHRONIZE_ERROR", kvcm::ClientErrorCode::ER_CUDA_STREAM_SYNCHRONIZE_ERROR)
         .value("ER_CUDA_STREAM_DESTROY_ERROR", kvcm::ClientErrorCode::ER_CUDA_STREAM_DESTROY_ERROR)
         .value("ER_CUDA_HOST_REGISTER_ERROR", kvcm::ClientErrorCode::ER_CUDA_HOST_REGISTER_ERROR)
+        .value("ER_TPU_PJRT_INIT_ERROR", kvcm::ClientErrorCode::ER_TPU_PJRT_INIT_ERROR)
+        .value("ER_TPU_DMA_MAP_ERROR", kvcm::ClientErrorCode::ER_TPU_DMA_MAP_ERROR)
+        .value("ER_TPU_BUFFER_TRANSFER_ERROR", kvcm::ClientErrorCode::ER_TPU_BUFFER_TRANSFER_ERROR)
         .finalize();
 
     py::native_enum<kvcm::MemoryType>(module, "MemoryType", "enum.Enum")
         .value("CPU", kvcm::MemoryType::CPU)
         .value("GPU", kvcm::MemoryType::GPU)
+        .value("TPU", kvcm::MemoryType::TPU)
         .finalize();
 
     py::native_enum<kvcm::RoleType>(module, "RoleType", "enum.Enum")

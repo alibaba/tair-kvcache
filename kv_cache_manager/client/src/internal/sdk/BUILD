@@ -32,6 +32,11 @@ config_setting(
     values = {"define": "using_musa=true"},
 )
 
+config_setting(
+    name = "using_tpu",
+    values = {"define": "using_tpu=true"},
+)
+
 cc_library(
     name = "sdk_common",
     srcs = ["sdk_interface.cc"],
@@ -65,6 +70,11 @@ cc_library(
             "hf3fs_usrbio_client.cc",
         ],
         "//conditions:default": [],
+    }) + select({
+        ":using_tpu": [
+            "tpu_client.cc",
+        ],
+        "//conditions:default": [],
     }),
     hdrs = [
         "local_file_sdk.h",
@@ -88,6 +98,11 @@ cc_library(
             "hf3fs_usrbio_client.h",
         ],
         "//conditions:default": [],
+    }) + select({
+        ":using_tpu": [
+            "tpu_client.h",
+        ],
+        "//conditions:default": [],
     }),
     deps = [
         ":lock_free_thread_pool",
@@ -105,6 +120,11 @@ cc_library(
         ":using_musa": [
             ":sdk_buffer_check_util_musa",
             "@local_config_musa//:musa",
+        ],
+        "//conditions:default": [],
+    }) + select({
+        ":using_tpu": [
+            "//3rdparty/libtpu",
         ],
         "//conditions:default": [],
     }) + select({

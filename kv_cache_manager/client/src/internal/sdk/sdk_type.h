@@ -20,6 +20,7 @@ enum class SdkType : uint8_t {
 struct BlockGroup {
     std::vector<DataStorageUri> remote_uris;
     BlockBuffers local_buffers;
+    std::vector<size_t> buffer_indices;  // indices into the original BlockBuffers (avoids copy)
 };
 
 struct Hf3fsRemoteItem {

@@ -4,6 +4,8 @@
 #include <cuda_runtime.h>
 #elif defined(USING_MUSA)
 #include <musa_runtime.h>
+#elif defined(USING_TPU)
+#include "kv_cache_manager/client/src/internal/sdk/tpu_client.h"
 #endif
 #include "kv_cache_manager/client/src/internal/sdk/sdk_interface.h"
 
@@ -22,7 +24,8 @@ public:
 private:
     ClientErrorCode Alloc(const std::vector<DataStorageUri> &remote_uris,
                           std::vector<DataStorageUri> &alloc_uris) override;
-    ClientErrorCode DoGet(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers);
+    ClientErrorCode DoGet(const std::vector<DataStorageUri> &remote_uris, BlockBuffers &local_buffers,
+                          const std::vector<size_t> &buffer_indices);
     ClientErrorCode DoPut(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers);
 
 private:
@@ -31,6 +34,8 @@ private:
     cudaStream_t cuda_stream_ = nullptr;
 #elif defined(USING_MUSA)
     musaStream_t musa_stream_ = nullptr;
+#elif defined(USING_TPU)
+    TpuClient tpu_client_;
 #endif
     bool support_register_readonly_ = true;
     bool support_pageable_memory_access_ = false; // If true, no need to call cudaHostRegister for mmap'd memory

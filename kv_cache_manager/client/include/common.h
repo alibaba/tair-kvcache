@@ -60,6 +60,13 @@ enum [[nodiscard]] ClientErrorCode : int32_t{
     ER_CUDA_STREAM_SYNCHRONIZE_ERROR = 115,
     ER_CUDA_STREAM_DESTROY_ERROR = 116,
     ER_CUDA_HOST_REGISTER_ERROR = 117,
+
+    // tpu
+    ER_TPU_PJRT_INIT_ERROR = 120,
+    ER_TPU_DMA_MAP_ERROR = 121,
+    ER_TPU_BUFFER_TRANSFER_ERROR = 122,
+    ER_TPU_RAWBUFFER_ERROR = 123,
+    ER_TPU_EVENT_ERROR = 124,
 };
 
 enum class QueryType : int {
@@ -107,6 +114,7 @@ struct ClusterInfo {
 enum class MemoryType : uint8_t {
     CPU = 0,
     GPU = 1,
+    TPU = 2,
 };
 
 // 一块连续的内存，存放一层的 K 或 V 数据

@@ -86,6 +86,7 @@ build --copt -Wno-maybe-uninitialized # protobuf
 build --copt -Wno-format-overflow # cm2
 build --copt -Wno-nonnull # mooncake gcc11
 build --copt -Wno-array-parameter # BoringSSL gcc11
+build --copt -Wno-dangling-pointer # BoringSSL gcc12+
 build --copt -Wno-unused-result # grpc gcc11
 # build --copt="-mno-avx512f"
 # build --copt="-mrdrnd"
@@ -159,6 +160,17 @@ build:client_with_musa --config=client
 build:client_with_musa --config=musa
 
 build:client_only_header  --define CLIENT_ONLY_HEADER=true
+
+# TPU platform (no RDMA, no CUDA)
+# tpu: build kv_cache_manager_bin without mooncake/RDMA
+build:tpu --define DISABLE_MOONCAKE=true
+build:tpu --copt=-DUSING_TPU
+build:tpu --define using_tpu=true
+# client_with_tpu: build kv_cache_manager_client.so without mooncake/RDMA
+build:client_with_tpu --config=tpu
+build:client_with_tpu --copt=-DENABLE_TAIR_MEMPOOL
+build:client_with_tpu --define ENABLE_TAIR_MEMPOOL=true
+build:client_with_tpu --define USER_CLIENT_LOGGER=true
 
 # version stamping
 build --workspace_status_command=bazel/workspace_status.sh
