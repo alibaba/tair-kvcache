@@ -167,6 +167,7 @@ inline std::string RoleTypeToString(RoleType role_type) {
 struct RegistSpan {
     void *base{nullptr};
     size_t size{0};
+    int fd{-1};
     void set_base_as_uint64(uint64_t base_ptr) { base = reinterpret_cast<void *>(base_ptr); }
     [[nodiscard]] uint64_t base_as_uint64() const { return reinterpret_cast<uint64_t>(base); }
 };

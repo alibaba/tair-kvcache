@@ -66,6 +66,11 @@ ClientErrorCode SdkWrapper::Init(const std::unique_ptr<ClientConfig> &client_con
             KVCM_LOG_WARN("fill span failed, storage config: %s", storage_config->ToString().c_str());
             return ec;
         }
+        ec = UpdateTairMempoolSdkConfig(sdk_backend_config, regist_span);
+        if (ec != ER_OK) {
+            KVCM_LOG_WARN("fill tair mempool span failed, storage config: %s", storage_config->ToString().c_str());
+            return ec;
+        }
 
         // 将完整的 spec → byte_size_per_block 映射传给 SDK
         sdk_backend_config->set_spec_byte_sizes_per_block(location_spec_infos);
@@ -203,6 +208,28 @@ ClientErrorCode SdkWrapper::UpdateMooncakeSdkConfig(const std::shared_ptr<SdkBac
     config->set_local_mem_ptr(span->base);
     config->set_local_buffer_size(span->size);
     config->set_self_location_spec_name(self_location_spec_name);
+    return ER_OK;
+}
+
+ClientErrorCode SdkWrapper::UpdateTairMempoolSdkConfig(const std::shared_ptr<SdkBackendConfig> &sdk_backend_config,
+                                                       RegistSpan *span) {
+    if (DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL != sdk_backend_config->type()) {
+        return ER_OK;
+    }
+    auto config = std::dynamic_pointer_cast<TairMempoolSdkConfig>(sdk_backend_config);
+    if (!config) {
+        KVCM_LOG_WARN("convert to tair mempool config failed");
+        return ER_INVALID_SDKBACKEND_CONFIG;
+    }
+    if (span == nullptr) {
+        // For TairMempool, regist_span is optional (only needed for shared memory registration)
+        return ER_OK;
+    }
+    if (span->fd >= 0) {
+        config->set_shm_fd(span->fd);
+        config->set_shm_size(span->size);
+        config->set_client_base(span->base);
+    }
     return ER_OK;
 }
 
