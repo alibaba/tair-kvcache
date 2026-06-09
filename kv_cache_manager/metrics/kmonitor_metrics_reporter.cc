@@ -53,6 +53,8 @@ struct KmonitorMetricsReporter::Context {
     // manager metrics metrics
     DECLARE_METRICS(manager, request_key_count);
     DECLARE_METRICS(manager, prefix_match_len);
+    DECLARE_METRICS(manager, get_cache_location_query_block_counter);
+    DECLARE_METRICS(manager, get_cache_location_hit_block_counter);
     DECLARE_METRICS(manager, prefix_match_time_us);
     DECLARE_METRICS(manager, lock_write_location_retry_times);
     DECLARE_METRICS(manager, write_cache_io_cost_us);
@@ -292,6 +294,11 @@ bool KmonitorMetricsReporter::InitMetrics() {
     // manager metrics
     REGISTER_GAUGE_METRIC(manager, request_key_count);
     REGISTER_GAUGE_METRIC(manager, prefix_match_len);
+    // Workaround: KMonitor only supports QPS and GAUGE metric types (no COUNTER).
+    // These are semantically cumulative counters; registered as GAUGE to match
+    // existing codebase convention (e.g. cache_reclaimer counters).
+    REGISTER_GAUGE_METRIC(manager, get_cache_location_query_block_counter);
+    REGISTER_GAUGE_METRIC(manager, get_cache_location_hit_block_counter);
     REGISTER_GAUGE_METRIC(manager, prefix_match_time_us);
     REGISTER_GAUGE_METRIC(manager, lock_write_location_retry_times);
     REGISTER_GAUGE_METRIC(manager, write_cache_io_cost_us);
@@ -460,6 +467,8 @@ void KmonitorMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
         // manager metrics
         REPORT_COLLECTED_METRICS(manager, request_key_count);
         REPORT_COLLECTED_METRICS(manager, prefix_match_len);
+        REPORT_COLLECTED_METRICS(manager, get_cache_location_query_block_counter);
+        REPORT_COLLECTED_METRICS(manager, get_cache_location_hit_block_counter);
         REPORT_COLLECTED_METRICS(manager, prefix_match_time_us);
         REPORT_COLLECTED_METRICS(manager, lock_write_location_retry_times);
         REPORT_COLLECTED_METRICS(manager, write_cache_io_cost_us);

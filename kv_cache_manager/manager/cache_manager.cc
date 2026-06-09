@@ -379,6 +379,27 @@ CacheManager::GetCacheLocation(RequestContext *request_context,
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, ManagerPrefixMatch);
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, prefix_match_len, cache_locations.size());
     RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, CacheLocationViewVecWrapper, "get cache location failed");
+    // accumulate hit/query block counters for hit-rate monitoring (only on success)
+    if (service_metrics_collector) {
+        size_t query_count = query_keys.size();
+        size_t hit_count = 0;
+        if (query_type == QueryType::QT_PREFIX_MATCH) {
+            // PrefixMatch only returns matched blocks; size() == hit count
+            hit_count = cache_locations.size();
+        } else {
+            // BatchGet / ReverseRollSW pad misses with empty CacheLocation
+            for (const auto &loc : cache_locations) {
+                if (loc && !loc->id().empty()) {
+                    ++hit_count;
+                }
+            }
+        }
+        Counter query_counter, hit_counter;
+        COPY_METRICS_(service_metrics_collector, manager, get_cache_location_query_block_counter, query_counter);
+        COPY_METRICS_(service_metrics_collector, manager, get_cache_location_hit_block_counter, hit_counter);
+        query_counter += query_count;
+        hit_counter += hit_count;
+    }
     FilterLocationSpecByName(cache_locations, location_spec_names);
 
     auto cache_get_event = std::make_shared<CacheGetEvent>(instance_id);
@@ -1141,7 +1162,9 @@ bool ParseInt64(const std::string &s, int64_t &out) {
         }
         out = v;
         return true;
-    } catch (...) { return false; }
+    } catch (...) {
+        return false;
+    }
 }
 
 std::shared_ptr<VineyardBackend> LookupVineyardBackend(const std::shared_ptr<RegistryManager> &registry_manager,

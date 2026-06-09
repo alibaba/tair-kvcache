@@ -22,6 +22,7 @@
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
+#include "kv_cache_manager/metrics/metrics_collector.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
 namespace {
@@ -101,7 +102,8 @@ public:
     void TearDown() override {}
 
     std::unique_ptr<CacheManager> createCacheManager() {
-        std::shared_ptr<MetricsRegistry> metrics_registry = std::make_shared<MetricsRegistry>();
+        metrics_registry_ = std::make_shared<MetricsRegistry>();
+        std::shared_ptr<MetricsRegistry> &metrics_registry = metrics_registry_;
         registry_manager_ = std::make_shared<RegistryManager>("", metrics_registry);
         std::shared_ptr<InstanceGroup> instance_group = std::make_shared<InstanceGroup>();
         auto meta_indexer_config = std::make_shared<MetaIndexerConfig>();
@@ -173,6 +175,7 @@ public:
     std::unique_ptr<CacheManager> cache_manager_;
     std::shared_ptr<RegistryManager> registry_manager_;
     std::shared_ptr<RequestContext> request_context_;
+    std::shared_ptr<MetricsRegistry> metrics_registry_;
 };
 
 TEST_F(CacheManagerTest, TestRegisterInstance) {
@@ -607,6 +610,146 @@ TEST_F(CacheManagerTest, TestGetCacheLocationPrefixMatch) {
             ASSERT_EQ(3, cache_location_view.location_specs().size());
         }
     }
+}
+
+TEST_F(CacheManagerTest, TestGetCacheLocationHitRateCounters) {
+    auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    ASSERT_EQ(expected,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               "test_instance",
+                                               64,
+                                               createLocationSpecInfos(),
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>()));
+
+    // Write blocks {1, 2, 3}
+    std::vector<int64_t> write_keys{1, 2, 3};
+    auto [ec1, write_info] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", write_keys, {}, {}, 100000000);
+    ASSERT_EQ(EC_OK, ec1);
+    BlockMask finish_mask = static_cast<size_t>(3); // all 3 blocks succeeded (offset semantics)
+    ASSERT_EQ(EC_OK,
+              cache_manager_->FinishWriteCache(
+                  request_context_.get(), "test_instance", write_info.write_session_id(), finish_mask));
+
+    // Create a RequestContext with a ServiceMetricsCollector so counters get incremented
+    auto svc_collector = std::make_shared<ServiceMetricsCollector>(metrics_registry_);
+    ASSERT_TRUE(svc_collector->Init());
+    auto metrics_ctx = std::make_unique<RequestContext>("hit_rate_test", svc_collector);
+
+    // Query 1: PrefixMatch with keys {1, 2, 4} → hits {1, 2}, miss at 4
+    {
+        std::vector<int64_t> query_keys{1, 2, 4};
+        BlockMask block_mask = static_cast<size_t>(0);
+        auto [ec, result] = cache_manager_->GetCacheLocation(metrics_ctx.get(),
+                                                             "test_instance",
+                                                             CacheManager::QueryType::QT_PREFIX_MATCH,
+                                                             query_keys,
+                                                             {},
+                                                             block_mask,
+                                                             0,
+                                                             {});
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(2u, result.cache_locations_view().size()); // 2 hits
+    }
+
+    // Query 2: PrefixMatch with keys {1, 2, 3} → all 3 hit
+    {
+        std::vector<int64_t> query_keys{1, 2, 3};
+        BlockMask block_mask = static_cast<size_t>(0);
+        auto [ec, result] = cache_manager_->GetCacheLocation(metrics_ctx.get(),
+                                                             "test_instance",
+                                                             CacheManager::QueryType::QT_PREFIX_MATCH,
+                                                             query_keys,
+                                                             {},
+                                                             block_mask,
+                                                             0,
+                                                             {});
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(3u, result.cache_locations_view().size()); // 3 hits
+    }
+
+    // Verify cumulative counters: query 3+3=6, hit 2+3=5
+    Counter query_counter, hit_counter;
+    COPY_METRICS_(svc_collector.get(), manager, get_cache_location_query_block_counter, query_counter);
+    COPY_METRICS_(svc_collector.get(), manager, get_cache_location_hit_block_counter, hit_counter);
+    EXPECT_EQ(6u, query_counter.Get());
+    EXPECT_EQ(5u, hit_counter.Get());
+}
+
+TEST_F(CacheManagerTest, TestGetCacheLocationHitRateCounters_BatchGet) {
+    auto expected = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    ASSERT_EQ(expected,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               "test_instance",
+                                               64,
+                                               createLocationSpecInfos(),
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>()));
+
+    // Write blocks {1, 2, 3}
+    std::vector<int64_t> write_keys{1, 2, 3};
+    auto [ec1, write_info] =
+        cache_manager_->StartWriteCache(request_context_.get(), "test_instance", write_keys, {}, {}, 100000000);
+    ASSERT_EQ(EC_OK, ec1);
+    BlockMask finish_mask = static_cast<size_t>(3);
+    ASSERT_EQ(EC_OK,
+              cache_manager_->FinishWriteCache(
+                  request_context_.get(), "test_instance", write_info.write_session_id(), finish_mask));
+
+    auto svc_collector = std::make_shared<ServiceMetricsCollector>(metrics_registry_);
+    ASSERT_TRUE(svc_collector->Init());
+    auto metrics_ctx = std::make_unique<RequestContext>("batch_get_hit_rate_test", svc_collector);
+
+    // BatchGet query: keys {1, 2, 99} → 2 hits (1,2), 1 miss (99)
+    {
+        std::vector<int64_t> query_keys{1, 2, 99};
+        BlockMask block_mask = static_cast<size_t>(0);
+        auto [ec, result] = cache_manager_->GetCacheLocation(metrics_ctx.get(),
+                                                             "test_instance",
+                                                             CacheManager::QueryType::QT_BATCH_GET,
+                                                             query_keys,
+                                                             {},
+                                                             block_mask,
+                                                             0,
+                                                             {});
+        ASSERT_EQ(EC_OK, ec);
+        // BatchGet returns all keys; hits have non-empty id, misses have empty id
+        ASSERT_EQ(3u, result.cache_locations_view().size());
+    }
+
+    Counter query_counter, hit_counter;
+    COPY_METRICS_(svc_collector.get(), manager, get_cache_location_query_block_counter, query_counter);
+    COPY_METRICS_(svc_collector.get(), manager, get_cache_location_hit_block_counter, hit_counter);
+    EXPECT_EQ(3u, query_counter.Get());
+    EXPECT_EQ(2u, hit_counter.Get());
+}
+
+TEST_F(CacheManagerTest, TestGetCacheLocationHitRateCounters_ErrorPath) {
+    auto svc_collector = std::make_shared<ServiceMetricsCollector>(metrics_registry_);
+    ASSERT_TRUE(svc_collector->Init());
+    auto metrics_ctx = std::make_unique<RequestContext>("error_path_test", svc_collector);
+
+    // Query non-existent instance → should fail and NOT increment counters
+    std::vector<int64_t> query_keys{1, 2, 3};
+    BlockMask block_mask = static_cast<size_t>(0);
+    auto [ec, result] = cache_manager_->GetCacheLocation(metrics_ctx.get(),
+                                                         "nonexistent_instance",
+                                                         CacheManager::QueryType::QT_PREFIX_MATCH,
+                                                         query_keys,
+                                                         {},
+                                                         block_mask,
+                                                         0,
+                                                         {});
+    EXPECT_NE(EC_OK, ec);
+
+    Counter query_counter, hit_counter;
+    COPY_METRICS_(svc_collector.get(), manager, get_cache_location_query_block_counter, query_counter);
+    COPY_METRICS_(svc_collector.get(), manager, get_cache_location_hit_block_counter, hit_counter);
+    EXPECT_EQ(0u, query_counter.Get());
+    EXPECT_EQ(0u, hit_counter.Get());
 }
 
 TEST_F(CacheManagerTest, TestGetCacheLocationBatchGet) {
