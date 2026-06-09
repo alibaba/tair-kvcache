@@ -601,7 +601,7 @@ void CacheReclaimer::ReclaimByLRU(const std::shared_ptr<RequestContext> &request
     // 1. get the sampled block keys and the LRU timestamp info from
     // the meta indexer
     const std::int64_t begin_tp_sample = TimestampUtil::GetSteadyTimeUs();
-    if (!DoKeySampling(request_context, instance_info, keys, maps)) {
+    if (!DoKeySamplingByLRU(request_context, instance_info, exceeded_node_ids, keys, maps)) {
         LOG_WITH_ID(DEBUG, "key sampling failed");
         return;
     }
@@ -750,10 +750,11 @@ void CacheReclaimer::ReclaimCron() noexcept {
     }
 }
 
-bool CacheReclaimer::DoKeySampling(const std::shared_ptr<RequestContext> &request_context,
-                                   const std::shared_ptr<const InstanceInfo> &instance_info,
-                                   std::vector<std::int64_t> &out_keys,
-                                   std::vector<std::map<std::string, std::string>> &out_maps) noexcept {
+bool CacheReclaimer::DoKeySamplingByLRU(const std::shared_ptr<RequestContext> &request_context,
+                                        const std::shared_ptr<const InstanceInfo> &instance_info,
+                                        const std::unordered_set<std::string> &exceeded_node_ids,
+                                        std::vector<std::int64_t> &out_keys,
+                                        std::vector<std::map<std::string, std::string>> &out_maps) noexcept {
     const std::string &ins_id = instance_info->instance_id();
     const std::string &ins_gr = instance_info->instance_group_name();
 
@@ -774,14 +775,16 @@ bool CacheReclaimer::DoKeySampling(const std::shared_ptr<RequestContext> &reques
     }
 
     auto cancelled = std::make_shared<std::atomic<bool>>(false);
-    auto sample = [request_context, ins_id, ins_gr, meta_indexer, cancelled](
+    const std::string sample_type = exceeded_node_ids.empty() ? "lru" : "node_lru";
+    auto sample = [request_context, ins_id, ins_gr, meta_indexer, cancelled, &exceeded_node_ids, &sample_type](
                       std::size_t sampling_sz,
                       std::vector<std::int64_t> &keys,
                       std::vector<std::map<std::string, std::string>> &maps) -> ErrorCode {
         if (cancelled->load(std::memory_order_relaxed)) {
             return ErrorCode::EC_ERROR;
         }
-        if (const auto ec = meta_indexer->SampleReclaimKeys(request_context.get(), sampling_sz, keys);
+        if (const auto ec = meta_indexer->SampleReclaimKeys(
+                request_context.get(), sample_type, exceeded_node_ids, sampling_sz, keys);
             ec != ErrorCode::EC_OK) {
             LOG_WITH_ID(WARN, "random sample failed, error code: [%d]", static_cast<std::int32_t>(ec));
             return ec;
@@ -1304,6 +1307,7 @@ bool CacheReclaimer::TryReclaimOnGroup(const std::shared_ptr<RequestContext> &re
             group_json = registry_manager_->GetGroupAffinityStrategyJson(request_context.get(), ins_gr);
         }
         AffinityResolveContext resolve_ctx;
+        resolve_ctx.instance_group_name = ins_gr;
         resolve_ctx.group_strategy_json = std::move(group_json);
         exceeded_node_ids = affinity_manager_->ResolveEviction(resolve_ctx);
     }

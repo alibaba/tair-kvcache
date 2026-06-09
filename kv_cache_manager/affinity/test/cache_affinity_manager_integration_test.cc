@@ -91,9 +91,9 @@ TEST_F(CacheAffinityManagerIntegrationTest, AdaptiveHotKeyRetentionLoop) {
     ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonString(kFullStrategyJson));
 
     // Cluster: 3 nodes, caller is on node_a
-    mgr.UpsertNodeMetrics({"node_a", "node_a", 400000, 0.60, 10, 10, 1});
-    mgr.UpsertNodeMetrics({"node_b", "node_b", 800000, 0.20, 5, 5, 1});
-    mgr.UpsertNodeMetrics({"node_c", "node_c", 600000, 0.30, 5, 5, 1});
+    mgr.UpsertNodeMetrics({"node_a", "node_a", DataStorageType{}, 400000, 0.60, 10, 10, 1});
+    mgr.UpsertNodeMetrics({"node_b", "node_b", DataStorageType{}, 800000, 0.20, 5, 5, 1});
+    mgr.UpsertNodeMetrics({"node_c", "node_c", DataStorageType{}, 600000, 0.30, 5, 5, 1});
 
     AffinityResolveContext ctx;
     ctx.caller_node.node_id = "node_a";
@@ -180,10 +180,10 @@ TEST_F(CacheAffinityManagerIntegrationTest, WritePipelineFilterSortLimit) {
     // node_b: load 0.40, free 200000
     // node_c: load 0.30, free 800000
     // node_d: load 0.50, free 500000
-    mgr.UpsertNodeMetrics({"node_a", "node_a", 50000, 0.95, 0, 0, 1});
-    mgr.UpsertNodeMetrics({"node_b", "node_b", 200000, 0.40, 0, 0, 1});
-    mgr.UpsertNodeMetrics({"node_c", "node_c", 800000, 0.30, 0, 0, 1});
-    mgr.UpsertNodeMetrics({"node_d", "node_d", 500000, 0.50, 0, 0, 1});
+    mgr.UpsertNodeMetrics({"node_a", "node_a", DataStorageType{}, 50000, 0.95, 0, 0, 1});
+    mgr.UpsertNodeMetrics({"node_b", "node_b", DataStorageType{}, 200000, 0.40, 0, 0, 1});
+    mgr.UpsertNodeMetrics({"node_c", "node_c", DataStorageType{}, 800000, 0.30, 0, 0, 1});
+    mgr.UpsertNodeMetrics({"node_d", "node_d", DataStorageType{}, 500000, 0.50, 0, 0, 1});
 
     AffinityResolveContext ctx;
     ctx.caller_node.node_id = "node_a"; // caller is on the overloaded node
@@ -213,8 +213,8 @@ TEST_F(CacheAffinityManagerIntegrationTest, WritePipelinePreferLocalWithFilter) 
 
     // node_a (caller): load 0.50, passes filter (max 0.90)
     // node_b: load 0.30, highest free_bytes
-    mgr.UpsertNodeMetrics({"node_a", "node_a", 300000, 0.50, 0, 0, 1});
-    mgr.UpsertNodeMetrics({"node_b", "node_b", 800000, 0.30, 0, 0, 1});
+    mgr.UpsertNodeMetrics({"node_a", "node_a", DataStorageType{}, 300000, 0.50, 0, 0, 1});
+    mgr.UpsertNodeMetrics({"node_b", "node_b", DataStorageType{}, 800000, 0.30, 0, 0, 1});
 
     AffinityResolveContext ctx;
     ctx.caller_node.node_id = "node_a";
@@ -240,8 +240,8 @@ TEST_F(CacheAffinityManagerIntegrationTest, ReadOnMissCallerCapacityGateBlocksHi
     ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonString(kFullStrategyJson));
 
     // caller node_a: load 0.82 > threshold(0.85) - buffer(0.05) = 0.80
-    mgr.UpsertNodeMetrics({"node_a", "node_a", 180000, 0.82, 0, 0, 1});
-    mgr.UpsertNodeMetrics({"node_b", "node_b", 800000, 0.20, 0, 0, 1});
+    mgr.UpsertNodeMetrics({"node_a", "node_a", DataStorageType{}, 180000, 0.82, 0, 0, 1});
+    mgr.UpsertNodeMetrics({"node_b", "node_b", DataStorageType{}, 800000, 0.20, 0, 0, 1});
 
     AffinityResolveContext ctx;
     ctx.caller_node.node_id = "node_a";
@@ -273,8 +273,8 @@ TEST_F(CacheAffinityManagerIntegrationTest, EvictionLoopWithHysteresis) {
 
     // node_a: load 0.90 (> threshold 0.85), free 100000 → total ~1000000
     // node_b: load 0.50 (healthy)
-    mgr.UpsertNodeMetrics({"node_a", "node_a", 100000, 0.90, 0, 0, 1});
-    mgr.UpsertNodeMetrics({"node_b", "node_b", 500000, 0.50, 0, 0, 1});
+    mgr.UpsertNodeMetrics({"node_a", "node_a", DataStorageType{}, 100000, 0.90, 0, 0, 1});
+    mgr.UpsertNodeMetrics({"node_b", "node_b", DataStorageType{}, 500000, 0.50, 0, 0, 1});
 
     AffinityResolveContext ctx;
     ctx.trace_id = "eviction-loop";
@@ -319,9 +319,9 @@ TEST_F(CacheAffinityManagerIntegrationTest, MultiCallerBothGetReplicationHints) 
     auto &mgr = NewManager();
     ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonString(kFullStrategyJson));
 
-    mgr.UpsertNodeMetrics({"node_a", "node_a", 500000, 0.30, 0, 0, 1});
-    mgr.UpsertNodeMetrics({"node_b", "node_b", 500000, 0.30, 0, 0, 1});
-    mgr.UpsertNodeMetrics({"node_c", "node_c", 800000, 0.20, 0, 0, 1});
+    mgr.UpsertNodeMetrics({"node_a", "node_a", DataStorageType{}, 500000, 0.30, 0, 0, 1});
+    mgr.UpsertNodeMetrics({"node_b", "node_b", DataStorageType{}, 500000, 0.30, 0, 0, 1});
+    mgr.UpsertNodeMetrics({"node_c", "node_c", DataStorageType{}, 800000, 0.20, 0, 0, 1});
 
     LocationSpec remote("tp0", "tair://node_c/block/7", "node_c");
     CacheLocation winner;
@@ -379,8 +379,8 @@ TEST_F(CacheAffinityManagerIntegrationTest, HintDedupSuppressionWindow) {
         }
     })"));
 
-    mgr.UpsertNodeMetrics({"node_a", "node_a", 500000, 0.30, 0, 0, 1});
-    mgr.UpsertNodeMetrics({"node_b", "node_b", 800000, 0.20, 0, 0, 1});
+    mgr.UpsertNodeMetrics({"node_a", "node_a", DataStorageType{}, 500000, 0.30, 0, 0, 1});
+    mgr.UpsertNodeMetrics({"node_b", "node_b", DataStorageType{}, 800000, 0.20, 0, 0, 1});
 
     AffinityResolveContext ctx;
     ctx.caller_node.node_id = "node_a";
@@ -434,8 +434,8 @@ TEST_F(CacheAffinityManagerIntegrationTest, ThreeTierPriorityRealisticOverrides)
     auto &mgr = NewManager();
     ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonString(kFullStrategyJson));
 
-    mgr.UpsertNodeMetrics({"node_a", "node_a", 500000, 0.30, 0, 0, 1});
-    mgr.UpsertNodeMetrics({"node_b", "node_b", 800000, 0.20, 0, 0, 1});
+    mgr.UpsertNodeMetrics({"node_a", "node_a", DataStorageType{}, 500000, 0.30, 0, 0, 1});
+    mgr.UpsertNodeMetrics({"node_b", "node_b", DataStorageType{}, 800000, 0.20, 0, 0, 1});
 
     LocationSpec remote("tp0", "tair://node_b/block/10", "node_b");
     CacheLocation winner;
@@ -501,8 +501,8 @@ TEST_F(CacheAffinityManagerIntegrationTest, GlobalKillSwitchMidFlight) {
     auto &mgr = NewManager();
     ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonString(kFullStrategyJson));
 
-    mgr.UpsertNodeMetrics({"node_a", "node_a", 100000, 0.90, 0, 0, 1});
-    mgr.UpsertNodeMetrics({"node_b", "node_b", 500000, 0.50, 0, 0, 1});
+    mgr.UpsertNodeMetrics({"node_a", "node_a", DataStorageType{}, 100000, 0.90, 0, 0, 1});
+    mgr.UpsertNodeMetrics({"node_b", "node_b", DataStorageType{}, 500000, 0.50, 0, 0, 1});
 
     // Before: eviction identifies node_a
     {
@@ -553,8 +553,8 @@ TEST_F(CacheAffinityManagerIntegrationTest, LoadFullStrategyFromFile) {
     std::string err;
     ASSERT_TRUE(mgr.LoadProcessStrategyFromJsonFile(path, &err)) << err;
 
-    mgr.UpsertNodeMetrics({"node_a", "node_a", 600000, 0.40, 0, 0, 1});
-    mgr.UpsertNodeMetrics({"node_b", "node_b", 200000, 0.30, 0, 0, 1});
+    mgr.UpsertNodeMetrics({"node_a", "node_a", DataStorageType{}, 600000, 0.40, 0, 0, 1});
+    mgr.UpsertNodeMetrics({"node_b", "node_b", DataStorageType{}, 200000, 0.30, 0, 0, 1});
 
     AffinityResolveContext ctx;
     ctx.caller_node.node_id = "node_a";
@@ -604,8 +604,8 @@ TEST_F(CacheAffinityManagerIntegrationTest, WriteAspectDisabledReadEvictionOn) {
 
     // node_a (caller): low load so capacity gate passes
     // node_b: high load, eviction target
-    mgr.UpsertNodeMetrics({"node_a", "node_a", 500000, 0.30, 0, 0, 1});
-    mgr.UpsertNodeMetrics({"node_b", "node_b", 100000, 0.90, 0, 0, 1});
+    mgr.UpsertNodeMetrics({"node_a", "node_a", DataStorageType{}, 500000, 0.30, 0, 0, 1});
+    mgr.UpsertNodeMetrics({"node_b", "node_b", DataStorageType{}, 100000, 0.90, 0, 0, 1});
 
     AffinityResolveContext ctx;
     ctx.caller_node.node_id = "node_a";

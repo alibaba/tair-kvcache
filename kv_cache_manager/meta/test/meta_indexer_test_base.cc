@@ -257,7 +257,9 @@ void MetaIndexerTestBase::DoScanAndSampleReclaimKeysTest() {
     try_count = 100;
     while (try_count-- && keys.size() < static_cast<size_t>(key_count)) {
         KeyVector out_keys;
-        ASSERT_EQ(EC_OK, meta_indexer_->SampleReclaimKeys(request_context_.get(), key_count, out_keys));
+        ASSERT_EQ(EC_OK,
+                  meta_indexer_->SampleReclaimKeys(
+                      request_context_.get(), "lru", std::unordered_set<std::string>{}, key_count, out_keys));
         for (const auto key : out_keys) {
             if (std::find(keys.begin(), keys.end(), key) == keys.end()) {
                 keys.push_back(key);

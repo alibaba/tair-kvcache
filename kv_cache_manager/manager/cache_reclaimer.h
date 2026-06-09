@@ -496,10 +496,11 @@ private:
     void ReclaimCron() noexcept;
 
     // below are helper routines for internal usage
-    bool DoKeySampling(const std::shared_ptr<RequestContext> &request_context,
-                       const std::shared_ptr<const InstanceInfo> &instance_info,
-                       std::vector<std::int64_t> &out_keys,
-                       std::vector<std::map<std::string, std::string>> &out_maps) noexcept;
+    bool DoKeySamplingByLRU(const std::shared_ptr<RequestContext> &request_context,
+                            const std::shared_ptr<const InstanceInfo> &instance_info,
+                            const std::unordered_set<std::string> &exceeded_node_ids,
+                            std::vector<std::int64_t> &out_keys,
+                            std::vector<std::map<std::string, std::string>> &out_maps) noexcept;
 
     bool MakeBatchByLRU(const RequestContext *request_context,
                         const std::shared_ptr<const InstanceInfo> &instance_info,

@@ -8,10 +8,12 @@
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/standard_uri.h"
+#include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_storage_backend_factory.h"
+#include "kv_cache_manager/meta/reclaim_indexer/reclaim_indexer_factory.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
 
 namespace kv_cache_manager {
@@ -56,6 +58,28 @@ ErrorCode MetaStorageBackendManager::Init(const std::string &instance_id,
     instance_id_ = instance_id;
 
     const std::string &storage_uri = config->GetStorageUri();
+    std::string reclaim_indexer_types_str;
+    std::string persistent_type;
+    std::string cache_type;
+    if (!storage_uri.empty()) {
+        StandardUri uri = StandardUri::FromUri(storage_uri);
+        if (!uri.Valid()) {
+            KVCM_LOG_ERROR("invalid storage uri[%s]", storage_uri.c_str());
+            return EC_BADARGS;
+        }
+        reclaim_indexer_types_str = uri.GetParam("reclaim_indexer_type");
+        persistent_type = uri.GetParam("persistent_type");
+        cache_type = uri.GetParam("cache_type");
+    }
+
+    cache_type_ = cache_type;
+    persistent_type_ = persistent_type;
+
+    ErrorCode indexer_ec = InitReclaimIndexers(reclaim_indexer_types_str);
+    if (indexer_ec != EC_OK) {
+        return indexer_ec;
+    }
+
     if (config->GetStorageType() != META_CACHED_BACKEND_TYPE_STR) {
         // Single-backend mode: one backend serves every read/write directly.
         persistent_backend_ = MetaStorageBackendFactory::CreateAndInitStorageBackend(instance_id_, config);
@@ -70,17 +94,6 @@ ErrorCode MetaStorageBackendManager::Init(const std::string &instance_id,
     }
 
     assert((config->GetStorageType() == META_CACHED_BACKEND_TYPE_STR));
-    std::string persistent_type;
-    std::string cache_type;
-    if (!storage_uri.empty()) {
-        StandardUri uri = StandardUri::FromUri(storage_uri);
-        if (!uri.Valid()) {
-            KVCM_LOG_ERROR("invalid storage uri[%s]", storage_uri.c_str());
-            return EC_BADARGS;
-        }
-        persistent_type = uri.GetParam("persistent_type");
-        cache_type = uri.GetParam("cache_type");
-    }
     // default to redis / local
     persistent_type = persistent_type.empty() ? META_REDIS_BACKEND_TYPE_STR : persistent_type;
     cache_type = cache_type.empty() ? META_LOCAL_BACKEND_TYPE_STR : cache_type;
@@ -103,6 +116,23 @@ ErrorCode MetaStorageBackendManager::Init(const std::string &instance_id,
                   instance_id_.c_str(),
                   cache_type.c_str(),
                   persistent_type.c_str());
+    return EC_OK;
+}
+
+ErrorCode MetaStorageBackendManager::InitReclaimIndexers(const std::string &types_str) noexcept {
+    if (types_str.empty()) {
+        return EC_OK;
+    }
+    auto types = StringUtil::Split(types_str, ";");
+    for (const auto &type : types) {
+        auto indexer = ReclaimIndexerFactory::Create(type);
+        if (!indexer) {
+            KVCM_LOG_ERROR("fail to create reclaim indexer type[%s]", type.c_str());
+            return EC_ERROR;
+        }
+        KVCM_LOG_INFO("reclaim indexer created, type[%s]", type.c_str());
+        reclaim_indexers_[type] = std::move(indexer);
+    }
     return EC_OK;
 }
 
@@ -288,6 +318,7 @@ int64_t MetaStorageBackendManager::BackfillKeysToCache(const KeyTypeVec &keys,
             KVCM_LOG_WARN("backfill PutIfAbsent failed key[%ld] ec[%d]", keys[i], put_results[i]);
         }
     }
+    NotifyIndexersAdd(keys, locations, put_results);
     return backfilled_count;
 }
 
@@ -298,15 +329,17 @@ std::vector<ErrorCode> MetaStorageBackendManager::Put(RequestContext *request_co
     PropertyMapVector &properties = batch.batch_properties;
     std::vector<ErrorCode> persistent_results = persistent_backend_->Put(request_context, keys, locations, properties);
     if (!cache_backend_) {
+        NotifyIndexersAdd(keys, locations, persistent_results);
         return persistent_results;
     }
     const int64_t cache_begin = TimestampUtil::GetCurrentTimeUs();
     auto results = cache_backend_->Put(request_context, keys, locations, properties, persistent_results);
     if (request_context) {
         auto *mc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
-        KVCM_METRICS_COLLECTOR_SET_METRICS(mc, meta_indexer, cache_backend_put_time_us,
-                                           TimestampUtil::GetCurrentTimeUs() - cache_begin);
+        KVCM_METRICS_COLLECTOR_SET_METRICS(
+            mc, meta_indexer, cache_backend_put_time_us, TimestampUtil::GetCurrentTimeUs() - cache_begin);
     }
+    NotifyIndexersAdd(keys, locations, results);
     return results;
 }
 
@@ -325,15 +358,17 @@ std::vector<ErrorCode> MetaStorageBackendManager::Upsert(RequestContext *request
     std::vector<ErrorCode> persistent_results =
         persistent_backend_->Upsert(request_context, keys, locations, properties);
     if (!cache_backend_) {
+        NotifyIndexersAdd(keys, locations, persistent_results);
         return persistent_results;
     }
     const int64_t cache_begin = TimestampUtil::GetCurrentTimeUs();
     auto results = cache_backend_->Upsert(request_context, keys, locations, properties, persistent_results);
     if (request_context) {
         auto *mc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
-        KVCM_METRICS_COLLECTOR_SET_METRICS(mc, meta_indexer, cache_backend_upsert_time_us,
-                                           TimestampUtil::GetCurrentTimeUs() - cache_begin);
+        KVCM_METRICS_COLLECTOR_SET_METRICS(
+            mc, meta_indexer, cache_backend_upsert_time_us, TimestampUtil::GetCurrentTimeUs() - cache_begin);
     }
+    NotifyIndexersAdd(keys, locations, results);
     return results;
 }
 
@@ -341,6 +376,7 @@ std::vector<ErrorCode> MetaStorageBackendManager::Delete(RequestContext *request
                                                          const KeyVector &keys) noexcept {
     std::vector<ErrorCode> persistent_results = persistent_backend_->Delete(request_context, keys);
     if (!cache_backend_) {
+        NotifyIndexersRemove(keys, persistent_results);
         return persistent_results;
     }
     if (recover_state_.load(std::memory_order_acquire) == RecoverState::kRecover) {
@@ -354,9 +390,10 @@ std::vector<ErrorCode> MetaStorageBackendManager::Delete(RequestContext *request
     auto results = cache_backend_->Delete(request_context, keys, persistent_results);
     if (request_context) {
         auto *mc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
-        KVCM_METRICS_COLLECTOR_SET_METRICS(mc, meta_indexer, cache_backend_delete_time_us,
-                                           TimestampUtil::GetCurrentTimeUs() - cache_begin);
+        KVCM_METRICS_COLLECTOR_SET_METRICS(
+            mc, meta_indexer, cache_backend_delete_time_us, TimestampUtil::GetCurrentTimeUs() - cache_begin);
     }
+    NotifyIndexersRemove(keys, results);
     return results;
 }
 
@@ -387,11 +424,12 @@ std::vector<ErrorCode> MetaStorageBackendManager::Delete(RequestContext *request
         results = cache_backend_->DeleteLocations(request_context, keys, location_ids, persistent_results);
         if (request_context) {
             auto *mc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
-            KVCM_METRICS_COLLECTOR_SET_METRICS(mc, meta_indexer, cache_backend_delete_time_us,
-                                               TimestampUtil::GetCurrentTimeUs() - cache_begin);
+            KVCM_METRICS_COLLECTOR_SET_METRICS(
+                mc, meta_indexer, cache_backend_delete_time_us, TimestampUtil::GetCurrentTimeUs() - cache_begin);
         }
     }
 
+    NotifyIndexersRemoveLocations(keys, location_ids, results);
     out_reclaimed_count = MaybeReclaimEmptyKeys(request_context, keys, results);
     return results;
 }
@@ -442,16 +480,20 @@ std::vector<ErrorCode> MetaStorageBackendManager::Get(RequestContext *request_co
                                                       CacheLocationMapVector &out_locations,
                                                       PropertyMapVector &out_properties) noexcept {
     if (!cache_backend_) {
-        return persistent_backend_->Get(request_context, keys, out_locations, out_properties);
+        auto results = persistent_backend_->Get(request_context, keys, out_locations, out_properties);
+        NotifyIndexersTouch(keys, results);
+        return results;
     }
 
     std::vector<ErrorCode> results = cache_backend_->Get(request_context, keys, out_locations, out_properties);
     if (recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning) {
+        NotifyIndexersTouch(keys, results);
         return results;
     }
 
     auto [missing_keys, missing_indices] = CollectMissingKeys(keys, results);
     if (missing_keys.empty()) {
+        NotifyIndexersTouch(keys, results);
         return results;
     }
 
@@ -467,6 +509,7 @@ std::vector<ErrorCode> MetaStorageBackendManager::Get(RequestContext *request_co
         for (size_t i = 0; i < missing_keys.size(); ++i) {
             results[missing_indices[i]] = EC_ERROR;
         }
+        NotifyIndexersTouch(keys, results);
         return results;
     }
     for (size_t i = 0; i < missing_keys.size(); ++i) {
@@ -477,6 +520,7 @@ std::vector<ErrorCode> MetaStorageBackendManager::Get(RequestContext *request_co
             out_properties[original_idx] = std::move(persistent_properties[i]);
         }
     }
+    NotifyIndexersTouch(keys, results);
     return results;
 }
 
@@ -484,16 +528,20 @@ std::vector<ErrorCode> MetaStorageBackendManager::GetLocations(RequestContext *r
                                                                const KeyVector &keys,
                                                                CacheLocationMapVector &out_location_maps) noexcept {
     if (!cache_backend_) {
-        return persistent_backend_->GetLocations(request_context, keys, out_location_maps);
+        auto results = persistent_backend_->GetLocations(request_context, keys, out_location_maps);
+        NotifyIndexersTouch(keys, results);
+        return results;
     }
 
     std::vector<ErrorCode> results = cache_backend_->GetLocations(request_context, keys, out_location_maps);
     if (recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning) {
+        NotifyIndexersTouch(keys, results);
         return results;
     }
 
     auto [missing_keys, missing_indices] = CollectMissingKeys(keys, results);
     if (missing_keys.empty()) {
+        NotifyIndexersTouch(keys, results);
         return results;
     }
 
@@ -506,6 +554,7 @@ std::vector<ErrorCode> MetaStorageBackendManager::GetLocations(RequestContext *r
         for (size_t i = 0; i < missing_keys.size(); ++i) {
             results[missing_indices[i]] = EC_ERROR;
         }
+        NotifyIndexersTouch(keys, results);
         return results;
     }
     for (size_t i = 0; i < missing_keys.size(); ++i) {
@@ -515,6 +564,7 @@ std::vector<ErrorCode> MetaStorageBackendManager::GetLocations(RequestContext *r
             out_location_maps[original_idx] = std::move(persistent_locations[i]);
         }
     }
+    NotifyIndexersTouch(keys, results);
     return results;
 }
 
@@ -706,18 +756,28 @@ ErrorCode MetaStorageBackendManager::RandomSample(RequestContext *request_contex
 }
 
 ErrorCode MetaStorageBackendManager::SampleReclaimKeys(RequestContext *request_context,
+                                                       const std::string &type,
+                                                       const std::unordered_set<std::string> &node_ids,
                                                        const int64_t count,
                                                        KeyTypeVec &out_keys) noexcept {
     if (count <= 0) {
         return EC_OK;
     }
-    // Until recover finishes, the cache backend has not seen every key yet,
-    // so we still go to persistent to avoid biased reclamation. In single-
-    // backend mode (no cache) we always go to persistent.
+
+    // Try the corresponding reclaim indexer first.
+    auto it = reclaim_indexers_.find(type);
+    if (it != reclaim_indexers_.end()) {
+        return it->second->Sample(static_cast<size_t>(count), node_ids, out_keys);
+    }
+
+    // general lru fallback
     if (cache_backend_ && recover_state_.load(std::memory_order_acquire) == RecoverState::kRunning) {
         return cache_backend_->SampleReclaimKeys(request_context, count, out_keys);
     }
     return persistent_backend_->SampleReclaimKeys(request_context, count, out_keys);
+
+    KVCM_LOG_WARN("SampleReclaimKeys: no reclaim indexer for type[%s]", type.c_str());
+    return EC_NOENT;
 }
 
 ErrorCode MetaStorageBackendManager::PutMetaData(const FieldMap &field_maps) noexcept {
@@ -754,6 +814,74 @@ int64_t MetaStorageBackendManager::GetOldestAccessTime() const noexcept {
         return cache_backend_->GetOldestAccessTime();
     }
     return INT64_MAX;
+}
+
+void MetaStorageBackendManager::NotifyIndexersAdd(const KeyVector &keys,
+                                                  const CacheLocationMapVector &locations,
+                                                  const std::vector<ErrorCode> &results) noexcept {
+    if (reclaim_indexers_.empty()) {
+        return;
+    }
+    for (auto &[type, indexer] : reclaim_indexers_) {
+        auto indexer_results = indexer->Add(keys, locations, results);
+        for (size_t i = 0; i < indexer_results.size(); ++i) {
+            if (indexer_results[i] != EC_OK && indexer_results[i] != EC_NOENT) {
+                KVCM_LOG_WARN(
+                    "reclaim indexer Add failed, type[%s] index[%lu] ec[%d]", type.c_str(), i, indexer_results[i]);
+            }
+        }
+    }
+}
+
+void MetaStorageBackendManager::NotifyIndexersTouch(const KeyVector &keys,
+                                                    const std::vector<ErrorCode> &results) noexcept {
+    if (reclaim_indexers_.empty()) {
+        return;
+    }
+    for (auto &[type, indexer] : reclaim_indexers_) {
+        auto indexer_results = indexer->Touch(keys, results);
+        for (size_t i = 0; i < indexer_results.size(); ++i) {
+            if (indexer_results[i] != EC_OK && indexer_results[i] != EC_NOENT) {
+                KVCM_LOG_WARN(
+                    "reclaim indexer Touch failed, type[%s] index[%lu] ec[%d]", type.c_str(), i, indexer_results[i]);
+            }
+        }
+    }
+}
+
+void MetaStorageBackendManager::NotifyIndexersRemove(const KeyVector &keys,
+                                                     const std::vector<ErrorCode> &results) noexcept {
+    if (reclaim_indexers_.empty()) {
+        return;
+    }
+    for (auto &[type, indexer] : reclaim_indexers_) {
+        auto indexer_results = indexer->Remove(keys, results);
+        for (size_t i = 0; i < indexer_results.size(); ++i) {
+            if (indexer_results[i] != EC_OK && indexer_results[i] != EC_NOENT) {
+                KVCM_LOG_WARN(
+                    "reclaim indexer Remove failed, type[%s] index[%lu] ec[%d]", type.c_str(), i, indexer_results[i]);
+            }
+        }
+    }
+}
+
+void MetaStorageBackendManager::NotifyIndexersRemoveLocations(const KeyVector &keys,
+                                                              const LocationIdsPerKey &location_ids,
+                                                              const std::vector<ErrorCode> &results) noexcept {
+    if (reclaim_indexers_.empty()) {
+        return;
+    }
+    for (auto &[type, indexer] : reclaim_indexers_) {
+        auto indexer_results = indexer->Remove(keys, location_ids, results);
+        for (size_t i = 0; i < indexer_results.size(); ++i) {
+            if (indexer_results[i] != EC_OK && indexer_results[i] != EC_NOENT) {
+                KVCM_LOG_WARN("reclaim indexer RemoveLocations failed, type[%s] index[%lu] ec[%d]",
+                              type.c_str(),
+                              i,
+                              indexer_results[i]);
+            }
+        }
+    }
 }
 
 } // namespace kv_cache_manager

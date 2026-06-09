@@ -95,8 +95,11 @@ public:
                    std::string &out_next_cursor,
                    KeyVector &out_keys) noexcept;
     ErrorCode RandomSample(RequestContext *request_context, const size_t count, KeyVector &out_keys) const noexcept;
-    ErrorCode
-    SampleReclaimKeys(RequestContext *request_context, const int64_t count, KeyVector &out_keys) const noexcept;
+    ErrorCode SampleReclaimKeys(RequestContext *request_context,
+                                const std::string &type,
+                                const std::unordered_set<std::string> &node_ids,
+                                const int64_t count,
+                                KeyVector &out_keys) const noexcept;
 
     void PersistMetaData() noexcept;
     size_t GetKeyCount() const noexcept;
@@ -153,9 +156,9 @@ private:
         int64_t async_enqueue_time_us = 0;
         int64_t cache_backend_upsert_time_us = 0;
         int64_t cache_backend_delete_time_us = 0;
-        int64_t put_key_count = 0;     // brand-new keys created by upsert
-        int64_t update_key_count = 0;  // existing keys updated by upsert
-        int64_t delete_key_count = 0;  // keys deleted by whole-key delete
+        int64_t put_key_count = 0;    // brand-new keys created by upsert
+        int64_t update_key_count = 0; // existing keys updated by upsert
+        int64_t delete_key_count = 0; // keys deleted by whole-key delete
     };
     // Returns {error_count, put_success_count}.
     std::pair<int32_t, int32_t> ExecuteRmwUpsert(const std::string &trace_id,

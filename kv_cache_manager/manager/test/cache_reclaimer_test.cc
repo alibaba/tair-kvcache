@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <thread>
 #include <type_traits>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -244,8 +245,12 @@ std::chrono::milliseconds mi_sample_reclaim_delay{0};
 ErrorCode sample_reclaim_result;
 KeyVector sample_reclaim_keys;
 
-ErrorCode
-MetaIndexer_SampleReclaimKeys_stub(void *obj, RequestContext *rc, const std::int64_t c, KeyVector &out_keys) noexcept {
+ErrorCode MetaIndexer_SampleReclaimKeys_stub(void *obj,
+                                             RequestContext *rc,
+                                             const std::string &type,
+                                             const std::unordered_set<std::string> &node_ids,
+                                             const std::int64_t c,
+                                             KeyVector &out_keys) noexcept {
     if (sample_reclaim_result == ErrorCode::EC_OK) {
         if (c == static_cast<std::int64_t>(sample_reclaim_keys.size())) {
             out_keys = sample_reclaim_keys;
@@ -2847,7 +2852,7 @@ TEST_F(CacheReclaimerTest, TestDoKeySampling) {
 
         std::vector<std::int64_t> keys;
         std::vector<std::map<std::string, std::string>> maps;
-        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
+        ASSERT_TRUE(cache_reclaimer_->DoKeySamplingByLRU(request_context_, instance_infos.front(), {}, keys, maps));
         ASSERT_EQ(sample_reclaim_keys.size(), keys.size());
         ASSERT_EQ(get_out_properties.size(), maps.size());
     }
@@ -2858,7 +2863,7 @@ TEST_F(CacheReclaimerTest, TestDoKeySampling) {
 
         std::vector<std::int64_t> keys;
         std::vector<std::map<std::string, std::string>> maps;
-        ASSERT_FALSE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
+        ASSERT_FALSE(cache_reclaimer_->DoKeySamplingByLRU(request_context_, instance_infos.front(), {}, keys, maps));
     }
 
     {
@@ -2867,7 +2872,7 @@ TEST_F(CacheReclaimerTest, TestDoKeySampling) {
 
         std::vector<std::int64_t> keys;
         std::vector<std::map<std::string, std::string>> maps;
-        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
+        ASSERT_TRUE(cache_reclaimer_->DoKeySamplingByLRU(request_context_, instance_infos.front(), {}, keys, maps));
         ASSERT_EQ(sample_reclaim_keys.size(), keys.size());
         ASSERT_EQ(get_out_properties.size(), maps.size());
     }
@@ -2878,7 +2883,7 @@ TEST_F(CacheReclaimerTest, TestDoKeySampling) {
 
         std::vector<std::int64_t> keys;
         std::vector<std::map<std::string, std::string>> maps;
-        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
+        ASSERT_TRUE(cache_reclaimer_->DoKeySamplingByLRU(request_context_, instance_infos.front(), {}, keys, maps));
         ASSERT_EQ(1000, keys.size());
         ASSERT_EQ(1000, maps.size());
     }
@@ -2889,7 +2894,7 @@ TEST_F(CacheReclaimerTest, TestDoKeySampling) {
 
         std::vector<std::int64_t> keys;
         std::vector<std::map<std::string, std::string>> maps;
-        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
+        ASSERT_TRUE(cache_reclaimer_->DoKeySamplingByLRU(request_context_, instance_infos.front(), {}, keys, maps));
         ASSERT_EQ(1000, keys.size());
         ASSERT_EQ(1000, maps.size());
     }
@@ -2900,7 +2905,7 @@ TEST_F(CacheReclaimerTest, TestDoKeySampling) {
 
         std::vector<std::int64_t> keys;
         std::vector<std::map<std::string, std::string>> maps;
-        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
+        ASSERT_TRUE(cache_reclaimer_->DoKeySamplingByLRU(request_context_, instance_infos.front(), {}, keys, maps));
         ASSERT_EQ(999, keys.size());
         ASSERT_EQ(999, maps.size());
     }
@@ -2911,7 +2916,7 @@ TEST_F(CacheReclaimerTest, TestDoKeySampling) {
 
         std::vector<std::int64_t> keys;
         std::vector<std::map<std::string, std::string>> maps;
-        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
+        ASSERT_TRUE(cache_reclaimer_->DoKeySamplingByLRU(request_context_, instance_infos.front(), {}, keys, maps));
         ASSERT_EQ(1001, keys.size());
         ASSERT_EQ(1001, maps.size());
     }
@@ -2922,7 +2927,7 @@ TEST_F(CacheReclaimerTest, TestDoKeySampling) {
 
         std::vector<std::int64_t> keys;
         std::vector<std::map<std::string, std::string>> maps;
-        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
+        ASSERT_TRUE(cache_reclaimer_->DoKeySamplingByLRU(request_context_, instance_infos.front(), {}, keys, maps));
         ASSERT_EQ(1, keys.size());
         ASSERT_EQ(1, maps.size());
     }
@@ -2938,7 +2943,7 @@ TEST_F(CacheReclaimerTest, TestDoKeySampling) {
 
         std::vector<std::int64_t> keys;
         std::vector<std::map<std::string, std::string>> maps;
-        ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
+        ASSERT_TRUE(cache_reclaimer_->DoKeySamplingByLRU(request_context_, instance_infos.front(), {}, keys, maps));
         ASSERT_EQ(91, keys.size());
         ASSERT_EQ(91, maps.size());
     }
@@ -2973,7 +2978,7 @@ TEST_F(CacheReclaimerTest, TestDoKeySamplingFutureTimeout_SampleReclaimKeysHangs
     std::vector<std::map<std::string, std::string>> maps;
 
     const auto t0 = std::chrono::steady_clock::now();
-    ASSERT_FALSE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
+    ASSERT_FALSE(cache_reclaimer_->DoKeySamplingByLRU(request_context_, instance_infos.front(), {}, keys, maps));
     const auto elapsed = std::chrono::steady_clock::now() - t0;
 
     // should return within the timeout budget (~50ms), not wait for the full 500ms task
@@ -3016,7 +3021,7 @@ TEST_F(CacheReclaimerTest, TestDoKeySamplingFutureTimeout_GetPropertiesHangs) {
 
     std::vector<std::int64_t> keys;
     std::vector<std::map<std::string, std::string>> maps;
-    ASSERT_FALSE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
+    ASSERT_FALSE(cache_reclaimer_->DoKeySamplingByLRU(request_context_, instance_infos.front(), {}, keys, maps));
 
     // wait for background tasks to finish naturally
     while (cache_reclaimer_->in_flight_sampling_tasks_.load() > 0) {
@@ -3052,7 +3057,7 @@ TEST_F(CacheReclaimerTest, TestDoKeySamplingFutureTimeout_NoTimeoutOnFastTasks) 
 
     std::vector<std::int64_t> keys;
     std::vector<std::map<std::string, std::string>> maps;
-    ASSERT_TRUE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
+    ASSERT_TRUE(cache_reclaimer_->DoKeySamplingByLRU(request_context_, instance_infos.front(), {}, keys, maps));
     ASSERT_EQ(10u, keys.size());
 
     // all tasks completed, in-flight should be zero
@@ -3088,7 +3093,7 @@ TEST_F(CacheReclaimerTest, TestDoKeySamplingFutureTimeout_DeadlineBoundsAllFutur
     std::vector<std::map<std::string, std::string>> maps;
 
     const auto t0 = std::chrono::steady_clock::now();
-    ASSERT_FALSE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
+    ASSERT_FALSE(cache_reclaimer_->DoKeySamplingByLRU(request_context_, instance_infos.front(), {}, keys, maps));
     const auto elapsed = std::chrono::steady_clock::now() - t0;
 
     // should be bounded by ~100ms deadline, not 500ms (5 tasks * 100ms)
@@ -3130,7 +3135,7 @@ TEST_F(CacheReclaimerTest, TestDoKeySamplingFutureTimeout_WorkerSaturationGuard)
 
     // should immediately return false without submitting new work
     const auto t0 = std::chrono::steady_clock::now();
-    ASSERT_FALSE(cache_reclaimer_->DoKeySampling(request_context_, instance_infos.front(), keys, maps));
+    ASSERT_FALSE(cache_reclaimer_->DoKeySamplingByLRU(request_context_, instance_infos.front(), {}, keys, maps));
     const auto elapsed = std::chrono::steady_clock::now() - t0;
     ASSERT_LT(elapsed, std::chrono::milliseconds(50));
 
@@ -3182,8 +3187,8 @@ TEST_F(CacheReclaimerTest, TestDupKeys) {
         std::vector<std::map<std::string, std::string>> maps(get_out_properties);
         std::vector<std::int64_t> batch;
         CacheReclaimer::AgeStats lru_age_stats;
-        ASSERT_TRUE(
-            cache_reclaimer_->MakeBatchByLRU(request_context_.get(), instance_infos.front(), keys, maps, batch, lru_age_stats));
+        ASSERT_TRUE(cache_reclaimer_->MakeBatchByLRU(
+            request_context_.get(), instance_infos.front(), keys, maps, batch, lru_age_stats));
         ASSERT_EQ(9, batch.size());
         // keys 1..10 unique, lru_times 0..9; tp=0 excluded from stats, tp=1..9 included (9 entries)
         // ages: now_us-1, now_us-2, ..., now_us-9 → min=now_us-9, max=now_us-1, diff=8
@@ -3238,8 +3243,8 @@ TEST_F(CacheReclaimerTest, TestDupKeys) {
         std::vector<std::map<std::string, std::string>> maps(get_out_properties);
         std::vector<std::int64_t> batch;
         CacheReclaimer::AgeStats lru_age_stats;
-        ASSERT_TRUE(
-            cache_reclaimer_->MakeBatchByLRU(request_context_.get(), instance_infos.front(), keys, maps, batch, lru_age_stats));
+        ASSERT_TRUE(cache_reclaimer_->MakeBatchByLRU(
+            request_context_.get(), instance_infos.front(), keys, maps, batch, lru_age_stats));
         ASSERT_EQ(1, batch.size());
         // all keys are 1 (only 1 unique key), first occurrence has tp=0 → excluded
         // age_count=0 → Clear() called → all stats zeroed
@@ -3291,8 +3296,8 @@ TEST_F(CacheReclaimerTest, TestDupKeys) {
         std::vector<std::map<std::string, std::string>> maps(get_out_properties);
         std::vector<std::int64_t> batch;
         CacheReclaimer::AgeStats lru_age_stats;
-        ASSERT_TRUE(
-            cache_reclaimer_->MakeBatchByLRU(request_context_.get(), instance_infos.front(), keys, maps, batch, lru_age_stats));
+        ASSERT_TRUE(cache_reclaimer_->MakeBatchByLRU(
+            request_context_.get(), instance_infos.front(), keys, maps, batch, lru_age_stats));
         ASSERT_EQ(2, batch.size());
         // keys={1*7,2,1,1}, tp={9*7,10,9,9}; sorted → key=1(tp=9) then key=2(tp=10)
         // ages: now_us-9 and now_us-10 → min=now_us-10, max=now_us-9, diff=1

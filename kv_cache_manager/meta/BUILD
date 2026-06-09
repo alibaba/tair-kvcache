@@ -84,6 +84,8 @@ cc_library(
         "//kv_cache_manager/common:standard_uri",
         "//kv_cache_manager/common:timestamp_util",
         "//kv_cache_manager/config",
+        "//kv_cache_manager/meta/reclaim_indexer:reclaim_indexer",
+        "//kv_cache_manager/meta/reclaim_indexer:reclaim_indexer_factory",
         "//kv_cache_manager/metrics:metrics_collector",
     ],
 )

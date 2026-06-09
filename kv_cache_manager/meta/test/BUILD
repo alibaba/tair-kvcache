@@ -29,6 +29,19 @@ cc_test(
 )
 
 cc_test(
+    name = "meta_indexer_node_lru_test",
+    srcs = [
+        "meta_indexer_node_lru_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    data = [],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/meta",
+    ],
+)
+
+cc_test(
     name = "meta_indexer_manager_test",
     srcs = [
         "meta_indexer_manager_test.cc",

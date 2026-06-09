@@ -179,7 +179,8 @@ MetaIndexer::Result MetaIndexer::Put(RequestContext *request_context,
     AdjustKeyCountMeta(keys.size() - error_count);
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, put_io_time_us, put_io_time_us);
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, lock_wait_time_us, lock_wait_time_us);
-    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, cache_backend_put_time_us, cache_backend_put_time_us);
+    KVCM_METRICS_COLLECTOR_SET_METRICS(
+        service_metrics_collector, meta_indexer, cache_backend_put_time_us, cache_backend_put_time_us);
     ProcessErrorResult(trace_id, kPutMetaOperation, error_count, keys.size(), result);
     return result;
 }
@@ -210,7 +211,8 @@ MetaIndexer::Result MetaIndexer::Delete(RequestContext *request_context, const K
     }
     AdjustKeyCountMeta(error_count - keys.size());
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, lock_wait_time_us, lock_wait_time_us);
-    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, cache_backend_delete_time_us, cache_backend_delete_time_us);
+    KVCM_METRICS_COLLECTOR_SET_METRICS(
+        service_metrics_collector, meta_indexer, cache_backend_delete_time_us, cache_backend_delete_time_us);
     ProcessErrorResult(trace_id, kDeleteMetaOperation, error_count, keys.size(), result);
     return result;
 }
@@ -347,8 +349,10 @@ void MetaIndexer::EmitRmwMetrics(MetricsCollector *metrics_collector,
     }
 
     if (has_upsert || has_delete) {
-        KVCM_METRICS_COLLECTOR_SET_METRICS(
-            service_metrics_collector, meta_indexer, async_enqueue_timeout_key_count, stats.async_enqueue_timeout_key_count);
+        KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector,
+                                           meta_indexer,
+                                           async_enqueue_timeout_key_count,
+                                           stats.async_enqueue_timeout_key_count);
         KVCM_METRICS_COLLECTOR_SET_METRICS(
             service_metrics_collector, meta_indexer, async_enqueue_time_us, stats.async_enqueue_time_us);
     }
@@ -766,14 +770,18 @@ MetaIndexer::RandomSample(RequestContext *request_context, const size_t count, K
 }
 
 ErrorCode MetaIndexer::SampleReclaimKeys(RequestContext *request_context,
+                                         const std::string &type,
+                                         const std::unordered_set<std::string> &node_ids,
                                          const int64_t count,
                                          KeyVector &out_keys) const noexcept {
     out_keys.clear();
     out_keys.reserve(count);
-    ErrorCode ec = backend_manager_->SampleReclaimKeys(request_context, count, out_keys);
+    ErrorCode ec = backend_manager_->SampleReclaimKeys(request_context, type, node_ids, count, out_keys);
     if (ec != EC_OK) {
-        KVCM_LOG_ERROR("instance[%s] meta indexer sample reclaim keys failed, count[%lu] sample key size[%lu]",
+        KVCM_LOG_ERROR("instance[%s] meta indexer sample reclaim keys failed, type[%s] count[%lu] sample key "
+                       "size[%lu]",
                        instance_id_.c_str(),
+                       type.c_str(),
                        count,
                        out_keys.size());
     }
