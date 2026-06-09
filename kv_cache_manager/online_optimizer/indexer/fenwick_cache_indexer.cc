@@ -117,6 +117,16 @@ void FenwickCacheIndexer::DoEvictOne() {
     reverse_map_.erase(rev_it);
     last_access_.erase(evicted_key);
     unique_count_--;
+    eviction_count_++;
+}
+
+int64_t FenwickCacheIndexer::memory_usage_bytes() const {
+    // FenwickTree: (capacity + 1) * sizeof(int64_t)
+    int64_t fenwick_bytes = (fenwick_.capacity() + 1) * static_cast<int64_t>(sizeof(int64_t));
+    // unordered_map overhead: ~56 bytes per entry (key + value + node overhead)
+    constexpr int64_t kMapEntryBytes = 56;
+    int64_t map_bytes = static_cast<int64_t>(last_access_.size() + reverse_map_.size()) * kMapEntryBytes;
+    return fenwick_bytes + map_bytes;
 }
 
 void FenwickCacheIndexer::DoCompact() {

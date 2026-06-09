@@ -155,6 +155,8 @@ message OptimizerInstanceSummary {
     int64 avg_bytes_per_block = 9;  // 平均每个 block 字节数
     int32 linear_step = 10;         // 线性步长
     int64 peak_unique_keys = 11;    // 峰值 unique key 数
+    int64 eviction_count = 13;       // 累计驱逐次数
+    int64 memory_usage_bytes = 14;   // indexer 内部数据结构的估算内存占用
 }
 
 message OptimizerListInstancesResponse {

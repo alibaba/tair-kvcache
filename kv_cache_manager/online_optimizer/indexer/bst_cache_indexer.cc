@@ -156,6 +156,17 @@ void BSTCacheIndexer::DoEvictOne() {
     reverse_map_.erase(min_time_);
     last_access_.erase(evicted_key);
     min_time_++;
+    eviction_count_++;
+}
+
+int64_t BSTCacheIndexer::memory_usage_bytes() const {
+    // TreapNode: ~48 bytes each (key, priority, size, left, right pointers + allocation overhead)
+    constexpr int64_t kTreapNodeBytes = 48;
+    int64_t treap_bytes = treap_.Size() * kTreapNodeBytes;
+    // unordered_map overhead: ~56 bytes per entry
+    constexpr int64_t kMapEntryBytes = 56;
+    int64_t map_bytes = static_cast<int64_t>(last_access_.size() + reverse_map_.size()) * kMapEntryBytes;
+    return treap_bytes + map_bytes;
 }
 
 } // namespace kv_cache_manager

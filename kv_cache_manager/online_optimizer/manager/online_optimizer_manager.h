@@ -66,6 +66,8 @@ struct InstanceSummary {
     int64_t avg_bytes_per_block = 0;
     int32_t linear_step = 0;
     int64_t peak_unique_keys = 0;
+    int64_t eviction_count = 0;
+    int64_t memory_usage_bytes = 0;
 };
 
 class OnlineOptimizerManager {

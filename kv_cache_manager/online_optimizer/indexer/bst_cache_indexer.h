@@ -51,6 +51,8 @@ public:
     int64_t ProcessKey(int64_t key) override;
     int64_t unique_count() const override;
     int64_t peak_unique_count() const override { return peak_unique_count_; }
+    int64_t eviction_count() const override { return eviction_count_; }
+    int64_t memory_usage_bytes() const override;
 
     void PostQueryMaintenance() override;
 
@@ -64,6 +66,7 @@ private:
     std::unordered_map<int64_t, int64_t> reverse_map_;
     int64_t logical_time_ = 0;
     int64_t peak_unique_count_ = 0;
+    int64_t eviction_count_ = 0;
     int64_t min_time_ = 0;
 };
 

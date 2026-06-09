@@ -37,6 +37,8 @@ struct OptimizerMetricsReporter::KmonContext {
     DECLARE_METRICS(trace, query_unique_keys);
     DECLARE_METRICS(trace, query_avg_bytes_per_block);
     DECLARE_METRICS(trace, query_linear_step);
+    DECLARE_METRICS(trace, query_eviction_count);
+    DECLARE_METRICS(trace, query_memory_usage_bytes);
 
     struct MapHashFunc {
         size_t operator()(const std::map<std::string, std::string> &m) const noexcept {
@@ -197,6 +199,8 @@ bool OptimizerMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(trace, query_unique_keys);
     REGISTER_GAUGE_METRIC(trace, query_avg_bytes_per_block);
     REGISTER_GAUGE_METRIC(trace, query_linear_step);
+    REGISTER_GAUGE_METRIC(trace, query_eviction_count);
+    REGISTER_GAUGE_METRIC(trace, query_memory_usage_bytes);
 
     KVCM_LOG_INFO("OptimizerMetricsReporter: kmonitor initialized, prefix[%s]", prefix_.c_str());
     return true;
@@ -263,6 +267,12 @@ void OptimizerMetricsReporter::ReportInterval() {
 
         Gauge linear_step = metrics_registry_->GetGauge(prefix_ + ".trace_query_linear_step", prom_tags);
         linear_step = static_cast<double>(s.linear_step);
+
+        Gauge eviction_count = metrics_registry_->GetGauge(prefix_ + ".trace_query_eviction_count", prom_tags);
+        eviction_count = static_cast<double>(s.eviction_count);
+
+        Gauge memory_usage = metrics_registry_->GetGauge(prefix_ + ".trace_query_memory_usage_bytes", prom_tags);
+        memory_usage = static_cast<double>(s.memory_usage_bytes);
     }
 
     // --- Kmonitor ---
@@ -280,6 +290,8 @@ void OptimizerMetricsReporter::ReportInterval() {
         REPORT_METRICS(trace, query_unique_keys, static_cast<double>(s.unique_keys));
         REPORT_METRICS(trace, query_avg_bytes_per_block, static_cast<double>(s.avg_bytes_per_block));
         REPORT_METRICS(trace, query_linear_step, static_cast<double>(s.linear_step));
+        REPORT_METRICS(trace, query_eviction_count, static_cast<double>(s.eviction_count));
+        REPORT_METRICS(trace, query_memory_usage_bytes, static_cast<double>(s.memory_usage_bytes));
     }
 }
 

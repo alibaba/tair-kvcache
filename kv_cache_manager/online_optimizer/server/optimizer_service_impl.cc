@@ -284,6 +284,8 @@ void OptimizerServiceImpl::ListInstances(RequestContext *request_context,
             pb->set_avg_bytes_per_block(s.avg_bytes_per_block);
             pb->set_linear_step(s.linear_step);
             pb->set_peak_unique_keys(s.peak_unique_keys);
+            pb->set_eviction_count(s.eviction_count);
+            pb->set_memory_usage_bytes(s.memory_usage_bytes);
         }
     }
 }

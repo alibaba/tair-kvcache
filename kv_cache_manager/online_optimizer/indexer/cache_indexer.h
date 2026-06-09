@@ -22,6 +22,12 @@ public:
 
     virtual int64_t peak_unique_count() const = 0;
 
+    // Number of keys evicted from the indexer.
+    virtual int64_t eviction_count() const = 0;
+
+    // Estimated memory usage in bytes of internal data structures.
+    virtual int64_t memory_usage_bytes() const = 0;
+
     // Called after processing all keys in a query batch.
     // Subclasses may perform eviction, compaction, etc.
     virtual void PostQueryMaintenance() {}

@@ -267,6 +267,8 @@ ErrorCode OnlineOptimizerManager::ListInstances(const std::string &instance_grou
                          : 0.0;
         s.unique_keys = state->indexer->unique_count();
         s.peak_unique_keys = state->indexer->peak_unique_count();
+        s.eviction_count = state->indexer->eviction_count();
+        s.memory_usage_bytes = state->indexer->memory_usage_bytes();
         s.avg_bytes_per_block = state->avg_bytes_per_block;
         s.linear_step = state->linear_step;
         summaries.push_back(std::move(s));
