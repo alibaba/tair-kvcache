@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <memory>
 
 #include "kv_cache_manager/client/include/manager_client.h"
@@ -42,6 +43,9 @@ public:
                                 const std::vector<int64_t> &keys,
                                 const std::vector<int64_t> &tokens,
                                 const BlockMask &block_mask) override;
+
+    void ReplicateWithData(const ReplicationHint &hint, const void *data, size_t size,
+                           std::function<void()> release_fn) override;
 
     ClientErrorCode LoadKvCaches(const UriStrVec &uri_str_vec, const BlockBuffers &block_buffers) override;
 
