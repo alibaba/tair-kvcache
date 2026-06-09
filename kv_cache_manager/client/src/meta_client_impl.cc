@@ -166,7 +166,8 @@ MetaClientImpl::StartWrite(const std::string &trace_id,
                            const std::vector<int64_t> &keys,
                            const std::vector<int64_t> &tokens,
                            const std::vector<std::string> &location_spec_group_names,
-                           int64_t write_timeout_seconds) {
+                           int64_t write_timeout_seconds,
+                           bool is_replication) {
     KVCM_LOG_DEBUG("start write with trace_id [%s], keys %s, tokens %s, location_spec_group_names [%s], "
                    "write_timeout_seconds [%ld]",
                    trace_id.c_str(),
@@ -176,7 +177,7 @@ MetaClientImpl::StartWrite(const std::string &trace_id,
                    write_timeout_seconds);
     const std::string &instance_id = CHECK_INSTANCE_STUB_WITH_TYPE();
     return stub_->StartWriteCache(
-        trace_id, instance_id, keys, tokens, location_spec_group_names, write_timeout_seconds, caller_node_);
+        trace_id, instance_id, keys, tokens, location_spec_group_names, write_timeout_seconds, caller_node_, is_replication);
 }
 ClientErrorCode MetaClientImpl::FinishWrite(const std::string &trace_id,
                                             const std::string &write_session_id,

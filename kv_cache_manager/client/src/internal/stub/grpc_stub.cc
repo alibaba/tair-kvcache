@@ -395,7 +395,8 @@ GrpcStub::StartWriteCache(const std::string &trace_id,
                           const TokenIdsVector &tokens,
                           const std::vector<std::string> &location_spec_group_names,
                           int64_t write_timeout_seconds,
-                          const CallerNode &caller) {
+                          const CallerNode &caller,
+                          bool is_replication) {
     auto stub = GET_AND_CHECK_STUB_WITH_TYPE();
     proto::meta::StartWriteCacheRequest request;
     SetKeysAndTokens(request, trace_id, instance_id, keys, tokens);
@@ -409,6 +410,7 @@ GrpcStub::StartWriteCache(const std::string &trace_id,
         proto_caller->set_node_id(caller.node_id);
         proto_caller->set_supernode_id(caller.supernode_id);
     }
+    request.set_is_replication(is_replication);
     grpc::ClientContext context;
     proto::meta::StartWriteCacheResponse response;
     auto grpc_status = stub->StartWriteCache(&context, request, &response);

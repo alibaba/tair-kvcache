@@ -120,7 +120,8 @@ public:
                  const TokenIdsVector &tokens,
                  const std::vector<std::string> &location_spec_group_names,
                  int64_t write_timeout_seconds,
-                 const CallerNode &caller),
+                 const CallerNode &caller,
+                 bool is_replication),
                 (override));
 
     MOCK_METHOD(ClientErrorCode,

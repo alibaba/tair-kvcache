@@ -1,10 +1,13 @@
 #pragma once
 
+#include <memory>
+
 #include "kv_cache_manager/client/include/manager_client.h"
 
 namespace kv_cache_manager {
 class MetaClient;
 class TransferClient;
+class ReplicationExecutor;
 class ManagerClientImpl : public ManagerClient {
 public:
     ManagerClientImpl();
@@ -56,5 +59,6 @@ private:
     friend class ManagerClient;
     std::unique_ptr<MetaClient> meta_client_;
     std::unique_ptr<TransferClient> transfer_client_;
+    std::unique_ptr<ReplicationExecutor> replication_executor_;
 };
 } // namespace kv_cache_manager
