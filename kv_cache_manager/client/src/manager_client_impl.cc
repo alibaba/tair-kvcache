@@ -1,5 +1,6 @@
 #include "kv_cache_manager/client/src/manager_client_impl.h"
 
+#include "kv_cache_manager/client/src/internal/config/client_config.h"
 #include "kv_cache_manager/client/src/meta_client_impl.h"
 #include "kv_cache_manager/client/src/replication_executor.h"
 #include "kv_cache_manager/client/src/transfer_client_impl.h"
@@ -49,8 +50,13 @@ ClientErrorCode ManagerClientImpl::Init(const std::string &client_config, InitPa
         }
     }
     if (meta_client_ && transfer_client_) {
+        ClientConfig config;
+        int num_workers = 2;
+        if (config.FromJsonString(client_config)) {
+            num_workers = std::max(1, static_cast<int>(config.replication_workers()));
+        }
         replication_executor_ =
-            std::make_unique<ReplicationExecutor>(meta_client_.get(), transfer_client_.get());
+            std::make_unique<ReplicationExecutor>(meta_client_.get(), transfer_client_.get(), num_workers);
     }
     KVCM_LOG_INFO("manager client init success");
     return ER_OK;

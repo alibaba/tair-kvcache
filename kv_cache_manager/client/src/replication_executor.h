@@ -18,7 +18,7 @@ class TransferClient;
 
 class ReplicationExecutor {
 public:
-    ReplicationExecutor(MetaClient *meta_client, TransferClient *transfer_client);
+    ReplicationExecutor(MetaClient *meta_client, TransferClient *transfer_client, int num_workers = 2);
     ~ReplicationExecutor();
 
     void Submit(const std::vector<ReplicationHint> &hints);
@@ -38,7 +38,7 @@ private:
     std::deque<ReplicationHint> queue_;
     std::set<std::string> inflight_;
     std::atomic<bool> stopped_{false};
-    std::thread worker_;
+    std::vector<std::thread> workers_;
 };
 
 } // namespace kv_cache_manager
