@@ -3,7 +3,9 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -11,6 +13,7 @@
 #include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/meta_cache_base_backend.h"
 #include "kv_cache_manager/meta/meta_storage_backend.h"
+#include "kv_cache_manager/meta/reclaim_indexer/reclaim_indexer.h"
 #include "kv_cache_manager/meta/types.h"
 
 namespace kv_cache_manager {
@@ -178,6 +181,11 @@ public:
     bool PreferSingleTaskReclaimSampling() const noexcept;
     // Apply the maintenance yield only to a complete Local reclaim source.
     size_t TouchKeysForMaintenance(const KeyTypeVec &keys) noexcept;
+    ErrorCode SampleReclaimKeys(RequestContext *request_context,
+                                const std::string &type,
+                                const std::unordered_set<std::string> &node_ids,
+                                const int64_t count,
+                                KeyTypeVec &out_keys) noexcept;
 
     ErrorCode PutMetaData(const FieldMap &field_maps) noexcept;
     ErrorCode GetMetaData(FieldMap &field_maps) noexcept;
@@ -241,11 +249,31 @@ private:
     int32_t MaybeReclaimEmptyKeys(RequestContext *request_context,
                                   const KeyVector &keys,
                                   const std::vector<ErrorCode> &delete_results) noexcept;
+    // Create reclaim indexers from a semicolon-separated type string (e.g. "node_lru;ttl").
+    ErrorCode InitReclaimIndexers(const std::string &types_str) noexcept;
+
+    // Notify all reclaim indexers about successfully written keys+locations (write / recover path).
+    void NotifyIndexersAdd(const KeyVector &keys,
+                           const CacheLocationMapVector &locations,
+                           const std::vector<ErrorCode> &results) noexcept;
+    // Notify all reclaim indexers about successfully read keys (read path).
+    void NotifyIndexersTouch(const KeyVector &keys, const std::vector<ErrorCode> &results) noexcept;
+    // Notify all reclaim indexers about fully deleted keys.
+    void NotifyIndexersRemove(const KeyVector &keys, const std::vector<ErrorCode> &results) noexcept;
+    // Notify all reclaim indexers about partially deleted locations.
+    void NotifyIndexersRemoveLocations(const KeyVector &keys,
+                                       const LocationIdsPerKey &location_ids,
+                                       const std::vector<ErrorCode> &results) noexcept;
+
     std::string instance_id_;
+    std::string cache_type_;
+    std::string persistent_type_;
     std::unique_ptr<MetaStorageBackend> persistent_backend_;
     std::unique_ptr<MetaCacheBaseBackend> cache_backend_;
     bool memory_primary_ = false;
     bool force_deleting_async_enqueue_ = true;
+    // type -> per-type reclaim indexer
+    std::unordered_map<std::string, std::unique_ptr<ReclaimIndexer>> reclaim_indexers_;
 
     std::atomic<RecoverState> recover_state_{RecoverState::kRecover};
     std::atomic<bool> is_closed_{false};

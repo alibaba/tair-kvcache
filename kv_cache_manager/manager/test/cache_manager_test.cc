@@ -1768,14 +1768,18 @@ TEST_F(CacheManagerTest, TestGetCacheLocationHitRateCounters) {
     {
         std::vector<int64_t> query_keys{1, 2, 4};
         BlockMask block_mask = static_cast<size_t>(0);
-        auto [ec, result] = cache_manager_->GetCacheLocation(metrics_ctx.get(),
-                                                             "test_instance",
-                                                             CacheManager::QueryType::QT_PREFIX_MATCH,
-                                                             query_keys,
-                                                             {},
-                                                             block_mask,
-                                                             0,
-                                                             {});
+        CacheLocationViewVecWrapper result;
+        std::vector<ReplicationHint> hints;
+        auto ec = cache_manager_->GetCacheLocation(metrics_ctx.get(),
+                                                   "test_instance",
+                                                   CacheManager::QueryType::QT_PREFIX_MATCH,
+                                                   query_keys,
+                                                   {},
+                                                   block_mask,
+                                                   0,
+                                                   {},
+                                                   result,
+                                                   hints);
         ASSERT_EQ(EC_OK, ec);
         ASSERT_EQ(2u, result.cache_locations_view().size()); // 2 hits
     }
@@ -1784,14 +1788,18 @@ TEST_F(CacheManagerTest, TestGetCacheLocationHitRateCounters) {
     {
         std::vector<int64_t> query_keys{1, 2, 3};
         BlockMask block_mask = static_cast<size_t>(0);
-        auto [ec, result] = cache_manager_->GetCacheLocation(metrics_ctx.get(),
-                                                             "test_instance",
-                                                             CacheManager::QueryType::QT_PREFIX_MATCH,
-                                                             query_keys,
-                                                             {},
-                                                             block_mask,
-                                                             0,
-                                                             {});
+        CacheLocationViewVecWrapper result;
+        std::vector<ReplicationHint> hints;
+        auto ec = cache_manager_->GetCacheLocation(metrics_ctx.get(),
+                                                   "test_instance",
+                                                   CacheManager::QueryType::QT_PREFIX_MATCH,
+                                                   query_keys,
+                                                   {},
+                                                   block_mask,
+                                                   0,
+                                                   {},
+                                                   result,
+                                                   hints);
         ASSERT_EQ(EC_OK, ec);
         ASSERT_EQ(3u, result.cache_locations_view().size()); // 3 hits
     }
@@ -1833,14 +1841,18 @@ TEST_F(CacheManagerTest, TestGetCacheLocationHitRateCounters_BatchGet) {
     {
         std::vector<int64_t> query_keys{1, 2, 99};
         BlockMask block_mask = static_cast<size_t>(0);
-        auto [ec, result] = cache_manager_->GetCacheLocation(metrics_ctx.get(),
-                                                             "test_instance",
-                                                             CacheManager::QueryType::QT_BATCH_GET,
-                                                             query_keys,
-                                                             {},
-                                                             block_mask,
-                                                             0,
-                                                             {});
+        CacheLocationViewVecWrapper result;
+        std::vector<ReplicationHint> hints;
+        auto ec = cache_manager_->GetCacheLocation(metrics_ctx.get(),
+                                                   "test_instance",
+                                                   CacheManager::QueryType::QT_BATCH_GET,
+                                                   query_keys,
+                                                   {},
+                                                   block_mask,
+                                                   0,
+                                                   {},
+                                                   result,
+                                                   hints);
         ASSERT_EQ(EC_OK, ec);
         // BatchGet returns all keys; hits have non-empty id, misses have empty id
         ASSERT_EQ(3u, result.cache_locations_view().size());
@@ -1861,14 +1873,18 @@ TEST_F(CacheManagerTest, TestGetCacheLocationHitRateCounters_ErrorPath) {
     // Query non-existent instance → should fail and NOT increment counters
     std::vector<int64_t> query_keys{1, 2, 3};
     BlockMask block_mask = static_cast<size_t>(0);
-    auto [ec, result] = cache_manager_->GetCacheLocation(metrics_ctx.get(),
-                                                         "nonexistent_instance",
-                                                         CacheManager::QueryType::QT_PREFIX_MATCH,
-                                                         query_keys,
-                                                         {},
-                                                         block_mask,
-                                                         0,
-                                                         {});
+    CacheLocationViewVecWrapper result;
+    std::vector<ReplicationHint> hints;
+    auto ec = cache_manager_->GetCacheLocation(metrics_ctx.get(),
+                                               "nonexistent_instance",
+                                               CacheManager::QueryType::QT_PREFIX_MATCH,
+                                               query_keys,
+                                               {},
+                                               block_mask,
+                                               0,
+                                               {},
+                                               result,
+                                               hints);
     EXPECT_NE(EC_OK, ec);
 
     Counter query_counter, hit_counter;
@@ -10909,8 +10925,8 @@ public:
     void SetUp() override {
         affinity_manager_ = std::make_shared<CacheAffinityManager>();
         ASSERT_TRUE(affinity_manager_->LoadProcessStrategyFromJsonString(kStrategyJson));
-        affinity_manager_->UpsertNodeMetrics({"node_a", "node_a", 500000, 0.30, 0, 0, 1});
-        affinity_manager_->UpsertNodeMetrics({"node_b", "node_b", 800000, 0.20, 0, 0, 1});
+        affinity_manager_->UpsertNodeMetrics({"node_a", "node_a", DataStorageType{}, 500000, 0.30, 0, 0, 1});
+        affinity_manager_->UpsertNodeMetrics({"node_b", "node_b", DataStorageType{}, 800000, 0.20, 0, 0, 1});
 
         cache_manager_ = createCacheManager();
         request_context_ = std::make_shared<RequestContext>("affinity_trace");

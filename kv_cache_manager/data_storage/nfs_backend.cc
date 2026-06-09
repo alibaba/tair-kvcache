@@ -131,6 +131,9 @@ std::vector<NodeMetrics> NfsBackend::SnapshotPerNodeMetrics() const {
     NodeMetrics m;
     m.node_id = local_node_id_;
     m.node_name = local_node_id_;
+    m.storage_type = DataStorageType::DATA_STORAGE_TYPE_NFS;
+    m.free_bytes = std::numeric_limits<uint64_t>::max(); // infinite storage
+    m.load_ratio = 0.0;
     return {std::move(m)};
 }
 
