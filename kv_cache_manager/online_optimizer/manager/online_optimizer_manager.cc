@@ -7,6 +7,7 @@
 
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/online_optimizer/config/optimizer_registry_manager.h"
+#include "kv_cache_manager/online_optimizer/indexer/ttl_cache_indexer_wrapper.h"
 
 namespace kv_cache_manager {
 
@@ -120,11 +121,9 @@ ErrorCode OnlineOptimizerManager::RegisterInstanceInternal(const OptimizerInstan
 
     const auto &capacity_gb = instance_group.capacity_gb();
     std::vector<int64_t> capacity_blocks(capacity_gb.size());
-    int64_t max_cap = 0;
     for (size_t i = 0; i < capacity_gb.size(); i++) {
         int64_t bytes = static_cast<int64_t>(capacity_gb[i] * 1024.0 * 1024.0 * 1024.0);
         capacity_blocks[i] = bytes / avg_bytes_per_block;
-        max_cap = std::max(max_cap, capacity_blocks[i]);
     }
 
     auto state = std::make_shared<InstanceState>();
@@ -134,13 +133,16 @@ ErrorCode OnlineOptimizerManager::RegisterInstanceInternal(const OptimizerInstan
     state->size_full_only = size_full_only;
     state->size_full_linear = size_full_linear;
     state->linear_step = linear_step;
-    state->avg_bytes_per_block = avg_bytes_per_block;
-    state->capacity_blocks = capacity_blocks;
-    state->max_capacity_blocks = max_cap;
-    state->primary_capacity_index = instance_group.primary_capacity_index();
     state->total_hits_per_capacity.resize(capacity_gb.size(), 0);
 
-    state->indexer = CreateCacheIndexer(instance_group.indexer_type(), instance_group.max_key_count());
+    state->indexer = CreateCacheIndexer(instance_group.indexer_type(), instance_group.max_key_count(),
+                                        capacity_gb, size_full_only, size_full_linear, linear_step);
+
+    if (instance_group.ttl_seconds() > 0) {
+        state->indexer = std::make_unique<TtlCacheIndexerWrapper>(
+            std::move(state->indexer),
+            instance_group.ttl_seconds());
+    }
 
     {
         std::unique_lock lock(instances_mutex_);
@@ -195,26 +197,11 @@ ErrorCode OnlineOptimizerManager::TraceQuery(const std::string &instance_id,
     std::lock_guard<std::mutex> guard(state->mutex);
 
     const int64_t total_blocks = static_cast<int64_t>(block_keys.size());
-    const size_t num_caps = state->capacity_blocks.size();
+    const size_t num_caps = state->total_hits_per_capacity.size();
 
-    std::vector<int64_t> hit_count(num_caps, 0);
-    std::vector<int64_t> first_miss(num_caps, total_blocks);
-
-    for (int64_t i = 0; i < total_blocks; i++) {
-        int64_t sd = state->indexer->ProcessKey(block_keys[i]);
-
-        for (size_t j = 0; j < num_caps; j++) {
-            if (i < first_miss[j]) {
-                if (sd >= state->capacity_blocks[j] || sd == INT64_MAX) {
-                    first_miss[j] = i;
-                }
-            }
-        }
-    }
-
-    for (size_t j = 0; j < num_caps; j++) {
-        hit_count[j] = first_miss[j];
-    }
+    std::vector<int64_t> hit_count;
+    int64_t max_hit_count;
+    state->indexer->ProcessKeys(block_keys, hit_count, max_hit_count);
 
     state->indexer->PostQueryMaintenance();
 
@@ -223,17 +210,17 @@ ErrorCode OnlineOptimizerManager::TraceQuery(const std::string &instance_id,
     for (size_t j = 0; j < num_caps; j++) {
         state->total_hits_per_capacity[j] += hit_count[j];
     }
-
-    int32_t primary_idx = state->primary_capacity_index;
-    if (primary_idx >= 0 && primary_idx < static_cast<int32_t>(num_caps)) {
-        result.cache_hit_count = hit_count[primary_idx];
-    } else if (!hit_count.empty()) {
-        result.cache_hit_count = hit_count[0];
+    if (max_hit_count >= 0) {
+        state->total_max_hits += max_hit_count;
     }
+
+    result.cache_hit_count = hit_count.empty() ? 0 : hit_count[0];
     result.total_blocks = total_blocks;
-    result.hit_count_per_capacity = hit_count;
+    hit_count.resize(num_caps);
+    result.hit_count_per_capacity = std::move(hit_count);
     result.capacity_gb = state->instance_group->capacity_gb();
     result.current_unique_keys = state->indexer->unique_count();
+    result.max_hit_count = max_hit_count;
 
     return EC_OK;
 }
@@ -258,19 +245,31 @@ ErrorCode OnlineOptimizerManager::ListInstances(const std::string &instance_grou
         s.total_queries = state->total_queries;
         s.total_blocks_queried = state->total_blocks_queried;
 
-        int32_t primary_idx = state->primary_capacity_index;
-        if (primary_idx >= 0 && primary_idx < static_cast<int32_t>(state->total_hits_per_capacity.size())) {
-            s.total_hits = state->total_hits_per_capacity[primary_idx];
-        }
-        s.hit_rate = state->total_blocks_queried > 0
-                         ? static_cast<double>(s.total_hits) / static_cast<double>(state->total_blocks_queried)
+        s.total_max_hits = state->total_max_hits;
+        s.max_hit_rate = state->total_blocks_queried > 0
+                         ? static_cast<double>(s.total_max_hits) / static_cast<double>(state->total_blocks_queried)
                          : 0.0;
         s.unique_keys = state->indexer->unique_count();
-        s.peak_unique_keys = state->indexer->peak_unique_count();
         s.eviction_count = state->indexer->eviction_count();
         s.memory_usage_bytes = state->indexer->memory_usage_bytes();
-        s.avg_bytes_per_block = state->avg_bytes_per_block;
+        s.kv_cache_usage_bytes = state->indexer->kv_cache_usage_bytes();
+        s.ttl_eviction_count = state->indexer->ttl_eviction_count();
+        s.avg_bytes_per_block = (state->linear_step <= 1)
+            ? state->size_full_linear
+            : ((state->linear_step - 1) * state->size_full_only + state->size_full_linear) / state->linear_step;
         s.linear_step = state->linear_step;
+
+        const auto &caps = state->instance_group->capacity_gb();
+        for (size_t i = 0; i < caps.size() && i < state->total_hits_per_capacity.size(); i++) {
+            PerCapacityHitRateInfo info;
+            info.capacity_gb = caps[i];
+            info.total_hits = state->total_hits_per_capacity[i];
+            info.hit_rate = state->total_blocks_queried > 0
+                ? static_cast<double>(info.total_hits) / static_cast<double>(state->total_blocks_queried)
+                : 0.0;
+            s.per_capacity_hit_rates.push_back(info);
+        }
+
         summaries.push_back(std::move(s));
     }
     return EC_OK;
@@ -288,10 +287,21 @@ ErrorCode OnlineOptimizerManager::ResetStats(const std::string &instance_id) {
     }
 
     std::lock_guard<std::mutex> guard(state->mutex);
-    state->indexer = CreateCacheIndexer(state->instance_group->indexer_type(), state->instance_group->max_key_count());
+    state->indexer = CreateCacheIndexer(state->instance_group->indexer_type(),
+                                        state->instance_group->max_key_count(),
+                                        state->instance_group->capacity_gb(),
+                                        state->size_full_only,
+                                        state->size_full_linear,
+                                        state->linear_step);
+    if (state->instance_group->ttl_seconds() > 0) {
+        state->indexer = std::make_unique<TtlCacheIndexerWrapper>(
+            std::move(state->indexer),
+            state->instance_group->ttl_seconds());
+    }
     state->total_queries = 0;
     state->total_blocks_queried = 0;
     std::fill(state->total_hits_per_capacity.begin(), state->total_hits_per_capacity.end(), 0);
+    state->total_max_hits = 0;
     KVCM_LOG_INFO("ResetStats OK: instance[%s]", instance_id.c_str());
     return EC_OK;
 }

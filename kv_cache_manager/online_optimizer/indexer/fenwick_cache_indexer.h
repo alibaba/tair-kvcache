@@ -30,13 +30,24 @@ class FenwickCacheIndexer : public CacheIndexer {
 public:
     explicit FenwickCacheIndexer(int64_t max_key_count);
 
-    int64_t ProcessKey(int64_t key) override;
+    void Init(const std::vector<double> &capacity_gb,
+              int64_t size_full_only,
+              int64_t size_full_linear,
+              int32_t linear_step) override;
+
+    void ProcessKeys(const std::vector<int64_t> &keys,
+                    std::vector<int64_t> &hit_count,
+                    int64_t &max_hit_count) override;
     int64_t unique_count() const override { return unique_count_; }
-    int64_t peak_unique_count() const override { return peak_unique_count_; }
     int64_t eviction_count() const override { return eviction_count_; }
     int64_t memory_usage_bytes() const override;
+    int64_t kv_cache_usage_bytes() const override;
 
     void PostQueryMaintenance() override;
+    bool RemoveKey(int64_t key) override;
+
+    // Exposed for testing: compute stack distance for a single key.
+    int64_t ComputeStackDistance(int64_t key);
 
 private:
     void EvictIfExceedsCapacity();
@@ -45,9 +56,10 @@ private:
     void DoCompact();
 
     int64_t max_key_count_;
+    int64_t avg_bytes_per_block_ = 0;
+    std::vector<int64_t> capacity_blocks_;
     int64_t logical_time_ = 0;
     int64_t unique_count_ = 0;
-    int64_t peak_unique_count_ = 0;
     int64_t eviction_count_ = 0;
     int64_t total_slots_;
     FenwickTree fenwick_;

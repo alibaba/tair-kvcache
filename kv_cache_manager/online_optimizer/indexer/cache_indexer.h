@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace kv_cache_manager {
 
@@ -14,13 +15,25 @@ public:
     CacheIndexer(const CacheIndexer &) = delete;
     CacheIndexer &operator=(const CacheIndexer &) = delete;
 
-    // Returns stack distance for this key.
-    // INT64_MAX means first-time access (cold miss).
-    virtual int64_t ProcessKey(int64_t key) = 0;
+    // Initialize the indexer with capacity and size parameters.
+    // capacity_gb: capacity tiers in GB.
+    // size_full_only: byte size of a full-only block.
+    // size_full_linear: byte size of a full+linear block.
+    // linear_step: linear step factor (>=1).
+    virtual void Init(const std::vector<double> &capacity_gb,
+                      int64_t size_full_only,
+                      int64_t size_full_linear,
+                      int32_t linear_step) = 0;
+
+    // Process a batch of key accesses and compute per-capacity prefix hit count.
+    // keys: the block keys in query order.
+    // hit_count: output vector sized to number of capacity tiers, filled with
+    //            the count of contiguous prefix hits for each tier.
+    virtual void ProcessKeys(const std::vector<int64_t> &keys,
+                             std::vector<int64_t> &hit_count,
+                             int64_t &max_hit_count) = 0;
 
     virtual int64_t unique_count() const = 0;
-
-    virtual int64_t peak_unique_count() const = 0;
 
     // Number of keys evicted from the indexer.
     virtual int64_t eviction_count() const = 0;
@@ -28,11 +41,26 @@ public:
     // Estimated memory usage in bytes of internal data structures.
     virtual int64_t memory_usage_bytes() const = 0;
 
+    // Estimated total kv cache size in bytes for all keys currently tracked.
+    virtual int64_t kv_cache_usage_bytes() const = 0;
+
+    // Remove a specific key from the indexer.
+    // Returns true if the key existed and was removed.
+    virtual bool RemoveKey(int64_t key) { return false; }
+
+    // Number of keys evicted due to TTL expiration.
+    virtual int64_t ttl_eviction_count() const { return 0; }
+
     // Called after processing all keys in a query batch.
     // Subclasses may perform eviction, compaction, etc.
     virtual void PostQueryMaintenance() {}
 };
 
-std::unique_ptr<CacheIndexer> CreateCacheIndexer(const std::string &indexer_type, int64_t max_key_count);
+std::unique_ptr<CacheIndexer> CreateCacheIndexer(const std::string &indexer_type,
+                                                  int64_t max_key_count,
+                                                  const std::vector<double> &capacity_gb,
+                                                  int64_t size_full_only,
+                                                  int64_t size_full_linear,
+                                                  int32_t linear_step);
 
 } // namespace kv_cache_manager

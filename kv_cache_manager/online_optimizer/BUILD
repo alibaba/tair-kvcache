@@ -49,14 +49,31 @@ cc_library(
         "indexer/bst_cache_indexer.cc",
         "indexer/cache_indexer.cc",
         "indexer/fenwick_cache_indexer.cc",
+        "indexer/lru_cache_indexer.cc",
     ],
     hdrs = [
         "indexer/bst_cache_indexer.h",
         "indexer/cache_indexer.h",
         "indexer/fenwick_cache_indexer.h",
+        "indexer/lru_cache_indexer.h",
     ],
     deps = [
         "//kv_cache_manager/common:logger",
+        "//kv_cache_manager/common/cache",
+    ],
+)
+
+cc_library(
+    name = "ttl_cache_indexer_wrapper",
+    srcs = [
+        "indexer/ttl_cache_indexer_wrapper.cc",
+    ],
+    hdrs = [
+        "indexer/ttl_cache_indexer_wrapper.h",
+    ],
+    deps = [
+        ":cache_indexer",
+        "//kv_cache_manager/common:timestamp_util",
     ],
 )
 
@@ -73,6 +90,7 @@ cc_library(
         ":optimizer_instance_info",
         ":optimizer_registry_manager",
         ":cache_indexer",
+        ":ttl_cache_indexer_wrapper",
         "//kv_cache_manager/common",
     ],
 )

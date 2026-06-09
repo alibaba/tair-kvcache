@@ -33,12 +33,18 @@ struct OptimizerMetricsReporter::KmonContext {
     // intervallic metrics
     DECLARE_METRICS(trace, query_total);
     DECLARE_METRICS(trace, query_blocks_total);
-    DECLARE_METRICS(trace, query_primary_hit_rate);
+    DECLARE_METRICS(trace, query_max_hit_rate);
     DECLARE_METRICS(trace, query_unique_keys);
     DECLARE_METRICS(trace, query_avg_bytes_per_block);
     DECLARE_METRICS(trace, query_linear_step);
     DECLARE_METRICS(trace, query_eviction_count);
     DECLARE_METRICS(trace, query_memory_usage_bytes);
+    DECLARE_METRICS(trace, query_kv_cache_usage_bytes);
+    DECLARE_METRICS(trace, query_ttl_eviction_count);
+    DECLARE_METRICS(trace, query_hit_rate);
+
+    DECLARE_METRICS(query, max_hit_count);
+    DECLARE_METRICS(query, max_hit_rate);
 
     struct MapHashFunc {
         size_t operator()(const std::map<std::string, std::string> &m) const noexcept {
@@ -195,12 +201,18 @@ bool OptimizerMetricsReporter::InitMetrics() {
     // intervallic metrics
     REGISTER_GAUGE_METRIC(trace, query_total);
     REGISTER_GAUGE_METRIC(trace, query_blocks_total);
-    REGISTER_GAUGE_METRIC(trace, query_primary_hit_rate);
+    REGISTER_GAUGE_METRIC(trace, query_max_hit_rate);
     REGISTER_GAUGE_METRIC(trace, query_unique_keys);
     REGISTER_GAUGE_METRIC(trace, query_avg_bytes_per_block);
     REGISTER_GAUGE_METRIC(trace, query_linear_step);
     REGISTER_GAUGE_METRIC(trace, query_eviction_count);
     REGISTER_GAUGE_METRIC(trace, query_memory_usage_bytes);
+    REGISTER_GAUGE_METRIC(trace, query_kv_cache_usage_bytes);
+    REGISTER_GAUGE_METRIC(trace, query_ttl_eviction_count);
+    REGISTER_GAUGE_METRIC(trace, query_hit_rate);
+
+    REGISTER_GAUGE_METRIC(query, max_hit_count);
+    REGISTER_GAUGE_METRIC(query, max_hit_rate);
 
     KVCM_LOG_INFO("OptimizerMetricsReporter: kmonitor initialized, prefix[%s]", prefix_.c_str());
     return true;
@@ -256,8 +268,8 @@ void OptimizerMetricsReporter::ReportInterval() {
         Gauge blocks_total = metrics_registry_->GetGauge(prefix_ + ".trace_query_blocks_total", prom_tags);
         blocks_total = static_cast<double>(s.total_blocks_queried);
 
-        Gauge primary_hit_rate = metrics_registry_->GetGauge(prefix_ + ".trace_query_primary_hit_rate", prom_tags);
-        primary_hit_rate = s.hit_rate;
+        Gauge max_hit_rate = metrics_registry_->GetGauge(prefix_ + ".trace_query_max_hit_rate", prom_tags);
+        max_hit_rate = s.max_hit_rate;
 
         Gauge unique_keys = metrics_registry_->GetGauge(prefix_ + ".trace_query_unique_keys", prom_tags);
         unique_keys = static_cast<double>(s.unique_keys);
@@ -273,6 +285,19 @@ void OptimizerMetricsReporter::ReportInterval() {
 
         Gauge memory_usage = metrics_registry_->GetGauge(prefix_ + ".trace_query_memory_usage_bytes", prom_tags);
         memory_usage = static_cast<double>(s.memory_usage_bytes);
+
+        Gauge kv_cache_usage = metrics_registry_->GetGauge(prefix_ + ".trace_query_kv_cache_usage_bytes", prom_tags);
+        kv_cache_usage = static_cast<double>(s.kv_cache_usage_bytes);
+
+        Gauge ttl_eviction = metrics_registry_->GetGauge(prefix_ + ".trace_query_ttl_eviction_count", prom_tags);
+        ttl_eviction = static_cast<double>(s.ttl_eviction_count);
+
+        for (const auto &cap_info : s.per_capacity_hit_rates) {
+            std::string cap_str = std::to_string(cap_info.capacity_gb);
+            MetricsTags cap_tags = {{"instance_id", s.instance_id}, {"capacity_gb", cap_str}};
+            Gauge rate = metrics_registry_->GetGauge(prefix_ + ".trace_query_hit_rate", cap_tags);
+            rate = cap_info.hit_rate;
+        }
     }
 
     // --- Kmonitor ---
@@ -286,12 +311,21 @@ void OptimizerMetricsReporter::ReportInterval() {
 
         REPORT_METRICS(trace, query_total, static_cast<double>(s.total_queries));
         REPORT_METRICS(trace, query_blocks_total, static_cast<double>(s.total_blocks_queried));
-        REPORT_METRICS(trace, query_primary_hit_rate, s.hit_rate);
+        REPORT_METRICS(trace, query_max_hit_rate, s.max_hit_rate);
         REPORT_METRICS(trace, query_unique_keys, static_cast<double>(s.unique_keys));
         REPORT_METRICS(trace, query_avg_bytes_per_block, static_cast<double>(s.avg_bytes_per_block));
         REPORT_METRICS(trace, query_linear_step, static_cast<double>(s.linear_step));
         REPORT_METRICS(trace, query_eviction_count, static_cast<double>(s.eviction_count));
         REPORT_METRICS(trace, query_memory_usage_bytes, static_cast<double>(s.memory_usage_bytes));
+        REPORT_METRICS(trace, query_kv_cache_usage_bytes, static_cast<double>(s.kv_cache_usage_bytes));
+        REPORT_METRICS(trace, query_ttl_eviction_count, static_cast<double>(s.ttl_eviction_count));
+
+        for (const auto &cap_info : s.per_capacity_hit_rates) {
+            std::string cap_str = std::to_string(cap_info.capacity_gb);
+            MetricsTags cap_tags = {{"instance_id", s.instance_id}, {"capacity_gb", cap_str}};
+            kmonitor::MetricsTags ktags = kmon_ctx_->GetKmonitorTags(cap_tags);
+            kmon_ctx_->trace_query_hit_rate_metrics->Report(&ktags, cap_info.hit_rate);
+        }
     }
 }
 
@@ -305,6 +339,8 @@ void OptimizerMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
         return;
     }
 
+    const auto &client_ip = p->client_ip();
+
     // --- Prometheus: per-capacity hit metrics ---
     if (metrics_registry_ && p->total_blocks() > 0) {
         const auto &per_cap = p->per_capacity_hits();
@@ -314,7 +350,7 @@ void OptimizerMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
             double hit_rate = static_cast<double>(info.hit_count) / static_cast<double>(p->total_blocks());
             std::string cap_str = std::to_string(info.capacity_gb);
 
-            MetricsTags prom_tags = {{"instance_id", instance_id}, {"capacity_gb", cap_str}};
+            MetricsTags prom_tags = {{"instance_id", instance_id}, {"client_ip", client_ip}, {"capacity_gb", cap_str}};
 
             Gauge rate_gauge = metrics_registry_->GetGauge(prefix_ + ".query_hit_rate", prom_tags);
             rate_gauge = hit_rate;
@@ -323,9 +359,16 @@ void OptimizerMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
             hit_gauge = static_cast<double>(info.hit_count);
         }
 
-        MetricsTags base_tags = {{"instance_id", instance_id}};
+        MetricsTags base_tags = {{"instance_id", instance_id}, {"client_ip", client_ip}};
         Gauge blocks_gauge = metrics_registry_->GetGauge(prefix_ + ".query_total_blocks", base_tags);
         blocks_gauge = static_cast<double>(p->total_blocks());
+
+        if (p->max_hit_count() >= 0) {
+            Gauge max_hit_gauge = metrics_registry_->GetGauge(prefix_ + ".query_max_hit_count", base_tags);
+            max_hit_gauge = static_cast<double>(p->max_hit_count());
+            Gauge max_rate_gauge = metrics_registry_->GetGauge(prefix_ + ".query_max_hit_rate", base_tags);
+            max_rate_gauge = p->max_hit_rate();
+        }
     }
 
     // --- Kmonitor ---
@@ -354,16 +397,21 @@ void OptimizerMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
             double hit_rate = static_cast<double>(info.hit_count) / static_cast<double>(p->total_blocks());
             std::string cap_str = std::to_string(info.capacity_gb);
 
-            MetricsTags base_tags = {{"instance_id", instance_id}, {"capacity_gb", cap_str}};
+            MetricsTags base_tags = {{"instance_id", instance_id}, {"client_ip", client_ip}, {"capacity_gb", cap_str}};
             kmonitor::MetricsTags tags = kmon_ctx_->GetKmonitorTags(base_tags);
 
             REPORT_METRICS(query, hit_rate, hit_rate);
             REPORT_METRICS(query, hit_count, static_cast<double>(info.hit_count));
         }
 
-        MetricsTags base_tags = {{"instance_id", instance_id}};
+        MetricsTags base_tags = {{"instance_id", instance_id}, {"client_ip", client_ip}};
         kmonitor::MetricsTags tags = kmon_ctx_->GetKmonitorTags(base_tags);
         REPORT_METRICS(query, total_blocks, static_cast<double>(p->total_blocks()));
+
+        if (p->max_hit_count() >= 0) {
+            REPORT_METRICS(query, max_hit_count, static_cast<double>(p->max_hit_count()));
+            REPORT_METRICS(query, max_hit_rate, p->max_hit_rate());
+        }
     }
 }
 

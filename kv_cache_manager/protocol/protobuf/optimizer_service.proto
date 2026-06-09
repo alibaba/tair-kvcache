@@ -48,10 +48,10 @@ message LocationSpecGroup {
 message OptimizerInstanceGroupProto {
     string name = 1;                    // group 唯一名称
     bool enabled = 2;                   // 是否启用该 group 的在线优化
-    repeated double capacity_gb = 4;    // 模拟的缓存容量列表，单位 GB，可配多档
-    int32 primary_capacity_index = 5;   // 主容量索引，命中率以此档为准
-    string indexer_type = 8;            // indexer 类型: "bst_lru" 或 "fenwick_lru"
-    int64 max_key_count = 9;            // indexer 最大 key 数量，0 表示不限制
+    repeated double capacity_gb = 3;    // 模拟的缓存容量列表，单位 GB，可配多档
+    string indexer_type = 4;            // indexer 类型: "bst_lru" 或 "fenwick_lru"
+    int64 max_key_count = 5;            // indexer 最大 key 数量，0 表示不限制
+    int64 ttl_seconds = 6;             // TTL 秒数，0 表示不启用 TTL 淘汰
 }
 
 // InstanceGroup 增删改查
@@ -120,6 +120,22 @@ message OptimizerRemoveInstanceResponse {
     CommonResponseHeader header = 1;
 }
 
+message OptimizerGetInstanceRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+}
+
+message OptimizerGetInstanceResponse {
+    CommonResponseHeader header = 1;
+    string instance_group = 2;
+    string instance_id = 3;
+    int32 block_size = 4;
+    repeated LocationSpecInfo location_spec_infos = 5;
+    repeated LocationSpecGroup location_spec_groups = 6;
+    int32 linear_step = 7;
+    string full_group_name = 8;
+}
+
 // TraceQuery：模拟 block 级缓存命中
 
 message TraceQueryRequest {
@@ -134,6 +150,7 @@ message TraceQueryResponse {
     int64 cache_hit_count = 2; // 命中的 block 数（前缀连续命中长度）
     int64 total_blocks = 3;    // 本次请求的总 block 数
     int64 current_unique_keys = 4; // 当前 unique key 数（容量占用）
+    int64 max_hit_count = 5;       // 最大理论命中数（-1 表示未启用）
 }
 
 // Instance 列表/统计重置
@@ -143,20 +160,28 @@ message OptimizerListInstancesRequest {
     string instance_group = 2; // 为空时返回所有 instance
 }
 
+message PerCapacityHitRate {
+    double capacity_gb = 1;
+    int64 total_hits = 2;
+    double hit_rate = 3;
+}
+
 message OptimizerInstanceSummary {
     string instance_id = 1;
     string instance_group = 2;
     int32 block_size = 3;
     int64 total_queries = 4;        // 累计查询次数
     int64 total_blocks_queried = 5; // 累计查询 block 数
-    int64 total_hits = 6;           // 累计命中 block 数
-    double hit_rate = 7;            // 命中率 = total_hits / total_blocks_queried
+    int64 total_max_hits = 6;       // 累计最大理论命中 block 数（max_key_count<=0 时有效）
+    double max_hit_rate = 7;        // 最大理论命中率
     int64 unique_keys = 8;          // 当前去重后的 key 数量
     int64 avg_bytes_per_block = 9;  // 平均每个 block 字节数
     int32 linear_step = 10;         // 线性步长
-    int64 peak_unique_keys = 11;    // 峰值 unique key 数
-    int64 eviction_count = 13;       // 累计驱逐次数
-    int64 memory_usage_bytes = 14;   // indexer 内部数据结构的估算内存占用
+    int64 eviction_count = 11;       // 累计驱逐次数
+    int64 memory_usage_bytes = 12;   // indexer 内部数据结构的估算内存占用
+    int64 kv_cache_usage_bytes = 13;  // 当前追踪的所有 key 对应的 kv cache 总大小
+    int64 ttl_eviction_count = 14;    // 因 TTL 过期而驱逐的 key 数量
+    repeated PerCapacityHitRate per_capacity_hit_rates = 15; // 各容量档位的累积命中率
 }
 
 message OptimizerListInstancesResponse {
@@ -184,6 +209,7 @@ service OptimizerService {
     // Instance 管理
     rpc RegisterInstance(OptimizerRegisterInstanceRequest) returns (OptimizerRegisterInstanceResponse);
     rpc RemoveInstance(OptimizerRemoveInstanceRequest) returns (OptimizerRemoveInstanceResponse);
+    rpc GetInstance(OptimizerGetInstanceRequest) returns (OptimizerGetInstanceResponse);
     rpc ListInstances(OptimizerListInstancesRequest) returns (OptimizerListInstancesResponse);
 
     // 在线 TraceQuery

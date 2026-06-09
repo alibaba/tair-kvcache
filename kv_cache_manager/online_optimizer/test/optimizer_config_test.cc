@@ -11,7 +11,6 @@ TEST_F(OptimizerInstanceGroupTest, DefaultValues) {
     EXPECT_TRUE(group.name().empty());
     EXPECT_FALSE(group.enabled());
     EXPECT_TRUE(group.capacity_gb().empty());
-    EXPECT_EQ(0, group.primary_capacity_index());
     EXPECT_EQ("fenwick_lru", group.indexer_type());
     EXPECT_EQ(0, group.max_key_count());
 }
@@ -21,7 +20,6 @@ TEST_F(OptimizerInstanceGroupTest, SerializeDeserialize) {
     group.set_name("g1");
     group.set_enabled(true);
     group.set_capacity_gb({40.0, 80.0, 120.0});
-    group.set_primary_capacity_index(2);
     group.set_indexer_type("bst_lru");
     group.set_max_key_count(10000);
 
@@ -35,7 +33,6 @@ TEST_F(OptimizerInstanceGroupTest, SerializeDeserialize) {
     EXPECT_DOUBLE_EQ(40.0, group2.capacity_gb()[0]);
     EXPECT_DOUBLE_EQ(80.0, group2.capacity_gb()[1]);
     EXPECT_DOUBLE_EQ(120.0, group2.capacity_gb()[2]);
-    EXPECT_EQ(2, group2.primary_capacity_index());
     EXPECT_EQ("bst_lru", group2.indexer_type());
     EXPECT_EQ(10000, group2.max_key_count());
 }
@@ -65,16 +62,6 @@ TEST_F(OptimizerInstanceGroupTest, ValidateEnabledWithCapacity) {
     group.set_capacity_gb({1.0});
     std::string fields;
     EXPECT_TRUE(group.ValidateRequiredFields(fields));
-}
-
-TEST_F(OptimizerInstanceGroupTest, ValidatePrimaryCapacityOutOfRange) {
-    OptimizerInstanceGroup group;
-    group.set_name("g1");
-    group.set_enabled(true);
-    group.set_capacity_gb({1.0});
-    group.set_primary_capacity_index(5);
-    std::string fields;
-    EXPECT_FALSE(group.ValidateRequiredFields(fields));
 }
 
 TEST_F(OptimizerInstanceGroupTest, ValidateInvalidIndexerType) {

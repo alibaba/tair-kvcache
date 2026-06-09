@@ -1,6 +1,7 @@
 #include "kv_cache_manager/online_optimizer/indexer/fenwick_cache_indexer.h"
 
 #include <algorithm>
+#include <cmath>
 #include <climits>
 #include <utility>
 
@@ -59,7 +60,33 @@ FenwickCacheIndexer::FenwickCacheIndexer(int64_t max_key_count)
     , fenwick_(total_slots_) {
 }
 
-int64_t FenwickCacheIndexer::ProcessKey(int64_t key) {
+void FenwickCacheIndexer::Init(const std::vector<double> &capacity_gb,
+                                int64_t size_full_only,
+                                int64_t size_full_linear,
+                                int32_t linear_step) {
+    linear_step = std::max(linear_step, int32_t(1));
+    int64_t avg_bytes_per_block;
+    if (linear_step <= 1) {
+        avg_bytes_per_block = size_full_linear;
+    } else {
+        avg_bytes_per_block =
+            ((linear_step - 1) * size_full_only + size_full_linear) / linear_step;
+    }
+
+    avg_bytes_per_block_ = avg_bytes_per_block;
+
+    capacity_blocks_.resize(capacity_gb.size());
+    for (size_t i = 0; i < capacity_gb.size(); i++) {
+        int64_t bytes = static_cast<int64_t>(capacity_gb[i] * 1024.0 * 1024.0 * 1024.0);
+        capacity_blocks_[i] = (avg_bytes_per_block_ > 0) ? bytes / avg_bytes_per_block_ : 0;
+    }
+}
+
+int64_t FenwickCacheIndexer::kv_cache_usage_bytes() const {
+    return unique_count() * avg_bytes_per_block_;
+}
+
+int64_t FenwickCacheIndexer::ComputeStackDistance(int64_t key) {
     int64_t sd = INT64_MAX;
     auto it = last_access_.find(key);
     if (it != last_access_.end()) {
@@ -72,9 +99,6 @@ int64_t FenwickCacheIndexer::ProcessKey(int64_t key) {
         reverse_map_.erase(t_prev);
     } else {
         unique_count_++;
-        if (unique_count_ > peak_unique_count_) {
-            peak_unique_count_ = unique_count_;
-        }
     }
 
     if (logical_time_ >= total_slots_) {
@@ -89,9 +113,43 @@ int64_t FenwickCacheIndexer::ProcessKey(int64_t key) {
     return sd;
 }
 
+void FenwickCacheIndexer::ProcessKeys(const std::vector<int64_t> &keys,
+                                      std::vector<int64_t> &hit_count,
+                                      int64_t &max_hit_count) {
+    const size_t num_caps = capacity_blocks_.size();
+    const int64_t total_keys = static_cast<int64_t>(keys.size());
+    hit_count.assign(num_caps, total_keys);
+    max_hit_count = (max_key_count_ <= 0) ? total_keys : -1;
+
+    for (int64_t i = 0; i < total_keys; i++) {
+        int64_t sd = ComputeStackDistance(keys[i]);
+        for (size_t j = 0; j < num_caps; j++) {
+            bool is_hit = (sd != INT64_MAX && sd < capacity_blocks_[j]);
+            if (i < hit_count[j] && !is_hit) {
+                hit_count[j] = i;
+            }
+        }
+        if (max_hit_count > 0 && i < max_hit_count && sd == INT64_MAX) {
+            max_hit_count = i;
+        }
+    }
+}
+
 void FenwickCacheIndexer::PostQueryMaintenance() {
     EvictIfExceedsCapacity();
     CompactIfNeeded();
+}
+
+bool FenwickCacheIndexer::RemoveKey(int64_t key) {
+    auto it = last_access_.find(key);
+    if (it == last_access_.end()) return false;
+    int64_t t = it->second;
+    fenwick_.Update(t, -1);
+    reverse_map_.erase(t);
+    last_access_.erase(it);
+    unique_count_--;
+    eviction_count_++;
+    return true;
 }
 
 void FenwickCacheIndexer::EvictIfExceedsCapacity() {

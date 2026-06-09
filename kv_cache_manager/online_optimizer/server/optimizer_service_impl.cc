@@ -28,9 +28,9 @@ OptimizerInstanceGroup ConvertProtoToInstanceGroup(const proto::optimizer::Optim
     group.set_enabled(pb.enabled());
     std::vector<double> caps(pb.capacity_gb().begin(), pb.capacity_gb().end());
     group.set_capacity_gb(caps);
-    group.set_primary_capacity_index(pb.primary_capacity_index());
     group.set_indexer_type(pb.indexer_type().empty() ? "fenwick_lru" : pb.indexer_type());
     group.set_max_key_count(pb.max_key_count());
+    group.set_ttl_seconds(pb.ttl_seconds());
     return group;
 }
 
@@ -41,9 +41,9 @@ void ConvertInstanceGroupToProto(const OptimizerInstanceGroup &group,
     for (double cap : group.capacity_gb()) {
         pb->add_capacity_gb(cap);
     }
-    pb->set_primary_capacity_index(group.primary_capacity_index());
     pb->set_indexer_type(group.indexer_type());
     pb->set_max_key_count(group.max_key_count());
+    pb->set_ttl_seconds(group.ttl_seconds());
 }
 
 OptimizerInstanceInfo ConvertProtoToInstanceInfo(
@@ -221,6 +221,41 @@ void OptimizerServiceImpl::RemoveInstance(RequestContext *request_context,
     SetErrorOnCollector(request_context, ec);
 }
 
+void OptimizerServiceImpl::GetInstance(RequestContext *request_context,
+                                        const proto::optimizer::OptimizerGetInstanceRequest *request,
+                                        proto::optimizer::OptimizerGetInstanceResponse *response) {
+    request_context->set_api_name("GetInstance");
+    OptimizerCallGuard guard(request_context, metrics_reporter_.get());
+
+    ErrorCode ec = manager_->GetInstanceState(request->instance_id(),
+        [&](const InstanceState &state) {
+            const auto &info = *state.instance_info;
+            response->set_instance_group(info.instance_group_name());
+            response->set_instance_id(info.instance_id());
+            response->set_block_size(info.block_size());
+            for (const auto &spec : info.location_spec_infos()) {
+                auto *pb_spec = response->add_location_spec_infos();
+                pb_spec->set_name(spec.name());
+                pb_spec->set_size(spec.size());
+            }
+            for (const auto &group : info.location_spec_groups()) {
+                auto *pb_group = response->add_location_spec_groups();
+                pb_group->set_name(group.name());
+                for (const auto &name : group.spec_names()) {
+                    pb_group->add_spec_names(name);
+                }
+            }
+            response->set_linear_step(info.linear_step());
+            response->set_full_group_name(info.full_group_name());
+        });
+
+    SetPbResponseHeader(response->mutable_header(), ec);
+    request_context->set_status_code(static_cast<int>(ec));
+    if (ec != EC_OK) {
+        SetErrorOnCollector(request_context, ec);
+    }
+}
+
 void OptimizerServiceImpl::TraceQuery(RequestContext *request_context,
                                        const proto::optimizer::TraceQueryRequest *request,
                                        proto::optimizer::TraceQueryResponse *response) {
@@ -239,6 +274,7 @@ void OptimizerServiceImpl::TraceQuery(RequestContext *request_context,
         response->set_cache_hit_count(result.cache_hit_count);
         response->set_total_blocks(result.total_blocks);
         response->set_current_unique_keys(result.current_unique_keys);
+        response->set_max_hit_count(result.max_hit_count);
 
         auto *collector = dynamic_cast<OptimizerServiceMetricsCollector *>(
             request_context->metrics_collector());
@@ -251,6 +287,11 @@ void OptimizerServiceImpl::TraceQuery(RequestContext *request_context,
                 per_cap.push_back({result.capacity_gb[i], result.hit_count_per_capacity[i]});
             }
             collector->set_per_capacity_hits(std::move(per_cap));
+            collector->set_max_hit_count(result.max_hit_count);
+            if (result.total_blocks > 0 && result.max_hit_count >= 0) {
+                collector->set_max_hit_rate(
+                    static_cast<double>(result.max_hit_count) / static_cast<double>(result.total_blocks));
+            }
         }
     } else {
         SetErrorOnCollector(request_context, ec);
@@ -278,14 +319,21 @@ void OptimizerServiceImpl::ListInstances(RequestContext *request_context,
             pb->set_block_size(s.block_size);
             pb->set_total_queries(s.total_queries);
             pb->set_total_blocks_queried(s.total_blocks_queried);
-            pb->set_total_hits(s.total_hits);
-            pb->set_hit_rate(s.hit_rate);
+            pb->set_total_max_hits(s.total_max_hits);
+            pb->set_max_hit_rate(s.max_hit_rate);
             pb->set_unique_keys(s.unique_keys);
             pb->set_avg_bytes_per_block(s.avg_bytes_per_block);
             pb->set_linear_step(s.linear_step);
-            pb->set_peak_unique_keys(s.peak_unique_keys);
             pb->set_eviction_count(s.eviction_count);
             pb->set_memory_usage_bytes(s.memory_usage_bytes);
+            pb->set_kv_cache_usage_bytes(s.kv_cache_usage_bytes);
+            pb->set_ttl_eviction_count(s.ttl_eviction_count);
+            for (const auto &cap : s.per_capacity_hit_rates) {
+                auto *pb_cap = pb->add_per_capacity_hit_rates();
+                pb_cap->set_capacity_gb(cap.capacity_gb);
+                pb_cap->set_total_hits(cap.total_hits);
+                pb_cap->set_hit_rate(cap.hit_rate);
+            }
         }
     }
 }

@@ -14,6 +14,9 @@ OptimizerCallGuard::OptimizerCallGuard(RequestContext *request_context,
                                        OptimizerMetricsReporter *metrics_reporter)
     : request_context_(request_context), metrics_reporter_(metrics_reporter) {
     auto *collector = dynamic_cast<OptimizerServiceMetricsCollector *>(request_context->metrics_collector());
+    if (collector && !request_context->client_ip().empty()) {
+        collector->set_client_ip(request_context->client_ip());
+    }
     query_scope_ = KVCM_METRICS_COLLECTOR_CHRONO_SCOPE(collector, ServiceQuery);
 }
 

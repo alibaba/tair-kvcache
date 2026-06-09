@@ -67,11 +67,23 @@ public:
     void set_per_capacity_hits(std::vector<PerCapacityHitInfo> v) { per_capacity_hits_ = std::move(v); }
     const std::vector<PerCapacityHitInfo> &per_capacity_hits() const { return per_capacity_hits_; }
 
+    void set_max_hit_count(int64_t v) { max_hit_count_ = v; }
+    int64_t max_hit_count() const { return max_hit_count_; }
+
+    void set_max_hit_rate(double v) { max_hit_rate_ = v; }
+    double max_hit_rate() const { return max_hit_rate_; }
+
+    void set_client_ip(const std::string &v) { client_ip_ = v; }
+    const std::string &client_ip() const { return client_ip_; }
+
 private:
     std::string instance_id_;
+    std::string client_ip_;
     int64_t total_blocks_ = 0;
     int64_t cache_hit_count_ = 0;
     std::vector<PerCapacityHitInfo> per_capacity_hits_;
+    int64_t max_hit_count_ = -1;
+    double max_hit_rate_ = 0.0;
 };
 
 #undef KVCM_CHRONO_METRICS

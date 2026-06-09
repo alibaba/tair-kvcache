@@ -26,17 +26,12 @@ struct InstanceState {
     int64_t size_full_only = 0;
     int64_t size_full_linear = 0;
     int32_t linear_step = 1;
-    int64_t avg_bytes_per_block = 0;
-
-    std::vector<int64_t> capacity_blocks;
-    int64_t max_capacity_blocks = 0;
-    int32_t primary_capacity_index = 0;
-
     std::mutex mutex;
 
     int64_t total_queries = 0;
     int64_t total_blocks_queried = 0;
     std::vector<int64_t> total_hits_per_capacity;
+    int64_t total_max_hits = 0;
 };
 
 struct TraceQueryResult {
@@ -45,6 +40,7 @@ struct TraceQueryResult {
     std::vector<int64_t> hit_count_per_capacity;
     std::vector<double> capacity_gb;
     int64_t current_unique_keys = 0;
+    int64_t max_hit_count = -1;
 };
 
 struct RegisterInstanceResult {
@@ -54,20 +50,28 @@ struct RegisterInstanceResult {
     int64_t size_full_linear = 0;
 };
 
+struct PerCapacityHitRateInfo {
+    double capacity_gb;
+    int64_t total_hits;
+    double hit_rate;
+};
+
 struct InstanceSummary {
     std::string instance_id;
     std::string instance_group;
     int32_t block_size = 0;
     int64_t total_queries = 0;
     int64_t total_blocks_queried = 0;
-    int64_t total_hits = 0;
-    double hit_rate = 0.0;
+    int64_t total_max_hits = 0;
+    double max_hit_rate = 0.0;
     int64_t unique_keys = 0;
     int64_t avg_bytes_per_block = 0;
     int32_t linear_step = 0;
-    int64_t peak_unique_keys = 0;
     int64_t eviction_count = 0;
     int64_t memory_usage_bytes = 0;
+    int64_t kv_cache_usage_bytes = 0;
+    int64_t ttl_eviction_count = 0;
+    std::vector<PerCapacityHitRateInfo> per_capacity_hit_rates;
 };
 
 class OnlineOptimizerManager {

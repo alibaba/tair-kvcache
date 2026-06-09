@@ -25,6 +25,19 @@ cc_test(
 )
 
 cc_test(
+    name = "TtlCacheIndexerWrapperTest",
+    srcs = [
+        "ttl_cache_indexer_wrapper_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/online_optimizer:cache_indexer",
+        "//kv_cache_manager/online_optimizer:ttl_cache_indexer_wrapper",
+    ],
+)
+
+cc_test(
     name = "OnlineOptimizerManagerTest",
     srcs = [
         "online_optimizer_manager_test.cc",

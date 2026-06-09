@@ -15,14 +15,12 @@ protected:
 
     OptimizerInstanceGroup MakeGroup(const std::string &name = "g1",
                                       std::vector<double> caps = {1.0},
-                                      int32_t primary_idx = 0,
                                       const std::string &indexer_type = "fenwick_lru",
                                       int64_t max_key_count = 0) {
         OptimizerInstanceGroup group;
         group.set_name(name);
         group.set_enabled(true);
         group.set_capacity_gb(caps);
-        group.set_primary_capacity_index(primary_idx);
         group.set_indexer_type(indexer_type);
         group.set_max_key_count(max_key_count);
         return group;
@@ -84,7 +82,7 @@ TEST_F(OnlineOptimizerManagerTest, RegisterInstanceBasic) {
 
 TEST_F(OnlineOptimizerManagerTest, RegisterInstanceHybrid) {
     auto info = MakeHybridInfo("i1", "g1", 16, 3, "F0");
-    auto group = MakeGroup("g1", {1.0}, 0);
+    auto group = MakeGroup("g1", {1.0});
     RegisterInstanceResult result;
 
     ErrorCode ec = mgr_->RegisterInstance(info, group, result);
@@ -165,7 +163,7 @@ TEST_F(OnlineOptimizerManagerTest, TraceQueryNonExistentInstance) {
 
 TEST_F(OnlineOptimizerManagerTest, TraceQueryMultipleCapacities) {
     auto info = MakeInfo();
-    auto group = MakeGroup("g1", {0.0001, 1.0}, 1, "fenwick_lru", 0);
+    auto group = MakeGroup("g1", {0.0001, 1.0}, "fenwick_lru", 0);
     RegisterInstanceResult reg_result;
     mgr_->RegisterInstance(info, group, reg_result);
 
@@ -180,7 +178,12 @@ TEST_F(OnlineOptimizerManagerTest, TraceQueryMultipleCapacities) {
 
     TraceQueryResult result;
     mgr_->TraceQuery("i1", init_keys, result);
-    EXPECT_EQ(100, result.cache_hit_count);
+    // cache_hit_count uses index 0 (smallest capacity ~6 blocks), prefix match starts at key 0
+    // whose stack distance (99) exceeds the small capacity, so prefix hit = 0
+    EXPECT_EQ(0, result.cache_hit_count);
+    // Large capacity (index 1) should hit all 100 keys
+    ASSERT_EQ(2, result.hit_count_per_capacity.size());
+    EXPECT_EQ(100, result.hit_count_per_capacity[1]);
 }
 
 TEST_F(OnlineOptimizerManagerTest, ListInstances) {
@@ -230,7 +233,7 @@ TEST_F(OnlineOptimizerManagerTest, ResetStatsNonExistent) {
 
 TEST_F(OnlineOptimizerManagerTest, BSTIndexerType) {
     auto info = MakeInfo();
-    auto group = MakeGroup("g1", {1.0}, 0, "bst_lru", 0);
+    auto group = MakeGroup("g1", {1.0}, "bst_lru", 0);
     RegisterInstanceResult reg_result;
     mgr_->RegisterInstance(info, group, reg_result);
 
@@ -244,20 +247,58 @@ TEST_F(OnlineOptimizerManagerTest, BSTIndexerType) {
     EXPECT_EQ(5, result.cache_hit_count);
     EXPECT_EQ(5, result.current_unique_keys);
 
-    mgr_->GetInstanceState("i1", [](const InstanceState &s) {
-        EXPECT_EQ(5, s.indexer->peak_unique_count());
-    });
 }
 
 TEST_F(OnlineOptimizerManagerTest, MaxKeyCountEviction) {
     auto info = MakeInfo();
-    auto group = MakeGroup("g1", {1.0}, 0, "fenwick_lru", 5);
+    auto group = MakeGroup("g1", {0.00005}, "fenwick_lru", 5);
     RegisterInstanceResult reg_result;
     mgr_->RegisterInstance(info, group, reg_result);
 
     TraceQueryResult result;
     mgr_->TraceQuery("i1", {1, 2, 3, 4, 5, 6, 7}, result);
     EXPECT_LE(result.current_unique_keys, 5);
+}
+
+TEST_F(OnlineOptimizerManagerTest, MaxKeyCountAutoRaised) {
+    // max_key_count=5, but capacity 1.0 GB -> ~65536 blocks.
+    // Auto-raise should lift max_key_count to 65536 so large capacity tier is not truncated.
+    auto info = MakeInfo();
+    auto group = MakeGroup("g1", {0.00005, 1.0}, "fenwick_lru", 5);
+    RegisterInstanceResult reg_result;
+    mgr_->RegisterInstance(info, group, reg_result);
+
+    std::vector<int64_t> keys;
+    for (int64_t i = 0; i < 100; i++) {
+        keys.push_back(i);
+    }
+    TraceQueryResult dummy;
+    mgr_->TraceQuery("i1", keys, dummy);
+
+    TraceQueryResult result;
+    mgr_->TraceQuery("i1", keys, result);
+    // Large capacity (index 1) should hit all 100 keys — not truncated by max_key_count
+    ASSERT_EQ(2, result.hit_count_per_capacity.size());
+    EXPECT_EQ(100, result.hit_count_per_capacity[1]);
+}
+
+TEST_F(OnlineOptimizerManagerTest, LruIndexerMaxKeyCountUnlimited) {
+    auto info = MakeInfo();
+    auto group = MakeGroup("g1", {1.0}, "lru", 0);
+    RegisterInstanceResult reg_result;
+    mgr_->RegisterInstance(info, group, reg_result);
+
+    std::vector<int64_t> keys;
+    for (int64_t i = 0; i < 200; i++) {
+        keys.push_back(i);
+    }
+    TraceQueryResult result;
+    mgr_->TraceQuery("i1", keys, result);
+    EXPECT_EQ(200, result.current_unique_keys);
+
+    mgr_->TraceQuery("i1", keys, result);
+    EXPECT_EQ(200, result.cache_hit_count);
+    EXPECT_EQ(200, result.current_unique_keys);
 }
 
 TEST_F(OnlineOptimizerManagerTest, ReRegisterReplacesPrevious) {
@@ -277,6 +318,30 @@ TEST_F(OnlineOptimizerManagerTest, ReRegisterReplacesPrevious) {
     EXPECT_EQ(1, summaries.size());
     EXPECT_EQ(0, summaries[0].total_queries);
     EXPECT_EQ(32, summaries[0].block_size);
+}
+
+TEST_F(OnlineOptimizerManagerTest, ListInstancesPerCapacityHitRates) {
+    auto info = MakeInfo();
+    auto group = MakeGroup("g1", {1.0, 5.0});
+    RegisterInstanceResult reg_result;
+    mgr_->RegisterInstance(info, group, reg_result);
+
+    TraceQueryResult result;
+    mgr_->TraceQuery("i1", {1, 2, 3}, result);
+    mgr_->TraceQuery("i1", {1, 2, 3}, result);
+
+    std::vector<InstanceSummary> summaries;
+    mgr_->ListInstances("", summaries);
+    ASSERT_EQ(1, summaries.size());
+    ASSERT_EQ(2, summaries[0].per_capacity_hit_rates.size());
+
+    EXPECT_DOUBLE_EQ(1.0, summaries[0].per_capacity_hit_rates[0].capacity_gb);
+    EXPECT_DOUBLE_EQ(5.0, summaries[0].per_capacity_hit_rates[1].capacity_gb);
+
+    EXPECT_EQ(6, summaries[0].total_blocks_queried);
+    EXPECT_GT(summaries[0].per_capacity_hit_rates[1].total_hits, 0);
+    EXPECT_GE(summaries[0].per_capacity_hit_rates[1].hit_rate, 0.0);
+    EXPECT_LE(summaries[0].per_capacity_hit_rates[1].hit_rate, 1.0);
 }
 
 } // namespace kv_cache_manager

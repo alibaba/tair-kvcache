@@ -26,7 +26,7 @@ protected:
         g->set_name(group_name);
         g->set_enabled(enabled);
         g->add_capacity_gb(capacity_gb);
-        g->set_primary_capacity_index(0);
+
         g->set_indexer_type("fenwick_lru");
 
         proto::optimizer::CommonResponse resp;
@@ -67,7 +67,6 @@ TEST_F(OptimizerServiceImplTest, CreateAndGetInstanceGroup) {
     g->set_name("test_grp");
     g->set_enabled(true);
     g->add_capacity_gb(2.0);
-    g->set_primary_capacity_index(0);
     g->set_indexer_type("fenwick_lru");
 
     proto::optimizer::CommonResponse create_resp;
@@ -112,7 +111,6 @@ TEST_F(OptimizerServiceImplTest, UpdateInstanceGroup) {
     g->set_name("upd_grp");
     g->set_enabled(true);
     g->add_capacity_gb(4.0);
-    g->set_primary_capacity_index(0);
     g->set_indexer_type("bst_lru");
     g->set_max_key_count(5000);
 
@@ -392,6 +390,58 @@ TEST_F(OptimizerServiceImplTest, RegisterWithLinearStep) {
     service_->RegisterInstance(&ctx, &req, &resp);
     EXPECT_EQ(proto::optimizer::OK, resp.header().status().code());
     EXPECT_GT(resp.avg_bytes_per_block(), 0);
+}
+
+TEST_F(OptimizerServiceImplTest, GetInstanceSuccess) {
+    CreateTestGroup("grp1");
+
+    auto reg_req = MakeRegisterRequest("grp1", "inst1", 128, 2, "full_grp");
+    auto *spec2 = reg_req.add_location_spec_infos();
+    spec2->set_name("linear");
+    spec2->set_size(64);
+    auto *group = reg_req.add_location_spec_groups();
+    group->set_name("full_grp");
+    group->add_spec_names("full");
+
+    proto::optimizer::OptimizerRegisterInstanceResponse reg_resp;
+    RequestContext ctx1("t1", nullptr);
+    service_->RegisterInstance(&ctx1, &reg_req, &reg_resp);
+    ASSERT_EQ(proto::optimizer::OK, reg_resp.header().status().code());
+
+    proto::optimizer::OptimizerGetInstanceRequest get_req;
+    get_req.set_trace_id("t2");
+    get_req.set_instance_id("inst1");
+    proto::optimizer::OptimizerGetInstanceResponse get_resp;
+    RequestContext ctx2("t2", nullptr);
+    service_->GetInstance(&ctx2, &get_req, &get_resp);
+
+    EXPECT_EQ(proto::optimizer::OK, get_resp.header().status().code());
+    EXPECT_EQ("grp1", get_resp.instance_group());
+    EXPECT_EQ("inst1", get_resp.instance_id());
+    EXPECT_EQ(128, get_resp.block_size());
+    EXPECT_EQ(2, get_resp.linear_step());
+    EXPECT_EQ("full_grp", get_resp.full_group_name());
+
+    ASSERT_EQ(2, get_resp.location_spec_infos_size());
+    EXPECT_EQ("full", get_resp.location_spec_infos(0).name());
+    EXPECT_EQ(128, get_resp.location_spec_infos(0).size());
+    EXPECT_EQ("linear", get_resp.location_spec_infos(1).name());
+    EXPECT_EQ(64, get_resp.location_spec_infos(1).size());
+
+    ASSERT_EQ(1, get_resp.location_spec_groups_size());
+    EXPECT_EQ("full_grp", get_resp.location_spec_groups(0).name());
+    ASSERT_EQ(1, get_resp.location_spec_groups(0).spec_names_size());
+    EXPECT_EQ("full", get_resp.location_spec_groups(0).spec_names(0));
+}
+
+TEST_F(OptimizerServiceImplTest, GetInstanceNotExist) {
+    proto::optimizer::OptimizerGetInstanceRequest req;
+    req.set_trace_id("t1");
+    req.set_instance_id("nonexistent");
+    proto::optimizer::OptimizerGetInstanceResponse resp;
+    RequestContext ctx("t1", nullptr);
+    service_->GetInstance(&ctx, &req, &resp);
+    EXPECT_EQ(proto::optimizer::INSTANCE_NOT_EXIST, resp.header().status().code());
 }
 
 } // namespace kv_cache_manager

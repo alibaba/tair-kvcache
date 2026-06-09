@@ -50,6 +50,10 @@ public:
                         const proto::optimizer::OptimizerRemoveInstanceRequest *request,
                         proto::optimizer::OptimizerRemoveInstanceResponse *response);
 
+    void GetInstance(RequestContext *request_context,
+                     const proto::optimizer::OptimizerGetInstanceRequest *request,
+                     proto::optimizer::OptimizerGetInstanceResponse *response);
+
     // TraceQuery
     void TraceQuery(RequestContext *request_context,
                     const proto::optimizer::TraceQueryRequest *request,
