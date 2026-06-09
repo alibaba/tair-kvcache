@@ -21,6 +21,7 @@ public:
     void Add(const std::string &cluster_id, const std::string &tier, int64_t key, const std::string &infer_id);
     void Remove(const std::string &cluster_id, const std::string &tier, int64_t key, const std::string &infer_id);
     void RemoveFromAllTiers(const std::string &cluster_id, int64_t key, const std::string &infer_id);
+    void RemoveInfer(const std::string &cluster_id, const std::string &infer_id);
     void ApplyEvent(const std::string &cluster_id, const TierFlowKeyEvent &event);
 
     [[nodiscard]] bool

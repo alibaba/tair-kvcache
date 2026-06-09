@@ -90,8 +90,10 @@ bool HierarchicalReplayManager::Init() {
     if (write_delay_ns_ <= 0) {
         throw std::runtime_error("trace_replay.write_delay_ns must be positive");
     }
+    cache_drop_events_ = LoadCacheDropEvents();
     pending_writes_ = {};
     next_pending_write_sequence_ = 0;
+    next_cache_drop_event_index_ = 0;
 
     const bool enable_lifecycle_tracking = config_.enable_lifecycle_tracking();
     engine_manager_ = std::make_unique<OptimizerManager>(
@@ -107,6 +109,59 @@ bool HierarchicalReplayManager::Init() {
         return false;
     }
     return true;
+}
+
+std::vector<HierarchicalReplayManager::CacheDropEvent> HierarchicalReplayManager::LoadCacheDropEvents() const {
+    std::vector<CacheDropEvent> events;
+    const std::string &event_file = config_.cache_drop_event_file();
+    if (event_file.empty()) {
+        return events;
+    }
+
+    std::ifstream file(event_file);
+    if (!file.is_open()) {
+        throw std::runtime_error("Failed to open cache drop event file: " + event_file);
+    }
+
+    std::string line;
+    int64_t line_number = 0;
+    auto fail = [&](const std::string &message) {
+        throw std::runtime_error(event_file + ":" + std::to_string(line_number) + ": " + message);
+    };
+    while (std::getline(file, line)) {
+        line_number++;
+        if (line.find_first_not_of(" \t\r\n") == std::string::npos) {
+            continue;
+        }
+
+        rapidjson::Document doc;
+        if (doc.Parse(line.c_str()).HasParseError() || !doc.IsObject()) {
+            fail("failed to parse JSON");
+        }
+        if (!doc.HasMember("timestamp_ns")) {
+            fail("missing integer field: timestamp_ns");
+        }
+        if (!doc.HasMember("instance_id") || !doc["instance_id"].IsString() ||
+            std::string(doc["instance_id"].GetString()).empty()) {
+            fail("missing non-empty string field: instance_id");
+        }
+
+        CacheDropEvent event;
+        if (!ParseOptimizerInt64(doc["timestamp_ns"], event.timestamp_ns) || event.timestamp_ns <= 0) {
+            fail("invalid timestamp_ns");
+        }
+        event.instance_id = doc["instance_id"].GetString();
+        if (engine_to_cluster_.find(event.instance_id) == engine_to_cluster_.end()) {
+            fail("unknown engine instance_id: " + event.instance_id);
+        }
+        events.push_back(std::move(event));
+    }
+
+    std::stable_sort(events.begin(), events.end(), [](const CacheDropEvent &lhs, const CacheDropEvent &rhs) {
+        return lhs.timestamp_ns < rhs.timestamp_ns;
+    });
+    KVCM_LOG_INFO("Loaded %zu cache drop events from file: %s", events.size(), event_file.c_str());
+    return events;
 }
 
 bool HierarchicalReplayManager::ValidateAndBuildMappings() {
@@ -363,6 +418,7 @@ void HierarchicalReplayManager::RunTracesWithPrefixHitScheduling(
 
     pending_writes_ = {};
     next_pending_write_sequence_ = 0;
+    next_cache_drop_event_index_ = 0;
     size_t request_idx = 0;
     std::string current_engine_instance_id = engine_instance_ids.front();
     const auto prefix_match_count =
@@ -373,6 +429,7 @@ void HierarchicalReplayManager::RunTracesWithPrefixHitScheduling(
         if (!trace) {
             continue;
         }
+        ApplyDueCacheDropEvents(trace->timestamp_ns());
         FlushPendingWritesThrough(trace->timestamp_ns());
         if (auto request_trace = std::dynamic_pointer_cast<RequestSchemaTrace>(trace)) {
             current_engine_instance_id = infer_engine_scheduler_.ChoosePrefixHitEngineInstance(
@@ -389,18 +446,22 @@ void HierarchicalReplayManager::RunTracesWithPrefixHitScheduling(
         }
         RunTrace(trace);
     }
+    ApplyRemainingCacheDropEvents();
     FlushAllPendingWrites();
 }
 
 void HierarchicalReplayManager::RunTraces(const std::vector<std::shared_ptr<OptimizerSchemaTrace>> &traces) {
     pending_writes_ = {};
     next_pending_write_sequence_ = 0;
+    next_cache_drop_event_index_ = 0;
     for (const auto &trace : traces) {
         if (trace) {
+            ApplyDueCacheDropEvents(trace->timestamp_ns());
             FlushPendingWritesThrough(trace->timestamp_ns());
         }
         RunTrace(trace);
     }
+    ApplyRemainingCacheDropEvents();
     FlushAllPendingWrites();
 }
 
@@ -479,6 +540,37 @@ void HierarchicalReplayManager::FlushAllPendingWrites() {
 
 void HierarchicalReplayManager::RunPendingWrite(const WriteCacheSchemaTrace &trace) {
     WriteCacheWithTtlUs(trace.instance_id(), trace.trace_id(), trace.timestamp_ns(), trace.keys(), trace.ttl_us());
+}
+
+void HierarchicalReplayManager::ApplyDueCacheDropEvents(int64_t timestamp_ns) {
+    while (next_cache_drop_event_index_ < cache_drop_events_.size() &&
+           cache_drop_events_[next_cache_drop_event_index_].timestamp_ns <= timestamp_ns) {
+        const auto &event = cache_drop_events_[next_cache_drop_event_index_++];
+        FlushPendingWritesThrough(event.timestamp_ns);
+        ApplyCacheDropEvent(event);
+    }
+}
+
+void HierarchicalReplayManager::ApplyRemainingCacheDropEvents() {
+    while (next_cache_drop_event_index_ < cache_drop_events_.size()) {
+        const auto &event = cache_drop_events_[next_cache_drop_event_index_++];
+        FlushPendingWritesThrough(event.timestamp_ns);
+        ApplyCacheDropEvent(event);
+    }
+}
+
+void HierarchicalReplayManager::ApplyCacheDropEvent(const CacheDropEvent &event) {
+    if (!engine_manager_) {
+        throw std::runtime_error("HierarchicalReplayManager is not initialized");
+    }
+    const std::string &cluster_id = ClusterForEngine(event.instance_id);
+    if (!engine_manager_->ClearCache(event.instance_id)) {
+        throw std::runtime_error("Failed to drop engine cache for instance_id: " + event.instance_id);
+    }
+    p2p_tracker_.RemoveInfer(cluster_id, event.instance_id);
+    KVCM_LOG_INFO("Dropped engine cache for instance_id=%s at timestamp_ns=%lld",
+                  event.instance_id.c_str(),
+                  static_cast<long long>(event.timestamp_ns));
 }
 
 HierarchicalGetCacheLocationRes HierarchicalReplayManager::GetCacheLocation(const std::string &engine_instance_id,

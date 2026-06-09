@@ -257,6 +257,7 @@ public:
     [[nodiscard]] const std::string &infer_scheduling_strategy() const { return infer_scheduling_strategy_; }
     [[nodiscard]] bool infer_active_windows_from_trace() const { return infer_active_windows_from_trace_; }
     [[nodiscard]] bool enable_lifecycle_tracking() const { return enable_lifecycle_tracking_; }
+    [[nodiscard]] const std::string &cache_drop_event_file() const { return cache_drop_event_file_; }
     [[nodiscard]] const std::vector<InferClusterConfig> &infer_clusters() const { return infer_clusters_; }
 
     void set_trace_file_path(const std::string &path) { trace_file_path_ = path; }
@@ -272,6 +273,7 @@ public:
     void set_infer_scheduling_strategy(const std::string &strategy) { infer_scheduling_strategy_ = strategy; }
     void set_infer_active_windows_from_trace(bool enabled) { infer_active_windows_from_trace_ = enabled; }
     void set_enable_lifecycle_tracking(bool enabled) { enable_lifecycle_tracking_ = enabled; }
+    void set_cache_drop_event_file(const std::string &path) { cache_drop_event_file_ = path; }
 
 private:
     bool BuildOptimizerConfigs();
@@ -287,6 +289,7 @@ private:
     std::string infer_scheduling_strategy_ = "preserve_trace";
     bool infer_active_windows_from_trace_ = false;
     bool enable_lifecycle_tracking_ = false;
+    std::string cache_drop_event_file_;
 };
 
 } // namespace kv_cache_manager

@@ -100,13 +100,22 @@ private:
         }
     };
 
+    struct CacheDropEvent {
+        int64_t timestamp_ns = 0;
+        std::string instance_id;
+    };
+
     bool ValidateAndBuildMappings();
+    std::vector<CacheDropEvent> LoadCacheDropEvents() const;
     void RunTracesWithPrefixHitScheduling(const std::vector<std::shared_ptr<OptimizerSchemaTrace>> &traces);
     void HandleRequest(const RequestSchemaTrace &trace);
     void ScheduleRequestWrite(const RequestSchemaTrace &trace);
     void FlushPendingWritesThrough(int64_t timestamp_ns);
     void FlushAllPendingWrites();
     void RunPendingWrite(const WriteCacheSchemaTrace &trace);
+    void ApplyDueCacheDropEvents(int64_t timestamp_ns);
+    void ApplyRemainingCacheDropEvents();
+    void ApplyCacheDropEvent(const CacheDropEvent &event);
     void ExportCombinedHitRates() const;
     void ExportReadIo() const;
     void ExportPoolWriteIo() const;
@@ -180,8 +189,10 @@ private:
     std::vector<CombinedReadRecord> combined_read_records_;
     std::vector<CombinedWriteRecord> combined_write_records_;
     std::vector<PoolWriteIoRecord> pool_write_io_records_;
+    std::vector<CacheDropEvent> cache_drop_events_;
     int64_t write_delay_ns_ = 1;
     uint64_t next_pending_write_sequence_ = 0;
+    size_t next_cache_drop_event_index_ = 0;
     std::priority_queue<PendingWrite, std::vector<PendingWrite>, PendingWriteCompare> pending_writes_;
 };
 

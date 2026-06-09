@@ -257,6 +257,7 @@ bool HierarchicalReplayConfig::FromRapidValue(const rapidjson::Value &rapid_valu
     }
     KVCM_JSON_GET_DEFAULT_MACRO(
         rapid_value, "infer_active_windows_from_trace", infer_active_windows_from_trace_, false);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "cache_drop_event_file", cache_drop_event_file_, std::string(""));
     if (infer_active_windows_from_trace_) {
         for (const auto &cluster : infer_clusters_) {
             if (!cluster.active_windows().empty()) {
@@ -277,6 +278,9 @@ void HierarchicalReplayConfig::ToRapidWriter(rapidjson::Writer<rapidjson::String
     Put(writer, "infer_scheduling_strategy", infer_scheduling_strategy_);
     Put(writer, "infer_active_windows_from_trace", infer_active_windows_from_trace_);
     Put(writer, "enable_lifecycle_tracking", enable_lifecycle_tracking_);
+    if (!cache_drop_event_file_.empty()) {
+        Put(writer, "cache_drop_event_file", cache_drop_event_file_);
+    }
     Put(writer, "infer_clusters", infer_clusters_);
     Put(writer, "storage_pool", storage_pool_);
 }

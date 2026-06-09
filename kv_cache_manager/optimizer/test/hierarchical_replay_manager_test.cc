@@ -317,6 +317,53 @@ TEST_F(HierarchicalReplayManagerTest, P2PReadSkipsInactivePeerFromTraceWindow) {
     EXPECT_THAT(content, HasSubstr("read_after_scaledown,engine_b,model_l3,1,0,0,0,0"));
 }
 
+TEST_F(HierarchicalReplayManagerTest, CacheDropClearsEngineAndP2PTracker) {
+    const std::string root = GetTestTempRootPath() + "/hierarchical_replay_cache_drop";
+    std::filesystem::create_directories(root);
+    HierarchicalReplayConfig config = CreateHierarchicalConfig(root);
+    config.set_cache_drop_event_file(root + "/drop_events.jsonl");
+
+    StoragePoolFlowConfig flow = CreateStoragePoolFlow();
+    flow.set_write_mode(TierWriteMode::CASCADING);
+    SetStoragePoolFlow(config, flow);
+
+    P2PReadFlowConfig p2p_flow;
+    p2p_flow.set_tier("dram");
+    p2p_flow.set_peer_read_touch_enabled(false);
+    auto cluster = CreateInferClusterConfig(flow, {p2p_flow});
+    cluster.set_active_windows({CreateInferActiveWindow("engine_a", 0, 1000),
+                                CreateInferActiveWindow("engine_b", 0, 1000)});
+    config.set_infer_clusters({cluster});
+
+    std::ofstream trace(config.trace_file_path());
+    trace << R"({"type":"write","instance_id":"engine_a","trace_id":"write_before_drop","timestamp_ns":100,"keys":[9101]})"
+          << "\n";
+    trace
+        << R"({"type":"get","instance_id":"engine_a","trace_id":"read_local_after_drop","timestamp_ns":200,"keys":[9101],"input_len":16,"query_type":"batch_get","block_mask":[]})"
+        << "\n";
+    trace
+        << R"({"type":"get","instance_id":"engine_b","trace_id":"read_peer_after_drop","timestamp_ns":300,"keys":[9101],"input_len":16,"query_type":"batch_get","block_mask":[]})"
+        << "\n";
+    trace.close();
+
+    std::ofstream drop_events(config.cache_drop_event_file());
+    drop_events << R"({"timestamp_ns":150,"instance_id":"engine_a"})" << "\n";
+    drop_events.close();
+
+    HierarchicalReplayManager manager(config);
+    ASSERT_TRUE(manager.Init());
+    manager.DirectRun();
+    manager.AnalyzeResults();
+
+    std::ifstream csv(root + "/combined/hierarchical_hit_rates.csv");
+    ASSERT_TRUE(csv.is_open());
+    std::ostringstream buffer;
+    buffer << csv.rdbuf();
+    const std::string content = buffer.str();
+    EXPECT_THAT(content, HasSubstr("read_local_after_drop,engine_a,model_l3,1,0,0,0,0"));
+    EXPECT_THAT(content, HasSubstr("read_peer_after_drop,engine_b,model_l3,1,0,0,0,0"));
+}
+
 TEST_F(HierarchicalReplayManagerTest, EngineReadUsesBatchGetAndPoolPrefixSkipsEngineHits) {
     const std::string root = GetTestTempRootPath() + "/hierarchical_replay_engine_batch_get";
     HierarchicalReplayConfig config = CreateHierarchicalConfig(root);

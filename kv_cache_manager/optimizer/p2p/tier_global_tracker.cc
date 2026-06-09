@@ -50,6 +50,29 @@ void TierGlobalTracker::RemoveFromAllTiers(const std::string &cluster_id, int64_
     }
 }
 
+void TierGlobalTracker::RemoveInfer(const std::string &cluster_id, const std::string &infer_id) {
+    const std::string prefix = cluster_id + "\x1f";
+    for (auto scope_it = holders_.begin(); scope_it != holders_.end();) {
+        if (scope_it->first.rfind(prefix, 0) != 0) {
+            ++scope_it;
+            continue;
+        }
+        for (auto key_it = scope_it->second.begin(); key_it != scope_it->second.end();) {
+            key_it->second.erase(infer_id);
+            if (key_it->second.empty()) {
+                key_it = scope_it->second.erase(key_it);
+            } else {
+                ++key_it;
+            }
+        }
+        if (scope_it->second.empty()) {
+            scope_it = holders_.erase(scope_it);
+        } else {
+            ++scope_it;
+        }
+    }
+}
+
 void TierGlobalTracker::ApplyEvent(const std::string &cluster_id, const TierFlowKeyEvent &event) {
     if (event.kind == TierFlowEventKind::ENTER_TIER && !event.to_tier.empty()) {
         Add(cluster_id, event.to_tier, event.block_key, event.instance_id);
