@@ -22,7 +22,9 @@
 - Crash Stack Trace
   - [English](crash-handler-en_US.md) - Crash signal handler & offline stack decoder
   - [中文](crash-handler-zh_CN.md) - 崩溃堆栈打印与离线解析
-- [HTTP Bearer Authentication](http-auth-en_US.md) - Bearer token auth for Admin/Debug HTTP services
+- HTTP Bearer Authentication
+  - [English](http-auth-en_US.md) - Bearer token auth for Admin/Debug HTTP services
+  - [中文](http-auth-zh_CN.md) - Admin/Debug HTTP 服务的 Bearer Token 鉴权
 
 
 ---
