@@ -259,17 +259,19 @@ class HiCacheKVCM(HiCacheStorage):
         hf3fs_configs = []
         storage_configs_json = json.loads(storage_configs)
         for storage_config in storage_configs_json:
-            if storage_config["type"] == "hf3fs" and storage_config["is_available"]:
-                hf3fs_config = {
-                    "type": "hf3fs",
-                    "mountpoint": storage_config["storage_spec"]["mountpoint"],
-                    "root_dir": storage_config["storage_spec"]["root_dir"],
-                    "read_iov_block_size": self.read_iov_block_size,
-                    "read_iov_size": self.iov_size,
-                    "write_iov_block_size": self.write_iov_block_size,
-                    "write_iov_size": self.iov_size,
-                }
-                hf3fs_configs.append(hf3fs_config)
+            storage_type = storage_config["type"]
+            if storage_type not in ("hf3fs", "vcns_hf3fs") or not storage_config.get("is_available", True):
+                continue
+            hf3fs_config = {
+                "type": storage_type,
+                "mountpoint": storage_config["storage_spec"]["mountpoint"],
+                "root_dir": storage_config["storage_spec"]["root_dir"],
+                "read_iov_block_size": self.read_iov_block_size,
+                "read_iov_size": self.iov_size,
+                "write_iov_block_size": self.write_iov_block_size,
+                "write_iov_size": self.iov_size,
+            }
+            hf3fs_configs.append(hf3fs_config)
         return hf3fs_configs
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
