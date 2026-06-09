@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -46,6 +47,9 @@ public:
                                         const std::vector<int64_t> &keys,
                                         const std::vector<int64_t> &tokens,
                                         const BlockMask &block_mask) = 0;
+
+    virtual void ReplicateWithData(const ReplicationHint &hint, const void *data, size_t size,
+                                   std::function<void()> release_fn) = 0;
 
     // for transfer client
     virtual ClientErrorCode LoadKvCaches(const UriStrVec &uri_str_vec, const BlockBuffers &block_buffers) = 0;

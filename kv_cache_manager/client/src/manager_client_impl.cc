@@ -122,6 +122,15 @@ ClientErrorCode ManagerClientImpl::RemoveCache(const std::string &trace_id,
     return meta_client_->RemoveCache(trace_id, keys, tokens, block_mask);
 }
 
+void ManagerClientImpl::ReplicateWithData(const ReplicationHint &hint, const void *data, size_t size,
+                                          std::function<void()> release_fn) {
+    if (replication_executor_) {
+        replication_executor_->SubmitWithData(hint, data, size, std::move(release_fn));
+    } else if (release_fn) {
+        release_fn();
+    }
+}
+
 ClientErrorCode ManagerClientImpl::LoadKvCaches(const UriStrVec &uri_str_vec, const BlockBuffers &block_buffers) {
     CHECK_CLIENT(transfer_client_);
     return transfer_client_->LoadKvCaches(uri_str_vec, block_buffers);
