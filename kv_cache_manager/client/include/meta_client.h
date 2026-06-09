@@ -31,7 +31,7 @@ public:
                const std::vector<int64_t> &tokens,
                const std::vector<std::string> &location_spec_group_names,
                int64_t write_timeout_seconds,
-               int32_t min_replica_count = 0) = 0;
+               bool is_replication = false, int32_t min_replica_count = 0) = 0;
     virtual ClientErrorCode FinishWrite(const std::string &trace_id,
                                         const std::string &write_session_id,
                                         const BlockMask &success_block,

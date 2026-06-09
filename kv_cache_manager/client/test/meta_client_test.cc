@@ -123,8 +123,7 @@ public:
                  const std::vector<std::string> &location_spec_group_names,
                  int64_t write_timeout_seconds,
                  const CallerNode &caller,
-
-                 int32_t min_replica_count),
+                 bool is_replication, int32_t min_replica_count),
                 (override));
 
     MOCK_METHOD(ClientErrorCode,

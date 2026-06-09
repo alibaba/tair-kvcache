@@ -1,6 +1,7 @@
 #include "kv_cache_manager/client/src/manager_client_impl.h"
 
 #include "kv_cache_manager/client/src/meta_client_impl.h"
+#include "kv_cache_manager/client/src/replication_executor.h"
 #include "kv_cache_manager/client/src/transfer_client_impl.h"
 #include "kv_cache_manager/common/logger.h"
 
@@ -47,11 +48,20 @@ ClientErrorCode ManagerClientImpl::Init(const std::string &client_config, InitPa
             return ER_TRANSFERCLIENT_INIT_ERROR;
         }
     }
+    if (meta_client_ && transfer_client_) {
+        replication_executor_ =
+            std::make_unique<ReplicationExecutor>(meta_client_.get(), transfer_client_.get());
+    }
     KVCM_LOG_INFO("manager client init success");
     return ER_OK;
 }
 
-void ManagerClientImpl::Shutdown() {}
+void ManagerClientImpl::Shutdown() {
+    if (replication_executor_) {
+        replication_executor_->Shutdown();
+        replication_executor_.reset();
+    }
+}
 
 std::pair<ClientErrorCode, Locations>
 ManagerClientImpl::MatchLocation(const std::string &trace_id,
@@ -63,8 +73,12 @@ ManagerClientImpl::MatchLocation(const std::string &trace_id,
                                  const std::vector<std::string> &location_spec_names,
                                  std::vector<ReplicationHint> &out_hints) {
     CHECK_CLIENT_WITH_TYPE(meta_client_);
-    return meta_client_->MatchLocation(
+    auto result = meta_client_->MatchLocation(
         trace_id, query_type, keys, tokens, block_mask, sw_size, location_spec_names, out_hints);
+    if (result.first == ER_OK && !out_hints.empty() && replication_executor_) {
+        replication_executor_->Submit(out_hints);
+    }
+    return result;
 }
 
 std::pair<ClientErrorCode, WriteLocation>
