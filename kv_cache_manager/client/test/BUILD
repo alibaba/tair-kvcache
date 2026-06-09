@@ -18,6 +18,18 @@ cc_test(
 )
 
 cc_test(
+    name = "ReplicationExecutorTest",
+    srcs = [
+        "replication_executor_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/client",
+        "//kv_cache_manager/common:unittest",
+    ],
+)
+
+cc_test(
     name = "TransferClientTest",
     srcs = [
         "transfer_client_test.cc",
