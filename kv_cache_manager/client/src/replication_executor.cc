@@ -8,9 +8,11 @@
 
 namespace kv_cache_manager {
 
-ReplicationExecutor::ReplicationExecutor(MetaClient *meta_client, TransferClient *transfer_client)
+ReplicationExecutor::ReplicationExecutor(MetaClient *meta_client, TransferClient *transfer_client, int num_workers)
     : meta_client_(meta_client), transfer_client_(transfer_client) {
-    worker_ = std::thread(&ReplicationExecutor::WorkerLoop, this);
+    for (int i = 0; i < num_workers; ++i) {
+        workers_.emplace_back(&ReplicationExecutor::WorkerLoop, this);
+    }
 }
 
 ReplicationExecutor::~ReplicationExecutor() { Shutdown(); }
@@ -37,9 +39,11 @@ void ReplicationExecutor::Shutdown() {
     if (stopped_.exchange(true)) {
         return;
     }
-    cv_.notify_one();
-    if (worker_.joinable()) {
-        worker_.join();
+    cv_.notify_all();
+    for (auto &w : workers_) {
+        if (w.joinable()) {
+            w.join();
+        }
     }
 }
 

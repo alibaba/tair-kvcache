@@ -14,6 +14,7 @@ bool ClientConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
     KVCM_JSON_GET_MACRO(rapid_value, "sdk_config", sdk_wrapper_config_);
     KVCM_JSON_GET_MACRO(rapid_value, "model_deployment", model_deployment_);
     KVCM_JSON_GET_MACRO(rapid_value, "location_spec_groups", location_spec_groups_);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "replication_workers", replication_workers_, static_cast<int32_t>(2));
     return Check();
 }
 void ClientConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
@@ -26,6 +27,7 @@ void ClientConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &wri
     Put(writer, "sdk_config", sdk_wrapper_config_);
     Put(writer, "model_deployment", model_deployment_);
     Put(writer, "location_spec_groups", location_spec_groups_);
+    Put(writer, "replication_workers", replication_workers_);
 }
 
 bool ClientConfig::operator==(const ClientConfig &other) const {
