@@ -6,11 +6,13 @@ Optimizer 功能应该容易理解、评审和扩展。新增能力必须先设�
 
 1. 在 `kv_cache_manager/optimizer/.agent/tasks/` 记录需求。
 2. 在 `kv_cache_manager/optimizer/.agent/plans/` 写计划或设计文档。
-3. 对照 trace/config 语义和命中率口径评审计划。
-4. 在最小归属模块内实现计划中的能力。
-5. 为行为和非法输入补聚焦测试。
-6. 如果工作流变化，同步更新用户文档和对应 skill。
-7. 如果是通用能力，按 optimizer 仿真开发准备到 `https://github.com/alibaba/tair-kvcache` 的 PR。
+3. 停下来和用户讨论 plan 中的设计决策与设计细节，尤其是会影响 trace/config 语义、命中率口径、输出文件、兼容性或后续实验解释的部分。
+4. 在 plan 中记录用户确认结果或需要修改的方向。
+5. 只有用户确认后，才能在最小归属模块内实现计划中的能力。
+6. 为行为和非法输入补聚焦测试。
+7. 如果工作流变化，同步更新用户文档和对应 skill。
+8. 实现完成后，如需复盘，在 `kv_cache_manager/optimizer/.agent/workflows/` 记录实际执行过程和逐文件改动。
+9. 如果是通用能力，按 optimizer 仿真开发准备到 `https://github.com/alibaba/tair-kvcache` 的 PR。
 
 使用 [../tasks/TEMPLATE.md](../tasks/TEMPLATE.md) 和 [../plans/TEMPLATE.md](../plans/TEMPLATE.md)。
 
@@ -38,6 +40,19 @@ Optimizer 功能应该容易理解、评审和扩展。新增能力必须先设�
 - 哪些非法输入应该 fail fast？
 - 输出文件或 CSV 列有什么变化？
 - 哪些测试能证明新行为？
+
+## Plan Review 规则
+
+plan 不是实现后的总结，而是实现前的讨论材料。对新增能力而言，plan 至少要把以下内容列成“待用户确认的设计决策”：
+
+- 能力作用范围，例如只影响某个 replay 入口，还是改变标准 trace/config。
+- 新字段的命名、默认值、非法输入和兼容策略。
+- 新行为如何影响命中率、block counter、IO 或生命周期统计。
+- 是否复用现有 manager/index/eviction 结构，还是新增独立模块。
+- 哪些参数必须由用户、部署配置或 trace 元数据确认，不能由 agent 猜测。
+- 哪些输出是用户可见的稳定接口。
+
+用户确认前，agent 只能继续阅读代码、补充 plan 或提出备选方案，不得开始编辑实现代码。若用户要求先做原型，也必须在 plan 中明确标记为“未确认假设版”。
 
 ## 标准开源 PR 标准
 

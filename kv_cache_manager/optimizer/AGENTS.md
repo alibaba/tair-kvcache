@@ -7,7 +7,8 @@
 1. 先读 [.agent/handbook/README.md](.agent/handbook/README.md)，确定任务路径。
 2. 执行固定流程时，优先使用 [.agent/skills/](.agent/skills/) 下的任务 skill。
 3. 修改代码前，先在 [.agent/tasks/](.agent/tasks/) 记录需求，再在 [.agent/plans/](.agent/plans/) 写计划或设计文档。
-4. 只有任务需要字段、接口或扩展点细节时，再继续打开更深层参考。
+4. plan 落盘后必须先和用户讨论设计决策与设计细节；用户确认后才能开始实现。不要把未确认的 agent 假设直接写成代码。
+5. 只有任务需要字段、接口或扩展点细节时，再继续打开更深层参考。
 
 ## 不可违反的约束
 
@@ -18,6 +19,8 @@
 - `keys` 只包含完整 block key；不足一个 block 的尾部 token 不写入 `keys`，但仍计入 `input_len`。
 - 任何新的 optimizer 需求都必须在 `kv_cache_manager/optimizer/.agent/tasks/` 下有 task 记录。
 - 任何会改变代码、行为、流程或用户可见文档的需求，都必须在实现前于 `kv_cache_manager/optimizer/.agent/plans/` 下写计划或设计文档。
+- plan 必须列出待用户确认的设计决策；这些决策被用户确认前，不得开始代码实现。
+- workflow 记录实现后的事实过程，不能替代实现前的 plan review。
 
 ## 运行前必须确认的参数
 
