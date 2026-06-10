@@ -178,10 +178,10 @@ void LocalMetricsReporter::ReportInterval() {
         SET_METRICS_(p, meta_indexer, total_key_count, static_cast<double>(total_key_count_v));
         SET_METRICS_(p,
                      meta_indexer,
-                     total_cache_usage, // the semantics is: usage_ratio among all the known groups
+                     total_cache_usage, // the semantics is: (usage_ratio * 100.0) among all the known groups
                      total_capacity_byte_size_v > 0 ? (static_cast<double>(total_usage_byte_size_v) /
-                                                       static_cast<double>(total_capacity_byte_size_v))
-                                                    : 1.0);
+                                                       static_cast<double>(total_capacity_byte_size_v) * 100.0)
+                                                    : 100.0);
     } while (false);
 
     do {
