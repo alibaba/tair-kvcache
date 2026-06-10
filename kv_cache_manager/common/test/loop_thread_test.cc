@@ -88,17 +88,15 @@ TEST_F(LoopThreadTest, TestRunOnce) {
 }
 
 TEST_F(LoopThreadTest, TestStrictMode) {
-    // 测试严格模式
     std::atomic<int> count(0);
     auto loop_thread = LoopThread::CreateLoopThread(
         [&count]() {
             count++;
-            // 模拟耗时操作
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         },
         1000,
         "test",
-        true); // 严格模式
+        true);
     EXPECT_NE(loop_thread, nullptr);
 
     auto start_time = std::chrono::steady_clock::now();
