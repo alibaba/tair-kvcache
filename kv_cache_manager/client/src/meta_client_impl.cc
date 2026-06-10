@@ -232,6 +232,7 @@ MetaClientImpl::GetHostCacheState(const std::string &trace_id,
     const std::string &instance_id = CHECK_INSTANCE_STUB_WITH_TYPE();
     return stub_->GetHostCacheState(trace_id, instance_id, query_type, keys, medium, p2p_host_count);
 }
+std::string MetaClientImpl::GetCallerNode() const { return caller_node_.node_id; }
 
 ClientErrorCode MetaClientImpl::IsValid(const std::unique_ptr<ClientConfig> &client_config) const {
     if (client_config == nullptr) {

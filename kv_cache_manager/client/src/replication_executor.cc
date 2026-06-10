@@ -25,10 +25,14 @@ void ReplicationExecutor::Submit(const std::vector<ReplicationHint> &hints) {
     for (const auto &hint : hints) {
         std::string key = MakeKey(hint.block_key, hint.target_node_id);
         if (inflight_.count(key)) {
+            KVCM_LOG_DEBUG("[replication] Submit: block_key [%ld] target [%s] already inflight, skipped",
+                           hint.block_key, hint.target_node_id.c_str());
             continue;
         }
         inflight_.insert(key);
         queue_.push_back(ReplicationTask{hint});
+        KVCM_LOG_INFO("[replication] Submit: block_key [%ld] target [%s] enqueued (queue_size=%zu)",
+                      hint.block_key, hint.target_node_id.c_str(), queue_.size());
     }
     if (!queue_.empty()) {
         cv_.notify_one();
@@ -39,16 +43,31 @@ void ReplicationExecutor::SubmitWithData(ReplicationHint hint, const void *data,
                                          std::function<void()> release_fn) {
     ReleaseGuard guard(std::move(release_fn));
     if (stopped_.load(std::memory_order_relaxed)) {
+        KVCM_LOG_WARN("[replication] SubmitWithData: executor stopped, block_key [%ld] dropped", hint.block_key);
         return;
     }
     std::lock_guard<std::mutex> lk(mu_);
     std::string key = MakeKey(hint.block_key, hint.target_node_id);
-    if (inflight_.count(key) || piggyback_queue_size_ >= max_piggyback_queue_) {
+    if (inflight_.count(key)) {
+        KVCM_LOG_INFO("[replication] SubmitWithData: block_key [%ld] target [%s] already inflight "
+                      "(likely auto-submitted by MatchLocation), piggyback data dropped. "
+                      "Async replication via ExecuteHintAsync is in progress.",
+                      hint.block_key, hint.target_node_id.c_str());
+        return;
+    }
+    if (piggyback_queue_size_ >= max_piggyback_queue_) {
+        KVCM_LOG_WARN("[replication] SubmitWithData: block_key [%ld] target [%s] dropped, "
+                      "piggyback queue full (%d/%d)",
+                      hint.block_key, hint.target_node_id.c_str(),
+                      piggyback_queue_size_, max_piggyback_queue_);
         return;
     }
     inflight_.insert(key);
     ++piggyback_queue_size_;
     queue_.push_front(ReplicationTask{std::move(hint), data, size, std::move(guard)});
+    KVCM_LOG_INFO("[replication] SubmitWithData: block_key [%ld] target [%s] enqueued (piggyback_queue=%d/%d)",
+                  hint.block_key, hint.target_node_id.c_str(),
+                  piggyback_queue_size_, max_piggyback_queue_);
     cv_.notify_one();
 }
 
@@ -104,6 +123,9 @@ void ReplicationExecutor::ExecuteTask(ReplicationTask &task) {
 
 void ReplicationExecutor::ExecuteWrite(const std::string &trace_id, const ReplicationHint &hint,
                                        const void *data, size_t data_size) {
+    KVCM_LOG_DEBUG("[replication] ExecuteWrite BEGIN trace_id [%s] block_key [%ld] target [%s] data_size [%zu]",
+                  trace_id.c_str(), hint.block_key, hint.target_node_id.c_str(), data_size);
+
     auto [start_ec, write_loc] =
         meta_client_->StartWrite(trace_id, {hint.block_key}, {}, {}, /*write_timeout_seconds=*/60, /*is_replication=*/true);
     if (start_ec != ER_OK) {
@@ -111,9 +133,11 @@ void ReplicationExecutor::ExecuteWrite(const std::string &trace_id, const Replic
                       trace_id.c_str(), hint.block_key, start_ec);
         return;
     }
+    KVCM_LOG_DEBUG("[replication] ExecuteWrite trace_id [%s] StartWrite OK: session_id [%s] locations=%zu",
+                  trace_id.c_str(), write_loc.write_session_id.c_str(), write_loc.locations.size());
 
     if (write_loc.locations.empty()) {
-        KVCM_LOG_DEBUG("[replication] trace_id [%s] block_key [%ld] already replicated (no locations returned)",
+        KVCM_LOG_INFO("[replication] trace_id [%s] block_key [%ld] already replicated (no locations returned by server)",
                        trace_id.c_str(), hint.block_key);
         return;
     }
@@ -124,6 +148,8 @@ void ReplicationExecutor::ExecuteWrite(const std::string &trace_id, const Replic
         return;
     }
     std::string dest_uri = location[0].uri;
+    KVCM_LOG_DEBUG("[replication] ExecuteWrite trace_id [%s] dest_uri [%s] spec_name [%s]",
+                  trace_id.c_str(), dest_uri.c_str(), location[0].spec_name.c_str());
 
     BlockBuffer block_buf;
     block_buf.iovs.push_back(Iov{MemoryType::CPU, const_cast<void *>(data), data_size, false});
@@ -135,6 +161,9 @@ void ReplicationExecutor::ExecuteWrite(const std::string &trace_id, const Replic
                       trace_id.c_str(), dest_uri.c_str(), save_ec);
         return;
     }
+    std::string actual_uri = actual_uris.empty() ? "(empty)" : actual_uris[0];
+    KVCM_LOG_DEBUG("[replication] ExecuteWrite trace_id [%s] SaveKvCaches OK: actual_uri [%s]",
+                  trace_id.c_str(), actual_uri.c_str());
 
     Locations finish_locations;
     if (!actual_uris.empty()) {
@@ -152,8 +181,9 @@ void ReplicationExecutor::ExecuteWrite(const std::string &trace_id, const Replic
         return;
     }
 
-    KVCM_LOG_INFO("[replication] trace_id [%s] block_key [%ld] replicated to node [%s] (piggyback)",
-                  trace_id.c_str(), hint.block_key, hint.target_node_id.c_str());
+    KVCM_LOG_INFO("[replication] ExecuteWrite DONE trace_id [%s] block_key [%ld] replicated to node [%s] "
+                  "dest_uri [%s] (piggyback)",
+                  trace_id.c_str(), hint.block_key, hint.target_node_id.c_str(), dest_uri.c_str());
 }
 
 void ReplicationExecutor::ExecuteHintAsync(const std::string &trace_id, const ReplicationHint &hint) {

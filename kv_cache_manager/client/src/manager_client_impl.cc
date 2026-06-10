@@ -54,9 +54,12 @@ ClientErrorCode ManagerClientImpl::Init(const std::string &client_config, InitPa
         int num_workers = 2;
         if (config.FromJsonString(client_config)) {
             num_workers = std::max(1, static_cast<int>(config.replication_workers()));
+            auto_replicate_ = config.auto_replicate();
         }
         replication_executor_ =
             std::make_unique<ReplicationExecutor>(meta_client_.get(), transfer_client_.get(), num_workers);
+        KVCM_LOG_INFO("replication executor created: workers=%d auto_replicate=%s",
+                      num_workers, auto_replicate_ ? "true" : "false");
     }
     KVCM_LOG_INFO("manager client init success");
     return ER_OK;
@@ -81,7 +84,7 @@ ManagerClientImpl::MatchLocation(const std::string &trace_id,
     CHECK_CLIENT_WITH_TYPE(meta_client_);
     auto result = meta_client_->MatchLocation(
         trace_id, query_type, keys, tokens, block_mask, sw_size, location_spec_names, out_hints);
-    if (result.first == ER_OK && !out_hints.empty() && replication_executor_) {
+    if (result.first == ER_OK && !out_hints.empty() && replication_executor_ && auto_replicate_) {
         replication_executor_->Submit(out_hints);
     }
     return result;
@@ -122,12 +125,20 @@ ClientErrorCode ManagerClientImpl::RemoveCache(const std::string &trace_id,
     return meta_client_->RemoveCache(trace_id, keys, tokens, block_mask);
 }
 
-void ManagerClientImpl::ReplicateWithData(const ReplicationHint &hint, const void *data, size_t size,
+void ManagerClientImpl::ReplicateWithData(const ReplicationHint &hint,
+                                          const void *data,
+                                          size_t size,
                                           std::function<void()> release_fn) {
     if (replication_executor_) {
         replication_executor_->SubmitWithData(hint, data, size, std::move(release_fn));
-    } else if (release_fn) {
-        release_fn();
+    } else {
+        KVCM_LOG_ERROR("[replication] ReplicateWithData: replication_executor_ is null, "
+                       "block_key [%ld] target [%s] cannot be replicated. "
+                       "Hint was dropped. Check that meta_client_ and transfer_client_ both initialized.",
+                       hint.block_key, hint.target_node_id.c_str());
+        if (release_fn) {
+            release_fn();
+        }
     }
 }
 
@@ -140,6 +151,11 @@ std::pair<ClientErrorCode, UriStrVec> ManagerClientImpl::SaveKvCaches(const UriS
                                                                       const BlockBuffers &block_buffers) {
     CHECK_CLIENT_WITH_TYPE(transfer_client_);
     return transfer_client_->SaveKvCaches(uri_str_vec, block_buffers);
+}
+
+std::string ManagerClientImpl::GetCallerNode() const {
+    CHECK_CLIENT_WITH_TYPE(meta_client_);
+    return meta_client_->GetCallerNode();
 }
 
 std::unique_ptr<ManagerClient> ManagerClient::Create(const std::string &client_config, InitParams &init_params) {

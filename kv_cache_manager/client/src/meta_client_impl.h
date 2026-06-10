@@ -71,6 +71,7 @@ public:
                       const std::vector<int64_t> &keys,
                       const std::vector<std::string> &medium,
                       int32_t p2p_host_count) override;
+    std::string GetCallerNode() const override;
 
 protected:
     ClientErrorCode Init(const std::string &client_config, const InitParams &init_params) override;

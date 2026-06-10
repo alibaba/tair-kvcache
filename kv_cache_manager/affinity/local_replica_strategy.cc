@@ -32,18 +32,9 @@ ReadDecision LocalReplicaAffinityStrategy::ResolveRead(const ReadRequest &req, c
     }
 
     // ==== Step 2: on_miss 路径 —— 决定是否产出 ReplicationHint ====
-    // 这里包含机制层（sketch.Observe）+ 策略层（4 gate 判定）。
-    // 算法内部封装：调用方（meta_searcher / cache_manager）完全不知道复制怎么算的。
     if (!params_.enable_on_miss || ctx.caller_node.node_id.empty()) {
         return dec;
     }
-    // TODO: 当前用 any_local（任意 spec 在本地即跳过），对多 spec 场景存在
-    // 部分副本永远无法补全的问题：spec A 在本地 → any_local=true → spec B 的
-    // 远端命中不被 sketch 记录 → 永远不触发 hint。修为 all_local 需同时：
-    //   1. ReplicationHint 支持 per-spec 粒度（当前 proto 只有 block 级）
-    //   2. SDK 侧只复制缺失 spec（避免重复创建已有 spec）
-    //   3. existsOnCallerNode 按 spec 粒度去重
-    // 暂保持 any_local 语义；单 spec 场景无此问题。
     if (any_local) {
         return dec;
     }

@@ -44,13 +44,17 @@ public:
                                 const std::vector<int64_t> &tokens,
                                 const BlockMask &block_mask) override;
 
-    void ReplicateWithData(const ReplicationHint &hint, const void *data, size_t size,
+    void ReplicateWithData(const ReplicationHint &hint,
+                           const void *data,
+                           size_t size,
                            std::function<void()> release_fn) override;
 
     ClientErrorCode LoadKvCaches(const UriStrVec &uri_str_vec, const BlockBuffers &block_buffers) override;
 
     std::pair<ClientErrorCode, UriStrVec> SaveKvCaches(const UriStrVec &uri_str_vec,
                                                        const BlockBuffers &block_buffers) override;
+
+    std::string GetCallerNode() const override;
 
 protected:
     ClientErrorCode Init(const std::string &client_config, InitParams &init_params) override;
@@ -64,5 +68,6 @@ private:
     std::unique_ptr<MetaClient> meta_client_;
     std::unique_ptr<TransferClient> transfer_client_;
     std::unique_ptr<ReplicationExecutor> replication_executor_;
+    bool auto_replicate_ = false;
 };
 } // namespace kv_cache_manager

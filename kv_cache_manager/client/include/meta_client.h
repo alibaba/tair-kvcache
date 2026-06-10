@@ -72,6 +72,7 @@ public:
                       const std::vector<int64_t> &keys,
                       const std::vector<std::string> &medium,
                       int32_t p2p_host_count) = 0;
+    virtual std::string GetCallerNode() const = 0;
 
 protected:
     MetaClient() = default;
