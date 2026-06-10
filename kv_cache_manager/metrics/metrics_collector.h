@@ -309,6 +309,12 @@ class ServiceMetricsCollector final : public MetricsCollector {
     KVCM_GAUGE_METRICS(meta_indexer, cache_backend_upsert_time_us)
     KVCM_GAUGE_METRICS(meta_indexer, cache_backend_delete_time_us)
 
+    // affinity metrics
+    KVCM_GAUGE_METRICS(affinity, read_local_hit)
+    KVCM_GAUGE_METRICS(affinity, read_remote_hit)
+    KVCM_GAUGE_METRICS(affinity, hint_emitted)
+    KVCM_GAUGE_METRICS(affinity, replication_write_count)
+
 public:
     ServiceMetricsCollector() = delete;
     explicit ServiceMetricsCollector(std::shared_ptr<MetricsRegistry> metrics_registry) noexcept;

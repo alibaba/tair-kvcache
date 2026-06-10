@@ -112,6 +112,16 @@ DEFINE_METRICS_NAME_FOR_META_INDEXER(cache_backend_put_time_us);
 DEFINE_METRICS_NAME_FOR_META_INDEXER(cache_backend_upsert_time_us);
 DEFINE_METRICS_NAME_FOR_META_INDEXER(cache_backend_delete_time_us);
 
+// affinity metrics
+#define DEFINE_METRICS_NAME_FOR_AFFINITY(name) DEFINE_METRICS_NAME_(ServiceMetricsCollector, affinity, name)
+#define REGISTER_GAUGE_METRICS_FOR_AFFINITY(name)                                                                      \
+    REGISTER_METRICS_W_TAGS_GAUGE_(metrics_registry_, affinity, name, metrics_tags_)
+
+DEFINE_METRICS_NAME_FOR_AFFINITY(read_local_hit);
+DEFINE_METRICS_NAME_FOR_AFFINITY(read_remote_hit);
+DEFINE_METRICS_NAME_FOR_AFFINITY(hint_emitted);
+DEFINE_METRICS_NAME_FOR_AFFINITY(replication_write_count);
+
 ServiceMetricsCollector::ServiceMetricsCollector(std::shared_ptr<MetricsRegistry> metrics_registry) noexcept
     : MetricsCollector(std::move(metrics_registry)) {}
 
@@ -178,6 +188,12 @@ bool ServiceMetricsCollector::Init() {
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER(cache_backend_put_time_us);
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER(cache_backend_upsert_time_us);
     REGISTER_GAUGE_METRICS_FOR_META_INDEXER(cache_backend_delete_time_us);
+
+    // affinity metrics
+    REGISTER_GAUGE_METRICS_FOR_AFFINITY(read_local_hit);
+    REGISTER_GAUGE_METRICS_FOR_AFFINITY(read_remote_hit);
+    REGISTER_GAUGE_METRICS_FOR_AFFINITY(hint_emitted);
+    REGISTER_GAUGE_METRICS_FOR_AFFINITY(replication_write_count);
 
     return true;
 }

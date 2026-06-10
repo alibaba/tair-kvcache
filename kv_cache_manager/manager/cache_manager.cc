@@ -457,10 +457,38 @@ ErrorCode CacheManager::GetCacheLocation(RequestContext *request_context,
         event_manager_->Publish(cache_get_event);
     }
     for (auto &se : side_effects) {
-        // 多重继承: downcast 到 SideEffect 子类后再切片回纯数据基类。
         if (auto *hint = dynamic_cast<ReplicationHintSideEffect *>(se.get())) {
             out_hints.push_back(std::move(static_cast<ReplicationHint &>(*hint)));
         }
+    }
+    if (service_metrics_collector && !request_context->caller_node().node_id.empty()) {
+        const auto &caller_node_id = request_context->caller_node().node_id;
+        double local_hit = 0, remote_hit = 0;
+        for (const auto &loc_ptr : cache_locations) {
+            if (!loc_ptr) {
+                continue;
+            }
+            bool has_uri = false, has_local = false;
+            for (const auto &spec : loc_ptr->location_specs()) {
+                if (!spec.uri().empty()) {
+                    has_uri = true;
+                    if (spec.node_id() == caller_node_id) {
+                        has_local = true;
+                    }
+                }
+            }
+            if (has_uri) {
+                if (has_local) {
+                    ++local_hit;
+                } else {
+                    ++remote_hit;
+                }
+            }
+        }
+        KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, affinity, read_local_hit, local_hit);
+        KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, affinity, read_remote_hit, remote_hit);
+        KVCM_METRICS_COLLECTOR_SET_METRICS(
+            service_metrics_collector, affinity, hint_emitted, static_cast<double>(out_hints.size()));
     }
     out_locations = CacheLocationViewVecWrapper(std::move(cache_locations));
     return ec;
@@ -659,6 +687,8 @@ CacheManager::StartWriteCache(RequestContext *request_context,
     if (event_manager_) {
         event_manager_->Publish(start_write_event);
     }
+    KVCM_METRICS_COLLECTOR_SET_METRICS(
+        service_metrics_collector, affinity, replication_write_count, request_context->is_replication() ? 1.0 : 0.0);
     return {EC_OK,
             StartWriteCacheInfo(std::move(write_session_id),
                                 std::move(block_mask),
