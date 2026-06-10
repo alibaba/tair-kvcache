@@ -166,7 +166,8 @@ bool OptimizerManager::Init() {
                                                 eviction_manager_,
                                                 stats_collector_,
                                                 instance_group_ttl_disabled_,
-                                                instance_ttl_refresh_on_read_));
+                                                instance_ttl_refresh_on_read_,
+                                                config_.mamba_state_config()));
     return true;
 }
 
@@ -392,7 +393,11 @@ bool OptimizerManager::ClearCache(const std::string &instance_id) {
         KVCM_LOG_ERROR("Indexer manager not initialized");
         return false;
     }
-    return indexer_manager_->ClearCache(instance_id);
+    const bool cleared = indexer_manager_->ClearCache(instance_id);
+    if (cleared && optimizer_runner_) {
+        optimizer_runner_->ClearMambaState(instance_id);
+    }
+    return cleared;
 }
 
 void OptimizerManager::ClearAllCaches() {
@@ -401,6 +406,9 @@ void OptimizerManager::ClearAllCaches() {
         return;
     }
     indexer_manager_->ClearAllCaches();
+    if (optimizer_runner_) {
+        optimizer_runner_->ClearAllMambaStates();
+    }
 }
 
 bool OptimizerManager::ClearCacheAndResetStats(const std::string &instance_id) {

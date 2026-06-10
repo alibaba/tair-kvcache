@@ -19,6 +19,20 @@ hierarchical 写 storage pool 时，三种策略都以 engine pool-source 层为
 
 hierarchical 读 engine-local 时按 `infer_clusters[].engine_read_query_type` 查询；配置 P2P 后，在 engine-local 和 storage pool 之间按 `p2p_read_flows` 查询同集群 peer。完整 `keys` 仍会传给 storage pool：`prefix_match` 下，engine/P2P 已命中的 index 不计入 pool hit，但允许 prefix 继续向后匹配，直到某个 block 在 engine、P2P 和 pool 都未命中；`batch_get` 下，storage pool 也逐 block 独立查询。
 
+标准 `optimizer_run` 也支持顶层可选 `mamba_state`，用于紧急估算无限容量全局池化下的 Mamba/Linear state 影响。当前实现是轻量版本：不建本地/P2P/pool 拆分，不把 Mamba state 建模成完整 component-aware tier，也不模拟 Mamba state 的容量、驱逐和跨 tier 流转。它只在同一个全局 optimizer instance 上维护稀疏 state checkpoint：每次写入时，为请求的第 `chunk_size_blocks`、`2 * chunk_size_blocks` ... 个完整 block，以及 request 结尾 block 写入 checkpoint；request 结尾 checkpoint 固定开启，不提供关闭参数。读取时先按原 KV 逻辑得到 raw KV 连续前缀，再取不超过该前缀的最长已存在 checkpoint 作为最终 `HitBlocks` / `HitRate`。这条路径适合 `optimizer_run` 的单实例超大容量配置和快速粗估，不表示最终完整模拟方案。后续完整版本应把 Mamba state 作为 KV block 上方的 component 维度纳入统一 replay 语义，并补齐容量、驱逐、tier/pool/P2P 交互和统计口径。
+
+示例：
+
+```json
+{
+  "mamba_state": {
+    "enabled": true,
+    "chunk_size_blocks": 64,
+    "bytes_per_state": 131072
+  }
+}
+```
+
 `storage_pool_flow` 是跨 manager 的 engine → storage pool 边，不复用 `tier_flows` 的 propagation 命名：
 
 | 字段 | 说明 |
@@ -53,8 +67,12 @@ AccHitRate = AccHitTokens / AccInputTokens
 | `CachedBlocksAllInstances` | 同一 optimizer 进程内所有 instance 的总缓存 block 数 |
 | `ReadBlocks` / `HitBlocks` | 当前请求读取 / 命中的 block 数 |
 | `LocalHitBlocks` / `PeerHitBlocks` / `RemoteHitBlocks` | engine 本地命中 / 同集群 peer 命中 / KVCM 或 storage pool 命中 block 数 |
+| `RawKvHitBlocks` | 开启 `mamba_state` 时的原始 KV 命中 block 数 |
+| `MambaStateCandidateBlocks` / `MambaStateHitBlocks` | 标准 `optimizer_run` 开启 `mamba_state` 时，raw KV 连续前缀和不超过该前缀的最长 state checkpoint |
+| `MambaStateStoredCheckpoints` / `MambaStateStoredBytes` | 标准 `optimizer_run` 当前已写入的 state checkpoint 数和按 `bytes_per_state` 换算的字节数 |
 | `InputTokens` / `HitTokens` | 当前请求的输入 token 数 / 命中 token 数 |
 | `LocalHitTokens` / `PeerHitTokens` / `RemoteHitTokens` | engine 本地命中 / 同集群 peer 命中 / KVCM 或 storage pool 命中 token 数 |
+| `RawKvHitTokens` / `RawKvHitRate` | 开启 `mamba_state` 时，未被 state 截断的 KV token 命中和命中率 |
 | `HitRate` | 当前请求整体 token hit rate |
 | `LocalHitRate` / `PeerHitRate` / `RemoteHitRate` | 当前请求 local / peer / remote token hit rate |
 | `AccReadBlocks` / `AccHitBlocks` | 累计读取 / 命中的 block 数 |

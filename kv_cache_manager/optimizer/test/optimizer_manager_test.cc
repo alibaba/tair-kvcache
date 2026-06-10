@@ -156,6 +156,58 @@ TEST_F(OptimizerManagerTest, ReadUsesExplicitInputLen) {
     EXPECT_EQ(last_read->remote_hit_blocks, 1);
 }
 
+TEST_F(OptimizerManagerTest, MambaStateCheckpointsGateOptimizerRunHits) {
+    auto config = CreateTestOptimizerConfig();
+    OptMambaStateConfig mamba_state;
+    mamba_state.set_enabled(true);
+    mamba_state.set_chunk_size_blocks(2);
+    mamba_state.set_bytes_per_state(128);
+    config.set_mamba_state_config(mamba_state);
+
+    auto groups = config.instance_groups();
+    ASSERT_EQ(groups.size(), 1);
+    auto group = groups[0];
+    group.set_quota_capacity(-1);
+    group.set_used_percentage(1.0);
+    auto instances = group.instances();
+    ASSERT_EQ(instances.size(), 1);
+    instances[0].set_block_size(16);
+    instances[0].set_bytes_per_token(1);
+    group.set_instances(instances);
+    config.set_instance_groups({group});
+
+    OptimizerManager manager(config);
+    ASSERT_TRUE(manager.Init());
+
+    const std::vector<int64_t> full_request = {1, 2, 3, 4, 5};
+    manager.WriteCache("instance1", "write_full", 1000, full_request);
+
+    BlockMask remote_read_mask = std::vector<bool>{false, false, false};
+    auto partial_hit = manager.GetCacheLocation("instance1", "read_three", 2000, {1, 2, 3}, remote_read_mask, 48);
+    EXPECT_EQ(partial_hit.kvcm_hit_length, 2);
+
+    const auto *partial_record = manager.hit_rate_tracker_->LastReadRecord("instance1");
+    ASSERT_NE(partial_record, nullptr);
+    EXPECT_TRUE(partial_record->mamba_state_enabled);
+    EXPECT_EQ(partial_record->raw_kv_remote_hit_blocks, 3);
+    EXPECT_EQ(partial_record->remote_hit_blocks, 2);
+    EXPECT_EQ(partial_record->mamba_state_candidate_blocks, 3);
+    EXPECT_EQ(partial_record->mamba_state_hit_blocks, 2);
+    EXPECT_EQ(partial_record->mamba_state_stored_checkpoints, 3);
+    EXPECT_EQ(partial_record->mamba_state_bytes_per_state, 128);
+
+    BlockMask full_remote_read_mask = std::vector<bool>{false, false, false, false, false};
+    auto full_hit = manager.GetCacheLocation("instance1", "read_full", 3000, full_request, full_remote_read_mask, 80);
+    EXPECT_EQ(full_hit.kvcm_hit_length, 5);
+
+    const auto *full_record = manager.hit_rate_tracker_->LastReadRecord("instance1");
+    ASSERT_NE(full_record, nullptr);
+    EXPECT_EQ(full_record->raw_kv_remote_hit_blocks, 5);
+    EXPECT_EQ(full_record->remote_hit_blocks, 5);
+    EXPECT_EQ(full_record->mamba_state_candidate_blocks, 5);
+    EXPECT_EQ(full_record->mamba_state_hit_blocks, 5);
+}
+
 TEST_F(OptimizerManagerTest, ReadRejectsPartialTailBlockKeys) {
     OptimizerManager manager(config_);
     ASSERT_TRUE(manager.Init());

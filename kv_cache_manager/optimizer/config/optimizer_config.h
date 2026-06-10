@@ -28,6 +28,28 @@ private:
     int64_t write_delay_ns_ = 1;
 };
 
+class OptMambaStateConfig : public Jsonizable {
+public:
+    OptMambaStateConfig() = default;
+    ~OptMambaStateConfig() override = default;
+
+    bool FromRapidValue(const rapidjson::Value &rapid_value) override;
+    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
+
+    [[nodiscard]] bool enabled() const { return enabled_; }
+    [[nodiscard]] size_t chunk_size_blocks() const { return chunk_size_blocks_; }
+    [[nodiscard]] size_t bytes_per_state() const { return bytes_per_state_; }
+
+    void set_enabled(bool enabled) { enabled_ = enabled; }
+    void set_chunk_size_blocks(size_t chunk_size_blocks) { chunk_size_blocks_ = chunk_size_blocks; }
+    void set_bytes_per_state(size_t bytes_per_state) { bytes_per_state_ = bytes_per_state; }
+
+private:
+    bool enabled_ = false;
+    size_t chunk_size_blocks_ = 0;
+    size_t bytes_per_state_ = 0;
+};
+
 class OptimizerConfig : public Jsonizable {
 public:
     OptimizerConfig() = default;
@@ -40,6 +62,7 @@ public:
     [[nodiscard]] const std::string &output_result_path() const { return output_result_path_; }
     [[nodiscard]] const EvictionConfig &eviction_config() const { return eviction_config_; }
     [[nodiscard]] const OptTraceReplayConfig &trace_replay_config() const { return trace_replay_config_; }
+    [[nodiscard]] const OptMambaStateConfig &mamba_state_config() const { return mamba_state_config_; }
     [[nodiscard]] const std::vector<OptInstanceGroupConfig> &instance_groups() const { return instance_groups_; }
     [[nodiscard]] std::vector<OptInstanceGroupConfig> &mutable_instance_groups() { return instance_groups_; }
 
@@ -47,6 +70,7 @@ public:
     void set_output_result_path(const std::string &path) { output_result_path_ = path; }
     void set_eviction_params(const EvictionConfig &config) { eviction_config_ = config; }
     void set_trace_replay_config(const OptTraceReplayConfig &config) { trace_replay_config_ = config; }
+    void set_mamba_state_config(const OptMambaStateConfig &config) { mamba_state_config_ = config; }
     void set_instance_groups(const std::vector<OptInstanceGroupConfig> &groups) { instance_groups_ = groups; }
 
 private:
@@ -54,6 +78,7 @@ private:
     std::string output_result_path_;
     EvictionConfig eviction_config_;
     OptTraceReplayConfig trace_replay_config_;
+    OptMambaStateConfig mamba_state_config_;
     std::vector<OptInstanceGroupConfig> instance_groups_;
 };
 

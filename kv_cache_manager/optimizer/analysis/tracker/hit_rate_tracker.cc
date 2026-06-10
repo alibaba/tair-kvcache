@@ -112,12 +112,36 @@ void HitRateTracker::ExportHitRates(const std::string &instance_id,
         }
     }
     bool has_tiered_data = (num_tiers > 0);
+    bool has_mamba_state_data = false;
+    for (const auto &r : data.read_records) {
+        if (r.mamba_state_enabled) {
+            has_mamba_state_data = true;
+            break;
+        }
+    }
+    if (!has_mamba_state_data) {
+        for (const auto &w : data.write_records) {
+            if (w.mamba_state_enabled) {
+                has_mamba_state_data = true;
+                break;
+            }
+        }
+    }
 
     // ---- 写入 CSV ----
-    file << "TimestampNs,TraceId,CachedBlocks,CachedBlocksAllInstances,ReadBlocks,LocalHitBlocks,RemoteHitBlocks,HitBlocks,"
-            "InputTokens,LocalHitTokens,RemoteHitTokens,HitTokens,LocalHitRate,RemoteHitRate,HitRate,"
+    file << "TimestampNs,TraceId,CachedBlocks,CachedBlocksAllInstances,ReadBlocks,LocalHitBlocks,RemoteHitBlocks,"
+            "HitBlocks,"
+            "InputTokens,LocalHitTokens,RemoteHitTokens,HitTokens,LocalHitRate,RemoteHitRate,HitRate";
+    if (has_mamba_state_data) {
+        file << ",RawKvHitBlocks,MambaStateEnabled,MambaStateCandidateBlocks,MambaStateHitBlocks,"
+                "MambaStateStoredCheckpoints,MambaStateStoredBytes,RawKvHitTokens,RawKvHitRate";
+    }
+    file << ","
             "AccReadBlocks,AccHitBlocks,AccInputTokens,AccLocalHitTokens,AccRemoteHitTokens,AccHitTokens,"
             "AccLocalHitRate,AccRemoteHitRate,AccHitRate,AccWriteBlocks";
+    if (has_mamba_state_data) {
+        file << ",AccMambaStateWriteCheckpoints,AccMambaStateNewCheckpoints,AccMambaStateStoredBytes";
+    }
     if (has_tiered_data) {
         for (size_t t = 0; t < num_tiers; ++t) {
             const auto &name = tier_names[t];
@@ -146,6 +170,9 @@ void HitRateTracker::ExportHitRates(const std::string &instance_id,
     size_t acc_remote_hit_tokens = 0;
     size_t acc_hit_tokens = 0;
     size_t write_index = 0;
+    size_t acc_mamba_state_write_checkpoints = 0;
+    size_t acc_mamba_state_new_checkpoints = 0;
+    size_t acc_mamba_state_stored_bytes = 0;
     std::vector<size_t> acc_tier_hit_tokens(num_tiers, 0);
 
     for (size_t i = 0; i < data.read_records.size(); ++i) {
@@ -167,6 +194,12 @@ void HitRateTracker::ExportHitRates(const std::string &instance_id,
         while (write_index < data.write_records.size() &&
                data.write_records[write_index].timestamp_ns <= r.timestamp_ns) {
             acc_write_blocks += data.write_records[write_index].write_blocks;
+            if (data.write_records[write_index].mamba_state_enabled) {
+                acc_mamba_state_write_checkpoints += data.write_records[write_index].mamba_state_write_checkpoints;
+                acc_mamba_state_new_checkpoints += data.write_records[write_index].mamba_state_new_checkpoints;
+                acc_mamba_state_stored_bytes += data.write_records[write_index].mamba_state_new_checkpoints *
+                                                data.write_records[write_index].mamba_state_bytes_per_state;
+            }
             write_index++;
         }
 
@@ -176,13 +209,27 @@ void HitRateTracker::ExportHitRates(const std::string &instance_id,
              << remote_hit_tokens << "," << hit_tokens << ","
              << (input_tokens > 0 ? static_cast<double>(local_hit_tokens) / input_tokens : 0.0) << ","
              << (input_tokens > 0 ? static_cast<double>(remote_hit_tokens) / input_tokens : 0.0) << ","
-             << (input_tokens > 0 ? static_cast<double>(hit_tokens) / input_tokens : 0.0) << "," << acc_read_blocks
-             << "," << acc_hit_blocks << "," << acc_input_tokens << "," << acc_local_hit_tokens << ","
-             << acc_remote_hit_tokens << "," << acc_hit_tokens << ","
+             << (input_tokens > 0 ? static_cast<double>(hit_tokens) / input_tokens : 0.0);
+        if (has_mamba_state_data) {
+            const size_t raw_kv_hit_blocks =
+                r.mamba_state_enabled ? r.raw_kv_local_hit_blocks + r.raw_kv_remote_hit_blocks : current_hit;
+            const size_t raw_kv_hit_tokens = raw_kv_hit_blocks * block_size_tokens;
+            const size_t stored_bytes = r.mamba_state_stored_checkpoints * r.mamba_state_bytes_per_state;
+            file << "," << raw_kv_hit_blocks << "," << r.mamba_state_enabled << "," << r.mamba_state_candidate_blocks
+                 << "," << r.mamba_state_hit_blocks << "," << r.mamba_state_stored_checkpoints << "," << stored_bytes
+                 << "," << raw_kv_hit_tokens << ","
+                 << (input_tokens > 0 ? static_cast<double>(raw_kv_hit_tokens) / input_tokens : 0.0);
+        }
+        file << "," << acc_read_blocks << "," << acc_hit_blocks << "," << acc_input_tokens << ","
+             << acc_local_hit_tokens << "," << acc_remote_hit_tokens << "," << acc_hit_tokens << ","
              << (acc_input_tokens > 0 ? static_cast<double>(acc_local_hit_tokens) / acc_input_tokens : 0.0) << ","
              << (acc_input_tokens > 0 ? static_cast<double>(acc_remote_hit_tokens) / acc_input_tokens : 0.0) << ","
              << (acc_input_tokens > 0 ? static_cast<double>(acc_hit_tokens) / acc_input_tokens : 0.0) << ","
              << acc_write_blocks;
+        if (has_mamba_state_data) {
+            file << "," << acc_mamba_state_write_checkpoints << "," << acc_mamba_state_new_checkpoints << ","
+                 << acc_mamba_state_stored_bytes;
+        }
         if (has_tiered_data) {
             for (size_t t = 0; t < num_tiers; ++t) {
                 size_t hits = (t < r.per_tier_hit_blocks.size()) ? r.per_tier_hit_blocks[t] : 0;
