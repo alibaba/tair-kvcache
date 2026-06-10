@@ -84,18 +84,38 @@ std::vector<std::pair<ErrorCode, DataStorageUri>> NfsBackend::Create(const std::
 std::vector<LocationDescriptor> NfsBackend::CreateWithHints(const std::vector<std::string> &keys,
                                                             size_t size_per_key,
                                                             const WriteHints &hints,
-                                                            bool /*strict*/,
+                                                            bool strict,
                                                             const std::string &trace_id,
                                                             std::function<void()> cb) {
+    const std::string preferred = hints.preferred_node_ids.empty() ? std::string() : hints.preferred_node_ids.front();
+
+    // In strict mode the caller demands placement on a specific node.
+    // NFS backend always writes to local_node_id_, so if the preferred node
+    // differs (or is empty), fail fast rather than silently placing elsewhere.
+    if (strict && preferred != local_node_id_) {
+        KVCM_LOG_WARN("CreateWithHints strict=true but preferred_node [%s] != local_node [%s], "
+                      "rejecting %zu keys, trace_id=[%s]",
+                      preferred.c_str(),
+                      local_node_id_.c_str(),
+                      keys.size(),
+                      trace_id.c_str());
+        std::vector<LocationDescriptor> out;
+        out.reserve(keys.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            out.push_back(LocationDescriptor{EC_ERROR, DataStorageUri{}, /*node_id=*/""});
+        }
+        return out;
+    }
+
     auto legacy = Create(keys, size_per_key, trace_id, std::move(cb));
     std::vector<LocationDescriptor> out;
     out.reserve(legacy.size());
-    const std::string preferred = hints.preferred_node_ids.empty() ? std::string() : hints.preferred_node_ids.front();
     for (auto &p : legacy) {
         if (!preferred.empty()) {
             p.second.SetParam("preferred_node", preferred);
+            p.second.SetParam("local_node_id", local_node_id_);
         }
-        out.push_back(LocationDescriptor{p.first, std::move(p.second), preferred});
+        out.push_back(LocationDescriptor{p.first, std::move(p.second), local_node_id_});
     }
     return out;
 }
