@@ -57,10 +57,36 @@ bool Server::Init(const ServerConfig &config) {
         if (!strategy_file.empty()) {
             std::string err;
             if (!affinity_manager_->LoadProcessStrategyFromJsonFile(strategy_file, &err)) {
-                KVCM_LOG_WARN("load process affinity strategy file[%s] failed: %s", strategy_file.c_str(),
-                              err.c_str());
+                KVCM_LOG_WARN("load process affinity strategy file[%s] failed: %s", strategy_file.c_str(), err.c_str());
             } else {
                 KVCM_LOG_INFO("loaded process affinity strategy from file[%s]", strategy_file.c_str());
+            }
+        } else {
+            // No explicit strategy file: apply built-in local_replica default.
+            // - write: prefer_local with passthrough on miss (best-effort local placement)
+            // - read:  frequency sketch triggers ReplicationHint after 3 remote reads
+            static constexpr char kDefaultStrategyJson[] = R"({
+                "type": "local_replica",
+                "write": {
+                    "ops": {
+                        "prefer_local": {"on_miss": "passthrough"},
+                        "limit": 2
+                    }
+                },
+                "read": {
+                    "on_miss": {
+                        "enabled": true,
+                        "replication_hot_threshold": 3,
+                        "caller_capacity_threshold": 0.90,
+                        "caller_capacity_buffer": 0.05
+                    }
+                }
+            })";
+            std::string err;
+            if (!affinity_manager_->LoadProcessStrategyFromJsonString(kDefaultStrategyJson, &err)) {
+                KVCM_LOG_WARN("load default affinity strategy failed: %s", err.c_str());
+            } else {
+                KVCM_LOG_INFO("loaded built-in default affinity strategy (local_replica)");
             }
         }
     }

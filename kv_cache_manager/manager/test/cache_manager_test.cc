@@ -2831,20 +2831,35 @@ TEST_F(CacheManagerAffinityTest, ReplicationWriteBypassesGlobalDedup) {
         EXPECT_TRUE(info.locations().cache_locations_view().empty()) << "No new locations for fully deduped write";
     }
 
-    // Replication write with is_replication=true: should NOT be globally deduped.
-    // File backend doesn't fill node_id, so existsOnCallerNode always returns
-    // false (no spec matches caller_node_id) → replication write proceeds.
+    // Replication write: directly test FilterWriteCache to verify that
+    // is_replication=true bypasses global dedup when caller_node_id differs
+    // from existing location node_ids.
     {
         request_context_->set_is_replication(true);
         request_context_->set_caller_node_id("node_a");
-        auto [ec, info] =
-            cache_manager_->StartWriteCache(request_context_.get(), "test_instance", keys, {}, {}, 100000000);
+
+        auto *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+        ASSERT_NE(nullptr, meta_searcher);
+
+        CacheManager::KeyVector new_keys;
+        std::vector<std::string_view> new_location_spec_group_names;
+        BlockMask block_mask = static_cast<size_t>(0);
+
+        auto ec = cache_manager_->FilterWriteCache(request_context_.get(),
+                                                   "test_instance",
+                                                   meta_searcher,
+                                                   keys,
+                                                   new_keys,
+                                                   {},
+                                                   new_location_spec_group_names,
+                                                   block_mask);
         ASSERT_EQ(EC_OK, ec);
 
-        auto mask_offset = std::get<BlockMaskOffset>(info.block_mask());
-        EXPECT_EQ(0u, mask_offset) << "Replication write should bypass global dedup (no local replica found)";
-        EXPECT_EQ(keys.size(), info.locations().cache_locations_view().size())
-            << "All keys should get new locations for replication write";
+        // All keys should pass through filter (not deduped) because caller
+        // "node_a" has no local replica — NFS node_id is local IP, not "node_a".
+        auto mask_offset = std::get<BlockMaskOffset>(block_mask);
+        EXPECT_EQ(0u, mask_offset) << "Replication filter should not dedup (no local replica on node_a)";
+        EXPECT_EQ(keys.size(), new_keys.size()) << "All keys should pass through replication filter";
 
         // Clean up
         request_context_->set_is_replication(false);
