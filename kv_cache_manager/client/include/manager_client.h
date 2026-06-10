@@ -48,13 +48,16 @@ public:
                                         const std::vector<int64_t> &tokens,
                                         const BlockMask &block_mask) = 0;
 
-    virtual void ReplicateWithData(const ReplicationHint &hint, const void *data, size_t size,
-                                   std::function<void()> release_fn) = 0;
+    virtual void
+    ReplicateWithData(const ReplicationHint &hint, const void *data, size_t size, std::function<void()> release_fn) = 0;
 
     // for transfer client
     virtual ClientErrorCode LoadKvCaches(const UriStrVec &uri_str_vec, const BlockBuffers &block_buffers) = 0;
     virtual std::pair<ClientErrorCode, UriStrVec> SaveKvCaches(const UriStrVec &uri_str_vec,
                                                                const BlockBuffers &block_buffers) = 0;
+
+    // diagnostic: expose caller node id for debugging affinity issues
+    virtual std::string GetCallerNode() const = 0;
 
 protected:
     ManagerClient() = default;

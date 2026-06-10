@@ -56,6 +56,8 @@ public:
 
     const std::string &GetStorageConfig() const override;
 
+    std::string GetCallerNode() const override;
+
 protected:
     ClientErrorCode Init(const std::string &client_config, const InitParams &init_params) override;
     void Shutdown() override;
