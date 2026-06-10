@@ -34,12 +34,22 @@ class BenchmarkConfig:
         self.indexer_type = os.getenv("BENCH_INDEXER_TYPE", "bst_lru")
         self.max_key_count = int(os.getenv("BENCH_MAX_KEY_COUNT", "0"))
 
-        # Benchmark mode: "setup_and_run" | "run_only" | "setup_only"
+        # Benchmark mode: "setup_and_run" | "run_only" | "setup_only" | "trace_replay"
         self.mode = os.getenv("BENCH_MODE", "setup_and_run")
 
         # HTTP connection pool
         self.connection_timeout = float(os.getenv("BENCH_CONNECTION_TIMEOUT", "5.0"))
         self.request_timeout = float(os.getenv("BENCH_REQUEST_TIMEOUT", "10.0"))
+
+        # Trace replay parameters (only used when mode=trace_replay)
+        self.trace_data_dir = os.getenv("BENCH_TRACE_DATA_DIR", "")
+        self.trace_speed_factor = float(os.getenv("BENCH_TRACE_SPEED_FACTOR", "1.0"))
+        self.trace_loop = os.getenv("BENCH_TRACE_LOOP", "false").lower() in ("true", "1", "yes")
+        self.trace_loop_count = int(os.getenv("BENCH_TRACE_LOOP_COUNT", "0"))
+        self.trace_max_requests = int(os.getenv("BENCH_TRACE_MAX_REQUESTS", "0"))
+
+        if self.trace_loop_count > 0:
+            self.trace_loop = True
 
     @property
     def base_url(self) -> str:
@@ -70,5 +80,10 @@ class BenchmarkConfig:
             f"  mode:                {self.mode}",
             f"  connection_timeout:  {self.connection_timeout}",
             f"  request_timeout:     {self.request_timeout}",
+            f"  trace_data_dir:      {self.trace_data_dir}",
+            f"  trace_speed_factor:  {self.trace_speed_factor}",
+            f"  trace_loop:          {self.trace_loop}",
+            f"  trace_loop_count:    {self.trace_loop_count} (0=unlimited)",
+            f"  trace_max_requests:  {self.trace_max_requests} (0=unlimited)",
         ]
         return "\n".join(lines)

@@ -5,7 +5,7 @@ import logging
 
 from .config import BenchmarkConfig
 from .client import OptimizerClient
-from .setup import setup_instance, teardown_instance
+from .setup import setup_instance
 from .stats import StatsCollector
 from .runner import BenchmarkRunner
 
@@ -24,7 +24,7 @@ def main():
     client = OptimizerClient(config)
 
     try:
-        if config.mode in ("setup_and_run", "setup_only"):
+        if config.mode in ("setup_and_run", "setup_only", "trace_replay"):
             setup_instance(client, config)
 
         if config.mode == "setup_only":
@@ -32,11 +32,20 @@ def main():
             return
 
         stats = StatsCollector(report_interval=config.report_interval)
-        runner = BenchmarkRunner(config, client, stats)
+
+        if config.mode == "trace_replay":
+            if not config.trace_data_dir:
+                logger.error("BENCH_TRACE_DATA_DIR is required for trace_replay mode.")
+                sys.exit(1)
+            from .trace_replay import TraceReplayRunner
+            runner = TraceReplayRunner(config, client, stats)
+        else:
+            runner = BenchmarkRunner(config, client, stats)
+
         runner.run()
 
-        if config.mode == "setup_and_run":
-            teardown_instance(client, config)
+        # NOTE: teardown removed to avoid accidental deletion of production instances.
+        # Use the kvcm_ops CLI to remove instances manually if needed.
 
     except KeyboardInterrupt:
         logger.info("Interrupted by user.")
