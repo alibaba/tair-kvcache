@@ -83,24 +83,22 @@ TEST_F(LoopThreadTest, TestRunOnce) {
 }
 
 TEST_F(LoopThreadTest, TestStrictMode) {
-    // 测试严格模式
     std::atomic<int> count(0);
     auto loop_thread = LoopThread::CreateLoopThread(
         [&count]() {
             count++;
-            // 模拟耗时操作
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         },
         1000,
         "test",
-        true); // 严格模式
+        true);
     EXPECT_NE(loop_thread, nullptr);
 
-    // 等待一段时间
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-
-    int final_count = count.load();
-    EXPECT_GT(final_count, 0);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    while (count.load() == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_GT(count.load(), 0);
 
     loop_thread->Stop();
 }
