@@ -144,3 +144,4 @@ bazel run //kv_cache_manager/optimizer/analysis/script:tradeoff_analysis_run_by_
 
 - [Optimizer README](../kv_cache_manager/optimizer/README.md)
 - [Optimizer 架构文档](../kv_cache_manager/optimizer/docs/optimizer_architecture.md)
+- [Optimizer 工作手册](../kv_cache_manager/optimizer/.agent/handbook/README.md)

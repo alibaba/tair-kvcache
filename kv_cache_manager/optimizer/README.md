@@ -33,6 +33,8 @@ KVCacheManager Optimizer 是一个独立的缓存优化分析模块，通过回�
 
 标准回放模式、multi-infer replay、trace schema 和命中率口径见 [docs/strategy_config.md](docs/strategy_config.md)。标准版中 `HitRate` 统一表示整体 token hit rate，即 `HitTokens / InputTokens`；`LocalHit*` 表示 engine 本地命中，`RemoteHit*` 表示 KVCM/L3 命中。传入 optimizer config 的 Python 入口统一使用配置中的 `output_result_path`；`multi_infer_replay` 不读取完整 config，使用显式 `--output-dir`。标准 `get` trace 必须包含 `input_len`；外部只有请求级日志时可使用 `type=request`，optimizer 会按 `trace_replay.write_delay_ns` 在内部调度 delayed write；其他来源日志需要先转换为 optimizer schema。
 
+渐进式工作入口见 [.agent/handbook/README.md](.agent/handbook/README.md)。常见任务优先使用 [.agent/skills/](.agent/skills/) 下的任务 skill，再按需阅读更深层参考。
+
 ### 架构设计
 
 ```
