@@ -56,6 +56,8 @@ public:
 
     virtual const std::string &GetStorageConfig() const = 0;
 
+    virtual std::string GetCallerNode() const = 0;
+
 protected:
     MetaClient() = default;
     virtual ClientErrorCode Init(const std::string &config, const InitParams &init_params) = 0;

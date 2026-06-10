@@ -176,8 +176,14 @@ MetaClientImpl::StartWrite(const std::string &trace_id,
                    DebugStringUtil::ToString(location_spec_group_names).c_str(),
                    write_timeout_seconds);
     const std::string &instance_id = CHECK_INSTANCE_STUB_WITH_TYPE();
-    return stub_->StartWriteCache(
-        trace_id, instance_id, keys, tokens, location_spec_group_names, write_timeout_seconds, caller_node_, is_replication);
+    return stub_->StartWriteCache(trace_id,
+                                  instance_id,
+                                  keys,
+                                  tokens,
+                                  location_spec_group_names,
+                                  write_timeout_seconds,
+                                  caller_node_,
+                                  is_replication);
 }
 ClientErrorCode MetaClientImpl::FinishWrite(const std::string &trace_id,
                                             const std::string &write_session_id,
@@ -209,6 +215,8 @@ const std::string &MetaClientImpl::GetStorageConfig() const {
     KVCM_LOG_DEBUG("get storage config");
     return storage_config_;
 }
+
+std::string MetaClientImpl::GetCallerNode() const { return caller_node_.node_id; }
 
 ClientErrorCode MetaClientImpl::IsValid(const std::unique_ptr<ClientConfig> &client_config) const {
     if (client_config == nullptr) {

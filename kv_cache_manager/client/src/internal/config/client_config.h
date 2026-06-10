@@ -29,6 +29,7 @@ public:
     const ModelDeployment &model_deployment() const { return model_deployment_; }
     const LocationSpecGroups &location_spec_groups() const { return location_spec_groups_; }
     int32_t replication_workers() const { return replication_workers_; }
+    bool auto_replicate() const { return auto_replicate_; }
 
 private:
     bool Check() const;
@@ -44,6 +45,7 @@ private:
     ModelDeployment model_deployment_;
     LocationSpecGroups location_spec_groups_;
     int32_t replication_workers_ = 2;
+    bool auto_replicate_ = false;
 };
 
 } // namespace kv_cache_manager
