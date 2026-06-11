@@ -32,6 +32,7 @@ public:
     QueryType default_query_type() const { return static_cast<QueryType>(default_query_type_); }
     int32_t replication_workers() const { return replication_workers_; }
     bool auto_replicate() const { return auto_replicate_; }
+    int32_t caller_node_refresh_seconds() const { return caller_node_refresh_seconds_; }
 
 private:
     bool Check() const;
@@ -49,6 +50,7 @@ private:
     int32_t default_query_type_{0};
     int32_t replication_workers_ = 2;
     bool auto_replicate_ = false;
+    int32_t caller_node_refresh_seconds_ = 30;
 };
 
 } // namespace kv_cache_manager

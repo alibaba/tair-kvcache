@@ -69,6 +69,7 @@ private:
     const ClientConfig *GetClientConfig() const;
     const ClientConfig *GetClientConfigUnsafe() const;
     const std::string &GetInstanceId() const;
+    CallerNode CurrentCallerNode() const;
 
 private:
     friend class MetaClient;
@@ -76,7 +77,6 @@ private:
     std::unique_ptr<Stub> stub_;
     std::string storage_config_;
     std::unique_ptr<CallerNodeProvider> caller_node_provider_;
-    CallerNode caller_node_;
     mutable std::shared_mutex config_mutex_;
 };
 } // namespace kv_cache_manager

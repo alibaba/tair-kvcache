@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <memory>
 #include <vector>
 
@@ -27,7 +28,8 @@ public:
     // Returns a non-null CallerNodeProvider. Falls back to
     // NoopCallerNodeProvider if no concrete provider is applicable.
     static std::unique_ptr<CallerNodeProvider>
-    Create(const std::vector<std::shared_ptr<StorageConfig>> &storage_configs);
+    Create(const std::vector<std::shared_ptr<StorageConfig>> &storage_configs,
+           std::chrono::seconds refresh_interval = std::chrono::seconds(30));
 };
 
 } // namespace kv_cache_manager
