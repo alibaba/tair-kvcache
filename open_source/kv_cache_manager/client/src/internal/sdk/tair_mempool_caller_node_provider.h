@@ -1,7 +1,7 @@
 #pragma once
 
+#include <chrono>
 #include <memory>
-#include <string>
 
 #include "kv_cache_manager/client/include/common.h"
 #include "kv_cache_manager/client/src/internal/sdk/caller_node_provider.h"
@@ -9,18 +9,14 @@
 
 namespace kv_cache_manager {
 
-// Open-source stub: always returns empty CallerNode (no pace-mp available).
 class TairMempoolCallerNodeProvider : public CallerNodeProvider {
 public:
-    TairMempoolCallerNodeProvider() = default;
+    explicit TairMempoolCallerNodeProvider(std::chrono::seconds = std::chrono::seconds(30)) {}
     ~TairMempoolCallerNodeProvider() override = default;
 
-    ClientErrorCode Init(const std::shared_ptr<StorageConfig> &storage_config);
+    ClientErrorCode Init(const std::shared_ptr<StorageConfig> &) { return ER_SDKINIT_ERROR; }
 
-    CallerNode GetCallerNode() const override { return cached_caller_node_; }
-
-private:
-    CallerNode cached_caller_node_;
+    CallerNode GetCallerNode() override { return {}; }
 };
 
 } // namespace kv_cache_manager

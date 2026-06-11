@@ -17,6 +17,8 @@ bool ClientConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "default_query_type", default_query_type_, static_cast<int32_t>(0));
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "replication_workers", replication_workers_, static_cast<int32_t>(2));
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "auto_replicate", auto_replicate_, false);
+    KVCM_JSON_GET_DEFAULT_MACRO(
+        rapid_value, "caller_node_refresh_seconds", caller_node_refresh_seconds_, static_cast<int32_t>(30));
     return Check();
 }
 void ClientConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
@@ -32,6 +34,7 @@ void ClientConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &wri
     Put(writer, "default_query_type", default_query_type_);
     Put(writer, "replication_workers", replication_workers_);
     Put(writer, "auto_replicate", auto_replicate_);
+    Put(writer, "caller_node_refresh_seconds", caller_node_refresh_seconds_);
 }
 
 bool ClientConfig::operator==(const ClientConfig &other) const {

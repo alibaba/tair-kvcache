@@ -1,5 +1,7 @@
 #include "kv_cache_manager/client/src/meta_client_impl.h"
 
+#include <chrono>
+
 #include "kv_cache_manager/client/src/internal/config/client_config.h"
 #include "kv_cache_manager/client/src/internal/sdk/caller_node_provider.h"
 #include "kv_cache_manager/client/src/internal/sdk/caller_node_provider_factory.h"
@@ -33,7 +35,7 @@ std::string GenRandomTraceId(const std::string &prefix_log) {
 
 namespace kv_cache_manager {
 
-MetaClientImpl::MetaClientImpl() {}
+MetaClientImpl::MetaClientImpl() : caller_node_provider_(std::make_unique<NoopCallerNodeProvider>()) {}
 
 MetaClientImpl::~MetaClientImpl() { Shutdown(); }
 
@@ -93,9 +95,9 @@ ClientErrorCode MetaClientImpl::Init(const std::string &client_config, const Ini
     }
     if (ec != ER_OK) {
         KVCM_LOG_ERROR("meta client init fail, last errorcode [%d]", ec);
-    } else {
-        KVCM_LOG_INFO("meta client init success");
+        return ec;
     }
+    KVCM_LOG_INFO("meta client init success");
     return ec;
 }
 
@@ -127,7 +129,7 @@ std::pair<ClientErrorCode, Locations> MetaClientImpl::MatchLocation(const std::s
                                    block_mask,
                                    sw_size,
                                    location_spec_names,
-                                   caller_node_,
+                                   CurrentCallerNode(),
                                    out_hints);
 }
 
@@ -177,7 +179,7 @@ MetaClientImpl::StartWrite(const std::string &trace_id,
                    write_timeout_seconds);
     const std::string &instance_id = CHECK_INSTANCE_STUB_WITH_TYPE();
     return stub_->StartWriteCache(
-        trace_id, instance_id, keys, tokens, location_spec_group_names, write_timeout_seconds, caller_node_, is_replication, min_replica_count);
+        trace_id, instance_id, keys, tokens, location_spec_group_names, write_timeout_seconds, CurrentCallerNode(), is_replication, min_replica_count);
 }
 ClientErrorCode MetaClientImpl::FinishWrite(const std::string &trace_id,
                                             const std::string &write_session_id,
@@ -232,7 +234,7 @@ MetaClientImpl::GetHostCacheState(const std::string &trace_id,
     const std::string &instance_id = CHECK_INSTANCE_STUB_WITH_TYPE();
     return stub_->GetHostCacheState(trace_id, instance_id, query_type, keys, medium, p2p_host_count);
 }
-std::string MetaClientImpl::GetCallerNode() const { return caller_node_.node_id; }
+std::string MetaClientImpl::GetCallerNode() const { return CurrentCallerNode().node_id; }
 
 ClientErrorCode MetaClientImpl::IsValid(const std::unique_ptr<ClientConfig> &client_config) const {
     if (client_config == nullptr) {
@@ -289,18 +291,21 @@ ClientErrorCode MetaClientImpl::Connect(const std::string &address) {
 }
 
 void MetaClientImpl::InitCallerNodeProvider(const std::string &storage_config) {
+    const auto refresh_interval = std::chrono::seconds(
+        client_config_ ? client_config_->caller_node_refresh_seconds() : 30);
     std::vector<std::shared_ptr<StorageConfig>> parsed_storage_configs;
     if (Jsonizable::FromJsonString(storage_config, parsed_storage_configs)) {
-        caller_node_provider_ = CallerNodeProviderFactory::Create(parsed_storage_configs);
+        caller_node_provider_ = CallerNodeProviderFactory::Create(parsed_storage_configs, refresh_interval);
     } else {
         KVCM_LOG_WARN("parse storage_config json failed, falling back to noop caller_node_provider: [%s]",
                       storage_config.c_str());
         caller_node_provider_ = std::make_unique<NoopCallerNodeProvider>();
     }
-    caller_node_ = caller_node_provider_->GetCallerNode();
-    KVCM_LOG_INFO("resolved caller_node node_id [%s] supernode_id [%s]",
-                  caller_node_.node_id.empty() ? "(empty)" : caller_node_.node_id.c_str(),
-                  caller_node_.supernode_id.empty() ? "(empty)" : caller_node_.supernode_id.c_str());
+}
+
+CallerNode MetaClientImpl::CurrentCallerNode() const {
+    std::shared_lock read_guard(config_mutex_);
+    return caller_node_provider_ ? caller_node_provider_->GetCallerNode() : CallerNode{};
 }
 
 const std::string &MetaClientImpl::GetInstanceId() const {

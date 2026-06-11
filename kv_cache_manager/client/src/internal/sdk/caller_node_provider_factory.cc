@@ -9,7 +9,11 @@
 namespace kv_cache_manager {
 
 std::unique_ptr<CallerNodeProvider>
-CallerNodeProviderFactory::Create(const std::vector<std::shared_ptr<StorageConfig>> &storage_configs) {
+CallerNodeProviderFactory::Create(const std::vector<std::shared_ptr<StorageConfig>> &storage_configs,
+                                  std::chrono::seconds refresh_interval) {
+    if (refresh_interval.count() <= 0) {
+        refresh_interval = std::chrono::seconds(30);
+    }
     for (const auto &storage_config : storage_configs) {
         if (!storage_config) {
             continue;
@@ -18,7 +22,7 @@ CallerNodeProviderFactory::Create(const std::vector<std::shared_ptr<StorageConfi
         switch (type) {
 #ifdef ENABLE_TAIR_MEMPOOL
         case DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL: {
-            auto provider = std::make_unique<TairMempoolCallerNodeProvider>();
+            auto provider = std::make_unique<TairMempoolCallerNodeProvider>(refresh_interval);
             if (provider->Init(storage_config) == ER_OK) {
                 KVCM_LOG_INFO("caller_node_provider: using TairMempoolCallerNodeProvider for storage [%s]",
                               storage_config->global_unique_name().c_str());
