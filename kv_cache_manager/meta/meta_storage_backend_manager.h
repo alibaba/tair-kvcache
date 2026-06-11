@@ -12,13 +12,11 @@
 #include "kv_cache_manager/meta/meta_cache_base_backend.h"
 #include "kv_cache_manager/meta/meta_storage_backend.h"
 #include "kv_cache_manager/meta/types.h"
-#include "kv_cache_manager/metrics/revisit_interval_histogram.h"
 
 namespace kv_cache_manager {
 
 class MetaStorageBackendConfig;
 class RequestContext;
-class RevisitIntervalHistogram;
 
 // Backend orchestrator with two modes (auto-selected at Init):
 //   * Dual-backend: persistent (source-of-truth) + cache (hot cache).

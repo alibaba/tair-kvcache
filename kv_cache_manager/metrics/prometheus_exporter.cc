@@ -136,7 +136,7 @@ std::string PrometheusExporter::Expose(MetricsRegistry &registry, const std::str
     std::ostringstream ss;
 
     std::string prev_name;
-    std::string prev_histogram_family;
+    std::string emitted_histogram_family; // tracks which histogram family already has its TYPE header
     bool family_header_written = false;
     for (const auto &[name, tags, val] : all_metrics) {
         if (val == nullptr || !val->touched.load(std::memory_order_relaxed)) {
@@ -155,15 +155,16 @@ std::string PrometheusExporter::Expose(MetricsRegistry &registry, const std::str
         }
 
         if (!family_header_written) {
-            const char *type_str = "untyped";
             if (is_histogram) {
-                type_str = "histogram";
-                // For histogram, use family name in TYPE declaration
-                std::string family_prom_name = SanitizeName(prefix, histogram_family);
-                ss << "# HELP " << family_prom_name << ' ' << histogram_family << '\n';
-                ss << "# TYPE " << family_prom_name << ' ' << type_str << '\n';
-                prev_histogram_family = histogram_family;
+                // Only emit TYPE header once per histogram family
+                if (histogram_family != emitted_histogram_family) {
+                    std::string family_prom_name = SanitizeName(prefix, histogram_family);
+                    ss << "# HELP " << family_prom_name << ' ' << histogram_family << '\n';
+                    ss << "# TYPE " << family_prom_name << " histogram\n";
+                    emitted_histogram_family = histogram_family;
+                }
             } else {
+                const char *type_str = "untyped";
                 if (std::holds_alternative<CounterValue>(val->value)) {
                     type_str = "counter";
                 } else if (std::holds_alternative<GaugeValue>(val->value)) {
@@ -179,7 +180,15 @@ std::string PrometheusExporter::Expose(MetricsRegistry &registry, const std::str
         WriteLabels(ss, tags);
 
         if (std::holds_alternative<CounterValue>(val->value)) {
-            ss << ' ' << std::get<CounterValue>(val->value).load(std::memory_order_relaxed);
+            uint64_t raw = std::get<CounterValue>(val->value).load(std::memory_order_relaxed);
+            // _sum stores microseconds internally; convert to seconds for Prometheus output
+            if (is_histogram && name.size() > 4 && name.substr(name.size() - 4) == "_sum") {
+                // Output as floating point seconds with microsecond precision
+                double seconds = static_cast<double>(raw) / 1e6;
+                ss << ' ' << seconds;
+            } else {
+                ss << ' ' << raw;
+            }
         } else if (std::holds_alternative<GaugeValue>(val->value)) {
             double gv = std::get<GaugeValue>(val->value).load(std::memory_order_relaxed);
             if (std::isnan(gv)) {

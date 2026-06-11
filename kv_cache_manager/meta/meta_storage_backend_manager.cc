@@ -11,7 +11,6 @@
 #include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/meta/common.h"
-#include "kv_cache_manager/meta/meta_local_backend.h"
 #include "kv_cache_manager/meta/meta_storage_backend_factory.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
 
@@ -759,10 +758,7 @@ int64_t MetaStorageBackendManager::GetOldestAccessTime() const noexcept {
 
 void MetaStorageBackendManager::SetRevisitHistogram(std::shared_ptr<RevisitIntervalHistogram> histogram) {
     if (cache_backend_) {
-        auto *local_backend = dynamic_cast<MetaLocalBackend *>(cache_backend_.get());
-        if (local_backend) {
-            local_backend->SetRevisitHistogram(histogram);
-        }
+        cache_backend_->SetRevisitHistogram(histogram);
     }
 }
 

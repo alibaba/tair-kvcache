@@ -60,9 +60,9 @@ void RevisitIntervalHistogram::Observe(int64_t interval_us) {
     // Always increment +Inf bucket
     bucket_counters_[boundaries_.size()]++;
 
-    // Increment sum (in milliseconds) and count
-    uint64_t interval_ms = static_cast<uint64_t>(interval_us / 1000);
-    sum_counter_ += interval_ms;
+    // Increment sum (stored in microseconds to preserve precision as uint64)
+    // PrometheusExporter will convert to seconds on output
+    sum_counter_ += static_cast<uint64_t>(interval_us);
     count_counter_++;
 }
 

@@ -286,7 +286,7 @@ TEST_F(PrometheusExporterTest, HistogramBasicOutput) {
     c1 += 2;
     c5 += 5;
     cinf += 5;
-    csum += 15000; // 15 seconds in milliseconds
+    csum += 15000000; // 15 seconds stored in microseconds
     ccount += 5;
 
     std::string output = PrometheusExporter::Expose(*registry_);
@@ -307,8 +307,8 @@ TEST_F(PrometheusExporterTest, HistogramBasicOutput) {
         << "Actual output:\n"
         << output;
 
-    // Should have sum and count
-    EXPECT_NE(output.find("kvcm_revisit_interval_seconds_sum{instance_id=\"test\"} 15000"), std::string::npos)
+    // Should have sum (converted from microseconds to seconds) and count
+    EXPECT_NE(output.find("kvcm_revisit_interval_seconds_sum{instance_id=\"test\"} 15"), std::string::npos)
         << "Actual output:\n"
         << output;
     EXPECT_NE(output.find("kvcm_revisit_interval_seconds_count{instance_id=\"test\"} 5"), std::string::npos)

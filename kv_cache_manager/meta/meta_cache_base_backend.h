@@ -4,6 +4,8 @@
 
 namespace kv_cache_manager {
 
+class RevisitIntervalHistogram;
+
 // Intermediate base class for cache-type backends (e.g. MetaLocalBackend).
 // Extends MetaStorageBackend with conditional write operations that accept
 // previous_error_codes, allowing callers to skip keys that already failed
@@ -20,6 +22,9 @@ public:
 
     virtual size_t GetMemUsage() const noexcept = 0;
     virtual int64_t GetOldestAccessTime() const noexcept = 0;
+
+    // Set histogram for revisit interval tracking (optional, default no-op).
+    virtual void SetRevisitHistogram(std::shared_ptr<RevisitIntervalHistogram> /*histogram*/) {}
 
     // 写入 locations + properties，仅当 key 在 cache 中不存在时才写入。
     // 若 key 已存在，返回 EC_OK 且不修改已有数据（幂等）。

@@ -10,12 +10,11 @@
 
 namespace kv_cache_manager {
 
-namespace {
-
-// Parse comma-separated bucket boundaries string into a sorted vector of doubles.
-// Returns empty vector if parsing fails or validation fails.
-std::vector<double> ParseRevisitIntervalBuckets(const std::string &buckets_str) {
+std::vector<double> ServerConfig::ParseRevisitIntervalBuckets(const std::string &buckets_str) {
     std::vector<double> boundaries;
+    if (buckets_str.empty()) {
+        return boundaries;
+    }
     std::istringstream iss(buckets_str);
     std::string token;
 
@@ -47,8 +46,6 @@ std::vector<double> ParseRevisitIntervalBuckets(const std::string &buckets_str) 
 
     return boundaries;
 }
-
-} // namespace
 
 // clang-format off
 std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSettingsMap = {

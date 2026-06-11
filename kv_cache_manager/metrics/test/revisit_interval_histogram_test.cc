@@ -150,11 +150,11 @@ TEST_F(RevisitIntervalHistogramTest, SumCalculation) {
     std::vector<double> boundaries = {1.0, 5.0, 10.0};
     ASSERT_TRUE(hist.Init(registry_, boundaries, "test_instance"));
 
-    hist.Observe(1000000); // 1s = 1000ms
-    hist.Observe(2500000); // 2.5s = 2500ms
-    hist.Observe(100000);  // 0.1s = 100ms
+    hist.Observe(1000000); // 1s = 1,000,000 us
+    hist.Observe(2500000); // 2.5s = 2,500,000 us
+    hist.Observe(100000);  // 0.1s = 100,000 us
 
-    EXPECT_EQ(hist.GetSum(), 3600); // 1000 + 2500 + 100
+    EXPECT_EQ(hist.GetSum(), 3600000); // sum stored in microseconds
 }
 
 // 测试 Per-instance 隔离
@@ -207,7 +207,7 @@ TEST_F(RevisitIntervalHistogramTest, ManyObservations) {
     }
 
     EXPECT_EQ(hist.GetCount(), 1000);
-    EXPECT_EQ(hist.GetSum(), 3000000); // 1000 * 3000ms
+    EXPECT_EQ(hist.GetSum(), 3000000000); // 1000 * 3,000,000 us
 
     auto counts = hist.GetBucketCounts();
     EXPECT_EQ(counts[0], 0);    // <= 1.0

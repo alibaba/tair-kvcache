@@ -4,6 +4,7 @@
 #include <functional>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace kv_cache_manager {
 
@@ -46,6 +47,10 @@ public:
     const std::string &GetAdvertisedHost() const { return advertised_host_; }
     const std::string &GetCustomInfo() const { return custom_info_; }
     const std::string &GetRevisitIntervalBuckets() const { return revisit_interval_buckets_; }
+
+    // Parse revisit_interval_buckets config string into sorted vector of doubles.
+    // Returns default boundaries if config is empty or invalid.
+    static std::vector<double> ParseRevisitIntervalBuckets(const std::string &buckets_str);
 
 private:
     void UpdateDefaultConfig();

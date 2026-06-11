@@ -13,8 +13,11 @@ namespace kv_cache_manager {
 //
 // Each histogram instance maintains N+2 counters:
 //   - N bucket counters (cumulative: bucket[i] counts observations <= boundary[i])
-//   - 1 sum counter (total of all observed values, in milliseconds)
+//   - 1 sum counter (total of all observed values, in microseconds)
 //   - 1 count counter (total number of observations)
+//
+// The sum is stored in microseconds for uint64 precision. PrometheusExporter
+// converts to seconds on output by dividing by 1e6.
 //
 // All counters are registered with an instance_id tag for per-instance isolation.
 // Observe() uses only atomic increments (~10ns per call), no locks or allocations.

@@ -73,8 +73,8 @@ public:
     MetaLocalBackend() = default;
     ~MetaLocalBackend() = default;
 
-    // Set histogram for revisit interval tracking (optional, can be nullptr).
-    void SetRevisitHistogram(std::shared_ptr<RevisitIntervalHistogram> histogram) {
+    // Set histogram for revisit interval tracking (overrides base class no-op).
+    void SetRevisitHistogram(std::shared_ptr<RevisitIntervalHistogram> histogram) override {
         revisit_histogram_ = std::move(histogram);
     }
 
