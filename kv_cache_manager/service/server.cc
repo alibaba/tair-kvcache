@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <grpcpp/grpcpp.h>
+#include <sstream>
 
 #include "kv_cache_manager/common/build_version.h"
 #include "kv_cache_manager/common/loop_thread.h"
@@ -32,6 +33,50 @@
 
 namespace kv_cache_manager {
 
+namespace {
+
+// Parse comma-separated bucket boundaries string into a vector of doubles.
+// Returns empty vector if parsing fails or validation fails.
+std::vector<double> ParseRevisitIntervalBuckets(const std::string &buckets_str) {
+    if (buckets_str.empty()) {
+        return {};
+    }
+
+    std::vector<double> boundaries;
+    std::istringstream iss(buckets_str);
+    std::string token;
+
+    while (std::getline(iss, token, ',')) {
+        // Trim whitespace
+        size_t start = token.find_first_not_of(" \t");
+        size_t end = token.find_last_not_of(" \t");
+        if (start == std::string::npos) {
+            continue;
+        }
+        token = token.substr(start, end - start + 1);
+
+        try {
+            double val = std::stod(token);
+            if (val <= 0.0) {
+                KVCM_LOG_ERROR("Revisit interval bucket boundary must be positive: %s", token.c_str());
+                return {};
+            }
+            if (!boundaries.empty() && val <= boundaries.back()) {
+                KVCM_LOG_ERROR("Revisit interval bucket boundaries must be strictly ascending");
+                return {};
+            }
+            boundaries.push_back(val);
+        } catch (const std::exception &e) {
+            KVCM_LOG_ERROR("Failed to parse revisit interval bucket boundary '%s': %s", token.c_str(), e.what());
+            return {};
+        }
+    }
+
+    return boundaries;
+}
+
+} // namespace
+
 bool Server::Init(const ServerConfig &config) {
     KVCM_LOG_INFO("begin server init...\n");
 
@@ -59,6 +104,12 @@ bool Server::Init(const ServerConfig &config) {
                          config_.GetCacheReclaimerIdleIntervalMs(),
                          config_.GetCacheReclaimerWorkerSize());
     cache_manager_->PauseReclaimer(); // Resume after DoRecover
+
+    // Set revisit interval histogram configuration
+    auto boundaries = ParseRevisitIntervalBuckets(config_.GetRevisitIntervalBuckets());
+    if (!boundaries.empty()) {
+        cache_manager_->SetRevisitHistogramConfig(boundaries);
+    }
 
     CreateMetricsReporter();
     CreateAndRegisterEventPublisher();

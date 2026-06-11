@@ -2,12 +2,53 @@
 
 #include <algorithm>
 #include <fstream>
+#include <sstream>
 #include <stdio.h>
 
 #include "kv_cache_manager/common/env_util.h"
 #include "kv_cache_manager/common/string_util.h"
 
 namespace kv_cache_manager {
+
+namespace {
+
+// Parse comma-separated bucket boundaries string into a sorted vector of doubles.
+// Returns empty vector if parsing fails or validation fails.
+std::vector<double> ParseRevisitIntervalBuckets(const std::string &buckets_str) {
+    std::vector<double> boundaries;
+    std::istringstream iss(buckets_str);
+    std::string token;
+
+    while (std::getline(iss, token, ',')) {
+        StringUtil::Trim(token);
+        if (token.empty()) {
+            continue;
+        }
+        try {
+            double val = std::stod(token);
+            if (val <= 0.0) {
+                fprintf(stderr, "Bucket boundary must be positive: %s\n", token.c_str());
+                return {};
+            }
+            boundaries.push_back(val);
+        } catch (const std::exception &e) {
+            fprintf(stderr, "Failed to parse bucket boundary: %s\n", token.c_str());
+            return {};
+        }
+    }
+
+    // Check ascending order
+    for (size_t i = 1; i < boundaries.size(); ++i) {
+        if (boundaries[i] <= boundaries[i - 1]) {
+            fprintf(stderr, "Bucket boundaries must be in strictly ascending order\n");
+            return {};
+        }
+    }
+
+    return boundaries;
+}
+
+} // namespace
 
 // clang-format off
 std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSettingsMap = {
@@ -153,6 +194,11 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
      [](const std::string &value, ServerConfig *config) {
          config->prometheus_prefix_ = value;
          return true;
+     }},
+    {"kvcm.metrics.revisit_interval_buckets",
+     [](const std::string &value, ServerConfig *config) {
+         config->revisit_interval_buckets_ = value;
+         return true;
      }}};
 // clang-format on
 
@@ -284,6 +330,16 @@ bool ServerConfig::Check() {
         fprintf(stderr, "registry_storage_uri must be set\n");
         return false;
     }
+
+    // Validate revisit_interval_buckets if set
+    if (!revisit_interval_buckets_.empty()) {
+        auto boundaries = ParseRevisitIntervalBuckets(revisit_interval_buckets_);
+        if (boundaries.empty()) {
+            fprintf(stderr, "Invalid revisit_interval_buckets: must be positive numbers in ascending order\n");
+            return false;
+        }
+    }
+
     return true;
 }
 

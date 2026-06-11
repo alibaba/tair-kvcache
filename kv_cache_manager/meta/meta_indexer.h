@@ -17,6 +17,7 @@
 #include "kv_cache_manager/meta/meta_storage_backend_manager.h"
 #include "kv_cache_manager/meta/storage_usage_data.h"
 #include "kv_cache_manager/meta/types.h"
+#include "kv_cache_manager/metrics/revisit_interval_histogram.h"
 
 namespace kv_cache_manager {
 
@@ -55,6 +56,9 @@ public:
     ~MetaIndexer();
 
     ErrorCode Init(const std::string &instance_id, const std::shared_ptr<MetaIndexerConfig> &config) noexcept;
+
+    // Set revisit interval histogram for tracking cache access patterns.
+    void SetRevisitHistogram(std::shared_ptr<RevisitIntervalHistogram> histogram);
 
     // ---------- WRITE ----------
     Result Put(RequestContext *request_context,
@@ -153,9 +157,9 @@ private:
         int64_t async_enqueue_time_us = 0;
         int64_t cache_backend_upsert_time_us = 0;
         int64_t cache_backend_delete_time_us = 0;
-        int64_t put_key_count = 0;     // brand-new keys created by upsert
-        int64_t update_key_count = 0;  // existing keys updated by upsert
-        int64_t delete_key_count = 0;  // keys deleted by whole-key delete
+        int64_t put_key_count = 0;    // brand-new keys created by upsert
+        int64_t update_key_count = 0; // existing keys updated by upsert
+        int64_t delete_key_count = 0; // keys deleted by whole-key delete
     };
     // Returns {error_count, put_success_count}.
     std::pair<int32_t, int32_t> ExecuteRmwUpsert(const std::string &trace_id,

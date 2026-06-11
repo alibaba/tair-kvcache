@@ -45,6 +45,7 @@ public:
     const std::string &event_publishers_configs() { return event_publishers_configs_; }
     const std::string &GetAdvertisedHost() const { return advertised_host_; }
     const std::string &GetCustomInfo() const { return custom_info_; }
+    const std::string &GetRevisitIntervalBuckets() const { return revisit_interval_buckets_; }
 
 private:
     void UpdateDefaultConfig();
@@ -80,6 +81,7 @@ private:
     std::string event_publishers_configs_;
     std::string advertised_host_;
     std::string custom_info_;
+    std::string revisit_interval_buckets_;
 
 private:
     using SettingFunction = std::function<bool(const std::string &, ServerConfig *config)>;

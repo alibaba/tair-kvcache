@@ -11,6 +11,7 @@
 #include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/meta/common.h"
+#include "kv_cache_manager/meta/meta_local_backend.h"
 #include "kv_cache_manager/meta/meta_storage_backend_factory.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
 
@@ -304,8 +305,8 @@ std::vector<ErrorCode> MetaStorageBackendManager::Put(RequestContext *request_co
     auto results = cache_backend_->Put(request_context, keys, locations, properties, persistent_results);
     if (request_context) {
         auto *mc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
-        KVCM_METRICS_COLLECTOR_SET_METRICS(mc, meta_indexer, cache_backend_put_time_us,
-                                           TimestampUtil::GetCurrentTimeUs() - cache_begin);
+        KVCM_METRICS_COLLECTOR_SET_METRICS(
+            mc, meta_indexer, cache_backend_put_time_us, TimestampUtil::GetCurrentTimeUs() - cache_begin);
     }
     return results;
 }
@@ -331,8 +332,8 @@ std::vector<ErrorCode> MetaStorageBackendManager::Upsert(RequestContext *request
     auto results = cache_backend_->Upsert(request_context, keys, locations, properties, persistent_results);
     if (request_context) {
         auto *mc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
-        KVCM_METRICS_COLLECTOR_SET_METRICS(mc, meta_indexer, cache_backend_upsert_time_us,
-                                           TimestampUtil::GetCurrentTimeUs() - cache_begin);
+        KVCM_METRICS_COLLECTOR_SET_METRICS(
+            mc, meta_indexer, cache_backend_upsert_time_us, TimestampUtil::GetCurrentTimeUs() - cache_begin);
     }
     return results;
 }
@@ -354,8 +355,8 @@ std::vector<ErrorCode> MetaStorageBackendManager::Delete(RequestContext *request
     auto results = cache_backend_->Delete(request_context, keys, persistent_results);
     if (request_context) {
         auto *mc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
-        KVCM_METRICS_COLLECTOR_SET_METRICS(mc, meta_indexer, cache_backend_delete_time_us,
-                                           TimestampUtil::GetCurrentTimeUs() - cache_begin);
+        KVCM_METRICS_COLLECTOR_SET_METRICS(
+            mc, meta_indexer, cache_backend_delete_time_us, TimestampUtil::GetCurrentTimeUs() - cache_begin);
     }
     return results;
 }
@@ -387,8 +388,8 @@ std::vector<ErrorCode> MetaStorageBackendManager::Delete(RequestContext *request
         results = cache_backend_->DeleteLocations(request_context, keys, location_ids, persistent_results);
         if (request_context) {
             auto *mc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
-            KVCM_METRICS_COLLECTOR_SET_METRICS(mc, meta_indexer, cache_backend_delete_time_us,
-                                               TimestampUtil::GetCurrentTimeUs() - cache_begin);
+            KVCM_METRICS_COLLECTOR_SET_METRICS(
+                mc, meta_indexer, cache_backend_delete_time_us, TimestampUtil::GetCurrentTimeUs() - cache_begin);
         }
     }
 
@@ -754,6 +755,15 @@ int64_t MetaStorageBackendManager::GetOldestAccessTime() const noexcept {
         return cache_backend_->GetOldestAccessTime();
     }
     return INT64_MAX;
+}
+
+void MetaStorageBackendManager::SetRevisitHistogram(std::shared_ptr<RevisitIntervalHistogram> histogram) {
+    if (cache_backend_) {
+        auto *local_backend = dynamic_cast<MetaLocalBackend *>(cache_backend_.get());
+        if (local_backend) {
+            local_backend->SetRevisitHistogram(histogram);
+        }
+    }
 }
 
 } // namespace kv_cache_manager

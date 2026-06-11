@@ -217,9 +217,7 @@ MetaLocalBackend::UpsertForOneKey(KeyType key, const CacheLocationMap &locations
     return EC_OK;
 }
 
-ErrorCode MetaLocalBackend::DeleteForOneKey(KeyType key) {
-    return cache_->Erase(KeyToView(key)) ? EC_OK : EC_NOENT;
-}
+ErrorCode MetaLocalBackend::DeleteForOneKey(KeyType key) { return cache_->Erase(KeyToView(key)) ? EC_OK : EC_NOENT; }
 
 ErrorCode MetaLocalBackend::DeleteLocationsForOneKey(KeyType key, const std::vector<LocationId> &location_ids) {
     std::string_view key_sv = KeyToView(key);
@@ -394,6 +392,14 @@ ErrorCode MetaLocalBackend::GetForOneKey(KeyType key,
     }
     auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
     int64_t stored_time = item->GetLastAccessTime();
+
+    // Record revisit interval before updating access time
+    if (revisit_histogram_ && stored_time > 0) {
+        int64_t now = TimestampUtil::GetCurrentTimeUs();
+        int64_t interval_us = now - stored_time;
+        revisit_histogram_->Observe(interval_us);
+    }
+
     item->TouchAccessTime();
     {
         std::shared_lock lock(item->GetMutex());

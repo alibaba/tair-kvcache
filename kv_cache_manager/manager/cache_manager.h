@@ -175,6 +175,10 @@ public:
     std::shared_ptr<EventManager> event_manager() { return event_manager_; }
     std::shared_ptr<CacheManagerMetricsRecorder> metrics_recorder() { return metrics_recorder_; }
 
+    // Set revisit interval histogram configuration for per-instance tracking.
+    // Must be called before any MetaIndexer is created.
+    void SetRevisitHistogramConfig(const std::vector<double> &boundaries);
+
 private:
     ErrorCode FilterWriteCache(RequestContext *request_context,
                                const std::string &instance_id,

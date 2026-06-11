@@ -93,6 +93,27 @@ void WriteLabels(std::ostringstream &ss, const MetricsTags &tags) {
 
 } // namespace
 
+namespace {
+
+// Extract histogram family name from metric name.
+// Returns empty string if not a histogram metric.
+// Histogram metrics follow naming convention:
+//   <family>_bucket, <family>_sum, <family>_count
+std::string ExtractHistogramFamilyName(const std::string &name) {
+    if (name.size() > 7 && name.substr(name.size() - 7) == "_bucket") {
+        return name.substr(0, name.size() - 7);
+    }
+    if (name.size() > 4 && name.substr(name.size() - 4) == "_sum") {
+        return name.substr(0, name.size() - 4);
+    }
+    if (name.size() > 6 && name.substr(name.size() - 6) == "_count") {
+        return name.substr(0, name.size() - 6);
+    }
+    return "";
+}
+
+} // namespace
+
 std::string PrometheusExporter::Expose(MetricsRegistry &registry, const std::string &prefix) {
     std::vector<MetricsRegistry::metrics_tuple_t> all_metrics;
     registry.GetAllMetrics(all_metrics);
@@ -115,6 +136,7 @@ std::string PrometheusExporter::Expose(MetricsRegistry &registry, const std::str
     std::ostringstream ss;
 
     std::string prev_name;
+    std::string prev_histogram_family;
     bool family_header_written = false;
     for (const auto &[name, tags, val] : all_metrics) {
         if (val == nullptr || !val->touched.load(std::memory_order_relaxed)) {
@@ -123,6 +145,10 @@ std::string PrometheusExporter::Expose(MetricsRegistry &registry, const std::str
 
         std::string prom_name = SanitizeName(prefix, name);
 
+        // Check if this is a histogram metric
+        std::string histogram_family = ExtractHistogramFamilyName(name);
+        bool is_histogram = !histogram_family.empty();
+
         if (name != prev_name) {
             family_header_written = false;
             prev_name = name;
@@ -130,13 +156,22 @@ std::string PrometheusExporter::Expose(MetricsRegistry &registry, const std::str
 
         if (!family_header_written) {
             const char *type_str = "untyped";
-            if (std::holds_alternative<CounterValue>(val->value)) {
-                type_str = "counter";
-            } else if (std::holds_alternative<GaugeValue>(val->value)) {
-                type_str = "gauge";
+            if (is_histogram) {
+                type_str = "histogram";
+                // For histogram, use family name in TYPE declaration
+                std::string family_prom_name = SanitizeName(prefix, histogram_family);
+                ss << "# HELP " << family_prom_name << ' ' << histogram_family << '\n';
+                ss << "# TYPE " << family_prom_name << ' ' << type_str << '\n';
+                prev_histogram_family = histogram_family;
+            } else {
+                if (std::holds_alternative<CounterValue>(val->value)) {
+                    type_str = "counter";
+                } else if (std::holds_alternative<GaugeValue>(val->value)) {
+                    type_str = "gauge";
+                }
+                ss << "# HELP " << prom_name << ' ' << name << '\n';
+                ss << "# TYPE " << prom_name << ' ' << type_str << '\n';
             }
-            ss << "# HELP " << prom_name << ' ' << name << '\n';
-            ss << "# TYPE " << prom_name << ' ' << type_str << '\n';
             family_header_written = true;
         }
 

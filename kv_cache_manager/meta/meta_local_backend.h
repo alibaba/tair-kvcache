@@ -18,6 +18,7 @@
 #include "kv_cache_manager/config/meta_cache_policy_config.h"
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_cache_base_backend.h"
+#include "kv_cache_manager/metrics/revisit_interval_histogram.h"
 
 namespace kv_cache_manager {
 
@@ -71,6 +72,11 @@ class MetaLocalBackend : public MetaCacheBaseBackend {
 public:
     MetaLocalBackend() = default;
     ~MetaLocalBackend() = default;
+
+    // Set histogram for revisit interval tracking (optional, can be nullptr).
+    void SetRevisitHistogram(std::shared_ptr<RevisitIntervalHistogram> histogram) {
+        revisit_histogram_ = std::move(histogram);
+    }
 
     std::string GetStorageType() noexcept override;
 
@@ -178,11 +184,9 @@ private:
     size_t CollectOldestKeysFromShard(uint32_t shard_id, size_t count, std::vector<KeyType> &out_keys);
     ErrorCode
     CreateAndInsert(std::string_view key_sv, const CacheLocationMap &locations, const PropertyMap &properties);
-    ErrorCode CreateAndInsertIfAbsent(std::string_view key_sv,
-                                      const CacheLocationMap &locations,
-                                      const PropertyMap &properties);
     ErrorCode
-    UpdateInPlace(std::string_view key_sv, const CacheLocationMap &locations, const PropertyMap &properties);
+    CreateAndInsertIfAbsent(std::string_view key_sv, const CacheLocationMap &locations, const PropertyMap &properties);
+    ErrorCode UpdateInPlace(std::string_view key_sv, const CacheLocationMap &locations, const PropertyMap &properties);
     ErrorCode UpsertForOneKey(KeyType key, const CacheLocationMap &locations, const PropertyMap &properties);
     ErrorCode DeleteForOneKey(KeyType key);
     ErrorCode DeleteLocationsForOneKey(KeyType key, const std::vector<LocationId> &location_ids);
@@ -204,6 +208,7 @@ private:
     std::unique_ptr<std::atomic<int64_t>[]> shard_oldest_access_time_;
     uint32_t shard_mask_ = 0;
     size_t sample_times_ = 0;
+    std::shared_ptr<RevisitIntervalHistogram> revisit_histogram_;
 };
 
 } // namespace kv_cache_manager
