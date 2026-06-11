@@ -6,6 +6,7 @@
 
 ### 开发文档
 - [开发指南](develop/README.md) - 开发者入门指南和开发环境配置
+- [Commit 要求](develop/commit_requirements.md) - 提交前检查和 commit message 格式约定
 - [构建版本信息](develop/version_stamping.md) - Version Stamping 机制原理与使用方式
 - [API 文档](api/) - API 接口说明和使用示例
 

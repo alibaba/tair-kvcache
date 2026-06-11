@@ -1,6 +1,7 @@
 # AGENTS.md
 
 项目文档见 [docs/README.md](docs/README.md)。
+提交前检查和 commit message 格式见 [docs/develop/commit_requirements.md](docs/develop/commit_requirements.md)。
 
 ## 约束
 
