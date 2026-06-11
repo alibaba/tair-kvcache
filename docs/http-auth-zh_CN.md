@@ -54,6 +54,40 @@ admin/debug HTTP auth disabled (kvcm.service.admin_auth_token not set);
 do not expose admin/debug ports on untrusted networks
 ```
 
+## 鉴权豁免路由
+
+即使启用了 Bearer 鉴权，Admin 服务上仍有一小组**固定**路由不参与鉴权。
+这些路由在缺少 `Authorization` 头的情况下也能访问，目的是让目前尚不能
+携带 Bearer Token 的旧版健康检查器与 Prometheus 抓取任务继续工作：
+
+| 路由 | 用途 |
+|---|---|
+| `GET  /api/healthy` | 轻量级存活探针 |
+| `POST /api/checkHealth` | 完整健康检查 RPC |
+| `POST /api/getManagerClusterInfo` | leader / follower 拓扑 |
+| `POST /api/getMetrics` | 指标 RPC（JSON） |
+| `GET  /metrics` | Prometheus 抓取端点 |
+
+启用鉴权时，服务端会以 `WARN` 级别记录豁免列表，提醒运维当前的攻击
+面：
+
+```
+admin HTTP auth-exempt routes (reachable without a Bearer token):
+/api/healthy, /api/checkHealth, /api/getManagerClusterInfo,
+/api/getMetrics, /metrics
+```
+
+安全提示 —— 上述端点会向任何能够访问 6492 端口的调用方暴露健康状态、
+集群的 leader / follower 端点，以及指标信息（其 label 可能包含
+instance id、模型名等内容）。请在网络层将 admin 端口限制给受信调用方
+（控制面、负载均衡器、Oncall 机器、Prometheus 服务器等）。该豁免
+被定位为**临时过渡方案**，等到健康检查器与抓取任务具备发送
+`Authorization` 头的能力后即可移除。
+
+豁免列表硬编码在 `Server::StartHttpServer` 中，不能通过
+`kvcm.service.admin_auth_token` 或其他配置项调整。豁免只作用于 Admin
+HTTP 服务；Debug 服务始终受 verifier 保护。
+
 ## 配置
 
 | 配置项 | 默认值 | 说明 |
@@ -197,8 +231,9 @@ curl -X POST \
 
 ## Prometheus 抓取
 
-`/metrics` 端点由 Admin HTTP 服务提供，因此在启用鉴权时也受同一套 Bearer
-认证保护。请在 Prometheus 抓取任务中配置 `authorization`：
+`/metrics` 端点由 Admin HTTP 服务提供，目前位于
+[鉴权豁免路由](#鉴权豁免路由)列表中，因此在豁免生效期间，抓取任务无需
+携带 Bearer Token：
 
 ```yaml
 scrape_configs:
@@ -206,6 +241,12 @@ scrape_configs:
     metrics_path: /metrics
     static_configs:
       - targets: ["<host>:6492"]
+```
+
+后续如果将 `/metrics` 从豁免列表中移除，抓取任务则需要补充
+`authorization` 配置，例如：
+
+```yaml
     authorization:
       type: Bearer
       credentials: s3cret-token

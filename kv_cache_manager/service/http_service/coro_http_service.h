@@ -6,6 +6,7 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "google/protobuf/message.h"
 #include "kv_cache_manager/service/http_service/auth/token_verifier.h"
@@ -36,6 +37,15 @@ public:
     // called before Start()
     void SetTokenVerifier(std::shared_ptr<TokenVerifier> verifier);
 
+    // exempt a specific path from Bearer auth even when a verifier is
+    // attached.  intended for endpoints that must remain reachable by
+    // tokenless callers (e.g. an external health checker that cannot
+    // attach an Authorization header).  exempt routes leak whatever
+    // information their handler returns to anyone reaching the port,
+    // so use sparingly and document each exemption.  must be called
+    // before Start()
+    void AddUnauthenticatedRoute(const std::string &api);
+
     static std::string GetHttpClientIp(const coro_http::coro_http_connection *http_conn);
 
 protected:
@@ -54,6 +64,7 @@ private:
     std::unordered_map<std::string, HandlerType> post_handlers_{};
     std::unique_ptr<coro_http::coro_http_server> server_{};
     std::shared_ptr<TokenVerifier> token_verifier_{};
+    std::unordered_set<std::string> unauthenticated_routes_{};
 };
 
 template <typename ServiceType, typename PbRequestMessage, typename PbResponseMessage>

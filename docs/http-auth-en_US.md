@@ -56,6 +56,44 @@ admin/debug HTTP auth disabled (kvcm.service.admin_auth_token not set);
 do not expose admin/debug ports on untrusted networks
 ```
 
+## Auth-exempt routes
+
+A small, fixed set of Admin routes is exempt from Bearer auth even
+when enforcement is enabled. These routes remain reachable without an
+`Authorization` header so that legacy health checkers and Prometheus
+scrapers (which today cannot attach a Bearer token) keep working.
+
+| Route | Purpose |
+|---|---|
+| `GET  /api/healthy` | lightweight liveness probe |
+| `POST /api/checkHealth` | full health-check RPC |
+| `POST /api/getManagerClusterInfo` | leader / follower topology |
+| `POST /api/getMetrics` | metrics RPC (JSON) |
+| `GET  /metrics` | Prometheus scrape endpoint |
+
+When enforcement is enabled, the server logs the exempt list at
+`WARN` so operators are reminded of the reduced surface:
+
+```
+admin HTTP auth-exempt routes (reachable without a Bearer token):
+/api/healthy, /api/checkHealth, /api/getManagerClusterInfo,
+/api/getMetrics, /metrics
+```
+
+Security caveat — these endpoints expose health status, the cluster's
+leader/follower endpoints, and metrics (which can include label values
+such as instance ids and model names) to anyone who can reach port
+6492. Firewall the admin port to trusted callers (control plane,
+load balancers, on-call hosts, Prometheus servers) at the network
+layer; the exemption is intended as a temporary bridge until the
+health checker and scraper learn to send the `Authorization` header,
+after which the exemption can be removed.
+
+The list is hard-coded in `Server::StartHttpServer` and is not
+configurable via `kvcm.service.admin_auth_token` or any other key.
+The exemption applies on the Admin HTTP service only; Debug routes
+are always gated by the verifier.
+
 ## Configuration
 
 | Key | Default | Description |
@@ -206,8 +244,9 @@ audit drift — compare the fingerprint sets across nodes.
 ## Prometheus Scraping
 
 The `/metrics` endpoint is served by the Admin HTTP service and is
-therefore subject to the same Bearer auth when enabled. Configure your
-Prometheus scrape job with `authorization`:
+currently in the [auth-exempt route list](#auth-exempt-routes), so
+scrape jobs do not need to send a Bearer token while the exemption
+is in place:
 
 ```yaml
 scrape_configs:
@@ -215,6 +254,12 @@ scrape_configs:
     metrics_path: /metrics
     static_configs:
       - targets: ["<host>:6492"]
+```
+
+Once the exemption for `/metrics` is removed, the scrape job will
+need an `authorization` stanza, e.g.:
+
+```yaml
     authorization:
       type: Bearer
       credentials: s3cret-token

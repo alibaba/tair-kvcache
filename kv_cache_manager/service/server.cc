@@ -243,8 +243,30 @@ bool Server::StartHttpServer() {
     admin_http_service_->SetTokenVerifier(verifier);
     debug_http_service_->SetTokenVerifier(verifier);
     admin_impl_->SetTokenVerifier(verifier);
+
+    // legacy health-check and Prometheus-scrape callers in the
+    // control plane cannot attach an Authorization header today, so a
+    // small fixed set of admin routes must remain reachable without a
+    // Bearer token even when auth is enforced.  these endpoints
+    // expose cluster topology, health status, and metrics to anyone
+    // who can reach the admin port; treat the exemption as a
+    // temporary bridge until those callers learn to send the header
+    static constexpr const char *kAdminUnauthenticatedRoutes[] = {
+        "/api/healthy",
+        "/api/checkHealth",
+        "/api/getManagerClusterInfo",
+        "/api/getMetrics",
+        "/metrics",
+    };
+    for (const auto *route : kAdminUnauthenticatedRoutes) {
+        admin_http_service_->AddUnauthenticatedRoute(route);
+    }
+
     if (!admin_tokens.empty()) {
         KVCM_LOG_INFO("admin/debug HTTP Bearer auth enabled, accepted_tokens=%zu", admin_tokens.size());
+        KVCM_LOG_WARN("admin HTTP auth-exempt routes (reachable without a Bearer token): "
+                      "/api/healthy, /api/checkHealth, /api/getManagerClusterInfo, "
+                      "/api/getMetrics, /metrics");
     } else {
         KVCM_LOG_WARN("admin/debug HTTP auth disabled (kvcm.service.admin_auth_token not set); "
                       "do not expose admin/debug ports on untrusted networks");
