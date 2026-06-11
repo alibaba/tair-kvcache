@@ -95,21 +95,26 @@ void WriteLabels(std::ostringstream &ss, const MetricsTags &tags) {
 
 namespace {
 
-// Extract histogram family name from metric name.
-// Returns empty string if not a histogram metric.
-// Histogram metrics follow naming convention:
-//   <family>_bucket, <family>_sum, <family>_count
-std::string ExtractHistogramFamilyName(const std::string &name) {
-    if (name.size() > 7 && name.substr(name.size() - 7) == "_bucket") {
-        return name.substr(0, name.size() - 7);
-    }
-    if (name.size() > 4 && name.substr(name.size() - 4) == "_sum") {
-        return name.substr(0, name.size() - 4);
-    }
-    if (name.size() > 6 && name.substr(name.size() - 6) == "_count") {
-        return name.substr(0, name.size() - 6);
+// Check if a metric name is a histogram _bucket metric.
+// Returns the family name (without _bucket suffix) if yes, empty string otherwise.
+// Only _bucket is used for identification because:
+// 1. It's unique to histograms (no regular counter ends with _bucket)
+// 2. Alphabetically _bucket < _count < _sum, so _bucket is always seen first
+std::string ExtractHistogramFamilyFromBucket(const std::string &name) {
+    static const std::string kBucketSuffix = "_bucket";
+    if (name.size() > kBucketSuffix.size() &&
+        name.compare(name.size() - kBucketSuffix.size(), kBucketSuffix.size(), kBucketSuffix) == 0) {
+        return name.substr(0, name.size() - kBucketSuffix.size());
     }
     return "";
+}
+
+// Check if a metric name belongs to a known histogram family (by _count or _sum suffix).
+// Returns true if the name ends with _count or _sum AND the family is in the known set.
+bool IsHistogramSubMetric(const std::string &name, const std::string &family) {
+    if (family.empty())
+        return false;
+    return (name == family + "_count" || name == family + "_sum");
 }
 
 } // namespace
@@ -136,7 +141,7 @@ std::string PrometheusExporter::Expose(MetricsRegistry &registry, const std::str
     std::ostringstream ss;
 
     std::string prev_name;
-    std::string emitted_histogram_family; // tracks which histogram family already has its TYPE header
+    std::string histogram_family; // set when we see a _bucket metric; used for _count/_sum
     bool family_header_written = false;
     for (const auto &[name, tags, val] : all_metrics) {
         if (val == nullptr || !val->touched.load(std::memory_order_relaxed)) {
@@ -145,9 +150,10 @@ std::string PrometheusExporter::Expose(MetricsRegistry &registry, const std::str
 
         std::string prom_name = SanitizeName(prefix, name);
 
-        // Check if this is a histogram metric
-        std::string histogram_family = ExtractHistogramFamilyName(name);
-        bool is_histogram = !histogram_family.empty();
+        // Detect histogram: _bucket sets the family; _count/_sum check against it
+        std::string bucket_family = ExtractHistogramFamilyFromBucket(name);
+        bool is_histogram_bucket = !bucket_family.empty();
+        bool is_histogram_sub = IsHistogramSubMetric(name, histogram_family);
 
         if (name != prev_name) {
             family_header_written = false;
@@ -155,15 +161,15 @@ std::string PrometheusExporter::Expose(MetricsRegistry &registry, const std::str
         }
 
         if (!family_header_written) {
-            if (is_histogram) {
-                // Only emit TYPE header once per histogram family
-                if (histogram_family != emitted_histogram_family) {
-                    std::string family_prom_name = SanitizeName(prefix, histogram_family);
-                    ss << "# HELP " << family_prom_name << ' ' << histogram_family << '\n';
-                    ss << "# TYPE " << family_prom_name << " histogram\n";
-                    emitted_histogram_family = histogram_family;
-                }
+            if (is_histogram_bucket) {
+                histogram_family = bucket_family;
+                std::string family_prom_name = SanitizeName(prefix, histogram_family);
+                ss << "# HELP " << family_prom_name << ' ' << histogram_family << '\n';
+                ss << "# TYPE " << family_prom_name << " histogram\n";
+            } else if (is_histogram_sub) {
+                // _count or _sum of known histogram family — no header needed
             } else {
+                histogram_family.clear();
                 const char *type_str = "untyped";
                 if (std::holds_alternative<CounterValue>(val->value)) {
                     type_str = "counter";
@@ -181,9 +187,7 @@ std::string PrometheusExporter::Expose(MetricsRegistry &registry, const std::str
 
         if (std::holds_alternative<CounterValue>(val->value)) {
             uint64_t raw = std::get<CounterValue>(val->value).load(std::memory_order_relaxed);
-            // _sum stores microseconds internally; convert to seconds for Prometheus output
-            if (is_histogram && name.size() > 4 && name.substr(name.size() - 4) == "_sum") {
-                // Output as floating point seconds with microsecond precision
+            if (is_histogram_sub && name.size() > 4 && name.compare(name.size() - 4, 4, "_sum") == 0) {
                 double seconds = static_cast<double>(raw) / 1e6;
                 ss << ' ' << seconds;
             } else {

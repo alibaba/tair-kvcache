@@ -77,8 +77,8 @@ TEST_F(RevisitIntervalHistogramTest, ObserveSingleValue) {
 
     // Count should be 1
     EXPECT_EQ(hist.GetCount(), 1);
-    // Sum should be 3000 milliseconds
-    EXPECT_EQ(hist.GetSum(), 3000);
+    // Sum should be 3,000,000 microseconds
+    EXPECT_EQ(hist.GetSum(), 3000000);
 
     // Bucket counts: [0, 1, 1, 1] for boundaries [1.0, 5.0, 10.0, +Inf]
     // 3 seconds <= 5.0, so buckets 5.0, 10.0, +Inf are incremented
