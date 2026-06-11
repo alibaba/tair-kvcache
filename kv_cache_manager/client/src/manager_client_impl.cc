@@ -1,7 +1,7 @@
 #include "kv_cache_manager/client/src/manager_client_impl.h"
 
+#include "kv_cache_manager/client/include/meta_client.h"
 #include "kv_cache_manager/client/src/internal/config/client_config.h"
-#include "kv_cache_manager/client/src/meta_client_impl.h"
 #include "kv_cache_manager/client/src/replication_executor.h"
 #include "kv_cache_manager/client/src/transfer_client_impl.h"
 #include "kv_cache_manager/common/logger.h"
@@ -29,7 +29,7 @@ ClientErrorCode ManagerClientImpl::Init(const std::string &client_config, InitPa
         return ER_INVALID_ROLETYPE;
     }
     if (init_params.role_type & RoleType::SCHEDULER) {
-        meta_client_ = MetaClientImpl::Create(client_config, init_params);
+        meta_client_ = MetaClient::Create(client_config, init_params);
         if (meta_client_ == nullptr) {
             KVCM_LOG_ERROR("init meta client failed");
             return ER_METACLIENT_INIT_ERROR;

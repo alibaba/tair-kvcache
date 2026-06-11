@@ -47,6 +47,7 @@ public:
                  const std::vector<int64_t> &, const BlockMask &),
                 (override));
     MOCK_METHOD(const std::string &, GetStorageConfig, (), (const, override));
+    MOCK_METHOD(std::string, GetCallerNode, (), (const, override));
     MOCK_METHOD(ClientErrorCode, Init, (const std::string &, const InitParams &), (override));
     MOCK_METHOD(void, Shutdown, (), (override));
 };

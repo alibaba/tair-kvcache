@@ -30,6 +30,7 @@ public:
     const LocationSpecGroups &location_spec_groups() const { return location_spec_groups_; }
     int32_t replication_workers() const { return replication_workers_; }
     bool auto_replicate() const { return auto_replicate_; }
+    int32_t caller_node_refresh_seconds() const { return caller_node_refresh_seconds_; }
 
 private:
     bool Check() const;
@@ -46,6 +47,7 @@ private:
     LocationSpecGroups location_spec_groups_;
     int32_t replication_workers_ = 2;
     bool auto_replicate_ = false;
+    int32_t caller_node_refresh_seconds_ = 30;
 };
 
 } // namespace kv_cache_manager
