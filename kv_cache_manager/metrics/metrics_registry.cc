@@ -370,4 +370,28 @@ Gauge MetricsRegistry::GetGauge(const std::string &name, const MetricsTags &tags
     return metrics_data->GetOrCreateGauge(tags);
 }
 
+void MetricsRegistry::RegisterHistogramFamily(const std::string &family_name) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    histogram_families_.insert(family_name);
+}
+
+void MetricsRegistry::MapMetricToFamily(const std::string &metric_name, const std::string &family_name) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    metric_to_family_.emplace(metric_name, family_name);
+}
+
+std::string MetricsRegistry::GetMetricFamily(const std::string &metric_name) const {
+    std::lock_guard<std::mutex> guard(mutex_);
+    auto it = metric_to_family_.find(metric_name);
+    if (it == metric_to_family_.end()) {
+        return {};
+    }
+    return it->second;
+}
+
+std::set<std::string> MetricsRegistry::GetHistogramFamilies() const {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return histogram_families_;
+}
+
 } // namespace kv_cache_manager

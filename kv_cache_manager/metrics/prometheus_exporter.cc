@@ -1,6 +1,7 @@
 #include "kv_cache_manager/metrics/prometheus_exporter.h"
 
 #include <cmath>
+#include <set>
 #include <sstream>
 #include <string>
 #include <variant>
@@ -93,35 +94,6 @@ void WriteLabels(std::ostringstream &ss, const MetricsTags &tags) {
 
 } // namespace
 
-namespace {
-
-// Check if a metric name is a histogram _bucket metric.
-// Returns the family name (without _bucket suffix) if yes, empty string otherwise.
-// Only _bucket is used for identification because:
-// 1. It's unique to histograms (no regular counter ends with _bucket)
-// 2. Alphabetically _bucket < _count < _sum, so _bucket is always seen first
-//
-// CONSTRAINT: This relies on MetricsRegistry iterating metrics in sorted order.
-// If metric naming changes (e.g. prefix added), this detection will silently fail.
-std::string ExtractHistogramFamilyFromBucket(const std::string &name) {
-    static const std::string kBucketSuffix = "_bucket";
-    if (name.size() > kBucketSuffix.size() &&
-        name.compare(name.size() - kBucketSuffix.size(), kBucketSuffix.size(), kBucketSuffix) == 0) {
-        return name.substr(0, name.size() - kBucketSuffix.size());
-    }
-    return "";
-}
-
-// Check if a metric name belongs to a known histogram family (by _count or _sum suffix).
-// Returns true if the name ends with _count or _sum AND the family is in the known set.
-bool IsHistogramSubMetric(const std::string &name, const std::string &family) {
-    if (family.empty())
-        return false;
-    return (name == family + "_count" || name == family + "_sum");
-}
-
-} // namespace
-
 std::string PrometheusExporter::Expose(MetricsRegistry &registry, const std::string &prefix) {
     std::vector<MetricsRegistry::metrics_tuple_t> all_metrics;
     registry.GetAllMetrics(all_metrics);
@@ -141,11 +113,16 @@ std::string PrometheusExporter::Expose(MetricsRegistry &registry, const std::str
     // the first time any write path on Counter/Gauge runs against it.
     // If every series in a family is untouched, the # HELP / # TYPE
     // header is omitted as well.
+    //
+    // Histogram families are identified via explicit metric→family mapping
+    // registered by RevisitIntervalHistogram::Init(). The exporter queries
+    // the registry — no suffix-based guessing.
     std::ostringstream ss;
 
     std::string prev_name;
-    std::string histogram_family; // set when we see a _bucket metric; used for _count/_sum
-    bool family_header_written = false;
+    std::string current_family;             // histogram family for current metric (empty if regular)
+    std::set<std::string> families_written; // histogram families whose TYPE header was emitted
+    bool name_header_written = false;       // tracks TYPE/HELP for regular (non-histogram) metrics
     for (const auto &[name, tags, val] : all_metrics) {
         if (val == nullptr || !val->touched.load(std::memory_order_relaxed)) {
             continue;
@@ -153,26 +130,22 @@ std::string PrometheusExporter::Expose(MetricsRegistry &registry, const std::str
 
         std::string prom_name = SanitizeName(prefix, name);
 
-        // Detect histogram: _bucket sets the family; _count/_sum check against it
-        std::string bucket_family = ExtractHistogramFamilyFromBucket(name);
-        bool is_histogram_bucket = !bucket_family.empty();
-        bool is_histogram_sub = IsHistogramSubMetric(name, histogram_family);
-
         if (name != prev_name) {
-            family_header_written = false;
             prev_name = name;
+            name_header_written = false;
+            current_family = registry.GetMetricFamily(name);
         }
 
-        if (!family_header_written) {
-            if (is_histogram_bucket) {
-                histogram_family = bucket_family;
-                std::string family_prom_name = SanitizeName(prefix, histogram_family);
-                ss << "# HELP " << family_prom_name << ' ' << histogram_family << '\n';
-                ss << "# TYPE " << family_prom_name << " histogram\n";
-            } else if (is_histogram_sub) {
-                // _count or _sum of known histogram family — no header needed
+        if (!name_header_written) {
+            if (!current_family.empty()) {
+                // Histogram metric: emit TYPE/HELP once per family
+                if (families_written.insert(current_family).second) {
+                    std::string family_prom_name = SanitizeName(prefix, current_family);
+                    ss << "# HELP " << family_prom_name << ' ' << current_family << '\n';
+                    ss << "# TYPE " << family_prom_name << " histogram\n";
+                }
             } else {
-                histogram_family.clear();
+                // Regular counter/gauge
                 const char *type_str = "untyped";
                 if (std::holds_alternative<CounterValue>(val->value)) {
                     type_str = "counter";
@@ -182,7 +155,7 @@ std::string PrometheusExporter::Expose(MetricsRegistry &registry, const std::str
                 ss << "# HELP " << prom_name << ' ' << name << '\n';
                 ss << "# TYPE " << prom_name << ' ' << type_str << '\n';
             }
-            family_header_written = true;
+            name_header_written = true;
         }
 
         ss << prom_name;
@@ -190,9 +163,11 @@ std::string PrometheusExporter::Expose(MetricsRegistry &registry, const std::str
 
         if (std::holds_alternative<CounterValue>(val->value)) {
             uint64_t raw = std::get<CounterValue>(val->value).load(std::memory_order_relaxed);
-            if (is_histogram_sub && name.size() > 4 && name.compare(name.size() - 4, 4, "_sum") == 0) {
-                double seconds = static_cast<double>(raw) / 1e6;
-                ss << ' ' << seconds;
+            // Histogram _sum stores microseconds; convert to seconds for Prometheus
+            static const std::string kSumSuffix = "_sum";
+            if (!current_family.empty() && name.size() >= kSumSuffix.size() &&
+                name.compare(name.size() - kSumSuffix.size(), kSumSuffix.size(), kSumSuffix) == 0) {
+                ss << ' ' << static_cast<double>(raw) / 1e6;
             } else {
                 ss << ' ' << raw;
             }

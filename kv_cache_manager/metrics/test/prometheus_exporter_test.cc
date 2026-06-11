@@ -271,6 +271,12 @@ TEST_F(PrometheusExporterTest, CounterIncrementedThenResetAppears) {
 // Histogram output tests
 
 TEST_F(PrometheusExporterTest, HistogramBasicOutput) {
+    // Register histogram family metadata (as RevisitIntervalHistogram::Init would)
+    registry_->RegisterHistogramFamily("revisit_interval_seconds");
+    registry_->MapMetricToFamily("revisit_interval_seconds_bucket", "revisit_interval_seconds");
+    registry_->MapMetricToFamily("revisit_interval_seconds_sum", "revisit_interval_seconds");
+    registry_->MapMetricToFamily("revisit_interval_seconds_count", "revisit_interval_seconds");
+
     MetricsTags tags_le1 = {{"instance_id", "test"}, {"le", "1"}};
     MetricsTags tags_le5 = {{"instance_id", "test"}, {"le", "5"}};
     MetricsTags tags_leinf = {{"instance_id", "test"}, {"le", "+Inf"}};
@@ -317,6 +323,9 @@ TEST_F(PrometheusExporterTest, HistogramBasicOutput) {
 }
 
 TEST_F(PrometheusExporterTest, HistogramTypeAppearsOnlyOnce) {
+    registry_->RegisterHistogramFamily("revisit_interval_seconds");
+    registry_->MapMetricToFamily("revisit_interval_seconds_bucket", "revisit_interval_seconds");
+
     MetricsTags tags1 = {{"instance_id", "a"}, {"le", "1"}};
     MetricsTags tags2 = {{"instance_id", "b"}, {"le", "1"}};
 
@@ -332,4 +341,37 @@ TEST_F(PrometheusExporterTest, HistogramTypeAppearsOnlyOnce) {
     ASSERT_NE(first, std::string::npos);
     size_t second = output.find("# TYPE kvcm_revisit_interval_seconds histogram", first + 1);
     EXPECT_EQ(second, std::string::npos) << "TYPE histogram line appears more than once";
+}
+
+// Verify that an unmapped counter ending with _count is NOT misidentified as histogram
+TEST_F(PrometheusExporterTest, UnmappedCountSuffixNotMisidentified) {
+    // Register a regular counter with _count suffix — no family mapping
+    Counter c = registry_->GetCounter("meta_indexer.total_key_count");
+    c += 42;
+
+    std::string output = PrometheusExporter::Expose(*registry_);
+
+    // Should be output as a normal counter, not histogram
+    EXPECT_NE(output.find("# TYPE kvcm_meta_indexer_total_key_count counter"), std::string::npos) << "Actual output:\n"
+                                                                                                  << output;
+    EXPECT_EQ(output.find("histogram"), std::string::npos) << "Should not contain histogram TYPE";
+}
+
+// Verify GetMetricFamily returns empty string for unmapped metrics
+TEST_F(PrometheusExporterTest, GetMetricFamilyReturnsEmpty) {
+    EXPECT_TRUE(registry_->GetMetricFamily("nonexistent_metric").empty());
+    EXPECT_TRUE(registry_->GetMetricFamily("").empty());
+
+    registry_->MapMetricToFamily("some_metric", "some_family");
+    EXPECT_EQ(registry_->GetMetricFamily("some_metric"), "some_family");
+    EXPECT_TRUE(registry_->GetMetricFamily("other_metric").empty());
+}
+
+// Verify MapMetricToFamily is idempotent
+TEST_F(PrometheusExporterTest, MapMetricToFamilyIdempotent) {
+    registry_->MapMetricToFamily("metric_a", "family_x");
+    registry_->MapMetricToFamily("metric_a", "family_x"); // duplicate
+    registry_->MapMetricToFamily("metric_a", "family_y"); // different family — first wins (emplace semantics)
+
+    EXPECT_EQ(registry_->GetMetricFamily("metric_a"), "family_x");
 }

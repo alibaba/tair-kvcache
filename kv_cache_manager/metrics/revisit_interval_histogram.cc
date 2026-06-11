@@ -24,6 +24,10 @@ bool RevisitIntervalHistogram::Init(std::shared_ptr<MetricsRegistry> registry,
     boundaries_ = boundaries;
     MetricsTags tags = {{"instance_id", instance_id}};
 
+    // Register histogram family metadata (only once per registry, idempotent)
+    static constexpr const char *kFamilyName = "revisit_interval_seconds";
+    registry->RegisterHistogramFamily(kFamilyName);
+
     // Register bucket counters (N buckets + 1 for +Inf)
     bucket_counters_.resize(boundaries_.size() + 1);
     for (size_t i = 0; i < boundaries_.size(); ++i) {
@@ -41,6 +45,11 @@ bool RevisitIntervalHistogram::Init(std::shared_ptr<MetricsRegistry> registry,
     // Register sum and count counters
     sum_counter_ = registry->GetCounter("revisit_interval_seconds_sum", tags);
     count_counter_ = registry->GetCounter("revisit_interval_seconds_count", tags);
+
+    // Map metric names to family (idempotent, safe for concurrent Init calls)
+    registry->MapMetricToFamily("revisit_interval_seconds_bucket", kFamilyName);
+    registry->MapMetricToFamily("revisit_interval_seconds_sum", kFamilyName);
+    registry->MapMetricToFamily("revisit_interval_seconds_count", kFamilyName);
 
     return true;
 }
