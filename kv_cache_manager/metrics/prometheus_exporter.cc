@@ -100,6 +100,9 @@ namespace {
 // Only _bucket is used for identification because:
 // 1. It's unique to histograms (no regular counter ends with _bucket)
 // 2. Alphabetically _bucket < _count < _sum, so _bucket is always seen first
+//
+// CONSTRAINT: This relies on MetricsRegistry iterating metrics in sorted order.
+// If metric naming changes (e.g. prefix added), this detection will silently fail.
 std::string ExtractHistogramFamilyFromBucket(const std::string &name) {
     static const std::string kBucketSuffix = "_bucket";
     if (name.size() > kBucketSuffix.size() &&

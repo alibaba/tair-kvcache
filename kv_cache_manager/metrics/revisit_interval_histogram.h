@@ -42,7 +42,7 @@ public:
 
     // Record an observation (interval in microseconds).
     // Increments all bucket counters where boundary >= interval_seconds.
-    // Increments sum counter by interval_seconds * 1000 (milliseconds).
+    // Increments sum counter by interval_us (stored in microseconds).
     // Increments count counter by 1.
     // Thread-safe: uses only atomic operations.
     void Observe(int64_t interval_us);

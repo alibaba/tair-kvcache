@@ -1,5 +1,6 @@
 #include <cstdint>
 #include <memory>
+#include <set>
 #include <vector>
 
 #include "kv_cache_manager/common/unittest.h"
@@ -214,4 +215,37 @@ TEST_F(RevisitIntervalHistogramTest, ManyObservations) {
     EXPECT_EQ(counts[1], 1000); // <= 5.0
     EXPECT_EQ(counts[2], 1000); // <= 10.0
     EXPECT_EQ(counts[3], 1000); // <= +Inf
+}
+
+// 测试 le 标签格式化（整数边界不含多余零）
+TEST_F(RevisitIntervalHistogramTest, LeLabelFormatting) {
+    RevisitIntervalHistogram hist;
+    // Mix integer and non-integer boundaries
+    std::vector<double> boundaries = {1.0, 2.5, 60.0, 300.0, 3600.0};
+    ASSERT_TRUE(hist.Init(registry_, boundaries, "test_instance"));
+
+    std::vector<MetricsRegistry::metrics_tuple_t> all_metrics;
+    registry_->GetAllMetrics(all_metrics);
+
+    // Collect le values from bucket metrics
+    std::set<std::string> le_values;
+    for (const auto &[name, tags, val] : all_metrics) {
+        if (name == "revisit_interval_seconds_bucket") {
+            auto it = tags.find("le");
+            if (it != tags.end()) {
+                le_values.insert(it->second);
+            }
+        }
+    }
+
+    // Should have 6 buckets: 5 boundaries + +Inf
+    ASSERT_EQ(le_values.size(), 6);
+
+    // Integer boundaries must not have trailing zeros like "1.000000"
+    EXPECT_EQ(le_values.count("1"), 1);        // not "1.000000"
+    EXPECT_EQ(le_values.count("2.500000"), 1); // non-integer keeps decimals (std::to_string behavior)
+    EXPECT_EQ(le_values.count("60"), 1);       // not "60.000000"
+    EXPECT_EQ(le_values.count("300"), 1);      // not "300.000000"
+    EXPECT_EQ(le_values.count("3600"), 1);     // not "3600.000000"
+    EXPECT_EQ(le_values.count("+Inf"), 1);
 }
