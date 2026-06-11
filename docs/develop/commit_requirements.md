@@ -53,6 +53,7 @@ ci
 ```text
 fix bug
 manager: fix leader election
+chore(ci): add tair-kvcache image sync pipeline
 [manager]
 ```
 
