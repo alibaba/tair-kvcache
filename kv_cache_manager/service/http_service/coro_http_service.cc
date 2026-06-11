@@ -108,10 +108,20 @@ void CoroHttpService::SetTokenVerifier(std::shared_ptr<TokenVerifier> verifier) 
     token_verifier_ = std::move(verifier);
 }
 
+void CoroHttpService::AddUnauthenticatedRoute(const std::string &api) {
+    unauthenticated_routes_.insert(api);
+}
+
 CoroHttpService::HandlerType CoroHttpService::WrapWithAuth(const std::string &api, HandlerType handler) {
     // when no verifier is configured the service runs in open mode;
     // return the handler unchanged so there is zero per-request cost
     if (!token_verifier_) {
+        return handler;
+    }
+    // explicitly exempt routes bypass auth even when a verifier is
+    // attached.  this keeps the exemption decision a startup-time
+    // property of the route rather than a per-request branch
+    if (unauthenticated_routes_.count(api) > 0) {
         return handler;
     }
     auto verifier = token_verifier_;
