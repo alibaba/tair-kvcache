@@ -60,7 +60,7 @@ public:
 private:
     std::vector<double> boundaries_;       // bucket boundaries in seconds
     std::vector<Counter> bucket_counters_; // cumulative counters
-    Counter sum_counter_;                  // sum of all observations (milliseconds)
+    Counter sum_counter_;                  // sum of all observations (microseconds)
     Counter count_counter_;                // total number of observations
 };
 
