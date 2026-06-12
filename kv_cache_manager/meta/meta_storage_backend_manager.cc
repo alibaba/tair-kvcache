@@ -757,6 +757,11 @@ int64_t MetaStorageBackendManager::GetOldestAccessTime() const noexcept {
 }
 
 void MetaStorageBackendManager::SetRevisitHistogram(std::shared_ptr<RevisitIntervalHistogram> histogram) {
+    // 无条件调用两个 backend 的 SetRevisitHistogram
+    // 基类默认实现为空操作（no-op），只有支持重访间隔统计的 backend 才会重写
+    if (persistent_backend_) {
+        persistent_backend_->SetRevisitHistogram(histogram);
+    }
     if (cache_backend_) {
         cache_backend_->SetRevisitHistogram(histogram);
     }
