@@ -1,0 +1,11 @@
+diff --git a/protobuf.bzl b/protobuf.bzl
+index 1234567..abcdefg 100644
+--- a/protobuf.bzl
++++ b/protobuf.bzl
+@@ -763,3 +763,6 @@ def check_protobuf_required_bazel_version():
+     copied filegroup. (Fixed in bazel 0.5.4)
+     """
+     versions.check(minimum_bazel_version = "0.5.4")
++
++# Re-export _proto_gen for backward compatibility with external projects
++proto_gen = _proto_gen

@@ -5,23 +5,7 @@ def clean_dep(dep):
     return str(Label(dep))
 
 def http_deps():
-    http_archive(
-        name = "rules_pkg",
-        urls = [
-            "https://github.com/bazelbuild/rules_pkg/releases/download/0.6.0/rules_pkg-0.6.0.tar.gz",
-            "https://mirror.bazel.build/github.com/bazelbuild/rules_pkg/releases/download/0.6.0/rules_pkg-0.6.0.tar.gz",
-        ],
-        sha256 = "62eeb544ff1ef41d786e329e1536c1d541bb9bcad27ae984d57f18f314018e66",
-    )
-
-    http_archive(
-        name = "bazel_skylib",
-        sha256 = "97e70364e9249702246c0e9444bccdc4b847bed1eb03c5a3ece4f83dfe6abc44",
-        urls = ["https://github.com/bazelbuild/bazel-skylib/releases/download/1.0.2/bazel-skylib-1.0.2.tar.gz"],
-        patch_cmds = [
-            "sed 's$@bazel_tools//platforms:(linux|osx|windows|android|freebsd|ios|os)$@platforms//os:\\1$' -E -i ./toolchains/unittest/BUILD",
-        ],
-    )
+    # NOTE: rules_pkg, bazel_skylib are managed by MODULE.bazel (bzlmod)
 
     http_archive(
         name = "io_bazel_rules_closure",
@@ -164,27 +148,4 @@ def http_deps():
         ],
     )
 
-    http_archive(
-        name = "rules_cuda",
-        sha256 = "fe8d3d8ed52b9b433f89021b03e3c428a82e10ed90c72808cc4988d1f4b9d1b3",
-        strip_prefix = "rules_cuda-v0.2.5",
-        urls = ["https://github.com/bazel-contrib/rules_cuda/releases/download/v0.2.5/rules_cuda-v0.2.5.tar.gz"],
-    )
-
-    # pybind11
-    http_archive(
-        name = "pybind11_bazel",
-        sha256 = "9c7ffea05a5f2bd9211fdf7c5c685617fa93a801ebd814aed5a32617b7193ed6",
-        patches = ["//patches/pybind11_bazel:0001-replace-current_py_cc_headers.patch"],
-        strip_prefix = "pybind11_bazel-3.0.0",
-        urls = ["https://github.com/pybind/pybind11_bazel/archive/v3.0.0.zip"],
-    )
-
-    # We still require the pybind library.
-    http_archive(
-        name = "pybind11",
-        build_file = "@pybind11_bazel//:pybind11-BUILD.bazel",
-        sha256 = "20fb420fe163d0657a262a8decb619b7c3101ea91db35f1a7227e67c426d4c7e",
-        strip_prefix = "pybind11-3.0.1",
-        urls = ["https://github.com/pybind/pybind11/archive/v3.0.1.zip"],
-    )
+    # NOTE: rules_cuda, pybind11_bazel, pybind11 are managed by MODULE.bazel (bzlmod)

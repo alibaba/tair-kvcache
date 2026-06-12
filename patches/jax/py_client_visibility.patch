@@ -1,0 +1,13 @@
+diff --git a/jaxlib/BUILD b/jaxlib/BUILD
+index 1234567..abcdefg 100644
+--- a/jaxlib/BUILD
++++ b/jaxlib/BUILD
+@@ -1040,7 +1040,7 @@ cc_library(
+         "-fno-strict-aliasing",
+     ],
+     features = ["-use_header_modules"],
+-    visibility = jax_visibility("jaxlib/py_client"),
++    visibility = ["//visibility:public"],
+     deps = [
+         ":cached_py_object",
+         ":call_location",

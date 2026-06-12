@@ -1,8 +1,8 @@
 load("@grpc//bazel:cc_grpc_library.bzl", "cc_grpc_library")
 load("@pip_cpu//:requirements.bzl", "requirement")
 load("@rules_proto//proto:defs.bzl", "proto_library")
+load("@com_google_protobuf//bazel:cc_proto_library.bzl", "cc_proto_library")
 load("//bazel:py_proto.bzl", "generate_grpc_proto")
-load("//bazel:tf_proto.bzl", "cc_proto", "tf_proto_library_cc")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -11,53 +11,98 @@ config_setting(
     values = {"define": "CLIENT_ONLY_HEADER=true"},
 )
 
+# ---- Standard proto_library targets ----
+
+proto_library(
+    name = "meta_service_proto",
+    srcs = ["meta_service.proto"],
+)
+
+proto_library(
+    name = "kv_meta_service_proto",
+    srcs = ["kv_meta_service.proto"],
+)
+
+proto_library(
+    name = "admin_service_proto",
+    srcs = ["admin_service.proto"],
+    deps = ["@com_google_protobuf//:wrappers_proto"],
+)
+
+proto_library(
+    name = "debug_service_proto",
+    srcs = ["debug_service.proto"],
+)
+
+# ---- Standard cc_proto_library targets ----
+
+cc_proto_library(
+    name = "meta_service_cc_proto",
+    deps = [":meta_service_proto"],
+)
+
+cc_proto_library(
+    name = "kv_meta_service_cc_proto",
+    deps = [":kv_meta_service_proto"],
+)
+
+cc_proto_library(
+    name = "admin_service_cc_proto",
+    deps = [":admin_service_proto"],
+)
+
+cc_proto_library(
+    name = "debug_service_cc_proto",
+    deps = [":debug_service_proto"],
+)
+
+# ---- Standard cc_grpc_library targets ----
+
+cc_grpc_library(
+    name = "meta_service_cc_grpc",
+    srcs = [":meta_service_proto"],
+    deps = [":meta_service_cc_proto"],
+    grpc_only = True,
+)
+
+cc_grpc_library(
+    name = "admin_service_cc_grpc",
+    srcs = [":admin_service_proto"],
+    deps = [":admin_service_cc_proto"],
+    grpc_only = True,
+)
+
+cc_grpc_library(
+    name = "debug_service_cc_grpc",
+    srcs = [":debug_service_proto"],
+    deps = [":debug_service_cc_proto"],
+    grpc_only = True,
+)
+
+# ---- Compatibility aggregation targets ----
+
 cc_library(
     name = "service_cc_proto",
-    srcs = [
-        "admin_service.pb.cc",
-        "debug_service.pb.cc",
-        "kv_meta_service.pb.cc",
-        "meta_service.pb.cc",
+    deps = [
+        ":admin_service_cc_proto",
+        ":debug_service_cc_proto",
+        ":kv_meta_service_cc_proto",
+        ":meta_service_cc_proto",
     ],
-    hdrs = [
-        "admin_service.pb.h",
-        "debug_service.pb.h",
-        "kv_meta_service.pb.h",
-        "meta_service.pb.h",
-    ],
-    include_prefix = "service/proto",
-    deps = select({
-        "client_only_header": [
-            ":admin_service_cc_impl_grpc_header_only",
-            ":debug_service_cc_impl_grpc_header_only",
-            ":kv_meta_service_cc_impl_grpc_header_only",
-            ":meta_service_cc_impl_grpc_header_only",
-        ],
-        "//conditions:default": [
-            ":admin_service_cc_impl",
-            ":debug_service_cc_impl",
-            ":kv_meta_service_cc_impl",
-            ":meta_service_cc_impl",
-        ],
-    }),
 )
 
 cc_library(
     name = "service_cc_grpc",
-    srcs = [
-        "admin_service.grpc.pb.cc",
-        "debug_service.grpc.pb.cc",
-        "meta_service.grpc.pb.cc",
-    ],
-    hdrs = [
-        "admin_service.grpc.pb.h",
-        "debug_service.grpc.pb.h",
-        "meta_service.grpc.pb.h",
-    ],
-    include_prefix = "service/proto",
     visibility = ["//visibility:public"],
-    deps = [":service_cc_proto"],
+    deps = [
+        ":admin_service_cc_grpc",
+        ":debug_service_cc_grpc",
+        ":meta_service_cc_grpc",
+        ":service_cc_proto",
+    ],
 )
+
+# ---- Python proto targets ----
 
 py_library(
     name = "meta_service_py_proto",
@@ -112,40 +157,4 @@ generate_grpc_proto(
     name = "debug_service_py",
     create_grpc_proto = ":create_grpc_proto",
     proto = "debug_service.proto",
-)
-
-tf_proto_library_cc(
-    name = "meta_service",
-    srcs = [
-        "meta_service.proto",
-    ],
-    cc_grpc_version = True,
-    default_header = True,
-)
-
-tf_proto_library_cc(
-    name = "kv_meta_service",
-    srcs = [
-        "kv_meta_service.proto",
-    ],
-    cc_grpc_version = True,
-    default_header = True,
-)
-
-tf_proto_library_cc(
-    name = "admin_service",
-    srcs = [
-        "admin_service.proto",
-    ],
-    cc_grpc_version = True,
-    default_header = True,
-)
-
-tf_proto_library_cc(
-    name = "debug_service",
-    srcs = [
-        "debug_service.proto",
-    ],
-    cc_grpc_version = True,
-    default_header = True,
 )

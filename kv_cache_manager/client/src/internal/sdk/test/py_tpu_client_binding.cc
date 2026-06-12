@@ -5,12 +5,36 @@
 #include <pybind11/stl.h>
 
 #include "kv_cache_manager/client/src/internal/sdk/tpu_client.h"
+#include "kv_cache_manager/client/src/internal/sdk/tpu/jax_utils.h"
 
 namespace py = pybind11;
 namespace kvcm = kv_cache_manager;
 
+// =====================================================================
+// PyArray → PJRT_Buffer* extractor implementation (bridge registration)
+// =====================================================================
+// This function uses jax_utils.h to extract the C API PJRT_Buffer* handle
+// from a jax.Array's internal PyArray storage. It is registered at module
+// init time so that local_file_sdk.cc can call it without XLA/JAX deps.
+static PJRT_Buffer* ExtractBufferFromPyArray(void* py_array_ptr) {
+    try {
+        auto* py_obj = reinterpret_cast<PyObject*>(py_array_ptr);
+        // Get the first shard's data object
+        py::object jax_array = py::reinterpret_borrow<py::object>(py_obj);
+        auto* shard_obj = jax_array.attr("addressable_shards")[0]
+                                     .attr("data").ptr();
+        auto* pjrt_buf = kv_cache_manager::tpu::GetPjrtBufferFromPyObject(shard_obj);
+        return kv_cache_manager::tpu::GetCBufferHandle(pjrt_buf);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
 PYBIND11_MODULE(py_tpu_client, m) {
     m.doc() = "TpuClient pybind11 binding for Python-level TPU testing";
+
+    // Register the PyArray buffer extractor for local_file_sdk bridge
+    kvcm::RegisterPyArrayBufferExtractor(ExtractBufferFromPyArray);
 
     // 绑定 ClientErrorCode（只绑定常用值）
     py::enum_<kvcm::ClientErrorCode>(m, "ClientErrorCode")
@@ -127,5 +151,71 @@ PYBIND11_MODULE(py_tpu_client, m) {
         }, py::arg("raw"))
         .def("destroy_raw_buffer", [](kvcm::TpuClient& self, uintptr_t raw_addr) {
             self.DestroyRawBuffer(reinterpret_cast<PJRT_RawBuffer*>(raw_addr));
-        }, py::arg("raw"));
+        }, py::arg("raw"))
+
+        // =================================================================
+        // jax.Array integration: extract PJRT_Buffer* from jax.Array
+        // =================================================================
+
+        // Extract the C API PJRT_Buffer* handle from a jax.Array.
+        // Returns (error_code, buffer_ptr) where buffer_ptr is uintptr_t.
+        // The returned buffer_ptr can be used with buffer_to_host / etc.
+        // NOTE: does NOT create a new buffer — the handle points to the
+        //       existing device memory owned by JAX.
+        .def("extract_buffer_from_jax_array",
+             [](kvcm::TpuClient& self, py::object jax_array) -> py::tuple {
+            try {
+                // Get the first shard's PjRtBuffer*
+                auto* shard_obj = jax_array.attr("addressable_shards")[0]
+                                          .attr("data").ptr();
+                auto* pjrt_buf = kv_cache_manager::tpu::GetPjrtBufferFromPyObject(
+                    reinterpret_cast<PyObject*>(shard_obj));
+
+                // Convert to C API handle
+                PJRT_Buffer* c_buf = kv_cache_manager::tpu::GetCBufferHandle(pjrt_buf);
+                if (c_buf == nullptr) {
+                    return py::make_tuple(
+                        kvcm::ER_TPU_BUFFER_TRANSFER_ERROR, uintptr_t(0));
+                }
+                return py::make_tuple(kvcm::ER_OK, reinterpret_cast<uintptr_t>(c_buf));
+            } catch (const std::exception& e) {
+                return py::make_tuple(kvcm::ER_TPU_BUFFER_TRANSFER_ERROR, uintptr_t(0));
+            }
+        }, py::arg("jax_array"))
+
+        // Convenience: D2H transfer from a jax.Array's device buffer to host.
+        // Extracts PJRT_Buffer* and calls BufferToHost in one step.
+        .def("buffer_to_host_from_jax",
+             [](kvcm::TpuClient& self, py::object jax_array,
+                uintptr_t dst_addr, size_t size) {
+            try {
+                auto* shard_obj = jax_array.attr("addressable_shards")[0]
+                                          .attr("data").ptr();
+                auto* pjrt_buf = kv_cache_manager::tpu::GetPjrtBufferFromPyObject(
+                    reinterpret_cast<PyObject*>(shard_obj));
+                PJRT_Buffer* c_buf = kv_cache_manager::tpu::GetCBufferHandle(pjrt_buf);
+                if (c_buf == nullptr) {
+                    return kvcm::ER_TPU_BUFFER_TRANSFER_ERROR;
+                }
+                return self.BufferToHost(c_buf, reinterpret_cast<void*>(dst_addr), size);
+            } catch (const std::exception& e) {
+                return kvcm::ER_TPU_BUFFER_TRANSFER_ERROR;
+            }
+        }, py::arg("jax_array"), py::arg("dst_addr"), py::arg("size"))
+
+        // Convenience: H2D transfer to a jax.Array's device buffer from host.
+        // Extracts PJRT_Buffer* and calls BufferFromHost (creates new buffer).
+        // Returns (error_code, new_buffer_ptr).
+        // NOTE: This creates a NEW PJRT_Buffer on the same device — it does
+        //       NOT write into the existing jax.Array's memory.
+        .def("buffer_from_host_to_jax_device",
+             [](kvcm::TpuClient& self, py::object jax_array,
+                uintptr_t src_addr, size_t size) -> py::tuple {
+            // Use the jax.Array only to determine target device.
+            // BufferFromHost always creates on self.device_.
+            PJRT_Buffer* new_buf = nullptr;
+            auto ec = self.BufferFromHost(
+                reinterpret_cast<const void*>(src_addr), size, new_buf);
+            return py::make_tuple(ec, reinterpret_cast<uintptr_t>(new_buf));
+        }, py::arg("jax_array"), py::arg("src_addr"), py::arg("size"));
 }

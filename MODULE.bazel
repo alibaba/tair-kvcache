@@ -1,0 +1,152 @@
+module(name = "kv_cache_manager")
+
+###############################################################################
+# XLA and JAX — local checkouts for TPU support
+###############################################################################
+
+bazel_dep(name = "xla")
+local_path_override(
+    module_name = "xla",
+    path = "/home/zhaotaonan_ztn/xla",
+)
+
+bazel_dep(name = "jax")
+local_path_override(
+    module_name = "jax",
+    path = "/home/zhaotaonan_ztn/jax",
+)
+
+###############################################################################
+# Core dependencies (versions aligned with XLA / JAX)
+###############################################################################
+
+bazel_dep(name = "abseil-cpp", version = "20260107.1", repo_name = "com_google_absl")
+bazel_dep(name = "protobuf", version = "32.1", repo_name = "com_google_protobuf")
+bazel_dep(name = "platforms", version = "1.0.0")
+bazel_dep(name = "rules_cc", version = "0.2.17")
+bazel_dep(name = "rules_proto", version = "7.1.0")
+bazel_dep(name = "rules_pkg", version = "1.1.0")
+bazel_dep(name = "rules_python", version = "1.8.5")
+bazel_dep(name = "bazel_skylib", version = "1.8.2")
+bazel_dep(name = "googletest", version = "1.17.0", repo_name = "com_google_googletest")
+bazel_dep(name = "grpc", version = "1.78.0", repo_name = "grpc")
+bazel_dep(name = "pybind11_bazel", version = "3.0.0")
+bazel_dep(name = "rules_cuda", version = "0.2.5")
+bazel_dep(name = "rules_ml_toolchain")
+
+# rules_ml_toolchain — use the same version as XLA
+archive_override(
+    module_name = "rules_ml_toolchain",
+    integrity = "sha256-rniUnlQ0DNcwtAE/PGb9huKletQug8Wd5BNReZznYEs=",
+    strip_prefix = "rules_ml_toolchain-44a2499fc046cd3c88625494ad5b7ebffcbb7b7b",
+    urls = ["https://github.com/google-ml-infra/rules_ml_toolchain/archive/44a2499fc046cd3c88625494ad5b7ebffcbb7b7b.tar.gz"],
+)
+
+###############################################################################
+# Dependency overrides
+# Note: XLA-specific patches (abseil, protobuf, grpc) are applied by XLA's own
+# MODULE.bazel. We only override versions when we need different versions
+# than what BCR provides.
+###############################################################################
+
+single_version_override(
+    module_name = "abseil-cpp",
+    patch_strip = 1,
+    patches = [
+        "//patches/absl:btree.patch",
+        "//patches/absl:build_dll.patch",
+        "//patches/absl:endian.patch",
+        "//patches/absl:append_and_overwrite.patch",
+    ],
+)
+
+single_version_override(
+    module_name = "protobuf",
+    patch_strip = 1,
+    patches = [
+        "//patches/protobuf:protobuf_arena.patch",
+        "//patches/protobuf:fix_message_lite_incomplete_type.patch",
+        "//patches/protobuf:fix_python_dist_package.patch",
+        "//patches/protobuf:protobuf_proto_gen_public.patch",
+    ],
+    version = "32.1",
+)
+
+single_version_override(
+    module_name = "grpc",
+    patch_strip = 1,
+    patches = [
+        "//patches/grpc_xla:grpc.patch",
+        "//patches/grpc_xla:layering_check_bzlmod.patch",
+    ],
+    version = "1.78.0",
+)
+
+###############################################################################
+# XLA third-party extensions (nanobind, stablehlo, llvm, etc.)
+###############################################################################
+
+third_party = use_extension("@xla//third_party/extensions:third_party.bzl", "third_party_ext")
+use_repo(
+    third_party,
+    "nanobind",
+    "stablehlo",
+)
+
+llvm = use_extension("@xla//third_party/extensions:llvm.bzl", "llvm_extension")
+use_repo(llvm, "llvm-project")
+
+tsl_extension = use_extension("@xla//third_party/extensions:tsl.bzl", "tsl_extension")
+use_repo(tsl_extension, "tsl")
+
+###############################################################################
+# Python toolchain
+###############################################################################
+
+single_version_override(
+    module_name = "rules_python",
+    patch_strip = 1,
+    patches = [
+        "//patches/rules_python:rules_python_pip_version.patch",
+        "//patches/rules_python:rules_python_freethreaded.patch",
+        "//patches/rules_python:rules_python_versions.patch",
+        "//patches/rules_python:rules_python_scope.patch",
+        "//patches/rules_python:rules_python_local_wheel.patch",
+    ],
+    version = "1.8.5",
+)
+
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.defaults(python_version = "3.12")
+python.toolchain(python_version = "3.11")
+python.toolchain(python_version = "3.12")
+use_repo(python, "pythons_hub")
+
+pip_cpu = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
+pip_cpu.parse(
+    hub_name = "pip_cpu",
+    python_version = "3.12",
+    requirements_lock = "//open_source/deps:requirements_lock_cpu.txt",
+    extra_pip_args = [
+        "--index-url=https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple",
+    ],
+    timeout = 3600,
+)
+use_repo(pip_cpu, "pip_cpu")
+
+###############################################################################
+# pybind11
+###############################################################################
+
+pybind11_internal_configure = use_extension(
+    "@pybind11_bazel//:internal_configure.bzl",
+    "internal_configure_extension",
+)
+use_repo(pybind11_internal_configure, "pybind11")
+
+###############################################################################
+# Non-BCR external repos (originally from WORKSPACE)
+###############################################################################
+
+non_bcr_deps = use_extension("//bazel:non_bcr_deps.bzl", "non_bcr_deps")
+use_repo(non_bcr_deps, "zlib_archive", "rapidjson")

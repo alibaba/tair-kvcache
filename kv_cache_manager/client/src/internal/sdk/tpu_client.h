@@ -14,6 +14,34 @@
 
 namespace kv_cache_manager {
 
+// =====================================================================
+// PyArray → PJRT_Buffer* extraction bridge
+// =====================================================================
+// Runtime-registered function for extracting PJRT_Buffer* from a PyArray*
+// (jax.Array's internal C storage pointer). This avoids compile-time XLA/JAX
+// dependencies in translation units that only need the C API handle.
+//
+// Registration: py_tpu_client_binding.cc calls RegisterPyArrayBufferExtractor()
+// at module init time. local_file_sdk.cc calls GetPyArrayBufferExtractor() to
+// obtain the function pointer.
+//
+// The extractor returns the C API PJRT_Buffer* handle for the first shard of
+// the jax.Array, or nullptr on failure.
+
+using PyArrayBufferExtractorFn = PJRT_Buffer* (*)(void* py_array_ptr);
+
+/**
+ * Register the PyArray → PJRT_Buffer* extraction function.
+ * Must be called before any TPU iov with PyArray* base is processed.
+ * Typically called from the pybind11 module init (py_tpu_client_binding.cc).
+ */
+void RegisterPyArrayBufferExtractor(PyArrayBufferExtractorFn fn);
+
+/**
+ * Get the registered extraction function. Returns nullptr if not registered.
+ */
+PyArrayBufferExtractorFn GetPyArrayBufferExtractor();
+
 /**
  * TpuClient - Manages TPU device access and data transfers using PJRT C API
  *

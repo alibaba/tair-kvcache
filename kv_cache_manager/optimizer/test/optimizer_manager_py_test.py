@@ -19,10 +19,12 @@ class OptimizerManagerPyTest(unittest.TestCase):
         print(f"Using temporary directory: {self.temp_dir}")
         # 直接初始化 OptimizerManager
         test_srcdir = os.getenv("TEST_SRCDIR")
+        test_workspace = os.getenv("TEST_WORKSPACE", "_main")
         if test_srcdir:
             config_file = os.path.join(
-                test_srcdir, 
-                "kv_cache_manager/kv_cache_manager/optimizer/test/testdata/optimizer_startup_config_load.json"
+                test_srcdir,
+                test_workspace,
+                "kv_cache_manager/optimizer/test/testdata/optimizer_startup_config_load.json"
             )
 
         self.config_file = config_file

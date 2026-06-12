@@ -16,6 +16,21 @@
 
 namespace kv_cache_manager {
 
+// =====================================================================
+// PyArray → PJRT_Buffer* extraction bridge (runtime registration)
+// =====================================================================
+namespace {
+PyArrayBufferExtractorFn g_py_array_buffer_extractor = nullptr;
+}  // namespace
+
+void RegisterPyArrayBufferExtractor(PyArrayBufferExtractorFn fn) {
+    g_py_array_buffer_extractor = fn;
+}
+
+PyArrayBufferExtractorFn GetPyArrayBufferExtractor() {
+    return g_py_array_buffer_extractor;
+}
+
 namespace {
 // Default libtpu.so path (installed by uv in the vllm_tpu_env_yemu virtualenv)
 constexpr const char* kDefaultLibtpuPath =

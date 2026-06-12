@@ -6,65 +6,8 @@ def clean_dep(dep):
     return str(Label(dep))
 
 def git_deps():
-    http_archive(
-        name = "rules_cc",
-        sha256 = "b87996d308549fc3933f57a786004ef65b44b83fd63f1b0303a4bbc3fd26bbaf",
-        strip_prefix = "rules_cc-1477dbab59b401daa94acedbeaefe79bf9112167",
-        type = "tar.gz",
-        urls = [
-            "https://codeload.github.com/bazelbuild/rules_cc/tar.gz/1477dbab59b401daa94acedbeaefe79bf9112167",
-            "https://github.com/bazelbuild/rules_cc/archive/1477dbab59b401daa94acedbeaefe79bf9112167.tar.gz",
-        ],
-    )
-
-    http_archive(
-        name = "rules_python",
-        sha256 = "3d6fe72f1a056b3462f02afba5049210acbaec131087fb19082fa6792198a9fa",
-        strip_prefix = "rules_python-084b877c98b580839ceab2b071b02fc6768f3de6",
-        type = "tar.gz",
-        urls = [
-            "https://codeload.github.com/bazelbuild/rules_python/tar.gz/084b877c98b580839ceab2b071b02fc6768f3de6",
-            "https://github.com/bazelbuild/rules_python/archive/084b877c98b580839ceab2b071b02fc6768f3de6.tar.gz",
-        ],
-        patches = [
-            "//patches/rules_python:0001-add-extra-data.patch",
-            "//patches/rules_python:0002-remove-import-from-rules_cc.patch",
-            "//patches/rules_python:0001-xx.patch",
-        ],
-    )
-    http_archive(
-        name = "com_google_googletest",
-        sha256 = "7ff5db23de232a39cbb5c9f5143c355885e30ac596161a6b9fc50c4538bfbf01",
-        strip_prefix = "googletest-f8d7d77c06936315286eb55f8de22cd23c188571",
-        type = "tar.gz",
-        urls = [
-            "https://codeload.github.com/google/googletest/tar.gz/f8d7d77c06936315286eb55f8de22cd23c188571",
-            "https://github.com/google/googletest/archive/f8d7d77c06936315286eb55f8de22cd23c188571.tar.gz",
-        ],
-    )
-
-    http_archive(
-        name = "com_github_nanopb_nanopb",
-        sha256 = "8bbbb1e78d4ddb0a1919276924ab10d11b631df48b657d960e0c795a25515735",
-        build_file = "@grpc//third_party:nanopb.BUILD",
-        strip_prefix = "nanopb-f8ac463766281625ad710900479130c7fcb4d63b",
-        type = "tar.gz",
-        urls = [
-            "https://codeload.github.com/nanopb/nanopb/tar.gz/f8ac463766281625ad710900479130c7fcb4d63b",
-            "https://github.com/nanopb/nanopb/archive/f8ac463766281625ad710900479130c7fcb4d63b.tar.gz",
-        ],
-    )
-
-    http_archive(
-        name = "six_archive",
-        build_file = clean_dep("//3rdparty/six:six.BUILD"),
-        sha256 = "105f8d68616f8248e24bf0e9372ef04d3cc10104f1980f54d57b2ce73a5ad56a",
-        strip_prefix = "six-1.10.0",
-        urls = [
-            "http://mirror.bazel.build/pypi.python.org/packages/source/s/six/six-1.10.0.tar.gz",
-            "http://pypi.python.org/packages/source/s/six/six-1.10.0.tar.gz",
-        ],
-    )
+    # NOTE: rules_cc, rules_python, com_google_googletest, com_google_absl,
+    # com_google_protobuf, grpc are managed by MODULE.bazel (bzlmod).
 
     http_archive(
         name = "zlib_archive",
@@ -76,41 +19,6 @@ def git_deps():
             "https://github.com/madler/zlib/archive/refs/tags/v1.2.11.tar.gz",
         ],
         sha256 = "629380c90a77b964d896ed37163f5c3a34f6e6d897311f1df2a7016355c45eff",
-    )
-
-    http_archive(
-        name = "com_google_absl",
-        sha256 = "62c27e7a633e965a2f40ff16b487c3b778eae440bab64cad83b34ef1cbe3aa93",
-        strip_prefix = "abseil-cpp-6f9d96a1f41439ac172ee2ef7ccd8edf0e5d068c",
-        type = "tar.gz",
-        urls = [
-            "https://codeload.github.com/abseil/abseil-cpp/tar.gz/6f9d96a1f41439ac172ee2ef7ccd8edf0e5d068c",
-            "https://github.com/abseil/abseil-cpp/archive/6f9d96a1f41439ac172ee2ef7ccd8edf0e5d068c.tar.gz",
-        ],
-        patch_cmds = [
-            "sed -i -e 's/^#define ABSL_OPTION_USE_STD_STRING_VIEW 2/#define ABSL_OPTION_USE_STD_STRING_VIEW 0/' 'absl/base/options.h'",
-            "sed 's$@bazel_tools//platforms:(linux|osx|windows|android|freebsd|ios|os)$@platforms//os:\\1$' -E -i absl/BUILD.bazel",
-            "sed 's$@bazel_tools//platforms:(cpu|x86_32|x86_64|ppc|arm|aarch64|s390x)$@platforms//cpu:\\1$' -i -E absl/BUILD.bazel",
-            "sed 's$@bazel_tools//platforms:(linux|osx|windows|android|freebsd|ios|os)$@platforms//os:\\1$' -E -i absl/time/internal/cctz/BUILD.bazel",
-            "sed 's$@bazel_tools//platforms:(cpu|x86_32|x86_64|ppc|arm|aarch64|s390x)$@platforms//cpu:\\1$' -i -E absl/time/internal/cctz/BUILD.bazel",
-        ],
-    )
-
-    native.local_repository(
-        name = "com_google_protobuf",
-        path = "3rdparty/protobuf",
-    )
-
-    http_archive(
-        name = "grpc",
-        sha256 = "ddd5c9c42bc609108c2e9494e9cfa34ea42d0efd0eb4b183db8a4124dabdc1c2",
-        strip_prefix = "grpc-109c570727c3089fef655edcdd0dd02cc5958010",
-        type = "tar.gz",
-        urls = [
-            "https://codeload.github.com/grpc/grpc/tar.gz/109c570727c3089fef655edcdd0dd02cc5958010",
-            "https://github.com/grpc/grpc/archive/109c570727c3089fef655edcdd0dd02cc5958010.tar.gz",
-        ],
-        patches = ["//patches/grpc:0001-Rename-gettid-functions.patch"],
     )
 
     http_archive(
@@ -212,60 +120,5 @@ def git_deps():
         ],
     )
 
-    # Needed by Protobuf
-    native.bind(
-        name = "grpc_cpp_plugin",
-        actual = "@grpc//:grpc_cpp_plugin",
-    )
-
-    native.bind(
-        name = "grpc_python_plugin",
-        actual = "@grpc//:grpc_python_plugin",
-    )
-
-    # Needed by gRPC
-    native.bind(
-        name = "libssl",
-        actual = "@boringssl//:ssl",
-    )
-
-    # Needed by gRPC
-    native.bind(
-        name = "nanopb",
-        actual = "@com_github_nanopb_nanopb//:nanopb",
-    )
-
-    # gRPC expects //external:protobuf_clib and //external:protobuf_compiler
-    # to point to Protobuf's compiler library.
-    native.bind(
-        name = "protobuf_clib",
-        actual = "@com_google_protobuf//:protoc_lib",
-    )
-
-    # Needed by gRPC
-    native.bind(
-        name = "protobuf_headers",
-        actual = "@com_google_protobuf//:protobuf_headers",
-    )
-
-    # # Needed by Protobuf
-    native.bind(
-        name = "grpc_cpp_plugin",
-        actual = "@grpc//:grpc_cpp_plugin",
-    )
-    native.bind(
-        name = "grpc_python_plugin",
-        actual = "@grpc//:grpc_python_plugin",
-    )
-
-    # # Needed by Protobuf
-    native.bind(
-        name = "six",
-        actual = "@six_archive//:six",
-    )
-
-    # Needed by gRPC
-    native.bind(
-        name = "zlib",
-        actual = "@zlib_archive//:zlib",
-    )
+    # NOTE: native.bind() calls removed — incompatible with bzlmod.
+    # Protobuf/gRPC bindings are resolved directly via bzlmod deps.

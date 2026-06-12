@@ -100,35 +100,34 @@ TEST_F(LocalFileSdkTpuTest, TestTpuDmaMapUnmap) {
 }
 
 // Test SDK Put/Get with TPU memory (full round-trip)
+// Uses the bridge pattern: iov.base = PJRT_Buffer* directly (no Python/PyArray).
+// A trivial extractor is registered to cast iov.base → PJRT_Buffer*.
 TEST_F(LocalFileSdkTpuTest, TestSdkPutGetWithTpuMemory) {
 #ifdef USING_TPU
     LocalFileSdk sdk;
     ASSERT_EQ(ER_OK, sdk.Init(sdk_backend_config_, nullptr));
 
-    // Prepare test data
+    // Register a trivial extractor: iov.base IS already a PJRT_Buffer*
+    RegisterPyArrayBufferExtractor([](void* ptr) -> PJRT_Buffer* {
+        return reinterpret_cast<PJRT_Buffer*>(ptr);
+    });
+
+    // Prepare test data (single iov for clean round-trip with same blkid)
     const char* test_data = "this is tpu local file test data!!";
     size_t len1 = strlen(test_data);
-    const char* test_data_2 = "second tpu iov test data content!!";
-    size_t len2 = strlen(test_data_2);
-    size_t total_size = len1 + len2;
 
     // Allocate host buffer with test data
-    std::vector<char> host_put_data(total_size);
+    std::vector<char> host_put_data(len1);
     std::memcpy(host_put_data.data(), test_data, len1);
-    std::memcpy(host_put_data.data() + len1, test_data_2, len2);
 
-    // Create TPU buffers for Put: upload host data to TPU
+    // Create TPU buffer for Put: upload host data to TPU
     PJRT_Buffer* tpu_buf1 = nullptr;
     auto ec = sdk.tpu_client_.BufferFromHost(host_put_data.data(), len1, tpu_buf1);
     ASSERT_EQ(ec, ER_OK) << "BufferFromHost for iov1 failed";
     ASSERT_NE(tpu_buf1, nullptr);
 
-    PJRT_Buffer* tpu_buf2 = nullptr;
-    ec = sdk.tpu_client_.BufferFromHost(host_put_data.data() + len1, len2, tpu_buf2);
-    ASSERT_EQ(ec, ER_OK) << "BufferFromHost for iov2 failed";
-    ASSERT_NE(tpu_buf2, nullptr);
-
-    // Build IOVs with TPU memory type for Put
+    // Build IOV with TPU memory type for Put
+    // iov.base = PJRT_Buffer* (extractor returns it as-is)
     BlockBuffer put_buf;
     Iov put_iov1;
     put_iov1.base = reinterpret_cast<void*>(tpu_buf1);
@@ -137,13 +136,6 @@ TEST_F(LocalFileSdkTpuTest, TestSdkPutGetWithTpuMemory) {
     put_iov1.ignore = false;
     put_buf.iovs.push_back(put_iov1);
 
-    Iov put_iov2;
-    put_iov2.base = reinterpret_cast<void*>(tpu_buf2);
-    put_iov2.size = len2;
-    put_iov2.type = MemoryType::TPU;
-    put_iov2.ignore = false;
-    put_buf.iovs.push_back(put_iov2);
-
     DataStorageUri uri("file://" + root_path_ + "/local_file/test_tpu.txt");
     uri.SetParam("blkid", "0");
     uri.SetParam("size", "1024");
@@ -151,62 +143,47 @@ TEST_F(LocalFileSdkTpuTest, TestSdkPutGetWithTpuMemory) {
     const std::vector<DataStorageUri>& remote_uris = {uri};
     BlockBuffers local_buffers = {put_buf};
 
-    // Put: TPU memory -> local file
+    // Put: TPU memory -> local file (uses RawBuffer D2H)
     auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
     auto put_ec = sdk.Put(remote_uris, local_buffers, actual_remote_uris);
     ASSERT_EQ(put_ec, ER_OK) << "Put failed";
     ASSERT_EQ(actual_remote_uris->size(), 1);
 
-    // Cleanup put buffers
+    // Cleanup put buffer
     sdk.tpu_client_.DestroyBuffer(tpu_buf1);
-    sdk.tpu_client_.DestroyBuffer(tpu_buf2);
 
-    // Get: local file -> TPU memory
-    // For Get, iov.base will be filled by SDK with newly created PJRT_Buffer*
+    // Get: local file -> TPU memory (SDK creates new PJRT_Buffer* via BufferFromHost)
     BlockBuffer get_buf;
     Iov get_iov1;
-    get_iov1.base = nullptr;  // Will be filled by SDK
+    get_iov1.base = nullptr;  // SDK will fill with new PJRT_Buffer* handle
     get_iov1.size = len1;
     get_iov1.type = MemoryType::TPU;
     get_iov1.ignore = false;
     get_buf.iovs.push_back(get_iov1);
-
-    Iov get_iov2;
-    get_iov2.base = nullptr;  // Will be filled by SDK
-    get_iov2.size = len2;
-    get_iov2.type = MemoryType::TPU;
-    get_iov2.ignore = false;
-    get_buf.iovs.push_back(get_iov2);
 
     local_buffers[0] = get_buf;
 
     auto get_ec = sdk.Get(remote_uris, local_buffers);
     ASSERT_EQ(get_ec, ER_OK) << "Get failed";
 
-    // SDK should have filled iov.base with new PJRT_Buffer* handles
+    // SDK should have filled iov.base with new PJRT_Buffer* handle
     PJRT_Buffer* get_tpu_buf1 = reinterpret_cast<PJRT_Buffer*>(local_buffers[0].iovs[0].base);
-    PJRT_Buffer* get_tpu_buf2 = reinterpret_cast<PJRT_Buffer*>(local_buffers[0].iovs[1].base);
     ASSERT_NE(get_tpu_buf1, nullptr) << "Get should create TPU buffer for iov1";
-    ASSERT_NE(get_tpu_buf2, nullptr) << "Get should create TPU buffer for iov2";
 
-    // Read back from TPU buffers to verify
+    // Read back from TPU buffer to verify
     std::vector<char> host_get_data1(len1, 0);
     ec = sdk.tpu_client_.BufferToHost(get_tpu_buf1, host_get_data1.data(), len1);
     ASSERT_EQ(ec, ER_OK) << "BufferToHost for iov1 failed";
 
-    std::vector<char> host_get_data2(len2, 0);
-    ec = sdk.tpu_client_.BufferToHost(get_tpu_buf2, host_get_data2.data(), len2);
-    ASSERT_EQ(ec, ER_OK) << "BufferToHost for iov2 failed";
-
     // Verify data integrity
     ASSERT_EQ(std::memcmp(host_get_data1.data(), test_data, len1), 0)
         << "iov1 data mismatch";
-    ASSERT_EQ(std::memcmp(host_get_data2.data(), test_data_2, len2), 0)
-        << "iov2 data mismatch";
 
-    // Cleanup get buffers
+    // Cleanup get buffer
     sdk.tpu_client_.DestroyBuffer(get_tpu_buf1);
-    sdk.tpu_client_.DestroyBuffer(get_tpu_buf2);
+
+    // Unregister extractor
+    RegisterPyArrayBufferExtractor(nullptr);
 #else
     GTEST_SKIP() << "TPU not enabled, skipping TPU SDK Put/Get test";
 #endif

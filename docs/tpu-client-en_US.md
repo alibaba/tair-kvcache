@@ -40,6 +40,18 @@ See "Initialization Flow" below.
 | RawBuffer destroy | `DestroyRawBuffer()` | Release a RawBuffer (does not affect original Buffer) |
 | Error extraction | `GetErrorMessage()` | Static utility to extract text from PJRT_Error |
 
+### jax.Array Integration (py_tpu_client binding)
+
+The Python binding (`py_tpu_client`) provides additional methods for working
+with `jax.Array` objects directly, extracting the underlying `PJRT_Buffer*`
+via the tpu-raiden approach (`PyArrayObject → ifrt::Array → PjRtCompatibleArray → PjRtBuffer* → PJRT_Buffer*`):
+
+| Method | Description |
+|---|---|
+| `extract_buffer_from_jax_array(jax_array)` | Extract `PJRT_Buffer*` C API handle from a jax.Array |
+| `buffer_to_host_from_jax(jax_array, dst, size)` | D2H transfer from jax.Array's device buffer |
+| `buffer_from_host_to_jax_device(jax_array, src, size)` | H2D transfer (creates new buffer on same device) |
+
 Note: `CreateViewOfDeviceBuffer` is **not supported** on TPU. All data
 transfers use `BufferFromHostBuffer` / `ToHostBuffer`.
 
@@ -226,3 +238,8 @@ WaitEventsBatch, DestroyEventNullSafe, WaitEventNullSafe,
 AsyncBufferOpsUninitReturnsError, HasRawBufferExtensionAfterInit,
 RawBufferRoundTrip, RawBufferOpsUninitReturnsError,
 DestroyRawBufferNullSafe, RawBufferBatchAsyncD2H.
+
+Python-level tests (py_tpu_client_test.py) additionally cover:
+JaxInteraction, BasicRoundtrip, NumpyRoundtrip, AsyncH2D, AsyncD2H,
+LargeBuffer, DmaMap, RawBuffer, JaxArrayExtractBuffer,
+JaxArrayD2H, JaxArrayH2DD2HRoundtrip.

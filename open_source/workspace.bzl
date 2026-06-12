@@ -11,35 +11,8 @@ def load_deps():
     git_deps()
 
 def kv_cache_manager_workspace():
-    ## skylib
-    skylib_version = "1.0.3"
-    http_archive(
-        name = "bazel_skylib",
-        sha256 = "1c531376ac7e5a180e0237938a2536de0c54d93f5c278634818e0efc952dd56c",
-        type = "tar.gz",
-        urls = [
-            "https://mirror.bazel.build/github.com/bazelbuild/bazel-skylib/releases/download/{}/bazel-skylib-{}.tar.gz".format(skylib_version, skylib_version),
-            "https://github.com/bazelbuild/bazel-skylib/releases/download/{}/bazel-skylib-{}.tar.gz".format(skylib_version, skylib_version)
-        ],
-    )
-
-    http_archive(
-        name = "rules_proto",
-        sha256 = "e017528fd1c91c5a33f15493e3a398181a9e821a804eb7ff5acdd1d2d6c2b18d",
-        strip_prefix = "rules_proto-4.0.0-3.20.0",
-        urls = [
-            "https://github.com/bazelbuild/rules_proto/archive/refs/tags/4.0.0-3.20.0.tar.gz",
-        ],
-    )
-
-    http_archive(
-        name = "rules_pkg",
-        urls = [
-            "https://mirror.bazel.build/github.com/bazelbuild/rules_pkg/releases/download/0.6.0/rules_pkg-0.6.0.tar.gz",
-            "https://github.com/bazelbuild/rules_pkg/releases/download/0.6.0/rules_pkg-0.6.0.tar.gz",
-        ],
-        sha256 = "62eeb544ff1ef41d786e329e1536c1d541bb9bcad27ae984d57f18f314018e66",
-    )
+    # NOTE: bazel_skylib, rules_proto, rules_pkg are now managed by MODULE.bazel (bzlmod)
+    # Do NOT define them here to avoid conflicts with bzlmod resolution.
 
     http_archive(
         name = "hiredis",

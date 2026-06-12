@@ -101,7 +101,7 @@ def cc_proto_library(
             includes = includes,
             protoc = protoc,
             visibility = ["//visibility:public"],
-            deps = [s + "_genproto" for s in all_protolib_deps],
+            deps = [s + "_genproto" for s in protolib_deps],
         )
 
         # An empty cc_library to make rule dependency consistent.
@@ -114,7 +114,7 @@ def cc_proto_library(
     grpc_cpp_plugin = None
     plugin_options = []
     if use_grpc_plugin:
-        grpc_cpp_plugin = "@grpc//:grpc_cpp_plugin"
+        grpc_cpp_plugin = "@grpc//src/compiler:grpc_cpp_plugin"
         if use_grpc_namespace:
             plugin_options = ["services_namespace=grpc"]
 
@@ -129,10 +129,10 @@ def cc_proto_library(
         plugin = grpc_cpp_plugin,
         plugin_language = "grpc",
         plugin_options = plugin_options,
-        gen_cc = 1,
+        langs = ["cpp"],
         outs = outs,
         visibility = ["//visibility:public"],
-        deps = [s + "_genproto" for s in all_protolib_deps],
+        deps = [s + "_genproto" for s in protolib_deps],
     )
 
     cc_libs_grpc_header_only = cc_libs[:]
@@ -227,7 +227,7 @@ def py_proto_library(
         deps = [s + "_genproto" for s in deps],
         includes = includes,
         protoc = protoc,
-        gen_py = 1,
+        langs = ["python"],
         outs = outs,
         visibility = ["//visibility:public"],
         plugin = grpc_python_plugin,

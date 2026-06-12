@@ -10,7 +10,7 @@ namespace {
 ::google::protobuf::util::JsonPrintOptions CreateJsonPrintOption() {
     ::google::protobuf::util::JsonPrintOptions option;
     option.add_whitespace = false;
-    option.always_print_primitive_fields = true;
+    option.always_print_fields_with_no_presence = true;
     option.always_print_enums_as_ints = false;
     option.preserve_proto_field_names = true;
     return option;
@@ -42,7 +42,7 @@ bool ProtoMessageJsonUtil::FromJson(const std::string &json, ::google::protobuf:
     auto status = google::protobuf::util::JsonStringToMessage(json, message, option);
     if (!status.ok()) {
         // TODO: change to return in response
-        KVCM_LOG_WARN("json parse error, message: %s", status.error_message().data());
+        KVCM_LOG_WARN("json parse error, message: %s", std::string(status.message()).c_str());
     }
     return status.ok();
 }

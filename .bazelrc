@@ -75,10 +75,21 @@ build --copt -O2
 build --copt -g --strip=never
 build --copt -Wall
 build --copt -Werror
+build --copt -Wno-unknown-warning-option # allow GCC-specific flags with clang
+build --copt -Wno-deprecated-non-prototype # zlib old C code
+build --copt -Wno-inconsistent-missing-override # clang override warning
+build --copt -Wno-macro-redefined # allow EIGEN_MAX_CPP_VER override
+build --copt -Wno-unused-private-field # clang: unused private fields
+build --copt -Wno-braced-scalar-init # clang: braces around scalar init
+build --copt -Wno-unused-lambda-capture # clang: unused lambda capture
+build --copt -Wno-defaulted-function-deleted # clang: defaulted function deleted
+build --cxxopt -std=c++17 # required by Eigen/XLA
+build --copt -DEIGEN_MAX_CPP_VER=17 # override default 11
 build --copt -Wno-unknown-pragmas # omp
 build --copt -Wno-sign-compare # alog
 build --copt -Wno-attributes # pybind11
 build --per_file_copt=havenask//.*@-Wno-error=array-bounds # havenask gcc13
+build --per_file_copt=external/.*@-Wno-error # disable -Werror for all external deps
 build --copt -Wno-stringop-truncation # grpc
 build --copt -Wno-stringop-overflow # grpc
 build --copt -Wno-tautological-compare # grpc
@@ -92,9 +103,9 @@ build --copt -Wno-unused-result # grpc gcc11
 # build --copt="-mrdrnd"
 build --cxxopt -Wno-class-memaccess # grpc
 build --copt -Wno-deprecated-declarations
-build --experimental_cc_implementation_deps
+# --experimental_cc_implementation_deps stabilized in Bazel 7
 build --copt -DOPENSSL_IS_BORINGSSL
-build --experimental_cc_shared_library
+# --experimental_cc_shared_library stabilized in Bazel 7
 build --linkopt="-lm"
 build --linkopt="-lpthread"
 build --define=grpc_no_ares=true
@@ -166,6 +177,9 @@ build:client_only_header  --define CLIENT_ONLY_HEADER=true
 build:tpu --define DISABLE_MOONCAKE=true
 build:tpu --copt=-DUSING_TPU
 build:tpu --define using_tpu=true
+# NOTE: WORKSPACE and MODULE.bazel coexist for TPU builds.
+# bzlmod handles xla/jax/abseil/protobuf/grpc; WORKSPACE handles legacy deps.
+build:tpu --experimental_repo_remote_exec  # required by XLA's tensorrt_configure
 # client_with_tpu: build kv_cache_manager_client.so without mooncake/RDMA
 build:client_with_tpu --config=tpu
 build:client_with_tpu --copt=-DENABLE_TAIR_MEMPOOL

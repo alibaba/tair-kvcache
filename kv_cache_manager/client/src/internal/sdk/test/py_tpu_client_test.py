@@ -208,6 +208,50 @@ class TpuClientTest(unittest.TestCase):
         self.client.destroy_raw_buffer(raw)
         self.client.destroy_buffer(buf)
 
+    def test_jax_array_extract_buffer(self):
+        """Extract PJRT_Buffer* handle from a jax.Array."""
+        import jax
+        import jax.numpy as jnp
+
+        x = jnp.arange(8, dtype=jnp.float32)
+        ec, buf_ptr = self.client.extract_buffer_from_jax_array(x)
+        self._assert_ok(ec, "extract_buffer_from_jax_array")
+        self.assertNotEqual(buf_ptr, 0, "buffer ptr should not be null")
+
+    def test_jax_array_d2h(self):
+        """D2H transfer from jax.Array device buffer to host via TpuClient."""
+        import jax
+        import jax.numpy as jnp
+
+        expected = np.arange(128, dtype=np.float32)
+        x = jnp.array(expected)
+
+        dst = np.zeros(128, dtype=np.float32)
+        ec = self.client.buffer_to_host_from_jax(x, dst.ctypes.data, dst.nbytes)
+        self._assert_ok(ec, "buffer_to_host_from_jax")
+        np.testing.assert_array_equal(expected, dst)
+
+    def test_jax_array_h2d_d2h_roundtrip(self):
+        """H2D via TpuClient + D2H from jax.Array to verify data on device."""
+        import jax
+        import jax.numpy as jnp
+
+        # Create data on host
+        src_data = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+                            dtype=np.float32)
+
+        # H2D: create a new PJRT_Buffer on TPU via TpuClient
+        ec, buf = self.client.buffer_from_host(src_data.ctypes.data, src_data.nbytes)
+        self._assert_ok(ec, "buffer_from_host")
+
+        # D2H: read back via TpuClient's BufferToHost
+        dst = np.zeros(8, dtype=np.float32)
+        ec = self.client.buffer_to_host(buf, dst.ctypes.data, dst.nbytes)
+        self._assert_ok(ec, "buffer_to_host")
+        np.testing.assert_array_equal(src_data, dst)
+
+        self.client.destroy_buffer(buf)
+
 
 def _ordered_suite():
     """Build a test suite with test_0_jax_interaction running first."""
@@ -224,6 +268,9 @@ def _ordered_suite():
         "test_large_buffer",
         "test_dma_map",
         "test_raw_buffer",
+        "test_jax_array_extract_buffer",
+        "test_jax_array_d2h",
+        "test_jax_array_h2d_d2h_roundtrip",
     ]
     suite.addTests(loader.loadTestsFromNames(test_names, TpuClientTest))
     return suite

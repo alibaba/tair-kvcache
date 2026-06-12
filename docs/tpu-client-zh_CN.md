@@ -38,6 +38,18 @@ libtpu 内部的 `RealInitGoogle()` 完成 Google 子系统初始化。
 | RawBuffer 销毁 | `DestroyRawBuffer()` | 释放 RawBuffer（不影响原 Buffer） |
 | 错误信息 | `GetErrorMessage()` | 静态方法，提取 PJRT_Error 中的文本 |
 
+### jax.Array 集成（py_tpu_client 绑定）
+
+Python 绑定层（`py_tpu_client`）提供直接操作 `jax.Array` 对象的方法，
+通过 tpu-raiden 方案（`PyArrayObject → ifrt::Array → PjRtCompatibleArray → PjRtBuffer* → PJRT_Buffer*`）
+提取底层设备 Buffer：
+
+| 接口 | 说明 |
+|---|---|
+| `extract_buffer_from_jax_array(jax_array)` | 从 jax.Array 提取 `PJRT_Buffer*` C API 句柄 |
+| `buffer_to_host_from_jax(jax_array, dst, size)` | 从 jax.Array 设备 Buffer 执行 D2H 传输 |
+| `buffer_from_host_to_jax_device(jax_array, src, size)` | H2D 传输（在同一设备上创建新 Buffer） |
+
 注意：`CreateViewOfDeviceBuffer` 在 TPU 平台上**不受支持**，所有数据
 传输均通过 `BufferFromHostBuffer` / `ToHostBuffer` 实现。
 
@@ -208,3 +220,8 @@ WaitEventsBatch、DestroyEventNullSafe、WaitEventNullSafe、
 AsyncBufferOpsUninitReturnsError、HasRawBufferExtensionAfterInit、
 RawBufferRoundTrip、RawBufferOpsUninitReturnsError、
 DestroyRawBufferNullSafe、RawBufferBatchAsyncD2H。
+
+Python 层测试（py_tpu_client_test.py）额外覆盖：
+JaxInteraction、BasicRoundtrip、NumpyRoundtrip、AsyncH2D、AsyncD2H、
+LargeBuffer、DmaMap、RawBuffer、JaxArrayExtractBuffer、
+JaxArrayD2H、JaxArrayH2DD2HRoundtrip。

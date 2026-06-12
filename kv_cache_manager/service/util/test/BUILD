@@ -1,6 +1,7 @@
 package(default_visibility = ["//visibility:private"])
 
-load("//bazel:tf_proto.bzl", "tf_proto_library_cc")
+load("@rules_proto//proto:defs.bzl", "proto_library")
+load("@com_google_protobuf//bazel:cc_proto_library.bzl", "cc_proto_library")
 
 cc_test(
     name = "ProtoMessageJsonUtilTest",
@@ -15,22 +16,12 @@ cc_test(
     ],
 )
 
-tf_proto_library_cc(
-    name = "service_util_test",
-    srcs = [
-        "service_util_test.proto",
-    ],
-    default_header = True,
+proto_library(
+    name = "service_util_test_proto",
+    srcs = ["service_util_test.proto"],
 )
 
-cc_library(
+cc_proto_library(
     name = "service_util_test_cc_proto",
-    srcs = [
-        "service_util_test.pb.cc",
-    ],
-    hdrs = [
-        "service_util_test.pb.h",
-    ],
-    include_prefix = "service/util/test",
-    deps = [":service_util_test_cc_impl"],
+    deps = [":service_util_test_proto"],
 )

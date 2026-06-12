@@ -49,6 +49,7 @@ py_test(
     data = ["lsan_suppressions.txt"],
     # 主入口改为 runner
     main = "asan_runner.py",
+    imports = ["../../.."],
     deps = [
         "//kv_cache_manager/client/pybind:kvcm_py_client_lib",
     ],

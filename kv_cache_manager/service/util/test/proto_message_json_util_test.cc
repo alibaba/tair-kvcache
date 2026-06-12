@@ -2,7 +2,7 @@
 
 #include "kv_cache_manager/common/unittest.h"
 #include "service/util/proto_message_json_util.h"
-#include "service/util/test/service_util_test.pb.h"
+#include "kv_cache_manager/service/util/test/service_util_test.pb.h"
 
 namespace kv_cache_manager {
 

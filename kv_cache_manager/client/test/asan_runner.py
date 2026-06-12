@@ -16,6 +16,13 @@ test_script = sys.argv[2]
 rest_args = sys.argv[3:]
 
 env = os.environ.copy()
+# Propagate Bazel's sys.path (imports) to the child process via PYTHONPATH
+existing_pythonpath = env.get("PYTHONPATH", "")
+bazel_paths = os.pathsep.join(p for p in sys.path if p)
+if existing_pythonpath:
+    env["PYTHONPATH"] = bazel_paths + os.pathsep + existing_pythonpath
+else:
+    env["PYTHONPATH"] = bazel_paths
 if "ASAN_OPTIONS"  in os.environ:
     # --- 构造绝对路径 ---
     suppressions_abs = os.path.join(os.environ.get("TEST_SRCDIR"), os.environ.get("TEST_WORKSPACE"), suppressions_runfiles_path)

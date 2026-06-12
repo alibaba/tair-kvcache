@@ -164,11 +164,18 @@ pybind_extension(
             "hf3fs_unittest_empty.cc",
         ],
     }),
+    features = ["-use_header_modules"],
     deps = [
         "//kv_cache_manager/client/src/internal/sdk",
     ] + select({
         ":using_tpu": [
             "//3rdparty/libtpu",
+            "//kv_cache_manager/client/src/internal/sdk/tpu:jax_utils",
+            "@xla//xla/pjrt:pjrt_client",
+            "@xla//xla/pjrt/c_api_client:pjrt_c_api_client",
+            "@xla//xla/python/ifrt",
+            "@xla//xla/python/pjrt_ifrt",
+            "@jax//jaxlib:py_client",
         ],
         "//conditions:default": [],
     }),

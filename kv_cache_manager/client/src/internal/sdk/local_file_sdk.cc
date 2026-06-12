@@ -247,9 +247,9 @@ ClientErrorCode LocalFileSdk::Get(const std::vector<DataStorageUri> &remote_uris
         KVCM_LOG_ERROR("Get failed, remote_uris size not equal to local_buffers size");
         return ER_INVALID_PARAMS;
     }
-    // DoGet may modify iov.base for TPU buffers (output parameter semantics).
-    // const_cast is safe: Get fills destination buffers, similar to how read()
-    // writes to its output buffer despite the data being conceptually "const".
+    // const_cast: Get writes into destination buffers (CPU/GPU iov.base).
+    // For TPU, iov.base holds a PyArray* (read-only input); data is written
+    // directly into the jax.Array's existing device memory via RawBuffer.
     auto &mutable_buffers = const_cast<BlockBuffers &>(local_buffers);
     auto group_map = SplitByPath(remote_uris, mutable_buffers);
     for (const auto &group : group_map) {
@@ -392,9 +392,9 @@ ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_ur
         }
     }
     std::vector<PJRT_Event*> tpu_events;
-    std::vector<PJRT_Buffer*> tpu_buffers;
-    std::vector<void**> tpu_iov_bases;  // iov.base pointers to assign after async completes
-    std::vector<std::vector<char>> tpu_temp_bufs;  // keep host buffers alive during async H2D
+    std::vector<PJRT_Buffer*> tpu_new_bufs;   // newly created buffers (Get output)
+    std::vector<void**> tpu_iov_bases;         // iov.base pointers to update (Get output)
+    std::vector<std::vector<char>> tpu_temp_bufs;  // temp host buffers for H2D
 #endif
 
     size_t offset = 0;
@@ -458,20 +458,24 @@ ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_ur
                 } else if (iov.type == MemoryType::TPU) {
 #if defined(USING_TPU)
                     exist_tpu_iov = true;
+                    // Get: file → TPU. Create a new PJRT_Buffer* from file data.
+                    // The bridge extracts the existing PJRT_Buffer* from iov.base
+                    // (used only for validation), but we create a NEW buffer since
+                    // BufferFromHost handles tile layout correctly.
                     tpu_temp_bufs.emplace_back(iov.size);
                     std::memcpy(tpu_temp_bufs.back().data(), src + offset, iov.size);
-                    PJRT_Buffer* tpu_buffer = nullptr;
+                    PJRT_Buffer* new_buf = nullptr;
                     PJRT_Event* event = nullptr;
                     auto buf_ec = tpu_client_.BufferFromHostAsync(
-                        tpu_temp_bufs.back().data(), iov.size, tpu_buffer, event);
+                        tpu_temp_bufs.back().data(), iov.size, new_buf, event);
                     if (buf_ec != ER_OK) {
                         KVCM_LOG_ERROR("TPU BufferFromHostAsync failed in Get");
                         for (auto* e : tpu_events) tpu_client_.DestroyEvent(e);
-                        for (auto* b : tpu_buffers) tpu_client_.DestroyBuffer(b);
+                        for (auto* b : tpu_new_bufs) tpu_client_.DestroyBuffer(b);
                         return buf_ec;
                     }
                     tpu_events.push_back(event);
-                    tpu_buffers.push_back(tpu_buffer);
+                    tpu_new_bufs.push_back(new_buf);
                     tpu_iov_bases.push_back(&iov.base);
 #endif
                 }
@@ -485,12 +489,12 @@ ClientErrorCode LocalFileSdk::DoGet(const std::vector<DataStorageUri> &remote_ur
         auto wait_ec = tpu_client_.WaitEvents(tpu_events);
         if (wait_ec != ER_OK) {
             KVCM_LOG_ERROR("TPU WaitEvents failed in Get");
-            for (auto* b : tpu_buffers) tpu_client_.DestroyBuffer(b);
+            for (auto* b : tpu_new_bufs) tpu_client_.DestroyBuffer(b);
             return wait_ec;
         }
-        // All async H2D completed; assign buffer handles to iovs
-        for (size_t j = 0; j < tpu_buffers.size(); ++j) {
-            *tpu_iov_bases[j] = reinterpret_cast<void*>(tpu_buffers[j]);
+        // All async H2D completed; assign new buffer handles to iov.base
+        for (size_t j = 0; j < tpu_new_bufs.size(); ++j) {
+            *tpu_iov_bases[j] = reinterpret_cast<void*>(tpu_new_bufs[j]);
         }
     }
 #elif defined(USING_CUDA)
@@ -646,16 +650,25 @@ ClientErrorCode LocalFileSdk::DoPut(const std::vector<DataStorageUri> &remote_ur
                 } else if (iov.type == MemoryType::TPU) {
 #if defined(USING_TPU)
                     exist_tpu_iov = true;
-                    PJRT_Buffer* tpu_buffer = reinterpret_cast<PJRT_Buffer*>(iov.base);
-                    if (!tpu_buffer) {
-                        KVCM_LOG_ERROR("TPU buffer handle is null in Put");
+                    // Put: TPU → file. Extract PJRT_Buffer* from iov.base via bridge,
+                    // then use BufferToHostAsync (handles tile layout correctly).
+                    auto extractor = GetPyArrayBufferExtractor();
+                    if (!extractor) {
+                        KVCM_LOG_ERROR("TPU PyArray buffer extractor not registered in Put");
                         for (auto* e : tpu_events) tpu_client_.DestroyEvent(e);
                         return ER_TPU_BUFFER_TRANSFER_ERROR;
                     }
+                    PJRT_Buffer* c_buf = extractor(iov.base);
+                    if (!c_buf) {
+                        KVCM_LOG_ERROR("TPU PyArray buffer extraction returned null in Put");
+                        for (auto* e : tpu_events) tpu_client_.DestroyEvent(e);
+                        return ER_TPU_BUFFER_TRANSFER_ERROR;
+                    }
+                    // D2H: device memory → temp host buffer via regular API
                     tpu_temp_bufs.emplace_back(iov.size);
                     PJRT_Event* event = nullptr;
                     auto buf_ec = tpu_client_.BufferToHostAsync(
-                        tpu_buffer, tpu_temp_bufs.back().data(), iov.size, event);
+                        c_buf, tpu_temp_bufs.back().data(), iov.size, event);
                     if (buf_ec != ER_OK) {
                         KVCM_LOG_ERROR("TPU BufferToHostAsync failed in Put");
                         for (auto* e : tpu_events) tpu_client_.DestroyEvent(e);
