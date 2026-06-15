@@ -7,7 +7,7 @@
 
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/online_optimizer/config/optimizer_registry_manager.h"
-#include "kv_cache_manager/online_optimizer/indexer/ttl_cache_indexer_wrapper.h"
+#include "kv_cache_manager/online_optimizer/indexer/cache_indexer_factory.h"
 
 namespace kv_cache_manager {
 
@@ -135,14 +135,9 @@ ErrorCode OnlineOptimizerManager::RegisterInstanceInternal(const OptimizerInstan
     state->linear_step = linear_step;
     state->total_hits_per_capacity.resize(capacity_gb.size(), 0);
 
-    state->indexer = CreateCacheIndexer(instance_group.indexer_type(), instance_group.max_key_count(),
-                                        capacity_gb, size_full_only, size_full_linear, linear_step);
-
-    if (instance_group.ttl_seconds() > 0) {
-        state->indexer = std::make_unique<TtlCacheIndexerWrapper>(
-            std::move(state->indexer),
-            instance_group.ttl_seconds());
-    }
+    state->indexer = CacheIndexerFactory::CreateCacheIndexer(instance_group.indexer_type(), instance_group.max_key_count(),
+                                        capacity_gb, size_full_only, size_full_linear, linear_step,
+                                        instance_group.ttl_seconds());
 
     {
         std::unique_lock lock(instances_mutex_);
@@ -270,6 +265,18 @@ ErrorCode OnlineOptimizerManager::ListInstances(const std::string &instance_grou
             s.per_capacity_hit_rates.push_back(info);
         }
 
+        // Collect hit age bucket distribution
+        auto age_buckets = state->indexer->GetHitAgeBuckets();
+        for (const auto &bucket : age_buckets) {
+            HitAgeBucketRatio ratio_info;
+            ratio_info.threshold_seconds = bucket.threshold_seconds;
+            ratio_info.hit_count = bucket.hit_count;
+            ratio_info.ratio = s.total_max_hits > 0
+                ? static_cast<double>(bucket.hit_count) / static_cast<double>(s.total_max_hits)
+                : 0.0;
+            s.hit_age_bucket_ratios.push_back(ratio_info);
+        }
+
         summaries.push_back(std::move(s));
     }
     return EC_OK;
@@ -287,17 +294,13 @@ ErrorCode OnlineOptimizerManager::ResetStats(const std::string &instance_id) {
     }
 
     std::lock_guard<std::mutex> guard(state->mutex);
-    state->indexer = CreateCacheIndexer(state->instance_group->indexer_type(),
+    state->indexer = CacheIndexerFactory::CreateCacheIndexer(state->instance_group->indexer_type(),
                                         state->instance_group->max_key_count(),
                                         state->instance_group->capacity_gb(),
                                         state->size_full_only,
                                         state->size_full_linear,
-                                        state->linear_step);
-    if (state->instance_group->ttl_seconds() > 0) {
-        state->indexer = std::make_unique<TtlCacheIndexerWrapper>(
-            std::move(state->indexer),
-            state->instance_group->ttl_seconds());
-    }
+                                        state->linear_step,
+                                        state->instance_group->ttl_seconds());
     state->total_queries = 0;
     state->total_blocks_queried = 0;
     std::fill(state->total_hits_per_capacity.begin(), state->total_hits_per_capacity.end(), 0);

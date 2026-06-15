@@ -45,6 +45,10 @@ public:
                                 const proto::optimizer::OptimizerRemoveInstanceRequest *request,
                                 proto::optimizer::OptimizerRemoveInstanceResponse *response) override;
 
+    grpc::Status GetInstance(grpc::ServerContext *context,
+                             const proto::optimizer::OptimizerGetInstanceRequest *request,
+                             proto::optimizer::OptimizerGetInstanceResponse *response) override;
+
     // TraceQuery
     grpc::Status TraceQuery(grpc::ServerContext *context,
                             const proto::optimizer::TraceQueryRequest *request,

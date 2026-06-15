@@ -1,5 +1,5 @@
 #include "kv_cache_manager/common/unittest.h"
-#include "kv_cache_manager/online_optimizer/indexer/cache_indexer.h"
+#include "kv_cache_manager/online_optimizer/indexer/cache_indexer_factory.h"
 #include "kv_cache_manager/online_optimizer/indexer/ttl_cache_indexer_wrapper.h"
 
 #include <vector>
@@ -12,7 +12,7 @@ static std::unique_ptr<CacheIndexer> MakeInnerIndexer(const std::string &type,
                                                        int64_t max_key_count = 0,
                                                        double capacity_gb = 10.0) {
     constexpr int64_t kOneGB = 1024LL * 1024 * 1024;
-    auto indexer = CreateCacheIndexer(type, max_key_count, {capacity_gb}, kOneGB, kOneGB, 1);
+    auto indexer = CacheIndexerFactory::CreateCacheIndexer(type, max_key_count, {capacity_gb}, kOneGB, kOneGB, 1);
     return indexer;
 }
 
@@ -232,6 +232,131 @@ TEST_F(TtlCacheIndexerWrapperTest, ExactTtlBoundary) {
     wrapper.ProcessKeys({1}, hit_count, max_hit);
     EXPECT_EQ(0, hit_count[0]);
     EXPECT_EQ(1, wrapper.ttl_eviction_count());
+}
+
+TEST_F(TtlCacheIndexerWrapperTest, HitAgeBucketBasic) {
+    int64_t now = 1000;
+    auto clock = [&now]() { return now; };
+    TtlCacheIndexerWrapper wrapper(MakeInnerIndexer("fenwick_lru"), 3600, clock);
+    // Use small thresholds for easy testing
+    wrapper.SetHitAgeBucketThresholds({10, 30, 60});
+    // Buckets: [0,10) [10,30) [30,60) [60,+inf)
+
+    std::vector<int64_t> hit_count;
+    int64_t max_hit;
+
+    // Insert keys 1, 2, 3
+    wrapper.ProcessKeys({1, 2, 3}, hit_count, max_hit);
+
+    // Re-access key 1 at age=5 (< 10 → bucket 0)
+    now = 1005;
+    wrapper.ProcessKeys({1}, hit_count, max_hit);
+
+    // Re-access key 2 at age=15 (>= 10, < 30 → bucket 1)
+    now = 1015;
+    wrapper.ProcessKeys({2}, hit_count, max_hit);
+
+    // Re-access key 3 at age=45 (>= 30, < 60 → bucket 2)
+    now = 1045;
+    wrapper.ProcessKeys({3}, hit_count, max_hit);
+
+    auto buckets = wrapper.GetHitAgeBuckets();
+    ASSERT_EQ(4u, buckets.size());
+
+    // bucket [0,10): threshold=10, count=1 (key 1 at age 5)
+    EXPECT_EQ(10, buckets[0].threshold_seconds);
+    EXPECT_EQ(1, buckets[0].hit_count);
+
+    // bucket [10,30): threshold=30, count=1 (key 2 at age 15)
+    EXPECT_EQ(30, buckets[1].threshold_seconds);
+    EXPECT_EQ(1, buckets[1].hit_count);
+
+    // bucket [30,60): threshold=60, count=1 (key 3 at age 45)
+    EXPECT_EQ(60, buckets[2].threshold_seconds);
+    EXPECT_EQ(1, buckets[2].hit_count);
+
+    // bucket [60,+inf): threshold=0, count=0
+    EXPECT_EQ(0, buckets[3].threshold_seconds);
+    EXPECT_EQ(0, buckets[3].hit_count);
+}
+
+TEST_F(TtlCacheIndexerWrapperTest, HitAgeBucketInfinityBucket) {
+    int64_t now = 1000;
+    auto clock = [&now]() { return now; };
+    TtlCacheIndexerWrapper wrapper(MakeInnerIndexer("fenwick_lru"), 10000, clock);
+    wrapper.SetHitAgeBucketThresholds({10, 100});
+    // Buckets: [0,10) [10,100) [100,+inf)
+
+    std::vector<int64_t> hit_count;
+    int64_t max_hit;
+    wrapper.ProcessKeys({1}, hit_count, max_hit);
+
+    // Re-access at age=200 (>= 100 → bucket 2, the +inf bucket)
+    now = 1200;
+    wrapper.ProcessKeys({1}, hit_count, max_hit);
+
+    auto buckets = wrapper.GetHitAgeBuckets();
+    ASSERT_EQ(3u, buckets.size());
+    EXPECT_EQ(0, buckets[0].hit_count);   // [0,10)
+    EXPECT_EQ(0, buckets[1].hit_count);   // [10,100)
+    EXPECT_EQ(1, buckets[2].hit_count);   // [100,+inf)
+    EXPECT_EQ(0, buckets[2].threshold_seconds);
+}
+
+TEST_F(TtlCacheIndexerWrapperTest, HitAgeBucketDefaultThresholds) {
+    int64_t now = 1000;
+    auto clock = [&now]() { return now; };
+    TtlCacheIndexerWrapper wrapper(MakeInnerIndexer("fenwick_lru"), 100000, clock);
+    // Don't call SetHitAgeBucketThresholds — use defaults {5,30,60,120,300,600,1800,3600,7200}
+
+    auto buckets = wrapper.GetHitAgeBuckets();
+    // 9 thresholds + 1 infinity bucket = 10
+    ASSERT_EQ(10u, buckets.size());
+    EXPECT_EQ(5, buckets[0].threshold_seconds);
+    EXPECT_EQ(30, buckets[1].threshold_seconds);
+    EXPECT_EQ(60, buckets[2].threshold_seconds);
+    EXPECT_EQ(120, buckets[3].threshold_seconds);
+    EXPECT_EQ(300, buckets[4].threshold_seconds);
+    EXPECT_EQ(600, buckets[5].threshold_seconds);
+    EXPECT_EQ(1800, buckets[6].threshold_seconds);
+    EXPECT_EQ(3600, buckets[7].threshold_seconds);
+    EXPECT_EQ(7200, buckets[8].threshold_seconds);
+    EXPECT_EQ(0, buckets[9].threshold_seconds);
+
+    // All counts should be 0 initially
+    for (const auto &b : buckets) {
+        EXPECT_EQ(0, b.hit_count);
+    }
+}
+
+TEST_F(TtlCacheIndexerWrapperTest, HitAgeBucketMultipleHitsSameBucket) {
+    int64_t now = 1000;
+    auto clock = [&now]() { return now; };
+    TtlCacheIndexerWrapper wrapper(MakeInnerIndexer("fenwick_lru"), 3600, clock);
+    wrapper.SetHitAgeBucketThresholds({10, 30});
+
+    std::vector<int64_t> hit_count;
+    int64_t max_hit;
+
+    // Insert 3 keys
+    wrapper.ProcessKeys({1, 2, 3}, hit_count, max_hit);
+
+    // Re-access all 3 at age=5 → all fall into bucket [0,10)
+    now = 1005;
+    wrapper.ProcessKeys({1, 2, 3}, hit_count, max_hit);
+
+    auto buckets = wrapper.GetHitAgeBuckets();
+    ASSERT_EQ(3u, buckets.size());
+    EXPECT_EQ(3, buckets[0].hit_count);   // [0,10): 3 hits
+    EXPECT_EQ(0, buckets[1].hit_count);   // [10,30)
+    EXPECT_EQ(0, buckets[2].hit_count);   // [30,+inf)
+}
+
+TEST_F(TtlCacheIndexerWrapperTest, HitAgeBucketNoTrackingWithoutTtlWrapper) {
+    // Base CacheIndexer should return empty buckets
+    auto indexer = MakeInnerIndexer("fenwick_lru");
+    auto buckets = indexer->GetHitAgeBuckets();
+    EXPECT_TRUE(buckets.empty());
 }
 
 } // namespace kv_cache_manager

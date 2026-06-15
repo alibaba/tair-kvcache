@@ -56,6 +56,12 @@ struct PerCapacityHitRateInfo {
     double hit_rate;
 };
 
+struct HitAgeBucketRatio {
+    int64_t threshold_seconds;  // upper bound of this bucket (0 means "+inf")
+    int64_t hit_count;
+    double ratio;               // hit_count / total_max_hits
+};
+
 struct InstanceSummary {
     std::string instance_id;
     std::string instance_group;
@@ -72,6 +78,7 @@ struct InstanceSummary {
     int64_t kv_cache_usage_bytes = 0;
     int64_t ttl_eviction_count = 0;
     std::vector<PerCapacityHitRateInfo> per_capacity_hit_rates;
+    std::vector<HitAgeBucketRatio> hit_age_bucket_ratios;
 };
 
 class OnlineOptimizerManager {

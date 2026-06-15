@@ -40,9 +40,16 @@ public:
 
     void PostQueryMaintenance() override;
     bool RemoveKey(int64_t key) override;
+    std::vector<HitAgeBucketInfo> GetHitAgeBuckets() const override;
+
+    // Configure the age bucket thresholds (in seconds, ascending order).
+    // The last bucket implicitly covers [last_threshold, +inf).
+    // Default: {5, 30, 60, 120, 300, 600, 1800, 3600, 7200}.
+    void SetHitAgeBucketThresholds(const std::vector<int64_t> &thresholds);
 
 private:
     void HarvestExpired(int64_t now);
+    size_t FindAgeBucket(int64_t age_seconds) const;
 
     std::unique_ptr<CacheIndexer> inner_;
     int64_t ttl_seconds_;
@@ -51,6 +58,13 @@ private:
     std::unordered_map<int64_t, int64_t> key_access_time_;
     std::set<std::pair<int64_t, int64_t>> expire_set_;
     int64_t ttl_eviction_count_ = 0;
+
+    // Age bucket thresholds (sorted ascending). Each value is the upper bound
+    // of a bucket. A final "+inf" bucket is always appended.
+    std::vector<int64_t> hit_age_thresholds_ = {5, 30, 60, 120, 300, 600, 1800, 3600, 7200};
+    // hit_age_bucket_counts_ has size = hit_age_thresholds_.size() + 1
+    // buckets: [0,5) [5,30) [30,60) ... [7200, +inf)
+    std::vector<int64_t> hit_age_bucket_counts_;
 };
 
 } // namespace kv_cache_manager

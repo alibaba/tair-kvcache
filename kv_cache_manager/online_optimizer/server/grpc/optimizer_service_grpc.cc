@@ -98,6 +98,16 @@ grpc::Status OptimizerServiceGRpc::RemoveInstance(
     return grpc::Status::OK;
 }
 
+grpc::Status OptimizerServiceGRpc::GetInstance(
+    grpc::ServerContext *context,
+    const proto::optimizer::OptimizerGetInstanceRequest *request,
+    proto::optimizer::OptimizerGetInstanceResponse *response) {
+    RequestContext request_context(request->trace_id(), MakeCollector(metrics_registry_));
+    request_context.set_client_ip(ExtractIpFromPeer(context->peer()));
+    service_impl_->GetInstance(&request_context, request, response);
+    return grpc::Status::OK;
+}
+
 // TraceQuery
 
 grpc::Status OptimizerServiceGRpc::TraceQuery(

@@ -10,7 +10,7 @@ cc_library(
     ],
     deps = [
         "//kv_cache_manager/common",
-        "//kv_cache_manager/config",
+        "//kv_cache_manager/config:instance_info",
     ],
 )
 
@@ -39,7 +39,7 @@ cc_library(
         ":optimizer_instance_group",
         ":optimizer_instance_info",
         "//kv_cache_manager/common",
-        "//kv_cache_manager/config",
+        "//kv_cache_manager/config:registry_backend",
     ],
 )
 
@@ -47,7 +47,6 @@ cc_library(
     name = "cache_indexer",
     srcs = [
         "indexer/bst_cache_indexer.cc",
-        "indexer/cache_indexer.cc",
         "indexer/fenwick_cache_indexer.cc",
         "indexer/lru_cache_indexer.cc",
     ],
@@ -60,6 +59,22 @@ cc_library(
     deps = [
         "//kv_cache_manager/common:logger",
         "//kv_cache_manager/common/cache",
+    ],
+)
+
+cc_library(
+    name = "cache_indexer_factory",
+    srcs = [
+        "indexer/cache_indexer_factory.cc",
+    ],
+    hdrs = [
+        "indexer/cache_indexer_factory.h",
+    ],
+    deps = [
+        ":cache_indexer",
+        ":ttl_cache_indexer_wrapper",
+        "//kv_cache_manager/common:env_util",
+        "//kv_cache_manager/common:logger",
     ],
 )
 
@@ -90,6 +105,7 @@ cc_library(
         ":optimizer_instance_info",
         ":optimizer_registry_manager",
         ":cache_indexer",
+        ":cache_indexer_factory",
         ":ttl_cache_indexer_wrapper",
         "//kv_cache_manager/common",
     ],

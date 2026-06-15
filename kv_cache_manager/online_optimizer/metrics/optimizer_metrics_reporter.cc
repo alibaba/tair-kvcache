@@ -46,6 +46,8 @@ struct OptimizerMetricsReporter::KmonContext {
     DECLARE_METRICS(query, max_hit_count);
     DECLARE_METRICS(query, max_hit_rate);
 
+    DECLARE_METRICS(trace, query_hit_age_bucket_ratio);
+
     struct MapHashFunc {
         size_t operator()(const std::map<std::string, std::string> &m) const noexcept {
             size_t hash = 0;
@@ -214,6 +216,8 @@ bool OptimizerMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(query, max_hit_count);
     REGISTER_GAUGE_METRIC(query, max_hit_rate);
 
+    REGISTER_GAUGE_METRIC(trace, query_hit_age_bucket_ratio);
+
     KVCM_LOG_INFO("OptimizerMetricsReporter: kmonitor initialized, prefix[%s]", prefix_.c_str());
     return true;
 }
@@ -298,6 +302,15 @@ void OptimizerMetricsReporter::ReportInterval() {
             Gauge rate = metrics_registry_->GetGauge(prefix_ + ".trace_query_hit_rate", cap_tags);
             rate = cap_info.hit_rate;
         }
+
+        for (const auto &bucket : s.hit_age_bucket_ratios) {
+            std::string bucket_label = bucket.threshold_seconds > 0
+                ? std::to_string(bucket.threshold_seconds) + "s"
+                : "inf";
+            MetricsTags bucket_tags = {{"instance_id", s.instance_id}, {"age_bucket", bucket_label}};
+            Gauge bucket_ratio = metrics_registry_->GetGauge(prefix_ + ".trace_query_hit_age_bucket_ratio", bucket_tags);
+            bucket_ratio = bucket.ratio;
+        }
     }
 
     // --- Kmonitor ---
@@ -325,6 +338,15 @@ void OptimizerMetricsReporter::ReportInterval() {
             MetricsTags cap_tags = {{"instance_id", s.instance_id}, {"capacity_gb", cap_str}};
             kmonitor::MetricsTags ktags = kmon_ctx_->GetKmonitorTags(cap_tags);
             kmon_ctx_->trace_query_hit_rate_metrics->Report(&ktags, cap_info.hit_rate);
+        }
+
+        for (const auto &bucket : s.hit_age_bucket_ratios) {
+            std::string bucket_label = bucket.threshold_seconds > 0
+                ? std::to_string(bucket.threshold_seconds) + "s"
+                : "inf";
+            MetricsTags bucket_tags = {{"instance_id", s.instance_id}, {"age_bucket", bucket_label}};
+            kmonitor::MetricsTags ktags = kmon_ctx_->GetKmonitorTags(bucket_tags);
+            kmon_ctx_->trace_query_hit_age_bucket_ratio_metrics->Report(&ktags, bucket.ratio);
         }
     }
 }
@@ -381,12 +403,10 @@ void OptimizerMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
     // service metrics
     REPORT_METRICS(service, qps, 1.0);
     REPORT_STEAL_METRICS(service, query_rt_us);
-
-    do {
-        double service_error_code_v;
-        GET_METRICS_(p, service, error_code, service_error_code_v);
-        REPORT_METRICS_WHEN(service, error_qps, 1.0, !CommonUtil::IsZeroDouble(service_error_code_v));
-    } while (false);
+    double service_error_code_v;
+    STEAL_METRICS_(p, service, error_code, service_error_code_v);
+    REPORT_METRICS_WHEN(service, error_qps, 1.0,
+                        !std::isnan(service_error_code_v) && !CommonUtil::IsZeroDouble(service_error_code_v));
 
     // optimizer business metrics
     if (p->total_blocks() > 0) {

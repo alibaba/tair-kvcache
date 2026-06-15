@@ -33,6 +33,7 @@ cc_test(
     deps = [
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/online_optimizer:cache_indexer",
+        "//kv_cache_manager/online_optimizer:cache_indexer_factory",
         "//kv_cache_manager/online_optimizer:ttl_cache_indexer_wrapper",
     ],
 )

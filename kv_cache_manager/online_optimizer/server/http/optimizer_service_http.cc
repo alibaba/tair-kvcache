@@ -64,6 +64,8 @@ void OptimizerServiceHttp::RegisterHandler() {
         Post, optimizer/registerInstance, OptimizerRegisterInstance, OptimizerRegisterInstance, RegisterInstance);
     REGISTER_HTTP_HANDLER_FOR_OPTIMIZER_SERVICE(
         Post, optimizer/removeInstance, OptimizerRemoveInstance, OptimizerRemoveInstance, RemoveInstance);
+    REGISTER_HTTP_HANDLER_FOR_OPTIMIZER_SERVICE(
+        Post, optimizer/getInstance, OptimizerGetInstance, OptimizerGetInstance, GetInstance);
 
     // TraceQuery
     REGISTER_HTTP_HANDLER_FOR_OPTIMIZER_SERVICE(
@@ -132,6 +134,14 @@ void OptimizerServiceHttp::RemoveInstance(coro_http::coro_http_connection *http_
     RequestContext request_context(request->trace_id(), MakeCollector(metrics_registry_));
     request_context.set_client_ip(CoroHttpService::GetHttpClientIp(http_conn));
     service_impl_->RemoveInstance(&request_context, request, response);
+}
+
+void OptimizerServiceHttp::GetInstance(coro_http::coro_http_connection *http_conn,
+                                        proto::optimizer::OptimizerGetInstanceRequest *request,
+                                        proto::optimizer::OptimizerGetInstanceResponse *response) {
+    RequestContext request_context(request->trace_id(), MakeCollector(metrics_registry_));
+    request_context.set_client_ip(CoroHttpService::GetHttpClientIp(http_conn));
+    service_impl_->GetInstance(&request_context, request, response);
 }
 
 // TraceQuery

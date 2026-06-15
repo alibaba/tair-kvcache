@@ -51,6 +51,10 @@ public:
                         proto::optimizer::OptimizerRemoveInstanceRequest *request,
                         proto::optimizer::OptimizerRemoveInstanceResponse *response);
 
+    void GetInstance(coro_http::coro_http_connection *http_conn,
+                     proto::optimizer::OptimizerGetInstanceRequest *request,
+                     proto::optimizer::OptimizerGetInstanceResponse *response);
+
     // TraceQuery
     void TraceQuery(coro_http::coro_http_connection *http_conn,
                     proto::optimizer::TraceQueryRequest *request,
