@@ -24,7 +24,7 @@ public:
                                                                 const BlockMask &block_mask,
                                                                 int32_t sw_size,
                                                                 const std::vector<std::string> &location_spec_names,
-                                                                std::vector<ReplicationHint> &out_hints) = 0;
+                                                                std::vector<ClientReplicationHint> &out_hints) = 0;
 
     virtual std::pair<ClientErrorCode, WriteLocation>
     StartWrite(const std::string &trace_id,
@@ -48,8 +48,10 @@ public:
                                         const std::vector<int64_t> &tokens,
                                         const BlockMask &block_mask) = 0;
 
-    virtual void
-    ReplicateWithData(const ReplicationHint &hint, const void *data, size_t size, std::function<void()> release_fn) = 0;
+    virtual void ReplicateWithData(const ClientReplicationHint &hint,
+                                   const void *data,
+                                   size_t size,
+                                   std::function<void()> release_fn) = 0;
 
     // for transfer client
     virtual ClientErrorCode LoadKvCaches(const UriStrVec &uri_str_vec, const BlockBuffers &block_buffers) = 0;

@@ -61,6 +61,7 @@ cc_library(
     srcs = [
         "caller_node_provider_factory.cc",
         "local_file_sdk.cc",
+        "nfs_caller_node_provider.cc",
         "sdk_factory.cc",
         "sdk_interface.cc",
         "sdk_wrapper.cc",
@@ -81,6 +82,7 @@ cc_library(
         "deadline_util.h",
         "caller_node_provider_factory.h",
         "local_file_sdk.h",
+        "nfs_caller_node_provider.h",
         "sdk_factory.h",
         "sdk_interface.h",
         "sdk_type.h",
