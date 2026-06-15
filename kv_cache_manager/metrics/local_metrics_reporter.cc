@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <shared_mutex>
 #include <utility>
 
 #include "kv_cache_manager/common/common_util.h"
@@ -14,6 +15,7 @@
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
+#include "kv_cache_manager/metrics/metrics_lifecycle.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
 namespace kv_cache_manager {
@@ -90,6 +92,12 @@ void LocalMetricsReporter::ReportInterval() {
     if (!cache_manager_) {
         return;
     }
+
+    // hold a shared lifecycle lock across the entire metrics publication
+    // so concurrent RemoveInstance/RemoveInstanceGroup/RemoveStorage
+    // (which hold the lock as a writer) cannot interleave a tag-filter
+    // purge with EmplaceMetricsCollector calls below
+    std::shared_lock<std::shared_mutex> lifecycle_guard(cache_manager_->metrics_lifecycle()->mut_);
 
     do {
         // for data storage metrics

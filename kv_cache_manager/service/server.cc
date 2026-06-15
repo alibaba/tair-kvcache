@@ -14,6 +14,7 @@
 #include "kv_cache_manager/event/log_event_publisher.h"
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/manager/startup_config_loader.h"
+#include "kv_cache_manager/metrics/metrics_lifecycle.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/metrics/metrics_reporter.h"
 #include "kv_cache_manager/metrics/metrics_reporter_factory.h"
@@ -34,6 +35,10 @@ bool Server::Init(const ServerConfig &config) {
     KVCM_LOG_INFO("begin server init...\n");
 
     metrics_registry_ = std::make_shared<MetricsRegistry>();
+    // single shared lifecycle handle: producers hold it as a reader
+    // around metric registration; AdminServiceImpl::RemoveInstance and
+    // RemoveInstanceGroup hold it as a writer for the entire removal
+    metrics_lifecycle_ = std::make_shared<MetricsLifecycle>();
 
     config_ = config;
 
@@ -45,7 +50,7 @@ bool Server::Init(const ServerConfig &config) {
     registry_manager_.reset(new RegistryManager(registry_storage_uri, metrics_registry_));
     registry_manager_->Init();
 
-    cache_manager_.reset(new CacheManager(metrics_registry_, registry_manager_));
+    cache_manager_.reset(new CacheManager(metrics_registry_, registry_manager_, metrics_lifecycle_));
     cache_manager_->Init(config_.GetSchedulePlanExecutorThreadCount(),
                          config_.GetCacheReclaimerKeySamplingSizeTotal(),
                          config_.GetCacheReclaimerKeySamplingSizePerTask(),
@@ -133,6 +138,24 @@ bool Server::Start() {
         KVCM_LOG_ERROR("init http server failed");
         return false;
     }
+
+    // wire up instance-removal callback: invalidate per-instance
+    // collector caches on both gRPC and HTTP meta services
+    // registered before leader election so no RemoveInstance can arrive
+    // before the callback is in place (API_CALL_GUARD rejects requests
+    // when not leader)
+    std::weak_ptr<MetaServiceGRpc> grpc_weak = meta_service_;
+    std::weak_ptr<MetaServiceHttp> http_weak = meta_http_service_;
+    cache_manager_->SetOnInstanceRemoved(
+        [grpc_weak = std::move(grpc_weak), http_weak = std::move(http_weak)](const std::string &instance_id) {
+            if (const auto grpc = grpc_weak.lock()) {
+                grpc->InvalidateCollectorCache(instance_id);
+            }
+            if (const auto http = http_weak.lock()) {
+                http->InvalidateCollectorCache(instance_id);
+            }
+        });
+
     if (!leader_elector_->Start()) {
         KVCM_LOG_ERROR("leader_elector start failed");
         return false;
@@ -169,7 +192,7 @@ bool Server::StartRpcServer() {
     // grpc::EnableDefaultHealthCheckService(true);
     // grpc::reflection::InitProtoReflectionServerBuilderPlugin();
 
-    meta_service_.reset(new MetaServiceGRpc(metrics_registry_, meta_impl_, registry_manager_));
+    meta_service_.reset(new MetaServiceGRpc(metrics_registry_, meta_impl_, registry_manager_, metrics_lifecycle_));
     admin_service_.reset(new AdminServiceGRpc(metrics_registry_, admin_impl_));
     debug_service_.reset(new DebugServiceGRpc(metrics_registry_, debug_impl_));
 
@@ -227,7 +250,8 @@ bool Server::StartHttpServer() {
                                                               : std::thread::hardware_concurrency();
     KVCM_LOG_INFO("HTTP server io_thread_num=%zu (configured=%d)", io_thread_num, configured_io_thread_num);
 
-    meta_http_service_ = std::make_shared<MetaServiceHttp>(metrics_registry_, meta_impl_, registry_manager_);
+    meta_http_service_ =
+        std::make_shared<MetaServiceHttp>(metrics_registry_, meta_impl_, registry_manager_, metrics_lifecycle_);
     admin_http_service_ = std::make_shared<AdminServiceHttp>(
         metrics_registry_, admin_impl_, config_.enable_prometheus(), config_.prometheus_prefix());
     debug_http_service_ = std::make_shared<DebugServiceHttp>(metrics_registry_, debug_impl_);

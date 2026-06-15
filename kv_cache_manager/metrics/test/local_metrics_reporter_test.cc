@@ -300,8 +300,11 @@ TEST_F(LocalMetricsReporterTest, TestReportInterval02) {
 TEST_F(LocalMetricsReporterTest, TestReportIntervalCacheManagerMetrics) {
     cache_manager_->meta_indexer_manager_ = std::make_shared<MetaIndexerManager>();
     cache_manager_->write_location_manager_ = std::make_shared<WriteLocationManager>();
-    cache_manager_->metrics_recorder_ = std::make_shared<CacheManagerMetricsRecorder>(
-        cache_manager_->meta_indexer_manager_, cache_manager_->write_location_manager_, registry_manager_);
+    cache_manager_->metrics_recorder_ =
+        std::make_shared<CacheManagerMetricsRecorder>(cache_manager_->meta_indexer_manager_,
+                                                      cache_manager_->write_location_manager_,
+                                                      registry_manager_,
+                                                      cache_manager_->metrics_lifecycle());
 
     RequestContext request_context("test_trace");
     InstanceGroup instance_group;

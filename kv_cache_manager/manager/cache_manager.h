@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <string>
 #include <thread>
@@ -28,6 +29,7 @@ class ReclaimerTaskSupervisor;
 class StartupConfigLoader;
 class EventManager;
 class CacheManagerMetricsRecorder;
+struct MetricsLifecycle;
 constexpr unsigned int DEFAULT_SCHEDULE_PLAN_EXECUTOR_THREAD_COUNT = 2;
 
 class CacheManager {
@@ -58,7 +60,9 @@ public:
     using UriType = std::string;
     using UriVector = std::vector<UriType>;
 
-    CacheManager(std::shared_ptr<MetricsRegistry> metrics_registry, std::shared_ptr<RegistryManager> registry_manager);
+    CacheManager(std::shared_ptr<MetricsRegistry> metrics_registry,
+                 std::shared_ptr<RegistryManager> registry_manager,
+                 std::shared_ptr<MetricsLifecycle> metrics_lifecycle = nullptr);
     ~CacheManager();
 
     bool Init(int32_t schedule_plan_executor_thread_count = DEFAULT_SCHEDULE_PLAN_EXECUTOR_THREAD_COUNT,
@@ -73,6 +77,14 @@ public:
     void StopRecoverRetryLoop();
     ErrorCode DoCleanup();
     std::shared_ptr<RegistryManager> GetRegistryManager() { return registry_manager_; }
+    [[nodiscard]] std::shared_ptr<MetricsLifecycle> metrics_lifecycle() const { return metrics_lifecycle_; }
+
+    // register a callback invoked after an instance is fully removed;
+    // must be set before serving traffic (not thread-safe for writes)
+    // the callback runs on the RemoveInstance call stack — callees
+    // must not re-enter CacheManager methods
+    using OnInstanceRemovedFn = std::function<void(const std::string &instance_id)>;
+    void SetOnInstanceRemoved(OnInstanceRemovedFn fn) { on_instance_removed_ = std::move(fn); }
 
     std::string GetExtraInfo(RequestContext *request_context, const std::string &instance_id);
 
@@ -251,6 +263,10 @@ private:
     SubmitDelReqFunc GetSubmitDelReqFunc(const std::string &instance_id) const;
     void ClearVineyardCleanupCallbacks();
 
+    // purge metrics registry entries and invoke the removal callback
+    // for a given instance_id
+    void InvalidateInstanceMetrics(const std::string &instance_id) const;
+
 private:
     /***
      * === 成员变量清理说明 ===
@@ -280,9 +296,12 @@ private:
     std::unique_ptr<ReclaimerTaskSupervisor> reclaimer_task_supervisor_;
     // 无需清理 - 不包含运行时状态
     std::shared_ptr<EventManager> event_manager_;
+    // 无需清理
+    std::shared_ptr<MetricsLifecycle> metrics_lifecycle_;
     // 需要清理 - 避免有metrics遗留
     std::shared_ptr<CacheManagerMetricsRecorder> metrics_recorder_;
-
+    // 无需清理
+    OnInstanceRemovedFn on_instance_removed_;
     // 需要清理 - recover 重试线程相关，在DoCleanup()中StopRecoverRetryLoop()
     std::thread recover_retry_thread_;
     std::atomic<bool> recover_retry_stop_{false};

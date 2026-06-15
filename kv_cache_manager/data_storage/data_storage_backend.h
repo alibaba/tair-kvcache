@@ -38,7 +38,6 @@ public:
         if (!metrics_collector_->Init()) {
             metrics_collector_ = nullptr;
         }
-        // TODO (rui): handle metrics collector unregistration during Close()
         return DoOpen(config, trace_id);
     }
     virtual ErrorCode DoOpen(const StorageConfig &config, const std::string &trace_id) = 0;

@@ -11,12 +11,14 @@ namespace kv_cache_manager {
 
 class MetaServiceImpl;
 class MetricsRegistry;
+struct MetricsLifecycle;
 
 class MetaServiceHttp : public CoroHttpService, public MetaServiceMetricsBase {
 public:
     MetaServiceHttp(std::shared_ptr<MetricsRegistry> metrics_registry,
                     std::shared_ptr<MetaServiceImpl> meta_service_impl,
-                    std::shared_ptr<RegistryManager> registry_manager);
+                    std::shared_ptr<RegistryManager> registry_manager,
+                    std::shared_ptr<MetricsLifecycle> metrics_lifecycle = nullptr);
 
     void Init() override;
     void RegisterHandler() override;

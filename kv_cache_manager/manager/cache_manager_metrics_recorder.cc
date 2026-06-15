@@ -11,6 +11,7 @@
 #include "kv_cache_manager/manager/write_location_manager.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
+#include "kv_cache_manager/metrics/metrics_lifecycle.h"
 
 namespace kv_cache_manager {
 
@@ -40,10 +41,12 @@ private:
 
 CacheManagerMetricsRecorder::CacheManagerMetricsRecorder(std::shared_ptr<MetaIndexerManager> meta_indexer_manager,
                                                          std::shared_ptr<WriteLocationManager> write_location_manager,
-                                                         std::shared_ptr<RegistryManager> registry_manager)
+                                                         std::shared_ptr<RegistryManager> registry_manager,
+                                                         std::shared_ptr<MetricsLifecycle> metrics_lifecycle)
     : meta_indexer_manager_(meta_indexer_manager)
     , write_location_manager_(write_location_manager)
-    , registry_manager_(registry_manager) {}
+    , registry_manager_(registry_manager)
+    , metrics_lifecycle_(std::move(metrics_lifecycle)) {}
 
 CacheManagerMetricsRecorder::~CacheManagerMetricsRecorder() { Stop(); }
 
@@ -66,10 +69,33 @@ void CacheManagerMetricsRecorder::DoCleanup() {
     return;
 }
 
+void CacheManagerMetricsRecorder::RemoveInstance(const std::string &instance_id) {
+    std::scoped_lock guard(mutex_);
+    for (auto &[group_name, instance_map] : group_instance_id_metric_map_) {
+        instance_map.erase(instance_id);
+    }
+}
+
+void CacheManagerMetricsRecorder::RemoveGroup(const std::string &group_name) {
+    std::scoped_lock guard(mutex_);
+    group_usage_ratio_map_.erase(group_name);
+    group_instance_id_metric_map_.erase(group_name);
+}
+
 void CacheManagerMetricsRecorder::RecorderLoop() {
     KVCM_LOG_INFO("RecorderLoop started");
     while (!stop_.load(std::memory_order_relaxed)) {
         SleepHelper sleep_helper(stop_mutex_, stop_cv_, stop_);
+
+        // hold a shared lifecycle lock around the entire registry-read
+        // → publish span so an instance/group removal cannot interleave
+        // between sampling the registry and publishing the snapshot
+        // without this, a recorder iteration that read the registry
+        // pre-removal could publish a stale snapshot post-removal that
+        // the reporter would then materialise into the metrics
+        // registry, leaking metrics permanently
+        std::shared_lock<std::shared_mutex> lifecycle_guard(metrics_lifecycle_->mut_);
+
         const auto request_context = std::make_shared<RequestContext>(kTraceId);
         const auto [ec, instance_groups] = registry_manager_->ListInstanceGroup(request_context.get());
         if (ec != ErrorCode::EC_OK) {

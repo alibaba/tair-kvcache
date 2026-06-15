@@ -2779,6 +2779,85 @@ TEST_F(CacheManagerTest, TestRecoverRetryLoopLifecycle) {
     ASSERT_EQ(EC_OK, cache_manager_->DoCleanup());
 }
 
+/* ------------ InvalidateInstanceMetrics tests ------------ */
+
+TEST_F(CacheManagerTest, InvalidateInstanceMetricsEmptyIdIsNoOp) {
+    auto metrics_registry = std::make_shared<MetricsRegistry>();
+    auto rm_registry = std::make_shared<MetricsRegistry>(); // separate for RM internals
+    auto rm = std::make_shared<RegistryManager>("", rm_registry);
+    rm->Init();
+    auto cm = std::make_unique<CacheManager>(metrics_registry, rm);
+
+    metrics_registry->GetCounter("test.counter", {{"instance_id", "inst1"}});
+    ASSERT_EQ(1, metrics_registry->GetSize());
+
+    // empty id should be a no-op
+    cm->InvalidateInstanceMetrics("");
+    ASSERT_EQ(1, metrics_registry->GetSize());
+}
+
+TEST_F(CacheManagerTest, InvalidateInstanceMetricsNoCallbackDoesNotCrash) {
+    auto metrics_registry = std::make_shared<MetricsRegistry>();
+    auto rm_registry = std::make_shared<MetricsRegistry>();
+    auto rm = std::make_shared<RegistryManager>("", rm_registry);
+    rm->Init();
+    auto cm = std::make_unique<CacheManager>(metrics_registry, rm);
+
+    metrics_registry->GetCounter("test.counter", {{"instance_id", "inst1"}});
+    ASSERT_EQ(1, metrics_registry->GetSize());
+
+    // no callback set — should not crash, and still purge registry
+    ASSERT_NO_FATAL_FAILURE(cm->InvalidateInstanceMetrics("inst1"));
+    ASSERT_EQ(0, metrics_registry->GetSize());
+}
+
+TEST_F(CacheManagerTest, InvalidateInstanceMetricsPurgesRegistry) {
+    auto metrics_registry = std::make_shared<MetricsRegistry>();
+    auto rm_registry = std::make_shared<MetricsRegistry>();
+    auto rm = std::make_shared<RegistryManager>("", rm_registry);
+    rm->Init();
+    auto cm = std::make_unique<CacheManager>(metrics_registry, rm);
+
+    metrics_registry->GetCounter("m1", {{"instance_id", "inst1"}});
+    metrics_registry->GetGauge("m2", {{"instance_id", "inst1"}, {"extra", "tag"}});
+    metrics_registry->GetCounter("m1", {{"instance_id", "inst2"}});
+    ASSERT_EQ(3, metrics_registry->GetSize());
+
+    cm->InvalidateInstanceMetrics("inst1");
+
+    // only inst2 remains
+    ASSERT_EQ(1, metrics_registry->GetSize());
+    std::vector<MetricsRegistry::metrics_tuple_t> all;
+    metrics_registry->GetAllMetrics(all);
+    ASSERT_EQ(1, all.size());
+    auto &[name, tags, _] = all[0];
+    ASSERT_EQ("m1", name);
+    ASSERT_EQ("inst2", tags.at("instance_id"));
+}
+
+TEST_F(CacheManagerTest, InvalidateInstanceMetricsInvokesCallback) {
+    auto metrics_registry = std::make_shared<MetricsRegistry>();
+    auto rm_registry = std::make_shared<MetricsRegistry>();
+    auto rm = std::make_shared<RegistryManager>("", rm_registry);
+    rm->Init();
+    auto cm = std::make_unique<CacheManager>(metrics_registry, rm);
+
+    std::string received_id;
+    int call_count = 0;
+    cm->SetOnInstanceRemoved([&](const std::string &id) {
+        received_id = id;
+        ++call_count;
+    });
+
+    cm->InvalidateInstanceMetrics("inst42");
+    ASSERT_EQ(1, call_count);
+    ASSERT_EQ("inst42", received_id);
+
+    // empty id should not invoke callback
+    cm->InvalidateInstanceMetrics("");
+    ASSERT_EQ(1, call_count);
+}
+
 // =============================================================
 // GetCacheLocationsByBackend with backend_selectors
 // =============================================================

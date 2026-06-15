@@ -1,5 +1,6 @@
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <cstddef>
@@ -229,6 +230,37 @@ Gauge MetricsData::GetOrCreateGauge(const MetricsTags &tags) {
     return Gauge{it->second};
 }
 
+namespace {
+
+// returns true if tags contains all key-value pairs in filter
+bool TagsMatch(const MetricsTags &tags, const MetricsTags &filter) {
+    return std::all_of(filter.begin(), filter.end(), [&tags](const auto &kv) {
+        auto it = tags.find(kv.first);
+        return it != tags.end() && it->second == kv.second;
+    });
+}
+
+} // anonymous namespace
+
+bool MetricsData::Remove(const MetricsTags &tags) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    return metrics_data_.erase(tags) > 0;
+}
+
+std::size_t MetricsData::RemoveByTagFilter(const MetricsTags &filter) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    std::size_t removed = 0;
+    for (auto it = metrics_data_.begin(); it != metrics_data_.end();) {
+        if (TagsMatch(it->first, filter)) {
+            it = metrics_data_.erase(it);
+            ++removed;
+        } else {
+            ++it;
+        }
+    }
+    return removed;
+}
+
 std::optional<Gauge> MetricsData::GetGauge(const MetricsTags &tags) {
     std::lock_guard<std::mutex> guard(mutex_);
     auto it = metrics_data_.find(tags);
@@ -304,6 +336,26 @@ std::shared_ptr<MetricsData> MetricsRegistry::GetOrCreateMetricsData(const std::
         it = metrics_data_map_.emplace(name, std::make_shared<MetricsData>()).first;
     }
     return it->second;
+}
+
+bool MetricsRegistry::Remove(const std::string &name, const MetricsTags &tags) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    const auto it = metrics_data_map_.find(name);
+    if (it == metrics_data_map_.end() || it->second == nullptr) {
+        return false;
+    }
+    return it->second->Remove(tags);
+}
+
+std::size_t MetricsRegistry::RemoveByTagFilter(const MetricsTags &filter) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    std::size_t total = 0;
+    for (auto &[name, data] : metrics_data_map_) {
+        if (data != nullptr) {
+            total += data->RemoveByTagFilter(filter);
+        }
+    }
+    return total;
 }
 
 Counter MetricsRegistry::GetCounter(const std::string &name, const MetricsTags &tags) {

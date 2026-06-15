@@ -39,6 +39,7 @@
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
 #include "kv_cache_manager/meta/types.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
+#include "kv_cache_manager/metrics/metrics_lifecycle.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/protocol/protobuf/meta_service.pb.h"
 
@@ -126,15 +127,17 @@ IsSpecNameInSpecGroup(const std::string &trace_id,
 } // namespace
 
 CacheManager::CacheManager(std::shared_ptr<MetricsRegistry> metrics_registry,
-                           std::shared_ptr<RegistryManager> registry_manager)
+                           std::shared_ptr<RegistryManager> registry_manager,
+                           std::shared_ptr<MetricsLifecycle> metrics_lifecycle)
     : meta_indexer_manager_(std::make_shared<MetaIndexerManager>())
     , write_location_manager_(std::make_shared<WriteLocationManager>())
     , meta_searcher_manager_(std::make_shared<MetaSearcherManager>(registry_manager, meta_indexer_manager_))
     , data_storage_selector_(std::make_unique<DataStorageSelector>(meta_indexer_manager_, registry_manager))
     , metrics_registry_(std::move(metrics_registry))
     , registry_manager_(std::move(registry_manager))
+    , metrics_lifecycle_(metrics_lifecycle ? std::move(metrics_lifecycle) : std::make_shared<MetricsLifecycle>())
     , metrics_recorder_(std::make_shared<CacheManagerMetricsRecorder>(
-          meta_indexer_manager_, write_location_manager_, registry_manager_)) {}
+          meta_indexer_manager_, write_location_manager_, registry_manager_, metrics_lifecycle_)) {}
 
 CacheManager::~CacheManager() {
     ClearVineyardCleanupCallbacks();
@@ -256,10 +259,38 @@ ErrorCode CacheManager::RemoveInstance(RequestContext *request_context,
     auto ec = registry_manager_->RemoveInstance(request_context, instance_group, instance_id);
     RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "remove instance failed");
 
+    InvalidateInstanceMetrics(instance_id);
+
     ec = TrimCache(request_context, instance_id, proto::meta::TrimStrategy::TS_REMOVE_ALL_CACHE);
     RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "remove instance failed");
     PREFIX_LOG(INFO, "remove instance OK");
     return ec;
+}
+
+void CacheManager::InvalidateInstanceMetrics(const std::string &instance_id) const {
+    if (instance_id.empty()) {
+        return;
+    }
+
+    // callers must hold a unique lock on metrics_lifecycle_->mut_ while
+    // invoking this, so that no producer (recorder publish span,
+    // reporter ReportInterval, MetaServiceMetricsBase slow path) can
+    // register new instance_id-tagged metrics during the steps below
+
+    // 1) prune the recorder snapshot so the reporter cannot recreate
+    //    entries on its next cycle
+    if (metrics_recorder_) {
+        metrics_recorder_->RemoveInstance(instance_id);
+    }
+    // 2) remove existing metrics entries from the registry
+    if (metrics_registry_) {
+        metrics_registry_->RemoveByTagFilter({{"instance_id", instance_id}});
+    }
+    // 3) evict cached per-instance collectors so subsequent requests
+    //    do not resurrect entries through stale handles
+    if (on_instance_removed_) {
+        on_instance_removed_(instance_id);
+    }
 }
 
 std::pair<ErrorCode, InstanceInfoConstPtr> CacheManager::GetInstanceInfo(RequestContext *request_context,

@@ -17,8 +17,9 @@ namespace kv_cache_manager {
 
 MetaServiceHttp::MetaServiceHttp(std::shared_ptr<MetricsRegistry> metrics_registry,
                                  std::shared_ptr<MetaServiceImpl> meta_service_impl,
-                                 std::shared_ptr<RegistryManager> registry_manager)
-    : MetaServiceMetricsBase(std::move(metrics_registry), registry_manager)
+                                 std::shared_ptr<RegistryManager> registry_manager,
+                                 std::shared_ptr<MetricsLifecycle> metrics_lifecycle)
+    : MetaServiceMetricsBase(std::move(metrics_registry), registry_manager, std::move(metrics_lifecycle))
     , meta_service_impl_(std::move(meta_service_impl)) {}
 
 void MetaServiceHttp::Init() { MetaServiceMetricsBase::InitMetrics(); }

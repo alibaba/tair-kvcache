@@ -196,3 +196,18 @@ cc_test(
         "//kv_cache_manager/manager:write_location_manager",
     ],
 )
+
+cc_test(
+    name = "CacheManagerMetricsRecorderTest",
+    srcs = [
+        "cache_manager_metrics_recorder_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    data = [],
+    linkstatic = True,
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/manager:cache_manager_metrics_recorder",
+        "//kv_cache_manager/metrics:metrics_lifecycle",
+    ],
+)

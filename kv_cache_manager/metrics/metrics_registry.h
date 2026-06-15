@@ -211,6 +211,13 @@ public:
     std::optional<Gauge> GetGauge(const MetricsTags &tags);
     bool RemoveByTags(const MetricsTags &tags);
 
+    // remove a specific entry by exact tags; returns true if erased
+    bool Remove(const MetricsTags &tags);
+
+    // remove all entries whose tags are a superset of filter;
+    // returns number of entries removed
+    std::size_t RemoveByTagFilter(const MetricsTags &filter);
+
 private:
     std::mutex mutex_;
     std::map<MetricsTags, std::shared_ptr<MetricsValue>> metrics_data_;
@@ -235,6 +242,13 @@ public:
 
     Counter GetCounter(const std::string &name, const MetricsTags &tags = {});
     Gauge GetGauge(const std::string &name, const MetricsTags &tags = {});
+
+    // remove a specific metric by name + tags; returns true if erased
+    bool Remove(const std::string &name, const MetricsTags &tags);
+
+    // remove all metrics across all names whose tags match the filter;
+    // returns total number of entries removed
+    std::size_t RemoveByTagFilter(const MetricsTags &filter);
 
     [[nodiscard]] std::shared_ptr<MetricsData> GetMetricsData(const std::string &name) noexcept;
     [[nodiscard]] std::shared_ptr<MetricsData> GetOrCreateMetricsData(const std::string &name) noexcept;

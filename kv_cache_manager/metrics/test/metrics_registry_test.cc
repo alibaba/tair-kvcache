@@ -697,3 +697,240 @@ TEST_F(MetricsRegistryTest, TestMetricsRegistryMultiThreads) {
 
     t.join();
 }
+
+/* ---------------------- MetricsData::Remove ----------------------- */
+
+TEST_F(MetricsRegistryTest, TestMetricsDataRemoveExact) {
+    auto md = std::make_shared<MetricsData>();
+
+    MetricsTags tags_a{{"instance_id", "inst1"}};
+    MetricsTags tags_b{{"instance_id", "inst2"}};
+    MetricsTags tags_c{{"instance_id", "inst1"}, {"instance_group", "grp1"}};
+
+    md->GetOrCreateCounter(tags_a);
+    md->GetOrCreateGauge(tags_b);
+    md->GetOrCreateCounter(tags_c);
+    ASSERT_EQ(3, md->GetSize());
+
+    // remove non-existent tags returns false
+    ASSERT_FALSE(md->Remove(MetricsTags{{"instance_id", "inst999"}}));
+    ASSERT_EQ(3, md->GetSize());
+
+    // remove exact match
+    ASSERT_TRUE(md->Remove(tags_a));
+    ASSERT_EQ(2, md->GetSize());
+
+    // removing again returns false
+    ASSERT_FALSE(md->Remove(tags_a));
+    ASSERT_EQ(2, md->GetSize());
+
+    // remaining entries unaffected
+    ASSERT_TRUE(md->Remove(tags_b));
+    ASSERT_EQ(1, md->GetSize());
+    ASSERT_TRUE(md->Remove(tags_c));
+    ASSERT_EQ(0, md->GetSize());
+}
+
+TEST_F(MetricsRegistryTest, TestMetricsDataRemoveByTagFilter) {
+    auto md = std::make_shared<MetricsData>();
+
+    MetricsTags tags_a{{"instance_id", "inst1"}, {"instance_group", "grp1"}};
+    MetricsTags tags_b{{"instance_id", "inst2"}, {"instance_group", "grp1"}};
+    MetricsTags tags_c{{"instance_id", "inst1"}, {"instance_group", "grp2"}};
+    MetricsTags tags_d{{"instance_id", "inst3"}, {"instance_group", "grp2"}};
+
+    md->GetOrCreateCounter(tags_a);
+    md->GetOrCreateGauge(tags_b);
+    md->GetOrCreateCounter(tags_c);
+    md->GetOrCreateGauge(tags_d);
+    ASSERT_EQ(4, md->GetSize());
+
+    // filter by instance_id=inst1 should remove tags_a and tags_c
+    ASSERT_EQ(2, md->RemoveByTagFilter({{"instance_id", "inst1"}}));
+    ASSERT_EQ(2, md->GetSize());
+
+    // filter by instance_group=grp1 should remove tags_b only
+    ASSERT_EQ(1, md->RemoveByTagFilter({{"instance_group", "grp1"}}));
+    ASSERT_EQ(1, md->GetSize());
+
+    // filter by non-existent tag should remove nothing
+    ASSERT_EQ(0, md->RemoveByTagFilter({{"instance_id", "inst999"}}));
+    ASSERT_EQ(1, md->GetSize());
+
+    // empty filter matches everything
+    ASSERT_EQ(1, md->RemoveByTagFilter({}));
+    ASSERT_EQ(0, md->GetSize());
+}
+
+TEST_F(MetricsRegistryTest, TestMetricsDataRemoveByTagFilterMultiKey) {
+    auto md = std::make_shared<MetricsData>();
+
+    MetricsTags tags_a{{"instance_id", "inst1"}, {"instance_group", "grp1"}};
+    MetricsTags tags_b{{"instance_id", "inst1"}, {"instance_group", "grp2"}};
+    MetricsTags tags_c{{"instance_id", "inst2"}, {"instance_group", "grp1"}};
+
+    md->GetOrCreateCounter(tags_a);
+    md->GetOrCreateCounter(tags_b);
+    md->GetOrCreateCounter(tags_c);
+    ASSERT_EQ(3, md->GetSize());
+
+    // filter with two keys: only tags_a matches both
+    ASSERT_EQ(1, md->RemoveByTagFilter({{"instance_id", "inst1"}, {"instance_group", "grp1"}}));
+    ASSERT_EQ(2, md->GetSize());
+}
+
+/* -------------------- MetricsRegistry::Remove -------------------- */
+
+TEST_F(MetricsRegistryTest, TestMetricsRegistryRemoveExact) {
+    MetricsTags tags_a{{"instance_id", "inst1"}};
+    MetricsTags tags_b{{"instance_id", "inst2"}};
+
+    auto c1 = registry_->GetCounter("metric1", tags_a);
+    auto c2 = registry_->GetCounter("metric1", tags_b);
+    auto g1 = registry_->GetGauge("metric2", tags_a);
+    ASSERT_EQ(3, registry_->GetSize());
+
+    // remove non-existent name
+    ASSERT_FALSE(registry_->Remove("no_such_metric", tags_a));
+    ASSERT_EQ(3, registry_->GetSize());
+
+    // remove non-existent tags under existing name
+    ASSERT_FALSE(registry_->Remove("metric1", {{"instance_id", "inst999"}}));
+    ASSERT_EQ(3, registry_->GetSize());
+
+    // remove existing entry
+    ASSERT_TRUE(registry_->Remove("metric1", tags_a));
+    ASSERT_EQ(2, registry_->GetSize());
+
+    // the counter handle is still usable (detached)
+    ++c1;
+    ASSERT_EQ(1, c1.Get());
+
+    // metric1 still exists with tags_b
+    ASSERT_NE(nullptr, registry_->GetMetricsData("metric1"));
+
+    // remove last entry under metric1 -> MetricsData remains (empty shell)
+    ASSERT_TRUE(registry_->Remove("metric1", tags_b));
+    ASSERT_EQ(1, registry_->GetSize());
+    // the MetricsData shell persists to avoid orphaning concurrent readers
+    auto md = registry_->GetMetricsData("metric1");
+    ASSERT_NE(nullptr, md);
+    ASSERT_EQ(0, md->GetSize());
+
+    // metric2 still intact
+    ASSERT_TRUE(registry_->Remove("metric2", tags_a));
+    ASSERT_EQ(0, registry_->GetSize());
+}
+
+/* --------------- MetricsRegistry::RemoveByTagFilter -------------- */
+
+TEST_F(MetricsRegistryTest, TestMetricsRegistryRemoveByTagFilter) {
+    MetricsTags tags_inst1_grp1{{"instance_id", "inst1"}, {"instance_group", "grp1"}};
+    MetricsTags tags_inst2_grp1{{"instance_id", "inst2"}, {"instance_group", "grp1"}};
+    MetricsTags tags_inst1_grp2{{"instance_id", "inst1"}, {"instance_group", "grp2"}};
+    MetricsTags tags_inst3_grp2{{"instance_id", "inst3"}, {"instance_group", "grp2"}};
+
+    // spread metrics across multiple names
+    registry_->GetCounter("service.query_counter", tags_inst1_grp1);
+    registry_->GetGauge("service.query_rt_us", tags_inst1_grp1);
+    registry_->GetCounter("service.query_counter", tags_inst2_grp1);
+    registry_->GetGauge("cache_manager_instance.key_count", tags_inst1_grp2);
+    registry_->GetGauge("cache_manager_instance.byte_size", tags_inst3_grp2);
+    ASSERT_EQ(5, registry_->GetSize());
+
+    // remove all metrics for instance_id=inst1 (should remove 3 entries)
+    ASSERT_EQ(3, registry_->RemoveByTagFilter({{"instance_id", "inst1"}}));
+    ASSERT_EQ(2, registry_->GetSize());
+
+    // verify remaining
+    std::vector<MetricsRegistry::metrics_tuple_t> all;
+    registry_->GetAllMetrics(all);
+    ASSERT_EQ(2, all.size());
+
+    // remove by instance_group=grp2 (should remove 1)
+    ASSERT_EQ(1, registry_->RemoveByTagFilter({{"instance_group", "grp2"}}));
+    ASSERT_EQ(1, registry_->GetSize());
+
+    // remove remaining by instance_group=grp1
+    ASSERT_EQ(1, registry_->RemoveByTagFilter({{"instance_group", "grp1"}}));
+    ASSERT_EQ(0, registry_->GetSize());
+
+    // no-op on empty registry
+    ASSERT_EQ(0, registry_->RemoveByTagFilter({{"instance_id", "inst1"}}));
+}
+
+TEST_F(MetricsRegistryTest, TestMetricsRegistryRemoveByTagFilterKeepsEmptyShell) {
+    MetricsTags tags{{"instance_id", "inst1"}};
+    registry_->GetCounter("metric1", tags);
+    ASSERT_EQ(1, registry_->GetSize());
+    ASSERT_NE(nullptr, registry_->GetMetricsData("metric1"));
+
+    // removing the only entry leaves an empty MetricsData shell
+    // (avoids orphaning concurrent GetCounter/GetGauge callers)
+    registry_->RemoveByTagFilter({{"instance_id", "inst1"}});
+    ASSERT_EQ(0, registry_->GetSize());
+    auto md = registry_->GetMetricsData("metric1");
+    ASSERT_NE(nullptr, md);
+    ASSERT_EQ(0, md->GetSize());
+
+    // GetNames still includes the name (shell is present)
+    auto names = registry_->GetNames();
+    ASSERT_EQ(1, names.size());
+    ASSERT_EQ("metric1", names[0]);
+
+    // re-creating a metric under the same name reuses the shell
+    auto counter = registry_->GetCounter("metric1", tags);
+    ASSERT_EQ(1, registry_->GetSize());
+    ASSERT_EQ(md, registry_->GetMetricsData("metric1"));
+}
+
+TEST_F(MetricsRegistryTest, TestMetricsRegistryRemoveDetachedHandleStillWorks) {
+    MetricsTags tags{{"instance_id", "inst1"}};
+    auto counter = registry_->GetCounter("metric1", tags);
+    ++counter;
+    ASSERT_EQ(1, counter.Get());
+
+    // remove from registry
+    registry_->Remove("metric1", tags);
+
+    // the handle still works (shared_ptr keeps it alive)
+    ++counter;
+    ASSERT_EQ(2, counter.Get());
+
+    // but it's no longer visible in GetAllMetrics
+    std::vector<MetricsRegistry::metrics_tuple_t> all;
+    registry_->GetAllMetrics(all);
+    ASSERT_TRUE(all.empty());
+}
+
+TEST_F(MetricsRegistryTest, TestMetricsRegistryRemoveByTagFilterMultiThread) {
+    // populate registry with metrics across two instances
+    for (int i = 0; i < 100; ++i) {
+        registry_->GetCounter("counter." + std::to_string(i), {{"instance_id", "inst1"}});
+        registry_->GetGauge("gauge." + std::to_string(i), {{"instance_id", "inst2"}});
+    }
+    ASSERT_EQ(200, registry_->GetSize());
+
+    // concurrently remove inst1 metrics while reading
+    std::thread remover([this]() { registry_->RemoveByTagFilter({{"instance_id", "inst1"}}); });
+
+    std::thread reader([this]() {
+        std::vector<MetricsRegistry::metrics_tuple_t> all;
+        for (int i = 0; i < 50; ++i) {
+            registry_->GetAllMetrics(all);
+            // size should be somewhere between 100 and 200
+            ASSERT_GE(all.size(), 100);
+            ASSERT_LE(all.size(), 200);
+        }
+    });
+
+    remover.join();
+    reader.join();
+
+    // after removal, only inst2 metrics remain
+    ASSERT_EQ(100, registry_->GetSize());
+
+    // clean up
+    ASSERT_EQ(100, registry_->RemoveByTagFilter({{"instance_id", "inst2"}}));
+    ASSERT_EQ(0, registry_->GetSize());
+}

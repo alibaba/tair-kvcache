@@ -11,6 +11,13 @@ cc_library(
 )
 
 cc_library(
+    name = "metrics_lifecycle",
+    hdrs = [
+        "metrics_lifecycle.h",
+    ],
+)
+
+cc_library(
     name = "metrics_collector",
     srcs = [
         "metrics_collector.cc",
@@ -43,6 +50,7 @@ cc_library(
     ],
     deps = [
         ":metrics_registry",
+        ":metrics_lifecycle",
         ":metrics_collector",
         "//kv_cache_manager/common:utils",
         "//kv_cache_manager/common:logger",

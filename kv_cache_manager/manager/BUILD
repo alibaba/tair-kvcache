@@ -31,6 +31,7 @@ cc_library(
         "//kv_cache_manager/data_storage",
         "//kv_cache_manager/event:event_publisher",
         "//kv_cache_manager/metrics:metrics_collector",
+        "//kv_cache_manager/metrics:metrics_lifecycle",
         "//kv_cache_manager/metrics:metrics_registry",
     ],
 )
@@ -156,6 +157,7 @@ cc_library(
         ":write_location_manager",
         "//kv_cache_manager/config",
         "//kv_cache_manager/meta:meta_indexer_manager",
+        "//kv_cache_manager/metrics:metrics_lifecycle",
     ],
 )
 

@@ -1,6 +1,7 @@
 #include "kv_cache_manager/service/admin_service_impl.h"
 
 #include <memory>
+#include <shared_mutex>
 #include <string>
 #include <utility>
 #include <variant>
@@ -14,6 +15,8 @@
 #include "kv_cache_manager/config/node_endpoint_info.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/manager/cache_manager.h"
+#include "kv_cache_manager/manager/cache_manager_metrics_recorder.h"
+#include "kv_cache_manager/metrics/metrics_lifecycle.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/metrics/metrics_reporter.h"
 #include "kv_cache_manager/protocol/protobuf/admin_service.pb.h"
@@ -178,6 +181,11 @@ void AdminServiceImpl::RemoveStorage(RequestContext *request_context,
     if (request->storage_unique_name().empty()) {
         CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("RemoveStorage", "storage_unique_name", true);
     }
+    // hold the lifecycle lock as a writer so metric-registration sites
+    // (reporter interval loop) cannot re-create storage-tagged entries
+    // concurrently with the purge below
+    std::unique_lock<std::shared_mutex> lifecycle_guard(cache_manager_->metrics_lifecycle()->mut_);
+
     ErrorCode ec_info = registry_manager_->RemoveStorage(request_context, request->storage_unique_name());
     if (ec_info != EC_OK) {
         status->set_code(proto::admin::INTERNAL_ERROR);
@@ -190,6 +198,11 @@ void AdminServiceImpl::RemoveStorage(RequestContext *request_context,
         request_context->set_status_code(status->code());
         status->set_message("Storage removed successfully");
         KVCM_LOG_INFO("[traceId: %s] RemoveStorage succeeded", request->trace_id().c_str());
+
+        // purge storage-tagged metrics from the registry
+        if (metrics_registry_) {
+            metrics_registry_->RemoveByTagFilter({{"unique_name", request->storage_unique_name()}});
+        }
     }
 };
 
@@ -326,6 +339,12 @@ void AdminServiceImpl::RemoveInstanceGroup(RequestContext *request_context,
     if (request->name().empty()) {
         CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("RemoveInstanceGroup", "name", true);
     }
+    // hold the lifecycle lock as a writer so metric-registration sites
+    // (recorder publish, local reporter loops, MetaServiceMetricsBase
+    // slow path) cannot re-create group-tagged entries concurrently
+    // with the purge below
+    std::unique_lock<std::shared_mutex> lifecycle_guard(cache_manager_->metrics_lifecycle()->mut_);
+
     ErrorCode ec_info = registry_manager_->RemoveInstanceGroup(request_context, request->name());
     if (ec_info != EC_OK) {
         status->set_code(proto::admin::INTERNAL_ERROR);
@@ -338,6 +357,23 @@ void AdminServiceImpl::RemoveInstanceGroup(RequestContext *request_context,
         request_context->set_status_code(status->code());
         status->set_message("Instance group removed successfully");
         KVCM_LOG_INFO("[traceId: %s] RemoveInstanceGroup succeeded", request->trace_id().c_str());
+
+        // contract: caller must drain all instances via RemoveInstance
+        // before invoking this
+        //
+        // RemoveInstanceGroup scope is group config+group-tagged
+        // metrics only; per-instance cleanup is not retried here to
+        // avoid racing with concurrent group re-creates
+
+        // prune the recorder snapshot so the reporter cannot recreate
+        // group-tagged entries on its next cycle
+        if (const auto recorder = cache_manager_->metrics_recorder()) {
+            recorder->RemoveGroup(request->name());
+        }
+        // remove group-tagged metrics from the registry
+        if (metrics_registry_) {
+            metrics_registry_->RemoveByTagFilter({{"instance_group", request->name()}});
+        }
     }
 };
 
@@ -574,6 +610,11 @@ void AdminServiceImpl::RemoveInstance(RequestContext *request_context,
     if (request->instance_id().empty()) {
         CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("RemoveInstance", "instance_id", true);
     }
+    // exclude all metrics-registration sites for the duration of the
+    // removal so InvalidateInstanceMetrics' single tag-filter purge
+    // cannot race with concurrent producers; instance removal is low
+    // frequency, so the wide locking range is acceptable
+    std::unique_lock<std::shared_mutex> lifecycle_guard(cache_manager_->metrics_lifecycle()->mut_);
     ErrorCode ec_info =
         cache_manager_->RemoveInstance(request_context, request->instance_group(), request->instance_id());
     if (ec_info != EC_OK) {
