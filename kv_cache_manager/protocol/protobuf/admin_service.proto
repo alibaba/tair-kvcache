@@ -190,6 +190,42 @@ message CacheReclaimStrategy {
     int32 delay_before_delete_ms = 7; // Location设置为Deleting状态后等待多少毫秒再调用Storage删除
 }
 
+// ===== 多层存储迁移（Tiered Storage Migration）配置 =====
+
+// 复制完成后源端 location 的处理方式
+enum MigrationRetention {
+    MIGRATION_RETENTION_UNSPECIFIED = 0;
+    MIGRATION_RETENTION_DELETE_SOURCE = 1; // 复制完成后立即删除源端 location，尽量只保留单副本
+    MIGRATION_RETENTION_KEEP_BOTH = 2;     // 保留双副本，由 Reclaimer 后续回收
+}
+
+// Copy 执行方式：通过 DataStorageBackend::Copy 把数据复制到目标 storage
+message MigrationCopyMethod {
+    bool enabled = 1;
+    int64 max_concurrency = 2; // 固定 Copy 并发上限；未设置时服务端使用默认值
+}
+
+// Mark 执行方式：给 block 打标，下次 StartWriteCache 时引导推理引擎多写一份到目标 storage
+message MigrationMarkMethod {
+    bool enabled = 1;
+    int64 mark_timeout_ms = 2; // 标记超时阈值（毫秒），超过未被消费则清除（兜底）
+}
+
+// 执行方式集合，Copy / Mark 可同时开启（与触发模式正交）
+message MigrationMethods {
+    MigrationCopyMethod copy = 1;
+    MigrationMarkMethod mark = 2;
+}
+
+// 单条迁移规则，绑定一个源 storage
+message MigrationStrategy {
+    string storage_unique_name = 1; // 源 storage（热层）unique name
+    string target_storage = 2;      // 目标 storage（冷层）unique name
+    double trigger_threshold = 3;   // 水位触发阈值（迁移区间下界），如 0.70
+    MigrationMethods methods = 4;
+    MigrationRetention retention = 5;
+}
+
 enum CachePreferStrategy {
     CPS_UNSPECIFIED = 0;
     CPS_ALWAYS_3FS = 1;
@@ -236,6 +272,7 @@ message CacheConfig {
     CacheReclaimStrategy reclaim_strategy = 1;
     CachePreferStrategy data_storage_strategy = 2;
     MetaIndexerConfig meta_indexer_config = 3;
+    repeated MigrationStrategy migration_strategies = 4; // 多层存储迁移规则，per-storage
 }
 
 message InstanceGroup {
@@ -341,6 +378,38 @@ message RemoveCacheRequest {
     repeated int64 block_keys = 3;
     repeated int64 token_ids = 4;
     BlockMask block_mask = 5;
+}
+
+// ===== 多层存储迁移 API 触发 =====
+
+enum MigrationMethod {
+    MIGRATION_METHOD_UNSPECIFIED = 0;
+    MIGRATION_METHOD_COPY = 1; // 仅 Copy
+    MIGRATION_METHOD_MARK = 2; // 仅 Mark
+    MIGRATION_METHOD_BOTH = 3; // Copy + Mark
+}
+
+// 规则触发：block_keys 为空时按规则采样过滤候选
+message MigrationRule {
+    int32 sample_count = 1; // 采样数量上限
+    int64 min_age_ms = 2;   // 仅迁移存活超过该时长的 block（0 表示不限）
+}
+
+// 跨存储层迁移指定 block 的 cache
+message MigrateCacheRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    string source_storage_name = 3;
+    string target_storage_name = 4;
+    repeated int64 block_keys = 5; // 显式指定；非空时直接使用，忽略 rule
+    MigrationRule rule = 6;        // block_keys 为空时按规则采样过滤
+    MigrationMethod method = 7;    // COPY / MARK / BOTH
+}
+
+message MigrateCacheResponse {
+    CommonResponseHeader header = 1;
+    int64 accepted = 2; // 接受并投递的 block 数
+    int64 rejected = 3; // 被准入策略 / 校验拒绝的 block 数
 }
 
 message ModelDeployment {
@@ -537,6 +606,8 @@ service AdminService {
     rpc GetCacheMeta(GetCacheMetaRequest) returns (GetCacheMetaResponse);
     // 删除指定key的cache,用于修复用户反馈的单query异常,暂时与meta_service保持一致
     rpc RemoveCache(RemoveCacheRequest) returns (CommonResponse);
+    // 跨存储层迁移指定 block 的 cache（Copy / Mark），支持显式 block_keys 或规则采样
+    rpc MigrateCache(MigrateCacheRequest) returns (MigrateCacheResponse);
     // 增删改查instance信息
     rpc RegisterInstance(RegisterInstanceRequest) returns (CommonResponse);
     rpc RemoveInstance(RemoveInstanceRequest) returns (CommonResponse);

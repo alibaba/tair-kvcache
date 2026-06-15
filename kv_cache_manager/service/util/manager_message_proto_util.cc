@@ -207,6 +207,24 @@ void ProtoConvert::CacheConfigToProto(const CacheConfig &cache_config_info,
             meta_cache_policy_config->set_high_pri_pool_ratio(origin_meta_cache_policy_config->GetHighPriPoolRatio());
         }
     }
+
+    // 转换migration_strategies
+    for (const auto &migration_strategy : cache_config_info.migration_strategies()) {
+        if (migration_strategy == nullptr) {
+            continue;
+        }
+        auto *proto_migration_strategy = proto_cache_config->add_migration_strategies();
+        proto_migration_strategy->set_storage_unique_name(migration_strategy->storage_unique_name());
+        proto_migration_strategy->set_target_storage(migration_strategy->target_storage());
+        proto_migration_strategy->set_trigger_threshold(migration_strategy->trigger_threshold());
+        auto *methods = proto_migration_strategy->mutable_methods();
+        methods->mutable_copy()->set_enabled(migration_strategy->methods().copy().enabled());
+        methods->mutable_copy()->set_max_concurrency(migration_strategy->methods().copy().max_concurrency());
+        methods->mutable_mark()->set_enabled(migration_strategy->methods().mark().enabled());
+        methods->mutable_mark()->set_mark_timeout_ms(migration_strategy->methods().mark().mark_timeout_ms());
+        proto_migration_strategy->set_retention(
+            static_cast<proto::admin::MigrationRetention>(migration_strategy->retention()));
+    }
 }
 
 void ProtoConvert::CacheConfigFromProto(const proto::admin::CacheConfig *proto_cache_config,
@@ -264,6 +282,29 @@ void ProtoConvert::CacheConfigFromProto(const proto::admin::CacheConfig *proto_c
     }
 
     cache_config_info.set_meta_indexer_config(meta_indexer_config);
+
+    // 转换migration_strategies
+    std::vector<std::shared_ptr<MigrationStrategy>> migration_strategies;
+    migration_strategies.reserve(proto_cache_config->migration_strategies_size());
+    for (const auto &proto_migration_strategy : proto_cache_config->migration_strategies()) {
+        auto migration_strategy = std::make_shared<MigrationStrategy>();
+        migration_strategy->set_storage_unique_name(proto_migration_strategy.storage_unique_name());
+        migration_strategy->set_target_storage(proto_migration_strategy.target_storage());
+        migration_strategy->set_trigger_threshold(proto_migration_strategy.trigger_threshold());
+        MigrationMethods methods;
+        methods.mutable_copy().set_enabled(proto_migration_strategy.methods().copy().enabled());
+        const auto proto_copy_max_concurrency = proto_migration_strategy.methods().copy().max_concurrency();
+        methods.mutable_copy().set_max_concurrency(proto_copy_max_concurrency > 0
+                                                       ? proto_copy_max_concurrency
+                                                       : MigrationCopyMethod::kDefaultMaxConcurrency);
+        methods.mutable_mark().set_enabled(proto_migration_strategy.methods().mark().enabled());
+        methods.mutable_mark().set_mark_timeout_ms(proto_migration_strategy.methods().mark().mark_timeout_ms());
+        migration_strategy->set_methods(methods);
+        migration_strategy->set_retention(
+            static_cast<MigrationRetention>(proto_migration_strategy.retention()));
+        migration_strategies.push_back(migration_strategy);
+    }
+    cache_config_info.set_migration_strategies(migration_strategies);
 }
 
 void ProtoConvert::InstanceGroupToProto(const InstanceGroup &instance_group_info,

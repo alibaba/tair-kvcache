@@ -10,6 +10,7 @@
 #include "kv_cache_manager/config/cache_reclaim_strategy.h"
 #include "kv_cache_manager/config/data_storage_strategy.h"
 #include "kv_cache_manager/config/meta_indexer_config.h"
+#include "kv_cache_manager/config/migration_strategy.h"
 
 namespace kv_cache_manager {
 
@@ -53,6 +54,10 @@ public:
     CachePreferStrategy cache_prefer_strategy() const { return cache_prefer_strategy_; }
 
     const std::shared_ptr<MetaIndexerConfig> &meta_indexer_config() const { return meta_indexer_config_; }
+
+    const std::vector<std::shared_ptr<MigrationStrategy>> &migration_strategies() const {
+        return migration_strategies_;
+    }
     // Setters
     void set_reclaim_strategy(const std::shared_ptr<CacheReclaimStrategy> &reclaim_strategy) {
         reclaim_strategy_ = reclaim_strategy;
@@ -62,6 +67,9 @@ public:
     }
     void set_meta_indexer_config(const std::shared_ptr<MetaIndexerConfig> &meta_indexer_config) {
         meta_indexer_config_ = meta_indexer_config;
+    }
+    void set_migration_strategies(const std::vector<std::shared_ptr<MigrationStrategy>> &migration_strategies) {
+        migration_strategies_ = migration_strategies;
     }
 
 public:
@@ -75,6 +83,7 @@ private:
     CachePreferStrategy cache_prefer_strategy_;
     std::shared_ptr<CacheReclaimStrategy> reclaim_strategy_;
     std::shared_ptr<MetaIndexerConfig> meta_indexer_config_;
+    std::vector<std::shared_ptr<MigrationStrategy>> migration_strategies_;
 };
 
 using CacheConfigConstPtr = std::shared_ptr<const CacheConfig>;
