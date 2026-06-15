@@ -24,10 +24,10 @@ AdminServiceHttp::AdminServiceHttp(std::shared_ptr<MetricsRegistry> metrics_regi
                                    std::shared_ptr<AdminServiceImpl> admin_service_impl,
                                    bool enable_prometheus,
                                    const std::string &prometheus_prefix)
-    : metrics_registry_(std::move(metrics_registry)),
-      admin_service_impl_(std::move(admin_service_impl)),
-      enable_prometheus_(enable_prometheus),
-      prometheus_prefix_(prometheus_prefix) {}
+    : metrics_registry_(std::move(metrics_registry))
+    , admin_service_impl_(std::move(admin_service_impl))
+    , enable_prometheus_(enable_prometheus)
+    , prometheus_prefix_(prometheus_prefix) {}
 
 void AdminServiceHttp::Init() {
     // for storage APIs
@@ -76,6 +76,11 @@ void AdminServiceHttp::Init() {
 
     // for logging control APIs
     MAKE_SERVICE_METRICS_COLLECTOR(UpdateLogger);
+
+    // for admin auth token management APIs
+    MAKE_SERVICE_METRICS_COLLECTOR(SetAdminAuthTokens);
+    MAKE_SERVICE_METRICS_COLLECTOR(RotateAdminAuthToken);
+    MAKE_SERVICE_METRICS_COLLECTOR(ListAdminAuthTokens);
 }
 
 void AdminServiceHttp::RegisterHandler() {
@@ -141,8 +146,7 @@ void AdminServiceHttp::RegisterHandler() {
                        [this](coro_http::coro_http_request &req,
                               coro_http::coro_http_response &res) -> async_simple::coro::Lazy<void> {
                            proto::admin::CheckHealthRequest request;
-                           request.set_trace_id("kvcm-healthy-" +
-                                                std::to_string(TimestampUtil::GetCurrentTimeMs()));
+                           request.set_trace_id("kvcm-healthy-" + std::to_string(TimestampUtil::GetCurrentTimeMs()));
                            proto::admin::CheckHealthResponse response;
 
                            this->CheckHealth(req.get_conn(), &request, &response);
@@ -160,8 +164,7 @@ void AdminServiceHttp::RegisterHandler() {
                            if (!ProtoMessageJsonUtil::ToJson(&response, body)) {
                                body = R"({"status":"FAIL"})";
                            }
-                           res.set_status_and_content(coro_http::status_type::service_unavailable,
-                                                      std::move(body));
+                           res.set_status_and_content(coro_http::status_type::service_unavailable, std::move(body));
                            co_return;
                        });
 
@@ -177,6 +180,13 @@ void AdminServiceHttp::RegisterHandler() {
 
     // logging control APIs
     REGISTER_HTTP_HANDLER_FOR_ADMIN_SERVICE(Post, updateLogger, UpdateLogger, Common, UpdateLogger);
+
+    // admin auth token management APIs (runtime only)
+    REGISTER_HTTP_HANDLER_FOR_ADMIN_SERVICE(Post, setAdminAuthTokens, SetAdminAuthTokens, Common, SetAdminAuthTokens);
+    REGISTER_HTTP_HANDLER_FOR_ADMIN_SERVICE(
+        Post, rotateAdminAuthToken, RotateAdminAuthToken, Common, RotateAdminAuthToken);
+    REGISTER_HTTP_HANDLER_FOR_ADMIN_SERVICE(
+        Post, listAdminAuthTokens, ListAdminAuthTokens, ListAdminAuthTokens, ListAdminAuthTokens);
 }
 
 void AdminServiceHttp::AddStorage(coro_http::coro_http_connection *http_conn,
@@ -445,6 +455,30 @@ void AdminServiceHttp::UpdateLogger(coro_http::coro_http_connection *http_conn,
     API_CONTEXT_INIT_HTTP(UpdateLogger)
     KVCM_LOG_INFO("[traceId: %s] UpdateLogger called.", request->trace_id().c_str());
     admin_service_impl_->UpdateLogger(request_context, request, response);
+}
+
+void AdminServiceHttp::SetAdminAuthTokens(coro_http::coro_http_connection *http_conn,
+                                          proto::admin::SetAdminAuthTokensRequest *request,
+                                          proto::admin::CommonResponse *response) {
+    API_CONTEXT_INIT_HTTP(SetAdminAuthTokens)
+    KVCM_LOG_INFO("[traceId: %s] SetAdminAuthTokens called.", request->trace_id().c_str());
+    admin_service_impl_->SetAdminAuthTokens(request_context, request, response);
+}
+
+void AdminServiceHttp::RotateAdminAuthToken(coro_http::coro_http_connection *http_conn,
+                                            proto::admin::RotateAdminAuthTokenRequest *request,
+                                            proto::admin::CommonResponse *response) {
+    API_CONTEXT_INIT_HTTP(RotateAdminAuthToken)
+    KVCM_LOG_INFO("[traceId: %s] RotateAdminAuthToken called.", request->trace_id().c_str());
+    admin_service_impl_->RotateAdminAuthToken(request_context, request, response);
+}
+
+void AdminServiceHttp::ListAdminAuthTokens(coro_http::coro_http_connection *http_conn,
+                                           proto::admin::ListAdminAuthTokensRequest *request,
+                                           proto::admin::ListAdminAuthTokensResponse *response) {
+    API_CONTEXT_INIT_HTTP(ListAdminAuthTokens)
+    KVCM_LOG_INFO("[traceId: %s] ListAdminAuthTokens called.", request->trace_id().c_str());
+    admin_service_impl_->ListAdminAuthTokens(request_context, request, response);
 }
 
 } // namespace kv_cache_manager

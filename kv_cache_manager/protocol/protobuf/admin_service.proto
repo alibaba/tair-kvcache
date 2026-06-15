@@ -518,6 +518,32 @@ message UpdateLoggerRequest {
     string log_level = 3; // DEBUG INFO WARN ERROR
 }
 
+// runtime admin auth token management (kvcm.service.admin_auth_token).
+// changes are ephemeral; restart restores the config-file value
+message SetAdminAuthTokensRequest {
+    string trace_id = 1;
+    // full replacement list. empty => disable enforcement (open mode)
+    repeated string tokens = 2;
+}
+
+message RotateAdminAuthTokenRequest {
+    string trace_id = 1;
+    // optional. when non-empty must match an existing accepted token
+    // and is removed from the list after new_token is added
+    string old_token = 2;
+    // appended to the accepted list. duplicates are silently ignored
+    string new_token = 3;
+}
+
+message ListAdminAuthTokensRequest { string trace_id = 1; }
+message ListAdminAuthTokensResponse {
+    CommonResponseHeader header = 1;
+    bool enforcing = 2; // false iff the token list is empty
+    int32 token_count = 3;
+    // 8-hex-char FNV-1a fingerprint per accepted token
+    repeated string fingerprints = 4;
+}
+
 service AdminService {
     // 增删改查 存储集群配置 (Storage)
     rpc AddStorage(AddStorageRequest) returns (CommonResponse);
@@ -558,4 +584,8 @@ service AdminService {
     rpc UpdateLeaderElectorConfig(UpdateLeaderElectorConfigRequest) returns (CommonResponse);
     // 日志行为控制
     rpc UpdateLogger(UpdateLoggerRequest) returns (CommonResponse);
+    // admin auth token 在线管理（运行时生效，不持久化）
+    rpc SetAdminAuthTokens(SetAdminAuthTokensRequest) returns (CommonResponse);
+    rpc RotateAdminAuthToken(RotateAdminAuthTokenRequest) returns (CommonResponse);
+    rpc ListAdminAuthTokens(ListAdminAuthTokensRequest) returns (ListAdminAuthTokensResponse);
 }

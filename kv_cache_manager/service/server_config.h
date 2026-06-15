@@ -4,6 +4,7 @@
 #include <functional>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace kv_cache_manager {
 
@@ -28,6 +29,7 @@ public:
     int32_t GetServiceHttpPort() const { return service_http_port_; }
     int32_t GetServiceAdminRpcPort() const { return service_admin_rpc_port_; }
     int32_t GetServiceAdminHttpPort() const { return service_admin_http_port_; }
+    const std::vector<std::string> &GetAdminAuthTokens() const { return admin_auth_tokens_; }
     bool IsEnableDebugService() const { return enable_debug_service_; }
     uint32_t GetLogLevel() const { return log_level_; }
     const std::string &startup_config() { return startup_config_; }
@@ -63,6 +65,9 @@ private:
     int32_t service_http_port_ = 0;
     int32_t service_admin_rpc_port_ = 0;
     int32_t service_admin_http_port_ = 0;
+    // accepted Bearer tokens for the admin and debug HTTP services;
+    // empty list means auth is disabled (open mode)
+    std::vector<std::string> admin_auth_tokens_;
     bool enable_debug_service_ = false;
     uint32_t log_level_ = 0;
     std::string startup_config_;

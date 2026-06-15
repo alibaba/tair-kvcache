@@ -40,11 +40,14 @@ bool CoroHttpService::Start(int32_t port, size_t thread_num) {
     server_ = std::make_unique<coro_http::coro_http_server>(thread_num, static_cast<unsigned short>(port), "0.0.0.0");
 
     // 注册所有 GET/POST handler
+    // chain order: logger(auth(handler)) — so 401 responses produced
+    // by the auth middleware still go through the request/response
+    // logger for audit purposes
     for (const auto &[path, handler] : get_handlers_) {
-        server_->set_http_handler<coro_http::GET>(path, WrapWithLogger(path, handler));
+        server_->set_http_handler<coro_http::GET>(path, WrapWithLogger(path, WrapWithAuth(path, handler)));
     }
     for (const auto &[path, handler] : post_handlers_) {
-        server_->set_http_handler<coro_http::POST>(path, WrapWithLogger(path, handler));
+        server_->set_http_handler<coro_http::POST>(path, WrapWithLogger(path, WrapWithAuth(path, handler)));
     }
 
     auto ec = server_->async_start().get(); // 注意这里用 get()
@@ -98,6 +101,60 @@ CoroHttpService::HandlerType CoroHttpService::WrapWithLogger(const std::string &
         co_await handler(req, res);
 
         LogDebugHttpResponse(res);
+    };
+}
+
+void CoroHttpService::SetTokenVerifier(std::shared_ptr<TokenVerifier> verifier) {
+    token_verifier_ = std::move(verifier);
+}
+
+CoroHttpService::HandlerType CoroHttpService::WrapWithAuth(const std::string &api, HandlerType handler) {
+    // when no verifier is configured the service runs in open mode;
+    // return the handler unchanged so there is zero per-request cost
+    if (!token_verifier_) {
+        return handler;
+    }
+    auto verifier = token_verifier_;
+    return [api, handler, verifier](coro_http::coro_http_request &req,
+                                    coro_http::coro_http_response &res) -> async_simple::coro::Lazy<void> {
+        auto authz = req.get_header_value("Authorization");
+        auto outcome = verifier->Verify(authz);
+        if (outcome == AuthOutcome::kOk) {
+            co_await handler(req, res);
+            co_return;
+        }
+
+        // RFC 6750 §3: respond with 401 and a WWW-Authenticate
+        // challenge advertising the Bearer scheme.  the optional
+        // `error` parameter distinguishes malformed requests from
+        // bad tokens; absent credentials get the bare challenge
+        std::string www_auth = "Bearer realm=\"" + verifier->Realm() + "\"";
+        const char *err = nullptr;
+        switch (outcome) {
+        case AuthOutcome::kInvalidRequest:
+            err = "invalid_request";
+            break;
+        case AuthOutcome::kInvalidToken:
+            err = "invalid_token";
+            break;
+        case AuthOutcome::kMissingCredentials:
+        case AuthOutcome::kOk:
+            break;
+        }
+        if (err != nullptr) {
+            www_auth += ", error=\"";
+            www_auth += err;
+            www_auth += "\"";
+        }
+        res.add_header("WWW-Authenticate", www_auth);
+        res.add_header("Content-Type", "application/json");
+        res.set_status_and_content(coro_http::status_type::unauthorized, std::string(R"({"error":"unauthorized"})"));
+
+        KVCM_LOG_WARN("[AUTH] denied api=%s outcome=%d ip=%s",
+                      api.c_str(),
+                      static_cast<int>(outcome),
+                      GetHttpClientIp(req.get_conn()).c_str());
+        co_return;
     };
 }
 

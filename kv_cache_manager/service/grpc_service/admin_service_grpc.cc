@@ -63,6 +63,11 @@ void AdminServiceGRpc::Init() {
 
     // for logging control APIs
     MAKE_SERVICE_METRICS_COLLECTOR(UpdateLogger);
+
+    // for admin auth token APIs
+    MAKE_SERVICE_METRICS_COLLECTOR(SetAdminAuthTokens);
+    MAKE_SERVICE_METRICS_COLLECTOR(RotateAdminAuthToken);
+    MAKE_SERVICE_METRICS_COLLECTOR(ListAdminAuthTokens);
 }
 
 grpc::Status AdminServiceGRpc::AddStorage(grpc::ServerContext *context,
@@ -294,6 +299,30 @@ grpc::Status AdminServiceGRpc::UpdateLogger(grpc::ServerContext *context,
                                             proto::admin::CommonResponse *response) {
     API_CONTEXT_INIT_GRPC(UpdateLogger)
     admin_service_impl_->UpdateLogger(request_context, request, response);
+    return grpc::Status::OK;
+}
+
+grpc::Status AdminServiceGRpc::SetAdminAuthTokens(grpc::ServerContext *context,
+                                                  const proto::admin::SetAdminAuthTokensRequest *request,
+                                                  proto::admin::CommonResponse *response) {
+    API_CONTEXT_INIT_GRPC(SetAdminAuthTokens)
+    admin_service_impl_->SetAdminAuthTokens(request_context, request, response);
+    return grpc::Status::OK;
+}
+
+grpc::Status AdminServiceGRpc::RotateAdminAuthToken(grpc::ServerContext *context,
+                                                    const proto::admin::RotateAdminAuthTokenRequest *request,
+                                                    proto::admin::CommonResponse *response) {
+    API_CONTEXT_INIT_GRPC(RotateAdminAuthToken)
+    admin_service_impl_->RotateAdminAuthToken(request_context, request, response);
+    return grpc::Status::OK;
+}
+
+grpc::Status AdminServiceGRpc::ListAdminAuthTokens(grpc::ServerContext *context,
+                                                   const proto::admin::ListAdminAuthTokensRequest *request,
+                                                   proto::admin::ListAdminAuthTokensResponse *response) {
+    API_CONTEXT_INIT_GRPC(ListAdminAuthTokens)
+    admin_service_impl_->ListAdminAuthTokens(request_context, request, response);
     return grpc::Status::OK;
 }
 

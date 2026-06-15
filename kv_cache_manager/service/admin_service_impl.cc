@@ -1,5 +1,8 @@
 #include "kv_cache_manager/service/admin_service_impl.h"
 
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
 #include <memory>
 #include <string>
 #include <utility>
@@ -17,6 +20,7 @@
 #include "kv_cache_manager/metrics/metrics_registry.h"
 #include "kv_cache_manager/metrics/metrics_reporter.h"
 #include "kv_cache_manager/protocol/protobuf/admin_service.pb.h"
+#include "kv_cache_manager/service/http_service/auth/static_bearer_token_verifier.h"
 #include "kv_cache_manager/service/util/manager_message_proto_util.h"
 #include "kv_cache_manager/service/util/proto_message_json_util.h"
 #include "kv_cache_manager/service/util/service_call_guard.h"
@@ -53,7 +57,7 @@
         if ((single_field)) {                                                                                          \
             invalid_fields += "{" api_name ": {" manager_req "}}";                                                     \
         } else {                                                                                                       \
-            /* invalid_fields 已在ValidateRequiredFields构造完成 */                                              \
+            /* invalid_fields 已在ValidateRequiredFields构造完成 */                                                    \
         }                                                                                                              \
         status->set_code(proto::admin::INVALID_ARGUMENT);                                                              \
         status->set_message(invalid_fields);                                                                           \
@@ -976,6 +980,118 @@ void AdminServiceImpl::UpdateLogger(RequestContext *request_context,
     request_context->set_status_code(status->code());
     status->set_message("Update logger success");
     KVCM_LOG_INFO("[traceId: %s] Update logger success", request->trace_id().c_str());
+}
+
+namespace {
+
+// FNV-1a 32-bit, non-cryptographic.  used to derive a short
+// fingerprint from an admin auth token so operators can identify
+// installed tokens without seeing the secret.  truncating to 32 bits
+// is fine because the surface is small (a handful of tokens) and
+// collision impact is purely cosmetic
+std::string FnvFingerprint(const std::string &input) {
+    std::uint32_t hash = 0x811c9dc5u;
+    for (unsigned char ch : input) {
+        hash ^= static_cast<std::uint32_t>(ch);
+        hash *= 0x01000193u;
+    }
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "%08x", hash);
+    return std::string(buf);
+}
+
+} // namespace
+
+void AdminServiceImpl::SetAdminAuthTokens(RequestContext *request_context,
+                                          const proto::admin::SetAdminAuthTokensRequest *request,
+                                          proto::admin::CommonResponse *response) {
+    API_CALL_GUARD("SetAdminAuthTokens", false);
+    auto *header = response->mutable_header();
+    auto *status = header->mutable_status();
+    if (!token_verifier_) {
+        status->set_code(proto::admin::UNSUPPORTED);
+        request_context->set_status_code(status->code());
+        status->set_message("admin auth not configured");
+        return;
+    }
+    std::vector<std::string> tokens(request->tokens().begin(), request->tokens().end());
+    // drop empty entries to match config-file parsing semantics
+    tokens.erase(std::remove_if(tokens.begin(), tokens.end(), [](const std::string &s) { return s.empty(); }),
+                 tokens.end());
+    const std::size_t count = tokens.size();
+    token_verifier_->SetTokens(std::move(tokens));
+    status->set_code(proto::admin::OK);
+    request_context->set_status_code(status->code());
+    status->set_message("admin auth tokens updated");
+    KVCM_LOG_INFO("[traceId: %s] SetAdminAuthTokens applied count=%zu enforcing=%s",
+                  request->trace_id().c_str(),
+                  count,
+                  count > 0 ? "true" : "false");
+}
+
+void AdminServiceImpl::RotateAdminAuthToken(RequestContext *request_context,
+                                            const proto::admin::RotateAdminAuthTokenRequest *request,
+                                            proto::admin::CommonResponse *response) {
+    API_CALL_GUARD("RotateAdminAuthToken", false);
+    auto *header = response->mutable_header();
+    auto *status = header->mutable_status();
+    if (!token_verifier_) {
+        status->set_code(proto::admin::UNSUPPORTED);
+        request_context->set_status_code(status->code());
+        status->set_message("admin auth not configured");
+        return;
+    }
+    if (request->new_token().empty()) {
+        status->set_code(proto::admin::INVALID_ARGUMENT);
+        request_context->set_status_code(status->code());
+        status->set_message("new_token must not be empty");
+        return;
+    }
+    auto cur = token_verifier_->SnapshotTokens();
+    if (!request->old_token().empty()) {
+        auto it = std::find(cur.begin(), cur.end(), request->old_token());
+        if (it == cur.end()) {
+            status->set_code(proto::admin::INVALID_ARGUMENT);
+            request_context->set_status_code(status->code());
+            status->set_message("old_token not found");
+            return;
+        }
+        cur.erase(it);
+    }
+    if (std::find(cur.begin(), cur.end(), request->new_token()) == cur.end()) {
+        cur.push_back(request->new_token());
+    }
+    const std::size_t count = cur.size();
+    token_verifier_->SetTokens(std::move(cur));
+    status->set_code(proto::admin::OK);
+    request_context->set_status_code(status->code());
+    status->set_message("admin auth tokens rotated");
+    KVCM_LOG_INFO("[traceId: %s] RotateAdminAuthToken applied count=%zu", request->trace_id().c_str(), count);
+}
+
+void AdminServiceImpl::ListAdminAuthTokens(RequestContext *request_context,
+                                           const proto::admin::ListAdminAuthTokensRequest *request,
+                                           proto::admin::ListAdminAuthTokensResponse *response) {
+    API_CALL_GUARD("ListAdminAuthTokens", false);
+    auto *header = response->mutable_header();
+    auto *status = header->mutable_status();
+    if (!token_verifier_) {
+        response->set_enforcing(false);
+        response->set_token_count(0);
+        status->set_code(proto::admin::OK);
+        request_context->set_status_code(status->code());
+        status->set_message("admin auth not configured");
+        return;
+    }
+    auto cur = token_verifier_->SnapshotTokens();
+    response->set_enforcing(!cur.empty());
+    response->set_token_count(static_cast<std::int32_t>(cur.size()));
+    for (const auto &t : cur) {
+        response->add_fingerprints(FnvFingerprint(t));
+    }
+    status->set_code(proto::admin::OK);
+    request_context->set_status_code(status->code());
+    status->set_message("admin auth tokens listed");
 }
 
 } // namespace kv_cache_manager

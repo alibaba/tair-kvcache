@@ -109,6 +109,17 @@ public:
                               const proto::admin::UpdateLoggerRequest *request,
                               proto::admin::CommonResponse *response) override;
 
+    // admin auth token 在线管理
+    grpc::Status SetAdminAuthTokens(grpc::ServerContext *context,
+                                    const proto::admin::SetAdminAuthTokensRequest *request,
+                                    proto::admin::CommonResponse *response) override;
+    grpc::Status RotateAdminAuthToken(grpc::ServerContext *context,
+                                      const proto::admin::RotateAdminAuthTokenRequest *request,
+                                      proto::admin::CommonResponse *response) override;
+    grpc::Status ListAdminAuthTokens(grpc::ServerContext *context,
+                                     const proto::admin::ListAdminAuthTokensRequest *request,
+                                     proto::admin::ListAdminAuthTokensResponse *response) override;
+
 private:
     std::shared_ptr<MetricsRegistry> metrics_registry_;
     std::shared_ptr<AdminServiceImpl> admin_service_impl_;
@@ -159,6 +170,11 @@ private:
 
     // for logging control APIs
     KVCM_DECLARE_METRICS_COLLECTOR_(UpdateLogger);
+
+    // for admin auth token APIs
+    KVCM_DECLARE_METRICS_COLLECTOR_(SetAdminAuthTokens);
+    KVCM_DECLARE_METRICS_COLLECTOR_(RotateAdminAuthToken);
+    KVCM_DECLARE_METRICS_COLLECTOR_(ListAdminAuthTokens);
 };
 
 } // namespace kv_cache_manager
