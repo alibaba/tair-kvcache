@@ -1,5 +1,7 @@
 #include "kv_cache_manager/client/src/internal/sdk/caller_node_provider_factory.h"
 
+#include "kv_cache_manager/client/src/internal/sdk/nfs_caller_node_provider.h"
+
 #ifdef ENABLE_TAIR_MEMPOOL
 #include "stub_source/kv_cache_manager/client/src/internal/sdk/tair_mempool_caller_node_provider.h"
 #endif
@@ -33,6 +35,12 @@ CallerNodeProviderFactory::Create(const std::vector<std::shared_ptr<StorageConfi
             break;
         }
 #endif
+        case DataStorageType::DATA_STORAGE_TYPE_NFS: {
+            auto provider = std::make_unique<NfsCallerNodeProvider>();
+            KVCM_LOG_INFO("caller_node_provider: using NfsCallerNodeProvider for storage [%s]",
+                          storage_config->global_unique_name().c_str());
+            return provider;
+        }
         default:
             // No concrete provider for this storage type in this build —
             // fall through and try the next storage config (if any).

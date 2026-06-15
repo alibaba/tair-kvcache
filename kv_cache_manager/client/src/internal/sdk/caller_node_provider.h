@@ -2,7 +2,7 @@
 
 #include <string>
 
-#include "kv_cache_manager/common/affinity_types.h"
+#include "kv_cache_manager/client/include/common.h"
 
 namespace kv_cache_manager {
 
@@ -29,15 +29,15 @@ public:
     // Returns the caller's local node identity for the storage backend.
     // An empty node_id means "unknown" and is treated as
     // "affinity not enabled for this caller" by the server.
-    virtual CallerNode GetCallerNode() = 0;
+    virtual ClientCallerNode GetCallerNode() = 0;
 };
 
-// Default fallback: returns empty CallerNode. Used when no concrete provider
+// Default fallback: returns empty ClientCallerNode. Used when no concrete provider
 // is applicable (no tair-mempool storage configured, build without
 // ENABLE_TAIR_MEMPOOL, etc.). Behaviourally identical to the old client.
 class NoopCallerNodeProvider : public CallerNodeProvider {
 public:
-    CallerNode GetCallerNode() override { return {}; }
+    ClientCallerNode GetCallerNode() override { return {}; }
 };
 
 } // namespace kv_cache_manager

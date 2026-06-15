@@ -21,7 +21,7 @@ public:
                                                         const BlockMask &block_mask,
                                                         int32_t sw_size,
                                                         const std::vector<std::string> &location_spec_names,
-                                                        std::vector<ReplicationHint> &out_hints) override;
+                                                        std::vector<ClientReplicationHint> &out_hints) override;
 
     std::pair<ClientErrorCode, WriteLocation> StartWrite(const std::string &trace_id,
                                                          const std::vector<int64_t> &keys,
@@ -44,7 +44,7 @@ public:
                                 const std::vector<int64_t> &tokens,
                                 const BlockMask &block_mask) override;
 
-    void ReplicateWithData(const ReplicationHint &hint,
+    void ReplicateWithData(const ClientReplicationHint &hint,
                            const void *data,
                            size_t size,
                            std::function<void()> release_fn) override;

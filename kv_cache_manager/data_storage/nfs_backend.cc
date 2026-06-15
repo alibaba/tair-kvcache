@@ -114,6 +114,8 @@ std::vector<LocationDescriptor> NfsBackend::CreateWithHints(const std::vector<st
         if (!preferred.empty()) {
             p.second.SetParam("preferred_node", preferred);
             p.second.SetParam("local_node_id", local_node_id_);
+            KVCM_LOG_INFO(
+                "create with hints preferred_node[%s] local_node_id[%s]", preferred.c_str(), local_node_id_.c_str());
         }
         out.push_back(LocationDescriptor{p.first, std::move(p.second), local_node_id_});
     }

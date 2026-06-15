@@ -59,7 +59,8 @@ ClientErrorCode ManagerClientImpl::Init(const std::string &client_config, InitPa
         replication_executor_ =
             std::make_unique<ReplicationExecutor>(meta_client_.get(), transfer_client_.get(), num_workers);
         KVCM_LOG_INFO("replication executor created: workers=%d auto_replicate=%s",
-                      num_workers, auto_replicate_ ? "true" : "false");
+                      num_workers,
+                      auto_replicate_ ? "true" : "false");
     }
     KVCM_LOG_INFO("manager client init success");
     return ER_OK;
@@ -80,7 +81,7 @@ ManagerClientImpl::MatchLocation(const std::string &trace_id,
                                  const BlockMask &block_mask,
                                  int32_t sw_size,
                                  const std::vector<std::string> &location_spec_names,
-                                 std::vector<ReplicationHint> &out_hints) {
+                                 std::vector<ClientReplicationHint> &out_hints) {
     CHECK_CLIENT_WITH_TYPE(meta_client_);
     auto result = meta_client_->MatchLocation(
         trace_id, query_type, keys, tokens, block_mask, sw_size, location_spec_names, out_hints);
@@ -125,7 +126,7 @@ ClientErrorCode ManagerClientImpl::RemoveCache(const std::string &trace_id,
     return meta_client_->RemoveCache(trace_id, keys, tokens, block_mask);
 }
 
-void ManagerClientImpl::ReplicateWithData(const ReplicationHint &hint,
+void ManagerClientImpl::ReplicateWithData(const ClientReplicationHint &hint,
                                           const void *data,
                                           size_t size,
                                           std::function<void()> release_fn) {
@@ -135,7 +136,8 @@ void ManagerClientImpl::ReplicateWithData(const ReplicationHint &hint,
         KVCM_LOG_ERROR("[replication] ReplicateWithData: replication_executor_ is null, "
                        "block_key [%ld] target [%s] cannot be replicated. "
                        "Hint was dropped. Check that meta_client_ and transfer_client_ both initialized.",
-                       hint.block_key, hint.target_node_id.c_str());
+                       hint.block_key,
+                       hint.target_node_id.c_str());
         if (release_fn) {
             release_fn();
         }
