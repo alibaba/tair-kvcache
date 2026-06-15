@@ -1,19 +1,29 @@
 module(name = "kv_cache_manager")
 
 ###############################################################################
-# XLA and JAX — local checkouts for TPU support
+# XLA and JAX — TPU support
 ###############################################################################
 
 bazel_dep(name = "xla")
-local_path_override(
+archive_override(
     module_name = "xla",
-    path = "/home/zhaotaonan_ztn/xla",
+    strip_prefix = "xla-e7f75a07ea8e185ae22684a437c0254bc855b427",
+    urls = [
+        "https://github.com/openxla/xla/archive/e7f75a07ea8e185ae22684a437c0254bc855b427.tar.gz",
+    ],
 )
 
 bazel_dep(name = "jax")
-local_path_override(
+archive_override(
     module_name = "jax",
-    path = "/home/zhaotaonan_ztn/jax",
+    strip_prefix = "jax-bacac85372d5d5a6bf3e1e9578a475ab0ab656ec",
+    urls = [
+        "https://github.com/jax-ml/jax/archive/bacac85372d5d5a6bf3e1e9578a475ab0ab656ec.tar.gz",
+    ],
+    patch_strip = 1,
+    patches = [
+        "//patches/jax:py_client_visibility.patch",
+    ],
 )
 
 ###############################################################################

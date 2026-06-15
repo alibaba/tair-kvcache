@@ -180,6 +180,9 @@ build:tpu --define using_tpu=true
 # NOTE: WORKSPACE and MODULE.bazel coexist for TPU builds.
 # bzlmod handles xla/jax/abseil/protobuf/grpc; WORKSPACE handles legacy deps.
 build:tpu --experimental_repo_remote_exec  # required by XLA's tensorrt_configure
+# libtpu.so runtime path for TPU tests. Override via TPU_LIBRARY_PATH env var.
+# The default points to the standard JAX+libtpu installation location.
+test:tpu --test_env=TPU_LIBRARY_PATH=/home/zhaotaonan_ztn/vllm_tpu_env_yemu/lib/python3.12/site-packages/libtpu/libtpu.so
 # client_with_tpu: build kv_cache_manager_client.so without mooncake/RDMA
 build:client_with_tpu --config=tpu
 build:client_with_tpu --copt=-DENABLE_TAIR_MEMPOOL

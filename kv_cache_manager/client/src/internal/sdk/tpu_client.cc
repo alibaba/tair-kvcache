@@ -9,12 +9,43 @@
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
-#include <link.h>
 #include <vector>
 
 #include "xla/pjrt/c/pjrt_c_api_raw_buffer_extension.h"
 
 namespace kv_cache_manager {
+
+// =====================================================================
+// PJRT C API helper macros — reduce boilerplate for Args struct init
+// and error handling patterns that repeat throughout this file.
+// =====================================================================
+
+// Initialize a PJRT *_Args struct with struct_size and extension_start.
+// Usage: PJRT_INIT(PJRT_Client_Create);  → declares `args` of type PJRT_Client_Create_Args
+#define PJRT_INIT(type) \
+    type##_Args args{}; \
+    args.struct_size = type##_Args_STRUCT_SIZE; \
+    args.extension_start = nullptr
+
+// Call a PJRT API function and return error_code if it returns a PJRT_Error*.
+// Uses api_ (TpuClient member) for error handling.
+// Usage: PJRT_CHECK(PJRT_Client_Create(&args), ER_TPU_PJRT_INIT_ERROR);
+#define PJRT_CHECK(call, error_code) \
+    do { \
+        PJRT_Error* _pjrt_err = (call); \
+        if (_pjrt_err != nullptr) { \
+            std::string _msg = TpuClient::GetErrorMessage(api_, _pjrt_err); \
+            KVCM_LOG_ERROR(#call " failed: %s", _msg.c_str()); \
+            return error_code; \
+        } \
+    } while (0)
+
+// Guard: return error_code if api_ (and optionally client_) is null.
+#define PJRT_GUARD(error_code) \
+    do { if (!api_ || !client_) return error_code; } while (0)
+
+#define PJRT_GUARD_API(error_code) \
+    do { if (!api_) return error_code; } while (0)
 
 // =====================================================================
 // PyArray → PJRT_Buffer* extraction bridge (runtime registration)
@@ -32,54 +63,14 @@ PyArrayBufferExtractorFn GetPyArrayBufferExtractor() {
 }
 
 namespace {
-// Default libtpu.so path (installed by uv in the vllm_tpu_env_yemu virtualenv)
-constexpr const char* kDefaultLibtpuPath =
-    "/home/zhaotaonan_ztn/vllm_tpu_env_yemu/lib/python3.12/site-packages/libtpu/libtpu.so";
-
-// Offset of RealInitGoogle in libtpu.so v0.0.41.
-// Demangled: RealInitGoogle(std::string_view, int*, char***, bool, bool)
-// This is the internal initialization function that sets up Google's
-// infrastructure (flags, logging, etc.) required by PJRT_Client_Create.
-// In standalone C++ (unlike JAX/Python), we must call this explicitly.
-// TODO: make this version-aware or use dlinfo+symbol lookup if possible.
-constexpr uintptr_t kRealInitGoogleOffset = 0x1d654780;
-
-// Function signature matching the demangled RealInitGoogle:
-// std::string_view is passed as (const char* data, size_t len) in libc++ ABI
-using RealInitGoogleFunc = void (*)(const char* progname, size_t len,
-                                     int* argc, char*** argv,
-                                     bool remove_flags, bool install_signal_handlers);
+// Default libtpu.so search path. Override via TPU_LIBRARY_PATH env var.
+// When JAX is installed, libtpu is typically at:
+//   <python-site-packages>/libtpu/libtpu.so
+constexpr const char* kDefaultLibtpuPath = "libtpu.so";
 
 const char* GetLibtpuPath() {
     const char* env_path = std::getenv("TPU_LIBRARY_PATH");
     return (env_path && env_path[0] != '\0') ? env_path : kDefaultLibtpuPath;
-}
-
-// Call RealInitGoogle() to set up Google's internal infrastructure
-// (flags, logging, filesystem, etc.) required by PJRT_Client_Create.
-// This is equivalent to what JAX's jaxlib does during Python import.
-bool CallRealInitGoogle(void* libtpu_handle) {
-    struct link_map* lm = nullptr;
-    if (dlinfo(libtpu_handle, RTLD_DI_LINKMAP, &lm) != 0) {
-        KVCM_LOG_ERROR("dlinfo failed: %s", dlerror());
-        return false;
-    }
-
-    uintptr_t base = static_cast<uintptr_t>(lm->l_addr);
-    auto init_google = reinterpret_cast<RealInitGoogleFunc>(base + kRealInitGoogleOffset);
-
-    // Call with minimal args: program name, no argc/argv manipulation,
-    // don't remove flags, don't install signal handlers.
-    static const char* kProgName = "kvcm_tpu";
-    static int dummy_argc = 1;
-    static char* dummy_argv[] = {const_cast<char*>(kProgName), nullptr};
-    static char** dummy_argv_ptr = dummy_argv;
-
-    init_google(kProgName, strlen(kProgName), &dummy_argc, &dummy_argv_ptr,
-                false, false);
-
-    KVCM_LOG_INFO("RealInitGoogle called successfully (base=0x%lx)", base);
-    return true;
 }
 } // anonymous namespace
 
@@ -89,19 +80,19 @@ TpuClient::~TpuClient() {
 
 std::string TpuClient::GetErrorMessage(const PJRT_Api* api, PJRT_Error* error) {
     if (!api || !error) return "unknown error";
-    PJRT_Error_Message_Args args{};
-    args.struct_size = PJRT_Error_Message_Args_STRUCT_SIZE;
-    args.extension_start = nullptr;
-    args.error = error;
-    api->PJRT_Error_Message(&args);
-    std::string msg(args.message, args.message_size);
 
-    // Destroy the error
-    PJRT_Error_Destroy_Args destroy_args{};
-    destroy_args.struct_size = PJRT_Error_Destroy_Args_STRUCT_SIZE;
-    destroy_args.extension_start = nullptr;
-    destroy_args.error = error;
-    api->PJRT_Error_Destroy(&destroy_args);
+    std::string msg;
+    {
+        PJRT_INIT(PJRT_Error_Message);
+        args.error = error;
+        api->PJRT_Error_Message(&args);
+        msg.assign(args.message, args.message_size);
+    }
+    {
+        PJRT_INIT(PJRT_Error_Destroy);
+        args.error = error;
+        api->PJRT_Error_Destroy(&args);
+    }
     return msg;
 }
 
@@ -111,15 +102,15 @@ ClientErrorCode TpuClient::Init() {
         Destroy();
     }
 
-    // Load libtpu.so and run one-time Google init on first call only.
-    // RealInitGoogle() is not idempotent - calling it twice will abort.
-    // PJRT_Plugin_Initialize() is also not idempotent.
+    // Load libtpu.so on first call only.
+    // PJRT_Plugin_Initialize() is not idempotent — calling it twice will abort.
     // If libtpu is already loaded (e.g. by JAX's TPU plugin), we skip
-    // both dlopen and RealInitGoogle, and just reuse the existing PJRT_Api.
-    static bool google_initialized = false;
+    // both dlopen and PJRT_Plugin_Initialize, and just reuse the existing PJRT_Api.
+    static bool plugin_initialized = false;
     static void* shared_libtpu_handle = nullptr;
+    static bool needs_plugin_init = false;
 
-    if (!google_initialized) {
+    if (!plugin_initialized) {
         const char* lib_path = GetLibtpuPath();
 
         // Check if libtpu.so is already loaded in this process
@@ -128,27 +119,21 @@ ClientErrorCode TpuClient::Init() {
         void* existing_handle = dlopen(lib_path, RTLD_NOW | RTLD_GLOBAL | RTLD_NOLOAD);
         if (existing_handle) {
             // libtpu already loaded by another component (e.g. JAX).
-            // RealInitGoogle and PJRT_Plugin_Initialize have already run —
-            // skip them to avoid duplicate-init abort.
+            // PJRT_Plugin_Initialize has already run — skip to avoid abort.
             shared_libtpu_handle = existing_handle;
+            needs_plugin_init = false;
             KVCM_LOG_INFO("libtpu already loaded (by JAX or another component), reusing handle");
         } else {
-            // First loader in this process — load and initialize
+            // First loader in this process — load the library
             shared_libtpu_handle = dlopen(lib_path, RTLD_NOW | RTLD_GLOBAL);
             if (!shared_libtpu_handle) {
                 KVCM_LOG_ERROR("dlopen(%s) failed: %s", lib_path, dlerror());
                 return ER_TPU_PJRT_INIT_ERROR;
             }
             KVCM_LOG_INFO("libtpu loaded from: %s", lib_path);
-
-            if (!CallRealInitGoogle(shared_libtpu_handle)) {
-                KVCM_LOG_ERROR("Failed to call RealInitGoogle");
-                dlclose(shared_libtpu_handle);
-                shared_libtpu_handle = nullptr;
-                return ER_TPU_PJRT_INIT_ERROR;
-            }
+            needs_plugin_init = true;
         }
-        google_initialized = true;
+        plugin_initialized = true;
     }
 
     libtpu_handle_ = shared_libtpu_handle;
@@ -167,44 +152,47 @@ ClientErrorCode TpuClient::Init() {
         return ER_TPU_PJRT_INIT_ERROR;
     }
 
-    // Create PJRT client
-    PJRT_Client_Create_Args create_args{};
-    create_args.struct_size = PJRT_Client_Create_Args_STRUCT_SIZE;
-    create_args.extension_start = nullptr;
-    create_args.create_options = nullptr;
-    create_args.num_options = 0;
-    create_args.kv_get_callback = nullptr;
-    create_args.kv_get_user_arg = nullptr;
-    create_args.kv_put_callback = nullptr;
-    create_args.kv_put_user_arg = nullptr;
-
-    PJRT_Error* err = api_->PJRT_Client_Create(&create_args);
-    if (err != nullptr) {
-        std::string msg = GetErrorMessage(api_, err);
-        KVCM_LOG_ERROR("PJRT_Client_Create failed: %s", msg.c_str());
-        return ER_TPU_PJRT_INIT_ERROR;
+    // Call PJRT_Plugin_Initialize if we are the first loader.
+    // Skip if JAX (or another component) already initialized the plugin.
+    if (needs_plugin_init) {
+        PJRT_INIT(PJRT_Plugin_Initialize);
+        PJRT_CHECK(api_->PJRT_Plugin_Initialize(&args), ER_TPU_PJRT_INIT_ERROR);
+        KVCM_LOG_INFO("PJRT_Plugin_Initialize succeeded");
+        needs_plugin_init = false;
     }
-    client_ = create_args.client;
+
+    // Create PJRT client
+    {
+        PJRT_INIT(PJRT_Client_Create);
+        args.create_options = nullptr;
+        args.num_options = 0;
+        args.kv_get_callback = nullptr;
+        args.kv_get_user_arg = nullptr;
+        args.kv_put_callback = nullptr;
+        args.kv_put_user_arg = nullptr;
+        PJRT_CHECK(api_->PJRT_Client_Create(&args), ER_TPU_PJRT_INIT_ERROR);
+        client_ = args.client;
+    }
 
     // Get addressable devices
-    PJRT_Client_AddressableDevices_Args devices_args{};
-    devices_args.struct_size = PJRT_Client_AddressableDevices_Args_STRUCT_SIZE;
-    devices_args.extension_start = nullptr;
-    devices_args.client = client_;
-    api_->PJRT_Client_AddressableDevices(&devices_args);
+    size_t num_devices = 0;
+    {
+        PJRT_INIT(PJRT_Client_AddressableDevices);
+        args.client = client_;
+        api_->PJRT_Client_AddressableDevices(&args);
 
-    if (devices_args.num_addressable_devices == 0) {
-        KVCM_LOG_ERROR("No addressable TPU devices found");
-        Destroy();
-        return ER_TPU_PJRT_INIT_ERROR;
+        if (args.num_addressable_devices == 0) {
+            KVCM_LOG_ERROR("No addressable TPU devices found");
+            Destroy();
+            return ER_TPU_PJRT_INIT_ERROR;
+        }
+
+        device_ = args.addressable_devices[0];
+        num_devices = args.num_addressable_devices;
+        KVCM_LOG_INFO("TPU PJRT client initialized with %zu devices", num_devices);
     }
 
-    device_ = devices_args.addressable_devices[0];
-    KVCM_LOG_INFO("TPU PJRT client initialized with %zu devices",
-                   devices_args.num_addressable_devices);
-
-    // Log platform/device/memory info via read-only PJRT APIs
-    LogDeviceInfo(devices_args.num_addressable_devices);
+    LogDeviceInfo(num_devices);
 
     // Probe and log all API capabilities
     ProbeApiCapabilities();
@@ -222,9 +210,7 @@ ClientErrorCode TpuClient::Init() {
 
 void TpuClient::Destroy() {
     if (client_ && api_) {
-        PJRT_Client_Destroy_Args args{};
-        args.struct_size = PJRT_Client_Destroy_Args_STRUCT_SIZE;
-        args.extension_start = nullptr;
+        PJRT_INIT(PJRT_Client_Destroy);
         args.client = client_;
         api_->PJRT_Client_Destroy(&args);
     }
@@ -232,22 +218,16 @@ void TpuClient::Destroy() {
     device_ = nullptr;
     api_ = nullptr;
     rawbuf_ext_ = nullptr;
-    // Note: libtpu_handle_ points to a shared static handle, don't dlclose here.
     libtpu_handle_ = nullptr;
 }
 
 ClientErrorCode TpuClient::DmaMap(void* data, size_t size) {
-    if (!api_ || !client_) {
-        return ER_TPU_DMA_MAP_ERROR;
-    }
-    // DMA mapping for TPU - return success as basic operations don't require it
+    PJRT_GUARD(ER_TPU_DMA_MAP_ERROR);
     return ER_OK;
 }
 
 ClientErrorCode TpuClient::DmaUnmap(void* data) {
-    if (!api_ || !client_) {
-        return ER_TPU_DMA_MAP_ERROR;
-    }
+    PJRT_GUARD(ER_TPU_DMA_MAP_ERROR);
     return ER_OK;
 }
 
@@ -267,10 +247,7 @@ ClientErrorCode TpuClient::BufferToHost(PJRT_Buffer* buffer, void* host_dst, siz
 
 void TpuClient::DestroyBuffer(PJRT_Buffer* buffer) {
     if (!api_ || !buffer) return;
-
-    PJRT_Buffer_Destroy_Args args{};
-    args.struct_size = PJRT_Buffer_Destroy_Args_STRUCT_SIZE;
-    args.extension_start = nullptr;
+    PJRT_INIT(PJRT_Buffer_Destroy);
     args.buffer = buffer;
     api_->PJRT_Buffer_Destroy(&args);
 }
@@ -282,19 +259,11 @@ void TpuClient::DestroyBuffer(PJRT_Buffer* buffer) {
 ClientErrorCode TpuClient::BufferFromHostAsync(const void* host_src, size_t size,
                                                 PJRT_Buffer*& out_buffer,
                                                 PJRT_Event*& out_event) {
-    if (!api_ || !client_ || !device_) {
-        return ER_TPU_BUFFER_TRANSFER_ERROR;
-    }
-
-    if (size == 0) {
-        return ER_INVALID_PARAMS;
-    }
+    if (!api_ || !client_ || !device_) return ER_TPU_BUFFER_TRANSFER_ERROR;
+    if (size == 0) return ER_INVALID_PARAMS;
 
     int64_t dim = static_cast<int64_t>(size);
-
-    PJRT_Client_BufferFromHostBuffer_Args args{};
-    args.struct_size = PJRT_Client_BufferFromHostBuffer_Args_STRUCT_SIZE;
-    args.extension_start = nullptr;
+    PJRT_INIT(PJRT_Client_BufferFromHostBuffer);
     args.client = client_;
     args.data = host_src;
     args.type = PJRT_Buffer_Type_U8;
@@ -306,45 +275,26 @@ ClientErrorCode TpuClient::BufferFromHostAsync(const void* host_src, size_t size
     args.device = device_;
     args.memory = nullptr;
     args.device_layout = nullptr;
-
-    PJRT_Error* err = api_->PJRT_Client_BufferFromHostBuffer(&args);
-    if (err != nullptr) {
-        std::string msg = GetErrorMessage(api_, err);
-        KVCM_LOG_ERROR("BufferFromHostBuffer(async) failed: %s", msg.c_str());
-        return ER_TPU_BUFFER_TRANSFER_ERROR;
-    }
+    PJRT_CHECK(api_->PJRT_Client_BufferFromHostBuffer(&args), ER_TPU_BUFFER_TRANSFER_ERROR);
 
     out_buffer = args.buffer;
-    out_event = args.done_with_host_buffer;  // may be nullptr
+    out_event = args.done_with_host_buffer;
     return ER_OK;
 }
 
 ClientErrorCode TpuClient::BufferToHostAsync(PJRT_Buffer* buffer, void* host_dst,
                                               size_t size, PJRT_Event*& out_event) {
-    if (!api_ || !buffer) {
-        return ER_TPU_BUFFER_TRANSFER_ERROR;
-    }
+    if (!api_ || !buffer) return ER_TPU_BUFFER_TRANSFER_ERROR;
+    if (size == 0) return ER_INVALID_PARAMS;
 
-    if (size == 0) {
-        return ER_INVALID_PARAMS;
-    }
-
-    PJRT_Buffer_ToHostBuffer_Args args{};
-    args.struct_size = PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE;
-    args.extension_start = nullptr;
+    PJRT_INIT(PJRT_Buffer_ToHostBuffer);
     args.src = buffer;
     args.host_layout = nullptr;
     args.dst = host_dst;
     args.dst_size = size;
+    PJRT_CHECK(api_->PJRT_Buffer_ToHostBuffer(&args), ER_TPU_BUFFER_TRANSFER_ERROR);
 
-    PJRT_Error* err = api_->PJRT_Buffer_ToHostBuffer(&args);
-    if (err != nullptr) {
-        std::string msg = GetErrorMessage(api_, err);
-        KVCM_LOG_ERROR("Buffer_ToHostBuffer(async) failed: %s", msg.c_str());
-        return ER_TPU_BUFFER_TRANSFER_ERROR;
-    }
-
-    out_event = args.event;  // may be nullptr
+    out_event = args.event;
     return ER_OK;
 }
 
@@ -353,22 +303,11 @@ ClientErrorCode TpuClient::BufferToHostAsync(PJRT_Buffer* buffer, void* host_dst
 // =========================================================================
 
 ClientErrorCode TpuClient::WaitEvent(PJRT_Event* event) {
-    if (!api_ || !event) {
-        return ER_OK;  // nothing to wait on
-    }
+    if (!api_ || !event) return ER_OK;
 
-    PJRT_Event_Await_Args await_args{};
-    await_args.struct_size = PJRT_Event_Await_Args_STRUCT_SIZE;
-    await_args.extension_start = nullptr;
-    await_args.event = event;
-    PJRT_Error* err = api_->PJRT_Event_Await(&await_args);
-
-    if (err != nullptr) {
-        std::string msg = GetErrorMessage(api_, err);
-        KVCM_LOG_ERROR("Event_Await failed: %s", msg.c_str());
-        DestroyEvent(event);
-        return ER_TPU_EVENT_ERROR;
-    }
+    PJRT_INIT(PJRT_Event_Await);
+    args.event = event;
+    PJRT_CHECK(api_->PJRT_Event_Await(&args), ER_TPU_EVENT_ERROR);
 
     DestroyEvent(event);
     return ER_OK;
@@ -389,10 +328,7 @@ ClientErrorCode TpuClient::WaitEvents(std::vector<PJRT_Event*>& events) {
 
 void TpuClient::DestroyEvent(PJRT_Event* event) {
     if (!api_ || !event) return;
-
-    PJRT_Event_Destroy_Args args{};
-    args.struct_size = PJRT_Event_Destroy_Args_STRUCT_SIZE;
-    args.extension_start = nullptr;
+    PJRT_INIT(PJRT_Event_Destroy);
     args.event = event;
     api_->PJRT_Event_Destroy(&args);
 }
@@ -419,24 +355,15 @@ bool TpuClient::HasRawBufferExtension() const {
 }
 
 ClientErrorCode TpuClient::CreateRawAlias(PJRT_Buffer* buffer, PJRT_RawBuffer*& out_raw) {
-    if (!api_ || !rawbuf_ext_ || !rawbuf_ext_->PJRT_RawBuffer_CreateRawAliasOfBuffer) {
+    if (!api_ || !rawbuf_ext_ || !rawbuf_ext_->PJRT_RawBuffer_CreateRawAliasOfBuffer)
         return ER_TPU_RAWBUFFER_ERROR;
-    }
-    if (!buffer) {
-        return ER_INVALID_PARAMS;
-    }
+    if (!buffer) return ER_INVALID_PARAMS;
 
     PJRT_RawBuffer_CreateRawAliasOfBuffer_Args args{};
     args.struct_size = PJRT_RawBuffer_CreateRawAliasOfBuffer_Args_STRUCT_SIZE;
     args.extension_start = nullptr;
     args.buffer = buffer;
-
-    PJRT_Error* err = rawbuf_ext_->PJRT_RawBuffer_CreateRawAliasOfBuffer(&args);
-    if (err != nullptr) {
-        std::string msg = GetErrorMessage(api_, err);
-        KVCM_LOG_ERROR("CreateRawAliasOfBuffer failed: %s", msg.c_str());
-        return ER_TPU_RAWBUFFER_ERROR;
-    }
+    PJRT_CHECK(rawbuf_ext_->PJRT_RawBuffer_CreateRawAliasOfBuffer(&args), ER_TPU_RAWBUFFER_ERROR);
 
     out_raw = args.raw_buffer;
     return ER_OK;
@@ -445,12 +372,9 @@ ClientErrorCode TpuClient::CreateRawAlias(PJRT_Buffer* buffer, PJRT_RawBuffer*& 
 ClientErrorCode TpuClient::RawBufferFromHost(PJRT_RawBuffer* raw, const void* src,
                                               int64_t offset, int64_t size,
                                               PJRT_Event*& out_event) {
-    if (!api_ || !rawbuf_ext_ || !rawbuf_ext_->PJRT_RawBuffer_CopyRawHostToDevice) {
+    if (!api_ || !rawbuf_ext_ || !rawbuf_ext_->PJRT_RawBuffer_CopyRawHostToDevice)
         return ER_TPU_RAWBUFFER_ERROR;
-    }
-    if (!raw || !src || size <= 0) {
-        return ER_INVALID_PARAMS;
-    }
+    if (!raw || !src || size <= 0) return ER_INVALID_PARAMS;
 
     PJRT_RawBuffer_CopyRawHostToDevice_Args args{};
     args.struct_size = PJRT_RawBuffer_CopyRawHostToDevice_Args_STRUCT_SIZE;
@@ -459,13 +383,7 @@ ClientErrorCode TpuClient::RawBufferFromHost(PJRT_RawBuffer* raw, const void* sr
     args.src = src;
     args.offset = offset;
     args.transfer_size = size;
-
-    PJRT_Error* err = rawbuf_ext_->PJRT_RawBuffer_CopyRawHostToDevice(&args);
-    if (err != nullptr) {
-        std::string msg = GetErrorMessage(api_, err);
-        KVCM_LOG_ERROR("RawBuffer_CopyRawHostToDevice failed: %s", msg.c_str());
-        return ER_TPU_RAWBUFFER_ERROR;
-    }
+    PJRT_CHECK(rawbuf_ext_->PJRT_RawBuffer_CopyRawHostToDevice(&args), ER_TPU_RAWBUFFER_ERROR);
 
     out_event = args.event;
     return ER_OK;
@@ -474,12 +392,9 @@ ClientErrorCode TpuClient::RawBufferFromHost(PJRT_RawBuffer* raw, const void* sr
 ClientErrorCode TpuClient::RawBufferToHost(PJRT_RawBuffer* raw, void* dst,
                                             int64_t offset, int64_t size,
                                             PJRT_Event*& out_event) {
-    if (!api_ || !rawbuf_ext_ || !rawbuf_ext_->PJRT_RawBuffer_CopyRawDeviceToHost) {
+    if (!api_ || !rawbuf_ext_ || !rawbuf_ext_->PJRT_RawBuffer_CopyRawDeviceToHost)
         return ER_TPU_RAWBUFFER_ERROR;
-    }
-    if (!raw || !dst || size <= 0) {
-        return ER_INVALID_PARAMS;
-    }
+    if (!raw || !dst || size <= 0) return ER_INVALID_PARAMS;
 
     PJRT_RawBuffer_CopyRawDeviceToHost_Args args{};
     args.struct_size = PJRT_RawBuffer_CopyRawDeviceToHost_Args_STRUCT_SIZE;
@@ -488,46 +403,29 @@ ClientErrorCode TpuClient::RawBufferToHost(PJRT_RawBuffer* raw, void* dst,
     args.dst = dst;
     args.offset = offset;
     args.transfer_size = size;
-
-    PJRT_Error* err = rawbuf_ext_->PJRT_RawBuffer_CopyRawDeviceToHost(&args);
-    if (err != nullptr) {
-        std::string msg = GetErrorMessage(api_, err);
-        KVCM_LOG_ERROR("RawBuffer_CopyRawDeviceToHost failed: %s", msg.c_str());
-        return ER_TPU_RAWBUFFER_ERROR;
-    }
+    PJRT_CHECK(rawbuf_ext_->PJRT_RawBuffer_CopyRawDeviceToHost(&args), ER_TPU_RAWBUFFER_ERROR);
 
     out_event = args.event;
     return ER_OK;
 }
 
 ClientErrorCode TpuClient::RawBufferGetDeviceSize(PJRT_RawBuffer* raw, size_t& out_size) {
-    if (!api_ || !rawbuf_ext_ || !rawbuf_ext_->PJRT_RawBuffer_GetOnDeviceSizeInBytes) {
+    if (!api_ || !rawbuf_ext_ || !rawbuf_ext_->PJRT_RawBuffer_GetOnDeviceSizeInBytes)
         return ER_TPU_RAWBUFFER_ERROR;
-    }
-    if (!raw) {
-        return ER_INVALID_PARAMS;
-    }
+    if (!raw) return ER_INVALID_PARAMS;
 
     PJRT_RawBuffer_GetOnDeviceSizeInBytes_Args args{};
     args.struct_size = PJRT_RawBuffer_GetOnDeviceSizeInBytes_Args_STRUCT_SIZE;
     args.extension_start = nullptr;
     args.buffer = raw;
-
-    PJRT_Error* err = rawbuf_ext_->PJRT_RawBuffer_GetOnDeviceSizeInBytes(&args);
-    if (err != nullptr) {
-        std::string msg = GetErrorMessage(api_, err);
-        KVCM_LOG_ERROR("RawBuffer_GetOnDeviceSizeInBytes failed: %s", msg.c_str());
-        return ER_TPU_RAWBUFFER_ERROR;
-    }
+    PJRT_CHECK(rawbuf_ext_->PJRT_RawBuffer_GetOnDeviceSizeInBytes(&args), ER_TPU_RAWBUFFER_ERROR);
 
     out_size = args.on_device_size_in_bytes;
     return ER_OK;
 }
 
 void TpuClient::DestroyRawBuffer(PJRT_RawBuffer* raw) {
-    if (!api_ || !rawbuf_ext_ || !raw) return;
-    if (!rawbuf_ext_->PJRT_RawBuffer_Destroy) return;
-
+    if (!api_ || !rawbuf_ext_ || !raw || !rawbuf_ext_->PJRT_RawBuffer_Destroy) return;
     PJRT_RawBuffer_Destroy_Args args{};
     args.struct_size = PJRT_RawBuffer_Destroy_Args_STRUCT_SIZE;
     args.extension_start = nullptr;
@@ -822,239 +720,167 @@ void TpuClient::ProbeApiCapabilities() const {
 #undef _PJRT_PROBE_FIELD
 
 void TpuClient::LogDeviceInfo(size_t num_addressable_devices) const {
-    if (!api_ || !client_) return;
+    PJRT_GUARD((void)0);
 
     KVCM_LOG_INFO("===== TPU Platform & Device Info =====");
 
     // --- Client-level info ---
-    PJRT_Client_PlatformName_Args name_args{};
-    name_args.struct_size = PJRT_Client_PlatformName_Args_STRUCT_SIZE;
-    name_args.extension_start = nullptr;
-    name_args.client = client_;
-    if (api_->PJRT_Client_PlatformName(&name_args) == nullptr) {
-        KVCM_LOG_INFO("Platform name   : %.*s",
-                       static_cast<int>(name_args.platform_name_size),
-                       name_args.platform_name);
+    {
+        PJRT_INIT(PJRT_Client_PlatformName);
+        args.client = client_;
+        if (api_->PJRT_Client_PlatformName(&args) == nullptr)
+            KVCM_LOG_INFO("Platform name   : %.*s",
+                           static_cast<int>(args.platform_name_size), args.platform_name);
     }
-
-    PJRT_Client_PlatformVersion_Args ver_args{};
-    ver_args.struct_size = PJRT_Client_PlatformVersion_Args_STRUCT_SIZE;
-    ver_args.extension_start = nullptr;
-    ver_args.client = client_;
-    if (api_->PJRT_Client_PlatformVersion(&ver_args) == nullptr) {
-        KVCM_LOG_INFO("Platform version: %.*s",
-                       static_cast<int>(ver_args.platform_version_size),
-                       ver_args.platform_version);
+    {
+        PJRT_INIT(PJRT_Client_PlatformVersion);
+        args.client = client_;
+        if (api_->PJRT_Client_PlatformVersion(&args) == nullptr)
+            KVCM_LOG_INFO("Platform version: %.*s",
+                           static_cast<int>(args.platform_version_size), args.platform_version);
     }
-
-    PJRT_Client_ProcessIndex_Args pi_args{};
-    pi_args.struct_size = PJRT_Client_ProcessIndex_Args_STRUCT_SIZE;
-    pi_args.extension_start = nullptr;
-    pi_args.client = client_;
-    if (api_->PJRT_Client_ProcessIndex(&pi_args) == nullptr) {
-        KVCM_LOG_INFO("Process index   : %d", pi_args.process_index);
+    {
+        PJRT_INIT(PJRT_Client_ProcessIndex);
+        args.client = client_;
+        if (api_->PJRT_Client_ProcessIndex(&args) == nullptr)
+            KVCM_LOG_INFO("Process index   : %d", args.process_index);
     }
-
-    // Total devices (including non-addressable)
-    PJRT_Client_Devices_Args devs_args{};
-    devs_args.struct_size = PJRT_Client_Devices_Args_STRUCT_SIZE;
-    devs_args.extension_start = nullptr;
-    devs_args.client = client_;
-    if (api_->PJRT_Client_Devices(&devs_args) == nullptr) {
-        KVCM_LOG_INFO("Total devices   : %zu (addressable: %zu)",
-                       devs_args.num_devices, num_addressable_devices);
+    {
+        PJRT_INIT(PJRT_Client_Devices);
+        args.client = client_;
+        if (api_->PJRT_Client_Devices(&args) == nullptr)
+            KVCM_LOG_INFO("Total devices   : %zu (addressable: %zu)",
+                           args.num_devices, num_addressable_devices);
     }
-
-    // Addressable memories at client level
-    PJRT_Client_AddressableMemories_Args cmem_args{};
-    cmem_args.struct_size = PJRT_Client_AddressableMemories_Args_STRUCT_SIZE;
-    cmem_args.extension_start = nullptr;
-    cmem_args.client = client_;
-    if (api_->PJRT_Client_AddressableMemories(&cmem_args) == nullptr) {
-        KVCM_LOG_INFO("Client addressable memories: %zu",
-                       cmem_args.num_addressable_memories);
+    {
+        PJRT_INIT(PJRT_Client_AddressableMemories);
+        args.client = client_;
+        if (api_->PJRT_Client_AddressableMemories(&args) == nullptr)
+            KVCM_LOG_INFO("Client addressable memories: %zu", args.num_addressable_memories);
     }
 
     // --- Per-device info ---
-    // Get addressable devices again for iteration
-    PJRT_Client_AddressableDevices_Args addr_args{};
-    addr_args.struct_size = PJRT_Client_AddressableDevices_Args_STRUCT_SIZE;
-    addr_args.extension_start = nullptr;
-    addr_args.client = client_;
-    if (api_->PJRT_Client_AddressableDevices(&addr_args) != nullptr) {
+    PJRT_INIT(PJRT_Client_AddressableDevices);
+    args.client = client_;
+    if (api_->PJRT_Client_AddressableDevices(&args) != nullptr) {
         KVCM_LOG_INFO("===== End TPU Platform & Device Info =====");
         return;
     }
 
-    for (size_t i = 0; i < addr_args.num_addressable_devices; ++i) {
-        PJRT_Device* dev = addr_args.addressable_devices[i];
+    for (size_t i = 0; i < args.num_addressable_devices; ++i) {
+        PJRT_Device* dev = args.addressable_devices[i];
         KVCM_LOG_INFO("--- Device [%zu] ---", i);
 
-        // IsAddressable
-        PJRT_Device_IsAddressable_Args ia_args{};
-        ia_args.struct_size = PJRT_Device_IsAddressable_Args_STRUCT_SIZE;
-        ia_args.extension_start = nullptr;
-        ia_args.device = dev;
-        if (api_->PJRT_Device_IsAddressable(&ia_args) == nullptr) {
-            KVCM_LOG_INFO("  is_addressable    : %s",
-                           ia_args.is_addressable ? "true" : "false");
+        {
+            PJRT_INIT(PJRT_Device_IsAddressable);
+            args.device = dev;
+            if (api_->PJRT_Device_IsAddressable(&args) == nullptr)
+                KVCM_LOG_INFO("  is_addressable    : %s", args.is_addressable ? "true" : "false");
         }
-
-        // LocalHardwareId
-        PJRT_Device_LocalHardwareId_Args hwid_args{};
-        hwid_args.struct_size = PJRT_Device_LocalHardwareId_Args_STRUCT_SIZE;
-        hwid_args.extension_start = nullptr;
-        hwid_args.device = dev;
-        if (api_->PJRT_Device_LocalHardwareId(&hwid_args) == nullptr) {
-            KVCM_LOG_INFO("  local_hardware_id : %d",
-                           hwid_args.local_hardware_id);
+        {
+            PJRT_INIT(PJRT_Device_LocalHardwareId);
+            args.device = dev;
+            if (api_->PJRT_Device_LocalHardwareId(&args) == nullptr)
+                KVCM_LOG_INFO("  local_hardware_id : %d", args.local_hardware_id);
         }
 
         // DeviceDescription
-        PJRT_Device_GetDescription_Args desc_args{};
-        desc_args.struct_size = PJRT_Device_GetDescription_Args_STRUCT_SIZE;
-        desc_args.extension_start = nullptr;
-        desc_args.device = dev;
-        if (api_->PJRT_Device_GetDescription(&desc_args) == nullptr) {
-            PJRT_DeviceDescription* desc = desc_args.device_description;
+        {
+            PJRT_INIT(PJRT_Device_GetDescription);
+            args.device = dev;
+            if (api_->PJRT_Device_GetDescription(&args) == nullptr) {
+                PJRT_DeviceDescription* desc = args.device_description;
 
-            PJRT_DeviceDescription_Id_Args id_args{};
-            id_args.struct_size = PJRT_DeviceDescription_Id_Args_STRUCT_SIZE;
-            id_args.extension_start = nullptr;
-            id_args.device_description = desc;
-            if (api_->PJRT_DeviceDescription_Id(&id_args) == nullptr) {
-                KVCM_LOG_INFO("  device_id         : %d", id_args.id);
-            }
+                { PJRT_INIT(PJRT_DeviceDescription_Id);
+                  args.device_description = desc;
+                  if (api_->PJRT_DeviceDescription_Id(&args) == nullptr)
+                      KVCM_LOG_INFO("  device_id         : %d", args.id); }
 
-            PJRT_DeviceDescription_ProcessIndex_Args dpi_args{};
-            dpi_args.struct_size = PJRT_DeviceDescription_ProcessIndex_Args_STRUCT_SIZE;
-            dpi_args.extension_start = nullptr;
-            dpi_args.device_description = desc;
-            if (api_->PJRT_DeviceDescription_ProcessIndex(&dpi_args) == nullptr) {
-                KVCM_LOG_INFO("  device_proc_index : %d",
-                               dpi_args.process_index);
-            }
+                { PJRT_INIT(PJRT_DeviceDescription_ProcessIndex);
+                  args.device_description = desc;
+                  if (api_->PJRT_DeviceDescription_ProcessIndex(&args) == nullptr)
+                      KVCM_LOG_INFO("  device_proc_index : %d", args.process_index); }
 
-            PJRT_DeviceDescription_Kind_Args kind_args{};
-            kind_args.struct_size = PJRT_DeviceDescription_Kind_Args_STRUCT_SIZE;
-            kind_args.extension_start = nullptr;
-            kind_args.device_description = desc;
-            if (api_->PJRT_DeviceDescription_Kind(&kind_args) == nullptr) {
-                KVCM_LOG_INFO("  device_kind       : %.*s",
-                               static_cast<int>(kind_args.device_kind_size),
-                               kind_args.device_kind);
-            }
+                { PJRT_INIT(PJRT_DeviceDescription_Kind);
+                  args.device_description = desc;
+                  if (api_->PJRT_DeviceDescription_Kind(&args) == nullptr)
+                      KVCM_LOG_INFO("  device_kind       : %.*s",
+                                     static_cast<int>(args.device_kind_size), args.device_kind); }
 
-            PJRT_DeviceDescription_ToString_Args str_args{};
-            str_args.struct_size = PJRT_DeviceDescription_ToString_Args_STRUCT_SIZE;
-            str_args.extension_start = nullptr;
-            str_args.device_description = desc;
-            if (api_->PJRT_DeviceDescription_ToString(&str_args) == nullptr) {
-                KVCM_LOG_INFO("  to_string         : %.*s",
-                               static_cast<int>(str_args.to_string_size),
-                               str_args.to_string);
-            }
+                { PJRT_INIT(PJRT_DeviceDescription_ToString);
+                  args.device_description = desc;
+                  if (api_->PJRT_DeviceDescription_ToString(&args) == nullptr)
+                      KVCM_LOG_INFO("  to_string         : %.*s",
+                                     static_cast<int>(args.to_string_size), args.to_string); }
 
-            PJRT_DeviceDescription_DebugString_Args dbg_args{};
-            dbg_args.struct_size = PJRT_DeviceDescription_DebugString_Args_STRUCT_SIZE;
-            dbg_args.extension_start = nullptr;
-            dbg_args.device_description = desc;
-            if (api_->PJRT_DeviceDescription_DebugString(&dbg_args) == nullptr) {
-                KVCM_LOG_INFO("  debug_string      : %.*s",
-                               static_cast<int>(dbg_args.debug_string_size),
-                               dbg_args.debug_string);
+                { PJRT_INIT(PJRT_DeviceDescription_DebugString);
+                  args.device_description = desc;
+                  if (api_->PJRT_DeviceDescription_DebugString(&args) == nullptr)
+                      KVCM_LOG_INFO("  debug_string      : %.*s",
+                                     static_cast<int>(args.debug_string_size), args.debug_string); }
             }
         }
 
         // DefaultMemory + Memory details
-        PJRT_Device_DefaultMemory_Args dm_args{};
-        dm_args.struct_size = PJRT_Device_DefaultMemory_Args_STRUCT_SIZE;
-        dm_args.extension_start = nullptr;
-        dm_args.device = dev;
-        if (api_->PJRT_Device_DefaultMemory(&dm_args) == nullptr && dm_args.memory) {
-            PJRT_Memory* mem = dm_args.memory;
+        {
+            PJRT_INIT(PJRT_Device_DefaultMemory);
+            args.device = dev;
+            if (api_->PJRT_Device_DefaultMemory(&args) == nullptr && args.memory) {
+                PJRT_Memory* mem = args.memory;
 
-            PJRT_Memory_Id_Args mid_args{};
-            mid_args.struct_size = PJRT_Memory_Id_Args_STRUCT_SIZE;
-            mid_args.extension_start = nullptr;
-            mid_args.memory = mem;
-            if (api_->PJRT_Memory_Id(&mid_args) == nullptr) {
-                KVCM_LOG_INFO("  default_memory_id : %d", mid_args.id);
-            }
+                { PJRT_INIT(PJRT_Memory_Id);
+                  args.memory = mem;
+                  if (api_->PJRT_Memory_Id(&args) == nullptr)
+                      KVCM_LOG_INFO("  default_memory_id : %d", args.id); }
 
-            PJRT_Memory_Kind_Args mk_args{};
-            mk_args.struct_size = PJRT_Memory_Kind_Args_STRUCT_SIZE;
-            mk_args.extension_start = nullptr;
-            mk_args.memory = mem;
-            if (api_->PJRT_Memory_Kind(&mk_args) == nullptr) {
-                KVCM_LOG_INFO("  default_memory_kind: %.*s",
-                               static_cast<int>(mk_args.kind_size),
-                               mk_args.kind);
-            }
+                { PJRT_INIT(PJRT_Memory_Kind);
+                  args.memory = mem;
+                  if (api_->PJRT_Memory_Kind(&args) == nullptr)
+                      KVCM_LOG_INFO("  default_memory_kind: %.*s",
+                                     static_cast<int>(args.kind_size), args.kind); }
 
-            PJRT_Memory_Kind_Id_Args mki_args{};
-            mki_args.struct_size = PJRT_Memory_Kind_Id_Args_STRUCT_SIZE;
-            mki_args.extension_start = nullptr;
-            mki_args.memory = mem;
-            if (api_->PJRT_Memory_Kind_Id(&mki_args) == nullptr) {
-                KVCM_LOG_INFO("  memory_kind_id    : %d",
-                               mki_args.kind_id);
-            }
+                { PJRT_INIT(PJRT_Memory_Kind_Id);
+                  args.memory = mem;
+                  if (api_->PJRT_Memory_Kind_Id(&args) == nullptr)
+                      KVCM_LOG_INFO("  memory_kind_id    : %d", args.kind_id); }
 
-            PJRT_Memory_DebugString_Args mdbg_args{};
-            mdbg_args.struct_size = PJRT_Memory_DebugString_Args_STRUCT_SIZE;
-            mdbg_args.extension_start = nullptr;
-            mdbg_args.memory = mem;
-            if (api_->PJRT_Memory_DebugString(&mdbg_args) == nullptr) {
-                KVCM_LOG_INFO("  memory_debug_str  : %.*s",
-                               static_cast<int>(mdbg_args.debug_string_size),
-                               mdbg_args.debug_string);
+                { PJRT_INIT(PJRT_Memory_DebugString);
+                  args.memory = mem;
+                  if (api_->PJRT_Memory_DebugString(&args) == nullptr)
+                      KVCM_LOG_INFO("  memory_debug_str  : %.*s",
+                                     static_cast<int>(args.debug_string_size), args.debug_string); }
             }
         }
 
         // Addressable memories for this device
-        PJRT_Device_AddressableMemories_Args dam_args{};
-        dam_args.struct_size = PJRT_Device_AddressableMemories_Args_STRUCT_SIZE;
-        dam_args.extension_start = nullptr;
-        dam_args.device = dev;
-        if (api_->PJRT_Device_AddressableMemories(&dam_args) == nullptr) {
-            KVCM_LOG_INFO("  addressable_memories: %zu",
-                           dam_args.num_memories);
+        {
+            PJRT_INIT(PJRT_Device_AddressableMemories);
+            args.device = dev;
+            if (api_->PJRT_Device_AddressableMemories(&args) == nullptr)
+                KVCM_LOG_INFO("  addressable_memories: %zu", args.num_memories);
         }
 
         // MemoryStats (best-effort, may return UNIMPLEMENTED)
-        PJRT_Device_MemoryStats_Args ms_args{};
-        ms_args.struct_size = PJRT_Device_MemoryStats_Args_STRUCT_SIZE;
-        ms_args.extension_start = nullptr;
-        ms_args.device = dev;
-        PJRT_Error* ms_err = api_->PJRT_Device_MemoryStats(&ms_args);
-        if (ms_err == nullptr) {
-            KVCM_LOG_INFO("  memory.bytes_in_use: %ld", ms_args.bytes_in_use);
-            if (ms_args.bytes_limit_is_set) {
-                KVCM_LOG_INFO("  memory.bytes_limit : %ld",
-                               ms_args.bytes_limit);
+        {
+            PJRT_INIT(PJRT_Device_MemoryStats);
+            args.device = dev;
+            PJRT_Error* ms_err = api_->PJRT_Device_MemoryStats(&args);
+            if (ms_err == nullptr) {
+                KVCM_LOG_INFO("  memory.bytes_in_use: %ld", args.bytes_in_use);
+                if (args.bytes_limit_is_set)
+                    KVCM_LOG_INFO("  memory.bytes_limit : %ld", args.bytes_limit);
+                if (args.peak_bytes_in_use_is_set)
+                    KVCM_LOG_INFO("  memory.peak_bytes  : %ld", args.peak_bytes_in_use);
+                if (args.largest_alloc_size_is_set)
+                    KVCM_LOG_INFO("  memory.largest_alloc: %ld", args.largest_alloc_size);
+                if (args.bytes_reserved_is_set)
+                    KVCM_LOG_INFO("  memory.bytes_reserved: %ld", args.bytes_reserved);
+                if (args.pool_bytes_is_set)
+                    KVCM_LOG_INFO("  memory.pool_bytes  : %ld", args.pool_bytes);
+            } else {
+                std::string msg = GetErrorMessage(api_, ms_err);
+                KVCM_LOG_INFO("  memory_stats      : unavailable (%s)", msg.c_str());
             }
-            if (ms_args.peak_bytes_in_use_is_set) {
-                KVCM_LOG_INFO("  memory.peak_bytes  : %ld",
-                               ms_args.peak_bytes_in_use);
-            }
-            if (ms_args.largest_alloc_size_is_set) {
-                KVCM_LOG_INFO("  memory.largest_alloc: %ld",
-                               ms_args.largest_alloc_size);
-            }
-            if (ms_args.bytes_reserved_is_set) {
-                KVCM_LOG_INFO("  memory.bytes_reserved: %ld",
-                               ms_args.bytes_reserved);
-            }
-            if (ms_args.pool_bytes_is_set) {
-                KVCM_LOG_INFO("  memory.pool_bytes  : %ld",
-                               ms_args.pool_bytes);
-            }
-        } else {
-            // MemoryStats may return UNIMPLEMENTED - that's OK
-            std::string msg = GetErrorMessage(api_, ms_err);
-            KVCM_LOG_INFO("  memory_stats      : unavailable (%s)",
-                           msg.c_str());
         }
     }
 
