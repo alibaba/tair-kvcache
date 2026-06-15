@@ -328,8 +328,8 @@ std::pair<ClientErrorCode, Locations> GrpcStub::GetCacheLocation(const std::stri
                                                                  const BlockMask &block_mask,
                                                                  int32_t sw_size,
                                                                  const std::vector<std::string> &location_spec_names,
-                                                                 const CallerNode &caller,
-                                                                 std::vector<ReplicationHint> &out_hints) {
+                                                                 const ClientCallerNode &caller,
+                                                                 std::vector<ClientReplicationHint> &out_hints) {
     auto stub = GET_AND_CHECK_STUB_WITH_TYPE();
     proto::meta::GetCacheLocationRequest request;
     request.set_query_type(static_cast<proto::meta::QueryType>(query_type));
@@ -355,7 +355,7 @@ std::pair<ClientErrorCode, Locations> GrpcStub::GetCacheLocation(const std::stri
     out_hints.clear();
     out_hints.reserve(response.hints_size());
     for (const auto &h : response.hints()) {
-        ReplicationHint hint;
+        ClientReplicationHint hint;
         hint.block_key = h.block_key();
         hint.source_uri = h.source_uri();
         hint.target_node_id = h.target_node_id();
@@ -395,7 +395,7 @@ GrpcStub::StartWriteCache(const std::string &trace_id,
                           const TokenIdsVector &tokens,
                           const std::vector<std::string> &location_spec_group_names,
                           int64_t write_timeout_seconds,
-                          const CallerNode &caller,
+                          const ClientCallerNode &caller,
                           bool is_replication) {
     auto stub = GET_AND_CHECK_STUB_WITH_TYPE();
     proto::meta::StartWriteCacheRequest request;

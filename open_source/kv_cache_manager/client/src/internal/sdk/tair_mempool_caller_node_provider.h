@@ -16,7 +16,7 @@ public:
 
     ClientErrorCode Init(const std::shared_ptr<StorageConfig> &) { return ER_SDKINIT_ERROR; }
 
-    CallerNode GetCallerNode() override { return {}; }
+    ClientCallerNode GetCallerNode() override { return {}; }
 };
 
 } // namespace kv_cache_manager

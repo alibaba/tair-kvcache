@@ -3,9 +3,9 @@
 #include <fstream>
 #include <gmock/gmock.h>
 
+#include "kv_cache_manager/client/include/common.h"
 #include "kv_cache_manager/client/src/internal/stub/stub.h"
 #include "kv_cache_manager/client/src/meta_client_impl.h"
-#include "kv_cache_manager/common/affinity_types.h"
 #include "kv_cache_manager/common/unittest.h"
 
 using namespace kv_cache_manager;
@@ -98,8 +98,8 @@ public:
                  const BlockMask &block_mask,
                  int32_t sw_size,
                  const std::vector<std::string> &location_spec_names,
-                 const CallerNode &caller,
-                 std::vector<ReplicationHint> &out_hints),
+                 const ClientCallerNode &caller,
+                 std::vector<ClientReplicationHint> &out_hints),
                 (override));
 
     MOCK_METHOD((std::pair<ClientErrorCode, int64_t>),
@@ -120,7 +120,7 @@ public:
                  const TokenIdsVector &tokens,
                  const std::vector<std::string> &location_spec_group_names,
                  int64_t write_timeout_seconds,
-                 const CallerNode &caller,
+                 const ClientCallerNode &caller,
                  bool is_replication),
                 (override));
 

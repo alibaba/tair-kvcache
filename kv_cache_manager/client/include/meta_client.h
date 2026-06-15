@@ -23,7 +23,7 @@ public:
                                                                 const BlockMask &block_mask,
                                                                 int32_t sw_size,
                                                                 const std::vector<std::string> &location_spec_names,
-                                                                std::vector<ReplicationHint> &out_hints) = 0;
+                                                                std::vector<ClientReplicationHint> &out_hints) = 0;
 
     virtual std::pair<ClientErrorCode, WriteLocation>
     StartWrite(const std::string &trace_id,

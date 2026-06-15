@@ -110,7 +110,7 @@ std::pair<ClientErrorCode, Locations> MetaClientImpl::MatchLocation(const std::s
                                                                     const BlockMask &block_mask,
                                                                     int32_t sw_size,
                                                                     const std::vector<std::string> &location_spec_names,
-                                                                    std::vector<ReplicationHint> &out_hints) {
+                                                                    std::vector<ClientReplicationHint> &out_hints) {
     KVCM_LOG_DEBUG("match location with trace_id [%s], query_type [%d], keys %s, tokens %s, block_mask %s, sw_size "
                    "[%d], location_spec_names %s",
                    trace_id.c_str(),
@@ -274,8 +274,8 @@ ClientErrorCode MetaClientImpl::Connect(const std::string &address) {
 }
 
 void MetaClientImpl::InitCallerNodeProvider(const std::string &storage_config) {
-    const auto refresh_interval = std::chrono::seconds(
-        client_config_ ? client_config_->caller_node_refresh_seconds() : 30);
+    const auto refresh_interval =
+        std::chrono::seconds(client_config_ ? client_config_->caller_node_refresh_seconds() : 30);
     std::vector<std::shared_ptr<StorageConfig>> parsed_storage_configs;
     if (Jsonizable::FromJsonString(storage_config, parsed_storage_configs)) {
         caller_node_provider_ = CallerNodeProviderFactory::Create(parsed_storage_configs, refresh_interval);
@@ -286,9 +286,9 @@ void MetaClientImpl::InitCallerNodeProvider(const std::string &storage_config) {
     }
 }
 
-CallerNode MetaClientImpl::CurrentCallerNode() const {
+ClientCallerNode MetaClientImpl::CurrentCallerNode() const {
     std::shared_lock read_guard(config_mutex_);
-    return caller_node_provider_ ? caller_node_provider_->GetCallerNode() : CallerNode{};
+    return caller_node_provider_ ? caller_node_provider_->GetCallerNode() : ClientCallerNode{};
 }
 
 const std::string &MetaClientImpl::GetInstanceId() const {

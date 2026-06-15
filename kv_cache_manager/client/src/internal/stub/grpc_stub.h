@@ -42,8 +42,8 @@ public:
                                                            const BlockMask &block_mask,
                                                            int32_t sw_size,
                                                            const std::vector<std::string> &location_spec_names,
-                                                           const CallerNode &caller,
-                                                           std::vector<ReplicationHint> &out_hints) override;
+                                                           const ClientCallerNode &caller,
+                                                           std::vector<ClientReplicationHint> &out_hints) override;
 
     std::pair<ClientErrorCode, int64_t> GetCacheLocationLen(const std::string &trace_id,
                                                             const std::string &instance_id,
@@ -58,7 +58,7 @@ public:
                                                               const TokenIdsVector &tokens,
                                                               const std::vector<std::string> &location_spec_group_names,
                                                               int64_t write_timeout_seconds,
-                                                              const CallerNode &caller,
+                                                              const ClientCallerNode &caller,
                                                               bool is_replication = false) override;
 
     ClientErrorCode FinishWriteCache(const std::string &trace_id,

@@ -7,8 +7,8 @@
 #include <thread>
 
 #include "kv_cache_manager/affinity/cache_affinity_manager.h"
+#include "kv_cache_manager/client/include/common.h"
 #include "kv_cache_manager/client/src/internal/stub/grpc_stub.h"
-#include "kv_cache_manager/common/affinity_types.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/net_util.h"
 #include "kv_cache_manager/common/standard_uri.h"
@@ -220,7 +220,7 @@ TEST_F(GrpcStubTest, TestRetry) {
     // 每次断连后首次RPC会因subchannel状态异常而立即失败，用dummy call触发subchannel重连。
     // 升级到grpc1.45.0+后可以去掉所有dummyCall调用。
     auto dummyCall = [this]() {
-        std::vector<ReplicationHint> hints;
+        std::vector<ClientReplicationHint> hints;
         stub_->GetCacheLocation(
             "trace_dummy", "instance1", QueryType::QT_PREFIX_MATCH, {}, {}, static_cast<size_t>(0), 0, {}, {}, hints);
     };
@@ -261,7 +261,7 @@ TEST_F(GrpcStubTest, TestRetry) {
 
     // --- Retry test 2: GetCacheLocation (写入中，应返回空) ---
     retryTest([&]() {
-        std::vector<ReplicationHint> hints;
+        std::vector<ClientReplicationHint> hints;
         auto [success, locations] = stub_->GetCacheLocation("trace3",
                                                             "instance1",
                                                             QueryType::QT_PREFIX_MATCH,
@@ -285,7 +285,7 @@ TEST_F(GrpcStubTest, TestRetry) {
 
     // --- Retry test 4: GetCacheLocation (finish后，应返回缓存数据) ---
     retryTest([&]() {
-        std::vector<ReplicationHint> hints;
+        std::vector<ClientReplicationHint> hints;
         auto [success, locations] = stub_->GetCacheLocation("trace5",
                                                             "instance1",
                                                             QueryType::QT_PREFIX_MATCH,
@@ -302,7 +302,7 @@ TEST_F(GrpcStubTest, TestRetry) {
 
     // --- Retry test 5: GetCacheLocation with offset (应返回子集) ---
     retryTest([&]() {
-        std::vector<ReplicationHint> hints;
+        std::vector<ClientReplicationHint> hints;
         auto [success, locations] = stub_->GetCacheLocation(
             "trace6", "instance1", QueryType::QT_PREFIX_MATCH, {1, 2, 3}, {}, static_cast<size_t>(1), 0, {}, {}, hints);
         EXPECT_EQ(ER_OK, success);
@@ -322,7 +322,7 @@ TEST_F(GrpcStubTest, TestRegisterInstance) {
 
 TEST_F(GrpcStubTest, TestStartWriteCache) {
     // NfsBackend 默认上报本机 IP 为节点, caller 用本机 IP 即可触发 prefer_local 透传。
-    const CallerNode caller{NetUtil::GetLocalIp(), ""};
+    const ClientCallerNode caller{NetUtil::GetLocalIp(), ""};
 
     auto expected = std::pair<ClientErrorCode, std::string>(ER_OK, default_storage_configs);
     ASSERT_EQ(expected,
@@ -535,7 +535,7 @@ TEST_F(GrpcStubTest, TestGetCacheLocationPrefixMatch) {
     std::string write_session_id;
     Locations target_locations;
     // 不消费 hints，复用一个出参变量满足新签名的必填契约
-    std::vector<ReplicationHint> hints;
+    std::vector<ClientReplicationHint> hints;
     {
         auto [success, write_location] =
             stub_->StartWriteCache("trace2", "instance1", {1, 2, 3, 4}, {}, {}, 1000000, {});
@@ -609,7 +609,7 @@ TEST_F(GrpcStubTest, TestGetCacheLocationBatchGet) {
     std::string write_session_id;
     Locations target_locations;
     // 不消费 hints，复用一个出参变量满足新签名的必填契约
-    std::vector<ReplicationHint> hints;
+    std::vector<ClientReplicationHint> hints;
     {
         auto [success, write_location] =
             stub_->StartWriteCache("trace2", "instance1", {1, 2, 3, 4}, {}, {}, 1000000, {});
@@ -661,7 +661,7 @@ TEST_F(GrpcStubTest, TestGetCacheLocationReverseRollSlideWindowMatch) {
     std::string write_session_id;
     Locations target_locations;
     // 不消费 hints，复用一个出参变量满足新签名的必填契约
-    std::vector<ReplicationHint> hints;
+    std::vector<ClientReplicationHint> hints;
     {
         auto [success, write_location] =
             stub_->StartWriteCache("trace2", "instance1", {1, 2, 3, 4, 5, 6}, {}, {}, 1000000, {});
@@ -918,7 +918,7 @@ TEST_F(GrpcStubTest, TestSpanTracer) {
     std::string write_session_id;
     Locations target_locations;
     // 不消费 hints，复用一个出参变量满足新签名的必填契约
-    std::vector<ReplicationHint> hints;
+    std::vector<ClientReplicationHint> hints;
     {
         auto [success, write_location] =
             stub_->StartWriteCache("trace2__kvcm_need_span_tracer", "instance1", {1, 2, 3, 4}, {}, {}, 1000000, {});
@@ -1027,7 +1027,7 @@ TEST_F(GrpcStubTest, TestGetClusterInfoWithLeaderElector) {
     leader_elector->Stop();
 }
 
-// 端到端验证 ReplicationHint 透传: local_replica + read.on_miss + 热度阈值触发,
+// 端到端验证 ClientReplicationHint 透传: local_replica + read.on_miss + 热度阈值触发,
 // caller 选用非本机 ID 让 spec 不匹配, 累计到阈值后服务端生成 hint。
 TEST_F(GrpcStubTest, TestGetCacheLocationPropagatesReplicationHints) {
     // 1. 重载 affinity 策略：启用 read.on_miss 并把热度阈值压到 3，
@@ -1044,7 +1044,7 @@ TEST_F(GrpcStubTest, TestGetCacheLocationPropagatesReplicationHints) {
 
     // 2. NfsBackend 默认节点 = 本机 IP; caller 用 node_a (非本机 ID) 触发远程分支。
     //    caller_capacity_threshold gate 对缺失的 caller 度量是 permissive 的。
-    const CallerNode caller{"node_a", ""};
+    const ClientCallerNode caller{"node_a", ""};
 
     // 3. 注册 instance + 写完 3 个 block，使 GetCacheLocation 能命中数据。
     auto expected_reg = std::pair<ClientErrorCode, std::string>(ER_OK, default_storage_configs);
@@ -1067,7 +1067,7 @@ TEST_F(GrpcStubTest, TestGetCacheLocationPropagatesReplicationHints) {
     //    threshold=3 时最迟在第 3 次就应出现 hint，留 4 次余量。
     bool found_hints = false;
     for (int i = 0; i < 4 && !found_hints; ++i) {
-        std::vector<ReplicationHint> hints;
+        std::vector<ClientReplicationHint> hints;
         auto [ec, locations] = stub_->GetCacheLocation("trace_r" + std::to_string(i),
                                                        "instance1",
                                                        QueryType::QT_BATCH_GET,
@@ -1091,5 +1091,5 @@ TEST_F(GrpcStubTest, TestGetCacheLocationPropagatesReplicationHints) {
             }
         }
     }
-    EXPECT_TRUE(found_hints) << "GrpcStub 应当把服务端返回的 ReplicationHint 通过 out_hints 透传给调用方";
+    EXPECT_TRUE(found_hints) << "GrpcStub 应当把服务端返回的 ClientReplicationHint 通过 out_hints 透传给调用方";
 }

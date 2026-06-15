@@ -6,8 +6,6 @@
 #include <variant>
 #include <vector>
 
-#include "kv_cache_manager/common/affinity_types.h"
-
 namespace kv_cache_manager {
 
 enum [[nodiscard]] ClientErrorCode : int32_t{
@@ -188,6 +186,19 @@ struct ForwardContext {
 struct TransferTraceInfo {
     bool need_print = false;
     std::vector<std::string> block_ids; // block_ids.size() must be equal to block_buffer.size()
+};
+
+// Client-side mirror of common/affinity_types.h::CallerNode.
+struct ClientCallerNode {
+    std::string node_id;
+    std::string supernode_id;
+};
+
+// Client-side mirror of common/affinity_types.h::ReplicationHint.
+struct ClientReplicationHint {
+    int64_t block_key{0};
+    std::string source_uri;
+    std::string target_node_id;
 };
 
 } // namespace kv_cache_manager

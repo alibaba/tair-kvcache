@@ -5,7 +5,6 @@
 #include <string>
 
 #include "kv_cache_manager/client/include/meta_client.h"
-#include "kv_cache_manager/common/affinity_types.h"
 
 namespace kv_cache_manager {
 class Stub;
@@ -24,7 +23,7 @@ public:
                                                         const BlockMask &block_mask,
                                                         int32_t sw_size,
                                                         const std::vector<std::string> &location_spec_names,
-                                                        std::vector<ReplicationHint> &out_hints) override;
+                                                        std::vector<ClientReplicationHint> &out_hints) override;
 
     std::pair<ClientErrorCode, int64_t> MatchLocationLen(const std::string &trace_id,
                                                          QueryType query_type,
@@ -69,7 +68,7 @@ private:
     const ClientConfig *GetClientConfig() const;
     const ClientConfig *GetClientConfigUnsafe() const;
     const std::string &GetInstanceId() const;
-    CallerNode CurrentCallerNode() const;
+    ClientCallerNode CurrentCallerNode() const;
 
 private:
     friend class MetaClient;
