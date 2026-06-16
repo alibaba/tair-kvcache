@@ -398,7 +398,7 @@ class SGLangScheduleEmulator(ScheduleEmulator):
             and self.future_queue[0].last_event_time <= self.global_values.clock
         ):
             req = _heapq.heappop(self.future_queue)
-            req.queue_time_start = self.global_values.clock
+            req.queue_time_start = req.last_event_time
             self.waiting_queue.append(req)
             self.tree_cache.add_to_prefetch_queue(req)
 
@@ -818,7 +818,7 @@ class SGLangScheduleEmulator(ScheduleEmulator):
             # add blocksize of kvcm
             if self.kvcm_block_size:
                 req.block_size = self.kvcm_block_size
-            req.queue_time_start = self.global_values.clock
+            req.queue_time_start = req.last_event_time
             self.waiting_queue.append(req)
 
             if self.use_real_token and self.enable_hicache:
