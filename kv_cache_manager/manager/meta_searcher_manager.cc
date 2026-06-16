@@ -2,6 +2,7 @@
 
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/config/cache_config.h"
+#include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/instance_info.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
@@ -39,6 +40,18 @@ MetaSearcher *MetaSearcherManager::TryCreateMetaSearcher(RequestContext *request
         KVCM_LOG_ERROR("instance group [%s] not found", instance_group.c_str());
         return nullptr;
     }
+
+    // Resolve per-group revisit interval bucket boundaries
+    std::vector<double> group_boundaries;
+    auto [group_ec, group_ptr] = registry_manager_->GetInstanceGroup(request_context, instance_group);
+    if (group_ec == EC_OK && group_ptr && !group_ptr->revisit_interval_buckets().empty()) {
+        group_boundaries = InstanceGroup::ParseRevisitIntervalBuckets(group_ptr->revisit_interval_buckets());
+        if (group_boundaries.empty()) {
+            KVCM_LOG_WARN("instance group [%s] has invalid revisit_interval_buckets, falling back to default",
+                          instance_group.c_str());
+        }
+    }
+
     {
         std::scoped_lock write_guard(mutex_);
         // double check
@@ -46,7 +59,7 @@ MetaSearcher *MetaSearcherManager::TryCreateMetaSearcher(RequestContext *request
         if (meta_searcher != nullptr) {
             return meta_searcher;
         }
-        ec = meta_indexer_manager_->CreateMetaIndexer(instance_id, cache_config->meta_indexer_config());
+        ec = meta_indexer_manager_->CreateMetaIndexer(instance_id, cache_config->meta_indexer_config(), group_boundaries);
         if (ec == ErrorCode::EC_OK) {
             if (auto pair = meta_searcher_map_.emplace(
                     instance_id,

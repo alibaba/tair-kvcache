@@ -25,7 +25,9 @@ public:
     // Must be called before CreateMetaIndexer.
     void SetRevisitHistogramConfig(std::shared_ptr<MetricsRegistry> registry, const std::vector<double> &boundaries);
 
-    ErrorCode CreateMetaIndexer(const std::string &instance_id, const std::shared_ptr<MetaIndexerConfig> &config);
+    ErrorCode CreateMetaIndexer(const std::string &instance_id,
+                                const std::shared_ptr<MetaIndexerConfig> &config,
+                                const std::vector<double> &boundaries = {});
 
     std::shared_ptr<MetaIndexer> GetMetaIndexer(const std::string &instance_id) const;
 

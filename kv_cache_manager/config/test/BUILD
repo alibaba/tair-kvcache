@@ -69,6 +69,19 @@ cc_test(
     ],
 )
 
+cc_test(
+    name = "instance_group_test",
+    srcs = [
+        "instance_group_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    data = [],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config",
+    ],
+)
+
 cc_library(
     name = "coordination_backend_test_base",
     testonly = True,

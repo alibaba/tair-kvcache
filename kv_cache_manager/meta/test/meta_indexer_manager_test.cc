@@ -7,6 +7,7 @@
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
 #include "kv_cache_manager/meta/meta_storage_backend.h"
+#include "kv_cache_manager/metrics/metrics_registry.h"
 namespace kv_cache_manager {
 
 class MetaIndexerManagerTest : public TESTBASE {
@@ -206,6 +207,58 @@ TEST_F(MetaIndexerManagerTest, TestDoCleanupMultiThread) {
     ASSERT_EQ(4, get_count.load());
     // 验证：最终所有 indexer 都被清理
     ASSERT_EQ(0, manager_->GetIndexerSize());
+}
+
+// --- Per-instance boundary override tests ---
+
+TEST_F(MetaIndexerManagerTest, TestCreateWithDefaultBoundaries) {
+    // Set global default boundaries
+    auto registry = std::make_shared<MetricsRegistry>();
+    std::vector<double> default_boundaries = {1, 5, 30, 60};
+    manager_->SetRevisitHistogramConfig(registry, default_boundaries);
+
+    // Create indexer without per-instance boundaries (uses default)
+    ASSERT_EQ(ErrorCode::EC_OK, CreateMetaIndexer("inst_default", META_LOCAL_BACKEND_TYPE_STR));
+    auto indexer = manager_->GetMetaIndexer("inst_default");
+    ASSERT_NE(indexer, nullptr);
+}
+
+TEST_F(MetaIndexerManagerTest, TestCreateWithPerInstanceBoundaries) {
+    // Set global default boundaries
+    auto registry = std::make_shared<MetricsRegistry>();
+    std::vector<double> default_boundaries = {1, 5, 30, 60};
+    manager_->SetRevisitHistogramConfig(registry, default_boundaries);
+
+    // Create indexer with per-instance boundaries (overrides default)
+    std::vector<double> custom_boundaries = {1, 10, 60, 300};
+    auto meta_indexer_config = std::make_shared<MetaIndexerConfig>();
+    auto backend_config = std::make_shared<MetaStorageBackendConfig>();
+    backend_config->storage_type_ = META_LOCAL_BACKEND_TYPE_STR;
+    meta_indexer_config->meta_storage_backend_config_ = backend_config;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              manager_->CreateMetaIndexer("inst_custom", meta_indexer_config, custom_boundaries));
+
+    auto indexer = manager_->GetMetaIndexer("inst_custom");
+    ASSERT_NE(indexer, nullptr);
+}
+
+TEST_F(MetaIndexerManagerTest, TestCreateWithEmptyBoundariesUsesDefault) {
+    // Set global default boundaries
+    auto registry = std::make_shared<MetricsRegistry>();
+    std::vector<double> default_boundaries = {1, 5, 30, 60};
+    manager_->SetRevisitHistogramConfig(registry, default_boundaries);
+
+    // Create indexer with empty boundaries vector (should use default)
+    auto meta_indexer_config = std::make_shared<MetaIndexerConfig>();
+    auto backend_config = std::make_shared<MetaStorageBackendConfig>();
+    backend_config->storage_type_ = META_LOCAL_BACKEND_TYPE_STR;
+    meta_indexer_config->meta_storage_backend_config_ = backend_config;
+    std::vector<double> empty_boundaries;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              manager_->CreateMetaIndexer("inst_fallback", meta_indexer_config, empty_boundaries));
+
+    auto indexer = manager_->GetMetaIndexer("inst_fallback");
+    ASSERT_NE(indexer, nullptr);
 }
 
 } // namespace kv_cache_manager
