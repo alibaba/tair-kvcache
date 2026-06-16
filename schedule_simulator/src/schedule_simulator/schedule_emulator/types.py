@@ -80,7 +80,7 @@ class RouterConfig:
     cache_threshold: float = 0.3
     # balance_abs_threshold: int = 64
     balance_abs_threshold: int = 8
-    # balance_rel_threshold: float = 1.5  # DEPRECATED: removed, only abs threshold used
+    balance_rel_threshold: float = 1.5
     eviction_interval_secs: int = 120
     max_tree_size: int = 2**26
     # Power_of_two

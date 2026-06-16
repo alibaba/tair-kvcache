@@ -228,7 +228,10 @@ class CacheAwarePolicyOld(BasePolicy):
         max_load = max(loads) if loads else 0
         min_load = min(loads) if loads else 0
 
-        is_imbalanced = (max_load - min_load > self.config.balance_abs_threshold)
+        is_imbalanced = (
+            max_load - min_load > self.config.balance_abs_threshold
+            and max_load > min_load * self.config.balance_rel_threshold
+        )
 
         if is_imbalanced:
             logger.debug(
@@ -410,7 +413,10 @@ class CacheAwarePolicy(BasePolicy):
             max_load = max(loads) if loads else 0
             min_load = min(loads) if loads else 0
 
-            is_imbalanced = (max_load - min_load > self.config.balance_abs_threshold)
+            is_imbalanced = (
+            max_load - min_load > self.config.balance_abs_threshold
+            and max_load > min_load * self.config.balance_rel_threshold
+        )
 
             if is_imbalanced:
                 logger.debug(
@@ -509,7 +515,8 @@ class CacheAwarePolicy(BasePolicy):
             self.evict_cache(self.config.max_tree_size)
             self.next_evict_time += self.config.eviction_interval_secs
 
-        await self.update_workload(schedulers, current_time)
+        if not schedulers[0].scheduler_config.request_level_scheduling:
+            await self.update_workload(schedulers, current_time)
 
 
 class DirectCacheAwarePolicy(BasePolicy):
@@ -565,7 +572,10 @@ class DirectCacheAwarePolicy(BasePolicy):
         loads = [self.workers[i].get_load() for i in healthy_indices]
         max_load = max(loads) if loads else 0
         min_load = min(loads) if loads else 0
-        is_imbalanced = (max_load - min_load > self.config.balance_abs_threshold)
+        is_imbalanced = (
+            max_load - min_load > self.config.balance_abs_threshold
+            and max_load > min_load * self.config.balance_rel_threshold
+        )
         if is_imbalanced:
             min_load_idx = min(
                 healthy_indices, key=lambda idx: self.workers[idx].get_load()
@@ -618,4 +628,5 @@ class DirectCacheAwarePolicy(BasePolicy):
                 if isinstance(sched.tree_cache, HierarchicalCacheAdapter):
                     self._use_hierarchical = True
                     self._engine_id_to_idx[sched.tree_cache.engine_id] = i
-        await self.update_workload(schedulers, current_time)
+        if not schedulers[0].scheduler_config.request_level_scheduling:
+            await self.update_workload(schedulers, current_time)

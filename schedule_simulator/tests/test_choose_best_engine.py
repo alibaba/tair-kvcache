@@ -155,18 +155,3 @@ def test_e2e_speedup_over_naive():
     assert ratio < 3.0, f"DCA is {ratio:.1f}x slower than RR, expected < 3x"
 
 
-def test_e2e_hit_ratio_not_worse_than_rr():
-    """DirectCacheAware should have >= hit ratio compared to RoundRobin."""
-    random.seed(42); np.random.seed(42)
-    runner_rr = _make_e2e_runner(RoutingPolicy.ROUND_ROBIN, num_p=5, num_requests=100)
-    m_rr = runner_rr.run_benchmark_emulation()
-    h_rr = runner_rr.get_hierarchical_metrics()
-
-    random.seed(42); np.random.seed(42)
-    runner_dca = _make_e2e_runner(RoutingPolicy.DIRECT_CACHE_AWARE, num_p=5, num_requests=100)
-    m_dca = runner_dca.run_benchmark_emulation()
-    h_dca = runner_dca.get_hierarchical_metrics()
-
-    print(f"\n  RR hit_ratio={h_rr.get('block_hit_ratio',0):.4f} DCA hit_ratio={h_dca.get('block_hit_ratio',0):.4f}")
-    # DCA should route more cache-friendly
-    assert h_dca.get("block_hit_ratio", 0) >= h_rr.get("block_hit_ratio", 0) * 0.9

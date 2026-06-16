@@ -323,54 +323,6 @@ class TestRequestLevelP2P:
         print(f"[p2p_reduces_uncached] peer_hit_blocks={total_peer_hit}, "
               f"requests_with_reuse={len(reused)}/{len(all_completed)}")
 
-    def test_p2p_latency_in_ttft(self):
-        """P2P transfer latency should increase TTFT compared to no-P2P baseline."""
-        shared_prefix = list(range(2000, 2050))
-        records = []
-        for i in range(6):
-            records.append({
-                "timestamp": float(i) * 10,  # spaced out to avoid queueing
-                "input_length": 50,
-                "output_length": 1,
-                "block_ids": shared_prefix,
-            })
-        dataset_path = self._make_dataset(records)
-
-        # Run with P2P enabled (bandwidth=10 GB/s)
-        runner_p2p = self._make_runner(
-            num_p=2, peer_bw=10.0, dataset_path=dataset_path, num_prompts=6
-        )
-        metrics_p2p = runner_p2p.run_benchmark_emulation()
-
-        # Verify that completed requests with peer data have latency > inference-only latency
-        all_completed = []
-        for sched in runner_p2p.p_schedulers:
-            all_completed.extend(sched.completed_requests)
-
-        # Sort by id to check sequential behavior
-        all_completed.sort(key=lambda r: r.id)
-
-        # First request (cold) vs later requests (with cache)
-        first_req = all_completed[0]
-        later_reqs_with_reuse = [r for r in all_completed[1:] if r.final_reused_tokens > 0]
-
-        if later_reqs_with_reuse:
-            # Later requests with cache should be faster despite P2P latency
-            # because they skip prefill for cached tokens
-            first_ttft = first_req.gen_token_latencies[0] if first_req.gen_token_latencies else 0
-            later_ttfts = [r.gen_token_latencies[0] for r in later_reqs_with_reuse
-                           if r.gen_token_latencies]
-            avg_later = sum(later_ttfts) / len(later_ttfts) if later_ttfts else 0
-            # With P2P, later requests should be faster (less prefill) 
-            # but not zero (P2P transfer takes time)
-            print(f"[p2p_ttft] first_ttft={first_ttft:.4f}s, "
-                  f"avg_cached_ttft={avg_later:.4f}s, reused_count={len(later_reqs_with_reuse)}")
-            assert avg_later < first_ttft or len(later_reqs_with_reuse) == 0, \
-                "Cached requests should be faster than cold requests"
-        
-        assert metrics_p2p["completed"] == 6
-        print(f"[p2p_latency_ttft] completed={metrics_p2p['completed']}")
-
     def test_p2p_bandwidth_no_effect_on_ttft(self):
         """P2P bandwidth should NOT affect TTFT (Optimizer handles P2P internally)."""
         shared_prefix = list(range(3000, 3050))

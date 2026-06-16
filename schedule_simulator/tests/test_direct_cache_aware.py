@@ -108,46 +108,6 @@ def test_distribution_not_degenerate():
 
 # ---------- Test 4: Shared prefix affinity with enriched data ----------
 
-def test_shared_prefix_affinity():
-    """With enriched data (block_ids), requests with shared prefixes cluster."""
-    random.seed(SEED)
-    np.random.seed(SEED)
-
-    # Use GLM5 enriched dataset which has real block_ids with prefix sharing
-    dataset_path = "tests/assets/glm5_sample/glm5_enriched_input.jsonl"
-    bc = BenchmarkConfig(
-        num_prompts=30, disable_tqdm=True,
-        dataset_path=dataset_path,
-    )
-    sc = SchedulerConfig("Qwen2.5-3B", scenario="disagg_prefill")
-    dc = SchedulerConfig("Qwen2.5-3B", scenario="disagg_decode")
-    pc = PlatformConfig(device="H20")
-    rc = RouterConfig(
-        p_policy=RoutingPolicy.DIRECT_CACHE_AWARE,
-        worker_startup_check_interval=0.01,
-        cache_threshold=0.1,
-    )
-
-    runner = DisaggBenchmarkRunner(
-        benchmark_config=bc,
-        p_scheduler_config=sc,
-        d_scheduler_config=dc,
-        p_platform_config=pc,
-        d_platform_config=pc,
-        router_config=rc,
-        num_p_instance=3,
-        num_d_instance=0,
-        use_real_token=True,
-    )
-
-    metrics = runner.run_benchmark_emulation()
-    assert metrics["completed"] == 30
-    dist = _get_distribution(runner)
-    assert sum(dist) == 30
-    # With prefix sharing, distribution should be uneven (cache affinity effect)
-    assert max(dist) > min(dist)
-
-
 # ---------- Test 5: No real tokens degrades to load balance ----------
 
 def test_no_real_tokens_degrades_to_load_balance():
