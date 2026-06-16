@@ -11,44 +11,10 @@
 namespace kv_cache_manager {
 
 std::vector<double> ServerConfig::ParseRevisitIntervalBuckets(const std::string &buckets_str) {
-    std::vector<double> boundaries;
-    if (buckets_str.empty()) {
-        return boundaries;
+    auto boundaries = StringUtil::ParseBucketBoundaries(buckets_str);
+    if (!buckets_str.empty() && boundaries.empty()) {
+        fprintf(stderr, "Invalid revisit_interval_buckets: must be positive numbers in strictly ascending order\n");
     }
-    std::istringstream iss(buckets_str);
-    std::string token;
-
-    while (std::getline(iss, token, ',')) {
-        StringUtil::Trim(token);
-        if (token.empty()) {
-            continue;
-        }
-        try {
-            size_t pos = 0;
-            double val = std::stod(token, &pos);
-            if (pos != token.size()) {
-                fprintf(stderr, "Trailing characters in bucket boundary: %s\n", token.c_str());
-                return {};
-            }
-            if (val <= 0.0 || !std::isfinite(val)) {
-                fprintf(stderr, "Bucket boundary must be positive and finite: %s\n", token.c_str());
-                return {};
-            }
-            boundaries.push_back(val);
-        } catch (const std::exception &e) {
-            fprintf(stderr, "Failed to parse bucket boundary: %s\n", token.c_str());
-            return {};
-        }
-    }
-
-    // Check ascending order
-    for (size_t i = 1; i < boundaries.size(); ++i) {
-        if (boundaries[i] <= boundaries[i - 1]) {
-            fprintf(stderr, "Bucket boundaries must be in strictly ascending order\n");
-            return {};
-        }
-    }
-
     return boundaries;
 }
 

@@ -1,8 +1,5 @@
 #include "kv_cache_manager/config/instance_group.h"
 
-#include <cmath>
-#include <sstream>
-
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/string_util.h"
 
@@ -24,7 +21,16 @@ bool InstanceGroup::FromRapidValue(const rapidjson::Value &rapid_value) {
                                 "event_reporting_storage_candidates",
                                 event_reporting_storage_candidates_,
                                 std::vector<std::string>());
-    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "revisit_interval_buckets", revisit_interval_buckets_, std::string(""));
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "revisit_interval_buckets", revisit_interval_buckets_str_, std::string(""));
+    // Parse and validate immediately
+    if (!revisit_interval_buckets_str_.empty()) {
+        parsed_revisit_interval_buckets_ = StringUtil::ParseBucketBoundaries(revisit_interval_buckets_str_);
+        if (parsed_revisit_interval_buckets_.empty()) {
+            KVCM_LOG_WARN("InstanceGroup [%s]: invalid revisit_interval_buckets '%s', will use server default",
+                          name_.c_str(),
+                          revisit_interval_buckets_str_.c_str());
+        }
+    }
     return true;
 }
 
@@ -39,7 +45,7 @@ void InstanceGroup::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &wr
     Put(writer, "version", version_);
     Put(writer, "extra_info", extra_info_);
     Put(writer, "event_reporting_storage_candidates", event_reporting_storage_candidates_);
-    Put(writer, "revisit_interval_buckets", revisit_interval_buckets_);
+    Put(writer, "revisit_interval_buckets", revisit_interval_buckets_str_);
 }
 
 bool InstanceGroup::ValidateRequiredFields(std::string &invalid_fields) const {
@@ -73,42 +79,18 @@ bool InstanceGroup::ValidateRequiredFields(std::string &invalid_fields) const {
     return valid;
 }
 
-std::vector<double> InstanceGroup::ParseRevisitIntervalBuckets(const std::string &buckets_str) {
-    std::vector<double> boundaries;
+void InstanceGroup::set_revisit_interval_buckets(const std::string &buckets_str) {
+    revisit_interval_buckets_str_ = buckets_str;
     if (buckets_str.empty()) {
-        return boundaries;
+        parsed_revisit_interval_buckets_.clear();
+        return;
     }
-    std::istringstream iss(buckets_str);
-    std::string token;
-
-    while (std::getline(iss, token, ',')) {
-        StringUtil::Trim(token);
-        if (token.empty()) {
-            return {};  // reject empty tokens (e.g. "1,,5")
-        }
-        try {
-            size_t pos = 0;
-            double val = std::stod(token, &pos);
-            if (pos != token.size()) {
-                return {};  // reject partial consumption (e.g. "1s")
-            }
-            if (val <= 0.0 || !std::isfinite(val)) {
-                return {};
-            }
-            boundaries.push_back(val);
-        } catch (const std::exception &) {
-            return {};
-        }
+    parsed_revisit_interval_buckets_ = StringUtil::ParseBucketBoundaries(buckets_str);
+    if (parsed_revisit_interval_buckets_.empty()) {
+        KVCM_LOG_WARN("InstanceGroup [%s]: invalid revisit_interval_buckets '%s', will use server default",
+                      name_.c_str(),
+                      buckets_str.c_str());
     }
-
-    // Check strictly ascending order
-    for (size_t i = 1; i < boundaries.size(); ++i) {
-        if (boundaries[i] <= boundaries[i - 1]) {
-            return {};
-        }
-    }
-
-    return boundaries;
 }
 
 } // namespace kv_cache_manager

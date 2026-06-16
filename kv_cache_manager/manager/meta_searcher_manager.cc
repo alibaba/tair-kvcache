@@ -34,23 +34,25 @@ MetaSearcher *MetaSearcherManager::TryCreateMetaSearcher(RequestContext *request
         return nullptr;
     }
     const std::string &instance_group = instance_info->instance_group_name();
-    auto cache_config = registry_manager_->GetCacheConfig(instance_group);
-    if (cache_config == nullptr) {
+
+    // Look up InstanceGroup once — used for both cache_config and revisit boundaries
+    auto [group_ec, group_ptr] = registry_manager_->GetInstanceGroup(request_context, instance_group);
+    if (group_ec != EC_OK || group_ptr == nullptr) {
         request_context->error_tracer()->AddErrorMsg("instance group not found");
         KVCM_LOG_ERROR("instance group [%s] not found", instance_group.c_str());
         return nullptr;
     }
 
-    // Resolve per-group revisit interval bucket boundaries
-    std::vector<double> group_boundaries;
-    auto [group_ec, group_ptr] = registry_manager_->GetInstanceGroup(request_context, instance_group);
-    if (group_ec == EC_OK && group_ptr && !group_ptr->revisit_interval_buckets().empty()) {
-        group_boundaries = InstanceGroup::ParseRevisitIntervalBuckets(group_ptr->revisit_interval_buckets());
-        if (group_boundaries.empty()) {
-            KVCM_LOG_WARN("instance group [%s] has invalid revisit_interval_buckets, falling back to default",
-                          instance_group.c_str());
-        }
+    auto cache_config = group_ptr->cache_config();
+    if (cache_config == nullptr) {
+        request_context->error_tracer()->AddErrorMsg("instance group cache_config is null");
+        KVCM_LOG_ERROR("instance group [%s] has null cache_config", instance_group.c_str());
+        return nullptr;
     }
+
+    // Per-group revisit interval bucket boundaries (already parsed and validated at write time).
+    // Empty vector means "use server-level default" — resolved inside CreateMetaIndexer.
+    const auto &group_boundaries = group_ptr->revisit_interval_buckets();
 
     {
         std::scoped_lock write_guard(mutex_);

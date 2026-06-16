@@ -6,6 +6,7 @@
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
+#include "kv_cache_manager/meta/meta_local_backend.h"
 #include "kv_cache_manager/meta/meta_storage_backend.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 namespace kv_cache_manager {
@@ -221,6 +222,14 @@ TEST_F(MetaIndexerManagerTest, TestCreateWithDefaultBoundaries) {
     ASSERT_EQ(ErrorCode::EC_OK, CreateMetaIndexer("inst_default", META_LOCAL_BACKEND_TYPE_STR));
     auto indexer = manager_->GetMetaIndexer("inst_default");
     ASSERT_NE(indexer, nullptr);
+
+    // Verify histogram was created with default boundaries
+    auto *backend = dynamic_cast<MetaLocalBackend *>(indexer->backend_manager_->persistent_backend_.get());
+    ASSERT_NE(backend, nullptr);
+    ASSERT_NE(backend->revisit_histogram_, nullptr);
+    EXPECT_EQ(backend->revisit_histogram_->GetBoundaries().size(), 4);
+    EXPECT_DOUBLE_EQ(backend->revisit_histogram_->GetBoundaries()[0], 1.0);
+    EXPECT_DOUBLE_EQ(backend->revisit_histogram_->GetBoundaries()[3], 60.0);
 }
 
 TEST_F(MetaIndexerManagerTest, TestCreateWithPerInstanceBoundaries) {
@@ -240,6 +249,16 @@ TEST_F(MetaIndexerManagerTest, TestCreateWithPerInstanceBoundaries) {
 
     auto indexer = manager_->GetMetaIndexer("inst_custom");
     ASSERT_NE(indexer, nullptr);
+
+    // Verify histogram uses per-instance boundaries, NOT the default
+    auto *backend = dynamic_cast<MetaLocalBackend *>(indexer->backend_manager_->persistent_backend_.get());
+    ASSERT_NE(backend, nullptr);
+    ASSERT_NE(backend->revisit_histogram_, nullptr);
+    EXPECT_EQ(backend->revisit_histogram_->GetBoundaries().size(), 4);
+    EXPECT_DOUBLE_EQ(backend->revisit_histogram_->GetBoundaries()[0], 1.0);
+    EXPECT_DOUBLE_EQ(backend->revisit_histogram_->GetBoundaries()[1], 10.0);  // NOT 5.0 (default)
+    EXPECT_DOUBLE_EQ(backend->revisit_histogram_->GetBoundaries()[2], 60.0);
+    EXPECT_DOUBLE_EQ(backend->revisit_histogram_->GetBoundaries()[3], 300.0);  // NOT 60.0 (default)
 }
 
 TEST_F(MetaIndexerManagerTest, TestCreateWithEmptyBoundariesUsesDefault) {
@@ -259,6 +278,13 @@ TEST_F(MetaIndexerManagerTest, TestCreateWithEmptyBoundariesUsesDefault) {
 
     auto indexer = manager_->GetMetaIndexer("inst_fallback");
     ASSERT_NE(indexer, nullptr);
+
+    // Verify histogram falls back to default boundaries
+    auto *backend = dynamic_cast<MetaLocalBackend *>(indexer->backend_manager_->persistent_backend_.get());
+    ASSERT_NE(backend, nullptr);
+    ASSERT_NE(backend->revisit_histogram_, nullptr);
+    EXPECT_EQ(backend->revisit_histogram_->GetBoundaries().size(), 4);
+    EXPECT_DOUBLE_EQ(backend->revisit_histogram_->GetBoundaries()[1], 5.0);  // default, not custom
 }
 
 } // namespace kv_cache_manager
