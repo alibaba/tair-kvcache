@@ -199,16 +199,21 @@ enum MigrationRetention {
     MIGRATION_RETENTION_KEEP_BOTH = 2;     // 保留双副本，由 Reclaimer 后续回收
 }
 
+// Mark 被 StartWriteCache 消费后的清理策略
+enum MigrationMarkClearPolicy {
+    MIGRATION_MARK_CLEAR_ON_NEXT_WRITE_SUCCESS = 0; // 本次 target CacheLocation 成功 SERVING 后清标
+    MIGRATION_MARK_CLEAR_ON_FULL_BLOCK_COVERED = 1; // target CacheLocation 覆盖完整 block 后清标
+}
+
 // Copy 执行方式：通过 DataStorageBackend::Copy 把数据复制到目标 storage
 message MigrationCopyMethod {
     bool enabled = 1;
-    int64 max_concurrency = 2; // 固定 Copy 并发上限；未设置时服务端使用默认值
 }
 
 // Mark 执行方式：给 block 打标，下次 StartWriteCache 时引导推理引擎多写一份到目标 storage
 message MigrationMarkMethod {
     bool enabled = 1;
-    int64 mark_timeout_ms = 2; // 标记超时阈值（毫秒），超过未被消费则清除（兜底）
+    google.protobuf.Int64Value timeout_ms = 3;
 }
 
 // 执行方式集合，Copy / Mark 可同时开启（与触发模式正交）
@@ -224,6 +229,12 @@ message MigrationStrategy {
     double trigger_threshold = 3;   // 水位触发阈值（迁移区间下界），如 0.70
     MigrationMethods methods = 4;
     MigrationRetention retention = 5;
+}
+
+message MigrationConfig {
+    repeated MigrationStrategy strategies = 1; // 多层存储迁移规则，per-storage
+    google.protobuf.Int64Value copy_max_concurrency = 2; // instance group 级 Copy 并发上限
+    MigrationMarkClearPolicy mark_clear_policy = 3; // instance group 级 Mark 清理策略
 }
 
 enum CachePreferStrategy {
@@ -272,7 +283,7 @@ message CacheConfig {
     CacheReclaimStrategy reclaim_strategy = 1;
     CachePreferStrategy data_storage_strategy = 2;
     MetaIndexerConfig meta_indexer_config = 3;
-    repeated MigrationStrategy migration_strategies = 4; // 多层存储迁移规则，per-storage
+    MigrationConfig migration_config = 4;
 }
 
 message InstanceGroup {
@@ -392,7 +403,6 @@ enum MigrationMethod {
 // 规则触发：block_keys 为空时按规则采样过滤候选
 message MigrationRule {
     int32 sample_count = 1; // 采样数量上限
-    int64 min_age_ms = 2;   // 仅迁移存活超过该时长的 block（0 表示不限）
 }
 
 // 跨存储层迁移指定 block 的 cache

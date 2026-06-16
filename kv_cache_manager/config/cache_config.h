@@ -39,6 +39,8 @@ enum class CachePreferStrategy {
  */
 class CacheConfig : public Jsonizable {
 public:
+    static constexpr int64_t kDefaultMigrationCopyMaxConcurrency = MigrationConfig::kDefaultCopyMaxConcurrency;
+
     CacheConfig() = default;
     CacheConfig(CachePreferStrategy cache_prefer_strategy,
                 const std::shared_ptr<CacheReclaimStrategy> &reclaim_strategy,
@@ -56,8 +58,11 @@ public:
     const std::shared_ptr<MetaIndexerConfig> &meta_indexer_config() const { return meta_indexer_config_; }
 
     const std::vector<std::shared_ptr<MigrationStrategy>> &migration_strategies() const {
-        return migration_strategies_;
+        return migration_config_.strategies();
     }
+    const MigrationConfig &migration_config() const { return migration_config_; }
+    int64_t migration_copy_max_concurrency() const { return migration_config_.copy_max_concurrency(); }
+    MigrationMarkClearPolicy migration_mark_clear_policy() const { return migration_config_.mark_clear_policy(); }
     // Setters
     void set_reclaim_strategy(const std::shared_ptr<CacheReclaimStrategy> &reclaim_strategy) {
         reclaim_strategy_ = reclaim_strategy;
@@ -69,7 +74,16 @@ public:
         meta_indexer_config_ = meta_indexer_config;
     }
     void set_migration_strategies(const std::vector<std::shared_ptr<MigrationStrategy>> &migration_strategies) {
-        migration_strategies_ = migration_strategies;
+        migration_config_.set_strategies(migration_strategies);
+    }
+    void set_migration_copy_max_concurrency(int64_t migration_copy_max_concurrency) {
+        migration_config_.set_copy_max_concurrency(migration_copy_max_concurrency);
+    }
+    void set_migration_mark_clear_policy(MigrationMarkClearPolicy migration_mark_clear_policy) {
+        migration_config_.set_mark_clear_policy(migration_mark_clear_policy);
+    }
+    void set_migration_config(const MigrationConfig &migration_config) {
+        migration_config_ = migration_config;
     }
 
 public:
@@ -83,7 +97,7 @@ private:
     CachePreferStrategy cache_prefer_strategy_;
     std::shared_ptr<CacheReclaimStrategy> reclaim_strategy_;
     std::shared_ptr<MetaIndexerConfig> meta_indexer_config_;
-    std::vector<std::shared_ptr<MigrationStrategy>> migration_strategies_;
+    MigrationConfig migration_config_;
 };
 
 using CacheConfigConstPtr = std::shared_ptr<const CacheConfig>;

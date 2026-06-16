@@ -1,7 +1,9 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
+#include <vector>
 
 #include "kv_cache_manager/common/jsonizable.h"
 
@@ -14,50 +16,51 @@ enum class MigrationRetention {
     MIGRATION_RETENTION_KEEP_BOTH = 2,     // 保留双副本，由 Reclaimer 后续回收
 };
 
-// Copy 执行方式：通过 DataStorageBackend::Copy 把数据复制到目标 storage
+// Mark 被 StartWriteCache 消费后的清理策略。
+enum class MigrationMarkClearPolicy {
+    CLEAR_ON_NEXT_WRITE_SUCCESS = 0, // 本次 target CacheLocation 成功 SERVING 后清标
+    CLEAR_ON_FULL_BLOCK_COVERED = 1, // target CacheLocation 覆盖完整 block 后清标
+};
+
+// Copy 执行方式：通过 DataStorageBackend::Copy 把数据复制到目标 storage。
 class MigrationCopyMethod : public Jsonizable {
 public:
-    static constexpr int64_t kDefaultMaxConcurrency = 1;
-
     MigrationCopyMethod() = default;
-    explicit MigrationCopyMethod(bool enabled, int64_t max_concurrency = kDefaultMaxConcurrency)
-        : enabled_(enabled)
-        , max_concurrency_(max_concurrency) {}
+    explicit MigrationCopyMethod(bool enabled)
+        : enabled_(enabled) {}
     ~MigrationCopyMethod() override;
 
     bool enabled() const { return enabled_; }
-    int64_t max_concurrency() const { return max_concurrency_; }
     void set_enabled(bool enabled) { enabled_ = enabled; }
-    void set_max_concurrency(int64_t max_concurrency) { max_concurrency_ = max_concurrency; }
 
     bool FromRapidValue(const rapidjson::Value &rapid_value) override;
     void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
 
 private:
     bool enabled_ = false;
-    int64_t max_concurrency_ = kDefaultMaxConcurrency;
 };
 
 // Mark 执行方式：给 block 打标，下次 StartWriteCache 时引导推理引擎多写一份到目标 storage
 class MigrationMarkMethod : public Jsonizable {
 public:
+    static constexpr int64_t kDefaultTimeoutMs = 24 * 60 * 60 * 1000;
+
     MigrationMarkMethod() = default;
-    MigrationMarkMethod(bool enabled, int64_t mark_timeout_ms)
-        : enabled_(enabled)
-        , mark_timeout_ms_(mark_timeout_ms) {}
+    explicit MigrationMarkMethod(bool enabled)
+        : enabled_(enabled) {}
     ~MigrationMarkMethod() override;
 
     bool enabled() const { return enabled_; }
-    int64_t mark_timeout_ms() const { return mark_timeout_ms_; }
+    int64_t timeout_ms() const { return timeout_ms_; }
     void set_enabled(bool enabled) { enabled_ = enabled; }
-    void set_mark_timeout_ms(int64_t mark_timeout_ms) { mark_timeout_ms_ = mark_timeout_ms; }
+    void set_timeout_ms(int64_t timeout_ms) { timeout_ms_ = timeout_ms; }
 
     bool FromRapidValue(const rapidjson::Value &rapid_value) override;
     void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
 
 private:
     bool enabled_ = false;
-    int64_t mark_timeout_ms_ = 0;
+    int64_t timeout_ms_ = kDefaultTimeoutMs;
 };
 
 // 执行方式集合，Copy / Mark 可同时开启（与触发模式正交）
@@ -117,6 +120,37 @@ private:
     double trigger_threshold_ = 0.0;                                             // 水位触发阈值（迁移区间下界）
     MigrationMethods methods_;                                                   // Copy / Mark 执行方式
     MigrationRetention retention_ = MigrationRetention::MIGRATION_RETENTION_UNSPECIFIED; // 源端保留策略
+};
+
+class MigrationConfig : public Jsonizable {
+public:
+    static constexpr int64_t kDefaultCopyMaxConcurrency = 1;
+
+    MigrationConfig() = default;
+    ~MigrationConfig() override;
+
+    const std::vector<std::shared_ptr<MigrationStrategy>> &strategies() const { return strategies_; }
+    int64_t copy_max_concurrency() const { return copy_max_concurrency_; }
+    MigrationMarkClearPolicy mark_clear_policy() const { return mark_clear_policy_; }
+
+    void set_strategies(const std::vector<std::shared_ptr<MigrationStrategy>> &strategies) {
+        strategies_ = strategies;
+    }
+    void set_copy_max_concurrency(int64_t copy_max_concurrency) {
+        copy_max_concurrency_ = copy_max_concurrency;
+    }
+    void set_mark_clear_policy(MigrationMarkClearPolicy mark_clear_policy) {
+        mark_clear_policy_ = mark_clear_policy;
+    }
+
+    bool FromRapidValue(const rapidjson::Value &rapid_value) override;
+    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
+    bool ValidateRequiredFields(std::string &invalid_fields) const;
+
+private:
+    std::vector<std::shared_ptr<MigrationStrategy>> strategies_;
+    int64_t copy_max_concurrency_ = kDefaultCopyMaxConcurrency;
+    MigrationMarkClearPolicy mark_clear_policy_ = MigrationMarkClearPolicy::CLEAR_ON_NEXT_WRITE_SUCCESS;
 };
 
 } // namespace kv_cache_manager

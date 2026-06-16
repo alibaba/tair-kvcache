@@ -8,7 +8,7 @@ bool CacheConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
     KVCM_JSON_GET_MACRO(rapid_value, "reclaim_strategy", reclaim_strategy_);
     KVCM_JSON_GET_MACRO(rapid_value, "cache_prefer_strategy", cache_prefer_strategy_);
     KVCM_JSON_GET_MACRO(rapid_value, "meta_indexer_config", meta_indexer_config_);
-    KVCM_JSON_GET_MACRO(rapid_value, "migration_strategies", migration_strategies_);
+    KVCM_JSON_GET_MACRO(rapid_value, "migration_config", migration_config_);
     return true;
 }
 
@@ -16,7 +16,7 @@ void CacheConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writ
     Put(writer, "reclaim_strategy", reclaim_strategy_);
     Put(writer, "cache_prefer_strategy", cache_prefer_strategy_);
     Put(writer, "meta_indexer_config", meta_indexer_config_);
-    Put(writer, "migration_strategies", migration_strategies_);
+    Put(writer, "migration_config", migration_config_);
 }
 bool CacheConfig::ValidateRequiredFields(std::string &invalid_fields) const {
     bool valid = true;
@@ -37,14 +37,8 @@ bool CacheConfig::ValidateRequiredFields(std::string &invalid_fields) const {
     } else if (!meta_indexer_config_->ValidateRequiredFields(local_invalid_fields)) {
         valid = false;
     }
-    // migration_strategies 为可选项；若配置了则每条都必须合法
-    for (const auto &migration_strategy : migration_strategies_) {
-        if (migration_strategy == nullptr) {
-            valid = false;
-            local_invalid_fields += "{migration_strategies:null_entry}";
-        } else if (!migration_strategy->ValidateRequiredFields(local_invalid_fields)) {
-            valid = false;
-        }
+    if (!migration_config_.ValidateRequiredFields(local_invalid_fields)) {
+        valid = false;
     }
     if (!valid) {
         invalid_fields += "{CacheConfig: " + local_invalid_fields + "}";

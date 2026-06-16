@@ -1,31 +1,41 @@
 #include "kv_cache_manager/config/migration_strategy.h"
 
+#include <cmath>
+
 namespace kv_cache_manager {
+
+namespace {
+
+bool IsValidMigrationRetention(MigrationRetention retention) {
+    return retention == MigrationRetention::MIGRATION_RETENTION_UNSPECIFIED ||
+           retention == MigrationRetention::MIGRATION_RETENTION_DELETE_SOURCE ||
+           retention == MigrationRetention::MIGRATION_RETENTION_KEEP_BOTH;
+}
+
+} // namespace
 
 MigrationCopyMethod::~MigrationCopyMethod() = default;
 
 bool MigrationCopyMethod::FromRapidValue(const rapidjson::Value &rapid_value) {
     KVCM_JSON_GET_MACRO(rapid_value, "enabled", enabled_);
-    KVCM_JSON_GET_MACRO(rapid_value, "max_concurrency", max_concurrency_);
     return true;
 }
 
 void MigrationCopyMethod::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
     Put(writer, "enabled", enabled_);
-    Put(writer, "max_concurrency", max_concurrency_);
 }
 
 MigrationMarkMethod::~MigrationMarkMethod() = default;
 
 bool MigrationMarkMethod::FromRapidValue(const rapidjson::Value &rapid_value) {
     KVCM_JSON_GET_MACRO(rapid_value, "enabled", enabled_);
-    KVCM_JSON_GET_MACRO(rapid_value, "mark_timeout_ms", mark_timeout_ms_);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "timeout_ms", timeout_ms_, MigrationMarkMethod::kDefaultTimeoutMs);
     return true;
 }
 
 void MigrationMarkMethod::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
     Put(writer, "enabled", enabled_);
-    Put(writer, "mark_timeout_ms", mark_timeout_ms_);
+    Put(writer, "timeout_ms", timeout_ms_);
 }
 
 MigrationMethods::~MigrationMethods() = default;
@@ -77,7 +87,7 @@ bool MigrationStrategy::ValidateRequiredFields(std::string &invalid_fields) cons
         local_invalid_fields += "{target_storage_equals_source}";
     }
     // trigger_threshold 是水位比例，应落在 (0, 1) 区间
-    if (trigger_threshold_ <= 0.0 || trigger_threshold_ >= 1.0) {
+    if (!std::isfinite(trigger_threshold_) || trigger_threshold_ <= 0.0 || trigger_threshold_ >= 1.0) {
         valid = false;
         local_invalid_fields += "{trigger_threshold}";
     }
@@ -86,18 +96,68 @@ bool MigrationStrategy::ValidateRequiredFields(std::string &invalid_fields) cons
         valid = false;
         local_invalid_fields += "{methods_none_enabled}";
     }
+    if (methods_.mark().enabled() && methods_.mark().timeout_ms() <= 0) {
+        valid = false;
+        local_invalid_fields += "{mark_timeout_ms}";
+    }
+    if (!IsValidMigrationRetention(retention_)) {
+        valid = false;
+        local_invalid_fields += "{retention}";
+    }
     // Copy 路径会按 retention 处理源端，必须显式指定
     if (methods_.copy().enabled() && retention_ == MigrationRetention::MIGRATION_RETENTION_UNSPECIFIED) {
         valid = false;
         local_invalid_fields += "{retention}";
     }
-    // Copy 并发上限固定由配置控制；启用 Copy 时必须为正数
-    if (methods_.copy().enabled() && methods_.copy().max_concurrency() <= 0) {
+    if (!valid) {
+        invalid_fields += "{MigrationStrategy: " + local_invalid_fields + "}";
+    }
+    return valid;
+}
+
+MigrationConfig::~MigrationConfig() = default;
+
+bool MigrationConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value,
+                                "copy_max_concurrency",
+                                copy_max_concurrency_,
+                                MigrationConfig::kDefaultCopyMaxConcurrency);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value,
+                                "mark_clear_policy",
+                                mark_clear_policy_,
+                                MigrationMarkClearPolicy::CLEAR_ON_NEXT_WRITE_SUCCESS);
+    KVCM_JSON_GET_MACRO(rapid_value, "strategies", strategies_);
+    return true;
+}
+
+void MigrationConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
+    Put(writer, "copy_max_concurrency", copy_max_concurrency_);
+    Put(writer, "mark_clear_policy", mark_clear_policy_);
+    Put(writer, "strategies", strategies_);
+}
+
+bool MigrationConfig::ValidateRequiredFields(std::string &invalid_fields) const {
+    bool valid = true;
+    std::string local_invalid_fields;
+    if (copy_max_concurrency_ <= 0) {
         valid = false;
         local_invalid_fields += "{copy_max_concurrency}";
     }
+    if (mark_clear_policy_ != MigrationMarkClearPolicy::CLEAR_ON_NEXT_WRITE_SUCCESS &&
+        mark_clear_policy_ != MigrationMarkClearPolicy::CLEAR_ON_FULL_BLOCK_COVERED) {
+        valid = false;
+        local_invalid_fields += "{mark_clear_policy}";
+    }
+    for (const auto &strategy : strategies_) {
+        if (strategy == nullptr) {
+            valid = false;
+            local_invalid_fields += "{strategies:null_entry}";
+        } else if (!strategy->ValidateRequiredFields(local_invalid_fields)) {
+            valid = false;
+        }
+    }
     if (!valid) {
-        invalid_fields += "{MigrationStrategy: " + local_invalid_fields + "}";
+        invalid_fields += "{MigrationConfig: " + local_invalid_fields + "}";
     }
     return valid;
 }

@@ -208,20 +208,23 @@ void ProtoConvert::CacheConfigToProto(const CacheConfig &cache_config_info,
         }
     }
 
-    // 转换migration_strategies
+    // 转换migration_config
+    auto *migration_config = proto_cache_config->mutable_migration_config();
+    migration_config->mutable_copy_max_concurrency()->set_value(cache_config_info.migration_copy_max_concurrency());
+    migration_config->set_mark_clear_policy(
+        static_cast<proto::admin::MigrationMarkClearPolicy>(cache_config_info.migration_mark_clear_policy()));
     for (const auto &migration_strategy : cache_config_info.migration_strategies()) {
         if (migration_strategy == nullptr) {
             continue;
         }
-        auto *proto_migration_strategy = proto_cache_config->add_migration_strategies();
+        auto *proto_migration_strategy = migration_config->add_strategies();
         proto_migration_strategy->set_storage_unique_name(migration_strategy->storage_unique_name());
         proto_migration_strategy->set_target_storage(migration_strategy->target_storage());
         proto_migration_strategy->set_trigger_threshold(migration_strategy->trigger_threshold());
         auto *methods = proto_migration_strategy->mutable_methods();
         methods->mutable_copy()->set_enabled(migration_strategy->methods().copy().enabled());
-        methods->mutable_copy()->set_max_concurrency(migration_strategy->methods().copy().max_concurrency());
         methods->mutable_mark()->set_enabled(migration_strategy->methods().mark().enabled());
-        methods->mutable_mark()->set_mark_timeout_ms(migration_strategy->methods().mark().mark_timeout_ms());
+        methods->mutable_mark()->mutable_timeout_ms()->set_value(migration_strategy->methods().mark().timeout_ms());
         proto_migration_strategy->set_retention(
             static_cast<proto::admin::MigrationRetention>(migration_strategy->retention()));
     }
@@ -251,6 +254,14 @@ void ProtoConvert::CacheConfigFromProto(const proto::admin::CacheConfig *proto_c
     // 转换data_storage_strategy (cache_prefer_strategy)
     cache_config_info.set_cache_prefer_strategy(
         static_cast<CachePreferStrategy>(proto_cache_config->data_storage_strategy()));
+    const auto &proto_migration_config = proto_cache_config->migration_config();
+    if (proto_migration_config.has_copy_max_concurrency()) {
+        cache_config_info.set_migration_copy_max_concurrency(proto_migration_config.copy_max_concurrency().value());
+    } else {
+        cache_config_info.set_migration_copy_max_concurrency(CacheConfig::kDefaultMigrationCopyMaxConcurrency);
+    }
+    cache_config_info.set_migration_mark_clear_policy(
+        static_cast<MigrationMarkClearPolicy>(proto_migration_config.mark_clear_policy()));
 
     // 转换meta_indexer_config
     auto meta_indexer_config = std::make_shared<MetaIndexerConfig>();
@@ -283,22 +294,22 @@ void ProtoConvert::CacheConfigFromProto(const proto::admin::CacheConfig *proto_c
 
     cache_config_info.set_meta_indexer_config(meta_indexer_config);
 
-    // 转换migration_strategies
+    // 转换migration_config.strategies
     std::vector<std::shared_ptr<MigrationStrategy>> migration_strategies;
-    migration_strategies.reserve(proto_cache_config->migration_strategies_size());
-    for (const auto &proto_migration_strategy : proto_cache_config->migration_strategies()) {
+    migration_strategies.reserve(proto_migration_config.strategies_size());
+    for (const auto &proto_migration_strategy : proto_migration_config.strategies()) {
         auto migration_strategy = std::make_shared<MigrationStrategy>();
         migration_strategy->set_storage_unique_name(proto_migration_strategy.storage_unique_name());
         migration_strategy->set_target_storage(proto_migration_strategy.target_storage());
         migration_strategy->set_trigger_threshold(proto_migration_strategy.trigger_threshold());
         MigrationMethods methods;
         methods.mutable_copy().set_enabled(proto_migration_strategy.methods().copy().enabled());
-        const auto proto_copy_max_concurrency = proto_migration_strategy.methods().copy().max_concurrency();
-        methods.mutable_copy().set_max_concurrency(proto_copy_max_concurrency > 0
-                                                       ? proto_copy_max_concurrency
-                                                       : MigrationCopyMethod::kDefaultMaxConcurrency);
         methods.mutable_mark().set_enabled(proto_migration_strategy.methods().mark().enabled());
-        methods.mutable_mark().set_mark_timeout_ms(proto_migration_strategy.methods().mark().mark_timeout_ms());
+        if (proto_migration_strategy.methods().mark().has_timeout_ms()) {
+            methods.mutable_mark().set_timeout_ms(proto_migration_strategy.methods().mark().timeout_ms().value());
+        } else {
+            methods.mutable_mark().set_timeout_ms(MigrationMarkMethod::kDefaultTimeoutMs);
+        }
         migration_strategy->set_methods(methods);
         migration_strategy->set_retention(
             static_cast<MigrationRetention>(proto_migration_strategy.retention()));
