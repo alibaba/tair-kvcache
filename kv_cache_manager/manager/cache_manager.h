@@ -31,6 +31,7 @@ class StartupConfigLoader;
 class EventManager;
 class CacheManagerMetricsRecorder;
 struct MetricsLifecycle;
+class MigrationManager;
 constexpr unsigned int DEFAULT_SCHEDULE_PLAN_EXECUTOR_THREAD_COUNT = 2;
 
 class CacheManager {
@@ -171,11 +172,16 @@ public:
     void PauseReclaimer();
     void ResumeReclaimer();
 
+    // 多层存储迁移控制面随 leader 生命周期启停（OnBecomeLeader/OnNoLongerLeader）。
+    void StartMigrationManager();
+    void StopMigrationManager();
+
     std::shared_ptr<MetaIndexerManager> meta_indexer_manager() { return meta_indexer_manager_; }
     std::shared_ptr<SchedulePlanExecutor> schedule_plan_executor() { return schedule_plan_executor_; }
     std::shared_ptr<CacheReclaimer> cache_reclaimer() { return cache_reclaimer_; }
     std::shared_ptr<EventManager> event_manager() { return event_manager_; }
     std::shared_ptr<CacheManagerMetricsRecorder> metrics_recorder() { return metrics_recorder_; }
+    std::shared_ptr<MigrationManager> migration_manager() { return migration_manager_; }
 
     // Set revisit interval histogram configuration for per-instance tracking.
     // Must be called before any MetaIndexer is created.
@@ -190,7 +196,8 @@ private:
                                const std::vector<std::string> &location_spec_group_names,
                                std::vector<std::string_view> &new_location_spec_group_names,
                                BlockMask &block_mask,
-                               int32_t min_replica_count);
+                               int32_t min_replica_count,
+                               std::vector<std::string> &new_keys_tiered_targets);
     ErrorCode FilterWriteCacheWithMinReplica(RequestContext *request_context,
                                              const std::string &instance_id,
                                              MetaSearcher *meta_searcher,
@@ -199,12 +206,25 @@ private:
                                              const std::vector<std::string> &location_spec_group_names,
                                              std::vector<std::string_view> &new_location_spec_group_names,
                                              BlockMask &block_mask,
-                                             int32_t min_replica_count);
+                                             int32_t min_replica_count,
+                                             std::vector<std::string> &new_keys_tiered_targets);
     ErrorCode GenWriteLocation(RequestContext *request_context,
                                const std::string &instance_id,
                                const CacheManager::KeyVector &keys,
                                const std::vector<std::string_view> &location_spec_group_names,
+                               const std::vector<std::string> &tiered_targets,
                                CacheLocationVector &new_locations);
+    // 在指定 storage 上为 keys 分配写 location（GenWriteLocation 的单 storage 分配单元，
+    // 供多层存储 Mark 路径按 block 路由到不同 storage 复用）。out_locations 与 keys 同序追加。
+    ErrorCode GenWriteLocationOnStorage(RequestContext *request_context,
+                                        const std::string &instance_id,
+                                        const CacheManager::KeyVector &keys,
+                                        const std::vector<std::string_view> &location_spec_group_names,
+                                        const std::shared_ptr<const InstanceInfo> &instance_info,
+                                        const std::shared_ptr<DataStorageManager> &data_storage_manager,
+                                        const std::string &storage_name,
+                                        DataStorageType storage_type,
+                                        CacheLocationVector &out_locations);
     ErrorCode CreateInSingleBatch(RequestContext *request_context,
                                   const std::string &instance_id,
                                   const CacheManager::KeyVector &keys,
@@ -300,6 +320,8 @@ private:
     std::shared_ptr<SchedulePlanExecutor> schedule_plan_executor_;
     // 无需清理 - 仅需要暂停
     std::shared_ptr<CacheReclaimer> cache_reclaimer_;
+    // 无需清理 - 随 leader 生命周期 Start/Stop；活跃任务在切主时由 Reclaimer 孤儿检测兜底
+    std::shared_ptr<MigrationManager> migration_manager_;
     // 无需清理 - SchedulePlanExecutor遗留的Plan会继续跑完
     std::unique_ptr<ReclaimerTaskSupervisor> reclaimer_task_supervisor_;
     // 无需清理 - 不包含运行时状态

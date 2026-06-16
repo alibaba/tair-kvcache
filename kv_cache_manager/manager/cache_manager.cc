@@ -4,6 +4,7 @@
 #include <array>
 #include <cassert>
 #include <chrono>
+#include <map>
 #include <set>
 #include <string>
 #include <string_view>
@@ -30,6 +31,7 @@
 #include "kv_cache_manager/manager/data_storage_selector.h"
 #include "kv_cache_manager/manager/hash_util.h"
 #include "kv_cache_manager/manager/meta_searcher_manager.h"
+#include "kv_cache_manager/manager/migration_manager.h"
 #include "kv_cache_manager/manager/reclaimer_task_supervisor.h"
 #include "kv_cache_manager/manager/schedule_plan_executor.h"
 #include "kv_cache_manager/manager/select_location_policy.h"
@@ -124,6 +126,113 @@ IsSpecNameInSpecGroup(const std::string &trace_id,
     return {EC_OK, true};
 }
 
+bool HasServingOrWritingLocOnStorage(const CacheLocationMap &loc_map,
+                                     const std::string &storage_name,
+                                     const std::vector<std::string> &requested_spec_names = {}) {
+    for (const auto &[_, loc_ptr] : loc_map) {
+        if (!loc_ptr || (loc_ptr->status() != CacheLocationStatus::CLS_SERVING &&
+                         loc_ptr->status() != CacheLocationStatus::CLS_WRITING)) {
+            continue;
+        }
+        const auto &loc_specs = loc_ptr->location_specs();
+        if (requested_spec_names.empty()) {
+            for (const auto &spec : loc_specs) {
+                if (const DataStorageUri uri(spec.uri()); uri.Valid() && uri.GetHostName() == storage_name) {
+                    return true;
+                }
+            }
+            continue;
+        }
+        const bool covers_all = std::all_of(
+            requested_spec_names.begin(), requested_spec_names.end(), [&loc_specs, &storage_name](const auto &name) {
+                return std::any_of(loc_specs.begin(), loc_specs.end(), [&name, &storage_name](const auto &spec) {
+                    const DataStorageUri uri(spec.uri());
+                    return spec.name() == name && uri.Valid() && uri.GetHostName() == storage_name;
+                });
+            });
+        if (covers_all) {
+            return true;
+        }
+    }
+    return false;
+}
+
+const CacheLocation *FindLocationById(const CacheLocationMap &loc_map, const std::string &location_id) {
+    auto it = loc_map.find(location_id);
+    if (it == loc_map.end()) {
+        return nullptr;
+    }
+    return it->second.get();
+}
+
+bool LocationHasSpecOnStorage(const CacheLocation &loc, const std::string &storage_name) {
+    return std::any_of(loc.location_specs().begin(), loc.location_specs().end(), [&storage_name](const auto &spec) {
+        const DataStorageUri uri(spec.uri());
+        return uri.Valid() && uri.GetHostName() == storage_name;
+    });
+}
+
+std::vector<std::string> BuildAllLocationSpecNames(const std::shared_ptr<const InstanceInfo> &instance_info) {
+    std::vector<std::string> spec_names;
+    if (instance_info == nullptr) {
+        return spec_names;
+    }
+    spec_names.reserve(instance_info->location_spec_infos().size());
+    for (const auto &spec_info : instance_info->location_spec_infos()) {
+        spec_names.push_back(spec_info.name());
+    }
+    return spec_names;
+}
+
+bool LocationCoversFullBlockOnStorage(const CacheLocation &loc,
+                                      const std::string &storage_name,
+                                      const std::shared_ptr<const InstanceInfo> &instance_info) {
+    if (instance_info == nullptr || instance_info->location_spec_infos().empty()) {
+        return false;
+    }
+    const auto &loc_specs = loc.location_specs();
+    return std::all_of(instance_info->location_spec_infos().begin(),
+                       instance_info->location_spec_infos().end(),
+                       [&loc_specs, &storage_name](const LocationSpecInfo &spec_info) {
+                           return std::any_of(loc_specs.begin(), loc_specs.end(), [&spec_info, &storage_name](const auto &spec) {
+                               const DataStorageUri uri(spec.uri());
+                               return spec.name() == spec_info.name() && uri.Valid() && uri.GetHostName() == storage_name;
+                           });
+                       });
+}
+
+MigrationMarkClearPolicy GetMarkClearPolicyForTarget(RequestContext *request_context,
+                                                     const std::shared_ptr<RegistryManager> &registry_manager,
+                                                     const std::shared_ptr<const InstanceInfo> &instance_info,
+                                                     const std::string &target_storage) {
+    if (registry_manager == nullptr || instance_info == nullptr || target_storage.empty()) {
+        return MigrationMarkClearPolicy::CLEAR_ON_NEXT_WRITE_SUCCESS;
+    }
+    auto [ec, instance_group] =
+        registry_manager->GetInstanceGroup(request_context, instance_info->instance_group_name());
+    if (ec != EC_OK || instance_group == nullptr || instance_group->cache_config() == nullptr) {
+        return MigrationMarkClearPolicy::CLEAR_ON_NEXT_WRITE_SUCCESS;
+    }
+    for (const auto &strategy : instance_group->cache_config()->migration_strategies()) {
+        if (strategy != nullptr && strategy->methods().mark().enabled() && strategy->target_storage() == target_storage) {
+            return strategy->methods().mark().clear_policy();
+        }
+    }
+    return MigrationMarkClearPolicy::CLEAR_ON_NEXT_WRITE_SUCCESS;
+}
+
+bool IsTieredMigrationEnabled(RequestContext *request_context,
+                              const std::shared_ptr<RegistryManager> &registry_manager,
+                              const std::shared_ptr<const InstanceInfo> &instance_info) {
+    if (registry_manager == nullptr || instance_info == nullptr) {
+        return false;
+    }
+    auto [ec, instance_group] =
+        registry_manager->GetInstanceGroup(request_context, instance_info->instance_group_name());
+    return ec == EC_OK && instance_group != nullptr && instance_group->cache_config() != nullptr &&
+           !instance_group->cache_config()->migration_strategies().empty();
+}
+
 } // namespace
 
 CacheManager::CacheManager(std::shared_ptr<MetricsRegistry> metrics_registry,
@@ -171,6 +280,12 @@ bool CacheManager::Init(int32_t schedule_plan_executor_thread_count,
         KVCM_LOG_ERROR("event_manager init failed");
     }
 
+    migration_manager_ = std::make_shared<MigrationManager>(schedule_plan_executor_,
+                                                            meta_indexer_manager_,
+                                                            registry_manager_->data_storage_manager(),
+                                                            metrics_registry_,
+                                                            event_manager_);
+
     cache_reclaimer_ = std::make_shared<CacheReclaimer>(cache_reclaimer_key_sampling_size_total,
                                                         cache_reclaimer_key_sampling_size_per_task,
                                                         cache_reclaimer_del_batch_size,
@@ -183,7 +298,8 @@ bool CacheManager::Init(int32_t schedule_plan_executor_thread_count,
                                                         metrics_registry_,
                                                         event_manager_,
                                                         write_location_manager_,
-                                                        std::move(cache_reclaimer_async_delete_config));
+                                                        std::move(cache_reclaimer_async_delete_config),
+                                                        migration_manager_);
     if (cache_reclaimer_->Start() != EC_OK) {
         KVCM_LOG_ERROR("CacheManager init failed");
         return false;
@@ -646,6 +762,7 @@ CacheManager::StartWriteCache(RequestContext *request_context,
     BlockMask block_mask;
     KeyVector new_keys;
     std::vector<std::string_view> new_location_spec_group_names;
+    std::vector<std::string> new_keys_tiered_targets;
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, ManagerFilterWriteCache);
     KeyVector query_keys = keys;
 
@@ -660,7 +777,8 @@ CacheManager::StartWriteCache(RequestContext *request_context,
                                      location_spec_group_names,
                                      new_location_spec_group_names,
                                      block_mask,
-                                     min_replica_count);
+                                     min_replica_count,
+                                     new_keys_tiered_targets);
     } else {
         auto [ec_temp, block_size] = GetBlockSize(request_context, instance_id);
         RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec_temp, StartWriteCacheInfo, "start write cache failed");
@@ -675,7 +793,8 @@ CacheManager::StartWriteCache(RequestContext *request_context,
                                      location_spec_group_names,
                                      new_location_spec_group_names,
                                      block_mask,
-                                     min_replica_count);
+                                     min_replica_count,
+                                     new_keys_tiered_targets);
     }
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, ManagerFilterWriteCache);
     RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, filter_ec, StartWriteCacheInfo, "filter write cache failed");
@@ -688,7 +807,8 @@ CacheManager::StartWriteCache(RequestContext *request_context,
     } else {
         RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, StartWriteCacheInfo, "start write cache failed");
         KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, GenWriteLocation);
-        ec = GenWriteLocation(request_context, instance_id, new_keys, new_location_spec_group_names, new_locations);
+        ec = GenWriteLocation(
+            request_context, instance_id, new_keys, new_location_spec_group_names, new_keys_tiered_targets, new_locations);
         KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, GenWriteLocation);
         RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, StartWriteCacheInfo, "start write cache failed");
         KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, ManagerBatchAddLocation);
@@ -758,6 +878,7 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
         RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_INSTANCE_NOT_EXIST, "finish write cache failed: meta searcher not found");
     }
     std::vector<KeyType> success_batch_keys;
+    std::vector<std::string> success_batch_location_ids;
     std::vector<std::vector<MetaSearcher::LocationUpdateTask>> success_batch_update_tasks;
     CacheLocationDelRequest failed_del_request{.instance_id = instance_id, .delay = std::chrono::seconds(0)};
 
@@ -765,6 +886,7 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
         if (IsIndexInMaskRange(success_block_mask, block_key_idx)) {
             // success
             success_batch_keys.push_back(location_info.keys[block_key_idx]);
+            success_batch_location_ids.push_back(location_info.location_ids[block_key_idx]);
             success_batch_update_tasks.push_back(
                 {{location_info.location_ids[block_key_idx], CacheLocationStatus::CLS_SERVING}});
         } else {
@@ -778,8 +900,8 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
     KVCM_METRICS_COLLECTOR_SET_METRICS(
         service_metrics_collector, manager, request_key_count, success_batch_keys.size());
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, ManagerBatchUpdateLocation);
+    std::vector<std::vector<ErrorCode>> out_batch_results;
     if (!success_batch_keys.empty()) {
-        std::vector<std::vector<ErrorCode>> out_batch_results;
         ec = meta_searcher->BatchUpdateLocationStatus(
             request_context, success_batch_keys, success_batch_update_tasks, out_batch_results);
         if (ec != EC_OK) {
@@ -788,6 +910,54 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
         }
     }
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, ManagerBatchUpdateLocation);
+
+    // 多层存储 Mark 消费完成：仅当本次 target location 成功 SERVING 后，按配置策略清标。
+    if (migration_manager_ != nullptr && !success_batch_keys.empty()) {
+        KeyVector mark_candidate_keys;
+        std::vector<std::string> mark_candidate_location_ids;
+        for (size_t i = 0; i < success_batch_keys.size(); ++i) {
+            if (i >= out_batch_results.size() || out_batch_results[i].empty() ||
+                out_batch_results[i][0] != ErrorCode::EC_OK) {
+                continue;
+            }
+            mark_candidate_keys.push_back(success_batch_keys[i]);
+            mark_candidate_location_ids.push_back(success_batch_location_ids[i]);
+        }
+        if (!mark_candidate_keys.empty()) {
+            std::vector<std::string> tiered_targets;
+            migration_manager_->BatchGetTieredWriteTargets(instance_id, mark_candidate_keys, tiered_targets);
+            std::vector<CacheLocationMap> loc_maps;
+            static const BlockMask empty_block_mask = static_cast<size_t>(0);
+            const auto get_loc_ec =
+                meta_searcher->BatchGetLocation(request_context, mark_candidate_keys, empty_block_mask, loc_maps);
+            auto instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
+            if (get_loc_ec == EC_OK && loc_maps.size() == mark_candidate_keys.size()) {
+                for (size_t i = 0; i < mark_candidate_keys.size(); ++i) {
+                    if (i >= tiered_targets.size() || tiered_targets[i].empty()) {
+                        continue;
+                    }
+                    const auto *loc = FindLocationById(loc_maps[i], mark_candidate_location_ids[i]);
+                    if (loc == nullptr || loc->status() != CacheLocationStatus::CLS_SERVING ||
+                        !LocationHasSpecOnStorage(*loc, tiered_targets[i])) {
+                        continue;
+                    }
+                    const auto clear_policy =
+                        GetMarkClearPolicyForTarget(request_context, registry_manager_, instance_info, tiered_targets[i]);
+                    if (clear_policy == MigrationMarkClearPolicy::CLEAR_ON_NEXT_WRITE_SUCCESS ||
+                        (clear_policy == MigrationMarkClearPolicy::CLEAR_ON_FULL_BLOCK_COVERED &&
+                         LocationCoversFullBlockOnStorage(*loc, tiered_targets[i], instance_info))) {
+                        migration_manager_->ClearTieredWriteMark(instance_id, mark_candidate_keys[i]);
+                    }
+                }
+            } else {
+                PREFIX_LOG(WARN,
+                           "skip tiered mark clear because reloading finished locations failed, ec %d, got %zu, want %zu",
+                           get_loc_ec,
+                           loc_maps.size(),
+                           mark_candidate_keys.size());
+            }
+        }
+    }
 
     if (!failed_del_request.block_keys.empty()) {
         reclaimer_task_supervisor_->Submit(request_context->trace_id(), std::move(failed_del_request));
@@ -869,6 +1039,17 @@ ErrorCode CacheManager::TrimCache(RequestContext *request_context,
 void CacheManager::PauseReclaimer() { cache_reclaimer_->Pause(); }
 void CacheManager::ResumeReclaimer() { cache_reclaimer_->Resume(); }
 
+void CacheManager::StartMigrationManager() {
+    if (migration_manager_) {
+        migration_manager_->Start();
+    }
+}
+void CacheManager::StopMigrationManager() {
+    if (migration_manager_) {
+        migration_manager_->Stop();
+    }
+}
+
 void CacheManager::FilterLocationSpecByName(CacheLocationVector &locations,
                                             const std::vector<std::string> &location_spec_names) {
     if (location_spec_names.empty()) {
@@ -936,7 +1117,8 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
                                          const std::vector<std::string> &location_spec_group_names,
                                          std::vector<std::string_view> &new_location_spec_group_names,
                                          BlockMask &block_mask,
-                                         int32_t min_replica_count) {
+                                         int32_t min_replica_count,
+                                         std::vector<std::string> &new_keys_tiered_targets) {
     if (min_replica_count > 1) {
         return FilterWriteCacheWithMinReplica(request_context,
                                               instance_id,
@@ -946,7 +1128,8 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
                                               location_spec_group_names,
                                               new_location_spec_group_names,
                                               block_mask,
-                                              min_replica_count);
+                                              min_replica_count,
+                                              new_keys_tiered_targets);
     }
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
@@ -965,19 +1148,21 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
     KeyVector prune_keys;
     std::vector<std::vector<std::string>> prune_loc_ids_vec;
 
-    // Resolve instance_info for spec-group-aware filtering.
+    // Resolve instance_info for spec-group-aware filtering and full-block tiered target checks.
     // When location_spec_group_names is provided, we check per-spec-group
     // coverage instead of block-level existence, allowing complementary
     // locations (e.g. KV-only and Mamba-only) to coexist in the same block.
     std::shared_ptr<const InstanceInfo> instance_info;
-    if (!location_spec_group_names.empty()) {
+    if (!location_spec_group_names.empty() || migration_manager_ != nullptr) {
         instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
     }
+    const bool tiered_migration_enabled =
+        migration_manager_ != nullptr && IsTieredMigrationEnabled(request_context, registry_manager_, instance_info);
+    const std::vector<std::string> all_spec_names = BuildAllLocationSpecNames(instance_info);
 
-    auto existsForWrite =
-        [&](size_t i, const CacheLocationMap &m, std::vector<std::string> &out_prune_loc_ids) -> bool {
+    auto requestedSpecNames = [&](size_t i) -> const std::vector<std::string> * {
         if (!instance_info || i >= location_spec_group_names.size() || location_spec_group_names[i].empty()) {
-            return policy->ExistsForWrite(m, check_loc_data_exist, out_prune_loc_ids);
+            return nullptr;
         }
         const auto &groups = instance_info->location_spec_groups();
         auto it =
@@ -986,19 +1171,44 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
                              location_spec_group_names[i],
                              [](const LocationSpecGroup &g, const std::string_view &name) { return g.name() < name; });
         if (it == groups.end() || it->name() != location_spec_group_names[i]) {
+            return nullptr;
+        }
+        return &it->spec_names();
+    };
+    auto existsForWrite =
+        [&](size_t i, const CacheLocationMap &m, std::vector<std::string> &out_prune_loc_ids) -> bool {
+        const auto *spec_names = requestedSpecNames(i);
+        if (spec_names == nullptr) {
             return policy->ExistsForWrite(m, check_loc_data_exist, out_prune_loc_ids);
         }
-        return policy->ExistsForWrite(m, it->spec_names(), check_loc_data_exist, out_prune_loc_ids);
+        return policy->ExistsForWrite(m, *spec_names, check_loc_data_exist, out_prune_loc_ids);
     };
 
     // Single pass: compute exists status for all blocks.
     std::vector<bool> exists_flags(location_maps.size());
+    // 多层存储 Mark 消费：批量预取各 block 的冷层目标（一次元数据读，避免逐块往返）。
+    // 命中（target 非空）时仅在目标冷 storage 尚无 SERVING/WRITING 副本时纳入待写集合，
+    // 并记录其目标冷 storage，由 GenWriteLocation 按 block 路由到冷层。
+    std::vector<std::string> tiered_target_per_key(location_maps.size());
+    if (tiered_migration_enabled) {
+        migration_manager_->BatchGetTieredWriteTargets(instance_id, keys, tiered_target_per_key);
+    }
     for (size_t i = 0; i < location_maps.size(); ++i) {
         std::vector<std::string> prune_loc_ids;
         exists_flags[i] = existsForWrite(i, location_maps[i], prune_loc_ids);
         if (!prune_loc_ids.empty()) {
             prune_keys.emplace_back(keys[i]);
             prune_loc_ids_vec.emplace_back(prune_loc_ids);
+        }
+        if (!tiered_target_per_key[i].empty()) {
+            const auto *spec_names = requestedSpecNames(i);
+            if (spec_names == nullptr && !all_spec_names.empty()) {
+                spec_names = &all_spec_names;
+            }
+            exists_flags[i] =
+                spec_names == nullptr
+                    ? HasServingOrWritingLocOnStorage(location_maps[i], tiered_target_per_key[i])
+                    : HasServingOrWritingLocOnStorage(location_maps[i], tiered_target_per_key[i], *spec_names);
         }
     }
     if (!prune_keys.empty() && submit_del_req) {
@@ -1022,6 +1232,8 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
     if (only_prefix_not_empty) {
         block_mask = static_cast<BlockMaskOffset>(first_empty_idx);
         new_keys.insert(new_keys.end(), keys.begin() + first_empty_idx, keys.end());
+        new_keys_tiered_targets.insert(
+            new_keys_tiered_targets.end(), tiered_target_per_key.begin() + first_empty_idx, tiered_target_per_key.end());
         if (!location_spec_group_names.empty()) {
             new_location_spec_group_names.insert(new_location_spec_group_names.end(),
                                                  location_spec_group_names.begin() + first_empty_idx,
@@ -1035,6 +1247,7 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
             std::get<BlockMaskVector>(block_mask)[i] = true;
         } else {
             new_keys.push_back(keys[i]);
+            new_keys_tiered_targets.push_back(tiered_target_per_key[i]);
             if (!location_spec_group_names.empty()) {
                 new_location_spec_group_names.push_back(location_spec_group_names[i]);
             }
@@ -1051,7 +1264,8 @@ ErrorCode CacheManager::FilterWriteCacheWithMinReplica(RequestContext *request_c
                                                        const std::vector<std::string> &location_spec_group_names,
                                                        std::vector<std::string_view> &new_location_spec_group_names,
                                                        BlockMask &block_mask,
-                                                       int32_t min_replica_count) {
+                                                       int32_t min_replica_count,
+                                                       std::vector<std::string> &new_keys_tiered_targets) {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
     static const BlockMask empty_block_mask = static_cast<size_t>(0);
@@ -1071,9 +1285,12 @@ ErrorCode CacheManager::FilterWriteCacheWithMinReplica(RequestContext *request_c
     std::vector<std::vector<std::string>> prune_loc_ids_vec;
 
     std::shared_ptr<const InstanceInfo> instance_info;
-    if (!location_spec_group_names.empty()) {
+    if (!location_spec_group_names.empty() || migration_manager_ != nullptr) {
         instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
     }
+    const bool tiered_migration_enabled =
+        migration_manager_ != nullptr && IsTieredMigrationEnabled(request_context, registry_manager_, instance_info);
+    const std::vector<std::string> all_spec_names = BuildAllLocationSpecNames(instance_info);
 
     static const std::vector<std::string> empty_spec_names;
     auto existsForWrite =
@@ -1098,12 +1315,42 @@ ErrorCode CacheManager::FilterWriteCacheWithMinReplica(RequestContext *request_c
     };
 
     std::vector<bool> exists_flags(location_maps.size());
+    std::vector<std::string> tiered_target_per_key(location_maps.size());
+    std::vector<std::string> tiered_target_to_write(location_maps.size());
+    if (tiered_migration_enabled) {
+        migration_manager_->BatchGetTieredWriteTargets(instance_id, keys, tiered_target_per_key);
+    }
     for (size_t i = 0; i < location_maps.size(); ++i) {
         std::vector<std::string> prune_loc_ids;
         exists_flags[i] = existsForWrite(i, location_maps[i], prune_loc_ids);
         if (!prune_loc_ids.empty()) {
             prune_keys.emplace_back(keys[i]);
             prune_loc_ids_vec.emplace_back(std::move(prune_loc_ids));
+        }
+        if (!tiered_target_per_key[i].empty()) {
+            const std::vector<std::string> *spec_names = &empty_spec_names;
+            if (instance_info && i < location_spec_group_names.size() && !location_spec_group_names[i].empty()) {
+                const auto &groups = instance_info->location_spec_groups();
+                auto it = std::lower_bound(
+                    groups.begin(),
+                    groups.end(),
+                    location_spec_group_names[i],
+                    [](const LocationSpecGroup &g, const std::string_view &name) { return g.name() < name; });
+                if (it != groups.end() && it->name() == location_spec_group_names[i]) {
+                    spec_names = &it->spec_names();
+                }
+            }
+            if (spec_names->empty() && !all_spec_names.empty()) {
+                spec_names = &all_spec_names;
+            }
+            const bool target_satisfied =
+                spec_names->empty()
+                    ? HasServingOrWritingLocOnStorage(location_maps[i], tiered_target_per_key[i])
+                    : HasServingOrWritingLocOnStorage(location_maps[i], tiered_target_per_key[i], *spec_names);
+            if (!target_satisfied) {
+                exists_flags[i] = false;
+                tiered_target_to_write[i] = tiered_target_per_key[i];
+            }
         }
     }
     if (!prune_keys.empty() && submit_del_req) {
@@ -1125,6 +1372,9 @@ ErrorCode CacheManager::FilterWriteCacheWithMinReplica(RequestContext *request_c
     if (only_prefix_not_empty) {
         block_mask = static_cast<BlockMaskOffset>(first_empty_idx);
         new_keys.insert(new_keys.end(), keys.begin() + first_empty_idx, keys.end());
+        new_keys_tiered_targets.insert(new_keys_tiered_targets.end(),
+                                       tiered_target_to_write.begin() + first_empty_idx,
+                                       tiered_target_to_write.end());
         if (!location_spec_group_names.empty()) {
             new_location_spec_group_names.insert(new_location_spec_group_names.end(),
                                                  location_spec_group_names.begin() + first_empty_idx,
@@ -1138,6 +1388,7 @@ ErrorCode CacheManager::FilterWriteCacheWithMinReplica(RequestContext *request_c
             std::get<BlockMaskVector>(block_mask)[i] = true;
         } else {
             new_keys.push_back(keys[i]);
+            new_keys_tiered_targets.push_back(tiered_target_to_write[i]);
             if (!location_spec_group_names.empty()) {
                 new_location_spec_group_names.push_back(location_spec_group_names[i]);
             }
@@ -1295,35 +1546,21 @@ ErrorCode CacheManager::CreateBySpec(RequestContext *request_context,
     return EC_OK;
 }
 
-ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
-                                         const std::string &instance_id,
-                                         const CacheManager::KeyVector &keys,
-                                         const std::vector<std::string_view> &location_spec_group_names,
-                                         CacheLocationVector &new_locations) {
+ErrorCode CacheManager::GenWriteLocationOnStorage(RequestContext *request_context,
+                                                  const std::string &instance_id,
+                                                  const CacheManager::KeyVector &keys,
+                                                  const std::vector<std::string_view> &location_spec_group_names,
+                                                  const std::shared_ptr<const InstanceInfo> &instance_info,
+                                                  const std::shared_ptr<DataStorageManager> &data_storage_manager,
+                                                  const std::string &storage_name,
+                                                  DataStorageType storage_type,
+                                                  CacheLocationVector &out_locations) {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
 
     if (keys.empty()) {
-        PREFIX_LOG(INFO, "new keys empty, no need to generate write location");
         return EC_OK;
     }
-
-    auto data_storage_manager = registry_manager_->data_storage_manager();
-    if (data_storage_manager == nullptr) {
-        request_context->error_tracer()->AddErrorMsg("data storage manager not found");
-        RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_ERROR, "data storage manager not found");
-    }
-
-    auto instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
-    if (instance_info == nullptr) {
-        request_context->error_tracer()->AddErrorMsg("instance not found");
-        RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_INSTANCE_NOT_EXIST, "instance not found");
-    }
-
-    // select storage type and unique name
-    const auto select_result = data_storage_selector_->SelectCacheWriteDataStorageBackend(
-        request_context, instance_info->instance_group_name());
-    RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, select_result.ec, "select storage backend failed");
 
     std::vector<DataStorageUri> allocated_uris;
     allocated_uris.reserve(instance_info->location_spec_infos().size() * keys.size());
@@ -1347,7 +1584,7 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
                                       location_spec_group_names,
                                       instance_info,
                                       data_storage_manager,
-                                      select_result.name,
+                                      storage_name,
                                       allocated_uris,
                                       key_to_uris,
                                       is_create_success,
@@ -1360,7 +1597,7 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
                                location_spec_group_names,
                                instance_info,
                                data_storage_manager,
-                               select_result.name,
+                               storage_name,
                                allocated_uris,
                                key_to_uris,
                                is_create_success);
@@ -1370,7 +1607,7 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
     if (!is_create_success) {
         request_context->error_tracer()->AddErrorMsg("some internal error when GenWriteLocation");
         auto error_codes = data_storage_manager->Delete(
-            request_context, select_result.name, allocated_uris, []() { /* do nothing */ });
+            request_context, storage_name, allocated_uris, []() { /* do nothing */ });
         for (size_t i = 0; i < error_codes.size(); i++) {
             if (i >= allocated_uris.size()) {
                 PREFIX_LOG(WARN,
@@ -1382,7 +1619,7 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
             if (error_codes[i] != ErrorCode::EC_OK) {
                 PREFIX_LOG(WARN,
                            "delete data uri failed, storage unique name: %s, uri: %s",
-                           select_result.name.c_str(),
+                           storage_name.c_str(),
                            allocated_uris[i].ToUriString().c_str());
             }
         }
@@ -1391,7 +1628,7 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
 
     for (const auto &uris : key_to_uris) {
         auto cache_location = std::make_shared<CacheLocation>();
-        cache_location->set_type(select_result.type);
+        cache_location->set_type(storage_type);
         for (const auto &[data_storage_uri_idx, location_spec_info] : uris) {
             LocationSpec location_spec;
             location_spec.set_name(location_spec_info->name());
@@ -1399,7 +1636,150 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
             cache_location->push_location_spec(std::move(location_spec));
         }
         cache_location->set_spec_size(uris.size());
-        new_locations.push_back(std::move(cache_location));
+        out_locations.push_back(std::move(cache_location));
+    }
+    return EC_OK;
+}
+
+ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
+                                         const std::string &instance_id,
+                                         const CacheManager::KeyVector &keys,
+                                         const std::vector<std::string_view> &location_spec_group_names,
+                                         const std::vector<std::string> &tiered_targets,
+                                         CacheLocationVector &new_locations) {
+    SPAN_TRACER(request_context);
+    const std::string &trace_id = request_context->trace_id();
+
+    if (keys.empty()) {
+        PREFIX_LOG(INFO, "new keys empty, no need to generate write location");
+        return EC_OK;
+    }
+
+    auto data_storage_manager = registry_manager_->data_storage_manager();
+    if (data_storage_manager == nullptr) {
+        request_context->error_tracer()->AddErrorMsg("data storage manager not found");
+        RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_ERROR, "data storage manager not found");
+    }
+
+    auto instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
+    if (instance_info == nullptr) {
+        request_context->error_tracer()->AddErrorMsg("instance not found");
+        RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_INSTANCE_NOT_EXIST, "instance not found");
+    }
+
+    // 按目标 storage 对 keys 分组：Mark 命中且目标 storage 存在 -> 路由到冷层；其余 -> 默认 storage。
+    // 默认 storage 只在确实有普通写入或 tiered target fallback 时选择，避免全量 marked write 被 hot 层选择失败阻断。
+    const bool has_tiered = tiered_targets.size() == keys.size();
+    std::map<std::string, std::vector<size_t>> indices_by_storage;
+    std::map<std::string, DataStorageType> type_by_storage;
+    std::vector<size_t> default_indices;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (has_tiered && !tiered_targets[i].empty()) {
+            const auto backend = data_storage_manager->GetDataStorageBackend(tiered_targets[i]);
+            if (backend != nullptr) {
+                indices_by_storage[tiered_targets[i]].push_back(i);
+                type_by_storage[tiered_targets[i]] = backend->GetType();
+                continue;
+            } else {
+                PREFIX_LOG(WARN,
+                           "tiered target storage [%s] not found, fallback to default storage",
+                           tiered_targets[i].c_str());
+            }
+        }
+        default_indices.push_back(i);
+    }
+    if (!default_indices.empty()) {
+        const auto select_result = data_storage_selector_->SelectCacheWriteDataStorageBackend(
+            request_context, instance_info->instance_group_name());
+        RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, select_result.ec, "select storage backend failed");
+        for (const auto idx : default_indices) {
+            indices_by_storage[select_result.name].push_back(idx);
+        }
+        type_by_storage[select_result.name] = select_result.type;
+    }
+
+    // 输出与 keys 同序对齐（CacheLocationVector 为 shared_ptr 向量，先填空）
+    new_locations.resize(keys.size());
+    auto collect_location_uris = [&](const CacheLocationVector &locations,
+                                     std::map<std::string, std::vector<DataStorageUri>> &uris_by_storage) {
+        for (const auto &location : locations) {
+            if (location == nullptr) {
+                continue;
+            }
+            for (const auto &location_spec : location->location_specs()) {
+                DataStorageUri uri(location_spec.uri());
+                if (!uri.Valid() || uri.GetHostName().empty()) {
+                    PREFIX_LOG(WARN, "skip rollback invalid generated uri: %s", location_spec.uri().c_str());
+                    continue;
+                }
+                uris_by_storage[uri.GetHostName()].push_back(std::move(uri));
+            }
+        }
+    };
+    auto rollback_generated_locations = [&](const CacheLocationVector *extra_locations = nullptr) {
+        std::map<std::string, std::vector<DataStorageUri>> uris_by_storage;
+        collect_location_uris(new_locations, uris_by_storage);
+        if (extra_locations != nullptr) {
+            collect_location_uris(*extra_locations, uris_by_storage);
+        }
+        for (const auto &[storage_name, uris] : uris_by_storage) {
+            const auto results = data_storage_manager->Delete(
+                request_context, storage_name, uris, []() { /* do nothing */ });
+            if (results.size() != uris.size()) {
+                PREFIX_LOG(WARN,
+                           "rollback generated locations on storage %s returned %zu results, request size %zu",
+                           storage_name.c_str(),
+                           results.size(),
+                           uris.size());
+            }
+            for (const auto ec : results) {
+                if (ec != EC_OK) {
+                    PREFIX_LOG(WARN, "rollback generated location on storage %s failed, ec %d", storage_name.c_str(), ec);
+                }
+            }
+        }
+        new_locations.clear();
+    };
+    const bool has_sgn = !location_spec_group_names.empty();
+    for (const auto &[storage_name, indices] : indices_by_storage) {
+        KeyVector sub_keys;
+        std::vector<std::string_view> sub_sgn;
+        sub_keys.reserve(indices.size());
+        if (has_sgn) {
+            sub_sgn.reserve(indices.size());
+        }
+        for (size_t idx : indices) {
+            sub_keys.push_back(keys[idx]);
+            if (has_sgn) {
+                sub_sgn.push_back(location_spec_group_names[idx]);
+            }
+        }
+        CacheLocationVector sub_locations;
+        auto ec = GenWriteLocationOnStorage(request_context,
+                                            instance_id,
+                                            sub_keys,
+                                            sub_sgn,
+                                            instance_info,
+                                            data_storage_manager,
+                                            storage_name,
+                                            type_by_storage[storage_name],
+                                            sub_locations);
+        if (ec != EC_OK) {
+            rollback_generated_locations(&sub_locations);
+            RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "GenWriteLocationOnStorage failed");
+        }
+        if (sub_locations.size() != indices.size()) {
+            PREFIX_LOG(WARN,
+                       "sub_locations size %zu != indices size %zu for storage %s",
+                       sub_locations.size(),
+                       indices.size(),
+                       storage_name.c_str());
+            rollback_generated_locations(&sub_locations);
+            return EC_ERROR;
+        }
+        for (size_t j = 0; j < indices.size(); ++j) {
+            new_locations[indices[j]] = std::move(sub_locations[j]);
+        }
     }
     return EC_OK;
 }
