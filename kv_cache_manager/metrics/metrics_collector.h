@@ -335,6 +335,9 @@ class DataStorageMetricsCollector final : public MetricsCollector {
 
     KVCM_CHRONO_METRICS(data_storage, create_time_us, DataStorageCreate)
 
+    KVCM_GAUGE_METRICS(data_storage, copy_keys_qps)
+    KVCM_CHRONO_METRICS(data_storage, copy_time_us, DataStorageCopy)
+
 public:
     DataStorageMetricsCollector() = delete;
     explicit DataStorageMetricsCollector(std::shared_ptr<MetricsRegistry> metrics_registry) noexcept;

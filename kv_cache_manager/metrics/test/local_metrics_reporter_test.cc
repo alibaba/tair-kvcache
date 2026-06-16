@@ -110,16 +110,17 @@ TEST_F(LocalMetricsReporterTest, TestReportPerQuery00) {
 }
 
 TEST_F(LocalMetricsReporterTest, TestReportPerQuery01) {
+    constexpr int kDataStorageMetricsCount = 9;
     EXPECT_EQ(3, metrics_registry_->GetSize());
 
     DataStorageMetricsCollector collector(metrics_registry_);
     collector.Init();
 
-    EXPECT_EQ(7, metrics_registry_->GetSize());
+    EXPECT_EQ(kDataStorageMetricsCount, metrics_registry_->GetSize());
 
     {
         reporter_->ReportPerQuery(&collector);
-        EXPECT_EQ(7, metrics_registry_->GetSize());
+        EXPECT_EQ(kDataStorageMetricsCount, metrics_registry_->GetSize());
 
         std::uint64_t v;
         GET_METRICS_(&collector, data_storage, create_counter, v);
@@ -135,7 +136,7 @@ TEST_F(LocalMetricsReporterTest, TestReportPerQuery01) {
         g = 6.0;
 
         reporter_->ReportPerQuery(&collector);
-        EXPECT_EQ(7, metrics_registry_->GetSize());
+        EXPECT_EQ(kDataStorageMetricsCount, metrics_registry_->GetSize());
 
         std::uint64_t v;
         GET_METRICS_(&collector, data_storage, create_counter, v);
@@ -151,7 +152,7 @@ TEST_F(LocalMetricsReporterTest, TestReportPerQuery01) {
         g = 2.0;
 
         reporter_->ReportPerQuery(&collector);
-        EXPECT_EQ(7, metrics_registry_->GetSize());
+        EXPECT_EQ(kDataStorageMetricsCount, metrics_registry_->GetSize());
 
         std::uint64_t v;
         GET_METRICS_(&collector, data_storage, create_counter, v);
