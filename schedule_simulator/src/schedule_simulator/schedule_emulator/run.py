@@ -64,6 +64,7 @@ class BenchmarkRunner:
             request_queue=request_queue,
             response_queue=response_queue,
             use_real_token_ids=use_real_token,
+            page_size=scheduler_config.page_size,
         )
 
         self.scheduler_emulator = SGLangScheduleEmulator(
@@ -128,6 +129,7 @@ class BenchmarkRunner:
             response_queue=new_response_queue,
             use_real_token_ids=self.use_real_token,
             kvcm_block_size=self.kvcm_block_size,
+            page_size=self.scheduler_emulator.scheduler_config.page_size,
         )
         if reset_scheduler:
             self.scheduler_emulator.reset()
@@ -326,6 +328,7 @@ class DisaggBenchmarkRunner:
             request_queue=gateway_request_queue,
             response_queue=gateway_response_queue,
             use_real_token_ids=use_real_token,
+            page_size=p_scheduler_config.page_size,
         )
 
         self.p_schedulers = [

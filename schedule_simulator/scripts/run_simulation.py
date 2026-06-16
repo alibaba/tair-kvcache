@@ -50,6 +50,8 @@ def main():
     p.add_argument("--ms-per-token", type=float, default=None)
     p.add_argument("--enable-hierarchical", action="store_true")
     p.add_argument("--page-size", type=int, default=None, help="Page/block size for cache (default: 1)")
+    p.add_argument("--data-block-size", type=int, default=None,
+                   help="Block size in dataset block_ids (e.g., 256). If different from --page-size, block_ids are converted.")
     p.add_argument("--enable-p2p", action="store_true", default=True)
     p.add_argument("--no-p2p", action="store_true")
     p.add_argument("--write-policy", type=str, default="write_through")
@@ -72,6 +74,7 @@ def main():
         min_output_length=args.min_output if not args.dataset else None,
         max_output_length=args.max_output if not args.dataset else None,
         request_rate=args.request_rate, disable_tqdm=args.quiet,
+        data_block_size=args.data_block_size,
     )
     sc = SchedulerConfig(
         model=args.model,

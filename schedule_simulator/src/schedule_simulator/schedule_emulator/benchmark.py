@@ -11,6 +11,7 @@ from schedule_simulator.schedule_emulator.types import (
 )
 from schedule_simulator.schedule_emulator.utils import calc_metrics
 from schedule_simulator.dataset import MultiTurnConversationDataset
+from schedule_simulator.schedule_emulator.block_id_converter import convert_block_ids
 
 
 class BenchmarkEmulator:
@@ -21,12 +22,14 @@ class BenchmarkEmulator:
         response_queue: asyncio.Queue,
         use_real_token_ids: bool = False,
         kvcm_block_size: Optional[int] = None,
+        page_size: Optional[int] = None,
     ):
         self.config = config
         self.request_queue = request_queue
         self.response_queue = response_queue
         self.use_real_token_ids = use_real_token_ids
         self.kvcm_block_size = kvcm_block_size
+        self.page_size = page_size
         self.response_lock = asyncio.Lock()
         self.global_clock = 0
         self.pending_requests: dict[
@@ -51,6 +54,16 @@ class BenchmarkEmulator:
             async with self.response_lock:
                 if req.id in self.pending_requests:
                     del self.pending_requests[req.id]
+
+    def _maybe_convert_block_ids(self, block_ids):
+        """Convert block_ids if data_block_size differs from page_size."""
+        if block_ids is None:
+            return None
+        data_bs = self.config.data_block_size
+        target_bs = self.page_size
+        if data_bs is None or target_bs is None or data_bs == target_bs:
+            return block_ids
+        return convert_block_ids(block_ids, data_bs, target_bs)
 
     async def get_request(self) -> AsyncGenerator[FakeRequest, None]:
         if self.config.dataset_path is not None and os.path.exists(
@@ -184,7 +197,9 @@ class BenchmarkEmulator:
                         disk_cache_hit_length=int(
                             req.get("disk_cache_hit_length", 0)
                         ),
-                        origin_input_ids=req.get("block_ids"),
+                        origin_input_ids=self._maybe_convert_block_ids(
+                            req.get("block_ids")
+                        ),
                     )
                     if req.get("instance_id"):
                         new_req.extra_key = req["instance_id"]

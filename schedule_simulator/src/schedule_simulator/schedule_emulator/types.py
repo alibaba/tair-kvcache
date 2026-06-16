@@ -30,6 +30,7 @@ class BenchmarkConfig:
     max_prefix_host_hit_rate: Optional[float] = None
     disable_tqdm: bool = False
     num_instances: int = 1  # The number of server instance.
+    data_block_size: Optional[int] = None  # Block size (tokens/block) used in dataset block_ids
 
     # Control the timestamp parameter when sending requests to the LLM server from the benchmark client.
     with_queue_start: bool = False
