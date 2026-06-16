@@ -49,7 +49,8 @@ public:
     const std::string &GetRevisitIntervalBuckets() const { return revisit_interval_buckets_; }
 
     // Parse revisit_interval_buckets config string into sorted vector of doubles.
-    // Returns default boundaries if config is empty or invalid.
+    // Returns empty vector if config is empty or invalid. Caller is responsible
+    // for applying default boundaries when the result is empty.
     static std::vector<double> ParseRevisitIntervalBuckets(const std::string &buckets_str);
 
 private:

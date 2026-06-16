@@ -31,7 +31,8 @@ bool RevisitIntervalHistogram::Init(std::shared_ptr<MetricsRegistry> registry,
     bucket_counters_.resize(boundaries_.size() + 1);
     for (size_t i = 0; i < boundaries_.size(); ++i) {
         MetricsTags bucket_tags = tags;
-        // Format le label: integers without decimals, non-integers as-is
+        // Format "le" (less-or-equal) label — standard Prometheus histogram bucket tag.
+        // Integers without decimals, non-integers as-is.
         double b = boundaries_[i];
         bucket_tags["le"] = (b == std::floor(b)) ? std::to_string(static_cast<int64_t>(b)) : std::to_string(b);
         bucket_counters_[i] = registry->GetCounter("revisit_interval_seconds_bucket", bucket_tags);
