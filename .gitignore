@@ -16,3 +16,9 @@ __pycache__/
 !.aoneci
 compile_commands.json
 stub_source
+# schedule_simulator
+schedule_simulator/tests/assets/glm5_sample/glm5_optimizer_trace.jsonl
+schedule_simulator/tests/assets/glm5_enriched_large.jsonl
+*.pyc
+.coverage
+htmlcov/

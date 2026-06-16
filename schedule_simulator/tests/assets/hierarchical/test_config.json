@@ -1,0 +1,91 @@
+{
+  "trace_file_path": "/tmp/hierarchical_test_trace.jsonl",
+  "output_result_path": "/tmp/hierarchical_test_output",
+  "infer_scheduling_strategy": "preserve_trace",
+  "infer_active_windows_from_trace": false,
+  "enable_lifecycle_tracking": false,
+  "infer_eviction_params": {
+    "eviction_mode": 3,
+    "eviction_batch_size_per_instance": 100
+  },
+  "infer_clusters": [
+    {
+      "storage_pool_id": "pool_1",
+      "engine_read_query_type": "batch_get",
+      "model": {
+        "block_size": 1,
+        "bytes_per_token": 1,
+        "eviction_policy_type": "lru",
+        "eviction_policy_params": {
+          "sample_rate": 1.0
+        }
+      },
+      "infer_ids": [
+        "engine_0",
+        "engine_1"
+      ],
+      "ttl_config": {
+        "default_block_ttl_seconds": 0,
+        "refresh_on_read": true
+      },
+      "tiers": [
+        {
+          "name": "hbm",
+          "capacity": 0.25
+        },
+        {
+          "name": "dram",
+          "capacity": 0.5
+        }
+      ],
+      "tier_flows": [
+        {
+          "from_tier": "hbm",
+          "to_tier": "dram",
+          "write_mode": "write_through",
+          "access_propagation_enabled": false,
+          "write_propagation_enabled": false,
+          "selective_write_threshold": 2
+        }
+      ],
+      "storage_pool_flow": {
+        "write_mode": "write_through",
+        "local_read_touch_enabled": false,
+        "shadow_write_touch_enabled": false,
+        "selective_write_threshold": 2
+      },
+      "p2p_read_flows": [
+        {
+          "tier": "hbm",
+          "peer_read_touch_enabled": true
+        }
+      ]
+    }
+  ],
+  "storage_pool": {
+    "output_result_path": "/tmp/hierarchical_test_output/pool",
+    "storage_name": "l3",
+    "capacity": 1.0,
+    "eviction_params": {
+      "eviction_mode": 3,
+      "eviction_batch_size_per_instance": 100
+    },
+    "pools": [
+      {
+        "pool_id": "pool_1",
+        "model": {
+          "block_size": 1,
+          "bytes_per_token": 1,
+          "eviction_policy_type": "lru",
+          "eviction_policy_params": {
+            "sample_rate": 1.0
+          }
+        },
+        "ttl_config": {
+          "default_block_ttl_seconds": 0,
+          "refresh_on_read": true
+        }
+      }
+    ]
+  }
+}

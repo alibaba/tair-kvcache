@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "schedule-simulator"
+version = "0.1.0"
+description = "Standalone theoretical modeling simulator for LLM serving systems"
+dependencies = [
+    "kunlun-commons",
+    "deepestim",
+    "numpy",
+    "pandas",
+    "scipy",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+aic = ["aiconfigurator", "xgboost"]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
