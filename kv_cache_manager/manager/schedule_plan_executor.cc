@@ -708,4 +708,68 @@ bool SchedulePlanExecutor::SubmitTask(std::function<void()> task, std::chrono::m
     return SubmitRaw(std::move(task), delay);
 }
 
+void SchedulePlanExecutor::DoCopyTask(const std::shared_ptr<std::promise<PlanExecuteResult>> &promise,
+                                      const CacheLocationCopyRequest &task) {
+    PlanExecuteResult result;
+    result.status = ErrorCode::EC_OK;
+
+    if (task.src_uris.size() != task.dst_uris.size()) {
+        HandleErrorPromise(promise,
+                           ErrorCode::EC_BADARGS,
+                           "src_uris size %d != dst_uris size %d",
+                           task.src_uris.size(),
+                           task.dst_uris.size());
+        return;
+    }
+    if (task.src_uris.empty()) {
+        promise->set_value(result);
+        return;
+    }
+
+    auto request_context = std::make_shared<RequestContext>("location_copy_task_trace");
+    std::vector<ErrorCode> copy_results =
+        data_storage_manager_->Copy(request_context.get(), task.exec_storage_name, task.src_uris, task.dst_uris);
+
+    for (size_t i = 0; i < copy_results.size(); ++i) {
+        if (copy_results[i] != ErrorCode::EC_OK) {
+            result.status = ErrorCode::EC_PARTIAL_OK;
+            KVCM_LOG_WARN("Failed to copy kvcache via storage %s, block_key: %ld, src: %s, dst: %s, ec: %d",
+                          task.exec_storage_name.c_str(),
+                          task.block_key,
+                          i < task.src_uris.size() ? task.src_uris[i].ToUriString().c_str() : "",
+                          i < task.dst_uris.size() ? task.dst_uris[i].ToUriString().c_str() : "",
+                          copy_results[i]);
+        }
+    }
+    KVCM_LOG_DEBUG("DoCopyTask completed for instance_id: %s, block_key: %ld, status: %d",
+                   task.instance_id.c_str(),
+                   task.block_key,
+                   result.status);
+    promise->set_value(result);
+}
+
+std::future<PlanExecuteResult> SchedulePlanExecutor::Submit(const CacheLocationCopyRequest &task) {
+    KVCM_LOG_DEBUG("Submitting copy task for instance_id: %s, block_key: %ld, uris: %zu",
+                   task.instance_id.c_str(),
+                   task.block_key,
+                   task.src_uris.size());
+
+    auto promise = std::make_shared<std::promise<PlanExecuteResult>>();
+    std::future<PlanExecuteResult> future = promise->get_future();
+
+    if (stop_) {
+        HandleErrorPromise(promise, ErrorCode::EC_ERROR, "SchedulePlanExecutor stopped.");
+        return future;
+    }
+
+    // copy 任务是 URI 级（URI 已由 MigrationManager 解析/预分配），无需 meta 解析，直接异步执行。
+    bool submit_result =
+        this->SubmitRaw([this, promise, task]() { DoCopyTask(promise, task); }, task.delay);
+    if (!submit_result) {
+        HandleErrorPromise(promise, ErrorCode::EC_ERROR, "submit copy task failed");
+        return future;
+    }
+    return future;
+}
+
 } // namespace kv_cache_manager

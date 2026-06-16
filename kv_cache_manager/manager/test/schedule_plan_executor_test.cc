@@ -1,5 +1,6 @@
 #include <atomic>
 #include <filesystem>
+#include <fstream>
 #include <stdexcept>
 #include <thread>
 
@@ -8,6 +9,7 @@
 #include "kv_cache_manager/config/meta_indexer_config.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
+#include "kv_cache_manager/data_storage/data_storage_uri.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
 #include "kv_cache_manager/manager/schedule_plan_executor.h"
 #include "kv_cache_manager/meta/cache_location.h"
@@ -104,6 +106,24 @@ public:
         nfs_storage_config.set_storage_spec(nfs_storage_spec);
         auto request_context = std::make_shared<RequestContext>("test_trace_id");
         return data_storage_manager_->RegisterStorage(request_context.get(), "nfs_01", nfs_storage_config);
+    }
+    // 注册一个 Dummy storage（基于文件系统），供 copy 任务做真实文件复制
+    bool CreateDummyStorage(const std::string &name, const std::string &root) {
+        auto spec = std::make_shared<DummyStorageSpec>();
+        spec->set_root_path(root);
+        spec->set_key_count_per_file(1);
+        StorageConfig config;
+        config.set_type(DataStorageType::DATA_STORAGE_TYPE_DUMMY);
+        config.set_global_unique_name(name);
+        config.set_storage_spec(spec);
+        auto request_context = std::make_shared<RequestContext>("test_trace_id");
+        return data_storage_manager_->RegisterStorage(request_context.get(), name, config) == ErrorCode::EC_OK;
+    }
+    static DataStorageUri MakeUri(const std::string &path) {
+        DataStorageUri uri;
+        uri.SetProtocol("dummy");
+        uri.SetPath(path);
+        return uri;
     }
     std::shared_ptr<MetaIndexerManager> meta_manager_;
     std::shared_ptr<DataStorageManager> data_storage_manager_;
@@ -1082,4 +1102,84 @@ TEST_F(SchedulePlanExecutorTest, TestSubmitAsyncRejectedHasNoFuture) {
     const auto meta_submit_result = executor.SubmitAsync(CacheMetaDelRequest{});
     EXPECT_FALSE(meta_submit_result.accepted);
     EXPECT_FALSE(meta_submit_result.future.valid());
+}
+
+// ===== CacheLocationCopyRequest（多层存储迁移 copy 任务）=====
+
+TEST_F(SchedulePlanExecutorTest, TestCopyTaskSuccess) {
+    std::string root = GetPrivateTestRuntimeDataPath() + "copy_dummy/";
+    ASSERT_TRUE(CreateDummyStorage("dummy_01", root));
+    SchedulePlanExecutor executor(2, meta_manager_, data_storage_manager_, metrics_registry_);
+
+    // 准备源文件（含内容），目标父目录尚不存在
+    std::string src = root + "src_block";
+    std::string dst = root + "cold/dst_block";
+    {
+        std::ofstream ofs(src);
+        ofs << "kvcache-bytes";
+    }
+    ASSERT_TRUE(std::filesystem::exists(src));
+
+    CacheLocationCopyRequest req{
+        .instance_id = kTestInstanceName,
+        .block_key = 1001,
+        .exec_storage_name = "dummy_01",
+        .src_uris = {MakeUri(src)},
+        .dst_uris = {MakeUri(dst)},
+    };
+    auto result = executor.Submit(req).get();
+    ASSERT_EQ(ErrorCode::EC_OK, result.status) << result.error_message;
+    ASSERT_TRUE(std::filesystem::exists(dst));
+    ASSERT_EQ(std::filesystem::file_size(src), std::filesystem::file_size(dst));
+}
+
+TEST_F(SchedulePlanExecutorTest, TestCopyTaskSourceMissing) {
+    std::string root = GetPrivateTestRuntimeDataPath() + "copy_dummy_miss/";
+    ASSERT_TRUE(CreateDummyStorage("dummy_02", root));
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+
+    CacheLocationCopyRequest req{
+        .instance_id = kTestInstanceName,
+        .block_key = 1002,
+        .exec_storage_name = "dummy_02",
+        .src_uris = {MakeUri(root + "no_such_src")},
+        .dst_uris = {MakeUri(root + "dst")},
+    };
+    auto result = executor.Submit(req).get();
+    // 源端缺失 -> 部分失败（新 PlanExecuteResult 仅 status）
+    ASSERT_EQ(ErrorCode::EC_PARTIAL_OK, result.status);
+    ASSERT_FALSE(std::filesystem::exists(root + "dst"));
+}
+
+TEST_F(SchedulePlanExecutorTest, TestCopyTaskSizeMismatch) {
+    std::string root = GetPrivateTestRuntimeDataPath() + "copy_dummy_mismatch/";
+    ASSERT_TRUE(CreateDummyStorage("dummy_03", root));
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+
+    CacheLocationCopyRequest req{
+        .instance_id = kTestInstanceName,
+        .block_key = 1003,
+        .exec_storage_name = "dummy_03",
+        .src_uris = {MakeUri(root + "a"), MakeUri(root + "b")},
+        .dst_uris = {MakeUri(root + "a_dst")}, // 数量不匹配
+    };
+    auto result = executor.Submit(req).get();
+    ASSERT_EQ(ErrorCode::EC_BADARGS, result.status);
+}
+
+TEST_F(SchedulePlanExecutorTest, TestCopyTaskStopped) {
+    std::string root = GetPrivateTestRuntimeDataPath() + "copy_dummy_stop/";
+    ASSERT_TRUE(CreateDummyStorage("dummy_04", root));
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+    executor.Stop();
+
+    CacheLocationCopyRequest req{
+        .instance_id = kTestInstanceName,
+        .block_key = 1004,
+        .exec_storage_name = "dummy_04",
+        .src_uris = {MakeUri(root + "x")},
+        .dst_uris = {MakeUri(root + "y")},
+    };
+    auto result = executor.Submit(req).get();
+    ASSERT_EQ(ErrorCode::EC_ERROR, result.status);
 }

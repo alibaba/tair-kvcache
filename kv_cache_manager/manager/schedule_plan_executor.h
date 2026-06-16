@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
+#include "kv_cache_manager/data_storage/data_storage_uri.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
@@ -53,6 +54,18 @@ struct CacheLocationDelRequest {
     std::chrono::microseconds delay{std::chrono::seconds(0)};
 };
 
+// 单个 block 的跨存储复制请求。URI 由上层（MigrationManager）解析与预分配后传入；
+// SchedulePlanExecutor 只负责异步调用 backend.Copy 搬字节并回报结果，不创建 location/不做 CAS
+// （目标 location 的创建与 CLS_WRITING->SERVING 的状态流转由 MigrationManager 负责）。
+struct CacheLocationCopyRequest {
+    std::string instance_id;
+    int64_t block_key;
+    std::string exec_storage_name;        // 执行 Copy 的 backend（一期 = 源 storage 的 unique name）
+    std::vector<DataStorageUri> src_uris; // 源端各 spec 的 uri
+    std::vector<DataStorageUri> dst_uris; // 目标端各 spec 预分配的 uri（与 src_uris 一一对应）
+    std::chrono::microseconds delay{std::chrono::seconds(0)};
+};
+
 struct ScheduledTask {
     std::function<void()> task;
     std::function<void()> cancel_task;
@@ -78,6 +91,7 @@ public:
 
     std::future<PlanExecuteResult> Submit(const CacheMetaDelRequest &task);
     std::future<PlanExecuteResult> Submit(const CacheLocationDelRequest &task);
+    std::future<PlanExecuteResult> Submit(const CacheLocationCopyRequest &task);
     AsyncDeleteSubmitResult SubmitAsync(const CacheMetaDelRequest &task);
     AsyncDeleteSubmitResult SubmitAsync(const CacheLocationDelRequest &task);
 
@@ -128,6 +142,8 @@ private:
     AsyncDeleteSubmitResult SubmitDeleteTaskAsync(std::chrono::microseconds delay,
                                                   std::function<LocationDelAdmissionResult()> prepare);
     PlanExecuteResult DoLocationDelTask(const CacheLocationDelRequest &task);
+    void DoCopyTask(const std::shared_ptr<std::promise<PlanExecuteResult>> &promise,
+                    const CacheLocationCopyRequest &task);
 
     KVCM_GAUGE_METRICS_FOR_SCHEDULE_PLAN_EXECUTOR(waiting_task_count)
     KVCM_GAUGE_METRICS_FOR_SCHEDULE_PLAN_EXECUTOR(executing_task_count)

@@ -68,3 +68,17 @@ TEST_F(DataStorageManagerTest, TestSimple) {
     data_storage_backends = data_storage_manager.GetAvailableStorages();
     ASSERT_EQ(0, data_storage_backends.size());
 }
+
+TEST_F(DataStorageManagerTest, TestCopyRejectsMismatchedUris) {
+    DataStorageManager data_storage_manager(metrics_registry_);
+    RequestContext request_context("test");
+    std::vector<DataStorageUri> src_uris = {DataStorageUri("file://storage1/data/src1?size=128"),
+                                            DataStorageUri("file://storage1/data/src2?size=128")};
+    std::vector<DataStorageUri> dst_uris = {DataStorageUri("file://storage1/data/dst1?size=128")};
+
+    const auto results = data_storage_manager.Copy(&request_context, "storage1", src_uris, dst_uris);
+    ASSERT_EQ(src_uris.size(), results.size());
+    for (const auto ec : results) {
+        ASSERT_EQ(EC_BADARGS, ec);
+    }
+}

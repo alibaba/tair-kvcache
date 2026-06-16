@@ -166,4 +166,39 @@ std::vector<ErrorCode> DummyBackend::UnLock(const std::vector<DataStorageUri> &s
     return results;
 }
 
+std::vector<ErrorCode> DummyBackend::Copy(const std::vector<DataStorageUri> &src_uris,
+                                          const std::vector<DataStorageUri> &dst_uris,
+                                          const std::string &trace_id) {
+    // mock 实现：逐项把源文件复制到目标路径。源端不存在则返回 EC_NOENT
+    // （用于模拟迁移过程中源端被驱逐 / source lost 场景）。
+    if (src_uris.size() != dst_uris.size()) {
+        KVCM_LOG_ERROR("dummy copy: src/dst size mismatch, src: [%zu], dst: [%zu]", src_uris.size(), dst_uris.size());
+        return std::vector<ErrorCode>(src_uris.size(), ErrorCode::EC_BADARGS);
+    }
+    std::vector<ErrorCode> results;
+    results.reserve(src_uris.size());
+    for (std::size_t i = 0; i != src_uris.size(); ++i) {
+        const std::filesystem::path src_path = src_uris[i].GetPath();
+        const std::filesystem::path dst_path = dst_uris[i].GetPath();
+        std::error_code ec;
+        if (!std::filesystem::exists(src_path, ec) || ec) {
+            KVCM_LOG_WARN("dummy copy: source not exist, src: [%s]", src_path.string().c_str());
+            results.push_back(ErrorCode::EC_NOENT);
+            continue;
+        }
+        std::filesystem::create_directories(dst_path.parent_path(), ec);
+        std::filesystem::copy_file(src_path, dst_path, std::filesystem::copy_options::overwrite_existing, ec);
+        if (ec) {
+            KVCM_LOG_ERROR("dummy copy failed, src: [%s], dst: [%s], msg: [%s]",
+                           src_path.string().c_str(),
+                           dst_path.string().c_str(),
+                           ec.message().c_str());
+            results.push_back(ErrorCode::EC_IO_ERROR);
+            continue;
+        }
+        results.push_back(ErrorCode::EC_OK);
+    }
+    return results;
+}
+
 } // namespace kv_cache_manager
