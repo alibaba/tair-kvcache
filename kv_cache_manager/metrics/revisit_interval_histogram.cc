@@ -1,6 +1,5 @@
 #include "kv_cache_manager/metrics/revisit_interval_histogram.h"
 
-#include <algorithm>
 #include <cmath>
 
 namespace kv_cache_manager {
@@ -66,16 +65,16 @@ void RevisitIntervalHistogram::Observe(int64_t interval_us) {
     // All buckets with boundary >= interval_s should be incremented
     for (size_t i = 0; i < boundaries_.size(); ++i) {
         if (boundaries_[i] >= interval_s) {
-            bucket_counters_[i]++;
+            ++bucket_counters_[i];
         }
     }
     // Always increment +Inf bucket
-    bucket_counters_[boundaries_.size()]++;
+    ++bucket_counters_[boundaries_.size()];
 
     // Increment sum (stored in microseconds to preserve precision as uint64)
     // PrometheusExporter will convert to seconds on output
     sum_counter_ += static_cast<uint64_t>(interval_us);
-    count_counter_++;
+    ++count_counter_;
 }
 
 std::vector<uint64_t> RevisitIntervalHistogram::GetBucketCounts() const {
