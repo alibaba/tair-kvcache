@@ -98,6 +98,12 @@ struct KmonitorMetricsReporter::Context {
     DECLARE_METRICS(meta_indexer, cache_backend_upsert_time_us);
     DECLARE_METRICS(meta_indexer, cache_backend_delete_time_us);
 
+    // affinity metrics
+    DECLARE_METRICS(affinity, read_local_hit);
+    DECLARE_METRICS(affinity, read_remote_hit);
+    DECLARE_METRICS(affinity, hint_emitted);
+    DECLARE_METRICS(affinity, replication_write_count);
+
     // data storage metrics
     DECLARE_METRICS(data_storage, create_qps);
     DECLARE_METRICS(data_storage, create_keys_qps);
@@ -278,7 +284,6 @@ bool KmonitorMetricsReporter::Init(std::shared_ptr<CacheManager> cache_manager,
         }                                                                                                              \
     } while (0)
 
-
 bool KmonitorMetricsReporter::InitMetrics() {
     ctx_->kmonitor = kmonitor::KMonitorFactory::GetKMonitor("kvcm_default");
     auto reporter = ctx_->kmonitor;
@@ -341,6 +346,12 @@ bool KmonitorMetricsReporter::InitMetrics() {
     REGISTER_GAUGE_METRIC(meta_indexer, cache_backend_put_time_us);
     REGISTER_GAUGE_METRIC(meta_indexer, cache_backend_upsert_time_us);
     REGISTER_GAUGE_METRIC(meta_indexer, cache_backend_delete_time_us);
+
+    // affinity metrics
+    REGISTER_GAUGE_METRIC(affinity, read_local_hit);
+    REGISTER_GAUGE_METRIC(affinity, read_remote_hit);
+    REGISTER_GAUGE_METRIC(affinity, hint_emitted);
+    REGISTER_GAUGE_METRIC(affinity, replication_write_count);
 
     // data storage metrics
     REGISTER_QPS_METRIC(data_storage, create_qps);
@@ -511,6 +522,12 @@ void KmonitorMetricsReporter::ReportPerQuery(MetricsCollector *collector) {
         REPORT_STEAL_METRICS(meta_indexer, cache_backend_put_time_us);
         REPORT_STEAL_METRICS(meta_indexer, cache_backend_upsert_time_us);
         REPORT_STEAL_METRICS(meta_indexer, cache_backend_delete_time_us);
+
+        // affinity metrics
+        REPORT_STEAL_METRICS(affinity, read_local_hit);
+        REPORT_STEAL_METRICS(affinity, read_remote_hit);
+        REPORT_STEAL_METRICS(affinity, hint_emitted);
+        REPORT_STEAL_METRICS(affinity, replication_write_count);
     } else if (dynamic_cast<DataStorageMetricsCollector *>(collector)) {
         const auto *p = dynamic_cast<DataStorageMetricsCollector *>(collector);
         const kmonitor::MetricsTags tags = ctx_->GetKmonitorTags(p->GetMetricsTags());
