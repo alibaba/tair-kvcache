@@ -298,6 +298,7 @@ void ProtoConvert::InstanceGroupToProto(const InstanceGroup &instance_group_info
     for (const auto &candidate : instance_group_info.event_reporting_storage_candidates()) {
         proto_instance_group->add_event_reporting_storage_candidates(candidate);
     }
+    proto_instance_group->set_revisit_interval_buckets(instance_group_info.revisit_interval_buckets_raw());
 }
 void ProtoConvert::InstanceGroupFromProto(const proto::admin::InstanceGroup *proto_instance_group,
                                           InstanceGroup &instance_group_info) {
@@ -340,6 +341,7 @@ void ProtoConvert::InstanceGroupFromProto(const proto::admin::InstanceGroup *pro
         proto_instance_group->event_reporting_storage_candidates().begin(),
         proto_instance_group->event_reporting_storage_candidates().end());
     instance_group_info.set_event_reporting_storage_candidates(event_reporting_storage_candidates);
+    instance_group_info.set_revisit_interval_buckets(proto_instance_group->revisit_interval_buckets());
 }
 
 void ProtoConvert::AccountFromProto(const proto::admin::Account *proto_account, Account &account_info) {

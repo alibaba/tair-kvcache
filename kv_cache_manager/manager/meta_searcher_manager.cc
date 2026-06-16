@@ -36,8 +36,8 @@ MetaSearcher *MetaSearcherManager::TryCreateMetaSearcher(RequestContext *request
     const std::string &instance_group = instance_info->instance_group_name();
 
     // Look up InstanceGroup once — used for both cache_config and revisit boundaries
-    auto [group_ec, group_ptr] = registry_manager_->GetInstanceGroup(request_context, instance_group);
-    if (group_ec != EC_OK || group_ptr == nullptr) {
+    auto group_ptr = registry_manager_->GetInstanceGroupConfig(instance_group);
+    if (group_ptr == nullptr) {
         request_context->error_tracer()->AddErrorMsg("instance group not found");
         KVCM_LOG_ERROR("instance group [%s] not found", instance_group.c_str());
         return nullptr;
