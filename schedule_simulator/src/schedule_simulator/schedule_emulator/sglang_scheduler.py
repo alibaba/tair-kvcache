@@ -115,19 +115,46 @@ class SGLangScheduleEmulator(ScheduleEmulator):
 
         if self.model is None or self.hw is None:
             if time_predictor is None:
-                raise ValueError(
-                    "Model or hardware not found. Install kunlun-commons or provide "
-                    "a time_predictor and kv_cache_space_per_token/max_num_tokens in SchedulerConfig."
+                # Auto-load bundled default predictor
+                import os
+                from schedule_simulator.infer_time_predictor.request_level import RequestLevelTimePredictor
+                _default_pkl = os.path.join(
+                    os.path.dirname(__file__), "..", "data", "default_predictor.pkl"
                 )
-            logger.warning("ModelInfo/AcceleratorInfo unavailable; using provided predictor and config overrides.")
+                if os.path.exists(_default_pkl):
+                    time_predictor = RequestLevelTimePredictor(lookup_table_path=_default_pkl)
+                    logger.debug("Auto-loaded default predictor from bundled pkl.")
+                else:
+                    raise ValueError(
+                        "Model or hardware not found. Install kunlun-commons or provide "
+                        "a time_predictor and kv_cache_space_per_token/max_num_tokens in SchedulerConfig."
+                    )
+            # Apply sensible defaults for kv_cache and max_num_tokens if not set
+            if self.scheduler_config.kv_cache_space_per_token is None:
+                self.scheduler_config.kv_cache_space_per_token = 320
+            if self.scheduler_config.max_num_tokens is None:
+                self.scheduler_config.max_num_tokens = 163840
 
         if time_predictor is None:
-            logger.warning(
-                "The predictor class is not specified, using LLMPerfTimePredictor."
-            )
-            time_predictor = LLMPerfTimePredictor(
-                self.model, self.hw, self.scheduler_config
-            )
+            from schedule_simulator._compat import HAS_DEEPESTIM
+            if HAS_DEEPESTIM and self.model is not None and self.hw is not None:
+                logger.warning(
+                    "The predictor class is not specified, using LLMPerfTimePredictor."
+                )
+                time_predictor = LLMPerfTimePredictor(
+                    self.model, self.hw, self.scheduler_config
+                )
+            else:
+                # Fallback to bundled default predictor
+                import os
+                from schedule_simulator.infer_time_predictor.request_level import RequestLevelTimePredictor
+                _default_pkl = os.path.join(
+                    os.path.dirname(__file__), "..", "data", "default_predictor.pkl"
+                )
+                if os.path.exists(_default_pkl):
+                    time_predictor = RequestLevelTimePredictor(lookup_table_path=_default_pkl)
+                else:
+                    time_predictor = RequestLevelTimePredictor(constant_ms_per_token=0.5)
 
         self.time_predictor = time_predictor
 
@@ -168,7 +195,9 @@ class SGLangScheduleEmulator(ScheduleEmulator):
 
         # memory fraction
         # Ref: https://github.com/sgl-project/sglang/blob/v0.4.8/python/sglang/srt/server_args.py#L274
-        if self.scheduler_config.mem_fraction_static is None and self.hw is not None:
+        if self.scheduler_config.mem_fraction_static is None and self.hw is None:
+            self.scheduler_config.mem_fraction_static = 0.8
+        elif self.scheduler_config.mem_fraction_static is None and self.hw is not None:
             parallel_size = (
                 self.scheduler_config.tp_size * self.scheduler_config.pp_size
             )
@@ -209,16 +238,23 @@ class SGLangScheduleEmulator(ScheduleEmulator):
                 self.scheduler_config.chunked_prefill_size = 8192
             else:
                 self.scheduler_config.chunked_prefill_size = 16384
+        elif self.scheduler_config.chunked_prefill_size is None:
+            self.scheduler_config.chunked_prefill_size = 8192
 
         # max number of tokens (L1 device cache capacity)
         if self.scheduler_config.max_num_tokens is not None:
             self.max_num_tokens = self.scheduler_config.max_num_tokens
         elif self.model is not None and self.hw is not None:
-            self.max_num_tokens = estimate_kv_cache_pool_capacity(
-                self.model, self.hw, self.scheduler_config
-            )
+            from schedule_simulator._compat import HAS_DEEPESTIM as _has_de
+            if _has_de:
+                self.max_num_tokens = estimate_kv_cache_pool_capacity(
+                    self.model, self.hw, self.scheduler_config
+                )
+            else:
+                self.max_num_tokens = 163840
         else:
-            self.max_num_tokens = 0  # Will be unused in request-level mode
+            # Use config override (set during fallback) or sensible default
+            self.max_num_tokens = self.scheduler_config.max_num_tokens or 163840
         self.rest_num_tokens = self.max_num_tokens
 
         logger.debug(f"The max number of tokens is {self.max_num_tokens}.")
