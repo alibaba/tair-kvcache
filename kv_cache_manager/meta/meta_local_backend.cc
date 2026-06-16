@@ -217,7 +217,9 @@ MetaLocalBackend::UpsertForOneKey(KeyType key, const CacheLocationMap &locations
     return EC_OK;
 }
 
-ErrorCode MetaLocalBackend::DeleteForOneKey(KeyType key) { return cache_->Erase(KeyToView(key)) ? EC_OK : EC_NOENT; }
+ErrorCode MetaLocalBackend::DeleteForOneKey(KeyType key) {
+    return cache_->Erase(KeyToView(key)) ? EC_OK : EC_NOENT;
+}
 
 ErrorCode MetaLocalBackend::DeleteLocationsForOneKey(KeyType key, const std::vector<LocationId> &location_ids) {
     std::string_view key_sv = KeyToView(key);

@@ -185,8 +185,7 @@ MetaIndexer::Result MetaIndexer::Put(RequestContext *request_context,
     AdjustKeyCountMeta(keys.size() - error_count);
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, put_io_time_us, put_io_time_us);
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, lock_wait_time_us, lock_wait_time_us);
-    KVCM_METRICS_COLLECTOR_SET_METRICS(
-        service_metrics_collector, meta_indexer, cache_backend_put_time_us, cache_backend_put_time_us);
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, cache_backend_put_time_us, cache_backend_put_time_us);
     ProcessErrorResult(trace_id, kPutMetaOperation, error_count, keys.size(), result);
     return result;
 }
@@ -217,8 +216,7 @@ MetaIndexer::Result MetaIndexer::Delete(RequestContext *request_context, const K
     }
     AdjustKeyCountMeta(error_count - keys.size());
     KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, lock_wait_time_us, lock_wait_time_us);
-    KVCM_METRICS_COLLECTOR_SET_METRICS(
-        service_metrics_collector, meta_indexer, cache_backend_delete_time_us, cache_backend_delete_time_us);
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, meta_indexer, cache_backend_delete_time_us, cache_backend_delete_time_us);
     ProcessErrorResult(trace_id, kDeleteMetaOperation, error_count, keys.size(), result);
     return result;
 }
@@ -355,10 +353,8 @@ void MetaIndexer::EmitRmwMetrics(MetricsCollector *metrics_collector,
     }
 
     if (has_upsert || has_delete) {
-        KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector,
-                                           meta_indexer,
-                                           async_enqueue_timeout_key_count,
-                                           stats.async_enqueue_timeout_key_count);
+        KVCM_METRICS_COLLECTOR_SET_METRICS(
+            service_metrics_collector, meta_indexer, async_enqueue_timeout_key_count, stats.async_enqueue_timeout_key_count);
         KVCM_METRICS_COLLECTOR_SET_METRICS(
             service_metrics_collector, meta_indexer, async_enqueue_time_us, stats.async_enqueue_time_us);
     }

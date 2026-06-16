@@ -157,9 +157,9 @@ private:
         int64_t async_enqueue_time_us = 0;
         int64_t cache_backend_upsert_time_us = 0;
         int64_t cache_backend_delete_time_us = 0;
-        int64_t put_key_count = 0;    // brand-new keys created by upsert
-        int64_t update_key_count = 0; // existing keys updated by upsert
-        int64_t delete_key_count = 0; // keys deleted by whole-key delete
+        int64_t put_key_count = 0;     // brand-new keys created by upsert
+        int64_t update_key_count = 0;  // existing keys updated by upsert
+        int64_t delete_key_count = 0;  // keys deleted by whole-key delete
     };
     // Returns {error_count, put_success_count}.
     std::pair<int32_t, int32_t> ExecuteRmwUpsert(const std::string &trace_id,

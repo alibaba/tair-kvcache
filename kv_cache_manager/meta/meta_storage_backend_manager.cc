@@ -304,8 +304,8 @@ std::vector<ErrorCode> MetaStorageBackendManager::Put(RequestContext *request_co
     auto results = cache_backend_->Put(request_context, keys, locations, properties, persistent_results);
     if (request_context) {
         auto *mc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
-        KVCM_METRICS_COLLECTOR_SET_METRICS(
-            mc, meta_indexer, cache_backend_put_time_us, TimestampUtil::GetCurrentTimeUs() - cache_begin);
+        KVCM_METRICS_COLLECTOR_SET_METRICS(mc, meta_indexer, cache_backend_put_time_us,
+                                           TimestampUtil::GetCurrentTimeUs() - cache_begin);
     }
     return results;
 }
@@ -331,8 +331,8 @@ std::vector<ErrorCode> MetaStorageBackendManager::Upsert(RequestContext *request
     auto results = cache_backend_->Upsert(request_context, keys, locations, properties, persistent_results);
     if (request_context) {
         auto *mc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
-        KVCM_METRICS_COLLECTOR_SET_METRICS(
-            mc, meta_indexer, cache_backend_upsert_time_us, TimestampUtil::GetCurrentTimeUs() - cache_begin);
+        KVCM_METRICS_COLLECTOR_SET_METRICS(mc, meta_indexer, cache_backend_upsert_time_us,
+                                           TimestampUtil::GetCurrentTimeUs() - cache_begin);
     }
     return results;
 }
@@ -354,8 +354,8 @@ std::vector<ErrorCode> MetaStorageBackendManager::Delete(RequestContext *request
     auto results = cache_backend_->Delete(request_context, keys, persistent_results);
     if (request_context) {
         auto *mc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
-        KVCM_METRICS_COLLECTOR_SET_METRICS(
-            mc, meta_indexer, cache_backend_delete_time_us, TimestampUtil::GetCurrentTimeUs() - cache_begin);
+        KVCM_METRICS_COLLECTOR_SET_METRICS(mc, meta_indexer, cache_backend_delete_time_us,
+                                           TimestampUtil::GetCurrentTimeUs() - cache_begin);
     }
     return results;
 }
@@ -387,8 +387,8 @@ std::vector<ErrorCode> MetaStorageBackendManager::Delete(RequestContext *request
         results = cache_backend_->DeleteLocations(request_context, keys, location_ids, persistent_results);
         if (request_context) {
             auto *mc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
-            KVCM_METRICS_COLLECTOR_SET_METRICS(
-                mc, meta_indexer, cache_backend_delete_time_us, TimestampUtil::GetCurrentTimeUs() - cache_begin);
+            KVCM_METRICS_COLLECTOR_SET_METRICS(mc, meta_indexer, cache_backend_delete_time_us,
+                                               TimestampUtil::GetCurrentTimeUs() - cache_begin);
         }
     }
 

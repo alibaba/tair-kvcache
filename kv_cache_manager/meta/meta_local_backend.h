@@ -184,9 +184,11 @@ private:
     size_t CollectOldestKeysFromShard(uint32_t shard_id, size_t count, std::vector<KeyType> &out_keys);
     ErrorCode
     CreateAndInsert(std::string_view key_sv, const CacheLocationMap &locations, const PropertyMap &properties);
+    ErrorCode CreateAndInsertIfAbsent(std::string_view key_sv,
+                                      const CacheLocationMap &locations,
+                                      const PropertyMap &properties);
     ErrorCode
-    CreateAndInsertIfAbsent(std::string_view key_sv, const CacheLocationMap &locations, const PropertyMap &properties);
-    ErrorCode UpdateInPlace(std::string_view key_sv, const CacheLocationMap &locations, const PropertyMap &properties);
+    UpdateInPlace(std::string_view key_sv, const CacheLocationMap &locations, const PropertyMap &properties);
     ErrorCode UpsertForOneKey(KeyType key, const CacheLocationMap &locations, const PropertyMap &properties);
     ErrorCode DeleteForOneKey(KeyType key);
     ErrorCode DeleteLocationsForOneKey(KeyType key, const std::vector<LocationId> &location_ids);

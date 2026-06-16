@@ -28,9 +28,7 @@ namespace kv_cache_manager {
 #define DECLARE_METRICS_NAME_(group, name) static const std::string METRICS_NAME_(group, name)
 
 #define DEFINE_METRICS_NAME_(scope, group, name)                                                                       \
-    const std::string SCOPED_METRICS_NAME_(scope, group, name) {                                                       \
-#group "." #name                                                                                               \
-    }
+    const std::string SCOPED_METRICS_NAME_(scope, group, name) { #group "." #name }
 
 #define DECLARE_METRICS_COUNTER_(group, name) Counter METRICS_(group, name)
 

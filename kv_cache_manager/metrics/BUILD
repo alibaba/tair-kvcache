@@ -50,10 +50,10 @@ cc_library(
     ],
     deps = [
         ":metrics_lifecycle",
-        ":metrics_collector",
         ":metrics_registry",
-        "//kv_cache_manager/common:logger",
+        ":metrics_collector",
         "//kv_cache_manager/common:utils",
+        "//kv_cache_manager/common:logger",
         "//kv_cache_manager/manager:cache_manager",
         "@havenask//aios/kmonitor:kmonitor_client_cpp",
     ],
