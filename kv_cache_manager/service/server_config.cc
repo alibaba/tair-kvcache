@@ -333,10 +333,8 @@ void ServerConfig::UpdateEnviron(EnvironMap &environ) {
 }
 
 bool ServerConfig::Check() {
-    if (registry_storage_uri_.empty()) {
-        fprintf(stderr, "registry_storage_uri must be set\n");
-        return false;
-    }
+    // registry_storage_uri is optional: when empty, RegistryStorageBackendFactory
+    // falls back to local backend. No validation needed for empty value.
 
     // Validate revisit_interval_buckets if set
     if (!revisit_interval_buckets_.empty()) {

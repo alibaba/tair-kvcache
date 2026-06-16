@@ -14,12 +14,12 @@ public:
 };
 
 TEST_F(ServerConfigTest, TestSimple) {
-    // empty
+    // empty config is valid (registry_storage_uri is optional, falls back to local backend)
     {
         ServerConfig config;
         std::unordered_map<std::string, std::string> environ;
         ASSERT_TRUE(config.Parse("", environ));
-        ASSERT_FALSE(config.Check());
+        ASSERT_TRUE(config.Check());
     }
     // config_file not exist
     {
@@ -47,7 +47,7 @@ TEST_F(ServerConfigTest, TestSimple) {
         environ.insert({"kvcm.service.rpc_port", "6381"});
         environ.insert({"kvcm.service.http_port", "6382"});
         ASSERT_TRUE(config.Parse("", environ));
-        ASSERT_FALSE(config.Check());
+        ASSERT_TRUE(config.Check());  // registry_storage_uri is optional
         environ.insert({"kvcm.registry_storage.uri", "redis://127.0.0.1:6379?auth=123456"});
         ASSERT_TRUE(config.Parse("", environ));
         ASSERT_TRUE(config.Check());
