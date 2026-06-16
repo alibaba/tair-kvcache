@@ -1,7 +1,11 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
+#include <utility>
+#include <vector>
 
+#include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/protocol/protobuf/admin_service.pb.h"
 #include "kv_cache_manager/service/service_impl_base.h"
 
@@ -11,6 +15,7 @@ class LeaderElector;
 class CacheManager;
 class MetricsReporter;
 class MetricsRegistry;
+class MetaIndexer;
 class RegistryManager;
 class RequestContext;
 
@@ -65,6 +70,9 @@ public:
     void RemoveCache(RequestContext *request_context,
                      const proto::admin::RemoveCacheRequest *request,
                      proto::admin::CommonResponse *response);
+    void MigrateCache(RequestContext *request_context,
+                      const proto::admin::MigrateCacheRequest *request,
+                      proto::admin::MigrateCacheResponse *response);
 
     void RegisterInstance(RequestContext *request_context,
                           const proto::admin::RegisterInstanceRequest *request,
@@ -122,6 +130,11 @@ public:
                       proto::admin::CommonResponse *response);
 
 private:
+    std::pair<ErrorCode, std::vector<std::int64_t>>
+    SelectMigrationCandidateKeys(RequestContext *request_context,
+                                 const proto::admin::MigrateCacheRequest *request,
+                                 const std::shared_ptr<MetaIndexer> &meta_indexer) const;
+
     std::shared_ptr<CacheManager> cache_manager_;
     std::shared_ptr<MetricsReporter> metrics_reporter_;
     std::shared_ptr<MetricsRegistry> metrics_registry_; // for the GetMetrics API
