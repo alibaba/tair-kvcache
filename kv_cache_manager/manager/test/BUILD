@@ -11,6 +11,7 @@ cc_test(
     deps = [
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/manager:cache_reclaimer",
+        "//kv_cache_manager/manager:migration_manager",
         "@cpp_stub",
     ],
 )
@@ -42,6 +43,20 @@ cc_test(
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/manager:schedule_plan_executor",
         "@cpp_stub",
+    ],
+)
+
+cc_test(
+    name = "MigrationManagerTest",
+    srcs = [
+        "migration_manager_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    data = [],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/event:event_publisher",
+        "//kv_cache_manager/manager:migration_manager",
     ],
 )
 
