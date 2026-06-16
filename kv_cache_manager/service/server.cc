@@ -63,8 +63,7 @@ bool Server::Init(const ServerConfig &config) {
     // Set revisit interval histogram configuration
     auto boundaries = ServerConfig::ParseRevisitIntervalBuckets(config_.GetRevisitIntervalBuckets());
     if (boundaries.empty()) {
-        // Default bucket boundaries (seconds)
-        boundaries = {1, 5, 30, 60, 120, 180, 300, 600, 900, 1800, 3600, 21600, 86400};
+        boundaries = ServerConfig::GetDefaultRevisitIntervalBuckets();
     }
     cache_manager_->SetRevisitHistogramConfig(boundaries);
 

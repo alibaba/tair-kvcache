@@ -47,6 +47,11 @@ std::vector<double> ServerConfig::ParseRevisitIntervalBuckets(const std::string 
     return boundaries;
 }
 
+const std::vector<double> &ServerConfig::GetDefaultRevisitIntervalBuckets() {
+    static const std::vector<double> kDefaults = {1, 5, 30, 60, 120, 180, 300, 600, 900, 1800, 3600, 21600, 86400};
+    return kDefaults;
+}
+
 // clang-format off
 std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSettingsMap = {
     {"kvcm.registry_storage.uri",

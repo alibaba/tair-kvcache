@@ -53,6 +53,10 @@ public:
     // for applying default boundaries when the result is empty.
     static std::vector<double> ParseRevisitIntervalBuckets(const std::string &buckets_str);
 
+    // Default bucket boundaries (seconds) for revisit interval histogram.
+    // 13 boundaries → 14 buckets including +Inf.
+    static const std::vector<double> &GetDefaultRevisitIntervalBuckets();
+
 private:
     void UpdateDefaultConfig();
     bool ParseFromFile(const std::string &config_file);
