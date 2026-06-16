@@ -1,12 +1,10 @@
 from schedule_simulator.schedule_emulator.types import (
     SchedulerConfig,
 )
-from kunlun_commons.model_info import ModelInfo
-from kunlun_commons.hardwares.accelerator import AcceleratorInfo
-from kunlun_commons.data_type import DataType
-from kunlun_commons.utils import get_logger
-
-from deepestim.llmperf import TheoreticalExecutionAnalyzer, RequestInfo, InferenceConfig
+from schedule_simulator._compat import (
+    ModelInfo, AcceleratorInfo, DataType, get_logger,
+    TheoreticalExecutionAnalyzer, RequestInfo, InferenceConfig,
+)
 
 from schedule_simulator.infer_time_predictor.base import (
     InferTimePredictor,

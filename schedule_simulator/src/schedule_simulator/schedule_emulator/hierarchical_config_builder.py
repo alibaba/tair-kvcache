@@ -7,9 +7,7 @@ import os
 import tempfile
 from typing import Optional
 
-from kunlun_commons.model_info import ModelInfo
-from kunlun_commons.hardwares.accelerator import AcceleratorInfo
-from kunlun_commons.data_type import DataType
+from schedule_simulator._compat import ModelInfo, AcceleratorInfo, DataType
 
 from schedule_simulator.schedule_emulator.types import (
     SchedulerConfig,
@@ -47,30 +45,35 @@ def build_hierarchical_config(
         open(trace_path, "w").close()
 
     if isinstance(scheduler_config.model, str):
-        model = ModelInfo.find_by_model_name(scheduler_config.model)
+        model = ModelInfo.find_by_model_name(scheduler_config.model) if ModelInfo is not None else None
     else:
         model = scheduler_config.model
 
     if isinstance(platform_config.device, str):
-        hw = AcceleratorInfo.find_by_hw_name(platform_config.device)
+        hw = AcceleratorInfo.find_by_hw_name(platform_config.device) if AcceleratorInfo is not None else None
     else:
         hw = platform_config.device
 
     if scheduler_config.data_type is None:
-        dt = DataType(DataType.alias().get(model.torch_dtype, "FP16"))
+        if model is not None and DataType is not None:
+            dt = DataType(DataType.alias().get(model.torch_dtype, "FP16"))
+        else:
+            dt = None
     else:
         dt = scheduler_config.data_type
 
     # Use scheduler_config override if set, otherwise derive from model
     if scheduler_config.kv_cache_space_per_token is not None:
         kv_bytes_per_token = scheduler_config.kv_cache_space_per_token
-    else:
+    elif model is not None and dt is not None:
         kv_bytes_per_token = (
             calc_kv_cache_cell_elems(model, scheduler_config.tp_size, scheduler_config.pp_size)
             * dt.bytes
         )
+    else:
+        kv_bytes_per_token = 320  # sensible default for request-level mode
 
-    hbm_capacity_gb = platform_config.hbm_capacity_gb or hw.hbm_capacity_gb
+    hbm_capacity_gb = platform_config.hbm_capacity_gb or (hw.hbm_capacity_gb if hw is not None else 80)
     dram_capacity_gb = platform_config.memory_capacity_gb or (hbm_capacity_gb * 2)
 
     write_mode_map = {

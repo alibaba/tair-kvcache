@@ -74,12 +74,12 @@ def make_shared_prefix_dataset(num_requests=30, base_timestamp=1000):
 
 def create_runner(dataset_path, num_prompts, num_p_instance, p_policy, ms_per_token=0.01, page_size=None):
     """Helper to create a DisaggBenchmarkRunner with common settings."""
-    p_sc = SchedulerConfig("Qwen2.5-3B", scenario="disagg_prefill")
+    p_sc = SchedulerConfig("Qwen2.5-3B", scenario="disagg_prefill", request_level_scheduling=True, kv_cache_space_per_token=320, max_num_tokens=100000, chunked_prefill_size=8192)
     p_sc.request_level_scheduling = True
     if page_size:
         p_sc.page_size = page_size
 
-    d_sc = SchedulerConfig("Qwen2.5-3B", scenario="disagg_decode")
+    d_sc = SchedulerConfig("Qwen2.5-3B", scenario="disagg_decode", request_level_scheduling=True, kv_cache_space_per_token=320, max_num_tokens=100000, chunked_prefill_size=8192)
     d_sc.request_level_scheduling = True
 
     pc = PlatformConfig(device="A100-SXM4-80GB")

@@ -6,7 +6,7 @@ from schedule_simulator.infer_time_predictor.base import (
     ScheduleRequest,
     ScheduleBatch,
 )
-from kunlun_commons.utils.logger import get_logger
+from schedule_simulator._compat import get_logger_v2 as get_logger
 
 
 logger = get_logger("schedule_simulator")

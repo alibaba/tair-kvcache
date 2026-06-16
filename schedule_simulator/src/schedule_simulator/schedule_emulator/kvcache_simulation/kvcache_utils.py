@@ -1,6 +1,6 @@
 import tempfile
 from typing import Optional, Union, List
-from kunlun_commons.utils import get_logger
+from schedule_simulator._compat import get_logger
 
 try:
     from kv_cache_manager.optimizer.pybind import kvcm_py_optimizer

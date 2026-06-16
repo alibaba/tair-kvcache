@@ -35,7 +35,7 @@ from schedule_simulator.schedule_emulator.dispatch.dispatch_policy import (
 from schedule_simulator.schedule_emulator.schedule_policy import SchedulePolicy
 from schedule_simulator.schedule_emulator.hierarchical_config_builder import build_hierarchical_config
 
-from kunlun_commons.utils.logger import get_logger
+from schedule_simulator._compat import get_logger_v2 as get_logger
 
 
 logger = get_logger("schedule_simulator")

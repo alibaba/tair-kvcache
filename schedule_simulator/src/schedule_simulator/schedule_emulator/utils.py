@@ -1,9 +1,4 @@
-from kunlun_commons.model_info import ModelInfo
-from kunlun_commons.hardwares.accelerator import AcceleratorInfo
-from deepestim.llmperf.analyzers.theoretical_execution_analyzer import (
-    TheoreticalExecutionAnalyzer,
-)
-from deepestim.llmperf.types import InferenceConfig
+from schedule_simulator._compat import ModelInfo, AcceleratorInfo, TEA_v2 as TheoreticalExecutionAnalyzer, IC_v2 as InferenceConfig
 from schedule_simulator.schedule_emulator.types import (
     FakeRequest,
     SchedulerConfig,

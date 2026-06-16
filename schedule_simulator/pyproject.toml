@@ -7,8 +7,6 @@ name = "schedule-simulator"
 version = "0.1.0"
 description = "Standalone theoretical modeling simulator for LLM serving systems"
 dependencies = [
-    "kunlun-commons",
-    "deepestim",
     "numpy",
     "pandas",
     "scipy",
@@ -16,6 +14,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+full = ["kunlun-commons", "deepestim"]
 aic = ["aiconfigurator", "xgboost"]
 test = ["pytest"]
 

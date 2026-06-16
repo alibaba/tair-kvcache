@@ -23,7 +23,7 @@ from .kvcache_utils import (
     KVCachePool,
     SimHiCacheController,
 )
-from kunlun_commons.utils import get_logger
+from schedule_simulator._compat import get_logger
 
 logger = get_logger("sim_hiradix_cache")
 

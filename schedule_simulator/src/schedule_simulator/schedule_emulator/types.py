@@ -1,8 +1,6 @@
 from dataclasses import dataclass, field
 from typing import Optional, Union, Any
-from kunlun_commons.model_info import ModelInfo
-from kunlun_commons.hardwares.accelerator import AcceleratorInfo
-from kunlun_commons.data_type import DataType
+from schedule_simulator._compat import ModelInfo, AcceleratorInfo, DataType
 from enum import Enum, IntEnum, unique
 from schedule_simulator.dataset import BaseDataset
 

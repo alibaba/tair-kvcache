@@ -3,9 +3,7 @@ from dataclasses import dataclass, field
 from schedule_simulator.schedule_emulator.types import (
     SchedulerConfig,
 )
-from kunlun_commons.model_info import ModelInfo
-from kunlun_commons.hardwares.accelerator import AcceleratorInfo
-from kunlun_commons.utils import get_logger
+from schedule_simulator._compat import ModelInfo, AcceleratorInfo, get_logger
 
 
 logger = get_logger("schedule_simulator")

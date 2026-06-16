@@ -2,9 +2,7 @@ from schedule_simulator.schedule_emulator.types import (
     SchedulerConfig,
 )
 from schedule_simulator.infer_time_predictor.base import ScheduleBatch
-from kunlun_commons.model_info import ModelInfo
-from kunlun_commons.hardwares.accelerator import AcceleratorInfo
-from kunlun_commons.utils import get_logger
+from schedule_simulator._compat import ModelInfo, AcceleratorInfo, get_logger
 
 import pandas as pd
 import numpy as np

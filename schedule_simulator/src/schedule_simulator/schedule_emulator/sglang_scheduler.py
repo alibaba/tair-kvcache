@@ -30,13 +30,12 @@ from schedule_simulator.schedule_emulator.kvcache_simulation import (
     RadixKey,
 )
 
-from kunlun_commons.model_info import ModelInfo
-from kunlun_commons.system_info import AcceleratorInfo, DataType
+from schedule_simulator._compat import ModelInfo, AcceleratorInfo, DataType
 
 import asyncio
 from typing import Optional
 import heapq
-from kunlun_commons.utils import get_logger
+from schedule_simulator._compat import get_logger
 
 logger = get_logger("schedule_simulator")
 
@@ -95,11 +94,11 @@ class SGLangScheduleEmulator(ScheduleEmulator):
             self.log_metrics_interval = self.scheduler_config.log_metrics_interval
 
         if isinstance(self.scheduler_config.model, str):
-            self.model = ModelInfo.find_by_model_name(self.scheduler_config.model)
+            self.model = ModelInfo.find_by_model_name(self.scheduler_config.model) if ModelInfo is not None else None
         else:
             self.model = self.scheduler_config.model
         if isinstance(platform_config.device, str):
-            self.hw = AcceleratorInfo.find_by_hw_name(platform_config.device)
+            self.hw = AcceleratorInfo.find_by_hw_name(platform_config.device) if AcceleratorInfo is not None else None
         else:
             self.hw = platform_config.device
 
@@ -107,14 +106,20 @@ class SGLangScheduleEmulator(ScheduleEmulator):
         self.kvcm_block_size = kvcm_block_size
         self.enable_hicache = enable_hierarchical_cache
         if self.scheduler_config.data_type is None:
-            self.scheduler_config.data_type = DataType(
-                DataType.alias().get(self.model.torch_dtype, "FP16")
-            )
+            if self.model is not None and DataType is not None:
+                self.scheduler_config.data_type = DataType(
+                    DataType.alias().get(self.model.torch_dtype, "FP16")
+                )
         if self.scheduler_config.kv_cache_data_type is None:
             self.scheduler_config.kv_cache_data_type = self.scheduler_config.data_type
 
         if self.model is None or self.hw is None:
-            raise ValueError("Model or hardware not found")
+            if time_predictor is None:
+                raise ValueError(
+                    "Model or hardware not found. Install kunlun-commons or provide "
+                    "a time_predictor and kv_cache_space_per_token/max_num_tokens in SchedulerConfig."
+                )
+            logger.warning("ModelInfo/AcceleratorInfo unavailable; using provided predictor and config overrides.")
 
         if time_predictor is None:
             logger.warning(
@@ -128,13 +133,15 @@ class SGLangScheduleEmulator(ScheduleEmulator):
 
         if self.scheduler_config.kv_cache_space_per_token is not None:
             self.kv_cache_space_per_token = self.scheduler_config.kv_cache_space_per_token
-        else:
+        elif self.model is not None and self.scheduler_config.data_type is not None:
             self.kv_cache_space_per_token = (
                 calc_kv_cache_cell_elems(
                     self.model, self.scheduler_config.tp_size, self.scheduler_config.pp_size
                 )
                 * self.scheduler_config.data_type.bytes
             )
+        else:
+            self.kv_cache_space_per_token = 0  # Will be unused in request-level mode
 
         self.max_num_tokens = 0
         self.rest_num_tokens = 0
@@ -161,7 +168,7 @@ class SGLangScheduleEmulator(ScheduleEmulator):
 
         # memory fraction
         # Ref: https://github.com/sgl-project/sglang/blob/v0.4.8/python/sglang/srt/server_args.py#L274
-        if self.scheduler_config.mem_fraction_static is None:
+        if self.scheduler_config.mem_fraction_static is None and self.hw is not None:
             parallel_size = (
                 self.scheduler_config.tp_size * self.scheduler_config.pp_size
             )
@@ -195,7 +202,7 @@ class SGLangScheduleEmulator(ScheduleEmulator):
 
         # chunked prefill size
         # Ref: https://github.com/sgl-project/sglang/blob/v0.4.8/python/sglang/srt/server_args.py#L318
-        if self.scheduler_config.chunked_prefill_size is None:
+        if self.scheduler_config.chunked_prefill_size is None and self.hw is not None:
             if self.hw.hbm_capacity_gb < 35:
                 self.scheduler_config.chunked_prefill_size = 2048
             elif self.hw.hbm_capacity_gb < 160:
@@ -206,14 +213,16 @@ class SGLangScheduleEmulator(ScheduleEmulator):
         # max number of tokens (L1 device cache capacity)
         if self.scheduler_config.max_num_tokens is not None:
             self.max_num_tokens = self.scheduler_config.max_num_tokens
-        else:
+        elif self.model is not None and self.hw is not None:
             self.max_num_tokens = estimate_kv_cache_pool_capacity(
                 self.model, self.hw, self.scheduler_config
             )
+        else:
+            self.max_num_tokens = 0  # Will be unused in request-level mode
         self.rest_num_tokens = self.max_num_tokens
 
         logger.debug(f"The max number of tokens is {self.max_num_tokens}.")
-        if self.max_num_tokens <= 0:
+        if self.max_num_tokens <= 0 and not self.scheduler_config.request_level_scheduling:
             raise RuntimeError("There is not enough memory to run the model.")
 
     def _init_tree_cache(self) -> PrefixCache:

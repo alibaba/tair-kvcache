@@ -1,6 +1,4 @@
-from kunlun_commons.data_type import DataType
-from kunlun_commons.hardwares.accelerator import AcceleratorInfo
-from kunlun_commons.model_info import ModelInfo
+from schedule_simulator._compat import DataType, AcceleratorInfo, ModelInfo
 import numpy as np
 import os
 import re
