@@ -14,6 +14,8 @@
 #include "kv_cache_manager/optimizer/config/optimizer_config_loader.h"
 #include "kv_cache_manager/optimizer/manager/optimizer_loader.h"
 #include "kv_cache_manager/optimizer/manager/optimizer_manager.h"
+#include "kv_cache_manager/optimizer/config/hierarchical_replay_config_loader.h"
+#include "kv_cache_manager/optimizer/manager/hierarchical_replay_manager.h"
 
 namespace py = pybind11;
 namespace kvcm = kv_cache_manager;
@@ -187,5 +189,82 @@ PYBIND11_MODULE(kvcm_py_optimizer, module) {
              &kvcm::OptimizerManager::ClearAllCachesAndResetStats,
              py::call_guard<py::gil_scoped_release>(),
              "Clear caches and reset statistics for all instances");
+
+
+    // =========================================================================
+    // Hierarchical Replay Manager bindings
+    // =========================================================================
+
+    // HierarchicalGetCacheLocationRes
+    py::class_<kvcm::HierarchicalGetCacheLocationRes>(module, "HierarchicalGetCacheLocationRes")
+        .def_readonly("trace_id", &kvcm::HierarchicalGetCacheLocationRes::trace_id)
+        .def_readonly("engine_hit_length", &kvcm::HierarchicalGetCacheLocationRes::engine_hit_length)
+        .def_readonly("peer_hit_length", &kvcm::HierarchicalGetCacheLocationRes::peer_hit_length)
+        .def_readonly("storage_pool_hit_length", &kvcm::HierarchicalGetCacheLocationRes::storage_pool_hit_length)
+        .def_readonly("total_hit_length", &kvcm::HierarchicalGetCacheLocationRes::total_hit_length);
+
+    // HierarchicalReplayConfigLoader
+    py::class_<kvcm::HierarchicalReplayConfigLoader>(module, "HierarchicalReplayConfigLoader")
+        .def(py::init<>())
+        .def("load", &kvcm::HierarchicalReplayConfigLoader::Load)
+        .def("config", &kvcm::HierarchicalReplayConfigLoader::get_config);
+
+    // HierarchicalReplayConfig
+    py::class_<kvcm::HierarchicalReplayConfig>(module, "HierarchicalReplayConfig")
+        .def(py::init<>())
+        .def("trace_file_path", &kvcm::HierarchicalReplayConfig::trace_file_path)
+        .def("set_trace_file_path", &kvcm::HierarchicalReplayConfig::set_trace_file_path)
+        .def("output_result_path", &kvcm::HierarchicalReplayConfig::output_result_path)
+        .def("set_output_result_path", &kvcm::HierarchicalReplayConfig::set_output_result_path)
+        .def("infer_scheduling_strategy", &kvcm::HierarchicalReplayConfig::infer_scheduling_strategy)
+        .def("set_infer_scheduling_strategy", &kvcm::HierarchicalReplayConfig::set_infer_scheduling_strategy)
+        .def("infer_active_windows_from_trace", &kvcm::HierarchicalReplayConfig::infer_active_windows_from_trace)
+        .def("set_infer_active_windows_from_trace", &kvcm::HierarchicalReplayConfig::set_infer_active_windows_from_trace);
+
+
+    // ChooseBestEngineRes
+    py::class_<kvcm::ChooseBestEngineRes>(module, "ChooseBestEngineRes")
+        .def_readonly("engine_instance_id", &kvcm::ChooseBestEngineRes::engine_instance_id)
+        .def_readonly("hit_count", &kvcm::ChooseBestEngineRes::hit_count);
+
+    // HierarchicalReplayManager
+    py::class_<kvcm::HierarchicalReplayManager>(module, "HierarchicalReplayManager")
+        .def(py::init<const kvcm::HierarchicalReplayConfig &>())
+        .def("Init", &kvcm::HierarchicalReplayManager::Init, py::call_guard<py::gil_scoped_release>())
+        .def("DirectRun", &kvcm::HierarchicalReplayManager::DirectRun, py::call_guard<py::gil_scoped_release>(),
+             "Run full trace replay from the configured trace file")
+        .def("AnalyzeResults", &kvcm::HierarchicalReplayManager::AnalyzeResults,
+             py::call_guard<py::gil_scoped_release>(),
+             "Finalize and export hierarchical hit rate analysis")
+        .def("GetCacheLocation", &kvcm::HierarchicalReplayManager::GetCacheLocation,
+             py::call_guard<py::gil_scoped_release>(),
+             py::arg("engine_instance_id"),
+             py::arg("trace_id"),
+             py::arg("timestamp"),
+             py::arg("block_ids"),
+             py::arg("input_len"),
+             py::arg("query_type") = "prefix_match",
+             "Query cache with hierarchical read: engine local -> P2P peer -> storage pool")
+        .def("ChooseBestEngine", &kvcm::HierarchicalReplayManager::ChooseBestEngine,
+             py::call_guard<py::gil_scoped_release>(),
+             py::arg("block_ids"),
+             py::arg("timestamp"),
+             "Find the engine with the longest prefix match for given block_ids (single C++ call)")
+        .def("WriteCache", &kvcm::HierarchicalReplayManager::WriteCache,
+             py::call_guard<py::gil_scoped_release>(),
+             py::arg("engine_instance_id"),
+             py::arg("trace_id"),
+             py::arg("timestamp"),
+             py::arg("block_ids"),
+             py::arg("ttl_seconds") = int64_t(0),
+             "Write blocks to hierarchical cache with tier flow propagation")
+        .def("WriteCacheWithTtlUs", &kvcm::HierarchicalReplayManager::WriteCacheWithTtlUs,
+             py::call_guard<py::gil_scoped_release>(),
+             py::arg("engine_instance_id"),
+             py::arg("trace_id"),
+             py::arg("timestamp"),
+             py::arg("block_ids"),
+             py::arg("ttl_us"),
+             "Write blocks with microsecond TTL granularity");
 
 } // namespace kv_cache_manager

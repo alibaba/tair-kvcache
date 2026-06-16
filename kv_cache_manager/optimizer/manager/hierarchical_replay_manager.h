@@ -26,6 +26,12 @@ struct HierarchicalGetCacheLocationRes {
     int64_t total_hit_length = 0;
 };
 
+
+struct ChooseBestEngineRes {
+    std::string engine_instance_id;
+    int64_t hit_count = 0;
+};
+
 class HierarchicalReplayManager {
 public:
     explicit HierarchicalReplayManager(const HierarchicalReplayConfig &config);
@@ -43,6 +49,9 @@ public:
                                                      const std::vector<int64_t> &block_ids,
                                                      int64_t input_len,
                                                      const std::string &query_type = "prefix_match");
+    ChooseBestEngineRes ChooseBestEngine(const std::vector<int64_t> &block_ids,
+                                         int64_t timestamp);
+
     WriteCacheRes WriteCache(const std::string &engine_instance_id,
                              const std::string &trace_id,
                              int64_t timestamp,

@@ -130,4 +130,19 @@ TierGlobalPeerSelection TierGlobalTracker::SelectPeer(const std::string &engine_
     return selection;
 }
 
+std::unordered_set<std::string>
+TierGlobalTracker::HoldersOf(const std::string &cluster_id,
+                             const std::string &tier,
+                             int64_t block_key) const {
+    auto scope_it = holders_.find(ScopeKey(cluster_id, tier));
+    if (scope_it == holders_.end()) {
+        return {};
+    }
+    auto key_it = scope_it->second.find(block_key);
+    if (key_it == scope_it->second.end()) {
+        return {};
+    }
+    return key_it->second;
+}
+
 } // namespace kv_cache_manager

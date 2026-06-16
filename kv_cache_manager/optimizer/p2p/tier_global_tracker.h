@@ -33,6 +33,11 @@ public:
                                                      const std::vector<int64_t> &block_ids,
                                                      const std::vector<bool> &satisfied_mask) const;
 
+    /// Return the set of infer_ids that hold the given block_key in (cluster, tier).
+    /// Used by ChooseBestEngine to narrow candidate engines before PrefixMatchCount.
+    [[nodiscard]] std::unordered_set<std::string>
+    HoldersOf(const std::string &cluster_id, const std::string &tier, int64_t block_key) const;
+
 private:
     static std::string ScopeKey(const std::string &cluster_id, const std::string &tier);
 
