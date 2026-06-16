@@ -43,6 +43,11 @@ bool Server::Init(const ServerConfig &config) {
 
     config_ = config;
 
+    if (!config_.Check()) {
+        KVCM_LOG_ERROR("server config check failed");
+        return false;
+    }
+
     if (!CreateLeaderElector()) {
         return false;
     }

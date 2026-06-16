@@ -24,9 +24,14 @@ std::vector<double> ServerConfig::ParseRevisitIntervalBuckets(const std::string 
             continue;
         }
         try {
-            double val = std::stod(token);
-            if (val <= 0.0) {
-                fprintf(stderr, "Bucket boundary must be positive: %s\n", token.c_str());
+            size_t pos = 0;
+            double val = std::stod(token, &pos);
+            if (pos != token.size()) {
+                fprintf(stderr, "Trailing characters in bucket boundary: %s\n", token.c_str());
+                return {};
+            }
+            if (val <= 0.0 || !std::isfinite(val)) {
+                fprintf(stderr, "Bucket boundary must be positive and finite: %s\n", token.c_str());
                 return {};
             }
             boundaries.push_back(val);
