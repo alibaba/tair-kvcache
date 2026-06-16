@@ -361,6 +361,7 @@ class DisaggBenchmarkRunner:
 
         self.request_output_lengths: dict[int, int] = dict()
         self.request_output_ids: dict[int, list] = dict()
+        self.request_to_p_worker: dict[int, int] = dict()  # req.id -> p_worker_idx for load tracking
 
         # 策略状态缓存
         self.p_staging_queue: list[FakeRequest] = []
@@ -503,6 +504,9 @@ class DisaggBenchmarkRunner:
         logger.debug(
             f"policy:{policy.name} reqid:{req.id}  reqlen:{req.input_token_length} is_decode:{is_decode} select_id: {select_id}"
         )
+        # Track request -> worker mapping for load decrement on completion
+        if not is_decode:
+            self.request_to_p_worker[req.id] = select_id
         schedulers[select_id].request_queue.put_nowait(req)
         return select_id
 
@@ -544,6 +548,10 @@ class DisaggBenchmarkRunner:
 
             req = self._safe_get_request(self.router_queue)
             if req:
+                # Decrement P worker load: request completed on prefill node
+                p_worker_idx = self.request_to_p_worker.pop(req.id, None)
+                if p_worker_idx is not None:
+                    self.p_policy.complete_request(p_worker_idx)
                 req.output_token_length = self.request_output_lengths.pop(req.id, 1)
                 req.output_ids = self.request_output_ids.pop(req.id, 1)
                 self.d_staging_queue.append(req)

@@ -51,7 +51,6 @@ def _make_policy_with_mock_schedulers(num_engines: int, page_size: int, cache_th
         p_policy=RoutingPolicy.DIRECT_CACHE_AWARE,
         cache_threshold=cache_threshold,
         balance_abs_threshold=100,  # high to avoid load-balance trigger
-        balance_rel_threshold=10.0,
     )
     policy = DirectCacheAwarePolicy(num_engines, config)
 

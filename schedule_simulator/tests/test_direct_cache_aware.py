@@ -32,7 +32,6 @@ def _make_runner(
     use_real_token=False,
     cache_threshold=0.3,
     balance_abs_threshold=64,
-    balance_rel_threshold=1.5,
 ):
     random.seed(seed)
     np.random.seed(seed)
@@ -58,7 +57,6 @@ def _make_runner(
         worker_startup_check_interval=0.01,
         cache_threshold=cache_threshold,
         balance_abs_threshold=balance_abs_threshold,
-        balance_rel_threshold=balance_rel_threshold,
     )
     return DisaggBenchmarkRunner(
         benchmark_config=bc,
@@ -171,7 +169,6 @@ def test_load_balance_override():
     runner = _make_runner(
         num_p=5, num_requests=50,
         balance_abs_threshold=2,
-        balance_rel_threshold=1.2,
     )
     metrics = runner.run_benchmark_emulation()
     assert metrics["completed"] == 50
