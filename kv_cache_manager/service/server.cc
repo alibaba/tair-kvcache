@@ -69,7 +69,7 @@ bool Server::Init(const ServerConfig &config) {
                 "type": "local_replica",
                 "write": {
                     "ops": {
-                        "prefer_local": {"on_miss": "passthrough"},
+                        "prefer_local": {"on_miss": "abort"},
                         "limit": 2
                     }
                 },
