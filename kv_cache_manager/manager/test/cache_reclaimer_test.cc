@@ -23,17 +23,21 @@
 #include "kv_cache_manager/config/meta_cache_policy_config.h"
 #include "kv_cache_manager/config/meta_indexer_config.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
+#include "kv_cache_manager/config/migration_strategy.h"
 #include "kv_cache_manager/config/model_deployment.h"
 #include "kv_cache_manager/config/quota_config.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/config/trigger_strategy.h"
+#include "kv_cache_manager/data_storage/data_storage_backend.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/manager/cache_reclaimer.h"
 #include "kv_cache_manager/manager/meta_searcher.h"
 #include "kv_cache_manager/manager/meta_searcher_manager.h"
+#include "kv_cache_manager/manager/migration_manager.h"
 #include "kv_cache_manager/manager/schedule_plan_executor.h"
+#include "kv_cache_manager/manager/write_location_manager.h"
 #include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
@@ -72,6 +76,53 @@ CacheLocationConstPtr MakeCacheLocation(const std::string &location_id,
     }
     return std::make_shared<CacheLocation>(location_id, status, type, specs.size(), std::move(specs));
 }
+
+class TypedTestBackend : public DataStorageBackend {
+public:
+    TypedTestBackend(std::shared_ptr<MetricsRegistry> metrics_registry, DataStorageType type)
+        : DataStorageBackend(std::move(metrics_registry)), type_(type) {}
+
+    DataStorageType GetType() override { return type_; }
+    bool Available() override { return true; }
+    double GetStorageUsageRatio(const std::string &trace_id) const override {
+        static_cast<void>(trace_id);
+        return 0.0;
+    }
+    ErrorCode DoOpen(const StorageConfig &config, const std::string &trace_id) override {
+        static_cast<void>(config);
+        static_cast<void>(trace_id);
+        return EC_OK;
+    }
+    ErrorCode Close() override { return EC_OK; }
+    std::vector<std::pair<ErrorCode, DataStorageUri>> Create(const std::vector<std::string> &keys,
+                                                             size_t size_per_key,
+                                                             const std::string &trace_id,
+                                                             std::function<void()> cb) override {
+        static_cast<void>(size_per_key);
+        static_cast<void>(trace_id);
+        static_cast<void>(cb);
+        return std::vector<std::pair<ErrorCode, DataStorageUri>>(keys.size(), {EC_OK, DataStorageUri{}});
+    }
+    std::vector<ErrorCode> Delete(const std::vector<DataStorageUri> &storage_uris,
+                                  const std::string &trace_id,
+                                  std::function<void()> cb) override {
+        static_cast<void>(trace_id);
+        static_cast<void>(cb);
+        return std::vector<ErrorCode>(storage_uris.size(), EC_OK);
+    }
+    std::vector<bool> Exist(const std::vector<DataStorageUri> &storage_uris) override {
+        return std::vector<bool>(storage_uris.size(), true);
+    }
+    std::vector<ErrorCode> Lock(const std::vector<DataStorageUri> &storage_uris) override {
+        return std::vector<ErrorCode>(storage_uris.size(), EC_OK);
+    }
+    std::vector<ErrorCode> UnLock(const std::vector<DataStorageUri> &storage_uris) override {
+        return std::vector<ErrorCode>(storage_uris.size(), EC_OK);
+    }
+
+private:
+    DataStorageType type_;
+};
 
 /* ---------------- RegistryManager_ListInstanceGroup_stub ---------------- */
 
@@ -286,9 +337,11 @@ MetaIndexer_RandomSample_stub(void *obj, RequestContext *rc, const std::size_t c
 std::chrono::milliseconds mi_sample_reclaim_delay{0};
 ErrorCode sample_reclaim_result;
 KeyVector sample_reclaim_keys;
+int sample_reclaim_call_counter;
 
 ErrorCode
 MetaIndexer_SampleReclaimKeys_stub(void *obj, RequestContext *rc, const std::int64_t c, KeyVector &out_keys) noexcept {
+    ++sample_reclaim_call_counter;
     if (sample_reclaim_result == ErrorCode::EC_OK) {
         if (c == static_cast<std::int64_t>(sample_reclaim_keys.size())) {
             out_keys = sample_reclaim_keys;
@@ -328,18 +381,26 @@ MetaSearcher *MetaSearcherManager_GetMetaSearcher_stub(void *obj, const std::str
 std::chrono::milliseconds ms_batchgetloc_delay{0};
 ErrorCode batch_get_loc_result;
 std::vector<CacheLocationMap> batch_get_loc_out_maps;
+int batch_get_loc_call_counter;
 
 ErrorCode MetaSearcher_BatchGetLocation_stub(void *obj,
                                              RequestContext *rc,
                                              const std::vector<std::int64_t> &kv,
                                              const BlockMask &bm,
                                              std::vector<CacheLocationMap> &out_loc_maps) {
+    ++batch_get_loc_call_counter;
     if (batch_get_loc_result == ErrorCode::EC_OK) {
         out_loc_maps = batch_get_loc_out_maps;
     }
     std::this_thread::sleep_for(ms_batchgetloc_delay);
     return batch_get_loc_result;
 }
+
+std::vector<MigrationManager::MigrationRequest> captured_copy_reqs;
+std::vector<std::vector<MigrationManager::MigrationRequest>> captured_copy_req_batches;
+std::string captured_copy_trace;
+std::vector<std::int64_t> captured_mark_keys;
+std::string captured_mark_target;
 
 class CacheReclaimerTest : public TESTBASE {
 public:
@@ -374,10 +435,17 @@ public:
         spe_submit_accepted = true;
         spe_submit_auto_complete = true;
         spe_submit_invalid_future = false;
+        captured_copy_reqs.clear();
+        captured_copy_req_batches.clear();
+        captured_copy_trace.clear();
+        captured_mark_keys.clear();
+        captured_mark_target.clear();
         get_result = ErrorCode::EC_OK;
         random_sample_result = ErrorCode::EC_OK;
         sample_reclaim_result = ErrorCode::EC_OK;
         batch_get_loc_result = ErrorCode::EC_OK;
+        sample_reclaim_call_counter = 0;
+        batch_get_loc_call_counter = 0;
 
         key_count = 1;
         max_key_count = 16;
@@ -398,9 +466,10 @@ public:
         msm_ = std::make_shared<MetaSearcherManager>(rm_, mim_);
         dsm_ = std::make_shared<DataStorageManager>(mr_);
         spe_ = std::make_shared<SchedulePlanExecutor>(0, mim_, dsm_, mr_);
+        mm_ = std::make_shared<MigrationManager>(spe_, mim_, dsm_);
 
-        cache_reclaimer_ =
-            std::make_unique<CacheReclaimer>(10, 100, 1, 10, 16, rm_, mim_, msm_, spe_, mr_, em_, nullptr);
+        cache_reclaimer_ = std::make_unique<CacheReclaimer>(
+            10, 100, 1, 10, 16, rm_, mim_, msm_, spe_, mr_, em_, nullptr, CacheReclaimerAsyncDeleteConfig{}, mm_);
 
         // avoid nullptr issue when testing methods that involve metrics
         // counter but no need to start the working thread
@@ -430,6 +499,10 @@ public:
             mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, delete_complete_count));
         cache_reclaimer_->METRICS_(cache_reclaimer, delete_fail_count) =
             mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, delete_fail_count));
+        cache_reclaimer_->METRICS_(cache_reclaimer, migration_copy_submitted_total) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, migration_copy_submitted_total));
+        cache_reclaimer_->METRICS_(cache_reclaimer, migration_mark_submitted_total) =
+            mr_->GetCounter(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, migration_mark_submitted_total));
 
         cache_reclaimer_->METRICS_(cache_reclaimer, reclaim_cron_duration_us) =
             mr_->GetGauge(SCOPED_METRICS_NAME_(CacheReclaimer, cache_reclaimer, reclaim_cron_duration_us));
@@ -471,11 +544,18 @@ public:
             submitted_del_requests.clear();
             submitted_del_promises.clear();
         }
+        captured_copy_reqs.clear();
+        captured_copy_req_batches.clear();
+        captured_copy_trace.clear();
+        captured_mark_keys.clear();
+        captured_mark_target.clear();
 
         get_out_properties.clear();
         random_sample_keys.clear();
         sample_reclaim_keys.clear();
         batch_get_loc_out_maps.clear();
+        sample_reclaim_call_counter = 0;
+        batch_get_loc_call_counter = 0;
 
         stub_.reset(ADDR(RegistryManager, ListInstanceGroup));
         stub_.reset(ADDR(RegistryManager, ListInstanceInfo));
@@ -562,6 +642,7 @@ public:
     std::shared_ptr<SchedulePlanExecutor> spe_;
     std::shared_ptr<MetricsRegistry> mr_;
     std::shared_ptr<EventManager> em_;
+    std::shared_ptr<MigrationManager> mm_;
     std::shared_ptr<RequestContext> request_context_;
 };
 
@@ -1024,93 +1105,6 @@ TEST_F(CacheReclaimerTest, TestNullMetaSearcher) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     ASSERT_TRUE(cache_reclaimer_->IsRunning()); // the worker thread should still be running
-}
-
-TEST_F(CacheReclaimerTest, TestTriggerReclaiming00) {
-    // instance 0 block byte size = 1024, key count = 1
-    // 1024 * 1 > 16
-    // should *not* trigger reclaiming by the used_size strategy
-    GTEST_SKIP() << "Skipping for reclaim_strategy->trigger_strategy().used_size() is ignored";
-
-    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 1024);
-
-    // use instance 0 from setup()
-
-    const auto ins_group = InstanceGroupFactory();
-    ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_size(16);
-    cache_reclaimer_->job_state_flag_ = true;
-    auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
-                                                     ins_group->name(),
-                                                     ins_group->quota(),
-                                                     ins_group->cache_config()->reclaim_strategy(),
-                                                     instance_infos);
-    ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
-}
-
-TEST_F(CacheReclaimerTest, TestTriggerReclaiming01) {
-    // instance 0 block byte size = 1024, key count = 1
-    // 1024 * 1 == 1024
-    // should *not* trigger reclaiming by the used_size strategy
-    GTEST_SKIP() << "Skipping for reclaim_strategy->trigger_strategy().used_size() is ignored";
-
-    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 1024);
-
-    // use instance 0 from setup()
-
-    const auto ins_group = InstanceGroupFactory();
-    ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_size(1024);
-    cache_reclaimer_->job_state_flag_ = true;
-    auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
-                                                     ins_group->name(),
-                                                     ins_group->quota(),
-                                                     ins_group->cache_config()->reclaim_strategy(),
-                                                     instance_infos);
-    ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
-}
-
-TEST_F(CacheReclaimerTest, TestTriggerReclaiming02) {
-    // instance 0 block byte size = 1024, key count = 1
-    // 1024 * 1 < 1025
-    // should *not* trigger reclaiming by the used_size strategy
-    GTEST_SKIP() << "Skipping for reclaim_strategy->trigger_strategy().used_size() is ignored";
-
-    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 1024);
-
-    // use instance 0 from setup()
-
-    const auto ins_group = InstanceGroupFactory();
-    ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_size(1025);
-    cache_reclaimer_->job_state_flag_ = true;
-    auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
-                                                     ins_group->name(),
-                                                     ins_group->quota(),
-                                                     ins_group->cache_config()->reclaim_strategy(),
-                                                     instance_infos);
-    ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
-}
-
-TEST_F(CacheReclaimerTest, TestTriggerReclaiming03) {
-    // test multiple instances
-    // instance 0 block byte size = 1024, key count = 1
-    // instance 1 block byte size = 256, key count = 1
-    // 1024 * 1 + 256 * 1 > 1025
-    // should *not* trigger reclaiming by the used_size strategy
-    GTEST_SKIP() << "Skipping for reclaim_strategy->trigger_strategy().used_size() is ignored";
-
-    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 1024);
-    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 256);
-
-    // use instance 0 from setup()
-
-    const auto ins_group = InstanceGroupFactory();
-    ins_group->cache_config_->reclaim_strategy_->trigger_strategy_.set_used_size(1025);
-    cache_reclaimer_->job_state_flag_ = true;
-    auto wle = cache_reclaimer_->GetWaterLevelExceed(request_context_.get(),
-                                                     ins_group->name(),
-                                                     ins_group->quota(),
-                                                     ins_group->cache_config()->reclaim_strategy(),
-                                                     instance_infos);
-    ASSERT_FALSE(CacheReclaimer::IsTriggerReclaiming(wle));
 }
 
 TEST_F(CacheReclaimerTest, TestTriggerReclaiming04) {
@@ -4085,44 +4079,425 @@ TEST_F(CacheReclaimerTest, TestDupKeys) {
     }
 }
 
-TEST_F(CacheReclaimerTest, TestPerf) {
-    GTEST_SKIP() << "Skipping for generic unit test run"; // delete this line to run this case
+// 活跃迁移任务不影响 FilterLocID 的驱逐选择；HasMigrationTask 只用于防重复迁移提交。
+TEST_F(CacheReclaimerTest, TestFilterLocIDDoesNotSkipActiveMigrationTask) {
+    const auto ins_info = InstanceInfoFactory();
 
-    spe_submit_delay = std::chrono::milliseconds{0};
-    mi_getprop_delay = std::chrono::milliseconds{0};
-    mi_randsample_delay = std::chrono::milliseconds{0};
-    ms_batchgetloc_delay = std::chrono::milliseconds{0};
+    // seed 一个活跃迁移任务，使 HasMigrationTask(42) 为真（43 无）。
+    mm_->DebugInsertActiveCopyTask(ins_info->instance_id(), 42, "");
+    ASSERT_TRUE(mm_->HasMigrationTask(ins_info->instance_id(), 42));
+    ASSERT_FALSE(mm_->HasMigrationTask(ins_info->instance_id(), 43));
 
-    int sampling_sz = 10000;
-    int batching_sz = 1000;
-    int sampling_sz_per_task = batching_sz;
+    auto make_serving_map = [](const std::string &loc_id) {
+        CacheLocationMap m;
+        auto loc = std::make_shared<CacheLocation>(
+            loc_id,
+            CacheLocationStatus::CLS_SERVING,
+            DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+            1,
+            std::vector<LocationSpec>{LocationSpec("TP0", "dummy://d/" + loc_id)});
+        m.emplace(loc_id, loc);
+        return m;
+    };
 
-    cache_reclaimer_->sampling_size_.store(sampling_sz);
-    cache_reclaimer_->sampling_size_per_task_.store(sampling_sz_per_task);
-    cache_reclaimer_->batching_size_.store(batching_sz);
+    // case 1: 仅 group 级（general）水位超阈值 -> 收集所有可驱逐 location。
+    {
+        batch_get_loc_out_maps = {make_serving_map("loc_a"), make_serving_map("loc_b")};
+        batch_get_loc_result = ErrorCode::EC_OK;
 
-    for (int i = 0; i != sampling_sz_per_task; ++i) {
-        sample_reclaim_keys.emplace_back(i);
-        get_out_properties.emplace_back(PropertyMap{{PROPERTY_LRU_TIME, "9"}});
+        CacheReclaimer::WaterLevelExceed wl;
+        wl.SetGeneralWaterLevelExceed(true);
+        ASSERT_FALSE(wl.CheckStorageTypeWaterLevelExceed());
+
+        std::vector<std::vector<std::string>> out;
+        CacheReclaimer::AgeStats age_stats;
+        ASSERT_TRUE(cache_reclaimer_->FilterLocID(request_context_.get(), ins_info, {42, 43}, wl, out, age_stats));
+        ASSERT_EQ(2u, out.size());
+        ASSERT_EQ(1u, out[0].size()) << "active migration task should not suppress eviction";
+        ASSERT_EQ("loc_a", out[0][0]);
+        ASSERT_EQ(1u, out[1].size());
+        ASSERT_EQ("loc_b", out[1][0]);
     }
 
-    batch_get_loc_out_maps = std::vector<CacheLocationMap>(
-        batching_sz,
-        CacheLocationMap{{"foo",
-                          std::make_shared<CacheLocation>("foo",
-                                                          CacheLocationStatus::CLS_SERVING,
-                                                          DataStorageType::DATA_STORAGE_TYPE_NFS,
-                                                          8,
-                                                          std::vector<LocationSpec>{})}});
+    // case 2: 某存储类型水位超阈值 -> 同样不因活跃迁移任务跳过。
+    {
+        batch_get_loc_out_maps = {make_serving_map("loc_a"), make_serving_map("loc_b")};
+        batch_get_loc_result = ErrorCode::EC_OK;
 
-    cache_reclaimer_->job_state_flag_ = true;
+        CacheReclaimer::WaterLevelExceed wl;
+        wl.SetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_DUMMY, true);
+        ASSERT_TRUE(wl.CheckStorageTypeWaterLevelExceed());
 
-    auto start_tp = std::chrono::steady_clock::now();
-    while (true) {
-        cache_reclaimer_->ReclaimByLRU(
-            request_context_, instance_infos.front(), CacheReclaimer::WaterLevelExceed{}, 1000);
-        if (std::chrono::steady_clock::now() - start_tp >= std::chrono::milliseconds(60 * 1000)) {
+        std::vector<std::vector<std::string>> out;
+        CacheReclaimer::AgeStats age_stats;
+        ASSERT_TRUE(cache_reclaimer_->FilterLocID(request_context_.get(), ins_info, {42, 43}, wl, out, age_stats));
+        ASSERT_EQ(2u, out.size());
+        ASSERT_EQ(1u, out[0].size()) << "migrating block not protected in storage-type eviction zone";
+        ASSERT_EQ("loc_a", out[0][0]);
+        ASSERT_EQ(1u, out[1].size());
+        ASSERT_EQ("loc_b", out[1][0]);
+    }
+}
+
+TEST_F(CacheReclaimerTest, TestFilterLocIDSkipsActiveWritingLocations) {
+    auto write_location_manager = std::make_shared<WriteLocationManager>();
+    cache_reclaimer_ = std::make_unique<CacheReclaimer>(
+        10, 100, 1, 10, 16, rm_, mim_, msm_, spe_, mr_, em_, write_location_manager, mm_);
+
+    const auto ins_info = InstanceInfoFactory();
+    mm_->DebugInsertActiveCopyTask(ins_info->instance_id(), 42, "migration_writing");
+    write_location_manager->Put("write_session",
+                                {44},
+                                {"client_writing"},
+                                60,
+                                [](std::unique_ptr<WriteLocationManager::WriteLocationInfo>) {});
+
+    auto make_writing_map = [](const std::string &loc_id) {
+        CacheLocationMap m;
+        auto loc = std::make_shared<CacheLocation>(
+            loc_id,
+            CacheLocationStatus::CLS_WRITING,
+            DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+            1,
+            std::vector<LocationSpec>{LocationSpec("TP0", "dummy://d/" + loc_id)});
+        m.emplace(loc_id, loc);
+        return m;
+    };
+
+    batch_get_loc_out_maps = {make_writing_map("migration_writing"),
+                              make_writing_map("orphan_writing"),
+                              make_writing_map("client_writing")};
+    batch_get_loc_result = ErrorCode::EC_OK;
+
+    CacheReclaimer::WaterLevelExceed wl;
+    wl.SetGeneralWaterLevelExceed(true);
+
+    std::vector<std::vector<std::string>> out;
+    CacheReclaimer::AgeStats age_stats;
+    ASSERT_TRUE(cache_reclaimer_->FilterLocID(request_context_.get(), ins_info, {42, 43, 44}, wl, out, age_stats));
+    ASSERT_EQ(3u, out.size());
+    EXPECT_TRUE(out[0].empty()) << "active copy target should not be treated as orphan";
+    ASSERT_EQ(1u, out[1].size());
+    EXPECT_EQ("orphan_writing", out[1][0]);
+    EXPECT_TRUE(out[2].empty()) << "active client write location should not be treated as orphan";
+}
+
+/* -------- keep_both 分层淘汰优先级（多副本保冷弃热）stub + test -------- */
+namespace {
+std::shared_ptr<const InstanceGroup> g_cold_ig;
+std::pair<ErrorCode, std::shared_ptr<const InstanceGroup>>
+RegistryManager_GetInstanceGroup_cold_stub(void * /*obj*/, RequestContext * /*rc*/, const std::string & /*ig*/) {
+    return {ErrorCode::EC_OK, g_cold_ig};
+}
+} // namespace
+
+// 多层存储 keep_both 配套：总水位超限时，对同时有冷/热副本的 block 只淘汰热(源)副本、保留冷副本；
+// 仅热副本的 block 维持正常淘汰。
+TEST_F(CacheReclaimerTest, TestFilterLocIDKeepColdEvictHot) {
+    // 构建带 target_storage=cold_01 的迁移策略的 IG，并通过 stub 让 GetInstanceGroup 返回它。
+    auto ig = InstanceGroupFactory();
+    {
+        auto cfg = std::make_shared<CacheConfig>();
+        auto strategy = std::make_shared<MigrationStrategy>();
+        strategy->set_storage_unique_name("hot_01");
+        strategy->set_target_storage("cold_01");
+        cfg->set_migration_strategies({strategy});
+        ig->set_cache_config(cfg);
+    }
+    g_cold_ig = ig;
+    stub_.set(ADDR(RegistryManager, GetInstanceGroup), RegistryManager_GetInstanceGroup_cold_stub);
+
+    const auto ins_info = InstanceInfoFactory();
+
+    auto make_loc = [](const std::string &loc_id, const std::string &storage) {
+        return std::make_shared<CacheLocation>(
+            loc_id,
+            CacheLocationStatus::CLS_SERVING,
+            DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+            1,
+            std::vector<LocationSpec>{LocationSpec("TP0", "dummy://" + storage + "/" + loc_id)});
+    };
+    // block 0: 冷+热 双副本; block 1: 仅热副本
+    CacheLocationMap m0;
+    m0.emplace("hot_a", make_loc("hot_a", "hot_01"));
+    m0.emplace("cold_a", make_loc("cold_a", "cold_01"));
+    CacheLocationMap m1;
+    m1.emplace("hot_b", make_loc("hot_b", "hot_01"));
+    batch_get_loc_out_maps = {std::move(m0), std::move(m1)};
+    batch_get_loc_result = ErrorCode::EC_OK;
+
+    CacheReclaimer::WaterLevelExceed wl;
+    wl.SetGeneralWaterLevelExceed(true); // 总水位超限分支
+    ASSERT_FALSE(wl.CheckStorageTypeWaterLevelExceed());
+
+    std::vector<std::vector<std::string>> out;
+    CacheReclaimer::AgeStats age_stats;
+    ASSERT_TRUE(cache_reclaimer_->FilterLocID(request_context_.get(), ins_info, {0, 1}, wl, out, age_stats));
+    ASSERT_EQ(2u, out.size());
+    // block 0 多副本 -> 只淘汰热副本 hot_a，保留 cold_a
+    ASSERT_EQ(1u, out[0].size()) << "multi-replica block should evict only the hot copy";
+    ASSERT_EQ("hot_a", out[0][0]);
+    // block 1 仅热副本 -> 正常淘汰
+    ASSERT_EQ(1u, out[1].size());
+    ASSERT_EQ("hot_b", out[1][0]);
+
+    stub_.reset(ADDR(RegistryManager, GetInstanceGroup));
+    g_cold_ig.reset();
+}
+
+TEST_F(CacheReclaimerTest, TestFilterLocIDDoesNotEvictHotWhenColdSpecsIncomplete) {
+    auto ig = InstanceGroupFactory();
+    {
+        auto cfg = std::make_shared<CacheConfig>();
+        auto strategy = std::make_shared<MigrationStrategy>();
+        strategy->set_storage_unique_name("hot_01");
+        strategy->set_target_storage("cold_01");
+        cfg->set_migration_strategies({strategy});
+        ig->set_cache_config(cfg);
+    }
+    g_cold_ig = ig;
+    stub_.set(ADDR(RegistryManager, GetInstanceGroup), RegistryManager_GetInstanceGroup_cold_stub);
+
+    const auto ins_info = InstanceInfoFactory();
+    auto hot_loc = std::make_shared<CacheLocation>(
+        "hot_full",
+        CacheLocationStatus::CLS_SERVING,
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        2,
+        std::vector<LocationSpec>{
+            LocationSpec("TP0", "dummy://hot_01/hot_full/tp0"),
+            LocationSpec("TP1", "dummy://hot_01/hot_full/tp1"),
+        });
+    auto partial_cold_loc = std::make_shared<CacheLocation>(
+        "cold_partial",
+        CacheLocationStatus::CLS_SERVING,
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://cold_01/cold_partial/tp0")});
+
+    CacheLocationMap loc_map;
+    loc_map.emplace("hot_full", hot_loc);
+    loc_map.emplace("cold_partial", partial_cold_loc);
+    batch_get_loc_out_maps = {std::move(loc_map)};
+    batch_get_loc_result = ErrorCode::EC_OK;
+
+    CacheReclaimer::WaterLevelExceed wl;
+    wl.SetGeneralWaterLevelExceed(true);
+
+    std::vector<std::vector<std::string>> out;
+    CacheReclaimer::AgeStats age_stats;
+    ASSERT_TRUE(cache_reclaimer_->FilterLocID(request_context_.get(), ins_info, {0}, wl, out, age_stats));
+    ASSERT_EQ(1u, out.size());
+    EXPECT_TRUE(out[0].empty()) << "hot location should stay until cold tier covers all of its specs";
+
+    stub_.reset(ADDR(RegistryManager, GetInstanceGroup));
+    g_cold_ig.reset();
+}
+
+TEST_F(CacheReclaimerTest, TestFilterLocIDDoesNotPreserveColdOrphanWriting) {
+    auto write_location_manager = std::make_shared<WriteLocationManager>();
+    cache_reclaimer_ = std::make_unique<CacheReclaimer>(
+        10, 100, 1, 10, 16, rm_, mim_, msm_, spe_, mr_, em_, write_location_manager, mm_);
+
+    auto ig = InstanceGroupFactory();
+    {
+        auto cfg = std::make_shared<CacheConfig>();
+        auto strategy = std::make_shared<MigrationStrategy>();
+        strategy->set_storage_unique_name("hot_01");
+        strategy->set_target_storage("cold_01");
+        cfg->set_migration_strategies({strategy});
+        ig->set_cache_config(cfg);
+    }
+    g_cold_ig = ig;
+    stub_.set(ADDR(RegistryManager, GetInstanceGroup), RegistryManager_GetInstanceGroup_cold_stub);
+
+    const auto ins_info = InstanceInfoFactory();
+    auto make_loc = [](const std::string &loc_id, const std::string &storage, CacheLocationStatus status) {
+        return std::make_shared<CacheLocation>(
+            loc_id,
+            status,
+            DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+            1,
+            std::vector<LocationSpec>{LocationSpec("TP0", "dummy://" + storage + "/" + loc_id)});
+    };
+
+    CacheLocationMap loc_map;
+    loc_map.emplace("hot_serving", make_loc("hot_serving", "hot_01", CacheLocationStatus::CLS_SERVING));
+    loc_map.emplace("cold_orphan", make_loc("cold_orphan", "cold_01", CacheLocationStatus::CLS_WRITING));
+    batch_get_loc_out_maps = {std::move(loc_map)};
+    batch_get_loc_result = ErrorCode::EC_OK;
+
+    CacheReclaimer::WaterLevelExceed wl;
+    wl.SetGeneralWaterLevelExceed(true);
+
+    std::vector<std::vector<std::string>> out;
+    CacheReclaimer::AgeStats age_stats;
+    ASSERT_TRUE(cache_reclaimer_->FilterLocID(request_context_.get(), ins_info, {0}, wl, out, age_stats));
+    ASSERT_EQ(1u, out.size());
+    ASSERT_EQ(2u, out[0].size());
+    std::sort(out[0].begin(), out[0].end());
+    EXPECT_EQ("cold_orphan", out[0][0]);
+    EXPECT_EQ("hot_serving", out[0][1]);
+
+    stub_.reset(ADDR(RegistryManager, GetInstanceGroup));
+    g_cold_ig.reset();
+}
+
+/* ---------------- increment B: migration strategy stubs ---------------- */
+
+namespace {
+CacheLocationConstPtr
+MakeLocWithStatus(const std::string &id, const std::string &storage, const CacheLocationStatus status) {
+    return std::make_shared<CacheLocation>(
+        id,
+        status,
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://" + storage + "/p_" + id)});
+}
+
+CacheLocationConstPtr MakeServingLoc(const std::string &id, const std::string &storage) {
+    return MakeLocWithStatus(id, storage, CacheLocationStatus::CLS_SERVING);
+}
+} // namespace
+
+// 按请求 key 构造对齐的 location map（不依赖 batch 顺序）：
+//   10,20,21,22,30 -> 仅在 hot_01
+//   11             -> hot_01 + cold_01(目标已有副本)
+//   12             -> 仅在 other_storage(非源)
+//   13             -> hot_01 + cold_01(目标已有 WRITING location)
+//   40             -> 仅在 hot_02
+ErrorCode MigrateTest_BatchGetLocation_stub(void *obj,
+                                            RequestContext *rc,
+                                            const std::vector<std::int64_t> &kv,
+                                            const BlockMask &bm,
+                                            std::vector<CacheLocationMap> &out_loc_maps) {
+    ++batch_get_loc_call_counter;
+    out_loc_maps.clear();
+    for (const auto k : kv) {
+        CacheLocationMap m;
+        switch (k) {
+        case 10:
+        case 20:
+        case 21:
+        case 22:
+        case 30:
+            m.emplace("src_" + std::to_string(k), MakeServingLoc("src_" + std::to_string(k), "hot_01"));
             break;
+        case 40:
+            m.emplace("src_" + std::to_string(k), MakeServingLoc("src_" + std::to_string(k), "hot_02"));
+            break;
+        case 50:
+            m.emplace("src_50", MakeServingLoc("src_50", "hot_vcns"));
+            break;
+        case 11:
+            m.emplace("src_11", MakeServingLoc("src_11", "hot_01"));
+            m.emplace("dst_11", MakeServingLoc("dst_11", "cold_01"));
+            break;
+        case 13:
+            m.emplace("src_13", MakeServingLoc("src_13", "hot_01"));
+            m.emplace("dst_13", MakeLocWithStatus("dst_13", "cold_01", CacheLocationStatus::CLS_WRITING));
+            break;
+        case 12:
+            m.emplace("oth_12", MakeServingLoc("oth_12", "other_storage"));
+            break;
+        default:
+            break;
+        }
+        out_loc_maps.emplace_back(std::move(m));
+    }
+    return ErrorCode::EC_OK;
+}
+
+std::vector<ErrorCode> MigrationManager_BatchSubmit_stub(void *obj,
+                                                         const std::string &trace_id,
+                                                         std::vector<MigrationManager::MigrationRequest> requests) {
+    captured_copy_trace = trace_id;
+    captured_copy_reqs = requests;
+    captured_copy_req_batches.emplace_back(requests);
+    return std::vector<ErrorCode>(requests.size(), ErrorCode::EC_OK);
+}
+
+ErrorCode MigrationManager_MarkForTieredWrite_stub(void *obj,
+                                                   const std::string &instance_id,
+                                                   const std::vector<std::int64_t> &block_keys,
+                                                   const std::string &dst_storage_name) {
+    static_cast<void>(obj);
+    static_cast<void>(instance_id);
+    captured_mark_keys = block_keys;
+    captured_mark_target = dst_storage_name;
+    return ErrorCode::EC_OK;
+}
+
+static MigrationStrategy MakeStrategy(const std::string &src,
+                                      const std::string &dst,
+                                      bool copy_enabled,
+                                      bool mark_enabled) {
+    MigrationStrategy strategy;
+    strategy.set_storage_unique_name(src);
+    strategy.set_target_storage(dst);
+    strategy.set_trigger_threshold(0.5);
+    MigrationMethods methods;
+    methods.set_copy(MigrationCopyMethod(copy_enabled));
+    methods.set_mark(MigrationMarkMethod(mark_enabled));
+    strategy.set_methods(methods);
+    strategy.set_retention(MigrationRetention::MIGRATION_RETENTION_DELETE_SOURCE);
+    return strategy;
+}
+
+TEST_F(CacheReclaimerTest, TestMigrateByStrategyOnBatch) {
+    stub_.set(ADDR(MigrationManager, BatchSubmit), MigrationManager_BatchSubmit_stub);
+    stub_.set(ADDR(MigrationManager, MarkForTieredWrite), MigrationManager_MarkForTieredWrite_stub);
+
+    cache_reclaimer_->job_state_flag_ = true; // 让 IsRunning() 为真，无需启动 cron 线程
+
+    const auto ins_info = InstanceInfoFactory();
+    auto make_loc_maps = [&](const std::vector<std::int64_t> &batch) {
+        std::vector<CacheLocationMap> loc_maps;
+        const BlockMask blk_mask(std::in_place_type<BlockMaskVector>, batch.size(), false);
+        const auto ec = MigrateTest_BatchGetLocation_stub(nullptr, request_context_.get(), batch, blk_mask, loc_maps);
+        EXPECT_EQ(ErrorCode::EC_OK, ec);
+        EXPECT_EQ(batch.size(), loc_maps.size());
+        return loc_maps;
+    };
+
+    // ---- 场景 A：准入过滤（仅 copy）----
+    {
+        captured_copy_reqs.clear();
+        captured_copy_req_batches.clear();
+        const std::vector<std::int64_t> batch = {10, 11, 12, 13};
+        const auto loc_maps = make_loc_maps(batch);
+
+        const auto strategy = MakeStrategy("hot_01", "cold_01", /*copy*/ true, /*mark*/ false);
+        const std::size_t submitted = cache_reclaimer_->MigrateByStrategyOnBatch(
+            request_context_, ins_info, strategy, /*available_copy_slots*/ 5, batch, loc_maps);
+
+        // 仅 block 10 合格：11 目标已有 SERVING 副本，12 不在源 storage 上，13 目标已有 WRITING location
+        ASSERT_EQ(1u, submitted);
+        ASSERT_EQ(1u, captured_copy_reqs.size());
+        ASSERT_EQ(10, captured_copy_reqs[0].block_key);
+        ASSERT_EQ("src_10", captured_copy_reqs[0].src_location_id);
+        ASSERT_EQ("hot_01", captured_copy_reqs[0].src_storage_name);
+        ASSERT_EQ("cold_01", captured_copy_reqs[0].dst_storage_name);
+    }
+
+    // ---- 场景 B：并发预算上限 ----
+    {
+        captured_copy_reqs.clear();
+        captured_copy_req_batches.clear();
+        const std::vector<std::int64_t> batch = {20, 21, 22};
+        const auto loc_maps = make_loc_maps(batch);
+
+        const auto strategy = MakeStrategy("hot_01", "cold_01", /*copy*/ true, /*mark*/ false);
+        const std::size_t submitted = cache_reclaimer_->MigrateByStrategyOnBatch(
+            request_context_, ins_info, strategy, /*available_copy_slots*/ 2, batch, loc_maps);
+
+        // 3 个合格候选，预算 2 -> 只提交 2 个
+        ASSERT_EQ(2u, submitted);
+        ASSERT_EQ(2u, captured_copy_reqs.size());
+        for (const auto &req : captured_copy_reqs) {
+            ASSERT_TRUE(req.block_key == 20 || req.block_key == 21 || req.block_key == 22);
+            ASSERT_EQ("hot_01", req.src_storage_name);
         }
     }
 
@@ -4131,49 +4506,273 @@ TEST_F(CacheReclaimerTest, TestPerf) {
     const auto &req = requests.back();
     ASSERT_EQ(batching_sz, req.block_keys.size());
 
-    std::uint64_t reclaim_cron_count_v;
-    std::uint64_t reclaim_job_count_v;
-    std::uint64_t blk_submit_count_v;
-    std::uint64_t loc_submit_count_v;
-    std::uint64_t blk_del_count_v;
-    std::uint64_t loc_del_count_v;
+    // ---- 场景 C：mark 路径 ----
+    {
+        captured_copy_reqs.clear();
+        captured_copy_req_batches.clear();
+        captured_mark_keys.clear();
+        const std::vector<std::int64_t> batch = {30};
+        const auto loc_maps = make_loc_maps(batch);
 
-    double reclaim_cron_duration_us_v;
-    double reclaim_job_duration_us_v;
-    double reclaim_lru_sample_duration_us_v;
-    double reclaim_lru_batch_duration_us_v;
-    double reclaim_lru_filter_duration_us_v;
-    double reclaim_lru_submit_duration_us_v;
+        const auto strategy = MakeStrategy("hot_01", "cold_01", /*copy*/ false, /*mark*/ true);
+        const std::size_t submitted = cache_reclaimer_->MigrateByStrategyOnBatch(
+            request_context_, ins_info, strategy, /*available_copy_slots*/ 0, batch, loc_maps);
 
-    GET_METRICS_(cache_reclaimer_, cache_reclaimer, reclaim_cron_count, reclaim_cron_count_v);
-    GET_METRICS_(cache_reclaimer_, cache_reclaimer, reclaim_job_count, reclaim_job_count_v);
-    GET_METRICS_(cache_reclaimer_, cache_reclaimer, block_submit_count, blk_submit_count_v);
-    GET_METRICS_(cache_reclaimer_, cache_reclaimer, location_submit_count, loc_submit_count_v);
-    GET_METRICS_(cache_reclaimer_, cache_reclaimer, block_del_count, blk_del_count_v);
-    GET_METRICS_(cache_reclaimer_, cache_reclaimer, location_del_count, loc_del_count_v);
+        ASSERT_EQ(0u, submitted); // 无 copy
+        ASSERT_TRUE(captured_copy_reqs.empty());
+        ASSERT_EQ(1u, captured_mark_keys.size());
+        ASSERT_EQ(30, captured_mark_keys[0]);
+        ASSERT_EQ("cold_01", captured_mark_target);
+    }
 
-    GET_METRICS_(cache_reclaimer_, cache_reclaimer, reclaim_cron_duration_us, reclaim_cron_duration_us_v);
-    GET_METRICS_(cache_reclaimer_, cache_reclaimer, reclaim_job_duration_us, reclaim_job_duration_us_v);
-    GET_METRICS_(cache_reclaimer_, cache_reclaimer, reclaim_lru_sample_duration_us, reclaim_lru_sample_duration_us_v);
-    GET_METRICS_(cache_reclaimer_, cache_reclaimer, reclaim_lru_batch_duration_us, reclaim_lru_batch_duration_us_v);
-    GET_METRICS_(cache_reclaimer_, cache_reclaimer, reclaim_lru_filter_duration_us, reclaim_lru_filter_duration_us_v);
-    GET_METRICS_(cache_reclaimer_, cache_reclaimer, reclaim_lru_submit_duration_us, reclaim_lru_submit_duration_us_v);
+    // ---- 场景 D：copy + mark 互斥分发，copy 优先；copy 槽位外才 mark ----
+    {
+        captured_copy_reqs.clear();
+        captured_copy_req_batches.clear();
+        captured_mark_keys.clear();
+        captured_mark_target.clear();
+        const std::vector<std::int64_t> batch = {20, 21, 22};
+        const auto loc_maps = make_loc_maps(batch);
 
-    KVCM_LOG_INFO("reclaim_cron_count: [%" PRIu64 "]", reclaim_cron_count_v);
-    KVCM_LOG_INFO("reclaim_job_count: [%" PRIu64 "]", reclaim_job_count_v);
-    KVCM_LOG_INFO("blk_submit_count: [%" PRIu64 "]", blk_submit_count_v);
-    KVCM_LOG_INFO("loc_submit_count: [%" PRIu64 "]", loc_submit_count_v);
-    KVCM_LOG_INFO("blk_del_count: [%" PRIu64 "]", blk_del_count_v);
-    KVCM_LOG_INFO("loc_del_count: [%" PRIu64 "]", loc_del_count_v);
+        const auto strategy = MakeStrategy("hot_01", "cold_01", /*copy*/ true, /*mark*/ true);
+        const std::size_t submitted = cache_reclaimer_->MigrateByStrategyOnBatch(
+            request_context_, ins_info, strategy, /*available_copy_slots*/ 2, batch, loc_maps);
 
-    KVCM_LOG_INFO("reclaim_cron_duration_us: [%f]", reclaim_cron_duration_us_v);
-    KVCM_LOG_INFO("reclaim_job_duration_us: [%f]", reclaim_job_duration_us_v);
-    KVCM_LOG_INFO("reclaim_lru_sample_duration_us: [%f]", reclaim_lru_sample_duration_us_v);
-    KVCM_LOG_INFO("reclaim_lru_batch_duration_us: [%f]", reclaim_lru_batch_duration_us_v);
-    KVCM_LOG_INFO("reclaim_lru_filter_duration_us: [%f]", reclaim_lru_filter_duration_us_v);
-    KVCM_LOG_INFO("reclaim_lru_submit_duration_us: [%f]", reclaim_lru_submit_duration_us_v);
+        ASSERT_EQ(2u, submitted);
+        ASSERT_EQ(2u, captured_copy_reqs.size());
+        ASSERT_EQ(1u, captured_mark_keys.size());
+        std::vector<std::int64_t> copied_keys;
+        for (const auto &req : captured_copy_reqs) {
+            copied_keys.push_back(req.block_key);
+            ASSERT_FALSE(VecContains(captured_mark_keys, req.block_key));
+        }
+        ASSERT_TRUE(VecContains(copied_keys, 20) || VecContains(captured_mark_keys, 20));
+        ASSERT_TRUE(VecContains(copied_keys, 21) || VecContains(captured_mark_keys, 21));
+        ASSERT_TRUE(VecContains(copied_keys, 22) || VecContains(captured_mark_keys, 22));
+        ASSERT_EQ("cold_01", captured_mark_target);
+    }
 
-    KVCM_LOG_INFO("run time: 60 sec, reclaim job qps: [%f], loc del qps: [%f]",
-                  static_cast<double>(reclaim_job_count_v) / 60.0,
-                  static_cast<double>(loc_submit_count_v) / 60.0);
+    stub_.reset(ADDR(MigrationManager, BatchSubmit));
+    stub_.reset(ADDR(MigrationManager, MarkForTieredWrite));
+}
+
+TEST_F(CacheReclaimerTest, TestTryMigrateOnGroupReusesSampledBatchAcrossStrategies) {
+    stub_.set(ADDR(MetaSearcher, BatchGetLocation), MigrateTest_BatchGetLocation_stub);
+    stub_.set(ADDR(MigrationManager, BatchSubmit), MigrationManager_BatchSubmit_stub);
+
+    cache_reclaimer_->job_state_flag_ = true;
+    rm_->data_storage_manager_ = dsm_;
+
+    auto register_nfs_storage = [this](const std::string &name) {
+        auto spec = std::make_shared<NfsStorageSpec>();
+        spec->set_root_path(GetPrivateTestRuntimeDataPath() + name + "/");
+        spec->set_key_count_per_file(1);
+        StorageConfig storage_config(DataStorageType::DATA_STORAGE_TYPE_NFS, name, spec);
+        ASSERT_EQ(ErrorCode::EC_OK, dsm_->RegisterStorage(request_context_.get(), name, storage_config));
+    };
+    register_nfs_storage("hot_01");
+    register_nfs_storage("hot_02");
+
+    auto ins_group = InstanceGroupFactory();
+    {
+        QuotaConfig quota_config;
+        quota_config.set_capacity(1000);
+        quota_config.set_storage_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
+        InstanceGroupQuota quota;
+        quota.set_capacity(1000);
+        quota.set_quota_config({quota_config});
+        ins_group->set_quota(quota);
+
+        auto cfg = std::make_shared<CacheConfig>();
+        cfg->set_reclaim_strategy(ins_group->cache_config()->reclaim_strategy());
+        cfg->set_meta_indexer_config(ins_group->cache_config()->meta_indexer_config());
+        cfg->set_migration_copy_max_concurrency(2);
+        cfg->set_migration_strategies({
+            std::make_shared<MigrationStrategy>(MakeStrategy("hot_01", "cold_01", /*copy*/ true, /*mark*/ false)),
+            std::make_shared<MigrationStrategy>(MakeStrategy("hot_02", "cold_02", /*copy*/ true, /*mark*/ false)),
+        });
+        ins_group->set_cache_config(cfg);
+    }
+
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 800);
+    key_count = 2;
+    max_key_count = 16;
+    sample_reclaim_keys = {10, 40};
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 2));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 2));
+
+    captured_copy_reqs.clear();
+    captured_copy_req_batches.clear();
+    cache_reclaimer_->TryMigrateOnGroup(request_context_, ins_group, {InstanceInfoFactory()});
+
+    ASSERT_EQ(1, sample_reclaim_call_counter);
+    ASSERT_EQ(1, batch_get_loc_call_counter);
+    ASSERT_EQ(2u, captured_copy_req_batches.size());
+    ASSERT_EQ(1u, captured_copy_req_batches[0].size());
+    ASSERT_EQ(10, captured_copy_req_batches[0][0].block_key);
+    ASSERT_EQ("hot_01", captured_copy_req_batches[0][0].src_storage_name);
+    ASSERT_EQ(1u, captured_copy_req_batches[1].size());
+    ASSERT_EQ(40, captured_copy_req_batches[1][0].block_key);
+    ASSERT_EQ("hot_02", captured_copy_req_batches[1][0].src_storage_name);
+
+    stub_.reset(ADDR(MetaSearcher, BatchGetLocation));
+    stub_.reset(ADDR(MigrationManager, BatchSubmit));
+}
+
+// 水位低于 trigger_threshold 时 TryMigrateOnGroup 不下发任何 copy/mark。
+TEST_F(CacheReclaimerTest, TestTryMigrateOnGroupSkipsBelowThreshold) {
+    stub_.set(ADDR(MetaSearcher, BatchGetLocation), MigrateTest_BatchGetLocation_stub);
+    stub_.set(ADDR(MigrationManager, BatchSubmit), MigrationManager_BatchSubmit_stub);
+    stub_.set(ADDR(MigrationManager, MarkForTieredWrite), MigrationManager_MarkForTieredWrite_stub);
+
+    cache_reclaimer_->job_state_flag_ = true;
+    rm_->data_storage_manager_ = dsm_;
+
+    auto spec = std::make_shared<NfsStorageSpec>();
+    spec->set_root_path(GetPrivateTestRuntimeDataPath() + "hot_01/");
+    spec->set_key_count_per_file(1);
+    StorageConfig storage_config(DataStorageType::DATA_STORAGE_TYPE_NFS, "hot_01", spec);
+    ASSERT_EQ(ErrorCode::EC_OK, dsm_->RegisterStorage(request_context_.get(), "hot_01", storage_config));
+
+    auto ins_group = InstanceGroupFactory();
+    {
+        QuotaConfig quota_config;
+        quota_config.set_capacity(1000);
+        quota_config.set_storage_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
+        InstanceGroupQuota quota;
+        quota.set_capacity(1000);
+        quota.set_quota_config({quota_config});
+        ins_group->set_quota(quota);
+
+        auto cfg = std::make_shared<CacheConfig>();
+        cfg->set_reclaim_strategy(ins_group->cache_config()->reclaim_strategy());
+        cfg->set_meta_indexer_config(ins_group->cache_config()->meta_indexer_config());
+        cfg->set_migration_strategies({
+            std::make_shared<MigrationStrategy>(MakeStrategy("hot_01", "cold_01", /*copy*/ true, /*mark*/ true)),
+        });
+        ins_group->set_cache_config(cfg);
+    }
+
+    // 用量 200 / 容量 1000 = 0.2 < threshold 0.5 -> 水位门控早返回。
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 200);
+    sample_reclaim_keys = {10};
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 1));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 1));
+
+    captured_copy_reqs.clear();
+    captured_copy_req_batches.clear();
+    captured_mark_keys.clear();
+    cache_reclaimer_->TryMigrateOnGroup(request_context_, ins_group, {InstanceInfoFactory()});
+
+    ASSERT_TRUE(captured_copy_reqs.empty());
+    ASSERT_TRUE(captured_copy_req_batches.empty());
+    ASSERT_TRUE(captured_mark_keys.empty());
+    ASSERT_EQ(0, sample_reclaim_call_counter); // 未触发采样
+    ASSERT_EQ(0, batch_get_loc_call_counter);
+
+    stub_.reset(ADDR(MetaSearcher, BatchGetLocation));
+    stub_.reset(ADDR(MigrationManager, BatchSubmit));
+    stub_.reset(ADDR(MigrationManager, MarkForTieredWrite));
+}
+
+// quota 中不含源 storage 对应 type 时（capacity<=0），TryMigrateOnGroup 跳过该 strategy。
+TEST_F(CacheReclaimerTest, TestTryMigrateOnGroupSkipsWhenNoCapacity) {
+    stub_.set(ADDR(MetaSearcher, BatchGetLocation), MigrateTest_BatchGetLocation_stub);
+    stub_.set(ADDR(MigrationManager, BatchSubmit), MigrationManager_BatchSubmit_stub);
+    stub_.set(ADDR(MigrationManager, MarkForTieredWrite), MigrationManager_MarkForTieredWrite_stub);
+
+    cache_reclaimer_->job_state_flag_ = true;
+    rm_->data_storage_manager_ = dsm_;
+
+    auto spec = std::make_shared<NfsStorageSpec>();
+    spec->set_root_path(GetPrivateTestRuntimeDataPath() + "hot_01/");
+    spec->set_key_count_per_file(1);
+    StorageConfig storage_config(DataStorageType::DATA_STORAGE_TYPE_NFS, "hot_01", spec);
+    ASSERT_EQ(ErrorCode::EC_OK, dsm_->RegisterStorage(request_context_.get(), "hot_01", storage_config));
+
+    auto ins_group = InstanceGroupFactory();
+    {
+        // quota 不为 NFS 类型设置 capacity -> capacity=0 -> 早返回。
+        InstanceGroupQuota quota;
+        quota.set_capacity(0);
+        quota.set_quota_config({});
+        ins_group->set_quota(quota);
+
+        auto cfg = std::make_shared<CacheConfig>();
+        cfg->set_reclaim_strategy(ins_group->cache_config()->reclaim_strategy());
+        cfg->set_meta_indexer_config(ins_group->cache_config()->meta_indexer_config());
+        cfg->set_migration_strategies({
+            std::make_shared<MigrationStrategy>(MakeStrategy("hot_01", "cold_01", /*copy*/ true, /*mark*/ true)),
+        });
+        ins_group->set_cache_config(cfg);
+    }
+
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 800);
+    sample_reclaim_keys = {10};
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 1));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 1));
+
+    captured_copy_reqs.clear();
+    captured_copy_req_batches.clear();
+    captured_mark_keys.clear();
+    cache_reclaimer_->TryMigrateOnGroup(request_context_, ins_group, {InstanceInfoFactory()});
+
+    ASSERT_TRUE(captured_copy_reqs.empty());
+    ASSERT_TRUE(captured_copy_req_batches.empty());
+    ASSERT_TRUE(captured_mark_keys.empty());
+    ASSERT_EQ(0, sample_reclaim_call_counter);
+    ASSERT_EQ(0, batch_get_loc_call_counter);
+
+    stub_.reset(ADDR(MetaSearcher, BatchGetLocation));
+    stub_.reset(ADDR(MigrationManager, BatchSubmit));
+    stub_.reset(ADDR(MigrationManager, MarkForTieredWrite));
+}
+
+// VCNS_HF3FS 在水位/用量统计上归并到 HF3FS；迁移策略查 source type quota 时也应一致归并。
+TEST_F(CacheReclaimerTest, TestTryMigrateOnGroupNormalizesVcnsSourceTypeForQuota) {
+    stub_.set(ADDR(MetaSearcher, BatchGetLocation), MigrateTest_BatchGetLocation_stub);
+    stub_.set(ADDR(MigrationManager, BatchSubmit), MigrationManager_BatchSubmit_stub);
+
+    cache_reclaimer_->job_state_flag_ = true;
+    rm_->data_storage_manager_ = dsm_;
+
+    dsm_->storage_map_["hot_vcns"] =
+        std::make_shared<TypedTestBackend>(mr_, DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS);
+
+    auto ins_group = InstanceGroupFactory();
+    {
+        QuotaConfig quota_config;
+        quota_config.set_capacity(1000);
+        quota_config.set_storage_type(DataStorageType::DATA_STORAGE_TYPE_HF3FS);
+        InstanceGroupQuota quota;
+        quota.set_capacity(1000);
+        quota.set_quota_config({quota_config});
+        ins_group->set_quota(quota);
+
+        auto cfg = std::make_shared<CacheConfig>();
+        cfg->set_reclaim_strategy(ins_group->cache_config()->reclaim_strategy());
+        cfg->set_meta_indexer_config(ins_group->cache_config()->meta_indexer_config());
+        cfg->set_migration_strategies({
+            std::make_shared<MigrationStrategy>(MakeStrategy("hot_vcns", "cold_01", /*copy*/ true, /*mark*/ false)),
+        });
+        ins_group->set_cache_config(cfg);
+    }
+
+    dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS, 800);
+    sample_reclaim_keys = {50};
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetSamplingSize(request_context_.get(), 1));
+    ASSERT_EQ(ErrorCode::EC_OK, cache_reclaimer_->SetBatchingSize(request_context_.get(), 1));
+
+    captured_copy_reqs.clear();
+    captured_copy_req_batches.clear();
+    cache_reclaimer_->TryMigrateOnGroup(request_context_, ins_group, {InstanceInfoFactory()});
+
+    ASSERT_EQ(1, sample_reclaim_call_counter);
+    ASSERT_EQ(1, batch_get_loc_call_counter);
+    ASSERT_EQ(1u, captured_copy_reqs.size());
+    ASSERT_EQ(50, captured_copy_reqs[0].block_key);
+    ASSERT_EQ("hot_vcns", captured_copy_reqs[0].src_storage_name);
+
+    stub_.reset(ADDR(MetaSearcher, BatchGetLocation));
+    stub_.reset(ADDR(MigrationManager, BatchSubmit));
 }

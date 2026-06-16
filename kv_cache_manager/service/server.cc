@@ -121,6 +121,7 @@ void Server::OnBecomeLeader() {
         return;
     }
     cache_manager_->ResumeReclaimer();
+    cache_manager_->StartMigrationManager();
 
     meta_impl_->EnableLeaderOnlyRequests();
     admin_impl_->EnableLeaderOnlyRequests();
@@ -136,6 +137,10 @@ void Server::OnNoLongerLeader() {
 
     meta_impl_->WaitForAllLeaderOnlyRequestsToComplete();
     admin_impl_->WaitForAllLeaderOnlyRequestsToComplete();
+
+    // Stop migration after leader-only requests drain, so MigrateCache cannot submit
+    // new copy tasks after the migration monitor has stopped.
+    cache_manager_->StopMigrationManager();
 
     ErrorCode ec = cache_manager_->DoCleanup();
     if (ec != EC_OK) {

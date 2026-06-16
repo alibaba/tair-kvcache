@@ -10,6 +10,7 @@
 #include <forward_list>
 #include <functional>
 #include <future>
+#include <initializer_list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -54,6 +55,8 @@ class InstanceGroupQuota;
 class InstanceInfo;
 class MetaIndexerManager;
 class MetaSearcherManager;
+class MigrationManager;
+class MigrationStrategy;
 class RegistryManager;
 class RequestContext;
 class SchedulePlanExecutor;
@@ -159,7 +162,8 @@ public:
                    std::shared_ptr<MetricsRegistry> metrics_registry,
                    std::shared_ptr<EventManager> event_manager,
                    std::shared_ptr<WriteLocationManager> write_location_manager,
-                   CacheReclaimerAsyncDeleteConfig async_delete_config = {});
+                   CacheReclaimerAsyncDeleteConfig async_delete_config = {},
+                   std::shared_ptr<MigrationManager> migration_manager = nullptr);
 
     /**
      * @brief Delete copy constructor
@@ -317,6 +321,8 @@ private:
     const std::shared_ptr<EventManager> event_manager_;
     // to detect orphaned CLS_WRITING locations during reclaiming
     const std::shared_ptr<WriteLocationManager> write_location_manager_;
+    // to query active migration tasks for source-side protection（可为空：未启用迁移时）
+    const std::shared_ptr<MigrationManager> migration_manager_;
 
     // represents the object of the associated working thread
     std::thread reclaimer_;
@@ -572,6 +578,18 @@ private:
                         std::vector<std::int64_t> &out_batch,
                         AgeStats &out_lru_age_stats) const noexcept;
 
+    bool BuildMigrationBatch(const std::shared_ptr<RequestContext> &request_context,
+                             const std::shared_ptr<const InstanceInfo> &instance_info,
+                             std::vector<std::int64_t> &out_batch,
+                             std::vector<CacheLocationMap> &out_loc_maps) noexcept;
+
+    std::size_t MigrateByStrategyOnBatch(const std::shared_ptr<RequestContext> &request_context,
+                                         const std::shared_ptr<const InstanceInfo> &instance_info,
+                                         const MigrationStrategy &strategy,
+                                         std::size_t available_copy_slots,
+                                         const std::vector<std::int64_t> &batch,
+                                         const std::vector<CacheLocationMap> &loc_maps) noexcept;
+
     bool FilterLocID(RequestContext *request_context,
                      const std::shared_ptr<const InstanceInfo> &instance_info,
                      const std::vector<std::int64_t> &batch,
@@ -581,6 +599,13 @@ private:
                      CountsByStorageType &out_location_counts_by_type,
                      std::uint64_t &out_predicted_deleted_keys,
                      AgeStats &out_create_age_stats) noexcept;
+
+    /**
+     * @brief 评估并执行一个 instance group 的多层存储迁移（水位触发）。
+     */
+    void TryMigrateOnGroup(const std::shared_ptr<RequestContext> &request_context,
+                           const std::shared_ptr<const InstanceGroup> &instance_group,
+                           const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) noexcept;
 
     bool SubmitDelReq(const std::shared_ptr<RequestContext> &request_context,
                       const std::shared_ptr<const InstanceInfo> &instance_info,
@@ -619,6 +644,8 @@ private:
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(delete_submit_count)
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(delete_complete_count)
     KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(delete_fail_count)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(migration_copy_submitted_total)
+    KVCM_COUNTER_METRICS_FOR_CACHE_RECLAIMER(migration_mark_submitted_total)
 
     KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_cron_duration_us)
     KVCM_GAUGE_METRICS_FOR_CACHE_RECLAIMER(reclaim_quota_duration_us)

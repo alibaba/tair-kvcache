@@ -148,7 +148,10 @@ class MultiLocationTest(abc.ABC, TestBase, unittest.TestCase):
                     all_specs.add(s["name"])
 
             if "tp0" not in all_specs:
-                # tp0 fully pruned — success
+                # The query response is built before the async metadata delete
+                # task has necessarily finished. Give the submitted prune task
+                # a chance to complete before rewriting GroupA.
+                time.sleep(1)
                 break
 
             if attempt < max_attempts - 1:
