@@ -482,14 +482,6 @@ std::vector<std::vector<ErrorCode>> MetaLocalBackend::GetLocations(RequestContex
             continue;
         }
         auto *item = static_cast<MetaMemCacheItem *>(cache_->Value(handle));
-        // Record revisit interval before updating access time
-        if (revisit_histogram_) {
-            int64_t stored_time = item->GetLastAccessTime();
-            if (stored_time > 0) {
-                int64_t now = TimestampUtil::GetCurrentTimeUs();
-                revisit_histogram_->Observe(now - stored_time);
-            }
-        }
         item->TouchAccessTime();
         results[i].resize(location_ids[i].size());
         {
