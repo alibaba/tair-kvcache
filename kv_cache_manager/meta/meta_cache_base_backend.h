@@ -4,8 +4,6 @@
 
 namespace kv_cache_manager {
 
-class RevisitIntervalHistogram;
-
 // Intermediate base class for cache-type backends (e.g. MetaLocalBackend).
 // Extends MetaStorageBackend with conditional write operations that accept
 // previous_error_codes, allowing callers to skip keys that already failed

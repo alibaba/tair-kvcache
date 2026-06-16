@@ -10,6 +10,7 @@
 
 namespace kv_cache_manager {
 class MetaStorageBackendConfig;
+class RevisitIntervalHistogram;
 class RequestContext;
 
 // MetaStorageBackend — MetaIndexer 后端存储抽象基类
@@ -264,6 +265,6 @@ public:
     // 设置重访间隔直方图（用于统计缓存命中时间间隔分布）。
     // 默认实现为空操作（no-op），只有需要统计重访间隔的后端才需要重写。
     // @param histogram 直方图对象，用于记录重访间隔数据
-    virtual void SetRevisitHistogram(std::shared_ptr<class RevisitIntervalHistogram> /*histogram*/) {}
+    virtual void SetRevisitHistogram(std::shared_ptr<RevisitIntervalHistogram> /*histogram*/) {}
 };
 } // namespace kv_cache_manager
