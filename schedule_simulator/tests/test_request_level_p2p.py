@@ -291,7 +291,10 @@ class TestRequestLevelP2P:
         records = []
         for i in range(10):
             records.append({
-                "timestamp": float(i),
+                # Timestamps spaced 1s apart (>> prefill latency ~0.2s)
+                # so that each request arrives after the previous completes,
+                # allowing WriteCache to be visible to subsequent GetCacheLocation.
+                "timestamp": float(i) * 1000,
                 "input_length": 50,
                 "output_length": 1,
                 "block_ids": shared_prefix,

@@ -3,7 +3,7 @@
 将 enriched.jsonl 数据转换为 schedule_simulator 仿真输入格式。
 
 处理流程:
-  enriched.jsonl → (1) 按 service_names 过滤 → (2) 格式转换 → sim.jsonl
+  enriched.jsonl → (1) 按 service_names 过滤 → (2) 按 pod 前缀过滤 → (3) 格式转换 → sim.jsonl
 
 使用示例:
   # 完整流程（过滤 + 转换）:
@@ -72,6 +72,14 @@ def should_include(record: dict, target_service: str) -> bool:
     return target_service in service_names
 
 
+def should_include_by_pod_prefix(record: dict, pod_prefix: str) -> bool:
+    """检查记录的首个 pod (实际服务节点) 是否以指定前缀开头"""
+    pods = record.get('pods', [])
+    if not pods:
+        return False
+    return pods[0].startswith(pod_prefix)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='将 enriched.jsonl 转换为 schedule_simulator 仿真输入格式')
@@ -84,10 +92,12 @@ def main():
                              '(例: qwen3.6-plus-2026-04-02-think-model-e1b8)')
     parser.add_argument('--no-filter', action='store_true',
                         help='不过滤，直接转换所有记录')
+    parser.add_argument('--pod-prefix', default='e02',
+                        help='按 pod 名称前缀过滤 (默认: e02, 设为空字符串禁用)')
     args = parser.parse_args()
 
-    if not args.no_filter and not args.service_name:
-        print("错误: 必须指定 --service-name 或 --no-filter", file=sys.stderr)
+    if not args.no_filter and not args.service_name and not args.pod_prefix:
+        print("错误: 必须指定 --service-name、--pod-prefix 或 --no-filter", file=sys.stderr)
         sys.exit(1)
 
     t0 = time.time()
@@ -104,8 +114,12 @@ def main():
 
             # 过滤
             if not args.no_filter:
-                if not should_include(record, args.service_name):
-                    continue
+                if args.service_name:
+                    if not should_include(record, args.service_name):
+                        continue
+                if args.pod_prefix:
+                    if not should_include_by_pod_prefix(record, args.pod_prefix):
+                        continue
 
             # 转换
             out_rec = convert_record(record)
@@ -130,7 +144,10 @@ def main():
     print(f'  Pod 数量: {len(pods_seen)}')
     print(f'  耗时: {elapsed:.1f}s')
     if not args.no_filter:
-        print(f'  过滤条件: service_names 包含 "{args.service_name}"')
+        if args.service_name:
+            print(f'  过滤条件: service_names 包含 "{args.service_name}"')
+        if args.pod_prefix:
+            print(f'  过滤条件: pods 包含前缀 "{args.pod_prefix}"')
     print(f'{"="*50}')
 
 

@@ -77,14 +77,22 @@ class RouterConfig:
     p_policy: RoutingPolicy = RoutingPolicy.ROUND_ROBIN
     d_policy: RoutingPolicy = RoutingPolicy.ROUND_ROBIN
     # CacheAwareConfig
-    cache_threshold: float = 0.3
+    # cache_threshold: float = 0.3
+    cache_threshold: float = 0.01
     # balance_abs_threshold: int = 64
-    balance_abs_threshold: int = 8
+    # balance_abs_threshold: int = 8
+    # balance_abs_threshold: int = 4
+    balance_abs_threshold: int = 2
     balance_rel_threshold: float = 1.5
     eviction_interval_secs: int = 120
     max_tree_size: int = 2**26
     # Power_of_two
     worker_startup_check_interval: float = 30  # s
+    # Pre-cache-aware probabilistic routing
+    topk_routing: bool = False       # 启用概率路由（默认关闭，向后兼容）
+    lmax: int = 40                   # 满载基准 (Lmax in scoring formula)
+    weight_prefix: float = 30.0      # 前缀命中权重 (wp)
+    weight_load: float = 10.0        # 负载均衡权重 (wl)
 
     @classmethod
     def from_string_policy(

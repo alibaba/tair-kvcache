@@ -60,6 +60,11 @@ def main():
     p.add_argument("--output-dir", type=str, default="./sim_results")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--enable-stats", action="store_true")
+    # Probabilistic routing (topk) parameters
+    p.add_argument("--topk-routing", action="store_true", help="Enable probabilistic topK routing")
+    p.add_argument("--lmax", type=int, default=40, help="Max load baseline for normalization (Lmax)")
+    p.add_argument("--weight-prefix", type=float, default=30.0, help="Prefix hit weight (wp) in scoring formula")
+    p.add_argument("--weight-load", type=float, default=10.0, help="Load balance weight (wl) in scoring formula")
     p.add_argument("--quiet", action="store_true")
     args = p.parse_args()
 
@@ -130,7 +135,9 @@ def main():
             d_scheduler_config=SchedulerConfig(args.model, scenario="disagg_decode"),
             p_platform_config=pc, d_platform_config=PlatformConfig(device=args.device),
             router_config=RouterConfig(p_policy=policy_map[args.routing],
-                d_policy=RoutingPolicy.ROUND_ROBIN, worker_startup_check_interval=0.01),
+                d_policy=RoutingPolicy.ROUND_ROBIN, worker_startup_check_interval=0.01,
+                topk_routing=args.topk_routing, lmax=args.lmax,
+                weight_prefix=args.weight_prefix, weight_load=args.weight_load),
             num_p_instance=args.num_p_instances, num_d_instance=0,
             infer_time_predictor=predictor,
             enable_hierarchical=args.enable_hierarchical,

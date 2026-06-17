@@ -52,6 +52,10 @@ public:
     ChooseBestEngineRes ChooseBestEngine(const std::vector<int64_t> &block_ids,
                                          int64_t timestamp);
 
+    std::vector<ChooseBestEngineRes> ChooseTopKEngines(const std::vector<int64_t> &block_ids,
+                                                       int64_t timestamp,
+                                                       int64_t top_k = 0);
+
     WriteCacheRes WriteCache(const std::string &engine_instance_id,
                              const std::string &trace_id,
                              int64_t timestamp,

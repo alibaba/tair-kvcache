@@ -155,3 +155,119 @@ def test_e2e_speedup_over_naive():
     assert ratio < 3.0, f"DCA is {ratio:.1f}x slower than RR, expected < 3x"
 
 
+
+
+# ---------- Unit tests for ChooseTopKEngines API ----------
+
+def test_topk_cold_returns_empty():
+    """With no data written, ChooseTopKEngines returns empty list."""
+    manager, ids = _make_manager(3)
+    results = manager.ChooseTopKEngines([100, 200, 300], 1000000000, 0)
+    assert results == [] or len(results) == 0
+
+
+def test_topk_empty_blocks_returns_empty():
+    """Empty block_ids should return empty list."""
+    manager, ids = _make_manager(3)
+    manager.WriteCache("P0", "r0", 1000000000, [1, 2, 3])
+    results = manager.ChooseTopKEngines([], 1000000000, 0)
+    assert len(results) == 0
+
+
+def test_topk_returns_all_positive_hits():
+    """All returned results should have hit_count > 0."""
+    manager, ids = _make_manager(5)
+    ts = 1000000000
+    manager.WriteCache("P0", "r0", ts, [1, 2, 3])
+    manager.WriteCache("P1", "r1", ts, [1, 2, 3, 4, 5])
+    manager.WriteCache("P2", "r2", ts, [1, 2])
+    # P3, P4 have no data
+
+    results = manager.ChooseTopKEngines([1, 2, 3, 4, 5, 6], ts + 100, 0)
+    assert len(results) > 0
+    for r in results:
+        assert r.hit_count > 0
+    # P3 and P4 should NOT be in results
+    result_ids = {r.engine_instance_id for r in results}
+    assert "P3" not in result_ids
+    assert "P4" not in result_ids
+
+
+def test_topk_sorted_descending():
+    """Results should be sorted by hit_count descending."""
+    manager, ids = _make_manager(5)
+    ts = 1000000000
+    manager.WriteCache("P0", "r0", ts, [1, 2, 3])
+    manager.WriteCache("P1", "r1", ts, [1, 2, 3, 4, 5, 6, 7])
+    manager.WriteCache("P2", "r2", ts, [1, 2, 3, 4, 5])
+    manager.WriteCache("P3", "r3", ts, [1])
+
+    results = manager.ChooseTopKEngines([1, 2, 3, 4, 5, 6, 7, 8], ts + 100, 0)
+    for i in range(len(results) - 1):
+        assert results[i].hit_count >= results[i + 1].hit_count
+
+
+def test_topk_consistent_with_best_engine():
+    """First element of TopK should match ChooseBestEngine result."""
+    manager, ids = _make_manager(5)
+    ts = 1000000000
+    manager.WriteCache("P0", "r0", ts, [1, 2, 3])
+    manager.WriteCache("P1", "r1", ts, [1, 2, 3, 4, 5, 6, 7])
+    manager.WriteCache("P2", "r2", ts, [1, 2, 3, 4, 5])
+
+    query = [1, 2, 3, 4, 5, 6, 7, 8]
+    best = manager.ChooseBestEngine(query, ts + 100)
+    topk = manager.ChooseTopKEngines(query, ts + 100, 0)
+
+    assert len(topk) > 0
+    assert topk[0].engine_instance_id == best.engine_instance_id
+    assert topk[0].hit_count == best.hit_count
+
+
+def test_topk_truncates_to_k():
+    """When top_k > 0, result length should be <= top_k."""
+    manager, ids = _make_manager(5)
+    ts = 1000000000
+    # Write to all 5 engines with different prefix lengths
+    for i in range(5):
+        manager.WriteCache(f"P{i}", f"r{i}", ts, list(range(1, i + 3)))
+
+    results_all = manager.ChooseTopKEngines(list(range(1, 10)), ts + 100, 0)
+    results_2 = manager.ChooseTopKEngines(list(range(1, 10)), ts + 100, 2)
+
+    assert len(results_2) <= 2
+    assert len(results_all) >= len(results_2)
+    # The top-2 should be the same as first 2 of results_all
+    if len(results_all) >= 2:
+        assert results_2[0].engine_instance_id == results_all[0].engine_instance_id
+        assert results_2[1].engine_instance_id == results_all[1].engine_instance_id
+
+
+def test_topk_performance_vs_best_engine():
+    """ChooseTopKEngines should not be significantly slower than ChooseBestEngine."""
+    manager, ids = _make_manager(20)
+    ts = 1000000000
+    blocks = list(range(100))
+
+    # Write some data to various engines
+    for i, eid in enumerate(ids):
+        manager.WriteCache(eid, f"r{i}", ts, blocks[i*5:(i+1)*5])
+
+    query_blocks = list(range(50))
+
+    # Time ChooseBestEngine
+    t0 = time.perf_counter()
+    for _ in range(100):
+        manager.ChooseBestEngine(query_blocks, ts + 1000)
+    time_best = time.perf_counter() - t0
+
+    # Time ChooseTopKEngines
+    t0 = time.perf_counter()
+    for _ in range(100):
+        manager.ChooseTopKEngines(query_blocks, ts + 1000, 0)
+    time_topk = time.perf_counter() - t0
+
+    ratio = time_topk / time_best
+    print(f"\n  BestEngine: {time_best*1000:.1f}ms, TopKEngines: {time_topk*1000:.1f}ms, ratio: {ratio:.2f}x")
+    # TopK should be < 3x slower (main overhead is sort + vector alloc)
+    assert ratio < 3.0, f"TopK is {ratio:.1f}x slower than BestEngine, expected < 3x"

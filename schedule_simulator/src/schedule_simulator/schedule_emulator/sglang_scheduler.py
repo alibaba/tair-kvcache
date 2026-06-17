@@ -78,6 +78,9 @@ class SGLangScheduleEmulator(ScheduleEmulator):
         # Keep track of the historical running times for key-value (KV) cache loading.
         self.last_batch_run_timestamp: float = 0
         self.last_batch_run_time: float = 0
+        # Two-phase request-level state: track in-flight request
+        self.running_request: Optional[FakeRequest] = None
+        self.running_finish_time: float = 0
         self.last_prefetch_end_time: float = 0
         # Keep all the responded requests that will be used for logging metrics.
         self.completed_requests: list[FakeRequest] = []
@@ -367,6 +370,10 @@ class SGLangScheduleEmulator(ScheduleEmulator):
         return num_tokens
 
     async def is_idle(self, curtime: float | None = None) -> bool:
+        # Two-phase: running_request means node is busy
+        if self.running_request is not None:
+            return False
+
         has_active_or_waiting_work = (
             self.chunked_req is not None
             or self.waiting_queue
@@ -438,6 +445,16 @@ class SGLangScheduleEmulator(ScheduleEmulator):
 
     def _run_request_level(self):
         import heapq as _heapq
+
+        # Phase 1: Complete running request if clock has advanced past finish time
+        if self.running_request is not None:
+            if self.global_values.clock >= self.running_finish_time:
+                self._complete_running_request()
+            else:
+                # Not yet finished; should not happen with F2 scheme but guard anyway
+                return
+
+        # Move arrived requests from future_queue to waiting_queue
         while (
             len(self.future_queue) > 0
             and self.future_queue[0].last_event_time <= self.global_values.clock
@@ -454,6 +471,7 @@ class SGLangScheduleEmulator(ScheduleEmulator):
                 )
             return
 
+        # Phase 2: Start processing next request
         req = self.waiting_queue.pop(0)
         req.queue_time_end = self.global_values.clock
 
@@ -474,27 +492,40 @@ class SGLangScheduleEmulator(ScheduleEmulator):
             batch = SB(reqs=[SR(input_length=max(uncached, 1), past_kv_length=cached)])
             latency = self.time_predictor.predict_infer_time(batch)
 
-        self.global_values.clock += latency
-        self.global_values.iteration += 1
+        # Two-phase: mark as running, advance clock to finish_time
+        self.running_request = req
+        self.running_finish_time = self.global_values.clock + latency
+        self.global_values.clock = self.running_finish_time
+        self.last_batch_run_timestamp = self.running_finish_time
+        self.last_batch_run_time = latency
 
-        req.gen_token_latencies.append(self.global_values.clock - req.last_event_time)
-        req.last_event_time = self.global_values.clock
+    def _complete_running_request(self):
+        """Complete the currently running request (phase 2 of two-phase model)."""
+        req = self.running_request
+        finish_time = self.running_finish_time
+
+        self.global_values.iteration += 1
+        req.gen_token_latencies.append(finish_time - req.last_event_time)
+        req.last_event_time = finish_time
         req.stage = RequestStage.COMPLETE
         self.completed_requests.append(req)
         self.num_requests -= 1
         self.response_queue.put_nowait(req)
 
-        self.tree_cache.on_request_complete(req, self.global_values.clock)
+        self.tree_cache.on_request_complete(req, finish_time)
         self.tree_cache.drop_match_result(req)
+
+        self.running_request = None
+        self.running_finish_time = 0
 
         if self.scheduler_config.enable_stats:
             self.iter_stats.append(
                 IterationStats(
-                    timestamp=self.global_values.clock,
+                    timestamp=finish_time,
                     iter=self.global_values.iteration,
-                    iter_latency_ms=latency * 1e3,
+                    iter_latency_ms=(finish_time - (finish_time - self.last_batch_run_time)) * 1e3,
                     num_context_requests=1,
-                    num_ctx_tokens=max(uncached, 1),
+                    num_ctx_tokens=max(req.input_token_length - req.final_reused_tokens, 1),
                     num_gen_requests=0,
                     request_stats=[RequestStats(
                         req.id, "prefill",
@@ -505,6 +536,7 @@ class SGLangScheduleEmulator(ScheduleEmulator):
                     num_waiting_requests=len(self.waiting_queue),
                 )
             )
+
 
     def adjust_global_clock(self):
         if len(self.waiting_queue) == 0 and len(self.future_queue) == 0:
@@ -852,6 +884,12 @@ class SGLangScheduleEmulator(ScheduleEmulator):
     def process_input_requests(self, new_reqs: list[FakeRequest]):
         for req in new_reqs:
             heapq.heappush(self.future_queue, self.format_with_scenario(req))
+
+        # In request-level two-phase mode, when a request is running (pending WriteCache),
+        # skip moving future->waiting here. _run_request_level will handle it
+        # AFTER completing the running request, ensuring GetCacheLocation sees writes.
+        if self.scheduler_config.request_level_scheduling and self.running_request is not None:
+            return
 
         while (
             len(self.future_queue) > 0

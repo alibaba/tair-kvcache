@@ -408,6 +408,8 @@ class DisaggBenchmarkRunner:
 
         from schedule_simulator.schedule_emulator.hierarchical_cache_adapter import HierarchicalCacheAdapter
 
+        self._node_config_path = config_path
+
         loader = kvcm.HierarchicalReplayConfigLoader()
         if not loader.load(config_path):
             raise ValueError(f"Failed to load hierarchical config from {config_path}")
@@ -802,6 +804,26 @@ class DisaggBenchmarkRunner:
                     pool_hit = sched.tree_cache.total_pool_hit_blocks
                 w.writerow([pod_name, total_reqs, total_input, total_output,
                             total_blocks, engine_hit, peer_hit, pool_hit])
+
+        # 5. Routing decisions JSONL
+        if hasattr(self, 'p_policy') and hasattr(self.p_policy, 'get_routing_records'):
+            records = self.p_policy.get_routing_records()
+            if records:
+                with open(os.path.join(output_dir, "routing_decisions.jsonl"), "w") as f:
+                    for r in records:
+                        f.write(_json.dumps(r, ensure_ascii=False) + "\n")
+
+        # 6. Optimizer configs
+        import shutil
+        # Router optimizer config (approximate prefix tree)
+        if hasattr(self, 'p_policy') and hasattr(self.p_policy, '_router_config_path'):
+            router_cfg = self.p_policy._router_config_path
+            if router_cfg and os.path.exists(router_cfg):
+                shutil.copy2(router_cfg, os.path.join(output_dir, "router_optimizer_config.json"))
+        # Node real optimizer config
+        if hasattr(self, '_node_config_path') and self._node_config_path:
+            if os.path.exists(self._node_config_path):
+                shutil.copy2(self._node_config_path, os.path.join(output_dir, "node_optimizer_config.json"))
     def get_response_results(self) -> list[FakeRequest]:
         return self.benchmark_emulator.get_response_results()
 

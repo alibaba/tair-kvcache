@@ -187,7 +187,7 @@ def test_p2p_enabled_multiple_instances():
     config = json.load(open(path))
     p2p = config["infer_clusters"][0].get("p2p_read_flows", [])
     assert len(p2p) == 1, "Should have P2P flow with 2+ instances"
-    assert p2p[0]["tier"] == "hbm"
+    assert p2p[0]["tier"] == "dram"
     print(f"[p2p_enabled] P2P flow on tier={p2p[0]['tier']}")
 
 

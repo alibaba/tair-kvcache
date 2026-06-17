@@ -27,7 +27,7 @@ def build_hierarchical_config(
     output_dir: Optional[str] = None,
     storage_pool_capacity_gb: float = 1.0,
     enable_p2p: bool = True,
-    p2p_tier: str = "hbm",
+    p2p_tier: str = "dram",
     enable_lifecycle_tracking: bool = False,
 ) -> str:
     """
@@ -104,10 +104,29 @@ def build_hierarchical_config(
 
     p2p_read_flows = []
     if enable_p2p and len(all_infer_ids) > 1:
+        # Ensure the referenced p2p_tier exists in tiers list with proper tier_flow
+        tier_names = {t["name"] for t in tiers}
+        if p2p_tier not in tier_names:
+            tiers.append({"name": p2p_tier, "capacity": dram_capacity_gb})
+            # C++ loader requires a tier_flow connecting hbm -> p2p_tier
+            tier_flows.append({
+                "from_tier": "hbm",
+                "to_tier": p2p_tier,
+                "write_mode": write_mode_map.get(
+                    scheduler_config.hicache_write_policy, "write_through"
+                ),
+                "access_propagation_enabled": False,
+                "write_propagation_enabled": False,
+                "selective_write_threshold": 2,
+            })
         p2p_read_flows.append({
             "tier": p2p_tier,
-            "peer_read_touch_enabled": True,
+            "peer_read_touch_enabled": False,
         })
+        # p2p_read_flows.append({
+        #     "tier": "dram",
+        #     "peer_read_touch_enabled": True,
+        # })
 
     config = {
         "trace_file_path": trace_path,
@@ -127,7 +146,10 @@ def build_hierarchical_config(
                     "block_size": scheduler_config.page_size if scheduler_config.page_size else 1,
                     "bytes_per_token": kv_bytes_per_token,
                     "eviction_policy_type": "lru",
-                    "eviction_policy_params": {"sample_rate": 1.0},
+                    "eviction_policy_params": {
+                        "sample_rate": 1.0,
+                        "shard_count": 1
+                        },
                 },
                 "infer_ids": all_infer_ids,
                 "ttl_config": {

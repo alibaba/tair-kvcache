@@ -643,6 +643,78 @@ ChooseBestEngineRes HierarchicalReplayManager::ChooseBestEngine(const std::vecto
     return best;
 }
 
+std::vector<ChooseBestEngineRes> HierarchicalReplayManager::ChooseTopKEngines(
+    const std::vector<int64_t> &block_ids,
+    int64_t timestamp,
+    int64_t top_k) {
+    if (!engine_manager_) {
+        throw std::runtime_error("HierarchicalReplayManager is not initialized");
+    }
+
+    const auto &engine_ids = infer_engine_scheduler_.engine_instance_ids();
+    const std::vector<std::string> active_ids =
+        infer_engine_scheduler_.ActiveInferIds(engine_ids, timestamp);
+
+    if (active_ids.empty() || block_ids.empty()) {
+        return {};
+    }
+
+    std::vector<ChooseBestEngineRes> results;
+
+    // Use P2P tracker to narrow candidate engines (same optimization as ChooseBestEngine)
+    std::unordered_set<std::string> candidates;
+    for (const auto &[engine_id, cluster_id] : engine_to_cluster_) {
+        auto flows_it = cluster_p2p_read_flows_.find(cluster_id);
+        if (flows_it == cluster_p2p_read_flows_.end() || flows_it->second.empty()) {
+            continue;
+        }
+        for (const auto &flow : flows_it->second) {
+            auto holders = p2p_tracker_.HoldersOf(cluster_id, flow.tier(), block_ids[0]);
+            candidates.insert(holders.begin(), holders.end());
+        }
+        break;
+    }
+
+    // Collect matches from candidate set or all active engines
+    auto collect_matches = [&](bool use_candidates) {
+        for (const auto &engine_id : active_ids) {
+            if (use_candidates && candidates.count(engine_id) == 0) {
+                continue;
+            }
+            const size_t match = engine_manager_->PrefixMatchCount(engine_id, block_ids, timestamp);
+            if (match > 0) {
+                ChooseBestEngineRes res;
+                res.engine_instance_id = engine_id;
+                res.hit_count = static_cast<int64_t>(match);
+                results.push_back(std::move(res));
+            }
+        }
+    };
+
+    if (!candidates.empty()) {
+        collect_matches(true);
+        if (results.empty()) {
+            // Fallback: no P2P candidates had hits, scan all active engines
+            collect_matches(false);
+        }
+    } else {
+        collect_matches(false);
+    }
+
+    // Sort by hit_count descending
+    std::sort(results.begin(), results.end(),
+              [](const ChooseBestEngineRes &a, const ChooseBestEngineRes &b) {
+                  return a.hit_count > b.hit_count;
+              });
+
+    // Truncate to top_k (0 means return all)
+    if (top_k > 0 && static_cast<size_t>(top_k) < results.size()) {
+        results.resize(static_cast<size_t>(top_k));
+    }
+
+    return results;
+}
+
 WriteCacheRes HierarchicalReplayManager::WriteCache(const std::string &engine_instance_id,
                                                     const std::string &trace_id,
                                                     int64_t timestamp,

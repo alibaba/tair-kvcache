@@ -330,6 +330,22 @@ class HierarchicalCacheAdapter(PrefixCache):
             return None
         return self.manager.ChooseBestEngine(block_ids, timestamp_ns)
 
+    def choose_top_k_engines(self, block_ids: list, timestamp_ns: int, top_k: int = 0) -> list:
+        """Return all engines with prefix match, sorted by hit_count descending.
+
+        Args:
+            block_ids: Token block IDs for prefix matching.
+            timestamp_ns: Current timestamp in nanoseconds.
+            top_k: Number of top results to return. 0 = return all with hit_count > 0.
+
+        Returns:
+            List of ChooseBestEngineRes objects (engine_instance_id, hit_count),
+            sorted by hit_count descending. Empty list if no matches.
+        """
+        if not block_ids:
+            return []
+        return self.manager.ChooseTopKEngines(block_ids, timestamp_ns, top_k)
+
     def get_hierarchical_metrics(self) -> dict:
         total_input = sum(r.input_length for r in self.read_records)
         total_blocks = sum(r.num_blocks for r in self.read_records)

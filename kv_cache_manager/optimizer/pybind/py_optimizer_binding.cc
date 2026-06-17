@@ -250,6 +250,13 @@ PYBIND11_MODULE(kvcm_py_optimizer, module) {
              py::arg("block_ids"),
              py::arg("timestamp"),
              "Find the engine with the longest prefix match for given block_ids (single C++ call)")
+        .def("ChooseTopKEngines", &kvcm::HierarchicalReplayManager::ChooseTopKEngines,
+             py::call_guard<py::gil_scoped_release>(),
+             py::arg("block_ids"),
+             py::arg("timestamp"),
+             py::arg("top_k") = int64_t(0),
+             "Return all engines with prefix match (hit_count > 0), sorted by hit_count desc. "
+             "top_k=0 returns all matches.")
         .def("WriteCache", &kvcm::HierarchicalReplayManager::WriteCache,
              py::call_guard<py::gil_scoped_release>(),
              py::arg("engine_instance_id"),
