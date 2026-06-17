@@ -52,10 +52,10 @@ ErrorCode VineyardBackend::DoOpen(const StorageConfig &config, const std::string
     liveness_checker_running_.store(true, std::memory_order_relaxed);
     liveness_checker_thread_ = std::thread(&VineyardBackend::LivenessCheckerLoop, this);
 
-    KVCM_LOG_INFO("trace_id [%s] | VineyardBackend opened, cluster: [%s], hb_timeout=%ldms, "
+    KVCM_LOG_INFO("trace_id [%s] | VineyardBackend opened, storage: [%s], hb_timeout=%ldms, "
                   "cleanup_grace=%ldms, check_interval=%ldms",
                   trace_id.c_str(),
-                  spec_.cluster_name().c_str(),
+                  config_.global_unique_name().c_str(),
                   heartbeat_timeout_ms_,
                   cleanup_grace_ms_,
                   liveness_check_interval_ms_);
@@ -78,7 +78,7 @@ ErrorCode VineyardBackend::Close() {
         cleanup_callback_ = nullptr;
         cleanup_cb_set_.store(false, std::memory_order_release);
     }
-    KVCM_LOG_INFO("VineyardBackend closed, cluster: [%s]", spec_.cluster_name().c_str());
+    KVCM_LOG_INFO("VineyardBackend closed, storage: [%s]", config_.global_unique_name().c_str());
     return EC_OK;
 }
 
@@ -106,7 +106,8 @@ ErrorCode VineyardBackend::RegisterNode(const std::string &host_ip_port, const s
         info.last_heartbeat_ms.store(now_ms, std::memory_order_relaxed);
         info.available.store(true, std::memory_order_relaxed);
         info.unavailable_since_ms.store(0, std::memory_order_relaxed);
-        info.metrics_tags = {{"instance_id", spec_.cluster_name()}, {"host", host_ip_port}};
+        auto instance_id = config_.global_unique_name().substr(4); // strip "v6d_" prefix
+        info.metrics_tags = {{"instance_id", instance_id}, {"host", host_ip_port}};
         KVCM_LOG_INFO("VineyardBackend: node [%s] already registered, mediums=%zu (refreshed heartbeat, gen=%lu)",
                       host_ip_port.c_str(),
                       info.mediums.size(),
@@ -119,12 +120,13 @@ ErrorCode VineyardBackend::RegisterNode(const std::string &host_ip_port, const s
     info->available.store(true, std::memory_order_relaxed);
     info->unavailable_since_ms.store(0, std::memory_order_relaxed);
     info->mediums = mediums;
-    info->metrics_tags = {{"instance_id", spec_.cluster_name()}, {"host", host_ip_port}};
+    auto instance_id = config_.global_unique_name().substr(4); // strip "v6d_" prefix
+    info->metrics_tags = {{"instance_id", instance_id}, {"host", host_ip_port}};
     nodes_[host_ip_port] = std::move(info);
 
-    KVCM_LOG_INFO("VineyardBackend: node [%s] registered in cluster [%s], mediums=%zu, gen=%lu",
+    KVCM_LOG_INFO("VineyardBackend: node [%s] registered in storage [%s], mediums=%zu, gen=%lu",
                   host_ip_port.c_str(),
-                  spec_.cluster_name().c_str(),
+                  config_.global_unique_name().c_str(),
                   mediums.size(),
                   node_generation_[host_ip_port]);
     return EC_OK;
@@ -147,9 +149,9 @@ ErrorCode VineyardBackend::UnregisterNode(const std::string &host_ip_port) {
         }
     }
     nodes_.erase(it);
-    KVCM_LOG_INFO("VineyardBackend: node [%s] unregistered from cluster [%s]",
+    KVCM_LOG_INFO("VineyardBackend: node [%s] unregistered from storage [%s]",
                   host_ip_port.c_str(),
-                  spec_.cluster_name().c_str());
+                  config_.global_unique_name().c_str());
     return EC_OK;
 }
 

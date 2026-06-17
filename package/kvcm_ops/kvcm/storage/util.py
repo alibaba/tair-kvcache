@@ -33,9 +33,7 @@ def gen_3fs_config_data(args):
 
 
 def gen_vineyard_config_data(args):
-    storage_spec = {
-        "cluster_name": args.cluster_name,
-    }
+    storage_spec = {}
     if args.heartbeat_timeout_ms is not None:
         storage_spec["heartbeat_timeout_ms"] = args.heartbeat_timeout_ms
     if args.cleanup_grace_ms is not None:
@@ -98,7 +96,6 @@ def add_3fs_sub_parser(subparsers):
 
 def add_vineyard_sub_parser(subparsers):
     parser_vineyard = subparsers.add_parser('vineyard', help='Vineyard (v6d) storage options')
-    parser_vineyard.add_argument('--cluster_name', "-c", required=True, help='vineyard cluster name')
     parser_vineyard.add_argument(
         '--heartbeat_timeout_ms',
         type=int,

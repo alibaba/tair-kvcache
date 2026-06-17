@@ -209,18 +209,15 @@ public:
     bool ValidateRequiredFields(std::string &invalid_fields) const override;
     std::string ToString() const override;
 
-    const std::string &cluster_name() const { return cluster_name_; }
     int64_t heartbeat_timeout_ms() const { return heartbeat_timeout_ms_; }
     int64_t cleanup_grace_ms() const { return cleanup_grace_ms_; }
     int64_t liveness_check_interval_ms() const { return liveness_check_interval_ms_; }
 
-    void set_cluster_name(const std::string &cluster_name) { cluster_name_ = cluster_name; }
     void set_heartbeat_timeout_ms(int64_t v) { heartbeat_timeout_ms_ = v; }
     void set_cleanup_grace_ms(int64_t v) { cleanup_grace_ms_ = v; }
     void set_liveness_check_interval_ms(int64_t v) { liveness_check_interval_ms_ = v; }
 
 private:
-    std::string cluster_name_;
     int64_t heartbeat_timeout_ms_ = kDefaultHeartbeatTimeoutMs;
     int64_t cleanup_grace_ms_ = kDefaultCleanupGraceMs;
     int64_t liveness_check_interval_ms_ = kDefaultLivenessCheckIntervalMs;

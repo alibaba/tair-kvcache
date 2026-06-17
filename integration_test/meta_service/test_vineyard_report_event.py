@@ -210,7 +210,9 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
                 "storage": {
                     "global_unique_name": cls.VINEYARD_STORAGE_NAME,
                     "vineyard": {
-                        "cluster_name": cls.instance_id,
+                        "heartbeat_timeout_ms": 30000,
+                        "cleanup_grace_ms": 300000,
+                        "liveness_check_interval_ms": 5000,
                     },
                     "check_storage_available_when_open": False,
                 },

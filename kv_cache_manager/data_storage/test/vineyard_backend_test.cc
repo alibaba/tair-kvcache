@@ -21,11 +21,10 @@ public:
     static StorageConfig
     MakeConfig(int64_t hb_timeout_ms = 200, int64_t cleanup_grace_ms = 400, int64_t check_interval_ms = 50) {
         auto spec = std::make_shared<VineyardStorageSpec>();
-        spec->set_cluster_name("v6d_cluster_test");
         spec->set_heartbeat_timeout_ms(hb_timeout_ms);
         spec->set_cleanup_grace_ms(cleanup_grace_ms);
         spec->set_liveness_check_interval_ms(check_interval_ms);
-        return StorageConfig(DataStorageType::DATA_STORAGE_TYPE_VINEYARD, "v6d_test", spec);
+        return StorageConfig(DataStorageType::DATA_STORAGE_TYPE_VINEYARD, "v6d_v6d_cluster_test", spec);
     }
 
     std::shared_ptr<MetricsRegistry> metrics_registry_;
@@ -288,11 +287,12 @@ TEST_F(VineyardBackendTest, OnHeartbeatPublishesMetricsGauges) {
     ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 5000, /*grace*/ 10000, /*tick*/ 50), "trace"));
     ASSERT_EQ(EC_OK, backend.RegisterNode("10.0.0.10:9600", {"mem"}));
 
-    backend.OnHeartbeat("10.0.0.10:9600", {
-        {"hit_rate", "0.85"},
-        {"active_leases", "5"},
-        {"non_numeric_field", "BOTH_OK"},
-    });
+    backend.OnHeartbeat("10.0.0.10:9600",
+                        {
+                            {"hit_rate", "0.85"},
+                            {"active_leases", "5"},
+                            {"non_numeric_field", "BOTH_OK"},
+                        });
 
     auto hit_rate_data = metrics_registry_->GetMetricsData("v6d.hit_rate");
     ASSERT_NE(hit_rate_data, nullptr);
@@ -308,10 +308,11 @@ TEST_F(VineyardBackendTest, OnHeartbeatPublishesMetricsGauges) {
     auto non_numeric = metrics_registry_->GetMetricsData("v6d.non_numeric_field");
     ASSERT_EQ(non_numeric, nullptr);
 
-    backend.OnHeartbeat("10.0.0.10:9600", {
-        {"hit_rate", "0.90"},
-        {"brand_new_metric", "42"},
-    });
+    backend.OnHeartbeat("10.0.0.10:9600",
+                        {
+                            {"hit_rate", "0.90"},
+                            {"brand_new_metric", "42"},
+                        });
 
     auto new_data = metrics_registry_->GetMetricsData("v6d.brand_new_metric");
     ASSERT_NE(new_data, nullptr);

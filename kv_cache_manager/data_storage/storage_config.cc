@@ -390,7 +390,6 @@ bool StorageConfig::ValidateRequiredFields(std::string &invalid_fields) const {
 
 // VineyardStorageSpec
 bool VineyardStorageSpec::FromRapidValue(const rapidjson::Value &rapid_value) {
-    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "cluster_name", cluster_name_, std::string(""));
     KVCM_JSON_GET_DEFAULT_MACRO(
         rapid_value, "heartbeat_timeout_ms", heartbeat_timeout_ms_, static_cast<int64_t>(kDefaultHeartbeatTimeoutMs));
     KVCM_JSON_GET_DEFAULT_MACRO(
@@ -403,7 +402,6 @@ bool VineyardStorageSpec::FromRapidValue(const rapidjson::Value &rapid_value) {
 }
 
 void VineyardStorageSpec::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
-    Put(writer, "cluster_name", cluster_name_);
     Put(writer, "heartbeat_timeout_ms", heartbeat_timeout_ms_);
     Put(writer, "cleanup_grace_ms", cleanup_grace_ms_);
     Put(writer, "liveness_check_interval_ms", liveness_check_interval_ms_);
@@ -412,10 +410,6 @@ void VineyardStorageSpec::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffe
 bool VineyardStorageSpec::ValidateRequiredFields(std::string &invalid_fields) const {
     bool valid = true;
     std::string local_invalid_fields;
-    if (cluster_name_.empty()) {
-        valid = false;
-        local_invalid_fields += "{cluster_name}";
-    }
     if (heartbeat_timeout_ms_ <= 0) {
         valid = false;
         local_invalid_fields += "{heartbeat_timeout_ms}";
@@ -436,8 +430,7 @@ bool VineyardStorageSpec::ValidateRequiredFields(std::string &invalid_fields) co
 
 std::string VineyardStorageSpec::ToString() const {
     std::ostringstream oss;
-    oss << "cluster_name: " << cluster_name_ << ", heartbeat_timeout_ms: " << heartbeat_timeout_ms_
-        << ", cleanup_grace_ms: " << cleanup_grace_ms_
+    oss << "heartbeat_timeout_ms: " << heartbeat_timeout_ms_ << ", cleanup_grace_ms: " << cleanup_grace_ms_
         << ", liveness_check_interval_ms: " << liveness_check_interval_ms_;
     return oss.str();
 }
