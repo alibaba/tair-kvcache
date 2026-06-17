@@ -86,6 +86,10 @@ public:
     struct LocationUpdateTask {
         std::string location_id;
         CacheLocationStatus new_status;
+        // 数据校验码 (任务 82620492)：0 = 不更新 hash，保留 CacheLocation 上已有的值；
+        // 非 0 时通过 ReadModifyWriteLocation 写入 CacheLocation.block_hash。
+        // FinishWriteCache 链路携带，其他链路保持默认 0 即可。
+        int64_t block_hash = 0;
     };
     ErrorCode BatchUpdateLocationStatus(RequestContext *request_context,
                                         const KeyVector &keys,

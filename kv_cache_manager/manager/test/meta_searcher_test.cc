@@ -456,6 +456,69 @@ TEST_F(MetaSearcherTest, TestBatchUpdateLocationStatus) {
     EXPECT_EQ(ec, ErrorCode::EC_BADARGS);
 }
 
+// 任务 82620492：LocationUpdateTask.block_hash != 0 时应当落到 CacheLocation.block_hash。
+TEST_F(MetaSearcherTest, TestBatchUpdateLocationStatusPersistsBlockHash) {
+    MetaSearcher::KeyVector keys = {7001, 7002};
+    auto location_specs = MetaSearcherTestHelper::CreateDefaultLocationSpecs();
+    CacheLocationVector locations = {
+        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, location_specs),
+        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, location_specs),
+    };
+    std::vector<std::string> out_location_ids;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchAddLocation(request_context_.get(), keys, locations, out_location_ids));
+    ASSERT_EQ(out_location_ids.size(), keys.size());
+
+    constexpr int64_t kHashA = 0x1234567890ABCDEFLL;
+    constexpr int64_t kHashB = -42;
+    std::vector<std::vector<MetaSearcher::LocationUpdateTask>> batch_tasks{
+        {MetaSearcher::LocationUpdateTask{out_location_ids[0], CLS_SERVING, kHashA}},
+        {MetaSearcher::LocationUpdateTask{out_location_ids[1], CLS_SERVING, kHashB}},
+    };
+    std::vector<std::vector<ErrorCode>> out_batch_results;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), keys, batch_tasks, out_batch_results));
+
+    std::vector<CacheLocationMap> out_location_maps;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, out_location_maps));
+    ASSERT_EQ(out_location_maps.size(), 2u);
+    EXPECT_EQ(out_location_maps[0].at(out_location_ids[0])->block_hash(), kHashA);
+    EXPECT_EQ(out_location_maps[1].at(out_location_ids[1])->block_hash(), kHashB);
+}
+
+// block_hash == 0 (sentinel) 表示"不更新"，应保留 CacheLocation 上已有 hash。
+TEST_F(MetaSearcherTest, TestBatchUpdateLocationStatusZeroHashPreservesExisting) {
+    MetaSearcher::KeyVector keys = {7100};
+    auto location_specs = MetaSearcherTestHelper::CreateDefaultLocationSpecs();
+    CacheLocationVector locations = {
+        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, location_specs),
+    };
+    std::vector<std::string> out_location_ids;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchAddLocation(request_context_.get(), keys, locations, out_location_ids));
+
+    // 先写入一个 hash
+    constexpr int64_t kInitial = 0xDEADBEEFLL;
+    std::vector<std::vector<MetaSearcher::LocationUpdateTask>> first_tasks{
+        {MetaSearcher::LocationUpdateTask{out_location_ids[0], CLS_SERVING, kInitial}},
+    };
+    std::vector<std::vector<ErrorCode>> first_results;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), keys, first_tasks, first_results));
+
+    // 再用 block_hash=0 调用，hash 应保留
+    std::vector<std::vector<MetaSearcher::LocationUpdateTask>> second_tasks{
+        {MetaSearcher::LocationUpdateTask{out_location_ids[0], CLS_SERVING, 0}},
+    };
+    std::vector<std::vector<ErrorCode>> second_results;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), keys, second_tasks, second_results));
+
+    std::vector<CacheLocationMap> out_location_maps;
+    BlockMask mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, out_location_maps));
+    EXPECT_EQ(out_location_maps[0].at(out_location_ids[0])->block_hash(), kInitial);
+}
+
 TEST_F(MetaSearcherTest, TestBlockKeyWithMultipleLocations) {
     // 准备测试数据 - 使用相同的key添加多个location
     MetaSearcher::KeyVector keys = {12345}; // 只使用一个key

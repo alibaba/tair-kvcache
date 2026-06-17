@@ -144,12 +144,16 @@ public:
                                                               const std::vector<std::string> &location_spec_group_names,
                                                               int64_t write_timeout_seconds,
                                                               int32_t min_replica_count = 1);
+    // block_hashes (任务 82620492)：与 location_info.keys 等长 (即与 StartWriteCache 上
+    // 报的 block_keys 等长，而不是 mask 中"成功"的子集)。每个元素是该 block 的数据
+    // 校验码；client 不上报时传空 vector，server 写入时保留 CacheLocation 已有 hash。
     ErrorCode
     FinishWriteCache(RequestContext *request_context,
                      const std::string &instance_id,
                      const std::string &write_session_id,
                      const BlockMask &success_block_mask,
-                     std::unique_ptr<WriteLocationManager::WriteLocationInfo> write_location_info_internal = nullptr);
+                     std::unique_ptr<WriteLocationManager::WriteLocationInfo> write_location_info_internal = nullptr,
+                     const std::vector<int64_t> &block_hashes = {});
 
     ErrorCode RemoveCache(RequestContext *request_context,
                           const std::string &instance_id,
