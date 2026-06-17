@@ -67,7 +67,8 @@ public:
                                              const std::string &instance_id,
                                              const std::string write_session_id,
                                              const BlockMask &success_block,
-                                             const Locations &locations) = 0;
+                                             const Locations &locations,
+                                             const std::vector<int64_t> &block_hashes = {}) = 0;
 
     virtual ClientErrorCode RemoveCache(const std::string &trace_id,
                                         const std::string &instance_id,

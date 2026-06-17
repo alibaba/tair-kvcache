@@ -124,17 +124,32 @@ PYBIND11_MODULE(kvcm_py_client, module) {
     // 绑定TransferClient类
     py::class_<kvcm::TransferClient, py::smart_holder>(module, "TransferClient")
         .def_static("Create", &kvcm::TransferClient::Create, py::call_guard<py::gil_scoped_release>())
-        .def("LoadKvCaches",
-             &kvcm::TransferClient::LoadKvCaches,
-             py::arg("uri_str_vec"),
-             py::arg("block_buffers"),
-             py::arg("trace_info") = nullptr,
-             py::call_guard<py::gil_scoped_release>())
-        .def("SaveKvCaches",
-             &kvcm::TransferClient::SaveKvCaches,
-             py::arg("uri_str_vec"),
-             py::arg("block_buffers"),
-             py::arg("trace_info") = nullptr,
-             py::call_guard<py::gil_scoped_release>());
+        // 任务 82620492：C++ 接口加了 expected_hashes / out_block_hashes 指针参数 (用于
+        // 方案 A 校验通路)。Python 端暂时不暴露 hash，用 lambda 截断到 3 参数 (走 default
+        // nullptr)；后续 py_connector 接入 checksum 时再扩展 Python 签名。
+        .def(
+            "LoadKvCaches",
+            [](kvcm::TransferClient *self,
+               const kvcm::UriStrVec &uri_str_vec,
+               const kvcm::BlockBuffers &block_buffers,
+               std::shared_ptr<kvcm::TransferTraceInfo> trace_info) {
+                return self->LoadKvCaches(uri_str_vec, block_buffers, trace_info);
+            },
+            py::arg("uri_str_vec"),
+            py::arg("block_buffers"),
+            py::arg("trace_info") = nullptr,
+            py::call_guard<py::gil_scoped_release>())
+        .def(
+            "SaveKvCaches",
+            [](kvcm::TransferClient *self,
+               const kvcm::UriStrVec &uri_str_vec,
+               const kvcm::BlockBuffers &block_buffers,
+               std::shared_ptr<kvcm::TransferTraceInfo> trace_info) {
+                return self->SaveKvCaches(uri_str_vec, block_buffers, trace_info);
+            },
+            py::arg("uri_str_vec"),
+            py::arg("block_buffers"),
+            py::arg("trace_info") = nullptr,
+            py::call_guard<py::gil_scoped_release>());
 
 } // namespace kv_cache_manager

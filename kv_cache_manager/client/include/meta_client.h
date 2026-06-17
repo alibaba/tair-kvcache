@@ -31,10 +31,14 @@ public:
                const std::vector<int64_t> &tokens,
                const std::vector<std::string> &location_spec_group_names,
                int64_t write_timeout_seconds) = 0;
+    // 任务 82620492：block_hashes 与 StartWrite 时上报的 keys 一一对应；空 vector
+    // 视为未上报。MetaClientImpl 会把每个 hash 填到 FinishWriteCacheRequest.locations
+    // 对应位置的 block_hash 字段透传给 server。
     virtual ClientErrorCode FinishWrite(const std::string &trace_id,
                                         const std::string &write_session_id,
                                         const BlockMask &success_block,
-                                        const Locations &locations) = 0;
+                                        const Locations &locations,
+                                        const std::vector<int64_t> &block_hashes = {}) = 0;
 
     virtual std::pair<ClientErrorCode, Metas> MatchMeta(const std::string &trace_id,
                                                         const std::vector<int64_t> &keys,

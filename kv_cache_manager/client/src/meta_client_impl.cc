@@ -169,14 +169,17 @@ MetaClientImpl::StartWrite(const std::string &trace_id,
 ClientErrorCode MetaClientImpl::FinishWrite(const std::string &trace_id,
                                             const std::string &write_session_id,
                                             const BlockMask &success_block,
-                                            const Locations &locations) {
-    KVCM_LOG_DEBUG("finish write with trace_id [%s], write_session_id [%s], block_mask %s, locations %s",
+                                            const Locations &locations,
+                                            const std::vector<int64_t> &block_hashes) {
+    KVCM_LOG_DEBUG("finish write with trace_id [%s], write_session_id [%s], block_mask %s, locations %s, "
+                   "block_hashes_size %zu",
                    trace_id.c_str(),
                    write_session_id.c_str(),
                    DebugStringUtil::ToString(success_block).c_str(),
-                   DebugStringUtil::ToString(locations).c_str());
+                   DebugStringUtil::ToString(locations).c_str(),
+                   block_hashes.size());
     const std::string &instance_id = CHECK_INSTANCE_STUB();
-    return stub_->FinishWriteCache(trace_id, instance_id, write_session_id, success_block, locations);
+    return stub_->FinishWriteCache(trace_id, instance_id, write_session_id, success_block, locations, block_hashes);
 }
 
 ClientErrorCode MetaClientImpl::RemoveCache(const std::string &trace_id,

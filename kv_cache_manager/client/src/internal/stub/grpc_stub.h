@@ -62,7 +62,8 @@ public:
                                      const std::string &instance_id,
                                      const std::string write_session_id,
                                      const BlockMask &success_block,
-                                     const Locations &locations) override;
+                                     const Locations &locations,
+                                     const std::vector<int64_t> &block_hashes = {}) override;
 
     ClientErrorCode RemoveCache(const std::string &trace_id,
                                 const std::string &instance_id,
@@ -73,7 +74,7 @@ public:
     bool TrimCache() override;
 
     std::pair<ClientErrorCode, ClusterInfo> GetClusterInfo(const std::string &trace_id,
-                                                            const std::string &instance_id) override;
+                                                           const std::string &instance_id) override;
 
 private:
     std::shared_ptr<proto::meta::MetaService::Stub> GetStub() const;
