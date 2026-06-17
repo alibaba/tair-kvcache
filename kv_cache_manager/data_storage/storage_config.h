@@ -32,6 +32,43 @@ constexpr std::size_t ToIndex(const DataStorageType &type) noexcept { return sta
 // must be treated the same as the base type
 DataStorageType ToBaseType(const DataStorageType &type) noexcept;
 
+// 数据校验算法。值与 proto::meta::ChecksumAlgo / proto::admin::ChecksumAlgo 对齐。
+// CA_CRC32_XOR_INT64 = client SDK 中 SdkBufferCheckUtil::GetBlocksHash 的实现
+// (CRC32 per iov -> HashUtil::HashIntArray 聚合为 int64)。
+enum class ChecksumAlgo : uint8_t {
+    CA_UNSPECIFIED = 0,
+    CA_CRC32_XOR_INT64 = 1,
+};
+
+std::string ToString(ChecksumAlgo algo);
+ChecksumAlgo ToChecksumAlgo(const std::string &name);
+
+// 数据校验配置。默认全部关闭，未设置时所有校验路径跳过。
+// proto 端定义见 protocol/protobuf/meta_service.proto:DataIntegrityConfig。
+class DataIntegrityConfig : public Jsonizable {
+public:
+    bool FromRapidValue(const rapidjson::Value &rapid_value) override;
+    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
+    bool ValidateRequiredFields(std::string &invalid_fields) const;
+    std::string ToString() const;
+
+    bool enable_meta_checksum() const { return enable_meta_checksum_; }
+    bool enable_inline_header() const { return enable_inline_header_; }
+    uint32_t inline_header_version() const { return inline_header_version_; }
+    ChecksumAlgo algo() const { return algo_; }
+
+    void set_enable_meta_checksum(bool v) { enable_meta_checksum_ = v; }
+    void set_enable_inline_header(bool v) { enable_inline_header_ = v; }
+    void set_inline_header_version(uint32_t v) { inline_header_version_ = v; }
+    void set_algo(ChecksumAlgo algo) { algo_ = algo; }
+
+private:
+    bool enable_meta_checksum_ = false;  // 方案 A
+    bool enable_inline_header_ = false;  // 方案 B：本期仅接口预留，运行期被 Validate 拒绝
+    uint32_t inline_header_version_ = 0; // 0 = 无 inline header (兼容老数据)
+    ChecksumAlgo algo_ = ChecksumAlgo::CA_CRC32_XOR_INT64;
+};
+
 class StorageSpec : public Jsonizable {
 public:
     bool FromRapidValue(const rapidjson::Value &rapid_value) override { return false; }
@@ -241,11 +278,14 @@ public:
     const std::shared_ptr<StorageSpec> &storage_spec() const { return storage_spec_; }
     const bool check_storage_available_when_open() const { return check_storage_available_when_open_; }
     bool is_available() const { return is_available_; }
+    const DataIntegrityConfig &integrity() const { return integrity_; }
+    DataIntegrityConfig &mutable_integrity() { return integrity_; }
     void set_global_unique_name(const std::string &global_unique_name) { global_unique_name_ = global_unique_name; }
     void set_type(DataStorageType type) { type_ = type; }
     void set_storage_spec(const std::shared_ptr<StorageSpec> &storage_spec) { storage_spec_ = storage_spec; }
     void set_check_storage_available_when_open(bool value) { check_storage_available_when_open_ = value; }
     void set_is_available(bool is_available) { is_available_ = is_available; }
+    void set_integrity(const DataIntegrityConfig &integrity) { integrity_ = integrity; }
 
 private:
     DataStorageType type_{DataStorageType::DATA_STORAGE_TYPE_UNKNOWN};
@@ -253,6 +293,7 @@ private:
     std::shared_ptr<StorageSpec> storage_spec_;
     bool check_storage_available_when_open_ = false;
     bool is_available_ = true; // for recover
+    DataIntegrityConfig integrity_;
 };
 
 } // namespace kv_cache_manager
