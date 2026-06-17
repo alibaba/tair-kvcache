@@ -45,7 +45,9 @@ def generate_python(status_vars, output):
     git_commit_full = status_vars.get("STABLE_GIT_COMMIT_FULL", "unknown")
     git_repo = status_vars.get("STABLE_GIT_REPO", "unknown")
     build_date = status_vars.get("BUILD_DATE", "unknown")
-    build_timestamp = status_vars.get("BUILD_TIMESTAMP", build_date)
+    build_timestamp = status_vars.get(
+        "STABLE_BUILD_TIMESTAMP", status_vars.get("BUILD_TIMESTAMP", build_date)
+    )
     build_time = status_vars.get("BUILD_TIME", "unknown")
     full_version = "%s+%s.%s" % (version, build_timestamp, git_commit)
 
@@ -67,7 +69,9 @@ def generate_cpp(status_vars, output):
     git_commit_full = status_vars.get("STABLE_GIT_COMMIT_FULL", "unknown")
     git_repo = status_vars.get("STABLE_GIT_REPO", "unknown")
     build_date = status_vars.get("BUILD_DATE", "unknown")
-    build_timestamp = status_vars.get("BUILD_TIMESTAMP", build_date)
+    build_timestamp = status_vars.get(
+        "STABLE_BUILD_TIMESTAMP", status_vars.get("BUILD_TIMESTAMP", build_date)
+    )
     build_time = status_vars.get("BUILD_TIME", "unknown")
     full_version = "%s+%s.%s" % (version, build_timestamp, git_commit)
 
