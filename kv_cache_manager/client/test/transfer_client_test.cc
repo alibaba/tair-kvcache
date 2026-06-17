@@ -227,3 +227,105 @@ TEST_F(TransferClientTest, TestBlockBufferUsage) {
 
     free(get_buffer);
 }
+
+// 任务 82620492：方案 B (inline_header) 在本期未实现，Init 期间必须拒绝。
+TEST_F(TransferClientTest, TestCreateRejectsInlineHeader) {
+    auto init_params = init_params_;
+    init_params.regist_span = new RegistSpan();
+    init_params.regist_span->base = malloc(1024 * 1024);
+    init_params.regist_span->size = 1024 * 1024;
+    init_params.storage_configs = R"([
+        {
+            "type": "file",
+            "global_unique_name": "test_nfs",
+            "storage_spec": {
+                "root_path": "/tmp/test/",
+                "key_count_per_file": 5
+            },
+            "integrity": {
+                "enable_inline_header": true
+            }
+        }
+    ])";
+    auto client = TransferClient::Create(client_config_, init_params);
+    EXPECT_EQ(client, nullptr);
+    free(init_params.regist_span->base);
+    delete init_params.regist_span;
+}
+
+// inline_header_version != 0 但开关没开 -> 同样被 Init 拒绝。
+TEST_F(TransferClientTest, TestCreateRejectsOrphanInlineHeaderVersion) {
+    auto init_params = init_params_;
+    init_params.regist_span = new RegistSpan();
+    init_params.regist_span->base = malloc(1024 * 1024);
+    init_params.regist_span->size = 1024 * 1024;
+    init_params.storage_configs = R"([
+        {
+            "type": "file",
+            "global_unique_name": "test_nfs",
+            "storage_spec": {
+                "root_path": "/tmp/test/",
+                "key_count_per_file": 5
+            },
+            "integrity": {
+                "enable_inline_header": false,
+                "inline_header_version": 1
+            }
+        }
+    ])";
+    auto client = TransferClient::Create(client_config_, init_params);
+    EXPECT_EQ(client, nullptr);
+    free(init_params.regist_span->base);
+    delete init_params.regist_span;
+}
+
+// enable_meta_checksum=true 的 spec 能正常 Init (内部触发 hash pool 初始化或退化警告)。
+TEST_F(TransferClientTest, TestCreateAcceptsMetaChecksumSpec) {
+    auto init_params = init_params_;
+    init_params.regist_span = new RegistSpan();
+    init_params.regist_span->base = malloc(1024 * 1024);
+    init_params.regist_span->size = 1024 * 1024;
+    init_params.storage_configs = R"([
+        {
+            "type": "file",
+            "global_unique_name": "test_nfs",
+            "storage_spec": {
+                "root_path": "/tmp/test/",
+                "key_count_per_file": 5
+            },
+            "integrity": {
+                "enable_meta_checksum": true,
+                "algo": "crc32_xor_int64"
+            }
+        }
+    ])";
+    auto client = TransferClient::Create(client_config_, init_params);
+    EXPECT_NE(client, nullptr);
+    free(init_params.regist_span->base);
+    delete init_params.regist_span;
+}
+
+// expected_hashes 全 0 -> sentinel 跳过校验，行为 == 老路径，不会因 hash 不匹配返回错误。
+TEST_F(TransferClientTest, TestLoadKvCachesExpectedHashesAllZeroSkipsCheck) {
+    auto client = TransferClient::Create(client_config_, init_params_);
+    ASSERT_NE(client, nullptr);
+    BlockBuffer buffer1, buffer2;
+    BlockBuffers block_buffers = {buffer1, buffer2};
+    std::vector<int64_t> expected_hashes = {0, 0};
+    EXPECT_EQ(ER_OK, client->LoadKvCaches(locations_, block_buffers, nullptr, &expected_hashes));
+}
+
+// expected_hashes 长度与 block_buffers 不一致 -> ER_CHECKSUM_MISMATCH。
+TEST_F(TransferClientTest, TestLoadKvCachesExpectedHashesSizeMismatchFails) {
+    auto client = TransferClient::Create(client_config_, init_params_);
+    ASSERT_NE(client, nullptr);
+    BlockBuffer buffer1, buffer2;
+    BlockBuffers block_buffers = {buffer1, buffer2};
+    std::vector<int64_t> expected_hashes = {0}; // 长度 1，但 buffers 长度 2
+#if defined(USING_CUDA) || defined(USING_MUSA)
+    EXPECT_EQ(ER_CHECKSUM_MISMATCH, client->LoadKvCaches(locations_, block_buffers, nullptr, &expected_hashes));
+#else
+    // 非 CUDA/MUSA build：校验路径整体退化为 no-op，长度不匹配也不报错。
+    EXPECT_EQ(ER_OK, client->LoadKvCaches(locations_, block_buffers, nullptr, &expected_hashes));
+#endif
+}
