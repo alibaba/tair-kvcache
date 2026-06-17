@@ -21,16 +21,9 @@ bool InstanceGroup::FromRapidValue(const rapidjson::Value &rapid_value) {
                                 "event_reporting_storage_candidates",
                                 event_reporting_storage_candidates_,
                                 std::vector<std::string>());
-    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "revisit_interval_buckets", revisit_interval_buckets_str_, std::string(""));
-    // Parse and validate immediately
-    if (!revisit_interval_buckets_str_.empty()) {
-        parsed_revisit_interval_buckets_ = StringUtil::ParseBucketBoundaries(revisit_interval_buckets_str_);
-        if (parsed_revisit_interval_buckets_.empty()) {
-            KVCM_LOG_WARN("InstanceGroup [%s]: invalid revisit_interval_buckets '%s', will use server default",
-                          name_.c_str(),
-                          revisit_interval_buckets_str_.c_str());
-        }
-    }
+    std::string buckets_str;
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "revisit_interval_buckets", buckets_str, std::string(""));
+    set_revisit_interval_buckets(buckets_str);
     return true;
 }
 

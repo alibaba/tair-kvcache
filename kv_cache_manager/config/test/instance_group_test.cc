@@ -1,6 +1,8 @@
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/config/instance_group.h"
+#include "kv_cache_manager/protocol/protobuf/admin_service.pb.h"
+#include "kv_cache_manager/service/util/manager_message_proto_util.h"
 
 namespace kv_cache_manager {
 
@@ -165,6 +167,51 @@ TEST_F(InstanceGroupTest, JsonRoundTripInvalidBuckets) {
     // Raw string preserved, but parsed vector is empty (invalid)
     EXPECT_EQ("5,1,30", parsed.revisit_interval_buckets_raw());
     EXPECT_TRUE(parsed.revisit_interval_buckets().empty());
+}
+
+// --- Proto round-trip ---
+
+TEST_F(InstanceGroupTest, ProtoRoundTripWithBuckets) {
+    InstanceGroup original;
+    original.set_name("test_group");
+    original.set_storage_candidates({"local"});
+    original.set_global_quota_group_name("default");
+    original.set_max_instance_count(10);
+    original.set_version(1);
+    original.set_revisit_interval_buckets("1,5,30,60");
+
+    // ToProto
+    proto::admin::InstanceGroup proto_msg;
+    ProtoConvert::InstanceGroupToProto(original, &proto_msg);
+    EXPECT_EQ("1,5,30,60", proto_msg.revisit_interval_buckets());
+
+    // FromProto
+    InstanceGroup restored;
+    ProtoConvert::InstanceGroupFromProto(&proto_msg, restored);
+    EXPECT_EQ("test_group", restored.name());
+    EXPECT_EQ("1,5,30,60", restored.revisit_interval_buckets_raw());
+    ASSERT_EQ(restored.revisit_interval_buckets().size(), 4);
+    EXPECT_DOUBLE_EQ(restored.revisit_interval_buckets()[0], 1.0);
+    EXPECT_DOUBLE_EQ(restored.revisit_interval_buckets()[3], 60.0);
+}
+
+TEST_F(InstanceGroupTest, ProtoRoundTripWithoutBuckets) {
+    InstanceGroup original;
+    original.set_name("test_group");
+    original.set_storage_candidates({"local"});
+    original.set_global_quota_group_name("default");
+    original.set_max_instance_count(10);
+    original.set_version(1);
+    // revisit_interval_buckets not set
+
+    proto::admin::InstanceGroup proto_msg;
+    ProtoConvert::InstanceGroupToProto(original, &proto_msg);
+    EXPECT_TRUE(proto_msg.revisit_interval_buckets().empty());
+
+    InstanceGroup restored;
+    ProtoConvert::InstanceGroupFromProto(&proto_msg, restored);
+    EXPECT_TRUE(restored.revisit_interval_buckets_raw().empty());
+    EXPECT_TRUE(restored.revisit_interval_buckets().empty());
 }
 
 } // namespace kv_cache_manager

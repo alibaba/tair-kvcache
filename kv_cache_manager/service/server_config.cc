@@ -306,8 +306,7 @@ bool ServerConfig::Check() {
     if (!revisit_interval_buckets_.empty()) {
         auto boundaries = ParseRevisitIntervalBuckets(revisit_interval_buckets_);
         if (boundaries.empty()) {
-            fprintf(stderr, "Invalid revisit_interval_buckets: must be positive numbers in ascending order\n");
-            return false;
+            return false;  // ParseRevisitIntervalBuckets already printed the error
         }
     }
 

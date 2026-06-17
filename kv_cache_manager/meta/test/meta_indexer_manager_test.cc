@@ -287,4 +287,34 @@ TEST_F(MetaIndexerManagerTest, TestCreateWithEmptyBoundariesUsesDefault) {
     EXPECT_DOUBLE_EQ(backend->revisit_histogram_->GetBoundaries()[1], 5.0);  // default, not custom
 }
 
+TEST_F(MetaIndexerManagerTest, TestExistingInstanceUnaffectedByConfigChange) {
+    // Set initial default boundaries
+    auto registry = std::make_shared<MetricsRegistry>();
+    std::vector<double> initial_boundaries = {1, 5, 30};
+    manager_->SetRevisitHistogramConfig(registry, initial_boundaries);
+
+    // Create instance with initial boundaries
+    ASSERT_EQ(ErrorCode::EC_OK, CreateMetaIndexer("inst_stable", META_LOCAL_BACKEND_TYPE_STR));
+
+    // Verify initial boundaries
+    auto *backend_before = dynamic_cast<MetaLocalBackend *>(
+        manager_->GetMetaIndexer("inst_stable")->backend_manager_->persistent_backend_.get());
+    ASSERT_NE(backend_before, nullptr);
+    ASSERT_NE(backend_before->revisit_histogram_, nullptr);
+    ASSERT_EQ(backend_before->revisit_histogram_->GetBoundaries().size(), 3);
+    EXPECT_DOUBLE_EQ(backend_before->revisit_histogram_->GetBoundaries()[1], 5.0);
+
+    // Change the global default boundaries (simulates config update)
+    std::vector<double> new_boundaries = {1, 10, 60};
+    manager_->SetRevisitHistogramConfig(registry, new_boundaries);
+
+    // Existing instance's histogram MUST still use the original boundaries
+    auto *backend_after = dynamic_cast<MetaLocalBackend *>(
+        manager_->GetMetaIndexer("inst_stable")->backend_manager_->persistent_backend_.get());
+    ASSERT_NE(backend_after, nullptr);
+    ASSERT_NE(backend_after->revisit_histogram_, nullptr);
+    EXPECT_EQ(backend_after->revisit_histogram_->GetBoundaries().size(), 3);
+    EXPECT_DOUBLE_EQ(backend_after->revisit_histogram_->GetBoundaries()[1], 5.0);  // still 5.0, NOT 10.0
+}
+
 } // namespace kv_cache_manager
