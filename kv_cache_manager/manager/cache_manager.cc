@@ -184,28 +184,34 @@ std::vector<std::string> BuildAllLocationSpecNames(const std::shared_ptr<const I
     return spec_names;
 }
 
-bool LocationCoversFullBlockOnStorage(const CacheLocation &loc,
+bool LocationsCoverFullBlockOnStorage(const CacheLocationMap &loc_map,
                                       const std::string &storage_name,
                                       const std::shared_ptr<const InstanceInfo> &instance_info) {
     if (instance_info == nullptr || instance_info->location_spec_infos().empty()) {
         return false;
     }
-    const auto &loc_specs = loc.location_specs();
     return std::all_of(instance_info->location_spec_infos().begin(),
                        instance_info->location_spec_infos().end(),
-                       [&loc_specs, &storage_name](const LocationSpecInfo &spec_info) {
-                           return std::any_of(loc_specs.begin(), loc_specs.end(), [&spec_info, &storage_name](const auto &spec) {
-                               const DataStorageUri uri(spec.uri());
-                               return spec.name() == spec_info.name() && uri.Valid() && uri.GetHostName() == storage_name;
+                       [&loc_map, &storage_name](const LocationSpecInfo &spec_info) {
+                           return std::any_of(loc_map.begin(), loc_map.end(), [&spec_info, &storage_name](const auto &entry) {
+                               const auto &loc_ptr = entry.second;
+                               if (!loc_ptr || loc_ptr->status() != CacheLocationStatus::CLS_SERVING) {
+                                   return false;
+                               }
+                               return std::any_of(
+                                   loc_ptr->location_specs().begin(), loc_ptr->location_specs().end(), [&spec_info, &storage_name](const auto &spec) {
+                                       const DataStorageUri uri(spec.uri());
+                                       return spec.name() == spec_info.name() && uri.Valid() &&
+                                              uri.GetHostName() == storage_name;
+                                   });
                            });
                        });
 }
 
-MigrationMarkClearPolicy GetMarkClearPolicyForTarget(RequestContext *request_context,
+MigrationMarkClearPolicy GetMigrationMarkClearPolicy(RequestContext *request_context,
                                                      const std::shared_ptr<RegistryManager> &registry_manager,
-                                                     const std::shared_ptr<const InstanceInfo> &instance_info,
-                                                     const std::string &target_storage) {
-    if (registry_manager == nullptr || instance_info == nullptr || target_storage.empty()) {
+                                                     const std::shared_ptr<const InstanceInfo> &instance_info) {
+    if (registry_manager == nullptr || instance_info == nullptr) {
         return MigrationMarkClearPolicy::CLEAR_ON_NEXT_WRITE_SUCCESS;
     }
     auto [ec, instance_group] =
@@ -213,12 +219,7 @@ MigrationMarkClearPolicy GetMarkClearPolicyForTarget(RequestContext *request_con
     if (ec != EC_OK || instance_group == nullptr || instance_group->cache_config() == nullptr) {
         return MigrationMarkClearPolicy::CLEAR_ON_NEXT_WRITE_SUCCESS;
     }
-    for (const auto &strategy : instance_group->cache_config()->migration_strategies()) {
-        if (strategy != nullptr && strategy->methods().mark().enabled() && strategy->target_storage() == target_storage) {
-            return strategy->methods().mark().clear_policy();
-        }
-    }
-    return MigrationMarkClearPolicy::CLEAR_ON_NEXT_WRITE_SUCCESS;
+    return instance_group->cache_config()->migration_mark_clear_policy();
 }
 
 bool IsTieredMigrationEnabled(RequestContext *request_context,
@@ -942,10 +943,10 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
                         continue;
                     }
                     const auto clear_policy =
-                        GetMarkClearPolicyForTarget(request_context, registry_manager_, instance_info, tiered_targets[i]);
+                        GetMigrationMarkClearPolicy(request_context, registry_manager_, instance_info);
                     if (clear_policy == MigrationMarkClearPolicy::CLEAR_ON_NEXT_WRITE_SUCCESS ||
                         (clear_policy == MigrationMarkClearPolicy::CLEAR_ON_FULL_BLOCK_COVERED &&
-                         LocationCoversFullBlockOnStorage(*loc, tiered_targets[i], instance_info))) {
+                         LocationsCoverFullBlockOnStorage(loc_maps[i], tiered_targets[i], instance_info))) {
                         migration_manager_->ClearTieredWriteMark(instance_id, mark_candidate_keys[i]);
                     }
                 }

@@ -571,7 +571,8 @@ void AdminServiceImpl::MigrateCache(RequestContext *request_context,
         CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("MigrateCache", "target_storage_name", true);
     }
     const auto method = request->method();
-    if (method == proto::admin::MIGRATION_METHOD_UNSPECIFIED) {
+    if (method != proto::admin::MIGRATION_METHOD_COPY && method != proto::admin::MIGRATION_METHOD_MARK &&
+        method != proto::admin::MIGRATION_METHOD_BOTH) {
         CHECK_REQUIRED_FIELDS_VALIDATION_AND_RETURN("MigrateCache", "method", true);
     }
 

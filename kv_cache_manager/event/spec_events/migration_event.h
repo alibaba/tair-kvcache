@@ -97,6 +97,7 @@ public:
         BaseEvent::ToRapidWriter(writer);
         Put(writer, "block_key", block_key_);
         Put(writer, "dst_storage", dst_storage_);
+        Put(writer, "method", std::string("mark"));
     }
 
 private:
@@ -118,6 +119,7 @@ public:
         BaseEvent::ToRapidWriter(writer);
         Put(writer, "block_key", block_key_);
         Put(writer, "dst_storage", dst_storage_);
+        Put(writer, "method", std::string("mark"));
     }
 
 private:

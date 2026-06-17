@@ -60,6 +60,7 @@ public:
         loader.Init(registry_manager_);
         loader.Load("");
         ASSERT_EQ(EC_OK, cache_manager_->DoRecover());
+        cache_manager_->migration_manager()->DebugEnableCopySubmissionsForTest();
 
         ASSERT_TRUE(RegisterDummyStorage("hot_01"));
         ASSERT_TRUE(RegisterDummyStorage("cold_01"));
@@ -171,6 +172,12 @@ TEST_F(AdminServiceImplTest, TestInvalidArgs) {
     }
     {
         auto req = MakeReq(proto::admin::MIGRATION_METHOD_UNSPECIFIED, {1});
+        proto::admin::MigrateCacheResponse resp;
+        admin_->MigrateCache(rc.get(), &req, &resp);
+        ASSERT_EQ(proto::admin::INVALID_ARGUMENT, resp.header().status().code());
+    }
+    {
+        auto req = MakeReq(static_cast<proto::admin::MigrationMethod>(999), {1});
         proto::admin::MigrateCacheResponse resp;
         admin_->MigrateCache(rc.get(), &req, &resp);
         ASSERT_EQ(proto::admin::INVALID_ARGUMENT, resp.header().status().code());

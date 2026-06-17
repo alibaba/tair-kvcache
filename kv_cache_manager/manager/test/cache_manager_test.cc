@@ -3453,6 +3453,67 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheWithMinReplicaUsesTieredMarkTarget)
     ASSERT_EQ("cold_01", new_targets[0]);
 }
 
+TEST_F(CacheManagerTest, TestFilterWriteCacheWithMinReplicaHonorsTieredMarkWhenReplicaSatisfied) {
+    EnableTieredMigrationStrategy();
+    cache_manager_->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "min_replica_satisfied_tiered",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     std::vector<LocationSpecGroup>());
+    MetaSearcher *meta_searcher =
+        cache_manager_->meta_searcher_manager_->GetMetaSearcher("min_replica_satisfied_tiered");
+    ASSERT_TRUE(meta_searcher);
+
+    auto make_hot_loc = [](const std::string &uri) {
+        return std::make_shared<CacheLocation>(
+            DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+            1,
+            std::vector<LocationSpec>{LocationSpec("tp0", uri)});
+    };
+    std::vector<std::string> ids;
+    ASSERT_EQ(EC_OK,
+              meta_searcher->BatchAddLocation(
+                  request_context_.get(), {1}, {make_hot_loc("dummy://hot_01/blk1_a?size=1")}, ids));
+    ASSERT_EQ(1u, ids.size());
+    std::vector<std::vector<MetaSearcher::LocationCASTask>> cas_tasks{
+        {MetaSearcher::LocationCASTask{ids[0], CLS_WRITING, CLS_SERVING}}};
+    std::vector<std::vector<ErrorCode>> cas_results;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchCASLocationStatus(request_context_.get(), {1}, cas_tasks, cas_results));
+
+    ids.clear();
+    ASSERT_EQ(EC_OK,
+              meta_searcher->BatchAddLocation(
+                  request_context_.get(), {1}, {make_hot_loc("dummy://hot_02/blk1_b?size=1")}, ids));
+    ASSERT_EQ(1u, ids.size());
+    cas_tasks = {{MetaSearcher::LocationCASTask{ids[0], CLS_WRITING, CLS_SERVING}}};
+    cas_results.clear();
+    ASSERT_EQ(EC_OK, meta_searcher->BatchCASLocationStatus(request_context_.get(), {1}, cas_tasks, cas_results));
+
+    cache_manager_->migration_manager()->MarkForTieredWrite("min_replica_satisfied_tiered", {1}, "cold_01");
+
+    CacheManager::KeyVector new_keys;
+    std::vector<std::string_view> new_sgn;
+    BlockMask block_mask;
+    std::vector<std::string> new_targets;
+    auto ec = cache_manager_->FilterWriteCache(request_context_.get(),
+                                               "min_replica_satisfied_tiered",
+                                               meta_searcher,
+                                               {1},
+                                               new_keys,
+                                               {},
+                                               new_sgn,
+                                               block_mask,
+                                               2,
+                                               new_targets);
+    ASSERT_EQ(EC_OK, ec);
+    ASSERT_EQ(1u, new_keys.size());
+    ASSERT_EQ(1, new_keys[0]);
+    ASSERT_EQ(1u, new_targets.size());
+    ASSERT_EQ("cold_01", new_targets[0]);
+}
+
 TEST_F(CacheManagerTest, TestFilterWriteCacheTieredMarkChecksSpecGroupOnTarget) {
     EnableTieredMigrationStrategy();
     std::vector<LocationSpecInfo> location_spec_infos = {
@@ -3655,18 +3716,10 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheClearsTieredMark) {
 }
 
 TEST_F(CacheManagerTest, TestFinishWriteCacheFullBlockPolicyKeepsPartialMark) {
-    auto strategy = std::make_shared<MigrationStrategy>();
-    strategy->set_storage_unique_name("hot_01");
-    strategy->set_target_storage("cold_01");
-    strategy->set_trigger_threshold(0.7);
-    MigrationMethods methods;
-    methods.mutable_mark().set_enabled(true);
-    methods.mutable_mark().set_clear_policy(MigrationMarkClearPolicy::CLEAR_ON_FULL_BLOCK_COVERED);
-    strategy->set_methods(methods);
-    strategy->set_retention(MigrationRetention::MIGRATION_RETENTION_UNSPECIFIED);
     auto default_group = registry_manager_->instance_group_configs_["default"];
     ASSERT_TRUE(default_group != nullptr);
-    default_group->cache_config_->set_migration_strategies({strategy});
+    default_group->cache_config_->set_migration_mark_clear_policy(
+        MigrationMarkClearPolicy::CLEAR_ON_FULL_BLOCK_COVERED);
 
     cache_manager_->RegisterInstance(request_context_.get(),
                                      "default",
@@ -3704,26 +3757,25 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheFullBlockPolicyKeepsPartialMark) {
                                                std::move(partial_info)));
     ASSERT_TRUE(cache_manager_->migration_manager()->IsMarkedForTieredWrite("full_policy_instance", 1));
 
-    auto full_cold_loc = std::make_shared<CacheLocation>(
+    auto remaining_cold_loc = std::make_shared<CacheLocation>(
         DataStorageType::DATA_STORAGE_TYPE_DUMMY,
-        4,
+        3,
         std::vector<LocationSpec>{
-            LocationSpec("tp0", "dummy://cold_01/blk1/tp0_full?size=1"),
             LocationSpec("tp1", "dummy://cold_01/blk1/tp1?size=1"),
             LocationSpec("tp2", "dummy://cold_01/blk1/tp2?size=1"),
             LocationSpec("tp3", "dummy://cold_01/blk1/tp3?size=1"),
         });
-    std::vector<std::string> full_ids;
-    ASSERT_EQ(EC_OK, meta_searcher->BatchAddLocation(request_context_.get(), {1}, {full_cold_loc}, full_ids));
-    auto full_info = std::make_unique<WriteLocationManager::WriteLocationInfo>();
-    full_info->keys = {1};
-    full_info->location_ids = {full_ids[0]};
+    std::vector<std::string> remaining_ids;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchAddLocation(request_context_.get(), {1}, {remaining_cold_loc}, remaining_ids));
+    auto remaining_info = std::make_unique<WriteLocationManager::WriteLocationInfo>();
+    remaining_info->keys = {1};
+    remaining_info->location_ids = {remaining_ids[0]};
     ASSERT_EQ(EC_OK,
               cache_manager_->FinishWriteCache(request_context_.get(),
                                                "full_policy_instance",
-                                               "sess_full",
+                                               "sess_remaining",
                                                static_cast<BlockMaskOffset>(1),
-                                               std::move(full_info)));
+                                               std::move(remaining_info)));
     ASSERT_FALSE(cache_manager_->migration_manager()->IsMarkedForTieredWrite("full_policy_instance", 1));
 }
 
