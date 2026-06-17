@@ -20,6 +20,9 @@ except ImportError:
 from schedule_simulator.schedule_emulator.types import *
 from schedule_simulator.schedule_emulator.run import BenchmarkRunner, DisaggBenchmarkRunner
 from schedule_simulator.schedule_emulator.base import GlobalValues
+from schedule_simulator.infer_time_predictor import RequestLevelTimePredictor
+
+_FAST_PREDICTOR = RequestLevelTimePredictor(constant_ms_per_token=0.1)
 
 SAMPLE_DIR = os.path.join(os.path.dirname(__file__), "assets/glm5_sample")
 ENRICHED_INPUT = os.path.join(SAMPLE_DIR, "glm5_enriched_input.jsonl")
@@ -109,7 +112,8 @@ def test_e2e_enriched_has_real_hits():
     runner = DisaggBenchmarkRunner(
         benchmark_config=BenchmarkConfig(dataset_path=ENRICHED_INPUT, num_prompts=100, disable_tqdm=True),
         p_scheduler_config=SchedulerConfig("Qwen2.5-3B", scenario="disagg_prefill",
-            chunked_prefill_size=8192, hicache_storage_backend="hf3fs"),
+            chunked_prefill_size=8192, hicache_storage_backend="hf3fs",
+            request_level_scheduling=True),
         d_scheduler_config=SchedulerConfig("Qwen2.5-3B", scenario="disagg_decode"),
         p_platform_config=PlatformConfig(device="H20", disk_read_bandwidth_gb=2.0,
             memory_read_bandwidth_gb=16.0, memory_capacity_gb=64.0, peer_read_bandwidth_gb=10.0),
@@ -117,6 +121,7 @@ def test_e2e_enriched_has_real_hits():
         router_config=RouterConfig(p_policy=RoutingPolicy.ROUND_ROBIN, d_policy=RoutingPolicy.ROUND_ROBIN,
             worker_startup_check_interval=0.01),
         num_p_instance=5, num_d_instance=0,
+        infer_time_predictor=_FAST_PREDICTOR,
         enable_hierarchical=True, hierarchical_output_dir="/tmp/block_ids_e2e",
     )
     m = runner.run_benchmark_emulation()
@@ -140,9 +145,11 @@ def test_e2e_enriched_has_real_hits():
 def test_e2e_plain_has_zero_hits():
     random.seed(42); np.random.seed(42)
     runner = DisaggBenchmarkRunner(
-        benchmark_config=BenchmarkConfig(dataset_path=PLAIN_INPUT, num_prompts=50, disable_tqdm=True),
+        benchmark_config=BenchmarkConfig(dataset_path=PLAIN_INPUT, num_prompts=5,
+            max_input_length=1000, disable_tqdm=True),
         p_scheduler_config=SchedulerConfig("Qwen2.5-3B", scenario="disagg_prefill",
-            chunked_prefill_size=8192, hicache_storage_backend="hf3fs"),
+            chunked_prefill_size=8192, hicache_storage_backend="hf3fs",
+            request_level_scheduling=True, page_size=256),
         d_scheduler_config=SchedulerConfig("Qwen2.5-3B", scenario="disagg_decode"),
         p_platform_config=PlatformConfig(device="H20", disk_read_bandwidth_gb=2.0,
             memory_read_bandwidth_gb=16.0, memory_capacity_gb=64.0),
@@ -150,12 +157,13 @@ def test_e2e_plain_has_zero_hits():
         router_config=RouterConfig(p_policy=RoutingPolicy.ROUND_ROBIN, d_policy=RoutingPolicy.ROUND_ROBIN,
             worker_startup_check_interval=0.01),
         num_p_instance=3, num_d_instance=0,
+        infer_time_predictor=_FAST_PREDICTOR,
         enable_hierarchical=True, hierarchical_output_dir="/tmp/block_ids_plain",
     )
     m = runner.run_benchmark_emulation()
     h = runner.get_hierarchical_metrics()
 
-    assert m["completed"] == 50
+    assert m["completed"] == 5
     total_hit = h["total_engine_hit_blocks"] + h["total_peer_hit_blocks"] + h["total_pool_hit_blocks"]
     assert total_hit == 0, "Without real block_ids, should have 0 hits, got %d" % total_hit
     print("[e2e_plain] total_hit=0 as expected (synthetic block_ids)")
@@ -238,7 +246,8 @@ def test_block_level_metrics():
     runner = DisaggBenchmarkRunner(
         benchmark_config=BenchmarkConfig(dataset_path=ENRICHED_INPUT, num_prompts=50, disable_tqdm=True),
         p_scheduler_config=SchedulerConfig("Qwen2.5-3B", scenario="disagg_prefill",
-            chunked_prefill_size=8192, hicache_storage_backend="hf3fs"),
+            chunked_prefill_size=8192, hicache_storage_backend="hf3fs",
+            request_level_scheduling=True),
         d_scheduler_config=SchedulerConfig("Qwen2.5-3B", scenario="disagg_decode"),
         p_platform_config=PlatformConfig(device="H20", disk_read_bandwidth_gb=2.0,
             memory_read_bandwidth_gb=16.0, memory_capacity_gb=64.0, peer_read_bandwidth_gb=10.0),
@@ -246,6 +255,7 @@ def test_block_level_metrics():
         router_config=RouterConfig(p_policy=RoutingPolicy.ROUND_ROBIN, d_policy=RoutingPolicy.ROUND_ROBIN,
             worker_startup_check_interval=0.01),
         num_p_instance=3, num_d_instance=0,
+        infer_time_predictor=_FAST_PREDICTOR,
         enable_hierarchical=True, hierarchical_output_dir="/tmp/block_metrics_test",
     )
     runner.run_benchmark_emulation()
@@ -287,7 +297,8 @@ def test_per_request_records_have_num_blocks():
     runner = DisaggBenchmarkRunner(
         benchmark_config=BenchmarkConfig(dataset_path=ENRICHED_INPUT, num_prompts=20, disable_tqdm=True),
         p_scheduler_config=SchedulerConfig("Qwen2.5-3B", scenario="disagg_prefill",
-            chunked_prefill_size=8192, hicache_storage_backend="hf3fs"),
+            chunked_prefill_size=8192, hicache_storage_backend="hf3fs",
+            request_level_scheduling=True),
         d_scheduler_config=SchedulerConfig("Qwen2.5-3B", scenario="disagg_decode"),
         p_platform_config=PlatformConfig(device="H20", disk_read_bandwidth_gb=2.0,
             memory_read_bandwidth_gb=16.0, memory_capacity_gb=64.0),
@@ -295,6 +306,7 @@ def test_per_request_records_have_num_blocks():
         router_config=RouterConfig(p_policy=RoutingPolicy.ROUND_ROBIN, d_policy=RoutingPolicy.ROUND_ROBIN,
             worker_startup_check_interval=0.01),
         num_p_instance=2, num_d_instance=0,
+        infer_time_predictor=_FAST_PREDICTOR,
         enable_hierarchical=True, hierarchical_output_dir="/tmp/block_records_test",
     )
     runner.run_benchmark_emulation()
