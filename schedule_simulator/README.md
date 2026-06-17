@@ -150,6 +150,25 @@ python3 scripts/run_simulation.py \
   --output-dir ./results_full
 ```
 
+### 概率路由仿真（推荐用于策略评估）
+
+```bash
+python3 scripts/run_simulation.py \\
+  --dataset data/h21_32_256k_15min_full.jsonl \\
+  --num-prompts 50000 \\
+  --request-level \\
+  --ms-per-token 0.1 \\
+  --kv-bytes-per-token 640 --max-num-tokens 999999999 \\
+  --num-p-instances 32 --routing direct_cache_aware \\
+  --enable-hierarchical --enable-p2p \\
+  --page-size 2048 --data-block-size 256 \\
+  --topk-routing --lmax 40 --weight-prefix 30.0 --weight-load 10.0 \\
+  --output-dir ./results_topk
+```
+
+> **注**：概率路由需配合 `--enable-hierarchical` 使用，且 `--routing` 必须为 `cache_aware` 或 `direct_cache_aware`。
+> 关闭 `--topk-routing` 则回退到传统确定性路由，完全向后兼容。
+
 ## 5. 完整参数说明
 
 ### CLI 参数
@@ -175,18 +194,135 @@ python3 scripts/run_simulation.py \
 | `--page-size` | None | block 大小（tokens/block），需与数据中 block_ids 粒度一致 |
 | `--write-policy` | write_through | 缓存写策略: write_through / write_back / write_through_selective |
 | `--pool-capacity` | 2.0 | 共享存储池容量 (GB)，设 0 关闭 L3 |
+| `--topk-routing` | False | 启用概率路由（需配合 cache_aware/direct_cache_aware） |
+| `--lmax` | 40 | 满载归一化基准（Lmax） |
+| `--weight-prefix` | 30.0 | 前缀命中打分权重 wp |
+| `--weight-load` | 10.0 | 负载均衡打分权重 wl |
 | `--output-dir` | ./sim_results | 输出目录 |
 | `--seed` | 42 | 随机种子 |
 
-### 五种路由策略
+### 路由策略详细说明
+
+#### 基础策略
 
 | 策略 | 说明 | 适用场景 |
 |------|------|----------|
 | `random` | 随机分配 | 基线对比 |
-| `round_robin` | 轮询 | 均匀负载 |
-| `power_of_two` | 两选一（按 token 负载） | 异步负载感知 |
-| `cache_aware` | 路由侧近似 radix tree | 无 Optimizer 集成时 |
-| `direct_cache_aware` | 直接查询 Optimizer 真实 cache（**推荐**） | 需 `--enable-hierarchical` |
+| `round_robin` | 轮询 | 均匀负载基线 |
+| `power_of_two` | 随机选两个节点，取负载较低的 | 无缓存感知时的负载均衡 |
+
+#### `cache_aware` — 近似前缀树路由
+
+**原理**：路由层维护一棵独立的近似 RadixTree（通过 C++ Optimizer `WriteCache` 更新），每次请求到达时调用 `ChooseBestEngine` 找到最长前缀匹配的节点。
+
+**决策流程**：
+1. 调用 `ChooseBestEngine(block_ids)` 获取最优引擎 + 命中数
+2. 计算 `match_rate = hit_count × page_size / input_length`
+3. 若 `match_rate > cache_threshold`（默认 0.3）：检查负载均衡
+   - `is_overloaded = (best_load - min_load > balance_abs_threshold) AND (best_load > min_load × balance_rel_threshold)`
+   - 若过载 → 回退到最小负载节点（`load_balance_override`）
+   - 若未过载 → 路由到最优缓存节点（`cache_hit`）
+4. 若 `match_rate <= cache_threshold` → 回退到最小负载节点（`cache_miss_fallback`）
+
+**关键配置**：
+- `cache_threshold = 0.3`（命中率低于此值视为无缓存）
+- `balance_abs_threshold = 8`（负载差绝对阈值）
+- `balance_rel_threshold = 1.5`（负载差相对阈值，1.5 表示 50% 以上差距）
+
+**限制**：近似树与引擎真实缓存状态存在延迟偏差；确定性选择导致热点集中。
+
+**入口命令**：
+```bash
+python3 scripts/run_simulation.py \\
+  --dataset data/input.jsonl \\
+  --num-p-instances 32 --routing cache_aware \\
+  --request-level --ms-per-token 0.1 \\
+  --enable-hierarchical --enable-p2p \\
+  --page-size 2048 --data-block-size 256
+```
+
+#### `direct_cache_aware` — 直连 Optimizer 路由（**推荐**）
+
+**原理**：与 `cache_aware` 相同的决策逻辑，但直接查询各引擎 Optimizer 的真实 RadixTree（零延迟、零偏差），用于评估缓存路由的理想上限。
+
+**与 `cache_aware` 的区别**：
+| 维度 | cache_aware | direct_cache_aware |
+|------|-------------|-------------------|
+| 前缀树来源 | 路由层近似副本 | 引擎真实缓存 |
+| 一致性延迟 | 有（WriteCache 更新延迟） | 无 |
+| 适用场景 | 模拟线上实际行为 | 评估策略理论上限 |
+
+**入口命令**：
+```bash
+python3 scripts/run_simulation.py \\
+  --dataset data/input.jsonl \\
+  --num-p-instances 32 --routing direct_cache_aware \\
+  --request-level --ms-per-token 0.1 \\
+  --enable-hierarchical --enable-p2p \\
+  --page-size 2048 --data-block-size 256
+```
+
+#### `cache_aware` / `direct_cache_aware` + `--topk-routing` — 概率路由（**新增**）
+
+**原理**：线上 Pre-Cache-Aware-Scheduler 的仿真实现。不再确定性选择单个最优节点，而是综合所有节点的“缓存命中率 + 负载”进行指数打分，再从 TopK 候选中加权随机采样。
+
+**核心公式**：
+```
+p_i = hit_count_i × page_size / input_token_length   # 前缀命中比例 [0,1]
+l_i = load_i / Lmax                                   # 归一化负载
+l̄ = mean(l_i)                                        # 平均负载
+
+score_i = 2^(wp × p_i + wl × (l̄ - l_i))             # 指数打分
+```
+
+**决策流程**：
+1. 调用 `ChooseTopKEngines(block_ids)` 获取**所有**有命中的节点
+2. 对每个候选节点计算 `score_i`
+3. **TopK 截断**：`K = max(⌈√N⌉, 5)`，只保留得分最高的 K 个节点
+4. **加权随机采样**：`Pr(i) = score_i / Σ(score_j ∈ topK)`
+
+**参数说明**：
+| 参数 | 默认值 | 含义 |
+|------|--------|------|
+| `--topk-routing` | 关闭 | 启用概率路由 |
+| `--lmax` | 40 | 满载基准（归一化分母） |
+| `--weight-prefix` | 30.0 | 缓存命中权重 wp（越大越倾向高命中节点） |
+| `--weight-load` | 10.0 | 负载均衡权重 wl（越大越倾向低负载节点） |
+
+**分数量级示例**（直觉理解）：
+| p_i | 负载状态 | score |
+|-----|----------|-------|
+| 1.0（满命中） | 空闲 | ~2³² ≈ 4.3×10⁹ |
+| 1.0（满命中） | 均载 | ~2³⁰ ≈ 10⁹ |
+| 0（无命中） | 空闲 | ~2² = 4 |
+| 0（无命中） | 满载 | ~2⁻⁵ = 0.03 |
+
+**优势**：
+- 避免热点集中：高命中节点概率更高但不独占
+- 负载均衡内嵌公式：无需事后 overload 补救
+- TopK 截断：去除长尾噪音，采样更高效
+
+**入口命令**：
+```bash
+python3 scripts/run_simulation.py \\
+  --dataset data/input.jsonl \\
+  --num-p-instances 32 --routing direct_cache_aware \\
+  --request-level --ms-per-token 0.1 \\
+  --enable-hierarchical --enable-p2p \\
+  --page-size 2048 --data-block-size 256 \\
+  --topk-routing --lmax 40 --weight-prefix 30.0 --weight-load 10.0
+```
+
+#### 策略对比总结
+
+| 维度 | cache_aware | direct_cache_aware | + topk_routing |
+|------|------------|-------------------|----------------|
+| 选择方式 | 确定性：选最大命中 | 确定性：选最大命中 | 概率性：加权随机 |
+| 负载均衡 | 阈值触发覆盖 | 阈值触发覆盖 | 内嵌公式 |
+| 热点风险 | 高 | 高 | 低 |
+| 缓存利用率 | 最高 | 最高 | 略低 |
+| 尾延迟（P99） | 高（过载） | 高（过载） | 低（均匀）|
+| 输出日志 | 标准字段 | 标准字段 | +概率路由指标 |
 
 ### 输入数据格式 (JSONL)
 
@@ -213,7 +349,40 @@ python3 scripts/run_simulation.py \
 | `simulation_summary.json` | TTFT/TPOT 分位数、吞吐量、并发度、queue_wait、三级命中率 |
 | `per_request.csv` | 逐请求: req_id, input_length, ttft_ms, queue_wait_ms, engine/peer/pool_hit |
 | `per_iteration.csv` | 逐 iteration: pod, timestamp, latency_ms, batch 组成 |
+| `routing_decisions.jsonl` | 逐请求路由决策日志（含概率路由指标，见下方说明） |
 | `optimizer/` | Hierarchical cache 配置和分析输出 |
+
+#### routing_decisions.jsonl 字段说明
+
+基础字段（所有 cache_aware 策略均输出）：
+
+| 字段 | 说明 |
+|------|------|
+| `req_id` | 请求 ID |
+| `timestamp` | 路由时刻（仿真时间） |
+| `input_length` | 输入 token 长度 |
+| `best_engine_id` | 前缀匹配最优引擎 ID |
+| `hit_count` | 最优引擎命中 block 数 |
+| `match_rate` | 最优引擎命中率 |
+| `routed_to` | 实际路由到的引擎 ID |
+| `reason` | 路由原因: cache_hit / load_balance_override / cache_miss_fallback |
+| `loads` | 路由时刻各节点负载快照 |
+| `best_engine_load` | 最优引擎当时负载 |
+
+概率路由额外字段（仅 `--topk-routing` 时输出，小数保留 3 位）：
+
+| 字段 | 说明 |
+|------|------|
+| `routing_mode` | 固定 "probabilistic" |
+| `chosen_p_i` | 被选中节点的前缀命中比例 |
+| `chosen_score` | 被选中节点的打分 |
+| `chosen_load` | 被选中节点的负载 |
+| `l_bar` | 全局平均归一化负载 |
+| `topk_size` | TopK 截断后候选数 |
+| `total_candidates` | 全部候选节点数 |
+| `top1_engine_id` | 最高分节点 ID |
+| `top1_score` | 最高分 |
+| `top1_hit_count` | 最高分节点命中 block 数 |
 
 ## 6. C++ Optimizer 接口
 
@@ -265,7 +434,7 @@ cd schedule_simulator
 # 设置 PYTHONPATH（包含 C++ 模块）
 export PYTHONPATH=/path/to/tair-kvcache/bazel-bin/kv_cache_manager/optimizer/pybind:$PYTHONPATH
 
-# 运行全部测试（当前 207 个）
+# 运行全部测试（当前 235 个）
 python3 -m pytest tests/ -v
 
 # 仅运行不依赖 C++ 模块的测试
