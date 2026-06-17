@@ -19,6 +19,8 @@ enum ErrorCode {
     SERVER_NOT_LEADER = 9;
 
     IO_ERROR = 20;
+    CHECKSUM_MISMATCH = 21;      // 读出的数据 hash 与 meta 中保存的 hash 不一致
+    INLINE_HEADER_INVALID = 22;  // KVCache 数据块内嵌 header 校验失败 (方案 B，本期未启用)
     UNKNOWN_ERROR = 100;
     ERROR_MAX = 65535;
 }

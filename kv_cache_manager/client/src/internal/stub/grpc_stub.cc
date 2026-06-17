@@ -127,7 +127,9 @@ kv_cache_manager::ClientErrorCode ToClientError(kv_cache_manager::proto::meta::E
                   {proto::meta::INVALID_ARGUMENT, ER_SERVICE_INVALID_ARGUMENT},
                   {proto::meta::DUPLICATE_ENTITY, ER_SERVICE_DUPLICATE_ENTITY},
                   {proto::meta::INSTANCE_NOT_EXIST, ER_SERVICE_INSTANCE_NOT_EXIST},
-                  {proto::meta::SERVER_NOT_LEADER, ER_SERVICE_NOT_LEADER}};
+                  {proto::meta::SERVER_NOT_LEADER, ER_SERVICE_NOT_LEADER},
+                  {proto::meta::CHECKSUM_MISMATCH, ER_CHECKSUM_MISMATCH},
+                  {proto::meta::INLINE_HEADER_INVALID, ER_INLINE_HEADER_INVALID}};
     if (auto iter = error_map.find(service_error); iter != error_map.end()) {
         return iter->second;
     }
@@ -456,7 +458,7 @@ bool GrpcStub::TrimCache() {
 }
 
 std::pair<ClientErrorCode, ClusterInfo> GrpcStub::GetClusterInfo(const std::string &trace_id,
-                                                                  const std::string &instance_id) {
+                                                                 const std::string &instance_id) {
     auto stub = GET_AND_CHECK_STUB_WITH_TYPE();
     proto::meta::GetClusterInfoRequest request;
     SetCommonInfo(request, trace_id, instance_id);
@@ -476,9 +478,8 @@ std::pair<ClientErrorCode, ClusterInfo> GrpcStub::GetClusterInfo(const std::stri
         info.leader_endpoint.meta_http_port = ep.meta_http_port();
         info.leader_endpoint.custom_info = ep.custom_info();
     }
-    KVCM_LOG_DEBUG("get cluster info success, self=%s, leader=%s",
-                   info.self_node_id.c_str(),
-                   info.leader_node_id.c_str());
+    KVCM_LOG_DEBUG(
+        "get cluster info success, self=%s, leader=%s", info.self_node_id.c_str(), info.leader_node_id.c_str());
     return {ER_OK, info};
 }
 

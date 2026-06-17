@@ -60,6 +60,10 @@ enum [[nodiscard]] ClientErrorCode : int32_t{
     ER_CUDA_STREAM_SYNCHRONIZE_ERROR = 115,
     ER_CUDA_STREAM_DESTROY_ERROR = 116,
     ER_CUDA_HOST_REGISTER_ERROR = 117,
+
+    // data integrity
+    ER_CHECKSUM_MISMATCH = 118,     // 读出的 block 数据 hash 与 meta 中保存的 hash 不一致
+    ER_INLINE_HEADER_INVALID = 119, // KVCache 数据块内嵌 header 校验失败 (方案 B，本期未启用)
 };
 
 enum class QueryType : int {
