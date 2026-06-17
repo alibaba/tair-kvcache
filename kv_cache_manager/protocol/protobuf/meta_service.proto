@@ -46,6 +46,25 @@ enum StorageType {
     ST_VINEYARD = 7;
 }
 
+// 数据校验算法标识。CA_CRC32_XOR_INT64 对应 SdkBufferCheckUtil::GetBlocksHash 的实现
+// (CRC32 per iov -> HashUtil::HashIntArray 聚合为 int64)。新算法在此追加，禁止复用旧值。
+enum ChecksumAlgo {
+    CA_UNSPECIFIED = 0;
+    CA_CRC32_XOR_INT64 = 1;
+}
+
+// 数据校验配置。所有字段默认关闭，老 spec 不带本字段时校验路径全部跳过。
+message DataIntegrityConfig {
+    // 方案 A：是否在 KVCM meta 里持久化 block_hash 并在读端做校验。
+    bool enable_meta_checksum = 1;
+    // 方案 B：是否在 KVCache 数据块内嵌 header (block_key + checksum + version)。
+    // 注意：本期仅留接口，运行期看到 true 会被 Validate / Init 拒绝。
+    bool enable_inline_header = 2;
+    // 方案 B 的数据布局版本，0 表示无 inline header (兼容老数据)。
+    uint32 inline_header_version = 3;
+    ChecksumAlgo algo = 4;
+}
+
 // ---- V6D event reporting ----
 
 enum ReportEventType {
@@ -121,6 +140,10 @@ message CacheLocation {
     StorageType type = 1;
     int32 spec_size = 2;
     repeated LocationSpec location_specs = 3;
+    // 数据校验码，由 client 在写入完成后通过 FinishWriteCacheRequest.locations 上报，
+    // 在 GetCacheLocation / GetCacheMeta 返回时供读端比对。0 表示未设置 (老数据 / 老 client)，
+    // 读端遇到 0 必须跳过校验。同一 block 的多副本必须写入相同 hash。
+    int64 block_hash = 4;
 }
 
 message LocationSpecInfo {
@@ -222,6 +245,7 @@ message StorageConfig {
         DummyStorageSpec dummy = 9;
     }
     bool check_storage_available_when_open = 8;
+    DataIntegrityConfig integrity = 11; // 数据校验配置，缺省视为全部关闭
 }
 
 message RegisterInstanceRequest {

@@ -46,6 +46,21 @@ enum StorageType {
     ST_VINEYARD = 7;
 }
 
+// 数据校验算法标识。语义与 meta_service.proto 中同名枚举一致；
+// 三份 proto 各自维护一份定义以保持 package 独立、互不 import。
+enum ChecksumAlgo {
+    CA_UNSPECIFIED = 0;
+    CA_CRC32_XOR_INT64 = 1;
+}
+
+// 数据校验配置。语义与 meta_service.proto 中同名 message 一致。
+message DataIntegrityConfig {
+    bool enable_meta_checksum = 1;
+    bool enable_inline_header = 2;
+    uint32 inline_header_version = 3;
+    ChecksumAlgo algo = 4;
+}
+
 message LocalStorageSpec {}
 
 message DummyStorageSpec {
@@ -121,6 +136,7 @@ message StorageConfig {
         VineyardStorageSpec vineyard = 10;
     }
     bool check_storage_available_when_open = 8;
+    DataIntegrityConfig integrity = 11; // 数据校验配置，缺省视为全部关闭
 }
 
 // 以下接口默认是instanceGroup之间的storage相互隔离
@@ -315,6 +331,9 @@ message CacheLocation {
     StorageType type = 1;
     int32 spec_size = 2;
     repeated LocationSpec location_specs = 3;
+    // 数据校验码。语义与 meta_service.proto 中 CacheLocation.block_hash 一致：
+    // 0 = 未设置 (老数据 / 老 client，读端跳过校验)。
+    int64 block_hash = 4;
 }
 
 message LocationSpecInfo {

@@ -43,6 +43,21 @@ enum StorageType {
     ST_VINEYARD = 7;
 }
 
+// 数据校验算法标识。语义与 meta_service.proto 中同名枚举一致；
+// 三份 proto 各自维护一份定义以保持 package 独立、互不 import。
+enum ChecksumAlgo {
+    CA_UNSPECIFIED = 0;
+    CA_CRC32_XOR_INT64 = 1;
+}
+
+// 数据校验配置。语义与 meta_service.proto 中同名 message 一致。
+message DataIntegrityConfig {
+    bool enable_meta_checksum = 1;
+    bool enable_inline_header = 2;
+    uint32 inline_header_version = 3;
+    ChecksumAlgo algo = 4;
+}
+
 // 使用URI统一多种存储表示，由client或者connector负责解析
 // ThreeFSLocation: 3fs://na61_3fs_cluster_01/data_root/dir1/filename?offset=0&size=1024
 // MoonCakeLocation: mooncake://na61_mc_bucket_01/my_key1
@@ -128,6 +143,7 @@ message StorageConfig {
         DummyStorageSpec dummy = 9;
     }
     bool check_storage_available_when_open = 8;
+    DataIntegrityConfig integrity = 11; // 数据校验配置，缺省视为全部关闭
 }
 
 message RegisterInstanceRequest {
