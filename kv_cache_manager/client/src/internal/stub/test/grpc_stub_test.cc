@@ -28,9 +28,12 @@
 using namespace kv_cache_manager;
 
 namespace {
+// 任务 82620492：integrity 字段是后加的，StorageConfig::ToRapidWriter 始终输出 (即使全默认)。
+// 这里跟着扩展，避免对 RegisterInstance 返回值做字面值断言时挂。
 static const std::string default_storage_configs(
     "[{\"type\":\"file\",\"is_available\":true,\"global_unique_name\":\"nfs_01\",\"storage_spec\":{"
-    "\"root_path\":\"/tmp/nfs/\",\"key_count_per_file\":8}}]");
+    "\"root_path\":\"/tmp/nfs/\",\"key_count_per_file\":8},\"integrity\":{\"enable_meta_checksum\":false,"
+    "\"enable_inline_header\":false,\"inline_header_version\":0,\"algo\":\"crc32_xor_int64\"}}]");
 
 template <typename Func>
 bool WaitUntil(Func condition, int timeout_ms = 5000, int interval_ms = 100) {
