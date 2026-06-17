@@ -29,6 +29,18 @@ cc_test(
 )
 
 cc_test(
+    name = "cache_location_test",
+    srcs = [
+        "cache_location_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/meta:cache_location",
+    ],
+)
+
+cc_test(
     name = "meta_indexer_manager_test",
     srcs = [
         "meta_indexer_manager_test.cc",
