@@ -7,6 +7,7 @@
 #endif
 #include "kv_cache_manager/client/src/internal/config/client_config.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_wrapper.h"
+#include "kv_cache_manager/client/src/internal/util/checksum_verify_util.h"
 #include "kv_cache_manager/client/src/internal/util/debug_string_util.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
@@ -197,6 +198,12 @@ ClientErrorCode TransferClientImpl::LoadKvCaches(const UriStrVec &uri_str_vec,
     }
     // Read-side verification path: only kicks in when caller supplies expected checksums
     // (typically forwarded from CacheLocation.checksum returned by meta service).
+    //
+    // Verification is two-stage by default: a fast XOR aggregate over the whole batch
+    // catches the common case in O(1) comparisons. On mismatch the slow per-block walk
+    // pinpoints the offending blocks for diagnostics. Set KVCM_CHECKSUM_STRICT_MODE=1
+    // to skip the fast aggregate entirely and force per-block comparison (useful for
+    // triaging cases the XOR could in theory hide via paired cancellation, p ~2^-64).
     if (expected_checksums != nullptr && !expected_checksums->empty()) {
         if (expected_checksums->size() != block_buffers.size()) {
             KVCM_LOG_ERROR("expected_checksums size [%zu] mismatches block_buffers size [%zu]",
@@ -214,24 +221,24 @@ ClientErrorCode TransferClientImpl::LoadKvCaches(const UriStrVec &uri_str_vec,
             auto handle = sdk_buffer_check_pool_->GetCell();
             auto actual = SdkBufferCheckUtil::GetBlocksHash(
                 block_buffers, handle->d_iovs, handle->d_crcs, handle->h_iovs, max_check_iov_num_, handle->gpu_stream);
-            if (actual.size() != expected_checksums->size()) {
-                KVCM_LOG_ERROR(
-                    "actual checksums size [%zu] != expected [%zu]", actual.size(), expected_checksums->size());
+            const bool strict_mode = EnvUtil::GetEnv("KVCM_CHECKSUM_STRICT_MODE", false);
+            const auto verify_result = VerifyBatchChecksums(*expected_checksums, actual, strict_mode);
+            if (verify_result.mismatch) {
+                if (verify_result.faulty_indices.empty()) {
+                    // Size mismatch surfaced from the helper (we already pre-checked
+                    // expected vs block_buffers above, so this is paranoid coverage).
+                    KVCM_LOG_ERROR(
+                        "actual checksums size [%zu] != expected [%zu]", actual.size(), expected_checksums->size());
+                } else {
+                    for (auto idx : verify_result.faulty_indices) {
+                        KVCM_LOG_ERROR("checksum mismatch at block %zu: expected=0x%lx, actual=0x%lx, uri=%s",
+                                       idx,
+                                       static_cast<unsigned long>((*expected_checksums)[idx]),
+                                       static_cast<unsigned long>(actual[idx]),
+                                       idx < uri_str_vec.size() ? uri_str_vec[idx].c_str() : "<oob>");
+                    }
+                }
                 return ER_CHECKSUM_MISMATCH;
-            }
-            for (size_t i = 0; i < actual.size(); ++i) {
-                const int64_t expected = (*expected_checksums)[i];
-                if (expected == 0) {
-                    continue; // sentinel: legacy data / legacy client did not report
-                }
-                if (expected != actual[i]) {
-                    KVCM_LOG_ERROR("checksum mismatch at block %zu: expected=0x%lx, actual=0x%lx, uri=%s",
-                                   i,
-                                   static_cast<unsigned long>(expected),
-                                   static_cast<unsigned long>(actual[i]),
-                                   i < uri_str_vec.size() ? uri_str_vec[i].c_str() : "<oob>");
-                    return ER_CHECKSUM_MISMATCH;
-                }
             }
         }
     }
