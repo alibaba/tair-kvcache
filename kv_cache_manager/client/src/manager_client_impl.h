@@ -27,7 +27,7 @@ public:
                                 const std::string &write_session_id,
                                 const BlockMask &success_block,
                                 const Locations &locations,
-                                const std::vector<int64_t> &block_hashes = {}) override;
+                                const std::vector<int64_t> &checksums = {}) override;
 
     std::pair<ClientErrorCode, Metas> MatchMeta(const std::string &trace_id,
                                                 const std::vector<int64_t> &keys,
@@ -42,11 +42,11 @@ public:
 
     ClientErrorCode LoadKvCaches(const UriStrVec &uri_str_vec,
                                  const BlockBuffers &block_buffers,
-                                 const std::vector<int64_t> *expected_hashes = nullptr) override;
+                                 const std::vector<int64_t> *expected_checksums = nullptr) override;
 
     std::pair<ClientErrorCode, UriStrVec> SaveKvCaches(const UriStrVec &uri_str_vec,
                                                        const BlockBuffers &block_buffers,
-                                                       std::vector<int64_t> *out_block_hashes = nullptr) override;
+                                                       std::vector<int64_t> *out_checksums = nullptr) override;
 
 protected:
     ClientErrorCode Init(const std::string &client_config, InitParams &init_params) override;

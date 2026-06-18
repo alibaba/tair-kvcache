@@ -724,7 +724,7 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
                                const std::string &write_session_id,
                                const BlockMask &success_block_mask,
                                std::unique_ptr<WriteLocationManager::WriteLocationInfo> write_location_info_internal,
-                               const std::vector<int64_t> &block_hashes) {
+                               const std::vector<int64_t> &checksums) {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
@@ -743,15 +743,15 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
                                      success_block_mask.index(),
                                      location_info.keys.size());
     }
-    // block_hashes 与 location_info.keys 一一对应；client 不上报时为空，
-    // 此时所有 LocationUpdateTask.block_hash 保留默认 0，meta_searcher 不会覆盖
-    // CacheLocation 已有 hash。长度不一致视为客户端 bug，直接 EC_BADARGS。
-    const bool has_hashes = !block_hashes.empty();
-    if (has_hashes && block_hashes.size() != location_info.keys.size()) {
+    // checksums must be the same length as keys (full batch, not the success subset).
+    // An empty vector means the client did not report any; existing CacheLocation
+    // checksums are then preserved. Any length mismatch is treated as a client bug.
+    const bool has_checksums = !checksums.empty();
+    if (has_checksums && checksums.size() != location_info.keys.size()) {
         RETURN_IF_EC_NOT_OK_WITH_LOG(WARN,
                                      EC_BADARGS,
-                                     "block_hashes size (%zu) does not match keys size (%zu)",
-                                     block_hashes.size(),
+                                     "checksums size (%zu) does not match keys size (%zu)",
+                                     checksums.size(),
                                      location_info.keys.size());
     }
 
@@ -771,7 +771,7 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
             MetaSearcher::LocationUpdateTask task{
                 .location_id = location_info.location_ids[block_key_idx],
                 .new_status = CacheLocationStatus::CLS_SERVING,
-                .block_hash = has_hashes ? block_hashes[block_key_idx] : int64_t{0},
+                .checksum = has_checksums ? checksums[block_key_idx] : int64_t{0},
             };
             success_batch_update_tasks.push_back({std::move(task)});
         } else {

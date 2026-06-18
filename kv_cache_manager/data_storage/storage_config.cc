@@ -234,13 +234,14 @@ void DataIntegrityConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffe
 bool DataIntegrityConfig::ValidateRequiredFields(std::string &invalid_fields) const {
     bool valid = true;
     std::string local_invalid_fields;
-    // 方案 B inline header 在本期未实现，运行期一律拒绝；仅 proto / 配置层留位以便后续 P1
-    // 直接接入而不动 wire format。
+    // Scheme B inline header is reserved but not implemented; reject at runtime so the
+    // proto/config slot is kept for a future P1 without touching wire format.
     if (enable_inline_header_) {
         valid = false;
         local_invalid_fields += "{enable_inline_header is reserved, not implemented yet}";
     }
-    // inline_header_version != 0 隐含开启了 inline header 但开关没开，是配置矛盾。
+    // inline_header_version != 0 implies inline header is on, but the flag is off:
+    // contradictory config.
     if (inline_header_version_ != 0 && !enable_inline_header_) {
         valid = false;
         local_invalid_fields += "{inline_header_version requires enable_inline_header=true}";

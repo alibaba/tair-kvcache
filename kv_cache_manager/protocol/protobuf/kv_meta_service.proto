@@ -15,8 +15,8 @@ enum ErrorCode {
     INSTANCE_NOT_EXIST = 8;
 
     IO_ERROR = 20;
-    CHECKSUM_MISMATCH = 21;      // 读出的数据 hash 与 meta 中保存的 hash 不一致
-    INLINE_HEADER_INVALID = 22;  // KVCache 数据块内嵌 header 校验失败 (方案 B，本期未启用)
+    CHECKSUM_MISMATCH = 21;      // checksum on the read buffer differs from what meta has
+    INLINE_HEADER_INVALID = 22;  // inline header check failed (Scheme B, reserved, disabled)
     UNKNOWN_ERROR = 100;
     ERROR_MAX = 65535;
 }
@@ -45,14 +45,14 @@ enum StorageType {
     ST_VINEYARD = 7;
 }
 
-// 数据校验算法标识。语义与 meta_service.proto 中同名枚举一致；
-// 三份 proto 各自维护一份定义以保持 package 独立、互不 import。
+// Checksum algorithm. Same semantics as meta_service.proto. Re-declared per package
+// to keep proto files independent (no cross-package imports).
 enum ChecksumAlgo {
     CA_UNSPECIFIED = 0;
     CA_CRC32_XOR_INT64 = 1;
 }
 
-// 数据校验配置。语义与 meta_service.proto 中同名 message 一致。
+// Data integrity config. Same semantics as meta_service.proto.
 message DataIntegrityConfig {
     bool enable_meta_checksum = 1;
     bool enable_inline_header = 2;
@@ -145,7 +145,7 @@ message StorageConfig {
         DummyStorageSpec dummy = 9;
     }
     bool check_storage_available_when_open = 8;
-    DataIntegrityConfig integrity = 11; // 数据校验配置，缺省视为全部关闭
+    DataIntegrityConfig integrity = 11; // data integrity config; absent = all disabled
 }
 
 message RegisterInstanceRequest {

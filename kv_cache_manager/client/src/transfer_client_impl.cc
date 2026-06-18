@@ -35,7 +35,7 @@ ClientErrorCode TransferClientImpl::ValidateStorageConfigsForIntegrity(const std
     }
     std::vector<std::shared_ptr<StorageConfig>> parsed;
     if (!Jsonizable::FromJsonString(storage_configs_json, parsed)) {
-        // 让下游 sdk_wrapper 报具体的 ER_INVALID_STORAGE_CONFIG，本函数保持沉默。
+        // Stay silent and let sdk_wrapper report ER_INVALID_STORAGE_CONFIG downstream.
         return ER_OK;
     }
     for (const auto &cfg : parsed) {
@@ -114,8 +114,8 @@ ClientErrorCode TransferClientImpl::Init(const std::string &client_config, const
             sdk_wrapper_.reset();
             return ec;
         }
-        // 任务 82620492：解析 storage_configs，拒绝 inline_header (方案 B 预留) +
-        // 自动启用 hash pool (方案 A 开关 enable_meta_checksum)。
+        // Parse storage_configs to reject Scheme B (inline_header) early and to
+        // auto-initialize the checksum pool when any spec opts into meta_checksum.
         bool any_meta_checksum_enabled = false;
         ec = ValidateStorageConfigsForIntegrity(init_params_.storage_configs, any_meta_checksum_enabled);
         if (ec != ER_OK) {
@@ -140,7 +140,7 @@ ClientErrorCode TransferClientImpl::Init(const std::string &client_config, const
 #else
         if (any_meta_checksum_enabled) {
             KVCM_LOG_WARN("storage spec enables meta_checksum but build is not CUDA/MUSA; "
-                          "Save/Load hash compute will be skipped, verification will degrade to no-op");
+                          "Save/Load checksum compute will be skipped, verification will degrade to no-op");
         }
 #endif
         KVCM_LOG_INFO("transfer client init success");
@@ -148,22 +148,22 @@ ClientErrorCode TransferClientImpl::Init(const std::string &client_config, const
     }
 }
 
-void TransferClientImpl::PrintBlockHashAndUri(const std::string &prefix,
-                                              const UriStrVec &uri_str_vec,
-                                              const std::vector<int64_t> &block_hashs,
-                                              const std::shared_ptr<TransferTraceInfo> &trace_info) const {
+void TransferClientImpl::PrintBlockChecksumAndUri(const std::string &prefix,
+                                                  const UriStrVec &uri_str_vec,
+                                                  const std::vector<int64_t> &block_checksums,
+                                                  const std::shared_ptr<TransferTraceInfo> &trace_info) const {
     std::stringstream ss;
     ss << prefix << "; self_location_spec_name : " << init_params_.self_location_spec_name
-       << "; uri size : " << uri_str_vec.size() << "; real size : " << block_hashs.size();
+       << "; uri size : " << uri_str_vec.size() << "; real size : " << block_checksums.size();
     ss << "{";
-    bool invalid = (trace_info != nullptr) && (trace_info->block_ids.size() >= block_hashs.size());
-    for (size_t i = 0; i < block_hashs.size(); ++i) {
+    bool invalid = (trace_info != nullptr) && (trace_info->block_ids.size() >= block_checksums.size());
+    for (size_t i = 0; i < block_checksums.size(); ++i) {
         ss << "\"" << prefix;
         if (invalid) {
             ss << "_" << trace_info->block_ids[i] << "_";
         }
-        ss << uri_str_vec[i] << "\":" << block_hashs[i];
-        if (i != (block_hashs.size() - 1)) {
+        ss << uri_str_vec[i] << "\":" << block_checksums[i];
+        if (i != (block_checksums.size() - 1)) {
             ss << ',';
         }
     }
@@ -174,7 +174,7 @@ void TransferClientImpl::PrintBlockHashAndUri(const std::string &prefix,
 ClientErrorCode TransferClientImpl::LoadKvCaches(const UriStrVec &uri_str_vec,
                                                  const BlockBuffers &block_buffers,
                                                  std::shared_ptr<TransferTraceInfo> trace_info,
-                                                 const std::vector<int64_t> *expected_hashes) {
+                                                 const std::vector<int64_t> *expected_checksums) {
     KVCM_LOG_DEBUG("load kv caches with uri_str_vec %s, block_buffers %s",
                    DebugStringUtil::ToString(uri_str_vec).c_str(),
                    DebugStringUtil::ToString(block_buffers).c_str());
@@ -187,38 +187,42 @@ ClientErrorCode TransferClientImpl::LoadKvCaches(const UriStrVec &uri_str_vec,
 #if defined(USING_CUDA) || defined(USING_MUSA)
     if (is_check_buffer_) {
         bool need_print = (trace_info == nullptr) ? true : trace_info->need_print;
-        std::vector<int64_t> block_hashs;
+        std::vector<int64_t> block_checksums;
         if (need_print) {
             auto handle = sdk_buffer_check_pool_->GetCell();
-            block_hashs = SdkBufferCheckUtil::GetBlocksHash(
+            block_checksums = SdkBufferCheckUtil::GetBlocksHash(
                 block_buffers, handle->d_iovs, handle->d_crcs, handle->h_iovs, max_check_iov_num_, handle->gpu_stream);
         }
-        PrintBlockHashAndUri("get_", uri_str_vec, block_hashs, trace_info);
+        PrintBlockChecksumAndUri("get_", uri_str_vec, block_checksums, trace_info);
     }
-    // 任务 82620492：读端校验路径。expected_hashes 非空 + 至少一项 != 0 时算 actual。
-    if (expected_hashes != nullptr && !expected_hashes->empty()) {
-        if (expected_hashes->size() != block_buffers.size()) {
-            KVCM_LOG_ERROR("expected_hashes size [%zu] mismatches block_buffers size [%zu]",
-                           expected_hashes->size(),
+    // Read-side verification path: only kicks in when caller supplies expected checksums
+    // (typically forwarded from CacheLocation.checksum returned by meta service).
+    if (expected_checksums != nullptr && !expected_checksums->empty()) {
+        if (expected_checksums->size() != block_buffers.size()) {
+            KVCM_LOG_ERROR("expected_checksums size [%zu] mismatches block_buffers size [%zu]",
+                           expected_checksums->size(),
                            block_buffers.size());
             return ER_CHECKSUM_MISMATCH;
         }
         if (!sdk_buffer_check_pool_) {
-            // 未启用 pool (spec 没开 enable_meta_checksum，但 caller 又传了 expected)。
-            // 这是配置不一致；按 fail-open 处理 + 警告，避免推理路径强阻塞。
-            KVCM_LOG_WARN("expected_hashes given but sdk_buffer_check_pool is not enabled; skip verification");
+            // Caller asked for verification but the pool was not initialized
+            // (spec did not enable meta_checksum). Fail open with a warning to avoid
+            // blocking the inference path on a config mismatch.
+            KVCM_LOG_WARN("expected_checksums given but sdk_buffer_check_pool is not enabled; "
+                          "skip verification");
         } else {
             auto handle = sdk_buffer_check_pool_->GetCell();
             auto actual = SdkBufferCheckUtil::GetBlocksHash(
                 block_buffers, handle->d_iovs, handle->d_crcs, handle->h_iovs, max_check_iov_num_, handle->gpu_stream);
-            if (actual.size() != expected_hashes->size()) {
-                KVCM_LOG_ERROR("actual hashes size [%zu] != expected [%zu]", actual.size(), expected_hashes->size());
+            if (actual.size() != expected_checksums->size()) {
+                KVCM_LOG_ERROR(
+                    "actual checksums size [%zu] != expected [%zu]", actual.size(), expected_checksums->size());
                 return ER_CHECKSUM_MISMATCH;
             }
             for (size_t i = 0; i < actual.size(); ++i) {
-                const int64_t expected = (*expected_hashes)[i];
+                const int64_t expected = (*expected_checksums)[i];
                 if (expected == 0) {
-                    continue; // sentinel: 老数据 / 老 client 未上报 hash
+                    continue; // sentinel: legacy data / legacy client did not report
                 }
                 if (expected != actual[i]) {
                     KVCM_LOG_ERROR("checksum mismatch at block %zu: expected=0x%lx, actual=0x%lx, uri=%s",
@@ -232,8 +236,8 @@ ClientErrorCode TransferClientImpl::LoadKvCaches(const UriStrVec &uri_str_vec,
         }
     }
 #else
-    if (expected_hashes != nullptr && !expected_hashes->empty()) {
-        KVCM_LOG_WARN("expected_hashes given but build is not CUDA/MUSA; verification skipped (no-op)");
+    if (expected_checksums != nullptr && !expected_checksums->empty()) {
+        KVCM_LOG_WARN("expected_checksums given but build is not CUDA/MUSA; verification skipped (no-op)");
     }
 #endif
     return ec;
@@ -242,47 +246,48 @@ ClientErrorCode TransferClientImpl::LoadKvCaches(const UriStrVec &uri_str_vec,
 std::pair<ClientErrorCode, UriStrVec> TransferClientImpl::SaveKvCaches(const UriStrVec &uri_str_vec,
                                                                        const BlockBuffers &block_buffers,
                                                                        std::shared_ptr<TransferTraceInfo> trace_info,
-                                                                       std::vector<int64_t> *out_block_hashes) {
+                                                                       std::vector<int64_t> *out_checksums) {
     KVCM_LOG_DEBUG("save kv caches with uri_str_vec %s, block_buffers %s",
                    DebugStringUtil::ToString(uri_str_vec).c_str(),
                    DebugStringUtil::ToString(block_buffers).c_str());
     CHECK_SDK_WITH_TYPE();
 #if defined(USING_CUDA) || defined(USING_MUSA)
-    // 任务 82620492：写端算 hash 路径。out_block_hashes 非空时算并写入。
-    // 复用 is_check_buffer_ 已有的 print-only 路径输出，不重复算 hash。
-    std::vector<int64_t> block_hashs;
-    bool block_hashs_computed = false;
-    if (out_block_hashes != nullptr || is_check_buffer_) {
+    // Write-side checksum compute: triggered by either an explicit out_checksums
+    // request or the legacy KVCM_SDK_CHECK print-only fallback. The two paths share
+    // the same computation so the checksum is computed at most once per call.
+    std::vector<int64_t> block_checksums;
+    bool block_checksums_computed = false;
+    if (out_checksums != nullptr || is_check_buffer_) {
         if (!sdk_buffer_check_pool_) {
-            if (out_block_hashes != nullptr) {
-                KVCM_LOG_WARN("out_block_hashes requested but sdk_buffer_check_pool is not enabled; "
-                              "return empty vector (caller should treat as 'hash not available')");
-                out_block_hashes->clear();
+            if (out_checksums != nullptr) {
+                KVCM_LOG_WARN("out_checksums requested but sdk_buffer_check_pool is not enabled; "
+                              "return empty vector (caller should treat as 'checksum not available')");
+                out_checksums->clear();
             }
         } else {
             bool need_print = (trace_info == nullptr) ? true : trace_info->need_print;
-            if (out_block_hashes != nullptr || need_print) {
+            if (out_checksums != nullptr || need_print) {
                 auto handle = sdk_buffer_check_pool_->GetCell();
-                block_hashs = SdkBufferCheckUtil::GetBlocksHash(block_buffers,
-                                                                handle->d_iovs,
-                                                                handle->d_crcs,
-                                                                handle->h_iovs,
-                                                                max_check_iov_num_,
-                                                                handle->gpu_stream);
-                block_hashs_computed = true;
+                block_checksums = SdkBufferCheckUtil::GetBlocksHash(block_buffers,
+                                                                    handle->d_iovs,
+                                                                    handle->d_crcs,
+                                                                    handle->h_iovs,
+                                                                    max_check_iov_num_,
+                                                                    handle->gpu_stream);
+                block_checksums_computed = true;
             }
         }
         if (is_check_buffer_) {
-            PrintBlockHashAndUri("put_", uri_str_vec, block_hashs, trace_info);
+            PrintBlockChecksumAndUri("put_", uri_str_vec, block_checksums, trace_info);
         }
-        if (out_block_hashes != nullptr && block_hashs_computed) {
-            *out_block_hashes = block_hashs;
+        if (out_checksums != nullptr && block_checksums_computed) {
+            *out_checksums = block_checksums;
         }
     }
 #else
-    if (out_block_hashes != nullptr) {
-        KVCM_LOG_WARN("out_block_hashes requested but build is not CUDA/MUSA; return empty vector");
-        out_block_hashes->clear();
+    if (out_checksums != nullptr) {
+        KVCM_LOG_WARN("out_checksums requested but build is not CUDA/MUSA; return empty vector");
+        out_checksums->clear();
     }
 #endif
     auto remote_uris = ParseLocations(uri_str_vec);

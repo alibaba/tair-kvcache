@@ -124,9 +124,11 @@ PYBIND11_MODULE(kvcm_py_client, module) {
     // 绑定TransferClient类
     py::class_<kvcm::TransferClient, py::smart_holder>(module, "TransferClient")
         .def_static("Create", &kvcm::TransferClient::Create, py::call_guard<py::gil_scoped_release>())
-        // 任务 82620492：C++ 接口加了 expected_hashes / out_block_hashes 指针参数 (用于
-        // 方案 A 校验通路)。Python 端暂时不暴露 hash，用 lambda 截断到 3 参数 (走 default
-        // nullptr)；后续 py_connector 接入 checksum 时再扩展 Python 签名。
+        // C++ interface gained pointer parameters expected_checksums / out_checksums for
+        // Scheme A verification. The Python binding intentionally keeps the legacy
+        // 3-argument signature via a lambda (default nullptr), letting connectors
+        // (vLLM / SGLang / TRT-LLM) keep building unchanged. Extend here once
+        // py_connector adopts checksum reporting.
         .def(
             "LoadKvCaches",
             [](kvcm::TransferClient *self,

@@ -305,27 +305,27 @@ TEST_F(TransferClientTest, TestCreateAcceptsMetaChecksumSpec) {
     delete init_params.regist_span;
 }
 
-// expected_hashes 全 0 -> sentinel 跳过校验，行为 == 老路径，不会因 hash 不匹配返回错误。
+// expected_checksums 全 0 -> sentinel 跳过校验，行为 == 老路径，不会因 checksum 不匹配返回错误。
 TEST_F(TransferClientTest, TestLoadKvCachesExpectedHashesAllZeroSkipsCheck) {
     auto client = TransferClient::Create(client_config_, init_params_);
     ASSERT_NE(client, nullptr);
     BlockBuffer buffer1, buffer2;
     BlockBuffers block_buffers = {buffer1, buffer2};
-    std::vector<int64_t> expected_hashes = {0, 0};
-    EXPECT_EQ(ER_OK, client->LoadKvCaches(locations_, block_buffers, nullptr, &expected_hashes));
+    std::vector<int64_t> expected_checksums = {0, 0};
+    EXPECT_EQ(ER_OK, client->LoadKvCaches(locations_, block_buffers, nullptr, &expected_checksums));
 }
 
-// expected_hashes 长度与 block_buffers 不一致 -> ER_CHECKSUM_MISMATCH。
+// expected_checksums 长度与 block_buffers 不一致 -> ER_CHECKSUM_MISMATCH。
 TEST_F(TransferClientTest, TestLoadKvCachesExpectedHashesSizeMismatchFails) {
     auto client = TransferClient::Create(client_config_, init_params_);
     ASSERT_NE(client, nullptr);
     BlockBuffer buffer1, buffer2;
     BlockBuffers block_buffers = {buffer1, buffer2};
-    std::vector<int64_t> expected_hashes = {0}; // 长度 1，但 buffers 长度 2
+    std::vector<int64_t> expected_checksums = {0}; // 长度 1，但 buffers 长度 2
 #if defined(USING_CUDA) || defined(USING_MUSA)
-    EXPECT_EQ(ER_CHECKSUM_MISMATCH, client->LoadKvCaches(locations_, block_buffers, nullptr, &expected_hashes));
+    EXPECT_EQ(ER_CHECKSUM_MISMATCH, client->LoadKvCaches(locations_, block_buffers, nullptr, &expected_checksums));
 #else
     // 非 CUDA/MUSA build：校验路径整体退化为 no-op，长度不匹配也不报错。
-    EXPECT_EQ(ER_OK, client->LoadKvCaches(locations_, block_buffers, nullptr, &expected_hashes));
+    EXPECT_EQ(ER_OK, client->LoadKvCaches(locations_, block_buffers, nullptr, &expected_checksums));
 #endif
 }

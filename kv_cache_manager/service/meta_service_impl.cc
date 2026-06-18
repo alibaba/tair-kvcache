@@ -566,19 +566,18 @@ void MetaServiceImpl::FinishWriteCache(RequestContext *request_context,
         SET_SPAN_TRACER_STR_IN_HEADER(request_context);
         return;
     }
-    // 调用Manager层完成写入缓存
     BlockMask success_blocks_req;
     ProtoConvert::BlockMaskFromProto(&request->success_blocks(), success_blocks_req);
-    // 任务 82620492：从 request->locations() 解析 block_hash 列表透传给 manager。
-    // 约定 client 发 locations.size() == keys.size() (与 StartWriteCache 时的 block_keys 一一对应)，
-    // 失败的 block 也带占位 CacheLocation 但 block_hash=0。
-    // 老 client 不传 locations 时为空，manager 收到空 vector 不会改 CacheLocation 已有 hash。
-    // locations.size() 与 keys.size() 不匹配时由 CacheManager::FinishWriteCache 统一校验返回 EC_BADARGS。
-    std::vector<int64_t> block_hashes;
+    // Forward the per-block checksums reported via FinishWriteCacheRequest.locations
+    // (parallel to the keys from StartWriteCache; failed blocks carry a placeholder
+    // CacheLocation with checksum=0). Legacy clients omit locations entirely, in which
+    // case the vector stays empty and CacheManager keeps existing checksums.
+    // Length mismatch with keys is checked centrally in CacheManager::FinishWriteCache.
+    std::vector<int64_t> checksums;
     if (request->locations_size() > 0) {
-        block_hashes.reserve(request->locations_size());
+        checksums.reserve(request->locations_size());
         for (const auto &loc : request->locations()) {
-            block_hashes.push_back(loc.block_hash());
+            checksums.push_back(loc.checksum());
         }
     }
     ErrorCode ec_info = cache_manager_->FinishWriteCache(request_context,
@@ -586,7 +585,7 @@ void MetaServiceImpl::FinishWriteCache(RequestContext *request_context,
                                                          request->write_session_id(),
                                                          success_blocks_req,
                                                          /*write_location_info_internal=*/nullptr,
-                                                         block_hashes);
+                                                         checksums);
 
     if (ec_info != EC_OK) {
         status->set_code(ToMetaPbError(ec_info));

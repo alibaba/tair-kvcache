@@ -829,10 +829,10 @@ ErrorCode MetaSearcher::BatchUpdateLocationStatus(RequestContext *request_contex
             // COW: copy the location, modify the copy, replace the pointer
             auto new_loc = std::make_shared<CacheLocation>(*locs[loc_index]);
             new_loc->set_status(batch_tasks[key_index][loc_index].new_status);
-            // 任务 82620492：FinishWriteCache 路径会带 block_hash != 0；
-            // 其他路径 (默认 0) 保留 CacheLocation 已有 hash，避免重置。
-            if (batch_tasks[key_index][loc_index].block_hash != 0) {
-                new_loc->set_block_hash(batch_tasks[key_index][loc_index].block_hash);
+            // Only overwrite the persisted checksum when the caller supplied one
+            // (non-zero); 0 means "keep whatever is already there".
+            if (batch_tasks[key_index][loc_index].checksum != 0) {
+                new_loc->set_checksum(batch_tasks[key_index][loc_index].checksum);
             }
             locs[loc_index] = std::move(new_loc);
         }

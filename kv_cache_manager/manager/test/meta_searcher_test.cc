@@ -456,8 +456,8 @@ TEST_F(MetaSearcherTest, TestBatchUpdateLocationStatus) {
     EXPECT_EQ(ec, ErrorCode::EC_BADARGS);
 }
 
-// 任务 82620492：LocationUpdateTask.block_hash != 0 时应当落到 CacheLocation.block_hash。
-TEST_F(MetaSearcherTest, TestBatchUpdateLocationStatusPersistsBlockHash) {
+// LocationUpdateTask.checksum != 0 时应当落到 CacheLocation.checksum。
+TEST_F(MetaSearcherTest, TestBatchUpdateLocationStatusPersistsChecksum) {
     MetaSearcher::KeyVector keys = {7001, 7002};
     auto location_specs = MetaSearcherTestHelper::CreateDefaultLocationSpecs();
     CacheLocationVector locations = {
@@ -468,11 +468,11 @@ TEST_F(MetaSearcherTest, TestBatchUpdateLocationStatusPersistsBlockHash) {
     ASSERT_EQ(EC_OK, meta_searcher_->BatchAddLocation(request_context_.get(), keys, locations, out_location_ids));
     ASSERT_EQ(out_location_ids.size(), keys.size());
 
-    constexpr int64_t kHashA = 0x1234567890ABCDEFLL;
-    constexpr int64_t kHashB = -42;
+    constexpr int64_t kChecksumA = 0x1234567890ABCDEFLL;
+    constexpr int64_t kChecksumB = -42;
     std::vector<std::vector<MetaSearcher::LocationUpdateTask>> batch_tasks{
-        {MetaSearcher::LocationUpdateTask{out_location_ids[0], CLS_SERVING, kHashA}},
-        {MetaSearcher::LocationUpdateTask{out_location_ids[1], CLS_SERVING, kHashB}},
+        {MetaSearcher::LocationUpdateTask{out_location_ids[0], CLS_SERVING, kChecksumA}},
+        {MetaSearcher::LocationUpdateTask{out_location_ids[1], CLS_SERVING, kChecksumB}},
     };
     std::vector<std::vector<ErrorCode>> out_batch_results;
     ASSERT_EQ(EC_OK,
@@ -482,12 +482,12 @@ TEST_F(MetaSearcherTest, TestBatchUpdateLocationStatusPersistsBlockHash) {
     BlockMask mask;
     ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, out_location_maps));
     ASSERT_EQ(out_location_maps.size(), 2u);
-    EXPECT_EQ(out_location_maps[0].at(out_location_ids[0])->block_hash(), kHashA);
-    EXPECT_EQ(out_location_maps[1].at(out_location_ids[1])->block_hash(), kHashB);
+    EXPECT_EQ(out_location_maps[0].at(out_location_ids[0])->checksum(), kChecksumA);
+    EXPECT_EQ(out_location_maps[1].at(out_location_ids[1])->checksum(), kChecksumB);
 }
 
-// block_hash == 0 (sentinel) 表示"不更新"，应保留 CacheLocation 上已有 hash。
-TEST_F(MetaSearcherTest, TestBatchUpdateLocationStatusZeroHashPreservesExisting) {
+// checksum == 0 (sentinel) 表示"不更新"，应保留 CacheLocation 上已有 checksum。
+TEST_F(MetaSearcherTest, TestBatchUpdateLocationStatusZeroChecksumPreservesExisting) {
     MetaSearcher::KeyVector keys = {7100};
     auto location_specs = MetaSearcherTestHelper::CreateDefaultLocationSpecs();
     CacheLocationVector locations = {
@@ -496,7 +496,7 @@ TEST_F(MetaSearcherTest, TestBatchUpdateLocationStatusZeroHashPreservesExisting)
     std::vector<std::string> out_location_ids;
     ASSERT_EQ(EC_OK, meta_searcher_->BatchAddLocation(request_context_.get(), keys, locations, out_location_ids));
 
-    // 先写入一个 hash
+    // 先写入一个 checksum
     constexpr int64_t kInitial = 0xDEADBEEFLL;
     std::vector<std::vector<MetaSearcher::LocationUpdateTask>> first_tasks{
         {MetaSearcher::LocationUpdateTask{out_location_ids[0], CLS_SERVING, kInitial}},
@@ -505,7 +505,7 @@ TEST_F(MetaSearcherTest, TestBatchUpdateLocationStatusZeroHashPreservesExisting)
     ASSERT_EQ(EC_OK,
               meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), keys, first_tasks, first_results));
 
-    // 再用 block_hash=0 调用，hash 应保留
+    // 再用 checksum=0 调用，原 checksum 应保留
     std::vector<std::vector<MetaSearcher::LocationUpdateTask>> second_tasks{
         {MetaSearcher::LocationUpdateTask{out_location_ids[0], CLS_SERVING, 0}},
     };
@@ -516,7 +516,7 @@ TEST_F(MetaSearcherTest, TestBatchUpdateLocationStatusZeroHashPreservesExisting)
     std::vector<CacheLocationMap> out_location_maps;
     BlockMask mask;
     ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, mask, out_location_maps));
-    EXPECT_EQ(out_location_maps[0].at(out_location_ids[0])->block_hash(), kInitial);
+    EXPECT_EQ(out_location_maps[0].at(out_location_ids[0])->checksum(), kInitial);
 }
 
 TEST_F(MetaSearcherTest, TestBlockKeyWithMultipleLocations) {

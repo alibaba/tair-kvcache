@@ -32,14 +32,15 @@ public:
                const std::vector<int64_t> &tokens,
                const std::vector<std::string> &location_spec_group_names,
                int64_t write_timeout_seconds) = 0;
-    // 任务 82620492：block_hashes 与 StartWrite 时上报的 keys 一一对应 (长度等于
-    // keys.size，而不是 success_block 中"成功"的子集；失败位置填 0)。空 vector
-    // 视为 client 未启用 meta_checksum，server 不会修改 CacheLocation 已有 hash。
+    // checksums parallels the keys captured at StartWrite (length == keys.size, full
+    // batch including failed positions which carry 0). Pass an empty vector when the
+    // client did not enable meta_checksum; server then keeps existing CacheLocation
+    // checksums untouched.
     virtual ClientErrorCode FinishWrite(const std::string &trace_id,
                                         const std::string &write_session_id,
                                         const BlockMask &success_block,
                                         const Locations &locations,
-                                        const std::vector<int64_t> &block_hashes = {}) = 0;
+                                        const std::vector<int64_t> &checksums = {}) = 0;
 
     virtual std::pair<ClientErrorCode, Metas> MatchMeta(const std::string &trace_id,
                                                         const std::vector<int64_t> &keys,
@@ -53,14 +54,15 @@ public:
                                         const BlockMask &block_mask) = 0;
 
     // for transfer client
-    // 任务 82620492：out_block_hashes 透传给 TransferClient::SaveKvCaches。
-    // 非 nullptr 时 SDK 算 hash 写入；上层之后调 FinishWrite 时把同一个 vector 传回去。
+    // out_checksums is forwarded to TransferClient::SaveKvCaches; when non-null the SDK
+    // writes the computed checksums into it and the caller passes the same vector to
+    // FinishWrite later.
     virtual ClientErrorCode LoadKvCaches(const UriStrVec &uri_str_vec,
                                          const BlockBuffers &block_buffers,
-                                         const std::vector<int64_t> *expected_hashes = nullptr) = 0;
+                                         const std::vector<int64_t> *expected_checksums = nullptr) = 0;
     virtual std::pair<ClientErrorCode, UriStrVec> SaveKvCaches(const UriStrVec &uri_str_vec,
                                                                const BlockBuffers &block_buffers,
-                                                               std::vector<int64_t> *out_block_hashes = nullptr) = 0;
+                                                               std::vector<int64_t> *out_checksums = nullptr) = 0;
 
 protected:
     ManagerClient() = default;

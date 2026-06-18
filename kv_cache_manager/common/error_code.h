@@ -26,8 +26,8 @@ enum [[nodiscard]] ErrorCode : int32_t{
     EC_NOSCRIPT = 17,
     EC_SERVICE_NOT_LEADER = 18,
     EC_NODE_NOT_REGISTERED = 19,
-    EC_CHECKSUM_MISMATCH = 20,     // 读出的 block 数据 hash 与 meta 中保存的 hash 不一致
-    EC_INLINE_HEADER_INVALID = 21, // KVCache 数据块内嵌 header 校验失败 (方案 B，本期未启用)
+    EC_CHECKSUM_MISMATCH = 20,     // checksum on the read buffer differs from what meta has
+    EC_INLINE_HEADER_INVALID = 21, // inline header check failed (Scheme B, reserved, disabled)
     EC_UNKNOWN = 127,
     EC_KVCM_MAX,
 };

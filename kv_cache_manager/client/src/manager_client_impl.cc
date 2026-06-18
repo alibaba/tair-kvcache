@@ -79,9 +79,9 @@ ClientErrorCode ManagerClientImpl::FinishWrite(const std::string &trace_id,
                                                const std::string &write_session_id,
                                                const BlockMask &success_block,
                                                const Locations &locations,
-                                               const std::vector<int64_t> &block_hashes) {
+                                               const std::vector<int64_t> &checksums) {
     CHECK_CLIENT(meta_client_);
-    return meta_client_->FinishWrite(trace_id, write_session_id, success_block, locations, block_hashes);
+    return meta_client_->FinishWrite(trace_id, write_session_id, success_block, locations, checksums);
 }
 
 std::pair<ClientErrorCode, Metas> ManagerClientImpl::MatchMeta(const std::string &trace_id,
@@ -103,16 +103,16 @@ ClientErrorCode ManagerClientImpl::RemoveCache(const std::string &trace_id,
 
 ClientErrorCode ManagerClientImpl::LoadKvCaches(const UriStrVec &uri_str_vec,
                                                 const BlockBuffers &block_buffers,
-                                                const std::vector<int64_t> *expected_hashes) {
+                                                const std::vector<int64_t> *expected_checksums) {
     CHECK_CLIENT(transfer_client_);
-    return transfer_client_->LoadKvCaches(uri_str_vec, block_buffers, /*trace_info=*/nullptr, expected_hashes);
+    return transfer_client_->LoadKvCaches(uri_str_vec, block_buffers, /*trace_info=*/nullptr, expected_checksums);
 }
 
 std::pair<ClientErrorCode, UriStrVec> ManagerClientImpl::SaveKvCaches(const UriStrVec &uri_str_vec,
                                                                       const BlockBuffers &block_buffers,
-                                                                      std::vector<int64_t> *out_block_hashes) {
+                                                                      std::vector<int64_t> *out_checksums) {
     CHECK_CLIENT_WITH_TYPE(transfer_client_);
-    return transfer_client_->SaveKvCaches(uri_str_vec, block_buffers, /*trace_info=*/nullptr, out_block_hashes);
+    return transfer_client_->SaveKvCaches(uri_str_vec, block_buffers, /*trace_info=*/nullptr, out_checksums);
 }
 
 std::unique_ptr<ManagerClient> ManagerClient::Create(const std::string &client_config, InitParams &init_params) {

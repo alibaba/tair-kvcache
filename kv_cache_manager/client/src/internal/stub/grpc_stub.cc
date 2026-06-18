@@ -408,7 +408,7 @@ ClientErrorCode GrpcStub::FinishWriteCache(const std::string &trace_id,
                                            const std::string write_session_id,
                                            const BlockMask &success_block,
                                            const Locations &locations,
-                                           const std::vector<int64_t> &block_hashes) {
+                                           const std::vector<int64_t> &checksums) {
     auto stub = GET_AND_CHECK_STUB();
     proto::meta::FinishWriteCacheRequest request;
     SetCommonInfo(request, trace_id, instance_id);
@@ -422,16 +422,16 @@ ClientErrorCode GrpcStub::FinishWriteCache(const std::string &trace_id,
                        DebugStringUtil::ToString(locations).c_str());
         return ec;
     }
-    // 任务 82620492：把 hash 填到对应位置的 CacheLocation.block_hash 上。
-    // 长度不一致视为 client 端 bug；server 端的 CacheManager 也会再次校验长度。
-    if (!block_hashes.empty()) {
-        if (static_cast<int>(block_hashes.size()) != proto_locations->size()) {
-            KVCM_LOG_ERROR("block_hashes size [%zu] mismatches locations size [%d]; skip hash propagation",
-                           block_hashes.size(),
+    // Fill each checksum into the parallel CacheLocation slot. Length mismatch is a
+    // client-side bug; server's CacheManager re-validates the length anyway.
+    if (!checksums.empty()) {
+        if (static_cast<int>(checksums.size()) != proto_locations->size()) {
+            KVCM_LOG_ERROR("checksums size [%zu] mismatches locations size [%d]; skip checksum propagation",
+                           checksums.size(),
                            proto_locations->size());
         } else {
             for (int i = 0; i < proto_locations->size(); ++i) {
-                proto_locations->Mutable(i)->set_block_hash(block_hashes[i]);
+                proto_locations->Mutable(i)->set_checksum(checksums[i]);
             }
         }
     }

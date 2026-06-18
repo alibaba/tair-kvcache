@@ -126,7 +126,7 @@ public:
                  const std::string write_session_id,
                  const BlockMask &success_block,
                  const Locations &locations,
-                 const std::vector<int64_t> &block_hashes),
+                 const std::vector<int64_t> &checksums),
                 (override));
 
     MOCK_METHOD(ClientErrorCode,

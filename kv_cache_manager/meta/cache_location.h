@@ -107,7 +107,7 @@ public:
         Put(writer, "spec_size", spec_size_);
         Put(writer, "create_time", create_time_);
         Put(writer, "location_specs", location_specs_);
-        Put(writer, "block_hash", block_hash_);
+        Put(writer, "checksum", checksum_);
     }
 
     bool FromRapidValue(const rapidjson::Value &rapid_value) override {
@@ -117,9 +117,9 @@ public:
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "spec_size", spec_size_, size_t{0});
         KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "create_time", create_time_, int64_t{0});
         KVCM_JSON_GET_MACRO(rapid_value, "location_specs", location_specs_);
-        // block_hash 是后加的字段，老 meta 数据没有该字段时反序列化为 0；
-        // 读端遇到 0 必须跳过校验 (兼容老 client 不上报 hash 的场景)。
-        KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "block_hash", block_hash_, int64_t{0});
+        // checksum was added later; legacy entries deserialize to 0, which readers treat
+        // as "skip verification" to stay compatible with old clients that did not report it.
+        KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "checksum", checksum_, int64_t{0});
         return true;
     }
 
@@ -130,7 +130,7 @@ public:
     void set_create_time(int64_t create_time) { create_time_ = create_time; }
     void push_location_spec(LocationSpec &&location_spec) { location_specs_.push_back(std::move(location_spec)); }
     void set_location_specs(std::vector<LocationSpec> &&location_specs) { location_specs_ = location_specs; }
-    void set_block_hash(int64_t block_hash) { block_hash_ = block_hash; }
+    void set_checksum(int64_t checksum) { checksum_ = checksum; }
 
     [[nodiscard]] const std::vector<LocationSpec> &location_specs() const { return location_specs_; }
     [[nodiscard]] const std::string &id() const { return id_; }
@@ -138,7 +138,7 @@ public:
     [[nodiscard]] DataStorageType type() const { return type_; }
     [[nodiscard]] size_t spec_size() const { return spec_size_; }
     [[nodiscard]] int64_t create_time() const { return create_time_; }
-    [[nodiscard]] int64_t block_hash() const { return block_hash_; }
+    [[nodiscard]] int64_t checksum() const { return checksum_; }
     [[nodiscard]] size_t EstimateMemUsage() const {
         size_t usage = sizeof(CacheLocation) + id_.size();
         for (const auto &spec : location_specs_) {
@@ -154,9 +154,9 @@ private:
     size_t spec_size_ = 0;
     int64_t create_time_ = 0;
     std::vector<LocationSpec> location_specs_;
-    // 数据校验码 (跨副本一致)，由 client 在 FinishWriteCache 时上报；
-    // 0 = 未设置 (老 client / 老数据)，读端必须跳过校验。
-    int64_t block_hash_ = 0;
+    // Per-block data checksum, identical across replicas. Reported by client in
+    // FinishWriteCache; 0 = unset (legacy data / legacy client), readers must skip.
+    int64_t checksum_ = 0;
 };
 
 using CacheLocationConstPtr = std::shared_ptr<const CacheLocation>;

@@ -37,7 +37,7 @@ public:
                                 const std::string &write_session_id,
                                 const BlockMask &success_block,
                                 const Locations &locations,
-                                const std::vector<int64_t> &block_hashes = {}) override;
+                                const std::vector<int64_t> &checksums = {}) override;
 
     std::pair<ClientErrorCode, Metas> MatchMeta(const std::string &trace_id,
                                                 const std::vector<int64_t> &keys,

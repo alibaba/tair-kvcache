@@ -32,9 +32,9 @@ constexpr std::size_t ToIndex(const DataStorageType &type) noexcept { return sta
 // must be treated the same as the base type
 DataStorageType ToBaseType(const DataStorageType &type) noexcept;
 
-// 数据校验算法。值与 proto::meta::ChecksumAlgo / proto::admin::ChecksumAlgo 对齐。
-// CA_CRC32_XOR_INT64 = client SDK 中 SdkBufferCheckUtil::GetBlocksHash 的实现
-// (CRC32 per iov -> HashUtil::HashIntArray 聚合为 int64)。
+// Checksum algorithm; values mirror proto::meta::ChecksumAlgo and proto::admin::ChecksumAlgo.
+// CA_CRC32_XOR_INT64 is what SdkBufferCheckUtil::GetBlocksHash produces (CRC32 per iov
+// aggregated via HashUtil::HashIntArray into an int64).
 enum class ChecksumAlgo : uint8_t {
     CA_UNSPECIFIED = 0,
     CA_CRC32_XOR_INT64 = 1,
@@ -43,8 +43,8 @@ enum class ChecksumAlgo : uint8_t {
 std::string ToString(ChecksumAlgo algo);
 ChecksumAlgo ToChecksumAlgo(const std::string &name);
 
-// 数据校验配置。默认全部关闭，未设置时所有校验路径跳过。
-// proto 端定义见 protocol/protobuf/meta_service.proto:DataIntegrityConfig。
+// Data integrity config; all fields default to disabled (verification path skipped).
+// See protocol/protobuf/meta_service.proto:DataIntegrityConfig for the wire shape.
 class DataIntegrityConfig : public Jsonizable {
 public:
     bool FromRapidValue(const rapidjson::Value &rapid_value) override;
@@ -63,9 +63,9 @@ public:
     void set_algo(ChecksumAlgo algo) { algo_ = algo; }
 
 private:
-    bool enable_meta_checksum_ = false;  // 方案 A
-    bool enable_inline_header_ = false;  // 方案 B：本期仅接口预留，运行期被 Validate 拒绝
-    uint32_t inline_header_version_ = 0; // 0 = 无 inline header (兼容老数据)
+    bool enable_meta_checksum_ = false;  // Scheme A
+    bool enable_inline_header_ = false;  // Scheme B: reserved; rejected by Validate
+    uint32_t inline_header_version_ = 0; // 0 = no inline header (legacy data)
     ChecksumAlgo algo_ = ChecksumAlgo::CA_CRC32_XOR_INT64;
 };
 
