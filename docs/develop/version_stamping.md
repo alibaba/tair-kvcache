@@ -44,7 +44,7 @@ build --workspace_status_command=bazel/workspace_status.sh
 在 BUILD 文件中通过 `stamp = 1` 的 genrule 调用 `gen_version_info.py`，该脚本读取 Bazel 生成的 status 文件，输出格式化的版本信息文件。
 
 - Python 组件：生成 `_version_info.py`，包含 `VERSION`、`GIT_COMMIT`、`FULL_VERSION` 等模块级变量
-- C++ 组件：生成 `build_version.h`，包含 `KVCM_VERSION`、`KVCM_GIT_COMMIT`、`KVCM_FULL_VERSION` 等宏定义
+- C++ 组件：生成 `build_version.h` 和 `build_version.cc`，包含 `kKvcmVersion`、`kKvcmGitCommit`、`kKvcmFullVersion` 等常量
 
 ### 3. py_wheel stamp
 
@@ -82,7 +82,7 @@ py_wheel(
 ```
 bazel/
 ├── workspace_status.sh   # Bazel workspace status 脚本，提供 stamp 变量
-├── gen_version_info.py   # 版本信息文件生成器（支持 Python / C++ 两种输出格式）
+├── gen_version_info.py   # 版本信息文件生成器（支持 Python / C++ 输出）
 ├── version.bzl           # 可复用的 Starlark 宏（version_info_py / version_info_cc）
 └── BUILD                 # exports_files 声明
 ```
@@ -127,7 +127,7 @@ logger.info("version: %s (commit: %s, build: %s)", FULL_VERSION, GIT_COMMIT, BUI
 
 ### 为 C++ 组件接入版本信息
 
-1. 在 BUILD 文件中加载宏并生成版本头文件：
+1. 在 BUILD 文件中加载宏并生成版本库：
 
 ```python
 load("//bazel:version.bzl", "version_info_cc")
@@ -141,22 +141,24 @@ cc_library(
 )
 ```
 
+`version_info_cc` 会生成稳定的 `build_version.h` 声明文件和包含实际字符串值的 `build_version.cc`。构建时间变化时只需要重编这个很小的 `.cc`，依赖方通常只需要重新链接。
+
 2. 在 C++ 代码中包含使用：
 
 ```cpp
 #include "my_package/build_version.h"
 
-// 可用的宏定义：
-// KVCM_VERSION        - "0.0.1"
-// KVCM_GIT_COMMIT     - "2cd6c5a9"
-// KVCM_GIT_COMMIT_FULL - "2cd6c5a9..."
-// KVCM_GIT_REPO       - "git@github.com:..."
-// KVCM_BUILD_DATE     - "20260409"
-// KVCM_BUILD_TIMESTAMP - "20260409.113826"
-// KVCM_BUILD_TIME     - "2026-04-09 11:38:26"
-// KVCM_FULL_VERSION   - "0.0.1+20260409.113826.2cd6c5a9"
+// 可用的常量：
+// kKvcmVersion        - "0.0.1"
+// kKvcmGitCommit     - "2cd6c5a9"
+// kKvcmGitCommitFull - "2cd6c5a9..."
+// kKvcmGitRepo       - "git@github.com:..."
+// kKvcmBuildDate     - "20260409"
+// kKvcmBuildTimestamp - "20260409.113826"
+// kKvcmBuildTime     - "2026-04-09 11:38:26"
+// kKvcmFullVersion   - "0.0.1+20260409.113826.2cd6c5a9"
 
-std::cout << "Version: " << KVCM_FULL_VERSION << std::endl;
+std::cout << "Version: " << kKvcmFullVersion << std::endl;
 ```
 
 ### 为 py_wheel 包添加版本号
@@ -192,7 +194,7 @@ bazel build //path/to:my_package.dist
 | vllm connector | Python wheel + 日志 | `py_connector/common/_version_info.py`，启动时打印 |
 | client pybind | Python wheel | wheel 包版本号 |
 | optimizer pybind | Python wheel | wheel 包版本号 |
-| manager (C++) | C++ 二进制 | `common/build_version.h`，`./main -v` 输出 |
+| manager (C++) | C++ 二进制 | `common/build_version.h` / `.cc`，`./main -v` 输出 |
 
 ## 修改版本号
 

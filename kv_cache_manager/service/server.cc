@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <grpcpp/grpcpp.h>
 
+#include "kv_cache_manager/common/build_version.h"
 #include "kv_cache_manager/common/loop_thread.h"
 #include "kv_cache_manager/common/net_util.h"
 #include "kv_cache_manager/config/coordination_backend.h"
@@ -161,10 +162,10 @@ bool Server::Start() {
         return false;
     }
     KVCM_LOG_INFO("\n%s\nkvcm server start OK!\nversion: %s\ncommit: %s\nbuild time: %s",
-                  KVCM_ART,
-                  SYS_GLB_VERSION,
-                  SYS_GLB_GIT_INFO,
-                  SYS_GLB_BUILD_TIME);
+                  kKvcmArt,
+                  kKvcmFullVersion,
+                  kKvcmGitCommit,
+                  kKvcmBuildTime);
     return true;
 }
 
