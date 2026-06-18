@@ -57,6 +57,17 @@ ClientErrorCode TransferClientImpl::ValidateStorageConfigsForIntegrity(const std
                 integrity.inline_header_version());
             return ER_INLINE_HEADER_INVALID;
         }
+        // Reject any other integrity validation failure (e.g. enable_meta_checksum=true
+        // with algo=CA_UNSPECIFIED). Without this the client silently falls back to
+        // CRC32 even though server-side StorageConfig::ValidateRequiredFields would
+        // reject the same config -- inconsistency between server and client init.
+        std::string integrity_invalid_fields;
+        if (!integrity.ValidateRequiredFields(integrity_invalid_fields)) {
+            KVCM_LOG_ERROR("storage config [%s] has invalid integrity config: %s; reject init",
+                           cfg->global_unique_name().c_str(),
+                           integrity_invalid_fields.c_str());
+            return ER_INVALID_STORAGE_CONFIG;
+        }
         if (integrity.enable_meta_checksum()) {
             any_meta_checksum_enabled = true;
         }
@@ -204,6 +215,12 @@ ClientErrorCode TransferClientImpl::LoadKvCaches(const UriStrVec &uri_str_vec,
     // pinpoints the offending blocks for diagnostics. Set KVCM_CHECKSUM_STRICT_MODE=1
     // to skip the fast aggregate entirely and force per-block comparison (useful for
     // triaging cases the XOR could in theory hide via paired cancellation, p ~2^-64).
+    //
+    // Blocks whose buffer contains any iov with ignore=true are partial reads: the
+    // underlying SDK leaves the ignored ranges untouched, so hashing them would
+    // include stale memory and always disagree with the stored checksum. We force the
+    // expected slot to the 0 sentinel for those blocks so the verifier skips them; an
+    // empty / no-iov block is equally unverifiable and gets the same treatment.
     if (expected_checksums != nullptr && !expected_checksums->empty()) {
         if (expected_checksums->size() != block_buffers.size()) {
             KVCM_LOG_ERROR("expected_checksums size [%zu] mismatches block_buffers size [%zu]",
@@ -218,24 +235,56 @@ ClientErrorCode TransferClientImpl::LoadKvCaches(const UriStrVec &uri_str_vec,
             KVCM_LOG_WARN("expected_checksums given but sdk_buffer_check_pool is not enabled; "
                           "skip verification");
         } else {
+            std::vector<int64_t> effective_expected = *expected_checksums;
+            size_t skipped_blocks = 0;
+            for (size_t i = 0; i < block_buffers.size(); ++i) {
+                if (effective_expected[i] == 0) {
+                    continue; // already sentinel
+                }
+                const auto &iovs = block_buffers[i].iovs;
+                bool unverifiable = iovs.empty();
+                if (!unverifiable) {
+                    for (const auto &iov : iovs) {
+                        if (iov.ignore) {
+                            unverifiable = true;
+                            break;
+                        }
+                    }
+                }
+                if (unverifiable) {
+                    effective_expected[i] = 0;
+                    ++skipped_blocks;
+                }
+            }
+            if (skipped_blocks > 0) {
+                KVCM_LOG_DEBUG("checksum verification skipped %zu block(s) due to ignored or empty iovs",
+                               skipped_blocks);
+            }
             auto handle = sdk_buffer_check_pool_->GetCell();
             auto actual = SdkBufferCheckUtil::GetBlocksHash(
                 block_buffers, handle->d_iovs, handle->d_crcs, handle->h_iovs, max_check_iov_num_, handle->gpu_stream);
             const bool strict_mode = EnvUtil::GetEnv("KVCM_CHECKSUM_STRICT_MODE", false);
-            const auto verify_result = VerifyBatchChecksums(*expected_checksums, actual, strict_mode);
+            const auto verify_result = VerifyBatchChecksums(effective_expected, actual, strict_mode);
             if (verify_result.mismatch) {
                 if (verify_result.faulty_indices.empty()) {
                     // Size mismatch surfaced from the helper (we already pre-checked
                     // expected vs block_buffers above, so this is paranoid coverage).
                     KVCM_LOG_ERROR(
-                        "actual checksums size [%zu] != expected [%zu]", actual.size(), expected_checksums->size());
+                        "actual checksums size [%zu] != expected [%zu]", actual.size(), effective_expected.size());
                 } else {
+                    // Structured per-block log; field set mirrors ChecksumMismatchEvent
+                    // so a log scraper can build the same observability surface until
+                    // the client SDK grows a real EventManager hook (follow-up).
                     for (auto idx : verify_result.faulty_indices) {
-                        KVCM_LOG_ERROR("checksum mismatch at block %zu: expected=0x%lx, actual=0x%lx, uri=%s",
+                        KVCM_LOG_ERROR("ChecksumMismatchEvent {block_index=%zu, expected_checksum=0x%lx, "
+                                       "actual_checksum=0x%lx, storage_uri=\"%s\", trace_id=\"%s\"}",
                                        idx,
-                                       static_cast<unsigned long>((*expected_checksums)[idx]),
+                                       static_cast<unsigned long>(effective_expected[idx]),
                                        static_cast<unsigned long>(actual[idx]),
-                                       idx < uri_str_vec.size() ? uri_str_vec[idx].c_str() : "<oob>");
+                                       idx < uri_str_vec.size() ? uri_str_vec[idx].c_str() : "<oob>",
+                                       (trace_info != nullptr && !trace_info->block_ids.empty())
+                                           ? trace_info->block_ids.front().c_str()
+                                           : "<unknown>");
                     }
                 }
                 return ER_CHECKSUM_MISMATCH;
@@ -262,10 +311,22 @@ std::pair<ClientErrorCode, UriStrVec> TransferClientImpl::SaveKvCaches(const Uri
     // Write-side checksum compute: triggered by either an explicit out_checksums
     // request or the legacy KVCM_SDK_CHECK print-only fallback. The two paths share
     // the same computation so the checksum is computed at most once per call.
+    //
+    // SdkBufferCheckUtil::GetBlocksHash dereferences block_buffers.front(), so we
+    // must guard against empty / malformed input here. The full URI / Iov validity
+    // check still happens inside sdk_wrapper_->Put() below; we only short-circuit
+    // the obviously invalid shapes that would crash the hashing kernel.
     std::vector<int64_t> block_checksums;
     bool block_checksums_computed = false;
+    const bool checksum_input_usable = !block_buffers.empty() && !block_buffers.front().iovs.empty();
     if (out_checksums != nullptr || is_check_buffer_) {
-        if (!sdk_buffer_check_pool_) {
+        if (!checksum_input_usable) {
+            if (out_checksums != nullptr) {
+                KVCM_LOG_WARN("block_buffers empty or first block has no iovs; "
+                              "skip checksum compute and return empty out_checksums");
+                out_checksums->clear();
+            }
+        } else if (!sdk_buffer_check_pool_) {
             if (out_checksums != nullptr) {
                 KVCM_LOG_WARN("out_checksums requested but sdk_buffer_check_pool is not enabled; "
                               "return empty vector (caller should treat as 'checksum not available')");
@@ -284,7 +345,7 @@ std::pair<ClientErrorCode, UriStrVec> TransferClientImpl::SaveKvCaches(const Uri
                 block_checksums_computed = true;
             }
         }
-        if (is_check_buffer_) {
+        if (is_check_buffer_ && checksum_input_usable) {
             PrintBlockChecksumAndUri("put_", uri_str_vec, block_checksums, trace_info);
         }
         if (out_checksums != nullptr && block_checksums_computed) {

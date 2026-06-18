@@ -84,7 +84,8 @@ public:
                  const KeyVector &keys,
                  const TokenIdsVector &tokens,
                  const BlockMask &block_mask,
-                 int32_t detail_level),
+                 int32_t detail_level,
+                 std::vector<int64_t> *out_checksums),
                 (override));
 
     MOCK_METHOD((std::pair<ClientErrorCode, Locations>),
@@ -96,7 +97,8 @@ public:
                  const TokenIdsVector &tokens,
                  const BlockMask &block_mask,
                  int32_t sw_size,
-                 const std::vector<std::string> &location_spec_names),
+                 const std::vector<std::string> &location_spec_names,
+                 std::vector<int64_t> *out_checksums),
                 (override));
 
     MOCK_METHOD((std::pair<ClientErrorCode, int64_t>),

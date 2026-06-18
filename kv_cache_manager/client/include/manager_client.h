@@ -17,14 +17,18 @@ public:
     static std::unique_ptr<ManagerClient> Create(const std::string &config, InitParams &init_params);
 
     // for meta client
-    virtual std::pair<ClientErrorCode, Locations>
-    MatchLocation(const std::string &trace_id,
-                  QueryType query_type,
-                  const std::vector<int64_t> &keys,
-                  const std::vector<int64_t> &tokens,
-                  const BlockMask &block_mask,
-                  int32_t sw_size,
-                  const std::vector<std::string> &location_spec_names) = 0;
+    // out_checksums (optional): when non-null, filled with the per-block checksum the
+    // server stored at write time, parallel to the returned Locations. The caller is
+    // expected to pass this same vector to LoadKvCaches's expected_checksums to enable
+    // read-side verification.
+    virtual std::pair<ClientErrorCode, Locations> MatchLocation(const std::string &trace_id,
+                                                                QueryType query_type,
+                                                                const std::vector<int64_t> &keys,
+                                                                const std::vector<int64_t> &tokens,
+                                                                const BlockMask &block_mask,
+                                                                int32_t sw_size,
+                                                                const std::vector<std::string> &location_spec_names,
+                                                                std::vector<int64_t> *out_checksums = nullptr) = 0;
 
     virtual std::pair<ClientErrorCode, WriteLocation>
     StartWrite(const std::string &trace_id,
@@ -46,7 +50,8 @@ public:
                                                         const std::vector<int64_t> &keys,
                                                         const std::vector<int64_t> &tokens,
                                                         const BlockMask &block_mask,
-                                                        int32_t detail_level) = 0;
+                                                        int32_t detail_level,
+                                                        std::vector<int64_t> *out_checksums = nullptr) = 0;
 
     virtual ClientErrorCode RemoveCache(const std::string &trace_id,
                                         const std::vector<int64_t> &keys,

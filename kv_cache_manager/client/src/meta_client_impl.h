@@ -20,7 +20,8 @@ public:
                                                         const std::vector<int64_t> &tokens,
                                                         const BlockMask &block_mask,
                                                         int32_t sw_size,
-                                                        const std::vector<std::string> &location_spec_names) override;
+                                                        const std::vector<std::string> &location_spec_names,
+                                                        std::vector<int64_t> *out_checksums = nullptr) override;
 
     std::pair<ClientErrorCode, int64_t> MatchLocationLen(const std::string &trace_id,
                                                          QueryType query_type,
@@ -43,7 +44,8 @@ public:
                                                 const std::vector<int64_t> &keys,
                                                 const std::vector<int64_t> &tokens,
                                                 const BlockMask &block_mask,
-                                                int32_t detail_level) override;
+                                                int32_t detail_level,
+                                                std::vector<int64_t> *out_checksums = nullptr) override;
 
     ClientErrorCode RemoveCache(const std::string &trace_id,
                                 const std::vector<int64_t> &keys,

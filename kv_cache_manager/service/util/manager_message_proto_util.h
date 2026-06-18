@@ -209,6 +209,10 @@ void ProtoConvert::CacheLocationViewToProto(const CacheLocationView &cache_locat
         DataStorageTypeToProto(cache_location_info.type(), &type);
         proto_cache_location->set_type(type);
     }
+    // Round-trip the checksum so readers can verify with the value persisted at write
+    // time. 0 means "no checksum" and is the legacy default; new readers skip the
+    // sentinel.
+    proto_cache_location->set_checksum(cache_location_info.checksum());
 
     for (const auto &location_spec : cache_location_info.location_specs()) {
         auto *proto_spec = proto_cache_location->add_location_specs();

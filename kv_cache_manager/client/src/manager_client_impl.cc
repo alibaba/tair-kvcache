@@ -60,9 +60,11 @@ ManagerClientImpl::MatchLocation(const std::string &trace_id,
                                  const std::vector<int64_t> &tokens,
                                  const BlockMask &block_mask,
                                  int32_t sw_size,
-                                 const std::vector<std::string> &location_spec_names) {
+                                 const std::vector<std::string> &location_spec_names,
+                                 std::vector<int64_t> *out_checksums) {
     CHECK_CLIENT_WITH_TYPE(meta_client_);
-    return meta_client_->MatchLocation(trace_id, query_type, keys, tokens, block_mask, sw_size, location_spec_names);
+    return meta_client_->MatchLocation(
+        trace_id, query_type, keys, tokens, block_mask, sw_size, location_spec_names, out_checksums);
 }
 
 std::pair<ClientErrorCode, WriteLocation>
@@ -88,9 +90,10 @@ std::pair<ClientErrorCode, Metas> ManagerClientImpl::MatchMeta(const std::string
                                                                const std::vector<int64_t> &keys,
                                                                const std::vector<int64_t> &tokens,
                                                                const BlockMask &block_mask,
-                                                               int32_t detail_level) {
+                                                               int32_t detail_level,
+                                                               std::vector<int64_t> *out_checksums) {
     CHECK_CLIENT_WITH_TYPE(meta_client_);
-    return meta_client_->MatchMeta(trace_id, keys, tokens, block_mask, detail_level);
+    return meta_client_->MatchMeta(trace_id, keys, tokens, block_mask, detail_level, out_checksums);
 }
 
 ClientErrorCode ManagerClientImpl::RemoveCache(const std::string &trace_id,

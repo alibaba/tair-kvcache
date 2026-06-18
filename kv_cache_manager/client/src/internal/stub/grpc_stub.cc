@@ -63,16 +63,24 @@
 
 namespace {
 
-kv_cache_manager::Locations GenLocations(
-    const google::protobuf::RepeatedPtrField<::kv_cache_manager::proto::meta::CacheLocation> &proto_locations) {
+kv_cache_manager::Locations
+GenLocations(const google::protobuf::RepeatedPtrField<::kv_cache_manager::proto::meta::CacheLocation> &proto_locations,
+             std::vector<int64_t> *out_checksums = nullptr) {
     kv_cache_manager::Locations locations;
     locations.reserve(proto_locations.size());
+    if (out_checksums != nullptr) {
+        out_checksums->clear();
+        out_checksums->reserve(proto_locations.size());
+    }
     for (const auto &proto_location : proto_locations) {
         const auto &location_specs = proto_location.location_specs();
         locations.push_back({});
         locations.back().reserve(location_specs.size());
         for (const auto &location_spec : location_specs) {
             locations.back().push_back({location_spec.name(), location_spec.uri()});
+        }
+        if (out_checksums != nullptr) {
+            out_checksums->push_back(proto_location.checksum());
         }
     }
     return locations;
@@ -301,7 +309,8 @@ std::pair<ClientErrorCode, Metas> GrpcStub::GetCacheMeta(const std::string &trac
                                                          const KeyVector &keys,
                                                          const TokenIdsVector &tokens,
                                                          const BlockMask &block_mask,
-                                                         int32_t detail_level) {
+                                                         int32_t detail_level,
+                                                         std::vector<int64_t> *out_checksums) {
     auto stub = GET_AND_CHECK_STUB_WITH_TYPE();
     proto::meta::GetCacheMetaRequest request;
     SetKeysAndTokens(request, trace_id, instance_id, keys, tokens);
@@ -312,7 +321,7 @@ std::pair<ClientErrorCode, Metas> GrpcStub::GetCacheMeta(const std::string &trac
     auto grpc_status = stub->GetCacheMeta(&context, request, &response);
     CHECK_GRPC_STATUS_WITH_TYPE(grpc_status);
     CHECK_COMMON_HEADER_WITH_TYPE(response);
-    auto locations = GenLocations(response.locations());
+    auto locations = GenLocations(response.locations(), out_checksums);
     std::vector<std::string> metas;
     std::for_each(
         response.metas().begin(), response.metas().end(), [&metas](const std::string &meta) { metas.push_back(meta); });
@@ -329,7 +338,8 @@ std::pair<ClientErrorCode, Locations> GrpcStub::GetCacheLocation(const std::stri
                                                                  const TokenIdsVector &tokens,
                                                                  const BlockMask &block_mask,
                                                                  int32_t sw_size,
-                                                                 const std::vector<std::string> &location_spec_names) {
+                                                                 const std::vector<std::string> &location_spec_names,
+                                                                 std::vector<int64_t> *out_checksums) {
     auto stub = GET_AND_CHECK_STUB_WITH_TYPE();
     proto::meta::GetCacheLocationRequest request;
     request.set_query_type(static_cast<proto::meta::QueryType>(query_type));
@@ -346,7 +356,7 @@ std::pair<ClientErrorCode, Locations> GrpcStub::GetCacheLocation(const std::stri
     auto grpc_status = stub->GetCacheLocation(&context, request, &response);
     CHECK_GRPC_STATUS_WITH_TYPE(grpc_status);
     CHECK_COMMON_HEADER_WITH_TYPE(response);
-    auto locations = GenLocations(response.locations());
+    auto locations = GenLocations(response.locations(), out_checksums);
     KVCM_LOG_DEBUG("get cache location success, locations: %s", DebugStringUtil::ToString(locations).c_str());
     return {ER_OK, locations};
 }
@@ -423,16 +433,19 @@ ClientErrorCode GrpcStub::FinishWriteCache(const std::string &trace_id,
         return ec;
     }
     // Fill each checksum into the parallel CacheLocation slot. Length mismatch is a
-    // client-side bug; server's CacheManager re-validates the length anyway.
+    // client-side bug -- fail loudly instead of dropping checksums silently, otherwise
+    // the server commits the write with checksum=0 while the caller believes the
+    // checksum was reported and an undetectable read corruption window opens.
     if (!checksums.empty()) {
         if (static_cast<int>(checksums.size()) != proto_locations->size()) {
-            KVCM_LOG_ERROR("checksums size [%zu] mismatches locations size [%d]; skip checksum propagation",
+            KVCM_LOG_ERROR("checksums size [%zu] mismatches locations size [%d]; refuse to send "
+                           "FinishWriteCache without checksums",
                            checksums.size(),
                            proto_locations->size());
-        } else {
-            for (int i = 0; i < proto_locations->size(); ++i) {
-                proto_locations->Mutable(i)->set_checksum(checksums[i]);
-            }
+            return ER_INVALID_PARAMS;
+        }
+        for (int i = 0; i < proto_locations->size(); ++i) {
+            proto_locations->Mutable(i)->set_checksum(checksums[i]);
         }
     }
     ProtoConvert::BlockMaskToProto(success_block, request.mutable_success_blocks());
