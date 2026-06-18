@@ -66,10 +66,18 @@ def main():
     p.add_argument("--weight-prefix", type=float, default=30.0, help="Prefix hit weight (wp) in scoring formula")
     p.add_argument("--weight-load", type=float, default=10.0, help="Load balance weight (wl) in scoring formula")
     p.add_argument("--quiet", action="store_true")
+    p.add_argument("--pod-prefix", type=str, default=None,
+                   help="Filter records by pod name prefix (e.g. 'ds-acb49efe'). "
+                        "Only records whose pods[0] starts with this prefix are kept.")
+    p.add_argument("--timeline-mode", type=str, default="disabled",
+                   choices=["disabled", "route_only", "route_and_latency", "latency_only"],
+                   help="Timeline replay mode: route_only uses trace routing, "
+                        "route_and_latency uses trace routing+latency, "
+                        "latency_only uses trace latency with sim routing")
     args = p.parse_args()
 
     random.seed(args.seed); np.random.seed(args.seed)
-    from schedule_simulator.schedule_emulator.types import BenchmarkConfig, SchedulerConfig, PlatformConfig, RouterConfig, RoutingPolicy
+    from schedule_simulator.schedule_emulator.types import BenchmarkConfig, SchedulerConfig, PlatformConfig, RouterConfig, RoutingPolicy, TimelineMode
     from schedule_simulator.schedule_emulator.run import DisaggBenchmarkRunner, BenchmarkRunner
 
     bc = BenchmarkConfig(
@@ -80,10 +88,11 @@ def main():
         max_output_length=args.max_output if not args.dataset else None,
         request_rate=args.request_rate, disable_tqdm=args.quiet,
         data_block_size=args.data_block_size,
+            pod_prefix=args.pod_prefix,
     )
     sc = SchedulerConfig(
         model=args.model,
-        scenario="disagg_prefill" if args.num_p_instances > 1 else "normal",
+        scenario="disagg_prefill" if (args.num_p_instances > 1 or args.timeline_mode != "disabled") else "normal",
         request_level_scheduling=args.request_level,
         chunked_prefill_size=args.chunk_size,
         hicache_storage_backend="hf3fs" if args.enable_hierarchical else None,
@@ -116,20 +125,42 @@ def main():
                 predictor = RequestLevelTimePredictor(constant_ms_per_token=args.ms_per_token)
             else:
                 predictor = RequestLevelTimePredictor(constant_ms_per_token=0.1)
-                print("[WARN] No predictor specified, using default 0.1 ms/token")
+                if args.timeline_mode not in ("route_and_latency", "latency_only"):
+                    print("[WARN] No predictor specified, using default 0.1 ms/token")
 
     policy_map = {"random": RoutingPolicy.RANDOM, "round_robin": RoutingPolicy.ROUND_ROBIN,
                   "power_of_two": RoutingPolicy.POWER_OF_TWO, "cache_aware": RoutingPolicy.CACHE_AWARE, "cache_aware_old": RoutingPolicy.CACHE_AWARE_OLD, "direct_cache_aware": RoutingPolicy.DIRECT_CACHE_AWARE}
 
+    # Timeline replay setup
+    from schedule_simulator.schedule_emulator.timeline_loader import TimelineLoader
+    timeline_mode = TimelineMode(args.timeline_mode)
+    timeline_loader = None
+    if timeline_mode != TimelineMode.DISABLED:
+        if not args.dataset:
+            print("[ERROR] --timeline-mode requires --dataset to be specified")
+            sys.exit(1)
+        timeline_loader = TimelineLoader(args.dataset, pod_prefix=args.pod_prefix)
+        if timeline_loader.num_pods == 0:
+            print(f"[ERROR] Timeline mode '{timeline_mode.value}' enabled but no 'pods' "
+                  f"field found in dataset. Each JSONL record must contain a 'pods' array "
+                  f"(e.g. 'pods': ['pod-name']). File: {args.dataset}")
+            sys.exit(1)
+        if not args.quiet:
+            print(f"[INFO] Timeline mode: {timeline_mode.value}, "
+                  f"{timeline_loader.num_pods} pods detected from file")
+
+    # Print config summary (after timeline setup so node count is correct)
     if not args.quiet:
+        actual_nodes = timeline_loader.num_pods if timeline_loader else args.num_p_instances
+        mode_str = "request-level" if args.request_level else "iteration-level"
+        timeline_str = f", timeline={timeline_mode.value}" if timeline_mode != TimelineMode.DISABLED else ""
         print("=" * 60)
-        print("Config: %d requests, %d P nodes, %s, %s" % (
-            args.num_prompts, args.num_p_instances, args.routing,
-            "request-level" if args.request_level else "iteration-level"))
+        print(f"Config: {args.num_prompts} requests, {actual_nodes} P nodes, "
+              f"{args.routing}, {mode_str}{timeline_str}")
         print("=" * 60)
 
     t0 = time.time()
-    if args.num_p_instances > 1:
+    if args.num_p_instances > 1 or (timeline_mode != TimelineMode.DISABLED and timeline_loader):
         runner = DisaggBenchmarkRunner(
             benchmark_config=bc, p_scheduler_config=sc,
             d_scheduler_config=SchedulerConfig(args.model, scenario="disagg_decode"),
@@ -145,6 +176,8 @@ def main():
             hierarchical_config_path=args.hierarchical_config,
             hierarchical_output_dir=os.path.join(args.output_dir, "optimizer") if args.enable_hierarchical else None,
             storage_pool_capacity_gb=max(args.pool_capacity, 0.0001),
+            timeline_loader=timeline_loader,
+            timeline_mode=timeline_mode,
         )
     else:
         sc.scenario = "normal"

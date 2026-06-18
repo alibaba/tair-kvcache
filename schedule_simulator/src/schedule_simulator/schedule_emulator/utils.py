@@ -126,12 +126,7 @@ def calc_metrics(requests: list[FakeRequest]) -> dict:
         "p95_itl_ms": np.percentile(itls or 0, 95) * 1000,
         "p99_itl_ms": np.percentile(itls or 0, 99) * 1000,
         "max_itl_ms": float(np.max(itls or 0)) * 1000,
-        "mean_e2e_latency_ms": np.mean(e2e_latencies) * 1000,
-        "median_e2e_latency_ms": np.median(e2e_latencies) * 1000,
-        "std_e2e_latency_ms": np.std(e2e_latencies) * 1000,
-        "p90_e2e_latency_ms": np.percentile(e2e_latencies or 0, 90) * 1000,
-        "p95_e2e_latency_ms": np.percentile(e2e_latencies or 0, 95) * 1000,
-        "p99_e2e_latency_ms": np.percentile(e2e_latencies or 0, 99) * 1000,
+
         "mean_queue_wait_ms": np.mean(queue_waits or 0) * 1000,
         "median_queue_wait_ms": np.median(queue_waits or 0) * 1000,
         "p90_queue_wait_ms": np.percentile(queue_waits or 0, 90) * 1000,

@@ -79,9 +79,8 @@ def test_metrics_percentile_ordering():
     # TTFT: p99 >= p95 >= p90 >= median
     assert m["p99_ttft_ms"] >= m["p95_ttft_ms"] >= m["p90_ttft_ms"]
     assert m["p90_ttft_ms"] >= m["median_ttft_ms"]
-    # E2E: p99 >= p95 >= p90 >= median
-    assert m["p99_e2e_latency_ms"] >= m["p95_e2e_latency_ms"] >= m["p90_e2e_latency_ms"]
-    assert m["p90_e2e_latency_ms"] >= m["median_e2e_latency_ms"]
+    # Queue wait: p99 >= p90 >= median
+    assert m["p99_queue_wait_ms"] >= m["p90_queue_wait_ms"] >= m["median_queue_wait_ms"]
     print("[percentile_order] OK")
 
 
@@ -102,8 +101,6 @@ def test_metrics_all_fields_present():
         "mean_ttft_ms", "median_ttft_ms", "std_ttft_ms", "p90_ttft_ms", "p95_ttft_ms", "p99_ttft_ms",
         "mean_tpot_ms", "median_tpot_ms", "std_tpot_ms", "p90_tpot_ms", "p95_tpot_ms", "p99_tpot_ms",
         "mean_itl_ms", "median_itl_ms", "std_itl_ms", "p90_itl_ms", "p95_itl_ms", "p99_itl_ms", "max_itl_ms",
-        "mean_e2e_latency_ms", "median_e2e_latency_ms", "std_e2e_latency_ms",
-        "p90_e2e_latency_ms", "p95_e2e_latency_ms", "p99_e2e_latency_ms",
         "mean_queue_wait_ms", "median_queue_wait_ms", "p90_queue_wait_ms", "p99_queue_wait_ms",
     ]
     for k in required:
@@ -166,6 +163,14 @@ def test_export_summary_json_complete():
     assert "mean_ttft_ms" in summary
     assert "concurrency" in summary
     assert "mean_queue_wait_ms" in summary
+    # New topology fields
+    assert "num_nodes" in summary
+    assert summary["num_nodes"] == 2  # num_p_instance=2
+    assert "hbm_capacity_gb" in summary
+    assert "mem_capacity_gb" in summary
+    # e2e fields should be removed
+    assert "mean_e2e_latency_ms" not in summary
+    assert "p99_e2e_latency_ms" not in summary
     print("[summary_json] completed=%d, fields=%d" % (summary["completed"], len(summary)))
 
 

@@ -5,6 +5,7 @@ from schedule_simulator.schedule_emulator.types import (
     RequestStats,
     RequestStage,
     RequestCacheFetchStats,
+    TimelineMode,
 )
 from schedule_simulator.infer_time_predictor import (
     ScheduleBatch,
@@ -52,6 +53,7 @@ class SGLangScheduleEmulator(ScheduleEmulator):
         enable_hierarchical_cache: bool = False,  # add for test case which only use L1 cache
         kvcm_block_size: int = None,
         name: str = "SGLangScheduler",
+        timeline_mode: TimelineMode = TimelineMode.DISABLED,
     ):
         super().__init__(
             scheduler_config,
@@ -60,6 +62,7 @@ class SGLangScheduleEmulator(ScheduleEmulator):
             response_queue,
             name,
         )
+        self.timeline_mode = timeline_mode
 
         # Keep the request which arrived before current clock.
         self.waiting_queue: list[FakeRequest] = []
@@ -485,12 +488,25 @@ class SGLangScheduleEmulator(ScheduleEmulator):
         req.context_prefill_start = cached
         req.context_prefill_end = req.input_token_length
 
-        if hasattr(self.time_predictor, "predict_request_time"):
-            latency = self.time_predictor.predict_request_time(max(uncached, 1), cached)
+        # Timeline latency override
+        if self.timeline_mode in (TimelineMode.ROUTE_AND_LATENCY, TimelineMode.LATENCY_ONLY):
+            if req.timeline_prefill_ms is not None:
+                latency = req.timeline_prefill_ms / 1000.0
+            else:
+                # Fallback to predictor if timeline has no prefill_ms
+                if hasattr(self.time_predictor, "predict_request_time"):
+                    latency = self.time_predictor.predict_request_time(max(uncached, 1), cached)
+                else:
+                    from schedule_simulator.infer_time_predictor.base import ScheduleBatch as SB, ScheduleRequest as SR
+                    batch = SB(reqs=[SR(input_length=max(uncached, 1), past_kv_length=cached)])
+                    latency = self.time_predictor.predict_infer_time(batch)
         else:
-            from schedule_simulator.infer_time_predictor.base import ScheduleBatch as SB, ScheduleRequest as SR
-            batch = SB(reqs=[SR(input_length=max(uncached, 1), past_kv_length=cached)])
-            latency = self.time_predictor.predict_infer_time(batch)
+            if hasattr(self.time_predictor, "predict_request_time"):
+                latency = self.time_predictor.predict_request_time(max(uncached, 1), cached)
+            else:
+                from schedule_simulator.infer_time_predictor.base import ScheduleBatch as SB, ScheduleRequest as SR
+                batch = SB(reqs=[SR(input_length=max(uncached, 1), past_kv_length=cached)])
+                latency = self.time_predictor.predict_infer_time(batch)
 
         # Two-phase: mark as running, advance clock to finish_time
         self.running_request = req

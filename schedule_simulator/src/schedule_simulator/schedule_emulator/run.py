@@ -11,11 +11,13 @@ from schedule_simulator.schedule_emulator.types import (
     PlatformConfig,
     RouterConfig,
     RoutingPolicy,
+    TimelineMode,
     IterationStats,
     RequestCacheFetchStats,
     IterationCacheFetchStats,
     FakeRequest,
 )
+from schedule_simulator.schedule_emulator.timeline_loader import TimelineLoader
 from schedule_simulator.schedule_emulator.benchmark import BenchmarkEmulator
 from schedule_simulator.schedule_emulator.sglang_scheduler import (
     SGLangScheduleEmulator,
@@ -216,6 +218,14 @@ class BenchmarkRunner:
 
         # 1. Summary JSON (metrics + hierarchical)
         summary = dict(metrics)
+        # Add topology and capacity info
+        summary["num_nodes"] = len(self.p_schedulers) if hasattr(self, 'p_schedulers') else 1
+        if hasattr(self, 'p_platform_config'):
+            summary["hbm_capacity_gb"] = self.p_platform_config.hbm_capacity_gb
+            summary["mem_capacity_gb"] = self.p_platform_config.memory_capacity_gb
+        else:
+            summary["hbm_capacity_gb"] = None
+            summary["mem_capacity_gb"] = None
         hier = self.get_hierarchical_metrics()
         if hier:
             for k, v in hier.items():
@@ -308,6 +318,8 @@ class DisaggBenchmarkRunner:
         hierarchical_output_dir: Optional[str] = None,
         storage_pool_capacity_gb: float = 1.0,
         enable_p2p: bool = True,
+        timeline_loader: Optional[TimelineLoader] = None,
+        timeline_mode: TimelineMode = TimelineMode.DISABLED,
     ):
         assert p_scheduler_config.scenario == "disagg_prefill"
         assert d_scheduler_config.scenario == "disagg_decode"
@@ -318,6 +330,18 @@ class DisaggBenchmarkRunner:
             "The number of requests is unknown during PD disaggregation."
         )
         self.use_real_token = use_real_token
+        self.timeline_mode = timeline_mode
+        self.timeline_loader = timeline_loader
+        self.p_platform_config = p_platform_config
+
+        # Override num_p_instance from timeline file
+        if timeline_mode != TimelineMode.DISABLED and timeline_loader:
+            num_p_instance = timeline_loader.num_pods
+            logger.info(
+                f"Timeline mode '{timeline_mode.value}': "
+                f"overriding num_p_instance to {num_p_instance} "
+                f"(from {timeline_loader.num_pods} unique pods in timeline)"
+            )
 
         gateway_request_queue = asyncio.Queue()
         gateway_response_queue = asyncio.Queue()
@@ -329,6 +353,7 @@ class DisaggBenchmarkRunner:
             response_queue=gateway_response_queue,
             use_real_token_ids=use_real_token,
             page_size=p_scheduler_config.page_size,
+            timeline_mode=timeline_mode,
         )
 
         self.p_schedulers = [
@@ -342,6 +367,7 @@ class DisaggBenchmarkRunner:
                 time_predictor=infer_time_predictor,
                 name=f"Prefill{i}",
                 use_real_token=use_real_token,
+                timeline_mode=timeline_mode,
             )
             for i in range(num_p_instance)
         ]
@@ -491,6 +517,19 @@ class DisaggBenchmarkRunner:
 
     async def _dispatch_request(self, req: FakeRequest, is_decode: bool) -> int:
         """根据策略选择 worker 索引 (逻辑保持不变，仅做微调)"""
+        # Timeline routing: override policy for prefill requests
+        if not is_decode and self.timeline_mode in (
+            TimelineMode.ROUTE_ONLY, TimelineMode.ROUTE_AND_LATENCY
+        ):
+            pod_name = req.timeline_pod_name
+            if pod_name and self.timeline_loader:
+                selected_id = self.timeline_loader.get_pod_index(pod_name)
+                if selected_id is not None:
+                    self.p_schedulers[selected_id].request_queue.put_nowait(req)
+                    return selected_id
+            # fallback to policy if timeline route not found
+            logger.debug(f"Timeline route not found for req {req.id}, falling back to policy")
+
         if is_decode:
             schedulers, policy = self.d_schedulers, self.d_policy
         else:
@@ -736,6 +775,14 @@ class DisaggBenchmarkRunner:
 
         # 1. Summary JSON (metrics + hierarchical)
         summary = dict(metrics)
+        # Add topology and capacity info
+        summary["num_nodes"] = len(self.p_schedulers) if hasattr(self, 'p_schedulers') else 1
+        if hasattr(self, 'p_platform_config'):
+            summary["hbm_capacity_gb"] = self.p_platform_config.hbm_capacity_gb
+            summary["mem_capacity_gb"] = self.p_platform_config.memory_capacity_gb
+        else:
+            summary["hbm_capacity_gb"] = None
+            summary["mem_capacity_gb"] = None
         hier = self.get_hierarchical_metrics()
         if hier:
             for k, v in hier.items():

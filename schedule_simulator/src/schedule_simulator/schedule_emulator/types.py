@@ -29,6 +29,7 @@ class BenchmarkConfig:
     disable_tqdm: bool = False
     num_instances: int = 1  # The number of server instance.
     data_block_size: Optional[int] = None  # Block size (tokens/block) used in dataset block_ids
+    pod_prefix: Optional[str] = None  # Filter records by pod name prefix
 
     # Control the timestamp parameter when sending requests to the LLM server from the benchmark client.
     with_queue_start: bool = False
@@ -66,6 +67,14 @@ class RoutingPolicy(Enum):
     POWER_OF_TWO = "power_of_two"
     ROUND_ROBIN = "round_robin"
     DIRECT_CACHE_AWARE = "direct_cache_aware"
+
+
+class TimelineMode(str, Enum):
+    """Timeline replay mode for using real trace data."""
+    DISABLED = "disabled"
+    ROUTE_ONLY = "route_only"
+    ROUTE_AND_LATENCY = "route_and_latency"
+    LATENCY_ONLY = "latency_only"
 
 
 @dataclass
@@ -259,6 +268,9 @@ class FakeRequest:
     # if block_size is not None, then the ids represents the hash value of each blocks
     block_size: Optional[int] = None
     extra_key: Optional[str] = None
+    # Timeline replay fields
+    timeline_pod_name: Optional[str] = None
+    timeline_prefill_ms: Optional[float] = None
 
     def __eq__(self, req):
         if not isinstance(req, FakeRequest):
