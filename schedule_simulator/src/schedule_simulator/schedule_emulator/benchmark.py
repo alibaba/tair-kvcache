@@ -98,6 +98,7 @@ class BenchmarkEmulator:
     @staticmethod
     def _normalize_timestamp(ts) -> float:
         """Normalize timestamp to seconds. Auto-detect format:
+        - ts > 1e15: epoch microseconds (e.g. 1780923600400578) -> /1e6
         - ts > 1e12: epoch milliseconds (e.g. 1780923600400) -> /1e3
         - 1e9 < ts <= 1e12: epoch seconds (e.g. 1780923600.4) -> use directly
         - ts <= 1e9: sim.jsonl milliseconds (e.g. 1000.0) -> /1e3
@@ -105,8 +106,11 @@ class BenchmarkEmulator:
         if ts is None:
             return 0.0
         ts = float(ts)
-        if ts > 1e12:
-            # Epoch milliseconds
+        if ts > 1e15:
+            # Epoch microseconds (e.g. 1780923600400578)
+            return ts / 1e6
+        elif ts > 1e12:
+            # Epoch milliseconds (e.g. 1780923600400)
             return ts / 1e3
         elif ts > 1e9:
             # Epoch seconds (Unix time for years 2001+)
