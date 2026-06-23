@@ -499,7 +499,9 @@ class CacheAwarePolicy(BasePolicy):
         loads = {}
         for i, eid in enumerate(self._engine_ids):
             if i < len(self.workers):
-                loads[eid] = self.workers[i].get_load()
+                load_val = self.workers[i].get_load()
+                if load_val > 0:
+                    loads[eid] = load_val
         best_engine_load = None
         if best_engine_id and best_engine_id in self._engine_id_to_idx:
             bidx = self._engine_id_to_idx[best_engine_id]
@@ -857,10 +859,14 @@ class DirectCacheAwarePolicy(BasePolicy):
         loads = {}
         for eid, eidx in self._engine_id_to_idx.items():
             if eidx < len(self.workers):
-                loads[eid] = self.workers[eidx].get_load()
+                load_val = self.workers[eidx].get_load()
+                if load_val > 0:
+                    loads[eid] = load_val
         if not loads:
             for i in range(len(self.workers)):
-                loads[f"P{i}"] = self.workers[i].get_load()
+                load_val = self.workers[i].get_load()
+                if load_val > 0:
+                    loads[f"P{i}"] = load_val
         best_engine_load = None
         if best_engine_id and best_engine_id in self._engine_id_to_idx:
             bidx = self._engine_id_to_idx[best_engine_id]
@@ -901,3 +907,170 @@ class DirectCacheAwarePolicy(BasePolicy):
                     self._use_hierarchical = True
                     self._engine_id_to_idx[sched.tree_cache.engine_id] = i
         await self.update_workload(schedulers, current_time)
+
+
+class BinPackPolicy(CacheAwarePolicy):
+    """BinPack routing strategy with group-based bin-packing.
+
+    When pods_per_group and bin_capacity are configured:
+    - Pods are divided into groups (pod i -> group i // pods_per_group)
+    - Routing first determines target group via cache_aware best-engine match
+    - Within the group, prefer the pod with highest current load (bin-packing)
+      as long as it doesn't exceed bin_capacity
+    - If all pods in group are at capacity, fall back to least loaded in group
+
+    When pods_per_group is None, behaves identically to CacheAwarePolicy.
+    """
+
+    def __init__(self, num_schedulers: int, config: "RouterConfig",
+                 scheduler_config=None, platform_config=None):
+        super().__init__(num_schedulers, config,
+                         scheduler_config=scheduler_config,
+                         platform_config=platform_config)
+        self.name = RoutingPolicy.BIN_PACK
+        # Group configuration
+        self.pods_per_group = config.pods_per_group
+        self.bin_capacity = config.bin_capacity
+
+    def _get_group_id(self, pod_idx: int) -> int:
+        """Get group ID for a given pod index."""
+        if self.pods_per_group is None:
+            return 0
+        return pod_idx // self.pods_per_group
+
+    def _get_group_members(self, group_id: int, healthy_indices: list) -> list:
+        """Get list of healthy pod indices belonging to a given group."""
+        if self.pods_per_group is None:
+            return healthy_indices
+        return [i for i in healthy_indices
+                if i // self.pods_per_group == group_id]
+
+    async def select_worker(self, req: FakeRequest) -> Optional[int]:
+        """Route request with group-based bin-packing logic."""
+        # If group routing is not enabled, fall back to parent CacheAwarePolicy
+        if self.pods_per_group is None or self.bin_capacity is None:
+            return await super().select_worker(req)
+
+        try:
+            if not self._initialized:
+                logger.warning("BinPackPolicy.select_worker called before initialization")
+                healthy_indices = [i for i, w in enumerate(self.workers) if w.is_healthy()]
+                if not healthy_indices:
+                    return 0
+                min_load_idx = min(healthy_indices, key=lambda idx: (self.workers[idx].get_load(), self.workers[idx].get_total_req()))
+                self.workers[min_load_idx].increment_load()
+                return min_load_idx
+
+            healthy_indices = [i for i, w in enumerate(self.workers) if w.is_healthy()]
+            if not healthy_indices:
+                self.workers[0].increment_load()
+                return 0
+
+            # Step 1: Use cache_aware ChooseBestEngine to find best matching engine
+            best_idx = None
+            best_hit = 0
+            best_engine_id = None
+            if self._optimizer_manager and req.origin_input_ids:
+                try:
+                    block_ids = list(req.origin_input_ids)
+                    timestamp_ns = int(req.last_event_time * 1e9) if req.last_event_time else 0
+                    res = self._optimizer_manager.ChooseBestEngine(block_ids, timestamp_ns)
+                    if res.hit_count > 0 and res.engine_instance_id in self._engine_id_to_idx:
+                        best_idx = self._engine_id_to_idx[res.engine_instance_id]
+                        best_hit = res.hit_count
+                        best_engine_id = res.engine_instance_id
+                except Exception as e:
+                    logger.error(f"BinPackPolicy: ChooseBestEngine failed: {e}")
+
+            # Step 2: Determine target group
+            if best_idx is not None:
+                target_group = self._get_group_id(best_idx)
+            else:
+                # No cache hit: pick group with lowest instant load;
+                # break ties by lowest historical total requests (for cache balance)
+                num_groups = (len(self.workers) + self.pods_per_group - 1) // self.pods_per_group
+                group_loads = []
+                for g in range(num_groups):
+                    members = self._get_group_members(g, healthy_indices)
+                    if members:
+                        avg_load = sum(self.workers[i].get_load() for i in members) / len(members)
+                        total_hist = sum(self.workers[i].get_total_req() for i in members)
+                        group_loads.append((avg_load, total_hist, g))
+                if group_loads:
+                    target_group = min(group_loads)[2]
+                else:
+                    target_group = 0
+
+            # Step 3: Within target group, apply bin-packing (prefer highest loaded pod under capacity)
+            group_members = self._get_group_members(target_group, healthy_indices)
+            if not group_members:
+                # Fallback: use all healthy
+                group_members = healthy_indices
+
+            # Check if target group is all at/over capacity
+            group_has_capacity = any(
+                self.workers[i].get_load() < self.bin_capacity for i in group_members
+            )
+
+            if group_has_capacity:
+                chosen_idx = self._binpack_select(group_members)
+                # Determine reason: did we land on the cache-best pod or rerouted within group?
+                if best_idx is not None and chosen_idx == best_idx:
+                    reason = "binpack_cache_direct"
+                else:
+                    reason = "binpack_group_reroute"
+            else:
+                # Group is full! Route to the group with lowest average load;
+                # break ties by lowest historical total requests
+                num_groups = (len(self.workers) + self.pods_per_group - 1) // self.pods_per_group
+                alt_group_loads = []
+                for g in range(num_groups):
+                    if g == target_group:
+                        continue
+                    members = self._get_group_members(g, healthy_indices)
+                    if members:
+                        avg_load = sum(self.workers[i].get_load() for i in members) / len(members)
+                        total_hist = sum(self.workers[i].get_total_req() for i in members)
+                        alt_group_loads.append((avg_load, total_hist, g))
+                best_alt_group = None
+                if alt_group_loads:
+                    best_alt_group = min(alt_group_loads)[2]
+                if best_alt_group is not None:
+                    alt_members = self._get_group_members(best_alt_group, healthy_indices)
+                    chosen_idx = self._binpack_select(alt_members)
+                else:
+                    # All groups full - absolute fallback to least loaded pod
+                    chosen_idx = min(healthy_indices, key=lambda i: (self.workers[i].get_load(), self.workers[i].get_total_req()))
+                reason = "binpack_group_overflow"
+
+            # Write to approx tree and increment load
+            engine_id = self._engine_ids[chosen_idx] if self._engine_ids and chosen_idx < len(self._engine_ids) else self.workers[chosen_idx].id
+            self._write_to_approx_tree(req, engine_id)
+            self.workers[chosen_idx].increment_load()
+            self._record_routing_decision(req, best_engine_id, best_hit, 0.0, engine_id, reason)
+            return chosen_idx
+
+        except Exception as e:
+            logger.error(f"BinPackPolicy.select_worker unexpected error: {e}", exc_info=True)
+            healthy_indices = [i for i, w in enumerate(self.workers) if w.is_healthy()]
+            if healthy_indices:
+                idx = healthy_indices[0]
+                self.workers[idx].increment_load()
+                return idx
+            return 0
+
+    def _binpack_select(self, candidates: list) -> int:
+        """Select pod within group using bin-packing: prefer highest load under capacity.
+
+        Strategy: Among pods whose load < bin_capacity, pick the one with highest load
+        (fill up one pod before moving to next). If all are at/over capacity, pick least loaded.
+        """
+        under_capacity = [(self.workers[i].get_load(), i) for i in candidates
+                          if self.workers[i].get_load() < self.bin_capacity]
+        if under_capacity:
+            # Pick highest loaded pod that's still under capacity (bin-pack: fill one up)
+            under_capacity.sort(reverse=True)
+            return under_capacity[0][1]
+        else:
+            # All at capacity: fall back to least loaded
+            return min(candidates, key=lambda i: (self.workers[i].get_load(), self.workers[i].get_total_req()))

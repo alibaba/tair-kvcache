@@ -500,6 +500,22 @@ class SGLangScheduleEmulator(ScheduleEmulator):
                     from schedule_simulator.infer_time_predictor.base import ScheduleBatch as SB, ScheduleRequest as SR
                     batch = SB(reqs=[SR(input_length=max(uncached, 1), past_kv_length=cached)])
                     latency = self.time_predictor.predict_infer_time(batch)
+
+            # Compute predicted latency for accuracy comparison
+            # ROUTE_AND_LATENCY: use trace cached_input_tokens as predictor input
+            # LATENCY_ONLY: use simulator prefix tree match result as predictor input
+            if self.timeline_mode == TimelineMode.ROUTE_AND_LATENCY:
+                pred_cached = req.timeline_cached_tokens if req.timeline_cached_tokens is not None else 0
+            else:
+                pred_cached = cached  # from simulator prefix tree match
+            pred_uncached = max(req.input_token_length - pred_cached, 1)
+            if hasattr(self.time_predictor, "predict_request_time"):
+                pred_latency = self.time_predictor.predict_request_time(pred_uncached, pred_cached)
+            else:
+                from schedule_simulator.infer_time_predictor.base import ScheduleBatch as SB, ScheduleRequest as SR
+                batch = SB(reqs=[SR(input_length=pred_uncached, past_kv_length=pred_cached)])
+                pred_latency = self.time_predictor.predict_infer_time(batch)
+            req.predicted_prefill_ms = pred_latency * 1000.0  # seconds -> ms
         else:
             if hasattr(self.time_predictor, "predict_request_time"):
                 latency = self.time_predictor.predict_request_time(max(uncached, 1), cached)

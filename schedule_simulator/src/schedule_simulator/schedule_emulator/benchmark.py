@@ -1,5 +1,10 @@
 import os
 import json
+try:
+    import orjson
+    _json_loads = orjson.loads
+except ImportError:
+    _json_loads = json.loads
 import numpy as np
 import asyncio
 from typing import AsyncGenerator, Optional
@@ -89,11 +94,19 @@ class BenchmarkEmulator:
         if raw_ids:
             # Check first element to determine format
             if raw_ids and isinstance(raw_ids[0], str):
-                int_ids = [self._to_int64(h) for h in raw_ids]
+                int_ids = self._hex_list_to_int64(raw_ids)
             else:
                 int_ids = raw_ids  # already int list
             return self._maybe_convert_block_ids(int_ids)
         return None
+
+    @staticmethod
+    def _hex_list_to_int64(hex_list):
+        """Batch convert hex strings to int64 using numpy (3x faster than loop)."""
+        hex_concat = ''.join(hex_list)
+        byte_data = bytes.fromhex(hex_concat)
+        arr = np.frombuffer(byte_data, dtype='>u8') % np.uint64(2**63)
+        return arr.astype(np.int64).tolist()
 
     @staticmethod
     def _normalize_timestamp(ts) -> float:
@@ -228,7 +241,7 @@ class BenchmarkEmulator:
 
     async def sample_request_from_file(self) -> AsyncGenerator[FakeRequest, None]:
         input_requests = []
-        with open(self.config.dataset_path) as f:
+        with open(self.config.dataset_path, "rb") as f:
             line = f.readline()
             id = 0
             index = 0
@@ -239,7 +252,7 @@ class BenchmarkEmulator:
                     index += 1
                     continue
                 index += 1
-                req: dict = json.loads(line)
+                req: dict = _json_loads(line)
                 # Filter by pod prefix if specified
                 if self.config.pod_prefix:
                     pods = req.get("pods", [])
@@ -303,6 +316,9 @@ class BenchmarkEmulator:
                             fl_ms = prefill_info.get("first_latency_ms")
                             if fl_ms is not None:
                                 new_req.timeline_prefill_ms = float(fl_ms)
+                            cached_tokens = prefill_info.get("cached_input_tokens")
+                            if cached_tokens is not None:
+                                new_req.timeline_cached_tokens = int(cached_tokens)
                     input_requests.append(new_req)
                 id += 1
                 line = f.readline()

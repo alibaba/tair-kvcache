@@ -35,7 +35,7 @@ def main():
     p.add_argument("--hbm-capacity", type=float, default=None, help="HBM capacity in GB (overrides hardware default)")
     p.add_argument("--num-p-instances", type=int, default=1)
     p.add_argument("--routing", type=str, default="round_robin",
-                   choices=["random","round_robin","power_of_two","cache_aware","cache_aware_old","direct_cache_aware"])
+                   choices=["random","round_robin","power_of_two","cache_aware","cache_aware_old","direct_cache_aware","bin_pack"])
     p.add_argument("--request-level", action="store_true")
     p.add_argument("--chunk-size", type=int, default=8192)
     p.add_argument("--kv-bytes-per-token", type=int, default=None,
@@ -65,6 +65,8 @@ def main():
     p.add_argument("--lmax", type=int, default=40, help="Max load baseline for normalization (Lmax)")
     p.add_argument("--weight-prefix", type=float, default=30.0, help="Prefix hit weight (wp) in scoring formula")
     p.add_argument("--weight-load", type=float, default=10.0, help="Load balance weight (wl) in scoring formula")
+    p.add_argument("--pods-per-group", type=int, default=None, help="Number of pods per group for BinPack routing (None=disabled)")
+    p.add_argument("--bin-capacity", type=int, default=None, help="Max inflight requests per pod in BinPack mode (None=disabled)")
     p.add_argument("--quiet", action="store_true")
     p.add_argument("--pod-prefix", type=str, default=None,
                    help="Filter records by pod name prefix (e.g. 'ds-acb49efe'). "
@@ -129,7 +131,7 @@ def main():
                     print("[WARN] No predictor specified, using default 0.1 ms/token")
 
     policy_map = {"random": RoutingPolicy.RANDOM, "round_robin": RoutingPolicy.ROUND_ROBIN,
-                  "power_of_two": RoutingPolicy.POWER_OF_TWO, "cache_aware": RoutingPolicy.CACHE_AWARE, "cache_aware_old": RoutingPolicy.CACHE_AWARE_OLD, "direct_cache_aware": RoutingPolicy.DIRECT_CACHE_AWARE}
+                  "power_of_two": RoutingPolicy.POWER_OF_TWO, "cache_aware": RoutingPolicy.CACHE_AWARE, "cache_aware_old": RoutingPolicy.CACHE_AWARE_OLD, "direct_cache_aware": RoutingPolicy.DIRECT_CACHE_AWARE, "bin_pack": RoutingPolicy.BIN_PACK}
 
     # Timeline replay setup
     from schedule_simulator.schedule_emulator.timeline_loader import TimelineLoader
@@ -168,7 +170,8 @@ def main():
             router_config=RouterConfig(p_policy=policy_map[args.routing],
                 d_policy=RoutingPolicy.ROUND_ROBIN, worker_startup_check_interval=0.01,
                 topk_routing=args.topk_routing, lmax=args.lmax,
-                weight_prefix=args.weight_prefix, weight_load=args.weight_load),
+                weight_prefix=args.weight_prefix, weight_load=args.weight_load,
+                pods_per_group=args.pods_per_group, bin_capacity=args.bin_capacity),
             num_p_instance=args.num_p_instances, num_d_instance=0,
             infer_time_predictor=predictor,
             enable_hierarchical=args.enable_hierarchical,

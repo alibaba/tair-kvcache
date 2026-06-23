@@ -33,6 +33,7 @@ from schedule_simulator.schedule_emulator.dispatch.dispatch_policy import (
     CacheAwarePolicy,
     CacheAwarePolicyOld,
     DirectCacheAwarePolicy,
+    BinPackPolicy,
 )
 from schedule_simulator.schedule_emulator.schedule_policy import SchedulePolicy
 from schedule_simulator.schedule_emulator.hierarchical_config_builder import build_hierarchical_config
@@ -199,6 +200,49 @@ class BenchmarkRunner:
         total["peer_hit_block_ratio"] = total_peer_hit_blocks / tb
         total["pool_hit_block_ratio"] = total_pool_hit_blocks / tb
         total["block_hit_ratio"] = total["total_blocks_hit"] / tb
+
+        # Compute group_hit vs external_peer_hit breakdown
+        pods_per_group = None
+        if hasattr(self, 'p_policy') and hasattr(self.p_policy, 'pods_per_group'):
+            pods_per_group = self.p_policy.pods_per_group
+        elif hasattr(self, 'policy') and hasattr(self.policy, 'pods_per_group'):
+            pods_per_group = self.policy.pods_per_group
+
+        total_group_hit_blocks = 0
+        total_external_peer_hit_blocks = 0
+        if pods_per_group and pods_per_group > 0:
+            # Build engine_id -> pod_idx mapping
+            all_scheds = self.p_schedulers + self.d_schedulers if hasattr(self, 'p_schedulers') else [self.scheduler_emulator]
+            engine_id_to_pod_idx = {}
+            for idx, s in enumerate(all_scheds):
+                if isinstance(s.tree_cache, HierarchicalCacheAdapter):
+                    engine_id_to_pod_idx[s.tree_cache.engine_id] = idx
+
+            for idx, s in enumerate(all_scheds):
+                if isinstance(s.tree_cache, HierarchicalCacheAdapter):
+                    my_group = idx // pods_per_group
+                    for rec in s.tree_cache.read_records:
+                        if rec.peer_hit > 0 and rec.peer_source_engine_id:
+                            src_idx = engine_id_to_pod_idx.get(rec.peer_source_engine_id)
+                            if src_idx is not None:
+                                src_group = src_idx // pods_per_group
+                                if src_group == my_group:
+                                    total_group_hit_blocks += rec.peer_hit
+                                else:
+                                    total_external_peer_hit_blocks += rec.peer_hit
+                            else:
+                                total_external_peer_hit_blocks += rec.peer_hit
+                        elif rec.peer_hit > 0:
+                            total_external_peer_hit_blocks += rec.peer_hit
+        else:
+            # No group config: all peer hits are external
+            total_external_peer_hit_blocks = total_peer_hit_blocks
+
+        total["total_group_hit_blocks"] = total_group_hit_blocks
+        total["total_external_peer_hit_blocks"] = total_external_peer_hit_blocks
+        total["group_hit_block_ratio"] = total_group_hit_blocks / tb
+        total["external_peer_hit_block_ratio"] = total_external_peer_hit_blocks / tb
+
         return total
 
     def analyze_hierarchical_results(self):
@@ -231,6 +275,34 @@ class BenchmarkRunner:
             for k, v in hier.items():
                 if k not in ("read_records", "write_records"):
                     summary["hierarchical_" + k] = v
+        # Routing reason statistics
+        if hasattr(self, 'p_policy') and hasattr(self.p_policy, 'get_routing_records'):
+            reason_counts = {}
+            routing_records = self.p_policy.get_routing_records()
+            for rec in routing_records:
+                r = rec.get("reason", "unknown")
+                reason_counts[r] = reason_counts.get(r, 0) + 1
+            total_routes = sum(reason_counts.values())
+            if total_routes > 0:
+                reason_stats = {}
+                for r, cnt in sorted(reason_counts.items(), key=lambda x: -x[1]):
+                    reason_stats[r] = {"count": cnt, "ratio": round(cnt / total_routes, 4)}
+                summary["routing_reason_stats"] = reason_stats
+
+        # Routing reason statistics
+        if hasattr(self, 'policy') and hasattr(self.policy, 'get_routing_records'):
+            reason_counts = {}
+            routing_records = self.policy.get_routing_records()
+            for rec in routing_records:
+                r = rec.get("reason", "unknown")
+                reason_counts[r] = reason_counts.get(r, 0) + 1
+            total_routes = sum(reason_counts.values())
+            if total_routes > 0:
+                reason_stats = {}
+                for r, cnt in sorted(reason_counts.items(), key=lambda x: -x[1]):
+                    reason_stats[r] = {"count": cnt, "ratio": round(cnt / total_routes, 4)}
+                summary["routing_reason_stats"] = reason_stats
+
         with open(os.path.join(output_dir, "simulation_summary.json"), "w") as f:
             _json.dump(summary, f, indent=2)
 
@@ -238,22 +310,55 @@ class BenchmarkRunner:
         hit_map = {}
         if hier and "read_records" in hier:
             for r in hier["read_records"]:
-                hit_map[r.req_id] = (r.engine_hit, r.peer_hit, r.pool_hit, r.num_blocks)
+                peer_src = getattr(r, 'peer_source_engine_id', '') or ''
+                hit_map[r.req_id] = (r.engine_hit, r.peer_hit, r.pool_hit, r.num_blocks, peer_src)
 
         with open(os.path.join(output_dir, "per_request.csv"), "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["req_id", "input_length", "output_length",
                         "ttft_ms", "e2e_latency_ms", "queue_wait_ms",
                         "cache_reused_tokens",
-                        "engine_hit", "peer_hit", "pool_hit", "num_blocks"])
+                        "engine_hit", "peer_hit", "pool_hit", "num_blocks",
+                        "group_hit", "external_peer_hit", "peer_source_engine_id"])
+            # Build engine_id -> pod_idx mapping for group classification
+            from schedule_simulator.schedule_emulator.hierarchical_cache_adapter import HierarchicalCacheAdapter as _HCA
+            req_engine_map = {}
+            all_s = self.p_schedulers + self.d_schedulers if hasattr(self, 'p_schedulers') else [self.scheduler_emulator]
+            for idx2, s2 in enumerate(all_s):
+                if isinstance(s2.tree_cache, _HCA):
+                    req_engine_map[s2.tree_cache.engine_id] = idx2
+            req_pods_per_group = None
+            if hasattr(self, 'p_policy') and hasattr(self.p_policy, 'pods_per_group'):
+                req_pods_per_group = self.p_policy.pods_per_group
+
+            # Pre-build request_id -> pod_idx mapping (O(N) once instead of O(R*N))
+            req_to_pod_idx = {}
+            if req_pods_per_group and req_pods_per_group > 0:
+                for idx3, s3 in enumerate(all_s):
+                    for completed_req in s3.completed_requests:
+                        req_to_pod_idx[id(completed_req)] = idx3
+
             for req in sorted(results, key=lambda r: r.id):
                 ttft = req.gen_token_latencies[0] * 1000 if req.gen_token_latencies else 0
                 e2e = sum(req.gen_token_latencies) * 1000
                 qw = (req.queue_time_end - req.queue_time_start) * 1000 if req.queue_time_start >= 0 else 0
-                eh, ph, sh, nb = hit_map.get(req.id, (0, 0, 0, 0))
+                eh, ph, sh, nb, peer_src = hit_map.get(req.id, (0, 0, 0, 0, ""))
+                # Compute group_hit vs external_peer_hit
+                gh, eph = 0, ph
+                if ph > 0 and peer_src and req_pods_per_group and req_pods_per_group > 0:
+                    current_pod_idx = req_to_pod_idx.get(id(req))
+                    if current_pod_idx is not None:
+                        my_group = current_pod_idx // req_pods_per_group
+                        src_idx = req_engine_map.get(peer_src)
+                        if src_idx is not None:
+                            src_group = src_idx // req_pods_per_group
+                            if src_group == my_group:
+                                gh, eph = ph, 0
+                            else:
+                                gh, eph = 0, ph
                 w.writerow([req.id, req.input_token_length, req.output_token_length,
                             round(ttft, 3), round(e2e, 3), round(qw, 3),
-                            req.final_reused_tokens, eh, ph, sh, nb])
+                            req.final_reused_tokens, eh, ph, sh, nb, gh, eph, peer_src])
 
         # 3. Per-iteration CSV
         with open(os.path.join(output_dir, "per_iteration.csv"), "w", newline="") as f:
@@ -273,11 +378,23 @@ class BenchmarkRunner:
         # 4. Per-pod stats CSV
         from schedule_simulator.schedule_emulator.hierarchical_cache_adapter import HierarchicalCacheAdapter
         all_scheds = self.p_schedulers + self.d_schedulers if hasattr(self, 'p_schedulers') else [self.scheduler_emulator]
+
+        # Build engine_id -> pod_idx mapping for group classification
+        engine_id_to_pod_idx = {}
+        for idx, s in enumerate(all_scheds):
+            if isinstance(s.tree_cache, HierarchicalCacheAdapter):
+                engine_id_to_pod_idx[s.tree_cache.engine_id] = idx
+
+        # Get pods_per_group from policy config
+        pods_per_group = None
+        if hasattr(self, 'p_policy') and hasattr(self.p_policy, 'pods_per_group'):
+            pods_per_group = self.p_policy.pods_per_group
+
         with open(os.path.join(output_dir, "per_pod_stats.csv"), "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["pod", "total_requests", "total_input_tokens", "total_output_tokens",
                         "total_blocks", "total_engine_hit_blocks", "total_peer_hit_blocks",
-                        "total_pool_hit_blocks"])
+                        "total_pool_hit_blocks", "total_group_hit_blocks", "total_external_peer_hit_blocks"])
             num_p = len(self.p_schedulers) if hasattr(self, 'p_schedulers') else len(all_scheds)
             for i, sched in enumerate(all_scheds):
                 pod_name = "P%d" % i if i < num_p else "D%d" % (i - num_p)
@@ -290,12 +407,32 @@ class BenchmarkRunner:
                 engine_hit = 0
                 peer_hit = 0
                 pool_hit = 0
+                group_hit = 0
+                external_peer_hit = 0
                 if isinstance(sched.tree_cache, HierarchicalCacheAdapter):
                     engine_hit = sched.tree_cache.total_engine_hit_blocks
                     peer_hit = sched.tree_cache.total_peer_hit_blocks
                     pool_hit = sched.tree_cache.total_pool_hit_blocks
+                    # Classify peer_hit into group_hit and external_peer_hit
+                    if pods_per_group and pods_per_group > 0:
+                        my_group = i // pods_per_group
+                        for rec in sched.tree_cache.read_records:
+                            if rec.peer_hit > 0 and rec.peer_source_engine_id:
+                                src_idx = engine_id_to_pod_idx.get(rec.peer_source_engine_id)
+                                if src_idx is not None:
+                                    src_group = src_idx // pods_per_group
+                                    if src_group == my_group:
+                                        group_hit += rec.peer_hit
+                                    else:
+                                        external_peer_hit += rec.peer_hit
+                                else:
+                                    external_peer_hit += rec.peer_hit
+                            elif rec.peer_hit > 0:
+                                external_peer_hit += rec.peer_hit
+                    else:
+                        external_peer_hit = peer_hit  # No group info, all peer = external
                 w.writerow([pod_name, total_reqs, total_input, total_output,
-                            total_blocks, engine_hit, peer_hit, pool_hit])
+                            total_blocks, engine_hit, peer_hit, pool_hit, group_hit, external_peer_hit])
     def get_response_results(self) -> list[FakeRequest]:
         return self.benchmark_emulator.get_response_results()
 
@@ -512,6 +649,8 @@ class DisaggBenchmarkRunner:
             return CacheAwarePolicyOld(num_schedulers, config)
         elif policy_name == RoutingPolicy.DIRECT_CACHE_AWARE:
             return DirectCacheAwarePolicy(num_schedulers, config)
+        elif policy_name == RoutingPolicy.BIN_PACK:
+            return BinPackPolicy(num_schedulers, config, scheduler_config=scheduler_config, platform_config=platform_config)
         else:
             raise ValueError(f"Unknown policy: {policy_name}")
 
@@ -756,6 +895,49 @@ class DisaggBenchmarkRunner:
         total["peer_hit_block_ratio"] = total_peer_hit_blocks / tb
         total["pool_hit_block_ratio"] = total_pool_hit_blocks / tb
         total["block_hit_ratio"] = total["total_blocks_hit"] / tb
+
+        # Compute group_hit vs external_peer_hit breakdown
+        pods_per_group = None
+        if hasattr(self, 'p_policy') and hasattr(self.p_policy, 'pods_per_group'):
+            pods_per_group = self.p_policy.pods_per_group
+        elif hasattr(self, 'policy') and hasattr(self.policy, 'pods_per_group'):
+            pods_per_group = self.policy.pods_per_group
+
+        total_group_hit_blocks = 0
+        total_external_peer_hit_blocks = 0
+        if pods_per_group and pods_per_group > 0:
+            # Build engine_id -> pod_idx mapping
+            all_scheds = self.p_schedulers + self.d_schedulers if hasattr(self, 'p_schedulers') else [self.scheduler_emulator]
+            engine_id_to_pod_idx = {}
+            for idx, s in enumerate(all_scheds):
+                if isinstance(s.tree_cache, HierarchicalCacheAdapter):
+                    engine_id_to_pod_idx[s.tree_cache.engine_id] = idx
+
+            for idx, s in enumerate(all_scheds):
+                if isinstance(s.tree_cache, HierarchicalCacheAdapter):
+                    my_group = idx // pods_per_group
+                    for rec in s.tree_cache.read_records:
+                        if rec.peer_hit > 0 and rec.peer_source_engine_id:
+                            src_idx = engine_id_to_pod_idx.get(rec.peer_source_engine_id)
+                            if src_idx is not None:
+                                src_group = src_idx // pods_per_group
+                                if src_group == my_group:
+                                    total_group_hit_blocks += rec.peer_hit
+                                else:
+                                    total_external_peer_hit_blocks += rec.peer_hit
+                            else:
+                                total_external_peer_hit_blocks += rec.peer_hit
+                        elif rec.peer_hit > 0:
+                            total_external_peer_hit_blocks += rec.peer_hit
+        else:
+            # No group config: all peer hits are external
+            total_external_peer_hit_blocks = total_peer_hit_blocks
+
+        total["total_group_hit_blocks"] = total_group_hit_blocks
+        total["total_external_peer_hit_blocks"] = total_external_peer_hit_blocks
+        total["group_hit_block_ratio"] = total_group_hit_blocks / tb
+        total["external_peer_hit_block_ratio"] = total_external_peer_hit_blocks / tb
+
         return total
 
     def analyze_hierarchical_results(self):
@@ -788,6 +970,45 @@ class DisaggBenchmarkRunner:
             for k, v in hier.items():
                 if k not in ("read_records", "write_records"):
                     summary["hierarchical_" + k] = v
+        # Predictor accuracy comparison (only when timeline latency is available)
+        predictor_pairs = []
+        for req in results:
+            if req.timeline_prefill_ms is not None and req.predicted_prefill_ms is not None:
+                predictor_pairs.append((req.timeline_prefill_ms, req.predicted_prefill_ms))
+        if predictor_pairs:
+            import math
+            actual_vals = [p[0] for p in predictor_pairs]
+            pred_vals = [p[1] for p in predictor_pairs]
+            abs_errors = [abs(a - p) for a, p in predictor_pairs]
+            rel_errors = [abs(a - p) / max(a, 1e-6) for a, p in predictor_pairs]
+            sq_errors = [(a - p) ** 2 for a, p in predictor_pairs]
+            n = len(predictor_pairs)
+            summary["predictor_accuracy"] = {
+                "num_samples": n,
+                "mae_ms": round(sum(abs_errors) / n, 3),
+                "mape_pct": round(sum(rel_errors) / n * 100, 2),
+                "rmse_ms": round(math.sqrt(sum(sq_errors) / n), 3),
+                "median_abs_error_ms": round(sorted(abs_errors)[n // 2], 3),
+                "p90_abs_error_ms": round(sorted(abs_errors)[int(n * 0.9)], 3),
+                "p99_abs_error_ms": round(sorted(abs_errors)[min(int(n * 0.99), n - 1)], 3),
+                "mean_actual_ms": round(sum(actual_vals) / n, 3),
+                "mean_predicted_ms": round(sum(pred_vals) / n, 3),
+            }
+
+        # Routing reason statistics
+        if hasattr(self, 'p_policy') and hasattr(self.p_policy, 'get_routing_records'):
+            reason_counts = {}
+            routing_records = self.p_policy.get_routing_records()
+            for rec in routing_records:
+                r = rec.get("reason", "unknown")
+                reason_counts[r] = reason_counts.get(r, 0) + 1
+            total_routes = sum(reason_counts.values())
+            if total_routes > 0:
+                reason_stats = {}
+                for r, cnt in sorted(reason_counts.items(), key=lambda x: -x[1]):
+                    reason_stats[r] = {"count": cnt, "ratio": round(cnt / total_routes, 4)}
+                summary["routing_reason_stats"] = reason_stats
+
         with open(os.path.join(output_dir, "simulation_summary.json"), "w") as f:
             _json.dump(summary, f, indent=2)
 
@@ -795,22 +1016,67 @@ class DisaggBenchmarkRunner:
         hit_map = {}
         if hier and "read_records" in hier:
             for r in hier["read_records"]:
-                hit_map[r.req_id] = (r.engine_hit, r.peer_hit, r.pool_hit, r.num_blocks)
+                peer_src = getattr(r, 'peer_source_engine_id', '') or ''
+                hit_map[r.req_id] = (r.engine_hit, r.peer_hit, r.pool_hit, r.num_blocks, peer_src)
+
+        # Check if any request has timeline latency data (for conditional columns)
+        has_timeline_latency = any(
+            req.timeline_prefill_ms is not None for req in results
+        )
 
         with open(os.path.join(output_dir, "per_request.csv"), "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["req_id", "input_length", "output_length",
-                        "ttft_ms", "e2e_latency_ms", "queue_wait_ms",
-                        "cache_reused_tokens",
-                        "engine_hit", "peer_hit", "pool_hit", "num_blocks"])
+            header = ["req_id", "input_length", "output_length",
+                      "ttft_ms", "e2e_latency_ms", "queue_wait_ms",
+                      "cache_reused_tokens",
+                      "engine_hit", "peer_hit", "pool_hit", "num_blocks",
+                      "group_hit", "external_peer_hit", "peer_source_engine_id"]
+            if has_timeline_latency:
+                header.extend(["timeline_prefill_ms", "predicted_prefill_ms"])
+            w.writerow(header)
+            # Build engine_id -> pod_idx mapping for group classification
+            from schedule_simulator.schedule_emulator.hierarchical_cache_adapter import HierarchicalCacheAdapter as _HCA2
+            req_engine_map2 = {}
+            for idx2, s2 in enumerate(self.p_schedulers + self.d_schedulers):
+                if isinstance(s2.tree_cache, _HCA2):
+                    req_engine_map2[s2.tree_cache.engine_id] = idx2
+            req_pods_per_group2 = None
+            if hasattr(self, 'p_policy') and hasattr(self.p_policy, 'pods_per_group'):
+                req_pods_per_group2 = self.p_policy.pods_per_group
+
+            # Pre-build request_id -> pod_idx mapping (O(N) once instead of O(R*N))
+            req_to_pod_idx2 = {}
+            if req_pods_per_group2 and req_pods_per_group2 > 0:
+                for idx3, s3 in enumerate(self.p_schedulers + self.d_schedulers):
+                    for completed_req in s3.completed_requests:
+                        req_to_pod_idx2[id(completed_req)] = idx3
+
             for req in sorted(results, key=lambda r: r.id):
                 ttft = req.gen_token_latencies[0] * 1000 if req.gen_token_latencies else 0
                 e2e = sum(req.gen_token_latencies) * 1000
                 qw = (req.queue_time_end - req.queue_time_start) * 1000 if req.queue_time_start >= 0 else 0
-                eh, ph, sh, nb = hit_map.get(req.id, (0, 0, 0, 0))
-                w.writerow([req.id, req.input_token_length, req.output_token_length,
-                            round(ttft, 3), round(e2e, 3), round(qw, 3),
-                            req.final_reused_tokens, eh, ph, sh, nb])
+                eh, ph, sh, nb, peer_src = hit_map.get(req.id, (0, 0, 0, 0, ""))
+                gh, eph = 0, ph  # Default: all peer hits are external
+                if ph > 0 and peer_src and req_pods_per_group2 and req_pods_per_group2 > 0:
+                    current_pod_idx = req_to_pod_idx2.get(id(req))
+                    if current_pod_idx is not None:
+                        my_group = current_pod_idx // req_pods_per_group2
+                        src_idx = req_engine_map2.get(peer_src)
+                        if src_idx is not None:
+                            src_group = src_idx // req_pods_per_group2
+                            if src_group == my_group:
+                                gh, eph = ph, 0
+                            else:
+                                gh, eph = 0, ph
+                row = [req.id, req.input_token_length, req.output_token_length,
+                       round(ttft, 3), round(e2e, 3), round(qw, 3),
+                       req.final_reused_tokens, eh, ph, sh, nb, gh, eph, peer_src]
+                if has_timeline_latency:
+                    row.extend([
+                        round(req.timeline_prefill_ms, 3) if req.timeline_prefill_ms is not None else "",
+                        round(req.predicted_prefill_ms, 3) if req.predicted_prefill_ms is not None else "",
+                    ])
+                w.writerow(row)
 
         # 3. Per-iteration CSV
         with open(os.path.join(output_dir, "per_iteration.csv"), "w", newline="") as f:
@@ -829,12 +1095,25 @@ class DisaggBenchmarkRunner:
 
         # 4. Per-pod stats CSV
         from schedule_simulator.schedule_emulator.hierarchical_cache_adapter import HierarchicalCacheAdapter
+        all_scheds_export = self.p_schedulers + self.d_schedulers
+
+        # Build engine_id -> pod_idx mapping for group classification
+        engine_id_to_pod_idx = {}
+        for idx, s in enumerate(all_scheds_export):
+            if isinstance(s.tree_cache, HierarchicalCacheAdapter):
+                engine_id_to_pod_idx[s.tree_cache.engine_id] = idx
+
+        # Get pods_per_group from policy config
+        pods_per_group = None
+        if hasattr(self, 'p_policy') and hasattr(self.p_policy, 'pods_per_group'):
+            pods_per_group = self.p_policy.pods_per_group
+
         with open(os.path.join(output_dir, "per_pod_stats.csv"), "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["pod", "total_requests", "total_input_tokens", "total_output_tokens",
                         "total_blocks", "total_engine_hit_blocks", "total_peer_hit_blocks",
-                        "total_pool_hit_blocks"])
-            for i, sched in enumerate(self.p_schedulers + self.d_schedulers):
+                        "total_pool_hit_blocks", "total_group_hit_blocks", "total_external_peer_hit_blocks"])
+            for i, sched in enumerate(all_scheds_export):
                 pod_name = "P%d" % i if i < len(self.p_schedulers) else "D%d" % (i - len(self.p_schedulers))
                 completed = sched.completed_requests
                 total_reqs = len(completed)
@@ -845,12 +1124,32 @@ class DisaggBenchmarkRunner:
                 engine_hit = 0
                 peer_hit = 0
                 pool_hit = 0
+                group_hit = 0
+                external_peer_hit = 0
                 if isinstance(sched.tree_cache, HierarchicalCacheAdapter):
                     engine_hit = sched.tree_cache.total_engine_hit_blocks
                     peer_hit = sched.tree_cache.total_peer_hit_blocks
                     pool_hit = sched.tree_cache.total_pool_hit_blocks
+                    # Classify peer_hit into group_hit and external_peer_hit
+                    if pods_per_group and pods_per_group > 0:
+                        my_group = i // pods_per_group
+                        for rec in sched.tree_cache.read_records:
+                            if rec.peer_hit > 0 and rec.peer_source_engine_id:
+                                src_idx = engine_id_to_pod_idx.get(rec.peer_source_engine_id)
+                                if src_idx is not None:
+                                    src_group = src_idx // pods_per_group
+                                    if src_group == my_group:
+                                        group_hit += rec.peer_hit
+                                    else:
+                                        external_peer_hit += rec.peer_hit
+                                else:
+                                    external_peer_hit += rec.peer_hit
+                            elif rec.peer_hit > 0:
+                                external_peer_hit += rec.peer_hit
+                    else:
+                        external_peer_hit = peer_hit  # No group info, all peer = external
                 w.writerow([pod_name, total_reqs, total_input, total_output,
-                            total_blocks, engine_hit, peer_hit, pool_hit])
+                            total_blocks, engine_hit, peer_hit, pool_hit, group_hit, external_peer_hit])
 
         # 5. Routing decisions JSONL
         if hasattr(self, 'p_policy') and hasattr(self.p_policy, 'get_routing_records'):

@@ -23,6 +23,7 @@ class HierarchicalHitRecord:
     total_hit: int = 0
     input_length: int = 0
     num_blocks: int = 0
+    peer_source_engine_id: str = ""  # Engine ID that provided peer cache hit
 
 
 @dataclass
@@ -73,6 +74,8 @@ class HierarchicalCacheAdapter(PrefixCache):
         self.total_engine_hit_blocks: int = 0
         self.total_peer_hit_blocks: int = 0
         self.total_pool_hit_blocks: int = 0
+        self.total_group_hit_blocks: int = 0       # Peer hits from same group
+        self.total_external_peer_hit_blocks: int = 0  # Peer hits from other groups
 
         self.read_records: list[HierarchicalHitRecord] = []
         self.write_records: list[HierarchicalWriteRecord] = []
@@ -112,6 +115,12 @@ class HierarchicalCacheAdapter(PrefixCache):
         req.host_cache_hit_length = res.peer_hit_length
         req.disk_cache_hit_length = res.storage_pool_hit_length
 
+        # Capture peer source engine ID (available when C++ exposes it)
+        peer_source_id = ""
+        if hasattr(res, "peer_source_infer_id"):
+            peer_source_id = res.peer_source_infer_id or ""
+        req.peer_source_engine_id = peer_source_id
+
         self.total_engine_hit_blocks += res.engine_hit_length
         self.total_peer_hit_blocks += res.peer_hit_length
         self.total_pool_hit_blocks += res.storage_pool_hit_length
@@ -125,6 +134,7 @@ class HierarchicalCacheAdapter(PrefixCache):
             total_hit=res.total_hit_length,
             input_length=req.input_token_length,
             num_blocks=len(full_block_ids),
+            peer_source_engine_id=peer_source_id,
         ))
 
         super().add_to_prefetch_queue(req)

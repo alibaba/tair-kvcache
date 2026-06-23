@@ -201,7 +201,8 @@ PYBIND11_MODULE(kvcm_py_optimizer, module) {
         .def_readonly("engine_hit_length", &kvcm::HierarchicalGetCacheLocationRes::engine_hit_length)
         .def_readonly("peer_hit_length", &kvcm::HierarchicalGetCacheLocationRes::peer_hit_length)
         .def_readonly("storage_pool_hit_length", &kvcm::HierarchicalGetCacheLocationRes::storage_pool_hit_length)
-        .def_readonly("total_hit_length", &kvcm::HierarchicalGetCacheLocationRes::total_hit_length);
+        .def_readonly("total_hit_length", &kvcm::HierarchicalGetCacheLocationRes::total_hit_length)
+        .def_readonly("peer_source_infer_id", &kvcm::HierarchicalGetCacheLocationRes::peer_source_infer_id);
 
     // HierarchicalReplayConfigLoader
     py::class_<kvcm::HierarchicalReplayConfigLoader>(module, "HierarchicalReplayConfigLoader")

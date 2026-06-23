@@ -573,6 +573,7 @@ HierarchicalGetCacheLocationRes HierarchicalReplayManager::GetCacheLocation(cons
     res.peer_hit_length = static_cast<int64_t>(peer_hit_indices.size());
     res.storage_pool_hit_length = static_cast<int64_t>(storage_pool_hit_blocks);
     res.total_hit_length = static_cast<int64_t>(engine_hit_blocks + peer_hit_indices.size() + storage_pool_hit_blocks);
+    res.peer_source_infer_id = record.peer_source_infer_id;
     return res;
 }
 

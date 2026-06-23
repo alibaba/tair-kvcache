@@ -67,6 +67,7 @@ class RoutingPolicy(Enum):
     POWER_OF_TWO = "power_of_two"
     ROUND_ROBIN = "round_robin"
     DIRECT_CACHE_AWARE = "direct_cache_aware"
+    BIN_PACK = "bin_pack"
 
 
 class TimelineMode(str, Enum):
@@ -102,6 +103,9 @@ class RouterConfig:
     lmax: int = 40                   # 满载基准 (Lmax in scoring formula)
     weight_prefix: float = 30.0      # 前缀命中权重 (wp)
     weight_load: float = 10.0        # 负载均衡权重 (wl)
+    # BinPack group settings
+    pods_per_group: Optional[int] = None   # Number of pods per group (None = disabled)
+    bin_capacity: Optional[int] = None     # Max inflight requests per pod in bin-pack mode
 
     @classmethod
     def from_string_policy(
@@ -271,6 +275,9 @@ class FakeRequest:
     # Timeline replay fields
     timeline_pod_name: Optional[str] = None
     timeline_prefill_ms: Optional[float] = None
+    timeline_cached_tokens: Optional[int] = None  # cached tokens from trace prefill info
+    predicted_prefill_ms: Optional[float] = None  # predicted latency from time predictor
+    peer_source_engine_id: str = ""  # Engine ID that provided peer cache hit (from C++ GetCacheLocation)
 
     def __eq__(self, req):
         if not isinstance(req, FakeRequest):

@@ -69,7 +69,7 @@ class TestPerPodStatsExport:
 
         expected_cols = {"pod", "total_requests", "total_input_tokens", "total_output_tokens",
                          "total_blocks", "total_engine_hit_blocks", "total_peer_hit_blocks",
-                         "total_pool_hit_blocks"}
+                         "total_pool_hit_blocks", "total_group_hit_blocks", "total_external_peer_hit_blocks"}
         assert set(rows[0].keys()) == expected_cols
 
     def test_per_pod_stats_row_count_matches_instances(self):

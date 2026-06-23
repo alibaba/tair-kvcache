@@ -24,6 +24,7 @@ struct HierarchicalGetCacheLocationRes {
     int64_t peer_hit_length = 0;
     int64_t storage_pool_hit_length = 0;
     int64_t total_hit_length = 0;
+    std::string peer_source_infer_id;
 };
 
 
