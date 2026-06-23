@@ -1,0 +1,25 @@
+name: Aliyun ECS Runner POC
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - codex/aliyun-ecs-poc-runner-20260623
+
+jobs:
+  trigger-aliyun-ecs-runner:
+    name: Trigger Aliyun ECS scale set runner
+    runs-on: aliyun-ecs-poc
+    timeout-minutes: 10
+    steps:
+      - name: Print runner context
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "runner_name=${RUNNER_NAME}"
+          echo "runner_os=${RUNNER_OS}"
+          echo "github_repository=${GITHUB_REPOSITORY}"
+          echo "github_ref=${GITHUB_REF}"
+          uname -a
+          pwd
+          ls -la /home/runner || true
