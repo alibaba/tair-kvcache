@@ -67,6 +67,8 @@ def main():
     p.add_argument("--weight-load", type=float, default=10.0, help="Load balance weight (wl) in scoring formula")
     p.add_argument("--pods-per-group", type=int, default=None, help="Number of pods per group for BinPack routing (None=disabled)")
     p.add_argument("--bin-capacity", type=int, default=None, help="Max inflight requests per pod in BinPack mode (None=disabled)")
+    p.add_argument("--export-routing-decisions", action="store_true",
+                   help="Export routing_decisions.jsonl (default off, file can be very large)")
     p.add_argument("--quiet", action="store_true")
     p.add_argument("--pod-prefix", type=str, default=None,
                    help="Filter records by pod name prefix (e.g. 'ds-acb49efe'). "
@@ -190,7 +192,7 @@ def main():
     m = runner.run_benchmark_emulation()
     os.makedirs(args.output_dir, exist_ok=True)
     if hasattr(runner, "export_results"):
-        runner.export_results(args.output_dir, m)
+        runner.export_results(args.output_dir, m, export_routing_decisions=args.export_routing_decisions)
     else:
         with open(os.path.join(args.output_dir, "simulation_summary.json"), "w") as f:
             json.dump(m, f, indent=2)

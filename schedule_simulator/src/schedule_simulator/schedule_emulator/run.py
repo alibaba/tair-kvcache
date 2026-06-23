@@ -250,7 +250,7 @@ class BenchmarkRunner:
             self.hierarchical_manager.AnalyzeResults()
 
 
-    def export_results(self, output_dir: str, metrics: dict = None):
+    def export_results(self, output_dir: str, metrics: dict = None, export_routing_decisions: bool = False):
         """Export simulation results to files: summary JSON, per-request CSV, per-iteration CSV."""
         import json as _json
         os.makedirs(output_dir, exist_ok=True)
@@ -945,7 +945,7 @@ class DisaggBenchmarkRunner:
             self.hierarchical_manager.AnalyzeResults()
 
 
-    def export_results(self, output_dir: str, metrics: dict = None):
+    def export_results(self, output_dir: str, metrics: dict = None, export_routing_decisions: bool = False):
         """Export simulation results to files: summary JSON, per-request CSV, per-iteration CSV."""
         import json as _json
         os.makedirs(output_dir, exist_ok=True)
@@ -1151,8 +1151,8 @@ class DisaggBenchmarkRunner:
                 w.writerow([pod_name, total_reqs, total_input, total_output,
                             total_blocks, engine_hit, peer_hit, pool_hit, group_hit, external_peer_hit])
 
-        # 5. Routing decisions JSONL
-        if hasattr(self, 'p_policy') and hasattr(self.p_policy, 'get_routing_records'):
+        # 5. Routing decisions JSONL (only when explicitly enabled)
+        if export_routing_decisions and hasattr(self, 'p_policy') and hasattr(self.p_policy, 'get_routing_records'):
             records = self.p_policy.get_routing_records()
             if records:
                 with open(os.path.join(output_dir, "routing_decisions.jsonl"), "w") as f:
