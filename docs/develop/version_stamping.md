@@ -30,7 +30,7 @@ build --workspace_status_command=bazel/workspace_status.sh
 | `STABLE_GIT_COMMIT_FULL` | `2cd6c5a9...` | git 完整 commit hash |
 | `STABLE_GIT_REPO` | `git@github.com:alibaba/tair-kvcache.git` | 远程仓库地址 |
 | `STABLE_KVCM_VERSION` | `0.0.1` | 语义版本号 |
-| `STABLE_BUILD_TIMESTAMP` | `20260409.113826` | 构建日期+时间，用于完整版本号，避免同日同 commit 打包冲突 |
+| `STABLE_BUILD_TIMESTAMP` | `20260409113826` | 构建日期+时间，用于完整版本号，避免同 commit 打包冲突 |
 | `BUILD_DATE` | `20260409` | 构建日期 |
 | `BUILD_TIME` | `2026-04-09 11:38:26` | 构建时间 |
 
@@ -59,7 +59,7 @@ py_wheel(
 )
 ```
 
-最终 wheel 内部的版本号为 `0.0.1+20260409.113826.2cd6c5a9`（符合 [PEP 440](https://peps.python.org/pep-0440/) local version 规范）。
+最终 wheel 内部的版本号为 `0.0.1+20260409113826.2cd6c5a9`（符合 [PEP 440](https://peps.python.org/pep-0440/) local version 规范）。
 
 > **注意**：Bazel 输出路径中的文件名在分析阶段确定，仍包含字面占位符。使用 `.dist` 后缀目标（如 `bazel build :my_wheel.dist`）可在 `dist/` 目录下获得正确文件名的 wheel 文件。
 
@@ -71,10 +71,10 @@ py_wheel(
 {STABLE_KVCM_VERSION}+{STABLE_BUILD_TIMESTAMP}.{STABLE_GIT_COMMIT}
 ```
 
-示例：`0.0.1+20260409.113826.2cd6c5a9`
+示例：`0.0.1+20260409113826.2cd6c5a9`
 
 - `0.0.1`：语义版本号，在 `bazel/workspace_status.sh` 中定义
-- `20260409.113826`：构建日期+时间
+- `20260409113826`：构建日期+时间，使用单个数字段避免 PEP 440 对纯数字 local version segment 去除前导零
 - `2cd6c5a9`：git commit 短 hash
 
 ## 文件结构
@@ -121,9 +121,9 @@ logger.info("version: %s (commit: %s, build: %s)", FULL_VERSION, GIT_COMMIT, BUI
 | `GIT_COMMIT_FULL` | str | `"2cd6c5a9..."` | 完整 commit hash |
 | `GIT_REPO` | str | `"git@github.com:..."` | 远程仓库地址 |
 | `BUILD_DATE` | str | `"20260409"` | 构建日期 |
-| `BUILD_TIMESTAMP` | str | `"20260409.113826"` | 构建日期+时间 |
+| `BUILD_TIMESTAMP` | str | `"20260409113826"` | 构建日期+时间 |
 | `BUILD_TIME` | str | `"2026-04-09 11:38:26"` | 构建时间 |
-| `FULL_VERSION` | str | `"0.0.1+20260409.113826.2cd6c5a9"` | 完整版本号 |
+| `FULL_VERSION` | str | `"0.0.1+20260409113826.2cd6c5a9"` | 完整版本号 |
 
 ### 为 C++ 组件接入版本信息
 
@@ -154,9 +154,9 @@ cc_library(
 // kKvcmGitCommitFull - "2cd6c5a9..."
 // kKvcmGitRepo       - "git@github.com:..."
 // kKvcmBuildDate     - "20260409"
-// kKvcmBuildTimestamp - "20260409.113826"
+// kKvcmBuildTimestamp - "20260409113826"
 // kKvcmBuildTime     - "2026-04-09 11:38:26"
-// kKvcmFullVersion   - "0.0.1+20260409.113826.2cd6c5a9"
+// kKvcmFullVersion   - "0.0.1+20260409113826.2cd6c5a9"
 
 std::cout << "Version: " << kKvcmFullVersion << std::endl;
 ```
@@ -183,7 +183,7 @@ bazel build //path/to:my_package
 # 推荐：使用 .dist 目标获取正确文件名
 bazel build //path/to:my_package.dist
 # 输出位于 bazel-bin/path/to/my_package.dist/
-# 文件名示例：my_package-0.0.1+20260409.113826.2cd6c5a9-cp310-cp310-linux_x86_64.whl
+# 文件名示例：my_package-0.0.1+20260409113826.2cd6c5a9-cp310-cp310-linux_x86_64.whl
 ```
 
 ## 当前接入组件
@@ -212,6 +212,6 @@ echo "STABLE_KVCM_VERSION 0.0.1"
 
 - `workspace_status.sh` 中的所有 git 命令都有 `|| echo unknown` 兜底，git 信息会退化为 `unknown`
 - `STABLE_KVCM_VERSION`、`STABLE_BUILD_TIMESTAMP`、`BUILD_DATE`、`BUILD_TIME` 不依赖 git，不受影响
-- 最终版本号为 `0.0.1+20260409.113826.unknown`，PEP 440 合法
+- 最终版本号为 `0.0.1+20260409113826.unknown`，PEP 440 合法
 - py_wheel stamp 中 `{STABLE_GIT_COMMIT}` 被替换为 `unknown`，wheel 正常构建
-- C++ 宏同理，编译不受影响
+- C++ 常量同理，编译不受影响

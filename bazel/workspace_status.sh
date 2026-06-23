@@ -12,6 +12,6 @@ echo "STABLE_GIT_REPO $(git remote get-url origin 2>/dev/null || echo unknown)"
 echo "STABLE_KVCM_VERSION 0.0.1"
 # Used by py_wheel version templates; keep stable so repeat packaging for the
 # same commit invalidates the cached wheel action and gets a fresh version.
-echo "STABLE_BUILD_TIMESTAMP $(date +%Y%m%d.%H%M%S)"
+echo "STABLE_BUILD_TIMESTAMP $(date +%Y%m%d%H%M%S)"
 echo "BUILD_DATE $(date +%Y%m%d)"
 echo "BUILD_TIME $(date '+%Y-%m-%d %H:%M:%S')"
