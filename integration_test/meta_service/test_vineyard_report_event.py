@@ -184,7 +184,7 @@ def _build_vineyard_uri(host_ip_port, medium, params=None):
 # ---------------------------------------------------------------------------
 class VineyardReportEventFunctionalTest(unittest.TestCase):
     HOST = "192.168.1.200:8080"
-    VINEYARD_STORAGE_NAME = "v6d_v6d_cluster_0"
+    VINEYARD_STORAGE_NAME = "vineyard_default"
 
     @classmethod
     def setUpClass(cls):

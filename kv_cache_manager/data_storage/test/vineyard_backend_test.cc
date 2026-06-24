@@ -24,7 +24,7 @@ public:
         spec->set_heartbeat_timeout_ms(hb_timeout_ms);
         spec->set_cleanup_grace_ms(cleanup_grace_ms);
         spec->set_liveness_check_interval_ms(check_interval_ms);
-        return StorageConfig(DataStorageType::DATA_STORAGE_TYPE_VINEYARD, "v6d_v6d_cluster_test", spec);
+        return StorageConfig(DataStorageType::DATA_STORAGE_TYPE_VINEYARD, "vineyard_test_group", spec);
     }
 
     std::shared_ptr<MetricsRegistry> metrics_registry_;
@@ -55,7 +55,7 @@ TEST_F(VineyardBackendTest, OpenWithWrongSpecTypeFails) {
     VineyardBackend backend(metrics_registry_);
     auto spec = std::make_shared<NfsStorageSpec>();
     spec->set_root_path("/tmp");
-    StorageConfig cfg(DataStorageType::DATA_STORAGE_TYPE_VINEYARD, "v6d_test", spec);
+    StorageConfig cfg(DataStorageType::DATA_STORAGE_TYPE_VINEYARD, "vineyard_test", spec);
     ASSERT_NE(EC_OK, backend.Open(cfg, "trace"));
     ASSERT_FALSE(backend.Available());
 }
@@ -78,11 +78,11 @@ TEST_F(VineyardBackendTest, RegisterNodeWithMediums) {
     VineyardBackend backend(metrics_registry_);
     ASSERT_EQ(EC_OK, backend.Open(MakeConfig(), "trace"));
 
-    ASSERT_EQ(EC_BADARGS, backend.RegisterNode("", {"mem"}));
-    ASSERT_EQ(EC_OK, backend.RegisterNode("10.0.0.1:8080", {"mem", "disk"}));
+    ASSERT_EQ(EC_BADARGS, backend.RegisterNode("test_inst", "", {"mem"}));
+    ASSERT_EQ(EC_OK, backend.RegisterNode("test_inst", "10.0.0.1:8080", {"mem", "disk"}));
     ASSERT_TRUE(backend.IsNodeAvailable("10.0.0.1:8080"));
 
-    ASSERT_EQ(EC_OK, backend.RegisterNode("10.0.0.1:8080", {"disk", "ssd"}));
+    ASSERT_EQ(EC_OK, backend.RegisterNode("test_inst", "10.0.0.1:8080", {"disk", "ssd"}));
     {
         auto it = backend.nodes_.find("10.0.0.1:8080");
         ASSERT_NE(it, backend.nodes_.end());
@@ -91,7 +91,7 @@ TEST_F(VineyardBackendTest, RegisterNodeWithMediums) {
 
     backend.SetNodeUnavailable("10.0.0.1:8080");
     ASSERT_FALSE(backend.IsNodeAvailable("10.0.0.1:8080"));
-    ASSERT_EQ(EC_OK, backend.RegisterNode("10.0.0.1:8080", {"mem"}));
+    ASSERT_EQ(EC_OK, backend.RegisterNode("test_inst", "10.0.0.1:8080", {"mem"}));
     ASSERT_TRUE(backend.IsNodeAvailable("10.0.0.1:8080"));
 
     ASSERT_EQ(EC_OK, backend.UnregisterNode("10.0.0.1:8080"));
@@ -104,7 +104,7 @@ TEST_F(VineyardBackendTest, RegisterNodeWithMediums) {
 TEST_F(VineyardBackendTest, OnHeartbeatRefreshesAndRevivesNode) {
     VineyardBackend backend(metrics_registry_);
     ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 200, /*grace*/ 5000, /*tick*/ 50), "trace"));
-    ASSERT_EQ(EC_OK, backend.RegisterNode("10.0.0.3:8080", {"mem"}));
+    ASSERT_EQ(EC_OK, backend.RegisterNode("test_inst", "10.0.0.3:8080", {"mem"}));
 
     int64_t initial_hb = 0;
     {
@@ -144,12 +144,12 @@ TEST_F(VineyardBackendTest, LivenessLoopHealthyToUnavailableToCleanup) {
 
     std::atomic<int> cleanup_calls{0};
     std::string cleanup_host;
-    backend.SetCleanupCallback([&](const std::string &host, uint64_t /*gen*/) {
+    backend.SetCleanupCallback([&](const std::string & /*instance_id*/, const std::string &host, uint64_t /*gen*/) {
         ++cleanup_calls;
         cleanup_host = host;
     });
 
-    ASSERT_EQ(EC_OK, backend.RegisterNode("10.0.0.4:8080", {"mem"}));
+    ASSERT_EQ(EC_OK, backend.RegisterNode("test_inst", "10.0.0.4:8080", {"mem"}));
     ASSERT_TRUE(backend.IsNodeAvailable("10.0.0.4:8080"));
 
     std::this_thread::sleep_for(160ms);
@@ -173,9 +173,9 @@ TEST_F(VineyardBackendTest, HeartbeatWithinGraceWindowRecovers) {
     ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 80, /*grace*/ 5000, /*tick*/ 20), "trace"));
 
     std::atomic<int> cleanup_calls{0};
-    backend.SetCleanupCallback([&](const std::string &, uint64_t /*gen*/) { ++cleanup_calls; });
+    backend.SetCleanupCallback([&](const std::string &, const std::string &, uint64_t /*gen*/) { ++cleanup_calls; });
 
-    ASSERT_EQ(EC_OK, backend.RegisterNode("10.0.0.5:8080", {"mem"}));
+    ASSERT_EQ(EC_OK, backend.RegisterNode("test_inst", "10.0.0.5:8080", {"mem"}));
     std::this_thread::sleep_for(140ms);
     ASSERT_FALSE(backend.IsNodeAvailable("10.0.0.5:8080"));
 
@@ -194,9 +194,9 @@ TEST_F(VineyardBackendTest, RegisterAfterCleanupCreatesNewEntry) {
     ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 80, /*grace*/ 120, /*tick*/ 20), "trace"));
 
     std::atomic<int> cleanup_calls{0};
-    backend.SetCleanupCallback([&](const std::string &, uint64_t /*gen*/) { ++cleanup_calls; });
+    backend.SetCleanupCallback([&](const std::string &, const std::string &, uint64_t /*gen*/) { ++cleanup_calls; });
 
-    ASSERT_EQ(EC_OK, backend.RegisterNode("10.0.0.6:8080", {"mem"}));
+    ASSERT_EQ(EC_OK, backend.RegisterNode("test_inst", "10.0.0.6:8080", {"mem"}));
     for (int i = 0; i < 80 && cleanup_calls.load() == 0; ++i) {
         std::this_thread::sleep_for(20ms);
     }
@@ -204,7 +204,7 @@ TEST_F(VineyardBackendTest, RegisterAfterCleanupCreatesNewEntry) {
 
     EXPECT_EQ(backend.nodes_.count("10.0.0.6:8080"), 0u);
 
-    ASSERT_EQ(EC_OK, backend.RegisterNode("10.0.0.6:8080", {"mem", "disk"}));
+    ASSERT_EQ(EC_OK, backend.RegisterNode("test_inst", "10.0.0.6:8080", {"mem", "disk"}));
     ASSERT_TRUE(backend.IsNodeAvailable("10.0.0.6:8080"));
     {
         auto it = backend.nodes_.find("10.0.0.6:8080");
@@ -221,9 +221,9 @@ TEST_F(VineyardBackendTest, HostDownRemovesNodeFromTable) {
     ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 200, /*grace*/ 400, /*tick*/ 50), "trace"));
 
     std::atomic<int> cleanup_calls{0};
-    backend.SetCleanupCallback([&](const std::string &, uint64_t /*gen*/) { ++cleanup_calls; });
+    backend.SetCleanupCallback([&](const std::string &, const std::string &, uint64_t /*gen*/) { ++cleanup_calls; });
 
-    ASSERT_EQ(EC_OK, backend.RegisterNode("10.0.0.7:8080", {"mem"}));
+    ASSERT_EQ(EC_OK, backend.RegisterNode("test_inst", "10.0.0.7:8080", {"mem"}));
     ASSERT_TRUE(backend.IsNodeAvailable("10.0.0.7:8080"));
 
     backend.SetNodeUnavailable("10.0.0.7:8080");
@@ -246,17 +246,17 @@ TEST_F(VineyardBackendTest, GenerationBumpsOnReRegistration) {
     const std::string host = "10.0.0.8:8080";
     ASSERT_EQ(0u, backend.GetNodeGeneration(host));
 
-    ASSERT_EQ(EC_OK, backend.RegisterNode(host, {"mem"}));
+    ASSERT_EQ(EC_OK, backend.RegisterNode("test_inst", host, {"mem"}));
     ASSERT_EQ(1u, backend.GetNodeGeneration(host));
 
     backend.SetNodeUnavailable(host);
     ASSERT_EQ(EC_OK, backend.UnregisterNode(host));
     ASSERT_EQ(1u, backend.GetNodeGeneration(host));
 
-    ASSERT_EQ(EC_OK, backend.RegisterNode(host, {"mem", "disk"}));
+    ASSERT_EQ(EC_OK, backend.RegisterNode("test_inst", host, {"mem", "disk"}));
     ASSERT_EQ(2u, backend.GetNodeGeneration(host));
 
-    ASSERT_EQ(EC_OK, backend.RegisterNode(host, {"ssd"}));
+    ASSERT_EQ(EC_OK, backend.RegisterNode("test_inst", host, {"ssd"}));
     ASSERT_EQ(3u, backend.GetNodeGeneration(host));
 
     ASSERT_EQ(EC_OK, backend.Close());
@@ -268,10 +268,11 @@ TEST_F(VineyardBackendTest, LivenessLoopPassesGenerationToCallback) {
     ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 80, /*grace*/ 120, /*tick*/ 20), "trace"));
 
     std::atomic<uint64_t> received_gen{0};
-    backend.SetCleanupCallback([&](const std::string &, uint64_t gen) { received_gen.store(gen); });
+    backend.SetCleanupCallback(
+        [&](const std::string &, const std::string &, uint64_t gen) { received_gen.store(gen); });
 
     const std::string host = "10.0.0.9:8080";
-    ASSERT_EQ(EC_OK, backend.RegisterNode(host, {"mem"}));
+    ASSERT_EQ(EC_OK, backend.RegisterNode("test_inst", host, {"mem"}));
     uint64_t expected_gen = backend.GetNodeGeneration(host);
 
     for (int i = 0; i < 80 && received_gen.load() == 0; ++i) {
@@ -285,7 +286,7 @@ TEST_F(VineyardBackendTest, LivenessLoopPassesGenerationToCallback) {
 TEST_F(VineyardBackendTest, OnHeartbeatPublishesMetricsGauges) {
     VineyardBackend backend(metrics_registry_);
     ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 5000, /*grace*/ 10000, /*tick*/ 50), "trace"));
-    ASSERT_EQ(EC_OK, backend.RegisterNode("10.0.0.10:9600", {"mem"}));
+    ASSERT_EQ(EC_OK, backend.RegisterNode("test_inst", "10.0.0.10:9600", {"mem"}));
 
     backend.OnHeartbeat("10.0.0.10:9600",
                         {
@@ -296,7 +297,7 @@ TEST_F(VineyardBackendTest, OnHeartbeatPublishesMetricsGauges) {
 
     auto hit_rate_data = metrics_registry_->GetMetricsData("v6d.hit_rate");
     ASSERT_NE(hit_rate_data, nullptr);
-    MetricsTags expected_tags = {{"instance_id", "v6d_cluster_test"}, {"host", "10.0.0.10:9600"}};
+    MetricsTags expected_tags = {{"instance_id", "test_inst"}, {"host", "10.0.0.10:9600"}};
     auto gauge = hit_rate_data->GetOrCreateGauge(expected_tags);
     ASSERT_DOUBLE_EQ(0.85, gauge.Get());
 
@@ -327,14 +328,14 @@ TEST_F(VineyardBackendTest, SetNodeUnavailableZerosGauges) {
     VineyardBackend backend(metrics_registry_);
     ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 5000, /*grace*/ 10000, /*tick*/ 50), "trace"));
 
-    ASSERT_EQ(EC_OK, backend.RegisterNode("10.0.0.30:9600", {"mem"}));
-    ASSERT_EQ(EC_OK, backend.RegisterNode("10.0.0.31:9600", {"mem"}));
+    ASSERT_EQ(EC_OK, backend.RegisterNode("test_inst", "10.0.0.30:9600", {"mem"}));
+    ASSERT_EQ(EC_OK, backend.RegisterNode("test_inst", "10.0.0.31:9600", {"mem"}));
 
     backend.OnHeartbeat("10.0.0.30:9600", {{"hit_rate", "0.90"}, {"mem_used", "8192"}});
     backend.OnHeartbeat("10.0.0.31:9600", {{"hit_rate", "0.80"}, {"mem_used", "4096"}});
 
-    MetricsTags tags_30 = {{"instance_id", "v6d_cluster_test"}, {"host", "10.0.0.30:9600"}};
-    MetricsTags tags_31 = {{"instance_id", "v6d_cluster_test"}, {"host", "10.0.0.31:9600"}};
+    MetricsTags tags_30 = {{"instance_id", "test_inst"}, {"host", "10.0.0.30:9600"}};
+    MetricsTags tags_31 = {{"instance_id", "test_inst"}, {"host", "10.0.0.31:9600"}};
 
     auto hr_data = metrics_registry_->GetMetricsData("v6d.hit_rate");
     ASSERT_NE(hr_data, nullptr);
@@ -360,14 +361,14 @@ TEST_F(VineyardBackendTest, UnregisterNodeCleansUpGauges) {
     VineyardBackend backend(metrics_registry_);
     ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 5000, /*grace*/ 10000, /*tick*/ 50), "trace"));
 
-    ASSERT_EQ(EC_OK, backend.RegisterNode("10.0.0.20:9600", {"mem"}));
-    ASSERT_EQ(EC_OK, backend.RegisterNode("10.0.0.21:9600", {"mem"}));
+    ASSERT_EQ(EC_OK, backend.RegisterNode("test_inst", "10.0.0.20:9600", {"mem"}));
+    ASSERT_EQ(EC_OK, backend.RegisterNode("test_inst", "10.0.0.21:9600", {"mem"}));
 
     backend.OnHeartbeat("10.0.0.20:9600", {{"hit_rate", "0.75"}, {"mem_used", "4096"}});
     backend.OnHeartbeat("10.0.0.21:9600", {{"hit_rate", "0.60"}, {"mem_used", "2048"}});
 
-    MetricsTags tags_20 = {{"instance_id", "v6d_cluster_test"}, {"host", "10.0.0.20:9600"}};
-    MetricsTags tags_21 = {{"instance_id", "v6d_cluster_test"}, {"host", "10.0.0.21:9600"}};
+    MetricsTags tags_20 = {{"instance_id", "test_inst"}, {"host", "10.0.0.20:9600"}};
+    MetricsTags tags_21 = {{"instance_id", "test_inst"}, {"host", "10.0.0.21:9600"}};
 
     auto hr_data = metrics_registry_->GetMetricsData("v6d.hit_rate");
     ASSERT_NE(hr_data, nullptr);

@@ -1947,25 +1947,31 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_UnregisteredBackend) {
 
 TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_VineyardFallbackLookup) {
     // Vineyard URI hostname is a node IP, not the global_unique_name.
-    // The functor should fall back to "v6d_{instance_id}" for lookup.
+    // The functor should look up "vineyard_{instance_group}" via instance_id -> group mapping.
     const std::string instance_id = "my_cluster";
-    const std::string v6d_storage_name = "v6d_" + instance_id;
+    const std::string instance_group = "my_group";
+    const std::string vineyard_storage_name = "vineyard_" + instance_group;
     const std::string node_host = "192.168.1.100:8080";
+
+    // Register instance so GetInstanceGroupName works
+    auto instance_info = std::make_shared<InstanceInfo>(
+        "test_quota_group", instance_group, instance_id, 64, createLocationSpecInfos(), createModelDeployment());
+    registry_manager_->instance_infos_[instance_id] = instance_info;
 
     auto metrics_registry = cache_manager_->metrics_registry_;
     auto vineyard_backend = std::make_shared<VineyardBackend>(metrics_registry);
 
     StorageConfig config;
-    config.set_global_unique_name(v6d_storage_name);
+    config.set_global_unique_name(vineyard_storage_name);
     config.set_type(DataStorageType::DATA_STORAGE_TYPE_VINEYARD);
     auto spec = std::make_shared<VineyardStorageSpec>();
     config.set_storage_spec(spec);
     vineyard_backend->Open(config, "test_trace");
 
-    vineyard_backend->RegisterNode(node_host, {"mem"});
+    vineyard_backend->RegisterNode(instance_id, node_host, {"mem"});
 
     auto dsm = registry_manager_->data_storage_manager_;
-    dsm->storage_map_[v6d_storage_name] = vineyard_backend;
+    dsm->storage_map_[vineyard_storage_name] = vineyard_backend;
 
     auto func = cache_manager_->GetCheckLocDataExistFunc(instance_id);
 
@@ -1975,31 +1981,37 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_VineyardFallbackLookup) {
     loc.set_location_specs({LocationSpec("tp0", "vineyard://192.168.1.100:8080/mem?gpu=A100")});
     ASSERT_EQ(func(loc), true);
 
-    dsm->storage_map_.erase(v6d_storage_name);
+    dsm->storage_map_.erase(vineyard_storage_name);
 }
 
 TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_VineyardNodeUnavailable) {
     // When a vineyard node is registered but unavailable (grace period),
     // the functor should return false (not reachable).
     const std::string instance_id = "my_cluster";
-    const std::string v6d_storage_name = "v6d_" + instance_id;
+    const std::string instance_group = "my_group";
+    const std::string vineyard_storage_name = "vineyard_" + instance_group;
     const std::string node_host = "192.168.1.200:8080";
+
+    // Register instance so GetInstanceGroupName works
+    auto instance_info = std::make_shared<InstanceInfo>(
+        "test_quota_group", instance_group, instance_id, 64, createLocationSpecInfos(), createModelDeployment());
+    registry_manager_->instance_infos_[instance_id] = instance_info;
 
     auto metrics_registry = cache_manager_->metrics_registry_;
     auto vineyard_backend = std::make_shared<VineyardBackend>(metrics_registry);
 
     StorageConfig config;
-    config.set_global_unique_name(v6d_storage_name);
+    config.set_global_unique_name(vineyard_storage_name);
     config.set_type(DataStorageType::DATA_STORAGE_TYPE_VINEYARD);
     auto spec = std::make_shared<VineyardStorageSpec>();
     config.set_storage_spec(spec);
     vineyard_backend->Open(config, "test_trace");
 
-    vineyard_backend->RegisterNode(node_host, {"mem"});
+    vineyard_backend->RegisterNode(instance_id, node_host, {"mem"});
     vineyard_backend->SetNodeUnavailable(node_host);
 
     auto dsm = registry_manager_->data_storage_manager_;
-    dsm->storage_map_[v6d_storage_name] = vineyard_backend;
+    dsm->storage_map_[vineyard_storage_name] = vineyard_backend;
 
     auto func = cache_manager_->GetCheckLocDataExistFunc(instance_id);
 
@@ -2009,28 +2021,34 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_VineyardNodeUnavailable) {
     loc.set_location_specs({LocationSpec("tp0", "vineyard://192.168.1.200:8080/mem")});
     ASSERT_EQ(func(loc), false);
 
-    dsm->storage_map_.erase(v6d_storage_name);
+    dsm->storage_map_.erase(vineyard_storage_name);
 }
 
 TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_VineyardNodeUnregistered) {
     // When a vineyard node has been unregistered (dead, past grace period),
     // MightExist returns false -> the functor should return false.
     const std::string instance_id = "my_cluster";
-    const std::string v6d_storage_name = "v6d_" + instance_id;
+    const std::string instance_group = "my_group";
+    const std::string vineyard_storage_name = "vineyard_" + instance_group;
     const std::string node_host = "192.168.1.200:8080";
+
+    // Register instance so GetInstanceGroupName works
+    auto instance_info = std::make_shared<InstanceInfo>(
+        "test_quota_group", instance_group, instance_id, 64, createLocationSpecInfos(), createModelDeployment());
+    registry_manager_->instance_infos_[instance_id] = instance_info;
 
     auto metrics_registry = cache_manager_->metrics_registry_;
     auto vineyard_backend = std::make_shared<VineyardBackend>(metrics_registry);
 
     StorageConfig config;
-    config.set_global_unique_name(v6d_storage_name);
+    config.set_global_unique_name(vineyard_storage_name);
     config.set_type(DataStorageType::DATA_STORAGE_TYPE_VINEYARD);
     auto spec = std::make_shared<VineyardStorageSpec>();
     config.set_storage_spec(spec);
     vineyard_backend->Open(config, "test_trace");
 
     auto dsm = registry_manager_->data_storage_manager_;
-    dsm->storage_map_[v6d_storage_name] = vineyard_backend;
+    dsm->storage_map_[vineyard_storage_name] = vineyard_backend;
 
     auto func = cache_manager_->GetCheckLocDataExistFunc(instance_id);
 
@@ -2040,7 +2058,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_VineyardNodeUnregistered) 
     loc.set_location_specs({LocationSpec("tp0", "vineyard://192.168.1.200:8080/mem")});
     ASSERT_EQ(func(loc), false);
 
-    dsm->storage_map_.erase(v6d_storage_name);
+    dsm->storage_map_.erase(vineyard_storage_name);
 }
 
 TEST_F(CacheManagerTest, TestGetSubmitDelReqFunc_NullExecutor) {
@@ -2911,13 +2929,13 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
     auto vineyard_backend = std::make_shared<VineyardBackend>(metrics_registry);
     {
         StorageConfig v6d_config;
-        v6d_config.set_global_unique_name("v6d_test_instance");
+        v6d_config.set_global_unique_name("vineyard_default");
         v6d_config.set_type(DataStorageType::DATA_STORAGE_TYPE_VINEYARD);
         v6d_config.set_storage_spec(std::make_shared<VineyardStorageSpec>());
         vineyard_backend->Open(v6d_config, "test_trace");
     }
     auto dsm = registry_manager_->data_storage_manager_;
-    dsm->storage_map_["v6d_test_instance"] = vineyard_backend;
+    dsm->storage_map_["vineyard_default"] = vineyard_backend;
 
     // Inject V6D locations via ReportEvent
     struct PeerKeys {
@@ -3196,6 +3214,6 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
         EXPECT_EQ(2u, kl[0].location_specs().size());
     }
 
-    dsm->storage_map_.erase("v6d_test_instance");
+    dsm->storage_map_.erase("vineyard_default");
 }
 } // namespace kv_cache_manager

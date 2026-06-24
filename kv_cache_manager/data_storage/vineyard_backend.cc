@@ -88,7 +88,9 @@ void VineyardBackend::SetCleanupCallback(CleanupCallback cb) {
     cleanup_cb_set_.store(cleanup_callback_ != nullptr, std::memory_order_release);
 }
 
-ErrorCode VineyardBackend::RegisterNode(const std::string &host_ip_port, const std::vector<std::string> &mediums) {
+ErrorCode VineyardBackend::RegisterNode(const std::string &instance_id,
+                                        const std::string &host_ip_port,
+                                        const std::vector<std::string> &mediums) {
     if (host_ip_port.empty()) {
         return EC_BADARGS;
     }
@@ -106,7 +108,7 @@ ErrorCode VineyardBackend::RegisterNode(const std::string &host_ip_port, const s
         info.last_heartbeat_ms.store(now_ms, std::memory_order_relaxed);
         info.available.store(true, std::memory_order_relaxed);
         info.unavailable_since_ms.store(0, std::memory_order_relaxed);
-        auto instance_id = config_.global_unique_name().substr(4); // strip "v6d_" prefix
+        info.instance_id = instance_id;
         info.metrics_tags = {{"instance_id", instance_id}, {"host", host_ip_port}};
         KVCM_LOG_INFO("VineyardBackend: node [%s] already registered, mediums=%zu (refreshed heartbeat, gen=%lu)",
                       host_ip_port.c_str(),
@@ -120,7 +122,7 @@ ErrorCode VineyardBackend::RegisterNode(const std::string &host_ip_port, const s
     info->available.store(true, std::memory_order_relaxed);
     info->unavailable_since_ms.store(0, std::memory_order_relaxed);
     info->mediums = mediums;
-    auto instance_id = config_.global_unique_name().substr(4); // strip "v6d_" prefix
+    info->instance_id = instance_id;
     info->metrics_tags = {{"instance_id", instance_id}, {"host", host_ip_port}};
     nodes_[host_ip_port] = std::move(info);
 
@@ -238,7 +240,12 @@ uint64_t VineyardBackend::GetNodeGeneration(const std::string &host_ip_port) con
 void VineyardBackend::LivenessCheckerLoop() {
     while (liveness_checker_running_.load(std::memory_order_relaxed) && IsOpen()) {
         int64_t now_ms = NowMillis();
-        std::vector<std::pair<std::string, uint64_t>> to_cleanup;
+        struct CleanupEntry {
+            std::string instance_id;
+            std::string host;
+            uint64_t gen;
+        };
+        std::vector<CleanupEntry> to_cleanup;
 
         {
             std::shared_lock<std::shared_mutex> lock(nodes_mutex_);
@@ -270,7 +277,7 @@ void VineyardBackend::LivenessCheckerLoop() {
                 if (unavailable_since > 0 && now_ms - unavailable_since >= cleanup_grace_ms_) {
                     auto gen_it = node_generation_.find(kv.first);
                     uint64_t gen = (gen_it != node_generation_.end()) ? gen_it->second : 0;
-                    to_cleanup.emplace_back(kv.first, gen);
+                    to_cleanup.push_back({info.instance_id, kv.first, gen});
                 }
             }
         }
@@ -281,20 +288,20 @@ void VineyardBackend::LivenessCheckerLoop() {
                 std::lock_guard<std::mutex> lock(cleanup_cb_mutex_);
                 cb_copy = cleanup_callback_;
             }
-            for (const auto &[host, gen] : to_cleanup) {
+            for (const auto &entry : to_cleanup) {
                 KVCM_LOG_WARN("VineyardBackend: node [%s] passed cleanup_grace_ms, triggering cleanup (gen=%lu)",
-                              host.c_str(),
-                              gen);
+                              entry.host.c_str(),
+                              entry.gen);
                 if (cb_copy) {
-                    cb_copy(host, gen);
+                    cb_copy(entry.instance_id, entry.host, entry.gen);
                 }
-                uint64_t current_gen = GetNodeGeneration(host);
-                if (current_gen == gen) {
-                    UnregisterNode(host);
+                uint64_t current_gen = GetNodeGeneration(entry.host);
+                if (current_gen == entry.gen) {
+                    UnregisterNode(entry.host);
                 } else {
                     KVCM_LOG_INFO("VineyardBackend: node [%s] re-registered (gen=%lu -> %lu), skipping unregister",
-                                  host.c_str(),
-                                  gen,
+                                  entry.host.c_str(),
+                                  entry.gen,
                                   current_gen);
                 }
             }

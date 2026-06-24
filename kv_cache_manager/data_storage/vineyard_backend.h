@@ -18,7 +18,8 @@ namespace kv_cache_manager {
 class VineyardBackend : public DataStorageBackend {
 public:
     // generation_at_trigger fences stale cleanup against re-registration.
-    using CleanupCallback = std::function<void(const std::string &host_ip_port, uint64_t generation_at_trigger)>;
+    using CleanupCallback = std::function<void(
+        const std::string &instance_id, const std::string &host_ip_port, uint64_t generation_at_trigger)>;
 
     VineyardBackend() = delete;
     explicit VineyardBackend(std::shared_ptr<MetricsRegistry> metrics_registry);
@@ -36,7 +37,9 @@ public:
     void SetCleanupCallback(CleanupCallback cb);
     bool IsCleanupCallbackSet() const { return cleanup_cb_set_.load(std::memory_order_acquire); }
 
-    ErrorCode RegisterNode(const std::string &host_ip_port, const std::vector<std::string> &mediums);
+    ErrorCode RegisterNode(const std::string &instance_id,
+                           const std::string &host_ip_port,
+                           const std::vector<std::string> &mediums);
 
     ErrorCode UnregisterNode(const std::string &host_ip_port);
 
@@ -69,6 +72,7 @@ private:
     }
 
     struct NodeInfo {
+        std::string instance_id;
         std::atomic<int64_t> last_heartbeat_ms{0};
         std::atomic<bool> available{true};
         std::atomic<int64_t> unavailable_since_ms{0};

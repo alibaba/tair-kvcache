@@ -1397,7 +1397,11 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
 
 namespace {
 
-std::string VineyardStorageNameFromInstance(const std::string &instance_id) { return "v6d_" + instance_id; }
+std::string GetVineyardStorageName(const std::shared_ptr<RegistryManager> &registry_manager,
+                                   const std::string &instance_id) {
+    std::string group_name = registry_manager->GetInstanceGroupName(instance_id);
+    return "vineyard_" + group_name;
+}
 
 std::string BuildVineyardLocationId(const std::string &medium, const std::string &host_ip_port) {
     std::string id;
@@ -1420,9 +1424,7 @@ bool ParseInt64(const std::string &s, int64_t &out) {
         }
         out = v;
         return true;
-    } catch (...) {
-        return false;
-    }
+    } catch (...) { return false; }
 }
 
 std::shared_ptr<VineyardBackend> LookupVineyardBackend(const std::shared_ptr<RegistryManager> &registry_manager,
@@ -1430,8 +1432,8 @@ std::shared_ptr<VineyardBackend> LookupVineyardBackend(const std::shared_ptr<Reg
     if (!registry_manager || !registry_manager->data_storage_manager()) {
         return nullptr;
     }
-    return std::dynamic_pointer_cast<VineyardBackend>(
-        registry_manager->data_storage_manager()->GetDataStorageBackend(VineyardStorageNameFromInstance(instance_id)));
+    return std::dynamic_pointer_cast<VineyardBackend>(registry_manager->data_storage_manager()->GetDataStorageBackend(
+        GetVineyardStorageName(registry_manager, instance_id)));
 }
 
 } // namespace
@@ -1458,20 +1460,22 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
 
     auto vineyard_backend = LookupVineyardBackend(registry_manager_, instance_id);
     if (!vineyard_backend) {
+        auto storage_name = GetVineyardStorageName(registry_manager_, instance_id);
         KVCM_LOG_WARN(
-            "trace_id [%s] | ReportEvent: VineyardBackend [v6d_%s] not found", trace_id.c_str(), instance_id.c_str());
+            "trace_id [%s] | ReportEvent: VineyardBackend [%s] not found", trace_id.c_str(), storage_name.c_str());
         response_status->set_code(proto::meta::INSTANCE_NOT_EXIST);
         response_status->set_message("VineyardBackend not found for instance: " + instance_id);
         return EC_INSTANCE_NOT_EXIST;
     }
 
     if (!vineyard_backend->IsCleanupCallbackSet()) {
-        vineyard_backend->SetCleanupCallback([this, instance_id](const std::string &down_host, uint64_t generation) {
-            assert(this->schedule_plan_executor_);
-            this->schedule_plan_executor_->SubmitTask([this, instance_id, down_host, generation] {
-                this->CleanupHostLocations(instance_id, down_host, generation);
+        vineyard_backend->SetCleanupCallback(
+            [this](const std::string &instance_id, const std::string &down_host, uint64_t generation) {
+                assert(this->schedule_plan_executor_);
+                this->schedule_plan_executor_->SubmitTask([this, instance_id, down_host, generation] {
+                    this->CleanupHostLocations(instance_id, down_host, generation);
+                });
             });
-        });
     }
 
     MetaSearcher *meta_searcher = meta_searcher_manager_->GetMetaSearcher(instance_id);
@@ -1602,7 +1606,7 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
     }
 
     if (has_register) {
-        auto ec = vineyard_backend->RegisterNode(host_ip_port, register_mediums);
+        auto ec = vineyard_backend->RegisterNode(instance_id, host_ip_port, register_mediums);
         if (ec != EC_OK) {
             for (int i = 0; i < events_size; ++i) {
                 if (request->events(i).event_type() == proto::meta::EVENT_NODE_REGISTER) {
@@ -2178,7 +2182,7 @@ CheckLocDataExistFunc CacheManager::GetCheckLocDataExistFunc(const std::string &
         std::string storage_unique_name = storage_uris.front().GetHostName();
         bool is_vineyard = (storage_uris.front().GetProtocol() == "vineyard");
         if (is_vineyard) {
-            storage_unique_name = VineyardStorageNameFromInstance(instance_id);
+            storage_unique_name = GetVineyardStorageName(registry_manager_, instance_id);
         }
         const auto result = registry_manager_->data_storage_manager()->Exist(storage_unique_name, storage_uris, true);
         return std::all_of(result.cbegin(), result.cend(), [](bool v) { return v; });
