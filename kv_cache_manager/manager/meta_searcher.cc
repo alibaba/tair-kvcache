@@ -1185,6 +1185,7 @@ ErrorCode MetaSearcher::BatchDeleteLocations(RequestContext *request_context,
 
 ErrorCode MetaSearcher::CleanupLocationsByHost(RequestContext *request_context,
                                                const std::string &host_suffix,
+                                               DataStorageType storage_type,
                                                size_t scan_batch_size,
                                                std::function<bool()> should_abort) {
     if (host_suffix.empty()) {
@@ -1224,8 +1225,7 @@ ErrorCode MetaSearcher::CleanupLocationsByHost(RequestContext *request_context,
                     for (const auto &kv : location_maps[i]) {
                         const std::string &loc_id = kv.first;
                         const CacheLocation &loc = *kv.second;
-                        if (loc.type() == DataStorageType::DATA_STORAGE_TYPE_VINEYARD &&
-                            loc_id.size() >= host_suffix.size() &&
+                        if (loc.type() == storage_type && loc_id.size() >= host_suffix.size() &&
                             loc_id.compare(loc_id.size() - host_suffix.size(), host_suffix.size(), host_suffix) == 0) {
                             delete_loc_ids[i].push_back(loc_id);
                             has_any_location = true;

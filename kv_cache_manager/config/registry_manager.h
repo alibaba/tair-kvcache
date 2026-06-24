@@ -81,6 +81,7 @@ public:
     ErrorCode LoadConfigSnapshot(RequestContext *request_context, const std::string &config_snapshot);
 
     std::shared_ptr<const CacheConfig> GetCacheConfig(const std::string &instance_group);
+    std::shared_ptr<const InstanceGroup> GetInstanceGroupConfig(const std::string &instance_group_name) const;
 
     std::shared_ptr<DataStorageManager> data_storage_manager() const;
     std::string GetInstanceGroupName(const std::string &instance_id) const;

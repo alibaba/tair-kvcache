@@ -443,6 +443,16 @@ CacheConfigConstPtr RegistryManager::GetCacheConfig(const std::string &instance_
     return nullptr;
 }
 
+std::shared_ptr<const InstanceGroup>
+RegistryManager::GetInstanceGroupConfig(const std::string &instance_group_name) const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    auto it = instance_group_configs_.find(instance_group_name);
+    if (it != instance_group_configs_.end()) {
+        return it->second;
+    }
+    return nullptr;
+}
+
 std::shared_ptr<DataStorageManager> RegistryManager::data_storage_manager() const { return data_storage_manager_; }
 
 ErrorCode RegistryManager::LoadAndSave(const std::string &key, const std::string &id, const Jsonizable *jsonizable) {

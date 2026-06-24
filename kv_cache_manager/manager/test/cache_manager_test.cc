@@ -1947,7 +1947,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_UnregisteredBackend) {
 
 TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_VineyardFallbackLookup) {
     // Vineyard URI hostname is a node IP, not the global_unique_name.
-    // The functor should look up "vineyard_{instance_group}" via instance_id -> group mapping.
+    // The functor should look up the backend via event_reporting_storage_candidates.
     const std::string instance_id = "my_cluster";
     const std::string instance_group = "my_group";
     const std::string vineyard_storage_name = "vineyard_" + instance_group;
@@ -1957,6 +1957,16 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_VineyardFallbackLookup) {
     auto instance_info = std::make_shared<InstanceInfo>(
         "test_quota_group", instance_group, instance_id, 64, createLocationSpecInfos(), createModelDeployment());
     registry_manager_->instance_infos_[instance_id] = instance_info;
+
+    // Create InstanceGroup with event_reporting_storage_candidates
+    auto ig = std::make_shared<InstanceGroup>();
+    ig->set_name(instance_group);
+    ig->set_storage_candidates({vineyard_storage_name});
+    ig->set_event_reporting_storage_candidates({vineyard_storage_name});
+    ig->set_global_quota_group_name("test_quota_group");
+    ig->set_max_instance_count(10);
+    ig->set_version(1);
+    registry_manager_->instance_group_configs_[instance_group] = ig;
 
     auto metrics_registry = cache_manager_->metrics_registry_;
     auto vineyard_backend = std::make_shared<VineyardBackend>(metrics_registry);
@@ -1982,6 +1992,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_VineyardFallbackLookup) {
     ASSERT_EQ(func(loc), true);
 
     dsm->storage_map_.erase(vineyard_storage_name);
+    registry_manager_->instance_group_configs_.erase(instance_group);
 }
 
 TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_VineyardNodeUnavailable) {
@@ -1996,6 +2007,16 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_VineyardNodeUnavailable) {
     auto instance_info = std::make_shared<InstanceInfo>(
         "test_quota_group", instance_group, instance_id, 64, createLocationSpecInfos(), createModelDeployment());
     registry_manager_->instance_infos_[instance_id] = instance_info;
+
+    // Create InstanceGroup with event_reporting_storage_candidates
+    auto ig = std::make_shared<InstanceGroup>();
+    ig->set_name(instance_group);
+    ig->set_storage_candidates({vineyard_storage_name});
+    ig->set_event_reporting_storage_candidates({vineyard_storage_name});
+    ig->set_global_quota_group_name("test_quota_group");
+    ig->set_max_instance_count(10);
+    ig->set_version(1);
+    registry_manager_->instance_group_configs_[instance_group] = ig;
 
     auto metrics_registry = cache_manager_->metrics_registry_;
     auto vineyard_backend = std::make_shared<VineyardBackend>(metrics_registry);
@@ -2022,6 +2043,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_VineyardNodeUnavailable) {
     ASSERT_EQ(func(loc), false);
 
     dsm->storage_map_.erase(vineyard_storage_name);
+    registry_manager_->instance_group_configs_.erase(instance_group);
 }
 
 TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_VineyardNodeUnregistered) {
@@ -2036,6 +2058,16 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_VineyardNodeUnregistered) 
     auto instance_info = std::make_shared<InstanceInfo>(
         "test_quota_group", instance_group, instance_id, 64, createLocationSpecInfos(), createModelDeployment());
     registry_manager_->instance_infos_[instance_id] = instance_info;
+
+    // Create InstanceGroup with event_reporting_storage_candidates
+    auto ig = std::make_shared<InstanceGroup>();
+    ig->set_name(instance_group);
+    ig->set_storage_candidates({vineyard_storage_name});
+    ig->set_event_reporting_storage_candidates({vineyard_storage_name});
+    ig->set_global_quota_group_name("test_quota_group");
+    ig->set_max_instance_count(10);
+    ig->set_version(1);
+    registry_manager_->instance_group_configs_[instance_group] = ig;
 
     auto metrics_registry = cache_manager_->metrics_registry_;
     auto vineyard_backend = std::make_shared<VineyardBackend>(metrics_registry);
@@ -2059,6 +2091,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_VineyardNodeUnregistered) 
     ASSERT_EQ(func(loc), false);
 
     dsm->storage_map_.erase(vineyard_storage_name);
+    registry_manager_->instance_group_configs_.erase(instance_group);
 }
 
 TEST_F(CacheManagerTest, TestGetSubmitDelReqFunc_NullExecutor) {
@@ -2937,6 +2970,9 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
     auto dsm = registry_manager_->data_storage_manager_;
     dsm->storage_map_["vineyard_default"] = vineyard_backend;
 
+    // Configure event_reporting_storage_candidates for the "default" instance group
+    registry_manager_->instance_group_configs_["default"]->set_event_reporting_storage_candidates({"vineyard_default"});
+
     // Inject V6D locations via ReportEvent
     struct PeerKeys {
         std::string host;
@@ -2951,6 +2987,7 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
         proto::meta::ReportEventRequest req;
         req.set_instance_id("test_instance");
         req.set_host_ip_port(pd.host);
+        req.set_storage_type(proto::meta::ST_VINEYARD);
 
         auto *reg = req.add_events();
         reg->set_event_type(proto::meta::EVENT_NODE_REGISTER);

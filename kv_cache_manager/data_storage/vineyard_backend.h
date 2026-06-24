@@ -12,15 +12,12 @@
 #include <vector>
 
 #include "kv_cache_manager/data_storage/data_storage_backend.h"
+#include "kv_cache_manager/data_storage/event_reporting_backend.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
 
 namespace kv_cache_manager {
-class VineyardBackend : public DataStorageBackend {
+class VineyardBackend : public DataStorageBackend, public EventReportingBackend {
 public:
-    // generation_at_trigger fences stale cleanup against re-registration.
-    using CleanupCallback = std::function<void(
-        const std::string &instance_id, const std::string &host_ip_port, uint64_t generation_at_trigger)>;
-
     VineyardBackend() = delete;
     explicit VineyardBackend(std::shared_ptr<MetricsRegistry> metrics_registry);
     ~VineyardBackend() override;
@@ -34,20 +31,27 @@ public:
     ErrorCode DoOpen(const StorageConfig &config, const std::string &trace_id) override;
     ErrorCode Close() override;
 
-    void SetCleanupCallback(CleanupCallback cb);
-    bool IsCleanupCallbackSet() const { return cleanup_cb_set_.load(std::memory_order_acquire); }
+    // EventReportingBackend interface
+    void SetCleanupCallback(CleanupCallback cb) override;
+    bool IsCleanupCallbackSet() const override { return cleanup_cb_set_.load(std::memory_order_acquire); }
 
     ErrorCode RegisterNode(const std::string &instance_id,
                            const std::string &host_ip_port,
-                           const std::vector<std::string> &mediums);
+                           const std::vector<std::string> &mediums) override;
 
-    ErrorCode UnregisterNode(const std::string &host_ip_port);
+    ErrorCode UnregisterNode(const std::string &host_ip_port) override;
 
-    ErrorCode OnHeartbeat(const std::string &host_ip_port, const std::map<std::string, std::string> &system_status);
-    void SetNodeUnavailable(const std::string &host_ip_port);
+    ErrorCode OnHeartbeat(const std::string &host_ip_port,
+                          const std::map<std::string, std::string> &system_status) override;
+    void SetNodeUnavailable(const std::string &host_ip_port) override;
     bool IsNodeAvailable(const std::string &host_ip_port) const;
 
-    uint64_t GetNodeGeneration(const std::string &host_ip_port) const;
+    uint64_t GetNodeGeneration(const std::string &host_ip_port) const override;
+
+    std::string BuildLocationId(const std::string &medium, const std::string &host_ip_port) const override;
+    std::string HostSuffix(const std::string &host_ip_port) const override;
+    DataStorageType GetStorageType() const override;
+    std::string GetProtocol() const override;
 
     std::vector<std::pair<ErrorCode, DataStorageUri>> Create(const std::vector<std::string> &keys,
                                                              size_t size_per_key,

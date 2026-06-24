@@ -295,6 +295,9 @@ void ProtoConvert::InstanceGroupToProto(const InstanceGroup &instance_group_info
     proto_instance_group->set_user_data(instance_group_info.user_data());
     proto_instance_group->set_version(instance_group_info.version());
     proto_instance_group->set_extra_info(instance_group_info.extra_info());
+    for (const auto &candidate : instance_group_info.event_reporting_storage_candidates()) {
+        proto_instance_group->add_event_reporting_storage_candidates(candidate);
+    }
 }
 void ProtoConvert::InstanceGroupFromProto(const proto::admin::InstanceGroup *proto_instance_group,
                                           InstanceGroup &instance_group_info) {
@@ -333,6 +336,10 @@ void ProtoConvert::InstanceGroupFromProto(const proto::admin::InstanceGroup *pro
     instance_group_info.set_user_data(proto_instance_group->user_data());
     instance_group_info.set_version(proto_instance_group->version());
     instance_group_info.set_extra_info(proto_instance_group->extra_info());
+    std::vector<std::string> event_reporting_storage_candidates(
+        proto_instance_group->event_reporting_storage_candidates().begin(),
+        proto_instance_group->event_reporting_storage_candidates().end());
+    instance_group_info.set_event_reporting_storage_candidates(event_reporting_storage_candidates);
 }
 
 void ProtoConvert::AccountFromProto(const proto::admin::Account *proto_account, Account &account_info) {

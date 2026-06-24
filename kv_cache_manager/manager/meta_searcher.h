@@ -118,6 +118,7 @@ public:
                                    std::vector<std::vector<ErrorCode>> &out_per_location_ec);
     ErrorCode CleanupLocationsByHost(RequestContext *request_context,
                                      const std::string &host_suffix,
+                                     DataStorageType storage_type,
                                      size_t scan_batch_size = 1000,
                                      std::function<bool()> should_abort = nullptr);
 

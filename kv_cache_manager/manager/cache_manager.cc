@@ -22,7 +22,7 @@
 #include "kv_cache_manager/config/meta_cache_policy_config.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
-#include "kv_cache_manager/data_storage/vineyard_backend.h"
+#include "kv_cache_manager/data_storage/event_reporting_backend.h"
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/event/spec_events/optimizer_event.h"
 #include "kv_cache_manager/manager/cache_manager_metrics_recorder.h"
@@ -140,7 +140,7 @@ CacheManager::CacheManager(std::shared_ptr<MetricsRegistry> metrics_registry,
           meta_indexer_manager_, write_location_manager_, registry_manager_, metrics_lifecycle_)) {}
 
 CacheManager::~CacheManager() {
-    ClearVineyardCleanupCallbacks();
+    ClearEventCleanupCallbacks();
     StopRecoverRetryLoop();
     if (write_location_manager_) {
         write_location_manager_->Stop();
@@ -1397,23 +1397,27 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
 
 namespace {
 
-std::string GetVineyardStorageName(const std::shared_ptr<RegistryManager> &registry_manager,
-                                   const std::string &instance_id) {
+std::shared_ptr<DataStorageBackend>
+LookupEventReportingBackend(const std::shared_ptr<RegistryManager> &registry_manager, const std::string &instance_id) {
+    if (!registry_manager || !registry_manager->data_storage_manager()) {
+        return nullptr;
+    }
     std::string group_name = registry_manager->GetInstanceGroupName(instance_id);
-    return "vineyard_" + group_name;
+    if (group_name.empty()) {
+        return nullptr;
+    }
+    auto ig = registry_manager->GetInstanceGroupConfig(group_name);
+    if (!ig || ig->event_reporting_storage_candidates().empty()) {
+        return nullptr;
+    }
+    auto dsm = registry_manager->data_storage_manager();
+    const auto &candidate_name = ig->event_reporting_storage_candidates().front();
+    auto backend = dsm->GetDataStorageBackend(candidate_name);
+    if (!backend || !dynamic_cast<EventReportingBackend *>(backend.get())) {
+        return nullptr;
+    }
+    return backend;
 }
-
-std::string BuildVineyardLocationId(const std::string &medium, const std::string &host_ip_port) {
-    std::string id;
-    id.reserve(8 + medium.size() + 1 + host_ip_port.size());
-    id.append("kvs#v6d#");
-    id.append(medium);
-    id.push_back('#');
-    id.append(host_ip_port);
-    return id;
-}
-
-std::string VineyardHostSuffix(const std::string &host_ip_port) { return "#" + host_ip_port; }
 
 bool ParseInt64(const std::string &s, int64_t &out) {
     try {
@@ -1425,15 +1429,6 @@ bool ParseInt64(const std::string &s, int64_t &out) {
         out = v;
         return true;
     } catch (...) { return false; }
-}
-
-std::shared_ptr<VineyardBackend> LookupVineyardBackend(const std::shared_ptr<RegistryManager> &registry_manager,
-                                                       const std::string &instance_id) {
-    if (!registry_manager || !registry_manager->data_storage_manager()) {
-        return nullptr;
-    }
-    return std::dynamic_pointer_cast<VineyardBackend>(registry_manager->data_storage_manager()->GetDataStorageBackend(
-        GetVineyardStorageName(registry_manager, instance_id)));
 }
 
 } // namespace
@@ -1458,22 +1453,44 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
         return EC_OK;
     }
 
-    auto vineyard_backend = LookupVineyardBackend(registry_manager_, instance_id);
-    if (!vineyard_backend) {
-        auto storage_name = GetVineyardStorageName(registry_manager_, instance_id);
-        KVCM_LOG_WARN(
-            "trace_id [%s] | ReportEvent: VineyardBackend [%s] not found", trace_id.c_str(), storage_name.c_str());
+    DataStorageType requested_type = static_cast<DataStorageType>(request->storage_type());
+    if (requested_type == DataStorageType::DATA_STORAGE_TYPE_UNKNOWN) {
+        KVCM_LOG_WARN("trace_id [%s] | ReportEvent: storage_type is required but not specified", trace_id.c_str());
+        response_status->set_code(proto::meta::INVALID_ARGUMENT);
+        response_status->set_message("storage_type is required");
+        return EC_BADARGS;
+    }
+
+    auto event_backend_holder = LookupEventReportingBackend(registry_manager_, instance_id);
+    auto *event_backend = dynamic_cast<EventReportingBackend *>(event_backend_holder.get());
+    if (!event_backend) {
+        KVCM_LOG_WARN("trace_id [%s] | ReportEvent: EventReportingBackend not found for instance [%s] type [%d]",
+                      trace_id.c_str(),
+                      instance_id.c_str(),
+                      static_cast<int>(requested_type));
         response_status->set_code(proto::meta::INSTANCE_NOT_EXIST);
-        response_status->set_message("VineyardBackend not found for instance: " + instance_id);
+        response_status->set_message("EventReportingBackend not found for instance: " + instance_id);
         return EC_INSTANCE_NOT_EXIST;
     }
 
-    if (!vineyard_backend->IsCleanupCallbackSet()) {
-        vineyard_backend->SetCleanupCallback(
-            [this](const std::string &instance_id, const std::string &down_host, uint64_t generation) {
+    if (event_backend->GetStorageType() != requested_type) {
+        KVCM_LOG_WARN("trace_id [%s] | ReportEvent: storage_type mismatch for instance [%s], "
+                      "requested [%d] but backend is [%d]",
+                      trace_id.c_str(),
+                      instance_id.c_str(),
+                      static_cast<int>(requested_type),
+                      static_cast<int>(event_backend->GetStorageType()));
+        response_status->set_code(proto::meta::INVALID_ARGUMENT);
+        response_status->set_message("storage_type mismatch");
+        return EC_BADARGS;
+    }
+
+    if (!event_backend->IsCleanupCallbackSet()) {
+        event_backend->SetCleanupCallback(
+            [this, requested_type](const std::string &instance_id, const std::string &down_host, uint64_t generation) {
                 assert(this->schedule_plan_executor_);
-                this->schedule_plan_executor_->SubmitTask([this, instance_id, down_host, generation] {
-                    this->CleanupHostLocations(instance_id, down_host, generation);
+                this->schedule_plan_executor_->SubmitTask([this, instance_id, down_host, generation, requested_type] {
+                    this->CleanupHostLocations(instance_id, down_host, generation, requested_type);
                 });
             });
     }
@@ -1562,7 +1579,7 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 per_item_ec[i] = EC_BADARGS;
                 break;
             }
-            std::string location_id = BuildVineyardLocationId(p.medium(), host_ip_port);
+            std::string location_id = event_backend->BuildLocationId(p.medium(), host_ip_port);
             std::vector<LocationSpec> entry_specs;
             entry_specs.reserve(p.specs_size());
             for (const auto &s : p.specs()) {
@@ -1592,7 +1609,8 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 per_item_ec[i] = EC_BADARGS;
                 break;
             }
-            block_to_del[block_key].push_back(BlockDelEntry{BuildVineyardLocationId(p.medium(), host_ip_port), i});
+            block_to_del[block_key].push_back(
+                BlockDelEntry{event_backend->BuildLocationId(p.medium(), host_ip_port), i});
             break;
         }
         default:
@@ -1606,7 +1624,7 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
     }
 
     if (has_register) {
-        auto ec = vineyard_backend->RegisterNode(instance_id, host_ip_port, register_mediums);
+        auto ec = event_backend->RegisterNode(instance_id, host_ip_port, register_mediums);
         if (ec != EC_OK) {
             for (int i = 0; i < events_size; ++i) {
                 if (request->events(i).event_type() == proto::meta::EVENT_NODE_REGISTER) {
@@ -1623,7 +1641,7 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
     }
 
     if (has_heartbeat) {
-        auto hb_ec = vineyard_backend->OnHeartbeat(host_ip_port, heartbeat_status);
+        auto hb_ec = event_backend->OnHeartbeat(host_ip_port, heartbeat_status);
         if (hb_ec != EC_OK) {
             for (int i = 0; i < events_size; ++i) {
                 if (request->events(i).event_type() == proto::meta::EVENT_HEARTBEAT) {
@@ -1664,7 +1682,7 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             for (const auto &entry : entries) {
                 upserts[i].push_back(MetaSearcher::UpsertLocation{
                     entry.location_id,
-                    DataStorageType::DATA_STORAGE_TYPE_VINEYARD,
+                    event_backend->GetStorageType(),
                     CacheLocationStatus::CLS_SERVING,
                     entry.specs,
                 });
@@ -1739,13 +1757,13 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
     }
 
     if (has_host_down) {
-        vineyard_backend->SetNodeUnavailable(host_ip_port);
-        uint64_t gen_at_trigger = vineyard_backend->GetNodeGeneration(host_ip_port);
+        event_backend->SetNodeUnavailable(host_ip_port);
+        uint64_t gen_at_trigger = event_backend->GetNodeGeneration(host_ip_port);
         assert(schedule_plan_executor_);
-        schedule_plan_executor_->SubmitTask([this, instance_id, host_ip_port, gen_at_trigger] {
-            this->CleanupHostLocations(instance_id, host_ip_port, gen_at_trigger);
+        schedule_plan_executor_->SubmitTask([this, instance_id, host_ip_port, gen_at_trigger, requested_type] {
+            this->CleanupHostLocations(instance_id, host_ip_port, gen_at_trigger, requested_type);
         });
-        vineyard_backend->UnregisterNode(host_ip_port);
+        event_backend->UnregisterNode(host_ip_port);
         KVCM_LOG_INFO("trace_id [%s] | HOST_DOWN: host [%s] cleanup scheduled (gen=%lu) and removed from node table",
                       trace_id.c_str(),
                       host_ip_port.c_str(),
@@ -1783,11 +1801,13 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
 
 void CacheManager::CleanupHostLocations(const std::string &instance_id,
                                         const std::string &host_ip_port,
-                                        uint64_t cleanup_generation) {
-    auto vineyard_backend = LookupVineyardBackend(registry_manager_, instance_id);
+                                        uint64_t cleanup_generation,
+                                        DataStorageType storage_type) {
+    auto event_backend_holder = LookupEventReportingBackend(registry_manager_, instance_id);
+    auto *event_backend = dynamic_cast<EventReportingBackend *>(event_backend_holder.get());
 
-    if (vineyard_backend) {
-        uint64_t current_gen = vineyard_backend->GetNodeGeneration(host_ip_port);
+    if (event_backend) {
+        uint64_t current_gen = event_backend->GetNodeGeneration(host_ip_port);
         if (current_gen != cleanup_generation) {
             KVCM_LOG_INFO("CleanupHostLocations: skipping stale cleanup for host [%s] instance [%s] "
                           "(trigger_gen=%lu, current_gen=%lu — node re-registered)",
@@ -1806,17 +1826,18 @@ void CacheManager::CleanupHostLocations(const std::string &instance_id,
     }
 
     RequestContext cleanup_ctx("cleanup_host_" + host_ip_port);
-    const std::string host_suffix = VineyardHostSuffix(host_ip_port);
+    const std::string host_suffix = event_backend ? event_backend->HostSuffix(host_ip_port) : ("#" + host_ip_port);
 
-    auto abort_if_reregistered = [vineyard_backend, host_ip_port, cleanup_generation]() -> bool {
-        if (!vineyard_backend) {
+    auto abort_if_reregistered = [event_backend_holder, host_ip_port, cleanup_generation]() -> bool {
+        auto *eb = dynamic_cast<EventReportingBackend *>(event_backend_holder.get());
+        if (!eb) {
             return false;
         }
-        return vineyard_backend->GetNodeGeneration(host_ip_port) != cleanup_generation;
+        return eb->GetNodeGeneration(host_ip_port) != cleanup_generation;
     };
 
     auto ec = meta_searcher->CleanupLocationsByHost(
-        &cleanup_ctx, host_suffix, /*scan_batch_size=*/1000, abort_if_reregistered);
+        &cleanup_ctx, host_suffix, storage_type, /*scan_batch_size=*/1000, abort_if_reregistered);
 
     if (ec == EC_OK) {
         KVCM_LOG_INFO("CleanupHostLocations: finished cleaning host [%s] from instance [%s]",
@@ -2049,21 +2070,21 @@ void CacheManager::StopRecoverRetryLoop() {
         recover_retry_thread_.join();
     }
 }
-void CacheManager::ClearVineyardCleanupCallbacks() {
+void CacheManager::ClearEventCleanupCallbacks() {
     if (!registry_manager_ || !registry_manager_->data_storage_manager()) {
         return;
     }
     auto dsm = registry_manager_->data_storage_manager();
     for (const auto &name : dsm->GetAllStorageNames()) {
-        auto vb = std::dynamic_pointer_cast<VineyardBackend>(dsm->GetDataStorageBackend(name));
-        if (vb) {
-            vb->SetCleanupCallback(nullptr);
+        auto *erb = dynamic_cast<EventReportingBackend *>(dsm->GetDataStorageBackend(name).get());
+        if (erb) {
+            erb->SetCleanupCallback(nullptr);
         }
     }
 }
 
 ErrorCode CacheManager::DoCleanup() {
-    ClearVineyardCleanupCallbacks();
+    ClearEventCleanupCallbacks();
     StopRecoverRetryLoop();
     // aborting write session need meta indexer
     if (write_location_manager_) {
@@ -2180,9 +2201,13 @@ CheckLocDataExistFunc CacheManager::GetCheckLocDataExistFunc(const std::string &
         }
 
         std::string storage_unique_name = storage_uris.front().GetHostName();
-        bool is_vineyard = (storage_uris.front().GetProtocol() == "vineyard");
-        if (is_vineyard) {
-            storage_unique_name = GetVineyardStorageName(registry_manager_, instance_id);
+        auto erb_holder = LookupEventReportingBackend(registry_manager_, instance_id);
+        auto *erb = dynamic_cast<EventReportingBackend *>(erb_holder.get());
+        if (erb && loc.type() == erb->GetStorageType()) {
+            auto ig = registry_manager_->GetInstanceGroupConfig(registry_manager_->GetInstanceGroupName(instance_id));
+            if (ig && !ig->event_reporting_storage_candidates().empty()) {
+                storage_unique_name = ig->event_reporting_storage_candidates().front();
+            }
         }
         const auto result = registry_manager_->data_storage_manager()->Exist(storage_unique_name, storage_uris, true);
         return std::all_of(result.cbegin(), result.cend(), [](bool v) { return v; });

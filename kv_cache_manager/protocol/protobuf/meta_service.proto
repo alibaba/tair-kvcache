@@ -97,6 +97,7 @@ message ReportEventRequest {
     string instance_id = 2;
     string host_ip_port = 3;
     repeated EventItem events = 4;
+    StorageType storage_type = 5; // required: declares the reporter's storage type
 }
 
 message ReportEventResponse {

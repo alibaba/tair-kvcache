@@ -304,6 +304,7 @@ class InstanceGroup(JsonData):
                  user_data: str = "",
                  version: int = 1,
                  extra_info: str = "",
+                 event_reporting_storage_candidates=None,
                  ):
         self._name = name
         self._storage_candidates = storage_candidates
@@ -314,6 +315,7 @@ class InstanceGroup(JsonData):
         self._user_data = user_data
         self._version = version
         self._extra_info = extra_info
+        self._event_reporting_storage_candidates = event_reporting_storage_candidates or []
         self.check()
 
     def check(self):
@@ -329,7 +331,7 @@ class InstanceGroup(JsonData):
         self._cache_config.check()
 
     def to_json_data(self) -> dict:
-        return {
+        data = {
             "name" : self._name,
             "storage_candidates" : self._storage_candidates,
             "global_quota_group_name" : self._quota_group_name,
@@ -340,6 +342,9 @@ class InstanceGroup(JsonData):
             "version" : self._version,
             "extra_info" : self._extra_info,
         }
+        if self._event_reporting_storage_candidates:
+            data["event_reporting_storage_candidates"] = self._event_reporting_storage_candidates
+        return data
     
     @classmethod
     def from_json_data(cls, json_data: dict):
@@ -360,7 +365,8 @@ class InstanceGroup(JsonData):
         if JsonData.expect_exist("version", json_data, (str, int)):
             version = int(json_data["version"])
         extra_info = json_data.get("extra_info", "")
-        return cls(name, storage_candidates, instance_group_quota, quota_group_name, max_instance_count, cache_config, user_data, version, extra_info)
+        event_reporting_storage_candidates = json_data.get("event_reporting_storage_candidates", [])
+        return cls(name, storage_candidates, instance_group_quota, quota_group_name, max_instance_count, cache_config, user_data, version, extra_info, event_reporting_storage_candidates)
     
 # create or update
 def parse_instance_group_args(is_create: bool):
@@ -492,6 +498,13 @@ def parse_instance_group_args(is_create: bool):
             "Opaque JSON string passed through to clients (e.g. V6D). "
             "On update, the provided JSON is merged into existing extra_info."
         )
+    )
+
+    parser.add_argument(
+        "--event_reporting_storage_candidates",
+        type=split_strs,
+        default=[] if is_create else argparse.SUPPRESS,
+        help="event_reporting_storage_candidates, eg. vineyard_default or vineyard_g1,vineyard_g2"
     )
 
     args = parser.parse_args()

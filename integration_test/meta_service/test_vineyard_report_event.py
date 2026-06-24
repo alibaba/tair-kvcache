@@ -161,12 +161,13 @@ def _ev_heartbeat(system_status=None):
     }
 
 
-def _make_request(instance_id, host_ip_port, events, trace_id="test"):
+def _make_request(instance_id, host_ip_port, events, trace_id="test", storage_type="ST_VINEYARD"):
     return {
         "trace_id": trace_id,
         "instance_id": instance_id,
         "host_ip_port": host_ip_port,
         "events": events,
+        "storage_type": storage_type,
     }
 
 
@@ -510,6 +511,7 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
                 "instance_id": self.instance_id,
                 "host_ip_port": "",
                 "events": [_ev_node_register(["mem"])],
+                "storage_type": "ST_VINEYARD",
             },
             check_ok=False,
         )

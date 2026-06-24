@@ -356,4 +356,20 @@ std::vector<ErrorCode> VineyardBackend::UnLock(const std::vector<DataStorageUri>
     return std::vector<ErrorCode>(storage_uris.size(), ErrorCode::EC_UNIMPLEMENTED);
 }
 
+std::string VineyardBackend::BuildLocationId(const std::string &medium, const std::string &host_ip_port) const {
+    std::string id;
+    id.reserve(8 + medium.size() + 1 + host_ip_port.size());
+    id.append("kvs#v6d#");
+    id.append(medium);
+    id.push_back('#');
+    id.append(host_ip_port);
+    return id;
+}
+
+std::string VineyardBackend::HostSuffix(const std::string &host_ip_port) const { return "#" + host_ip_port; }
+
+DataStorageType VineyardBackend::GetStorageType() const { return DataStorageType::DATA_STORAGE_TYPE_VINEYARD; }
+
+std::string VineyardBackend::GetProtocol() const { return "vineyard"; }
+
 } // namespace kv_cache_manager

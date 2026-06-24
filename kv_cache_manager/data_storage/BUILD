@@ -14,6 +14,7 @@ cc_library(
         "data_storage_backend.h",
         "data_storage_manager.h",
         "dummy_backend.h",
+        "event_reporting_backend.h",
         "hf3fs_backend.h",
         "mooncake_backend.h",
         "nfs_backend.h",

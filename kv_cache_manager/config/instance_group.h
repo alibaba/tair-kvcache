@@ -41,6 +41,12 @@ public:
     void set_version(int64_t version) { version_ = version; }
     const std::string &extra_info() const { return extra_info_; }
     void set_extra_info(const std::string &extra_info) { extra_info_ = extra_info; }
+    const std::vector<std::string> &event_reporting_storage_candidates() const {
+        return event_reporting_storage_candidates_;
+    }
+    void set_event_reporting_storage_candidates(const std::vector<std::string> &candidates) {
+        event_reporting_storage_candidates_ = candidates;
+    }
 
 private:
     std::string name_;
@@ -52,6 +58,7 @@ private:
     std::string user_data_;
     int64_t version_;
     std::string extra_info_;
+    std::vector<std::string> event_reporting_storage_candidates_;
 };
 
 } // namespace kv_cache_manager

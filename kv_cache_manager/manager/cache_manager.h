@@ -236,8 +236,10 @@ private:
                                        CacheLocationVector &locations);
     std::string GetStorageConfigStr(RequestContext *request_context, const std::string &instance_id) const;
 
-    void
-    CleanupHostLocations(const std::string &instance_id, const std::string &host_ip_port, uint64_t cleanup_generation);
+    void CleanupHostLocations(const std::string &instance_id,
+                              const std::string &host_ip_port,
+                              uint64_t cleanup_generation,
+                              DataStorageType storage_type);
     ErrorCode GetCacheLocationByQueryType(MetaSearcher *meta_searcher,
                                           RequestContext *request_context,
                                           const std::string &instance_id,
@@ -261,7 +263,7 @@ private:
                                                                   const std::string &instance_id) const;
     CheckLocDataExistFunc GetCheckLocDataExistFunc(const std::string &instance_id) const;
     SubmitDelReqFunc GetSubmitDelReqFunc(const std::string &instance_id) const;
-    void ClearVineyardCleanupCallbacks();
+    void ClearEventCleanupCallbacks();
 
     // purge metrics registry entries and invoke the removal callback
     // for a given instance_id

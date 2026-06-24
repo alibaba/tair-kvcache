@@ -56,6 +56,8 @@ def main():
         incoming = json.loads(args.extra_info)
         existing.update(incoming)
         current._extra_info = json.dumps(existing, ensure_ascii=False)
+    if hasattr(args, "event_reporting_storage_candidates"):
+        current._event_reporting_storage_candidates = args.event_reporting_storage_candidates
     current.check()
     current_version = current._version
     current._version += 1
