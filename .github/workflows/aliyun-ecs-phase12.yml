@@ -1,0 +1,53 @@
+name: aliyun-ecs-phase12
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - codex/aliyun-ecs-phase12-20260624
+  workflow_dispatch:
+
+concurrency:
+  group: aliyun-ecs-phase12-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  container-smoke:
+    name: container smoke
+    runs-on: aliyun-ecs-phase12
+    timeout-minutes: 20
+    container:
+      image: ghcr.io/alibaba/tair-kvcache-kvcm-dev:2026_02_13_12_03_24230b1
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+      - name: inspect runner and container
+        run: |
+          set -euxo pipefail
+          id
+          uname -a
+          cat /etc/os-release || true
+          df -h
+          mount | head -n 50
+          command -v bazelisk
+          bazelisk version
+
+  bazel-small:
+    name: bazel small target
+    needs: container-smoke
+    runs-on: aliyun-ecs-phase12
+    timeout-minutes: 60
+    container:
+      image: ghcr.io/alibaba/tair-kvcache-kvcm-dev:2026_02_13_12_03_24230b1
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+      - name: test LruEvictionPolicyTest
+        run: |
+          set -euxo pipefail
+          ulimit -c unlimited
+          bazelisk test //kv_cache_manager/optimizer/test:LruEvictionPolicyTest \
+            --cache_test_results=no \
+            --test_output=errors
