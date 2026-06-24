@@ -1,6 +1,9 @@
 name: aliyun-controller-poc
 
 on:
+  push:
+    branches:
+      - codex/aliyun-ecs-controller-poc-20260624
   workflow_dispatch:
 
 permissions:
