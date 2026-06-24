@@ -1,0 +1,23 @@
+name: aliyun-controller-poc
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: aliyun-ecs-controller-poc
+    steps:
+      - name: Runner context
+        run: |
+          set -eux
+          hostname
+          whoami
+          uname -a
+          df -h /
+      - name: Network smoke
+        run: |
+          set -eux
+          curl -L --connect-timeout 5 --max-time 20 -o /dev/null -w '%{http_code}\n' https://github.com/
