@@ -2029,7 +2029,7 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_VineyardNodeUnavailable) {
     vineyard_backend->Open(config, "test_trace");
 
     vineyard_backend->RegisterNode(instance_id, node_host, {"mem"});
-    vineyard_backend->SetNodeUnavailable(node_host);
+    vineyard_backend->SetNodeUnavailable(instance_id, node_host);
 
     auto dsm = registry_manager_->data_storage_manager_;
     dsm->storage_map_[vineyard_storage_name] = vineyard_backend;

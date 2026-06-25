@@ -39,14 +39,15 @@ public:
                            const std::string &host_ip_port,
                            const std::vector<std::string> &mediums) override;
 
-    ErrorCode UnregisterNode(const std::string &host_ip_port) override;
+    ErrorCode UnregisterNode(const std::string &instance_id, const std::string &host_ip_port) override;
 
-    ErrorCode OnHeartbeat(const std::string &host_ip_port,
+    ErrorCode OnHeartbeat(const std::string &instance_id,
+                          const std::string &host_ip_port,
                           const std::map<std::string, std::string> &system_status) override;
-    void SetNodeUnavailable(const std::string &host_ip_port) override;
-    bool IsNodeAvailable(const std::string &host_ip_port) const;
+    void SetNodeUnavailable(const std::string &instance_id, const std::string &host_ip_port) override;
+    bool IsNodeAvailable(const std::string &instance_id, const std::string &host_ip_port) const;
 
-    uint64_t GetNodeGeneration(const std::string &host_ip_port) const override;
+    uint64_t GetNodeGeneration(const std::string &instance_id, const std::string &host_ip_port) const override;
 
     std::string BuildLocationId(const std::string &medium, const std::string &host_ip_port) const override;
     std::string HostSuffix(const std::string &host_ip_port) const override;
@@ -82,6 +83,7 @@ private:
         std::atomic<int64_t> unavailable_since_ms{0};
 
         std::vector<std::string> mediums;
+        mutable std::mutex status_mutex;
         std::map<std::string, std::string> last_system_status;
         MetricsTags metrics_tags;
     };
@@ -89,9 +91,11 @@ private:
     VineyardStorageSpec spec_;
 
     mutable std::shared_mutex nodes_mutex_;
-    std::unordered_map<std::string, std::unique_ptr<NodeInfo>> nodes_;
+    // instance_id -> (host_ip_port -> NodeInfo)
+    std::unordered_map<std::string, std::unordered_map<std::string, std::unique_ptr<NodeInfo>>> instance_nodes_;
     // Persists across unregister/register to fence stale cleanup.
-    std::unordered_map<std::string, uint64_t> node_generation_;
+    // instance_id -> (host_ip_port -> generation)
+    std::unordered_map<std::string, std::unordered_map<std::string, uint64_t>> node_generation_;
 
     std::thread liveness_checker_thread_;
     std::atomic<bool> liveness_checker_running_{false};

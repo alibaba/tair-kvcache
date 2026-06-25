@@ -79,6 +79,16 @@ class KVCMClient:
             raise AssertionError(f"addStorage failed: {json.dumps(body)}")
         return body
 
+    def create_instance_group(self, data):
+        url = f"{self.admin_url}/api/createInstanceGroup"
+        resp = self.session.post(url, json=data)
+        resp.raise_for_status()
+        body = resp.json()
+        code = body.get("header", {}).get("status", {}).get("code")
+        if code not in ("OK", "DUPLICATE_ENTITY"):
+            raise AssertionError(f"createInstanceGroup failed: {json.dumps(body)}")
+        return body
+
     def get_cache_location(self, data):
         url = f"{self.base_url}/api/getCacheLocation"
         resp = self.session.post(url, json=data)
@@ -86,13 +96,13 @@ class KVCMClient:
         return resp.json()
 
     def start_write_cache_with_min_replica(self, data, check_response=True):
-        url = f"{self.base_url}/api/startWriteCacheWithMinReplica"
+        url = f"{self.base_url}/api/startWriteCache"
         resp = self.session.post(url, json=data)
         resp.raise_for_status()
         body = resp.json()
         if check_response:
             code = body.get("header", {}).get("status", {}).get("code")
-            assert code == "OK", f"startWriteCacheWithMinReplica failed: {json.dumps(body)}"
+            assert code == "OK", f"startWriteCache failed: {json.dumps(body)}"
         return body
 
     def finish_write_cache(self, data, check_response=True):
@@ -186,12 +196,14 @@ def _build_vineyard_uri(host_ip_port, medium, params=None):
 class VineyardReportEventFunctionalTest(unittest.TestCase):
     HOST = "192.168.1.200:8080"
     VINEYARD_STORAGE_NAME = "vineyard_default"
+    INSTANCE_GROUP_NAME = "vineyard_test_group"
 
     @classmethod
     def setUpClass(cls):
         cls.client = KVCMClient(BASE_URL, ADMIN_URL)
         cls.instance_id = INSTANCE_ID
         cls._ensure_vineyard_storage_registered()
+        cls._ensure_instance_group_created()
         cls._ensure_instance_registered()
         # Register host so subsequent events have a NodeInfo entry.
         cls.client.report_event(
@@ -223,11 +235,48 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
             print(f"[WARN] addStorage failed (may already exist): {e}")
 
     @classmethod
+    def _ensure_instance_group_created(cls):
+        cls.client.create_instance_group({
+            "trace_id": "setup_ig",
+            "instance_group": {
+                "name": cls.INSTANCE_GROUP_NAME,
+                "storage_candidates": ["nfs_01", cls.VINEYARD_STORAGE_NAME],
+                "global_quota_group_name": "default_quota_group",
+                "max_instance_count": 100,
+                "quota": {
+                    "capacity": 10737418240,
+                    "quota_config": [{"storage_type": 4, "capacity": 10737418240}],
+                },
+                "cache_config": {
+                    "reclaim_strategy": {
+                        "storage_unique_name": "nfs_01",
+                        "reclaim_policy": 1,
+                        "trigger_strategy": {"used_size": 1073741824, "used_percentage": 0.8},
+                        "trigger_period_seconds": 60,
+                        "reclaim_step_size": 1073741824,
+                        "reclaim_step_percentage": 10,
+                    },
+                    "data_storage_strategy": 2,
+                    "meta_indexer_config": {
+                        "max_key_count": 1000000,
+                        "mutex_shard_num": 16,
+                        "batch_key_size": 16,
+                        "meta_storage_backend_config": {"storage_type": "local", "storage_uri": ""},
+                        "meta_cache_policy_config": {"type": "LRU", "capacity": 10000},
+                    },
+                },
+                "event_reporting_storage_candidates": [cls.VINEYARD_STORAGE_NAME],
+                "version": 1,
+            },
+        })
+        print(f"[SETUP] InstanceGroup '{cls.INSTANCE_GROUP_NAME}' created")
+
+    @classmethod
     def _ensure_instance_registered(cls):
         try:
             cls.client.register_instance({
                 "trace_id": "setup",
-                "instance_group": "default",
+                "instance_group": cls.INSTANCE_GROUP_NAME,
                 "instance_id": cls.instance_id,
                 "block_size": 128,
                 "model_deployment": {

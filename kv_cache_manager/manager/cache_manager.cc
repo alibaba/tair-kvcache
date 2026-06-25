@@ -1641,7 +1641,7 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
     }
 
     if (has_heartbeat) {
-        auto hb_ec = event_backend->OnHeartbeat(host_ip_port, heartbeat_status);
+        auto hb_ec = event_backend->OnHeartbeat(instance_id, host_ip_port, heartbeat_status);
         if (hb_ec != EC_OK) {
             for (int i = 0; i < events_size; ++i) {
                 if (request->events(i).event_type() == proto::meta::EVENT_HEARTBEAT) {
@@ -1757,13 +1757,13 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
     }
 
     if (has_host_down) {
-        event_backend->SetNodeUnavailable(host_ip_port);
-        uint64_t gen_at_trigger = event_backend->GetNodeGeneration(host_ip_port);
+        event_backend->SetNodeUnavailable(instance_id, host_ip_port);
+        uint64_t gen_at_trigger = event_backend->GetNodeGeneration(instance_id, host_ip_port);
         assert(schedule_plan_executor_);
         schedule_plan_executor_->SubmitTask([this, instance_id, host_ip_port, gen_at_trigger, requested_type] {
             this->CleanupHostLocations(instance_id, host_ip_port, gen_at_trigger, requested_type);
         });
-        event_backend->UnregisterNode(host_ip_port);
+        event_backend->UnregisterNode(instance_id, host_ip_port);
         KVCM_LOG_INFO("trace_id [%s] | HOST_DOWN: host [%s] cleanup scheduled (gen=%lu) and removed from node table",
                       trace_id.c_str(),
                       host_ip_port.c_str(),
@@ -1807,7 +1807,7 @@ void CacheManager::CleanupHostLocations(const std::string &instance_id,
     auto *event_backend = dynamic_cast<EventReportingBackend *>(event_backend_holder.get());
 
     if (event_backend) {
-        uint64_t current_gen = event_backend->GetNodeGeneration(host_ip_port);
+        uint64_t current_gen = event_backend->GetNodeGeneration(instance_id, host_ip_port);
         if (current_gen != cleanup_generation) {
             KVCM_LOG_INFO("CleanupHostLocations: skipping stale cleanup for host [%s] instance [%s] "
                           "(trigger_gen=%lu, current_gen=%lu — node re-registered)",
@@ -1828,12 +1828,12 @@ void CacheManager::CleanupHostLocations(const std::string &instance_id,
     RequestContext cleanup_ctx("cleanup_host_" + host_ip_port);
     const std::string host_suffix = event_backend ? event_backend->HostSuffix(host_ip_port) : ("#" + host_ip_port);
 
-    auto abort_if_reregistered = [event_backend_holder, host_ip_port, cleanup_generation]() -> bool {
+    auto abort_if_reregistered = [event_backend_holder, instance_id, host_ip_port, cleanup_generation]() -> bool {
         auto *eb = dynamic_cast<EventReportingBackend *>(event_backend_holder.get());
         if (!eb) {
             return false;
         }
-        return eb->GetNodeGeneration(host_ip_port) != cleanup_generation;
+        return eb->GetNodeGeneration(instance_id, host_ip_port) != cleanup_generation;
     };
 
     auto ec = meta_searcher->CleanupLocationsByHost(
