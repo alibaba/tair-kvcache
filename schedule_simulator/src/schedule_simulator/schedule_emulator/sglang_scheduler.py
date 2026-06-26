@@ -248,7 +248,14 @@ class SGLangScheduleEmulator(ScheduleEmulator):
             self.scheduler_config.chunked_prefill_size = 8192
 
         # max number of tokens (L1 device cache capacity)
-        if self.scheduler_config.max_num_tokens is not None:
+        # In request-level + hierarchical mode, HBM capacity is fully managed by
+        # the C++ Optimizer (via --hbm-capacity). max_num_tokens here only serves
+        # as a Python-side guard and KVCachePool sizing hint; use a large default
+        # so it never becomes a binding constraint.
+        if self.scheduler_config.request_level_scheduling and self.scheduler_config.hicache_storage_backend is not None:
+            # Hierarchical mode: Optimizer owns eviction; default to 10M tokens
+            self.max_num_tokens = self.scheduler_config.max_num_tokens or 10_000_000
+        elif self.scheduler_config.max_num_tokens is not None:
             self.max_num_tokens = self.scheduler_config.max_num_tokens
         elif self.model is not None and self.hw is not None:
             from schedule_simulator._compat import HAS_DEEPESTIM as _has_de

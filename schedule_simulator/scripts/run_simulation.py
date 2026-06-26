@@ -41,7 +41,7 @@ def main():
     p.add_argument("--kv-bytes-per-token", type=int, default=None,
                    help="KV cache bytes per token (skip ModelInfo derivation)")
     p.add_argument("--max-num-tokens", type=int, default=None,
-                   help="L1 device KV cache capacity in tokens (skip HBM derivation)")
+                   help="L1 device KV cache capacity in tokens (optional; in hierarchical mode HBM is managed by Optimizer via --hbm-capacity)")
     p.add_argument("--l2-cache-tokens", type=int, default=None,
                    help="L2 host cache capacity in tokens (default: 2x L1)")
     p.add_argument("--predictor-pkl", type=str, default=None)
