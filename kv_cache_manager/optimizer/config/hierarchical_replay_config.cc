@@ -214,12 +214,13 @@ bool InferClusterConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "p2p_read_flows", p2p_read_flows_, std::vector<P2PReadFlowConfig>{});
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "active_windows", active_windows_, std::vector<InferActiveWindowConfig>{});
     KVCM_JSON_GET_MACRO(rapid_value, "storage_pool_flow", storage_pool_flow_);
-    return !storage_pool_id_.empty() && IsEngineReadQueryTypeValid(engine_read_query_type_) && !infer_ids_.empty() &&
-           !tiers_.empty();
+    return IsEngineReadQueryTypeValid(engine_read_query_type_) && !infer_ids_.empty() && !tiers_.empty();
 }
 
 void InferClusterConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
-    Put(writer, "storage_pool_id", storage_pool_id_);
+    if (!storage_pool_id_.empty()) {
+        Put(writer, "storage_pool_id", storage_pool_id_);
+    }
     Put(writer, "engine_read_query_type", engine_read_query_type_);
     Put(writer, "model", model_);
     Put(writer, "infer_ids", infer_ids_);
@@ -234,7 +235,9 @@ void InferClusterConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer
     if (!active_windows_.empty()) {
         Put(writer, "active_windows", active_windows_);
     }
-    Put(writer, "storage_pool_flow", storage_pool_flow_);
+    if (!storage_pool_id_.empty()) {
+        Put(writer, "storage_pool_flow", storage_pool_flow_);
+    }
 }
 
 bool HierarchicalReplayConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
@@ -249,7 +252,13 @@ bool HierarchicalReplayConfig::FromRapidValue(const rapidjson::Value &rapid_valu
         }
     }
     KVCM_JSON_GET_MACRO(rapid_value, "infer_clusters", infer_clusters_);
-    KVCM_JSON_GET_MACRO(rapid_value, "storage_pool", storage_pool_);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "enable_storage_pool", enable_storage_pool_, enable_storage_pool_);
+    if (enable_storage_pool_) {
+        KVCM_JSON_GET_MACRO(rapid_value, "storage_pool", storage_pool_);
+    } else if (rapid_value.HasMember("storage_pool") && (!rapid_value["storage_pool"].IsObject() ||
+                                                         !storage_pool_.FromRapidValue(rapid_value["storage_pool"]))) {
+        return false;
+    }
     KVCM_JSON_GET_DEFAULT_MACRO(
         rapid_value, "infer_scheduling_strategy", infer_scheduling_strategy_, std::string("preserve_trace"));
     if (!IsSupportedInferSchedulingStrategy(infer_scheduling_strategy_)) {
@@ -278,22 +287,27 @@ void HierarchicalReplayConfig::ToRapidWriter(rapidjson::Writer<rapidjson::String
     Put(writer, "infer_scheduling_strategy", infer_scheduling_strategy_);
     Put(writer, "infer_active_windows_from_trace", infer_active_windows_from_trace_);
     Put(writer, "enable_lifecycle_tracking", enable_lifecycle_tracking_);
+    Put(writer, "enable_storage_pool", enable_storage_pool_);
     if (!cache_drop_event_file_.empty()) {
         Put(writer, "cache_drop_event_file", cache_drop_event_file_);
     }
     Put(writer, "infer_clusters", infer_clusters_);
-    Put(writer, "storage_pool", storage_pool_);
+    if (enable_storage_pool_) {
+        Put(writer, "storage_pool", storage_pool_);
+    }
 }
 
 bool HierarchicalReplayConfig::BuildOptimizerConfigs() {
     std::unordered_set<std::string> pool_ids;
-    for (const auto &pool : storage_pool_.pools()) {
-        if (!pool_ids.insert(pool.pool_id()).second) {
+    if (enable_storage_pool_) {
+        for (const auto &pool : storage_pool_.pools()) {
+            if (!pool_ids.insert(pool.pool_id()).second) {
+                return false;
+            }
+        }
+        if (pool_ids.empty()) {
             return false;
         }
-    }
-    if (pool_ids.empty()) {
-        return false;
     }
 
     OptimizerConfig engine_config;
@@ -306,7 +320,7 @@ bool HierarchicalReplayConfig::BuildOptimizerConfigs() {
     engine_to_storage_pool_.clear();
     std::unordered_set<std::string> engine_ids;
     for (const auto &infer_group : infer_clusters_) {
-        if (pool_ids.find(infer_group.storage_pool_id()) == pool_ids.end()) {
+        if (enable_storage_pool_ && pool_ids.find(infer_group.storage_pool_id()) == pool_ids.end()) {
             return false;
         }
         if (infer_active_windows_from_trace_ && !infer_group.active_windows().empty()) {

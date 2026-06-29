@@ -19,6 +19,7 @@ bazel run //kv_cache_manager/optimizer:hierarchical_replay_main -- /path/to/hier
 - `infer_clusters[].tier_flows` 写满本地相邻层级的流动策略。
 - `infer_clusters[].storage_pool_flow` 定义该推理实例集群本地最后一层到 storage pool 的流动策略。这条边跨 engine manager 和 storage pool manager，不属于单个 optimizer instance group 的 `tier_flows`。
 - `infer_clusters[].p2p_read_flows` 可选定义同一个推理集群内的 peer read。P2P 位于 engine-local read 和 storage pool read 之间，命中计入 `PeerHit`，设计细节见 `docs/p2p_read.md`。
+- `enable_storage_pool=false` 时关闭 storage pool 层：配置中可以省略顶层 `storage_pool`，也可以省略 `infer_clusters[].storage_pool_id` 和 `infer_clusters[].storage_pool_flow`；读路径只执行 engine-local 和可选 P2P，`RemoteHit*` 固定为 0，写路径不写 pool。
 - `infer_clusters[].active_windows` 可选定义推理实例在线时间段，字段为 `infer_id/start_ns/end_ns`；同一个 infer 可以配置多个窗口。`round_robin` 和 `prefix_hit` 只会在当前时间活跃的 infer 中选择实例，P2P 也只会查询当前活跃 peer。
 - `infer_active_windows_from_trace=true` 时，trace 的 `instance_id` 只用于推导每个 infer 的在线窗口，请求仍按 `infer_scheduling_strategy` 重新调度。该字段不能和 `infer_clusters[].active_windows` 同时使用。
 - 没有配置 `active_windows` 且没有开启 `infer_active_windows_from_trace` 时，`round_robin` / `prefix_hit` 将认为该 cluster 内所有 infer 全程在线。

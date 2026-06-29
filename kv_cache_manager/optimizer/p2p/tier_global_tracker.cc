@@ -1,5 +1,6 @@
 #include "kv_cache_manager/optimizer/p2p/tier_global_tracker.h"
 
+#include <limits>
 #include <utility>
 
 namespace kv_cache_manager {
@@ -98,7 +99,8 @@ bool TierGlobalTracker::Contains(const std::string &cluster_id,
 TierGlobalPeerSelection TierGlobalTracker::SelectPeer(const std::string &engine_instance_id,
                                                       const std::string &cluster_id,
                                                       const std::string &tier,
-                                                      const std::vector<std::string> &candidate_infer_ids,
+                                                      const std::unordered_map<std::string, size_t> &infer_rank,
+                                                      const std::function<bool(const std::string &)> &is_infer_active,
                                                       const std::vector<int64_t> &block_ids,
                                                       const std::vector<bool> &satisfied_mask) const {
     std::vector<size_t> missing_indices;
@@ -124,22 +126,31 @@ TierGlobalPeerSelection TierGlobalTracker::SelectPeer(const std::string &engine_
         return {};
     }
 
+    const auto &scope = scope_it->second;
+    const auto &first_key_holders = first_key_it->second;
     size_t best_len = 0;
+    size_t best_rank = std::numeric_limits<size_t>::max();
     std::string best_peer;
-    for (const auto &peer_id : candidate_infer_ids) {
-        if (peer_id == engine_instance_id || first_key_it->second.count(peer_id) == 0) {
+    for (const auto &peer_id : first_key_holders) {
+        if (peer_id == engine_instance_id) {
             continue;
         }
-        size_t match_len = 0;
+        auto rank_it = infer_rank.find(peer_id);
+        if (rank_it == infer_rank.end() || !is_infer_active(peer_id)) {
+            continue;
+        }
+        size_t match_len = 1;
         while (match_len < missing_indices.size()) {
             const size_t block_idx = missing_indices[match_len];
-            if (!Contains(cluster_id, tier, block_ids[block_idx], peer_id)) {
+            auto key_it = scope.find(block_ids[block_idx]);
+            if (key_it == scope.end() || key_it->second.count(peer_id) == 0) {
                 break;
             }
             ++match_len;
         }
-        if (match_len > best_len) {
+        if (match_len > best_len || (match_len == best_len && rank_it->second < best_rank)) {
             best_len = match_len;
+            best_rank = rank_it->second;
             best_peer = peer_id;
         }
     }

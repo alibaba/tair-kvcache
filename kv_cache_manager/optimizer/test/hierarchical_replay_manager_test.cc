@@ -331,13 +331,14 @@ TEST_F(HierarchicalReplayManagerTest, CacheDropClearsEngineAndP2PTracker) {
     p2p_flow.set_tier("dram");
     p2p_flow.set_peer_read_touch_enabled(false);
     auto cluster = CreateInferClusterConfig(flow, {p2p_flow});
-    cluster.set_active_windows({CreateInferActiveWindow("engine_a", 0, 1000),
-                                CreateInferActiveWindow("engine_b", 0, 1000)});
+    cluster.set_active_windows(
+        {CreateInferActiveWindow("engine_a", 0, 1000), CreateInferActiveWindow("engine_b", 0, 1000)});
     config.set_infer_clusters({cluster});
 
     std::ofstream trace(config.trace_file_path());
-    trace << R"({"type":"write","instance_id":"engine_a","trace_id":"write_before_drop","timestamp_ns":100,"keys":[9101]})"
-          << "\n";
+    trace
+        << R"({"type":"write","instance_id":"engine_a","trace_id":"write_before_drop","timestamp_ns":100,"keys":[9101]})"
+        << "\n";
     trace
         << R"({"type":"get","instance_id":"engine_a","trace_id":"read_local_after_drop","timestamp_ns":200,"keys":[9101],"input_len":16,"query_type":"batch_get","block_mask":[]})"
         << "\n";
@@ -347,7 +348,8 @@ TEST_F(HierarchicalReplayManagerTest, CacheDropClearsEngineAndP2PTracker) {
     trace.close();
 
     std::ofstream drop_events(config.cache_drop_event_file());
-    drop_events << R"({"timestamp_ns":150,"instance_id":"engine_a"})" << "\n";
+    drop_events << R"({"timestamp_ns":150,"instance_id":"engine_a"})"
+                << "\n";
     drop_events.close();
 
     HierarchicalReplayManager manager(config);
@@ -530,6 +532,89 @@ TEST_F(HierarchicalReplayManagerTest, ParsesCompactClusterConfig) {
 
     HierarchicalReplayManager manager(config);
     EXPECT_TRUE(manager.Init());
+}
+
+TEST_F(HierarchicalReplayManagerTest, CanDisableStoragePoolFromCompactClusterConfig) {
+    const std::string root = GetTestTempRootPath() + "/hierarchical_replay_no_storage_pool";
+    std::ostringstream json;
+    json << R"({
+        "trace_file_path": ")"
+         << root << R"(/trace.jsonl",
+        "output_result_path": ")"
+         << root << R"(/output",
+        "infer_eviction_params": {
+            "eviction_mode": 3,
+            "eviction_batch_size_per_instance": 10
+        },
+        "enable_storage_pool": false,
+        "infer_clusters": [
+            {
+                "engine_read_query_type": "batch_get",
+                "model": {
+                    "block_size": 16,
+                    "bytes_per_token": 1,
+                    "eviction_policy_type": "lru",
+                    "eviction_policy_params": {
+                        "sample_rate": 1.0,
+                        "shard_count": 1,
+                        "sample_times": 32,
+                        "eviction_amplification_factor": 1.0
+                    }
+                },
+                "infer_ids": ["engine_a", "engine_b"],
+                "ttl_config": {
+                    "default_block_ttl_seconds": 0,
+                    "refresh_on_read": true
+                },
+                "tiers": [
+                    {"name": "hbm", "capacity": 1.0},
+                    {"name": "dram", "capacity": 1.0}
+                ],
+                "tier_flows": [
+                    {
+                        "from_tier": "hbm",
+                        "to_tier": "dram",
+                        "write_mode": "write_through",
+                        "access_propagation_enabled": false,
+                        "write_propagation_enabled": false,
+                        "selective_write_threshold": 2
+                    }
+                ],
+                "p2p_read_flows": [
+                    {
+                        "tier": "hbm",
+                        "peer_read_touch_enabled": false
+                    }
+                ]
+            }
+        ]
+    })";
+
+    HierarchicalReplayConfig config;
+    ASSERT_TRUE(config.FromJsonString(json.str()));
+    EXPECT_FALSE(config.enable_storage_pool());
+    EXPECT_TRUE(config.storage_pool().pools().empty());
+    EXPECT_EQ(config.engine_to_storage_pool().size(), 2);
+
+    HierarchicalReplayManager manager(config);
+    ASSERT_TRUE(manager.Init());
+
+    manager.WriteCache("engine_a", "write_peer", 1000, {1001});
+    auto peer_hit = manager.GetCacheLocation("engine_b", "peer_no_pool", 2000, {1001}, 16, "batch_get");
+    EXPECT_EQ(peer_hit.engine_hit_length, 0);
+    EXPECT_EQ(peer_hit.peer_hit_length, 1);
+    EXPECT_EQ(peer_hit.storage_pool_hit_length, 0);
+    EXPECT_EQ(peer_hit.total_hit_length, 1);
+
+    auto local_hit = manager.GetCacheLocation("engine_b", "local_after_peer_no_pool", 3000, {1001}, 16, "batch_get");
+    EXPECT_EQ(local_hit.engine_hit_length, 1);
+    EXPECT_EQ(local_hit.peer_hit_length, 0);
+    EXPECT_EQ(local_hit.storage_pool_hit_length, 0);
+    EXPECT_EQ(local_hit.total_hit_length, 1);
+
+    manager.AnalyzeResults();
+    EXPECT_TRUE(std::filesystem::exists(root + "/output/hierarchical_hit_rates.csv"));
+    EXPECT_FALSE(std::filesystem::exists(root + "/output/pool"));
 }
 
 TEST_F(HierarchicalReplayManagerTest, ExportsLifecycleForEngineAndPoolWhenEnabled) {

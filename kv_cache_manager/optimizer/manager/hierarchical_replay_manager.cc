@@ -103,10 +103,13 @@ bool HierarchicalReplayManager::Init() {
         return false;
     }
 
-    storage_pool_manager_ = std::make_unique<HashStoragePoolManager>(config_.storage_pool(), enable_lifecycle_tracking);
-    if (!storage_pool_manager_->Init()) {
-        KVCM_LOG_ERROR("Hierarchical replay failed to initialize storage pool manager.");
-        return false;
+    if (config_.enable_storage_pool()) {
+        storage_pool_manager_ =
+            std::make_unique<HashStoragePoolManager>(config_.storage_pool(), enable_lifecycle_tracking);
+        if (!storage_pool_manager_->Init()) {
+            KVCM_LOG_ERROR("Hierarchical replay failed to initialize storage pool manager.");
+            return false;
+        }
     }
     return true;
 }
@@ -168,19 +171,22 @@ bool HierarchicalReplayManager::ValidateAndBuildMappings() {
     engine_to_storage_pool_.clear();
     engine_to_cluster_.clear();
     cluster_infer_ids_.clear();
+    cluster_infer_rank_.clear();
     cluster_p2p_read_flows_.clear();
     engine_read_query_type_.clear();
     engine_storage_pool_flow_.clear();
     engine_block_size_.clear();
 
     const auto engine_instances = CollectInstances(config_.engine_config());
-    const auto storage_pools = CollectStoragePools(config_.storage_pool());
+    const bool enable_storage_pool = config_.enable_storage_pool();
+    const auto storage_pools = enable_storage_pool ? CollectStoragePools(config_.storage_pool())
+                                                   : std::unordered_map<std::string, StoragePoolInfo>{};
     std::vector<InferEngineActiveWindow> active_windows;
     if (engine_instances.empty()) {
         KVCM_LOG_ERROR("Hierarchical replay engine_config has no instances.");
         return false;
     }
-    if (storage_pools.empty()) {
+    if (enable_storage_pool && storage_pools.empty()) {
         KVCM_LOG_ERROR("Hierarchical replay storage_pool has no pools.");
         return false;
     }
@@ -219,6 +225,14 @@ bool HierarchicalReplayManager::ValidateAndBuildMappings() {
         }
     }
 
+    for (const auto &[cluster_id, infer_ids] : cluster_infer_ids_) {
+        auto &rank = cluster_infer_rank_[cluster_id];
+        rank.reserve(infer_ids.size());
+        for (size_t idx = 0; idx < infer_ids.size(); ++idx) {
+            rank.emplace(infer_ids[idx], idx);
+        }
+    }
+
     std::vector<std::string> engine_instance_ids;
     engine_instance_ids.reserve(config_.engine_to_storage_pool().size());
     for (const auto &mapping : config_.engine_to_storage_pool()) {
@@ -227,11 +241,6 @@ bool HierarchicalReplayManager::ValidateAndBuildMappings() {
         auto engine_it = engine_instances.find(engine_instance_id);
         if (engine_it == engine_instances.end()) {
             KVCM_LOG_ERROR("engine_to_storage_pool references unknown engine instance: %s", engine_instance_id.c_str());
-            return false;
-        }
-        auto storage_pool_it = storage_pools.find(storage_pool_id);
-        if (storage_pool_it == storage_pools.end()) {
-            KVCM_LOG_ERROR("engine_to_storage_pool references unknown storage pool: %s", storage_pool_id.c_str());
             return false;
         }
         if (engine_to_storage_pool_.find(engine_instance_id) != engine_to_storage_pool_.end()) {
@@ -246,18 +255,29 @@ bool HierarchicalReplayManager::ValidateAndBuildMappings() {
         }
 
         const size_t engine_block_size = PositiveBlockSizeOrZero(engine_it->second);
-        const size_t storage_pool_block_size = storage_pool_it->second.block_size;
-        if (engine_block_size == 0 || storage_pool_block_size == 0 || engine_block_size != storage_pool_block_size) {
-            KVCM_LOG_ERROR("engine/storage_pool block_size mismatch for engine=%s storage_pool=%s",
-                           engine_instance_id.c_str(),
-                           storage_pool_id.c_str());
+        if (engine_block_size == 0) {
+            KVCM_LOG_ERROR("engine instance has invalid block_size: %s", engine_instance_id.c_str());
             return false;
         }
-        if (engine_it->second.bytes_per_token() != storage_pool_it->second.bytes_per_token) {
-            KVCM_LOG_ERROR("engine/storage_pool bytes_per_token mismatch for engine=%s storage_pool=%s",
-                           engine_instance_id.c_str(),
-                           storage_pool_id.c_str());
-            return false;
+        if (enable_storage_pool) {
+            auto storage_pool_it = storage_pools.find(storage_pool_id);
+            if (storage_pool_it == storage_pools.end()) {
+                KVCM_LOG_ERROR("engine_to_storage_pool references unknown storage pool: %s", storage_pool_id.c_str());
+                return false;
+            }
+            const size_t storage_pool_block_size = storage_pool_it->second.block_size;
+            if (storage_pool_block_size == 0 || engine_block_size != storage_pool_block_size) {
+                KVCM_LOG_ERROR("engine/storage_pool block_size mismatch for engine=%s storage_pool=%s",
+                               engine_instance_id.c_str(),
+                               storage_pool_id.c_str());
+                return false;
+            }
+            if (engine_it->second.bytes_per_token() != storage_pool_it->second.bytes_per_token) {
+                KVCM_LOG_ERROR("engine/storage_pool bytes_per_token mismatch for engine=%s storage_pool=%s",
+                               engine_instance_id.c_str(),
+                               storage_pool_id.c_str());
+                return false;
+            }
         }
 
         engine_to_storage_pool_[engine_instance_id] = storage_pool_id;
@@ -318,6 +338,15 @@ const std::vector<std::string> &HierarchicalReplayManager::InferIdsForCluster(co
     return it->second;
 }
 
+const std::unordered_map<std::string, size_t> &
+HierarchicalReplayManager::InferRankForCluster(const std::string &cluster_id) const {
+    auto it = cluster_infer_rank_.find(cluster_id);
+    if (it == cluster_infer_rank_.end()) {
+        throw std::runtime_error("No infer rank for cluster: " + cluster_id);
+    }
+    return it->second;
+}
+
 const std::vector<P2PReadFlowConfig> &
 HierarchicalReplayManager::P2PReadFlowsForCluster(const std::string &cluster_id) const {
     auto it = cluster_p2p_read_flows_.find(cluster_id);
@@ -369,10 +398,16 @@ TierGlobalPeerSelection HierarchicalReplayManager::ApplyP2PReadFlow(const std::s
         return {};
     }
     const std::string &cluster_id = ClusterForEngine(engine_instance_id);
-    const std::vector<std::string> active_infer_ids =
-        infer_engine_scheduler_.ActiveInferIds(InferIdsForCluster(cluster_id), timestamp);
-    TierGlobalPeerSelection result = p2p_tracker_.SelectPeer(
-        engine_instance_id, cluster_id, flow.tier(), active_infer_ids, block_ids, *satisfied_mask);
+    const auto is_infer_active = [this, timestamp](const std::string &infer_id) {
+        return infer_engine_scheduler_.IsInferActiveAt(infer_id, timestamp);
+    };
+    TierGlobalPeerSelection result = p2p_tracker_.SelectPeer(engine_instance_id,
+                                                             cluster_id,
+                                                             flow.tier(),
+                                                             InferRankForCluster(cluster_id),
+                                                             is_infer_active,
+                                                             block_ids,
+                                                             *satisfied_mask);
     if (result.hit_indices.empty()) {
         return result;
     }
@@ -579,7 +614,8 @@ HierarchicalGetCacheLocationRes HierarchicalReplayManager::GetCacheLocation(cons
                                                                             const std::vector<int64_t> &block_ids,
                                                                             int64_t input_len,
                                                                             const std::string &query_type) {
-    if (!engine_manager_ || !storage_pool_manager_) {
+    const bool enable_storage_pool = config_.enable_storage_pool();
+    if (!engine_manager_ || (enable_storage_pool && !storage_pool_manager_)) {
         throw std::runtime_error("HierarchicalReplayManager is not initialized");
     }
     auto block_size_it = engine_block_size_.find(engine_instance_id);
@@ -587,7 +623,7 @@ HierarchicalGetCacheLocationRes HierarchicalReplayManager::GetCacheLocation(cons
         throw std::runtime_error("Unknown engine instance: " + engine_instance_id);
     }
 
-    const std::string &storage_pool_id = StoragePoolForEngine(engine_instance_id);
+    const std::string storage_pool_id = enable_storage_pool ? StoragePoolForEngine(engine_instance_id) : std::string();
     const std::string &engine_read_query_type = EngineReadQueryTypeForEngine(engine_instance_id);
     const BlockMask empty_mask = BlockMaskVector{};
     const auto engine_res = engine_manager_->GetCacheLocation(
@@ -601,15 +637,18 @@ HierarchicalGetCacheLocationRes HierarchicalReplayManager::GetCacheLocation(cons
     }
     const size_t engine_hit_blocks = engine_hit_indices.size();
 
-    const auto &storage_pool_flow = StoragePoolFlowForEngine(engine_instance_id);
-    ApplyStoragePoolCascadingEvictions(storage_pool_id,
-                                       engine_instance_id,
-                                       "read_eviction",
-                                       trace_id,
-                                       timestamp,
-                                       0,
-                                       storage_pool_flow,
-                                       engine_res.evicted_keys);
+    const StoragePoolFlowConfig storage_pool_flow =
+        enable_storage_pool ? StoragePoolFlowForEngine(engine_instance_id) : StoragePoolFlowConfig();
+    if (enable_storage_pool) {
+        ApplyStoragePoolCascadingEvictions(storage_pool_id,
+                                           engine_instance_id,
+                                           "read_eviction",
+                                           trace_id,
+                                           timestamp,
+                                           0,
+                                           storage_pool_flow,
+                                           engine_res.evicted_keys);
+    }
     std::vector<bool> satisfied_mask(block_ids.size(), false);
     MarkIndices(engine_hit_indices, &satisfied_mask);
     std::vector<size_t> peer_hit_indices;
@@ -632,18 +671,21 @@ HierarchicalGetCacheLocationRes HierarchicalReplayManager::GetCacheLocation(cons
         }
         peer_hit_indices.insert(peer_hit_indices.end(), p2p_read.hit_indices.begin(), p2p_read.hit_indices.end());
     }
-    const std::vector<size_t> non_storage_hit_indices = IndicesFromMask(satisfied_mask);
-    const auto storage_pool_read = ReadStoragePool(engine_instance_id,
-                                                   storage_pool_id,
-                                                   trace_id,
-                                                   timestamp,
-                                                   block_ids,
-                                                   non_storage_hit_indices,
-                                                   input_len,
-                                                   query_type,
-                                                   storage_pool_flow);
-    const size_t storage_pool_hit_blocks = storage_pool_read.hit_blocks;
-    MarkIndices(storage_pool_read.hit_indices, &satisfied_mask);
+    size_t storage_pool_hit_blocks = 0;
+    if (enable_storage_pool) {
+        const std::vector<size_t> non_storage_hit_indices = IndicesFromMask(satisfied_mask);
+        const auto storage_pool_read = ReadStoragePool(engine_instance_id,
+                                                       storage_pool_id,
+                                                       trace_id,
+                                                       timestamp,
+                                                       block_ids,
+                                                       non_storage_hit_indices,
+                                                       input_len,
+                                                       query_type,
+                                                       storage_pool_flow);
+        storage_pool_hit_blocks = storage_pool_read.hit_blocks;
+        MarkIndices(storage_pool_read.hit_indices, &satisfied_mask);
+    }
 
     CombinedReadRecord record;
     record.trace_id = trace_id;
@@ -682,16 +724,19 @@ WriteCacheRes HierarchicalReplayManager::WriteCacheWithTtlUs(const std::string &
                                                              int64_t timestamp,
                                                              const std::vector<int64_t> &block_ids,
                                                              int64_t ttl_us) {
-    if (!engine_manager_ || !storage_pool_manager_) {
+    const bool enable_storage_pool = config_.enable_storage_pool();
+    if (!engine_manager_ || (enable_storage_pool && !storage_pool_manager_)) {
         throw std::runtime_error("HierarchicalReplayManager is not initialized");
     }
-    const std::string &storage_pool_id = StoragePoolForEngine(engine_instance_id);
 
     auto engine_res = engine_manager_->WriteCacheWithTtlUs(engine_instance_id, trace_id, timestamp, block_ids, ttl_us);
     ApplyEngineTierEvents(engine_res.tier_flow_events);
-    const auto &storage_pool_flow = StoragePoolFlowForEngine(engine_instance_id);
-    ApplyStoragePoolWriteFlow(
-        engine_instance_id, storage_pool_id, trace_id, timestamp, ttl_us, storage_pool_flow, engine_res);
+    if (enable_storage_pool) {
+        const std::string &storage_pool_id = StoragePoolForEngine(engine_instance_id);
+        const auto &storage_pool_flow = StoragePoolFlowForEngine(engine_instance_id);
+        ApplyStoragePoolWriteFlow(
+            engine_instance_id, storage_pool_id, trace_id, timestamp, ttl_us, storage_pool_flow, engine_res);
+    }
 
     CombinedWriteRecord record;
     record.timestamp_ns = timestamp;
@@ -710,7 +755,7 @@ HashStoragePoolReadResult HierarchicalReplayManager::ReadStoragePool(const std::
                                                                      const std::string &query_type,
                                                                      const StoragePoolFlowConfig &flow) {
     HashStoragePoolReadResult result;
-    if (block_ids.empty()) {
+    if (!config_.enable_storage_pool() || block_ids.empty()) {
         return result;
     }
 
@@ -742,7 +787,7 @@ WriteCacheRes HierarchicalReplayManager::WriteStoragePoolKeys(const std::string 
                                                               bool touch_existing) {
     WriteCacheRes res;
     res.trace_id = trace_id;
-    if (keys.empty()) {
+    if (!config_.enable_storage_pool() || keys.empty()) {
         return res;
     }
 
@@ -772,6 +817,9 @@ void HierarchicalReplayManager::ApplyStoragePoolWriteFlow(const std::string &eng
                                                           int64_t ttl_us,
                                                           const StoragePoolFlowConfig &flow,
                                                           const WriteCacheRes &engine_write_res) {
+    if (!config_.enable_storage_pool()) {
+        return;
+    }
     if (flow.write_mode() == TierWriteMode::WRITE_THROUGH) {
         WriteStoragePoolKeys(engine_instance_id,
                              storage_pool_id,
@@ -812,7 +860,7 @@ void HierarchicalReplayManager::ApplyStoragePoolCascadingEvictions(const std::st
                                                                    int64_t ttl_us,
                                                                    const StoragePoolFlowConfig &flow,
                                                                    const std::vector<int64_t> &evicted_keys) {
-    if (flow.write_mode() != TierWriteMode::CASCADING) {
+    if (!config_.enable_storage_pool() || flow.write_mode() != TierWriteMode::CASCADING) {
         return;
     }
     WriteStoragePoolKeys(engine_instance_id,

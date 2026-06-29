@@ -124,6 +124,7 @@ private:
     const StoragePoolFlowConfig &StoragePoolFlowForEngine(const std::string &engine_instance_id) const;
     const std::string &ClusterForEngine(const std::string &engine_instance_id) const;
     const std::vector<std::string> &InferIdsForCluster(const std::string &cluster_id) const;
+    const std::unordered_map<std::string, size_t> &InferRankForCluster(const std::string &cluster_id) const;
     const std::vector<P2PReadFlowConfig> &P2PReadFlowsForCluster(const std::string &cluster_id) const;
     void ApplyEngineTierEvents(const std::vector<TierFlowKeyEvent> &events);
     void FillEngineFromHitIndices(const std::string &engine_instance_id,
@@ -180,6 +181,7 @@ private:
     std::unordered_map<std::string, std::string> engine_to_storage_pool_;
     std::unordered_map<std::string, std::string> engine_to_cluster_;
     std::unordered_map<std::string, std::vector<std::string>> cluster_infer_ids_;
+    std::unordered_map<std::string, std::unordered_map<std::string, size_t>> cluster_infer_rank_;
     std::unordered_map<std::string, std::vector<P2PReadFlowConfig>> cluster_p2p_read_flows_;
     std::unordered_map<std::string, std::string> engine_read_query_type_;
     std::unordered_map<std::string, StoragePoolFlowConfig> engine_storage_pool_flow_;

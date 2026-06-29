@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -30,7 +31,8 @@ public:
     [[nodiscard]] TierGlobalPeerSelection SelectPeer(const std::string &engine_instance_id,
                                                      const std::string &cluster_id,
                                                      const std::string &tier,
-                                                     const std::vector<std::string> &candidate_infer_ids,
+                                                     const std::unordered_map<std::string, size_t> &infer_rank,
+                                                     const std::function<bool(const std::string &)> &is_infer_active,
                                                      const std::vector<int64_t> &block_ids,
                                                      const std::vector<bool> &satisfied_mask) const;
 
