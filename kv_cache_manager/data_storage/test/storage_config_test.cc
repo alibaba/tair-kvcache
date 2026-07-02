@@ -54,12 +54,13 @@ TEST_F(StorageConfigTest, TestStorageConfigJsonizeNfs) {
 TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecParseNewSchema) {
     // 新版 schema：直接用 service_discovery_url，不带任何老字段。
     const std::string json =
-        R"({"domain":"pace.meta","timeout":5000,"service_discovery_url":"spectrum://v-xx?cache_time=30"})";
+        R"({"domain":"pace.meta","timeout":5000,"service_discovery_url":"spectrum://v-xx?cache_time=30","media_type":5})";
     TairMemPoolStorageSpec spec;
     ASSERT_TRUE(spec.FromJsonString(json));
     EXPECT_EQ(spec.domain(), "pace.meta");
     EXPECT_EQ(spec.timeout(), 5000);
     EXPECT_EQ(spec.service_discovery_url(), "spectrum://v-xx?cache_time=30");
+    EXPECT_EQ(spec.media_type(), kTairMemPoolMediaTypeSsd);
 }
 
 TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecMigrateLegacyVipserverFields) {
@@ -72,6 +73,23 @@ TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecMigrateLegacyVipserverFields
     EXPECT_EQ(spec.domain(), "pace.meta");
     EXPECT_EQ(spec.timeout(), 5000);
     EXPECT_EQ(spec.service_discovery_url(), "vipserver://pace.meta.vipserver");
+    EXPECT_EQ(spec.media_type(), kTairMemPoolMediaTypeUnspecified);
+}
+
+TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecRejectsInvalidMediaType) {
+    const std::string json = R"({"domain":"pace.meta","timeout":5000,"media_type":7})";
+    TairMemPoolStorageSpec spec;
+    ASSERT_TRUE(spec.FromJsonString(json));
+
+    std::string invalid_fields;
+    EXPECT_FALSE(spec.ValidateRequiredFields(invalid_fields));
+    EXPECT_NE(invalid_fields.find("media_type"), std::string::npos);
+}
+
+TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecRejectsOverflowMediaType) {
+    const std::string json = R"({"domain":"pace.meta","timeout":5000,"media_type":65538})";
+    TairMemPoolStorageSpec spec;
+    EXPECT_FALSE(spec.FromJsonString(json));
 }
 
 TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecLegacyEnableFalseDoesNotMigrate) {
@@ -102,15 +120,17 @@ TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecLegacyEnabledButEmptyDomainN
 }
 
 TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecToJsonOmitsLegacyFields) {
-    // ToJsonString 必须只输出新版字段（domain / timeout / service_discovery_url），
+    // ToJsonString 必须只输出新版字段（domain / timeout / service_discovery_url / media_type），
     // 不应再输出已废弃的 enable_vipserver / vipserver_domain，避免污染老 client 的解析路径。
     TairMemPoolStorageSpec spec;
     spec.set_domain("pace.meta");
     spec.set_timeout(5000);
     spec.set_service_discovery_url("spectrum://v-zz?cache_time=30");
+    spec.set_media_type(kTairMemPoolMediaTypeSsd);
     const std::string json = spec.ToJsonString();
     EXPECT_NE(json.find("\"domain\":\"pace.meta\""), std::string::npos);
     EXPECT_NE(json.find("\"service_discovery_url\":\"spectrum://v-zz?cache_time=30\""), std::string::npos);
+    EXPECT_NE(json.find("\"media_type\":5"), std::string::npos);
     EXPECT_EQ(json.find("enable_vipserver"), std::string::npos);
     EXPECT_EQ(json.find("vipserver_domain"), std::string::npos);
 }
@@ -121,6 +141,7 @@ TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecRoundTrip) {
     spec.set_domain("pace.meta");
     spec.set_timeout(5000);
     spec.set_service_discovery_url("static://10.0.0.1:8080,10.0.0.2:8080");
+    spec.set_media_type(kTairMemPoolMediaTypeDram);
     const std::string json = spec.ToJsonString();
 
     TairMemPoolStorageSpec parsed;
@@ -128,4 +149,5 @@ TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecRoundTrip) {
     EXPECT_EQ(parsed.domain(), spec.domain());
     EXPECT_EQ(parsed.timeout(), spec.timeout());
     EXPECT_EQ(parsed.service_discovery_url(), spec.service_discovery_url());
+    EXPECT_EQ(parsed.media_type(), spec.media_type());
 }

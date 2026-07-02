@@ -95,6 +95,7 @@ message TairMemPoolStorageSpec {
     //     spectrum://v-ad2d143d?cache_time=30&retry_time=3&timeout=5000
     //     static://11.22.33.44:8080,33.55.66.77:8080
     string service_discovery_url = 5;
+    int32 media_type = 6; // 0=不指定；2=DRAM；5=SSD
 }
 
 message NfsStorageSpec {

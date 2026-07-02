@@ -47,6 +47,7 @@ public:
 private:
     DummyStorageSpec spec_;
     std::filesystem::path base_path_;
+    bool memory_only_ = false;
 };
 
 } // namespace kv_cache_manager

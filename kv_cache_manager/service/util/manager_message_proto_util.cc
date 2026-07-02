@@ -1,5 +1,6 @@
 #include "manager_message_proto_util.h"
 
+#include <limits>
 #include <type_traits>
 
 #include "kv_cache_manager/common/logger.h"
@@ -49,6 +50,7 @@ void ProtoConvert::StorageConfigToProto(const StorageConfig &storage_config,
         tair_mem_pool->set_domain(tair_mem_pool_storage.domain());
         tair_mem_pool->set_timeout(tair_mem_pool_storage.timeout());
         tair_mem_pool->set_service_discovery_url(tair_mem_pool_storage.service_discovery_url());
+        tair_mem_pool->set_media_type(tair_mem_pool_storage.media_type());
     } else if (type == DataStorageType::DATA_STORAGE_TYPE_NFS) {
         const auto &nfs_storage = *std::dynamic_pointer_cast<NfsStorageSpec>(storage_config.storage_spec());
         auto *nfs = proto_storage_config->mutable_nfs();
@@ -116,6 +118,10 @@ void ProtoConvert::StorageFromProto(const proto::admin::StorageConfig *proto_sto
         spec.set_domain(proto_storage_config->tair_mem_pool().domain());
         spec.set_timeout(proto_storage_config->tair_mem_pool().timeout());
         spec.set_service_discovery_url(proto_storage_config->tair_mem_pool().service_discovery_url());
+        const int32_t media_type = proto_storage_config->tair_mem_pool().media_type();
+        spec.set_media_type(media_type < 0 || media_type > std::numeric_limits<uint16_t>::max()
+                                ? std::numeric_limits<uint16_t>::max()
+                                : static_cast<uint16_t>(media_type));
         storage_config.set_storage_spec(std::make_shared<TairMemPoolStorageSpec>(spec));
         storage_config.set_type(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL);
         break;

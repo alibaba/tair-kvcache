@@ -176,6 +176,31 @@ TEST_F(DummyBackendTest, TestExistAndMightExistOnNonExistentFiles) {
     EXPECT_FALSE(might_res[1]);
 }
 
+TEST_F(DummyBackendTest, TestMemoryOnlyModeSkipsFileSystemChecks) {
+    DummyBackend backend(metrics_registry_);
+    auto config = MakeConfig("memory://", 1);
+    ASSERT_EQ(EC_OK, backend.Open(config, "trace_1"));
+    ASSERT_TRUE(backend.Available());
+
+    auto create_res = backend.Create({"memory_key"}, 128, "trace_2", []() {});
+    ASSERT_EQ(create_res.size(), 1u);
+    ASSERT_EQ(create_res[0].first, EC_OK);
+    EXPECT_EQ(create_res[0].second.GetProtocol(), "dummy");
+    EXPECT_NE(std::string::npos, create_res[0].second.ToUriString().find("/memory/memory_key"));
+
+    DataStorageUri missing_uri;
+    missing_uri.SetProtocol("dummy");
+    missing_uri.SetPath("/definitely/not/on/disk");
+    EXPECT_TRUE(backend.Exist({missing_uri})[0]);
+    EXPECT_TRUE(backend.MightExist({missing_uri})[0]);
+
+    bool cb_called = false;
+    auto delete_res = backend.Delete({missing_uri}, "trace_3", [&cb_called]() { cb_called = true; });
+    ASSERT_TRUE(cb_called);
+    ASSERT_EQ(delete_res.size(), 1u);
+    EXPECT_EQ(delete_res[0], EC_OK);
+}
+
 TEST_F(DummyBackendTest, TestExistAndMightExistOnExistingFiles) {
     DummyBackend backend(metrics_registry_);
     auto config = MakeConfig(test_root_, 1);
