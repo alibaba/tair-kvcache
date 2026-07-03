@@ -329,3 +329,18 @@ TEST_F(TransferClientTest, TestLoadKvCachesExpectedHashesSizeMismatchFails) {
     EXPECT_EQ(ER_OK, client->LoadKvCaches(locations_, block_buffers, nullptr, &expected_checksums));
 #endif
 }
+
+// SaveKvCaches 失败时 out_checksums 必须保持空 —— 老实现把计算完的 checksum 直接
+// 交给 caller，再让 caller 透传到 FinishWrite，就会给磁盘上不存在的数据落一条 hash。
+// 此处触发 sdk_wrapper->Put 前置校验错误 (empty inputs)，覆盖两种 build 下的行为。
+TEST_F(TransferClientTest, TestSaveKvCachesFailureLeavesOutChecksumsEmpty) {
+    auto client = TransferClient::Create(client_config_, init_params_);
+    ASSERT_NE(client, nullptr);
+    UriStrVec empty_uris = {};
+    BlockBuffers empty_buffers = {};
+    // 预先塞一个「上次遗留」的 checksum，确保 SaveKvCaches 在失败路径上清理它。
+    std::vector<int64_t> out_checksums = {0xDEADBEEFLL};
+    auto result = client->SaveKvCaches(empty_uris, empty_buffers, /*trace_info=*/nullptr, &out_checksums);
+    EXPECT_EQ(ER_INVALID_PARAMS, result.first);
+    EXPECT_TRUE(out_checksums.empty()) << "out_checksums must be cleared on Save failure";
+}
