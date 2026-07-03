@@ -194,3 +194,16 @@ TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecRoundTrip) {
     EXPECT_EQ(parsed.timeout(), spec.timeout());
     EXPECT_EQ(parsed.service_discovery_url(), spec.service_discovery_url());
 }
+
+// integrity 字段类型错乱 (bool 位置放了 string) 时 StorageConfig 必须整体解析失败,
+// 而不是把 integrity 静默降级为全默认后照收。
+TEST_F(StorageConfigTest, TestStorageConfigRejectsMalformedIntegrity) {
+    const std::string malformed_json = R"({
+        "type": "file",
+        "global_unique_name": "bad_integrity",
+        "storage_spec": {"root_path": "/tmp/x", "key_count_per_file": 1},
+        "integrity": {"enable_meta_checksum": "true", "enable_inline_header": false}
+    })";
+    StorageConfig config;
+    EXPECT_FALSE(config.FromJsonString(malformed_json));
+}
