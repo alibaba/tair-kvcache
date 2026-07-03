@@ -97,6 +97,9 @@ CacheLocationConstPtr SelectAndMergeForMatch(SelectLocationPolicy *policy,
     }
     result->set_spec_size(specs.size());
     result->set_location_specs(std::move(specs));
+    // Same block replicated across specs shares one checksum by design (see
+    // data_integrity design doc); carry the winner's so the read path can verify.
+    result->set_checksum(winner->checksum());
     return result;
 }
 
@@ -521,6 +524,7 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
                 }
                 merged->set_spec_size(specs.size());
                 merged->set_location_specs(std::move(specs));
+                merged->set_checksum(winner->checksum());
                 out_locations[i].push_back(std::move(merged));
             }
         }

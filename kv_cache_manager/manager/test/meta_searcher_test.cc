@@ -1380,6 +1380,82 @@ TEST_F(MetaSearcherTest, TestBatchGetMergesSpecsByStorageType) {
     }
 }
 
+// SelectAndMergeForMatch must carry the winner's checksum into the merged
+// CacheLocation so the read path can verify. Without this the sentinel 0 makes
+// LoadKvCaches skip verification even when meta stored a real checksum.
+TEST_F(MetaSearcherTest, TestBatchGetBestLocationPreservesChecksum) {
+    MetaSearcher::KeyVector keys = {61000};
+    std::vector<LocationSpec> specs_a = {MetaSearcherTestHelper::CreateLocationSpec("tp0", "nfs:///a/tp0")};
+    std::vector<LocationSpec> specs_b = {MetaSearcherTestHelper::CreateLocationSpec("tp1", "nfs:///b/tp1")};
+    CacheLocationConstPtr loc_a =
+        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, specs_a);
+    CacheLocationConstPtr loc_b =
+        MetaSearcherTestHelper::CreateCacheLocation(DataStorageType::DATA_STORAGE_TYPE_NFS, 1, specs_b);
+
+    // All replicas of a block share one checksum by design.
+    constexpr int64_t kChecksum = 0x0123456789ABCDEFLL;
+
+    std::vector<std::string> out_ids_a;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchAddLocation(request_context_.get(), keys, {loc_a}, out_ids_a));
+    std::vector<std::string> out_ids_b;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchAddLocation(request_context_.get(), keys, {loc_b}, out_ids_b));
+
+    std::vector<std::vector<MetaSearcher::LocationUpdateTask>> tasks{
+        {{out_ids_a[0], CLS_SERVING, kChecksum}, {out_ids_b[0], CLS_SERVING, kChecksum}},
+    };
+    std::vector<std::vector<ErrorCode>> results;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), keys, tasks, results));
+
+    CacheLocationVector out_locations;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetBestLocation(request_context_.get(), keys, out_locations, &policy_));
+    ASSERT_EQ(out_locations.size(), 1u);
+    ASSERT_EQ(out_locations[0]->location_specs().size(), 2u); // both merged
+    EXPECT_EQ(out_locations[0]->checksum(), kChecksum);
+}
+
+// BatchGetBestLocationByBackend has its own inline merge path (does not go
+// through SelectAndMergeForMatch); it must also carry the checksum.
+TEST_F(MetaSearcherTest, TestBatchGetBestLocationByBackendPreservesChecksum) {
+    MetaSearcher::KeyVector keys = {61100};
+    std::vector<LocationSpec> specs_a = {LocationSpec("tp0", "v6d://peer_a:8080/tp0")};
+    std::vector<LocationSpec> specs_b = {LocationSpec("tp1", "v6d://peer_b:8080/tp1")};
+
+    std::vector<std::vector<MetaSearcher::UpsertLocation>> upserts = {
+        {
+            {"kvs#v6d#mem#peer_a:8080", DataStorageType::DATA_STORAGE_TYPE_VINEYARD, CLS_SERVING, specs_a},
+            {"kvs#v6d#mem#peer_b:8080", DataStorageType::DATA_STORAGE_TYPE_VINEYARD, CLS_SERVING, specs_b},
+        },
+    };
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchUpsertLocations(request_context_.get(), keys, upserts, per_key_ec));
+
+    // Attach a checksum to both replicas via the update path.
+    std::vector<CacheLocationMap> loc_maps;
+    BlockMask empty_mask;
+    ASSERT_EQ(EC_OK, meta_searcher_->BatchGetLocation(request_context_.get(), keys, empty_mask, loc_maps));
+    ASSERT_EQ(loc_maps.size(), 1u);
+    ASSERT_EQ(loc_maps[0].size(), 2u);
+    constexpr int64_t kChecksum = 0x77AA55BB11CC33DDLL;
+    std::vector<MetaSearcher::LocationUpdateTask> per_key_tasks;
+    for (const auto &[id, _loc] : loc_maps[0]) {
+        per_key_tasks.push_back({id, CLS_SERVING, kChecksum});
+    }
+    std::vector<std::vector<MetaSearcher::LocationUpdateTask>> update_tasks{per_key_tasks};
+    std::vector<std::vector<ErrorCode>> update_results;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchUpdateLocationStatus(request_context_.get(), keys, update_tasks, update_results));
+
+    std::vector<BackendSelector> selectors = {
+        {DataStorageType::DATA_STORAGE_TYPE_VINEYARD, LocationSelectStrategy::LSS_V6D_COVERAGE},
+    };
+    LocationsPerKey out;
+    ASSERT_EQ(EC_OK,
+              meta_searcher_->BatchGetBestLocationByBackend(request_context_.get(), keys, out, &policy_, selectors));
+    ASSERT_EQ(out.size(), 1u);
+    ASSERT_FALSE(out[0].empty());
+    EXPECT_EQ(out[0].front()->checksum(), kChecksum);
+}
+
 // ============================================================
 // BatchGetBestLocationByBackend tests
 // ============================================================
