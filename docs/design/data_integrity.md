@@ -51,10 +51,12 @@ GetBlocksHash    ──▶ actual[i]
                         │
                         ▼
    VerifyBatchChecksums(expected, actual, strict_mode):
-     fast (default) ── XOR aggregate, single compare
+     fast (default) ── XOR aggregate with position-dependent odd multiplier,
+                       single compare. Order-sensitive: block swaps and same-
+                       delta paired mutations both change the aggregate.
                        └─ mismatch → fallback per-block to pinpoint faulty indices
      strict         ── KVCM_CHECKSUM_STRICT_MODE=1 forces per-block always
-                       (catches paired-cancellation, ~2^-64 false negative)
+                       (diagnostic knob for on-call triage)
 
      all match  → ER_OK
      mismatch   → KVCM_LOG_ERROR per faulty block + ER_CHECKSUM_MISMATCH
@@ -109,7 +111,7 @@ GetBlocksHash    ──▶ actual[i]
 再聚合 xor 后概率更低)。当前接受这个 false-negative，不引入 3-state 语义 (避免
 proto 字段类型升级)。
 
-### Validate 三层防线
+### Validate 四层防线
 
 `DataIntegrityConfig::ValidateRequiredFields` 同时做三件事:
 
@@ -117,9 +119,14 @@ proto 字段类型升级)。
 2. `inline_header_version != 0` 但开关没开 → 拒绝 (配置矛盾)
 3. `enable_meta_checksum=true` 但 `algo == CA_UNSPECIFIED` → 拒绝 (必须显式设算法)
 
-`StorageConfig::ValidateRequiredFields` 把 DataIntegrityConfig 的拒绝合并到自身。
-`TransferClientImpl::Init` 解析 `init_params.storage_configs` 时做相同检查 + 返回
-client error code `ER_INLINE_HEADER_INVALID`。
+- **StorageConfig 层**: `StorageConfig::FromRapidValue` 里 integrity 子对象解析失败时
+  整段 JSON 解析失败 (不允许静默降级为「全关」)；`StorageConfig::ValidateRequiredFields`
+  把 DataIntegrityConfig 的拒绝合并到自身。
+- **Registry 层**: `RegistryManager::AddStorage` 与 `RegistryManager::RecoverStorageUnsafe`
+  在写入 registry 之前都调 `ValidateRequiredFields`，防止半合法的配置落盘后每次重启都
+  被 recover 进来，最终让 client 端 Init 说不 —— server 与 client 视图不一致。
+- **Client 层**: `TransferClientImpl::Init` 解析 `init_params.storage_configs` 时做相同
+  检查 + 返回 `ER_INLINE_HEADER_INVALID` / `ER_INVALID_STORAGE_CONFIG`。
 
 ### 读端校验策略：fast + per-block fallback
 
@@ -128,17 +135,22 @@ Reviewer 反馈：「一个 location 一个 checksum 就够了，因为每次都
 
 落地为两段式校验 (`client/src/internal/util/checksum_verify_util.h`):
 
-**Stage 1 — fast (默认)**: 把整个 batch 的 expected 和 actual 各自 XOR 聚合成一个
-`int64`，比一次。批量越大，相对节省越多 (避免 N 次 cache line read + 分支)。
+**Stage 1 — fast (默认)**: 把整个 batch 的 expected 和 actual 各自聚合成一个 `uint64`
+比一次。每个 block 的贡献先乘以 `(2*i+1) * kIndexSalt` (kIndexSalt = 2^64/phi，
+奇数，模 2^64 乘法可逆) 再 XOR，聚合是 order-sensitive 的 —— 整数乘法不是
+GF(2)-线性，`(A*m0)^(B*m1) != (B*m0)^(A*m1)`，所以 block 顺序错乱 (读串) 直接被抓；
+同一 delta 成对突变 (`expected=[A,B]`, `actual=[A^D, B^D]`) 也因非线性无法对消。
+批量越大，相对节省越多 (避免 N 次 cache line read + 分支)。
 
 **Stage 2 — slow (仅在 fast 检测到 mismatch，或 strict_mode=true 时进入)**: 遍历
 batch，回填每个错位 block 的 index，让上层逐块 log + 后续发布
 `ChecksumMismatchEvent`。
 
 **strict mode (`KVCM_CHECKSUM_STRICT_MODE=1`)**: 跳过 fast 聚合，直接走 per-block。
-用途：fast 路径理论上可被「成对 XOR 抵消」绕过 (概率 ~`2^-64`)，排查阶段可强制严格
-比对消除这个不确定性。`ChecksumVerifyUtilTest.StrictModeCatchesPairedXorCancellation`
-构造了这个 corner case 并验证 fast 漏 / strict 抓的差异。
+用途：诊断工具 —— 排查阶段想要 per-block 结果而不想经过 fast fallback 时使用；
+`ChecksumVerifyUtilTest.FastPathCatchesBlockSwap` /
+`ChecksumVerifyUtilTest.DetectsSameDeltaPairedMutation` 分别覆盖两种历史 fast 漏检
+模式，防止将来实现回退到纯 XOR 聚合时静默失效。
 
 ## 方案 B: 接口预留 (本期未实现)
 
@@ -169,7 +181,12 @@ batch，回填每个错位 block 的 index，让上层逐块 log + 后续发布
 | 非 CUDA/MUSA build 的 client 收到 `expected_checksums` | warn 日志 + 整条校验路径 no-op (fail-open) |
 | spec 开了 `enable_meta_checksum` 但 client 没传 `expected_checksums` | 不校验 (兼容增量接入) |
 | spec 开了 `enable_meta_checksum` 但 `sdk_buffer_check_pool` init 失败 | `Init` 返回 `ER_INIT_CHECK_BUFFER_ERROR` |
-| Fast path 成对 XOR 抵消的极端构造 (~2^-64) | 默认 fast 漏；`KVCM_CHECKSUM_STRICT_MODE=1` 抓 |
+| Block swap / 同 delta 成对突变 | 引入 position-dependent 奇数乘子后 fast path 直接抓；strict_mode 一致 |
+| RegistryManager 收到 `enable_inline_header=true` 的持久化配置 | `AddStorage` / `RecoverStorageUnsafe` 都 `ValidateRequiredFields` 拒 (`EC_BADARGS`，recover 时 `++error_count` skip) |
+| StorageConfig JSON 里 `integrity` 字段类型错乱 | `FromJsonString` 直接返回 false，`RegistryManager` / `TransferClient` 拿不到降级后的配置 |
+| `SaveKvCaches` IOV 数超 `KVCM_SDK_MAX_CHECK_IOV_NUM` | Put 前拒 (`ER_INVALID_PARAMS`)，不写入介质 |
+| `SaveKvCaches` 之后 `Put` 失败 | `out_checksums` 保持空，caller 不会把 hash 透传给 FinishWrite |
+| merged CacheLocation (batch_get / prefix / reverse-window) | winner 的 checksum 透传到 merged location，读端能校验 |
 
 mismatch 时**当前不自动调用 RemoveCache 清理 meta** —— 留给上层 (ManagerClient 或推理引擎
 connector) 根据业务策略决定 (重试 / drop / 上报)。未来可以加一个 `RemoveCacheByMismatch`
@@ -177,7 +194,7 @@ connector) 根据业务策略决定 (重试 / drop / 上报)。未来可以加�
 
 ## 实现拆分
 
-落地共 13 个 commit (跳过原 plan 中的 commit 10 chaos test，理由见 follow-up):
+落地共 20 个 commit (跳过原 plan 中的 commit 10 chaos test，理由见 follow-up):
 
 | Commit | 范围 |
 |---|---|
@@ -194,6 +211,13 @@ connector) 根据业务策略决定 (重试 / drop / 上报)。未来可以加�
 | 11 | `[manager] update storage JSON literal assertions for new integrity field` |
 | 12 | `[refactor] rename block_hash to checksum across protocol and C++ layers` |
 | 13 | `[client] add fast batch verify with per-block fallback on Load path` |
+| 14 | `[client] address codex review feedback (read-path round-trip + 6 fixes)` |
+| 15 | `[manager] copy checksum into merged CacheLocation for read path` |
+| 16 | `[client] make VerifyBatchChecksums fast path order-sensitive` |
+| 17 | `[client] address 4 more review points on Save/Load checksum path` |
+| 18 | `[config] validate storage config at RegistryManager Add / Recover` |
+| 19 | `[data_storage] propagate integrity JSON parse failure in StorageConfig` |
+| 20 | `[docs] update data_integrity design doc for round-2 review feedback` |
 
 每个 commit 在 `github-opensource/` 下用 `bazelisk test --config=debug --config=asan
 --test_env ASAN_OPTIONS=detect_odr_violation=0 //kv_cache_manager/<改动 package>/test:all`
