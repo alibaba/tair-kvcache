@@ -81,16 +81,32 @@ TEST_F(ChecksumVerifyUtilTest, StrictModeAllMatch) {
     EXPECT_FALSE(r.mismatch);
 }
 
-// 极端：fast 路径 XOR 偶然抵消的构造场景。Strict mode 必须仍能发现。
-// 构造：block #0 expected=0xAAAA actual=0xBBBB，block #1 expected=0xBBBB actual=0xAAAA
-// XOR 都是 0xAAAA ^ 0xBBBB，fast aggregate 相等 -> fast 漏；strict 不漏。
-TEST_F(ChecksumVerifyUtilTest, StrictModeCatchesPairedXorCancellation) {
+// Block swap (读串): expected=[A,B], actual=[B,A]. 老 XOR 聚合无序会漏，
+// 加了 position-dependent 奇数乘子后 fast path 也能识别并回填两个 faulty index。
+TEST_F(ChecksumVerifyUtilTest, FastPathCatchesBlockSwap) {
     std::vector<int64_t> expected = {0xAAAA, 0xBBBB};
     std::vector<int64_t> actual = {0xBBBB, 0xAAAA};
-    // Fast: 漏 (XOR 都是 0xAAAA^0xBBBB)
     auto r_fast = VerifyBatchChecksums(expected, actual, /*strict_mode=*/false);
-    EXPECT_FALSE(r_fast.mismatch);
-    // Strict: 抓到两个
+    ASSERT_TRUE(r_fast.mismatch);
+    ASSERT_EQ(r_fast.faulty_indices.size(), 2u);
+    EXPECT_EQ(r_fast.faulty_indices[0], 0u);
+    EXPECT_EQ(r_fast.faulty_indices[1], 1u);
+    // Strict 一致。
+    auto r_strict = VerifyBatchChecksums(expected, actual, /*strict_mode=*/true);
+    ASSERT_TRUE(r_strict.mismatch);
+    EXPECT_EQ(r_strict.faulty_indices.size(), 2u);
+}
+
+// Same-delta 成对突变：每个 block 都被同一 delta 改写 (expected=[A,B],
+// actual=[A^X, B^X])。老 XOR fast 会 delta 对消而漏；新的乘法聚合不再有 GF(2)-
+// 线性，所以两条路径都能识别。这里同时断言，防止将来实现回退成纯 XOR 时漏检回归。
+TEST_F(ChecksumVerifyUtilTest, DetectsSameDeltaPairedMutation) {
+    constexpr int64_t kDelta = 0x0F0F0F0F0F0F0F0FLL;
+    std::vector<int64_t> expected = {0xAAAA, 0xBBBB};
+    std::vector<int64_t> actual = {0xAAAA ^ kDelta, 0xBBBB ^ kDelta};
+    auto r_fast = VerifyBatchChecksums(expected, actual, /*strict_mode=*/false);
+    ASSERT_TRUE(r_fast.mismatch);
+    EXPECT_EQ(r_fast.faulty_indices.size(), 2u);
     auto r_strict = VerifyBatchChecksums(expected, actual, /*strict_mode=*/true);
     ASSERT_TRUE(r_strict.mismatch);
     EXPECT_EQ(r_strict.faulty_indices.size(), 2u);
