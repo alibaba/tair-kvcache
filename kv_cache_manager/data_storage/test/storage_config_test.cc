@@ -207,3 +207,14 @@ TEST_F(StorageConfigTest, TestStorageConfigRejectsMalformedIntegrity) {
     StorageConfig config;
     EXPECT_FALSE(config.FromJsonString(malformed_json));
 }
+
+TEST_F(StorageConfigTest, TestStorageConfigRejectsNonObjectIntegrity) {
+    const std::string malformed_json = R"({
+        "type": "file",
+        "global_unique_name": "bad_integrity",
+        "storage_spec": {"root_path": "/tmp/x", "key_count_per_file": 1},
+        "integrity": "bad"
+    })";
+    StorageConfig config;
+    EXPECT_FALSE(config.FromJsonString(malformed_json));
+}

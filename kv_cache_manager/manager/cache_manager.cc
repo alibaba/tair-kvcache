@@ -1444,7 +1444,9 @@ bool ParseInt64(const std::string &s, int64_t &out) {
         }
         out = v;
         return true;
-    } catch (...) { return false; }
+    } catch (...) {
+        return false;
+    }
 }
 
 } // namespace
@@ -1779,8 +1781,8 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
         schedule_plan_executor_->SubmitTask([this, instance_id, host_ip_port, gen_at_trigger, requested_type] {
             this->CleanupHostLocations(instance_id, host_ip_port, gen_at_trigger, requested_type);
         });
-        event_backend->UnregisterNode(instance_id, host_ip_port);
-        KVCM_LOG_INFO("trace_id [%s] | HOST_DOWN: host [%s] cleanup scheduled (gen=%lu) and removed from node table",
+        event_backend->UnregisterNodeIfGenerationMatches(instance_id, host_ip_port, gen_at_trigger);
+        KVCM_LOG_INFO("trace_id [%s] | HOST_DOWN: host [%s] cleanup scheduled and unregister attempted (gen=%lu)",
                       trace_id.c_str(),
                       host_ip_port.c_str(),
                       gen_at_trigger);
@@ -2220,10 +2222,16 @@ CheckLocDataExistFunc CacheManager::GetCheckLocDataExistFunc(const std::string &
         auto erb_holder = LookupEventReportingBackend(registry_manager_, instance_id);
         auto *erb = dynamic_cast<EventReportingBackend *>(erb_holder.get());
         if (erb && loc.type() == erb->GetStorageType()) {
-            auto ig = registry_manager_->GetInstanceGroupConfig(registry_manager_->GetInstanceGroupName(instance_id));
-            if (ig && !ig->event_reporting_storage_candidates().empty()) {
-                storage_unique_name = ig->event_reporting_storage_candidates().front();
-            }
+            return std::all_of(storage_uris.cbegin(), storage_uris.cend(), [&](const DataStorageUri &uri) {
+                if (!uri.Valid() || uri.GetHostName().empty()) {
+                    return true;
+                }
+                std::string host_ip_port = uri.GetHostName();
+                if (uri.GetPort() > 0) {
+                    host_ip_port += ":" + std::to_string(uri.GetPort());
+                }
+                return erb->IsNodeAvailable(instance_id, host_ip_port);
+            });
         }
         const auto result = registry_manager_->data_storage_manager()->Exist(storage_unique_name, storage_uris, true);
         return std::all_of(result.cbegin(), result.cend(), [](bool v) { return v; });

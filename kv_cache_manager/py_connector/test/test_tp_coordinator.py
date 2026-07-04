@@ -20,7 +20,7 @@ from kv_cache_manager.py_connector.common.tp_coordinator import (
 def _find_free_port():
     """Find a free TCP port."""
     with socket_module.socket(socket_module.AF_INET, socket_module.SOCK_STREAM) as s:
-        s.bind(('', 0))
+        s.bind(('127.0.0.1', 0))
         return s.getsockname()[1]
 
 

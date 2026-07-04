@@ -429,7 +429,11 @@ bool StorageConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
     // integrity 字段是后加的，老配置不带该字段时保留默认值 (全部关闭)。
     // 存在但字段类型错乱 (例如 "enable_meta_checksum": "true" 用了字符串)
     // 必须让整个 StorageConfig 解析失败，否则会静默降级为「全关」。
-    if (rapid_value.HasMember("integrity") && rapid_value["integrity"].IsObject()) {
+    if (rapid_value.HasMember("integrity")) {
+        if (!rapid_value["integrity"].IsObject()) {
+            KVCM_LOG_ERROR("integrity must be a json object");
+            return false;
+        }
         if (!integrity_.FromRapidValue(rapid_value["integrity"])) {
             return false;
         }

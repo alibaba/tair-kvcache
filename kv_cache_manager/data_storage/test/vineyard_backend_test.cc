@@ -267,6 +267,23 @@ TEST_F(VineyardBackendTest, GenerationBumpsOnReRegistration) {
     ASSERT_EQ(EC_OK, backend.Close());
 }
 
+TEST_F(VineyardBackendTest, GuardedUnregisterSkipsStaleGeneration) {
+    VineyardBackend backend(metrics_registry_);
+    ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 200, /*grace*/ 5000, /*tick*/ 50), "trace"));
+
+    const std::string host = "10.0.0.8:8080";
+    ASSERT_EQ(EC_OK, backend.RegisterNode("test_inst", host, {"mem"}));
+    uint64_t stale_gen = backend.GetNodeGeneration("test_inst", host);
+
+    ASSERT_EQ(EC_OK, backend.RegisterNode("test_inst", host, {"mem", "disk"}));
+    ASSERT_NE(stale_gen, backend.GetNodeGeneration("test_inst", host));
+
+    ASSERT_EQ(EC_OK, backend.UnregisterNodeIfGenerationMatches("test_inst", host, stale_gen));
+    EXPECT_TRUE(backend.IsNodeAvailable("test_inst", host));
+
+    ASSERT_EQ(EC_OK, backend.Close());
+}
+
 // (10) Cleanup callback receives correct generation
 TEST_F(VineyardBackendTest, LivenessLoopPassesGenerationToCallback) {
     VineyardBackend backend(metrics_registry_);
