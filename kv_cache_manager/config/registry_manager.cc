@@ -195,6 +195,11 @@ ErrorCode RegistryManager::UpdateStorage(RequestContext *request_context,
     std::unique_lock<std::shared_mutex> lock(mutex_);
     const auto &trace_id = request_context->request_id();
     const auto &global_unique_name = storage_config.global_unique_name();
+    std::string invalid_fields;
+    if (!storage_config.ValidateRequiredFields(invalid_fields)) {
+        PREFIX_LOG_S(WARN, "update storage failed: invalid config, fields[%s]", invalid_fields.c_str());
+        return EC_BADARGS;
+    }
     // 重建期间短暂不可用
     auto ec = RemoveStorage(request_context, global_unique_name);
     RETURN_IF_EC_NOT_OK_WITH_LOG_S(WARN, ec, "update storage failed: remove storage failed");

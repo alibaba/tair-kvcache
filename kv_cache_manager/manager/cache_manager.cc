@@ -1413,6 +1413,8 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
 
 namespace {
 
+std::string LegacyVineyardStorageNameFromInstance(const std::string &instance_id) { return "v6d_" + instance_id; }
+
 std::shared_ptr<DataStorageBackend>
 LookupEventReportingBackend(const std::shared_ptr<RegistryManager> &registry_manager, const std::string &instance_id) {
     if (!registry_manager || !registry_manager->data_storage_manager()) {
@@ -1424,6 +1426,11 @@ LookupEventReportingBackend(const std::shared_ptr<RegistryManager> &registry_man
     }
     auto ig = registry_manager->GetInstanceGroupConfig(group_name);
     if (!ig || ig->event_reporting_storage_candidates().empty()) {
+        auto legacy_backend = registry_manager->data_storage_manager()->GetDataStorageBackend(
+            LegacyVineyardStorageNameFromInstance(instance_id));
+        if (legacy_backend && dynamic_cast<EventReportingBackend *>(legacy_backend.get())) {
+            return legacy_backend;
+        }
         return nullptr;
     }
     auto dsm = registry_manager->data_storage_manager();

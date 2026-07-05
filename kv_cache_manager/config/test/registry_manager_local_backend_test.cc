@@ -743,4 +743,31 @@ TEST_F(RegistryManagerLocalBackendTest, TestAddStorageRejectsInvalidIntegrity) {
     }
 }
 
+TEST_F(RegistryManagerLocalBackendTest, TestUpdateStorageRejectsInvalidIntegrityBeforeRemovingExistingStorage) {
+    std::string local_path = GetPrivateTestRuntimeDataPath() + "_registry_local_backend_update_reject_integrity";
+    std::string uri = "local://" + local_path + "?cluster_name=test";
+    ASSERT_TRUE(InitRegistryManager(uri));
+
+    std::shared_ptr<NfsStorageSpec> original_spec = GetDefaultNfsStorageSpec();
+    original_spec->set_root_path(GetPrivateTestRuntimeDataPath() + "/original_nfs_root/");
+    StorageConfig original_config(DataStorageType::DATA_STORAGE_TYPE_NFS, "storage1", original_spec);
+    ASSERT_EQ(EC_OK, registry_manager_->AddStorage(request_context_.get(), original_config));
+    ASSERT_TRUE(registry_manager_->data_storage_manager()->GetDataStorageBackend("storage1"));
+
+    DataIntegrityConfig integrity;
+    integrity.set_enable_inline_header(true);
+    std::shared_ptr<NfsStorageSpec> invalid_spec = GetDefaultNfsStorageSpec();
+    invalid_spec->set_root_path(GetPrivateTestRuntimeDataPath() + "/invalid_nfs_root/");
+    StorageConfig invalid_config(DataStorageType::DATA_STORAGE_TYPE_NFS, "storage1", invalid_spec);
+    invalid_config.set_integrity(integrity);
+
+    EXPECT_EQ(EC_BADARGS, registry_manager_->UpdateStorage(request_context_.get(), invalid_config, true));
+
+    auto storage = registry_manager_->data_storage_manager()->GetDataStorageBackend("storage1");
+    ASSERT_TRUE(storage);
+    auto spec = std::dynamic_pointer_cast<NfsStorageSpec>(storage->GetStorageConfig().storage_spec());
+    ASSERT_TRUE(spec);
+    EXPECT_EQ(GetPrivateTestRuntimeDataPath() + "/original_nfs_root/", spec->root_path());
+}
+
 } // namespace kv_cache_manager

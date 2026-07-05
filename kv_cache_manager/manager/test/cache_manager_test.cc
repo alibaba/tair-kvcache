@@ -3264,4 +3264,33 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
 
     dsm->storage_map_.erase("vineyard_default");
 }
+
+TEST_F(CacheManagerTest, TestReportEventUsesLegacyVineyardBackendWhenEventCandidatesMissing) {
+    auto metrics_registry = cache_manager_->metrics_registry_;
+    auto vineyard_backend = std::make_shared<VineyardBackend>(metrics_registry);
+    StorageConfig v6d_config;
+    v6d_config.set_global_unique_name("v6d_test_instance");
+    v6d_config.set_type(DataStorageType::DATA_STORAGE_TYPE_VINEYARD);
+    v6d_config.set_storage_spec(std::make_shared<VineyardStorageSpec>());
+    ASSERT_EQ(EC_OK, vineyard_backend->Open(v6d_config, "test_trace"));
+
+    auto dsm = registry_manager_->data_storage_manager_;
+    dsm->storage_map_["v6d_test_instance"] = vineyard_backend;
+    registry_manager_->instance_group_configs_["default"]->set_event_reporting_storage_candidates({});
+
+    proto::meta::ReportEventRequest req;
+    req.set_instance_id("test_instance");
+    req.set_host_ip_port("192.168.10.1:8080");
+    req.set_storage_type(proto::meta::ST_VINEYARD);
+    auto *reg = req.add_events();
+    reg->set_event_type(proto::meta::EVENT_NODE_REGISTER);
+    reg->mutable_node_register()->add_mediums("mem");
+
+    proto::meta::ReportEventResponse resp;
+    ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+    EXPECT_TRUE(vineyard_backend->IsNodeAvailable("test_instance", "192.168.10.1:8080"));
+
+    dsm->storage_map_.erase("v6d_test_instance");
+}
+
 } // namespace kv_cache_manager

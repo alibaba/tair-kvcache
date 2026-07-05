@@ -219,6 +219,11 @@ ClientErrorCode TransferClientImpl::Init(const std::string &client_config, const
                 KVCM_LOG_ERROR("sdk_buffer_check_pool init faild, sdk_check_cell_num[%lu], max_check_iov_num[%lu]",
                                sdk_check_cell_num,
                                max_check_iov_num_);
+                client_config_.reset();
+                sdk_wrapper_.reset();
+                sdk_buffer_check_pool_.reset();
+                meta_checksum_enabled_ = false;
+                is_check_buffer_ = false;
                 return ER_INIT_CHECK_BUFFER_ERROR;
             }
         }
