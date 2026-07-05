@@ -2,6 +2,8 @@
 
 #include <sstream>
 
+#include "kv_cache_manager/common/logger.h"
+
 namespace kv_cache_manager {
 
 std::string ThreeFSStorageSpec::ToString() const {
