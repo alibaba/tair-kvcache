@@ -7,7 +7,7 @@ using namespace kv_cache_manager;
 
 class ChecksumVerifyUtilTest : public TESTBASE {};
 
-// Fast path：所有 block 一致 -> mismatch=false, faulty_indices 空。
+// 所有 block 一致 -> mismatch=false, faulty_indices 空。
 TEST_F(ChecksumVerifyUtilTest, FastPathAllMatch) {
     std::vector<int64_t> expected = {0x1111, 0x2222, 0x3333};
     std::vector<int64_t> actual = expected;
@@ -16,7 +16,7 @@ TEST_F(ChecksumVerifyUtilTest, FastPathAllMatch) {
     EXPECT_TRUE(r.faulty_indices.empty());
 }
 
-// Fast path：检测到不匹配后应该回填 faulty_indices 让上层逐块打日志。
+// 检测到不匹配后应该回填 faulty_indices 让上层逐块打日志。
 TEST_F(ChecksumVerifyUtilTest, FastPathDetectsMismatchAndLocatesIndex) {
     std::vector<int64_t> expected = {0x1111, 0x2222, 0x3333};
     std::vector<int64_t> actual = {0x1111, 0xFFFF, 0x3333}; // block #1 错
@@ -26,7 +26,7 @@ TEST_F(ChecksumVerifyUtilTest, FastPathDetectsMismatchAndLocatesIndex) {
     EXPECT_EQ(r.faulty_indices[0], 1u);
 }
 
-// 多个错位 block：fallback 阶段把所有错的都列出来。
+// 多个错位 block：把所有错的都列出来。
 TEST_F(ChecksumVerifyUtilTest, FastPathListsAllFaultyBlocks) {
     std::vector<int64_t> expected = {0x1111, 0x2222, 0x3333, 0x4444};
     std::vector<int64_t> actual = {0xAAAA, 0x2222, 0xBBBB, 0x4444}; // #0, #2 错
@@ -45,7 +45,7 @@ TEST_F(ChecksumVerifyUtilTest, FastPathSentinelZeroIsSkipped) {
     EXPECT_FALSE(r.mismatch);
 }
 
-// 全 sentinel：fast 路径没有可比较的项，等同于全 match。
+// 全 sentinel：没有可比较的项，等同于全 match。
 TEST_F(ChecksumVerifyUtilTest, FastPathAllSentinelsTreatedAsMatch) {
     std::vector<int64_t> expected = {0, 0, 0};
     std::vector<int64_t> actual = {0xAA, 0xBB, 0xCC};
@@ -62,7 +62,7 @@ TEST_F(ChecksumVerifyUtilTest, SizeMismatchReturnsMismatchWithoutIndices) {
     EXPECT_TRUE(r.faulty_indices.empty());
 }
 
-// Strict mode：行为跟 fast fallback 一致 (per-block 比对)，但跳过 fast 聚合阶段。
+// strict_mode 参数保留兼容；当前实现始终逐块比对。
 TEST_F(ChecksumVerifyUtilTest, StrictModeMatchesFastFallback) {
     std::vector<int64_t> expected = {0x1111, 0, 0x3333, 0x4444};
     std::vector<int64_t> actual = {0xAAAA, 0x2222, 0x3333, 0xBBBB}; // #0, #3 错；#1 是 sentinel
@@ -81,8 +81,7 @@ TEST_F(ChecksumVerifyUtilTest, StrictModeAllMatch) {
     EXPECT_FALSE(r.mismatch);
 }
 
-// Block swap (读串): expected=[A,B], actual=[B,A]. 老 XOR 聚合无序会漏，
-// 加了 position-dependent 奇数乘子后 fast path 也能识别并回填两个 faulty index。
+// Block swap (读串): expected=[A,B], actual=[B,A]. 必须识别并回填两个 faulty index。
 TEST_F(ChecksumVerifyUtilTest, FastPathCatchesBlockSwap) {
     std::vector<int64_t> expected = {0xAAAA, 0xBBBB};
     std::vector<int64_t> actual = {0xBBBB, 0xAAAA};
@@ -98,8 +97,7 @@ TEST_F(ChecksumVerifyUtilTest, FastPathCatchesBlockSwap) {
 }
 
 // Same-delta 成对突变：每个 block 都被同一 delta 改写 (expected=[A,B],
-// actual=[A^X, B^X])。老 XOR fast 会 delta 对消而漏；新的乘法聚合不再有 GF(2)-
-// 线性，所以两条路径都能识别。这里同时断言，防止将来实现回退成纯 XOR 时漏检回归。
+// actual=[A^X, B^X])。老 XOR fast 会 delta 对消而漏；逐块比对必须识别。
 TEST_F(ChecksumVerifyUtilTest, DetectsSameDeltaPairedMutation) {
     constexpr int64_t kDelta = 0x0F0F0F0F0F0F0F0FLL;
     std::vector<int64_t> expected = {0xAAAA, 0xBBBB};
@@ -110,4 +108,18 @@ TEST_F(ChecksumVerifyUtilTest, DetectsSameDeltaPairedMutation) {
     auto r_strict = VerifyBatchChecksums(expected, actual, /*strict_mode=*/true);
     ASSERT_TRUE(r_strict.mismatch);
     EXPECT_EQ(r_strict.faulty_indices.size(), 2u);
+}
+
+// High-bit 成对突变：奇数乘法聚合也会让最高位 delta 在偶数个 block 中抵消。
+// 逐块比对不能接受这种 batch。
+TEST_F(ChecksumVerifyUtilTest, DetectsHighBitPairedMutation) {
+    constexpr int64_t kHighBit = static_cast<int64_t>(0x8000000000000000ULL);
+    std::vector<int64_t> expected = {0x1111, 0x2222, 0x3333};
+    std::vector<int64_t> actual = {0x1111 ^ kHighBit, 0x2222 ^ kHighBit, 0x3333};
+
+    auto r = VerifyBatchChecksums(expected, actual, /*strict_mode=*/false);
+    ASSERT_TRUE(r.mismatch);
+    ASSERT_EQ(r.faulty_indices.size(), 2u);
+    EXPECT_EQ(r.faulty_indices[0], 0u);
+    EXPECT_EQ(r.faulty_indices[1], 1u);
 }

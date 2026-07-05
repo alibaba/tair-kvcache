@@ -305,6 +305,31 @@ TEST_F(TransferClientTest, TestCreateAcceptsMetaChecksumSpec) {
     delete init_params.regist_span;
 }
 
+TEST_F(TransferClientTest, TestCreateRejectsUnsupportedChecksumAlgo) {
+    auto init_params = init_params_;
+    init_params.regist_span = new RegistSpan();
+    init_params.regist_span->base = malloc(1024 * 1024);
+    init_params.regist_span->size = 1024 * 1024;
+    init_params.storage_configs = R"([
+        {
+            "type": "file",
+            "global_unique_name": "test_nfs",
+            "storage_spec": {
+                "root_path": "/tmp/test/",
+                "key_count_per_file": 5
+            },
+            "integrity": {
+                "enable_meta_checksum": true,
+                "algo": "unknown_algo"
+            }
+        }
+    ])";
+    auto client = TransferClient::Create(client_config_, init_params);
+    EXPECT_EQ(client, nullptr);
+    free(init_params.regist_span->base);
+    delete init_params.regist_span;
+}
+
 // expected_checksums 全 0 -> sentinel 跳过校验，行为 == 老路径，不会因 checksum 不匹配返回错误。
 TEST_F(TransferClientTest, TestLoadKvCachesExpectedHashesAllZeroSkipsCheck) {
     auto client = TransferClient::Create(client_config_, init_params_);

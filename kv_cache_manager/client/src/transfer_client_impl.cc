@@ -38,6 +38,15 @@ bool IsChecksumHashableBlock(const BlockBuffer &block_buffer) {
     });
 }
 
+std::vector<size_t> GetIovSizeShape(const BlockBuffer &block_buffer) {
+    std::vector<size_t> shape;
+    shape.reserve(block_buffer.iovs.size());
+    for (const auto &iov : block_buffer.iovs) {
+        shape.push_back(iov.size);
+    }
+    return shape;
+}
+
 bool HashBlocksByIovShape(const BlockBuffers &block_buffers,
                           SdkBufferCheckPool::CellHandle &handle,
                           size_t max_check_iov_num,
@@ -50,7 +59,7 @@ bool HashBlocksByIovShape(const BlockBuffers &block_buffers,
 
     BlockBuffers chunk;
     std::vector<size_t> chunk_indices;
-    size_t chunk_iov_num = 0;
+    std::vector<size_t> chunk_iov_shape;
     size_t chunk_total_iovs = 0;
 
     auto flush_chunk = [&]() -> bool {
@@ -68,7 +77,7 @@ bool HashBlocksByIovShape(const BlockBuffers &block_buffers,
         }
         chunk.clear();
         chunk_indices.clear();
-        chunk_iov_num = 0;
+        chunk_iov_shape.clear();
         chunk_total_iovs = 0;
         return true;
     };
@@ -79,13 +88,14 @@ bool HashBlocksByIovShape(const BlockBuffers &block_buffers,
             KVCM_LOG_ERROR("block [%zu] has invalid iov_num [%zu] for checksum hash", i, iov_num);
             return false;
         }
-        if (!chunk.empty() && (iov_num != chunk_iov_num || chunk_total_iovs + iov_num > max_check_iov_num)) {
+        auto iov_shape = GetIovSizeShape(block_buffers[i]);
+        if (!chunk.empty() && (iov_shape != chunk_iov_shape || chunk_total_iovs + iov_num > max_check_iov_num)) {
             if (!flush_chunk()) {
                 return false;
             }
         }
         if (chunk.empty()) {
-            chunk_iov_num = iov_num;
+            chunk_iov_shape = std::move(iov_shape);
         }
         chunk.push_back(block_buffers[i]);
         chunk_indices.push_back(i);
