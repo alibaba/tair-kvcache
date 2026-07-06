@@ -66,6 +66,22 @@ public final class MetaClientConfig {
         public Builder leaderRefreshIntervalSeconds(int leaderRefreshIntervalSeconds) { this.leaderRefreshIntervalSeconds = leaderRefreshIntervalSeconds; return this; }
 
         public MetaClientConfig build() {
+            // M3 fix: Validate numeric parameters
+            if (grpcPort <= 0 || grpcPort > 65535) {
+                throw new IllegalArgumentException("grpcPort must be between 1 and 65535, got: " + grpcPort);
+            }
+            if (httpPort != null && (httpPort <= 0 || httpPort > 65535)) {
+                throw new IllegalArgumentException("httpPort must be between 1 and 65535, got: " + httpPort);
+            }
+            if (callTimeoutMs <= 0) {
+                throw new IllegalArgumentException("callTimeoutMs must be > 0, got: " + callTimeoutMs);
+            }
+            if (leaderRetryCount < 0) {
+                throw new IllegalArgumentException("leaderRetryCount must be >= 0, got: " + leaderRetryCount);
+            }
+            if (leaderRefreshIntervalSeconds <= 0) {
+                throw new IllegalArgumentException("leaderRefreshIntervalSeconds must be > 0, got: " + leaderRefreshIntervalSeconds);
+            }
             return new MetaClientConfig(this);
         }
     }

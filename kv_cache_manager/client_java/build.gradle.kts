@@ -15,7 +15,6 @@ repositories {
 
 val grpcVersion = "1.58.0"
 val protobufVersion = "3.25.3"
-val jacksonVersion = "2.17.2"
 val okhttpVersion = "4.12.0"
 
 java {
@@ -40,9 +39,8 @@ dependencies {
     // javax.annotation for @Generated (required by gRPC stubs)
     compileOnly("javax.annotation:javax.annotation-api:1.3.2")
 
-    // HTTP fallback: OkHttp + Jackson
+    // HTTP fallback: OkHttp
     implementation("com.squareup.okhttp3:okhttp:${okhttpVersion}")
-    implementation("com.fasterxml.jackson.core:jackson-databind:${jacksonVersion}")
 
     // SLF4J for logging
     implementation("org.slf4j:slf4j-api:2.0.13")

@@ -19,13 +19,17 @@ public class AutoFailoverClient implements MetaClient {
 
     private final MetaClientConfig config;
     private volatile GrpcMetaClient grpcClient;
+    private volatile String currentHost;
+    private volatile int currentPort;
     private final HttpMetaClient httpClient; // null if HTTP disabled
     private final LeaderDiscovery leaderDiscovery; // null if auto-discover disabled
     private final Object reconnectLock = new Object();
 
     AutoFailoverClient(MetaClientConfig config) {
         this.config = config;
-        this.grpcClient = new GrpcMetaClient(config.getSeedAddress(), config.getGrpcPort(),
+        this.currentHost = config.getSeedAddress();
+        this.currentPort = config.getGrpcPort();
+        this.grpcClient = new GrpcMetaClient(currentHost, currentPort,
                 config.getCallTimeoutMs());
 
         if (config.isHttpEnabled()) {
@@ -161,8 +165,12 @@ public class AutoFailoverClient implements MetaClient {
         // Try gRPC with leader-not-leader retry
         int retriesLeft = config.getLeaderRetryCount();
         while (true) {
+            GrpcMetaClient client;
+            synchronized (reconnectLock) {
+                client = grpcClient;
+            }
             try {
-                return rpc.execute(grpcClient);
+                return rpc.execute(client);
             } catch (ServerNotLeaderException e) {
                 LOG.warn("Server is not leader, triggering re-discovery");
                 if (leaderDiscovery != null) {
@@ -186,7 +194,15 @@ public class AutoFailoverClient implements MetaClient {
             } catch (KvcmException e) {
                 if (e.getErrorCode() == ErrorCode.IO_ERROR && httpClient != null) {
                     LOG.warn("gRPC call failed with IO error, falling back to HTTP: {}", e.getMessage());
-                    return rpc.execute(httpClient);
+                    try {
+                        return rpc.execute(httpClient);
+                    } catch (Exception httpEx) {
+                        LOG.error("Both gRPC and HTTP transports failed", httpEx);
+                        throw new KvcmException(ErrorCode.IO_ERROR,
+                                "All transports failed. gRPC: " + e.getMessage()
+                                        + ", HTTP: " + httpEx.getMessage(),
+                                httpEx);
+                    }
                 }
                 throw e;
             }
@@ -200,18 +216,18 @@ public class AutoFailoverClient implements MetaClient {
         String leaderHost = leaderDiscovery.getCurrentHost();
         int leaderPort = leaderDiscovery.getCurrentPort();
         synchronized (reconnectLock) {
-            // Check if already connected to this address
-            if (leaderHost.equals(config.getSeedAddress()) && leaderPort == config.getGrpcPort()) {
-                return; // still on seed, no reconnect needed
+            // Check if already connected to this address (C2 fix: compare against current, not seed)
+            if (leaderHost.equals(currentHost) && leaderPort == currentPort) {
+                return;
             }
-            LOG.info("Reconnecting gRPC channel to {}:{}", leaderHost, leaderPort);
+            LOG.info("Reconnecting gRPC channel from {}:{} to {}:{}",
+                    currentHost, currentPort, leaderHost, leaderPort);
             GrpcMetaClient old = grpcClient;
             grpcClient = new GrpcMetaClient(leaderHost, leaderPort, config.getCallTimeoutMs());
-            try {
-                old.close();
-            } catch (Exception e) {
-                LOG.warn("Error closing old gRPC channel during reconnect", e);
-            }
+            currentHost = leaderHost;
+            currentPort = leaderPort;
+            // Delayed close of old channel to avoid C1 race condition
+            old.delayedClose(100);
         }
     }
 }

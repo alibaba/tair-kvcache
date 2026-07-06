@@ -39,6 +39,8 @@ class LeaderDiscovery {
     private volatile int currentPort;
 
     private ScheduledExecutorService scheduler;
+    // M1 fix: Reuse channel for discovery instead of creating per attempt
+    private volatile ManagedChannel discoveryChannel;
 
     LeaderDiscovery(String seedAddress, int grpcPort, String instanceId, int refreshIntervalSeconds) {
         this.seedAddress = seedAddress;
@@ -91,12 +93,14 @@ class LeaderDiscovery {
      * @return true if leader was discovered and address updated
      */
     boolean discoverLeader() {
-        ManagedChannel channel = null;
         try {
-            channel = ManagedChannelBuilder.forAddress(seedAddress, grpcPort)
-                    .usePlaintext()
-                    .build();
-            MetaServiceGrpc.MetaServiceBlockingStub stub = MetaServiceGrpc.newBlockingStub(channel);
+            // M1 fix: Reuse channel, only rebuild if null or shutdown
+            if (discoveryChannel == null || discoveryChannel.isShutdown()) {
+                discoveryChannel = ManagedChannelBuilder.forAddress(seedAddress, grpcPort)
+                        .usePlaintext()
+                        .build();
+            }
+            MetaServiceGrpc.MetaServiceBlockingStub stub = MetaServiceGrpc.newBlockingStub(discoveryChannel);
 
             GetClusterInfoRequest request = GetClusterInfoRequest.newBuilder()
                     .setTraceId("leader_discovery_" + System.nanoTime())
@@ -136,11 +140,13 @@ class LeaderDiscovery {
             return true;
         } catch (Exception e) {
             LOG.warn("Leader discovery from {} failed: {}", seedAddress, e.getMessage());
+            // Channel may be broken, force rebuild next time
+            if (discoveryChannel != null) {
+                discoveryChannel.shutdownNow();
+                discoveryChannel = null;
+            }
             return false;
         } finally {
-            if (channel != null) {
-                channel.shutdownNow();
-            }
             lastDiscoverTimeMs.set(System.currentTimeMillis());
         }
     }
@@ -160,6 +166,11 @@ class LeaderDiscovery {
                 scheduler.shutdownNow();
                 Thread.currentThread().interrupt();
             }
+        }
+        // M1 fix: Also shutdown the reused discovery channel
+        if (discoveryChannel != null) {
+            discoveryChannel.shutdownNow();
+            discoveryChannel = null;
         }
     }
 

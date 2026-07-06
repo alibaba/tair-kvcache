@@ -23,11 +23,34 @@ public class GrpcMetaClient implements MetaClient {
     private final MetaServiceGrpc.MetaServiceBlockingStub stub;
     private final int callTimeoutMs;
 
+    @SuppressWarnings("unchecked")
     public GrpcMetaClient(String host, int port, int callTimeoutMs) {
         this.callTimeoutMs = callTimeoutMs;
+        // C3 fix: Add gRPC-level retry policy matching C++ client behavior
+        java.util.Map<String, Object> retryPolicy = new java.util.HashMap<>();
+        retryPolicy.put("maxAttempts", 3.0);
+        retryPolicy.put("initialBackoff", "0.1s");
+        retryPolicy.put("maxBackoff", "1s");
+        retryPolicy.put("backoffMultiplier", 1.5);
+        retryPolicy.put("retryableStatusCodes", java.util.Arrays.asList("UNAVAILABLE"));
+
+        java.util.Map<String, Object> name = new java.util.HashMap<>();
+        name.put("service", "kv_cache_manager.proto.meta.MetaService");
+
+        java.util.Map<String, Object> methodConfig = new java.util.HashMap<>();
+        methodConfig.put("name", java.util.Arrays.asList(name));
+        methodConfig.put("waitForReady", true);
+        methodConfig.put("timeout", (callTimeoutMs / 1000.0) + "s");
+        methodConfig.put("retryPolicy", retryPolicy);
+
+        java.util.Map<String, Object> serviceConfig = new java.util.HashMap<>();
+        serviceConfig.put("methodConfig", java.util.Arrays.asList(methodConfig));
+
         this.channel = ManagedChannelBuilder.forAddress(host, port)
                 .usePlaintext()
                 .maxInboundMessageSize(-1)
+                .defaultServiceConfig(serviceConfig)
+                .enableRetry()
                 .keepAliveTime(10, TimeUnit.SECONDS)
                 .keepAliveTimeout(10, TimeUnit.SECONDS)
                 .keepAliveWithoutCalls(true)
@@ -169,6 +192,24 @@ public class GrpcMetaClient implements MetaClient {
     }
 
     /**
+     * Schedule a delayed close of this channel.
+     * Used during leader reconnection to avoid closing a channel
+     * that may still have in-flight RPCs.
+     */
+    void delayedClose(long delayMs) {
+        Thread closer = new Thread(() -> {
+            try {
+                Thread.sleep(delayMs);
+                close();
+            } catch (Exception e) {
+                LOG.warn("Error in delayed close of gRPC channel", e);
+            }
+        }, "grpc-channel-delayed-close");
+        closer.setDaemon(true);
+        closer.start();
+    }
+
+    /**
      * Re-create a new GrpcMetaClient pointing to a different address.
      * Used by AutoFailoverClient when leader changes.
      */
@@ -196,10 +237,25 @@ public class GrpcMetaClient implements MetaClient {
         try {
             return call.execute();
         } catch (StatusRuntimeException e) {
-            throw new KvcmException(
-                    ErrorCode.IO_ERROR,
-                    "gRPC call " + rpcName + " failed: " + e.getStatus(),
-                    e);
+            // M4 fix: Better error mapping - distinguish timeout from transient failures
+            ErrorCode errorCode;
+            String message;
+            io.grpc.Status.Code grpcCode = e.getStatus().getCode();
+
+            if (grpcCode == io.grpc.Status.Code.DEADLINE_EXCEEDED) {
+                errorCode = ErrorCode.IO_ERROR;
+                message = "gRPC call " + rpcName + " timed out: " + e.getStatus();
+            } else if (grpcCode == io.grpc.Status.Code.UNAVAILABLE) {
+                errorCode = ErrorCode.IO_ERROR;
+                message = "gRPC call " + rpcName + " unavailable (server may be down): " + e.getStatus();
+            } else if (grpcCode == io.grpc.Status.Code.INVALID_ARGUMENT) {
+                errorCode = ErrorCode.INVALID_ARGUMENT;
+                message = "gRPC call " + rpcName + " invalid argument: " + e.getStatus();
+            } else {
+                errorCode = ErrorCode.IO_ERROR;
+                message = "gRPC call " + rpcName + " failed: " + e.getStatus();
+            }
+            throw new KvcmException(errorCode, message, e);
         }
     }
 }
