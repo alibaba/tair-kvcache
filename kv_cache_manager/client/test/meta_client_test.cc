@@ -78,18 +78,17 @@ public:
                 (const std::string &trace_id, const std::string &instance_id),
                 (override));
 
-    MOCK_METHOD((std::pair<ClientErrorCode, Metas>),
+    MOCK_METHOD((std::pair<ClientErrorCode, MatchMetaResult>),
                 GetCacheMeta,
                 (const std::string &trace_id,
                  const std::string &instance_id,
                  const KeyVector &keys,
                  const TokenIdsVector &tokens,
                  const BlockMask &block_mask,
-                 int32_t detail_level,
-                 std::vector<int64_t> *out_checksums),
+                 const MatchMetaOptions &options),
                 (override));
 
-    MOCK_METHOD((std::pair<ClientErrorCode, Locations>),
+    MOCK_METHOD((std::pair<ClientErrorCode, MatchLocationResult>),
                 GetCacheLocation,
                 (const std::string &trace_id,
                  const std::string &instance_id,
@@ -97,9 +96,8 @@ public:
                  const KeyVector &keys,
                  const TokenIdsVector &tokens,
                  const BlockMask &block_mask,
-                 int32_t sw_size,
                  const std::vector<std::string> &location_spec_names,
-                 std::vector<int64_t> *out_checksums),
+                 const MatchLocationOptions &options),
                 (override));
 
     MOCK_METHOD((std::pair<ClientErrorCode, int64_t>),
@@ -109,7 +107,7 @@ public:
                  QueryType query_type,
                  const KeyVector &keys,
                  const TokenIdsVector &tokens,
-                 int32_t sw_size),
+                 const MatchLocationLenOptions &options),
                 (override));
 
     MOCK_METHOD((std::pair<ClientErrorCode, WriteLocation>),
@@ -337,7 +335,13 @@ TEST_F(MetaClientTest, TestMatchLocationLen) {
     const int32_t sw_size = 0;
     const int64_t expected_len = 2;
 
-    EXPECT_CALL(*mock_stub, GetCacheLocationLen(trace_id, "test_instance", query_type, keys, tokens, sw_size))
+    EXPECT_CALL(*mock_stub,
+                GetCacheLocationLen(trace_id,
+                                    "test_instance",
+                                    query_type,
+                                    keys,
+                                    tokens,
+                                    ::testing::Field(&MatchLocationLenOptions::sw_size, sw_size)))
         .Times(1)
         .WillOnce(::testing::Return(std::make_pair(ER_OK, expected_len)));
 
@@ -347,7 +351,13 @@ TEST_F(MetaClientTest, TestMatchLocationLen) {
 
     // Test failed MatchLocationLen call
     const ClientErrorCode expected_error = ER_SERVICE_INTERNAL_ERROR;
-    EXPECT_CALL(*mock_stub, GetCacheLocationLen(trace_id + "_fail", "test_instance", query_type, keys, tokens, sw_size))
+    EXPECT_CALL(*mock_stub,
+                GetCacheLocationLen(trace_id + "_fail",
+                                    "test_instance",
+                                    query_type,
+                                    keys,
+                                    tokens,
+                                    ::testing::Field(&MatchLocationLenOptions::sw_size, sw_size)))
         .Times(1)
         .WillOnce(::testing::Return(std::make_pair(expected_error, int64_t{0})));
 
@@ -377,11 +387,11 @@ TEST_F(MetaClientTest, TestMatchLocationOptionsForwardToStub) {
                                  keys,
                                  tokens,
                                  block_mask,
-                                 sw_size,
                                  spec_names,
-                                 ::testing::IsNull()))
+                                 ::testing::AllOf(::testing::Field(&MatchLocationOptions::sw_size, sw_size),
+                                                  ::testing::Field(&MatchLocationOptions::include_checksums, false))))
         .Times(1)
-        .WillOnce(::testing::Return(std::make_pair(ER_OK, locations)));
+        .WillOnce(::testing::Return(std::make_pair(ER_OK, MatchLocationResult{locations, {}})));
 
     auto [ec, result_locations] =
         client->MatchLocation(trace_id, query_type, keys, tokens, block_mask, sw_size, spec_names);
@@ -395,12 +405,12 @@ TEST_F(MetaClientTest, TestMatchLocationOptionsForwardToStub) {
                                  keys,
                                  tokens,
                                  block_mask,
-                                 sw_size,
                                  spec_names,
-                                 ::testing::NotNull()))
+                                 ::testing::AllOf(::testing::Field(&MatchLocationOptions::sw_size, sw_size),
+                                                  ::testing::Field(&MatchLocationOptions::include_checksums, true))))
         .Times(1)
-        .WillOnce(::testing::DoAll(::testing::SetArgPointee<8>(std::vector<int64_t>{0x11, 0x22}),
-                                   ::testing::Return(std::make_pair(ER_OK, locations))));
+        .WillOnce(::testing::Return(
+            std::make_pair(ER_OK, MatchLocationResult{locations, std::vector<int64_t>{0x11, 0x22}})));
 
     auto [result_ec, result] = client->MatchLocation(
         trace_id, query_type, keys, tokens, block_mask, spec_names, MatchLocationOptions::WithChecksums(sw_size));
@@ -431,10 +441,10 @@ TEST_F(MetaClientTest, TestMatchMetaOptionsForwardToStub) {
                              keys,
                              tokens,
                              block_mask,
-                             detail_level,
-                             ::testing::IsNull()))
+                             ::testing::AllOf(::testing::Field(&MatchMetaOptions::detail_level, detail_level),
+                                              ::testing::Field(&MatchMetaOptions::include_checksums, false))))
         .Times(1)
-        .WillOnce(::testing::Return(std::make_pair(ER_OK, metas)));
+        .WillOnce(::testing::Return(std::make_pair(ER_OK, MatchMetaResult{metas, {}})));
 
     auto [ec, result_metas] = client->MatchMeta(trace_id, keys, tokens, block_mask, detail_level);
     EXPECT_EQ(ER_OK, ec);
@@ -447,11 +457,11 @@ TEST_F(MetaClientTest, TestMatchMetaOptionsForwardToStub) {
                              keys,
                              tokens,
                              block_mask,
-                             detail_level,
-                             ::testing::NotNull()))
+                             ::testing::AllOf(::testing::Field(&MatchMetaOptions::detail_level, detail_level),
+                                              ::testing::Field(&MatchMetaOptions::include_checksums, true))))
         .Times(1)
-        .WillOnce(::testing::DoAll(::testing::SetArgPointee<6>(std::vector<int64_t>{0x33}),
-                                   ::testing::Return(std::make_pair(ER_OK, metas))));
+        .WillOnce(
+            ::testing::Return(std::make_pair(ER_OK, MatchMetaResult{metas, std::vector<int64_t>{0x33}})));
 
     auto [result_ec, result] =
         client->MatchMeta(trace_id, keys, tokens, block_mask, MatchMetaOptions::WithChecksums(detail_level));

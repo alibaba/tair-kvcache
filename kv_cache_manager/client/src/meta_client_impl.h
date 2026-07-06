@@ -16,6 +16,7 @@ public:
 
     using MetaClient::FinishWrite;
     using MetaClient::MatchLocation;
+    using MetaClient::MatchLocationLen;
     using MetaClient::MatchMeta;
 
     std::pair<ClientErrorCode, MatchLocationResult> MatchLocation(const std::string &trace_id,
@@ -30,7 +31,7 @@ public:
                                                          QueryType query_type,
                                                          const std::vector<int64_t> &keys,
                                                          const std::vector<int64_t> &tokens,
-                                                         int32_t sw_size) override;
+                                                         const MatchLocationLenOptions &options) override;
 
     std::pair<ClientErrorCode, WriteLocation> StartWrite(const std::string &trace_id,
                                                          const std::vector<int64_t> &keys,

@@ -50,9 +50,9 @@ std::vector<size_t> GetIovSizeShape(const BlockBuffer &block_buffer) {
 bool HashBlocksByIovShape(const BlockBuffers &block_buffers,
                           SdkBufferCheckPool::CellHandle &handle,
                           size_t max_check_iov_num,
-                          std::vector<int64_t> &out_checksums) {
-    out_checksums.clear();
-    out_checksums.resize(block_buffers.size());
+                          std::vector<int64_t> &block_checksums) {
+    block_checksums.clear();
+    block_checksums.resize(block_buffers.size());
     if (block_buffers.empty()) {
         return true;
     }
@@ -73,7 +73,7 @@ bool HashBlocksByIovShape(const BlockBuffers &block_buffers,
             return false;
         }
         for (size_t i = 0; i < checksums.size(); ++i) {
-            out_checksums[chunk_indices[i]] = checksums[i];
+            block_checksums[chunk_indices[i]] = checksums[i];
         }
         chunk.clear();
         chunk_indices.clear();
@@ -402,7 +402,7 @@ std::pair<ClientErrorCode, SaveKvCachesResult> TransferClientImpl::SaveKvCaches(
                                                                                 const BlockBuffers &block_buffers,
                                                                                 const SaveKvCachesOptions &options) {
     SaveKvCachesResult result;
-    auto *out_checksums = options.include_checksums ? &result.checksums : nullptr;
+    auto *checksum_sink = options.include_checksums ? &result.checksums : nullptr;
     KVCM_LOG_DEBUG("save kv caches with uri_str_vec %s, block_buffers %s",
                    DebugStringUtil::ToString(uri_str_vec).c_str(),
                    DebugStringUtil::ToString(block_buffers).c_str());
@@ -418,15 +418,15 @@ std::pair<ClientErrorCode, SaveKvCachesResult> TransferClientImpl::SaveKvCaches(
     // then hash by compatible iov-shape chunks.
     std::vector<int64_t> block_checksums;
     bool block_checksums_computed = false;
-    if (out_checksums != nullptr || is_check_buffer_) {
+    if (checksum_sink != nullptr || is_check_buffer_) {
         if (!sdk_buffer_check_pool_) {
-            if (out_checksums != nullptr) {
+            if (checksum_sink != nullptr) {
                 KVCM_LOG_WARN("checksums requested but sdk_buffer_check_pool is not enabled; "
                               "return empty vector (caller should treat as 'checksum not available')");
             }
         } else {
             bool need_print = (trace_info == nullptr) ? true : trace_info->need_print;
-            if (out_checksums != nullptr || need_print) {
+            if (checksum_sink != nullptr || need_print) {
                 auto invalid_it =
                     std::find_if(block_buffers.begin(), block_buffers.end(), [](const BlockBuffer &block_buffer) {
                         return !IsChecksumHashableBlock(block_buffer);
@@ -434,20 +434,20 @@ std::pair<ClientErrorCode, SaveKvCachesResult> TransferClientImpl::SaveKvCaches(
                 if (invalid_it != block_buffers.end()) {
                     const size_t idx = std::distance(block_buffers.begin(), invalid_it);
                     KVCM_LOG_WARN("block [%zu] has ignored, empty, null, or zero-size iovs; skip checksum hash", idx);
-                    if (out_checksums != nullptr) {
+                    if (checksum_sink != nullptr) {
                         return {ER_INVALID_PARAMS, {}};
                     }
                 } else {
                     auto handle = sdk_buffer_check_pool_->GetCell();
                     if (!HashBlocksByIovShape(block_buffers, handle, max_check_iov_num_, block_checksums)) {
-                        if (out_checksums != nullptr) {
+                        if (checksum_sink != nullptr) {
                             return {ER_INVALID_PARAMS, {}};
                         }
                     } else {
                         block_checksums_computed = true;
                     }
                 }
-                if (out_checksums != nullptr && block_checksums_computed &&
+                if (checksum_sink != nullptr && block_checksums_computed &&
                     block_checksums.size() != block_buffers.size()) {
                     KVCM_LOG_ERROR(
                         "block_checksums size [%zu] != block_buffers size [%zu]; reject write before it commits",
@@ -464,7 +464,7 @@ std::pair<ClientErrorCode, SaveKvCachesResult> TransferClientImpl::SaveKvCaches(
         // not return checksums for data that never landed on disk.
     }
 #else
-    if (out_checksums != nullptr) {
+    if (checksum_sink != nullptr) {
         KVCM_LOG_WARN("checksums requested but build is not CUDA/MUSA; return empty vector");
     }
 #endif
@@ -477,7 +477,7 @@ std::pair<ClientErrorCode, SaveKvCachesResult> TransferClientImpl::SaveKvCaches(
     }
 #if defined(USING_CUDA) || defined(USING_MUSA)
     // Put succeeded; only now hand computed checksums back to the caller.
-    if (out_checksums != nullptr && block_checksums_computed) {
+    if (checksum_sink != nullptr && block_checksums_computed) {
         result.checksums = std::move(block_checksums);
     }
 #endif

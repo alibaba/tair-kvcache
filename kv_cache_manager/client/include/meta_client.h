@@ -96,7 +96,16 @@ public:
                                                                  QueryType query_type,
                                                                  const std::vector<int64_t> &keys,
                                                                  const std::vector<int64_t> &tokens,
-                                                                 int32_t sw_size) = 0;
+                                                                 int32_t sw_size) {
+        return MatchLocationLen(
+            trace_id, query_type, keys, tokens, MatchLocationLenOptions::WithSlideWindowSize(sw_size));
+    }
+
+    virtual std::pair<ClientErrorCode, int64_t> MatchLocationLen(const std::string &trace_id,
+                                                                 QueryType query_type,
+                                                                 const std::vector<int64_t> &keys,
+                                                                 const std::vector<int64_t> &tokens,
+                                                                 const MatchLocationLenOptions &options) = 0;
 
     virtual ClientErrorCode RemoveCache(const std::string &trace_id,
                                         const std::vector<int64_t> &keys,

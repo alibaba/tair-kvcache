@@ -80,6 +80,46 @@ public:
         }
     }
 
+    std::pair<ClientErrorCode, Locations> GetCacheLocation(const std::string &trace_id,
+                                                           const std::string &instance_id,
+                                                           QueryType query_type,
+                                                           const Stub::KeyVector &keys,
+                                                           const Stub::TokenIdsVector &tokens,
+                                                           const BlockMask &block_mask,
+                                                           int32_t sw_size,
+                                                           const std::vector<std::string> &location_spec_names) {
+        auto [ec, result] = stub_->GetCacheLocation(trace_id,
+                                                    instance_id,
+                                                    query_type,
+                                                    keys,
+                                                    tokens,
+                                                    block_mask,
+                                                    location_spec_names,
+                                                    MatchLocationOptions::WithSlideWindowSize(sw_size));
+        return {ec, std::move(result.locations)};
+    }
+
+    std::pair<ClientErrorCode, int64_t> GetCacheLocationLen(const std::string &trace_id,
+                                                            const std::string &instance_id,
+                                                            QueryType query_type,
+                                                            const Stub::KeyVector &keys,
+                                                            const Stub::TokenIdsVector &tokens,
+                                                            int32_t sw_size) {
+        return stub_->GetCacheLocationLen(
+            trace_id, instance_id, query_type, keys, tokens, MatchLocationLenOptions::WithSlideWindowSize(sw_size));
+    }
+
+    std::pair<ClientErrorCode, Metas> GetCacheMeta(const std::string &trace_id,
+                                                   const std::string &instance_id,
+                                                   const Stub::KeyVector &keys,
+                                                   const Stub::TokenIdsVector &tokens,
+                                                   const BlockMask &block_mask,
+                                                   int32_t detail_level) {
+        auto [ec, result] = stub_->GetCacheMeta(
+            trace_id, instance_id, keys, tokens, block_mask, MatchMetaOptions::WithDetailLevel(detail_level));
+        return {ec, std::move(result.metas)};
+    }
+
 private:
     int GetFreePort();
     void StartService(int port = -1);
@@ -212,7 +252,7 @@ TEST_F(GrpcStubTest, TestRetry) {
     // 每次断连后首次RPC会因subchannel状态异常而立即失败，用dummy call触发subchannel重连。
     // 升级到grpc1.45.0+后可以去掉所有dummyCall调用。
     auto dummyCall = [this]() {
-        stub_->GetCacheLocation(
+        GetCacheLocation(
             "trace_dummy", "instance1", QueryType::QT_PREFIX_MATCH, {}, {}, static_cast<size_t>(0), 0, {});
     };
 
@@ -251,7 +291,7 @@ TEST_F(GrpcStubTest, TestRetry) {
 
     // --- Retry test 2: GetCacheLocation (写入中，应返回空) ---
     retryTest([&]() {
-        auto [success, locations] = stub_->GetCacheLocation(
+        auto [success, locations] = GetCacheLocation(
             "trace3", "instance1", QueryType::QT_PREFIX_MATCH, {1, 2, 3, 4}, {}, static_cast<size_t>(0), 0, {});
         EXPECT_EQ(ER_OK, success);
         EXPECT_EQ(Locations({}), locations);
@@ -266,7 +306,7 @@ TEST_F(GrpcStubTest, TestRetry) {
 
     // --- Retry test 4: GetCacheLocation (finish后，应返回缓存数据) ---
     retryTest([&]() {
-        auto [success, locations] = stub_->GetCacheLocation(
+        auto [success, locations] = GetCacheLocation(
             "trace5", "instance1", QueryType::QT_PREFIX_MATCH, {1, 2, 3, 4}, {}, static_cast<size_t>(0), 0, {});
         EXPECT_EQ(ER_OK, success);
         ExpectLocationsEq(target_locations, locations);
@@ -274,7 +314,7 @@ TEST_F(GrpcStubTest, TestRetry) {
 
     // --- Retry test 5: GetCacheLocation with offset (应返回子集) ---
     retryTest([&]() {
-        auto [success, locations] = stub_->GetCacheLocation(
+        auto [success, locations] = GetCacheLocation(
             "trace6", "instance1", QueryType::QT_PREFIX_MATCH, {1, 2, 3}, {}, static_cast<size_t>(1), 0, {});
         EXPECT_EQ(ER_OK, success);
         ExpectLocationsEq(Locations(target_locations.begin() + 1, target_locations.end()), locations);
@@ -495,7 +535,7 @@ TEST_F(GrpcStubTest, TestGetCacheLocationPrefixMatch) {
         target_locations = write_location.locations;
     }
     {
-        auto [success, locations] = stub_->GetCacheLocation(
+        auto [success, locations] = GetCacheLocation(
             "trace3", "instance1", QueryType::QT_PREFIX_MATCH, {1, 2, 3, 4}, {}, static_cast<size_t>(0), 0, {});
         ASSERT_EQ(ER_OK, success);
         ASSERT_EQ(Locations({}), locations);
@@ -506,14 +546,14 @@ TEST_F(GrpcStubTest, TestGetCacheLocationPrefixMatch) {
         target_locations.resize(target_locations.size() - 2); // Only the successful blocks
     }
     {
-        auto [success, locations] = stub_->GetCacheLocation(
+        auto [success, locations] = GetCacheLocation(
             "trace5", "instance1", QueryType::QT_PREFIX_MATCH, {1, 2, 3, 4}, {}, static_cast<size_t>(0), 0, {});
         ASSERT_EQ(ER_OK, success);
         ExpectLocationsEq(target_locations, locations);
         ASSERT_FALSE(HasFailure());
     }
     {
-        auto [success, locations] = stub_->GetCacheLocation(
+        auto [success, locations] = GetCacheLocation(
             "trace6", "instance1", QueryType::QT_PREFIX_MATCH, {1, 2, 3}, {}, static_cast<size_t>(1), 0, {});
         ASSERT_EQ(ER_OK, success);
         ASSERT_EQ(locations.size(), 1);
@@ -521,14 +561,14 @@ TEST_F(GrpcStubTest, TestGetCacheLocationPrefixMatch) {
         ASSERT_FALSE(HasFailure());
     }
     {
-        auto [success, locations] = stub_->GetCacheLocation(
+        auto [success, locations] = GetCacheLocation(
             "trace6", "instance1", QueryType::QT_PREFIX_MATCH, {1, 2, 3}, {}, static_cast<size_t>(6), 0, {});
         ASSERT_EQ(ER_OK, success);
         ASSERT_EQ(Locations({}), locations);
     }
     {
         BlockMask block_mask = BlockMaskVector({true, false, false, false});
-        auto [success, locations] = stub_->GetCacheLocation(
+        auto [success, locations] = GetCacheLocation(
             "trace6", "instance1", QueryType::QT_PREFIX_MATCH, {1, 2, 3}, {}, block_mask, 0, {});
         ASSERT_EQ(ER_OK, success);
         ExpectLocationsEq(Locations({target_locations[1]}), locations);
@@ -550,7 +590,7 @@ TEST_F(GrpcStubTest, TestGetCacheLocationBatchGet) {
         target_locations = write_location.locations;
     }
     {
-        auto [success, locations] = stub_->GetCacheLocation(
+        auto [success, locations] = GetCacheLocation(
             "trace3", "instance1", QueryType::QT_BATCH_GET, {1, 2, 3, 4}, {}, static_cast<size_t>(0), 0, {});
         ASSERT_EQ(ER_OK, success);
         ASSERT_EQ(Locations({{{"tp0", ""}, {"tp1", ""}},
@@ -564,7 +604,7 @@ TEST_F(GrpcStubTest, TestGetCacheLocationBatchGet) {
         ASSERT_EQ(ER_OK, stub_->FinishWriteCache("trace4", "instance1", write_session_id, success_block, {}));
     }
     {
-        auto [success, locations] = stub_->GetCacheLocation(
+        auto [success, locations] = GetCacheLocation(
             "trace5", "instance1", QueryType::QT_BATCH_GET, {0, 1, 22, 3, 4}, {}, static_cast<size_t>(0), 0, {});
         ASSERT_EQ(ER_OK, success);
         Locations expected_batch = {{{"tp0", ""}, {"tp1", ""}},
@@ -592,7 +632,7 @@ TEST_F(GrpcStubTest, TestGetCacheLocationReverseRollSlideWindowMatch) {
         target_locations = write_location.locations;
     }
     {
-        auto [success, locations] = stub_->GetCacheLocation("trace3",
+        auto [success, locations] = GetCacheLocation("trace3",
                                                             "instance1",
                                                             QueryType::QT_REVERSE_ROLL_SW_MATCH,
                                                             {1, 2, 3, 4, 5, 6},
@@ -618,7 +658,7 @@ TEST_F(GrpcStubTest, TestGetCacheLocationReverseRollSlideWindowMatch) {
         target_locations[5] = {};
     }
     {
-        auto [success, locations] = stub_->GetCacheLocation("trace5",
+        auto [success, locations] = GetCacheLocation("trace5",
                                                             "instance1",
                                                             QueryType::QT_REVERSE_ROLL_SW_MATCH,
                                                             {1, 2, 3, 4, 5, 6},
@@ -637,7 +677,7 @@ TEST_F(GrpcStubTest, TestGetCacheLocationReverseRollSlideWindowMatch) {
         ASSERT_FALSE(HasFailure());
     }
     {
-        auto [success, locations] = stub_->GetCacheLocation("trace5",
+        auto [success, locations] = GetCacheLocation("trace5",
                                                             "instance1",
                                                             QueryType::QT_REVERSE_ROLL_SW_MATCH,
                                                             {1, 2, 3, 4, 6, 7, 8},
@@ -657,7 +697,7 @@ TEST_F(GrpcStubTest, TestGetCacheLocationReverseRollSlideWindowMatch) {
         ASSERT_FALSE(HasFailure());
     }
     {
-        auto [success, locations] = stub_->GetCacheLocation("trace5",
+        auto [success, locations] = GetCacheLocation("trace5",
                                                             "instance1",
                                                             QueryType::QT_REVERSE_ROLL_SW_MATCH,
                                                             {1, 2, 3, 10, 5, 7, 8},
@@ -696,7 +736,7 @@ TEST_F(GrpcStubTest, TestGetCacheLocationLen) {
     {
         // After finish, should return 2 (number of successful blocks)
         auto [success, len] =
-            stub_->GetCacheLocationLen("trace5", "instance1", QueryType::QT_PREFIX_MATCH, {1, 2, 3, 4}, {}, 0);
+            GetCacheLocationLen("trace5", "instance1", QueryType::QT_PREFIX_MATCH, {1, 2, 3, 4}, {}, 0);
         ASSERT_EQ(ER_OK, success);
         ASSERT_EQ(2, len);
     }
@@ -741,7 +781,7 @@ TEST_F(GrpcStubTest, TestGetCacheMeta) {
     }
     {
         auto [success, meta] =
-            stub_->GetCacheMeta("trace3", "instance1", {1, 2, 3, 4}, {}, static_cast<size_t>(0), 100);
+            GetCacheMeta("trace3", "instance1", {1, 2, 3, 4}, {}, static_cast<size_t>(0), 100);
         ASSERT_EQ(ER_OK, success);
         ExpectLocationsEq(target_locations, meta.locations);
         ASSERT_FALSE(HasFailure());
@@ -749,7 +789,7 @@ TEST_F(GrpcStubTest, TestGetCacheMeta) {
     }
     {
         auto [success, meta] =
-            stub_->GetCacheMeta("trace4", "instance1", {1, 2, 3, 4, 5}, {}, static_cast<size_t>(0), 100);
+            GetCacheMeta("trace4", "instance1", {1, 2, 3, 4, 5}, {}, static_cast<size_t>(0), 100);
         ASSERT_EQ(ER_OK, success);
         Locations extended_target_locations = target_locations;
         extended_target_locations.push_back({});
@@ -774,7 +814,7 @@ TEST_F(GrpcStubTest, TestGetCacheMeta) {
         bool result = WaitUntil(
             [this, &expected_locations_after_finished, &meta_pred]() {
                 auto [success, meta] =
-                    stub_->GetCacheMeta("trace3", "instance1", {1, 2, 3, 4}, {}, static_cast<size_t>(0), 100);
+                    GetCacheMeta("trace3", "instance1", {1, 2, 3, 4}, {}, static_cast<size_t>(0), 100);
                 if (success != ER_OK) {
                     return false;
                 }
@@ -797,7 +837,7 @@ TEST_F(GrpcStubTest, TestGetCacheMeta) {
         bool result = WaitUntil(
             [this, &expected_locations_after_finished, &meta_pred]() {
                 auto [success, meta] =
-                    stub_->GetCacheMeta("trace3", "instance1", {1, 2, 3, 4, 5}, {}, static_cast<size_t>(0), 100);
+                    GetCacheMeta("trace3", "instance1", {1, 2, 3, 4, 5}, {}, static_cast<size_t>(0), 100);
                 if (success != ER_OK) {
                     return false;
                 }
@@ -837,7 +877,7 @@ TEST_F(GrpcStubTest, TestSpanTracer) {
         target_locations = write_location.locations;
     }
     {
-        auto [success, locations] = stub_->GetCacheLocation("trace3__kvcm_need_span_tracer",
+        auto [success, locations] = GetCacheLocation("trace3__kvcm_need_span_tracer",
                                                             "instance1",
                                                             QueryType::QT_PREFIX_MATCH,
                                                             {1, 2, 3, 4},
@@ -856,7 +896,7 @@ TEST_F(GrpcStubTest, TestSpanTracer) {
         target_locations.resize(target_locations.size() - 2);
     }
     {
-        auto [success, locations] = stub_->GetCacheLocation("trace5__kvcm_need_span_tracer",
+        auto [success, locations] = GetCacheLocation("trace5__kvcm_need_span_tracer",
                                                             "instance1",
                                                             QueryType::QT_PREFIX_MATCH,
                                                             {1, 2, 3, 4},

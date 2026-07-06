@@ -219,6 +219,16 @@ struct MatchLocationResult {
     std::vector<int64_t> checksums;
 };
 
+struct MatchLocationLenOptions {
+    int32_t sw_size{-1};
+
+    static MatchLocationLenOptions WithSlideWindowSize(int32_t sw_size) {
+        MatchLocationLenOptions options;
+        options.sw_size = sw_size;
+        return options;
+    }
+};
+
 struct MatchMetaOptions {
     int32_t detail_level{0};
     bool include_checksums{false};

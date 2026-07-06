@@ -31,36 +31,29 @@ public:
     virtual std::pair<ClientErrorCode, InstanceInfo> GetInstanceInfo(const std::string &trace_id,
                                                                      const std::string &instance_id) = 0;
 
-    // TODO : remove this
-    // out_checksums (optional): when non-null and the server returns CacheLocation
-    // checksums, this vector is filled in parallel to Metas::locations so the caller
-    // can pass them to LoadKvCaches for read-side verification.
-    virtual std::pair<ClientErrorCode, Metas> GetCacheMeta(const std::string &trace_id,
-                                                           const std::string &instance_id,
-                                                           const KeyVector &keys,
-                                                           const TokenIdsVector &tokens,
-                                                           const BlockMask &block_mask,
-                                                           int32_t detail_level,
-                                                           std::vector<int64_t> *out_checksums = nullptr) = 0;
+    virtual std::pair<ClientErrorCode, MatchMetaResult> GetCacheMeta(const std::string &trace_id,
+                                                                     const std::string &instance_id,
+                                                                     const KeyVector &keys,
+                                                                     const TokenIdsVector &tokens,
+                                                                     const BlockMask &block_mask,
+                                                                     const MatchMetaOptions &options) = 0;
 
-    // out_checksums (optional): when non-null this vector is filled with the per-block
-    // checksum returned by the server in parallel to the returned Locations.
-    virtual std::pair<ClientErrorCode, Locations> GetCacheLocation(const std::string &trace_id,
-                                                                   const std::string &instance_id,
-                                                                   QueryType query_type,
-                                                                   const KeyVector &keys,
-                                                                   const TokenIdsVector &tokens,
-                                                                   const BlockMask &block_mask,
-                                                                   int32_t sw_size,
-                                                                   const std::vector<std::string> &location_spec_names,
-                                                                   std::vector<int64_t> *out_checksums = nullptr) = 0;
+    virtual std::pair<ClientErrorCode, MatchLocationResult>
+    GetCacheLocation(const std::string &trace_id,
+                     const std::string &instance_id,
+                     QueryType query_type,
+                     const KeyVector &keys,
+                     const TokenIdsVector &tokens,
+                     const BlockMask &block_mask,
+                     const std::vector<std::string> &location_spec_names,
+                     const MatchLocationOptions &options) = 0;
 
     virtual std::pair<ClientErrorCode, int64_t> GetCacheLocationLen(const std::string &trace_id,
                                                                     const std::string &instance_id,
                                                                     QueryType query_type,
                                                                     const KeyVector &keys,
                                                                     const TokenIdsVector &tokens,
-                                                                    int32_t sw_size) = 0;
+                                                                    const MatchLocationLenOptions &options) = 0;
 
     virtual std::pair<ClientErrorCode, WriteLocation>
     StartWriteCache(const std::string &trace_id,
