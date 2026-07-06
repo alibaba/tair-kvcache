@@ -2,10 +2,224 @@
 #include <filesystem>
 #include <fstream>
 
+#include "kv_cache_manager/client/include/manager_client.h"
 #include "kv_cache_manager/client/src/transfer_client_impl.h"
 #include "kv_cache_manager/common/unittest.h"
 
 using namespace kv_cache_manager;
+
+class RecordingTransferClient : public TransferClient {
+public:
+    using TransferClient::LoadKvCaches;
+    using TransferClient::SaveKvCaches;
+
+    ClientErrorCode LoadKvCaches(const UriStrVec &uri_str_vec,
+                                 const BlockBuffers &block_buffers,
+                                 const LoadKvCachesOptions &options) override {
+        last_load_uri_count = uri_str_vec.size();
+        last_load_buffer_count = block_buffers.size();
+        last_load_options = options;
+        return ER_OK;
+    }
+
+    std::pair<ClientErrorCode, UriStrVec> SaveKvCaches(const UriStrVec &uri_str_vec,
+                                                       const BlockBuffers &block_buffers,
+                                                       const SaveKvCachesOptions &options) override {
+        last_save_uri_count = uri_str_vec.size();
+        last_save_buffer_count = block_buffers.size();
+        last_save_options = options;
+        return {ER_OK, uri_str_vec};
+    }
+
+    size_t last_load_uri_count{0};
+    size_t last_load_buffer_count{0};
+    LoadKvCachesOptions last_load_options;
+    size_t last_save_uri_count{0};
+    size_t last_save_buffer_count{0};
+    SaveKvCachesOptions last_save_options;
+
+protected:
+    ClientErrorCode Init(const std::string &, const InitParams &) override { return ER_OK; }
+};
+
+class RecordingManagerClient : public ManagerClient {
+public:
+    using ManagerClient::FinishWrite;
+    using ManagerClient::LoadKvCaches;
+    using ManagerClient::MatchLocation;
+    using ManagerClient::MatchMeta;
+    using ManagerClient::SaveKvCaches;
+
+    std::pair<ClientErrorCode, Locations> MatchLocation(const std::string &,
+                                                        QueryType,
+                                                        const std::vector<int64_t> &,
+                                                        const std::vector<int64_t> &,
+                                                        const BlockMask &,
+                                                        int32_t,
+                                                        const std::vector<std::string> &,
+                                                        const MatchLocationOptions &options) override {
+        last_match_location_options = options;
+        return {ER_OK, Locations{}};
+    }
+
+    std::pair<ClientErrorCode, WriteLocation> StartWrite(const std::string &,
+                                                         const std::vector<int64_t> &,
+                                                         const std::vector<int64_t> &,
+                                                         const std::vector<std::string> &,
+                                                         int64_t) override {
+        return {ER_OK, WriteLocation{}};
+    }
+
+    ClientErrorCode FinishWrite(const std::string &,
+                                const std::string &,
+                                const BlockMask &,
+                                const Locations &,
+                                const FinishWriteOptions &options) override {
+        last_finish_write_options = options;
+        return ER_OK;
+    }
+
+    std::pair<ClientErrorCode, Metas> MatchMeta(const std::string &,
+                                                const std::vector<int64_t> &,
+                                                const std::vector<int64_t> &,
+                                                const BlockMask &,
+                                                int32_t,
+                                                const MatchMetaOptions &options) override {
+        last_match_meta_options = options;
+        return {ER_OK, Metas{}};
+    }
+
+    ClientErrorCode RemoveCache(const std::string &,
+                                const std::vector<int64_t> &,
+                                const std::vector<int64_t> &,
+                                const BlockMask &) override {
+        return ER_OK;
+    }
+
+    ClientErrorCode LoadKvCaches(const UriStrVec &,
+                                 const BlockBuffers &,
+                                 const LoadKvCachesOptions &options) override {
+        last_load_options = options;
+        return ER_OK;
+    }
+
+    std::pair<ClientErrorCode, UriStrVec> SaveKvCaches(const UriStrVec &,
+                                                       const BlockBuffers &,
+                                                       const SaveKvCachesOptions &options) override {
+        last_save_options = options;
+        return {ER_OK, UriStrVec{}};
+    }
+
+    MatchLocationOptions last_match_location_options;
+    FinishWriteOptions last_finish_write_options;
+    MatchMetaOptions last_match_meta_options;
+    LoadKvCachesOptions last_load_options;
+    SaveKvCachesOptions last_save_options;
+
+protected:
+    ClientErrorCode Init(const std::string &, InitParams &) override { return ER_OK; }
+    void Shutdown() override {}
+};
+
+TEST(ClientOptionsTest, TransferConvenienceOverloadsForwardOptions) {
+    RecordingTransferClient client;
+    UriStrVec uris = {"file://test_nfs/path?blkid=0&size=1"};
+    BlockBuffers buffers = {BlockBuffer{}};
+
+    EXPECT_EQ(ER_OK, client.LoadKvCaches(uris, buffers));
+    EXPECT_EQ(uris.size(), client.last_load_uri_count);
+    EXPECT_EQ(buffers.size(), client.last_load_buffer_count);
+    EXPECT_EQ(nullptr, client.last_load_options.trace_info);
+    EXPECT_EQ(nullptr, client.last_load_options.expected_checksums);
+
+    auto trace_info = std::make_shared<TransferTraceInfo>();
+    trace_info->need_print = true;
+    EXPECT_EQ(ER_OK, client.LoadKvCaches(uris, buffers, trace_info));
+    EXPECT_EQ(trace_info, client.last_load_options.trace_info);
+    EXPECT_EQ(nullptr, client.last_load_options.expected_checksums);
+
+    std::vector<int64_t> expected_checksums = {0x11};
+    EXPECT_EQ(ER_OK,
+              client.LoadKvCaches(uris, buffers, LoadKvCachesOptions::VerifyWith(expected_checksums, trace_info)));
+    EXPECT_EQ(trace_info, client.last_load_options.trace_info);
+    EXPECT_EQ(&expected_checksums, client.last_load_options.expected_checksums);
+
+    auto save_result = client.SaveKvCaches(uris, buffers);
+    EXPECT_EQ(ER_OK, save_result.first);
+    EXPECT_EQ(uris.size(), client.last_save_uri_count);
+    EXPECT_EQ(buffers.size(), client.last_save_buffer_count);
+    EXPECT_EQ(nullptr, client.last_save_options.trace_info);
+    EXPECT_EQ(nullptr, client.last_save_options.out_checksums);
+
+    std::vector<int64_t> out_checksums;
+    save_result = client.SaveKvCaches(uris, buffers, SaveKvCachesOptions::CollectChecksums(out_checksums, trace_info));
+    EXPECT_EQ(ER_OK, save_result.first);
+    EXPECT_EQ(trace_info, client.last_save_options.trace_info);
+    EXPECT_EQ(&out_checksums, client.last_save_options.out_checksums);
+}
+
+TEST(ClientOptionsTest, ManagerConvenienceOverloadsForwardOptions) {
+    RecordingManagerClient client;
+    const std::string trace_id = "trace";
+    const std::vector<int64_t> keys = {1, 2};
+    const std::vector<int64_t> tokens = {3, 4};
+    const BlockMask block_mask = static_cast<BlockMaskOffset>(0);
+    const std::vector<std::string> spec_names = {"tp0"};
+    const Locations locations = {{{"tp0", "file://test"}}};
+    const UriStrVec uris = {"file://test"};
+    const BlockBuffers buffers = {BlockBuffer{}};
+
+    EXPECT_EQ(ER_OK,
+              client.MatchLocation(
+                        trace_id, QueryType::QT_PREFIX_MATCH, keys, tokens, block_mask, 0, spec_names)
+                  .first);
+    EXPECT_EQ(nullptr, client.last_match_location_options.out_checksums);
+
+    std::vector<int64_t> match_location_checksums;
+    EXPECT_EQ(ER_OK,
+              client.MatchLocation(trace_id,
+                                   QueryType::QT_PREFIX_MATCH,
+                                   keys,
+                                   tokens,
+                                   block_mask,
+                                   0,
+                                   spec_names,
+                                   MatchLocationOptions::CollectChecksums(match_location_checksums))
+                  .first);
+    EXPECT_EQ(&match_location_checksums, client.last_match_location_options.out_checksums);
+
+    EXPECT_EQ(ER_OK, client.FinishWrite(trace_id, "session", block_mask, locations));
+    EXPECT_EQ(nullptr, client.last_finish_write_options.checksums);
+
+    std::vector<int64_t> finish_checksums = {0x21, 0};
+    EXPECT_EQ(ER_OK,
+              client.FinishWrite(
+                  trace_id, "session", block_mask, locations, FinishWriteOptions::WithChecksums(finish_checksums)));
+    EXPECT_EQ(&finish_checksums, client.last_finish_write_options.checksums);
+
+    EXPECT_EQ(ER_OK, client.MatchMeta(trace_id, keys, tokens, block_mask, 1).first);
+    EXPECT_EQ(nullptr, client.last_match_meta_options.out_checksums);
+
+    std::vector<int64_t> match_meta_checksums;
+    EXPECT_EQ(ER_OK,
+              client.MatchMeta(
+                        trace_id, keys, tokens, block_mask, 1, MatchMetaOptions::CollectChecksums(match_meta_checksums))
+                  .first);
+    EXPECT_EQ(&match_meta_checksums, client.last_match_meta_options.out_checksums);
+
+    EXPECT_EQ(ER_OK, client.LoadKvCaches(uris, buffers));
+    EXPECT_EQ(nullptr, client.last_load_options.expected_checksums);
+
+    EXPECT_EQ(ER_OK, client.LoadKvCaches(uris, buffers, LoadKvCachesOptions::VerifyWith(finish_checksums)));
+    EXPECT_EQ(&finish_checksums, client.last_load_options.expected_checksums);
+
+    EXPECT_EQ(ER_OK, client.SaveKvCaches(uris, buffers).first);
+    EXPECT_EQ(nullptr, client.last_save_options.out_checksums);
+
+    EXPECT_EQ(ER_OK,
+              client.SaveKvCaches(uris, buffers, SaveKvCachesOptions::CollectChecksums(finish_checksums)).first);
+    EXPECT_EQ(&finish_checksums, client.last_save_options.out_checksums);
+}
 
 class TransferClientTest : public TESTBASE {
 public:
