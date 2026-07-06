@@ -83,7 +83,8 @@ public:
     std::string CreateSourceLocation(int64_t block_key,
                                      const std::string &hot_storage,
                                      bool write_file,
-                                     const std::string &content) {
+                                     const std::string &content,
+                                     int64_t create_time = 0) {
         auto rc = std::make_shared<RequestContext>("create_source");
         std::string key = kInstance + "/TP0/" + StringUtil::Uint64ToHex(block_key);
         auto results = data_storage_manager_->Create(rc.get(), hot_storage, {key}, content.size(), nullptr);
@@ -103,6 +104,9 @@ public:
         auto loc = std::make_shared<CacheLocation>(DataStorageType::DATA_STORAGE_TYPE_DUMMY,
                                                    1,
                                                    std::vector<LocationSpec>{LocationSpec("TP0", src_uri.ToUriString())});
+        if (create_time != 0) {
+            loc->set_create_time(create_time);
+        }
         std::vector<std::string> ids;
         EXPECT_EQ(ErrorCode::EC_OK, meta_searcher.BatchAddLocation(rc.get(), {block_key}, {loc}, ids));
         EXPECT_EQ(1u, ids.size());
@@ -214,6 +218,38 @@ TEST_F(MigrationManagerTest, TestMarkLifecycle) {
     ASSERT_EQ(3u, stats.marks_added);
     ASSERT_EQ(1u, stats.marks_cleared);
     ASSERT_EQ(2u, stats.active_marks); // best-effort = added - cleared
+}
+
+// F-14: 部分 key 因 block 不存在被 MA_SKIP 时，marks_added / expiry / event 只计实际成功数，
+// 不按 request 全量计——否则 active_marks(added-cleared) 会单调膨胀。
+TEST_F(MigrationManagerTest, TestMarkStatsOnlyCountActualSuccess) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "mark_stats_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "mark_stats_cold/"));
+    // 只创建 key 1 和 3 的 block；key 2 不存在 → MA_SKIP
+    CreateSourceLocation(1, "hot_01", false, "a");
+    CreateSourceLocation(3, "hot_01", false, "c");
+
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    ASSERT_EQ(ErrorCode::EC_OK, mgr.MarkForTieredWrite(kInstance, {1, 2, 3}, "cold_01"));
+
+    // key 1, 3 成功打标；key 2 被 MA_SKIP
+    ASSERT_TRUE(mgr.IsMarkedForTieredWrite(kInstance, 1));
+    ASSERT_FALSE(mgr.IsMarkedForTieredWrite(kInstance, 2)); // 不存在，未打标
+    ASSERT_TRUE(mgr.IsMarkedForTieredWrite(kInstance, 3));
+
+    auto stats = mgr.GetStats();
+    ASSERT_EQ(2u, stats.marks_added);      // actual=2, not request=3
+    ASSERT_EQ(0u, stats.marks_cleared);
+    ASSERT_EQ(2u, stats.active_marks);     // 2-0=2, 不会有幽灵 +1
+
+    // 清掉全部两个成功的 mark → active 归零
+    mgr.ClearTieredWriteMark(kInstance, 1);
+    mgr.ClearTieredWriteMark(kInstance, 3);
+    stats = mgr.GetStats();
+    ASSERT_EQ(2u, stats.marks_added);
+    ASSERT_EQ(2u, stats.marks_cleared);
+    ASSERT_EQ(0u, stats.active_marks);     // 完全收敛，无漂移
 }
 
 // F-02: 打标到未注册的 target storage 应失败（EC_NOENT）且不写入任何 mark，
@@ -489,6 +525,52 @@ TEST_F(MigrationManagerTest, TestSubmitThenSuccessSourceLost) {
     ASSERT_EQ(1u, stats.copy_submitted);
     ASSERT_EQ(0u, stats.copy_completed);
     ASSERT_EQ(1u, stats.copy_failed);
+}
+
+// F-08: Submit 时 PrepareCopyTask 应记录 src_create_time。当源 location 的 create_time 与记录不匹配时
+// (id 复用场景),OnTaskSuccess 应按 source_lost 处理并清理目标半成品。
+// 验证方式:创建带非零 create_time 的源,Submit,保留源但手动篡改活跃任务中的 src_create_time
+// 使其不匹配→OnTaskSuccess 应判 source_lost。
+TEST_F(MigrationManagerTest, TestSubmitThenSuccessSourceCreateTimeMismatch) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "reuse_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "reuse_cold/"));
+
+    int64_t block_key = 260;
+    const int64_t original_create_time = 1000;
+    std::string src_loc = CreateSourceLocation(block_key, "hot_01", true, "data", original_create_time);
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    mgr.DebugEnableCopySubmissionsForTest();
+    MigrationManager::MigrationRequest req;
+    req.instance_id = kInstance;
+    req.block_key = block_key;
+    req.src_location_id = src_loc;
+    req.src_storage_name = "hot_01";
+    req.dst_storage_name = "cold_01";
+    req.retention = MigrationRetention::MIGRATION_RETENTION_DELETE_SOURCE;
+    ASSERT_EQ(ErrorCode::EC_OK, mgr.Submit("t", req));
+    std::string dst_loc = mgr.GetActiveTaskDstLocation(kInstance, block_key);
+    ASSERT_EQ(CLS_WRITING, GetLocationStatus(block_key, dst_loc));
+
+    // 源仍在(id 命中 + SERVING),但篡改活跃任务的 src_create_time 使其不匹配——
+    // 模拟"id 被复用、新 location 的 create_time 和记录不同"。
+    {
+        std::lock_guard<std::mutex> lock(mgr.task_mutex_);
+        auto &tasks = mgr.active_tasks_by_instance_[kInstance];
+        auto it = tasks.find(block_key);
+        ASSERT_TRUE(it != tasks.end());
+        it->second.src_create_time = original_create_time + 9999; // 篡改：不等于源实际的 1000
+    }
+
+    mgr.OnTaskSuccess(kInstance, block_key);
+
+    // IsSourceLocationServing 找到了 src_loc(id + SERVING),但 create_time 不匹配 → source_lost。
+    ASSERT_FALSE(mgr.HasMigrationTask(kInstance, block_key));
+    ASSERT_EQ(0u, mgr.ActiveTaskCount());
+    ASSERT_TRUE(WaitFor([&]() { return GetLocationStatus(block_key, dst_loc) == CLS_NOT_FOUND; }));
+    // 源不应被删(retention DELETE_SOURCE 只在 promote 成功后执行,这里走 source_lost)。
+    ASSERT_EQ(CLS_SERVING, GetLocationStatus(block_key, src_loc));
+    ASSERT_EQ(1u, mgr.GetStats().copy_failed);
 }
 
 TEST_F(MigrationManagerTest, TestSubmitThenFail) {

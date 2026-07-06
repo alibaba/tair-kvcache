@@ -61,7 +61,10 @@ public:
 
     // 跨存储后端复制：把 src_uris[i] 的数据复制到 dst_uris[i]（多层存储迁移 Copy 路径用）。
     // 可选能力，默认不支持（返回逐项 EC_UNIMPLEMENTED）；支持复制的后端（如 TairMempool）按需 override。
-    // 同步语义：返回时复制已完成（内部可异步提交+轮询）。要求 src_uris.size() == dst_uris.size()。
+    // 同步语义：返回时复制已完成（内部可异步提交+轮询）。
+    // 前置：src_uris.size() == dst_uris.size()。
+    // 后置：返回 vector.size() 必须等于 src_uris.size()，逐项对应每个 URI 的复制结果。
+    //        调用方依赖此长度等式判断完整性；短返回会被视为整体失败（F-27）。
     virtual std::vector<ErrorCode> Copy(const std::vector<DataStorageUri> &src_uris,
                                         const std::vector<DataStorageUri> &dst_uris,
                                         const std::string &trace_id) {

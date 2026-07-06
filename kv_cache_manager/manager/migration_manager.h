@@ -121,13 +121,6 @@ public:
     bool HasActiveCopyTargetLocation(const std::string &location_id) const;
     size_t ActiveTaskCount() const;
 
-    // 仅供测试/诊断：返回某 block_key 当前活跃 Copy 任务的目标 location_id（无任务返回空串）。
-    std::string GetActiveTaskDstLocation(const std::string &instance_id, int64_t block_key) const;
-    // 仅供测试/诊断：注入一个伪造的活跃 Copy 任务上下文（用于覆盖活跃目标保护等分支）。
-    void DebugInsertActiveCopyTask(const std::string &instance_id, int64_t block_key, const std::string &dst_location_id);
-    // 仅供测试：允许不开 monitor 直接提交 Copy，再手动驱动 OnTaskSuccess/OnTaskFailed。
-    void DebugEnableCopySubmissionsForTest();
-
     // ---- Copy 准入策略（CacheReclaimer / AdminServiceImpl 共用） ----
     enum class CopyAdmissionStatus {
         kAccept,
@@ -156,11 +149,17 @@ public:
     MigrationStats GetStats() const;
 
 private:
+    // ---- 仅供测试/诊断（BUILD 通过 -fno-access-control 访问；F-07）----
+    std::string GetActiveTaskDstLocation(const std::string &instance_id, int64_t block_key) const;
+    void DebugInsertActiveCopyTask(const std::string &instance_id, int64_t block_key, const std::string &dst_location_id);
+    void DebugEnableCopySubmissionsForTest();
+
     // 单个活跃 Copy 任务的上下文。
     struct CopyTaskContext {
         std::string instance_id;
         int64_t block_key = 0;
         std::string src_location_id;
+        int64_t src_create_time = 0; // F-08: 提交时源 location 的 create_time，OnTaskSuccess 比对以防 id 复用
         std::string src_storage_name;
         std::string dst_storage_name;
         std::string dst_location_id;

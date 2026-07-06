@@ -716,7 +716,7 @@ void SchedulePlanExecutor::DoCopyTask(const std::shared_ptr<std::promise<PlanExe
     if (task.src_uris.size() != task.dst_uris.size()) {
         HandleErrorPromise(promise,
                            ErrorCode::EC_BADARGS,
-                           "src_uris size %d != dst_uris size %d",
+                           "src_uris size %zu != dst_uris size %zu",
                            task.src_uris.size(),
                            task.dst_uris.size());
         return;
@@ -729,6 +729,19 @@ void SchedulePlanExecutor::DoCopyTask(const std::shared_ptr<std::promise<PlanExe
     auto request_context = std::make_shared<RequestContext>("location_copy_task_trace");
     std::vector<ErrorCode> copy_results =
         data_storage_manager_->Copy(request_context.get(), task.exec_storage_name, task.src_uris, task.dst_uris);
+
+    // F-27: 后端必须为每个输入 URI 返回一个结果(接口 postcondition)。短返回意味着部分 spec 的
+    // 复制状态不可知——整体判为失败,防止 MigrationManager promote 不完整的目标 location。
+    if (copy_results.size() != task.src_uris.size()) {
+        HandleErrorPromise(promise,
+                           ErrorCode::EC_ERROR,
+                           "Copy returned %zu results, expected %zu (storage: %s, block_key: %ld)",
+                           copy_results.size(),
+                           task.src_uris.size(),
+                           task.exec_storage_name.c_str(),
+                           task.block_key);
+        return;
+    }
 
     for (size_t i = 0; i < copy_results.size(); ++i) {
         if (copy_results[i] != ErrorCode::EC_OK) {

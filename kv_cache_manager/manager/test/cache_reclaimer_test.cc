@@ -4776,3 +4776,62 @@ TEST_F(CacheReclaimerTest, TestTryMigrateOnGroupNormalizesVcnsSourceTypeForQuota
     stub_.reset(ADDR(MetaSearcher, BatchGetLocation));
     stub_.reset(ADDR(MigrationManager, BatchSubmit));
 }
+
+// F-23: BOTH 方法下 copy 提交部分失败时，失败的 block 应回落到 mark（与 Admin BOTH 对齐）。
+// 用一个让第 2 个 copy request 失败的 stub 验证回落行为。
+namespace {
+std::vector<ErrorCode> BatchSubmit_PartialFail_stub(void * /*obj*/,
+                                                    const std::string &trace_id,
+                                                    std::vector<MigrationManager::MigrationRequest> requests) {
+    captured_copy_trace = trace_id;
+    captured_copy_reqs = requests;
+    captured_copy_req_batches.emplace_back(requests);
+    std::vector<ErrorCode> results(requests.size(), ErrorCode::EC_OK);
+    // 让第 2 个(index 1)失败
+    if (results.size() > 1) {
+        results[1] = ErrorCode::EC_ERROR;
+    }
+    return results;
+}
+} // namespace
+
+TEST_F(CacheReclaimerTest, TestMigrateByStrategyBothCopyFailFallbackMark) {
+    cache_reclaimer_->job_state_flag_ = true;
+    const auto ins_info = InstanceInfoFactory();
+    captured_copy_reqs.clear();
+    captured_copy_req_batches.clear();
+    captured_mark_keys.clear();
+    captured_mark_target.clear();
+
+    stub_.set(ADDR(MetaSearcher, BatchGetLocation), MigrateTest_BatchGetLocation_stub);
+    // 用部分失败的 BatchSubmit stub
+    stub_.set(ADDR(MigrationManager, BatchSubmit), BatchSubmit_PartialFail_stub);
+    stub_.set(ADDR(MigrationManager, MarkForTieredWrite), MigrationManager_MarkForTieredWrite_stub);
+
+    // batch = {20, 21, 22}：全部合格(loc_maps 里有源)；slots 足够(5)
+    const std::vector<std::int64_t> batch = {20, 21, 22};
+    std::vector<CacheLocationMap> loc_maps;
+    {
+        const BlockMask blk_mask(std::in_place_type<BlockMaskVector>, batch.size(), false);
+        ASSERT_EQ(ErrorCode::EC_OK,
+                  MigrateTest_BatchGetLocation_stub(nullptr, request_context_.get(), batch, blk_mask, loc_maps));
+        ASSERT_EQ(batch.size(), loc_maps.size());
+    }
+
+    const auto strategy = MakeStrategy("hot_01", "cold_01", /*copy*/ true, /*mark*/ true);
+    const std::size_t submitted = cache_reclaimer_->MigrateByStrategyOnBatch(
+        request_context_, ins_info, strategy, /*available_copy_slots*/ 5, batch, loc_maps);
+
+    // 3 个都进 copy；BatchSubmit 返回 [OK, ERROR, OK]
+    ASSERT_EQ(3u, captured_copy_reqs.size());
+    // submitted_copy = 2 (index 0 和 2 成功)
+    ASSERT_EQ(2u, submitted);
+    // 失败的 index 1 (block_key=21) 应回落到 mark
+    ASSERT_EQ(1u, captured_mark_keys.size());
+    ASSERT_EQ(21, captured_mark_keys[0]);
+    ASSERT_EQ("cold_01", captured_mark_target);
+
+    stub_.reset(ADDR(MetaSearcher, BatchGetLocation));
+    stub_.reset(ADDR(MigrationManager, BatchSubmit));
+    stub_.reset(ADDR(MigrationManager, MarkForTieredWrite));
+}

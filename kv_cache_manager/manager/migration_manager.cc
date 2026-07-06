@@ -303,6 +303,7 @@ ErrorCode MigrationManager::PrepareCopyTask(const std::string &trace_id,
     out_ctx.instance_id = request.instance_id;
     out_ctx.block_key = request.block_key;
     out_ctx.src_location_id = request.src_location_id;
+    out_ctx.src_create_time = src_location.create_time(); // F-08: 记录源 location 的创建时间
     out_ctx.src_storage_name = request.src_storage_name;
     out_ctx.dst_storage_name = request.dst_storage_name;
     out_ctx.dst_location_id = out_location_ids[0];
@@ -433,7 +434,12 @@ bool MigrationManager::IsSourceLocationServing(const CopyTaskContext &ctx) const
         return false;
     }
     auto iter = location_maps[0].find(ctx.src_location_id);
-    return iter != location_maps[0].end() && iter->second != nullptr && iter->second->status() == CLS_SERVING;
+    if (iter == location_maps[0].end() || iter->second == nullptr) {
+        return false;
+    }
+    // F-08: id + status + create_time 三者同时匹配，防止 id 复用导致误判新 location 为原始源。
+    return iter->second->status() == CLS_SERVING &&
+           iter->second->create_time() == ctx.src_create_time;
 }
 
 void MigrationManager::CompleteCopyTaskAsFailed(const CopyTaskContext &ctx, const std::string &fail_reason) {
@@ -672,12 +678,15 @@ ErrorCode MigrationManager::MarkForTieredWrite(const std::string &instance_id,
         return EC_INSTANCE_NOT_EXIST;
     }
     const int64_t deadline_ms = TimestampUtil::GetCurrentTimeMs() + timeout_ms;
+    // F-14: 记录实际成功打标的 key index，供 stat/expiry/event 仅按 actual 口径更新。
+    // modifier 在 RMW 批次内按 global_idx 回调，顺序对齐 block_keys。
+    std::vector<bool> mark_succeeded(block_keys.size(), false);
     // RMW：只写 property（out_new_locations 留空，不动 location）。不存在的 block 跳过（不给空 block 打标）。
-    auto modifier = [&dst_storage_name, deadline_ms](const LocationIdVector & /*existing*/,
-                                                     ErrorCode get_ec,
-                                                     size_t /*idx*/,
-                                                     PropertyMap &upsert_property_map,
-                                                     CacheLocationMap & /*out_new*/) -> ModifierResult {
+    auto modifier = [&dst_storage_name, deadline_ms, &mark_succeeded](const LocationIdVector & /*existing*/,
+                                                                       ErrorCode get_ec,
+                                                                       size_t idx,
+                                                                       PropertyMap &upsert_property_map,
+                                                                       CacheLocationMap & /*out_new*/) -> ModifierResult {
         if (get_ec == EC_NOENT) {
             return {MA_SKIP, EC_OK};
         }
@@ -686,6 +695,9 @@ ErrorCode MigrationManager::MarkForTieredWrite(const std::string &instance_id,
         }
         upsert_property_map[PROPERTY_TIERED_WRITE_TARGET] = dst_storage_name;
         upsert_property_map[PROPERTY_TIERED_WRITE_DEADLINE_MS] = std::to_string(deadline_ms);
+        if (idx < mark_succeeded.size()) {
+            mark_succeeded[idx] = true;
+        }
         return {MA_OK, EC_OK};
     };
     RequestContext rc("migration_mark");
@@ -695,18 +707,21 @@ ErrorCode MigrationManager::MarkForTieredWrite(const std::string &instance_id,
         std::lock_guard<std::mutex> mark_lock(mark_mutex_);
         result = indexer->ReadModifyWriteBlock(&rc, keys, modifier);
     }
-    stat_marks_added_.fetch_add(block_keys.size(), std::memory_order_relaxed);
-    UpdateMarksActiveGauge();
-    if (result.ec == EC_OK) {
-        for (int64_t block_key : block_keys) {
-            EnqueueMarkExpiry(instance_id, block_key, dst_storage_name, deadline_ms);
-        }
+    // F-14: stat/expiry/event 按实际成功数更新（actual 口径），不再用 block_keys.size()（request 口径）。
+    const size_t actual_marked = static_cast<size_t>(std::count(mark_succeeded.begin(), mark_succeeded.end(), true));
+    if (actual_marked > 0) {
+        stat_marks_added_.fetch_add(actual_marked, std::memory_order_relaxed);
     }
-    if (event_manager_ != nullptr) {
-        for (int64_t block_key : block_keys) {
+    UpdateMarksActiveGauge();
+    for (size_t i = 0; i < block_keys.size(); ++i) {
+        if (!mark_succeeded[i]) {
+            continue;
+        }
+        EnqueueMarkExpiry(instance_id, block_keys[i], dst_storage_name, deadline_ms);
+        if (event_manager_ != nullptr) {
             auto ev = std::make_shared<MigrationMarkAddEvent>(instance_id);
             ev->SetEventTriggerTime();
-            ev->SetAdditionalArgs(block_key, dst_storage_name);
+            ev->SetAdditionalArgs(block_keys[i], dst_storage_name);
             event_manager_->Publish(ev);
         }
     }

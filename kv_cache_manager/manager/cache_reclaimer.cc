@@ -1789,6 +1789,7 @@ std::size_t CacheReclaimer::MigrateByStrategyOnBatch(const std::shared_ptr<Reque
 
     // 3. 准入过滤 + 收集 copy / mark 候选
     std::vector<MigrationManager::MigrationRequest> copy_reqs;
+    std::vector<std::int64_t> copy_block_keys; // F-23: 保留 copy 候选的 block_key，用于失败回落 mark
     std::vector<std::int64_t> mark_keys;
     for (std::size_t i = 0; i != batch.size(); ++i) {
         const std::int64_t block_key = batch[i];
@@ -1806,6 +1807,7 @@ std::size_t CacheReclaimer::MigrateByStrategyOnBatch(const std::shared_ptr<Reque
             req.src_storage_name = src_name;
             req.dst_storage_name = dst_name;
             req.retention = strategy.retention();
+            copy_block_keys.emplace_back(block_key);
             copy_reqs.emplace_back(std::move(req));
             continue; // Copy 优先：已进入 copy 分发的 block 不再重复 mark。
         }
@@ -1818,9 +1820,12 @@ std::size_t CacheReclaimer::MigrateByStrategyOnBatch(const std::shared_ptr<Reque
     std::size_t submitted_copy = 0;
     if (!copy_reqs.empty()) {
         const auto results = migration_manager_->BatchSubmit(request_context->trace_id(), std::move(copy_reqs));
-        for (const auto ec : results) {
-            if (ec == ErrorCode::EC_OK) {
+        for (std::size_t i = 0; i < results.size(); ++i) {
+            if (results[i] == ErrorCode::EC_OK) {
                 ++submitted_copy;
+            } else if (mark_enabled && i < copy_block_keys.size()) {
+                // F-23: copy 提交失败的 block 回落到 mark（与 Admin BOTH 语义对齐），避免静默丢弃迁移机会。
+                mark_keys.emplace_back(copy_block_keys[i]);
             }
         }
         if (submitted_copy > 0) {
@@ -1829,6 +1834,8 @@ std::size_t CacheReclaimer::MigrateByStrategyOnBatch(const std::shared_ptr<Reque
     }
     if (!mark_keys.empty()) {
         migration_manager_->MarkForTieredWrite(ins_id, mark_keys, dst_name, strategy.methods().mark().timeout_ms());
+        // request/submitted 口径（≠ actual marked 数）：部分 key 可能因 block 不存在被 MA_SKIP。
+        // MigrationManager 内部的 marks_active gauge 已按实际成功数统计（F-14）；此处仅记录提交量。
         METRICS_(cache_reclaimer, migration_mark_submitted_total) += mark_keys.size();
     }
 

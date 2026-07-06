@@ -1167,6 +1167,55 @@ TEST_F(SchedulePlanExecutorTest, TestCopyTaskSizeMismatch) {
     ASSERT_EQ(ErrorCode::EC_BADARGS, result.status);
 }
 
+// F-27: Copy 后端返回短 vector(违反 postcondition) → DoCopyTask 应整体判为失败，
+// 防止 MigrationManager promote 不完整目标 location。
+TEST_F(SchedulePlanExecutorTest, TestCopyTaskShortResultVector) {
+    std::string root = GetPrivateTestRuntimeDataPath() + "copy_dummy_short/";
+    ASSERT_TRUE(CreateDummyStorage("dummy_short", root));
+    SchedulePlanExecutor executor(1, meta_manager_, data_storage_manager_, metrics_registry_);
+
+    // 注入一个 Copy 返回短 vector 的 mock 后端（覆盖真实 dummy backend）。
+    class ShortCopyBackend : public DataStorageBackend {
+    public:
+        ShortCopyBackend() : DataStorageBackend(nullptr) { SetOpen(true); SetAvailable(true); }
+        DataStorageType GetType() override { return DataStorageType::DATA_STORAGE_TYPE_DUMMY; }
+        bool Available() override { return true; }
+        double GetStorageUsageRatio(const std::string &) const override { return 0.0; }
+        const StorageConfig &GetStorageConfig() override { return config_; }
+        ErrorCode DoOpen(const StorageConfig &, const std::string &) override { return EC_OK; }
+        ErrorCode Close() override { return EC_OK; }
+        std::vector<std::pair<ErrorCode, DataStorageUri>>
+        Create(const std::vector<std::string> &, size_t, const std::string &, std::function<void()>) override { return {}; }
+        std::vector<ErrorCode>
+        Delete(const std::vector<DataStorageUri> &, const std::string &, std::function<void()>) override { return {}; }
+        std::vector<bool> Exist(const std::vector<DataStorageUri> &u) override { return std::vector<bool>(u.size(), true); }
+        std::vector<ErrorCode> Lock(const std::vector<DataStorageUri> &u) override { return std::vector<ErrorCode>(u.size(), EC_OK); }
+        std::vector<ErrorCode> UnLock(const std::vector<DataStorageUri> &u) override { return std::vector<ErrorCode>(u.size(), EC_OK); }
+        std::vector<ErrorCode> Copy(const std::vector<DataStorageUri> &src,
+                                    const std::vector<DataStorageUri> &,
+                                    const std::string &) override {
+            // 故意只返回 1 个结果（输入可能 2 或更多）——违反 postcondition
+            return {ErrorCode::EC_OK};
+        }
+        StorageConfig config_;
+    };
+    data_storage_manager_->storage_map_["dummy_short"] = std::make_shared<ShortCopyBackend>();
+
+    std::string src1 = root + "src1", src2 = root + "src2";
+    std::string dst1 = root + "dst1", dst2 = root + "dst2";
+    CacheLocationCopyRequest req{
+        .instance_id = kTestInstanceName,
+        .block_key = 1005,
+        .exec_storage_name = "dummy_short",
+        .src_uris = {MakeUri(src1), MakeUri(src2)},
+        .dst_uris = {MakeUri(dst1), MakeUri(dst2)},
+    };
+    auto result = executor.Submit(req).get();
+    // 短 vector → 整体失败，不应是 EC_OK
+    ASSERT_NE(ErrorCode::EC_OK, result.status);
+    ASSERT_FALSE(result.error_message.empty());
+}
+
 TEST_F(SchedulePlanExecutorTest, TestCopyTaskStopped) {
     std::string root = GetPrivateTestRuntimeDataPath() + "copy_dummy_stop/";
     ASSERT_TRUE(CreateDummyStorage("dummy_04", root));
