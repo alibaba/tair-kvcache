@@ -171,59 +171,6 @@ ErrorCode VineyardBackend::UnregisterNode(const std::string &instance_id, const 
     return EC_OK;
 }
 
-ErrorCode VineyardBackend::UnregisterNodeIfGenerationMatches(const std::string &instance_id,
-                                                             const std::string &host_ip_port,
-                                                             uint64_t expected_generation) {
-    std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
-    auto gen_inst_it = node_generation_.find(instance_id);
-    uint64_t current_generation = 0;
-    if (gen_inst_it != node_generation_.end()) {
-        auto gen_it = gen_inst_it->second.find(host_ip_port);
-        if (gen_it != gen_inst_it->second.end()) {
-            current_generation = gen_it->second;
-        }
-    }
-    if (current_generation != expected_generation) {
-        KVCM_LOG_INFO("VineyardBackend: skip unregister node [%s] for instance [%s], generation changed [%lu -> %lu]",
-                      host_ip_port.c_str(),
-                      instance_id.c_str(),
-                      expected_generation,
-                      current_generation);
-        return EC_OK;
-    }
-
-    auto inst_it = instance_nodes_.find(instance_id);
-    if (inst_it == instance_nodes_.end()) {
-        KVCM_LOG_WARN("VineyardBackend: instance [%s] not found for guarded unregister node [%s]",
-                      instance_id.c_str(),
-                      host_ip_port.c_str());
-        return EC_NOENT;
-    }
-    auto it = inst_it->second.find(host_ip_port);
-    if (it == inst_it->second.end()) {
-        KVCM_LOG_WARN("VineyardBackend: node [%s] not found for instance [%s] for guarded unregister",
-                      host_ip_port.c_str(),
-                      instance_id.c_str());
-        return EC_NOENT;
-    }
-    if (metrics_registry_) {
-        auto &info = *it->second;
-        std::lock_guard<std::mutex> status_lock(info.status_mutex);
-        for (const auto &kv : info.last_system_status) {
-            auto data = metrics_registry_->GetMetricsData("v6d." + kv.first);
-            if (data) {
-                data->RemoveByTags(info.metrics_tags);
-            }
-        }
-    }
-    inst_it->second.erase(it);
-    KVCM_LOG_INFO("VineyardBackend: node [%s] guarded-unregistered from storage [%s] for instance [%s]",
-                  host_ip_port.c_str(),
-                  config_.global_unique_name().c_str(),
-                  instance_id.c_str());
-    return EC_OK;
-}
-
 // kvcm重启nodes_信息会丢失，v6d侧发送心跳会收到EC_NODE_NOT_REGISTERED，触发v6d re-register
 ErrorCode VineyardBackend::OnHeartbeat(const std::string &instance_id,
                                        const std::string &host_ip_port,

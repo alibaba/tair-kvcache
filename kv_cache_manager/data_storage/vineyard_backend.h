@@ -40,15 +40,12 @@ public:
                            const std::vector<std::string> &mediums) override;
 
     ErrorCode UnregisterNode(const std::string &instance_id, const std::string &host_ip_port) override;
-    ErrorCode UnregisterNodeIfGenerationMatches(const std::string &instance_id,
-                                                const std::string &host_ip_port,
-                                                uint64_t expected_generation) override;
 
     ErrorCode OnHeartbeat(const std::string &instance_id,
                           const std::string &host_ip_port,
                           const std::map<std::string, std::string> &system_status) override;
     void SetNodeUnavailable(const std::string &instance_id, const std::string &host_ip_port) override;
-    bool IsNodeAvailable(const std::string &instance_id, const std::string &host_ip_port) const override;
+    bool IsNodeAvailable(const std::string &instance_id, const std::string &host_ip_port) const;
 
     uint64_t GetNodeGeneration(const std::string &instance_id, const std::string &host_ip_port) const override;
 

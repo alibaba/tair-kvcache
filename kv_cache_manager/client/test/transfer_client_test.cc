@@ -442,7 +442,7 @@ TEST_F(TransferClientTest, TestBlockBufferUsage) {
     free(get_buffer);
 }
 
-// 任务 82620492：方案 B (inline_header) 在本期未实现，Init 期间必须拒绝。
+// Inline headers are not supported yet, so Init must reject that configuration.
 TEST_F(TransferClientTest, TestCreateRejectsInlineHeader) {
     auto init_params = init_params_;
     init_params.regist_span = new RegistSpan();

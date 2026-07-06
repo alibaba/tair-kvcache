@@ -28,8 +28,8 @@
 using namespace kv_cache_manager;
 
 namespace {
-// 任务 82620492：integrity 字段是后加的，StorageConfig::ToRapidWriter 始终输出 (即使全默认)。
-// 这里跟着扩展，避免对 RegisterInstance 返回值做字面值断言时挂。
+// StorageConfig::ToRapidWriter always emits the integrity block, even when all
+// fields are default values.
 static const std::string default_storage_configs(
     "[{\"type\":\"file\",\"is_available\":true,\"global_unique_name\":\"nfs_01\",\"storage_spec\":{"
     "\"root_path\":\"/tmp/nfs/\",\"key_count_per_file\":8},\"integrity\":{\"enable_meta_checksum\":false,"
