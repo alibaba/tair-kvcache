@@ -3,8 +3,8 @@
 
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/optimizer/config/eviction_config.h"
-#include "kv_cache_manager/optimizer/config/instance_config.h"
-#include "kv_cache_manager/optimizer/config/instance_group_config.h"
+#include "kv_cache_manager/optimizer/config/replay_instance_config.h"
+#include "kv_cache_manager/optimizer/config/replay_instance_group_config.h"
 #include "kv_cache_manager/optimizer/config/tier_config.h"
 #include "kv_cache_manager/optimizer/config/types.h"
 #include "kv_cache_manager/optimizer/eviction_policy/lru.h"
@@ -25,13 +25,13 @@ public:
 
 protected:
     std::shared_ptr<OptEvictionManager> manager_;
-    OptInstanceConfig CreateTestInstanceConfig(const std::string &instance_id);
+    OptimizerReplayInstanceConfig CreateTestInstanceConfig(const std::string &instance_id);
     std::vector<OptTierConfig> CreateTestTierConfigs();
-    OptInstanceGroupConfig CreateTestInstanceGroupConfig();
+    OptimizerReplayInstanceGroupConfig CreateTestInstanceGroupConfig();
 };
 
-OptInstanceConfig OptEvictionManagerTest::CreateTestInstanceConfig(const std::string &instance_id) {
-    OptInstanceConfig config;
+OptimizerReplayInstanceConfig OptEvictionManagerTest::CreateTestInstanceConfig(const std::string &instance_id) {
+    OptimizerReplayInstanceConfig config;
     config.set_instance_id(instance_id);
     config.set_instance_group_name("test_group");
     config.set_block_size(1024);
@@ -60,8 +60,8 @@ std::vector<OptTierConfig> OptEvictionManagerTest::CreateTestTierConfigs() {
     return configs;
 }
 
-OptInstanceGroupConfig OptEvictionManagerTest::CreateTestInstanceGroupConfig() {
-    OptInstanceGroupConfig config;
+OptimizerReplayInstanceGroupConfig OptEvictionManagerTest::CreateTestInstanceGroupConfig() {
+    OptimizerReplayInstanceGroupConfig config;
     config.set_group_name("test_group");
     config.set_quota_capacity(1024 * 1024 * 100); // 100MB
     config.set_used_percentage(0.0);
@@ -75,7 +75,7 @@ OptInstanceGroupConfig OptEvictionManagerTest::CreateTestInstanceGroupConfig() {
     config.set_storages({tier1});
 
     // 添加实例配置
-    OptInstanceConfig instance1;
+    OptimizerReplayInstanceConfig instance1;
     instance1.set_instance_id("instance1");
     instance1.set_instance_group_name("test_group");
     instance1.set_block_size(1024);
@@ -372,7 +372,7 @@ TEST_F(OptEvictionManagerTest, HierarchicalEvictionEnabled) {
 }
 
 TEST_F(OptEvictionManagerTest, ActiveEvictExpiredShouldNotTriggerFallbackEviction) {
-    OptInstanceConfig ttl_instance;
+    OptimizerReplayInstanceConfig ttl_instance;
     ttl_instance.set_instance_id("ttl_instance");
     ttl_instance.set_instance_group_name("ttl_group");
     ttl_instance.set_block_size(1024);
@@ -403,7 +403,7 @@ TEST_F(OptEvictionManagerTest, ActiveEvictExpiredShouldNotTriggerFallbackEvictio
     tier_policy->OnBlockWritten(&alive_block);
     tier_policy->OnBlockAccessedWithOptions(&alive_block, 1000, true); // 推进时钟，确保 expired_block 过期
 
-    OptInstanceGroupConfig ttl_group;
+    OptimizerReplayInstanceGroupConfig ttl_group;
     ttl_group.set_group_name("ttl_group");
     ttl_group.set_instances({ttl_instance});
 
@@ -416,7 +416,7 @@ TEST_F(OptEvictionManagerTest, ActiveEvictExpiredShouldNotTriggerFallbackEvictio
 }
 
 TEST_F(OptEvictionManagerTest, ActiveEvictExpiredUsesCurrentTimestamp) {
-    OptInstanceConfig ttl_instance;
+    OptimizerReplayInstanceConfig ttl_instance;
     ttl_instance.set_instance_id("ttl_instance_ts");
     ttl_instance.set_instance_group_name("ttl_group_ts");
     ttl_instance.set_block_size(1024);
@@ -439,7 +439,7 @@ TEST_F(OptEvictionManagerTest, ActiveEvictExpiredUsesCurrentTimestamp) {
     tier_policy->OnBlockWritten(&expired_block);
 
     // 这里不通过 OnBlockAccessed 推进策略时钟，仅依赖 ActiveEvictExpired 的 current_timestamp。
-    auto ttl_group = OptInstanceGroupConfig();
+    auto ttl_group = OptimizerReplayInstanceGroupConfig();
     ttl_group.set_group_name("ttl_group_ts");
     ttl_group.set_instances({ttl_instance});
 
@@ -476,7 +476,7 @@ TEST_F(OptEvictionManagerTest, ActiveEvictExpiredSkipsNonTtlPolicyInV1) {
     tier_policy->OnBlockWritten(&expired_block);
     tier_policy->OnBlockWritten(&alive_block);
 
-    OptInstanceGroupConfig group_cfg;
+    OptimizerReplayInstanceGroupConfig group_cfg;
     group_cfg.set_group_name("mixed_group");
     group_cfg.set_instances({lru_instance});
 
@@ -489,7 +489,7 @@ TEST_F(OptEvictionManagerTest, ActiveEvictExpiredSkipsNonTtlPolicyInV1) {
 // TTL 过期应清除 block 在所有 tier 的 location（block 级语义）
 TEST_F(OptEvictionManagerTest, ActiveEvictExpiredClearsAllTiers) {
     // 创建 2-tier hierarchical TTL 实例
-    OptInstanceConfig ttl_instance;
+    OptimizerReplayInstanceConfig ttl_instance;
     ttl_instance.set_instance_id("ttl_multi_tier");
     ttl_instance.set_instance_group_name("ttl_mt_group");
     ttl_instance.set_block_size(1024);
@@ -537,7 +537,7 @@ TEST_F(OptEvictionManagerTest, ActiveEvictExpiredClearsAllTiers) {
     policy_group->policies[0]->OnBlockWritten(&alive_block);
     policy_group->policies[1]->OnBlockWritten(&alive_block);
 
-    OptInstanceGroupConfig group;
+    OptimizerReplayInstanceGroupConfig group;
     group.set_group_name("ttl_mt_group");
     group.set_instances({ttl_instance});
 

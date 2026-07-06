@@ -6,8 +6,8 @@
 #include <vector>
 
 #include "kv_cache_manager/optimizer/config/eviction_config.h"
-#include "kv_cache_manager/optimizer/config/instance_config.h"
-#include "kv_cache_manager/optimizer/config/instance_group_config.h"
+#include "kv_cache_manager/optimizer/config/replay_instance_config.h"
+#include "kv_cache_manager/optimizer/config/replay_instance_group_config.h"
 #include "kv_cache_manager/optimizer/config/tier_config.h"
 #include "kv_cache_manager/optimizer/config/types.h"
 #include "kv_cache_manager/optimizer/eviction_policy/base.h"
@@ -35,7 +35,7 @@ public:
     ~OptEvictionManager() = default;
     bool Init(const EvictionConfig &eviction_config);
 
-    TieredPolicyGroup *CreateAndRegisterEvictionPolicy(const OptInstanceConfig &instance_config,
+    TieredPolicyGroup *CreateAndRegisterEvictionPolicy(const OptimizerReplayInstanceConfig &instance_config,
                                                        const std::vector<OptTierConfig> &storage_configs,
                                                        bool hierarchical_eviction_enabled = false);
 
@@ -43,21 +43,22 @@ public:
     // eviction_timestamp 仅在 cascading 降级时用来写入新 tier 的 TierStat，其他分支不使用
     std::unordered_map<std::string, std::vector<BlockEntry *>>
     EvictByMode(const std::string &instance_id,
-                const OptInstanceGroupConfig &instance_group_config,
+                const OptimizerReplayInstanceGroupConfig &instance_group_config,
                 int64_t eviction_timestamp);
 
     // 显式过期驱逐：遍历所有实例调用 EvictExpired()
     std::unordered_map<std::string, std::vector<BlockEntry *>>
-    ActiveEvictExpired(const OptInstanceGroupConfig &instance_group_config, int64_t current_timestamp);
+    ActiveEvictExpired(const OptimizerReplayInstanceGroupConfig &instance_group_config, int64_t current_timestamp);
 
     // ---- 用量查询接口 ----
 
     // 统一超额计算(bytes)：tier_idx 有值表示分层(对标 storages[tier_idx].capacity)，nullopt 表示非分层(对标
     // quota_capacity)
-    size_t GetExcessUsage(const OptInstanceGroupConfig &instance_group_config, std::optional<size_t> tier_idx) const;
+    size_t GetExcessUsage(const OptimizerReplayInstanceGroupConfig &instance_group_config,
+                          std::optional<size_t> tier_idx) const;
 
     // Group 用量(bytes)：tier_idx 有值表示指定 tier 的用量，nullopt 表示 shared_policy 用量
-    size_t GetCurrentGroupUsageBytes(const OptInstanceGroupConfig &instance_group_config,
+    size_t GetCurrentGroupUsageBytes(const OptimizerReplayInstanceGroupConfig &instance_group_config,
                                      std::optional<size_t> tier_idx = std::nullopt) const;
 
     // Instance 用量：物理存储总占用（累加所有 tier）
@@ -78,7 +79,7 @@ private:
     // 驱逐模式分发：根据 eviction_mode 调用对应的驱逐实现
     std::unordered_map<std::string, std::vector<BlockEntry *>>
     DispatchEviction(const std::string &instance_id,
-                     const OptInstanceGroupConfig &instance_group_config,
+                     const OptimizerReplayInstanceGroupConfig &instance_group_config,
                      std::optional<size_t> tier_idx,
                      size_t excess);
 
@@ -86,11 +87,11 @@ private:
     // tier_idx: nullopt 表示非分层模式(使用 shared_policy)，有值表示分层模式(使用 policies[tier_idx])
     // excess: 需要驱逐的 bytes 数量
     std::unordered_map<std::string, std::vector<BlockEntry *>> EvictByGroupRough(
-        const OptInstanceGroupConfig &instance_group_config, std::optional<size_t> tier_idx, size_t excess);
+        const OptimizerReplayInstanceGroupConfig &instance_group_config, std::optional<size_t> tier_idx, size_t excess);
     // precise=false: 每轮固定 batch size; precise=true: 每轮 cap 到剩余所需数量
     std::unordered_map<std::string, std::vector<BlockEntry *>>
     EvictByInstance(const std::string &instance_id,
-                    const OptInstanceGroupConfig &instance_group_config,
+                    const OptimizerReplayInstanceGroupConfig &instance_group_config,
                     std::optional<size_t> tier_idx,
                     size_t excess,
                     bool precise);

@@ -154,9 +154,9 @@ def extract_bytes_per_block_map(config_path: str) -> Dict[str, int]:
     bytes_per_block = block_size × bytes_per_token
 
     Note:
-        bytes_per_token 是 Python 侧的配置注解字段，C++ 层（OptInstanceConfig）不解析该字段。
-        block_size 在 KVCM C++ 层由 RegisterInstance/MismatchFields 强制要求同一 group 内一致；
-        bytes_per_token 无 C++ 层强制约束，依赖配置人员保证同一 group 内的值一致（通常
+        bytes_per_token 是 trace replay 配置里的 legacy size 字段，C++ 层
+        OptimizerReplayInstanceConfig 也会解析该字段。
+        bytes_per_token 依赖配置人员保证同一 group 内的值一致（通常
         同一 group 服务同一模型，bytes_per_token 自然相同）。
 
     缺少配置时打印 warning 并将该 instance 的值设为 0（调用方需检查）。

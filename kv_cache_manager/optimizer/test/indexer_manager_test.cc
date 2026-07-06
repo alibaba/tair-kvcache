@@ -5,8 +5,8 @@
 #include "kv_cache_manager/optimizer/analysis/stats_collector.h"
 #include "kv_cache_manager/optimizer/analysis/stats_tracker.h"
 #include "kv_cache_manager/optimizer/config/eviction_config.h"
-#include "kv_cache_manager/optimizer/config/instance_config.h"
-#include "kv_cache_manager/optimizer/config/instance_group_config.h"
+#include "kv_cache_manager/optimizer/config/replay_instance_config.h"
+#include "kv_cache_manager/optimizer/config/replay_instance_group_config.h"
 #include "kv_cache_manager/optimizer/config/tier_config.h"
 #include "kv_cache_manager/optimizer/config/types.h"
 #include "kv_cache_manager/optimizer/eviction_policy/lru.h"
@@ -30,9 +30,9 @@ public:
 protected:
     std::shared_ptr<OptIndexerManager> indexer_manager_;
     std::shared_ptr<OptEvictionManager> eviction_manager_;
-    OptInstanceConfig CreateTestInstanceConfig(const std::string &instance_id);
+    OptimizerReplayInstanceConfig CreateTestInstanceConfig(const std::string &instance_id);
     std::vector<OptTierConfig> CreateTestTierConfigs();
-    OptInstanceGroupConfig CreateTestInstanceGroupConfig();
+    OptimizerReplayInstanceGroupConfig CreateTestInstanceGroupConfig();
 };
 
 class CountingEvictionTracker : public StatsTracker {
@@ -49,8 +49,8 @@ public:
     size_t eviction_count = 0;
 };
 
-OptInstanceConfig OptIndexerManagerTest::CreateTestInstanceConfig(const std::string &instance_id) {
-    OptInstanceConfig config;
+OptimizerReplayInstanceConfig OptIndexerManagerTest::CreateTestInstanceConfig(const std::string &instance_id) {
+    OptimizerReplayInstanceConfig config;
     config.set_instance_id(instance_id);
     config.set_instance_group_name("test_group");
     config.set_block_size(1024);
@@ -78,8 +78,8 @@ std::vector<OptTierConfig> OptIndexerManagerTest::CreateTestTierConfigs() {
     return configs;
 }
 
-OptInstanceGroupConfig OptIndexerManagerTest::CreateTestInstanceGroupConfig() {
-    OptInstanceGroupConfig config;
+OptimizerReplayInstanceGroupConfig OptIndexerManagerTest::CreateTestInstanceGroupConfig() {
+    OptimizerReplayInstanceGroupConfig config;
     config.set_group_name("test_group");
     config.set_quota_capacity(1024 * 1024 * 100); // 100MB
     config.set_used_percentage(0.0);
@@ -166,7 +166,7 @@ TEST_F(OptIndexerManagerTest, GetAllOptIndexers) {
 }
 
 TEST_F(OptIndexerManagerTest, RegisterInstanceGroups) {
-    std::unordered_map<std::string, OptInstanceGroupConfig> instance_groups;
+    std::unordered_map<std::string, OptimizerReplayInstanceGroupConfig> instance_groups;
     instance_groups["test_group"] = CreateTestInstanceGroupConfig();
 
     indexer_manager_->RegisterInstanceGroups(instance_groups);
@@ -176,7 +176,7 @@ TEST_F(OptIndexerManagerTest, RegisterInstanceGroups) {
 }
 
 TEST_F(OptIndexerManagerTest, RegisterInstances) {
-    std::unordered_map<std::string, OptInstanceConfig> instances;
+    std::unordered_map<std::string, OptimizerReplayInstanceConfig> instances;
     instances["instance1"] = CreateTestInstanceConfig("instance1");
     instances["instance2"] = CreateTestInstanceConfig("instance2");
 
@@ -240,11 +240,11 @@ TEST_F(OptIndexerManagerTest, RegisterInstanceGroupsAndInstances) {
     auto tier_configs = CreateTestTierConfigs();
 
     // 注册实例组和实例
-    std::unordered_map<std::string, OptInstanceGroupConfig> instance_groups;
+    std::unordered_map<std::string, OptimizerReplayInstanceGroupConfig> instance_groups;
     instance_groups["test_group"] = CreateTestInstanceGroupConfig();
     indexer_manager_->RegisterInstanceGroups(instance_groups);
 
-    std::unordered_map<std::string, OptInstanceConfig> instances;
+    std::unordered_map<std::string, OptimizerReplayInstanceConfig> instances;
     instances["instance1"] = instance_config;
     indexer_manager_->RegisterInstances(instances);
 
@@ -293,7 +293,7 @@ TEST_F(OptIndexerManagerTest, GetCurrentInstanceUsageNonExistent) {
 }
 
 TEST_F(OptIndexerManagerTest, EvictExpiredBeforeAccessOnlyExpiresLocationWithoutNodeCleanup) {
-    OptInstanceConfig ttl_instance;
+    OptimizerReplayInstanceConfig ttl_instance;
     ttl_instance.set_instance_id("instance_ttl");
     ttl_instance.set_instance_group_name("ttl_group");
     ttl_instance.set_block_size(1024);
@@ -305,7 +305,7 @@ TEST_F(OptIndexerManagerTest, EvictExpiredBeforeAccessOnlyExpiresLocationWithout
     auto tier_configs = CreateTestTierConfigs();
     ASSERT_TRUE(indexer_manager_->CreateOptIndexer(ttl_instance, tier_configs, false));
 
-    OptInstanceGroupConfig ttl_group;
+    OptimizerReplayInstanceGroupConfig ttl_group;
     ttl_group.set_group_name("ttl_group");
     ttl_group.set_quota_capacity(1024 * 1024 * 100);
     ttl_group.set_used_percentage(1.0);
@@ -313,11 +313,11 @@ TEST_F(OptIndexerManagerTest, EvictExpiredBeforeAccessOnlyExpiresLocationWithout
     ttl_group.set_storages(tier_configs);
     ttl_group.set_instances({ttl_instance});
 
-    std::unordered_map<std::string, OptInstanceGroupConfig> groups;
+    std::unordered_map<std::string, OptimizerReplayInstanceGroupConfig> groups;
     groups["ttl_group"] = ttl_group;
     indexer_manager_->RegisterInstanceGroups(groups);
 
-    std::unordered_map<std::string, OptInstanceConfig> instances;
+    std::unordered_map<std::string, OptimizerReplayInstanceConfig> instances;
     instances["instance_ttl"] = ttl_instance;
     indexer_manager_->RegisterInstances(instances);
 

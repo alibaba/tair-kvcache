@@ -4,9 +4,9 @@
 
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/optimizer/config/eviction_config.h"
-#include "kv_cache_manager/optimizer/config/instance_config.h"
-#include "kv_cache_manager/optimizer/config/instance_group_config.h"
 #include "kv_cache_manager/optimizer/config/optimizer_config.h"
+#include "kv_cache_manager/optimizer/config/replay_instance_config.h"
+#include "kv_cache_manager/optimizer/config/replay_instance_group_config.h"
 #include "kv_cache_manager/optimizer/config/tier_config.h"
 #include "kv_cache_manager/optimizer/config/types.h"
 #include "kv_cache_manager/optimizer/manager/optimizer_manager.h"
@@ -32,7 +32,7 @@ OptimizerConfig OptimizerManagerTest::CreateTestOptimizerConfig() {
     eviction_config.set_eviction_batch_size_per_instance(10);
     config.set_eviction_params(eviction_config);
     // 创建实例组配置
-    OptInstanceGroupConfig instance_group;
+    OptimizerReplayInstanceGroupConfig instance_group;
     instance_group.set_group_name("test_group");
     instance_group.set_quota_capacity(1024 * 1024 * 100); // 100MB
     instance_group.set_used_percentage(0.0);
@@ -47,7 +47,7 @@ OptimizerConfig OptimizerManagerTest::CreateTestOptimizerConfig() {
     instance_group.set_storages({tier1});
 
     // 添加实例配置到实例组
-    OptInstanceConfig instance1;
+    OptimizerReplayInstanceConfig instance1;
     instance1.set_instance_id("instance1");
     instance1.set_instance_group_name("test_group");
     instance1.set_block_size(1024);

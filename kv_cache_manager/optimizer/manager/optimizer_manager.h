@@ -57,13 +57,13 @@ public:
     void ClearAllCachesAndResetStats();
 
 private:
-    bool CreateRadixTreeIndex(const OptInstanceConfig &instance_config,
+    bool CreateRadixTreeIndex(const OptimizerReplayInstanceConfig &instance_config,
                               const std::vector<OptTierConfig> &storage_configs);
 
 private:
     OptimizerConfig config_;
-    std::unordered_map<std::string, OptInstanceGroupConfig> instance_group_configs_;
-    std::unordered_map<std::string, OptInstanceConfig> instance_configs_;
+    std::unordered_map<std::string, OptimizerReplayInstanceGroupConfig> instance_group_configs_;
+    std::unordered_map<std::string, OptimizerReplayInstanceConfig> instance_configs_;
     std::unordered_map<std::string, bool> instance_group_ttl_disabled_;
     std::unordered_map<std::string, bool> instance_ttl_refresh_on_read_;
 

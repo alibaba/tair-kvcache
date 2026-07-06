@@ -9,7 +9,7 @@ namespace kv_cache_manager {
 OptIndexerManager::OptIndexerManager(const std::shared_ptr<OptEvictionManager> &eviction_manager)
     : eviction_manager_(eviction_manager) {}
 
-bool OptIndexerManager::CreateOptIndexer(const OptInstanceConfig &instance_config,
+bool OptIndexerManager::CreateOptIndexer(const OptimizerReplayInstanceConfig &instance_config,
                                          const std::vector<OptTierConfig> &storage_configs,
                                          bool hierarchical_eviction_enabled,
                                          TierWriteMode tier_write_mode,
@@ -70,14 +70,16 @@ size_t OptIndexerManager::GetInstanceBlockSize(const std::string &instance_id) c
 }
 
 void OptIndexerManager::RegisterInstanceGroups(
-    const std::unordered_map<std::string, OptInstanceGroupConfig> &instance_groups) {
+    const std::unordered_map<std::string, OptimizerReplayInstanceGroupConfig> &instance_groups) {
     instance_group_configs_ = instance_groups;
 }
-void OptIndexerManager::RegisterInstances(const std::unordered_map<std::string, OptInstanceConfig> &instances) {
+void OptIndexerManager::RegisterInstances(
+    const std::unordered_map<std::string, OptimizerReplayInstanceConfig> &instances) {
     instance_configs_ = instances;
 }
 
-const OptInstanceGroupConfig *OptIndexerManager::FindInstanceGroupConfig(const std::string &instance_id) const {
+const OptimizerReplayInstanceGroupConfig *
+OptIndexerManager::FindInstanceGroupConfig(const std::string &instance_id) const {
     auto instance_it = instance_configs_.find(instance_id);
     if (instance_it == instance_configs_.end()) {
         KVCM_LOG_ERROR("Instance config not found for instance_id: %s", instance_id.c_str());

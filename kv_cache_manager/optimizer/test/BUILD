@@ -143,3 +143,101 @@ py_test(
         # 后续可加 --test_arg="--verbose" 等，会传给真实测试
     ],
 )
+
+cc_test(
+    name = "LruCacheIndexerTest",
+    srcs = [
+        "lru_cache_indexer_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/optimizer/index:cache_indexer",
+    ],
+)
+
+cc_test(
+    name = "TtlCacheIndexerWrapperTest",
+    srcs = [
+        "ttl_cache_indexer_wrapper_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/optimizer/index:cache_indexer",
+        "//kv_cache_manager/optimizer/index:cache_indexer_factory",
+        "//kv_cache_manager/optimizer/index:ttl_cache_indexer_wrapper",
+    ],
+)
+
+cc_test(
+    name = "OnlineOptimizerManagerTest",
+    srcs = [
+        "online_optimizer_manager_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/optimizer:online_optimizer_manager",
+        "//kv_cache_manager/optimizer/config",
+        "//kv_cache_manager/optimizer/config:optimizer_registry_manager",
+    ],
+)
+
+cc_test(
+    name = "OptimizerConfigTest",
+    srcs = [
+        "optimizer_config_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/optimizer/config",
+    ],
+)
+
+cc_test(
+    name = "OptimizerServiceImplTest",
+    srcs = [
+        "optimizer_service_impl_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/optimizer:online_optimizer_manager",
+        "//kv_cache_manager/optimizer:optimizer_service_impl",
+        "//kv_cache_manager/optimizer/config",
+        "//kv_cache_manager/optimizer/config:optimizer_registry_manager",
+        "//kv_cache_manager/protocol/protobuf:service_cc_proto",
+    ],
+)
+
+cc_test(
+    name = "OptimizerMetricsReporterTest",
+    srcs = [
+        "optimizer_metrics_reporter_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/metrics:metrics_registry",
+        "//kv_cache_manager/optimizer:online_optimizer_manager",
+        "//kv_cache_manager/optimizer:optimizer_metrics_collector",
+        "//kv_cache_manager/optimizer:optimizer_metrics_reporter",
+        "//kv_cache_manager/optimizer/config",
+        "//kv_cache_manager/optimizer/config:optimizer_registry_manager",
+    ],
+)
+
+cc_test(
+    name = "OnlineOptimizerServerConfigTest",
+    srcs = [
+        "online_optimizer_server_config_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:env_util",
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/optimizer:online_optimizer_server_config",
+    ],
+)

@@ -92,7 +92,7 @@ bundle_tar(
 bundle_files(
     name = "optimizer_pkg_bin",
     srcs = [
-        "//kv_cache_manager/online_optimizer:online_optimizer_server_main",
+        "//kv_cache_manager/optimizer:online_optimizer_server_main",
     ],
     prefix = "bin",
 )

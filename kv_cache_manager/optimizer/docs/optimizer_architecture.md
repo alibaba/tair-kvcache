@@ -84,8 +84,8 @@ kv_cache_manager/optimizer/
 │   └── trace_util.h              # Trace 工具
 ├── config/               # 配置层
 │   ├── optimizer_config.h/cc     # 顶层配置
-│   ├── instance_group_config.h/cc # 实例组配置
-│   ├── instance_config.h/cc      # 实例配置
+│   ├── replay_instance_group_config.h/cc # trace replay/tier 模拟实例组配置
+│   ├── replay_instance_config.h/cc      # trace replay 实例配置
 │   ├── tier_config.h/cc          # 存储层配置
 │   ├── eviction_config.h         # 驱逐策略参数
 │   └── types.h                   # 类型定义
@@ -683,8 +683,8 @@ optimizer.AnalyzeResults()
 
 **配置**：
 - optimizer_config.h/cc - 顶层配置
-- instance_group_config.h/cc - 实例组配置
-- instance_config.h/cc - 实例配置
+- replay_instance_group_config.h/cc - trace replay/tier 模拟实例组配置
+- replay_instance_config.h/cc - trace replay 实例配置
 - tier_config.h/cc - 存储层配置
 - eviction_config.h - 驱逐策略参数
 - types.h - 类型定义
