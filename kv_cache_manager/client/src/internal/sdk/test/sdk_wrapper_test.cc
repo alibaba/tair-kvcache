@@ -206,3 +206,157 @@ TEST_F(SdkWrapperTest, TestUpdateMooncakeSdkConfig) {
     ASSERT_EQ(ER_OK, sdk_wrapper.UpdateMooncakeSdkConfig(mooncake_config, &span, ""));
 #endif
 }
+
+// ============================================================================
+// Multi-storage test fixture
+// ============================================================================
+class SdkWrapperMultiStorageTest : public TESTBASE {
+public:
+    void SetUp() override {
+        root_path_ = GetPrivateTestRuntimeDataPath();
+        client_config_ = CreateTestClientConfig();
+        init_params_.role_type = RoleType::WORKER;
+        init_params_.regist_span = new RegistSpan();
+        auto buffer = malloc(1024 * 1024);
+        init_params_.regist_span->base = buffer;
+        init_params_.regist_span->size = 1024 * 1024;
+        init_params_.self_location_spec_name = "tp0";
+        init_params_.storage_configs = CreateMultiStorageConfigs();
+    }
+
+    void TearDown() override {
+        free(init_params_.regist_span->base);
+        delete init_params_.regist_span;
+    }
+
+protected:
+    std::unique_ptr<ClientConfig> client_config_;
+    InitParams init_params_;
+    std::string root_path_;
+
+private:
+    std::unique_ptr<ClientConfig> CreateTestClientConfig() {
+        auto client_config = std::make_unique<ClientConfig>();
+        std::string client_config_str = R"({
+            "instance_group": "group",
+            "instance_id": "instance",
+            "address": ["127.0.0.1:8080"],
+            "block_size": 128,
+            "sdk_config": {
+                "thread_num": 8,
+                "queue_size": 2000,
+                "sdk_backend_configs": [{"type": "file"}],
+                "timeout_config": {
+                    "put_timeout_ms": 2000,
+                    "get_timeout_ms": 2000
+                }
+            },
+            "model_deployment": {
+                "model_name": "test_model",
+                "dtype": "FP8",
+                "use_mla": false,
+                "tp_size": 1,
+                "dp_size": 1,
+                "pp_size": 1
+            },
+            "location_spec_infos": {"tp0": 1024}
+        })";
+        client_config->FromJsonString(client_config_str);
+        return client_config;
+    }
+
+    std::string CreateMultiStorageConfigs() {
+        return "["
+               R"({"type":"file","global_unique_name":"nfs_a","storage_spec":{"root_path":")" +
+               root_path_ + R"(/nfs_a/","key_count_per_file":2}},)"
+               R"({"type":"file","global_unique_name":"nfs_b","storage_spec":{"root_path":")" +
+               root_path_ + R"(/nfs_b/","key_count_per_file":2}})"
+               "]";
+    }
+};
+
+TEST_F(SdkWrapperMultiStorageTest, TestMixedStoragePutAndGet) {
+    SdkWrapper sdk_wrapper;
+    ASSERT_EQ(ER_OK, sdk_wrapper.Init(client_config_, init_params_));
+
+    // 同 backend 使用同 path（不同 blkid），避免 SDK 内部 SplitByPath 导致重排
+    std::vector<DataStorageUri> remote_uris = {
+        DataStorageUri("file://nfs_a/" + root_path_ + "/nfs_a/0/0/1?blkid=0&size=1024"),
+        DataStorageUri("file://nfs_b/" + root_path_ + "/nfs_b/0/0/1?blkid=1&size=1024"),
+        DataStorageUri("file://nfs_a/" + root_path_ + "/nfs_a/0/0/1?blkid=2&size=1024"),
+    };
+    BlockBuffers local_buffers = {BlockBuffer(), BlockBuffer(), BlockBuffer()};
+
+    auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
+    ASSERT_EQ(ER_OK, sdk_wrapper.Put(remote_uris, local_buffers, actual_remote_uris));
+
+    ASSERT_EQ(actual_remote_uris->size(), 3);
+    ASSERT_EQ(actual_remote_uris->at(0).ToUriString(), remote_uris[0].ToUriString());
+    ASSERT_EQ(actual_remote_uris->at(1).ToUriString(), remote_uris[1].ToUriString());
+    ASSERT_EQ(actual_remote_uris->at(2).ToUriString(), remote_uris[2].ToUriString());
+
+    ASSERT_EQ(ER_OK, sdk_wrapper.Get(*actual_remote_uris, local_buffers));
+}
+
+TEST_F(SdkWrapperMultiStorageTest, TestSingleStorageBackwardCompat) {
+    SdkWrapper sdk_wrapper;
+    ASSERT_EQ(ER_OK, sdk_wrapper.Init(client_config_, init_params_));
+
+    std::vector<DataStorageUri> remote_uris = {
+        DataStorageUri("file://nfs_a/" + root_path_ + "/nfs_a/0/0/1?blkid=0&size=1024"),
+        DataStorageUri("file://nfs_a/" + root_path_ + "/nfs_a/0/0/1?blkid=1&size=1024"),
+    };
+    BlockBuffers local_buffers = {BlockBuffer(), BlockBuffer()};
+
+    auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
+    ASSERT_EQ(ER_OK, sdk_wrapper.Put(remote_uris, local_buffers, actual_remote_uris));
+    ASSERT_EQ(actual_remote_uris->size(), 2);
+    ASSERT_EQ(actual_remote_uris->at(0).ToUriString(), remote_uris[0].ToUriString());
+    ASSERT_EQ(actual_remote_uris->at(1).ToUriString(), remote_uris[1].ToUriString());
+
+    ASSERT_EQ(ER_OK, sdk_wrapper.Get(*actual_remote_uris, local_buffers));
+}
+
+TEST_F(SdkWrapperMultiStorageTest, TestMixedStorageWithInvalidSdk) {
+    SdkWrapper sdk_wrapper;
+    ASSERT_EQ(ER_OK, sdk_wrapper.Init(client_config_, init_params_));
+
+    std::vector<DataStorageUri> remote_uris = {
+        DataStorageUri("file://nfs_a/" + root_path_ + "/nfs_a/0/0/1?blkid=0&size=1024"),
+        DataStorageUri("file://unknown_backend/" + root_path_ + "/unknown/0/0/1?blkid=1&size=1024"),
+    };
+    BlockBuffers local_buffers = {BlockBuffer(), BlockBuffer()};
+
+    auto actual_remote_uris = std::make_shared<std::vector<DataStorageUri>>();
+    ASSERT_EQ(ER_GETSDK_ERROR, sdk_wrapper.Put(remote_uris, local_buffers, actual_remote_uris));
+    ASSERT_EQ(ER_GETSDK_ERROR, sdk_wrapper.Get(remote_uris, local_buffers));
+}
+
+TEST_F(SdkWrapperMultiStorageTest, TestGroupBySdk) {
+    SdkWrapper sdk_wrapper;
+    ASSERT_EQ(ER_OK, sdk_wrapper.Init(client_config_, init_params_));
+
+    std::vector<DataStorageUri> remote_uris = {
+        DataStorageUri("file://nfs_a/" + root_path_ + "/nfs_a/0/0/1?blkid=0&size=1024"),
+        DataStorageUri("file://nfs_b/" + root_path_ + "/nfs_b/0/0/2?blkid=1&size=1024"),
+        DataStorageUri("file://nfs_a/" + root_path_ + "/nfs_a/0/0/3?blkid=2&size=1024"),
+    };
+    BlockBuffers local_buffers = {BlockBuffer(), BlockBuffer(), BlockBuffer()};
+
+    std::vector<SdkWrapper::SdkGroup> groups;
+    ASSERT_EQ(ER_OK, sdk_wrapper.GroupBySdk(remote_uris, local_buffers, groups));
+    ASSERT_EQ(groups.size(), 2);
+
+    // 第一组 nfs_a: indices 0, 2
+    ASSERT_EQ(groups[0].indices.size(), 2);
+    ASSERT_EQ(groups[0].indices[0], 0);
+    ASSERT_EQ(groups[0].indices[1], 2);
+    ASSERT_EQ(groups[0].uris.size(), 2);
+    ASSERT_EQ(groups[0].buffers.size(), 2);
+
+    // 第二组 nfs_b: index 1
+    ASSERT_EQ(groups[1].indices.size(), 1);
+    ASSERT_EQ(groups[1].indices[0], 1);
+    ASSERT_EQ(groups[1].uris.size(), 1);
+    ASSERT_EQ(groups[1].buffers.size(), 1);
+}

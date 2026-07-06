@@ -1,5 +1,7 @@
 #include "kv_cache_manager/client/src/internal/sdk/sdk_wrapper.h"
 
+#include <unordered_map>
+
 #include "kv_cache_manager/client/src/internal/sdk/lock_free_thread_pool.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_factory.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_interface.h"
@@ -80,17 +82,55 @@ ClientErrorCode SdkWrapper::Init(const std::unique_ptr<ClientConfig> &client_con
     return ER_OK;
 }
 
+ClientErrorCode SdkWrapper::GroupBySdk(const std::vector<DataStorageUri> &remote_uris,
+                                       const BlockBuffers &local_buffers,
+                                       std::vector<SdkGroup> &groups) {
+    std::unordered_map<std::string, size_t> hostname_to_group;
+    for (size_t i = 0; i < remote_uris.size(); ++i) {
+        std::string hostname = remote_uris[i].GetHostName();
+        if (hostname.empty()) {
+            KVCM_LOG_WARN("GroupBySdk: remote_uri %s has empty hostname", remote_uris[i].ToUriString().c_str());
+            return ER_GETSDK_ERROR;
+        }
+        auto it = hostname_to_group.find(hostname);
+        if (it == hostname_to_group.end()) {
+            auto sdk = GetSdk(remote_uris[i]);
+            if (!sdk) {
+                KVCM_LOG_WARN("GroupBySdk: no sdk found for hostname: %s", hostname.c_str());
+                return ER_GETSDK_ERROR;
+            }
+            hostname_to_group[hostname] = groups.size();
+            groups.push_back({sdk, {}, {}, {}});
+        }
+        auto &group = groups[hostname_to_group[hostname]];
+        group.indices.push_back(i);
+        group.uris.push_back(remote_uris[i]);
+        group.buffers.push_back(local_buffers[i]);
+    }
+    return ER_OK;
+}
+
 ClientErrorCode SdkWrapper::Get(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers) {
     auto ec = Valid(remote_uris, local_buffers);
     if (ec != ER_OK) {
         return ec;
     }
-    auto sdk = GetSdk(remote_uris[0]);
-    if (!sdk) {
-        return ER_GETSDK_ERROR;
+    std::vector<SdkGroup> groups;
+    ec = GroupBySdk(remote_uris, local_buffers, groups);
+    if (ec != ER_OK) {
+        return ec;
     }
-    auto task = [sdk, remote_uris, &local_buffers]() { return sdk->Get(remote_uris, local_buffers); };
-    return RunWithTimeout(OpType::GET, task, wrapper_config_->timeout_config().get_timeout_ms());
+
+    // Build task vector for parallel dispatch
+    std::vector<std::function<ClientErrorCode()>> tasks;
+    tasks.reserve(groups.size());
+    for (const auto &group : groups) {
+        // Capture group by value to prevent use-after-free on timeout
+        tasks.push_back([group]() { return group.sdk->Get(group.uris, group.buffers); });
+    }
+
+    int timeout_ms = wrapper_config_->timeout_config().get_timeout_ms();
+    return RunWithTimeoutParallel(OpType::GET, std::move(tasks), timeout_ms);
 }
 
 ClientErrorCode SdkWrapper::Put(const std::vector<DataStorageUri> &remote_uris,
@@ -101,15 +141,51 @@ ClientErrorCode SdkWrapper::Put(const std::vector<DataStorageUri> &remote_uris,
         KVCM_LOG_WARN("put failed, remote_uris or local_buffers invalid.");
         return ec;
     }
-    auto sdk = GetSdk(remote_uris[0]);
-    if (!sdk) {
-        KVCM_LOG_WARN("put failed. can not get sdk by uri: %s", remote_uris[0].ToUriString().c_str());
-        return ER_GETSDK_ERROR;
+    std::vector<SdkGroup> groups;
+    ec = GroupBySdk(remote_uris, local_buffers, groups);
+    if (ec != ER_OK) {
+        return ec;
     }
-    auto task = [sdk, remote_uris, local_buffers, actual_remote_uris]() {
-        return sdk->Put(remote_uris, local_buffers, actual_remote_uris);
-    };
-    return RunWithTimeout(OpType::PUT, task, wrapper_config_->timeout_config().put_timeout_ms());
+    actual_remote_uris->resize(remote_uris.size());
+
+    // Build task vector and result containers for parallel dispatch
+    std::vector<std::function<ClientErrorCode()>> tasks;
+    std::vector<std::shared_ptr<std::vector<DataStorageUri>>> group_results;
+    tasks.reserve(groups.size());
+    group_results.reserve(groups.size());
+
+    for (const auto &group : groups) {
+        auto group_actual_uris = std::make_shared<std::vector<DataStorageUri>>();
+        group_results.push_back(group_actual_uris);
+        // Capture group by value to prevent use-after-free on timeout
+        tasks.push_back([group, group_actual_uris]() {
+            return group.sdk->Put(group.uris, group.buffers, group_actual_uris);
+        });
+    }
+
+    int timeout_ms = wrapper_config_->timeout_config().put_timeout_ms();
+    ec = RunWithTimeoutParallel(OpType::PUT, std::move(tasks), timeout_ms);
+    if (ec != ER_OK) {
+        KVCM_LOG_WARN("put failed, sdk error: %d", static_cast<int>(ec));
+        return ec;
+    }
+
+    // Result aggregation and validation
+    for (size_t i = 0; i < groups.size(); ++i) {
+        const auto &group = groups[i];
+        const auto &group_actual_uris = group_results[i];
+        
+        if (group_actual_uris->size() != group.indices.size()) {
+            KVCM_LOG_WARN("sdk returned mismatched actual_uris size: %zu vs %zu",
+                          group_actual_uris->size(),
+                          group.indices.size());
+            return ER_SDKWRITE_ERROR;
+        }
+        for (size_t j = 0; j < group.indices.size(); ++j) {
+            (*actual_remote_uris)[group.indices[j]] = (*group_actual_uris)[j];
+        }
+    }
+    return ER_OK;
 }
 
 ClientErrorCode SdkWrapper::Valid(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers local_buffers) {
@@ -155,30 +231,70 @@ std::string SdkWrapper::getOpTypeString(OpType op_type) const {
     return "unknown";
 }
 
-ClientErrorCode
-SdkWrapper::RunWithTimeout(OpType op_type, const std::function<ClientErrorCode()> &func, int timeout_ms) const {
+ClientErrorCode SdkWrapper::RunWithTimeoutParallel(OpType op_type,
+                                                   std::vector<std::function<ClientErrorCode()>> &&tasks,
+                                                   int timeout_ms) const {
+    if (tasks.empty()) {
+        return ER_OK;
+    }
+
+    // Check capacity before submitting any tasks
     if (wait_task_thread_pool_->isFull()) {
-        KVCM_LOG_WARN("run %s failed, wait task thread pool is full, something maybe wrong",
+        KVCM_LOG_WARN("run %s parallel failed, wait task thread pool is full",
                       getOpTypeString(op_type).c_str());
         return ER_THREADPOOL_ERROR;
     }
-    // wrap func with stop flag inside
-    auto stop = std::make_shared<std::atomic<bool>>(false);
-    auto wrapped = [stop, func]() -> ClientErrorCode {
-        if (stop->load()) {
-            return ER_SDK_TIMEOUT;
-        }
-        return func();
-    };
 
-    auto future = wait_task_thread_pool_->async(wrapped);
-    if (future.wait_for(std::chrono::milliseconds(timeout_ms)) == std::future_status::ready) {
-        return future.get();
+    // Submit all tasks with shared stop flag
+    auto stop = std::make_shared<std::atomic<bool>>(false);
+    std::vector<std::future<ClientErrorCode>> futures;
+    futures.reserve(tasks.size());
+
+    for (auto &task : tasks) {
+        auto wrapped = [stop, task]() -> ClientErrorCode {
+            if (stop->load()) {
+                return ER_SDK_TIMEOUT;
+            }
+            return task();
+        };
+        futures.push_back(wait_task_thread_pool_->async(wrapped));
     }
 
-    KVCM_LOG_WARN("run %s but timeout: %d ms", getOpTypeString(op_type).c_str(), timeout_ms);
-    stop->store(true);
-    return ER_SDK_TIMEOUT;
+    // Wait with shared deadline
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    for (size_t i = 0; i < futures.size(); ++i) {
+        auto remaining = deadline - std::chrono::steady_clock::now();
+        if (remaining <= std::chrono::steady_clock::duration::zero()) {
+            remaining = std::chrono::steady_clock::duration::zero();
+        }
+
+        if (futures[i].wait_for(remaining) != std::future_status::ready) {
+            KVCM_LOG_WARN("run %s parallel but timeout: %d ms (group %zu/%zu)",
+                          getOpTypeString(op_type).c_str(),
+                          timeout_ms,
+                          i + 1,
+                          futures.size());
+            stop->store(true);
+            // Drain all remaining in-flight tasks before returning
+            for (size_t j = i + 1; j < futures.size(); ++j) {
+                futures[j].wait();
+            }
+            return ER_SDK_TIMEOUT;
+        }
+
+        auto ec = futures[i].get();
+        if (ec != ER_OK) {
+            // Fail-fast: signal remaining tasks to exit early, then drain in-flight
+            // tasks to prevent background writes into caller's buffers
+            stop->store(true);
+            for (size_t j = i + 1; j < futures.size(); ++j) {
+                futures[j].wait();
+            }
+            return ec;
+        }
+    }
+
+    return ER_OK;
 }
 
 ClientErrorCode SdkWrapper::UpdateMooncakeSdkConfig(const std::shared_ptr<SdkBackendConfig> &sdk_backend_config,
