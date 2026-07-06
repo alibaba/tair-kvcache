@@ -8,7 +8,7 @@ cc_test(
     copts = ["-fno-access-control"],
     deps = [
         "//kv_cache_manager/common:unittest",
-        "//kv_cache_manager/online_optimizer:online_optimizer_server",
+        "//kv_cache_manager/optimizer:online_optimizer_server",
         "//kv_cache_manager/protocol/protobuf:service_cc_grpc",
         "//kv_cache_manager/protocol/protobuf:service_cc_proto",
         "@grpc//:grpc++",
@@ -23,7 +23,7 @@ py_library(
         "optimizer_interface_cases.py",
     ],
     data = [
-        "//kv_cache_manager/online_optimizer:online_optimizer_server_main",
+        "//kv_cache_manager/optimizer:online_optimizer_server_main",
     ],
     deps = [],
 )
@@ -33,7 +33,7 @@ py_test(
     srcs = ["http_interface_test.py"],
     main = "http_interface_test.py",
     data = [
-        "//kv_cache_manager/online_optimizer:online_optimizer_server_main",
+        "//kv_cache_manager/optimizer:online_optimizer_server_main",
     ],
     tags = ["no-remote-exec"],
     deps = [
@@ -47,7 +47,7 @@ py_test(
     srcs = ["grpc_interface_test.py"],
     main = "grpc_interface_test.py",
     data = [
-        "//kv_cache_manager/online_optimizer:online_optimizer_server_main",
+        "//kv_cache_manager/optimizer:online_optimizer_server_main",
     ],
     tags = ["no-remote-exec"],
     deps = [

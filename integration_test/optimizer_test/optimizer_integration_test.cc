@@ -1,15 +1,14 @@
 #include <cstring>
 #include <fstream>
+#include <grpcpp/grpcpp.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <thread>
 #include <tuple>
 #include <unistd.h>
 
-#include <grpcpp/grpcpp.h>
-
 #include "kv_cache_manager/common/unittest.h"
-#include "kv_cache_manager/online_optimizer/server/online_optimizer_server.h"
+#include "kv_cache_manager/optimizer/service/online_optimizer_server.h"
 #include "kv_cache_manager/protocol/protobuf/optimizer_service.grpc.pb.h"
 #include "kv_cache_manager/protocol/protobuf/optimizer_service.pb.h"
 
@@ -22,7 +21,9 @@ namespace {
 std::pair<int, int> AllocateDistinctPorts() {
     auto bind_ephemeral = []() -> std::pair<int, int> {
         int fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (fd == -1) { return {-1, -1}; }
+        if (fd == -1) {
+            return {-1, -1};
+        }
 
         struct sockaddr_in addr;
         std::memset(&addr, 0, sizeof(addr));
@@ -44,9 +45,25 @@ std::pair<int, int> AllocateDistinctPorts() {
 
     auto [fd1, port1] = bind_ephemeral();
     auto [fd2, port2] = bind_ephemeral();
-    if (fd1 >= 0) { close(fd1); }
-    if (fd2 >= 0) { close(fd2); }
+    if (fd1 >= 0) {
+        close(fd1);
+    }
+    if (fd2 >= 0) {
+        close(fd2);
+    }
     return {port1, port2};
+}
+
+void AddFullStateInfo(proto::optimizer::OptimizerRegisterInstanceRequest *req, int64_t full_size) {
+    auto *spec = req->add_location_spec_infos();
+    spec->set_name("full");
+    spec->set_size(full_size);
+
+    auto *group = req->add_location_spec_groups();
+    group->set_name("full_group");
+    group->add_spec_names("full");
+
+    req->mutable_optimizer_state_info()->set_full_location_spec_group_name("full_group");
 }
 
 } // namespace
@@ -59,8 +76,7 @@ protected:
         ASSERT_GT(http_port_, 0);
 
         const char *tmpdir = std::getenv("TEST_TMPDIR");
-        config_path_ = std::string(tmpdir ? tmpdir : "/tmp") +
-                        "/optimizer_integ_config.json";
+        config_path_ = std::string(tmpdir ? tmpdir : "/tmp") + "/optimizer_integ_config.json";
         {
             std::ofstream ofs(config_path_);
             ASSERT_TRUE(ofs.is_open()) << "Cannot create config file: " << config_path_;
@@ -80,9 +96,8 @@ protected:
 
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-        auto channel = grpc::CreateChannel(
-            "127.0.0.1:" + std::to_string(rpc_port_),
-            grpc::InsecureChannelCredentials());
+        auto channel =
+            grpc::CreateChannel("127.0.0.1:" + std::to_string(rpc_port_), grpc::InsecureChannelCredentials());
         stub_ = proto::optimizer::OptimizerService::NewStub(channel);
         ASSERT_NE(nullptr, stub_);
     }
@@ -98,13 +113,12 @@ protected:
         }
     }
 
-    void CreateTestGroup(const std::string &group_name,
-                         double capacity_gb = 1.0) {
+    void CreateTestGroup(const std::string &group_name, double capacity_gb = 1.0) {
         proto::optimizer::CreateInstanceGroupRequest req;
         req.set_trace_id("setup-" + group_name);
         auto *g = req.mutable_instance_group();
         g->set_name(group_name);
-        g->set_enabled(true);
+        g->set_eviction_policy(proto::optimizer::OPTIMIZER_EVICTION_POLICY_LRU);
         g->add_capacity_gb(capacity_gb);
 
         proto::optimizer::CommonResponse resp;
@@ -113,10 +127,11 @@ protected:
         ASSERT_TRUE(status.ok()) << status.error_message();
     }
 
-    proto::optimizer::OptimizerRegisterInstanceResponse RegisterTestInstance(
-        const std::string &group, const std::string &instance_id,
-        int32_t block_size = 1024, double capacity_gb = 1.0,
-        int32_t linear_step = 1) {
+    proto::optimizer::OptimizerRegisterInstanceResponse RegisterTestInstance(const std::string &group,
+                                                                             const std::string &instance_id,
+                                                                             int32_t block_size = 1024,
+                                                                             double capacity_gb = 1.0,
+                                                                             int32_t linear_step = 1) {
         CreateTestGroup(group, capacity_gb);
 
         proto::optimizer::OptimizerRegisterInstanceRequest req;
@@ -125,10 +140,7 @@ protected:
         req.set_instance_id(instance_id);
         req.set_block_size(block_size);
         req.set_linear_step(linear_step);
-
-        auto *spec = req.add_location_spec_infos();
-        spec->set_name("full");
-        spec->set_size(block_size);
+        AddFullStateInfo(&req, block_size);
 
         proto::optimizer::OptimizerRegisterInstanceResponse resp;
         grpc::ClientContext ctx;
@@ -161,9 +173,8 @@ TEST_F(OnlineOptimizerIntegrationTest, InstanceGroupCRUD) {
         req.set_trace_id("crud-create");
         auto *g = req.mutable_instance_group();
         g->set_name("crud_grp");
-        g->set_enabled(true);
         g->add_capacity_gb(2.0);
-        g->set_indexer_type("fenwick_lru");
+        g->set_eviction_policy(proto::optimizer::OPTIMIZER_EVICTION_POLICY_LRU);
 
         proto::optimizer::CommonResponse resp;
         grpc::ClientContext ctx;
@@ -184,7 +195,7 @@ TEST_F(OnlineOptimizerIntegrationTest, InstanceGroupCRUD) {
         EXPECT_EQ(proto::optimizer::OK, resp.header().status().code());
         EXPECT_EQ("crud_grp", resp.instance_group().name());
         EXPECT_DOUBLE_EQ(2.0, resp.instance_group().capacity_gb(0));
-        EXPECT_EQ("fenwick_lru", resp.instance_group().indexer_type());
+        EXPECT_EQ(proto::optimizer::OPTIMIZER_EVICTION_POLICY_LRU, resp.instance_group().eviction_policy());
     }
 
     // Update
@@ -193,9 +204,8 @@ TEST_F(OnlineOptimizerIntegrationTest, InstanceGroupCRUD) {
         req.set_trace_id("crud-update");
         auto *g = req.mutable_instance_group();
         g->set_name("crud_grp");
-        g->set_enabled(true);
         g->add_capacity_gb(4.0);
-        g->set_indexer_type("bst_lru");
+        g->set_eviction_policy(proto::optimizer::OPTIMIZER_EVICTION_POLICY_LRU);
 
         proto::optimizer::CommonResponse resp;
         grpc::ClientContext ctx;
@@ -215,7 +225,7 @@ TEST_F(OnlineOptimizerIntegrationTest, InstanceGroupCRUD) {
         ASSERT_TRUE(status.ok());
         EXPECT_EQ(proto::optimizer::OK, resp.header().status().code());
         EXPECT_DOUBLE_EQ(4.0, resp.instance_group().capacity_gb(0));
-        EXPECT_EQ("bst_lru", resp.instance_group().indexer_type());
+        EXPECT_EQ(proto::optimizer::OPTIMIZER_EVICTION_POLICY_LRU, resp.instance_group().eviction_policy());
     }
 
     // List
@@ -264,7 +274,6 @@ TEST_F(OnlineOptimizerIntegrationTest, CreateGroupWithEmptyName) {
     req.set_trace_id("boundary-empty-name");
     auto *g = req.mutable_instance_group();
     g->set_name("");
-    g->set_enabled(true);
     g->add_capacity_gb(1.0);
 
     proto::optimizer::CommonResponse resp;
@@ -280,7 +289,6 @@ TEST_F(OnlineOptimizerIntegrationTest, CreateGroupWithNoCapacity) {
     req.set_trace_id("boundary-no-cap");
     auto *g = req.mutable_instance_group();
     g->set_name("no_cap_grp");
-    g->set_enabled(true);
     // No capacity_gb set
 
     proto::optimizer::CommonResponse resp;
@@ -320,7 +328,7 @@ TEST_F(OnlineOptimizerIntegrationTest, CreateGroupWithMultipleCapacities) {
         req.set_trace_id("boundary-multi-cap");
         auto *g = req.mutable_instance_group();
         g->set_name("multi_cap_grp");
-        g->set_enabled(true);
+        g->set_eviction_policy(proto::optimizer::OPTIMIZER_EVICTION_POLICY_LRU);
         g->add_capacity_gb(0.5);
         g->add_capacity_gb(1.0);
         g->add_capacity_gb(2.0);
@@ -419,8 +427,8 @@ TEST_F(OnlineOptimizerIntegrationTest, RegisterWithEmptySpecs) {
 TEST_F(OnlineOptimizerIntegrationTest, RegisterAndListInstances) {
     auto resp = RegisterTestInstance("integ_grp1", "integ_reg_list_1");
     EXPECT_EQ(proto::optimizer::OK, resp.header().status().code());
-    EXPECT_GT(resp.capacity_blocks_size(), 0);
-    EXPECT_GT(resp.capacity_blocks(0), 0);
+    EXPECT_GT(resp.estimated_capacity_blocks_size(), 0);
+    EXPECT_GT(resp.estimated_capacity_blocks(0), 0);
 
     proto::optimizer::OptimizerListInstancesRequest list_req;
     list_req.set_trace_id("integ-list-1");
@@ -436,7 +444,7 @@ TEST_F(OnlineOptimizerIntegrationTest, RegisterAndListInstances) {
         if (inst.instance_id() == "integ_reg_list_1") {
             found = true;
             EXPECT_EQ("integ_grp1", inst.instance_group());
-            EXPECT_EQ(1024, inst.block_size());
+            EXPECT_EQ(1024, inst.debug_info().block_size());
         }
     }
     EXPECT_TRUE(found) << "Registered instance not found in list";
@@ -449,7 +457,6 @@ TEST_F(OnlineOptimizerIntegrationTest, RegisterWithDisabledGroup) {
         req.set_trace_id("setup-disabled-grp");
         auto *g = req.mutable_instance_group();
         g->set_name("disabled_grp");
-        g->set_enabled(false);
         g->add_capacity_gb(1.0);
 
         proto::optimizer::CommonResponse resp;
@@ -495,7 +502,7 @@ TEST_F(OnlineOptimizerIntegrationTest, TraceQueryMissAndHit) {
         auto status = stub_->TraceQuery(&ctx, tq_req, &tq_resp);
         ASSERT_TRUE(status.ok());
         EXPECT_EQ(proto::optimizer::OK, tq_resp.header().status().code());
-        EXPECT_EQ(0, tq_resp.cache_hit_count());
+        EXPECT_EQ(0, tq_resp.capacity_results(0).cache_hit_count());
         EXPECT_EQ(3, tq_resp.total_blocks());
     }
 
@@ -512,7 +519,7 @@ TEST_F(OnlineOptimizerIntegrationTest, TraceQueryMissAndHit) {
         auto status = stub_->TraceQuery(&ctx, tq_req, &tq_resp);
         ASSERT_TRUE(status.ok());
         EXPECT_EQ(proto::optimizer::OK, tq_resp.header().status().code());
-        EXPECT_EQ(3, tq_resp.cache_hit_count());
+        EXPECT_EQ(3, tq_resp.capacity_results(0).cache_hit_count());
         EXPECT_EQ(3, tq_resp.total_blocks());
     }
 
@@ -529,7 +536,7 @@ TEST_F(OnlineOptimizerIntegrationTest, TraceQueryMissAndHit) {
         auto status = stub_->TraceQuery(&ctx, tq_req, &tq_resp);
         ASSERT_TRUE(status.ok());
         EXPECT_EQ(proto::optimizer::OK, tq_resp.header().status().code());
-        EXPECT_EQ(1, tq_resp.cache_hit_count());
+        EXPECT_EQ(1, tq_resp.capacity_results(0).cache_hit_count());
         EXPECT_EQ(3, tq_resp.total_blocks());
     }
 }
@@ -562,7 +569,7 @@ TEST_F(OnlineOptimizerIntegrationTest, TraceQueryReturnsUniqueKeys) {
         auto status = stub_->TraceQuery(&ctx, tq_req, &tq_resp);
         ASSERT_TRUE(status.ok());
         EXPECT_EQ(proto::optimizer::OK, tq_resp.header().status().code());
-        EXPECT_EQ(3, tq_resp.current_unique_keys());
+        EXPECT_EQ(3, tq_resp.capacity_results(0).current_unique_keys());
     }
 
     // Insert some overlapping keys
@@ -578,7 +585,7 @@ TEST_F(OnlineOptimizerIntegrationTest, TraceQueryReturnsUniqueKeys) {
         auto status = stub_->TraceQuery(&ctx, tq_req, &tq_resp);
         ASSERT_TRUE(status.ok());
         EXPECT_EQ(proto::optimizer::OK, tq_resp.header().status().code());
-        EXPECT_EQ(4, tq_resp.current_unique_keys());
+        EXPECT_EQ(4, tq_resp.capacity_results(0).current_unique_keys());
     }
 }
 
@@ -812,7 +819,7 @@ TEST_F(OnlineOptimizerIntegrationTest, TraceQueryIsolationBetweenInstances) {
         grpc::ClientContext ctx;
         stub_->TraceQuery(&ctx, tq_req, &tq_resp);
         EXPECT_EQ(proto::optimizer::OK, tq_resp.header().status().code());
-        EXPECT_EQ(0, tq_resp.cache_hit_count());
+        EXPECT_EQ(0, tq_resp.capacity_results(0).cache_hit_count());
     }
 }
 
@@ -835,7 +842,7 @@ TEST_F(OnlineOptimizerIntegrationTest, RegisterWithLinearStep) {
     for (const auto &inst : list_resp.instances()) {
         if (inst.instance_id() == "integ_ls_1") {
             found = true;
-            EXPECT_EQ(4, inst.linear_step());
+            EXPECT_EQ(4, inst.debug_info().linear_step());
         }
     }
     EXPECT_TRUE(found);
@@ -865,9 +872,7 @@ TEST_F(OnlineOptimizerIntegrationTest, RegisterDuplicateOverwrites) {
         req.set_instance_group("integ_grp_dup");
         req.set_instance_id("integ_dup_1");
         req.set_block_size(1024);
-        auto *spec = req.add_location_spec_infos();
-        spec->set_name("full");
-        spec->set_size(1024);
+        AddFullStateInfo(&req, 1024);
 
         proto::optimizer::OptimizerRegisterInstanceResponse resp;
         grpc::ClientContext ctx;
@@ -953,7 +958,7 @@ TEST_F(OnlineOptimizerIntegrationTest, FullLifecycle) {
         proto::optimizer::TraceQueryResponse tq_resp;
         grpc::ClientContext ctx;
         stub_->TraceQuery(&ctx, tq_req, &tq_resp);
-        EXPECT_EQ(0, tq_resp.cache_hit_count());
+        EXPECT_EQ(0, tq_resp.capacity_results(0).cache_hit_count());
         EXPECT_EQ(5, tq_resp.total_blocks());
     }
 
@@ -968,7 +973,7 @@ TEST_F(OnlineOptimizerIntegrationTest, FullLifecycle) {
         proto::optimizer::TraceQueryResponse tq_resp;
         grpc::ClientContext ctx;
         stub_->TraceQuery(&ctx, tq_req, &tq_resp);
-        EXPECT_EQ(5, tq_resp.cache_hit_count());
+        EXPECT_EQ(5, tq_resp.capacity_results(0).cache_hit_count());
         EXPECT_EQ(5, tq_resp.total_blocks());
     }
 
@@ -986,11 +991,11 @@ TEST_F(OnlineOptimizerIntegrationTest, FullLifecycle) {
             if (inst.instance_id() == inst_id) {
                 EXPECT_EQ(2, inst.total_queries());
                 EXPECT_EQ(10, inst.total_blocks_queried());
-                EXPECT_EQ(5, inst.unique_keys());
+                EXPECT_EQ(5, inst.debug_info().unique_keys());
                 // Verify per-capacity hit rates
-                ASSERT_GE(inst.per_capacity_hit_rates_size(), 1);
-                EXPECT_EQ(5, inst.per_capacity_hit_rates(0).total_hits());
-                EXPECT_GT(inst.per_capacity_hit_rates(0).hit_rate(), 0.0);
+                ASSERT_GE(inst.capacity_summaries_size(), 1);
+                EXPECT_EQ(5, inst.capacity_summaries(0).total_hits());
+                EXPECT_GT(inst.capacity_summaries(0).hit_rate(), 0.0);
             }
         }
     }
@@ -1057,9 +1062,9 @@ TEST_F(OnlineOptimizerIntegrationTest, MultiCapacityHitRateTracking) {
         req.set_trace_id("setup-multi-cap-hr");
         auto *g = req.mutable_instance_group();
         g->set_name("multi_cap_hr_grp");
-        g->set_enabled(true);
-        g->add_capacity_gb(0.001);  // Very small - will have limited capacity
-        g->add_capacity_gb(10.0);   // Large - should hold everything
+        g->set_eviction_policy(proto::optimizer::OPTIMIZER_EVICTION_POLICY_LRU);
+        g->add_capacity_gb(0.001); // Very small - will have limited capacity
+        g->add_capacity_gb(10.0);  // Large - should hold everything
 
         proto::optimizer::CommonResponse resp;
         grpc::ClientContext ctx;
@@ -1074,16 +1079,14 @@ TEST_F(OnlineOptimizerIntegrationTest, MultiCapacityHitRateTracking) {
         req.set_instance_group("multi_cap_hr_grp");
         req.set_instance_id("multi_cap_hr_inst");
         req.set_block_size(1024);
-        auto *spec = req.add_location_spec_infos();
-        spec->set_name("full");
-        spec->set_size(1024);
+        AddFullStateInfo(&req, 1024);
 
         proto::optimizer::OptimizerRegisterInstanceResponse resp;
         grpc::ClientContext ctx;
         stub_->RegisterInstance(&ctx, req, &resp);
         ASSERT_EQ(proto::optimizer::OK, resp.header().status().code());
-        // Should have 2 capacity_blocks entries
-        EXPECT_EQ(2, resp.capacity_blocks_size());
+        // Should have 2 estimated_capacity_blocks entries
+        EXPECT_EQ(2, resp.estimated_capacity_blocks_size());
     }
 
     // TraceQuery to populate stats
@@ -1110,7 +1113,7 @@ TEST_F(OnlineOptimizerIntegrationTest, MultiCapacityHitRateTracking) {
         ASSERT_EQ(1, list_resp.instances_size());
         const auto &inst = list_resp.instances(0);
         // Should have 2 per-capacity hit rate entries
-        EXPECT_EQ(2, inst.per_capacity_hit_rates_size());
+        EXPECT_EQ(2, inst.capacity_summaries_size());
     }
 }
 

@@ -101,16 +101,16 @@ def _find_binary():
     candidates = [
         os.path.join(os.environ.get('TEST_SRCDIR', ''),
                      os.environ.get('TEST_WORKSPACE', ''),
-                     'kv_cache_manager/online_optimizer/online_optimizer_server_main'),
+                     'kv_cache_manager/optimizer/online_optimizer_server_main'),
         # Runfiles path
-        'kv_cache_manager/online_optimizer/online_optimizer_server_main',
+        'kv_cache_manager/optimizer/online_optimizer_server_main',
     ]
 
     # Also check relative to this test file for local dev
     test_dir = os.path.dirname(os.path.abspath(__file__))
     workspace_root = os.path.abspath(os.path.join(test_dir, '../../'))
     candidates.append(os.path.join(
-        workspace_root, 'bazel-bin/kv_cache_manager/online_optimizer/online_optimizer_server_main'))
+        workspace_root, 'bazel-bin/kv_cache_manager/optimizer/online_optimizer_server_main'))
 
     for path in candidates:
         if os.path.isfile(path) and os.access(path, os.X_OK):
@@ -121,7 +121,7 @@ def _find_binary():
     if runfiles_dir:
         workspace = os.environ.get('TEST_WORKSPACE', '')
         path = os.path.join(runfiles_dir, workspace,
-                            'kv_cache_manager/online_optimizer/online_optimizer_server_main')
+                            'kv_cache_manager/optimizer/online_optimizer_server_main')
         if os.path.isfile(path):
             return path
 
@@ -269,9 +269,8 @@ class OptimizerServiceTestCases(OptimizerTestBase):
             "trace_id": self._trace_id,
             "instance_group": {
                 "name": group_name,
-                "enabled": True,
+                "eviction_policy": "OPTIMIZER_EVICTION_POLICY_LRU",
                 "capacity_gb": [1.0, 2.0],
-                "indexer_type": "fenwick_lru",
             }
         }
         resp = self._client.create_instance_group(create_req)
@@ -285,7 +284,7 @@ class OptimizerServiceTestCases(OptimizerTestBase):
         })
         self.assertEqual(get_resp["header"]["status"]["code"], "OK")
         self.assertEqual(get_resp["instance_group"]["name"], group_name)
-        self.assertEqual(get_resp["instance_group"]["enabled"], True)
+        self.assertEqual(get_resp["instance_group"]["eviction_policy"], "OPTIMIZER_EVICTION_POLICY_LRU")
         self.assertEqual(len(get_resp["instance_group"]["capacity_gb"]), 2)
 
     def test_update_instance_group(self):
@@ -296,9 +295,8 @@ class OptimizerServiceTestCases(OptimizerTestBase):
             "trace_id": self._trace_id,
             "instance_group": {
                 "name": group_name,
-                "enabled": True,
+                "eviction_policy": "OPTIMIZER_EVICTION_POLICY_LRU",
                 "capacity_gb": [1.0],
-                "indexer_type": "fenwick_lru",
             }
         })
         # Update
@@ -306,9 +304,8 @@ class OptimizerServiceTestCases(OptimizerTestBase):
             "trace_id": self._trace_id,
             "instance_group": {
                 "name": group_name,
-                "enabled": True,
+                "eviction_policy": "OPTIMIZER_EVICTION_POLICY_LRU",
                 "capacity_gb": [2.0, 4.0],
-                "indexer_type": "bst_lru",
             }
         })
         self.assertEqual(resp["header"]["status"]["code"], "OK")
@@ -318,7 +315,7 @@ class OptimizerServiceTestCases(OptimizerTestBase):
             "trace_id": self._trace_id,
             "name": group_name,
         })
-        self.assertEqual(get_resp["instance_group"]["indexer_type"], "bst_lru")
+        self.assertEqual(get_resp["instance_group"]["eviction_policy"], "OPTIMIZER_EVICTION_POLICY_LRU")
         self.assertEqual(len(get_resp["instance_group"]["capacity_gb"]), 2)
 
     def test_remove_instance_group(self):
@@ -329,7 +326,7 @@ class OptimizerServiceTestCases(OptimizerTestBase):
             "trace_id": self._trace_id,
             "instance_group": {
                 "name": group_name,
-                "enabled": True,
+                "eviction_policy": "OPTIMIZER_EVICTION_POLICY_LRU",
                 "capacity_gb": [1.0],
             }
         })
@@ -354,7 +351,7 @@ class OptimizerServiceTestCases(OptimizerTestBase):
             "trace_id": self._trace_id,
             "instance_group": {
                 "name": group_name,
-                "enabled": True,
+                "eviction_policy": "OPTIMIZER_EVICTION_POLICY_LRU",
                 "capacity_gb": [1.0],
             }
         })
@@ -371,7 +368,7 @@ class OptimizerServiceTestCases(OptimizerTestBase):
             "trace_id": self._trace_id,
             "instance_group": {
                 "name": "",
-                "enabled": True,
+                "eviction_policy": "OPTIMIZER_EVICTION_POLICY_LRU",
                 "capacity_gb": [1.0],
             }
         }, check_response=False)
@@ -395,7 +392,7 @@ class OptimizerServiceTestCases(OptimizerTestBase):
             "trace_id": self._trace_id,
             "instance_group": {
                 "name": group_name,
-                "enabled": True,
+                "eviction_policy": "OPTIMIZER_EVICTION_POLICY_LRU",
                 "capacity_gb": [capacity_gb],
             }
         })
@@ -406,6 +403,8 @@ class OptimizerServiceTestCases(OptimizerTestBase):
             "block_size": block_size,
             "linear_step": linear_step,
             "location_spec_infos": [{"name": "full", "size": block_size}],
+            "location_spec_groups": [{"name": "full_group", "spec_names": ["full"]}],
+            "optimizer_state_info": {"full_location_spec_group_name": "full_group"},
         })
         return reg_resp
 
@@ -415,8 +414,8 @@ class OptimizerServiceTestCases(OptimizerTestBase):
         inst_id = f"test_reg_inst_{self._trace_id}"
         resp = self._create_group_and_register(group_name, inst_id)
         self.assertEqual(resp["header"]["status"]["code"], "OK")
-        self.assertIn("capacity_blocks", resp)
-        self.assertGreater(len(resp["capacity_blocks"]), 0)
+        self.assertIn("estimated_capacity_blocks", resp)
+        self.assertGreater(len(resp["estimated_capacity_blocks"]), 0)
 
     def test_register_without_group_fails(self):
         """Registering in a non-existent group should fail."""
@@ -436,7 +435,7 @@ class OptimizerServiceTestCases(OptimizerTestBase):
             "trace_id": self._trace_id,
             "instance_group": {
                 "name": group_name,
-                "enabled": True,
+                "eviction_policy": "OPTIMIZER_EVICTION_POLICY_LRU",
                 "capacity_gb": [1.0],
             }
         })
@@ -456,7 +455,7 @@ class OptimizerServiceTestCases(OptimizerTestBase):
             "trace_id": self._trace_id,
             "instance_group": {
                 "name": group_name,
-                "enabled": True,
+                "eviction_policy": "OPTIMIZER_EVICTION_POLICY_LRU",
                 "capacity_gb": [1.0],
             }
         })
@@ -542,7 +541,7 @@ class OptimizerServiceTestCases(OptimizerTestBase):
             "block_keys": [100, 200, 300],
         })
         self.assertEqual(resp1["header"]["status"]["code"], "OK")
-        self.assertEqual(int(resp1["cache_hit_count"]), 0)
+        self.assertEqual(int(resp1["capacity_results"][0]["cache_hit_count"]), 0)
         self.assertEqual(int(resp1["total_blocks"]), 3)
 
         # Second query - same keys, all hit
@@ -552,7 +551,7 @@ class OptimizerServiceTestCases(OptimizerTestBase):
             "block_keys": [100, 200, 300],
         })
         self.assertEqual(resp2["header"]["status"]["code"], "OK")
-        self.assertEqual(int(resp2["cache_hit_count"]), 3)
+        self.assertEqual(int(resp2["capacity_results"][0]["cache_hit_count"]), 3)
         self.assertEqual(int(resp2["total_blocks"]), 3)
 
     def test_trace_query_mixed(self):
@@ -575,7 +574,7 @@ class OptimizerServiceTestCases(OptimizerTestBase):
             "block_keys": [1, 4, 5],
         })
         self.assertEqual(resp["header"]["status"]["code"], "OK")
-        self.assertEqual(int(resp["cache_hit_count"]), 1)
+        self.assertEqual(int(resp["capacity_results"][0]["cache_hit_count"]), 1)
         self.assertEqual(int(resp["total_blocks"]), 3)
 
     def test_trace_query_nonexistent_instance(self):
@@ -598,7 +597,7 @@ class OptimizerServiceTestCases(OptimizerTestBase):
             "instance_id": inst_id,
             "block_keys": [10, 20, 30],
         })
-        self.assertEqual(int(resp["current_unique_keys"]), 3)
+        self.assertEqual(int(resp["capacity_results"][0]["current_unique_keys"]), 3)
 
         # Add overlapping keys
         resp = self._client.trace_query({
@@ -606,7 +605,7 @@ class OptimizerServiceTestCases(OptimizerTestBase):
             "instance_id": inst_id,
             "block_keys": [20, 30, 40],
         })
-        self.assertEqual(int(resp["current_unique_keys"]), 4)
+        self.assertEqual(int(resp["capacity_results"][0]["current_unique_keys"]), 4)
 
     # --- ResetStats Tests ---
 
@@ -673,7 +672,7 @@ class OptimizerServiceTestCases(OptimizerTestBase):
             "instance_id": inst_b,
             "block_keys": [1000, 2000],
         })
-        self.assertEqual(int(resp["cache_hit_count"]), 0)
+        self.assertEqual(int(resp["capacity_results"][0]["cache_hit_count"]), 0)
 
     def test_list_instances_filter_by_group(self):
         """ListInstances should filter by group."""
@@ -719,7 +718,7 @@ class OptimizerServiceTestCases(OptimizerTestBase):
             "instance_id": inst_id,
             "block_keys": [1, 2, 3, 4, 5],
         })
-        self.assertEqual(int(tq1["cache_hit_count"]), 0)
+        self.assertEqual(int(tq1["capacity_results"][0]["cache_hit_count"]), 0)
         self.assertEqual(int(tq1["total_blocks"]), 5)
 
         # 3. TraceQuery (hit)
@@ -728,7 +727,7 @@ class OptimizerServiceTestCases(OptimizerTestBase):
             "instance_id": inst_id,
             "block_keys": [1, 2, 3, 4, 5],
         })
-        self.assertEqual(int(tq2["cache_hit_count"]), 5)
+        self.assertEqual(int(tq2["capacity_results"][0]["cache_hit_count"]), 5)
 
         # 4. List and verify stats
         list_resp = self._client.list_instances({
@@ -741,10 +740,10 @@ class OptimizerServiceTestCases(OptimizerTestBase):
                 found = True
                 self.assertEqual(int(inst["total_queries"]), 2)
                 self.assertEqual(int(inst["total_blocks_queried"]), 10)
-                self.assertEqual(int(inst["unique_keys"]), 5)
-                # Check per_capacity_hit_rates
-                self.assertGreater(len(inst.get("per_capacity_hit_rates", [])), 0)
-                self.assertEqual(int(inst["per_capacity_hit_rates"][0]["total_hits"]), 5)
+                self.assertEqual(int(inst["debug_info"]["unique_keys"]), 5)
+                # Check capacity_summaries
+                self.assertGreater(len(inst.get("capacity_summaries", [])), 0)
+                self.assertEqual(int(inst["capacity_summaries"][0]["total_hits"]), 5)
         self.assertTrue(found, "Instance not found in list")
 
         # 5. Reset stats
@@ -791,7 +790,7 @@ class OptimizerServiceTestCases(OptimizerTestBase):
         })
         for inst in resp.get("instances", []):
             if inst["instance_id"] == inst_id:
-                self.assertEqual(int(inst["linear_step"]), 4)
+                self.assertEqual(int(inst["debug_info"]["linear_step"]), 4)
 
     # --- Duplicate Registration Tests ---
 
@@ -815,6 +814,8 @@ class OptimizerServiceTestCases(OptimizerTestBase):
             "instance_id": inst_id,
             "block_size": 1024,
             "location_spec_infos": [{"name": "full", "size": 1024}],
+            "location_spec_groups": [{"name": "full_group", "spec_names": ["full"]}],
+            "optimizer_state_info": {"full_location_spec_group_name": "full_group"},
         })
         self.assertEqual(resp["header"]["status"]["code"], "OK")
 
