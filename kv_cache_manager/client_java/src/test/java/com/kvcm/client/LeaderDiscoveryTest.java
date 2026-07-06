@@ -150,14 +150,11 @@ class LeaderDiscoveryTest {
                 if (ep.getHost().isEmpty() || ep.getMetaRpcPort() <= 0) {
                     return false;
                 }
-                // Use reflection to update volatile fields since they're in the parent
+                // Use reflection to update the currentAddress field (now an immutable LeaderAddress)
                 try {
-                    java.lang.reflect.Field hostField = LeaderDiscovery.class.getDeclaredField("currentHost");
-                    hostField.setAccessible(true);
-                    hostField.set(this, ep.getHost());
-                    java.lang.reflect.Field portField = LeaderDiscovery.class.getDeclaredField("currentPort");
-                    portField.setAccessible(true);
-                    portField.set(this, ep.getMetaRpcPort());
+                    java.lang.reflect.Field addrField = LeaderDiscovery.class.getDeclaredField("currentAddress");
+                    addrField.setAccessible(true);
+                    addrField.set(this, new LeaderAddress(ep.getHost(), ep.getMetaRpcPort()));
                 } catch (Exception e) {
                     throw new RuntimeException(e);
                 }

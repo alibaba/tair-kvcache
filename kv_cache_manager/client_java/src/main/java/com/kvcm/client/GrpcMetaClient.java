@@ -23,7 +23,6 @@ public class GrpcMetaClient implements MetaClient {
     private final MetaServiceGrpc.MetaServiceBlockingStub stub;
     private final int callTimeoutMs;
 
-    @SuppressWarnings("unchecked")
     public GrpcMetaClient(String host, int port, int callTimeoutMs) {
         this.callTimeoutMs = callTimeoutMs;
         // C3 fix: Add gRPC-level retry policy matching C++ client behavior
@@ -189,41 +188,6 @@ public class GrpcMetaClient implements MetaClient {
         if (!channel.awaitTermination(5, TimeUnit.SECONDS)) {
             channel.shutdownNow();
         }
-    }
-
-    /**
-     * Schedule a delayed close of this channel.
-     * Used during leader reconnection to avoid closing a channel
-     * that may still have in-flight RPCs.
-     */
-    void delayedClose(long delayMs) {
-        Thread closer = new Thread(() -> {
-            try {
-                Thread.sleep(delayMs);
-                close();
-            } catch (Exception e) {
-                LOG.warn("Error in delayed close of gRPC channel", e);
-            }
-        }, "grpc-channel-delayed-close");
-        closer.setDaemon(true);
-        closer.start();
-    }
-
-    /**
-     * Re-create a new GrpcMetaClient pointing to a different address.
-     * Used by AutoFailoverClient when leader changes.
-     */
-    GrpcMetaClient reconnect(String host, int port) {
-        try {
-            close();
-        } catch (Exception e) {
-            LOG.warn("Error closing old channel during reconnect", e);
-        }
-        return new GrpcMetaClient(host, port, callTimeoutMs);
-    }
-
-    String getAddress() {
-        return channel.authority();
     }
 
     // --- Internal ---

@@ -6,6 +6,10 @@ import kv_cache_manager.proto.meta.MetaServiceOuterClass.ErrorCode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+
 /**
  * Auto-failover MetaClient: gRPC primary → HTTP fallback → leader re-discovery + retry.
  * <p>
@@ -15,15 +19,24 @@ import org.slf4j.LoggerFactory;
 public class AutoFailoverClient implements MetaClient {
 
     private static final Logger LOG = LoggerFactory.getLogger(AutoFailoverClient.class);
-    private static final long BASE_BACKOFF_MS = 5;
+    private static final long BASE_BACKOFF_MS = 100;
+
+    // Shared scheduler for delayed channel close (replaces per-call thread spawning)
+    private static final ScheduledExecutorService CLOSE_SCHEDULER =
+            Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "kvcm-channel-close");
+                t.setDaemon(true);
+                return t;
+            });
 
     private final MetaClientConfig config;
     private volatile GrpcMetaClient grpcClient;
     private volatile String currentHost;
     private volatile int currentPort;
-    private final HttpMetaClient httpClient; // null if HTTP disabled
+    private volatile HttpMetaClient httpClient; // volatile: recreated on leader change
     private final LeaderDiscovery leaderDiscovery; // null if auto-discover disabled
     private final Object reconnectLock = new Object();
+    private volatile boolean closed;
 
     AutoFailoverClient(MetaClientConfig config) {
         this.config = config;
@@ -33,10 +46,8 @@ public class AutoFailoverClient implements MetaClient {
                 config.getCallTimeoutMs());
 
         if (config.isHttpEnabled()) {
-            this.httpClient = new HttpMetaClient(config.getSeedAddress(), config.getHttpPort(),
+            this.httpClient = new HttpMetaClient(currentHost, config.getHttpPort(),
                     config.getCallTimeoutMs());
-        } else {
-            this.httpClient = null;
         }
 
         if (config.isAutoDiscoverLeader()) {
@@ -44,7 +55,6 @@ public class AutoFailoverClient implements MetaClient {
                     config.getSeedAddress(), config.getGrpcPort(),
                     config.getInstanceId(), config.getLeaderRefreshIntervalSeconds());
             leaderDiscovery.start();
-            // If leader was discovered, reconnect to leader
             reconnectIfNeeded();
         } else {
             this.leaderDiscovery = null;
@@ -139,12 +149,20 @@ public class AutoFailoverClient implements MetaClient {
 
     @Override
     public void close() throws Exception {
+        if (closed) {
+            return;
+        }
+        closed = true;
         if (leaderDiscovery != null) {
             leaderDiscovery.stop();
         }
-        grpcClient.close();
-        if (httpClient != null) {
-            httpClient.close();
+        // Acquire lock to prevent race with reconnectIfNeeded
+        synchronized (reconnectLock) {
+            grpcClient.close();
+            HttpMetaClient http = httpClient;
+            if (http != null) {
+                http.close();
+            }
         }
     }
 
@@ -155,6 +173,12 @@ public class AutoFailoverClient implements MetaClient {
         T execute(MetaClient client);
     }
 
+    private void ensureOpen() {
+        if (closed) {
+            throw new IllegalStateException("Client is closed");
+        }
+    }
+
     /**
      * Core failover template:
      * 1. Try gRPC
@@ -162,7 +186,7 @@ public class AutoFailoverClient implements MetaClient {
      * 3. On gRPC IO error → fallback to HTTP if available
      */
     private <T> T withFailover(RpcCall<T> rpc) {
-        // Try gRPC with leader-not-leader retry
+        ensureOpen();
         int retriesLeft = config.getLeaderRetryCount();
         while (true) {
             GrpcMetaClient client;
@@ -174,7 +198,7 @@ public class AutoFailoverClient implements MetaClient {
             } catch (ServerNotLeaderException e) {
                 LOG.warn("Server is not leader, triggering re-discovery");
                 if (leaderDiscovery != null) {
-                    leaderDiscovery.triggerImmediateRefresh();
+                    // Synchronous discovery only — no redundant triggerImmediateRefresh
                     if (leaderDiscovery.discoverLeader()) {
                         reconnectIfNeeded();
                     }
@@ -192,10 +216,11 @@ public class AutoFailoverClient implements MetaClient {
                     throw new KvcmException(ErrorCode.IO_ERROR, "Interrupted during failover backoff", ie);
                 }
             } catch (KvcmException e) {
-                if (e.getErrorCode() == ErrorCode.IO_ERROR && httpClient != null) {
+                HttpMetaClient http = httpClient;
+                if (e.getErrorCode() == ErrorCode.IO_ERROR && http != null) {
                     LOG.warn("gRPC call failed with IO error, falling back to HTTP: {}", e.getMessage());
                     try {
-                        return rpc.execute(httpClient);
+                        return rpc.execute(http);
                     } catch (Exception httpEx) {
                         LOG.error("Both gRPC and HTTP transports failed", httpEx);
                         throw new KvcmException(ErrorCode.IO_ERROR,
@@ -213,21 +238,53 @@ public class AutoFailoverClient implements MetaClient {
         if (leaderDiscovery == null) {
             return;
         }
-        String leaderHost = leaderDiscovery.getCurrentHost();
-        int leaderPort = leaderDiscovery.getCurrentPort();
+        LeaderAddress leaderAddr = leaderDiscovery.getCurrentAddress();
         synchronized (reconnectLock) {
-            // Check if already connected to this address (C2 fix: compare against current, not seed)
-            if (leaderHost.equals(currentHost) && leaderPort == currentPort) {
+            if (leaderAddr.host.equals(currentHost) && leaderAddr.port == currentPort) {
                 return;
             }
-            LOG.info("Reconnecting gRPC channel from {}:{} to {}:{}",
-                    currentHost, currentPort, leaderHost, leaderPort);
-            GrpcMetaClient old = grpcClient;
-            grpcClient = new GrpcMetaClient(leaderHost, leaderPort, config.getCallTimeoutMs());
-            currentHost = leaderHost;
-            currentPort = leaderPort;
-            // Delayed close of old channel to avoid C1 race condition
-            old.delayedClose(100);
+            LOG.info("Reconnecting from {}:{} to {}:{}",
+                    currentHost, currentPort, leaderAddr.host, leaderAddr.port);
+
+            // Replace gRPC client
+            GrpcMetaClient oldGrpc = grpcClient;
+            grpcClient = new GrpcMetaClient(leaderAddr.host, leaderAddr.port, config.getCallTimeoutMs());
+
+            // Recreate HTTP client to follow leader (if HTTP enabled)
+            HttpMetaClient oldHttp = httpClient;
+            if (config.isHttpEnabled()) {
+                httpClient = new HttpMetaClient(leaderAddr.host, config.getHttpPort(),
+                        config.getCallTimeoutMs());
+            }
+
+            currentHost = leaderAddr.host;
+            currentPort = leaderAddr.port;
+
+            // Delayed close of old clients via shared scheduler
+            scheduleClose(oldGrpc);
+            if (oldHttp != null) {
+                scheduleClose(oldHttp);
+            }
         }
+    }
+
+    private static void scheduleClose(GrpcMetaClient client) {
+        CLOSE_SCHEDULER.schedule(() -> {
+            try {
+                client.close();
+            } catch (Exception e) {
+                LOG.warn("Error in delayed close of gRPC channel", e);
+            }
+        }, 100, TimeUnit.MILLISECONDS);
+    }
+
+    private static void scheduleClose(HttpMetaClient client) {
+        CLOSE_SCHEDULER.schedule(() -> {
+            try {
+                client.close();
+            } catch (Exception e) {
+                LOG.warn("Error in delayed close of HTTP client", e);
+            }
+        }, 100, TimeUnit.MILLISECONDS);
     }
 }

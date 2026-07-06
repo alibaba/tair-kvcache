@@ -21,6 +21,33 @@ import java.util.concurrent.atomic.AtomicLong;
  * Call {@link #triggerImmediateRefresh()} to force an immediate refresh
  * (e.g., on SERVER_NOT_LEADER or connection failure).
  */
+/**
+ * Immutable holder for leader address (host + port).
+ * Ensures atomic reads of both fields.
+ */
+final class LeaderAddress {
+    final String host;
+    final int port;
+
+    LeaderAddress(String host, int port) {
+        this.host = host;
+        this.port = port;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof LeaderAddress)) return false;
+        LeaderAddress that = (LeaderAddress) o;
+        return port == that.port && host.equals(that.host);
+    }
+
+    @Override
+    public int hashCode() {
+        return 31 * host.hashCode() + port;
+    }
+}
+
 class LeaderDiscovery {
 
     private static final Logger LOG = LoggerFactory.getLogger(LeaderDiscovery.class);
@@ -35,20 +62,20 @@ class LeaderDiscovery {
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicBoolean immediateRefresh = new AtomicBoolean(false);
 
-    private volatile String currentHost;
-    private volatile int currentPort;
-
-    private ScheduledExecutorService scheduler;
-    // M1 fix: Reuse channel for discovery instead of creating per attempt
-    private volatile ManagedChannel discoveryChannel;
+    // C3 fix: Use immutable holder for atomic host+port reads
+    private volatile LeaderAddress currentAddress;
+    // M1 fix: Make scheduler volatile for safe cross-thread publication
+    private volatile ScheduledExecutorService scheduler;
+    // C2 fix: Lock for channel creation to prevent check-then-act race
+    private final Object channelLock = new Object();
+    private ManagedChannel discoveryChannel; // guarded by channelLock
 
     LeaderDiscovery(String seedAddress, int grpcPort, String instanceId, int refreshIntervalSeconds) {
         this.seedAddress = seedAddress;
         this.grpcPort = grpcPort;
         this.instanceId = instanceId;
         this.refreshIntervalSeconds = refreshIntervalSeconds;
-        this.currentHost = seedAddress;
-        this.currentPort = grpcPort;
+        this.currentAddress = new LeaderAddress(seedAddress, grpcPort);
     }
 
     /**
@@ -80,10 +107,10 @@ class LeaderDiscovery {
      */
     void triggerImmediateRefresh() {
         immediateRefresh.set(true);
-        if (scheduler != null) {
-            // Cancel and reschedule to wake up sooner
-            // Not critical if we miss - the next cycle will pick it up
-            scheduler.schedule(this::refreshLoop, 0, TimeUnit.MILLISECONDS);
+        ScheduledExecutorService s = scheduler;
+        if (s != null) {
+            // Schedule immediate refresh
+            s.schedule(this::refreshLoop, 0, TimeUnit.MILLISECONDS);
         }
     }
 
@@ -93,14 +120,19 @@ class LeaderDiscovery {
      * @return true if leader was discovered and address updated
      */
     boolean discoverLeader() {
-        try {
-            // M1 fix: Reuse channel, only rebuild if null or shutdown
+        ManagedChannel channel;
+        // C2 fix: Lock channel creation to prevent check-then-act race
+        synchronized (channelLock) {
             if (discoveryChannel == null || discoveryChannel.isShutdown()) {
                 discoveryChannel = ManagedChannelBuilder.forAddress(seedAddress, grpcPort)
                         .usePlaintext()
                         .build();
             }
-            MetaServiceGrpc.MetaServiceBlockingStub stub = MetaServiceGrpc.newBlockingStub(discoveryChannel);
+            channel = discoveryChannel;
+        }
+
+        try {
+            MetaServiceGrpc.MetaServiceBlockingStub stub = MetaServiceGrpc.newBlockingStub(channel);
 
             GetClusterInfoRequest request = GetClusterInfoRequest.newBuilder()
                     .setTraceId("leader_discovery_" + System.nanoTime())
@@ -128,22 +160,23 @@ class LeaderDiscovery {
                 return false;
             }
 
-            String newHost = endpoint.getHost();
-            int newPort = endpoint.getMetaRpcPort();
-
-            if (!newHost.equals(currentHost) || newPort != currentPort) {
+            // C3 fix: Atomic update via immutable holder
+            LeaderAddress newAddress = new LeaderAddress(endpoint.getHost(), endpoint.getMetaRpcPort());
+            LeaderAddress old = currentAddress;
+            if (!newAddress.equals(old)) {
                 LOG.info("Leader discovered: switching from {}:{} to {}:{}",
-                        currentHost, currentPort, newHost, newPort);
-                currentHost = newHost;
-                currentPort = newPort;
+                        old.host, old.port, newAddress.host, newAddress.port);
+                currentAddress = newAddress;
             }
             return true;
         } catch (Exception e) {
             LOG.warn("Leader discovery from {} failed: {}", seedAddress, e.getMessage());
             // Channel may be broken, force rebuild next time
-            if (discoveryChannel != null) {
-                discoveryChannel.shutdownNow();
-                discoveryChannel = null;
+            synchronized (channelLock) {
+                if (discoveryChannel != null) {
+                    discoveryChannel.shutdownNow();
+                    discoveryChannel = null;
+                }
             }
             return false;
         } finally {
@@ -151,8 +184,9 @@ class LeaderDiscovery {
         }
     }
 
-    String getCurrentHost() { return currentHost; }
-    int getCurrentPort() { return currentPort; }
+    LeaderAddress getCurrentAddress() { return currentAddress; }
+    String getCurrentHost() { return currentAddress.host; }
+    int getCurrentPort() { return currentAddress.port; }
 
     void stop() {
         running.set(false);
@@ -167,10 +201,11 @@ class LeaderDiscovery {
                 Thread.currentThread().interrupt();
             }
         }
-        // M1 fix: Also shutdown the reused discovery channel
-        if (discoveryChannel != null) {
-            discoveryChannel.shutdownNow();
-            discoveryChannel = null;
+        synchronized (channelLock) {
+            if (discoveryChannel != null) {
+                discoveryChannel.shutdownNow();
+                discoveryChannel = null;
+            }
         }
     }
 

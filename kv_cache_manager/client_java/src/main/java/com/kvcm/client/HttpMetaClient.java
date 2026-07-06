@@ -25,7 +25,6 @@ public class HttpMetaClient implements MetaClient {
     private final OkHttpClient httpClient;
     private final String baseUrl;
     private final JsonFormat.Printer printer;
-    private final JsonFormat.Parser parser;
 
     public HttpMetaClient(String host, int port, int callTimeoutMs) {
         this.baseUrl = "http://" + host + ":" + port;
@@ -39,7 +38,6 @@ public class HttpMetaClient implements MetaClient {
                 .omittingInsignificantWhitespace()
                 .includingDefaultValueFields()
                 .preservingProtoFieldNames();
-        this.parser = JsonFormat.parser().ignoringUnknownFields();
     }
 
     HttpMetaClient(MetaClientConfig config) {
@@ -149,7 +147,8 @@ public class HttpMetaClient implements MetaClient {
                         "HTTP " + httpResponse.code() + " from " + endpoint);
             }
             String responseJson = httpResponse.body() != null ? httpResponse.body().string() : "{}";
-            parser.merge(responseJson, responseBuilder);
+            // Create parser per-call (JsonFormat.Parser is NOT thread-safe)
+            JsonFormat.parser().ignoringUnknownFields().merge(responseJson, responseBuilder);
         } catch (InvalidProtocolBufferException e) {
             throw new KvcmException(ErrorCode.IO_ERROR,
                     "Failed to parse response JSON from " + endpoint + ": " + e.getMessage(), e);
