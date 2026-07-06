@@ -90,25 +90,6 @@ GenLocations(const google::protobuf::RepeatedPtrField<::kv_cache_manager::proto:
     return result;
 }
 
-kv_cache_manager::ClientErrorCode
-GenCacheLocation(const kv_cache_manager::Locations &locations,
-                 google::protobuf::RepeatedPtrField<::kv_cache_manager::proto::meta::CacheLocation> *proto_locations) {
-    if (locations.empty()) {
-        return kv_cache_manager::ClientErrorCode::ER_OK;
-    }
-    for (const auto &location : locations) {
-        auto *cache_location = proto_locations->Add();
-        cache_location->set_type(::kv_cache_manager::proto::meta::StorageType::ST_UNSPECIFIED);
-        cache_location->set_spec_size(-1);
-        for (const auto &location_spec : location) {
-            auto *spec = cache_location->add_location_specs();
-            spec->set_name(location_spec.spec_name);
-            spec->set_uri(location_spec.uri);
-        }
-    }
-    return kv_cache_manager::ClientErrorCode::ER_OK;
-}
-
 template <typename ProtoMessage>
 inline std::enable_if_t<std::is_base_of_v<google::protobuf::Message, ProtoMessage>>
 SetCommonInfo(ProtoMessage &proto_message, const std::string &trace_id, const std::string &instance_id) {
@@ -433,30 +414,8 @@ ClientErrorCode GrpcStub::FinishWriteCache(const std::string &trace_id,
     proto::meta::FinishWriteCacheRequest request;
     SetCommonInfo(request, trace_id, instance_id);
     request.set_write_session_id(write_session_id);
-    auto proto_locations = request.mutable_locations();
-    auto ec = GenCacheLocation(locations, proto_locations);
-    if (ec != ER_OK) {
-        KVCM_LOG_DEBUG("finish write cache failed, write_session_id: %s, block_mask: %s, locations: %s",
-                       write_session_id.c_str(),
-                       DebugStringUtil::ToString(success_block).c_str(),
-                       DebugStringUtil::ToString(locations).c_str());
-        return ec;
-    }
-    // Fill each checksum into the parallel CacheLocation slot. Length mismatch is a
-    // client-side bug -- fail loudly instead of dropping checksums silently, otherwise
-    // the server commits the write with checksum=0 while the caller believes the
-    // checksum was reported and an undetectable read corruption window opens.
-    if (!checksums.empty()) {
-        if (static_cast<int>(checksums.size()) != proto_locations->size()) {
-            KVCM_LOG_ERROR("checksums size [%zu] mismatches locations size [%d]; refuse to send "
-                           "FinishWriteCache without checksums",
-                           checksums.size(),
-                           proto_locations->size());
-            return ER_INVALID_PARAMS;
-        }
-        for (int i = 0; i < proto_locations->size(); ++i) {
-            proto_locations->Mutable(i)->set_checksum(checksums[i]);
-        }
+    for (auto checksum : checksums) {
+        request.add_checksums(checksum);
     }
     ProtoConvert::BlockMaskToProto(success_block, request.mutable_success_blocks());
     grpc::ClientContext context;

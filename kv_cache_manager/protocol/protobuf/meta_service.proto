@@ -144,7 +144,7 @@ message CacheLocation {
     StorageType type = 1;
     int32 spec_size = 2;
     repeated LocationSpec location_specs = 3;
-    // Per-block data checksum. Reported by client via FinishWriteCacheRequest.locations
+    // Per-block data checksum. Reported by client via FinishWriteCacheRequest.checksums
     // and echoed back on GetCacheLocation / GetCacheMeta so readers can verify.
     // 0 = unset (legacy data / legacy client); readers must skip verification when 0.
     // All replicas of the same block must carry the same checksum.
@@ -407,7 +407,9 @@ message FinishWriteCacheRequest {
     string instance_id = 2;
     string write_session_id = 3;
     BlockMask success_blocks = 4;
-    repeated CacheLocation locations = 5;
+    // Full-batch checksum vector, parallel to the keys captured by StartWriteCache.
+    // Empty = not reported; 0 per entry = no checksum for that block.
+    repeated int64 checksums = 5;
 }
 
 // 删除指定 blockKeys，用于修复线上用户反馈case说某些提示词会胡言乱语的情况

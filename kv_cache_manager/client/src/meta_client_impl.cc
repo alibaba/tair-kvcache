@@ -174,17 +174,16 @@ ClientErrorCode MetaClientImpl::FinishWrite(const std::string &trace_id,
                                             const BlockMask &success_block,
                                             const Locations &locations,
                                             const FinishWriteOptions &options) {
-    const std::vector<int64_t> empty_checksums;
-    const auto &checksums = options.checksums == nullptr ? empty_checksums : *options.checksums;
     KVCM_LOG_DEBUG("finish write with trace_id [%s], write_session_id [%s], block_mask %s, locations %s, "
                    "checksums_size %zu",
                    trace_id.c_str(),
                    write_session_id.c_str(),
                    DebugStringUtil::ToString(success_block).c_str(),
                    DebugStringUtil::ToString(locations).c_str(),
-                   checksums.size());
+                   options.checksums.size());
     const std::string &instance_id = CHECK_INSTANCE_STUB();
-    return stub_->FinishWriteCache(trace_id, instance_id, write_session_id, success_block, locations, checksums);
+    return stub_->FinishWriteCache(
+        trace_id, instance_id, write_session_id, success_block, locations, options.checksums);
 }
 
 ClientErrorCode MetaClientImpl::RemoveCache(const std::string &trace_id,

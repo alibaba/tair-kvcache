@@ -130,19 +130,19 @@ TEST(ClientOptionsTest, TransferConvenienceOverloadsForwardOptions) {
     EXPECT_EQ(uris.size(), client.last_load_uri_count);
     EXPECT_EQ(buffers.size(), client.last_load_buffer_count);
     EXPECT_EQ(nullptr, client.last_load_options.trace_info);
-    EXPECT_EQ(nullptr, client.last_load_options.expected_checksums);
+    EXPECT_TRUE(client.last_load_options.expected_checksums.empty());
 
     auto trace_info = std::make_shared<TransferTraceInfo>();
     trace_info->need_print = true;
     EXPECT_EQ(ER_OK, client.LoadKvCaches(uris, buffers, trace_info));
     EXPECT_EQ(trace_info, client.last_load_options.trace_info);
-    EXPECT_EQ(nullptr, client.last_load_options.expected_checksums);
+    EXPECT_TRUE(client.last_load_options.expected_checksums.empty());
 
     std::vector<int64_t> expected_checksums = {0x11};
     EXPECT_EQ(ER_OK,
               client.LoadKvCaches(uris, buffers, LoadKvCachesOptions::VerifyWith(expected_checksums, trace_info)));
     EXPECT_EQ(trace_info, client.last_load_options.trace_info);
-    EXPECT_EQ(&expected_checksums, client.last_load_options.expected_checksums);
+    EXPECT_EQ(expected_checksums, client.last_load_options.expected_checksums);
 
     auto save_result = client.SaveKvCaches(uris, buffers);
     EXPECT_EQ(ER_OK, save_result.first);
@@ -194,13 +194,13 @@ TEST(ClientOptionsTest, ManagerConvenienceOverloadsForwardOptions) {
     EXPECT_TRUE(client.last_match_location_options.include_checksums);
 
     EXPECT_EQ(ER_OK, client.FinishWrite(trace_id, "session", block_mask, locations));
-    EXPECT_EQ(nullptr, client.last_finish_write_options.checksums);
+    EXPECT_TRUE(client.last_finish_write_options.checksums.empty());
 
     std::vector<int64_t> finish_checksums = {0x21, 0};
     EXPECT_EQ(ER_OK,
               client.FinishWrite(
                   trace_id, "session", block_mask, locations, FinishWriteOptions::WithChecksums(finish_checksums)));
-    EXPECT_EQ(&finish_checksums, client.last_finish_write_options.checksums);
+    EXPECT_EQ(finish_checksums, client.last_finish_write_options.checksums);
 
     EXPECT_EQ(ER_OK, client.MatchMeta(trace_id, keys, tokens, block_mask, 1).first);
     EXPECT_EQ(1, client.last_match_meta_options.detail_level);
@@ -213,10 +213,10 @@ TEST(ClientOptionsTest, ManagerConvenienceOverloadsForwardOptions) {
     EXPECT_TRUE(client.last_match_meta_options.include_checksums);
 
     EXPECT_EQ(ER_OK, client.LoadKvCaches(uris, buffers));
-    EXPECT_EQ(nullptr, client.last_load_options.expected_checksums);
+    EXPECT_TRUE(client.last_load_options.expected_checksums.empty());
 
     EXPECT_EQ(ER_OK, client.LoadKvCaches(uris, buffers, LoadKvCachesOptions::VerifyWith(finish_checksums)));
-    EXPECT_EQ(&finish_checksums, client.last_load_options.expected_checksums);
+    EXPECT_EQ(finish_checksums, client.last_load_options.expected_checksums);
 
     EXPECT_EQ(ER_OK, client.SaveKvCaches(uris, buffers).first);
     EXPECT_FALSE(client.last_save_options.include_checksums);
@@ -566,14 +566,8 @@ TEST_F(TransferClientTest, TestLoadKvCachesExpectedHashesSizeMismatchFails) {
     BlockBuffer buffer1, buffer2;
     BlockBuffers block_buffers = {buffer1, buffer2};
     std::vector<int64_t> expected_checksums = {0}; // 长度 1，但 buffers 长度 2
-#if defined(USING_CUDA) || defined(USING_MUSA)
     EXPECT_EQ(ER_CHECKSUM_MISMATCH,
               client->LoadKvCaches(locations_, block_buffers, LoadKvCachesOptions::VerifyWith(expected_checksums)));
-#else
-    // 非 CUDA/MUSA build：校验路径整体退化为 no-op，长度不匹配也不报错。
-    EXPECT_EQ(ER_OK,
-              client->LoadKvCaches(locations_, block_buffers, LoadKvCachesOptions::VerifyWith(expected_checksums)));
-#endif
 }
 
 // SaveKvCaches 失败时 result.checksums 必须保持空 —— 老实现把计算完的 checksum 直接

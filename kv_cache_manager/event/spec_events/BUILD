@@ -5,7 +5,6 @@ cc_library(
     srcs = [],
     hdrs = [
         "cache_reclaim_event.h",
-        "data_integrity_event.h",
         "optimizer_event.h",
     ],
     deps = [
@@ -13,4 +12,3 @@ cc_library(
         "//kv_cache_manager/meta:cache_location",
     ],
 )
-

@@ -568,16 +568,11 @@ void MetaServiceImpl::FinishWriteCache(RequestContext *request_context,
     }
     BlockMask success_blocks_req;
     ProtoConvert::BlockMaskFromProto(&request->success_blocks(), success_blocks_req);
-    // Forward the per-block checksums reported via FinishWriteCacheRequest.locations
-    // (parallel to the keys from StartWriteCache; failed blocks carry a placeholder
-    // CacheLocation with checksum=0). Legacy clients omit locations entirely, in which
-    // case the vector stays empty and CacheManager keeps existing checksums.
-    // Length mismatch with keys is checked centrally in CacheManager::FinishWriteCache.
     std::vector<int64_t> checksums;
-    if (request->locations_size() > 0) {
-        checksums.reserve(request->locations_size());
-        for (const auto &loc : request->locations()) {
-            checksums.push_back(loc.checksum());
+    if (request->checksums_size() > 0) {
+        checksums.reserve(request->checksums_size());
+        for (auto checksum : request->checksums()) {
+            checksums.push_back(checksum);
         }
     }
     ErrorCode ec_info = cache_manager_->FinishWriteCache(request_context,

@@ -475,6 +475,60 @@ TEST_F(GrpcStubTest, TestFinishWriteCacheSuccess) {
     }
 }
 
+TEST_F(GrpcStubTest, TestFinishWriteCacheWithChecksums) {
+    auto expected = std::pair<ClientErrorCode, std::string>(ER_OK, default_storage_configs);
+    ASSERT_EQ(expected,
+              stub_->RegisterInstance(
+                  "trace1", "default", "instance1", 64, createLocationSpecInfos(2), createModelDeployment(2, 1), {}));
+    std::string write_session_id;
+    Locations target_locations;
+    {
+        auto [success, write_location] = stub_->StartWriteCache("trace2", "instance1", {1, 2, 3, 4}, {}, {}, 1000000);
+        ASSERT_EQ(ER_OK, success);
+        write_session_id = write_location.write_session_id;
+        target_locations = write_location.locations;
+    }
+    {
+        BlockMask success_block = static_cast<size_t>(4);
+        Locations unrelated_locations = {{{"tp0", "file://caller-owned-location-subset"}}};
+        const std::vector<int64_t> checksums = {0x11, 0x22, 0x33, 0x44};
+        ASSERT_EQ(ER_OK,
+                  stub_->FinishWriteCache(
+                      "trace3", "instance1", write_session_id, success_block, unrelated_locations, checksums));
+    }
+    {
+        auto [success, result] = stub_->GetCacheLocation("trace4",
+                                                         "instance1",
+                                                         QueryType::QT_PREFIX_MATCH,
+                                                         {1, 2, 3, 4},
+                                                         {},
+                                                         static_cast<size_t>(0),
+                                                         {},
+                                                         MatchLocationOptions::WithChecksums());
+        ASSERT_EQ(ER_OK, success);
+        ExpectLocationsEq(target_locations, result.locations);
+        ASSERT_EQ((std::vector<int64_t>{0x11, 0x22, 0x33, 0x44}), result.checksums);
+    }
+}
+
+TEST_F(GrpcStubTest, TestFinishWriteCacheRejectsChecksumSizeMismatch) {
+    auto expected = std::pair<ClientErrorCode, std::string>(ER_OK, default_storage_configs);
+    ASSERT_EQ(expected,
+              stub_->RegisterInstance(
+                  "trace1", "default", "instance1", 64, createLocationSpecInfos(2), createModelDeployment(2, 1), {}));
+    std::string write_session_id;
+    {
+        auto [success, write_location] = stub_->StartWriteCache("trace2", "instance1", {1, 2, 3, 4}, {}, {}, 1000000);
+        ASSERT_EQ(ER_OK, success);
+        write_session_id = write_location.write_session_id;
+    }
+    {
+        BlockMask success_block = static_cast<size_t>(4);
+        ASSERT_EQ(ER_SERVICE_INVALID_ARGUMENT,
+                  stub_->FinishWriteCache("trace3", "instance1", write_session_id, success_block, {}, {0x11}));
+    }
+}
+
 TEST_F(GrpcStubTest, TestFinishWriteCacheFail) {
     auto expected = std::pair<ClientErrorCode, std::string>(ER_OK, default_storage_configs);
     ASSERT_EQ(expected,

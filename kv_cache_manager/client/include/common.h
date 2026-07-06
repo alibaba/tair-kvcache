@@ -3,6 +3,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -253,18 +254,18 @@ struct MatchMetaResult {
 };
 
 struct FinishWriteOptions {
-    const std::vector<int64_t> *checksums{nullptr};
+    std::vector<int64_t> checksums;
 
-    static FinishWriteOptions WithChecksums(const std::vector<int64_t> &checksums) {
+    static FinishWriteOptions WithChecksums(std::vector<int64_t> checksums) {
         FinishWriteOptions options;
-        options.checksums = &checksums;
+        options.checksums = std::move(checksums);
         return options;
     }
 };
 
 struct LoadKvCachesOptions {
     std::shared_ptr<TransferTraceInfo> trace_info{nullptr};
-    const std::vector<int64_t> *expected_checksums{nullptr};
+    std::vector<int64_t> expected_checksums;
 
     static LoadKvCachesOptions WithTraceInfo(std::shared_ptr<TransferTraceInfo> trace_info) {
         LoadKvCachesOptions options;
@@ -272,17 +273,17 @@ struct LoadKvCachesOptions {
         return options;
     }
 
-    static LoadKvCachesOptions VerifyWith(const std::vector<int64_t> &checksums) {
+    static LoadKvCachesOptions VerifyWith(std::vector<int64_t> checksums) {
         LoadKvCachesOptions options;
-        options.expected_checksums = &checksums;
+        options.expected_checksums = std::move(checksums);
         return options;
     }
 
-    static LoadKvCachesOptions VerifyWith(const std::vector<int64_t> &checksums,
+    static LoadKvCachesOptions VerifyWith(std::vector<int64_t> checksums,
                                           std::shared_ptr<TransferTraceInfo> trace_info) {
         LoadKvCachesOptions options;
         options.trace_info = trace_info;
-        options.expected_checksums = &checksums;
+        options.expected_checksums = std::move(checksums);
         return options;
     }
 };
