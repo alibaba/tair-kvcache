@@ -3,6 +3,18 @@ package(default_visibility = ["//visibility:private"])
 load("//bazel:tf_proto.bzl", "tf_proto_library_cc")
 
 cc_test(
+    name = "ManagerMessageProtoUtilTest",
+    srcs = [
+        "manager_message_proto_util_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/service/util:manager_message_proto_util",
+    ],
+)
+
+cc_test(
     name = "ProtoMessageJsonUtilTest",
     srcs = [
         "proto_message_json_util_test.cc",

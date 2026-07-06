@@ -701,7 +701,11 @@ CacheManager::StartWriteCache(RequestContext *request_context,
             RequestContext temp_request_context(trace_id + "_timeout_callback");
             BlockMaskOffset succeed_block = 0;
             auto ec = this->FinishWriteCache(
-                &temp_request_context, instance_id, write_session_id, succeed_block, std::move(write_location_info));
+                &temp_request_context,
+                instance_id,
+                write_session_id,
+                succeed_block,
+                CacheManager::FinishWriteCacheOptions::WithWriteLocationInfo(std::move(write_location_info)));
             static_cast<void>(ec);
         });
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, PutWriteLocationManager);
@@ -723,14 +727,13 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
                                const std::string &instance_id,
                                const std::string &write_session_id,
                                const BlockMask &success_block_mask,
-                               std::unique_ptr<WriteLocationManager::WriteLocationInfo> write_location_info_internal,
-                               const std::vector<int64_t> &checksums) {
+                               CacheManager::FinishWriteCacheOptions options) {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
     auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     WriteLocationManager::WriteLocationInfo location_info;
-    if (write_location_info_internal != nullptr) {
-        location_info = std::move(*write_location_info_internal);
+    if (options.write_location_info_internal != nullptr) {
+        location_info = std::move(*options.write_location_info_internal);
     } else if (!write_location_manager_->GetAndDelete(write_session_id, location_info)) {
         request_context->error_tracer()->AddErrorMsg("write_session_id has been deleted");
         RETURN_IF_EC_NOT_OK_WITH_LOG(
@@ -746,12 +749,12 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
     // checksums must be the same length as keys (full batch, not the success subset).
     // An empty vector means the client did not report any; existing CacheLocation
     // checksums are then preserved. Any length mismatch is treated as a client bug.
-    const bool has_checksums = !checksums.empty();
-    if (has_checksums && checksums.size() != location_info.keys.size()) {
+    const bool has_checksums = !options.checksums.empty();
+    if (has_checksums && options.checksums.size() != location_info.keys.size()) {
         RETURN_IF_EC_NOT_OK_WITH_LOG(WARN,
                                      EC_BADARGS,
                                      "checksums size (%zu) does not match keys size (%zu)",
-                                     checksums.size(),
+                                     options.checksums.size(),
                                      location_info.keys.size());
     }
 
@@ -771,7 +774,7 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
             MetaSearcher::LocationUpdateTask task{
                 .location_id = location_info.location_ids[block_key_idx],
                 .new_status = CacheLocationStatus::CLS_SERVING,
-                .checksum = has_checksums ? checksums[block_key_idx] : int64_t{0},
+                .checksum = has_checksums ? options.checksums[block_key_idx] : int64_t{0},
             };
             success_batch_update_tasks.push_back({std::move(task)});
         } else {

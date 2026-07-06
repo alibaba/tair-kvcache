@@ -182,8 +182,7 @@ ClientErrorCode MetaClientImpl::FinishWrite(const std::string &trace_id,
                    DebugStringUtil::ToString(locations).c_str(),
                    options.checksums.size());
     const std::string &instance_id = CHECK_INSTANCE_STUB();
-    return stub_->FinishWriteCache(
-        trace_id, instance_id, write_session_id, success_block, locations, options.checksums);
+    return stub_->FinishWriteCache(trace_id, instance_id, write_session_id, success_block, locations, options);
 }
 
 ClientErrorCode MetaClientImpl::RemoveCache(const std::string &trace_id,

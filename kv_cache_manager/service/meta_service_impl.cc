@@ -579,8 +579,8 @@ void MetaServiceImpl::FinishWriteCache(RequestContext *request_context,
                                                          request->instance_id(),
                                                          request->write_session_id(),
                                                          success_blocks_req,
-                                                         /*write_location_info_internal=*/nullptr,
-                                                         checksums);
+                                                         CacheManager::FinishWriteCacheOptions::WithChecksums(
+                                                             std::move(checksums)));
 
     if (ec_info != EC_OK) {
         status->set_code(ToMetaPbError(ec_info));

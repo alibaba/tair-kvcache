@@ -409,12 +409,12 @@ ClientErrorCode GrpcStub::FinishWriteCache(const std::string &trace_id,
                                            const std::string write_session_id,
                                            const BlockMask &success_block,
                                            const Locations &locations,
-                                           const std::vector<int64_t> &checksums) {
+                                           const FinishWriteOptions &options) {
     auto stub = GET_AND_CHECK_STUB();
     proto::meta::FinishWriteCacheRequest request;
     SetCommonInfo(request, trace_id, instance_id);
     request.set_write_session_id(write_session_id);
-    for (auto checksum : checksums) {
+    for (auto checksum : options.checksums) {
         request.add_checksums(checksum);
     }
     ProtoConvert::BlockMaskToProto(success_block, request.mutable_success_blocks());

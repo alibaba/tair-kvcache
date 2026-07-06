@@ -292,14 +292,27 @@ ClientErrorCode TransferClientImpl::LoadKvCaches(const UriStrVec &uri_str_vec,
 #if defined(USING_CUDA) || defined(USING_MUSA)
     const auto &trace_info = options.trace_info;
     if (is_check_buffer_) {
-        bool need_print = (trace_info == nullptr) ? true : trace_info->need_print;
-        std::vector<int64_t> block_checksums;
+        const bool need_print = (trace_info == nullptr) ? true : trace_info->need_print;
         if (need_print) {
-            auto handle = sdk_buffer_check_pool_->GetCell();
-            block_checksums = SdkBufferCheckUtil::GetBlocksHash(
-                block_buffers, handle->d_iovs, handle->d_crcs, handle->h_iovs, max_check_iov_num_, handle->gpu_stream);
+            auto invalid_it = std::find_if(block_buffers.begin(), block_buffers.end(), [](const BlockBuffer &block) {
+                return !IsChecksumHashableBlock(block);
+            });
+            if (invalid_it != block_buffers.end()) {
+                const size_t idx = std::distance(block_buffers.begin(), invalid_it);
+                KVCM_LOG_WARN("block [%zu] has ignored, empty, null, or zero-size iovs; skip checksum print", idx);
+            } else if (sdk_buffer_check_pool_) {
+                auto handle = sdk_buffer_check_pool_->GetCell();
+                std::vector<int64_t> block_checksums;
+                if (HashBlocksByIovShape(block_buffers, handle, max_check_iov_num_, block_checksums)) {
+                    PrintBlockChecksumAndUri("get_", uri_str_vec, block_checksums, trace_info);
+                } else {
+                    KVCM_LOG_WARN("checksum print failed to hash blocks safely; skip checksum print");
+                }
+            } else {
+                KVCM_LOG_WARN("KVCM_SDK_CHECK is enabled but sdk_buffer_check_pool is not initialized; "
+                              "skip checksum print");
+            }
         }
-        PrintBlockChecksumAndUri("get_", uri_str_vec, block_checksums, trace_info);
     }
     // Read-side verification path: only kicks in when caller supplies expected checksums
     // (typically forwarded from CacheLocation.checksum returned by meta service).

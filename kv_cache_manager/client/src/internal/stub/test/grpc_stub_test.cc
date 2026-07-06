@@ -494,7 +494,12 @@ TEST_F(GrpcStubTest, TestFinishWriteCacheWithChecksums) {
         const std::vector<int64_t> checksums = {0x11, 0x22, 0x33, 0x44};
         ASSERT_EQ(ER_OK,
                   stub_->FinishWriteCache(
-                      "trace3", "instance1", write_session_id, success_block, unrelated_locations, checksums));
+                      "trace3",
+                      "instance1",
+                      write_session_id,
+                      success_block,
+                      unrelated_locations,
+                      FinishWriteOptions::WithChecksums(checksums)));
     }
     {
         auto [success, result] = stub_->GetCacheLocation("trace4",
@@ -525,7 +530,12 @@ TEST_F(GrpcStubTest, TestFinishWriteCacheRejectsChecksumSizeMismatch) {
     {
         BlockMask success_block = static_cast<size_t>(4);
         ASSERT_EQ(ER_SERVICE_INVALID_ARGUMENT,
-                  stub_->FinishWriteCache("trace3", "instance1", write_session_id, success_block, {}, {0x11}));
+                  stub_->FinishWriteCache("trace3",
+                                          "instance1",
+                                          write_session_id,
+                                          success_block,
+                                          {},
+                                          FinishWriteOptions::WithChecksums(std::vector<int64_t>{0x11})));
     }
 }
 

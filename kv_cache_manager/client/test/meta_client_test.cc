@@ -127,7 +127,7 @@ public:
                  const std::string write_session_id,
                  const BlockMask &success_block,
                  const Locations &locations,
-                 const std::vector<int64_t> &checksums),
+                 const FinishWriteOptions &options),
                 (override));
 
     MOCK_METHOD(ClientErrorCode,
@@ -489,7 +489,7 @@ TEST_F(MetaClientTest, TestFinishWriteOptionsForwardToStub) {
                                  write_session_id,
                                  success_block,
                                  locations,
-                                 ::testing::IsEmpty()))
+                                 ::testing::Field(&FinishWriteOptions::checksums, ::testing::IsEmpty())))
         .Times(1)
         .WillOnce(::testing::Return(ER_OK));
 
@@ -502,7 +502,7 @@ TEST_F(MetaClientTest, TestFinishWriteOptionsForwardToStub) {
                                  write_session_id,
                                  success_block,
                                  locations,
-                                 ::testing::ElementsAre(0x44, 0)))
+                                 ::testing::Field(&FinishWriteOptions::checksums, ::testing::ElementsAre(0x44, 0))))
         .Times(1)
         .WillOnce(::testing::Return(ER_OK));
 
