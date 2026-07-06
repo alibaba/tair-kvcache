@@ -18,13 +18,13 @@ public:
     using MetaClient::MatchLocation;
     using MetaClient::MatchMeta;
 
-    std::pair<ClientErrorCode, Locations> MatchLocation(const std::string &trace_id,
-                                                        QueryType query_type,
-                                                        const std::vector<int64_t> &keys,
-                                                        const std::vector<int64_t> &tokens,
-                                                        const BlockMask &block_mask,
-                                                        const std::vector<std::string> &location_spec_names,
-                                                        const MatchLocationOptions &options) override;
+    std::pair<ClientErrorCode, MatchLocationResult> MatchLocation(const std::string &trace_id,
+                                                                  QueryType query_type,
+                                                                  const std::vector<int64_t> &keys,
+                                                                  const std::vector<int64_t> &tokens,
+                                                                  const BlockMask &block_mask,
+                                                                  const std::vector<std::string> &location_spec_names,
+                                                                  const MatchLocationOptions &options) override;
 
     std::pair<ClientErrorCode, int64_t> MatchLocationLen(const std::string &trace_id,
                                                          QueryType query_type,

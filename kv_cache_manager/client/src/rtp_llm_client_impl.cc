@@ -24,13 +24,15 @@ std::pair<ClientErrorCode, Locations> RTPLLMClientImpl::Match(const std::string 
                                                               const std::vector<int64_t> &keys,
                                                               const BlockMask &block_mask,
                                                               const ForwardContext &forward_context) {
-    return manager_client_->MatchLocation(trace_id,
-                                          query_type,
-                                          keys,
-                                          {},
-                                          block_mask,
-                                          {},
-                                          MatchLocationOptions::WithSlideWindowSize(forward_context.sw_size));
+    auto [ec, result] = manager_client_->MatchLocation(trace_id,
+                                                       query_type,
+                                                       keys,
+                                                       {},
+                                                       block_mask,
+                                                       {},
+                                                       MatchLocationOptions::WithSlideWindowSize(
+                                                           forward_context.sw_size));
+    return {ec, std::move(result.locations)};
 }
 
 std::pair<ClientErrorCode, WriteLocation>

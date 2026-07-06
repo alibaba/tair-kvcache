@@ -97,13 +97,14 @@ ClientErrorCode MetaClientImpl::Init(const std::string &client_config, const Ini
 
 void MetaClientImpl::Shutdown() {}
 
-std::pair<ClientErrorCode, Locations> MetaClientImpl::MatchLocation(const std::string &trace_id,
-                                                                    QueryType query_type,
-                                                                    const std::vector<int64_t> &keys,
-                                                                    const std::vector<int64_t> &tokens,
-                                                                    const BlockMask &block_mask,
-                                                                    const std::vector<std::string> &location_spec_names,
-                                                                    const MatchLocationOptions &options) {
+std::pair<ClientErrorCode, MatchLocationResult>
+MetaClientImpl::MatchLocation(const std::string &trace_id,
+                              QueryType query_type,
+                              const std::vector<int64_t> &keys,
+                              const std::vector<int64_t> &tokens,
+                              const BlockMask &block_mask,
+                              const std::vector<std::string> &location_spec_names,
+                              const MatchLocationOptions &options) {
     const int32_t sw_size = options.sw_size;
     KVCM_LOG_DEBUG("match location with trace_id [%s], query_type [%d], keys %s, tokens %s, block_mask %s, sw_size "
                    "[%d], location_spec_names %s",
@@ -115,16 +116,12 @@ std::pair<ClientErrorCode, Locations> MetaClientImpl::MatchLocation(const std::s
                    sw_size,
                    DebugStringUtil::ToString(location_spec_names).c_str());
     const std::string &instance_id = CHECK_INSTANCE_STUB_WITH_TYPE();
-    return stub_->GetCacheLocation(
-        trace_id,
-        instance_id,
-        query_type,
-        keys,
-        tokens,
-        block_mask,
-        sw_size,
-        location_spec_names,
-        options.out_checksums);
+    MatchLocationResult result;
+    auto *out_checksums = options.include_checksums ? &result.checksums : nullptr;
+    auto [ec, locations] = stub_->GetCacheLocation(
+        trace_id, instance_id, query_type, keys, tokens, block_mask, sw_size, location_spec_names, out_checksums);
+    result.locations = std::move(locations);
+    return {ec, std::move(result)};
 }
 
 std::pair<ClientErrorCode, int64_t> MetaClientImpl::MatchLocationLen(const std::string &trace_id,

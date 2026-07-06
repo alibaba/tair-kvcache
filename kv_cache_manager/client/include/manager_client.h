@@ -23,13 +23,9 @@ public:
                                                         const std::vector<int64_t> &tokens,
                                                         const BlockMask &block_mask,
                                                         const std::vector<std::string> &location_spec_names) {
-        return MatchLocation(trace_id,
-                             query_type,
-                             keys,
-                             tokens,
-                             block_mask,
-                             location_spec_names,
-                             MatchLocationOptions{});
+        auto [ec, result] = MatchLocation(
+            trace_id, query_type, keys, tokens, block_mask, location_spec_names, MatchLocationOptions{});
+        return {ec, std::move(result.locations)};
     }
 
     std::pair<ClientErrorCode, Locations> MatchLocation(const std::string &trace_id,
@@ -39,24 +35,26 @@ public:
                                                         const BlockMask &block_mask,
                                                         int32_t sw_size,
                                                         const std::vector<std::string> &location_spec_names) {
-        return MatchLocation(trace_id,
-                             query_type,
-                             keys,
-                             tokens,
-                             block_mask,
-                             location_spec_names,
-                             MatchLocationOptions::WithSlideWindowSize(sw_size));
+        auto [ec, result] = MatchLocation(trace_id,
+                                          query_type,
+                                          keys,
+                                          tokens,
+                                          block_mask,
+                                          location_spec_names,
+                                          MatchLocationOptions::WithSlideWindowSize(sw_size));
+        return {ec, std::move(result.locations)};
     }
 
     // MatchLocationOptions carries optional query controls such as slide-window
     // size and checksum collection for later LoadKvCaches verification.
-    virtual std::pair<ClientErrorCode, Locations> MatchLocation(const std::string &trace_id,
-                                                                QueryType query_type,
-                                                                const std::vector<int64_t> &keys,
-                                                                const std::vector<int64_t> &tokens,
-                                                                const BlockMask &block_mask,
-                                                                const std::vector<std::string> &location_spec_names,
-                                                                const MatchLocationOptions &options) = 0;
+    virtual std::pair<ClientErrorCode, MatchLocationResult>
+    MatchLocation(const std::string &trace_id,
+                  QueryType query_type,
+                  const std::vector<int64_t> &keys,
+                  const std::vector<int64_t> &tokens,
+                  const BlockMask &block_mask,
+                  const std::vector<std::string> &location_spec_names,
+                  const MatchLocationOptions &options) = 0;
 
     virtual std::pair<ClientErrorCode, WriteLocation>
     StartWrite(const std::string &trace_id,

@@ -53,7 +53,7 @@ ClientErrorCode ManagerClientImpl::Init(const std::string &client_config, InitPa
 
 void ManagerClientImpl::Shutdown() {}
 
-std::pair<ClientErrorCode, Locations>
+std::pair<ClientErrorCode, MatchLocationResult>
 ManagerClientImpl::MatchLocation(const std::string &trace_id,
                                  QueryType query_type,
                                  const std::vector<int64_t> &keys,

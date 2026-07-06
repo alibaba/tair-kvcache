@@ -50,15 +50,15 @@ public:
     using ManagerClient::MatchMeta;
     using ManagerClient::SaveKvCaches;
 
-    std::pair<ClientErrorCode, Locations> MatchLocation(const std::string &,
-                                                        QueryType,
-                                                        const std::vector<int64_t> &,
-                                                        const std::vector<int64_t> &,
-                                                        const BlockMask &,
-                                                        const std::vector<std::string> &,
-                                                        const MatchLocationOptions &options) override {
+    std::pair<ClientErrorCode, MatchLocationResult> MatchLocation(const std::string &,
+                                                                  QueryType,
+                                                                  const std::vector<int64_t> &,
+                                                                  const std::vector<int64_t> &,
+                                                                  const BlockMask &,
+                                                                  const std::vector<std::string> &,
+                                                                  const MatchLocationOptions &options) override {
         last_match_location_options = options;
-        return {ER_OK, Locations{}};
+        return {ER_OK, MatchLocationResult{}};
     }
 
     std::pair<ClientErrorCode, WriteLocation> StartWrite(const std::string &,
@@ -172,16 +172,15 @@ TEST(ClientOptionsTest, ManagerConvenienceOverloadsForwardOptions) {
               client.MatchLocation(trace_id, QueryType::QT_PREFIX_MATCH, keys, tokens, block_mask, spec_names)
                   .first);
     EXPECT_EQ(-1, client.last_match_location_options.sw_size);
-    EXPECT_EQ(nullptr, client.last_match_location_options.out_checksums);
+    EXPECT_FALSE(client.last_match_location_options.include_checksums);
 
     EXPECT_EQ(ER_OK,
               client.MatchLocation(
                         trace_id, QueryType::QT_REVERSE_ROLL_SW_MATCH, keys, tokens, block_mask, 7, spec_names)
                   .first);
     EXPECT_EQ(7, client.last_match_location_options.sw_size);
-    EXPECT_EQ(nullptr, client.last_match_location_options.out_checksums);
+    EXPECT_FALSE(client.last_match_location_options.include_checksums);
 
-    std::vector<int64_t> match_location_checksums;
     EXPECT_EQ(ER_OK,
               client.MatchLocation(trace_id,
                                    QueryType::QT_PREFIX_MATCH,
@@ -189,10 +188,10 @@ TEST(ClientOptionsTest, ManagerConvenienceOverloadsForwardOptions) {
                                    tokens,
                                    block_mask,
                                    spec_names,
-                                   MatchLocationOptions::CollectChecksums(match_location_checksums, 8))
+                                   MatchLocationOptions::WithChecksums(8))
                   .first);
     EXPECT_EQ(8, client.last_match_location_options.sw_size);
-    EXPECT_EQ(&match_location_checksums, client.last_match_location_options.out_checksums);
+    EXPECT_TRUE(client.last_match_location_options.include_checksums);
 
     EXPECT_EQ(ER_OK, client.FinishWrite(trace_id, "session", block_mask, locations));
     EXPECT_EQ(nullptr, client.last_finish_write_options.checksums);

@@ -388,7 +388,6 @@ TEST_F(MetaClientTest, TestMatchLocationOptionsForwardToStub) {
     EXPECT_EQ(ER_OK, ec);
     EXPECT_EQ(locations, result_locations);
 
-    std::vector<int64_t> out_checksums;
     EXPECT_CALL(*mock_stub,
                 GetCacheLocation(trace_id,
                                  "test_instance",
@@ -398,22 +397,18 @@ TEST_F(MetaClientTest, TestMatchLocationOptionsForwardToStub) {
                                  block_mask,
                                  sw_size,
                                  spec_names,
-                                 ::testing::Eq(&out_checksums)))
+                                 ::testing::NotNull()))
         .Times(1)
         .WillOnce(::testing::DoAll(::testing::SetArgPointee<8>(std::vector<int64_t>{0x11, 0x22}),
                                    ::testing::Return(std::make_pair(ER_OK, locations))));
 
-    std::tie(ec, result_locations) = client->MatchLocation(trace_id,
-                                                           query_type,
-                                                           keys,
-                                                           tokens,
-                                                           block_mask,
-                                                           spec_names,
-                                                           MatchLocationOptions::CollectChecksums(out_checksums,
-                                                                                                  sw_size));
+    auto [result_ec, result] = client->MatchLocation(
+        trace_id, query_type, keys, tokens, block_mask, spec_names, MatchLocationOptions::WithChecksums(sw_size));
+    ec = result_ec;
+    result_locations = std::move(result.locations);
     EXPECT_EQ(ER_OK, ec);
     EXPECT_EQ(locations, result_locations);
-    EXPECT_THAT(out_checksums, ::testing::ElementsAre(0x11, 0x22));
+    EXPECT_THAT(result.checksums, ::testing::ElementsAre(0x11, 0x22));
 }
 
 TEST_F(MetaClientTest, TestMatchMetaOptionsForwardToStub) {

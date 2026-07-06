@@ -198,7 +198,7 @@ struct MatchLocationOptions {
     // Slide-window size for QT_REVERSE_ROLL_SW_MATCH. The default keeps the
     // existing non-window query behavior.
     int32_t sw_size{-1};
-    std::vector<int64_t> *out_checksums{nullptr};
+    bool include_checksums{false};
 
     static MatchLocationOptions WithSlideWindowSize(int32_t sw_size) {
         MatchLocationOptions options;
@@ -206,12 +206,17 @@ struct MatchLocationOptions {
         return options;
     }
 
-    static MatchLocationOptions CollectChecksums(std::vector<int64_t> &checksums, int32_t sw_size = -1) {
+    static MatchLocationOptions WithChecksums(int32_t sw_size = -1) {
         MatchLocationOptions options;
         options.sw_size = sw_size;
-        options.out_checksums = &checksums;
+        options.include_checksums = true;
         return options;
     }
+};
+
+struct MatchLocationResult {
+    Locations locations;
+    std::vector<int64_t> checksums;
 };
 
 struct MatchMetaOptions {
