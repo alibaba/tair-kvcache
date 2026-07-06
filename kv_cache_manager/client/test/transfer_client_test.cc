@@ -337,7 +337,8 @@ TEST_F(TransferClientTest, TestLoadKvCachesExpectedHashesAllZeroSkipsCheck) {
     BlockBuffer buffer1, buffer2;
     BlockBuffers block_buffers = {buffer1, buffer2};
     std::vector<int64_t> expected_checksums = {0, 0};
-    EXPECT_EQ(ER_OK, client->LoadKvCaches(locations_, block_buffers, nullptr, &expected_checksums));
+    EXPECT_EQ(ER_OK,
+              client->LoadKvCaches(locations_, block_buffers, LoadKvCachesOptions::VerifyWith(expected_checksums)));
 }
 
 // expected_checksums 长度与 block_buffers 不一致 -> ER_CHECKSUM_MISMATCH。
@@ -348,10 +349,12 @@ TEST_F(TransferClientTest, TestLoadKvCachesExpectedHashesSizeMismatchFails) {
     BlockBuffers block_buffers = {buffer1, buffer2};
     std::vector<int64_t> expected_checksums = {0}; // 长度 1，但 buffers 长度 2
 #if defined(USING_CUDA) || defined(USING_MUSA)
-    EXPECT_EQ(ER_CHECKSUM_MISMATCH, client->LoadKvCaches(locations_, block_buffers, nullptr, &expected_checksums));
+    EXPECT_EQ(ER_CHECKSUM_MISMATCH,
+              client->LoadKvCaches(locations_, block_buffers, LoadKvCachesOptions::VerifyWith(expected_checksums)));
 #else
     // 非 CUDA/MUSA build：校验路径整体退化为 no-op，长度不匹配也不报错。
-    EXPECT_EQ(ER_OK, client->LoadKvCaches(locations_, block_buffers, nullptr, &expected_checksums));
+    EXPECT_EQ(ER_OK,
+              client->LoadKvCaches(locations_, block_buffers, LoadKvCachesOptions::VerifyWith(expected_checksums)));
 #endif
 }
 
@@ -365,7 +368,8 @@ TEST_F(TransferClientTest, TestSaveKvCachesFailureLeavesOutChecksumsEmpty) {
     BlockBuffers empty_buffers = {};
     // 预先塞一个「上次遗留」的 checksum，确保 SaveKvCaches 在失败路径上清理它。
     std::vector<int64_t> out_checksums = {0xDEADBEEFLL};
-    auto result = client->SaveKvCaches(empty_uris, empty_buffers, /*trace_info=*/nullptr, &out_checksums);
+    auto result =
+        client->SaveKvCaches(empty_uris, empty_buffers, SaveKvCachesOptions::CollectChecksums(out_checksums));
     EXPECT_EQ(ER_INVALID_PARAMS, result.first);
     EXPECT_TRUE(out_checksums.empty()) << "out_checksums must be cleared on Save failure";
 }

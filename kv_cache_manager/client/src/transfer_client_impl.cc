@@ -273,8 +273,8 @@ void TransferClientImpl::PrintBlockChecksumAndUri(const std::string &prefix,
 
 ClientErrorCode TransferClientImpl::LoadKvCaches(const UriStrVec &uri_str_vec,
                                                  const BlockBuffers &block_buffers,
-                                                 std::shared_ptr<TransferTraceInfo> trace_info,
-                                                 const std::vector<int64_t> *expected_checksums) {
+                                                 const LoadKvCachesOptions &options) {
+    const auto *expected_checksums = options.expected_checksums;
     KVCM_LOG_DEBUG("load kv caches with uri_str_vec %s, block_buffers %s",
                    DebugStringUtil::ToString(uri_str_vec).c_str(),
                    DebugStringUtil::ToString(block_buffers).c_str());
@@ -285,6 +285,7 @@ ClientErrorCode TransferClientImpl::LoadKvCaches(const UriStrVec &uri_str_vec,
         return ec;
     }
 #if defined(USING_CUDA) || defined(USING_MUSA)
+    const auto &trace_info = options.trace_info;
     if (is_check_buffer_) {
         bool need_print = (trace_info == nullptr) ? true : trace_info->need_print;
         std::vector<int64_t> block_checksums;
@@ -298,11 +299,9 @@ ClientErrorCode TransferClientImpl::LoadKvCaches(const UriStrVec &uri_str_vec,
     // Read-side verification path: only kicks in when caller supplies expected checksums
     // (typically forwarded from CacheLocation.checksum returned by meta service).
     //
-    // Verification is two-stage by default: a fast XOR aggregate over the whole batch
-    // catches the common case in O(1) comparisons. On mismatch the slow per-block walk
-    // pinpoints the offending blocks for diagnostics. Set KVCM_CHECKSUM_STRICT_MODE=1
-    // to skip the fast aggregate entirely and force per-block comparison (useful for
-    // triaging cases the XOR could in theory hide via paired cancellation, p ~2^-64).
+    // Verification is always per-block so paired checksum changes cannot cancel each
+    // other out. KVCM_CHECKSUM_STRICT_MODE is still read for compatibility with older
+    // revisions of VerifyBatchChecksums.
     //
     // Blocks whose buffer contains any iov with ignore=true are partial reads: the
     // underlying SDK leaves the ignored ranges untouched, so hashing them would
@@ -401,13 +400,14 @@ ClientErrorCode TransferClientImpl::LoadKvCaches(const UriStrVec &uri_str_vec,
 
 std::pair<ClientErrorCode, UriStrVec> TransferClientImpl::SaveKvCaches(const UriStrVec &uri_str_vec,
                                                                        const BlockBuffers &block_buffers,
-                                                                       std::shared_ptr<TransferTraceInfo> trace_info,
-                                                                       std::vector<int64_t> *out_checksums) {
+                                                                       const SaveKvCachesOptions &options) {
+    auto *out_checksums = options.out_checksums;
     KVCM_LOG_DEBUG("save kv caches with uri_str_vec %s, block_buffers %s",
                    DebugStringUtil::ToString(uri_str_vec).c_str(),
                    DebugStringUtil::ToString(block_buffers).c_str());
     CHECK_SDK_WITH_TYPE();
 #if defined(USING_CUDA) || defined(USING_MUSA)
+    const auto &trace_info = options.trace_info;
     // Write-side checksum compute: triggered by either an explicit out_checksums
     // request or the legacy KVCM_SDK_CHECK print-only fallback. The two paths share
     // the same computation so the checksum is computed at most once per call.

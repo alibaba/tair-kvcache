@@ -192,4 +192,86 @@ struct TransferTraceInfo {
     std::vector<std::string> block_ids; // block_ids.size() must be equal to block_buffer.size()
 };
 
+// Optional operation metadata keeps integrity controls out of the hot-path
+// parameter list while leaving default calls concise.
+struct MatchLocationOptions {
+    std::vector<int64_t> *out_checksums{nullptr};
+
+    static MatchLocationOptions CollectChecksums(std::vector<int64_t> &checksums) {
+        MatchLocationOptions options;
+        options.out_checksums = &checksums;
+        return options;
+    }
+};
+
+struct MatchMetaOptions {
+    std::vector<int64_t> *out_checksums{nullptr};
+
+    static MatchMetaOptions CollectChecksums(std::vector<int64_t> &checksums) {
+        MatchMetaOptions options;
+        options.out_checksums = &checksums;
+        return options;
+    }
+};
+
+struct FinishWriteOptions {
+    const std::vector<int64_t> *checksums{nullptr};
+
+    static FinishWriteOptions WithChecksums(const std::vector<int64_t> &checksums) {
+        FinishWriteOptions options;
+        options.checksums = &checksums;
+        return options;
+    }
+};
+
+struct LoadKvCachesOptions {
+    std::shared_ptr<TransferTraceInfo> trace_info{nullptr};
+    const std::vector<int64_t> *expected_checksums{nullptr};
+
+    static LoadKvCachesOptions WithTraceInfo(std::shared_ptr<TransferTraceInfo> trace_info) {
+        LoadKvCachesOptions options;
+        options.trace_info = trace_info;
+        return options;
+    }
+
+    static LoadKvCachesOptions VerifyWith(const std::vector<int64_t> &checksums) {
+        LoadKvCachesOptions options;
+        options.expected_checksums = &checksums;
+        return options;
+    }
+
+    static LoadKvCachesOptions VerifyWith(const std::vector<int64_t> &checksums,
+                                          std::shared_ptr<TransferTraceInfo> trace_info) {
+        LoadKvCachesOptions options;
+        options.trace_info = trace_info;
+        options.expected_checksums = &checksums;
+        return options;
+    }
+};
+
+struct SaveKvCachesOptions {
+    std::shared_ptr<TransferTraceInfo> trace_info{nullptr};
+    std::vector<int64_t> *out_checksums{nullptr};
+
+    static SaveKvCachesOptions WithTraceInfo(std::shared_ptr<TransferTraceInfo> trace_info) {
+        SaveKvCachesOptions options;
+        options.trace_info = trace_info;
+        return options;
+    }
+
+    static SaveKvCachesOptions CollectChecksums(std::vector<int64_t> &checksums) {
+        SaveKvCachesOptions options;
+        options.out_checksums = &checksums;
+        return options;
+    }
+
+    static SaveKvCachesOptions CollectChecksums(std::vector<int64_t> &checksums,
+                                                std::shared_ptr<TransferTraceInfo> trace_info) {
+        SaveKvCachesOptions options;
+        options.trace_info = trace_info;
+        options.out_checksums = &checksums;
+        return options;
+    }
+};
+
 } // namespace kv_cache_manager

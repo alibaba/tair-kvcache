@@ -124,11 +124,10 @@ PYBIND11_MODULE(kvcm_py_client, module) {
     // 绑定TransferClient类
     py::class_<kvcm::TransferClient, py::smart_holder>(module, "TransferClient")
         .def_static("Create", &kvcm::TransferClient::Create, py::call_guard<py::gil_scoped_release>())
-        // C++ interface gained pointer parameters expected_checksums / out_checksums for
-        // Scheme A verification. The Python binding intentionally keeps the legacy
-        // 3-argument signature via a lambda (default nullptr), letting connectors
-        // (vLLM / SGLang / TRT-LLM) keep building unchanged. Extend here once
-        // py_connector adopts checksum reporting.
+        // C++ interface exposes checksum reporting through options. The Python binding
+        // intentionally keeps the legacy 3-argument signature via a lambda (default
+        // nullptr), letting connectors (vLLM / SGLang / TRT-LLM) keep building
+        // unchanged. Extend here once py_connector adopts checksum reporting.
         .def(
             "LoadKvCaches",
             [](kvcm::TransferClient *self,

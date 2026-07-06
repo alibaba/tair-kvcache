@@ -104,7 +104,7 @@ std::pair<ClientErrorCode, Locations> MetaClientImpl::MatchLocation(const std::s
                                                                     const BlockMask &block_mask,
                                                                     int32_t sw_size,
                                                                     const std::vector<std::string> &location_spec_names,
-                                                                    std::vector<int64_t> *out_checksums) {
+                                                                    const MatchLocationOptions &options) {
     KVCM_LOG_DEBUG("match location with trace_id [%s], query_type [%d], keys %s, tokens %s, block_mask %s, sw_size "
                    "[%d], location_spec_names %s",
                    trace_id.c_str(),
@@ -116,7 +116,15 @@ std::pair<ClientErrorCode, Locations> MetaClientImpl::MatchLocation(const std::s
                    DebugStringUtil::ToString(location_spec_names).c_str());
     const std::string &instance_id = CHECK_INSTANCE_STUB_WITH_TYPE();
     return stub_->GetCacheLocation(
-        trace_id, instance_id, query_type, keys, tokens, block_mask, sw_size, location_spec_names, out_checksums);
+        trace_id,
+        instance_id,
+        query_type,
+        keys,
+        tokens,
+        block_mask,
+        sw_size,
+        location_spec_names,
+        options.out_checksums);
 }
 
 std::pair<ClientErrorCode, int64_t> MetaClientImpl::MatchLocationLen(const std::string &trace_id,
@@ -139,7 +147,7 @@ std::pair<ClientErrorCode, Metas> MetaClientImpl::MatchMeta(const std::string &t
                                                             const std::vector<int64_t> &tokens,
                                                             const BlockMask &block_mask,
                                                             int32_t detail_level,
-                                                            std::vector<int64_t> *out_checksums) {
+                                                            const MatchMetaOptions &options) {
     KVCM_LOG_DEBUG("match meta with trace_id [%s], keys %s, tokens %s, block_mask %s, detail_level [%d]",
                    trace_id.c_str(),
                    DebugStringUtil::ToString(keys).c_str(),
@@ -147,7 +155,8 @@ std::pair<ClientErrorCode, Metas> MetaClientImpl::MatchMeta(const std::string &t
                    DebugStringUtil::ToString(block_mask).c_str(),
                    detail_level);
     const std::string &instance_id = CHECK_INSTANCE_STUB_WITH_TYPE();
-    return stub_->GetCacheMeta(trace_id, instance_id, keys, tokens, block_mask, detail_level, out_checksums);
+    return stub_->GetCacheMeta(
+        trace_id, instance_id, keys, tokens, block_mask, detail_level, options.out_checksums);
 }
 
 std::pair<ClientErrorCode, WriteLocation>
@@ -171,7 +180,9 @@ ClientErrorCode MetaClientImpl::FinishWrite(const std::string &trace_id,
                                             const std::string &write_session_id,
                                             const BlockMask &success_block,
                                             const Locations &locations,
-                                            const std::vector<int64_t> &checksums) {
+                                            const FinishWriteOptions &options) {
+    const std::vector<int64_t> empty_checksums;
+    const auto &checksums = options.checksums == nullptr ? empty_checksums : *options.checksums;
     KVCM_LOG_DEBUG("finish write with trace_id [%s], write_session_id [%s], block_mask %s, locations %s, "
                    "checksums_size %zu",
                    trace_id.c_str(),

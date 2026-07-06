@@ -10,6 +10,12 @@ public:
     ManagerClientImpl();
     ~ManagerClientImpl() override;
 
+    using ManagerClient::FinishWrite;
+    using ManagerClient::LoadKvCaches;
+    using ManagerClient::MatchLocation;
+    using ManagerClient::MatchMeta;
+    using ManagerClient::SaveKvCaches;
+
     std::pair<ClientErrorCode, Locations> MatchLocation(const std::string &trace_id,
                                                         QueryType query_type,
                                                         const std::vector<int64_t> &keys,
@@ -17,7 +23,7 @@ public:
                                                         const BlockMask &block_mask,
                                                         int32_t sw_size,
                                                         const std::vector<std::string> &location_spec_names,
-                                                        std::vector<int64_t> *out_checksums = nullptr) override;
+                                                        const MatchLocationOptions &options) override;
 
     std::pair<ClientErrorCode, WriteLocation> StartWrite(const std::string &trace_id,
                                                          const std::vector<int64_t> &keys,
@@ -28,14 +34,14 @@ public:
                                 const std::string &write_session_id,
                                 const BlockMask &success_block,
                                 const Locations &locations,
-                                const std::vector<int64_t> &checksums = {}) override;
+                                const FinishWriteOptions &options) override;
 
     std::pair<ClientErrorCode, Metas> MatchMeta(const std::string &trace_id,
                                                 const std::vector<int64_t> &keys,
                                                 const std::vector<int64_t> &tokens,
                                                 const BlockMask &block_mask,
                                                 int32_t detail_level,
-                                                std::vector<int64_t> *out_checksums = nullptr) override;
+                                                const MatchMetaOptions &options) override;
 
     ClientErrorCode RemoveCache(const std::string &trace_id,
                                 const std::vector<int64_t> &keys,
@@ -44,11 +50,11 @@ public:
 
     ClientErrorCode LoadKvCaches(const UriStrVec &uri_str_vec,
                                  const BlockBuffers &block_buffers,
-                                 const std::vector<int64_t> *expected_checksums = nullptr) override;
+                                 const LoadKvCachesOptions &options) override;
 
     std::pair<ClientErrorCode, UriStrVec> SaveKvCaches(const UriStrVec &uri_str_vec,
                                                        const BlockBuffers &block_buffers,
-                                                       std::vector<int64_t> *out_checksums = nullptr) override;
+                                                       const SaveKvCachesOptions &options) override;
 
 protected:
     ClientErrorCode Init(const std::string &client_config, InitParams &init_params) override;

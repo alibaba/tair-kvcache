@@ -20,14 +20,15 @@ public:
     TransferClientImpl();
     ~TransferClientImpl() override;
 
+    using TransferClient::LoadKvCaches;
+    using TransferClient::SaveKvCaches;
+
     ClientErrorCode LoadKvCaches(const UriStrVec &uri_str_vec,
                                  const BlockBuffers &block_buffers,
-                                 std::shared_ptr<TransferTraceInfo> trace_info = nullptr,
-                                 const std::vector<int64_t> *expected_checksums = nullptr) override;
+                                 const LoadKvCachesOptions &options) override;
     std::pair<ClientErrorCode, UriStrVec> SaveKvCaches(const UriStrVec &uri_str_vec,
                                                        const BlockBuffers &block_buffers,
-                                                       std::shared_ptr<TransferTraceInfo> trace_info = nullptr,
-                                                       std::vector<int64_t> *out_checksums = nullptr) override;
+                                                       const SaveKvCachesOptions &options) override;
 
 protected:
     ClientErrorCode Init(const std::string &client_config, const InitParams &init_params) override;
