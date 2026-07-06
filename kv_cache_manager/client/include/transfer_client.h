@@ -36,21 +36,23 @@ public:
 
     std::pair<ClientErrorCode, UriStrVec> SaveKvCaches(const UriStrVec &uri_str_vec,
                                                        const BlockBuffers &block_buffers) {
-        return SaveKvCaches(uri_str_vec, block_buffers, SaveKvCachesOptions{});
+        auto [ec, result] = SaveKvCaches(uri_str_vec, block_buffers, SaveKvCachesOptions{});
+        return {ec, std::move(result.uri_str_vec)};
     }
 
     std::pair<ClientErrorCode, UriStrVec> SaveKvCaches(const UriStrVec &uri_str_vec,
                                                        const BlockBuffers &block_buffers,
                                                        std::shared_ptr<TransferTraceInfo> trace_info) {
         auto options = SaveKvCachesOptions::WithTraceInfo(trace_info);
-        return SaveKvCaches(uri_str_vec, block_buffers, options);
+        auto [ec, result] = SaveKvCaches(uri_str_vec, block_buffers, options);
+        return {ec, std::move(result.uri_str_vec)};
     }
 
-    // SaveKvCachesOptions carries optional trace_info and the checksum sink for
-    // write-side collection. On success, out_checksums matches block_buffers.size().
-    virtual std::pair<ClientErrorCode, UriStrVec> SaveKvCaches(const UriStrVec &uri_str_vec,
-                                                               const BlockBuffers &block_buffers,
-                                                               const SaveKvCachesOptions &options) = 0;
+    // SaveKvCachesOptions carries optional trace_info and checksum collection
+    // controls. On success, SaveKvCachesResult::checksums matches block_buffers.size().
+    virtual std::pair<ClientErrorCode, SaveKvCachesResult> SaveKvCaches(const UriStrVec &uri_str_vec,
+                                                                        const BlockBuffers &block_buffers,
+                                                                        const SaveKvCachesOptions &options) = 0;
 
 protected:
     TransferClient() = default;

@@ -139,12 +139,12 @@ std::pair<ClientErrorCode, int64_t> MetaClientImpl::MatchLocationLen(const std::
     return stub_->GetCacheLocationLen(trace_id, instance_id, query_type, keys, tokens, sw_size);
 }
 
-std::pair<ClientErrorCode, Metas> MetaClientImpl::MatchMeta(const std::string &trace_id,
-                                                            const std::vector<int64_t> &keys,
-                                                            const std::vector<int64_t> &tokens,
-                                                            const BlockMask &block_mask,
-                                                            int32_t detail_level,
-                                                            const MatchMetaOptions &options) {
+std::pair<ClientErrorCode, MatchMetaResult> MetaClientImpl::MatchMeta(const std::string &trace_id,
+                                                                      const std::vector<int64_t> &keys,
+                                                                      const std::vector<int64_t> &tokens,
+                                                                      const BlockMask &block_mask,
+                                                                      const MatchMetaOptions &options) {
+    const int32_t detail_level = options.detail_level;
     KVCM_LOG_DEBUG("match meta with trace_id [%s], keys %s, tokens %s, block_mask %s, detail_level [%d]",
                    trace_id.c_str(),
                    DebugStringUtil::ToString(keys).c_str(),
@@ -152,8 +152,11 @@ std::pair<ClientErrorCode, Metas> MetaClientImpl::MatchMeta(const std::string &t
                    DebugStringUtil::ToString(block_mask).c_str(),
                    detail_level);
     const std::string &instance_id = CHECK_INSTANCE_STUB_WITH_TYPE();
-    return stub_->GetCacheMeta(
-        trace_id, instance_id, keys, tokens, block_mask, detail_level, options.out_checksums);
+    MatchMetaResult result;
+    auto *out_checksums = options.include_checksums ? &result.checksums : nullptr;
+    auto [ec, metas] = stub_->GetCacheMeta(trace_id, instance_id, keys, tokens, block_mask, detail_level, out_checksums);
+    result.metas = std::move(metas);
+    return {ec, std::move(result)};
 }
 
 std::pair<ClientErrorCode, WriteLocation>

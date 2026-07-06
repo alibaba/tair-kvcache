@@ -84,14 +84,13 @@ ClientErrorCode ManagerClientImpl::FinishWrite(const std::string &trace_id,
     return meta_client_->FinishWrite(trace_id, write_session_id, success_block, locations, options);
 }
 
-std::pair<ClientErrorCode, Metas> ManagerClientImpl::MatchMeta(const std::string &trace_id,
-                                                               const std::vector<int64_t> &keys,
-                                                               const std::vector<int64_t> &tokens,
-                                                               const BlockMask &block_mask,
-                                                               int32_t detail_level,
-                                                               const MatchMetaOptions &options) {
+std::pair<ClientErrorCode, MatchMetaResult> ManagerClientImpl::MatchMeta(const std::string &trace_id,
+                                                                         const std::vector<int64_t> &keys,
+                                                                         const std::vector<int64_t> &tokens,
+                                                                         const BlockMask &block_mask,
+                                                                         const MatchMetaOptions &options) {
     CHECK_CLIENT_WITH_TYPE(meta_client_);
-    return meta_client_->MatchMeta(trace_id, keys, tokens, block_mask, detail_level, options);
+    return meta_client_->MatchMeta(trace_id, keys, tokens, block_mask, options);
 }
 
 ClientErrorCode ManagerClientImpl::RemoveCache(const std::string &trace_id,
@@ -109,9 +108,9 @@ ClientErrorCode ManagerClientImpl::LoadKvCaches(const UriStrVec &uri_str_vec,
     return transfer_client_->LoadKvCaches(uri_str_vec, block_buffers, options);
 }
 
-std::pair<ClientErrorCode, UriStrVec> ManagerClientImpl::SaveKvCaches(const UriStrVec &uri_str_vec,
-                                                                      const BlockBuffers &block_buffers,
-                                                                      const SaveKvCachesOptions &options) {
+std::pair<ClientErrorCode, SaveKvCachesResult> ManagerClientImpl::SaveKvCaches(const UriStrVec &uri_str_vec,
+                                                                               const BlockBuffers &block_buffers,
+                                                                               const SaveKvCachesOptions &options) {
     CHECK_CLIENT_WITH_TYPE(transfer_client_);
     return transfer_client_->SaveKvCaches(uri_str_vec, block_buffers, options);
 }

@@ -82,15 +82,16 @@ public:
                                                 const std::vector<int64_t> &tokens,
                                                 const BlockMask &block_mask,
                                                 int32_t detail_level) {
-        return MatchMeta(trace_id, keys, tokens, block_mask, detail_level, MatchMetaOptions{});
+        auto [ec, result] =
+            MatchMeta(trace_id, keys, tokens, block_mask, MatchMetaOptions::WithDetailLevel(detail_level));
+        return {ec, std::move(result.metas)};
     }
 
-    virtual std::pair<ClientErrorCode, Metas> MatchMeta(const std::string &trace_id,
-                                                        const std::vector<int64_t> &keys,
-                                                        const std::vector<int64_t> &tokens,
-                                                        const BlockMask &block_mask,
-                                                        int32_t detail_level,
-                                                        const MatchMetaOptions &options) = 0;
+    virtual std::pair<ClientErrorCode, MatchMetaResult> MatchMeta(const std::string &trace_id,
+                                                                  const std::vector<int64_t> &keys,
+                                                                  const std::vector<int64_t> &tokens,
+                                                                  const BlockMask &block_mask,
+                                                                  const MatchMetaOptions &options) = 0;
 
     virtual ClientErrorCode RemoveCache(const std::string &trace_id,
                                         const std::vector<int64_t> &keys,
@@ -108,12 +109,13 @@ public:
 
     std::pair<ClientErrorCode, UriStrVec> SaveKvCaches(const UriStrVec &uri_str_vec,
                                                        const BlockBuffers &block_buffers) {
-        return SaveKvCaches(uri_str_vec, block_buffers, SaveKvCachesOptions{});
+        auto [ec, result] = SaveKvCaches(uri_str_vec, block_buffers, SaveKvCachesOptions{});
+        return {ec, std::move(result.uri_str_vec)};
     }
 
-    virtual std::pair<ClientErrorCode, UriStrVec> SaveKvCaches(const UriStrVec &uri_str_vec,
-                                                               const BlockBuffers &block_buffers,
-                                                               const SaveKvCachesOptions &options) = 0;
+    virtual std::pair<ClientErrorCode, SaveKvCachesResult> SaveKvCaches(const UriStrVec &uri_str_vec,
+                                                                        const BlockBuffers &block_buffers,
+                                                                        const SaveKvCachesOptions &options) = 0;
 
 protected:
     ManagerClient() = default;

@@ -22,13 +22,15 @@ public:
         return ER_OK;
     }
 
-    std::pair<ClientErrorCode, UriStrVec> SaveKvCaches(const UriStrVec &uri_str_vec,
-                                                       const BlockBuffers &block_buffers,
-                                                       const SaveKvCachesOptions &options) override {
+    std::pair<ClientErrorCode, SaveKvCachesResult> SaveKvCaches(const UriStrVec &uri_str_vec,
+                                                                const BlockBuffers &block_buffers,
+                                                                const SaveKvCachesOptions &options) override {
         last_save_uri_count = uri_str_vec.size();
         last_save_buffer_count = block_buffers.size();
         last_save_options = options;
-        return {ER_OK, uri_str_vec};
+        SaveKvCachesResult result;
+        result.uri_str_vec = uri_str_vec;
+        return {ER_OK, std::move(result)};
     }
 
     size_t last_load_uri_count{0};
@@ -78,14 +80,13 @@ public:
         return ER_OK;
     }
 
-    std::pair<ClientErrorCode, Metas> MatchMeta(const std::string &,
-                                                const std::vector<int64_t> &,
-                                                const std::vector<int64_t> &,
-                                                const BlockMask &,
-                                                int32_t,
-                                                const MatchMetaOptions &options) override {
+    std::pair<ClientErrorCode, MatchMetaResult> MatchMeta(const std::string &,
+                                                          const std::vector<int64_t> &,
+                                                          const std::vector<int64_t> &,
+                                                          const BlockMask &,
+                                                          const MatchMetaOptions &options) override {
         last_match_meta_options = options;
-        return {ER_OK, Metas{}};
+        return {ER_OK, MatchMetaResult{}};
     }
 
     ClientErrorCode RemoveCache(const std::string &,
@@ -102,11 +103,11 @@ public:
         return ER_OK;
     }
 
-    std::pair<ClientErrorCode, UriStrVec> SaveKvCaches(const UriStrVec &,
-                                                       const BlockBuffers &,
-                                                       const SaveKvCachesOptions &options) override {
+    std::pair<ClientErrorCode, SaveKvCachesResult> SaveKvCaches(const UriStrVec &,
+                                                                const BlockBuffers &,
+                                                                const SaveKvCachesOptions &options) override {
         last_save_options = options;
-        return {ER_OK, UriStrVec{}};
+        return {ER_OK, SaveKvCachesResult{}};
     }
 
     MatchLocationOptions last_match_location_options;
@@ -148,13 +149,12 @@ TEST(ClientOptionsTest, TransferConvenienceOverloadsForwardOptions) {
     EXPECT_EQ(uris.size(), client.last_save_uri_count);
     EXPECT_EQ(buffers.size(), client.last_save_buffer_count);
     EXPECT_EQ(nullptr, client.last_save_options.trace_info);
-    EXPECT_EQ(nullptr, client.last_save_options.out_checksums);
+    EXPECT_FALSE(client.last_save_options.include_checksums);
 
-    std::vector<int64_t> out_checksums;
-    save_result = client.SaveKvCaches(uris, buffers, SaveKvCachesOptions::CollectChecksums(out_checksums, trace_info));
-    EXPECT_EQ(ER_OK, save_result.first);
+    auto save_with_checksum_result = client.SaveKvCaches(uris, buffers, SaveKvCachesOptions::WithChecksums(trace_info));
+    EXPECT_EQ(ER_OK, save_with_checksum_result.first);
     EXPECT_EQ(trace_info, client.last_save_options.trace_info);
-    EXPECT_EQ(&out_checksums, client.last_save_options.out_checksums);
+    EXPECT_TRUE(client.last_save_options.include_checksums);
 }
 
 TEST(ClientOptionsTest, ManagerConvenienceOverloadsForwardOptions) {
@@ -203,14 +203,14 @@ TEST(ClientOptionsTest, ManagerConvenienceOverloadsForwardOptions) {
     EXPECT_EQ(&finish_checksums, client.last_finish_write_options.checksums);
 
     EXPECT_EQ(ER_OK, client.MatchMeta(trace_id, keys, tokens, block_mask, 1).first);
-    EXPECT_EQ(nullptr, client.last_match_meta_options.out_checksums);
+    EXPECT_EQ(1, client.last_match_meta_options.detail_level);
+    EXPECT_FALSE(client.last_match_meta_options.include_checksums);
 
-    std::vector<int64_t> match_meta_checksums;
     EXPECT_EQ(ER_OK,
-              client.MatchMeta(
-                        trace_id, keys, tokens, block_mask, 1, MatchMetaOptions::CollectChecksums(match_meta_checksums))
+              client.MatchMeta(trace_id, keys, tokens, block_mask, MatchMetaOptions::WithChecksums(1))
                   .first);
-    EXPECT_EQ(&match_meta_checksums, client.last_match_meta_options.out_checksums);
+    EXPECT_EQ(1, client.last_match_meta_options.detail_level);
+    EXPECT_TRUE(client.last_match_meta_options.include_checksums);
 
     EXPECT_EQ(ER_OK, client.LoadKvCaches(uris, buffers));
     EXPECT_EQ(nullptr, client.last_load_options.expected_checksums);
@@ -219,11 +219,10 @@ TEST(ClientOptionsTest, ManagerConvenienceOverloadsForwardOptions) {
     EXPECT_EQ(&finish_checksums, client.last_load_options.expected_checksums);
 
     EXPECT_EQ(ER_OK, client.SaveKvCaches(uris, buffers).first);
-    EXPECT_EQ(nullptr, client.last_save_options.out_checksums);
+    EXPECT_FALSE(client.last_save_options.include_checksums);
 
-    EXPECT_EQ(ER_OK,
-              client.SaveKvCaches(uris, buffers, SaveKvCachesOptions::CollectChecksums(finish_checksums)).first);
-    EXPECT_EQ(&finish_checksums, client.last_save_options.out_checksums);
+    EXPECT_EQ(ER_OK, client.SaveKvCaches(uris, buffers, SaveKvCachesOptions::WithChecksums()).first);
+    EXPECT_TRUE(client.last_save_options.include_checksums);
 }
 
 class TransferClientTest : public TESTBASE {
@@ -577,18 +576,15 @@ TEST_F(TransferClientTest, TestLoadKvCachesExpectedHashesSizeMismatchFails) {
 #endif
 }
 
-// SaveKvCaches 失败时 out_checksums 必须保持空 —— 老实现把计算完的 checksum 直接
-// 交给 caller，再让 caller 透传到 FinishWrite，就会给磁盘上不存在的数据落一条 hash。
+// SaveKvCaches 失败时 result.checksums 必须保持空 —— 老实现把计算完的 checksum 直接
+// 返回给 caller，再让 caller 透传到 FinishWrite，就会给磁盘上不存在的数据落一条 hash。
 // 此处触发 sdk_wrapper->Put 前置校验错误 (empty inputs)，覆盖两种 build 下的行为。
-TEST_F(TransferClientTest, TestSaveKvCachesFailureLeavesOutChecksumsEmpty) {
+TEST_F(TransferClientTest, TestSaveKvCachesFailureLeavesChecksumsEmpty) {
     auto client = TransferClient::Create(client_config_, init_params_);
     ASSERT_NE(client, nullptr);
     UriStrVec empty_uris = {};
     BlockBuffers empty_buffers = {};
-    // 预先塞一个「上次遗留」的 checksum，确保 SaveKvCaches 在失败路径上清理它。
-    std::vector<int64_t> out_checksums = {0xDEADBEEFLL};
-    auto result =
-        client->SaveKvCaches(empty_uris, empty_buffers, SaveKvCachesOptions::CollectChecksums(out_checksums));
+    auto result = client->SaveKvCaches(empty_uris, empty_buffers, SaveKvCachesOptions::WithChecksums());
     EXPECT_EQ(ER_INVALID_PARAMS, result.first);
-    EXPECT_TRUE(out_checksums.empty()) << "out_checksums must be cleared on Save failure";
+    EXPECT_TRUE(result.second.checksums.empty()) << "checksums must stay empty on Save failure";
 }

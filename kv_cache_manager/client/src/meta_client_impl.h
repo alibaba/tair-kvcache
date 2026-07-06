@@ -43,12 +43,11 @@ public:
                                 const Locations &locations,
                                 const FinishWriteOptions &options) override;
 
-    std::pair<ClientErrorCode, Metas> MatchMeta(const std::string &trace_id,
-                                                const std::vector<int64_t> &keys,
-                                                const std::vector<int64_t> &tokens,
-                                                const BlockMask &block_mask,
-                                                int32_t detail_level,
-                                                const MatchMetaOptions &options) override;
+    std::pair<ClientErrorCode, MatchMetaResult> MatchMeta(const std::string &trace_id,
+                                                          const std::vector<int64_t> &keys,
+                                                          const std::vector<int64_t> &tokens,
+                                                          const BlockMask &block_mask,
+                                                          const MatchMetaOptions &options) override;
 
     ClientErrorCode RemoveCache(const std::string &trace_id,
                                 const std::vector<int64_t> &keys,

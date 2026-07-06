@@ -220,13 +220,26 @@ struct MatchLocationResult {
 };
 
 struct MatchMetaOptions {
-    std::vector<int64_t> *out_checksums{nullptr};
+    int32_t detail_level{0};
+    bool include_checksums{false};
 
-    static MatchMetaOptions CollectChecksums(std::vector<int64_t> &checksums) {
+    static MatchMetaOptions WithDetailLevel(int32_t detail_level) {
         MatchMetaOptions options;
-        options.out_checksums = &checksums;
+        options.detail_level = detail_level;
         return options;
     }
+
+    static MatchMetaOptions WithChecksums(int32_t detail_level = 0) {
+        MatchMetaOptions options;
+        options.detail_level = detail_level;
+        options.include_checksums = true;
+        return options;
+    }
+};
+
+struct MatchMetaResult {
+    Metas metas;
+    std::vector<int64_t> checksums;
 };
 
 struct FinishWriteOptions {
@@ -266,7 +279,7 @@ struct LoadKvCachesOptions {
 
 struct SaveKvCachesOptions {
     std::shared_ptr<TransferTraceInfo> trace_info{nullptr};
-    std::vector<int64_t> *out_checksums{nullptr};
+    bool include_checksums{false};
 
     static SaveKvCachesOptions WithTraceInfo(std::shared_ptr<TransferTraceInfo> trace_info) {
         SaveKvCachesOptions options;
@@ -274,19 +287,23 @@ struct SaveKvCachesOptions {
         return options;
     }
 
-    static SaveKvCachesOptions CollectChecksums(std::vector<int64_t> &checksums) {
+    static SaveKvCachesOptions WithChecksums() {
         SaveKvCachesOptions options;
-        options.out_checksums = &checksums;
+        options.include_checksums = true;
         return options;
     }
 
-    static SaveKvCachesOptions CollectChecksums(std::vector<int64_t> &checksums,
-                                                std::shared_ptr<TransferTraceInfo> trace_info) {
+    static SaveKvCachesOptions WithChecksums(std::shared_ptr<TransferTraceInfo> trace_info) {
         SaveKvCachesOptions options;
         options.trace_info = trace_info;
-        options.out_checksums = &checksums;
+        options.include_checksums = true;
         return options;
     }
+};
+
+struct SaveKvCachesResult {
+    UriStrVec uri_str_vec;
+    std::vector<int64_t> checksums;
 };
 
 } // namespace kv_cache_manager

@@ -81,15 +81,16 @@ public:
                                                 const std::vector<int64_t> &tokens,
                                                 const BlockMask &block_mask,
                                                 int32_t detail_level) {
-        return MatchMeta(trace_id, keys, tokens, block_mask, detail_level, MatchMetaOptions{});
+        auto [ec, result] =
+            MatchMeta(trace_id, keys, tokens, block_mask, MatchMetaOptions::WithDetailLevel(detail_level));
+        return {ec, std::move(result.metas)};
     }
 
-    virtual std::pair<ClientErrorCode, Metas> MatchMeta(const std::string &trace_id,
-                                                        const std::vector<int64_t> &keys,
-                                                        const std::vector<int64_t> &tokens,
-                                                        const BlockMask &block_mask,
-                                                        int32_t detail_level,
-                                                        const MatchMetaOptions &options) = 0;
+    virtual std::pair<ClientErrorCode, MatchMetaResult> MatchMeta(const std::string &trace_id,
+                                                                  const std::vector<int64_t> &keys,
+                                                                  const std::vector<int64_t> &tokens,
+                                                                  const BlockMask &block_mask,
+                                                                  const MatchMetaOptions &options) = 0;
 
     virtual std::pair<ClientErrorCode, int64_t> MatchLocationLen(const std::string &trace_id,
                                                                  QueryType query_type,

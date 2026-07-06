@@ -398,17 +398,18 @@ ClientErrorCode TransferClientImpl::LoadKvCaches(const UriStrVec &uri_str_vec,
     return ec;
 }
 
-std::pair<ClientErrorCode, UriStrVec> TransferClientImpl::SaveKvCaches(const UriStrVec &uri_str_vec,
-                                                                       const BlockBuffers &block_buffers,
-                                                                       const SaveKvCachesOptions &options) {
-    auto *out_checksums = options.out_checksums;
+std::pair<ClientErrorCode, SaveKvCachesResult> TransferClientImpl::SaveKvCaches(const UriStrVec &uri_str_vec,
+                                                                                const BlockBuffers &block_buffers,
+                                                                                const SaveKvCachesOptions &options) {
+    SaveKvCachesResult result;
+    auto *out_checksums = options.include_checksums ? &result.checksums : nullptr;
     KVCM_LOG_DEBUG("save kv caches with uri_str_vec %s, block_buffers %s",
                    DebugStringUtil::ToString(uri_str_vec).c_str(),
                    DebugStringUtil::ToString(block_buffers).c_str());
     CHECK_SDK_WITH_TYPE();
 #if defined(USING_CUDA) || defined(USING_MUSA)
     const auto &trace_info = options.trace_info;
-    // Write-side checksum compute: triggered by either an explicit out_checksums
+    // Write-side checksum compute: triggered by either an explicit checksum
     // request or the legacy KVCM_SDK_CHECK print-only fallback. The two paths share
     // the same computation so the checksum is computed at most once per call.
     //
@@ -420,9 +421,8 @@ std::pair<ClientErrorCode, UriStrVec> TransferClientImpl::SaveKvCaches(const Uri
     if (out_checksums != nullptr || is_check_buffer_) {
         if (!sdk_buffer_check_pool_) {
             if (out_checksums != nullptr) {
-                KVCM_LOG_WARN("out_checksums requested but sdk_buffer_check_pool is not enabled; "
+                KVCM_LOG_WARN("checksums requested but sdk_buffer_check_pool is not enabled; "
                               "return empty vector (caller should treat as 'checksum not available')");
-                out_checksums->clear();
             }
         } else {
             bool need_print = (trace_info == nullptr) ? true : trace_info->need_print;
@@ -435,14 +435,12 @@ std::pair<ClientErrorCode, UriStrVec> TransferClientImpl::SaveKvCaches(const Uri
                     const size_t idx = std::distance(block_buffers.begin(), invalid_it);
                     KVCM_LOG_WARN("block [%zu] has ignored, empty, null, or zero-size iovs; skip checksum hash", idx);
                     if (out_checksums != nullptr) {
-                        out_checksums->clear();
                         return {ER_INVALID_PARAMS, {}};
                     }
                 } else {
                     auto handle = sdk_buffer_check_pool_->GetCell();
                     if (!HashBlocksByIovShape(block_buffers, handle, max_check_iov_num_, block_checksums)) {
                         if (out_checksums != nullptr) {
-                            out_checksums->clear();
                             return {ER_INVALID_PARAMS, {}};
                         }
                     } else {
@@ -455,7 +453,6 @@ std::pair<ClientErrorCode, UriStrVec> TransferClientImpl::SaveKvCaches(const Uri
                         "block_checksums size [%zu] != block_buffers size [%zu]; reject write before it commits",
                         block_checksums.size(),
                         block_buffers.size());
-                    out_checksums->clear();
                     return {ER_INVALID_PARAMS, {}};
                 }
             }
@@ -463,15 +460,12 @@ std::pair<ClientErrorCode, UriStrVec> TransferClientImpl::SaveKvCaches(const Uri
         if (is_check_buffer_ && block_checksums_computed) {
             PrintBlockChecksumAndUri("put_", uri_str_vec, block_checksums, trace_info);
         }
-        // Deliberately DO NOT assign to *out_checksums here — see below. A prior
-        // version filled the vector before Put, which meant a failed Put returned
-        // checksums for data that never landed on disk; a caller then persisting
-        // those via FinishWrite would associate a checksum with a nonexistent block.
+        // Deliberately DO NOT assign to result.checksums here; a failed Put must
+        // not return checksums for data that never landed on disk.
     }
 #else
     if (out_checksums != nullptr) {
-        KVCM_LOG_WARN("out_checksums requested but build is not CUDA/MUSA; return empty vector");
-        out_checksums->clear();
+        KVCM_LOG_WARN("checksums requested but build is not CUDA/MUSA; return empty vector");
     }
 #endif
     auto remote_uris = ParseLocations(uri_str_vec);
@@ -484,10 +478,11 @@ std::pair<ClientErrorCode, UriStrVec> TransferClientImpl::SaveKvCaches(const Uri
 #if defined(USING_CUDA) || defined(USING_MUSA)
     // Put succeeded; only now hand computed checksums back to the caller.
     if (out_checksums != nullptr && block_checksums_computed) {
-        *out_checksums = std::move(block_checksums);
+        result.checksums = std::move(block_checksums);
     }
 #endif
-    return {ER_OK, ConstructLocations(*actual_remote_uris)};
+    result.uri_str_vec = ConstructLocations(*actual_remote_uris);
+    return {ER_OK, std::move(result)};
 }
 
 ClientErrorCode TransferClientImpl::IsValid(const std::unique_ptr<ClientConfig> &client_config) const {

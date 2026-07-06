@@ -441,7 +441,6 @@ TEST_F(MetaClientTest, TestMatchMetaOptionsForwardToStub) {
     EXPECT_EQ(metas.locations, result_metas.locations);
     EXPECT_EQ(metas.metas, result_metas.metas);
 
-    std::vector<int64_t> out_checksums;
     EXPECT_CALL(*mock_stub,
                 GetCacheMeta(trace_id,
                              "test_instance",
@@ -449,17 +448,19 @@ TEST_F(MetaClientTest, TestMatchMetaOptionsForwardToStub) {
                              tokens,
                              block_mask,
                              detail_level,
-                             ::testing::Eq(&out_checksums)))
+                             ::testing::NotNull()))
         .Times(1)
         .WillOnce(::testing::DoAll(::testing::SetArgPointee<6>(std::vector<int64_t>{0x33}),
                                    ::testing::Return(std::make_pair(ER_OK, metas))));
 
-    std::tie(ec, result_metas) = client->MatchMeta(
-        trace_id, keys, tokens, block_mask, detail_level, MatchMetaOptions::CollectChecksums(out_checksums));
+    auto [result_ec, result] =
+        client->MatchMeta(trace_id, keys, tokens, block_mask, MatchMetaOptions::WithChecksums(detail_level));
+    ec = result_ec;
+    result_metas = std::move(result.metas);
     EXPECT_EQ(ER_OK, ec);
     EXPECT_EQ(metas.locations, result_metas.locations);
     EXPECT_EQ(metas.metas, result_metas.metas);
-    EXPECT_THAT(out_checksums, ::testing::ElementsAre(0x33));
+    EXPECT_THAT(result.checksums, ::testing::ElementsAre(0x33));
 }
 
 TEST_F(MetaClientTest, TestFinishWriteOptionsForwardToStub) {

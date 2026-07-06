@@ -26,9 +26,9 @@ public:
     ClientErrorCode LoadKvCaches(const UriStrVec &uri_str_vec,
                                  const BlockBuffers &block_buffers,
                                  const LoadKvCachesOptions &options) override;
-    std::pair<ClientErrorCode, UriStrVec> SaveKvCaches(const UriStrVec &uri_str_vec,
-                                                       const BlockBuffers &block_buffers,
-                                                       const SaveKvCachesOptions &options) override;
+    std::pair<ClientErrorCode, SaveKvCachesResult> SaveKvCaches(const UriStrVec &uri_str_vec,
+                                                                const BlockBuffers &block_buffers,
+                                                                const SaveKvCachesOptions &options) override;
 
 protected:
     ClientErrorCode Init(const std::string &client_config, const InitParams &init_params) override;
