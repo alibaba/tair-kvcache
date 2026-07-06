@@ -143,7 +143,33 @@ public:
 
         EXPECT_EQ(EC_OK, cache_manager->DoRecover());
 
+        // 注册 tiered 测试用的冷热 dummy 后端。MarkForTieredWrite 现要求 target 已注册(F-02)，
+        // 且 F-21 测试需要真实 backend 以便用 MightExistInterceptor 构造"meta SERVING 但数据已丢"。
+        RegisterDummyStorage("hot_01");
+        RegisterDummyStorage("cold_01");
+
         return cache_manager;
+    }
+
+    bool RegisterDummyStorage(const std::string &name) {
+        auto spec = std::make_shared<DummyStorageSpec>();
+        spec->set_root_path(GetPrivateTestRuntimeDataPath() + name + "/");
+        spec->set_key_count_per_file(1);
+        StorageConfig config;
+        config.set_type(DataStorageType::DATA_STORAGE_TYPE_DUMMY);
+        config.set_global_unique_name(name);
+        config.set_storage_spec(spec);
+        auto rc = std::make_shared<RequestContext>("reg_storage");
+        auto dsm = registry_manager_->data_storage_manager();
+        if (dsm->RegisterStorage(rc.get(), name, config) != EC_OK) {
+            return false;
+        }
+        // 默认让数据 MightExist=true，使仅建 meta location(未真正写数据文件)的 tiered 测试仍视其为有效；
+        // 需要模拟"数据已丢"的用例可在测试内覆盖为返回 false 的 interceptor(见 F-21 stale 测试)。
+        auto original = dsm->storage_map_[name];
+        dsm->storage_map_[name] = std::make_shared<MightExistInterceptor>(
+            original, [](const std::vector<DataStorageUri> &uris) { return std::vector<bool>(uris.size(), true); });
+        return true;
     }
 
     ModelDeployment createModelDeployment() {
@@ -3412,6 +3438,72 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheTieredMarkSkipsExistingTarget) {
     ASSERT_TRUE(new_targets.empty());
 }
 
+// F-21: 冷层 target 有 CLS_SERVING location 但数据已丢(MightExist=false)时，marked write 不应因
+// meta 仍 SERVING 就跳过；应视 target 未满足 → block 进待写集并路由回 cold_01。stale 判断复用普通路径
+// 的 prune 结果(同一次 Exist)，不额外查后端。
+TEST_F(CacheManagerTest, TestFilterWriteCacheTieredStaleTargetTriggersRewrite) {
+    EnableTieredMigrationStrategy();
+    cache_manager_->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "stale_tier_instance",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     std::vector<LocationSpecGroup>());
+    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("stale_tier_instance");
+    ASSERT_TRUE(meta_searcher);
+
+    // block 1: 冷层 cold_01 上有一个覆盖全 spec 的 SERVING location。
+    auto cold_loc = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        4,
+        std::vector<LocationSpec>{
+            LocationSpec("tp0", "dummy://cold_01/blk1/tp0?size=1"),
+            LocationSpec("tp1", "dummy://cold_01/blk1/tp1?size=1"),
+            LocationSpec("tp2", "dummy://cold_01/blk1/tp2?size=1"),
+            LocationSpec("tp3", "dummy://cold_01/blk1/tp3?size=1"),
+        });
+    std::vector<std::string> ids;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchAddLocation(request_context_.get(), {1}, {cold_loc}, ids));
+    ASSERT_EQ(1u, ids.size());
+    std::vector<std::vector<MetaSearcher::LocationCASTask>> cas_tasks{
+        {MetaSearcher::LocationCASTask{ids[0], CLS_WRITING, CLS_SERVING}}};
+    std::vector<std::vector<ErrorCode>> cas_results;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchCASLocationStatus(request_context_.get(), {1}, cas_tasks, cas_results));
+    cache_manager_->migration_manager()->MarkForTieredWrite("stale_tier_instance", {1}, "cold_01");
+    ASSERT_TRUE(cache_manager_->migration_manager()->IsMarkedForTieredWrite("stale_tier_instance", 1));
+
+    // 让 cold_01 的数据 MightExist=false(模拟数据被驱逐/丢失)——此时 meta 仍 SERVING，但数据不在。
+    auto dsm = registry_manager_->data_storage_manager_;
+    auto original = dsm->storage_map_["cold_01"];
+    dsm->storage_map_["cold_01"] = std::make_shared<MightExistInterceptor>(
+        original, [](const std::vector<DataStorageUri> &uris) { return std::vector<bool>(uris.size(), false); });
+
+    CacheManager::KeyVector keys = {1};
+    CacheManager::KeyVector new_keys;
+    std::vector<std::string_view> new_sgn;
+    BlockMask block_mask;
+    std::vector<std::string> new_targets;
+    auto ec = cache_manager_->FilterWriteCache(request_context_.get(),
+                                               "stale_tier_instance",
+                                               meta_searcher,
+                                               keys,
+                                               new_keys,
+                                               {},
+                                               new_sgn,
+                                               block_mask,
+                                               1,
+                                               new_targets);
+    dsm->storage_map_["cold_01"] = original;
+
+    ASSERT_EQ(EC_OK, ec);
+    // 关键:stale 冷层 target 被视为未满足 → block 1 需重写且路由回 cold_01(而非误判已满足跳过)。
+    ASSERT_EQ(1u, new_keys.size());
+    ASSERT_EQ(1, new_keys[0]);
+    ASSERT_EQ(1u, new_targets.size());
+    ASSERT_EQ("cold_01", new_targets[0]);
+}
+
 TEST_F(CacheManagerTest, TestFilterWriteCacheWithMinReplicaUsesTieredMarkTarget) {
     EnableTieredMigrationStrategy();
     cache_manager_->RegisterInstance(request_context_.get(),
@@ -3604,19 +3696,7 @@ TEST_F(CacheManagerTest, TestGenWriteLocationTieredRouting) {
                                      createLocationSpecInfos(),
                                      createModelDeployment(),
                                      std::vector<LocationSpecGroup>());
-    // 注册冷存储 cold_01（dummy）
-    {
-        auto spec = std::make_shared<DummyStorageSpec>();
-        spec->set_root_path("/tmp/kvcm_cold_p5/");
-        spec->set_key_count_per_file(1);
-        StorageConfig config;
-        config.set_type(DataStorageType::DATA_STORAGE_TYPE_DUMMY);
-        config.set_global_unique_name("cold_01");
-        config.set_storage_spec(spec);
-        ASSERT_EQ(EC_OK,
-                  registry_manager_->data_storage_manager()->RegisterStorage(
-                      request_context_.get(), "cold_01", config));
-    }
+    // cold_01 由 fixture 注册（dummy + MightExist=true）。
 
     CacheManager::KeyVector new_keys = {1, 2};
     std::vector<std::string_view> new_sgn;
@@ -3643,18 +3723,7 @@ TEST_F(CacheManagerTest, TestGenWriteLocationAllTieredDoesNotRequireDefaultStora
                                                createLocationSpecInfos(),
                                                createModelDeployment(),
                                                std::vector<LocationSpecGroup>()));
-    {
-        auto spec = std::make_shared<DummyStorageSpec>();
-        spec->set_root_path("/tmp/kvcm_cold_all_tiered/");
-        spec->set_key_count_per_file(1);
-        StorageConfig config;
-        config.set_type(DataStorageType::DATA_STORAGE_TYPE_DUMMY);
-        config.set_global_unique_name("cold_01");
-        config.set_storage_spec(spec);
-        ASSERT_EQ(EC_OK,
-                  registry_manager_->data_storage_manager()->RegisterStorage(
-                      request_context_.get(), "cold_01", config));
-    }
+    // cold_01 由 fixture 注册（dummy + MightExist=true）。
     ASSERT_EQ(EC_OK, registry_manager_->DisableStorage(request_context_.get(), "nfs_01"));
 
     CacheManager::KeyVector new_keys = {1, 2};
@@ -3677,6 +3746,8 @@ TEST_F(CacheManagerTest, TestGenWriteLocationAllTieredDoesNotRequireDefaultStora
 
 // FinishWriteCache 成功把本次 target CacheLocation 置为 SERVING 后清除 tiered-write mark
 TEST_F(CacheManagerTest, TestFinishWriteCacheClearsTieredMark) {
+    // 清标是 tiered migration 行为，仅对启用了 migration_strategies 的 group 生效（F-20）。
+    EnableTieredMigrationStrategy();
     cache_manager_->RegisterInstance(request_context_.get(),
                                      "default",
                                      "placeholder_id",
@@ -3720,6 +3791,8 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheFullBlockPolicyKeepsPartialMark) {
     ASSERT_TRUE(default_group != nullptr);
     default_group->cache_config_->set_migration_mark_clear_policy(
         MigrationMarkClearPolicy::CLEAR_ON_FULL_BLOCK_COVERED);
+    // 清标只对启用了 migration_strategies 的 group 生效（F-20）。
+    EnableTieredMigrationStrategy();
 
     cache_manager_->RegisterInstance(request_context_.get(),
                                      "default",
@@ -3777,6 +3850,54 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheFullBlockPolicyKeepsPartialMark) {
                                                static_cast<BlockMaskOffset>(1),
                                                std::move(remaining_info)));
     ASSERT_FALSE(cache_manager_->migration_manager()->IsMarkedForTieredWrite("full_policy_instance", 1));
+}
+
+// F-20: FinishWriteCache 的 mark 清理只对启用了 tiered migration 的 instance group 生效，
+// 与 FilterWriteCache 的 mark 消费入口对称。未配置 migration_strategies 的 group（例如 admin
+// 旁路直接打标）不应在 finish 时清标——这类 mark 由 MigrationManager 的超时线程兜底清理。
+// 旧实现用 `migration_manager_ != nullptr`（恒真）当门，会错误地对无策略 group 也清标。
+TEST_F(CacheManagerTest, TestFinishWriteCacheSkipsTieredMarkWhenMigrationDisabled) {
+    // 注意：默认 "default" group 未启用 migration 策略（未调用 EnableTieredMigrationStrategy）。
+    cache_manager_->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "tiered_disabled_finish",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     std::vector<LocationSpecGroup>());
+    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("tiered_disabled_finish");
+    ASSERT_TRUE(meta_searcher);
+
+    auto hot_loc = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("tp0", "dummy://hot/blk1?size=1")});
+    std::vector<std::string> hot_ids;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchAddLocation(request_context_.get(), {1}, {hot_loc}, hot_ids));
+
+    // 通过 admin 旁路直接打标（该 group 无策略）。
+    cache_manager_->migration_manager()->MarkForTieredWrite("tiered_disabled_finish", {1}, "cold_01");
+    ASSERT_TRUE(cache_manager_->migration_manager()->IsMarkedForTieredWrite("tiered_disabled_finish", 1));
+
+    // 构造一个 finish 后会 SERVING 且覆盖 spec 的冷层 target：旧代码（判空恒真）据此清标，
+    // 新代码因该 group 未启用 migration 而跳过整段，mark 应保留。
+    auto target_loc = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("tp0", "dummy://cold_01/blk1?size=1")});
+    std::vector<std::string> target_ids;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchAddLocation(request_context_.get(), {1}, {target_loc}, target_ids));
+    ASSERT_EQ(1u, target_ids.size());
+
+    auto info = std::make_unique<WriteLocationManager::WriteLocationInfo>();
+    info->keys = {1};
+    info->location_ids = {target_ids[0]};
+    BlockMask success_mask = static_cast<BlockMaskOffset>(1);
+    auto ec = cache_manager_->FinishWriteCache(
+        request_context_.get(), "tiered_disabled_finish", "sess_disabled", success_mask, std::move(info));
+    ASSERT_EQ(EC_OK, ec);
+    // 关键断言：未启用 migration 的 group，finish 不清标。
+    ASSERT_TRUE(cache_manager_->migration_manager()->IsMarkedForTieredWrite("tiered_disabled_finish", 1));
 }
 
 } // namespace kv_cache_manager

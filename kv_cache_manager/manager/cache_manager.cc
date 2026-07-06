@@ -128,10 +128,17 @@ IsSpecNameInSpecGroup(const std::string &trace_id,
 
 bool HasServingOrWritingLocOnStorage(const CacheLocationMap &loc_map,
                                      const std::string &storage_name,
-                                     const std::vector<std::string> &requested_spec_names = {}) {
-    for (const auto &[_, loc_ptr] : loc_map) {
+                                     const std::vector<std::string> &requested_spec_names = {},
+                                     const std::vector<std::string> &exclude_loc_ids = {}) {
+    for (const auto &[loc_id, loc_ptr] : loc_map) {
         if (!loc_ptr || (loc_ptr->status() != CacheLocationStatus::CLS_SERVING &&
                          loc_ptr->status() != CacheLocationStatus::CLS_WRITING)) {
+            continue;
+        }
+        // F-21: 跳过普通路径已判定为 stale(meta SERVING 但数据已丢)的 location——复用其 prune 结果，
+        // 避免把 stale 目标副本误判为"已满足"而跳过重写(不额外查一次后端 Exist)。
+        if (!exclude_loc_ids.empty() &&
+            std::find(exclude_loc_ids.begin(), exclude_loc_ids.end(), loc_id) != exclude_loc_ids.end()) {
             continue;
         }
         const auto &loc_specs = loc_ptr->location_specs();
@@ -286,6 +293,9 @@ bool CacheManager::Init(int32_t schedule_plan_executor_thread_count,
                                                             registry_manager_->data_storage_manager(),
                                                             metrics_registry_,
                                                             event_manager_);
+    // Invariant: migration_manager_ is always constructed here. Feature enablement is a per
+    // instance-group property (IsTieredMigrationEnabled), never expressed via pointer nullness.
+    assert(migration_manager_ != nullptr);
 
     cache_reclaimer_ = std::make_shared<CacheReclaimer>(cache_reclaimer_key_sampling_size_total,
                                                         cache_reclaimer_key_sampling_size_per_task,
@@ -913,7 +923,11 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
     KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, ManagerBatchUpdateLocation);
 
     // 多层存储 Mark 消费完成：仅当本次 target location 成功 SERVING 后，按配置策略清标。
-    if (migration_manager_ != nullptr && !success_batch_keys.empty()) {
+    // 仅处理启用了 tiered migration（配置了 migration_strategies）的 instance group，与
+    // FilterWriteCache 的 mark 消费入口保持对称；非分层 group 无 mark 可清（admin 旁路打的标由 timeout 兜底）。
+    const auto instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
+    if (!success_batch_keys.empty() &&
+        IsTieredMigrationEnabled(request_context, registry_manager_, instance_info)) {
         KeyVector mark_candidate_keys;
         std::vector<std::string> mark_candidate_location_ids;
         for (size_t i = 0; i < success_batch_keys.size(); ++i) {
@@ -931,7 +945,6 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
             static const BlockMask empty_block_mask = static_cast<size_t>(0);
             const auto get_loc_ec =
                 meta_searcher->BatchGetLocation(request_context, mark_candidate_keys, empty_block_mask, loc_maps);
-            auto instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
             if (get_loc_ec == EC_OK && loc_maps.size() == mark_candidate_keys.size()) {
                 for (size_t i = 0; i < mark_candidate_keys.size(); ++i) {
                     if (i >= tiered_targets.size() || tiered_targets[i].empty()) {
@@ -1040,16 +1053,8 @@ ErrorCode CacheManager::TrimCache(RequestContext *request_context,
 void CacheManager::PauseReclaimer() { cache_reclaimer_->Pause(); }
 void CacheManager::ResumeReclaimer() { cache_reclaimer_->Resume(); }
 
-void CacheManager::StartMigrationManager() {
-    if (migration_manager_) {
-        migration_manager_->Start();
-    }
-}
-void CacheManager::StopMigrationManager() {
-    if (migration_manager_) {
-        migration_manager_->Stop();
-    }
-}
+void CacheManager::StartMigrationManager() { migration_manager_->Start(); }
+void CacheManager::StopMigrationManager() { migration_manager_->Stop(); }
 
 void CacheManager::FilterLocationSpecByName(CacheLocationVector &locations,
                                             const std::vector<std::string> &location_spec_names) {
@@ -1153,12 +1158,12 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
     // When location_spec_group_names is provided, we check per-spec-group
     // coverage instead of block-level existence, allowing complementary
     // locations (e.g. KV-only and Mamba-only) to coexist in the same block.
-    std::shared_ptr<const InstanceInfo> instance_info;
-    if (!location_spec_group_names.empty() || migration_manager_ != nullptr) {
-        instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
-    }
+    // Fetched unconditionally: tiered_migration_enabled depends on it, so gating the fetch on
+    // "tiered enabled" would be circular. (Equivalent to prior behavior, which always fetched.)
+    std::shared_ptr<const InstanceInfo> instance_info =
+        registry_manager_->GetInstanceInfo(request_context, instance_id);
     const bool tiered_migration_enabled =
-        migration_manager_ != nullptr && IsTieredMigrationEnabled(request_context, registry_manager_, instance_info);
+        IsTieredMigrationEnabled(request_context, registry_manager_, instance_info);
     const std::vector<std::string> all_spec_names = BuildAllLocationSpecNames(instance_info);
 
     auto requestedSpecNames = [&](size_t i) -> const std::vector<std::string> * {
@@ -1208,8 +1213,9 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
             }
             exists_flags[i] =
                 spec_names == nullptr
-                    ? HasServingOrWritingLocOnStorage(location_maps[i], tiered_target_per_key[i])
-                    : HasServingOrWritingLocOnStorage(location_maps[i], tiered_target_per_key[i], *spec_names);
+                    ? HasServingOrWritingLocOnStorage(location_maps[i], tiered_target_per_key[i], {}, prune_loc_ids)
+                    : HasServingOrWritingLocOnStorage(
+                          location_maps[i], tiered_target_per_key[i], *spec_names, prune_loc_ids);
         }
     }
     if (!prune_keys.empty() && submit_del_req) {
@@ -1285,12 +1291,11 @@ ErrorCode CacheManager::FilterWriteCacheWithMinReplica(RequestContext *request_c
     KeyVector prune_keys;
     std::vector<std::vector<std::string>> prune_loc_ids_vec;
 
-    std::shared_ptr<const InstanceInfo> instance_info;
-    if (!location_spec_group_names.empty() || migration_manager_ != nullptr) {
-        instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
-    }
+    // Fetched unconditionally: tiered_migration_enabled depends on instance_info (see FilterWriteCache above).
+    std::shared_ptr<const InstanceInfo> instance_info =
+        registry_manager_->GetInstanceInfo(request_context, instance_id);
     const bool tiered_migration_enabled =
-        migration_manager_ != nullptr && IsTieredMigrationEnabled(request_context, registry_manager_, instance_info);
+        IsTieredMigrationEnabled(request_context, registry_manager_, instance_info);
     const std::vector<std::string> all_spec_names = BuildAllLocationSpecNames(instance_info);
 
     static const std::vector<std::string> empty_spec_names;
@@ -1326,7 +1331,8 @@ ErrorCode CacheManager::FilterWriteCacheWithMinReplica(RequestContext *request_c
         exists_flags[i] = existsForWrite(i, location_maps[i], prune_loc_ids);
         if (!prune_loc_ids.empty()) {
             prune_keys.emplace_back(keys[i]);
-            prune_loc_ids_vec.emplace_back(std::move(prune_loc_ids));
+            // 复制而非 move：下方 tiered 检查还要用 prune_loc_ids 排除 stale 目标副本(F-21)。
+            prune_loc_ids_vec.emplace_back(prune_loc_ids);
         }
         if (!tiered_target_per_key[i].empty()) {
             const std::vector<std::string> *spec_names = &empty_spec_names;
@@ -1346,8 +1352,9 @@ ErrorCode CacheManager::FilterWriteCacheWithMinReplica(RequestContext *request_c
             }
             const bool target_satisfied =
                 spec_names->empty()
-                    ? HasServingOrWritingLocOnStorage(location_maps[i], tiered_target_per_key[i])
-                    : HasServingOrWritingLocOnStorage(location_maps[i], tiered_target_per_key[i], *spec_names);
+                    ? HasServingOrWritingLocOnStorage(location_maps[i], tiered_target_per_key[i], {}, prune_loc_ids)
+                    : HasServingOrWritingLocOnStorage(
+                          location_maps[i], tiered_target_per_key[i], *spec_names, prune_loc_ids);
             if (!target_satisfied) {
                 exists_flags[i] = false;
                 tiered_target_to_write[i] = tiered_target_per_key[i];

@@ -12,9 +12,12 @@
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
 #include "kv_cache_manager/common/timestamp_util.h"
+#include "kv_cache_manager/config/cache_config.h"
+#include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/leader_elector.h"
 #include "kv_cache_manager/config/node_endpoint_info.h"
 #include "kv_cache_manager/config/registry_manager.h"
+#include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
 #include "kv_cache_manager/manager/cache_manager.h"
 #include "kv_cache_manager/manager/cache_manager_metrics_recorder.h"
@@ -598,6 +601,36 @@ void AdminServiceImpl::MigrateCache(RequestContext *request_context,
         status->set_message("instance not found: " + instance_id);
         request_context->set_status_code(status->code());
         return;
+    }
+
+    // F-02: target storage 必须是已注册的 storage——COPY 需在其上分配空间，MARK 需要它可被写路径满足。
+    // 否则会静默降级（写回落热层）并留下永不被满足的 mark。上层直接拒绝，避免误导性的 accepted。
+    {
+        auto data_storage_manager = registry_manager_->data_storage_manager();
+        if (data_storage_manager == nullptr || data_storage_manager->GetDataStorageBackend(dst_name) == nullptr) {
+            status->set_code(proto::admin::INVALID_ARGUMENT);
+            status->set_message("target storage not registered: " + dst_name);
+            request_context->set_status_code(status->code());
+            return;
+        }
+    }
+
+    // F-01: MARK/BOTH 会写入 tiered-write mark，而写路径只在配置了 migration strategy 的 instance group
+    // 才消费该 mark（与 FilterWriteCache 的消费门 IsTieredMigrationEnabled 对齐）。无 strategy 时打标是
+    // "成功的 no-op"（持久化后永不被消费）。保守起见直接拒绝，避免向调用方返回误导性的 accepted。
+    if (do_mark) {
+        const auto group_name = registry_manager_->GetInstanceGroupName(instance_id);
+        auto [group_ec, instance_group] = registry_manager_->GetInstanceGroup(request_context, group_name);
+        const bool has_migration_strategy = group_ec == EC_OK && instance_group != nullptr &&
+                                            instance_group->cache_config() != nullptr &&
+                                            !instance_group->cache_config()->migration_strategies().empty();
+        if (!has_migration_strategy) {
+            status->set_code(proto::admin::INVALID_ARGUMENT);
+            status->set_message("MARK/BOTH requires a migration strategy configured on the instance group: " +
+                                instance_id);
+            request_context->set_status_code(status->code());
+            return;
+        }
     }
 
     // 1. 选候选 block_keys：显式 block_keys 优先；否则按 rule 采样 + 过滤

@@ -654,6 +654,15 @@ ErrorCode MigrationManager::MarkForTieredWrite(const std::string &instance_id,
     if (dst_storage_name.empty() || block_keys.empty()) {
         return EC_OK;
     }
+    // F-02: 目标 storage 必须是已注册的 storage。否则打标会产生"永不被满足"的 mark：
+    // 下次写入因目标不存在静默回落热层，且清标条件（目标覆盖 spec）永远不成立，mark 只能等超时。
+    // 在此统一拦截，覆盖 admin 与 reclaimer 两条打标路径。
+    if (data_storage_manager_ == nullptr || data_storage_manager_->GetDataStorageBackend(dst_storage_name) == nullptr) {
+        KVCM_LOG_WARN("MarkForTieredWrite: target storage [%s] not registered, skip marking (instance %s)",
+                      dst_storage_name.c_str(),
+                      instance_id.c_str());
+        return EC_NOENT;
+    }
     if (timeout_ms <= 0) {
         timeout_ms = MigrationMarkMethod::kDefaultTimeoutMs;
     }

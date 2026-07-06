@@ -183,6 +183,7 @@ public:
 TEST_F(MigrationManagerTest, TestMarkLifecycle) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
     ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "ml_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "ml_cold/"));
     // 持久化方案：打标前 block 必须已存在（有 location），否则 MA_SKIP 不打标。
     CreateSourceLocation(1, "hot_01", false, "a");
     CreateSourceLocation(2, "hot_01", false, "b");
@@ -215,9 +216,26 @@ TEST_F(MigrationManagerTest, TestMarkLifecycle) {
     ASSERT_EQ(2u, stats.active_marks); // best-effort = added - cleared
 }
 
+// F-02: 打标到未注册的 target storage 应失败（EC_NOENT）且不写入任何 mark，
+// 避免产生"永不被满足、只能等超时"的孤儿标记。覆盖 reclaimer 打标路径。
+TEST_F(MigrationManagerTest, TestMarkForTieredWriteRejectsUnregisteredTarget) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "mark_badtarget_hot/"));
+    CreateSourceLocation(1, "hot_01", false, "a");
+
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    ASSERT_EQ(ErrorCode::EC_NOENT, mgr.MarkForTieredWrite(kInstance, {1}, "unregistered_cold"));
+    ASSERT_FALSE(mgr.IsMarkedForTieredWrite(kInstance, 1));
+    ASSERT_EQ("", mgr.GetTieredWriteTarget(kInstance, 1));
+
+    auto stats = mgr.GetStats();
+    ASSERT_EQ(0u, stats.marks_added);
+}
+
 TEST_F(MigrationManagerTest, TestMarkConsumedEventIncludesTargetStorage) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
     ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "mark_event_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "mark_event_cold/"));
     CreateSourceLocation(4, "hot_01", false, "d");
 
     auto event_manager = std::make_shared<EventManager>();
@@ -253,6 +271,7 @@ TEST_F(MigrationManagerTest, TestMarkConsumedEventIncludesTargetStorage) {
 TEST_F(MigrationManagerTest, TestMarkExpiresLazilyOnLookup) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
     ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "mark_lazy_expire_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "mark_lazy_expire_cold/"));
     CreateSourceLocation(5, "hot_01", false, "e");
 
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
@@ -267,6 +286,7 @@ TEST_F(MigrationManagerTest, TestMarkExpiresLazilyOnLookup) {
 TEST_F(MigrationManagerTest, TestMarkExpiresByBackgroundCleanup) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
     ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "mark_bg_expire_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "mark_bg_expire_cold/"));
     CreateSourceLocation(6, "hot_01", false, "f");
 
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
@@ -280,6 +300,7 @@ TEST_F(MigrationManagerTest, TestMarkExpiresByBackgroundCleanup) {
 TEST_F(MigrationManagerTest, TestExpiredCleanupDoesNotClearRefreshedMark) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
     ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "mark_refresh_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "mark_refresh_cold/"));
     CreateSourceLocation(7, "hot_01", false, "g");
 
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
