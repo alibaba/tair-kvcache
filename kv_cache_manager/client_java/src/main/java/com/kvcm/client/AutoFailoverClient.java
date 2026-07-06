@@ -9,6 +9,7 @@ import org.slf4j.LoggerFactory;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Auto-failover MetaClient: gRPC primary → HTTP fallback → leader re-discovery + retry.
@@ -21,7 +22,7 @@ public class AutoFailoverClient implements MetaClient {
     private static final Logger LOG = LoggerFactory.getLogger(AutoFailoverClient.class);
     private static final long BASE_BACKOFF_MS = 100;
 
-    // Shared scheduler for delayed channel close (replaces per-call thread spawning)
+    // Shared scheduler for delayed channel close
     private static final ScheduledExecutorService CLOSE_SCHEDULER =
             Executors.newSingleThreadScheduledExecutor(r -> {
                 Thread t = new Thread(r, "kvcm-channel-close");
@@ -31,22 +32,20 @@ public class AutoFailoverClient implements MetaClient {
 
     private final MetaClientConfig config;
     private volatile GrpcMetaClient grpcClient;
-    private volatile String currentHost;
-    private volatile int currentPort;
+    private volatile LeaderAddress currentAddress;
     private volatile HttpMetaClient httpClient; // volatile: recreated on leader change
     private final LeaderDiscovery leaderDiscovery; // null if auto-discover disabled
     private final Object reconnectLock = new Object();
-    private volatile boolean closed;
+    private final AtomicBoolean closed = new AtomicBoolean(false);
 
     AutoFailoverClient(MetaClientConfig config) {
         this.config = config;
-        this.currentHost = config.getSeedAddress();
-        this.currentPort = config.getGrpcPort();
-        this.grpcClient = new GrpcMetaClient(currentHost, currentPort,
+        this.currentAddress = new LeaderAddress(config.getSeedAddress(), config.getGrpcPort());
+        this.grpcClient = new GrpcMetaClient(currentAddress.host, currentAddress.port,
                 config.getCallTimeoutMs());
 
         if (config.isHttpEnabled()) {
-            this.httpClient = new HttpMetaClient(currentHost, config.getHttpPort(),
+            this.httpClient = new HttpMetaClient(currentAddress.host, config.getHttpPort(),
                     config.getCallTimeoutMs());
         }
 
@@ -59,6 +58,15 @@ public class AutoFailoverClient implements MetaClient {
         } else {
             this.leaderDiscovery = null;
         }
+    }
+
+    /** Package-private: for testing with pre-built clients (e.g., InProcess gRPC). */
+    AutoFailoverClient(MetaClientConfig config, GrpcMetaClient grpcClient, HttpMetaClient httpClient) {
+        this.config = config;
+        this.currentAddress = new LeaderAddress(config.getSeedAddress(), config.getGrpcPort());
+        this.grpcClient = grpcClient;
+        this.httpClient = httpClient;
+        this.leaderDiscovery = null; // no leader discovery in test mode
     }
 
     // --- Instance management ---
@@ -149,10 +157,9 @@ public class AutoFailoverClient implements MetaClient {
 
     @Override
     public void close() throws Exception {
-        if (closed) {
+        if (!closed.compareAndSet(false, true)) {
             return;
         }
-        closed = true;
         if (leaderDiscovery != null) {
             leaderDiscovery.stop();
         }
@@ -174,7 +181,7 @@ public class AutoFailoverClient implements MetaClient {
     }
 
     private void ensureOpen() {
-        if (closed) {
+        if (closed.get()) {
             throw new IllegalStateException("Client is closed");
         }
     }
@@ -183,7 +190,7 @@ public class AutoFailoverClient implements MetaClient {
      * Core failover template:
      * 1. Try gRPC
      * 2. On SERVER_NOT_LEADER → discover leader → rebuild channel → retry (up to leaderRetryCount)
-     * 3. On gRPC IO error → fallback to HTTP if available
+     * 3. On gRPC IO error → fallback to HTTP if available (propagate SERVER_NOT_LEADER for re-discovery)
      */
     private <T> T withFailover(RpcCall<T> rpc) {
         ensureOpen();
@@ -221,6 +228,13 @@ public class AutoFailoverClient implements MetaClient {
                     LOG.warn("gRPC call failed with IO error, falling back to HTTP: {}", e.getMessage());
                     try {
                         return rpc.execute(http);
+                    } catch (ServerNotLeaderException httpNotLeader) {
+                        // Propagate SERVER_NOT_LEADER from HTTP path for re-discovery
+                        LOG.warn("HTTP fallback also returned SERVER_NOT_LEADER, triggering re-discovery");
+                        if (leaderDiscovery != null) {
+                            leaderDiscovery.triggerImmediateRefresh();
+                        }
+                        throw httpNotLeader;
                     } catch (Exception httpEx) {
                         LOG.error("Both gRPC and HTTP transports failed", httpEx);
                         throw new KvcmException(ErrorCode.IO_ERROR,
@@ -240,11 +254,11 @@ public class AutoFailoverClient implements MetaClient {
         }
         LeaderAddress leaderAddr = leaderDiscovery.getCurrentAddress();
         synchronized (reconnectLock) {
-            if (leaderAddr.host.equals(currentHost) && leaderAddr.port == currentPort) {
+            if (leaderAddr.equals(currentAddress)) {
                 return;
             }
             LOG.info("Reconnecting from {}:{} to {}:{}",
-                    currentHost, currentPort, leaderAddr.host, leaderAddr.port);
+                    currentAddress.host, currentAddress.port, leaderAddr.host, leaderAddr.port);
 
             // Replace gRPC client
             GrpcMetaClient oldGrpc = grpcClient;
@@ -257,8 +271,7 @@ public class AutoFailoverClient implements MetaClient {
                         config.getCallTimeoutMs());
             }
 
-            currentHost = leaderAddr.host;
-            currentPort = leaderAddr.port;
+            currentAddress = leaderAddr;
 
             // Delayed close of old clients via shared scheduler
             scheduleClose(oldGrpc);

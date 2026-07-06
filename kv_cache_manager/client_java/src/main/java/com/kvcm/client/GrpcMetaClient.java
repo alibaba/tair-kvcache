@@ -27,7 +27,7 @@ public class GrpcMetaClient implements MetaClient {
         this.callTimeoutMs = callTimeoutMs;
         // C3 fix: Add gRPC-level retry policy matching C++ client behavior
         java.util.Map<String, Object> retryPolicy = new java.util.HashMap<>();
-        retryPolicy.put("maxAttempts", 3.0);
+        retryPolicy.put("maxAttempts", 3);
         retryPolicy.put("initialBackoff", "0.1s");
         retryPolicy.put("maxBackoff", "1s");
         retryPolicy.put("backoffMultiplier", 1.5);
@@ -47,7 +47,7 @@ public class GrpcMetaClient implements MetaClient {
 
         this.channel = ManagedChannelBuilder.forAddress(host, port)
                 .usePlaintext()
-                .maxInboundMessageSize(-1)
+                .maxInboundMessageSize(Integer.MAX_VALUE)
                 .defaultServiceConfig(serviceConfig)
                 .enableRetry()
                 .keepAliveTime(10, TimeUnit.SECONDS)
