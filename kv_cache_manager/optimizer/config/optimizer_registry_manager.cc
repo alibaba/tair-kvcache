@@ -126,6 +126,15 @@ ErrorCode OptimizerRegistryManager::RemoveInstanceGroup(const std::string &group
         return EC_NOENT;
     }
 
+    for (const auto &[instance_id, info] : instance_infos_) {
+        if (info && info->instance_group_name() == group_name) {
+            KVCM_LOG_ERROR("OptimizerRegistryManager: cannot remove instance group[%s], instance[%s] still exists",
+                           group_name.c_str(),
+                           instance_id.c_str());
+            return EC_BADARGS;
+        }
+    }
+
     if (storage_) {
         auto ec = LoadAndDelete(kOptInstanceGroupKey, group_name);
         if (ec != EC_OK) {

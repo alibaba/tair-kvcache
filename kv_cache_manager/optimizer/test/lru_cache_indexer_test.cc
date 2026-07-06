@@ -165,6 +165,21 @@ TEST_F(LruCacheIndexerTest, LinearStepGrouping) {
     EXPECT_EQ(2, hit_count[0]);
 }
 
+TEST_F(LruCacheIndexerTest, LinearStepColdAllMissReturnsZeroForCapacitiesAndMaxCache) {
+    LruCacheIndexer indexer(true);
+    constexpr int64_t kOneGB = 1024LL * 1024 * 1024;
+    indexer.Init({10.0, 20.0}, kOneGB / 2, kOneGB, 2);
+
+    std::vector<int64_t> hit_count;
+    int64_t max_hit;
+    indexer.ProcessKeys({1, 2, 3, 4}, hit_count, max_hit);
+
+    ASSERT_EQ(2u, hit_count.size());
+    EXPECT_EQ(0, hit_count[0]);
+    EXPECT_EQ(0, hit_count[1]);
+    EXPECT_EQ(0, max_hit);
+}
+
 TEST_F(LruCacheIndexerTest, LinearStepBoundaryChargeMismatch) {
     LruCacheIndexer indexer(0);
     constexpr int64_t kOneGB = 1024LL * 1024 * 1024;

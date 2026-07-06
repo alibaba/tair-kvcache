@@ -175,6 +175,30 @@ TEST_F(OptimizerServiceImplTest, RemoveInstanceGroup) {
     EXPECT_NE(proto::optimizer::OK, get_resp.header().status().code());
 }
 
+TEST_F(OptimizerServiceImplTest, RemoveInstanceGroupWithRegisteredInstanceFails) {
+    CreateTestGroup("grp_with_inst");
+
+    auto reg_req = MakeRegisterRequest("grp_with_inst", "inst1", 1024);
+    proto::optimizer::OptimizerRegisterInstanceResponse reg_resp;
+    RequestContext ctx("trace1", nullptr);
+    service_->RegisterInstance(&ctx, &reg_req, &reg_resp);
+    ASSERT_EQ(proto::optimizer::OK, reg_resp.header().status().code());
+
+    proto::optimizer::RemoveInstanceGroupRequest req;
+    req.set_trace_id("t1");
+    req.set_name("grp_with_inst");
+    proto::optimizer::CommonResponse resp;
+    service_->RemoveInstanceGroup(&ctx, &req, &resp);
+    EXPECT_EQ(proto::optimizer::INVALID_ARGUMENT, resp.header().status().code());
+
+    proto::optimizer::GetInstanceGroupRequest get_req;
+    get_req.set_trace_id("t2");
+    get_req.set_name("grp_with_inst");
+    proto::optimizer::GetInstanceGroupResponse get_resp;
+    service_->GetInstanceGroup(&ctx, &get_req, &get_resp);
+    EXPECT_EQ(proto::optimizer::OK, get_resp.header().status().code());
+}
+
 TEST_F(OptimizerServiceImplTest, ListInstanceGroups) {
     CreateTestGroup("list_g1");
     CreateTestGroup("list_g2");

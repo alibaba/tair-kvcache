@@ -143,8 +143,9 @@ void LruCacheIndexer::ProcessKeysLinearAttention(const std::vector<int64_t> &key
                                                  int64_t &max_hit_count) {
     const size_t num_caps = caches_.size();
     const int64_t total_keys = static_cast<int64_t>(keys.size());
-    hit_count.assign(num_caps, total_keys);
-    max_hit_count = max_cache_ ? total_keys : -1;
+    std::vector<int64_t> first_miss(num_caps, total_keys);
+    max_hit_count = max_cache_ ? 0 : -1;
+    int64_t max_first_miss = total_keys;
 
     std::vector<int64_t> last_checkpoint(num_caps, -1);
     int64_t max_last_checkpoint = -1;
@@ -159,24 +160,24 @@ void LruCacheIndexer::ProcessKeysLinearAttention(const std::vector<int64_t> &key
         for (size_t j = 0; j < num_caps; j++) {
             bool is_checkpoint = false;
             if (LookupAndInsert(caches_[j].get(), key_sv, is_linear, desired_charge, is_new_key, is_checkpoint)) {
-                if (is_checkpoint && i < hit_count[j]) {
+                if (is_checkpoint && i < first_miss[j]) {
                     last_checkpoint[j] = i;
                 }
             } else {
-                if (i < hit_count[j]) {
-                    hit_count[j] = i;
+                if (i < first_miss[j]) {
+                    first_miss[j] = i;
                 }
             }
         }
         if (max_cache_) {
             bool is_checkpoint = false;
             if (LookupAndInsert(max_cache_.get(), key_sv, is_linear, desired_charge, is_new_key, is_checkpoint)) {
-                if (is_checkpoint && i < max_hit_count) {
+                if (is_checkpoint && i < max_first_miss) {
                     max_last_checkpoint = i;
                 }
             } else {
-                if (i < max_hit_count) {
-                    max_hit_count = i;
+                if (i < max_first_miss) {
+                    max_first_miss = i;
                 }
             }
         }
@@ -186,18 +187,15 @@ void LruCacheIndexer::ProcessKeysLinearAttention(const std::vector<int64_t> &key
         }
     }
 
+    hit_count.assign(num_caps, 0);
     for (size_t j = 0; j < num_caps; j++) {
-        if (last_checkpoint[j] >= 0 && last_checkpoint[j] < hit_count[j]) {
+        if (last_checkpoint[j] >= 0 && last_checkpoint[j] < first_miss[j]) {
             hit_count[j] = last_checkpoint[j] + 1;
-        } else {
-            hit_count[j] = 0;
         }
     }
-    if (max_hit_count >= 0) {
-        if (max_last_checkpoint >= 0 && max_last_checkpoint < max_hit_count) {
+    if (max_cache_) {
+        if (max_last_checkpoint >= 0 && max_last_checkpoint < max_first_miss) {
             max_hit_count = max_last_checkpoint + 1;
-        } else {
-            max_hit_count = 0;
         }
     }
 }
@@ -241,10 +239,10 @@ int64_t LruCacheIndexer::kv_cache_usage_bytes() const {
 int64_t LruCacheIndexer::memory_usage_bytes() const {
     int64_t total = 0;
     for (const auto &cache : caches_) {
-        total += static_cast<int64_t>(cache->GetOccupancyCount()) * 200;
+        total += static_cast<int64_t>(cache->GetOccupancyCount()) * kEstimatedCacheEntryOverheadBytes;
     }
     if (max_cache_) {
-        total += static_cast<int64_t>(max_cache_->GetOccupancyCount()) * 200;
+        total += static_cast<int64_t>(max_cache_->GetOccupancyCount()) * kEstimatedCacheEntryOverheadBytes;
     }
     return total;
 }

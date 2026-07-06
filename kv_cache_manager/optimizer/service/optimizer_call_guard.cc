@@ -7,6 +7,8 @@
 #include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/optimizer/service/metrics/optimizer_metrics_collector.h"
 #include "kv_cache_manager/optimizer/service/metrics/optimizer_metrics_reporter.h"
+#include "rapidjson/stringbuffer.h"
+#include "rapidjson/writer.h"
 
 namespace kv_cache_manager {
 
@@ -28,12 +30,23 @@ OptimizerCallGuard::~OptimizerCallGuard() {
 
     if (request_context_) {
         int64_t cost_us = TimestampUtil::GetCurrentTimeUs() - request_context_->request_begin_time_us();
-        std::string log = "{\"api_name\":\"" + request_context_->api_name() + "\",\"trace_id\":\"" +
-                          request_context_->trace_id() + "\",\"request_id\":\"" + request_context_->request_id() +
-                          "\",\"client_ip\":\"" + request_context_->client_ip() +
-                          "\",\"status_code\":" + std::to_string(request_context_->status_code()) +
-                          ",\"cost_us\":" + std::to_string(cost_us) + "}";
-        KVCM_ACCESS_LOG(log);
+        rapidjson::StringBuffer buffer;
+        rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+        writer.StartObject();
+        writer.Key("api_name");
+        writer.String(request_context_->api_name());
+        writer.Key("trace_id");
+        writer.String(request_context_->trace_id());
+        writer.Key("request_id");
+        writer.String(request_context_->request_id());
+        writer.Key("client_ip");
+        writer.String(request_context_->client_ip());
+        writer.Key("status_code");
+        writer.Int(request_context_->status_code());
+        writer.Key("cost_us");
+        writer.Int64(cost_us);
+        writer.EndObject();
+        KVCM_ACCESS_LOG(buffer.GetString());
     }
 }
 

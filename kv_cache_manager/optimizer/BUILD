@@ -87,6 +87,7 @@ cc_library(
         ":optimizer_metrics_collector",
         ":optimizer_metrics_reporter",
         "//kv_cache_manager/common",
+        "@rapidjson",
     ],
 )
 

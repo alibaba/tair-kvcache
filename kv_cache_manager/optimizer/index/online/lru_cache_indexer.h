@@ -31,6 +31,9 @@ public:
     bool RemoveKey(int64_t key) override;
 
 private:
+    // Coarse bookkeeping estimate for the online simulation metadata per cached key.
+    static constexpr int64_t kEstimatedCacheEntryOverheadBytes = 200;
+
     void RebuildCaches();
     void
     ProcessKeysFullAttention(const std::vector<int64_t> &keys, std::vector<int64_t> &hit_count, int64_t &max_hit_count);
