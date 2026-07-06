@@ -23,7 +23,6 @@ public:
                                                         const std::vector<int64_t> &keys,
                                                         const std::vector<int64_t> &tokens,
                                                         const BlockMask &block_mask,
-                                                        int32_t sw_size,
                                                         const std::vector<std::string> &location_spec_names,
                                                         const MatchLocationOptions &options) override;
 

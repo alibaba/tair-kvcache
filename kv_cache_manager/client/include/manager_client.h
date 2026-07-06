@@ -22,6 +22,21 @@ public:
                                                         const std::vector<int64_t> &keys,
                                                         const std::vector<int64_t> &tokens,
                                                         const BlockMask &block_mask,
+                                                        const std::vector<std::string> &location_spec_names) {
+        return MatchLocation(trace_id,
+                             query_type,
+                             keys,
+                             tokens,
+                             block_mask,
+                             location_spec_names,
+                             MatchLocationOptions{});
+    }
+
+    std::pair<ClientErrorCode, Locations> MatchLocation(const std::string &trace_id,
+                                                        QueryType query_type,
+                                                        const std::vector<int64_t> &keys,
+                                                        const std::vector<int64_t> &tokens,
+                                                        const BlockMask &block_mask,
                                                         int32_t sw_size,
                                                         const std::vector<std::string> &location_spec_names) {
         return MatchLocation(trace_id,
@@ -29,19 +44,17 @@ public:
                              keys,
                              tokens,
                              block_mask,
-                             sw_size,
                              location_spec_names,
-                             MatchLocationOptions{});
+                             MatchLocationOptions::WithSlideWindowSize(sw_size));
     }
 
-    // MatchLocationOptions optionally collects stored per-block checksums in parallel
-    // to the returned Locations for later LoadKvCaches verification.
+    // MatchLocationOptions carries optional query controls such as slide-window
+    // size and checksum collection for later LoadKvCaches verification.
     virtual std::pair<ClientErrorCode, Locations> MatchLocation(const std::string &trace_id,
                                                                 QueryType query_type,
                                                                 const std::vector<int64_t> &keys,
                                                                 const std::vector<int64_t> &tokens,
                                                                 const BlockMask &block_mask,
-                                                                int32_t sw_size,
                                                                 const std::vector<std::string> &location_spec_names,
                                                                 const MatchLocationOptions &options) = 0;
 

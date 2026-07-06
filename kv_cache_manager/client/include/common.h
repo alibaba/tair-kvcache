@@ -192,13 +192,23 @@ struct TransferTraceInfo {
     std::vector<std::string> block_ids; // block_ids.size() must be equal to block_buffer.size()
 };
 
-// Optional operation metadata keeps integrity controls out of the hot-path
+// Optional operation controls keep rarely used knobs out of the hot-path
 // parameter list while leaving default calls concise.
 struct MatchLocationOptions {
+    // Slide-window size for QT_REVERSE_ROLL_SW_MATCH. The default keeps the
+    // existing non-window query behavior.
+    int32_t sw_size{-1};
     std::vector<int64_t> *out_checksums{nullptr};
 
-    static MatchLocationOptions CollectChecksums(std::vector<int64_t> &checksums) {
+    static MatchLocationOptions WithSlideWindowSize(int32_t sw_size) {
         MatchLocationOptions options;
+        options.sw_size = sw_size;
+        return options;
+    }
+
+    static MatchLocationOptions CollectChecksums(std::vector<int64_t> &checksums, int32_t sw_size = -1) {
+        MatchLocationOptions options;
+        options.sw_size = sw_size;
         options.out_checksums = &checksums;
         return options;
     }

@@ -55,7 +55,6 @@ public:
                                                         const std::vector<int64_t> &,
                                                         const std::vector<int64_t> &,
                                                         const BlockMask &,
-                                                        int32_t,
                                                         const std::vector<std::string> &,
                                                         const MatchLocationOptions &options) override {
         last_match_location_options = options;
@@ -170,9 +169,16 @@ TEST(ClientOptionsTest, ManagerConvenienceOverloadsForwardOptions) {
     const BlockBuffers buffers = {BlockBuffer{}};
 
     EXPECT_EQ(ER_OK,
-              client.MatchLocation(
-                        trace_id, QueryType::QT_PREFIX_MATCH, keys, tokens, block_mask, 0, spec_names)
+              client.MatchLocation(trace_id, QueryType::QT_PREFIX_MATCH, keys, tokens, block_mask, spec_names)
                   .first);
+    EXPECT_EQ(-1, client.last_match_location_options.sw_size);
+    EXPECT_EQ(nullptr, client.last_match_location_options.out_checksums);
+
+    EXPECT_EQ(ER_OK,
+              client.MatchLocation(
+                        trace_id, QueryType::QT_REVERSE_ROLL_SW_MATCH, keys, tokens, block_mask, 7, spec_names)
+                  .first);
+    EXPECT_EQ(7, client.last_match_location_options.sw_size);
     EXPECT_EQ(nullptr, client.last_match_location_options.out_checksums);
 
     std::vector<int64_t> match_location_checksums;
@@ -182,10 +188,10 @@ TEST(ClientOptionsTest, ManagerConvenienceOverloadsForwardOptions) {
                                    keys,
                                    tokens,
                                    block_mask,
-                                   0,
                                    spec_names,
-                                   MatchLocationOptions::CollectChecksums(match_location_checksums))
+                                   MatchLocationOptions::CollectChecksums(match_location_checksums, 8))
                   .first);
+    EXPECT_EQ(8, client.last_match_location_options.sw_size);
     EXPECT_EQ(&match_location_checksums, client.last_match_location_options.out_checksums);
 
     EXPECT_EQ(ER_OK, client.FinishWrite(trace_id, "session", block_mask, locations));

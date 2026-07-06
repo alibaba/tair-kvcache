@@ -408,9 +408,9 @@ TEST_F(MetaClientTest, TestMatchLocationOptionsForwardToStub) {
                                                            keys,
                                                            tokens,
                                                            block_mask,
-                                                           sw_size,
                                                            spec_names,
-                                                           MatchLocationOptions::CollectChecksums(out_checksums));
+                                                           MatchLocationOptions::CollectChecksums(out_checksums,
+                                                                                                  sw_size));
     EXPECT_EQ(ER_OK, ec);
     EXPECT_EQ(locations, result_locations);
     EXPECT_THAT(out_checksums, ::testing::ElementsAre(0x11, 0x22));

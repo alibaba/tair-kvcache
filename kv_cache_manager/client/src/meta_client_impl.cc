@@ -102,9 +102,9 @@ std::pair<ClientErrorCode, Locations> MetaClientImpl::MatchLocation(const std::s
                                                                     const std::vector<int64_t> &keys,
                                                                     const std::vector<int64_t> &tokens,
                                                                     const BlockMask &block_mask,
-                                                                    int32_t sw_size,
                                                                     const std::vector<std::string> &location_spec_names,
                                                                     const MatchLocationOptions &options) {
+    const int32_t sw_size = options.sw_size;
     KVCM_LOG_DEBUG("match location with trace_id [%s], query_type [%d], keys %s, tokens %s, block_mask %s, sw_size "
                    "[%d], location_spec_names %s",
                    trace_id.c_str(),
