@@ -466,12 +466,20 @@ void MigrationManager::CompleteCopyTaskAsFailed(const CopyTaskContext &ctx, cons
 
 void MigrationManager::OnTaskSuccess(const std::string &instance_id, int64_t block_key) {
     CopyTaskContext ctx;
+    ClaimResult claim;
     {
         std::lock_guard<std::mutex> lock(task_mutex_);
-        if (!FindActiveTaskLocked(instance_id, block_key, ctx)) {
-            return; // 已被取消或处理过
-        }
+        claim = ClaimForCompletionLocked(instance_id, block_key, ctx);
     }
+    if (claim == ClaimResult::kNotFound || claim == ClaimResult::kBusyCompleting) {
+        return; // 已处理过 / 完成认领中
+    }
+    if (claim == ClaimResult::kWasCancelling) {
+        // F-11: 用户已取消。copy 虽成功也丢弃：不 promote、不删源，删掉仍为 WRITING 的目标半成品。
+        CompleteCancelledTask(ctx);
+        return;
+    }
+    // kClaimedRunning：状态已在锁内置 kCompleting，并发 Cancel 会走 busy 分支。
 
     if (!IsSourceLocationServing(ctx)) {
         KVCM_LOG_WARN("migration source lost, block_key %ld src_loc %s, discard dst_loc %s",
@@ -542,11 +550,18 @@ void MigrationManager::OnTaskSuccess(const std::string &instance_id, int64_t blo
 
 void MigrationManager::OnTaskFailed(const std::string &instance_id, int64_t block_key, ErrorCode reason) {
     CopyTaskContext ctx;
+    ClaimResult claim;
     {
         std::lock_guard<std::mutex> lock(task_mutex_);
-        if (!FindActiveTaskLocked(instance_id, block_key, ctx)) {
-            return;
-        }
+        claim = ClaimForCompletionLocked(instance_id, block_key, ctx);
+    }
+    if (claim == ClaimResult::kNotFound || claim == ClaimResult::kBusyCompleting) {
+        return;
+    }
+    if (claim == ClaimResult::kWasCancelling) {
+        // F-11: 已取消，无论 copy 结果如何一律按取消收尾（清 WRITING 目标，记 cancelled 终态）。
+        CompleteCancelledTask(ctx);
+        return;
     }
 
     // 失败：CAS 目标 WRITING -> DELETING 并删除目标半成品，源端不动。
@@ -933,20 +948,17 @@ void MigrationManager::ProcessExpiredMarks() {
     }
 }
 
-ErrorCode MigrationManager::Cancel(const std::string &instance_id, int64_t block_key) {
-    CopyTaskContext ctx;
+void MigrationManager::CompleteCancelledTask(const CopyTaskContext &ctx) {
+    // F-11: 取消任务的延迟收尾（monitor 线程，认领到 kWasCancelling 时调用）。
+    // 目标此时仍为 WRITING（cancelling 任务从未被 promote）；CAS WRITING->DELETING 删半成品，源端不动。
+    SubmitTargetLocationDelete(ctx);
     {
         std::lock_guard<std::mutex> lock(task_mutex_);
-        if (!FindActiveTaskLocked(instance_id, block_key, ctx)) {
-            return EC_NOENT;
-        }
-        RemoveActiveTaskLocked(instance_id, block_key);
+        RemoveActiveTaskLocked(ctx.instance_id, ctx.block_key);
     }
-    // 清理目标半成品（CAS WRITING->DELETING + 删除）。源端不动。
-    SubmitTargetLocationDelete(ctx);
     stat_copy_cancelled_.fetch_add(1, std::memory_order_relaxed);
-    // F-16: cancelled 是与 success/failed 对称的终态，补 metric + event，使 submitted 可对账
-    // （submitted == success + failed + cancelled），并让离线分析看到取消事件。
+    // cancelled 是与 success/failed 对称的终态（F-16）：在实际清理时计数，保 submitted==success+failed+cancelled。
+    // 被取消任务无论底层 copy 成/败一律记 cancelled（用户意图优先）。
     const int64_t duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                     std::chrono::steady_clock::now() - ctx.submit_time)
                                     .count();
@@ -965,11 +977,40 @@ ErrorCode MigrationManager::Cancel(const std::string &instance_id, int64_t block
                               /*fail_reason=*/"cancelled");
         event_manager_->Publish(ev);
     }
-    KVCM_LOG_INFO("migration cancelled: instance %s block_key %ld dst_loc %s",
+    KVCM_LOG_INFO("migration cancelled (deferred cleanup): instance %s block_key %ld dst_loc %s",
                   ctx.instance_id.c_str(),
-                  block_key,
+                  ctx.block_key,
                   ctx.dst_location_id.c_str());
-    return EC_OK;
+}
+
+ErrorCode MigrationManager::Cancel(const std::string &instance_id, int64_t block_key) {
+    // F-11: 仅标记 cancelling，不立即删目标 / 不移除任务。收尾推迟到 copy future 完成时由 monitor
+    // 经 OnTaskSuccess/OnTaskFailed 认领到 kWasCancelling 后调 CompleteCancelledTask 执行——
+    // 规避 cancel 与 promote 并发误删刚提升的目标，且无需 backend cancel token（copy 跑完再清）。
+    // cancelling 期间任务仍在活跃表：HasActiveTaskLocked 挡重复 Submit，HasActiveCopyTargetLocation
+    // 继续保护该 WRITING 目标不被 reclaimer 提前回收（避免双清理）。
+    CancelResult result;
+    {
+        std::lock_guard<std::mutex> lock(task_mutex_);
+        result = MarkCancellingLocked(instance_id, block_key);
+    }
+    switch (result) {
+    case CancelResult::kNotFound:
+        return EC_NOENT;
+    case CancelResult::kBusyCompleting:
+        KVCM_LOG_INFO("[cancel] instance %s block_key %ld already completing, cancel too late",
+                      instance_id.c_str(),
+                      block_key);
+        return EC_EXIST; // 完成中，取消太晚；迁移将照常完成
+    case CancelResult::kMarked:
+        KVCM_LOG_INFO("[cancel] instance %s block_key %ld marked cancelling; cleanup deferred to copy completion",
+                      instance_id.c_str(),
+                      block_key);
+        return EC_OK;
+    case CancelResult::kAlreadyCancelling:
+        return EC_OK; // 幂等
+    }
+    return EC_OK; // 不可达
 }
 
 std::vector<ErrorCode> MigrationManager::BatchCancel(const std::string &instance_id,
@@ -1010,24 +1051,54 @@ bool MigrationManager::RemoveActiveTaskLocked(const std::string &instance_id, in
     return true;
 }
 
-bool MigrationManager::FindActiveTaskLocked(const std::string &instance_id,
-                                            int64_t block_key,
-                                            CopyTaskContext &out_ctx) const {
-    auto instance_iter = active_tasks_by_instance_.find(instance_id);
-    if (instance_iter == active_tasks_by_instance_.end()) {
-        return false;
-    }
-    auto task_iter = instance_iter->second.find(block_key);
-    if (task_iter == instance_iter->second.end()) {
-        return false;
-    }
-    out_ctx = task_iter->second;
-    return true;
-}
-
 bool MigrationManager::HasActiveTaskLocked(const std::string &instance_id, int64_t block_key) const {
     auto instance_iter = active_tasks_by_instance_.find(instance_id);
     return instance_iter != active_tasks_by_instance_.end() && instance_iter->second.count(block_key) > 0;
+}
+
+MigrationManager::ClaimResult MigrationManager::ClaimForCompletionLocked(const std::string &instance_id,
+                                                                        int64_t block_key,
+                                                                        CopyTaskContext &out_ctx) {
+    auto instance_iter = active_tasks_by_instance_.find(instance_id);
+    if (instance_iter == active_tasks_by_instance_.end()) {
+        return ClaimResult::kNotFound;
+    }
+    auto task_iter = instance_iter->second.find(block_key);
+    if (task_iter == instance_iter->second.end()) {
+        return ClaimResult::kNotFound;
+    }
+    CopyTaskContext &task = task_iter->second;
+    if (task.state == CopyTaskState::kCancelling) {
+        out_ctx = task; // 交由 CompleteCancelledTask 收尾（删 WRITING 目标、不 promote）
+        return ClaimResult::kWasCancelling;
+    }
+    if (task.state == CopyTaskState::kCompleting) {
+        return ClaimResult::kBusyCompleting; // 防御：完成路径仅单一 monitor 线程，正常不会重入
+    }
+    task.state = CopyTaskState::kCompleting; // 认领：此后并发 Cancel 走 busy 分支
+    out_ctx = task;
+    return ClaimResult::kClaimedRunning;
+}
+
+MigrationManager::CancelResult MigrationManager::MarkCancellingLocked(const std::string &instance_id,
+                                                                     int64_t block_key) {
+    auto instance_iter = active_tasks_by_instance_.find(instance_id);
+    if (instance_iter == active_tasks_by_instance_.end()) {
+        return CancelResult::kNotFound;
+    }
+    auto task_iter = instance_iter->second.find(block_key);
+    if (task_iter == instance_iter->second.end()) {
+        return CancelResult::kNotFound;
+    }
+    CopyTaskContext &task = task_iter->second;
+    if (task.state == CopyTaskState::kCompleting) {
+        return CancelResult::kBusyCompleting; // 完成中，取消太晚
+    }
+    if (task.state == CopyTaskState::kCancelling) {
+        return CancelResult::kAlreadyCancelling; // 幂等
+    }
+    task.state = CopyTaskState::kCancelling; // 标记；收尾推迟到 future 完成时由 monitor 执行
+    return CancelResult::kMarked;
 }
 
 bool MigrationManager::HasMigrationTask(const std::string &instance_id, int64_t block_key) const {

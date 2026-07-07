@@ -1,6 +1,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -602,6 +603,154 @@ TEST_F(MigrationManagerTest, TestSubmitThenFail) {
     ASSERT_EQ(CLS_SERVING, GetLocationStatus(block_key, src_loc));
     ASSERT_TRUE(mgr.IsMarkedForTieredWrite(kInstance, block_key));
     ASSERT_EQ(1u, mgr.GetStats().copy_failed);
+}
+
+// ============ F-11：Cancel 任务状态机（认领 + 延迟收尾） ============
+
+// Cancel 只标 cancelling、不立即清理；任务与 WRITING 目标保留（slot 保护）；待完成回调收尾。
+TEST_F(MigrationManagerTest, TestCancelDefersCleanupAndKeepsSlot) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "cancel_defer_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "cancel_defer_cold/"));
+
+    const int64_t block_key = 700;
+    const std::string src_loc = CreateSourceLocation(block_key, "hot_01", true, "data");
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    mgr.DebugEnableCopySubmissionsForTest();
+    MigrationManager::MigrationRequest req;
+    req.instance_id = kInstance;
+    req.block_key = block_key;
+    req.src_location_id = src_loc;
+    req.src_storage_name = "hot_01";
+    req.dst_storage_name = "cold_01";
+    ASSERT_EQ(ErrorCode::EC_OK, mgr.Submit("t", req));
+    const std::string dst_loc = mgr.GetActiveTaskDstLocation(kInstance, block_key);
+    ASSERT_EQ(CLS_WRITING, GetLocationStatus(block_key, dst_loc));
+
+    // Cancel：标记 cancelling，不删不移除。
+    ASSERT_EQ(ErrorCode::EC_OK, mgr.Cancel(kInstance, block_key));
+    ASSERT_TRUE(mgr.HasMigrationTask(kInstance, block_key));            // slot 保留
+    ASSERT_TRUE(mgr.HasActiveCopyTargetLocation(kInstance, block_key, dst_loc)); // 目标仍被保护
+    ASSERT_EQ(CLS_WRITING, GetLocationStatus(block_key, dst_loc));      // 目标未删
+
+    // cancelling 期间同 block 不接受新提交（slot 占用）。
+    ASSERT_EQ(ErrorCode::EC_EXIST, mgr.Submit("t2", req));
+
+    // 幂等：重复 Cancel 仍 OK。
+    ASSERT_EQ(ErrorCode::EC_OK, mgr.Cancel(kInstance, block_key));
+}
+
+// Cancel 后 copy 成功：不 promote、不删源，删 WRITING 目标，记 cancelled 终态。
+TEST_F(MigrationManagerTest, TestCancelThenSuccessDiscardsTarget) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "cancel_succ_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "cancel_succ_cold/"));
+
+    const int64_t block_key = 701;
+    const std::string src_loc = CreateSourceLocation(block_key, "hot_01", true, "data");
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    mgr.DebugEnableCopySubmissionsForTest();
+    MigrationManager::MigrationRequest req;
+    req.instance_id = kInstance;
+    req.block_key = block_key;
+    req.src_location_id = src_loc;
+    req.src_storage_name = "hot_01";
+    req.dst_storage_name = "cold_01";
+    req.retention = MigrationRetention::MIGRATION_RETENTION_DELETE_SOURCE;
+    ASSERT_EQ(ErrorCode::EC_OK, mgr.Submit("t", req));
+    const std::string dst_loc = mgr.GetActiveTaskDstLocation(kInstance, block_key);
+
+    ASSERT_EQ(ErrorCode::EC_OK, mgr.Cancel(kInstance, block_key));
+    // 完成回调认领到 cancelling → 走取消收尾。
+    mgr.OnTaskSuccess(kInstance, block_key);
+
+    ASSERT_FALSE(mgr.HasMigrationTask(kInstance, block_key));
+    // 目标未提升为 SERVING，而是被删（WRITING->DELETING，异步消失）。
+    ASSERT_TRUE(WaitFor([&]() { return GetLocationStatus(block_key, dst_loc) == CLS_NOT_FOUND; }));
+    ASSERT_NE(CLS_SERVING, GetLocationStatus(block_key, dst_loc));
+    // 源端不动。
+    ASSERT_EQ(CLS_SERVING, GetLocationStatus(block_key, src_loc));
+    // 记 cancelled 终态，非 completed。
+    const auto stats = mgr.GetStats();
+    ASSERT_EQ(1u, stats.copy_cancelled);
+    ASSERT_EQ(0u, stats.copy_completed);
+}
+
+// Cancel 后 copy 失败：仍按 cancelled 收尾（用户意图优先），不计 failed。
+TEST_F(MigrationManagerTest, TestCancelThenFailCountsCancelled) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "cancel_fail_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "cancel_fail_cold/"));
+
+    const int64_t block_key = 702;
+    const std::string src_loc = CreateSourceLocation(block_key, "hot_01", true, "data");
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    mgr.DebugEnableCopySubmissionsForTest();
+    MigrationManager::MigrationRequest req;
+    req.instance_id = kInstance;
+    req.block_key = block_key;
+    req.src_location_id = src_loc;
+    req.src_storage_name = "hot_01";
+    req.dst_storage_name = "cold_01";
+    ASSERT_EQ(ErrorCode::EC_OK, mgr.Submit("t", req));
+    const std::string dst_loc = mgr.GetActiveTaskDstLocation(kInstance, block_key);
+
+    ASSERT_EQ(ErrorCode::EC_OK, mgr.Cancel(kInstance, block_key));
+    mgr.OnTaskFailed(kInstance, block_key, ErrorCode::EC_IO_ERROR);
+
+    ASSERT_FALSE(mgr.HasMigrationTask(kInstance, block_key));
+    ASSERT_TRUE(WaitFor([&]() { return GetLocationStatus(block_key, dst_loc) == CLS_NOT_FOUND; }));
+    const auto stats = mgr.GetStats();
+    ASSERT_EQ(1u, stats.copy_cancelled);
+    ASSERT_EQ(0u, stats.copy_failed);
+}
+
+// 完成已认领(kCompleting)后 Cancel 太晚：返回 EC_EXIST，迁移照常完成。
+TEST_F(MigrationManagerTest, TestCancelWhileCompletingIsTooLate) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "cancel_late_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "cancel_late_cold/"));
+
+    const int64_t block_key = 703;
+    const std::string src_loc = CreateSourceLocation(block_key, "hot_01", true, "data");
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    mgr.DebugEnableCopySubmissionsForTest();
+    MigrationManager::MigrationRequest req;
+    req.instance_id = kInstance;
+    req.block_key = block_key;
+    req.src_location_id = src_loc;
+    req.src_storage_name = "hot_01";
+    req.dst_storage_name = "cold_01";
+    req.retention = MigrationRetention::MIGRATION_RETENTION_DELETE_SOURCE;
+    ASSERT_EQ(ErrorCode::EC_OK, mgr.Submit("t", req));
+    const std::string dst_loc = mgr.GetActiveTaskDstLocation(kInstance, block_key);
+
+    // 直接把状态置 kCompleting，模拟 monitor 正在收尾的窗口（测试经 -fno-access-control 访问私有）。
+    {
+        std::lock_guard<std::mutex> lock(mgr.task_mutex_);
+        mgr.active_tasks_by_instance_[kInstance][block_key].state =
+            MigrationManager::CopyTaskState::kCompleting;
+    }
+    ASSERT_EQ(ErrorCode::EC_EXIST, mgr.Cancel(kInstance, block_key)); // 太晚
+
+    // 复位为 kRunning 让完成路径正常收尾（验证迁移照常完成）。
+    {
+        std::lock_guard<std::mutex> lock(mgr.task_mutex_);
+        mgr.active_tasks_by_instance_[kInstance][block_key].state =
+            MigrationManager::CopyTaskState::kRunning;
+    }
+    mgr.OnTaskSuccess(kInstance, block_key);
+    ASSERT_EQ(CLS_SERVING, GetLocationStatus(block_key, dst_loc)); // 正常提升
+    ASSERT_FALSE(mgr.HasMigrationTask(kInstance, block_key));
+    ASSERT_EQ(1u, mgr.GetStats().copy_completed);
+}
+
+// Cancel 不存在的任务返回 EC_NOENT。
+TEST_F(MigrationManagerTest, TestCancelNonExistentReturnsNoent) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    mgr.DebugEnableCopySubmissionsForTest();
+    ASSERT_EQ(ErrorCode::EC_NOENT, mgr.Cancel(kInstance, 999999));
 }
 
 // ============ 端到端 copy 链路（启动监控线程 + DummyBackend 实测） ============

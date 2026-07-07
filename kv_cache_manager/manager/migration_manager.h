@@ -181,6 +181,13 @@ private:
     void DebugInsertActiveCopyTask(const std::string &instance_id, int64_t block_key, const std::string &dst_location_id);
     void DebugEnableCopySubmissionsForTest();
 
+    // F-11: 活跃 Copy 任务的收尾状态机。用于让外部 Cancel 线程与单一 monitor 完成线程在
+    // task_mutex_ 内原子认领"谁负责收尾"，避免 cancel 与 promote 并发误删刚提升的目标。
+    //   kRunning    —— copy 提交后、future 未完成，正常态；
+    //   kCompleting —— monitor 已认领完成（promote/失败清理进行中），此后 Cancel 太晚；
+    //   kCancelling —— 外部已请求取消，收尾推迟到 future 完成时由 monitor 执行（删 WRITING 目标、不 promote）。
+    enum class CopyTaskState { kRunning, kCompleting, kCancelling };
+
     // 单个活跃 Copy 任务的上下文。
     struct CopyTaskContext {
         std::string instance_id;
@@ -192,7 +199,8 @@ private:
         std::string dst_location_id;
         MigrationRetention retention = MigrationRetention::MIGRATION_RETENTION_DELETE_SOURCE;
         std::chrono::steady_clock::time_point submit_time;
-        uint64_t total_bytes = 0; // 源端各 spec 字节数之和（取自 uri size 参数）
+        uint64_t total_bytes = 0;              // 源端各 spec 字节数之和（取自 uri size 参数）
+        CopyTaskState state = CopyTaskState::kRunning; // F-11: 收尾认领状态
     };
 
     // 监控线程待处理的 copy future。
@@ -265,10 +273,20 @@ private:
     bool InsertActiveTaskLocked(CopyTaskContext ctx);
     // 移除 (instance, block) 的活跃任务；不存在返回 false。
     bool RemoveActiveTaskLocked(const std::string &instance_id, int64_t block_key);
-    // 查找 (instance, block) 的活跃任务；命中则拷贝到 out_ctx 并返回 true。
-    bool FindActiveTaskLocked(const std::string &instance_id, int64_t block_key, CopyTaskContext &out_ctx) const;
     // 仅判断 (instance, block) 是否已有活跃任务（存在性查询，不拷贝 ctx）。
     bool HasActiveTaskLocked(const std::string &instance_id, int64_t block_key) const;
+
+    // ---- F-11 收尾认领（均要求调用方持有 task_mutex_）----
+    enum class ClaimResult { kClaimedRunning, kWasCancelling, kBusyCompleting, kNotFound };
+    // monitor 完成路径认领：kRunning→置 kCompleting 并拷 ctx（kClaimedRunning）；
+    // kCancelling→拷 ctx 返回 kWasCancelling（不改状态，交由 CompleteCancelledTask 收尾）。
+    ClaimResult ClaimForCompletionLocked(const std::string &instance_id, int64_t block_key, CopyTaskContext &out_ctx);
+    enum class CancelResult { kMarked, kAlreadyCancelling, kBusyCompleting, kNotFound };
+    // 外部 Cancel 认领：kRunning→置 kCancelling（kMarked）；kCancelling→幂等；kCompleting→太晚。
+    CancelResult MarkCancellingLocked(const std::string &instance_id, int64_t block_key);
+    // 取消任务的延迟收尾（monitor 线程，入口不持锁）：删 WRITING 目标（源不动）+ 移除活跃任务
+    // + cancelled 终态 metric/event/log。仅由 OnTaskSuccess/OnTaskFailed 在认领到 kWasCancelling 时调用。
+    void CompleteCancelledTask(const CopyTaskContext &ctx);
 
     std::shared_ptr<SchedulePlanExecutor> schedule_plan_executor_;
     std::shared_ptr<MetaIndexerManager> meta_indexer_manager_;
