@@ -1,4 +1,4 @@
-package com.kvcm.client;
+package com.alibaba.tair.kvcm.client;
 
 import kv_cache_manager.proto.meta.MetaServiceOuterClass.*;
 

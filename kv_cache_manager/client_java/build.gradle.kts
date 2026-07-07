@@ -83,8 +83,37 @@ sourceSets {
             )
         }
     }
+    create("integrationTest") {
+        compileClasspath += sourceSets.main.get().output
+        runtimeClasspath += sourceSets.main.get().output
+    }
+}
+
+val integrationTestImplementation by configurations.getting {
+    extendsFrom(configurations.testImplementation.get())
+}
+
+val integrationTestRuntimeOnly by configurations.getting {
+    extendsFrom(configurations.testRuntimeOnly.get())
 }
 
 tasks.test {
     useJUnitPlatform()
+}
+
+tasks.register<Test>("integrationTest") {
+    description = "Runs integration tests against a real KVCM server."
+    group = "verification"
+    testClassesDirs = sourceSets["integrationTest"].output.classesDirs
+    classpath = sourceSets["integrationTest"].runtimeClasspath
+    useJUnitPlatform()
+    mustRunAfter(tasks.test)
+    
+    // Pass KVCM_BIN environment variable to tests
+    environment("KVCM_BIN", System.getenv("KVCM_BIN") ?: "")
+    
+    // Show test output
+    testLogging {
+        events("passed", "skipped", "failed", "standardOut", "standardError")
+    }
 }

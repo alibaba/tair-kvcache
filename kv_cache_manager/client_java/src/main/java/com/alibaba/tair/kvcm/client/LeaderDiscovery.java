@@ -1,6 +1,6 @@
-package com.kvcm.client;
+package com.alibaba.tair.kvcm.client;
 
-import com.kvcm.client.exception.KvcmException;
+import com.alibaba.tair.kvcm.client.exception.KvcmException;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import kv_cache_manager.proto.meta.MetaServiceGrpc;

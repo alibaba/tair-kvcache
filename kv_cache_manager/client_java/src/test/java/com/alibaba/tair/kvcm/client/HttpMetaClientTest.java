@@ -1,6 +1,6 @@
-package com.kvcm.client;
+package com.alibaba.tair.kvcm.client;
 
-import com.kvcm.client.exception.KvcmException;
+import com.alibaba.tair.kvcm.client.exception.KvcmException;
 import com.google.protobuf.util.JsonFormat;
 import kv_cache_manager.proto.meta.MetaServiceOuterClass.*;
 import okhttp3.mockwebserver.MockResponse;

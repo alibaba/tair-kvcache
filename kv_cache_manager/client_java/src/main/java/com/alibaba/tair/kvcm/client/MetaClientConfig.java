@@ -1,4 +1,4 @@
-package com.kvcm.client;
+package com.alibaba.tair.kvcm.client;
 
 /**
  * Configuration for KVCM MetaClient.

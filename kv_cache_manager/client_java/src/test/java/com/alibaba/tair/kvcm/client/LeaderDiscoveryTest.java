@@ -1,4 +1,4 @@
-package com.kvcm.client;
+package com.alibaba.tair.kvcm.client;
 
 import io.grpc.Server;
 import io.grpc.inprocess.InProcessServerBuilder;

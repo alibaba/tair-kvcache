@@ -1,6 +1,6 @@
-package com.kvcm.client;
+package com.alibaba.tair.kvcm.client;
 
-import com.kvcm.client.exception.KvcmException;
+import com.alibaba.tair.kvcm.client.exception.KvcmException;
 import io.grpc.ManagedChannel;
 import io.grpc.ManagedChannelBuilder;
 import io.grpc.StatusRuntimeException;
@@ -27,7 +27,7 @@ public class GrpcMetaClient implements MetaClient {
         this.callTimeoutMs = callTimeoutMs;
         // C3 fix: Add gRPC-level retry policy matching C++ client behavior
         java.util.Map<String, Object> retryPolicy = new java.util.HashMap<>();
-        retryPolicy.put("maxAttempts", 3);
+        retryPolicy.put("maxAttempts", 3.0);
         retryPolicy.put("initialBackoff", "0.1s");
         retryPolicy.put("maxBackoff", "1s");
         retryPolicy.put("backoffMultiplier", 1.5);

@@ -1,4 +1,4 @@
-package com.kvcm.client.exception;
+package com.alibaba.tair.kvcm.client.exception;
 
 import kv_cache_manager.proto.meta.MetaServiceOuterClass.ErrorCode;
 

@@ -1,7 +1,7 @@
-package com.kvcm.client;
+package com.alibaba.tair.kvcm.client;
 
-import com.kvcm.client.exception.KvcmException;
-import com.kvcm.client.exception.ServerNotLeaderException;
+import com.alibaba.tair.kvcm.client.exception.KvcmException;
+import com.alibaba.tair.kvcm.client.exception.ServerNotLeaderException;
 import io.grpc.ManagedChannel;
 import io.grpc.Server;
 import io.grpc.inprocess.InProcessChannelBuilder;

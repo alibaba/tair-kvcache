@@ -1,9 +1,9 @@
-package com.kvcm.client;
+package com.alibaba.tair.kvcm.client;
 
 import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.Message;
 import com.google.protobuf.util.JsonFormat;
-import com.kvcm.client.exception.KvcmException;
+import com.alibaba.tair.kvcm.client.exception.KvcmException;
 import kv_cache_manager.proto.meta.MetaServiceOuterClass.*;
 import okhttp3.*;
 import org.slf4j.Logger;
