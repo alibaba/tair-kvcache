@@ -42,7 +42,6 @@ class MultiLocationTest(abc.ABC, TestBase, unittest.TestCase):
     GROUP_B = "GroupB"  # contains spec "tp1"
     POLL_ATTEMPTS = 10
     POLL_INTERVAL_SECONDS = 1
-    LAZY_PRUNE_SETTLE_SECONDS = 2
 
     def setUp(self):
         self.init_default()
@@ -132,25 +131,17 @@ class MultiLocationTest(abc.ABC, TestBase, unittest.TestCase):
         self._delete_cache_locations(locs_a, list(range(len(locs_a))))
 
         # Query performs lazy stale-location detection and then submits async
-        # metadata pruning.  Wait for the read path to stop exposing tp0, then
-        # give the async metadata delete a settle window before the rewrite.
+        # metadata pruning.  Wait for the read path to stop exposing tp0.
         self._wait_for_prefix_specs(block_keys,
                                     expected_location_count=3,
                                     required_specs={"tp1"},
                                     absent_specs={"tp0"})
-        self._settle_lazy_prune()
 
-        # Verify only tp1 specs remain (tp0 was pruned)
-        self._wait_for_prefix_specs(block_keys,
-                                    expected_location_count=3,
-                                    required_specs={"tp1"},
-                                    absent_specs={"tp0"})
-        self._settle_lazy_prune()
-
-        # Rewrite with GroupA → should allocate new locations
-        new_locs_a = self._write_blocks_with_group(block_keys, token_ids,
-                                                   self.GROUP_A,
-                                                   expected_location_count=3)
+        # Rewrite with GroupA.  StartWriteCache may still observe async
+        # deleting metadata, so retry until write filtering allocates all
+        # missing GroupA locations.  Failed attempts are explicitly aborted.
+        new_locs_a = self._write_blocks_with_group_retry(
+            block_keys, token_ids, self.GROUP_A, expected_location_count=3)
         self._verify_block_keys(new_locs_a, block_keys)
 
         # Query: full coverage restored
@@ -224,6 +215,39 @@ class MultiLocationTest(abc.ABC, TestBase, unittest.TestCase):
         self._finish_write_blocks(write_session_id, len(locations))
         return locations
 
+    def _write_blocks_with_group_retry(self, block_keys, token_ids, group_name,
+                                       expected_location_count):
+        last_resp = None
+        for attempt in range(1, self.POLL_ATTEMPTS + 1):
+            resp = self._start_write_blocks(block_keys, token_ids,
+                                            group_name=group_name)
+            last_resp = resp
+            write_session_id = resp["write_session_id"]
+            locations = resp["locations"]
+            if len(locations) == expected_location_count:
+                self._touch_cache_locations(locations)
+                self._finish_write_blocks(write_session_id, len(locations))
+                return locations
+
+            self._finish_write_blocks(write_session_id, len(locations),
+                                      success=False)
+            mismatch = self._format_start_write_mismatch(
+                resp, locations, expected_location_count)
+            logging.info(
+                "attempt %d/%d: rewrite did not allocate all locations, "
+                "aborted session and will retry: %s",
+                attempt,
+                self.POLL_ATTEMPTS,
+                mismatch)
+            if attempt < self.POLL_ATTEMPTS:
+                time.sleep(self.POLL_INTERVAL_SECONDS)
+
+        mismatch = self._format_start_write_mismatch(
+            last_resp, last_resp["locations"], expected_location_count)
+        self.fail(
+            "rewrite did not allocate expected locations after retries: "
+            f"{mismatch}")
+
     def _start_write_blocks(self, block_keys, token_ids, group_name=None):
         req = {
             "trace_id": self._trace_id,
@@ -236,13 +260,13 @@ class MultiLocationTest(abc.ABC, TestBase, unittest.TestCase):
             req["location_spec_group_names"] = [group_name] * len(block_keys)
         return self._client.start_write_cache(req)
 
-    def _finish_write_blocks(self, write_session_id, loc_sz):
+    def _finish_write_blocks(self, write_session_id, loc_sz, success=True):
         return self._client.finish_write_cache({
             "trace_id": self._trace_id,
             "instance_id": self._instance_id,
             "write_session_id": write_session_id,
             "success_blocks": {
-                "bool_masks": {"values": [True] * loc_sz},
+                "bool_masks": {"values": [success] * loc_sz},
             },
         })
 
@@ -282,11 +306,6 @@ class MultiLocationTest(abc.ABC, TestBase, unittest.TestCase):
             f"required_specs={sorted(required_specs)}, "
             f"absent_specs={sorted(absent_specs)}, "
             f"last_locations={self._summarize_locations(last_resp['locations'])}")
-
-    def _settle_lazy_prune(self):
-        # The query that filters stale locations enqueues metadata deletion
-        # asynchronously.  StartWriteCache reads metadata, so avoid racing it.
-        time.sleep(self.LAZY_PRUNE_SETTLE_SECONDS)
 
     def _assert_locations_have_specs(self, locations, required_specs=None,
                                      absent_specs=None):
