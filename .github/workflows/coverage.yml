@@ -101,6 +101,7 @@ jobs:
           GCOV_BIN="${PWD}/tools/coverage/gcov_json_isolated.sh"
           echo "gcc: $(gcc --version | head -1)"
           echo "gcov: $(${REAL_GCOV_BIN} --version | head -1)"
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
           git fetch origin main --no-tags --prune
           rm -rf coverage bazel-testlogs
           bazelisk coverage \
