@@ -1,12 +1,6 @@
 package com.alibaba.tair.kvcm.client;
 
 import kv_cache_manager.proto.meta.MetaServiceOuterClass.*;
-import org.junit.jupiter.api.AfterAll;
-import org.junit.jupiter.api.BeforeAll;
-import org.junit.jupiter.api.BeforeEach;
-import org.junit.jupiter.api.TestInfo;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -18,18 +12,6 @@ import static org.junit.jupiter.api.Assertions.*;
  * as the primary transport to avoid code duplication.
  */
 public abstract class CacheAwareTestBase extends IntegrationTestBase {
-
-    private static final Logger LOG = LoggerFactory.getLogger(CacheAwareTestBase.class);
-
-    private String instanceId;
-
-    @BeforeEach
-    void setUpTestIsolation(TestInfo testInfo) {
-        String methodName = testInfo.getTestMethod()
-                .map(m -> m.getName())
-                .orElse("unknown");
-        instanceId = "test_" + methodName + "_" + System.currentTimeMillis();
-    }
 
     /**
      * Returns the MetaClient to test (gRPC or HTTP).
