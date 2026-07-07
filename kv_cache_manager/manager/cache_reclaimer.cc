@@ -1788,65 +1788,31 @@ std::size_t CacheReclaimer::MigrateByStrategyOnBatch(const std::shared_ptr<Reque
     const std::string &src_name = strategy.storage_unique_name();
     const std::string &dst_name = strategy.target_storage();
 
-    // 3. 准入过滤 + 收集 copy / mark 候选
-    std::vector<MigrationManager::MigrationRequest> copy_reqs;
-    std::vector<std::int64_t> copy_block_keys; // F-23: 保留 copy 候选的 block_key，用于失败回落 mark
-    std::vector<std::int64_t> mark_keys;
-    for (std::size_t i = 0; i != batch.size(); ++i) {
-        const std::int64_t block_key = batch[i];
-        const auto admission = migration_manager_->CheckCopyAdmission(ins_id, block_key, loc_maps[i], src_name, dst_name);
-        if (admission.status != MigrationManager::CopyAdmissionStatus::kAccept ||
-            admission.src_location == nullptr) {
-            continue;
-        }
+    // F-10 DRY: 准入 + 分发 + fallback 委派共享 DispatchMigrationBatch（与 Admin MigrateCache 同一函数）。
+    MigrationManager::DispatchBatchParams params;
+    params.do_copy = copy_enabled;
+    params.do_mark = mark_enabled;
+    params.max_copy_slots = available_copy_slots;
+    params.retention = strategy.retention();
+    params.mark_timeout_ms = strategy.methods().mark().timeout_ms();
+    params.dedup_marks = true; // reclaimer 跳过已打标的 block（10a: 内部用 BatchGetTieredWriteTargets 批量查）
+    const auto dispatch = migration_manager_->DispatchMigrationBatch(
+        request_context->trace_id(), ins_id, src_name, dst_name, batch, loc_maps, params);
 
-        if (copy_enabled && copy_reqs.size() < available_copy_slots) {
-            MigrationManager::MigrationRequest req;
-            req.instance_id = ins_id;
-            req.block_key = block_key;
-            req.src_location_id = admission.src_location->id();
-            req.src_storage_name = src_name;
-            req.dst_storage_name = dst_name;
-            req.retention = strategy.retention();
-            copy_block_keys.emplace_back(block_key);
-            copy_reqs.emplace_back(std::move(req));
-            continue; // Copy 优先：已进入 copy 分发的 block 不再重复 mark。
-        }
-        if (mark_enabled && !migration_manager_->IsMarkedForTieredWrite(ins_id, block_key)) {
-            mark_keys.emplace_back(block_key);
-        }
+    if (dispatch.copy_submitted > 0) {
+        METRICS_(cache_reclaimer, migration_copy_submitted_total) += dispatch.copy_submitted;
     }
-
-    // 4. 分发
-    std::size_t submitted_copy = 0;
-    if (!copy_reqs.empty()) {
-        const auto results = migration_manager_->BatchSubmit(request_context->trace_id(), std::move(copy_reqs));
-        for (std::size_t i = 0; i < results.size(); ++i) {
-            if (results[i] == ErrorCode::EC_OK) {
-                ++submitted_copy;
-            } else if (mark_enabled && i < copy_block_keys.size()) {
-                // F-23: copy 提交失败的 block 回落到 mark（与 Admin BOTH 语义对齐），避免静默丢弃迁移机会。
-                mark_keys.emplace_back(copy_block_keys[i]);
-            }
-        }
-        if (submitted_copy > 0) {
-            METRICS_(cache_reclaimer, migration_copy_submitted_total) += submitted_copy;
-        }
-    }
-    if (!mark_keys.empty()) {
-        migration_manager_->MarkForTieredWrite(ins_id, mark_keys, dst_name, strategy.methods().mark().timeout_ms());
-        // request/submitted 口径（≠ actual marked 数）：部分 key 可能因 block 不存在被 MA_SKIP。
-        // MigrationManager 内部的 marks_active gauge 已按实际成功数统计（F-14）；此处仅记录提交量。
-        METRICS_(cache_reclaimer, migration_mark_submitted_total) += mark_keys.size();
+    if (dispatch.mark_submitted > 0) {
+        METRICS_(cache_reclaimer, migration_mark_submitted_total) += dispatch.mark_submitted;
     }
 
     LOG_WITH_ID(DEBUG,
-                "migrate by strategy: src [%s] dst [%s] copy_submitted [%zu] mark_submitted [%zu]",
+                "migrate by strategy: src [%s] dst [%s] copy_submitted [%lld] mark_submitted [%lld]",
                 src_name.c_str(),
                 dst_name.c_str(),
-                submitted_copy,
-                mark_keys.size());
-    return submitted_copy;
+                static_cast<long long>(dispatch.copy_submitted),
+                static_cast<long long>(dispatch.mark_submitted));
+    return dispatch.copy_submitted;
 }
 
 bool CacheReclaimer::SubmitDelReq(const std::shared_ptr<RequestContext> &request_context,

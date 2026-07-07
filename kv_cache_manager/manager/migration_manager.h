@@ -56,6 +56,10 @@ public:
         std::string src_storage_name; // 执行 Copy 的 backend（一期 = 源 storage 的 unique name）
         std::string dst_storage_name; // 目标 storage（冷层）
         MigrationRetention retention = MigrationRetention::MIGRATION_RETENTION_DELETE_SOURCE;
+        // F-10: admission 已定位的源 location 信息，传入 PrepareCopyTask 避免冗余 BatchGetLocation。
+        // 非空时 PrepareCopyTask 直接使用；空时 fallback 重读 meta（兼容不经 DispatchMigrationBatch 的调用方）。
+        std::vector<LocationSpec> src_specs;
+        int64_t src_create_time = 0;
     };
 
     struct MigrationStats {
@@ -174,6 +178,31 @@ public:
                                const std::vector<int64_t> &explicit_block_keys,
                                int64_t sample_count);
 
+    // ---- 共享迁移分发（F-10 DRY：Admin MigrateCache 与 CacheReclaimer 两路共用）----
+    // 对已准备好的 (batch, loc_maps) 执行：逐 block 准入(CheckCopyAdmission) + copy/mark 分类
+    // + BatchSubmit + copy 失败回落 mark(F-23) + MarkForTieredWrite。
+    // 两路差异通过 params 参数化（copy slot 限制 / retention / mark timeout / mark 去重）。
+    struct DispatchBatchParams {
+        bool do_copy = false;
+        bool do_mark = false;
+        std::size_t max_copy_slots = SIZE_MAX;
+        MigrationRetention retention = MigrationRetention::MIGRATION_RETENTION_DELETE_SOURCE;
+        int64_t mark_timeout_ms = MigrationMarkMethod::kDefaultTimeoutMs;
+        bool dedup_marks = false; // true=跳过已打标的 block（reclaimer 用；Admin 显式指定 block 不需要）
+    };
+    struct DispatchBatchResult {
+        int64_t copy_submitted = 0;
+        int64_t copy_failed = 0;
+        int64_t mark_submitted = 0;
+    };
+    DispatchBatchResult DispatchMigrationBatch(const std::string &trace_id,
+                                              const std::string &instance_id,
+                                              const std::string &src_name,
+                                              const std::string &dst_name,
+                                              const std::vector<int64_t> &batch,
+                                              const std::vector<CacheLocationMap> &loc_maps,
+                                              const DispatchBatchParams &params);
+
     // ---- 统计 ----
     MigrationStats GetStats() const;
 
@@ -228,7 +257,7 @@ private:
     // 解析源 location -> 在目标 storage 预分配 dst_uris -> 建目标 location(CLS_WRITING)。
     // 成功时填充 out_ctx、out_src_uris、out_dst_uris。
     ErrorCode PrepareCopyTask(const std::string &trace_id,
-                              const MigrationRequest &request,
+                              MigrationRequest &request,
                               CopyTaskContext &out_ctx,
                               std::vector<DataStorageUri> &out_src_uris,
                               std::vector<DataStorageUri> &out_dst_uris);
