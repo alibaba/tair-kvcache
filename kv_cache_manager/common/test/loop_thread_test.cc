@@ -37,9 +37,11 @@ TEST_F(LoopThreadTest, TestCreateAndStop) {
 
     loop_thread->Stop();
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
     int count_after_stop = count.load();
-    EXPECT_EQ(count_before_stop, count_after_stop);
+    EXPECT_GE(count_after_stop, count_before_stop);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    EXPECT_EQ(count_after_stop, count.load());
 }
 
 TEST_F(LoopThreadTest, TestRunOnce) {
