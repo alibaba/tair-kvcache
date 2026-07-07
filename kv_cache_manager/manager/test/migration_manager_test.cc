@@ -1079,6 +1079,60 @@ TEST_F(MigrationManagerTest, TestCheckCopyAdmissionTriesNextSourceLocation) {
     ASSERT_EQ("loc_src_l1", adm.src_location->id());
 }
 
+// F-09: 多个 target location 分别覆盖不同 specs，联合覆盖完整 → 不应 kAccept。
+TEST_F(MigrationManagerTest, TestCheckCopyAdmissionUnionCoverage) {
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    const std::string src = "hot_01";
+    const std::string dst = "cold_01";
+
+    // source 含 tp0, tp1；cold 上 loc_a(tp0, SERVING) + loc_b(tp1, SERVING) 联合覆盖。
+    {
+        CacheLocationMap loc_map;
+        auto src_loc = MakeLocationWithSpecs("loc_src", src, CLS_SERVING, {"tp0", "tp1"});
+        auto dst_a = MakeLocationWithSpecs("loc_dst_a", dst, CLS_SERVING, {"tp0"});
+        auto dst_b = MakeLocationWithSpecs("loc_dst_b", dst, CLS_SERVING, {"tp1"});
+        loc_map[src_loc->id()] = src_loc;
+        loc_map[dst_a->id()] = dst_a;
+        loc_map[dst_b->id()] = dst_b;
+        const auto adm = mgr.CheckCopyAdmission(kInstance, 9, loc_map, src, dst);
+        ASSERT_EQ(MigrationManager::CopyAdmissionStatus::kTargetServingExists, adm.status);
+    }
+    // WRITING 联合覆盖 → kTargetWritingExists
+    {
+        CacheLocationMap loc_map;
+        auto src_loc = MakeLocationWithSpecs("loc_src", src, CLS_SERVING, {"tp0", "tp1"});
+        auto dst_a = MakeLocationWithSpecs("loc_dst_a", dst, CLS_WRITING, {"tp0"});
+        auto dst_b = MakeLocationWithSpecs("loc_dst_b", dst, CLS_WRITING, {"tp1"});
+        loc_map[src_loc->id()] = src_loc;
+        loc_map[dst_a->id()] = dst_a;
+        loc_map[dst_b->id()] = dst_b;
+        const auto adm = mgr.CheckCopyAdmission(kInstance, 10, loc_map, src, dst);
+        ASSERT_EQ(MigrationManager::CopyAdmissionStatus::kTargetWritingExists, adm.status);
+    }
+    // 混合：tp0 SERVING + tp1 WRITING → kTargetWritingExists（SERVING∪WRITING 联合覆盖）
+    {
+        CacheLocationMap loc_map;
+        auto src_loc = MakeLocationWithSpecs("loc_src", src, CLS_SERVING, {"tp0", "tp1"});
+        auto dst_a = MakeLocationWithSpecs("loc_dst_a", dst, CLS_SERVING, {"tp0"});
+        auto dst_b = MakeLocationWithSpecs("loc_dst_b", dst, CLS_WRITING, {"tp1"});
+        loc_map[src_loc->id()] = src_loc;
+        loc_map[dst_a->id()] = dst_a;
+        loc_map[dst_b->id()] = dst_b;
+        const auto adm = mgr.CheckCopyAdmission(kInstance, 11, loc_map, src, dst);
+        ASSERT_EQ(MigrationManager::CopyAdmissionStatus::kTargetWritingExists, adm.status);
+    }
+    // 部分覆盖（只有 tp0，缺 tp1）→ 仍 kAccept
+    {
+        CacheLocationMap loc_map;
+        auto src_loc = MakeLocationWithSpecs("loc_src", src, CLS_SERVING, {"tp0", "tp1"});
+        auto dst_a = MakeLocationWithSpecs("loc_dst_a", dst, CLS_SERVING, {"tp0"});
+        loc_map[src_loc->id()] = src_loc;
+        loc_map[dst_a->id()] = dst_a;
+        const auto adm = mgr.CheckCopyAdmission(kInstance, 12, loc_map, src, dst);
+        ASSERT_EQ(MigrationManager::CopyAdmissionStatus::kAccept, adm.status);
+    }
+}
+
 TEST_F(MigrationManagerTest, TestActiveTasksScopedByInstance) {
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
     const std::string other_instance = "other_instance";

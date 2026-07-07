@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <tuple>
+#include <unordered_set>
 #include <utility>
 
 #include "kv_cache_manager/common/logger.h"
@@ -35,36 +36,24 @@ int64_t ParseInt64OrZero(const std::string &value) {
     return end != nullptr && *end == '\0' ? parsed : 0;
 }
 
-bool LocationCoversSourceSpecsOnStorage(const CacheLocation &target_location,
-                                        const std::string &storage_name,
-                                        const CacheLocation &source_location) {
-    const auto &source_specs = source_location.location_specs();
-    if (source_specs.empty()) {
-        return false;
-    }
-    const auto &target_specs = target_location.location_specs();
-    return std::all_of(source_specs.begin(), source_specs.end(), [&target_specs, &storage_name](const auto &src_spec) {
-        return std::any_of(target_specs.begin(), target_specs.end(), [&src_spec, &storage_name](const auto &dst_spec) {
-            const DataStorageUri uri(dst_spec.uri());
-            return dst_spec.name() == src_spec.name() && uri.Valid() && uri.GetHostName() == storage_name;
-        });
-    });
-}
-
-const CacheLocation *FindLocationCoveringSourceSpecsOnStorage(
+// F-09: 收集目标 storage 上指定 status 的 location 联合覆盖的 spec name 集合。
+// 一次 O(L·S) 扫描替代旧的 per-location 全覆盖判断（O(L²·S²)）。
+std::unordered_set<std::string> CollectCoveredSpecNames(
     const CacheLocationMap &loc_map,
     const std::string &storage_name,
-    std::initializer_list<CacheLocationStatus> statuses,
-    const CacheLocation &source_location) {
+    std::initializer_list<CacheLocationStatus> statuses) {
+    std::unordered_set<std::string> covered;
     for (const auto &[_, loc_ptr] : loc_map) {
         if (!loc_ptr || std::find(statuses.begin(), statuses.end(), loc_ptr->status()) == statuses.end()) {
             continue;
         }
-        if (LocationCoversSourceSpecsOnStorage(*loc_ptr, storage_name, source_location)) {
-            return loc_ptr.get();
+        for (const auto &spec : loc_ptr->location_specs()) {
+            if (DataStorageUri uri(spec.uri()); uri.Valid() && uri.GetHostName() == storage_name) {
+                covered.insert(spec.name());
+            }
         }
     }
-    return nullptr;
+    return covered;
 }
 
 std::vector<const CacheLocation *> FindLocationsOnStorage(const CacheLocationMap &loc_map,
@@ -1191,16 +1180,25 @@ MigrationManager::CopyAdmission MigrationManager::CheckCopyAdmission(const std::
         return {CopyAdmissionStatus::kSourceServingNotFound, nullptr};
     }
 
+    // F-09: 按目标 storage 上多个 location 的联合覆盖判断,替代旧的 per-location 全覆盖。
+    // 建索引一次 O(L·S),之后 per-source O(S) set lookup。
+    const auto serving_covered = CollectCoveredSpecNames(loc_map, dst_storage_name, {CacheLocationStatus::CLS_SERVING});
+    const auto all_covered =
+        CollectCoveredSpecNames(loc_map, dst_storage_name, {CacheLocationStatus::CLS_SERVING, CacheLocationStatus::CLS_WRITING});
+
+    auto specs_covered_by = [](const CacheLocation &src, const std::unordered_set<std::string> &covered) {
+        return std::all_of(src.location_specs().begin(), src.location_specs().end(),
+                           [&covered](const auto &spec) { return covered.count(spec.name()) > 0; });
+    };
+
     bool all_sources_covered_by_serving = true;
     bool all_sources_covered_by_writing = true;
     for (const auto *src_loc : src_locations) {
-        if (FindLocationCoveringSourceSpecsOnStorage(
-                loc_map, dst_storage_name, {CacheLocationStatus::CLS_SERVING}, *src_loc) != nullptr) {
+        if (specs_covered_by(*src_loc, serving_covered)) {
             continue;
         }
         all_sources_covered_by_serving = false;
-        if (FindLocationCoveringSourceSpecsOnStorage(
-                loc_map, dst_storage_name, {CacheLocationStatus::CLS_WRITING}, *src_loc) != nullptr) {
+        if (specs_covered_by(*src_loc, all_covered)) {
             continue;
         }
         all_sources_covered_by_writing = false;

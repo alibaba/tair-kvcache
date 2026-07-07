@@ -126,42 +126,44 @@ IsSpecNameInSpecGroup(const std::string &trace_id,
     return {EC_OK, true};
 }
 
-bool HasServingOrWritingLocOnStorage(const CacheLocationMap &loc_map,
-                                     const std::string &storage_name,
-                                     const std::vector<std::string> &requested_spec_names = {},
-                                     const std::vector<std::string> &exclude_loc_ids = {}) {
+// F-09/F-22 共享 helper: 收集目标 storage 上指定 status 的 location 联合覆盖的 spec name 集合。
+// 一次 O(L·S) 扫描。exclude_loc_ids 供 F-21 排除 stale location。
+std::unordered_set<std::string> CollectCoveredSpecNames(
+    const CacheLocationMap &loc_map,
+    const std::string &storage_name,
+    std::initializer_list<CacheLocationStatus> statuses,
+    const std::vector<std::string> &exclude_loc_ids = {}) {
+    std::unordered_set<std::string> covered;
     for (const auto &[loc_id, loc_ptr] : loc_map) {
-        if (!loc_ptr || (loc_ptr->status() != CacheLocationStatus::CLS_SERVING &&
-                         loc_ptr->status() != CacheLocationStatus::CLS_WRITING)) {
+        if (!loc_ptr || std::find(statuses.begin(), statuses.end(), loc_ptr->status()) == statuses.end()) {
             continue;
         }
-        // F-21: 跳过普通路径已判定为 stale(meta SERVING 但数据已丢)的 location——复用其 prune 结果，
-        // 避免把 stale 目标副本误判为"已满足"而跳过重写(不额外查一次后端 Exist)。
         if (!exclude_loc_ids.empty() &&
             std::find(exclude_loc_ids.begin(), exclude_loc_ids.end(), loc_id) != exclude_loc_ids.end()) {
             continue;
         }
-        const auto &loc_specs = loc_ptr->location_specs();
-        if (requested_spec_names.empty()) {
-            for (const auto &spec : loc_specs) {
-                if (const DataStorageUri uri(spec.uri()); uri.Valid() && uri.GetHostName() == storage_name) {
-                    return true;
-                }
+        for (const auto &spec : loc_ptr->location_specs()) {
+            if (DataStorageUri uri(spec.uri()); uri.Valid() && uri.GetHostName() == storage_name) {
+                covered.insert(spec.name());
             }
-            continue;
-        }
-        const bool covers_all = std::all_of(
-            requested_spec_names.begin(), requested_spec_names.end(), [&loc_specs, &storage_name](const auto &name) {
-                return std::any_of(loc_specs.begin(), loc_specs.end(), [&name, &storage_name](const auto &spec) {
-                    const DataStorageUri uri(spec.uri());
-                    return spec.name() == name && uri.Valid() && uri.GetHostName() == storage_name;
-                });
-            });
-        if (covers_all) {
-            return true;
         }
     }
-    return false;
+    return covered;
+}
+
+// F-22: 判断目标 storage 上是否有 SERVING/WRITING location（联合）覆盖 requested specs。
+// requested_spec_names 空时只判"有任何 spec 在该 storage 上"。
+bool HasServingOrWritingLocOnStorage(const CacheLocationMap &loc_map,
+                                     const std::string &storage_name,
+                                     const std::vector<std::string> &requested_spec_names = {},
+                                     const std::vector<std::string> &exclude_loc_ids = {}) {
+    const auto covered = CollectCoveredSpecNames(
+        loc_map, storage_name, {CacheLocationStatus::CLS_SERVING, CacheLocationStatus::CLS_WRITING}, exclude_loc_ids);
+    if (requested_spec_names.empty()) {
+        return !covered.empty();
+    }
+    return std::all_of(requested_spec_names.begin(), requested_spec_names.end(),
+                       [&covered](const auto &name) { return covered.count(name) > 0; });
 }
 
 const CacheLocation *FindLocationById(const CacheLocationMap &loc_map, const std::string &location_id) {
