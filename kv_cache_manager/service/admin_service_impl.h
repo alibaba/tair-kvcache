@@ -130,11 +130,6 @@ public:
                       proto::admin::CommonResponse *response);
 
 private:
-    std::pair<ErrorCode, std::vector<std::int64_t>>
-    SelectMigrationCandidateKeys(RequestContext *request_context,
-                                 const proto::admin::MigrateCacheRequest *request,
-                                 const std::shared_ptr<MetaIndexer> &meta_indexer) const;
-
     std::shared_ptr<CacheManager> cache_manager_;
     std::shared_ptr<MetricsReporter> metrics_reporter_;
     std::shared_ptr<MetricsRegistry> metrics_registry_; // for the GetMetrics API

@@ -1056,6 +1056,78 @@ void CacheManager::ResumeReclaimer() { cache_reclaimer_->Resume(); }
 void CacheManager::StartMigrationManager() { migration_manager_->Start(); }
 void CacheManager::StopMigrationManager() { migration_manager_->Stop(); }
 
+CacheManager::MigrateCacheResult CacheManager::MigrateCache(RequestContext *request_context,
+                                                            const std::string &trace_id,
+                                                            const std::string &instance_id,
+                                                            const std::string &src_name,
+                                                            const std::string &dst_name,
+                                                            bool do_copy,
+                                                            bool do_mark,
+                                                            const std::vector<int64_t> &explicit_block_keys,
+                                                            int64_t sample_count) {
+    // F-05 瘦 facade：只做前置校验（依赖存在 / instance 存在 / F-02 target 注册 / F-01 strategy），
+    // 迁移编排（候选/meta/admission/dispatch/计数）下沉 MigrationManager::MigrateCache。
+    MigrateCacheResult result;
+
+    if (migration_manager_ == nullptr || meta_indexer_manager_ == nullptr) {
+        result.ec = EC_ERROR;
+        result.message = "migration manager not available";
+        return result;
+    }
+    // instance 存在性前置（保持与原实现相同的错误优先级：instance → F-02 → F-01）。
+    auto meta_indexer = meta_indexer_manager_->GetMetaIndexer(instance_id);
+    if (meta_indexer == nullptr) {
+        result.ec = EC_INSTANCE_NOT_EXIST;
+        result.message = "instance not found: " + instance_id;
+        return result;
+    }
+
+    // F-02: target storage 必须是已注册的 storage——COPY 需在其上分配空间，MARK 需要它可被写路径满足。
+    // 否则会静默降级（写回落热层）并留下永不被满足的 mark。上层直接拒绝，避免误导性的 accepted。
+    {
+        auto data_storage_manager = registry_manager_->data_storage_manager();
+        if (data_storage_manager == nullptr || data_storage_manager->GetDataStorageBackend(dst_name) == nullptr) {
+            result.ec = EC_BADARGS;
+            result.message = "target storage not registered: " + dst_name;
+            return result;
+        }
+    }
+
+    // F-01: MARK/BOTH 会写入 tiered-write mark，而写路径只在配置了 migration strategy 的 instance group
+    // 才消费该 mark（与 FilterWriteCache 的消费门 IsTieredMigrationEnabled 对齐）。无 strategy 时打标是
+    // "成功的 no-op"（持久化后永不被消费）。保守起见直接拒绝，避免向调用方返回误导性的 accepted。
+    if (do_mark) {
+        const auto group_name = registry_manager_->GetInstanceGroupName(instance_id);
+        auto [group_ec, instance_group] = registry_manager_->GetInstanceGroup(request_context, group_name);
+        const bool has_migration_strategy = group_ec == EC_OK && instance_group != nullptr &&
+                                            instance_group->cache_config() != nullptr &&
+                                            !instance_group->cache_config()->migration_strategies().empty();
+        if (!has_migration_strategy) {
+            result.ec = EC_BADARGS;
+            result.message =
+                "MARK/BOTH requires a migration strategy configured on the instance group: " + instance_id;
+            return result;
+        }
+    }
+
+    // 前置通过 → 委派编排。meta_indexer 已取得并校验，直接传入避免二次查找。
+    const auto domain = migration_manager_->MigrateCache(request_context,
+                                                         trace_id,
+                                                         instance_id,
+                                                         meta_indexer,
+                                                         src_name,
+                                                         dst_name,
+                                                         do_copy,
+                                                         do_mark,
+                                                         explicit_block_keys,
+                                                         sample_count);
+    result.ec = domain.ec;
+    result.accepted = domain.accepted;
+    result.rejected = domain.rejected;
+    result.message = domain.message;
+    return result;
+}
+
 void CacheManager::FilterLocationSpecByName(CacheLocationVector &locations,
                                             const std::vector<std::string> &location_spec_names) {
     if (location_spec_names.empty()) {

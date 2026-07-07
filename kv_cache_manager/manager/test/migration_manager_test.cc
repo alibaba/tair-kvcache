@@ -967,15 +967,15 @@ TEST_F(MigrationManagerTest, TestStopDropsActiveTasks) {
     mgr.DebugInsertActiveCopyTask(kInstance, /*block_key*/ 1001, "loc_dst_a");
     mgr.DebugInsertActiveCopyTask(kInstance, /*block_key*/ 1002, "loc_dst_b");
     ASSERT_TRUE(mgr.HasMigrationTask(kInstance, 1001));
-    ASSERT_TRUE(mgr.HasActiveCopyTargetLocation("loc_dst_a"));
+    ASSERT_TRUE(mgr.HasActiveCopyTargetLocation(kInstance, 1001, "loc_dst_a"));
     ASSERT_EQ(2u, mgr.ActiveTaskCount());
 
     mgr.Stop();
 
     ASSERT_FALSE(mgr.HasMigrationTask(kInstance, 1001));
     ASSERT_FALSE(mgr.HasMigrationTask(kInstance, 1002));
-    ASSERT_FALSE(mgr.HasActiveCopyTargetLocation("loc_dst_a"));
-    ASSERT_FALSE(mgr.HasActiveCopyTargetLocation("loc_dst_b"));
+    ASSERT_FALSE(mgr.HasActiveCopyTargetLocation(kInstance, 1001, "loc_dst_a"));
+    ASSERT_FALSE(mgr.HasActiveCopyTargetLocation(kInstance, 1002, "loc_dst_b"));
     ASSERT_EQ(0u, mgr.ActiveTaskCount());
 
     // 重新 Start 后这些 block_key 应该可以再次被识别为"无活跃任务"。
@@ -983,6 +983,29 @@ TEST_F(MigrationManagerTest, TestStopDropsActiveTasks) {
     ASSERT_FALSE(mgr.HasMigrationTask(kInstance, 1001));
     ASSERT_EQ(0u, mgr.ActiveTaskCount());
     mgr.Stop();
+}
+
+// F-18: HasActiveCopyTargetLocation 按 (instance_id, block_key) 作用域判断——
+// 两个不同 instance/block 用相同 dst_location_id 时，只有匹配 scope 的那个才应被保护。
+TEST_F(MigrationManagerTest, TestHasActiveCopyTargetLocationIsScoped) {
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    const std::string other_instance = "other_instance";
+    const std::string shared_dst = "shared_dst_loc"; // 两个 task 复用同一 dst_location_id
+
+    // instance A / block 1 → shared_dst；instance B / block 2 → shared_dst
+    mgr.DebugInsertActiveCopyTask(kInstance, /*block_key*/ 1, shared_dst);
+    mgr.DebugInsertActiveCopyTask(other_instance, /*block_key*/ 2, shared_dst);
+
+    // 精确匹配 (instance, block, loc) 才为 true
+    ASSERT_TRUE(mgr.HasActiveCopyTargetLocation(kInstance, 1, shared_dst));
+    ASSERT_TRUE(mgr.HasActiveCopyTargetLocation(other_instance, 2, shared_dst));
+
+    // 同 loc_id 但 scope 不匹配 → false（旧的裸 id 实现在此会误报 true）
+    ASSERT_FALSE(mgr.HasActiveCopyTargetLocation(kInstance, 2, shared_dst));         // 错的 block
+    ASSERT_FALSE(mgr.HasActiveCopyTargetLocation(other_instance, 1, shared_dst));    // 错的 block
+    ASSERT_FALSE(mgr.HasActiveCopyTargetLocation("nonexistent_instance", 1, shared_dst)); // 错的 instance
+    ASSERT_FALSE(mgr.HasActiveCopyTargetLocation(kInstance, 1, "different_loc"));    // 错的 loc_id
+    ASSERT_FALSE(mgr.HasActiveCopyTargetLocation(kInstance, 1, ""));                 // 空 loc_id
 }
 
 TEST_F(MigrationManagerTest, TestSubmitRejectedAfterStop) {

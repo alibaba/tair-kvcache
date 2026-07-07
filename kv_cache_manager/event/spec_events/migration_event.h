@@ -127,4 +127,28 @@ private:
     std::string dst_storage_;
 };
 
+// F-16: mark 超时过期（推理引擎未在 deadline 内消费）的独立事件，与 MigrationMarkConsumed
+// 区分——后者表示 mark 被真正消费/清理，前者表示 mark 被超时兜底清除（浪费）。
+class MigrationMarkExpiredEvent : public BaseEvent {
+public:
+    explicit MigrationMarkExpiredEvent(const std::string &source)
+        : BaseEvent(source, "migration", "MigrationMarkExpired") {}
+
+    void SetAdditionalArgs(std::int64_t block_key, const std::string &dst_storage) {
+        block_key_ = block_key;
+        dst_storage_ = dst_storage;
+    }
+
+    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override {
+        BaseEvent::ToRapidWriter(writer);
+        Put(writer, "block_key", block_key_);
+        Put(writer, "dst_storage", dst_storage_);
+        Put(writer, "method", std::string("mark"));
+    }
+
+private:
+    std::int64_t block_key_{0};
+    std::string dst_storage_;
+};
+
 } // namespace kv_cache_manager

@@ -26,6 +26,7 @@ namespace kv_cache_manager {
 class MetaIndexerManager;
 class DataStorageManager;
 class EventManager;
+class RequestContext;
 
 /**
  * MigrationManager —— 多层存储迁移统一控制面。
@@ -118,7 +119,11 @@ public:
     // ---- 查询（防重复迁移 + 并发预算） ----
     bool HasMigrationTask(const std::string &instance_id, int64_t block_key) const;
     // Reclaimer 孤儿检测使用：运行期不能回收活跃 Copy 任务正在写入的目标 location。
-    bool HasActiveCopyTargetLocation(const std::string &location_id) const;
+    // F-18: 按 (instance_id, block_key) 作用域查找——location_id 不保证跨 instance/block 全局唯一，
+    // 且作用域查找为 O(1)（避免全表扫描）。
+    bool HasActiveCopyTargetLocation(const std::string &instance_id,
+                                     int64_t block_key,
+                                     const std::string &location_id) const;
     size_t ActiveTaskCount() const;
 
     // ---- Copy 准入策略（CacheReclaimer / AdminServiceImpl 共用） ----
@@ -144,6 +149,28 @@ public:
                                      const CacheLocationMap &loc_map,
                                      const std::string &src_storage_name,
                                      const std::string &dst_storage_name) const;
+
+    // ---- 编排入口（API 触发；F-05 domain API，供 CacheManager::MigrateCache 薄 facade 调用）----
+    // 承载迁移编排本身：候选选择 + location 批查(MetaSearcher) + 逐 block 准入(CheckCopyAdmission)
+    // + Copy(BatchSubmit)/Mark(MarkForTieredWrite) 分发与 copy 失败回落 + accepted/rejected 统计。
+    // 前置条件（instance 存在=meta_indexer 非空、target 已注册=F-02、group 有 strategy=F-01）由 facade
+    // 完成后再调本方法；meta_indexer 由调用方传入（facade 已按 instance 取得并做非空校验）。
+    struct MigrateResult {
+        ErrorCode ec = EC_OK;
+        int64_t accepted = 0;
+        int64_t rejected = 0;
+        std::string message;
+    };
+    MigrateResult MigrateCache(RequestContext *request_context,
+                               const std::string &trace_id,
+                               const std::string &instance_id,
+                               const std::shared_ptr<MetaIndexer> &meta_indexer,
+                               const std::string &src_name,
+                               const std::string &dst_name,
+                               bool do_copy,
+                               bool do_mark,
+                               const std::vector<int64_t> &explicit_block_keys,
+                               int64_t sample_count);
 
     // ---- 统计 ----
     MigrationStats GetStats() const;
@@ -208,6 +235,13 @@ private:
 
     // 取指定 instance 的 MetaIndexer（可能为 nullptr）。
     std::shared_ptr<MetaIndexer> GetIndexer(const std::string &instance_id) const;
+    // MigrateCache 候选选取：显式 block_keys 优先；否则按 sample_count 采样（<=0 用默认 100）。
+    std::pair<ErrorCode, std::vector<std::int64_t>>
+    SelectMigrationCandidateKeys(RequestContext *request_context,
+                                 const std::string &trace_id,
+                                 const std::vector<int64_t> &explicit_block_keys,
+                                 int64_t sample_count,
+                                 const std::shared_ptr<MetaIndexer> &meta_indexer) const;
     bool ClearTieredWriteMarkInternal(const std::string &instance_id, int64_t block_key);
     bool ClearTieredWriteMarkIfMatchInternal(const std::string &instance_id,
                                              int64_t block_key,
@@ -223,6 +257,18 @@ private:
                                           int64_t block_key,
                                           std::string &target) const;
     size_t ActiveTaskCountUnsafe() const; // 调用方持有 task_mutex_
+
+    // ---- 活跃任务表操作收口（F-13 Part A；均要求调用方持有 task_mutex_）----
+    // 统一处理"内层 map 空则 erase 外层 + 更新 active gauge"，避免各业务路径重复手写、遗漏。
+    // 业务语义的 stats/event 仍由各调用方按转换语义各自发出。
+    // 返回该 (instance, block) 之前是否已存在活跃任务（true 表示重复）。
+    bool InsertActiveTaskLocked(CopyTaskContext ctx);
+    // 移除 (instance, block) 的活跃任务；不存在返回 false。
+    bool RemoveActiveTaskLocked(const std::string &instance_id, int64_t block_key);
+    // 查找 (instance, block) 的活跃任务；命中则拷贝到 out_ctx 并返回 true。
+    bool FindActiveTaskLocked(const std::string &instance_id, int64_t block_key, CopyTaskContext &out_ctx) const;
+    // 仅判断 (instance, block) 是否已有活跃任务（存在性查询，不拷贝 ctx）。
+    bool HasActiveTaskLocked(const std::string &instance_id, int64_t block_key) const;
 
     std::shared_ptr<SchedulePlanExecutor> schedule_plan_executor_;
     std::shared_ptr<MetaIndexerManager> meta_indexer_manager_;
@@ -262,11 +308,13 @@ private:
     Counter m_tasks_submitted_total_;
     Counter m_tasks_completed_success_;
     Counter m_tasks_completed_failed_;
+    Counter m_tasks_completed_cancelled_; // F-16: cancelled 终态，与 success/failed 对称
     Gauge m_tasks_active_;
     Counter m_copy_bytes_total_;
     Gauge m_copy_duration_ms_;
     Gauge m_marks_active_;
     Counter m_marks_consumed_total_;
+    Counter m_marks_expired_total_; // F-16: 超时过期清除的 mark（与 consumed 区分：浪费 vs 有效消费）
 
     void UpdateActiveTasksGauge(); // 调用方持有 task_mutex_
     void UpdateMarksActiveGauge(); // best-effort：基于 added-cleared 原子计数

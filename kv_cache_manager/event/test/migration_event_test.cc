@@ -37,4 +37,20 @@ TEST_F(MigrationEventTest, TestMarkConsumedEventIncludesMethod) {
     EXPECT_STREQ("cold_01", doc["dst_storage"].GetString());
 }
 
+// F-16: 超时过期事件独立于 consumed，type=MigrationMarkExpired。
+TEST_F(MigrationEventTest, TestMarkExpiredEventDistinctFromConsumed) {
+    MigrationMarkExpiredEvent event("instance_1");
+    event.SetAdditionalArgs(456, "cold_02");
+
+    rapidjson::Document doc;
+    doc.Parse(event.ToJsonString().c_str());
+    ASSERT_FALSE(doc.HasParseError());
+    ASSERT_TRUE(doc.HasMember("type"));
+    ASSERT_TRUE(doc.HasMember("dst_storage"));
+    ASSERT_TRUE(doc.HasMember("block_key"));
+    EXPECT_STREQ("MigrationMarkExpired", doc["type"].GetString());
+    EXPECT_STREQ("cold_02", doc["dst_storage"].GetString());
+    EXPECT_EQ(456, doc["block_key"].GetInt64());
+}
+
 } // namespace kv_cache_manager

@@ -1434,6 +1434,7 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
     std::uint64_t selected_total_bytes = 0;
     for (std::size_t block_idx = 0; block_idx < loc_maps.size(); ++block_idx) {
         const auto &loc_map = loc_maps[block_idx];
+        const std::int64_t block_key = batch[block_idx]; // F-18: 传入 block scope，供 active copy target 精确判断
         std::vector<std::string> loc_id_vec;
         std::size_t valid_location_count = 0;
 
@@ -1449,7 +1450,7 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
                 const auto &loc = *loc_ptr;
                 const bool is_active_copy_target =
                     loc.status() == CacheLocationStatus::CLS_WRITING && migration_manager_ != nullptr &&
-                    migration_manager_->HasActiveCopyTargetLocation(loc.id());
+                    migration_manager_->HasActiveCopyTargetLocation(ins_id, block_key, loc.id());
                 const bool is_orphaned_writing = loc.status() == CacheLocationStatus::CLS_WRITING &&
                                                  write_location_manager_ != nullptr &&
                                                  !write_location_manager_->HasLocationId(loc.id()) &&
@@ -1479,7 +1480,7 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
             //    it is not an active migration copy target.
             const bool is_active_copy_target =
                 loc.status() == CacheLocationStatus::CLS_WRITING && migration_manager_ != nullptr &&
-                migration_manager_->HasActiveCopyTargetLocation(loc.id());
+                migration_manager_->HasActiveCopyTargetLocation(ins_id, block_key, loc.id());
             const bool is_orphaned_writing = loc.status() == CacheLocationStatus::CLS_WRITING &&
                                              write_location_manager_ != nullptr &&
                                              !write_location_manager_->HasLocationId(loc.id()) &&

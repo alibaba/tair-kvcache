@@ -107,11 +107,14 @@ MigrationManager::MigrationManager(std::shared_ptr<SchedulePlanExecutor> schedul
             metrics_registry_->GetCounter("migration.tasks_completed_total", {{"status", "success"}});
         m_tasks_completed_failed_ =
             metrics_registry_->GetCounter("migration.tasks_completed_total", {{"status", "failed"}});
+        m_tasks_completed_cancelled_ =
+            metrics_registry_->GetCounter("migration.tasks_completed_total", {{"status", "cancelled"}});
         m_tasks_active_ = metrics_registry_->GetGauge("migration.tasks_active");
         m_copy_bytes_total_ = metrics_registry_->GetCounter("migration.copy_bytes_total");
         m_copy_duration_ms_ = metrics_registry_->GetGauge("migration.copy_duration_ms");
         m_marks_active_ = metrics_registry_->GetGauge("migration.marks_active");
         m_marks_consumed_total_ = metrics_registry_->GetCounter("migration.marks_consumed_total");
+        m_marks_expired_total_ = metrics_registry_->GetCounter("migration.marks_expired_total");
     }
 }
 
@@ -326,9 +329,7 @@ ErrorCode MigrationManager::Submit(const std::string &trace_id, MigrationRequest
     // 同一 instance 内同一 block 已有活跃任务则拒绝（防重复迁移）。
     {
         std::lock_guard<std::mutex> lock(task_mutex_);
-        auto instance_iter = active_tasks_by_instance_.find(request.instance_id);
-        if (instance_iter != active_tasks_by_instance_.end() &&
-            instance_iter->second.count(request.block_key) > 0) {
+        if (HasActiveTaskLocked(request.instance_id, request.block_key)) {
             KVCM_LOG_INFO("[%s] instance %s block_key %ld already has an active migration task, skip",
                           trace_id.c_str(),
                           request.instance_id.c_str(),
@@ -349,14 +350,11 @@ ErrorCode MigrationManager::Submit(const std::string &trace_id, MigrationRequest
     // 登记活跃任务（用于防重复迁移和 copy 并发预算统计）。
     {
         std::lock_guard<std::mutex> lock(task_mutex_);
-        auto &instance_tasks = active_tasks_by_instance_[request.instance_id];
-        if (instance_tasks.count(request.block_key) > 0) {
+        if (!InsertActiveTaskLocked(ctx)) { // 按值收 copy，ctx 后续仍需用于构造 copy_req
             // 并发竞争：已被其它请求占用，回滚刚建好的目标 location。
             SubmitTargetLocationDelete(ctx);
             return EC_EXIST;
         }
-        instance_tasks.emplace(request.block_key, ctx);
-        UpdateActiveTasksGauge();
     }
 
     // 提交 copy 任务。
@@ -371,15 +369,10 @@ ErrorCode MigrationManager::Submit(const std::string &trace_id, MigrationRequest
     if (!future.valid()) {
         KVCM_LOG_WARN("[%s] submit copy task failed for block_key %ld", trace_id.c_str(), ctx.block_key);
         SubmitTargetLocationDelete(ctx);
-        std::lock_guard<std::mutex> lock(task_mutex_);
-        auto instance_iter = active_tasks_by_instance_.find(ctx.instance_id);
-        if (instance_iter != active_tasks_by_instance_.end()) {
-            instance_iter->second.erase(ctx.block_key);
-            if (instance_iter->second.empty()) {
-                active_tasks_by_instance_.erase(instance_iter);
-            }
+        {
+            std::lock_guard<std::mutex> lock(task_mutex_);
+            RemoveActiveTaskLocked(ctx.instance_id, ctx.block_key);
         }
-        UpdateActiveTasksGauge();
         return EC_ERROR;
     }
 
@@ -446,24 +439,27 @@ void MigrationManager::CompleteCopyTaskAsFailed(const CopyTaskContext &ctx, cons
     SubmitTargetLocationDelete(ctx);
     {
         std::lock_guard<std::mutex> lock(task_mutex_);
-        auto instance_iter = active_tasks_by_instance_.find(ctx.instance_id);
-        if (instance_iter != active_tasks_by_instance_.end()) {
-            instance_iter->second.erase(ctx.block_key);
-            if (instance_iter->second.empty()) {
-                active_tasks_by_instance_.erase(instance_iter);
-            }
-        }
-        UpdateActiveTasksGauge();
+        RemoveActiveTaskLocked(ctx.instance_id, ctx.block_key);
     }
     stat_copy_failed_.fetch_add(1, std::memory_order_relaxed);
+    // F-16: 失败路径也填真实 duration（提交到失败的耗时），而非硬编码 0，
+    // 便于区分"快速失败"与"跑很久才失败"。
+    const int64_t duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() - ctx.submit_time)
+                                    .count();
     if (metrics_enabled_) {
         ++m_tasks_completed_failed_;
     }
     if (event_manager_ != nullptr) {
         auto ev = std::make_shared<MigrationCompletedEvent>(ctx.instance_id);
         ev->SetEventTriggerTime();
-        ev->SetAdditionalArgs(
-            ctx.block_key, ctx.src_storage_name, ctx.dst_storage_name, 0, ctx.total_bytes, false, fail_reason);
+        ev->SetAdditionalArgs(ctx.block_key,
+                              ctx.src_storage_name,
+                              ctx.dst_storage_name,
+                              duration_ms,
+                              ctx.total_bytes,
+                              false,
+                              fail_reason);
         event_manager_->Publish(ev);
     }
 }
@@ -472,15 +468,9 @@ void MigrationManager::OnTaskSuccess(const std::string &instance_id, int64_t blo
     CopyTaskContext ctx;
     {
         std::lock_guard<std::mutex> lock(task_mutex_);
-        auto instance_iter = active_tasks_by_instance_.find(instance_id);
-        if (instance_iter == active_tasks_by_instance_.end()) {
+        if (!FindActiveTaskLocked(instance_id, block_key, ctx)) {
             return; // 已被取消或处理过
         }
-        auto iter = instance_iter->second.find(block_key);
-        if (iter == instance_iter->second.end()) {
-            return; // 已被取消或处理过
-        }
-        ctx = iter->second;
     }
 
     if (!IsSourceLocationServing(ctx)) {
@@ -525,14 +515,7 @@ void MigrationManager::OnTaskSuccess(const std::string &instance_id, int64_t blo
     // 最后移除活跃任务。
     {
         std::lock_guard<std::mutex> lock(task_mutex_);
-        auto instance_iter = active_tasks_by_instance_.find(ctx.instance_id);
-        if (instance_iter != active_tasks_by_instance_.end()) {
-            instance_iter->second.erase(block_key);
-            if (instance_iter->second.empty()) {
-                active_tasks_by_instance_.erase(instance_iter);
-            }
-        }
-        UpdateActiveTasksGauge();
+        RemoveActiveTaskLocked(ctx.instance_id, block_key);
     }
     stat_copy_completed_.fetch_add(1, std::memory_order_relaxed);
     const int64_t duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -561,15 +544,9 @@ void MigrationManager::OnTaskFailed(const std::string &instance_id, int64_t bloc
     CopyTaskContext ctx;
     {
         std::lock_guard<std::mutex> lock(task_mutex_);
-        auto instance_iter = active_tasks_by_instance_.find(instance_id);
-        if (instance_iter == active_tasks_by_instance_.end()) {
+        if (!FindActiveTaskLocked(instance_id, block_key, ctx)) {
             return;
         }
-        auto iter = instance_iter->second.find(block_key);
-        if (iter == instance_iter->second.end()) {
-            return;
-        }
-        ctx = iter->second;
     }
 
     // 失败：CAS 目标 WRITING -> DELETING 并删除目标半成品，源端不动。
@@ -844,8 +821,16 @@ bool MigrationManager::ClearTieredWriteMarkIfMatchInternal(const std::string &in
     if (cleared) {
         stat_marks_cleared_.fetch_add(1, std::memory_order_relaxed);
         UpdateMarksActiveGauge();
+        // F-16: 这是超时过期路径（monitor 线程按 deadline 清除），计入 expired 而非 consumed，
+        // 便于区分"引擎未及时消费的浪费" vs "被真正消费的 mark"。
         if (metrics_enabled_) {
-            ++m_marks_consumed_total_;
+            ++m_marks_expired_total_;
+        }
+        if (event_manager_ != nullptr) {
+            auto ev = std::make_shared<MigrationMarkExpiredEvent>(instance_id);
+            ev->SetEventTriggerTime();
+            ev->SetAdditionalArgs(block_key, expected_target);
+            event_manager_->Publish(ev);
         }
     }
     return cleared;
@@ -952,24 +937,34 @@ ErrorCode MigrationManager::Cancel(const std::string &instance_id, int64_t block
     CopyTaskContext ctx;
     {
         std::lock_guard<std::mutex> lock(task_mutex_);
-        auto instance_iter = active_tasks_by_instance_.find(instance_id);
-        if (instance_iter == active_tasks_by_instance_.end()) {
+        if (!FindActiveTaskLocked(instance_id, block_key, ctx)) {
             return EC_NOENT;
         }
-        auto iter = instance_iter->second.find(block_key);
-        if (iter == instance_iter->second.end()) {
-            return EC_NOENT;
-        }
-        ctx = iter->second;
-        instance_iter->second.erase(iter);
-        if (instance_iter->second.empty()) {
-            active_tasks_by_instance_.erase(instance_iter);
-        }
-        UpdateActiveTasksGauge();
+        RemoveActiveTaskLocked(instance_id, block_key);
     }
     // 清理目标半成品（CAS WRITING->DELETING + 删除）。源端不动。
     SubmitTargetLocationDelete(ctx);
     stat_copy_cancelled_.fetch_add(1, std::memory_order_relaxed);
+    // F-16: cancelled 是与 success/failed 对称的终态，补 metric + event，使 submitted 可对账
+    // （submitted == success + failed + cancelled），并让离线分析看到取消事件。
+    const int64_t duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    std::chrono::steady_clock::now() - ctx.submit_time)
+                                    .count();
+    if (metrics_enabled_) {
+        ++m_tasks_completed_cancelled_;
+    }
+    if (event_manager_ != nullptr) {
+        auto ev = std::make_shared<MigrationCompletedEvent>(ctx.instance_id);
+        ev->SetEventTriggerTime();
+        ev->SetAdditionalArgs(ctx.block_key,
+                              ctx.src_storage_name,
+                              ctx.dst_storage_name,
+                              duration_ms,
+                              ctx.total_bytes,
+                              /*success=*/false,
+                              /*fail_reason=*/"cancelled");
+        event_manager_->Publish(ev);
+    }
     KVCM_LOG_INFO("migration cancelled: instance %s block_key %ld dst_loc %s",
                   ctx.instance_id.c_str(),
                   block_key,
@@ -987,27 +982,74 @@ std::vector<ErrorCode> MigrationManager::BatchCancel(const std::string &instance
     return results;
 }
 
-bool MigrationManager::HasMigrationTask(const std::string &instance_id, int64_t block_key) const {
-    std::lock_guard<std::mutex> lock(task_mutex_);
+bool MigrationManager::InsertActiveTaskLocked(CopyTaskContext ctx) {
+    const std::string instance_id = ctx.instance_id;
+    const int64_t block_key = ctx.block_key;
+    auto &instance_tasks = active_tasks_by_instance_[instance_id];
+    if (instance_tasks.count(block_key) > 0) {
+        return false; // 已存在：调用方决定如何处理（回滚等）
+    }
+    instance_tasks[block_key] = std::move(ctx);
+    UpdateActiveTasksGauge();
+    return true;
+}
+
+bool MigrationManager::RemoveActiveTaskLocked(const std::string &instance_id, int64_t block_key) {
+    auto instance_iter = active_tasks_by_instance_.find(instance_id);
+    if (instance_iter == active_tasks_by_instance_.end()) {
+        return false;
+    }
+    const size_t erased = instance_iter->second.erase(block_key);
+    if (erased == 0) {
+        return false;
+    }
+    if (instance_iter->second.empty()) {
+        active_tasks_by_instance_.erase(instance_iter); // 内层空则收回外层，避免 stale 空 map
+    }
+    UpdateActiveTasksGauge();
+    return true;
+}
+
+bool MigrationManager::FindActiveTaskLocked(const std::string &instance_id,
+                                            int64_t block_key,
+                                            CopyTaskContext &out_ctx) const {
+    auto instance_iter = active_tasks_by_instance_.find(instance_id);
+    if (instance_iter == active_tasks_by_instance_.end()) {
+        return false;
+    }
+    auto task_iter = instance_iter->second.find(block_key);
+    if (task_iter == instance_iter->second.end()) {
+        return false;
+    }
+    out_ctx = task_iter->second;
+    return true;
+}
+
+bool MigrationManager::HasActiveTaskLocked(const std::string &instance_id, int64_t block_key) const {
     auto instance_iter = active_tasks_by_instance_.find(instance_id);
     return instance_iter != active_tasks_by_instance_.end() && instance_iter->second.count(block_key) > 0;
 }
 
-bool MigrationManager::HasActiveCopyTargetLocation(const std::string &location_id) const {
+bool MigrationManager::HasMigrationTask(const std::string &instance_id, int64_t block_key) const {
+    std::lock_guard<std::mutex> lock(task_mutex_);
+    return HasActiveTaskLocked(instance_id, block_key);
+}
+
+bool MigrationManager::HasActiveCopyTargetLocation(const std::string &instance_id,
+                                                   int64_t block_key,
+                                                   const std::string &location_id) const {
     if (location_id.empty()) {
         return false;
     }
+    // F-18: 作用域到 (instance_id, block_key)——一次 copy 任务的目标 location 属于同一 block；
+    // 直接 O(1) 定位，避免全表扫描，也避免跨 instance/block 的 id 碰撞误判。
     std::lock_guard<std::mutex> lock(task_mutex_);
-    for (const auto &instance_entry : active_tasks_by_instance_) {
-        const auto &instance_tasks = instance_entry.second;
-        for (const auto &task_entry : instance_tasks) {
-            const auto &ctx = task_entry.second;
-            if (ctx.dst_location_id == location_id) {
-                return true;
-            }
-        }
+    auto instance_iter = active_tasks_by_instance_.find(instance_id);
+    if (instance_iter == active_tasks_by_instance_.end()) {
+        return false;
     }
-    return false;
+    auto task_iter = instance_iter->second.find(block_key);
+    return task_iter != instance_iter->second.end() && task_iter->second.dst_location_id == location_id;
 }
 
 size_t MigrationManager::ActiveTaskCountUnsafe() const {
@@ -1044,8 +1086,7 @@ void MigrationManager::DebugInsertActiveCopyTask(const std::string &instance_id,
     ctx.instance_id = instance_id;
     ctx.block_key = block_key;
     ctx.dst_location_id = dst_location_id;
-    active_tasks_by_instance_[instance_id][block_key] = std::move(ctx);
-    UpdateActiveTasksGauge();
+    InsertActiveTaskLocked(std::move(ctx));
 }
 
 void MigrationManager::DebugEnableCopySubmissionsForTest() {
@@ -1088,6 +1129,134 @@ MigrationManager::CopyAdmission MigrationManager::CheckCopyAdmission(const std::
         return {CopyAdmissionStatus::kTargetWritingExists, nullptr};
     }
     return {CopyAdmissionStatus::kTargetServingExists, nullptr};
+}
+
+std::pair<ErrorCode, std::vector<std::int64_t>>
+MigrationManager::SelectMigrationCandidateKeys(RequestContext *request_context,
+                                               const std::string &trace_id,
+                                               const std::vector<int64_t> &explicit_block_keys,
+                                               int64_t sample_count,
+                                               const std::shared_ptr<MetaIndexer> &meta_indexer) const {
+    std::vector<std::int64_t> candidate_keys;
+    if (!explicit_block_keys.empty()) {
+        candidate_keys.assign(explicit_block_keys.begin(), explicit_block_keys.end());
+        return {EC_OK, std::move(candidate_keys)};
+    }
+
+    constexpr int64_t kDefaultMigrateSampleCount = 100;
+    const int64_t count = sample_count > 0 ? sample_count : kDefaultMigrateSampleCount;
+    if (const auto ec = meta_indexer->SampleReclaimKeys(request_context, count, candidate_keys); ec != EC_OK) {
+        KVCM_LOG_WARN("[%s] MigrateCache sample keys failed, ec %d", trace_id.c_str(), ec);
+        return {ec, {}};
+    }
+    return {EC_OK, std::move(candidate_keys)};
+}
+
+MigrationManager::MigrateResult MigrationManager::MigrateCache(RequestContext *request_context,
+                                                              const std::string &trace_id,
+                                                              const std::string &instance_id,
+                                                              const std::shared_ptr<MetaIndexer> &meta_indexer,
+                                                              const std::string &src_name,
+                                                              const std::string &dst_name,
+                                                              bool do_copy,
+                                                              bool do_mark,
+                                                              const std::vector<int64_t> &explicit_block_keys,
+                                                              int64_t sample_count) {
+    MigrateResult result;
+
+    // meta_indexer 由 facade 保证非空（instance 存在性已前置校验）；防御性再查一次。
+    if (meta_indexer == nullptr) {
+        result.ec = EC_INSTANCE_NOT_EXIST;
+        result.message = "instance not found: " + instance_id;
+        return result;
+    }
+
+    // 1. 选候选 block_keys：显式 block_keys 优先；否则按 rule 采样 + 过滤。
+    auto [select_ec, candidate_keys] =
+        SelectMigrationCandidateKeys(request_context, trace_id, explicit_block_keys, sample_count, meta_indexer);
+    if (select_ec != EC_OK) {
+        result.ec = select_ec;
+        result.message = "select migration candidate keys failed";
+        return result;
+    }
+
+    const int64_t total = static_cast<int64_t>(candidate_keys.size());
+    if (candidate_keys.empty()) {
+        result.ec = EC_OK;
+        result.accepted = 0;
+        result.rejected = 0;
+        result.message = "no candidate to migrate";
+        return result;
+    }
+
+    // 2. 取各 block 的 location，准入过滤（在源 storage 上、SERVING、未在迁移中、目标无副本）。
+    MetaSearcher meta_searcher(meta_indexer);
+    std::vector<CacheLocationMap> loc_maps;
+    BlockMask empty_mask;
+    if (const auto ec = meta_searcher.BatchGetLocation(request_context, candidate_keys, empty_mask, loc_maps);
+        ec != EC_OK || loc_maps.size() != candidate_keys.size()) {
+        result.ec = EC_ERROR;
+        result.message = "get cache location failed";
+        return result;
+    }
+
+    std::vector<int64_t> mark_keys;
+    std::vector<int64_t> copy_keys;
+    std::vector<MigrationRequest> copy_reqs;
+    for (size_t i = 0; i < candidate_keys.size(); ++i) {
+        const int64_t block_key = candidate_keys[i];
+        const auto admission = CheckCopyAdmission(instance_id, block_key, loc_maps[i], src_name, dst_name);
+        if (admission.status != CopyAdmissionStatus::kAccept || admission.src_location == nullptr) {
+            continue; // 已在迁移中 / 目标已有副本 / 不在源 storage 上
+        }
+        if (do_copy) {
+            MigrationRequest req;
+            req.instance_id = instance_id;
+            req.block_key = block_key;
+            req.src_location_id = admission.src_location->id();
+            req.src_storage_name = src_name;
+            req.dst_storage_name = dst_name;
+            req.retention = MigrationRetention::MIGRATION_RETENTION_DELETE_SOURCE; // API 触发默认删源
+            copy_keys.push_back(block_key);
+            copy_reqs.push_back(std::move(req));
+            continue; // Copy 优先：BOTH 时已进入 copy 的 block 不再重复 mark。
+        }
+        if (do_mark) {
+            mark_keys.push_back(block_key);
+        }
+    }
+
+    // 3. 分发：Copy -> BatchSubmit（统计 EC_OK），Mark -> MarkForTieredWrite（copy 未接纳的候选）。
+    int64_t accepted = 0;
+    if (do_copy && !copy_reqs.empty()) {
+        const auto results = BatchSubmit(trace_id, std::move(copy_reqs));
+        for (size_t i = 0; i < results.size(); ++i) {
+            const auto ec = results[i];
+            if (ec == EC_OK) {
+                ++accepted;
+            } else if (do_mark && i < copy_keys.size()) {
+                mark_keys.push_back(copy_keys[i]);
+            }
+        }
+    }
+    if (do_mark && !mark_keys.empty()) {
+        const auto mark_ec = MarkForTieredWrite(instance_id, mark_keys, dst_name);
+        if (mark_ec == EC_OK) {
+            accepted += static_cast<int64_t>(mark_keys.size());
+        } else {
+            KVCM_LOG_WARN("[%s] MigrateCache mark failed for instance %s, ec %d, keys %zu",
+                          trace_id.c_str(),
+                          instance_id.c_str(),
+                          mark_ec,
+                          mark_keys.size());
+        }
+    }
+
+    result.ec = EC_OK;
+    result.accepted = accepted;
+    result.rejected = total - accepted;
+    result.message = "migrate cache dispatched";
+    return result;
 }
 
 MigrationManager::MigrationStats MigrationManager::GetStats() const {
