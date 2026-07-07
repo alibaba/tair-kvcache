@@ -46,13 +46,19 @@ cd kv_cache_manager/client_java
 
 ### Test Classes
 
-1. **CacheAwareGrpcTest** (16 tests)
+1. **CacheAwareTestBase** (abstract base class)
+   - Shared test logic for all CacheAware RPCs
+   - Setup helpers: `registerInstance`, `startWriteCache`, `finishWriteCache`
+   - 15 shared test methods covering 3 RPCs
+
+2. **CacheAwareGrpcTest** (15 tests)
    - Tests all 3 CacheAware RPCs via gRPC
    - Covers normal, error, and boundary scenarios
+   - Includes `GetCacheLocationLen` tests (gRPC only)
 
-2. **CacheAwareHttpTest** (11 tests)
+3. **CacheAwareHttpTest** (11 tests)
    - Tests 2 CacheAware RPCs via HTTP
-   - Excludes GetCacheLocationLen (no HTTP endpoint)
+   - Excludes `GetCacheLocationLen` (no HTTP endpoint)
    - Includes HTTP 404 verification test
 
 ### Test Coverage
@@ -65,13 +71,12 @@ cd kv_cache_manager/client_java
 - Location spec names filtering
 - Token IDs to block keys conversion
 
-#### GetCacheLocationLen (6 scenarios)
+#### GetCacheLocationLen (5 scenarios)
 - QT_PREFIX_MATCH with prefix break
 - QT_PREFIX_MATCH with no matches
 - QT_BATCH_GET with existing keys
 - QT_BATCH_GET with no matches
 - Consistency with GetCacheLocation
-- Documented limitation (no HTTP endpoint)
 
 #### GetCacheMeta (4 scenarios)
 - CLS_SERVING status after write
@@ -155,11 +160,17 @@ IntegrationTestBase
     ├── @BeforeEach: generate unique instanceId
     └── Helper methods: registerInstance, startWriteCache, finishWriteCache
 
-CacheAwareGrpcTest extends IntegrationTestBase
-    └── 16 test methods (gRPC protocol)
+CacheAwareTestBase extends IntegrationTestBase
+    ├── Abstract method: getClient()
+    └── 15 shared test methods (RPC logic)
 
-CacheAwareHttpTest extends IntegrationTestBase
-    └── 11 test methods (HTTP protocol)
+CacheAwareGrpcTest extends CacheAwareTestBase
+    ├── getClient() → grpcClient
+    └── 15 test methods (gRPC protocol)
+
+CacheAwareHttpTest extends CacheAwareTestBase
+    ├── getClient() → httpClient
+    └── 11 test methods (HTTP protocol, excludes GetCacheLocationLen)
 
 KvcmServerManager
     ├── Port allocation (ServerSocket)
@@ -169,9 +180,9 @@ KvcmServerManager
     └── Work directory management
 ```
 
-## References
+## Test Results
 
-- Python Integration Tests: `integration_test/meta_service/`
-- Proto Definitions: `kv_cache_manager/protocol/protobuf/meta_service.proto`
-- Java Client Source: `kv_cache_manager/client_java/src/main/java/com/kvcm/client/`
-- OpenSpec Test Plan: `openspec/changes/java-client-integration-tests/`
+Total: **59 tests**
+- Unit tests: 33 passed
+- Integration tests: 26 passed (15 gRPC + 11 HTTP)
+
