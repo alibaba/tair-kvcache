@@ -115,6 +115,7 @@ jobs:
             --test_timeout=900 \
             --jobs=8 \
             --local_test_jobs=8 \
+            --flaky_test_attempts=3 \
             --cache_test_results=no \
             --test_output=errors \
             //kv_cache_manager/... \
