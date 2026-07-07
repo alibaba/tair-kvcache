@@ -40,8 +40,8 @@ public class AutoFailoverClient implements MetaClient {
 
     AutoFailoverClient(MetaClientConfig config) {
         this.config = config;
-        this.currentAddress = new LeaderAddress(config.getSeedAddress(), config.getGrpcPort());
-        this.grpcClient = new GrpcMetaClient(currentAddress.host, currentAddress.port,
+        this.currentAddress = new LeaderAddress(config.getSeedAddress(), config.getGrpcPort(), config.getHttpPort());
+        this.grpcClient = new GrpcMetaClient(currentAddress.host, currentAddress.grpcPort,
                 config.getCallTimeoutMs());
 
         if (config.isHttpEnabled()) {
@@ -190,7 +190,7 @@ public class AutoFailoverClient implements MetaClient {
      * Core failover template:
      * 1. Try gRPC
      * 2. On SERVER_NOT_LEADER → discover leader → rebuild channel → retry (up to leaderRetryCount)
-     * 3. On gRPC IO error → fallback to HTTP if available (propagate SERVER_NOT_LEADER for re-discovery)
+     * 3. On gRPC IO error → fallback to HTTP if available, trigger leader re-discovery
      */
     private <T> T withFailover(RpcCall<T> rpc) {
         ensureOpen();
@@ -223,24 +223,44 @@ public class AutoFailoverClient implements MetaClient {
                     throw new KvcmException(ErrorCode.IO_ERROR, "Interrupted during failover backoff", ie);
                 }
             } catch (KvcmException e) {
-                HttpMetaClient http = httpClient;
-                if (e.getErrorCode() == ErrorCode.IO_ERROR && http != null) {
-                    LOG.warn("gRPC call failed with IO error, falling back to HTTP: {}", e.getMessage());
-                    try {
-                        return rpc.execute(http);
-                    } catch (ServerNotLeaderException httpNotLeader) {
-                        // Propagate SERVER_NOT_LEADER from HTTP path for re-discovery
-                        LOG.warn("HTTP fallback also returned SERVER_NOT_LEADER, triggering re-discovery");
-                        if (leaderDiscovery != null) {
-                            leaderDiscovery.triggerImmediateRefresh();
+                if (e.getErrorCode() == ErrorCode.IO_ERROR) {
+                    // Trigger leader re-discovery on IO error (leader may be dead)
+                    if (leaderDiscovery != null) {
+                        leaderDiscovery.triggerImmediateRefresh();
+                        if (leaderDiscovery.discoverLeader()) {
+                            reconnectIfNeeded();
                         }
-                        throw httpNotLeader;
-                    } catch (Exception httpEx) {
-                        LOG.error("Both gRPC and HTTP transports failed", httpEx);
-                        throw new KvcmException(ErrorCode.IO_ERROR,
-                                "All transports failed. gRPC: " + e.getMessage()
-                                        + ", HTTP: " + httpEx.getMessage(),
-                                httpEx);
+                    }
+
+                    HttpMetaClient http = httpClient;
+                    if (http != null) {
+                        LOG.warn("gRPC call failed with IO error, falling back to HTTP: {}", e.getMessage());
+                        try {
+                            return rpc.execute(http);
+                        } catch (ServerNotLeaderException httpNotLeader) {
+                            // Propagate SERVER_NOT_LEADER from HTTP path for re-discovery
+                            LOG.warn("HTTP fallback also returned SERVER_NOT_LEADER, triggering re-discovery");
+                            if (leaderDiscovery != null) {
+                                leaderDiscovery.triggerImmediateRefresh();
+                            }
+                            throw httpNotLeader;
+                        } catch (KvcmException httpKvcm) {
+                            // Preserve application-level error codes from HTTP
+                            if (httpKvcm.getErrorCode() != ErrorCode.IO_ERROR) {
+                                throw httpKvcm;
+                            }
+                            LOG.error("Both gRPC and HTTP transports failed", httpKvcm);
+                            throw new KvcmException(ErrorCode.IO_ERROR,
+                                    "All transports failed. gRPC: " + e.getMessage()
+                                            + ", HTTP: " + httpKvcm.getMessage(),
+                                    httpKvcm);
+                        } catch (Exception httpEx) {
+                            LOG.error("Both gRPC and HTTP transports failed", httpEx);
+                            throw new KvcmException(ErrorCode.IO_ERROR,
+                                    "All transports failed. gRPC: " + e.getMessage()
+                                            + ", HTTP: " + httpEx.getMessage(),
+                                    httpEx);
+                        }
                     }
                 }
                 throw e;
@@ -258,16 +278,17 @@ public class AutoFailoverClient implements MetaClient {
                 return;
             }
             LOG.info("Reconnecting from {}:{} to {}:{}",
-                    currentAddress.host, currentAddress.port, leaderAddr.host, leaderAddr.port);
+                    currentAddress.host, currentAddress.grpcPort, leaderAddr.host, leaderAddr.grpcPort);
 
             // Replace gRPC client
             GrpcMetaClient oldGrpc = grpcClient;
-            grpcClient = new GrpcMetaClient(leaderAddr.host, leaderAddr.port, config.getCallTimeoutMs());
+            grpcClient = new GrpcMetaClient(leaderAddr.host, leaderAddr.grpcPort, config.getCallTimeoutMs());
 
             // Recreate HTTP client to follow leader (if HTTP enabled)
             HttpMetaClient oldHttp = httpClient;
             if (config.isHttpEnabled()) {
-                httpClient = new HttpMetaClient(leaderAddr.host, config.getHttpPort(),
+                int httpPort = leaderAddr.httpPort > 0 ? leaderAddr.httpPort : config.getHttpPort();
+                httpClient = new HttpMetaClient(leaderAddr.host, httpPort,
                         config.getCallTimeoutMs());
             }
 

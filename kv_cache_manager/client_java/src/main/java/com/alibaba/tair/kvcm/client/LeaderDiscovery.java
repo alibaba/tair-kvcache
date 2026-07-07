@@ -22,29 +22,38 @@ import java.util.concurrent.atomic.AtomicLong;
  * (e.g., on SERVER_NOT_LEADER or connection failure).
  */
 /**
- * Immutable holder for leader address (host + port).
- * Ensures atomic reads of both fields.
+ * Immutable holder for leader address (host + ports).
+ * Ensures atomic reads of all fields.
  */
 final class LeaderAddress {
     final String host;
-    final int port;
+    final int grpcPort;
+    final int httpPort;
 
-    LeaderAddress(String host, int port) {
-        this.host = host;
-        this.port = port;
+    LeaderAddress(String host, int grpcPort) {
+        this(host, grpcPort, 0);
     }
+
+    LeaderAddress(String host, int grpcPort, int httpPort) {
+        this.host = host;
+        this.grpcPort = grpcPort;
+        this.httpPort = httpPort;
+    }
+
+    /** For backward compatibility: port() returns grpcPort. */
+    int port() { return grpcPort; }
 
     @Override
     public boolean equals(Object o) {
         if (this == o) return true;
         if (!(o instanceof LeaderAddress)) return false;
         LeaderAddress that = (LeaderAddress) o;
-        return port == that.port && host.equals(that.host);
+        return grpcPort == that.grpcPort && httpPort == that.httpPort && host.equals(that.host);
     }
 
     @Override
     public int hashCode() {
-        return 31 * host.hashCode() + port;
+        return 31 * (31 * host.hashCode() + grpcPort) + httpPort;
     }
 }
 
@@ -161,11 +170,12 @@ class LeaderDiscovery {
             }
 
             // C3 fix: Atomic update via immutable holder
-            LeaderAddress newAddress = new LeaderAddress(endpoint.getHost(), endpoint.getMetaRpcPort());
+            LeaderAddress newAddress = new LeaderAddress(
+                    endpoint.getHost(), endpoint.getMetaRpcPort(), endpoint.getMetaHttpPort());
             LeaderAddress old = currentAddress;
             if (!newAddress.equals(old)) {
                 LOG.info("Leader discovered: switching from {}:{} to {}:{}",
-                        old.host, old.port, newAddress.host, newAddress.port);
+                        old.host, old.grpcPort, newAddress.host, newAddress.grpcPort);
                 currentAddress = newAddress;
             }
             return true;
@@ -186,7 +196,7 @@ class LeaderDiscovery {
 
     LeaderAddress getCurrentAddress() { return currentAddress; }
     String getCurrentHost() { return currentAddress.host; }
-    int getCurrentPort() { return currentAddress.port; }
+    int getCurrentPort() { return currentAddress.grpcPort; }
 
     void stop() {
         running.set(false);
