@@ -337,14 +337,6 @@ public class CacheAwareGrpcTest extends IntegrationTestBase {
         assertEquals(locationResponse.getLocationsCount(), lenResponse.getCacheLocationLen());
     }
 
-    @Test
-    void testGetCacheLocationLen_documentedLimitation() {
-        // This test documents that GetCacheLocationLen has no HTTP endpoint
-        // See task 5.6: Document that GetCacheLocationLen has no HTTP endpoint (known limitation)
-        // The HTTP test suite will skip this RPC
-        assertTrue(true, "GetCacheLocationLen has no HTTP endpoint - documented limitation");
-    }
-
     // === GetCacheMeta Tests ===
 
     @Test

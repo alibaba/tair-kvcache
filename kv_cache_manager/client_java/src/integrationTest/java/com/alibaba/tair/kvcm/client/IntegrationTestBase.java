@@ -47,6 +47,9 @@ public abstract class IntegrationTestBase {
         if (grpcClient != null) {
             grpcClient.close();
         }
+        if (httpClient != null) {
+            httpClient.close();
+        }
         if (server != null) {
             server.stop();
         }

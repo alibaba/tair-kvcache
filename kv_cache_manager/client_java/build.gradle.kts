@@ -3,7 +3,7 @@ plugins {
     id("com.google.protobuf") version "0.9.4"
 }
 
-group = "com.kvcm"
+group = "com.alibaba.tair.kvcm"
 version = "0.1.0-SNAPSHOT"
 
 repositories {
@@ -109,8 +109,11 @@ tasks.register<Test>("integrationTest") {
     useJUnitPlatform()
     mustRunAfter(tasks.test)
     
-    // Pass KVCM_BIN environment variable to tests
-    environment("KVCM_BIN", System.getenv("KVCM_BIN") ?: "")
+    // Pass KVCM_BIN environment variable to tests (only if set)
+    val kvcmBin = System.getenv("KVCM_BIN")
+    if (kvcmBin != null) {
+        environment("KVCM_BIN", kvcmBin)
+    }
     
     // Show test output
     testLogging {

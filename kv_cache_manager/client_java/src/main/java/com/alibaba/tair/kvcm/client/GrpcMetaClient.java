@@ -27,6 +27,7 @@ public class GrpcMetaClient implements MetaClient {
         this.callTimeoutMs = callTimeoutMs;
         // C3 fix: Add gRPC-level retry policy matching C++ client behavior
         java.util.Map<String, Object> retryPolicy = new java.util.HashMap<>();
+        // gRPC service config expects JSON number types as Java Double, not Integer
         retryPolicy.put("maxAttempts", 3.0);
         retryPolicy.put("initialBackoff", "0.1s");
         retryPolicy.put("maxBackoff", "1s");

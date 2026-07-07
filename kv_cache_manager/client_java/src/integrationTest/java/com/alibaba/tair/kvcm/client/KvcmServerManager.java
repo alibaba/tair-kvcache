@@ -13,7 +13,6 @@ import java.io.IOException;
 import java.net.ServerSocket;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.util.Comparator;
 import java.util.concurrent.TimeUnit;
 
@@ -275,18 +274,6 @@ public class KvcmServerManager {
                 channel.awaitTermination(1, TimeUnit.SECONDS);
             }
         }
-    }
-
-    private String readStderr() {
-        Path stderrPath = workDir.resolve("stderr.log");
-        if (Files.exists(stderrPath)) {
-            try {
-                return new String(Files.readAllBytes(stderrPath));
-            } catch (IOException e) {
-                return "(unable to read stderr: " + e.getMessage() + ")";
-            }
-        }
-        return "(stderr.log not found)";
     }
 
     private void cleanupWorkDirectory() {
