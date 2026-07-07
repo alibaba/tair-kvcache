@@ -34,12 +34,19 @@ jobs:
           - name: unit_test
             test_target: "//kv_cache_manager/..."
             test_args: ""
+            save_disk_cache: true
           - name: integration_test
             test_target: "//integration_test/..."
             test_args: ""
+            save_disk_cache: true
+          - name: asan_test
+            test_target: "//kv_cache_manager/... //integration_test/..."
+            test_args: "--config=debug --config=asan"
+            save_disk_cache: true
           - name: client_test
             test_target: "//kv_cache_manager/client/..."
             test_args: "--config=client"
+            save_disk_cache: true
     name: ${{ matrix.name }}
     runs-on: ${{ inputs.runs-on || vars.TEST_OPEN_SRC_RUNS_ON || 'ubuntu-latest' }}
     container:
@@ -67,7 +74,7 @@ jobs:
           bazelisk-cache: true
           disk-cache: ${{ runner.os }}-${{ github.workflow }}-${{ matrix.name }}
           repository-cache: true
-          cache-save: ${{ inputs.rebuildDiskCache || false }}
+          cache-save: ${{ matrix.save_disk_cache && (github.event_name == 'push' || (inputs.rebuildDiskCache || false)) }}
       - &clean_disk_cache_step
         name: clean_disk_cache
         if: ${{ inputs.rebuildDiskCache || false }}
@@ -93,7 +100,7 @@ jobs:
           bazelisk test ${{ matrix.test_target }} ${{ matrix.test_args }} --config=ci_fast --cache_test_results=no --test_output=errors
       - &delete_old_disk_cache_step
         name: delete_old_disk_cache
-        if: ${{ inputs.rebuildDiskCache || false }}
+        if: ${{ matrix.save_disk_cache && (github.event_name == 'push' || (inputs.rebuildDiskCache || false)) }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

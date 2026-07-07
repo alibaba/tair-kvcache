@@ -51,6 +51,17 @@ bazelisk info --announce_rc repository_cache
   - 需要本地启动一个Redis或Valkey。
   - ```bazelisk test //kv_cache_manager/common/test:redis_client_real_service_test //kv_cache_manager/meta/test:meta_redis_backend_real_service_test //kv_cache_manager/meta/test:meta_storage_backend_manager_real_redis_test //kv_cache_manager/meta/test:meta_indexer_redis_test //kv_cache_manager/manager/test:MetaSearcherRedisTest //kv_cache_manager/config/test:registry_manager_redis_backend_test --test_tag_filters=redis```
 - 启用ASAN：上述命令后添加 ```--config=debug --config=asan --test_env ASAN_OPTIONS=detect_odr_violation=0```
+- 覆盖率：
+  - ```REAL_GCOV_BIN="$(command -v gcov-$(gcc -dumpversion | cut -d. -f1) || command -v gcov)"```
+  - ```GCOV_BIN="${PWD}/tools/coverage/gcov_json_isolated.sh"```
+  - ```bazelisk coverage --config=debug --combined_report=lcov --instrumentation_filter="^//kv_cache_manager" --action_env=GCOV="${GCOV_BIN}" --test_env=GCOV="${GCOV_BIN}" --action_env=KVCM_REAL_GCOV="${REAL_GCOV_BIN}" --test_env=KVCM_REAL_GCOV="${REAL_GCOV_BIN}" --test_timeout=900 --jobs=8 --local_test_jobs=8 //kv_cache_manager/... //integration_test/...```
+  - ```gcov_json_isolated.sh``` 用于规避 Bazel 6.4 C++ coverage collector 在并发 gcov json 采集时共享 ```*.gcov.json.gz``` 中间文件导致的竞态。
+  - 增量覆盖率报告：```python3 tools/coverage/coverage_report.py --lcov bazel-out/_coverage/_coverage_report.dat --base-ref origin/main --head-ref HEAD --include-prefix kv_cache_manager/```
+  - HTML 报告：安装 lcov 后执行 ```mkdir -p coverage && cp bazel-out/_coverage/_coverage_report.dat coverage/lcov.info && genhtml coverage/lcov.info --output-directory coverage/html --title "tair-kvcache coverage" --legend --show-details --ignore-errors source --ignore-errors negative```，入口为 ```coverage/html/index.html```。
+  - 分支覆盖率需要 LCOV 中包含 ```BRDA/BRF/BRH``` 记录；当前 Bazel 6.4 默认 C++ coverage 只生成行覆盖率。
+  - CI 会上传 ```coverage/lcov.info```、```coverage/coverage-summary.md```、```coverage/coverage-summary.json``` 和 ```coverage/html/```。
+  - GitHub Actions cache 空间有限；CI 为普通单测、集成测试、客户端测试、ASAN 和 coverage 各保留一份主分支 Bazel disk cache。PR 只读取 cache，不写入；main push 或手动 ```rebuildDiskCache``` 会在测试成功后替换对应旧 cache，避免同类 cache 多版本堆积。ASAN 的单测与集成测试放在同一个 job/cache 中，减少 cache 数量。
+  - ```test-opensrc``` 可通过 workflow_dispatch 的 ```runs-on``` 或仓库变量 ```TEST_OPEN_SRC_RUNS_ON``` 选择 ```ubuntu-latest```、```ubuntu-24.04-arm``` 或 ```aliyun-ecs-x64```；```coverage``` 可通过 workflow_dispatch 的 ```runs-on``` 或仓库变量 ```COVERAGE_RUNS_ON``` 选择同样的 runner。
 ### 测试资源清理
 
 测试结束后会自动清理资源。测试工作目录位于 bazel runfiles 目录中，不会污染源代码目录。如果测试异常退出，可能需要手动清理：
@@ -158,4 +169,4 @@ githooks中已经添加了C++等语言的格式化脚本，请确保开发环境
 提交前检查和 commit message 格式见 [Commit 要求](commit_requirements.md)。
 
 ## CI
-可参考```.github/workflows```目录下的配置。
+可参考```.github/workflows```目录下的配置。```test-opensrc``` 包含普通测试和 ASAN 测试；```coverage``` 负责全量 LCOV 与增量覆盖率采集。
