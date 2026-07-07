@@ -137,6 +137,13 @@ class MultiLocationTest(abc.ABC, TestBase, unittest.TestCase):
                                     required_specs={"tp1"},
                                     absent_specs={"tp0"})
 
+        # Dummy storage uses deterministic paths for the same key/spec.  Put
+        # marker files back on the old GroupA paths: if stale metadata still
+        # exists, StartWriteCache treats it as covered until the queued prune
+        # deletes the markers and removes the old metadata; if prune already
+        # finished, these markers simply become the rewritten data files.
+        self._touch_cache_locations(locs_a)
+
         # Rewrite with GroupA.  StartWriteCache may still observe async
         # deleting metadata, so retry until write filtering allocates all
         # missing GroupA locations.  Failed attempts are explicitly aborted.
@@ -229,8 +236,10 @@ class MultiLocationTest(abc.ABC, TestBase, unittest.TestCase):
                 self._finish_write_blocks(write_session_id, len(locations))
                 return locations
 
+            self._touch_cache_locations(locations)
             self._finish_write_blocks(write_session_id, len(locations),
                                       success=False)
+            self._wait_for_locations_absent(locations)
             mismatch = self._format_start_write_mismatch(
                 resp, locations, expected_location_count)
             logging.info(
@@ -348,18 +357,41 @@ class MultiLocationTest(abc.ABC, TestBase, unittest.TestCase):
             f"expected {expected_count}; "
             f"block_mask={resp.get('block_mask')}, uris={uris}")
 
+    def _wait_for_locations_absent(self, locations):
+        paths = self._location_paths(locations)
+        for attempt in range(1, self.POLL_ATTEMPTS + 1):
+            remaining = [path for path in paths if os.path.exists(path)]
+            if not remaining:
+                return
+            logging.info(
+                "attempt %d/%d: waiting for aborted write cleanup, "
+                "remaining_paths=%s",
+                attempt,
+                self.POLL_ATTEMPTS,
+                remaining)
+            if attempt < self.POLL_ATTEMPTS:
+                time.sleep(self.POLL_INTERVAL_SECONDS)
+
+        self.fail(f"aborted write cleanup did not delete paths: {remaining}")
+
+    @staticmethod
+    def _location_paths(locations):
+        return [
+            urlparse(spec["uri"]).path
+            for loc in locations
+            for spec in loc.get("location_specs", [])
+        ]
+
     @staticmethod
     def _touch_cache_locations(locations):
         """Simulate the cache data write by creating data files."""
-        for loc in locations:
-            for spec in loc.get("location_specs", []):
-                file_path = urlparse(spec["uri"]).path
-                try:
-                    os.utime(file_path)
-                except FileNotFoundError:
-                    os.makedirs(os.path.dirname(file_path), exist_ok=True)
-                    with open(file_path, 'x') as _:
-                        pass
+        for file_path in MultiLocationTest._location_paths(locations):
+            try:
+                os.utime(file_path)
+            except FileNotFoundError:
+                os.makedirs(os.path.dirname(file_path), exist_ok=True)
+                with open(file_path, 'x') as _:
+                    pass
 
     @staticmethod
     def _delete_cache_locations(locations, indices):
