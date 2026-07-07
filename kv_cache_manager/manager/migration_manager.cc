@@ -1136,6 +1136,20 @@ size_t MigrationManager::ActiveTaskCount() const {
     return ActiveTaskCountUnsafe();
 }
 
+std::vector<int64_t> MigrationManager::GetActiveBlockKeysForInstance(const std::string &instance_id) const {
+    std::lock_guard<std::mutex> lock(task_mutex_);
+    auto instance_iter = active_tasks_by_instance_.find(instance_id);
+    if (instance_iter == active_tasks_by_instance_.end()) {
+        return {};
+    }
+    std::vector<int64_t> keys;
+    keys.reserve(instance_iter->second.size());
+    for (const auto &entry : instance_iter->second) {
+        keys.push_back(entry.first);
+    }
+    return keys;
+}
+
 std::string MigrationManager::GetActiveTaskDstLocation(const std::string &instance_id, int64_t block_key) const {
     std::lock_guard<std::mutex> lock(task_mutex_);
     auto instance_iter = active_tasks_by_instance_.find(instance_id);

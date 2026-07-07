@@ -392,12 +392,49 @@ ErrorCode CacheManager::RemoveInstance(RequestContext *request_context,
     SPAN_TRACER(request_context);
     const auto &trace_id = request_context->trace_id();
 
+    // F-12: drain 活跃迁移 copy 后再 trim，避免 trim 与 backend copy 竞态
+    // （trim 把 active copy 的 WRITING 目标 CAS→DELETING 删掉 / copy 成功后 promote 的 SERVING 目标被 trim 删）。
+    // 步骤：暂停 reclaimer（阻止新迁移提交）→ cancel 活跃 copy → 有界等待完成 → 恢复 reclaimer。
+    if (migration_manager_ != nullptr) {
+        PauseReclaimer();
+        const auto active_keys = migration_manager_->GetActiveBlockKeysForInstance(instance_id);
+        if (!active_keys.empty()) {
+            migration_manager_->BatchCancel(instance_id, active_keys);
+            // 有界等待：cancelling 任务由 monitor 线程在 copy future 完成后清理（F-11 延迟收尾）。
+            constexpr int kDrainTimeoutMs = 5000;
+            constexpr int kPollIntervalMs = 50;
+            int waited_ms = 0;
+            while (waited_ms < kDrainTimeoutMs) {
+                if (migration_manager_->GetActiveBlockKeysForInstance(instance_id).empty()) {
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(kPollIntervalMs));
+                waited_ms += kPollIntervalMs;
+            }
+            if (!migration_manager_->GetActiveBlockKeysForInstance(instance_id).empty()) {
+                KVCM_LOG_WARN("[%s] RemoveInstance drain timeout (%dms) for instance %s, "
+                              "proceeding with trim; residual WRITING targets will be orphan-cleaned",
+                              trace_id.c_str(),
+                              kDrainTimeoutMs,
+                              instance_id.c_str());
+            }
+        }
+    }
+
     auto ec = registry_manager_->RemoveInstance(request_context, instance_group, instance_id);
-    RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "remove instance failed");
+    if (ec != EC_OK) {
+        if (migration_manager_ != nullptr) {
+            ResumeReclaimer();
+        }
+        RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "remove instance failed");
+    }
 
     InvalidateInstanceMetrics(instance_id);
 
     ec = TrimCache(request_context, instance_id, proto::meta::TrimStrategy::TS_REMOVE_ALL_CACHE);
+    if (migration_manager_ != nullptr) {
+        ResumeReclaimer();
+    }
     RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "remove instance failed");
     PREFIX_LOG(INFO, "remove instance OK");
     return ec;

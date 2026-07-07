@@ -1134,6 +1134,76 @@ TEST_F(MigrationManagerTest, TestStopDropsActiveTasks) {
     mgr.Stop();
 }
 
+// F-12: GetActiveBlockKeysForInstance 返回指定 instance 的活跃 block_key 列表（用于 drain 前 BatchCancel）。
+TEST_F(MigrationManagerTest, TestGetActiveBlockKeysForInstance) {
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    const std::string other_instance = "other_instance";
+
+    // 空 instance → 空列表
+    ASSERT_TRUE(mgr.GetActiveBlockKeysForInstance(kInstance).empty());
+
+    mgr.DebugInsertActiveCopyTask(kInstance, 1001, "loc_a");
+    mgr.DebugInsertActiveCopyTask(kInstance, 1002, "loc_b");
+    mgr.DebugInsertActiveCopyTask(other_instance, 2001, "loc_c");
+
+    auto keys = mgr.GetActiveBlockKeysForInstance(kInstance);
+    ASSERT_EQ(2u, keys.size());
+    std::sort(keys.begin(), keys.end());
+    ASSERT_EQ(1001, keys[0]);
+    ASSERT_EQ(1002, keys[1]);
+
+    // other_instance 独立
+    auto other_keys = mgr.GetActiveBlockKeysForInstance(other_instance);
+    ASSERT_EQ(1u, other_keys.size());
+    ASSERT_EQ(2001, other_keys[0]);
+
+    // 不存在的 instance → 空列表
+    ASSERT_TRUE(mgr.GetActiveBlockKeysForInstance("no_such").empty());
+}
+
+// F-12: BatchCancel + GetActiveBlockKeysForInstance 配合实现 drain：
+// cancel 后 copy 完成回调清理活跃任务，block keys 列表变空。
+TEST_F(MigrationManagerTest, TestDrainInstanceViaBatchCancelAndPoll) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "drain_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "drain_cold/"));
+
+    const int64_t bk1 = 801, bk2 = 802;
+    const std::string src1 = CreateSourceLocation(bk1, "hot_01", true, "d1");
+    const std::string src2 = CreateSourceLocation(bk2, "hot_01", true, "d2");
+
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    mgr.DebugEnableCopySubmissionsForTest();
+
+    auto submit = [&](int64_t bk, const std::string &src_loc) {
+        MigrationManager::MigrationRequest req;
+        req.instance_id = kInstance;
+        req.block_key = bk;
+        req.src_location_id = src_loc;
+        req.src_storage_name = "hot_01";
+        req.dst_storage_name = "cold_01";
+        return mgr.Submit("t", req);
+    };
+    ASSERT_EQ(ErrorCode::EC_OK, submit(bk1, src1));
+    ASSERT_EQ(ErrorCode::EC_OK, submit(bk2, src2));
+    ASSERT_EQ(2u, mgr.GetActiveBlockKeysForInstance(kInstance).size());
+
+    // drain: 取 keys → BatchCancel
+    const auto keys = mgr.GetActiveBlockKeysForInstance(kInstance);
+    mgr.BatchCancel(kInstance, keys);
+
+    // 任务标为 cancelling，仍在活跃表
+    ASSERT_EQ(2u, mgr.GetActiveBlockKeysForInstance(kInstance).size());
+
+    // 模拟 copy 完成回调（monitor 线程未启动，手动驱动）
+    mgr.OnTaskSuccess(kInstance, bk1);
+    mgr.OnTaskFailed(kInstance, bk2, ErrorCode::EC_IO_ERROR);
+
+    // drain 完成：活跃表空
+    ASSERT_TRUE(mgr.GetActiveBlockKeysForInstance(kInstance).empty());
+    ASSERT_EQ(2u, mgr.GetStats().copy_cancelled);
+}
+
 // F-18: HasActiveCopyTargetLocation 按 (instance_id, block_key) 作用域判断——
 // 两个不同 instance/block 用相同 dst_location_id 时，只有匹配 scope 的那个才应被保护。
 TEST_F(MigrationManagerTest, TestHasActiveCopyTargetLocationIsScoped) {

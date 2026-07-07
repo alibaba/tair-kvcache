@@ -125,6 +125,8 @@ public:
                                      int64_t block_key,
                                      const std::string &location_id) const;
     size_t ActiveTaskCount() const;
+    // F-12: 取指定 instance 的活跃 copy task block_key 列表（用于 drain 前 BatchCancel）。
+    std::vector<int64_t> GetActiveBlockKeysForInstance(const std::string &instance_id) const;
 
     // ---- Copy 准入策略（CacheReclaimer / AdminServiceImpl 共用） ----
     enum class CopyAdmissionStatus {
