@@ -25,32 +25,10 @@ public class GrpcMetaClient implements MetaClient {
 
     public GrpcMetaClient(String host, int port, int callTimeoutMs) {
         this.callTimeoutMs = callTimeoutMs;
-        // C3 fix: Add gRPC-level retry policy matching C++ client behavior
-        java.util.Map<String, Object> retryPolicy = new java.util.HashMap<>();
-        // gRPC service config expects JSON number types as Java Double, not Integer
-        retryPolicy.put("maxAttempts", 3.0);
-        retryPolicy.put("initialBackoff", "0.1s");
-        retryPolicy.put("maxBackoff", "1s");
-        retryPolicy.put("backoffMultiplier", 1.5);
-        retryPolicy.put("retryableStatusCodes", java.util.Arrays.asList("UNAVAILABLE"));
-
-        java.util.Map<String, Object> name = new java.util.HashMap<>();
-        name.put("service", "kv_cache_manager.proto.meta.MetaService");
-
-        java.util.Map<String, Object> methodConfig = new java.util.HashMap<>();
-        methodConfig.put("name", java.util.Arrays.asList(name));
-        methodConfig.put("waitForReady", true);
-        methodConfig.put("timeout", (callTimeoutMs / 1000.0) + "s");
-        methodConfig.put("retryPolicy", retryPolicy);
-
-        java.util.Map<String, Object> serviceConfig = new java.util.HashMap<>();
-        serviceConfig.put("methodConfig", java.util.Arrays.asList(methodConfig));
 
         this.channel = ManagedChannelBuilder.forAddress(host, port)
                 .usePlaintext()
                 .maxInboundMessageSize(Integer.MAX_VALUE)
-                .defaultServiceConfig(serviceConfig)
-                .enableRetry()
                 .keepAliveTime(10, TimeUnit.SECONDS)
                 .keepAliveTimeout(10, TimeUnit.SECONDS)
                 .keepAliveWithoutCalls(true)
