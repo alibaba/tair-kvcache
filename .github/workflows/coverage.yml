@@ -1,0 +1,211 @@
+name: coverage
+permissions:
+  contents: read
+  actions: write
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+    inputs:
+      runs-on:
+        description: "Runner type"
+        type: choice
+        options:
+          - ubuntu-24.04-arm
+          - ubuntu-latest
+          - aliyun-ecs-x64
+        default: ubuntu-latest
+      rebuildDiskCache:
+        description: "Rebuild disk cache"
+        type: boolean
+        default: false
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ inputs.runs-on || vars.COVERAGE_RUNS_ON || 'ubuntu-latest' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  coverage-github:
+    if: ${{ (inputs.runs-on || vars.COVERAGE_RUNS_ON || 'ubuntu-latest') == 'ubuntu-latest' || (inputs.runs-on || vars.COVERAGE_RUNS_ON || 'ubuntu-latest') == 'ubuntu-24.04-arm' }}
+    name: coverage
+    runs-on: ${{ inputs.runs-on || vars.COVERAGE_RUNS_ON || 'ubuntu-latest' }}
+    container:
+      image: ghcr.io/alibaba/tair-kvcache-kvcm-dev:2026_02_13_12_03_24230b1
+      volumes:
+        - /:/host_root/
+      options: --privileged
+    steps:
+      # https://github.com/actions/runner-images/issues/2840
+      - name: Free up disk space
+        run: |
+          echo "Disk space before cleanup:"
+          df -h
+          rm -rf /host_root/usr/share/dotnet
+          rm -rf /host_root/usr/local/lib/android
+          rm -rf /host_root/opt/ghc
+          echo "Disk space after cleanup:"
+          df -h
+
+      - &checkout_step
+        name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - &setup_bazel_step
+        name: setup_bazel
+        uses: bazel-contrib/setup-bazel@0.18.0
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ runner.os }}-${{ github.workflow }}
+          repository-cache: true
+          cache-save: ${{ github.event_name == 'push' || (inputs.rebuildDiskCache || false) }}
+
+      - &clean_disk_cache_step
+        name: clean_disk_cache
+        if: ${{ inputs.rebuildDiskCache || false }}
+        run: |
+          rm -rf ~/.cache/bazel-disk
+
+      - &install_coverage_tools_step
+        name: install_coverage_tools
+        run: |
+          set -e
+          set -x
+          if ! command -v genhtml >/dev/null 2>&1; then
+            if command -v apt-get >/dev/null 2>&1; then
+              apt-get update -qq
+              DEBIAN_FRONTEND=noninteractive apt-get install -y -qq lcov
+            elif command -v yum >/dev/null 2>&1; then
+              yum install -y -q lcov
+            else
+              echo "No supported package manager found for installing lcov/genhtml" >&2
+              exit 1
+            fi
+          fi
+          genhtml --version
+
+      - &bazel_coverage_step
+        name: bazel_coverage
+        env:
+          COVERAGE_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before || 'origin/main' }}
+        run: |
+          set -e
+          set -x
+          BASE_REF="${COVERAGE_BASE_REF}"
+          if [ -z "${BASE_REF}" ] || [[ "${BASE_REF}" =~ ^0+$ ]]; then
+            BASE_REF="origin/main"
+          fi
+          GCC_MAJOR="$(gcc -dumpversion | cut -d. -f1)"
+          REAL_GCOV_BIN="$(command -v "gcov-${GCC_MAJOR}" || command -v gcov)"
+          GCOV_BIN="${PWD}/tools/coverage/gcov_json_isolated.sh"
+          echo "gcc: $(gcc --version | head -1)"
+          echo "gcov: $(${REAL_GCOV_BIN} --version | head -1)"
+          git fetch origin main --no-tags --prune
+          rm -rf coverage bazel-testlogs
+          bazelisk coverage \
+            --config=debug \
+            --combined_report=lcov \
+            --instrumentation_filter="^//kv_cache_manager" \
+            --action_env=GCOV="${GCOV_BIN}" \
+            --test_env=GCOV="${GCOV_BIN}" \
+            --action_env=KVCM_REAL_GCOV="${REAL_GCOV_BIN}" \
+            --test_env=KVCM_REAL_GCOV="${REAL_GCOV_BIN}" \
+            --test_timeout=900 \
+            --jobs=8 \
+            --local_test_jobs=8 \
+            --cache_test_results=no \
+            --test_output=errors \
+            //kv_cache_manager/... \
+            //integration_test/...
+          mkdir -p coverage
+          cp bazel-out/_coverage/_coverage_report.dat coverage/lcov.info
+          python3 tools/coverage/coverage_report.py \
+            --lcov coverage/lcov.info \
+            --workspace "${PWD}" \
+            --base-ref "${BASE_REF}" \
+            --head-ref HEAD \
+            --include-prefix kv_cache_manager/ \
+            --output-dir coverage
+          GENHTML_ARGS=(
+            coverage/lcov.info
+            --output-directory coverage/html
+            --title "tair-kvcache coverage"
+            --legend
+            --show-details
+            --ignore-errors source
+            --ignore-errors negative
+          )
+          if grep -q '^BRDA:' coverage/lcov.info; then
+            GENHTML_ARGS+=(--branch-coverage)
+          fi
+          genhtml "${GENHTML_ARGS[@]}"
+
+      - &delete_old_disk_cache_step
+        name: delete_old_disk_cache
+        if: ${{ github.event_name == 'push' || (inputs.rebuildDiskCache || false) }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -x
+          ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+          curl -sLo /usr/local/bin/jq "https://github.com/jqlang/jq/releases/download/jq-1.8.1/jq-linux-${ARCH}" && chmod +x /usr/local/bin/jq
+          GH_VER=2.89.0
+          curl -sL "https://github.com/cli/cli/releases/download/v${GH_VER}/gh_${GH_VER}_linux_${ARCH}.tar.gz" | tar xz --strip-components=1 -C /usr/local
+          RUNNER_ARCH_LOWER=$(echo "${{ runner.arch }}" | tr '[:upper:]' '[:lower:]')
+          DISK_CACHE_NAME="disk-${{ runner.os }}-${{ github.workflow }}"
+          gh cache list --repo ${{ github.repository }} --json id,key --limit 100 | \
+            jq -r --arg arch "$RUNNER_ARCH_LOWER" --arg name "$DISK_CACHE_NAME" \
+              '.[] | select((.key | contains($arch)) and (.key | contains($name))) | .id' | \
+            xargs -I {} gh cache delete {} --repo ${{ github.repository }} || true
+
+      - &append_coverage_summary_step
+        name: Append coverage summary
+        if: ${{ always() && hashFiles('coverage/coverage-summary.md') != '' }}
+        run: |
+          cat coverage/coverage-summary.md >> "${GITHUB_STEP_SUMMARY}"
+          if [ -f coverage/html/index.html ]; then
+            {
+              echo ""
+              echo "HTML coverage report: \`coverage/html/index.html\` in the uploaded artifact."
+            } >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+      - &upload_coverage_artifacts_step
+        name: Upload coverage artifacts
+        uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: coverage-report
+          path: |
+            coverage/**
+            bazel-testlogs/**/*.xml
+          if-no-files-found: warn
+          overwrite: true
+
+  coverage-aliyun:
+    if: ${{ (inputs.runs-on || vars.COVERAGE_RUNS_ON || 'ubuntu-latest') == 'aliyun-ecs-x64' }}
+    name: coverage
+    runs-on: aliyun-ecs-x64
+    container:
+      image: ghcr.io/alibaba/tair-kvcache-kvcm-dev:2026_02_13_12_03_24230b1
+      options: --privileged
+    steps:
+      - *checkout_step
+      - *setup_bazel_step
+      - *clean_disk_cache_step
+      - *install_coverage_tools_step
+      - *bazel_coverage_step
+      - *delete_old_disk_cache_step
+      - *append_coverage_summary_step
+      - *upload_coverage_artifacts_step
+
+  validate-runner-selection:
+    if: ${{ (inputs.runs-on || vars.COVERAGE_RUNS_ON || 'ubuntu-latest') != 'ubuntu-latest' && (inputs.runs-on || vars.COVERAGE_RUNS_ON || 'ubuntu-latest') != 'ubuntu-24.04-arm' && (inputs.runs-on || vars.COVERAGE_RUNS_ON || 'ubuntu-latest') != 'aliyun-ecs-x64' }}
+    name: validate_runner_selection
+    runs-on: ubuntu-latest
+    steps:
+      - name: fail_invalid_runner_selection
+        run: |
+          echo "::error::Invalid runner selection. Set runs-on or COVERAGE_RUNS_ON to one of: ubuntu-latest, ubuntu-24.04-arm, aliyun-ecs-x64."
+          exit 1
