@@ -120,3 +120,7 @@ tasks.register<Test>("integrationTest") {
         events("passed", "skipped", "failed", "standardOut", "standardError")
     }
 }
+
+tasks.check {
+    dependsOn("integrationTest")
+}

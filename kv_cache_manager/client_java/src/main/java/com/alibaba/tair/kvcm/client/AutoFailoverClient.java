@@ -40,7 +40,8 @@ public class AutoFailoverClient implements MetaClient {
 
     AutoFailoverClient(MetaClientConfig config) {
         this.config = config;
-        this.currentAddress = new LeaderAddress(config.getSeedAddress(), config.getGrpcPort(), config.getHttpPort());
+        int httpPort = config.isHttpEnabled() ? config.getHttpPort() : 0;
+        this.currentAddress = new LeaderAddress(config.getSeedAddress(), config.getGrpcPort(), httpPort);
         this.grpcClient = new GrpcMetaClient(currentAddress.host, currentAddress.grpcPort,
                 config.getCallTimeoutMs());
 
@@ -238,12 +239,27 @@ public class AutoFailoverClient implements MetaClient {
                         try {
                             return rpc.execute(http);
                         } catch (ServerNotLeaderException httpNotLeader) {
-                            // Propagate SERVER_NOT_LEADER from HTTP path for re-discovery
-                            LOG.warn("HTTP fallback also returned SERVER_NOT_LEADER, triggering re-discovery");
+                            // HTTP reached a stale follower — re-discover and retry via gRPC
+                            LOG.warn("HTTP fallback returned SERVER_NOT_LEADER, triggering re-discovery");
                             if (leaderDiscovery != null) {
                                 leaderDiscovery.triggerImmediateRefresh();
+                                if (leaderDiscovery.discoverLeader()) {
+                                    reconnectIfNeeded();
+                                }
                             }
-                            throw httpNotLeader;
+                            if (retriesLeft <= 0) {
+                                throw httpNotLeader;
+                            }
+                            retriesLeft--;
+                            int attempt = config.getLeaderRetryCount() - retriesLeft;
+                            long backoffMs = BASE_BACKOFF_MS * attempt + (long) (Math.random() * BASE_BACKOFF_MS);
+                            try {
+                                Thread.sleep(backoffMs);
+                            } catch (InterruptedException ie) {
+                                Thread.currentThread().interrupt();
+                                throw new KvcmException(ErrorCode.IO_ERROR, "Interrupted during failover backoff", ie);
+                            }
+                            continue;
                         } catch (KvcmException httpKvcm) {
                             // Preserve application-level error codes from HTTP
                             if (httpKvcm.getErrorCode() != ErrorCode.IO_ERROR) {
