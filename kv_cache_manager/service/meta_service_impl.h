@@ -45,6 +45,10 @@ public:
                       const proto::meta::GetCacheMetaRequest *request,
                       proto::meta::GetCacheMetaResponse *response);
 
+    void GetCacheMetaDetail(RequestContext *request_context,
+                            const proto::meta::GetCacheMetaDetailRequest *request,
+                            proto::meta::GetCacheMetaDetailResponse *response);
+
     void StartWriteCache(RequestContext *request_context,
                          const proto::meta::StartWriteCacheRequest *request,
                          proto::meta::StartWriteCacheResponse *response);

@@ -227,3 +227,76 @@ curl -g -vvv -X POST http://localhost:6382/api/getCacheMeta \
     "detail_level": 1
 }'
 ```
+
+## Get Cache Meta Detail
+```bash
+curl -g -vvv -X POST http://localhost:6382/api/getCacheMetaDetail \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json" \
+  -d '{
+    "trace_id": "trace_id_131",
+    "instance_id": "test_instance",
+    "block_keys": [123, 456],
+    "block_mask": {
+        "offset": 0
+    },
+    "detail_level": 1
+}'
+```
+
+Example response:
+```json
+{
+  "header": {
+    "status": {
+      "code": "OK",
+      "message": "Cache metadata detail retrieved successfully"
+    },
+    "request_id": "request_id"
+  },
+  "items": [
+    {
+      "request_index": 0,
+      "block_key": 123,
+      "prev_block_key": "",
+      "properties": {
+        "BP#prev_key": ""
+      },
+      "locations": [
+        {
+          "location_id": "loc_a",
+          "status": "CLS_SERVING",
+          "type": "ST_3FS",
+          "spec_size": 2,
+          "create_time": 1710000000000000,
+          "location_specs": [
+            {"name": "tp0", "uri": "3fs://cluster/root/key_123_tp0?offset=0&size=1024"},
+            {"name": "tp1", "uri": "3fs://cluster/root/key_123_tp1?offset=0&size=1024"}
+          ]
+        },
+        {
+          "location_id": "loc_b",
+          "status": "CLS_WRITING",
+          "type": "ST_NFS",
+          "spec_size": 1,
+          "create_time": 1710000001000000,
+          "location_specs": [
+            {"name": "tp0", "uri": "file://nfs/root/key_123_tp0?offset=0&size=1024"}
+          ]
+        }
+      ]
+    },
+    {
+      "request_index": 1,
+      "block_key": 456,
+      "locations": [
+        {
+          "status": "CLS_NOT_FOUND"
+        }
+      ]
+    }
+  ]
+}
+```
+
+This diagnostic API returns raw metadata for every unmasked requested key. It does not apply location selection, data-file existence filtering, or lazy prune.

@@ -7,6 +7,7 @@ from kv_cache_manager.protocol.protobuf.meta_service_pb2 import (
     RegisterInstanceRequest,
     GetInstanceInfoRequest,
     GetCacheLocationRequest, 
+    GetCacheMetaDetailRequest,
     StartWriteCacheRequest,
     FinishWriteCacheRequest,
     RemoveCacheRequest,
@@ -74,6 +75,18 @@ class MetaServiceGrpcClient(cases.MetaServiceClientBase):
             if response_dict['header']['status']['code'] != "OK":
                 raise AssertionError(
                     f"Request to get_cache_location failed with error: {response_dict['header']['status']['message']}")
+        return response_dict
+
+    def get_cache_meta_detail(self, data, check_response=True):
+        """Get full raw metadata detail for specified block keys"""
+        request = self._convert_dict_to_proto(GetCacheMetaDetailRequest, data)
+        response = self._stub.GetCacheMetaDetail(request, timeout=self._timeout)
+        response_dict = self._convert_proto_to_dict(response)
+        if check_response:
+            if response_dict['header']['status']['code'] != "OK":
+                raise AssertionError(
+                    f"Request to get_cache_meta_detail failed with error: "
+                    f"{response_dict['header']['status']['message']}")
         return response_dict
 
     def start_write_cache(self, data, check_response=True):

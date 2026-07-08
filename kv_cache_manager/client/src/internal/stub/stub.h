@@ -40,6 +40,13 @@ public:
                                                            const BlockMask &block_mask,
                                                            int32_t detail_level) = 0;
 
+    virtual std::pair<ClientErrorCode, CacheMetaDetails> GetCacheMetaDetail(const std::string &trace_id,
+                                                                            const std::string &instance_id,
+                                                                            const KeyVector &keys,
+                                                                            const TokenIdsVector &tokens,
+                                                                            const BlockMask &block_mask,
+                                                                            int32_t detail_level) = 0;
+
     virtual std::pair<ClientErrorCode, Locations>
     GetCacheLocation(const std::string &trace_id,
                      const std::string &instance_id,

@@ -42,6 +42,11 @@ class MetaServiceClientBase(abc.ABC):
         return {}
 
     @abc.abstractmethod
+    def get_cache_meta_detail(self, data, check_response=True) -> Dict:
+        """Get full raw metadata detail for specified block keys"""
+        return {}
+
+    @abc.abstractmethod
     def start_write_cache(self, data, check_response=True) -> Dict:
         """Start writing cache data"""
         return {}
