@@ -92,6 +92,15 @@ std::pair<ClientErrorCode, Metas> ManagerClientImpl::MatchMeta(const std::string
     return meta_client_->MatchMeta(trace_id, keys, tokens, block_mask, detail_level);
 }
 
+std::pair<ClientErrorCode, CacheMetaDetails> ManagerClientImpl::MatchMetaDetail(const std::string &trace_id,
+                                                                                const std::vector<int64_t> &keys,
+                                                                                const std::vector<int64_t> &tokens,
+                                                                                const BlockMask &block_mask,
+                                                                                int32_t detail_level) {
+    CHECK_CLIENT_WITH_TYPE(meta_client_);
+    return meta_client_->MatchMetaDetail(trace_id, keys, tokens, block_mask, detail_level);
+}
+
 ClientErrorCode ManagerClientImpl::RemoveCache(const std::string &trace_id,
                                                const std::vector<int64_t> &keys,
                                                const std::vector<int64_t> &tokens,

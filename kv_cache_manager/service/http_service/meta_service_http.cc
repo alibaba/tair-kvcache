@@ -31,6 +31,8 @@ void MetaServiceHttp::RegisterHandler() {
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, getInstanceInfo, GetInstanceInfo, GetInstanceInfo, GetInstanceInfo);
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, getCacheMeta, GetCacheMeta, GetCacheMeta, GetCacheMeta);
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(
+        Post, getCacheMetaDetail, GetCacheMetaDetail, GetCacheMetaDetail, GetCacheMetaDetail);
+    REGISTER_HTTP_HANDLER_FOR_META_SERVICE(
         Post, getCacheLocation, GetCacheLocation, GetCacheLocation, GetCacheLocation);
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(
         Post, getCacheLocationLen, GetCacheLocationLen, GetCacheLocationLen, GetCacheLocationLen);

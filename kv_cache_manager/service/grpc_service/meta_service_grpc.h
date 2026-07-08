@@ -33,6 +33,10 @@ public:
                               const proto::meta::GetCacheMetaRequest *request,
                               proto::meta::GetCacheMetaResponse *response) override;
 
+    grpc::Status GetCacheMetaDetail(grpc::ServerContext *context,
+                                    const proto::meta::GetCacheMetaDetailRequest *request,
+                                    proto::meta::GetCacheMetaDetailResponse *response) override;
+
     grpc::Status GetCacheLocation(grpc::ServerContext *context,
                                   const proto::meta::GetCacheLocationRequest *request,
                                   proto::meta::GetCacheLocationResponse *response) override;
