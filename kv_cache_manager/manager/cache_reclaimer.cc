@@ -1390,8 +1390,8 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
         if (auto [ig_ec, ig] = registry_manager_->GetInstanceGroup(request_context, ins_gr);
             ig_ec == ErrorCode::EC_OK && ig != nullptr && ig->cache_config() != nullptr) {
             for (const auto &s : ig->cache_config()->migration_strategies()) {
-                if (s != nullptr && !s->target_storage().empty()) {
-                    cold_storages.insert(s->target_storage());
+                if (s != nullptr && !s->target_storage_name().empty()) {
+                    cold_storages.insert(s->target_storage_name());
                 }
             }
         }
@@ -1628,14 +1628,22 @@ void CacheReclaimer::TryMigrateOnGroup(const std::shared_ptr<RequestContext> &re
     const auto configured_copy_concurrency = cache_config->migration_copy_max_concurrency();
     const std::size_t max_concurrent_copy =
         configured_copy_concurrency > 0 ? static_cast<std::size_t>(configured_copy_concurrency) : 0;
-    const std::size_t active_copy = migration_manager_->ActiveTaskCount();
+    // F-03: 按当前 group 的 instance 集合统计活跃 copy 数，不跨 group 抢 slot。
+    std::vector<std::string> group_instance_ids;
+    group_instance_ids.reserve(instance_infos.size());
+    for (const auto &info : instance_infos) {
+        if (info != nullptr) {
+            group_instance_ids.push_back(info->instance_id());
+        }
+    }
+    const std::size_t active_copy = migration_manager_->ActiveTaskCountForInstances(group_instance_ids);
     std::size_t available_copy_slots = max_concurrent_copy > active_copy ? max_concurrent_copy - active_copy : 0;
 
     for (const auto &strategy : strategies) {
         if (strategy == nullptr) {
             continue;
         }
-        const std::string &src_name = strategy->storage_unique_name();
+        const std::string &src_name = strategy->source_storage_name();
         const auto backend = data_storage_manager->GetDataStorageBackend(src_name);
         if (backend == nullptr) {
             LOG_WITH_GR(WARN, "migration source storage [%s] not found; skip", src_name.c_str());
@@ -1785,8 +1793,8 @@ std::size_t CacheReclaimer::MigrateByStrategyOnBatch(const std::shared_ptr<Reque
 
     const std::string &ins_id = instance_info->instance_id();
     const std::string &ins_gr = instance_info->instance_group_name();
-    const std::string &src_name = strategy.storage_unique_name();
-    const std::string &dst_name = strategy.target_storage();
+    const std::string &src_name = strategy.source_storage_name();
+    const std::string &dst_name = strategy.target_storage_name();
 
     // F-10 DRY: 准入 + 分发 + fallback 委派共享 DispatchMigrationBatch（与 Admin MigrateCache 同一函数）。
     MigrationManager::DispatchBatchParams params;

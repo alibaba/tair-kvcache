@@ -4199,8 +4199,8 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDKeepColdEvictHot) {
     {
         auto cfg = std::make_shared<CacheConfig>();
         auto strategy = std::make_shared<MigrationStrategy>();
-        strategy->set_storage_unique_name("hot_01");
-        strategy->set_target_storage("cold_01");
+        strategy->set_source_storage_name("hot_01");
+        strategy->set_target_storage_name("cold_01");
         cfg->set_migration_strategies({strategy});
         ig->set_cache_config(cfg);
     }
@@ -4250,8 +4250,8 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDDoesNotEvictHotWhenColdSpecsIncomplete
     {
         auto cfg = std::make_shared<CacheConfig>();
         auto strategy = std::make_shared<MigrationStrategy>();
-        strategy->set_storage_unique_name("hot_01");
-        strategy->set_target_storage("cold_01");
+        strategy->set_source_storage_name("hot_01");
+        strategy->set_target_storage_name("cold_01");
         cfg->set_migration_strategies({strategy});
         ig->set_cache_config(cfg);
     }
@@ -4303,8 +4303,8 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDDoesNotPreserveColdOrphanWriting) {
     {
         auto cfg = std::make_shared<CacheConfig>();
         auto strategy = std::make_shared<MigrationStrategy>();
-        strategy->set_storage_unique_name("hot_01");
-        strategy->set_target_storage("cold_01");
+        strategy->set_source_storage_name("hot_01");
+        strategy->set_target_storage_name("cold_01");
         cfg->set_migration_strategies({strategy});
         ig->set_cache_config(cfg);
     }
@@ -4434,8 +4434,8 @@ static MigrationStrategy MakeStrategy(const std::string &src,
                                       bool copy_enabled,
                                       bool mark_enabled) {
     MigrationStrategy strategy;
-    strategy.set_storage_unique_name(src);
-    strategy.set_target_storage(dst);
+    strategy.set_source_storage_name(src);
+    strategy.set_target_storage_name(dst);
     strategy.set_trigger_threshold(0.5);
     MigrationMethods methods;
     methods.set_copy(MigrationCopyMethod(copy_enabled));
@@ -4834,4 +4834,105 @@ TEST_F(CacheReclaimerTest, TestMigrateByStrategyBothCopyFailFallbackMark) {
     stub_.reset(ADDR(MetaSearcher, BatchGetLocation));
     stub_.reset(ADDR(MigrationManager, BatchSubmit));
     stub_.reset(ADDR(MigrationManager, MarkForTieredWrite));
+}
+
+// F-26: multi-cold union — 多个 cold SERVING location 联合覆盖 hot 的多 specs → 允许删 hot。
+TEST_F(CacheReclaimerTest, TestFilterLocIDMultiColdUnionCoversHot) {
+    auto ig = InstanceGroupFactory();
+    {
+        auto cfg = std::make_shared<CacheConfig>();
+        auto strategy = std::make_shared<MigrationStrategy>();
+        strategy->set_source_storage_name("hot_01");
+        strategy->set_target_storage_name("cold_01");
+        cfg->set_migration_strategies({strategy});
+        ig->set_cache_config(cfg);
+    }
+    g_cold_ig = ig;
+    stub_.set(ADDR(RegistryManager, GetInstanceGroup), RegistryManager_GetInstanceGroup_cold_stub);
+    const auto ins_info = InstanceInfoFactory();
+
+    auto hot_loc = std::make_shared<CacheLocation>(
+        "hot_full",
+        CacheLocationStatus::CLS_SERVING,
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        2,
+        std::vector<LocationSpec>{
+            LocationSpec("TP0", "dummy://hot_01/hot_full/tp0"),
+            LocationSpec("TP1", "dummy://hot_01/hot_full/tp1"),
+        });
+    auto cold_a = std::make_shared<CacheLocation>(
+        "cold_a",
+        CacheLocationStatus::CLS_SERVING,
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://cold_01/cold_a/tp0")});
+    auto cold_b = std::make_shared<CacheLocation>(
+        "cold_b",
+        CacheLocationStatus::CLS_SERVING,
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("TP1", "dummy://cold_01/cold_b/tp1")});
+
+    CacheLocationMap loc_map;
+    loc_map.emplace("hot_full", hot_loc);
+    loc_map.emplace("cold_a", cold_a);
+    loc_map.emplace("cold_b", cold_b);
+    batch_get_loc_out_maps = {std::move(loc_map)};
+    batch_get_loc_result = ErrorCode::EC_OK;
+
+    CacheReclaimer::WaterLevelExceed wl;
+    wl.SetGeneralWaterLevelExceed(true);
+
+    std::vector<std::vector<std::string>> out;
+    CacheReclaimer::AgeStats age_stats;
+    ASSERT_TRUE(cache_reclaimer_->FilterLocID(request_context_.get(), ins_info, {0}, wl, out, age_stats));
+    ASSERT_EQ(1u, out.size());
+    ASSERT_EQ(1u, out[0].size()) << "hot should be evicted when cold union covers all specs";
+    ASSERT_EQ("hot_full", out[0][0]);
+
+    stub_.reset(ADDR(RegistryManager, GetInstanceGroup));
+    g_cold_ig.reset();
+}
+
+// F-26: storage-type eviction zone 下不保冷 — 硬驱逐时 keep-cold-evict-hot 不生效。
+TEST_F(CacheReclaimerTest, TestFilterLocIDStorageTypeEvictionIgnoresCold) {
+    auto ig = InstanceGroupFactory();
+    {
+        auto cfg = std::make_shared<CacheConfig>();
+        auto strategy = std::make_shared<MigrationStrategy>();
+        strategy->set_source_storage_name("hot_01");
+        strategy->set_target_storage_name("cold_01");
+        cfg->set_migration_strategies({strategy});
+        ig->set_cache_config(cfg);
+    }
+    g_cold_ig = ig;
+    stub_.set(ADDR(RegistryManager, GetInstanceGroup), RegistryManager_GetInstanceGroup_cold_stub);
+    const auto ins_info = InstanceInfoFactory();
+
+    auto make_loc = [](const std::string &loc_id, const std::string &storage) {
+        return std::make_shared<CacheLocation>(
+            loc_id,
+            CacheLocationStatus::CLS_SERVING,
+            DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+            1,
+            std::vector<LocationSpec>{LocationSpec("TP0", "dummy://" + storage + "/" + loc_id)});
+    };
+    CacheLocationMap m;
+    m.emplace("hot_a", make_loc("hot_a", "hot_01"));
+    m.emplace("cold_a", make_loc("cold_a", "cold_01"));
+    batch_get_loc_out_maps = {std::move(m)};
+    batch_get_loc_result = ErrorCode::EC_OK;
+
+    CacheReclaimer::WaterLevelExceed wl;
+    wl.SetWaterLevelExceedByType(DataStorageType::DATA_STORAGE_TYPE_DUMMY, true);
+    ASSERT_TRUE(wl.CheckStorageTypeWaterLevelExceed());
+
+    std::vector<std::vector<std::string>> out;
+    CacheReclaimer::AgeStats age_stats;
+    ASSERT_TRUE(cache_reclaimer_->FilterLocID(request_context_.get(), ins_info, {0}, wl, out, age_stats));
+    ASSERT_EQ(1u, out.size());
+    ASSERT_EQ(2u, out[0].size()) << "storage-type eviction should not preserve cold";
+
+    stub_.reset(ADDR(RegistryManager, GetInstanceGroup));
+    g_cold_ig.reset();
 }

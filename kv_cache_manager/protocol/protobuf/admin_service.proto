@@ -206,35 +206,37 @@ enum MigrationMarkClearPolicy {
     MIGRATION_MARK_CLEAR_ON_FULL_BLOCK_COVERED = 1; // target CacheLocation 覆盖完整 block 后清标
 }
 
-// Copy 执行方式：通过 DataStorageBackend::Copy 把数据复制到目标 storage
-message MigrationCopyMethod {
+// F-04: 执行方式配置（Config 后缀，区分 MigrationMethod 请求枚举）
+
+// Copy 执行方式配置：通过 DataStorageBackend::Copy 把数据复制到目标 storage
+message MigrationCopyMethodConfig {
     bool enabled = 1;
 }
 
-// Mark 执行方式：给 block 打标，下次 StartWriteCache 时引导推理引擎多写一份到目标 storage
-message MigrationMarkMethod {
+// Mark 执行方式配置：给 block 打标，下次 StartWriteCache 时引导推理引擎多写一份到目标 storage
+message MigrationMarkMethodConfig {
     bool enabled = 1;
     google.protobuf.Int64Value timeout_ms = 3;
 }
 
-// 执行方式集合，Copy / Mark 可同时开启（与触发模式正交）
-message MigrationMethods {
-    MigrationCopyMethod copy = 1;
-    MigrationMarkMethod mark = 2;
+// 执行方式配置集合，Copy / Mark 可同时开启（与触发模式正交）
+message MigrationMethodConfigs {
+    MigrationCopyMethodConfig copy = 1;
+    MigrationMarkMethodConfig mark = 2;
 }
 
 // 单条迁移规则，绑定一个源 storage
 message MigrationStrategy {
-    string storage_unique_name = 1; // 源 storage（热层）unique name
-    string target_storage = 2;      // 目标 storage（冷层）unique name
-    double trigger_threshold = 3;   // 水位触发阈值（迁移区间下界），如 0.70
-    MigrationMethods methods = 4;
+    string source_storage_name = 1;   // 源 storage（热层）unique name
+    string target_storage_name = 2;   // 目标 storage（冷层）unique name
+    double trigger_threshold = 3;     // 水位触发阈值（迁移区间下界），如 0.70
+    MigrationMethodConfigs method_configs = 4;
     MigrationRetention retention = 5;
 }
 
 message MigrationConfig {
     repeated MigrationStrategy strategies = 1; // 多层存储迁移规则，per-storage
-    google.protobuf.Int64Value copy_max_concurrency = 2; // instance group 级 Copy 并发上限
+    google.protobuf.Int32Value copy_max_concurrency = 2; // instance group 级 Copy 并发上限
     MigrationMarkClearPolicy mark_clear_policy = 3; // instance group 级 Mark 清理策略
 }
 

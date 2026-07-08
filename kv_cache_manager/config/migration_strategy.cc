@@ -54,8 +54,8 @@ void MigrationMethods::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> 
 MigrationStrategy::~MigrationStrategy() = default;
 
 bool MigrationStrategy::FromRapidValue(const rapidjson::Value &rapid_value) {
-    KVCM_JSON_GET_MACRO(rapid_value, "storage_unique_name", storage_unique_name_);
-    KVCM_JSON_GET_MACRO(rapid_value, "target_storage", target_storage_);
+    KVCM_JSON_GET_MACRO(rapid_value, "source_storage_name", source_storage_name_);
+    KVCM_JSON_GET_MACRO(rapid_value, "target_storage_name", target_storage_name_);
     KVCM_JSON_GET_MACRO(rapid_value, "trigger_threshold", trigger_threshold_);
     KVCM_JSON_GET_MACRO(rapid_value, "methods", methods_);
     KVCM_JSON_GET_MACRO(rapid_value, "retention", retention_);
@@ -63,8 +63,8 @@ bool MigrationStrategy::FromRapidValue(const rapidjson::Value &rapid_value) {
 }
 
 void MigrationStrategy::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
-    Put(writer, "storage_unique_name", storage_unique_name_);
-    Put(writer, "target_storage", target_storage_);
+    Put(writer, "source_storage_name", source_storage_name_);
+    Put(writer, "target_storage_name", target_storage_name_);
     Put(writer, "trigger_threshold", trigger_threshold_);
     Put(writer, "methods", methods_);
     Put(writer, "retention", retention_);
@@ -73,16 +73,15 @@ void MigrationStrategy::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer>
 bool MigrationStrategy::ValidateRequiredFields(std::string &invalid_fields) const {
     bool valid = true;
     std::string local_invalid_fields;
-    if (storage_unique_name_.empty()) {
+    if (source_storage_name_.empty()) {
         valid = false;
-        local_invalid_fields += "{storage_unique_name}";
+        local_invalid_fields += "{source_storage_name}";
     }
-    if (target_storage_.empty()) {
+    if (target_storage_name_.empty()) {
         valid = false;
-        local_invalid_fields += "{target_storage}";
+        local_invalid_fields += "{target_storage_name}";
     }
-    // 源与目标必须是不同的 storage，否则迁移无意义
-    if (!storage_unique_name_.empty() && storage_unique_name_ == target_storage_) {
+    if (!source_storage_name_.empty() && source_storage_name_ == target_storage_name_) {
         valid = false;
         local_invalid_fields += "{target_storage_equals_source}";
     }

@@ -978,7 +978,7 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
             mark_candidate_location_ids.push_back(success_batch_location_ids[i]);
         }
         if (!mark_candidate_keys.empty()) {
-            std::vector<std::string> tiered_targets;
+            std::vector<MigrationManager::MarkQueryResult> tiered_targets;
             migration_manager_->BatchGetTieredWriteTargets(instance_id, mark_candidate_keys, tiered_targets);
             std::vector<CacheLocationMap> loc_maps;
             static const BlockMask empty_block_mask = static_cast<size_t>(0);
@@ -986,20 +986,23 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
                 meta_searcher->BatchGetLocation(request_context, mark_candidate_keys, empty_block_mask, loc_maps);
             if (get_loc_ec == EC_OK && loc_maps.size() == mark_candidate_keys.size()) {
                 for (size_t i = 0; i < mark_candidate_keys.size(); ++i) {
-                    if (i >= tiered_targets.size() || tiered_targets[i].empty()) {
+                    if (i >= tiered_targets.size() || tiered_targets[i].target.empty()) {
                         continue;
                     }
                     const auto *loc = FindLocationById(loc_maps[i], mark_candidate_location_ids[i]);
                     if (loc == nullptr || loc->status() != CacheLocationStatus::CLS_SERVING ||
-                        !LocationHasSpecOnStorage(*loc, tiered_targets[i])) {
+                        !LocationHasSpecOnStorage(*loc, tiered_targets[i].target)) {
                         continue;
                     }
                     const auto clear_policy =
                         GetMigrationMarkClearPolicy(request_context, registry_manager_, instance_info);
                     if (clear_policy == MigrationMarkClearPolicy::CLEAR_ON_NEXT_WRITE_SUCCESS ||
                         (clear_policy == MigrationMarkClearPolicy::CLEAR_ON_FULL_BLOCK_COVERED &&
-                         LocationsCoverFullBlockOnStorage(loc_maps[i], tiered_targets[i], instance_info))) {
-                        migration_manager_->ClearTieredWriteMark(instance_id, mark_candidate_keys[i]);
+                         LocationsCoverFullBlockOnStorage(loc_maps[i], tiered_targets[i].target, instance_info))) {
+                        // F-15: 按 target+deadline 条件清除，避免清掉后续同 block 新 mark。
+                        migration_manager_->ClearTieredWriteMarkIfMatch(
+                            instance_id, mark_candidate_keys[i],
+                            tiered_targets[i].target, tiered_targets[i].deadline_ms);
                     }
                 }
             } else {
@@ -1308,7 +1311,11 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
     // 并记录其目标冷 storage，由 GenWriteLocation 按 block 路由到冷层。
     std::vector<std::string> tiered_target_per_key(location_maps.size());
     if (tiered_migration_enabled) {
-        migration_manager_->BatchGetTieredWriteTargets(instance_id, keys, tiered_target_per_key);
+        std::vector<MigrationManager::MarkQueryResult> mark_results;
+        migration_manager_->BatchGetTieredWriteTargets(instance_id, keys, mark_results);
+        for (size_t i = 0; i < mark_results.size() && i < tiered_target_per_key.size(); ++i) {
+            tiered_target_per_key[i] = std::move(mark_results[i].target);
+        }
     }
     for (size_t i = 0; i < location_maps.size(); ++i) {
         std::vector<std::string> prune_loc_ids;
@@ -1435,7 +1442,11 @@ ErrorCode CacheManager::FilterWriteCacheWithMinReplica(RequestContext *request_c
     std::vector<std::string> tiered_target_per_key(location_maps.size());
     std::vector<std::string> tiered_target_to_write(location_maps.size());
     if (tiered_migration_enabled) {
-        migration_manager_->BatchGetTieredWriteTargets(instance_id, keys, tiered_target_per_key);
+        std::vector<MigrationManager::MarkQueryResult> mark_results;
+        migration_manager_->BatchGetTieredWriteTargets(instance_id, keys, mark_results);
+        for (size_t i = 0; i < mark_results.size() && i < tiered_target_per_key.size(); ++i) {
+            tiered_target_per_key[i] = std::move(mark_results[i].target);
+        }
     }
     for (size_t i = 0; i < location_maps.size(); ++i) {
         std::vector<std::string> prune_loc_ids;

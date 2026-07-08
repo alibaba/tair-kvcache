@@ -16,8 +16,8 @@ public:
 TEST_F(MigrationStrategyTest, TestParseFull) {
     MigrationStrategy strategy;
     std::string json = R"({
-        "storage_unique_name": "pace_mempool_01",
-        "target_storage": "pace_ssd_01",
+        "source_storage_name": "pace_mempool_01",
+        "target_storage_name": "pace_ssd_01",
         "trigger_threshold": 0.70,
         "methods": {
             "copy": { "enabled": true },
@@ -26,8 +26,8 @@ TEST_F(MigrationStrategyTest, TestParseFull) {
         "retention": 1
     })";
     ASSERT_TRUE(strategy.FromJsonString(json));
-    ASSERT_EQ("pace_mempool_01", strategy.storage_unique_name());
-    ASSERT_EQ("pace_ssd_01", strategy.target_storage());
+    ASSERT_EQ("pace_mempool_01", strategy.source_storage_name());
+    ASSERT_EQ("pace_ssd_01", strategy.target_storage_name());
     ASSERT_DOUBLE_EQ(0.70, strategy.trigger_threshold());
     ASSERT_TRUE(strategy.methods().copy().enabled());
     ASSERT_TRUE(strategy.methods().mark().enabled());
@@ -41,8 +41,8 @@ TEST_F(MigrationStrategyTest, TestParseFull) {
 // ToJsonString -> FromJsonString 往返一致
 TEST_F(MigrationStrategyTest, TestRoundTrip) {
     MigrationStrategy strategy;
-    strategy.set_storage_unique_name("hot");
-    strategy.set_target_storage("cold");
+    strategy.set_source_storage_name("hot");
+    strategy.set_target_storage_name("cold");
     strategy.set_trigger_threshold(0.6);
     MigrationMethods methods;
     methods.mutable_copy().set_enabled(false);
@@ -53,8 +53,8 @@ TEST_F(MigrationStrategyTest, TestRoundTrip) {
 
     MigrationStrategy parsed;
     ASSERT_TRUE(parsed.FromJsonString(strategy.ToJsonString()));
-    ASSERT_EQ("hot", parsed.storage_unique_name());
-    ASSERT_EQ("cold", parsed.target_storage());
+    ASSERT_EQ("hot", parsed.source_storage_name());
+    ASSERT_EQ("cold", parsed.target_storage_name());
     ASSERT_DOUBLE_EQ(0.6, parsed.trigger_threshold());
     ASSERT_FALSE(parsed.methods().copy().enabled());
     ASSERT_TRUE(parsed.methods().mark().enabled());
@@ -66,8 +66,8 @@ TEST_F(MigrationStrategyTest, TestRoundTrip) {
 TEST_F(MigrationStrategyTest, TestValidation) {
     auto make_valid = []() {
         MigrationStrategy s;
-        s.set_storage_unique_name("hot");
-        s.set_target_storage("cold");
+        s.set_source_storage_name("hot");
+        s.set_target_storage_name("cold");
         s.set_trigger_threshold(0.7);
         MigrationMethods m;
         m.mutable_copy().set_enabled(true);
@@ -83,19 +83,19 @@ TEST_F(MigrationStrategyTest, TestValidation) {
     }
     { // 源 storage 为空
         auto s = make_valid();
-        s.set_storage_unique_name("");
+        s.set_source_storage_name("");
         std::string f;
         ASSERT_FALSE(s.ValidateRequiredFields(f));
     }
     { // 目标 storage 为空
         auto s = make_valid();
-        s.set_target_storage("");
+        s.set_target_storage_name("");
         std::string f;
         ASSERT_FALSE(s.ValidateRequiredFields(f));
     }
     { // 源与目标相同
         auto s = make_valid();
-        s.set_target_storage("hot");
+        s.set_target_storage_name("hot");
         std::string f;
         ASSERT_FALSE(s.ValidateRequiredFields(f));
     }
@@ -143,8 +143,8 @@ TEST_F(MigrationStrategyTest, TestValidation) {
     }
     { // 仅 mark：未指定 retention 也合法（mark 不删源端）
         MigrationStrategy s;
-        s.set_storage_unique_name("hot");
-        s.set_target_storage("cold");
+        s.set_source_storage_name("hot");
+        s.set_target_storage_name("cold");
         s.set_trigger_threshold(0.7);
         MigrationMethods m;
         m.mutable_mark().set_enabled(true);
@@ -154,8 +154,8 @@ TEST_F(MigrationStrategyTest, TestValidation) {
     }
     { // 仅 mark：未指定 retention 合法，但非法枚举仍应拒绝
         MigrationStrategy s;
-        s.set_storage_unique_name("hot");
-        s.set_target_storage("cold");
+        s.set_source_storage_name("hot");
+        s.set_target_storage_name("cold");
         s.set_trigger_threshold(0.7);
         MigrationMethods m;
         m.mutable_mark().set_enabled(true);
@@ -178,22 +178,22 @@ TEST_F(MigrationStrategyTest, TestInCacheConfig) {
     CacheConfig cache_config;
     std::string json = R"({
         "cache_prefer_strategy": 5,
-        "reclaim_strategy": { "storage_unique_name": "pace_mempool_01" },
+        "reclaim_strategy": { "source_storage_name": "pace_mempool_01" },
         "meta_indexer_config": { "meta_storage_backend_config": { "storage_type": "local" } },
         "migration_config": {
             "copy_max_concurrency": 6,
             "mark_clear_policy": 1,
             "strategies": [
                 {
-                    "storage_unique_name": "pace_mempool_01",
-                    "target_storage": "pace_ssd_01",
+                    "source_storage_name": "pace_mempool_01",
+                    "target_storage_name": "pace_ssd_01",
                     "trigger_threshold": 0.70,
                     "methods": { "copy": { "enabled": true }, "mark": { "enabled": false } },
                     "retention": 1
                 },
                 {
-                    "storage_unique_name": "pace_mempool_02",
-                    "target_storage": "pace_ssd_02",
+                    "source_storage_name": "pace_mempool_02",
+                    "target_storage_name": "pace_ssd_02",
                     "trigger_threshold": 0.60,
                     "methods": { "copy": { "enabled": true }, "mark": { "enabled": true, "timeout_ms": 120000 } },
                     "retention": 2
@@ -205,8 +205,8 @@ TEST_F(MigrationStrategyTest, TestInCacheConfig) {
     ASSERT_EQ(6, cache_config.migration_copy_max_concurrency());
     ASSERT_EQ(MigrationMarkClearPolicy::CLEAR_ON_FULL_BLOCK_COVERED, cache_config.migration_mark_clear_policy());
     ASSERT_EQ(2u, cache_config.migration_strategies().size());
-    ASSERT_EQ("pace_mempool_01", cache_config.migration_strategies()[0]->storage_unique_name());
-    ASSERT_EQ("pace_ssd_02", cache_config.migration_strategies()[1]->target_storage());
+    ASSERT_EQ("pace_mempool_01", cache_config.migration_strategies()[0]->source_storage_name());
+    ASSERT_EQ("pace_ssd_02", cache_config.migration_strategies()[1]->target_storage_name());
     ASSERT_EQ(120000, cache_config.migration_strategies()[1]->methods().mark().timeout_ms());
 
     // 往返后列表仍然存在
@@ -222,7 +222,7 @@ TEST_F(MigrationStrategyTest, TestInCacheConfig) {
     CacheConfig no_migration;
     std::string json2 = R"({
         "cache_prefer_strategy": 5,
-        "reclaim_strategy": { "storage_unique_name": "pace_mempool_01" },
+        "reclaim_strategy": { "source_storage_name": "pace_mempool_01" },
         "meta_indexer_config": { "meta_storage_backend_config": { "storage_type": "local" } }
     })";
     ASSERT_TRUE(no_migration.FromJsonString(json2));

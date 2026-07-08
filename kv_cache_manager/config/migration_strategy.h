@@ -93,19 +93,17 @@ public:
     MigrationStrategy() = default;
     ~MigrationStrategy() override;
 
-    // Getters
-    const std::string &storage_unique_name() const { return storage_unique_name_; }
-    const std::string &target_storage() const { return target_storage_; }
+    // Getters (F-04: source/target 对称命名)
+    const std::string &source_storage_name() const { return source_storage_name_; }
+    const std::string &target_storage_name() const { return target_storage_name_; }
     double trigger_threshold() const { return trigger_threshold_; }
     const MigrationMethods &methods() const { return methods_; }
     MigrationMethods &mutable_methods() { return methods_; }
     MigrationRetention retention() const { return retention_; }
 
     // Setters
-    void set_storage_unique_name(const std::string &storage_unique_name) {
-        storage_unique_name_ = storage_unique_name;
-    }
-    void set_target_storage(const std::string &target_storage) { target_storage_ = target_storage; }
+    void set_source_storage_name(const std::string &name) { source_storage_name_ = name; }
+    void set_target_storage_name(const std::string &name) { target_storage_name_ = name; }
     void set_trigger_threshold(double trigger_threshold) { trigger_threshold_ = trigger_threshold; }
     void set_methods(const MigrationMethods &methods) { methods_ = methods; }
     void set_retention(MigrationRetention retention) { retention_ = retention; }
@@ -115,11 +113,11 @@ public:
     bool ValidateRequiredFields(std::string &invalid_fields) const;
 
 private:
-    std::string storage_unique_name_;                                            // 源 storage（热层）
-    std::string target_storage_;                                                 // 目标 storage（冷层）
-    double trigger_threshold_ = 0.0;                                             // 水位触发阈值（迁移区间下界）
-    MigrationMethods methods_;                                                   // Copy / Mark 执行方式
-    MigrationRetention retention_ = MigrationRetention::MIGRATION_RETENTION_UNSPECIFIED; // 源端保留策略
+    std::string source_storage_name_;
+    std::string target_storage_name_;
+    double trigger_threshold_ = 0.0;
+    MigrationMethods methods_;
+    MigrationRetention retention_ = MigrationRetention::MIGRATION_RETENTION_UNSPECIFIED;
 };
 
 class MigrationConfig : public Jsonizable {

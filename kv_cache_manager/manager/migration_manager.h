@@ -103,14 +103,26 @@ public:
                                  const std::vector<int64_t> &block_keys,
                                  const std::string &dst_storage_name,
                                  int64_t timeout_ms = MigrationMarkMethod::kDefaultTimeoutMs);
-    bool IsMarkedForTieredWrite(const std::string &instance_id, int64_t block_key) const;
-    std::string GetTieredWriteTarget(const std::string &instance_id, int64_t block_key) const;
-    void ClearTieredWriteMark(const std::string &instance_id, int64_t block_key);
+    bool IsMarkedForTieredWrite(const std::string &instance_id, int64_t block_key);
+    std::string GetTieredWriteTarget(const std::string &instance_id, int64_t block_key);
+    // F-15: 按 expected target+deadline 条件清除 mark（不匹配则不清，防止清掉同 block 新 mark）。
+    // FinishWriteCache / OnTaskSuccess 使用此接口替代旧的无条件 ClearTieredWriteMark。
+    bool ClearTieredWriteMarkIfMatch(const std::string &instance_id,
+                                     int64_t block_key,
+                                     const std::string &expected_target,
+                                     int64_t expected_deadline_ms);
 
-    // 批量查询（写路径优化，避免逐 block 元数据往返）；out_targets 与 block_keys 同序，空串=未打标。
+    // F-15: mark 查询结果（target + deadline），供 match-clear 使用。
+    struct MarkQueryResult {
+        std::string target;    // 空=未打标/已清/已过期
+        int64_t deadline_ms = 0;
+    };
+
+    // 批量查询（写路径优化，避免逐 block 元数据往返）；out 与 block_keys 同序，target 空=未打标。
+    // 非 const：发现过期 mark 时会触发清理。
     ErrorCode BatchGetTieredWriteTargets(const std::string &instance_id,
                                          const std::vector<int64_t> &block_keys,
-                                         std::vector<std::string> &out_targets) const;
+                                         std::vector<MarkQueryResult> &out);
 
     // Mark 持久化属性名（block 级 property）。
     static const std::string PROPERTY_TIERED_WRITE_TARGET; // 值=目标冷 storage；空串=未打标/已清
@@ -129,6 +141,8 @@ public:
                                      int64_t block_key,
                                      const std::string &location_id) const;
     size_t ActiveTaskCount() const;
+    // F-03: 按 instance 集合过滤的活跃 copy task 数（group 级并发预算用）。
+    size_t ActiveTaskCountForInstances(const std::vector<std::string> &instance_ids) const;
     // F-12: 取指定 instance 的活跃 copy task block_key 列表（用于 drain 前 BatchCancel）。
     std::vector<int64_t> GetActiveBlockKeysForInstance(const std::string &instance_id) const;
 
@@ -231,6 +245,8 @@ private:
         MigrationRetention retention = MigrationRetention::MIGRATION_RETENTION_DELETE_SOURCE;
         std::chrono::steady_clock::time_point submit_time;
         uint64_t total_bytes = 0;              // 源端各 spec 字节数之和（取自 uri size 参数）
+        std::string mark_target;               // F-15: 提交时 mark 的 target（空=无 mark，用于 match-clear）
+        int64_t mark_deadline_ms = 0;          // F-15: 提交时 mark 的 deadline（用于 match-clear）
         CopyTaskState state = CopyTaskState::kRunning; // F-11: 收尾认领状态
     };
 
@@ -281,20 +297,16 @@ private:
                                  const std::vector<int64_t> &explicit_block_keys,
                                  int64_t sample_count,
                                  const std::shared_ptr<MetaIndexer> &meta_indexer) const;
-    bool ClearTieredWriteMarkInternal(const std::string &instance_id, int64_t block_key);
     bool ClearTieredWriteMarkIfMatchInternal(const std::string &instance_id,
                                              int64_t block_key,
                                              const std::string &expected_target,
-                                             int64_t expected_deadline_ms);
+                                             int64_t expected_deadline_ms,
+                                             bool is_expiry = false);
     void EnqueueMarkExpiry(const std::string &instance_id,
                            int64_t block_key,
                            const std::string &target_storage,
                            int64_t deadline_ms);
     void ProcessExpiredMarks();
-    // Mark 策略：查询 block 级 property，命中时输出目标 storage。
-    bool ShouldWriteToTieredStorageByMark(const std::string &instance_id,
-                                          int64_t block_key,
-                                          std::string &target) const;
     size_t ActiveTaskCountUnsafe() const; // 调用方持有 task_mutex_
 
     // ---- 活跃任务表操作收口（F-13 Part A；均要求调用方持有 task_mutex_）----
@@ -335,7 +347,6 @@ private:
     std::condition_variable pending_cv_;
     std::deque<PendingCopy> pending_copies_;
 
-    mutable std::mutex mark_mutex_;
     std::mutex mark_expiry_mutex_;
     std::priority_queue<ExpiringMark, std::vector<ExpiringMark>, ExpiringMarkGreater> mark_expiry_queue_;
 

@@ -88,8 +88,8 @@ public:
             return;
         }
         auto strategy = std::make_shared<MigrationStrategy>();
-        strategy->set_storage_unique_name("hot_01");
-        strategy->set_target_storage("cold_01");
+        strategy->set_source_storage_name("hot_01");
+        strategy->set_target_storage_name("cold_01");
         strategy->set_trigger_threshold(0.01);
         MigrationMethods methods;
         methods.mutable_mark().set_enabled(true);

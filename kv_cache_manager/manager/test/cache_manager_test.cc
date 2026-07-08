@@ -203,8 +203,8 @@ public:
         ASSERT_TRUE(iter->second->cache_config_ != nullptr);
 
         auto strategy = std::make_shared<MigrationStrategy>();
-        strategy->set_storage_unique_name(source_storage);
-        strategy->set_target_storage(target_storage);
+        strategy->set_source_storage_name(source_storage);
+        strategy->set_target_storage_name(target_storage);
         strategy->set_trigger_threshold(0.01);
         MigrationMethods methods;
         methods.mutable_mark().set_enabled(true);

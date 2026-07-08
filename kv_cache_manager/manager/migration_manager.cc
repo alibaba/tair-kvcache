@@ -36,6 +36,28 @@ int64_t ParseInt64OrZero(const std::string &value) {
     return end != nullptr && *end == '\0' ? parsed : 0;
 }
 
+// F-15: mark property 解析结果。target 为空表示无标记或已清；expired 表示已过期待清理。
+struct MarkInfo {
+    std::string target;
+    int64_t deadline_ms = 0;
+    bool expired = false;
+};
+
+static MarkInfo ParseMarkFromProperties(const PropertyMap &props, int64_t now_ms) {
+    MarkInfo info;
+    auto tit = props.find(MigrationManager::PROPERTY_TIERED_WRITE_TARGET);
+    if (tit == props.end() || tit->second.empty()) {
+        return info;
+    }
+    info.target = tit->second;
+    auto dit = props.find(MigrationManager::PROPERTY_TIERED_WRITE_DEADLINE_MS);
+    info.deadline_ms = dit == props.end() ? 0 : ParseInt64OrZero(dit->second);
+    if (info.deadline_ms > 0 && info.deadline_ms <= now_ms) {
+        info.expired = true;
+    }
+    return info;
+}
+
 // F-09: 收集目标 storage 上指定 status 的 location 联合覆盖的 spec name 集合。
 // 一次 O(L·S) 扫描替代旧的 per-location 全覆盖判断（O(L²·S²)）。
 std::unordered_set<std::string> CollectCoveredSpecNames(
@@ -357,6 +379,15 @@ ErrorCode MigrationManager::Submit(const std::string &trace_id, MigrationRequest
         return prepare_ec;
     }
     ctx.submit_time = std::chrono::steady_clock::now();
+    // F-15: 快照当前 mark 到 ctx，供 OnTaskSuccess 做 match-clear。
+    {
+        std::vector<MarkQueryResult> mark_snap;
+        BatchGetTieredWriteTargets(request.instance_id, {request.block_key}, mark_snap);
+        if (!mark_snap.empty()) {
+            ctx.mark_target = mark_snap[0].target;
+            ctx.mark_deadline_ms = mark_snap[0].deadline_ms;
+        }
+    }
 
     // 登记活跃任务（用于防重复迁移和 copy 并发预算统计）。
     {
@@ -598,6 +629,15 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
         ctx.retention = req.retention;
         ctx.total_bytes = preps[i].total_bytes;
         ctx.submit_time = std::chrono::steady_clock::now();
+        // F-15: 快照当前 mark 到 ctx，供 OnTaskSuccess 做 match-clear（不清掉后续新 mark）。
+        {
+            std::vector<MarkQueryResult> mark_snap;
+            BatchGetTieredWriteTargets(req.instance_id, {req.block_key}, mark_snap);
+            if (!mark_snap.empty()) {
+                ctx.mark_target = mark_snap[0].target;
+                ctx.mark_deadline_ms = mark_snap[0].deadline_ms;
+            }
+        }
 
         {
             std::lock_guard<std::mutex> lock(task_mutex_);
@@ -809,8 +849,10 @@ void MigrationManager::OnTaskSuccess(const std::string &instance_id, int64_t blo
         return;
     }
 
-    // 目标已可用，先清除可能存在的 Mark，避免后续 StartWriteCache 重复写冷层。
-    ClearTieredWriteMark(ctx.instance_id, block_key);
+    // F-15: 按提交时快照的 mark target/deadline 做条件清除，避免清掉后续同 block 新 mark。
+    if (!ctx.mark_target.empty()) {
+        ClearTieredWriteMarkIfMatchInternal(ctx.instance_id, block_key, ctx.mark_target, ctx.mark_deadline_ms);
+    }
 
     // 按 retention 处理源端。
     if (ctx.retention == MigrationRetention::MIGRATION_RETENTION_DELETE_SOURCE) {
@@ -991,11 +1033,7 @@ ErrorCode MigrationManager::MarkForTieredWrite(const std::string &instance_id,
     };
     RequestContext rc("migration_mark");
     KeyVector keys(block_keys.begin(), block_keys.end());
-    MetaIndexer::Result result(EC_OK);
-    {
-        std::lock_guard<std::mutex> mark_lock(mark_mutex_);
-        result = indexer->ReadModifyWriteBlock(&rc, keys, modifier);
-    }
+    auto result = indexer->ReadModifyWriteBlock(&rc, keys, modifier);
     // F-14: stat/expiry/event 按实际成功数更新（actual 口径），不再用 block_keys.size()（request 口径）。
     const size_t actual_marked = static_cast<size_t>(std::count(mark_succeeded.begin(), mark_succeeded.end(), true));
     if (actual_marked > 0) {
@@ -1017,110 +1055,60 @@ ErrorCode MigrationManager::MarkForTieredWrite(const std::string &instance_id,
     return result.ec;
 }
 
-bool MigrationManager::IsMarkedForTieredWrite(const std::string &instance_id, int64_t block_key) const {
-    std::string target;
-    return ShouldWriteToTieredStorageByMark(instance_id, block_key, target);
+bool MigrationManager::ClearTieredWriteMarkIfMatch(const std::string &instance_id,
+                                                    int64_t block_key,
+                                                    const std::string &expected_target,
+                                                    int64_t expected_deadline_ms) {
+    return ClearTieredWriteMarkIfMatchInternal(instance_id, block_key, expected_target, expected_deadline_ms);
 }
 
-std::string MigrationManager::GetTieredWriteTarget(const std::string &instance_id, int64_t block_key) const {
-    std::string target;
-    return ShouldWriteToTieredStorageByMark(instance_id, block_key, target) ? target : std::string();
+bool MigrationManager::IsMarkedForTieredWrite(const std::string &instance_id, int64_t block_key) {
+    std::vector<MarkQueryResult> results;
+    BatchGetTieredWriteTargets(instance_id, {block_key}, results);
+    return !results.empty() && !results[0].target.empty();
 }
 
-bool MigrationManager::ClearTieredWriteMarkInternal(const std::string &instance_id, int64_t block_key) {
-    std::lock_guard<std::mutex> mark_lock(mark_mutex_);
-    auto indexer = GetIndexer(instance_id);
-    if (indexer == nullptr) {
-        return false;
-    }
-    std::string event_dst_storage;
-    bool had_mark = false;
-    {
-        RequestContext prop_rc("migration_clear_mark_props");
-        PropertyMapVector props;
-        indexer->GetProperties(&prop_rc, {block_key}, {PROPERTY_TIERED_WRITE_TARGET}, props);
-        if (!props.empty()) {
-            const auto target_it = props[0].find(PROPERTY_TIERED_WRITE_TARGET);
-            if (target_it != props[0].end() && !target_it->second.empty()) {
-                had_mark = true;
-                event_dst_storage = target_it->second;
-            }
-        }
-    }
-    bool cleared = false;
-    // RMW：把 mark 属性置空作墓碑（读侧把空视为未打标）。block 不存在则 no-op（幂等）。
-    auto modifier = [&cleared](const LocationIdVector & /*existing*/,
-                               ErrorCode get_ec,
-                               size_t /*idx*/,
-                               PropertyMap &upsert_property_map,
-                               CacheLocationMap & /*out_new*/) -> ModifierResult {
-        if (get_ec != EC_OK) {
-            return {MA_SKIP, EC_OK};
-        }
-        upsert_property_map[PROPERTY_TIERED_WRITE_TARGET] = "";
-        upsert_property_map[PROPERTY_TIERED_WRITE_DEADLINE_MS] = "";
-        cleared = true;
-        return {MA_OK, EC_OK};
-    };
-    RequestContext rc("migration_clear_mark");
-    indexer->ReadModifyWriteBlock(&rc, {block_key}, modifier);
-    if (cleared) {
-        if (had_mark) {
-            stat_marks_cleared_.fetch_add(1, std::memory_order_relaxed);
-            UpdateMarksActiveGauge();
-            if (metrics_enabled_) {
-                ++m_marks_consumed_total_;
-            }
-        }
-        if (event_manager_ != nullptr && had_mark) {
-            auto ev = std::make_shared<MigrationMarkConsumedEvent>(instance_id);
-            ev->SetEventTriggerTime();
-            ev->SetAdditionalArgs(block_key, event_dst_storage);
-            event_manager_->Publish(ev);
-        }
-    }
-    return cleared;
+std::string MigrationManager::GetTieredWriteTarget(const std::string &instance_id, int64_t block_key) {
+    std::vector<MarkQueryResult> results;
+    BatchGetTieredWriteTargets(instance_id, {block_key}, results);
+    return (!results.empty() && !results[0].target.empty()) ? results[0].target : std::string();
 }
 
-void MigrationManager::ClearTieredWriteMark(const std::string &instance_id, int64_t block_key) {
-    static_cast<void>(ClearTieredWriteMarkInternal(instance_id, block_key));
-}
-
+// F-15: match 检查在 RMW modifier 闭包内执行（shard lock 保原子），不需要外部 mark_mutex_。
+// modifier 内通过捕获的 indexer 读 GetProperties（GetProperties 不走 shard lock，不死锁），
+// 读-比较-写三步在同一个 shard lock 内完成，与 BatchCASLocationStatus 同模式。
 bool MigrationManager::ClearTieredWriteMarkIfMatchInternal(const std::string &instance_id,
                                                            int64_t block_key,
                                                            const std::string &expected_target,
-                                                           int64_t expected_deadline_ms) {
+                                                           int64_t expected_deadline_ms,
+                                                           bool is_expiry) {
     if (expected_target.empty() || expected_deadline_ms <= 0) {
         return false;
     }
-    std::lock_guard<std::mutex> mark_lock(mark_mutex_);
     auto indexer = GetIndexer(instance_id);
     if (indexer == nullptr) {
         return false;
     }
-    RequestContext prop_rc("migration_conditional_clear_mark_props");
-    PropertyMapVector props;
-    indexer->GetProperties(
-        &prop_rc, {block_key}, {PROPERTY_TIERED_WRITE_TARGET, PROPERTY_TIERED_WRITE_DEADLINE_MS}, props);
-    if (props.empty()) {
-        return false;
-    }
-    const auto target_it = props[0].find(PROPERTY_TIERED_WRITE_TARGET);
-    const auto deadline_it = props[0].find(PROPERTY_TIERED_WRITE_DEADLINE_MS);
-    const int64_t current_deadline_ms =
-        deadline_it == props[0].end() ? 0 : ParseInt64OrZero(deadline_it->second);
-    if (target_it == props[0].end() || target_it->second != expected_target ||
-        current_deadline_ms != expected_deadline_ms) {
-        return false;
-    }
 
     bool cleared = false;
-    auto modifier = [&cleared](const LocationIdVector & /*existing*/,
-                               ErrorCode get_ec,
-                               size_t /*idx*/,
-                               PropertyMap &upsert_property_map,
-                               CacheLocationMap & /*out_new*/) -> ModifierResult {
+    auto modifier = [&indexer, block_key, &expected_target, expected_deadline_ms, &cleared](
+                        const LocationIdVector & /*existing*/,
+                        ErrorCode get_ec,
+                        size_t /*idx*/,
+                        PropertyMap &upsert_property_map,
+                        CacheLocationMap & /*out_new*/) -> ModifierResult {
         if (get_ec != EC_OK) {
+            return {MA_SKIP, EC_OK};
+        }
+        RequestContext check_rc("migration_match_clear_check");
+        PropertyMapVector check_props;
+        indexer->GetProperties(&check_rc, {block_key},
+            {PROPERTY_TIERED_WRITE_TARGET, PROPERTY_TIERED_WRITE_DEADLINE_MS}, check_props);
+        if (check_props.empty()) {
+            return {MA_SKIP, EC_OK};
+        }
+        auto mark = ParseMarkFromProperties(check_props[0], 0);
+        if (mark.target != expected_target || mark.deadline_ms != expected_deadline_ms) {
             return {MA_SKIP, EC_OK};
         }
         upsert_property_map[PROPERTY_TIERED_WRITE_TARGET] = "";
@@ -1133,53 +1121,34 @@ bool MigrationManager::ClearTieredWriteMarkIfMatchInternal(const std::string &in
     if (cleared) {
         stat_marks_cleared_.fetch_add(1, std::memory_order_relaxed);
         UpdateMarksActiveGauge();
-        // F-16: 这是超时过期路径（monitor 线程按 deadline 清除），计入 expired 而非 consumed，
-        // 便于区分"引擎未及时消费的浪费" vs "被真正消费的 mark"。
         if (metrics_enabled_) {
-            ++m_marks_expired_total_;
+            if (is_expiry) {
+                ++m_marks_expired_total_;
+            } else {
+                ++m_marks_consumed_total_;
+            }
         }
         if (event_manager_ != nullptr) {
-            auto ev = std::make_shared<MigrationMarkExpiredEvent>(instance_id);
-            ev->SetEventTriggerTime();
-            ev->SetAdditionalArgs(block_key, expected_target);
-            event_manager_->Publish(ev);
+            if (is_expiry) {
+                auto ev = std::make_shared<MigrationMarkExpiredEvent>(instance_id);
+                ev->SetEventTriggerTime();
+                ev->SetAdditionalArgs(block_key, expected_target);
+                event_manager_->Publish(ev);
+            } else {
+                auto ev = std::make_shared<MigrationMarkConsumedEvent>(instance_id);
+                ev->SetEventTriggerTime();
+                ev->SetAdditionalArgs(block_key, expected_target);
+                event_manager_->Publish(ev);
+            }
         }
     }
     return cleared;
 }
 
-bool MigrationManager::ShouldWriteToTieredStorageByMark(const std::string &instance_id,
-                                                        int64_t block_key,
-                                                        std::string &target) const {
-    auto indexer = GetIndexer(instance_id);
-    if (indexer == nullptr) {
-        return false;
-    }
-    RequestContext rc("migration_query_mark");
-    PropertyMapVector props;
-    indexer->GetProperties(&rc, {block_key}, {PROPERTY_TIERED_WRITE_TARGET, PROPERTY_TIERED_WRITE_DEADLINE_MS}, props);
-    if (props.empty()) {
-        return false;
-    }
-    auto tit = props[0].find(PROPERTY_TIERED_WRITE_TARGET);
-    if (tit == props[0].end() || tit->second.empty()) {
-        return false; // 未打标 / 已清（墓碑）
-    }
-    auto deadline_it = props[0].find(PROPERTY_TIERED_WRITE_DEADLINE_MS);
-    const int64_t deadline_ms = deadline_it == props[0].end() ? 0 : ParseInt64OrZero(deadline_it->second);
-    if (deadline_ms > 0 && deadline_ms <= TimestampUtil::GetCurrentTimeMs()) {
-        const_cast<MigrationManager *>(this)->ClearTieredWriteMarkIfMatchInternal(
-            instance_id, block_key, tit->second, deadline_ms);
-        return false;
-    }
-    target = tit->second;
-    return true;
-}
-
 ErrorCode MigrationManager::BatchGetTieredWriteTargets(const std::string &instance_id,
                                                        const std::vector<int64_t> &block_keys,
-                                                       std::vector<std::string> &out_targets) const {
-    out_targets.assign(block_keys.size(), std::string());
+                                                       std::vector<MarkQueryResult> &out) {
+    out.resize(block_keys.size());
     if (block_keys.empty()) {
         return EC_OK;
     }
@@ -1190,27 +1159,23 @@ ErrorCode MigrationManager::BatchGetTieredWriteTargets(const std::string &instan
     RequestContext rc("migration_query_mark_batch");
     KeyVector keys(block_keys.begin(), block_keys.end());
     PropertyMapVector props;
-    // 注：部分 block 不存在时 GetProperties 可能返回非 OK 聚合 ec，但 props 仍逐 key 填充
-    //（缺失 key 为空 map）。因此不按聚合 ec 早退，直接按 props 逐项解析。
     indexer->GetProperties(&rc, keys, {PROPERTY_TIERED_WRITE_TARGET, PROPERTY_TIERED_WRITE_DEADLINE_MS}, props);
     std::vector<ExpiringMark> expired_marks;
     const int64_t now_ms = TimestampUtil::GetCurrentTimeMs();
-    for (size_t i = 0; i < props.size() && i < out_targets.size(); ++i) {
-        auto tit = props[i].find(PROPERTY_TIERED_WRITE_TARGET);
-        if (tit == props[i].end() || tit->second.empty()) {
+    for (size_t i = 0; i < props.size() && i < out.size(); ++i) {
+        auto mark = ParseMarkFromProperties(props[i], now_ms);
+        if (mark.target.empty()) {
             continue;
         }
-        auto deadline_it = props[i].find(PROPERTY_TIERED_WRITE_DEADLINE_MS);
-        const int64_t deadline_ms = deadline_it == props[i].end() ? 0 : ParseInt64OrZero(deadline_it->second);
-        if (deadline_ms > 0 && deadline_ms <= now_ms) {
-            expired_marks.push_back(ExpiringMark{deadline_ms, instance_id, block_keys[i], tit->second});
+        if (mark.expired) {
+            expired_marks.push_back(ExpiringMark{mark.deadline_ms, instance_id, block_keys[i], mark.target});
             continue;
         }
-        out_targets[i] = tit->second;
+        out[i].target = std::move(mark.target);
+        out[i].deadline_ms = mark.deadline_ms;
     }
-    for (const auto &mark : expired_marks) {
-        const_cast<MigrationManager *>(this)->ClearTieredWriteMarkIfMatchInternal(
-            mark.instance_id, mark.block_key, mark.target_storage, mark.deadline_ms);
+    for (const auto &em : expired_marks) {
+        ClearTieredWriteMarkIfMatchInternal(em.instance_id, em.block_key, em.target_storage, em.deadline_ms, true);
     }
     return EC_OK;
 }
@@ -1241,7 +1206,7 @@ void MigrationManager::ProcessExpiredMarks() {
     }
     for (const auto &mark : expired_marks) {
         ClearTieredWriteMarkIfMatchInternal(
-            mark.instance_id, mark.block_key, mark.target_storage, mark.deadline_ms);
+            mark.instance_id, mark.block_key, mark.target_storage, mark.deadline_ms, true);
     }
 }
 
@@ -1433,6 +1398,18 @@ size_t MigrationManager::ActiveTaskCount() const {
     return ActiveTaskCountUnsafe();
 }
 
+size_t MigrationManager::ActiveTaskCountForInstances(const std::vector<std::string> &instance_ids) const {
+    std::lock_guard<std::mutex> lock(task_mutex_);
+    size_t total = 0;
+    for (const auto &id : instance_ids) {
+        auto it = active_tasks_by_instance_.find(id);
+        if (it != active_tasks_by_instance_.end()) {
+            total += it->second.size();
+        }
+    }
+    return total;
+}
+
 std::vector<int64_t> MigrationManager::GetActiveBlockKeysForInstance(const std::string &instance_id) const {
     std::lock_guard<std::mutex> lock(task_mutex_);
     auto instance_iter = active_tasks_by_instance_.find(instance_id);
@@ -1621,10 +1598,10 @@ MigrationManager::DispatchBatchResult MigrationManager::DispatchMigrationBatch(
     // 10a: mark 去重用 batch 查询替代逐 block IsMarkedForTieredWrite（N 次 meta 往返 → 1 次）。
     std::unordered_set<int64_t> already_marked;
     if (params.do_mark && params.dedup_marks) {
-        std::vector<std::string> targets;
-        if (BatchGetTieredWriteTargets(instance_id, batch, targets) == EC_OK) {
-            for (std::size_t i = 0; i < batch.size() && i < targets.size(); ++i) {
-                if (!targets[i].empty()) {
+        std::vector<MarkQueryResult> mark_results;
+        if (BatchGetTieredWriteTargets(instance_id, batch, mark_results) == EC_OK) {
+            for (std::size_t i = 0; i < batch.size() && i < mark_results.size(); ++i) {
+                if (!mark_results[i].target.empty()) {
                     already_marked.insert(batch[i]);
                 }
             }

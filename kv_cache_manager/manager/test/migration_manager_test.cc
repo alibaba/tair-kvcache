@@ -176,6 +176,16 @@ public:
         return pred();
     }
 
+    // F-15: 旧的无条件 ClearTieredWriteMark 已删除，测试用 helper 模拟：
+    // 先查 mark 拿到 target+deadline，再做 match-clear。
+    void ClearMarkForTest(MigrationManager &mgr, const std::string &instance_id, int64_t block_key) {
+        std::vector<MigrationManager::MarkQueryResult> results;
+        mgr.BatchGetTieredWriteTargets(instance_id, {block_key}, results);
+        if (!results.empty() && !results[0].target.empty()) {
+            mgr.ClearTieredWriteMarkIfMatch(instance_id, block_key, results[0].target, results[0].deadline_ms);
+        }
+    }
+
     std::shared_ptr<MetaIndexerManager> meta_manager_;
     std::shared_ptr<DataStorageManager> data_storage_manager_;
     std::shared_ptr<MetricsRegistry> metrics_registry_;
@@ -209,7 +219,7 @@ TEST_F(MigrationManagerTest, TestMarkLifecycle) {
     ASSERT_EQ(1u, LocationCount(2));
     ASSERT_EQ(1u, LocationCount(3));
 
-    mgr.ClearTieredWriteMark(kInstance, 2);
+    ClearMarkForTest(mgr, kInstance, 2);
     ASSERT_FALSE(mgr.IsMarkedForTieredWrite(kInstance, 2));
     ASSERT_TRUE(mgr.IsMarkedForTieredWrite(kInstance, 1));
     ASSERT_EQ("", mgr.GetTieredWriteTarget(kInstance, 2));
@@ -219,6 +229,44 @@ TEST_F(MigrationManagerTest, TestMarkLifecycle) {
     ASSERT_EQ(3u, stats.marks_added);
     ASSERT_EQ(1u, stats.marks_cleared);
     ASSERT_EQ(2u, stats.active_marks); // best-effort = added - cleared
+}
+
+// F-15: match-clear 不会清掉同 block 上后来打的新 mark（不同 target 或 deadline）。
+TEST_F(MigrationManagerTest, TestClearMarkDoesNotClobberNewerMark) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "clobber_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "clobber_cold_01/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_02", GetPrivateTestRuntimeDataPath() + "clobber_cold_02/"));
+    CreateSourceLocation(1, "hot_01", false, "x");
+
+    auto event_publisher = std::make_shared<CaptureEventPublisher>();
+    auto event_manager = std::make_shared<EventManager>();
+    ASSERT_TRUE(event_manager->Init());
+    ASSERT_TRUE(event_manager->RegisterPublisher("capture", event_publisher));
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_, metrics_registry_, event_manager);
+    mgr.Start();
+
+    // 打 mark A: target=cold_01
+    ASSERT_EQ(ErrorCode::EC_OK, mgr.MarkForTieredWrite(kInstance, {1}, "cold_01"));
+    ASSERT_TRUE(mgr.IsMarkedForTieredWrite(kInstance, 1));
+    // 快照 mark A 的 target+deadline（模拟 Copy 提交时的快照）
+    std::vector<MigrationManager::MarkQueryResult> snap;
+    mgr.BatchGetTieredWriteTargets(kInstance, {1}, snap);
+    ASSERT_EQ("cold_01", snap[0].target);
+    const auto old_deadline = snap[0].deadline_ms;
+    ASSERT_GT(old_deadline, 0);
+
+    // 覆盖：打 mark B: target=cold_02（模拟新一轮迁移打了不同目标的 mark）
+    ASSERT_EQ(ErrorCode::EC_OK, mgr.MarkForTieredWrite(kInstance, {1}, "cold_02"));
+    ASSERT_EQ("cold_02", mgr.GetTieredWriteTarget(kInstance, 1));
+
+    // 用 mark A 的快照做 match-clear → 不应匹配（当前 mark 是 B）
+    ASSERT_FALSE(mgr.ClearTieredWriteMarkIfMatch(kInstance, 1, "cold_01", old_deadline));
+    // mark B 应该存活
+    ASSERT_TRUE(mgr.IsMarkedForTieredWrite(kInstance, 1));
+    ASSERT_EQ("cold_02", mgr.GetTieredWriteTarget(kInstance, 1));
+
+    mgr.Stop();
 }
 
 // F-14: 部分 key 因 block 不存在被 MA_SKIP 时，marks_added / expiry / event 只计实际成功数，
@@ -245,8 +293,8 @@ TEST_F(MigrationManagerTest, TestMarkStatsOnlyCountActualSuccess) {
     ASSERT_EQ(2u, stats.active_marks);     // 2-0=2, 不会有幽灵 +1
 
     // 清掉全部两个成功的 mark → active 归零
-    mgr.ClearTieredWriteMark(kInstance, 1);
-    mgr.ClearTieredWriteMark(kInstance, 3);
+    ClearMarkForTest(mgr, kInstance, 1);
+    ClearMarkForTest(mgr, kInstance, 3);
     stats = mgr.GetStats();
     ASSERT_EQ(2u, stats.marks_added);
     ASSERT_EQ(2u, stats.marks_cleared);
@@ -287,7 +335,7 @@ TEST_F(MigrationManagerTest, TestMarkConsumedEventIncludesTargetStorage) {
 
     ASSERT_EQ(ErrorCode::EC_OK, mgr.MarkForTieredWrite(kInstance, {4}, "cold_01"));
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    mgr.ClearTieredWriteMark(kInstance, 4);
+    ClearMarkForTest(mgr, kInstance, 4);
 
     bool found = false;
     for (const auto &event : publisher->events) {
@@ -312,9 +360,9 @@ TEST_F(MigrationManagerTest, TestMarkExpiresLazilyOnLookup) {
     CreateSourceLocation(5, "hot_01", false, "e");
 
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
-    ASSERT_EQ(ErrorCode::EC_OK, mgr.MarkForTieredWrite(kInstance, {5}, "cold_01", /*timeout_ms*/ 1));
+    ASSERT_EQ(ErrorCode::EC_OK, mgr.MarkForTieredWrite(kInstance, {5}, "cold_01", /*timeout_ms*/ 50));
     ASSERT_TRUE(mgr.IsMarkedForTieredWrite(kInstance, 5));
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
 
     ASSERT_FALSE(mgr.IsMarkedForTieredWrite(kInstance, 5));
     ASSERT_EQ("", GetRawTieredWriteTarget(5));
@@ -874,6 +922,124 @@ TEST_F(MigrationManagerTest, TestBatchSubmit) {
     ASSERT_EQ(3u, mgr.ActiveTaskCount());
 }
 
+// F-17: BatchSubmit partial failure — 部分请求有坏 src_location_id，其他成功的仍被跟踪。
+TEST_F(MigrationManagerTest, TestBatchSubmitPartialFailure) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "batch_pf_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "batch_pf_cold/"));
+
+    std::string good_loc_0 = CreateSourceLocation(900, "hot_01", true, "data0");
+    std::string good_loc_2 = CreateSourceLocation(902, "hot_01", true, "data2");
+
+    std::vector<MigrationManager::MigrationRequest> reqs;
+    // req 0: good
+    {
+        MigrationManager::MigrationRequest r;
+        r.instance_id = kInstance;
+        r.block_key = 900;
+        r.src_location_id = good_loc_0;
+        r.src_storage_name = "hot_01";
+        r.dst_storage_name = "cold_01";
+        reqs.push_back(std::move(r));
+    }
+    // req 1: bad src_location_id
+    {
+        MigrationManager::MigrationRequest r;
+        r.instance_id = kInstance;
+        r.block_key = 901;
+        r.src_location_id = "nonexistent_loc";
+        r.src_storage_name = "hot_01";
+        r.dst_storage_name = "cold_01";
+        reqs.push_back(std::move(r));
+    }
+    // req 2: good
+    {
+        MigrationManager::MigrationRequest r;
+        r.instance_id = kInstance;
+        r.block_key = 902;
+        r.src_location_id = good_loc_2;
+        r.src_storage_name = "hot_01";
+        r.dst_storage_name = "cold_01";
+        reqs.push_back(std::move(r));
+    }
+
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    mgr.DebugEnableCopySubmissionsForTest();
+    auto results = mgr.BatchSubmit("t", reqs);
+    ASSERT_EQ(3u, results.size());
+    ASSERT_EQ(ErrorCode::EC_OK, results[0]);
+    ASSERT_NE(ErrorCode::EC_OK, results[1]);
+    ASSERT_EQ(ErrorCode::EC_OK, results[2]);
+    ASSERT_EQ(2u, mgr.ActiveTaskCount());
+    ASSERT_TRUE(mgr.HasMigrationTask(kInstance, 900));
+    ASSERT_FALSE(mgr.HasMigrationTask(kInstance, 901));
+    ASSERT_TRUE(mgr.HasMigrationTask(kInstance, 902));
+}
+
+// F-03: ActiveTaskCountForInstances 按 instance 集合过滤，跨 group 不抢 slot。
+TEST_F(MigrationManagerTest, TestActiveTaskCountForInstancesIsolation) {
+    const std::string kInstanceA = "group_a_inst_01";
+    const std::string kInstanceB = "group_b_inst_01";
+    ASSERT_TRUE(CreateMetaIndexer(kInstanceA));
+    ASSERT_TRUE(CreateMetaIndexer(kInstanceB));
+    ASSERT_TRUE(CreateDummyStorage("hot_a", GetPrivateTestRuntimeDataPath() + "iso_hot_a/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_a", GetPrivateTestRuntimeDataPath() + "iso_cold_a/"));
+    ASSERT_TRUE(CreateDummyStorage("hot_b", GetPrivateTestRuntimeDataPath() + "iso_hot_b/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_b", GetPrivateTestRuntimeDataPath() + "iso_cold_b/"));
+
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_, metrics_registry_, nullptr);
+    mgr.Start();
+    mgr.DebugEnableCopySubmissionsForTest();
+
+    // group A: 提交 2 个 copy task
+    {
+        auto rc = std::make_shared<RequestContext>("create_src_a");
+        MetaSearcher meta_a(meta_manager_->GetMetaIndexer(kInstanceA));
+        for (int64_t key : {100, 200}) {
+            std::string k = kInstanceA + "/TP0/" + StringUtil::Uint64ToHex(key);
+            auto results = data_storage_manager_->Create(rc.get(), "hot_a", {k}, 4, nullptr);
+            auto loc = std::make_shared<CacheLocation>(
+                DataStorageType::DATA_STORAGE_TYPE_DUMMY, 1,
+                std::vector<LocationSpec>{LocationSpec("TP0", results[0].second.ToUriString())});
+            std::vector<std::string> ids;
+            meta_a.BatchAddLocation(rc.get(), {key}, {loc}, ids);
+            std::vector<std::vector<MetaSearcher::LocationCASTask>> cas{{MetaSearcher::LocationCASTask{ids[0], CLS_WRITING, CLS_SERVING}}};
+            std::vector<std::vector<ErrorCode>> cas_r;
+            meta_a.BatchCASLocationStatus(rc.get(), {key}, cas, cas_r);
+        }
+        std::vector<MigrationManager::MigrationRequest> reqs;
+        for (int64_t key : {100, 200}) {
+            MigrationManager::MigrationRequest req;
+            req.instance_id = kInstanceA;
+            req.block_key = key;
+            auto rc2 = std::make_shared<RequestContext>("get_src");
+            std::vector<CacheLocationMap> maps;
+            MetaSearcher meta_a2(meta_manager_->GetMetaIndexer(kInstanceA));
+            meta_a2.BatchGetLocation(rc2.get(), {key}, BlockMask{}, maps);
+            req.src_location_id = maps[0].begin()->first;
+            req.src_storage_name = "hot_a";
+            req.dst_storage_name = "cold_a";
+            reqs.push_back(std::move(req));
+        }
+        auto results = mgr.BatchSubmit(kInstanceA, std::move(reqs));
+        ASSERT_EQ(2u, results.size());
+        for (auto ec : results) {
+            ASSERT_EQ(ErrorCode::EC_OK, ec);
+        }
+    }
+
+    // 全局 = 2
+    ASSERT_EQ(2u, mgr.ActiveTaskCount());
+    // group A 的 instance 集合 = 2
+    ASSERT_EQ(2u, mgr.ActiveTaskCountForInstances({kInstanceA}));
+    // group B 的 instance 集合 = 0（B 没有任何 task）
+    ASSERT_EQ(0u, mgr.ActiveTaskCountForInstances({kInstanceB}));
+    // 两个 group 合 = 全局
+    ASSERT_EQ(2u, mgr.ActiveTaskCountForInstances({kInstanceA, kInstanceB}));
+
+    mgr.Stop();
+}
+
 // ===== 可观测：metrics 计数/gauge + events 发布 smoke =====
 
 TEST_F(MigrationManagerTest, TestMetricsAndEvents) {
@@ -895,7 +1061,7 @@ TEST_F(MigrationManagerTest, TestMetricsAndEvents) {
     CreateSourceLocation(2, "hot_01", false, "b");
     mgr.MarkForTieredWrite(kInstance, {1, 2}, "cold_01");
     ASSERT_DOUBLE_EQ(2.0, metrics_registry_->GetGauge("migration.marks_active").Get());
-    mgr.ClearTieredWriteMark(kInstance, 1);
+    ClearMarkForTest(mgr, kInstance, 1);
     ASSERT_EQ(1u, metrics_registry_->GetCounter("migration.marks_consumed_total").Get());
     ASSERT_DOUBLE_EQ(1.0, metrics_registry_->GetGauge("migration.marks_active").Get());
 

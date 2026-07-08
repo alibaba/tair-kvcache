@@ -224,13 +224,13 @@ void ProtoConvert::CacheConfigToProto(const CacheConfig &cache_config_info,
             continue;
         }
         auto *proto_migration_strategy = migration_config->add_strategies();
-        proto_migration_strategy->set_storage_unique_name(migration_strategy->storage_unique_name());
-        proto_migration_strategy->set_target_storage(migration_strategy->target_storage());
+        proto_migration_strategy->set_source_storage_name(migration_strategy->source_storage_name());
+        proto_migration_strategy->set_target_storage_name(migration_strategy->target_storage_name());
         proto_migration_strategy->set_trigger_threshold(migration_strategy->trigger_threshold());
-        auto *methods = proto_migration_strategy->mutable_methods();
-        methods->mutable_copy()->set_enabled(migration_strategy->methods().copy().enabled());
-        methods->mutable_mark()->set_enabled(migration_strategy->methods().mark().enabled());
-        methods->mutable_mark()->mutable_timeout_ms()->set_value(migration_strategy->methods().mark().timeout_ms());
+        auto *method_configs = proto_migration_strategy->mutable_method_configs();
+        method_configs->mutable_copy()->set_enabled(migration_strategy->methods().copy().enabled());
+        method_configs->mutable_mark()->set_enabled(migration_strategy->methods().mark().enabled());
+        method_configs->mutable_mark()->mutable_timeout_ms()->set_value(migration_strategy->methods().mark().timeout_ms());
         proto_migration_strategy->set_retention(
             static_cast<proto::admin::MigrationRetention>(migration_strategy->retention()));
     }
@@ -305,14 +305,14 @@ void ProtoConvert::CacheConfigFromProto(const proto::admin::CacheConfig *proto_c
     migration_strategies.reserve(proto_migration_config.strategies_size());
     for (const auto &proto_migration_strategy : proto_migration_config.strategies()) {
         auto migration_strategy = std::make_shared<MigrationStrategy>();
-        migration_strategy->set_storage_unique_name(proto_migration_strategy.storage_unique_name());
-        migration_strategy->set_target_storage(proto_migration_strategy.target_storage());
+        migration_strategy->set_source_storage_name(proto_migration_strategy.source_storage_name());
+        migration_strategy->set_target_storage_name(proto_migration_strategy.target_storage_name());
         migration_strategy->set_trigger_threshold(proto_migration_strategy.trigger_threshold());
         MigrationMethods methods;
-        methods.mutable_copy().set_enabled(proto_migration_strategy.methods().copy().enabled());
-        methods.mutable_mark().set_enabled(proto_migration_strategy.methods().mark().enabled());
-        if (proto_migration_strategy.methods().mark().has_timeout_ms()) {
-            methods.mutable_mark().set_timeout_ms(proto_migration_strategy.methods().mark().timeout_ms().value());
+        methods.mutable_copy().set_enabled(proto_migration_strategy.method_configs().copy().enabled());
+        methods.mutable_mark().set_enabled(proto_migration_strategy.method_configs().mark().enabled());
+        if (proto_migration_strategy.method_configs().mark().has_timeout_ms()) {
+            methods.mutable_mark().set_timeout_ms(proto_migration_strategy.method_configs().mark().timeout_ms().value());
         } else {
             methods.mutable_mark().set_timeout_ms(MigrationMarkMethod::kDefaultTimeoutMs);
         }
