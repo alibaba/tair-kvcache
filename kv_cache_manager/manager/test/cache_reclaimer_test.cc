@@ -4936,3 +4936,53 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDStorageTypeEvictionIgnoresCold) {
     stub_.reset(ADDR(RegistryManager, GetInstanceGroup));
     g_cold_ig.reset();
 }
+
+// F-26: WRITING 状态的冷副本不算覆盖——迁移中的半成品不能作为删热依据。
+TEST_F(CacheReclaimerTest, TestFilterLocIDWritingColdDoesNotProtectHot) {
+    auto ig = InstanceGroupFactory();
+    {
+        auto cfg = std::make_shared<CacheConfig>();
+        auto strategy = std::make_shared<MigrationStrategy>();
+        strategy->set_source_storage_name("hot_01");
+        strategy->set_target_storage_name("cold_01");
+        cfg->set_migration_strategies({strategy});
+        ig->set_cache_config(cfg);
+    }
+    g_cold_ig = ig;
+    stub_.set(ADDR(RegistryManager, GetInstanceGroup), RegistryManager_GetInstanceGroup_cold_stub);
+    const auto ins_info = InstanceInfoFactory();
+
+    // hot: SERVING, cold: WRITING(迁移中半成品)
+    auto hot_loc = std::make_shared<CacheLocation>(
+        "hot_a",
+        CacheLocationStatus::CLS_SERVING,
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://hot_01/hot_a")});
+    auto cold_writing = std::make_shared<CacheLocation>(
+        "cold_w",
+        CacheLocationStatus::CLS_WRITING,
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://cold_01/cold_w")});
+
+    CacheLocationMap loc_map;
+    loc_map.emplace("hot_a", hot_loc);
+    loc_map.emplace("cold_w", cold_writing);
+    batch_get_loc_out_maps = {std::move(loc_map)};
+    batch_get_loc_result = ErrorCode::EC_OK;
+
+    CacheReclaimer::WaterLevelExceed wl;
+    wl.SetGeneralWaterLevelExceed(true);
+
+    std::vector<std::vector<std::string>> out;
+    CacheReclaimer::AgeStats age_stats;
+    ASSERT_TRUE(cache_reclaimer_->FilterLocID(request_context_.get(), ins_info, {0}, wl, out, age_stats));
+    ASSERT_EQ(1u, out.size());
+    // WRITING cold 不算覆盖 → has_cold=false → keep_cold_evict_hot=false → hot 正常被选
+    ASSERT_EQ(1u, out[0].size());
+    ASSERT_EQ("hot_a", out[0][0]);
+
+    stub_.reset(ADDR(RegistryManager, GetInstanceGroup));
+    g_cold_ig.reset();
+}

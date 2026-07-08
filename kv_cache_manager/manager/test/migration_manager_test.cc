@@ -622,6 +622,36 @@ TEST_F(MigrationManagerTest, TestSubmitThenSuccessSourceCreateTimeMismatch) {
     ASSERT_EQ(1u, mgr.GetStats().copy_failed);
 }
 
+// F-17: create_time=0 边界——源和 ctx 都默认 0,0==0 应视为匹配,正常 promote。
+TEST_F(MigrationManagerTest, TestSubmitThenSuccessSourceCreateTimeZeroMatches) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "ct0_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "ct0_cold/"));
+
+    int64_t block_key = 270;
+    // create_time=0(默认,不设)
+    std::string src_loc = CreateSourceLocation(block_key, "hot_01", true, "data");
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    mgr.DebugEnableCopySubmissionsForTest();
+    MigrationManager::MigrationRequest req;
+    req.instance_id = kInstance;
+    req.block_key = block_key;
+    req.src_location_id = src_loc;
+    req.src_storage_name = "hot_01";
+    req.dst_storage_name = "cold_01";
+    req.retention = MigrationRetention::MIGRATION_RETENTION_KEEP_BOTH;
+    ASSERT_EQ(ErrorCode::EC_OK, mgr.Submit("t", req));
+
+    mgr.OnTaskSuccess(kInstance, block_key);
+
+    // create_time 两边都 0 → 匹配 → 正常 promote,不走 source_lost
+    std::string dst_loc = mgr.GetActiveTaskDstLocation(kInstance, block_key);
+    ASSERT_FALSE(mgr.HasMigrationTask(kInstance, block_key));
+    ASSERT_EQ(1u, mgr.GetStats().copy_completed);
+    ASSERT_EQ(0u, mgr.GetStats().copy_failed);
+    ASSERT_EQ(CLS_SERVING, GetLocationStatus(block_key, src_loc));
+}
+
 TEST_F(MigrationManagerTest, TestSubmitThenFail) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
     ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "fail_hot/"));
@@ -982,51 +1012,17 @@ TEST_F(MigrationManagerTest, TestActiveTaskCountForInstancesIsolation) {
     const std::string kInstanceB = "group_b_inst_01";
     ASSERT_TRUE(CreateMetaIndexer(kInstanceA));
     ASSERT_TRUE(CreateMetaIndexer(kInstanceB));
-    ASSERT_TRUE(CreateDummyStorage("hot_a", GetPrivateTestRuntimeDataPath() + "iso_hot_a/"));
-    ASSERT_TRUE(CreateDummyStorage("cold_a", GetPrivateTestRuntimeDataPath() + "iso_cold_a/"));
-    ASSERT_TRUE(CreateDummyStorage("hot_b", GetPrivateTestRuntimeDataPath() + "iso_hot_b/"));
-    ASSERT_TRUE(CreateDummyStorage("cold_b", GetPrivateTestRuntimeDataPath() + "iso_cold_b/"));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "iso_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "iso_cold/"));
 
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_, metrics_registry_, nullptr);
     mgr.Start();
     mgr.DebugEnableCopySubmissionsForTest();
 
-    // group A: 提交 2 个 copy task
-    {
-        auto rc = std::make_shared<RequestContext>("create_src_a");
-        MetaSearcher meta_a(meta_manager_->GetMetaIndexer(kInstanceA));
-        for (int64_t key : {100, 200}) {
-            std::string k = kInstanceA + "/TP0/" + StringUtil::Uint64ToHex(key);
-            auto results = data_storage_manager_->Create(rc.get(), "hot_a", {k}, 4, nullptr);
-            auto loc = std::make_shared<CacheLocation>(
-                DataStorageType::DATA_STORAGE_TYPE_DUMMY, 1,
-                std::vector<LocationSpec>{LocationSpec("TP0", results[0].second.ToUriString())});
-            std::vector<std::string> ids;
-            meta_a.BatchAddLocation(rc.get(), {key}, {loc}, ids);
-            std::vector<std::vector<MetaSearcher::LocationCASTask>> cas{{MetaSearcher::LocationCASTask{ids[0], CLS_WRITING, CLS_SERVING}}};
-            std::vector<std::vector<ErrorCode>> cas_r;
-            meta_a.BatchCASLocationStatus(rc.get(), {key}, cas, cas_r);
-        }
-        std::vector<MigrationManager::MigrationRequest> reqs;
-        for (int64_t key : {100, 200}) {
-            MigrationManager::MigrationRequest req;
-            req.instance_id = kInstanceA;
-            req.block_key = key;
-            auto rc2 = std::make_shared<RequestContext>("get_src");
-            std::vector<CacheLocationMap> maps;
-            MetaSearcher meta_a2(meta_manager_->GetMetaIndexer(kInstanceA));
-            meta_a2.BatchGetLocation(rc2.get(), {key}, BlockMask{}, maps);
-            req.src_location_id = maps[0].begin()->first;
-            req.src_storage_name = "hot_a";
-            req.dst_storage_name = "cold_a";
-            reqs.push_back(std::move(req));
-        }
-        auto results = mgr.BatchSubmit(kInstanceA, std::move(reqs));
-        ASSERT_EQ(2u, results.size());
-        for (auto ec : results) {
-            ASSERT_EQ(ErrorCode::EC_OK, ec);
-        }
-    }
+    // 复用 fixture 的 CreateSourceLocation 不行（它绑 kInstance），手动用 DebugInsertActiveCopyTask 注入。
+    // DebugInsert 直接往活跃表插 entry，不走真实 copy 流程，避免 storage setup 脆弱性。
+    mgr.DebugInsertActiveCopyTask(kInstanceA, 100, "dst_a1");
+    mgr.DebugInsertActiveCopyTask(kInstanceA, 200, "dst_a2");
 
     // 全局 = 2
     ASSERT_EQ(2u, mgr.ActiveTaskCount());
