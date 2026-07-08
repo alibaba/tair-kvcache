@@ -43,7 +43,16 @@ enum StorageType {
     ST_NFS = 4;
     ST_VCNS_3FS = 5;
     ST_DUMMY = 6;
-    ST_VINEYARD = 7;
+    ST_EVENT_REPORT_L1P5 = 7;
+    ST_EVENT_REPORT_L2 = 8;
+}
+
+enum QueryType {
+    QT_UNSPECIFIED = 0;
+    QT_BATCH_GET = 1;
+    QT_PREFIX_MATCH = 2;
+    QT_REVERSE_ROLL_SW_MATCH = 3;
+    QT_PREFIX_MATCH_WITH_MAMBA = 4;
 }
 
 message LocalStorageSpec {}
@@ -103,7 +112,7 @@ message NfsStorageSpec {
     int32 key_count_per_file = 2;
 }
 
-message VineyardStorageSpec {
+message EventReportStorageSpec {
     int64 heartbeat_timeout_ms = 1;
     int64 cleanup_grace_ms = 2;
     int64 liveness_check_interval_ms = 3;
@@ -119,9 +128,11 @@ message StorageConfig {
         NfsStorageSpec nfs = 6;
         VcnsThreeFSStorageSpec vcnsthreefs = 7;
         DummyStorageSpec dummy = 9;
-        VineyardStorageSpec vineyard = 10;
+        EventReportStorageSpec event_report = 14;
     }
     bool check_storage_available_when_open = 8;
+    // 仅供响应中使用，标识存储类型；请求时类型由 oneof 字段决定。
+    StorageType storage_type = 11;
 }
 
 // 以下接口默认是instanceGroup之间的storage相互隔离
@@ -299,7 +310,7 @@ message InstanceGroup {
     string user_data = 7;
     int64 version = 8;
     string extra_info = 9; // opaque JSON passed through to clients
-    repeated string event_reporting_storage_candidates = 10; // backends that handle ReportEvent
+    repeated string event_report_storage_candidates = 10; // backends that handle ReportEvent
     string revisit_interval_buckets = 11; // comma-separated bucket boundaries in seconds (e.g. "1,5,30,60")
 }
 
@@ -445,6 +456,7 @@ message InstanceInfo {
     repeated LocationSpecInfo location_spec_infos = 5; // 一个location内的所有spec，StartWriteCache时会按照这个进行分配
     ModelDeployment model_deployment = 6;
     repeated LocationSpecGroup location_spec_groups = 7; // 一个group包含多个spec name。用于简化StartWriteCache时指定可以提供哪些location spec。
+    QueryType query_type = 8;                            
 }
 
 message RegisterInstanceRequest {
@@ -455,6 +467,7 @@ message RegisterInstanceRequest {
     repeated LocationSpecInfo location_spec_infos = 5; // 一个location内的所有spec，StartWriteCache时会按照这个进行分配
     ModelDeployment model_deployment = 6;
     repeated LocationSpecGroup location_spec_groups = 7; // 一个group包含多个spec name。用于简化StartWriteCache时指定可以提供哪些location spec。
+    QueryType query_type = 8;                           
 }
 
 message RemoveInstanceRequest {

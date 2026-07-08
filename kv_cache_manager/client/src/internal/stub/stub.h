@@ -27,7 +27,8 @@ public:
                      int32_t block_size,
                      const LocationSpecInfoMap &location_spec_infos,
                      const ModelDeployment &model_deployment,
-                     const LocationSpecGroups &location_spec_groups) = 0;
+                     const LocationSpecGroups &location_spec_groups,
+                     QueryType query_type = QueryType::QT_UNSPECIFIED) = 0;
     virtual std::pair<ClientErrorCode, InstanceInfo> GetInstanceInfo(const std::string &trace_id,
                                                                      const std::string &instance_id) = 0;
 

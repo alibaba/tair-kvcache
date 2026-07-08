@@ -3,6 +3,7 @@
 #include <memory>
 #include <string>
 
+#include "kv_cache_manager/client/include/common.h"
 #include "kv_cache_manager/common/jsonizable.h"
 #include "kv_cache_manager/config/model_deployment.h"
 #include "meta_channel_config.h"
@@ -28,6 +29,7 @@ public:
     std::shared_ptr<SdkWrapperConfig> sdk_wrapper_config() const { return sdk_wrapper_config_; }
     const ModelDeployment &model_deployment() const { return model_deployment_; }
     const LocationSpecGroups &location_spec_groups() const { return location_spec_groups_; }
+    QueryType query_type() const { return static_cast<QueryType>(query_type_); }
 
 private:
     bool Check() const;
@@ -42,6 +44,7 @@ private:
     std::shared_ptr<SdkWrapperConfig> sdk_wrapper_config_;
     ModelDeployment model_deployment_;
     LocationSpecGroups location_spec_groups_;
+    int32_t query_type_{0};
 };
 
 } // namespace kv_cache_manager

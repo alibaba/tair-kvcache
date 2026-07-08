@@ -69,6 +69,10 @@ public:
                      const proto::meta::ReportEventRequest *request,
                      proto::meta::ReportEventResponse *response);
 
+    void GetHostCacheState(RequestContext *request_context,
+                           const proto::meta::GetHostCacheStateRequest *request,
+                           proto::meta::GetHostCacheStateResponse *response);
+
 private:
     std::shared_ptr<CacheManager> cache_manager_;
     std::shared_ptr<MetricsReporter> metrics_reporter_;

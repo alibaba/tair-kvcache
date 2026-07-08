@@ -65,6 +65,10 @@ public:
                              const proto::meta::ReportEventRequest *request,
                              proto::meta::ReportEventResponse *response) override;
 
+    grpc::Status GetHostCacheState(grpc::ServerContext *context,
+                                   const proto::meta::GetHostCacheStateRequest *request,
+                                   proto::meta::GetHostCacheStateResponse *response) override;
+
 private:
     std::shared_ptr<MetaServiceImpl> meta_service_impl_;
 };

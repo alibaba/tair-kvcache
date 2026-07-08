@@ -22,7 +22,8 @@ public:
                                                              int32_t block_size,
                                                              const LocationSpecInfoMap &location_spec_infos,
                                                              const ModelDeployment &model_deployment,
-                                                             const LocationSpecGroups &location_spec_groups) override;
+                                                             const LocationSpecGroups &location_spec_groups,
+                                                             QueryType query_type = QueryType::QT_UNSPECIFIED) override;
 
     std::pair<ClientErrorCode, InstanceInfo> GetInstanceInfo(const std::string &trace_id,
                                                              const std::string &instance_id) override;
@@ -73,7 +74,7 @@ public:
     bool TrimCache() override;
 
     std::pair<ClientErrorCode, ClusterInfo> GetClusterInfo(const std::string &trace_id,
-                                                            const std::string &instance_id) override;
+                                                           const std::string &instance_id) override;
 
 private:
     std::shared_ptr<proto::meta::MetaService::Stub> GetStub() const;

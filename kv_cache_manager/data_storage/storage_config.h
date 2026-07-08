@@ -16,9 +16,14 @@ enum class DataStorageType : uint8_t {
     DATA_STORAGE_TYPE_NFS = 4,
     DATA_STORAGE_TYPE_VCNS_HF3FS = 5,
     DATA_STORAGE_TYPE_DUMMY = 6,
-    DATA_STORAGE_TYPE_VINEYARD = 7,
+    DATA_STORAGE_TYPE_EVENT_REPORT_L1P5 = 7,
+    DATA_STORAGE_TYPE_EVENT_REPORT_L2 = 8,
     COUNT, // as sentinel, must be last
 };
+
+constexpr uint16_t kTairMemPoolMediaTypeUnspecified = 0;
+constexpr uint16_t kTairMemPoolMediaTypeDram = 2;
+constexpr uint16_t kTairMemPoolMediaTypeSsd = 5;
 
 std::string ToString(const DataStorageType &type);
 
@@ -26,9 +31,10 @@ DataStorageType ToDataStorageType(const std::string &type);
 
 constexpr std::size_t ToIndex(const DataStorageType &type) noexcept { return static_cast<std::size_t>(type); }
 
-constexpr uint16_t kTairMemPoolMediaTypeUnspecified = 0;
-constexpr uint16_t kTairMemPoolMediaTypeDram = 2;
-constexpr uint16_t kTairMemPoolMediaTypeSsd = 5;
+constexpr bool IsEventReportStorageType(const DataStorageType &type) noexcept {
+    return type == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5 ||
+           type == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2;
+}
 
 // help mapping sub storage type to base storage type
 // e.g., VCNS_HF3FS (sub) --> HF3FS (base)
@@ -205,7 +211,7 @@ private:
     int32_t key_count_per_file_ = 0;
 };
 
-class VineyardStorageSpec : public StorageSpec {
+class EventReportStorageSpec : public StorageSpec {
 public:
     static constexpr int64_t kDefaultHeartbeatTimeoutMs = 30 * 1000;
     static constexpr int64_t kDefaultCleanupGraceMs = 5 * 60 * 1000;

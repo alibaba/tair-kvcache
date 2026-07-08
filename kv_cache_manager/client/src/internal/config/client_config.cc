@@ -14,6 +14,7 @@ bool ClientConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
     KVCM_JSON_GET_MACRO(rapid_value, "sdk_config", sdk_wrapper_config_);
     KVCM_JSON_GET_MACRO(rapid_value, "model_deployment", model_deployment_);
     KVCM_JSON_GET_MACRO(rapid_value, "location_spec_groups", location_spec_groups_);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "query_type", query_type_, static_cast<int32_t>(0));
     return Check();
 }
 void ClientConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
@@ -26,6 +27,7 @@ void ClientConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &wri
     Put(writer, "sdk_config", sdk_wrapper_config_);
     Put(writer, "model_deployment", model_deployment_);
     Put(writer, "location_spec_groups", location_spec_groups_);
+    Put(writer, "query_type", query_type_);
 }
 
 bool ClientConfig::operator==(const ClientConfig &other) const {
@@ -39,7 +41,8 @@ bool ClientConfig::operator==(const ClientConfig &other) const {
 
     return block_size_ == other.block_size_ && instance_group_ == other.instance_group_ &&
            instance_id_ == other.instance_id_ && location_spec_infos_ == other.location_spec_infos_ &&
-           addresses_ == other.addresses_ && sdk_configs_equal && model_deployment_ == other.model_deployment_;
+           addresses_ == other.addresses_ && sdk_configs_equal && model_deployment_ == other.model_deployment_ &&
+           location_spec_groups_ == other.location_spec_groups_ && query_type_ == other.query_type_;
 }
 
 bool ClientConfig::Check() const {
@@ -70,6 +73,11 @@ bool ClientConfig::Check() const {
                 return false;
             }
         }
+    }
+    if (query_type_ < static_cast<int32_t>(QueryType::QT_UNSPECIFIED) ||
+        query_type_ > static_cast<int32_t>(QueryType::QT_PREFIX_MATCH_WITH_MAMBA)) {
+        KVCM_LOG_ERROR("query_type [%d] is invalid", query_type_);
+        return false;
     }
     return true;
 }

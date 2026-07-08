@@ -42,11 +42,9 @@ public:
     void set_version(int64_t version) { version_ = version; }
     const std::string &extra_info() const { return extra_info_; }
     void set_extra_info(const std::string &extra_info) { extra_info_ = extra_info; }
-    const std::vector<std::string> &event_reporting_storage_candidates() const {
-        return event_reporting_storage_candidates_;
-    }
-    void set_event_reporting_storage_candidates(const std::vector<std::string> &candidates) {
-        event_reporting_storage_candidates_ = candidates;
+    const std::vector<std::string> &event_report_storage_candidates() const { return event_report_storage_candidates_; }
+    void set_event_report_storage_candidates(const std::vector<std::string> &candidates) {
+        event_report_storage_candidates_ = candidates;
     }
 
     // Revisit interval histogram bucket boundaries (parsed, validated).
@@ -70,7 +68,7 @@ private:
     std::string user_data_;
     int64_t version_;
     std::string extra_info_;
-    std::vector<std::string> event_reporting_storage_candidates_;
+    std::vector<std::string> event_report_storage_candidates_;
     std::string revisit_interval_buckets_str_;            // raw string for JSON wire format
     std::vector<double> parsed_revisit_interval_buckets_; // parsed, validated boundaries
 };

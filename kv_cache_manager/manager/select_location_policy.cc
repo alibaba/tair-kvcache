@@ -4,39 +4,7 @@
 #include <string>
 #include <vector>
 
-namespace {
-
-// 从 URI 中提取 hostname，例如 "nfs://host01/path" → "host01"
-std::string_view ExtractHostName(std::string_view uri) {
-    static std::string empty_str;
-    // 找协议分隔符 "://"
-    auto pos_protocol_end = uri.find("://");
-    if (pos_protocol_end == std::string::npos) {
-        return empty_str;
-    }
-    // 提取 "[hostname][/path][?query]" 部分
-    size_t host_start = pos_protocol_end + 3; // 跳过 "://"
-    // 找第一个 '/' 或 '?'，那个是 hostname 结束的位置
-    size_t pos_path_start = uri.find('/', host_start);
-    size_t pos_query_start = uri.find('?', host_start);
-    // 提取 hostname
-    if (pos_path_start == std::string::npos && pos_query_start == std::string::npos) {
-        // 没有 path 和 params
-        return uri.substr(host_start);
-    } else if (pos_path_start != std::string::npos &&
-               (pos_query_start == std::string::npos || pos_path_start < pos_query_start)) {
-        // 有 path（可能后面还有 query）
-        return uri.substr(host_start, pos_path_start - host_start);
-
-    } else if (pos_query_start != std::string::npos &&
-               (pos_path_start == std::string::npos || pos_query_start < pos_path_start)) {
-        // 没有 path，hostname 后直接是 query
-        return uri.substr(host_start, pos_query_start - host_start);
-    }
-    return empty_str;
-}
-
-} // anonymous namespace
+#include "kv_cache_manager/common/standard_uri.h"
 
 namespace kv_cache_manager {
 
@@ -55,7 +23,7 @@ CacheLocationConstPtr WeightSLPolicy::SelectForMatch(CacheLocationMap &location_
         }
         if (kv.second->status() == CacheLocationStatus::CLS_SERVING) {
             if (check_loc_data_exist && !check_loc_data_exist(*kv.second)) {
-                if (kv.second->type() != DataStorageType::DATA_STORAGE_TYPE_VINEYARD) {
+                if (!IsEventReportStorageType(kv.second->type())) {
                     out_prune_loc_ids.emplace_back(kv.first);
                 }
                 continue;
@@ -85,7 +53,7 @@ bool WeightSLPolicy::ExistsForWrite(const CacheLocationMap &location_map,
         if (kv.second->status() != CacheLocationStatus::CLS_NOT_FOUND) {
             if (kv.second->status() == CacheLocationStatus::CLS_SERVING && check_loc_data_exist &&
                 !check_loc_data_exist(*kv.second)) {
-                if (kv.second->type() != DataStorageType::DATA_STORAGE_TYPE_VINEYARD) {
+                if (!IsEventReportStorageType(kv.second->type())) {
                     out_prune_loc_ids.emplace_back(kv.first);
                 }
                 continue;
@@ -120,7 +88,7 @@ bool WeightSLPolicy::ExistsForWrite(const CacheLocationMap &location_map,
         }
         if (kv.second->status() == CacheLocationStatus::CLS_SERVING && check_loc_data_exist &&
             !check_loc_data_exist(*kv.second)) {
-            if (kv.second->type() != DataStorageType::DATA_STORAGE_TYPE_VINEYARD) {
+            if (!IsEventReportStorageType(kv.second->type())) {
                 out_prune_loc_ids.emplace_back(kv.first);
             }
             continue;
@@ -160,7 +128,7 @@ bool WeightSLPolicy::ExistsForWriteWithMinCount(const CacheLocationMap &location
         }
         if (check_loc_data_exist && kv.second->status() == CacheLocationStatus::CLS_SERVING &&
             !check_loc_data_exist(*kv.second)) {
-            if (kv.second->type() != DataStorageType::DATA_STORAGE_TYPE_VINEYARD) {
+            if (!IsEventReportStorageType(kv.second->type())) {
                 out_prune_loc_ids.emplace_back(kv.first);
             }
             continue;
@@ -202,7 +170,7 @@ uint32_t NamedStorageWeightedSLPolicy::GetWeight(CacheLocationMap::const_referen
         return 0;
     }
     // all location_specs in location have the same host name
-    std::string_view host_name = ExtractHostName(kv.second->location_specs().front().uri());
+    std::string host_name = StandardUri(kv.second->location_specs().front().uri()).GetHostPort();
     if (auto iter = weight_map_.find(host_name); iter != weight_map_.end()) {
         return iter->second;
     }
@@ -216,8 +184,8 @@ bool SelectLocationPolicy::IsSameDataStorage(const CacheLocation &candidate, con
     if (candidate.location_specs().empty() || reference.location_specs().empty()) {
         return candidate.location_specs().empty() == reference.location_specs().empty();
     }
-    return ExtractHostName(candidate.location_specs().front().uri()) ==
-           ExtractHostName(reference.location_specs().front().uri());
+    return StandardUri(candidate.location_specs().front().uri()).GetHostPort() ==
+           StandardUri(reference.location_specs().front().uri()).GetHostPort();
 }
 
 } // namespace kv_cache_manager

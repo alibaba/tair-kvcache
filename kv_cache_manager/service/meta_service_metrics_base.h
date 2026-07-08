@@ -1,6 +1,7 @@
 #pragma once
 
 #include <shared_mutex>
+#include <string>
 #include <unordered_map>
 
 #include "kv_cache_manager/metrics/metrics_collector.h"
@@ -33,6 +34,15 @@ private:                                                                        
     } while (0)
 #endif
 
+#ifndef KVCM_INVALIDATE_TYPED_METRICS_COLLECTOR_MAP_
+#define KVCM_INVALIDATE_TYPED_METRICS_COLLECTOR_MAP_(name, instance_id)                                                \
+    do {                                                                                                               \
+        std::scoped_lock guard(mutex_##name##_);                                                                       \
+        KVCM_METRICS_COLLECTOR_MAP_(name).erase(MakeTypedCollectorKey(instance_id, kEventReportL1P5MetricsType));      \
+        KVCM_METRICS_COLLECTOR_MAP_(name).erase(MakeTypedCollectorKey(instance_id, kEventReportL2MetricsType));        \
+    } while (0)
+#endif
+
 class RegistryManager;
 struct MetricsLifecycle;
 
@@ -59,8 +69,19 @@ public:
     KVCM_DECLARE_METRICS_COLLECTOR_MAP_METHOD_(ReportEvent);
     KVCM_DECLARE_METRICS_COLLECTOR_MAP_METHOD_(EventBlockAdd);
     KVCM_DECLARE_METRICS_COLLECTOR_MAP_METHOD_(EventBlockDelete);
+    KVCM_DECLARE_METRICS_COLLECTOR_MAP_METHOD_(GetHostCacheState);
 
 protected:
+    std::shared_ptr<MetricsCollector> get_metrics_collector_from_map_for_ReportEvent(const std::string &instance_id,
+                                                                                     const std::string &type);
+    std::shared_ptr<MetricsCollector> get_metrics_collector_from_map_for_EventBlockAdd(const std::string &instance_id,
+                                                                                       const std::string &type);
+    std::shared_ptr<MetricsCollector>
+    get_metrics_collector_from_map_for_EventBlockDelete(const std::string &instance_id, const std::string &type);
+
+    static constexpr const char *kEventReportL1P5MetricsType = "event_report_l1p5";
+    static constexpr const char *kEventReportL2MetricsType = "event_report_l2";
+
     KVCM_DECLARE_METRICS_COLLECTOR_(RegisterInstance);
     KVCM_DECLARE_METRICS_COLLECTOR_(GetInstanceInfo);
     KVCM_DECLARE_METRICS_COLLECTOR_(GetClusterInfo);
@@ -76,8 +97,18 @@ protected:
     KVCM_DECLARE_METRICS_COLLECTOR_MAP_(ReportEvent);
     KVCM_DECLARE_METRICS_COLLECTOR_MAP_(EventBlockAdd);
     KVCM_DECLARE_METRICS_COLLECTOR_MAP_(EventBlockDelete);
+    KVCM_DECLARE_METRICS_COLLECTOR_MAP_(GetHostCacheState);
 
 private:
+    std::shared_ptr<MetricsCollector> GetMetricsCollectorFromMap(
+        const std::string &api_name,
+        std::unordered_map<std::string, std::shared_ptr<MetricsCollector>> &metrics_collector_map,
+        std::shared_mutex &mutex,
+        const std::string &instance_id,
+        const std::string &collector_key,
+        const MetricsTags &extra_tags);
+    static std::string MakeTypedCollectorKey(const std::string &instance_id, const std::string &type);
+
     std::shared_ptr<MetricsRegistry> metrics_registry_;
     std::shared_ptr<RegistryManager> registry_manager_;
     // shared coarse-grained lock that excludes RemoveInstance /

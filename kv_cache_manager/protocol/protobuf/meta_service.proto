@@ -43,40 +43,62 @@ enum StorageType {
     ST_NFS = 4;
     ST_VCNS_3FS = 5;
     ST_DUMMY = 6;
-    ST_VINEYARD = 7;
+    ST_EVENT_REPORT_L1P5 = 7;
+    ST_EVENT_REPORT_L2 = 8;
 }
 
-// ---- V6D event reporting ----
+// ---- Cache event reporting ----
+//
+// ReportEvent is the ingestion API used by cache subscribers. A subscriber
+// normalizes engine-specific cache signals (for example RTP-LLM full cache
+// snapshots or vLLM KV events) into block-level mutations on one storage
+// system. `storage_type` names that large storage/cache system; `medium`
+// identifies one diffable cache namespace under the reporter host; LocationSpec
+// describes where each cache component of the block lives. KVCM currently
+// matches only full-attention specs and ignores mamba-state specs by
+// LocationSpec.name.
 
 enum ReportEventType {
     EVENT_UNSPECIFIED = 0;
-    EVENT_NODE_REGISTER = 1; // V6D node starts up and registers with KVCM
-    EVENT_BLOCK_ADD = 2;     // V6D stored a new block locally
-    EVENT_BLOCK_DELETE = 3;  // V6D deleted a block locally
-    EVENT_HOST_DOWN = 4;     // V6D node is going down (graceful or detected)
-    EVENT_HEARTBEAT = 5;     // V6D periodic heartbeat
+    EVENT_NODE_REGISTER = 1; // Reporter node starts up and registers with KVCM
+    EVENT_BLOCK_ADD = 2;     // Reporter stored a block in one location
+    EVENT_BLOCK_DELETE = 3;  // Reporter removed a block from one location
+    EVENT_HOST_DOWN = 4;     // Reporter node is going down (graceful or detected)
+    EVENT_HEARTBEAT = 5;     // Reporter periodic heartbeat
+    EVENT_BLOCK_SNAPSHOT = 6; // Reporter sends the full block set for one host/medium
 }
 
-message NodeRegisterParams {
+message NodeRegisterEventParams {
     repeated string mediums = 1; // mediums supported by the node, e.g. ["mem","disk"]
 }
 
-message BlockAddParams {
+message BlockAddEventParams {
     string block_key = 1; // int64 as string
     string uri = 2;       // deprecated, use specs instead
-    string medium = 3;    // e.g. "mem"/"disk"/"ssd"/"hbm"
+    string medium = 3;    // cache tier/namespace, e.g. "mem", "disk", "gpu", "hbm"
     repeated LocationSpec specs = 4;
 }
 
-message BlockDeleteParams {
+message BlockDeleteEventParams {
     string block_key = 1;
-    string medium = 2;
+    string medium = 2; // cache tier/namespace, e.g. "mem", "disk", "gpu", "hbm"
+    repeated string spec_names = 3;
 }
 
-message HostDownParams {
+message BlockSnapshotItem {
+    string block_key = 1;
+    repeated LocationSpec specs = 2;
 }
 
-message HeartbeatParams {
+message BlockSnapshotEventParams {
+    string medium = 1; // cache tier/namespace, e.g. "mem", "disk", "gpu", "hbm"
+    repeated BlockSnapshotItem blocks = 2;
+}
+
+message HostDownEventParams {
+}
+
+message HeartbeatEventParams {
     // KVCM only refreshes last_heartbeat; system_status is opaque observability data
     map<string, string> system_status = 1;
 }
@@ -84,11 +106,12 @@ message HeartbeatParams {
 message EventItem {
     ReportEventType event_type = 1;
     oneof event_params {
-        NodeRegisterParams node_register = 2;
-        BlockAddParams block_add = 3;
-        BlockDeleteParams block_delete = 4;
-        HostDownParams host_down = 5;
-        HeartbeatParams heartbeat = 6;
+        NodeRegisterEventParams node_register = 2;
+        BlockAddEventParams block_add = 3;
+        BlockDeleteEventParams block_delete = 4;
+        HostDownEventParams host_down = 5;
+        HeartbeatEventParams heartbeat = 6;
+        BlockSnapshotEventParams block_snapshot = 7;
     }
 }
 
@@ -97,7 +120,7 @@ message ReportEventRequest {
     string instance_id = 2;
     string host_ip_port = 3;
     repeated EventItem events = 4;
-    StorageType storage_type = 5; // required: declares the reporter's storage type
+    StorageType storage_type = 5; // required: declares the reporter's storage/event_report
 }
 
 message ReportEventResponse {
@@ -153,6 +176,7 @@ message InstanceInfo {
     repeated LocationSpecInfo location_spec_infos = 5; // 一个location内的所有spec，StartWriteCache时会按照这个进行分配
     ModelDeployment model_deployment = 6;
     repeated LocationSpecGroup location_spec_groups = 7; // 一个group包含多个spec name。用于简化StartWriteCache时指定可以提供哪些location spec。
+    QueryType query_type = 8;
 }
 
 message LocalStorageSpec {}
@@ -233,6 +257,7 @@ message RegisterInstanceRequest {
     repeated LocationSpecInfo location_spec_infos = 5; // 一个location内的所有spec，StartWriteCache时会按照这个进行分配
     ModelDeployment model_deployment = 6;
     repeated LocationSpecGroup location_spec_groups = 7; // 一个group包含多个spec name。用于简化StartWriteCache时指定可以提供哪些location spec。
+    QueryType query_type = 8;
 }
 
 message RegisterInstanceResponse {
@@ -265,6 +290,7 @@ enum QueryType {
     QT_BATCH_GET = 1;
     QT_PREFIX_MATCH = 2;
     QT_REVERSE_ROLL_SW_MATCH = 3;
+    QT_PREFIX_MATCH_WITH_MAMBA = 4;
 }
 
 message GetCacheLocationRequest {
@@ -452,8 +478,30 @@ service MetaService {
     rpc TrimCache(TrimCacheRequest) returns (CommonResponse);
     // 查询集群信息（leader发现），任意节点均可处理
     rpc GetClusterInfo(GetClusterInfoRequest) returns (GetClusterInfoResponse);
-    // V6D 上报事件（节点注册、Block 增删、节点宕机）
+    // 推理节点上报事件（节点注册、Block 增删、节点宕机、心跳）
     rpc ReportEvent(ReportEventRequest) returns (ReportEventResponse);
+    // 查询 instance 下所有 host 的 prefix match 结果
+    rpc GetHostCacheState(GetHostCacheStateRequest) returns (GetHostCacheStateResponse);
     // 每个 key 的多个 Cache 位置（每种backend根据策略选择一个地址）
     rpc GetCacheLocationsByBackend(GetCacheLocationsByBackendRequest) returns (GetCacheLocationsByBackendResponse);
+}
+
+// ---- GetHostCacheState ----
+
+message GetHostCacheStateRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    QueryType query_type = 3;
+    repeated int64 block_cache_keys = 4;   // 请求 prompt 的有序 block cache keys
+    repeated string medium = 5;            // 要匹配的介质列表；为空时考虑所有介质
+}
+
+message HostCacheMatch {
+    string host_ip_port = 1;   // 必须与 Master 中 workerStatus.getIpPort() 的格式完全一致
+    int64 prefix_match_blocks = 2;         // 连续命中的 block 数（调用方自己 ×block_size 算 tokens）
+}
+
+message GetHostCacheStateResponse {
+    CommonResponseHeader header = 1;
+    repeated HostCacheMatch hosts = 2;
 }
