@@ -5,6 +5,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
@@ -160,6 +161,9 @@ public:
     ErrorCode ReportEvent(RequestContext *request_context,
                           const proto::meta::ReportEventRequest *request,
                           proto::meta::ReportEventResponse *response);
+    ErrorCode GetHostCacheState(RequestContext *request_context,
+                                const proto::meta::GetHostCacheStateRequest *request,
+                                proto::meta::GetHostCacheStateResponse *response);
     ErrorCode TrimCache(RequestContext *request_context,
                         const std::string &instance_id,
                         const proto::meta::TrimStrategy &trim_strategy,

@@ -302,6 +302,14 @@ void ProtoConvert::DataStorageTypeToProto(const DataStorageType &data_storage_ty
         *proto_data_storage_type = T::ST_VINEYARD;
         break;
     }
+    case DataStorageType::DATA_STORAGE_TYPE_RTP_LLM: {
+        *proto_data_storage_type = T::ST_RTP_LLM;
+        break;
+    }
+    case DataStorageType::DATA_STORAGE_TYPE_VLLM: {
+        *proto_data_storage_type = T::ST_VLLM;
+        break;
+    }
     default: {
         // Handle unknown storage type case if necessary
         break;
@@ -344,6 +352,14 @@ void ProtoConvert::DataStorageTypeFromProto(const T proto_data_storage_type, Dat
     }
     case T::ST_VINEYARD: {
         data_storage_type_info = DataStorageType::DATA_STORAGE_TYPE_VINEYARD;
+        break;
+    }
+    case T::ST_RTP_LLM: {
+        data_storage_type_info = DataStorageType::DATA_STORAGE_TYPE_RTP_LLM;
+        break;
+    }
+    case T::ST_VLLM: {
+        data_storage_type_info = DataStorageType::DATA_STORAGE_TYPE_VLLM;
         break;
     }
     default: {

@@ -59,6 +59,7 @@ public:
     KVCM_DECLARE_METRICS_COLLECTOR_MAP_METHOD_(ReportEvent);
     KVCM_DECLARE_METRICS_COLLECTOR_MAP_METHOD_(EventBlockAdd);
     KVCM_DECLARE_METRICS_COLLECTOR_MAP_METHOD_(EventBlockDelete);
+    KVCM_DECLARE_METRICS_COLLECTOR_MAP_METHOD_(GetHostCacheState);
 
 protected:
     KVCM_DECLARE_METRICS_COLLECTOR_(RegisterInstance);
@@ -76,6 +77,7 @@ protected:
     KVCM_DECLARE_METRICS_COLLECTOR_MAP_(ReportEvent);
     KVCM_DECLARE_METRICS_COLLECTOR_MAP_(EventBlockAdd);
     KVCM_DECLARE_METRICS_COLLECTOR_MAP_(EventBlockDelete);
+    KVCM_DECLARE_METRICS_COLLECTOR_MAP_(GetHostCacheState);
 
 private:
     std::shared_ptr<MetricsRegistry> metrics_registry_;

@@ -1341,43 +1341,43 @@ protected:
         std::vector<std::vector<MetaSearcher::UpsertLocation>> v6d_upserts = {
             // key 80000: peer_a + peer_b
             {
-                {"kvs#v6d#mem#peer_a:8080",
+                {"kvs#vineyard#mem#peer_a:8080",
                  DataStorageType::DATA_STORAGE_TYPE_VINEYARD,
                  CLS_SERVING,
-                 {LocationSpec("tp0", "v6d://peer_a:8080/tp0")}},
-                {"kvs#v6d#mem#peer_b:8080",
+                 {LocationSpec("tp0", "vineyard://peer_a:8080/tp0")}},
+                {"kvs#vineyard#mem#peer_b:8080",
                  DataStorageType::DATA_STORAGE_TYPE_VINEYARD,
                  CLS_SERVING,
-                 {LocationSpec("tp0", "v6d://peer_b:8080/tp0")}},
+                 {LocationSpec("tp0", "vineyard://peer_b:8080/tp0")}},
             },
             // key 80001: peer_a + peer_b
             {
-                {"kvs#v6d#mem#peer_a:8080",
+                {"kvs#vineyard#mem#peer_a:8080",
                  DataStorageType::DATA_STORAGE_TYPE_VINEYARD,
                  CLS_SERVING,
-                 {LocationSpec("tp0", "v6d://peer_a:8080/tp0")}},
-                {"kvs#v6d#mem#peer_b:8080",
+                 {LocationSpec("tp0", "vineyard://peer_a:8080/tp0")}},
+                {"kvs#vineyard#mem#peer_b:8080",
                  DataStorageType::DATA_STORAGE_TYPE_VINEYARD,
                  CLS_SERVING,
-                 {LocationSpec("tp0", "v6d://peer_b:8080/tp0")}},
+                 {LocationSpec("tp0", "vineyard://peer_b:8080/tp0")}},
             },
             // key 80002: peer_b only
             {
-                {"kvs#v6d#mem#peer_b:8080",
+                {"kvs#vineyard#mem#peer_b:8080",
                  DataStorageType::DATA_STORAGE_TYPE_VINEYARD,
                  CLS_SERVING,
-                 {LocationSpec("tp0", "v6d://peer_b:8080/tp0")}},
+                 {LocationSpec("tp0", "vineyard://peer_b:8080/tp0")}},
             },
             // key 80003: peer_a + peer_b
             {
-                {"kvs#v6d#mem#peer_a:8080",
+                {"kvs#vineyard#mem#peer_a:8080",
                  DataStorageType::DATA_STORAGE_TYPE_VINEYARD,
                  CLS_SERVING,
-                 {LocationSpec("tp0", "v6d://peer_a:8080/tp0")}},
-                {"kvs#v6d#mem#peer_b:8080",
+                 {LocationSpec("tp0", "vineyard://peer_a:8080/tp0")}},
+                {"kvs#vineyard#mem#peer_b:8080",
                  DataStorageType::DATA_STORAGE_TYPE_VINEYARD,
                  CLS_SERVING,
-                 {LocationSpec("tp0", "v6d://peer_b:8080/tp0")}},
+                 {LocationSpec("tp0", "vineyard://peer_b:8080/tp0")}},
             },
         };
         std::vector<ErrorCode> per_key_ec;

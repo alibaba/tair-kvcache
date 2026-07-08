@@ -137,4 +137,12 @@ grpc::Status MetaServiceGRpc::ReportEvent(grpc::ServerContext *context,
     return grpc::Status::OK;
 }
 
+grpc::Status MetaServiceGRpc::GetHostCacheState(grpc::ServerContext *context,
+                                                const proto::meta::GetHostCacheStateRequest *request,
+                                                proto::meta::GetHostCacheStateResponse *response) {
+    API_CONTEXT_GET_COLLECTOR_AND_INIT_GRPC(GetHostCacheState, grpc::Status::OK);
+    meta_service_impl_->GetHostCacheState(request_context, request, response);
+    return grpc::Status::OK;
+}
+
 } // namespace kv_cache_manager

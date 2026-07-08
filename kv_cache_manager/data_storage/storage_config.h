@@ -17,6 +17,8 @@ enum class DataStorageType : uint8_t {
     DATA_STORAGE_TYPE_VCNS_HF3FS = 5,
     DATA_STORAGE_TYPE_DUMMY = 6,
     DATA_STORAGE_TYPE_VINEYARD = 7,
+    DATA_STORAGE_TYPE_RTP_LLM = 8,
+    DATA_STORAGE_TYPE_VLLM = 9,
     COUNT, // as sentinel, must be last
 };
 
@@ -198,7 +200,7 @@ private:
     int32_t key_count_per_file_ = 0;
 };
 
-class VineyardStorageSpec : public StorageSpec {
+class EventReportingStorageSpec : public StorageSpec {
 public:
     static constexpr int64_t kDefaultHeartbeatTimeoutMs = 30 * 1000;
     static constexpr int64_t kDefaultCleanupGraceMs = 5 * 60 * 1000;

@@ -37,6 +37,7 @@ HELP_MODULE = [
     "kvcm_ops.config_server._help",
 ]
 
+
 def main():
     help_message_list = []
     for module_name in HELP_MODULE:
@@ -76,6 +77,8 @@ def main():
     disable_storage
     update_storage
     remove_storage
+  storage types (for add_storage/update_storage):
+    nfs / pace / 3fs / vineyard / rtp_llm / vllm
   trace:
     trace_key
     trace_uri

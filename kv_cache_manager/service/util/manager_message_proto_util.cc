@@ -59,12 +59,23 @@ void ProtoConvert::StorageConfigToProto(const StorageConfig &storage_config,
         auto *dummy = proto_storage_config->mutable_dummy();
         dummy->set_root_path(dummy_storage.root_path());
         dummy->set_key_count_per_file(dummy_storage.key_count_per_file());
-    } else if (type == DataStorageType::DATA_STORAGE_TYPE_VINEYARD) {
-        const auto &vineyard_storage = *std::dynamic_pointer_cast<VineyardStorageSpec>(storage_config.storage_spec());
-        auto *vineyard = proto_storage_config->mutable_vineyard();
-        vineyard->set_heartbeat_timeout_ms(vineyard_storage.heartbeat_timeout_ms());
-        vineyard->set_cleanup_grace_ms(vineyard_storage.cleanup_grace_ms());
-        vineyard->set_liveness_check_interval_ms(vineyard_storage.liveness_check_interval_ms());
+    } else if (type == DataStorageType::DATA_STORAGE_TYPE_VINEYARD ||
+               type == DataStorageType::DATA_STORAGE_TYPE_RTP_LLM || type == DataStorageType::DATA_STORAGE_TYPE_VLLM) {
+        const auto &er_spec = *std::dynamic_pointer_cast<EventReportingStorageSpec>(storage_config.storage_spec());
+        proto::admin::EventReportingStorageSpec *spec = nullptr;
+        if (type == DataStorageType::DATA_STORAGE_TYPE_RTP_LLM) {
+            spec = proto_storage_config->mutable_rtp_llm();
+            proto_storage_config->set_storage_type(proto::admin::ST_RTP_LLM);
+        } else if (type == DataStorageType::DATA_STORAGE_TYPE_VLLM) {
+            spec = proto_storage_config->mutable_vllm();
+            proto_storage_config->set_storage_type(proto::admin::ST_VLLM);
+        } else {
+            spec = proto_storage_config->mutable_vineyard();
+            proto_storage_config->set_storage_type(proto::admin::ST_VINEYARD);
+        }
+        spec->set_heartbeat_timeout_ms(er_spec.heartbeat_timeout_ms());
+        spec->set_cleanup_grace_ms(er_spec.cleanup_grace_ms());
+        spec->set_liveness_check_interval_ms(er_spec.liveness_check_interval_ms());
     }
 }
 
@@ -137,7 +148,7 @@ void ProtoConvert::StorageFromProto(const proto::admin::StorageConfig *proto_sto
         break;
     }
     case proto::admin::StorageConfig::kVineyard: {
-        VineyardStorageSpec spec;
+        EventReportingStorageSpec spec;
         const auto &v = proto_storage_config->vineyard();
         if (v.heartbeat_timeout_ms() > 0)
             spec.set_heartbeat_timeout_ms(v.heartbeat_timeout_ms());
@@ -145,8 +156,34 @@ void ProtoConvert::StorageFromProto(const proto::admin::StorageConfig *proto_sto
             spec.set_cleanup_grace_ms(v.cleanup_grace_ms());
         if (v.liveness_check_interval_ms() > 0)
             spec.set_liveness_check_interval_ms(v.liveness_check_interval_ms());
-        storage_config.set_storage_spec(std::make_shared<VineyardStorageSpec>(spec));
+        storage_config.set_storage_spec(std::make_shared<EventReportingStorageSpec>(spec));
         storage_config.set_type(DataStorageType::DATA_STORAGE_TYPE_VINEYARD);
+        break;
+    }
+    case proto::admin::StorageConfig::kRtpLlm: {
+        EventReportingStorageSpec spec;
+        const auto &v = proto_storage_config->rtp_llm();
+        if (v.heartbeat_timeout_ms() > 0)
+            spec.set_heartbeat_timeout_ms(v.heartbeat_timeout_ms());
+        if (v.cleanup_grace_ms() > 0)
+            spec.set_cleanup_grace_ms(v.cleanup_grace_ms());
+        if (v.liveness_check_interval_ms() > 0)
+            spec.set_liveness_check_interval_ms(v.liveness_check_interval_ms());
+        storage_config.set_storage_spec(std::make_shared<EventReportingStorageSpec>(spec));
+        storage_config.set_type(DataStorageType::DATA_STORAGE_TYPE_RTP_LLM);
+        break;
+    }
+    case proto::admin::StorageConfig::kVllm: {
+        EventReportingStorageSpec spec;
+        const auto &v = proto_storage_config->vllm();
+        if (v.heartbeat_timeout_ms() > 0)
+            spec.set_heartbeat_timeout_ms(v.heartbeat_timeout_ms());
+        if (v.cleanup_grace_ms() > 0)
+            spec.set_cleanup_grace_ms(v.cleanup_grace_ms());
+        if (v.liveness_check_interval_ms() > 0)
+            spec.set_liveness_check_interval_ms(v.liveness_check_interval_ms());
+        storage_config.set_storage_spec(std::make_shared<EventReportingStorageSpec>(spec));
+        storage_config.set_type(DataStorageType::DATA_STORAGE_TYPE_VLLM);
         break;
     }
     default:

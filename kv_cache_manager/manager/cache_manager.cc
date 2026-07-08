@@ -1429,11 +1429,22 @@ LookupEventReportingBackend(const std::shared_ptr<RegistryManager> &registry_man
 bool ParseInt64(const std::string &s, int64_t &out) {
     try {
         size_t consumed = 0;
-        int64_t v = std::stoll(s, &consumed);
+        // vLLM block hashes are uint64; use stoull to accept values that
+        // exceed INT64_MAX, then reinterpret as int64_t via bit-pattern
+        // preservation (same approach as ParseOptimizerKey in
+        // optimizer_schema_trace.h). Negative decimal strings are also
+        // handled correctly: stoull wraps them to the two's-complement
+        // uint64 representation, and the conversion below restores the
+        // original signed value.
+        uint64_t v = std::stoull(s, &consumed);
         if (consumed != s.size()) {
             return false;
         }
-        out = v;
+        if (v <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+            out = static_cast<int64_t>(v);
+        } else {
+            out = std::numeric_limits<int64_t>::min() + static_cast<int64_t>(v - (uint64_t{1} << 63));
+        }
         return true;
     } catch (...) { return false; }
 }
@@ -2237,6 +2248,135 @@ SubmitDelReqFunc CacheManager::GetSubmitDelReqFunc(const std::string &instance_i
             }
         }
     };
+}
+
+ErrorCode CacheManager::GetHostCacheState(RequestContext *request_context,
+                                          const proto::meta::GetHostCacheStateRequest *request,
+                                          proto::meta::GetHostCacheStateResponse *response) {
+    SPAN_TRACER(request_context);
+    const std::string &trace_id = request_context->trace_id();
+    const std::string &instance_id = request->instance_id();
+    auto *response_status = response->mutable_header()->mutable_status();
+
+    if (instance_id.empty()) {
+        KVCM_LOG_WARN("trace_id [%s] | GetHostCacheState: empty instance_id", trace_id.c_str());
+        response_status->set_code(proto::meta::INVALID_ARGUMENT);
+        response_status->set_message("empty instance_id");
+        return EC_BADARGS;
+    }
+
+    const auto &block_cache_keys = request->block_cache_keys();
+    if (block_cache_keys.empty()) {
+        // No keys to match — return empty list (do not return prefix=0 for all hosts)
+        response_status->set_code(proto::meta::OK);
+        return EC_OK;
+    }
+
+    MetaSearcher *meta_searcher = meta_searcher_manager_->GetMetaSearcher(instance_id);
+    if (!meta_searcher) {
+        KVCM_LOG_WARN("trace_id [%s] | GetHostCacheState: meta searcher not found for instance [%s]",
+                      trace_id.c_str(),
+                      instance_id.c_str());
+        response_status->set_code(proto::meta::INSTANCE_NOT_EXIST);
+        response_status->set_message("meta searcher not found for instance: " + instance_id);
+        return EC_INSTANCE_NOT_EXIST;
+    }
+
+    // Build medium filter set (empty = match all mediums)
+    std::unordered_set<std::string> medium_filter(request->medium().begin(), request->medium().end());
+
+    // Query locations for all block_cache_keys
+    CacheManager::KeyVector keys(block_cache_keys.begin(), block_cache_keys.end());
+    BlockMask empty_mask;
+    std::vector<CacheLocationMap> location_maps;
+    auto ec = meta_searcher->BatchGetLocation(request_context, keys, empty_mask, location_maps);
+    if (ec != EC_OK) {
+        KVCM_LOG_WARN("trace_id [%s] | GetHostCacheState: BatchGetLocation failed, ec %d",
+                      trace_id.c_str(),
+                      static_cast<int>(ec));
+        response_status->set_code(proto::meta::INTERNAL_ERROR);
+        response_status->set_message("BatchGetLocation failed");
+        return ec;
+    }
+
+    // Parse location_ids and compute prefix match per host
+    // location_id format: kvs#<identifier>#<medium>#<host_ip_port>
+    // parts[2] = medium, parts[3] = host_ip_port
+    std::map<std::string, int64_t> host_prefix;
+    std::set<std::string> active_hosts;
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (i >= location_maps.size())
+            break;
+
+        const auto &locations = location_maps[i];
+        std::set<std::string> owners;
+        for (const auto &kv : locations) {
+            const std::string &loc_id = kv.first;
+            // Parse location_id by splitting on '#'
+            // Expected: kvs#<identifier>#<medium>#<host_ip_port>
+            size_t pos1 = loc_id.find('#');
+            if (pos1 == std::string::npos)
+                continue;
+            size_t pos2 = loc_id.find('#', pos1 + 1);
+            if (pos2 == std::string::npos)
+                continue;
+            size_t pos3 = loc_id.find('#', pos2 + 1);
+            if (pos3 == std::string::npos)
+                continue;
+            std::string medium = loc_id.substr(pos2 + 1, pos3 - pos2 - 1);
+            std::string host = loc_id.substr(pos3 + 1);
+            if (host.empty())
+                continue;
+
+            // Medium filter: empty filter = match all
+            if (!medium_filter.empty() && medium_filter.find(medium) == medium_filter.end())
+                continue;
+
+            owners.insert(host);
+        }
+
+        if (i == 0) {
+            // First key: initialize active_hosts with all owners
+            for (const auto &h : owners) {
+                active_hosts.insert(h);
+            }
+            if (active_hosts.empty()) {
+                // No host owns the first key — no prefix match possible
+                break;
+            }
+        } else {
+            // Terminate hosts not in owners
+            std::set<std::string> confirmed;
+            for (const auto &h : active_hosts) {
+                if (owners.find(h) == owners.end()) {
+                    host_prefix[h] = static_cast<int64_t>(i);
+                    confirmed.insert(h);
+                }
+            }
+            for (const auto &h : confirmed) {
+                active_hosts.erase(h);
+            }
+            if (active_hosts.empty()) {
+                break;
+            }
+        }
+    }
+
+    // Remaining active hosts matched all keys
+    for (const auto &h : active_hosts) {
+        host_prefix[h] = static_cast<int64_t>(keys.size());
+    }
+
+    // Assemble response
+    for (const auto &kv : host_prefix) {
+        auto *match = response->add_hosts();
+        match->set_host_ip_port(kv.first);
+        match->set_prefix_match_blocks(kv.second);
+    }
+
+    response_status->set_code(proto::meta::OK);
+    return EC_OK;
 }
 
 } // namespace kv_cache_manager
