@@ -65,6 +65,13 @@ bool InstanceGroup::ValidateRequiredFields(std::string &invalid_fields) const {
     } else if (!cache_config_->ValidateRequiredFields(local_invalid_fields)) {
         valid = false;
     }
+    // Reject non-empty but invalid revisit_interval_buckets.
+    // raw string is non-empty but parsed vector is empty → user provided invalid config.
+    // Empty raw string is fine (means "use server default").
+    if (!revisit_interval_buckets_str_.empty() && parsed_revisit_interval_buckets_.empty()) {
+        valid = false;
+        local_invalid_fields += "{revisit_interval_buckets}";
+    }
 
     if (!valid) {
         invalid_fields += "{InstanceGroup: " + local_invalid_fields + "}";

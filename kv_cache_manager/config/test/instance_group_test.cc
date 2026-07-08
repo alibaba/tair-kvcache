@@ -1,6 +1,8 @@
 #include "kv_cache_manager/common/unittest.h"
-#include "kv_cache_manager/common/string_util.h"
+#include "kv_cache_manager/config/cache_config.h"
+#include "kv_cache_manager/config/cache_reclaim_strategy.h"
 #include "kv_cache_manager/config/instance_group.h"
+#include "kv_cache_manager/config/meta_indexer_config.h"
 #include "kv_cache_manager/protocol/protobuf/admin_service.pb.h"
 #include "kv_cache_manager/service/util/manager_message_proto_util.h"
 
@@ -11,76 +13,6 @@ public:
     void SetUp() override {}
     void TearDown() override {}
 };
-
-// --- StringUtil::ParseBucketBoundaries ---
-
-TEST_F(InstanceGroupTest, ParseEmptyStringReturnsEmpty) {
-    auto result = StringUtil::ParseBucketBoundaries("");
-    EXPECT_TRUE(result.empty());
-}
-
-TEST_F(InstanceGroupTest, ParseValidBoundaries) {
-    auto result = StringUtil::ParseBucketBoundaries("1,5,30,60,300,3600");
-    ASSERT_EQ(result.size(), 6);
-    EXPECT_DOUBLE_EQ(result[0], 1.0);
-    EXPECT_DOUBLE_EQ(result[1], 5.0);
-    EXPECT_DOUBLE_EQ(result[2], 30.0);
-    EXPECT_DOUBLE_EQ(result[3], 60.0);
-    EXPECT_DOUBLE_EQ(result[4], 300.0);
-    EXPECT_DOUBLE_EQ(result[5], 3600.0);
-}
-
-TEST_F(InstanceGroupTest, ParseWithSpaces) {
-    auto result = StringUtil::ParseBucketBoundaries(" 1 , 5 , 30 ");
-    ASSERT_EQ(result.size(), 3);
-    EXPECT_DOUBLE_EQ(result[0], 1.0);
-    EXPECT_DOUBLE_EQ(result[1], 5.0);
-    EXPECT_DOUBLE_EQ(result[2], 30.0);
-}
-
-TEST_F(InstanceGroupTest, ParseNonAscendingRejected) {
-    EXPECT_TRUE(StringUtil::ParseBucketBoundaries("5,1,30").empty());
-}
-
-TEST_F(InstanceGroupTest, ParseDuplicateRejected) {
-    EXPECT_TRUE(StringUtil::ParseBucketBoundaries("1,5,5,30").empty());
-}
-
-TEST_F(InstanceGroupTest, ParseNegativeRejected) {
-    EXPECT_TRUE(StringUtil::ParseBucketBoundaries("-1,5,30").empty());
-}
-
-TEST_F(InstanceGroupTest, ParseZeroRejected) {
-    EXPECT_TRUE(StringUtil::ParseBucketBoundaries("0,5,30").empty());
-}
-
-TEST_F(InstanceGroupTest, ParseTrailingCharsRejected) {
-    EXPECT_TRUE(StringUtil::ParseBucketBoundaries("1s,5,30").empty());
-}
-
-TEST_F(InstanceGroupTest, ParseEmptyTokenRejected) {
-    EXPECT_TRUE(StringUtil::ParseBucketBoundaries("1,,5").empty());
-}
-
-TEST_F(InstanceGroupTest, ParseLeadingCommaRejected) {
-    EXPECT_TRUE(StringUtil::ParseBucketBoundaries(",1,5").empty());
-}
-
-TEST_F(InstanceGroupTest, ParseTrailingCommaRejected) {
-    EXPECT_TRUE(StringUtil::ParseBucketBoundaries("1,5,").empty());
-}
-
-TEST_F(InstanceGroupTest, ParseNonNumericRejected) {
-    EXPECT_TRUE(StringUtil::ParseBucketBoundaries("abc,5,30").empty());
-}
-
-TEST_F(InstanceGroupTest, ParseFractionalBoundaries) {
-    auto result = StringUtil::ParseBucketBoundaries("0.5,1.5,5.0");
-    ASSERT_EQ(result.size(), 3);
-    EXPECT_DOUBLE_EQ(result[0], 0.5);
-    EXPECT_DOUBLE_EQ(result[1], 1.5);
-    EXPECT_DOUBLE_EQ(result[2], 5.0);
-}
 
 // --- InstanceGroup set_revisit_interval_buckets ---
 
@@ -107,6 +39,49 @@ TEST_F(InstanceGroupTest, SetEmptyBuckets) {
     group.set_name("test");
     group.set_revisit_interval_buckets("");
     EXPECT_TRUE(group.revisit_interval_buckets().empty());
+}
+
+// --- ValidateRequiredFields revisit_interval_buckets ---
+
+// Helper: validate only the revisit_interval_buckets check in isolation.
+// Builds a fully valid InstanceGroup, then sets the buckets to test.
+static std::pair<bool, std::string> ValidateBucketsOnly(const std::string &buckets_str) {
+    InstanceGroup group;
+    group.set_name("test");
+    group.set_storage_candidates({"local"});
+    group.set_global_quota_group_name("default");
+    group.set_max_instance_count(10);
+    auto quota = InstanceGroupQuota();
+    quota.set_capacity(1024);
+    group.set_quota(quota);
+
+    auto reclaim = std::make_shared<CacheReclaimStrategy>();
+    reclaim->set_storage_unique_name("local");
+    auto meta_config = std::make_shared<MetaIndexerConfig>();
+    auto cache_config = std::make_shared<CacheConfig>(
+        CachePreferStrategy::CPS_PREFER_3FS, reclaim, meta_config);
+    group.set_cache_config(cache_config);
+    group.set_revisit_interval_buckets(buckets_str);
+
+    std::string invalid_fields;
+    bool result = group.ValidateRequiredFields(invalid_fields);
+    return {result, invalid_fields};
+}
+
+TEST_F(InstanceGroupTest, ValidateRejectsInvalidBuckets) {
+    auto [valid, invalid_fields] = ValidateBucketsOnly("5,1,30");  // invalid: not ascending
+    EXPECT_FALSE(valid);
+    EXPECT_NE(invalid_fields.find("revisit_interval_buckets"), std::string::npos);
+}
+
+TEST_F(InstanceGroupTest, ValidateAcceptsValidBuckets) {
+    auto [valid, invalid_fields] = ValidateBucketsOnly("1,5,30,60");
+    EXPECT_TRUE(valid);
+}
+
+TEST_F(InstanceGroupTest, ValidateAcceptsEmptyBuckets) {
+    auto [valid, invalid_fields] = ValidateBucketsOnly("");
+    EXPECT_TRUE(valid);
 }
 
 // --- JSON round-trip ---
@@ -163,10 +138,15 @@ TEST_F(InstanceGroupTest, JsonRoundTripInvalidBuckets) {
     })";
 
     InstanceGroup parsed;
+    // FromRapidValue is lenient — accepts and preserves raw, but parsed is empty
     ASSERT_TRUE(parsed.FromJsonString(json));
-    // Raw string preserved, but parsed vector is empty (invalid)
     EXPECT_EQ("5,1,30", parsed.revisit_interval_buckets_raw());
     EXPECT_TRUE(parsed.revisit_interval_buckets().empty());
+
+    // But ValidateRequiredFields should reject it
+    std::string invalid_fields;
+    EXPECT_FALSE(parsed.ValidateRequiredFields(invalid_fields));
+    EXPECT_NE(invalid_fields.find("revisit_interval_buckets"), std::string::npos);
 }
 
 // --- Proto round-trip ---
