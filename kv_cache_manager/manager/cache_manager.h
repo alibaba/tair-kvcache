@@ -140,6 +140,13 @@ public:
                                                            const BlockMask &block_mask,
                                                            int32_t detail_level /*TODO*/);
 
+    std::pair<ErrorCode, CacheMetaDetailVec> GetCacheMetaDetail(RequestContext *request_context,
+                                                                const std::string &instance_id,
+                                                                const KeyVector &keys,
+                                                                const TokenIdsVector &tokens,
+                                                                const BlockMask &block_mask,
+                                                                int32_t detail_level /*reserved*/);
+
     std::pair<ErrorCode, CacheLocationViewVecWrapper>
     GetCacheLocation(RequestContext *request_context,
                      const std::string &instance_id,

@@ -42,6 +42,12 @@ public:
                                                         const BlockMask &block_mask,
                                                         int32_t detail_level) = 0;
 
+    virtual std::pair<ClientErrorCode, CacheMetaDetails> MatchMetaDetail(const std::string &trace_id,
+                                                                         const std::vector<int64_t> &keys,
+                                                                         const std::vector<int64_t> &tokens,
+                                                                         const BlockMask &block_mask,
+                                                                         int32_t detail_level) = 0;
+
     virtual std::pair<ClientErrorCode, int64_t> MatchLocationLen(const std::string &trace_id,
                                                                  QueryType query_type,
                                                                  const std::vector<int64_t> &keys,

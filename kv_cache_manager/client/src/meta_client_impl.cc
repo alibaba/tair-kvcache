@@ -149,6 +149,21 @@ std::pair<ClientErrorCode, Metas> MetaClientImpl::MatchMeta(const std::string &t
     return stub_->GetCacheMeta(trace_id, instance_id, keys, tokens, block_mask, detail_level);
 }
 
+std::pair<ClientErrorCode, CacheMetaDetails> MetaClientImpl::MatchMetaDetail(const std::string &trace_id,
+                                                                             const std::vector<int64_t> &keys,
+                                                                             const std::vector<int64_t> &tokens,
+                                                                             const BlockMask &block_mask,
+                                                                             int32_t detail_level) {
+    KVCM_LOG_DEBUG("match meta detail with trace_id [%s], keys %s, tokens %s, block_mask %s, detail_level [%d]",
+                   trace_id.c_str(),
+                   DebugStringUtil::ToString(keys).c_str(),
+                   DebugStringUtil::ToString(tokens).c_str(),
+                   DebugStringUtil::ToString(block_mask).c_str(),
+                   detail_level);
+    const std::string &instance_id = CHECK_INSTANCE_STUB_WITH_TYPE();
+    return stub_->GetCacheMetaDetail(trace_id, instance_id, keys, tokens, block_mask, detail_level);
+}
+
 std::pair<ClientErrorCode, WriteLocation>
 MetaClientImpl::StartWrite(const std::string &trace_id,
                            const std::vector<int64_t> &keys,

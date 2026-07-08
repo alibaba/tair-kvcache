@@ -403,6 +403,45 @@ message GetCacheMetaResponse {
     repeated string metas = 3;            // 与请求key一一对应
 }
 
+message GetCacheMetaDetailRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    repeated int64 block_keys = 3;
+    repeated int64 token_ids = 4;
+    BlockMask block_mask = 5; // 对block_keys或者token_ids的mask
+    int32 detail_level = 6;   // 预留，用于控制诊断明细级别
+}
+
+enum CacheLocationStatus {
+    CLS_NOT_FOUND = 0;
+    CLS_NEW = 1;
+    CLS_WRITING = 2;
+    CLS_SERVING = 3;
+    CLS_DELETING = 4;
+}
+
+message CacheLocationDetail {
+    string location_id = 1;
+    CacheLocationStatus status = 2;
+    StorageType type = 3;
+    int32 spec_size = 4;
+    int64 create_time = 5;
+    repeated LocationSpec location_specs = 6;
+}
+
+message CacheMetaDetailItem {
+    int32 request_index = 1;
+    int64 block_key = 2;
+    string prev_block_key = 3;
+    map<string, string> properties = 4;
+    repeated CacheLocationDetail locations = 5;
+}
+
+message GetCacheMetaDetailResponse {
+    CommonResponseHeader header = 1;
+    repeated CacheMetaDetailItem items = 2;
+}
+
 // 在每次写入 cache 前, 需要调用这个接口获得CacheLocation信息
 message StartWriteCacheRequest {
     string trace_id = 1;
@@ -496,6 +535,8 @@ service MetaService {
     rpc GetInstanceInfo(GetInstanceInfoRequest) returns (GetInstanceInfoResponse);
     // 在排查问题时获取meta完整信息，明确的; TODO : 把这个挪到debug service中
     rpc GetCacheMeta(GetCacheMetaRequest) returns (GetCacheMetaResponse);
+    // 查询指定 key 的完整 raw metadata，不做 location 选择、数据文件检查或 lazy prune
+    rpc GetCacheMetaDetail(GetCacheMetaDetailRequest) returns (GetCacheMetaDetailResponse);
     // 返回Cache的位置，由PD节点调用
     rpc GetCacheLocation(GetCacheLocationRequest) returns (GetCacheLocationResponse);
     // 返回命中的key的数量

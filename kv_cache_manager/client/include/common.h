@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <string>
@@ -82,6 +83,33 @@ struct Metas {
     Locations locations;
     std::vector<std::string> metas;
 };
+
+enum class CacheMetaLocationStatus : int32_t {
+    CLS_NOT_FOUND = 0,
+    CLS_NEW = 1,
+    CLS_WRITING = 2,
+    CLS_SERVING = 3,
+    CLS_DELETING = 4,
+};
+
+struct CacheMetaLocationDetail {
+    std::string location_id;
+    CacheMetaLocationStatus status{CacheMetaLocationStatus::CLS_NOT_FOUND};
+    int32_t storage_type{0};
+    int32_t spec_size{0};
+    int64_t create_time{0};
+    Location location_specs;
+};
+
+struct CacheMetaDetailItem {
+    int32_t request_index{0};
+    int64_t block_key{0};
+    std::string prev_block_key;
+    std::map<std::string, std::string> properties;
+    std::vector<CacheMetaLocationDetail> locations;
+};
+
+using CacheMetaDetails = std::vector<CacheMetaDetailItem>;
 
 using BlockMaskVector = std::vector<bool>;
 using BlockMaskOffset = size_t;

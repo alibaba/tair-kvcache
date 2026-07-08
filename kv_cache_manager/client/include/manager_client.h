@@ -43,6 +43,12 @@ public:
                                                         const BlockMask &block_mask,
                                                         int32_t detail_level) = 0;
 
+    virtual std::pair<ClientErrorCode, CacheMetaDetails> MatchMetaDetail(const std::string &trace_id,
+                                                                         const std::vector<int64_t> &keys,
+                                                                         const std::vector<int64_t> &tokens,
+                                                                         const BlockMask &block_mask,
+                                                                         int32_t detail_level) = 0;
+
     virtual ClientErrorCode RemoveCache(const std::string &trace_id,
                                         const std::vector<int64_t> &keys,
                                         const std::vector<int64_t> &tokens,

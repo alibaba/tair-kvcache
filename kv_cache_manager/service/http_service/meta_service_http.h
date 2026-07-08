@@ -33,6 +33,9 @@ public:
     void GetCacheMeta(coro_http::coro_http_connection *http_conn,
                       proto::meta::GetCacheMetaRequest *request,
                       proto::meta::GetCacheMetaResponse *response);
+    void GetCacheMetaDetail(coro_http::coro_http_connection *http_conn,
+                            proto::meta::GetCacheMetaDetailRequest *request,
+                            proto::meta::GetCacheMetaDetailResponse *response);
     void GetCacheLocation(coro_http::coro_http_connection *http_conn,
                           proto::meta::GetCacheLocationRequest *request,
                           proto::meta::GetCacheLocationResponse *response);

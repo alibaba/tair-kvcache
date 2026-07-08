@@ -5,6 +5,8 @@
 #include <chrono>
 #include <grpcpp/grpcpp.h>
 #include <type_traits>
+#include <unordered_map>
+#include <utility>
 
 #include "kv_cache_manager/client/src/internal/util/debug_string_util.h"
 #include "kv_cache_manager/common/logger.h"
@@ -76,6 +78,39 @@ kv_cache_manager::Locations GenLocations(
         }
     }
     return locations;
+}
+
+kv_cache_manager::CacheMetaDetails GenCacheMetaDetails(
+    const google::protobuf::RepeatedPtrField<::kv_cache_manager::proto::meta::CacheMetaDetailItem>
+        &proto_cache_meta_details) {
+    kv_cache_manager::CacheMetaDetails cache_meta_details;
+    cache_meta_details.reserve(proto_cache_meta_details.size());
+    for (const auto &proto_item : proto_cache_meta_details) {
+        kv_cache_manager::CacheMetaDetailItem item;
+        item.request_index = proto_item.request_index();
+        item.block_key = proto_item.block_key();
+        item.prev_block_key = proto_item.prev_block_key();
+        for (const auto &[property_name, property_value] : proto_item.properties()) {
+            item.properties[property_name] = property_value;
+        }
+        item.locations.reserve(proto_item.locations_size());
+        for (const auto &proto_location : proto_item.locations()) {
+            kv_cache_manager::CacheMetaLocationDetail location;
+            location.location_id = proto_location.location_id();
+            location.status =
+                static_cast<kv_cache_manager::CacheMetaLocationStatus>(proto_location.status());
+            location.storage_type = static_cast<int32_t>(proto_location.type());
+            location.spec_size = proto_location.spec_size();
+            location.create_time = proto_location.create_time();
+            location.location_specs.reserve(proto_location.location_specs_size());
+            for (const auto &proto_spec : proto_location.location_specs()) {
+                location.location_specs.push_back({proto_spec.name(), proto_spec.uri()});
+            }
+            item.locations.push_back(std::move(location));
+        }
+        cache_meta_details.push_back(std::move(item));
+    }
+    return cache_meta_details;
 }
 
 kv_cache_manager::ClientErrorCode
@@ -320,6 +355,27 @@ std::pair<ClientErrorCode, Metas> GrpcStub::GetCacheMeta(const std::string &trac
                    DebugStringUtil::ToString(locations).c_str(),
                    DebugStringUtil::ToString(metas).c_str());
     return {ER_OK, {locations, metas}};
+}
+
+std::pair<ClientErrorCode, CacheMetaDetails> GrpcStub::GetCacheMetaDetail(const std::string &trace_id,
+                                                                          const std::string &instance_id,
+                                                                          const KeyVector &keys,
+                                                                          const TokenIdsVector &tokens,
+                                                                          const BlockMask &block_mask,
+                                                                          int32_t detail_level) {
+    auto stub = GET_AND_CHECK_STUB_WITH_TYPE();
+    proto::meta::GetCacheMetaDetailRequest request;
+    SetKeysAndTokens(request, trace_id, instance_id, keys, tokens);
+    ProtoConvert::BlockMaskToProto(block_mask, request.mutable_block_mask());
+    request.set_detail_level(detail_level);
+    grpc::ClientContext context;
+    proto::meta::GetCacheMetaDetailResponse response;
+    auto grpc_status = stub->GetCacheMetaDetail(&context, request, &response);
+    CHECK_GRPC_STATUS_WITH_TYPE(grpc_status);
+    CHECK_COMMON_HEADER_WITH_TYPE(response);
+    auto cache_meta_details = GenCacheMetaDetails(response.items());
+    KVCM_LOG_DEBUG("get cache meta detail success, items: %lu", cache_meta_details.size());
+    return {ER_OK, cache_meta_details};
 }
 
 std::pair<ClientErrorCode, Locations> GrpcStub::GetCacheLocation(const std::string &trace_id,

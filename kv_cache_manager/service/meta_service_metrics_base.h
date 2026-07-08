@@ -64,6 +64,7 @@ public:
     void InvalidateCollectorCache(const std::string &instance_id);
 
     KVCM_DECLARE_METRICS_COLLECTOR_MAP_METHOD_(GetCacheMeta);
+    KVCM_DECLARE_METRICS_COLLECTOR_MAP_METHOD_(GetCacheMetaDetail);
     KVCM_DECLARE_METRICS_COLLECTOR_MAP_METHOD_(GetCacheLocation);
     KVCM_DECLARE_METRICS_COLLECTOR_MAP_METHOD_(GetCacheLocationsByBackend);
     KVCM_DECLARE_METRICS_COLLECTOR_MAP_METHOD_(GetCacheLocationLen);
@@ -98,6 +99,7 @@ protected:
     KVCM_DECLARE_METRICS_COLLECTOR_(GetClusterInfo);
     KVCM_DECLARE_METRICS_COLLECTOR_(ReportEvent);
     KVCM_DECLARE_METRICS_COLLECTOR_MAP_(GetCacheMeta);
+    KVCM_DECLARE_METRICS_COLLECTOR_MAP_(GetCacheMetaDetail);
     KVCM_DECLARE_METRICS_COLLECTOR_MAP_(GetCacheLocation);
     KVCM_DECLARE_METRICS_COLLECTOR_MAP_(GetCacheLocationsByBackend);
     KVCM_DECLARE_METRICS_COLLECTOR_MAP_(GetCacheLocationLen);

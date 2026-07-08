@@ -2072,6 +2072,33 @@ ErrorCode MetaSearcher::BatchGetLocation(RequestContext *request_context,
     return EC_OK;
 }
 
+ErrorCode MetaSearcher::BatchGetRawMeta(RequestContext *request_context,
+                                        const KeyVector &keys,
+                                        CacheLocationMapVector &out_location_maps,
+                                        PropertyMapVector &out_properties,
+                                        std::vector<ErrorCode> &out_error_codes) {
+    out_location_maps.clear();
+    out_properties.clear();
+    out_error_codes.clear();
+
+    if (keys.empty()) {
+        return EC_OK;
+    }
+
+    auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, MetaSearcherIndexerGet);
+    auto result = meta_indexer_->Get(request_context, keys, out_location_maps, out_properties);
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, MetaSearcherIndexerGet);
+    out_error_codes = std::move(result.error_codes);
+    for (size_t idx = 0; idx < keys.size() && idx < out_error_codes.size(); idx++) {
+        if (out_error_codes[idx] != ErrorCode::EC_OK && out_error_codes[idx] != ErrorCode::EC_NOENT) {
+            KVCM_LOG_WARN(
+                "get raw meta failed, key[%lu](%lu), error_code: %d", idx, keys[idx], out_error_codes[idx]);
+        }
+    }
+    return EC_OK;
+}
+
 ErrorCode MetaSearcher::BatchAddLocation(RequestContext *request_context,
                                          const KeyVector &keys,
                                          const CacheLocationVector &locations,

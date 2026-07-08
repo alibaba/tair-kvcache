@@ -53,6 +53,10 @@ class MetaServiceHttpClient(cases.MetaServiceClientBase):
         """Get cache location for specified block keys"""
         return self._make_api_request('/api/getCacheLocation', data, check_response)
 
+    def get_cache_meta_detail(self, data, check_response=True):
+        """Get full raw metadata detail for specified block keys"""
+        return self._make_api_request('/api/getCacheMetaDetail', data, check_response)
+
     def start_write_cache(self, data, check_response=True):
         """Start writing cache data"""
         return self._make_api_request('/api/startWriteCache', data, check_response)
