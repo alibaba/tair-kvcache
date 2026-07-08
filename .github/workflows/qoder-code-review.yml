@@ -1,5 +1,7 @@
 name: Qoder Auto Code Review
 
+permissions: {}
+
 on:
   pull_request_target:
     types: [ opened, reopened, unlabeled ]
@@ -12,27 +14,35 @@ on:
         description: 'PR number to review'
         required: true
         type: string
+      runs-on:
+        description: "Runner type"
+        type: choice
+        options:
+          - ubuntu-latest
+          - aliyun-ecs-x64
+        default: ubuntu-latest
 
 jobs:
   qoder-review:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runs-on || vars.QODER_CODE_REVIEW_RUNS_ON || 'ubuntu-latest' }}
     # Trigger conditions:
     # 1. Trusted authors' PR opened/reopened (ignore synchronize to reduce duplicate reviews)
     # 2. 'ai reviewed' label removed by a maintainer (re-review)
     # 3. OWNER/COLLABORATOR comments starting with '@tair-ci review'
     # 4. Manual workflow dispatch
     if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request_target' &&
-       github.event.action != 'unlabeled' &&
-       contains(fromJSON('["OWNER", "COLLABORATOR"]'), github.event.pull_request.author_association)) ||
-      (github.event_name == 'pull_request_target' &&
-       github.event.action == 'unlabeled' &&
-       github.event.label.name == 'ai reviewed') ||
-      (github.event_name == 'issue_comment' &&
-       github.event.issue.pull_request &&
-       startsWith(github.event.comment.body, '@tair-ci review') &&
-       contains(fromJSON('["OWNER", "COLLABORATOR"]'), github.event.comment.author_association))
+      contains(fromJSON('["ubuntu-latest", "aliyun-ecs-x64"]'), inputs.runs-on || vars.QODER_CODE_REVIEW_RUNS_ON || 'ubuntu-latest') &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'pull_request_target' &&
+        github.event.action != 'unlabeled' &&
+        contains(fromJSON('["OWNER", "COLLABORATOR"]'), github.event.pull_request.author_association)) ||
+       (github.event_name == 'pull_request_target' &&
+        github.event.action == 'unlabeled' &&
+        github.event.label.name == 'ai reviewed') ||
+       (github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request &&
+        startsWith(github.event.comment.body, '@tair-ci review') &&
+        contains(fromJSON('["OWNER", "COLLABORATOR"]'), github.event.comment.author_association)))
     permissions:
       contents: read
       issues: write
@@ -69,12 +79,46 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
 
+      - name: Ensure jq
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if command -v jq >/dev/null 2>&1; then
+            exit 0
+          fi
+
+          SUDO=""
+          if [ "$(id -u)" -ne 0 ]; then
+            SUDO="sudo"
+          fi
+
+          if command -v apt-get >/dev/null 2>&1; then
+            ${SUDO} apt-get update -qq
+            ${SUDO} apt-get install -y -qq jq
+          elif command -v yum >/dev/null 2>&1; then
+            ${SUDO} yum install -y -q jq
+          elif command -v dnf >/dev/null 2>&1; then
+            ${SUDO} dnf install -y -q jq
+          else
+            echo "::error::jq is required but no supported package manager was found."
+            exit 1
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
       - name: Prepare Qoder MCP config
         shell: bash
         env:
+          HOME: ${{ runner.temp }}/qoder-home
           QODER_MCP_CONFIG: ${{ runner.temp }}/qoder-mcp.json
         run: |
           set -euo pipefail
+
+          mkdir -p "${HOME}"
 
           # qoder-action injects its installation token in the later qodercli
           # step, so keep these as literal placeholders for qodercli to expand
@@ -101,8 +145,10 @@ jobs:
         timeout-minutes: 30
         # uses: QoderAI/qoder-action@v0
         uses: QoderAI/qoder-action@0881d27d15a7a93778ebc5c942d11da313ee8b7e
+        env:
+          HOME: ${{ runner.temp }}/qoder-home
         with:
-          qodercli_version: '1.0.4'
+          qodercli_version: '1.0.39'
           qoder_personal_access_token: ${{ secrets.QODER_PERSONAL_ACCESS_TOKEN }}
           prompt: |
             /review ${{ github.repository }} ${{ steps.pr-info.outputs.number }}
@@ -110,7 +156,7 @@ jobs:
             GITHUB_REPOSITORY: ${{ github.repository }}
             PR_NUMBER: ${{ steps.pr-info.outputs.number }}
             REVIEW_FORMAT_REFERENCE:
-            - If available, read /home/runner/.qoder/commands/review-pr.md and use only its final review organization, section shape, and tone as a loose formatting reference.
+            - If available, read ~/.qoder/commands/review-pr.md and use only its final review organization, section shape, and tone as a loose formatting reference.
             - Do NOT execute /review-pr. Do NOT treat its agent definitions, sub-agent workflow, tool restrictions, or issue-selection guidance as mandatory for this review.
             MANDATORY_REQUIREMENTS:
             - Use GitHub MCP to fetch the PR metadata, changed files, diff, existing PR comments, submitted reviews, and review comments before reviewing.
@@ -160,6 +206,23 @@ jobs:
             echo "::endgroup::"
           fi
 
+      - name: Cleanup Qoder sensitive state
+        if: ${{ always() }}
+        shell: bash
+        env:
+          QODER_HOME: ${{ runner.temp }}/qoder-home
+          QODER_MCP_CONFIG: ${{ runner.temp }}/qoder-mcp.json
+          RUNNER_TEMP_DIR: ${{ runner.temp }}
+        run: |
+          set +e
+
+          git remote set-url origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          rm -f "${QODER_MCP_CONFIG}"
+          case "${QODER_HOME}" in
+            "${RUNNER_TEMP_DIR}"/*) rm -rf "${QODER_HOME}" ;;
+            *) echo "::warning::Skip cleanup for unexpected QODER_HOME=${QODER_HOME}" ;;
+          esac
+
       - name: Add ai reviewed label
         uses: actions/github-script@v8
         env:
@@ -175,3 +238,25 @@ jobs:
                 labels: ['ai reviewed']
               });
             }
+
+  validate-runner-selection:
+    if: >-
+      !contains(fromJSON('["ubuntu-latest", "aliyun-ecs-x64"]'), inputs.runs-on || vars.QODER_CODE_REVIEW_RUNS_ON || 'ubuntu-latest') &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'pull_request_target' &&
+        github.event.action != 'unlabeled' &&
+        contains(fromJSON('["OWNER", "COLLABORATOR"]'), github.event.pull_request.author_association)) ||
+       (github.event_name == 'pull_request_target' &&
+        github.event.action == 'unlabeled' &&
+        github.event.label.name == 'ai reviewed') ||
+       (github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request &&
+        startsWith(github.event.comment.body, '@tair-ci review') &&
+        contains(fromJSON('["OWNER", "COLLABORATOR"]'), github.event.comment.author_association)))
+    name: validate_runner_selection
+    runs-on: ubuntu-latest
+    steps:
+      - name: fail_invalid_runner_selection
+        run: |
+          echo "::error::Invalid runner selection. Set runs-on or QODER_CODE_REVIEW_RUNS_ON to one of: ubuntu-latest, aliyun-ecs-x64."
+          exit 1
