@@ -5,6 +5,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
@@ -43,6 +44,7 @@ public:
         QT_BATCH_GET = 1,
         QT_PREFIX_MATCH = 2,
         QT_REVERSE_ROLL_SW_MATCH = 3,
+        QT_PREFIX_MATCH_WITH_MAMBA = 4,
     };
     std::string QueryTypeToString(QueryType query_type) const {
         switch (query_type) {
@@ -52,6 +54,8 @@ public:
             return "prefix_match";
         case QueryType::QT_REVERSE_ROLL_SW_MATCH:
             return "reverse_roll_sw_match";
+        case QueryType::QT_PREFIX_MATCH_WITH_MAMBA:
+            return "prefix_match_with_mamba";
         default:
             return "unspecified";
         }
@@ -62,6 +66,11 @@ public:
     using TokenIdsVector = std::vector<KeyType>;
     using UriType = std::string;
     using UriVector = std::vector<UriType>;
+
+    struct HostCacheMatch {
+        std::string host_ip_port;
+        int64_t prefix_match_blocks;
+    };
 
     CacheManager(std::shared_ptr<MetricsRegistry> metrics_registry,
                  std::shared_ptr<RegistryManager> registry_manager,
@@ -99,7 +108,8 @@ public:
                                                        int32_t block_size,
                                                        const std::vector<LocationSpecInfo> &location_spec_infos,
                                                        const ModelDeployment &model_deployment,
-                                                       const std::vector<LocationSpecGroup> &location_spec_groups);
+                                                       const std::vector<LocationSpecGroup> &location_spec_groups,
+                                                       QueryType query_type = QueryType::QT_UNSPECIFIED);
 
     ErrorCode
     RemoveInstance(RequestContext *request_context, const std::string &instance_group, const std::string &instance_id);
@@ -185,6 +195,12 @@ public:
     ErrorCode ReportEvent(RequestContext *request_context,
                           const proto::meta::ReportEventRequest *request,
                           proto::meta::ReportEventResponse *response);
+    std::pair<ErrorCode, std::vector<HostCacheMatch>>
+    GetHostCacheState(RequestContext *request_context,
+                      const std::string &instance_id,
+                      QueryType query_type,
+                      const KeyVector &block_cache_keys,
+                      const std::vector<std::string> &medium_filter = {});
     ErrorCode TrimCache(RequestContext *request_context,
                         const std::string &instance_id,
                         const proto::meta::TrimStrategy &trim_strategy,

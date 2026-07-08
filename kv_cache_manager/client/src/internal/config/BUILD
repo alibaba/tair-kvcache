@@ -12,6 +12,7 @@ cc_library(
         "sdk_config.h",
     ],
     deps = [
+        "//kv_cache_manager/client:common",
         "//kv_cache_manager/common:jsonizable",
         "//kv_cache_manager/common:logger",
         "//kv_cache_manager/config",

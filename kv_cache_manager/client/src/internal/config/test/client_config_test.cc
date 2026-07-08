@@ -15,6 +15,20 @@ TEST_F(ClientConfigTest, TestClientConfigSuccess) {
     std::string file_content = getFileContent("client_config_success.json");
     ASSERT_FALSE(file_content.empty());
     ASSERT_TRUE(client_config.FromJsonString(file_content));
+    ASSERT_EQ(QueryType::QT_UNSPECIFIED, client_config.query_type());
+}
+
+TEST_F(ClientConfigTest, TestClientConfigQueryType) {
+    ClientConfig client_config;
+    std::string file_content = getFileContent("client_config_success.json");
+    ASSERT_FALSE(file_content.empty());
+    const std::string location_spec_infos_field = R"(    "location_spec_infos": {)";
+    const auto pos = file_content.find(location_spec_infos_field);
+    ASSERT_NE(std::string::npos, pos);
+    file_content.insert(pos, R"(    "query_type": 4,
+)");
+    ASSERT_TRUE(client_config.FromJsonString(file_content));
+    ASSERT_EQ(QueryType::QT_PREFIX_MATCH_WITH_MAMBA, client_config.query_type());
 }
 
 TEST_F(ClientConfigTest, TestClientConfigTairMemPoolSuccess) {

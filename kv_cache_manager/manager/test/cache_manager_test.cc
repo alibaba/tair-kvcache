@@ -13,9 +13,7 @@
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_backend.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
-#include "kv_cache_manager/data_storage/data_storage_uri.h"
-#include "kv_cache_manager/data_storage/storage_config.h"
-#include "kv_cache_manager/data_storage/vineyard_backend.h"
+#include "kv_cache_manager/data_storage/event_report_backend.h"
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/manager/cache_location_view.h"
 #include "kv_cache_manager/manager/cache_manager.h"
@@ -2133,12 +2131,12 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_UnregisteredBackend) {
     ASSERT_EQ(func(loc), true);
 }
 
-TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_VineyardFallbackLookup) {
-    // Vineyard URI hostname is a node IP, not the global_unique_name.
-    // The functor should look up the backend via event_reporting_storage_candidates.
+TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_EventReportFallbackLookup) {
+    // Event report URI hostname is a node IP, not the global_unique_name.
+    // The functor should look up the backend via event_report_storage_candidates.
     const std::string instance_id = "my_cluster";
     const std::string instance_group = "my_group";
-    const std::string vineyard_storage_name = "vineyard_" + instance_group;
+    const std::string event_report_storage_name = "event_report_" + instance_group;
     const std::string node_host = "192.168.1.100:8080";
 
     // Register instance so GetInstanceGroupName works
@@ -2146,49 +2144,49 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_VineyardFallbackLookup) {
         "test_quota_group", instance_group, instance_id, 64, createLocationSpecInfos(), createModelDeployment());
     registry_manager_->instance_infos_[instance_id] = instance_info;
 
-    // Create InstanceGroup with event_reporting_storage_candidates
+    // Create InstanceGroup with event_report_storage_candidates
     auto ig = std::make_shared<InstanceGroup>();
     ig->set_name(instance_group);
-    ig->set_storage_candidates({vineyard_storage_name});
-    ig->set_event_reporting_storage_candidates({vineyard_storage_name});
+    ig->set_storage_candidates({event_report_storage_name});
+    ig->set_event_report_storage_candidates({event_report_storage_name});
     ig->set_global_quota_group_name("test_quota_group");
     ig->set_max_instance_count(10);
     ig->set_version(1);
     registry_manager_->instance_group_configs_[instance_group] = ig;
 
     auto metrics_registry = cache_manager_->metrics_registry_;
-    auto vineyard_backend = std::make_shared<VineyardBackend>(metrics_registry);
+    auto event_report_backend = std::make_shared<EventReportBackend>(metrics_registry);
 
     StorageConfig config;
-    config.set_global_unique_name(vineyard_storage_name);
-    config.set_type(DataStorageType::DATA_STORAGE_TYPE_VINEYARD);
-    auto spec = std::make_shared<VineyardStorageSpec>();
+    config.set_global_unique_name(event_report_storage_name);
+    config.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
+    auto spec = std::make_shared<EventReportStorageSpec>();
     config.set_storage_spec(spec);
-    vineyard_backend->Open(config, "test_trace");
+    event_report_backend->Open(config, "test_trace");
 
-    vineyard_backend->RegisterNode(instance_id, node_host, {"mem"});
+    event_report_backend->RegisterNode(instance_id, node_host, {"mem"});
 
     auto dsm = registry_manager_->data_storage_manager_;
-    dsm->storage_map_[vineyard_storage_name] = vineyard_backend;
+    dsm->storage_map_[event_report_storage_name] = event_report_backend;
 
     auto func = cache_manager_->GetCheckLocDataExistFunc(instance_id);
 
     CacheLocation loc;
     loc.set_status(CLS_SERVING);
-    loc.set_type(DataStorageType::DATA_STORAGE_TYPE_VINEYARD);
-    loc.set_location_specs({LocationSpec("tp0", "vineyard://192.168.1.100:8080/mem?gpu=A100")});
+    loc.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
+    loc.set_location_specs({LocationSpec("tp0", "event_report://192.168.1.100:8080/mem?gpu=A100")});
     ASSERT_EQ(func(loc), true);
 
-    dsm->storage_map_.erase(vineyard_storage_name);
+    dsm->storage_map_.erase(event_report_storage_name);
     registry_manager_->instance_group_configs_.erase(instance_group);
 }
 
-TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_VineyardNodeUnavailable) {
-    // When a vineyard node is registered but unavailable (grace period),
+TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_EventReportNodeUnavailable) {
+    // When a event report node is registered but unavailable (grace period),
     // the functor should return false (not reachable).
     const std::string instance_id = "my_cluster";
     const std::string instance_group = "my_group";
-    const std::string vineyard_storage_name = "vineyard_" + instance_group;
+    const std::string event_report_storage_name = "event_report_" + instance_group;
     const std::string node_host = "192.168.1.200:8080";
 
     // Register instance so GetInstanceGroupName works
@@ -2196,50 +2194,50 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_VineyardNodeUnavailable) {
         "test_quota_group", instance_group, instance_id, 64, createLocationSpecInfos(), createModelDeployment());
     registry_manager_->instance_infos_[instance_id] = instance_info;
 
-    // Create InstanceGroup with event_reporting_storage_candidates
+    // Create InstanceGroup with event_report_storage_candidates
     auto ig = std::make_shared<InstanceGroup>();
     ig->set_name(instance_group);
-    ig->set_storage_candidates({vineyard_storage_name});
-    ig->set_event_reporting_storage_candidates({vineyard_storage_name});
+    ig->set_storage_candidates({event_report_storage_name});
+    ig->set_event_report_storage_candidates({event_report_storage_name});
     ig->set_global_quota_group_name("test_quota_group");
     ig->set_max_instance_count(10);
     ig->set_version(1);
     registry_manager_->instance_group_configs_[instance_group] = ig;
 
     auto metrics_registry = cache_manager_->metrics_registry_;
-    auto vineyard_backend = std::make_shared<VineyardBackend>(metrics_registry);
+    auto event_report_backend = std::make_shared<EventReportBackend>(metrics_registry);
 
     StorageConfig config;
-    config.set_global_unique_name(vineyard_storage_name);
-    config.set_type(DataStorageType::DATA_STORAGE_TYPE_VINEYARD);
-    auto spec = std::make_shared<VineyardStorageSpec>();
+    config.set_global_unique_name(event_report_storage_name);
+    config.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
+    auto spec = std::make_shared<EventReportStorageSpec>();
     config.set_storage_spec(spec);
-    vineyard_backend->Open(config, "test_trace");
+    event_report_backend->Open(config, "test_trace");
 
-    vineyard_backend->RegisterNode(instance_id, node_host, {"mem"});
-    vineyard_backend->SetNodeUnavailable(instance_id, node_host);
+    event_report_backend->RegisterNode(instance_id, node_host, {"mem"});
+    event_report_backend->SetNodeUnavailable(instance_id, node_host);
 
     auto dsm = registry_manager_->data_storage_manager_;
-    dsm->storage_map_[vineyard_storage_name] = vineyard_backend;
+    dsm->storage_map_[event_report_storage_name] = event_report_backend;
 
     auto func = cache_manager_->GetCheckLocDataExistFunc(instance_id);
 
     CacheLocation loc;
     loc.set_status(CLS_SERVING);
-    loc.set_type(DataStorageType::DATA_STORAGE_TYPE_VINEYARD);
-    loc.set_location_specs({LocationSpec("tp0", "vineyard://192.168.1.200:8080/mem")});
+    loc.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
+    loc.set_location_specs({LocationSpec("tp0", "event_report://192.168.1.200:8080/mem")});
     ASSERT_EQ(func(loc), false);
 
-    dsm->storage_map_.erase(vineyard_storage_name);
+    dsm->storage_map_.erase(event_report_storage_name);
     registry_manager_->instance_group_configs_.erase(instance_group);
 }
 
-TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_VineyardNodeUnregistered) {
-    // When a vineyard node has been unregistered (dead, past grace period),
+TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_EventReportNodeUnregistered) {
+    // When a event report node has been unregistered (dead, past grace period),
     // MightExist returns false -> the functor should return false.
     const std::string instance_id = "my_cluster";
     const std::string instance_group = "my_group";
-    const std::string vineyard_storage_name = "vineyard_" + instance_group;
+    const std::string event_report_storage_name = "event_report_" + instance_group;
     const std::string node_host = "192.168.1.200:8080";
 
     // Register instance so GetInstanceGroupName works
@@ -2247,38 +2245,38 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_VineyardNodeUnregistered) 
         "test_quota_group", instance_group, instance_id, 64, createLocationSpecInfos(), createModelDeployment());
     registry_manager_->instance_infos_[instance_id] = instance_info;
 
-    // Create InstanceGroup with event_reporting_storage_candidates
+    // Create InstanceGroup with event_report_storage_candidates
     auto ig = std::make_shared<InstanceGroup>();
     ig->set_name(instance_group);
-    ig->set_storage_candidates({vineyard_storage_name});
-    ig->set_event_reporting_storage_candidates({vineyard_storage_name});
+    ig->set_storage_candidates({event_report_storage_name});
+    ig->set_event_report_storage_candidates({event_report_storage_name});
     ig->set_global_quota_group_name("test_quota_group");
     ig->set_max_instance_count(10);
     ig->set_version(1);
     registry_manager_->instance_group_configs_[instance_group] = ig;
 
     auto metrics_registry = cache_manager_->metrics_registry_;
-    auto vineyard_backend = std::make_shared<VineyardBackend>(metrics_registry);
+    auto event_report_backend = std::make_shared<EventReportBackend>(metrics_registry);
 
     StorageConfig config;
-    config.set_global_unique_name(vineyard_storage_name);
-    config.set_type(DataStorageType::DATA_STORAGE_TYPE_VINEYARD);
-    auto spec = std::make_shared<VineyardStorageSpec>();
+    config.set_global_unique_name(event_report_storage_name);
+    config.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
+    auto spec = std::make_shared<EventReportStorageSpec>();
     config.set_storage_spec(spec);
-    vineyard_backend->Open(config, "test_trace");
+    event_report_backend->Open(config, "test_trace");
 
     auto dsm = registry_manager_->data_storage_manager_;
-    dsm->storage_map_[vineyard_storage_name] = vineyard_backend;
+    dsm->storage_map_[event_report_storage_name] = event_report_backend;
 
     auto func = cache_manager_->GetCheckLocDataExistFunc(instance_id);
 
     CacheLocation loc;
     loc.set_status(CLS_SERVING);
-    loc.set_type(DataStorageType::DATA_STORAGE_TYPE_VINEYARD);
-    loc.set_location_specs({LocationSpec("tp0", "vineyard://192.168.1.200:8080/mem")});
+    loc.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
+    loc.set_location_specs({LocationSpec("tp0", "event_report://192.168.1.200:8080/mem")});
     ASSERT_EQ(func(loc), false);
 
-    dsm->storage_map_.erase(vineyard_storage_name);
+    dsm->storage_map_.erase(event_report_storage_name);
     registry_manager_->instance_group_configs_.erase(instance_group);
 }
 
@@ -2969,6 +2967,25 @@ TEST_F(CacheManagerTest, TestDoRecoverAfterCleanup) {
     ASSERT_EQ("test_instance", meta_searcher->meta_indexer_->instance_id_);
 }
 
+TEST_F(CacheManagerTest, TestDoRecoverPreservesRegisteredQueryType) {
+    registry_manager_->instance_infos_["test_instance"]->set_query_type(
+        static_cast<int32_t>(CacheManager::QueryType::QT_PREFIX_MATCH));
+
+    ASSERT_EQ(EC_OK, cache_manager_->DoCleanup());
+    ASSERT_EQ(EC_OK, cache_manager_->DoRecoverOnce());
+
+    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    ASSERT_TRUE(meta_searcher);
+    ASSERT_TRUE(meta_searcher->meta_indexer_);
+    ASSERT_EQ("test_instance", meta_searcher->meta_indexer_->instance_id_);
+
+    CacheManager::KeyVector keys = {1};
+    auto [ec, hosts] = cache_manager_->GetHostCacheState(
+        request_context_.get(), "test_instance", CacheManager::QueryType::QT_UNSPECIFIED, keys);
+    EXPECT_EQ(EC_OK, ec);
+    EXPECT_TRUE(hosts.empty());
+}
+
 TEST_F(CacheManagerTest, TestDoRecoverOnceWithRegistryPartialFailureThenFix) {
     // Scenario:
     // 1. RegistryManager has instance_group + test_instance recovered, but a second instance
@@ -3113,17 +3130,403 @@ TEST_F(CacheManagerTest, InvalidateInstanceMetricsInvokesCallback) {
     ASSERT_EQ(1, call_count);
 }
 
+TEST_F(CacheManagerTest, TestReportEventBlockAddMergesLocationSpecs) {
+    auto expected_reg = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    const std::string instance_id = "test_report_event_merge";
+    std::vector<LocationSpecInfo> location_spec_infos = {
+        LocationSpecInfo("linear_0", 512),
+        LocationSpecInfo("linear_1", 512),
+        LocationSpecInfo("full_3", 512),
+    };
+    ASSERT_EQ(expected_reg,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               instance_id,
+                                               64,
+                                               location_spec_infos,
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>()));
+
+    auto event_backend = std::make_shared<EventReportBackend>(cache_manager_->metrics_registry_);
+    {
+        StorageConfig cfg;
+        cfg.set_global_unique_name("event_backend_default");
+        cfg.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
+        cfg.set_storage_spec(std::make_shared<EventReportStorageSpec>());
+        event_backend->Open(cfg, "test_trace");
+    }
+    registry_manager_->data_storage_manager_->storage_map_["event_backend_default"] = event_backend;
+    registry_manager_->instance_group_configs_["default"]->set_event_report_storage_candidates(
+        {"event_backend_default"});
+
+    const std::string host = "10.0.0.9:8080";
+    auto report_specs =
+        [&](int64_t key, const std::string &medium, const std::vector<std::vector<LocationSpec>> &spec_groups) {
+            proto::meta::ReportEventRequest req;
+            req.set_instance_id(instance_id);
+            req.set_host_ip_port(host);
+            req.set_storage_type(proto::meta::ST_EVENT_REPORT_L1P5);
+
+            auto *reg = req.add_events();
+            reg->set_event_type(proto::meta::EVENT_NODE_REGISTER);
+            reg->mutable_node_register()->add_mediums("mem");
+
+            for (const auto &specs : spec_groups) {
+                auto *ev = req.add_events();
+                ev->set_event_type(proto::meta::EVENT_BLOCK_ADD);
+                auto *ba = ev->mutable_block_add();
+                ba->set_block_key(std::to_string(key));
+                ba->set_medium(medium);
+                for (const auto &input_spec : specs) {
+                    auto *spec = ba->add_specs();
+                    spec->set_name(input_spec.name());
+                    spec->set_uri(input_spec.uri());
+                }
+            }
+
+            proto::meta::ReportEventResponse resp;
+            ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+        };
+
+    auto *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher(instance_id);
+    ASSERT_NE(nullptr, meta_searcher);
+
+    auto get_location_map = [&](int64_t key) {
+        std::vector<CacheLocationMap> location_maps;
+        BlockMask mask = static_cast<size_t>(0);
+        EXPECT_EQ(EC_OK, meta_searcher->BatchGetLocation(request_context_.get(), {key}, mask, location_maps));
+        EXPECT_EQ(1u, location_maps.size());
+        return location_maps.empty() ? CacheLocationMap() : location_maps[0];
+    };
+    auto get_spec_uris = [](const CacheLocationConstPtr &location) {
+        std::map<std::string, std::string> spec_uris;
+        if (!location) {
+            return spec_uris;
+        }
+        for (const auto &spec : location->location_specs()) {
+            spec_uris[spec.name()] = spec.uri();
+        }
+        return spec_uris;
+    };
+
+    // Case 1: one BlockAdd can create one CacheLocation with multiple specs.
+    const int64_t multi_spec_key = 9001;
+    report_specs(multi_spec_key,
+                 "mem",
+                 {{LocationSpec("linear_0", "event_report://10.0.0.9:8080/mem"),
+                   LocationSpec("linear_1", "event_report://10.0.0.9:8080/mem")}});
+    {
+        auto location_map = get_location_map(multi_spec_key);
+        ASSERT_EQ(1u, location_map.size());
+        const std::string location_id = event_backend->BuildLocationId("mem", host);
+        auto loc_it = location_map.find(location_id);
+        ASSERT_NE(location_map.end(), loc_it);
+        ASSERT_TRUE(loc_it->second);
+        EXPECT_EQ(2u, loc_it->second->spec_size());
+        auto spec_uris = get_spec_uris(loc_it->second);
+        ASSERT_EQ(2u, spec_uris.size());
+        EXPECT_EQ("event_report://10.0.0.9:8080/mem", spec_uris["linear_0"]);
+        EXPECT_EQ("event_report://10.0.0.9:8080/mem", spec_uris["linear_1"]);
+    }
+
+    // Case 2: later reports append new specs and overwrite same-name specs.
+    report_specs(multi_spec_key, "mem", {{LocationSpec("linear_0", "event_report://10.0.0.9:8080/mem")}});
+    report_specs(multi_spec_key, "mem", {{LocationSpec("full_3", "event_report://10.0.0.9:8080/mem")}});
+    {
+        auto location_map = get_location_map(multi_spec_key);
+        ASSERT_EQ(1u, location_map.size());
+        const std::string location_id = event_backend->BuildLocationId("mem", host);
+        auto loc_it = location_map.find(location_id);
+        ASSERT_NE(location_map.end(), loc_it);
+        ASSERT_TRUE(loc_it->second);
+        EXPECT_EQ(3u, loc_it->second->spec_size());
+        auto spec_uris = get_spec_uris(loc_it->second);
+        ASSERT_EQ(3u, spec_uris.size());
+        EXPECT_EQ("event_report://10.0.0.9:8080/mem", spec_uris["linear_0"]);
+        EXPECT_EQ("event_report://10.0.0.9:8080/mem", spec_uris["linear_1"]);
+        EXPECT_EQ("event_report://10.0.0.9:8080/mem", spec_uris["full_3"]);
+    }
+
+    // Case 3: multiple BlockAdd events for the same key in one request are merged before writing meta.
+    const int64_t same_request_key = 9002;
+    report_specs(same_request_key,
+                 "mem",
+                 {{LocationSpec("linear_0", "event_report://10.0.0.9:8080/mem")},
+                  {LocationSpec("linear_1", "event_report://10.0.0.9:8080/mem")},
+                  {LocationSpec("linear_0", "event_report://10.0.0.9:8080/mem")}});
+    {
+        auto location_map = get_location_map(same_request_key);
+        ASSERT_EQ(1u, location_map.size());
+        const std::string location_id = event_backend->BuildLocationId("mem", host);
+        auto loc_it = location_map.find(location_id);
+        ASSERT_NE(location_map.end(), loc_it);
+        ASSERT_TRUE(loc_it->second);
+        EXPECT_EQ(2u, loc_it->second->spec_size());
+        auto spec_uris = get_spec_uris(loc_it->second);
+        ASSERT_EQ(2u, spec_uris.size());
+        EXPECT_EQ("event_report://10.0.0.9:8080/mem", spec_uris["linear_0"]);
+        EXPECT_EQ("event_report://10.0.0.9:8080/mem", spec_uris["linear_1"]);
+    }
+
+    // Case 4: same key with different medium uses different location_id and does not merge into one CacheLocation.
+    const int64_t multi_medium_key = 9003;
+    report_specs(multi_medium_key, "mem", {{LocationSpec("linear_0", "event_report://10.0.0.9:8080/mem")}});
+    report_specs(multi_medium_key, "disk", {{LocationSpec("linear_1", "event_report://10.0.0.9:8080/disk")}});
+    {
+        auto location_map = get_location_map(multi_medium_key);
+        ASSERT_EQ(2u, location_map.size());
+
+        const std::string mem_location_id = event_backend->BuildLocationId("mem", host);
+        const std::string disk_location_id = event_backend->BuildLocationId("disk", host);
+        auto mem_it = location_map.find(mem_location_id);
+        auto disk_it = location_map.find(disk_location_id);
+        ASSERT_NE(location_map.end(), mem_it);
+        ASSERT_NE(location_map.end(), disk_it);
+        ASSERT_TRUE(mem_it->second);
+        ASSERT_TRUE(disk_it->second);
+
+        auto mem_specs = get_spec_uris(mem_it->second);
+        auto disk_specs = get_spec_uris(disk_it->second);
+        ASSERT_EQ(1u, mem_specs.size());
+        ASSERT_EQ(1u, disk_specs.size());
+        EXPECT_EQ("event_report://10.0.0.9:8080/mem", mem_specs["linear_0"]);
+        EXPECT_EQ("event_report://10.0.0.9:8080/disk", disk_specs["linear_1"]);
+    }
+}
+
+TEST_F(CacheManagerTest, TestReportEventL1P5L2BlockAddAreIsolated) {
+    auto expected_reg = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    const std::string instance_id = "test_report_event_l1p5_l2";
+    std::vector<LocationSpecInfo> location_spec_infos = {
+        LocationSpecInfo("linear_0", 512),
+        LocationSpecInfo("linear_1", 512),
+    };
+    ASSERT_EQ(expected_reg,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               instance_id,
+                                               64,
+                                               location_spec_infos,
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>()));
+
+    auto make_backend = [&](const std::string &name, DataStorageType type) {
+        auto backend = std::make_shared<EventReportBackend>(cache_manager_->metrics_registry_);
+        StorageConfig cfg;
+        cfg.set_global_unique_name(name);
+        cfg.set_type(type);
+        cfg.set_storage_spec(std::make_shared<EventReportStorageSpec>());
+        return std::make_pair(backend, backend->Open(cfg, "test_trace"));
+    };
+
+    auto l1p5_backend_result = make_backend("event_backend_l1p5", DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
+    ASSERT_EQ(EC_OK, l1p5_backend_result.second);
+    auto l2_backend_result = make_backend("event_backend_l2", DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2);
+    ASSERT_EQ(EC_OK, l2_backend_result.second);
+    auto l1p5_backend = l1p5_backend_result.first;
+    auto l2_backend = l2_backend_result.first;
+    registry_manager_->data_storage_manager_->storage_map_["event_backend_l1p5"] = l1p5_backend;
+    registry_manager_->data_storage_manager_->storage_map_["event_backend_l2"] = l2_backend;
+    registry_manager_->instance_group_configs_["default"]->set_event_report_storage_candidates(
+        {"event_backend_l1p5", "event_backend_l2"});
+
+    const std::string host = "10.0.0.11:8080";
+    const int64_t key = 9201;
+    auto report_one = [&](proto::meta::StorageType storage_type, const std::string &spec_name, const std::string &uri) {
+        proto::meta::ReportEventRequest req;
+        req.set_instance_id(instance_id);
+        req.set_host_ip_port(host);
+        req.set_storage_type(storage_type);
+        auto *reg = req.add_events();
+        reg->set_event_type(proto::meta::EVENT_NODE_REGISTER);
+        reg->mutable_node_register()->add_mediums("mem");
+        auto *ev = req.add_events();
+        ev->set_event_type(proto::meta::EVENT_BLOCK_ADD);
+        auto *ba = ev->mutable_block_add();
+        ba->set_block_key(std::to_string(key));
+        ba->set_medium("mem");
+        auto *spec = ba->add_specs();
+        spec->set_name(spec_name);
+        spec->set_uri(uri);
+        proto::meta::ReportEventResponse resp;
+        ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+    };
+
+    report_one(proto::meta::ST_EVENT_REPORT_L1P5, "linear_0", "event_report://10.0.0.11:8080/l1p5");
+    report_one(proto::meta::ST_EVENT_REPORT_L2, "linear_1", "event_report://10.0.0.11:8080/l2");
+
+    auto *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher(instance_id);
+    ASSERT_NE(nullptr, meta_searcher);
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask mask = static_cast<size_t>(0);
+    ASSERT_EQ(EC_OK, meta_searcher->BatchGetLocation(request_context_.get(), {key}, mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    const auto &location_map = location_maps[0];
+    ASSERT_EQ(2u, location_map.size());
+
+    const std::string l1p5_location_id = l1p5_backend->BuildLocationId("mem", host);
+    const std::string l2_location_id = l2_backend->BuildLocationId("mem", host);
+    ASSERT_NE(l1p5_location_id, l2_location_id);
+    auto l1p5_it = location_map.find(l1p5_location_id);
+    auto l2_it = location_map.find(l2_location_id);
+    ASSERT_NE(location_map.end(), l1p5_it);
+    ASSERT_NE(location_map.end(), l2_it);
+    ASSERT_TRUE(l1p5_it->second);
+    ASSERT_TRUE(l2_it->second);
+
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5, l1p5_it->second->type());
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, l2_it->second->type());
+    ASSERT_EQ(1u, l1p5_it->second->location_specs().size());
+    ASSERT_EQ(1u, l2_it->second->location_specs().size());
+    EXPECT_EQ("linear_0", l1p5_it->second->location_specs()[0].name());
+    EXPECT_EQ("event_report://10.0.0.11:8080/l1p5", l1p5_it->second->location_specs()[0].uri());
+    EXPECT_EQ("linear_1", l2_it->second->location_specs()[0].name());
+    EXPECT_EQ("event_report://10.0.0.11:8080/l2", l2_it->second->location_specs()[0].uri());
+}
+
+TEST_F(CacheManagerTest, TestReportEventBlockDeleteRemovesLocationSpecs) {
+    auto expected_reg = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    const std::string instance_id = "test_report_event_delete_specs";
+    std::vector<LocationSpecInfo> location_spec_infos = {
+        LocationSpecInfo("linear_0", 512),
+        LocationSpecInfo("linear_1", 512),
+        LocationSpecInfo("full_3", 512),
+    };
+    ASSERT_EQ(expected_reg,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               instance_id,
+                                               64,
+                                               location_spec_infos,
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>()));
+
+    auto event_backend = std::make_shared<EventReportBackend>(cache_manager_->metrics_registry_);
+    {
+        StorageConfig cfg;
+        cfg.set_global_unique_name("event_backend_delete");
+        cfg.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
+        cfg.set_storage_spec(std::make_shared<EventReportStorageSpec>());
+        event_backend->Open(cfg, "test_trace");
+    }
+    registry_manager_->data_storage_manager_->storage_map_["event_backend_delete"] = event_backend;
+    registry_manager_->instance_group_configs_["default"]->set_event_report_storage_candidates(
+        {"event_backend_delete"});
+
+    const std::string host = "10.0.0.10:8080";
+    auto report_add = [&](int64_t key, const std::string &medium, const std::vector<LocationSpec> &specs) {
+        proto::meta::ReportEventRequest req;
+        req.set_instance_id(instance_id);
+        req.set_host_ip_port(host);
+        req.set_storage_type(proto::meta::ST_EVENT_REPORT_L1P5);
+        auto *reg = req.add_events();
+        reg->set_event_type(proto::meta::EVENT_NODE_REGISTER);
+        reg->mutable_node_register()->add_mediums(medium);
+        auto *ev = req.add_events();
+        ev->set_event_type(proto::meta::EVENT_BLOCK_ADD);
+        auto *ba = ev->mutable_block_add();
+        ba->set_block_key(std::to_string(key));
+        ba->set_medium(medium);
+        for (const auto &input_spec : specs) {
+            auto *spec = ba->add_specs();
+            spec->set_name(input_spec.name());
+            spec->set_uri(input_spec.uri());
+        }
+        proto::meta::ReportEventResponse resp;
+        ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+    };
+    auto report_delete =
+        [&](int64_t key, const std::string &medium, const std::vector<std::vector<std::string>> &spec_name_groups) {
+            proto::meta::ReportEventRequest req;
+            req.set_instance_id(instance_id);
+            req.set_host_ip_port(host);
+            req.set_storage_type(proto::meta::ST_EVENT_REPORT_L1P5);
+            auto *reg = req.add_events();
+            reg->set_event_type(proto::meta::EVENT_NODE_REGISTER);
+            reg->mutable_node_register()->add_mediums(medium);
+            for (const auto &spec_names : spec_name_groups) {
+                auto *ev = req.add_events();
+                ev->set_event_type(proto::meta::EVENT_BLOCK_DELETE);
+                auto *bd = ev->mutable_block_delete();
+                bd->set_block_key(std::to_string(key));
+                bd->set_medium(medium);
+                for (const auto &spec_name : spec_names) {
+                    bd->add_spec_names(spec_name);
+                }
+            }
+            proto::meta::ReportEventResponse resp;
+            ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+        };
+
+    auto *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher(instance_id);
+    ASSERT_NE(nullptr, meta_searcher);
+    auto get_location_map = [&](int64_t key) {
+        std::vector<CacheLocationMap> location_maps;
+        BlockMask mask = static_cast<size_t>(0);
+        EXPECT_EQ(EC_OK, meta_searcher->BatchGetLocation(request_context_.get(), {key}, mask, location_maps));
+        EXPECT_EQ(1u, location_maps.size());
+        return location_maps.empty() ? CacheLocationMap() : location_maps[0];
+    };
+    auto get_spec_names = [](const CacheLocationConstPtr &location) {
+        std::set<std::string> spec_names;
+        if (!location) {
+            return spec_names;
+        }
+        for (const auto &spec : location->location_specs()) {
+            spec_names.insert(spec.name());
+        }
+        return spec_names;
+    };
+
+    const int64_t partial_delete_key = 9101;
+    report_add(partial_delete_key,
+               "mem",
+               {LocationSpec("linear_0", "event_report://10.0.0.10:8080/mem"),
+                LocationSpec("linear_1", "event_report://10.0.0.10:8080/mem"),
+                LocationSpec("full_3", "event_report://10.0.0.10:8080/mem")});
+
+    report_delete(partial_delete_key, "mem", {{"linear_0"}});
+    {
+        auto location_map = get_location_map(partial_delete_key);
+        ASSERT_EQ(1u, location_map.size());
+        const auto location_id = event_backend->BuildLocationId("mem", host);
+        auto loc_it = location_map.find(location_id);
+        ASSERT_NE(location_map.end(), loc_it);
+        EXPECT_EQ((std::set<std::string>{"linear_1", "full_3"}), get_spec_names(loc_it->second));
+        EXPECT_EQ(2u, loc_it->second->spec_size());
+    }
+
+    report_delete(partial_delete_key, "mem", {{"linear_1"}, {"full_3"}});
+    {
+        auto location_map = get_location_map(partial_delete_key);
+        EXPECT_TRUE(location_map.empty());
+    }
+
+    const int64_t multi_medium_key = 9103;
+    report_add(multi_medium_key, "mem", {LocationSpec("linear_0", "event_report://10.0.0.10:8080/mem")});
+    report_add(multi_medium_key, "disk", {LocationSpec("linear_1", "event_report://10.0.0.10:8080/disk")});
+    report_delete(multi_medium_key, "mem", {{"linear_0"}});
+    {
+        auto location_map = get_location_map(multi_medium_key);
+        ASSERT_EQ(1u, location_map.size());
+        const auto disk_location_id = event_backend->BuildLocationId("disk", host);
+        auto disk_it = location_map.find(disk_location_id);
+        ASSERT_NE(location_map.end(), disk_it);
+        EXPECT_EQ((std::set<std::string>{"linear_1"}), get_spec_names(disk_it->second));
+    }
+}
+
 // =============================================================
 // GetCacheLocationsByBackend with backend_selectors
 // =============================================================
 //
 // Data layout:
-//   3 V6D peers: A (192.168.1.1:8080), B (192.168.1.2:8080), C (192.168.1.3:8080)
+//   3 event report peers: A (192.168.1.1:8080), B (192.168.1.2:8080), C (192.168.1.3:8080)
 //   key 300: peer_A, peer_B, peer_C
 //   key 400: peer_A, peer_B
 //   key 500: peer_B only
 //   key 600: peer_A, peer_B
-//   key 700: no V6D
+//   key 700: no event report
 //   All 5 keys have NFS locations.
 //
 // PREFIX (from key[0]):
@@ -3161,23 +3564,24 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
             cache_manager_->FinishWriteCache(request_context_.get(), "test_instance", swci.write_session_id(), bm));
     }
 
-    // Set up VineyardBackend
+    // Set up EventReportBackend
     auto metrics_registry = cache_manager_->metrics_registry_;
-    auto vineyard_backend = std::make_shared<VineyardBackend>(metrics_registry);
+    auto event_report_backend = std::make_shared<EventReportBackend>(metrics_registry);
     {
-        StorageConfig v6d_config;
-        v6d_config.set_global_unique_name("vineyard_default");
-        v6d_config.set_type(DataStorageType::DATA_STORAGE_TYPE_VINEYARD);
-        v6d_config.set_storage_spec(std::make_shared<VineyardStorageSpec>());
-        vineyard_backend->Open(v6d_config, "test_trace");
+        StorageConfig er_config;
+        er_config.set_global_unique_name("event_report_default");
+        er_config.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2);
+        er_config.set_storage_spec(std::make_shared<EventReportStorageSpec>());
+        event_report_backend->Open(er_config, "test_trace");
     }
     auto dsm = registry_manager_->data_storage_manager_;
-    dsm->storage_map_["vineyard_default"] = vineyard_backend;
+    dsm->storage_map_["event_report_default"] = event_report_backend;
 
-    // Configure event_reporting_storage_candidates for the "default" instance group
-    registry_manager_->instance_group_configs_["default"]->set_event_reporting_storage_candidates({"vineyard_default"});
+    // Configure event_report_storage_candidates for the "default" instance group
+    registry_manager_->instance_group_configs_["default"]->set_event_report_storage_candidates(
+        {"event_report_default"});
 
-    // Inject V6D locations via ReportEvent
+    // Inject event report locations via ReportEvent
     struct PeerKeys {
         std::string host;
         std::vector<int64_t> keys;
@@ -3191,7 +3595,7 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
         proto::meta::ReportEventRequest req;
         req.set_instance_id("test_instance");
         req.set_host_ip_port(pd.host);
-        req.set_storage_type(proto::meta::ST_VINEYARD);
+        req.set_storage_type(proto::meta::ST_EVENT_REPORT_L2);
 
         auto *reg = req.add_events();
         reg->set_event_type(proto::meta::EVENT_NODE_REGISTER);
@@ -3205,7 +3609,7 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
             ba->set_medium("mem");
             auto *spec = ba->add_specs();
             spec->set_name("tp0");
-            spec->set_uri("vineyard://" + pd.host + "/mem");
+            spec->set_uri("event_report://" + pd.host + "/mem");
         }
 
         proto::meta::ReportEventResponse resp;
@@ -3227,10 +3631,10 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
         ASSERT_EQ(EC_BADARGS, ec);
     }
 
-    // --- Test 2: V6D PREFIX + NFS (NFS on 300,500,700 should not affect V6D peer selection) ---
+    // --- Test 2: EVENT_REPORT PREFIX + NFS (NFS on 300,500,700 should not affect event report peer selection) ---
     {
         std::vector<BackendSelector> selectors = {
-            {DataStorageType::DATA_STORAGE_TYPE_VINEYARD, LocationSelectStrategy::LSS_V6D_PREFIX},
+            {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX},
             {DataStorageType::DATA_STORAGE_TYPE_NFS, LocationSelectStrategy::LSS_WEIGHTED_RANDOM},
         };
         BlockMask bm = static_cast<size_t>(0);
@@ -3247,33 +3651,33 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
         ASSERT_EQ(5u, locs.size());
 
         // peer_B wins with prefix=4 (keys 300,400,500,600)
-        // key 300 (index 0): V6D + NFS = 2
+        // key 300 (index 0): event report + NFS = 2
         {
             const auto &kl = locs[0].cache_locations_view();
             ASSERT_EQ(2u, kl.size());
             EXPECT_NE(std::string::npos, kl[0].location_specs()[0].uri().find("192.168.1.2"));
         }
-        // key 400 (index 1): V6D only = 1 (no NFS for 400)
+        // key 400 (index 1): event report only = 1 (no NFS for 400)
         {
             const auto &kl = locs[1].cache_locations_view();
             ASSERT_EQ(1u, kl.size());
-            EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_VINEYARD, kl[0].type());
+            EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, kl[0].type());
             EXPECT_NE(std::string::npos, kl[0].location_specs()[0].uri().find("192.168.1.2"));
         }
-        // key 500 (index 2): V6D + NFS = 2
+        // key 500 (index 2): event report + NFS = 2
         {
             const auto &kl = locs[2].cache_locations_view();
             ASSERT_EQ(2u, kl.size());
             EXPECT_NE(std::string::npos, kl[0].location_specs()[0].uri().find("192.168.1.2"));
         }
-        // key 600 (index 3): V6D only = 1 (no NFS for 600)
+        // key 600 (index 3): event report only = 1 (no NFS for 600)
         {
             const auto &kl = locs[3].cache_locations_view();
             ASSERT_EQ(1u, kl.size());
-            EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_VINEYARD, kl[0].type());
+            EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, kl[0].type());
             EXPECT_NE(std::string::npos, kl[0].location_specs()[0].uri().find("192.168.1.2"));
         }
-        // key 700 (index 4): NFS only = 1 (no V6D peer has this key)
+        // key 700 (index 4): NFS only = 1 (no event report peer has this key)
         {
             const auto &kl = locs[4].cache_locations_view();
             ASSERT_EQ(1u, kl.size());
@@ -3281,10 +3685,10 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
         }
     }
 
-    // --- Test 3: V6D COVERAGE + NFS (NFS presence does not affect V6D coverage selection) ---
+    // --- Test 3: EVENT_REPORT COVERAGE + NFS (NFS presence does not affect event report coverage selection) ---
     {
         std::vector<BackendSelector> selectors = {
-            {DataStorageType::DATA_STORAGE_TYPE_VINEYARD, LocationSelectStrategy::LSS_V6D_COVERAGE},
+            {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_COVERAGE},
             {DataStorageType::DATA_STORAGE_TYPE_NFS, LocationSelectStrategy::LSS_WEIGHTED_RANDOM},
         };
         BlockMask bm = static_cast<size_t>(0);
@@ -3301,17 +3705,17 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
         ASSERT_EQ(5u, locs.size());
 
         // peer_B covers most keys (300,400,500,600) = 4
-        // key 300 (index 0): V6D + NFS = 2
+        // key 300 (index 0): event report + NFS = 2
         ASSERT_EQ(2u, locs[0].cache_locations_view().size());
         EXPECT_NE(std::string::npos, locs[0].cache_locations_view()[0].location_specs()[0].uri().find("192.168.1.2"));
-        // key 400 (index 1): V6D only = 1
+        // key 400 (index 1): event report only = 1
         ASSERT_EQ(1u, locs[1].cache_locations_view().size());
-        EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_VINEYARD, locs[1].cache_locations_view()[0].type());
-        // key 500 (index 2): V6D + NFS = 2
+        EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, locs[1].cache_locations_view()[0].type());
+        // key 500 (index 2): event report + NFS = 2
         ASSERT_EQ(2u, locs[2].cache_locations_view().size());
-        // key 600 (index 3): V6D only = 1
+        // key 600 (index 3): event report only = 1
         ASSERT_EQ(1u, locs[3].cache_locations_view().size());
-        EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_VINEYARD, locs[3].cache_locations_view()[0].type());
+        EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, locs[3].cache_locations_view()[0].type());
         // key 700 (index 4): NFS only = 1
         ASSERT_EQ(1u, locs[4].cache_locations_view().size());
         EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_NFS, locs[4].cache_locations_view()[0].type());
@@ -3349,19 +3753,19 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
         EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_NFS, locs[4].cache_locations_view()[0].type());
     }
 
-    // --- Test 5: PREFIX stops when first key has no V6D, but NFS still works ---
+    // --- Test 5: PREFIX stops when first key has no event report, but NFS still works ---
     // keys = {700, 300, 400}; NFS exists for 700 and 300, not for 400
     {
-        std::vector<int64_t> keys_no_v6d_first = {700, 300, 400};
+        std::vector<int64_t> keys_no_er_first = {700, 300, 400};
         std::vector<BackendSelector> selectors = {
-            {DataStorageType::DATA_STORAGE_TYPE_VINEYARD, LocationSelectStrategy::LSS_V6D_PREFIX},
+            {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX},
             {DataStorageType::DATA_STORAGE_TYPE_NFS, LocationSelectStrategy::LSS_WEIGHTED_RANDOM},
         };
         BlockMask bm = static_cast<size_t>(0);
         auto [ec, locs] = cache_manager_->GetCacheLocationsByBackend(request_context_.get(),
                                                                      "test_instance",
                                                                      CacheManager::QueryType::QT_BATCH_GET,
-                                                                     keys_no_v6d_first,
+                                                                     keys_no_er_first,
                                                                      {},
                                                                      bm,
                                                                      0,
@@ -3369,23 +3773,23 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
                                                                      selectors);
         ASSERT_EQ(EC_OK, ec);
         ASSERT_EQ(3u, locs.size());
-        // V6D PREFIX stops at key 700 → no V6D for any key
+        // EVENT_REPORT PREFIX stops at key 700 → no event report for any key
         // key 700 (index 0): NFS only = 1
         ASSERT_EQ(1u, locs[0].cache_locations_view().size());
         EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_NFS, locs[0].cache_locations_view()[0].type());
-        // key 300 (index 1): NFS only = 1 (V6D blocked by prefix)
+        // key 300 (index 1): NFS only = 1 (event report blocked by prefix)
         ASSERT_EQ(1u, locs[1].cache_locations_view().size());
         EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_NFS, locs[1].cache_locations_view()[0].type());
-        // key 400 (index 2): nothing (no V6D from prefix, no NFS written)
+        // key 400 (index 2): nothing (no event report from prefix, no NFS written)
         EXPECT_TRUE(locs[2].cache_locations_view().empty());
     }
 
-    // --- Test 6: COVERAGE skips keys with no V6D, NFS fills gaps independently ---
+    // --- Test 6: COVERAGE skips keys with no event report, NFS fills gaps independently ---
     // keys = {700, 300, 400}; NFS exists for 700 and 300, not for 400
     {
         std::vector<int64_t> keys_gap = {700, 300, 400};
         std::vector<BackendSelector> selectors = {
-            {DataStorageType::DATA_STORAGE_TYPE_VINEYARD, LocationSelectStrategy::LSS_V6D_COVERAGE},
+            {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_COVERAGE},
             {DataStorageType::DATA_STORAGE_TYPE_NFS, LocationSelectStrategy::LSS_WEIGHTED_RANDOM},
         };
         BlockMask bm = static_cast<size_t>(0);
@@ -3400,21 +3804,21 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
                                                                      selectors);
         ASSERT_EQ(EC_OK, ec);
         ASSERT_EQ(3u, locs.size());
-        // key 700 (index 0): NFS only = 1 (no V6D peer)
+        // key 700 (index 0): NFS only = 1 (no event report peer)
         ASSERT_EQ(1u, locs[0].cache_locations_view().size());
         EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_NFS, locs[0].cache_locations_view()[0].type());
-        // key 300 (index 1): V6D + NFS = 2
+        // key 300 (index 1): event report + NFS = 2
         ASSERT_EQ(2u, locs[1].cache_locations_view().size());
-        // key 400 (index 2): V6D only = 1 (no NFS for 400)
+        // key 400 (index 2): event report only = 1 (no NFS for 400)
         ASSERT_EQ(1u, locs[2].cache_locations_view().size());
-        EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_VINEYARD, locs[2].cache_locations_view()[0].type());
+        EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, locs[2].cache_locations_view()[0].type());
     }
 
     // --- Test 7: nonexistent keys → all empty ---
     {
         std::vector<int64_t> bad_keys = {99998, 99999};
         std::vector<BackendSelector> selectors = {
-            {DataStorageType::DATA_STORAGE_TYPE_VINEYARD, LocationSelectStrategy::LSS_V6D_PREFIX},
+            {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2, LocationSelectStrategy::LSS_V6D_PREFIX},
             {DataStorageType::DATA_STORAGE_TYPE_NFS, LocationSelectStrategy::LSS_WEIGHTED_RANDOM},
         };
         BlockMask bm = static_cast<size_t>(0);
@@ -3455,7 +3859,392 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
         EXPECT_EQ(2u, kl[0].location_specs().size());
     }
 
-    dsm->storage_map_.erase("vineyard_default");
+    dsm->storage_map_.erase("event_report_default");
+}
+
+// =============================================================
+// GetHostCacheState — per-host prefix match length
+// =============================================================
+//
+// Data layout:
+//   3 hosts: A (10.0.0.1:8080), B (10.0.0.2:8080), C (10.0.0.3:8080)
+//   key 100: host_A, host_B, host_C
+//   key 200: host_A, host_B
+//   key 300: host_B only
+//   key 400: host_A, host_B
+//   key 500: no host
+//
+// Query keys = {100, 200, 300, 400, 500}
+//   host_A: 100→200→(miss 300) → prefix=2
+//   host_B: 100→200→300→400→(miss 500) → prefix=4
+//   host_C: 100→(miss 200) → prefix=1
+//
+TEST_F(CacheManagerTest, TestGetHostCacheState) {
+    auto expected_reg = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    const std::string instance_id = "test_host_cache_state_prefix";
+    ASSERT_EQ(expected_reg,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               instance_id,
+                                               64,
+                                               createLocationSpecInfos(),
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>(),
+                                               CacheManager::QueryType::QT_PREFIX_MATCH));
+
+    // Set up EventReportBackend so that location_ids carry host_ip_port
+    auto metrics_registry = cache_manager_->metrics_registry_;
+    auto event_backend = std::make_shared<EventReportBackend>(metrics_registry);
+    {
+        StorageConfig cfg;
+        cfg.set_global_unique_name("event_backend_default");
+        cfg.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
+        cfg.set_storage_spec(std::make_shared<EventReportStorageSpec>());
+        event_backend->Open(cfg, "test_trace");
+    }
+    auto dsm = registry_manager_->data_storage_manager_;
+    dsm->storage_map_["event_backend_default"] = event_backend;
+    registry_manager_->instance_group_configs_["default"]->set_event_report_storage_candidates(
+        {"event_backend_default"});
+
+    // Inject cache locations via ReportEvent — each host reports a subset of keys
+    struct HostKeys {
+        std::string host;
+        std::vector<int64_t> keys;
+    };
+    std::vector<HostKeys> host_data = {
+        {"10.0.0.1:8080", {100, 200, 400}},
+        {"10.0.0.2:8080", {100, 200, 300, 400}},
+        {"10.0.0.3:8080", {100}},
+        {"10.0.0.4:8080", {200, 300}},
+    };
+    for (const auto &hd : host_data) {
+        proto::meta::ReportEventRequest req;
+        req.set_instance_id(instance_id);
+        req.set_host_ip_port(hd.host);
+        req.set_storage_type(proto::meta::ST_EVENT_REPORT_L1P5);
+
+        auto *reg = req.add_events();
+        reg->set_event_type(proto::meta::EVENT_NODE_REGISTER);
+        reg->mutable_node_register()->add_mediums("mem");
+
+        for (int64_t key : hd.keys) {
+            auto *ev = req.add_events();
+            ev->set_event_type(proto::meta::EVENT_BLOCK_ADD);
+            auto *ba = ev->mutable_block_add();
+            ba->set_block_key(std::to_string(key));
+            ba->set_medium("mem");
+            auto *spec = ba->add_specs();
+            spec->set_name("tp0");
+            spec->set_uri("event_report://" + hd.host + "/mem");
+        }
+
+        proto::meta::ReportEventResponse resp;
+        ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+    }
+
+    // Helper: find a host's prefix_match_blocks in the result
+    auto find_prefix = [](const std::vector<CacheManager::HostCacheMatch> &hosts, const std::string &host) -> int64_t {
+        for (const auto &h : hosts) {
+            if (h.host_ip_port == host) {
+                return h.prefix_match_blocks;
+            }
+        }
+        return -1; // not found
+    };
+
+    // --- Test 1: full query — different prefix lengths per host ---
+    // keys = {100, 200, 300, 400, 500}
+    //   host_A: prefix=2 (100,200; miss 300)
+    //   host_B: prefix=4 (100,200,300,400; miss 500)
+    //   host_C: prefix=1 (100; miss 200)
+    {
+        CacheManager::KeyVector keys = {100, 200, 300, 400, 500};
+        auto [ec, hosts] = cache_manager_->GetHostCacheState(
+            request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, keys);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(3, hosts.size());
+
+        EXPECT_EQ(2, find_prefix(hosts, "10.0.0.1:8080"));
+        EXPECT_EQ(4, find_prefix(hosts, "10.0.0.2:8080"));
+        EXPECT_EQ(1, find_prefix(hosts, "10.0.0.3:8080"));
+    }
+
+    // --- Test 1b: unspecified query type falls back to RegisterInstance.query_type ---
+    {
+        CacheManager::KeyVector keys = {100, 200, 300, 400, 500};
+        auto [ec, hosts] = cache_manager_->GetHostCacheState(
+            request_context_.get(), instance_id, CacheManager::QueryType::QT_UNSPECIFIED, keys);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(3, hosts.size());
+
+        EXPECT_EQ(2, find_prefix(hosts, "10.0.0.1:8080"));
+        EXPECT_EQ(4, find_prefix(hosts, "10.0.0.2:8080"));
+        EXPECT_EQ(1, find_prefix(hosts, "10.0.0.3:8080"));
+    }
+
+    // --- Test 2: all keys cached by host_B → prefix = full length ---
+    // keys = {100, 200, 300, 400}
+    //   host_A: prefix=2 (miss 300)
+    //   host_B: prefix=4 (all matched)
+    //   host_C: prefix=1 (miss 200)
+    {
+        CacheManager::KeyVector keys = {100, 200, 300, 400};
+        auto [ec, hosts] = cache_manager_->GetHostCacheState(
+            request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, keys);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(3, hosts.size());
+
+        EXPECT_EQ(2, find_prefix(hosts, "10.0.0.1:8080"));
+        EXPECT_EQ(4, find_prefix(hosts, "10.0.0.2:8080"));
+        EXPECT_EQ(1, find_prefix(hosts, "10.0.0.3:8080"));
+    }
+
+    // --- Test 3: single key — all hosts have prefix=1 ---
+    {
+        CacheManager::KeyVector keys = {100};
+        auto [ec, hosts] = cache_manager_->GetHostCacheState(
+            request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, keys);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(3, hosts.size());
+
+        EXPECT_EQ(1, find_prefix(hosts, "10.0.0.1:8080"));
+        EXPECT_EQ(1, find_prefix(hosts, "10.0.0.2:8080"));
+        EXPECT_EQ(1, find_prefix(hosts, "10.0.0.3:8080"));
+    }
+
+    // --- Test 4: first key not cached by any host → empty response ---
+    // keys = {999, 100, 200}
+    {
+        CacheManager::KeyVector keys = {999, 100, 200};
+        auto [ec, hosts] = cache_manager_->GetHostCacheState(
+            request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, keys);
+        ASSERT_EQ(EC_OK, ec);
+        EXPECT_EQ(0, hosts.size());
+    }
+
+    // --- Test 5: medium filter (only "mem") — should not change results ---
+    {
+        CacheManager::KeyVector keys = {100, 200, 300, 400, 500};
+        auto [ec, hosts] = cache_manager_->GetHostCacheState(
+            request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, keys, {"mem"});
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(3, hosts.size());
+
+        EXPECT_EQ(2, find_prefix(hosts, "10.0.0.1:8080"));
+        EXPECT_EQ(4, find_prefix(hosts, "10.0.0.2:8080"));
+        EXPECT_EQ(1, find_prefix(hosts, "10.0.0.3:8080"));
+    }
+
+    // --- Test 6: medium filter (non-existent medium "ssd") → no hosts ---
+    {
+        CacheManager::KeyVector keys = {100, 200};
+        auto [ec, hosts] = cache_manager_->GetHostCacheState(
+            request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, keys, {"ssd"});
+        ASSERT_EQ(EC_OK, ec);
+        EXPECT_EQ(0, hosts.size());
+    }
+
+    // --- Test 7: middle miss stops prefix; later hits do not extend any host ---
+    {
+        CacheManager::KeyVector keys = {100, 500, 400};
+        auto [ec, hosts] = cache_manager_->GetHostCacheState(
+            request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, keys);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(3, hosts.size());
+
+        EXPECT_EQ(1, find_prefix(hosts, "10.0.0.1:8080"));
+        EXPECT_EQ(1, find_prefix(hosts, "10.0.0.2:8080"));
+        EXPECT_EQ(1, find_prefix(hosts, "10.0.0.3:8080"));
+        EXPECT_EQ(-1, find_prefix(hosts, "10.0.0.4:8080"));
+    }
+
+    // --- Test 8: hosts absent from the first key are not returned with prefix=0 ---
+    {
+        CacheManager::KeyVector keys = {100, 200, 300};
+        auto [ec, hosts] = cache_manager_->GetHostCacheState(
+            request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, keys);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(3, hosts.size());
+
+        EXPECT_EQ(2, find_prefix(hosts, "10.0.0.1:8080"));
+        EXPECT_EQ(3, find_prefix(hosts, "10.0.0.2:8080"));
+        EXPECT_EQ(1, find_prefix(hosts, "10.0.0.3:8080"));
+        EXPECT_EQ(-1, find_prefix(hosts, "10.0.0.4:8080"));
+    }
+
+    // --- Test 9: unavailable host is filtered even before metadata cleanup ---
+    {
+        event_backend->SetNodeUnavailable(instance_id, "10.0.0.2:8080");
+        CacheManager::KeyVector keys = {100, 200, 300, 400};
+        auto [ec, hosts] = cache_manager_->GetHostCacheState(
+            request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH, keys);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(2, hosts.size());
+
+        EXPECT_EQ(2, find_prefix(hosts, "10.0.0.1:8080"));
+        EXPECT_EQ(-1, find_prefix(hosts, "10.0.0.2:8080"));
+        EXPECT_EQ(1, find_prefix(hosts, "10.0.0.3:8080"));
+    }
+
+    dsm->storage_map_.erase("event_backend_default");
+}
+
+TEST_F(CacheManagerTest, TestGetHostCacheStateUnspecifiedWithoutRegisteredQueryType) {
+    auto expected_reg = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    const std::string instance_id = "test_host_cache_state_no_query_type";
+    ASSERT_EQ(expected_reg,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               instance_id,
+                                               64,
+                                               createLocationSpecInfos(),
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>()));
+
+    CacheManager::KeyVector keys = {100};
+    auto [ec, hosts] = cache_manager_->GetHostCacheState(
+        request_context_.get(), instance_id, CacheManager::QueryType::QT_UNSPECIFIED, keys);
+    EXPECT_EQ(EC_ERROR, ec);
+    EXPECT_TRUE(hosts.empty());
+}
+
+TEST_F(CacheManagerTest, TestGetHostCacheStatePrefixMatchWithMamba) {
+    auto expected_reg = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    const std::string instance_id = "test_host_cache_state_mamba";
+    std::vector<LocationSpecInfo> location_spec_infos = {
+        LocationSpecInfo("full_0", 512),
+        LocationSpecInfo("linear_0", 512),
+        LocationSpecInfo("linear_1", 512),
+    };
+    std::vector<LocationSpecGroup> location_spec_groups = {
+        LocationSpecGroup("full_0", {"full_0"}),
+        LocationSpecGroup("linear_0", {"linear_0"}),
+        LocationSpecGroup("linear_1", {"linear_1"}),
+    };
+    ASSERT_EQ(expected_reg,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               instance_id,
+                                               64,
+                                               location_spec_infos,
+                                               createModelDeployment(),
+                                               location_spec_groups,
+                                               CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA));
+
+    auto metrics_registry = cache_manager_->metrics_registry_;
+    auto event_backend = std::make_shared<EventReportBackend>(metrics_registry);
+    {
+        StorageConfig cfg;
+        cfg.set_global_unique_name("event_backend_mamba");
+        cfg.set_type(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5);
+        cfg.set_storage_spec(std::make_shared<EventReportStorageSpec>());
+        event_backend->Open(cfg, "test_trace");
+    }
+    auto dsm = registry_manager_->data_storage_manager_;
+    dsm->storage_map_["event_backend_mamba"] = event_backend;
+    registry_manager_->instance_group_configs_["default"]->set_event_report_storage_candidates({"event_backend_mamba"});
+
+    auto report_specs = [&](const std::string &host, int64_t key, const std::vector<std::string> &spec_names) {
+        proto::meta::ReportEventRequest req;
+        req.set_instance_id(instance_id);
+        req.set_host_ip_port(host);
+        req.set_storage_type(proto::meta::ST_EVENT_REPORT_L1P5);
+
+        auto *reg = req.add_events();
+        reg->set_event_type(proto::meta::EVENT_NODE_REGISTER);
+        reg->mutable_node_register()->add_mediums("mem");
+
+        auto *ev = req.add_events();
+        ev->set_event_type(proto::meta::EVENT_BLOCK_ADD);
+        auto *ba = ev->mutable_block_add();
+        ba->set_block_key(std::to_string(key));
+        ba->set_medium("mem");
+        for (const auto &spec_name : spec_names) {
+            auto *spec = ba->add_specs();
+            spec->set_name(spec_name);
+            spec->set_uri("event_report://" + host + "/mem");
+        }
+
+        proto::meta::ReportEventResponse resp;
+        ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+    };
+
+    const std::string host_a = "10.0.1.1:8080";
+    const std::string host_b = "10.0.1.2:8080";
+    const std::string host_c = "10.0.1.3:8080";
+
+    report_specs(host_a, 100, {"full_0", "linear_0", "linear_1"});
+    report_specs(host_a, 200, {"full_0"});
+    report_specs(host_a, 300, {"full_0"});
+    report_specs(host_a, 300, {"linear_0", "linear_1"});
+    report_specs(host_a, 400, {"full_0", "linear_0"});
+
+    report_specs(host_b, 100, {"full_0"});
+    report_specs(host_b, 200, {"full_0"});
+    report_specs(host_b, 300, {"full_0"});
+    report_specs(host_b, 400, {"full_0", "linear_0", "linear_1"});
+
+    report_specs(host_c, 100, {"full_0"});
+    report_specs(host_c, 200, {"full_0"});
+
+    const std::string host_d = "10.0.1.4:8080";
+    report_specs(host_d, 200, {"full_0", "linear_0", "linear_1"});
+    report_specs(host_d, 300, {"full_0", "linear_0", "linear_1"});
+
+    auto find_prefix = [](const std::vector<CacheManager::HostCacheMatch> &hosts, const std::string &host) -> int64_t {
+        for (const auto &h : hosts) {
+            if (h.host_ip_port == host) {
+                return h.prefix_match_blocks;
+            }
+        }
+        return -1;
+    };
+
+    CacheManager::KeyVector keys = {100, 200, 300, 400, 500};
+    auto [ec, hosts] = cache_manager_->GetHostCacheState(
+        request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA, keys);
+    ASSERT_EQ(EC_OK, ec);
+
+    auto expect_mamba_matches = [&](const std::vector<CacheManager::HostCacheMatch> &matches) {
+        EXPECT_EQ(3, find_prefix(matches, host_a));
+        EXPECT_EQ(4, find_prefix(matches, host_b));
+        EXPECT_EQ(-1, find_prefix(matches, host_c));
+        EXPECT_EQ(-1, find_prefix(matches, host_d));
+    };
+    expect_mamba_matches(hosts);
+
+    auto [fallback_ec, fallback_hosts] = cache_manager_->GetHostCacheState(
+        request_context_.get(), instance_id, CacheManager::QueryType::QT_UNSPECIFIED, keys);
+    ASSERT_EQ(EC_OK, fallback_ec);
+    expect_mamba_matches(fallback_hosts);
+
+    {
+        CacheManager::KeyVector break_keys = {100, 500, 400};
+        auto [break_ec, break_hosts] = cache_manager_->GetHostCacheState(
+            request_context_.get(), instance_id, CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA, break_keys);
+        ASSERT_EQ(EC_OK, break_ec);
+        EXPECT_EQ(1, find_prefix(break_hosts, host_a));
+        EXPECT_EQ(-1, find_prefix(break_hosts, host_b));
+        EXPECT_EQ(-1, find_prefix(break_hosts, host_c));
+        EXPECT_EQ(-1, find_prefix(break_hosts, host_d));
+    }
+
+    {
+        CacheManager::KeyVector keys_without_host_d_first = {100, 200, 300};
+        auto [absent_ec, absent_hosts] =
+            cache_manager_->GetHostCacheState(request_context_.get(),
+                                              instance_id,
+                                              CacheManager::QueryType::QT_PREFIX_MATCH_WITH_MAMBA,
+                                              keys_without_host_d_first);
+        ASSERT_EQ(EC_OK, absent_ec);
+        EXPECT_EQ(3, find_prefix(absent_hosts, host_a));
+        EXPECT_EQ(-1, find_prefix(absent_hosts, host_b));
+        EXPECT_EQ(-1, find_prefix(absent_hosts, host_c));
+        EXPECT_EQ(-1, find_prefix(absent_hosts, host_d));
+    }
+
+    dsm->storage_map_.erase("event_backend_mamba");
 }
 // ===== 多层存储 Mark 消费（写路径）=====
 

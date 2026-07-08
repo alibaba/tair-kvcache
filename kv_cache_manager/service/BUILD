@@ -70,6 +70,7 @@ cc_library(
         ":grpc_wrapper",
         ":service_impl_base",
         "//kv_cache_manager/common",
+        "//kv_cache_manager/common:env_util",
         "//kv_cache_manager/config:leader_elector_base",
         "//kv_cache_manager/manager:cache_location_view",
         "//kv_cache_manager/manager:cache_manager",
@@ -79,6 +80,7 @@ cc_library(
         "//kv_cache_manager/service/util:proto_message_json_util",
         "//kv_cache_manager/service/util:service_access_log",
         "//kv_cache_manager/service/util:service_call_guard",
+        "@rapidjson",
     ],
 )
 

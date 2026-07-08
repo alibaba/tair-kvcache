@@ -2,6 +2,7 @@ import argparse
 from ..common.json_data import *
 from ..common.common_args import *
 
+
 class StorageQuota(JsonData):
     def __init__(self,
                  s_type: str,
@@ -9,22 +10,30 @@ class StorageQuota(JsonData):
         self._type = s_type
         self._capacity = capacity
         self.check()
-    
+
     def to_json_data(self) -> dict:
         return {
-            "storage_type" : self._type,
-            "capacity" : self._capacity
+            "storage_type": self._type,
+            "capacity": self._capacity
         }
-    
+
     def check(self) -> bool:
         _type = self._type.upper()
-        if not _type in ["ST_3FS", "ST_TAIRMEMPOOL", "ST_NFS"]:
-            raise RuntimeError(f"storage type {self._type} invalid, support ST_3FS|ST_TAIRMEMPOOL|ST_NFS")
+        supported_types = [
+            "ST_3FS",
+            "ST_TAIRMEMPOOL",
+            "ST_NFS",
+            "ST_EVENT_REPORT_L1P5",
+            "ST_EVENT_REPORT_L2",
+        ]
+        if _type not in supported_types:
+            raise RuntimeError(
+                f"storage type {self._type} invalid, support {'|'.join(supported_types)}")
         self._type = _type
         if self._capacity <= 0:
             raise RuntimeError(f"StorageQuota capacity {self._capacity} <= 0")
         return True
-    
+
     @classmethod
     def from_json_data(cls, json_data: dict):
         if JsonData.expect_exist("storage_type", json_data, str):
@@ -32,6 +41,7 @@ class StorageQuota(JsonData):
         if JsonData.expect_exist("capacity", json_data, (str, int)):
             capacity = int(json_data["capacity"])
         return cls(s_type, capacity)
+
 
 def split_storage_quotas_value(value: str):
     storage_quota_strs = split_strs(value, ';')
@@ -44,6 +54,7 @@ def split_storage_quotas_value(value: str):
         result.append(StorageQuota(s_type, int(capacity_str)))
     return result
 
+
 class InstanceGroupQuota(JsonData):
     def __init__(self,
                  capacity: int,
@@ -51,23 +62,23 @@ class InstanceGroupQuota(JsonData):
         self._capacity = capacity
         self._storage_qoutas = storage_qoutas
         self.check()
-    
+
     def to_json_data(self) -> dict:
         quota_configs = []
         for storage_quota in self._storage_qoutas:
             quota_configs.append(storage_quota.to_json_data())
         return {
-            "capacity" : self._capacity,
-            "quota_config" : quota_configs
+            "capacity": self._capacity,
+            "quota_config": quota_configs
         }
-    
+
     def check(self) -> bool:
         if self._capacity <= 0:
             raise RuntimeError(f"InstanceGroupQuota capacity {self._capacity} <= 0")
         for storage_qouta in self._storage_qoutas:
             storage_qouta.check()
         return True
-    
+
     @classmethod
     def from_json_data(cls, json_data: dict):
         if JsonData.expect_exist("capacity", json_data, (str, int)):
@@ -79,10 +90,11 @@ class InstanceGroupQuota(JsonData):
                 storage_qoutas.append(StorageQuota.from_json_data(storage_quota_obj))
         return cls(capacity, storage_qoutas)
 
+
 class ReclaimStrategy(JsonData):
     def __init__(self,
                  storage_unique_name: str = "",
-                 reclaim_policy: str = "POLICY_LRU", # POLICY_LRU|POLICY_LFU|POLICY_TTL
+                 reclaim_policy: str = "POLICY_LRU",  # POLICY_LRU|POLICY_LFU|POLICY_TTL
                  trigger_used_percentage: float = 0.8,
                  trigger_used_size: int = 0,
                  trigger_period_seconds: int = 0,
@@ -99,28 +111,28 @@ class ReclaimStrategy(JsonData):
         self._reclaim_step_percentage = reclaim_step_percentage
         self._delay_before_delete_ms = delay_before_delete_ms
         self.check()
-    
+
     def to_json_data(self) -> dict:
         return {
-            "storage_unique_name" : self._storage_unique_name,
-            "reclaim_policy" : self._reclaim_policy,
-            "trigger_strategy" : {
-                "used_size" : self._trigger_used_size,
-                "used_percentage" : self._trigger_used_percentage
+            "storage_unique_name": self._storage_unique_name,
+            "reclaim_policy": self._reclaim_policy,
+            "trigger_strategy": {
+                "used_size": self._trigger_used_size,
+                "used_percentage": self._trigger_used_percentage
             },
-            "trigger_period_seconds" : self._trigger_period_seconds,
-            "reclaim_step_size" : self._reclaim_step_size,
-            "reclaim_step_percentage" : self._reclaim_step_percentage,
-            "delay_before_delete_ms" : self._delay_before_delete_ms
+            "trigger_period_seconds": self._trigger_period_seconds,
+            "reclaim_step_size": self._reclaim_step_size,
+            "reclaim_step_percentage": self._reclaim_step_percentage,
+            "delay_before_delete_ms": self._delay_before_delete_ms
         }
-    
+
     def check(self) -> bool:
         _reclaim_policy = self._reclaim_policy.upper()
-        if not _reclaim_policy in ["POLICY_LRU", "POLICY_LFU", "POLICY_TTL"]:
+        if _reclaim_policy not in ["POLICY_LRU", "POLICY_LFU", "POLICY_TTL"]:
             raise RuntimeError(f"reclaim_policy {_reclaim_policy} invalid, support POLICY_LRU|POLICY_LFU|POLICY_TTL")
         self._reclaim_policy = _reclaim_policy
         return True
-    
+
     @classmethod
     def from_json_data(cls, json_data: dict):
         if JsonData.expect_exist("storage_unique_name", json_data, str):
@@ -141,28 +153,37 @@ class ReclaimStrategy(JsonData):
             reclaim_step_percentage = float(json_data["reclaim_step_percentage"])
         if JsonData.expect_exist("delay_before_delete_ms", json_data, (str, int)):
             delay_before_delete_ms = int(json_data["delay_before_delete_ms"])
-        return cls(storage_unique_name, reclaim_policy, trigger_used_percentage, trigger_used_size, trigger_period_seconds, reclaim_step_size, reclaim_step_percentage, delay_before_delete_ms)
+        return cls(
+            storage_unique_name,
+            reclaim_policy,
+            trigger_used_percentage,
+            trigger_used_size,
+            trigger_period_seconds,
+            reclaim_step_size,
+            reclaim_step_percentage,
+            delay_before_delete_ms)
+
 
 class MetaStorageBackendConfig(JsonData):
     def __init__(self,
-                 storage_type: str = "local", # local|redis|cached
-                 storage_uri: str = ""): # if set empty, no persistence
+                 storage_type: str = "local",  # local|redis|cached
+                 storage_uri: str = ""):  # if set empty, no persistence
         self._storage_type = storage_type
         self._storage_uri = storage_uri
         self.check()
-    
+
     def to_json_data(self) -> dict:
         return {
-            "storage_type" : self._storage_type,
-            "storage_uri" : self._storage_uri
+            "storage_type": self._storage_type,
+            "storage_uri": self._storage_uri
         }
-    
+
     def check(self) -> bool:
         _storage_type = self._storage_type.lower()
-        if not _storage_type in ["local", "redis", "cached"]:
+        if _storage_type not in ["local", "redis", "cached"]:
             raise RuntimeError(f"MetaStorageBackendConfig type {_storage_type} invalid, support local|redis|cached")
         self._storage_type = _storage_type
-    
+
     @classmethod
     def from_json_data(cls, json_data: dict):
         if JsonData.expect_exist("storage_type", json_data, str):
@@ -170,6 +191,7 @@ class MetaStorageBackendConfig(JsonData):
         if JsonData.expect_exist("storage_uri", json_data, str):
             storage_uri = json_data["storage_uri"]
         return cls(storage_type, storage_uri)
+
 
 def meta_storage_backend_config_value(value: str):
     config_strs = split_strs(value)
@@ -179,9 +201,10 @@ def meta_storage_backend_config_value(value: str):
         return MetaStorageBackendConfig(config_strs[0], config_strs[1])
     raise argparse.ArgumentTypeError(f"Invalid config value, expect 'type' or 'type,uri', got '{value}'")
 
+
 class MetaCachePolicyConfig(JsonData):
     def __init__(self,
-                 capacity: int = 10 * 1024, # MB
+                 capacity: int = 10 * 1024,  # MB
                  m_type: str = "LRU",
                  cache_shard_bits: int = 6,
                  high_pri_pool_ratio: float = 0.0):
@@ -193,18 +216,18 @@ class MetaCachePolicyConfig(JsonData):
 
     def to_json_data(self) -> dict:
         return {
-            "capacity" : self._capacity,
-            "type" : self._type,
-            "cache_shard_bits" : self._cache_shard_bits,
-            "high_pri_pool_ratio" : self._high_pri_pool_ratio
+            "capacity": self._capacity,
+            "type": self._type,
+            "cache_shard_bits": self._cache_shard_bits,
+            "high_pri_pool_ratio": self._high_pri_pool_ratio
         }
-    
+
     def check(self) -> bool:
         _type = self._type.upper()
         if _type != "LRU":
             raise RuntimeError(f"MetaCachePolicyConfig type {_type} invalid, only support LRU now")
         self._type = _type
-    
+
     @classmethod
     def from_json_data(cls, json_data: dict):
         if JsonData.expect_exist("capacity", json_data, (str, int)):
@@ -217,13 +240,14 @@ class MetaCachePolicyConfig(JsonData):
             high_pri_pool_ratio = json_data["high_pri_pool_ratio"]
         return cls(capacity, m_type, cache_shard_bits, high_pri_pool_ratio)
 
+
 class MetaIndexerConfig(JsonData):
     def __init__(self,
                  max_key_count: int = 1 * 1000 * 1000 * 1000,
                  mutex_shard_num: int = 512,
                  batch_key_size: int = 128,
                  meta_storage_backend_config: MetaStorageBackendConfig = MetaStorageBackendConfig(),
-                 meta_cache_policy_config : MetaCachePolicyConfig = MetaCachePolicyConfig()):
+                 meta_cache_policy_config: MetaCachePolicyConfig = MetaCachePolicyConfig()):
         self._max_key_count = max_key_count
         self._mutex_shard_num = mutex_shard_num
         self._batch_key_size = batch_key_size
@@ -233,17 +257,17 @@ class MetaIndexerConfig(JsonData):
 
     def to_json_data(self) -> dict:
         return {
-            "max_key_count" : self._max_key_count,
-            "mutex_shard_num" : self._mutex_shard_num,
-            "batch_key_size" : self._batch_key_size,
-            "meta_storage_backend_config" : self._meta_storage_backend_config.to_json_data(),
-            "meta_cache_policy_config" : self._meta_cache_policy_config.to_json_data()
+            "max_key_count": self._max_key_count,
+            "mutex_shard_num": self._mutex_shard_num,
+            "batch_key_size": self._batch_key_size,
+            "meta_storage_backend_config": self._meta_storage_backend_config.to_json_data(),
+            "meta_cache_policy_config": self._meta_cache_policy_config.to_json_data()
         }
-    
+
     def check(self) -> bool:
         self._meta_storage_backend_config.check()
         self._meta_cache_policy_config.check()
-    
+
     @classmethod
     def from_json_data(cls, json_data: dict):
         if JsonData.expect_exist("max_key_count", json_data, (str, int)):
@@ -253,10 +277,17 @@ class MetaIndexerConfig(JsonData):
         if JsonData.expect_exist("batch_key_size", json_data, (str, int)):
             batch_key_size = int(json_data["batch_key_size"])
         if JsonData.expect_exist("meta_storage_backend_config", json_data, dict):
-            meta_storage_backend_config = MetaStorageBackendConfig.from_json_data(json_data["meta_storage_backend_config"])
+            meta_storage_backend_config = MetaStorageBackendConfig.from_json_data(
+                json_data["meta_storage_backend_config"])
         if JsonData.expect_exist("meta_cache_policy_config", json_data, dict):
             meta_cache_policy_config = MetaCachePolicyConfig.from_json_data(json_data["meta_cache_policy_config"])
-        return cls(max_key_count, mutex_shard_num, batch_key_size, meta_storage_backend_config, meta_cache_policy_config)
+        return cls(
+            max_key_count,
+            mutex_shard_num,
+            batch_key_size,
+            meta_storage_backend_config,
+            meta_cache_policy_config)
+
 
 class CacheConfig(JsonData):
     def __init__(self,
@@ -270,15 +301,21 @@ class CacheConfig(JsonData):
 
     def to_json_data(self) -> dict:
         return {
-            "reclaim_strategy" : self._reclaim_strategy.to_json_data(),
-            "data_storage_strategy" : self._data_storage_strategy,
-            "meta_indexer_config" : self._meta_indexer_config.to_json_data()
+            "reclaim_strategy": self._reclaim_strategy.to_json_data(),
+            "data_storage_strategy": self._data_storage_strategy,
+            "meta_indexer_config": self._meta_indexer_config.to_json_data()
         }
-    
+
     def check(self) -> bool:
         _data_storage_strategy = self._data_storage_strategy.upper()
-        if _data_storage_strategy not in ["CPS_ALWAYS_3FS", "CPS_PREFER_3FS", "CPS_ALWAYS_TAIR_MEMPOOL", "CPS_PREFER_TAIR_MEMPOOL"]:
-            raise RuntimeError(f"data_storage_strategy {_data_storage_strategy} invalid, support CPS_ALWAYS_3FS|CPS_PREFER_3FS|CPS_ALWAYS_TAIR_MEMPOOL|CPS_PREFER_TAIR_MEMPOOL")
+        valid_strategies = [
+            "CPS_ALWAYS_3FS", "CPS_PREFER_3FS",
+            "CPS_ALWAYS_TAIR_MEMPOOL", "CPS_PREFER_TAIR_MEMPOOL",
+            "CPS_ALWAYS_VCNS_3FS", "CPS_PREFER_VCNS_3FS",
+        ]
+        if _data_storage_strategy not in valid_strategies:
+            raise RuntimeError(
+                f"data_storage_strategy {_data_storage_strategy} invalid, support { '|'.join(valid_strategies) }")
         self._data_storage_strategy = _data_storage_strategy
         self._reclaim_strategy.check()
         self._meta_indexer_config.check()
@@ -293,6 +330,7 @@ class CacheConfig(JsonData):
             meta_indexer_config = MetaIndexerConfig.from_json_data(json_data["meta_indexer_config"])
         return cls(data_storage_strategy, reclaim_strategy, meta_indexer_config)
 
+
 class InstanceGroup(JsonData):
     def __init__(self,
                  name: str,
@@ -304,7 +342,7 @@ class InstanceGroup(JsonData):
                  user_data: str = "",
                  version: int = 1,
                  extra_info: str = "",
-                 event_reporting_storage_candidates=None,
+                 event_report_storage_candidates=None,
                  ):
         self._name = name
         self._storage_candidates = storage_candidates
@@ -315,7 +353,7 @@ class InstanceGroup(JsonData):
         self._user_data = user_data
         self._version = version
         self._extra_info = extra_info
-        self._event_reporting_storage_candidates = event_reporting_storage_candidates or []
+        self._event_report_storage_candidates = event_report_storage_candidates or []
         self.check()
 
     def check(self):
@@ -332,20 +370,20 @@ class InstanceGroup(JsonData):
 
     def to_json_data(self) -> dict:
         data = {
-            "name" : self._name,
-            "storage_candidates" : self._storage_candidates,
-            "global_quota_group_name" : self._quota_group_name,
-            "max_instance_count" : self._max_instance_count,
-            "quota" : self._instance_group_quota.to_json_data(),
-            "cache_config" : self._cache_config.to_json_data(),
-            "user_data" : self._user_data,
-            "version" : self._version,
-            "extra_info" : self._extra_info,
+            "name": self._name,
+            "storage_candidates": self._storage_candidates,
+            "global_quota_group_name": self._quota_group_name,
+            "max_instance_count": self._max_instance_count,
+            "quota": self._instance_group_quota.to_json_data(),
+            "cache_config": self._cache_config.to_json_data(),
+            "user_data": self._user_data,
+            "version": self._version,
+            "extra_info": self._extra_info,
         }
-        if self._event_reporting_storage_candidates:
-            data["event_reporting_storage_candidates"] = self._event_reporting_storage_candidates
+        if self._event_report_storage_candidates:
+            data["event_report_storage_candidates"] = self._event_report_storage_candidates
         return data
-    
+
     @classmethod
     def from_json_data(cls, json_data: dict):
         if JsonData.expect_exist("name", json_data, str):
@@ -365,10 +403,13 @@ class InstanceGroup(JsonData):
         if JsonData.expect_exist("version", json_data, (str, int)):
             version = int(json_data["version"])
         extra_info = json_data.get("extra_info", "")
-        event_reporting_storage_candidates = json_data.get("event_reporting_storage_candidates", [])
-        return cls(name, storage_candidates, instance_group_quota, quota_group_name, max_instance_count, cache_config, user_data, version, extra_info, event_reporting_storage_candidates)
-    
+        event_report_storage_candidates = json_data.get("event_report_storage_candidates", [])
+        return cls(name, storage_candidates, instance_group_quota, quota_group_name, max_instance_count,
+                   cache_config, user_data, version, extra_info, event_report_storage_candidates)
+
 # create or update
+
+
 def parse_instance_group_args(is_create: bool):
     common_parser = create_common_parser()
     method = "create_instance_group" if is_create else "update_instance_group"
@@ -423,9 +464,17 @@ def parse_instance_group_args(is_create: bool):
     parser.add_argument(
         "--quota_configs",
         type=split_storage_quotas_value,
-        default=[StorageQuota("ST_NFS", 10000000000), StorageQuota("ST_3FS", 10000000000), StorageQuota("ST_TAIRMEMPOOL", 10000000000)] if is_create else argparse.SUPPRESS,
-        help="quota_configs, eg. ST_NFS,10000000000;ST_3FS,10000000000;ST_TAIRMEMPOOL,10000000000"
-    )
+        default=[
+            StorageQuota(
+                "ST_NFS",
+                10000000000),
+            StorageQuota(
+                "ST_3FS",
+                10000000000),
+            StorageQuota(
+                "ST_TAIRMEMPOOL",
+                10000000000)] if is_create else argparse.SUPPRESS,
+        help="quota_configs, eg. ST_NFS,10000000000;ST_3FS,10000000000;ST_TAIRMEMPOOL,10000000000")
 
     parser.add_argument(
         "--reclaim_policy",
@@ -479,7 +528,7 @@ def parse_instance_group_args(is_create: bool):
     parser.add_argument(
         "--search_cache_capacity",
         type=int,
-        default=10 * 1024 if is_create else argparse.SUPPRESS, # 10 * 1024 MB
+        default=10 * 1024 if is_create else argparse.SUPPRESS,  # 10 * 1024 MB
         help="search_cache_capacity(MB)"
     )
 
@@ -495,16 +544,16 @@ def parse_instance_group_args(is_create: bool):
         type=str,
         default="" if is_create else argparse.SUPPRESS,
         help=(
-            "Opaque JSON string passed through to clients (e.g. V6D). "
+            "Opaque JSON string passed through to clients (e.g. event report). "
             "On update, the provided JSON is merged into existing extra_info."
         )
     )
 
     parser.add_argument(
-        "--event_reporting_storage_candidates",
+        "--event_report_storage_candidates",
         type=split_strs,
         default=[] if is_create else argparse.SUPPRESS,
-        help="event_reporting_storage_candidates, eg. vineyard_default or vineyard_g1,vineyard_g2"
+        help="event_report_storage_candidates, eg. event_report_default or event_report_g1,event_report_g2"
     )
 
     args = parser.parse_args()

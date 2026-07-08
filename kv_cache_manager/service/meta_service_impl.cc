@@ -5,6 +5,8 @@
 #include <utility>
 #include <vector>
 
+#include "google/protobuf/message.h"
+#include "kv_cache_manager/common/env_util.h"
 #include "kv_cache_manager/common/error_code.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
@@ -19,14 +21,15 @@
 #include "kv_cache_manager/service/util/manager_message_proto_util.h"
 #include "kv_cache_manager/service/util/proto_message_json_util.h"
 #include "kv_cache_manager/service/util/service_call_guard.h"
+#include "rapidjson/stringbuffer.h"
+#include "rapidjson/writer.h"
 
 // TODO(rui): move into common.h
-#define API_CALL_GUARD(api_name, is_leader_only)                                                                       \
+#define API_CALL_GUARD_WITH_DEBUG(api_name, is_leader_only, request_debug_expr, response_debug_expr)                   \
     request_context->set_api_name(api_name);                                                                           \
     response->mutable_header()->set_request_id(request_context->request_id());                                         \
     {                                                                                                                  \
-        std::string request_debug;                                                                                     \
-        ProtoMessageJsonUtil::ToJson(request, request_debug);                                                          \
+        std::string request_debug = (request_debug_expr);                                                              \
         request_context->set_request_debug(request_debug);                                                             \
     }                                                                                                                  \
     if (!CheckAndIncrementRequestCount(is_leader_only)) {                                                              \
@@ -41,11 +44,14 @@
     }                                                                                                                  \
     ServiceCallGuard service_call_guard(                                                                               \
         cache_manager_.get(), request_context, metrics_reporter_.get(), [request_context, response, this]() {          \
-            std::string response_debug;                                                                                \
-            ProtoMessageJsonUtil::ToJson(response, response_debug);                                                    \
+            std::string response_debug = (response_debug_expr);                                                        \
             request_context->set_response_debug(response_debug);                                                       \
             DecrementRequestCount(is_leader_only);                                                                     \
         });
+
+#define API_CALL_GUARD(api_name, is_leader_only)                                                                       \
+    API_CALL_GUARD_WITH_DEBUG(                                                                                         \
+        api_name, is_leader_only, BuildProtoMessageDebugJson(request), BuildProtoMessageDebugJson(response))
 
 #define SET_SPAN_TRACER_STR_IN_HEADER(request_context_pointer)                                                         \
     if (request_context_pointer->need_span_tracer()) {                                                                 \
@@ -101,6 +107,148 @@ kv_cache_manager::proto::meta::ErrorCode ToMetaPbError(kv_cache_manager::ErrorCo
 } // anonymous namespace
 
 namespace kv_cache_manager {
+
+namespace {
+
+constexpr const char *kReportEventFullAccessLogEnv = "KVCM_REPORT_EVENT_FULL_ACCESS_LOG";
+
+std::string BuildProtoMessageDebugJson(const google::protobuf::Message *message) {
+    std::string debug_json;
+    ProtoMessageJsonUtil::ToJson(message, debug_json);
+    return debug_json;
+}
+
+bool IsReportEventFullAccessLogEnabled() { return EnvUtil::GetEnv(kReportEventFullAccessLogEnv, false); }
+
+const char *FirstBlockKeyFromEvent(const proto::meta::EventItem &event) {
+    if (event.has_block_add()) {
+        return event.block_add().block_key().c_str();
+    }
+    if (event.has_block_delete()) {
+        return event.block_delete().block_key().c_str();
+    }
+    if (event.has_block_snapshot() && event.block_snapshot().blocks_size() > 0) {
+        return event.block_snapshot().blocks(0).block_key().c_str();
+    }
+    return "";
+}
+
+std::string BuildReportEventRequestAccessLogSummary(const proto::meta::ReportEventRequest *request) {
+    if (IsReportEventFullAccessLogEnabled()) {
+        return BuildProtoMessageDebugJson(request);
+    }
+
+    int node_register_count = 0;
+    int heartbeat_count = 0;
+    int host_down_count = 0;
+    int block_add_count = 0;
+    int block_delete_count = 0;
+    int block_snapshot_count = 0;
+    int unknown_count = 0;
+    std::string first_event_type = "N/A";
+    std::string first_block_key = "N/A";
+
+    for (int i = 0; i < request->events_size(); ++i) {
+        const auto &event = request->events(i);
+        if (i == 0) {
+            first_event_type = proto::meta::ReportEventType_Name(event.event_type());
+            const char *block_key = FirstBlockKeyFromEvent(event);
+            if (block_key[0] != '\0') {
+                first_block_key = block_key;
+            }
+        }
+
+        switch (event.event_type()) {
+        case proto::meta::EVENT_NODE_REGISTER:
+            ++node_register_count;
+            break;
+        case proto::meta::EVENT_HEARTBEAT:
+            ++heartbeat_count;
+            break;
+        case proto::meta::EVENT_HOST_DOWN:
+            ++host_down_count;
+            break;
+        case proto::meta::EVENT_BLOCK_ADD:
+            ++block_add_count;
+            break;
+        case proto::meta::EVENT_BLOCK_DELETE:
+            ++block_delete_count;
+            break;
+        case proto::meta::EVENT_BLOCK_SNAPSHOT:
+            ++block_snapshot_count;
+            break;
+        default:
+            ++unknown_count;
+            break;
+        }
+    }
+
+    rapidjson::StringBuffer sb;
+    rapidjson::Writer<rapidjson::StringBuffer> writer(sb);
+    writer.StartObject();
+    writer.Key("trace_id");
+    writer.String(request->trace_id().c_str());
+    writer.Key("instance_id");
+    writer.String(request->instance_id().c_str());
+    writer.Key("host_ip_port");
+    writer.String(request->host_ip_port().c_str());
+    writer.Key("storage_type");
+    writer.String(proto::meta::StorageType_Name(request->storage_type()).c_str());
+    writer.Key("event_count");
+    writer.Int(request->events_size());
+    writer.Key("node_register_count");
+    writer.Int(node_register_count);
+    writer.Key("heartbeat_count");
+    writer.Int(heartbeat_count);
+    writer.Key("host_down_count");
+    writer.Int(host_down_count);
+    writer.Key("block_add_count");
+    writer.Int(block_add_count);
+    writer.Key("block_delete_count");
+    writer.Int(block_delete_count);
+    writer.Key("block_snapshot_count");
+    writer.Int(block_snapshot_count);
+    writer.Key("unknown_count");
+    writer.Int(unknown_count);
+    writer.Key("first_event_type");
+    writer.String(first_event_type.c_str());
+    writer.Key("first_block_key");
+    writer.String(first_block_key.c_str());
+    writer.EndObject();
+    return sb.GetString();
+}
+
+std::string BuildReportEventResponseAccessLogSummary(const proto::meta::ReportEventResponse *response) {
+    if (IsReportEventFullAccessLogEnabled()) {
+        return BuildProtoMessageDebugJson(response);
+    }
+
+    int failed_item_count = 0;
+    for (const auto item_result : response->item_results()) {
+        if (item_result != proto::meta::OK) {
+            ++failed_item_count;
+        }
+    }
+
+    const auto &status = response->header().status();
+    rapidjson::StringBuffer sb;
+    rapidjson::Writer<rapidjson::StringBuffer> writer(sb);
+    writer.StartObject();
+    writer.Key("status_code");
+    writer.String(proto::meta::ErrorCode_Name(status.code()).c_str());
+    writer.Key("status_message");
+    writer.String(status.message().c_str());
+    writer.Key("item_results_count");
+    writer.Int(response->item_results_size());
+    writer.Key("failed_item_count");
+    writer.Int(failed_item_count);
+    writer.Key("extra_info_size");
+    writer.Uint64(response->extra_info().size());
+    writer.EndObject();
+    return sb.GetString();
+}
+
+} // namespace
 
 MetaServiceImpl::MetaServiceImpl(std::shared_ptr<CacheManager> cache_manager,
                                  std::shared_ptr<MetricsReporter> metrics_reporter,
@@ -173,13 +321,15 @@ void MetaServiceImpl::RegisterInstance(RequestContext *request_context,
     }
     std::vector<LocationSpecGroup> location_spec_groups;
     ProtoConvert::LocationSpecGroupsFromProto(request->location_spec_groups(), location_spec_groups);
-    auto [ec_info, storage_configs] = cache_manager_->RegisterInstance(request_context,
-                                                                       request->instance_group(),
-                                                                       request->instance_id(),
-                                                                       request->block_size(),
-                                                                       location_spec_infos,
-                                                                       model_deployment_req,
-                                                                       location_spec_groups);
+    auto [ec_info, storage_configs] =
+        cache_manager_->RegisterInstance(request_context,
+                                         request->instance_group(),
+                                         request->instance_id(),
+                                         request->block_size(),
+                                         location_spec_infos,
+                                         model_deployment_req,
+                                         location_spec_groups,
+                                         static_cast<CacheManager::QueryType>(request->query_type()));
 
     if (ec_info != EC_OK) {
         status->set_code(ToMetaPbError(ec_info));
@@ -721,7 +871,10 @@ void MetaServiceImpl::ReportEvent(RequestContext *request_context,
                                   const proto::meta::ReportEventRequest *request,
                                   proto::meta::ReportEventResponse *response) {
     SPAN_TRACER(request_context);
-    API_CALL_GUARD("ReportEvent", true);
+    API_CALL_GUARD_WITH_DEBUG("ReportEvent",
+                              true,
+                              BuildReportEventRequestAccessLogSummary(request),
+                              BuildReportEventResponseAccessLogSummary(response));
     auto *header = response->mutable_header();
 
     KVCM_LOG_INFO("[traceId: %s] ReportEvent called, instance_id: %s, host_ip_port: %s, event_count: %d",
@@ -743,6 +896,60 @@ void MetaServiceImpl::ReportEvent(RequestContext *request_context,
     auto *smc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
     KVCM_METRICS_COLLECTOR_SET_METRICS(smc, service, error_code, (ec != EC_OK) ? 1.0 : 0.0);
     request_context->set_status_code(header->status().code());
+    SET_SPAN_TRACER_STR_IN_HEADER(request_context);
+}
+
+void MetaServiceImpl::GetHostCacheState(RequestContext *request_context,
+                                        const proto::meta::GetHostCacheStateRequest *request,
+                                        proto::meta::GetHostCacheStateResponse *response) {
+    SPAN_TRACER(request_context);
+    API_CALL_GUARD("GetHostCacheState", true);
+    auto *header = response->mutable_header();
+    auto *status = header->mutable_status();
+    std::string invalid_fields = "missing or invalid fields: ";
+    if (request->instance_id().empty()) {
+        CHECK_REQUIRED_FIELDS_VALIDATION("GetHostCacheState", "instance_id", true);
+        SET_SPAN_TRACER_STR_IN_HEADER(request_context);
+        return;
+    }
+    if (request->block_cache_keys().empty()) {
+        CHECK_REQUIRED_FIELDS_VALIDATION("GetHostCacheState", "block_cache_keys", true);
+        SET_SPAN_TRACER_STR_IN_HEADER(request_context);
+        return;
+    }
+
+    CacheManager::KeyVector keys(request->block_cache_keys().begin(), request->block_cache_keys().end());
+    std::vector<std::string> mediums(request->medium().begin(), request->medium().end());
+
+    KVCM_LOG_INFO("[traceId: %s] GetHostCacheState called, instance_id: %s, block_cache_keys_count: %d",
+                  request->trace_id().c_str(),
+                  request->instance_id().c_str(),
+                  request->block_cache_keys_size());
+
+    auto [ec, host_matches] =
+        cache_manager_->GetHostCacheState(request_context,
+                                          request->instance_id(),
+                                          static_cast<CacheManager::QueryType>(request->query_type()),
+                                          keys,
+                                          mediums);
+    if (ec != EC_OK) {
+        status->set_code(ToMetaPbError(ec));
+        request_context->set_status_code(status->code());
+        status->set_message("Failed to get host cache state: " + request_context->error_tracer()->ToJsonString());
+        KVCM_LOG_ERROR("[traceId: %s] GetHostCacheState failed, ec: %d", request->trace_id().c_str(), ec);
+    } else {
+        for (const auto &match : host_matches) {
+            auto *host_match = response->add_hosts();
+            host_match->set_host_ip_port(match.host_ip_port);
+            host_match->set_prefix_match_blocks(match.prefix_match_blocks);
+        }
+        status->set_code(proto::meta::OK);
+        request_context->set_status_code(status->code());
+        status->set_message("Host cache state retrieved successfully");
+        KVCM_LOG_INFO("[traceId: %s] GetHostCacheState succeeded, returned %d hosts",
+                      request->trace_id().c_str(),
+                      response->hosts_size());
+    }
     SET_SPAN_TRACER_STR_IN_HEADER(request_context);
 }
 

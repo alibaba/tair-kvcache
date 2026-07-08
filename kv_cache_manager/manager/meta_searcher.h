@@ -18,11 +18,12 @@ using SubmitDelReqFunc = std::function<void(const std::vector<std::int64_t> &blk
                                             const std::vector<std::vector<std::string>> &loc_ids)>;
 
 class MetaIndexer;
+class LocationSpecGroup;
 
 enum class LocationSelectStrategy : int32_t {
     LSS_UNSPECIFIED = 0,
-    LSS_V6D_PREFIX = 1,   // 对应v6d侧，best_effort = false
-    LSS_V6D_COVERAGE = 2, // 对应v6d侧，best_effort = true
+    LSS_V6D_PREFIX = 1,   // 对应 v6d 侧，best_effort = false
+    LSS_V6D_COVERAGE = 2, // 对应 v6d 侧，best_effort = true
     LSS_WEIGHTED_RANDOM = 3,
 };
 
@@ -37,6 +38,11 @@ public:
     using KeyVector = std::vector<KeyType>;
     using UriType = std::string;
     using UriVector = std::vector<UriType>;
+
+    struct HostCacheMatch {
+        std::string host_ip_port;
+        int64_t prefix_match_blocks;
+    };
 
     explicit MetaSearcher(const std::shared_ptr<MetaIndexer> &meta_manager);
     MetaSearcher(const std::shared_ptr<MetaIndexer> &meta_indexer,
@@ -65,6 +71,15 @@ public:
                                           int32_t sw_size,
                                           CacheLocationVector &out_locations,
                                           SelectLocationPolicy *policy) const;
+    ErrorCode PrefixMatchByHost(RequestContext *request_context,
+                                const KeyVector &keys,
+                                const std::vector<std::string> &medium_filter,
+                                std::vector<HostCacheMatch> &out_matches) const;
+    ErrorCode PrefixMatchWithMambaByHost(RequestContext *request_context,
+                                         const KeyVector &keys,
+                                         const std::vector<std::string> &medium_filter,
+                                         const std::vector<LocationSpecGroup> &location_spec_groups,
+                                         std::vector<HostCacheMatch> &out_matches) const;
     ErrorCode BatchGetLocation(RequestContext *request_context,
                                const KeyVector &keys,
                                const BlockMask &input_mask,
@@ -73,16 +88,24 @@ public:
                                const KeyVector &keys,
                                const CacheLocationVector &locations,
                                std::vector<std::string> &out_location_ids);
-    struct UpsertLocation {
+    struct MergeLocationSpecsTask {
         std::string location_id;
         DataStorageType type;
         CacheLocationStatus status;
         std::vector<LocationSpec> specs;
     };
-    ErrorCode BatchUpsertLocations(RequestContext *request_context,
-                                   const KeyVector &keys,
-                                   const std::vector<std::vector<UpsertLocation>> &new_locations_per_key,
-                                   std::vector<ErrorCode> &out_per_key_ec);
+    ErrorCode BatchMergeLocationSpecs(RequestContext *request_context,
+                                      const KeyVector &keys,
+                                      const std::vector<std::vector<MergeLocationSpecsTask>> &tasks_per_key,
+                                      std::vector<ErrorCode> &out_per_key_ec);
+    struct DeleteLocationSpecsTask {
+        std::string location_id;
+        std::vector<std::string> spec_names;
+    };
+    ErrorCode BatchDeleteLocationSpecs(RequestContext *request_context,
+                                       const KeyVector &keys,
+                                       const std::vector<std::vector<DeleteLocationSpecsTask>> &tasks_per_key,
+                                       std::vector<std::vector<ErrorCode>> &out_batch_results);
     struct LocationUpdateTask {
         std::string location_id;
         CacheLocationStatus new_status;
@@ -108,10 +131,6 @@ public:
                                      const KeyVector &keys,
                                      const std::vector<std::vector<LocationCADTask>> &batch_tasks,
                                      std::vector<std::vector<ErrorCode>> &out_batch_results);
-    ErrorCode BatchDeleteLocation(RequestContext *request_context,
-                                  const KeyVector &keys,
-                                  const std::vector<std::string> &location_ids,
-                                  std::vector<ErrorCode> &results);
     ErrorCode BatchDeleteLocations(RequestContext *request_context,
                                    const KeyVector &keys,
                                    const LocationIdsPerKey &location_ids_per_key,
