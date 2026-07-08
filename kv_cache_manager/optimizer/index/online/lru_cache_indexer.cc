@@ -96,40 +96,55 @@ bool LruCacheIndexer::LookupAndInsert(Cache *cache,
 
 void LruCacheIndexer::ProcessKeys(const std::vector<int64_t> &keys,
                                   std::vector<int64_t> &hit_count,
-                                  int64_t &max_hit_count) {
+                                  int64_t &max_hit_count,
+                                  std::vector<bool> *key_hits) {
     if (linear_step_ == 0) {
-        ProcessKeysFullAttention(keys, hit_count, max_hit_count);
+        ProcessKeysFullAttention(keys, hit_count, max_hit_count, key_hits);
     } else {
-        ProcessKeysLinearAttention(keys, hit_count, max_hit_count);
+        ProcessKeysLinearAttention(keys, hit_count, max_hit_count, key_hits);
     }
 }
 
 void LruCacheIndexer::ProcessKeysFullAttention(const std::vector<int64_t> &keys,
                                                std::vector<int64_t> &hit_count,
-                                               int64_t &max_hit_count) {
+                                               int64_t &max_hit_count,
+                                               std::vector<bool> *key_hits) {
     const size_t num_caps = caches_.size();
     const int64_t total_keys = static_cast<int64_t>(keys.size());
     hit_count.assign(num_caps, total_keys);
     max_hit_count = max_cache_ ? total_keys : -1;
+    if (key_hits) {
+        key_hits->assign(keys.size(), false);
+    }
 
     for (int64_t i = 0; i < total_keys; i++) {
         int64_t key = keys[i];
         std::string_view key_sv(reinterpret_cast<const char *>(&key), sizeof(key));
 
         bool is_new_key = true;
+        bool largest_cache_hit = false;
         for (size_t j = 0; j < num_caps; j++) {
-            if (!LookupAndInsert(caches_[j].get(), key_sv, is_new_key)) {
+            const bool hit = LookupAndInsert(caches_[j].get(), key_sv, is_new_key);
+            if (j + 1 == num_caps) {
+                largest_cache_hit = hit;
+            }
+            if (!hit) {
                 if (i < hit_count[j]) {
                     hit_count[j] = i;
                 }
             }
         }
+        bool max_cache_hit = false;
         if (max_cache_) {
-            if (!LookupAndInsert(max_cache_.get(), key_sv, is_new_key)) {
+            max_cache_hit = LookupAndInsert(max_cache_.get(), key_sv, is_new_key);
+            if (!max_cache_hit) {
                 if (i < max_hit_count) {
                     max_hit_count = i;
                 }
             }
+        }
+        if (key_hits) {
+            (*key_hits)[i] = largest_cache_hit;
         }
 
         if (is_new_key) {
@@ -140,12 +155,16 @@ void LruCacheIndexer::ProcessKeysFullAttention(const std::vector<int64_t> &keys,
 
 void LruCacheIndexer::ProcessKeysLinearAttention(const std::vector<int64_t> &keys,
                                                  std::vector<int64_t> &hit_count,
-                                                 int64_t &max_hit_count) {
+                                                 int64_t &max_hit_count,
+                                                 std::vector<bool> *key_hits) {
     const size_t num_caps = caches_.size();
     const int64_t total_keys = static_cast<int64_t>(keys.size());
     std::vector<int64_t> first_miss(num_caps, total_keys);
     max_hit_count = max_cache_ ? 0 : -1;
     int64_t max_first_miss = total_keys;
+    if (key_hits) {
+        key_hits->assign(keys.size(), false);
+    }
 
     std::vector<int64_t> last_checkpoint(num_caps, -1);
     int64_t max_last_checkpoint = -1;
@@ -157,9 +176,15 @@ void LruCacheIndexer::ProcessKeysLinearAttention(const std::vector<int64_t> &key
         const int64_t desired_charge = is_linear ? size_full_linear_ : size_full_only_;
 
         bool is_new_key = true;
+        bool largest_cache_hit = false;
         for (size_t j = 0; j < num_caps; j++) {
             bool is_checkpoint = false;
-            if (LookupAndInsert(caches_[j].get(), key_sv, is_linear, desired_charge, is_new_key, is_checkpoint)) {
+            const bool hit =
+                LookupAndInsert(caches_[j].get(), key_sv, is_linear, desired_charge, is_new_key, is_checkpoint);
+            if (j + 1 == num_caps) {
+                largest_cache_hit = hit;
+            }
+            if (hit) {
                 if (is_checkpoint && i < first_miss[j]) {
                     last_checkpoint[j] = i;
                 }
@@ -169,9 +194,12 @@ void LruCacheIndexer::ProcessKeysLinearAttention(const std::vector<int64_t> &key
                 }
             }
         }
+        bool max_cache_hit = false;
         if (max_cache_) {
             bool is_checkpoint = false;
-            if (LookupAndInsert(max_cache_.get(), key_sv, is_linear, desired_charge, is_new_key, is_checkpoint)) {
+            max_cache_hit =
+                LookupAndInsert(max_cache_.get(), key_sv, is_linear, desired_charge, is_new_key, is_checkpoint);
+            if (max_cache_hit) {
                 if (is_checkpoint && i < max_first_miss) {
                     max_last_checkpoint = i;
                 }
@@ -180,6 +208,9 @@ void LruCacheIndexer::ProcessKeysLinearAttention(const std::vector<int64_t> &key
                     max_first_miss = i;
                 }
             }
+        }
+        if (key_hits) {
+            (*key_hits)[i] = largest_cache_hit;
         }
 
         if (is_new_key) {

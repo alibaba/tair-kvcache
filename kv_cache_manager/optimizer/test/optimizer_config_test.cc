@@ -1,3 +1,5 @@
+#include <limits>
+
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/optimizer/config/optimizer_config.h"
 #include "kv_cache_manager/optimizer/config/optimizer_instance_group.h"
@@ -64,6 +66,15 @@ TEST_F(OptimizerInstanceGroupTest, ValidateWithCapacity) {
     group.set_capacity_gb({1.0});
     std::string fields;
     EXPECT_TRUE(group.ValidateRequiredFields(fields));
+}
+
+TEST_F(OptimizerInstanceGroupTest, ValidateCapacityTooLargeFails) {
+    OptimizerInstanceGroup group;
+    group.set_name("g1");
+    group.set_capacity_gb({static_cast<double>(std::numeric_limits<int64_t>::max())});
+    std::string fields;
+    EXPECT_FALSE(group.ValidateRequiredFields(fields));
+    EXPECT_NE(std::string::npos, fields.find("capacity_gb"));
 }
 
 TEST_F(OptimizerInstanceGroupTest, ValidateInvalidEvictionPolicyType) {

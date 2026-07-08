@@ -25,8 +25,10 @@ public:
               int64_t size_full_linear,
               int32_t linear_step) override;
 
-    void
-    ProcessKeys(const std::vector<int64_t> &keys, std::vector<int64_t> &hit_count, int64_t &max_hit_count) override;
+    void ProcessKeys(const std::vector<int64_t> &keys,
+                     std::vector<int64_t> &hit_count,
+                     int64_t &max_hit_count,
+                     std::vector<bool> *key_hits = nullptr) override;
 
     int64_t unique_count() const override;
     int64_t eviction_count() const override;

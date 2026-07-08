@@ -92,6 +92,12 @@ public:
 
     ErrorCode RegisterInstance(const OptimizerInstanceInfo &instance_info, RegisterInstanceResult &result);
 
+    ErrorCode CreateInstanceGroup(const OptimizerInstanceGroup &instance_group);
+
+    ErrorCode UpdateInstanceGroup(const OptimizerInstanceGroup &instance_group);
+
+    ErrorCode RemoveInstanceGroup(const std::string &instance_group_name);
+
     ErrorCode RemoveInstance(const std::string &instance_id);
 
     ErrorCode
@@ -115,6 +121,10 @@ private:
                                        RegisterInstanceResult &result);
 
     static int64_t ComputeSizeForGroup(const std::vector<LocationSpecInfo> &specs, const LocationSpecGroup &group);
+
+    bool HasActiveInstanceInGroup(const std::string &instance_group_name) const;
+
+    bool HasPersistedInstanceInGroup(const std::string &instance_group_name) const;
 
     std::shared_ptr<OptimizerRegistryManager> registry_manager_;
     mutable std::mutex admin_ops_mutex_;

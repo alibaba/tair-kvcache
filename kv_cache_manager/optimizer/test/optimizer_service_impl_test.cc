@@ -199,6 +199,45 @@ TEST_F(OptimizerServiceImplTest, RemoveInstanceGroupWithRegisteredInstanceFails)
     EXPECT_EQ(proto::optimizer::OK, get_resp.header().status().code());
 }
 
+TEST_F(OptimizerServiceImplTest, RemoveInstanceGroupWithActiveInstanceOnlyFails) {
+    CreateTestGroup("grp_active_only");
+
+    auto reg_req = MakeRegisterRequest("grp_active_only", "inst1", 1024);
+    proto::optimizer::OptimizerRegisterInstanceResponse reg_resp;
+    RequestContext ctx("trace1", nullptr);
+    service_->RegisterInstance(&ctx, &reg_req, &reg_resp);
+    ASSERT_EQ(proto::optimizer::OK, reg_resp.header().status().code());
+    ASSERT_EQ(EC_OK, registry_->DeleteInstanceInfo("inst1"));
+
+    proto::optimizer::RemoveInstanceGroupRequest req;
+    req.set_trace_id("t1");
+    req.set_name("grp_active_only");
+    proto::optimizer::CommonResponse resp;
+    service_->RemoveInstanceGroup(&ctx, &req, &resp);
+    EXPECT_EQ(proto::optimizer::INVALID_ARGUMENT, resp.header().status().code());
+}
+
+TEST_F(OptimizerServiceImplTest, UpdateInstanceGroupWithRegisteredInstanceFails) {
+    CreateTestGroup("grp_update_with_inst");
+
+    auto reg_req = MakeRegisterRequest("grp_update_with_inst", "inst1", 1024);
+    proto::optimizer::OptimizerRegisterInstanceResponse reg_resp;
+    RequestContext ctx("trace1", nullptr);
+    service_->RegisterInstance(&ctx, &reg_req, &reg_resp);
+    ASSERT_EQ(proto::optimizer::OK, reg_resp.header().status().code());
+
+    proto::optimizer::UpdateInstanceGroupRequest req;
+    req.set_trace_id("t1");
+    auto *g = req.mutable_instance_group();
+    g->set_name("grp_update_with_inst");
+    g->add_capacity_gb(4.0);
+    g->set_eviction_policy(proto::optimizer::OPTIMIZER_EVICTION_POLICY_LRU);
+
+    proto::optimizer::CommonResponse resp;
+    service_->UpdateInstanceGroup(&ctx, &req, &resp);
+    EXPECT_EQ(proto::optimizer::INVALID_ARGUMENT, resp.header().status().code());
+}
+
 TEST_F(OptimizerServiceImplTest, ListInstanceGroups) {
     CreateTestGroup("list_g1");
     CreateTestGroup("list_g2");

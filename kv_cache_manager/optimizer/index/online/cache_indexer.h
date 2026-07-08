@@ -37,8 +37,13 @@ public:
     // keys: the block keys in query order.
     // hit_count: output vector sized to number of capacity tiers, filled with
     //            the count of contiguous prefix hits for each tier.
-    virtual void
-    ProcessKeys(const std::vector<int64_t> &keys, std::vector<int64_t> &hit_count, int64_t &max_hit_count) = 0;
+    // key_hits: optional output, one entry per input key. When provided, it is
+    // filled with whether the key was resident before this query updated the
+    // indexer. This is separate from prefix hit_count.
+    virtual void ProcessKeys(const std::vector<int64_t> &keys,
+                             std::vector<int64_t> &hit_count,
+                             int64_t &max_hit_count,
+                             std::vector<bool> *key_hits = nullptr) = 0;
 
     virtual int64_t unique_count() const = 0;
 

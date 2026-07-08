@@ -1,8 +1,16 @@
 #include "kv_cache_manager/optimizer/config/optimizer_instance_group.h"
 
 #include <cmath>
+#include <limits>
 
 namespace kv_cache_manager {
+
+namespace {
+
+constexpr double kBytesPerGb = 1024.0 * 1024.0 * 1024.0;
+constexpr double kMaxCapacityGbForInt64 = static_cast<double>(std::numeric_limits<int64_t>::max()) / kBytesPerGb;
+
+} // namespace
 
 bool OptimizerInstanceGroup::FromRapidValue(const rapidjson::Value &rapid_value) {
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "name", name_, std::string(""));
@@ -41,6 +49,11 @@ bool OptimizerInstanceGroup::ValidateRequiredFields(std::string &invalid_fields)
         if (!std::isfinite(cap) || cap <= 0.0) {
             valid = false;
             local_invalid_fields += "{capacity_gb: non-positive or non-finite value}";
+            break;
+        }
+        if (cap > kMaxCapacityGbForInt64) {
+            valid = false;
+            local_invalid_fields += "{capacity_gb: value exceeds int64 byte range}";
             break;
         }
     }

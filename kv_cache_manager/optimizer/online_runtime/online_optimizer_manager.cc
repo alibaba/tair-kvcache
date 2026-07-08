@@ -45,6 +45,56 @@ int64_t OnlineOptimizerManager::ComputeSizeForGroup(const std::vector<LocationSp
     return total;
 }
 
+bool OnlineOptimizerManager::HasActiveInstanceInGroup(const std::string &instance_group_name) const {
+    std::shared_lock lock(instances_mutex_);
+    for (const auto &[_, state] : instances_) {
+        if (state && state->instance_info && state->instance_info->instance_group_name() == instance_group_name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool OnlineOptimizerManager::HasPersistedInstanceInGroup(const std::string &instance_group_name) const {
+    return registry_manager_ && !registry_manager_->ListInstanceInfos(instance_group_name).empty();
+}
+
+ErrorCode OnlineOptimizerManager::CreateInstanceGroup(const OptimizerInstanceGroup &instance_group) {
+    if (!registry_manager_) {
+        return EC_ERROR;
+    }
+    std::lock_guard admin_guard(admin_ops_mutex_);
+    return registry_manager_->CreateInstanceGroup(instance_group);
+}
+
+ErrorCode OnlineOptimizerManager::UpdateInstanceGroup(const OptimizerInstanceGroup &instance_group) {
+    if (!registry_manager_) {
+        return EC_ERROR;
+    }
+
+    std::lock_guard admin_guard(admin_ops_mutex_);
+    if (HasActiveInstanceInGroup(instance_group.name()) || HasPersistedInstanceInGroup(instance_group.name())) {
+        KVCM_LOG_ERROR("UpdateInstanceGroup failed: instance group[%s] still has registered instances",
+                       instance_group.name().c_str());
+        return EC_BADARGS;
+    }
+    return registry_manager_->UpdateInstanceGroup(instance_group);
+}
+
+ErrorCode OnlineOptimizerManager::RemoveInstanceGroup(const std::string &instance_group_name) {
+    if (!registry_manager_) {
+        return EC_ERROR;
+    }
+
+    std::lock_guard admin_guard(admin_ops_mutex_);
+    if (HasActiveInstanceInGroup(instance_group_name) || HasPersistedInstanceInGroup(instance_group_name)) {
+        KVCM_LOG_ERROR("RemoveInstanceGroup failed: instance group[%s] still has registered instances",
+                       instance_group_name.c_str());
+        return EC_BADARGS;
+    }
+    return registry_manager_->RemoveInstanceGroup(instance_group_name);
+}
+
 ErrorCode OnlineOptimizerManager::RegisterInstance(const OptimizerInstanceInfo &instance_info,
                                                    RegisterInstanceResult &result) {
     const auto &instance_id = instance_info.instance_id();

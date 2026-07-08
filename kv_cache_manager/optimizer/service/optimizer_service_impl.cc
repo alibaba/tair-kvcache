@@ -95,7 +95,7 @@ OptimizerServiceImpl::OptimizerServiceImpl(std::shared_ptr<OnlineOptimizerManage
                                            std::shared_ptr<OptimizerMetricsReporter> metrics_reporter)
     : manager_(std::move(manager)), metrics_reporter_(std::move(metrics_reporter)) {}
 
-// InstanceGroup CRUD — directly call registry_manager
+// InstanceGroup CRUD
 
 void OptimizerServiceImpl::CreateInstanceGroup(RequestContext *request_context,
                                                const proto::optimizer::CreateInstanceGroupRequest *request,
@@ -103,7 +103,6 @@ void OptimizerServiceImpl::CreateInstanceGroup(RequestContext *request_context,
     request_context->set_api_name("CreateInstanceGroup");
     OptimizerCallGuard guard(request_context, metrics_reporter_.get());
 
-    auto registry = manager_->registry_manager();
     auto group = ConvertProtoToInstanceGroup(request->instance_group());
 
     std::string invalid_fields;
@@ -115,7 +114,7 @@ void OptimizerServiceImpl::CreateInstanceGroup(RequestContext *request_context,
         return;
     }
 
-    ErrorCode ec = registry ? registry->CreateInstanceGroup(group) : EC_ERROR;
+    ErrorCode ec = manager_ ? manager_->CreateInstanceGroup(group) : EC_ERROR;
 
     SetPbResponseHeader(response->mutable_header(), ec);
     request_context->set_status_code(static_cast<int>(ec));
@@ -128,7 +127,6 @@ void OptimizerServiceImpl::UpdateInstanceGroup(RequestContext *request_context,
     request_context->set_api_name("UpdateInstanceGroup");
     OptimizerCallGuard guard(request_context, metrics_reporter_.get());
 
-    auto registry = manager_->registry_manager();
     auto group = ConvertProtoToInstanceGroup(request->instance_group());
 
     std::string invalid_fields;
@@ -140,7 +138,7 @@ void OptimizerServiceImpl::UpdateInstanceGroup(RequestContext *request_context,
         return;
     }
 
-    ErrorCode ec = registry ? registry->UpdateInstanceGroup(group) : EC_ERROR;
+    ErrorCode ec = manager_ ? manager_->UpdateInstanceGroup(group) : EC_ERROR;
 
     SetPbResponseHeader(response->mutable_header(), ec);
     request_context->set_status_code(static_cast<int>(ec));
@@ -153,8 +151,7 @@ void OptimizerServiceImpl::RemoveInstanceGroup(RequestContext *request_context,
     request_context->set_api_name("RemoveInstanceGroup");
     OptimizerCallGuard guard(request_context, metrics_reporter_.get());
 
-    auto registry = manager_->registry_manager();
-    ErrorCode ec = registry ? registry->RemoveInstanceGroup(request->name()) : EC_ERROR;
+    ErrorCode ec = manager_ ? manager_->RemoveInstanceGroup(request->name()) : EC_ERROR;
 
     SetPbResponseHeader(response->mutable_header(), ec);
     request_context->set_status_code(static_cast<int>(ec));

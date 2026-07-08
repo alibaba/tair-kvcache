@@ -26,20 +26,27 @@ void TtlCacheIndexerWrapper::Init(const std::vector<double> &capacity_gb,
 
 void TtlCacheIndexerWrapper::ProcessKeys(const std::vector<int64_t> &keys,
                                          std::vector<int64_t> &hit_count,
-                                         int64_t &max_hit_count) {
+                                         int64_t &max_hit_count,
+                                         std::vector<bool> *key_hits) {
     int64_t now = clock_();
 
     HarvestExpired(now);
 
-    inner_->ProcessKeys(keys, hit_count, max_hit_count);
+    std::vector<bool> inner_key_hits;
+    inner_->ProcessKeys(keys, hit_count, max_hit_count, &inner_key_hits);
+    if (key_hits) {
+        *key_hits = inner_key_hits;
+    }
 
-    for (int64_t key : keys) {
+    for (size_t i = 0; i < keys.size(); ++i) {
+        int64_t key = keys[i];
         auto it = key_access_time_.find(key);
         if (it != key_access_time_.end()) {
-            // Key is a hit — record age into the appropriate bucket
-            int64_t age_seconds = now - it->second;
-            size_t bucket_index = FindAgeBucket(age_seconds);
-            hit_age_bucket_counts_[bucket_index]++;
+            if (i < inner_key_hits.size() && inner_key_hits[i]) {
+                int64_t age_seconds = now - it->second;
+                size_t bucket_index = FindAgeBucket(age_seconds);
+                hit_age_bucket_counts_[bucket_index]++;
+            }
 
             expire_set_.erase({it->second + ttl_seconds_, key});
             it->second = now;
@@ -95,9 +102,6 @@ bool TtlCacheIndexerWrapper::RemoveKey(int64_t key) {
     return inner_->RemoveKey(key);
 }
 
-// KNOWN ISSUE: When max_key_count > 0, the inner LRU may evict a key by capacity while its stale
-// TTL entry in key_access_time_ persists, causing ProcessKeys to miscount it as a hit and inflate
-// age-bucket stats. This does NOT occur when max_key_count <= 0 (inner LRU never evicts).
 std::vector<HitAgeBucketInfo> TtlCacheIndexerWrapper::GetHitAgeBuckets() const {
     std::vector<HitAgeBucketInfo> result;
     result.reserve(hit_age_bucket_counts_.size());

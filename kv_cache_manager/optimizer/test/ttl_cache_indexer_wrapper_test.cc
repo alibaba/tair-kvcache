@@ -280,6 +280,32 @@ TEST_F(TtlCacheIndexerWrapperTest, HitAgeBucketBasic) {
     EXPECT_EQ(0, buckets[3].hit_count);
 }
 
+TEST_F(TtlCacheIndexerWrapperTest, CapacityEvictedKeyDoesNotIncrementHitAgeBucket) {
+    int64_t now = 1000;
+    auto clock = [&now]() { return now; };
+    TtlCacheIndexerWrapper wrapper(MakeInnerIndexer("lru", true, 2.0), 100, clock);
+    wrapper.SetHitAgeBucketThresholds({10});
+
+    std::vector<int64_t> hit_count;
+    int64_t max_hit;
+    wrapper.ProcessKeys({1, 2}, hit_count, max_hit);
+    wrapper.PostQueryMaintenance();
+
+    now = 1005;
+    wrapper.ProcessKeys({3}, hit_count, max_hit);
+    wrapper.PostQueryMaintenance();
+
+    now = 1010;
+    wrapper.ProcessKeys({1}, hit_count, max_hit);
+    EXPECT_EQ(0, hit_count[0]);
+    EXPECT_EQ(1, max_hit);
+
+    auto buckets = wrapper.GetHitAgeBuckets();
+    ASSERT_EQ(2u, buckets.size());
+    EXPECT_EQ(0, buckets[0].hit_count);
+    EXPECT_EQ(0, buckets[1].hit_count);
+}
+
 TEST_F(TtlCacheIndexerWrapperTest, HitAgeBucketInfinityBucket) {
     int64_t now = 1000;
     auto clock = [&now]() { return now; };

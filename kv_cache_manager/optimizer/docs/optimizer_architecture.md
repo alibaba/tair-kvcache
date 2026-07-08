@@ -29,12 +29,22 @@ KVCacheManager Optimizer 是一个独立的缓存优化分析模块，通过回�
 - **详细统计**：提供命中率、缓存使用情况等详细统计
 - **灵活配置**：通过 JSON 配置文件灵活配置实例、存储和策略
 - **可视化分析**：支持 Radix Tree 可视化、命中率图表和 Trade-off 曲线分析
+- **在线优化服务**：支持通过服务接口注册在线实例、实时 TraceQuery 统计命中率和容量使用
 
 ---
 
 ## 架构设计
 
 ### 整体架构
+
+Optimizer 当前包含离线 trace 回放和在线优化服务两条运行路径：
+
+- 离线回放路径使用 `OptimizerManager`、`OptIndexerManager`、`OptEvictionManager` 和 `RadixTreeIndex`，依赖 replay 配置、trace loader/converter 和 data storage 类型。
+- 在线服务路径使用 `OnlineOptimizerManager`、`CacheIndexerFactory`、`LruCacheIndexer`/`TtlCacheIndexerWrapper` 和 service/protobuf 接口，依赖 online 实例组/实例配置与 registry。
+
+两条路径共享 optimizer 模块内的命中率建模代码，但运行时、配置 target 和服务边界保持独立，避免在线服务引入离线 replay/data storage 依赖。
+
+#### 离线回放
 
 ```
 main.cc (程序入口)
@@ -56,6 +66,20 @@ OptimizerManager (核心协调器)
     Visualization Tools (可视化工具)
 ```
 
+#### 在线服务
+
+```
+OptimizerServiceImpl (HTTP/gRPC 接口)
+    ↓
+OnlineOptimizerManager (在线运行时协调器)
+    ├── OptimizerRegistryManager (实例组/实例持久化)
+    └── InstanceState (instance_id 隔离的运行状态)
+        ↓
+    CacheIndexerFactory
+        ├── LruCacheIndexer (容量命中率模拟)
+        └── TtlCacheIndexerWrapper (TTL 淘汰和 hit-age 统计)
+```
+
 ### 目录结构
 
 ```
@@ -67,7 +91,8 @@ kv_cache_manager/optimizer/
 │   ├── indexer_manager.h/cc         # 索引管理器
 │   └── optimizer_loader.h/cc        # Trace 加载器
 ├── index/                # 索引层
-│   └── radix_tree_index.h/cc        # Radix 树索引
+│   ├── radix_tree_index.h/cc        # 离线 Radix 树索引
+│   └── online/                    # 在线容量/TTL 命中率索引器
 ├── eviction_policy/      # 驱逐策略层
 │   ├── base.h                   # 策略基类
 │   ├── common_structure.h       # 通用数据结构
@@ -86,9 +111,17 @@ kv_cache_manager/optimizer/
 │   ├── optimizer_config.h/cc     # 顶层配置
 │   ├── replay_instance_group_config.h/cc # trace replay/tier 模拟实例组配置
 │   ├── replay_instance_config.h/cc      # trace replay 实例配置
+│   ├── optimizer_instance_group.h/cc    # 在线优化实例组配置
+│   ├── optimizer_instance_info.h/cc     # 在线优化实例配置
+│   ├── optimizer_registry_manager.h/cc  # 在线实例 registry
 │   ├── tier_config.h/cc          # 存储层配置
 │   ├── eviction_config.h         # 驱逐策略参数
 │   └── types.h                   # 类型定义
+├── online_runtime/       # 在线优化运行时
+│   └── online_optimizer_manager.h/cc # 在线实例注册、TraceQuery 和统计
+├── service/              # 在线服务实现
+│   ├── optimizer_service_impl.h/cc    # 服务接口适配层
+│   └── metrics/                   # 在线指标上报
 ├── analysis/             # 分析层
 │   ├── result_structure.h        # 结果结构定义
 │   ├── result_analysis.h/cc      # 命中率分析
@@ -112,6 +145,8 @@ kv_cache_manager/optimizer/
 ├── main.cc               # 程序入口
 └── optimizer_startup_config_load.json  # 配置示例
 ```
+
+在线服务协议定义在 `kv_cache_manager/protocol/protobuf/optimizer_service.proto`，由 service 层转换为 optimizer online config/runtime 对象。
 
 ---
 
