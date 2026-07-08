@@ -86,6 +86,7 @@ void MetaServiceMetricsBase::InvalidateCollectorCache(const std::string &instanc
     KVCM_INVALIDATE_METRICS_COLLECTOR_MAP_(ReportEvent, instance_id);
     KVCM_INVALIDATE_METRICS_COLLECTOR_MAP_(EventBlockAdd, instance_id);
     KVCM_INVALIDATE_METRICS_COLLECTOR_MAP_(EventBlockDelete, instance_id);
+    KVCM_INVALIDATE_METRICS_COLLECTOR_MAP_(GetHostCacheState, instance_id);
 }
 
 KVCM_DEFINE_METRICS_COLLECTOR_MAP_METHOD_(GetCacheMeta);
@@ -100,5 +101,6 @@ KVCM_DEFINE_METRICS_COLLECTOR_MAP_METHOD_(GetClusterInfo);
 KVCM_DEFINE_METRICS_COLLECTOR_MAP_METHOD_(ReportEvent);
 KVCM_DEFINE_METRICS_COLLECTOR_MAP_METHOD_(EventBlockAdd);
 KVCM_DEFINE_METRICS_COLLECTOR_MAP_METHOD_(EventBlockDelete);
+KVCM_DEFINE_METRICS_COLLECTOR_MAP_METHOD_(GetHostCacheState);
 
 } // namespace kv_cache_manager

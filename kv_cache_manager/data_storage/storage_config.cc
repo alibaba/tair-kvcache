@@ -163,6 +163,10 @@ std::string ToString(const DataStorageType &type) {
         return "dummy";
     case DataStorageType::DATA_STORAGE_TYPE_VINEYARD:
         return "vineyard";
+    case DataStorageType::DATA_STORAGE_TYPE_RTP_LLM:
+        return "rtp_llm";
+    case DataStorageType::DATA_STORAGE_TYPE_VLLM:
+        return "vllm";
     default:
         return "unrecognized";
     }
@@ -183,6 +187,12 @@ DataStorageType ToDataStorageType(const std::string &type) {
         return DataStorageType::DATA_STORAGE_TYPE_DUMMY;
     } else if (type == "vineyard") {
         return DataStorageType::DATA_STORAGE_TYPE_VINEYARD;
+    } else if (type == "event_reporting") {
+        return DataStorageType::DATA_STORAGE_TYPE_VINEYARD; // 向后兼容：JSON 键名 event_reporting 映射到 VINEYARD
+    } else if (type == "rtp_llm") {
+        return DataStorageType::DATA_STORAGE_TYPE_RTP_LLM;
+    } else if (type == "vllm") {
+        return DataStorageType::DATA_STORAGE_TYPE_VLLM;
     } else {
         return DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
     }
@@ -351,8 +361,10 @@ bool StorageConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
         storage_spec_ = tmp;
     } else if (type_ == DataStorageType::DATA_STORAGE_TYPE_DUMMY) {
         auto tmp = std::make_shared<DummyStorageSpec>();
-    } else if (type_ == DataStorageType::DATA_STORAGE_TYPE_VINEYARD) {
-        auto tmp = std::make_shared<VineyardStorageSpec>();
+    } else if (type_ == DataStorageType::DATA_STORAGE_TYPE_VINEYARD ||
+               type_ == DataStorageType::DATA_STORAGE_TYPE_RTP_LLM ||
+               type_ == DataStorageType::DATA_STORAGE_TYPE_VLLM) {
+        auto tmp = std::make_shared<EventReportingStorageSpec>();
         KVCM_JSON_GET_MACRO(rapid_value, "storage_spec", tmp);
         storage_spec_ = tmp;
     } else {
@@ -388,8 +400,8 @@ bool StorageConfig::ValidateRequiredFields(std::string &invalid_fields) const {
     return valid;
 }
 
-// VineyardStorageSpec
-bool VineyardStorageSpec::FromRapidValue(const rapidjson::Value &rapid_value) {
+// EventReportingStorageSpec
+bool EventReportingStorageSpec::FromRapidValue(const rapidjson::Value &rapid_value) {
     KVCM_JSON_GET_DEFAULT_MACRO(
         rapid_value, "heartbeat_timeout_ms", heartbeat_timeout_ms_, static_cast<int64_t>(kDefaultHeartbeatTimeoutMs));
     KVCM_JSON_GET_DEFAULT_MACRO(
@@ -401,13 +413,13 @@ bool VineyardStorageSpec::FromRapidValue(const rapidjson::Value &rapid_value) {
     return true;
 }
 
-void VineyardStorageSpec::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
+void EventReportingStorageSpec::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
     Put(writer, "heartbeat_timeout_ms", heartbeat_timeout_ms_);
     Put(writer, "cleanup_grace_ms", cleanup_grace_ms_);
     Put(writer, "liveness_check_interval_ms", liveness_check_interval_ms_);
 }
 
-bool VineyardStorageSpec::ValidateRequiredFields(std::string &invalid_fields) const {
+bool EventReportingStorageSpec::ValidateRequiredFields(std::string &invalid_fields) const {
     bool valid = true;
     std::string local_invalid_fields;
     if (heartbeat_timeout_ms_ <= 0) {
@@ -423,12 +435,12 @@ bool VineyardStorageSpec::ValidateRequiredFields(std::string &invalid_fields) co
         local_invalid_fields += "{liveness_check_interval_ms}";
     }
     if (!valid) {
-        invalid_fields += "{VineyardStorageSpec: " + local_invalid_fields + "}";
+        invalid_fields += "{EventReportingStorageSpec: " + local_invalid_fields + "}";
     }
     return valid;
 }
 
-std::string VineyardStorageSpec::ToString() const {
+std::string EventReportingStorageSpec::ToString() const {
     std::ostringstream oss;
     oss << "heartbeat_timeout_ms: " << heartbeat_timeout_ms_ << ", cleanup_grace_ms: " << cleanup_grace_ms_
         << ", liveness_check_interval_ms: " << liveness_check_interval_ms_;

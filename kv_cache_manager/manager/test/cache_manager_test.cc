@@ -11,7 +11,7 @@
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_backend.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
-#include "kv_cache_manager/data_storage/vineyard_backend.h"
+#include "kv_cache_manager/data_storage/event_reporting_backend.h"
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/manager/cache_location_view.h"
 #include "kv_cache_manager/manager/cache_manager.h"
@@ -1969,12 +1969,12 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_VineyardFallbackLookup) {
     registry_manager_->instance_group_configs_[instance_group] = ig;
 
     auto metrics_registry = cache_manager_->metrics_registry_;
-    auto vineyard_backend = std::make_shared<VineyardBackend>(metrics_registry);
+    auto vineyard_backend = std::make_shared<EventReportingBackend>(metrics_registry);
 
     StorageConfig config;
     config.set_global_unique_name(vineyard_storage_name);
     config.set_type(DataStorageType::DATA_STORAGE_TYPE_VINEYARD);
-    auto spec = std::make_shared<VineyardStorageSpec>();
+    auto spec = std::make_shared<EventReportingStorageSpec>();
     config.set_storage_spec(spec);
     vineyard_backend->Open(config, "test_trace");
 
@@ -2019,12 +2019,12 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_VineyardNodeUnavailable) {
     registry_manager_->instance_group_configs_[instance_group] = ig;
 
     auto metrics_registry = cache_manager_->metrics_registry_;
-    auto vineyard_backend = std::make_shared<VineyardBackend>(metrics_registry);
+    auto vineyard_backend = std::make_shared<EventReportingBackend>(metrics_registry);
 
     StorageConfig config;
     config.set_global_unique_name(vineyard_storage_name);
     config.set_type(DataStorageType::DATA_STORAGE_TYPE_VINEYARD);
-    auto spec = std::make_shared<VineyardStorageSpec>();
+    auto spec = std::make_shared<EventReportingStorageSpec>();
     config.set_storage_spec(spec);
     vineyard_backend->Open(config, "test_trace");
 
@@ -2070,12 +2070,12 @@ TEST_F(CacheManagerTest, TestGetCheckLocDataExistFunc_VineyardNodeUnregistered) 
     registry_manager_->instance_group_configs_[instance_group] = ig;
 
     auto metrics_registry = cache_manager_->metrics_registry_;
-    auto vineyard_backend = std::make_shared<VineyardBackend>(metrics_registry);
+    auto vineyard_backend = std::make_shared<EventReportingBackend>(metrics_registry);
 
     StorageConfig config;
     config.set_global_unique_name(vineyard_storage_name);
     config.set_type(DataStorageType::DATA_STORAGE_TYPE_VINEYARD);
-    auto spec = std::make_shared<VineyardStorageSpec>();
+    auto spec = std::make_shared<EventReportingStorageSpec>();
     config.set_storage_spec(spec);
     vineyard_backend->Open(config, "test_trace");
 
@@ -2957,14 +2957,14 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
             cache_manager_->FinishWriteCache(request_context_.get(), "test_instance", swci.write_session_id(), bm));
     }
 
-    // Set up VineyardBackend
+    // Set up EventReportingBackend
     auto metrics_registry = cache_manager_->metrics_registry_;
-    auto vineyard_backend = std::make_shared<VineyardBackend>(metrics_registry);
+    auto vineyard_backend = std::make_shared<EventReportingBackend>(metrics_registry);
     {
         StorageConfig v6d_config;
         v6d_config.set_global_unique_name("vineyard_default");
         v6d_config.set_type(DataStorageType::DATA_STORAGE_TYPE_VINEYARD);
-        v6d_config.set_storage_spec(std::make_shared<VineyardStorageSpec>());
+        v6d_config.set_storage_spec(std::make_shared<EventReportingStorageSpec>());
         vineyard_backend->Open(v6d_config, "test_trace");
     }
     auto dsm = registry_manager_->data_storage_manager_;
@@ -3252,5 +3252,243 @@ TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {
     }
 
     dsm->storage_map_.erase("vineyard_default");
+}
+
+// =============================================================
+// GetHostCacheState — per-host prefix match length
+// =============================================================
+//
+// Data layout:
+//   3 hosts: A (10.0.0.1:8080), B (10.0.0.2:8080), C (10.0.0.3:8080)
+//   key 100: host_A, host_B, host_C
+//   key 200: host_A, host_B
+//   key 300: host_B only
+//   key 400: host_A, host_B
+//   key 500: no host
+//
+// Query keys = {100, 200, 300, 400, 500}
+//   host_A: 100→200→(miss 300) → prefix=2
+//   host_B: 100→200→300→400→(miss 500) → prefix=4
+//   host_C: 100→(miss 200) → prefix=1
+//
+TEST_F(CacheManagerTest, TestGetHostCacheState) {
+    auto expected_reg = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    ASSERT_EQ(expected_reg,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               "test_instance",
+                                               64,
+                                               createLocationSpecInfos(),
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>()));
+
+    // Set up EventReportingBackend so that location_ids carry host_ip_port
+    auto metrics_registry = cache_manager_->metrics_registry_;
+    auto event_backend = std::make_shared<EventReportingBackend>(metrics_registry);
+    {
+        StorageConfig cfg;
+        cfg.set_global_unique_name("event_backend_default");
+        cfg.set_type(DataStorageType::DATA_STORAGE_TYPE_VLLM);
+        cfg.set_storage_spec(std::make_shared<EventReportingStorageSpec>());
+        event_backend->Open(cfg, "test_trace");
+    }
+    auto dsm = registry_manager_->data_storage_manager_;
+    dsm->storage_map_["event_backend_default"] = event_backend;
+    registry_manager_->instance_group_configs_["default"]->set_event_reporting_storage_candidates(
+        {"event_backend_default"});
+
+    // Inject cache locations via ReportEvent — each host reports a subset of keys
+    struct HostKeys {
+        std::string host;
+        std::vector<int64_t> keys;
+    };
+    std::vector<HostKeys> host_data = {
+        {"10.0.0.1:8080", {100, 200, 400}},
+        {"10.0.0.2:8080", {100, 200, 300, 400}},
+        {"10.0.0.3:8080", {100}},
+    };
+    for (const auto &hd : host_data) {
+        proto::meta::ReportEventRequest req;
+        req.set_instance_id("test_instance");
+        req.set_host_ip_port(hd.host);
+        req.set_storage_type(proto::meta::ST_VLLM);
+
+        auto *reg = req.add_events();
+        reg->set_event_type(proto::meta::EVENT_NODE_REGISTER);
+        reg->mutable_node_register()->add_mediums("mem");
+
+        for (int64_t key : hd.keys) {
+            auto *ev = req.add_events();
+            ev->set_event_type(proto::meta::EVENT_BLOCK_ADD);
+            auto *ba = ev->mutable_block_add();
+            ba->set_block_key(std::to_string(key));
+            ba->set_medium("mem");
+            auto *spec = ba->add_specs();
+            spec->set_name("tp0");
+            spec->set_uri("vllm://" + hd.host + "/mem");
+        }
+
+        proto::meta::ReportEventResponse resp;
+        ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+    }
+
+    // Helper: find a host's prefix_match_blocks in the response
+    auto find_prefix = [](const proto::meta::GetHostCacheStateResponse &resp, const std::string &host) -> int64_t {
+        for (const auto &h : resp.hosts()) {
+            if (h.host_ip_port() == host) {
+                return h.prefix_match_blocks();
+            }
+        }
+        return -1; // not found
+    };
+
+    // --- Test 1: full query — different prefix lengths per host ---
+    // keys = {100, 200, 300, 400, 500}
+    //   host_A: prefix=2 (100,200; miss 300)
+    //   host_B: prefix=4 (100,200,300,400; miss 500)
+    //   host_C: prefix=1 (100; miss 200)
+    {
+        proto::meta::GetHostCacheStateRequest req;
+        req.set_instance_id("test_instance");
+        req.add_block_cache_keys(100);
+        req.add_block_cache_keys(200);
+        req.add_block_cache_keys(300);
+        req.add_block_cache_keys(400);
+        req.add_block_cache_keys(500);
+
+        proto::meta::GetHostCacheStateResponse resp;
+        ASSERT_EQ(EC_OK, cache_manager_->GetHostCacheState(request_context_.get(), &req, &resp));
+        ASSERT_EQ(proto::meta::OK, resp.header().status().code());
+        ASSERT_EQ(3, resp.hosts_size());
+
+        EXPECT_EQ(2, find_prefix(resp, "10.0.0.1:8080"));
+        EXPECT_EQ(4, find_prefix(resp, "10.0.0.2:8080"));
+        EXPECT_EQ(1, find_prefix(resp, "10.0.0.3:8080"));
+    }
+
+    // --- Test 2: all keys cached by host_B → prefix = full length ---
+    // keys = {100, 200, 300, 400}
+    //   host_A: prefix=2 (miss 300)
+    //   host_B: prefix=4 (all matched)
+    //   host_C: prefix=1 (miss 200)
+    {
+        proto::meta::GetHostCacheStateRequest req;
+        req.set_instance_id("test_instance");
+        req.add_block_cache_keys(100);
+        req.add_block_cache_keys(200);
+        req.add_block_cache_keys(300);
+        req.add_block_cache_keys(400);
+
+        proto::meta::GetHostCacheStateResponse resp;
+        ASSERT_EQ(EC_OK, cache_manager_->GetHostCacheState(request_context_.get(), &req, &resp));
+        ASSERT_EQ(proto::meta::OK, resp.header().status().code());
+        ASSERT_EQ(3, resp.hosts_size());
+
+        EXPECT_EQ(2, find_prefix(resp, "10.0.0.1:8080"));
+        EXPECT_EQ(4, find_prefix(resp, "10.0.0.2:8080"));
+        EXPECT_EQ(1, find_prefix(resp, "10.0.0.3:8080"));
+    }
+
+    // --- Test 3: single key — all hosts have prefix=1 ---
+    {
+        proto::meta::GetHostCacheStateRequest req;
+        req.set_instance_id("test_instance");
+        req.add_block_cache_keys(100);
+
+        proto::meta::GetHostCacheStateResponse resp;
+        ASSERT_EQ(EC_OK, cache_manager_->GetHostCacheState(request_context_.get(), &req, &resp));
+        ASSERT_EQ(proto::meta::OK, resp.header().status().code());
+        ASSERT_EQ(3, resp.hosts_size());
+
+        EXPECT_EQ(1, find_prefix(resp, "10.0.0.1:8080"));
+        EXPECT_EQ(1, find_prefix(resp, "10.0.0.2:8080"));
+        EXPECT_EQ(1, find_prefix(resp, "10.0.0.3:8080"));
+    }
+
+    // --- Test 4: first key not cached by any host → empty response ---
+    // keys = {999, 100, 200}
+    {
+        proto::meta::GetHostCacheStateRequest req;
+        req.set_instance_id("test_instance");
+        req.add_block_cache_keys(999);
+        req.add_block_cache_keys(100);
+        req.add_block_cache_keys(200);
+
+        proto::meta::GetHostCacheStateResponse resp;
+        ASSERT_EQ(EC_OK, cache_manager_->GetHostCacheState(request_context_.get(), &req, &resp));
+        ASSERT_EQ(proto::meta::OK, resp.header().status().code());
+        EXPECT_EQ(0, resp.hosts_size());
+    }
+
+    // --- Test 5: empty block_cache_keys → OK, empty response ---
+    {
+        proto::meta::GetHostCacheStateRequest req;
+        req.set_instance_id("test_instance");
+
+        proto::meta::GetHostCacheStateResponse resp;
+        ASSERT_EQ(EC_OK, cache_manager_->GetHostCacheState(request_context_.get(), &req, &resp));
+        ASSERT_EQ(proto::meta::OK, resp.header().status().code());
+        EXPECT_EQ(0, resp.hosts_size());
+    }
+
+    // --- Test 6: nonexistent instance → error ---
+    {
+        proto::meta::GetHostCacheStateRequest req;
+        req.set_instance_id("nonexistent_instance");
+        req.add_block_cache_keys(100);
+
+        proto::meta::GetHostCacheStateResponse resp;
+        auto ec = cache_manager_->GetHostCacheState(request_context_.get(), &req, &resp);
+        ASSERT_EQ(EC_INSTANCE_NOT_EXIST, ec);
+        ASSERT_EQ(proto::meta::INSTANCE_NOT_EXIST, resp.header().status().code());
+    }
+
+    // --- Test 7: empty instance_id → INVALID_ARGUMENT ---
+    {
+        proto::meta::GetHostCacheStateRequest req;
+        req.add_block_cache_keys(100);
+
+        proto::meta::GetHostCacheStateResponse resp;
+        auto ec = cache_manager_->GetHostCacheState(request_context_.get(), &req, &resp);
+        ASSERT_EQ(EC_BADARGS, ec);
+        ASSERT_EQ(proto::meta::INVALID_ARGUMENT, resp.header().status().code());
+    }
+
+    // --- Test 8: medium filter (only "mem") — should not change results ---
+    {
+        proto::meta::GetHostCacheStateRequest req;
+        req.set_instance_id("test_instance");
+        req.add_block_cache_keys(100);
+        req.add_block_cache_keys(200);
+        req.add_block_cache_keys(300);
+        req.add_block_cache_keys(400);
+        req.add_block_cache_keys(500);
+        req.add_medium("mem");
+
+        proto::meta::GetHostCacheStateResponse resp;
+        ASSERT_EQ(EC_OK, cache_manager_->GetHostCacheState(request_context_.get(), &req, &resp));
+        ASSERT_EQ(proto::meta::OK, resp.header().status().code());
+        ASSERT_EQ(3, resp.hosts_size());
+
+        EXPECT_EQ(2, find_prefix(resp, "10.0.0.1:8080"));
+        EXPECT_EQ(4, find_prefix(resp, "10.0.0.2:8080"));
+        EXPECT_EQ(1, find_prefix(resp, "10.0.0.3:8080"));
+    }
+
+    // --- Test 9: medium filter (non-existent medium "ssd") → no hosts ---
+    {
+        proto::meta::GetHostCacheStateRequest req;
+        req.set_instance_id("test_instance");
+        req.add_block_cache_keys(100);
+        req.add_block_cache_keys(200);
+        req.add_medium("ssd");
+
+        proto::meta::GetHostCacheStateResponse resp;
+        ASSERT_EQ(EC_OK, cache_manager_->GetHostCacheState(request_context_.get(), &req, &resp));
+        ASSERT_EQ(proto::meta::OK, resp.header().status().code());
+        EXPECT_EQ(0, resp.hosts_size());
+    }
+
+    dsm->storage_map_.erase("event_backend_default");
 }
 } // namespace kv_cache_manager

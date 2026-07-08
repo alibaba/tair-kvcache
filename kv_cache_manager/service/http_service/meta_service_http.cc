@@ -42,6 +42,8 @@ void MetaServiceHttp::RegisterHandler() {
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, trimCache, TrimCache, Common, TrimCache);
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, getClusterInfo, GetClusterInfo, GetClusterInfo, GetClusterInfo);
     REGISTER_HTTP_HANDLER_FOR_META_SERVICE(Post, reportEvent, ReportEvent, ReportEvent, ReportEvent);
+    REGISTER_HTTP_HANDLER_FOR_META_SERVICE(
+        Post, getHostCacheState, GetHostCacheState, GetHostCacheState, GetHostCacheState);
 }
 
 void MetaServiceHttp::RegisterInstance(coro_http::coro_http_connection *http_conn,
@@ -191,6 +193,17 @@ void MetaServiceHttp::ReportEvent(coro_http::coro_http_connection *http_conn,
             request_context->GetMetricsCollectorsVehicle().AddMetricsCollector(mc);
     }
     meta_service_impl_->ReportEvent(request_context, request, response);
+}
+
+void MetaServiceHttp::GetHostCacheState(coro_http::coro_http_connection *http_conn,
+                                        proto::meta::GetHostCacheStateRequest *request,
+                                        proto::meta::GetHostCacheStateResponse *response) {
+    API_CONTEXT_GET_COLLECTOR_AND_INIT_HTTP(GetHostCacheState, __NOTHING__);
+    KVCM_LOG_INFO("[traceId: %s] GetHostCacheState called, instance_id: %s, block_cache_keys_count: %d",
+                  request->trace_id().c_str(),
+                  request->instance_id().c_str(),
+                  request->block_cache_keys_size());
+    meta_service_impl_->GetHostCacheState(request_context, request, response);
 }
 
 } // namespace kv_cache_manager

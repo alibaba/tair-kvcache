@@ -44,9 +44,11 @@ enum StorageType {
     ST_VCNS_3FS = 5;
     ST_DUMMY = 6;
     ST_VINEYARD = 7;
+    ST_RTP_LLM = 8; // RTP-LLM 推理节点本地缓存
+    ST_VLLM = 9;          // VLLM 推理节点本地缓存
 }
 
-// ---- V6D event reporting ----
+// ---- Event reporting (V6D / RTP-LLM / VLLM) ----
 
 enum ReportEventType {
     EVENT_UNSPECIFIED = 0;
@@ -451,8 +453,29 @@ service MetaService {
     rpc TrimCache(TrimCacheRequest) returns (CommonResponse);
     // 查询集群信息（leader发现），任意节点均可处理
     rpc GetClusterInfo(GetClusterInfoRequest) returns (GetClusterInfoResponse);
-    // V6D 上报事件（节点注册、Block 增删、节点宕机）
+    // 推理节点上报事件（节点注册、Block 增删、节点宕机、心跳）
     rpc ReportEvent(ReportEventRequest) returns (ReportEventResponse);
+    // 查询 instance 下所有 host 的 prefix match 结果
+    rpc GetHostCacheState(GetHostCacheStateRequest) returns (GetHostCacheStateResponse);
     // 每个 key 的多个 Cache 位置（每种backend根据策略选择一个地址）
     rpc GetCacheLocationsByBackend(GetCacheLocationsByBackendRequest) returns (GetCacheLocationsByBackendResponse);
+}
+
+// ---- GetHostCacheState ----
+
+message GetHostCacheStateRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    repeated int64 block_cache_keys = 3;   // 请求 prompt 的有序 block cache keys
+    repeated string medium = 4;            // 要匹配的介质列表；为空时考虑所有介质
+}
+
+message HostCacheMatch {
+    string host_ip_port = 1;   // 必须与 Master 中 workerStatus.getIpPort() 的格式完全一致
+    int64 prefix_match_blocks = 2;         // 连续命中的 block 数（调用方自己 ×block_size 算 tokens）
+}
+
+message GetHostCacheStateResponse {
+    CommonResponseHeader header = 1;
+    repeated HostCacheMatch hosts = 2;
 }

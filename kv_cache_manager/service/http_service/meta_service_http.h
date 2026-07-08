@@ -60,6 +60,10 @@ public:
                      proto::meta::ReportEventRequest *request,
                      proto::meta::ReportEventResponse *response);
 
+    void GetHostCacheState(coro_http::coro_http_connection *http_conn,
+                           proto::meta::GetHostCacheStateRequest *request,
+                           proto::meta::GetHostCacheStateResponse *response);
+
 private:
     std::shared_ptr<MetaServiceImpl> meta_service_impl_;
 };

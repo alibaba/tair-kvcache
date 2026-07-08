@@ -746,4 +746,33 @@ void MetaServiceImpl::ReportEvent(RequestContext *request_context,
     SET_SPAN_TRACER_STR_IN_HEADER(request_context);
 }
 
+void MetaServiceImpl::GetHostCacheState(RequestContext *request_context,
+                                        const proto::meta::GetHostCacheStateRequest *request,
+                                        proto::meta::GetHostCacheStateResponse *response) {
+    SPAN_TRACER(request_context);
+    API_CALL_GUARD("GetHostCacheState", true);
+    auto *header = response->mutable_header();
+    auto *status = header->mutable_status();
+
+    KVCM_LOG_INFO("[traceId: %s] GetHostCacheState called, instance_id: %s, block_cache_keys_count: %d",
+                  request->trace_id().c_str(),
+                  request->instance_id().c_str(),
+                  request->block_cache_keys_size());
+
+    auto ec = cache_manager_->GetHostCacheState(request_context, request, response);
+    if (ec != EC_OK) {
+        KVCM_LOG_WARN("[traceId: %s] GetHostCacheState failed, ec=%d", request->trace_id().c_str(), ec);
+    } else {
+        status->set_code(proto::meta::OK);
+        request_context->set_status_code(status->code());
+        KVCM_LOG_INFO("[traceId: %s] GetHostCacheState succeeded, returned %d hosts",
+                      request->trace_id().c_str(),
+                      response->hosts_size());
+    }
+    auto *smc = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
+    KVCM_METRICS_COLLECTOR_SET_METRICS(smc, service, error_code, (ec != EC_OK) ? 1.0 : 0.0);
+    request_context->set_status_code(header->status().code());
+    SET_SPAN_TRACER_STR_IN_HEADER(request_context);
+}
+
 } // namespace kv_cache_manager

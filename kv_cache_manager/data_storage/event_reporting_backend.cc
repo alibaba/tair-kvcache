@@ -1,4 +1,4 @@
-#include "kv_cache_manager/data_storage/vineyard_backend.h"
+#include "kv_cache_manager/data_storage/event_reporting_backend.h"
 
 #include <algorithm>
 #include <charconv>
@@ -19,25 +19,46 @@
 
 namespace kv_cache_manager {
 
-VineyardBackend::VineyardBackend(std::shared_ptr<MetricsRegistry> metrics_registry)
+EventReportingBackend::EventReportingBackend(std::shared_ptr<MetricsRegistry> metrics_registry)
     : DataStorageBackend(std::move(metrics_registry)) {}
 
-VineyardBackend::~VineyardBackend() {
+EventReportingBackend::~EventReportingBackend() {
     if (IsOpen()) {
         Close();
     }
 }
 
-DataStorageType VineyardBackend::GetType() { return DataStorageType::DATA_STORAGE_TYPE_VINEYARD; }
+// --- Engine-specific parameter derivation ---
 
-bool VineyardBackend::Available() { return IsOpen(); }
+std::string EventReportingBackend::GetBackendIdentifier(DataStorageType type) {
+    switch (type) {
+    case DataStorageType::DATA_STORAGE_TYPE_VINEYARD:
+        return "vineyard";
+    case DataStorageType::DATA_STORAGE_TYPE_RTP_LLM:
+        return "rtp_llm";
+    case DataStorageType::DATA_STORAGE_TYPE_VLLM:
+        return "vllm";
+    default:
+        return "unknown";
+    }
+}
 
-double VineyardBackend::GetStorageUsageRatio(const std::string & /*trace_id*/) const { return 1.0; }
+std::string EventReportingBackend::GetMetricsPrefix(DataStorageType type) { return GetBackendIdentifier(type) + "."; }
 
-ErrorCode VineyardBackend::DoOpen(const StorageConfig &config, const std::string &trace_id) {
-    auto spec = std::dynamic_pointer_cast<VineyardStorageSpec>(config.storage_spec());
+std::string EventReportingBackend::GetProtocolStr(DataStorageType type) { return GetBackendIdentifier(type); }
+
+// --- DataStorageBackend interface ---
+
+DataStorageType EventReportingBackend::GetType() { return config_.type(); }
+
+bool EventReportingBackend::Available() { return IsOpen(); }
+
+double EventReportingBackend::GetStorageUsageRatio(const std::string & /*trace_id*/) const { return 1.0; }
+
+ErrorCode EventReportingBackend::DoOpen(const StorageConfig &config, const std::string &trace_id) {
+    auto spec = std::dynamic_pointer_cast<EventReportingStorageSpec>(config.storage_spec());
     if (!spec) {
-        KVCM_LOG_WARN("trace_id [%s] | VineyardBackend::DoOpen: unexpected config type, storage config: [%s]",
+        KVCM_LOG_WARN("trace_id [%s] | EventReportingBackend::DoOpen: unexpected config type, storage config: [%s]",
                       trace_id.c_str(),
                       config.ToString().c_str());
         return EC_ERROR;
@@ -50,19 +71,20 @@ ErrorCode VineyardBackend::DoOpen(const StorageConfig &config, const std::string
     SetOpen(true);
 
     liveness_checker_running_.store(true, std::memory_order_relaxed);
-    liveness_checker_thread_ = std::thread(&VineyardBackend::LivenessCheckerLoop, this);
+    liveness_checker_thread_ = std::thread(&EventReportingBackend::LivenessCheckerLoop, this);
 
-    KVCM_LOG_INFO("trace_id [%s] | VineyardBackend opened, storage: [%s], hb_timeout=%ldms, "
+    KVCM_LOG_INFO("trace_id [%s] | EventReportingBackend opened, storage: [%s], type: [%s], hb_timeout=%ldms, "
                   "cleanup_grace=%ldms, check_interval=%ldms",
                   trace_id.c_str(),
                   config_.global_unique_name().c_str(),
+                  ToString(config_.type()).c_str(),
                   heartbeat_timeout_ms_,
                   cleanup_grace_ms_,
                   liveness_check_interval_ms_);
     return EC_OK;
 }
 
-ErrorCode VineyardBackend::Close() {
+ErrorCode EventReportingBackend::Close() {
     SetOpen(false);
     liveness_checker_running_.store(false, std::memory_order_relaxed);
     if (liveness_checker_thread_.joinable()) {
@@ -78,19 +100,19 @@ ErrorCode VineyardBackend::Close() {
         cleanup_callback_ = nullptr;
         cleanup_cb_set_.store(false, std::memory_order_release);
     }
-    KVCM_LOG_INFO("VineyardBackend closed, storage: [%s]", config_.global_unique_name().c_str());
+    KVCM_LOG_INFO("EventReportingBackend closed, storage: [%s]", config_.global_unique_name().c_str());
     return EC_OK;
 }
 
-void VineyardBackend::SetCleanupCallback(CleanupCallback cb) {
+void EventReportingBackend::SetCleanupCallback(CleanupCallback cb) {
     std::lock_guard<std::mutex> lock(cleanup_cb_mutex_);
     cleanup_callback_ = std::move(cb);
     cleanup_cb_set_.store(cleanup_callback_ != nullptr, std::memory_order_release);
 }
 
-ErrorCode VineyardBackend::RegisterNode(const std::string &instance_id,
-                                        const std::string &host_ip_port,
-                                        const std::vector<std::string> &mediums) {
+ErrorCode EventReportingBackend::RegisterNode(const std::string &instance_id,
+                                              const std::string &host_ip_port,
+                                              const std::vector<std::string> &mediums) {
     if (host_ip_port.empty()) {
         return EC_BADARGS;
     }
@@ -111,7 +133,7 @@ ErrorCode VineyardBackend::RegisterNode(const std::string &instance_id,
         info.unavailable_since_ms.store(0, std::memory_order_relaxed);
         info.instance_id = instance_id;
         info.metrics_tags = {{"instance_id", instance_id}, {"host", host_ip_port}};
-        KVCM_LOG_INFO("VineyardBackend: node [%s] already registered for instance [%s], "
+        KVCM_LOG_INFO("EventReportingBackend: node [%s] already registered for instance [%s], "
                       "mediums=%zu (refreshed heartbeat, gen=%lu)",
                       host_ip_port.c_str(),
                       instance_id.c_str(),
@@ -129,7 +151,7 @@ ErrorCode VineyardBackend::RegisterNode(const std::string &instance_id,
     info->metrics_tags = {{"instance_id", instance_id}, {"host", host_ip_port}};
     host_map[host_ip_port] = std::move(info);
 
-    KVCM_LOG_INFO("VineyardBackend: node [%s] registered in storage [%s] for instance [%s], mediums=%zu, gen=%lu",
+    KVCM_LOG_INFO("EventReportingBackend: node [%s] registered in storage [%s] for instance [%s], mediums=%zu, gen=%lu",
                   host_ip_port.c_str(),
                   config_.global_unique_name().c_str(),
                   instance_id.c_str(),
@@ -138,47 +160,47 @@ ErrorCode VineyardBackend::RegisterNode(const std::string &instance_id,
     return EC_OK;
 }
 
-ErrorCode VineyardBackend::UnregisterNode(const std::string &instance_id, const std::string &host_ip_port) {
+ErrorCode EventReportingBackend::UnregisterNode(const std::string &instance_id, const std::string &host_ip_port) {
     std::unique_lock<std::shared_mutex> lock(nodes_mutex_);
     auto inst_it = instance_nodes_.find(instance_id);
     if (inst_it == instance_nodes_.end()) {
-        KVCM_LOG_WARN("VineyardBackend: instance [%s] not found for unregister node [%s]",
+        KVCM_LOG_WARN("EventReportingBackend: instance [%s] not found for unregister node [%s]",
                       instance_id.c_str(),
                       host_ip_port.c_str());
         return EC_NOENT;
     }
     auto it = inst_it->second.find(host_ip_port);
     if (it == inst_it->second.end()) {
-        KVCM_LOG_WARN("VineyardBackend: node [%s] not found for instance [%s] for unregister",
+        KVCM_LOG_WARN("EventReportingBackend: node [%s] not found for instance [%s] for unregister",
                       host_ip_port.c_str(),
                       instance_id.c_str());
         return EC_NOENT;
     }
     if (metrics_registry_) {
         auto &info = *it->second;
+        auto prefix = GetMetricsPrefix(config_.type());
         for (const auto &kv : info.last_system_status) {
-            auto data = metrics_registry_->GetMetricsData("v6d." + kv.first);
+            auto data = metrics_registry_->GetMetricsData(prefix + kv.first);
             if (data) {
                 data->RemoveByTags(info.metrics_tags);
             }
         }
     }
     inst_it->second.erase(it);
-    KVCM_LOG_INFO("VineyardBackend: node [%s] unregistered from storage [%s] for instance [%s]",
+    KVCM_LOG_INFO("EventReportingBackend: node [%s] unregistered from storage [%s] for instance [%s]",
                   host_ip_port.c_str(),
                   config_.global_unique_name().c_str(),
                   instance_id.c_str());
     return EC_OK;
 }
 
-// kvcm重启nodes_信息会丢失，v6d侧发送心跳会收到EC_NODE_NOT_REGISTERED，触发v6d re-register
-ErrorCode VineyardBackend::OnHeartbeat(const std::string &instance_id,
-                                       const std::string &host_ip_port,
-                                       const std::map<std::string, std::string> &system_status) {
+ErrorCode EventReportingBackend::OnHeartbeat(const std::string &instance_id,
+                                             const std::string &host_ip_port,
+                                             const std::map<std::string, std::string> &system_status) {
     std::shared_lock<std::shared_mutex> lock(nodes_mutex_);
     auto inst_it = instance_nodes_.find(instance_id);
     if (inst_it == instance_nodes_.end()) {
-        KVCM_LOG_WARN("VineyardBackend: heartbeat from unregistered instance [%s] node [%s], "
+        KVCM_LOG_WARN("EventReportingBackend: heartbeat from unregistered instance [%s] node [%s], "
                       "returning NODE_NOT_REGISTERED",
                       instance_id.c_str(),
                       host_ip_port.c_str());
@@ -186,7 +208,7 @@ ErrorCode VineyardBackend::OnHeartbeat(const std::string &instance_id,
     }
     auto it = inst_it->second.find(host_ip_port);
     if (it == inst_it->second.end()) {
-        KVCM_LOG_WARN("VineyardBackend: heartbeat from unregistered node [%s] for instance [%s], "
+        KVCM_LOG_WARN("EventReportingBackend: heartbeat from unregistered node [%s] for instance [%s], "
                       "returning NODE_NOT_REGISTERED",
                       host_ip_port.c_str(),
                       instance_id.c_str());
@@ -198,7 +220,7 @@ ErrorCode VineyardBackend::OnHeartbeat(const std::string &instance_id,
     bool prev = info.available.exchange(true, std::memory_order_relaxed);
     if (!prev) {
         info.unavailable_since_ms.store(0, std::memory_order_relaxed);
-        KVCM_LOG_INFO("VineyardBackend: node [%s] recovered from unavailable", host_ip_port.c_str());
+        KVCM_LOG_INFO("EventReportingBackend: node [%s] recovered from unavailable", host_ip_port.c_str());
     }
     {
         std::lock_guard<std::mutex> status_lock(info.status_mutex);
@@ -207,6 +229,7 @@ ErrorCode VineyardBackend::OnHeartbeat(const std::string &instance_id,
 
     if (metrics_registry_) {
         const auto &tags = info.metrics_tags;
+        auto prefix = GetMetricsPrefix(config_.type());
         for (const auto &kv : system_status) {
             const auto &s = kv.second;
             if (s.empty())
@@ -214,14 +237,14 @@ ErrorCode VineyardBackend::OnHeartbeat(const std::string &instance_id,
             char *end = nullptr;
             double val = std::strtod(s.c_str(), &end);
             if (end == s.c_str() + s.size()) {
-                REPORT_DYNAMIC_GAUGE_(metrics_registry_, "v6d." + kv.first, tags, val);
+                REPORT_DYNAMIC_GAUGE_(metrics_registry_, prefix + kv.first, tags, val);
             }
         }
     }
     return EC_OK;
 }
 
-void VineyardBackend::SetNodeUnavailable(const std::string &instance_id, const std::string &host_ip_port) {
+void EventReportingBackend::SetNodeUnavailable(const std::string &instance_id, const std::string &host_ip_port) {
     std::shared_lock<std::shared_mutex> lock(nodes_mutex_);
     auto inst_it = instance_nodes_.find(instance_id);
     if (inst_it == instance_nodes_.end()) {
@@ -239,13 +262,14 @@ void VineyardBackend::SetNodeUnavailable(const std::string &instance_id, const s
     }
 }
 
-void VineyardBackend::ClearNodeGauges(const NodeInfo &info) {
+void EventReportingBackend::ClearNodeGauges(const NodeInfo &info) {
     if (!metrics_registry_) {
         return;
     }
     std::lock_guard<std::mutex> status_lock(info.status_mutex);
+    auto prefix = GetMetricsPrefix(config_.type());
     for (const auto &kv : info.last_system_status) {
-        auto data = metrics_registry_->GetMetricsData("v6d." + kv.first);
+        auto data = metrics_registry_->GetMetricsData(prefix + kv.first);
         if (data) {
             auto gauge = data->GetGauge(info.metrics_tags);
             if (gauge) {
@@ -255,7 +279,7 @@ void VineyardBackend::ClearNodeGauges(const NodeInfo &info) {
     }
 }
 
-bool VineyardBackend::IsNodeAvailable(const std::string &instance_id, const std::string &host_ip_port) const {
+bool EventReportingBackend::IsNodeAvailable(const std::string &instance_id, const std::string &host_ip_port) const {
     std::shared_lock<std::shared_mutex> lock(nodes_mutex_);
     auto inst_it = instance_nodes_.find(instance_id);
     if (inst_it == instance_nodes_.end()) {
@@ -268,7 +292,8 @@ bool VineyardBackend::IsNodeAvailable(const std::string &instance_id, const std:
     return it->second->available.load(std::memory_order_relaxed);
 }
 
-uint64_t VineyardBackend::GetNodeGeneration(const std::string &instance_id, const std::string &host_ip_port) const {
+uint64_t EventReportingBackend::GetNodeGeneration(const std::string &instance_id,
+                                                  const std::string &host_ip_port) const {
     std::shared_lock<std::shared_mutex> lock(nodes_mutex_);
     auto inst_it = node_generation_.find(instance_id);
     if (inst_it == node_generation_.end()) {
@@ -278,7 +303,7 @@ uint64_t VineyardBackend::GetNodeGeneration(const std::string &instance_id, cons
     return it != inst_it->second.end() ? it->second : 0;
 }
 
-void VineyardBackend::LivenessCheckerLoop() {
+void EventReportingBackend::LivenessCheckerLoop() {
     while (liveness_checker_running_.load(std::memory_order_relaxed) && IsOpen()) {
         int64_t now_ms = NowMillis();
         struct CleanupEntry {
@@ -310,11 +335,11 @@ void VineyardBackend::LivenessCheckerLoop() {
                     bool prev = info.available.exchange(false, std::memory_order_relaxed);
                     if (prev) {
                         info.unavailable_since_ms.store(now_ms, std::memory_order_relaxed);
-                        KVCM_LOG_WARN(
-                            "VineyardBackend: node [%s] instance [%s] timed out (no hb for %ldms), marked unavailable",
-                            host.c_str(),
-                            inst_id.c_str(),
-                            now_ms - last_hb);
+                        KVCM_LOG_WARN("EventReportingBackend: node [%s] instance [%s] timed out (no hb for %ldms), "
+                                      "marked unavailable",
+                                      host.c_str(),
+                                      inst_id.c_str(),
+                                      now_ms - last_hb);
                         ClearNodeGauges(info);
                     }
                     int64_t unavailable_since = info.unavailable_since_ms.load(std::memory_order_relaxed);
@@ -340,7 +365,7 @@ void VineyardBackend::LivenessCheckerLoop() {
                 cb_copy = cleanup_callback_;
             }
             for (const auto &entry : to_cleanup) {
-                KVCM_LOG_WARN("VineyardBackend: node [%s] instance [%s] passed cleanup_grace_ms, "
+                KVCM_LOG_WARN("EventReportingBackend: node [%s] instance [%s] passed cleanup_grace_ms, "
                               "triggering cleanup (gen=%lu)",
                               entry.host.c_str(),
                               entry.instance_id.c_str(),
@@ -352,10 +377,11 @@ void VineyardBackend::LivenessCheckerLoop() {
                 if (current_gen == entry.gen) {
                     UnregisterNode(entry.instance_id, entry.host);
                 } else {
-                    KVCM_LOG_INFO("VineyardBackend: node [%s] re-registered (gen=%lu -> %lu), skipping unregister",
-                                  entry.host.c_str(),
-                                  entry.gen,
-                                  current_gen);
+                    KVCM_LOG_INFO(
+                        "EventReportingBackend: node [%s] re-registered (gen=%lu -> %lu), skipping unregister",
+                        entry.host.c_str(),
+                        entry.gen,
+                        current_gen);
                 }
             }
         }
@@ -364,27 +390,27 @@ void VineyardBackend::LivenessCheckerLoop() {
     }
 }
 
-std::vector<std::pair<ErrorCode, DataStorageUri>> VineyardBackend::Create(const std::vector<std::string> &keys,
-                                                                          size_t /*size_per_key*/,
-                                                                          const std::string &trace_id,
-                                                                          std::function<void()> /*cb*/) {
-    KVCM_LOG_WARN("trace_id [%s] | VineyardBackend::Create should not be called", trace_id.c_str());
+std::vector<std::pair<ErrorCode, DataStorageUri>> EventReportingBackend::Create(const std::vector<std::string> &keys,
+                                                                                size_t /*size_per_key*/,
+                                                                                const std::string &trace_id,
+                                                                                std::function<void()> /*cb*/) {
+    KVCM_LOG_WARN("trace_id [%s] | EventReportingBackend::Create should not be called", trace_id.c_str());
     return std::vector<std::pair<ErrorCode, DataStorageUri>>(
         keys.size(), std::make_pair(ErrorCode::EC_UNIMPLEMENTED, DataStorageUri()));
 }
 
-std::vector<ErrorCode> VineyardBackend::Delete(const std::vector<DataStorageUri> &storage_uris,
-                                               const std::string &trace_id,
-                                               std::function<void()> /*cb*/) {
-    KVCM_LOG_WARN("trace_id [%s] | VineyardBackend::Delete should not be called", trace_id.c_str());
+std::vector<ErrorCode> EventReportingBackend::Delete(const std::vector<DataStorageUri> &storage_uris,
+                                                     const std::string &trace_id,
+                                                     std::function<void()> /*cb*/) {
+    KVCM_LOG_WARN("trace_id [%s] | EventReportingBackend::Delete should not be called", trace_id.c_str());
     return std::vector<ErrorCode>(storage_uris.size(), ErrorCode::EC_UNIMPLEMENTED);
 }
 
-std::vector<bool> VineyardBackend::Exist(const std::vector<DataStorageUri> &storage_uris) {
+std::vector<bool> EventReportingBackend::Exist(const std::vector<DataStorageUri> &storage_uris) {
     return std::vector<bool>(storage_uris.size(), false);
 }
 
-std::vector<bool> VineyardBackend::MightExist(const std::vector<DataStorageUri> &storage_uris) {
+std::vector<bool> EventReportingBackend::MightExist(const std::vector<DataStorageUri> &storage_uris) {
     std::vector<bool> result;
     result.reserve(storage_uris.size());
     std::shared_lock<std::shared_mutex> lock(nodes_mutex_);
@@ -410,28 +436,31 @@ std::vector<bool> VineyardBackend::MightExist(const std::vector<DataStorageUri> 
     return result;
 }
 
-std::vector<ErrorCode> VineyardBackend::Lock(const std::vector<DataStorageUri> &storage_uris) {
+std::vector<ErrorCode> EventReportingBackend::Lock(const std::vector<DataStorageUri> &storage_uris) {
     return std::vector<ErrorCode>(storage_uris.size(), ErrorCode::EC_UNIMPLEMENTED);
 }
 
-std::vector<ErrorCode> VineyardBackend::UnLock(const std::vector<DataStorageUri> &storage_uris) {
+std::vector<ErrorCode> EventReportingBackend::UnLock(const std::vector<DataStorageUri> &storage_uris) {
     return std::vector<ErrorCode>(storage_uris.size(), ErrorCode::EC_UNIMPLEMENTED);
 }
 
-std::string VineyardBackend::BuildLocationId(const std::string &medium, const std::string &host_ip_port) const {
-    std::string id;
-    id.reserve(8 + medium.size() + 1 + host_ip_port.size());
-    id.append("kvs#v6d#");
-    id.append(medium);
-    id.push_back('#');
-    id.append(host_ip_port);
-    return id;
+std::string EventReportingBackend::BuildLocationId(const std::string &medium, const std::string &host_ip_port) const {
+    auto id = GetBackendIdentifier(config_.type());
+    std::string result;
+    result.reserve(4 + id.size() + 1 + medium.size() + 1 + host_ip_port.size());
+    result.append("kvs#");
+    result.append(id);
+    result.push_back('#');
+    result.append(medium);
+    result.push_back('#');
+    result.append(host_ip_port);
+    return result;
 }
 
-std::string VineyardBackend::HostSuffix(const std::string &host_ip_port) const { return "#" + host_ip_port; }
+std::string EventReportingBackend::HostSuffix(const std::string &host_ip_port) const { return "#" + host_ip_port; }
 
-DataStorageType VineyardBackend::GetStorageType() const { return DataStorageType::DATA_STORAGE_TYPE_VINEYARD; }
+DataStorageType EventReportingBackend::GetStorageType() const { return config_.type(); }
 
-std::string VineyardBackend::GetProtocol() const { return "vineyard"; }
+std::string EventReportingBackend::GetProtocol() const { return GetProtocolStr(config_.type()); }
 
 } // namespace kv_cache_manager

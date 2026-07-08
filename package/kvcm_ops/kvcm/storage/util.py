@@ -32,7 +32,7 @@ def gen_3fs_config_data(args):
     return storage_spec
 
 
-def gen_vineyard_config_data(args):
+def gen_event_reporting_config_data(args):
     storage_spec = {}
     if args.heartbeat_timeout_ms is not None:
         storage_spec["heartbeat_timeout_ms"] = args.heartbeat_timeout_ms
@@ -94,27 +94,28 @@ def add_3fs_sub_parser(subparsers):
     return parser_3fs
 
 
-def add_vineyard_sub_parser(subparsers):
-    parser_vineyard = subparsers.add_parser('vineyard', help='Vineyard (v6d) storage options')
-    parser_vineyard.add_argument(
+def add_event_reporting_sub_parser(subparsers, name, help_text):
+    parser = subparsers.add_parser(name, help=help_text)
+    parser.add_argument(
         '--heartbeat_timeout_ms',
         type=int,
         default=None,
         help='heartbeat timeout in ms (server default: 30000)')
-    parser_vineyard.add_argument(
+    parser.add_argument(
         '--cleanup_grace_ms',
         type=int,
         default=None,
         help='cleanup grace period in ms (server default: 300000)')
-    parser_vineyard.add_argument(
+    parser.add_argument(
         '--liveness_check_interval_ms',
         type=int,
         default=None,
         help='liveness check interval in ms (server default: 5000)')
-    return parser_vineyard
+    return parser
 
 
-def add_or_update_main(method: str, handle_nfs, handle_pace, handle_3fs, handle_vineyard):
+def add_or_update_main(method: str, handle_nfs, handle_pace, handle_3fs,
+                       handle_vineyard, handle_rtp_llm, handle_vllm):
     common_parser = create_common_parser()
     parser = argparse.ArgumentParser(
         prog=f"python3 script.kvcm.storage.{method}",
@@ -140,12 +141,16 @@ def add_or_update_main(method: str, handle_nfs, handle_pace, handle_3fs, handle_
     parser_nfs = add_nfs_sub_parser(subparsers)
     parser_pace = add_pace_sub_parser(subparsers)
     parser_3fs = add_3fs_sub_parser(subparsers)
-    parser_vineyard = add_vineyard_sub_parser(subparsers)
+    parser_vineyard = add_event_reporting_sub_parser(subparsers, 'vineyard', 'Vineyard (v6d) storage options')
+    parser_rtp_llm = add_event_reporting_sub_parser(subparsers, 'rtp_llm', 'RTP-LLM storage options')
+    parser_vllm = add_event_reporting_sub_parser(subparsers, 'vllm', 'VLLM storage options')
 
     parser_nfs.set_defaults(func=handle_nfs)
     parser_pace.set_defaults(func=handle_pace)
     parser_3fs.set_defaults(func=handle_3fs)
     parser_vineyard.set_defaults(func=handle_vineyard)
+    parser_rtp_llm.set_defaults(func=handle_rtp_llm)
+    parser_vllm.set_defaults(func=handle_vllm)
 
     args = parser.parse_args()
 

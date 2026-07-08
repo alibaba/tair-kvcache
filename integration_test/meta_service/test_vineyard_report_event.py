@@ -483,8 +483,24 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
         # Register + add mem/disk replicas in a single batch.
         events = [_ev_node_register(["mem", "disk"])]
         for bk in block_keys:
-            events.append(_ev_block_add(bk, "mem", _make_single_spec("spec_4096", _build_vineyard_uri(down_host, "mem"))))
-            events.append(_ev_block_add(bk, "disk", _make_single_spec("spec_4096", _build_vineyard_uri(down_host, "disk"))))
+            events.append(
+                _ev_block_add(
+                    bk,
+                    "mem",
+                    _make_single_spec(
+                        "spec_4096",
+                        _build_vineyard_uri(
+                            down_host,
+                            "mem"))))
+            events.append(
+                _ev_block_add(
+                    bk,
+                    "disk",
+                    _make_single_spec(
+                        "spec_4096",
+                        _build_vineyard_uri(
+                            down_host,
+                            "disk"))))
         self.client.report_event(_make_request(self.instance_id, down_host, events, trace_id="t08a"))
 
         body = self.client.report_event(
@@ -695,7 +711,6 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
             for spec in loc.get("location_specs", []):
                 self.assertNotIn(host, spec.get("uri", ""),
                                  f"Cleanup should have removed host [{host}] from results")
-
 
 
 # ---------------------------------------------------------------------------
