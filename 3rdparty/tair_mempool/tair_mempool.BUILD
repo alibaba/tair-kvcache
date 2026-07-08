@@ -14,14 +14,11 @@ cc_library(
         "src/address_mgmt/bfc_allocator.cpp",
         "src/address_mgmt/shared_meta.cpp",
         "src/address_mgmt/util.cpp",
-        "src/client/data_dumper.cpp",
-        "src/client/ga_mapper.cpp",
-        "src/client/request_encoder.cpp",
         "src/common/env_util.cpp",
         "src/cuda/cuda_util.cpp",
         "src/pace_mp_api.cpp",
         "src/monitor/latency_profiler.cpp"
-    ] + glob(["src/client/mps*.cpp"]),
+    ] + glob(["src/client/*.cpp"]),
     hdrs = glob([
         "include/pace_mp.h",
         "include/pace_mp_meta.h",
