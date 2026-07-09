@@ -504,6 +504,15 @@ def main():
             output_file=output_path,
             sort_by_timestamp=not args.no_sort
         )
+
+        if merged_count != total_traces:
+            print(
+                "❌ Error: Trace count mismatch: "
+                f"conversion stage reported {total_traces} traces, "
+                f"but final output contains {merged_count}",
+                file=sys.stderr
+            )
+            return 1
         
         print(f"\n✅ Success! Generated {merged_count} traces")
         

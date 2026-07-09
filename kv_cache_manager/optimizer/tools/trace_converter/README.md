@@ -457,10 +457,25 @@ class MyConverter(BaseConverter):
     def __init__(self, default_instance_id='instance',
                  instance_block_sizes=None, mode='optimizer', **kwargs):
         super().__init__(default_instance_id, instance_block_sizes, mode)
+        self.converter_config = kwargs.get('converter_config', {})
     
-    def convert(self, input_file: str, output_file: str) -> int:
-        """转换逻辑实现"""
-        pass
+    def convert_to_traces(self, input_file: str) -> list:
+        """读取输入并返回标准 trace dict 列表"""
+        traces = []
+        with open(input_file, 'r', encoding='utf-8') as f_in:
+            for line in f_in:
+                if not line.strip():
+                    continue
+                raw = json.loads(line)
+                traces.append({
+                    'type': 'get',
+                    'instance_id': raw.get('instance_id', self.default_instance_id),
+                    'trace_id': raw['trace_id'],
+                    'timestamp_ns': raw['timestamp_ns'],
+                    'keys': raw['keys'],
+                    'input_len': raw['input_len'],
+                })
+        return traces
 ```
 
 **命名约定**：
