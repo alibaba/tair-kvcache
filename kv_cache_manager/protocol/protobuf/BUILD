@@ -18,12 +18,14 @@ cc_library(
         "debug_service.pb.cc",
         "kv_meta_service.pb.cc",
         "meta_service.pb.cc",
+        "optimizer_service.pb.cc",
     ],
     hdrs = [
         "admin_service.pb.h",
         "debug_service.pb.h",
         "kv_meta_service.pb.h",
         "meta_service.pb.h",
+        "optimizer_service.pb.h",
     ],
     include_prefix = "service/proto",
     deps = select({
@@ -32,12 +34,14 @@ cc_library(
             ":debug_service_cc_impl_grpc_header_only",
             ":kv_meta_service_cc_impl_grpc_header_only",
             ":meta_service_cc_impl_grpc_header_only",
+            ":optimizer_service_cc_impl_grpc_header_only",
         ],
         "//conditions:default": [
             ":admin_service_cc_impl",
             ":debug_service_cc_impl",
             ":kv_meta_service_cc_impl",
             ":meta_service_cc_impl",
+            ":optimizer_service_cc_impl",
         ],
     }),
 )
@@ -48,11 +52,13 @@ cc_library(
         "admin_service.grpc.pb.cc",
         "debug_service.grpc.pb.cc",
         "meta_service.grpc.pb.cc",
+        "optimizer_service.grpc.pb.cc",
     ],
     hdrs = [
         "admin_service.grpc.pb.h",
         "debug_service.grpc.pb.h",
         "meta_service.grpc.pb.h",
+        "optimizer_service.grpc.pb.h",
     ],
     include_prefix = "service/proto",
     visibility = ["//visibility:public"],
@@ -148,4 +154,25 @@ tf_proto_library_cc(
     ],
     cc_grpc_version = True,
     default_header = True,
+)
+
+tf_proto_library_cc(
+    name = "optimizer_service",
+    srcs = [
+        "optimizer_service.proto",
+    ],
+    cc_grpc_version = True,
+    default_header = True,
+)
+
+generate_grpc_proto(
+    name = "optimizer_service_py",
+    create_grpc_proto = ":create_grpc_proto",
+    proto = "optimizer_service.proto",
+)
+
+py_library(
+    name = "optimizer_service_py_proto",
+    srcs = [":optimizer_service_py"],
+    visibility = ["//visibility:public"],
 )

@@ -1,4 +1,5 @@
 package(default_visibility = [
+    "//kv_cache_manager/optimizer:__pkg__",
     "//kv_cache_manager/service:__subpackages__",
     "//stub_source:__subpackages__",
 ])

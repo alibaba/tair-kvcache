@@ -17,6 +17,41 @@ cc_library(
 )
 
 cc_library(
+    name = "instance_info",
+    srcs = [
+        "instance_info.cc",
+        "model_deployment.cc",
+    ],
+    hdrs = [
+        "instance_info.h",
+        "model_deployment.h",
+    ],
+    deps = [
+        "//kv_cache_manager/common",
+    ],
+)
+
+cc_library(
+    name = "registry_backend",
+    srcs = [
+        "registry_local_backend.cc",
+        "registry_redis_backend.cc",
+        "registry_storage_backend_factory.cc",
+    ],
+    hdrs = [
+        "registry_local_backend.h",
+        "registry_redis_backend.h",
+        "registry_storage_backend.h",
+        "registry_storage_backend_factory.h",
+    ],
+    deps = [
+        "//kv_cache_manager/common",
+        "//kv_cache_manager/common:concurrent_hash_map",
+        "//kv_cache_manager/common:redis_client",
+    ],
+)
+
+cc_library(
     name = "config",
     srcs = [
         "cache_config.cc",
@@ -24,16 +59,11 @@ cc_library(
         "data_storage_strategy.cc",
         "instance_group.cc",
         "instance_group_quota.cc",
-        "instance_info.cc",
         "meta_cache_policy_config.cc",
         "meta_indexer_config.cc",
         "meta_storage_backend_config.cc",
-        "model_deployment.cc",
         "quota_config.cc",
-        "registry_local_backend.cc",
         "registry_manager.cc",
-        "registry_redis_backend.cc",
-        "registry_storage_backend_factory.cc",
         "trigger_strategy.cc",
     ],
     hdrs = [
@@ -43,20 +73,16 @@ cc_library(
         "data_storage_strategy.h",
         "instance_group.h",
         "instance_group_quota.h",
-        "instance_info.h",
         "meta_cache_policy_config.h",
         "meta_indexer_config.h",
         "meta_storage_backend_config.h",
-        "model_deployment.h",
         "quota_config.h",
-        "registry_local_backend.h",
         "registry_manager.h",
-        "registry_redis_backend.h",
-        "registry_storage_backend.h",
-        "registry_storage_backend_factory.h",
         "trigger_strategy.h",
     ],
     deps = [
+        ":instance_info",
+        ":registry_backend",
         "//kv_cache_manager/common",
         "//kv_cache_manager/common:concurrent_hash_map",
         "//kv_cache_manager/common:redis_client",

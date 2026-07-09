@@ -206,3 +206,15 @@ cc_test(
         "//kv_cache_manager/common:unittest",
     ],
 )
+
+cc_test(
+    name = "string_util_test",
+    srcs = [
+        "string_util_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/common:string_util",
+        "//kv_cache_manager/common:unittest",
+    ],
+)

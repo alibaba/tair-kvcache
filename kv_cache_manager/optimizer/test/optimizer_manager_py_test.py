@@ -34,6 +34,7 @@ class OptimizerManagerPyTest(unittest.TestCase):
         
         self.assertIsNotNone(self.manager)
         self.manager.Init()
+
     def tearDown(self):
         # 清理临时目录
         import shutil

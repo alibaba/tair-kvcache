@@ -4,7 +4,7 @@
 #include <vector>
 
 #include "kv_cache_manager/common/jsonizable.h"
-#include "kv_cache_manager/optimizer/config/instance_config.h"
+#include "kv_cache_manager/optimizer/config/replay_instance_config.h"
 #include "kv_cache_manager/optimizer/config/tier_config.h"
 #include "kv_cache_manager/optimizer/config/types.h"
 namespace kv_cache_manager {
@@ -67,10 +67,10 @@ private:
     std::vector<OptTierFlowConfig> tier_flows_;
 };
 
-class OptInstanceGroupConfig : public Jsonizable {
+class OptimizerReplayInstanceGroupConfig : public Jsonizable {
 public:
-    OptInstanceGroupConfig() = default;
-    ~OptInstanceGroupConfig() override = default;
+    OptimizerReplayInstanceGroupConfig() = default;
+    ~OptimizerReplayInstanceGroupConfig() override = default;
     bool FromRapidValue(const rapidjson::Value &rapid_value) override;
     void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
 
@@ -90,7 +90,7 @@ public:
     [[nodiscard]] int64_t default_block_ttl_seconds() const { return default_block_ttl_seconds_; }
     [[nodiscard]] bool ttl_refresh_on_read() const { return ttl_refresh_on_read_; }
     [[nodiscard]] const std::vector<OptTierConfig> &storages() const { return storages_; }
-    [[nodiscard]] const std::vector<OptInstanceConfig> &instances() const { return instances_; }
+    [[nodiscard]] const std::vector<OptimizerReplayInstanceConfig> &instances() const { return instances_; }
     [[nodiscard]] std::vector<OptTierConfig> &mutable_storages() { return storages_; }
 
     void set_group_name(const std::string &name) { group_name_ = name; }
@@ -105,7 +105,7 @@ public:
     void set_default_block_ttl_seconds(int64_t ttl) { default_block_ttl_seconds_ = ttl; }
     void set_ttl_refresh_on_read(bool enabled) { ttl_refresh_on_read_ = enabled; }
     void set_storages(const std::vector<OptTierConfig> &storages) { storages_ = storages; }
-    void set_instances(const std::vector<OptInstanceConfig> &instances) { instances_ = instances; }
+    void set_instances(const std::vector<OptimizerReplayInstanceConfig> &instances) { instances_ = instances; }
 
 private:
     std::string group_name_;
@@ -116,7 +116,7 @@ private:
     bool ttl_refresh_on_read_ = true;
 
     std::vector<OptTierConfig> storages_;
-    std::vector<OptInstanceConfig> instances_;
+    std::vector<OptimizerReplayInstanceConfig> instances_;
 };
 
 } // namespace kv_cache_manager

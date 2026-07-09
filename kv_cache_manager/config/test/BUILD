@@ -69,6 +69,21 @@ cc_test(
     ],
 )
 
+cc_test(
+    name = "instance_group_test",
+    srcs = [
+        "instance_group_test.cc",
+    ],
+    copts = ["-fno-access-control"],
+    data = [],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/config",
+        "//kv_cache_manager/protocol/protobuf:service_cc_proto",
+        "//kv_cache_manager/service/util:manager_message_proto_util",
+    ],
+)
+
 cc_library(
     name = "coordination_backend_test_base",
     testonly = True,

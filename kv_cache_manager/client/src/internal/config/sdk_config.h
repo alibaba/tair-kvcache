@@ -29,8 +29,8 @@ public:
     void set_get_timeout_ms(int timeout_ms) { get_timeout_ms_ = timeout_ms; }
 
 private:
-    int put_timeout_ms_{2000};
-    int get_timeout_ms_{2000};
+    int put_timeout_ms_{15000};
+    int get_timeout_ms_{15000};
 };
 
 class SdkBackendConfig : public Jsonizable {

@@ -6,8 +6,8 @@
 #include <vector>
 
 #include "kv_cache_manager/optimizer/config/eviction_config.h"
-#include "kv_cache_manager/optimizer/config/instance_config.h"
-#include "kv_cache_manager/optimizer/config/instance_group_config.h"
+#include "kv_cache_manager/optimizer/config/replay_instance_config.h"
+#include "kv_cache_manager/optimizer/config/replay_instance_group_config.h"
 #include "kv_cache_manager/optimizer/config/tier_config.h"
 #include "kv_cache_manager/optimizer/index/radix_tree_index.h"
 #include "kv_cache_manager/optimizer/manager/eviction_manager.h"
@@ -18,7 +18,7 @@ public:
 
     OptIndexerManager(const std::shared_ptr<OptEvictionManager> &eviction_manager);
     ~OptIndexerManager() = default;
-    bool CreateOptIndexer(const OptInstanceConfig &instance_config,
+    bool CreateOptIndexer(const OptimizerReplayInstanceConfig &instance_config,
                           const std::vector<OptTierConfig> &storage_configs,
                           bool hierarchical_eviction_enabled = false,
                           TierWriteMode tier_write_mode = TierWriteMode::WRITE_THROUGH,
@@ -34,8 +34,9 @@ public:
     size_t GetOptIndexerSize() const;
 
 public:
-    void RegisterInstanceGroups(const std::unordered_map<std::string, OptInstanceGroupConfig> &instance_groups);
-    void RegisterInstances(const std::unordered_map<std::string, OptInstanceConfig> &instances);
+    void
+    RegisterInstanceGroups(const std::unordered_map<std::string, OptimizerReplayInstanceGroupConfig> &instance_groups);
+    void RegisterInstances(const std::unordered_map<std::string, OptimizerReplayInstanceConfig> &instances);
 
     // 仅做过期清理，不做容量驱逐；返回待清理的 block 列表
     EvictedBlocks EvictExpiredBeforeAccess(const std::string &instance_id, int64_t current_timestamp);
@@ -58,13 +59,13 @@ public:
     void ClearAllCaches();
 
 private:
-    const OptInstanceGroupConfig *FindInstanceGroupConfig(const std::string &instance_id) const;
+    const OptimizerReplayInstanceGroupConfig *FindInstanceGroupConfig(const std::string &instance_id) const;
 
     std::unordered_map<std::string, std::shared_ptr<RadixTreeIndex>> opt_indexer_map_;
     std::shared_ptr<OptEvictionManager> eviction_manager_;
 
-    std::unordered_map<std::string, OptInstanceGroupConfig> instance_group_configs_;
-    std::unordered_map<std::string, OptInstanceConfig> instance_configs_;
+    std::unordered_map<std::string, OptimizerReplayInstanceGroupConfig> instance_group_configs_;
+    std::unordered_map<std::string, OptimizerReplayInstanceConfig> instance_configs_;
 };
 
 } // namespace kv_cache_manager

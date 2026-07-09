@@ -1,19 +1,21 @@
-#include "kv_cache_manager/optimizer/config/instance_config.h"
+#include "kv_cache_manager/optimizer/config/replay_instance_config.h"
 
 #include "kv_cache_manager/common/logger.h"
 
 namespace kv_cache_manager {
-bool OptInstanceConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
+
+bool OptimizerReplayInstanceConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
     KVCM_JSON_GET_MACRO(rapid_value, "instance_id", instance_id_);
     KVCM_JSON_GET_MACRO(rapid_value, "block_size", block_size_);
-    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "bytes_per_token", bytes_per_token_, int64_t(0));
+    KVCM_JSON_GET_MACRO(rapid_value, "bytes_per_token", bytes_per_token_);
+    KVCM_JSON_GET_MACRO(rapid_value, "instance_group_name", instance_group_name_);
+
     if (bytes_per_token_ <= 0) {
-        KVCM_LOG_ERROR(
-            "bytes_per_token is required and must be > 0 (got %lld), capacity eviction cannot function without it",
-            static_cast<long long>(bytes_per_token_));
+        KVCM_LOG_ERROR("bytes_per_token must be positive for offline optimizer instance %s, got %lld",
+                       instance_id_.c_str(),
+                       static_cast<long long>(bytes_per_token_));
         return false;
     }
-    KVCM_JSON_GET_MACRO(rapid_value, "instance_group_name", instance_group_name_);
     std::string eviction_policy_type_str;
     KVCM_JSON_GET_MACRO(rapid_value, "eviction_policy_type", eviction_policy_type_str);
     eviction_policy_type_ = ToEvictionPolicyType(eviction_policy_type_str);
@@ -36,7 +38,9 @@ bool OptInstanceConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
     return true;
 };
 
-void OptInstanceConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
+int64_t OptimizerReplayInstanceConfig::bytes_per_block() const { return bytes_per_token_ * block_size_; }
+
+void OptimizerReplayInstanceConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
     Put(writer, "instance_id", instance_id_);
     Put(writer, "block_size", block_size_);
     if (bytes_per_token_ > 0) {

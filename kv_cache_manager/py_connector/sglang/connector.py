@@ -190,8 +190,8 @@ class HiCacheKVCM(HiCacheStorage):
         # sdk
         self.sdk_thread_num = self.extra_config.get("sdk_thread_num", 4)
         self.sdk_queue_size = self.extra_config.get("sdk_queue_size", 1000)
-        self.sdk_get_timeout_ms = self.extra_config.get("sdk_get_timeout_ms", 5000)
-        self.sdk_put_timeout_ms = self.extra_config.get("sdk_put_timeout_ms", 10000)
+        self.sdk_get_timeout_ms = self.extra_config.get("sdk_get_timeout_ms", 15000)
+        self.sdk_put_timeout_ms = self.extra_config.get("sdk_put_timeout_ms", 15000)
 
         self.read_iov_block_size = self.extra_config.get("read_iov_block_size", 0)
         self.write_iov_block_size = self.extra_config.get("write_iov_block_size", 0)

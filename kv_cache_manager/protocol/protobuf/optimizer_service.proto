@@ -1,0 +1,245 @@
+syntax = "proto3";
+
+package kv_cache_manager.proto.optimizer;
+
+option cc_generic_services = false;
+
+enum ErrorCode {
+    UNSPECIFIED = 0;
+    OK = 1;
+    UNSUPPORTED = 2;
+    INTERNAL_ERROR = 3;
+    SERVICE_NOT_READY = 4;
+    INVALID_ARGUMENT = 5;
+    DUPLICATE_ENTITY = 6;
+    REACH_MAX_ENTITY_CAPACITY = 7;
+    INSTANCE_NOT_EXIST = 8;
+    SERVER_NOT_LEADER = 9;
+
+    IO_ERROR = 20;
+    UNKNOWN_ERROR = 100;
+    ERROR_MAX = 65535;
+}
+
+message Status {
+    ErrorCode code = 1;
+    string message = 2;
+}
+
+message CommonResponseHeader {
+    Status status = 1;
+    string request_id = 2;
+    string tracer_result = 3;
+}
+
+message CommonResponse { CommonResponseHeader header = 1; }
+
+message LocationSpecInfo {
+    string name = 1; // 对应 KVCM LocationSpecInfo.name
+    int64 size = 2;  // 该 spec 的字节数
+}
+
+message LocationSpecGroup {
+    string name = 1;
+    repeated string spec_names = 2;
+}
+
+message OptimizerStateInfo {
+    string full_location_spec_group_name = 1;   // optimizer 语义：full 状态对应的 KVCM LocationSpecGroup
+    string linear_location_spec_group_name = 2; // optimizer 语义：linear/mamba 额外状态对应的 KVCM LocationSpecGroup，可为空
+}
+
+enum OptimizerEvictionPolicy {
+    OPTIMIZER_EVICTION_POLICY_UNSPECIFIED = 0;
+    OPTIMIZER_EVICTION_POLICY_LRU = 1;
+}
+
+// OptimizerInstanceGroup 配置，控制在线优化器的缓存模拟行为
+message OptimizerInstanceGroupProto {
+    string name = 1;                     // group 唯一名称
+    OptimizerEvictionPolicy eviction_policy = 2; // group 对应一条驱逐策略线，当前仅支持 LRU
+    repeated double capacity_gb = 3;     // group 下的多容量列表，单位 GB
+    bool shared_group_quota = 4;         // true 表示 group 内 instance 共享容量预算
+    int64 ttl_seconds = 5;               // TTL 秒数，0 表示不启用 TTL
+    bool enable_theoretical_max_cache = 6; // 是否启用 theoretical/max cache
+}
+
+// InstanceGroup 增删改查
+
+message CreateInstanceGroupRequest {
+    string trace_id = 1;
+    OptimizerInstanceGroupProto instance_group = 2;
+}
+
+message UpdateInstanceGroupRequest {
+    string trace_id = 1;
+    OptimizerInstanceGroupProto instance_group = 2;
+}
+
+message RemoveInstanceGroupRequest {
+    string trace_id = 1;
+    string name = 2; // group 名称
+}
+
+message GetInstanceGroupRequest {
+    string trace_id = 1;
+    string name = 2; // group 名称
+}
+
+message GetInstanceGroupResponse {
+    CommonResponseHeader header = 1;
+    OptimizerInstanceGroupProto instance_group = 2;
+}
+
+message ListInstanceGroupsRequest {
+    string trace_id = 1;
+}
+
+message ListInstanceGroupsResponse {
+    CommonResponseHeader header = 1;
+    repeated OptimizerInstanceGroupProto instance_groups = 2;
+}
+
+// Instance 注册/删除（注册前 group 必须已存在）
+
+message OptimizerRegisterInstanceRequest {
+    string trace_id = 1;
+    string instance_group = 2;   // 所属 group 名称
+    string instance_id = 3;      // 实例唯一标识，代表一个模型的具体部署
+    int32 block_size = 4;        // 一个 block 包含多少 token
+    repeated LocationSpecInfo location_spec_infos = 5;   // KVCM 风格 spec 定义
+    repeated LocationSpecGroup location_spec_groups = 6; // KVCM 风格 spec group 定义
+    OptimizerStateInfo optimizer_state_info = 7; // 显式声明 optimizer full/linear 状态如何映射到 KVCM group
+    int32 linear_step = 8;       // 0 表示 full-only；>0 表示每 linear_step 个 block 产生一次 full+linear checkpoint
+}
+
+message OptimizerRegisterInstanceResponse {
+    CommonResponseHeader header = 1;
+    repeated int64 estimated_capacity_blocks = 2; // 各档容量按 average block size 折算的 block 数
+    int64 size_full_only = 3;           // 仅 full spec 的单 block 字节数
+    int64 size_full_linear = 4;         // full+linear 混合的单 block 字节数
+}
+
+message OptimizerRemoveInstanceRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+}
+
+message OptimizerRemoveInstanceResponse {
+    CommonResponseHeader header = 1;
+}
+
+message OptimizerGetInstanceRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+}
+
+message OptimizerGetInstanceResponse {
+    CommonResponseHeader header = 1;
+    string instance_group = 2;
+    string instance_id = 3;
+    int32 block_size = 4;
+    repeated LocationSpecInfo location_spec_infos = 5;
+    repeated LocationSpecGroup location_spec_groups = 6;
+    OptimizerStateInfo optimizer_state_info = 7;
+    int32 linear_step = 8;
+}
+
+// TraceQuery：模拟 block 级缓存命中
+
+message TraceQueryRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+    repeated int64 block_keys = 3;  // 本次请求的 block key 序列（有序，前缀匹配）
+    repeated int64 token_ids = 4;   // 预留：token 粒度追踪
+}
+
+message TraceQueryResponse {
+    CommonResponseHeader header = 1;
+    int64 total_blocks = 2;    // 本次请求的总 block 数
+    repeated TraceQueryCapacityResult capacity_results = 3;
+    TraceQueryTheoreticalResult theoretical_result = 4;
+}
+
+message TraceQueryCapacityResult {
+    double capacity_gb = 1;
+    int64 cache_hit_count = 2;      // 该容量下的前缀连续命中长度
+    double hit_rate = 3;            // cache_hit_count / total_blocks
+    int64 current_unique_keys = 4;  // 该容量下当前 resident unique key 数
+}
+
+message TraceQueryTheoreticalResult {
+    int64 max_hit_count = 1;        // theoretical/max cache 前缀连续命中长度，未启用时为 -1
+    int64 current_unique_keys = 2;  // theoretical/max cache 当前 resident unique key 数
+}
+
+// Instance 列表/统计重置
+
+message OptimizerListInstancesRequest {
+    string trace_id = 1;
+    string instance_group = 2; // 为空时返回所有 instance
+}
+
+message OptimizerCapacitySummary {
+    double capacity_gb = 1;
+    int64 total_hits = 2;
+    double hit_rate = 3;
+}
+
+message OptimizerTheoreticalSummary {
+    int64 total_max_hits = 1;
+    double max_hit_rate = 2;
+}
+
+message OptimizerInstanceDebugInfo {
+    int32 block_size = 1;
+    int64 unique_keys = 2;
+    int32 linear_step = 3;
+    int64 eviction_count = 4;
+    int64 memory_usage_bytes = 5;
+    int64 kv_cache_usage_bytes = 6;
+    int64 ttl_eviction_count = 7;
+}
+
+message OptimizerInstanceSummary {
+    string instance_id = 1;
+    string instance_group = 2;
+    int64 total_queries = 3;        // 累计查询次数
+    int64 total_blocks_queried = 4; // 累计查询 block 数
+    repeated OptimizerCapacitySummary capacity_summaries = 5; // 各容量档位的累积命中率
+    OptimizerTheoreticalSummary theoretical_summary = 6;
+    OptimizerInstanceDebugInfo debug_info = 7;
+}
+
+message OptimizerListInstancesResponse {
+    CommonResponseHeader header = 1;
+    repeated OptimizerInstanceSummary instances = 2;
+}
+
+message OptimizerResetStatsRequest {
+    string trace_id = 1;
+    string instance_id = 2;
+}
+
+message OptimizerResetStatsResponse {
+    CommonResponseHeader header = 1;
+}
+
+service OptimizerService {
+    // InstanceGroup 管理
+    rpc CreateInstanceGroup(CreateInstanceGroupRequest) returns (CommonResponse);
+    rpc UpdateInstanceGroup(UpdateInstanceGroupRequest) returns (CommonResponse);
+    rpc RemoveInstanceGroup(RemoveInstanceGroupRequest) returns (CommonResponse);
+    rpc GetInstanceGroup(GetInstanceGroupRequest) returns (GetInstanceGroupResponse);
+    rpc ListInstanceGroups(ListInstanceGroupsRequest) returns (ListInstanceGroupsResponse);
+
+    // Instance 管理
+    rpc RegisterInstance(OptimizerRegisterInstanceRequest) returns (OptimizerRegisterInstanceResponse);
+    rpc RemoveInstance(OptimizerRemoveInstanceRequest) returns (OptimizerRemoveInstanceResponse);
+    rpc GetInstance(OptimizerGetInstanceRequest) returns (OptimizerGetInstanceResponse);
+    rpc ListInstances(OptimizerListInstancesRequest) returns (OptimizerListInstancesResponse);
+
+    // 在线 TraceQuery
+    rpc TraceQuery(TraceQueryRequest) returns (TraceQueryResponse);
+    rpc ResetStats(OptimizerResetStatsRequest) returns (OptimizerResetStatsResponse);
+}

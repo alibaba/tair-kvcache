@@ -1,6 +1,7 @@
 #include "kv_cache_manager/metrics/prometheus_exporter.h"
 
 #include <cmath>
+#include <set>
 #include <sstream>
 #include <string>
 #include <variant>
@@ -112,10 +113,16 @@ std::string PrometheusExporter::Expose(MetricsRegistry &registry, const std::str
     // the first time any write path on Counter/Gauge runs against it.
     // If every series in a family is untouched, the # HELP / # TYPE
     // header is omitted as well.
+    //
+    // Histogram families are identified via explicit metric→family mapping
+    // registered by RevisitIntervalHistogram::Init(). The exporter queries
+    // the registry — no suffix-based guessing.
     std::ostringstream ss;
 
     std::string prev_name;
-    bool family_header_written = false;
+    std::string current_family;             // histogram family for current metric (empty if regular)
+    std::set<std::string> families_written; // histogram families whose TYPE header was emitted
+    bool name_header_written = false;       // tracks TYPE/HELP for regular (non-histogram) metrics
     for (const auto &[name, tags, val] : all_metrics) {
         if (val == nullptr || !val->touched.load(std::memory_order_relaxed)) {
             continue;
@@ -124,27 +131,46 @@ std::string PrometheusExporter::Expose(MetricsRegistry &registry, const std::str
         std::string prom_name = SanitizeName(prefix, name);
 
         if (name != prev_name) {
-            family_header_written = false;
             prev_name = name;
+            name_header_written = false;
+            current_family = registry.GetMetricFamily(name);
         }
 
-        if (!family_header_written) {
-            const char *type_str = "untyped";
-            if (std::holds_alternative<CounterValue>(val->value)) {
-                type_str = "counter";
-            } else if (std::holds_alternative<GaugeValue>(val->value)) {
-                type_str = "gauge";
+        if (!name_header_written) {
+            if (!current_family.empty()) {
+                // Histogram metric: emit TYPE/HELP once per family
+                if (families_written.insert(current_family).second) {
+                    std::string family_prom_name = SanitizeName(prefix, current_family);
+                    ss << "# HELP " << family_prom_name << ' ' << current_family << '\n';
+                    ss << "# TYPE " << family_prom_name << " histogram\n";
+                }
+            } else {
+                // Regular counter/gauge
+                const char *type_str = "untyped";
+                if (std::holds_alternative<CounterValue>(val->value)) {
+                    type_str = "counter";
+                } else if (std::holds_alternative<GaugeValue>(val->value)) {
+                    type_str = "gauge";
+                }
+                ss << "# HELP " << prom_name << ' ' << name << '\n';
+                ss << "# TYPE " << prom_name << ' ' << type_str << '\n';
             }
-            ss << "# HELP " << prom_name << ' ' << name << '\n';
-            ss << "# TYPE " << prom_name << ' ' << type_str << '\n';
-            family_header_written = true;
+            name_header_written = true;
         }
 
         ss << prom_name;
         WriteLabels(ss, tags);
 
         if (std::holds_alternative<CounterValue>(val->value)) {
-            ss << ' ' << std::get<CounterValue>(val->value).load(std::memory_order_relaxed);
+            uint64_t raw = std::get<CounterValue>(val->value).load(std::memory_order_relaxed);
+            // Histogram _sum stores microseconds; convert to seconds for Prometheus
+            static const std::string kSumSuffix = "_sum";
+            if (!current_family.empty() && name.size() >= kSumSuffix.size() &&
+                name.compare(name.size() - kSumSuffix.size(), kSumSuffix.size(), kSumSuffix) == 0) {
+                ss << ' ' << static_cast<double>(raw) / 1e6;
+            } else {
+                ss << ' ' << raw;
+            }
         } else if (std::holds_alternative<GaugeValue>(val->value)) {
             double gv = std::get<GaugeValue>(val->value).load(std::memory_order_relaxed);
             if (std::isnan(gv)) {

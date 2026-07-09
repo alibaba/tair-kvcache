@@ -1,4 +1,4 @@
-#include "kv_cache_manager/optimizer/config/instance_group_config.h"
+#include "kv_cache_manager/optimizer/config/replay_instance_group_config.h"
 
 #include <algorithm>
 #include <sstream>
@@ -270,7 +270,7 @@ OptTierStrategyConfig::BuildFlowStrategies(const std::vector<OptTierConfig> &sto
     return strategies;
 }
 
-bool OptInstanceGroupConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
+bool OptimizerReplayInstanceGroupConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
     KVCM_JSON_GET_MACRO(rapid_value, "group_name", group_name_);
     KVCM_JSON_GET_MACRO(rapid_value, "used_percentage", used_percentage_);
     KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "default_block_ttl_seconds", default_block_ttl_seconds_, int64_t(0));
@@ -298,7 +298,8 @@ bool OptInstanceGroupConfig::FromRapidValue(const rapidjson::Value &rapid_value)
     return true;
 };
 
-void OptInstanceGroupConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
+void OptimizerReplayInstanceGroupConfig::ToRapidWriter(
+    rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
     Put(writer, "group_name", group_name_);
     // Write quota_capacity in GB
     const double quota_gb =

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 #include "kv_cache_manager/common/jsonizable.h"
 #include "kv_cache_manager/config/cache_config.h"
@@ -48,6 +49,17 @@ public:
         event_reporting_storage_candidates_ = candidates;
     }
 
+    // Revisit interval histogram bucket boundaries (parsed, validated).
+    // Empty vector means "use server-level default".
+    const std::vector<double> &revisit_interval_buckets() const { return parsed_revisit_interval_buckets_; }
+
+    // Set from raw config string. Parses and validates immediately.
+    // On parse failure, logs a warning and stores empty vector (fallback to default).
+    void set_revisit_interval_buckets(const std::string &buckets_str);
+
+    // Raw string for JSON serialization (preserves original config text).
+    const std::string &revisit_interval_buckets_raw() const { return revisit_interval_buckets_str_; }
+
 private:
     std::string name_;
     std::vector<std::string> storage_candidates_;
@@ -59,6 +71,8 @@ private:
     int64_t version_;
     std::string extra_info_;
     std::vector<std::string> event_reporting_storage_candidates_;
+    std::string revisit_interval_buckets_str_;            // raw string for JSON wire format
+    std::vector<double> parsed_revisit_interval_buckets_; // parsed, validated boundaries
 };
 
 } // namespace kv_cache_manager

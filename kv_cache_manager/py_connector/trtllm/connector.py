@@ -80,8 +80,8 @@ def init_kvcm_transfer_client(llm_args, kvcm_config, extra_config):
     # sdk
     sdk_thread_num = kvcm_config.get("sdk_thread_num", 4)
     sdk_queue_size = kvcm_config.get("sdk_queue_size", 1000)
-    sdk_get_timeout_ms = kvcm_config.get("sdk_get_timeout_ms", 5000)
-    sdk_put_timeout_ms = kvcm_config.get("sdk_put_timeout_ms", 10000)
+    sdk_get_timeout_ms = kvcm_config.get("sdk_get_timeout_ms", 15000)
+    sdk_put_timeout_ms = kvcm_config.get("sdk_put_timeout_ms", 15000)
 
     # data transfer setup
     # TODO: sdk_config

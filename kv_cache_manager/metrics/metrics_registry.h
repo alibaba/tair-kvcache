@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -253,9 +254,21 @@ public:
     [[nodiscard]] std::shared_ptr<MetricsData> GetMetricsData(const std::string &name) noexcept;
     [[nodiscard]] std::shared_ptr<MetricsData> GetOrCreateMetricsData(const std::string &name) noexcept;
 
+    // Histogram family metadata (thread-safe via mutex_).
+    // RegisterHistogramFamily: declare a histogram family name (idempotent).
+    // MapMetricToFamily: map a metric name to a histogram family (idempotent).
+    // GetMetricFamily: look up the family for a metric name (empty string if unmapped).
+    // GetHistogramFamilies: return a snapshot of all registered family names (copy).
+    void RegisterHistogramFamily(const std::string &family_name);
+    void MapMetricToFamily(const std::string &metric_name, const std::string &family_name);
+    [[nodiscard]] std::string GetMetricFamily(const std::string &metric_name) const;
+    [[nodiscard]] std::set<std::string> GetHistogramFamilies() const;
+
 private:
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     std::map<std::string, std::shared_ptr<MetricsData>> metrics_data_map_;
+    std::set<std::string> histogram_families_;
+    std::map<std::string, std::string> metric_to_family_;
 };
 
 } // namespace kv_cache_manager

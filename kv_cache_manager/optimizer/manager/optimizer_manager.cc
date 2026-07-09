@@ -175,7 +175,7 @@ bool OptimizerManager::Init() {
     return true;
 }
 
-bool OptimizerManager::CreateRadixTreeIndex(const OptInstanceConfig &instance_config,
+bool OptimizerManager::CreateRadixTreeIndex(const OptimizerReplayInstanceConfig &instance_config,
                                             const std::vector<OptTierConfig> &storage_configs) {
     auto group_it = instance_group_configs_.find(instance_config.instance_group_name());
     if (group_it == instance_group_configs_.end()) {

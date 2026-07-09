@@ -33,24 +33,37 @@ cc_library(
 )
 
 cc_library(
-    name = "metrics_reporter",
+    name = "kmon_param",
     srcs = [
         "kmon_param.cc",
+    ],
+    hdrs = [
+        "kmon_param.h",
+    ],
+    deps = [
+        "//kv_cache_manager/common:utils",
+        "//kv_cache_manager/common:logger",
+    ],
+)
+
+cc_library(
+    name = "metrics_reporter",
+    srcs = [
         "kmonitor_metrics_reporter.cc",
         "local_metrics_reporter.cc",
         "logging_metrics_reporter.cc",
     ],
     hdrs = [
         "dummy_metrics_reporter.h",
-        "kmon_param.h",
         "kmonitor_metrics_reporter.h",
         "local_metrics_reporter.h",
         "logging_metrics_reporter.h",
         "metrics_reporter.h",
     ],
     deps = [
-        ":metrics_registry",
+        ":kmon_param",
         ":metrics_lifecycle",
+        ":metrics_registry",
         ":metrics_collector",
         "//kv_cache_manager/common:utils",
         "//kv_cache_manager/common:logger",
@@ -66,6 +79,19 @@ cc_library(
     ],
     hdrs = [
         "prometheus_exporter.h",
+    ],
+    deps = [
+        ":metrics_registry",
+    ],
+)
+
+cc_library(
+    name = "revisit_interval_histogram",
+    srcs = [
+        "revisit_interval_histogram.cc",
+    ],
+    hdrs = [
+        "revisit_interval_histogram.h",
     ],
     deps = [
         ":metrics_registry",

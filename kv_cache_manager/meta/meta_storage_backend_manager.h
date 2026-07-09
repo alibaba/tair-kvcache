@@ -97,6 +97,9 @@ public:
     size_t GetMemUsage() const noexcept;
     int64_t GetOldestAccessTime() const noexcept;
 
+    // Set revisit interval histogram for cache backend (optional, for metrics tracking).
+    void SetRevisitHistogram(std::shared_ptr<RevisitIntervalHistogram> histogram);
+
 private:
     void AsyncRecoverTask() noexcept;
     int64_t BackfillKeysToCache(const KeyTypeVec &keys,

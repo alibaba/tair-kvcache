@@ -2,12 +2,26 @@
 
 #include <algorithm>
 #include <fstream>
+#include <sstream>
 #include <stdio.h>
 
 #include "kv_cache_manager/common/env_util.h"
 #include "kv_cache_manager/common/string_util.h"
 
 namespace kv_cache_manager {
+
+std::vector<double> ServerConfig::ParseRevisitIntervalBuckets(const std::string &buckets_str) {
+    auto boundaries = StringUtil::ParseBucketBoundaries(buckets_str);
+    if (!buckets_str.empty() && boundaries.empty()) {
+        fprintf(stderr, "Invalid revisit_interval_buckets: must be positive numbers in strictly ascending order\n");
+    }
+    return boundaries;
+}
+
+const std::vector<double> &ServerConfig::GetDefaultRevisitIntervalBuckets() {
+    static const std::vector<double> kDefaults = {1, 5, 30, 60, 120, 180, 300, 600, 900, 1800, 3600, 21600, 86400};
+    return kDefaults;
+}
 
 // clang-format off
 std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSettingsMap = {
@@ -153,6 +167,11 @@ std::unordered_map<std::string, ServerConfig::SettingFunction> ServerConfig::kSe
      [](const std::string &value, ServerConfig *config) {
          config->prometheus_prefix_ = value;
          return true;
+     }},
+    {"kvcm.metrics.revisit_interval_buckets",
+     [](const std::string &value, ServerConfig *config) {
+         config->revisit_interval_buckets_ = value;
+         return true;
      }}};
 // clang-format on
 
@@ -280,10 +299,17 @@ void ServerConfig::UpdateEnviron(EnvironMap &environ) {
 }
 
 bool ServerConfig::Check() {
-    if (registry_storage_uri_.empty()) {
-        fprintf(stderr, "registry_storage_uri must be set\n");
-        return false;
+    // registry_storage_uri is optional: when empty, RegistryStorageBackendFactory
+    // falls back to local backend. No validation needed for empty value.
+
+    // Validate revisit_interval_buckets if set
+    if (!revisit_interval_buckets_.empty()) {
+        auto boundaries = ParseRevisitIntervalBuckets(revisit_interval_buckets_);
+        if (boundaries.empty()) {
+            return false; // ParseRevisitIntervalBuckets already printed the error
+        }
     }
+
     return true;
 }
 

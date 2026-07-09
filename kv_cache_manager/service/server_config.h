@@ -4,6 +4,7 @@
 #include <functional>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace kv_cache_manager {
 
@@ -45,6 +46,16 @@ public:
     const std::string &event_publishers_configs() { return event_publishers_configs_; }
     const std::string &GetAdvertisedHost() const { return advertised_host_; }
     const std::string &GetCustomInfo() const { return custom_info_; }
+    const std::string &GetRevisitIntervalBuckets() const { return revisit_interval_buckets_; }
+
+    // Parse revisit_interval_buckets config string into sorted vector of doubles.
+    // Returns empty vector if config is empty or invalid. Caller is responsible
+    // for applying default boundaries when the result is empty.
+    static std::vector<double> ParseRevisitIntervalBuckets(const std::string &buckets_str);
+
+    // Default bucket boundaries (seconds) for revisit interval histogram.
+    // 13 boundaries → 14 buckets including +Inf.
+    static const std::vector<double> &GetDefaultRevisitIntervalBuckets();
 
 private:
     void UpdateDefaultConfig();
@@ -80,6 +91,7 @@ private:
     std::string event_publishers_configs_;
     std::string advertised_host_;
     std::string custom_info_;
+    std::string revisit_interval_buckets_;
 
 private:
     using SettingFunction = std::function<bool(const std::string &, ServerConfig *config)>;

@@ -126,6 +126,14 @@ TEST_F(SdkBackendConfigTest, TestDuplicatedSdkConfig) {
     ASSERT_EQ(8, std::dynamic_pointer_cast<MooncakeSdkConfig>(mooncake_config)->put_replica_num());
 }
 
+TEST_F(SdkBackendConfigTest, TestSdkTimeoutConfigDefault) {
+    SdkTimeoutConfig timeout_config;
+
+    ASSERT_EQ(15000, timeout_config.get_timeout_ms());
+    ASSERT_EQ(15000, timeout_config.put_timeout_ms());
+    ASSERT_TRUE(timeout_config.Validate());
+}
+
 // Test cases for operator== functions
 TEST_F(SdkBackendConfigTest, TestSdkTimeoutConfigEquality) {
     SdkTimeoutConfig config1;

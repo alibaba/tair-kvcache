@@ -8,10 +8,10 @@
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/meta/cache_location.h"
 #include "kv_cache_manager/optimizer/config/insight_simulator_types.h"
-#include "kv_cache_manager/optimizer/config/instance_config.h"
-#include "kv_cache_manager/optimizer/config/instance_group_config.h"
 #include "kv_cache_manager/optimizer/config/optimizer_config.h"
 #include "kv_cache_manager/optimizer/config/optimizer_config_loader.h"
+#include "kv_cache_manager/optimizer/config/replay_instance_config.h"
+#include "kv_cache_manager/optimizer/config/replay_instance_group_config.h"
 #include "kv_cache_manager/optimizer/manager/optimizer_loader.h"
 #include "kv_cache_manager/optimizer/manager/optimizer_manager.h"
 
@@ -89,15 +89,16 @@ PYBIND11_MODULE(kvcm_py_optimizer, module) {
         .def("set_output_result_path", &kvcm::OptimizerConfig::set_output_result_path)
         .def("output_result_path", &kvcm::OptimizerConfig::output_result_path);
 
-    py::class_<kvcm::OptInstanceGroupConfig>(module, "OptInstanceGroupConfig")
+    py::class_<kvcm::OptimizerReplayInstanceGroupConfig>(module, "OptimizerReplayInstanceGroupConfig")
         .def(py::init<>())
-        .def("quota_capacity", &kvcm::OptInstanceGroupConfig::quota_capacity)
-        .def("set_quota_capacity", &kvcm::OptInstanceGroupConfig::set_quota_capacity)
-        .def("used_percentage", &kvcm::OptInstanceGroupConfig::used_percentage)
-        .def("set_used_percentage", &kvcm::OptInstanceGroupConfig::set_used_percentage);
+        .def("quota_capacity", &kvcm::OptimizerReplayInstanceGroupConfig::quota_capacity)
+        .def("set_quota_capacity", &kvcm::OptimizerReplayInstanceGroupConfig::set_quota_capacity)
+        .def("used_percentage", &kvcm::OptimizerReplayInstanceGroupConfig::used_percentage)
+        .def("set_used_percentage", &kvcm::OptimizerReplayInstanceGroupConfig::set_used_percentage);
 
     // 绑定 vector 类型，确保元素保持引用关系
-    py::bind_vector<std::vector<kvcm::OptInstanceGroupConfig>>(module, "VectorOptInstanceGroupConfig");
+    py::bind_vector<std::vector<kvcm::OptimizerReplayInstanceGroupConfig>>(module,
+                                                                           "VectorOptimizerReplayInstanceGroupConfig");
 
     // 绑定OptimizerConfigLoader
     py::class_<kvcm::OptimizerConfigLoader>(module, "OptimizerConfigLoader")
