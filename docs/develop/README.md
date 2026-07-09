@@ -28,6 +28,7 @@ bazelisk run //kv_cache_manager:main
   - HTML 报告：安装 lcov 后执行 ```mkdir -p coverage && cp bazel-out/_coverage/_coverage_report.dat coverage/lcov.info && sed -E -i 's/^(DA:[0-9]+),-[0-9]+/\1,0/' coverage/lcov.info && genhtml coverage/lcov.info --output-directory coverage/html --title "tair-kvcache coverage" --legend --show-details --ignore-errors source```，入口为 ```coverage/html/index.html```。
   - 分支覆盖率需要 LCOV 中包含 ```BRDA/BRF/BRH``` 记录；当前 Bazel 6.4 默认 C++ coverage 只生成行覆盖率。
   - CI 会上传 ```coverage/lcov.info```、```coverage/coverage-summary.md```、```coverage/coverage-summary.json``` 和 ```coverage/html/```。
+  - PR 触发的 coverage 会用同一条固定 PR 评论更新全量覆盖率、增量覆盖率和 HTML artifact 链接；若 PR token 无写权限（例如部分 fork 场景），评论步骤只告警，不影响覆盖率结果。
   - GitHub Actions cache 空间有限；CI 为普通单测、集成测试、客户端测试、ASAN 和 coverage 各保留一份主分支 Bazel disk cache。PR 只读取 cache，不写入；main push 或手动 ```rebuildDiskCache``` 会在测试成功后替换对应旧 cache，避免同类 cache 多版本堆积。ASAN 的单测与集成测试放在同一个 job/cache 中，减少 cache 数量。
   - ```test-opensrc``` 可通过 workflow_dispatch 的 ```runs-on``` 或仓库变量 ```TEST_OPEN_SRC_RUNS_ON``` 选择 ```ubuntu-latest```、```ubuntu-24.04-arm``` 或 ```aliyun-ecs-x64```；```coverage``` 可通过 workflow_dispatch 的 ```runs-on``` 或仓库变量 ```COVERAGE_RUNS_ON``` 选择同样的 runner。
 ### 测试资源清理
