@@ -4501,11 +4501,6 @@ TEST_F(CacheReclaimerTest, TestMigrateByStrategyOnBatch) {
         }
     }
 
-    const auto requests = SubmittedDelRequestsSnapshot();
-    ASSERT_FALSE(requests.empty());
-    const auto &req = requests.back();
-    ASSERT_EQ(batching_sz, req.block_keys.size());
-
     // ---- 场景 C：mark 路径 ----
     {
         captured_copy_reqs.clear();

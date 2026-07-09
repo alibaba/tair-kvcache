@@ -13,6 +13,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
@@ -145,6 +146,13 @@ public:
     size_t ActiveTaskCountForInstances(const std::vector<std::string> &instance_ids) const;
     // F-12: 取指定 instance 的活跃 copy task block_key 列表（用于 drain 前 BatchCancel）。
     std::vector<int64_t> GetActiveBlockKeysForInstance(const std::string &instance_id) const;
+
+    // F-12: instance 级 draining——RemoveInstance 期间阻止该 instance 的所有新迁移提交。
+    // Submit/BatchSubmit 在 copy_submission_mutex_ 下检查此集合，覆盖 reclaimer + admin 两条提交路径。
+    // BeginDrainingInstance 拿锁 insert 建立 happens-before：之后的提交拿锁必见 draining → 拒绝；
+    // 拿锁前的 in-flight 提交先完成 insert 活跃表 → 落进 drain 快照被 BatchCancel。两头堵死。
+    void BeginDrainingInstance(const std::string &instance_id);
+    void EndDrainingInstance(const std::string &instance_id);
 
     // ---- Copy 准入策略（CacheReclaimer / AdminServiceImpl 共用） ----
     enum class CopyAdmissionStatus {
@@ -312,7 +320,7 @@ private:
     // ---- 活跃任务表操作收口（F-13 Part A；均要求调用方持有 task_mutex_）----
     // 统一处理"内层 map 空则 erase 外层 + 更新 active gauge"，避免各业务路径重复手写、遗漏。
     // 业务语义的 stats/event 仍由各调用方按转换语义各自发出。
-    // 返回该 (instance, block) 之前是否已存在活跃任务（true 表示重复）。
+    // 插入成功返回 true；若该 (instance, block) 已存在活跃任务则不插入并返回 false（调用方据此回滚）。
     bool InsertActiveTaskLocked(CopyTaskContext ctx);
     // 移除 (instance, block) 的活跃任务；不存在返回 false。
     bool RemoveActiveTaskLocked(const std::string &instance_id, int64_t block_key);
@@ -355,6 +363,8 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<bool> accepting_copy_submissions_{false};
     std::mutex copy_submission_mutex_;
+    // F-12: draining 中的 instance（copy_submission_mutex_ 保护）。非空即拒绝该 instance 的新提交。
+    std::unordered_set<std::string> draining_instances_;
 
     // 统计计数（原子，GetStats 汇总）。
     std::atomic<uint64_t> stat_copy_submitted_{0};

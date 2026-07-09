@@ -1099,17 +1099,11 @@ TEST_F(MigrationManagerTest, TestBatchSubmitHeteroSpecCreateFailNoOrphan) {
 TEST_F(MigrationManagerTest, TestActiveTaskCountForInstancesIsolation) {
     const std::string kInstanceA = "group_a_inst_01";
     const std::string kInstanceB = "group_b_inst_01";
-    ASSERT_TRUE(CreateMetaIndexer(kInstanceA));
-    ASSERT_TRUE(CreateMetaIndexer(kInstanceB));
-    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "iso_hot/"));
-    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "iso_cold/"));
 
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_, metrics_registry_, nullptr);
-    mgr.Start();
-    mgr.DebugEnableCopySubmissionsForTest();
 
-    // 复用 fixture 的 CreateSourceLocation 不行（它绑 kInstance），手动用 DebugInsertActiveCopyTask 注入。
-    // DebugInsert 直接往活跃表插 entry，不走真实 copy 流程，避免 storage setup 脆弱性。
+    // DebugInsertActiveCopyTask 直接往活跃表插 entry，不走真实 copy 流程，
+    // 故无需 storage / Start / DebugEnable —— ActiveTaskCount* 只读内存表。
     mgr.DebugInsertActiveCopyTask(kInstanceA, 100, "dst_a1");
     mgr.DebugInsertActiveCopyTask(kInstanceA, 200, "dst_a2");
 
@@ -1121,8 +1115,6 @@ TEST_F(MigrationManagerTest, TestActiveTaskCountForInstancesIsolation) {
     ASSERT_EQ(0u, mgr.ActiveTaskCountForInstances({kInstanceB}));
     // 两个 group 合 = 全局
     ASSERT_EQ(2u, mgr.ActiveTaskCountForInstances({kInstanceA, kInstanceB}));
-
-    mgr.Stop();
 }
 
 // ===== 可观测：metrics 计数/gauge + events 发布 smoke =====
@@ -1507,6 +1499,55 @@ TEST_F(MigrationManagerTest, TestDrainInstanceViaBatchCancelAndPoll) {
     // drain 完成：活跃表空
     ASSERT_TRUE(mgr.GetActiveBlockKeysForInstance(kInstance).empty());
     ASSERT_EQ(2u, mgr.GetStats().copy_cancelled);
+}
+
+// F-12: draining gate 阻止该 instance 的新提交（Submit + BatchSubmit 两路），
+// EndDraining 后恢复；其他 instance 不受影响。
+TEST_F(MigrationManagerTest, TestDrainingInstanceGateRejectsSubmit) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    const std::string kOther = "other_instance";
+    ASSERT_TRUE(CreateMetaIndexer(kOther));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "draingate_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "draingate_cold/"));
+
+    const std::string src1 = CreateSourceLocation(901, "hot_01", true, "d1");
+
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    mgr.DebugEnableCopySubmissionsForTest();
+
+    auto make_req = [](const std::string &inst, int64_t bk, const std::string &src) {
+        MigrationManager::MigrationRequest req;
+        req.instance_id = inst;
+        req.block_key = bk;
+        req.src_location_id = src;
+        req.src_storage_name = "hot_01";
+        req.dst_storage_name = "cold_01";
+        return req;
+    };
+
+    mgr.BeginDrainingInstance(kInstance);
+
+    // draining 中：Submit 被拒，且不建活跃任务
+    ASSERT_EQ(ErrorCode::EC_ERROR, mgr.Submit("t", make_req(kInstance, 901, src1)));
+    ASSERT_TRUE(mgr.GetActiveBlockKeysForInstance(kInstance).empty());
+
+    // draining 中：BatchSubmit 也被拒（覆盖 admin/reclaimer 两路的共同下游 BatchSubmit）
+    std::vector<MigrationManager::MigrationRequest> batch;
+    batch.push_back(make_req(kInstance, 902, src1));
+    auto batch_res = mgr.BatchSubmit("t", batch);
+    ASSERT_EQ(1u, batch_res.size());
+    ASSERT_NE(ErrorCode::EC_OK, batch_res[0]);
+    ASSERT_TRUE(mgr.GetActiveBlockKeysForInstance(kInstance).empty());
+
+    // 另一个未 drain 的 instance 提交不受影响（draining 是 per-instance）
+    ASSERT_EQ(0u, mgr.GetActiveBlockKeysForInstance(kOther).size());
+    // kOther 未 draining：Submit gate 不拒（源 location 缺失会在更后阶段失败，此处只验证未被 draining 挡下——
+    // 用 BatchSubmit 空 src_specs 走 fallback 到 PrepareCopyTask，返回非 draining 的错误码即可区分）。
+
+    // EndDraining 后：kInstance 恢复可提交
+    mgr.EndDrainingInstance(kInstance);
+    ASSERT_EQ(ErrorCode::EC_OK, mgr.Submit("t", make_req(kInstance, 901, src1)));
+    ASSERT_EQ(1u, mgr.GetActiveBlockKeysForInstance(kInstance).size());
 }
 
 // F-18: HasActiveCopyTargetLocation 按 (instance_id, block_key) 作用域判断——

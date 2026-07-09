@@ -396,13 +396,32 @@ ErrorCode CacheManager::RemoveInstance(RequestContext *request_context,
 
     // F-12: drain 活跃迁移 copy 后再 trim，避免 trim 与 backend copy 竞态
     // （trim 把 active copy 的 WRITING 目标 CAS→DELETING 删掉 / copy 成功后 promote 的 SERVING 目标被 trim 删）。
-    // 步骤：暂停 reclaimer（阻止新迁移提交）→ cancel 活跃 copy → 有界等待完成 → 恢复 reclaimer。
+    // 步骤：draining gate（阻止该 instance 所有新迁移提交，覆盖 reclaimer + admin 两路）
+    //       + PauseReclaimer（快速路径）→ cancel 活跃 copy → 有界等待完成 → 恢复。
+    // RAII guard 保证 EndDraining + ResumeReclaimer 在任何出口（含宏 return）都执行，避免 draining set 泄漏。
+    struct DrainGuard {
+        CacheManager *mgr;
+        std::string instance_id;
+        bool active = false;
+        ~DrainGuard() {
+            if (active) {
+                if (auto mm = mgr->migration_manager()) {
+                    mm->EndDrainingInstance(instance_id);
+                }
+                mgr->ResumeReclaimer();
+            }
+        }
+    } drain_guard{this, instance_id, false};
+
     if (migration_manager_ != nullptr) {
-        PauseReclaimer();
+        migration_manager_->BeginDrainingInstance(instance_id); // 契约保证：happens-before 所有后续提交
+        PauseReclaimer();                                       // 快速路径：减少 reclaimer 无效轮转
+        drain_guard.active = true;
         const auto active_keys = migration_manager_->GetActiveBlockKeysForInstance(instance_id);
         if (!active_keys.empty()) {
             migration_manager_->BatchCancel(instance_id, active_keys);
             // 有界等待：cancelling 任务由 monitor 线程在 copy future 完成后清理（F-11 延迟收尾）。
+            // draining gate 已阻止新提交，故快照后不会有逃逸任务，poll 只需等快照内 cancel 收尾。
             constexpr int kDrainTimeoutMs = 5000;
             constexpr int kPollIntervalMs = 50;
             int waited_ms = 0;
@@ -424,20 +443,12 @@ ErrorCode CacheManager::RemoveInstance(RequestContext *request_context,
     }
 
     auto ec = registry_manager_->RemoveInstance(request_context, instance_group, instance_id);
-    if (ec != EC_OK) {
-        if (migration_manager_ != nullptr) {
-            ResumeReclaimer();
-        }
-        RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "remove instance failed");
-    }
+    RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "remove instance failed"); // drain_guard 析构自动收尾
 
     InvalidateInstanceMetrics(instance_id);
 
     ec = TrimCache(request_context, instance_id, proto::meta::TrimStrategy::TS_REMOVE_ALL_CACHE);
-    if (migration_manager_ != nullptr) {
-        ResumeReclaimer();
-    }
-    RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "remove instance failed");
+    RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, ec, "remove instance failed"); // drain_guard 析构自动收尾
     PREFIX_LOG(INFO, "remove instance OK");
     return ec;
 }
