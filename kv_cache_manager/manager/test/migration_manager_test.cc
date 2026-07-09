@@ -21,8 +21,50 @@
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
+#include "stub.h"
 
 using namespace kv_cache_manager;
+
+// ---- F-10 orphan-leak 测试用 DataStorageManager::Create/Delete 存根 ----
+// 复现"异构 size spec 分散到多个 create_group、某 group 失败使 block ineligible、
+// 后处理 group 已成功分配的 URI 被跳过 → rollback 漏删 → orphan"的场景。
+namespace f10_orphan_stub {
+std::vector<DataStorageUri> g_created_uris;
+std::vector<DataStorageUri> g_deleted_uris;
+int g_create_call_count = 0;
+
+std::vector<std::pair<ErrorCode, DataStorageUri>> Create_stub(void * /*obj*/,
+                                                              RequestContext * /*rc*/,
+                                                              const std::string & /*name*/,
+                                                              const std::vector<std::string> &keys,
+                                                              size_t size,
+                                                              std::function<void()> /*cb*/) {
+    ++g_create_call_count;
+    const bool fail = (g_create_call_count == 1); // 第一个被处理的 group 失败(与迭代序无关地触发泄漏路径)
+    std::vector<std::pair<ErrorCode, DataStorageUri>> results;
+    for (const auto &k : keys) {
+        if (fail) {
+            results.emplace_back(ErrorCode::EC_ERROR, DataStorageUri{});
+            continue;
+        }
+        DataStorageUri uri("dummy://cold_01/" + k + "?size=" + std::to_string(size));
+        g_created_uris.push_back(uri);
+        results.emplace_back(ErrorCode::EC_OK, uri);
+    }
+    return results;
+}
+
+std::vector<ErrorCode> Delete_stub(void * /*obj*/,
+                                   RequestContext * /*rc*/,
+                                   const std::string & /*name*/,
+                                   const std::vector<DataStorageUri> &uris,
+                                   std::function<void()> /*cb*/) {
+    for (const auto &u : uris) {
+        g_deleted_uris.push_back(u);
+    }
+    return std::vector<ErrorCode>(uris.size(), ErrorCode::EC_OK);
+}
+} // namespace f10_orphan_stub
 
 class CaptureEventPublisher : public EventPublisher {
 public:
@@ -1004,6 +1046,53 @@ TEST_F(MigrationManagerTest, TestBatchSubmitPartialFailure) {
     ASSERT_TRUE(mgr.HasMigrationTask(kInstance, 900));
     ASSERT_FALSE(mgr.HasMigrationTask(kInstance, 901));
     ASSERT_TRUE(mgr.HasMigrationTask(kInstance, 902));
+}
+
+// F-10 泄漏修复: 异构 size spec 分散到多个 create_group,某 group 的 Create 失败使 block
+// ineligible;后处理 group 里同 block 已成功分配的 URI 不能被跳过泄漏,必须 Delete。
+TEST_F(MigrationManagerTest, TestBatchSubmitHeteroSpecCreateFailNoOrphan) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "orphan_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "orphan_cold/"));
+
+    f10_orphan_stub::g_created_uris.clear();
+    f10_orphan_stub::g_deleted_uris.clear();
+    f10_orphan_stub::g_create_call_count = 0;
+    Stub stub;
+    stub.set(ADDR(DataStorageManager, Create), f10_orphan_stub::Create_stub);
+    stub.set(ADDR(DataStorageManager, Delete), f10_orphan_stub::Delete_stub);
+
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    mgr.DebugEnableCopySubmissionsForTest();
+
+    // 单 block,两个不同 size 的 spec → 落到两个 create_group。
+    MigrationManager::MigrationRequest req;
+    req.instance_id = kInstance;
+    req.block_key = 700;
+    req.src_location_id = "src_700";
+    req.src_storage_name = "hot_01";
+    req.dst_storage_name = "cold_01";
+    req.src_specs = {
+        LocationSpec("tp0", "dummy://hot_01/src_700_tp0?size=111"),
+        LocationSpec("tp1", "dummy://hot_01/src_700_tp1?size=222"),
+    };
+    std::vector<MigrationManager::MigrationRequest> reqs;
+    reqs.push_back(std::move(req));
+
+    auto results = mgr.BatchSubmit("t", reqs);
+    ASSERT_EQ(1u, results.size());
+    ASSERT_NE(ErrorCode::EC_OK, results[0]); // 整块失败(一个 group Create 失败)
+
+    // 一个 group 失败、一个成功 → 恰好 1 个 URI 被成功 Create。
+    ASSERT_EQ(1u, f10_orphan_stub::g_created_uris.size());
+    // 关键: 成功 Create 的 URI 必须被 Delete,不能 orphan(修复前会被跳过泄漏)。
+    for (const auto &created : f10_orphan_stub::g_created_uris) {
+        const bool deleted =
+            std::any_of(f10_orphan_stub::g_deleted_uris.begin(),
+                        f10_orphan_stub::g_deleted_uris.end(),
+                        [&](const DataStorageUri &d) { return d.ToUriString() == created.ToUriString(); });
+        ASSERT_TRUE(deleted) << "created URI leaked (not deleted): " << created.ToUriString();
+    }
 }
 
 // F-03: ActiveTaskCountForInstances 按 instance 集合过滤，跨 group 不抢 slot。

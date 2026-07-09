@@ -529,6 +529,11 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
 
     // 执行 batch Create + 回填 per-block URI
     auto batch_ctx = std::make_shared<RequestContext>(trace_id.empty() ? "migration_batch_prepare" : trace_id);
+    // 异构 size 的 spec 分散在不同 create_group；某 group 使一个 block ineligible 后，
+    // 之后处理的 group 里同 block 的 spec 可能已被 batch Create 成功分配 URI，却在下面
+    // `!eligible` 分支被跳过、不进 preps[i].dst_uris，导致后续 rollback 删不到 → 永久 orphan
+    // （无 CacheLocation meta，reclaimer 也 GC 不到）。收集这些孤儿 URI，在 group 循环后统一删。
+    std::vector<DataStorageUri> skipped_created_uris;
     for (auto &[size, entries] : create_groups) {
         std::vector<std::string> keys;
         keys.reserve(entries.size());
@@ -539,7 +544,14 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
             data_storage_manager_->Create(batch_ctx.get(), first_req.dst_storage_name, keys, size, nullptr);
         for (std::size_t j = 0; j < entries.size() && j < create_results.size(); ++j) {
             const auto &e = entries[j];
-            if (!eligible[e.req_idx]) continue; // 已被其他 spec 的失败标记
+            if (!eligible[e.req_idx]) {
+                // 该 block 已被其他 spec 的失败标记 ineligible；本 spec 若已成功分配，
+                // 需补删（否则永不进 dst_uris，rollback 漏删）。
+                if (create_results[j].first == EC_OK) {
+                    skipped_created_uris.push_back(create_results[j].second);
+                }
+                continue;
+            }
             if (create_results[j].first == EC_OK) {
                 preps[e.req_idx].src_uris.push_back(e.src_uri);
                 preps[e.req_idx].dst_uris.push_back(create_results[j].second);
@@ -550,6 +562,9 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
                 results[e.req_idx] = EC_ERROR;
             }
         }
+    }
+    if (!skipped_created_uris.empty()) {
+        data_storage_manager_->Delete(batch_ctx.get(), first_req.dst_storage_name, skipped_created_uris, nullptr);
     }
 
     // 回滚 Create 部分失败的 block 的已分配 URI
