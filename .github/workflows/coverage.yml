@@ -26,6 +26,8 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   coverage-github:
+    outputs:
+      coverage-artifact-url: ${{ steps.upload_coverage_artifacts.outputs.artifact-url }}
     if: ${{ (inputs.runs-on || vars.COVERAGE_RUNS_ON || 'ubuntu-latest') == 'ubuntu-latest' || (inputs.runs-on || vars.COVERAGE_RUNS_ON || 'ubuntu-latest') == 'ubuntu-24.04-arm' }}
     name: coverage
     runs-on: ${{ inputs.runs-on || vars.COVERAGE_RUNS_ON || 'ubuntu-latest' }}
@@ -175,6 +177,7 @@ jobs:
 
       - &upload_coverage_artifacts_step
         name: Upload coverage artifacts
+        id: upload_coverage_artifacts
         uses: actions/upload-artifact@v6
         if: always()
         with:
@@ -186,6 +189,8 @@ jobs:
           overwrite: true
 
   coverage-aliyun:
+    outputs:
+      coverage-artifact-url: ${{ steps.upload_coverage_artifacts.outputs.artifact-url }}
     if: ${{ (inputs.runs-on || vars.COVERAGE_RUNS_ON || 'ubuntu-latest') == 'aliyun-ecs-x64' }}
     name: coverage
     runs-on: aliyun-ecs-x64
@@ -201,6 +206,93 @@ jobs:
       - *delete_old_disk_cache_step
       - *append_coverage_summary_step
       - *upload_coverage_artifacts_step
+
+  comment-pr-coverage:
+    if: ${{ always() && github.event_name == 'pull_request' && (needs.coverage-github.outputs.coverage-artifact-url != '' || needs.coverage-aliyun.outputs.coverage-artifact-url != '') }}
+    needs:
+      - coverage-github
+      - coverage-aliyun
+    name: comment_pr_coverage
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      pull-requests: write
+    steps:
+      - name: Download coverage artifact
+        uses: actions/download-artifact@v6
+        continue-on-error: true
+        with:
+          name: coverage-report
+          path: coverage-artifact
+
+      - name: Comment PR coverage
+        uses: actions/github-script@v8
+        env:
+          COVERAGE_ARTIFACT_URL: ${{ needs.coverage-github.outputs.coverage-artifact-url || needs.coverage-aliyun.outputs.coverage-artifact-url }}
+        with:
+          script: |
+            const fs = require('fs');
+
+            const marker = '<!-- tair-kvcache-coverage-report -->';
+            const summaryPath = 'coverage-artifact/coverage/coverage-summary.md';
+            if (!fs.existsSync(summaryPath)) {
+              core.warning(`Coverage summary not found at ${summaryPath}; skip coverage comment.`);
+              return;
+            }
+
+            let summary = fs.readFileSync(summaryPath, 'utf8').trim();
+            const maxSummaryLength = 60000;
+            if (summary.length > maxSummaryLength) {
+              summary = `${summary.slice(0, maxSummaryLength)}\n\n_Comment truncated; see the uploaded artifact for the full report._`;
+            }
+
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const artifactUrl = process.env.COVERAGE_ARTIFACT_URL || '';
+            const links = artifactUrl
+              ? `HTML report and raw LCOV: [coverage-report](${artifactUrl})`
+              : `Workflow run: [${context.runId}](${runUrl})`;
+            const body = [
+              marker,
+              summary,
+              '',
+              links,
+              `Workflow run: [${context.runId}](${runUrl})`,
+            ].join('\n');
+
+            const issue_number = context.payload.pull_request?.number;
+            if (!issue_number) {
+              core.warning('No pull request number found; skip coverage comment.');
+              return;
+            }
+
+            try {
+              const { owner, repo } = context.repo;
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner,
+                repo,
+                issue_number,
+                per_page: 100,
+              });
+              const existing = comments.find((comment) => comment.body?.includes(marker));
+
+              if (existing) {
+                await github.rest.issues.updateComment({
+                  owner,
+                  repo,
+                  comment_id: existing.id,
+                  body,
+                });
+              } else {
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number,
+                  body,
+                });
+              }
+            } catch (error) {
+              core.warning(`Failed to write PR coverage comment: ${error.message}`);
+            }
 
   validate-runner-selection:
     if: ${{ (inputs.runs-on || vars.COVERAGE_RUNS_ON || 'ubuntu-latest') != 'ubuntu-latest' && (inputs.runs-on || vars.COVERAGE_RUNS_ON || 'ubuntu-latest') != 'ubuntu-24.04-arm' && (inputs.runs-on || vars.COVERAGE_RUNS_ON || 'ubuntu-latest') != 'aliyun-ecs-x64' }}
