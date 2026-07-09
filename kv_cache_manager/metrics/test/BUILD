@@ -123,3 +123,18 @@ cc_test(
         "//kv_cache_manager/metrics:metrics_registry",
     ],
 )
+
+cc_test(
+    name = "RevisitIntervalHistogramTest",
+    srcs = [
+        "revisit_interval_histogram_test.cc",
+    ],
+    copts = [
+        "-fno-access-control",
+    ],
+    deps = [
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/metrics:metrics_registry",
+        "//kv_cache_manager/metrics:revisit_interval_histogram",
+    ],
+)

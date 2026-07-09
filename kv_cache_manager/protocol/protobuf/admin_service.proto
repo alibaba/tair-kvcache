@@ -249,6 +249,7 @@ message InstanceGroup {
     int64 version = 8;
     string extra_info = 9; // opaque JSON passed through to clients
     repeated string event_reporting_storage_candidates = 10; // backends that handle ReportEvent
+    string revisit_interval_buckets = 11; // comma-separated bucket boundaries in seconds (e.g. "1,5,30,60")
 }
 
 message CreateInstanceGroupRequest {

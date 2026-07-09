@@ -13,8 +13,8 @@ class TairKvCacheConnectorExtraConfig:
         self.write_timeout_seconds: int = extra_config.get("write_timeout_seconds", 30)
         self.sdk_thread_num = extra_config.get("sdk_thread_num", 32)
         self.sdk_queue_size = extra_config.get("sdk_queue_size", 1000)
-        self.sdk_get_timeout_ms = extra_config.get("sdk_get_timeout_ms", 5000)
-        self.sdk_put_timeout_ms = extra_config.get("sdk_put_timeout_ms", 10000)
+        self.sdk_get_timeout_ms = extra_config.get("sdk_get_timeout_ms", 15000)
+        self.sdk_put_timeout_ms = extra_config.get("sdk_put_timeout_ms", 15000)
 
         self.read_iov_block_size = extra_config.get("read_iov_block_size", 0)
         self.write_iov_block_size = extra_config.get("write_iov_block_size", 0)

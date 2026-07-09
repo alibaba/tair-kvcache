@@ -207,6 +207,13 @@ std::string CacheManager::GetExtraInfo(RequestContext *request_context, const st
     return "";
 }
 
+void CacheManager::SetRevisitHistogramConfig(const std::vector<double> &boundaries) {
+    if (meta_indexer_manager_ && metrics_registry_ && !boundaries.empty()) {
+        meta_indexer_manager_->SetRevisitHistogramConfig(metrics_registry_, boundaries);
+        KVCM_LOG_INFO("Set revisit histogram config with %zu boundaries", boundaries.size());
+    }
+}
+
 std::pair<ErrorCode, std::string>
 CacheManager::RegisterInstance(RequestContext *request_context,
                                const std::string &instance_group,

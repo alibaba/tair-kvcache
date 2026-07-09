@@ -1,5 +1,8 @@
 #include "kv_cache_manager/config/instance_group.h"
 
+#include "kv_cache_manager/common/logger.h"
+#include "kv_cache_manager/common/string_util.h"
+
 namespace kv_cache_manager {
 
 InstanceGroup::~InstanceGroup() = default;
@@ -18,6 +21,9 @@ bool InstanceGroup::FromRapidValue(const rapidjson::Value &rapid_value) {
                                 "event_reporting_storage_candidates",
                                 event_reporting_storage_candidates_,
                                 std::vector<std::string>());
+    std::string buckets_str;
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "revisit_interval_buckets", buckets_str, std::string(""));
+    set_revisit_interval_buckets(buckets_str);
     return true;
 }
 
@@ -32,6 +38,7 @@ void InstanceGroup::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &wr
     Put(writer, "version", version_);
     Put(writer, "extra_info", extra_info_);
     Put(writer, "event_reporting_storage_candidates", event_reporting_storage_candidates_);
+    Put(writer, "revisit_interval_buckets", revisit_interval_buckets_str_);
 }
 
 bool InstanceGroup::ValidateRequiredFields(std::string &invalid_fields) const {
@@ -58,10 +65,32 @@ bool InstanceGroup::ValidateRequiredFields(std::string &invalid_fields) const {
     } else if (!cache_config_->ValidateRequiredFields(local_invalid_fields)) {
         valid = false;
     }
+    // Reject non-empty but invalid revisit_interval_buckets.
+    // raw string is non-empty but parsed vector is empty → user provided invalid config.
+    // Empty raw string is fine (means "use server default").
+    if (!revisit_interval_buckets_str_.empty() && parsed_revisit_interval_buckets_.empty()) {
+        valid = false;
+        local_invalid_fields += "{revisit_interval_buckets}";
+    }
 
     if (!valid) {
         invalid_fields += "{InstanceGroup: " + local_invalid_fields + "}";
     }
     return valid;
 }
+
+void InstanceGroup::set_revisit_interval_buckets(const std::string &buckets_str) {
+    revisit_interval_buckets_str_ = buckets_str;
+    if (buckets_str.empty()) {
+        parsed_revisit_interval_buckets_.clear();
+        return;
+    }
+    parsed_revisit_interval_buckets_ = StringUtil::ParseBucketBoundaries(buckets_str);
+    if (parsed_revisit_interval_buckets_.empty()) {
+        KVCM_LOG_WARN("InstanceGroup [%s]: invalid revisit_interval_buckets '%s', will use server default",
+                      name_.c_str(),
+                      buckets_str.c_str());
+    }
+}
+
 } // namespace kv_cache_manager

@@ -43,6 +43,11 @@ bool Server::Init(const ServerConfig &config) {
 
     config_ = config;
 
+    if (!config_.Check()) {
+        KVCM_LOG_ERROR("server config check failed");
+        return false;
+    }
+
     if (!CreateLeaderElector()) {
         return false;
     }
@@ -59,6 +64,13 @@ bool Server::Init(const ServerConfig &config) {
                          config_.GetCacheReclaimerIdleIntervalMs(),
                          config_.GetCacheReclaimerWorkerSize());
     cache_manager_->PauseReclaimer(); // Resume after DoRecover
+
+    // Set revisit interval histogram configuration
+    auto boundaries = ServerConfig::ParseRevisitIntervalBuckets(config_.GetRevisitIntervalBuckets());
+    if (boundaries.empty()) {
+        boundaries = ServerConfig::GetDefaultRevisitIntervalBuckets();
+    }
+    cache_manager_->SetRevisitHistogramConfig(boundaries);
 
     CreateMetricsReporter();
     CreateAndRegisterEventPublisher();

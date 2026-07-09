@@ -6,7 +6,9 @@
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
+#include "kv_cache_manager/meta/meta_local_backend.h"
 #include "kv_cache_manager/meta/meta_storage_backend.h"
+#include "kv_cache_manager/metrics/metrics_registry.h"
 namespace kv_cache_manager {
 
 class MetaIndexerManagerTest : public TESTBASE {
@@ -206,6 +208,111 @@ TEST_F(MetaIndexerManagerTest, TestDoCleanupMultiThread) {
     ASSERT_EQ(4, get_count.load());
     // 验证：最终所有 indexer 都被清理
     ASSERT_EQ(0, manager_->GetIndexerSize());
+}
+
+// --- Per-instance boundary override tests ---
+
+TEST_F(MetaIndexerManagerTest, TestCreateWithDefaultBoundaries) {
+    // Set global default boundaries
+    auto registry = std::make_shared<MetricsRegistry>();
+    std::vector<double> default_boundaries = {1, 5, 30, 60};
+    manager_->SetRevisitHistogramConfig(registry, default_boundaries);
+
+    // Create indexer without per-instance boundaries (uses default)
+    ASSERT_EQ(ErrorCode::EC_OK, CreateMetaIndexer("inst_default", META_LOCAL_BACKEND_TYPE_STR));
+    auto indexer = manager_->GetMetaIndexer("inst_default");
+    ASSERT_NE(indexer, nullptr);
+
+    // Verify histogram was created with default boundaries
+    auto *backend = dynamic_cast<MetaLocalBackend *>(indexer->backend_manager_->persistent_backend_.get());
+    ASSERT_NE(backend, nullptr);
+    ASSERT_NE(backend->revisit_histogram_, nullptr);
+    EXPECT_EQ(backend->revisit_histogram_->GetBoundaries().size(), 4);
+    EXPECT_DOUBLE_EQ(backend->revisit_histogram_->GetBoundaries()[0], 1.0);
+    EXPECT_DOUBLE_EQ(backend->revisit_histogram_->GetBoundaries()[3], 60.0);
+}
+
+TEST_F(MetaIndexerManagerTest, TestCreateWithPerInstanceBoundaries) {
+    // Set global default boundaries
+    auto registry = std::make_shared<MetricsRegistry>();
+    std::vector<double> default_boundaries = {1, 5, 30, 60};
+    manager_->SetRevisitHistogramConfig(registry, default_boundaries);
+
+    // Create indexer with per-instance boundaries (overrides default)
+    std::vector<double> custom_boundaries = {1, 10, 60, 300};
+    auto meta_indexer_config = std::make_shared<MetaIndexerConfig>();
+    auto backend_config = std::make_shared<MetaStorageBackendConfig>();
+    backend_config->storage_type_ = META_LOCAL_BACKEND_TYPE_STR;
+    meta_indexer_config->meta_storage_backend_config_ = backend_config;
+    ASSERT_EQ(ErrorCode::EC_OK, manager_->CreateMetaIndexer("inst_custom", meta_indexer_config, custom_boundaries));
+
+    auto indexer = manager_->GetMetaIndexer("inst_custom");
+    ASSERT_NE(indexer, nullptr);
+
+    // Verify histogram uses per-instance boundaries, NOT the default
+    auto *backend = dynamic_cast<MetaLocalBackend *>(indexer->backend_manager_->persistent_backend_.get());
+    ASSERT_NE(backend, nullptr);
+    ASSERT_NE(backend->revisit_histogram_, nullptr);
+    EXPECT_EQ(backend->revisit_histogram_->GetBoundaries().size(), 4);
+    EXPECT_DOUBLE_EQ(backend->revisit_histogram_->GetBoundaries()[0], 1.0);
+    EXPECT_DOUBLE_EQ(backend->revisit_histogram_->GetBoundaries()[1], 10.0); // NOT 5.0 (default)
+    EXPECT_DOUBLE_EQ(backend->revisit_histogram_->GetBoundaries()[2], 60.0);
+    EXPECT_DOUBLE_EQ(backend->revisit_histogram_->GetBoundaries()[3], 300.0); // NOT 60.0 (default)
+}
+
+TEST_F(MetaIndexerManagerTest, TestCreateWithEmptyBoundariesUsesDefault) {
+    // Set global default boundaries
+    auto registry = std::make_shared<MetricsRegistry>();
+    std::vector<double> default_boundaries = {1, 5, 30, 60};
+    manager_->SetRevisitHistogramConfig(registry, default_boundaries);
+
+    // Create indexer with empty boundaries vector (should use default)
+    auto meta_indexer_config = std::make_shared<MetaIndexerConfig>();
+    auto backend_config = std::make_shared<MetaStorageBackendConfig>();
+    backend_config->storage_type_ = META_LOCAL_BACKEND_TYPE_STR;
+    meta_indexer_config->meta_storage_backend_config_ = backend_config;
+    std::vector<double> empty_boundaries;
+    ASSERT_EQ(ErrorCode::EC_OK, manager_->CreateMetaIndexer("inst_fallback", meta_indexer_config, empty_boundaries));
+
+    auto indexer = manager_->GetMetaIndexer("inst_fallback");
+    ASSERT_NE(indexer, nullptr);
+
+    // Verify histogram falls back to default boundaries
+    auto *backend = dynamic_cast<MetaLocalBackend *>(indexer->backend_manager_->persistent_backend_.get());
+    ASSERT_NE(backend, nullptr);
+    ASSERT_NE(backend->revisit_histogram_, nullptr);
+    EXPECT_EQ(backend->revisit_histogram_->GetBoundaries().size(), 4);
+    EXPECT_DOUBLE_EQ(backend->revisit_histogram_->GetBoundaries()[1], 5.0); // default, not custom
+}
+
+TEST_F(MetaIndexerManagerTest, TestExistingInstanceUnaffectedByConfigChange) {
+    // Set initial default boundaries
+    auto registry = std::make_shared<MetricsRegistry>();
+    std::vector<double> initial_boundaries = {1, 5, 30};
+    manager_->SetRevisitHistogramConfig(registry, initial_boundaries);
+
+    // Create instance with initial boundaries
+    ASSERT_EQ(ErrorCode::EC_OK, CreateMetaIndexer("inst_stable", META_LOCAL_BACKEND_TYPE_STR));
+
+    // Verify initial boundaries
+    auto *backend_before = dynamic_cast<MetaLocalBackend *>(
+        manager_->GetMetaIndexer("inst_stable")->backend_manager_->persistent_backend_.get());
+    ASSERT_NE(backend_before, nullptr);
+    ASSERT_NE(backend_before->revisit_histogram_, nullptr);
+    ASSERT_EQ(backend_before->revisit_histogram_->GetBoundaries().size(), 3);
+    EXPECT_DOUBLE_EQ(backend_before->revisit_histogram_->GetBoundaries()[1], 5.0);
+
+    // Change the global default boundaries (simulates config update)
+    std::vector<double> new_boundaries = {1, 10, 60};
+    manager_->SetRevisitHistogramConfig(registry, new_boundaries);
+
+    // Existing instance's histogram MUST still use the original boundaries
+    auto *backend_after = dynamic_cast<MetaLocalBackend *>(
+        manager_->GetMetaIndexer("inst_stable")->backend_manager_->persistent_backend_.get());
+    ASSERT_NE(backend_after, nullptr);
+    ASSERT_NE(backend_after->revisit_histogram_, nullptr);
+    EXPECT_EQ(backend_after->revisit_histogram_->GetBoundaries().size(), 3);
+    EXPECT_DOUBLE_EQ(backend_after->revisit_histogram_->GetBoundaries()[1], 5.0); // still 5.0, NOT 10.0
 }
 
 } // namespace kv_cache_manager

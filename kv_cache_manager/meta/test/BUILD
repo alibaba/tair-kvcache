@@ -38,6 +38,7 @@ cc_test(
     deps = [
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/meta",
+        "//kv_cache_manager/metrics:metrics_registry",
     ],
 )
 
