@@ -89,9 +89,7 @@ class VllmAdapter(AbstractEngineAdapter):
         self._ctx = zmq.asyncio.Context.instance()
         self._msgpack_helper = KVEventBatchMsgpackHelper()
         self._last_seq = -1
-        self._sub: zmq.asyncio.Socket = self._ctx.socket(zmq.SUB)
-        self._dealer: zmq.asyncio.Socket = self._ctx.socket(zmq.DEALER)
-        self._configure_sub_socket()
+        self._generation = 0
         if logger.is_debug_enabled():
             logger.debug(
                 "connecting vLLM ZMQ sockets",
@@ -104,34 +102,45 @@ class VllmAdapter(AbstractEngineAdapter):
                     "reconnect_ivl_max_ms": self._config.zmq_reconnect_ivl_max_ms,
                 },
             )
-        self._sub.connect(self._endpoint.zmq_pub_endpoint)
-        self._sub.setsockopt_string(zmq.SUBSCRIBE, self._endpoint.zmq_topic)
-        self._dealer.connect(self._endpoint.zmq_replay_endpoint)
+        self._sub = self._open_sub_socket()
+        self._dealer = self._open_dealer_socket()
 
-    def _configure_sub_socket(self) -> None:
+    def _open_sub_socket(self) -> zmq.asyncio.Socket:
+        sub = self._ctx.socket(zmq.SUB)
+        self._configure_sub_socket(sub)
+        sub.connect(self._endpoint.zmq_pub_endpoint)
+        sub.setsockopt_string(zmq.SUBSCRIBE, self._endpoint.zmq_topic)
+        return sub
+
+    def _open_dealer_socket(self) -> zmq.asyncio.Socket:
+        dealer = self._ctx.socket(zmq.DEALER)
+        dealer.connect(self._endpoint.zmq_replay_endpoint)
+        return dealer
+
+    def _configure_sub_socket(self, sub: zmq.asyncio.Socket) -> None:
         """Apply reconnect and TCP keepalive options to the SUB socket."""
 
-        self._sub.setsockopt(zmq.RECONNECT_IVL, self._config.zmq_reconnect_ivl_ms)
-        self._sub.setsockopt(
+        sub.setsockopt(zmq.RECONNECT_IVL, self._config.zmq_reconnect_ivl_ms)
+        sub.setsockopt(
             zmq.RECONNECT_IVL_MAX,
             self._config.zmq_reconnect_ivl_max_ms,
         )
         if self._config.zmq_tcp_keepalive:
-            self._sub.setsockopt(zmq.TCP_KEEPALIVE, 1)
-            self._sub.setsockopt(
+            sub.setsockopt(zmq.TCP_KEEPALIVE, 1)
+            sub.setsockopt(
                 zmq.TCP_KEEPALIVE_IDLE,
                 self._config.zmq_tcp_keepalive_idle_s,
             )
-            self._sub.setsockopt(
+            sub.setsockopt(
                 zmq.TCP_KEEPALIVE_INTVL,
                 self._config.zmq_tcp_keepalive_intvl_s,
             )
-            self._sub.setsockopt(
+            sub.setsockopt(
                 zmq.TCP_KEEPALIVE_CNT,
                 self._config.zmq_tcp_keepalive_cnt,
             )
         else:
-            self._sub.setsockopt(zmq.TCP_KEEPALIVE, 0)
+            sub.setsockopt(zmq.TCP_KEEPALIVE, 0)
 
     async def subscribe_kv_events(self) -> AsyncGenerator[list[KVEventBatch], None]:
         """Subscribe to vLLM KV events and repair sequence gaps with replay.
@@ -147,6 +156,7 @@ class VllmAdapter(AbstractEngineAdapter):
                 if received is None:
                     continue
                 seq, payload = received
+                generation = self._generation
 
                 if seq > self._last_seq + 1:
                     missed = seq - self._last_seq - 1
@@ -159,7 +169,7 @@ class VllmAdapter(AbstractEngineAdapter):
                             "missed": missed,
                         },
                     )
-                    replay_batches = await self._replay_missing_batches(seq)
+                    replay_batches = await self._replay_missing_batches(seq, generation)
                     if replay_batches is None:
                         continue
 
@@ -186,21 +196,27 @@ class VllmAdapter(AbstractEngineAdapter):
                         step="zmq_subscribe",
                         tags={"seq": seq, **_summarize_batch(batch)},
                     )
-                yield [batch]
+                if generation != self._generation:
+                    continue
                 self._last_seq = seq
+                yield [batch]
         finally:
             self._sub.close(linger=0)
             self._dealer.close(linger=0)
 
     async def _recv_live_message(self) -> tuple[int, bytes] | None:
+        generation = self._generation
+        sub = self._sub
         try:
-            frames = await self._sub.recv_multipart()
+            frames = await sub.recv_multipart()
         except Exception as exc:
             logger.warning(
                 "failed to receive kv event message",
                 step="zmq_subscribe",
                 tags={"error": exc.__class__.__name__, "message": str(exc)},
             )
+            return None
+        if generation != self._generation:
             return None
         if len(frames) != 3:
             logger.warning(
@@ -231,7 +247,7 @@ class VllmAdapter(AbstractEngineAdapter):
         return seq, payload
 
     async def _replay_missing_batches(
-        self, current_seq: int
+        self, current_seq: int, generation: int
     ) -> list[KVEventBatch] | None:
         gap_start_seq = self._last_seq + 1
         if logger.is_debug_enabled():
@@ -240,8 +256,9 @@ class VllmAdapter(AbstractEngineAdapter):
                 step="zmq_replay",
                 tags={"gap_start_seq": gap_start_seq, "current_seq": current_seq},
             )
+        dealer = self._dealer
         try:
-            await self._dealer.send_multipart([b"", gap_start_seq.to_bytes(8, "big")])
+            await dealer.send_multipart([b"", gap_start_seq.to_bytes(8, "big")])
         except Exception as exc:
             logger.warning(
                 "failed to request kv event replay",
@@ -254,11 +271,13 @@ class VllmAdapter(AbstractEngineAdapter):
                 },
             )
             return None
+        if generation != self._generation:
+            return None
 
         replay_batches: list[KVEventBatch] = []
         while True:
             try:
-                frames = await self._dealer.recv_multipart()
+                frames = await dealer.recv_multipart()
             except Exception as exc:
                 logger.warning(
                     "failed to receive kv event replay message",
@@ -270,6 +289,8 @@ class VllmAdapter(AbstractEngineAdapter):
                         "message": str(exc),
                     },
                 )
+                return None
+            if generation != self._generation:
                 return None
             if len(frames) != 3:
                 logger.warning(
@@ -349,13 +370,15 @@ class VllmAdapter(AbstractEngineAdapter):
                 await asyncio.sleep(self._config.engine_health_interval_s)
                 yield LivenessEvent.UNHEALTHY
 
-    def reset_generation_state(self) -> None:
-        """Clear sequence state and recreate the replay socket after recovery."""
+    async def reset_generation_state(self) -> None:
+        """Clear sequence state and recreate sockets after engine recovery."""
 
+        self._generation += 1
         self._last_seq = -1
+        self._sub.close(linger=0)
         self._dealer.close(linger=0)
-        self._dealer = self._ctx.socket(zmq.DEALER)
-        self._dealer.connect(self._endpoint.zmq_replay_endpoint)
+        self._sub = self._open_sub_socket()
+        self._dealer = self._open_dealer_socket()
 
     def map_medium(self, medium: str | None) -> str:
         if medium is None:

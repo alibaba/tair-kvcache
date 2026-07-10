@@ -39,6 +39,15 @@ def _mock_adapter_sockets(mocker: Any) -> tuple[MagicMock, MagicMock]:
     return mock_sub, mock_dealer
 
 
+def _mock_adapter_socket_sequence(mocker: Any, *sockets: MagicMock) -> MagicMock:
+    mock_ctx = MagicMock()
+    mock_ctx.socket.side_effect = list(sockets)
+    mocker.patch(
+        "subscriber.engine.vllm.zmq.asyncio.Context.instance", return_value=mock_ctx
+    )
+    return mock_ctx
+
+
 class _FakeAsyncClient:
     """Async context manager that returns queued responses / exceptions."""
 
@@ -141,6 +150,7 @@ def test_adapter_logs_zmq_debug_endpoints(
     config: SubscriberConfig, mocker: Any
 ) -> None:
     _mock_adapter_sockets(mocker)
+    mocker.patch("subscriber.engine.vllm.logger.is_debug_enabled", return_value=True)
     debug = mocker.patch("subscriber.engine.vllm.logger.debug")
 
     VllmAdapter(config)
@@ -158,25 +168,158 @@ def test_adapter_logs_zmq_debug_endpoints(
     )
 
 
-def test_reset_generation_state_resets_seq_and_recreates_dealer(
+async def test_reset_generation_state_resets_seq_and_recreates_sockets(
     config: SubscriberConfig, mocker: Any
 ) -> None:
-    mock_sub = MagicMock()
+    old_sub = MagicMock()
     old_dealer = MagicMock()
+    new_sub = MagicMock()
     new_dealer = MagicMock()
-    mock_ctx = MagicMock()
-    mock_ctx.socket.side_effect = [mock_sub, old_dealer, new_dealer]
-    mocker.patch(
-        "subscriber.engine.vllm.zmq.asyncio.Context.instance", return_value=mock_ctx
-    )
+    _mock_adapter_socket_sequence(mocker, old_sub, old_dealer, new_sub, new_dealer)
     adapter = VllmAdapter(config)
     adapter._last_seq = 99
 
-    adapter.reset_generation_state()
+    await adapter.reset_generation_state()
 
     assert adapter._last_seq == -1
+    old_sub.close.assert_called_once_with(linger=0)
     old_dealer.close.assert_called_once_with(linger=0)
+    new_sub.connect.assert_called_once_with(config.zmq_pub_endpoint)
+    new_sub.setsockopt_string.assert_called_once()
     new_dealer.connect.assert_called_once_with(config.zmq_replay_endpoint)
+
+
+async def test_reset_generation_drops_inflight_live_message(
+    config: SubscriberConfig, mocker: Any
+) -> None:
+    batch = KVEventBatch(ts=1.0, events=[AllBlocksCleared()])
+    payload = _encode_batch(batch)
+    old_sub = MagicMock()
+    old_dealer = MagicMock()
+    new_sub = MagicMock()
+    new_dealer = MagicMock()
+    _mock_adapter_socket_sequence(mocker, old_sub, old_dealer, new_sub, new_dealer)
+    recv_started = asyncio.Event()
+    release_recv = asyncio.Event()
+
+    async def recv_multipart() -> list[bytes]:
+        recv_started.set()
+        await release_recv.wait()
+        return [b"", _seq_bytes(0), payload]
+
+    old_sub.recv_multipart = AsyncMock(side_effect=recv_multipart)
+
+    adapter = VllmAdapter(config)
+    receive_task = asyncio.create_task(adapter._recv_live_message())
+    await recv_started.wait()
+
+    await adapter.reset_generation_state()
+    release_recv.set()
+
+    assert await asyncio.wait_for(receive_task, timeout=1.0) is None
+    old_sub.close.assert_called_once_with(linger=0)
+    old_dealer.close.assert_called_once_with(linger=0)
+
+
+async def test_reset_generation_drops_inflight_replay_batches(
+    config: SubscriberConfig, mocker: Any
+) -> None:
+    """Race scenario: reset lands between replay send and replay recv.
+
+    Without the generation guard, ``_replay_missing_batches`` would return
+    the stale replay batch decoded from the old dealer socket and the
+    subscribe loop would re-anchor ``_last_seq`` to a sequence belonging to
+    the previous engine instance.
+    """
+    stale_batch = KVEventBatch(ts=0.5, events=[AllBlocksCleared()])
+    stale_payload = _encode_batch(stale_batch)
+    old_sub = MagicMock()
+    old_dealer = MagicMock()
+    new_sub = MagicMock()
+    new_dealer = MagicMock()
+    _mock_adapter_socket_sequence(mocker, old_sub, old_dealer, new_sub, new_dealer)
+    send_started = asyncio.Event()
+    release_send = asyncio.Event()
+    recv_started = asyncio.Event()
+    release_recv = asyncio.Event()
+
+    async def fake_send(_frames: list[bytes]) -> None:
+        send_started.set()
+        await release_send.wait()
+
+    async def fake_recv() -> list[bytes]:
+        recv_started.set()
+        await release_recv.wait()
+        return [b"", _seq_bytes(1), stale_payload]
+
+    old_dealer.send_multipart = AsyncMock(side_effect=fake_send)
+    old_dealer.recv_multipart = AsyncMock(side_effect=fake_recv)
+
+    adapter = VllmAdapter(config)
+    adapter._last_seq = 0
+    replay_task = asyncio.create_task(adapter._replay_missing_batches(5, 0))
+    await send_started.wait()
+    release_send.set()
+    await recv_started.wait()
+
+    await adapter.reset_generation_state()
+    release_recv.set()
+
+    assert await asyncio.wait_for(replay_task, timeout=1.0) is None
+    old_sub.close.assert_called_once_with(linger=0)
+    old_dealer.close.assert_called_once_with(linger=0)
+    assert adapter._last_seq == -1, (
+        "reset must keep _last_seq at -1; replay must not have anchored it "
+        "to the stale batch's sequence"
+    )
+
+
+async def test_replay_missing_batches_uses_new_dealer_after_reset(
+    config: SubscriberConfig, mocker: Any
+) -> None:
+    """After reset, a fresh replay call must use the new dealer socket and
+    succeed — proving generation advancement does not permanently disable
+    replay.
+    """
+    stale_batch = KVEventBatch(ts=0.5, events=[AllBlocksCleared()])
+    stale_payload = _encode_batch(stale_batch)
+    fresh_batch = KVEventBatch(ts=2.0, events=[AllBlocksCleared()])
+    fresh_payload = _encode_batch(fresh_batch)
+    old_sub = MagicMock()
+    old_dealer = MagicMock()
+    new_sub = MagicMock()
+    new_dealer = MagicMock()
+    _mock_adapter_socket_sequence(mocker, old_sub, old_dealer, new_sub, new_dealer)
+    recv_started = asyncio.Event()
+    release_recv = asyncio.Event()
+
+    async def stale_recv() -> list[bytes]:
+        recv_started.set()
+        await release_recv.wait()
+        return [b"", _seq_bytes(1), stale_payload]
+
+    old_dealer.send_multipart = AsyncMock()
+    old_dealer.recv_multipart = AsyncMock(side_effect=stale_recv)
+    new_dealer.send_multipart = AsyncMock()
+    new_dealer.recv_multipart = AsyncMock(
+        side_effect=[
+            [b"", _seq_bytes(1), fresh_payload],
+            [b"", (-1).to_bytes(8, "big", signed=True), b""],
+        ]
+    )
+
+    adapter = VllmAdapter(config)
+    adapter._last_seq = 0
+    stale_task = asyncio.create_task(adapter._replay_missing_batches(5, 0))
+    await recv_started.wait()
+
+    await adapter.reset_generation_state()
+    release_recv.set()
+    assert await asyncio.wait_for(stale_task, timeout=1.0) is None
+
+    result = await adapter._replay_missing_batches(5, adapter._generation)
+    assert result == [fresh_batch]
+    new_dealer.send_multipart.assert_awaited_once_with([b"", (0).to_bytes(8, "big")])
 
 
 async def _collect_n(adapter: VllmAdapter, n: int) -> list[list[KVEventBatch]]:

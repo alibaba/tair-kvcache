@@ -131,9 +131,7 @@ async def test_spectrum_service_discovery_keeps_cached_endpoints_on_poll_failure
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     http_client = SequencedFakeHttpClient()
-    discovery = SpectrumServiceDiscovery(
-        "vs-a", cache_ttl=60, http_client=http_client
-    )
+    discovery = SpectrumServiceDiscovery("vs-a", cache_ttl=60, http_client=http_client)
     await discovery.start()
 
     async def fail_get(url: str, timeout: float) -> FakeResponse:

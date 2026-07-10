@@ -24,7 +24,7 @@ class FakeAdapter(AbstractEngineAdapter):
         for event in self._events:
             yield event
 
-    def reset_generation_state(self) -> None:
+    async def reset_generation_state(self) -> None:
         self.reset_generation_calls += 1
 
     def map_medium(self, medium: str | None) -> str:
@@ -194,8 +194,8 @@ async def test_reset_generation_runs_before_epoch_bump_and_gate_open() -> None:
             super().__init__()
             self._coordinator_ref = coordinator_ref
 
-        def reset_generation_state(self) -> None:
-            super().reset_generation_state()
+        async def reset_generation_state(self) -> None:
+            await super().reset_generation_state()
             coordinator = self._coordinator_ref[0]
             events_order.append(f"reset(epoch={coordinator.epoch})")
 

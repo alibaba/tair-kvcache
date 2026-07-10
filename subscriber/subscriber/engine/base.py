@@ -92,11 +92,30 @@ class AbstractEngineAdapter(ABC):
         """
         ...
 
-    def reset_generation_state(self) -> None:
+    async def reset_generation_state(self) -> None:
         """Reset adapter-local generation state after an engine restart.
 
         The health coordinator calls this before opening a new sendable epoch
         after recovery from DEAD. Adapters should clear sequence tracking and
         recreate any replay/session state that belongs to the old generation.
+
+        In-flight await contract
+        ------------------------
+        When this method runs, the adapter may still have awaits parked on the
+        previous generation's sockets — for example a live ``recv_multipart``
+        on the SUB socket, or a replay ``send``/``recv`` pair on the DEALER
+        socket. If those awaits returned their results into the new epoch,
+        stale seq/payload from the old engine instance would be yielded with
+        the freshly reset sequence counter and forwarded to kvcm as if it
+        belonged to the new generation.
+
+        Implementations must therefore invalidate any in-flight result whose
+        await spanned the reset. The vLLM adapter does this with a monotonic
+        ``self._generation`` counter: every async helper snapshots the counter
+        before each await and discards the result (returns ``None`` / skips
+        the yield) if the counter has advanced by the time the await resumes.
+        Closing the old sockets with ``linger=0`` inside this method provides
+        a second line of defense by turning parked awaits into exceptions that
+        the helpers already translate into ``None``.
         """
         return None

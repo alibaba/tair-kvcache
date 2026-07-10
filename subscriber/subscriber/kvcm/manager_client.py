@@ -335,38 +335,3 @@ class HttpKvCacheManagerClient:
         await self._http_client.aclose()
         if self._service_discovery is not None:
             await self._service_discovery.close()
-
-    def load_manager_client(
-        base_url: str,
-        instance_id: str,
-        *,
-        auto_discover_leader: bool = True,
-        leader_retry_count: int = 1,
-        leader_retry_base_interval_seconds: float = 0.005,
-        discovery_refresh_interval_seconds: int = 30,
-        request_timeout_seconds: float = 1.0,
-    ) -> Any:
-        try:
-            from kv_cache_manager.py_connector.common.manager_client import (
-                KvCacheManagerClient,
-            )
-
-            return KvCacheManagerClient(
-                base_url,
-                instance_id=instance_id,
-                auto_discover_leader=auto_discover_leader,
-                leader_retry_count=leader_retry_count,
-                leader_retry_base_interval_seconds=leader_retry_base_interval_seconds,
-                discovery_refresh_interval_seconds=discovery_refresh_interval_seconds,
-            )
-        except Exception as exc:
-            logger.info("Falling back to built-in KVCM HTTP manager client: %s", exc)
-            return HttpKvCacheManagerClient(
-                base_url,
-                instance_id=instance_id,
-                auto_discover_leader=auto_discover_leader,
-                leader_retry_count=leader_retry_count,
-                leader_retry_base_interval_seconds=leader_retry_base_interval_seconds,
-                discovery_refresh_interval_seconds=discovery_refresh_interval_seconds,
-                request_timeout_seconds=request_timeout_seconds,
-            )

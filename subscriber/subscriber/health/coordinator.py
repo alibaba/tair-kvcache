@@ -93,7 +93,7 @@ class EngineHealthCoordinator:
             self._epoch += 1
             self._state = EngineHealthState.HEALTHY
         elif self._state is EngineHealthState.DEAD:
-            self._adapter.reset_generation_state()
+            await self._adapter.reset_generation_state()
             self._epoch += 1
             self._state = EngineHealthState.HEALTHY
         self._failure_count = 0

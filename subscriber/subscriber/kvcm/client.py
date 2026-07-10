@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import os
 import time
 from collections.abc import Callable
@@ -73,14 +74,42 @@ class KvcmClient:
     def _trace_id(self, operation: str) -> str:
         return f"subscriber_{operation}_{time.monotonic_ns()}"
 
+    def _block_size(self) -> int:
+        raw = os.environ.get("DS_LLM_ENGINE_CONFIG", "")
+        if not raw:
+            return 1
+        try:
+            config = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            logger.warning(
+                "failed to parse DS_LLM_ENGINE_CONFIG, using default block_size=1",
+                step="kvcm_register",
+                exc_info=True,
+            )
+            return 1
+        if not isinstance(config, dict):
+            return 1
+        block_size = config.get("block_size", 1)
+        if (
+            isinstance(block_size, bool)
+            or not isinstance(block_size, int)
+            or block_size <= 0
+        ):
+            return 1
+        return block_size
+
+    def _location_spec_name(self, block_size: int) -> str:
+        return f"vllm_{block_size}"
+
     def _register_instance_request(self) -> dict[str, object]:
+        block_size = self._block_size()
+        location_spec_name = self._location_spec_name(block_size)
         return {
             "trace_id": self._trace_id("register_instance"),
             "instance_group": "default",
             "instance_id": self._instance_id(),
-            # TODO: 从 DS_LLM_ENGINE_CONFIG 环境变量里解析 block_size
-            "block_size": 1,
-            "location_spec_infos": [{"name": "default", "size": 1}],
+            "block_size": block_size,
+            "location_spec_infos": [{"name": location_spec_name, "size": block_size}],
             "model_deployment": {
                 "model_name": "default",
                 "dtype": "",
@@ -92,7 +121,9 @@ class KvcmClient:
                 "extra": "",
                 "user_data": "",
             },
-            "location_spec_groups": [{"name": "default", "spec_names": ["default"]}],
+            "location_spec_groups": [
+                {"name": "default", "spec_names": [location_spec_name]}
+            ],
         }
 
     def _node_register_event(self) -> dict[str, object]:
@@ -118,6 +149,15 @@ class KvcmClient:
             "storage_type": self._storage_type,
         }
 
+    def _block_specs(self, medium: str) -> list[dict[str, str]]:
+        block_size = self._block_size()
+        return [
+            {
+                "name": self._location_spec_name(block_size),
+                "uri": f"vllm://{self._host_ip_port()}/{medium}",
+            }
+        ]
+
     def _report_events_for_batches(
         self, batches: list[KVEventBatch]
     ) -> list[dict[str, object]]:
@@ -126,6 +166,7 @@ class KvcmClient:
             for event in batch.events:
                 if isinstance(event, BlockStored):
                     medium = self._medium_mapper(event.medium)
+                    specs = self._block_specs(medium)
                     for block_hash in event.block_hashes:
                         events.append(
                             {
@@ -133,7 +174,7 @@ class KvcmClient:
                                 "block_add": {
                                     "block_key": str(block_hash),
                                     "medium": medium,
-                                    "specs": [],
+                                    "specs": specs,
                                 },
                             }
                         )

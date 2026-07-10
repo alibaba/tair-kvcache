@@ -85,9 +85,9 @@ def test_register_instance_request_uses_env_instance_id(
     assert request["instance_id"] == "deploy-a"
     assert request["instance_group"] == "default"
     assert request["block_size"] == 1
-    assert request["location_spec_infos"] == [{"name": "default", "size": 1}]
+    assert request["location_spec_infos"] == [{"name": "vllm_1", "size": 1}]
     assert request["location_spec_groups"] == [
-        {"name": "default", "spec_names": ["default"]}
+        {"name": "default", "spec_names": ["vllm_1"]}
     ]
     assert request["model_deployment"] == {
         "model_name": "default",
@@ -100,6 +100,90 @@ def test_register_instance_request_uses_env_instance_id(
         "extra": "",
         "user_data": "",
     }
+
+
+def test_block_specs_use_registered_location_spec_name() -> None:
+    client = _client(SubscriberConfig(kvcm_host_ip_port="10.0.0.8:9000"))
+    register_request = client._register_instance_request()
+    block_events = client._report_events_for_batches(
+        [
+            KVEventBatch(
+                ts=1.0,
+                events=[
+                    BlockStored(
+                        block_hashes=[11],
+                        parent_block_hash=None,
+                        token_ids=[1, 2],
+                        block_size=2,
+                        lora_id=None,
+                        medium="GPU",
+                        lora_name=None,
+                    )
+                ],
+            )
+        ]
+    )
+
+    registered_spec_names = {
+        spec["name"] for spec in register_request["location_spec_infos"]
+    }
+    block_specs = block_events[0]["block_add"]["specs"]
+
+    assert block_specs == [{"name": "vllm_1", "uri": "vllm://10.0.0.8:9000/hbm"}]
+    assert {spec["name"] for spec in block_specs} <= registered_spec_names
+
+
+def test_register_and_block_specs_use_configured_block_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DS_LLM_ENGINE_CONFIG", '{"block_size": 16}')
+    client = _client(SubscriberConfig(kvcm_host_ip_port="10.0.0.8:9000"))
+
+    register_request = client._register_instance_request()
+    block_events = client._report_events_for_batches(
+        [
+            KVEventBatch(
+                ts=1.0,
+                events=[
+                    BlockStored(
+                        block_hashes=[11],
+                        parent_block_hash=None,
+                        token_ids=[1, 2],
+                        block_size=16,
+                        lora_id=None,
+                        medium="GPU",
+                        lora_name=None,
+                    )
+                ],
+            )
+        ]
+    )
+
+    assert register_request["block_size"] == 16
+    assert register_request["location_spec_infos"] == [{"name": "vllm_16", "size": 16}]
+    assert register_request["location_spec_groups"] == [
+        {"name": "default", "spec_names": ["vllm_16"]}
+    ]
+    assert block_events[0]["block_add"]["specs"] == [
+        {"name": "vllm_16", "uri": "vllm://10.0.0.8:9000/hbm"}
+    ]
+
+
+@pytest.mark.parametrize(
+    ("raw_config", "expected_block_size"),
+    [
+        ('{"block_size": 16}', 16),
+        ("[]", 1),
+        ("1", 1),
+        ('{"block_size": true}', 1),
+        ('{"block_size": 0}', 1),
+    ],
+)
+def test_block_size_falls_back_for_invalid_engine_config_shapes(
+    monkeypatch: pytest.MonkeyPatch, raw_config: str, expected_block_size: int
+) -> None:
+    monkeypatch.setenv("DS_LLM_ENGINE_CONFIG", raw_config)
+    assert _client()._block_size() == expected_block_size
 
 
 def test_register_instance_request_uses_empty_instance_id_when_env_missing(
@@ -144,7 +228,9 @@ def test_report_events_for_batches_maps_all_supported_event_types() -> None:
         ],
     )
 
-    events = _client()._report_events_for_batches([batch])
+    events = _client(
+        SubscriberConfig(kvcm_host_ip_port="127.0.0.1:8000")
+    )._report_events_for_batches([batch])
 
     assert events == [
         {
@@ -152,7 +238,7 @@ def test_report_events_for_batches_maps_all_supported_event_types() -> None:
             "block_add": {
                 "block_key": "11",
                 "medium": "hbm",
-                "specs": [],
+                "specs": [{"name": "vllm_1", "uri": "vllm://127.0.0.1:8000/hbm"}],
             },
         },
         {
@@ -160,7 +246,7 @@ def test_report_events_for_batches_maps_all_supported_event_types() -> None:
             "block_add": {
                 "block_key": "12",
                 "medium": "hbm",
-                "specs": [],
+                "specs": [{"name": "vllm_1", "uri": "vllm://127.0.0.1:8000/hbm"}],
             },
         },
         {
