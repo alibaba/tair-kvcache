@@ -7,7 +7,7 @@ from collections.abc import Callable
 from enum import StrEnum
 from typing import Any
 
-from kv_cache_manager.py_connector.common.manager_client import KvCacheManagerClient
+from subscriber.kvcm.manager_client import HttpKvCacheManagerClient
 
 from subscriber import logger
 from subscriber.config import SubscriberConfig
@@ -39,7 +39,7 @@ class KvcmClient:
         sdk_client_factory: Callable[[str], Any] | None = None,
     ) -> None:
         self._config = config
-        self._sdk_client_factory = sdk_client_factory or KvCacheManagerClient
+        self._sdk_client_factory = sdk_client_factory or HttpKvCacheManagerClient
         self._sdk_client: Any | None = None
         self._host_ip_port_value: str | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
