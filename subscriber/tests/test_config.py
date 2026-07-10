@@ -13,7 +13,6 @@ def test_defaults() -> None:
     assert config.zmq_pub_endpoint == "tcp://localhost:5557"
     assert config.zmq_replay_endpoint == "tcp://localhost:5558"
     assert config.zmq_topic == ""
-    assert config.kvcm_addr == "localhost:50051"
     assert config.engine_type == "vllm"
 
 
@@ -22,14 +21,6 @@ def test_engine_type_cli_override() -> None:
     args = parser.parse_args(["--engine-type", "sglang"])
     config = SubscriberConfig.from_args(args)
     assert config.engine_type == "sglang"
-
-
-def test_cli_override() -> None:
-    parser = build_parser()
-    args = parser.parse_args(["--kvcm-addr", "10.0.0.1:50051"])
-    config = SubscriberConfig.from_args(args)
-    assert config.kvcm_addr == "10.0.0.1:50051"
-    assert config.zmq_pub_endpoint == "tcp://localhost:5557"
 
 
 def test_kv_event_queue_maxsize_defaults_to_1024() -> None:
@@ -116,26 +107,22 @@ def test_yaml_loading(tmp_path: Path) -> None:
     yaml_file.write_text(
         textwrap.dedent("""\
             zmq_pub_endpoint: "tcp://remote:5557"
-            kvcm_addr: "10.0.0.2:50051"
         """)
     )
     parser = build_parser()
     args = parser.parse_args(["--config", str(yaml_file)])
     config = SubscriberConfig.from_args(args)
     assert config.zmq_pub_endpoint == "tcp://remote:5557"
-    assert config.kvcm_addr == "10.0.0.2:50051"
     assert config.zmq_replay_endpoint == "tcp://localhost:5558"
 
 
 def test_cli_overrides_yaml(tmp_path: Path) -> None:
     yaml_file = tmp_path / "config.yaml"
-    yaml_file.write_text("kvcm_addr: '10.0.0.2:50051'\n")
+    yaml_file.write_text("engine_type: vllm\n")
     parser = build_parser()
-    args = parser.parse_args(
-        ["--config", str(yaml_file), "--kvcm-addr", "10.0.0.3:50051"]
-    )
+    args = parser.parse_args(["--config", str(yaml_file), "--engine-type", "sglang"])
     config = SubscriberConfig.from_args(args)
-    assert config.kvcm_addr == "10.0.0.3:50051"
+    assert config.engine_type == "sglang"
 
 
 def test_health_config_defaults() -> None:

@@ -7,15 +7,15 @@ Supports URL-based configuration compatible with tair-kvcache C++/Python convent
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import random
-import threading
-import time
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence
+from typing import Any, Literal
 
-import requests
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -35,29 +35,38 @@ class ServiceDiscovery(ABC):
     """Service discovery abstract base class."""
 
     @abstractmethod
-    def get_all_endpoints(self) -> List[ServiceEndpoint]:
+    def get_all_endpoints(self) -> list[ServiceEndpoint]:
         """Return all available endpoints; empty list on failure."""
 
     @abstractmethod
-    def get_one_endpoint(self) -> Optional[ServiceEndpoint]:
+    def get_one_endpoint(self) -> ServiceEndpoint | None:
         """Return a single endpoint via load-balancing; None if unavailable."""
 
     @abstractmethod
-    def refresh(self) -> bool:
+    async def refresh(self) -> bool:
         """Force refresh; return whether successful."""
 
     @abstractmethod
     def get_type(self) -> str:
         """Return implementation type name (e.g. "Static", "Spectrum")."""
 
-    def close(self) -> None:
-        """Release resources; no-op by default."""
+    async def start(self) -> None:
+        """Initialize discovery resources; no-op by default."""
+        return None
 
-    def __enter__(self):
+    async def close(self) -> None:
+        """Release resources; no-op by default."""
+        return None
+
+    def __enter__(self) -> ServiceDiscovery:
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: Any,
+    ) -> Literal[False]:
         return False
 
 
@@ -66,10 +75,10 @@ class ServiceDiscovery(ABC):
 # ---------------------------------------------------------------------------
 
 
-def _parse_host_port_list(host_list: str) -> List[ServiceEndpoint]:
+def _parse_host_port_list(host_list: str) -> list[ServiceEndpoint]:
     if not host_list:
         raise ValueError("host_list is empty")
-    endpoints: List[ServiceEndpoint] = []
+    endpoints: list[ServiceEndpoint] = []
     for token in host_list.split(","):
         token = token.strip()
         if not token:
@@ -95,37 +104,36 @@ class StaticServiceDiscovery(ServiceDiscovery):
 
     def __init__(
         self,
-        host_list: Optional[str] = None,
+        host_list: str | None = None,
         *,
-        endpoints: Optional[Sequence[ServiceEndpoint]] = None,
+        endpoints: Sequence[ServiceEndpoint] | None = None,
     ):
         if endpoints is not None:
-            parsed: List[ServiceEndpoint] = list(endpoints)
+            parsed: list[ServiceEndpoint] = list(endpoints)
         elif host_list is not None:
             parsed = _parse_host_port_list(host_list)
         else:
             raise ValueError("must provide either host_list or endpoints")
         if not parsed:
             raise ValueError("StaticServiceDiscovery init with empty endpoints")
-        self._endpoints: List[ServiceEndpoint] = parsed
+        self._endpoints: list[ServiceEndpoint] = parsed
         self._rr_index = 0
-        self._rr_lock = threading.Lock()
+        self._rr_lock = asyncio.Lock()
 
     def get_type(self) -> str:
         return "Static"
 
-    def get_all_endpoints(self) -> List[ServiceEndpoint]:
+    def get_all_endpoints(self) -> list[ServiceEndpoint]:
         return list(self._endpoints)
 
-    def get_one_endpoint(self) -> Optional[ServiceEndpoint]:
+    def get_one_endpoint(self) -> ServiceEndpoint | None:
         if not self._endpoints:
             return None
-        with self._rr_lock:
-            ep = self._endpoints[self._rr_index % len(self._endpoints)]
-            self._rr_index = (self._rr_index + 1) % len(self._endpoints)
+        ep = self._endpoints[self._rr_index % len(self._endpoints)]
+        self._rr_index = (self._rr_index + 1) % len(self._endpoints)
         return ep
 
-    def refresh(self) -> bool:
+    async def refresh(self) -> bool:
         return bool(self._endpoints)
 
 
@@ -134,24 +142,23 @@ class StaticServiceDiscovery(ServiceDiscovery):
 # ---------------------------------------------------------------------------
 
 SPECTRUM_GATEWAY_BASE_URL = "http://127.0.0.1:8880"
-SPECTRUM_INSTANCES_PATH_TEMPLATE = (
-    "/api/v1/discovery/virtual-services/{vsid}/instances"
-)
+SPECTRUM_INSTANCES_PATH_TEMPLATE = "/api/v1/discovery/virtual-services/{vsid}/instances"
 
 
 class SpectrumServiceDiscovery(ServiceDiscovery):
-    """Spectrum gateway based service discovery with TTL cache."""
+    """Spectrum gateway service discovery with a background refresh loop."""
 
     def __init__(
         self,
         virtual_service_id: str,
         *,
-        port_override: Optional[int] = None,
-        cache_ttl: int = 30,
-        refresh_timeout: int = 5,
+        port_override: int | None = None,
+        cache_ttl: float = 1,
+        refresh_timeout: float = 5,
         auto_refresh: bool = True,
         retry_count: int = 0,
-    ):
+        http_client: Any | None = None,
+    ) -> None:
         if not virtual_service_id:
             raise ValueError("virtual_service_id must not be empty")
         self.virtual_service_id = virtual_service_id
@@ -160,16 +167,29 @@ class SpectrumServiceDiscovery(ServiceDiscovery):
         self.refresh_timeout = refresh_timeout
         self.auto_refresh = auto_refresh
         self.retry_count = max(0, retry_count)
+        if self.cache_ttl <= 0:
+            raise ValueError("spectrum poll interval must be positive")
 
-        self._cache: List[ServiceEndpoint] = []
-        self._cache_time: float = 0.0
-        self._cache_lock = threading.Lock()
+        self._cache: list[ServiceEndpoint] = []
+        self._cache_lock = asyncio.Lock()
+        self._refresh_lock = asyncio.Lock()
+        self._closed = False
 
-        self._session = requests.Session()
-        self._session.headers.update(
-            {"Accept": "application/json", "Content-Type": "application/json"}
+        self._http_client = http_client or httpx.AsyncClient(
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            }
         )
-        self.refresh()
+        self._refresh_task: asyncio.Task[None] | None = None
+
+    async def start(self) -> None:
+        await self.refresh()
+        if self.auto_refresh and self._refresh_task is None:
+            self._refresh_task = asyncio.create_task(
+                self._refresh_loop(),
+                name="spectrum-service-discovery-refresh",
+            )
 
     def get_type(self) -> str:
         return "Spectrum"
@@ -179,61 +199,66 @@ class SpectrumServiceDiscovery(ServiceDiscovery):
         path = SPECTRUM_INSTANCES_PATH_TEMPLATE.format(vsid=self.virtual_service_id)
         return SPECTRUM_GATEWAY_BASE_URL + path
 
-    def get_all_endpoints(self) -> List[ServiceEndpoint]:
-        with self._cache_lock:
-            if not (self._is_cache_expired() and self.auto_refresh):
-                return self._cache.copy()
-        self.refresh()
-        with self._cache_lock:
-            return self._cache.copy()
+    def get_all_endpoints(self) -> list[ServiceEndpoint]:
+        return self._cache.copy()
 
-    def get_one_endpoint(self) -> Optional[ServiceEndpoint]:
+    def get_one_endpoint(self) -> ServiceEndpoint | None:
         endpoints = self.get_all_endpoints()
         if not endpoints:
             return None
         return random.choice(endpoints)
 
-    def refresh(self) -> bool:
-        total_attempts = self.retry_count + 1
-        last_err: Optional[Exception] = None
-        for _ in range(total_attempts):
+    async def refresh(self) -> bool:
+        async with self._refresh_lock:
+            total_attempts = self.retry_count + 1
+            last_err: Exception | None = None
+            for _ in range(total_attempts):
+                try:
+                    endpoints = await self._fetch_from_spectrum()
+                    changed = endpoints != self._cache
+                    if changed:
+                        self._cache = endpoints
+                    if changed:
+                        logger.info(
+                            "Spectrum service discovery updated endpoints "
+                            "for vsid=%s: %s",
+                            self.virtual_service_id,
+                            [endpoint.host for endpoint in endpoints],
+                        )
+                    return True
+                except Exception as e:
+                    last_err = e
+            logger.error(
+                "Failed to refresh Spectrum service discovery for vsid=%s "
+                "after %d attempts; keeping cached endpoints: %s",
+                self.virtual_service_id,
+                total_attempts,
+                last_err,
+            )
+            return False
+
+    async def close(self) -> None:
+        self._closed = True
+        if self._refresh_task is not None:
+            self._refresh_task.cancel()
             try:
-                endpoints = self._fetch_from_spectrum()
-                with self._cache_lock:
-                    self._cache = endpoints
-                    self._cache_time = time.time()
-                if endpoints:
-                    logger.debug(
-                        "Spectrum service discovery refreshed: %d endpoints for vsid=%s",
-                        len(endpoints),
-                        self.virtual_service_id,
-                    )
-                else:
-                    logger.warning(
-                        "Spectrum service discovery returned no endpoints for vsid=%s",
-                        self.virtual_service_id,
-                    )
-                return True
-            except Exception as e:
-                last_err = e
-                continue
-        logger.error(
-            "Failed to refresh Spectrum service discovery for vsid=%s "
-            "after %d attempts: %s",
-            self.virtual_service_id,
-            total_attempts,
-            last_err,
+                await self._refresh_task
+            except asyncio.CancelledError:
+                pass
+            self._refresh_task = None
+        await self._http_client.aclose()
+
+    async def _refresh_loop(self) -> None:
+        while not self._closed:
+            await asyncio.sleep(self.cache_ttl)
+            if self._closed:
+                break
+            await self.refresh()
+
+    async def _fetch_from_spectrum(self) -> list[ServiceEndpoint]:
+        response = await self._http_client.get(
+            self.service_url, timeout=self.refresh_timeout
         )
-        return False
-
-    def close(self) -> None:
-        self._session.close()
-
-    def _is_cache_expired(self) -> bool:
-        return (time.time() - self._cache_time) > self.cache_ttl
-
-    def _fetch_from_spectrum(self) -> List[ServiceEndpoint]:
-        response = self._session.get(self.service_url, timeout=self.refresh_timeout)
         response.raise_for_status()
         data = response.json()
         items = data.get("instances", [])
@@ -243,23 +268,36 @@ class SpectrumServiceDiscovery(ServiceDiscovery):
                 self.virtual_service_id,
             )
             return []
-        endpoints: List[ServiceEndpoint] = []
+        endpoints: list[ServiceEndpoint] = []
         for item in items:
             if not isinstance(item, dict):
                 continue
-            if "ip" not in item or "port" not in item:
+            ip = item.get("ip")
+            port = (
+                self.port_override
+                if self.port_override is not None
+                else item.get("port")
+            )
+            if not isinstance(ip, str) or not ip:
                 continue
-            port = self.port_override if self.port_override is not None else item["port"]
+            if not isinstance(port, (int, str)) or isinstance(port, bool):
+                continue
+            try:
+                parsed_port = int(port)
+            except (TypeError, ValueError):
+                continue
+            if parsed_port <= 0 or parsed_port > 65535:
+                continue
             endpoints.append(
                 ServiceEndpoint(
-                    ip=item["ip"],
-                    port=port,
-                    host=f"{item['ip']}:{port}",
+                    ip=ip,
+                    port=parsed_port,
+                    host=f"{ip}:{parsed_port}",
                     weight=item.get("weight", 100),
                     healthy=True,
                 )
             )
-        return endpoints
+        return sorted(endpoints, key=lambda endpoint: (endpoint.ip, endpoint.port))
 
 
 # ---------------------------------------------------------------------------
@@ -272,7 +310,7 @@ _SCHEME_SPECTRUM = "spectrum"
 
 def _parse_discovery_url(
     url: str,
-) -> Optional[tuple[str, str, Dict[str, str]]]:
+) -> tuple[str, str, dict[str, str]] | None:
     """Parse ``<scheme>://<body>[?k=v(&k=v)*]``."""
     if not url:
         return None
@@ -281,12 +319,12 @@ def _parse_discovery_url(
         logger.error("invalid service discovery url, missing scheme: %r", url)
         return None
     scheme = url[:sep]
-    rest = url[sep + 3:]
+    rest = url[sep + 3 :]
     if not rest:
         logger.error("invalid service discovery url, empty body: %r", url)
         return None
     body, sep_char, query = rest.partition("?")
-    params: Dict[str, str] = {}
+    params: dict[str, str] = {}
     if sep_char:
         for kv in query.split("&"):
             if not kv:
@@ -299,7 +337,7 @@ def _parse_discovery_url(
     return scheme, body, params
 
 
-def _get_int_param(params: Dict[str, str], key: str, default: int) -> int:
+def _get_int_param(params: dict[str, str], key: str, default: int) -> int:
     raw = params.get(key)
     if raw is None or raw == "":
         return default
@@ -309,7 +347,7 @@ def _get_int_param(params: Dict[str, str], key: str, default: int) -> int:
         return default
 
 
-def create_service_discovery(url: str) -> Optional[ServiceDiscovery]:
+def create_service_discovery(url: str) -> ServiceDiscovery | None:
     """Create a ServiceDiscovery instance from a URL string.
 
     Supported schemes: ``static://``, ``spectrum://``.
@@ -333,15 +371,15 @@ def create_service_discovery(url: str) -> Optional[ServiceDiscovery]:
 
     if scheme == _SCHEME_SPECTRUM:
         # spectrum://vsid or spectrum://vsid:port
-        port_override: Optional[int] = None
+        port_override: int | None = None
         vsid = body
         colon_pos = body.rfind(":")
         if colon_pos > 0:
-            maybe_port = body[colon_pos + 1:]
+            maybe_port = body[colon_pos + 1 :]
             if maybe_port.isdigit():
                 port_override = int(maybe_port)
                 vsid = body[:colon_pos]
-        cache_ttl = _get_int_param(params, "cache_time", 30)
+        cache_ttl = _get_int_param(params, "cache_time", 1)
         timeout_ms = _get_int_param(params, "timeout", 0)
         refresh_timeout = max(1, timeout_ms // 1000) if timeout_ms > 0 else 5
         retry_count = _get_int_param(params, "retry_time", 0)

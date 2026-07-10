@@ -296,17 +296,7 @@ async def test_recv_live_message_skips_debug_when_disabled(
     adapter = VllmAdapter(config)
     assert await adapter._recv_live_message() == (7, payload)
 
-    debug.assert_called_once_with(
-        "connecting vLLM ZMQ sockets",
-        step="zmq_connect",
-        tags={
-            "pub_endpoint": config.zmq_pub_endpoint,
-            "replay_endpoint": config.zmq_replay_endpoint,
-            "topic": config.zmq_topic,
-            "reconnect_ivl_ms": config.zmq_reconnect_ivl_ms,
-            "reconnect_ivl_max_ms": config.zmq_reconnect_ivl_max_ms,
-        },
-    )
+    debug.assert_not_called()
 
 
 async def test_triggers_replay_on_gap(config: SubscriberConfig, mocker: Any) -> None:

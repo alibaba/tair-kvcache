@@ -69,6 +69,29 @@ class AbstractEngineAdapter(ABC):
         """Yield engine-agnostic liveness events for the health coordinator."""
         ...
 
+    @abstractmethod
+    def map_medium(self, medium: str | None) -> str:
+        """Translate an engine-native medium string to the kvcm wire value.
+
+        Returns the kvcm-side identifier (e.g. ``"hbm"``, ``"mem"``) for the
+        given engine-specific medium.  Returns ``""`` when *medium* is ``None``
+        or not recognized by this adapter.
+        """
+        ...
+
+    @abstractmethod
+    def supported_mediums(self) -> list[str]:
+        """Return the kvcm wire medium values this adapter can produce."""
+        ...
+
+    @abstractmethod
+    def storage_type(self) -> str:
+        """Return the kvcm storage type identifier for this engine.
+
+        For example, the vLLM adapter returns ``"ST_VLLM"``.
+        """
+        ...
+
     def reset_generation_state(self) -> None:
         """Reset adapter-local generation state after an engine restart.
 

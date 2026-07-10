@@ -27,6 +27,15 @@ class FakeAdapter(AbstractEngineAdapter):
     def reset_generation_state(self) -> None:
         self.reset_generation_calls += 1
 
+    def map_medium(self, medium: str | None) -> str:
+        return ""
+
+    def supported_mediums(self) -> list[str]:
+        return []
+
+    def storage_type(self) -> str:
+        return "ST_UNSPECIFIED"
+
 
 class RecordingKvcmClient(KvcmClient):
     def __init__(self) -> None:

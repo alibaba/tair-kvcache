@@ -30,7 +30,6 @@ class SubscriberConfig:
     data_parallel_size: int = 1
 
     # kvcm SDK
-    kvcm_addr: str = "localhost:50051"
     kvcm_host_ip_port: str = ""
     kvcm_heartbeat_interval_s: float = 1.0
     kv_event_queue_maxsize: int = 1024
@@ -87,8 +86,14 @@ class SubscriberConfig:
         parser.add_argument("--zmq-replay-endpoint", default=default)
         parser.add_argument("--zmq-topic", default=default)
         parser.add_argument("--data-parallel-size", type=int, default=default)
-        parser.add_argument("--kvcm-addr", default=default)
-        parser.add_argument("--kvcm-host-ip-port", default=default)
+        parser.add_argument("--block-size", type=int, default=default)
+        parser.add_argument(
+            "--kvcm-host-ip-port",
+            default=default,
+            help="Local IP of the subscriber/engine host, "
+            "reported to kvcm so it can reach this node "
+            "(e.g. 192.168.1.10).",
+        )
         parser.add_argument("--kvcm-heartbeat-interval-s", type=float, default=default)
         parser.add_argument("--kv-event-queue-maxsize", type=int, default=default)
         parser.add_argument("--engine-type", default=default)

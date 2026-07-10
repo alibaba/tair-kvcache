@@ -18,6 +18,14 @@ from subscriber.utils.msgpack_helper import KVEventBatchMsgpackHelper
 _END_SEQ = (-1).to_bytes(8, "big", signed=True)
 _MAX_DEBUG_BLOCK_HASHES = 32
 
+MEDIUM_VLLM_GPU = "GPU"
+MEDIUM_VLLM_CPU = "CPU"
+
+_KVCM_MEDIUM_MAP = {
+    MEDIUM_VLLM_GPU: "hbm",
+    MEDIUM_VLLM_CPU: "mem",
+}
+
 
 def _summarize_batch(batch: KVEventBatch) -> dict[str, object]:
     event_type_counts = Counter(type(event).__name__ for event in batch.events)
@@ -84,17 +92,18 @@ class VllmAdapter(AbstractEngineAdapter):
         self._sub: zmq.asyncio.Socket = self._ctx.socket(zmq.SUB)
         self._dealer: zmq.asyncio.Socket = self._ctx.socket(zmq.DEALER)
         self._configure_sub_socket()
-        logger.debug(
-            "connecting vLLM ZMQ sockets",
-            step="zmq_connect",
-            tags={
-                "pub_endpoint": self._endpoint.zmq_pub_endpoint,
-                "replay_endpoint": self._endpoint.zmq_replay_endpoint,
-                "topic": self._endpoint.zmq_topic,
-                "reconnect_ivl_ms": self._config.zmq_reconnect_ivl_ms,
-                "reconnect_ivl_max_ms": self._config.zmq_reconnect_ivl_max_ms,
-            },
-        )
+        if logger.is_debug_enabled():
+            logger.debug(
+                "connecting vLLM ZMQ sockets",
+                step="zmq_connect",
+                tags={
+                    "pub_endpoint": self._endpoint.zmq_pub_endpoint,
+                    "replay_endpoint": self._endpoint.zmq_replay_endpoint,
+                    "topic": self._endpoint.zmq_topic,
+                    "reconnect_ivl_ms": self._config.zmq_reconnect_ivl_ms,
+                    "reconnect_ivl_max_ms": self._config.zmq_reconnect_ivl_max_ms,
+                },
+            )
         self._sub.connect(self._endpoint.zmq_pub_endpoint)
         self._sub.setsockopt_string(zmq.SUBSCRIBE, self._endpoint.zmq_topic)
         self._dealer.connect(self._endpoint.zmq_replay_endpoint)
@@ -347,3 +356,14 @@ class VllmAdapter(AbstractEngineAdapter):
         self._dealer.close(linger=0)
         self._dealer = self._ctx.socket(zmq.DEALER)
         self._dealer.connect(self._endpoint.zmq_replay_endpoint)
+
+    def map_medium(self, medium: str | None) -> str:
+        if medium is None:
+            return ""
+        return _KVCM_MEDIUM_MAP.get(medium, "")
+
+    def supported_mediums(self) -> list[str]:
+        return list(_KVCM_MEDIUM_MAP.values())
+
+    def storage_type(self) -> str:
+        return "ST_VLLM"

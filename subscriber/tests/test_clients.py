@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from enum import Enum
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -13,26 +13,66 @@ from subscriber.types import AllBlocksCleared, BlockRemoved, BlockStored, KVEven
 
 
 class FakeSdkClient:
-    def __init__(self) -> None:
-        self.register_instance = MagicMock(
+    def __init__(self, base_url: str = "") -> None:
+        self.base_url = base_url
+        self.started = False
+        self.start = AsyncMock(side_effect=self._start)
+        self.register_instance = AsyncMock(
             return_value={"header": {"status": {"code": "OK"}}}
         )
-        self.report_event = MagicMock(
+        self.report_event = AsyncMock(
             return_value={"header": {"status": {"code": "OK"}}}
         )
-        self.close = MagicMock()
+        self.close = AsyncMock()
+
+    async def _start(self) -> None:
+        self.started = True
+
+
+_VLLM_MEDIUM_MAP = {"GPU": "hbm", "CPU": "mem"}
+
+
+@pytest.fixture(autouse=True)
+def _set_kvcm_vservice_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KVCM_VSERVICE_ID", "vs-test")
+
+
+def _vllm_medium_mapper(medium: str | None) -> str:
+    if medium is None:
+        return ""
+    return _VLLM_MEDIUM_MAP.get(medium, "")
 
 
 def _client(config: SubscriberConfig | None = None) -> KvcmClient:
     return KvcmClient(
-        config or SubscriberConfig(), sdk_client_factory=lambda _url: FakeSdkClient()
+        config or SubscriberConfig(),
+        medium_mapper=_vllm_medium_mapper,
+        storage_type="ST_VLLM",
+        supported_mediums=["hbm", "mem"],
+        sdk_client_factory=lambda _url: FakeSdkClient(),
+    )
+
+
+def _make_kvcm(config: SubscriberConfig, fake_sdk: FakeSdkClient) -> KvcmClient:
+    return KvcmClient(
+        config,
+        medium_mapper=_vllm_medium_mapper,
+        storage_type="ST_VLLM",
+        supported_mediums=["hbm", "mem"],
+        sdk_client_factory=lambda _url: fake_sdk,
     )
 
 
 def test_storage_type_maps_engine_type() -> None:
-    assert _client(SubscriberConfig(engine_type="vllm"))._storage_type() == "ST_VLLM"
+    assert _client(SubscriberConfig(engine_type="vllm"))._storage_type == "ST_VLLM"
     assert (
-        _client(SubscriberConfig(engine_type="unknown"))._storage_type()
+        KvcmClient(
+            SubscriberConfig(engine_type="unknown"),
+            medium_mapper=_vllm_medium_mapper,
+            storage_type="ST_UNSPECIFIED",
+            supported_mediums=["hbm", "mem"],
+            sdk_client_factory=lambda _url: FakeSdkClient(),
+        )._storage_type
         == "ST_UNSPECIFIED"
     )
 
@@ -111,7 +151,6 @@ def test_report_events_for_batches_maps_all_supported_event_types() -> None:
             "event_type": "EVENT_BLOCK_ADD",
             "block_add": {
                 "block_key": "11",
-                "uri": "",
                 "medium": "hbm",
                 "specs": [],
             },
@@ -120,7 +159,6 @@ def test_report_events_for_batches_maps_all_supported_event_types() -> None:
             "event_type": "EVENT_BLOCK_ADD",
             "block_add": {
                 "block_key": "12",
-                "uri": "",
                 "medium": "hbm",
                 "specs": [],
             },
@@ -155,16 +193,17 @@ def test_kvcm_event_types_are_string_enum_values() -> None:
 
 async def test_start_creates_sdk_registers_instance_reports_node_and_starts_heartbeat():
     fake_sdk = FakeSdkClient()
-    client = KvcmClient(
+    client = _make_kvcm(
         SubscriberConfig(
             kvcm_host_ip_port="10.0.0.8:9000", kvcm_heartbeat_interval_s=60.0
         ),
-        sdk_client_factory=lambda _url: fake_sdk,
+        fake_sdk,
     )
 
     await client.start()
     await client.close()
 
+    fake_sdk.start.assert_awaited_once()
     fake_sdk.register_instance.assert_called_once()
     register_request = fake_sdk.register_instance.call_args.args[0]
     assert register_request["block_size"] == 1
@@ -177,7 +216,35 @@ async def test_start_creates_sdk_registers_instance_reports_node_and_starts_hear
             "node_register": {"mediums": ["hbm", "mem"]},
         }
     ]
-    fake_sdk.close.assert_called_once()
+    fake_sdk.close.assert_awaited_once()
+
+
+async def test_start_uses_spectrum_address_from_vservice_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KVCM_VSERVICE_ID", "vs-a")
+    created_clients: list[FakeSdkClient] = []
+
+    def sdk_client_factory(base_url: str) -> FakeSdkClient:
+        client = FakeSdkClient(base_url)
+        created_clients.append(client)
+        return client
+
+    client = KvcmClient(
+        SubscriberConfig(
+            kvcm_host_ip_port="10.0.0.8:9000",
+            kvcm_heartbeat_interval_s=60.0,
+        ),
+        medium_mapper=_vllm_medium_mapper,
+        storage_type="ST_VLLM",
+        supported_mediums=["hbm", "mem"],
+        sdk_client_factory=sdk_client_factory,
+    )
+
+    await client.start()
+    await client.close()
+
+    assert [created.base_url for created in created_clients] == ["spectrum://vs-a"]
 
 
 async def test_start_resolves_host_ip_port_once_and_reuses_it(
@@ -201,7 +268,7 @@ async def test_start_resolves_host_ip_port_once_and_reuses_it(
         resolve_host_ip_port,
         raising=False,
     )
-    client = KvcmClient(config, sdk_client_factory=lambda _url: fake_sdk)
+    client = _make_kvcm(config, fake_sdk)
 
     await client.start()
     fake_sdk.report_event.reset_mock()
@@ -221,7 +288,7 @@ async def test_start_resolves_host_ip_port_once_and_reuses_it(
 async def test_start_propagates_register_failure_and_does_not_start_heartbeat() -> None:
     fake_sdk = FakeSdkClient()
     fake_sdk.register_instance.side_effect = RuntimeError("register failed")
-    client = KvcmClient(SubscriberConfig(), sdk_client_factory=lambda _url: fake_sdk)
+    client = _make_kvcm(SubscriberConfig(), fake_sdk)
 
     with pytest.raises(RuntimeError, match="register failed"):
         await client.start()
@@ -232,11 +299,11 @@ async def test_start_propagates_register_failure_and_does_not_start_heartbeat() 
 
 async def test_heartbeat_reports_periodically() -> None:
     fake_sdk = FakeSdkClient()
-    client = KvcmClient(
+    client = _make_kvcm(
         SubscriberConfig(
             kvcm_host_ip_port="10.0.0.8:9000", kvcm_heartbeat_interval_s=0.01
         ),
-        sdk_client_factory=lambda _url: fake_sdk,
+        fake_sdk,
     )
 
     await client.start()
@@ -250,7 +317,7 @@ async def test_heartbeat_reports_periodically() -> None:
         == [{"event_type": "EVENT_HEARTBEAT", "heartbeat": {"system_status": {}}}]
     ]
     assert heartbeat_calls
-    fake_sdk.close.assert_called_once()
+    fake_sdk.close.assert_awaited_once()
 
 
 async def test_heartbeat_failure_logs_warning_and_continues(mocker) -> None:
@@ -261,11 +328,11 @@ async def test_heartbeat_failure_logs_warning_and_continues(mocker) -> None:
         {"header": {"status": {"code": "OK"}}},
     ]
     warning = mocker.patch("subscriber.kvcm.client.logger.warning")
-    client = KvcmClient(
+    client = _make_kvcm(
         SubscriberConfig(
             kvcm_host_ip_port="10.0.0.8:9000", kvcm_heartbeat_interval_s=0.01
         ),
-        sdk_client_factory=lambda _url: fake_sdk,
+        fake_sdk,
     )
 
     await client.start()
@@ -279,49 +346,42 @@ async def test_heartbeat_failure_logs_warning_and_continues(mocker) -> None:
     )
 
 
-async def test_send_batch_converts_events_off_the_event_loop(
+async def test_send_batch_reports_events_without_blocking_sdk_thread(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fake_sdk = FakeSdkClient()
-    client = KvcmClient(
+    client = _make_kvcm(
         SubscriberConfig(
             kvcm_host_ip_port="10.0.0.8:9000", kvcm_heartbeat_interval_s=60.0
         ),
-        sdk_client_factory=lambda _url: fake_sdk,
+        fake_sdk,
     )
     main_thread = threading.current_thread()
-    call_threads: list[threading.Thread] = []
+    report_threads: list[threading.Thread] = []
 
-    original = client._report_events_for_batches
+    async def track_report(request: dict[str, object]) -> dict[str, object]:
+        report_threads.append(threading.current_thread())
+        return {"header": {"status": {"code": "OK"}}}
 
-    def track_conversion(batches: list[KVEventBatch]) -> list[dict[str, object]]:
-        call_threads.append(threading.current_thread())
-        return original(batches)
-
-    monkeypatch.setattr(client, "_report_events_for_batches", track_conversion)
+    monkeypatch.setattr(fake_sdk, "report_event", track_report)
 
     await client.start()
-    fake_sdk.report_event.reset_mock()
     await client.send_batch(
         [KVEventBatch(ts=1.0, events=[AllBlocksCleared()])], epoch=7
     )
     await client.close()
 
-    assert call_threads, "batch events were never converted"
-    assert all(t is not main_thread for t in call_threads), (
-        "batch event conversion must run off the event loop thread "
-        "(in asyncio.to_thread), "
-        f"but it ran on {main_thread}"
-    )
+    assert report_threads
+    assert report_threads == [main_thread, main_thread]
 
 
 async def test_send_batch_reports_converted_events() -> None:
     fake_sdk = FakeSdkClient()
-    client = KvcmClient(
+    client = _make_kvcm(
         SubscriberConfig(
             kvcm_host_ip_port="10.0.0.8:9000", kvcm_heartbeat_interval_s=60.0
         ),
-        sdk_client_factory=lambda _url: fake_sdk,
+        fake_sdk,
     )
     batch = KVEventBatch(
         ts=1.0,
@@ -345,11 +405,11 @@ async def test_send_batch_reports_converted_events() -> None:
 
 async def test_send_empty_batch_does_not_report_event() -> None:
     fake_sdk = FakeSdkClient()
-    client = KvcmClient(
+    client = _make_kvcm(
         SubscriberConfig(
             kvcm_host_ip_port="10.0.0.8:9000", kvcm_heartbeat_interval_s=60.0
         ),
-        sdk_client_factory=lambda _url: fake_sdk,
+        fake_sdk,
     )
 
     await client.start()
@@ -367,11 +427,11 @@ async def test_send_batch_logs_warning_for_item_results(mocker) -> None:
         "item_results": ["OK", "INTERNAL_ERROR"],
     }
     warning = mocker.patch("subscriber.kvcm.client.logger.warning")
-    client = KvcmClient(
+    client = _make_kvcm(
         SubscriberConfig(
             kvcm_host_ip_port="10.0.0.8:9000", kvcm_heartbeat_interval_s=60.0
         ),
-        sdk_client_factory=lambda _url: fake_sdk,
+        fake_sdk,
     )
     batch = KVEventBatch(
         ts=1.0,

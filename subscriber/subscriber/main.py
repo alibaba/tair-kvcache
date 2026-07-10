@@ -118,7 +118,12 @@ async def run(config: SubscriberConfig) -> None:
     """Run the subscriber event and liveness loops until cancellation or error."""
 
     adapter = AbstractEngineAdapter.create(config.engine_type, config)
-    kvcm = KvcmClient(config)
+    kvcm = KvcmClient(
+        config,
+        medium_mapper=adapter.map_medium,
+        storage_type=adapter.storage_type(),
+        supported_mediums=adapter.supported_mediums(),
+    )
     try:
         await kvcm.start()
         coordinator = EngineHealthCoordinator(adapter, kvcm, config)

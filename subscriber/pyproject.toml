@@ -46,3 +46,8 @@ strict = true
 asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = ["integration: real ZMQ socket tests (no mocks)"]
+
+[tool.uv]
+[[tool.uv.index]]
+url = "https://artlab.alibaba-inc.com/1/pypi/simple"
+default = true
