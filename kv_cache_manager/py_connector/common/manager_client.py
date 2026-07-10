@@ -1,35 +1,80 @@
 import random
 import threading
 import time
-from typing import List
+from typing import Optional
 
 import requests
 
 from kv_cache_manager.py_connector.common.logger import logger
+from kv_cache_manager.py_connector.common.service_discovery import ServiceDiscovery
+from kv_cache_manager.py_connector.common.service_discovery_factory import (
+    create_service_discovery,
+)
 
 
 class KvCacheManagerClient:
-    def __init__(self, base_url, *, instance_id="", auto_discover_leader=False, leader_retry_count=1,
-                 leader_retry_base_interval_seconds=0.005,
-                 discovery_refresh_interval_seconds=30,
-                 min_discover_interval_seconds=1):
+    def __init__(
+        self,
+        base_url,
+        *,
+        instance_id="",
+        auto_discover_leader=False,
+        leader_retry_count=1,
+        leader_retry_base_interval_seconds=0.005,
+        discovery_refresh_interval_seconds=30,
+        min_discover_interval_seconds=1,
+    ):
         """
         Args:
-            base_url: Manager service address. When auto_discover_leader is enabled, leader
-                discovery will always query this address (not the current leader). It is
-                recommended to use a load-balancer address that fronts all manager nodes.
+            base_url: Manager HTTP(S) address or a registered service-discovery URL.
+                When service discovery is used, every leader refresh selects a fresh
+                Manager seed endpoint from the provider.
         """
-        self.base_url = base_url
+        if not isinstance(base_url, str) or not base_url:
+            raise ValueError("base_url must be a non-empty string")
+
         self.session = requests.Session()
         self.headers = {'Accept': 'application/json', 'Content-Type': 'application/json'}
+        self._service_discovery: Optional[ServiceDiscovery] = None
+
+        if base_url.startswith(("http://", "https://")):
+            resolved_base_url = base_url.rstrip('/')
+        else:
+            discovery = create_service_discovery(base_url)
+            if discovery is None:
+                self.session.close()
+                raise ValueError(
+                    f"unsupported or invalid manager service discovery URL: {base_url!r}"
+                )
+            self._service_discovery = discovery
+            try:
+                endpoint = discovery.get_one_endpoint()
+            except Exception:
+                discovery.close()
+                self._service_discovery = None
+                self.session.close()
+                raise
+            if endpoint is None:
+                discovery.close()
+                self._service_discovery = None
+                self.session.close()
+                raise RuntimeError(
+                    f"manager service discovery returned no endpoint: {base_url!r}"
+                )
+            resolved_base_url = f"http://{endpoint.host}"
+            logger.info(
+                "Service discovery (%s) resolved manager seed endpoint: %s",
+                discovery.get_type(),
+                resolved_base_url,
+            )
+
+        self.base_url = resolved_base_url
 
         # Leader discovery settings
         self._instance_id = instance_id
-        # Immutable seed address used for all discovery requests.
-        # When auto_discover_leader is enabled, getClusterInfo is always sent to this
-        # address rather than the current base_url, so it should be a stable entry point
-        # (e.g. a load-balancer) that can reach any manager node.
-        self._discovery_url = base_url
+        # Immutable fallback seed. Direct-address clients always use it for
+        # getClusterInfo; service-discovery clients first try a fresh provider endpoint.
+        self._discovery_url = resolved_base_url
         self._auto_discover_leader = auto_discover_leader
         self._leader_retry_count = leader_retry_count
         self._leader_retry_base_interval = leader_retry_base_interval_seconds
@@ -71,7 +116,7 @@ class KvCacheManagerClient:
 
     def _do_discover_leader(self):
         """Actual discovery logic. Must be called under _leader_lock."""
-        url = self._discovery_url
+        url = self._resolve_discovery_url()
         try:
             try:
                 resp = requests.post(
@@ -114,6 +159,19 @@ class KvCacheManagerClient:
             return True
         finally:
             self._last_discover_time = time.monotonic()
+
+    def _resolve_discovery_url(self):
+        """Select a fresh Manager seed for the next leader discovery request."""
+        if self._service_discovery is not None:
+            try:
+                endpoint = self._service_discovery.get_one_endpoint()
+            except Exception as error:
+                logger.warning("Manager service discovery failed: %s", error)
+            else:
+                if endpoint is not None:
+                    return f"http://{endpoint.host}"
+                logger.warning("Manager service discovery returned no endpoints")
+        return self._discovery_url
 
     def _leader_refresh_loop(self):
         """Background daemon: periodically refresh leader address, supports urgent wakeup."""
@@ -226,9 +284,12 @@ class KvCacheManagerClient:
         return self._make_api_request('/api/getClusterInfo', data, check_response)
 
     def close(self):
-        """Close the HTTP session and stop background refresh thread"""
+        """Close HTTP, leader-refresh, and service-discovery resources."""
         self._closed.set()
         self._refresh_event.set()
         if self._refresh_thread and self._refresh_thread.is_alive():
             self._refresh_thread.join(timeout=5)
         self.session.close()
+        if self._service_discovery is not None:
+            self._service_discovery.close()
+            self._service_discovery = None

@@ -91,9 +91,8 @@ message TairMemPoolStorageSpec {
     reserved 3, 4; // 历史字段：enable_vipserver / vipserver_domain
     reserved "enable_vipserver", "vipserver_domain";
     // 服务发现 URL，统一抽象不同发现机制；空字符串表示不使用服务发现，直接使用 domain。
-    // 例：vipserver://pace.meta.vipserver?timeout=10
-    //     spectrum://v-ad2d143d?cache_time=30&retry_time=3&timeout=5000
-    //     static://11.22.33.44:8080,33.55.66.77:8080
+    // 例：static://11.22.33.44:8080,33.55.66.77:8080
+    //     custom://service-name?timeout=5000（需由构建环境注册 custom provider）
     string service_discovery_url = 5;
 }
 

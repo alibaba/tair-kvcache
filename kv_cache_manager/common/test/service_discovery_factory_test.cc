@@ -36,11 +36,3 @@ TEST_F(ServiceDiscoveryFactoryTest, TestStaticUrlMalformed) {
     EXPECT_EQ(ServiceDiscoveryFactory::CreateServiceDiscovery("static://10.0.0.1"), nullptr);
     EXPECT_EQ(ServiceDiscoveryFactory::CreateServiceDiscovery("static://10.0.0.1:abc"), nullptr);
 }
-
-TEST_F(ServiceDiscoveryFactoryTest, TestSpectrumEmptyVsidReturnsNullptr) {
-    EXPECT_EQ(ServiceDiscoveryFactory::CreateServiceDiscovery("spectrum://"), nullptr);
-}
-
-TEST_F(ServiceDiscoveryFactoryTest, TestVipserverEmptyDomainReturnsNullptr) {
-    EXPECT_EQ(ServiceDiscoveryFactory::CreateServiceDiscovery("vipserver://"), nullptr);
-}

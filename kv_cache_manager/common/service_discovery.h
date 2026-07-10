@@ -9,7 +9,7 @@ namespace kv_cache_manager {
 
 /**
  * 统一的服务节点数据结构。
- * 不同服务发现实现（VIPServer / Spectrum 等）都使用此结构暴露端点。
+ * 不同服务发现实现都使用此结构暴露端点。
  */
 struct ServiceEndpoint {
     std::string ip;
@@ -26,7 +26,7 @@ struct ServiceEndpoint {
 
 /**
  * 服务发现抽象基类。
- * 为不同的服务发现机制（VIPServer、EAS 等）提供统一接口。
+ * 为不同的服务发现机制提供统一接口。
  */
 class ServiceDiscovery {
 public:
@@ -47,7 +47,7 @@ public:
     /** 强制刷新底层数据（具体语义由实现决定）。 */
     virtual bool Refresh() = 0;
 
-    /** 服务发现类型名称（如 "VIPServer"、"EAS"）。 */
+    /** 服务发现类型名称，主要用于日志和诊断。 */
     virtual std::string GetType() const = 0;
 
 protected:
@@ -56,12 +56,11 @@ protected:
 
 /**
  * 带本地 TTL 缓存的服务发现基类。
- * 适用于"按需拉取 + 短期缓存"型的服务发现实现（如 EAS 走 HTTP 拉端点列表）。
+ * 适用于"按需拉取 + 短期缓存"型的服务发现实现。
  *
  * 子类只需实现 FetchEndpoints；缓存生命周期、并发安全、负载均衡由本基类承担。
  *
- * 不适用于本身已带订阅式缓存的实现（如 VIPServer SDK），那类实现应直接继承
- * ServiceDiscovery。
+ * 本身已带订阅式缓存的实现应直接继承 ServiceDiscovery。
  */
 class CachedServiceDiscovery : public ServiceDiscovery {
 public:

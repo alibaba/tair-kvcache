@@ -51,7 +51,7 @@ pkg_files(
     srcs = [
         "//package/script:decode_stack_trace_script",
         "//package/script:start_server_script",
-        "//package/script:start_server_spectrum_script",
+        "//stub_source/package/script:provider_start_server_scripts",
     ],
     attributes = pkg_attributes(
         mode = "0755",

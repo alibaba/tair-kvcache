@@ -64,9 +64,8 @@ def add_pace_sub_parser(subparsers):
         default="",
         help=(
             'service discovery url, empty string means use --domain directly. '
-            'Examples: vipserver://pace.meta.vipserver?timeout=10  |  '
-            'spectrum://v-ad2d143d?cache_time=30&retry_time=3&timeout=5000  |  '
-            'static://10.0.0.1:8080,10.0.0.2:8080'
+            'Examples: static://10.0.0.1:8080,10.0.0.2:8080  |  '
+            'custom://service-name?timeout=5000 (requires a registered provider)'
         ),
     )
     return parser_pace

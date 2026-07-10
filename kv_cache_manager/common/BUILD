@@ -338,9 +338,20 @@ cc_library(
     deps = [
         ":logger",
         ":service_discovery",
+        ":service_discovery_factory_extension_api",
         ":service_discovery_url",
-        "//stub_source/kv_cache_manager/common:spectrum_service_discovery",
         ":static_service_discovery",
-        "//stub_source/kv_cache_manager/common:vipserver_service_discovery",
+        "//stub_source/kv_cache_manager/common:service_discovery_factory_extension",
+    ],
+)
+
+cc_library(
+    name = "service_discovery_factory_extension_api",
+    hdrs = [
+        "service_discovery_factory_extension.h",
+    ],
+    deps = [
+        ":service_discovery",
+        ":service_discovery_url",
     ],
 )

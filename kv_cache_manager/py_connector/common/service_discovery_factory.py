@@ -1,89 +1,111 @@
 # -*- coding: utf-8 -*-
-"""按 URL 形式的服务发现配置创建并初始化对应的 :class:`ServiceDiscovery` 实例。
+"""Create service-discovery instances from provider-neutral URLs.
 
-支持的 URL（与 C++ 端 ``CreateServiceDiscovery`` 完全一致）：
-
-    - ``vipserver://<domain>[?timeout=<sec>]``
-        Python 端暂未提供原生 VIPServer 实现，命中此分支会打 ERROR 返回 None。
-    - ``spectrum://<virtual_service_id>[?cache_time=<sec>&retry_time=<n>&timeout=<ms>&port=<custom_port>]``
-    - ``static://<ip:port>[,<ip:port>...]``
-    - 空字符串：返回 None，调用方按"不使用服务发现"语义降级。
-
-设计目标：
-    1. 调用方不需要 import 任何具体实现类。
-    2. 新增类型时只需扩展 URL scheme 分支，业务代码零改动。
-    3. 与 C++ 端语义完全一致，便于配置在前后端复用同一份字符串。
+``static://host:port[,host:port...]`` is built in. Other schemes can be
+registered by the active build through :func:`register_service_discovery_provider`.
 """
 
-from typing import Dict, Optional, Tuple
+import importlib
+import threading
+from typing import Callable, Dict, Optional, Tuple
 
 from kv_cache_manager.py_connector.common.logger import logger
-from kv_cache_manager.py_connector.common.service_discovery import (
-    ServiceDiscovery,
-)
+from kv_cache_manager.py_connector.common.service_discovery import ServiceDiscovery
 
 
-_SCHEME_VIPSERVER = "vipserver"
-_SCHEME_SPECTRUM = "spectrum"
+ServiceDiscoveryProvider = Callable[[str, Dict[str, str]], Optional[ServiceDiscovery]]
+
 _SCHEME_STATIC = "static"
+_PROVIDER_EXTENSION_MODULE = (
+    "stub_source.kv_cache_manager.py_connector.common."
+    "service_discovery_factory_extension"
+)
+_provider_factories: Dict[str, ServiceDiscoveryProvider] = {}
+_registry_lock = threading.RLock()
+_extensions_loaded = False
 
 
 def _parse_url(url: str) -> Optional[Tuple[str, str, Dict[str, str]]]:
-    """解析 ``<scheme>://<body>[?k=v(&k=v)*]``，返回 (scheme, body, params) 或 None。
-
-    之所以不用 urllib.parse，是因为 ``static://ip:port,ip:port`` 含逗号会被
-    urllib 错误地塞进 hostname 校验流程，自己实现更稳。
-    """
+    """Parse ``<scheme>://<body>[?k=v(&k=v)*]``."""
     if not url:
         return None
     sep = url.find("://")
     if sep <= 0:
         logger.error(f"invalid service discovery url, missing scheme: {url!r}")
         return None
-    scheme = url[:sep]
+    scheme = url[:sep].lower()
     rest = url[sep + 3:]
     if not rest:
         logger.error(f"invalid service discovery url, empty body: {url!r}")
         return None
-    body, sep_pos, query = rest.partition("?")
-    params: Dict[str, str] = {}
-    if sep_pos:
-        for kv in query.split("&"):
-            if not kv:
-                continue
-            k, eq, v = kv.partition("=")
-            if not eq:
-                logger.error(f"invalid service discovery url, missing '=' in {kv!r}")
-                continue
-            params[k] = v if eq else ""
+    body, has_query, query = rest.partition("?")
     if not body:
         logger.error(f"invalid service discovery url, empty body: {url!r}")
         return None
+
+    params: Dict[str, str] = {}
+    if has_query:
+        for item in query.split("&"):
+            if not item:
+                continue
+            key, separator, value = item.partition("=")
+            if not separator or not key:
+                logger.error(
+                    f"invalid service discovery url query parameter: {item!r}"
+                )
+                return None
+            params[key] = value
     return scheme, body, params
 
 
-def _get_int_param(params: Dict[str, str], key: str, default: int) -> int:
-    raw = params.get(key)
-    if raw is None or raw == "":
-        return default
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return default
+def register_service_discovery_provider(
+    scheme: str,
+    provider: ServiceDiscoveryProvider,
+    *,
+    replace: bool = False,
+) -> None:
+    """Register a provider factory for one URL scheme.
+
+    Registration is thread-safe. Duplicate registrations are rejected unless
+    ``replace=True`` is explicitly requested.
+    """
+    normalized_scheme = scheme.strip().lower()
+    if not normalized_scheme or "://" in normalized_scheme:
+        raise ValueError(f"invalid service discovery scheme: {scheme!r}")
+    if not callable(provider):
+        raise TypeError("provider must be callable")
+    with _registry_lock:
+        if normalized_scheme in _provider_factories and not replace:
+            raise ValueError(
+                f"service discovery provider already registered: {normalized_scheme}"
+            )
+        _provider_factories[normalized_scheme] = provider
+
+
+def _load_provider_extensions() -> None:
+    """Load the build-selected provider registration module exactly once."""
+    global _extensions_loaded
+    with _registry_lock:
+        if _extensions_loaded:
+            return
+        try:
+            extension = importlib.import_module(_PROVIDER_EXTENSION_MODULE)
+            register = getattr(extension, "register_service_discovery_providers", None)
+            if register is not None:
+                register(register_service_discovery_provider)
+        except ImportError as error:
+            logger.debug("service discovery extension is unavailable: %s", error)
+        except Exception as error:
+            logger.error("failed to load service discovery extension: %s", error)
+        finally:
+            _extensions_loaded = True
 
 
 def create_service_discovery(url: str) -> Optional[ServiceDiscovery]:
-    """按 URL 创建并初始化对应的 ServiceDiscovery 实例。
+    """Create an initialized discovery instance for ``url``.
 
-    返回值约定：
-        - 空字符串 / 解析失败：返回 None
-        - 子类构造失败（如非法参数）：打 ERROR 并返回 None
-        - 未知 scheme：打 ERROR 并返回 None
-        - 仅 ``static://`` 与 ``spectrum://`` 在 py_connector 中有原生实现；
-          ``vipserver://`` 始终返回 None 并打 ERROR。
+    Empty, malformed, unsupported, or provider-rejected URLs return ``None``.
     """
-    if not url:
-        return None
     parsed = _parse_url(url)
     if parsed is None:
         return None
@@ -93,53 +115,29 @@ def create_service_discovery(url: str) -> Optional[ServiceDiscovery]:
         from kv_cache_manager.py_connector.common.static_service_discovery import (
             StaticServiceDiscovery,
         )
+
         try:
             return StaticServiceDiscovery(body)
-        except Exception as e:
-            logger.error(f"failed to create StaticServiceDiscovery for url={url!r}: {e}")
-            return None
-
-    if scheme == _SCHEME_SPECTRUM:
-        # Spectrum 是内部实现，从 stub_source 导入（指向 internal_source）
-        # 如果导入失败，说明是开源环境，不支持 Spectrum
-        try:
-            from stub_source.kv_cache_manager.py_connector.common.spectrum_service_discovery import (
-                SpectrumServiceDiscovery,
-            )
-        except ImportError:
+        except Exception as error:
             logger.error(
-                f"SpectrumServiceDiscovery not available (requires internal build), url={url!r}"
+                f"failed to create static service discovery for url={url!r}: {error}"
             )
-            return None
-        
-        cache_ttl = _get_int_param(params, "cache_time", 30)
-        # URL 里 timeout 单位是毫秒（与 C++ 端对齐），Python SDK 用秒，这里换算。
-        timeout_ms = _get_int_param(params, "timeout", 0)
-        refresh_timeout = max(1, timeout_ms // 1000) if timeout_ms > 0 else 5
-        retry_count = _get_int_param(params, "retry_time", 0)
-        # port 表示自定义端口；> 0 时强制覆盖 Spectrum 网关返回的端口。
-        custom_port = _get_int_param(params, "port", 0)
-        try:
-            return SpectrumServiceDiscovery(
-                body,
-                cache_ttl=cache_ttl,
-                refresh_timeout=refresh_timeout,
-                retry_count=retry_count,
-                custom_port=custom_port,
-            )
-        except NotImplementedError as e:
-            # 开源占位实现会抛出 NotImplementedError
-            logger.error(f"Spectrum service discovery not available: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"failed to create SpectrumServiceDiscovery for url={url!r}: {e}")
             return None
 
-    if scheme == _SCHEME_VIPSERVER:
+    _load_provider_extensions()
+    with _registry_lock:
+        provider = _provider_factories.get(scheme)
+    if provider is None:
         logger.error(
-            f"VIPServer service discovery is not implemented in py_connector, url={url!r}"
+            f"unsupported service discovery scheme={scheme!r}, url={url!r}"
         )
         return None
 
-    logger.error(f"unsupported service discovery scheme={scheme!r}, url={url!r}")
-    return None
+    try:
+        return provider(body, dict(params))
+    except Exception as error:
+        logger.error(
+            f"failed to create service discovery for scheme={scheme!r}, "
+            f"url={url!r}: {error}"
+        )
+        return None

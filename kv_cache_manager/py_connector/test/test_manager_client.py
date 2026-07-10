@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch, PropertyMock
 import requests
 
 from kv_cache_manager.py_connector.common.manager_client import KvCacheManagerClient
+from kv_cache_manager.py_connector.common.service_discovery import ServiceEndpoint
 
 
 def _ok_response_json(data=None):
@@ -51,6 +52,98 @@ def _make_mock_response(json_data, status_code=200):
     mock_resp.status_code = status_code
     mock_resp.json.return_value = json_data
     return mock_resp
+
+
+class TestManagerServiceDiscovery(unittest.TestCase):
+    def test_static_discovery_resolves_initial_seed(self):
+        client = KvCacheManagerClient(
+            "static://10.0.0.1:8080,10.0.0.2:8081",
+            auto_discover_leader=False,
+        )
+        try:
+            self.assertEqual(client.base_url, "http://10.0.0.1:8080")
+            self.assertEqual(client._discovery_url, "http://10.0.0.1:8080")
+            self.assertIsNotNone(client._service_discovery)
+        finally:
+            client.close()
+
+    @patch("kv_cache_manager.py_connector.common.manager_client.requests.post")
+    def test_leader_refresh_selects_fresh_discovery_seeds(self, mock_post):
+        mock_post.return_value = _make_mock_response(
+            _cluster_info_response("10.0.0.9", 9000)
+        )
+        client = KvCacheManagerClient(
+            "static://10.0.0.1:8080,10.0.0.2:8081",
+            auto_discover_leader=True,
+            discovery_refresh_interval_seconds=60,
+        )
+        try:
+            self.assertEqual(client.base_url, "http://10.0.0.9:9000")
+            first_discovery_url = mock_post.call_args.args[0]
+            self.assertEqual(
+                first_discovery_url,
+                "http://10.0.0.2:8081/api/getClusterInfo",
+            )
+
+            mock_post.reset_mock()
+            self.assertTrue(client._discover_leader())
+            second_discovery_url = mock_post.call_args.args[0]
+            self.assertEqual(
+                second_discovery_url,
+                "http://10.0.0.1:8080/api/getClusterInfo",
+            )
+        finally:
+            client.close()
+
+    @patch(
+        "kv_cache_manager.py_connector.common.manager_client.create_service_discovery"
+    )
+    def test_close_releases_discovery(self, mock_create):
+        discovery = MagicMock()
+        discovery.get_one_endpoint.return_value = ServiceEndpoint(
+            "10.0.0.1", 8080, "10.0.0.1:8080"
+        )
+        discovery.get_type.return_value = "Fake"
+        mock_create.return_value = discovery
+
+        client = KvCacheManagerClient("fake://manager", auto_discover_leader=False)
+        client.close()
+
+        discovery.close.assert_called_once_with()
+        self.assertIsNone(client._service_discovery)
+
+    @patch(
+        "kv_cache_manager.py_connector.common.manager_client.create_service_discovery",
+        return_value=None,
+    )
+    def test_invalid_discovery_url_is_rejected(self, _mock_create):
+        with self.assertRaises(ValueError):
+            KvCacheManagerClient("unknown://manager", auto_discover_leader=False)
+
+    @patch(
+        "kv_cache_manager.py_connector.common.manager_client.create_service_discovery"
+    )
+    def test_empty_discovery_result_is_rejected_and_closed(self, mock_create):
+        discovery = MagicMock()
+        discovery.get_one_endpoint.return_value = None
+        mock_create.return_value = discovery
+
+        with self.assertRaises(RuntimeError):
+            KvCacheManagerClient("fake://manager", auto_discover_leader=False)
+        discovery.close.assert_called_once_with()
+
+    @patch(
+        "kv_cache_manager.py_connector.common.manager_client.create_service_discovery"
+    )
+    def test_https_address_bypasses_discovery(self, mock_create):
+        client = KvCacheManagerClient(
+            "https://manager.example.com/", auto_discover_leader=False
+        )
+        try:
+            self.assertEqual(client.base_url, "https://manager.example.com")
+            mock_create.assert_not_called()
+        finally:
+            client.close()
 
 
 class TestLeaderDiscoveryInit(unittest.TestCase):
@@ -179,7 +272,7 @@ class TestLeaderDiscoveryInit(unittest.TestCase):
 
 
 class TestDiscoveryAlwaysUsesSeedUrl(unittest.TestCase):
-    """Tests that discovery always queries _discovery_url, never the current base_url."""
+    """Direct-address discovery always queries the immutable seed URL."""
 
     @patch("kv_cache_manager.py_connector.common.manager_client.requests.post")
     def test_discover_uses_discovery_url_not_base_url(self, mock_post):

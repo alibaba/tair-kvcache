@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Service Discovery 抽象基类与统一数据模型。
 
-各种服务发现实现（VIPServer / Spectrum / Static / 未来扩展类型）都遵循这个接口，
+各种服务发现实现都遵循这个接口，
 业务调用方拿到 ``ServiceDiscovery`` 后只关心端点列表，不关心底层实现。
 
 新增类型时只需：
@@ -46,7 +46,7 @@ class ServiceDiscovery(ABC):
 
     @abstractmethod
     def get_type(self) -> str:
-        """返回实现类型名（如 "VIPServer"、"Spectrum"），主要用于日志。"""
+        """返回实现类型名，主要用于日志和诊断。"""
 
     def close(self) -> None:
         """释放底层资源；默认无操作，子类按需实现。"""

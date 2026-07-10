@@ -189,7 +189,6 @@ cc_test(
     deps = [
         "//kv_cache_manager/common:service_discovery",
         "//kv_cache_manager/common:service_discovery_factory",
-        "//stub_source/kv_cache_manager/common:spectrum_service_discovery",
         "//kv_cache_manager/common:static_service_discovery",
         "//kv_cache_manager/common:unittest",
     ],

@@ -20,6 +20,8 @@ py_package(
     ],
     packages = [
         "kv_cache_manager",
+        # Build-selected service-discovery extension namespace.
+        "stub_source",
         "_solib_k8/_U_S_S3rdparty_S3fs_Chf3fs___U3rdparty_S3fs"
         # Do not include cuda library & libnuma, use the system-installed dynamic libraries.
     ]

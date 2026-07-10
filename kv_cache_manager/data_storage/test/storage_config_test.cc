@@ -54,12 +54,12 @@ TEST_F(StorageConfigTest, TestStorageConfigJsonizeNfs) {
 TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecParseNewSchema) {
     // 新版 schema：直接用 service_discovery_url，不带任何老字段。
     const std::string json =
-        R"({"domain":"pace.meta","timeout":5000,"service_discovery_url":"spectrum://v-xx?cache_time=30"})";
+        R"({"domain":"pace.meta","timeout":5000,"service_discovery_url":"custom://service-a?cache_time=30"})";
     TairMemPoolStorageSpec spec;
     ASSERT_TRUE(spec.FromJsonString(json));
     EXPECT_EQ(spec.domain(), "pace.meta");
     EXPECT_EQ(spec.timeout(), 5000);
-    EXPECT_EQ(spec.service_discovery_url(), "spectrum://v-xx?cache_time=30");
+    EXPECT_EQ(spec.service_discovery_url(), "custom://service-a?cache_time=30");
 }
 
 TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecMigrateLegacyVipserverFields) {
@@ -85,12 +85,11 @@ TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecLegacyEnableFalseDoesNotMigr
 
 TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecNewSchemaTakesPrecedenceOverLegacy) {
     // 同时有 service_discovery_url 与老字段时，以 service_discovery_url 为准。
-    const std::string json =
-        R"({"domain":"pace.meta","timeout":5000,"service_discovery_url":"spectrum://v-yy",)"
-        R"("enable_vipserver":true,"vipserver_domain":"pace.meta.vipserver"})";
+    const std::string json = R"({"domain":"pace.meta","timeout":5000,"service_discovery_url":"custom://service-b",)"
+                             R"("enable_vipserver":true,"vipserver_domain":"pace.meta.vipserver"})";
     TairMemPoolStorageSpec spec;
     ASSERT_TRUE(spec.FromJsonString(json));
-    EXPECT_EQ(spec.service_discovery_url(), "spectrum://v-yy");
+    EXPECT_EQ(spec.service_discovery_url(), "custom://service-b");
 }
 
 TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecLegacyEnabledButEmptyDomainNoMigrate) {
@@ -107,10 +106,10 @@ TEST_F(StorageConfigTest, TestTairMemPoolStorageSpecToJsonOmitsLegacyFields) {
     TairMemPoolStorageSpec spec;
     spec.set_domain("pace.meta");
     spec.set_timeout(5000);
-    spec.set_service_discovery_url("spectrum://v-zz?cache_time=30");
+    spec.set_service_discovery_url("custom://service-c?cache_time=30");
     const std::string json = spec.ToJsonString();
     EXPECT_NE(json.find("\"domain\":\"pace.meta\""), std::string::npos);
-    EXPECT_NE(json.find("\"service_discovery_url\":\"spectrum://v-zz?cache_time=30\""), std::string::npos);
+    EXPECT_NE(json.find("\"service_discovery_url\":\"custom://service-c?cache_time=30\""), std::string::npos);
     EXPECT_EQ(json.find("enable_vipserver"), std::string::npos);
     EXPECT_EQ(json.find("vipserver_domain"), std::string::npos);
 }
