@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 from enum import Enum
 from unittest.mock import AsyncMock
@@ -83,7 +84,7 @@ def test_register_instance_request_uses_env_instance_id(
     monkeypatch.setenv("SPECTRUM_DEPLOYMENT_NAME", "deploy-a")
     request = _client()._register_instance_request()
     assert request["instance_id"] == "deploy-a"
-    assert request["instance_group"] == "default"
+    assert request["instance_group"] == os.environ.get("KVCM_INSTANCE_GROUP", "")
     assert request["block_size"] == 1
     assert request["location_spec_infos"] == [{"name": "vllm_1", "size": 1}]
     assert request["location_spec_groups"] == [
@@ -330,7 +331,7 @@ async def test_start_uses_spectrum_address_from_vservice_id(
     await client.start()
     await client.close()
 
-    assert [created.base_url for created in created_clients] == ["spectrum://vs-a"]
+    assert [created.base_url for created in created_clients] == ["spectrum://vs-a:6382"]
 
 
 async def test_start_resolves_host_ip_port_once_and_reuses_it(

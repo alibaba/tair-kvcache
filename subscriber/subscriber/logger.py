@@ -9,10 +9,19 @@ try:
 
     _debug_enabled = False
 
-    def init(name: str, *, level: str = "info", **kwargs: object) -> None:
+    _LEVEL_TO_INT = {
+        "debug": 9,
+        "info": 7,
+        "warning": 5,
+        "error": 4,
+        "critical": 2,
+    }
+
+    def init(name: str, *, level: str = "info", **_ignored: object) -> None:
         global _debug_enabled
         _debug_enabled = level.lower() == "debug"
-        _dl.init(name, level=level, **kwargs)
+        log_level = _LEVEL_TO_INT.get(level.lower(), 7)
+        _dl.init(name, log_level=log_level)
 
     def is_debug_enabled() -> bool:
         return _debug_enabled

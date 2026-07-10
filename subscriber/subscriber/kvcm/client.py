@@ -42,8 +42,8 @@ class KvcmClient:
         self._medium_mapper = medium_mapper
         self._storage_type = storage_type
         self._supported_mediums = supported_mediums
-        self._sdk_client_factory = sdk_client_factory or HttpKvCacheManagerClient
-        self._sdk_client: Any | None = None
+        self._delegate_client_factory = sdk_client_factory or HttpKvCacheManagerClient
+        self._delegate_client: Any | None = None
         self._host_ip_port_value: str | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
 
@@ -53,13 +53,16 @@ class KvcmClient:
         return value
 
     def _create_sdk_client(self) -> Any:
-        return self._sdk_client_factory(self._sdk_base_url())
+        return self._delegate_client_factory(self._base_url())
 
-    def _sdk_base_url(self) -> str:
+    def _base_url(self) -> str:
         virtual_service_id = os.environ.get("KVCM_VSERVICE_ID", "")
         if not virtual_service_id:
             raise ValueError("Please specify KVCM_VSERVICE_ID")
-        return f"spectrum://{virtual_service_id}"
+        return f"spectrum://{virtual_service_id}:6382"
+
+    def _instance_group(self) -> str:
+        return os.environ.get("KVCM_INSTANCE_GROUP", "")
 
     def _instance_id(self) -> str:
         return os.environ.get("SPECTRUM_DEPLOYMENT_NAME", "")
@@ -106,7 +109,7 @@ class KvcmClient:
         location_spec_name = self._location_spec_name(block_size)
         return {
             "trace_id": self._trace_id("register_instance"),
-            "instance_group": "default",
+            "instance_group": self._instance_group(),
             "instance_id": self._instance_id(),
             "block_size": block_size,
             "location_spec_infos": [{"name": location_spec_name, "size": block_size}],
@@ -202,12 +205,12 @@ class KvcmClient:
             self._config.kvcm_host_ip_port,
             self._config.engine_health_url,
         )
-        self._sdk_client = self._create_sdk_client()
-        start = getattr(self._sdk_client, "start", None)
+        self._delegate_client = self._create_sdk_client()
+        start = getattr(self._delegate_client, "start", None)
         if start is not None:
             await self._maybe_await(start())
         await self._maybe_await(
-            self._sdk_client.register_instance(self._register_instance_request())
+            self._delegate_client.register_instance(self._register_instance_request())
         )
         await self._report_events([self._node_register_event()])
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
@@ -225,18 +228,18 @@ class KvcmClient:
                 )
 
     async def _report_events(self, events: list[dict[str, object]]) -> dict[str, Any]:
-        if self._sdk_client is None:
+        if self._delegate_client is None:
             raise RuntimeError("kvcm client has not been started")
-        sdk_client = self._sdk_client
+        sdk_client = self._delegate_client
         response = await self._maybe_await(
             sdk_client.report_event(self._report_event_request(events))
         )
         return cast(dict[str, Any], response)
 
     async def send_batch(self, batches: list[KVEventBatch], epoch: int) -> None:
-        if self._sdk_client is None:
+        if self._delegate_client is None:
             raise RuntimeError("kvcm client has not been started")
-        sdk_client = self._sdk_client
+        sdk_client = self._delegate_client
         events = self._report_events_for_batches(batches)
         if not events:
             response = None
@@ -270,6 +273,6 @@ class KvcmClient:
             except asyncio.CancelledError:
                 pass
             self._heartbeat_task = None
-        if self._sdk_client is not None:
-            await self._maybe_await(self._sdk_client.close())
-            self._sdk_client = None
+        if self._delegate_client is not None:
+            await self._maybe_await(self._delegate_client.close())
+            self._delegate_client = None
