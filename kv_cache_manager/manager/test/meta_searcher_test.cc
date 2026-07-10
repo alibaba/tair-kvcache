@@ -121,6 +121,69 @@ TEST_F(MetaSearcherTest, TestBatchAddLocation) {
     }
 }
 
+TEST_F(MetaSearcherTest, TestLocationKeyIndexMaintainedByLocationMutations) {
+    const std::string loc_a = "kvs#v6d#mem#host_a:8080";
+    const std::string loc_b = "kvs#v6d#mem#host_b:8080";
+
+    std::vector<std::vector<MetaSearcher::UpsertLocation>> upserts = {
+        {
+            {loc_a, DataStorageType::DATA_STORAGE_TYPE_VINEYARD, CLS_SERVING, {LocationSpec("tp0", "v6d://a/11")}},
+            {loc_b, DataStorageType::DATA_STORAGE_TYPE_VINEYARD, CLS_SERVING, {LocationSpec("tp0", "v6d://b/11")}},
+        },
+        {
+            {loc_a, DataStorageType::DATA_STORAGE_TYPE_VINEYARD, CLS_SERVING, {LocationSpec("tp0", "v6d://a/12")}},
+        },
+        {
+            {loc_b, DataStorageType::DATA_STORAGE_TYPE_VINEYARD, CLS_SERVING, {LocationSpec("tp0", "v6d://b/13")}},
+        },
+    };
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher_->BatchUpsertLocations(request_context_.get(), {11, 12, 13}, upserts, per_key_ec));
+    ASSERT_EQ(3, per_key_ec.size());
+    EXPECT_EQ(ErrorCode::EC_OK, per_key_ec[0]);
+    EXPECT_EQ(ErrorCode::EC_OK, per_key_ec[1]);
+    EXPECT_EQ(ErrorCode::EC_OK, per_key_ec[2]);
+
+    MetaSearcher::KeyVector indexed_keys;
+    EXPECT_EQ(ErrorCode::EC_BADARGS, meta_searcher_->GetKeysByLocationIndex("", indexed_keys));
+    ASSERT_EQ(ErrorCode::EC_OK, meta_searcher_->GetKeysByLocationIndex(loc_a, indexed_keys));
+    EXPECT_EQ((MetaSearcher::KeyVector{11, 12}), indexed_keys);
+    ASSERT_EQ(ErrorCode::EC_OK, meta_searcher_->GetKeysByLocationIndex(loc_b, indexed_keys));
+    EXPECT_EQ((MetaSearcher::KeyVector{11, 13}), indexed_keys);
+
+    LocationIdsPerKey delete_loc_a = {{loc_a}, {loc_a}, {loc_a}};
+    std::vector<std::vector<ErrorCode>> delete_ecs;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher_->BatchDeleteLocations(request_context_.get(), {11, 12, 13}, delete_loc_a, delete_ecs));
+    ASSERT_EQ(ErrorCode::EC_OK, meta_searcher_->GetKeysByLocationIndex(loc_a, indexed_keys));
+    EXPECT_TRUE(indexed_keys.empty());
+    ASSERT_EQ(ErrorCode::EC_OK, meta_searcher_->GetKeysByLocationIndex(loc_b, indexed_keys));
+    EXPECT_EQ((MetaSearcher::KeyVector{11, 13}), indexed_keys);
+
+    std::vector<std::vector<MetaSearcher::LocationCADTask>> cad_tasks = {{{loc_b, CLS_SERVING}}};
+    std::vector<std::vector<ErrorCode>> cad_ecs;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher_->BatchCADLocationStatus(request_context_.get(), {11}, cad_tasks, cad_ecs));
+    ASSERT_EQ(ErrorCode::EC_OK, meta_searcher_->GetKeysByLocationIndex(loc_b, indexed_keys));
+    EXPECT_EQ((MetaSearcher::KeyVector{13}), indexed_keys);
+
+    std::vector<ErrorCode> delete_results;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher_->BatchDeleteLocation(request_context_.get(), {13}, {loc_b}, delete_results));
+    ASSERT_EQ(ErrorCode::EC_OK, meta_searcher_->GetKeysByLocationIndex(loc_b, indexed_keys));
+    EXPECT_TRUE(indexed_keys.empty());
+
+    auto generated_loc = MetaSearcherTestHelper::CreateCacheLocation(
+        DataStorageType::DATA_STORAGE_TYPE_NFS, 1, {LocationSpec("nfs", "file:///tmp/generated?size=1")});
+    std::vector<std::string> generated_ids;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher_->BatchAddLocation(request_context_.get(), {14}, {generated_loc}, generated_ids));
+    ASSERT_EQ(1, generated_ids.size());
+    ASSERT_EQ(ErrorCode::EC_OK, meta_searcher_->GetKeysByLocationIndex(generated_ids[0], indexed_keys));
+    EXPECT_EQ((MetaSearcher::KeyVector{14}), indexed_keys);
+}
+
 TEST_F(MetaSearcherTest, TestBatchAddLocation2) {
     // 准备测试数据
     MetaSearcher::KeyVector keys = {1, 2, 3};

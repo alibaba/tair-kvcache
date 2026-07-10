@@ -55,28 +55,39 @@ enum ReportEventType {
     EVENT_BLOCK_DELETE = 3;  // V6D deleted a block locally
     EVENT_HOST_DOWN = 4;     // V6D node is going down (graceful or detected)
     EVENT_HEARTBEAT = 5;     // V6D periodic heartbeat
+    EVENT_BLOCK_SNAPSHOT = 6; // Reporter sends the full block set for one host/medium
 }
 
-message NodeRegisterParams {
+message NodeRegisterEventParams {
     repeated string mediums = 1; // mediums supported by the node, e.g. ["mem","disk"]
 }
 
-message BlockAddParams {
+message BlockAddEventParams {
     string block_key = 1; // int64 as string
     string uri = 2;       // deprecated, use specs instead
     string medium = 3;    // e.g. "mem"/"disk"/"ssd"/"hbm"
     repeated LocationSpec specs = 4;
 }
 
-message BlockDeleteParams {
+message BlockDeleteEventParams {
     string block_key = 1;
     string medium = 2;
 }
 
-message HostDownParams {
+message BlockSnapshotItem {
+    string block_key = 1;
+    repeated LocationSpec specs = 2;
 }
 
-message HeartbeatParams {
+message BlockSnapshotEventParams {
+    string medium = 1;
+    repeated BlockSnapshotItem blocks = 2;
+}
+
+message HostDownEventParams {
+}
+
+message HeartbeatEventParams {
     // KVCM only refreshes last_heartbeat; system_status is opaque observability data
     map<string, string> system_status = 1;
 }
@@ -84,11 +95,12 @@ message HeartbeatParams {
 message EventItem {
     ReportEventType event_type = 1;
     oneof event_params {
-        NodeRegisterParams node_register = 2;
-        BlockAddParams block_add = 3;
-        BlockDeleteParams block_delete = 4;
-        HostDownParams host_down = 5;
-        HeartbeatParams heartbeat = 6;
+        NodeRegisterEventParams node_register = 2;
+        BlockAddEventParams block_add = 3;
+        BlockDeleteEventParams block_delete = 4;
+        HostDownEventParams host_down = 5;
+        HeartbeatEventParams heartbeat = 6;
+        BlockSnapshotEventParams block_snapshot = 7;
     }
 }
 

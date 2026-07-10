@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <map>
+#include <mutex>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #include "kv_cache_manager/common/logger.h"
@@ -31,6 +33,10 @@ void LogErrorCodes(const std::string &operation_name,
             KVCM_LOG_WARN("%s failed, keys[%lu](%lu) return %d", operation_name.c_str(), i, keys[i], error_codes[i]);
         }
     }
+}
+
+bool ShouldRemoveLocationIndexEntry(ErrorCode ec) {
+    return ec == ErrorCode::EC_OK || ec == ErrorCode::EC_NOENT;
 }
 
 CacheLocationConstPtr SelectAndMergeForMatch(SelectLocationPolicy *policy,
@@ -207,6 +213,79 @@ MetaSearcher::MetaSearcher(const std::shared_ptr<MetaIndexer> &meta_indexer,
     , submit_del_req_func_(submit_del_req) {}
 
 MetaSearcher::~MetaSearcher() = default;
+
+void MetaSearcher::AddKeysToLocationIndex(const KeyVector &keys,
+                                          const LocationIdsPerKey &location_ids_per_key,
+                                          const std::vector<ErrorCode> &per_key_ec) {
+    if (keys.size() != location_ids_per_key.size()) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(location_key_index_mutex_);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (i >= per_key_ec.size() || per_key_ec[i] != ErrorCode::EC_OK) {
+            continue;
+        }
+        for (const auto &location_id : location_ids_per_key[i]) {
+            if (location_id.empty()) {
+                continue;
+            }
+            location_key_index_[location_id].insert(keys[i]);
+        }
+    }
+}
+
+void MetaSearcher::RemoveKeysFromLocationIndex(
+    const KeyVector &keys,
+    const LocationIdsPerKey &location_ids_per_key,
+    const std::vector<std::vector<ErrorCode>> &per_location_ec) {
+    if (keys.size() != location_ids_per_key.size()) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(location_key_index_mutex_);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (i >= per_location_ec.size()) {
+            continue;
+        }
+        for (size_t j = 0; j < location_ids_per_key[i].size(); ++j) {
+            if (j >= per_location_ec[i].size() || !ShouldRemoveLocationIndexEntry(per_location_ec[i][j])) {
+                continue;
+            }
+            const auto &location_id = location_ids_per_key[i][j];
+            if (location_id.empty()) {
+                continue;
+            }
+            auto iter = location_key_index_.find(location_id);
+            if (iter == location_key_index_.end()) {
+                continue;
+            }
+            iter->second.erase(keys[i]);
+            if (iter->second.empty()) {
+                location_key_index_.erase(iter);
+            }
+        }
+    }
+}
+
+ErrorCode MetaSearcher::GetKeysByLocationIndex(const std::string &location_id, KeyVector &out_keys) const {
+    if (location_id.empty()) {
+        return EC_BADARGS;
+    }
+
+    out_keys.clear();
+    std::lock_guard<std::mutex> lock(location_key_index_mutex_);
+    auto iter = location_key_index_.find(location_id);
+    if (iter == location_key_index_.end()) {
+        return EC_OK;
+    }
+    out_keys.reserve(iter->second.size());
+    for (const auto &key : iter->second) {
+        out_keys.push_back(key);
+    }
+    std::sort(out_keys.begin(), out_keys.end());
+    return EC_OK;
+}
 
 std::string MetaSearcher::BatchErrorCodeToStr(const std::vector<std::vector<ErrorCode>> &batch_results) {
     std::stringstream result_stream;
@@ -707,6 +786,11 @@ ErrorCode MetaSearcher::BatchAddLocation(RequestContext *request_context,
             meta_indexer_->AddStorageUsageByType(loc_sz[i].first, loc_sz[i].second);
         }
     }
+    LocationIdsPerKey location_ids_per_key(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        location_ids_per_key[i].push_back(out_location_ids[i]);
+    }
+    AddKeysToLocationIndex(keys, location_ids_per_key, result.error_codes);
 
     if (result.ec != ErrorCode::EC_OK) {
         LogErrorCodes("meta_indexer_->ReadModifyWriteBlock", result.error_codes, keys);
@@ -774,6 +858,14 @@ ErrorCode MetaSearcher::BatchUpsertLocations(RequestContext *request_context,
             meta_indexer_->AddStorageUsageByType(loc_sz[i].first, loc_sz[i].second);
         }
     }
+    LocationIdsPerKey location_ids_per_key(keys.size());
+    for (size_t i = 0; i < new_locations_per_key.size(); ++i) {
+        location_ids_per_key[i].reserve(new_locations_per_key[i].size());
+        for (const auto &entry : new_locations_per_key[i]) {
+            location_ids_per_key[i].push_back(entry.location_id);
+        }
+    }
+    AddKeysToLocationIndex(keys, location_ids_per_key, out_per_key_ec);
 
     if (result.ec != ErrorCode::EC_OK) {
         LogErrorCodes("meta_indexer_->ReadModifyWriteBlock", result.error_codes, keys);
@@ -1007,6 +1099,7 @@ ErrorCode MetaSearcher::BatchCADLocationStatus(RequestContext *request_context,
             }
         }
     }
+    RemoveKeysFromLocationIndex(keys, location_ids_per_key, out_batch_results);
 
     if (result.ec != ErrorCode::EC_OK) {
         KVCM_LOG_WARN("meta_indexer_->ReadModifyWriteLocation failed, ec: %d", result.ec);
@@ -1096,6 +1189,11 @@ ErrorCode MetaSearcher::BatchDeleteLocation(RequestContext *request_context,
             meta_indexer_->SubStorageUsageByType(loc_sz[i].first, loc_sz[i].second);
         }
     }
+    std::vector<std::vector<ErrorCode>> per_location_ec(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        per_location_ec[i].push_back(results[i]);
+    }
+    RemoveKeysFromLocationIndex(keys, location_ids_per_key, per_location_ec);
 
     if (result.ec != ErrorCode::EC_OK) {
         KVCM_LOG_WARN("meta_indexer_->ReadModifyWriteLocation failed, ec: %d", result.ec);
@@ -1176,6 +1274,7 @@ ErrorCode MetaSearcher::BatchDeleteLocations(RequestContext *request_context,
             }
         }
     }
+    RemoveKeysFromLocationIndex(keys, location_ids_per_key, out_per_location_ec);
 
     if (result.ec != ErrorCode::EC_OK) {
         KVCM_LOG_WARN("meta_indexer_->ReadModifyWriteLocation failed, ec: %d", result.ec);

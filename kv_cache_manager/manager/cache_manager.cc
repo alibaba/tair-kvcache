@@ -12,7 +12,6 @@
 #include <utility>
 #include <vector>
 
-#include "kv_cache_manager/common/env_util.h"
 #include "kv_cache_manager/common/jsonizable.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
@@ -1530,8 +1529,14 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
         std::string location_id;
         int event_index;
     };
+    struct SnapshotEntry {
+        std::string location_id;
+        std::map<int64_t, std::vector<LocationSpec>> blocks;
+        int event_index;
+    };
     std::map<int64_t, std::vector<BlockAddEntry>> block_to_add;
     std::map<int64_t, std::vector<BlockDelEntry>> block_to_del;
+    std::vector<SnapshotEntry> snapshots;
 
     for (int i = 0; i < events_size; ++i) {
         const auto &item = request->events(i);
@@ -1618,6 +1623,51 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             }
             block_to_del[block_key].push_back(
                 BlockDelEntry{event_backend->BuildLocationId(p.medium(), host_ip_port), i});
+            break;
+        }
+        case proto::meta::EVENT_BLOCK_SNAPSHOT: {
+            if (!item.has_block_snapshot()) {
+                per_item_ec[i] = EC_BADARGS;
+                break;
+            }
+            const auto &p = item.block_snapshot();
+            if (p.medium().empty()) {
+                KVCM_LOG_WARN("trace_id [%s] | EVENT_BLOCK_SNAPSHOT: empty medium", trace_id.c_str());
+                per_item_ec[i] = EC_BADARGS;
+                break;
+            }
+            SnapshotEntry snapshot;
+            snapshot.location_id = event_backend->BuildLocationId(p.medium(), host_ip_port);
+            snapshot.event_index = i;
+            bool valid_snapshot = true;
+            for (const auto &block : p.blocks()) {
+                int64_t block_key = 0;
+                if (!ParseInt64(block.block_key(), block_key)) {
+                    KVCM_LOG_WARN("trace_id [%s] | EVENT_BLOCK_SNAPSHOT: invalid block_key [%s]",
+                                  trace_id.c_str(),
+                                  block.block_key().c_str());
+                    valid_snapshot = false;
+                    break;
+                }
+                if (block.specs_size() == 0) {
+                    KVCM_LOG_WARN("trace_id [%s] | EVENT_BLOCK_SNAPSHOT: empty specs for block_key [%ld]",
+                                  trace_id.c_str(),
+                                  block_key);
+                    valid_snapshot = false;
+                    break;
+                }
+                auto &specs = snapshot.blocks[block_key];
+                specs.clear();
+                specs.reserve(block.specs_size());
+                for (const auto &s : block.specs()) {
+                    specs.emplace_back(s.name(), s.uri());
+                }
+            }
+            if (!valid_snapshot) {
+                per_item_ec[i] = EC_BADARGS;
+                break;
+            }
+            snapshots.emplace_back(std::move(snapshot));
             break;
         }
         default:
@@ -1760,6 +1810,105 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
         if (auto *del_mc = find_sub_collector("EventBlockDelete")) {
             KVCM_METRICS_COLLECTOR_SET_METRICS(del_mc, manager, request_key_count, del_keys_aggr.size());
             KVCM_METRICS_COLLECTOR_SET_METRICS(del_mc, meta_indexer, query_key_count, del_keys_aggr.size());
+        }
+    }
+
+    if (!snapshots.empty()) {
+        for (const auto &snapshot : snapshots) {
+            if (per_item_ec[snapshot.event_index] != EC_OK) {
+                continue;
+            }
+
+            KeyVector existing_keys;
+            auto list_ec = meta_searcher->GetKeysByLocationIndex(snapshot.location_id, existing_keys);
+            if (list_ec != EC_OK) {
+                KVCM_LOG_WARN("trace_id [%s] | EVENT_BLOCK_SNAPSHOT: get keys by location index failed, loc[%s], ec[%d]",
+                              trace_id.c_str(),
+                              snapshot.location_id.c_str(),
+                              static_cast<int32_t>(list_ec));
+                per_item_ec[snapshot.event_index] = list_ec;
+                continue;
+            }
+
+            std::unordered_set<int64_t> existing_key_set(existing_keys.begin(), existing_keys.end());
+            std::unordered_set<int64_t> reported_key_set;
+            reported_key_set.reserve(snapshot.blocks.size());
+            for (const auto &block : snapshot.blocks) {
+                reported_key_set.insert(block.first);
+            }
+
+            KeyVector add_keys;
+            std::vector<std::vector<MetaSearcher::UpsertLocation>> upserts;
+            for (const auto &block : snapshot.blocks) {
+                if (existing_key_set.find(block.first) != existing_key_set.end()) {
+                    continue;
+                }
+                add_keys.push_back(block.first);
+                upserts.push_back(std::vector<MetaSearcher::UpsertLocation>{
+                    MetaSearcher::UpsertLocation{
+                        snapshot.location_id,
+                        event_backend->GetStorageType(),
+                        CacheLocationStatus::CLS_SERVING,
+                        block.second,
+                    },
+                });
+            }
+
+            if (!add_keys.empty()) {
+                std::vector<ErrorCode> per_key_ec;
+                auto add_ec = meta_searcher->BatchUpsertLocations(request_context, add_keys, upserts, per_key_ec);
+                if (add_ec != EC_OK) {
+                    per_item_ec[snapshot.event_index] = add_ec;
+                } else {
+                    for (const auto &key_ec : per_key_ec) {
+                        if (key_ec != EC_OK) {
+                            per_item_ec[snapshot.event_index] = key_ec;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            KeyVector del_keys;
+            LocationIdsPerKey del_location_ids;
+            for (const auto &existing_key : existing_keys) {
+                if (reported_key_set.find(existing_key) != reported_key_set.end()) {
+                    continue;
+                }
+                del_keys.push_back(existing_key);
+                del_location_ids.push_back(LocationIdVector{snapshot.location_id});
+            }
+
+            if (!del_keys.empty()) {
+                std::vector<std::vector<ErrorCode>> per_location_ec;
+                auto del_ec =
+                    meta_searcher->BatchDeleteLocations(request_context, del_keys, del_location_ids, per_location_ec);
+                if (del_ec != EC_OK) {
+                    per_item_ec[snapshot.event_index] = del_ec;
+                } else {
+                    for (const auto &location_ecs : per_location_ec) {
+                        for (const auto &loc_ec : location_ecs) {
+                            if (loc_ec != EC_OK && loc_ec != EC_NOENT) {
+                                per_item_ec[snapshot.event_index] = loc_ec;
+                                break;
+                            }
+                        }
+                        if (per_item_ec[snapshot.event_index] != EC_OK) {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (per_item_ec[snapshot.event_index] == EC_OK) {
+                KVCM_LOG_INFO("trace_id [%s] | EVENT_BLOCK_SNAPSHOT: reconciled loc[%s], reported[%zu], add[%zu], "
+                              "delete[%zu]",
+                              trace_id.c_str(),
+                              snapshot.location_id.c_str(),
+                              snapshot.blocks.size(),
+                              add_keys.size(),
+                              del_keys.size());
+            }
         }
     }
 
@@ -2077,6 +2226,7 @@ void CacheManager::StopRecoverRetryLoop() {
         recover_retry_thread_.join();
     }
 }
+
 void CacheManager::ClearEventCleanupCallbacks() {
     if (!registry_manager_ || !registry_manager_->data_storage_manager()) {
         return;
