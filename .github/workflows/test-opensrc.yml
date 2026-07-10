@@ -90,7 +90,7 @@ jobs:
           set -x
           set -e
           ulimit -c unlimited
-          bazelisk test ${{ matrix.test_target }} ${{ matrix.test_args }} --cache_test_results=no --test_output=errors
+          bazelisk test ${{ matrix.test_target }} ${{ matrix.test_args }} --config=ci_fast --cache_test_results=no --test_output=errors
       - &delete_old_disk_cache_step
         name: delete_old_disk_cache
         if: ${{ inputs.rebuildDiskCache || false }}
