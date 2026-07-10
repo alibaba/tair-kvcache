@@ -1,0 +1,124 @@
+from __future__ import annotations
+
+import asyncio
+import time
+from collections.abc import Callable
+from enum import Enum
+
+from subscriber import logger
+from subscriber.config import SubscriberConfig
+from subscriber.engine.base import AbstractEngineAdapter
+from subscriber.health.events import LivenessEvent
+from subscriber.kvcm.client import KvcmClient
+from subscriber.types import AllBlocksCleared, KVEventBatch
+
+
+class EngineHealthState(Enum):
+    STARTING = "starting"
+    HEALTHY = "healthy"
+    DEAD = "dead"
+
+
+class EngineHealthCoordinator:
+    """Coordinate engine liveness, send gating, epochs, and reset emission.
+
+    The coordinator is the only component that decides whether KV events may be
+    forwarded to kvcm. It opens epochs on healthy generations, closes the gate
+    on transient unhealthy events, and emits ``AllBlocksCleared`` only after an
+    established generation reaches the configured failure threshold.
+    """
+
+    def __init__(
+        self,
+        adapter: AbstractEngineAdapter,
+        kvcm: KvcmClient,
+        config: SubscriberConfig,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
+        self._adapter = adapter
+        self._kvcm = kvcm
+        self._threshold = config.engine_health_failure_threshold
+        self._clock = clock or time.time
+        self._state = EngineHealthState.STARTING
+        self._epoch = 0
+        self._failure_count = 0
+        self._ready = asyncio.Event()
+
+    @property
+    def state(self) -> EngineHealthState:
+        """Current coarse liveness state for the engine generation."""
+
+        return self._state
+
+    @property
+    def epoch(self) -> int:
+        """Current send epoch associated with the active engine generation."""
+
+        return self._epoch
+
+    def capture_epoch(self) -> int | None:
+        """Snapshot the current epoch if the gate is open, else None."""
+
+        if self._ready.is_set():
+            return self._epoch
+        return None
+
+    def is_epoch_current(self, snapshot: int) -> bool:
+        """Return True if the snapshot still matches the active epoch."""
+
+        return snapshot == self._epoch
+
+    async def wait_ready_epoch(self) -> int:
+        """Wait until sending is allowed and return the current epoch."""
+
+        await self._ready.wait()
+        return self._epoch
+
+    async def watch_loop(self) -> None:
+        """Consume adapter liveness events and apply coordinator state changes."""
+
+        async for event in self._adapter.watch_liveness():
+            await self.handle_liveness_event(event)
+
+    async def handle_liveness_event(self, event: LivenessEvent) -> None:
+        """Apply one liveness event to the health state machine."""
+
+        if event is LivenessEvent.HEALTHY:
+            await self._on_healthy()
+            return
+        await self._on_unhealthy()
+
+    async def _on_healthy(self) -> None:
+        if self._state is EngineHealthState.STARTING:
+            self._epoch += 1
+            self._state = EngineHealthState.HEALTHY
+        elif self._state is EngineHealthState.DEAD:
+            self._adapter.reset_generation_state()
+            self._epoch += 1
+            self._state = EngineHealthState.HEALTHY
+        self._failure_count = 0
+        self._ready.set()
+
+    async def _on_unhealthy(self) -> None:
+        if self._state is EngineHealthState.DEAD:
+            return
+        self._failure_count += 1
+        if self._state is EngineHealthState.STARTING:
+            if self._failure_count % self._threshold == 0:
+                logger.warning(
+                    "engine health still unhealthy during startup",
+                    step="engine_health",
+                    tags={
+                        "state": self._state.value,
+                        "failure_count": self._failure_count,
+                    },
+                )
+            return
+        self._ready.clear()
+        if self._failure_count >= self._threshold:
+            self._state = EngineHealthState.DEAD
+            await self._send_all_blocks_cleared()
+
+    async def _send_all_blocks_cleared(self) -> None:
+        batch = KVEventBatch(ts=self._clock(), events=[AllBlocksCleared()])
+        await self._kvcm.send_batch([batch], self._epoch)
