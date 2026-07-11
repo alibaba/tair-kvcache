@@ -35,8 +35,8 @@ KVCM server可识别的配置参数列表如下。可通过配置文件、启动
 # 指定系统Registry自身数据存储位置
 # kvcm.registry_storage.uri=redis://127.0.0.1:6379?auth=123456
 
-# 指定协调后端服务的URI（用于多节点选主、节点信息存储等）
-# kvcm.coordination.uri=redis://127.0.0.1:6379?auth=123456
+# 指定协调后端服务的URI（用于多节点选主、节点信息存储等）。Redis选主key按cluster_name隔离。
+# kvcm.coordination.uri=redis://127.0.0.1:6379?auth=123456&cluster_name=kvcm_app_0
 # 旧配置 kvcm.distributed_lock.uri 仍可使用（向后兼容），但新配置优先
 
 # 指定选主时当前节点使用的node_id（如果不指定会自动生成）

@@ -251,11 +251,13 @@ kvcm.leader_elector.loop_interval_ms=100
 **多节点 HA（Redis，生产）：**
 
 ```
-kvcm.coordination.uri=redis://your_password@redis-host:6379?timeout_ms=5000&retry_count=3
+kvcm.coordination.uri=redis://your_password@redis-host:6379?timeout_ms=5000&retry_count=3&cluster_name=kvcm_app_0
 kvcm.leader_elector.lease_ms=10000
 kvcm.leader_elector.loop_interval_ms=100
 kvcm.service.advertised_host=10.0.0.1
 ```
+
+Redis选主key通过`cluster_name`区分：`kvcm_<cluster_name>_lock:`/`kvcm_<cluster_name>_kv:`。
 
 ## 7. 故障场景分析
 

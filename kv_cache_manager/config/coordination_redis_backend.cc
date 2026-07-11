@@ -85,6 +85,8 @@ ErrorCode CoordinationRedisBackend::Init(const StandardUri &standard_uri) noexce
 
     // 从URI参数中获取cluster_name，用于多KVCM实例共享同一Redis时的key隔离
     std::string cluster_name = standard_uri.GetParam("cluster_name");
+    // TODO: 下次做带迁移方案的Redis key重构时，改成 kvcm_lock:<cluster_name>: / kvcm_kv:<cluster_name>: 格式。
+    // 目前保留 kvcm_<cluster_name>_lock: / kvcm_<cluster_name>_kv:，避免升级时读写到新key空间。
     std::string base_prefix = "kvcm_";
     if (!cluster_name.empty()) {
         base_prefix += cluster_name + "_";

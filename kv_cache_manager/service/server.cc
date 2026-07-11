@@ -54,7 +54,10 @@ bool Server::Init(const ServerConfig &config) {
 
     auto registry_storage_uri = config_.GetRegistryStorageUri();
     registry_manager_.reset(new RegistryManager(registry_storage_uri, metrics_registry_));
-    registry_manager_->Init();
+    if (!registry_manager_->Init()) {
+        KVCM_LOG_ERROR("registry manager init failed");
+        return false;
+    }
 
     cache_manager_.reset(new CacheManager(metrics_registry_, registry_manager_, metrics_lifecycle_));
     cache_manager_->Init(config_.GetSchedulePlanExecutorThreadCount(),
