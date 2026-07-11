@@ -39,6 +39,22 @@ bool ShouldRemoveLocationIndexEntry(ErrorCode ec) {
     return ec == ErrorCode::EC_OK || ec == ErrorCode::EC_NOENT;
 }
 
+std::uint64_t LocationSpecSize(const std::vector<LocationSpec> &specs) {
+    std::uint64_t size = 0;
+    for (const auto &loc_spec : specs) {
+        if (DataStorageUri ds_uri(loc_spec.uri()); ds_uri.Valid()) {
+            std::uint64_t spec_size = 0;
+            ds_uri.GetParamAs<std::uint64_t>("size", spec_size);
+            size += spec_size;
+        }
+    }
+    return size;
+}
+
+std::uint64_t CacheLocationSize(const CacheLocationConstPtr &loc) {
+    return loc ? LocationSpecSize(loc->location_specs()) : 0;
+}
+
 CacheLocationConstPtr SelectAndMergeForMatch(SelectLocationPolicy *policy,
                                              CacheLocationMap &location_map,
                                              CheckLocDataExistFunc check_loc_data_exist,
@@ -808,6 +824,30 @@ ErrorCode MetaSearcher::BatchUpsertLocations(RequestContext *request_context,
     out_per_key_ec.assign(keys.size(), ErrorCode::EC_OK);
 
     std::vector<std::pair<DataStorageType, std::uint64_t>> loc_sz(keys.size());
+    std::vector<std::map<DataStorageType, std::uint64_t>> replaced_loc_sz(keys.size());
+    std::vector<CacheLocationMap> existing_location_maps;
+    BlockMask empty_mask = static_cast<size_t>(0);
+    auto existing_ec = BatchGetLocation(request_context, keys, empty_mask, existing_location_maps);
+    if (existing_ec != ErrorCode::EC_OK) {
+        return existing_ec;
+    }
+    for (size_t i = 0; i < new_locations_per_key.size(); ++i) {
+        if (i >= existing_location_maps.size()) {
+            continue;
+        }
+        std::unordered_set<std::string> seen_location_ids;
+        for (const auto &entry : new_locations_per_key[i]) {
+            if (entry.location_id.empty() || !seen_location_ids.insert(entry.location_id).second) {
+                continue;
+            }
+            auto existing_iter = existing_location_maps[i].find(entry.location_id);
+            if (existing_iter == existing_location_maps[i].end() || !existing_iter->second) {
+                continue;
+            }
+            replaced_loc_sz[i][existing_iter->second->type()] += CacheLocationSize(existing_iter->second);
+        }
+    }
+
     const int64_t batch_create_time = TimestampUtil::GetCurrentTimeUs();
 
     auto modifier = [&new_locations_per_key, &keys, &loc_sz, batch_create_time](
@@ -822,7 +862,15 @@ ErrorCode MetaSearcher::BatchUpsertLocations(RequestContext *request_context,
         }
         std::uint64_t key_total_sz = 0;
         DataStorageType key_type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
-        for (const auto &entry : new_locations_per_key[index]) {
+        std::map<std::string, size_t> final_entry_index_by_location;
+        for (size_t entry_index = 0; entry_index < new_locations_per_key[index].size(); ++entry_index) {
+            const auto &entry = new_locations_per_key[index][entry_index];
+            if (!entry.location_id.empty()) {
+                final_entry_index_by_location[entry.location_id] = entry_index;
+            }
+        }
+        for (const auto &kv : final_entry_index_by_location) {
+            const auto &entry = new_locations_per_key[index][kv.second];
             CacheLocation loc;
             loc.set_id(entry.location_id);
             loc.set_type(entry.type);
@@ -831,12 +879,8 @@ ErrorCode MetaSearcher::BatchUpsertLocations(RequestContext *request_context,
             loc.set_create_time(batch_create_time);
             for (const auto &ls : entry.specs) {
                 loc.push_location_spec(LocationSpec(ls.name(), ls.uri()));
-                if (DataStorageUri ds_uri(ls.uri()); ds_uri.Valid()) {
-                    std::uint64_t spec_sz = 0;
-                    ds_uri.GetParamAs<std::uint64_t>("size", spec_sz);
-                    key_total_sz += spec_sz;
-                }
             }
+            key_total_sz += LocationSpecSize(entry.specs);
             out_new_locations[entry.location_id] = std::make_shared<const CacheLocation>(std::move(loc));
             if (key_type == DataStorageType::DATA_STORAGE_TYPE_UNKNOWN) {
                 key_type = entry.type;
@@ -856,12 +900,19 @@ ErrorCode MetaSearcher::BatchUpsertLocations(RequestContext *request_context,
         out_per_key_ec[i] = key_ec;
         if (key_ec == ErrorCode::EC_OK) {
             meta_indexer_->AddStorageUsageByType(loc_sz[i].first, loc_sz[i].second);
+            for (const auto &replaced : replaced_loc_sz[i]) {
+                meta_indexer_->SubStorageUsageByType(replaced.first, replaced.second);
+            }
         }
     }
     LocationIdsPerKey location_ids_per_key(keys.size());
     for (size_t i = 0; i < new_locations_per_key.size(); ++i) {
+        std::unordered_set<std::string> seen_location_ids;
         location_ids_per_key[i].reserve(new_locations_per_key[i].size());
         for (const auto &entry : new_locations_per_key[i]) {
+            if (entry.location_id.empty() || !seen_location_ids.insert(entry.location_id).second) {
+                continue;
+            }
             location_ids_per_key[i].push_back(entry.location_id);
         }
     }

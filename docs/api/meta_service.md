@@ -101,6 +101,64 @@ curl -g -vvv -X POST http://localhost:6382/api/removeCache \
 }'
 ```
 
+## Report Event
+
+`reportEvent` is the cache-subscriber ingestion API. A subscriber normalizes
+engine-specific cache signals into block-level events:
+
+- RTP-LLM subscriber: report full host/location snapshots with `EVENT_BLOCK_SNAPSHOT`.
+- vLLM subscriber: map KV events to ordered `EVENT_BLOCK_ADD`,
+  `EVENT_BLOCK_DELETE`, and full-clear snapshots.
+
+`storage_type` identifies the storage/cache system, such as Vineyard/V6D.
+`location` identifies one diffable location namespace under the reporting host.
+Use `location.labels` when one host has multiple independent cache groups, such
+as vLLM `dp_rank` or `group_idx`. `specs` describes the concrete address of the
+block in that namespace.
+
+```bash
+curl -g -vvv -X POST http://localhost:6382/api/reportEvent \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json" \
+  -d '{
+    "trace_id": "trace_id_131",
+    "instance_id": "test_instance",
+    "host_ip_port": "192.168.2.1:8080",
+    "storage_type": "ST_VINEYARD",
+    "events": [
+      {
+        "event_type": "EVENT_NODE_REGISTER",
+        "node_register": {
+          "mediums": ["gpu"]
+        }
+      },
+      {
+        "event_type": "EVENT_BLOCK_SNAPSHOT",
+        "block_snapshot": {
+          "location": {
+            "medium": "gpu",
+            "labels": {
+              "dp_rank": "0",
+              "group_idx": "1"
+            }
+          },
+          "blocks": [
+            {
+              "block_key": "123",
+              "specs": [
+                {
+                  "name": "tp0",
+                  "uri": "vineyard://192.168.2.1/gpu/123?size=4096"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    ]
+}'
+```
+
 ## Trim Cache
 ```bash
 curl -g -vvv -X POST http://localhost:6382/api/trimCache \

@@ -1,7 +1,12 @@
 #include <chrono>
+#include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 #include "kv_cache_manager/common/jsonizable.h"
 #include "kv_cache_manager/common/request_context.h"
@@ -206,20 +211,92 @@ public:
         }
     }
 
+    using LocationScopeLabels = std::vector<std::pair<std::string, std::string>>;
+
+    void SetLocationScope(proto::meta::LocationScope *scope,
+                          const std::string &medium,
+                          const LocationScopeLabels &labels) {
+        scope->set_medium(medium);
+        for (const auto &label : labels) {
+            (*scope->mutable_labels())[label.first] = label.second;
+        }
+    }
+
+    std::string ExpectedReportEventLocationId(const std::string &host,
+                                              const std::string &medium,
+                                              const LocationScopeLabels &labels = {}) {
+        std::string location_id = "kvs#v6d#" + medium;
+        std::map<std::string, std::string> sorted_labels;
+        for (const auto &label : labels) {
+            sorted_labels[label.first] = label.second;
+        }
+        for (const auto &label : sorted_labels) {
+            location_id += ";" + label.first + "=" + label.second;
+        }
+        return location_id + "#" + host;
+    }
+
+    std::string ReportEventUri(const std::string &host,
+                               const std::string &medium,
+                               int64_t key,
+                               uint64_t size = 0,
+                               const std::string &suffix = "") {
+        std::string uri = "vineyard://" + host + "/" + medium + "/" + std::to_string(key) + suffix;
+        if (size > 0) {
+            uri += "?size=" + std::to_string(size);
+        }
+        return uri;
+    }
+
+    void AddBlockAddEvent(proto::meta::ReportEventRequest *req,
+                          const std::string &host,
+                          const std::string &medium,
+                          int64_t key,
+                          uint64_t size = 0,
+                          const LocationScopeLabels &labels = {},
+                          const std::string &suffix = "") {
+        auto *ev = req->add_events();
+        ev->set_event_type(proto::meta::EVENT_BLOCK_ADD);
+        auto *add = ev->mutable_block_add();
+        add->set_block_key(std::to_string(key));
+        SetLocationScope(add->mutable_location(), medium, labels);
+        auto *spec = add->add_specs();
+        spec->set_name("tp0");
+        spec->set_uri(ReportEventUri(host, medium, key, size, suffix));
+    }
+
+    void AddBlockDeleteEvent(proto::meta::ReportEventRequest *req,
+                             const std::string &medium,
+                             int64_t key,
+                             const LocationScopeLabels &labels = {}) {
+        auto *ev = req->add_events();
+        ev->set_event_type(proto::meta::EVENT_BLOCK_DELETE);
+        auto *del = ev->mutable_block_delete();
+        del->set_block_key(std::to_string(key));
+        SetLocationScope(del->mutable_location(), medium, labels);
+    }
+
     void AddBlockSnapshotEvent(proto::meta::ReportEventRequest *req,
                                const std::string &host,
                                const std::string &medium,
-                               const std::vector<int64_t> &keys) {
+                               const std::vector<int64_t> &keys,
+                               const LocationScopeLabels &labels = {},
+                               uint64_t size = 0,
+                               const std::string &suffix = "") {
         auto *ev = req->add_events();
         ev->set_event_type(proto::meta::EVENT_BLOCK_SNAPSHOT);
         auto *snapshot = ev->mutable_block_snapshot();
-        snapshot->set_medium(medium);
+        if (labels.empty()) {
+            snapshot->set_medium(medium);
+        } else {
+            SetLocationScope(snapshot->mutable_location(), medium, labels);
+        }
         for (auto key : keys) {
             auto *block = snapshot->add_blocks();
             block->set_block_key(std::to_string(key));
             auto *spec = block->add_specs();
             spec->set_name("tp0");
-            spec->set_uri("vineyard://" + host + "/" + medium + "/" + std::to_string(key));
+            spec->set_uri(ReportEventUri(host, medium, key, size, suffix));
         }
     }
 
@@ -285,6 +362,12 @@ public:
             return "";
         }
         return views.front().location_specs().front().uri();
+    }
+
+    uint64_t GetStorageUsageByType(DataStorageType type) {
+        auto meta_indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer("test_instance");
+        EXPECT_NE(nullptr, meta_indexer);
+        return meta_indexer ? meta_indexer->GetStorageUsageByType(type) : 0;
     }
 
     std::unique_ptr<CacheManager> cache_manager_;
@@ -3177,6 +3260,241 @@ TEST_F(CacheManagerTest, TestReportEventBlockSnapshotDoesNotTouchOtherMedium) {
     EXPECT_FALSE(HasLocation(400, mem_loc));
     EXPECT_TRUE(HasLocation(300, ssd_loc));
     EXPECT_TRUE(HasLocation(500, ssd_loc));
+}
+
+TEST_F(CacheManagerTest, TestReportEventPreservesDeleteThenAddOrder) {
+    RegisterDefaultInstanceForReportEvent();
+    SetupVineyardEventReportingBackend();
+
+    const std::string host = "192.168.2.1:8080";
+    const std::string location_id = ExpectedReportEventLocationId(host, "mem");
+
+    ReportBlockSnapshot(host, "mem", {300}, true);
+    ASSERT_TRUE(HasLocation(300, location_id));
+
+    proto::meta::ReportEventRequest req;
+    req.set_instance_id("test_instance");
+    req.set_host_ip_port(host);
+    req.set_storage_type(proto::meta::ST_VINEYARD);
+    AddBlockDeleteEvent(&req, "mem", 300);
+    AddBlockAddEvent(&req, host, "mem", 300, 0, {}, "-recreated");
+
+    proto::meta::ReportEventResponse resp;
+    EXPECT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+    EXPECT_EQ(proto::meta::OK, resp.header().status().code());
+    EXPECT_TRUE(HasLocation(300, location_id));
+    EXPECT_EQ(ReportEventUri(host, "mem", 300, 0, "-recreated"), GetFirstSpecUri(300, location_id));
+}
+
+TEST_F(CacheManagerTest, TestReportEventSnapshotIsOrderingBarrier) {
+    RegisterDefaultInstanceForReportEvent();
+    SetupVineyardEventReportingBackend();
+
+    const std::string host = "192.168.2.1:8080";
+    const std::string location_id = ExpectedReportEventLocationId(host, "mem");
+
+    {
+        proto::meta::ReportEventRequest req;
+        req.set_instance_id("test_instance");
+        req.set_host_ip_port(host);
+        req.set_storage_type(proto::meta::ST_VINEYARD);
+        AddNodeRegisterEvent(&req, {"mem"});
+        AddBlockSnapshotEvent(&req, host, "mem", {});
+        AddBlockAddEvent(&req, host, "mem", 300);
+
+        proto::meta::ReportEventResponse resp;
+        EXPECT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+        EXPECT_EQ(proto::meta::OK, resp.header().status().code());
+        EXPECT_TRUE(HasLocation(300, location_id));
+    }
+
+    {
+        proto::meta::ReportEventRequest req;
+        req.set_instance_id("test_instance");
+        req.set_host_ip_port(host);
+        req.set_storage_type(proto::meta::ST_VINEYARD);
+        AddBlockAddEvent(&req, host, "mem", 400);
+        AddBlockSnapshotEvent(&req, host, "mem", {});
+
+        proto::meta::ReportEventResponse resp;
+        EXPECT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+        EXPECT_EQ(proto::meta::OK, resp.header().status().code());
+        EXPECT_FALSE(HasLocation(300, location_id));
+        EXPECT_FALSE(HasLocation(400, location_id));
+    }
+}
+
+TEST_F(CacheManagerTest, TestReportEventLocationScopeSeparatesVllmGroups) {
+    RegisterDefaultInstanceForReportEvent();
+    SetupVineyardEventReportingBackend();
+
+    const std::string host = "192.168.2.1:8080";
+    const LocationScopeLabels group0 = {{"group_idx", "0"}, {"dp_rank", "0"}};
+    const LocationScopeLabels group1 = {{"group_idx", "1"}, {"dp_rank", "0"}};
+    const std::string group0_loc = ExpectedReportEventLocationId(host, "gpu", group0);
+    const std::string group1_loc = ExpectedReportEventLocationId(host, "gpu", group1);
+
+    {
+        proto::meta::ReportEventRequest req;
+        req.set_instance_id("test_instance");
+        req.set_host_ip_port(host);
+        req.set_storage_type(proto::meta::ST_VINEYARD);
+        AddNodeRegisterEvent(&req, {"gpu"});
+        AddBlockSnapshotEvent(&req, host, "gpu", {300, 400}, group0);
+        AddBlockSnapshotEvent(&req, host, "gpu", {300}, group1);
+
+        proto::meta::ReportEventResponse resp;
+        EXPECT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+        EXPECT_EQ(proto::meta::OK, resp.header().status().code());
+    }
+    ASSERT_TRUE(HasLocation(300, group0_loc));
+    ASSERT_TRUE(HasLocation(400, group0_loc));
+    ASSERT_TRUE(HasLocation(300, group1_loc));
+
+    ReportBlockSnapshot(host, "gpu", {400}, false, {});
+    EXPECT_TRUE(HasLocation(300, group0_loc));
+    EXPECT_TRUE(HasLocation(400, group0_loc));
+    EXPECT_TRUE(HasLocation(300, group1_loc));
+
+    {
+        proto::meta::ReportEventRequest req;
+        req.set_instance_id("test_instance");
+        req.set_host_ip_port(host);
+        req.set_storage_type(proto::meta::ST_VINEYARD);
+        AddBlockSnapshotEvent(&req, host, "gpu", {400}, group0);
+
+        proto::meta::ReportEventResponse resp;
+        EXPECT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+        EXPECT_EQ(proto::meta::OK, resp.header().status().code());
+    }
+    EXPECT_FALSE(HasLocation(300, group0_loc));
+    EXPECT_TRUE(HasLocation(400, group0_loc));
+    EXPECT_TRUE(HasLocation(300, group1_loc));
+}
+
+TEST_F(CacheManagerTest, TestReportEventUpsertUsageIsIdempotentAndDeltaBased) {
+    RegisterDefaultInstanceForReportEvent();
+    SetupVineyardEventReportingBackend();
+
+    const std::string host = "192.168.2.1:8080";
+    const std::string location_id = ExpectedReportEventLocationId(host, "mem");
+    const auto storage_type = DataStorageType::DATA_STORAGE_TYPE_VINEYARD;
+
+    {
+        proto::meta::ReportEventRequest req;
+        req.set_instance_id("test_instance");
+        req.set_host_ip_port(host);
+        req.set_storage_type(proto::meta::ST_VINEYARD);
+        AddNodeRegisterEvent(&req, {"mem"});
+        AddBlockAddEvent(&req, host, "mem", 300, 10, {}, "-old");
+        AddBlockAddEvent(&req, host, "mem", 300, 20, {}, "-new");
+
+        proto::meta::ReportEventResponse resp;
+        EXPECT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+        EXPECT_EQ(proto::meta::OK, resp.header().status().code());
+    }
+    EXPECT_EQ(20, GetStorageUsageByType(storage_type));
+    EXPECT_EQ(ReportEventUri(host, "mem", 300, 20, "-new"), GetFirstSpecUri(300, location_id));
+
+    {
+        proto::meta::ReportEventRequest req;
+        req.set_instance_id("test_instance");
+        req.set_host_ip_port(host);
+        req.set_storage_type(proto::meta::ST_VINEYARD);
+        AddBlockAddEvent(&req, host, "mem", 300, 20, {}, "-new");
+
+        proto::meta::ReportEventResponse resp;
+        EXPECT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+        EXPECT_EQ(proto::meta::OK, resp.header().status().code());
+    }
+    EXPECT_EQ(20, GetStorageUsageByType(storage_type));
+
+    {
+        proto::meta::ReportEventRequest req;
+        req.set_instance_id("test_instance");
+        req.set_host_ip_port(host);
+        req.set_storage_type(proto::meta::ST_VINEYARD);
+        AddBlockAddEvent(&req, host, "mem", 300, 35, {}, "-updated");
+
+        proto::meta::ReportEventResponse resp;
+        EXPECT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+        EXPECT_EQ(proto::meta::OK, resp.header().status().code());
+    }
+    EXPECT_EQ(35, GetStorageUsageByType(storage_type));
+    EXPECT_EQ(ReportEventUri(host, "mem", 300, 35, "-updated"), GetFirstSpecUri(300, location_id));
+
+    {
+        proto::meta::ReportEventRequest req;
+        req.set_instance_id("test_instance");
+        req.set_host_ip_port(host);
+        req.set_storage_type(proto::meta::ST_VINEYARD);
+        AddBlockSnapshotEvent(&req, host, "mem", {300}, {}, 35, "-updated");
+
+        proto::meta::ReportEventResponse resp;
+        EXPECT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+        EXPECT_EQ(proto::meta::OK, resp.header().status().code());
+    }
+    EXPECT_EQ(35, GetStorageUsageByType(storage_type));
+
+    {
+        proto::meta::ReportEventRequest req;
+        req.set_instance_id("test_instance");
+        req.set_host_ip_port(host);
+        req.set_storage_type(proto::meta::ST_VINEYARD);
+        AddBlockSnapshotEvent(&req, host, "mem", {300}, {}, 50, "-snapshot");
+
+        proto::meta::ReportEventResponse resp;
+        EXPECT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+        EXPECT_EQ(proto::meta::OK, resp.header().status().code());
+    }
+    EXPECT_EQ(50, GetStorageUsageByType(storage_type));
+    EXPECT_EQ(ReportEventUri(host, "mem", 300, 50, "-snapshot"), GetFirstSpecUri(300, location_id));
+
+    ReportBlockSnapshot(host, "mem", {});
+    EXPECT_EQ(0, GetStorageUsageByType(storage_type));
+    EXPECT_FALSE(HasLocation(300, location_id));
+}
+
+TEST_F(CacheManagerTest, TestReportEventDuplicateDeleteIsIdempotentForUsage) {
+    RegisterDefaultInstanceForReportEvent();
+    SetupVineyardEventReportingBackend();
+
+    const std::string host = "192.168.2.1:8080";
+    const std::string location_id = ExpectedReportEventLocationId(host, "mem");
+    const auto storage_type = DataStorageType::DATA_STORAGE_TYPE_VINEYARD;
+
+    {
+        proto::meta::ReportEventRequest req;
+        req.set_instance_id("test_instance");
+        req.set_host_ip_port(host);
+        req.set_storage_type(proto::meta::ST_VINEYARD);
+        AddNodeRegisterEvent(&req, {"mem"});
+        AddBlockAddEvent(&req, host, "mem", 300, 20);
+        AddBlockAddEvent(&req, host, "mem", 301, 20);
+
+        proto::meta::ReportEventResponse resp;
+        EXPECT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+        EXPECT_EQ(proto::meta::OK, resp.header().status().code());
+    }
+    ASSERT_EQ(40, GetStorageUsageByType(storage_type));
+    ASSERT_TRUE(HasLocation(300, location_id));
+    ASSERT_TRUE(HasLocation(301, location_id));
+
+    {
+        proto::meta::ReportEventRequest req;
+        req.set_instance_id("test_instance");
+        req.set_host_ip_port(host);
+        req.set_storage_type(proto::meta::ST_VINEYARD);
+        AddBlockDeleteEvent(&req, "mem", 300);
+        AddBlockDeleteEvent(&req, "mem", 300);
+
+        proto::meta::ReportEventResponse resp;
+        EXPECT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+        EXPECT_EQ(proto::meta::OK, resp.header().status().code());
+    }
+    EXPECT_EQ(20, GetStorageUsageByType(storage_type));
+    EXPECT_FALSE(HasLocation(300, location_id));
+    EXPECT_TRUE(HasLocation(301, location_id));
 }
 
 TEST_F(CacheManagerTest, TestReportEventBlockSnapshotRejectsInvalidSnapshot) {
