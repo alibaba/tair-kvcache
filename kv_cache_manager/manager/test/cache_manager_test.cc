@@ -260,6 +260,33 @@ public:
         return location_map.find(location_id) != location_map.end();
     }
 
+    std::string GetFirstSpecUri(int64_t key, const std::string &location_id) {
+        auto location_map = GetLocationMapForKey(key);
+        auto iter = location_map.find(location_id);
+        if (iter == location_map.end() || !iter->second || iter->second->location_specs().empty()) {
+            return "";
+        }
+        return iter->second->location_specs().front().uri();
+    }
+
+    std::string GetFirstQueriedSpecUri(int64_t key) {
+        BlockMask bm = static_cast<size_t>(0);
+        auto [ec, locations] = cache_manager_->GetCacheLocation(request_context_.get(),
+                                                                "test_instance",
+                                                                CacheManager::QueryType::QT_BATCH_GET,
+                                                                {key},
+                                                                {},
+                                                                bm,
+                                                                0,
+                                                                {});
+        EXPECT_EQ(EC_OK, ec);
+        const auto &views = locations.cache_locations_view();
+        if (views.empty() || views.front().location_specs().empty()) {
+            return "";
+        }
+        return views.front().location_specs().front().uri();
+    }
+
     std::unique_ptr<CacheManager> cache_manager_;
     std::shared_ptr<RegistryManager> registry_manager_;
     std::shared_ptr<RequestContext> request_context_;
@@ -3034,6 +3061,78 @@ TEST_F(CacheManagerTest, TestReportEventBlockSnapshotDiffsHostLocation) {
     ReportBlockSnapshot(host, "mem", {400, 500});
     EXPECT_FALSE(HasLocation(300, location_id));
     EXPECT_TRUE(HasLocation(400, location_id));
+    EXPECT_TRUE(HasLocation(500, location_id));
+}
+
+TEST_F(CacheManagerTest, TestReportEventBlockSnapshotVisibleThroughCacheQuery) {
+    RegisterDefaultInstanceForReportEvent();
+    SetupVineyardEventReportingBackend();
+
+    const std::string host = "192.168.2.1:8080";
+
+    ReportBlockSnapshot(host, "mem", {300, 400}, true);
+    EXPECT_EQ("vineyard://" + host + "/mem/300", GetFirstQueriedSpecUri(300));
+    EXPECT_EQ("vineyard://" + host + "/mem/400", GetFirstQueriedSpecUri(400));
+
+    ReportBlockSnapshot(host, "mem", {400, 500});
+    EXPECT_EQ("", GetFirstQueriedSpecUri(300));
+    EXPECT_EQ("vineyard://" + host + "/mem/400", GetFirstQueriedSpecUri(400));
+    EXPECT_EQ("vineyard://" + host + "/mem/500", GetFirstQueriedSpecUri(500));
+}
+
+TEST_F(CacheManagerTest, TestReportEventBlockSnapshotRefreshesExistingSpecs) {
+    RegisterDefaultInstanceForReportEvent();
+    SetupVineyardEventReportingBackend();
+
+    const std::string host = "192.168.2.1:8080";
+    const std::string location_id = "kvs#v6d#mem#" + host;
+
+    ReportBlockSnapshot(host, "mem", {300}, true);
+    ASSERT_EQ("vineyard://" + host + "/mem/300", GetFirstSpecUri(300, location_id));
+
+    proto::meta::ReportEventRequest req;
+    req.set_instance_id("test_instance");
+    req.set_host_ip_port(host);
+    req.set_storage_type(proto::meta::ST_VINEYARD);
+    auto *ev = req.add_events();
+    ev->set_event_type(proto::meta::EVENT_BLOCK_SNAPSHOT);
+    auto *snapshot = ev->mutable_block_snapshot();
+    snapshot->set_medium("mem");
+    auto *block = snapshot->add_blocks();
+    block->set_block_key("300");
+    auto *spec = block->add_specs();
+    spec->set_name("tp0");
+    spec->set_uri("vineyard://" + host + "/mem/300-updated");
+
+    proto::meta::ReportEventResponse resp;
+    EXPECT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+    EXPECT_EQ(proto::meta::OK, resp.header().status().code());
+    EXPECT_EQ("vineyard://" + host + "/mem/300-updated", GetFirstSpecUri(300, location_id));
+}
+
+TEST_F(CacheManagerTest, TestReportEventBlockSnapshotConvergesWithMultipleSnapshotsInOneRequest) {
+    RegisterDefaultInstanceForReportEvent();
+    SetupVineyardEventReportingBackend();
+
+    const std::string host = "192.168.2.1:8080";
+    const std::string location_id = "kvs#v6d#mem#" + host;
+
+    ReportBlockSnapshot(host, "mem", {300, 400}, true);
+    ASSERT_TRUE(HasLocation(300, location_id));
+    ASSERT_TRUE(HasLocation(400, location_id));
+
+    proto::meta::ReportEventRequest req;
+    req.set_instance_id("test_instance");
+    req.set_host_ip_port(host);
+    req.set_storage_type(proto::meta::ST_VINEYARD);
+    AddBlockSnapshotEvent(&req, host, "mem", {300, 500});
+    AddBlockSnapshotEvent(&req, host, "mem", {500});
+
+    proto::meta::ReportEventResponse resp;
+    EXPECT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+    EXPECT_EQ(proto::meta::OK, resp.header().status().code());
+    EXPECT_FALSE(HasLocation(300, location_id));
+    EXPECT_FALSE(HasLocation(400, location_id));
     EXPECT_TRUE(HasLocation(500, location_id));
 }
 

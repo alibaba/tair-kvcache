@@ -1830,20 +1830,16 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 continue;
             }
 
-            std::unordered_set<int64_t> existing_key_set(existing_keys.begin(), existing_keys.end());
             std::unordered_set<int64_t> reported_key_set;
             reported_key_set.reserve(snapshot.blocks.size());
             for (const auto &block : snapshot.blocks) {
                 reported_key_set.insert(block.first);
             }
 
-            KeyVector add_keys;
+            KeyVector upsert_keys;
             std::vector<std::vector<MetaSearcher::UpsertLocation>> upserts;
             for (const auto &block : snapshot.blocks) {
-                if (existing_key_set.find(block.first) != existing_key_set.end()) {
-                    continue;
-                }
-                add_keys.push_back(block.first);
+                upsert_keys.push_back(block.first);
                 upserts.push_back(std::vector<MetaSearcher::UpsertLocation>{
                     MetaSearcher::UpsertLocation{
                         snapshot.location_id,
@@ -1854,9 +1850,9 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
                 });
             }
 
-            if (!add_keys.empty()) {
+            if (!upsert_keys.empty()) {
                 std::vector<ErrorCode> per_key_ec;
-                auto add_ec = meta_searcher->BatchUpsertLocations(request_context, add_keys, upserts, per_key_ec);
+                auto add_ec = meta_searcher->BatchUpsertLocations(request_context, upsert_keys, upserts, per_key_ec);
                 if (add_ec != EC_OK) {
                     per_item_ec[snapshot.event_index] = add_ec;
                 } else {
@@ -1901,12 +1897,12 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
             }
 
             if (per_item_ec[snapshot.event_index] == EC_OK) {
-                KVCM_LOG_INFO("trace_id [%s] | EVENT_BLOCK_SNAPSHOT: reconciled loc[%s], reported[%zu], add[%zu], "
+                KVCM_LOG_INFO("trace_id [%s] | EVENT_BLOCK_SNAPSHOT: reconciled loc[%s], reported[%zu], upsert[%zu], "
                               "delete[%zu]",
                               trace_id.c_str(),
                               snapshot.location_id.c_str(),
                               snapshot.blocks.size(),
-                              add_keys.size(),
+                              upsert_keys.size(),
                               del_keys.size());
             }
         }
