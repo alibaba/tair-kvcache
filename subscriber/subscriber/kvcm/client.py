@@ -26,6 +26,24 @@ class KvcmReportEventType(StrEnum):
     HOST_DOWN = "EVENT_HOST_DOWN"
 
 
+def _get_engine_config_from_env() -> dict[str, Any]:
+    raw = os.environ.get("DS_LLM_ENGINE_CONFIG", "")
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            return {}
+        return parsed
+    except (json.JSONDecodeError, TypeError):
+        logger.warning(
+            "failed to parse DS_LLM_ENGINE_CONFIG",
+            step="kvcm_client_init",
+            exc_info=True,
+        )
+        return {}
+
+
 class KvcmClient:
     """Async boundary for forwarding KV event batches to kvcm."""
 
@@ -36,23 +54,27 @@ class KvcmClient:
         medium_mapper: Callable[[str | None], str],
         storage_type: str,
         supported_mediums: list[str],
-        sdk_client_factory: Callable[[str], Any] | None = None,
+        delegate_client_factory: Callable[[str], Any] | None = None,
     ) -> None:
         self._config = config
         self._medium_mapper = medium_mapper
         self._storage_type = storage_type
         self._supported_mediums = supported_mediums
-        self._delegate_client_factory = sdk_client_factory or HttpKvCacheManagerClient
+        self._delegate_client_factory = (
+            delegate_client_factory or HttpKvCacheManagerClient
+        )
         self._delegate_client: Any | None = None
         self._host_ip_port_value: str | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
+        self._engine_config: dict[str, Any] = _get_engine_config_from_env()
+        self._registered = False
 
     async def _maybe_await(self, value: Any) -> Any:
         if inspect.isawaitable(value):
             return await value
         return value
 
-    def _create_sdk_client(self) -> Any:
+    def _create_delegate_client(self) -> Any:
         return self._delegate_client_factory(self._base_url())
 
     def _base_url(self) -> str:
@@ -77,36 +99,25 @@ class KvcmClient:
     def _trace_id(self, operation: str) -> str:
         return f"subscriber_{operation}_{time.monotonic_ns()}"
 
-    def _block_size(self) -> int:
-        raw = os.environ.get("DS_LLM_ENGINE_CONFIG", "")
-        if not raw:
-            return 1
-        try:
-            config = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            logger.warning(
-                "failed to parse DS_LLM_ENGINE_CONFIG, using default block_size=1",
-                step="kvcm_register",
-                exc_info=True,
-            )
-            return 1
-        if not isinstance(config, dict):
-            return 1
-        block_size = config.get("block_size", 1)
-        if (
-            isinstance(block_size, bool)
-            or not isinstance(block_size, int)
-            or block_size <= 0
-        ):
-            return 1
-        return block_size
+    @staticmethod
+    def _config_int(cfg: dict[str, Any], key: str, default: int = 1) -> int:
+        raw = cfg.get(key)
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+            return default
+        return raw
 
     def _location_spec_name(self, block_size: int) -> str:
         return f"vllm_{block_size}"
 
     def _register_instance_request(self) -> dict[str, object]:
-        block_size = self._block_size()
+        cfg = self._engine_config
+        block_size = self._config_int(cfg, "block_size")
         location_spec_name = self._location_spec_name(block_size)
+        raw_dtype = cfg.get("dtype")
+        dtype = raw_dtype if isinstance(raw_dtype, str) else ""
+        tp_size = self._config_int(cfg, "tensor_parallel_size")
+        dp_size = self._config_int(cfg, "data_parallel_size")
+        pp_size = self._config_int(cfg, "pipeline_parallel_size")
         return {
             "trace_id": self._trace_id("register_instance"),
             "instance_group": self._instance_group(),
@@ -115,12 +126,12 @@ class KvcmClient:
             "location_spec_infos": [{"name": location_spec_name, "size": block_size}],
             "model_deployment": {
                 "model_name": "default",
-                "dtype": "",
+                "dtype": dtype,
                 "use_mla": False,
-                "tp_size": 1,
-                "dp_size": 1,
+                "tp_size": tp_size,
+                "dp_size": dp_size,
                 "lora_name": "",
-                "pp_size": 1,
+                "pp_size": pp_size,
                 "extra": "",
                 "user_data": "",
             },
@@ -153,7 +164,7 @@ class KvcmClient:
         }
 
     def _block_specs(self, medium: str) -> list[dict[str, str]]:
-        block_size = self._block_size()
+        block_size = self._config_int(self._engine_config, "block_size")
         return [
             {
                 "name": self._location_spec_name(block_size),
@@ -205,19 +216,54 @@ class KvcmClient:
             self._config.kvcm_host_ip_port,
             self._config.engine_health_url,
         )
-        self._delegate_client = self._create_sdk_client()
+        self._delegate_client = self._create_delegate_client()
         start = getattr(self._delegate_client, "start", None)
         if start is not None:
             await self._maybe_await(start())
+        if self._delegate_is_ready():
+            await self._register()
+        else:
+            logger.warning(
+                "kvcm has no available endpoint; starting in not-ready state",
+                step="kvcm_register",
+            )
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+
+    def _delegate_is_ready(self) -> bool:
+        if self._delegate_client is None:
+            return False
+        is_ready = getattr(self._delegate_client, "is_ready", None)
+        return bool(is_ready()) if is_ready is not None else True
+
+    async def _register(self) -> None:
+        if self._delegate_client is None:
+            raise RuntimeError("kvcm client has not been started")
         await self._maybe_await(
             self._delegate_client.register_instance(self._register_instance_request())
         )
         await self._report_events([self._node_register_event()])
-        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        self._registered = True
 
     async def _heartbeat_loop(self) -> None:
         while True:
             await asyncio.sleep(self._config.kvcm_heartbeat_interval_s)
+            if not self._registered:
+                if not self._delegate_is_ready():
+                    continue
+                try:
+                    await self._register()
+                except Exception:
+                    logger.warning(
+                        "kvcm registration retry failed",
+                        step="kvcm_register",
+                        exc_info=True,
+                    )
+                    continue
+                logger.info(
+                    "kvcm registration recovered",
+                    step="kvcm_register",
+                )
+                continue
             try:
                 await self._report_events([self._heartbeat_event()])
             except Exception:
@@ -230,22 +276,24 @@ class KvcmClient:
     async def _report_events(self, events: list[dict[str, object]]) -> dict[str, Any]:
         if self._delegate_client is None:
             raise RuntimeError("kvcm client has not been started")
-        sdk_client = self._delegate_client
         response = await self._maybe_await(
-            sdk_client.report_event(self._report_event_request(events))
+            self._delegate_client.report_event(self._report_event_request(events))
         )
         return cast(dict[str, Any], response)
 
     async def send_batch(self, batches: list[KVEventBatch], epoch: int) -> None:
         if self._delegate_client is None:
             raise RuntimeError("kvcm client has not been started")
-        sdk_client = self._delegate_client
+        if not self._registered:
+            raise RuntimeError("kvcm client is not ready")
         events = self._report_events_for_batches(batches)
         if not events:
             response = None
         else:
             response = await self._maybe_await(
-                sdk_client.report_event(self._report_event_request(events))
+                self._delegate_client.report_event(
+                    self._report_event_request(events), check_response=True
+                )
             )
         if response is None:
             if logger.is_debug_enabled():
@@ -276,3 +324,4 @@ class KvcmClient:
         if self._delegate_client is not None:
             await self._maybe_await(self._delegate_client.close())
             self._delegate_client = None
+        self._registered = False

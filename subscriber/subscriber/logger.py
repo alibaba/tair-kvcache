@@ -62,6 +62,7 @@ except ImportError:
             *args: object,
             step: str = "",
             tags: dict | None = None,  # type: ignore[type-arg]
+            exc_info: bool = False,
             **_: object,
         ) -> None:
             parts = [str(msg) % args if args else str(msg)]
@@ -69,7 +70,7 @@ except ImportError:
                 parts.append(f"step={step}")
             if tags:
                 parts.append(" ".join(f"{k}={v}" for k, v in tags.items()))
-            _log.log(level, " | ".join(parts))
+            _log.log(level, " | ".join(parts), exc_info=exc_info)
 
         return _log_fn
 

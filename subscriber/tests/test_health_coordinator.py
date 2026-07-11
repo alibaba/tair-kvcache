@@ -162,6 +162,34 @@ async def test_healthy_to_dead_sends_reset_once_with_current_epoch() -> None:
     assert len(kvcm.sent) == 1
 
 
+async def test_reset_report_failure_is_logged_and_recovery_continues(mocker) -> None:
+    class FailingResetKvcmClient(RecordingKvcmClient):
+        async def send_batch(self, batches: list[KVEventBatch], epoch: int) -> None:
+            raise RuntimeError("reset report failed")
+
+    adapter = FakeAdapter()
+    kvcm = FailingResetKvcmClient()
+    coordinator = EngineHealthCoordinator(adapter, kvcm, _config(threshold=1))
+    warning = mocker.patch("subscriber.health.coordinator.logger.warning")
+
+    await coordinator.handle_liveness_event(LivenessEvent.HEALTHY)
+    await coordinator.handle_liveness_event(LivenessEvent.UNHEALTHY)
+    await coordinator.handle_liveness_event(LivenessEvent.HEALTHY)
+
+    assert coordinator.state is EngineHealthState.HEALTHY
+    assert coordinator.epoch == 2
+    warning.assert_called_once_with(
+        "failed to report all blocks cleared to kvcm",
+        step="engine_health",
+        tags={
+            "epoch": 1,
+            "error": "RuntimeError",
+            "message": "reset report failed",
+        },
+        exc_info=True,
+    )
+
+
 async def test_dead_recovery_resets_generation_and_bumps_epoch() -> None:
     adapter = FakeAdapter()
     kvcm = RecordingKvcmClient()
@@ -211,6 +239,42 @@ async def test_reset_generation_runs_before_epoch_bump_and_gate_open() -> None:
 
     assert events_order == ["reset(epoch=1)"]
     assert coordinator.epoch == 2
+
+
+async def test_reset_generation_failure_is_logged_and_retried(mocker) -> None:
+    class FlakyResetAdapter(FakeAdapter):
+        async def reset_generation_state(self) -> None:
+            self.reset_generation_calls += 1
+            if self.reset_generation_calls == 1:
+                raise RuntimeError("socket recreation failed")
+
+    adapter = FlakyResetAdapter()
+    kvcm = RecordingKvcmClient()
+    coordinator = EngineHealthCoordinator(adapter, kvcm, _config(threshold=1))
+    warning = mocker.patch("subscriber.health.coordinator.logger.warning")
+
+    await coordinator.handle_liveness_event(LivenessEvent.HEALTHY)
+    await coordinator.handle_liveness_event(LivenessEvent.UNHEALTHY)
+    await coordinator.handle_liveness_event(LivenessEvent.HEALTHY)
+
+    assert coordinator.state is EngineHealthState.DEAD
+    assert coordinator.epoch == 1
+    warning.assert_called_once_with(
+        "failed to reset engine generation state; remaining not ready",
+        step="engine_health",
+        tags={
+            "epoch": 1,
+            "error": "RuntimeError",
+            "message": "socket recreation failed",
+        },
+        exc_info=True,
+    )
+
+    await coordinator.handle_liveness_event(LivenessEvent.HEALTHY)
+
+    assert coordinator.state is EngineHealthState.HEALTHY
+    assert coordinator.epoch == 2
+    assert adapter.reset_generation_calls == 2
 
 
 async def test_watch_loop_consumes_adapter_events() -> None:

@@ -121,6 +121,43 @@ async def test_send_kv_events_drops_batch_when_epoch_changed(
     assert queue.empty()
 
 
+async def test_send_kv_events_logs_failure_and_continues_with_next_batch(
+    kvcm: MagicMock, coordinator: MagicMock, mocker
+) -> None:
+    first_batch = _batch()
+    second_batch = _batch()
+    queue: asyncio.Queue[QueuedKVEventBatch] = asyncio.Queue()
+    await queue.put(QueuedKVEventBatch(first_batch, 1))
+    await queue.put(QueuedKVEventBatch(second_batch, 1))
+    error_message = (
+        "KVCM /api/reportEvent failed: INTERNAL_ERROR "
+        "ReportEvent partially failed; item_results=['OK', 'INTERNAL_ERROR']"
+    )
+    kvcm.send_batch.side_effect = [RuntimeError(error_message), None]
+    warning = mocker.patch("subscriber.main.logger.warning")
+
+    sender = asyncio.create_task(send_kv_events(kvcm, coordinator, queue))
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    sender.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await sender
+
+    assert kvcm.send_batch.await_count == 2
+    warning.assert_called_once_with(
+        "failed to send kv event batch to kvcm; dropping batch",
+        step="kvcm_send",
+        tags={
+            "epoch": 1,
+            "batch_count": 1,
+            "event_count": 1,
+            "error": "RuntimeError",
+            "message": error_message,
+        },
+        exc_info=True,
+    )
+
+
 async def test_kv_event_loop_sends_batch_when_epoch_unchanged(
     adapter: MagicMock, kvcm: MagicMock, coordinator: MagicMock
 ) -> None:
@@ -320,11 +357,12 @@ async def test_run_awaits_kvcm_close_when_start_raises(
     kvcm.close.assert_awaited_once()
 
 
-async def test_kv_event_loop_propagates_sender_exception_and_cancels_producer(
+async def test_kv_event_loop_survives_sender_exception_until_cancelled(
     adapter: MagicMock, kvcm: MagicMock, coordinator: MagicMock
 ) -> None:
     batch = _batch()
     producer_closed = asyncio.Event()
+    second_send_finished = asyncio.Event()
 
     async def _subscribe():
         try:
@@ -334,14 +372,22 @@ async def test_kv_event_loop_propagates_sender_exception_and_cancels_producer(
         finally:
             producer_closed.set()
 
-    adapter.subscribe_kv_events = _subscribe
-    kvcm.send_batch.side_effect = RuntimeError("kvcm send failed")
+    async def _send_batch(_batches: list[KVEventBatch], _epoch: int) -> None:
+        if kvcm.send_batch.await_count == 1:
+            raise RuntimeError("kvcm send failed")
+        second_send_finished.set()
 
-    with pytest.raises(RuntimeError, match="kvcm send failed"):
-        await asyncio.wait_for(
-            kv_event_loop(adapter, kvcm, coordinator, queue_maxsize=1),
-            timeout=0.5,
-        )
+    adapter.subscribe_kv_events = _subscribe
+    kvcm.send_batch.side_effect = _send_batch
+
+    loop_task = asyncio.create_task(
+        kv_event_loop(adapter, kvcm, coordinator, queue_maxsize=1)
+    )
+    await asyncio.wait_for(second_send_finished.wait(), timeout=0.5)
+    assert not loop_task.done()
+    loop_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await loop_task
 
     assert producer_closed.is_set()
 

@@ -52,10 +52,11 @@ class SequencedFakeHttpClient:
 
 
 class RecordingAsyncHttpClient:
-    def __init__(self) -> None:
+    def __init__(self, payload: dict[str, object] | None = None) -> None:
         self.headers: dict[str, str] = {}
         self.post_calls: list[tuple[str, dict[str, object], float]] = []
         self.closed = False
+        self.payload = payload or {"header": {"status": {"code": "OK"}}}
 
     async def post(
         self,
@@ -66,24 +67,31 @@ class RecordingAsyncHttpClient:
         timeout: float,
     ) -> FakeResponse:
         self.post_calls.append((url, json, timeout))
-        return FakeResponse({"header": {"status": {"code": "OK"}}})
+        return FakeResponse(self.payload)
 
     async def aclose(self) -> None:
         self.closed = True
 
 
 class EmptyServiceDiscovery(ServiceDiscovery):
+    def __init__(self) -> None:
+        self.endpoint: ServiceEndpoint | None = None
+        self.closed = False
+
     def get_type(self) -> str:
         return "Empty"
 
     def get_all_endpoints(self) -> list[ServiceEndpoint]:
-        return []
+        return [self.endpoint] if self.endpoint is not None else []
 
     def get_one_endpoint(self) -> ServiceEndpoint | None:
-        return None
+        return self.endpoint
 
     async def refresh(self) -> bool:
         return True
+
+    async def close(self) -> None:
+        self.closed = True
 
 
 async def test_spectrum_service_discovery_fetches_initial_endpoints() -> None:
@@ -145,22 +153,33 @@ async def test_spectrum_service_discovery_keeps_cached_endpoints_on_poll_failure
     await discovery.close()
 
 
-async def test_manager_client_fails_when_initial_spectrum_discovery_is_empty(
+async def test_manager_client_recovers_when_initial_spectrum_discovery_is_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    discovery = EmptyServiceDiscovery()
     monkeypatch.setattr(
         manager_client,
         "create_service_discovery",
-        lambda _: EmptyServiceDiscovery(),
+        lambda _: discovery,
     )
 
     client = HttpKvCacheManagerClient(
         "spectrum://vs-a",
         auto_discover_leader=False,
     )
-    with pytest.raises(RuntimeError, match="returned no endpoints"):
-        await client.start()
+
+    await client.start()
+
+    assert client.is_ready() is False
+    assert discovery.closed is False
+
+    discovery.endpoint = ServiceEndpoint(ip="10.0.0.9", port=7001, host="10.0.0.9:7001")
+
+    assert client.is_ready() is True
+    assert client.base_url == "http://10.0.0.9:7001"
+
     await client.close()
+    assert discovery.closed is True
 
 
 async def test_manager_client_reports_with_reused_async_http_client() -> None:
@@ -184,6 +203,82 @@ async def test_manager_client_reports_with_reused_async_http_client() -> None:
             0.25,
         )
     ]
+    assert http_client.closed
+
+
+async def test_manager_report_event_raises_for_non_ok_status_by_default() -> None:
+    http_client = RecordingAsyncHttpClient(
+        {
+            "header": {
+                "status": {
+                    "code": "INTERNAL_ERROR",
+                    "message": "ReportEvent partially failed",
+                }
+            },
+            "item_results": ["OK", "INTERNAL_ERROR"],
+        }
+    )
+    client = HttpKvCacheManagerClient(
+        "http://manager.test:8080",
+        auto_discover_leader=False,
+        http_client=http_client,
+    )
+    await client.start()
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "KVCM /api/reportEvent failed: INTERNAL_ERROR ReportEvent partially failed"
+        ),
+    ) as exc_info:
+        await client.report_event({"trace_id": "t1"})
+
+    await client.close()
+
+    assert "item_results=['OK', 'INTERNAL_ERROR']" in str(exc_info.value)
+
+
+async def test_manager_report_event_can_return_non_ok_for_explicit_inspection() -> None:
+    response = {
+        "header": {"status": {"code": "INTERNAL_ERROR", "message": "failed"}},
+        "item_results": ["INTERNAL_ERROR"],
+    }
+    http_client = RecordingAsyncHttpClient(response)
+    client = HttpKvCacheManagerClient(
+        "http://manager.test:8080",
+        auto_discover_leader=False,
+        http_client=http_client,
+    )
+    await client.start()
+
+    payload = await client.report_event({"trace_id": "t1"}, check_response=False)
+    await client.close()
+
+    assert payload == response
+
+
+async def test_manager_initial_leader_discovery_failure_is_nonfatal() -> None:
+    class FailingHttpClient(RecordingAsyncHttpClient):
+        async def post(
+            self,
+            url: str,
+            *,
+            json: dict[str, object],
+            headers: dict[str, str],
+            timeout: float,
+        ) -> FakeResponse:
+            raise RuntimeError("manager unavailable")
+
+    http_client = FailingHttpClient()
+    client = HttpKvCacheManagerClient(
+        "http://manager.test:8080",
+        discovery_refresh_interval_seconds=60,
+        http_client=http_client,
+    )
+
+    await client.start()
+    await client.close()
+
     assert http_client.closed
 
 

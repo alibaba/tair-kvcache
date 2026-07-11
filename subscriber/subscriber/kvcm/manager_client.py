@@ -39,7 +39,7 @@ class HttpKvCacheManagerClient:
         leader_retry_base_interval_seconds: float = 0.005,
         discovery_refresh_interval_seconds: int = 30,
         min_discover_interval_seconds: float = 1.0,
-        request_timeout_seconds: float = 1.0,
+        request_timeout_seconds: float = 5.0,
         http_client: Any | None = None,
     ):
         """Initialize the HTTP manager client.
@@ -104,10 +104,10 @@ class HttpKvCacheManagerClient:
                     base_url,
                 )
             else:
-                await self._service_discovery.close()
-                await self._http_client.aclose()
-                raise RuntimeError(
-                    f"Service discovery returned no endpoints for {base_url}"
+                logger.warning(
+                    "Service discovery returned no endpoints for %s; "
+                    "waiting for background refresh",
+                    base_url,
                 )
 
         self.base_url = base_url.rstrip("/")
@@ -115,7 +115,8 @@ class HttpKvCacheManagerClient:
 
         if self._auto_discover_leader:
             try:
-                await self._discover_leader()
+                if self.is_ready():
+                    await self._discover_leader()
             except Exception as e:
                 logger.warning(
                     "Initial leader discovery failed, keeping base_url %s: %s",
@@ -127,6 +128,24 @@ class HttpKvCacheManagerClient:
                 name="kvcm-leader-refresh",
             )
         self._started = True
+
+    def is_ready(self) -> bool:
+        """Return whether requests have a usable HTTP endpoint."""
+
+        if self.base_url.startswith(("http://", "https://")):
+            return True
+        if self._service_discovery is None:
+            return False
+        endpoint = self._service_discovery.get_one_endpoint()
+        if endpoint is None:
+            return False
+        self.base_url = f"http://{endpoint.host}"
+        logger.info(
+            "Service discovery (%s) recovered manager endpoint: %s",
+            self._service_discovery.get_type(),
+            self.base_url,
+        )
+        return True
 
     # ----- leader discovery internals -----
 
@@ -304,9 +323,14 @@ class HttpKvCacheManagerClient:
             if check_response:
                 status = payload.get("header", {}).get("status", {})
                 if status.get("code") != "OK":
+                    item_results = payload.get("item_results")
+                    item_results_detail = (
+                        f"; item_results={item_results!r}" if item_results else ""
+                    )
                     raise RuntimeError(
                         f"KVCM {endpoint} failed: "
                         f"{status.get('code')} {status.get('message')}"
+                        f"{item_results_detail}"
                     )
             return payload
 

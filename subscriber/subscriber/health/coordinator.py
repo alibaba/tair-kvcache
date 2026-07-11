@@ -93,7 +93,20 @@ class EngineHealthCoordinator:
             self._epoch += 1
             self._state = EngineHealthState.HEALTHY
         elif self._state is EngineHealthState.DEAD:
-            await self._adapter.reset_generation_state()
+            try:
+                await self._adapter.reset_generation_state()
+            except Exception as exc:
+                logger.warning(
+                    "failed to reset engine generation state; remaining not ready",
+                    step="engine_health",
+                    tags={
+                        "epoch": self._epoch,
+                        "error": exc.__class__.__name__,
+                        "message": str(exc),
+                    },
+                    exc_info=True,
+                )
+                return
             self._epoch += 1
             self._state = EngineHealthState.HEALTHY
         self._failure_count = 0
@@ -121,4 +134,16 @@ class EngineHealthCoordinator:
 
     async def _send_all_blocks_cleared(self) -> None:
         batch = KVEventBatch(ts=self._clock(), events=[AllBlocksCleared()])
-        await self._kvcm.send_batch([batch], self._epoch)
+        try:
+            await self._kvcm.send_batch([batch], self._epoch)
+        except Exception as exc:
+            logger.warning(
+                "failed to report all blocks cleared to kvcm",
+                step="engine_health",
+                tags={
+                    "epoch": self._epoch,
+                    "error": exc.__class__.__name__,
+                    "message": str(exc),
+                },
+                exc_info=True,
+            )

@@ -63,7 +63,24 @@ async def send_kv_events(
                     },
                 )
                 continue
-            await kvcm.send_batch(queued.batches, epoch)
+            try:
+                await kvcm.send_batch(queued.batches, epoch)
+            except Exception as exc:
+                # TODO: Buffer or replay batches dropped while KVCM is unavailable.
+                logger.warning(
+                    "failed to send kv event batch to kvcm; dropping batch",
+                    step="kvcm_send",
+                    tags={
+                        "epoch": epoch,
+                        "batch_count": len(queued.batches),
+                        "event_count": sum(
+                            len(batch.events) for batch in queued.batches
+                        ),
+                        "error": exc.__class__.__name__,
+                        "message": str(exc),
+                    },
+                    exc_info=True,
+                )
         finally:
             queue.task_done()
 
