@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <thread>
@@ -29,6 +30,8 @@ class ReclaimerTaskSupervisor;
 class StartupConfigLoader;
 class EventManager;
 class CacheManagerMetricsRecorder;
+class EventReportingBackend;
+class ServiceMetricsCollector;
 struct MetricsLifecycle;
 constexpr unsigned int DEFAULT_SCHEDULE_PLAN_EXECUTOR_THREAD_COUNT = 2;
 
@@ -180,6 +183,85 @@ public:
     void SetRevisitHistogramConfig(const std::vector<double> &boundaries);
 
 private:
+    struct ReportEventBlockAddEntry {
+        std::string location_id;
+        std::vector<LocationSpec> specs;
+        int event_index = 0;
+    };
+    struct ReportEventBlockDelEntry {
+        std::string location_id;
+        int event_index = 0;
+    };
+    struct ReportEventSnapshotEntry {
+        std::string location_id;
+        std::map<int64_t, std::vector<LocationSpec>> blocks;
+        int event_index = 0;
+    };
+    enum class ReportEventPendingMutationKind { NONE, ADD, DELETE };
+    struct ReportEventState {
+        explicit ReportEventState(size_t event_count) : per_item_ec(event_count, EC_OK) {}
+        std::vector<ErrorCode> per_item_ec;
+        std::map<int64_t, std::vector<ReportEventBlockAddEntry>> pending_adds;
+        std::map<int64_t, std::vector<ReportEventBlockDelEntry>> pending_dels;
+        ReportEventPendingMutationKind pending_kind = ReportEventPendingMutationKind::NONE;
+    };
+
+    static bool HasPrefix(const std::string &s, const std::string &prefix);
+    static bool IsMambaLocationSpecName(const std::string &name);
+    static bool IsFullAttentionLocationSpecName(const std::string &name);
+    static bool ContainsFullAttentionSpecName(const google::protobuf::RepeatedPtrField<std::string> &spec_names);
+    static std::vector<LocationSpec> BuildFullAttentionSpecs(
+        const google::protobuf::RepeatedPtrField<proto::meta::LocationSpec> &proto_specs);
+    static bool SameLocationSpecs(const std::vector<LocationSpec> &lhs, const std::vector<LocationSpec> &rhs);
+    static bool CacheLocationEquals(const CacheLocationConstPtr &loc,
+                                    DataStorageType type,
+                                    CacheLocationStatus status,
+                                    const std::vector<LocationSpec> &specs);
+    static bool ExistingLocationEquals(const CacheLocationMap *existing_map,
+                                       const std::string &location_id,
+                                       DataStorageType type,
+                                       CacheLocationStatus status,
+                                       const std::vector<LocationSpec> &specs);
+    static bool ParseInt64(const std::string &s, int64_t &out);
+    static proto::meta::ErrorCode ToProtoErrorCode(ErrorCode ec);
+    static ServiceMetricsCollector *FindReportEventSubCollector(RequestContext *request_context,
+                                                                const std::string &api_name);
+    static void SetReportEventItemEcIfOk(ReportEventState *state, int event_index, ErrorCode ec);
+
+    bool BuildReportEventLocationId(const std::string &trace_id,
+                                    EventReportingBackend *event_backend,
+                                    const std::string &host_ip_port,
+                                    const std::string &medium,
+                                    const char *event_name,
+                                    int event_index,
+                                    ReportEventState *state,
+                                    std::string &out_location_id) const;
+    void FlushReportEventAdds(RequestContext *request_context,
+                              MetaSearcher *meta_searcher,
+                              EventReportingBackend *event_backend,
+                              ReportEventState *state) const;
+    void FlushReportEventDeletes(RequestContext *request_context,
+                                 MetaSearcher *meta_searcher,
+                                 ReportEventState *state) const;
+    void FlushReportEventPending(RequestContext *request_context,
+                                 MetaSearcher *meta_searcher,
+                                 EventReportingBackend *event_backend,
+                                 ReportEventState *state) const;
+    void ApplyReportEventSnapshot(RequestContext *request_context,
+                                  MetaSearcher *meta_searcher,
+                                  EventReportingBackend *event_backend,
+                                  const ReportEventSnapshotEntry &snapshot,
+                                  ReportEventState *state) const;
+    void ProcessReportEventItem(RequestContext *request_context,
+                                const proto::meta::EventItem &item,
+                                int event_index,
+                                const std::string &instance_id,
+                                const std::string &host_ip_port,
+                                DataStorageType requested_type,
+                                MetaSearcher *meta_searcher,
+                                EventReportingBackend *event_backend,
+                                ReportEventState *state);
+
     ErrorCode FilterWriteCache(RequestContext *request_context,
                                const std::string &instance_id,
                                MetaSearcher *meta_searcher,

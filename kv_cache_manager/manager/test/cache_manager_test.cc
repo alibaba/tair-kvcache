@@ -211,29 +211,8 @@ public:
         }
     }
 
-    using LocationScopeLabels = std::vector<std::pair<std::string, std::string>>;
-
-    void SetLocationScope(proto::meta::LocationScope *scope,
-                          const std::string &medium,
-                          const LocationScopeLabels &labels) {
-        scope->set_medium(medium);
-        for (const auto &label : labels) {
-            (*scope->mutable_labels())[label.first] = label.second;
-        }
-    }
-
-    std::string ExpectedReportEventLocationId(const std::string &host,
-                                              const std::string &medium,
-                                              const LocationScopeLabels &labels = {}) {
-        std::string location_id = "kvs#v6d#" + medium;
-        std::map<std::string, std::string> sorted_labels;
-        for (const auto &label : labels) {
-            sorted_labels[label.first] = label.second;
-        }
-        for (const auto &label : sorted_labels) {
-            location_id += ";" + label.first + "=" + label.second;
-        }
-        return location_id + "#" + host;
+    std::string ExpectedReportEventLocationId(const std::string &host, const std::string &medium) {
+        return "kvs#v6d#" + medium + "#" + host;
     }
 
     std::string ReportEventUri(const std::string &host,
@@ -253,49 +232,48 @@ public:
                           const std::string &medium,
                           int64_t key,
                           uint64_t size = 0,
-                          const LocationScopeLabels &labels = {},
-                          const std::string &suffix = "") {
+                          const std::string &suffix = "",
+                          const std::string &spec_name = "tp0") {
         auto *ev = req->add_events();
         ev->set_event_type(proto::meta::EVENT_BLOCK_ADD);
         auto *add = ev->mutable_block_add();
         add->set_block_key(std::to_string(key));
-        SetLocationScope(add->mutable_location(), medium, labels);
+        add->set_medium(medium);
         auto *spec = add->add_specs();
-        spec->set_name("tp0");
+        spec->set_name(spec_name);
         spec->set_uri(ReportEventUri(host, medium, key, size, suffix));
     }
 
     void AddBlockDeleteEvent(proto::meta::ReportEventRequest *req,
                              const std::string &medium,
                              int64_t key,
-                             const LocationScopeLabels &labels = {}) {
+                             const std::vector<std::string> &spec_names = {}) {
         auto *ev = req->add_events();
         ev->set_event_type(proto::meta::EVENT_BLOCK_DELETE);
         auto *del = ev->mutable_block_delete();
         del->set_block_key(std::to_string(key));
-        SetLocationScope(del->mutable_location(), medium, labels);
+        del->set_medium(medium);
+        for (const auto &spec_name : spec_names) {
+            del->add_spec_names(spec_name);
+        }
     }
 
     void AddBlockSnapshotEvent(proto::meta::ReportEventRequest *req,
                                const std::string &host,
                                const std::string &medium,
                                const std::vector<int64_t> &keys,
-                               const LocationScopeLabels &labels = {},
                                uint64_t size = 0,
-                               const std::string &suffix = "") {
+                               const std::string &suffix = "",
+                               const std::string &spec_name = "tp0") {
         auto *ev = req->add_events();
         ev->set_event_type(proto::meta::EVENT_BLOCK_SNAPSHOT);
         auto *snapshot = ev->mutable_block_snapshot();
-        if (labels.empty()) {
-            snapshot->set_medium(medium);
-        } else {
-            SetLocationScope(snapshot->mutable_location(), medium, labels);
-        }
+        snapshot->set_medium(medium);
         for (auto key : keys) {
             auto *block = snapshot->add_blocks();
             block->set_block_key(std::to_string(key));
             auto *spec = block->add_specs();
-            spec->set_name("tp0");
+            spec->set_name(spec_name);
             spec->set_uri(ReportEventUri(host, medium, key, size, suffix));
         }
     }
@@ -3277,7 +3255,7 @@ TEST_F(CacheManagerTest, TestReportEventPreservesDeleteThenAddOrder) {
     req.set_host_ip_port(host);
     req.set_storage_type(proto::meta::ST_VINEYARD);
     AddBlockDeleteEvent(&req, "mem", 300);
-    AddBlockAddEvent(&req, host, "mem", 300, 0, {}, "-recreated");
+    AddBlockAddEvent(&req, host, "mem", 300, 0, "-recreated");
 
     proto::meta::ReportEventResponse resp;
     EXPECT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
@@ -3324,15 +3302,48 @@ TEST_F(CacheManagerTest, TestReportEventSnapshotIsOrderingBarrier) {
     }
 }
 
-TEST_F(CacheManagerTest, TestReportEventLocationScopeSeparatesVllmGroups) {
+TEST_F(CacheManagerTest, TestReportEventLocationSpecNameKeepsFullAttentionSpecs) {
     RegisterDefaultInstanceForReportEvent();
     SetupVineyardEventReportingBackend();
 
     const std::string host = "192.168.2.1:8080";
-    const LocationScopeLabels group0 = {{"group_idx", "0"}, {"dp_rank", "0"}};
-    const LocationScopeLabels group1 = {{"group_idx", "1"}, {"dp_rank", "0"}};
-    const std::string group0_loc = ExpectedReportEventLocationId(host, "gpu", group0);
-    const std::string group1_loc = ExpectedReportEventLocationId(host, "gpu", group1);
+    const std::string location_id = ExpectedReportEventLocationId(host, "gpu");
+
+    proto::meta::ReportEventRequest req;
+    req.set_instance_id("test_instance");
+    req.set_host_ip_port(host);
+    req.set_storage_type(proto::meta::ST_VINEYARD);
+    AddNodeRegisterEvent(&req, {"gpu"});
+    auto *mixed_ev = req.add_events();
+    mixed_ev->set_event_type(proto::meta::EVENT_BLOCK_SNAPSHOT);
+    auto *mixed_snapshot = mixed_ev->mutable_block_snapshot();
+    mixed_snapshot->set_medium("gpu");
+    auto *mixed_block = mixed_snapshot->add_blocks();
+    mixed_block->set_block_key("300");
+    auto *full_spec = mixed_block->add_specs();
+    full_spec->set_name("full_attention:group=0:tp=0");
+    full_spec->set_uri(ReportEventUri(host, "gpu", 300));
+    auto *mamba_spec = mixed_block->add_specs();
+    mamba_spec->set_name("mamba_state:group=1");
+    mamba_spec->set_uri(ReportEventUri(host, "gpu", 300, 0, "-mamba"));
+    AddBlockSnapshotEvent(&req, host, "gpu", {400}, 0, "", "mamba_state:group=1");
+
+    proto::meta::ReportEventResponse resp;
+    EXPECT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+    EXPECT_EQ(proto::meta::OK, resp.header().status().code());
+    EXPECT_TRUE(HasLocation(300, location_id));
+    EXPECT_FALSE(HasLocation(400, location_id));
+    const auto &specs = GetLocationMapForKey(300).at(location_id)->location_specs();
+    ASSERT_EQ(1, specs.size());
+    EXPECT_EQ("full_attention:group=0:tp=0", specs[0].name());
+}
+
+TEST_F(CacheManagerTest, TestReportEventSkipsMambaStateSpecNames) {
+    RegisterDefaultInstanceForReportEvent();
+    SetupVineyardEventReportingBackend();
+
+    const std::string host = "192.168.2.1:8080";
+    const std::string location_id = ExpectedReportEventLocationId(host, "gpu");
 
     {
         proto::meta::ReportEventRequest req;
@@ -3340,36 +3351,30 @@ TEST_F(CacheManagerTest, TestReportEventLocationScopeSeparatesVllmGroups) {
         req.set_host_ip_port(host);
         req.set_storage_type(proto::meta::ST_VINEYARD);
         AddNodeRegisterEvent(&req, {"gpu"});
-        AddBlockSnapshotEvent(&req, host, "gpu", {300, 400}, group0);
-        AddBlockSnapshotEvent(&req, host, "gpu", {300}, group1);
+        AddBlockAddEvent(&req, host, "gpu", 300, 0, "", "full_attention:group=0:tp=0");
 
         proto::meta::ReportEventResponse resp;
         EXPECT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
         EXPECT_EQ(proto::meta::OK, resp.header().status().code());
     }
-    ASSERT_TRUE(HasLocation(300, group0_loc));
-    ASSERT_TRUE(HasLocation(400, group0_loc));
-    ASSERT_TRUE(HasLocation(300, group1_loc));
-
-    ReportBlockSnapshot(host, "gpu", {400}, false, {});
-    EXPECT_TRUE(HasLocation(300, group0_loc));
-    EXPECT_TRUE(HasLocation(400, group0_loc));
-    EXPECT_TRUE(HasLocation(300, group1_loc));
+    ASSERT_TRUE(HasLocation(300, location_id));
 
     {
         proto::meta::ReportEventRequest req;
         req.set_instance_id("test_instance");
         req.set_host_ip_port(host);
         req.set_storage_type(proto::meta::ST_VINEYARD);
-        AddBlockSnapshotEvent(&req, host, "gpu", {400}, group0);
+        AddBlockSnapshotEvent(&req, host, "gpu", {400}, 0, "", "mamba_state:group=1");
+        AddBlockAddEvent(&req, host, "gpu", 401, 0, "", "mamba_state:group=1");
+        AddBlockDeleteEvent(&req, "gpu", 300, {"mamba_state:group=1"});
 
         proto::meta::ReportEventResponse resp;
         EXPECT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
         EXPECT_EQ(proto::meta::OK, resp.header().status().code());
     }
-    EXPECT_FALSE(HasLocation(300, group0_loc));
-    EXPECT_TRUE(HasLocation(400, group0_loc));
-    EXPECT_TRUE(HasLocation(300, group1_loc));
+    EXPECT_TRUE(HasLocation(300, location_id));
+    EXPECT_FALSE(HasLocation(400, location_id));
+    EXPECT_FALSE(HasLocation(401, location_id));
 }
 
 TEST_F(CacheManagerTest, TestReportEventUpsertUsageIsIdempotentAndDeltaBased) {
@@ -3386,8 +3391,8 @@ TEST_F(CacheManagerTest, TestReportEventUpsertUsageIsIdempotentAndDeltaBased) {
         req.set_host_ip_port(host);
         req.set_storage_type(proto::meta::ST_VINEYARD);
         AddNodeRegisterEvent(&req, {"mem"});
-        AddBlockAddEvent(&req, host, "mem", 300, 10, {}, "-old");
-        AddBlockAddEvent(&req, host, "mem", 300, 20, {}, "-new");
+        AddBlockAddEvent(&req, host, "mem", 300, 10, "-old");
+        AddBlockAddEvent(&req, host, "mem", 300, 20, "-new");
 
         proto::meta::ReportEventResponse resp;
         EXPECT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
@@ -3401,7 +3406,7 @@ TEST_F(CacheManagerTest, TestReportEventUpsertUsageIsIdempotentAndDeltaBased) {
         req.set_instance_id("test_instance");
         req.set_host_ip_port(host);
         req.set_storage_type(proto::meta::ST_VINEYARD);
-        AddBlockAddEvent(&req, host, "mem", 300, 20, {}, "-new");
+        AddBlockAddEvent(&req, host, "mem", 300, 20, "-new");
 
         proto::meta::ReportEventResponse resp;
         EXPECT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
@@ -3414,7 +3419,7 @@ TEST_F(CacheManagerTest, TestReportEventUpsertUsageIsIdempotentAndDeltaBased) {
         req.set_instance_id("test_instance");
         req.set_host_ip_port(host);
         req.set_storage_type(proto::meta::ST_VINEYARD);
-        AddBlockAddEvent(&req, host, "mem", 300, 35, {}, "-updated");
+        AddBlockAddEvent(&req, host, "mem", 300, 35, "-updated");
 
         proto::meta::ReportEventResponse resp;
         EXPECT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
@@ -3428,7 +3433,7 @@ TEST_F(CacheManagerTest, TestReportEventUpsertUsageIsIdempotentAndDeltaBased) {
         req.set_instance_id("test_instance");
         req.set_host_ip_port(host);
         req.set_storage_type(proto::meta::ST_VINEYARD);
-        AddBlockSnapshotEvent(&req, host, "mem", {300}, {}, 35, "-updated");
+        AddBlockSnapshotEvent(&req, host, "mem", {300}, 35, "-updated");
 
         proto::meta::ReportEventResponse resp;
         EXPECT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
@@ -3441,7 +3446,7 @@ TEST_F(CacheManagerTest, TestReportEventUpsertUsageIsIdempotentAndDeltaBased) {
         req.set_instance_id("test_instance");
         req.set_host_ip_port(host);
         req.set_storage_type(proto::meta::ST_VINEYARD);
-        AddBlockSnapshotEvent(&req, host, "mem", {300}, {}, 50, "-snapshot");
+        AddBlockSnapshotEvent(&req, host, "mem", {300}, 50, "-snapshot");
 
         proto::meta::ReportEventResponse resp;
         EXPECT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));

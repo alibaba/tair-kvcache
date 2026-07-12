@@ -284,22 +284,94 @@ void MetaSearcher::RemoveKeysFromLocationIndex(
     }
 }
 
-ErrorCode MetaSearcher::GetKeysByLocationIndex(const std::string &location_id, KeyVector &out_keys) const {
-    if (location_id.empty()) {
-        return EC_BADARGS;
-    }
-
+void MetaSearcher::SnapshotLocationKeyIndex(const std::string &location_id, KeyVector &out_keys) const {
     out_keys.clear();
     std::lock_guard<std::mutex> lock(location_key_index_mutex_);
     auto iter = location_key_index_.find(location_id);
     if (iter == location_key_index_.end()) {
-        return EC_OK;
+        return;
     }
     out_keys.reserve(iter->second.size());
     for (const auto &key : iter->second) {
         out_keys.push_back(key);
     }
     std::sort(out_keys.begin(), out_keys.end());
+}
+
+ErrorCode MetaSearcher::RebuildLocationKeyIndex(RequestContext *request_context,
+                                                const std::string &location_id,
+                                                size_t scan_batch_size) {
+    if (location_id.empty() || scan_batch_size == 0) {
+        return EC_BADARGS;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(location_key_index_mutex_);
+        if (rebuilt_location_key_index_.find(location_id) != rebuilt_location_key_index_.end()) {
+            return EC_OK;
+        }
+    }
+
+    std::unordered_set<KeyType> rebuilt_keys;
+    std::string cursor = "0";
+    do {
+        std::string next_cursor;
+        KeyVector scanned_keys;
+        ErrorCode scan_ec = meta_indexer_->Scan(request_context, cursor, scan_batch_size, next_cursor, scanned_keys);
+        if (scan_ec != EC_OK) {
+            return scan_ec;
+        }
+
+        if (!scanned_keys.empty()) {
+            std::vector<CacheLocationMap> location_maps;
+            BlockMask empty_mask = static_cast<size_t>(0);
+            ErrorCode get_ec = BatchGetLocation(request_context, scanned_keys, empty_mask, location_maps);
+            if (get_ec != EC_OK) {
+                return get_ec;
+            }
+            for (size_t i = 0; i < scanned_keys.size() && i < location_maps.size(); ++i) {
+                if (location_maps[i].find(location_id) != location_maps[i].end()) {
+                    rebuilt_keys.insert(scanned_keys[i]);
+                }
+            }
+        }
+
+        cursor = std::move(next_cursor);
+    } while (!cursor.empty() && cursor != "0");
+
+    std::lock_guard<std::mutex> lock(location_key_index_mutex_);
+    auto current_iter = location_key_index_.find(location_id);
+    if (current_iter != location_key_index_.end()) {
+        rebuilt_keys.insert(current_iter->second.begin(), current_iter->second.end());
+    }
+    location_key_index_[location_id] = std::move(rebuilt_keys);
+    rebuilt_location_key_index_.insert(location_id);
+    if (location_key_index_[location_id].empty()) {
+        location_key_index_.erase(location_id);
+    }
+    return EC_OK;
+}
+
+ErrorCode MetaSearcher::GetKeysByLocationIndex(RequestContext *request_context,
+                                               const std::string &location_id,
+                                               KeyVector &out_keys) {
+    if (location_id.empty()) {
+        return EC_BADARGS;
+    }
+
+    bool needs_rebuild = false;
+    {
+        std::lock_guard<std::mutex> lock(location_key_index_mutex_);
+        needs_rebuild = rebuilt_location_key_index_.find(location_id) == rebuilt_location_key_index_.end();
+    }
+    if (needs_rebuild) {
+        ErrorCode rebuild_ec = RebuildLocationKeyIndex(request_context, location_id);
+        if (rebuild_ec != EC_OK) {
+            return rebuild_ec;
+        }
+    }
+
+    SnapshotLocationKeyIndex(location_id, out_keys);
     return EC_OK;
 }
 

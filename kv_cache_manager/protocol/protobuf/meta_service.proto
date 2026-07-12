@@ -51,9 +51,11 @@ enum StorageType {
 // ReportEvent is the ingestion API used by cache subscribers. A subscriber
 // normalizes engine-specific cache signals (for example RTP-LLM full cache
 // snapshots or vLLM KV events) into block-level mutations on one storage
-// system. `storage_type` names that large storage/cache system; LocationScope
-// identifies one diffable location namespace inside it; LocationSpec describes
-// where the block lives within that namespace.
+// system. `storage_type` names that large storage/cache system; `medium`
+// identifies one diffable cache namespace under the reporter host; LocationSpec
+// describes where each cache component of the block lives. KVCM currently
+// matches only full-attention specs and ignores mamba-state specs by
+// LocationSpec.name.
 
 enum ReportEventType {
     EVENT_UNSPECIFIED = 0;
@@ -65,13 +67,6 @@ enum ReportEventType {
     EVENT_BLOCK_SNAPSHOT = 6; // Reporter sends the full block set for one host/medium
 }
 
-message LocationScope {
-    string medium = 1; // cache tier/namespace, e.g. "mem", "disk", "gpu", "hbm"
-    // Optional identity dimensions within a medium, e.g. {"dp_rank":"0", "group_idx":"1"}.
-    // KVCM sorts these labels and folds them into the location id.
-    map<string, string> labels = 2;
-}
-
 message NodeRegisterEventParams {
     repeated string mediums = 1; // mediums supported by the node, e.g. ["mem","disk"]
 }
@@ -79,15 +74,16 @@ message NodeRegisterEventParams {
 message BlockAddEventParams {
     string block_key = 1; // int64 as string
     string uri = 2;       // deprecated, use specs instead
-    string medium = 3;    // deprecated compatibility field; use location.medium instead
+    string medium = 3;    // cache tier/namespace, e.g. "mem", "disk", "gpu", "hbm"
     repeated LocationSpec specs = 4;
-    LocationScope location = 5;
 }
 
 message BlockDeleteEventParams {
     string block_key = 1;
-    string medium = 2; // deprecated compatibility field; use location.medium instead
-    LocationScope location = 3;
+    string medium = 2; // cache tier/namespace, e.g. "mem", "disk", "gpu", "hbm"
+    // Optional. When set, KVCM applies the delete only if these component names
+    // contain a full-attention spec; mamba-state-only deletes are ignored.
+    repeated string spec_names = 3;
 }
 
 message BlockSnapshotItem {
@@ -96,9 +92,8 @@ message BlockSnapshotItem {
 }
 
 message BlockSnapshotEventParams {
-    string medium = 1; // deprecated compatibility field; use location.medium instead
+    string medium = 1; // cache tier/namespace, e.g. "mem", "disk", "gpu", "hbm"
     repeated BlockSnapshotItem blocks = 2;
-    LocationScope location = 3;
 }
 
 message HostDownEventParams {

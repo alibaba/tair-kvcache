@@ -111,10 +111,17 @@ engine-specific cache signals into block-level events:
   `EVENT_BLOCK_DELETE`, and full-clear snapshots.
 
 `storage_type` identifies the storage/cache system, such as Vineyard/V6D.
-`location` identifies one diffable location namespace under the reporting host.
-Use `location.labels` when one host has multiple independent cache groups, such
-as vLLM `dp_rank` or `group_idx`. `specs` describes the concrete address of the
-block in that namespace.
+`medium` identifies one diffable cache namespace under the reporting host.
+`specs` describes the concrete address of the block in that namespace.
+Subscribers should encode component identity in `LocationSpec.name`, for
+example `full_attention:group=0:tp=0` or `mamba_state:group=1`. KVCM currently
+stores and matches only full-attention specs; mamba-state specs are accepted but
+ignored until fine-grained hybrid-cache matching is implemented. Legacy spec
+names such as `tp0` are treated as full-attention for compatibility.
+For `EVENT_BLOCK_SNAPSHOT`, the diff scope is the reporter `host_ip_port` plus
+`medium` after mamba-state specs are filtered. If an engine has multiple
+full-attention groups for one block, report them as multiple `LocationSpec`
+entries on the same `BlockSnapshotItem`.
 
 ```bash
 curl -g -vvv -X POST http://localhost:6382/api/reportEvent \
@@ -135,19 +142,13 @@ curl -g -vvv -X POST http://localhost:6382/api/reportEvent \
       {
         "event_type": "EVENT_BLOCK_SNAPSHOT",
         "block_snapshot": {
-          "location": {
-            "medium": "gpu",
-            "labels": {
-              "dp_rank": "0",
-              "group_idx": "1"
-            }
-          },
+          "medium": "gpu",
           "blocks": [
             {
               "block_key": "123",
               "specs": [
                 {
-                  "name": "tp0",
+                  "name": "full_attention:group=0:tp=0",
                   "uri": "vineyard://192.168.2.1/gpu/123?size=4096"
                 }
               ]
