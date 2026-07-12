@@ -32,6 +32,11 @@ public:
     std::vector<ErrorCode> Delete(const std::vector<std::string> &keys);
     std::vector<ErrorCode> DeleteFields(const std::vector<std::string> &keys,
                                         const std::vector<std::vector<std::string>> &field_names_vec);
+    std::vector<ErrorCode> SAdd(const std::vector<std::string> &keys,
+                                const std::vector<std::vector<std::string>> &members_vec);
+    std::vector<ErrorCode> SRem(const std::vector<std::string> &keys,
+                                const std::vector<std::vector<std::string>> &members_vec);
+    ErrorCode SMembers(const std::string &key, std::vector<std::string> &out_members);
     std::vector<ErrorCode> Get(const std::vector<std::string> &keys,
                                const std::vector<std::string> &field_names,
                                std::vector<std::map<std::string, std::string>> &out_field_maps);
@@ -84,6 +89,14 @@ public:
     static void BuildHashDeleteCmds(const std::vector<std::string> &keys,
                                     const std::vector<std::vector<std::string>> &field_names_vec,
                                     std::vector<CmdArgs> &out_cmds);
+
+    // SADD/SREM per key. Skips keys with empty member lists.
+    static void BuildSetAddCmds(const std::vector<std::string> &keys,
+                                const std::vector<std::vector<std::string>> &members_vec,
+                                std::vector<CmdArgs> &out_cmds);
+    static void BuildSetRemoveCmds(const std::vector<std::string> &keys,
+                                   const std::vector<std::vector<std::string>> &members_vec,
+                                   std::vector<CmdArgs> &out_cmds);
 
 protected:
 

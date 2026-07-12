@@ -87,6 +87,16 @@ public:
     ErrorCode PutMetaData(const FieldMap &field_maps) noexcept;
     ErrorCode GetMetaData(FieldMap &field_maps) noexcept;
 
+    ErrorCode AddKeysToLocationIndex(RequestContext *request_context,
+                                     const std::string &location_id,
+                                     const KeyVector &keys) noexcept;
+    ErrorCode RemoveKeysFromLocationIndex(RequestContext *request_context,
+                                          const std::string &location_id,
+                                          const KeyVector &keys) noexcept;
+    ErrorCode GetKeysByLocationIndex(RequestContext *request_context,
+                                     const std::string &location_id,
+                                     KeyVector &out_keys) noexcept;
+
     // Synchronously flush pending writes for the given keys to persistent storage.
     // Returns true on success, false on failure/timeout.
     bool Sync(const KeyVector &keys) noexcept;

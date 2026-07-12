@@ -728,6 +728,34 @@ ErrorCode MetaStorageBackendManager::GetMetaData(FieldMap &field_maps) noexcept 
     return persistent_backend_->GetMetaData(field_maps);
 }
 
+ErrorCode MetaStorageBackendManager::AddKeysToLocationIndex(RequestContext *request_context,
+                                                            const std::string &location_id,
+                                                            const KeyVector &keys) noexcept {
+    if (!persistent_backend_) {
+        return EC_ERROR;
+    }
+    return persistent_backend_->AddKeysToLocationIndex(request_context, location_id, keys);
+}
+
+ErrorCode MetaStorageBackendManager::RemoveKeysFromLocationIndex(RequestContext *request_context,
+                                                                 const std::string &location_id,
+                                                                 const KeyVector &keys) noexcept {
+    if (!persistent_backend_) {
+        return EC_ERROR;
+    }
+    return persistent_backend_->RemoveKeysFromLocationIndex(request_context, location_id, keys);
+}
+
+ErrorCode MetaStorageBackendManager::GetKeysByLocationIndex(RequestContext *request_context,
+                                                            const std::string &location_id,
+                                                            KeyVector &out_keys) noexcept {
+    out_keys.clear();
+    if (!persistent_backend_) {
+        return EC_ERROR;
+    }
+    return persistent_backend_->GetKeysByLocationIndex(request_context, location_id, out_keys);
+}
+
 bool MetaStorageBackendManager::Sync(const KeyVector &keys) noexcept {
     if (!persistent_backend_) {
         return true;

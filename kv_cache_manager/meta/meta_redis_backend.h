@@ -81,6 +81,15 @@ public:
     // ----- Metadata APIs -----
     ErrorCode PutMetaData(const FieldMap &field_maps) noexcept override;
     ErrorCode GetMetaData(FieldMap &field_maps) noexcept override;
+    ErrorCode AddKeysToLocationIndex(RequestContext *request_context,
+                                     const std::string &location_id,
+                                     const KeyTypeVec &keys) noexcept override;
+    ErrorCode RemoveKeysFromLocationIndex(RequestContext *request_context,
+                                          const std::string &location_id,
+                                          const KeyTypeVec &keys) noexcept override;
+    ErrorCode GetKeysByLocationIndex(RequestContext *request_context,
+                                     const std::string &location_id,
+                                     KeyTypeVec &out_keys) noexcept override;
 
 private:
     // virtual for test
@@ -92,6 +101,7 @@ private:
     std::string instance_id_;
     std::string cache_key_prefix_;
     std::string metadata_key_;
+    std::string location_index_key_prefix_;
     int64_t timeout_ms_ = 1000;
 };
 } // namespace kv_cache_manager

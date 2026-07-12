@@ -2,6 +2,7 @@
 
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
+#include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/config/meta_storage_backend_config.h"
 #include "kv_cache_manager/meta/common.h"
@@ -27,6 +28,7 @@ ErrorCode MetaRedisBackend::Init(const std::string &instance_id,
     instance_id_ = instance_id;
     cache_key_prefix_ = "kvcache:instance_" + instance_id_ + ":cache_";
     metadata_key_ = "kvcache:instance_" + instance_id_ + ":metadata";
+    location_index_key_prefix_ = "kvcache:instance_" + instance_id_ + ":locidx_";
 
     if (!config) {
         KVCM_LOG_ERROR("fail to init meta redis backend, invalid nullptr config");
@@ -479,6 +481,94 @@ ErrorCode MetaRedisBackend::GetMetaData(FieldMap &out_field_map) noexcept {
         out_field_map = std::move(maps[0]);
     }
     return error_codes[0];
+}
+
+ErrorCode MetaRedisBackend::AddKeysToLocationIndex(RequestContext * /*request_context*/,
+                                                   const std::string &location_id,
+                                                   const KeyTypeVec &keys) noexcept {
+    if (location_id.empty()) {
+        return EC_BADARGS;
+    }
+    if (keys.empty()) {
+        return EC_OK;
+    }
+    auto handle = client_pool_->AcquireClient(timeout_ms_);
+    if (!handle) {
+        KVCM_INTERVAL_LOG_WARN(
+            10, "add location index fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
+        return EC_TIMEOUT;
+    }
+    std::vector<std::string> members;
+    members.reserve(keys.size());
+    for (const auto &key : keys) {
+        members.emplace_back(std::to_string(key));
+    }
+    auto error_codes = handle->SAdd({location_index_key_prefix_ + location_id}, {members});
+    if (error_codes.empty()) {
+        return EC_ERROR;
+    }
+    return error_codes[0];
+}
+
+ErrorCode MetaRedisBackend::RemoveKeysFromLocationIndex(RequestContext * /*request_context*/,
+                                                        const std::string &location_id,
+                                                        const KeyTypeVec &keys) noexcept {
+    if (location_id.empty()) {
+        return EC_BADARGS;
+    }
+    if (keys.empty()) {
+        return EC_OK;
+    }
+    auto handle = client_pool_->AcquireClient(timeout_ms_);
+    if (!handle) {
+        KVCM_INTERVAL_LOG_WARN(
+            10, "remove location index fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
+        return EC_TIMEOUT;
+    }
+    std::vector<std::string> members;
+    members.reserve(keys.size());
+    for (const auto &key : keys) {
+        members.emplace_back(std::to_string(key));
+    }
+    auto error_codes = handle->SRem({location_index_key_prefix_ + location_id}, {members});
+    if (error_codes.empty()) {
+        return EC_ERROR;
+    }
+    return error_codes[0];
+}
+
+ErrorCode MetaRedisBackend::GetKeysByLocationIndex(RequestContext * /*request_context*/,
+                                                   const std::string &location_id,
+                                                   KeyTypeVec &out_keys) noexcept {
+    out_keys.clear();
+    if (location_id.empty()) {
+        return EC_BADARGS;
+    }
+    auto handle = client_pool_->AcquireClient(timeout_ms_);
+    if (!handle) {
+        KVCM_INTERVAL_LOG_WARN(
+            10, "get location index fail, fail to acquire redis client, instance[%s]", instance_id_.c_str());
+        return EC_TIMEOUT;
+    }
+    std::vector<std::string> members;
+    auto ec = handle->SMembers(location_index_key_prefix_ + location_id, members);
+    if (ec != EC_OK) {
+        return ec;
+    }
+    out_keys.reserve(members.size());
+    for (const auto &member : members) {
+        KeyType key = 0;
+        if (!StringUtil::StrToInt64(member.c_str(), key)) {
+            KVCM_LOG_WARN("location index has invalid key member[%s], instance[%s], location_id[%s]",
+                          member.c_str(),
+                          instance_id_.c_str(),
+                          location_id.c_str());
+            out_keys.clear();
+            return EC_CORRUPTION;
+        }
+        out_keys.emplace_back(key);
+    }
+    return EC_OK;
 }
 
 } // namespace kv_cache_manager

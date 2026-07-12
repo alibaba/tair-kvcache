@@ -333,6 +333,44 @@ void RedisClient::BuildHashDeleteCmds(const std::vector<std::string> &keys,
     }
 }
 
+void RedisClient::BuildSetAddCmds(const std::vector<std::string> &keys,
+                                  const std::vector<std::vector<std::string>> &members_vec,
+                                  std::vector<CmdArgs> &out_cmds) {
+    assert(keys.size() == members_vec.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (members_vec[i].empty()) {
+            continue;
+        }
+        CmdArgs sadd_cmd;
+        sadd_cmd.reserve(members_vec[i].size() + 2);
+        sadd_cmd.emplace_back("SADD");
+        sadd_cmd.emplace_back(keys[i]);
+        for (const auto &member : members_vec[i]) {
+            sadd_cmd.emplace_back(member);
+        }
+        out_cmds.emplace_back(std::move(sadd_cmd));
+    }
+}
+
+void RedisClient::BuildSetRemoveCmds(const std::vector<std::string> &keys,
+                                     const std::vector<std::vector<std::string>> &members_vec,
+                                     std::vector<CmdArgs> &out_cmds) {
+    assert(keys.size() == members_vec.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (members_vec[i].empty()) {
+            continue;
+        }
+        CmdArgs srem_cmd;
+        srem_cmd.reserve(members_vec[i].size() + 2);
+        srem_cmd.emplace_back("SREM");
+        srem_cmd.emplace_back(keys[i]);
+        for (const auto &member : members_vec[i]) {
+            srem_cmd.emplace_back(member);
+        }
+        out_cmds.emplace_back(std::move(srem_cmd));
+    }
+}
+
 // cover old key-fields
 std::vector<ErrorCode> RedisClient::Set(const std::vector<std::string> &keys,
                                         const std::vector<std::map<std::string, std::string>> &field_maps) {
@@ -545,6 +583,122 @@ std::vector<ErrorCode> RedisClient::DeleteFields(const std::vector<std::string> 
         }
     }
     return ec_per_key;
+}
+
+std::vector<ErrorCode> RedisClient::SAdd(const std::vector<std::string> &keys,
+                                         const std::vector<std::vector<std::string>> &members_vec) {
+    if (keys.size() != members_vec.size()) {
+        KVCM_REDIS_LOG_ERROR("redis sadd fail, keys.size[%lu] != members_vec.size[%lu]",
+                             keys.size(),
+                             members_vec.size());
+        return std::vector<ErrorCode>(keys.size(), EC_BADARGS);
+    }
+
+    std::vector<size_t> original_indexes;
+    std::vector<ErrorCode> ec_per_key(keys.size(), EC_OK);
+    original_indexes.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (!members_vec[i].empty()) {
+            original_indexes.emplace_back(i);
+        }
+    }
+
+    std::vector<CmdArgs> sadd_cmds;
+    sadd_cmds.reserve(original_indexes.size());
+    BuildSetAddCmds(keys, members_vec, sadd_cmds);
+    if (sadd_cmds.empty()) {
+        return ec_per_key;
+    }
+
+    std::vector<ReplyUPtr> sadd_replies = CommandPipeline(sadd_cmds);
+    if (sadd_cmds.size() != sadd_replies.size()) {
+        KVCM_REDIS_LOG_ERROR("redis sadd fail, pipeline sadd_cmds.size[%lu] != replies.size[%lu]",
+                             sadd_cmds.size(),
+                             sadd_replies.size());
+        return std::vector<ErrorCode>(keys.size(), EC_ERROR);
+    }
+    assert(original_indexes.size() == sadd_replies.size());
+    for (size_t i = 0; i < original_indexes.size(); ++i) {
+        const size_t original_idx = original_indexes[i];
+        const ReplyUPtr &reply = sadd_replies[i];
+        if (!IsReplyOk(reply.get()) || !CheckReplyInteger(reply.get())) {
+            KVCM_REDIS_LOG_ERROR("redis sadd fail, key[%s]", keys[original_idx].c_str());
+            ec_per_key[original_idx] = EC_ERROR;
+        }
+    }
+    return ec_per_key;
+}
+
+std::vector<ErrorCode> RedisClient::SRem(const std::vector<std::string> &keys,
+                                         const std::vector<std::vector<std::string>> &members_vec) {
+    if (keys.size() != members_vec.size()) {
+        KVCM_REDIS_LOG_ERROR("redis srem fail, keys.size[%lu] != members_vec.size[%lu]",
+                             keys.size(),
+                             members_vec.size());
+        return std::vector<ErrorCode>(keys.size(), EC_BADARGS);
+    }
+
+    std::vector<size_t> original_indexes;
+    std::vector<ErrorCode> ec_per_key(keys.size(), EC_OK);
+    original_indexes.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (!members_vec[i].empty()) {
+            original_indexes.emplace_back(i);
+        }
+    }
+
+    std::vector<CmdArgs> srem_cmds;
+    srem_cmds.reserve(original_indexes.size());
+    BuildSetRemoveCmds(keys, members_vec, srem_cmds);
+    if (srem_cmds.empty()) {
+        return ec_per_key;
+    }
+
+    std::vector<ReplyUPtr> srem_replies = CommandPipeline(srem_cmds);
+    if (srem_cmds.size() != srem_replies.size()) {
+        KVCM_REDIS_LOG_ERROR("redis srem fail, pipeline srem_cmds.size[%lu] != replies.size[%lu]",
+                             srem_cmds.size(),
+                             srem_replies.size());
+        return std::vector<ErrorCode>(keys.size(), EC_ERROR);
+    }
+    assert(original_indexes.size() == srem_replies.size());
+    for (size_t i = 0; i < original_indexes.size(); ++i) {
+        const size_t original_idx = original_indexes[i];
+        const ReplyUPtr &reply = srem_replies[i];
+        if (!IsReplyOk(reply.get()) || !CheckReplyInteger(reply.get())) {
+            KVCM_REDIS_LOG_ERROR("redis srem fail, key[%s]", keys[original_idx].c_str());
+            ec_per_key[original_idx] = EC_ERROR;
+        }
+    }
+    return ec_per_key;
+}
+
+ErrorCode RedisClient::SMembers(const std::string &key, std::vector<std::string> &out_members) {
+    out_members.clear();
+    std::vector<CmdArgs> cmds{{"SMEMBERS", key}};
+    std::vector<ReplyUPtr> replies = CommandPipeline(cmds);
+    if (replies.size() != 1) {
+        KVCM_REDIS_LOG_ERROR("redis smembers fail, pipeline replies.size[%lu]", replies.size());
+        return EC_ERROR;
+    }
+    const ReplyUPtr &reply = replies[0];
+    if (!IsReplyOk(reply.get()) || !CheckReplyArray(reply.get())) {
+        KVCM_REDIS_LOG_ERROR("redis smembers fail, key[%s]", key.c_str());
+        return EC_ERROR;
+    }
+    out_members.reserve(reply->elements);
+    for (size_t i = 0; i < reply->elements; ++i) {
+        const redisReply *element = reply->element[i];
+        if (!element || element->type != REDIS_REPLY_STRING) {
+            KVCM_REDIS_LOG_ERROR("redis smembers fail, key[%s] unexpected element type[%d]",
+                                 key.c_str(),
+                                 element ? element->type : -1);
+            out_members.clear();
+            return EC_ERROR;
+        }
+        out_members.emplace_back(element->str, element->len);
+    }
+    return EC_OK;
 }
 
 std::vector<ErrorCode> RedisClient::Get(const std::vector<std::string> &keys,

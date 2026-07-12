@@ -1,6 +1,7 @@
 #include "kv_cache_manager/meta/meta_dummy_backend.h"
 
 #include <cinttypes>
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -54,6 +55,7 @@ ErrorCode MetaDummyBackend::Open() noexcept {
 
     table_.Clear();
     metadata_.clear();
+    location_key_index_.clear();
     if (!enable_persistence_) {
         return ErrorCode::EC_OK;
     }
@@ -109,6 +111,9 @@ ErrorCode MetaDummyBackend::Open() noexcept {
                 auto loc = std::make_shared<CacheLocation>();
                 if (loc->FromJsonString(field_value)) {
                     item.locations[loc_id] = std::move(loc);
+                    if (!loc_id.empty()) {
+                        location_key_index_[loc_id].insert(key);
+                    }
                 }
             } else {
                 item.properties[field_name] = std::move(field_value);
@@ -473,6 +478,66 @@ ErrorCode MetaDummyBackend::GetMetaData(FieldMap &out_field_map) noexcept {
     }
     out_field_map = metadata_;
     return ErrorCode::EC_OK;
+}
+
+ErrorCode MetaDummyBackend::AddKeysToLocationIndex(RequestContext * /*request_context*/,
+                                                   const std::string &location_id,
+                                                   const KeyTypeVec &keys) noexcept {
+    if (location_id.empty()) {
+        return EC_BADARGS;
+    }
+    if (keys.empty()) {
+        return EC_OK;
+    }
+    std::lock_guard<std::mutex> guard(mutex_);
+    auto &indexed_keys = location_key_index_[location_id];
+    for (const auto &key : keys) {
+        indexed_keys.insert(key);
+    }
+    return EC_OK;
+}
+
+ErrorCode MetaDummyBackend::RemoveKeysFromLocationIndex(RequestContext * /*request_context*/,
+                                                        const std::string &location_id,
+                                                        const KeyTypeVec &keys) noexcept {
+    if (location_id.empty()) {
+        return EC_BADARGS;
+    }
+    if (keys.empty()) {
+        return EC_OK;
+    }
+    std::lock_guard<std::mutex> guard(mutex_);
+    auto iter = location_key_index_.find(location_id);
+    if (iter == location_key_index_.end()) {
+        return EC_OK;
+    }
+    for (const auto &key : keys) {
+        iter->second.erase(key);
+    }
+    if (iter->second.empty()) {
+        location_key_index_.erase(iter);
+    }
+    return EC_OK;
+}
+
+ErrorCode MetaDummyBackend::GetKeysByLocationIndex(RequestContext * /*request_context*/,
+                                                   const std::string &location_id,
+                                                   KeyTypeVec &out_keys) noexcept {
+    out_keys.clear();
+    if (location_id.empty()) {
+        return EC_BADARGS;
+    }
+    std::lock_guard<std::mutex> guard(mutex_);
+    auto iter = location_key_index_.find(location_id);
+    if (iter == location_key_index_.end()) {
+        return EC_OK;
+    }
+    out_keys.reserve(iter->second.size());
+    for (const auto &key : iter->second) {
+        out_keys.push_back(key);
+    }
+    std::sort(out_keys.begin(), out_keys.end());
+    return EC_OK;
 }
 
 } // namespace kv_cache_manager

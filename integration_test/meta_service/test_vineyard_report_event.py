@@ -160,6 +160,27 @@ def _ev_block_delete(block_key, medium):
     }
 
 
+def _ev_block_snapshot(medium, blocks):
+    """Build a block_snapshot event.
+
+    Args:
+        blocks: list of (block_key, specs) tuples.
+    """
+    return {
+        "event_type": "EVENT_BLOCK_SNAPSHOT",
+        "block_snapshot": {
+            "medium": medium,
+            "blocks": [
+                {
+                    "block_key": str(block_key),
+                    "specs": specs,
+                }
+                for block_key, specs in blocks
+            ],
+        },
+    }
+
+
 def _ev_host_down():
     return {"event_type": "EVENT_HOST_DOWN", "host_down": {}}
 
@@ -614,6 +635,52 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
         locations2 = resp2.get("locations", [])
         self.assertEqual(len(locations2), 0,
                          "Expected no write locations since 2 replicas already exist")
+
+    # 16. BLOCK_SNAPSHOT reconciles the full block set for one host/medium
+    def test_16_block_snapshot_diff(self):
+        host = "192.168.1.240:8080"
+        medium = "mem"
+        key_deleted = 8101
+        key_kept = 8102
+        key_added = 8103
+        uri_deleted = _build_vineyard_uri(host, medium, {"obj_id": "deleted"})
+        uri_kept = _build_vineyard_uri(host, medium, {"obj_id": "kept"})
+        uri_added = _build_vineyard_uri(host, medium, {"obj_id": "added"})
+
+        def has_uri(block_key, expected_uri):
+            resp = self.client.get_cache_location({
+                "trace_id": f"t16_query_{block_key}",
+                "instance_id": self.instance_id,
+                "query_type": "QT_BATCH_GET",
+                "block_keys": [block_key],
+                "block_mask": {"offset": 0},
+            })
+            for loc in resp.get("locations", []):
+                for spec in loc.get("location_specs", []):
+                    if spec.get("uri") == expected_uri:
+                        return True
+            return False
+
+        self.client.report_event(_make_request(self.instance_id, host, [
+            _ev_node_register([medium]),
+            _ev_block_snapshot(medium, [
+                (key_deleted, _make_single_spec("spec_4096", uri_deleted)),
+                (key_kept, _make_single_spec("spec_4096", uri_kept)),
+            ]),
+        ], trace_id="t16_snapshot_a"))
+        self.assertTrue(has_uri(key_kept, uri_kept))
+
+        self.client.report_event(_make_request(self.instance_id, host, [
+            _ev_block_snapshot(medium, [
+                (key_kept, _make_single_spec("spec_4096", uri_kept)),
+                (key_added, _make_single_spec("spec_4096", uri_added)),
+            ]),
+        ], trace_id="t16_snapshot_b"))
+
+        self.assertFalse(has_uri(key_deleted, uri_deleted),
+                         "Second full snapshot should delete blocks missing from the same host/medium")
+        self.assertTrue(has_uri(key_kept, uri_kept))
+        self.assertTrue(has_uri(key_added, uri_added))
 
     # 16a. Heartbeat timeout -> location filtered out, then recovery on heartbeat resume.
     def test_16a_heartbeat_timeout_then_recovery(self):

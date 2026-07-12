@@ -3,10 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <string>
-#include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
@@ -145,23 +142,18 @@ private:
                                           const KeyVector &keys,
                                           CacheLocationVector &out_locations,
                                           SelectLocationPolicy *policy) const;
-    void AddKeysToLocationIndex(const KeyVector &keys,
+    void AddKeysToLocationIndex(RequestContext *request_context,
+                                const KeyVector &keys,
                                 const LocationIdsPerKey &location_ids_per_key,
-                                const std::vector<ErrorCode> &per_key_ec);
-    void RemoveKeysFromLocationIndex(const KeyVector &keys,
+                                std::vector<ErrorCode> *per_key_ec);
+    void RemoveKeysFromLocationIndex(RequestContext *request_context,
+                                     const KeyVector &keys,
                                      const LocationIdsPerKey &location_ids_per_key,
                                      const std::vector<std::vector<ErrorCode>> &per_location_ec);
-    ErrorCode RebuildLocationKeyIndex(RequestContext *request_context,
-                                      const std::string &location_id,
-                                      size_t scan_batch_size = 1000);
-    void SnapshotLocationKeyIndex(const std::string &location_id, KeyVector &out_keys) const;
 
     std::shared_ptr<MetaIndexer> meta_indexer_;
     CheckLocDataExistFunc check_loc_data_exist_func_;
     SubmitDelReqFunc submit_del_req_func_;
-    mutable std::mutex location_key_index_mutex_;
-    std::unordered_map<std::string, std::unordered_set<KeyType>> location_key_index_;
-    std::unordered_set<std::string> rebuilt_location_key_index_;
 };
 
 } // namespace kv_cache_manager

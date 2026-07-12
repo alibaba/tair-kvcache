@@ -790,6 +790,45 @@ ErrorCode MetaIndexer::SampleReclaimKeys(RequestContext *request_context,
     return ec;
 }
 
+ErrorCode MetaIndexer::AddKeysToLocationIndex(RequestContext *request_context,
+                                              const std::string &location_id,
+                                              const KeyVector &keys) noexcept {
+    if (keys.empty()) {
+        return EC_OK;
+    }
+    if (location_id.empty()) {
+        return EC_BADARGS;
+    }
+    return backend_manager_->AddKeysToLocationIndex(request_context, location_id, keys);
+}
+
+ErrorCode MetaIndexer::RemoveKeysFromLocationIndex(RequestContext *request_context,
+                                                   const std::string &location_id,
+                                                   const KeyVector &keys) noexcept {
+    if (keys.empty()) {
+        return EC_OK;
+    }
+    if (location_id.empty()) {
+        return EC_BADARGS;
+    }
+    return backend_manager_->RemoveKeysFromLocationIndex(request_context, location_id, keys);
+}
+
+ErrorCode MetaIndexer::GetKeysByLocationIndex(RequestContext *request_context,
+                                              const std::string &location_id,
+                                              KeyVector &out_keys) noexcept {
+    out_keys.clear();
+    if (location_id.empty()) {
+        return EC_BADARGS;
+    }
+    auto ec = backend_manager_->GetKeysByLocationIndex(request_context, location_id, out_keys);
+    if (ec == EC_OK) {
+        std::sort(out_keys.begin(), out_keys.end());
+        out_keys.erase(std::unique(out_keys.begin(), out_keys.end()), out_keys.end());
+    }
+    return ec;
+}
+
 size_t MetaIndexer::GetKeyCount() const noexcept { return key_count_.load(); }
 
 size_t MetaIndexer::GetMaxKeyCount() const noexcept { return max_key_count_; }

@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <map>
-#include <mutex>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -36,7 +35,11 @@ void LogErrorCodes(const std::string &operation_name,
 }
 
 bool ShouldRemoveLocationIndexEntry(ErrorCode ec) {
-    return ec == ErrorCode::EC_OK || ec == ErrorCode::EC_NOENT;
+    // Remove the index only after CacheMeta confirms the location was deleted.
+    // If we remove on EC_NOENT, a concurrent add-before-meta write can be
+    // observed as over-index and then turned into under-index when its later
+    // CacheMeta write succeeds.
+    return ec == ErrorCode::EC_OK;
 }
 
 std::uint64_t LocationSpecSize(const std::vector<LocationSpec> &specs) {
@@ -230,28 +233,51 @@ MetaSearcher::MetaSearcher(const std::shared_ptr<MetaIndexer> &meta_indexer,
 
 MetaSearcher::~MetaSearcher() = default;
 
-void MetaSearcher::AddKeysToLocationIndex(const KeyVector &keys,
+void MetaSearcher::AddKeysToLocationIndex(RequestContext *request_context,
+                                          const KeyVector &keys,
                                           const LocationIdsPerKey &location_ids_per_key,
-                                          const std::vector<ErrorCode> &per_key_ec) {
-    if (keys.size() != location_ids_per_key.size()) {
+                                          std::vector<ErrorCode> *per_key_ec) {
+    if (keys.size() != location_ids_per_key.size() || !per_key_ec || per_key_ec->size() != keys.size()) {
         return;
     }
 
-    std::lock_guard<std::mutex> lock(location_key_index_mutex_);
+    std::unordered_map<std::string, KeyVector> keys_by_location;
+    std::unordered_map<std::string, std::vector<size_t>> key_indices_by_location;
     for (size_t i = 0; i < keys.size(); ++i) {
-        if (i >= per_key_ec.size() || per_key_ec[i] != ErrorCode::EC_OK) {
+        if ((*per_key_ec)[i] != ErrorCode::EC_OK) {
             continue;
         }
+        std::unordered_set<std::string> seen_location_ids;
         for (const auto &location_id : location_ids_per_key[i]) {
-            if (location_id.empty()) {
+            if (location_id.empty() || !seen_location_ids.insert(location_id).second) {
                 continue;
             }
-            location_key_index_[location_id].insert(keys[i]);
+            keys_by_location[location_id].push_back(keys[i]);
+            key_indices_by_location[location_id].push_back(i);
+        }
+    }
+
+    for (const auto &kv : keys_by_location) {
+        const std::string &location_id = kv.first;
+        const KeyVector &location_keys = kv.second;
+        ErrorCode ec = meta_indexer_->AddKeysToLocationIndex(request_context, location_id, location_keys);
+        if (ec == ErrorCode::EC_OK) {
+            continue;
+        }
+        KVCM_LOG_WARN("add location index failed, location_id[%s], keys[%zu], ec[%d]",
+                      location_id.c_str(),
+                      location_keys.size(),
+                      ec);
+        for (const auto key_index : key_indices_by_location[location_id]) {
+            if ((*per_key_ec)[key_index] == ErrorCode::EC_OK) {
+                (*per_key_ec)[key_index] = ec;
+            }
         }
     }
 }
 
 void MetaSearcher::RemoveKeysFromLocationIndex(
+    RequestContext *request_context,
     const KeyVector &keys,
     const LocationIdsPerKey &location_ids_per_key,
     const std::vector<std::vector<ErrorCode>> &per_location_ec) {
@@ -259,7 +285,9 @@ void MetaSearcher::RemoveKeysFromLocationIndex(
         return;
     }
 
-    std::lock_guard<std::mutex> lock(location_key_index_mutex_);
+    std::unordered_map<std::string, KeyVector> keys_by_location;
+    KeyVector keys_to_sync;
+    std::unordered_set<KeyType> seen_keys_to_sync;
     for (size_t i = 0; i < keys.size(); ++i) {
         if (i >= per_location_ec.size()) {
             continue;
@@ -272,84 +300,30 @@ void MetaSearcher::RemoveKeysFromLocationIndex(
             if (location_id.empty()) {
                 continue;
             }
-            auto iter = location_key_index_.find(location_id);
-            if (iter == location_key_index_.end()) {
-                continue;
-            }
-            iter->second.erase(keys[i]);
-            if (iter->second.empty()) {
-                location_key_index_.erase(iter);
+            keys_by_location[location_id].push_back(keys[i]);
+            if (seen_keys_to_sync.insert(keys[i]).second) {
+                keys_to_sync.push_back(keys[i]);
             }
         }
     }
-}
-
-void MetaSearcher::SnapshotLocationKeyIndex(const std::string &location_id, KeyVector &out_keys) const {
-    out_keys.clear();
-    std::lock_guard<std::mutex> lock(location_key_index_mutex_);
-    auto iter = location_key_index_.find(location_id);
-    if (iter == location_key_index_.end()) {
+    if (keys_by_location.empty()) {
         return;
     }
-    out_keys.reserve(iter->second.size());
-    for (const auto &key : iter->second) {
-        out_keys.push_back(key);
-    }
-    std::sort(out_keys.begin(), out_keys.end());
-}
 
-ErrorCode MetaSearcher::RebuildLocationKeyIndex(RequestContext *request_context,
-                                                const std::string &location_id,
-                                                size_t scan_batch_size) {
-    if (location_id.empty() || scan_batch_size == 0) {
-        return EC_BADARGS;
+    if (!meta_indexer_->Sync(keys_to_sync)) {
+        KVCM_LOG_WARN("skip location index removal because meta sync failed, keys[%zu]", keys_to_sync.size());
+        return;
     }
 
-    {
-        std::lock_guard<std::mutex> lock(location_key_index_mutex_);
-        if (rebuilt_location_key_index_.find(location_id) != rebuilt_location_key_index_.end()) {
-            return EC_OK;
+    for (const auto &kv : keys_by_location) {
+        ErrorCode ec = meta_indexer_->RemoveKeysFromLocationIndex(request_context, kv.first, kv.second);
+        if (ec != ErrorCode::EC_OK) {
+            KVCM_LOG_WARN("remove location index failed, location_id[%s], keys[%zu], ec[%d]",
+                          kv.first.c_str(),
+                          kv.second.size(),
+                          ec);
         }
     }
-
-    std::unordered_set<KeyType> rebuilt_keys;
-    std::string cursor = "0";
-    do {
-        std::string next_cursor;
-        KeyVector scanned_keys;
-        ErrorCode scan_ec = meta_indexer_->Scan(request_context, cursor, scan_batch_size, next_cursor, scanned_keys);
-        if (scan_ec != EC_OK) {
-            return scan_ec;
-        }
-
-        if (!scanned_keys.empty()) {
-            std::vector<CacheLocationMap> location_maps;
-            BlockMask empty_mask = static_cast<size_t>(0);
-            ErrorCode get_ec = BatchGetLocation(request_context, scanned_keys, empty_mask, location_maps);
-            if (get_ec != EC_OK) {
-                return get_ec;
-            }
-            for (size_t i = 0; i < scanned_keys.size() && i < location_maps.size(); ++i) {
-                if (location_maps[i].find(location_id) != location_maps[i].end()) {
-                    rebuilt_keys.insert(scanned_keys[i]);
-                }
-            }
-        }
-
-        cursor = std::move(next_cursor);
-    } while (!cursor.empty() && cursor != "0");
-
-    std::lock_guard<std::mutex> lock(location_key_index_mutex_);
-    auto current_iter = location_key_index_.find(location_id);
-    if (current_iter != location_key_index_.end()) {
-        rebuilt_keys.insert(current_iter->second.begin(), current_iter->second.end());
-    }
-    location_key_index_[location_id] = std::move(rebuilt_keys);
-    rebuilt_location_key_index_.insert(location_id);
-    if (location_key_index_[location_id].empty()) {
-        location_key_index_.erase(location_id);
-    }
-    return EC_OK;
 }
 
 ErrorCode MetaSearcher::GetKeysByLocationIndex(RequestContext *request_context,
@@ -358,21 +332,7 @@ ErrorCode MetaSearcher::GetKeysByLocationIndex(RequestContext *request_context,
     if (location_id.empty()) {
         return EC_BADARGS;
     }
-
-    bool needs_rebuild = false;
-    {
-        std::lock_guard<std::mutex> lock(location_key_index_mutex_);
-        needs_rebuild = rebuilt_location_key_index_.find(location_id) == rebuilt_location_key_index_.end();
-    }
-    if (needs_rebuild) {
-        ErrorCode rebuild_ec = RebuildLocationKeyIndex(request_context, location_id);
-        if (rebuild_ec != EC_OK) {
-            return rebuild_ec;
-        }
-    }
-
-    SnapshotLocationKeyIndex(location_id, out_keys);
-    return EC_OK;
+    return meta_indexer_->GetKeysByLocationIndex(request_context, location_id, out_keys);
 }
 
 std::string MetaSearcher::BatchErrorCodeToStr(const std::vector<std::vector<ErrorCode>> &batch_results) {
@@ -878,7 +838,8 @@ ErrorCode MetaSearcher::BatchAddLocation(RequestContext *request_context,
     for (size_t i = 0; i < keys.size(); ++i) {
         location_ids_per_key[i].push_back(out_location_ids[i]);
     }
-    AddKeysToLocationIndex(keys, location_ids_per_key, result.error_codes);
+    auto index_ecs = result.error_codes;
+    AddKeysToLocationIndex(request_context, keys, location_ids_per_key, &index_ecs);
 
     if (result.ec != ErrorCode::EC_OK) {
         LogErrorCodes("meta_indexer_->ReadModifyWriteBlock", result.error_codes, keys);
@@ -903,6 +864,19 @@ ErrorCode MetaSearcher::BatchUpsertLocations(RequestContext *request_context,
     if (existing_ec != ErrorCode::EC_OK) {
         return existing_ec;
     }
+    LocationIdsPerKey location_ids_per_key(keys.size());
+    for (size_t i = 0; i < new_locations_per_key.size(); ++i) {
+        std::unordered_set<std::string> seen_location_ids;
+        location_ids_per_key[i].reserve(new_locations_per_key[i].size());
+        for (const auto &entry : new_locations_per_key[i]) {
+            if (entry.location_id.empty() || !seen_location_ids.insert(entry.location_id).second) {
+                continue;
+            }
+            location_ids_per_key[i].push_back(entry.location_id);
+        }
+    }
+    AddKeysToLocationIndex(request_context, keys, location_ids_per_key, &out_per_key_ec);
+
     for (size_t i = 0; i < new_locations_per_key.size(); ++i) {
         if (i >= existing_location_maps.size()) {
             continue;
@@ -922,12 +896,18 @@ ErrorCode MetaSearcher::BatchUpsertLocations(RequestContext *request_context,
 
     const int64_t batch_create_time = TimestampUtil::GetCurrentTimeUs();
 
-    auto modifier = [&new_locations_per_key, &keys, &loc_sz, batch_create_time](
+    auto modifier = [&new_locations_per_key, &keys, &loc_sz, &out_per_key_ec, batch_create_time](
                         const LocationIdVector & /*existing_ids*/,
                         ErrorCode get_ec,
                         size_t index,
                         PropertyMap & /*upsert_property_map*/,
                         CacheLocationMap &out_new_locations) -> ModifierResult {
+        if (index >= out_per_key_ec.size()) {
+            return {ModifierAction::MA_FAIL, ErrorCode::EC_ERROR};
+        }
+        if (out_per_key_ec[index] != ErrorCode::EC_OK) {
+            return {ModifierAction::MA_FAIL, out_per_key_ec[index]};
+        }
         if (get_ec != ErrorCode::EC_OK && get_ec != ErrorCode::EC_NOENT) {
             KVCM_LOG_WARN("load location failed, key[%lu](%lu) return %d", index, keys[index], get_ec);
             return {ModifierAction::MA_FAIL, get_ec};
@@ -977,18 +957,6 @@ ErrorCode MetaSearcher::BatchUpsertLocations(RequestContext *request_context,
             }
         }
     }
-    LocationIdsPerKey location_ids_per_key(keys.size());
-    for (size_t i = 0; i < new_locations_per_key.size(); ++i) {
-        std::unordered_set<std::string> seen_location_ids;
-        location_ids_per_key[i].reserve(new_locations_per_key[i].size());
-        for (const auto &entry : new_locations_per_key[i]) {
-            if (entry.location_id.empty() || !seen_location_ids.insert(entry.location_id).second) {
-                continue;
-            }
-            location_ids_per_key[i].push_back(entry.location_id);
-        }
-    }
-    AddKeysToLocationIndex(keys, location_ids_per_key, out_per_key_ec);
 
     if (result.ec != ErrorCode::EC_OK) {
         LogErrorCodes("meta_indexer_->ReadModifyWriteBlock", result.error_codes, keys);
@@ -1222,7 +1190,7 @@ ErrorCode MetaSearcher::BatchCADLocationStatus(RequestContext *request_context,
             }
         }
     }
-    RemoveKeysFromLocationIndex(keys, location_ids_per_key, out_batch_results);
+    RemoveKeysFromLocationIndex(request_context, keys, location_ids_per_key, out_batch_results);
 
     if (result.ec != ErrorCode::EC_OK) {
         KVCM_LOG_WARN("meta_indexer_->ReadModifyWriteLocation failed, ec: %d", result.ec);
@@ -1316,7 +1284,7 @@ ErrorCode MetaSearcher::BatchDeleteLocation(RequestContext *request_context,
     for (size_t i = 0; i < keys.size(); ++i) {
         per_location_ec[i].push_back(results[i]);
     }
-    RemoveKeysFromLocationIndex(keys, location_ids_per_key, per_location_ec);
+    RemoveKeysFromLocationIndex(request_context, keys, location_ids_per_key, per_location_ec);
 
     if (result.ec != ErrorCode::EC_OK) {
         KVCM_LOG_WARN("meta_indexer_->ReadModifyWriteLocation failed, ec: %d", result.ec);
@@ -1397,7 +1365,7 @@ ErrorCode MetaSearcher::BatchDeleteLocations(RequestContext *request_context,
             }
         }
     }
-    RemoveKeysFromLocationIndex(keys, location_ids_per_key, out_per_location_ec);
+    RemoveKeysFromLocationIndex(request_context, keys, location_ids_per_key, out_per_location_ec);
 
     if (result.ec != ErrorCode::EC_OK) {
         KVCM_LOG_WARN("meta_indexer_->ReadModifyWriteLocation failed, ec: %d", result.ec);

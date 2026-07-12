@@ -106,6 +106,10 @@ ErrorCode MetaLocalBackend::Close() noexcept {
     }
     cache_.reset();
     cache_item_helper_.reset();
+    {
+        std::lock_guard<std::mutex> lock(location_key_index_mutex_);
+        location_key_index_.clear();
+    }
     KVCM_LOG_INFO("local backend close ok");
     return EC_OK;
 }
@@ -665,6 +669,66 @@ ErrorCode MetaLocalBackend::SampleReclaimKeys(RequestContext * /*request_context
 ErrorCode MetaLocalBackend::PutMetaData(const FieldMap & /*field_maps*/) noexcept { return EC_OK; }
 
 ErrorCode MetaLocalBackend::GetMetaData(FieldMap & /*field_maps*/) noexcept { return EC_NOENT; }
+
+ErrorCode MetaLocalBackend::AddKeysToLocationIndex(RequestContext * /*request_context*/,
+                                                   const std::string &location_id,
+                                                   const KeyTypeVec &keys) noexcept {
+    if (location_id.empty()) {
+        return EC_BADARGS;
+    }
+    if (keys.empty()) {
+        return EC_OK;
+    }
+    std::lock_guard<std::mutex> lock(location_key_index_mutex_);
+    auto &indexed_keys = location_key_index_[location_id];
+    for (const auto &key : keys) {
+        indexed_keys.insert(key);
+    }
+    return EC_OK;
+}
+
+ErrorCode MetaLocalBackend::RemoveKeysFromLocationIndex(RequestContext * /*request_context*/,
+                                                        const std::string &location_id,
+                                                        const KeyTypeVec &keys) noexcept {
+    if (location_id.empty()) {
+        return EC_BADARGS;
+    }
+    if (keys.empty()) {
+        return EC_OK;
+    }
+    std::lock_guard<std::mutex> lock(location_key_index_mutex_);
+    auto iter = location_key_index_.find(location_id);
+    if (iter == location_key_index_.end()) {
+        return EC_OK;
+    }
+    for (const auto &key : keys) {
+        iter->second.erase(key);
+    }
+    if (iter->second.empty()) {
+        location_key_index_.erase(iter);
+    }
+    return EC_OK;
+}
+
+ErrorCode MetaLocalBackend::GetKeysByLocationIndex(RequestContext * /*request_context*/,
+                                                   const std::string &location_id,
+                                                   KeyTypeVec &out_keys) noexcept {
+    out_keys.clear();
+    if (location_id.empty()) {
+        return EC_BADARGS;
+    }
+    std::lock_guard<std::mutex> lock(location_key_index_mutex_);
+    auto iter = location_key_index_.find(location_id);
+    if (iter == location_key_index_.end()) {
+        return EC_OK;
+    }
+    out_keys.reserve(iter->second.size());
+    for (const auto &key : iter->second) {
+        out_keys.push_back(key);
+    }
+    std::sort(out_keys.begin(), out_keys.end());
+    return EC_OK;
+}
 
 size_t MetaLocalBackend::GetMemUsage() const noexcept { return cache_->GetUsage(); }
 

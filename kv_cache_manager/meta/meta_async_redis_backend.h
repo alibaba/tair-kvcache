@@ -77,6 +77,15 @@ public:
     // ----- MetaData (sync passthrough) -----
     ErrorCode PutMetaData(const FieldMap &field_maps) noexcept override;
     ErrorCode GetMetaData(FieldMap &field_maps) noexcept override;
+    ErrorCode AddKeysToLocationIndex(RequestContext *request_context,
+                                     const std::string &location_id,
+                                     const KeyTypeVec &keys) noexcept override;
+    ErrorCode RemoveKeysFromLocationIndex(RequestContext *request_context,
+                                          const std::string &location_id,
+                                          const KeyTypeVec &keys) noexcept override;
+    ErrorCode GetKeysByLocationIndex(RequestContext *request_context,
+                                     const std::string &location_id,
+                                     KeyTypeVec &out_keys) noexcept override;
 
     // ----- Sync -----
     bool Sync(const KeyTypeVec &keys) noexcept override;
@@ -104,6 +113,7 @@ private:
     std::string instance_id_;
     std::string cache_key_prefix_;
     std::string metadata_key_;
+    std::string location_index_key_prefix_;
     int64_t timeout_ms_ = 2000;
 
     // Async config

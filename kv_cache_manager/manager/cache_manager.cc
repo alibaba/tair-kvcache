@@ -1751,8 +1751,8 @@ void CacheManager::ApplyReportEventSnapshot(RequestContext *request_context,
     }
 
     const std::string &trace_id = request_context->trace_id();
-    KeyVector existing_keys;
-    auto list_ec = meta_searcher->GetKeysByLocationIndex(request_context, snapshot.location_id, existing_keys);
+    KeyVector indexed_keys;
+    auto list_ec = meta_searcher->GetKeysByLocationIndex(request_context, snapshot.location_id, indexed_keys);
     if (list_ec != EC_OK) {
         KVCM_LOG_WARN("trace_id [%s] | EVENT_BLOCK_SNAPSHOT: get keys by location index failed, loc[%s], ec[%d]",
                       trace_id.c_str(),
@@ -1760,6 +1760,35 @@ void CacheManager::ApplyReportEventSnapshot(RequestContext *request_context,
                       static_cast<int32_t>(list_ec));
         state->per_item_ec[snapshot.event_index] = list_ec;
         return;
+    }
+
+    KeyVector existing_keys;
+    size_t stale_index_key_count = 0;
+    if (!indexed_keys.empty()) {
+        std::vector<CacheLocationMap> indexed_location_maps;
+        BlockMask bm = static_cast<size_t>(0);
+        auto get_ec = meta_searcher->BatchGetLocation(request_context, indexed_keys, bm, indexed_location_maps);
+        if (get_ec != EC_OK) {
+            state->per_item_ec[snapshot.event_index] = get_ec;
+            return;
+        }
+        existing_keys.reserve(indexed_keys.size());
+        for (size_t i = 0; i < indexed_keys.size(); ++i) {
+            const CacheLocationMap *location_map =
+                (i < indexed_location_maps.size()) ? &indexed_location_maps[i] : nullptr;
+            if (!location_map) {
+                ++stale_index_key_count;
+                continue;
+            }
+            auto iter = location_map->find(snapshot.location_id);
+            if (iter != location_map->end() && iter->second &&
+                iter->second->type() == event_backend->GetStorageType() &&
+                iter->second->status() == CacheLocationStatus::CLS_SERVING) {
+                existing_keys.push_back(indexed_keys[i]);
+            } else {
+                ++stale_index_key_count;
+            }
+        }
     }
 
     std::unordered_set<int64_t> reported_key_set;
@@ -1856,12 +1885,13 @@ void CacheManager::ApplyReportEventSnapshot(RequestContext *request_context,
 
     if (state->per_item_ec[snapshot.event_index] == EC_OK) {
         KVCM_LOG_INFO("trace_id [%s] | EVENT_BLOCK_SNAPSHOT: reconciled loc[%s], reported[%zu], upsert[%zu], "
-                      "delete[%zu]",
+                      "delete[%zu], stale_index[%zu]",
                       trace_id.c_str(),
                       snapshot.location_id.c_str(),
                       snapshot.blocks.size(),
                       upsert_keys.size(),
-                      del_keys.size());
+                      del_keys.size(),
+                      stale_index_key_count);
     }
 }
 

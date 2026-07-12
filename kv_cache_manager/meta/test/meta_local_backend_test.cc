@@ -90,6 +90,34 @@ TEST_F(MetaLocalBackendTest, TestSimple) {
     ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
 }
 
+TEST_F(MetaLocalBackendTest, TestLocationIndex) {
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Init("test_instance_location_index", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Open());
+
+    MetaStorageBackend::KeyTypeVec indexed_keys;
+    ASSERT_EQ(EC_BADARGS, meta_storage_backend_->AddKeysToLocationIndex(nullptr, "", {1}));
+    ASSERT_EQ(EC_BADARGS, meta_storage_backend_->RemoveKeysFromLocationIndex(nullptr, "", {1}));
+    ASSERT_EQ(EC_BADARGS, meta_storage_backend_->GetKeysByLocationIndex(nullptr, "", indexed_keys));
+
+    ASSERT_EQ(EC_OK, meta_storage_backend_->AddKeysToLocationIndex(nullptr, "loc_a", {3, 1, 1}));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->AddKeysToLocationIndex(nullptr, "loc_b", {2}));
+
+    ASSERT_EQ(EC_OK, meta_storage_backend_->GetKeysByLocationIndex(nullptr, "loc_a", indexed_keys));
+    ASSERT_EQ((MetaStorageBackend::KeyTypeVec{1, 3}), indexed_keys);
+    ASSERT_EQ(EC_OK, meta_storage_backend_->GetKeysByLocationIndex(nullptr, "loc_b", indexed_keys));
+    ASSERT_EQ((MetaStorageBackend::KeyTypeVec{2}), indexed_keys);
+
+    ASSERT_EQ(EC_OK, meta_storage_backend_->RemoveKeysFromLocationIndex(nullptr, "loc_a", {1, 100}));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->GetKeysByLocationIndex(nullptr, "loc_a", indexed_keys));
+    ASSERT_EQ((MetaStorageBackend::KeyTypeVec{3}), indexed_keys);
+
+    ASSERT_EQ(EC_OK, meta_storage_backend_->RemoveKeysFromLocationIndex(nullptr, "loc_a", {3}));
+    ASSERT_EQ(EC_OK, meta_storage_backend_->GetKeysByLocationIndex(nullptr, "loc_a", indexed_keys));
+    ASSERT_TRUE(indexed_keys.empty());
+
+    ASSERT_EQ(EC_OK, meta_storage_backend_->Close());
+}
+
 TEST_F(MetaLocalBackendTest, TestInit) {
     // invalid config
     ASSERT_EQ(EC_BADARGS, meta_storage_backend_->Init("test_instance_0", /*config*/ nullptr));

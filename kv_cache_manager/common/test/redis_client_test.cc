@@ -903,6 +903,88 @@ TEST_F(RedisClientTest, TestBuildHashDeleteCmdsEmpty) {
     ASSERT_TRUE(cmds.empty());
 }
 
+TEST_F(RedisClientTest, TestSetIndexCommands) {
+    EXPECT_CALL(*redis_client_, IsContextOk()).WillRepeatedly(Return(true));
+
+    std::vector<ReplyUPtr> sadd_replies;
+    sadd_replies.emplace_back(MakeFakeReplyInteger(2));
+    sadd_replies.emplace_back(MakeFakeReplyInteger(1));
+    EXPECT_CALL(*redis_client_,
+                TryExecPipeline(ElementsAre(ElementsAre(StrEq("SADD"), StrEq("idx_a"), StrEq("11"), StrEq("12")),
+                                            ElementsAre(StrEq("SADD"), StrEq("idx_c"), StrEq("13")))))
+        .WillOnce(Return(ByMove(std::move(sadd_replies))));
+    auto sadd_ecs = redis_client_->SAdd({"idx_a", "idx_b", "idx_c"}, {{"11", "12"}, {}, {"13"}});
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}), sadd_ecs);
+
+    std::vector<ReplyUPtr> srem_replies;
+    srem_replies.emplace_back(MakeFakeReplyInteger(1));
+    EXPECT_CALL(*redis_client_,
+                TryExecPipeline(ElementsAre(ElementsAre(StrEq("SREM"), StrEq("idx_a"), StrEq("11")))))
+        .WillOnce(Return(ByMove(std::move(srem_replies))));
+    auto srem_ecs = redis_client_->SRem({"idx_a", "idx_b"}, {{"11"}, {}});
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), srem_ecs);
+
+    std::vector<ReplyUPtr> smembers_replies;
+    smembers_replies.emplace_back(MakeFakeReplyArrayString({"11", "12"}));
+    EXPECT_CALL(*redis_client_, TryExecPipeline(ElementsAre(ElementsAre(StrEq("SMEMBERS"), StrEq("idx_a")))))
+        .WillOnce(Return(ByMove(std::move(smembers_replies))));
+    std::vector<std::string> members;
+    ASSERT_EQ(EC_OK, redis_client_->SMembers("idx_a", members));
+    ASSERT_EQ((std::vector<std::string>{"11", "12"}), members);
+}
+
+TEST_F(RedisClientTest, TestSetIndexCommandErrors) {
+    EXPECT_CALL(*redis_client_, IsContextOk()).WillRepeatedly(Return(true));
+
+    ASSERT_EQ((std::vector<ErrorCode>{EC_BADARGS}), redis_client_->SAdd({"idx_a"}, {}));
+    ASSERT_EQ((std::vector<ErrorCode>{EC_BADARGS}), redis_client_->SRem({"idx_a"}, {}));
+
+    std::vector<ReplyUPtr> sadd_replies;
+    sadd_replies.emplace_back(MakeFakeReplyInteger(-1));
+    sadd_replies.emplace_back(MakeFakeReplyInteger(1));
+    EXPECT_CALL(*redis_client_,
+                TryExecPipeline(ElementsAre(ElementsAre(StrEq("SADD"), StrEq("idx_a"), StrEq("11")),
+                                            ElementsAre(StrEq("SADD"), StrEq("idx_c"), StrEq("13")))))
+        .WillOnce(Return(ByMove(std::move(sadd_replies))));
+    auto sadd_ecs = redis_client_->SAdd({"idx_a", "idx_b", "idx_c"}, {{"11"}, {}, {"13"}});
+    ASSERT_EQ((std::vector<ErrorCode>{EC_ERROR, EC_OK, EC_OK}), sadd_ecs);
+
+    std::vector<ReplyUPtr> srem_replies;
+    srem_replies.emplace_back(MakeFakeReplyInteger(1));
+    srem_replies.emplace_back(MakeFakeReply(REDIS_REPLY_ERROR, "ERR"));
+    EXPECT_CALL(*redis_client_,
+                TryExecPipeline(ElementsAre(ElementsAre(StrEq("SREM"), StrEq("idx_a"), StrEq("11")),
+                                            ElementsAre(StrEq("SREM"), StrEq("idx_c"), StrEq("13")))))
+        .WillOnce(Return(ByMove(std::move(srem_replies))));
+    auto srem_ecs = redis_client_->SRem({"idx_a", "idx_b", "idx_c"}, {{"11"}, {}, {"13"}});
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_ERROR}), srem_ecs);
+
+    std::vector<ReplyUPtr> smembers_replies;
+    smembers_replies.emplace_back(MakeFakeReplyArrayString({"11", std::nullopt}));
+    EXPECT_CALL(*redis_client_, TryExecPipeline(ElementsAre(ElementsAre(StrEq("SMEMBERS"), StrEq("idx_a")))))
+        .WillOnce(Return(ByMove(std::move(smembers_replies))));
+    std::vector<std::string> members;
+    ASSERT_EQ(EC_ERROR, redis_client_->SMembers("idx_a", members));
+    ASSERT_TRUE(members.empty());
+}
+
+TEST_F(RedisClientTest, TestBuildSetIndexCmds) {
+    std::vector<std::string> keys = {"idx_a", "idx_b", "idx_c"};
+    std::vector<std::vector<std::string>> members = {{"11", "12"}, {}, {"13"}};
+
+    std::vector<CmdArgs> sadd_cmds;
+    RedisClient::BuildSetAddCmds(keys, members, sadd_cmds);
+    ASSERT_EQ(2, sadd_cmds.size());
+    ASSERT_EQ(CmdArgs({"SADD", "idx_a", "11", "12"}), sadd_cmds[0]);
+    ASSERT_EQ(CmdArgs({"SADD", "idx_c", "13"}), sadd_cmds[1]);
+
+    std::vector<CmdArgs> srem_cmds;
+    RedisClient::BuildSetRemoveCmds(keys, members, srem_cmds);
+    ASSERT_EQ(2, srem_cmds.size());
+    ASSERT_EQ(CmdArgs({"SREM", "idx_a", "11", "12"}), srem_cmds[0]);
+    ASSERT_EQ(CmdArgs({"SREM", "idx_c", "13"}), srem_cmds[1]);
+}
+
 TEST_F(RedisClientTest, TestBuildCmdsAppendToExisting) {
     std::vector<CmdArgs> cmds;
     cmds.push_back({"EXISTING_CMD"});

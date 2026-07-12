@@ -103,6 +103,60 @@ TEST_F(MetaDummyBackendTest, TestSimple) {
     ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Close());
 }
 
+TEST_F(MetaDummyBackendTest, TestLocationIndexRebuildsFromPersistentCacheMeta) {
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_storage_backend_->Init("test_instance_location_index_rebuild", meta_storage_backend_config_));
+    ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Open());
+
+    const std::string loc_a = "kvs#v6d#mem#host_a:8080";
+    const std::string loc_b = "kvs#v6d#mem#host_b:8080";
+
+    CacheLocationMapVector locations(2);
+    locations[0][loc_a] = std::make_shared<CacheLocation>(loc_a,
+                                                          CLS_SERVING,
+                                                          DataStorageType::DATA_STORAGE_TYPE_VINEYARD,
+                                                          1,
+                                                          std::vector<LocationSpec>{
+                                                              LocationSpec("tp0", "v6d://host_a:8080/11")});
+    locations[0][loc_b] = std::make_shared<CacheLocation>(loc_b,
+                                                          CLS_SERVING,
+                                                          DataStorageType::DATA_STORAGE_TYPE_VINEYARD,
+                                                          1,
+                                                          std::vector<LocationSpec>{
+                                                              LocationSpec("tp0", "v6d://host_b:8080/11")});
+    locations[1][loc_a] = std::make_shared<CacheLocation>(loc_a,
+                                                          CLS_SERVING,
+                                                          DataStorageType::DATA_STORAGE_TYPE_VINEYARD,
+                                                          1,
+                                                          std::vector<LocationSpec>{
+                                                              LocationSpec("tp0", "v6d://host_a:8080/12")});
+    PropertyMapVector properties(2);
+    ASSERT_EQ((std::vector<ErrorCode>{ErrorCode::EC_OK, ErrorCode::EC_OK}),
+              meta_storage_backend_->Put(nullptr, {11, 12}, locations, properties));
+
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_storage_backend_->AddKeysToLocationIndex(nullptr, loc_a, {11, 12, 999}));
+    ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->AddKeysToLocationIndex(nullptr, loc_b, {11}));
+
+    MetaStorageBackend::KeyTypeVec indexed_keys;
+    ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->GetKeysByLocationIndex(nullptr, loc_a, indexed_keys));
+    ASSERT_EQ((MetaStorageBackend::KeyTypeVec{11, 12, 999}), indexed_keys);
+
+    ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Close());
+
+    ConstructMetaStorageBackend();
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_storage_backend_->Init("test_instance_location_index_rebuild", meta_storage_backend_config_));
+    ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Open());
+
+    ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->GetKeysByLocationIndex(nullptr, loc_a, indexed_keys));
+    ASSERT_EQ((MetaStorageBackend::KeyTypeVec{11, 12}), indexed_keys);
+    ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->GetKeysByLocationIndex(nullptr, loc_b, indexed_keys));
+    ASSERT_EQ((MetaStorageBackend::KeyTypeVec{11}), indexed_keys);
+
+    ASSERT_EQ(ErrorCode::EC_OK, meta_storage_backend_->Close());
+}
+
 TEST_F(MetaDummyBackendTest, TestInit) {
     // invalid config
     ASSERT_NE(ErrorCode::EC_OK, meta_storage_backend_->Init("test_instance_0", /*config*/ nullptr));

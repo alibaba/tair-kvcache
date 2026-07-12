@@ -4,10 +4,13 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <shared_mutex>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "kv_cache_manager/common/cache/advanced_cache.h"
@@ -167,6 +170,15 @@ public:
     // meta data
     ErrorCode PutMetaData(const FieldMap &field_maps) noexcept override;
     ErrorCode GetMetaData(FieldMap &field_maps) noexcept override;
+    ErrorCode AddKeysToLocationIndex(RequestContext *request_context,
+                                     const std::string &location_id,
+                                     const KeyTypeVec &keys) noexcept override;
+    ErrorCode RemoveKeysFromLocationIndex(RequestContext *request_context,
+                                          const std::string &location_id,
+                                          const KeyTypeVec &keys) noexcept override;
+    ErrorCode GetKeysByLocationIndex(RequestContext *request_context,
+                                     const std::string &location_id,
+                                     KeyTypeVec &out_keys) noexcept override;
 
     size_t GetMemUsage() const noexcept override;
     int64_t GetOldestAccessTime() const noexcept override;
@@ -209,6 +221,8 @@ private:
     uint32_t shard_mask_ = 0;
     size_t sample_times_ = 0;
     std::shared_ptr<RevisitIntervalHistogram> revisit_histogram_;
+    mutable std::mutex location_key_index_mutex_;
+    std::unordered_map<std::string, std::unordered_set<KeyType>> location_key_index_;
 };
 
 } // namespace kv_cache_manager

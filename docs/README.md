@@ -3,6 +3,7 @@
 ### 设计文档
 - [模块架构与关联关系](design/module_architecture.md) - 各模块职责、依赖方向、控制流与数据流，附 Mermaid 图
 - [基本概念](design/basic_concepts.md) - Storage、Instance Group、Instance、Block、CacheLocation 等核心概念
+- [ReportEvent 元数据一致性与 Location 索引设计](design/report_event_metadata_consistency.md) - Subscriber 上报、CacheMeta 持久化、location 反向索引与不一致处理
 - [高可用与选主机制](design/ha_leader_elector.md) - HA 架构、LeaderElector 状态机、CoordinationBackend、Leader 发现
 
 ### 开发文档

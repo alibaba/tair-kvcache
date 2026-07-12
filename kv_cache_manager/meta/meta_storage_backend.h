@@ -244,6 +244,34 @@ public:
     // @return EC_OK 成功；EC_NOENT 无元数据；EC_ERROR 读取失败
     virtual ErrorCode GetMetaData(FieldMap &field_maps) noexcept = 0;
 
+    // =====================================================================
+    // Location Index APIs — derived secondary index for snapshot diff
+    // =====================================================================
+
+    // Add keys to the persistent secondary index:
+    //   location_id -> set(block_key)
+    // This index is not the source of truth. CacheMeta remains authoritative.
+    virtual ErrorCode AddKeysToLocationIndex(RequestContext * /*request_context*/,
+                                             const std::string & /*location_id*/,
+                                             const KeyTypeVec & /*keys*/) noexcept {
+        return EC_UNIMPLEMENTED;
+    }
+
+    // Remove keys from the persistent secondary index. Idempotent.
+    virtual ErrorCode RemoveKeysFromLocationIndex(RequestContext * /*request_context*/,
+                                                  const std::string & /*location_id*/,
+                                                  const KeyTypeVec & /*keys*/) noexcept {
+        return EC_UNIMPLEMENTED;
+    }
+
+    // Read candidate block keys from the persistent secondary index.
+    // Callers must verify every candidate against CacheMeta before using it.
+    virtual ErrorCode GetKeysByLocationIndex(RequestContext * /*request_context*/,
+                                             const std::string & /*location_id*/,
+                                             KeyTypeVec & /*out_keys*/) noexcept {
+        return EC_UNIMPLEMENTED;
+    }
+
     // Synchronously flush pending writes for the given keys.
     // Returns true if all writes persisted successfully, false on failure/timeout.
     // Default: no-op (sync backends have no pending writes).

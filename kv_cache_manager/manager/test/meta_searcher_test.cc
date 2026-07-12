@@ -185,7 +185,7 @@ TEST_F(MetaSearcherTest, TestLocationKeyIndexMaintainedByLocationMutations) {
     EXPECT_EQ((MetaSearcher::KeyVector{14}), indexed_keys);
 }
 
-TEST_F(MetaSearcherTest, TestLocationKeyIndexRebuildsFromMetaIndexer) {
+TEST_F(MetaSearcherTest, TestLocationKeyIndexPersistsAcrossSearcherInstances) {
     const std::string loc_a = "kvs#v6d#mem#host_a:8080";
     const std::string loc_b = "kvs#v6d#mem#host_b:8080";
 

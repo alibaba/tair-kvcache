@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <map>
@@ -313,6 +314,17 @@ public:
     bool HasLocation(int64_t key, const std::string &location_id) {
         auto location_map = GetLocationMapForKey(key);
         return location_map.find(location_id) != location_map.end();
+    }
+
+    MetaSearcher::KeyVector GetLocationIndexKeys(const std::string &location_id) {
+        auto *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+        EXPECT_NE(nullptr, meta_searcher);
+        MetaSearcher::KeyVector keys;
+        if (!meta_searcher) {
+            return keys;
+        }
+        EXPECT_EQ(EC_OK, meta_searcher->GetKeysByLocationIndex(request_context_.get(), location_id, keys));
+        return keys;
     }
 
     std::string GetFirstSpecUri(int64_t key, const std::string &location_id) {
@@ -3216,6 +3228,47 @@ TEST_F(CacheManagerTest, TestReportEventBlockSnapshotEmptySnapshotDeletesOnlyTar
     EXPECT_FALSE(HasLocation(300, loc_a));
     EXPECT_FALSE(HasLocation(400, loc_a));
     EXPECT_TRUE(HasLocation(300, loc_b));
+}
+
+TEST_F(CacheManagerTest, TestReportEventBlockSnapshotFiltersStaleLocationIndex) {
+    RegisterDefaultInstanceForReportEvent();
+    SetupVineyardEventReportingBackend();
+
+    const std::string host = "192.168.2.1:8080";
+    const std::string location_id = ExpectedReportEventLocationId(host, "mem");
+
+    ReportBlockSnapshot(host, "mem", {300}, true);
+    ASSERT_TRUE(HasLocation(300, location_id));
+
+    auto meta_indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer("test_instance");
+    ASSERT_NE(nullptr, meta_indexer);
+    ASSERT_EQ(EC_OK, meta_indexer->AddKeysToLocationIndex(request_context_.get(), location_id, {777}));
+    EXPECT_FALSE(HasLocation(777, location_id));
+
+    auto *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    ASSERT_NE(nullptr, meta_searcher);
+    std::vector<std::vector<MetaSearcher::UpsertLocation>> mismatched_locations = {
+        {{location_id,
+          DataStorageType::DATA_STORAGE_TYPE_NFS,
+          CLS_SERVING,
+          {LocationSpec("tp0", "file:///tmp/not-vineyard")}}},
+    };
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(EC_OK,
+              meta_searcher->BatchUpsertLocations(request_context_.get(), {778}, mismatched_locations, per_key_ec));
+    ASSERT_EQ(1, per_key_ec.size());
+    ASSERT_EQ(EC_OK, per_key_ec[0]);
+    ASSERT_TRUE(HasLocation(778, location_id));
+
+    ReportBlockSnapshot(host, "mem", {});
+    EXPECT_FALSE(HasLocation(300, location_id));
+    EXPECT_FALSE(HasLocation(777, location_id));
+    EXPECT_TRUE(HasLocation(778, location_id));
+
+    auto indexed_keys = GetLocationIndexKeys(location_id);
+    EXPECT_EQ(indexed_keys.end(), std::find(indexed_keys.begin(), indexed_keys.end(), 300));
+    EXPECT_NE(indexed_keys.end(), std::find(indexed_keys.begin(), indexed_keys.end(), 777));
+    EXPECT_NE(indexed_keys.end(), std::find(indexed_keys.begin(), indexed_keys.end(), 778));
 }
 
 TEST_F(CacheManagerTest, TestReportEventBlockSnapshotDoesNotTouchOtherMedium) {

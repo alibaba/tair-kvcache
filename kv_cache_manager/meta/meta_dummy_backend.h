@@ -4,6 +4,8 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "kv_cache_manager/common/concurrent_hash_map.h"
@@ -104,6 +106,15 @@ public:
 
     ErrorCode PutMetaData(const FieldMap &field_map) noexcept override;
     ErrorCode GetMetaData(FieldMap &out_field_map) noexcept override;
+    ErrorCode AddKeysToLocationIndex(RequestContext *request_context,
+                                     const std::string &location_id,
+                                     const KeyTypeVec &keys) noexcept override;
+    ErrorCode RemoveKeysFromLocationIndex(RequestContext *request_context,
+                                          const std::string &location_id,
+                                          const KeyTypeVec &keys) noexcept override;
+    ErrorCode GetKeysByLocationIndex(RequestContext *request_context,
+                                     const std::string &location_id,
+                                     KeyTypeVec &out_keys) noexcept override;
 
 private:
     ErrorCode PersistToPath();
@@ -111,6 +122,7 @@ private:
     std::mutex mutex_;
     ConcurrentHashMap<KeyType, DummyItem> table_;
     FieldMap metadata_;
+    std::unordered_map<std::string, std::unordered_set<KeyType>> location_key_index_;
     std::string path_;
     bool enable_persistence_ = false;
 };

@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <thread>
 
 #include "kv_cache_manager/common/redis_client.h"
@@ -133,6 +134,56 @@ TEST_F(MetaRedisBackendTest, TestOpenAndClose) {
         ASSERT_EQ(EC_OK, meta_redis_backend_->Init("instance_0", meta_storage_backend_config_));
         ASSERT_EQ(EC_ERROR, meta_redis_backend_->Open());
     }
+}
+
+TEST_F(MetaRedisBackendTest, TestLocationIndex) {
+    EXPECT_CALL(*meta_redis_backend_, CreateRedisClient()).WillRepeatedly(Invoke([]() {
+        StandardUri empty_storage_uri;
+        auto mock_redis_client = std::make_unique<MockRedisClient>(empty_storage_uri);
+        EXPECT_CALL(*mock_redis_client, Reconnect()).WillRepeatedly(Return(true));
+        EXPECT_CALL(*mock_redis_client, IsContextOk()).WillRepeatedly(Return(true));
+
+        std::vector<ReplyUPtr> sadd_replies;
+        sadd_replies.emplace_back(MakeFakeReplyInteger(2));
+        EXPECT_CALL(*mock_redis_client,
+                    TryExecPipeline(ElementsAre(ElementsAre(StrEq("SADD"),
+                                                            StrEq("kvcache:instance_instance_0:locidx_loc_a"),
+                                                            StrEq("11"),
+                                                            StrEq("12")))))
+            .WillOnce(Return(ByMove(std::move(sadd_replies))));
+
+        std::vector<ReplyUPtr> smembers_replies;
+        smembers_replies.emplace_back(MakeFakeReplyArrayString({"12", "11"}));
+        EXPECT_CALL(*mock_redis_client,
+                    TryExecPipeline(ElementsAre(
+                        ElementsAre(StrEq("SMEMBERS"), StrEq("kvcache:instance_instance_0:locidx_loc_a")))))
+            .WillOnce(Return(ByMove(std::move(smembers_replies))));
+
+        std::vector<ReplyUPtr> srem_replies;
+        srem_replies.emplace_back(MakeFakeReplyInteger(1));
+        EXPECT_CALL(*mock_redis_client,
+                    TryExecPipeline(ElementsAre(ElementsAre(StrEq("SREM"),
+                                                            StrEq("kvcache:instance_instance_0:locidx_loc_a"),
+                                                            StrEq("11")))))
+            .WillOnce(Return(ByMove(std::move(srem_replies))));
+        return mock_redis_client;
+    }));
+
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Init("instance_0", meta_storage_backend_config_));
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Open());
+
+    ASSERT_EQ(EC_BADARGS,
+              meta_redis_backend_->AddKeysToLocationIndex(nullptr, "", MetaStorageBackend::KeyTypeVec{11}));
+    ASSERT_EQ(EC_OK,
+              meta_redis_backend_->AddKeysToLocationIndex(nullptr, "loc_a", MetaStorageBackend::KeyTypeVec{11, 12}));
+
+    MetaStorageBackend::KeyTypeVec keys;
+    ASSERT_EQ(EC_OK, meta_redis_backend_->GetKeysByLocationIndex(nullptr, "loc_a", keys));
+    std::sort(keys.begin(), keys.end());
+    ASSERT_EQ((MetaStorageBackend::KeyTypeVec{11, 12}), keys);
+
+    ASSERT_EQ(EC_OK, meta_redis_backend_->RemoveKeysFromLocationIndex(nullptr, "loc_a", {11}));
+    ASSERT_EQ(EC_OK, meta_redis_backend_->Close());
 }
 
 TEST_F(MetaRedisBackendTest, TestSimple) {
