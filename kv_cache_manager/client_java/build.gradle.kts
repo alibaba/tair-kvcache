@@ -27,14 +27,14 @@ tasks.withType<JavaCompile> {
 }
 
 dependencies {
-    // gRPC
-    implementation("io.grpc:grpc-protobuf:${grpcVersion}")
-    implementation("io.grpc:grpc-stub:${grpcVersion}")
+    // gRPC (api: generated stubs expose GeneratedMessageV3 / MessageOrBuilder to consumers)
+    api("io.grpc:grpc-protobuf:${grpcVersion}")
+    api("io.grpc:grpc-stub:${grpcVersion}")
     implementation("io.grpc:grpc-netty-shaded:${grpcVersion}")
 
-    // Protobuf
-    implementation("com.google.protobuf:protobuf-java:${protobufVersion}")
-    implementation("com.google.protobuf:protobuf-java-util:${protobufVersion}")
+    // Protobuf (api: generated messages expose protobuf supertypes/builders to consumers)
+    api("com.google.protobuf:protobuf-java:${protobufVersion}")
+    api("com.google.protobuf:protobuf-java-util:${protobufVersion}")
 
     // javax.annotation for @Generated (required by gRPC stubs)
     compileOnly("javax.annotation:javax.annotation-api:1.3.2")

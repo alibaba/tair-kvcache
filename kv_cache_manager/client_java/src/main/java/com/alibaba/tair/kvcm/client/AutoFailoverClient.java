@@ -277,6 +277,21 @@ public class AutoFailoverClient implements MetaClient {
                                             + ", HTTP: " + httpEx.getMessage(),
                                     httpEx);
                         }
+                    } else if (leaderDiscovery != null) {
+                        // gRPC-only config: retry on the reconnected gRPC client
+                        if (retriesLeft <= 0) {
+                            throw e;
+                        }
+                        retriesLeft--;
+                        int attempt = config.getLeaderRetryCount() - retriesLeft;
+                        long backoffMs = BASE_BACKOFF_MS * attempt + (long) (Math.random() * BASE_BACKOFF_MS);
+                        try {
+                            Thread.sleep(backoffMs);
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            throw new KvcmException(ErrorCode.IO_ERROR, "Interrupted during failover backoff", ie);
+                        }
+                        continue;
                     }
                 }
                 throw e;

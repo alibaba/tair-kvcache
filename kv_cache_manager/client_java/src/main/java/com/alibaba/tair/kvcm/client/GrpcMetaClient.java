@@ -186,7 +186,7 @@ public class GrpcMetaClient implements MetaClient {
             io.grpc.Status.Code grpcCode = e.getStatus().getCode();
 
             if (grpcCode == io.grpc.Status.Code.DEADLINE_EXCEEDED) {
-                errorCode = ErrorCode.IO_ERROR;
+                errorCode = ErrorCode.UNKNOWN_ERROR;
                 message = "gRPC call " + rpcName + " timed out: " + e.getStatus();
             } else if (grpcCode == io.grpc.Status.Code.UNAVAILABLE) {
                 errorCode = ErrorCode.IO_ERROR;

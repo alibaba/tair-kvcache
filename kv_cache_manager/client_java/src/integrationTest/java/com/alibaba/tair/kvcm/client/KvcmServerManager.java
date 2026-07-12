@@ -81,13 +81,13 @@ public class KvcmServerManager {
                 rpcPort, httpPort, adminRpcPort, adminHttpPort);
 
         serverProcess = pb.start();
+        running = true;
 
         // In daemon mode (-d), the parent process forks and exits quickly.
         // We can't rely on serverProcess.isAlive() to check if the daemon is running.
         // Instead, we proceed directly to the health check which will verify the server is actually running.
 
         waitForHealthy();
-        running = true;
         LOG.info("KVCM server started successfully");
     }
 
@@ -203,7 +203,7 @@ public class KvcmServerManager {
         }
 
         LOG.info("Using KVCM binary: {}", path);
-        return path;
+        return binaryFile.getAbsoluteFile().getAbsolutePath();
     }
 
     private static Path createWorkDirectory() {
