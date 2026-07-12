@@ -319,6 +319,33 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.client.close()
 
+    def _query_specs(self, block_key, trace_id):
+        resp = self.client.get_cache_location({
+            "trace_id": trace_id,
+            "instance_id": self.instance_id,
+            "query_type": "QT_BATCH_GET",
+            "block_keys": [block_key],
+            "block_mask": {"offset": 0},
+        })
+        specs = []
+        for loc in resp.get("locations", []):
+            specs.extend(loc.get("location_specs", []))
+        return specs
+
+    def _assert_uri_present(self, block_key, expected_uri, trace_id):
+        specs = self._query_specs(block_key, trace_id)
+        self.assertTrue(
+            any(spec.get("uri") == expected_uri for spec in specs),
+            f"Expected uri={expected_uri} for block={block_key}, specs={specs}",
+        )
+
+    def _assert_uri_absent(self, block_key, unexpected_uri, trace_id):
+        specs = self._query_specs(block_key, trace_id)
+        self.assertFalse(
+            any(spec.get("uri") == unexpected_uri for spec in specs),
+            f"Unexpected uri={unexpected_uri} for block={block_key}, specs={specs}",
+        )
+
     # 1. NODE_REGISTER (with mediums)
     def test_01_node_register(self):
         body = self.client.report_event(
@@ -647,20 +674,6 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
         uri_kept = _build_vineyard_uri(host, medium, {"obj_id": "kept"})
         uri_added = _build_vineyard_uri(host, medium, {"obj_id": "added"})
 
-        def has_uri(block_key, expected_uri):
-            resp = self.client.get_cache_location({
-                "trace_id": f"t16_query_{block_key}",
-                "instance_id": self.instance_id,
-                "query_type": "QT_BATCH_GET",
-                "block_keys": [block_key],
-                "block_mask": {"offset": 0},
-            })
-            for loc in resp.get("locations", []):
-                for spec in loc.get("location_specs", []):
-                    if spec.get("uri") == expected_uri:
-                        return True
-            return False
-
         self.client.report_event(_make_request(self.instance_id, host, [
             _ev_node_register([medium]),
             _ev_block_snapshot(medium, [
@@ -668,7 +681,7 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
                 (key_kept, _make_single_spec("spec_4096", uri_kept)),
             ]),
         ], trace_id="t16_snapshot_a"))
-        self.assertTrue(has_uri(key_kept, uri_kept))
+        self._assert_uri_present(key_kept, uri_kept, "t16_query_kept_a")
 
         self.client.report_event(_make_request(self.instance_id, host, [
             _ev_block_snapshot(medium, [
@@ -677,10 +690,76 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
             ]),
         ], trace_id="t16_snapshot_b"))
 
-        self.assertFalse(has_uri(key_deleted, uri_deleted),
-                         "Second full snapshot should delete blocks missing from the same host/medium")
-        self.assertTrue(has_uri(key_kept, uri_kept))
-        self.assertTrue(has_uri(key_added, uri_added))
+        self._assert_uri_absent(key_deleted, uri_deleted, "t16_query_deleted_b")
+        self._assert_uri_present(key_kept, uri_kept, "t16_query_kept_b")
+        self._assert_uri_present(key_added, uri_added, "t16_query_added_b")
+
+    # 16c. Snapshot diff is scoped by host: same medium on another host survives.
+    def test_16c_block_snapshot_diff_is_host_scoped(self):
+        host_a = "192.168.1.241:8080"
+        host_b = "192.168.1.242:8080"
+        medium = "mem"
+        key_a_deleted = 8111
+        key_a_kept = 8112
+        key_b_kept = 8113
+        uri_a_deleted = _build_vineyard_uri(host_a, medium, {"obj_id": "a_deleted"})
+        uri_a_kept = _build_vineyard_uri(host_a, medium, {"obj_id": "a_kept"})
+        uri_b_kept = _build_vineyard_uri(host_b, medium, {"obj_id": "b_kept"})
+
+        self.client.report_event(_make_request(self.instance_id, host_a, [
+            _ev_node_register([medium]),
+            _ev_block_snapshot(medium, [
+                (key_a_deleted, _make_single_spec("host_a_deleted", uri_a_deleted)),
+                (key_a_kept, _make_single_spec("host_a_kept", uri_a_kept)),
+            ]),
+        ], trace_id="t16c_snapshot_host_a_initial"))
+        self.client.report_event(_make_request(self.instance_id, host_b, [
+            _ev_node_register([medium]),
+            _ev_block_snapshot(medium, [
+                (key_b_kept, _make_single_spec("host_b_kept", uri_b_kept)),
+            ]),
+        ], trace_id="t16c_snapshot_host_b_initial"))
+
+        self.client.report_event(_make_request(self.instance_id, host_a, [
+            _ev_block_snapshot(medium, [
+                (key_a_kept, _make_single_spec("host_a_kept", uri_a_kept)),
+            ]),
+        ], trace_id="t16c_snapshot_host_a_reconcile"))
+
+        self._assert_uri_absent(key_a_deleted, uri_a_deleted, "t16c_query_a_deleted")
+        self._assert_uri_present(key_a_kept, uri_a_kept, "t16c_query_a_kept")
+        self._assert_uri_present(key_b_kept, uri_b_kept, "t16c_query_b_kept")
+
+    # 16d. Snapshot diff is scoped by medium: another tier on the same host survives.
+    def test_16d_block_snapshot_diff_is_medium_scoped(self):
+        host = "192.168.1.243:8080"
+        key_mem_deleted = 8121
+        key_mem_kept = 8122
+        key_disk_kept = 8123
+        uri_mem_deleted = _build_vineyard_uri(host, "mem", {"obj_id": "mem_deleted"})
+        uri_mem_kept = _build_vineyard_uri(host, "mem", {"obj_id": "mem_kept"})
+        uri_disk_kept = _build_vineyard_uri(host, "disk", {"obj_id": "disk_kept"})
+
+        self.client.report_event(_make_request(self.instance_id, host, [
+            _ev_node_register(["mem", "disk"]),
+            _ev_block_snapshot("mem", [
+                (key_mem_deleted, _make_single_spec("mem_deleted", uri_mem_deleted)),
+                (key_mem_kept, _make_single_spec("mem_kept", uri_mem_kept)),
+            ]),
+            _ev_block_snapshot("disk", [
+                (key_disk_kept, _make_single_spec("disk_kept", uri_disk_kept)),
+            ]),
+        ], trace_id="t16d_snapshot_initial"))
+
+        self.client.report_event(_make_request(self.instance_id, host, [
+            _ev_block_snapshot("mem", [
+                (key_mem_kept, _make_single_spec("mem_kept", uri_mem_kept)),
+            ]),
+        ], trace_id="t16d_snapshot_mem_reconcile"))
+
+        self._assert_uri_absent(key_mem_deleted, uri_mem_deleted, "t16d_query_mem_deleted")
+        self._assert_uri_present(key_mem_kept, uri_mem_kept, "t16d_query_mem_kept")
+        self._assert_uri_present(key_disk_kept, uri_disk_kept, "t16d_query_disk_kept")
 
     # 16a. Heartbeat timeout -> location filtered out, then recovery on heartbeat resume.
     def test_16a_heartbeat_timeout_then_recovery(self):
