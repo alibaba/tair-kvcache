@@ -146,6 +146,57 @@ TEST_F(MetaStorageBackendManagerTest, TestInitDualBackend) {
     ASSERT_EQ(EC_OK, mgr.Close());
 }
 
+TEST_F(MetaStorageBackendManagerTest, TestLocationIndexSingleBackendRoundTrip) {
+    const std::string path = GetPrivateTestRuntimeDataPath() + "mgr_locidx_single";
+    std::filesystem::remove(path);
+    MetaStorageBackendManager mgr;
+    ASSERT_EQ(EC_OK, mgr.Init("inst_locidx_single", MakeSingleConfig(path)));
+    ASSERT_EQ(EC_OK, mgr.Open());
+
+    KeyVector out_keys = {999};
+    EXPECT_EQ(EC_OK, mgr.AddKeysToLocationIndex(request_context_.get(), "loc_a", {3, 1, 1}));
+    EXPECT_EQ(EC_OK, mgr.AddKeysToLocationIndex(request_context_.get(), "loc_b", {2}));
+    ASSERT_EQ(EC_OK, mgr.GetKeysByLocationIndex(request_context_.get(), "loc_a", out_keys));
+    EXPECT_EQ((KeyVector{1, 3}), out_keys);
+    ASSERT_EQ(EC_OK, mgr.GetKeysByLocationIndex(request_context_.get(), "loc_b", out_keys));
+    EXPECT_EQ((KeyVector{2}), out_keys);
+
+    EXPECT_EQ(EC_OK, mgr.RemoveKeysFromLocationIndex(request_context_.get(), "loc_a", {1, 404}));
+    ASSERT_EQ(EC_OK, mgr.GetKeysByLocationIndex(request_context_.get(), "loc_a", out_keys));
+    EXPECT_EQ((KeyVector{3}), out_keys);
+
+    EXPECT_EQ(EC_OK, mgr.RemoveKeysFromLocationIndex(request_context_.get(), "loc_a", {3}));
+    ASSERT_EQ(EC_OK, mgr.GetKeysByLocationIndex(request_context_.get(), "loc_a", out_keys));
+    EXPECT_TRUE(out_keys.empty());
+
+    ASSERT_EQ(EC_OK, mgr.Close());
+}
+
+TEST_F(MetaStorageBackendManagerTest, TestLocationIndexDualBackendRoundTrip) {
+    const std::string path = GetPrivateTestRuntimeDataPath() + "mgr_locidx_dual";
+    std::filesystem::remove(path);
+    MetaStorageBackendManager mgr;
+    ASSERT_EQ(EC_OK, mgr.Init("inst_locidx_dual", MakeDualConfig(path)));
+    ASSERT_EQ(EC_OK, mgr.Open());
+    WaitRunning(mgr);
+
+    KeyVector out_keys = {999};
+    EXPECT_EQ(EC_BADARGS, mgr.AddKeysToLocationIndex(request_context_.get(), "", {1}));
+    EXPECT_EQ(EC_BADARGS, mgr.RemoveKeysFromLocationIndex(request_context_.get(), "", {1}));
+    EXPECT_EQ(EC_BADARGS, mgr.GetKeysByLocationIndex(request_context_.get(), "", out_keys));
+    EXPECT_TRUE(out_keys.empty());
+
+    ASSERT_EQ(EC_OK, mgr.AddKeysToLocationIndex(request_context_.get(), "loc_a", {10, 20, 10}));
+    ASSERT_EQ(EC_OK, mgr.GetKeysByLocationIndex(request_context_.get(), "loc_a", out_keys));
+    EXPECT_EQ((KeyVector{10, 20}), out_keys);
+
+    ASSERT_EQ(EC_OK, mgr.RemoveKeysFromLocationIndex(request_context_.get(), "loc_a", {10}));
+    ASSERT_EQ(EC_OK, mgr.GetKeysByLocationIndex(request_context_.get(), "loc_a", out_keys));
+    EXPECT_EQ((KeyVector{20}), out_keys);
+
+    ASSERT_EQ(EC_OK, mgr.Close());
+}
+
 // --- Put/Get: CacheLocation serialization round-trip --------------------------
 
 TEST_F(MetaStorageBackendManagerTest, TestPutAndGetLocationsRoundTrip) {

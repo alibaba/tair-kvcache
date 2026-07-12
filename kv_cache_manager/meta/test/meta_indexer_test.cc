@@ -201,6 +201,43 @@ TEST_F(MetaIndexerTest, TestMakeBatches2) {
     ASSERT_EQ(expected_indexs, covered_indexs);
 }
 
+TEST_F(MetaIndexerTest, TestLocationIndexWrapper) {
+    std::string configStr = R"({
+        "max_key_count" : 100,
+        "mutex_shard_num" : 8,
+        "batch_key_size" : 2,
+        "meta_storage_backend_config" : { "storage_type" : "local" },
+        "meta_cache_policy_config" : { "capacity" : 0 }
+    })";
+    ASSERT_EQ(EC_OK, InitIndexer(configStr));
+
+    KeyVector keys = {3, 1, 3, 2};
+    KeyVector out_keys = {999};
+
+    EXPECT_EQ(EC_OK, meta_indexer_->AddKeysToLocationIndex(request_context_.get(), "", {}));
+    EXPECT_EQ(EC_OK, meta_indexer_->RemoveKeysFromLocationIndex(request_context_.get(), "", {}));
+    EXPECT_EQ(EC_BADARGS, meta_indexer_->AddKeysToLocationIndex(request_context_.get(), "", {1}));
+    EXPECT_EQ(EC_BADARGS, meta_indexer_->RemoveKeysFromLocationIndex(request_context_.get(), "", {1}));
+    EXPECT_EQ(EC_BADARGS, meta_indexer_->GetKeysByLocationIndex(request_context_.get(), "", out_keys));
+    EXPECT_TRUE(out_keys.empty());
+
+    ASSERT_EQ(EC_OK, meta_indexer_->AddKeysToLocationIndex(request_context_.get(), "loc_a", keys));
+    ASSERT_EQ(EC_OK, meta_indexer_->AddKeysToLocationIndex(request_context_.get(), "loc_b", {5}));
+
+    ASSERT_EQ(EC_OK, meta_indexer_->GetKeysByLocationIndex(request_context_.get(), "loc_a", out_keys));
+    EXPECT_EQ((KeyVector{1, 2, 3}), out_keys);
+    ASSERT_EQ(EC_OK, meta_indexer_->GetKeysByLocationIndex(request_context_.get(), "loc_b", out_keys));
+    EXPECT_EQ((KeyVector{5}), out_keys);
+
+    EXPECT_EQ(EC_OK, meta_indexer_->RemoveKeysFromLocationIndex(request_context_.get(), "loc_a", {2, 999}));
+    ASSERT_EQ(EC_OK, meta_indexer_->GetKeysByLocationIndex(request_context_.get(), "loc_a", out_keys));
+    EXPECT_EQ((KeyVector{1, 3}), out_keys);
+
+    EXPECT_EQ(EC_OK, meta_indexer_->RemoveKeysFromLocationIndex(request_context_.get(), "loc_a", {1, 3}));
+    ASSERT_EQ(EC_OK, meta_indexer_->GetKeysByLocationIndex(request_context_.get(), "loc_a", out_keys));
+    EXPECT_TRUE(out_keys.empty());
+}
+
 TEST_F(MetaIndexerTest, TestLocalSimple) {
     std::string configStr = R"({
         "max_key_count" : 100,

@@ -150,6 +150,7 @@ private:
                                      const KeyVector &keys,
                                      const LocationIdsPerKey &location_ids_per_key,
                                      const std::vector<std::vector<ErrorCode>> &per_location_ec);
+    static bool ShouldRemoveLocationIndexEntry(ErrorCode ec);
 
     std::shared_ptr<MetaIndexer> meta_indexer_;
     CheckLocDataExistFunc check_loc_data_exist_func_;

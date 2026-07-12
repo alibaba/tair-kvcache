@@ -46,9 +46,10 @@ public:
 
     void TearDown() override {}
 
-    std::shared_ptr<MetaStorageBackendConfig> ConstructMetaStorageBackendConfig() {
+    std::shared_ptr<MetaStorageBackendConfig> ConstructMetaStorageBackendConfig(
+        const std::string &path_suffix = "meta_local_backend_file_1") {
         auto meta_storage_backend_config = std::make_shared<MetaStorageBackendConfig>();
-        std::string local_path = GetPrivateTestRuntimeDataPath() + "meta_local_backend_file_1";
+        std::string local_path = GetPrivateTestRuntimeDataPath() + path_suffix;
         meta_storage_backend_config->SetStorageUri("file://" + local_path);
         std::error_code ec;
         bool exists = std::filesystem::exists(local_path, ec);
@@ -59,12 +60,14 @@ public:
         return meta_storage_backend_config;
     }
 
-    std::shared_ptr<MetaIndexer> CreateMetaIndexer() {
+    std::shared_ptr<MetaIndexer> CreateMetaIndexer(size_t max_key_count = 10000,
+                                                   int32_t mutex_shard_num = 32,
+                                                   const std::string &path_suffix = "meta_local_backend_file_1") {
         auto meta_indexer_config = std::make_shared<MetaIndexerConfig>();
-        auto backend_config = ConstructMetaStorageBackendConfig();
+        auto backend_config = ConstructMetaStorageBackendConfig(path_suffix);
         meta_indexer_config->SetMetaStorageBackendConfig(backend_config);
-        meta_indexer_config->SetMutexShardNum(32);
-        meta_indexer_config->SetMaxKeyCount(10000);
+        meta_indexer_config->SetMutexShardNum(mutex_shard_num);
+        meta_indexer_config->SetMaxKeyCount(max_key_count);
         auto indexer = std::make_shared<MetaIndexer>();
         auto metaCachePolicyConfig = std::make_shared<MetaCachePolicyConfig>();
         metaCachePolicyConfig->SetCapacity(0);
@@ -217,6 +220,57 @@ TEST_F(MetaSearcherTest, TestLocationKeyIndexPersistsAcrossSearcherInstances) {
     ASSERT_EQ(ErrorCode::EC_OK,
               rebuilt_searcher->GetKeysByLocationIndex(request_context_.get(), loc_a, indexed_keys));
     EXPECT_EQ((MetaSearcher::KeyVector{21, 22, 23}), indexed_keys);
+}
+
+TEST_F(MetaSearcherTest, TestDeleteNoentKeepsLocationIndex) {
+    const std::string loc_a = "kvs#v6d#mem#host_a:8080";
+    ASSERT_EQ(ErrorCode::EC_OK, meta_indexer_->AddKeysToLocationIndex(request_context_.get(), loc_a, {901}));
+
+    LocationIdsPerKey delete_loc_a = {{loc_a}};
+    std::vector<std::vector<ErrorCode>> delete_ecs;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              meta_searcher_->BatchDeleteLocations(request_context_.get(), {901}, delete_loc_a, delete_ecs));
+    ASSERT_EQ(1, delete_ecs.size());
+    ASSERT_EQ(1, delete_ecs[0].size());
+    EXPECT_EQ(ErrorCode::EC_NOENT, delete_ecs[0][0]);
+
+    MetaSearcher::KeyVector indexed_keys;
+    ASSERT_EQ(ErrorCode::EC_OK, meta_searcher_->GetKeysByLocationIndex(request_context_.get(), loc_a, indexed_keys));
+    EXPECT_EQ((MetaSearcher::KeyVector{901}), indexed_keys);
+}
+
+TEST_F(MetaSearcherTest, TestBatchUpsertLeavesOverIndexWhenMetaWriteFails) {
+    auto limited_indexer = CreateMetaIndexer(/*max_key_count=*/1,
+                                             /*mutex_shard_num=*/1,
+                                             "meta_local_backend_limited_capacity");
+    ASSERT_NE(nullptr, limited_indexer);
+    auto limited_searcher =
+        std::make_shared<MetaSearcher>(limited_indexer, dummy_check_loc_data_exist, dummy_submit_del_req);
+    const std::string loc_a = "kvs#v6d#mem#host_a:8080";
+
+    std::vector<std::vector<MetaSearcher::UpsertLocation>> upserts = {
+        {{loc_a, DataStorageType::DATA_STORAGE_TYPE_VINEYARD, CLS_SERVING, {LocationSpec("tp0", "v6d://a/31")}}},
+        {{loc_a, DataStorageType::DATA_STORAGE_TYPE_VINEYARD, CLS_SERVING, {LocationSpec("tp0", "v6d://a/32")}}},
+    };
+    std::vector<ErrorCode> per_key_ec;
+    EXPECT_EQ(ErrorCode::EC_ERROR,
+              limited_searcher->BatchUpsertLocations(request_context_.get(), {31, 32}, upserts, per_key_ec));
+    ASSERT_EQ(2, per_key_ec.size());
+    EXPECT_EQ(ErrorCode::EC_NOSPC, per_key_ec[0]);
+    EXPECT_EQ(ErrorCode::EC_NOSPC, per_key_ec[1]);
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask mask = static_cast<size_t>(0);
+    ASSERT_EQ(ErrorCode::EC_OK,
+              limited_searcher->BatchGetLocation(request_context_.get(), {31, 32}, mask, location_maps));
+    ASSERT_EQ(2, location_maps.size());
+    EXPECT_TRUE(location_maps[0].empty());
+    EXPECT_TRUE(location_maps[1].empty());
+
+    MetaSearcher::KeyVector indexed_keys;
+    ASSERT_EQ(ErrorCode::EC_OK,
+              limited_searcher->GetKeysByLocationIndex(request_context_.get(), loc_a, indexed_keys));
+    EXPECT_EQ((MetaSearcher::KeyVector{31, 32}), indexed_keys);
 }
 
 TEST_F(MetaSearcherTest, TestBatchAddLocation2) {

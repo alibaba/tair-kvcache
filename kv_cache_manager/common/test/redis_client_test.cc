@@ -968,6 +968,50 @@ TEST_F(RedisClientTest, TestSetIndexCommandErrors) {
     ASSERT_TRUE(members.empty());
 }
 
+TEST_F(RedisClientTest, TestSetIndexCommandsNoopAndPipelineShapeErrors) {
+    {
+        EXPECT_CALL(*redis_client_, TryExecPipeline(_)).Times(0);
+
+        auto sadd_ecs = redis_client_->SAdd({"idx_a", "idx_b"}, {{}, {}});
+        ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), sadd_ecs);
+
+        auto srem_ecs = redis_client_->SRem({"idx_a", "idx_b"}, {{}, {}});
+        ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), srem_ecs);
+    }
+    {
+        EXPECT_CALL(*redis_client_, IsContextOk()).WillRepeatedly(Return(true));
+
+        std::vector<ReplyUPtr> sadd_replies;
+        sadd_replies.emplace_back(MakeFakeReplyInteger(1));
+        EXPECT_CALL(*redis_client_,
+                    TryExecPipeline(ElementsAre(ElementsAre(StrEq("SADD"), StrEq("idx_a"), StrEq("11")),
+                                                ElementsAre(StrEq("SADD"), StrEq("idx_b"), StrEq("12")))))
+            .WillOnce(Return(ByMove(std::move(sadd_replies))));
+        auto sadd_ecs = redis_client_->SAdd({"idx_a", "idx_b"}, {{"11"}, {"12"}});
+        ASSERT_EQ((std::vector<ErrorCode>{EC_ERROR, EC_ERROR}), sadd_ecs);
+    }
+    {
+        EXPECT_CALL(*redis_client_, IsContextOk()).WillRepeatedly(Return(true));
+
+        std::vector<ReplyUPtr> srem_replies;
+        EXPECT_CALL(*redis_client_,
+                    TryExecPipeline(ElementsAre(ElementsAre(StrEq("SREM"), StrEq("idx_a"), StrEq("11")))))
+            .WillOnce(Return(ByMove(std::move(srem_replies))));
+        auto srem_ecs = redis_client_->SRem({"idx_a"}, {{"11"}});
+        ASSERT_EQ((std::vector<ErrorCode>{EC_ERROR}), srem_ecs);
+    }
+    {
+        EXPECT_CALL(*redis_client_, IsContextOk()).WillRepeatedly(Return(true));
+
+        std::vector<ReplyUPtr> smembers_replies;
+        EXPECT_CALL(*redis_client_, TryExecPipeline(ElementsAre(ElementsAre(StrEq("SMEMBERS"), StrEq("idx_a")))))
+            .WillOnce(Return(ByMove(std::move(smembers_replies))));
+        std::vector<std::string> members = {"stale"};
+        ASSERT_EQ(EC_ERROR, redis_client_->SMembers("idx_a", members));
+        ASSERT_TRUE(members.empty());
+    }
+}
+
 TEST_F(RedisClientTest, TestBuildSetIndexCmds) {
     std::vector<std::string> keys = {"idx_a", "idx_b", "idx_c"};
     std::vector<std::vector<std::string>> members = {{"11", "12"}, {}, {"13"}};
@@ -991,11 +1035,15 @@ TEST_F(RedisClientTest, TestBuildCmdsAppendToExisting) {
 
     RedisClient::BuildDeleteCmds({"k1"}, cmds);
     RedisClient::BuildHashSetCmds({"k2"}, {{{"f", "v"}}}, cmds);
+    RedisClient::BuildSetAddCmds({"idx"}, {{"11", "12"}}, cmds);
+    RedisClient::BuildSetRemoveCmds({"idx"}, {{"11"}}, cmds);
 
-    ASSERT_EQ(3, cmds.size());
+    ASSERT_EQ(5, cmds.size());
     ASSERT_EQ("EXISTING_CMD", cmds[0][0]);
     ASSERT_EQ("DEL", cmds[1][0]);
     ASSERT_EQ("HSET", cmds[2][0]);
+    ASSERT_EQ(CmdArgs({"SADD", "idx", "11", "12"}), cmds[3]);
+    ASSERT_EQ(CmdArgs({"SREM", "idx", "11"}), cmds[4]);
 }
 
 } // namespace kv_cache_manager

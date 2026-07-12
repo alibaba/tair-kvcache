@@ -1456,6 +1456,15 @@ bool CacheManager::IsFullAttentionLocationSpecName(const std::string &name) {
     return !IsMambaLocationSpecName(name);
 }
 
+bool CacheManager::ContainsFullAttentionLocationSpec(const std::vector<LocationSpec> &specs) {
+    for (const auto &spec : specs) {
+        if (IsFullAttentionLocationSpecName(spec.name())) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool CacheManager::ContainsFullAttentionSpecName(const google::protobuf::RepeatedPtrField<std::string> &spec_names) {
     if (spec_names.empty()) {
         return true;
@@ -1547,6 +1556,51 @@ void CacheManager::SetReportEventItemEcIfOk(ReportEventState *state, int event_i
         state->per_item_ec[event_index] == EC_OK) {
         state->per_item_ec[event_index] = ec;
     }
+}
+
+bool CacheManager::HasReportEventKeyFailure(const std::vector<ErrorCode> &per_key_ec) {
+    return std::any_of(per_key_ec.begin(), per_key_ec.end(), [](ErrorCode ec) { return ec != EC_OK; });
+}
+
+bool CacheManager::HasReportEventHardLocationFailure(const std::vector<std::vector<ErrorCode>> &per_location_ec) {
+    for (const auto &location_ecs : per_location_ec) {
+        for (const auto loc_ec : location_ecs) {
+            if (loc_ec != EC_OK && loc_ec != EC_NOENT) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+ErrorCode CacheManager::ResolveReportEventKeyError(ErrorCode aggregate_ec,
+                                                   bool has_specific_key_failure,
+                                                   const std::vector<ErrorCode> &per_key_ec,
+                                                   size_t key_index) {
+    if (key_index >= per_key_ec.size()) {
+        return aggregate_ec != EC_OK ? aggregate_ec : EC_ERROR;
+    }
+    ErrorCode key_ec = per_key_ec[key_index];
+    if (key_ec == EC_OK && aggregate_ec != EC_OK && !has_specific_key_failure) {
+        key_ec = aggregate_ec;
+    }
+    return key_ec;
+}
+
+ErrorCode CacheManager::ResolveReportEventLocationError(
+    ErrorCode aggregate_ec,
+    bool has_specific_hard_location_failure,
+    const std::vector<std::vector<ErrorCode>> &per_location_ec,
+    size_t key_index,
+    size_t location_index) {
+    if (key_index >= per_location_ec.size() || location_index >= per_location_ec[key_index].size()) {
+        return aggregate_ec != EC_OK ? aggregate_ec : EC_ERROR;
+    }
+    ErrorCode loc_ec = per_location_ec[key_index][location_index];
+    if (loc_ec == EC_OK && aggregate_ec != EC_OK && !has_specific_hard_location_failure) {
+        loc_ec = aggregate_ec;
+    }
+    return loc_ec;
 }
 
 bool CacheManager::BuildReportEventLocationId(const std::string &trace_id,
@@ -1643,9 +1697,10 @@ void CacheManager::FlushReportEventAdds(RequestContext *request_context,
     if (!filtered_keys.empty()) {
         std::vector<ErrorCode> per_key_ec;
         auto upsert_ec = meta_searcher->BatchUpsertLocations(request_context, filtered_keys, upserts, per_key_ec);
+        const bool has_specific_key_failure = HasReportEventKeyFailure(per_key_ec);
 
         for (size_t k = 0; k < filtered_keys.size(); ++k) {
-            ErrorCode key_ec = (upsert_ec != EC_OK) ? upsert_ec : ((k < per_key_ec.size()) ? per_key_ec[k] : EC_ERROR);
+            ErrorCode key_ec = ResolveReportEventKeyError(upsert_ec, has_specific_key_failure, per_key_ec, k);
             if (key_ec == EC_OK) {
                 continue;
             }
@@ -1698,9 +1753,10 @@ void CacheManager::FlushReportEventDeletes(RequestContext *request_context,
 
     std::vector<std::vector<ErrorCode>> per_location_ec;
     auto del_ec = meta_searcher->BatchDeleteLocations(request_context, del_keys_aggr, del_location_ids, per_location_ec);
+    const bool has_specific_hard_location_failure = HasReportEventHardLocationFailure(per_location_ec);
 
     for (size_t k = 0; k < del_keys_aggr.size(); ++k) {
-        if (del_ec != EC_OK || k >= per_location_ec.size()) {
+        if (k >= per_location_ec.size()) {
             ErrorCode key_ec = (del_ec != EC_OK) ? del_ec : EC_ERROR;
             for (const auto &event_indices : del_event_indices[k]) {
                 for (const auto event_index : event_indices) {
@@ -1710,7 +1766,8 @@ void CacheManager::FlushReportEventDeletes(RequestContext *request_context,
             continue;
         }
         for (size_t loc_index = 0; loc_index < del_event_indices[k].size(); ++loc_index) {
-            ErrorCode loc_ec = (loc_index < per_location_ec[k].size()) ? per_location_ec[k][loc_index] : EC_ERROR;
+            ErrorCode loc_ec = ResolveReportEventLocationError(
+                del_ec, has_specific_hard_location_failure, per_location_ec, k, loc_index);
             if (loc_ec == EC_OK || loc_ec == EC_NOENT) {
                 continue;
             }
@@ -1783,7 +1840,8 @@ void CacheManager::ApplyReportEventSnapshot(RequestContext *request_context,
             auto iter = location_map->find(snapshot.location_id);
             if (iter != location_map->end() && iter->second &&
                 iter->second->type() == event_backend->GetStorageType() &&
-                iter->second->status() == CacheLocationStatus::CLS_SERVING) {
+                iter->second->status() == CacheLocationStatus::CLS_SERVING &&
+                ContainsFullAttentionLocationSpec(iter->second->location_specs())) {
                 existing_keys.push_back(indexed_keys[i]);
             } else {
                 ++stale_index_key_count;

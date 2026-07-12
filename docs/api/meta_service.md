@@ -121,7 +121,10 @@ names such as `tp0` are treated as full-attention for compatibility.
 For `EVENT_BLOCK_SNAPSHOT`, the diff scope is the reporter `host_ip_port` plus
 `medium` after mamba-state specs are filtered. If an engine has multiple
 full-attention groups for one block, report them as multiple `LocationSpec`
-entries on the same `BlockSnapshotItem`.
+entries on the same `BlockSnapshotItem`. Snapshot reconciliation verifies
+existing CacheMeta candidates against full-attention specs before deleting
+blocks, so mamba-state-only metadata is not removed by the current full-attention
+matching path.
 
 ```bash
 curl -g -vvv -X POST http://localhost:6382/api/reportEvent \

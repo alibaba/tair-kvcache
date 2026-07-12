@@ -34,14 +34,6 @@ void LogErrorCodes(const std::string &operation_name,
     }
 }
 
-bool ShouldRemoveLocationIndexEntry(ErrorCode ec) {
-    // Remove the index only after CacheMeta confirms the location was deleted.
-    // If we remove on EC_NOENT, a concurrent add-before-meta write can be
-    // observed as over-index and then turned into under-index when its later
-    // CacheMeta write succeeds.
-    return ec == ErrorCode::EC_OK;
-}
-
 std::uint64_t LocationSpecSize(const std::vector<LocationSpec> &specs) {
     std::uint64_t size = 0;
     for (const auto &loc_spec : specs) {
@@ -232,6 +224,14 @@ MetaSearcher::MetaSearcher(const std::shared_ptr<MetaIndexer> &meta_indexer,
     , submit_del_req_func_(submit_del_req) {}
 
 MetaSearcher::~MetaSearcher() = default;
+
+bool MetaSearcher::ShouldRemoveLocationIndexEntry(ErrorCode ec) {
+    // Remove the index only after CacheMeta confirms the location was deleted.
+    // If we remove on EC_NOENT, a concurrent add-before-meta write can be
+    // observed as over-index and then turned into under-index when its later
+    // CacheMeta write succeeds.
+    return ec == ErrorCode::EC_OK;
+}
 
 void MetaSearcher::AddKeysToLocationIndex(RequestContext *request_context,
                                           const KeyVector &keys,
@@ -875,6 +875,10 @@ ErrorCode MetaSearcher::BatchUpsertLocations(RequestContext *request_context,
             location_ids_per_key[i].push_back(entry.location_id);
         }
     }
+    // ReportEvent snapshot diff cannot discover under-index without scanning all
+    // CacheMeta. Add the derived index before writing CacheMeta, so failures can
+    // only leave over-index, which snapshot verification filters and delayed
+    // repair can later clean up.
     AddKeysToLocationIndex(request_context, keys, location_ids_per_key, &out_per_key_ec);
 
     for (size_t i = 0; i < new_locations_per_key.size(); ++i) {

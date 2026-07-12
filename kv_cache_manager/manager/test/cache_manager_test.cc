@@ -3293,6 +3293,62 @@ TEST_F(CacheManagerTest, TestReportEventBlockSnapshotDoesNotTouchOtherMedium) {
     EXPECT_TRUE(HasLocation(500, ssd_loc));
 }
 
+TEST_F(CacheManagerTest, TestReportEventBlockSnapshotSameBlockOtherHostSurvives) {
+    RegisterDefaultInstanceForReportEvent();
+    SetupVineyardEventReportingBackend();
+
+    const std::string host_a = "192.168.2.1:8080";
+    const std::string host_b = "192.168.2.2:8080";
+    const std::string loc_a = ExpectedReportEventLocationId(host_a, "mem");
+    const std::string loc_b = ExpectedReportEventLocationId(host_b, "mem");
+
+    ReportBlockSnapshot(host_a, "mem", {300}, true);
+    ReportBlockSnapshot(host_b, "mem", {300}, true);
+    ASSERT_TRUE(HasLocation(300, loc_a));
+    ASSERT_TRUE(HasLocation(300, loc_b));
+
+    ReportBlockSnapshot(host_a, "mem", {});
+    EXPECT_FALSE(HasLocation(300, loc_a));
+    EXPECT_TRUE(HasLocation(300, loc_b));
+}
+
+TEST_F(CacheManagerTest, TestReportEventBlockSnapshotReplacesMismatchedReportedLocation) {
+    RegisterDefaultInstanceForReportEvent();
+    SetupVineyardEventReportingBackend();
+
+    const std::string host = "192.168.2.1:8080";
+    const std::string location_id = ExpectedReportEventLocationId(host, "mem");
+
+    auto *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    ASSERT_NE(nullptr, meta_searcher);
+    std::vector<std::vector<MetaSearcher::UpsertLocation>> mismatched_locations = {
+        {{location_id,
+          DataStorageType::DATA_STORAGE_TYPE_NFS,
+          CLS_SERVING,
+          {LocationSpec("tp0", "file:///tmp/not-vineyard?size=10")}}},
+    };
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(EC_OK,
+              meta_searcher->BatchUpsertLocations(request_context_.get(), {300}, mismatched_locations, per_key_ec));
+    ASSERT_EQ(1, per_key_ec.size());
+    ASSERT_EQ(EC_OK, per_key_ec[0]);
+    ASSERT_TRUE(HasLocation(300, location_id));
+    ASSERT_EQ(DataStorageType::DATA_STORAGE_TYPE_NFS, GetLocationMapForKey(300).at(location_id)->type());
+
+    proto::meta::ReportEventRequest req;
+    req.set_instance_id("test_instance");
+    req.set_host_ip_port(host);
+    req.set_storage_type(proto::meta::ST_VINEYARD);
+    AddBlockSnapshotEvent(&req, host, "mem", {300}, 20, "-reported");
+
+    proto::meta::ReportEventResponse resp;
+    EXPECT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+    EXPECT_EQ(proto::meta::OK, resp.header().status().code());
+    ASSERT_TRUE(HasLocation(300, location_id));
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_VINEYARD, GetLocationMapForKey(300).at(location_id)->type());
+    EXPECT_EQ(ReportEventUri(host, "mem", 300, 20, "-reported"), GetFirstSpecUri(300, location_id));
+}
+
 TEST_F(CacheManagerTest, TestReportEventPreservesDeleteThenAddOrder) {
     RegisterDefaultInstanceForReportEvent();
     SetupVineyardEventReportingBackend();
@@ -3428,6 +3484,82 @@ TEST_F(CacheManagerTest, TestReportEventSkipsMambaStateSpecNames) {
     EXPECT_TRUE(HasLocation(300, location_id));
     EXPECT_FALSE(HasLocation(400, location_id));
     EXPECT_FALSE(HasLocation(401, location_id));
+}
+
+TEST_F(CacheManagerTest, TestReportEventSnapshotDoesNotDeleteMambaOnlyExistingLocation) {
+    RegisterDefaultInstanceForReportEvent();
+    SetupVineyardEventReportingBackend();
+
+    const std::string host = "192.168.2.1:8080";
+    const std::string location_id = ExpectedReportEventLocationId(host, "gpu");
+
+    auto *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("test_instance");
+    ASSERT_NE(nullptr, meta_searcher);
+    std::vector<std::vector<MetaSearcher::UpsertLocation>> mamba_locations = {
+        {{location_id,
+          DataStorageType::DATA_STORAGE_TYPE_VINEYARD,
+          CLS_SERVING,
+          {LocationSpec("mamba_state:group=1", ReportEventUri(host, "gpu", 300, 0, "-mamba"))}}},
+    };
+    std::vector<ErrorCode> per_key_ec;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchUpsertLocations(request_context_.get(), {300}, mamba_locations, per_key_ec));
+    ASSERT_EQ(1, per_key_ec.size());
+    ASSERT_EQ(EC_OK, per_key_ec[0]);
+    ASSERT_TRUE(HasLocation(300, location_id));
+
+    ReportBlockSnapshot(host, "gpu", {}, true);
+    EXPECT_TRUE(HasLocation(300, location_id));
+
+    auto indexed_keys = GetLocationIndexKeys(location_id);
+    EXPECT_NE(indexed_keys.end(), std::find(indexed_keys.begin(), indexed_keys.end(), 300));
+}
+
+TEST_F(CacheManagerTest, TestReportEventDeleteSpecNamesRequireFullAttention) {
+    RegisterDefaultInstanceForReportEvent();
+    SetupVineyardEventReportingBackend();
+
+    const std::string host = "192.168.2.1:8080";
+    const std::string location_id = ExpectedReportEventLocationId(host, "gpu");
+
+    {
+        proto::meta::ReportEventRequest req;
+        req.set_instance_id("test_instance");
+        req.set_host_ip_port(host);
+        req.set_storage_type(proto::meta::ST_VINEYARD);
+        AddNodeRegisterEvent(&req, {"gpu"});
+        AddBlockAddEvent(&req, host, "gpu", 300, 0, "", "full_attention:group=0:tp=0");
+
+        proto::meta::ReportEventResponse resp;
+        EXPECT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+        EXPECT_EQ(proto::meta::OK, resp.header().status().code());
+    }
+    ASSERT_TRUE(HasLocation(300, location_id));
+
+    {
+        proto::meta::ReportEventRequest req;
+        req.set_instance_id("test_instance");
+        req.set_host_ip_port(host);
+        req.set_storage_type(proto::meta::ST_VINEYARD);
+        AddBlockDeleteEvent(&req, "gpu", 300, {"mamba_state:group=1"});
+
+        proto::meta::ReportEventResponse resp;
+        EXPECT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+        EXPECT_EQ(proto::meta::OK, resp.header().status().code());
+    }
+    EXPECT_TRUE(HasLocation(300, location_id));
+
+    {
+        proto::meta::ReportEventRequest req;
+        req.set_instance_id("test_instance");
+        req.set_host_ip_port(host);
+        req.set_storage_type(proto::meta::ST_VINEYARD);
+        AddBlockDeleteEvent(&req, "gpu", 300, {"mamba_state:group=1", "full_attention:group=0:tp=0"});
+
+        proto::meta::ReportEventResponse resp;
+        EXPECT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+        EXPECT_EQ(proto::meta::OK, resp.header().status().code());
+    }
+    EXPECT_FALSE(HasLocation(300, location_id));
 }
 
 TEST_F(CacheManagerTest, TestReportEventUpsertUsageIsIdempotentAndDeltaBased) {
@@ -3620,6 +3752,44 @@ TEST_F(CacheManagerTest, TestReportEventBlockSnapshotPartialFailureKeepsValidSna
     EXPECT_EQ(proto::meta::OK, resp.item_results(1));
     EXPECT_EQ(proto::meta::INVALID_ARGUMENT, resp.item_results(2));
     EXPECT_TRUE(HasLocation(300, location_id));
+}
+
+TEST_F(CacheManagerTest, TestReportEventPartialBlockAddFailureKeepsValidAdds) {
+    RegisterDefaultInstanceForReportEvent();
+    SetupVineyardEventReportingBackend();
+
+    const std::string host = "192.168.2.1:8080";
+    const std::string location_id = ExpectedReportEventLocationId(host, "mem");
+
+    proto::meta::ReportEventRequest req;
+    req.set_instance_id("test_instance");
+    req.set_host_ip_port(host);
+    req.set_storage_type(proto::meta::ST_VINEYARD);
+    AddNodeRegisterEvent(&req, {"mem"});
+    AddBlockAddEvent(&req, host, "mem", 300);
+
+    auto *invalid_key = req.add_events();
+    invalid_key->set_event_type(proto::meta::EVENT_BLOCK_ADD);
+    auto *invalid_add = invalid_key->mutable_block_add();
+    invalid_add->set_block_key("bad-key");
+    invalid_add->set_medium("mem");
+    auto *invalid_spec = invalid_add->add_specs();
+    invalid_spec->set_name("tp0");
+    invalid_spec->set_uri(ReportEventUri(host, "mem", 301));
+
+    AddBlockAddEvent(&req, host, "mem", 302);
+
+    proto::meta::ReportEventResponse resp;
+    EXPECT_EQ(EC_PARTIAL_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+    EXPECT_EQ(proto::meta::INTERNAL_ERROR, resp.header().status().code());
+    ASSERT_EQ(4, resp.item_results_size());
+    EXPECT_EQ(proto::meta::OK, resp.item_results(0));
+    EXPECT_EQ(proto::meta::OK, resp.item_results(1));
+    EXPECT_EQ(proto::meta::INVALID_ARGUMENT, resp.item_results(2));
+    EXPECT_EQ(proto::meta::OK, resp.item_results(3));
+    EXPECT_TRUE(HasLocation(300, location_id));
+    EXPECT_FALSE(HasLocation(301, location_id));
+    EXPECT_TRUE(HasLocation(302, location_id));
 }
 
 TEST_F(CacheManagerTest, TestGetCacheLocationsByBackendWithBackendSelectors) {

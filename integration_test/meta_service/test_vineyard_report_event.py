@@ -150,12 +150,13 @@ def _make_single_spec(name, uri):
     return [{"name": name, "uri": uri}]
 
 
-def _ev_block_delete(block_key, medium):
+def _ev_block_delete(block_key, medium, spec_names=None):
     return {
         "event_type": "EVENT_BLOCK_DELETE",
         "block_delete": {
             "block_key": str(block_key),
             "medium": medium,
+            "spec_names": list(spec_names or []),
         },
     }
 
@@ -760,6 +761,160 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
         self._assert_uri_absent(key_mem_deleted, uri_mem_deleted, "t16d_query_mem_deleted")
         self._assert_uri_present(key_mem_kept, uri_mem_kept, "t16d_query_mem_kept")
         self._assert_uri_present(key_disk_kept, uri_disk_kept, "t16d_query_disk_kept")
+
+    # 16e. Mamba-only reports are accepted but ignored for current full-attention matching.
+    def test_16e_mamba_only_report_does_not_delete_full_attention(self):
+        host = "192.168.1.244:8080"
+        medium = "gpu"
+        full_key = 8131
+        mamba_key = 8132
+        full_uri = _build_vineyard_uri(host, medium, {"obj_id": "full"})
+        mamba_uri = _build_vineyard_uri(host, medium, {"obj_id": "mamba"})
+
+        self.client.report_event(_make_request(self.instance_id, host, [
+            _ev_node_register([medium]),
+            _ev_block_add(
+                full_key,
+                medium,
+                _make_single_spec("full_attention:group=0:tp=0", full_uri),
+            ),
+        ], trace_id="t16e_full_add"))
+        self._assert_uri_present(full_key, full_uri, "t16e_query_full_before")
+
+        self.client.report_event(_make_request(self.instance_id, host, [
+            _ev_block_snapshot(medium, [
+                (mamba_key, _make_single_spec("mamba_state:group=1", mamba_uri)),
+            ]),
+            _ev_block_delete(full_key, medium, ["mamba_state:group=1"]),
+        ], trace_id="t16e_mamba_only"))
+
+        self._assert_uri_present(full_key, full_uri, "t16e_query_full_after")
+        self._assert_uri_absent(mamba_key, mamba_uri, "t16e_query_mamba_after")
+
+    # 16f. Snapshot is an ordering barrier inside one ReportEvent request.
+    def test_16f_snapshot_ordering_barrier_inside_batch(self):
+        host = "192.168.1.245:8080"
+        medium = "mem"
+        key_add_after_snapshot = 8141
+        key_add_before_snapshot = 8142
+        uri_after = _build_vineyard_uri(host, medium, {"obj_id": "after"})
+        uri_before = _build_vineyard_uri(host, medium, {"obj_id": "before"})
+
+        self.client.report_event(_make_request(self.instance_id, host, [
+            _ev_node_register([medium]),
+            _ev_block_snapshot(medium, []),
+            _ev_block_add(
+                key_add_after_snapshot,
+                medium,
+                _make_single_spec("tp0", uri_after),
+            ),
+        ], trace_id="t16f_snapshot_then_add"))
+        self._assert_uri_present(key_add_after_snapshot, uri_after, "t16f_query_after_present")
+
+        self.client.report_event(_make_request(self.instance_id, host, [
+            _ev_block_add(
+                key_add_before_snapshot,
+                medium,
+                _make_single_spec("tp0", uri_before),
+            ),
+            _ev_block_snapshot(medium, []),
+        ], trace_id="t16f_add_then_snapshot"))
+        self._assert_uri_absent(key_add_after_snapshot, uri_after, "t16f_query_after_deleted")
+        self._assert_uri_absent(key_add_before_snapshot, uri_before, "t16f_query_before_deleted")
+
+    # 16g. Per-item failures do not drop other valid mutations in the same batch.
+    def test_16g_partial_block_add_failure_keeps_valid_adds(self):
+        host = "192.168.1.246:8080"
+        medium = "mem"
+        key_a = 8151
+        key_b = 8152
+        uri_a = _build_vineyard_uri(host, medium, {"obj_id": "valid_a"})
+        uri_b = _build_vineyard_uri(host, medium, {"obj_id": "valid_b"})
+        invalid_uri = _build_vineyard_uri(host, medium, {"obj_id": "invalid"})
+
+        body = self.client.report_event(
+            _make_request(self.instance_id, host, [
+                _ev_node_register([medium]),
+                _ev_block_add(key_a, medium, _make_single_spec("tp0", uri_a)),
+                {
+                    "event_type": "EVENT_BLOCK_ADD",
+                    "block_add": {
+                        "block_key": "not-an-int64",
+                        "medium": medium,
+                        "specs": _make_single_spec("tp0", invalid_uri),
+                    },
+                },
+                _ev_block_add(key_b, medium, _make_single_spec("tp0", uri_b)),
+            ], trace_id="t16g_partial_add"),
+            check_ok=False,
+        )
+        item_results = body.get("item_results", [])
+        self.assertGreaterEqual(len(item_results), 4, json.dumps(body, ensure_ascii=False))
+        self.assertNotIn(item_results[2], ("OK", 1, "1"), json.dumps(body, ensure_ascii=False))
+
+        self._assert_uri_present(key_a, uri_a, "t16g_query_valid_a")
+        self._assert_uri_present(key_b, uri_b, "t16g_query_valid_b")
+
+    # 16h. Snapshot diff is scoped by host even when the same block exists on another host.
+    def test_16h_snapshot_same_block_other_host_survives(self):
+        host_a = "192.168.1.247:8080"
+        host_b = "192.168.1.248:8080"
+        medium = "mem"
+        block_key = 8161
+        uri_a = _build_vineyard_uri(host_a, medium, {"obj_id": "same_block_a"})
+        uri_b = _build_vineyard_uri(host_b, medium, {"obj_id": "same_block_b"})
+
+        self.client.report_event(_make_request(self.instance_id, host_a, [
+            _ev_node_register([medium]),
+            _ev_block_snapshot(medium, [
+                (block_key, _make_single_spec("host_a_full", uri_a)),
+            ]),
+        ], trace_id="t16h_snapshot_host_a"))
+        self.client.report_event(_make_request(self.instance_id, host_b, [
+            _ev_node_register([medium]),
+            _ev_block_snapshot(medium, [
+                (block_key, _make_single_spec("host_b_full", uri_b)),
+            ]),
+        ], trace_id="t16h_snapshot_host_b"))
+        self._assert_uri_present(block_key, uri_a, "t16h_query_a_before")
+        self._assert_uri_present(block_key, uri_b, "t16h_query_b_before")
+
+        self.client.report_event(_make_request(self.instance_id, host_a, [
+            _ev_block_snapshot(medium, []),
+        ], trace_id="t16h_snapshot_host_a_empty"))
+
+        self._assert_uri_absent(block_key, uri_a, "t16h_query_a_after")
+        self._assert_uri_present(block_key, uri_b, "t16h_query_b_after")
+
+    # 16i. Mixed full-attention and mamba specs store/match only full-attention today.
+    def test_16i_full_attention_and_mamba_mixed_report(self):
+        host = "192.168.1.249:8080"
+        medium = "gpu"
+        block_key = 8171
+        full_uri = _build_vineyard_uri(host, medium, {"obj_id": "full"})
+        mamba_uri = _build_vineyard_uri(host, medium, {"obj_id": "mamba"})
+
+        self.client.report_event(_make_request(self.instance_id, host, [
+            _ev_node_register([medium]),
+            _ev_block_snapshot(medium, [
+                (block_key, [
+                    {"name": "full_attention:group=0:tp=0", "uri": full_uri},
+                    {"name": "mamba_state:group=1", "uri": mamba_uri},
+                ]),
+            ]),
+        ], trace_id="t16i_mixed_snapshot"))
+        self._assert_uri_present(block_key, full_uri, "t16i_query_full_after_snapshot")
+        self._assert_uri_absent(block_key, mamba_uri, "t16i_query_mamba_after_snapshot")
+
+        self.client.report_event(_make_request(self.instance_id, host, [
+            _ev_block_delete(block_key, medium, ["mamba_state:group=1"]),
+        ], trace_id="t16i_mamba_delete"))
+        self._assert_uri_present(block_key, full_uri, "t16i_query_full_after_mamba_delete")
+
+        self.client.report_event(_make_request(self.instance_id, host, [
+            _ev_block_delete(block_key, medium, ["full_attention:group=0:tp=0"]),
+        ], trace_id="t16i_full_delete"))
+        self._assert_uri_absent(block_key, full_uri, "t16i_query_full_after_full_delete")
 
     # 16a. Heartbeat timeout -> location filtered out, then recovery on heartbeat resume.
     def test_16a_heartbeat_timeout_then_recovery(self):

@@ -209,6 +209,7 @@ private:
     static bool HasPrefix(const std::string &s, const std::string &prefix);
     static bool IsMambaLocationSpecName(const std::string &name);
     static bool IsFullAttentionLocationSpecName(const std::string &name);
+    static bool ContainsFullAttentionLocationSpec(const std::vector<LocationSpec> &specs);
     static bool ContainsFullAttentionSpecName(const google::protobuf::RepeatedPtrField<std::string> &spec_names);
     static std::vector<LocationSpec> BuildFullAttentionSpecs(
         const google::protobuf::RepeatedPtrField<proto::meta::LocationSpec> &proto_specs);
@@ -227,6 +228,18 @@ private:
     static ServiceMetricsCollector *FindReportEventSubCollector(RequestContext *request_context,
                                                                 const std::string &api_name);
     static void SetReportEventItemEcIfOk(ReportEventState *state, int event_index, ErrorCode ec);
+    static bool HasReportEventKeyFailure(const std::vector<ErrorCode> &per_key_ec);
+    static bool HasReportEventHardLocationFailure(const std::vector<std::vector<ErrorCode>> &per_location_ec);
+    static ErrorCode ResolveReportEventKeyError(ErrorCode aggregate_ec,
+                                                bool has_specific_key_failure,
+                                                const std::vector<ErrorCode> &per_key_ec,
+                                                size_t key_index);
+    static ErrorCode ResolveReportEventLocationError(
+        ErrorCode aggregate_ec,
+        bool has_specific_hard_location_failure,
+        const std::vector<std::vector<ErrorCode>> &per_location_ec,
+        size_t key_index,
+        size_t location_index);
 
     bool BuildReportEventLocationId(const std::string &trace_id,
                                     EventReportingBackend *event_backend,

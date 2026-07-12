@@ -1,4 +1,6 @@
 #include <atomic>
+#include <map>
+#include <set>
 #include <thread>
 
 #include "kv_cache_manager/common/redis_client.h"
@@ -194,6 +196,76 @@ TEST_F(MetaAsyncRedisBackendTest, TestDeleteLocations) {
     auto results = backend_->DeleteLocations(nullptr, keys, location_ids);
     ASSERT_EQ(1, results.size());
     ASSERT_EQ(EC_OK, results[0]);
+}
+
+TEST_F(MetaAsyncRedisBackendTest, TestLocationIndexPassthrough) {
+    config_->SetStorageUri("redis://user:pass@host:6379/?async_queue_count=1&async_max_batch=64&async_wait_us=1000"
+                           "&async_max_size=1000&async_drain_ms=2000&client_min_pool_size=1&client_max_pool_size=1");
+    std::map<std::string, std::set<std::string>> redis_sets;
+    EXPECT_CALL(*backend_, CreateRedisClient()).WillRepeatedly(Invoke([this, &redis_sets]() {
+        StandardUri empty_uri;
+        auto mock = std::make_shared<::testing::NiceMock<MockRedisClient>>(empty_uri);
+        ON_CALL(*mock, IsContextOk()).WillByDefault(Return(true));
+        ON_CALL(*mock, Reconnect()).WillByDefault(Return(true));
+        ON_CALL(*mock, TryExecPipeline(_)).WillByDefault(Invoke([this, &redis_sets](const std::vector<CmdArgs> &cmds) {
+            std::vector<ReplyUPtr> replies;
+            replies.reserve(cmds.size());
+            for (const auto &cmd : cmds) {
+                if (cmd.size() >= 3 && cmd[0] == "SADD") {
+                    auto &members = redis_sets[cmd[1]];
+                    int64_t added = 0;
+                    for (size_t i = 2; i < cmd.size(); ++i) {
+                        added += members.insert(cmd[i]).second ? 1 : 0;
+                    }
+                    replies.emplace_back(MakeFakeReplyInteger(added));
+                } else if (cmd.size() >= 3 && cmd[0] == "SREM") {
+                    auto &members = redis_sets[cmd[1]];
+                    int64_t removed = 0;
+                    for (size_t i = 2; i < cmd.size(); ++i) {
+                        removed += members.erase(cmd[i]);
+                    }
+                    replies.emplace_back(MakeFakeReplyInteger(removed));
+                } else if (cmd.size() == 2 && cmd[0] == "SMEMBERS") {
+                    std::vector<std::optional<std::string>> members;
+                    for (const auto &member : redis_sets[cmd[1]]) {
+                        members.emplace_back(member);
+                    }
+                    replies.emplace_back(MakeFakeReplyArrayString(members));
+                } else {
+                    replies.emplace_back(MakeFakeReplyInteger(1));
+                }
+            }
+            return replies;
+        }));
+        return mock;
+    }));
+
+    ASSERT_EQ(EC_OK, backend_->Init("test_instance", config_));
+    ASSERT_EQ(EC_OK, backend_->Open());
+
+    KeyTypeVec out_keys = {999};
+    EXPECT_EQ(EC_BADARGS, backend_->AddKeysToLocationIndex(nullptr, "", {}));
+    EXPECT_EQ(EC_BADARGS, backend_->RemoveKeysFromLocationIndex(nullptr, "", {}));
+    EXPECT_EQ(EC_BADARGS, backend_->AddKeysToLocationIndex(nullptr, "", {1}));
+    EXPECT_EQ(EC_BADARGS, backend_->RemoveKeysFromLocationIndex(nullptr, "", {1}));
+    EXPECT_EQ(EC_BADARGS, backend_->GetKeysByLocationIndex(nullptr, "", out_keys));
+    EXPECT_TRUE(out_keys.empty());
+
+    ASSERT_EQ(EC_OK, backend_->AddKeysToLocationIndex(nullptr, "loc_a", {3, 1, 3}));
+    ASSERT_EQ(EC_OK, backend_->AddKeysToLocationIndex(nullptr, "loc_b", {2}));
+    ASSERT_EQ(EC_OK, backend_->GetKeysByLocationIndex(nullptr, "loc_a", out_keys));
+    EXPECT_EQ((KeyTypeVec{1, 3}), out_keys);
+    ASSERT_EQ(EC_OK, backend_->GetKeysByLocationIndex(nullptr, "loc_b", out_keys));
+    EXPECT_EQ((KeyTypeVec{2}), out_keys);
+
+    ASSERT_EQ(EC_OK, backend_->RemoveKeysFromLocationIndex(nullptr, "loc_a", {1, 404}));
+    ASSERT_EQ(EC_OK, backend_->GetKeysByLocationIndex(nullptr, "loc_a", out_keys));
+    EXPECT_EQ((KeyTypeVec{3}), out_keys);
+
+    redis_sets["kvcache:instance_test_instance:locidx_loc_bad"].insert("not-int64");
+    out_keys = {999};
+    EXPECT_EQ(EC_CORRUPTION, backend_->GetKeysByLocationIndex(nullptr, "loc_bad", out_keys));
+    EXPECT_TRUE(out_keys.empty());
 }
 
 TEST_F(MetaAsyncRedisBackendTest, TestWriteEmptyKeys) {
