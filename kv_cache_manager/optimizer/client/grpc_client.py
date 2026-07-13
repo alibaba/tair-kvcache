@@ -324,9 +324,9 @@ class OptimizerGrpcClient(OptimizerClientBase):
         trace_id: Optional[str] = None,
     ):
         spec_size = block_bytes if block_bytes and block_bytes > 0 else 1
-        specs = list(location_spec_infos) if location_spec_infos is not None else [
+        specs = list(location_spec_infos or []) or [
             pb2.LocationSpecInfo(name="default", size=spec_size)]
-        groups = list(location_spec_groups) if location_spec_groups is not None else [
+        groups = list(location_spec_groups or []) or [
             pb2.LocationSpecGroup(name="full", spec_names=[specs[0].name])]
         state = optimizer_state_info or pb2.OptimizerStateInfo(
             full_location_spec_group_name=groups[0].name)

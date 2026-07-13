@@ -46,6 +46,7 @@ class BenchmarkConfig:
         self.trace_loop_count = int(os.getenv("BENCH_TRACE_LOOP_COUNT", "0"))
         self.trace_max_requests = int(os.getenv("BENCH_TRACE_MAX_REQUESTS", "0"))
 
+        # A positive loop count means the benchmark must loop to reach that count.
         if self.trace_loop_count > 0:
             self.trace_loop = True
 

@@ -64,8 +64,8 @@ class OptimizerHttpClient(OptimizerClientBase):
     @staticmethod
     def _normalize_address(address: str) -> str:
         if not address.startswith("http://") and not address.startswith("https://"):
-            return f"http://{address}"
-        return address
+            address = f"http://{address}"
+        return address.rstrip("/")
 
     def _build_session(self) -> requests.Session:
         session = requests.Session()
@@ -73,6 +73,7 @@ class OptimizerHttpClient(OptimizerClientBase):
             total=self._max_retries,
             backoff_factor=self._retry_backoff_seconds,
             status_forcelist=_RETRYABLE_STATUS_CODES,
+            allowed_methods=frozenset(["POST"]),
         )
         adapter = HTTPAdapter(
             pool_connections=32,
@@ -189,9 +190,9 @@ class OptimizerHttpClient(OptimizerClientBase):
         trace_id: Optional[str] = None,
     ):
         spec_size = block_bytes if block_bytes and block_bytes > 0 else 1
-        specs = list(location_spec_infos) if location_spec_infos is not None else [
+        specs = list(location_spec_infos or []) or [
             pb2.LocationSpecInfo(name="default", size=spec_size)]
-        groups = list(location_spec_groups) if location_spec_groups is not None else [
+        groups = list(location_spec_groups or []) or [
             pb2.LocationSpecGroup(name="full", spec_names=[specs[0].name])]
         state = optimizer_state_info or pb2.OptimizerStateInfo(
             full_location_spec_group_name=groups[0].name)

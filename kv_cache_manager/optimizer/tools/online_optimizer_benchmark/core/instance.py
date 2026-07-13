@@ -20,8 +20,9 @@ def setup_instance(client: Any, config: BenchmarkConfig):
     logger.info("Creating instance group: %s", config.instance_group)
     if config.block_bytes <= 0:
         logger.warning(
-            "BENCH_BLOCK_BYTES 未设置（block 字节数=1 占位），容量近似无限，"
-            "各容量档命中率将无区分度；若需真实容量曲线请设置 BENCH_BLOCK_BYTES")
+            "BENCH_BLOCK_BYTES is not set (using block byte size=1 placeholder); "
+            "capacity is approximately unlimited and hit rates will not differ "
+            "across capacity buckets. Set BENCH_BLOCK_BYTES for real capacity curves.")
 
     try:
         client.create_instance_group(

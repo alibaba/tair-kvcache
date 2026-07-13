@@ -65,6 +65,8 @@ class StatsCollector:
                 stats.total_requests += 1
                 stats.error_count += 1
                 stats.total_latency_ms += latency_ms
+                stats.min_latency_ms = min(stats.min_latency_ms, latency_ms)
+                stats.max_latency_ms = max(stats.max_latency_ms, latency_ms)
 
     def maybe_report_interval(self):
         """Check and print interval report if enough time has passed."""

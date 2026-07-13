@@ -144,6 +144,8 @@ class TraceReplayRunner:
         loader = TraceDataLoader(config.trace_data_dir, loop=config.trace_loop)
         summary = loader.scan_summary()
         self._print_trace_summary(summary)
+        if summary.total_records == 0:
+            raise ValueError(f"No trace records found in {config.trace_data_dir}")
 
         speed_factor = config.trace_speed_factor
         max_requests = config.trace_max_requests

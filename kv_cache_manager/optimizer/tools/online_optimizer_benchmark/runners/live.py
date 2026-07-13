@@ -18,25 +18,31 @@ class TokenBucket(object):
     """Token bucket rate limiter with Condition-based waiting."""
 
     def __init__(self, rate: float, capacity: float):
+        if rate <= 0:
+            raise ValueError("BENCH_QPS must be greater than 0")
+        if capacity <= 0:
+            raise ValueError("BENCH_THREAD_COUNT must be greater than 0")
         self._rate = rate
         self._capacity = capacity
         self._tokens = capacity
         self._last_refill = time.monotonic()
         self._condition = threading.Condition()
 
-    def acquire(self):
-        """Block until a token is available."""
+    def acquire(self, stop_event=None):
+        """Block until a token is available or the optional stop event is set."""
         with self._condition:
             while True:
+                if stop_event is not None and stop_event.is_set():
+                    return False
                 now = time.monotonic()
                 elapsed = now - self._last_refill
                 self._tokens = min(self._capacity, self._tokens + elapsed * self._rate)
                 self._last_refill = now
                 if self._tokens >= 1.0:
                     self._tokens -= 1.0
-                    return
+                    return True
                 wait_time = (1.0 - self._tokens) / self._rate
-                self._condition.wait(timeout=wait_time)
+                self._condition.wait(timeout=min(wait_time, 0.1))
 
 
 class BenchmarkRunner:
@@ -77,7 +83,8 @@ class BenchmarkRunner:
         def worker(thread_id: int):
             generator = generators[thread_id]
             while not self._stop_event.is_set():
-                bucket.acquire()
+                if not bucket.acquire(self._stop_event):
+                    break
                 if self._stop_event.is_set():
                     break
 

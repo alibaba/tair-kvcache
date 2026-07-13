@@ -20,10 +20,10 @@ logger = logging.getLogger(__name__)
 def main():
     config = BenchmarkConfig()
     logger.info("\n%s", config)
-
-    client = create_benchmark_client(config)
+    client = None
 
     try:
+        client = create_benchmark_client(config)
         if config.mode in ("setup_and_run", "setup_only", "trace_replay"):
             setup_instance(client, config)
 
@@ -53,7 +53,8 @@ def main():
         logger.exception("Benchmark failed")
         sys.exit(1)
     finally:
-        client.close()
+        if client is not None:
+            client.close()
 
 
 if __name__ == "__main__":
