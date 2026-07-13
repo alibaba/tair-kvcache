@@ -1,8 +1,6 @@
-build/
-.gradle/
+target/
 *.class
 *.jar
-!gradle/wrapper/gradle-wrapper.jar
 *.log
 .idea/
 *.iml
