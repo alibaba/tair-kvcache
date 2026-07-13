@@ -71,6 +71,7 @@ class LeaderDiscovery {
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicBoolean immediateRefresh = new AtomicBoolean(false);
 
+    private volatile ServiceDiscovery serviceDiscovery; // optional: for multi-node discovery
     // C3 fix: Use immutable holder for atomic host+port reads
     private volatile LeaderAddress currentAddress;
     // M1 fix: Make scheduler volatile for safe cross-thread publication
@@ -78,6 +79,17 @@ class LeaderDiscovery {
     // C2 fix: Lock for channel creation to prevent check-then-act race
     private final Object channelLock = new Object();
     private ManagedChannel discoveryChannel; // guarded by channelLock
+    private String channelHost; // guarded by channelLock — tracks current channel target
+    private int channelPort; // guarded by channelLock
+
+    /**
+     * Set an optional {@link ServiceDiscovery} for multi-node leader discovery.
+     * When set, {@link #discoverLeader()} will pick endpoints from the discovery
+     * instead of always using the seed address.
+     */
+    void setServiceDiscovery(ServiceDiscovery serviceDiscovery) {
+        this.serviceDiscovery = serviceDiscovery;
+    }
 
     LeaderDiscovery(String seedAddress, int grpcPort, String instanceId, int refreshIntervalSeconds) {
         this.seedAddress = seedAddress;
@@ -129,17 +141,37 @@ class LeaderDiscovery {
      * @return true if leader was discovered and address updated
      */
     boolean discoverLeader() {
+        // Resolve target node for the discovery query
+        String targetHost = seedAddress;
+        int targetPort = grpcPort;
+        ServiceDiscovery sd = serviceDiscovery;
+        if (sd != null) {
+            ServiceEndpoint ep = sd.getOneEndpoint();
+            if (ep != null) {
+                targetHost = ep.getHost();
+                targetPort = ep.getPort();
+            }
+        }
+
         ManagedChannel channel;
         // C2 fix: Lock channel creation to prevent check-then-act race
         synchronized (channelLock) {
-            if (discoveryChannel == null || discoveryChannel.isShutdown()) {
-                discoveryChannel = ManagedChannelBuilder.forAddress(seedAddress, grpcPort)
+            boolean needRebuild = discoveryChannel == null || discoveryChannel.isShutdown()
+                    || !targetHost.equals(channelHost) || targetPort != channelPort;
+            if (needRebuild) {
+                if (discoveryChannel != null) {
+                    discoveryChannel.shutdownNow();
+                }
+                discoveryChannel = ManagedChannelBuilder.forAddress(targetHost, targetPort)
                         .usePlaintext()
                         .build();
+                channelHost = targetHost;
+                channelPort = targetPort;
             }
             channel = discoveryChannel;
         }
 
+        String target = targetHost + ":" + targetPort;
         try {
             MetaServiceGrpc.MetaServiceBlockingStub stub = MetaServiceGrpc.newBlockingStub(channel);
 
@@ -153,19 +185,19 @@ class LeaderDiscovery {
 
             if (!response.hasHeader() || response.getHeader().getStatus().getCode() != ErrorCode.OK) {
                 String msg = response.hasHeader() ? response.getHeader().getStatus().getMessage() : "no header";
-                LOG.warn("Leader discovery from {} returned error: {}", seedAddress, msg);
+                LOG.warn("Leader discovery from {} returned error: {}", target, msg);
                 return false;
             }
 
             if (!response.hasLeaderEndpoint()) {
-                LOG.warn("Leader discovery from {}: leader_endpoint missing", seedAddress);
+                LOG.warn("Leader discovery from {}: leader_endpoint missing", target);
                 return false;
             }
 
             MetaNodeEndpoint endpoint = response.getLeaderEndpoint();
             if (endpoint.getHost().isEmpty() || endpoint.getMetaRpcPort() <= 0) {
                 LOG.warn("Leader discovery from {}: leader_endpoint incomplete (host={}, port={})",
-                        seedAddress, endpoint.getHost(), endpoint.getMetaRpcPort());
+                        target, endpoint.getHost(), endpoint.getMetaRpcPort());
                 return false;
             }
 
@@ -180,12 +212,14 @@ class LeaderDiscovery {
             }
             return true;
         } catch (Exception e) {
-            LOG.warn("Leader discovery from {} failed: {}", seedAddress, e.getMessage());
+            LOG.warn("Leader discovery from {} failed: {}", target, e.getMessage());
             // Channel may be broken, force rebuild next time
             synchronized (channelLock) {
                 if (discoveryChannel != null) {
                     discoveryChannel.shutdownNow();
                     discoveryChannel = null;
+                    channelHost = null;
+                    channelPort = 0;
                 }
             }
             return false;

@@ -3,10 +3,18 @@ package com.alibaba.tair.kvcm.client;
 /**
  * Configuration for KVCM MetaClient.
  * Use {@link Builder} to construct instances.
+ * <p>
+ * The {@code seedAddress} supports URL scheme format for service discovery:
+ * <ul>
+ *   <li>{@code static://ip:port[,ip:port]...} — static endpoint list</li>
+ *   <li>{@code spectrum://vsid[?params]} — Spectrum gateway discovery (requires SPI provider)</li>
+ * </ul>
+ * Plain {@code host:port} is automatically converted to {@code static://host:port}.
  */
 public final class MetaClientConfig {
 
     private final String seedAddress;
+    private final String serviceDiscoveryUrl;
     private final int grpcPort;
     private final Integer httpPort; // null = HTTP disabled
     private final String instanceId;
@@ -17,6 +25,7 @@ public final class MetaClientConfig {
 
     private MetaClientConfig(Builder builder) {
         this.seedAddress = builder.seedAddress;
+        this.serviceDiscoveryUrl = builder.serviceDiscoveryUrl;
         this.grpcPort = builder.grpcPort;
         this.httpPort = builder.httpPort;
         this.instanceId = builder.instanceId;
@@ -26,7 +35,12 @@ public final class MetaClientConfig {
         this.leaderRefreshIntervalSeconds = builder.leaderRefreshIntervalSeconds;
     }
 
+    /** Original seed address as provided (may be URL scheme or plain host:port). */
     public String getSeedAddress() { return seedAddress; }
+
+    /** Resolved service discovery URL (always in scheme://body format). */
+    public String getServiceDiscoveryUrl() { return serviceDiscoveryUrl; }
+
     public int getGrpcPort() { return grpcPort; }
     public Integer getHttpPort() { return httpPort; }
     public boolean isHttpEnabled() { return httpPort != null; }
@@ -42,6 +56,7 @@ public final class MetaClientConfig {
 
     public static final class Builder {
         private final String seedAddress;
+        private String serviceDiscoveryUrl;
         private int grpcPort = 6381;
         private Integer httpPort = null;
         private String instanceId = "";
@@ -66,7 +81,7 @@ public final class MetaClientConfig {
         public Builder leaderRefreshIntervalSeconds(int leaderRefreshIntervalSeconds) { this.leaderRefreshIntervalSeconds = leaderRefreshIntervalSeconds; return this; }
 
         public MetaClientConfig build() {
-            // M3 fix: Validate numeric parameters
+            // Validate numeric parameters
             if (grpcPort <= 0 || grpcPort > 65535) {
                 throw new IllegalArgumentException("grpcPort must be between 1 and 65535, got: " + grpcPort);
             }
@@ -82,7 +97,43 @@ public final class MetaClientConfig {
             if (leaderRefreshIntervalSeconds <= 0) {
                 throw new IllegalArgumentException("leaderRefreshIntervalSeconds must be > 0, got: " + leaderRefreshIntervalSeconds);
             }
+
+            // Normalize seedAddress to URL scheme format
+            this.serviceDiscoveryUrl = normalizeToDiscoveryUrl(seedAddress, grpcPort);
+
             return new MetaClientConfig(this);
         }
+    }
+
+    /**
+     * Normalize a seed address to a service discovery URL.
+     * <ul>
+     *   <li>Already has scheme ({@code static://}, {@code spectrum://}) → use as-is</li>
+     *   <li>Plain {@code host:port} → {@code static://host:port}</li>
+     *   <li>Plain {@code host} → {@code static://host:grpcPort}</li>
+     * </ul>
+     */
+    static String normalizeToDiscoveryUrl(String seedAddress, int grpcPort) {
+        // Already in URL scheme format
+        if (seedAddress.contains("://")) {
+            int sep = seedAddress.indexOf("://");
+            if (sep <= 0) {
+                throw new IllegalArgumentException("invalid seed address, malformed scheme: " + seedAddress);
+            }
+            String rest = seedAddress.substring(sep + 3);
+            if (rest.isEmpty()) {
+                throw new IllegalArgumentException("invalid seed address, empty body: " + seedAddress);
+            }
+            return seedAddress;
+        }
+
+        // Plain host:port or just host
+        int colonIdx = seedAddress.lastIndexOf(':');
+        if (colonIdx > 0 && colonIdx < seedAddress.length() - 1) {
+            // Has port already: host:port → static://host:port
+            return "static://" + seedAddress;
+        }
+        // Just host → static://host:grpcPort
+        return "static://" + seedAddress + ":" + grpcPort;
     }
 }

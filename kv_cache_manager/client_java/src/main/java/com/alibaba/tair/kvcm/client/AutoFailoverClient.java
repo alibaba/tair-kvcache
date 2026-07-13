@@ -35,25 +35,43 @@ public class AutoFailoverClient implements MetaClient {
     private volatile LeaderAddress currentAddress;
     private volatile HttpMetaClient httpClient; // volatile: recreated on leader change
     private final LeaderDiscovery leaderDiscovery; // null if auto-discover disabled
+    private final ServiceDiscovery serviceDiscovery; // null if not configured
     private final Object reconnectLock = new Object();
     private final AtomicBoolean closed = new AtomicBoolean(false);
 
     AutoFailoverClient(MetaClientConfig config) {
         this.config = config;
-        int httpPort = config.isHttpEnabled() ? config.getHttpPort() : 0;
-        this.currentAddress = new LeaderAddress(config.getSeedAddress(), config.getGrpcPort(), httpPort);
-        this.grpcClient = new GrpcMetaClient(currentAddress.host, currentAddress.grpcPort,
-                config.getCallTimeoutMs());
+
+        // Service discovery: resolve initial endpoint from URL scheme
+        this.serviceDiscovery = ServiceDiscoveryFactory.tryCreate(config.getServiceDiscoveryUrl());
+        String resolvedHost = config.getSeedAddress();
+        int resolvedGrpcPort = config.getGrpcPort();
+        int resolvedHttpPort = config.isHttpEnabled() ? config.getHttpPort() : 0;
+
+        if (serviceDiscovery != null) {
+            ServiceEndpoint ep = serviceDiscovery.getOneEndpoint();
+            if (ep != null) {
+                resolvedHost = ep.getHost();
+                resolvedGrpcPort = ep.getPort();
+                LOG.info("Service discovery ({}) resolved endpoint: {}:{}",
+                        serviceDiscovery.getType(), resolvedHost, resolvedGrpcPort);
+            } else {
+                LOG.warn("Service discovery returned no endpoints, falling back to seed address");
+            }
+        }
+
+        this.currentAddress = new LeaderAddress(resolvedHost, resolvedGrpcPort, resolvedHttpPort);
+        this.grpcClient = new GrpcMetaClient(resolvedHost, resolvedGrpcPort, config.getCallTimeoutMs());
 
         if (config.isHttpEnabled()) {
-            this.httpClient = new HttpMetaClient(currentAddress.host, config.getHttpPort(),
-                    config.getCallTimeoutMs());
+            this.httpClient = new HttpMetaClient(resolvedHost, resolvedHttpPort, config.getCallTimeoutMs());
         }
 
         if (config.isAutoDiscoverLeader()) {
             this.leaderDiscovery = new LeaderDiscovery(
-                    config.getSeedAddress(), config.getGrpcPort(),
+                    resolvedHost, resolvedGrpcPort,
                     config.getInstanceId(), config.getLeaderRefreshIntervalSeconds());
+            leaderDiscovery.setServiceDiscovery(serviceDiscovery);
             leaderDiscovery.start();
             reconnectIfNeeded();
         } else {
@@ -68,6 +86,7 @@ public class AutoFailoverClient implements MetaClient {
         this.grpcClient = grpcClient;
         this.httpClient = httpClient;
         this.leaderDiscovery = null; // no leader discovery in test mode
+        this.serviceDiscovery = null; // no service discovery in test mode
     }
 
     // --- Instance management ---
@@ -171,6 +190,9 @@ public class AutoFailoverClient implements MetaClient {
             if (http != null) {
                 http.close();
             }
+        }
+        if (serviceDiscovery != null) {
+            serviceDiscovery.close();
         }
     }
 
