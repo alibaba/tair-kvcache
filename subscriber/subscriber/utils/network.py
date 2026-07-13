@@ -1,10 +1,7 @@
 from __future__ import annotations
 
 import ipaddress
-import os
 import socket
-
-from subscriber.utils.spectrum import fetch_spectrum_endpoints
 
 _ROUTE_PROBE_ADDRESS = ("192.0.2.1", 80)
 
@@ -38,20 +35,10 @@ def local_ip_address() -> str:
 
 
 async def resolve_host_ip_port() -> str:
-    """Resolve the local engine address from its Spectrum virtual service."""
+    """Resolve the local PAI-EAS worker address."""
 
-    virtual_service_id = os.environ.get("SPECTRUM_APPLICATION_SERVICE_ID", "")
-    if not virtual_service_id:
-        raise ValueError("Please specify SPECTRUM_APPLICATION_SERVICE_ID")
     address = local_ip_address()
-    endpoints = await fetch_spectrum_endpoints(virtual_service_id)
-    endpoint = next((item for item in endpoints if item.ip == address), None)
-    if endpoint is None:
-        raise ValueError(
-            "Spectrum did not return an endpoint for local IP "
-            f"{address!r} in SPECTRUM_APPLICATION_SERVICE_ID="
-            f"{virtual_service_id!r}"
-        )
     if ":" in address:
         address = f"[{address}]"
-    return f"{address}:{endpoint.port}"
+    # PAI-EAS worker port is always 8080
+    return f"{address}:8080"

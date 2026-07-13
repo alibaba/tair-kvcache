@@ -1,12 +1,21 @@
 from __future__ import annotations
 
-# Thin shim: use real dashlog when installed (prod), fall back to stdlib
-# logging when not available (local dev / CI without the internal wheel).
+import gzip
+import logging as _logging
+import os
+import shutil
+from collections.abc import Callable
+from logging.handlers import RotatingFileHandler
+
+_LOG_FILE_MAX_BYTES = 100 * 1024 * 1024
+_LOG_FILE_BACKUP_COUNT = 3
 try:
-    import logging as _logging
+    import dashlog as _dl
+except ImportError:
+    _dl = None
 
-    import dashlog as _dl  # type: ignore[import-not-found]
 
+if _dl is not None:
     _debug_enabled = False
 
     _LEVEL_TO_INT = {
@@ -32,17 +41,49 @@ try:
     error = _dl.error
     critical = _dl.critical
 
-except ImportError:
-    import logging as _logging
-    from logging.handlers import RotatingFileHandler
+else:
+
+    def _gzip_rotator(source: str, destination: str) -> None:
+        with open(source, "rb") as source_file, gzip.open(destination, "wb") as output:
+            shutil.copyfileobj(source_file, output)
+        os.remove(source)
+
+    class _GzipRotatingFileHandler(RotatingFileHandler):
+        """Rotate logs into compressed backups to bound disk usage."""
+
+        def __init__(
+            self,
+            filename: str | os.PathLike[str],
+            mode: str = "a",
+            maxBytes: int = 0,
+            backupCount: int = 0,
+            encoding: str | None = None,
+            delay: bool = False,
+            errors: str | None = None,
+        ) -> None:
+            super().__init__(
+                filename,
+                mode=mode,
+                maxBytes=maxBytes,
+                backupCount=backupCount,
+                encoding=encoding,
+                delay=delay,
+                errors=errors,
+            )
+            self.namer = lambda default_name: f"{default_name}.gz"
+            self.rotator = _gzip_rotator
 
     _log = _logging.getLogger("subscriber")
     _log.setLevel(_logging.INFO)
+    _log.propagate = False
 
     _fmt = _logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
 
-    _fh = RotatingFileHandler(
-        "subscriber.log", maxBytes=100 * 1024 * 1024, backupCount=3
+    _fh = _GzipRotatingFileHandler(
+        "subscriber.log",
+        maxBytes=_LOG_FILE_MAX_BYTES,
+        backupCount=_LOG_FILE_BACKUP_COUNT,
+        encoding="utf-8",
     )
     _fh.setFormatter(_fmt)
     _log.addHandler(_fh)
@@ -54,14 +95,14 @@ except ImportError:
     def init(name: str, *, level: str = "info", **_: object) -> None:
         log_level = getattr(_logging, level.upper(), _logging.INFO)
         _log.setLevel(log_level)
-        _log.info("dashlog not installed, using stdlib logging (name=%s)", name)
+        _log.info("initialized stdlib logging (name=%s)", name)
 
-    def _make_log(level: int):  # type: ignore[no-untyped-def]
+    def _make_log(level: int) -> Callable[..., None]:
         def _log_fn(
             msg: object,
             *args: object,
             step: str = "",
-            tags: dict | None = None,  # type: ignore[type-arg]
+            tags: dict[str, object] | None = None,
             exc_info: bool = False,
             **_: object,
         ) -> None:
@@ -69,7 +110,7 @@ except ImportError:
             if step:
                 parts.append(f"step={step}")
             if tags:
-                parts.append(" ".join(f"{k}={v}" for k, v in tags.items()))
+                parts.append(" ".join(f"{key}={value}" for key, value in tags.items()))
             _log.log(level, " | ".join(parts), exc_info=exc_info)
 
         return _log_fn

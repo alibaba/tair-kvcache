@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -17,6 +18,11 @@ from subscriber.types import AllBlocksCleared, KVEventBatch
 
 def _batch() -> list[KVEventBatch]:
     return [KVEventBatch(ts=1.0, events=[AllBlocksCleared()])]
+
+
+def test_queued_kv_event_batch_requires_receipt_timestamp() -> None:
+    with pytest.raises(TypeError):
+        QueuedKVEventBatch(_batch(), 1)
 
 
 @pytest.fixture
@@ -88,7 +94,7 @@ async def test_send_kv_events_sends_batch_when_epoch_unchanged(
 ) -> None:
     batch = _batch()
     queue: asyncio.Queue[QueuedKVEventBatch] = asyncio.Queue()
-    await queue.put(QueuedKVEventBatch(batch, 1))
+    await queue.put(QueuedKVEventBatch(batch, 1, received_at=time.monotonic()))
 
     sender = asyncio.create_task(send_kv_events(kvcm, coordinator, queue))
     await asyncio.sleep(0)
@@ -101,12 +107,33 @@ async def test_send_kv_events_sends_batch_when_epoch_unchanged(
     assert queue.empty()
 
 
+async def test_send_kv_events_reports_successful_batch_latency(
+    kvcm: MagicMock, coordinator: MagicMock
+) -> None:
+    batch = _batch()
+    queue: asyncio.Queue[QueuedKVEventBatch] = asyncio.Queue()
+    reporter = MagicMock()
+    await queue.put(QueuedKVEventBatch(batch, 1, received_at=time.monotonic() - 0.01))
+
+    sender = asyncio.create_task(
+        send_kv_events(kvcm, coordinator, queue, latency_reporter=reporter)
+    )
+    await asyncio.sleep(0)
+    sender.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await sender
+
+    reporter.report.assert_called_once()
+    assert reporter.report.call_args.args[0] >= 0.01
+
+
 async def test_send_kv_events_drops_batch_when_epoch_changed(
     kvcm: MagicMock, coordinator: MagicMock
 ) -> None:
     batch = _batch()
     queue: asyncio.Queue[QueuedKVEventBatch] = asyncio.Queue()
-    await queue.put(QueuedKVEventBatch(batch, 1))
+    await queue.put(QueuedKVEventBatch(batch, 1, received_at=time.monotonic()))
     coordinator.wait_ready_epoch.return_value = 2
     coordinator.is_epoch_current.return_value = False
 
@@ -127,8 +154,8 @@ async def test_send_kv_events_logs_failure_and_continues_with_next_batch(
     first_batch = _batch()
     second_batch = _batch()
     queue: asyncio.Queue[QueuedKVEventBatch] = asyncio.Queue()
-    await queue.put(QueuedKVEventBatch(first_batch, 1))
-    await queue.put(QueuedKVEventBatch(second_batch, 1))
+    await queue.put(QueuedKVEventBatch(first_batch, 1, received_at=time.monotonic()))
+    await queue.put(QueuedKVEventBatch(second_batch, 1, received_at=time.monotonic()))
     error_message = (
         "KVCM /api/reportEvent failed: INTERNAL_ERROR "
         "ReportEvent partially failed; item_results=['OK', 'INTERNAL_ERROR']"

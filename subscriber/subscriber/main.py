@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from contextlib import suppress
 from dataclasses import dataclass
 
@@ -9,6 +10,7 @@ from subscriber.config import SubscriberConfig
 from subscriber.engine.base import AbstractEngineAdapter
 from subscriber.health.coordinator import EngineHealthCoordinator
 from subscriber.kvcm.client import KvcmClient
+from subscriber.metrics import LatencyReporter
 from subscriber.types import KVEventBatch
 
 
@@ -18,6 +20,7 @@ class QueuedKVEventBatch:
 
     batches: list[KVEventBatch]
     epoch_snapshot: int
+    received_at: float
 
 
 async def consume_kv_events(
@@ -37,7 +40,9 @@ async def consume_kv_events(
                     step="kv_event_loop",
                 )
                 continue
-            await queue.put(QueuedKVEventBatch(batches, epoch_snapshot))
+            await queue.put(
+                QueuedKVEventBatch(batches, epoch_snapshot, time.monotonic())
+            )
     finally:
         await events.aclose()
 
@@ -46,6 +51,7 @@ async def send_kv_events(
     kvcm: KvcmClient,
     coordinator: EngineHealthCoordinator,
     queue: asyncio.Queue[QueuedKVEventBatch],
+    latency_reporter: LatencyReporter | None = None,
 ) -> None:
     """Send queued batches only if their captured epoch is still current."""
 
@@ -65,6 +71,11 @@ async def send_kv_events(
                 continue
             try:
                 await kvcm.send_batch(queued.batches, epoch)
+                if latency_reporter is not None:
+                    try:
+                        latency_reporter.report(time.monotonic() - queued.received_at)
+                    except Exception:
+                        pass
             except Exception as exc:
                 # TODO: Buffer or replay batches dropped while KVCM is unavailable.
                 logger.warning(
@@ -97,8 +108,12 @@ async def kv_event_loop(
         raise ValueError("queue_maxsize must be >= 1")
 
     queue: asyncio.Queue[QueuedKVEventBatch] = asyncio.Queue(maxsize=queue_maxsize)
+    latency_reporter = LatencyReporter()
+    await latency_reporter.start()
     producer = asyncio.create_task(consume_kv_events(adapter, coordinator, queue))
-    sender = asyncio.create_task(send_kv_events(kvcm, coordinator, queue))
+    sender = asyncio.create_task(
+        send_kv_events(kvcm, coordinator, queue, latency_reporter)
+    )
     try:
         done, _ = await asyncio.wait(
             {producer, sender}, return_when=asyncio.FIRST_COMPLETED
@@ -129,6 +144,7 @@ async def kv_event_loop(
         producer.cancel()
         with suppress(asyncio.CancelledError):
             await producer
+        await latency_reporter.stop()
 
 
 async def run(config: SubscriberConfig) -> None:

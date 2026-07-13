@@ -88,7 +88,6 @@ class SubscriberConfig:
         parser.add_argument("--zmq-topic", default=default)
         parser.add_argument("--zmq-replay-timeout-s", type=float, default=default)
         parser.add_argument("--data-parallel-size", type=int, default=default)
-        parser.add_argument("--block-size", type=int, default=default)
         parser.add_argument("--kvcm-heartbeat-interval-s", type=float, default=default)
         parser.add_argument("--kvcm-request-timeout-s", type=float, default=default)
         parser.add_argument("--kv-event-queue-maxsize", type=int, default=default)

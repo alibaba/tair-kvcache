@@ -100,7 +100,9 @@ def _make_kvcm(config: SubscriberConfig, fake_sdk: FakeSdkClient) -> KvcmClient:
 
 
 def test_storage_type_maps_engine_type() -> None:
-    assert _client(SubscriberConfig(engine_type="vllm"))._storage_type == "ST_EVENT_REPORT"
+    assert (
+        _client(SubscriberConfig(engine_type="vllm"))._storage_type == "ST_EVENT_REPORT"
+    )
     assert (
         KvcmClient(
             SubscriberConfig(engine_type="unknown"),
