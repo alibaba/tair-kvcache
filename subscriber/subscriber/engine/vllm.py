@@ -432,4 +432,4 @@ class VllmAdapter(AbstractEngineAdapter):
         return list(_KVCM_MEDIUM_MAP.values())
 
     def storage_type(self) -> str:
-        return "ST_VLLM"
+        return "ST_EVENT_REPORT"

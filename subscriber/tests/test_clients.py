@@ -81,7 +81,7 @@ def _client(config: SubscriberConfig | None = None) -> KvcmClient:
     client = KvcmClient(
         config or SubscriberConfig(),
         medium_mapper=_vllm_medium_mapper,
-        storage_type="ST_VLLM",
+        storage_type="ST_EVENT_REPORT",
         supported_mediums=["hbm", "mem"],
         manager_client=FakeSdkClient(),
     )
@@ -93,14 +93,14 @@ def _make_kvcm(config: SubscriberConfig, fake_sdk: FakeSdkClient) -> KvcmClient:
     return KvcmClient(
         config,
         medium_mapper=_vllm_medium_mapper,
-        storage_type="ST_VLLM",
+        storage_type="ST_EVENT_REPORT",
         supported_mediums=["hbm", "mem"],
         manager_client=fake_sdk,
     )
 
 
 def test_storage_type_maps_engine_type() -> None:
-    assert _client(SubscriberConfig(engine_type="vllm"))._storage_type == "ST_VLLM"
+    assert _client(SubscriberConfig(engine_type="vllm"))._storage_type == "ST_EVENT_REPORT"
     assert (
         KvcmClient(
             SubscriberConfig(engine_type="unknown"),
@@ -269,7 +269,7 @@ def test_report_event_request_contains_common_fields(
 
     assert request["instance_id"] == "deploy-a"
     assert request["host_ip_port"] == "10.0.0.8:9000"
-    assert request["storage_type"] == "ST_VLLM"
+    assert request["storage_type"] == "ST_EVENT_REPORT"
     assert request["events"] == events
 
 
@@ -369,7 +369,7 @@ async def test_start_uses_injected_manager_client() -> None:
     client = KvcmClient(
         SubscriberConfig(kvcm_heartbeat_interval_s=60.0),
         medium_mapper=_vllm_medium_mapper,
-        storage_type="ST_VLLM",
+        storage_type="ST_EVENT_REPORT",
         supported_mediums=["hbm", "mem"],
         manager_client=fake_sdk,
     )
@@ -403,7 +403,7 @@ async def test_start_uses_spectrum_address_from_vservice_id(
     client = KvcmClient(
         SubscriberConfig(kvcm_heartbeat_interval_s=60.0),
         medium_mapper=_vllm_medium_mapper,
-        storage_type="ST_VLLM",
+        storage_type="ST_EVENT_REPORT",
         supported_mediums=["hbm", "mem"],
     )
 

@@ -88,7 +88,7 @@ class AbstractEngineAdapter(ABC):
     def storage_type(self) -> str:
         """Return the kvcm storage type identifier for this engine.
 
-        For example, the vLLM adapter returns ``"ST_VLLM"``.
+        For example, the vLLM adapter returns ``"ST_EVENT_REPORT"``.
         """
         ...
 
