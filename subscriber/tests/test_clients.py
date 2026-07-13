@@ -60,6 +60,7 @@ _VLLM_MEDIUM_MAP = {"GPU": "hbm", "CPU": "mem"}
 
 @pytest.fixture(autouse=True)
 def _set_kvcm_vservice_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SPECTRUM_APPLICATION_SERVICE_ID", raising=False)
     monkeypatch.setenv("KVCM_VSERVICE_ID", "vs-test")
 
     async def resolve_host_ip_port() -> str:

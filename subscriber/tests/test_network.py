@@ -71,7 +71,7 @@ async def test_fetch_spectrum_endpoints_validates_response_once() -> None:
 async def test_resolve_host_ip_port_uses_matching_local_engine_endpoint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("ENGINE_VSERVICE_ID", "engine-vs-a")
+    monkeypatch.setenv("SPECTRUM_APPLICATION_SERVICE_ID", "engine-vs-a")
     monkeypatch.setattr(network, "local_ip_address", lambda: "10.0.0.7")
     calls: list[str] = []
 
@@ -88,19 +88,19 @@ async def test_resolve_host_ip_port_uses_matching_local_engine_endpoint(
     assert calls == ["engine-vs-a"]
 
 
-async def test_resolve_host_ip_port_requires_engine_virtual_service_id(
+async def test_resolve_host_ip_port_requires_spectrum_application_service_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("ENGINE_VSERVICE_ID", raising=False)
+    monkeypatch.delenv("SPECTRUM_APPLICATION_SERVICE_ID", raising=False)
 
-    with pytest.raises(ValueError, match="ENGINE_VSERVICE_ID"):
+    with pytest.raises(ValueError, match="SPECTRUM_APPLICATION_SERVICE_ID"):
         await network.resolve_host_ip_port()
 
 
 async def test_resolve_host_ip_port_rejects_unlisted_local_ip(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("ENGINE_VSERVICE_ID", "engine-vs-a")
+    monkeypatch.setenv("SPECTRUM_APPLICATION_SERVICE_ID", "engine-vs-a")
     monkeypatch.setattr(network, "local_ip_address", lambda: "10.0.0.7")
 
     async def fetch(_: str) -> list[SpectrumEndpoint]:
@@ -115,7 +115,7 @@ async def test_resolve_host_ip_port_rejects_unlisted_local_ip(
 async def test_resolve_host_ip_port_formats_local_ipv6(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("ENGINE_VSERVICE_ID", "engine-vs-a")
+    monkeypatch.setenv("SPECTRUM_APPLICATION_SERVICE_ID", "engine-vs-a")
     monkeypatch.setattr(network, "local_ip_address", lambda: "2001:db8::1")
 
     async def fetch(_: str) -> list[SpectrumEndpoint]:

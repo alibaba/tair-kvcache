@@ -90,6 +90,7 @@ class SubscriberConfig:
         parser.add_argument("--data-parallel-size", type=int, default=default)
         parser.add_argument("--block-size", type=int, default=default)
         parser.add_argument("--kvcm-heartbeat-interval-s", type=float, default=default)
+        parser.add_argument("--kvcm-request-timeout-s", type=float, default=default)
         parser.add_argument("--kv-event-queue-maxsize", type=int, default=default)
         parser.add_argument("--engine-type", default=default)
         parser.add_argument(
@@ -166,6 +167,8 @@ class SubscriberConfig:
             raise ValueError("kv_event_queue_maxsize must be >= 1")
         if self.kvcm_heartbeat_interval_s <= 0:
             raise ValueError("kvcm_heartbeat_interval_s must be > 0")
+        if self.kvcm_request_timeout_s <= 0:
+            raise ValueError("kvcm_request_timeout_s must be > 0")
         if self.zmq_replay_timeout_s <= 0:
             raise ValueError("zmq_replay_timeout_s must be > 0")
 

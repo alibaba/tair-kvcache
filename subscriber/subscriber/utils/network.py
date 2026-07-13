@@ -40,16 +40,17 @@ def local_ip_address() -> str:
 async def resolve_host_ip_port() -> str:
     """Resolve the local engine address from its Spectrum virtual service."""
 
-    virtual_service_id = os.environ.get("ENGINE_VSERVICE_ID", "")
+    virtual_service_id = os.environ.get("SPECTRUM_APPLICATION_SERVICE_ID", "")
     if not virtual_service_id:
-        raise ValueError("Please specify ENGINE_VSERVICE_ID")
+        raise ValueError("Please specify SPECTRUM_APPLICATION_SERVICE_ID")
     address = local_ip_address()
     endpoints = await fetch_spectrum_endpoints(virtual_service_id)
     endpoint = next((item for item in endpoints if item.ip == address), None)
     if endpoint is None:
         raise ValueError(
             "Spectrum did not return an endpoint for local IP "
-            f"{address!r} in ENGINE_VSERVICE_ID={virtual_service_id!r}"
+            f"{address!r} in SPECTRUM_APPLICATION_SERVICE_ID="
+            f"{virtual_service_id!r}"
         )
     if ":" in address:
         address = f"[{address}]"
