@@ -2445,8 +2445,21 @@ std::string CacheManager::GetStorageConfigStr(RequestContext *request_context, c
         PREFIX_LOG(WARN, "instance group not found: %s", instance_group_name.c_str());
         return {};
     }
-    const auto &storage_candadates = instance_group->storage_candidates();
-    std::set<std::string_view> storage_candadate_set(storage_candadates.begin(), storage_candadates.end());
+    // storage_candidates only describes normal write placement. Tiered migration may move data to a
+    // source/target storage that is intentionally not a normal write candidate, but workers still need
+    // the corresponding SDK config to read copied data or write data directed by a migration mark.
+    std::set<std::string_view> accessible_storage_names(instance_group->storage_candidates().begin(),
+                                                        instance_group->storage_candidates().end());
+    const auto cache_config = instance_group->cache_config();
+    if (cache_config != nullptr) {
+        for (const auto &strategy : cache_config->migration_strategies()) {
+            if (strategy == nullptr) {
+                continue;
+            }
+            accessible_storage_names.insert(strategy->source_storage_name());
+            accessible_storage_names.insert(strategy->target_storage_name());
+        }
+    }
     // TODO : try optimize these copy operation
     std::vector<const StorageConfig *> result;
     for (const auto &config : all_configs) {
@@ -2455,7 +2468,7 @@ std::string CacheManager::GetStorageConfigStr(RequestContext *request_context, c
         if (config.type() == DataStorageType::DATA_STORAGE_TYPE_DUMMY) {
             continue;
         }
-        if (storage_candadate_set.find(config.global_unique_name()) != storage_candadate_set.end()) {
+        if (accessible_storage_names.find(config.global_unique_name()) != accessible_storage_names.end()) {
             result.push_back(&config);
         }
     }

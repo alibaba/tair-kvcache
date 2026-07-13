@@ -1,6 +1,7 @@
 #include <chrono>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <thread>
 
 #include "kv_cache_manager/common/jsonizable.h"
@@ -172,6 +173,18 @@ public:
         return true;
     }
 
+    bool RegisterNfsStorage(const std::string &name) {
+        auto spec = std::make_shared<NfsStorageSpec>();
+        spec->set_root_path(GetPrivateTestRuntimeDataPath() + name + "/");
+        spec->set_key_count_per_file(1);
+        StorageConfig config;
+        config.set_type(DataStorageType::DATA_STORAGE_TYPE_NFS);
+        config.set_global_unique_name(name);
+        config.set_storage_spec(spec);
+        auto rc = std::make_shared<RequestContext>("reg_nfs_storage");
+        return registry_manager_->data_storage_manager()->RegisterStorage(rc.get(), name, config) == EC_OK;
+    }
+
     ModelDeployment createModelDeployment() {
         ModelDeployment model_deployment;
         model_deployment.set_model_name("fake model");
@@ -296,6 +309,39 @@ TEST_F(CacheManagerTest, TestRegisterInstance) {
             EXPECT_EQ(true, success_count == error_count);
         }
     }
+}
+
+TEST_F(CacheManagerTest, TestRegisterInstanceReturnsTieredMigrationStorageConfigs) {
+    const std::string migration_source = "nfs_migration_source";
+    const std::string migration_target = "nfs_migration_target";
+    ASSERT_TRUE(RegisterNfsStorage(migration_source));
+    ASSERT_TRUE(RegisterNfsStorage(migration_target));
+
+    auto [group_ec, instance_group] = registry_manager_->GetInstanceGroup(request_context_.get(), "default");
+    ASSERT_EQ(EC_OK, group_ec);
+    ASSERT_NE(nullptr, instance_group);
+    const auto original_storage_candidates = instance_group->storage_candidates();
+    ASSERT_EQ(std::vector<std::string>({"nfs_01"}), original_storage_candidates);
+
+    EnableTieredMigrationStrategy("default", migration_source, migration_target);
+    auto [register_ec, storage_configs] = cache_manager_->RegisterInstance(request_context_.get(),
+                                                                           "default",
+                                                                           "tiered_sdk_config_instance",
+                                                                           64,
+                                                                           createLocationSpecInfos(),
+                                                                           createModelDeployment(),
+                                                                           std::vector<LocationSpecGroup>());
+    ASSERT_EQ(EC_OK, register_ec);
+
+    std::vector<std::shared_ptr<StorageConfig>> returned_configs;
+    ASSERT_TRUE(Jsonizable::FromJsonString(storage_configs, returned_configs));
+    std::set<std::string> returned_storage_names;
+    for (const auto &config : returned_configs) {
+        ASSERT_NE(nullptr, config);
+        returned_storage_names.insert(config->global_unique_name());
+    }
+    EXPECT_EQ((std::set<std::string>{"nfs_01", migration_source, migration_target}), returned_storage_names);
+    EXPECT_EQ(original_storage_candidates, instance_group->storage_candidates());
 }
 
 TEST_F(CacheManagerTest, TestRemoveInstance) {
