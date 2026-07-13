@@ -8,7 +8,7 @@ import static org.junit.jupiter.api.Assertions.*;
 /**
  * Integration tests for CacheAware RPCs using HTTP transport.
  * <p>
- * Note: GetCacheLocationLen has no HTTP endpoint, so those tests are skipped.
+ * All CacheAware RPCs are covered via HTTP, including GetCacheLocationLen.
  */
 public class CacheAwareHttpTest extends CacheAwareTestBase {
 
@@ -67,28 +67,28 @@ public class CacheAwareHttpTest extends CacheAwareTestBase {
         super.testGetCacheMeta_validateJsonStructure();
     }
 
-    /**
-     * HTTP-specific test: verify that GetCacheLocationLen returns 404 via HTTP.
-     * This RPC has no HTTP endpoint registered in the server.
-     */
     @Test
-    void testGetCacheLocationLen_noHttpEndpoint() {
-        MetaClient client = getClient();
-        registerInstance(instanceId);
+    void testGetCacheLocationLen_prefixMatch() {
+        super.testGetCacheLocationLen_prefixMatch();
+    }
 
-        GetCacheLocationLenRequest request = GetCacheLocationLenRequest.newBuilder()
-                .setTraceId("test-trace")
-                .setInstanceId(instanceId)
-                .setQueryType(QueryType.QT_BATCH_GET)
-                .addBlockKeys(1L)
-                .build();
+    @Test
+    void testGetCacheLocationLen_noMatches() {
+        super.testGetCacheLocationLen_noMatches();
+    }
 
-        Exception exception = assertThrows(Exception.class, () -> {
-            client.getCacheLocationLen(request);
-        });
+    @Test
+    void testGetCacheLocationLen_batchGet() {
+        super.testGetCacheLocationLen_batchGet();
+    }
 
-        String message = exception.getMessage();
-        assertTrue(message.contains("404") || message.contains("Not Found") || message.contains("not found"),
-                "Expected 404 error but got: " + message);
+    @Test
+    void testGetCacheLocationLen_batchGetNoMatches() {
+        super.testGetCacheLocationLen_batchGetNoMatches();
+    }
+
+    @Test
+    void testGetCacheLocationLen_consistency() {
+        super.testGetCacheLocationLen_consistency();
     }
 }

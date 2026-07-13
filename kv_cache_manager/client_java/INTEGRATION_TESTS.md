@@ -5,7 +5,7 @@
 Integration tests for the Java MetaClient that verify correct behavior against a real KVCM server. These tests cover the 3 CacheAware RPCs that were not covered by the existing Python integration tests:
 
 - **GetCacheLocationsByBackend** - Query cache locations by backend type
-- **GetCacheLocationLen** - Query cache hit count (gRPC only)
+- **GetCacheLocationLen** - Query cache hit count
 - **GetCacheMeta** - Query cache metadata with status
 
 ## Prerequisites
@@ -54,12 +54,11 @@ cd kv_cache_manager/client_java
 2. **CacheAwareGrpcTest** (15 tests)
    - Tests all 3 CacheAware RPCs via gRPC
    - Covers normal, error, and boundary scenarios
-   - Includes `GetCacheLocationLen` tests (gRPC only)
+   - Includes `GetCacheLocationLen` tests
 
-3. **CacheAwareHttpTest** (11 tests)
-   - Tests 2 CacheAware RPCs via HTTP
-   - Excludes `GetCacheLocationLen` (no HTTP endpoint)
-   - Includes HTTP 404 verification test
+3. **CacheAwareHttpTest** (15 tests)
+   - Tests all 3 CacheAware RPCs via HTTP
+   - Covers the same scenarios as the gRPC tests
 
 ### Test Coverage
 
@@ -103,12 +102,7 @@ Each test class:
 
 ## Known Limitations
 
-1. **GetCacheLocationLen has no HTTP endpoint**
-   - The server does not register this RPC in the HTTP handler
-   - HTTP tests verify this returns 404
-   - Only gRPC tests cover this RPC
-
-2. **Token IDs conversion behavior**
+1. **Token IDs conversion behavior**
    - The exact conversion logic (token_id → block_key) needs verification
    - Tests verify the query doesn't throw exceptions
    - TODO: Document expected conversion behavior
@@ -170,7 +164,7 @@ CacheAwareGrpcTest extends CacheAwareTestBase
 
 CacheAwareHttpTest extends CacheAwareTestBase
     ├── getClient() → httpClient
-    └── 11 test methods (HTTP protocol, excludes GetCacheLocationLen)
+    └── 15 test methods (HTTP protocol)
 
 KvcmServerManager
     ├── Port allocation (ServerSocket)
@@ -182,7 +176,7 @@ KvcmServerManager
 
 ## Test Results
 
-Total: **59 tests**
+Total: **63 tests**
 - Unit tests: 33 passed
-- Integration tests: 26 passed (15 gRPC + 11 HTTP)
+- Integration tests: 30 passed (15 gRPC + 15 HTTP)
 

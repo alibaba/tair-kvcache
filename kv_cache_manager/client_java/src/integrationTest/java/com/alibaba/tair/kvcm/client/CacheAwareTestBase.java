@@ -190,9 +190,9 @@ public abstract class CacheAwareTestBase extends IntegrationTestBase {
         assertEquals(3, response.getKeyLocationsCount());
     }
 
-    // === GetCacheLocationLen Tests (gRPC only) ===
+    // === GetCacheLocationLen Tests ===
 
-    void testGetCacheLocationLen_gRpcOnly() {
+    void testGetCacheLocationLen_prefixMatch() {
         MetaClient client = getClient();
         registerInstance(instanceId);
         String sessionId = startWriteCache(instanceId, 1L, 2L, 3L);

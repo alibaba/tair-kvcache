@@ -43,8 +43,8 @@ public class CacheAwareGrpcTest extends CacheAwareTestBase {
     }
 
     @Test
-    void testGetCacheLocationLen_gRpcOnly() {
-        super.testGetCacheLocationLen_gRpcOnly();
+    void testGetCacheLocationLen_prefixMatch() {
+        super.testGetCacheLocationLen_prefixMatch();
     }
 
     @Test
