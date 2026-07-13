@@ -117,6 +117,16 @@ class VllmAdapter(AbstractEngineAdapter):
         dealer.connect(self._endpoint.zmq_replay_endpoint)
         return dealer
 
+    def _replace_replay_socket(
+        self, failed_dealer: zmq.asyncio.Socket, generation: int
+    ) -> None:
+        """Discard a failed replay socket so a stale reply cannot be reused."""
+
+        if generation != self._generation or failed_dealer is not self._dealer:
+            return
+        failed_dealer.close(linger=0)
+        self._dealer = self._open_dealer_socket()
+
     def _configure_sub_socket(self, sub: zmq.asyncio.Socket) -> None:
         """Apply reconnect and TCP keepalive options to the SUB socket."""
 
@@ -170,12 +180,11 @@ class VllmAdapter(AbstractEngineAdapter):
                         },
                     )
                     replay_batches = await self._replay_missing_batches(seq, generation)
-                    if replay_batches is None:
+                    if generation != self._generation:
                         continue
-
                     if replay_batches:
                         yield replay_batches
-                    else:
+                    elif replay_batches == []:
                         logger.warning(
                             "replay returned no batches, "
                             "publisher buffer may have been pruned",
@@ -258,10 +267,27 @@ class VllmAdapter(AbstractEngineAdapter):
             )
         dealer = self._dealer
         try:
-            await dealer.send_multipart([b"", gap_start_seq.to_bytes(8, "big")])
-        except Exception as exc:
+            async with asyncio.timeout(self._config.zmq_replay_timeout_s):
+                await dealer.send_multipart([b"", gap_start_seq.to_bytes(8, "big")])
+        except TimeoutError:
+            self._replace_replay_socket(dealer, generation)
             logger.warning(
-                "failed to request kv event replay",
+                "kv event replay unavailable; sequence gap remains; "
+                "forwarding live batch",
+                step="zmq_replay",
+                tags={
+                    "gap_start_seq": gap_start_seq,
+                    "current_seq": current_seq,
+                    "error": "TimeoutError",
+                    "message": "replay timed out",
+                },
+            )
+            return None
+        except Exception as exc:
+            self._replace_replay_socket(dealer, generation)
+            logger.warning(
+                "kv event replay unavailable; sequence gap remains; "
+                "forwarding live batch",
                 step="zmq_replay",
                 tags={
                     "gap_start_seq": gap_start_seq,
@@ -277,10 +303,27 @@ class VllmAdapter(AbstractEngineAdapter):
         replay_batches: list[KVEventBatch] = []
         while True:
             try:
-                frames = await dealer.recv_multipart()
-            except Exception as exc:
+                async with asyncio.timeout(self._config.zmq_replay_timeout_s):
+                    frames = await dealer.recv_multipart()
+            except TimeoutError:
+                self._replace_replay_socket(dealer, generation)
                 logger.warning(
-                    "failed to receive kv event replay message",
+                    "kv event replay unavailable; sequence gap remains; "
+                    "forwarding live batch",
+                    step="zmq_replay",
+                    tags={
+                        "gap_start_seq": gap_start_seq,
+                        "current_seq": current_seq,
+                        "error": "TimeoutError",
+                        "message": "replay timed out",
+                    },
+                )
+                return None
+            except Exception as exc:
+                self._replace_replay_socket(dealer, generation)
+                logger.warning(
+                    "kv event replay unavailable; sequence gap remains; "
+                    "forwarding live batch",
                     step="zmq_replay",
                     tags={
                         "gap_start_seq": gap_start_seq,

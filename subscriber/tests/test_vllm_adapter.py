@@ -591,7 +591,177 @@ async def test_skips_bad_replay_payload_and_continues_live_stream(
     adapter = VllmAdapter(config)
     results = await _collect_n(adapter, 3)
 
-    assert results == [[batch], [batch, batch], [batch]]
+    assert results == [[batch], [batch], [batch]]
+    mock_dealer.send_multipart.assert_awaited_once_with([b"", (1).to_bytes(8, "big")])
+
+
+@pytest.mark.parametrize("failure_point", ["send", "recv"])
+async def test_replay_transport_failure_forwards_current_and_later_live_batches(
+    config: SubscriberConfig, mocker: Any, failure_point: str
+) -> None:
+    first_batch = KVEventBatch(ts=1.0, events=[AllBlocksCleared()])
+    gapped_batch = KVEventBatch(ts=2.0, events=[AllBlocksCleared()])
+    later_batch = KVEventBatch(ts=3.0, events=[AllBlocksCleared()])
+    old_sub = MagicMock()
+    old_dealer = MagicMock()
+    replacement_dealer = MagicMock()
+    _mock_adapter_socket_sequence(mocker, old_sub, old_dealer, replacement_dealer)
+    old_sub.recv_multipart = AsyncMock(
+        side_effect=[
+            [b"", _seq_bytes(0), _encode_batch(first_batch)],
+            [b"", _seq_bytes(2), _encode_batch(gapped_batch)],
+            [b"", _seq_bytes(3), _encode_batch(later_batch)],
+        ]
+    )
+    if failure_point == "send":
+        old_dealer.send_multipart = AsyncMock(side_effect=zmq.ZMQError("down"))
+    else:
+        old_dealer.send_multipart = AsyncMock()
+        old_dealer.recv_multipart = AsyncMock(side_effect=zmq.ZMQError("down"))
+    warning = mocker.patch("subscriber.engine.vllm.logger.warning")
+
+    adapter = VllmAdapter(config)
+    results = await _collect_n(adapter, 3)
+
+    assert results == [[first_batch], [gapped_batch], [later_batch]]
+    assert old_dealer.send_multipart.await_count == 1
+    old_dealer.close.assert_called_once_with(linger=0)
+    warning.assert_any_call(
+        "kv event replay unavailable; sequence gap remains; forwarding live batch",
+        step="zmq_replay",
+        tags={
+            "gap_start_seq": 1,
+            "current_seq": 2,
+            "error": "ZMQError",
+            "message": "down",
+        },
+    )
+
+
+async def test_replay_timeout_forwards_current_live_batch(
+    config: SubscriberConfig, mocker: Any
+) -> None:
+    config.zmq_replay_timeout_s = 0.01
+    first_batch = KVEventBatch(ts=1.0, events=[AllBlocksCleared()])
+    gapped_batch = KVEventBatch(ts=2.0, events=[AllBlocksCleared()])
+    old_sub = MagicMock()
+    old_dealer = MagicMock()
+    replacement_dealer = MagicMock()
+    _mock_adapter_socket_sequence(mocker, old_sub, old_dealer, replacement_dealer)
+    old_sub.recv_multipart = AsyncMock(
+        side_effect=[
+            [b"", _seq_bytes(0), _encode_batch(first_batch)],
+            [b"", _seq_bytes(2), _encode_batch(gapped_batch)],
+        ]
+    )
+    old_dealer.send_multipart = AsyncMock()
+
+    async def wait_forever() -> list[bytes]:
+        await asyncio.Event().wait()
+        return []
+
+    old_dealer.recv_multipart = AsyncMock(side_effect=wait_forever)
+    warning = mocker.patch("subscriber.engine.vllm.logger.warning")
+
+    adapter = VllmAdapter(config)
+    results = await _collect_n(adapter, 2)
+
+    assert results == [[first_batch], [gapped_batch]]
+    old_dealer.close.assert_called_once_with(linger=0)
+    warning.assert_any_call(
+        "kv event replay unavailable; sequence gap remains; forwarding live batch",
+        step="zmq_replay",
+        tags={
+            "gap_start_seq": 1,
+            "current_seq": 2,
+            "error": "TimeoutError",
+            "message": "replay timed out",
+        },
+    )
+
+
+async def test_replay_send_timeout_forwards_current_live_batch(
+    config: SubscriberConfig, mocker: Any
+) -> None:
+    config.zmq_replay_timeout_s = 0.01
+    first_batch = KVEventBatch(ts=1.0, events=[AllBlocksCleared()])
+    gapped_batch = KVEventBatch(ts=2.0, events=[AllBlocksCleared()])
+    old_sub = MagicMock()
+    old_dealer = MagicMock()
+    replacement_dealer = MagicMock()
+    _mock_adapter_socket_sequence(mocker, old_sub, old_dealer, replacement_dealer)
+    old_sub.recv_multipart = AsyncMock(
+        side_effect=[
+            [b"", _seq_bytes(0), _encode_batch(first_batch)],
+            [b"", _seq_bytes(2), _encode_batch(gapped_batch)],
+        ]
+    )
+
+    async def wait_forever(_frames: list[bytes]) -> None:
+        await asyncio.Event().wait()
+
+    old_dealer.send_multipart = AsyncMock(side_effect=wait_forever)
+    warning = mocker.patch("subscriber.engine.vllm.logger.warning")
+
+    adapter = VllmAdapter(config)
+    results = await _collect_n(adapter, 2)
+
+    assert results == [[first_batch], [gapped_batch]]
+    old_dealer.close.assert_called_once_with(linger=0)
+    warning.assert_any_call(
+        "kv event replay unavailable; sequence gap remains; forwarding live batch",
+        step="zmq_replay",
+        tags={
+            "gap_start_seq": 1,
+            "current_seq": 2,
+            "error": "TimeoutError",
+            "message": "replay timed out",
+        },
+    )
+
+
+async def test_replacement_replay_socket_recovers_a_later_gap(
+    config: SubscriberConfig, mocker: Any
+) -> None:
+    first_batch = KVEventBatch(ts=1.0, events=[AllBlocksCleared()])
+    first_gapped_batch = KVEventBatch(ts=2.0, events=[AllBlocksCleared()])
+    later_batch = KVEventBatch(ts=3.0, events=[AllBlocksCleared()])
+    replayed_batch = KVEventBatch(ts=4.0, events=[AllBlocksCleared()])
+    second_gapped_batch = KVEventBatch(ts=5.0, events=[AllBlocksCleared()])
+    old_sub = MagicMock()
+    old_dealer = MagicMock()
+    replacement_dealer = MagicMock()
+    _mock_adapter_socket_sequence(mocker, old_sub, old_dealer, replacement_dealer)
+    old_sub.recv_multipart = AsyncMock(
+        side_effect=[
+            [b"", _seq_bytes(0), _encode_batch(first_batch)],
+            [b"", _seq_bytes(2), _encode_batch(first_gapped_batch)],
+            [b"", _seq_bytes(3), _encode_batch(later_batch)],
+            [b"", _seq_bytes(5), _encode_batch(second_gapped_batch)],
+        ]
+    )
+    old_dealer.send_multipart = AsyncMock(side_effect=zmq.ZMQError("down"))
+    replacement_dealer.send_multipart = AsyncMock()
+    replacement_dealer.recv_multipart = AsyncMock(
+        side_effect=[
+            [b"", _seq_bytes(4), _encode_batch(replayed_batch)],
+            [b"", (-1).to_bytes(8, "big", signed=True), b""],
+        ]
+    )
+
+    adapter = VllmAdapter(config)
+    results = await _collect_n(adapter, 5)
+
+    assert results == [
+        [first_batch],
+        [first_gapped_batch],
+        [later_batch],
+        [replayed_batch],
+        [second_gapped_batch],
+    ]
+    replacement_dealer.send_multipart.assert_awaited_once_with(
+        [b"", (4).to_bytes(8, "big")]
+    )
 
 
 async def test_watch_liveness_converts_unexpected_probe_error_to_unhealthy(

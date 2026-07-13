@@ -14,6 +14,7 @@ from typing import Any
 
 import httpx
 
+from subscriber.kvcm.base import AbstractKvCacheManagerClient
 from subscriber.kvcm.service_discovery import (
     ServiceDiscovery,
     create_service_discovery,
@@ -22,7 +23,7 @@ from subscriber.kvcm.service_discovery import (
 logger = logging.getLogger(__name__)
 
 
-class HttpKvCacheManagerClient:
+class HttpKvCacheManagerClient(AbstractKvCacheManagerClient):
     """HTTP manager client with optional service-discovery and leader-discovery.
 
     Compatible with the ``KvCacheManagerClient`` API surface used by
@@ -52,6 +53,8 @@ class HttpKvCacheManagerClient:
                 - ``spectrum://<vsid>[:port][?cache_time=<sec>&timeout=<ms>&retry_time=<n>]``
                   — resolved via Spectrum gateway
         """
+        super().__init__()
+
         self.headers = {
             "Accept": "application/json",
             "Content-Type": "application/json",
@@ -115,7 +118,7 @@ class HttpKvCacheManagerClient:
 
         if self._auto_discover_leader:
             try:
-                if self.is_ready():
+                if await self.is_ready():
                     await self._discover_leader()
             except Exception as e:
                 logger.warning(
@@ -129,7 +132,7 @@ class HttpKvCacheManagerClient:
             )
         self._started = True
 
-    def is_ready(self) -> bool:
+    async def is_ready(self) -> bool:
         """Return whether requests have a usable HTTP endpoint."""
 
         if self.base_url.startswith(("http://", "https://")):

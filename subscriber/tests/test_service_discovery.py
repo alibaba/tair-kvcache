@@ -94,6 +94,10 @@ class EmptyServiceDiscovery(ServiceDiscovery):
         self.closed = True
 
 
+def test_spectrum_service_discovery_does_not_expose_service_url() -> None:
+    assert not hasattr(SpectrumServiceDiscovery, "service_url")
+
+
 async def test_spectrum_service_discovery_fetches_initial_endpoints() -> None:
     http_client = SequencedFakeHttpClient()
 
@@ -170,12 +174,12 @@ async def test_manager_client_recovers_when_initial_spectrum_discovery_is_empty(
 
     await client.start()
 
-    assert client.is_ready() is False
+    assert await client.is_ready() is False
     assert discovery.closed is False
 
     discovery.endpoint = ServiceEndpoint(ip="10.0.0.9", port=7001, host="10.0.0.9:7001")
 
-    assert client.is_ready() is True
+    assert await client.is_ready() is True
     assert client.base_url == "http://10.0.0.9:7001"
 
     await client.close()

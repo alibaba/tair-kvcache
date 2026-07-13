@@ -25,13 +25,14 @@ class SubscriberConfig:
     zmq_pub_endpoint: str = "tcp://localhost:5557"
     zmq_replay_endpoint: str = "tcp://localhost:5558"
     zmq_topic: str = ""
+    zmq_replay_timeout_s: float = 1.0
 
     # Data parallelism
     data_parallel_size: int = 1
 
     # kvcm SDK
-    kvcm_host_ip_port: str = ""
     kvcm_heartbeat_interval_s: float = 1.0
+    kvcm_request_timeout_s: float = 5.0
     kv_event_queue_maxsize: int = 1024
 
     # Engine
@@ -85,15 +86,9 @@ class SubscriberConfig:
         parser.add_argument("--zmq-pub-endpoint", default=default)
         parser.add_argument("--zmq-replay-endpoint", default=default)
         parser.add_argument("--zmq-topic", default=default)
+        parser.add_argument("--zmq-replay-timeout-s", type=float, default=default)
         parser.add_argument("--data-parallel-size", type=int, default=default)
         parser.add_argument("--block-size", type=int, default=default)
-        parser.add_argument(
-            "--kvcm-host-ip-port",
-            default=default,
-            help="Local IP of the subscriber/engine host, "
-            "reported to kvcm so it can reach this node "
-            "(e.g. 192.168.1.10).",
-        )
         parser.add_argument("--kvcm-heartbeat-interval-s", type=float, default=default)
         parser.add_argument("--kv-event-queue-maxsize", type=int, default=default)
         parser.add_argument("--engine-type", default=default)
@@ -171,6 +166,8 @@ class SubscriberConfig:
             raise ValueError("kv_event_queue_maxsize must be >= 1")
         if self.kvcm_heartbeat_interval_s <= 0:
             raise ValueError("kvcm_heartbeat_interval_s must be > 0")
+        if self.zmq_replay_timeout_s <= 0:
+            raise ValueError("zmq_replay_timeout_s must be > 0")
 
 
 def _parse_tcp_endpoint_for_multi_dp(

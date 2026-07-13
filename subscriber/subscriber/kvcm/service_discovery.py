@@ -17,6 +17,10 @@ from typing import Any, Literal
 
 import httpx
 
+from subscriber.utils.spectrum import (
+    fetch_spectrum_endpoints,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -141,9 +145,6 @@ class StaticServiceDiscovery(ServiceDiscovery):
 # Spectrum
 # ---------------------------------------------------------------------------
 
-SPECTRUM_GATEWAY_BASE_URL = "http://127.0.0.1:8880"
-SPECTRUM_INSTANCES_PATH_TEMPLATE = "/api/v1/discovery/virtual-services/{vsid}/instances"
-
 
 class SpectrumServiceDiscovery(ServiceDiscovery):
     """Spectrum gateway service discovery with a background refresh loop."""
@@ -193,11 +194,6 @@ class SpectrumServiceDiscovery(ServiceDiscovery):
 
     def get_type(self) -> str:
         return "Spectrum"
-
-    @property
-    def service_url(self) -> str:
-        path = SPECTRUM_INSTANCES_PATH_TEMPLATE.format(vsid=self.virtual_service_id)
-        return SPECTRUM_GATEWAY_BASE_URL + path
 
     def get_all_endpoints(self) -> list[ServiceEndpoint]:
         return self._cache.copy()
@@ -256,48 +252,21 @@ class SpectrumServiceDiscovery(ServiceDiscovery):
             await self.refresh()
 
     async def _fetch_from_spectrum(self) -> list[ServiceEndpoint]:
-        response = await self._http_client.get(
-            self.service_url, timeout=self.refresh_timeout
+        spectrum_endpoints = await fetch_spectrum_endpoints(
+            self.virtual_service_id,
+            port_override=self.port_override,
+            refresh_timeout=self.refresh_timeout,
+            http_client=self._http_client,
         )
-        response.raise_for_status()
-        data = response.json()
-        items = data.get("instances", [])
-        if not isinstance(items, list):
-            logger.warning(
-                "Spectrum response 'instances' is not a list for vsid=%s",
-                self.virtual_service_id,
+        return [
+            ServiceEndpoint(
+                ip=endpoint.ip,
+                port=endpoint.port,
+                host=f"{endpoint.ip}:{endpoint.port}",
+                weight=endpoint.weight,
             )
-            return []
-        endpoints: list[ServiceEndpoint] = []
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            ip = item.get("ip")
-            port = (
-                self.port_override
-                if self.port_override is not None
-                else item.get("port")
-            )
-            if not isinstance(ip, str) or not ip:
-                continue
-            if not isinstance(port, (int, str)) or isinstance(port, bool):
-                continue
-            try:
-                parsed_port = int(port)
-            except (TypeError, ValueError):
-                continue
-            if parsed_port <= 0 or parsed_port > 65535:
-                continue
-            endpoints.append(
-                ServiceEndpoint(
-                    ip=ip,
-                    port=parsed_port,
-                    host=f"{ip}:{parsed_port}",
-                    weight=item.get("weight", 100),
-                    healthy=True,
-                )
-            )
-        return sorted(endpoints, key=lambda endpoint: (endpoint.ip, endpoint.port))
+            for endpoint in spectrum_endpoints
+        ]
 
 
 # ---------------------------------------------------------------------------

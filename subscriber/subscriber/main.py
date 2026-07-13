@@ -152,7 +152,6 @@ async def run(config: SubscriberConfig) -> None:
                 "engine_type": config.engine_type,
                 "zmq_pub_endpoint": config.zmq_pub_endpoint,
                 "zmq_replay_endpoint": config.zmq_replay_endpoint,
-                "kvcm_host_ip_port": config.kvcm_host_ip_port,
                 "kvcm_heartbeat_interval_s": config.kvcm_heartbeat_interval_s,
                 "engine_health_url": config.engine_health_url,
                 "engine_health_interval_s": config.engine_health_interval_s,

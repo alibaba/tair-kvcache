@@ -58,7 +58,6 @@ def test_kv_event_queue_maxsize_must_be_positive() -> None:
 
 def test_kvcm_runtime_config_defaults() -> None:
     config = SubscriberConfig()
-    assert config.kvcm_host_ip_port == ""
     assert config.kvcm_heartbeat_interval_s == 1.0
 
 
@@ -66,14 +65,11 @@ def test_kvcm_runtime_config_cli_override() -> None:
     parser = build_parser()
     args = parser.parse_args(
         [
-            "--kvcm-host-ip-port",
-            "10.0.0.8:9000",
             "--kvcm-heartbeat-interval-s",
             "2.5",
         ]
     )
     config = SubscriberConfig.from_args(args)
-    assert config.kvcm_host_ip_port == "10.0.0.8:9000"
     assert config.kvcm_heartbeat_interval_s == 2.5
 
 
@@ -82,7 +78,6 @@ def test_kvcm_runtime_config_yaml_loading(tmp_path: Path) -> None:
     yaml_file.write_text(
         textwrap.dedent(
             """\
-            kvcm_host_ip_port: "10.0.0.9:9001"
             kvcm_heartbeat_interval_s: 3.0
             """
         )
@@ -90,7 +85,6 @@ def test_kvcm_runtime_config_yaml_loading(tmp_path: Path) -> None:
     parser = build_parser()
     args = parser.parse_args(["--config", str(yaml_file)])
     config = SubscriberConfig.from_args(args)
-    assert config.kvcm_host_ip_port == "10.0.0.9:9001"
     assert config.kvcm_heartbeat_interval_s == 3.0
 
 
@@ -179,10 +173,45 @@ def test_zmq_transport_config_defaults() -> None:
     config = SubscriberConfig()
     assert config.zmq_reconnect_ivl_ms == 100
     assert config.zmq_reconnect_ivl_max_ms == 5000
+    assert config.zmq_replay_timeout_s == 1.0
     assert config.zmq_tcp_keepalive is True
     assert config.zmq_tcp_keepalive_idle_s == 30
     assert config.zmq_tcp_keepalive_intvl_s == 5
     assert config.zmq_tcp_keepalive_cnt == 3
+
+
+def test_zmq_replay_timeout_cli_override() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["--zmq-replay-timeout-s", "0.25"])
+
+    config = SubscriberConfig.from_args(args)
+
+    assert config.zmq_replay_timeout_s == 0.25
+
+
+def test_zmq_replay_timeout_cli_overrides_yaml(tmp_path: Path) -> None:
+    yaml_file = tmp_path / "config.yaml"
+    yaml_file.write_text("zmq_replay_timeout_s: 0.75\n")
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--config",
+            str(yaml_file),
+            "--zmq-replay-timeout-s",
+            "0.25",
+        ]
+    )
+
+    config = SubscriberConfig.from_args(args)
+
+    assert config.zmq_replay_timeout_s == 0.25
+
+
+def test_zmq_replay_timeout_must_be_positive() -> None:
+    config = SubscriberConfig(zmq_replay_timeout_s=0)
+
+    with pytest.raises(ValueError, match="zmq_replay_timeout_s must be > 0"):
+        config.validate()
 
 
 def test_data_parallel_config_defaults() -> None:
