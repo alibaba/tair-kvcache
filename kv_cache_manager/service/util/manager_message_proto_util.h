@@ -298,16 +298,8 @@ void ProtoConvert::DataStorageTypeToProto(const DataStorageType &data_storage_ty
         *proto_data_storage_type = T::ST_DUMMY;
         break;
     }
-    case DataStorageType::DATA_STORAGE_TYPE_VINEYARD: {
-        *proto_data_storage_type = T::ST_VINEYARD;
-        break;
-    }
-    case DataStorageType::DATA_STORAGE_TYPE_RTP_LLM: {
-        *proto_data_storage_type = T::ST_RTP_LLM;
-        break;
-    }
-    case DataStorageType::DATA_STORAGE_TYPE_VLLM: {
-        *proto_data_storage_type = T::ST_VLLM;
+    case DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT: {
+        *proto_data_storage_type = T::ST_EVENT_REPORT;
         break;
     }
     default: {
@@ -350,16 +342,8 @@ void ProtoConvert::DataStorageTypeFromProto(const T proto_data_storage_type, Dat
         data_storage_type_info = DataStorageType::DATA_STORAGE_TYPE_DUMMY;
         break;
     }
-    case T::ST_VINEYARD: {
-        data_storage_type_info = DataStorageType::DATA_STORAGE_TYPE_VINEYARD;
-        break;
-    }
-    case T::ST_RTP_LLM: {
-        data_storage_type_info = DataStorageType::DATA_STORAGE_TYPE_RTP_LLM;
-        break;
-    }
-    case T::ST_VLLM: {
-        data_storage_type_info = DataStorageType::DATA_STORAGE_TYPE_VLLM;
+    case T::ST_EVENT_REPORT: {
+        data_storage_type_info = DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT;
         break;
     }
     default: {

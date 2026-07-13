@@ -19,9 +19,9 @@ class StorageQuota(JsonData):
 
     def check(self) -> bool:
         _type = self._type.upper()
-        if _type not in ["ST_3FS", "ST_TAIRMEMPOOL", "ST_NFS", "ST_VINEYARD", "ST_RTP_LLM", "ST_VLLM"]:
+        if _type not in ["ST_3FS", "ST_TAIRMEMPOOL", "ST_NFS", "ST_EVENT_REPORT"]:
             raise RuntimeError(
-                f"storage type {self._type} invalid, support ST_3FS|ST_TAIRMEMPOOL|ST_NFS|ST_VINEYARD|ST_RTP_LLM|ST_VLLM")
+                f"storage type {self._type} invalid, support ST_3FS|ST_TAIRMEMPOOL|ST_NFS|ST_EVENT_REPORT")
         self._type = _type
         if self._capacity <= 0:
             raise RuntimeError(f"StorageQuota capacity {self._capacity} <= 0")
@@ -335,7 +335,7 @@ class InstanceGroup(JsonData):
                  user_data: str = "",
                  version: int = 1,
                  extra_info: str = "",
-                 event_reporting_storage_candidates=None,
+                 event_report_storage_candidates=None,
                  ):
         self._name = name
         self._storage_candidates = storage_candidates
@@ -346,7 +346,7 @@ class InstanceGroup(JsonData):
         self._user_data = user_data
         self._version = version
         self._extra_info = extra_info
-        self._event_reporting_storage_candidates = event_reporting_storage_candidates or []
+        self._event_report_storage_candidates = event_report_storage_candidates or []
         self.check()
 
     def check(self):
@@ -373,8 +373,8 @@ class InstanceGroup(JsonData):
             "version": self._version,
             "extra_info": self._extra_info,
         }
-        if self._event_reporting_storage_candidates:
-            data["event_reporting_storage_candidates"] = self._event_reporting_storage_candidates
+        if self._event_report_storage_candidates:
+            data["event_report_storage_candidates"] = self._event_report_storage_candidates
         return data
 
     @classmethod
@@ -396,9 +396,9 @@ class InstanceGroup(JsonData):
         if JsonData.expect_exist("version", json_data, (str, int)):
             version = int(json_data["version"])
         extra_info = json_data.get("extra_info", "")
-        event_reporting_storage_candidates = json_data.get("event_reporting_storage_candidates", [])
+        event_report_storage_candidates = json_data.get("event_report_storage_candidates", [])
         return cls(name, storage_candidates, instance_group_quota, quota_group_name, max_instance_count,
-                   cache_config, user_data, version, extra_info, event_reporting_storage_candidates)
+                   cache_config, user_data, version, extra_info, event_report_storage_candidates)
 
 # create or update
 
@@ -537,16 +537,16 @@ def parse_instance_group_args(is_create: bool):
         type=str,
         default="" if is_create else argparse.SUPPRESS,
         help=(
-            "Opaque JSON string passed through to clients (e.g. V6D). "
+            "Opaque JSON string passed through to clients (e.g. event report). "
             "On update, the provided JSON is merged into existing extra_info."
         )
     )
 
     parser.add_argument(
-        "--event_reporting_storage_candidates",
+        "--event_report_storage_candidates",
         type=split_strs,
         default=[] if is_create else argparse.SUPPRESS,
-        help="event_reporting_storage_candidates, eg. vineyard_default or vineyard_g1,vineyard_g2"
+        help="event_report_storage_candidates, eg. event_report_default or event_report_g1,event_report_g2"
     )
 
     args = parser.parse_args()

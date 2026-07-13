@@ -4,6 +4,7 @@ from .util import *
 from ..common.http_helper import *
 from ...util.json_helper import *
 
+
 def get_current_instance_group(args):
     data = {
         "trace_id": args.trace_id + "_get",
@@ -14,6 +15,7 @@ def get_current_instance_group(args):
         raise RuntimeError(f"getInstanceGroup failed, result:[{result}]")
     print(result)
     return InstanceGroup.from_json_data(result["instance_group"])
+
 
 def main():
     args = parse_instance_group_args(is_create=False)
@@ -56,20 +58,21 @@ def main():
         incoming = json.loads(args.extra_info)
         existing.update(incoming)
         current._extra_info = json.dumps(existing, ensure_ascii=False)
-    if hasattr(args, "event_reporting_storage_candidates"):
-        current._event_reporting_storage_candidates = args.event_reporting_storage_candidates
+    if hasattr(args, "event_report_storage_candidates"):
+        current._event_report_storage_candidates = args.event_report_storage_candidates
     current.check()
     current_version = current._version
     current._version += 1
     print("new instance group:")
     print(current.to_json_data())
     data = {
-        "trace_id" : args.trace_id,
-        "instance_group" : current.to_json_data(),
-        "current_version" : current_version
+        "trace_id": args.trace_id,
+        "instance_group": current.to_json_data(),
+        "current_version": current_version
     }
     result = http_post(args.host, "/api/updateInstanceGroup", data, args.verbose)
     pretty_print_json(result)
+
 
 if __name__ == "__main__":
     main()

@@ -1321,12 +1321,12 @@ TEST_F(MetaSearcherTest, TestBatchGetMergesSpecsByStorageType) {
 // BatchGetBestLocationByBackend tests
 // ============================================================
 
-// Setup 5 keys across 3 V6D peers + 1 Tair peer:
-//   key 80000: v6d peer_a, peer_b    + tair host_t
-//   key 80001: v6d peer_a, peer_b    + tair host_t
-//   key 80002: v6d peer_b            + tair host_t
-//   key 80003: v6d peer_a, peer_b    + tair host_t
-//   key 80004: (no v6d)              + tair host_t
+// Setup 5 keys across 3 event report peers + 1 Tair peer:
+//   key 80000: event report peer_a, peer_b    + tair host_t
+//   key 80001: event report peer_a, peer_b    + tair host_t
+//   key 80002: event report peer_b            + tair host_t
+//   key 80003: event report peer_a, peer_b    + tair host_t
+//   key 80004: (no event report)              + tair host_t
 //
 // PREFIX (from key[0]): peer_a covers [80000,80001] then misses 80002 → prefix len 2
 //                       peer_b covers [80000,80001,80002,80003] → prefix len 4  → winner = peer_b
@@ -1337,52 +1337,52 @@ protected:
     void SetUp() override {
         MetaSearcherTest::SetUp();
 
-        // V6D locations
-        std::vector<std::vector<MetaSearcher::UpsertLocation>> v6d_upserts = {
+        // event report locations
+        std::vector<std::vector<MetaSearcher::UpsertLocation>> er_upserts = {
             // key 80000: peer_a + peer_b
             {
-                {"kvs#vineyard#mem#peer_a:8080",
-                 DataStorageType::DATA_STORAGE_TYPE_VINEYARD,
+                {"kvs#event_report#mem#peer_a:8080",
+                 DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
                  CLS_SERVING,
-                 {LocationSpec("tp0", "vineyard://peer_a:8080/tp0")}},
-                {"kvs#vineyard#mem#peer_b:8080",
-                 DataStorageType::DATA_STORAGE_TYPE_VINEYARD,
+                 {LocationSpec("tp0", "event_report://peer_a:8080/tp0")}},
+                {"kvs#event_report#mem#peer_b:8080",
+                 DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
                  CLS_SERVING,
-                 {LocationSpec("tp0", "vineyard://peer_b:8080/tp0")}},
+                 {LocationSpec("tp0", "event_report://peer_b:8080/tp0")}},
             },
             // key 80001: peer_a + peer_b
             {
-                {"kvs#vineyard#mem#peer_a:8080",
-                 DataStorageType::DATA_STORAGE_TYPE_VINEYARD,
+                {"kvs#event_report#mem#peer_a:8080",
+                 DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
                  CLS_SERVING,
-                 {LocationSpec("tp0", "vineyard://peer_a:8080/tp0")}},
-                {"kvs#vineyard#mem#peer_b:8080",
-                 DataStorageType::DATA_STORAGE_TYPE_VINEYARD,
+                 {LocationSpec("tp0", "event_report://peer_a:8080/tp0")}},
+                {"kvs#event_report#mem#peer_b:8080",
+                 DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
                  CLS_SERVING,
-                 {LocationSpec("tp0", "vineyard://peer_b:8080/tp0")}},
+                 {LocationSpec("tp0", "event_report://peer_b:8080/tp0")}},
             },
             // key 80002: peer_b only
             {
-                {"kvs#vineyard#mem#peer_b:8080",
-                 DataStorageType::DATA_STORAGE_TYPE_VINEYARD,
+                {"kvs#event_report#mem#peer_b:8080",
+                 DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
                  CLS_SERVING,
-                 {LocationSpec("tp0", "vineyard://peer_b:8080/tp0")}},
+                 {LocationSpec("tp0", "event_report://peer_b:8080/tp0")}},
             },
             // key 80003: peer_a + peer_b
             {
-                {"kvs#vineyard#mem#peer_a:8080",
-                 DataStorageType::DATA_STORAGE_TYPE_VINEYARD,
+                {"kvs#event_report#mem#peer_a:8080",
+                 DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
                  CLS_SERVING,
-                 {LocationSpec("tp0", "vineyard://peer_a:8080/tp0")}},
-                {"kvs#vineyard#mem#peer_b:8080",
-                 DataStorageType::DATA_STORAGE_TYPE_VINEYARD,
+                 {LocationSpec("tp0", "event_report://peer_a:8080/tp0")}},
+                {"kvs#event_report#mem#peer_b:8080",
+                 DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT,
                  CLS_SERVING,
-                 {LocationSpec("tp0", "vineyard://peer_b:8080/tp0")}},
+                 {LocationSpec("tp0", "event_report://peer_b:8080/tp0")}},
             },
         };
         std::vector<ErrorCode> per_key_ec;
         ErrorCode ec = meta_searcher_->BatchUpsertLocations(
-            request_context_.get(), {80000, 80001, 80002, 80003}, v6d_upserts, per_key_ec);
+            request_context_.get(), {80000, 80001, 80002, 80003}, er_upserts, per_key_ec);
         ASSERT_EQ(ec, ErrorCode::EC_OK);
 
         // Tair locations for all 5 keys
@@ -1402,10 +1402,10 @@ protected:
     }
 };
 
-TEST_F(BatchGetBestLocationByBackendTest, V6DPrefixStrategy) {
+TEST_F(BatchGetBestLocationByBackendTest, EventReportPrefixStrategy) {
     MetaSearcher::KeyVector keys = {80000, 80001, 80002, 80003, 80004};
     std::vector<BackendSelector> selectors = {
-        {DataStorageType::DATA_STORAGE_TYPE_VINEYARD, LocationSelectStrategy::LSS_V6D_PREFIX},
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT, LocationSelectStrategy::LSS_V6D_PREFIX},
     };
 
     LocationsPerKey out;
@@ -1417,20 +1417,20 @@ TEST_F(BatchGetBestLocationByBackendTest, V6DPrefixStrategy) {
     // peer_b covers the longest prefix: keys 80000-80003 (4 keys).
     // peer_a only covers 80000-80001 (2 keys, breaks at 80002).
     for (size_t i = 0; i < 4; ++i) {
-        ASSERT_EQ(out[i].size(), 1) << "key index " << i << " should have 1 V6D location";
-        EXPECT_EQ(out[i][0]->type(), DataStorageType::DATA_STORAGE_TYPE_VINEYARD);
+        ASSERT_EQ(out[i].size(), 1) << "key index " << i << " should have 1 event report location";
+        EXPECT_EQ(out[i][0]->type(), DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT);
         // URI should contain peer_b
         EXPECT_NE(out[i][0]->location_specs()[0].uri().find("peer_b"), std::string::npos)
             << "key index " << i << " should be served by peer_b";
     }
-    // key 80004 has no V6D location
+    // key 80004 has no event report location
     EXPECT_TRUE(out[4].empty());
 }
 
-TEST_F(BatchGetBestLocationByBackendTest, V6DCoverageStrategy) {
+TEST_F(BatchGetBestLocationByBackendTest, EventReportCoverageStrategy) {
     MetaSearcher::KeyVector keys = {80000, 80001, 80002, 80003, 80004};
     std::vector<BackendSelector> selectors = {
-        {DataStorageType::DATA_STORAGE_TYPE_VINEYARD, LocationSelectStrategy::LSS_V6D_COVERAGE},
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT, LocationSelectStrategy::LSS_V6D_COVERAGE},
     };
 
     LocationsPerKey out;
@@ -1454,7 +1454,7 @@ TEST_F(BatchGetBestLocationByBackendTest, PrefixStopsAtGap) {
     //   peer_b: covers 80000, 80002, 80003 → prefix = 3  → winner = peer_b
     MetaSearcher::KeyVector keys = {80000, 80002, 80003};
     std::vector<BackendSelector> selectors = {
-        {DataStorageType::DATA_STORAGE_TYPE_VINEYARD, LocationSelectStrategy::LSS_V6D_PREFIX},
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT, LocationSelectStrategy::LSS_V6D_PREFIX},
     };
 
     LocationsPerKey out;
@@ -1468,11 +1468,11 @@ TEST_F(BatchGetBestLocationByBackendTest, PrefixStopsAtGap) {
     }
 }
 
-TEST_F(BatchGetBestLocationByBackendTest, PrefixStopsWhenNoV6D) {
-    // key 80004 has no V6D. If it's the first key, PREFIX should stop immediately.
+TEST_F(BatchGetBestLocationByBackendTest, PrefixStopsWhenNoEventReport) {
+    // key 80004 has no event report. If it's the first key, PREFIX should stop immediately.
     MetaSearcher::KeyVector keys = {80004, 80000, 80001};
     std::vector<BackendSelector> selectors = {
-        {DataStorageType::DATA_STORAGE_TYPE_VINEYARD, LocationSelectStrategy::LSS_V6D_PREFIX},
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT, LocationSelectStrategy::LSS_V6D_PREFIX},
     };
 
     LocationsPerKey out;
@@ -1480,17 +1480,17 @@ TEST_F(BatchGetBestLocationByBackendTest, PrefixStopsWhenNoV6D) {
         meta_searcher_->BatchGetBestLocationByBackend(request_context_.get(), keys, out, &policy_, selectors);
     ASSERT_EQ(ec, ErrorCode::EC_OK);
     ASSERT_EQ(out.size(), 3);
-    // All empty because first key has no V6D, PREFIX stops
+    // All empty because first key has no event report, PREFIX stops
     for (size_t i = 0; i < 3; ++i) {
         EXPECT_TRUE(out[i].empty()) << "key index " << i << " should be empty";
     }
 }
 
 TEST_F(BatchGetBestLocationByBackendTest, CoverageSkipsGap) {
-    // COVERAGE skips keys with no V6D and picks from the rest.
+    // COVERAGE skips keys with no event report and picks from the rest.
     MetaSearcher::KeyVector keys = {80004, 80000, 80001};
     std::vector<BackendSelector> selectors = {
-        {DataStorageType::DATA_STORAGE_TYPE_VINEYARD, LocationSelectStrategy::LSS_V6D_COVERAGE},
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT, LocationSelectStrategy::LSS_V6D_COVERAGE},
     };
 
     LocationsPerKey out;
@@ -1498,7 +1498,7 @@ TEST_F(BatchGetBestLocationByBackendTest, CoverageSkipsGap) {
         meta_searcher_->BatchGetBestLocationByBackend(request_context_.get(), keys, out, &policy_, selectors);
     ASSERT_EQ(ec, ErrorCode::EC_OK);
     ASSERT_EQ(out.size(), 3);
-    EXPECT_TRUE(out[0].empty()); // 80004 has no V6D
+    EXPECT_TRUE(out[0].empty()); // 80004 has no event report
     EXPECT_EQ(out[1].size(), 1); // 80000
     EXPECT_EQ(out[2].size(), 1); // 80001
 }
@@ -1521,10 +1521,10 @@ TEST_F(BatchGetBestLocationByBackendTest, WeightedRandomTair) {
     }
 }
 
-TEST_F(BatchGetBestLocationByBackendTest, MixedV6DAndTair) {
+TEST_F(BatchGetBestLocationByBackendTest, MixedEventReportAndTair) {
     MetaSearcher::KeyVector keys = {80000, 80001, 80002, 80003, 80004};
     std::vector<BackendSelector> selectors = {
-        {DataStorageType::DATA_STORAGE_TYPE_VINEYARD, LocationSelectStrategy::LSS_V6D_PREFIX},
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT, LocationSelectStrategy::LSS_V6D_PREFIX},
         {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, LocationSelectStrategy::LSS_WEIGHTED_RANDOM},
     };
 
@@ -1534,20 +1534,20 @@ TEST_F(BatchGetBestLocationByBackendTest, MixedV6DAndTair) {
     ASSERT_EQ(ec, ErrorCode::EC_OK);
     ASSERT_EQ(out.size(), 5);
 
-    // Keys 80000-80003: 1 V6D (peer_b) + 1 Tair = 2 locations
+    // Keys 80000-80003: 1 event report (peer_b) + 1 Tair = 2 locations
     for (size_t i = 0; i < 4; ++i) {
         ASSERT_EQ(out[i].size(), 2) << "key index " << i;
-        int v6d_count = 0, tair_count = 0;
+        int er_count = 0, tair_count = 0;
         for (const auto &loc : out[i]) {
-            if (loc->type() == DataStorageType::DATA_STORAGE_TYPE_VINEYARD)
-                v6d_count++;
+            if (loc->type() == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT)
+                er_count++;
             if (loc->type() == DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL)
                 tair_count++;
         }
-        EXPECT_EQ(v6d_count, 1);
+        EXPECT_EQ(er_count, 1);
         EXPECT_EQ(tair_count, 1);
     }
-    // Key 80004: only Tair (no V6D)
+    // Key 80004: only Tair (no event report)
     ASSERT_EQ(out[4].size(), 1);
     EXPECT_EQ(out[4][0]->type(), DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL);
 }
@@ -1568,7 +1568,7 @@ TEST_F(BatchGetBestLocationByBackendTest, EmptySelectorsBackwardCompat) {
 TEST_F(BatchGetBestLocationByBackendTest, NoLocationsAtAll) {
     MetaSearcher::KeyVector keys = {99999}; // nonexistent key
     std::vector<BackendSelector> selectors = {
-        {DataStorageType::DATA_STORAGE_TYPE_VINEYARD, LocationSelectStrategy::LSS_V6D_PREFIX},
+        {DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT, LocationSelectStrategy::LSS_V6D_PREFIX},
         {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, LocationSelectStrategy::LSS_WEIGHTED_RANDOM},
     };
 

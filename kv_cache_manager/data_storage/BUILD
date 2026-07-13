@@ -5,7 +5,7 @@ cc_library(
     srcs = [
         "data_storage_manager.cc",
         "dummy_backend.cc",
-        "event_reporting_backend.cc",
+        "event_report_backend.cc",
         "hf3fs_backend.cc",
         "mooncake_backend.cc",
         "nfs_backend.cc",
@@ -14,7 +14,7 @@ cc_library(
         "data_storage_backend.h",
         "data_storage_manager.h",
         "dummy_backend.h",
-        "event_reporting_backend.h",
+        "event_report_backend.h",
         "hf3fs_backend.h",
         "mooncake_backend.h",
         "nfs_backend.h",

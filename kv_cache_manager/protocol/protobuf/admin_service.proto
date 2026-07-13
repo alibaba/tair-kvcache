@@ -43,9 +43,7 @@ enum StorageType {
     ST_NFS = 4;
     ST_VCNS_3FS = 5;
     ST_DUMMY = 6;
-    ST_VINEYARD = 7;
-    ST_RTP_LLM = 8; // RTP-LLM 推理节点本地缓存
-    ST_VLLM = 9;          // VLLM 推理节点本地缓存
+    ST_EVENT_REPORT = 7;
 }
 
 message LocalStorageSpec {}
@@ -104,7 +102,7 @@ message NfsStorageSpec {
     int32 key_count_per_file = 2;
 }
 
-message EventReportingStorageSpec {
+message EventReportStorageSpec {
     int64 heartbeat_timeout_ms = 1;
     int64 cleanup_grace_ms = 2;
     int64 liveness_check_interval_ms = 3;
@@ -120,9 +118,7 @@ message StorageConfig {
         NfsStorageSpec nfs = 6;
         VcnsThreeFSStorageSpec vcnsthreefs = 7;
         DummyStorageSpec dummy = 9;
-        EventReportingStorageSpec vineyard = 10;  // V6D (Vineyard)
-        EventReportingStorageSpec rtp_llm = 12;   // RTP-LLM
-        EventReportingStorageSpec vllm = 13;      // VLLM
+        EventReportStorageSpec event_report = 14;
     }
     bool check_storage_available_when_open = 8;
     // 仅供响应中使用，标识存储类型；请求时类型由 oneof 字段决定。
@@ -254,7 +250,7 @@ message InstanceGroup {
     string user_data = 7;
     int64 version = 8;
     string extra_info = 9; // opaque JSON passed through to clients
-    repeated string event_reporting_storage_candidates = 10; // backends that handle ReportEvent
+    repeated string event_report_storage_candidates = 10; // backends that handle ReportEvent
 }
 
 message CreateInstanceGroupRequest {

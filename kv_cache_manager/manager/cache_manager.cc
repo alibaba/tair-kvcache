@@ -22,7 +22,7 @@
 #include "kv_cache_manager/config/meta_cache_policy_config.h"
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
-#include "kv_cache_manager/data_storage/event_reporting_backend.h"
+#include "kv_cache_manager/data_storage/event_report_backend.h"
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/event/spec_events/optimizer_event.h"
 #include "kv_cache_manager/manager/cache_manager_metrics_recorder.h"
@@ -1397,8 +1397,8 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
 
 namespace {
 
-std::shared_ptr<DataStorageBackend>
-LookupEventReportingBackend(const std::shared_ptr<RegistryManager> &registry_manager, const std::string &instance_id) {
+std::shared_ptr<DataStorageBackend> LookupEventReportBackend(const std::shared_ptr<RegistryManager> &registry_manager,
+                                                             const std::string &instance_id) {
     if (!registry_manager || !registry_manager->data_storage_manager()) {
         return nullptr;
     }
@@ -1407,13 +1407,13 @@ LookupEventReportingBackend(const std::shared_ptr<RegistryManager> &registry_man
         return nullptr;
     }
     auto ig = registry_manager->GetInstanceGroupConfig(group_name);
-    if (!ig || ig->event_reporting_storage_candidates().empty()) {
+    if (!ig || ig->event_report_storage_candidates().empty()) {
         return nullptr;
     }
     auto dsm = registry_manager->data_storage_manager();
-    const auto &candidate_name = ig->event_reporting_storage_candidates().front();
+    const auto &candidate_name = ig->event_report_storage_candidates().front();
     auto backend = dsm->GetDataStorageBackend(candidate_name);
-    if (!backend || !dynamic_cast<EventReportingBackend *>(backend.get())) {
+    if (!backend || !dynamic_cast<EventReportBackend *>(backend.get())) {
         return nullptr;
     }
     return backend;
@@ -1422,13 +1422,6 @@ LookupEventReportingBackend(const std::shared_ptr<RegistryManager> &registry_man
 bool ParseInt64(const std::string &s, int64_t &out) {
     try {
         size_t consumed = 0;
-        // vLLM block hashes are uint64; use stoull to accept values that
-        // exceed INT64_MAX, then reinterpret as int64_t via bit-pattern
-        // preservation (same approach as ParseOptimizerKey in
-        // optimizer_schema_trace.h). Negative decimal strings are also
-        // handled correctly: stoull wraps them to the two's-complement
-        // uint64 representation, and the conversion below restores the
-        // original signed value.
         uint64_t v = std::stoull(s, &consumed);
         if (consumed != s.size()) {
             return false;
@@ -1472,15 +1465,15 @@ ErrorCode CacheManager::ReportEvent(RequestContext *request_context,
         return EC_BADARGS;
     }
 
-    auto event_backend_holder = LookupEventReportingBackend(registry_manager_, instance_id);
-    auto *event_backend = dynamic_cast<EventReportingBackend *>(event_backend_holder.get());
+    auto event_backend_holder = LookupEventReportBackend(registry_manager_, instance_id);
+    auto *event_backend = dynamic_cast<EventReportBackend *>(event_backend_holder.get());
     if (!event_backend) {
-        KVCM_LOG_WARN("trace_id [%s] | ReportEvent: EventReportingBackend not found for instance [%s] type [%d]",
+        KVCM_LOG_WARN("trace_id [%s] | ReportEvent: EventReportBackend not found for instance [%s] type [%d]",
                       trace_id.c_str(),
                       instance_id.c_str(),
                       static_cast<int>(requested_type));
         response_status->set_code(proto::meta::INSTANCE_NOT_EXIST);
-        response_status->set_message("EventReportingBackend not found for instance: " + instance_id);
+        response_status->set_message("EventReportBackend not found for instance: " + instance_id);
         return EC_INSTANCE_NOT_EXIST;
     }
 
@@ -1814,8 +1807,8 @@ void CacheManager::CleanupHostLocations(const std::string &instance_id,
                                         const std::string &host_ip_port,
                                         uint64_t cleanup_generation,
                                         DataStorageType storage_type) {
-    auto event_backend_holder = LookupEventReportingBackend(registry_manager_, instance_id);
-    auto *event_backend = dynamic_cast<EventReportingBackend *>(event_backend_holder.get());
+    auto event_backend_holder = LookupEventReportBackend(registry_manager_, instance_id);
+    auto *event_backend = dynamic_cast<EventReportBackend *>(event_backend_holder.get());
 
     if (event_backend) {
         uint64_t current_gen = event_backend->GetNodeGeneration(instance_id, host_ip_port);
@@ -1840,7 +1833,7 @@ void CacheManager::CleanupHostLocations(const std::string &instance_id,
     const std::string host_suffix = event_backend ? event_backend->HostSuffix(host_ip_port) : ("#" + host_ip_port);
 
     auto abort_if_reregistered = [event_backend_holder, instance_id, host_ip_port, cleanup_generation]() -> bool {
-        auto *eb = dynamic_cast<EventReportingBackend *>(event_backend_holder.get());
+        auto *eb = dynamic_cast<EventReportBackend *>(event_backend_holder.get());
         if (!eb) {
             return false;
         }
@@ -2087,7 +2080,7 @@ void CacheManager::ClearEventCleanupCallbacks() {
     }
     auto dsm = registry_manager_->data_storage_manager();
     for (const auto &name : dsm->GetAllStorageNames()) {
-        auto *erb = dynamic_cast<EventReportingBackend *>(dsm->GetDataStorageBackend(name).get());
+        auto *erb = dynamic_cast<EventReportBackend *>(dsm->GetDataStorageBackend(name).get());
         if (erb) {
             erb->SetCleanupCallback(nullptr);
         }
@@ -2212,12 +2205,12 @@ CheckLocDataExistFunc CacheManager::GetCheckLocDataExistFunc(const std::string &
         }
 
         std::string storage_unique_name = storage_uris.front().GetHostName();
-        auto erb_holder = LookupEventReportingBackend(registry_manager_, instance_id);
-        auto *erb = dynamic_cast<EventReportingBackend *>(erb_holder.get());
+        auto erb_holder = LookupEventReportBackend(registry_manager_, instance_id);
+        auto *erb = dynamic_cast<EventReportBackend *>(erb_holder.get());
         if (erb && loc.type() == erb->GetStorageType()) {
             auto ig = registry_manager_->GetInstanceGroupConfig(registry_manager_->GetInstanceGroupName(instance_id));
-            if (ig && !ig->event_reporting_storage_candidates().empty()) {
-                storage_unique_name = ig->event_reporting_storage_candidates().front();
+            if (ig && !ig->event_report_storage_candidates().empty()) {
+                storage_unique_name = ig->event_report_storage_candidates().front();
             }
         }
         const auto result = registry_manager_->data_storage_manager()->Exist(storage_unique_name, storage_uris, true);

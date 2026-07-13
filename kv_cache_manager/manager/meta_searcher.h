@@ -21,8 +21,8 @@ class MetaIndexer;
 
 enum class LocationSelectStrategy : int32_t {
     LSS_UNSPECIFIED = 0,
-    LSS_V6D_PREFIX = 1,   // 对应v6d侧，best_effort = false
-    LSS_V6D_COVERAGE = 2, // 对应v6d侧，best_effort = true
+    LSS_V6D_PREFIX = 1,   // 对应 v6d 侧，best_effort = false
+    LSS_V6D_COVERAGE = 2, // 对应 v6d 侧，best_effort = true
     LSS_WEIGHTED_RANDOM = 3,
 };
 
