@@ -66,9 +66,9 @@ cc_test(
 )
 
 cc_test(
-    name = "EventReportingBackendTest",
+    name = "EventReportBackendTest",
     srcs = [
-        "event_reporting_backend_test.cc",
+        "event_report_backend_test.cc",
     ],
     copts = ["-fno-access-control"],
     data = [],

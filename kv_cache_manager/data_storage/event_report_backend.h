@@ -17,17 +17,16 @@
 
 namespace kv_cache_manager {
 
-// Unified backend for event-reporting storage types (V6D / RTP-LLM / VLLM).
-// Engine-specific parameters (location_id prefix, metrics prefix, protocol)
-// are derived from config_.type() at DoOpen time.
-class EventReportingBackend : public DataStorageBackend {
+// Unified backend for event-reporting storage types.
+// Location_id prefix, metrics prefix, and protocol string are constants.
+class EventReportBackend : public DataStorageBackend {
 public:
     using CleanupCallback =
         std::function<void(const std::string &instance_id, const std::string &host_ip_port, uint64_t generation)>;
 
-    EventReportingBackend() = delete;
-    explicit EventReportingBackend(std::shared_ptr<MetricsRegistry> metrics_registry);
-    ~EventReportingBackend() override;
+    EventReportBackend() = delete;
+    explicit EventReportBackend(std::shared_ptr<MetricsRegistry> metrics_registry);
+    ~EventReportBackend() override;
 
     // --- DataStorageBackend interface ---
     DataStorageType GetType() override;
@@ -66,7 +65,6 @@ public:
     std::string BuildLocationId(const std::string &medium, const std::string &host_ip_port) const;
     std::string HostSuffix(const std::string &host_ip_port) const;
     DataStorageType GetStorageType() const;
-    std::string GetProtocol() const;
 
 private:
     struct NodeInfo {
@@ -88,12 +86,7 @@ private:
         return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
     }
 
-    // Engine-specific parameter derivation from config_.type()
-    static std::string GetBackendIdentifier(DataStorageType type);
-    static std::string GetMetricsPrefix(DataStorageType type);
-    static std::string GetProtocolStr(DataStorageType type);
-
-    EventReportingStorageSpec spec_;
+    EventReportStorageSpec spec_;
 
     mutable std::shared_mutex nodes_mutex_;
     // instance_id -> (host_ip_port -> NodeInfo)
@@ -105,9 +98,9 @@ private:
     std::thread liveness_checker_thread_;
     std::atomic<bool> liveness_checker_running_{false};
 
-    int64_t heartbeat_timeout_ms_ = EventReportingStorageSpec::kDefaultHeartbeatTimeoutMs;
-    int64_t cleanup_grace_ms_ = EventReportingStorageSpec::kDefaultCleanupGraceMs;
-    int64_t liveness_check_interval_ms_ = EventReportingStorageSpec::kDefaultLivenessCheckIntervalMs;
+    int64_t heartbeat_timeout_ms_ = EventReportStorageSpec::kDefaultHeartbeatTimeoutMs;
+    int64_t cleanup_grace_ms_ = EventReportStorageSpec::kDefaultCleanupGraceMs;
+    int64_t liveness_check_interval_ms_ = EventReportStorageSpec::kDefaultLivenessCheckIntervalMs;
 
     mutable std::mutex cleanup_cb_mutex_;
     CleanupCallback cleanup_callback_;

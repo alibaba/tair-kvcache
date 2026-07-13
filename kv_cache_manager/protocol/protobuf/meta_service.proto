@@ -43,20 +43,18 @@ enum StorageType {
     ST_NFS = 4;
     ST_VCNS_3FS = 5;
     ST_DUMMY = 6;
-    ST_VINEYARD = 7;
-    ST_RTP_LLM = 8; // RTP-LLM 推理节点本地缓存
-    ST_VLLM = 9;          // VLLM 推理节点本地缓存
+    ST_EVENT_REPORT = 7;
 }
 
-// ---- Event reporting (V6D / RTP-LLM / VLLM) ----
+// ---- Event reporting ----
 
 enum ReportEventType {
     EVENT_UNSPECIFIED = 0;
-    EVENT_NODE_REGISTER = 1; // V6D node starts up and registers with KVCM
-    EVENT_BLOCK_ADD = 2;     // V6D stored a new block locally
-    EVENT_BLOCK_DELETE = 3;  // V6D deleted a block locally
-    EVENT_HOST_DOWN = 4;     // V6D node is going down (graceful or detected)
-    EVENT_HEARTBEAT = 5;     // V6D periodic heartbeat
+    EVENT_NODE_REGISTER = 1; // node starts up and registers with KVCM
+    EVENT_BLOCK_ADD = 2;     // node stored a new block locally
+    EVENT_BLOCK_DELETE = 3;  // node deleted a block locally
+    EVENT_HOST_DOWN = 4;     // node is going down (graceful or detected)
+    EVENT_HEARTBEAT = 5;     // periodic heartbeat
 }
 
 message NodeRegisterParams {

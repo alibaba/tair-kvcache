@@ -67,6 +67,7 @@ curl -g -vvv -X POST http://localhost:56040/api/createInstanceGroup \
 }'
 '''
 
+
 def create_instance_group(args) -> InstanceGroup:
     instance_group_quota = InstanceGroupQuota(args.quota_capacity, args.quota_configs)
     reclaim_strategy = ReclaimStrategy(storage_unique_name=args.storage_candidates[0],
@@ -78,22 +79,21 @@ def create_instance_group(args) -> InstanceGroup:
                                             mutex_shard_num=args.mutex_shard_num,
                                             batch_key_size=args.batch_key_size,
                                             meta_storage_backend_config=args.meta_storage_backend_config,
-                                            meta_cache_policy_config = meta_cache_policy_config)
+                                            meta_cache_policy_config=meta_cache_policy_config)
     cache_config = CacheConfig(data_storage_strategy=args.data_storage_strategy,
                                reclaim_strategy=reclaim_strategy,
                                meta_indexer_config=meta_indexer_config)
-    instance_group = InstanceGroup(name = args.name,
-                                   storage_candidates = args.storage_candidates,
-                                   instance_group_quota = instance_group_quota,
-                                   quota_group_name = "default_quota_group",
-                                   max_instance_count = args.max_instance_count,
-                                   cache_config = cache_config,
-                                   user_data = args.user_data,
+    instance_group = InstanceGroup(name=args.name,
+                                   storage_candidates=args.storage_candidates,
+                                   instance_group_quota=instance_group_quota,
+                                   quota_group_name="default_quota_group",
+                                   max_instance_count=args.max_instance_count,
+                                   cache_config=cache_config,
+                                   user_data=args.user_data,
                                    version=1,
                                    extra_info=args.extra_info,
-                                   event_reporting_storage_candidates=args.event_reporting_storage_candidates)
+                                   event_report_storage_candidates=args.event_report_storage_candidates)
     return instance_group
-    
 
 
 def main():
@@ -105,6 +105,7 @@ def main():
     }
     result = http_post(args.host, "/api/createInstanceGroup", data, args.verbose)
     pretty_print_json(result)
+
 
 if __name__ == "__main__":
     main()

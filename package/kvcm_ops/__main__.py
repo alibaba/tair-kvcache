@@ -78,7 +78,7 @@ def main():
     update_storage
     remove_storage
   storage types (for add_storage/update_storage):
-    nfs / pace / 3fs / vineyard / rtp_llm / vllm
+    nfs / pace / 3fs / event_report
   trace:
     trace_key
     trace_uri

@@ -54,26 +54,14 @@ def handle_3fs(args):
     http_post_and_print(args.host, data, args.verbose)
 
 
-def handle_vineyard(args):
-    storage_spec = gen_event_reporting_config_data(args)
-    data = create_add_storage_data(args, "vineyard", storage_spec)
-    http_post_and_print(args.host, data, args.verbose)
-
-
-def handle_rtp_llm(args):
-    storage_spec = gen_event_reporting_config_data(args)
-    data = create_add_storage_data(args, "rtp_llm", storage_spec)
-    http_post_and_print(args.host, data, args.verbose)
-
-
-def handle_vllm(args):
-    storage_spec = gen_event_reporting_config_data(args)
-    data = create_add_storage_data(args, "vllm", storage_spec)
+def handle_event_report(args):
+    storage_spec = gen_event_report_config_data(args)
+    data = create_add_storage_data(args, "event_report", storage_spec)
     http_post_and_print(args.host, data, args.verbose)
 
 
 def main():
-    add_or_update_main("add_storage", handle_nfs, handle_pace, handle_3fs, handle_vineyard, handle_rtp_llm, handle_vllm)
+    add_or_update_main("add_storage", handle_nfs, handle_pace, handle_3fs, handle_event_report)
 
 
 if __name__ == "__main__":

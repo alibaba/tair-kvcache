@@ -47,7 +47,7 @@ CacheLocationConstPtr SelectAndMergeForMatch(SelectLocationPolicy *policy,
             continue;
         }
         if (check_loc_data_exist && !check_loc_data_exist(*loc_ptr)) {
-            if (loc_ptr->type() != DataStorageType::DATA_STORAGE_TYPE_VINEYARD) {
+            if (loc_ptr->type() != DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT) {
                 out_prune_loc_ids.push_back(id);
             }
             continue;
@@ -185,7 +185,7 @@ CacheLocationMap FilterValidLocations(const CacheLocationMap &location_map,
         if (loc->status() != CacheLocationStatus::CLS_SERVING)
             continue;
         if (check_loc_data_exist && !check_loc_data_exist(*loc)) {
-            if (loc->type() != DataStorageType::DATA_STORAGE_TYPE_VINEYARD) {
+            if (loc->type() != DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT) {
                 out_prune_loc_ids.push_back(id);
             }
             continue;
@@ -415,10 +415,10 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
     for (const auto &selector : selectors) {
         DataStorageType target_type = selector.backend_type;
 
-        if (target_type == DataStorageType::DATA_STORAGE_TYPE_VINEYARD &&
+        if (target_type == DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT &&
             (selector.strategy == LocationSelectStrategy::LSS_V6D_PREFIX ||
              selector.strategy == LocationSelectStrategy::LSS_V6D_COVERAGE)) {
-            // --- V6D cross-key selection ---
+            // --- event report cross-key selection ---
             bool is_prefix = (selector.strategy == LocationSelectStrategy::LSS_V6D_PREFIX);
 
             // Candidate enumeration
@@ -436,7 +436,7 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
                 std::vector<std::string> vineyard_addrs;
 
                 for (const auto &[id, loc] : vmap) {
-                    if (loc->type() != DataStorageType::DATA_STORAGE_TYPE_VINEYARD)
+                    if (loc->type() != DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT)
                         continue;
                     std::string addr = ExtractPeerAddrFromLocation(*loc);
                     if (addr.empty())
@@ -481,7 +481,7 @@ ErrorCode MetaSearcher::BatchGetBestLocationByBackend(RequestContext *request_co
             }
 
         } else {
-            // --- Per-key independent selection (WEIGHTED_RANDOM or other non-V6D) ---
+            // --- Per-key independent selection (WEIGHTED_RANDOM or other non-event-report) ---
             for (size_t i = 0; i < keys.size(); ++i) {
                 const auto &vmap = valid_maps[i];
                 CacheLocationMap filtered;

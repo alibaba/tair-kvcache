@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Integration tests for V6D ReportEvent HTTP interface.
+Integration tests for Event Report ReportEvent HTTP interface.
 
 Usage:
     # 1. Start KVCM service locally:
@@ -13,7 +13,7 @@ Usage:
     # 2. Run this script:
     python test_vineyard_report_event.py \
         --host localhost --http_port 56020 --admin_http_port 56040 \
-        --instance_id v6d_cluster_0
+        --instance_id event_report_cluster_0
 """
 
 import argparse
@@ -29,7 +29,7 @@ import requests
 
 BASE_URL = ""
 ADMIN_URL = ""
-INSTANCE_ID = "v6d_cluster_0"
+INSTANCE_ID = "event_report_cluster_0"
 SKIP_BENCH = False
 ONLY_BENCH = False
 # Requires small heartbeat_timeout_ms/cleanup_grace_ms in addStorage spec.
@@ -171,7 +171,7 @@ def _ev_heartbeat(system_status=None):
     }
 
 
-def _make_request(instance_id, host_ip_port, events, trace_id="test", storage_type="ST_VINEYARD"):
+def _make_request(instance_id, host_ip_port, events, trace_id="test", storage_type="ST_EVENT_REPORT"):
     return {
         "trace_id": trace_id,
         "instance_id": instance_id,
@@ -181,7 +181,7 @@ def _make_request(instance_id, host_ip_port, events, trace_id="test", storage_ty
     }
 
 
-def _build_vineyard_uri(host_ip_port, medium, params=None):
+def _build_event_report_uri(host_ip_port, medium, params=None):
     """Build vineyard URI: vineyard://{ip}:{port}/{medium}?k=v&..."""
     base = f"vineyard://{host_ip_port}/{medium}"
     if not params:
@@ -193,16 +193,16 @@ def _build_vineyard_uri(host_ip_port, medium, params=None):
 # ---------------------------------------------------------------------------
 # Functional tests
 # ---------------------------------------------------------------------------
-class VineyardReportEventFunctionalTest(unittest.TestCase):
+class EventReportFunctionalTest(unittest.TestCase):
     HOST = "192.168.1.200:8080"
-    VINEYARD_STORAGE_NAME = "vineyard_default"
-    INSTANCE_GROUP_NAME = "vineyard_test_group"
+    EVENT_REPORT_STORAGE_NAME = "event_report_default"
+    INSTANCE_GROUP_NAME = "event_report_test_group"
 
     @classmethod
     def setUpClass(cls):
         cls.client = KVCMClient(BASE_URL, ADMIN_URL)
         cls.instance_id = INSTANCE_ID
-        cls._ensure_vineyard_storage_registered()
+        cls._ensure_event_report_storage_registered()
         cls._ensure_instance_group_created()
         cls._ensure_instance_registered()
         # Register host so subsequent events have a NodeInfo entry.
@@ -216,13 +216,13 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
         )
 
     @classmethod
-    def _ensure_vineyard_storage_registered(cls):
+    def _ensure_event_report_storage_registered(cls):
         try:
             cls.client.add_storage({
                 "trace_id": "setup_storage",
                 "storage": {
-                    "global_unique_name": cls.VINEYARD_STORAGE_NAME,
-                    "vineyard": {
+                    "global_unique_name": cls.EVENT_REPORT_STORAGE_NAME,
+                    "event_report": {
                         "heartbeat_timeout_ms": 30000,
                         "cleanup_grace_ms": 300000,
                         "liveness_check_interval_ms": 5000,
@@ -230,7 +230,7 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
                     "check_storage_available_when_open": False,
                 },
             })
-            print(f"[SETUP] Vineyard storage '{cls.VINEYARD_STORAGE_NAME}' registered")
+            print(f"[SETUP] Event report storage '{cls.EVENT_REPORT_STORAGE_NAME}' registered")
         except Exception as e:
             print(f"[WARN] addStorage failed (may already exist): {e}")
 
@@ -240,7 +240,7 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
             "trace_id": "setup_ig",
             "instance_group": {
                 "name": cls.INSTANCE_GROUP_NAME,
-                "storage_candidates": ["nfs_01", cls.VINEYARD_STORAGE_NAME],
+                "storage_candidates": ["nfs_01"],
                 "global_quota_group_name": "default_quota_group",
                 "max_instance_count": 100,
                 "quota": {
@@ -265,7 +265,7 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
                         "meta_cache_policy_config": {"type": "LRU", "capacity": 10000},
                     },
                 },
-                "event_reporting_storage_candidates": [cls.VINEYARD_STORAGE_NAME],
+                "event_report_storage_candidates": [cls.EVENT_REPORT_STORAGE_NAME],
                 "version": 1,
             },
         })
@@ -280,7 +280,7 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
                 "instance_id": cls.instance_id,
                 "block_size": 128,
                 "model_deployment": {
-                    "model_name": "test_v6d_model",
+                    "model_name": "test_er_model",
                     "dtype": "FP8",
                     "use_mla": False,
                     "tp_size": 1,
@@ -322,7 +322,7 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
 
     # 3. BLOCK_ADD with single spec
     def test_03_block_add(self):
-        uri = _build_vineyard_uri(self.HOST, "mem", {"gpu": "A100"})
+        uri = _build_event_report_uri(self.HOST, "mem", {"gpu": "A100"})
         body = self.client.report_event(
             _make_request(
                 self.instance_id, self.HOST,
@@ -335,7 +335,7 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
     # 4. BLOCK_ADD then query: spec name/uri should match what was sent
     def test_04_block_add_then_query(self):
         block_key = 9002
-        uri = _build_vineyard_uri(self.HOST, "mem", {"flavor": "test_query"})
+        uri = _build_event_report_uri(self.HOST, "mem", {"flavor": "test_query"})
         spec_name = "tp0"
         self.client.report_event(
             _make_request(
@@ -370,8 +370,8 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
         self.client.report_event(
             _make_request(self.instance_id, host, [_ev_node_register(["mem", "disk"])], trace_id="t05a")
         )
-        uri_mem = _build_vineyard_uri(host, "mem")
-        uri_disk = _build_vineyard_uri(host, "disk")
+        uri_mem = _build_event_report_uri(host, "mem")
+        uri_disk = _build_event_report_uri(host, "disk")
         body = self.client.report_event(
             _make_request(
                 self.instance_id, host,
@@ -410,8 +410,8 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
         self.client.report_event(
             _make_request(self.instance_id, host, [_ev_node_register(["mem"])], trace_id="t05b_reg")
         )
-        uri_spec0 = _build_vineyard_uri(host, "mem", {"obj_id": "o1", "size": "512"})
-        uri_spec1 = _build_vineyard_uri(host, "mem", {"obj_id": "o2", "size": "512"})
+        uri_spec0 = _build_event_report_uri(host, "mem", {"obj_id": "o1", "size": "512"})
+        uri_spec1 = _build_event_report_uri(host, "mem", {"obj_id": "o2", "size": "512"})
         body = self.client.report_event(
             _make_request(
                 self.instance_id, host,
@@ -446,7 +446,7 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
     # 6. BLOCK_DELETE removes the specific (block_key, medium) entry
     def test_06_block_delete(self):
         block_key = 9003
-        uri = _build_vineyard_uri(self.HOST, "mem")
+        uri = _build_event_report_uri(self.HOST, "mem")
         self.client.report_event(
             _make_request(
                 self.instance_id, self.HOST,
@@ -489,7 +489,7 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
                     "mem",
                     _make_single_spec(
                         "spec_4096",
-                        _build_vineyard_uri(
+                        _build_event_report_uri(
                             down_host,
                             "mem"))))
             events.append(
@@ -498,7 +498,7 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
                     "disk",
                     _make_single_spec(
                         "spec_4096",
-                        _build_vineyard_uri(
+                        _build_event_report_uri(
                             down_host,
                             "disk"))))
         self.client.report_event(_make_request(self.instance_id, down_host, events, trace_id="t08a"))
@@ -528,7 +528,7 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
         body = self.client.report_event(
             _make_request(
                 self.instance_id, self.HOST,
-                [_ev_heartbeat({"version": "v6d-0.18", "cpu": "45%"})],
+                [_ev_heartbeat({"version": "er-0.18", "cpu": "45%"})],
                 trace_id="t10",
             )
         )
@@ -540,7 +540,7 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
         block_key = 9030
         events = [
             _ev_node_register(["mem"]),
-            _ev_block_add(block_key, "mem", _make_single_spec("spec_4096", _build_vineyard_uri(host, "mem"))),
+            _ev_block_add(block_key, "mem", _make_single_spec("spec_4096", _build_event_report_uri(host, "mem"))),
             _ev_heartbeat({"phase": "boot"}),
         ]
         body = self.client.report_event(
@@ -576,18 +576,18 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
                 "instance_id": self.instance_id,
                 "host_ip_port": "",
                 "events": [_ev_node_register(["mem"])],
-                "storage_type": "ST_VINEYARD",
+                "storage_type": "ST_EVENT_REPORT",
             },
             check_ok=False,
         )
         self.assertIn("header", body)
 
-    # 15. StartWriteCacheWithMinReplica: V6D eviction with min_replica_count=2
+    # 15. StartWriteCacheWithMinReplica: event report eviction with min_replica_count=2
     def test_15_start_write_cache_with_min_replica(self):
         block_key = 8001
-        uri = _build_vineyard_uri(self.HOST, "mem")
+        uri = _build_event_report_uri(self.HOST, "mem")
 
-        # Step 1: 1 VINEYARD replica only.
+        # Step 1: 1 EVENT_REPORT replica only.
         self.client.report_event(
             _make_request(
                 self.instance_id, self.HOST,
@@ -638,11 +638,11 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
 
         host = "192.168.1.250:8080"
         block_key = 9100
-        # Step 1: register + add a V6D replica.
+        # Step 1: register + add a event report replica.
         self.client.report_event(
             _make_request(self.instance_id, host, [
                 _ev_node_register(["mem"]),
-                _ev_block_add(block_key, "mem", _make_single_spec("spec_4096", _build_vineyard_uri(host, "mem"))),
+                _ev_block_add(block_key, "mem", _make_single_spec("spec_4096", _build_event_report_uri(host, "mem"))),
             ], trace_id="t16a_setup")
         )
         # Confirm the replica is queryable.
@@ -690,7 +690,7 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
         self.client.report_event(
             _make_request(self.instance_id, host, [
                 _ev_node_register(["mem"]),
-                _ev_block_add(block_key, "mem", _make_single_spec("spec_4096", _build_vineyard_uri(host, "mem"))),
+                _ev_block_add(block_key, "mem", _make_single_spec("spec_4096", _build_event_report_uri(host, "mem"))),
             ], trace_id="t16b_setup")
         )
 
@@ -716,7 +716,7 @@ class VineyardReportEventFunctionalTest(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # Bench tests
 # ---------------------------------------------------------------------------
-class VineyardReportEventBenchTest(unittest.TestCase):
+class EventReportBenchTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
@@ -764,10 +764,11 @@ class VineyardReportEventBenchTest(unittest.TestCase):
             for i in range(ops_per_thread):
                 block_key = thread_id * ops_per_thread + i + 100000
                 payload = _make_request(
-                    self.instance_id, host,
-                    [_ev_block_add(block_key, "mem", _make_single_spec("spec_4096", _build_vineyard_uri(host, "mem")))],
-                    trace_id=f"bench_add_{thread_id}_{i}",
-                )
+                    self.instance_id, host, [
+                        _ev_block_add(
+                            block_key, "mem", _make_single_spec(
+                                "spec_4096", _build_event_report_uri(
+                                    host, "mem")))], trace_id=f"bench_add_{thread_id}_{i}", )
                 t0 = time.monotonic()
                 try:
                     resp = session.post(f"{BASE_URL}/api/reportEvent", json=payload)
@@ -819,11 +820,8 @@ class VineyardReportEventBenchTest(unittest.TestCase):
             session.headers.update({"Content-Type": "application/json"})
             for i in range(ops_per_thread):
                 block_key = thread_id * ops_per_thread + i + 200000
-                events = [
-                    _ev_block_add(block_key, "mem", _make_single_spec("spec_4096", _build_vineyard_uri(host, "mem"))),
-                    _ev_block_delete(block_key, "mem"),
-                    _ev_heartbeat({"thread": str(thread_id)}),
-                ]
+                events = [_ev_block_add(block_key, "mem", _make_single_spec("spec_4096", _build_event_report_uri(
+                    host, "mem"))), _ev_block_delete(block_key, "mem"), _ev_heartbeat({"thread": str(thread_id)}), ]
                 payload = _make_request(
                     self.instance_id, host, events,
                     trace_id=f"bench_mixed_{thread_id}_{i}",
@@ -865,18 +863,18 @@ class VineyardReportEventBenchTest(unittest.TestCase):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="V6D ReportEvent HTTP integration tests")
+    parser = argparse.ArgumentParser(description="Event Report ReportEvent HTTP integration tests")
     parser.add_argument("--host", default="localhost", help="KVCM host")
     parser.add_argument("--http_port", type=int, default=56020, help="KVCM meta HTTP port")
     parser.add_argument("--admin_http_port", type=int, default=None,
                         help="KVCM admin HTTP port (for addStorage). Defaults to http_port.")
-    parser.add_argument("--instance_id", default="v6d_cluster_0", help="V6D instance_id")
+    parser.add_argument("--instance_id", default="event_report_cluster_0", help="event report instance_id")
     parser.add_argument("--skip-bench", action="store_true", help="Skip benchmark tests")
     parser.add_argument("--only-bench", action="store_true", help="Run only benchmark tests")
     parser.add_argument(
         "--enable-liveness-timing-tests",
         action="store_true",
-        help=("Run heartbeat/cleanup timing tests. Requires the Vineyard storage to be opened with "
+        help=("Run heartbeat/cleanup timing tests. Requires the Event report storage to be opened with "
               "small heartbeat_timeout_ms / cleanup_grace_ms (defaults to 1000ms / 2000ms here)."),
     )
     parser.add_argument("--heartbeat-timeout-ms", type=int, default=1000)
@@ -902,9 +900,9 @@ def main():
     suite = unittest.TestSuite()
 
     if not ONLY_BENCH:
-        suite.addTests(loader.loadTestsFromTestCase(VineyardReportEventFunctionalTest))
+        suite.addTests(loader.loadTestsFromTestCase(EventReportFunctionalTest))
     if not SKIP_BENCH:
-        suite.addTests(loader.loadTestsFromTestCase(VineyardReportEventBenchTest))
+        suite.addTests(loader.loadTestsFromTestCase(EventReportBenchTest))
 
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)

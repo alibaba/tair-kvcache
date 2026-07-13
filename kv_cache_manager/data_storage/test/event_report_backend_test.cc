@@ -7,32 +7,32 @@
 
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
-#include "kv_cache_manager/data_storage/event_reporting_backend.h"
+#include "kv_cache_manager/data_storage/event_report_backend.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
 using namespace kv_cache_manager;
 using namespace std::chrono_literals;
 
-class EventReportingBackendTest : public TESTBASE {
+class EventReportBackendTest : public TESTBASE {
 public:
     void SetUp() override { metrics_registry_ = std::make_shared<MetricsRegistry>(); }
 
     static StorageConfig
     MakeConfig(int64_t hb_timeout_ms = 200, int64_t cleanup_grace_ms = 400, int64_t check_interval_ms = 50) {
-        auto spec = std::make_shared<EventReportingStorageSpec>();
+        auto spec = std::make_shared<EventReportStorageSpec>();
         spec->set_heartbeat_timeout_ms(hb_timeout_ms);
         spec->set_cleanup_grace_ms(cleanup_grace_ms);
         spec->set_liveness_check_interval_ms(check_interval_ms);
-        return StorageConfig(DataStorageType::DATA_STORAGE_TYPE_VINEYARD, "vineyard_test_group", spec);
+        return StorageConfig(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT, "event_report_test_group", spec);
     }
 
     std::shared_ptr<MetricsRegistry> metrics_registry_;
 };
 
 // (1) GetType / Available / Create-Delete EC_UNIMPLEMENTED / GetStorageUsageRatio=1.0
-TEST_F(EventReportingBackendTest, BasicAccessors) {
-    EventReportingBackend backend(metrics_registry_);
+TEST_F(EventReportBackendTest, BasicAccessors) {
+    EventReportBackend backend(metrics_registry_);
     ASSERT_FALSE(backend.Available());
 
     ASSERT_DOUBLE_EQ(1.0, backend.GetStorageUsageRatio("trace"));
@@ -51,22 +51,22 @@ TEST_F(EventReportingBackendTest, BasicAccessors) {
 
     // After Open(), GetType() returns the configured type
     ASSERT_EQ(EC_OK, backend.Open(MakeConfig(), "trace"));
-    ASSERT_EQ(backend.GetType(), DataStorageType::DATA_STORAGE_TYPE_VINEYARD);
+    ASSERT_EQ(backend.GetType(), DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT);
     ASSERT_TRUE(backend.Available());
     ASSERT_EQ(EC_OK, backend.Close());
 }
 
-TEST_F(EventReportingBackendTest, OpenWithWrongSpecTypeFails) {
-    EventReportingBackend backend(metrics_registry_);
+TEST_F(EventReportBackendTest, OpenWithWrongSpecTypeFails) {
+    EventReportBackend backend(metrics_registry_);
     auto spec = std::make_shared<NfsStorageSpec>();
     spec->set_root_path("/tmp");
-    StorageConfig cfg(DataStorageType::DATA_STORAGE_TYPE_VINEYARD, "vineyard_test", spec);
+    StorageConfig cfg(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT, "event_report_test", spec);
     ASSERT_NE(EC_OK, backend.Open(cfg, "trace"));
     ASSERT_FALSE(backend.Available());
 }
 
-TEST_F(EventReportingBackendTest, OpenStartsLivenessLoopAndCloseStops) {
-    EventReportingBackend backend(metrics_registry_);
+TEST_F(EventReportBackendTest, OpenStartsLivenessLoopAndCloseStops) {
+    EventReportBackend backend(metrics_registry_);
     ASSERT_EQ(EC_OK, backend.Open(MakeConfig(), "trace"));
     ASSERT_TRUE(backend.Available());
     ASSERT_TRUE(backend.liveness_checker_running_.load());
@@ -79,8 +79,8 @@ TEST_F(EventReportingBackendTest, OpenStartsLivenessLoopAndCloseStops) {
 }
 
 // (2) RegisterNode / UnregisterNode
-TEST_F(EventReportingBackendTest, RegisterNodeWithMediums) {
-    EventReportingBackend backend(metrics_registry_);
+TEST_F(EventReportBackendTest, RegisterNodeWithMediums) {
+    EventReportBackend backend(metrics_registry_);
     ASSERT_EQ(EC_OK, backend.Open(MakeConfig(), "trace"));
 
     ASSERT_EQ(EC_BADARGS, backend.RegisterNode("test_inst", "", {"mem"}));
@@ -107,8 +107,8 @@ TEST_F(EventReportingBackendTest, RegisterNodeWithMediums) {
 }
 
 // (3) OnHeartbeat
-TEST_F(EventReportingBackendTest, OnHeartbeatRefreshesAndRevivesNode) {
-    EventReportingBackend backend(metrics_registry_);
+TEST_F(EventReportBackendTest, OnHeartbeatRefreshesAndRevivesNode) {
+    EventReportBackend backend(metrics_registry_);
     ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 200, /*grace*/ 5000, /*tick*/ 50), "trace"));
     ASSERT_EQ(EC_OK, backend.RegisterNode("test_inst", "10.0.0.3:8080", {"mem"}));
 
@@ -122,12 +122,12 @@ TEST_F(EventReportingBackendTest, OnHeartbeatRefreshesAndRevivesNode) {
     }
 
     std::this_thread::sleep_for(20ms);
-    ASSERT_EQ(EC_OK, backend.OnHeartbeat("test_inst", "10.0.0.3:8080", {{"version", "v6d-0.18"}}));
+    ASSERT_EQ(EC_OK, backend.OnHeartbeat("test_inst", "10.0.0.3:8080", {{"version", "er-0.18"}}));
     {
         auto &host_map = backend.instance_nodes_["test_inst"];
         auto it = host_map.find("10.0.0.3:8080");
         ASSERT_GT(it->second->last_heartbeat_ms.load(), initial_hb);
-        ASSERT_EQ(it->second->last_system_status.at("version"), "v6d-0.18");
+        ASSERT_EQ(it->second->last_system_status.at("version"), "er-0.18");
     }
 
     backend.SetNodeUnavailable("test_inst", "10.0.0.3:8080");
@@ -147,8 +147,8 @@ TEST_F(EventReportingBackendTest, OnHeartbeatRefreshesAndRevivesNode) {
 }
 
 // (5) LivenessCheckerLoop: healthy -> unavailable -> dead
-TEST_F(EventReportingBackendTest, LivenessLoopHealthyToUnavailableToCleanup) {
-    EventReportingBackend backend(metrics_registry_);
+TEST_F(EventReportBackendTest, LivenessLoopHealthyToUnavailableToCleanup) {
+    EventReportBackend backend(metrics_registry_);
     ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 100, /*grace*/ 200, /*tick*/ 20), "trace"));
 
     std::atomic<int> cleanup_calls{0};
@@ -177,8 +177,8 @@ TEST_F(EventReportingBackendTest, LivenessLoopHealthyToUnavailableToCleanup) {
 }
 
 // (6) Grace-period recovery
-TEST_F(EventReportingBackendTest, HeartbeatWithinGraceWindowRecovers) {
-    EventReportingBackend backend(metrics_registry_);
+TEST_F(EventReportBackendTest, HeartbeatWithinGraceWindowRecovers) {
+    EventReportBackend backend(metrics_registry_);
     ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 80, /*grace*/ 5000, /*tick*/ 20), "trace"));
 
     std::atomic<int> cleanup_calls{0};
@@ -198,8 +198,8 @@ TEST_F(EventReportingBackendTest, HeartbeatWithinGraceWindowRecovers) {
 }
 
 // (7) Re-registration after cleanup
-TEST_F(EventReportingBackendTest, RegisterAfterCleanupCreatesNewEntry) {
-    EventReportingBackend backend(metrics_registry_);
+TEST_F(EventReportBackendTest, RegisterAfterCleanupCreatesNewEntry) {
+    EventReportBackend backend(metrics_registry_);
     ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 80, /*grace*/ 120, /*tick*/ 20), "trace"));
 
     std::atomic<int> cleanup_calls{0};
@@ -226,8 +226,8 @@ TEST_F(EventReportingBackendTest, RegisterAfterCleanupCreatesNewEntry) {
 }
 
 // (8) EVENT_HOST_DOWN: immediate removal, no cleanup callback
-TEST_F(EventReportingBackendTest, HostDownRemovesNodeFromTable) {
-    EventReportingBackend backend(metrics_registry_);
+TEST_F(EventReportBackendTest, HostDownRemovesNodeFromTable) {
+    EventReportBackend backend(metrics_registry_);
     ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 200, /*grace*/ 400, /*tick*/ 50), "trace"));
 
     std::atomic<int> cleanup_calls{0};
@@ -249,8 +249,8 @@ TEST_F(EventReportingBackendTest, HostDownRemovesNodeFromTable) {
 }
 
 // (9) Generation counter fences stale cleanup
-TEST_F(EventReportingBackendTest, GenerationBumpsOnReRegistration) {
-    EventReportingBackend backend(metrics_registry_);
+TEST_F(EventReportBackendTest, GenerationBumpsOnReRegistration) {
+    EventReportBackend backend(metrics_registry_);
     ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 200, /*grace*/ 5000, /*tick*/ 50), "trace"));
 
     const std::string host = "10.0.0.8:8080";
@@ -273,8 +273,8 @@ TEST_F(EventReportingBackendTest, GenerationBumpsOnReRegistration) {
 }
 
 // (10) Cleanup callback receives correct generation
-TEST_F(EventReportingBackendTest, LivenessLoopPassesGenerationToCallback) {
-    EventReportingBackend backend(metrics_registry_);
+TEST_F(EventReportBackendTest, LivenessLoopPassesGenerationToCallback) {
+    EventReportBackend backend(metrics_registry_);
     ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 80, /*grace*/ 120, /*tick*/ 20), "trace"));
 
     std::atomic<uint64_t> received_gen{0};
@@ -293,8 +293,8 @@ TEST_F(EventReportingBackendTest, LivenessLoopPassesGenerationToCallback) {
     ASSERT_EQ(EC_OK, backend.Close());
 }
 
-TEST_F(EventReportingBackendTest, OnHeartbeatPublishesMetricsGauges) {
-    EventReportingBackend backend(metrics_registry_);
+TEST_F(EventReportBackendTest, OnHeartbeatPublishesMetricsGauges) {
+    EventReportBackend backend(metrics_registry_);
     ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 5000, /*grace*/ 10000, /*tick*/ 50), "trace"));
     ASSERT_EQ(EC_OK, backend.RegisterNode("test_inst", "10.0.0.10:9600", {"mem"}));
 
@@ -306,18 +306,18 @@ TEST_F(EventReportingBackendTest, OnHeartbeatPublishesMetricsGauges) {
                             {"non_numeric_field", "BOTH_OK"},
                         });
 
-    auto hit_rate_data = metrics_registry_->GetMetricsData("vineyard.hit_rate");
+    auto hit_rate_data = metrics_registry_->GetMetricsData("event_report.hit_rate");
     ASSERT_NE(hit_rate_data, nullptr);
     MetricsTags expected_tags = {{"instance_id", "test_inst"}, {"host", "10.0.0.10:9600"}};
     auto gauge = hit_rate_data->GetOrCreateGauge(expected_tags);
     ASSERT_DOUBLE_EQ(0.85, gauge.Get());
 
-    auto leases_data = metrics_registry_->GetMetricsData("vineyard.active_leases");
+    auto leases_data = metrics_registry_->GetMetricsData("event_report.active_leases");
     ASSERT_NE(leases_data, nullptr);
     auto leases_gauge = leases_data->GetOrCreateGauge(expected_tags);
     ASSERT_DOUBLE_EQ(5.0, leases_gauge.Get());
 
-    auto non_numeric = metrics_registry_->GetMetricsData("vineyard.non_numeric_field");
+    auto non_numeric = metrics_registry_->GetMetricsData("event_report.non_numeric_field");
     ASSERT_EQ(non_numeric, nullptr);
 
     backend.OnHeartbeat("test_inst",
@@ -327,7 +327,7 @@ TEST_F(EventReportingBackendTest, OnHeartbeatPublishesMetricsGauges) {
                             {"brand_new_metric", "42"},
                         });
 
-    auto new_data = metrics_registry_->GetMetricsData("vineyard.brand_new_metric");
+    auto new_data = metrics_registry_->GetMetricsData("event_report.brand_new_metric");
     ASSERT_NE(new_data, nullptr);
     auto new_gauge = new_data->GetOrCreateGauge(expected_tags);
     ASSERT_DOUBLE_EQ(42.0, new_gauge.Get());
@@ -336,8 +336,8 @@ TEST_F(EventReportingBackendTest, OnHeartbeatPublishesMetricsGauges) {
     ASSERT_EQ(EC_OK, backend.Close());
 }
 
-TEST_F(EventReportingBackendTest, SetNodeUnavailableZerosGauges) {
-    EventReportingBackend backend(metrics_registry_);
+TEST_F(EventReportBackendTest, SetNodeUnavailableZerosGauges) {
+    EventReportBackend backend(metrics_registry_);
     ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 5000, /*grace*/ 10000, /*tick*/ 50), "trace"));
 
     ASSERT_EQ(EC_OK, backend.RegisterNode("test_inst", "10.0.0.30:9600", {"mem"}));
@@ -349,7 +349,7 @@ TEST_F(EventReportingBackendTest, SetNodeUnavailableZerosGauges) {
     MetricsTags tags_30 = {{"instance_id", "test_inst"}, {"host", "10.0.0.30:9600"}};
     MetricsTags tags_31 = {{"instance_id", "test_inst"}, {"host", "10.0.0.31:9600"}};
 
-    auto hr_data = metrics_registry_->GetMetricsData("vineyard.hit_rate");
+    auto hr_data = metrics_registry_->GetMetricsData("event_report.hit_rate");
     ASSERT_NE(hr_data, nullptr);
     ASSERT_DOUBLE_EQ(0.90, hr_data->GetOrCreateGauge(tags_30).Get());
     ASSERT_DOUBLE_EQ(0.80, hr_data->GetOrCreateGauge(tags_31).Get());
@@ -357,7 +357,7 @@ TEST_F(EventReportingBackendTest, SetNodeUnavailableZerosGauges) {
     backend.SetNodeUnavailable("test_inst", "10.0.0.30:9600");
 
     ASSERT_DOUBLE_EQ(0.0, hr_data->GetOrCreateGauge(tags_30).Get());
-    auto mu_data = metrics_registry_->GetMetricsData("vineyard.mem_used");
+    auto mu_data = metrics_registry_->GetMetricsData("event_report.mem_used");
     ASSERT_DOUBLE_EQ(0.0, mu_data->GetOrCreateGauge(tags_30).Get());
 
     ASSERT_DOUBLE_EQ(0.80, hr_data->GetOrCreateGauge(tags_31).Get());
@@ -369,8 +369,8 @@ TEST_F(EventReportingBackendTest, SetNodeUnavailableZerosGauges) {
     ASSERT_EQ(EC_OK, backend.Close());
 }
 
-TEST_F(EventReportingBackendTest, UnregisterNodeCleansUpGauges) {
-    EventReportingBackend backend(metrics_registry_);
+TEST_F(EventReportBackendTest, UnregisterNodeCleansUpGauges) {
+    EventReportBackend backend(metrics_registry_);
     ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 5000, /*grace*/ 10000, /*tick*/ 50), "trace"));
 
     ASSERT_EQ(EC_OK, backend.RegisterNode("test_inst", "10.0.0.20:9600", {"mem"}));
@@ -382,7 +382,7 @@ TEST_F(EventReportingBackendTest, UnregisterNodeCleansUpGauges) {
     MetricsTags tags_20 = {{"instance_id", "test_inst"}, {"host", "10.0.0.20:9600"}};
     MetricsTags tags_21 = {{"instance_id", "test_inst"}, {"host", "10.0.0.21:9600"}};
 
-    auto hr_data = metrics_registry_->GetMetricsData("vineyard.hit_rate");
+    auto hr_data = metrics_registry_->GetMetricsData("event_report.hit_rate");
     ASSERT_NE(hr_data, nullptr);
     ASSERT_DOUBLE_EQ(0.75, hr_data->GetOrCreateGauge(tags_20).Get());
     ASSERT_DOUBLE_EQ(0.60, hr_data->GetOrCreateGauge(tags_21).Get());
@@ -393,7 +393,7 @@ TEST_F(EventReportingBackendTest, UnregisterNodeCleansUpGauges) {
     for (const auto &[tags, val] : hr_values) {
         ASSERT_NE(tags, tags_20) << "node 20 gauge should have been removed";
     }
-    auto mu_data = metrics_registry_->GetMetricsData("vineyard.mem_used");
+    auto mu_data = metrics_registry_->GetMetricsData("event_report.mem_used");
     auto mu_values = mu_data->GetMetricsValues();
     for (const auto &[tags, val] : mu_values) {
         ASSERT_NE(tags, tags_20) << "node 20 gauge should have been removed";
@@ -405,8 +405,8 @@ TEST_F(EventReportingBackendTest, UnregisterNodeCleansUpGauges) {
     ASSERT_EQ(EC_OK, backend.Close());
 }
 
-TEST_F(EventReportingBackendTest, TwoInstancesSameHostIsolated) {
-    EventReportingBackend backend(metrics_registry_);
+TEST_F(EventReportBackendTest, TwoInstancesSameHostIsolated) {
+    EventReportBackend backend(metrics_registry_);
     ASSERT_EQ(EC_OK, backend.Open(MakeConfig(/*hb*/ 200, /*grace*/ 5000, /*tick*/ 50), "trace"));
 
     const std::string host = "10.0.0.50:8080";
