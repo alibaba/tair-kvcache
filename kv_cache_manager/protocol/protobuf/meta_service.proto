@@ -46,15 +46,27 @@ enum StorageType {
     ST_VINEYARD = 7;
 }
 
-// ---- V6D event reporting ----
+// ---- Cache event reporting ----
+//
+// ReportEvent is the ingestion API used by cache subscribers. A subscriber
+// normalizes engine-specific cache signals (for example RTP-LLM cache snapshots
+// or vLLM KV events) into block-level mutations on one storage system.
+// `storage_type` names that large storage/cache system; `medium` identifies one
+// diffable cache namespace under the reporter host; LocationSpec describes
+// where each cache component of the block lives. KVCM currently matches only
+// full-attention specs and ignores mamba-state specs by LocationSpec.name.
 
 enum ReportEventType {
     EVENT_UNSPECIFIED = 0;
-    EVENT_NODE_REGISTER = 1; // V6D node starts up and registers with KVCM
-    EVENT_BLOCK_ADD = 2;     // V6D stored a new block locally
-    EVENT_BLOCK_DELETE = 3;  // V6D deleted a block locally
-    EVENT_HOST_DOWN = 4;     // V6D node is going down (graceful or detected)
-    EVENT_HEARTBEAT = 5;     // V6D periodic heartbeat
+    EVENT_NODE_REGISTER = 1; // Reporter node starts up and registers with KVCM
+    EVENT_BLOCK_ADD = 2;     // Reporter stored a block in one location
+    EVENT_BLOCK_DELETE = 3;  // Reporter removed a block from one location
+    EVENT_HOST_DOWN = 4;     // Reporter node is going down (graceful or detected)
+    EVENT_HEARTBEAT = 5;     // Reporter periodic heartbeat
+    // Schema placeholder for future full block snapshots. This event is not
+    // supported by the server yet; callers must not send it until a later
+    // implementation enables EVENT_BLOCK_SNAPSHOT handling.
+    EVENT_BLOCK_SNAPSHOT = 6;
 }
 
 message NodeRegisterParams {
@@ -64,13 +76,28 @@ message NodeRegisterParams {
 message BlockAddParams {
     string block_key = 1; // int64 as string
     string uri = 2;       // deprecated, use specs instead
-    string medium = 3;    // e.g. "mem"/"disk"/"ssd"/"hbm"
+    string medium = 3;    // cache tier/namespace, e.g. "mem", "disk", "gpu", "hbm"
     repeated LocationSpec specs = 4;
 }
 
 message BlockDeleteParams {
     string block_key = 1;
-    string medium = 2;
+    string medium = 2; // cache tier/namespace, e.g. "mem", "disk", "gpu", "hbm"
+    // Schema placeholder for future component-scoped delete semantics. The
+    // current server implementation ignores this field.
+    repeated string spec_names = 3;
+}
+
+message BlockSnapshotItem {
+    string block_key = 1;
+    repeated LocationSpec specs = 2;
+}
+
+// Schema placeholder for future full snapshot reporting. The
+// EVENT_BLOCK_SNAPSHOT event is currently unavailable on the server side.
+message BlockSnapshotEventParams {
+    string medium = 1; // cache tier/namespace, e.g. "mem", "disk", "gpu", "hbm"
+    repeated BlockSnapshotItem blocks = 2;
 }
 
 message HostDownParams {
@@ -89,6 +116,9 @@ message EventItem {
         BlockDeleteParams block_delete = 4;
         HostDownParams host_down = 5;
         HeartbeatParams heartbeat = 6;
+        // Declared for schema compatibility only; EVENT_BLOCK_SNAPSHOT is not
+        // usable until its server implementation lands.
+        BlockSnapshotEventParams block_snapshot = 7;
     }
 }
 
@@ -97,7 +127,7 @@ message ReportEventRequest {
     string instance_id = 2;
     string host_ip_port = 3;
     repeated EventItem events = 4;
-    StorageType storage_type = 5; // required: declares the reporter's storage type
+    StorageType storage_type = 5; // required: declares the reporter's storage/cache system
 }
 
 message ReportEventResponse {

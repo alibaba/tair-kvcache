@@ -2909,6 +2909,54 @@ TEST_F(CacheManagerTest, InvalidateInstanceMetricsInvokesCallback) {
     ASSERT_EQ(1, call_count);
 }
 
+TEST_F(CacheManagerTest, TestReportEventBlockSnapshotCurrentlyUnavailable) {
+    auto expected_reg = std::pair<ErrorCode, std::string>(EC_OK, default_storage_configs);
+    ASSERT_EQ(expected_reg,
+              cache_manager_->RegisterInstance(request_context_.get(),
+                                               "default",
+                                               "test_instance",
+                                               64,
+                                               createLocationSpecInfos(),
+                                               createModelDeployment(),
+                                               std::vector<LocationSpecGroup>()));
+
+    auto metrics_registry = cache_manager_->metrics_registry_;
+    auto vineyard_backend = std::make_shared<VineyardBackend>(metrics_registry);
+    StorageConfig v6d_config;
+    v6d_config.set_global_unique_name("vineyard_default");
+    v6d_config.set_type(DataStorageType::DATA_STORAGE_TYPE_VINEYARD);
+    v6d_config.set_storage_spec(std::make_shared<VineyardStorageSpec>());
+    ASSERT_EQ(EC_OK, vineyard_backend->Open(v6d_config, "test_trace"));
+
+    auto dsm = registry_manager_->data_storage_manager_;
+    dsm->storage_map_["vineyard_default"] = vineyard_backend;
+    registry_manager_->instance_group_configs_["default"]->set_event_reporting_storage_candidates({"vineyard_default"});
+
+    proto::meta::ReportEventRequest req;
+    req.set_instance_id("test_instance");
+    req.set_host_ip_port("192.168.1.10:8080");
+    req.set_storage_type(proto::meta::ST_VINEYARD);
+
+    auto *ev = req.add_events();
+    ev->set_event_type(proto::meta::EVENT_BLOCK_SNAPSHOT);
+    auto *snapshot = ev->mutable_block_snapshot();
+    snapshot->set_medium("mem");
+    auto *block = snapshot->add_blocks();
+    block->set_block_key("123");
+    auto *spec = block->add_specs();
+    spec->set_name("tp0");
+    spec->set_uri("vineyard://192.168.1.10:8080/mem/123");
+
+    proto::meta::ReportEventResponse resp;
+    EXPECT_EQ(EC_PARTIAL_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
+    ASSERT_EQ(proto::meta::INTERNAL_ERROR, resp.header().status().code());
+    ASSERT_EQ(1, resp.item_results_size());
+    EXPECT_EQ(proto::meta::INVALID_ARGUMENT, resp.item_results(0));
+
+    dsm->storage_map_.erase("vineyard_default");
+    registry_manager_->instance_group_configs_["default"]->set_event_reporting_storage_candidates({});
+}
+
 // =============================================================
 // GetCacheLocationsByBackend with backend_selectors
 // =============================================================
