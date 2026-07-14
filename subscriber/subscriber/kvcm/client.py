@@ -215,11 +215,15 @@ class KvcmClient:
         self._started = True
         if await self._manager_is_ready():
             try:
-                await self._register()
-            except Exception:
+                await self._register_instance()
+                await self._report_events([self._node_register_event()])
+                self._registered = True
+            except Exception as exc:
                 logger.warning(
-                    "kvcm initial registration failed; will retry via heartbeat",
+                    "kvcm initial registration failed (%s); will retry via heartbeat",
+                    type(exc).__name__,
                     step="kvcm_register",
+                    tags={"message": str(exc)},
                     exc_info=True,
                 )
         else:
@@ -234,11 +238,10 @@ class KvcmClient:
             return False
         return await self._manager_client.is_ready()
 
-    async def _register(self) -> None:
+    async def _register_instance(self) -> None:
         if not self._started or self._manager_client is None:
             raise RuntimeError("kvcm client has not been started")
         await self._manager_client.register_instance(self._register_instance_request())
-        await self._report_events([self._node_register_event()])
         self._registered = True
 
     async def _heartbeat_loop(self) -> None:
@@ -248,13 +251,28 @@ class KvcmClient:
                 if not await self._manager_is_ready():
                     continue
                 try:
-                    await self._register()
-                except Exception:
+                    await self._register_instance()
+                except Exception as exc:
                     logger.warning(
-                        "kvcm registration retry failed",
+                        "kvcm registerInstance retry failed (%s: %s)",
+                        type(exc).__name__,
+                        exc,
+                        step="kvcm_register",
+                        tags={"phase": "register_instance"},
+                        exc_info=True,
+                    )
+                    continue
+                try:
+                    await self._report_events([self._node_register_event()])
+                except Exception as exc:
+                    logger.warning(
+                        "kvcm node register report failed (%s: %s)",
+                        type(exc).__name__,
+                        exc,
                         step="kvcm_register",
                         exc_info=True,
                     )
+                    self._registered = False
                     continue
                 logger.info(
                     "kvcm registration recovered",
@@ -263,10 +281,12 @@ class KvcmClient:
 
             try:
                 await self._report_events([self._heartbeat_event()])
-            except Exception:
+            except Exception as exc:
                 self._registered = False
                 logger.warning(
-                    "kvcm heartbeat report failed",
+                    "kvcm heartbeat report failed (%s: %s)",
+                    type(exc).__name__,
+                    exc,
                     step="kvcm_heartbeat",
                     exc_info=True,
                 )

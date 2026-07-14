@@ -3,9 +3,9 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator
 
 from subscriber.config import SubscriberConfig
-from subscriber.engine.base import AbstractEngineAdapter
+from subscriber.engine.base import AbstractEngineAdapter, EngineEventBatch
 from subscriber.health.events import LivenessEvent
-from subscriber.types import KVEventBatch
+from subscriber.metrics import StageTimer
 
 
 @AbstractEngineAdapter.register("sglang")
@@ -13,10 +13,10 @@ class SGLangAdapter(AbstractEngineAdapter):
     def __init__(self, config: SubscriberConfig) -> None:
         self._config = config
 
-    async def subscribe_kv_events(self) -> AsyncGenerator[list[KVEventBatch], None]:
+    async def subscribe_kv_events(self) -> AsyncGenerator[EngineEventBatch, None]:
         pass
         if False:  # pragma: no cover - placeholder to satisfy async generator protocol
-            yield []
+            yield EngineEventBatch([], StageTimer())
 
     async def watch_liveness(self) -> AsyncGenerator[LivenessEvent, None]:
         pass

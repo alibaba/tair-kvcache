@@ -10,8 +10,9 @@ import zmq.asyncio
 
 from subscriber import logger
 from subscriber.config import SubscriberConfig
-from subscriber.engine.base import AbstractEngineAdapter
+from subscriber.engine.base import AbstractEngineAdapter, EngineEventBatch
 from subscriber.health.events import LivenessEvent
+from subscriber.metrics import StageTimer
 from subscriber.types import BlockRemoved, BlockStored, KVEventBatch
 from subscriber.utils.msgpack_helper import KVEventBatchMsgpackHelper
 
@@ -84,7 +85,11 @@ async def _probe_health(client: httpx.AsyncClient, url: str) -> LivenessEvent:
         logger.warning(
             "engine health probe failed",
             step="engine_health",
-            tags={"error": type(exc).__name__, "url": url},
+            tags={
+                "error": type(exc).__name__,
+                "message": str(exc),
+                "url": url,
+            },
         )
         return LivenessEvent.UNHEALTHY
     if response.status_code == 200:
@@ -176,12 +181,16 @@ class VllmAdapter(AbstractEngineAdapter):
         else:
             sub.setsockopt(zmq.TCP_KEEPALIVE, 0)
 
-    async def subscribe_kv_events(self) -> AsyncGenerator[list[KVEventBatch], None]:
+    async def subscribe_kv_events(self) -> AsyncGenerator[EngineEventBatch, None]:
         """Subscribe to vLLM KV events and repair sequence gaps with replay.
 
         The generator yields replayed batches first when a gap is detected, then
         yields the live batch that exposed the gap. Sequence tracking is local
         to this adapter generation and is reset by ``reset_generation_state``.
+
+        Each yield carries a :class:`StageTimer`: live events measure a
+        ``decode`` stage, replayed events measure a ``replay_fetch`` stage
+        (DEALER round-trip plus batch decode).
         """
 
         try:
@@ -203,11 +212,13 @@ class VllmAdapter(AbstractEngineAdapter):
                             "missed": missed,
                         },
                     )
+                    replay_timer = StageTimer()
                     replay_batches = await self._replay_missing_batches(seq, generation)
                     if generation != self._generation:
                         continue
                     if replay_batches:
-                        yield replay_batches
+                        replay_timer.mark("replay_fetch")
+                        yield EngineEventBatch(replay_batches, replay_timer)
                     elif replay_batches == []:
                         logger.warning(
                             "replay returned no batches, "
@@ -216,6 +227,7 @@ class VllmAdapter(AbstractEngineAdapter):
                             tags={"gap_start_seq": self._last_seq + 1},
                         )
 
+                timer = StageTimer()
                 batch = self._msgpack_helper.decode(
                     payload,
                     step="zmq_subscribe",
@@ -223,6 +235,7 @@ class VllmAdapter(AbstractEngineAdapter):
                 )
                 if batch is None:
                     continue
+                timer.mark("decode")
                 if logger.is_debug_enabled():
                     logger.debug(
                         "decoded vLLM KV event batch",
@@ -232,7 +245,7 @@ class VllmAdapter(AbstractEngineAdapter):
                 if generation != self._generation:
                     continue
                 self._last_seq = seq
-                yield [batch]
+                yield EngineEventBatch([batch], timer)
         finally:
             self._sub.close(linger=0)
             self._dealer.close(linger=0)

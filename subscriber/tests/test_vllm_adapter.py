@@ -10,6 +10,7 @@ import pytest
 import zmq
 
 from subscriber.config import SubscriberConfig
+from subscriber.engine.base import EngineEventBatch
 from subscriber.engine.vllm import VllmAdapter, _probe_health
 from subscriber.health.events import LivenessEvent
 from subscriber.types import AllBlocksCleared, BlockRemoved, BlockStored, KVEventBatch
@@ -371,16 +372,68 @@ async def test_replay_missing_batches_uses_new_dealer_after_reset(
 
 
 async def _collect_n(adapter: VllmAdapter, n: int) -> list[list[KVEventBatch]]:
-    results: list[list[KVEventBatch]] = []
+    events = await _collect_events_n(adapter, n)
+    return [event.batches for event in events]
+
+
+async def _collect_events_n(adapter: VllmAdapter, n: int) -> list[EngineEventBatch]:
+    results: list[EngineEventBatch] = []
 
     async def _run() -> None:
-        async for batches in adapter.subscribe_kv_events():
-            results.append(batches)
+        async for event in adapter.subscribe_kv_events():
+            results.append(event)
             if len(results) >= n:
                 break
 
     await asyncio.wait_for(_run(), timeout=1.0)
     return results
+
+
+async def test_live_event_carries_decode_span(
+    config: SubscriberConfig, mocker: Any
+) -> None:
+    batch = KVEventBatch(ts=1.0, events=[AllBlocksCleared()])
+    payload = _encode_batch(batch)
+    mock_sub, _ = _mock_adapter_sockets(mocker)
+    mock_sub.recv_multipart = AsyncMock(return_value=[b"", _seq_bytes(0), payload])
+
+    adapter = VllmAdapter(config)
+    events = await _collect_events_n(adapter, 1)
+
+    spans = events[0].timer.spans()
+    assert [span.name for span in spans] == ["decode"]
+    assert spans[0].duration_s >= 0
+
+
+async def test_replayed_event_carries_replay_fetch_span(
+    config: SubscriberConfig, mocker: Any
+) -> None:
+    batch = KVEventBatch(ts=1.0, events=[AllBlocksCleared()])
+    payload = _encode_batch(batch)
+    replay_batch = KVEventBatch(ts=0.5, events=[AllBlocksCleared()])
+    replay_payload = _encode_batch(replay_batch)
+
+    mock_sub, mock_dealer = _mock_adapter_sockets(mocker)
+    mock_sub.recv_multipart = AsyncMock(
+        side_effect=[
+            [b"", _seq_bytes(1), payload],
+            [b"", _seq_bytes(2), payload],
+        ]
+    )
+    mock_dealer.recv_multipart = AsyncMock(
+        side_effect=[
+            [b"", _seq_bytes(1), replay_payload],
+            [b"", (-1).to_bytes(8, "big", signed=True), b""],
+        ]
+    )
+    mock_dealer.send_multipart = AsyncMock()
+
+    adapter = VllmAdapter(config)
+    events = await _collect_events_n(adapter, 1)
+
+    spans = events[0].timer.spans()
+    assert [span.name for span in spans] == ["replay_fetch"]
+    assert spans[0].duration_s >= 0
 
 
 async def test_yields_single_batch_no_gap(

@@ -4,10 +4,11 @@ import asyncio
 from collections.abc import AsyncGenerator
 
 from subscriber.config import SubscriberConfig
-from subscriber.engine.base import AbstractEngineAdapter
+from subscriber.engine.base import AbstractEngineAdapter, EngineEventBatch
 from subscriber.health.coordinator import EngineHealthCoordinator, EngineHealthState
 from subscriber.health.events import LivenessEvent
 from subscriber.kvcm.client import KvcmClient
+from subscriber.metrics import StageTimer
 from subscriber.types import AllBlocksCleared, KVEventBatch
 
 
@@ -16,9 +17,9 @@ class FakeAdapter(AbstractEngineAdapter):
         self._events = events or []
         self.reset_generation_calls = 0
 
-    async def subscribe_kv_events(self) -> AsyncGenerator[list[KVEventBatch], None]:
+    async def subscribe_kv_events(self) -> AsyncGenerator[EngineEventBatch, None]:
         if False:
-            yield []
+            yield EngineEventBatch([], StageTimer())
 
     async def watch_liveness(self) -> AsyncGenerator[LivenessEvent, None]:
         for event in self._events:
@@ -74,7 +75,11 @@ async def test_cold_start_unhealthy_logs_when_threshold_reached(mocker) -> None:
     warning.assert_called_once_with(
         "engine health still unhealthy during startup",
         step="engine_health",
-        tags={"state": "starting", "failure_count": 2},
+        tags={
+            "state": "starting",
+            "failure_count": 2,
+            "failure_threshold": 2,
+        },
     )
 
 

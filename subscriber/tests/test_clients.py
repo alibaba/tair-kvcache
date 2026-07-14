@@ -447,7 +447,8 @@ async def test_start_resolves_host_ip_port_once_and_reuses_it(
 
 async def test_start_survives_register_failure_and_starts_heartbeat(mocker) -> None:
     fake_sdk = FakeSdkClient()
-    fake_sdk.register_instance.side_effect = RuntimeError("register failed")
+    register_error = RuntimeError("register failed")
+    fake_sdk.register_instance.side_effect = register_error
     warning = mocker.patch("subscriber.kvcm.client.logger.warning")
     client = _make_kvcm(SubscriberConfig(kvcm_heartbeat_interval_s=60.0), fake_sdk)
 
@@ -455,8 +456,10 @@ async def test_start_survives_register_failure_and_starts_heartbeat(mocker) -> N
 
     assert not client._registered
     warning.assert_any_call(
-        "kvcm initial registration failed; will retry via heartbeat",
+        "kvcm initial registration failed (%s); will retry via heartbeat",
+        "RuntimeError",
         step="kvcm_register",
+        tags={"message": "register failed"},
         exc_info=True,
     )
     assert client._heartbeat_task is not None
@@ -492,7 +495,9 @@ async def test_start_without_endpoint_drops_batches_then_registers_after_recover
     coordinator = mocker.Mock()
     coordinator.wait_ready_epoch = AsyncMock(return_value=1)
     coordinator.is_epoch_current.return_value = True
-    sender = asyncio.create_task(send_kv_events(client, coordinator, queue))
+    sender = asyncio.create_task(
+        send_kv_events(client, coordinator, queue, mocker.Mock())
+    )
     await queue.join()
 
     warning.assert_any_call(
@@ -575,11 +580,21 @@ async def test_heartbeat_reports_periodically() -> None:
 
 async def test_heartbeat_failure_logs_warning_and_continues(mocker) -> None:
     fake_sdk = FakeSdkClient()
-    fake_sdk.report_event.side_effect = [
-        {"header": {"status": {"code": "OK"}}},
-        RuntimeError("heartbeat failed"),
-        {"header": {"status": {"code": "OK"}}},
-    ]
+    heartbeat_error = RuntimeError("heartbeat failed")
+
+    async def report_event(
+        request: dict[str, object], **_kwargs: object
+    ) -> dict[str, object]:
+        events = request["events"]
+        if (
+            isinstance(events, list)
+            and events
+            and events[0].get("event_type") == "EVENT_HEARTBEAT"
+        ):
+            raise heartbeat_error
+        return {"header": {"status": {"code": "OK"}}}
+
+    fake_sdk.report_event.side_effect = report_event
     warning = mocker.patch("subscriber.kvcm.client.logger.warning")
     client = _make_kvcm(
         SubscriberConfig(kvcm_heartbeat_interval_s=0.01),
@@ -591,7 +606,9 @@ async def test_heartbeat_failure_logs_warning_and_continues(mocker) -> None:
     await client.close()
 
     warning.assert_any_call(
-        "kvcm heartbeat report failed",
+        "kvcm heartbeat report failed (%s: %s)",
+        "RuntimeError",
+        heartbeat_error,
         step="kvcm_heartbeat",
         exc_info=True,
     )

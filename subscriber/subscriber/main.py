@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import time
 from contextlib import suppress
 from dataclasses import dataclass
 
@@ -10,7 +9,7 @@ from subscriber.config import SubscriberConfig
 from subscriber.engine.base import AbstractEngineAdapter
 from subscriber.health.coordinator import EngineHealthCoordinator
 from subscriber.kvcm.client import KvcmClient
-from subscriber.metrics import LatencyReporter
+from subscriber.metrics import SpanMetricsReporter, StageTimer
 from subscriber.types import KVEventBatch
 
 
@@ -20,7 +19,7 @@ class QueuedKVEventBatch:
 
     batches: list[KVEventBatch]
     epoch_snapshot: int
-    received_at: float
+    timer: StageTimer
 
 
 async def consume_kv_events(
@@ -32,7 +31,7 @@ async def consume_kv_events(
 
     events = adapter.subscribe_kv_events()
     try:
-        async for batches in events:
+        async for event in events:
             epoch_snapshot = coordinator.capture_epoch()
             if epoch_snapshot is None:
                 logger.warning(
@@ -41,7 +40,7 @@ async def consume_kv_events(
                 )
                 continue
             await queue.put(
-                QueuedKVEventBatch(batches, epoch_snapshot, time.monotonic())
+                QueuedKVEventBatch(event.batches, epoch_snapshot, event.timer)
             )
     finally:
         await events.aclose()
@@ -51,14 +50,16 @@ async def send_kv_events(
     kvcm: KvcmClient,
     coordinator: EngineHealthCoordinator,
     queue: asyncio.Queue[QueuedKVEventBatch],
-    latency_reporter: LatencyReporter | None = None,
+    latency_reporter: SpanMetricsReporter,
 ) -> None:
     """Send queued batches only if their captured epoch is still current."""
 
     while True:
         queued = await queue.get()
         try:
+            queued.timer.mark("queue_wait")
             epoch = await coordinator.wait_ready_epoch()
+            queued.timer.mark("gate_wait")
             if not coordinator.is_epoch_current(queued.epoch_snapshot):
                 logger.warning(
                     "dropping kv event batch because engine epoch changed before send",
@@ -71,11 +72,6 @@ async def send_kv_events(
                 continue
             try:
                 await kvcm.send_batch(queued.batches, epoch)
-                if latency_reporter is not None:
-                    try:
-                        latency_reporter.report(time.monotonic() - queued.received_at)
-                    except Exception:
-                        pass
             except Exception as exc:
                 # TODO: Buffer or replay batches dropped while KVCM is unavailable.
                 logger.warning(
@@ -92,6 +88,11 @@ async def send_kv_events(
                     },
                     exc_info=True,
                 )
+                continue
+            # Metrics stay outside the send try/except: reporting is best-effort
+            # (report never raises) and must never be misread as a send failure.
+            queued.timer.mark("kvcm_send")
+            latency_reporter.report(queued.timer.spans())
         finally:
             queue.task_done()
 
@@ -108,7 +109,7 @@ async def kv_event_loop(
         raise ValueError("queue_maxsize must be >= 1")
 
     queue: asyncio.Queue[QueuedKVEventBatch] = asyncio.Queue(maxsize=queue_maxsize)
-    latency_reporter = LatencyReporter()
+    latency_reporter = SpanMetricsReporter()
     await latency_reporter.start()
     producer = asyncio.create_task(consume_kv_events(adapter, coordinator, queue))
     sender = asyncio.create_task(
@@ -118,6 +119,7 @@ async def kv_event_loop(
         done, _ = await asyncio.wait(
             {producer, sender}, return_when=asyncio.FIRST_COMPLETED
         )
+        producer_exited_first = sender not in done
         if sender in done:
             producer.cancel()
             with suppress(asyncio.CancelledError):
@@ -136,7 +138,14 @@ async def kv_event_loop(
             await sender
 
         await queue_drained
-        raise RuntimeError("kv event subscription ended unexpectedly")
+        raise RuntimeError(
+            "kv event subscription ended unexpectedly"
+            + (
+                "; producer exited before sender"
+                if producer_exited_first
+                else "; sender outlived producer"
+            )
+        )
     finally:
         sender.cancel()
         with suppress(asyncio.CancelledError):

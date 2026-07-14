@@ -124,6 +124,7 @@ class EngineHealthCoordinator:
                     tags={
                         "state": self._state.value,
                         "failure_count": self._failure_count,
+                        "failure_threshold": self._threshold,
                     },
                 )
             return

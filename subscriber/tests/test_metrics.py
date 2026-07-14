@@ -3,24 +3,59 @@ from __future__ import annotations
 import asyncio
 import importlib
 
+import pytest
 
-class _ContinuousQueue:
-    async def get(self) -> float:
+
+def _spans(module, *pairs: tuple[str, float]) -> list:
+    return [module.Span(name, duration) for name, duration in pairs]
+
+
+class _ContinuousSpanQueue:
+    async def get(self) -> list:
         await asyncio.sleep(0.001)
-        return 0.01
+        metrics = importlib.import_module("subscriber.metrics")
+        return [metrics.Span("kvcm_send", 0.01)]
 
 
-async def test_latency_reporter_warns_from_background_task(mocker) -> None:
+def test_stage_timer_derives_named_spans_between_marks() -> None:
+    metrics = importlib.import_module("subscriber.metrics")
+    ticks = iter([100.0, 100.2, 100.5, 101.0])
+    timer = metrics.StageTimer(clock=lambda: next(ticks))
+
+    timer.mark("queue_wait")
+    timer.mark("gate_wait")
+    timer.mark("kvcm_send")
+
+    spans = timer.spans()
+    assert [span.name for span in spans] == ["queue_wait", "gate_wait", "kvcm_send"]
+    assert [span.duration_s for span in spans] == pytest.approx([0.2, 0.3, 0.5])
+
+
+def test_stage_timer_without_marks_has_no_spans() -> None:
+    metrics = importlib.import_module("subscriber.metrics")
+    timer = metrics.StageTimer(clock=lambda: 5.0)
+
+    assert timer.spans() == []
+
+
+async def test_reporter_warns_with_stage_breakdown(mocker) -> None:
     metrics = importlib.import_module("subscriber.metrics")
     warning_logged = asyncio.Event()
     warning = mocker.patch(
         "subscriber.metrics.logger.warning",
         side_effect=lambda *args, **kwargs: warning_logged.set(),
     )
-    reporter = metrics.LatencyReporter(summary_interval_s=1)
+    reporter = metrics.SpanMetricsReporter(summary_interval_s=1)
 
     await reporter.start()
-    reporter.report(0.051)
+    reporter.report(
+        _spans(
+            metrics,
+            ("queue_wait", 0.01),
+            ("gate_wait", 0.005),
+            ("kvcm_send", 0.05),
+        )
+    )
 
     try:
         await asyncio.wait_for(warning_logged.wait(), timeout=1)
@@ -29,11 +64,37 @@ async def test_latency_reporter_warns_from_background_task(mocker) -> None:
     warning.assert_called_once_with(
         "kv event forwarding latency exceeded threshold",
         step="kv_event_metrics",
-        tags={"latency_ms": 51.0, "threshold_ms": 50.0},
+        tags={
+            "queue_wait_ms": 10.0,
+            "gate_wait_ms": 5.0,
+            "kvcm_send_ms": 50.0,
+            "total_ms": 65.0,
+            "threshold_ms": 50.0,
+        },
     )
 
 
-async def test_latency_reporter_logs_minute_average(mocker) -> None:
+async def test_reporter_skips_warning_below_threshold(mocker) -> None:
+    metrics = importlib.import_module("subscriber.metrics")
+    summary_logged = asyncio.Event()
+    warning = mocker.patch("subscriber.metrics.logger.warning")
+    mocker.patch(
+        "subscriber.metrics.logger.info",
+        side_effect=lambda *args, **kwargs: summary_logged.set(),
+    )
+    reporter = metrics.SpanMetricsReporter(summary_interval_s=0.01)
+
+    await reporter.start()
+    reporter.report(_spans(metrics, ("kvcm_send", 0.001)))
+
+    try:
+        await asyncio.wait_for(summary_logged.wait(), timeout=1)
+    finally:
+        await reporter.stop()
+    warning.assert_not_called()
+
+
+async def test_reporter_logs_stage_averages(mocker) -> None:
     metrics = importlib.import_module("subscriber.metrics")
     summary_logged = asyncio.Event()
 
@@ -42,11 +103,11 @@ async def test_latency_reporter_logs_minute_average(mocker) -> None:
             summary_logged.set()
 
     info = mocker.patch("subscriber.metrics.logger.info", side_effect=_record_info)
-    reporter = metrics.LatencyReporter(summary_interval_s=0.01)
+    reporter = metrics.SpanMetricsReporter(summary_interval_s=0.01)
 
     await reporter.start()
-    reporter.report(0.01)
-    reporter.report(0.03)
+    reporter.report(_spans(metrics, ("queue_wait", 0.01), ("kvcm_send", 0.03)))
+    reporter.report(_spans(metrics, ("queue_wait", 0.03), ("kvcm_send", 0.05)))
 
     try:
         await asyncio.wait_for(summary_logged.wait(), timeout=1)
@@ -55,19 +116,56 @@ async def test_latency_reporter_logs_minute_average(mocker) -> None:
     info.assert_called_with(
         "kv event forwarding latency average",
         step="kv_event_metrics",
-        tags={"average_latency_ms": 20.0, "sample_count": 2},
+        tags={
+            "queue_wait_avg_ms": 20.0,
+            "kvcm_send_avg_ms": 40.0,
+            "total_avg_ms": 60.0,
+            "sample_count": 2,
+        },
     )
 
 
-async def test_latency_reporter_logs_average_during_continuous_traffic(mocker) -> None:
+async def test_reporter_averages_each_stage_independently(mocker) -> None:
+    metrics = importlib.import_module("subscriber.metrics")
+    summary_logged = asyncio.Event()
+
+    def _record_info(*args, **kwargs) -> None:
+        if kwargs.get("tags", {}).get("sample_count") == 2:
+            summary_logged.set()
+
+    info = mocker.patch("subscriber.metrics.logger.info", side_effect=_record_info)
+    reporter = metrics.SpanMetricsReporter(summary_interval_s=0.01)
+
+    await reporter.start()
+    reporter.report(_spans(metrics, ("decode", 0.02), ("queue_wait", 0.01)))
+    reporter.report(_spans(metrics, ("replay_fetch", 0.10), ("queue_wait", 0.03)))
+
+    try:
+        await asyncio.wait_for(summary_logged.wait(), timeout=1)
+    finally:
+        await reporter.stop()
+    info.assert_called_with(
+        "kv event forwarding latency average",
+        step="kv_event_metrics",
+        tags={
+            "decode_avg_ms": 20.0,
+            "queue_wait_avg_ms": 20.0,
+            "replay_fetch_avg_ms": 100.0,
+            "total_avg_ms": 80.0,
+            "sample_count": 2,
+        },
+    )
+
+
+async def test_reporter_logs_average_during_continuous_traffic(mocker) -> None:
     metrics = importlib.import_module("subscriber.metrics")
     summary_logged = asyncio.Event()
     mocker.patch(
         "subscriber.metrics.logger.info",
         side_effect=lambda *args, **kwargs: summary_logged.set(),
     )
-    reporter = metrics.LatencyReporter(summary_interval_s=0.01)
-    reporter._queue = _ContinuousQueue()
+    reporter = metrics.SpanMetricsReporter(summary_interval_s=0.01)
+    reporter._queue = _ContinuousSpanQueue()
 
     await reporter.start()
     try:
@@ -76,7 +174,7 @@ async def test_latency_reporter_logs_average_during_continuous_traffic(mocker) -
         await reporter.stop()
 
 
-async def test_latency_reporter_offloads_warning_logging(mocker) -> None:
+async def test_reporter_offloads_warning_logging(mocker) -> None:
     metrics = importlib.import_module("subscriber.metrics")
     logging_offloaded = asyncio.Event()
 
@@ -85,10 +183,10 @@ async def test_latency_reporter_offloads_warning_logging(mocker) -> None:
         logging_offloaded.set()
 
     mocker.patch("subscriber.metrics.asyncio.to_thread", side_effect=_to_thread)
-    reporter = metrics.LatencyReporter(summary_interval_s=1)
+    reporter = metrics.SpanMetricsReporter(summary_interval_s=1)
 
     await reporter.start()
-    reporter.report(0.051)
+    reporter.report(_spans(metrics, ("kvcm_send", 0.051)))
 
     try:
         await asyncio.wait_for(logging_offloaded.wait(), timeout=1)
@@ -96,9 +194,9 @@ async def test_latency_reporter_offloads_warning_logging(mocker) -> None:
         await reporter.stop()
 
 
-async def test_latency_reporter_start_is_idempotent() -> None:
+async def test_reporter_start_is_idempotent() -> None:
     metrics = importlib.import_module("subscriber.metrics")
-    reporter = metrics.LatencyReporter()
+    reporter = metrics.SpanMetricsReporter()
 
     await reporter.start()
     first_task = reporter._task
@@ -110,10 +208,10 @@ async def test_latency_reporter_start_is_idempotent() -> None:
         await reporter.stop()
 
 
-def test_latency_reporter_swallows_report_errors(mocker) -> None:
+def test_reporter_swallows_report_errors(mocker) -> None:
     metrics = importlib.import_module("subscriber.metrics")
-    reporter = metrics.LatencyReporter()
+    reporter = metrics.SpanMetricsReporter()
     reporter._queue = mocker.Mock()
     reporter._queue.put_nowait.side_effect = RuntimeError("queue failure")
 
-    reporter.report(0.01)
+    reporter.report(_spans(metrics, ("kvcm_send", 0.01)))

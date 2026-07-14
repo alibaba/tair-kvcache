@@ -2,12 +2,47 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 
 from subscriber import logger
 
 
-class LatencyReporter:
-    """Best-effort, isolated reporting for KV event forwarding latency."""
+@dataclass(frozen=True)
+class Span:
+    """A single named pipeline stage with its measured duration in seconds."""
+
+    name: str
+    duration_s: float
+
+
+class StageTimer:
+    """Records monotonic marks along a pipeline and derives per-stage spans.
+
+    The timer captures an origin at construction. Each ``mark(name)`` closes the
+    stage that began at the previous mark (or the origin) and labels it. Adding a
+    new stage only requires one extra ``mark`` call at the right point.
+    """
+
+    def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self._origin = clock()
+        self._marks: list[tuple[str, float]] = []
+
+    def mark(self, name: str) -> None:
+        self._marks.append((name, self._clock()))
+
+    def spans(self) -> list[Span]:
+        spans: list[Span] = []
+        previous = self._origin
+        for name, at in self._marks:
+            spans.append(Span(name, at - previous))
+            previous = at
+        return spans
+
+
+class SpanMetricsReporter:
+    """Best-effort, isolated reporting for per-stage KV forwarding latency."""
 
     def __init__(
         self,
@@ -17,7 +52,7 @@ class LatencyReporter:
     ) -> None:
         self._warning_threshold_s = warning_threshold_s
         self._summary_interval_s = summary_interval_s
-        self._queue: asyncio.Queue[float] = asyncio.Queue(maxsize=1024)
+        self._queue: asyncio.Queue[Sequence[Span]] = asyncio.Queue(maxsize=1024)
         self._task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
@@ -47,27 +82,38 @@ class LatencyReporter:
         except Exception:
             pass
 
-    def report(self, latency_s: float) -> None:
-        """Queue a latency sample without blocking the event loop."""
+    def report(self, spans: Sequence[Span]) -> None:
+        """Queue a per-stage span sample. Never blocks and never raises."""
 
         try:
-            self._queue.put_nowait(latency_s)
+            self._queue.put_nowait(spans)
         except Exception:
             pass
 
     async def _run(self) -> None:
-        samples: list[float] = []
+        stage_totals: dict[str, float] = {}
+        stage_counts: dict[str, int] = {}
+        total_sum = 0.0
+        sample_count = 0
         next_summary_at = time.monotonic() + self._summary_interval_s
         try:
             while True:
                 try:
                     timeout = max(0.0, next_summary_at - time.monotonic())
-                    latency_s = await asyncio.wait_for(
+                    spans = await asyncio.wait_for(
                         self._queue.get(),
                         timeout=timeout,
                     )
-                    samples.append(latency_s)
-                    await self._log_warning_if_slow(latency_s)
+                    trace_total = 0.0
+                    for span in spans:
+                        stage_totals[span.name] = (
+                            stage_totals.get(span.name, 0.0) + span.duration_s
+                        )
+                        stage_counts[span.name] = stage_counts.get(span.name, 0) + 1
+                        trace_total += span.duration_s
+                    total_sum += trace_total
+                    sample_count += 1
+                    await self._log_warning_if_slow(spans, trace_total)
                 except TimeoutError:
                     pass
                 except asyncio.CancelledError:
@@ -76,38 +122,54 @@ class LatencyReporter:
                     pass
                 if time.monotonic() >= next_summary_at:
                     try:
-                        await self._log_summary(samples)
+                        await self._log_summary(
+                            stage_totals, stage_counts, total_sum, sample_count
+                        )
                     except Exception:
                         pass
-                    samples.clear()
+                    stage_totals = {}
+                    stage_counts = {}
+                    total_sum = 0.0
+                    sample_count = 0
                     next_summary_at = time.monotonic() + self._summary_interval_s
         except asyncio.CancelledError:
             raise
         except Exception:
             pass
 
-    async def _log_warning_if_slow(self, latency_s: float) -> None:
-        if latency_s <= self._warning_threshold_s:
+    async def _log_warning_if_slow(self, spans: Sequence[Span], total_s: float) -> None:
+        if total_s <= self._warning_threshold_s:
             return
+        tags: dict[str, object] = {
+            f"{span.name}_ms": round(span.duration_s * 1000, 3) for span in spans
+        }
+        tags["total_ms"] = round(total_s * 1000, 3)
+        tags["threshold_ms"] = round(self._warning_threshold_s * 1000, 3)
         await asyncio.to_thread(
             logger.warning,
             "kv event forwarding latency exceeded threshold",
             step="kv_event_metrics",
-            tags={
-                "latency_ms": round(latency_s * 1000, 3),
-                "threshold_ms": round(self._warning_threshold_s * 1000, 3),
-            },
+            tags=tags,
         )
 
-    async def _log_summary(self, samples: list[float]) -> None:
-        if not samples:
+    async def _log_summary(
+        self,
+        stage_totals: dict[str, float],
+        stage_counts: dict[str, int],
+        total_sum: float,
+        sample_count: int,
+    ) -> None:
+        if sample_count == 0:
             return
+        tags: dict[str, object] = {
+            f"{name}_avg_ms": round(total / stage_counts[name] * 1000, 3)
+            for name, total in stage_totals.items()
+        }
+        tags["total_avg_ms"] = round(total_sum / sample_count * 1000, 3)
+        tags["sample_count"] = sample_count
         await asyncio.to_thread(
             logger.info,
             "kv event forwarding latency average",
             step="kv_event_metrics",
-            tags={
-                "average_latency_ms": round(sum(samples) / len(samples) * 1000, 3),
-                "sample_count": len(samples),
-            },
+            tags=tags,
         )

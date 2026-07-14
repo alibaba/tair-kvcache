@@ -2,15 +2,32 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator, Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypeVar
 
 from subscriber.health.events import LivenessEvent
+from subscriber.metrics import StageTimer
 from subscriber.types import KVEventBatch
 
 if TYPE_CHECKING:
     from subscriber.config import SubscriberConfig
 
 _AdapterT = TypeVar("_AdapterT", bound="AbstractEngineAdapter")
+
+
+@dataclass(frozen=True)
+class EngineEventBatch:
+    """Engine-agnostic carrier yielded by adapters to the subscriber core.
+
+    Bundles the forwarded KV batches with the :class:`StageTimer` whose origin
+    is the moment the adapter began handling this event. The adapter marks its
+    own internal stages (e.g. ``decode`` for live events, ``replay_fetch`` for
+    replayed events); the subscriber core marks the remaining pipeline stages on
+    the same timer so a single span timeline covers receipt through kvcm send.
+    """
+
+    batches: list[KVEventBatch]
+    timer: StageTimer
 
 
 class AbstractEngineAdapter(ABC):
@@ -51,12 +68,16 @@ class AbstractEngineAdapter(ABC):
         return cls._registry[engine_type](config)
 
     @abstractmethod
-    def subscribe_kv_events(self) -> AsyncGenerator[list[KVEventBatch], None]:
+    def subscribe_kv_events(self) -> AsyncGenerator[EngineEventBatch, None]:
         """Yield realtime or replayed KV event batches in forwarding order.
 
-        Each yield is either:
+        Each yield is an :class:`EngineEventBatch` whose ``batches`` field is
+        either:
         - A single-element list: one real-time event batch.
         - A multi-element list: replayed batches when a sequence gap is detected.
+
+        The carried ``timer`` originates when the adapter begins handling the
+        event and has the adapter's internal stage(s) already marked.
 
         Implementations may aggregate one or more configured DP endpoints into
         this stream. Transport-specific replay and per-DP sequence tracking stay

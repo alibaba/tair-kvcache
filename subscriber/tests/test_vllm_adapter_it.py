@@ -140,7 +140,7 @@ async def test_real_zmq_publisher_delivers_single_event() -> None:
 
     async def _consume() -> None:
         async for received in adapter.subscribe_kv_events():
-            results.append(received)
+            results.append(received.batches)
             delivered.set()
             break
 
@@ -175,7 +175,7 @@ async def test_sequence_gap_triggers_real_replay() -> None:
 
     async def _consume() -> None:
         async for received in adapter.subscribe_kv_events():
-            results.append(received)
+            results.append(received.batches)
             delivered.set()
             if len(results) >= 3:
                 break
