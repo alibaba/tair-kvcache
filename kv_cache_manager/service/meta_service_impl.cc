@@ -753,16 +753,38 @@ void MetaServiceImpl::GetHostCacheState(RequestContext *request_context,
     API_CALL_GUARD("GetHostCacheState", true);
     auto *header = response->mutable_header();
     auto *status = header->mutable_status();
+    std::string invalid_fields = "missing or invalid fields: ";
+    if (request->instance_id().empty()) {
+        CHECK_REQUIRED_FIELDS_VALIDATION("GetHostCacheState", "instance_id", true);
+        SET_SPAN_TRACER_STR_IN_HEADER(request_context);
+        return;
+    }
+    if (request->block_cache_keys().empty()) {
+        CHECK_REQUIRED_FIELDS_VALIDATION("GetHostCacheState", "block_cache_keys", true);
+        SET_SPAN_TRACER_STR_IN_HEADER(request_context);
+        return;
+    }
+
+    CacheManager::KeyVector keys(request->block_cache_keys().begin(), request->block_cache_keys().end());
+    std::vector<std::string> mediums(request->medium().begin(), request->medium().end());
 
     KVCM_LOG_INFO("[traceId: %s] GetHostCacheState called, instance_id: %s, block_cache_keys_count: %d",
                   request->trace_id().c_str(),
                   request->instance_id().c_str(),
                   request->block_cache_keys_size());
 
-    auto ec = cache_manager_->GetHostCacheState(request_context, request, response);
+    auto [ec, host_matches] = cache_manager_->GetHostCacheState(request_context, request->instance_id(), keys, mediums);
     if (ec != EC_OK) {
-        KVCM_LOG_WARN("[traceId: %s] GetHostCacheState failed, ec=%d", request->trace_id().c_str(), ec);
+        status->set_code(ToMetaPbError(ec));
+        request_context->set_status_code(status->code());
+        status->set_message("Failed to get host cache state: " + request_context->error_tracer()->ToJsonString());
+        KVCM_LOG_ERROR("[traceId: %s] GetHostCacheState failed, ec: %d", request->trace_id().c_str(), ec);
     } else {
+        for (const auto &match : host_matches) {
+            auto *host_match = response->add_hosts();
+            host_match->set_host_ip_port(match.host_ip_port);
+            host_match->set_prefix_match_blocks(match.prefix_match_blocks);
+        }
         status->set_code(proto::meta::OK);
         request_context->set_status_code(status->code());
         KVCM_LOG_INFO("[traceId: %s] GetHostCacheState succeeded, returned %d hosts",

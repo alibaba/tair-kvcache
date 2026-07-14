@@ -61,6 +61,11 @@ public:
     using UriType = std::string;
     using UriVector = std::vector<UriType>;
 
+    struct HostCacheMatch {
+        std::string host_ip_port;
+        int64_t prefix_match_blocks;
+    };
+
     CacheManager(std::shared_ptr<MetricsRegistry> metrics_registry,
                  std::shared_ptr<RegistryManager> registry_manager,
                  std::shared_ptr<MetricsLifecycle> metrics_lifecycle = nullptr);
@@ -161,9 +166,11 @@ public:
     ErrorCode ReportEvent(RequestContext *request_context,
                           const proto::meta::ReportEventRequest *request,
                           proto::meta::ReportEventResponse *response);
-    ErrorCode GetHostCacheState(RequestContext *request_context,
-                                const proto::meta::GetHostCacheStateRequest *request,
-                                proto::meta::GetHostCacheStateResponse *response);
+    std::pair<ErrorCode, std::vector<HostCacheMatch>>
+    GetHostCacheState(RequestContext *request_context,
+                      const std::string &instance_id,
+                      const KeyVector &block_cache_keys,
+                      const std::vector<std::string> &medium_filter = {});
     ErrorCode TrimCache(RequestContext *request_context,
                         const std::string &instance_id,
                         const proto::meta::TrimStrategy &trim_strategy,

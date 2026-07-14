@@ -2237,65 +2237,40 @@ SubmitDelReqFunc CacheManager::GetSubmitDelReqFunc(const std::string &instance_i
     };
 }
 
-ErrorCode CacheManager::GetHostCacheState(RequestContext *request_context,
-                                          const proto::meta::GetHostCacheStateRequest *request,
-                                          proto::meta::GetHostCacheStateResponse *response) {
+std::pair<ErrorCode, std::vector<CacheManager::HostCacheMatch>>
+CacheManager::GetHostCacheState(RequestContext *request_context,
+                                const std::string &instance_id,
+                                const KeyVector &block_cache_keys,
+                                const std::vector<std::string> &medium_filter) {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
-    const std::string &instance_id = request->instance_id();
-    auto *response_status = response->mutable_header()->mutable_status();
-
-    if (instance_id.empty()) {
-        KVCM_LOG_WARN("trace_id [%s] | GetHostCacheState: empty instance_id", trace_id.c_str());
-        response_status->set_code(proto::meta::INVALID_ARGUMENT);
-        response_status->set_message("empty instance_id");
-        return EC_BADARGS;
-    }
-
-    const auto &block_cache_keys = request->block_cache_keys();
-    if (block_cache_keys.empty()) {
-        // No keys to match — return empty list (do not return prefix=0 for all hosts)
-        response_status->set_code(proto::meta::OK);
-        return EC_OK;
-    }
 
     MetaSearcher *meta_searcher = meta_searcher_manager_->GetMetaSearcher(instance_id);
     if (!meta_searcher) {
-        KVCM_LOG_WARN("trace_id [%s] | GetHostCacheState: meta searcher not found for instance [%s]",
-                      trace_id.c_str(),
-                      instance_id.c_str());
-        response_status->set_code(proto::meta::INSTANCE_NOT_EXIST);
-        response_status->set_message("meta searcher not found for instance: " + instance_id);
-        return EC_INSTANCE_NOT_EXIST;
+        RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN,
+                                          EC_INSTANCE_NOT_EXIST,
+                                          std::vector<HostCacheMatch>,
+                                          "meta searcher not found for instance: %s",
+                                          instance_id.c_str());
     }
 
     // Build medium filter set (empty = match all mediums)
-    std::unordered_set<std::string> medium_filter(request->medium().begin(), request->medium().end());
+    std::unordered_set<std::string> medium_set(medium_filter.begin(), medium_filter.end());
 
     // Query locations for all block_cache_keys
-    CacheManager::KeyVector keys(block_cache_keys.begin(), block_cache_keys.end());
     BlockMask empty_mask;
     std::vector<CacheLocationMap> location_maps;
-    auto ec = meta_searcher->BatchGetLocation(request_context, keys, empty_mask, location_maps);
-    if (ec != EC_OK) {
-        KVCM_LOG_WARN("trace_id [%s] | GetHostCacheState: BatchGetLocation failed, ec %d",
-                      trace_id.c_str(),
-                      static_cast<int>(ec));
-        response_status->set_code(proto::meta::INTERNAL_ERROR);
-        response_status->set_message("BatchGetLocation failed");
-        return ec;
-    }
+    auto ec = meta_searcher->BatchGetLocation(request_context, block_cache_keys, empty_mask, location_maps);
+    RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(
+        WARN, ec, std::vector<HostCacheMatch>, "BatchGetLocation failed for instance: %s", instance_id.c_str());
+    assert(block_cache_keys.size() == location_maps.size());
 
     // Parse locations and compute prefix match per host
     // Extract host_ip_port and medium from URI instead of parsing location_id.
     std::map<std::string, int64_t> host_prefix;
     std::set<std::string> active_hosts;
 
-    for (size_t i = 0; i < keys.size(); ++i) {
-        if (i >= location_maps.size()) {
-            break;
-        }
-
+    for (size_t i = 0; i < block_cache_keys.size(); ++i) {
         const auto &locations = location_maps[i];
         std::set<std::string> owners;
         for (const auto &kv : locations) {
@@ -2314,13 +2289,13 @@ ErrorCode CacheManager::GetHostCacheState(RequestContext *request_context,
             }
 
             // Medium filter: empty filter = match all
-            if (!medium_filter.empty()) {
+            if (!medium_set.empty()) {
                 std::string medium = parsed_uri.GetPath();
                 // Path format: "/mem" -> "mem"
                 if (!medium.empty() && medium[0] == '/') {
                     medium = medium.substr(1);
                 }
-                if (medium_filter.find(medium) == medium_filter.end()) {
+                if (medium_set.find(medium) == medium_set.end()) {
                     continue;
                 }
             }
@@ -2357,18 +2332,17 @@ ErrorCode CacheManager::GetHostCacheState(RequestContext *request_context,
 
     // Remaining active hosts matched all keys
     for (const auto &h : active_hosts) {
-        host_prefix[h] = static_cast<int64_t>(keys.size());
+        host_prefix[h] = static_cast<int64_t>(block_cache_keys.size());
     }
 
-    // Assemble response
+    // Assemble result
+    std::vector<HostCacheMatch> result;
+    result.reserve(host_prefix.size());
     for (const auto &kv : host_prefix) {
-        auto *match = response->add_hosts();
-        match->set_host_ip_port(kv.first);
-        match->set_prefix_match_blocks(kv.second);
+        result.push_back(HostCacheMatch{kv.first, kv.second});
     }
 
-    response_status->set_code(proto::meta::OK);
-    return EC_OK;
+    return {EC_OK, std::move(result)};
 }
 
 } // namespace kv_cache_manager
