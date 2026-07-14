@@ -49,12 +49,13 @@ enum StorageType {
 // ---- Cache event reporting ----
 //
 // ReportEvent is the ingestion API used by cache subscribers. A subscriber
-// normalizes engine-specific cache signals (for example RTP-LLM cache snapshots
-// or vLLM KV events) into block-level mutations on one storage system.
-// `storage_type` names that large storage/cache system; `medium` identifies one
-// diffable cache namespace under the reporter host; LocationSpec describes
-// where each cache component of the block lives. KVCM currently matches only
-// full-attention specs and ignores mamba-state specs by LocationSpec.name.
+// normalizes engine-specific cache signals (for example RTP-LLM full cache
+// snapshots or vLLM KV events) into block-level mutations on one storage
+// system. `storage_type` names that large storage/cache system; `medium`
+// identifies one diffable cache namespace under the reporter host; LocationSpec
+// describes where each cache component of the block lives. KVCM currently
+// matches only full-attention specs and ignores mamba-state specs by
+// LocationSpec.name.
 
 enum ReportEventType {
     EVENT_UNSPECIFIED = 0;
@@ -63,28 +64,25 @@ enum ReportEventType {
     EVENT_BLOCK_DELETE = 3;  // Reporter removed a block from one location
     EVENT_HOST_DOWN = 4;     // Reporter node is going down (graceful or detected)
     EVENT_HEARTBEAT = 5;     // Reporter periodic heartbeat
-    // Schema placeholder for future full block snapshots. This event is not
-    // supported by the server yet; callers must not send it until a later
-    // implementation enables EVENT_BLOCK_SNAPSHOT handling.
-    EVENT_BLOCK_SNAPSHOT = 6;
+    EVENT_BLOCK_SNAPSHOT = 6; // Reporter sends the full block set for one host/medium
 }
 
-message NodeRegisterParams {
+message NodeRegisterEventParams {
     repeated string mediums = 1; // mediums supported by the node, e.g. ["mem","disk"]
 }
 
-message BlockAddParams {
+message BlockAddEventParams {
     string block_key = 1; // int64 as string
     string uri = 2;       // deprecated, use specs instead
     string medium = 3;    // cache tier/namespace, e.g. "mem", "disk", "gpu", "hbm"
     repeated LocationSpec specs = 4;
 }
 
-message BlockDeleteParams {
+message BlockDeleteEventParams {
     string block_key = 1;
     string medium = 2; // cache tier/namespace, e.g. "mem", "disk", "gpu", "hbm"
-    // Schema placeholder for future component-scoped delete semantics. The
-    // current server implementation ignores this field.
+    // Optional. When set, KVCM applies the delete only if these component names
+    // contain a full-attention spec; mamba-state-only deletes are ignored.
     repeated string spec_names = 3;
 }
 
@@ -93,17 +91,15 @@ message BlockSnapshotItem {
     repeated LocationSpec specs = 2;
 }
 
-// Schema placeholder for future full snapshot reporting. The
-// EVENT_BLOCK_SNAPSHOT event is currently unavailable on the server side.
 message BlockSnapshotEventParams {
     string medium = 1; // cache tier/namespace, e.g. "mem", "disk", "gpu", "hbm"
     repeated BlockSnapshotItem blocks = 2;
 }
 
-message HostDownParams {
+message HostDownEventParams {
 }
 
-message HeartbeatParams {
+message HeartbeatEventParams {
     // KVCM only refreshes last_heartbeat; system_status is opaque observability data
     map<string, string> system_status = 1;
 }
@@ -111,13 +107,11 @@ message HeartbeatParams {
 message EventItem {
     ReportEventType event_type = 1;
     oneof event_params {
-        NodeRegisterParams node_register = 2;
-        BlockAddParams block_add = 3;
-        BlockDeleteParams block_delete = 4;
-        HostDownParams host_down = 5;
-        HeartbeatParams heartbeat = 6;
-        // Declared for schema compatibility only; EVENT_BLOCK_SNAPSHOT is not
-        // usable until its server implementation lands.
+        NodeRegisterEventParams node_register = 2;
+        BlockAddEventParams block_add = 3;
+        BlockDeleteEventParams block_delete = 4;
+        HostDownEventParams host_down = 5;
+        HeartbeatEventParams heartbeat = 6;
         BlockSnapshotEventParams block_snapshot = 7;
     }
 }
