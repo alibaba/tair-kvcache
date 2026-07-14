@@ -71,7 +71,6 @@ async def test_fetch_spectrum_endpoints_validates_response_once() -> None:
 async def test_resolve_host_ip_port_uses_pai_eas_worker_port(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("SPECTRUM_APPLICATION_SERVICE_ID", raising=False)
     monkeypatch.setattr(network, "local_ip_address", lambda: "10.0.0.7")
 
     assert await network.resolve_host_ip_port() == "10.0.0.7:8080"
@@ -80,7 +79,6 @@ async def test_resolve_host_ip_port_uses_pai_eas_worker_port(
 async def test_resolve_host_ip_port_formats_local_ipv6(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("SPECTRUM_APPLICATION_SERVICE_ID", raising=False)
     monkeypatch.setattr(network, "local_ip_address", lambda: "2001:db8::1")
 
     assert await network.resolve_host_ip_port() == "[2001:db8::1]:8080"

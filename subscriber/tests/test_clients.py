@@ -60,7 +60,6 @@ _VLLM_MEDIUM_MAP = {"GPU": "hbm", "CPU": "mem"}
 
 @pytest.fixture(autouse=True)
 def _set_kvcm_vservice_id(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("SPECTRUM_APPLICATION_SERVICE_ID", raising=False)
     monkeypatch.setenv("KVCM_VSERVICE_ID", "vs-test")
 
     async def resolve_host_ip_port() -> str:
@@ -446,16 +445,23 @@ async def test_start_resolves_host_ip_port_once_and_reuses_it(
     ] == ["10.0.0.7:8123", "10.0.0.7:8123"]
 
 
-async def test_start_propagates_register_failure_and_does_not_start_heartbeat() -> None:
+async def test_start_survives_register_failure_and_starts_heartbeat(mocker) -> None:
     fake_sdk = FakeSdkClient()
     fake_sdk.register_instance.side_effect = RuntimeError("register failed")
-    client = _make_kvcm(SubscriberConfig(), fake_sdk)
+    warning = mocker.patch("subscriber.kvcm.client.logger.warning")
+    client = _make_kvcm(SubscriberConfig(kvcm_heartbeat_interval_s=60.0), fake_sdk)
 
-    with pytest.raises(RuntimeError, match="register failed"):
-        await client.start()
+    await client.start()
 
-    fake_sdk.report_event.assert_not_called()
-    fake_sdk.close.assert_not_called()
+    assert not client._registered
+    warning.assert_any_call(
+        "kvcm initial registration failed; will retry via heartbeat",
+        step="kvcm_register",
+        exc_info=True,
+    )
+    assert client._heartbeat_task is not None
+
+    await client.close()
 
 
 async def test_start_without_endpoint_drops_batches_then_registers_after_recovery(
@@ -529,6 +535,23 @@ async def test_send_batch_before_start_raises_clear_error() -> None:
         )
 
 
+async def test_send_batch_raises_when_started_but_not_registered() -> None:
+    fake_sdk = FakeSdkClient()
+    fake_sdk.ready = False
+    client = _make_kvcm(SubscriberConfig(kvcm_heartbeat_interval_s=60.0), fake_sdk)
+
+    await client.start()
+    assert not client._registered
+
+    with pytest.raises(RuntimeError, match="kvcm client is not ready"):
+        await client.send_batch(
+            [KVEventBatch(ts=1.0, events=[AllBlocksCleared()])], epoch=1
+        )
+
+    fake_sdk.register_instance.assert_not_awaited()
+    await client.close()
+
+
 async def test_heartbeat_reports_periodically() -> None:
     fake_sdk = FakeSdkClient()
     client = _make_kvcm(
@@ -572,37 +595,6 @@ async def test_heartbeat_failure_logs_warning_and_continues(mocker) -> None:
         step="kvcm_heartbeat",
         exc_info=True,
     )
-
-
-async def test_runtime_kvcm_failure_marks_not_ready_then_reregisters() -> None:
-    fake_sdk = FakeSdkClient()
-    reregistered = asyncio.Event()
-
-    async def register_instance(_request: dict[str, object]) -> dict[str, object]:
-        if fake_sdk.register_instance.await_count == 2:
-            reregistered.set()
-        return {"header": {"status": {"code": "OK"}}}
-
-    fake_sdk.register_instance.side_effect = register_instance
-    fake_sdk.report_event.side_effect = [
-        {"header": {"status": {"code": "OK"}}},
-        RuntimeError("kvcm unavailable"),
-        {"header": {"status": {"code": "OK"}}},
-        {"header": {"status": {"code": "OK"}}},
-    ]
-    client = _make_kvcm(SubscriberConfig(kvcm_heartbeat_interval_s=0.01), fake_sdk)
-    batches = [KVEventBatch(ts=1.0, events=[AllBlocksCleared()])]
-
-    await client.start()
-    with pytest.raises(RuntimeError, match="kvcm unavailable"):
-        await client.send_batch(batches, epoch=1)
-
-    assert not client._registered
-    await asyncio.wait_for(reregistered.wait(), timeout=0.2)
-    assert client._registered
-
-    await client.send_batch(batches, epoch=1)
-    await client.close()
 
 
 async def test_runtime_kvcm_failure_retries_registration_until_recovered() -> None:

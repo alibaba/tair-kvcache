@@ -66,10 +66,34 @@ async def _probe_health(client: httpx.AsyncClient, url: str) -> LivenessEvent:
 
     try:
         response = await client.get(url)
-    except httpx.HTTPError:
+    except (httpx.ReadTimeout, httpx.ConnectTimeout) as exc:
+        logger.warning(
+            "engine health probe timed out",
+            step="engine_health",
+            tags={"error": type(exc).__name__, "url": url},
+        )
+        return LivenessEvent.UNHEALTHY
+    except httpx.ConnectError as exc:
+        logger.warning(
+            "engine health probe connection refused",
+            step="engine_health",
+            tags={"error": type(exc).__name__, "url": url},
+        )
+        return LivenessEvent.UNHEALTHY
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "engine health probe failed",
+            step="engine_health",
+            tags={"error": type(exc).__name__, "url": url},
+        )
         return LivenessEvent.UNHEALTHY
     if response.status_code == 200:
         return LivenessEvent.HEALTHY
+    logger.warning(
+        "engine health probe returned non-200",
+        step="engine_health",
+        tags={"status_code": response.status_code, "url": url},
+    )
     return LivenessEvent.UNHEALTHY
 
 

@@ -214,7 +214,14 @@ class KvcmClient:
         await self._manager_client.start()
         self._started = True
         if await self._manager_is_ready():
-            await self._register()
+            try:
+                await self._register()
+            except Exception:
+                logger.warning(
+                    "kvcm initial registration failed; will retry via heartbeat",
+                    step="kvcm_register",
+                    exc_info=True,
+                )
         else:
             logger.warning(
                 "kvcm has no available endpoint; starting in not-ready state",
@@ -253,7 +260,7 @@ class KvcmClient:
                     "kvcm registration recovered",
                     step="kvcm_register",
                 )
-                continue
+
             try:
                 await self._report_events([self._heartbeat_event()])
             except Exception:
@@ -285,7 +292,6 @@ class KvcmClient:
                     self._report_event_request(events), check_response=True
                 )
         except Exception:
-            self._registered = False
             raise
         if response is None:
             if logger.is_debug_enabled():

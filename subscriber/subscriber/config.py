@@ -41,7 +41,7 @@ class SubscriberConfig:
     # Engine liveness (HTTP /health polling)
     engine_health_url: str = "http://127.0.0.1:8000/health"
     engine_health_interval_s: float = 1.0
-    engine_health_timeout_s: float = 0.5
+    engine_health_timeout_s: float = 1.0
     engine_health_failure_threshold: int = 3
 
     # ZMQ SUB socket transport

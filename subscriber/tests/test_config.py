@@ -123,7 +123,7 @@ def test_health_config_defaults() -> None:
     config = SubscriberConfig()
     assert config.engine_health_url == "http://127.0.0.1:8000/health"
     assert config.engine_health_interval_s == 1.0
-    assert config.engine_health_timeout_s == 0.5
+    assert config.engine_health_timeout_s == 1.0
     assert config.engine_health_failure_threshold == 3
 
 

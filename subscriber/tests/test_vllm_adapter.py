@@ -100,6 +100,54 @@ async def test_probe_health_timeout_is_unhealthy() -> None:
         assert await _probe_health(active, "http://x/health") is LivenessEvent.UNHEALTHY
 
 
+async def test_probe_health_2xx_does_not_warn(mocker: Any) -> None:
+    warning = mocker.patch("subscriber.engine.vllm.logger.warning")
+    client = _FakeAsyncClient([_response(200)])
+    async with client as active:
+        await _probe_health(active, "http://x/health")
+    warning.assert_not_called()
+
+
+async def test_probe_health_timeout_logs_timeout(mocker: Any) -> None:
+    warning = mocker.patch("subscriber.engine.vllm.logger.warning")
+    client = _FakeAsyncClient([httpx.ReadTimeout("slow")])
+    async with client as active:
+        await _probe_health(active, "http://x/health")
+    warning.assert_called_once()
+    tags = warning.call_args.kwargs["tags"]
+    assert tags["error"] == "ReadTimeout"
+
+
+async def test_probe_health_connect_timeout_logs_connect_timeout(mocker: Any) -> None:
+    warning = mocker.patch("subscriber.engine.vllm.logger.warning")
+    client = _FakeAsyncClient([httpx.ConnectTimeout("conn slow")])
+    async with client as active:
+        await _probe_health(active, "http://x/health")
+    warning.assert_called_once()
+    tags = warning.call_args.kwargs["tags"]
+    assert tags["error"] == "ConnectTimeout"
+
+
+async def test_probe_health_connect_error_logs_connect_error(mocker: Any) -> None:
+    warning = mocker.patch("subscriber.engine.vllm.logger.warning")
+    client = _FakeAsyncClient([httpx.ConnectError("refused")])
+    async with client as active:
+        await _probe_health(active, "http://x/health")
+    warning.assert_called_once()
+    tags = warning.call_args.kwargs["tags"]
+    assert tags["error"] == "ConnectError"
+
+
+async def test_probe_health_non_2xx_logs_status_code(mocker: Any) -> None:
+    warning = mocker.patch("subscriber.engine.vllm.logger.warning")
+    client = _FakeAsyncClient([_response(503)])
+    async with client as active:
+        await _probe_health(active, "http://x/health")
+    warning.assert_called_once()
+    tags = warning.call_args.kwargs["tags"]
+    assert tags["status_code"] == 503
+
+
 async def test_watch_liveness_polls_and_maps_health(
     config: SubscriberConfig, mocker: Any
 ) -> None:

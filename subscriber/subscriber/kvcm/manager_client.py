@@ -267,6 +267,11 @@ class HttpKvCacheManagerClient(AbstractKvCacheManagerClient):
 
     # ----- HTTP request helpers -----
 
+    def _notify_leader_refresh(self) -> None:
+        """Wake the background leader-refresh loop when discovery is enabled."""
+        if self._auto_discover_leader:
+            self._refresh_event.set()
+
     async def _request(
         self,
         endpoint: str,
@@ -284,13 +289,29 @@ class HttpKvCacheManagerClient(AbstractKvCacheManagerClient):
                     headers=self.headers,
                     timeout=self._request_timeout_seconds,
                 )
+            except httpx.TimeoutException as e:
+                logger.warning(
+                    "Request to %s timed out after %.3fs (%s)",
+                    url,
+                    self._request_timeout_seconds,
+                    type(e).__name__,
+                )
+                self._notify_leader_refresh()
+                raise
             except httpx.ConnectError:
-                if self._auto_discover_leader:
-                    logger.warning(
-                        "Connection to %s failed, notifying background refresh",
-                        self.base_url,
-                    )
-                    self._refresh_event.set()
+                logger.warning(
+                    "Connection to %s failed, notifying background refresh",
+                    self.base_url,
+                )
+                self._notify_leader_refresh()
+                raise
+            except httpx.RequestError as e:
+                logger.warning(
+                    "Request to %s failed: %s (%s)",
+                    url,
+                    e,
+                    type(e).__name__,
+                )
                 raise
 
             response.raise_for_status()
