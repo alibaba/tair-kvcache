@@ -1,3 +1,4 @@
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <string>
@@ -74,6 +75,8 @@ public:
         // MARK/BOTH 要求 group 配置了 migration strategy（F-01）。默认启用，让 MARK/BOTH 用例走正常路径；
         // 需要验证"无 strategy 被拒"的用例可调用 SetDefaultMigrationStrategy(false)。
         SetDefaultMigrationStrategy(true);
+        // 大多数既有用例关注迁移准入而非并发限制，给足额度；限流用例单独覆盖 limit=1。
+        SetDefaultCopyConcurrency(16);
     }
 
     void TearDown() override {}
@@ -97,6 +100,13 @@ public:
         strategy->set_methods(methods);
         strategy->set_retention(MigrationRetention::MIGRATION_RETENTION_DELETE_SOURCE);
         it->second->cache_config_->set_migration_strategies({strategy});
+    }
+
+    void SetDefaultCopyConcurrency(std::size_t max_concurrency) {
+        auto it = registry_manager_->instance_group_configs_.find("default");
+        ASSERT_TRUE(it != registry_manager_->instance_group_configs_.end());
+        ASSERT_TRUE(it->second != nullptr && it->second->cache_config_ != nullptr);
+        it->second->cache_config_->set_migration_copy_max_concurrency(static_cast<int64_t>(max_concurrency));
     }
 
     bool RegisterDummyStorage(const std::string &name) {
@@ -131,9 +141,7 @@ public:
 
     // 在 meta 中为 block_key 直接添加一个位于指定 storage 的 CacheLocation。
     // status=CLS_SERVING 时 CAS WRITING->SERVING；status=CLS_WRITING 则保持。
-    void SeedLocationOnStorage(int64_t block_key,
-                               const std::string &storage_name,
-                               CacheLocationStatus status) {
+    void SeedLocationOnStorage(int64_t block_key, const std::string &storage_name, CacheLocationStatus status) {
         auto indexer = cache_manager_->meta_indexer_manager()->GetMetaIndexer(kInstance);
         ASSERT_NE(nullptr, indexer);
         MetaSearcher meta_searcher(indexer);
@@ -227,6 +235,140 @@ TEST_F(AdminServiceImplTest, TestExplicitBlockKeysCopy) {
     ASSERT_TRUE(cache_manager_->migration_manager()->HasMigrationTask(kInstance, 101));
     ASSERT_TRUE(cache_manager_->migration_manager()->HasMigrationTask(kInstance, 102));
     ASSERT_FALSE(cache_manager_->migration_manager()->HasMigrationTask(kInstance, 103));
+}
+
+TEST_F(AdminServiceImplTest, TestAdminCopyRespectsGroupConcurrencyLimit) {
+    SetDefaultCopyConcurrency(1);
+    SeedServingSource(111);
+    SeedServingSource(112);
+    SeedServingSource(113);
+
+    auto rc = std::make_shared<RequestContext>("admin_copy_limit");
+    auto req = MakeReq(proto::admin::MIGRATION_METHOD_COPY, {111, 112, 113});
+    proto::admin::MigrateCacheResponse resp;
+    admin_->MigrateCache(rc.get(), &req, &resp);
+
+    ASSERT_EQ(proto::admin::OK, resp.header().status().code());
+    ASSERT_EQ(1, resp.accepted());
+    ASSERT_EQ(2, resp.rejected());
+    ASSERT_EQ(1u, cache_manager_->migration_manager()->ActiveTaskCountForGroup("default"));
+    ASSERT_TRUE(cache_manager_->migration_manager()->HasMigrationTask(kInstance, 111));
+    ASSERT_FALSE(cache_manager_->migration_manager()->HasMigrationTask(kInstance, 112));
+    ASSERT_FALSE(cache_manager_->migration_manager()->HasMigrationTask(kInstance, 113));
+}
+
+TEST_F(AdminServiceImplTest, TestConcurrentAdminCopyCannotOversubscribeGroupLimit) {
+    SetDefaultCopyConcurrency(1);
+    SeedServingSource(121);
+    SeedServingSource(122);
+
+    auto req1 = MakeReq(proto::admin::MIGRATION_METHOD_COPY, {121});
+    auto req2 = MakeReq(proto::admin::MIGRATION_METHOD_COPY, {122});
+    proto::admin::MigrateCacheResponse resp1;
+    proto::admin::MigrateCacheResponse resp2;
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+    auto run = [&](proto::admin::MigrateCacheRequest *req, proto::admin::MigrateCacheResponse *resp) {
+        RequestContext rc("concurrent_admin_copy");
+        ready.fetch_add(1, std::memory_order_release);
+        while (!go.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        admin_->MigrateCache(&rc, req, resp);
+    };
+    std::thread first(run, &req1, &resp1);
+    std::thread second(run, &req2, &resp2);
+    while (ready.load(std::memory_order_acquire) != 2) {
+        std::this_thread::yield();
+    }
+    go.store(true, std::memory_order_release);
+    first.join();
+    second.join();
+
+    ASSERT_EQ(proto::admin::OK, resp1.header().status().code());
+    ASSERT_EQ(proto::admin::OK, resp2.header().status().code());
+    ASSERT_EQ(1, resp1.accepted() + resp2.accepted());
+    ASSERT_EQ(1, resp1.rejected() + resp2.rejected());
+    ASSERT_EQ(1u, cache_manager_->migration_manager()->ActiveTaskCountForGroup("default"));
+}
+
+TEST_F(AdminServiceImplTest, TestAdminAndReclaimerCopyShareGroupConcurrencyLimit) {
+    SetDefaultCopyConcurrency(1);
+    SeedServingSource(141);
+    SeedServingSource(142);
+
+    auto admin_req = MakeReq(proto::admin::MIGRATION_METHOD_COPY, {141});
+    proto::admin::MigrateCacheResponse admin_resp;
+
+    // CacheReclaimer 最终也通过带 CopyConcurrencyLimit 的 BatchSubmit 提交任务。这里让该入口与
+    // Admin MigrateCache 同时竞争同一个 group slot，验证共享硬限制不会被跨入口穿透。
+    MigrationManager::MigrationRequest reclaimer_req;
+    reclaimer_req.instance_group_name = "default";
+    reclaimer_req.instance_id = kInstance;
+    reclaimer_req.block_key = 142;
+    reclaimer_req.src_location_id = "reclaimer_src_142";
+    reclaimer_req.src_storage_name = "hot_01";
+    reclaimer_req.dst_storage_name = "cold_01";
+    reclaimer_req.src_specs = {LocationSpec("tp0", "dummy://hot_01/reclaimer_142?size=16")};
+
+    std::vector<ErrorCode> reclaimer_results;
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+    auto wait_for_start = [&] {
+        ready.fetch_add(1, std::memory_order_release);
+        while (!go.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    };
+
+    std::thread admin_thread([&] {
+        RequestContext rc("admin_reclaimer_limit_admin");
+        wait_for_start();
+        admin_->MigrateCache(&rc, &admin_req, &admin_resp);
+    });
+    std::thread reclaimer_thread([&] {
+        wait_for_start();
+        reclaimer_results = cache_manager_->migration_manager()->BatchSubmit(
+            "admin_reclaimer_limit_reclaimer",
+            {reclaimer_req},
+            MigrationManager::CopyConcurrencyLimit{"default", 1});
+    });
+    while (ready.load(std::memory_order_acquire) != 2) {
+        std::this_thread::yield();
+    }
+    go.store(true, std::memory_order_release);
+    admin_thread.join();
+    reclaimer_thread.join();
+
+    ASSERT_EQ(proto::admin::OK, admin_resp.header().status().code());
+    ASSERT_EQ(1u, reclaimer_results.size());
+    ASSERT_TRUE(reclaimer_results[0] == EC_OK || reclaimer_results[0] == EC_OUT_OF_LIMIT);
+    const int reclaimer_accepted = reclaimer_results[0] == EC_OK ? 1 : 0;
+    ASSERT_EQ(1, admin_resp.accepted() + reclaimer_accepted);
+    ASSERT_EQ(1, admin_resp.rejected() + (1 - reclaimer_accepted));
+    ASSERT_EQ(1u, cache_manager_->migration_manager()->ActiveTaskCountForGroup("default"));
+    ASSERT_NE(cache_manager_->migration_manager()->HasMigrationTask(kInstance, 141),
+              cache_manager_->migration_manager()->HasMigrationTask(kInstance, 142));
+}
+
+TEST_F(AdminServiceImplTest, TestAdminBothFallsBackToMarkWhenCopyLimitReached) {
+    SetDefaultCopyConcurrency(1);
+    SeedServingSource(131);
+    SeedServingSource(132);
+
+    auto rc = std::make_shared<RequestContext>("admin_both_limit");
+    auto req = MakeReq(proto::admin::MIGRATION_METHOD_BOTH, {131, 132});
+    proto::admin::MigrateCacheResponse resp;
+    admin_->MigrateCache(rc.get(), &req, &resp);
+
+    ASSERT_EQ(proto::admin::OK, resp.header().status().code());
+    ASSERT_EQ(2, resp.accepted());
+    ASSERT_EQ(0, resp.rejected());
+    ASSERT_EQ(1u, cache_manager_->migration_manager()->ActiveTaskCountForGroup("default"));
+    ASSERT_TRUE(cache_manager_->migration_manager()->HasMigrationTask(kInstance, 131));
+    ASSERT_FALSE(cache_manager_->migration_manager()->IsMarkedForTieredWrite(kInstance, 131));
+    ASSERT_FALSE(cache_manager_->migration_manager()->HasMigrationTask(kInstance, 132));
+    ASSERT_TRUE(cache_manager_->migration_manager()->IsMarkedForTieredWrite(kInstance, 132));
 }
 
 TEST_F(AdminServiceImplTest, TestExplicitBlockKeysMark) {

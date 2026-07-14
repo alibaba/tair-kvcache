@@ -1409,18 +1409,18 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
             return false;
         }
         for (const auto &source_spec : source_loc.location_specs()) {
-            const bool covered = std::any_of(loc_map.begin(), loc_map.end(), [&source_spec, &loc_on_cold_storage](const auto &entry) {
-                const auto &loc_ptr = entry.second;
-                if (!loc_ptr || loc_ptr->status() != CacheLocationStatus::CLS_SERVING ||
-                    !loc_on_cold_storage(*loc_ptr)) {
-                    return false;
-                }
-                return std::any_of(loc_ptr->location_specs().begin(),
-                                   loc_ptr->location_specs().end(),
-                                   [&source_spec](const auto &cold_spec) {
-                                       return cold_spec.name() == source_spec.name();
-                                   });
-            });
+            const bool covered =
+                std::any_of(loc_map.begin(), loc_map.end(), [&source_spec, &loc_on_cold_storage](const auto &entry) {
+                    const auto &loc_ptr = entry.second;
+                    if (!loc_ptr || loc_ptr->status() != CacheLocationStatus::CLS_SERVING ||
+                        !loc_on_cold_storage(*loc_ptr)) {
+                        return false;
+                    }
+                    return std::any_of(
+                        loc_ptr->location_specs().begin(),
+                        loc_ptr->location_specs().end(),
+                        [&source_spec](const auto &cold_spec) { return cold_spec.name() == source_spec.name(); });
+                });
             if (!covered) {
                 return false;
             }
@@ -1451,10 +1451,9 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
                 const bool is_active_copy_target =
                     loc.status() == CacheLocationStatus::CLS_WRITING && migration_manager_ != nullptr &&
                     migration_manager_->HasActiveCopyTargetLocation(ins_id, block_key, loc.id());
-                const bool is_orphaned_writing = loc.status() == CacheLocationStatus::CLS_WRITING &&
-                                                 write_location_manager_ != nullptr &&
-                                                 !write_location_manager_->HasLocationId(loc.id()) &&
-                                                 !is_active_copy_target;
+                const bool is_orphaned_writing =
+                    loc.status() == CacheLocationStatus::CLS_WRITING && write_location_manager_ != nullptr &&
+                    !write_location_manager_->HasLocationId(loc.id()) && !is_active_copy_target;
                 if (loc.status() != CacheLocationStatus::CLS_SERVING && !is_orphaned_writing) {
                     continue;
                 }
@@ -1481,10 +1480,9 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
             const bool is_active_copy_target =
                 loc.status() == CacheLocationStatus::CLS_WRITING && migration_manager_ != nullptr &&
                 migration_manager_->HasActiveCopyTargetLocation(ins_id, block_key, loc.id());
-            const bool is_orphaned_writing = loc.status() == CacheLocationStatus::CLS_WRITING &&
-                                             write_location_manager_ != nullptr &&
-                                             !write_location_manager_->HasLocationId(loc.id()) &&
-                                             !is_active_copy_target;
+            const bool is_orphaned_writing =
+                loc.status() == CacheLocationStatus::CLS_WRITING && write_location_manager_ != nullptr &&
+                !write_location_manager_->HasLocationId(loc.id()) && !is_active_copy_target;
             if (loc.status() == CacheLocationStatus::CLS_SERVING || is_orphaned_writing) {
                 bool selected_by_water_level = false;
                 if (in_storage_type_eviction_zone) {
@@ -1587,9 +1585,10 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
     return true;
 }
 
-void CacheReclaimer::TryMigrateOnGroup(const std::shared_ptr<RequestContext> &request_context,
-                                       const std::shared_ptr<const InstanceGroup> &instance_group,
-                                       const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) noexcept {
+void CacheReclaimer::TryMigrateOnGroup(
+    const std::shared_ptr<RequestContext> &request_context,
+    const std::shared_ptr<const InstanceGroup> &instance_group,
+    const std::vector<std::shared_ptr<const InstanceInfo>> &instance_infos) noexcept {
     if (!IsRunning() || IsPaused()) {
         return;
     }
@@ -1628,15 +1627,8 @@ void CacheReclaimer::TryMigrateOnGroup(const std::shared_ptr<RequestContext> &re
     const auto configured_copy_concurrency = cache_config->migration_copy_max_concurrency();
     const std::size_t max_concurrent_copy =
         configured_copy_concurrency > 0 ? static_cast<std::size_t>(configured_copy_concurrency) : 0;
-    // F-03: 按当前 group 的 instance 集合统计活跃 copy 数，不跨 group 抢 slot。
-    std::vector<std::string> group_instance_ids;
-    group_instance_ids.reserve(instance_infos.size());
-    for (const auto &info : instance_infos) {
-        if (info != nullptr) {
-            group_instance_ids.push_back(info->instance_id());
-        }
-    }
-    const std::size_t active_copy = migration_manager_->ActiveTaskCountForInstances(group_instance_ids);
+    // 按任务记录的 group 统计活跃 Copy。这里只用于提前剪枝，最终硬限制在 BatchSubmit 内原子执行。
+    const std::size_t active_copy = migration_manager_->ActiveTaskCountForGroup(ins_gr);
     std::size_t available_copy_slots = max_concurrent_copy > active_copy ? max_concurrent_copy - active_copy : 0;
 
     for (const auto &strategy : strategies) {
@@ -1795,12 +1787,18 @@ std::size_t CacheReclaimer::MigrateByStrategyOnBatch(const std::shared_ptr<Reque
     const std::string &ins_gr = instance_info->instance_group_name();
     const std::string &src_name = strategy.source_storage_name();
     const std::string &dst_name = strategy.target_storage_name();
+    const auto cache_config = registry_manager_->GetCacheConfig(ins_gr);
+    const auto configured_copy_concurrency =
+        cache_config == nullptr ? 0 : cache_config->migration_copy_max_concurrency();
+    const std::size_t max_concurrent_copy =
+        configured_copy_concurrency > 0 ? static_cast<std::size_t>(configured_copy_concurrency) : 0;
 
     // F-10 DRY: 准入 + 分发 + fallback 委派共享 DispatchMigrationBatch（与 Admin MigrateCache 同一函数）。
     MigrationManager::DispatchBatchParams params;
     params.do_copy = copy_enabled;
     params.do_mark = mark_enabled;
     params.max_copy_slots = available_copy_slots;
+    params.copy_limit = MigrationManager::CopyConcurrencyLimit{ins_gr, max_concurrent_copy};
     params.retention = strategy.retention();
     params.mark_timeout_ms = strategy.methods().mark().timeout_ms();
     params.dedup_marks = true; // reclaimer 跳过已打标的 block（10a: 内部用 BatchGetTieredWriteTargets 批量查）

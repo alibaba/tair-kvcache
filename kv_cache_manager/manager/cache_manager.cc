@@ -128,11 +128,10 @@ IsSpecNameInSpecGroup(const std::string &trace_id,
 
 // F-09/F-22 共享 helper: 收集目标 storage 上指定 status 的 location 联合覆盖的 spec name 集合。
 // 一次 O(L·S) 扫描。exclude_loc_ids 供 F-21 排除 stale location。
-std::unordered_set<std::string> CollectCoveredSpecNames(
-    const CacheLocationMap &loc_map,
-    const std::string &storage_name,
-    std::initializer_list<CacheLocationStatus> statuses,
-    const std::vector<std::string> &exclude_loc_ids = {}) {
+std::unordered_set<std::string> CollectCoveredSpecNames(const CacheLocationMap &loc_map,
+                                                        const std::string &storage_name,
+                                                        std::initializer_list<CacheLocationStatus> statuses,
+                                                        const std::vector<std::string> &exclude_loc_ids = {}) {
     std::unordered_set<std::string> covered;
     for (const auto &[loc_id, loc_ptr] : loc_map) {
         if (!loc_ptr || std::find(statuses.begin(), statuses.end(), loc_ptr->status()) == statuses.end()) {
@@ -162,8 +161,9 @@ bool HasServingOrWritingLocOnStorage(const CacheLocationMap &loc_map,
     if (requested_spec_names.empty()) {
         return !covered.empty();
     }
-    return std::all_of(requested_spec_names.begin(), requested_spec_names.end(),
-                       [&covered](const auto &name) { return covered.count(name) > 0; });
+    return std::all_of(requested_spec_names.begin(), requested_spec_names.end(), [&covered](const auto &name) {
+        return covered.count(name) > 0;
+    });
 }
 
 const CacheLocation *FindLocationById(const CacheLocationMap &loc_map, const std::string &location_id) {
@@ -202,18 +202,20 @@ bool LocationsCoverFullBlockOnStorage(const CacheLocationMap &loc_map,
     return std::all_of(instance_info->location_spec_infos().begin(),
                        instance_info->location_spec_infos().end(),
                        [&loc_map, &storage_name](const LocationSpecInfo &spec_info) {
-                           return std::any_of(loc_map.begin(), loc_map.end(), [&spec_info, &storage_name](const auto &entry) {
-                               const auto &loc_ptr = entry.second;
-                               if (!loc_ptr || loc_ptr->status() != CacheLocationStatus::CLS_SERVING) {
-                                   return false;
-                               }
-                               return std::any_of(
-                                   loc_ptr->location_specs().begin(), loc_ptr->location_specs().end(), [&spec_info, &storage_name](const auto &spec) {
-                                       const DataStorageUri uri(spec.uri());
-                                       return spec.name() == spec_info.name() && uri.Valid() &&
-                                              uri.GetHostName() == storage_name;
-                                   });
-                           });
+                           return std::any_of(
+                               loc_map.begin(), loc_map.end(), [&spec_info, &storage_name](const auto &entry) {
+                                   const auto &loc_ptr = entry.second;
+                                   if (!loc_ptr || loc_ptr->status() != CacheLocationStatus::CLS_SERVING) {
+                                       return false;
+                                   }
+                                   return std::any_of(loc_ptr->location_specs().begin(),
+                                                      loc_ptr->location_specs().end(),
+                                                      [&spec_info, &storage_name](const auto &spec) {
+                                                          const DataStorageUri uri(spec.uri());
+                                                          return spec.name() == spec_info.name() && uri.Valid() &&
+                                                                 uri.GetHostName() == storage_name;
+                                                      });
+                               });
                        });
 }
 
@@ -868,8 +870,12 @@ CacheManager::StartWriteCache(RequestContext *request_context,
     } else {
         RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, StartWriteCacheInfo, "start write cache failed");
         KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, GenWriteLocation);
-        ec = GenWriteLocation(
-            request_context, instance_id, new_keys, new_location_spec_group_names, new_keys_tiered_targets, new_locations);
+        ec = GenWriteLocation(request_context,
+                              instance_id,
+                              new_keys,
+                              new_location_spec_group_names,
+                              new_keys_tiered_targets,
+                              new_locations);
         KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, GenWriteLocation);
         RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(WARN, ec, StartWriteCacheInfo, "start write cache failed");
         KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, ManagerBatchAddLocation);
@@ -976,8 +982,7 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
     // 仅处理启用了 tiered migration（配置了 migration_strategies）的 instance group，与
     // FilterWriteCache 的 mark 消费入口保持对称；非分层 group 无 mark 可清（admin 旁路打的标由 timeout 兜底）。
     const auto instance_info = registry_manager_->GetInstanceInfo(request_context, instance_id);
-    if (!success_batch_keys.empty() &&
-        IsTieredMigrationEnabled(request_context, registry_manager_, instance_info)) {
+    if (!success_batch_keys.empty() && IsTieredMigrationEnabled(request_context, registry_manager_, instance_info)) {
         KeyVector mark_candidate_keys;
         std::vector<std::string> mark_candidate_location_ids;
         for (size_t i = 0; i < success_batch_keys.size(); ++i) {
@@ -1011,17 +1016,19 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
                         (clear_policy == MigrationMarkClearPolicy::CLEAR_ON_FULL_BLOCK_COVERED &&
                          LocationsCoverFullBlockOnStorage(loc_maps[i], tiered_targets[i].target, instance_info))) {
                         // F-15: 按 target+deadline 条件清除，避免清掉后续同 block 新 mark。
-                        migration_manager_->ClearTieredWriteMarkIfMatch(
-                            instance_id, mark_candidate_keys[i],
-                            tiered_targets[i].target, tiered_targets[i].deadline_ms);
+                        migration_manager_->ClearTieredWriteMarkIfMatch(instance_id,
+                                                                        mark_candidate_keys[i],
+                                                                        tiered_targets[i].target,
+                                                                        tiered_targets[i].deadline_ms);
                     }
                 }
             } else {
-                PREFIX_LOG(WARN,
-                           "skip tiered mark clear because reloading finished locations failed, ec %d, got %zu, want %zu",
-                           get_loc_ec,
-                           loc_maps.size(),
-                           mark_candidate_keys.size());
+                PREFIX_LOG(
+                    WARN,
+                    "skip tiered mark clear because reloading finished locations failed, ec %d, got %zu, want %zu",
+                    get_loc_ec,
+                    loc_maps.size(),
+                    mark_candidate_keys.size());
             }
         }
     }
@@ -1146,19 +1153,28 @@ CacheManager::MigrateCacheResult CacheManager::MigrateCache(RequestContext *requ
         }
     }
 
+    // Admin Copy 与 Reclaimer 共享 instance group 级并发上限。这里取得 group 配置并传给
+    // MigrationManager；最终的原子检查在 BatchSubmit 内完成，避免并发入口的 TOCTOU。
+    const auto group_name = registry_manager_->GetInstanceGroupName(instance_id);
+    auto [group_ec, instance_group] = registry_manager_->GetInstanceGroup(request_context, group_name);
+    if (group_ec != EC_OK || instance_group == nullptr || instance_group->cache_config() == nullptr) {
+        result.ec = group_ec == EC_OK ? EC_BADARGS : group_ec;
+        result.message = "instance group or cache config not found: " + group_name;
+        return result;
+    }
+    const auto cache_config = instance_group->cache_config();
+    const auto configured_copy_concurrency = cache_config->migration_copy_max_concurrency();
+    const std::size_t copy_max_concurrency =
+        configured_copy_concurrency > 0 ? static_cast<std::size_t>(configured_copy_concurrency) : 0;
+
     // F-01: MARK/BOTH 会写入 tiered-write mark，而写路径只在配置了 migration strategy 的 instance group
     // 才消费该 mark（与 FilterWriteCache 的消费门 IsTieredMigrationEnabled 对齐）。无 strategy 时打标是
     // "成功的 no-op"（持久化后永不被消费）。保守起见直接拒绝，避免向调用方返回误导性的 accepted。
     if (do_mark) {
-        const auto group_name = registry_manager_->GetInstanceGroupName(instance_id);
-        auto [group_ec, instance_group] = registry_manager_->GetInstanceGroup(request_context, group_name);
-        const bool has_migration_strategy = group_ec == EC_OK && instance_group != nullptr &&
-                                            instance_group->cache_config() != nullptr &&
-                                            !instance_group->cache_config()->migration_strategies().empty();
+        const bool has_migration_strategy = !cache_config->migration_strategies().empty();
         if (!has_migration_strategy) {
             result.ec = EC_BADARGS;
-            result.message =
-                "MARK/BOTH requires a migration strategy configured on the instance group: " + instance_id;
+            result.message = "MARK/BOTH requires a migration strategy configured on the instance group: " + instance_id;
             return result;
         }
     }
@@ -1166,6 +1182,7 @@ CacheManager::MigrateCacheResult CacheManager::MigrateCache(RequestContext *requ
     // 前置通过 → 委派编排。meta_indexer 已取得并校验，直接传入避免二次查找。
     const auto domain = migration_manager_->MigrateCache(request_context,
                                                          trace_id,
+                                                         group_name,
                                                          instance_id,
                                                          meta_indexer,
                                                          src_name,
@@ -1173,7 +1190,8 @@ CacheManager::MigrateCacheResult CacheManager::MigrateCache(RequestContext *requ
                                                          do_copy,
                                                          do_mark,
                                                          explicit_block_keys,
-                                                         sample_count);
+                                                         sample_count,
+                                                         copy_max_concurrency);
     result.ec = domain.ec;
     result.accepted = domain.accepted;
     result.rejected = domain.rejected;
@@ -1287,8 +1305,7 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
     // "tiered enabled" would be circular. (Equivalent to prior behavior, which always fetched.)
     std::shared_ptr<const InstanceInfo> instance_info =
         registry_manager_->GetInstanceInfo(request_context, instance_id);
-    const bool tiered_migration_enabled =
-        IsTieredMigrationEnabled(request_context, registry_manager_, instance_info);
+    const bool tiered_migration_enabled = IsTieredMigrationEnabled(request_context, registry_manager_, instance_info);
     const std::vector<std::string> all_spec_names = BuildAllLocationSpecNames(instance_info);
 
     auto requestedSpecNames = [&](size_t i) -> const std::vector<std::string> * {
@@ -1368,8 +1385,9 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
     if (only_prefix_not_empty) {
         block_mask = static_cast<BlockMaskOffset>(first_empty_idx);
         new_keys.insert(new_keys.end(), keys.begin() + first_empty_idx, keys.end());
-        new_keys_tiered_targets.insert(
-            new_keys_tiered_targets.end(), tiered_target_per_key.begin() + first_empty_idx, tiered_target_per_key.end());
+        new_keys_tiered_targets.insert(new_keys_tiered_targets.end(),
+                                       tiered_target_per_key.begin() + first_empty_idx,
+                                       tiered_target_per_key.end());
         if (!location_spec_group_names.empty()) {
             new_location_spec_group_names.insert(new_location_spec_group_names.end(),
                                                  location_spec_group_names.begin() + first_empty_idx,
@@ -1423,8 +1441,7 @@ ErrorCode CacheManager::FilterWriteCacheWithMinReplica(RequestContext *request_c
     // Fetched unconditionally: tiered_migration_enabled depends on instance_info (see FilterWriteCache above).
     std::shared_ptr<const InstanceInfo> instance_info =
         registry_manager_->GetInstanceInfo(request_context, instance_id);
-    const bool tiered_migration_enabled =
-        IsTieredMigrationEnabled(request_context, registry_manager_, instance_info);
+    const bool tiered_migration_enabled = IsTieredMigrationEnabled(request_context, registry_manager_, instance_info);
     const std::vector<std::string> all_spec_names = BuildAllLocationSpecNames(instance_info);
 
     static const std::vector<std::string> empty_spec_names;
@@ -1747,8 +1764,8 @@ ErrorCode CacheManager::GenWriteLocationOnStorage(RequestContext *request_contex
 
     if (!is_create_success) {
         request_context->error_tracer()->AddErrorMsg("some internal error when GenWriteLocation");
-        auto error_codes = data_storage_manager->Delete(
-            request_context, storage_name, allocated_uris, []() { /* do nothing */ });
+        auto error_codes =
+            data_storage_manager->Delete(request_context, storage_name, allocated_uris, []() { /* do nothing */ });
         for (size_t i = 0; i < error_codes.size(); i++) {
             if (i >= allocated_uris.size()) {
                 PREFIX_LOG(WARN,
@@ -1864,8 +1881,8 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
             collect_location_uris(*extra_locations, uris_by_storage);
         }
         for (const auto &[storage_name, uris] : uris_by_storage) {
-            const auto results = data_storage_manager->Delete(
-                request_context, storage_name, uris, []() { /* do nothing */ });
+            const auto results =
+                data_storage_manager->Delete(request_context, storage_name, uris, []() { /* do nothing */ });
             if (results.size() != uris.size()) {
                 PREFIX_LOG(WARN,
                            "rollback generated locations on storage %s returned %zu results, request size %zu",
@@ -1875,7 +1892,8 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
             }
             for (const auto ec : results) {
                 if (ec != EC_OK) {
-                    PREFIX_LOG(WARN, "rollback generated location on storage %s failed, ec %d", storage_name.c_str(), ec);
+                    PREFIX_LOG(
+                        WARN, "rollback generated location on storage %s failed, ec %d", storage_name.c_str(), ec);
                 }
             }
         }
@@ -1958,7 +1976,9 @@ bool ParseInt64(const std::string &s, int64_t &out) {
         }
         out = v;
         return true;
-    } catch (...) { return false; }
+    } catch (...) {
+        return false;
+    }
 }
 
 } // namespace

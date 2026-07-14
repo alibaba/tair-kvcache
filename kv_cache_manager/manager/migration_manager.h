@@ -51,6 +51,7 @@ class MigrationManager {
 public:
     // 一条 Copy 迁移请求：把 instance/block 下 src_location 的数据复制到 dst_storage。
     struct MigrationRequest {
+        std::string instance_group_name; // Copy 并发限流作用域；空表示未启用 group 限流（测试/内部直调）
         std::string instance_id;
         int64_t block_key = 0;
         std::string src_location_id;
@@ -61,6 +62,18 @@ public:
         // 非空时 PrepareCopyTask 直接使用；空时 fallback 重读 meta（兼容不经 DispatchMigrationBatch 的调用方）。
         std::vector<LocationSpec> src_specs;
         int64_t src_create_time = 0;
+    };
+
+    // Copy 提交的 group 级硬上限。BatchSubmit 在 copy_submission_mutex_ 内统计 active 并截断，
+    // 保证 Admin / Reclaimer 并发提交时不会同时看到同一个空闲 slot。
+    struct CopyConcurrencyLimit {
+        std::string instance_group_name;
+        std::size_t max_concurrency;
+
+        CopyConcurrencyLimit(std::string group_name = "", std::size_t concurrency = SIZE_MAX)
+            : instance_group_name(group_name), max_concurrency(concurrency) {}
+
+        bool enabled() const { return !instance_group_name.empty() && max_concurrency != SIZE_MAX; }
     };
 
     struct MigrationStats {
@@ -92,7 +105,9 @@ public:
     // 返回 EC_OK 表示已成功登记任务（不代表复制完成）。
     ErrorCode Submit(const std::string &trace_id, MigrationRequest request);
     // 批量提交，返回逐项结果（与 requests 一一对应）。
-    std::vector<ErrorCode> BatchSubmit(const std::string &trace_id, std::vector<MigrationRequest> requests);
+    std::vector<ErrorCode> BatchSubmit(const std::string &trace_id,
+                                       std::vector<MigrationRequest> requests,
+                                       CopyConcurrencyLimit copy_limit = CopyConcurrencyLimit());
 
     // ---- copy 任务完成回调（监控线程驱动，亦可供测试直接调用） ----
     void OnTaskSuccess(const std::string &instance_id, int64_t block_key);
@@ -115,7 +130,7 @@ public:
 
     // F-15: mark 查询结果（target + deadline），供 match-clear 使用。
     struct MarkQueryResult {
-        std::string target;    // 空=未打标/已清/已过期
+        std::string target; // 空=未打标/已清/已过期
         int64_t deadline_ms = 0;
     };
 
@@ -126,7 +141,7 @@ public:
                                          std::vector<MarkQueryResult> &out);
 
     // Mark 持久化属性名（block 级 property）。
-    static const std::string PROPERTY_TIERED_WRITE_TARGET; // 值=目标冷 storage；空串=未打标/已清
+    static const std::string PROPERTY_TIERED_WRITE_TARGET;      // 值=目标冷 storage；空串=未打标/已清
     static const std::string PROPERTY_TIERED_WRITE_DEADLINE_MS; // 值=过期时间戳(ms)；空/缺失=不过期旧标记
 
     // ---- 任务控制 ----
@@ -142,6 +157,8 @@ public:
                                      int64_t block_key,
                                      const std::string &location_id) const;
     size_t ActiveTaskCount() const;
+    // 按任务提交时记录的 instance group 统计活跃 Copy，用于统一的 group 级硬限流。
+    size_t ActiveTaskCountForGroup(const std::string &instance_group_name) const;
     // F-03: 按 instance 集合过滤的活跃 copy task 数（group 级并发预算用）。
     size_t ActiveTaskCountForInstances(const std::vector<std::string> &instance_ids) const;
     // F-12: 取指定 instance 的活跃 copy task block_key 列表（用于 drain 前 BatchCancel）。
@@ -157,10 +174,10 @@ public:
     // ---- Copy 准入策略（CacheReclaimer / AdminServiceImpl 共用） ----
     enum class CopyAdmissionStatus {
         kAccept,
-        kAlreadyMigrating,       // 该 block_key 已有活跃 Copy 任务
-        kTargetServingExists,    // 目标 storage 上已存在 SERVING 副本
-        kTargetWritingExists,    // 目标 storage 上存在 WRITING 副本（可能为其他迁移半成品）
-        kSourceServingNotFound,  // 源 storage 上没有 SERVING 副本，无可复制源
+        kAlreadyMigrating,      // 该 block_key 已有活跃 Copy 任务
+        kTargetServingExists,   // 目标 storage 上已存在 SERVING 副本
+        kTargetWritingExists,   // 目标 storage 上存在 WRITING 副本（可能为其他迁移半成品）
+        kSourceServingNotFound, // 源 storage 上没有 SERVING 副本，无可复制源
     };
 
     struct CopyAdmission {
@@ -191,6 +208,7 @@ public:
     };
     MigrateResult MigrateCache(RequestContext *request_context,
                                const std::string &trace_id,
+                               const std::string &instance_group_name,
                                const std::string &instance_id,
                                const std::shared_ptr<MetaIndexer> &meta_indexer,
                                const std::string &src_name,
@@ -198,7 +216,8 @@ public:
                                bool do_copy,
                                bool do_mark,
                                const std::vector<int64_t> &explicit_block_keys,
-                               int64_t sample_count);
+                               int64_t sample_count,
+                               std::size_t copy_max_concurrency);
 
     // ---- 共享迁移分发（F-10 DRY：Admin MigrateCache 与 CacheReclaimer 两路共用）----
     // 对已准备好的 (batch, loc_maps) 执行：逐 block 准入(CheckCopyAdmission) + copy/mark 分类
@@ -207,7 +226,9 @@ public:
     struct DispatchBatchParams {
         bool do_copy = false;
         bool do_mark = false;
+        // max_copy_slots 是调用方本批次的提前剪枝；copy_limit 是 BatchSubmit 内的原子硬限制。
         std::size_t max_copy_slots = SIZE_MAX;
+        CopyConcurrencyLimit copy_limit;
         MigrationRetention retention = MigrationRetention::MIGRATION_RETENTION_DELETE_SOURCE;
         int64_t mark_timeout_ms = MigrationMarkMethod::kDefaultTimeoutMs;
         bool dedup_marks = false; // true=跳过已打标的 block（reclaimer 用；Admin 显式指定 block 不需要）
@@ -218,12 +239,12 @@ public:
         int64_t mark_submitted = 0;
     };
     DispatchBatchResult DispatchMigrationBatch(const std::string &trace_id,
-                                              const std::string &instance_id,
-                                              const std::string &src_name,
-                                              const std::string &dst_name,
-                                              const std::vector<int64_t> &batch,
-                                              const std::vector<CacheLocationMap> &loc_maps,
-                                              const DispatchBatchParams &params);
+                                               const std::string &instance_id,
+                                               const std::string &src_name,
+                                               const std::string &dst_name,
+                                               const std::vector<int64_t> &batch,
+                                               const std::vector<CacheLocationMap> &loc_maps,
+                                               const DispatchBatchParams &params);
 
     // ---- 统计 ----
     MigrationStats GetStats() const;
@@ -231,7 +252,8 @@ public:
 private:
     // ---- 仅供测试/诊断（BUILD 通过 -fno-access-control 访问；F-07）----
     std::string GetActiveTaskDstLocation(const std::string &instance_id, int64_t block_key) const;
-    void DebugInsertActiveCopyTask(const std::string &instance_id, int64_t block_key, const std::string &dst_location_id);
+    void
+    DebugInsertActiveCopyTask(const std::string &instance_id, int64_t block_key, const std::string &dst_location_id);
     void DebugEnableCopySubmissionsForTest();
 
     // F-11: 活跃 Copy 任务的收尾状态机。用于让外部 Cancel 线程与单一 monitor 完成线程在
@@ -239,10 +261,15 @@ private:
     //   kRunning    —— copy 提交后、future 未完成，正常态；
     //   kCompleting —— monitor 已认领完成（promote/失败清理进行中），此后 Cancel 太晚；
     //   kCancelling —— 外部已请求取消，收尾推迟到 future 完成时由 monitor 执行（删 WRITING 目标、不 promote）。
-    enum class CopyTaskState { kRunning, kCompleting, kCancelling };
+    enum class CopyTaskState {
+        kRunning,
+        kCompleting,
+        kCancelling
+    };
 
     // 单个活跃 Copy 任务的上下文。
     struct CopyTaskContext {
+        std::string instance_group_name;
         std::string instance_id;
         int64_t block_key = 0;
         std::string src_location_id;
@@ -252,9 +279,9 @@ private:
         std::string dst_location_id;
         MigrationRetention retention = MigrationRetention::MIGRATION_RETENTION_DELETE_SOURCE;
         std::chrono::steady_clock::time_point submit_time;
-        uint64_t total_bytes = 0;              // 源端各 spec 字节数之和（取自 uri size 参数）
-        std::string mark_target;               // F-15: 提交时 mark 的 target（空=无 mark，用于 match-clear）
-        int64_t mark_deadline_ms = 0;          // F-15: 提交时 mark 的 deadline（用于 match-clear）
+        uint64_t total_bytes = 0;     // 源端各 spec 字节数之和（取自 uri size 参数）
+        std::string mark_target;      // F-15: 提交时 mark 的 target（空=无 mark，用于 match-clear）
+        int64_t mark_deadline_ms = 0; // F-15: 提交时 mark 的 deadline（用于 match-clear）
         CopyTaskState state = CopyTaskState::kRunning; // F-11: 收尾认领状态
     };
 
@@ -315,7 +342,8 @@ private:
                            const std::string &target_storage,
                            int64_t deadline_ms);
     void ProcessExpiredMarks();
-    size_t ActiveTaskCountUnsafe() const; // 调用方持有 task_mutex_
+    size_t ActiveTaskCountUnsafe() const;                                               // 调用方持有 task_mutex_
+    size_t ActiveTaskCountForGroupUnsafe(const std::string &instance_group_name) const; // 调用方持有 task_mutex_
 
     // ---- 活跃任务表操作收口（F-13 Part A；均要求调用方持有 task_mutex_）----
     // 统一处理"内层 map 空则 erase 外层 + 更新 active gauge"，避免各业务路径重复手写、遗漏。
@@ -328,11 +356,21 @@ private:
     bool HasActiveTaskLocked(const std::string &instance_id, int64_t block_key) const;
 
     // ---- F-11 收尾认领（均要求调用方持有 task_mutex_）----
-    enum class ClaimResult { kClaimedRunning, kWasCancelling, kBusyCompleting, kNotFound };
+    enum class ClaimResult {
+        kClaimedRunning,
+        kWasCancelling,
+        kBusyCompleting,
+        kNotFound
+    };
     // monitor 完成路径认领：kRunning→置 kCompleting 并拷 ctx（kClaimedRunning）；
     // kCancelling→拷 ctx 返回 kWasCancelling（不改状态，交由 CompleteCancelledTask 收尾）。
     ClaimResult ClaimForCompletionLocked(const std::string &instance_id, int64_t block_key, CopyTaskContext &out_ctx);
-    enum class CancelResult { kMarked, kAlreadyCancelling, kBusyCompleting, kNotFound };
+    enum class CancelResult {
+        kMarked,
+        kAlreadyCancelling,
+        kBusyCompleting,
+        kNotFound
+    };
     // 外部 Cancel 认领：kRunning→置 kCancelling（kMarked）；kCancelling→幂等；kCompleting→太晚。
     CancelResult MarkCancellingLocked(const std::string &instance_id, int64_t block_key);
     // 取消任务的延迟收尾（monitor 线程，入口不持锁）：删 WRITING 目标（源不动）+ 移除活跃任务

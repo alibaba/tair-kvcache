@@ -398,6 +398,7 @@ ErrorCode MetaSearcher_BatchGetLocation_stub(void *obj,
 
 std::vector<MigrationManager::MigrationRequest> captured_copy_reqs;
 std::vector<std::vector<MigrationManager::MigrationRequest>> captured_copy_req_batches;
+std::vector<MigrationManager::CopyConcurrencyLimit> captured_copy_limits;
 std::string captured_copy_trace;
 std::vector<std::int64_t> captured_mark_keys;
 std::string captured_mark_target;
@@ -437,6 +438,7 @@ public:
         spe_submit_invalid_future = false;
         captured_copy_reqs.clear();
         captured_copy_req_batches.clear();
+        captured_copy_limits.clear();
         captured_copy_trace.clear();
         captured_mark_keys.clear();
         captured_mark_target.clear();
@@ -546,6 +548,7 @@ public:
         }
         captured_copy_reqs.clear();
         captured_copy_req_batches.clear();
+        captured_copy_limits.clear();
         captured_copy_trace.clear();
         captured_mark_keys.clear();
         captured_mark_target.clear();
@@ -2674,9 +2677,8 @@ TEST_F(CacheReclaimerTest, TestCronJobAdaptiveSleepInterval) {
     // on absolute scheduler timing, while still requiring the second round to
     // arrive before the original sleep interval would have elapsed again.
     ASSERT_TRUE(WaitUntilSubmittedDelRequests(initial_sleep_interval + std::chrono::milliseconds(1000)));
-    ASSERT_TRUE(WaitUntil(
-        [this] { return ListInstanceGroupCallCount() > 1 && SubmittedDelRequestCount() > 1; },
-        initial_sleep_interval / 2));
+    ASSERT_TRUE(WaitUntil([this] { return ListInstanceGroupCallCount() > 1 && SubmittedDelRequestCount() > 1; },
+                          initial_sleep_interval / 2));
     cache_reclaimer_->Stop(); // join the worker thread
 
     ASSERT_LT(1, ListInstanceGroupCallCount());
@@ -2916,7 +2918,9 @@ TEST_F(CacheReclaimerTest, TestHandleDelRes03) {
 
     try {
         throw std::runtime_error("test exception");
-    } catch (...) { promise->set_exception(std::current_exception()); }
+    } catch (...) {
+        promise->set_exception(std::current_exception());
+    }
 
     cache_reclaimer_->HandleDelRes();
     ASSERT_FALSE(cache_reclaimer_->delete_handlers_.empty());
@@ -3956,8 +3960,8 @@ TEST_F(CacheReclaimerTest, TestDupKeys) {
         std::vector<std::map<std::string, std::string>> maps(get_out_properties);
         std::vector<std::int64_t> batch;
         CacheReclaimer::AgeStats lru_age_stats;
-        ASSERT_TRUE(
-            cache_reclaimer_->MakeBatchByLRU(request_context_.get(), instance_infos.front(), keys, maps, batch, lru_age_stats));
+        ASSERT_TRUE(cache_reclaimer_->MakeBatchByLRU(
+            request_context_.get(), instance_infos.front(), keys, maps, batch, lru_age_stats));
         ASSERT_EQ(9, batch.size());
         // keys 1..10 unique, lru_times 0..9; tp=0 excluded from stats, tp=1..9 included (9 entries)
         // ages: now_us-1, now_us-2, ..., now_us-9 → min=now_us-9, max=now_us-1, diff=8
@@ -4012,8 +4016,8 @@ TEST_F(CacheReclaimerTest, TestDupKeys) {
         std::vector<std::map<std::string, std::string>> maps(get_out_properties);
         std::vector<std::int64_t> batch;
         CacheReclaimer::AgeStats lru_age_stats;
-        ASSERT_TRUE(
-            cache_reclaimer_->MakeBatchByLRU(request_context_.get(), instance_infos.front(), keys, maps, batch, lru_age_stats));
+        ASSERT_TRUE(cache_reclaimer_->MakeBatchByLRU(
+            request_context_.get(), instance_infos.front(), keys, maps, batch, lru_age_stats));
         ASSERT_EQ(1, batch.size());
         // all keys are 1 (only 1 unique key), first occurrence has tp=0 → excluded
         // age_count=0 → Clear() called → all stats zeroed
@@ -4065,8 +4069,8 @@ TEST_F(CacheReclaimerTest, TestDupKeys) {
         std::vector<std::map<std::string, std::string>> maps(get_out_properties);
         std::vector<std::int64_t> batch;
         CacheReclaimer::AgeStats lru_age_stats;
-        ASSERT_TRUE(
-            cache_reclaimer_->MakeBatchByLRU(request_context_.get(), instance_infos.front(), keys, maps, batch, lru_age_stats));
+        ASSERT_TRUE(cache_reclaimer_->MakeBatchByLRU(
+            request_context_.get(), instance_infos.front(), keys, maps, batch, lru_age_stats));
         ASSERT_EQ(2, batch.size());
         // keys={1*7,2,1,1}, tp={9*7,10,9,9}; sorted → key=1(tp=9) then key=2(tp=10)
         // ages: now_us-9 and now_us-10 → min=now_us-10, max=now_us-9, diff=1
@@ -4090,12 +4094,12 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDDoesNotSkipActiveMigrationTask) {
 
     auto make_serving_map = [](const std::string &loc_id) {
         CacheLocationMap m;
-        auto loc = std::make_shared<CacheLocation>(
-            loc_id,
-            CacheLocationStatus::CLS_SERVING,
-            DataStorageType::DATA_STORAGE_TYPE_DUMMY,
-            1,
-            std::vector<LocationSpec>{LocationSpec("TP0", "dummy://d/" + loc_id)});
+        auto loc =
+            std::make_shared<CacheLocation>(loc_id,
+                                            CacheLocationStatus::CLS_SERVING,
+                                            DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+                                            1,
+                                            std::vector<LocationSpec>{LocationSpec("TP0", "dummy://d/" + loc_id)});
         m.emplace(loc_id, loc);
         return m;
     };
@@ -4146,27 +4150,23 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDSkipsActiveWritingLocations) {
 
     const auto ins_info = InstanceInfoFactory();
     mm_->DebugInsertActiveCopyTask(ins_info->instance_id(), 42, "migration_writing");
-    write_location_manager->Put("write_session",
-                                {44},
-                                {"client_writing"},
-                                60,
-                                [](std::unique_ptr<WriteLocationManager::WriteLocationInfo>) {});
+    write_location_manager->Put(
+        "write_session", {44}, {"client_writing"}, 60, [](std::unique_ptr<WriteLocationManager::WriteLocationInfo>) {});
 
     auto make_writing_map = [](const std::string &loc_id) {
         CacheLocationMap m;
-        auto loc = std::make_shared<CacheLocation>(
-            loc_id,
-            CacheLocationStatus::CLS_WRITING,
-            DataStorageType::DATA_STORAGE_TYPE_DUMMY,
-            1,
-            std::vector<LocationSpec>{LocationSpec("TP0", "dummy://d/" + loc_id)});
+        auto loc =
+            std::make_shared<CacheLocation>(loc_id,
+                                            CacheLocationStatus::CLS_WRITING,
+                                            DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+                                            1,
+                                            std::vector<LocationSpec>{LocationSpec("TP0", "dummy://d/" + loc_id)});
         m.emplace(loc_id, loc);
         return m;
     };
 
-    batch_get_loc_out_maps = {make_writing_map("migration_writing"),
-                              make_writing_map("orphan_writing"),
-                              make_writing_map("client_writing")};
+    batch_get_loc_out_maps = {
+        make_writing_map("migration_writing"), make_writing_map("orphan_writing"), make_writing_map("client_writing")};
     batch_get_loc_result = ErrorCode::EC_OK;
 
     CacheReclaimer::WaterLevelExceed wl;
@@ -4259,15 +4259,14 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDDoesNotEvictHotWhenColdSpecsIncomplete
     stub_.set(ADDR(RegistryManager, GetInstanceGroup), RegistryManager_GetInstanceGroup_cold_stub);
 
     const auto ins_info = InstanceInfoFactory();
-    auto hot_loc = std::make_shared<CacheLocation>(
-        "hot_full",
-        CacheLocationStatus::CLS_SERVING,
-        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
-        2,
-        std::vector<LocationSpec>{
-            LocationSpec("TP0", "dummy://hot_01/hot_full/tp0"),
-            LocationSpec("TP1", "dummy://hot_01/hot_full/tp1"),
-        });
+    auto hot_loc = std::make_shared<CacheLocation>("hot_full",
+                                                   CacheLocationStatus::CLS_SERVING,
+                                                   DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+                                                   2,
+                                                   std::vector<LocationSpec>{
+                                                       LocationSpec("TP0", "dummy://hot_01/hot_full/tp0"),
+                                                       LocationSpec("TP1", "dummy://hot_01/hot_full/tp1"),
+                                                   });
     auto partial_cold_loc = std::make_shared<CacheLocation>(
         "cold_partial",
         CacheLocationStatus::CLS_SERVING,
@@ -4411,10 +4410,12 @@ ErrorCode MigrateTest_BatchGetLocation_stub(void *obj,
 
 std::vector<ErrorCode> MigrationManager_BatchSubmit_stub(void *obj,
                                                          const std::string &trace_id,
-                                                         std::vector<MigrationManager::MigrationRequest> requests) {
+                                                         std::vector<MigrationManager::MigrationRequest> requests,
+                                                         MigrationManager::CopyConcurrencyLimit copy_limit) {
     captured_copy_trace = trace_id;
     captured_copy_reqs = requests;
     captured_copy_req_batches.emplace_back(requests);
+    captured_copy_limits.emplace_back(std::move(copy_limit));
     return std::vector<ErrorCode>(requests.size(), ErrorCode::EC_OK);
 }
 
@@ -4429,10 +4430,8 @@ ErrorCode MigrationManager_MarkForTieredWrite_stub(void *obj,
     return ErrorCode::EC_OK;
 }
 
-static MigrationStrategy MakeStrategy(const std::string &src,
-                                      const std::string &dst,
-                                      bool copy_enabled,
-                                      bool mark_enabled) {
+static MigrationStrategy
+MakeStrategy(const std::string &src, const std::string &dst, bool copy_enabled, bool mark_enabled) {
     MigrationStrategy strategy;
     strategy.set_source_storage_name(src);
     strategy.set_target_storage_name(dst);
@@ -4587,6 +4586,8 @@ TEST_F(CacheReclaimerTest, TestTryMigrateOnGroupReusesSampledBatchAcrossStrategi
             std::make_shared<MigrationStrategy>(MakeStrategy("hot_02", "cold_02", /*copy*/ true, /*mark*/ false)),
         });
         ins_group->set_cache_config(cfg);
+        // MigrateByStrategyOnBatch 从 RegistryManager 读取同一份 group 并发配置。
+        rm_->instance_group_configs_[ins_group->name()] = ins_group;
     }
 
     dummy_meta_indexer->AddStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS, 800);
@@ -4598,6 +4599,7 @@ TEST_F(CacheReclaimerTest, TestTryMigrateOnGroupReusesSampledBatchAcrossStrategi
 
     captured_copy_reqs.clear();
     captured_copy_req_batches.clear();
+    captured_copy_limits.clear();
     cache_reclaimer_->TryMigrateOnGroup(request_context_, ins_group, {InstanceInfoFactory()});
 
     ASSERT_EQ(1, sample_reclaim_call_counter);
@@ -4609,6 +4611,11 @@ TEST_F(CacheReclaimerTest, TestTryMigrateOnGroupReusesSampledBatchAcrossStrategi
     ASSERT_EQ(1u, captured_copy_req_batches[1].size());
     ASSERT_EQ(40, captured_copy_req_batches[1][0].block_key);
     ASSERT_EQ("hot_02", captured_copy_req_batches[1][0].src_storage_name);
+    ASSERT_EQ(2u, captured_copy_limits.size());
+    for (const auto &limit : captured_copy_limits) {
+        ASSERT_EQ(ins_group->name(), limit.instance_group_name);
+        ASSERT_EQ(2u, limit.max_concurrency);
+    }
 
     stub_.reset(ADDR(MetaSearcher, BatchGetLocation));
     stub_.reset(ADDR(MigrationManager, BatchSubmit));
@@ -4777,7 +4784,8 @@ TEST_F(CacheReclaimerTest, TestTryMigrateOnGroupNormalizesVcnsSourceTypeForQuota
 namespace {
 std::vector<ErrorCode> BatchSubmit_PartialFail_stub(void * /*obj*/,
                                                     const std::string &trace_id,
-                                                    std::vector<MigrationManager::MigrationRequest> requests) {
+                                                    std::vector<MigrationManager::MigrationRequest> requests,
+                                                    MigrationManager::CopyConcurrencyLimit /*copy_limit*/) {
     captured_copy_trace = trace_id;
     captured_copy_reqs = requests;
     captured_copy_req_batches.emplace_back(requests);
@@ -4846,27 +4854,26 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDMultiColdUnionCoversHot) {
     stub_.set(ADDR(RegistryManager, GetInstanceGroup), RegistryManager_GetInstanceGroup_cold_stub);
     const auto ins_info = InstanceInfoFactory();
 
-    auto hot_loc = std::make_shared<CacheLocation>(
-        "hot_full",
-        CacheLocationStatus::CLS_SERVING,
-        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
-        2,
-        std::vector<LocationSpec>{
-            LocationSpec("TP0", "dummy://hot_01/hot_full/tp0"),
-            LocationSpec("TP1", "dummy://hot_01/hot_full/tp1"),
-        });
-    auto cold_a = std::make_shared<CacheLocation>(
-        "cold_a",
-        CacheLocationStatus::CLS_SERVING,
-        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
-        1,
-        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://cold_01/cold_a/tp0")});
-    auto cold_b = std::make_shared<CacheLocation>(
-        "cold_b",
-        CacheLocationStatus::CLS_SERVING,
-        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
-        1,
-        std::vector<LocationSpec>{LocationSpec("TP1", "dummy://cold_01/cold_b/tp1")});
+    auto hot_loc = std::make_shared<CacheLocation>("hot_full",
+                                                   CacheLocationStatus::CLS_SERVING,
+                                                   DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+                                                   2,
+                                                   std::vector<LocationSpec>{
+                                                       LocationSpec("TP0", "dummy://hot_01/hot_full/tp0"),
+                                                       LocationSpec("TP1", "dummy://hot_01/hot_full/tp1"),
+                                                   });
+    auto cold_a =
+        std::make_shared<CacheLocation>("cold_a",
+                                        CacheLocationStatus::CLS_SERVING,
+                                        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+                                        1,
+                                        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://cold_01/cold_a/tp0")});
+    auto cold_b =
+        std::make_shared<CacheLocation>("cold_b",
+                                        CacheLocationStatus::CLS_SERVING,
+                                        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+                                        1,
+                                        std::vector<LocationSpec>{LocationSpec("TP1", "dummy://cold_01/cold_b/tp1")});
 
     CacheLocationMap loc_map;
     loc_map.emplace("hot_full", hot_loc);
@@ -4948,18 +4955,18 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDWritingColdDoesNotProtectHot) {
     const auto ins_info = InstanceInfoFactory();
 
     // hot: SERVING, cold: WRITING(迁移中半成品)
-    auto hot_loc = std::make_shared<CacheLocation>(
-        "hot_a",
-        CacheLocationStatus::CLS_SERVING,
-        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
-        1,
-        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://hot_01/hot_a")});
-    auto cold_writing = std::make_shared<CacheLocation>(
-        "cold_w",
-        CacheLocationStatus::CLS_WRITING,
-        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
-        1,
-        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://cold_01/cold_w")});
+    auto hot_loc =
+        std::make_shared<CacheLocation>("hot_a",
+                                        CacheLocationStatus::CLS_SERVING,
+                                        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+                                        1,
+                                        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://hot_01/hot_a")});
+    auto cold_writing =
+        std::make_shared<CacheLocation>("cold_w",
+                                        CacheLocationStatus::CLS_WRITING,
+                                        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+                                        1,
+                                        std::vector<LocationSpec>{LocationSpec("TP0", "dummy://cold_01/cold_w")});
 
     CacheLocationMap loc_map;
     loc_map.emplace("hot_a", hot_loc);
