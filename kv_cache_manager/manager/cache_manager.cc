@@ -16,6 +16,7 @@
 #include "kv_cache_manager/common/jsonizable.h"
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/common/request_context.h"
+#include "kv_cache_manager/common/standard_uri.h"
 #include "kv_cache_manager/common/string_util.h"
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/instance_info.h"
@@ -2285,39 +2286,44 @@ ErrorCode CacheManager::GetHostCacheState(RequestContext *request_context,
         return ec;
     }
 
-    // Parse location_ids and compute prefix match per host
-    // location_id format: kvs#<identifier>#<medium>#<host_ip_port>
-    // parts[2] = medium, parts[3] = host_ip_port
+    // Parse locations and compute prefix match per host
+    // Extract host_ip_port and medium from URI instead of parsing location_id.
     std::map<std::string, int64_t> host_prefix;
     std::set<std::string> active_hosts;
 
     for (size_t i = 0; i < keys.size(); ++i) {
-        if (i >= location_maps.size())
+        if (i >= location_maps.size()) {
             break;
+        }
 
         const auto &locations = location_maps[i];
         std::set<std::string> owners;
         for (const auto &kv : locations) {
-            const std::string &loc_id = kv.first;
-            // Parse location_id by splitting on '#'
-            // Expected: kvs#<identifier>#<medium>#<host_ip_port>
-            size_t pos1 = loc_id.find('#');
-            if (pos1 == std::string::npos)
+            if (!kv.second || kv.second->location_specs().empty()) {
                 continue;
-            size_t pos2 = loc_id.find('#', pos1 + 1);
-            if (pos2 == std::string::npos)
+            }
+            const std::string &uri_str = kv.second->location_specs().front().uri();
+            StandardUri parsed_uri(uri_str);
+            if (!parsed_uri.Valid()) {
                 continue;
-            size_t pos3 = loc_id.find('#', pos2 + 1);
-            if (pos3 == std::string::npos)
+            }
+
+            std::string host = parsed_uri.GetHostPort();
+            if (host.empty()) {
                 continue;
-            std::string medium = loc_id.substr(pos2 + 1, pos3 - pos2 - 1);
-            std::string host = loc_id.substr(pos3 + 1);
-            if (host.empty())
-                continue;
+            }
 
             // Medium filter: empty filter = match all
-            if (!medium_filter.empty() && medium_filter.find(medium) == medium_filter.end())
-                continue;
+            if (!medium_filter.empty()) {
+                std::string medium = parsed_uri.GetPath();
+                // Path format: "/mem" -> "mem"
+                if (!medium.empty() && medium[0] == '/') {
+                    medium = medium.substr(1);
+                }
+                if (medium_filter.find(medium) == medium_filter.end()) {
+                    continue;
+                }
+            }
 
             owners.insert(host);
         }
