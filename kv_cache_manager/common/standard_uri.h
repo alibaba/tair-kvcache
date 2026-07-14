@@ -20,6 +20,13 @@ public:
     const std::string &GetUserInfo() const { return user_info_; }
     const std::string &GetHostName() const { return hostname_; }
     int64_t GetPort() const { return port_; }
+    // Returns "hostname:port" if port > 0, otherwise just "hostname".
+    std::string GetHostPort() const {
+        if (port_ > 0) {
+            return hostname_ + ":" + std::to_string(port_);
+        }
+        return hostname_;
+    }
     const std::string &GetPath() const { return path_; }
     std::string GetParam(const std::string &key) const;
     template <typename T>
