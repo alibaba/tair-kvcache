@@ -3333,11 +3333,11 @@ TEST_F(CacheManagerTest, TestGetHostCacheState) {
         ASSERT_EQ(EC_OK, cache_manager_->ReportEvent(request_context_.get(), &req, &resp));
     }
 
-    // Helper: find a host's prefix_match_blocks in the response
-    auto find_prefix = [](const proto::meta::GetHostCacheStateResponse &resp, const std::string &host) -> int64_t {
-        for (const auto &h : resp.hosts()) {
-            if (h.host_ip_port() == host) {
-                return h.prefix_match_blocks();
+    // Helper: find a host's prefix_match_blocks in the result
+    auto find_prefix = [](const std::vector<CacheManager::HostCacheMatch> &hosts, const std::string &host) -> int64_t {
+        for (const auto &h : hosts) {
+            if (h.host_ip_port == host) {
+                return h.prefix_match_blocks;
             }
         }
         return -1; // not found
@@ -3349,22 +3349,14 @@ TEST_F(CacheManagerTest, TestGetHostCacheState) {
     //   host_B: prefix=4 (100,200,300,400; miss 500)
     //   host_C: prefix=1 (100; miss 200)
     {
-        proto::meta::GetHostCacheStateRequest req;
-        req.set_instance_id("test_instance");
-        req.add_block_cache_keys(100);
-        req.add_block_cache_keys(200);
-        req.add_block_cache_keys(300);
-        req.add_block_cache_keys(400);
-        req.add_block_cache_keys(500);
+        CacheManager::KeyVector keys = {100, 200, 300, 400, 500};
+        auto [ec, hosts] = cache_manager_->GetHostCacheState(request_context_.get(), "test_instance", keys);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(3, hosts.size());
 
-        proto::meta::GetHostCacheStateResponse resp;
-        ASSERT_EQ(EC_OK, cache_manager_->GetHostCacheState(request_context_.get(), &req, &resp));
-        ASSERT_EQ(proto::meta::OK, resp.header().status().code());
-        ASSERT_EQ(3, resp.hosts_size());
-
-        EXPECT_EQ(2, find_prefix(resp, "10.0.0.1:8080"));
-        EXPECT_EQ(4, find_prefix(resp, "10.0.0.2:8080"));
-        EXPECT_EQ(1, find_prefix(resp, "10.0.0.3:8080"));
+        EXPECT_EQ(2, find_prefix(hosts, "10.0.0.1:8080"));
+        EXPECT_EQ(4, find_prefix(hosts, "10.0.0.2:8080"));
+        EXPECT_EQ(1, find_prefix(hosts, "10.0.0.3:8080"));
     }
 
     // --- Test 2: all keys cached by host_B → prefix = full length ---
@@ -3373,121 +3365,64 @@ TEST_F(CacheManagerTest, TestGetHostCacheState) {
     //   host_B: prefix=4 (all matched)
     //   host_C: prefix=1 (miss 200)
     {
-        proto::meta::GetHostCacheStateRequest req;
-        req.set_instance_id("test_instance");
-        req.add_block_cache_keys(100);
-        req.add_block_cache_keys(200);
-        req.add_block_cache_keys(300);
-        req.add_block_cache_keys(400);
+        CacheManager::KeyVector keys = {100, 200, 300, 400};
+        auto [ec, hosts] = cache_manager_->GetHostCacheState(request_context_.get(), "test_instance", keys);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(3, hosts.size());
 
-        proto::meta::GetHostCacheStateResponse resp;
-        ASSERT_EQ(EC_OK, cache_manager_->GetHostCacheState(request_context_.get(), &req, &resp));
-        ASSERT_EQ(proto::meta::OK, resp.header().status().code());
-        ASSERT_EQ(3, resp.hosts_size());
-
-        EXPECT_EQ(2, find_prefix(resp, "10.0.0.1:8080"));
-        EXPECT_EQ(4, find_prefix(resp, "10.0.0.2:8080"));
-        EXPECT_EQ(1, find_prefix(resp, "10.0.0.3:8080"));
+        EXPECT_EQ(2, find_prefix(hosts, "10.0.0.1:8080"));
+        EXPECT_EQ(4, find_prefix(hosts, "10.0.0.2:8080"));
+        EXPECT_EQ(1, find_prefix(hosts, "10.0.0.3:8080"));
     }
 
     // --- Test 3: single key — all hosts have prefix=1 ---
     {
-        proto::meta::GetHostCacheStateRequest req;
-        req.set_instance_id("test_instance");
-        req.add_block_cache_keys(100);
+        CacheManager::KeyVector keys = {100};
+        auto [ec, hosts] = cache_manager_->GetHostCacheState(request_context_.get(), "test_instance", keys);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(3, hosts.size());
 
-        proto::meta::GetHostCacheStateResponse resp;
-        ASSERT_EQ(EC_OK, cache_manager_->GetHostCacheState(request_context_.get(), &req, &resp));
-        ASSERT_EQ(proto::meta::OK, resp.header().status().code());
-        ASSERT_EQ(3, resp.hosts_size());
-
-        EXPECT_EQ(1, find_prefix(resp, "10.0.0.1:8080"));
-        EXPECT_EQ(1, find_prefix(resp, "10.0.0.2:8080"));
-        EXPECT_EQ(1, find_prefix(resp, "10.0.0.3:8080"));
+        EXPECT_EQ(1, find_prefix(hosts, "10.0.0.1:8080"));
+        EXPECT_EQ(1, find_prefix(hosts, "10.0.0.2:8080"));
+        EXPECT_EQ(1, find_prefix(hosts, "10.0.0.3:8080"));
     }
 
     // --- Test 4: first key not cached by any host → empty response ---
     // keys = {999, 100, 200}
     {
-        proto::meta::GetHostCacheStateRequest req;
-        req.set_instance_id("test_instance");
-        req.add_block_cache_keys(999);
-        req.add_block_cache_keys(100);
-        req.add_block_cache_keys(200);
-
-        proto::meta::GetHostCacheStateResponse resp;
-        ASSERT_EQ(EC_OK, cache_manager_->GetHostCacheState(request_context_.get(), &req, &resp));
-        ASSERT_EQ(proto::meta::OK, resp.header().status().code());
-        EXPECT_EQ(0, resp.hosts_size());
+        CacheManager::KeyVector keys = {999, 100, 200};
+        auto [ec, hosts] = cache_manager_->GetHostCacheState(request_context_.get(), "test_instance", keys);
+        ASSERT_EQ(EC_OK, ec);
+        EXPECT_EQ(0, hosts.size());
     }
 
     // --- Test 5: empty block_cache_keys → OK, empty response ---
+    // Note: MetaServiceImpl layer rejects empty keys; CacheManager returns empty directly.
     {
-        proto::meta::GetHostCacheStateRequest req;
-        req.set_instance_id("test_instance");
-
-        proto::meta::GetHostCacheStateResponse resp;
-        ASSERT_EQ(EC_OK, cache_manager_->GetHostCacheState(request_context_.get(), &req, &resp));
-        ASSERT_EQ(proto::meta::OK, resp.header().status().code());
-        EXPECT_EQ(0, resp.hosts_size());
+        CacheManager::KeyVector keys = {};
+        auto [ec, hosts] = cache_manager_->GetHostCacheState(request_context_.get(), "test_instance", keys);
+        ASSERT_EQ(EC_OK, ec);
+        EXPECT_EQ(0, hosts.size());
     }
 
-    // --- Test 6: nonexistent instance → error ---
+    // --- Test 6: medium filter (only "mem") — should not change results ---
     {
-        proto::meta::GetHostCacheStateRequest req;
-        req.set_instance_id("nonexistent_instance");
-        req.add_block_cache_keys(100);
+        CacheManager::KeyVector keys = {100, 200, 300, 400, 500};
+        auto [ec, hosts] = cache_manager_->GetHostCacheState(request_context_.get(), "test_instance", keys, {"mem"});
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(3, hosts.size());
 
-        proto::meta::GetHostCacheStateResponse resp;
-        auto ec = cache_manager_->GetHostCacheState(request_context_.get(), &req, &resp);
-        ASSERT_EQ(EC_INSTANCE_NOT_EXIST, ec);
-        ASSERT_EQ(proto::meta::INSTANCE_NOT_EXIST, resp.header().status().code());
+        EXPECT_EQ(2, find_prefix(hosts, "10.0.0.1:8080"));
+        EXPECT_EQ(4, find_prefix(hosts, "10.0.0.2:8080"));
+        EXPECT_EQ(1, find_prefix(hosts, "10.0.0.3:8080"));
     }
 
-    // --- Test 7: empty instance_id → INVALID_ARGUMENT ---
+    // --- Test 7: medium filter (non-existent medium "ssd") → no hosts ---
     {
-        proto::meta::GetHostCacheStateRequest req;
-        req.add_block_cache_keys(100);
-
-        proto::meta::GetHostCacheStateResponse resp;
-        auto ec = cache_manager_->GetHostCacheState(request_context_.get(), &req, &resp);
-        ASSERT_EQ(EC_BADARGS, ec);
-        ASSERT_EQ(proto::meta::INVALID_ARGUMENT, resp.header().status().code());
-    }
-
-    // --- Test 8: medium filter (only "mem") — should not change results ---
-    {
-        proto::meta::GetHostCacheStateRequest req;
-        req.set_instance_id("test_instance");
-        req.add_block_cache_keys(100);
-        req.add_block_cache_keys(200);
-        req.add_block_cache_keys(300);
-        req.add_block_cache_keys(400);
-        req.add_block_cache_keys(500);
-        req.add_medium("mem");
-
-        proto::meta::GetHostCacheStateResponse resp;
-        ASSERT_EQ(EC_OK, cache_manager_->GetHostCacheState(request_context_.get(), &req, &resp));
-        ASSERT_EQ(proto::meta::OK, resp.header().status().code());
-        ASSERT_EQ(3, resp.hosts_size());
-
-        EXPECT_EQ(2, find_prefix(resp, "10.0.0.1:8080"));
-        EXPECT_EQ(4, find_prefix(resp, "10.0.0.2:8080"));
-        EXPECT_EQ(1, find_prefix(resp, "10.0.0.3:8080"));
-    }
-
-    // --- Test 9: medium filter (non-existent medium "ssd") → no hosts ---
-    {
-        proto::meta::GetHostCacheStateRequest req;
-        req.set_instance_id("test_instance");
-        req.add_block_cache_keys(100);
-        req.add_block_cache_keys(200);
-        req.add_medium("ssd");
-
-        proto::meta::GetHostCacheStateResponse resp;
-        ASSERT_EQ(EC_OK, cache_manager_->GetHostCacheState(request_context_.get(), &req, &resp));
-        ASSERT_EQ(proto::meta::OK, resp.header().status().code());
-        EXPECT_EQ(0, resp.hosts_size());
+        CacheManager::KeyVector keys = {100, 200};
+        auto [ec, hosts] = cache_manager_->GetHostCacheState(request_context_.get(), "test_instance", keys, {"ssd"});
+        ASSERT_EQ(EC_OK, ec);
+        EXPECT_EQ(0, hosts.size());
     }
 
     dsm->storage_map_.erase("event_backend_default");
