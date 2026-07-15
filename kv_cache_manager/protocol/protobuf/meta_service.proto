@@ -46,37 +46,60 @@ enum StorageType {
     ST_EVENT_REPORT = 7;
 }
 
-// ---- Event reporting ----
+// ---- Cache event reporting ----
+//
+// ReportEvent is the ingestion API used by cache subscribers. A subscriber
+// normalizes engine-specific cache signals (for example RTP-LLM full cache
+// snapshots or vLLM KV events) into block-level mutations on one storage
+// system. `storage_type` names that large storage/cache system; `medium`
+// identifies one diffable cache namespace under the reporter host; LocationSpec
+// describes where each cache component of the block lives. KVCM currently
+// matches only full-attention specs and ignores mamba-state specs by
+// LocationSpec.name.
 
 enum ReportEventType {
     EVENT_UNSPECIFIED = 0;
-    EVENT_NODE_REGISTER = 1; // node starts up and registers with KVCM
-    EVENT_BLOCK_ADD = 2;     // node stored a new block locally
-    EVENT_BLOCK_DELETE = 3;  // node deleted a block locally
-    EVENT_HOST_DOWN = 4;     // node is going down (graceful or detected)
-    EVENT_HEARTBEAT = 5;     // periodic heartbeat
+    EVENT_NODE_REGISTER = 1; // Reporter node starts up and registers with KVCM
+    EVENT_BLOCK_ADD = 2;     // Reporter stored a block in one location
+    EVENT_BLOCK_DELETE = 3;  // Reporter removed a block from one location
+    EVENT_HOST_DOWN = 4;     // Reporter node is going down (graceful or detected)
+    EVENT_HEARTBEAT = 5;     // Reporter periodic heartbeat
+    EVENT_BLOCK_SNAPSHOT = 6; // Reporter sends the full block set for one host/medium
 }
 
-message NodeRegisterParams {
+message NodeRegisterEventParams {
     repeated string mediums = 1; // mediums supported by the node, e.g. ["mem","disk"]
 }
 
-message BlockAddParams {
+message BlockAddEventParams {
     string block_key = 1; // int64 as string
     string uri = 2;       // deprecated, use specs instead
-    string medium = 3;    // e.g. "mem"/"disk"/"ssd"/"hbm"
+    string medium = 3;    // cache tier/namespace, e.g. "mem", "disk", "gpu", "hbm"
     repeated LocationSpec specs = 4;
 }
 
-message BlockDeleteParams {
+message BlockDeleteEventParams {
     string block_key = 1;
-    string medium = 2;
+    string medium = 2; // cache tier/namespace, e.g. "mem", "disk", "gpu", "hbm"
+    // Optional. When set, KVCM applies the delete only if these component names
+    // contain a full-attention spec; mamba-state-only deletes are ignored.
+    repeated string spec_names = 3;
 }
 
-message HostDownParams {
+message BlockSnapshotItem {
+    string block_key = 1;
+    repeated LocationSpec specs = 2;
 }
 
-message HeartbeatParams {
+message BlockSnapshotEventParams {
+    string medium = 1; // cache tier/namespace, e.g. "mem", "disk", "gpu", "hbm"
+    repeated BlockSnapshotItem blocks = 2;
+}
+
+message HostDownEventParams {
+}
+
+message HeartbeatEventParams {
     // KVCM only refreshes last_heartbeat; system_status is opaque observability data
     map<string, string> system_status = 1;
 }
@@ -84,11 +107,12 @@ message HeartbeatParams {
 message EventItem {
     ReportEventType event_type = 1;
     oneof event_params {
-        NodeRegisterParams node_register = 2;
-        BlockAddParams block_add = 3;
-        BlockDeleteParams block_delete = 4;
-        HostDownParams host_down = 5;
-        HeartbeatParams heartbeat = 6;
+        NodeRegisterEventParams node_register = 2;
+        BlockAddEventParams block_add = 3;
+        BlockDeleteEventParams block_delete = 4;
+        HostDownEventParams host_down = 5;
+        HeartbeatEventParams heartbeat = 6;
+        BlockSnapshotEventParams block_snapshot = 7;
     }
 }
 
@@ -97,7 +121,7 @@ message ReportEventRequest {
     string instance_id = 2;
     string host_ip_port = 3;
     repeated EventItem events = 4;
-    StorageType storage_type = 5; // required: declares the reporter's storage type
+    StorageType storage_type = 5; // required: declares the reporter's storage/event_report
 }
 
 message ReportEventResponse {

@@ -115,6 +115,16 @@ class KVCMClient:
             assert code == "OK", f"finishWriteCache failed: {json.dumps(body)}"
         return body
 
+    def get_host_cache_state(self, data, check_response=True):
+        url = f"{self.base_url}/api/getHostCacheState"
+        resp = self.session.post(url, json=data)
+        resp.raise_for_status()
+        body = resp.json()
+        if check_response:
+            code = body.get("header", {}).get("status", {}).get("code")
+            assert code == "OK", f"getHostCacheState failed: {json.dumps(body)}"
+        return body
+
     def close(self):
         self.session.close()
 
@@ -711,6 +721,64 @@ class EventReportFunctionalTest(unittest.TestCase):
             for spec in loc.get("location_specs", []):
                 self.assertNotIn(host, spec.get("uri", ""),
                                  f"Cleanup should have removed host [{host}] from results")
+
+    # 16. GetHostCacheState — per-host prefix match verification
+    def test_16_get_host_cache_state(self):
+        # Data layout (3 hosts, different key subsets):
+        #   key 10000: host_A, host_B, host_C
+        #   key 10001: host_A, host_B
+        #   key 10002: host_B only
+        #   key 10003: host_A, host_B
+        #   key 10004: no host
+        #
+        # Query keys = [10000, 10001, 10002, 10003, 10004]
+        #   host_A: 10000, 10001 (miss 10002) -> prefix=2
+        #   host_B: 10000, 10001, 10002, 10003 (miss 10004) -> prefix=4
+        #   host_C: 10000 (miss 10001) -> prefix=1
+        hosts = [
+            ("10.0.0.1:8080", [10000, 10001, 10003]),
+            ("10.0.0.2:8080", [10000, 10001, 10002, 10003]),
+            ("10.0.0.3:8080", [10000]),
+        ]
+
+        # 1. Each host: NODE_REGISTER + BLOCK_ADD
+        for host, keys in hosts:
+            events = [_ev_node_register(["mem"])]
+            for key in keys:
+                uri = _build_event_report_uri(host, "mem")
+                events.append(
+                    _ev_block_add(key, "mem", _make_single_spec("tp0", uri))
+                )
+            self.client.report_event(
+                _make_request(
+                    self.instance_id, host, events,
+                    trace_id=f"t16_setup_{host}",
+                )
+            )
+
+        # 2. Query GetHostCacheState
+        resp = self.client.get_host_cache_state({
+            "trace_id": "t16_query",
+            "instance_id": self.instance_id,
+            "block_cache_keys": [10000, 10001, 10002, 10003, 10004],
+        })
+
+        # 3. Verify prefix_match_blocks per host
+        expected = {
+            "10.0.0.1:8080": 2,
+            "10.0.0.2:8080": 4,
+            "10.0.0.3:8080": 1,
+        }
+        actual = {
+            h["host_ip_port"]: int(h["prefix_match_blocks"])
+            for h in resp.get("hosts", [])
+        }
+        for host, prefix in expected.items():
+            self.assertIn(host, actual, f"host {host} not found in response")
+            self.assertEqual(
+                actual[host], prefix,
+                f"host {host}: expected prefix={prefix}, got {actual[host]}",
+            )
 
 
 # ---------------------------------------------------------------------------

@@ -179,11 +179,29 @@ void MetaServiceHttp::ReportEvent(coro_http::coro_http_connection *http_conn,
                                   proto::meta::ReportEventRequest *request,
                                   proto::meta::ReportEventResponse *response) {
     API_CONTEXT_GET_COLLECTOR_AND_INIT_HTTP(ReportEvent, __NOTHING__);
-    KVCM_LOG_INFO("[traceId: %s] ReportEvent called, instance_id: %s, host_ip_port: %s, event_count: %d",
+    std::string first_event_type = "N/A";
+    std::string first_block_key = "N/A";
+    if (request->events_size() > 0) {
+        const auto &first_event = request->events(0);
+        first_event_type = proto::meta::ReportEventType_Name(first_event.event_type());
+        if (first_event.has_block_add()) {
+            first_block_key = first_event.block_add().block_key();
+        } else if (first_event.has_block_delete()) {
+            first_block_key = first_event.block_delete().block_key();
+        } else if (first_event.has_block_snapshot()) {
+            if (first_event.block_snapshot().blocks_size() > 0) {
+                first_block_key = first_event.block_snapshot().blocks(0).block_key();
+            }
+        }
+    }
+    KVCM_LOG_INFO("[traceId: %s] ReportEvent called, instance_id: %s, host_ip_port: %s, event_count: %d, "
+                  "first_event_type: %s, first_block_key: %s",
                   request->trace_id().c_str(),
                   request->instance_id().c_str(),
                   request->host_ip_port().c_str(),
-                  request->events_size());
+                  request->events_size(),
+                  first_event_type.c_str(),
+                  first_block_key.c_str());
     bool has_block_add = false, has_block_delete = false;
     for (int i = 0; i < request->events_size(); ++i) {
         if (request->events(i).event_type() == proto::meta::EVENT_BLOCK_ADD)

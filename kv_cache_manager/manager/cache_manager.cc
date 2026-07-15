@@ -2251,6 +2251,7 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
                                 const std::vector<std::string> &medium_filter) {
     SPAN_TRACER(request_context);
     const std::string &trace_id = request_context->trace_id();
+    auto *service_metrics_collector = dynamic_cast<ServiceMetricsCollector *>(request_context->metrics_collector());
 
     MetaSearcher *meta_searcher = meta_searcher_manager_->GetMetaSearcher(instance_id);
     if (!meta_searcher) {
@@ -2267,7 +2268,10 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
     // Query locations for all block_cache_keys
     BlockMask empty_mask;
     std::vector<CacheLocationMap> location_maps;
+    KVCM_METRICS_COLLECTOR_SET_METRICS(service_metrics_collector, manager, request_key_count, block_cache_keys.size());
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_BEGIN(service_metrics_collector, ManagerBatchGetLocation);
     auto ec = meta_searcher->BatchGetLocation(request_context, block_cache_keys, empty_mask, location_maps);
+    KVCM_METRICS_COLLECTOR_CHRONO_MARK_END(service_metrics_collector, ManagerBatchGetLocation);
     RETURN_IF_EC_NOT_OK_WITH_TYPE_LOG(
         WARN, ec, std::vector<HostCacheMatch>, "BatchGetLocation failed for instance: %s", instance_id.c_str());
     assert(block_cache_keys.size() == location_maps.size());
