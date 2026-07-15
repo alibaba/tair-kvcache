@@ -1,8 +1,10 @@
 #include "kv_cache_manager/manager/migration_manager.h"
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
-#include <cstdlib>
+#include <limits>
+#include <optional>
 #include <tuple>
 #include <unordered_set>
 #include <utility>
@@ -27,19 +29,26 @@ namespace {
 constexpr auto kMonitorIdleSleep = std::chrono::milliseconds(50);
 constexpr auto kFutureWaitTime = std::chrono::microseconds(200);
 
-int64_t ParseInt64OrZero(const std::string &value) {
+std::optional<int64_t> ParsePositiveInt64(const std::string &value) {
     if (value.empty()) {
-        return 0;
+        return std::nullopt;
     }
-    char *end = nullptr;
-    const auto parsed = std::strtoll(value.c_str(), &end, 10);
-    return end != nullptr && *end == '\0' ? parsed : 0;
+    int64_t parsed = 0;
+    const char *begin = value.data();
+    const char *end = begin + value.size();
+    const auto [ptr, ec] = std::from_chars(begin, end, parsed);
+    if (ec != std::errc{} || ptr != end || parsed <= 0) {
+        return std::nullopt;
+    }
+    return parsed;
 }
 
-// F-15: mark property 解析结果。target 为空表示无标记或已清；expired 表示已过期待清理。
+// F-15/R2-06: mark property 解析结果。target 为空表示无标记或已清；target 非空时 deadline
+// 必须是合法正整数，malformed 表示缺失、非数字、越界或非正值；expired 表示已过期待清理。
 struct MarkInfo {
     std::string target;
     int64_t deadline_ms = 0;
+    bool malformed = false;
     bool expired = false;
 };
 
@@ -51,8 +60,13 @@ static MarkInfo ParseMarkFromProperties(const PropertyMap &props, int64_t now_ms
     }
     info.target = tit->second;
     auto dit = props.find(MigrationManager::PROPERTY_TIERED_WRITE_DEADLINE_MS);
-    info.deadline_ms = dit == props.end() ? 0 : ParseInt64OrZero(dit->second);
-    if (info.deadline_ms > 0 && info.deadline_ms <= now_ms) {
+    const auto deadline = dit == props.end() ? std::nullopt : ParsePositiveInt64(dit->second);
+    if (!deadline.has_value()) {
+        info.malformed = true;
+        return info;
+    }
+    info.deadline_ms = *deadline;
+    if (info.deadline_ms <= now_ms) {
         info.expired = true;
     }
     return info;
@@ -1056,7 +1070,13 @@ ErrorCode MigrationManager::MarkForTieredWrite(const std::string &instance_id,
         KVCM_LOG_WARN("MarkForTieredWrite: meta indexer not found for instance %s", instance_id.c_str());
         return EC_INSTANCE_NOT_EXIST;
     }
-    const int64_t deadline_ms = TimestampUtil::GetCurrentTimeMs() + timeout_ms;
+    const int64_t now_ms = TimestampUtil::GetCurrentTimeMs();
+    if (timeout_ms > std::numeric_limits<int64_t>::max() - now_ms) {
+        KVCM_LOG_WARN(
+            "MarkForTieredWrite: timeout %ld overflows deadline for instance %s", timeout_ms, instance_id.c_str());
+        return EC_BADARGS;
+    }
+    const int64_t deadline_ms = now_ms + timeout_ms;
     // F-14: 记录实际成功打标的 key index，供 stat/expiry/event 仅按 actual 口径更新。
     // modifier 在 RMW 批次内按 global_idx 回调，顺序对齐 block_keys。
     std::vector<bool> mark_succeeded(block_keys.size(), false);
@@ -1108,6 +1128,9 @@ bool MigrationManager::ClearTieredWriteMarkIfMatch(const std::string &instance_i
                                                    int64_t block_key,
                                                    const std::string &expected_target,
                                                    int64_t expected_deadline_ms) {
+    if (expected_target.empty() || expected_deadline_ms <= 0) {
+        return false;
+    }
     return ClearTieredWriteMarkIfMatchInternal(instance_id, block_key, expected_target, expected_deadline_ms);
 }
 
@@ -1131,16 +1154,19 @@ bool MigrationManager::ClearTieredWriteMarkIfMatchInternal(const std::string &in
                                                            const std::string &expected_target,
                                                            int64_t expected_deadline_ms,
                                                            bool is_expiry) {
-    if (expected_target.empty() || expected_deadline_ms <= 0) {
+    if (expected_target.empty()) {
         return false;
     }
+    // R2-06: private 调用以非正 deadline 表示“仅匹配当前仍 malformed 的同 target Mark”。
+    // public ClearTieredWriteMarkIfMatch 仍拒绝非正 deadline，避免改变其精确快照语义。
+    const bool expect_malformed = expected_deadline_ms <= 0;
     auto indexer = GetIndexer(instance_id);
     if (indexer == nullptr) {
         return false;
     }
 
     bool cleared = false;
-    auto modifier = [&indexer, block_key, &expected_target, expected_deadline_ms, &cleared](
+    auto modifier = [&indexer, block_key, &expected_target, expected_deadline_ms, expect_malformed, &cleared](
                         const LocationIdVector & /*existing*/,
                         ErrorCode get_ec,
                         size_t /*idx*/,
@@ -1151,13 +1177,15 @@ bool MigrationManager::ClearTieredWriteMarkIfMatchInternal(const std::string &in
         }
         RequestContext check_rc("migration_match_clear_check");
         PropertyMapVector check_props;
-        indexer->GetProperties(
+        const auto check_result = indexer->GetProperties(
             &check_rc, {block_key}, {PROPERTY_TIERED_WRITE_TARGET, PROPERTY_TIERED_WRITE_DEADLINE_MS}, check_props);
-        if (check_props.empty()) {
+        if (check_result.ec != EC_OK || check_result.error_codes.size() != 1 || check_result.error_codes[0] != EC_OK ||
+            check_props.size() != 1) {
             return {MA_SKIP, EC_OK};
         }
         auto mark = ParseMarkFromProperties(check_props[0], 0);
-        if (mark.target != expected_target || mark.deadline_ms != expected_deadline_ms) {
+        if (mark.target != expected_target ||
+            (expect_malformed ? !mark.malformed : mark.deadline_ms != expected_deadline_ms)) {
             return {MA_SKIP, EC_OK};
         }
         upsert_property_map[PROPERTY_TIERED_WRITE_TARGET] = "";
@@ -1167,7 +1195,7 @@ bool MigrationManager::ClearTieredWriteMarkIfMatchInternal(const std::string &in
     };
     RequestContext rc("migration_conditional_clear_mark");
     indexer->ReadModifyWriteBlock(&rc, {block_key}, modifier);
-    if (cleared) {
+    if (cleared && !expect_malformed) {
         stat_marks_cleared_.fetch_add(1, std::memory_order_relaxed);
         UpdateMarksActiveGauge();
         if (metrics_enabled_) {
@@ -1246,6 +1274,7 @@ ErrorCode MigrationManager::BatchGetTieredWriteTargets(const std::string &instan
     }
 
     std::vector<ExpiringMark> expired_marks;
+    std::vector<std::pair<int64_t, std::string>> malformed_marks;
     const int64_t now_ms = TimestampUtil::GetCurrentTimeMs();
     std::size_t read_error_count = 0;
     for (size_t i = 0; i < block_keys.size(); ++i) {
@@ -1260,6 +1289,16 @@ ErrorCode MigrationManager::BatchGetTieredWriteTargets(const std::string &instan
             continue;
         }
         auto mark = ParseMarkFromProperties(props[i], now_ms);
+        if (mark.malformed) {
+            KVCM_LOG_WARN("malformed tiered write mark for instance %s, block %ld, target %s; "
+                          "treating as no-mark and clearing conditionally",
+                          instance_id.c_str(),
+                          block_keys[i],
+                          mark.target.c_str());
+            malformed_marks.emplace_back(block_keys[i], std::move(mark.target));
+            out[i].state = MarkQueryState::kNoMark;
+            continue;
+        }
         if (mark.target.empty()) {
             out[i].state = MarkQueryState::kNoMark;
             continue;
@@ -1275,6 +1314,9 @@ ErrorCode MigrationManager::BatchGetTieredWriteTargets(const std::string &instan
     }
     for (const auto &em : expired_marks) {
         ClearTieredWriteMarkIfMatchInternal(em.instance_id, em.block_key, em.target_storage, em.deadline_ms, true);
+    }
+    for (const auto &[block_key, target] : malformed_marks) {
+        ClearTieredWriteMarkIfMatchInternal(instance_id, block_key, target, 0);
     }
     if (read_error_count == 0) {
         return EC_OK;

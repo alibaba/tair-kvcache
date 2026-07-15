@@ -1,7 +1,9 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <vector>
 
@@ -235,6 +237,27 @@ public:
         return iter == props[0].end() ? std::string() : iter->second;
     }
 
+    void SetRawMark(int64_t block_key, const std::string &target, std::optional<std::string> deadline) {
+        auto indexer = meta_manager_->GetMetaIndexer(kInstance);
+        ASSERT_TRUE(indexer);
+        auto modifier = [&target, &deadline](const LocationIdVector & /*existing*/,
+                                             ErrorCode get_ec,
+                                             size_t /*idx*/,
+                                             PropertyMap &upsert_property_map,
+                                             CacheLocationMap & /*out_new*/) -> ModifierResult {
+            if (get_ec != EC_OK) {
+                return {MA_FAIL, get_ec};
+            }
+            upsert_property_map[MigrationManager::PROPERTY_TIERED_WRITE_TARGET] = target;
+            if (deadline.has_value()) {
+                upsert_property_map[MigrationManager::PROPERTY_TIERED_WRITE_DEADLINE_MS] = *deadline;
+            }
+            return {MA_OK, EC_OK};
+        };
+        RequestContext rc("set_raw_tiered_write_mark");
+        ASSERT_EQ(EC_OK, indexer->ReadModifyWriteBlock(&rc, {block_key}, modifier).ec);
+    }
+
     void DeleteLocationMeta(int64_t block_key, const std::string &location_id) {
         auto rc = std::make_shared<RequestContext>("delete_location_meta");
         MetaSearcher meta_searcher(meta_manager_->GetMetaIndexer(kInstance));
@@ -384,6 +407,74 @@ TEST_F(MigrationManagerTest, TestBatchGetTieredWriteTargetsRejectsMisalignedOutp
         ASSERT_TRUE(result.target.empty());
     }
     ASSERT_EQ(2u, metrics_registry_->GetCounter("migration.mark_query_errors_total").Get());
+}
+
+TEST_F(MigrationManagerTest, TestMalformedDeadlinesAreTreatedAsNoMarkAndCleared) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "malformed_mark_hot/"));
+    const std::vector<std::optional<std::string>> malformed_deadlines = {
+        std::nullopt,
+        std::string(),
+        "not-a-number",
+        "0",
+        "-1",
+        "99999999999999999999",
+        "-99999999999999999999",
+    };
+    std::vector<int64_t> block_keys;
+    for (size_t i = 0; i < malformed_deadlines.size(); ++i) {
+        const int64_t block_key = static_cast<int64_t>(100 + i);
+        CreateSourceLocation(block_key, "hot_01", false, "x");
+        SetRawMark(block_key, "cold_01", malformed_deadlines[i]);
+        block_keys.push_back(block_key);
+    }
+
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    std::vector<MigrationManager::MarkQueryResult> results;
+    ASSERT_EQ(EC_OK, mgr.BatchGetTieredWriteTargets(kInstance, block_keys, results));
+
+    ASSERT_EQ(block_keys.size(), results.size());
+    for (size_t i = 0; i < block_keys.size(); ++i) {
+        EXPECT_EQ(MigrationManager::MarkQueryState::kNoMark, results[i].state);
+        EXPECT_EQ(EC_OK, results[i].ec);
+        EXPECT_TRUE(results[i].target.empty());
+        EXPECT_EQ(0, results[i].deadline_ms);
+        EXPECT_TRUE(GetRawTieredWriteTarget(block_keys[i]).empty());
+    }
+}
+
+TEST_F(MigrationManagerTest, TestMalformedCleanupDoesNotClearValidRefresh) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "malformed_refresh_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "malformed_refresh_cold/"));
+    CreateSourceLocation(200, "hot_01", false, "x");
+    SetRawMark(200, "cold_01", std::string("invalid"));
+
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    ASSERT_FALSE(mgr.ClearTieredWriteMarkIfMatch(kInstance, 200, "cold_01", 0));
+    ASSERT_EQ("cold_01", GetRawTieredWriteTarget(200));
+    // 模拟查询已拿到 malformed target 后，另一线程把它刷新成同 target 的合法 Mark。
+    ASSERT_EQ(EC_OK, mgr.MarkForTieredWrite(kInstance, {200}, "cold_01", 10000));
+    ASSERT_FALSE(mgr.ClearTieredWriteMarkIfMatchInternal(kInstance, 200, "cold_01", 0));
+
+    std::vector<MigrationManager::MarkQueryResult> results;
+    ASSERT_EQ(EC_OK, mgr.BatchGetTieredWriteTargets(kInstance, {200}, results));
+    ASSERT_EQ(1u, results.size());
+    ASSERT_TRUE(results[0].HasValidMark());
+    ASSERT_EQ("cold_01", results[0].target);
+    ASSERT_GT(results[0].deadline_ms, 0);
+}
+
+TEST_F(MigrationManagerTest, TestMarkForTieredWriteRejectsDeadlineOverflow) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "mark_overflow_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "mark_overflow_cold/"));
+    CreateSourceLocation(201, "hot_01", false, "x");
+
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    ASSERT_EQ(EC_BADARGS, mgr.MarkForTieredWrite(kInstance, {201}, "cold_01", std::numeric_limits<int64_t>::max()));
+    ASSERT_TRUE(GetRawTieredWriteTarget(201).empty());
+    ASSERT_EQ(0u, mgr.GetStats().marks_added);
 }
 
 TEST_F(MigrationManagerTest, TestMarkLifecycle) {

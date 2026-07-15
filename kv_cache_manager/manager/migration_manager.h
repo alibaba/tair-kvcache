@@ -155,8 +155,8 @@ public:
                                          std::vector<MarkQueryResult> &out);
 
     // Mark 持久化属性名（block 级 property）。
-    static const std::string PROPERTY_TIERED_WRITE_TARGET;      // 值=目标冷 storage；空串=未打标/已清
-    static const std::string PROPERTY_TIERED_WRITE_DEADLINE_MS; // 值=过期时间戳(ms)；空/缺失=不过期旧标记
+    static const std::string PROPERTY_TIERED_WRITE_TARGET; // 值=目标冷 storage；空串=未打标/已清
+    static const std::string PROPERTY_TIERED_WRITE_DEADLINE_MS; // 值=正数过期时间戳(ms)；非法值按 malformed 清理
 
     // ---- 任务控制 ----
     ErrorCode Cancel(const std::string &instance_id, int64_t block_key);
