@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -7,7 +8,10 @@
 #include <type_traits>
 #include <unordered_map>
 
+#include "google/protobuf/descriptor.h"
 #include "google/protobuf/message.h"
+#include "kv_cache_manager/common/logger.h"
+#include "kv_cache_manager/common/timestamp_util.h"
 #include "kv_cache_manager/service/util/proto_message_json_util.h"
 #include "ylt/coro_http/coro_http_server.hpp"
 
@@ -60,23 +64,99 @@ CoroHttpService::HandlerType CoroHttpService::GetHandler(
         PbResponseMessage pb_res;
 
         std::string json_res;
+        const std::string request_type = pb_req.GetDescriptor() ? pb_req.GetDescriptor()->full_name() : "unknown";
+        const bool should_log_http_stage = request_type.find(".ReportEventRequest") != std::string::npos ||
+                                           request_type.find(".GetHostCacheStateRequest") != std::string::npos;
 
-        if (!ProtoMessageJsonUtil::FromJson(std::string(req.get_body()), &pb_req)) {
+        const int64_t t0 = TimestampUtil::GetSteadyTimeUs();
+        std::string body(req.get_body());
+        const int64_t t1 = TimestampUtil::GetSteadyTimeUs();
+
+        if (!ProtoMessageJsonUtil::FromJson(body, &pb_req)) {
+            const int64_t t2 = TimestampUtil::GetSteadyTimeUs();
             json_res = "{}";
             res.set_status_and_content(coro_http::status_type::bad_request, json_res);
+            const int64_t t3 = TimestampUtil::GetSteadyTimeUs();
+            if (should_log_http_stage) {
+                KVCM_LOG_INFO("http json stage parse_failed url=%.*s request_type=%s body_size=%zu body_copy_us=%ld "
+                              "from_json_us=%ld set_response_us=%ld handler_total_us=%ld",
+                              static_cast<int>(req.get_url().size()),
+                              req.get_url().data(),
+                              request_type.c_str(),
+                              body.size(),
+                              t1 - t0,
+                              t2 - t1,
+                              t3 - t2,
+                              t3 - t0);
+            }
             co_return;
+        }
+        const int64_t t2 = TimestampUtil::GetSteadyTimeUs();
+
+        std::string trace_id;
+        if (pb_req.GetDescriptor() && pb_req.GetReflection()) {
+            const auto *trace_field = pb_req.GetDescriptor()->FindFieldByName("trace_id");
+            if (trace_field && trace_field->cpp_type() == google::protobuf::FieldDescriptor::CPPTYPE_STRING &&
+                !trace_field->is_repeated()) {
+                trace_id = pb_req.GetReflection()->GetString(pb_req, trace_field);
+            }
         }
 
         callback(static_cast<ServiceType *>(this), req.get_conn(), &pb_req, &pb_res);
+        const int64_t t3 = TimestampUtil::GetSteadyTimeUs();
 
         if (!ProtoMessageJsonUtil::ToJson(&pb_res, json_res)) {
+            const int64_t t4 = TimestampUtil::GetSteadyTimeUs();
             json_res = "{}";
             res.set_status_and_content(coro_http::status_type::internal_server_error, json_res);
+            const int64_t t5 = TimestampUtil::GetSteadyTimeUs();
+            if (should_log_http_stage) {
+                const std::string response_type =
+                    pb_res.GetDescriptor() ? pb_res.GetDescriptor()->full_name() : "unknown";
+                KVCM_LOG_INFO("http json stage response_json_failed url=%.*s request_type=%s response_type=%s "
+                              "trace_id=%s body_size=%zu response_size=%zu body_copy_us=%ld from_json_us=%ld "
+                              "callback_us=%ld to_json_us=%ld set_response_us=%ld handler_total_us=%ld",
+                              static_cast<int>(req.get_url().size()),
+                              req.get_url().data(),
+                              request_type.c_str(),
+                              response_type.c_str(),
+                              trace_id.c_str(),
+                              body.size(),
+                              json_res.size(),
+                              t1 - t0,
+                              t2 - t1,
+                              t3 - t2,
+                              t4 - t3,
+                              t5 - t4,
+                              t5 - t0);
+            }
             co_return;
         }
+        const int64_t t4 = TimestampUtil::GetSteadyTimeUs();
         res.add_header("Content-Type", "application/json");
 
         res.set_status_and_content(coro_http::status_type::ok, json_res);
+        const int64_t t5 = TimestampUtil::GetSteadyTimeUs();
+
+        if (should_log_http_stage) {
+            const std::string response_type = pb_res.GetDescriptor() ? pb_res.GetDescriptor()->full_name() : "unknown";
+            KVCM_LOG_INFO("http json stage url=%.*s request_type=%s response_type=%s trace_id=%s body_size=%zu "
+                          "response_size=%zu body_copy_us=%ld from_json_us=%ld callback_us=%ld to_json_us=%ld "
+                          "set_response_us=%ld handler_total_us=%ld",
+                          static_cast<int>(req.get_url().size()),
+                          req.get_url().data(),
+                          request_type.c_str(),
+                          response_type.c_str(),
+                          trace_id.c_str(),
+                          body.size(),
+                          json_res.size(),
+                          t1 - t0,
+                          t2 - t1,
+                          t3 - t2,
+                          t4 - t3,
+                          t5 - t4,
+                          t5 - t0);
+        }
         co_return;
     };
 }

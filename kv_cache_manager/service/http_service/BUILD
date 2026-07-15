@@ -25,6 +25,7 @@ cc_library(
     deps = [
         "//kv_cache_manager/common:logger",
         "//kv_cache_manager/common:request_context",
+        "//kv_cache_manager/common:timestamp_util",
         "//kv_cache_manager/config",
         "//kv_cache_manager/data_storage",
         "//kv_cache_manager/data_storage:common_define",
