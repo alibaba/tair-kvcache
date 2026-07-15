@@ -142,6 +142,9 @@ ServiceCallGuard::~ServiceCallGuard() {
 }
 
 void ServiceCallGuard::PrintAccessLog(RequestContext *request_context) {
+    if (request_context->skip_access_log()) {
+        return;
+    }
     AccessLogJsonBuilder access_log_json_builder(request_context);
     std::string access_log = access_log_json_builder.Build();
     KVCM_ACCESS_LOG(access_log);

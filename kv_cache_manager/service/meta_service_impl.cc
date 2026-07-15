@@ -24,7 +24,7 @@
 #define API_CALL_GUARD(api_name, is_leader_only)                                                                       \
     request_context->set_api_name(api_name);                                                                           \
     response->mutable_header()->set_request_id(request_context->request_id());                                         \
-    {                                                                                                                  \
+    if (!request_context->skip_access_log()) {                                                                         \
         std::string request_debug;                                                                                     \
         ProtoMessageJsonUtil::ToJson(request, request_debug);                                                          \
         request_context->set_request_debug(request_debug);                                                             \
@@ -41,9 +41,11 @@
     }                                                                                                                  \
     ServiceCallGuard service_call_guard(                                                                               \
         cache_manager_.get(), request_context, metrics_reporter_.get(), [request_context, response, this]() {          \
-            std::string response_debug;                                                                                \
-            ProtoMessageJsonUtil::ToJson(response, response_debug);                                                    \
-            request_context->set_response_debug(response_debug);                                                       \
+            if (!request_context->skip_access_log()) {                                                                 \
+                std::string response_debug;                                                                            \
+                ProtoMessageJsonUtil::ToJson(response, response_debug);                                                \
+                request_context->set_response_debug(response_debug);                                                   \
+            }                                                                                                          \
             DecrementRequestCount(is_leader_only);                                                                     \
         });
 

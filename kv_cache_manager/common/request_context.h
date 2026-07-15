@@ -47,10 +47,13 @@ public:
     void set_request_debug(const std::string &value) { request_debug_ = value; }
     void set_response_debug(const std::string &value) { response_debug_ = value; }
     void set_parent_span_tracer(SpanTracer *tracer) const { parent_span_tracer_ = tracer; }
+    bool skip_access_log() const { return skip_access_log_; }
+    void set_skip_access_log(bool value) { skip_access_log_ = value; }
     ErrorTracer *error_tracer() { return error_tracer_.get(); }
 
 private:
     bool need_span_tracer_ = false;
+    bool skip_access_log_ = false;
     std::string trace_id_;   // 用户传递的trace_id
     std::string request_id_; // 为每一次请求生成的request_id
     int64_t request_begin_time_us_;

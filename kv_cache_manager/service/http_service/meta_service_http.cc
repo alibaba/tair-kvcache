@@ -170,6 +170,7 @@ void MetaServiceHttp::ReportEvent(coro_http::coro_http_connection *http_conn,
                                   proto::meta::ReportEventRequest *request,
                                   proto::meta::ReportEventResponse *response) {
     API_CONTEXT_GET_COLLECTOR_AND_INIT_HTTP(ReportEvent, __NOTHING__);
+    request_context->set_skip_access_log(true);
     std::string first_event_type = "N/A";
     std::string first_block_key = "N/A";
     if (request->events_size() > 0) {
