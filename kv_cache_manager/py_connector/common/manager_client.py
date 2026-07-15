@@ -1,11 +1,18 @@
 import random
 import threading
 import time
-from typing import List
+from typing import Optional
 
 import requests
 
 from kv_cache_manager.py_connector.common.logger import logger
+from kv_cache_manager.py_connector.common.service_discovery import (
+    ServiceDiscovery,
+    ServiceEndpoint,
+)
+from kv_cache_manager.py_connector.common.service_discovery_factory import (
+    create_service_discovery,
+)
 
 
 class KvCacheManagerClient:
@@ -15,21 +22,54 @@ class KvCacheManagerClient:
                  min_discover_interval_seconds=1):
         """
         Args:
-            base_url: Manager service address. When auto_discover_leader is enabled, leader
-                discovery will always query this address (not the current leader). It is
-                recommended to use a load-balancer address that fronts all manager nodes.
+            base_url: Manager HTTP(S) address or a service-discovery URL. When
+                auto_discover_leader is enabled, leader discovery always starts from
+                this entry point instead of the current leader.
         """
-        self.base_url = base_url
         self.session = requests.Session()
         self.headers = {'Accept': 'application/json', 'Content-Type': 'application/json'}
 
+        # Resolve service-discovery URLs before issuing any HTTP requests. Keep the
+        # discovery object alive so each leader refresh can start from a fresh endpoint.
+        self._service_discovery: Optional[ServiceDiscovery] = None
+        resolved_url = base_url
+        if not self._is_http_url(base_url):
+            self._service_discovery = create_service_discovery(base_url)
+            if self._service_discovery is None:
+                self.session.close()
+                raise ValueError(
+                    f"failed to create service discovery from manager address {base_url!r}"
+                )
+
+            try:
+                endpoint = self._service_discovery.get_one_endpoint()
+            except Exception as e:
+                self._close_service_discovery()
+                self.session.close()
+                raise RuntimeError(
+                    f"failed to resolve manager endpoints from {base_url!r}"
+                ) from e
+            if endpoint is None:
+                self._close_service_discovery()
+                self.session.close()
+                raise RuntimeError(
+                    f"service discovery returned no manager endpoints for {base_url!r}"
+                )
+
+            resolved_url = self._endpoint_url(endpoint)
+            logger.info(
+                "Service discovery (%s) resolved manager endpoint: %s",
+                self._service_discovery.get_type(),
+                resolved_url,
+            )
+
+        self.base_url = resolved_url.rstrip('/')
+
         # Leader discovery settings
         self._instance_id = instance_id
-        # Immutable seed address used for all discovery requests.
-        # When auto_discover_leader is enabled, getClusterInfo is always sent to this
-        # address rather than the current base_url, so it should be a stable entry point
-        # (e.g. a load-balancer) that can reach any manager node.
-        self._discovery_url = base_url
+        # Immutable fallback address used when service discovery cannot return a fresh
+        # endpoint. For a direct HTTP URL, this remains the stable discovery seed.
+        self._discovery_url = self.base_url
         self._auto_discover_leader = auto_discover_leader
         self._leader_retry_count = leader_retry_count
         self._leader_retry_base_interval = leader_retry_base_interval_seconds
@@ -54,6 +94,20 @@ class KvCacheManagerClient:
             self._refresh_thread.start()
 
     @staticmethod
+    def _is_http_url(url):
+        return url.startswith(('http://', 'https://'))
+
+    @staticmethod
+    def _endpoint_url(endpoint: ServiceEndpoint):
+        return f"http://{endpoint.host}"
+
+    def _close_service_discovery(self):
+        discovery = self._service_discovery
+        self._service_discovery = None
+        if discovery is not None:
+            discovery.close()
+
+    @staticmethod
     def _get_status_code(response_data):
         """Extract status code from a standard API response."""
         return response_data.get('header', {}).get('status', {}).get('code')
@@ -71,7 +125,7 @@ class KvCacheManagerClient:
 
     def _do_discover_leader(self):
         """Actual discovery logic. Must be called under _leader_lock."""
-        url = self._discovery_url
+        url = self._resolve_discovery_url()
         try:
             try:
                 resp = requests.post(
@@ -114,6 +168,25 @@ class KvCacheManagerClient:
             return True
         finally:
             self._last_discover_time = time.monotonic()
+
+    def _resolve_discovery_url(self):
+        """Resolve a fresh leader-discovery seed, falling back to the initial one."""
+        if self._service_discovery is not None:
+            try:
+                endpoint = self._service_discovery.get_one_endpoint()
+            except Exception as e:
+                logger.warning(
+                    "Failed to refresh manager endpoint through service discovery: %s",
+                    e,
+                )
+            else:
+                if endpoint is not None:
+                    return self._endpoint_url(endpoint)
+                logger.warning(
+                    "Service discovery returned no manager endpoints; using %s",
+                    self._discovery_url,
+                )
+        return self._discovery_url
 
     def _leader_refresh_loop(self):
         """Background daemon: periodically refresh leader address, supports urgent wakeup."""
@@ -242,9 +315,10 @@ class KvCacheManagerClient:
         return self._make_api_request('/api/getClusterInfo', data, check_response)
 
     def close(self):
-        """Close the HTTP session and stop background refresh thread"""
+        """Close the HTTP session, discovery client, and background refresh thread."""
         self._closed.set()
         self._refresh_event.set()
         if self._refresh_thread and self._refresh_thread.is_alive():
             self._refresh_thread.join(timeout=5)
         self.session.close()
+        self._close_service_discovery()

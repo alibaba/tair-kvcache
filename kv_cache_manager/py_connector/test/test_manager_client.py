@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch, PropertyMock
 import requests
 
 from kv_cache_manager.py_connector.common.manager_client import KvCacheManagerClient
+from kv_cache_manager.py_connector.common.service_discovery import ServiceEndpoint
 
 
 def _ok_response_json(data=None):
@@ -51,6 +52,113 @@ def _make_mock_response(json_data, status_code=200):
     mock_resp.status_code = status_code
     mock_resp.json.return_value = json_data
     return mock_resp
+
+
+class TestServiceDiscoveryInit(unittest.TestCase):
+    """Tests for resolving manager service-discovery URLs."""
+
+    def test_static_url_resolves_before_api_request(self):
+        client = KvCacheManagerClient(
+            "static://10.0.0.1:8080,10.0.0.2:9090",
+            auto_discover_leader=False,
+        )
+        try:
+            self.assertEqual(client.base_url, "http://10.0.0.1:8080")
+            self.assertIsNotNone(client._service_discovery)
+
+            client.session.post = MagicMock(
+                return_value=_make_mock_response(_ok_response_json())
+            )
+            client.register_instance({"trace_id": "test"})
+            client.session.post.assert_called_once()
+            self.assertEqual(
+                client.session.post.call_args[0][0],
+                "http://10.0.0.1:8080/api/registerInstance",
+            )
+        finally:
+            client.close()
+
+    @patch(
+        "kv_cache_manager.py_connector.common.manager_client.create_service_discovery"
+    )
+    def test_direct_https_url_bypasses_service_discovery(self, mock_create):
+        client = KvCacheManagerClient("https://manager.example.test:8443/")
+        try:
+            self.assertEqual(client.base_url, "https://manager.example.test:8443")
+            self.assertIsNone(client._service_discovery)
+            mock_create.assert_not_called()
+        finally:
+            client.close()
+
+    @patch(
+        "kv_cache_manager.py_connector.common.manager_client.create_service_discovery"
+    )
+    def test_unavailable_discovery_implementation_fails_fast(self, mock_create):
+        mock_create.return_value = None
+        with self.assertRaisesRegex(ValueError, "failed to create service discovery"):
+            KvCacheManagerClient("custom://manager-service")
+
+    @patch(
+        "kv_cache_manager.py_connector.common.manager_client.create_service_discovery"
+    )
+    def test_empty_discovery_result_fails_fast_and_closes(self, mock_create):
+        discovery = MagicMock()
+        discovery.get_one_endpoint.return_value = None
+        mock_create.return_value = discovery
+
+        with self.assertRaisesRegex(RuntimeError, "returned no manager endpoints"):
+            KvCacheManagerClient("custom://manager-service")
+
+        discovery.close.assert_called_once_with()
+
+    @patch("kv_cache_manager.py_connector.common.manager_client.requests.post")
+    def test_leader_discovery_uses_fresh_service_endpoint(self, mock_post):
+        mock_post.return_value = _make_mock_response(
+            _cluster_info_response("10.0.0.99", 9090)
+        )
+        client = KvCacheManagerClient(
+            "static://10.0.0.1:8080,10.0.0.2:8080",
+            auto_discover_leader=True,
+            discovery_refresh_interval_seconds=60,
+        )
+        try:
+            self.assertEqual(client.base_url, "http://10.0.0.99:9090")
+            self.assertEqual(
+                mock_post.call_args[0][0],
+                "http://10.0.0.2:8080/api/getClusterInfo",
+            )
+
+            mock_post.reset_mock()
+            mock_post.return_value = _make_mock_response(
+                _cluster_info_response("10.0.0.50", 7070)
+            )
+            self.assertTrue(client._discover_leader())
+            self.assertEqual(
+                mock_post.call_args[0][0],
+                "http://10.0.0.1:8080/api/getClusterInfo",
+            )
+            self.assertEqual(client.base_url, "http://10.0.0.50:7070")
+        finally:
+            client.close()
+
+    @patch(
+        "kv_cache_manager.py_connector.common.manager_client.create_service_discovery"
+    )
+    def test_close_releases_service_discovery(self, mock_create):
+        discovery = MagicMock()
+        discovery.get_one_endpoint.return_value = ServiceEndpoint(
+            ip="10.0.0.1",
+            port=8080,
+            host="10.0.0.1:8080",
+        )
+        discovery.get_type.return_value = "Test"
+        mock_create.return_value = discovery
+
+        client = KvCacheManagerClient("custom://manager-service")
+        client.close()
+        client.close()
+
+        discovery.close.assert_called_once_with()
 
 
 class TestLeaderDiscoveryInit(unittest.TestCase):

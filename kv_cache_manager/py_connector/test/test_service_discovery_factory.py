@@ -1,17 +1,55 @@
 # -*- coding: utf-8 -*-
 """Unit tests for service_discovery_factory.create_service_discovery."""
 
+import sys
 import unittest
+from types import ModuleType
 try:
-    from unittest.mock import MagicMock, patch
+    from unittest.mock import patch
 except ImportError:
-    from mock import MagicMock, patch
+    from mock import patch
 
 from kv_cache_manager.py_connector.common.service_discovery_factory import (
     _parse_url,
     _get_int_param,
     create_service_discovery,
 )
+
+
+_SPECTRUM_MODULE = (
+    "stub_source.kv_cache_manager.py_connector.common.spectrum_service_discovery"
+)
+
+
+class _FakeSpectrumServiceDiscovery:
+    """Factory test double that does not depend on an internal implementation."""
+
+    def __init__(
+        self,
+        virtual_service_id,
+        *,
+        cache_ttl=30,
+        refresh_timeout=5,
+        retry_count=0,
+        custom_port=0,
+    ):
+        self.virtual_service_id = virtual_service_id
+        self.cache_ttl = cache_ttl
+        self.refresh_timeout = refresh_timeout
+        self.retry_count = retry_count
+        self.custom_port = custom_port
+
+    def get_type(self):
+        return "Spectrum"
+
+    def close(self):
+        return None
+
+
+def _fake_spectrum_module():
+    module = ModuleType(_SPECTRUM_MODULE)
+    module.SpectrumServiceDiscovery = _FakeSpectrumServiceDiscovery
+    return module
 
 
 class TestParseUrl(unittest.TestCase):
@@ -94,106 +132,42 @@ class TestCreateServiceDiscovery(unittest.TestCase):
         # port 非数字
         self.assertIsNone(create_service_discovery("static://10.0.0.1:abc"))
 
-    @patch(
-        'kv_cache_manager.py_connector.common.spectrum_service_discovery.requests.Session'
-    )
-    def test_spectrum_url_creates_real_instance(self, mock_session_class):
-        mock_session = MagicMock()
-        mock_session_class.return_value = mock_session
+    def test_spectrum_url_passes_config_to_discovery(self):
+        with patch.dict(sys.modules, {_SPECTRUM_MODULE: _fake_spectrum_module()}):
+            discovery = create_service_discovery(
+                "spectrum://v-ad2d143d?cache_time=10&retry_time=2&timeout=3000"
+            )
 
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.json.return_value = {
-            'virtual_service_id': 'v-ad2d143d',
-            'instances': [
-                {'ip': '172.1.2.10', 'port': 8080},
-            ],
-        }
-        mock_session.get.return_value = mock_resp
-
-        discovery = create_service_discovery(
-            "spectrum://v-ad2d143d?cache_time=10&retry_time=2&timeout=3000"
-        )
         self.assertIsNotNone(discovery)
         self.assertEqual(discovery.get_type(), 'Spectrum')
-        # URL 中带的运行时配置应当被注入
+        self.assertEqual(discovery.virtual_service_id, 'v-ad2d143d')
         self.assertEqual(discovery.cache_ttl, 10)
         self.assertEqual(discovery.retry_count, 2)
         self.assertEqual(discovery.refresh_timeout, 3)  # 3000 ms → 3 s
-
-        endpoints = discovery.get_all_endpoints()
-        self.assertEqual(len(endpoints), 1)
-        self.assertEqual(endpoints[0].host, '172.1.2.10:8080')
         discovery.close()
 
     def test_spectrum_empty_vsid_returns_none(self):
         # body 为空时 _parse_url 即拒绝
         self.assertIsNone(create_service_discovery("spectrum://"))
 
-    @patch(
-        'kv_cache_manager.py_connector.common.spectrum_service_discovery.requests.Session'
-    )
-    def test_spectrum_url_with_custom_port_overrides_json(self, mock_session_class):
-        """URL 带 port 时所有 endpoint 端口被覆盖。"""
-        mock_session = MagicMock()
-        mock_session_class.return_value = mock_session
+    def test_spectrum_url_passes_custom_port(self):
+        with patch.dict(sys.modules, {_SPECTRUM_MODULE: _fake_spectrum_module()}):
+            discovery = create_service_discovery(
+                "spectrum://v-port?cache_time=10&retry_time=2&timeout=3000&port=12348"
+            )
 
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.json.return_value = {
-            'virtual_service_id': 'v-port',
-            'instances': [
-                {'ip': '10.0.0.1', 'port': 8080},
-                {'ip': '10.0.0.2', 'port': 8081},
-            ],
-        }
-        mock_session.get.return_value = mock_resp
-
-        discovery = create_service_discovery(
-            "spectrum://v-port?cache_time=10&retry_time=2&timeout=3000&port=12348"
-        )
         self.assertIsNotNone(discovery)
         self.assertEqual(discovery.custom_port, 12348)
-
-        endpoints = discovery.get_all_endpoints()
-        self.assertEqual(len(endpoints), 2)
-        self.assertEqual(endpoints[0].port, 12348)
-        self.assertEqual(endpoints[0].host, '10.0.0.1:12348')
-        self.assertEqual(endpoints[1].port, 12348)
-        self.assertEqual(endpoints[1].host, '10.0.0.2:12348')
         discovery.close()
 
-    @patch(
-        'kv_cache_manager.py_connector.common.spectrum_service_discovery.requests.Session'
-    )
-    def test_spectrum_url_without_port_uses_json(self, mock_session_class):
-        """URL 不带 port 时使用 JSON 中端口（向后兼容）。"""
-        mock_session = MagicMock()
-        mock_session_class.return_value = mock_session
+    def test_spectrum_url_uses_default_port_override(self):
+        with patch.dict(sys.modules, {_SPECTRUM_MODULE: _fake_spectrum_module()}):
+            discovery = create_service_discovery(
+                "spectrum://v-no-port?cache_time=10&retry_time=2&timeout=3000"
+            )
 
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.json.return_value = {
-            'virtual_service_id': 'v-no-port',
-            'instances': [
-                {'ip': '10.0.0.1', 'port': 8080},
-                {'ip': '10.0.0.2', 'port': 9090},
-            ],
-        }
-        mock_session.get.return_value = mock_resp
-
-        discovery = create_service_discovery(
-            "spectrum://v-no-port?cache_time=10&retry_time=2&timeout=3000"
-        )
         self.assertIsNotNone(discovery)
         self.assertEqual(discovery.custom_port, 0)
-
-        endpoints = discovery.get_all_endpoints()
-        self.assertEqual(len(endpoints), 2)
-        self.assertEqual(endpoints[0].port, 8080)
-        self.assertEqual(endpoints[0].host, '10.0.0.1:8080')
-        self.assertEqual(endpoints[1].port, 9090)
-        self.assertEqual(endpoints[1].host, '10.0.0.2:9090')
         discovery.close()
 
 
