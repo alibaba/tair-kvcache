@@ -378,11 +378,12 @@ ErrorCode MigrationManager::Submit(const std::string &trace_id, MigrationRequest
         return prepare_ec;
     }
     ctx.submit_time = std::chrono::steady_clock::now();
-    // F-15: 快照当前 mark 到 ctx，供 OnTaskSuccess 做 match-clear。
+    // F-15/R2-03: 只有指向本次 Copy 目标的 mark 才能绑定到 ctx，供 OnTaskSuccess 做 match-clear。
+    // 其他目标的 mark 表示独立的迁移意图，不能由本次 Copy 消费。
     {
         std::vector<MarkQueryResult> mark_snap;
         BatchGetTieredWriteTargets(request.instance_id, {request.block_key}, mark_snap);
-        if (!mark_snap.empty()) {
+        if (!mark_snap.empty() && mark_snap[0].target == ctx.dst_storage_name) {
             ctx.mark_target = mark_snap[0].target;
             ctx.mark_deadline_ms = mark_snap[0].deadline_ms;
         }
@@ -673,11 +674,11 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
             ctx.retention = req.retention;
             ctx.total_bytes = preps[i].total_bytes;
             ctx.submit_time = std::chrono::steady_clock::now();
-            // F-15: 快照当前 mark 到 ctx，供 OnTaskSuccess 做 match-clear（不清掉后续新 mark）。
+            // F-15/R2-03: 仅绑定与本次 Copy 目标一致的 mark；其他目标的 mark 必须保留。
             {
                 std::vector<MarkQueryResult> mark_snap;
                 BatchGetTieredWriteTargets(req.instance_id, {req.block_key}, mark_snap);
-                if (!mark_snap.empty()) {
+                if (!mark_snap.empty() && mark_snap[0].target == ctx.dst_storage_name) {
                     ctx.mark_target = mark_snap[0].target;
                     ctx.mark_deadline_ms = mark_snap[0].deadline_ms;
                 }

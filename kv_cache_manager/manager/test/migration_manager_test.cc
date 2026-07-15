@@ -175,6 +175,19 @@ public:
         return (it == maps[0].end() || !it->second) ? CLS_NOT_FOUND : it->second->status();
     }
 
+    CacheLocationConstPtr GetLocation(int64_t block_key, const std::string &location_id) {
+        auto rc = std::make_shared<RequestContext>("get_location");
+        MetaSearcher meta_searcher(meta_manager_->GetMetaIndexer(kInstance));
+        std::vector<CacheLocationMap> maps;
+        BlockMask empty_mask;
+        meta_searcher.BatchGetLocation(rc.get(), {block_key}, empty_mask, maps);
+        if (maps.empty()) {
+            return nullptr;
+        }
+        auto it = maps[0].find(location_id);
+        return (it == maps[0].end()) ? nullptr : it->second;
+    }
+
     size_t LocationCount(int64_t block_key) {
         auto rc = std::make_shared<RequestContext>("loc_count");
         MetaSearcher meta_searcher(meta_manager_->GetMetaIndexer(kInstance));
@@ -554,6 +567,40 @@ TEST_F(MigrationManagerTest, TestSubmitThenSuccessDeleteSource) {
     auto stats = mgr.GetStats();
     ASSERT_EQ(1u, stats.copy_submitted);
     ASSERT_EQ(1u, stats.copy_completed);
+}
+
+// R2-03: Copy 只允许消费与自身 destination 一致的 mark。写往 cold_02 的 Copy
+// 即使成功，也不能清掉仍要求写往 cold_01 的独立迁移意图。
+TEST_F(MigrationManagerTest, TestSubmitSuccessDoesNotClearMarkForDifferentTarget) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "mark_mismatch_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "mark_mismatch_cold_01/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_02", GetPrivateTestRuntimeDataPath() + "mark_mismatch_cold_02/"));
+
+    const int64_t block_key = 150;
+    const std::string src_loc = CreateSourceLocation(block_key, "hot_01", true, "data");
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    mgr.DebugEnableCopySubmissionsForTest();
+
+    ASSERT_EQ(ErrorCode::EC_OK, mgr.MarkForTieredWrite(kInstance, {block_key}, "cold_01"));
+    ASSERT_EQ("cold_01", mgr.GetTieredWriteTarget(kInstance, block_key));
+
+    MigrationManager::MigrationRequest req;
+    req.instance_id = kInstance;
+    req.block_key = block_key;
+    req.src_location_id = src_loc;
+    req.src_storage_name = "hot_01";
+    req.dst_storage_name = "cold_02";
+    req.retention = MigrationRetention::MIGRATION_RETENTION_KEEP_BOTH;
+    ASSERT_EQ(ErrorCode::EC_OK, mgr.Submit("mark_target_mismatch", req));
+
+    const std::string dst_loc = mgr.GetActiveTaskDstLocation(kInstance, block_key);
+    ASSERT_FALSE(dst_loc.empty());
+    mgr.OnTaskSuccess(kInstance, block_key);
+
+    ASSERT_EQ(CLS_SERVING, GetLocationStatus(block_key, dst_loc));
+    ASSERT_EQ("cold_01", mgr.GetTieredWriteTarget(kInstance, block_key));
+    ASSERT_EQ(0u, mgr.GetStats().marks_cleared);
 }
 
 TEST_F(MigrationManagerTest, TestSubmitThenSuccessKeepBoth) {
@@ -992,6 +1039,48 @@ TEST_F(MigrationManagerTest, TestBatchSubmit) {
         ASSERT_EQ(ErrorCode::EC_OK, ec);
     }
     ASSERT_EQ(3u, mgr.ActiveTaskCount());
+}
+
+// R2-03: 覆盖带 src_specs 的 BatchSubmit 主路径，确保批量 Copy 到 cold_02
+// 不会消费 block 上仍指向 cold_01 的 mark。
+TEST_F(MigrationManagerTest, TestBatchSubmitSuccessDoesNotClearMarkForDifferentTarget) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "batch_mark_mismatch_hot/"));
+    ASSERT_TRUE(
+        CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "batch_mark_mismatch_cold_01/"));
+    ASSERT_TRUE(
+        CreateDummyStorage("cold_02", GetPrivateTestRuntimeDataPath() + "batch_mark_mismatch_cold_02/"));
+
+    const int64_t block_key = 850;
+    const std::string src_loc = CreateSourceLocation(block_key, "hot_01", true, "batch-data");
+    const auto src_location = GetLocation(block_key, src_loc);
+    ASSERT_NE(nullptr, src_location);
+
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    mgr.DebugEnableCopySubmissionsForTest();
+    ASSERT_EQ(ErrorCode::EC_OK, mgr.MarkForTieredWrite(kInstance, {block_key}, "cold_01"));
+
+    MigrationManager::MigrationRequest req;
+    req.instance_id = kInstance;
+    req.block_key = block_key;
+    req.src_location_id = src_loc;
+    req.src_create_time = src_location->create_time();
+    req.src_storage_name = "hot_01";
+    req.dst_storage_name = "cold_02";
+    req.retention = MigrationRetention::MIGRATION_RETENTION_KEEP_BOTH;
+    req.src_specs = src_location->location_specs(); // 非空：强制走 BatchSubmit 真批量路径。
+
+    auto results = mgr.BatchSubmit("batch_mark_target_mismatch", {req});
+    ASSERT_EQ(1u, results.size());
+    ASSERT_EQ(ErrorCode::EC_OK, results[0]);
+
+    const std::string dst_loc = mgr.GetActiveTaskDstLocation(kInstance, block_key);
+    ASSERT_FALSE(dst_loc.empty());
+    mgr.OnTaskSuccess(kInstance, block_key);
+
+    ASSERT_EQ(CLS_SERVING, GetLocationStatus(block_key, dst_loc));
+    ASSERT_EQ("cold_01", mgr.GetTieredWriteTarget(kInstance, block_key));
+    ASSERT_EQ(0u, mgr.GetStats().marks_cleared);
 }
 
 // F-17: BatchSubmit partial failure — 部分请求有坏 src_location_id，其他成功的仍被跟踪。
