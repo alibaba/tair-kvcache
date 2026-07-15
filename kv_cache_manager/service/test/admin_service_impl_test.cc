@@ -237,6 +237,26 @@ TEST_F(AdminServiceImplTest, TestExplicitBlockKeysCopy) {
     ASSERT_FALSE(cache_manager_->migration_manager()->HasMigrationTask(kInstance, 103));
 }
 
+TEST_F(AdminServiceImplTest, TestExplicitBlockKeysCopyDeduplicatesBeforeConcurrencyAdmission) {
+    SetDefaultCopyConcurrency(2);
+    SeedServingSource(161);
+    SeedServingSource(162);
+    SeedServingSource(163);
+
+    auto rc = std::make_shared<RequestContext>("copy_dedup");
+    auto req = MakeReq(proto::admin::MIGRATION_METHOD_COPY, {161, 161, 162, 163, 162});
+    proto::admin::MigrateCacheResponse resp;
+    admin_->MigrateCache(rc.get(), &req, &resp);
+
+    ASSERT_EQ(proto::admin::OK, resp.header().status().code());
+    ASSERT_EQ(2, resp.accepted());
+    ASSERT_EQ(1, resp.rejected());
+    ASSERT_EQ(2u, cache_manager_->migration_manager()->ActiveTaskCountForGroup("default"));
+    ASSERT_TRUE(cache_manager_->migration_manager()->HasMigrationTask(kInstance, 161));
+    ASSERT_TRUE(cache_manager_->migration_manager()->HasMigrationTask(kInstance, 162));
+    ASSERT_FALSE(cache_manager_->migration_manager()->HasMigrationTask(kInstance, 163));
+}
+
 TEST_F(AdminServiceImplTest, TestAdminCopyRespectsGroupConcurrencyLimit) {
     SetDefaultCopyConcurrency(1);
     SeedServingSource(111);
@@ -389,6 +409,24 @@ TEST_F(AdminServiceImplTest, TestExplicitBlockKeysMark) {
     ASSERT_EQ("cold_01", cache_manager_->migration_manager()->GetTieredWriteTarget(kInstance, 201));
 }
 
+TEST_F(AdminServiceImplTest, TestExplicitBlockKeysMarkCountsUniqueBlocks) {
+    SeedServingSource(211);
+    SeedServingSource(212);
+
+    auto rc = std::make_shared<RequestContext>("mark_dedup");
+    auto req = MakeReq(proto::admin::MIGRATION_METHOD_MARK, {211, 212, 211, 213, 212});
+    proto::admin::MigrateCacheResponse resp;
+    admin_->MigrateCache(rc.get(), &req, &resp);
+
+    ASSERT_EQ(proto::admin::OK, resp.header().status().code());
+    ASSERT_EQ(2, resp.accepted());
+    ASSERT_EQ(1, resp.rejected());
+    ASSERT_TRUE(cache_manager_->migration_manager()->IsMarkedForTieredWrite(kInstance, 211));
+    ASSERT_TRUE(cache_manager_->migration_manager()->IsMarkedForTieredWrite(kInstance, 212));
+    ASSERT_FALSE(cache_manager_->migration_manager()->IsMarkedForTieredWrite(kInstance, 213));
+    ASSERT_EQ(2u, cache_manager_->migration_manager()->GetStats().marks_added);
+}
+
 // F-01: 未配置 migration strategy 的 group，MARK 应被拒绝——避免打标成功但永不被写路径消费的假成功。
 TEST_F(AdminServiceImplTest, TestMarkRejectedWhenNoMigrationStrategy) {
     SetDefaultMigrationStrategy(false); // 清除 strategy
@@ -452,6 +490,30 @@ TEST_F(AdminServiceImplTest, TestExplicitBlockKeysBothPrefersCopy) {
     ASSERT_TRUE(cache_manager_->migration_manager()->HasMigrationTask(kInstance, 252));
     ASSERT_FALSE(cache_manager_->migration_manager()->IsMarkedForTieredWrite(kInstance, 251));
     ASSERT_FALSE(cache_manager_->migration_manager()->IsMarkedForTieredWrite(kInstance, 252));
+}
+
+TEST_F(AdminServiceImplTest, TestExplicitBlockKeysBothProcessesEachBlockOnce) {
+    SetDefaultCopyConcurrency(1);
+    SeedServingSource(261);
+    SeedServingSource(262);
+    SeedServingSource(263);
+
+    auto rc = std::make_shared<RequestContext>("both_dedup");
+    auto req = MakeReq(proto::admin::MIGRATION_METHOD_BOTH, {261, 261, 262, 263, 262});
+    proto::admin::MigrateCacheResponse resp;
+    admin_->MigrateCache(rc.get(), &req, &resp);
+
+    ASSERT_EQ(proto::admin::OK, resp.header().status().code());
+    ASSERT_EQ(3, resp.accepted());
+    ASSERT_EQ(0, resp.rejected());
+    ASSERT_EQ(1u, cache_manager_->migration_manager()->ActiveTaskCountForGroup("default"));
+    ASSERT_TRUE(cache_manager_->migration_manager()->HasMigrationTask(kInstance, 261));
+    ASSERT_FALSE(cache_manager_->migration_manager()->IsMarkedForTieredWrite(kInstance, 261));
+    ASSERT_FALSE(cache_manager_->migration_manager()->HasMigrationTask(kInstance, 262));
+    ASSERT_TRUE(cache_manager_->migration_manager()->IsMarkedForTieredWrite(kInstance, 262));
+    ASSERT_FALSE(cache_manager_->migration_manager()->HasMigrationTask(kInstance, 263));
+    ASSERT_TRUE(cache_manager_->migration_manager()->IsMarkedForTieredWrite(kInstance, 263));
+    ASSERT_EQ(2u, cache_manager_->migration_manager()->GetStats().marks_added);
 }
 
 TEST_F(AdminServiceImplTest, TestRuleSampling) {

@@ -1578,7 +1578,14 @@ MigrationManager::SelectMigrationCandidateKeys(RequestContext *request_context,
                                                const std::shared_ptr<MetaIndexer> &meta_indexer) const {
     std::vector<std::int64_t> candidate_keys;
     if (!explicit_block_keys.empty()) {
-        candidate_keys.assign(explicit_block_keys.begin(), explicit_block_keys.end());
+        candidate_keys.reserve(explicit_block_keys.size());
+        std::unordered_set<int64_t> seen;
+        seen.reserve(explicit_block_keys.size());
+        for (const auto block_key : explicit_block_keys) {
+            if (seen.insert(block_key).second) {
+                candidate_keys.push_back(block_key);
+            }
+        }
         return {EC_OK, std::move(candidate_keys)};
     }
 

@@ -250,6 +250,17 @@ public:
 
 // ============ Mark 路径 ============
 
+TEST_F(MigrationManagerTest, TestSelectExplicitMigrationKeysDeduplicatesInOrder) {
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    RequestContext rc("select_explicit_keys");
+
+    auto [ec, keys] = mgr.SelectMigrationCandidateKeys(
+        &rc, "select_explicit_keys", {11, 12, 11, 13, 12}, 0, /*meta_indexer*/ nullptr);
+
+    ASSERT_EQ(ErrorCode::EC_OK, ec);
+    ASSERT_EQ((std::vector<int64_t>{11, 12, 13}), keys);
+}
+
 TEST_F(MigrationManagerTest, TestMarkLifecycle) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
     ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "ml_hot/"));
