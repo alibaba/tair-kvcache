@@ -373,10 +373,11 @@ ErrorCode MigrationManager::Submit(const std::string &trace_id, MigrationRequest
         return EC_ERROR;
     }
 
-    // 同一 instance 内同一 block 已有活跃任务则拒绝（防重复迁移）。
+    // R2-01: 在任何目标 WRITING location 发布前原子登记 preparing 占位。它同时用于防重复、
+    // copy 并发预算和 Reclaimer 保护，不能退化成先 HasActiveTaskLocked 再延迟插入。
     {
         std::lock_guard<std::mutex> lock(task_mutex_);
-        if (HasActiveTaskLocked(request.instance_id, request.block_key)) {
+        if (!ReservePreparingTaskLocked(request)) {
             KVCM_LOG_INFO("[%s] instance %s block_key %ld already has an active migration task, skip",
                           trace_id.c_str(),
                           request.instance_id.c_str(),
@@ -384,13 +385,35 @@ ErrorCode MigrationManager::Submit(const std::string &trace_id, MigrationRequest
             return EC_EXIST;
         }
     }
+    auto release_preparing = [&]() {
+        std::lock_guard<std::mutex> lock(task_mutex_);
+        RemovePreparingTaskLocked(request.instance_id, request.block_key);
+    };
 
     CopyTaskContext ctx;
     std::vector<DataStorageUri> src_uris;
     std::vector<DataStorageUri> dst_uris;
     ErrorCode prepare_ec = PrepareCopyTask(trace_id, request, ctx, src_uris, dst_uris);
     if (prepare_ec != EC_OK) {
+        // PrepareCopyTask 已回滚其成功分配的 URI；若 BatchAddLocation 部分成功留下 WRITING，
+        // 释放 reservation 后它会成为无 copy 在跑的真实 orphan，由 Reclaimer 安全清理。
+        release_preparing();
         return prepare_ec;
+    }
+
+    // BatchAddLocation 可能在返回前已经对 Reclaimer 可见；此前空 id 的 preparing 按 block 临时保护。
+    // 返回后立即绑定真实 id，缩短对同 block 其他 WRITING location 的宽泛保护时间。
+    bool target_bound = false;
+    {
+        std::lock_guard<std::mutex> lock(task_mutex_);
+        target_bound = UpdatePreparingTaskLocked(ctx);
+    }
+    if (!target_bound) {
+        // Cancel 可能已把 reservation 转成 kPrepareCancelling。先在 reservation 保护下清目标，
+        // 再释放未提交任务，避免 Reclaimer 与本线程同时处理刚发布的 WRITING location。
+        SubmitTargetLocationDelete(ctx);
+        release_preparing();
+        return EC_ERROR;
     }
     ctx.submit_time = std::chrono::steady_clock::now();
     // F-15/R2-03: 只有指向本次 Copy 目标的 mark 才能绑定到 ctx，供 OnTaskSuccess 做 match-clear。
@@ -405,14 +428,17 @@ ErrorCode MigrationManager::Submit(const std::string &trace_id, MigrationRequest
         }
     }
 
-    // 登记活跃任务（用于防重复迁移和 copy 并发预算统计）。
+    // future 对 monitor 可见前，先把完整快照写回并进入可认领的 kRunning。
+    // Cancel 若在 executor Submit 前命中 kRunning，会沿用 F-11 的 deferred-cancel 语义：copy 完成后丢弃目标。
+    bool task_running = false;
     {
         std::lock_guard<std::mutex> lock(task_mutex_);
-        if (!InsertActiveTaskLocked(ctx)) { // 按值收 copy，ctx 后续仍需用于构造 copy_req
-            // 并发竞争：已被其它请求占用，回滚刚建好的目标 location。
-            SubmitTargetLocationDelete(ctx);
-            return EC_EXIST;
-        }
+        task_running = UpdatePreparingTaskLocked(ctx) && MarkTaskRunningLocked(ctx.instance_id, ctx.block_key);
+    }
+    if (!task_running) {
+        SubmitTargetLocationDelete(ctx);
+        release_preparing();
+        return EC_ERROR;
     }
 
     // 提交 copy 任务。
@@ -474,10 +500,28 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
         return results;
     }
 
-    // ---- phase 0: group 级 Copy 硬限流 + per-block dedup + F-12 draining gate ----
-    // copy_submission_mutex_ 覆盖本函数直到 active task 登记完成；所有 Submit/BatchSubmit 也使用同一把锁，
-    // 因此这里的 active 统计和后续登记是原子的，不会被并发 Admin/Reclaimer 穿透。
+    // ---- phase 0: group 级 Copy 硬限流 + per-block dedup + F-12 draining gate + preparing reservation ----
+    // R2-02: 所有 eligible item 必须在任何 batch AddLocation 前进入 active 表。reservation 在本轮仍由
+    // copy_submission_mutex_ 串行保护，并在 task_mutex_ 内原子 check-and-insert；后续 R2-12 再缩慢 I/O 锁域。
     std::vector<bool> eligible(requests.size(), true);
+    std::vector<bool> reservation_active(requests.size(), false);
+    auto release_preparing_at = [&](std::size_t i) {
+        if (i >= requests.size() || !reservation_active[i]) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(task_mutex_);
+        RemovePreparingTaskLocked(requests[i].instance_id, requests[i].block_key);
+        reservation_active[i] = false;
+    };
+    auto release_all_preparing = [&]() {
+        std::lock_guard<std::mutex> lock(task_mutex_);
+        for (std::size_t i = 0; i < requests.size(); ++i) {
+            if (reservation_active[i]) {
+                RemovePreparingTaskLocked(requests[i].instance_id, requests[i].block_key);
+                reservation_active[i] = false;
+            }
+        }
+    };
     {
         std::lock_guard<std::mutex> lock(task_mutex_);
         std::size_t available_group_slots = SIZE_MAX;
@@ -492,22 +536,27 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
                 eligible[i] = false;
                 continue;
             }
-            if (HasActiveTaskLocked(requests[i].instance_id, requests[i].block_key)) {
+            if (copy_limit.enabled() && requests[i].instance_group_name != copy_limit.instance_group_name) {
+                results[i] = EC_BADARGS;
+                eligible[i] = false;
+                continue;
+            }
+            // 原子 reserve 同时挡住并发重复和同一输入 batch 内的重复 block；逐项失败不影响其他 item。
+            if (!ReservePreparingTaskLocked(requests[i])) {
                 results[i] = EC_EXIST;
                 eligible[i] = false;
                 continue;
             }
+            // 在同一个 task_mutex_ 临界区内先 reserve 再检查剩余 slot：这样即使 slot 已满，
+            // 同 block 重复项仍稳定返回 EC_EXIST；非重复项则立即回滚临时 reservation。
+            if (copy_limit.enabled() && available_group_slots == 0) {
+                RemovePreparingTaskLocked(requests[i].instance_id, requests[i].block_key);
+                results[i] = EC_OUT_OF_LIMIT;
+                eligible[i] = false;
+                continue;
+            }
+            reservation_active[i] = true;
             if (copy_limit.enabled()) {
-                if (requests[i].instance_group_name != copy_limit.instance_group_name) {
-                    results[i] = EC_BADARGS;
-                    eligible[i] = false;
-                    continue;
-                }
-                if (available_group_slots == 0) {
-                    results[i] = EC_OUT_OF_LIMIT;
-                    eligible[i] = false;
-                    continue;
-                }
                 --available_group_slots;
             }
         }
@@ -519,11 +568,13 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
     const auto &first_req = requests[0];
     auto indexer = meta_indexer_manager_ ? meta_indexer_manager_->GetMetaIndexer(first_req.instance_id) : nullptr;
     if (!indexer) {
+        release_all_preparing();
         return results;
     }
     auto dst_backend =
         data_storage_manager_ ? data_storage_manager_->GetDataStorageBackend(first_req.dst_storage_name) : nullptr;
     if (!dst_backend) {
+        release_all_preparing();
         return results;
     }
     const DataStorageType dst_type = dst_backend->GetType();
@@ -614,11 +665,18 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
 
     // 回滚 Create 部分失败的 block 的已分配 URI
     for (std::size_t i = 0; i < requests.size(); ++i) {
-        if (!eligible[i] && !preps[i].dst_uris.empty()) {
+        if (eligible[i]) {
+            continue;
+        }
+        if (!preps[i].dst_uris.empty()) {
             data_storage_manager_->Delete(batch_ctx.get(), requests[i].dst_storage_name, preps[i].dst_uris, nullptr);
             preps[i].dst_uris.clear();
             preps[i].src_uris.clear();
             preps[i].dst_specs.clear();
+        }
+        // EC_UNKNOWN 表示稍后仍要走单条 fallback，reservation 必须保留到该路径收敛。
+        if (results[i] != EC_UNKNOWN) {
+            release_preparing_at(i);
         }
     }
 
@@ -637,6 +695,7 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
             }
             eligible[i] = false;
             results[i] = EC_ERROR;
+            release_preparing_at(i);
             continue;
         }
         auto dst_loc = std::make_shared<CacheLocation>();
@@ -650,7 +709,7 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
         add_locations.push_back(std::move(dst_loc));
     }
 
-    // ---- phase 2+3: batch AddLocation + per-block InsertActiveTask + executor Submit ----
+    // ---- phase 2+3: batch AddLocation + bind preparing reservations + executor Submit ----
     if (!add_block_keys.empty()) {
         MetaSearcher meta_searcher(indexer);
         std::vector<std::string> location_ids;
@@ -667,18 +726,34 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
                 eligible[idx] = false;
                 results[idx] = EC_ERROR;
             }
+            // 部分成功但未返回 id 的 WRITING 会在释放后成为真实 orphan；此时没有 copy 被提交。
+            release_all_preparing();
             return results;
         }
 
-        // ---- phase 3: per-block InsertActiveTask + executor Submit ----
+        // ---- phase 3a: 先为整个批次绑定 location_id，再做任何逐项 mark 查询/submit ----
+        // BatchAddLocation 一次公开全部 WRITING；若仍在逐项循环里绑定，后半批会继续暴露宽泛窗口。
+        std::vector<CopyTaskContext> prepared_contexts(requests.size());
+        std::vector<bool> target_bound(requests.size(), false);
+        std::vector<std::size_t> bind_indices;
+        bind_indices.reserve(add_indices.size());
         for (std::size_t k = 0; k < add_indices.size(); ++k) {
             const std::size_t i = add_indices[k];
             if (!eligible[i] || k >= location_ids.size() || location_ids[k].empty()) {
+                // 无法识别目标 location id，不能提交 copy。URI 先 best-effort 删除；若 meta 已部分写入，
+                // reservation 释放后由 Reclaimer 清理残留 WRITING metadata。
+                if (!preps[i].dst_uris.empty()) {
+                    data_storage_manager_->Delete(
+                        batch_ctx.get(), requests[i].dst_storage_name, preps[i].dst_uris, nullptr);
+                    preps[i].dst_uris.clear();
+                }
+                eligible[i] = false;
                 results[i] = EC_ERROR;
+                release_preparing_at(i);
                 continue;
             }
             auto &req = requests[i];
-            CopyTaskContext ctx;
+            CopyTaskContext &ctx = prepared_contexts[i];
             ctx.instance_group_name = req.instance_group_name;
             ctx.instance_id = req.instance_id;
             ctx.block_key = req.block_key;
@@ -689,6 +764,31 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
             ctx.dst_location_id = location_ids[k];
             ctx.retention = req.retention;
             ctx.total_bytes = preps[i].total_bytes;
+            bind_indices.push_back(i);
+        }
+        {
+            std::lock_guard<std::mutex> lock(task_mutex_);
+            for (std::size_t i : bind_indices) {
+                target_bound[i] = UpdatePreparingTaskLocked(prepared_contexts[i]);
+            }
+        }
+        for (std::size_t i : bind_indices) {
+            if (target_bound[i]) {
+                continue;
+            }
+            SubmitTargetLocationDelete(prepared_contexts[i]);
+            release_preparing_at(i);
+            eligible[i] = false;
+            results[i] = EC_ERROR;
+        }
+
+        // ---- phase 3b: 逐项补齐提交快照、转 kRunning、提交 executor ----
+        for (std::size_t i : bind_indices) {
+            if (!eligible[i] || !target_bound[i]) {
+                continue;
+            }
+            auto &req = requests[i];
+            CopyTaskContext &ctx = prepared_contexts[i];
             ctx.submit_time = std::chrono::steady_clock::now();
             // F-15/R2-03: 仅绑定与本次 Copy 目标一致的 mark；其他目标的 mark 必须保留。
             {
@@ -701,13 +801,20 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
                 }
             }
 
+            bool task_running = false;
             {
                 std::lock_guard<std::mutex> lock(task_mutex_);
-                if (!InsertActiveTaskLocked(ctx)) {
-                    SubmitTargetLocationDelete(ctx);
-                    results[i] = EC_EXIST;
-                    continue;
+                task_running = UpdatePreparingTaskLocked(ctx) && MarkTaskRunningLocked(ctx.instance_id, ctx.block_key);
+                if (task_running) {
+                    reservation_active[i] = false; // 已成为正式 active task，不能再由 preparing guard 清理
                 }
+            }
+            if (!task_running) {
+                SubmitTargetLocationDelete(ctx);
+                release_preparing_at(i);
+                eligible[i] = false;
+                results[i] = EC_ERROR;
+                continue;
             }
 
             CacheLocationCopyRequest copy_req;
@@ -753,62 +860,78 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
         if (results[i] != EC_UNKNOWN)
             continue;          // 只处理被标记为需 fallback 的（src_specs 为空）
         results[i] = EC_ERROR; // 重置占位符为默认失败
-        if (!requests[i].instance_id.empty()) {
-            // 未经 batch Create 路径——逐条 PrepareCopyTask + 后续流程（不持 copy_submission_mutex_，
-            // 因为外层 BatchSubmit 已持有，此处是同一线程内的内联处理）。
-            {
-                std::lock_guard<std::mutex> lock(task_mutex_);
-                if (HasActiveTaskLocked(requests[i].instance_id, requests[i].block_key)) {
-                    results[i] = EC_EXIST;
-                    continue;
-                }
-            }
-            CopyTaskContext ctx;
-            std::vector<DataStorageUri> src_uris, dst_uris;
-            if (PrepareCopyTask(trace_id, requests[i], ctx, src_uris, dst_uris) != EC_OK) {
-                continue; // results[i] 保持 EC_ERROR
-            }
-            ctx.submit_time = std::chrono::steady_clock::now();
-            {
-                std::lock_guard<std::mutex> lock(task_mutex_);
-                if (!InsertActiveTaskLocked(ctx)) {
-                    SubmitTargetLocationDelete(ctx);
-                    results[i] = EC_EXIST;
-                    continue;
-                }
-            }
-            CacheLocationCopyRequest copy_req;
-            copy_req.instance_id = ctx.instance_id;
-            copy_req.block_key = ctx.block_key;
-            copy_req.exec_storage_name = ctx.src_storage_name;
-            copy_req.src_uris = std::move(src_uris);
-            copy_req.dst_uris = std::move(dst_uris);
-            std::future<PlanExecuteResult> future = schedule_plan_executor_->Submit(copy_req);
-            if (!future.valid()) {
-                SubmitTargetLocationDelete(ctx);
-                std::lock_guard<std::mutex> lock(task_mutex_);
-                RemoveActiveTaskLocked(ctx.instance_id, ctx.block_key);
-                continue;
-            }
-            {
-                std::lock_guard<std::mutex> lock(pending_mutex_);
-                pending_copies_.push_back(PendingCopy{ctx.instance_id, ctx.block_key, std::move(future)});
-            }
-            pending_cv_.notify_one();
-            stat_copy_submitted_.fetch_add(1, std::memory_order_relaxed);
-            if (metrics_enabled_) {
-                ++m_tasks_submitted_total_;
-            }
-            if (event_manager_ != nullptr) {
-                auto ev = std::make_shared<MigrationSubmittedEvent>(ctx.instance_id);
-                ev->SetEventTriggerTime();
-                ev->SetAdditionalArgs(ctx.block_key, ctx.src_storage_name, ctx.dst_storage_name, trace_id);
-                event_manager_->Publish(ev);
-            }
-            results[i] = EC_OK;
+        if (requests[i].instance_id.empty()) {
+            release_preparing_at(i);
+            continue;
         }
+        // 未经 batch Create 路径——复用 phase 0 已建立的 preparing reservation，逐条 PrepareCopyTask。
+        // 不能再次 Has/Insert，否则会把自己的 reservation 误判为重复任务。
+        CopyTaskContext ctx;
+        std::vector<DataStorageUri> src_uris, dst_uris;
+        if (PrepareCopyTask(trace_id, requests[i], ctx, src_uris, dst_uris) != EC_OK) {
+            release_preparing_at(i);
+            continue; // results[i] 保持 EC_ERROR
+        }
+        bool target_bound = false;
+        {
+            std::lock_guard<std::mutex> lock(task_mutex_);
+            target_bound = UpdatePreparingTaskLocked(ctx);
+        }
+        if (!target_bound) {
+            SubmitTargetLocationDelete(ctx);
+            release_preparing_at(i);
+            continue;
+        }
+
+        ctx.submit_time = std::chrono::steady_clock::now();
+        bool task_running = false;
+        {
+            std::lock_guard<std::mutex> lock(task_mutex_);
+            task_running = UpdatePreparingTaskLocked(ctx) && MarkTaskRunningLocked(ctx.instance_id, ctx.block_key);
+            if (task_running) {
+                reservation_active[i] = false;
+            }
+        }
+        if (!task_running) {
+            SubmitTargetLocationDelete(ctx);
+            release_preparing_at(i);
+            continue;
+        }
+
+        CacheLocationCopyRequest copy_req;
+        copy_req.instance_id = ctx.instance_id;
+        copy_req.block_key = ctx.block_key;
+        copy_req.exec_storage_name = ctx.src_storage_name;
+        copy_req.src_uris = std::move(src_uris);
+        copy_req.dst_uris = std::move(dst_uris);
+        std::future<PlanExecuteResult> future = schedule_plan_executor_->Submit(copy_req);
+        if (!future.valid()) {
+            SubmitTargetLocationDelete(ctx);
+            std::lock_guard<std::mutex> lock(task_mutex_);
+            RemoveActiveTaskLocked(ctx.instance_id, ctx.block_key);
+            continue;
+        }
+        {
+            std::lock_guard<std::mutex> lock(pending_mutex_);
+            pending_copies_.push_back(PendingCopy{ctx.instance_id, ctx.block_key, std::move(future)});
+        }
+        pending_cv_.notify_one();
+        stat_copy_submitted_.fetch_add(1, std::memory_order_relaxed);
+        if (metrics_enabled_) {
+            ++m_tasks_submitted_total_;
+        }
+        if (event_manager_ != nullptr) {
+            auto ev = std::make_shared<MigrationSubmittedEvent>(ctx.instance_id);
+            ev->SetEventTriggerTime();
+            ev->SetAdditionalArgs(ctx.block_key, ctx.src_storage_name, ctx.dst_storage_name, trace_id);
+            event_manager_->Publish(ev);
+        }
+        results[i] = EC_OK;
     }
 
+    // 防御性收口：正常路径此时只剩已转 kRunning 的 task（reservation_active=false）。任何遗漏的
+    // preparing item 都不应泄漏到函数返回之后。
+    release_all_preparing();
     return results;
 }
 
@@ -872,6 +995,12 @@ void MigrationManager::OnTaskSuccess(const std::string &instance_id, int64_t blo
     }
     if (claim == ClaimResult::kNotFound || claim == ClaimResult::kBusyCompleting) {
         return; // 已处理过 / 完成认领中
+    }
+    if (claim == ClaimResult::kBusyPreparing) {
+        KVCM_LOG_WARN("ignore premature migration success callback for preparing task: instance %s block_key %ld",
+                      instance_id.c_str(),
+                      block_key);
+        return;
     }
     if (claim == ClaimResult::kWasCancelling) {
         // F-11: 用户已取消。copy 虽成功也丢弃：不 promote、不删源，删掉仍为 WRITING 的目标半成品。
@@ -957,6 +1086,12 @@ void MigrationManager::OnTaskFailed(const std::string &instance_id, int64_t bloc
         claim = ClaimForCompletionLocked(instance_id, block_key, ctx);
     }
     if (claim == ClaimResult::kNotFound || claim == ClaimResult::kBusyCompleting) {
+        return;
+    }
+    if (claim == ClaimResult::kBusyPreparing) {
+        KVCM_LOG_WARN("ignore premature migration failure callback for preparing task: instance %s block_key %ld",
+                      instance_id.c_str(),
+                      block_key);
         return;
     }
     if (claim == ClaimResult::kWasCancelling) {
@@ -1397,11 +1532,9 @@ void MigrationManager::CompleteCancelledTask(const CopyTaskContext &ctx) {
 }
 
 ErrorCode MigrationManager::Cancel(const std::string &instance_id, int64_t block_key) {
-    // F-11: 仅标记 cancelling，不立即删目标 / 不移除任务。收尾推迟到 copy future 完成时由 monitor
-    // 经 OnTaskSuccess/OnTaskFailed 认领到 kWasCancelling 后调 CompleteCancelledTask 执行——
-    // 规避 cancel 与 promote 并发误删刚提升的目标，且无需 backend cancel token（copy 跑完再清）。
-    // cancelling 期间任务仍在活跃表：HasActiveTaskLocked 挡重复 Submit，HasActiveCopyTargetLocation
-    // 继续保护该 WRITING 目标不被 reclaimer 提前回收（避免双清理）。
+    // F-11/R2-01: preparing 取消只标记 kPrepareCancelling，由仍在同步 I/O 中的提交线程在下一安全
+    // 边界停止进入 copy、清目标并释放 reservation；running 取消仍等待 future 完成后由 monitor 收尾。
+    // 两种 cancelling 期间任务都保留在活跃表，继续挡重复 Submit 并保护 WRITING 目标。
     CancelResult result;
     {
         std::lock_guard<std::mutex> lock(task_mutex_);
@@ -1410,6 +1543,11 @@ ErrorCode MigrationManager::Cancel(const std::string &instance_id, int64_t block
     switch (result) {
     case CancelResult::kNotFound:
         return EC_NOENT;
+    case CancelResult::kMarkedPreparing:
+        KVCM_LOG_INFO("[cancel] instance %s block_key %ld cancelled while preparing; submitter will clean up",
+                      instance_id.c_str(),
+                      block_key);
+        return EC_OK;
     case CancelResult::kBusyCompleting:
         KVCM_LOG_INFO(
             "[cancel] instance %s block_key %ld already completing, cancel too late", instance_id.c_str(), block_key);
@@ -1447,6 +1585,61 @@ bool MigrationManager::InsertActiveTaskLocked(CopyTaskContext ctx) {
     return true;
 }
 
+bool MigrationManager::ReservePreparingTaskLocked(const MigrationRequest &request) {
+    CopyTaskContext ctx;
+    ctx.instance_group_name = request.instance_group_name;
+    ctx.instance_id = request.instance_id;
+    ctx.block_key = request.block_key;
+    ctx.src_location_id = request.src_location_id;
+    ctx.src_create_time = request.src_create_time;
+    ctx.src_storage_name = request.src_storage_name;
+    ctx.dst_storage_name = request.dst_storage_name;
+    ctx.retention = request.retention;
+    ctx.state = CopyTaskState::kPreparing;
+    // InsertActiveTaskLocked 在同一个 task_mutex_ 临界区内完成存在性检查与插入，避免 check-then-insert 窗口。
+    return InsertActiveTaskLocked(std::move(ctx));
+}
+
+bool MigrationManager::UpdatePreparingTaskLocked(const CopyTaskContext &ctx) {
+    auto instance_iter = active_tasks_by_instance_.find(ctx.instance_id);
+    if (instance_iter == active_tasks_by_instance_.end()) {
+        return false;
+    }
+    auto task_iter = instance_iter->second.find(ctx.block_key);
+    if (task_iter == instance_iter->second.end() || task_iter->second.state != CopyTaskState::kPreparing) {
+        return false;
+    }
+    task_iter->second = ctx;
+    task_iter->second.state = CopyTaskState::kPreparing;
+    return true;
+}
+
+bool MigrationManager::MarkTaskRunningLocked(const std::string &instance_id, int64_t block_key) {
+    auto instance_iter = active_tasks_by_instance_.find(instance_id);
+    if (instance_iter == active_tasks_by_instance_.end()) {
+        return false;
+    }
+    auto task_iter = instance_iter->second.find(block_key);
+    if (task_iter == instance_iter->second.end() || task_iter->second.state != CopyTaskState::kPreparing) {
+        return false;
+    }
+    task_iter->second.state = CopyTaskState::kRunning;
+    return true;
+}
+
+bool MigrationManager::RemovePreparingTaskLocked(const std::string &instance_id, int64_t block_key) {
+    auto instance_iter = active_tasks_by_instance_.find(instance_id);
+    if (instance_iter == active_tasks_by_instance_.end()) {
+        return false;
+    }
+    auto task_iter = instance_iter->second.find(block_key);
+    if (task_iter == instance_iter->second.end() || (task_iter->second.state != CopyTaskState::kPreparing &&
+                                                     task_iter->second.state != CopyTaskState::kPrepareCancelling)) {
+        return false;
+    }
+    return RemoveActiveTaskLocked(instance_id, block_key);
+}
+
 bool MigrationManager::RemoveActiveTaskLocked(const std::string &instance_id, int64_t block_key) {
     auto instance_iter = active_tasks_by_instance_.find(instance_id);
     if (instance_iter == active_tasks_by_instance_.end()) {
@@ -1480,6 +1673,9 @@ MigrationManager::ClaimResult MigrationManager::ClaimForCompletionLocked(const s
         return ClaimResult::kNotFound;
     }
     CopyTaskContext &task = task_iter->second;
+    if (task.state == CopyTaskState::kPreparing || task.state == CopyTaskState::kPrepareCancelling) {
+        return ClaimResult::kBusyPreparing;
+    }
     if (task.state == CopyTaskState::kCancelling) {
         out_ctx = task; // 交由 CompleteCancelledTask 收尾（删 WRITING 目标、不 promote）
         return ClaimResult::kWasCancelling;
@@ -1503,10 +1699,14 @@ MigrationManager::CancelResult MigrationManager::MarkCancellingLocked(const std:
         return CancelResult::kNotFound;
     }
     CopyTaskContext &task = task_iter->second;
+    if (task.state == CopyTaskState::kPreparing) {
+        task.state = CopyTaskState::kPrepareCancelling;
+        return CancelResult::kMarkedPreparing;
+    }
     if (task.state == CopyTaskState::kCompleting) {
         return CancelResult::kBusyCompleting; // 完成中，取消太晚
     }
-    if (task.state == CopyTaskState::kCancelling) {
+    if (task.state == CopyTaskState::kPrepareCancelling || task.state == CopyTaskState::kCancelling) {
         return CancelResult::kAlreadyCancelling; // 幂等
     }
     task.state = CopyTaskState::kCancelling; // 标记；收尾推迟到 future 完成时由 monitor 执行
@@ -1532,7 +1732,17 @@ bool MigrationManager::HasActiveCopyTargetLocation(const std::string &instance_i
         return false;
     }
     auto task_iter = instance_iter->second.find(block_key);
-    return task_iter != instance_iter->second.end() && task_iter->second.dst_location_id == location_id;
+    if (task_iter == instance_iter->second.end()) {
+        return false;
+    }
+    const CopyTaskContext &task = task_iter->second;
+    // R2-01/R2-02: BatchAddLocation 可能已经提交、但 location_id 尚未返回给提交线程。
+    // 此时按 (instance, block) 临时保护所有 WRITING location；id 一旦绑定即恢复精确匹配。
+    if ((task.state == CopyTaskState::kPreparing || task.state == CopyTaskState::kPrepareCancelling) &&
+        task.dst_location_id.empty()) {
+        return true;
+    }
+    return task.dst_location_id == location_id;
 }
 
 size_t MigrationManager::ActiveTaskCountUnsafe() const {

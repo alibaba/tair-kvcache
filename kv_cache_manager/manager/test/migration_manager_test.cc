@@ -91,6 +91,71 @@ MetaIndexer::Result GetProperties_stub(void * /*obj*/,
 }
 } // namespace r2_04_mark_query_stub
 
+namespace r2_reservation_stub {
+MigrationManager *g_manager = nullptr;
+std::vector<std::pair<std::string, int64_t>> g_expected_reservations;
+bool g_all_reserved_before_create = true;
+bool g_all_block_scoped_targets_protected = true;
+bool g_cancel_first_reservation_on_create = false;
+std::optional<ErrorCode> g_cancel_result;
+int g_create_calls = 0;
+
+void Reset() {
+    g_manager = nullptr;
+    g_expected_reservations.clear();
+    g_all_reserved_before_create = true;
+    g_all_block_scoped_targets_protected = true;
+    g_cancel_first_reservation_on_create = false;
+    g_cancel_result.reset();
+    g_create_calls = 0;
+}
+
+std::vector<std::pair<ErrorCode, DataStorageUri>> Create_stub(void * /*obj*/,
+                                                              RequestContext * /*rc*/,
+                                                              const std::string & /*name*/,
+                                                              const std::vector<std::string> &keys,
+                                                              size_t size,
+                                                              std::function<void()> /*cb*/) {
+    ++g_create_calls;
+    for (const auto &[instance_id, block_key] : g_expected_reservations) {
+        g_all_reserved_before_create =
+            g_all_reserved_before_create && g_manager != nullptr && g_manager->HasMigrationTask(instance_id, block_key);
+        // Create 发生在 BatchAddLocation 之前，此时 reservation 还没有 id；任意非空候选 id 都应受
+        // (instance, block) 临时保护，否则 publish->bind 窗口仍会被 Reclaimer 穿透。
+        g_all_block_scoped_targets_protected =
+            g_all_block_scoped_targets_protected && g_manager != nullptr &&
+            g_manager->HasActiveCopyTargetLocation(instance_id, block_key, "future_location_probe");
+    }
+    if (g_cancel_first_reservation_on_create && g_create_calls == 1 && g_manager != nullptr &&
+        !g_expected_reservations.empty()) {
+        const auto &[instance_id, block_key] = g_expected_reservations.front();
+        g_cancel_result = g_manager->Cancel(instance_id, block_key);
+    }
+
+    std::vector<std::pair<ErrorCode, DataStorageUri>> results;
+    results.reserve(keys.size());
+    for (const auto &key : keys) {
+        results.emplace_back(EC_OK, DataStorageUri("dummy://cold_01/" + key + "?size=" + std::to_string(size)));
+    }
+    return results;
+}
+
+MetaIndexer::Result ReadModifyWriteBlockFail_stub(void * /*obj*/,
+                                                  RequestContext * /*rc*/,
+                                                  const KeyVector &keys,
+                                                  const BlockIdsOnlyModifierFunc & /*modifier*/) noexcept {
+    MetaIndexer::Result result(EC_ERROR);
+    result.error_codes.assign(keys.size(), EC_ERROR);
+    return result;
+}
+
+using CopySubmitLocation = std::future<PlanExecuteResult> (SchedulePlanExecutor::*)(const CacheLocationCopyRequest &);
+
+std::future<PlanExecuteResult> CopySubmitInvalid_stub(void * /*obj*/, const CacheLocationCopyRequest & /*request*/) {
+    return {};
+}
+} // namespace r2_reservation_stub
+
 class CaptureEventPublisher : public EventPublisher {
 public:
     bool Init(const std::string & /*config*/) override { return true; }
@@ -692,6 +757,8 @@ TEST_F(MigrationManagerTest, TestSubmitNonExistInstance) {
     req.src_storage_name = "hot_01";
     req.dst_storage_name = "cold_01";
     ASSERT_EQ(ErrorCode::EC_INSTANCE_NOT_EXIST, mgr.Submit("t", req));
+    ASSERT_FALSE(mgr.HasMigrationTask(req.instance_id, req.block_key));
+    ASSERT_EQ(0u, mgr.ActiveTaskCount());
 }
 
 TEST_F(MigrationManagerTest, TestSubmitBadArgs) {
@@ -703,6 +770,8 @@ TEST_F(MigrationManagerTest, TestSubmitBadArgs) {
     req.block_key = 1;
     // 缺 src_location_id / storages
     ASSERT_EQ(ErrorCode::EC_BADARGS, mgr.Submit("t", req));
+    ASSERT_FALSE(mgr.HasMigrationTask(req.instance_id, req.block_key));
+    ASSERT_EQ(0u, mgr.ActiveTaskCount());
 }
 
 TEST_F(MigrationManagerTest, TestSubmitSourceNotFound) {
@@ -718,6 +787,8 @@ TEST_F(MigrationManagerTest, TestSubmitSourceNotFound) {
     req.src_storage_name = "hot_01";
     req.dst_storage_name = "cold_01";
     ASSERT_EQ(ErrorCode::EC_NOENT, mgr.Submit("t", req));
+    ASSERT_FALSE(mgr.HasMigrationTask(req.instance_id, req.block_key));
+    ASSERT_EQ(0u, mgr.ActiveTaskCount());
 }
 
 TEST_F(MigrationManagerTest, TestSubmitRejectedBeforeStart) {
@@ -1221,6 +1292,172 @@ TEST_F(MigrationManagerTest, TestEndToEndCopySourceMissing) {
 
 // ============ 重复提交 ============
 
+// R2-01/R2-02: preparing 与现有 active task 共用一张表，并显式覆盖去重、Reclaimer、
+// completion/cancel 以及 preparing->running 的状态转换。
+TEST_F(MigrationManagerTest, TestPreparingReservationStateMachine) {
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    MigrationManager::MigrationRequest req;
+    req.instance_group_name = "group_a";
+    req.instance_id = kInstance;
+    req.block_key = 680;
+    req.src_location_id = "src_680";
+    req.src_storage_name = "hot_01";
+    req.dst_storage_name = "cold_01";
+
+    {
+        std::lock_guard<std::mutex> lock(mgr.task_mutex_);
+        ASSERT_TRUE(mgr.ReservePreparingTaskLocked(req));
+        ASSERT_FALSE(mgr.ReservePreparingTaskLocked(req)) << "reserve must atomically reject duplicates";
+    }
+    ASSERT_TRUE(mgr.HasMigrationTask(kInstance, req.block_key));
+    ASSERT_EQ(1u, mgr.ActiveTaskCount());
+    ASSERT_EQ(1u, mgr.ActiveTaskCountForGroup("group_a"));
+    ASSERT_TRUE(mgr.HasActiveCopyTargetLocation(kInstance, req.block_key, "not_bound_yet"));
+
+    // premature completion 不能认领未提交任务；Cancel 只转取消态，由 Prepare 所有者安全清理。
+    mgr.OnTaskSuccess(kInstance, req.block_key);
+    mgr.OnTaskFailed(kInstance, req.block_key, EC_ERROR);
+    ASSERT_EQ(EC_OK, mgr.Cancel(kInstance, req.block_key));
+    ASSERT_EQ(EC_OK, mgr.Cancel(kInstance, req.block_key)) << "preparing cancel must be idempotent";
+    ASSERT_TRUE(mgr.HasMigrationTask(kInstance, req.block_key));
+    ASSERT_TRUE(mgr.HasActiveCopyTargetLocation(kInstance, req.block_key, "not_bound_yet"));
+    {
+        std::lock_guard<std::mutex> lock(mgr.task_mutex_);
+        ASSERT_EQ(MigrationManager::CopyTaskState::kPrepareCancelling,
+                  mgr.active_tasks_by_instance_[kInstance][req.block_key].state);
+        MigrationManager::CopyTaskContext ignored;
+        ignored.instance_id = req.instance_id;
+        ignored.block_key = req.block_key;
+        ASSERT_FALSE(mgr.UpdatePreparingTaskLocked(ignored)) << "cancelled prepare must not be overwritten";
+        ASSERT_FALSE(mgr.MarkTaskRunningLocked(kInstance, req.block_key));
+        ASSERT_TRUE(mgr.RemovePreparingTaskLocked(kInstance, req.block_key));
+    }
+    ASSERT_FALSE(mgr.HasMigrationTask(kInstance, req.block_key));
+
+    MigrationManager::CopyTaskContext prepared;
+    prepared.instance_group_name = req.instance_group_name;
+    prepared.instance_id = req.instance_id;
+    prepared.block_key = req.block_key;
+    prepared.src_location_id = req.src_location_id;
+    prepared.src_storage_name = req.src_storage_name;
+    prepared.dst_storage_name = req.dst_storage_name;
+    prepared.dst_location_id = "dst_680";
+    {
+        std::lock_guard<std::mutex> lock(mgr.task_mutex_);
+        ASSERT_TRUE(mgr.ReservePreparingTaskLocked(req));
+        ASSERT_TRUE(mgr.UpdatePreparingTaskLocked(prepared));
+    }
+    ASSERT_TRUE(mgr.HasActiveCopyTargetLocation(kInstance, req.block_key, "dst_680"));
+    ASSERT_FALSE(mgr.HasActiveCopyTargetLocation(kInstance, req.block_key, "other_dst"));
+
+    {
+        std::lock_guard<std::mutex> lock(mgr.task_mutex_);
+        ASSERT_TRUE(mgr.MarkTaskRunningLocked(kInstance, req.block_key));
+        ASSERT_FALSE(mgr.MarkTaskRunningLocked(kInstance, req.block_key));
+    }
+    ASSERT_EQ(EC_OK, mgr.Cancel(kInstance, req.block_key));
+    {
+        std::lock_guard<std::mutex> lock(mgr.task_mutex_);
+        ASSERT_EQ(MigrationManager::CopyTaskState::kCancelling,
+                  mgr.active_tasks_by_instance_[kInstance][req.block_key].state);
+        ASSERT_TRUE(mgr.RemoveActiveTaskLocked(kInstance, req.block_key));
+    }
+    ASSERT_EQ(0u, mgr.ActiveTaskCount());
+}
+
+// R2-01: 单条 Submit 在第一次目标 Create 前就必须让 preparing 对 active-target 查询可见。
+TEST_F(MigrationManagerTest, TestSubmitReservesPreparingBeforeCreate) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "reserve_single_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "reserve_single_cold/"));
+
+    const int64_t block_key = 681;
+    const std::string src_loc = CreateSourceLocation(block_key, "hot_01", true, "single-reserve");
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    mgr.DebugEnableCopySubmissionsForTest();
+
+    r2_reservation_stub::Reset();
+    r2_reservation_stub::g_manager = &mgr;
+    r2_reservation_stub::g_expected_reservations = {{kInstance, block_key}};
+    Stub stub;
+    stub.set(ADDR(DataStorageManager, Create), r2_reservation_stub::Create_stub);
+
+    MigrationManager::MigrationRequest req;
+    req.instance_id = kInstance;
+    req.block_key = block_key;
+    req.src_location_id = src_loc;
+    req.src_storage_name = "hot_01";
+    req.dst_storage_name = "cold_01";
+    ASSERT_EQ(EC_OK, mgr.Submit("r2_01_reserve", req));
+
+    ASSERT_GT(r2_reservation_stub::g_create_calls, 0);
+    ASSERT_TRUE(r2_reservation_stub::g_all_reserved_before_create);
+    ASSERT_TRUE(r2_reservation_stub::g_all_block_scoped_targets_protected);
+    const std::string dst_loc = mgr.GetActiveTaskDstLocation(kInstance, block_key);
+    ASSERT_FALSE(dst_loc.empty());
+    ASSERT_TRUE(mgr.HasActiveCopyTargetLocation(kInstance, block_key, dst_loc));
+    ASSERT_FALSE(mgr.HasActiveCopyTargetLocation(kInstance, block_key, "future_location_probe"));
+}
+
+// R2-01: Cancel 与同步 Prepare I/O 并发时只标记 reservation；提交线程返回后必须清目标、释放
+// reservation，且绝不能把取消态覆盖成 kRunning 或向 executor 提交 copy。
+TEST_F(MigrationManagerTest, TestSubmitCancelDuringPrepareStopsBeforeCopy) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "reserve_cancel_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "reserve_cancel_cold/"));
+
+    const int64_t block_key = 683;
+    const std::string src_loc = CreateSourceLocation(block_key, "hot_01", true, "cancel-during-prepare");
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    mgr.DebugEnableCopySubmissionsForTest();
+
+    r2_reservation_stub::Reset();
+    r2_reservation_stub::g_manager = &mgr;
+    r2_reservation_stub::g_expected_reservations = {{kInstance, block_key}};
+    r2_reservation_stub::g_cancel_first_reservation_on_create = true;
+    Stub stub;
+    stub.set(ADDR(DataStorageManager, Create), r2_reservation_stub::Create_stub);
+
+    MigrationManager::MigrationRequest req;
+    req.instance_id = kInstance;
+    req.block_key = block_key;
+    req.src_location_id = src_loc;
+    req.src_storage_name = "hot_01";
+    req.dst_storage_name = "cold_01";
+    ASSERT_EQ(EC_ERROR, mgr.Submit("r2_01_cancel_prepare", req));
+    ASSERT_EQ(std::optional<ErrorCode>(EC_OK), r2_reservation_stub::g_cancel_result);
+    ASSERT_EQ(0u, mgr.GetStats().copy_submitted);
+    ASSERT_FALSE(mgr.HasMigrationTask(kInstance, block_key));
+    ASSERT_EQ(0u, mgr.ActiveTaskCount());
+    ASSERT_TRUE(WaitFor([&]() { return LocationCount(block_key) == 1u; }));
+}
+
+// executor 接收失败发生在 kPreparing->kRunning 之后；失败路径仍须删除目标并移除 active entry。
+TEST_F(MigrationManagerTest, TestSubmitExecutorFailureReleasesActiveTask) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "reserve_exec_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "reserve_exec_cold/"));
+
+    const int64_t block_key = 682;
+    const std::string src_loc = CreateSourceLocation(block_key, "hot_01", true, "executor-failure");
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    mgr.DebugEnableCopySubmissionsForTest();
+    Stub stub;
+    stub.set(static_cast<r2_reservation_stub::CopySubmitLocation>(ADDR(SchedulePlanExecutor, Submit)),
+             r2_reservation_stub::CopySubmitInvalid_stub);
+
+    MigrationManager::MigrationRequest req;
+    req.instance_id = kInstance;
+    req.block_key = block_key;
+    req.src_location_id = src_loc;
+    req.src_storage_name = "hot_01";
+    req.dst_storage_name = "cold_01";
+    ASSERT_EQ(EC_ERROR, mgr.Submit("r2_01_submit_fail", req));
+    ASSERT_FALSE(mgr.HasMigrationTask(kInstance, block_key));
+    ASSERT_EQ(0u, mgr.ActiveTaskCount());
+    ASSERT_TRUE(WaitFor([&]() { return LocationCount(block_key) == 1u; }));
+}
+
 TEST_F(MigrationManagerTest, TestSubmitDuplicate) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
     ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "dup_hot/"));
@@ -1266,6 +1503,131 @@ TEST_F(MigrationManagerTest, TestBatchSubmit) {
         ASSERT_EQ(ErrorCode::EC_OK, ec);
     }
     ASSERT_EQ(3u, mgr.ActiveTaskCount());
+}
+
+// R2-02: 真批量路径必须在第一次 batch Create 前 reserve 所有 eligible block；批内重复逐项失败，
+// 不能中止其他项，也不能多占一个并发 slot。
+TEST_F(MigrationManagerTest, TestBatchReservesAllBeforeCreateAndDeduplicates) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "reserve_batch_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "reserve_batch_cold/"));
+
+    auto make_prepared_req = [&](int64_t block_key) {
+        const std::string src_loc = CreateSourceLocation(block_key, "hot_01", true, "batch-reserve");
+        const auto src = GetLocation(block_key, src_loc);
+        EXPECT_NE(nullptr, src);
+        MigrationManager::MigrationRequest req;
+        req.instance_group_name = "group_a";
+        req.instance_id = kInstance;
+        req.block_key = block_key;
+        req.src_location_id = src_loc;
+        req.src_create_time = src == nullptr ? 0 : src->create_time();
+        req.src_storage_name = "hot_01";
+        req.dst_storage_name = "cold_01";
+        if (src != nullptr) {
+            req.src_specs = src->location_specs();
+        }
+        return req;
+    };
+
+    auto first = make_prepared_req(810);
+    auto duplicate = first;
+    auto second = make_prepared_req(811);
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    mgr.DebugEnableCopySubmissionsForTest();
+
+    r2_reservation_stub::Reset();
+    r2_reservation_stub::g_manager = &mgr;
+    r2_reservation_stub::g_expected_reservations = {{kInstance, 810}, {kInstance, 811}};
+    Stub stub;
+    stub.set(ADDR(DataStorageManager, Create), r2_reservation_stub::Create_stub);
+
+    auto results = mgr.BatchSubmit(
+        "r2_02_reserve", {first, duplicate, second}, MigrationManager::CopyConcurrencyLimit{"group_a", 2});
+    ASSERT_EQ(3u, results.size());
+    ASSERT_EQ(EC_OK, results[0]);
+    ASSERT_EQ(EC_EXIST, results[1]);
+    ASSERT_EQ(EC_OK, results[2]);
+    ASSERT_GT(r2_reservation_stub::g_create_calls, 0);
+    ASSERT_TRUE(r2_reservation_stub::g_all_reserved_before_create);
+    ASSERT_TRUE(r2_reservation_stub::g_all_block_scoped_targets_protected);
+    ASSERT_EQ(2u, mgr.ActiveTaskCount());
+    ASSERT_TRUE(mgr.HasMigrationTask(kInstance, 810));
+    ASSERT_TRUE(mgr.HasMigrationTask(kInstance, 811));
+    ASSERT_FALSE(mgr.GetActiveTaskDstLocation(kInstance, 810).empty());
+    ASSERT_FALSE(mgr.GetActiveTaskDstLocation(kInstance, 811).empty());
+}
+
+// R2-02: batch AddLocation 失败时，所有尚未运行的 reservation 必须释放；此后即使 meta 曾部分
+// 成功，残留 WRITING 也只是无 copy 在跑的真正 orphan。
+TEST_F(MigrationManagerTest, TestBatchAddLocationFailureReleasesPreparingReservations) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "reserve_add_fail_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "reserve_add_fail_cold/"));
+
+    const int64_t block_key = 812;
+    const std::string src_loc = CreateSourceLocation(block_key, "hot_01", true, "add-failure");
+    const auto src = GetLocation(block_key, src_loc);
+    ASSERT_NE(nullptr, src);
+    MigrationManager::MigrationRequest req;
+    req.instance_group_name = "group_a";
+    req.instance_id = kInstance;
+    req.block_key = block_key;
+    req.src_location_id = src_loc;
+    req.src_create_time = src->create_time();
+    req.src_storage_name = "hot_01";
+    req.dst_storage_name = "cold_01";
+    req.src_specs = src->location_specs();
+
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    mgr.DebugEnableCopySubmissionsForTest();
+    Stub stub;
+    stub.set(ADDR(MetaIndexer, ReadModifyWriteBlock), r2_reservation_stub::ReadModifyWriteBlockFail_stub);
+
+    const auto results = mgr.BatchSubmit("r2_02_add_fail", {req});
+    ASSERT_EQ(1u, results.size());
+    ASSERT_NE(EC_OK, results[0]);
+    ASSERT_FALSE(mgr.HasMigrationTask(kInstance, block_key));
+    ASSERT_EQ(0u, mgr.ActiveTaskCount());
+    ASSERT_EQ(1u, LocationCount(block_key));
+}
+
+// R2-02: 真批量路径在 Create 阶段收到取消后，同样不能覆盖取消态或提交 copy。
+TEST_F(MigrationManagerTest, TestBatchCancelDuringPrepareStopsBeforeCopy) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "reserve_batch_cancel_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "reserve_batch_cancel_cold/"));
+
+    const int64_t block_key = 813;
+    const std::string src_loc = CreateSourceLocation(block_key, "hot_01", true, "batch-cancel-prepare");
+    const auto src = GetLocation(block_key, src_loc);
+    ASSERT_NE(nullptr, src);
+    MigrationManager::MigrationRequest req;
+    req.instance_group_name = "group_a";
+    req.instance_id = kInstance;
+    req.block_key = block_key;
+    req.src_location_id = src_loc;
+    req.src_create_time = src->create_time();
+    req.src_storage_name = "hot_01";
+    req.dst_storage_name = "cold_01";
+    req.src_specs = src->location_specs();
+
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    mgr.DebugEnableCopySubmissionsForTest();
+    r2_reservation_stub::Reset();
+    r2_reservation_stub::g_manager = &mgr;
+    r2_reservation_stub::g_expected_reservations = {{kInstance, block_key}};
+    r2_reservation_stub::g_cancel_first_reservation_on_create = true;
+    Stub stub;
+    stub.set(ADDR(DataStorageManager, Create), r2_reservation_stub::Create_stub);
+
+    const auto results = mgr.BatchSubmit("r2_02_cancel_prepare", {req});
+    ASSERT_EQ(1u, results.size());
+    ASSERT_EQ(EC_ERROR, results[0]);
+    ASSERT_EQ(std::optional<ErrorCode>(EC_OK), r2_reservation_stub::g_cancel_result);
+    ASSERT_EQ(0u, mgr.GetStats().copy_submitted);
+    ASSERT_FALSE(mgr.HasMigrationTask(kInstance, block_key));
+    ASSERT_TRUE(WaitFor([&]() { return LocationCount(block_key) == 1u; }));
 }
 
 // R2-03: 覆盖带 src_specs 的 BatchSubmit 主路径，确保批量 Copy 到 cold_02
@@ -1409,6 +1771,8 @@ TEST_F(MigrationManagerTest, TestBatchSubmitHeteroSpecCreateFailNoOrphan) {
                         [&](const DataStorageUri &d) { return d.ToUriString() == created.ToUriString(); });
         ASSERT_TRUE(deleted) << "created URI leaked (not deleted): " << created.ToUriString();
     }
+    ASSERT_FALSE(mgr.HasMigrationTask(kInstance, 700));
+    ASSERT_EQ(0u, mgr.ActiveTaskCount()) << "failed batch item leaked its preparing reservation";
 }
 
 // F-03: ActiveTaskCountForInstances 按 instance 集合过滤，跨 group 不抢 slot。

@@ -272,10 +272,14 @@ private:
 
     // F-11: 活跃 Copy 任务的收尾状态机。用于让外部 Cancel 线程与单一 monitor 完成线程在
     // task_mutex_ 内原子认领"谁负责收尾"，避免 cancel 与 promote 并发误删刚提升的目标。
-    //   kRunning    —— copy 提交后、future 未完成，正常态；
+    //   kPreparing  —— 已通过准入并占位，目标 location 可能尚未发布/尚未绑定 id；
+    //   kPrepareCancelling —— prepare 阶段收到取消，提交线程负责停止提交并清理 reservation/目标；
+    //   kRunning    —— copy 已进入提交阶段、future 未完成，正常态；
     //   kCompleting —— monitor 已认领完成（promote/失败清理进行中），此后 Cancel 太晚；
     //   kCancelling —— 外部已请求取消，收尾推迟到 future 完成时由 monitor 执行（删 WRITING 目标、不 promote）。
     enum class CopyTaskState {
+        kPreparing,
+        kPrepareCancelling,
         kRunning,
         kCompleting,
         kCancelling
@@ -364,6 +368,17 @@ private:
     // 业务语义的 stats/event 仍由各调用方按转换语义各自发出。
     // 插入成功返回 true；若该 (instance, block) 已存在活跃任务则不插入并返回 false（调用方据此回滚）。
     bool InsertActiveTaskLocked(CopyTaskContext ctx);
+    // 原子完成 (instance, block) 存在性检查与 preparing 占位；占位会立即参与去重、并发预算和
+    // Reclaimer active-target 判断。调用方不得把 check/insert 拆成两个临界区。
+    bool ReservePreparingTaskLocked(const MigrationRequest &request);
+    // 将 PrepareCopyTask 产出的完整上下文（尤其 dst_location_id）绑定到既有 preparing 占位；
+    // 不改变状态。仅当对应 entry 仍为 kPreparing 时成功。
+    bool UpdatePreparingTaskLocked(const CopyTaskContext &ctx);
+    // kPreparing -> kRunning；其他状态一律失败，避免覆盖并发状态转换。
+    bool MarkTaskRunningLocked(const std::string &instance_id, int64_t block_key);
+    // 仅移除仍由提交线程持有的 kPreparing/kPrepareCancelling entry，避免失败清理误删已进入
+    // 运行/收尾阶段的任务。
+    bool RemovePreparingTaskLocked(const std::string &instance_id, int64_t block_key);
     // 移除 (instance, block) 的活跃任务；不存在返回 false。
     bool RemoveActiveTaskLocked(const std::string &instance_id, int64_t block_key);
     // 仅判断 (instance, block) 是否已有活跃任务（存在性查询，不拷贝 ctx）。
@@ -373,6 +388,7 @@ private:
     enum class ClaimResult {
         kClaimedRunning,
         kWasCancelling,
+        kBusyPreparing,
         kBusyCompleting,
         kNotFound
     };
@@ -381,11 +397,13 @@ private:
     ClaimResult ClaimForCompletionLocked(const std::string &instance_id, int64_t block_key, CopyTaskContext &out_ctx);
     enum class CancelResult {
         kMarked,
+        kMarkedPreparing,
         kAlreadyCancelling,
         kBusyCompleting,
         kNotFound
     };
-    // 外部 Cancel 认领：kRunning→置 kCancelling（kMarked）；kCancelling→幂等；kCompleting→太晚。
+    // 外部 Cancel 认领：kPreparing→kPrepareCancelling（由提交线程清理）；
+    // kRunning→kCancelling（future 完成后清理）；两个 cancelling 状态均幂等；kCompleting→太晚。
     CancelResult MarkCancellingLocked(const std::string &instance_id, int64_t block_key);
     // 取消任务的延迟收尾（monitor 线程，入口不持锁）：删 WRITING 目标（源不动）+ 移除活跃任务
     // + cancelled 终态 metric/event/log。仅由 OnTaskSuccess/OnTaskFailed 在认领到 kWasCancelling 时调用。

@@ -4150,6 +4150,15 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDSkipsActiveWritingLocations) {
 
     const auto ins_info = InstanceInfoFactory();
     mm_->DebugInsertActiveCopyTask(ins_info->instance_id(), 42, "migration_writing");
+    MigrationManager::MigrationRequest preparing_req;
+    preparing_req.instance_id = ins_info->instance_id();
+    preparing_req.block_key = 45;
+    preparing_req.src_storage_name = "hot_01";
+    preparing_req.dst_storage_name = "cold_01";
+    {
+        std::lock_guard<std::mutex> lock(mm_->task_mutex_);
+        ASSERT_TRUE(mm_->ReservePreparingTaskLocked(preparing_req));
+    }
     write_location_manager->Put(
         "write_session", {44}, {"client_writing"}, 60, [](std::unique_ptr<WriteLocationManager::WriteLocationInfo>) {});
 
@@ -4165,8 +4174,10 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDSkipsActiveWritingLocations) {
         return m;
     };
 
-    batch_get_loc_out_maps = {
-        make_writing_map("migration_writing"), make_writing_map("orphan_writing"), make_writing_map("client_writing")};
+    batch_get_loc_out_maps = {make_writing_map("migration_writing"),
+                              make_writing_map("orphan_writing"),
+                              make_writing_map("client_writing"),
+                              make_writing_map("preparing_writing")};
     batch_get_loc_result = ErrorCode::EC_OK;
 
     CacheReclaimer::WaterLevelExceed wl;
@@ -4174,12 +4185,13 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDSkipsActiveWritingLocations) {
 
     std::vector<std::vector<std::string>> out;
     CacheReclaimer::AgeStats age_stats;
-    ASSERT_TRUE(cache_reclaimer_->FilterLocID(request_context_.get(), ins_info, {42, 43, 44}, wl, out, age_stats));
-    ASSERT_EQ(3u, out.size());
+    ASSERT_TRUE(cache_reclaimer_->FilterLocID(request_context_.get(), ins_info, {42, 43, 44, 45}, wl, out, age_stats));
+    ASSERT_EQ(4u, out.size());
     EXPECT_TRUE(out[0].empty()) << "active copy target should not be treated as orphan";
     ASSERT_EQ(1u, out[1].size());
     EXPECT_EQ("orphan_writing", out[1][0]);
     EXPECT_TRUE(out[2].empty()) << "active client write location should not be treated as orphan";
+    EXPECT_TRUE(out[3].empty()) << "preparing copy target should be protected before location id is bound";
 }
 
 /* -------- keep_both 分层淘汰优先级（多副本保冷弃热）stub + test -------- */
