@@ -245,6 +245,42 @@ bool IsTieredMigrationEnabled(RequestContext *request_context,
            !instance_group->cache_config()->migration_strategies().empty();
 }
 
+// R2-05: 只把仍存在 backend 的 valid Mark 交给写入过滤逻辑。
+// backend 已被注销时，按查询快照精确清标并让调用方保留普通 write 判定；并发刷新出的新 Mark
+// 会因 target/deadline 不匹配而保留。
+void ResolveUsableTieredWriteTargets(const std::string &trace_id,
+                                     const std::string &instance_id,
+                                     const CacheManager::KeyVector &keys,
+                                     const std::vector<MigrationManager::MarkQueryResult> &mark_results,
+                                     const std::shared_ptr<DataStorageManager> &data_storage_manager,
+                                     const std::shared_ptr<MigrationManager> &migration_manager,
+                                     std::vector<std::string> &out_targets) {
+    const size_t result_count = std::min({keys.size(), mark_results.size(), out_targets.size()});
+    for (size_t i = 0; i < result_count; ++i) {
+        const auto &mark = mark_results[i];
+        if (!mark.HasValidMark()) {
+            continue;
+        }
+        if (data_storage_manager != nullptr && data_storage_manager->GetDataStorageBackend(mark.target) != nullptr) {
+            out_targets[i] = mark.target;
+            continue;
+        }
+
+        bool cleared = false;
+        if (migration_manager != nullptr) {
+            cleared =
+                migration_manager->ClearTieredWriteMarkIfMatch(instance_id, keys[i], mark.target, mark.deadline_ms);
+        }
+        KVCM_LOG_WARN("trace_id [%s] instance [%s] block [%ld] tiered target storage [%s] not found; "
+                      "conditional mark clear [%s], use ordinary write policy",
+                      trace_id.c_str(),
+                      instance_id.c_str(),
+                      keys[i],
+                      mark.target.c_str(),
+                      cleared ? "succeeded" : "skipped");
+    }
+}
+
 } // namespace
 
 CacheManager::CacheManager(std::shared_ptr<MetricsRegistry> metrics_registry,
@@ -1352,11 +1388,13 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
                        "tiered mark query partially failed, ec %d; failed keys use ordinary write policy",
                        mark_query_ec);
         }
-        for (size_t i = 0; i < mark_results.size() && i < tiered_target_per_key.size(); ++i) {
-            if (mark_results[i].HasValidMark()) {
-                tiered_target_per_key[i] = std::move(mark_results[i].target);
-            }
-        }
+        ResolveUsableTieredWriteTargets(trace_id,
+                                        instance_id,
+                                        keys,
+                                        mark_results,
+                                        registry_manager_->data_storage_manager(),
+                                        migration_manager_,
+                                        tiered_target_per_key);
     }
     for (size_t i = 0; i < location_maps.size(); ++i) {
         std::vector<std::string> prune_loc_ids;
@@ -1490,11 +1528,13 @@ ErrorCode CacheManager::FilterWriteCacheWithMinReplica(RequestContext *request_c
                        "tiered mark query partially failed, ec %d; failed keys use ordinary min-replica policy",
                        mark_query_ec);
         }
-        for (size_t i = 0; i < mark_results.size() && i < tiered_target_per_key.size(); ++i) {
-            if (mark_results[i].HasValidMark()) {
-                tiered_target_per_key[i] = std::move(mark_results[i].target);
-            }
-        }
+        ResolveUsableTieredWriteTargets(trace_id,
+                                        instance_id,
+                                        keys,
+                                        mark_results,
+                                        registry_manager_->data_storage_manager(),
+                                        migration_manager_,
+                                        tiered_target_per_key);
     }
     for (size_t i = 0; i < location_maps.size(); ++i) {
         std::vector<std::string> prune_loc_ids;
@@ -1845,8 +1885,9 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
         RETURN_IF_EC_NOT_OK_WITH_LOG(WARN, EC_INSTANCE_NOT_EXIST, "instance not found");
     }
 
-    // 按目标 storage 对 keys 分组：Mark 命中且目标 storage 存在 -> 路由到冷层；其余 -> 默认 storage。
-    // 默认 storage 只在确实有普通写入或 tiered target fallback 时选择，避免全量 marked write 被 hot 层选择失败阻断。
+    // 按目标 storage 对 keys 分组：Mark 命中且目标 storage 存在 -> 路由到冷层；未命中 -> 默认 storage。
+    // FilterWriteCache 已验证 target；若 backend 在两阶段之间消失，拒绝本次写并由重试重新过滤，
+    // 不能 fallback 默认层，否则可能重复写一个原本已满足普通写条件的 block（R2-05）。
     const bool has_tiered = tiered_targets.size() == keys.size();
     std::map<std::string, std::vector<size_t>> indices_by_storage;
     std::map<std::string, DataStorageType> type_by_storage;
@@ -1858,11 +1899,12 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
                 indices_by_storage[tiered_targets[i]].push_back(i);
                 type_by_storage[tiered_targets[i]] = backend->GetType();
                 continue;
-            } else {
-                PREFIX_LOG(WARN,
-                           "tiered target storage [%s] not found, fallback to default storage",
-                           tiered_targets[i].c_str());
             }
+            PREFIX_LOG(WARN,
+                       "tiered target storage [%s] disappeared after filtering, reject write instead of falling "
+                       "back to default storage",
+                       tiered_targets[i].c_str());
+            return EC_NOENT;
         }
         default_indices.push_back(i);
     }
