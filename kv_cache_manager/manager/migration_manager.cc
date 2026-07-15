@@ -125,6 +125,7 @@ MigrationManager::MigrationManager(std::shared_ptr<SchedulePlanExecutor> schedul
         m_marks_active_ = metrics_registry_->GetGauge("migration.marks_active");
         m_marks_consumed_total_ = metrics_registry_->GetCounter("migration.marks_consumed_total");
         m_marks_expired_total_ = metrics_registry_->GetCounter("migration.marks_expired_total");
+        m_mark_query_errors_total_ = metrics_registry_->GetCounter("migration.mark_query_errors_total");
     }
 }
 
@@ -382,8 +383,9 @@ ErrorCode MigrationManager::Submit(const std::string &trace_id, MigrationRequest
     // 其他目标的 mark 表示独立的迁移意图，不能由本次 Copy 消费。
     {
         std::vector<MarkQueryResult> mark_snap;
-        BatchGetTieredWriteTargets(request.instance_id, {request.block_key}, mark_snap);
-        if (!mark_snap.empty() && mark_snap[0].target == ctx.dst_storage_name) {
+        const auto mark_ec = BatchGetTieredWriteTargets(request.instance_id, {request.block_key}, mark_snap);
+        if (mark_ec == EC_OK && !mark_snap.empty() && mark_snap[0].HasValidMark() &&
+            mark_snap[0].target == ctx.dst_storage_name) {
             ctx.mark_target = mark_snap[0].target;
             ctx.mark_deadline_ms = mark_snap[0].deadline_ms;
         }
@@ -677,8 +679,9 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
             // F-15/R2-03: 仅绑定与本次 Copy 目标一致的 mark；其他目标的 mark 必须保留。
             {
                 std::vector<MarkQueryResult> mark_snap;
-                BatchGetTieredWriteTargets(req.instance_id, {req.block_key}, mark_snap);
-                if (!mark_snap.empty() && mark_snap[0].target == ctx.dst_storage_name) {
+                const auto mark_ec = BatchGetTieredWriteTargets(req.instance_id, {req.block_key}, mark_snap);
+                if (mark_ec == EC_OK && !mark_snap.empty() && mark_snap[0].HasValidMark() &&
+                    mark_snap[0].target == ctx.dst_storage_name) {
                     ctx.mark_target = mark_snap[0].target;
                     ctx.mark_deadline_ms = mark_snap[0].deadline_ms;
                 }
@@ -1110,14 +1113,14 @@ bool MigrationManager::ClearTieredWriteMarkIfMatch(const std::string &instance_i
 
 bool MigrationManager::IsMarkedForTieredWrite(const std::string &instance_id, int64_t block_key) {
     std::vector<MarkQueryResult> results;
-    BatchGetTieredWriteTargets(instance_id, {block_key}, results);
-    return !results.empty() && !results[0].target.empty();
+    const auto ec = BatchGetTieredWriteTargets(instance_id, {block_key}, results);
+    return ec == EC_OK && !results.empty() && results[0].HasValidMark();
 }
 
 std::string MigrationManager::GetTieredWriteTarget(const std::string &instance_id, int64_t block_key) {
     std::vector<MarkQueryResult> results;
-    BatchGetTieredWriteTargets(instance_id, {block_key}, results);
-    return (!results.empty() && !results[0].target.empty()) ? results[0].target : std::string();
+    const auto ec = BatchGetTieredWriteTargets(instance_id, {block_key}, results);
+    return (ec == EC_OK && !results.empty() && results[0].HasValidMark()) ? results[0].target : std::string();
 }
 
 // F-15: match 检查在 RMW modifier 闭包内执行（shard lock 保原子），不需要外部 mark_mutex_。
@@ -1194,36 +1197,96 @@ bool MigrationManager::ClearTieredWriteMarkIfMatchInternal(const std::string &in
 ErrorCode MigrationManager::BatchGetTieredWriteTargets(const std::string &instance_id,
                                                        const std::vector<int64_t> &block_keys,
                                                        std::vector<MarkQueryResult> &out) {
-    out.resize(block_keys.size());
+    out.assign(block_keys.size(), MarkQueryResult{});
     if (block_keys.empty()) {
         return EC_OK;
     }
+    auto fail_all = [&](ErrorCode ec, const char *reason) {
+        for (auto &result : out) {
+            result.state = MarkQueryState::kReadError;
+            result.ec = ec;
+        }
+        if (metrics_enabled_) {
+            m_mark_query_errors_total_ += block_keys.size();
+        }
+        KVCM_LOG_WARN("mark query failed for instance %s, keys %zu, ec %d: %s",
+                      instance_id.c_str(),
+                      block_keys.size(),
+                      ec,
+                      reason);
+        return ec;
+    };
+
     auto indexer = GetIndexer(instance_id);
     if (indexer == nullptr) {
-        return EC_INSTANCE_NOT_EXIST;
+        return fail_all(EC_INSTANCE_NOT_EXIST, "meta indexer not found");
     }
     RequestContext rc("migration_query_mark_batch");
     KeyVector keys(block_keys.begin(), block_keys.end());
     PropertyMapVector props;
-    indexer->GetProperties(&rc, keys, {PROPERTY_TIERED_WRITE_TARGET, PROPERTY_TIERED_WRITE_DEADLINE_MS}, props);
+    const auto query_result =
+        indexer->GetProperties(&rc, keys, {PROPERTY_TIERED_WRITE_TARGET, PROPERTY_TIERED_WRITE_DEADLINE_MS}, props);
+    if (query_result.error_codes.size() != block_keys.size() || props.size() != block_keys.size()) {
+        KVCM_LOG_WARN("mark query result shape mismatch for instance %s: keys %zu, per_key_ec %zu, props %zu, "
+                      "aggregate ec %d",
+                      instance_id.c_str(),
+                      block_keys.size(),
+                      query_result.error_codes.size(),
+                      props.size(),
+                      query_result.ec);
+        return fail_all(EC_ERROR, "result shape mismatch");
+    }
+
+    const auto backend_error_count = static_cast<std::size_t>(std::count_if(
+        query_result.error_codes.begin(), query_result.error_codes.end(), [](ErrorCode ec) { return ec != EC_OK; }));
+    const ErrorCode expected_aggregate_ec =
+        backend_error_count == 0 ? EC_OK : (backend_error_count == block_keys.size() ? EC_ERROR : EC_PARTIAL_OK);
+    if (query_result.ec != expected_aggregate_ec) {
+        return fail_all(EC_ERROR, "aggregate and per-key errors are inconsistent");
+    }
+
     std::vector<ExpiringMark> expired_marks;
     const int64_t now_ms = TimestampUtil::GetCurrentTimeMs();
-    for (size_t i = 0; i < props.size() && i < out.size(); ++i) {
-        auto mark = ParseMarkFromProperties(props[i], now_ms);
-        if (mark.target.empty()) {
+    std::size_t read_error_count = 0;
+    for (size_t i = 0; i < block_keys.size(); ++i) {
+        out[i].ec = query_result.error_codes[i];
+        if (out[i].ec == EC_NOENT) {
+            out[i].state = MarkQueryState::kBlockNotFound;
             continue;
         }
-        if (mark.expired) {
-            expired_marks.push_back(ExpiringMark{mark.deadline_ms, instance_id, block_keys[i], mark.target});
+        if (out[i].ec != EC_OK) {
+            out[i].state = MarkQueryState::kReadError;
+            ++read_error_count;
+            continue;
+        }
+        auto mark = ParseMarkFromProperties(props[i], now_ms);
+        if (mark.target.empty()) {
+            out[i].state = MarkQueryState::kNoMark;
             continue;
         }
         out[i].target = std::move(mark.target);
         out[i].deadline_ms = mark.deadline_ms;
+        if (mark.expired) {
+            out[i].state = MarkQueryState::kExpired;
+            expired_marks.push_back(ExpiringMark{out[i].deadline_ms, instance_id, block_keys[i], out[i].target});
+            continue;
+        }
+        out[i].state = MarkQueryState::kValid;
     }
     for (const auto &em : expired_marks) {
         ClearTieredWriteMarkIfMatchInternal(em.instance_id, em.block_key, em.target_storage, em.deadline_ms, true);
     }
-    return EC_OK;
+    if (read_error_count == 0) {
+        return EC_OK;
+    }
+    if (metrics_enabled_) {
+        m_mark_query_errors_total_ += read_error_count;
+    }
+    KVCM_LOG_WARN("mark query partially failed for instance %s: keys %zu, read errors %zu",
+                  instance_id.c_str(),
+                  block_keys.size(),
+                  read_error_count);
+    return read_error_count == block_keys.size() ? EC_ERROR : EC_PARTIAL_OK;
 }
 
 void MigrationManager::EnqueueMarkExpiry(const std::string &instance_id,
@@ -1678,13 +1741,22 @@ MigrationManager::DispatchMigrationBatch(const std::string &trace_id,
 
     // 10a: mark 去重用 batch 查询替代逐 block IsMarkedForTieredWrite（N 次 meta 往返 → 1 次）。
     std::unordered_set<int64_t> already_marked;
+    std::unordered_set<int64_t> mark_query_failed;
     if (params.do_mark && params.dedup_marks) {
         std::vector<MarkQueryResult> mark_results;
-        if (BatchGetTieredWriteTargets(instance_id, batch, mark_results) == EC_OK) {
-            for (std::size_t i = 0; i < batch.size() && i < mark_results.size(); ++i) {
-                if (!mark_results[i].target.empty()) {
-                    already_marked.insert(batch[i]);
-                }
+        const auto mark_query_ec = BatchGetTieredWriteTargets(instance_id, batch, mark_results);
+        if (mark_query_ec != EC_OK) {
+            KVCM_LOG_WARN("[%s] mark dedup query partially failed for instance %s, ec %d; failed keys will retry",
+                          trace_id.c_str(),
+                          instance_id.c_str(),
+                          mark_query_ec);
+        }
+        for (std::size_t i = 0; i < batch.size() && i < mark_results.size(); ++i) {
+            if (mark_results[i].HasValidMark()) {
+                already_marked.insert(batch[i]);
+            } else if (mark_results[i].IsReadError()) {
+                // 无法确认已有 mark 时不覆盖未知状态，留待下一轮 reclaimer 重试。
+                mark_query_failed.insert(batch[i]);
             }
         }
     }
@@ -1714,7 +1786,7 @@ MigrationManager::DispatchMigrationBatch(const std::string &trace_id,
             copy_reqs.push_back(std::move(req));
             continue; // Copy 优先：已进入 copy 的 block 不再重复 mark。
         }
-        if (params.do_mark && already_marked.count(block_key) == 0) {
+        if (params.do_mark && already_marked.count(block_key) == 0 && mark_query_failed.count(block_key) == 0) {
             mark_keys.push_back(block_key);
         }
     }

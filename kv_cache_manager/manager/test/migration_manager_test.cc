@@ -66,6 +66,29 @@ std::vector<ErrorCode> Delete_stub(void * /*obj*/,
 }
 } // namespace f10_orphan_stub
 
+namespace r2_04_mark_query_stub {
+ErrorCode g_aggregate_ec = EC_OK;
+std::vector<ErrorCode> g_per_key_ecs;
+PropertyMapVector g_properties;
+
+void Reset() {
+    g_aggregate_ec = EC_OK;
+    g_per_key_ecs.clear();
+    g_properties.clear();
+}
+
+MetaIndexer::Result GetProperties_stub(void * /*obj*/,
+                                       RequestContext * /*rc*/,
+                                       const KeyVector & /*keys*/,
+                                       const std::vector<std::string> & /*property_names*/,
+                                       PropertyMapVector &out_properties) noexcept {
+    out_properties = g_properties;
+    MetaIndexer::Result result(g_aggregate_ec);
+    result.error_codes = g_per_key_ecs;
+    return result;
+}
+} // namespace r2_04_mark_query_stub
+
 class CaptureEventPublisher : public EventPublisher {
 public:
     bool Init(const std::string & /*config*/) override { return true; }
@@ -236,7 +259,7 @@ public:
     void ClearMarkForTest(MigrationManager &mgr, const std::string &instance_id, int64_t block_key) {
         std::vector<MigrationManager::MarkQueryResult> results;
         mgr.BatchGetTieredWriteTargets(instance_id, {block_key}, results);
-        if (!results.empty() && !results[0].target.empty()) {
+        if (!results.empty() && results[0].HasValidMark()) {
             mgr.ClearTieredWriteMarkIfMatch(instance_id, block_key, results[0].target, results[0].deadline_ms);
         }
     }
@@ -259,6 +282,108 @@ TEST_F(MigrationManagerTest, TestSelectExplicitMigrationKeysDeduplicatesInOrder)
 
     ASSERT_EQ(ErrorCode::EC_OK, ec);
     ASSERT_EQ((std::vector<int64_t>{11, 12, 13}), keys);
+}
+
+TEST_F(MigrationManagerTest, TestBatchGetTieredWriteTargetsPreservesPartialResults) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    r2_04_mark_query_stub::Reset();
+    r2_04_mark_query_stub::g_aggregate_ec = EC_PARTIAL_OK;
+    r2_04_mark_query_stub::g_per_key_ecs = {EC_OK, EC_ERROR, EC_OK};
+    r2_04_mark_query_stub::g_properties = {
+        {{MigrationManager::PROPERTY_TIERED_WRITE_TARGET, "cold_01"},
+         {MigrationManager::PROPERTY_TIERED_WRITE_DEADLINE_MS, "9999999999999"}},
+        {},
+        {},
+    };
+    Stub stub;
+    stub.set(ADDR(MetaIndexer, GetProperties), r2_04_mark_query_stub::GetProperties_stub);
+
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_, metrics_registry_);
+    std::vector<MigrationManager::MarkQueryResult> results;
+    ASSERT_EQ(EC_PARTIAL_OK, mgr.BatchGetTieredWriteTargets(kInstance, {1, 2, 3}, results));
+
+    ASSERT_EQ(3u, results.size());
+    ASSERT_EQ(MigrationManager::MarkQueryState::kValid, results[0].state);
+    ASSERT_EQ(EC_OK, results[0].ec);
+    ASSERT_EQ("cold_01", results[0].target);
+    ASSERT_EQ(9999999999999LL, results[0].deadline_ms);
+    ASSERT_EQ(MigrationManager::MarkQueryState::kReadError, results[1].state);
+    ASSERT_EQ(EC_ERROR, results[1].ec);
+    ASSERT_TRUE(results[1].target.empty());
+    ASSERT_EQ(MigrationManager::MarkQueryState::kNoMark, results[2].state);
+    ASSERT_EQ(EC_OK, results[2].ec);
+    ASSERT_TRUE(results[2].target.empty());
+    ASSERT_EQ(1u, metrics_registry_->GetCounter("migration.mark_query_errors_total").Get());
+}
+
+TEST_F(MigrationManagerTest, TestBatchGetTieredWriteTargetsReportsAllReadFailures) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    r2_04_mark_query_stub::Reset();
+    r2_04_mark_query_stub::g_aggregate_ec = EC_ERROR;
+    r2_04_mark_query_stub::g_per_key_ecs = {EC_ERROR, EC_ERROR};
+    r2_04_mark_query_stub::g_properties = {{}, {}};
+    Stub stub;
+    stub.set(ADDR(MetaIndexer, GetProperties), r2_04_mark_query_stub::GetProperties_stub);
+
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_, metrics_registry_);
+    std::vector<MigrationManager::MarkQueryResult> results;
+    ASSERT_EQ(EC_ERROR, mgr.BatchGetTieredWriteTargets(kInstance, {1, 2}, results));
+
+    ASSERT_EQ(2u, results.size());
+    for (const auto &result : results) {
+        ASSERT_EQ(MigrationManager::MarkQueryState::kReadError, result.state);
+        ASSERT_EQ(EC_ERROR, result.ec);
+        ASSERT_TRUE(result.target.empty());
+    }
+    ASSERT_EQ(2u, metrics_registry_->GetCounter("migration.mark_query_errors_total").Get());
+}
+
+TEST_F(MigrationManagerTest, TestBatchGetTieredWriteTargetsDistinguishesBlockNotFound) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    r2_04_mark_query_stub::Reset();
+    // MetaIndexer 把 EC_NOENT 计入 aggregate partial；mark query 将其显式保留为状态，
+    // 但不视为存储读取故障，因此对调用方返回 EC_OK。
+    r2_04_mark_query_stub::g_aggregate_ec = EC_PARTIAL_OK;
+    r2_04_mark_query_stub::g_per_key_ecs = {EC_NOENT, EC_OK};
+    r2_04_mark_query_stub::g_properties = {{}, {}};
+    Stub stub;
+    stub.set(ADDR(MetaIndexer, GetProperties), r2_04_mark_query_stub::GetProperties_stub);
+
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_, metrics_registry_);
+    std::vector<MigrationManager::MarkQueryResult> results;
+    ASSERT_EQ(EC_OK, mgr.BatchGetTieredWriteTargets(kInstance, {1, 2}, results));
+
+    ASSERT_EQ(2u, results.size());
+    ASSERT_EQ(MigrationManager::MarkQueryState::kBlockNotFound, results[0].state);
+    ASSERT_EQ(EC_NOENT, results[0].ec);
+    ASSERT_EQ(MigrationManager::MarkQueryState::kNoMark, results[1].state);
+    ASSERT_EQ(EC_OK, results[1].ec);
+    ASSERT_EQ(0u, metrics_registry_->GetCounter("migration.mark_query_errors_total").Get());
+}
+
+TEST_F(MigrationManagerTest, TestBatchGetTieredWriteTargetsRejectsMisalignedOutput) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    r2_04_mark_query_stub::Reset();
+    r2_04_mark_query_stub::g_aggregate_ec = EC_OK;
+    r2_04_mark_query_stub::g_per_key_ecs = {EC_OK, EC_OK};
+    r2_04_mark_query_stub::g_properties = {{{MigrationManager::PROPERTY_TIERED_WRITE_TARGET, "stale"}}};
+    Stub stub;
+    stub.set(ADDR(MetaIndexer, GetProperties), r2_04_mark_query_stub::GetProperties_stub);
+
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_, metrics_registry_);
+    MigrationManager::MarkQueryResult stale;
+    stale.state = MigrationManager::MarkQueryState::kValid;
+    stale.target = "must_be_cleared";
+    std::vector<MigrationManager::MarkQueryResult> results(2, stale);
+    ASSERT_EQ(EC_ERROR, mgr.BatchGetTieredWriteTargets(kInstance, {1, 2}, results));
+
+    ASSERT_EQ(2u, results.size());
+    for (const auto &result : results) {
+        ASSERT_EQ(MigrationManager::MarkQueryState::kReadError, result.state);
+        ASSERT_EQ(EC_ERROR, result.ec);
+        ASSERT_TRUE(result.target.empty());
+    }
+    ASSERT_EQ(2u, metrics_registry_->GetCounter("migration.mark_query_errors_total").Get());
 }
 
 TEST_F(MigrationManagerTest, TestMarkLifecycle) {
@@ -1309,6 +1434,31 @@ CacheLocationConstPtr MakeLocationWithSpecs(const std::string &id,
 }
 
 } // namespace
+
+TEST_F(MigrationManagerTest, TestDispatchSkipsMarkWhenDedupQueryFails) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    r2_04_mark_query_stub::Reset();
+    r2_04_mark_query_stub::g_aggregate_ec = EC_ERROR;
+    r2_04_mark_query_stub::g_per_key_ecs = {EC_ERROR};
+    r2_04_mark_query_stub::g_properties = {{}};
+    Stub stub;
+    stub.set(ADDR(MetaIndexer, GetProperties), r2_04_mark_query_stub::GetProperties_stub);
+
+    CacheLocationMap loc_map;
+    auto src_loc = MakeLocation("loc_src", "hot_01", CLS_SERVING);
+    loc_map[src_loc->id()] = src_loc;
+    MigrationManager::DispatchBatchParams params;
+    params.do_mark = true;
+    params.dedup_marks = true;
+
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_, metrics_registry_);
+    const auto result =
+        mgr.DispatchMigrationBatch("mark_query_error", kInstance, "hot_01", "cold_01", {1}, {loc_map}, params);
+
+    ASSERT_EQ(0, result.mark_submitted);
+    ASSERT_EQ(0u, mgr.GetStats().marks_added);
+    ASSERT_EQ(1u, metrics_registry_->GetCounter("migration.mark_query_errors_total").Get());
+}
 
 TEST_F(MigrationManagerTest, TestCheckCopyAdmission) {
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);

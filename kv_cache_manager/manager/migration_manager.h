@@ -128,14 +128,28 @@ public:
                                      const std::string &expected_target,
                                      int64_t expected_deadline_ms);
 
-    // F-15: mark 查询结果（target + deadline），供 match-clear 使用。
+    // F-15/R2-04: mark 查询结果严格与输入 key 对齐；读取失败不能伪装成 no-mark。
+    enum class MarkQueryState {
+        kNoMark,
+        kValid,
+        kExpired,
+        kBlockNotFound,
+        kReadError,
+    };
     struct MarkQueryResult {
-        std::string target; // 空=未打标/已清/已过期
+        MarkQueryState state = MarkQueryState::kNoMark;
+        ErrorCode ec = EC_OK;
+        // target/deadline 在 kValid/kExpired 时保存查询快照，供 match-clear 使用。
+        std::string target;
         int64_t deadline_ms = 0;
+
+        bool HasValidMark() const { return state == MarkQueryState::kValid; }
+        bool IsReadError() const { return state == MarkQueryState::kReadError; }
     };
 
-    // 批量查询（写路径优化，避免逐 block 元数据往返）；out 与 block_keys 同序，target 空=未打标。
-    // 非 const：发现过期 mark 时会触发清理。
+    // 批量查询（写路径优化，避免逐 block 元数据往返）；out 与 block_keys 严格同序、同长度。
+    // EC_NOENT 映射为 kBlockNotFound，不算读取故障；其他逐 key 错误返回 EC_PARTIAL_OK/EC_ERROR。
+    // 非 const：发现 kExpired mark 时会触发条件清理。
     ErrorCode BatchGetTieredWriteTargets(const std::string &instance_id,
                                          const std::vector<int64_t> &block_keys,
                                          std::vector<MarkQueryResult> &out);
@@ -423,6 +437,7 @@ private:
     Gauge m_marks_active_;
     Counter m_marks_consumed_total_;
     Counter m_marks_expired_total_; // F-16: 超时过期清除的 mark（与 consumed 区分：浪费 vs 有效消费）
+    Counter m_mark_query_errors_total_;
 
     void UpdateActiveTasksGauge(); // 调用方持有 task_mutex_
     void UpdateMarksActiveGauge(); // best-effort：基于 added-cleared 原子计数

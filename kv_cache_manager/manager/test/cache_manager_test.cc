@@ -13,6 +13,8 @@
 #include "kv_cache_manager/config/registry_manager.h"
 #include "kv_cache_manager/data_storage/data_storage_backend.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
+#include "kv_cache_manager/data_storage/data_storage_uri.h"
+#include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/data_storage/vineyard_backend.h"
 #include "kv_cache_manager/event/event_manager.h"
 #include "kv_cache_manager/manager/cache_location_view.h"
@@ -25,13 +27,12 @@
 #include "kv_cache_manager/manager/schedule_plan_executor.h"
 #include "kv_cache_manager/manager/startup_config_loader.h"
 #include "kv_cache_manager/manager/write_location_manager.h"
-#include "kv_cache_manager/data_storage/data_storage_uri.h"
-#include "kv_cache_manager/data_storage/storage_config.h"
 #include "kv_cache_manager/meta/common.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
 #include "kv_cache_manager/metrics/metrics_collector.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
+#include "stub.h"
 
 namespace {
 static const std::string default_storage_configs(
@@ -40,6 +41,22 @@ static const std::string default_storage_configs(
 } // namespace
 
 namespace kv_cache_manager {
+
+namespace r2_04_mark_query_stub {
+ErrorCode ReadError_stub(void * /*obj*/,
+                         const std::string & /*instance_id*/,
+                         const std::vector<int64_t> &block_keys,
+                         std::vector<MigrationManager::MarkQueryResult> &out) {
+    out.assign(block_keys.size(), MigrationManager::MarkQueryResult{});
+    for (auto &result : out) {
+        result.state = MigrationManager::MarkQueryState::kReadError;
+        result.ec = EC_ERROR;
+        // 故意携带 stale target，证明调用方依据 state 而不是 target 是否为空做判断。
+        result.target = "cold_01";
+    }
+    return EC_ERROR;
+}
+} // namespace r2_04_mark_query_stub
 
 class MockDataStorageBackend : public DataStorageBackend {
 public:
@@ -3393,6 +3410,101 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheTieredMarkPropagation) {
             ASSERT_EQ("", new_targets[i]); // 未命中 -> 空（走默认）
         }
     }
+}
+
+TEST_F(CacheManagerTest, TestFilterWriteCacheFallsBackToOrdinaryPolicyOnMarkReadError) {
+    EnableTieredMigrationStrategy();
+    cache_manager_->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "mark_read_error",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     std::vector<LocationSpecGroup>());
+    MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("mark_read_error");
+    ASSERT_TRUE(meta_searcher);
+
+    auto hot_loc = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("tp0", "dummy://hot_01/mark_read_error?size=1")});
+    std::vector<std::string> ids;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchAddLocation(request_context_.get(), {1}, {hot_loc}, ids));
+    ASSERT_EQ(1u, ids.size());
+    std::vector<std::vector<MetaSearcher::LocationCASTask>> cas_tasks{
+        {MetaSearcher::LocationCASTask{ids[0], CLS_WRITING, CLS_SERVING}}};
+    std::vector<std::vector<ErrorCode>> cas_results;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchCASLocationStatus(request_context_.get(), {1}, cas_tasks, cas_results));
+
+    Stub stub;
+    stub.set(ADDR(MigrationManager, BatchGetTieredWriteTargets), r2_04_mark_query_stub::ReadError_stub);
+    CacheManager::KeyVector new_keys;
+    std::vector<std::string_view> new_sgn;
+    BlockMask block_mask;
+    std::vector<std::string> new_targets;
+    ASSERT_EQ(EC_OK,
+              cache_manager_->FilterWriteCache(request_context_.get(),
+                                               "mark_read_error",
+                                               meta_searcher,
+                                               {1},
+                                               new_keys,
+                                               {},
+                                               new_sgn,
+                                               block_mask,
+                                               1,
+                                               new_targets));
+
+    ASSERT_TRUE(new_keys.empty());
+    ASSERT_TRUE(new_targets.empty());
+}
+
+TEST_F(CacheManagerTest, TestFilterWriteCacheWithMinReplicaFallsBackOnMarkReadError) {
+    EnableTieredMigrationStrategy();
+    cache_manager_->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "min_replica_mark_read_error",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     std::vector<LocationSpecGroup>());
+    MetaSearcher *meta_searcher =
+        cache_manager_->meta_searcher_manager_->GetMetaSearcher("min_replica_mark_read_error");
+    ASSERT_TRUE(meta_searcher);
+
+    auto make_hot_loc = [](const std::string &uri) {
+        return std::make_shared<CacheLocation>(
+            DataStorageType::DATA_STORAGE_TYPE_DUMMY, 1, std::vector<LocationSpec>{LocationSpec("tp0", uri)});
+    };
+    for (const auto &uri : {"dummy://hot_01/mark_read_error_a?size=1", "dummy://hot_02/mark_read_error_b?size=1"}) {
+        std::vector<std::string> ids;
+        ASSERT_EQ(EC_OK, meta_searcher->BatchAddLocation(request_context_.get(), {1}, {make_hot_loc(uri)}, ids));
+        ASSERT_EQ(1u, ids.size());
+        std::vector<std::vector<MetaSearcher::LocationCASTask>> cas_tasks{
+            {MetaSearcher::LocationCASTask{ids[0], CLS_WRITING, CLS_SERVING}}};
+        std::vector<std::vector<ErrorCode>> cas_results;
+        ASSERT_EQ(EC_OK, meta_searcher->BatchCASLocationStatus(request_context_.get(), {1}, cas_tasks, cas_results));
+    }
+
+    Stub stub;
+    stub.set(ADDR(MigrationManager, BatchGetTieredWriteTargets), r2_04_mark_query_stub::ReadError_stub);
+    CacheManager::KeyVector new_keys;
+    std::vector<std::string_view> new_sgn;
+    BlockMask block_mask;
+    std::vector<std::string> new_targets;
+    ASSERT_EQ(EC_OK,
+              cache_manager_->FilterWriteCache(request_context_.get(),
+                                               "min_replica_mark_read_error",
+                                               meta_searcher,
+                                               {1},
+                                               new_keys,
+                                               {},
+                                               new_sgn,
+                                               block_mask,
+                                               2,
+                                               new_targets));
+
+    ASSERT_TRUE(new_keys.empty());
+    ASSERT_TRUE(new_targets.empty());
 }
 
 TEST_F(CacheManagerTest, TestFilterWriteCacheSkipsTieredMarkWhenMigrationDisabled) {

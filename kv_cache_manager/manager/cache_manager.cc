@@ -995,14 +995,20 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
         }
         if (!mark_candidate_keys.empty()) {
             std::vector<MigrationManager::MarkQueryResult> tiered_targets;
-            migration_manager_->BatchGetTieredWriteTargets(instance_id, mark_candidate_keys, tiered_targets);
+            const auto mark_query_ec =
+                migration_manager_->BatchGetTieredWriteTargets(instance_id, mark_candidate_keys, tiered_targets);
+            if (mark_query_ec != EC_OK) {
+                PREFIX_LOG(WARN,
+                           "tiered mark query partially failed after write, ec %d; valid keys will still be cleared",
+                           mark_query_ec);
+            }
             std::vector<CacheLocationMap> loc_maps;
             static const BlockMask empty_block_mask = static_cast<size_t>(0);
             const auto get_loc_ec =
                 meta_searcher->BatchGetLocation(request_context, mark_candidate_keys, empty_block_mask, loc_maps);
             if (get_loc_ec == EC_OK && loc_maps.size() == mark_candidate_keys.size()) {
                 for (size_t i = 0; i < mark_candidate_keys.size(); ++i) {
-                    if (i >= tiered_targets.size() || tiered_targets[i].target.empty()) {
+                    if (i >= tiered_targets.size() || !tiered_targets[i].HasValidMark()) {
                         continue;
                     }
                     const auto *loc = FindLocationById(loc_maps[i], mark_candidate_location_ids[i]);
@@ -1340,9 +1346,16 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
     std::vector<std::string> tiered_target_per_key(location_maps.size());
     if (tiered_migration_enabled) {
         std::vector<MigrationManager::MarkQueryResult> mark_results;
-        migration_manager_->BatchGetTieredWriteTargets(instance_id, keys, mark_results);
+        const auto mark_query_ec = migration_manager_->BatchGetTieredWriteTargets(instance_id, keys, mark_results);
+        if (mark_query_ec != EC_OK) {
+            PREFIX_LOG(WARN,
+                       "tiered mark query partially failed, ec %d; failed keys use ordinary write policy",
+                       mark_query_ec);
+        }
         for (size_t i = 0; i < mark_results.size() && i < tiered_target_per_key.size(); ++i) {
-            tiered_target_per_key[i] = std::move(mark_results[i].target);
+            if (mark_results[i].HasValidMark()) {
+                tiered_target_per_key[i] = std::move(mark_results[i].target);
+            }
         }
     }
     for (size_t i = 0; i < location_maps.size(); ++i) {
@@ -1471,9 +1484,16 @@ ErrorCode CacheManager::FilterWriteCacheWithMinReplica(RequestContext *request_c
     std::vector<std::string> tiered_target_to_write(location_maps.size());
     if (tiered_migration_enabled) {
         std::vector<MigrationManager::MarkQueryResult> mark_results;
-        migration_manager_->BatchGetTieredWriteTargets(instance_id, keys, mark_results);
+        const auto mark_query_ec = migration_manager_->BatchGetTieredWriteTargets(instance_id, keys, mark_results);
+        if (mark_query_ec != EC_OK) {
+            PREFIX_LOG(WARN,
+                       "tiered mark query partially failed, ec %d; failed keys use ordinary min-replica policy",
+                       mark_query_ec);
+        }
         for (size_t i = 0; i < mark_results.size() && i < tiered_target_per_key.size(); ++i) {
-            tiered_target_per_key[i] = std::move(mark_results[i].target);
+            if (mark_results[i].HasValidMark()) {
+                tiered_target_per_key[i] = std::move(mark_results[i].target);
+            }
         }
     }
     for (size_t i = 0; i < location_maps.size(); ++i) {

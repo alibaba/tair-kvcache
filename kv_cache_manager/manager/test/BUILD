@@ -101,10 +101,12 @@ cc_test(
         "-fno-access-control",
     ],
     data = [],
+    linkstatic = True,
     shard_count = 10,
     deps = [
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/manager:cache_manager",
+        "@cpp_stub",
     ],
 )
 
