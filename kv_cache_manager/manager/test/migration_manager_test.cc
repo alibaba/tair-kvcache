@@ -123,6 +123,29 @@ bool WasDeleted(const DataStorageUri &created) {
 }
 } // namespace r2_08_create_shape_stub
 
+// ---- prepared BatchSubmit 逐项 Create 失败测试存根 ----
+// 返回数量严格对齐，但第二项失败，验证普通 per-item failure 不会扩大成整组失败。
+namespace prepared_batch_partial_create_stub {
+std::vector<std::pair<ErrorCode, DataStorageUri>> Create_stub(void * /*obj*/,
+                                                              RequestContext * /*rc*/,
+                                                              const std::string &name,
+                                                              const std::vector<std::string> &keys,
+                                                              size_t size,
+                                                              std::function<void()> /*cb*/) {
+    std::vector<std::pair<ErrorCode, DataStorageUri>> results;
+    results.reserve(keys.size());
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        if (i == 1) {
+            results.emplace_back(EC_ERROR, DataStorageUri{});
+            continue;
+        }
+        results.emplace_back(
+            EC_OK, DataStorageUri("dummy://" + name + "/" + keys[i] + "?size=" + std::to_string(size)));
+    }
+    return results;
+}
+} // namespace prepared_batch_partial_create_stub
+
 namespace r2_04_mark_query_stub {
 ErrorCode g_aggregate_ec = EC_OK;
 std::vector<ErrorCode> g_per_key_ecs;
@@ -1614,12 +1637,16 @@ TEST_F(MigrationManagerTest, TestBatchSubmit) {
     std::vector<MigrationManager::MigrationRequest> reqs;
     for (int64_t bk = 800; bk < 803; ++bk) {
         std::string src_loc = CreateSourceLocation(bk, "hot_01", true, "data");
+        const auto src = GetLocation(bk, src_loc);
+        ASSERT_NE(nullptr, src);
         MigrationManager::MigrationRequest req;
         req.instance_id = kInstance;
         req.block_key = bk;
         req.src_location_id = src_loc;
+        req.src_create_time = src->create_time();
         req.src_storage_name = "hot_01";
         req.dst_storage_name = "cold_01";
+        req.src_specs = src->location_specs();
         reqs.push_back(req);
     }
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
@@ -1630,6 +1657,58 @@ TEST_F(MigrationManagerTest, TestBatchSubmit) {
         ASSERT_EQ(ErrorCode::EC_OK, ec);
     }
     ASSERT_EQ(3u, mgr.ActiveTaskCount());
+}
+
+// R2-10: private prepared-request API 不再兼容空 src_specs fallback。违反 contract 时必须在
+// reservation/backend/meta I/O 前整批返回 EC_BADARGS。
+TEST_F(MigrationManagerTest, TestBatchSubmitRejectsEmptySourceSpecsBeforeIo) {
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    mgr.DebugEnableCopySubmissionsForTest();
+    r2_reservation_stub::Reset();
+    Stub stub;
+    stub.set(ADDR(DataStorageManager, Create), r2_reservation_stub::Create_stub);
+
+    MigrationManager::MigrationRequest request;
+    request.instance_id = kInstance;
+    request.block_key = 804;
+    request.src_location_id = "src_804";
+    request.src_storage_name = "hot_01";
+    request.dst_storage_name = "cold_01";
+
+    const auto results = mgr.BatchSubmit("r2_10_empty_specs", {request});
+    ASSERT_EQ(1u, results.size());
+    ASSERT_EQ(EC_BADARGS, results[0]);
+    ASSERT_EQ(0, r2_reservation_stub::g_create_calls);
+    ASSERT_EQ(0u, mgr.ActiveTaskCount());
+}
+
+// R2-09: 实现只持有一份 first_req indexer/target，混合 instance/target 的 batch 不能进入
+// Create 或 reservation；private contract 被内部误用时也要安全失败。
+TEST_F(MigrationManagerTest, TestBatchSubmitRejectsMixedPreparedBatchBeforeIo) {
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    mgr.DebugEnableCopySubmissionsForTest();
+    r2_reservation_stub::Reset();
+    Stub stub;
+    stub.set(ADDR(DataStorageManager, Create), r2_reservation_stub::Create_stub);
+
+    MigrationManager::MigrationRequest first;
+    first.instance_id = kInstance;
+    first.block_key = 805;
+    first.src_location_id = "src_805";
+    first.src_storage_name = "hot_01";
+    first.dst_storage_name = "cold_01";
+    first.src_specs = {LocationSpec("TP0", "dummy://hot_01/src_805?size=4")};
+    auto second = first;
+    second.instance_id = "other_instance";
+    second.block_key = 806;
+    second.dst_storage_name = "cold_02";
+
+    const auto results = mgr.BatchSubmit("r2_09_mixed_batch", {first, second});
+    ASSERT_EQ(2u, results.size());
+    ASSERT_EQ(EC_BADARGS, results[0]);
+    ASSERT_EQ(EC_BADARGS, results[1]);
+    ASSERT_EQ(0, r2_reservation_stub::g_create_calls);
+    ASSERT_EQ(0u, mgr.ActiveTaskCount());
 }
 
 // R2-02: 真批量路径必须在第一次 batch Create 前 reserve 所有 eligible block；批内重复逐项失败，
@@ -2015,49 +2094,33 @@ TEST_F(MigrationManagerTest, TestBatchSubmitSuccessDoesNotClearMarkForDifferentT
     ASSERT_EQ(0u, mgr.GetStats().marks_cleared);
 }
 
-// F-17: BatchSubmit partial failure — 部分请求有坏 src_location_id，其他成功的仍被跟踪。
+// F-17/R2-10: prepared BatchSubmit 的 Create 逐项失败不影响其他 request，且测试必须进入
+// 真批量路径，不能再通过空 src_specs fallback 覆盖单条流程。
 TEST_F(MigrationManagerTest, TestBatchSubmitPartialFailure) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
     ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "batch_pf_hot/"));
     ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "batch_pf_cold/"));
 
-    std::string good_loc_0 = CreateSourceLocation(900, "hot_01", true, "data0");
-    std::string good_loc_2 = CreateSourceLocation(902, "hot_01", true, "data2");
-
     std::vector<MigrationManager::MigrationRequest> reqs;
-    // req 0: good
-    {
+    for (int64_t block_key = 900; block_key <= 902; ++block_key) {
+        const std::string src_location_id = CreateSourceLocation(block_key, "hot_01", true, "data0");
+        const auto src = GetLocation(block_key, src_location_id);
+        ASSERT_NE(nullptr, src);
         MigrationManager::MigrationRequest r;
         r.instance_id = kInstance;
-        r.block_key = 900;
-        r.src_location_id = good_loc_0;
+        r.block_key = block_key;
+        r.src_location_id = src_location_id;
+        r.src_create_time = src->create_time();
         r.src_storage_name = "hot_01";
         r.dst_storage_name = "cold_01";
-        reqs.push_back(std::move(r));
-    }
-    // req 1: bad src_location_id
-    {
-        MigrationManager::MigrationRequest r;
-        r.instance_id = kInstance;
-        r.block_key = 901;
-        r.src_location_id = "nonexistent_loc";
-        r.src_storage_name = "hot_01";
-        r.dst_storage_name = "cold_01";
-        reqs.push_back(std::move(r));
-    }
-    // req 2: good
-    {
-        MigrationManager::MigrationRequest r;
-        r.instance_id = kInstance;
-        r.block_key = 902;
-        r.src_location_id = good_loc_2;
-        r.src_storage_name = "hot_01";
-        r.dst_storage_name = "cold_01";
+        r.src_specs = src->location_specs();
         reqs.push_back(std::move(r));
     }
 
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
     mgr.DebugEnableCopySubmissionsForTest();
+    Stub stub;
+    stub.set(ADDR(DataStorageManager, Create), prepared_batch_partial_create_stub::Create_stub);
     auto results = mgr.BatchSubmit("t", reqs);
     ASSERT_EQ(3u, results.size());
     ASSERT_EQ(ErrorCode::EC_OK, results[0]);
@@ -2647,6 +2710,8 @@ TEST_F(MigrationManagerTest, TestDrainingInstanceGateRejectsSubmit) {
     ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "draingate_cold/"));
 
     const std::string src1 = CreateSourceLocation(901, "hot_01", true, "d1");
+    const std::string src2 = CreateSourceLocation(902, "hot_01", true, "d2");
+    const std::string other_src = CreateSourceLocationForInstance(kOther, 903, "hot_01", true, "d3");
 
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
     mgr.DebugEnableCopySubmissionsForTest();
@@ -2668,17 +2733,19 @@ TEST_F(MigrationManagerTest, TestDrainingInstanceGateRejectsSubmit) {
     ASSERT_TRUE(mgr.GetActiveBlockKeysForInstance(kInstance).empty());
 
     // draining 中：BatchSubmit 也被拒（覆盖 admin/reclaimer 两路的共同下游 BatchSubmit）
-    std::vector<MigrationManager::MigrationRequest> batch;
-    batch.push_back(make_req(kInstance, 902, src1));
-    auto batch_res = mgr.BatchSubmit("t", batch);
+    auto prepared = make_req(kInstance, 902, src2);
+    const auto src2_location = GetLocation(902, src2);
+    ASSERT_NE(nullptr, src2_location);
+    prepared.src_create_time = src2_location->create_time();
+    prepared.src_specs = src2_location->location_specs();
+    auto batch_res = mgr.BatchSubmit("t", {prepared});
     ASSERT_EQ(1u, batch_res.size());
     ASSERT_NE(ErrorCode::EC_OK, batch_res[0]);
     ASSERT_TRUE(mgr.GetActiveBlockKeysForInstance(kInstance).empty());
 
     // 另一个未 drain 的 instance 提交不受影响（draining 是 per-instance）
-    ASSERT_EQ(0u, mgr.GetActiveBlockKeysForInstance(kOther).size());
-    // kOther 未 draining：Submit gate 不拒（源 location 缺失会在更后阶段失败，此处只验证未被 draining 挡下——
-    // 用 BatchSubmit 空 src_specs 走 fallback 到 PrepareCopyTask，返回非 draining 的错误码即可区分）。
+    ASSERT_EQ(ErrorCode::EC_OK, mgr.Submit("t", make_req(kOther, 903, other_src)));
+    ASSERT_EQ(1u, mgr.GetActiveBlockKeysForInstance(kOther).size());
 
     // EndDraining 后：kInstance 恢复可提交
     mgr.EndDrainingInstance(kInstance);

@@ -226,8 +226,8 @@ ErrorCode MigrationManager::PrepareCopyTask(const std::string &trace_id,
     }
 
     // 1. 读取源 location specs + create_time。
-    // F-10: 如果调用方（DispatchMigrationBatch）已在 admission 阶段取得 src_specs，直接使用，
-    // 跳过冗余 BatchGetLocation（每 block 省一次 meta 往返）。否则 fallback 重读。
+    // F-10: 如果调用方已在 admission 阶段取得 src_specs，直接使用并跳过冗余 BatchGetLocation；
+    // public 单条 Submit 仍允许不带快照，此时在这里重读源 location。private BatchSubmit 不走本函数。
     const std::vector<LocationSpec> *src_specs_ptr = nullptr;
     int64_t src_create_time = 0;
     if (!request.src_specs.empty()) {
@@ -508,6 +508,26 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
         return results;
     }
 
+    // R2-09/R2-10: BatchSubmit 是 DispatchMigrationBatch 的内部 prepared-request API，不再
+    // 兼容空 src_specs 后回读 meta 的第二套提交流程。整批共享的 indexer/target 均取 first_req，
+    // 因此任何 item 违反同 instance/target 或缺少源快照时，都必须在 reservation/I/O 前拒绝整批。
+    const auto &first_req = requests.front();
+    const bool prepared_batch =
+        !first_req.instance_id.empty() && !first_req.dst_storage_name.empty() &&
+        std::all_of(requests.begin(), requests.end(), [&first_req](const MigrationRequest &request) {
+            return request.instance_id == first_req.instance_id &&
+                   request.dst_storage_name == first_req.dst_storage_name && !request.src_location_id.empty() &&
+                   !request.src_storage_name.empty() && !request.src_specs.empty();
+        });
+    if (!prepared_batch) {
+        KVCM_LOG_WARN(
+            "[%s] reject invalid prepared migration batch: requests must share a non-empty instance/target and "
+            "carry non-empty source location/specs",
+            trace_id.c_str());
+        std::fill(results.begin(), results.end(), EC_BADARGS);
+        return results;
+    }
+
     // Stop 的 lifecycle barrier 与 Submit 相同：快检拒绝 shutdown 后的新调用；shared lock 覆盖本函数
     // 余下生命周期，但不串行其他 Submit/BatchSubmit。
     if (!accepting_copy_submissions_.load(std::memory_order_acquire)) {
@@ -584,7 +604,6 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
     // ---- phase 1: batch Create (按 size 分组) ----
     // 收集 eligible requests 的 src_specs → 构建 dst_key 列表 → 按 (dst_storage, size) 分组 batch Create。
     // per_block_src_uris[i] / per_block_dst_uris[i]: 第 i 个 request 的 src/dst URI 列表（按 spec 序）。
-    const auto &first_req = requests[0];
     auto indexer = meta_indexer_manager_ ? meta_indexer_manager_->GetMetaIndexer(first_req.instance_id) : nullptr;
     if (!indexer) {
         release_all_preparing();
@@ -619,13 +638,6 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
         if (!eligible[i])
             continue;
         auto &req = requests[i];
-        if (req.src_specs.empty()) {
-            // src_specs 未填充（非 DispatchMigrationBatch 路径）——标记 ineligible,
-            // batch Create 需要 src_specs，所以这类 request 退到末尾 fallback 逐条处理。
-            eligible[i] = false;
-            results[i] = EC_UNKNOWN; // 占位符，区分于真正的 EC_ERROR，fallback 循环据此识别
-            continue;
-        }
         for (std::size_t s = 0; s < req.src_specs.size(); ++s) {
             DataStorageUri src_uri(req.src_specs[s].uri());
             if (!src_uri.Valid()) {
@@ -716,10 +728,7 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
             preps[i].src_uris.clear();
             preps[i].dst_specs.clear();
         }
-        // EC_UNKNOWN 表示稍后仍要走单条 fallback，reservation 必须保留到该路径收敛。
-        if (results[i] != EC_UNKNOWN) {
-            release_preparing_at(i);
-        }
+        release_preparing_at(i);
     }
 
     // 收集成功 Create 的 block → batch AddLocation
@@ -894,82 +903,6 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
             results[i] = EC_OK;
         }
     } // if (!add_block_keys.empty())
-
-    // ---- fallback: 无 src_specs 的 request（直接调 BatchSubmit 但未经 DispatchMigrationBatch）----
-    // 这些 request 的 eligible[i]=false 且 results[i]=EC_ERROR（初始值），逐条走原 PrepareCopyTask。
-    // 不能回调 Submit（会递归获取非递归的 lifecycle shared_mutex），继续内联处理。
-    for (std::size_t i = 0; i < requests.size(); ++i) {
-        if (results[i] != EC_UNKNOWN)
-            continue;          // 只处理被标记为需 fallback 的（src_specs 为空）
-        results[i] = EC_ERROR; // 重置占位符为默认失败
-        if (requests[i].instance_id.empty()) {
-            release_preparing_at(i);
-            continue;
-        }
-        // 未经 batch Create 路径——复用 phase 0 已建立的 preparing reservation，逐条 PrepareCopyTask。
-        // 不能再次 Has/Insert，否则会把自己的 reservation 误判为重复任务。
-        CopyTaskContext ctx;
-        std::vector<DataStorageUri> src_uris, dst_uris;
-        if (PrepareCopyTask(trace_id, requests[i], ctx, src_uris, dst_uris) != EC_OK) {
-            release_preparing_at(i);
-            continue; // results[i] 保持 EC_ERROR
-        }
-        bool target_bound = false;
-        {
-            std::lock_guard<std::mutex> lock(task_mutex_);
-            target_bound = UpdatePreparingTaskLocked(ctx);
-        }
-        if (!target_bound) {
-            SubmitTargetLocationDelete(ctx);
-            release_preparing_at(i);
-            continue;
-        }
-
-        ctx.submit_time = std::chrono::steady_clock::now();
-        bool task_running = false;
-        {
-            std::lock_guard<std::mutex> lock(task_mutex_);
-            task_running = UpdatePreparingTaskLocked(ctx) && MarkTaskRunningLocked(ctx.instance_id, ctx.block_key);
-            if (task_running) {
-                reservation_active[i] = false;
-            }
-        }
-        if (!task_running) {
-            SubmitTargetLocationDelete(ctx);
-            release_preparing_at(i);
-            continue;
-        }
-
-        CacheLocationCopyRequest copy_req;
-        copy_req.instance_id = ctx.instance_id;
-        copy_req.block_key = ctx.block_key;
-        copy_req.exec_storage_name = ctx.src_storage_name;
-        copy_req.src_uris = std::move(src_uris);
-        copy_req.dst_uris = std::move(dst_uris);
-        std::future<PlanExecuteResult> future = schedule_plan_executor_->Submit(copy_req);
-        if (!future.valid()) {
-            SubmitTargetLocationDelete(ctx);
-            std::lock_guard<std::mutex> lock(task_mutex_);
-            RemoveActiveTaskLocked(ctx.instance_id, ctx.block_key);
-            continue;
-        }
-        {
-            std::lock_guard<std::mutex> lock(pending_mutex_);
-            pending_copies_.push_back(PendingCopy{ctx.instance_id, ctx.block_key, std::move(future)});
-        }
-        pending_cv_.notify_one();
-        stat_copy_submitted_.fetch_add(1, std::memory_order_relaxed);
-        if (metrics_enabled_) {
-            ++m_tasks_submitted_total_;
-        }
-        if (event_manager_ != nullptr) {
-            auto ev = std::make_shared<MigrationSubmittedEvent>(ctx.instance_id);
-            ev->SetEventTriggerTime();
-            ev->SetAdditionalArgs(ctx.block_key, ctx.src_storage_name, ctx.dst_storage_name, trace_id);
-            event_manager_->Publish(ev);
-        }
-        results[i] = EC_OK;
-    }
 
     // 防御性收口：正常路径此时只剩已转 kRunning 的 task（reservation_active=false）。任何遗漏的
     // preparing item 都不应泄漏到函数返回之后。

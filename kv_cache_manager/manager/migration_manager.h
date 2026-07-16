@@ -59,8 +59,9 @@ public:
         std::string src_storage_name; // 执行 Copy 的 backend（一期 = 源 storage 的 unique name）
         std::string dst_storage_name; // 目标 storage（冷层）
         MigrationRetention retention = MigrationRetention::MIGRATION_RETENTION_DELETE_SOURCE;
-        // F-10: admission 已定位的源 location 信息，传入 PrepareCopyTask 避免冗余 BatchGetLocation。
-        // 非空时 PrepareCopyTask 直接使用；空时 fallback 重读 meta（兼容不经 DispatchMigrationBatch 的调用方）。
+        // F-10: admission 已定位的源 location 信息，避免批量提交时冗余 BatchGetLocation。
+        // DispatchMigrationBatch 生成的 prepared request 必须非空；单条 Submit 可留空，由
+        // PrepareCopyTask 兼容性地重读 meta。
         std::vector<LocationSpec> src_specs;
         int64_t src_create_time = 0;
     };
@@ -105,10 +106,6 @@ public:
     // 同步完成"建目标 location + 提交 copy 任务"，copy 字节复制异步执行；
     // 返回 EC_OK 表示已成功登记任务（不代表复制完成）。
     ErrorCode Submit(const std::string &trace_id, MigrationRequest request);
-    // 批量提交，返回逐项结果（与 requests 一一对应）。
-    std::vector<ErrorCode> BatchSubmit(const std::string &trace_id,
-                                       std::vector<MigrationRequest> requests,
-                                       CopyConcurrencyLimit copy_limit = CopyConcurrencyLimit());
 
     // ---- copy 任务完成回调（监控线程驱动，亦可供测试直接调用） ----
     void OnTaskSuccess(const std::string &instance_id, int64_t block_key);
@@ -265,6 +262,14 @@ public:
     MigrationStats GetStats() const;
 
 private:
+    // R2-09: 仅供 DispatchMigrationBatch 使用的 prepared-request API，返回结果与 requests 逐项对齐。
+    // 前置条件：同批 request 属于同一 instance、目标 storage 相同、block_key 已去重，且每项已经
+    // 完成 admission 并填充非空 src_location_id/src_storage_name/src_specs。实现仍在入口做轻量
+    // shape 校验，违反 contract 时整批返回 EC_BADARGS，不进入 reservation/backend/meta I/O。
+    std::vector<ErrorCode> BatchSubmit(const std::string &trace_id,
+                                       std::vector<MigrationRequest> requests,
+                                       CopyConcurrencyLimit copy_limit = CopyConcurrencyLimit());
+
     // ---- 仅供测试/诊断（BUILD 通过 -fno-access-control 访问；F-07）----
     std::string GetActiveTaskDstLocation(const std::string &instance_id, int64_t block_key) const;
     void
