@@ -560,7 +560,7 @@ void AdminServiceImpl::MigrateCache(RequestContext *request_context,
     const bool do_mark =
         method == proto::admin::MIGRATION_METHOD_MARK || method == proto::admin::MIGRATION_METHOD_BOTH;
 
-    // F-05: 编排下沉到 CacheManager；service 层只做 proto glue + 结果映射。
+    // 编排下沉到 CacheManager；service 层只做 proto glue + 结果映射。
     // 显式 block_keys 优先，否则由 facade 按 rule.sample_count 采样（<=0 用默认）。
     const std::vector<int64_t> block_keys(request->block_keys().begin(), request->block_keys().end());
     const auto result = cache_manager_->MigrateCache(request_context,

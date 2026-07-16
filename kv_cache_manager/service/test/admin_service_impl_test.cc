@@ -72,7 +72,7 @@ public:
             cache_manager_, /*reporter*/ nullptr, metrics_registry_, registry_manager_, /*leader*/ nullptr);
         admin_->EnableLeaderOnlyRequests();
 
-        // MARK/BOTH 要求 group 配置了 migration strategy（F-01）。默认启用，让 MARK/BOTH 用例走正常路径；
+        // MARK/BOTH 要求 group 配置 migration strategy。默认启用，让 MARK/BOTH 用例走正常路径；
         // 需要验证"无 strategy 被拒"的用例可调用 SetDefaultMigrationStrategy(false)。
         SetDefaultMigrationStrategy(true);
         // 大多数既有用例关注迁移准入而非并发限制，给足额度；限流用例单独覆盖 limit=1。
@@ -81,7 +81,7 @@ public:
 
     void TearDown() override {}
 
-    // 设置/清除 default group 的 migration strategy（F-01 的 admin 侧准入依据）。
+    // 设置/清除 default group 的 migration strategy（Admin 侧的准入依据）。
     void SetDefaultMigrationStrategy(bool enabled) {
         auto it = registry_manager_->instance_group_configs_.find("default");
         ASSERT_TRUE(it != registry_manager_->instance_group_configs_.end());
@@ -427,7 +427,7 @@ TEST_F(AdminServiceImplTest, TestExplicitBlockKeysMarkCountsUniqueBlocks) {
     ASSERT_EQ(2u, cache_manager_->migration_manager()->GetStats().marks_added);
 }
 
-// F-01: 未配置 migration strategy 的 group，MARK 应被拒绝——避免打标成功但永不被写路径消费的假成功。
+// 未配置 migration strategy 的 group，MARK 应被拒绝，避免打标成功但永不被写路径消费的假成功。
 TEST_F(AdminServiceImplTest, TestMarkRejectedWhenNoMigrationStrategy) {
     SetDefaultMigrationStrategy(false); // 清除 strategy
     SeedServingSource(801);
@@ -559,8 +559,8 @@ TEST_F(AdminServiceImplTest, TestInstanceNotFound) {
     ASSERT_EQ(proto::admin::INSTANCE_NOT_EXIST, resp.header().status().code());
 }
 
-// F-02: target_storage_name 未注册时，MigrateCache 应直接拒绝（COPY 无处分配、MARK 会产生永不被满足的标记）。
-// 此前该用例用未注册 target 冒充 "copy 失败回落 mark"，实为把"目标无效"与"copy 失败"混淆；F-02 后应拒绝。
+// target_storage_name 未注册时，MigrateCache 应直接拒绝（COPY 无处分配、MARK 会产生永不被满足的标记）。
+// 未注册 target 属于目标无效，不能当作可回落到 mark 的 copy 失败。
 // 注：valid target 上"copy 失败→回落 mark"的路径缺确定性注入 hook，记为覆盖缺口（见追踪文档）。
 TEST_F(AdminServiceImplTest, TestMigrateCacheRejectsUnregisteredTargetStorage) {
     SeedServingSource(401);

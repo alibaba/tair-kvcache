@@ -1167,7 +1167,7 @@ TEST_F(SchedulePlanExecutorTest, TestCopyTaskSizeMismatch) {
     ASSERT_EQ(ErrorCode::EC_BADARGS, result.status);
 }
 
-// F-27: Copy 后端返回短 vector(违反 postcondition) → DoCopyTask 应整体判为失败，
+// Copy 后端返回短 vector（违反 postcondition）时，DoCopyTask 应整体判为失败，
 // 防止 MigrationManager promote 不完整目标 location。
 TEST_F(SchedulePlanExecutorTest, TestCopyTaskShortResultVector) {
     std::string root = GetPrivateTestRuntimeDataPath() + "copy_dummy_short/";

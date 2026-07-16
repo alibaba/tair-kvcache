@@ -93,7 +93,7 @@ public:
     MigrationStrategy() = default;
     ~MigrationStrategy() override;
 
-    // Getters (F-04: source/target 对称命名)
+    // Source/target getters use symmetric names.
     const std::string &source_storage_name() const { return source_storage_name_; }
     const std::string &target_storage_name() const { return target_storage_name_; }
     double trigger_threshold() const { return trigger_threshold_; }

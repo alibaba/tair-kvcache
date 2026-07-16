@@ -29,10 +29,10 @@
 
 using namespace kv_cache_manager;
 
-// ---- F-10 orphan-leak 测试用 DataStorageManager::Create/Delete 存根 ----
+// ---- orphan cleanup 测试用 DataStorageManager::Create/Delete 存根 ----
 // 复现"异构 size spec 分散到多个 create_group、某 group 失败使 block ineligible、
 // 后处理 group 已成功分配的 URI 被跳过 → rollback 漏删 → orphan"的场景。
-namespace f10_orphan_stub {
+namespace orphan_cleanup_stub {
 std::vector<DataStorageUri> g_created_uris;
 std::vector<DataStorageUri> g_deleted_uris;
 int g_create_call_count = 0;
@@ -68,12 +68,12 @@ std::vector<ErrorCode> Delete_stub(void * /*obj*/,
     }
     return std::vector<ErrorCode>(uris.size(), ErrorCode::EC_OK);
 }
-} // namespace f10_orphan_stub
+} // namespace orphan_cleanup_stub
 
-// ---- R2-08 batch Create 返回 shape 测试存根 ----
+// ---- batch Create 返回 shape 测试存根 ----
 // DataStorageBackend::Create 的契约是 keys/results 按下标一一对应；这里分别制造短返回和长返回，
 // 并记录所有成功返回的 URI，验证 shape 异常时调用方不会采用任何结果且会全部回滚。
-namespace r2_08_create_shape_stub {
+namespace create_result_shape_stub {
 enum class Shape {
     kShort,
     kLong,
@@ -121,7 +121,7 @@ bool WasDeleted(const DataStorageUri &created) {
         return deleted.ToUriString() == created.ToUriString();
     });
 }
-} // namespace r2_08_create_shape_stub
+} // namespace create_result_shape_stub
 
 // ---- prepared BatchSubmit 逐项 Create 失败测试存根 ----
 // 返回数量严格对齐，但第二项失败，验证普通 per-item failure 不会扩大成整组失败。
@@ -156,7 +156,7 @@ std::vector<std::pair<ErrorCode, DataStorageUri>> Create_stub(void * /*obj*/,
 }
 } // namespace prepared_batch_partial_create_stub
 
-namespace r2_04_mark_query_stub {
+namespace mark_query_result_stub {
 ErrorCode g_aggregate_ec = EC_OK;
 std::vector<ErrorCode> g_per_key_ecs;
 PropertyMapVector g_properties;
@@ -177,9 +177,9 @@ MetaIndexer::Result GetProperties_stub(void * /*obj*/,
     result.error_codes = g_per_key_ecs;
     return result;
 }
-} // namespace r2_04_mark_query_stub
+} // namespace mark_query_result_stub
 
-namespace r2_reservation_stub {
+namespace preparing_reservation_stub {
 MigrationManager *g_manager = nullptr;
 std::vector<std::pair<std::string, int64_t>> g_expected_reservations;
 bool g_all_reserved_before_create = true;
@@ -245,12 +245,12 @@ using CopySubmitLocation = std::future<PlanExecuteResult> (SchedulePlanExecutor:
 std::future<PlanExecuteResult> CopySubmitInvalid_stub(void * /*obj*/, const CacheLocationCopyRequest & /*request*/) {
     return {};
 }
-} // namespace r2_reservation_stub
+} // namespace preparing_reservation_stub
 
-// ---- R2-12 submission 锁域测试存根 ----
+// ---- submission 并发与锁域测试存根 ----
 // 第一笔 migration Create 可由测试精确卡住；后续 Create 仍可进入，用来区分“共享 lifecycle
 // barrier + 短准入锁”和旧的全函数互斥锁。所有状态都在同一 mutex 下访问，避免测试自身 data race。
-namespace r2_12_submission_stub {
+namespace submission_concurrency_stub {
 std::mutex g_mutex;
 std::condition_variable g_cv;
 bool g_block_first_create = false;
@@ -307,7 +307,7 @@ std::vector<std::pair<ErrorCode, DataStorageUri>> Create_stub(void * /*obj*/,
     }
     return results;
 }
-} // namespace r2_12_submission_stub
+} // namespace submission_concurrency_stub
 
 class CaptureEventPublisher : public EventPublisher {
 public:
@@ -505,7 +505,7 @@ public:
         return pred();
     }
 
-    // F-15: 旧的无条件 ClearTieredWriteMark 已删除，测试用 helper 模拟：
+    // 旧的无条件 ClearTieredWriteMark 已删除，测试用 helper 模拟：
     // 先查 mark 拿到 target+deadline，再做 match-clear。
     void ClearMarkForTest(MigrationManager &mgr, const std::string &instance_id, int64_t block_key) {
         std::vector<MigrationManager::MarkQueryResult> results;
@@ -537,17 +537,17 @@ TEST_F(MigrationManagerTest, TestSelectExplicitMigrationKeysDeduplicatesInOrder)
 
 TEST_F(MigrationManagerTest, TestBatchGetTieredWriteTargetsPreservesPartialResults) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
-    r2_04_mark_query_stub::Reset();
-    r2_04_mark_query_stub::g_aggregate_ec = EC_PARTIAL_OK;
-    r2_04_mark_query_stub::g_per_key_ecs = {EC_OK, EC_ERROR, EC_OK};
-    r2_04_mark_query_stub::g_properties = {
+    mark_query_result_stub::Reset();
+    mark_query_result_stub::g_aggregate_ec = EC_PARTIAL_OK;
+    mark_query_result_stub::g_per_key_ecs = {EC_OK, EC_ERROR, EC_OK};
+    mark_query_result_stub::g_properties = {
         {{MigrationManager::PROPERTY_TIERED_WRITE_TARGET, "cold_01"},
          {MigrationManager::PROPERTY_TIERED_WRITE_DEADLINE_MS, "9999999999999"}},
         {},
         {},
     };
     Stub stub;
-    stub.set(ADDR(MetaIndexer, GetProperties), r2_04_mark_query_stub::GetProperties_stub);
+    stub.set(ADDR(MetaIndexer, GetProperties), mark_query_result_stub::GetProperties_stub);
 
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_, metrics_registry_);
     std::vector<MigrationManager::MarkQueryResult> results;
@@ -569,12 +569,12 @@ TEST_F(MigrationManagerTest, TestBatchGetTieredWriteTargetsPreservesPartialResul
 
 TEST_F(MigrationManagerTest, TestBatchGetTieredWriteTargetsReportsAllReadFailures) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
-    r2_04_mark_query_stub::Reset();
-    r2_04_mark_query_stub::g_aggregate_ec = EC_ERROR;
-    r2_04_mark_query_stub::g_per_key_ecs = {EC_ERROR, EC_ERROR};
-    r2_04_mark_query_stub::g_properties = {{}, {}};
+    mark_query_result_stub::Reset();
+    mark_query_result_stub::g_aggregate_ec = EC_ERROR;
+    mark_query_result_stub::g_per_key_ecs = {EC_ERROR, EC_ERROR};
+    mark_query_result_stub::g_properties = {{}, {}};
     Stub stub;
-    stub.set(ADDR(MetaIndexer, GetProperties), r2_04_mark_query_stub::GetProperties_stub);
+    stub.set(ADDR(MetaIndexer, GetProperties), mark_query_result_stub::GetProperties_stub);
 
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_, metrics_registry_);
     std::vector<MigrationManager::MarkQueryResult> results;
@@ -591,14 +591,14 @@ TEST_F(MigrationManagerTest, TestBatchGetTieredWriteTargetsReportsAllReadFailure
 
 TEST_F(MigrationManagerTest, TestBatchGetTieredWriteTargetsDistinguishesBlockNotFound) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
-    r2_04_mark_query_stub::Reset();
+    mark_query_result_stub::Reset();
     // MetaIndexer 把 EC_NOENT 计入 aggregate partial；mark query 将其显式保留为状态，
     // 但不视为存储读取故障，因此对调用方返回 EC_OK。
-    r2_04_mark_query_stub::g_aggregate_ec = EC_PARTIAL_OK;
-    r2_04_mark_query_stub::g_per_key_ecs = {EC_NOENT, EC_OK};
-    r2_04_mark_query_stub::g_properties = {{}, {}};
+    mark_query_result_stub::g_aggregate_ec = EC_PARTIAL_OK;
+    mark_query_result_stub::g_per_key_ecs = {EC_NOENT, EC_OK};
+    mark_query_result_stub::g_properties = {{}, {}};
     Stub stub;
-    stub.set(ADDR(MetaIndexer, GetProperties), r2_04_mark_query_stub::GetProperties_stub);
+    stub.set(ADDR(MetaIndexer, GetProperties), mark_query_result_stub::GetProperties_stub);
 
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_, metrics_registry_);
     std::vector<MigrationManager::MarkQueryResult> results;
@@ -614,12 +614,12 @@ TEST_F(MigrationManagerTest, TestBatchGetTieredWriteTargetsDistinguishesBlockNot
 
 TEST_F(MigrationManagerTest, TestBatchGetTieredWriteTargetsRejectsMisalignedOutput) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
-    r2_04_mark_query_stub::Reset();
-    r2_04_mark_query_stub::g_aggregate_ec = EC_OK;
-    r2_04_mark_query_stub::g_per_key_ecs = {EC_OK, EC_OK};
-    r2_04_mark_query_stub::g_properties = {{{MigrationManager::PROPERTY_TIERED_WRITE_TARGET, "stale"}}};
+    mark_query_result_stub::Reset();
+    mark_query_result_stub::g_aggregate_ec = EC_OK;
+    mark_query_result_stub::g_per_key_ecs = {EC_OK, EC_OK};
+    mark_query_result_stub::g_properties = {{{MigrationManager::PROPERTY_TIERED_WRITE_TARGET, "stale"}}};
     Stub stub;
-    stub.set(ADDR(MetaIndexer, GetProperties), r2_04_mark_query_stub::GetProperties_stub);
+    stub.set(ADDR(MetaIndexer, GetProperties), mark_query_result_stub::GetProperties_stub);
 
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_, metrics_registry_);
     MigrationManager::MarkQueryResult stale;
@@ -741,7 +741,7 @@ TEST_F(MigrationManagerTest, TestMarkLifecycle) {
     ASSERT_EQ(2u, stats.active_marks); // best-effort = added - cleared
 }
 
-// F-15: match-clear 不会清掉同 block 上后来打的新 mark（不同 target 或 deadline）。
+// match-clear 不会清掉同 block 上后来打的新 mark（不同 target 或 deadline）。
 TEST_F(MigrationManagerTest, TestClearMarkDoesNotClobberNewerMark) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
     ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "clobber_hot/"));
@@ -779,7 +779,7 @@ TEST_F(MigrationManagerTest, TestClearMarkDoesNotClobberNewerMark) {
     mgr.Stop();
 }
 
-// F-14: 部分 key 因 block 不存在被 MA_SKIP 时，marks_added / expiry / event 只计实际成功数，
+// 部分 key 因 block 不存在被 MA_SKIP 时，marks_added / expiry / event 只计实际成功数，
 // 不按 request 全量计——否则 active_marks(added-cleared) 会单调膨胀。
 TEST_F(MigrationManagerTest, TestMarkStatsOnlyCountActualSuccess) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
@@ -811,7 +811,7 @@ TEST_F(MigrationManagerTest, TestMarkStatsOnlyCountActualSuccess) {
     ASSERT_EQ(0u, stats.active_marks);     // 完全收敛，无漂移
 }
 
-// F-02: 打标到未注册的 target storage 应失败（EC_NOENT）且不写入任何 mark，
+// 打标到未注册的 target storage 应失败（EC_NOENT）且不写入任何 mark，
 // 避免产生"永不被满足、只能等超时"的孤儿标记。覆盖 reclaimer 打标路径。
 TEST_F(MigrationManagerTest, TestMarkForTieredWriteRejectsUnregisteredTarget) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
@@ -1030,7 +1030,7 @@ TEST_F(MigrationManagerTest, TestSubmitThenSuccessDeleteSource) {
     ASSERT_EQ(1u, stats.copy_completed);
 }
 
-// R2-03: Copy 只允许消费与自身 destination 一致的 mark。写往 cold_02 的 Copy
+// Copy 只允许消费与自身 destination 一致的 mark。写往 cold_02 的 Copy
 // 即使成功，也不能清掉仍要求写往 cold_01 的独立迁移意图。
 TEST_F(MigrationManagerTest, TestSubmitSuccessDoesNotClearMarkForDifferentTarget) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
@@ -1126,7 +1126,7 @@ TEST_F(MigrationManagerTest, TestSubmitThenSuccessSourceLost) {
     ASSERT_EQ(1u, stats.copy_failed);
 }
 
-// F-08: Submit 时 PrepareCopyTask 应记录 src_create_time。当源 location 的 create_time 与记录不匹配时
+// Submit 时 PrepareCopyTask 应记录 src_create_time。当源 location 的 create_time 与记录不匹配时
 // (id 复用场景),OnTaskSuccess 应按 source_lost 处理并清理目标半成品。
 // 验证方式:创建带非零 create_time 的源,Submit,保留源但手动篡改活跃任务中的 src_create_time
 // 使其不匹配→OnTaskSuccess 应判 source_lost。
@@ -1172,7 +1172,7 @@ TEST_F(MigrationManagerTest, TestSubmitThenSuccessSourceCreateTimeMismatch) {
     ASSERT_EQ(1u, mgr.GetStats().copy_failed);
 }
 
-// F-17: create_time=0 边界——源和 ctx 都默认 0,0==0 应视为匹配,正常 promote。
+// create_time=0 边界：源和 ctx 都默认 0，0==0 应视为匹配并正常 promote。
 TEST_F(MigrationManagerTest, TestSubmitThenSuccessSourceCreateTimeZeroMatches) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
     ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "ct0_hot/"));
@@ -1233,7 +1233,7 @@ TEST_F(MigrationManagerTest, TestSubmitThenFail) {
     ASSERT_EQ(1u, mgr.GetStats().copy_failed);
 }
 
-// ============ F-11：Cancel 任务状态机（认领 + 延迟收尾） ============
+// ============ Cancel 任务状态机（认领 + 延迟收尾） ============
 
 // Cancel 只标 cancelling、不立即清理；任务与 WRITING 目标保留（slot 保护）；待完成回调收尾。
 TEST_F(MigrationManagerTest, TestCancelDefersCleanupAndKeepsSlot) {
@@ -1455,7 +1455,7 @@ TEST_F(MigrationManagerTest, TestEndToEndCopySourceMissing) {
 
 // ============ 重复提交 ============
 
-// R2-01/R2-02: preparing 与现有 active task 共用一张表，并显式覆盖去重、Reclaimer、
+// preparing 与现有 active task 共用一张表，并显式覆盖去重、Reclaimer、
 // completion/cancel 以及 preparing->running 的状态转换。
 TEST_F(MigrationManagerTest, TestPreparingReservationStateMachine) {
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
@@ -1528,7 +1528,7 @@ TEST_F(MigrationManagerTest, TestPreparingReservationStateMachine) {
     ASSERT_EQ(0u, mgr.ActiveTaskCount());
 }
 
-// R2-01: 单条 Submit 在第一次目标 Create 前就必须让 preparing 对 active-target 查询可见。
+// 单条 Submit 在第一次目标 Create 前就必须让 preparing 对 active-target 查询可见。
 TEST_F(MigrationManagerTest, TestSubmitReservesPreparingBeforeCreate) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
     ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "reserve_single_hot/"));
@@ -1539,11 +1539,11 @@ TEST_F(MigrationManagerTest, TestSubmitReservesPreparingBeforeCreate) {
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
     mgr.DebugEnableCopySubmissionsForTest();
 
-    r2_reservation_stub::Reset();
-    r2_reservation_stub::g_manager = &mgr;
-    r2_reservation_stub::g_expected_reservations = {{kInstance, block_key}};
+    preparing_reservation_stub::Reset();
+    preparing_reservation_stub::g_manager = &mgr;
+    preparing_reservation_stub::g_expected_reservations = {{kInstance, block_key}};
     Stub stub;
-    stub.set(ADDR(DataStorageManager, Create), r2_reservation_stub::Create_stub);
+    stub.set(ADDR(DataStorageManager, Create), preparing_reservation_stub::Create_stub);
 
     MigrationManager::MigrationRequest req;
     req.instance_id = kInstance;
@@ -1551,18 +1551,18 @@ TEST_F(MigrationManagerTest, TestSubmitReservesPreparingBeforeCreate) {
     req.src_location_id = src_loc;
     req.src_storage_name = "hot_01";
     req.dst_storage_name = "cold_01";
-    ASSERT_EQ(EC_OK, mgr.Submit("r2_01_reserve", req));
+    ASSERT_EQ(EC_OK, mgr.Submit("preparing_reservation", req));
 
-    ASSERT_GT(r2_reservation_stub::g_create_calls, 0);
-    ASSERT_TRUE(r2_reservation_stub::g_all_reserved_before_create);
-    ASSERT_TRUE(r2_reservation_stub::g_all_block_scoped_targets_protected);
+    ASSERT_GT(preparing_reservation_stub::g_create_calls, 0);
+    ASSERT_TRUE(preparing_reservation_stub::g_all_reserved_before_create);
+    ASSERT_TRUE(preparing_reservation_stub::g_all_block_scoped_targets_protected);
     const std::string dst_loc = mgr.GetActiveTaskDstLocation(kInstance, block_key);
     ASSERT_FALSE(dst_loc.empty());
     ASSERT_TRUE(mgr.HasActiveCopyTargetLocation(kInstance, block_key, dst_loc));
     ASSERT_FALSE(mgr.HasActiveCopyTargetLocation(kInstance, block_key, "future_location_probe"));
 }
 
-// R2-01: Cancel 与同步 Prepare I/O 并发时只标记 reservation；提交线程返回后必须清目标、释放
+// Cancel 与同步 Prepare I/O 并发时只标记 reservation；提交线程返回后必须清目标、释放
 // reservation，且绝不能把取消态覆盖成 kRunning 或向 executor 提交 copy。
 TEST_F(MigrationManagerTest, TestSubmitCancelDuringPrepareStopsBeforeCopy) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
@@ -1574,12 +1574,12 @@ TEST_F(MigrationManagerTest, TestSubmitCancelDuringPrepareStopsBeforeCopy) {
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
     mgr.DebugEnableCopySubmissionsForTest();
 
-    r2_reservation_stub::Reset();
-    r2_reservation_stub::g_manager = &mgr;
-    r2_reservation_stub::g_expected_reservations = {{kInstance, block_key}};
-    r2_reservation_stub::g_cancel_first_reservation_on_create = true;
+    preparing_reservation_stub::Reset();
+    preparing_reservation_stub::g_manager = &mgr;
+    preparing_reservation_stub::g_expected_reservations = {{kInstance, block_key}};
+    preparing_reservation_stub::g_cancel_first_reservation_on_create = true;
     Stub stub;
-    stub.set(ADDR(DataStorageManager, Create), r2_reservation_stub::Create_stub);
+    stub.set(ADDR(DataStorageManager, Create), preparing_reservation_stub::Create_stub);
 
     MigrationManager::MigrationRequest req;
     req.instance_id = kInstance;
@@ -1587,8 +1587,8 @@ TEST_F(MigrationManagerTest, TestSubmitCancelDuringPrepareStopsBeforeCopy) {
     req.src_location_id = src_loc;
     req.src_storage_name = "hot_01";
     req.dst_storage_name = "cold_01";
-    ASSERT_EQ(EC_ERROR, mgr.Submit("r2_01_cancel_prepare", req));
-    ASSERT_EQ(std::optional<ErrorCode>(EC_OK), r2_reservation_stub::g_cancel_result);
+    ASSERT_EQ(EC_ERROR, mgr.Submit("cancel_preparing_reservation", req));
+    ASSERT_EQ(std::optional<ErrorCode>(EC_OK), preparing_reservation_stub::g_cancel_result);
     ASSERT_EQ(0u, mgr.GetStats().copy_submitted);
     ASSERT_FALSE(mgr.HasMigrationTask(kInstance, block_key));
     ASSERT_EQ(0u, mgr.ActiveTaskCount());
@@ -1606,8 +1606,8 @@ TEST_F(MigrationManagerTest, TestSubmitExecutorFailureReleasesActiveTask) {
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
     mgr.DebugEnableCopySubmissionsForTest();
     Stub stub;
-    stub.set(static_cast<r2_reservation_stub::CopySubmitLocation>(ADDR(SchedulePlanExecutor, Submit)),
-             r2_reservation_stub::CopySubmitInvalid_stub);
+    stub.set(static_cast<preparing_reservation_stub::CopySubmitLocation>(ADDR(SchedulePlanExecutor, Submit)),
+             preparing_reservation_stub::CopySubmitInvalid_stub);
 
     MigrationManager::MigrationRequest req;
     req.instance_id = kInstance;
@@ -1615,7 +1615,7 @@ TEST_F(MigrationManagerTest, TestSubmitExecutorFailureReleasesActiveTask) {
     req.src_location_id = src_loc;
     req.src_storage_name = "hot_01";
     req.dst_storage_name = "cold_01";
-    ASSERT_EQ(EC_ERROR, mgr.Submit("r2_01_submit_fail", req));
+    ASSERT_EQ(EC_ERROR, mgr.Submit("copy_executor_submit_failure", req));
     ASSERT_FALSE(mgr.HasMigrationTask(kInstance, block_key));
     ASSERT_EQ(0u, mgr.ActiveTaskCount());
     ASSERT_TRUE(WaitFor([&]() { return LocationCount(block_key) == 1u; }));
@@ -1642,7 +1642,7 @@ TEST_F(MigrationManagerTest, TestSubmitDuplicate) {
     ASSERT_EQ(1u, mgr.ActiveTaskCount());
 }
 
-// R2-14: success 用例必须显式证明走了真批量主路径。同尺寸的三个 prepared request 应合并为
+// success 用例必须显式证明走了真批量主路径。同尺寸的三个 prepared request 应合并为
 // 一次三 key Create，并一次发布三个 WRITING location；不能只凭最终 EC_OK 间接判断。
 TEST_F(MigrationManagerTest, TestBatchSubmit) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
@@ -1667,19 +1667,19 @@ TEST_F(MigrationManagerTest, TestBatchSubmit) {
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
     mgr.DebugEnableCopySubmissionsForTest();
 
-    r2_reservation_stub::Reset();
-    r2_reservation_stub::g_manager = &mgr;
-    r2_reservation_stub::g_expected_reservations = {{kInstance, 800}, {kInstance, 801}, {kInstance, 802}};
+    preparing_reservation_stub::Reset();
+    preparing_reservation_stub::g_manager = &mgr;
+    preparing_reservation_stub::g_expected_reservations = {{kInstance, 800}, {kInstance, 801}, {kInstance, 802}};
     Stub stub;
-    stub.set(ADDR(DataStorageManager, Create), r2_reservation_stub::Create_stub);
+    stub.set(ADDR(DataStorageManager, Create), preparing_reservation_stub::Create_stub);
 
     auto results = mgr.BatchSubmit("t", reqs);
     ASSERT_EQ(3u, results.size());
     for (auto ec : results) {
         ASSERT_EQ(ErrorCode::EC_OK, ec);
     }
-    ASSERT_EQ(1, r2_reservation_stub::g_create_calls);
-    ASSERT_EQ((std::vector<std::size_t>{3}), r2_reservation_stub::g_create_key_counts);
+    ASSERT_EQ(1, preparing_reservation_stub::g_create_calls);
+    ASSERT_EQ((std::vector<std::size_t>{3}), preparing_reservation_stub::g_create_key_counts);
     ASSERT_EQ(3u, mgr.ActiveTaskCount());
     for (int64_t block_key = 800; block_key < 803; ++block_key) {
         const std::string dst_location_id = mgr.GetActiveTaskDstLocation(kInstance, block_key);
@@ -1689,14 +1689,14 @@ TEST_F(MigrationManagerTest, TestBatchSubmit) {
     }
 }
 
-// R2-10: private prepared-request API 不再兼容空 src_specs fallback。违反 contract 时必须在
+// private prepared-request API 不兼容空 src_specs fallback。违反 contract 时必须在
 // reservation/backend/meta I/O 前整批返回 EC_BADARGS。
 TEST_F(MigrationManagerTest, TestBatchSubmitRejectsEmptySourceSpecsBeforeIo) {
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
     mgr.DebugEnableCopySubmissionsForTest();
-    r2_reservation_stub::Reset();
+    preparing_reservation_stub::Reset();
     Stub stub;
-    stub.set(ADDR(DataStorageManager, Create), r2_reservation_stub::Create_stub);
+    stub.set(ADDR(DataStorageManager, Create), preparing_reservation_stub::Create_stub);
 
     MigrationManager::MigrationRequest request;
     request.instance_id = kInstance;
@@ -1705,21 +1705,21 @@ TEST_F(MigrationManagerTest, TestBatchSubmitRejectsEmptySourceSpecsBeforeIo) {
     request.src_storage_name = "hot_01";
     request.dst_storage_name = "cold_01";
 
-    const auto results = mgr.BatchSubmit("r2_10_empty_specs", {request});
+    const auto results = mgr.BatchSubmit("reject_empty_source_specs", {request});
     ASSERT_EQ(1u, results.size());
     ASSERT_EQ(EC_BADARGS, results[0]);
-    ASSERT_EQ(0, r2_reservation_stub::g_create_calls);
+    ASSERT_EQ(0, preparing_reservation_stub::g_create_calls);
     ASSERT_EQ(0u, mgr.ActiveTaskCount());
 }
 
-// R2-09: 实现只持有一份 first_req indexer/target，混合 instance/target 的 batch 不能进入
+// 实现只持有一份 first_req indexer/target，混合 instance/target 的 batch 不能进入
 // Create 或 reservation；private contract 被内部误用时也要安全失败。
 TEST_F(MigrationManagerTest, TestBatchSubmitRejectsMixedPreparedBatchBeforeIo) {
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
     mgr.DebugEnableCopySubmissionsForTest();
-    r2_reservation_stub::Reset();
+    preparing_reservation_stub::Reset();
     Stub stub;
-    stub.set(ADDR(DataStorageManager, Create), r2_reservation_stub::Create_stub);
+    stub.set(ADDR(DataStorageManager, Create), preparing_reservation_stub::Create_stub);
 
     MigrationManager::MigrationRequest first;
     first.instance_id = kInstance;
@@ -1733,15 +1733,15 @@ TEST_F(MigrationManagerTest, TestBatchSubmitRejectsMixedPreparedBatchBeforeIo) {
     second.block_key = 806;
     second.dst_storage_name = "cold_02";
 
-    const auto results = mgr.BatchSubmit("r2_09_mixed_batch", {first, second});
+    const auto results = mgr.BatchSubmit("reject_mixed_prepared_batch", {first, second});
     ASSERT_EQ(2u, results.size());
     ASSERT_EQ(EC_BADARGS, results[0]);
     ASSERT_EQ(EC_BADARGS, results[1]);
-    ASSERT_EQ(0, r2_reservation_stub::g_create_calls);
+    ASSERT_EQ(0, preparing_reservation_stub::g_create_calls);
     ASSERT_EQ(0u, mgr.ActiveTaskCount());
 }
 
-// R2-02: 真批量路径必须在第一次 batch Create 前 reserve 所有 eligible block；批内重复逐项失败，
+// 真批量路径必须在第一次 batch Create 前 reserve 所有 eligible block；批内重复逐项失败，
 // 不能中止其他项，也不能多占一个并发 slot。
 TEST_F(MigrationManagerTest, TestBatchReservesAllBeforeCreateAndDeduplicates) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
@@ -1772,21 +1772,21 @@ TEST_F(MigrationManagerTest, TestBatchReservesAllBeforeCreateAndDeduplicates) {
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
     mgr.DebugEnableCopySubmissionsForTest();
 
-    r2_reservation_stub::Reset();
-    r2_reservation_stub::g_manager = &mgr;
-    r2_reservation_stub::g_expected_reservations = {{kInstance, 810}, {kInstance, 811}};
+    preparing_reservation_stub::Reset();
+    preparing_reservation_stub::g_manager = &mgr;
+    preparing_reservation_stub::g_expected_reservations = {{kInstance, 810}, {kInstance, 811}};
     Stub stub;
-    stub.set(ADDR(DataStorageManager, Create), r2_reservation_stub::Create_stub);
+    stub.set(ADDR(DataStorageManager, Create), preparing_reservation_stub::Create_stub);
 
     auto results = mgr.BatchSubmit(
-        "r2_02_reserve", {first, duplicate, second}, MigrationManager::CopyConcurrencyLimit{"group_a", 2});
+        "batch_preparing_reservation", {first, duplicate, second}, MigrationManager::CopyConcurrencyLimit{"group_a", 2});
     ASSERT_EQ(3u, results.size());
     ASSERT_EQ(EC_OK, results[0]);
     ASSERT_EQ(EC_EXIST, results[1]);
     ASSERT_EQ(EC_OK, results[2]);
-    ASSERT_GT(r2_reservation_stub::g_create_calls, 0);
-    ASSERT_TRUE(r2_reservation_stub::g_all_reserved_before_create);
-    ASSERT_TRUE(r2_reservation_stub::g_all_block_scoped_targets_protected);
+    ASSERT_GT(preparing_reservation_stub::g_create_calls, 0);
+    ASSERT_TRUE(preparing_reservation_stub::g_all_reserved_before_create);
+    ASSERT_TRUE(preparing_reservation_stub::g_all_block_scoped_targets_protected);
     ASSERT_EQ(2u, mgr.ActiveTaskCount());
     ASSERT_TRUE(mgr.HasMigrationTask(kInstance, 810));
     ASSERT_TRUE(mgr.HasMigrationTask(kInstance, 811));
@@ -1794,7 +1794,7 @@ TEST_F(MigrationManagerTest, TestBatchReservesAllBeforeCreateAndDeduplicates) {
     ASSERT_FALSE(mgr.GetActiveTaskDstLocation(kInstance, 811).empty());
 }
 
-// R2-02: batch AddLocation 失败时，所有尚未运行的 reservation 必须释放；此后即使 meta 曾部分
+// batch AddLocation 失败时，所有尚未运行的 reservation 必须释放；此后即使 meta 曾部分
 // 成功，残留 WRITING 也只是无 copy 在跑的真正 orphan。
 TEST_F(MigrationManagerTest, TestBatchAddLocationFailureReleasesPreparingReservations) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
@@ -1818,9 +1818,9 @@ TEST_F(MigrationManagerTest, TestBatchAddLocationFailureReleasesPreparingReserva
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
     mgr.DebugEnableCopySubmissionsForTest();
     Stub stub;
-    stub.set(ADDR(MetaIndexer, ReadModifyWriteBlock), r2_reservation_stub::ReadModifyWriteBlockFail_stub);
+    stub.set(ADDR(MetaIndexer, ReadModifyWriteBlock), preparing_reservation_stub::ReadModifyWriteBlockFail_stub);
 
-    const auto results = mgr.BatchSubmit("r2_02_add_fail", {req});
+    const auto results = mgr.BatchSubmit("batch_add_location_failure", {req});
     ASSERT_EQ(1u, results.size());
     ASSERT_NE(EC_OK, results[0]);
     ASSERT_FALSE(mgr.HasMigrationTask(kInstance, block_key));
@@ -1828,7 +1828,7 @@ TEST_F(MigrationManagerTest, TestBatchAddLocationFailureReleasesPreparingReserva
     ASSERT_EQ(1u, LocationCount(block_key));
 }
 
-// R2-02: 真批量路径在 Create 阶段收到取消后，同样不能覆盖取消态或提交 copy。
+// 真批量路径在 Create 阶段收到取消后，同样不能覆盖取消态或提交 copy。
 TEST_F(MigrationManagerTest, TestBatchCancelDuringPrepareStopsBeforeCopy) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
     ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "reserve_batch_cancel_hot/"));
@@ -1850,30 +1850,30 @@ TEST_F(MigrationManagerTest, TestBatchCancelDuringPrepareStopsBeforeCopy) {
 
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
     mgr.DebugEnableCopySubmissionsForTest();
-    r2_reservation_stub::Reset();
-    r2_reservation_stub::g_manager = &mgr;
-    r2_reservation_stub::g_expected_reservations = {{kInstance, block_key}};
-    r2_reservation_stub::g_cancel_first_reservation_on_create = true;
+    preparing_reservation_stub::Reset();
+    preparing_reservation_stub::g_manager = &mgr;
+    preparing_reservation_stub::g_expected_reservations = {{kInstance, block_key}};
+    preparing_reservation_stub::g_cancel_first_reservation_on_create = true;
     Stub stub;
-    stub.set(ADDR(DataStorageManager, Create), r2_reservation_stub::Create_stub);
+    stub.set(ADDR(DataStorageManager, Create), preparing_reservation_stub::Create_stub);
 
-    const auto results = mgr.BatchSubmit("r2_02_cancel_prepare", {req});
+    const auto results = mgr.BatchSubmit("batch_cancel_preparing", {req});
     ASSERT_EQ(1u, results.size());
     ASSERT_EQ(EC_ERROR, results[0]);
-    ASSERT_EQ(std::optional<ErrorCode>(EC_OK), r2_reservation_stub::g_cancel_result);
+    ASSERT_EQ(std::optional<ErrorCode>(EC_OK), preparing_reservation_stub::g_cancel_result);
     ASSERT_EQ(0u, mgr.GetStats().copy_submitted);
     ASSERT_FALSE(mgr.HasMigrationTask(kInstance, block_key));
     ASSERT_TRUE(WaitFor([&]() { return LocationCount(block_key) == 1u; }));
 }
 
-// R2-12: 一笔 Submit 卡在同步 Create 时，另一个 instance 的 Submit 仍可进入自己的 Create；
+// 一笔 Submit 卡在同步 Create 时，另一个 instance 的 Submit 仍可进入自己的 Create；
 // lifecycle shared lock 只与 Stop 互斥，不能重新退化成 Submit 之间的全局串行锁。
 TEST_F(MigrationManagerTest, TestSlowCreateDoesNotSerializeOtherInstanceSubmit) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
-    const std::string other_instance = "r2_12_other_instance";
+    const std::string other_instance = "parallel_submit_other_instance";
     ASSERT_TRUE(CreateMetaIndexer(other_instance));
-    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "r2_12_parallel_hot/"));
-    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "r2_12_parallel_cold/"));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "parallel_submit_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "parallel_submit_cold/"));
 
     const std::string first_src = CreateSourceLocation(821, "hot_01", true, "parallel-first");
     const std::string second_src =
@@ -1891,24 +1891,24 @@ TEST_F(MigrationManagerTest, TestSlowCreateDoesNotSerializeOtherInstanceSubmit) 
         return req;
     };
 
-    r2_12_submission_stub::Reset();
+    submission_concurrency_stub::Reset();
     Stub stub;
-    stub.set(ADDR(DataStorageManager, Create), r2_12_submission_stub::Create_stub);
+    stub.set(ADDR(DataStorageManager, Create), submission_concurrency_stub::Create_stub);
     auto first = std::async(std::launch::async,
-                            [&]() { return mgr.Submit("r2_12_parallel_first", make_req(kInstance, 821, first_src)); });
-    const bool first_entered = r2_12_submission_stub::WaitForFirstCreate();
+                            [&]() { return mgr.Submit("parallel_submit_first", make_req(kInstance, 821, first_src)); });
+    const bool first_entered = submission_concurrency_stub::WaitForFirstCreate();
     if (!first_entered) {
-        r2_12_submission_stub::ReleaseFirstCreate();
+        submission_concurrency_stub::ReleaseFirstCreate();
         first.wait();
         EXPECT_TRUE(first_entered);
         return;
     }
 
     auto second = std::async(std::launch::async, [&]() {
-        return mgr.Submit("r2_12_parallel_second", make_req(other_instance, 822, second_src));
+        return mgr.Submit("parallel_submit_second", make_req(other_instance, 822, second_src));
     });
     const auto second_status_before_release = second.wait_for(std::chrono::seconds(5));
-    r2_12_submission_stub::ReleaseFirstCreate();
+    submission_concurrency_stub::ReleaseFirstCreate();
     const auto first_ec = first.get();
     const auto second_ec = second.get();
 
@@ -1916,15 +1916,15 @@ TEST_F(MigrationManagerTest, TestSlowCreateDoesNotSerializeOtherInstanceSubmit) 
         << "second Submit was serialized behind an unrelated slow Create";
     ASSERT_EQ(EC_OK, first_ec);
     ASSERT_EQ(EC_OK, second_ec);
-    ASSERT_EQ(2, r2_12_submission_stub::CreateCallCount());
+    ASSERT_EQ(2, submission_concurrency_stub::CreateCallCount());
 }
 
-// R2-12: drain 在慢 Create 期间必须快速关 gate，并用已可见的 preparing reservation 做一次 Cancel。
+// drain 在慢 Create 期间必须快速关 gate，并用已可见的 preparing reservation 做一次 Cancel。
 // Cancel 持久化为 kPrepareCancelling，Create 返回后提交线程应回滚，绝不能进入 executor。
 TEST_F(MigrationManagerTest, TestDrainCancelsReservationDuringSlowCreate) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
-    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "r2_12_drain_hot/"));
-    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "r2_12_drain_cold/"));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "drain_during_create_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "drain_during_create_cold/"));
 
     const int64_t block_key = 823;
     const std::string src = CreateSourceLocation(block_key, "hot_01", true, "drain-slow-create");
@@ -1938,13 +1938,13 @@ TEST_F(MigrationManagerTest, TestDrainCancelsReservationDuringSlowCreate) {
     req.src_storage_name = "hot_01";
     req.dst_storage_name = "cold_01";
 
-    r2_12_submission_stub::Reset();
+    submission_concurrency_stub::Reset();
     Stub stub;
-    stub.set(ADDR(DataStorageManager, Create), r2_12_submission_stub::Create_stub);
-    auto submit = std::async(std::launch::async, [&]() { return mgr.Submit("r2_12_drain", req); });
-    const bool create_entered = r2_12_submission_stub::WaitForFirstCreate();
+    stub.set(ADDR(DataStorageManager, Create), submission_concurrency_stub::Create_stub);
+    auto submit = std::async(std::launch::async, [&]() { return mgr.Submit("drain_during_create", req); });
+    const bool create_entered = submission_concurrency_stub::WaitForFirstCreate();
     if (!create_entered) {
-        r2_12_submission_stub::ReleaseFirstCreate();
+        submission_concurrency_stub::ReleaseFirstCreate();
         submit.wait();
         EXPECT_TRUE(create_entered);
         return;
@@ -1956,7 +1956,7 @@ TEST_F(MigrationManagerTest, TestDrainCancelsReservationDuringSlowCreate) {
         return std::make_pair(keys, mgr.BatchCancel(kInstance, keys));
     });
     const auto drain_status_before_release = drain.wait_for(std::chrono::seconds(5));
-    r2_12_submission_stub::ReleaseFirstCreate();
+    submission_concurrency_stub::ReleaseFirstCreate();
     const auto drain_result = drain.get();
     const auto submit_ec = submit.get();
     mgr.EndDrainingInstance(kInstance);
@@ -1970,12 +1970,12 @@ TEST_F(MigrationManagerTest, TestDrainCancelsReservationDuringSlowCreate) {
     ASSERT_FALSE(mgr.HasMigrationTask(kInstance, block_key));
 }
 
-// R2-12: Stop 先关闭 accepting，再通过 lifecycle unique lock 等待已准入 Submit 完整返回。
+// Stop 先关闭 accepting，再通过 lifecycle unique lock 等待已准入 Submit 完整返回。
 // 等待期间新请求应快速失败；Stop 不得在慢 Create owner 仍可能回写 active/pending 时提前清表。
 TEST_F(MigrationManagerTest, TestStopWaitsForSlowSubmitLifecycle) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
-    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "r2_12_stop_hot/"));
-    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "r2_12_stop_cold/"));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "stop_inflight_submit_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "stop_inflight_submit_cold/"));
 
     const std::string first_src = CreateSourceLocation(824, "hot_01", true, "stop-first");
     const std::string rejected_src = CreateSourceLocation(825, "hot_01", true, "stop-rejected");
@@ -1992,14 +1992,14 @@ TEST_F(MigrationManagerTest, TestStopWaitsForSlowSubmitLifecycle) {
         return req;
     };
 
-    r2_12_submission_stub::Reset();
+    submission_concurrency_stub::Reset();
     Stub stub;
-    stub.set(ADDR(DataStorageManager, Create), r2_12_submission_stub::Create_stub);
+    stub.set(ADDR(DataStorageManager, Create), submission_concurrency_stub::Create_stub);
     auto submit =
-        std::async(std::launch::async, [&]() { return mgr.Submit("r2_12_stop_inflight", make_req(824, first_src)); });
-    const bool create_entered = r2_12_submission_stub::WaitForFirstCreate();
+        std::async(std::launch::async, [&]() { return mgr.Submit("stop_inflight_submit", make_req(824, first_src)); });
+    const bool create_entered = submission_concurrency_stub::WaitForFirstCreate();
     if (!create_entered) {
-        r2_12_submission_stub::ReleaseFirstCreate();
+        submission_concurrency_stub::ReleaseFirstCreate();
         submit.wait();
         mgr.Stop();
         EXPECT_TRUE(create_entered);
@@ -2010,8 +2010,8 @@ TEST_F(MigrationManagerTest, TestStopWaitsForSlowSubmitLifecycle) {
     const bool accepting_closed =
         WaitFor([&]() { return !mgr.accepting_copy_submissions_.load(std::memory_order_acquire); });
     const auto stop_status_before_release = stop.wait_for(std::chrono::milliseconds(200));
-    const auto rejected_ec = mgr.Submit("r2_12_stop_reject", make_req(825, rejected_src));
-    r2_12_submission_stub::ReleaseFirstCreate();
+    const auto rejected_ec = mgr.Submit("stop_rejects_new_submit", make_req(825, rejected_src));
+    submission_concurrency_stub::ReleaseFirstCreate();
     const auto submit_ec = submit.get();
     stop.get();
 
@@ -2023,19 +2023,19 @@ TEST_F(MigrationManagerTest, TestStopWaitsForSlowSubmitLifecycle) {
     ASSERT_EQ(0u, mgr.ActiveTaskCount());
 }
 
-// R2-12: 缩锁后两个 BatchSubmit 可并发进入准入，但 group slot 的统计与 reservation 必须仍原子；
+// 缩锁后两个 BatchSubmit 可并发进入准入，但 group slot 的统计与 reservation 必须仍原子；
 // 第一批卡在 Create 时，第二批应立即 EC_OUT_OF_LIMIT，且不能进入第二次 Create。
 TEST_F(MigrationManagerTest, TestConcurrentBatchSubmitDoesNotOverissueGroupLimit) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
-    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "r2_12_limit_hot/"));
-    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "r2_12_limit_cold/"));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "concurrent_limit_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "concurrent_limit_cold/"));
 
     auto make_req = [&](int64_t block_key) {
         const std::string src = CreateSourceLocation(block_key, "hot_01", true, "group-limit");
         const auto src_location = GetLocation(block_key, src);
         EXPECT_NE(nullptr, src_location);
         MigrationManager::MigrationRequest req;
-        req.instance_group_name = "r2_12_group";
+        req.instance_group_name = "concurrent_limit_group";
         req.instance_id = kInstance;
         req.block_key = block_key;
         req.src_location_id = src;
@@ -2051,26 +2051,26 @@ TEST_F(MigrationManagerTest, TestConcurrentBatchSubmitDoesNotOverissueGroupLimit
     const auto second_req = make_req(827);
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
     mgr.DebugEnableCopySubmissionsForTest();
-    const MigrationManager::CopyConcurrencyLimit limit{"r2_12_group", 1};
+    const MigrationManager::CopyConcurrencyLimit limit{"concurrent_limit_group", 1};
 
-    r2_12_submission_stub::Reset();
+    submission_concurrency_stub::Reset();
     Stub stub;
-    stub.set(ADDR(DataStorageManager, Create), r2_12_submission_stub::Create_stub);
+    stub.set(ADDR(DataStorageManager, Create), submission_concurrency_stub::Create_stub);
     auto first =
-        std::async(std::launch::async, [&]() { return mgr.BatchSubmit("r2_12_limit_first", {first_req}, limit); });
-    const bool first_entered = r2_12_submission_stub::WaitForFirstCreate();
+        std::async(std::launch::async, [&]() { return mgr.BatchSubmit("concurrent_limit_first", {first_req}, limit); });
+    const bool first_entered = submission_concurrency_stub::WaitForFirstCreate();
     if (!first_entered) {
-        r2_12_submission_stub::ReleaseFirstCreate();
+        submission_concurrency_stub::ReleaseFirstCreate();
         first.wait();
         EXPECT_TRUE(first_entered);
         return;
     }
 
     auto second =
-        std::async(std::launch::async, [&]() { return mgr.BatchSubmit("r2_12_limit_second", {second_req}, limit); });
+        std::async(std::launch::async, [&]() { return mgr.BatchSubmit("concurrent_limit_second", {second_req}, limit); });
     const auto second_status_before_release = second.wait_for(std::chrono::seconds(5));
-    const int create_calls_before_release = r2_12_submission_stub::CreateCallCount();
-    r2_12_submission_stub::ReleaseFirstCreate();
+    const int create_calls_before_release = submission_concurrency_stub::CreateCallCount();
+    submission_concurrency_stub::ReleaseFirstCreate();
     const auto first_results = first.get();
     const auto second_results = second.get();
 
@@ -2079,10 +2079,10 @@ TEST_F(MigrationManagerTest, TestConcurrentBatchSubmitDoesNotOverissueGroupLimit
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), first_results);
     ASSERT_EQ((std::vector<ErrorCode>{EC_OUT_OF_LIMIT}), second_results);
     ASSERT_EQ(1, create_calls_before_release);
-    ASSERT_EQ(1, r2_12_submission_stub::CreateCallCount());
+    ASSERT_EQ(1, submission_concurrency_stub::CreateCallCount());
 }
 
-// R2-03: 覆盖带 src_specs 的 BatchSubmit 主路径，确保批量 Copy 到 cold_02
+// 覆盖带 src_specs 的 BatchSubmit 主路径，确保批量 Copy 到 cold_02
 // 不会消费 block 上仍指向 cold_01 的 mark。
 TEST_F(MigrationManagerTest, TestBatchSubmitSuccessDoesNotClearMarkForDifferentTarget) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
@@ -2124,7 +2124,7 @@ TEST_F(MigrationManagerTest, TestBatchSubmitSuccessDoesNotClearMarkForDifferentT
     ASSERT_EQ(0u, mgr.GetStats().marks_cleared);
 }
 
-// R2-14: prepared batch 中每个 item 必须绑定自己的 Mark 快照。三个相邻 item 分别携带
+// prepared batch 中每个 item 必须绑定自己的 Mark 快照。三个相邻 item 分别携带
 // matching target、different target 和 no-mark，完成回调只能清除第一项，不能按平行下标串位。
 TEST_F(MigrationManagerTest, TestBatchSubmitMarkSnapshotsStayAlignedPerItem) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
@@ -2162,7 +2162,7 @@ TEST_F(MigrationManagerTest, TestBatchSubmitMarkSnapshotsStayAlignedPerItem) {
     ASSERT_EQ(EC_OK, mgr.MarkForTieredWrite(kInstance, {851}, "cold_01")); // 与 Copy 目标匹配。
     ASSERT_EQ(EC_OK, mgr.MarkForTieredWrite(kInstance, {852}, "cold_02")); // 独立迁移意图。
 
-    const auto results = mgr.BatchSubmit("r2_14_mark_alignment", std::move(requests));
+    const auto results = mgr.BatchSubmit("prepared_mark_alignment", std::move(requests));
     ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_OK}), results);
 
     std::vector<std::string> dst_location_ids;
@@ -2183,7 +2183,7 @@ TEST_F(MigrationManagerTest, TestBatchSubmitMarkSnapshotsStayAlignedPerItem) {
     ASSERT_EQ(1u, mgr.GetStats().marks_cleared);
 }
 
-// F-17/R2-10: prepared BatchSubmit 的 Create 逐项失败不影响其他 request，且测试必须进入
+// prepared BatchSubmit 的 Create 逐项失败不影响其他 request，且测试必须进入
 // 真批量路径，不能再通过空 src_specs fallback 覆盖单条流程。
 TEST_F(MigrationManagerTest, TestBatchSubmitPartialFailure) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
@@ -2227,19 +2227,19 @@ TEST_F(MigrationManagerTest, TestBatchSubmitPartialFailure) {
     ASSERT_EQ(2u, LocationCount(902));
 }
 
-// F-10 泄漏修复: 异构 size spec 分散到多个 create_group,某 group 的 Create 失败使 block
+// 异构 size spec 分散到多个 create_group，某 group 的 Create 失败使 block
 // ineligible;后处理 group 里同 block 已成功分配的 URI 不能被跳过泄漏,必须 Delete。
 TEST_F(MigrationManagerTest, TestBatchSubmitHeteroSpecCreateFailNoOrphan) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
     ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "orphan_hot/"));
     ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "orphan_cold/"));
 
-    f10_orphan_stub::g_created_uris.clear();
-    f10_orphan_stub::g_deleted_uris.clear();
-    f10_orphan_stub::g_create_call_count = 0;
+    orphan_cleanup_stub::g_created_uris.clear();
+    orphan_cleanup_stub::g_deleted_uris.clear();
+    orphan_cleanup_stub::g_create_call_count = 0;
     Stub stub;
-    stub.set(ADDR(DataStorageManager, Create), f10_orphan_stub::Create_stub);
-    stub.set(ADDR(DataStorageManager, Delete), f10_orphan_stub::Delete_stub);
+    stub.set(ADDR(DataStorageManager, Create), orphan_cleanup_stub::Create_stub);
+    stub.set(ADDR(DataStorageManager, Delete), orphan_cleanup_stub::Delete_stub);
 
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
     mgr.DebugEnableCopySubmissionsForTest();
@@ -2263,12 +2263,12 @@ TEST_F(MigrationManagerTest, TestBatchSubmitHeteroSpecCreateFailNoOrphan) {
     ASSERT_NE(ErrorCode::EC_OK, results[0]); // 整块失败(一个 group Create 失败)
 
     // 一个 group 失败、一个成功 → 恰好 1 个 URI 被成功 Create。
-    ASSERT_EQ(1u, f10_orphan_stub::g_created_uris.size());
+    ASSERT_EQ(1u, orphan_cleanup_stub::g_created_uris.size());
     // 关键: 成功 Create 的 URI 必须被 Delete,不能 orphan(修复前会被跳过泄漏)。
-    for (const auto &created : f10_orphan_stub::g_created_uris) {
+    for (const auto &created : orphan_cleanup_stub::g_created_uris) {
         const bool deleted =
-            std::any_of(f10_orphan_stub::g_deleted_uris.begin(),
-                        f10_orphan_stub::g_deleted_uris.end(),
+            std::any_of(orphan_cleanup_stub::g_deleted_uris.begin(),
+                        orphan_cleanup_stub::g_deleted_uris.end(),
                         [&](const DataStorageUri &d) { return d.ToUriString() == created.ToUriString(); });
         ASSERT_TRUE(deleted) << "created URI leaked (not deleted): " << created.ToUriString();
     }
@@ -2276,7 +2276,7 @@ TEST_F(MigrationManagerTest, TestBatchSubmitHeteroSpecCreateFailNoOrphan) {
     ASSERT_EQ(0u, mgr.ActiveTaskCount()) << "failed batch item leaked its preparing reservation";
 }
 
-// R2-08: Batch Create 短返回时无法建立完整的位置映射。整组 request 都必须失败，且实际
+// Batch Create 短返回时无法建立完整的位置映射。整组 request 都必须失败，且实际
 // 返回的成功 URI 必须全部删除，不能依赖后面的 per-block spec 数量检查间接兜底。
 TEST_F(MigrationManagerTest, TestBatchSubmitShortCreateResultRollsBackWholeGroup) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
@@ -2298,29 +2298,29 @@ TEST_F(MigrationManagerTest, TestBatchSubmitShortCreateResultRollsBackWholeGroup
         requests.push_back(std::move(request));
     }
 
-    r2_08_create_shape_stub::Reset(r2_08_create_shape_stub::Shape::kShort);
+    create_result_shape_stub::Reset(create_result_shape_stub::Shape::kShort);
     Stub stub;
-    stub.set(ADDR(DataStorageManager, Create), r2_08_create_shape_stub::Create_stub);
-    stub.set(ADDR(DataStorageManager, Delete), r2_08_create_shape_stub::Delete_stub);
+    stub.set(ADDR(DataStorageManager, Create), create_result_shape_stub::Create_stub);
+    stub.set(ADDR(DataStorageManager, Delete), create_result_shape_stub::Delete_stub);
 
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
     mgr.DebugEnableCopySubmissionsForTest();
-    const auto results = mgr.BatchSubmit("r2_08_short_create", std::move(requests));
+    const auto results = mgr.BatchSubmit("short_create_result", std::move(requests));
 
     ASSERT_EQ(2u, results.size());
     ASSERT_EQ(EC_ERROR, results[0]);
     ASSERT_EQ(EC_ERROR, results[1]);
-    ASSERT_EQ(1u, r2_08_create_shape_stub::g_created_uris.size());
-    ASSERT_EQ(r2_08_create_shape_stub::g_created_uris.size(), r2_08_create_shape_stub::g_deleted_uris.size());
-    for (const auto &created : r2_08_create_shape_stub::g_created_uris) {
-        ASSERT_TRUE(r2_08_create_shape_stub::WasDeleted(created));
+    ASSERT_EQ(1u, create_result_shape_stub::g_created_uris.size());
+    ASSERT_EQ(create_result_shape_stub::g_created_uris.size(), create_result_shape_stub::g_deleted_uris.size());
+    for (const auto &created : create_result_shape_stub::g_created_uris) {
+        ASSERT_TRUE(create_result_shape_stub::WasDeleted(created));
     }
     ASSERT_EQ(1u, LocationCount(830));
     ASSERT_EQ(1u, LocationCount(831));
     ASSERT_EQ(0u, mgr.ActiveTaskCount());
 }
 
-// R2-08: Batch Create 长返回中的额外 URI 没有对应 CreateEntry。不能只采用前 N 个结果；
+// Batch Create 长返回中的额外 URI 没有对应 CreateEntry。不能只采用前 N 个结果；
 // 本组全部成功返回（包括 extra）都必须删除，且不得发布任何 WRITING location。
 TEST_F(MigrationManagerTest, TestBatchSubmitLongCreateResultDeletesEveryReturnedUri) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
@@ -2342,29 +2342,29 @@ TEST_F(MigrationManagerTest, TestBatchSubmitLongCreateResultDeletesEveryReturned
         requests.push_back(std::move(request));
     }
 
-    r2_08_create_shape_stub::Reset(r2_08_create_shape_stub::Shape::kLong);
+    create_result_shape_stub::Reset(create_result_shape_stub::Shape::kLong);
     Stub stub;
-    stub.set(ADDR(DataStorageManager, Create), r2_08_create_shape_stub::Create_stub);
-    stub.set(ADDR(DataStorageManager, Delete), r2_08_create_shape_stub::Delete_stub);
+    stub.set(ADDR(DataStorageManager, Create), create_result_shape_stub::Create_stub);
+    stub.set(ADDR(DataStorageManager, Delete), create_result_shape_stub::Delete_stub);
 
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
     mgr.DebugEnableCopySubmissionsForTest();
-    const auto results = mgr.BatchSubmit("r2_08_long_create", std::move(requests));
+    const auto results = mgr.BatchSubmit("long_create_result", std::move(requests));
 
     ASSERT_EQ(2u, results.size());
     ASSERT_EQ(EC_ERROR, results[0]);
     ASSERT_EQ(EC_ERROR, results[1]);
-    ASSERT_EQ(3u, r2_08_create_shape_stub::g_created_uris.size());
-    ASSERT_EQ(r2_08_create_shape_stub::g_created_uris.size(), r2_08_create_shape_stub::g_deleted_uris.size());
-    for (const auto &created : r2_08_create_shape_stub::g_created_uris) {
-        ASSERT_TRUE(r2_08_create_shape_stub::WasDeleted(created));
+    ASSERT_EQ(3u, create_result_shape_stub::g_created_uris.size());
+    ASSERT_EQ(create_result_shape_stub::g_created_uris.size(), create_result_shape_stub::g_deleted_uris.size());
+    for (const auto &created : create_result_shape_stub::g_created_uris) {
+        ASSERT_TRUE(create_result_shape_stub::WasDeleted(created));
     }
     ASSERT_EQ(1u, LocationCount(832));
     ASSERT_EQ(1u, LocationCount(833));
     ASSERT_EQ(0u, mgr.ActiveTaskCount());
 }
 
-// F-03: ActiveTaskCountForInstances 按 instance 集合过滤，跨 group 不抢 slot。
+// ActiveTaskCountForInstances 按 instance 集合过滤，跨 group 不抢 slot。
 TEST_F(MigrationManagerTest, TestActiveTaskCountForInstancesIsolation) {
     const std::string kInstanceA = "group_a_inst_01";
     const std::string kInstanceB = "group_b_inst_01";
@@ -2481,12 +2481,12 @@ CacheLocationConstPtr MakeLocationWithSpecs(const std::string &id,
 
 TEST_F(MigrationManagerTest, TestDispatchSkipsMarkWhenDedupQueryFails) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
-    r2_04_mark_query_stub::Reset();
-    r2_04_mark_query_stub::g_aggregate_ec = EC_ERROR;
-    r2_04_mark_query_stub::g_per_key_ecs = {EC_ERROR};
-    r2_04_mark_query_stub::g_properties = {{}};
+    mark_query_result_stub::Reset();
+    mark_query_result_stub::g_aggregate_ec = EC_ERROR;
+    mark_query_result_stub::g_per_key_ecs = {EC_ERROR};
+    mark_query_result_stub::g_properties = {{}};
     Stub stub;
-    stub.set(ADDR(MetaIndexer, GetProperties), r2_04_mark_query_stub::GetProperties_stub);
+    stub.set(ADDR(MetaIndexer, GetProperties), mark_query_result_stub::GetProperties_stub);
 
     CacheLocationMap loc_map;
     auto src_loc = MakeLocation("loc_src", "hot_01", CLS_SERVING);
@@ -2616,7 +2616,7 @@ TEST_F(MigrationManagerTest, TestCheckCopyAdmissionTriesNextSourceLocation) {
     ASSERT_EQ("loc_src_l1", adm.src_location->id());
 }
 
-// F-09: 多个 target location 分别覆盖不同 specs，联合覆盖完整 → 不应 kAccept。
+// 多个 target location 分别覆盖不同 specs，联合覆盖完整时不应 kAccept。
 TEST_F(MigrationManagerTest, TestCheckCopyAdmissionUnionCoverage) {
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
     const std::string src = "hot_01";
@@ -2725,7 +2725,7 @@ TEST_F(MigrationManagerTest, TestStopDropsActiveTasks) {
     mgr.Stop();
 }
 
-// F-12: GetActiveBlockKeysForInstance 返回指定 instance 的活跃 block_key 列表（用于 drain 前 BatchCancel）。
+// GetActiveBlockKeysForInstance 返回指定 instance 的活跃 block_key 列表（用于 drain 前 BatchCancel）。
 TEST_F(MigrationManagerTest, TestGetActiveBlockKeysForInstance) {
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
     const std::string other_instance = "other_instance";
@@ -2752,7 +2752,7 @@ TEST_F(MigrationManagerTest, TestGetActiveBlockKeysForInstance) {
     ASSERT_TRUE(mgr.GetActiveBlockKeysForInstance("no_such").empty());
 }
 
-// F-12: BatchCancel + GetActiveBlockKeysForInstance 配合实现 drain：
+// BatchCancel + GetActiveBlockKeysForInstance 配合实现 drain：
 // cancel 后 copy 完成回调清理活跃任务，block keys 列表变空。
 TEST_F(MigrationManagerTest, TestDrainInstanceViaBatchCancelAndPoll) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
@@ -2795,7 +2795,7 @@ TEST_F(MigrationManagerTest, TestDrainInstanceViaBatchCancelAndPoll) {
     ASSERT_EQ(2u, mgr.GetStats().copy_cancelled);
 }
 
-// F-12: draining gate 阻止该 instance 的新提交（Submit + BatchSubmit 两路），
+// draining gate 阻止该 instance 的新提交（Submit + BatchSubmit 两路），
 // EndDraining 后恢复；其他 instance 不受影响。
 TEST_F(MigrationManagerTest, TestDrainingInstanceGateRejectsSubmit) {
     ASSERT_TRUE(CreateMetaIndexer(kInstance));
@@ -2848,7 +2848,7 @@ TEST_F(MigrationManagerTest, TestDrainingInstanceGateRejectsSubmit) {
     ASSERT_EQ(1u, mgr.GetActiveBlockKeysForInstance(kInstance).size());
 }
 
-// F-18: HasActiveCopyTargetLocation 按 (instance_id, block_key) 作用域判断——
+// HasActiveCopyTargetLocation 按 (instance_id, block_key) 作用域判断：
 // 两个不同 instance/block 用相同 dst_location_id 时，只有匹配 scope 的那个才应被保护。
 TEST_F(MigrationManagerTest, TestHasActiveCopyTargetLocationIsScoped) {
     MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);

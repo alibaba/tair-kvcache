@@ -4798,7 +4798,7 @@ TEST_F(CacheReclaimerTest, TestTryMigrateOnGroupNormalizesVcnsSourceTypeForQuota
     stub_.reset(ADDR(MigrationManager, BatchSubmit));
 }
 
-// F-23: BOTH 方法下 copy 提交部分失败时，失败的 block 应回落到 mark（与 Admin BOTH 对齐）。
+// BOTH 方法下 copy 提交部分失败时，失败的 block 应回落到 mark（与 Admin BOTH 对齐）。
 // 用一个让第 2 个 copy request 失败的 stub 验证回落行为。
 namespace {
 std::vector<ErrorCode> BatchSubmit_PartialFail_stub(void * /*obj*/,
@@ -4858,7 +4858,7 @@ TEST_F(CacheReclaimerTest, TestMigrateByStrategyBothCopyFailFallbackMark) {
     stub_.reset(ADDR(MigrationManager, MarkForTieredWrite));
 }
 
-// F-26: multi-cold union — 多个 cold SERVING location 联合覆盖 hot 的多 specs → 允许删 hot。
+// multi-cold union：多个 cold SERVING location 联合覆盖 hot 的多 specs 时允许删除 hot。
 TEST_F(CacheReclaimerTest, TestFilterLocIDMultiColdUnionCoversHot) {
     auto ig = InstanceGroupFactory();
     {
@@ -4915,7 +4915,7 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDMultiColdUnionCoversHot) {
     g_cold_ig.reset();
 }
 
-// F-26: storage-type eviction zone 下不保冷 — 硬驱逐时 keep-cold-evict-hot 不生效。
+// storage-type eviction zone 下不保冷：硬驱逐时 keep-cold-evict-hot 不生效。
 TEST_F(CacheReclaimerTest, TestFilterLocIDStorageTypeEvictionIgnoresCold) {
     auto ig = InstanceGroupFactory();
     {
@@ -4958,7 +4958,7 @@ TEST_F(CacheReclaimerTest, TestFilterLocIDStorageTypeEvictionIgnoresCold) {
     g_cold_ig.reset();
 }
 
-// F-26: WRITING 状态的冷副本不算覆盖——迁移中的半成品不能作为删热依据。
+// WRITING 状态的冷副本不算覆盖：迁移中的半成品不能作为删除热副本的依据。
 TEST_F(CacheReclaimerTest, TestFilterLocIDWritingColdDoesNotProtectHot) {
     auto ig = InstanceGroupFactory();
     {

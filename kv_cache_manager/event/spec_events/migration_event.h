@@ -127,7 +127,7 @@ private:
     std::string dst_storage_;
 };
 
-// F-16: mark 超时过期（推理引擎未在 deadline 内消费）的独立事件，与 MigrationMarkConsumed
+// mark 超时过期（推理引擎未在 deadline 内消费）的独立事件，与 MigrationMarkConsumed
 // 区分——后者表示 mark 被真正消费/清理，前者表示 mark 被超时兜底清除（浪费）。
 class MigrationMarkExpiredEvent : public BaseEvent {
 public:

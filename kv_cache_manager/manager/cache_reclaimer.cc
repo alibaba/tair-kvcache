@@ -1434,7 +1434,7 @@ bool CacheReclaimer::FilterLocID(RequestContext *request_context,
     std::uint64_t selected_total_bytes = 0;
     for (std::size_t block_idx = 0; block_idx < loc_maps.size(); ++block_idx) {
         const auto &loc_map = loc_maps[block_idx];
-        const std::int64_t block_key = batch[block_idx]; // F-18: 传入 block scope，供 active copy target 精确判断
+        const std::int64_t block_key = batch[block_idx]; // 传入 block scope，供 active copy target 精确判断
         std::vector<std::string> loc_id_vec;
         std::size_t valid_location_count = 0;
 
@@ -1793,7 +1793,7 @@ std::size_t CacheReclaimer::MigrateByStrategyOnBatch(const std::shared_ptr<Reque
     const std::size_t max_concurrent_copy =
         configured_copy_concurrency > 0 ? static_cast<std::size_t>(configured_copy_concurrency) : 0;
 
-    // F-10 DRY: 准入 + 分发 + fallback 委派共享 DispatchMigrationBatch（与 Admin MigrateCache 同一函数）。
+    // 准入、分发和 fallback 委派共享 DispatchMigrationBatch（与 Admin MigrateCache 同一函数）。
     MigrationManager::DispatchBatchParams params;
     params.do_copy = copy_enabled;
     params.do_mark = mark_enabled;

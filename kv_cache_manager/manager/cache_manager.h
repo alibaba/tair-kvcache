@@ -160,7 +160,7 @@ public:
                           const TokenIdsVector &tokens,
                           const BlockMask &block_mask /*TODO*/);
 
-    // 分层迁移编排 facade（F-05）：把原本散在 AdminServiceImpl::MigrateCache 的业务编排
+    // 分层迁移编排 facade：把原本散在 AdminServiceImpl::MigrateCache 的业务编排
     // （候选采样 / location 批查 / 逐 block 准入 / Copy+Mark 分发与 fallback / 计数）收到 manager 层，
     // service 层只做 proto glue。返回内部 ErrorCode + accepted/rejected + message，由调用方映射 proto。
     struct MigrateCacheResult {

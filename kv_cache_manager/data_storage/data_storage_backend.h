@@ -64,7 +64,7 @@ public:
     // 同步语义：返回时复制已完成（内部可异步提交+轮询）。
     // 前置：src_uris.size() == dst_uris.size()。
     // 后置：返回 vector.size() 必须等于 src_uris.size()，逐项对应每个 URI 的复制结果。
-    //        调用方依赖此长度等式判断完整性；短返回会被视为整体失败（F-27）。
+    //        调用方依赖此长度等式判断完整性；短返回会被视为整体失败。
     virtual std::vector<ErrorCode> Copy(const std::vector<DataStorageUri> &src_uris,
                                         const std::vector<DataStorageUri> &dst_uris,
                                         const std::string &trace_id) {

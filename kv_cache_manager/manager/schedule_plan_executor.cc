@@ -736,7 +736,7 @@ void SchedulePlanExecutor::DoCopyTask(const std::shared_ptr<std::promise<PlanExe
     std::vector<ErrorCode> copy_results =
         data_storage_manager_->Copy(request_context.get(), task.exec_storage_name, task.src_uris, task.dst_uris);
 
-    // F-27: 后端必须为每个输入 URI 返回一个结果(接口 postcondition)。短返回意味着部分 spec 的
+    // 后端必须为每个输入 URI 返回一个结果（接口 postcondition）。短返回意味着部分 spec 的
     // 复制状态不可知——整体判为失败,防止 MigrationManager promote 不完整的目标 location。
     if (copy_results.size() != task.src_uris.size()) {
         HandleErrorPromise(promise,

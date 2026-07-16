@@ -37,7 +37,7 @@ TEST_F(MigrationEventTest, TestMarkConsumedEventIncludesMethod) {
     EXPECT_STREQ("cold_01", doc["dst_storage"].GetString());
 }
 
-// F-16: 超时过期事件独立于 consumed，type=MigrationMarkExpired。
+// 超时过期事件独立于 consumed，type=MigrationMarkExpired。
 TEST_F(MigrationEventTest, TestMarkExpiredEventDistinctFromConsumed) {
     MigrationMarkExpiredEvent event("instance_1");
     event.SetAdditionalArgs(456, "cold_02");

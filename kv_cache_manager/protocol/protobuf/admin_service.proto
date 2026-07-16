@@ -206,7 +206,7 @@ enum MigrationMarkClearPolicy {
     MIGRATION_MARK_CLEAR_ON_FULL_BLOCK_COVERED = 1; // target CacheLocation 覆盖完整 block 后清标
 }
 
-// F-04: 执行方式配置（Config 后缀，区分 MigrationMethod 请求枚举）
+// 执行方式配置（Config 后缀用于区分 MigrationMethod 请求枚举）。
 
 // Copy 执行方式配置：通过 DataStorageBackend::Copy 把数据复制到目标 storage
 message MigrationCopyMethodConfig {

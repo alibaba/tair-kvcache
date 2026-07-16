@@ -42,7 +42,7 @@ static const std::string default_storage_configs(
 
 namespace kv_cache_manager {
 
-namespace r2_04_mark_query_stub {
+namespace mark_query_read_error_stub {
 ErrorCode ReadError_stub(void * /*obj*/,
                          const std::string & /*instance_id*/,
                          const std::vector<int64_t> &block_keys,
@@ -56,9 +56,9 @@ ErrorCode ReadError_stub(void * /*obj*/,
     }
     return EC_ERROR;
 }
-} // namespace r2_04_mark_query_stub
+} // namespace mark_query_read_error_stub
 
-namespace r2_07_remove_instance_stub {
+namespace remove_instance_reclaimer_state_stub {
 CacheReclaimer *reclaimer = nullptr;
 bool called = false;
 bool observed_paused = false;
@@ -79,7 +79,7 @@ ErrorCode RemoveInstance_stub(void * /*obj*/,
     }
     return EC_ERROR;
 }
-} // namespace r2_07_remove_instance_stub
+} // namespace remove_instance_reclaimer_state_stub
 
 class MockDataStorageBackend : public DataStorageBackend {
 public:
@@ -184,8 +184,8 @@ public:
 
         EXPECT_EQ(EC_OK, cache_manager->DoRecover());
 
-        // 注册 tiered 测试用的冷热 dummy 后端。MarkForTieredWrite 现要求 target 已注册(F-02)，
-        // 且 F-21 测试需要真实 backend 以便用 MightExistInterceptor 构造"meta SERVING 但数据已丢"。
+        // 注册 tiered 测试用的冷热 dummy 后端。MarkForTieredWrite 要求 target 已注册，
+        // stale location 测试需要真实 backend 以便用 MightExistInterceptor 构造"meta SERVING 但数据已丢"。
         RegisterDummyStorage("hot_01");
         RegisterDummyStorage("cold_01");
 
@@ -206,7 +206,7 @@ public:
             return false;
         }
         // 默认让数据 MightExist=true，使仅建 meta location(未真正写数据文件)的 tiered 测试仍视其为有效；
-        // 需要模拟"数据已丢"的用例可在测试内覆盖为返回 false 的 interceptor(见 F-21 stale 测试)。
+        // 需要模拟"数据已丢"的用例可在测试内覆盖为返回 false 的 interceptor。
         auto original = dsm->storage_map_[name];
         dsm->storage_map_[name] = std::make_shared<MightExistInterceptor>(
             original, [](const std::vector<DataStorageUri> &uris) { return std::vector<bool>(uris.size(), true); });
@@ -432,12 +432,12 @@ TEST_F(CacheManagerTest, TestRemoveInstance) {
     }
 }
 
-// R2-07: RemoveInstance 的 per-instance draining 不得读写全局 Reclaimer pause 状态。
+// RemoveInstance 的 per-instance draining 不得读写全局 Reclaimer pause 状态。
 // Registry stub 在 drain 与删除的边界观察中间状态：false 场景验证删除 A 不会暂停
 // 其他 instance；true 场景验证错误返回不会 Resume 掉 Server 生命周期的既有暂停。
 TEST_F(CacheManagerTest, TestRemoveInstanceDoesNotChangeGlobalReclaimerPauseState) {
     Stub stub;
-    stub.set(ADDR(RegistryManager, RemoveInstance), r2_07_remove_instance_stub::RemoveInstance_stub);
+    stub.set(ADDR(RegistryManager, RemoveInstance), remove_instance_reclaimer_state_stub::RemoveInstance_stub);
 
     auto verify_pause_state = [&](bool initially_paused) {
         if (initially_paused) {
@@ -447,11 +447,11 @@ TEST_F(CacheManagerTest, TestRemoveInstanceDoesNotChangeGlobalReclaimerPauseStat
         }
         ASSERT_EQ(initially_paused, cache_manager_->cache_reclaimer()->IsPaused());
 
-        r2_07_remove_instance_stub::Reset(cache_manager_->cache_reclaimer().get());
-        RequestContext ctx(initially_paused ? "r2_07_paused" : "r2_07_running");
+        remove_instance_reclaimer_state_stub::Reset(cache_manager_->cache_reclaimer().get());
+        RequestContext ctx(initially_paused ? "remove_instance_paused" : "remove_instance_running");
         EXPECT_EQ(EC_ERROR, cache_manager_->RemoveInstance(&ctx, "default", "test_instance"));
-        EXPECT_TRUE(r2_07_remove_instance_stub::called);
-        EXPECT_EQ(initially_paused, r2_07_remove_instance_stub::observed_paused);
+        EXPECT_TRUE(remove_instance_reclaimer_state_stub::called);
+        EXPECT_EQ(initially_paused, remove_instance_reclaimer_state_stub::observed_paused);
         EXPECT_EQ(initially_paused, cache_manager_->cache_reclaimer()->IsPaused());
     };
 
@@ -3490,7 +3490,7 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheFallsBackToOrdinaryPolicyOnMarkRead
     ASSERT_EQ(EC_OK, meta_searcher->BatchCASLocationStatus(request_context_.get(), {1}, cas_tasks, cas_results));
 
     Stub stub;
-    stub.set(ADDR(MigrationManager, BatchGetTieredWriteTargets), r2_04_mark_query_stub::ReadError_stub);
+    stub.set(ADDR(MigrationManager, BatchGetTieredWriteTargets), mark_query_read_error_stub::ReadError_stub);
     CacheManager::KeyVector new_keys;
     std::vector<std::string_view> new_sgn;
     BlockMask block_mask;
@@ -3588,7 +3588,7 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheWithMinReplicaFallsBackOnMarkReadEr
     }
 
     Stub stub;
-    stub.set(ADDR(MigrationManager, BatchGetTieredWriteTargets), r2_04_mark_query_stub::ReadError_stub);
+    stub.set(ADDR(MigrationManager, BatchGetTieredWriteTargets), mark_query_read_error_stub::ReadError_stub);
     CacheManager::KeyVector new_keys;
     std::vector<std::string_view> new_sgn;
     BlockMask block_mask;
@@ -3754,7 +3754,7 @@ TEST_F(CacheManagerTest, TestFilterWriteCacheTieredMarkSkipsExistingTarget) {
     ASSERT_TRUE(new_targets.empty());
 }
 
-// F-21: 冷层 target 有 CLS_SERVING location 但数据已丢(MightExist=false)时，marked write 不应因
+// 冷层 target 有 CLS_SERVING location 但数据已丢（MightExist=false）时，marked write 不应因
 // meta 仍 SERVING 就跳过；应视 target 未满足 → block 进待写集并路由回 cold_01。stale 判断复用普通路径
 // 的 prune 结果(同一次 Exist)，不额外查后端。
 TEST_F(CacheManagerTest, TestFilterWriteCacheTieredStaleTargetTriggersRewrite) {
@@ -4079,7 +4079,7 @@ TEST_F(CacheManagerTest, TestGenWriteLocationMissingTieredTargetDoesNotFallback)
 
 // FinishWriteCache 成功把本次 target CacheLocation 置为 SERVING 后清除 tiered-write mark
 TEST_F(CacheManagerTest, TestFinishWriteCacheClearsTieredMark) {
-    // 清标是 tiered migration 行为，仅对启用了 migration_strategies 的 group 生效（F-20）。
+    // 清标是 tiered migration 行为，仅对启用了 migration_strategies 的 group 生效。
     EnableTieredMigrationStrategy();
     cache_manager_->RegisterInstance(request_context_.get(),
                                      "default",
@@ -4249,7 +4249,7 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheFullBlockPolicyKeepsPartialMark) {
     ASSERT_TRUE(default_group != nullptr);
     default_group->cache_config_->set_migration_mark_clear_policy(
         MigrationMarkClearPolicy::CLEAR_ON_FULL_BLOCK_COVERED);
-    // 清标只对启用了 migration_strategies 的 group 生效（F-20）。
+    // 清标只对启用了 migration_strategies 的 group 生效。
     EnableTieredMigrationStrategy();
 
     cache_manager_->RegisterInstance(request_context_.get(),
@@ -4310,7 +4310,7 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheFullBlockPolicyKeepsPartialMark) {
     ASSERT_FALSE(cache_manager_->migration_manager()->IsMarkedForTieredWrite("full_policy_instance", 1));
 }
 
-// F-20: FinishWriteCache 的 mark 清理只对启用了 tiered migration 的 instance group 生效，
+// FinishWriteCache 的 mark 清理只对启用了 tiered migration 的 instance group 生效，
 // 与 FilterWriteCache 的 mark 消费入口对称。未配置 migration_strategies 的 group（例如 admin
 // 旁路直接打标）不应在 finish 时清标——这类 mark 由 MigrationManager 的超时线程兜底清理。
 // 旧实现用 `migration_manager_ != nullptr`（恒真）当门，会错误地对无策略 group 也清标。

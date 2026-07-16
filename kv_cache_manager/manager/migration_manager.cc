@@ -43,7 +43,7 @@ std::optional<int64_t> ParsePositiveInt64(const std::string &value) {
     return parsed;
 }
 
-// F-15/R2-06: mark property 解析结果。target 为空表示无标记或已清；target 非空时 deadline
+// mark property 解析结果。target 为空表示无标记或已清；target 非空时 deadline
 // 必须是合法正整数，malformed 表示缺失、非数字、越界或非正值；expired 表示已过期待清理。
 struct MarkInfo {
     std::string target;
@@ -72,7 +72,7 @@ static MarkInfo ParseMarkFromProperties(const PropertyMap &props, int64_t now_ms
     return info;
 }
 
-// F-09: 收集目标 storage 上指定 status 的 location 联合覆盖的 spec name 集合。
+// 收集目标 storage 上指定 status 的 location 联合覆盖的 spec name 集合。
 // 一次 O(L·S) 扫描替代旧的 per-location 全覆盖判断（O(L²·S²)）。
 std::unordered_set<std::string> CollectCoveredSpecNames(const CacheLocationMap &loc_map,
                                                         const std::string &storage_name,
@@ -226,7 +226,7 @@ ErrorCode MigrationManager::PrepareCopyTask(const std::string &trace_id,
     }
 
     // 1. 读取源 location specs + create_time。
-    // F-10: 如果调用方已在 admission 阶段取得 src_specs，直接使用并跳过冗余 BatchGetLocation；
+    // 如果调用方已在 admission 阶段取得 src_specs，直接使用并跳过冗余 BatchGetLocation；
     // public 单条 Submit 仍允许不带快照，此时在这里重读源 location。private BatchSubmit 不走本函数。
     const std::vector<LocationSpec> *src_specs_ptr = nullptr;
     int64_t src_create_time = 0;
@@ -349,7 +349,7 @@ ErrorCode MigrationManager::PrepareCopyTask(const std::string &trace_id,
     out_ctx.instance_id = request.instance_id;
     out_ctx.block_key = request.block_key;
     out_ctx.src_location_id = request.src_location_id;
-    out_ctx.src_create_time = src_create_time; // F-08: 记录源 location 的创建时间
+    out_ctx.src_create_time = src_create_time; // 记录源 location 的创建时间
     out_ctx.src_storage_name = request.src_storage_name;
     out_ctx.dst_storage_name = request.dst_storage_name;
     out_ctx.dst_location_id = out_location_ids[0];
@@ -379,7 +379,7 @@ ErrorCode MigrationManager::Submit(const std::string &trace_id, MigrationRequest
         if (!accepting_copy_submissions_.load(std::memory_order_acquire)) {
             return reject_not_accepting();
         }
-        // F-12: instance 正在 drain（RemoveInstance 中）→ 拒绝新提交，避免 trim-vs-write 竞态。
+        // instance 正在 drain（RemoveInstance 中）时拒绝新提交，避免 trim-vs-write 竞态。
         if (draining_instances_.count(request.instance_id) > 0) {
             KVCM_LOG_WARN("[%s] reject migration copy submit for draining instance %s block_key %ld",
                           trace_id.c_str(),
@@ -388,7 +388,7 @@ ErrorCode MigrationManager::Submit(const std::string &trace_id, MigrationRequest
             return EC_ERROR;
         }
 
-        // R2-01/R2-12: 在释放短准入锁、执行任何目标 I/O 前原子登记 preparing 占位。它同时用于
+        // 在释放短准入锁、执行任何目标 I/O 前原子登记 preparing 占位。它同时用于
         // 防重复、copy 并发预算、Reclaimer 保护和 drain 快照，不能拆成 check-then-insert。
         std::lock_guard<std::mutex> lock(task_mutex_);
         if (!ReservePreparingTaskLocked(request)) {
@@ -430,7 +430,7 @@ ErrorCode MigrationManager::Submit(const std::string &trace_id, MigrationRequest
         return EC_ERROR;
     }
     ctx.submit_time = std::chrono::steady_clock::now();
-    // F-15/R2-03: 只有指向本次 Copy 目标的 mark 才能绑定到 ctx，供 OnTaskSuccess 做 match-clear。
+    // 只有指向本次 Copy 目标的 mark 才能绑定到 ctx，供 OnTaskSuccess 做 match-clear。
     // 其他目标的 mark 表示独立的迁移意图，不能由本次 Copy 消费。
     {
         std::vector<MarkQueryResult> mark_snap;
@@ -443,7 +443,7 @@ ErrorCode MigrationManager::Submit(const std::string &trace_id, MigrationRequest
     }
 
     // future 对 monitor 可见前，先把完整快照写回并进入可认领的 kRunning。
-    // Cancel 若在 executor Submit 前命中 kRunning，会沿用 F-11 的 deferred-cancel 语义：copy 完成后丢弃目标。
+    // Cancel 若在 executor Submit 前命中 kRunning，采用 deferred-cancel 语义：copy 完成后丢弃目标。
     bool task_running = false;
     {
         std::lock_guard<std::mutex> lock(task_mutex_);
@@ -507,7 +507,7 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
         return {};
     }
 
-    // R2-13: keep all long-lived per-request state together. The temporary vectors passed to batch APIs
+    // Keep all long-lived per-request state together. The temporary vectors passed to batch APIs
     // remain below, but their compact result indexes are mapped back to these stable items immediately.
     struct BatchCopyItem {
         explicit BatchCopyItem(MigrationRequest input_request) : request(std::move(input_request)) {}
@@ -543,7 +543,7 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
         return results;
     };
 
-    // R2-09/R2-10: BatchSubmit 是 DispatchMigrationBatch 的内部 prepared-request API，不再
+    // BatchSubmit 是 DispatchMigrationBatch 的内部 prepared-request API，不再
     // 兼容空 src_specs 后回读 meta 的第二套提交流程。整批共享的 indexer/target 均取 first_req，
     // 因此任何 item 违反同 instance/target 或缺少源快照时，都必须在 reservation/I/O 前拒绝整批。
     const auto &first_req = items.front().request;
@@ -573,8 +573,8 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
     }
     std::shared_lock<std::shared_mutex> lifecycle_lock(copy_submission_lifecycle_mutex_);
 
-    // ---- phase 0: group 级 Copy 硬限流 + per-block dedup + F-12 draining gate + preparing reservation ----
-    // R2-02/R2-12: 所有 eligible item 必须在释放短准入锁、执行任何 batch Create/AddLocation 前进入
+    // ---- phase 0: group 级 Copy 硬限流 + per-block dedup + draining gate + preparing reservation ----
+    // 所有 eligible item 必须在释放短准入锁、执行任何 batch Create/AddLocation 前进入
     // active 表。copy_submission_mutex_ 只串行本 phase 的 gate；后续 backend/meta I/O 可跨 instance 并行。
     // MarkFailed 只收拢 result/eligible。reservation 必须等 URI/Location rollback 完成后再释放，
     // 避免失败 item 尚在清理目标资源时，同 block 的新 Submit 已经进入并与旧清理相互覆盖。
@@ -608,7 +608,7 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
         }
         for (auto &item : items) {
             auto &request = item.request;
-            // F-12: instance 正在 drain → 拒绝（覆盖 reclaimer + admin 两路，与 Submit 一致）。
+            // instance 正在 drain 时拒绝（覆盖 reclaimer + admin 两路，与 Submit 一致）。
             if (draining_instances_.count(request.instance_id) > 0) {
                 item.MarkFailed(EC_ERROR);
                 continue;
@@ -849,7 +849,7 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
             }
         }
         // 与单条 Submit 保持相同边界：phase-3 失败只保证先提交基于精确 location id 的异步删除，
-        // 再释放 reservation；R2-13 的逐项 ownership 收拢不把该既有异步清理改成同步等待。
+        // 再释放 reservation；逐项 ownership 收拢不把该既有异步清理改成同步等待。
         for (auto *item : bind_items) {
             if (item->target_bound) {
                 continue;
@@ -867,7 +867,7 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
             auto &req = item->request;
             CopyTaskContext &ctx = item->context;
             ctx.submit_time = std::chrono::steady_clock::now();
-            // F-15/R2-03: 仅绑定与本次 Copy 目标一致的 mark；其他目标的 mark 必须保留。
+            // 仅绑定与本次 Copy 目标一致的 mark；其他目标的 mark 必须保留。
             {
                 std::vector<MarkQueryResult> mark_snap;
                 const auto mark_ec = BatchGetTieredWriteTargets(req.instance_id, {req.block_key}, mark_snap);
@@ -953,7 +953,7 @@ bool MigrationManager::IsSourceLocationServing(const CopyTaskContext &ctx) const
     if (iter == location_maps[0].end() || iter->second == nullptr) {
         return false;
     }
-    // F-08: id + status + create_time 三者同时匹配，防止 id 复用导致误判新 location 为原始源。
+    // id + status + create_time 三者同时匹配，防止 id 复用导致误判新 location 为原始源。
     return iter->second->status() == CLS_SERVING && iter->second->create_time() == ctx.src_create_time;
 }
 
@@ -964,7 +964,7 @@ void MigrationManager::CompleteCopyTaskAsFailed(const CopyTaskContext &ctx, cons
         RemoveActiveTaskLocked(ctx.instance_id, ctx.block_key);
     }
     stat_copy_failed_.fetch_add(1, std::memory_order_relaxed);
-    // F-16: 失败路径也填真实 duration（提交到失败的耗时），而非硬编码 0，
+    // 失败路径也填真实 duration（提交到失败的耗时），而非硬编码 0，
     // 便于区分"快速失败"与"跑很久才失败"。
     const int64_t duration_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - ctx.submit_time)
@@ -1003,7 +1003,7 @@ void MigrationManager::OnTaskSuccess(const std::string &instance_id, int64_t blo
         return;
     }
     if (claim == ClaimResult::kWasCancelling) {
-        // F-11: 用户已取消。copy 虽成功也丢弃：不 promote、不删源，删掉仍为 WRITING 的目标半成品。
+        // 用户已取消。copy 虽成功也丢弃：不 promote、不删源，删掉仍为 WRITING 的目标半成品。
         CompleteCancelledTask(ctx);
         return;
     }
@@ -1040,7 +1040,7 @@ void MigrationManager::OnTaskSuccess(const std::string &instance_id, int64_t blo
         return;
     }
 
-    // F-15: 按提交时快照的 mark target/deadline 做条件清除，避免清掉后续同 block 新 mark。
+    // 按提交时快照的 mark target/deadline 做条件清除，避免清掉后续同 block 新 mark。
     if (!ctx.mark_target.empty()) {
         ClearTieredWriteMarkIfMatchInternal(ctx.instance_id, block_key, ctx.mark_target, ctx.mark_deadline_ms);
     }
@@ -1095,7 +1095,7 @@ void MigrationManager::OnTaskFailed(const std::string &instance_id, int64_t bloc
         return;
     }
     if (claim == ClaimResult::kWasCancelling) {
-        // F-11: 已取消，无论 copy 结果如何一律按取消收尾（清 WRITING 目标，记 cancelled 终态）。
+        // 已取消，无论 copy 结果如何一律按取消收尾（清 WRITING 目标，记 cancelled 终态）。
         CompleteCancelledTask(ctx);
         return;
     }
@@ -1189,7 +1189,7 @@ ErrorCode MigrationManager::MarkForTieredWrite(const std::string &instance_id,
     if (dst_storage_name.empty() || block_keys.empty()) {
         return EC_OK;
     }
-    // F-02: 目标 storage 必须是已注册的 storage。否则打标会产生"永不被满足"的 mark：
+    // 目标 storage 必须是已注册的 storage。否则打标会产生"永不被满足"的 mark：
     // 下次写入因目标不存在静默回落热层，且清标条件（目标覆盖 spec）永远不成立，mark 只能等超时。
     // 在此统一拦截，覆盖 admin 与 reclaimer 两条打标路径。
     if (data_storage_manager_ == nullptr || data_storage_manager_->GetDataStorageBackend(dst_storage_name) == nullptr) {
@@ -1213,7 +1213,7 @@ ErrorCode MigrationManager::MarkForTieredWrite(const std::string &instance_id,
         return EC_BADARGS;
     }
     const int64_t deadline_ms = now_ms + timeout_ms;
-    // F-14: 记录实际成功打标的 key index，供 stat/expiry/event 仅按 actual 口径更新。
+    // 记录实际成功打标的 key index，供 stat/expiry/event 仅按 actual 口径更新。
     // modifier 在 RMW 批次内按 global_idx 回调，顺序对齐 block_keys。
     std::vector<bool> mark_succeeded(block_keys.size(), false);
     // RMW：只写 property（out_new_locations 留空，不动 location）。不存在的 block 跳过（不给空 block 打标）。
@@ -1239,7 +1239,7 @@ ErrorCode MigrationManager::MarkForTieredWrite(const std::string &instance_id,
     RequestContext rc("migration_mark");
     KeyVector keys(block_keys.begin(), block_keys.end());
     auto result = indexer->ReadModifyWriteBlock(&rc, keys, modifier);
-    // F-14: stat/expiry/event 按实际成功数更新（actual 口径），不再用 block_keys.size()（request 口径）。
+    // stat/expiry/event 按实际成功数更新（actual 口径），不再用 block_keys.size()（request 口径）。
     const size_t actual_marked = static_cast<size_t>(std::count(mark_succeeded.begin(), mark_succeeded.end(), true));
     if (actual_marked > 0) {
         stat_marks_added_.fetch_add(actual_marked, std::memory_order_relaxed);
@@ -1282,7 +1282,7 @@ std::string MigrationManager::GetTieredWriteTarget(const std::string &instance_i
     return (ec == EC_OK && !results.empty() && results[0].HasValidMark()) ? results[0].target : std::string();
 }
 
-// F-15: match 检查在 RMW modifier 闭包内执行（shard lock 保原子），不需要外部 mark_mutex_。
+// match 检查在 RMW modifier 闭包内执行（shard lock 保原子），不需要外部 mark_mutex_。
 // modifier 内通过捕获的 indexer 读 GetProperties（GetProperties 不走 shard lock，不死锁），
 // 读-比较-写三步在同一个 shard lock 内完成，与 BatchCASLocationStatus 同模式。
 bool MigrationManager::ClearTieredWriteMarkIfMatchInternal(const std::string &instance_id,
@@ -1293,7 +1293,7 @@ bool MigrationManager::ClearTieredWriteMarkIfMatchInternal(const std::string &in
     if (expected_target.empty()) {
         return false;
     }
-    // R2-06: private 调用以非正 deadline 表示“仅匹配当前仍 malformed 的同 target Mark”。
+    // private 调用以非正 deadline 表示“仅匹配当前仍 malformed 的同 target Mark”。
     // public ClearTieredWriteMarkIfMatch 仍拒绝非正 deadline，避免改变其精确快照语义。
     const bool expect_malformed = expected_deadline_ms <= 0;
     auto indexer = GetIndexer(instance_id);
@@ -1498,7 +1498,7 @@ void MigrationManager::ProcessExpiredMarks() {
 }
 
 void MigrationManager::CompleteCancelledTask(const CopyTaskContext &ctx) {
-    // F-11: 取消任务的延迟收尾（monitor 线程，认领到 kWasCancelling 时调用）。
+    // 取消任务的延迟收尾（monitor 线程，认领到 kWasCancelling 时调用）。
     // 目标此时仍为 WRITING（cancelling 任务从未被 promote）；CAS WRITING->DELETING 删半成品，源端不动。
     SubmitTargetLocationDelete(ctx);
     {
@@ -1506,7 +1506,7 @@ void MigrationManager::CompleteCancelledTask(const CopyTaskContext &ctx) {
         RemoveActiveTaskLocked(ctx.instance_id, ctx.block_key);
     }
     stat_copy_cancelled_.fetch_add(1, std::memory_order_relaxed);
-    // cancelled 是与 success/failed 对称的终态（F-16）：在实际清理时计数，保 submitted==success+failed+cancelled。
+    // cancelled 是与 success/failed 对称的终态：在实际清理时计数，保持 submitted==success+failed+cancelled。
     // 被取消任务无论底层 copy 成/败一律记 cancelled（用户意图优先）。
     const int64_t duration_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - ctx.submit_time)
@@ -1533,7 +1533,7 @@ void MigrationManager::CompleteCancelledTask(const CopyTaskContext &ctx) {
 }
 
 ErrorCode MigrationManager::Cancel(const std::string &instance_id, int64_t block_key) {
-    // F-11/R2-01: preparing 取消只标记 kPrepareCancelling，由仍在同步 I/O 中的提交线程在下一安全
+    // preparing 取消只标记 kPrepareCancelling，由仍在同步 I/O 中的提交线程在下一安全
     // 边界停止进入 copy、清目标并释放 reservation；running 取消仍等待 future 完成后由 monitor 收尾。
     // 两种 cancelling 期间任务都保留在活跃表，继续挡重复 Submit 并保护 WRITING 目标。
     CancelResult result;
@@ -1725,7 +1725,7 @@ bool MigrationManager::HasActiveCopyTargetLocation(const std::string &instance_i
     if (location_id.empty()) {
         return false;
     }
-    // F-18: 作用域到 (instance_id, block_key)——一次 copy 任务的目标 location 属于同一 block；
+    // 作用域限定为 (instance_id, block_key)：一次 copy 任务的目标 location 属于同一 block；
     // 直接 O(1) 定位，避免全表扫描，也避免跨 instance/block 的 id 碰撞误判。
     std::lock_guard<std::mutex> lock(task_mutex_);
     auto instance_iter = active_tasks_by_instance_.find(instance_id);
@@ -1737,7 +1737,7 @@ bool MigrationManager::HasActiveCopyTargetLocation(const std::string &instance_i
         return false;
     }
     const CopyTaskContext &task = task_iter->second;
-    // R2-01/R2-02: BatchAddLocation 可能已经提交、但 location_id 尚未返回给提交线程。
+    // BatchAddLocation 可能已经提交、但 location_id 尚未返回给提交线程。
     // 此时按 (instance, block) 临时保护所有 WRITING location；id 一旦绑定即恢复精确匹配。
     if ((task.state == CopyTaskState::kPreparing || task.state == CopyTaskState::kPrepareCancelling) &&
         task.dst_location_id.empty()) {
@@ -1853,7 +1853,7 @@ MigrationManager::CopyAdmission MigrationManager::CheckCopyAdmission(const std::
         return {CopyAdmissionStatus::kSourceServingNotFound, nullptr};
     }
 
-    // F-09: 按目标 storage 上多个 location 的联合覆盖判断,替代旧的 per-location 全覆盖。
+    // 按目标 storage 上多个 location 的联合覆盖判断，替代旧的 per-location 全覆盖。
     // 建索引一次 O(L·S),之后 per-source O(S) set lookup。
     const auto serving_covered = CollectCoveredSpecNames(loc_map, dst_storage_name, {CacheLocationStatus::CLS_SERVING});
     const auto all_covered = CollectCoveredSpecNames(
@@ -1965,7 +1965,7 @@ MigrationManager::MigrateResult MigrationManager::MigrateCache(RequestContext *r
         return result;
     }
 
-    // F-10 DRY: 准入 + 分发 + fallback 委派共享 DispatchMigrationBatch。
+    // 准入、分发和 fallback 委派共享 DispatchMigrationBatch。
     DispatchBatchParams params;
     params.do_copy = do_copy;
     params.do_mark = do_mark;
@@ -2055,7 +2055,7 @@ MigrationManager::DispatchMigrationBatch(const std::string &trace_id,
             } else {
                 ++result.copy_failed;
                 if (params.do_mark && i < copy_block_keys.size()) {
-                    mark_keys.push_back(copy_block_keys[i]); // F-23 fallback
+                    mark_keys.push_back(copy_block_keys[i]); // copy 失败时 fallback 到 mark
                 }
             }
         }

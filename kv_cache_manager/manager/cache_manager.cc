@@ -126,8 +126,8 @@ IsSpecNameInSpecGroup(const std::string &trace_id,
     return {EC_OK, true};
 }
 
-// F-09/F-22 共享 helper: 收集目标 storage 上指定 status 的 location 联合覆盖的 spec name 集合。
-// 一次 O(L·S) 扫描。exclude_loc_ids 供 F-21 排除 stale location。
+// 共享 helper：收集目标 storage 上指定 status 的 location 联合覆盖的 spec name 集合。
+// 一次 O(L·S) 扫描。exclude_loc_ids 用于排除 stale location。
 std::unordered_set<std::string> CollectCoveredSpecNames(const CacheLocationMap &loc_map,
                                                         const std::string &storage_name,
                                                         std::initializer_list<CacheLocationStatus> statuses,
@@ -150,7 +150,7 @@ std::unordered_set<std::string> CollectCoveredSpecNames(const CacheLocationMap &
     return covered;
 }
 
-// F-22: 判断目标 storage 上是否有 SERVING/WRITING location（联合）覆盖 requested specs。
+// 判断目标 storage 上是否有 SERVING/WRITING location（联合）覆盖 requested specs。
 // requested_spec_names 空时只判"有任何 spec 在该 storage 上"。
 bool HasServingOrWritingLocOnStorage(const CacheLocationMap &loc_map,
                                      const std::string &storage_name,
@@ -245,7 +245,7 @@ bool IsTieredMigrationEnabled(RequestContext *request_context,
            !instance_group->cache_config()->migration_strategies().empty();
 }
 
-// R2-05: 只把仍存在 backend 的 valid Mark 交给写入过滤逻辑。
+// 只把仍存在 backend 的 valid Mark 交给写入过滤逻辑。
 // backend 已被注销时，按查询快照精确清标并让调用方保留普通 write 判定；并发刷新出的新 Mark
 // 会因 target/deadline 不匹配而保留。
 void ResolveUsableTieredWriteTargets(const std::string &trace_id,
@@ -432,7 +432,7 @@ ErrorCode CacheManager::RemoveInstance(RequestContext *request_context,
     SPAN_TRACER(request_context);
     const auto &trace_id = request_context->trace_id();
 
-    // F-12: drain 活跃迁移 copy 后再 trim，避免 trim 与 backend copy 竞态
+    // drain 活跃迁移 copy 后再 trim，避免 trim 与 backend copy 竞态。
     // （trim 把 active copy 的 WRITING 目标 CAS→DELETING 删掉 / copy 成功后 promote 的 SERVING 目标被 trim 删）。
     // 步骤：draining gate（阻止该 instance 所有新 Copy，覆盖 reclaimer + admin 两路）
     //       → cancel 活跃 copy → 有界等待完成 → 删除并 trim。
@@ -459,7 +459,7 @@ ErrorCode CacheManager::RemoveInstance(RequestContext *request_context,
             migration_manager_->BatchCancel(instance_id, active_keys);
             // 有界等待：running/cancelling 任务由 monitor 在 copy future 完成后清理；快照中的
             // preparing 任务则已被置为 kPrepareCancelling，由提交线程在下一安全边界回滚。
-            // R2-12: draining gate 与锁内 reservation 保证快照不漏掉已准入任务，故无需重复 Cancel。
+            // draining gate 与锁内 reservation 保证快照不漏掉已准入任务，故无需重复 Cancel。
             constexpr int kDrainTimeoutMs = 5000;
             constexpr int kPollIntervalMs = 50;
             int waited_ms = 0;
@@ -1057,7 +1057,7 @@ CacheManager::FinishWriteCache(RequestContext *request_context,
                     if (clear_policy == MigrationMarkClearPolicy::CLEAR_ON_NEXT_WRITE_SUCCESS ||
                         (clear_policy == MigrationMarkClearPolicy::CLEAR_ON_FULL_BLOCK_COVERED &&
                          LocationsCoverFullBlockOnStorage(loc_maps[i], tiered_targets[i].target, instance_info))) {
-                        // F-15: 按 target+deadline 条件清除，避免清掉后续同 block 新 mark。
+                        // 按 target+deadline 条件清除，避免清掉后续同 block 新 mark。
                         migration_manager_->ClearTieredWriteMarkIfMatch(instance_id,
                                                                         mark_candidate_keys[i],
                                                                         tiered_targets[i].target,
@@ -1167,7 +1167,7 @@ CacheManager::MigrateCacheResult CacheManager::MigrateCache(RequestContext *requ
                                                             bool do_mark,
                                                             const std::vector<int64_t> &explicit_block_keys,
                                                             int64_t sample_count) {
-    // F-05 瘦 facade：只做前置校验（依赖存在 / instance 存在 / F-02 target 注册 / F-01 strategy），
+    // 薄 facade：只做前置校验（依赖、instance、target storage 和 migration strategy），
     // 迁移编排（候选/meta/admission/dispatch/计数）下沉 MigrationManager::MigrateCache。
     MigrateCacheResult result;
 
@@ -1176,7 +1176,7 @@ CacheManager::MigrateCacheResult CacheManager::MigrateCache(RequestContext *requ
         result.message = "migration manager not available";
         return result;
     }
-    // instance 存在性前置（保持与原实现相同的错误优先级：instance → F-02 → F-01）。
+    // instance 存在性前置（保持错误优先级：instance → target storage → migration strategy）。
     auto meta_indexer = meta_indexer_manager_->GetMetaIndexer(instance_id);
     if (meta_indexer == nullptr) {
         result.ec = EC_INSTANCE_NOT_EXIST;
@@ -1184,7 +1184,7 @@ CacheManager::MigrateCacheResult CacheManager::MigrateCache(RequestContext *requ
         return result;
     }
 
-    // F-02: target storage 必须是已注册的 storage——COPY 需在其上分配空间，MARK 需要它可被写路径满足。
+    // target storage 必须已注册：COPY 需在其上分配空间，MARK 需要它可被写路径满足。
     // 否则会静默降级（写回落热层）并留下永不被满足的 mark。上层直接拒绝，避免误导性的 accepted。
     {
         auto data_storage_manager = registry_manager_->data_storage_manager();
@@ -1210,7 +1210,7 @@ CacheManager::MigrateCacheResult CacheManager::MigrateCache(RequestContext *requ
         configured_copy_concurrency > 0 ? static_cast<std::size_t>(configured_copy_concurrency) : 0;
     int64_t mark_timeout_ms = MigrationMarkMethod::kDefaultTimeoutMs;
 
-    // F-01: IsTieredMigrationEnabled 以“group 至少有一条 migration strategy”作为写路径消费 Mark 的
+    // IsTieredMigrationEnabled 以“group 至少有一条 migration strategy”作为写路径消费 Mark 的
     // group 级开关，因此无 strategy 时打标会成为“成功的 no-op”，这里直接拒绝。Admin 显式 target
     // 不受 strategy route 约束；精确匹配到 enabled Mark route 只影响下方 timeout 的选择。
     if (do_mark) {
@@ -1553,7 +1553,7 @@ ErrorCode CacheManager::FilterWriteCacheWithMinReplica(RequestContext *request_c
         skip_write_flags[i] = existsForWrite(i, location_maps[i], prune_loc_ids);
         if (!prune_loc_ids.empty()) {
             prune_keys.emplace_back(keys[i]);
-            // 复制而非 move：下方 tiered 检查还要用 prune_loc_ids 排除 stale 目标副本(F-21)。
+            // 复制而非 move：下方 tiered 检查还要用 prune_loc_ids 排除 stale 目标副本。
             prune_loc_ids_vec.emplace_back(prune_loc_ids);
         }
         if (!tiered_target_per_key[i].empty()) {
@@ -1899,7 +1899,7 @@ ErrorCode CacheManager::GenWriteLocation(RequestContext *request_context,
 
     // 按目标 storage 对 keys 分组：Mark 命中且目标 storage 存在 -> 路由到冷层；未命中 -> 默认 storage。
     // FilterWriteCache 已验证 target；若 backend 在两阶段之间消失，拒绝本次写并由重试重新过滤，
-    // 不能 fallback 默认层，否则可能重复写一个原本已满足普通写条件的 block（R2-05）。
+    // 不能 fallback 默认层，否则可能重复写一个原本已满足普通写条件的 block。
     const bool has_tiered = tiered_targets.size() == keys.size();
     std::map<std::string, std::vector<size_t>> indices_by_storage;
     std::map<std::string, DataStorageType> type_by_storage;
