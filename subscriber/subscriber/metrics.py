@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
 from subscriber import logger
@@ -14,6 +14,14 @@ class Span:
 
     name: str
     duration_s: float
+
+
+@dataclass(frozen=True)
+class MetricSample:
+    """One forwarded batch's timing spans and aggregate counters."""
+
+    spans: Sequence[Span]
+    counters: Mapping[str, int]
 
 
 class StageTimer:
@@ -42,7 +50,7 @@ class StageTimer:
 
 
 class SpanMetricsReporter:
-    """Best-effort, isolated reporting for per-stage KV forwarding latency."""
+    """Best-effort reporting for forwarding latency and KVCM block hash counts."""
 
     def __init__(
         self,
@@ -52,7 +60,7 @@ class SpanMetricsReporter:
     ) -> None:
         self._warning_threshold_s = warning_threshold_s
         self._summary_interval_s = summary_interval_s
-        self._queue: asyncio.Queue[Sequence[Span]] = asyncio.Queue(maxsize=1024)
+        self._queue: asyncio.Queue[MetricSample] = asyncio.Queue(maxsize=1024)
         self._task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
@@ -82,11 +90,11 @@ class SpanMetricsReporter:
         except Exception:
             pass
 
-    def report(self, spans: Sequence[Span]) -> None:
-        """Queue a per-stage span sample. Never blocks and never raises."""
+    def report(self, sample: MetricSample) -> None:
+        """Queue a forwarding metric sample. Never blocks and never raises."""
 
         try:
-            self._queue.put_nowait(spans)
+            self._queue.put_nowait(sample)
         except Exception:
             pass
 
@@ -95,15 +103,17 @@ class SpanMetricsReporter:
         stage_counts: dict[str, int] = {}
         total_sum = 0.0
         sample_count = 0
+        counter_totals: dict[str, int] = {}
         next_summary_at = time.monotonic() + self._summary_interval_s
         try:
             while True:
                 try:
                     timeout = max(0.0, next_summary_at - time.monotonic())
-                    spans = await asyncio.wait_for(
+                    sample = await asyncio.wait_for(
                         self._queue.get(),
                         timeout=timeout,
                     )
+                    spans = sample.spans
                     trace_total = 0.0
                     for span in spans:
                         stage_totals[span.name] = (
@@ -111,6 +121,8 @@ class SpanMetricsReporter:
                         )
                         stage_counts[span.name] = stage_counts.get(span.name, 0) + 1
                         trace_total += span.duration_s
+                    for name, count in sample.counters.items():
+                        counter_totals[name] = counter_totals.get(name, 0) + count
                     total_sum += trace_total
                     sample_count += 1
                     await self._log_warning_if_slow(spans, trace_total)
@@ -123,7 +135,11 @@ class SpanMetricsReporter:
                 if time.monotonic() >= next_summary_at:
                     try:
                         await self._log_summary(
-                            stage_totals, stage_counts, total_sum, sample_count
+                            stage_totals,
+                            stage_counts,
+                            total_sum,
+                            sample_count,
+                            counter_totals,
                         )
                     except Exception:
                         pass
@@ -131,6 +147,7 @@ class SpanMetricsReporter:
                     stage_counts = {}
                     total_sum = 0.0
                     sample_count = 0
+                    counter_totals = {}
                     next_summary_at = time.monotonic() + self._summary_interval_s
         except asyncio.CancelledError:
             raise
@@ -158,6 +175,7 @@ class SpanMetricsReporter:
         stage_counts: dict[str, int],
         total_sum: float,
         sample_count: int,
+        counter_totals: Mapping[str, int],
     ) -> None:
         if sample_count == 0:
             return
@@ -167,6 +185,7 @@ class SpanMetricsReporter:
         }
         tags["total_avg_ms"] = round(total_sum / sample_count * 1000, 3)
         tags["sample_count"] = sample_count
+        tags.update(counter_totals)
         await asyncio.to_thread(
             logger.info,
             "kv event forwarding latency average",

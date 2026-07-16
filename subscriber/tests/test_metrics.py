@@ -10,11 +10,18 @@ def _spans(module, *pairs: tuple[str, float]) -> list:
     return [module.Span(name, duration) for name, duration in pairs]
 
 
+def _sample(module, *pairs: tuple[str, float], counters: dict[str, int] | None = None):
+    return module.MetricSample(
+        _spans(module, *pairs),
+        {} if counters is None else counters,
+    )
+
+
 class _ContinuousSpanQueue:
-    async def get(self) -> list:
+    async def get(self):
         await asyncio.sleep(0.001)
         metrics = importlib.import_module("subscriber.metrics")
-        return [metrics.Span("kvcm_send", 0.01)]
+        return _sample(metrics, ("kvcm_send", 0.01))
 
 
 def test_stage_timer_derives_named_spans_between_marks() -> None:
@@ -49,7 +56,7 @@ async def test_reporter_warns_with_stage_breakdown(mocker) -> None:
 
     await reporter.start()
     reporter.report(
-        _spans(
+        _sample(
             metrics,
             ("queue_wait", 0.01),
             ("gate_wait", 0.005),
@@ -85,7 +92,7 @@ async def test_reporter_skips_warning_below_threshold(mocker) -> None:
     reporter = metrics.SpanMetricsReporter(summary_interval_s=0.01)
 
     await reporter.start()
-    reporter.report(_spans(metrics, ("kvcm_send", 0.001)))
+    reporter.report(_sample(metrics, ("kvcm_send", 0.001)))
 
     try:
         await asyncio.wait_for(summary_logged.wait(), timeout=1)
@@ -106,8 +113,18 @@ async def test_reporter_logs_stage_averages(mocker) -> None:
     reporter = metrics.SpanMetricsReporter(summary_interval_s=0.01)
 
     await reporter.start()
-    reporter.report(_spans(metrics, ("queue_wait", 0.01), ("kvcm_send", 0.03)))
-    reporter.report(_spans(metrics, ("queue_wait", 0.03), ("kvcm_send", 0.05)))
+    reporter.report(
+        metrics.MetricSample(
+            [metrics.Span("queue_wait", 0.01), metrics.Span("kvcm_send", 0.03)],
+            {"stored_block_hash_count": 3, "removed_block_hash_count": 2},
+        )
+    )
+    reporter.report(
+        metrics.MetricSample(
+            [metrics.Span("queue_wait", 0.03), metrics.Span("kvcm_send", 0.05)],
+            {"stored_block_hash_count": 4, "removed_block_hash_count": 1},
+        )
+    )
 
     try:
         await asyncio.wait_for(summary_logged.wait(), timeout=1)
@@ -121,8 +138,56 @@ async def test_reporter_logs_stage_averages(mocker) -> None:
             "kvcm_send_avg_ms": 40.0,
             "total_avg_ms": 60.0,
             "sample_count": 2,
+            "stored_block_hash_count": 7,
+            "removed_block_hash_count": 3,
         },
     )
+
+
+async def test_reporter_resets_counters_after_summary_interval(mocker) -> None:
+    metrics = importlib.import_module("subscriber.metrics")
+    first_summary_logged = asyncio.Event()
+    second_summary_logged = asyncio.Event()
+    summaries: list[dict[str, object]] = []
+    loop = asyncio.get_running_loop()
+
+    def _record_info(*args, **kwargs) -> None:
+        tags = kwargs["tags"]
+        if "stored_block_hash_count" not in tags:
+            return
+        summaries.append(dict(tags))
+        event = first_summary_logged if len(summaries) == 1 else second_summary_logged
+        loop.call_soon_threadsafe(event.set)
+
+    mocker.patch("subscriber.metrics.logger.info", side_effect=_record_info)
+    reporter = metrics.SpanMetricsReporter(summary_interval_s=0.01)
+
+    await reporter.start()
+    reporter.report(
+        _sample(
+            metrics,
+            ("kvcm_send", 0.001),
+            counters={"stored_block_hash_count": 3, "removed_block_hash_count": 2},
+        )
+    )
+    try:
+        await asyncio.wait_for(first_summary_logged.wait(), timeout=1)
+        await asyncio.sleep(0)
+        reporter.report(
+            _sample(
+                metrics,
+                ("kvcm_send", 0.001),
+                counters={"stored_block_hash_count": 4, "removed_block_hash_count": 1},
+            )
+        )
+        await asyncio.wait_for(second_summary_logged.wait(), timeout=1)
+    finally:
+        await reporter.stop()
+
+    assert [
+        (summary["stored_block_hash_count"], summary["removed_block_hash_count"])
+        for summary in summaries
+    ] == [(3, 2), (4, 1)]
 
 
 async def test_reporter_averages_each_stage_independently(mocker) -> None:
@@ -137,8 +202,8 @@ async def test_reporter_averages_each_stage_independently(mocker) -> None:
     reporter = metrics.SpanMetricsReporter(summary_interval_s=0.01)
 
     await reporter.start()
-    reporter.report(_spans(metrics, ("decode", 0.02), ("queue_wait", 0.01)))
-    reporter.report(_spans(metrics, ("replay_fetch", 0.10), ("queue_wait", 0.03)))
+    reporter.report(_sample(metrics, ("decode", 0.02), ("queue_wait", 0.01)))
+    reporter.report(_sample(metrics, ("replay_fetch", 0.10), ("queue_wait", 0.03)))
 
     try:
         await asyncio.wait_for(summary_logged.wait(), timeout=1)
@@ -186,7 +251,7 @@ async def test_reporter_offloads_warning_logging(mocker) -> None:
     reporter = metrics.SpanMetricsReporter(summary_interval_s=1)
 
     await reporter.start()
-    reporter.report(_spans(metrics, ("kvcm_send", 0.051)))
+    reporter.report(_sample(metrics, ("kvcm_send", 0.051)))
 
     try:
         await asyncio.wait_for(logging_offloaded.wait(), timeout=1)
@@ -214,4 +279,4 @@ def test_reporter_swallows_report_errors(mocker) -> None:
     reporter._queue = mocker.Mock()
     reporter._queue.put_nowait.side_effect = RuntimeError("queue failure")
 
-    reporter.report(_spans(metrics, ("kvcm_send", 0.01)))
+    reporter.report(_sample(metrics, ("kvcm_send", 0.01)))

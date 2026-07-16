@@ -214,18 +214,7 @@ class KvcmClient:
         await self._manager_client.start()
         self._started = True
         if await self._manager_is_ready():
-            try:
-                await self._register_instance()
-                await self._report_events([self._node_register_event()])
-                self._registered = True
-            except Exception as exc:
-                logger.warning(
-                    "kvcm initial registration failed (%s); will retry via heartbeat",
-                    type(exc).__name__,
-                    step="kvcm_register",
-                    tags={"message": str(exc)},
-                    exc_info=True,
-                )
+            await self._register_and_report_node()
         else:
             logger.warning(
                 "kvcm has no available endpoint; starting in not-ready state",
@@ -242,6 +231,36 @@ class KvcmClient:
         if not self._started or self._manager_client is None:
             raise RuntimeError("kvcm client has not been started")
         await self._manager_client.register_instance(self._register_instance_request())
+
+    async def _register_and_report_node(self) -> None:
+        """Perform the two-step kvcm registration: the register_instance RPC
+        followed by the NODE_REGISTER event report. ``_registered`` is left
+        untouched; callers set it only after this method returns cleanly."""
+
+        try:
+            await self._register_instance()
+        except Exception as exc:
+            logger.warning(
+                "kvcm register_instance failed (%s: %s)",
+                type(exc).__name__,
+                exc,
+                step="kvcm_register",
+                tags={"phase": "register_instance"},
+                exc_info=exc,
+            )
+            return
+        try:
+            await self._report_events([self._node_register_event()])
+        except Exception as exc:
+            logger.warning(
+                "kvcm node_register report failed (%s: %s)",
+                type(exc).__name__,
+                exc,
+                step="kvcm_register",
+                tags={"phase": "node_register"},
+                exc_info=exc,
+            )
+            return
         self._registered = True
 
     async def _heartbeat_loop(self) -> None:
@@ -250,34 +269,12 @@ class KvcmClient:
             if not self._registered:
                 if not await self._manager_is_ready():
                     continue
-                try:
-                    await self._register_instance()
-                except Exception as exc:
-                    logger.warning(
-                        "kvcm registerInstance retry failed (%s: %s)",
-                        type(exc).__name__,
-                        exc,
+                await self._register_and_report_node()
+                if self._registered:
+                    logger.info(
+                        "kvcm registration recovered",
                         step="kvcm_register",
-                        tags={"phase": "register_instance"},
-                        exc_info=True,
                     )
-                    continue
-                try:
-                    await self._report_events([self._node_register_event()])
-                except Exception as exc:
-                    logger.warning(
-                        "kvcm node register report failed (%s: %s)",
-                        type(exc).__name__,
-                        exc,
-                        step="kvcm_register",
-                        exc_info=True,
-                    )
-                    self._registered = False
-                    continue
-                logger.info(
-                    "kvcm registration recovered",
-                    step="kvcm_register",
-                )
 
             try:
                 await self._report_events([self._heartbeat_event()])
@@ -288,7 +285,7 @@ class KvcmClient:
                     type(exc).__name__,
                     exc,
                     step="kvcm_heartbeat",
-                    exc_info=True,
+                    exc_info=exc,
                 )
 
     async def _report_events(self, events: list[dict[str, object]]) -> dict[str, Any]:

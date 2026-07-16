@@ -9,8 +9,8 @@ from subscriber.config import SubscriberConfig
 from subscriber.engine.base import AbstractEngineAdapter
 from subscriber.health.coordinator import EngineHealthCoordinator
 from subscriber.kvcm.client import KvcmClient
-from subscriber.metrics import SpanMetricsReporter, StageTimer
-from subscriber.types import KVEventBatch
+from subscriber.metrics import MetricSample, SpanMetricsReporter, StageTimer
+from subscriber.types import BlockRemoved, BlockStored, KVEventBatch
 
 
 @dataclass(frozen=True)
@@ -91,8 +91,28 @@ async def send_kv_events(
                 continue
             # Metrics stay outside the send try/except: reporting is best-effort
             # (report never raises) and must never be misread as a send failure.
+            stored_block_hash_count = sum(
+                len(event.block_hashes)
+                for batch in queued.batches
+                for event in batch.events
+                if isinstance(event, BlockStored)
+            )
+            removed_block_hash_count = sum(
+                len(event.block_hashes)
+                for batch in queued.batches
+                for event in batch.events
+                if isinstance(event, BlockRemoved)
+            )
             queued.timer.mark("kvcm_send")
-            latency_reporter.report(queued.timer.spans())
+            latency_reporter.report(
+                MetricSample(
+                    spans=queued.timer.spans(),
+                    counters={
+                        "stored_block_hash_count": stored_block_hash_count,
+                        "removed_block_hash_count": removed_block_hash_count,
+                    },
+                )
+            )
         finally:
             queue.task_done()
 

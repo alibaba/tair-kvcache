@@ -14,11 +14,46 @@ from subscriber.main import (
     send_kv_events,
 )
 from subscriber.metrics import StageTimer
-from subscriber.types import AllBlocksCleared, KVEventBatch
+from subscriber.types import AllBlocksCleared, BlockRemoved, BlockStored, KVEventBatch
 
 
 def _batch() -> list[KVEventBatch]:
     return [KVEventBatch(ts=1.0, events=[AllBlocksCleared()])]
+
+
+def _batch_with_block_hashes() -> list[KVEventBatch]:
+    return [
+        KVEventBatch(
+            ts=1.0,
+            events=[
+                BlockStored(
+                    block_hashes=[1, 2],
+                    parent_block_hash=None,
+                    token_ids=[10, 11],
+                    block_size=16,
+                    lora_id=None,
+                    medium="GPU",
+                    lora_name=None,
+                ),
+                BlockRemoved(block_hashes=[3], medium="GPU"),
+            ],
+        ),
+        KVEventBatch(
+            ts=2.0,
+            events=[
+                BlockStored(
+                    block_hashes=[4],
+                    parent_block_hash=None,
+                    token_ids=[12],
+                    block_size=16,
+                    lora_id=None,
+                    medium="GPU",
+                    lora_name=None,
+                ),
+                BlockRemoved(block_hashes=[5, 6], medium="GPU"),
+            ],
+        ),
+    ]
 
 
 def _event(batches: list[KVEventBatch]) -> EngineEventBatch:
@@ -115,7 +150,7 @@ async def test_send_kv_events_sends_batch_when_epoch_unchanged(
 async def test_send_kv_events_reports_successful_batch_latency(
     kvcm: MagicMock, coordinator: MagicMock
 ) -> None:
-    batch = _batch()
+    batch = _batch_with_block_hashes()
     queue: asyncio.Queue[QueuedKVEventBatch] = asyncio.Queue()
     reporter = MagicMock()
     await queue.put(QueuedKVEventBatch(batch, 1, StageTimer()))
@@ -130,21 +165,27 @@ async def test_send_kv_events_reports_successful_batch_latency(
         await sender
 
     reporter.report.assert_called_once()
-    spans = reporter.report.call_args.args[0]
+    sample = reporter.report.call_args.args[0]
+    spans = sample.spans
     assert [span.name for span in spans] == ["queue_wait", "gate_wait", "kvcm_send"]
     assert all(span.duration_s >= 0 for span in spans)
+    assert sample.counters == {
+        "stored_block_hash_count": 3,
+        "removed_block_hash_count": 3,
+    }
 
 
 async def test_send_kv_events_drops_batch_when_epoch_changed(
     kvcm: MagicMock, coordinator: MagicMock
 ) -> None:
-    batch = _batch()
+    batch = _batch_with_block_hashes()
     queue: asyncio.Queue[QueuedKVEventBatch] = asyncio.Queue()
+    reporter = MagicMock()
     await queue.put(QueuedKVEventBatch(batch, 1, StageTimer()))
     coordinator.wait_ready_epoch.return_value = 2
     coordinator.is_epoch_current.return_value = False
 
-    sender = asyncio.create_task(send_kv_events(kvcm, coordinator, queue, MagicMock()))
+    sender = asyncio.create_task(send_kv_events(kvcm, coordinator, queue, reporter))
     await asyncio.sleep(0)
     sender.cancel()
 
@@ -152,15 +193,17 @@ async def test_send_kv_events_drops_batch_when_epoch_changed(
         await sender
 
     kvcm.send_batch.assert_not_awaited()
+    reporter.report.assert_not_called()
     assert queue.empty()
 
 
 async def test_send_kv_events_logs_failure_and_continues_with_next_batch(
     kvcm: MagicMock, coordinator: MagicMock, mocker
 ) -> None:
-    first_batch = _batch()
+    first_batch = _batch_with_block_hashes()
     second_batch = _batch()
     queue: asyncio.Queue[QueuedKVEventBatch] = asyncio.Queue()
+    reporter = MagicMock()
     await queue.put(QueuedKVEventBatch(first_batch, 1, StageTimer()))
     await queue.put(QueuedKVEventBatch(second_batch, 1, StageTimer()))
     error_message = (
@@ -170,7 +213,7 @@ async def test_send_kv_events_logs_failure_and_continues_with_next_batch(
     kvcm.send_batch.side_effect = [RuntimeError(error_message), None]
     warning = mocker.patch("subscriber.main.logger.warning")
 
-    sender = asyncio.create_task(send_kv_events(kvcm, coordinator, queue, MagicMock()))
+    sender = asyncio.create_task(send_kv_events(kvcm, coordinator, queue, reporter))
     await asyncio.sleep(0)
     await asyncio.sleep(0)
     sender.cancel()
@@ -178,13 +221,18 @@ async def test_send_kv_events_logs_failure_and_continues_with_next_batch(
         await sender
 
     assert kvcm.send_batch.await_count == 2
+    reporter.report.assert_called_once()
+    assert reporter.report.call_args.args[0].counters == {
+        "stored_block_hash_count": 0,
+        "removed_block_hash_count": 0,
+    }
     warning.assert_called_once_with(
         "failed to send kv event batch to kvcm; dropping batch",
         step="kvcm_send",
         tags={
             "epoch": 1,
-            "batch_count": 1,
-            "event_count": 1,
+            "batch_count": 2,
+            "event_count": 4,
             "error": "RuntimeError",
             "message": error_message,
         },

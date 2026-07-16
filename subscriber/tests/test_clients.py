@@ -456,11 +456,53 @@ async def test_start_survives_register_failure_and_starts_heartbeat(mocker) -> N
 
     assert not client._registered
     warning.assert_any_call(
-        "kvcm initial registration failed (%s); will retry via heartbeat",
+        "kvcm register_instance failed (%s: %s)",
         "RuntimeError",
+        register_error,
         step="kvcm_register",
-        tags={"message": "register failed"},
-        exc_info=True,
+        tags={"phase": "register_instance"},
+        exc_info=register_error,
+    )
+    assert client._heartbeat_task is not None
+
+    await client.close()
+
+
+async def test_start_resets_registered_when_node_register_report_fails(
+    mocker,
+) -> None:
+    """Regression: if register_instance succeeds but the NODE_REGISTER report
+    fails, _registered must stay False so the heartbeat loop retries."""
+
+    fake_sdk = FakeSdkClient()
+    report_error = RuntimeError("node register report failed")
+
+    async def report_event(
+        request: dict[str, object], **_: object
+    ) -> dict[str, object]:
+        events = request.get("events")
+        if (
+            isinstance(events, list)
+            and events
+            and events[0].get("event_type") == "EVENT_NODE_REGISTER"
+        ):
+            raise report_error
+        return {"header": {"status": {"code": "OK"}}}
+
+    fake_sdk.report_event.side_effect = report_event
+    warning = mocker.patch("subscriber.kvcm.client.logger.warning")
+    client = _make_kvcm(SubscriberConfig(kvcm_heartbeat_interval_s=60.0), fake_sdk)
+
+    await client.start()
+
+    assert not client._registered
+    warning.assert_any_call(
+        "kvcm node_register report failed (%s: %s)",
+        "RuntimeError",
+        report_error,
+        step="kvcm_register",
+        tags={"phase": "node_register"},
+        exc_info=report_error,
     )
     assert client._heartbeat_task is not None
 
@@ -610,7 +652,7 @@ async def test_heartbeat_failure_logs_warning_and_continues(mocker) -> None:
         "RuntimeError",
         heartbeat_error,
         step="kvcm_heartbeat",
-        exc_info=True,
+        exc_info=heartbeat_error,
     )
 
 

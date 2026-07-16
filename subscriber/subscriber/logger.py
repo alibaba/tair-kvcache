@@ -4,6 +4,7 @@ import gzip
 import logging as _logging
 import os
 import shutil
+import traceback as _tb
 from collections.abc import Callable
 from logging.handlers import RotatingFileHandler
 
@@ -13,6 +14,63 @@ try:
     import dashlog as _dl
 except ImportError:
     _dl = None
+
+
+def _render_exc(exc_info: object) -> str:
+    """Render ``exc_info`` into a traceback string.
+
+    Accepts ``None`` / ``False`` (no output), ``True`` (current exception via
+    ``sys.exc_info``), a ``(type, value, tb)`` triple (the standard
+    ``sys.exc_info`` shape), or an exception object (uses its
+    ``__traceback__`` and follows ``__cause__`` / ``__context__`` chains).
+    Returns the empty string when there is nothing to render.
+    """
+
+    if exc_info is None or exc_info is False:
+        return ""
+    if exc_info is True:
+        return _tb.format_exc().rstrip()
+    if isinstance(exc_info, BaseException):
+        return "".join(_tb.format_exception(exc_info)).rstrip()
+    if (
+        isinstance(exc_info, tuple)
+        and len(exc_info) == 3
+        and isinstance(exc_info[1], BaseException)
+    ):
+        return "".join(_tb.format_exception(*exc_info)).rstrip()
+    return ""
+
+
+def _render_body(msg: object, args: tuple[object, ...], exc_info: object) -> str:
+    """Percent-format ``msg`` with ``args`` and append a rendered traceback.
+
+    This is the backend-agnostic core shared by the stdlib and dashlog code
+    paths. Backend-specific structured fields (``step``, ``tags``, ...) are
+    handled by each path's wrapper and deliberately NOT folded in here.
+    """
+
+    text = str(msg) % args if args else str(msg)
+    tb = _render_exc(exc_info)
+    return f"{text}\n{tb}" if tb else text
+
+
+def _wrap_dashlog(dl_fn: Callable[..., object]) -> Callable[..., None]:
+    """Forward to a dashlog level function with ``exc_info`` folded into the
+    message string. dashlog itself ignores ``exc_info``; this wrapper makes
+    tracebacks visible by embedding them in the message and strips the kwarg
+    so it never leaks downstream. ``step`` / ``tags`` / ``request_id`` /
+    ``flush`` / ``stacklevel`` pass through in kwargs as native dashlog
+    fields and are NOT rendered into the message."""
+
+    def _log(
+        msg: object,
+        *args: object,
+        exc_info: object = None,
+        **kwargs: object,
+    ) -> None:
+        dl_fn(_render_body(msg, args, exc_info), **kwargs)
+
+    return _log
 
 
 if _dl is not None:
@@ -35,11 +93,11 @@ if _dl is not None:
     def is_debug_enabled() -> bool:
         return _debug_enabled
 
-    debug = _dl.debug
-    info = _dl.info
-    warning = _dl.warning
-    error = _dl.error
-    critical = _dl.critical
+    debug = _wrap_dashlog(_dl.debug)
+    info = _wrap_dashlog(_dl.info)
+    warning = _wrap_dashlog(_dl.warning)
+    error = _wrap_dashlog(_dl.error)
+    critical = _wrap_dashlog(_dl.critical)
 
 else:
 
@@ -103,15 +161,15 @@ else:
             *args: object,
             step: str = "",
             tags: dict[str, object] | None = None,
-            exc_info: bool = False,
+            exc_info: object = None,
             **_: object,
         ) -> None:
-            parts = [str(msg) % args if args else str(msg)]
+            parts = [_render_body(msg, args, exc_info)]
             if step:
                 parts.append(f"step={step}")
             if tags:
                 parts.append(" ".join(f"{key}={value}" for key, value in tags.items()))
-            _log.log(level, " | ".join(parts), exc_info=exc_info)
+            _log.log(level, " | ".join(parts))
 
         return _log_fn
 
