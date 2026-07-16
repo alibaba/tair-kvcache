@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -64,7 +65,7 @@ public:
         int64_t src_create_time = 0;
     };
 
-    // Copy 提交的 group 级硬上限。BatchSubmit 在 copy_submission_mutex_ 内统计 active 并截断，
+    // Copy 提交的 group 级硬上限。BatchSubmit 在短准入锁 + task_mutex_ 内统计 active 并 reserve，
     // 保证 Admin / Reclaimer 并发提交时不会同时看到同一个空闲 slot。
     struct CopyConcurrencyLimit {
         std::string instance_group_name;
@@ -178,10 +179,10 @@ public:
     // F-12: 取指定 instance 的活跃 copy task block_key 列表（用于 drain 前 BatchCancel）。
     std::vector<int64_t> GetActiveBlockKeysForInstance(const std::string &instance_id) const;
 
-    // F-12: instance 级 draining——RemoveInstance 期间阻止该 instance 的所有新迁移提交。
-    // Submit/BatchSubmit 在 copy_submission_mutex_ 下检查此集合，覆盖 reclaimer + admin 两条提交路径。
-    // BeginDrainingInstance 拿锁 insert 建立 happens-before：之后的提交拿锁必见 draining → 拒绝；
-    // 拿锁前的 in-flight 提交先完成 insert 活跃表 → 落进 drain 快照被 BatchCancel。两头堵死。
+    // F-12/R2-12: instance 级 draining——RemoveInstance 期间阻止该 instance 的所有新迁移提交。
+    // Submit/BatchSubmit 在短准入锁下检查此集合，并在释放锁前登记 preparing reservation；
+    // BeginDrainingInstance 拿同一把锁 insert 后，早于它准入的任务已对 drain 快照可见，晚于它的
+    // 提交则直接拒绝。覆盖 reclaimer + admin 两条提交路径，且不等待其他 instance 的慢 I/O。
     void BeginDrainingInstance(const std::string &instance_id);
     void EndDrainingInstance(const std::string &instance_id);
 
@@ -432,6 +433,11 @@ private:
     std::thread monitor_thread_;
     std::atomic<bool> running_{false};
     std::atomic<bool> accepting_copy_submissions_{false};
+    // R2-12: Submit/BatchSubmit 全程持 shared lock，彼此可并行；Stop 持 unique lock，精确等待
+    // 已准入的提交函数完成后再停止 monitor/清 active table。锁序固定为：
+    // copy_submission_lifecycle_mutex_ -> copy_submission_mutex_ -> task_mutex_。
+    std::shared_mutex copy_submission_lifecycle_mutex_;
+    // 短准入锁：仅保护 accepting/draining 检查与 preparing reservation，不覆盖 backend/meta I/O。
     std::mutex copy_submission_mutex_;
     // F-12: draining 中的 instance（copy_submission_mutex_ 保护）。非空即拒绝该 instance 的新提交。
     std::unordered_set<std::string> draining_instances_;

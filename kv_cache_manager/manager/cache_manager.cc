@@ -458,8 +458,9 @@ ErrorCode CacheManager::RemoveInstance(RequestContext *request_context,
         const auto active_keys = migration_manager_->GetActiveBlockKeysForInstance(instance_id);
         if (!active_keys.empty()) {
             migration_manager_->BatchCancel(instance_id, active_keys);
-            // 有界等待：cancelling 任务由 monitor 线程在 copy future 完成后清理（F-11 延迟收尾）。
-            // draining gate 已阻止新提交，故快照后不会有逃逸任务，poll 只需等快照内 cancel 收尾。
+            // 有界等待：running/cancelling 任务由 monitor 在 copy future 完成后清理；快照中的
+            // preparing 任务则已被置为 kPrepareCancelling，由提交线程在下一安全边界回滚。
+            // R2-12: draining gate 与锁内 reservation 保证快照不漏掉已准入任务，故无需重复 Cancel。
             constexpr int kDrainTimeoutMs = 5000;
             constexpr int kPollIntervalMs = 50;
             int waited_ms = 0;

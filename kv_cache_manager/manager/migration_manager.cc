@@ -161,6 +161,7 @@ void MigrationManager::UpdateMarksActiveGauge() {
 MigrationManager::~MigrationManager() { Stop(); }
 
 void MigrationManager::Start() {
+    std::unique_lock<std::shared_mutex> lifecycle_lock(copy_submission_lifecycle_mutex_);
     bool expected = false;
     if (!running_.compare_exchange_strong(expected, true)) {
         return; // already running
@@ -171,8 +172,11 @@ void MigrationManager::Start() {
 }
 
 void MigrationManager::Stop() {
+    // 先关全局 gate，后来的 Submit 可在获取 lifecycle shared lock 前快速失败；随后用 unique lock
+    // 等待已经持有 shared lock 的提交函数完整返回。该 barrier 只等待 prepare/enqueue，不等待
+    // executor 中已异步运行的数据 Copy。
     accepting_copy_submissions_.store(false, std::memory_order_release);
-    std::lock_guard<std::mutex> submission_lock(copy_submission_mutex_);
+    std::unique_lock<std::shared_mutex> lifecycle_lock(copy_submission_lifecycle_mutex_);
 
     bool expected = true;
     if (!running_.compare_exchange_strong(expected, false)) {
@@ -355,27 +359,37 @@ ErrorCode MigrationManager::PrepareCopyTask(const std::string &trace_id,
 }
 
 ErrorCode MigrationManager::Submit(const std::string &trace_id, MigrationRequest request) {
-    std::lock_guard<std::mutex> submission_lock(copy_submission_mutex_);
-    if (!accepting_copy_submissions_.load(std::memory_order_acquire)) {
+    auto reject_not_accepting = [&]() {
         KVCM_LOG_WARN("[%s] reject migration copy submit for instance %s block_key %ld: "
                       "manager is not accepting submissions",
                       trace_id.c_str(),
                       request.instance_id.c_str(),
                       request.block_key);
         return EC_ERROR;
+    };
+    // Stop 先把 accepting 置 false，再等待 lifecycle unique lock。快检避免 shutdown 期间的新请求
+    // 排在 unique lock 后面；shared lock 则保证一旦进入，Stop 必须等本函数完整收口。
+    if (!accepting_copy_submissions_.load(std::memory_order_acquire)) {
+        return reject_not_accepting();
     }
-    // F-12: instance 正在 drain（RemoveInstance 中）→ 拒绝新提交，避免 trim-vs-write 竞态。
-    if (draining_instances_.count(request.instance_id) > 0) {
-        KVCM_LOG_WARN("[%s] reject migration copy submit for draining instance %s block_key %ld",
-                      trace_id.c_str(),
-                      request.instance_id.c_str(),
-                      request.block_key);
-        return EC_ERROR;
-    }
-
-    // R2-01: 在任何目标 WRITING location 发布前原子登记 preparing 占位。它同时用于防重复、
-    // copy 并发预算和 Reclaimer 保护，不能退化成先 HasActiveTaskLocked 再延迟插入。
+    std::shared_lock<std::shared_mutex> lifecycle_lock(copy_submission_lifecycle_mutex_);
     {
+        std::lock_guard<std::mutex> submission_lock(copy_submission_mutex_);
+        // shared lock 可能排在一次 Stop 后才拿到，必须在真正准入点复查。
+        if (!accepting_copy_submissions_.load(std::memory_order_acquire)) {
+            return reject_not_accepting();
+        }
+        // F-12: instance 正在 drain（RemoveInstance 中）→ 拒绝新提交，避免 trim-vs-write 竞态。
+        if (draining_instances_.count(request.instance_id) > 0) {
+            KVCM_LOG_WARN("[%s] reject migration copy submit for draining instance %s block_key %ld",
+                          trace_id.c_str(),
+                          request.instance_id.c_str(),
+                          request.block_key);
+            return EC_ERROR;
+        }
+
+        // R2-01/R2-12: 在释放短准入锁、执行任何目标 I/O 前原子登记 preparing 占位。它同时用于
+        // 防重复、copy 并发预算、Reclaimer 保护和 drain 快照，不能拆成 check-then-insert。
         std::lock_guard<std::mutex> lock(task_mutex_);
         if (!ReservePreparingTaskLocked(request)) {
             KVCM_LOG_INFO("[%s] instance %s block_key %ld already has an active migration task, skip",
@@ -494,15 +508,16 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
         return results;
     }
 
-    // ---- gate ----
-    std::lock_guard<std::mutex> submission_lock(copy_submission_mutex_);
+    // Stop 的 lifecycle barrier 与 Submit 相同：快检拒绝 shutdown 后的新调用；shared lock 覆盖本函数
+    // 余下生命周期，但不串行其他 Submit/BatchSubmit。
     if (!accepting_copy_submissions_.load(std::memory_order_acquire)) {
         return results;
     }
+    std::shared_lock<std::shared_mutex> lifecycle_lock(copy_submission_lifecycle_mutex_);
 
     // ---- phase 0: group 级 Copy 硬限流 + per-block dedup + F-12 draining gate + preparing reservation ----
-    // R2-02: 所有 eligible item 必须在任何 batch AddLocation 前进入 active 表。reservation 在本轮仍由
-    // copy_submission_mutex_ 串行保护，并在 task_mutex_ 内原子 check-and-insert；后续 R2-12 再缩慢 I/O 锁域。
+    // R2-02/R2-12: 所有 eligible item 必须在释放短准入锁、执行任何 batch Create/AddLocation 前进入
+    // active 表。copy_submission_mutex_ 只串行本 phase 的 gate；后续 backend/meta I/O 可跨 instance 并行。
     std::vector<bool> eligible(requests.size(), true);
     std::vector<bool> reservation_active(requests.size(), false);
     auto release_preparing_at = [&](std::size_t i) {
@@ -523,6 +538,10 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
         }
     };
     {
+        std::lock_guard<std::mutex> submission_lock(copy_submission_mutex_);
+        if (!accepting_copy_submissions_.load(std::memory_order_acquire)) {
+            return results;
+        }
         std::lock_guard<std::mutex> lock(task_mutex_);
         std::size_t available_group_slots = SIZE_MAX;
         if (copy_limit.enabled()) {
@@ -855,7 +874,7 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
 
     // ---- fallback: 无 src_specs 的 request（直接调 BatchSubmit 但未经 DispatchMigrationBatch）----
     // 这些 request 的 eligible[i]=false 且 results[i]=EC_ERROR（初始值），逐条走原 PrepareCopyTask。
-    // 不能回调 Submit（会死锁: copy_submission_mutex_ 已持有），内联处理。
+    // 不能回调 Submit（会递归获取非递归的 lifecycle shared_mutex），继续内联处理。
     for (std::size_t i = 0; i < requests.size(); ++i) {
         if (results[i] != EC_UNKNOWN)
             continue;          // 只处理被标记为需 fallback 的（src_specs 为空）

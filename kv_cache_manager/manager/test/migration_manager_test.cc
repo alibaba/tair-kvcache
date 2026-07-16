@@ -1,6 +1,8 @@
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -156,6 +158,68 @@ std::future<PlanExecuteResult> CopySubmitInvalid_stub(void * /*obj*/, const Cach
 }
 } // namespace r2_reservation_stub
 
+// ---- R2-12 submission 锁域测试存根 ----
+// 第一笔 migration Create 可由测试精确卡住；后续 Create 仍可进入，用来区分“共享 lifecycle
+// barrier + 短准入锁”和旧的全函数互斥锁。所有状态都在同一 mutex 下访问，避免测试自身 data race。
+namespace r2_12_submission_stub {
+std::mutex g_mutex;
+std::condition_variable g_cv;
+bool g_block_first_create = false;
+bool g_first_create_entered = false;
+bool g_release_first_create = false;
+int g_create_calls = 0;
+
+void Reset(bool block_first_create = true) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_block_first_create = block_first_create;
+    g_first_create_entered = false;
+    g_release_first_create = false;
+    g_create_calls = 0;
+}
+
+bool WaitForFirstCreate(std::chrono::milliseconds timeout = std::chrono::seconds(5)) {
+    std::unique_lock<std::mutex> lock(g_mutex);
+    return g_cv.wait_for(lock, timeout, []() { return g_first_create_entered; });
+}
+
+void ReleaseFirstCreate() {
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        g_release_first_create = true;
+    }
+    g_cv.notify_all();
+}
+
+int CreateCallCount() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_create_calls;
+}
+
+std::vector<std::pair<ErrorCode, DataStorageUri>> Create_stub(void * /*obj*/,
+                                                              RequestContext * /*rc*/,
+                                                              const std::string &name,
+                                                              const std::vector<std::string> &keys,
+                                                              size_t size,
+                                                              std::function<void()> /*cb*/) {
+    {
+        std::unique_lock<std::mutex> lock(g_mutex);
+        const int call_index = ++g_create_calls;
+        if (g_block_first_create && call_index == 1) {
+            g_first_create_entered = true;
+            g_cv.notify_all();
+            g_cv.wait(lock, []() { return g_release_first_create; });
+        }
+    }
+
+    std::vector<std::pair<ErrorCode, DataStorageUri>> results;
+    results.reserve(keys.size());
+    for (const auto &key : keys) {
+        results.emplace_back(EC_OK, DataStorageUri("dummy://" + name + "/" + key + "?size=" + std::to_string(size)));
+    }
+    return results;
+}
+} // namespace r2_12_submission_stub
+
 class CaptureEventPublisher : public EventPublisher {
 public:
     bool Init(const std::string & /*config*/) override { return true; }
@@ -211,15 +275,15 @@ public:
         return data_storage_manager_->RegisterStorage(rc.get(), name, config) == ErrorCode::EC_OK;
     }
 
-    // 在 hot 存储上创建一个 SERVING 的源 location，可选写入真实源文件内容。
-    // 返回 src_location_id。
-    std::string CreateSourceLocation(int64_t block_key,
-                                     const std::string &hot_storage,
-                                     bool write_file,
-                                     const std::string &content,
-                                     int64_t create_time = 0) {
+    // 在指定 instance 的 hot 存储上创建一个 SERVING 源 location，可选写入真实源文件内容。
+    std::string CreateSourceLocationForInstance(const std::string &instance_id,
+                                                int64_t block_key,
+                                                const std::string &hot_storage,
+                                                bool write_file,
+                                                const std::string &content,
+                                                int64_t create_time = 0) {
         auto rc = std::make_shared<RequestContext>("create_source");
-        std::string key = kInstance + "/TP0/" + StringUtil::Uint64ToHex(block_key);
+        std::string key = instance_id + "/TP0/" + StringUtil::Uint64ToHex(block_key);
         auto results = data_storage_manager_->Create(rc.get(), hot_storage, {key}, content.size(), nullptr);
         EXPECT_EQ(1u, results.size());
         EXPECT_EQ(ErrorCode::EC_OK, results[0].first);
@@ -233,10 +297,11 @@ public:
             ofs << content;
         }
 
-        MetaSearcher meta_searcher(meta_manager_->GetMetaIndexer(kInstance));
-        auto loc = std::make_shared<CacheLocation>(DataStorageType::DATA_STORAGE_TYPE_DUMMY,
-                                                   1,
-                                                   std::vector<LocationSpec>{LocationSpec("TP0", src_uri.ToUriString())});
+        MetaSearcher meta_searcher(meta_manager_->GetMetaIndexer(instance_id));
+        auto loc =
+            std::make_shared<CacheLocation>(DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+                                            1,
+                                            std::vector<LocationSpec>{LocationSpec("TP0", src_uri.ToUriString())});
         if (create_time != 0) {
             loc->set_create_time(create_time);
         }
@@ -249,6 +314,15 @@ public:
         std::vector<std::vector<ErrorCode>> cas_results;
         EXPECT_EQ(ErrorCode::EC_OK, meta_searcher.BatchCASLocationStatus(rc.get(), {block_key}, cas, cas_results));
         return ids[0];
+    }
+
+    // 绝大多数用例使用默认测试 instance，保留原 helper 以免测试调用面膨胀。
+    std::string CreateSourceLocation(int64_t block_key,
+                                     const std::string &hot_storage,
+                                     bool write_file,
+                                     const std::string &content,
+                                     int64_t create_time = 0) {
+        return CreateSourceLocationForInstance(kInstance, block_key, hot_storage, write_file, content, create_time);
     }
 
     // 查询某 block_key 下某 location_id 的状态，不存在返回 CLS_NOT_FOUND。
@@ -1628,6 +1702,222 @@ TEST_F(MigrationManagerTest, TestBatchCancelDuringPrepareStopsBeforeCopy) {
     ASSERT_EQ(0u, mgr.GetStats().copy_submitted);
     ASSERT_FALSE(mgr.HasMigrationTask(kInstance, block_key));
     ASSERT_TRUE(WaitFor([&]() { return LocationCount(block_key) == 1u; }));
+}
+
+// R2-12: 一笔 Submit 卡在同步 Create 时，另一个 instance 的 Submit 仍可进入自己的 Create；
+// lifecycle shared lock 只与 Stop 互斥，不能重新退化成 Submit 之间的全局串行锁。
+TEST_F(MigrationManagerTest, TestSlowCreateDoesNotSerializeOtherInstanceSubmit) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    const std::string other_instance = "r2_12_other_instance";
+    ASSERT_TRUE(CreateMetaIndexer(other_instance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "r2_12_parallel_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "r2_12_parallel_cold/"));
+
+    const std::string first_src = CreateSourceLocation(821, "hot_01", true, "parallel-first");
+    const std::string second_src =
+        CreateSourceLocationForInstance(other_instance, 822, "hot_01", true, "parallel-second");
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    mgr.DebugEnableCopySubmissionsForTest();
+
+    auto make_req = [](const std::string &instance_id, int64_t block_key, const std::string &src_location_id) {
+        MigrationManager::MigrationRequest req;
+        req.instance_id = instance_id;
+        req.block_key = block_key;
+        req.src_location_id = src_location_id;
+        req.src_storage_name = "hot_01";
+        req.dst_storage_name = "cold_01";
+        return req;
+    };
+
+    r2_12_submission_stub::Reset();
+    Stub stub;
+    stub.set(ADDR(DataStorageManager, Create), r2_12_submission_stub::Create_stub);
+    auto first = std::async(std::launch::async,
+                            [&]() { return mgr.Submit("r2_12_parallel_first", make_req(kInstance, 821, first_src)); });
+    const bool first_entered = r2_12_submission_stub::WaitForFirstCreate();
+    if (!first_entered) {
+        r2_12_submission_stub::ReleaseFirstCreate();
+        first.wait();
+        EXPECT_TRUE(first_entered);
+        return;
+    }
+
+    auto second = std::async(std::launch::async, [&]() {
+        return mgr.Submit("r2_12_parallel_second", make_req(other_instance, 822, second_src));
+    });
+    const auto second_status_before_release = second.wait_for(std::chrono::seconds(5));
+    r2_12_submission_stub::ReleaseFirstCreate();
+    const auto first_ec = first.get();
+    const auto second_ec = second.get();
+
+    ASSERT_EQ(std::future_status::ready, second_status_before_release)
+        << "second Submit was serialized behind an unrelated slow Create";
+    ASSERT_EQ(EC_OK, first_ec);
+    ASSERT_EQ(EC_OK, second_ec);
+    ASSERT_EQ(2, r2_12_submission_stub::CreateCallCount());
+}
+
+// R2-12: drain 在慢 Create 期间必须快速关 gate，并用已可见的 preparing reservation 做一次 Cancel。
+// Cancel 持久化为 kPrepareCancelling，Create 返回后提交线程应回滚，绝不能进入 executor。
+TEST_F(MigrationManagerTest, TestDrainCancelsReservationDuringSlowCreate) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "r2_12_drain_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "r2_12_drain_cold/"));
+
+    const int64_t block_key = 823;
+    const std::string src = CreateSourceLocation(block_key, "hot_01", true, "drain-slow-create");
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    mgr.DebugEnableCopySubmissionsForTest();
+
+    MigrationManager::MigrationRequest req;
+    req.instance_id = kInstance;
+    req.block_key = block_key;
+    req.src_location_id = src;
+    req.src_storage_name = "hot_01";
+    req.dst_storage_name = "cold_01";
+
+    r2_12_submission_stub::Reset();
+    Stub stub;
+    stub.set(ADDR(DataStorageManager, Create), r2_12_submission_stub::Create_stub);
+    auto submit = std::async(std::launch::async, [&]() { return mgr.Submit("r2_12_drain", req); });
+    const bool create_entered = r2_12_submission_stub::WaitForFirstCreate();
+    if (!create_entered) {
+        r2_12_submission_stub::ReleaseFirstCreate();
+        submit.wait();
+        EXPECT_TRUE(create_entered);
+        return;
+    }
+
+    auto drain = std::async(std::launch::async, [&]() {
+        mgr.BeginDrainingInstance(kInstance);
+        const auto keys = mgr.GetActiveBlockKeysForInstance(kInstance);
+        return std::make_pair(keys, mgr.BatchCancel(kInstance, keys));
+    });
+    const auto drain_status_before_release = drain.wait_for(std::chrono::seconds(5));
+    r2_12_submission_stub::ReleaseFirstCreate();
+    const auto drain_result = drain.get();
+    const auto submit_ec = submit.get();
+    mgr.EndDrainingInstance(kInstance);
+
+    ASSERT_EQ(std::future_status::ready, drain_status_before_release)
+        << "BeginDraining was blocked by slow prepare I/O";
+    ASSERT_EQ((std::vector<int64_t>{block_key}), drain_result.first);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), drain_result.second);
+    ASSERT_EQ(EC_ERROR, submit_ec);
+    ASSERT_EQ(0u, mgr.GetStats().copy_submitted);
+    ASSERT_FALSE(mgr.HasMigrationTask(kInstance, block_key));
+}
+
+// R2-12: Stop 先关闭 accepting，再通过 lifecycle unique lock 等待已准入 Submit 完整返回。
+// 等待期间新请求应快速失败；Stop 不得在慢 Create owner 仍可能回写 active/pending 时提前清表。
+TEST_F(MigrationManagerTest, TestStopWaitsForSlowSubmitLifecycle) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "r2_12_stop_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "r2_12_stop_cold/"));
+
+    const std::string first_src = CreateSourceLocation(824, "hot_01", true, "stop-first");
+    const std::string rejected_src = CreateSourceLocation(825, "hot_01", true, "stop-rejected");
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    mgr.Start();
+
+    auto make_req = [&](int64_t block_key, const std::string &src_location_id) {
+        MigrationManager::MigrationRequest req;
+        req.instance_id = kInstance;
+        req.block_key = block_key;
+        req.src_location_id = src_location_id;
+        req.src_storage_name = "hot_01";
+        req.dst_storage_name = "cold_01";
+        return req;
+    };
+
+    r2_12_submission_stub::Reset();
+    Stub stub;
+    stub.set(ADDR(DataStorageManager, Create), r2_12_submission_stub::Create_stub);
+    auto submit =
+        std::async(std::launch::async, [&]() { return mgr.Submit("r2_12_stop_inflight", make_req(824, first_src)); });
+    const bool create_entered = r2_12_submission_stub::WaitForFirstCreate();
+    if (!create_entered) {
+        r2_12_submission_stub::ReleaseFirstCreate();
+        submit.wait();
+        mgr.Stop();
+        EXPECT_TRUE(create_entered);
+        return;
+    }
+
+    auto stop = std::async(std::launch::async, [&]() { mgr.Stop(); });
+    const bool accepting_closed =
+        WaitFor([&]() { return !mgr.accepting_copy_submissions_.load(std::memory_order_acquire); });
+    const auto stop_status_before_release = stop.wait_for(std::chrono::milliseconds(200));
+    const auto rejected_ec = mgr.Submit("r2_12_stop_reject", make_req(825, rejected_src));
+    r2_12_submission_stub::ReleaseFirstCreate();
+    const auto submit_ec = submit.get();
+    stop.get();
+
+    ASSERT_TRUE(accepting_closed);
+    ASSERT_EQ(std::future_status::timeout, stop_status_before_release)
+        << "Stop returned while an admitted Submit still owned slow prepare I/O";
+    ASSERT_EQ(EC_ERROR, rejected_ec);
+    ASSERT_EQ(EC_OK, submit_ec);
+    ASSERT_EQ(0u, mgr.ActiveTaskCount());
+}
+
+// R2-12: 缩锁后两个 BatchSubmit 可并发进入准入，但 group slot 的统计与 reservation 必须仍原子；
+// 第一批卡在 Create 时，第二批应立即 EC_OUT_OF_LIMIT，且不能进入第二次 Create。
+TEST_F(MigrationManagerTest, TestConcurrentBatchSubmitDoesNotOverissueGroupLimit) {
+    ASSERT_TRUE(CreateMetaIndexer(kInstance));
+    ASSERT_TRUE(CreateDummyStorage("hot_01", GetPrivateTestRuntimeDataPath() + "r2_12_limit_hot/"));
+    ASSERT_TRUE(CreateDummyStorage("cold_01", GetPrivateTestRuntimeDataPath() + "r2_12_limit_cold/"));
+
+    auto make_req = [&](int64_t block_key) {
+        const std::string src = CreateSourceLocation(block_key, "hot_01", true, "group-limit");
+        const auto src_location = GetLocation(block_key, src);
+        EXPECT_NE(nullptr, src_location);
+        MigrationManager::MigrationRequest req;
+        req.instance_group_name = "r2_12_group";
+        req.instance_id = kInstance;
+        req.block_key = block_key;
+        req.src_location_id = src;
+        req.src_create_time = src_location == nullptr ? 0 : src_location->create_time();
+        req.src_storage_name = "hot_01";
+        req.dst_storage_name = "cold_01";
+        if (src_location != nullptr) {
+            req.src_specs = src_location->location_specs();
+        }
+        return req;
+    };
+    const auto first_req = make_req(826);
+    const auto second_req = make_req(827);
+    MigrationManager mgr(schedule_plan_executor_, meta_manager_, data_storage_manager_);
+    mgr.DebugEnableCopySubmissionsForTest();
+    const MigrationManager::CopyConcurrencyLimit limit{"r2_12_group", 1};
+
+    r2_12_submission_stub::Reset();
+    Stub stub;
+    stub.set(ADDR(DataStorageManager, Create), r2_12_submission_stub::Create_stub);
+    auto first =
+        std::async(std::launch::async, [&]() { return mgr.BatchSubmit("r2_12_limit_first", {first_req}, limit); });
+    const bool first_entered = r2_12_submission_stub::WaitForFirstCreate();
+    if (!first_entered) {
+        r2_12_submission_stub::ReleaseFirstCreate();
+        first.wait();
+        EXPECT_TRUE(first_entered);
+        return;
+    }
+
+    auto second =
+        std::async(std::launch::async, [&]() { return mgr.BatchSubmit("r2_12_limit_second", {second_req}, limit); });
+    const auto second_status_before_release = second.wait_for(std::chrono::seconds(5));
+    const int create_calls_before_release = r2_12_submission_stub::CreateCallCount();
+    r2_12_submission_stub::ReleaseFirstCreate();
+    const auto first_results = first.get();
+    const auto second_results = second.get();
+
+    ASSERT_EQ(std::future_status::ready, second_status_before_release)
+        << "group admission was serialized behind slow Create";
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK}), first_results);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OUT_OF_LIMIT}), second_results);
+    ASSERT_EQ(1, create_calls_before_release);
+    ASSERT_EQ(1, r2_12_submission_stub::CreateCallCount());
 }
 
 // R2-03: 覆盖带 src_specs 的 BatchSubmit 主路径，确保批量 Copy 到 cold_02
