@@ -19,13 +19,19 @@ class KvCacheManagerClient:
     def __init__(self, base_url, *, instance_id="", auto_discover_leader=False, leader_retry_count=1,
                  leader_retry_base_interval_seconds=0.005,
                  discovery_refresh_interval_seconds=30,
-                 min_discover_interval_seconds=1):
+                 min_discover_interval_seconds=1,
+                 request_timeout_seconds=1.0):
         """
         Args:
             base_url: Manager HTTP(S) address or a service-discovery URL. When
                 auto_discover_leader is enabled, leader discovery always starts from
                 this entry point instead of the current leader.
+            request_timeout_seconds: Timeout in seconds for Manager HTTP requests.
         """
+        self._request_timeout_seconds = float(request_timeout_seconds)
+        if self._request_timeout_seconds <= 0:
+            raise ValueError("request_timeout_seconds must be positive")
+
         self.session = requests.Session()
         self.headers = {'Accept': 'application/json', 'Content-Type': 'application/json'}
 
@@ -135,7 +141,7 @@ class KvCacheManagerClient:
                         "instance_id": self._instance_id,
                     },
                     headers=self.headers,
-                    timeout=5,
+                    timeout=self._request_timeout_seconds,
                 )
             except Exception as e:
                 logger.warning("Leader discovery request to %s failed: %s", url, e)
@@ -210,9 +216,19 @@ class KvCacheManagerClient:
         url = self.base_url + endpoint
 
         if method == 'POST':
-            response = self.session.post(url, json=data, headers=self.headers)
+            response = self.session.post(
+                url,
+                json=data,
+                headers=self.headers,
+                timeout=self._request_timeout_seconds,
+            )
         elif method == 'GET':
-            response = self.session.get(url, params=data, headers=self.headers)
+            response = self.session.get(
+                url,
+                params=data,
+                headers=self.headers,
+                timeout=self._request_timeout_seconds,
+            )
         else:
             raise ValueError(f"Unsupported HTTP method: {method}")
 

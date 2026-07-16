@@ -160,6 +160,20 @@ class TestCreateServiceDiscovery(unittest.TestCase):
         self.assertEqual(discovery.custom_port, 12348)
         discovery.close()
 
+    def test_spectrum_body_is_forwarded_to_implementation(self):
+        with patch.dict(sys.modules, {_SPECTRUM_MODULE: _fake_spectrum_module()}):
+            discovery = create_service_discovery(
+                "spectrum://virtual-service:opaque-suffix?cache_time=10"
+            )
+
+        self.assertIsNotNone(discovery)
+        self.assertEqual(
+            discovery.virtual_service_id,
+            "virtual-service:opaque-suffix",
+        )
+        self.assertEqual(discovery.custom_port, 0)
+        discovery.close()
+
     def test_spectrum_url_uses_default_port_override(self):
         with patch.dict(sys.modules, {_SPECTRUM_MODULE: _fake_spectrum_module()}):
             discovery = create_service_discovery(

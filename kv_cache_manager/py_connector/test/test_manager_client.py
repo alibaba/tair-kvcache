@@ -161,6 +161,50 @@ class TestServiceDiscoveryInit(unittest.TestCase):
         discovery.close.assert_called_once_with()
 
 
+class TestRequestTimeout(unittest.TestCase):
+    """Tests for the configurable Manager HTTP request timeout."""
+
+    def test_non_positive_timeout_is_rejected(self):
+        for timeout in (0, -1):
+            with self.subTest(timeout=timeout):
+                with self.assertRaisesRegex(ValueError, "must be positive"):
+                    KvCacheManagerClient(
+                        "http://10.0.0.1:8080",
+                        request_timeout_seconds=timeout,
+                    )
+
+    def test_api_request_uses_configured_timeout(self):
+        client = KvCacheManagerClient(
+            "http://10.0.0.1:8080",
+            request_timeout_seconds=1.5,
+        )
+        client.session.post = MagicMock(
+            return_value=_make_mock_response(_ok_response_json())
+        )
+
+        try:
+            client.register_instance({"trace_id": "test"})
+        finally:
+            client.close()
+
+        self.assertEqual(client.session.post.call_args.kwargs["timeout"], 1.5)
+
+    @patch("kv_cache_manager.py_connector.common.manager_client.requests.post")
+    def test_leader_discovery_uses_configured_timeout(self, mock_post):
+        mock_post.return_value = _make_mock_response(_cluster_info_response())
+        client = KvCacheManagerClient(
+            "http://10.0.0.1:8080",
+            auto_discover_leader=True,
+            discovery_refresh_interval_seconds=60,
+            request_timeout_seconds=2.5,
+        )
+
+        try:
+            self.assertEqual(mock_post.call_args.kwargs["timeout"], 2.5)
+        finally:
+            client.close()
+
+
 class TestLeaderDiscoveryInit(unittest.TestCase):
     """Tests for leader discovery during __init__."""
 
