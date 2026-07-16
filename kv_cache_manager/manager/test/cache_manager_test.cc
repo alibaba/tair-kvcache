@@ -3425,6 +3425,19 @@ TEST_F(CacheManagerTest, TestGetHostCacheState) {
         EXPECT_EQ(0, hosts.size());
     }
 
+    // --- Test 8: unavailable host is filtered even before metadata cleanup ---
+    {
+        event_backend->SetNodeUnavailable("test_instance", "10.0.0.2:8080");
+        CacheManager::KeyVector keys = {100, 200, 300, 400};
+        auto [ec, hosts] = cache_manager_->GetHostCacheState(request_context_.get(), "test_instance", keys);
+        ASSERT_EQ(EC_OK, ec);
+        ASSERT_EQ(2, hosts.size());
+
+        EXPECT_EQ(2, find_prefix(hosts, "10.0.0.1:8080"));
+        EXPECT_EQ(-1, find_prefix(hosts, "10.0.0.2:8080"));
+        EXPECT_EQ(1, find_prefix(hosts, "10.0.0.3:8080"));
+    }
+
     dsm->storage_map_.erase("event_backend_default");
 }
 } // namespace kv_cache_manager

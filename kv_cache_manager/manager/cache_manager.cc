@@ -2280,12 +2280,16 @@ CacheManager::GetHostCacheState(RequestContext *request_context,
     // Extract host_ip_port and medium from URI instead of parsing location_id.
     std::map<std::string, int64_t> host_prefix;
     std::set<std::string> active_hosts;
+    const auto check_loc_data_exist = GetCheckLocDataExistFunc(instance_id);
 
     for (size_t i = 0; i < block_cache_keys.size(); ++i) {
         const auto &locations = location_maps[i];
         std::set<std::string> owners;
         for (const auto &kv : locations) {
             if (!kv.second || kv.second->location_specs().empty()) {
+                continue;
+            }
+            if (check_loc_data_exist && !check_loc_data_exist(*kv.second)) {
                 continue;
             }
             const std::string &uri_str = kv.second->location_specs().front().uri();
