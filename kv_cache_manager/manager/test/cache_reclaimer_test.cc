@@ -305,9 +305,16 @@ MetaIndexer::Result MetaIndexer_GetProperties_stub(void *obj,
         } else {
             out_properties = PropertyMapVector(k.size());
         }
+    } else {
+        out_properties = PropertyMapVector(k.size());
     }
     std::this_thread::sleep_for(mi_getprop_delay);
-    return MetaIndexer::Result(get_result);
+    MetaIndexer::Result result(k.size());
+    result.ec = get_result;
+    if (get_result != ErrorCode::EC_OK) {
+        std::fill(result.error_codes.begin(), result.error_codes.end(), get_result);
+    }
+    return result;
 }
 
 /* ---------------- MetaIndexer_RandomSample_stub ---------------- */
