@@ -201,9 +201,17 @@ class KvCacheManagerClient:
         """Get information about a registered instance"""
         return self._make_api_request('/api/getInstanceInfo', data, check_response)
 
+    def get_cache_meta(self, data, check_response=True):
+        """Get cache metadata for specified block keys"""
+        return self._make_api_request('/api/getCacheMeta', data, check_response)
+
     def get_cache_location(self, data, check_response=True):
         """Get cache location for specified block keys"""
         return self._make_api_request('/api/getCacheLocation', data, check_response)
+
+    def get_cache_location_len(self, data, check_response=True):
+        """Get the number of cache locations matching the specified block keys"""
+        return self._make_api_request('/api/getCacheLocationLen', data, check_response)
 
     def get_cache_locations_by_backend(self, data, check_response=True):
         """Get cache locations selected independently for each storage backend."""
