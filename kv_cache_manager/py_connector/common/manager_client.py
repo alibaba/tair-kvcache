@@ -1,7 +1,7 @@
 import random
 import threading
 import time
-from typing import Optional
+from typing import Any, Mapping, Optional
 
 import requests
 
@@ -16,6 +16,28 @@ from kv_cache_manager.py_connector.common.service_discovery_factory import (
 
 
 class KvCacheManagerClient:
+    @classmethod
+    def from_connector_config(
+        cls, config: Mapping[str, Any]
+    ) -> "KvCacheManagerClient":
+        """Create a client from the shared connector configuration surface."""
+        return cls(
+            config["manager_uri"],
+            instance_id=config.get("instance_id", ""),
+            auto_discover_leader=config.get("auto_discover_leader", False),
+            leader_retry_count=config.get("leader_retry_count", 1),
+            leader_retry_base_interval_seconds=config.get(
+                "leader_retry_base_interval_seconds", 0.005
+            ),
+            discovery_refresh_interval_seconds=config.get(
+                "discovery_refresh_interval_seconds", 30
+            ),
+            min_discover_interval_seconds=config.get(
+                "min_discover_interval_seconds", 1
+            ),
+            request_timeout_seconds=config.get("request_timeout_seconds", 1.0),
+        )
+
     def __init__(self, base_url, *, instance_id="", auto_discover_leader=False, leader_retry_count=1,
                  leader_retry_base_interval_seconds=0.005,
                  discovery_refresh_interval_seconds=30,

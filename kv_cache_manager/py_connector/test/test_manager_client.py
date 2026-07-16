@@ -173,6 +173,27 @@ class TestRequestTimeout(unittest.TestCase):
                         request_timeout_seconds=timeout,
                     )
 
+    def test_connector_config_forwards_request_timeout(self):
+        client = KvCacheManagerClient.from_connector_config({
+            "manager_uri": "http://10.0.0.1:8080",
+            "instance_id": "connector-instance",
+            "request_timeout_seconds": 3.5,
+        })
+        try:
+            self.assertEqual(client._instance_id, "connector-instance")
+            self.assertEqual(client._request_timeout_seconds, 3.5)
+        finally:
+            client.close()
+
+    def test_connector_config_uses_request_timeout_default(self):
+        client = KvCacheManagerClient.from_connector_config({
+            "manager_uri": "http://10.0.0.1:8080",
+        })
+        try:
+            self.assertEqual(client._request_timeout_seconds, 1.0)
+        finally:
+            client.close()
+
     def test_api_request_uses_configured_timeout(self):
         client = KvCacheManagerClient(
             "http://10.0.0.1:8080",

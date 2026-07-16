@@ -495,8 +495,13 @@ client = KvCacheManagerClient(
     "static://127.0.0.1:6382,127.0.0.1:6383",
     instance_id="example-instance",
     auto_discover_leader=True,
+    request_timeout_seconds=2.0,
 )
 ```
+
+随项目提供的 vLLM、SGLang 和 TensorRT-LLM connector 都会从各自原有的
+extra config 中透传这些 Manager Client 参数，包括
+`request_timeout_seconds`；未配置时默认值为 `1.0` 秒。
 
 开源构建可直接使用 `static://`；需要内部实现的 scheme 仍由对应的
 `stub_source` 实现提供，通用 Client 不依赖具体服务发现类型。

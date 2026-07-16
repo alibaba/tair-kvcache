@@ -33,5 +33,6 @@ class TairKvCacheConnectorExtraConfig:
         self.leader_retry_base_interval_seconds: float = extra_config.get("leader_retry_base_interval_seconds", 0.005)
         self.discovery_refresh_interval_seconds: int = extra_config.get("discovery_refresh_interval_seconds", 30)
         self.min_discover_interval_seconds: int = extra_config.get("min_discover_interval_seconds", 1)
+        self.request_timeout_seconds: float = extra_config.get("request_timeout_seconds", 1.0)
 
         self.log_level: str = extra_config.get("log_level", "")
