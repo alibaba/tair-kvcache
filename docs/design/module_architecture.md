@@ -65,7 +65,7 @@ client 覆盖元数据面与数据面两条链路，其对应关系如下（管�
 **元数据面到 KVCM 有两条等价通路**，最终都落到服务端同一套 `*ServiceImpl`（`grpc_service`/`http_service` 只是传输适配层）：
 
 1. **C++ `MetaClient`（gRPC）**：走 `internal/stub:grpc_stub`，供 C++ 侧与经 pybind 的引擎使用。
-2. **Python `KvCacheManagerClient`（HTTP）**：位于 `py_connector/common/manager_client.py`，用 `requests` 访问 KVCM 的 `/api/*` 端点（`getCacheLocation`/`startWriteCache`/`finishWriteCache`/`registerInstance`/`removeCache`/`trimCache`/`getClusterInfo`），并自带 Leader 发现（`/api/getClusterInfo` → `leader_endpoint.meta_http_port`）与 `SERVER_NOT_LEADER` 重试。不同连接器按需选用其一。
+2. **Python `KvCacheManagerClient`（HTTP）**：位于 `py_connector/common/manager_client.py`，用 `requests` 覆盖 MetaService 的全部 `/api/*` 端点（`registerInstance`/`getInstanceInfo`/`getCacheMeta`/`getCacheLocation`/`getCacheLocationLen`/`getCacheLocationsByBackend`/`startWriteCache`/`finishWriteCache`/`removeCache`/`trimCache`/`getClusterInfo`/`reportEvent`），并自带 Leader 发现（`/api/getClusterInfo` → `leader_endpoint.meta_http_port`）与 `SERVER_NOT_LEADER` 重试。不同连接器按需选用其一。
 
 数据面则统一走 C++ `TransferClient`（经 pybind），与元数据面选哪条通路无关。
 

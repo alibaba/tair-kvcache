@@ -201,9 +201,21 @@ class KvCacheManagerClient:
         """Get information about a registered instance"""
         return self._make_api_request('/api/getInstanceInfo', data, check_response)
 
+    def get_cache_meta(self, data, check_response=True):
+        """Get cache metadata for specified block keys"""
+        return self._make_api_request('/api/getCacheMeta', data, check_response)
+
     def get_cache_location(self, data, check_response=True):
         """Get cache location for specified block keys"""
         return self._make_api_request('/api/getCacheLocation', data, check_response)
+
+    def get_cache_location_len(self, data, check_response=True):
+        """Get the number of cache locations matching the specified block keys"""
+        return self._make_api_request('/api/getCacheLocationLen', data, check_response)
+
+    def get_cache_locations_by_backend(self, data, check_response=True):
+        """Get cache locations selected independently for each storage backend."""
+        return self._make_api_request('/api/getCacheLocationsByBackend', data, check_response)
 
     def start_write_cache(self, data, check_response=True):
         """Start writing cache data"""
@@ -216,6 +228,10 @@ class KvCacheManagerClient:
     def remove_cache(self, data, check_response=True):
         """Remove cache data for specified block keys"""
         return self._make_api_request('/api/removeCache', data, check_response)
+
+    def report_event(self, data, check_response=True):
+        """Report node, cache block, host-down, or heartbeat events."""
+        return self._make_api_request('/api/reportEvent', data, check_response)
 
     def trim_cache(self, data, check_response=True):
         """Trim cache data based on specified strategy"""
