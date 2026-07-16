@@ -249,7 +249,8 @@ public:
 
     void EnableTieredMigrationStrategy(const std::string &group_name = "default",
                                        const std::string &source_storage = "hot_01",
-                                       const std::string &target_storage = "cold_01") {
+                                       const std::string &target_storage = "cold_01",
+                                       int64_t mark_timeout_ms = MigrationMarkMethod::kDefaultTimeoutMs) {
         auto iter = registry_manager_->instance_group_configs_.find(group_name);
         ASSERT_TRUE(iter != registry_manager_->instance_group_configs_.end());
         ASSERT_TRUE(iter->second != nullptr);
@@ -261,6 +262,7 @@ public:
         strategy->set_trigger_threshold(0.01);
         MigrationMethods methods;
         methods.mutable_mark().set_enabled(true);
+        methods.mutable_mark().set_timeout_ms(mark_timeout_ms);
         strategy->set_methods(methods);
         strategy->set_retention(MigrationRetention::MIGRATION_RETENTION_DELETE_SOURCE);
         iter->second->cache_config_->set_migration_strategies({strategy});
@@ -4088,14 +4090,15 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheClearsTieredMark) {
                                      std::vector<LocationSpecGroup>());
     MetaSearcher *meta_searcher = cache_manager_->meta_searcher_manager_->GetMetaSearcher("placeholder_id");
     ASSERT_TRUE(meta_searcher);
+    std::vector<std::string> source_ids;
     {
         auto loc = std::make_shared<CacheLocation>(
             DataStorageType::DATA_STORAGE_TYPE_DUMMY,
             1,
             std::vector<LocationSpec>{LocationSpec("tp0", "dummy://hot/blk1?size=1")});
-        std::vector<std::string> ids;
-        ASSERT_EQ(EC_OK, meta_searcher->BatchAddLocation(request_context_.get(), {1}, {loc}, ids));
+        ASSERT_EQ(EC_OK, meta_searcher->BatchAddLocation(request_context_.get(), {1}, {loc}, source_ids));
     }
+    ASSERT_EQ(1u, source_ids.size());
     cache_manager_->migration_manager()->MarkForTieredWrite("placeholder_id", {1}, "cold_01");
     ASSERT_TRUE(cache_manager_->migration_manager()->IsMarkedForTieredWrite("placeholder_id", 1));
 
@@ -4115,6 +4118,130 @@ TEST_F(CacheManagerTest, TestFinishWriteCacheClearsTieredMark) {
         request_context_.get(), "placeholder_id", "sess_p5", success_mask, std::move(info));
     ASSERT_EQ(EC_OK, ec);
     ASSERT_FALSE(cache_manager_->migration_manager()->IsMarkedForTieredWrite("placeholder_id", 1));
+
+    std::vector<CacheLocationMap> location_maps;
+    BlockMask empty_mask;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchGetLocation(request_context_.get(), {1}, empty_mask, location_maps));
+    ASSERT_EQ(1u, location_maps.size());
+    ASSERT_EQ(2u, location_maps[0].size());
+    EXPECT_NE(location_maps[0].end(), location_maps[0].find(source_ids[0]));
+    EXPECT_NE(location_maps[0].end(), location_maps[0].find(target_ids[0]));
+}
+
+TEST_F(CacheManagerTest, TestAdminMarkUsesMatchingStrategyTimeout) {
+    constexpr int64_t kTimeoutMs = 3000;
+    EnableTieredMigrationStrategy("default", "hot_01", "cold_01", kTimeoutMs);
+    cache_manager_->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "admin_mark_timeout_instance",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     std::vector<LocationSpecGroup>());
+    auto *meta_searcher =
+        cache_manager_->meta_searcher_manager_->GetMetaSearcher("admin_mark_timeout_instance");
+    ASSERT_TRUE(meta_searcher);
+    auto source_loc = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("tp0", "dummy://hot_01/blk1?size=1")});
+    std::vector<std::string> source_ids;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchAddLocation(request_context_.get(), {1}, {source_loc}, source_ids));
+    std::vector<std::vector<MetaSearcher::LocationUpdateTask>> status_tasks = {
+        {{source_ids[0], CacheLocationStatus::CLS_SERVING}}};
+    std::vector<std::vector<ErrorCode>> status_results;
+    ASSERT_EQ(EC_OK,
+              meta_searcher->BatchUpdateLocationStatus(
+                  request_context_.get(), {1}, status_tasks, status_results));
+
+    const auto before = std::chrono::system_clock::now();
+    const auto result = cache_manager_->MigrateCache(request_context_.get(),
+                                                     "admin-mark-timeout",
+                                                     "admin_mark_timeout_instance",
+                                                     "hot_01",
+                                                     "cold_01",
+                                                     false,
+                                                     true,
+                                                     {1},
+                                                     0);
+    const auto after = std::chrono::system_clock::now();
+    ASSERT_EQ(EC_OK, result.ec);
+    ASSERT_EQ(1, result.accepted);
+    ASSERT_EQ(0, result.rejected);
+
+    std::vector<MigrationManager::MarkQueryResult> marks;
+    ASSERT_EQ(EC_OK,
+              cache_manager_->migration_manager()->BatchGetTieredWriteTargets(
+                  "admin_mark_timeout_instance", {1}, marks));
+    ASSERT_EQ(1u, marks.size());
+    ASSERT_TRUE(marks[0].HasValidMark());
+    const auto before_deadline = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     before.time_since_epoch())
+                                     .count() +
+                                 kTimeoutMs;
+    const auto after_deadline =
+        std::chrono::duration_cast<std::chrono::milliseconds>(after.time_since_epoch()).count() + kTimeoutMs;
+    EXPECT_GE(marks[0].deadline_ms, before_deadline);
+    EXPECT_LE(marks[0].deadline_ms, after_deadline);
+}
+
+TEST_F(CacheManagerTest, TestAdminMarkAllowsUnmatchedTargetWithDefaultTimeout) {
+    EnableTieredMigrationStrategy("default", "hot_01", "cold_01", 3000);
+    ASSERT_TRUE(RegisterDummyStorage("cold_02"));
+    cache_manager_->RegisterInstance(request_context_.get(),
+                                     "default",
+                                     "admin_mark_unmatched_target",
+                                     64,
+                                     createLocationSpecInfos(),
+                                     createModelDeployment(),
+                                     std::vector<LocationSpecGroup>());
+    auto *meta_searcher =
+        cache_manager_->meta_searcher_manager_->GetMetaSearcher("admin_mark_unmatched_target");
+    ASSERT_TRUE(meta_searcher);
+    auto source_loc = std::make_shared<CacheLocation>(
+        DataStorageType::DATA_STORAGE_TYPE_DUMMY,
+        1,
+        std::vector<LocationSpec>{LocationSpec("tp0", "dummy://hot_01/blk1?size=1")});
+    std::vector<std::string> source_ids;
+    ASSERT_EQ(EC_OK, meta_searcher->BatchAddLocation(request_context_.get(), {1}, {source_loc}, source_ids));
+    ASSERT_EQ(1u, source_ids.size());
+    std::vector<std::vector<MetaSearcher::LocationUpdateTask>> status_tasks = {
+        {{source_ids[0], CacheLocationStatus::CLS_SERVING}}};
+    std::vector<std::vector<ErrorCode>> status_results;
+    ASSERT_EQ(EC_OK,
+              meta_searcher->BatchUpdateLocationStatus(
+                  request_context_.get(), {1}, status_tasks, status_results));
+
+    const auto before = std::chrono::system_clock::now();
+    const auto result = cache_manager_->MigrateCache(request_context_.get(),
+                                                     "admin-mark-unmatched-target",
+                                                     "admin_mark_unmatched_target",
+                                                     "hot_01",
+                                                     "cold_02",
+                                                     false,
+                                                     true,
+                                                     {1},
+                                                     0);
+    const auto after = std::chrono::system_clock::now();
+    ASSERT_EQ(EC_OK, result.ec);
+    ASSERT_EQ(1, result.accepted);
+    ASSERT_EQ(0, result.rejected);
+
+    std::vector<MigrationManager::MarkQueryResult> marks;
+    ASSERT_EQ(EC_OK,
+              cache_manager_->migration_manager()->BatchGetTieredWriteTargets(
+                  "admin_mark_unmatched_target", {1}, marks));
+    ASSERT_EQ(1u, marks.size());
+    ASSERT_TRUE(marks[0].HasValidMark());
+    EXPECT_EQ("cold_02", marks[0].target);
+    const auto before_deadline = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     before.time_since_epoch())
+                                     .count() +
+                                 MigrationMarkMethod::kDefaultTimeoutMs;
+    const auto after_deadline = std::chrono::duration_cast<std::chrono::milliseconds>(after.time_since_epoch()).count() +
+                                MigrationMarkMethod::kDefaultTimeoutMs;
+    EXPECT_GE(marks[0].deadline_ms, before_deadline);
+    EXPECT_LE(marks[0].deadline_ms, after_deadline);
 }
 
 TEST_F(CacheManagerTest, TestFinishWriteCacheFullBlockPolicyKeepsPartialMark) {

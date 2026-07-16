@@ -423,8 +423,8 @@ ErrorCode MigrationManager::Submit(const std::string &trace_id, MigrationRequest
         target_bound = UpdatePreparingTaskLocked(ctx);
     }
     if (!target_bound) {
-        // Cancel 可能已把 reservation 转成 kPrepareCancelling。先在 reservation 保护下清目标，
-        // 再释放未提交任务，避免 Reclaimer 与本线程同时处理刚发布的 WRITING location。
+        // Cancel 可能已把 reservation 转成 kPrepareCancelling。先在 reservation 保护下提交精确的
+        // 异步目标删除，再释放未提交任务；这里保证提交顺序，不等待实际删除完成。
         SubmitTargetLocationDelete(ctx);
         release_preparing();
         return EC_ERROR;
@@ -848,6 +848,8 @@ std::vector<ErrorCode> MigrationManager::BatchSubmit(const std::string &trace_id
                 item->target_bound = UpdatePreparingTaskLocked(item->context);
             }
         }
+        // 与单条 Submit 保持相同边界：phase-3 失败只保证先提交基于精确 location id 的异步删除，
+        // 再释放 reservation；R2-13 的逐项 ownership 收拢不把该既有异步清理改成同步等待。
         for (auto *item : bind_items) {
             if (item->target_bound) {
                 continue;
@@ -1112,7 +1114,8 @@ void MigrationManager::SubmitTargetLocationDelete(const CopyTaskContext &ctx) {
     if (!schedule_plan_executor_ || ctx.dst_location_id.empty()) {
         return;
     }
-    // CacheLocationDelRequest 会把目标 location CAS 到 DELETING 后删存储/删元数据，清理半成品。
+    // SubmitNonBlocking 只把任务放入 executor 队列；随后才会按精确 location id CAS 到 DELETING，
+    // 再删存储和元数据。调用方不能把本函数返回理解为目标已经删除完成。
     CacheLocationDelRequest del_req;
     del_req.instance_id = ctx.instance_id;
     del_req.block_keys = {ctx.block_key};
@@ -1922,7 +1925,8 @@ MigrationManager::MigrateResult MigrationManager::MigrateCache(RequestContext *r
                                                                bool do_mark,
                                                                const std::vector<int64_t> &explicit_block_keys,
                                                                int64_t sample_count,
-                                                               std::size_t copy_max_concurrency) {
+                                                               std::size_t copy_max_concurrency,
+                                                               int64_t mark_timeout_ms) {
     MigrateResult result;
 
     // meta_indexer 由 facade 保证非空（instance 存在性已前置校验）；防御性再查一次。
@@ -1966,6 +1970,7 @@ MigrationManager::MigrateResult MigrationManager::MigrateCache(RequestContext *r
     params.do_copy = do_copy;
     params.do_mark = do_mark;
     params.copy_limit = CopyConcurrencyLimit{instance_group_name, copy_max_concurrency};
+    params.mark_timeout_ms = mark_timeout_ms;
     const auto dispatch =
         DispatchMigrationBatch(trace_id, instance_id, src_name, dst_name, candidate_keys, loc_maps, params);
 

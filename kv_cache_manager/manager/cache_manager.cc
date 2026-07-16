@@ -1208,16 +1208,27 @@ CacheManager::MigrateCacheResult CacheManager::MigrateCache(RequestContext *requ
     const auto configured_copy_concurrency = cache_config->migration_copy_max_concurrency();
     const std::size_t copy_max_concurrency =
         configured_copy_concurrency > 0 ? static_cast<std::size_t>(configured_copy_concurrency) : 0;
+    int64_t mark_timeout_ms = MigrationMarkMethod::kDefaultTimeoutMs;
 
-    // F-01: MARK/BOTH 会写入 tiered-write mark，而写路径只在配置了 migration strategy 的 instance group
-    // 才消费该 mark（与 FilterWriteCache 的消费门 IsTieredMigrationEnabled 对齐）。无 strategy 时打标是
-    // "成功的 no-op"（持久化后永不被消费）。保守起见直接拒绝，避免向调用方返回误导性的 accepted。
+    // F-01: IsTieredMigrationEnabled 以“group 至少有一条 migration strategy”作为写路径消费 Mark 的
+    // group 级开关，因此无 strategy 时打标会成为“成功的 no-op”，这里直接拒绝。Admin 显式 target
+    // 不受 strategy route 约束；精确匹配到 enabled Mark route 只影响下方 timeout 的选择。
     if (do_mark) {
         const bool has_migration_strategy = !cache_config->migration_strategies().empty();
         if (!has_migration_strategy) {
             result.ec = EC_BADARGS;
             result.message = "MARK/BOTH requires a migration strategy configured on the instance group: " + instance_id;
             return result;
+        }
+
+        // Admin 保留显式指定任意已注册 target 的能力。精确匹配到启用 Mark 的 strategy 时复用其
+        // timeout；没有匹配 route 时仍允许迁移，并使用默认 timeout。
+        for (const auto &strategy : cache_config->migration_strategies()) {
+            if (strategy != nullptr && strategy->source_storage_name() == src_name &&
+                strategy->target_storage_name() == dst_name && strategy->methods().mark().enabled()) {
+                mark_timeout_ms = strategy->methods().mark().timeout_ms();
+                break;
+            }
         }
     }
 
@@ -1233,7 +1244,8 @@ CacheManager::MigrateCacheResult CacheManager::MigrateCache(RequestContext *requ
                                                          do_mark,
                                                          explicit_block_keys,
                                                          sample_count,
-                                                         copy_max_concurrency);
+                                                         copy_max_concurrency,
+                                                         mark_timeout_ms);
     result.ec = domain.ec;
     result.accepted = domain.accepted;
     result.rejected = domain.rejected;

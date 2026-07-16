@@ -105,6 +105,8 @@ public:
     // ---- Copy 路径 ----
     // 同步完成"建目标 location + 提交 copy 任务"，copy 字节复制异步执行；
     // 返回 EC_OK 表示已成功登记任务（不代表复制完成）。
+    // 低层单条接口，当前仅单元测试直接调用；它不接受 group CopyConcurrencyLimit。生产 Admin/Reclaimer
+    // 必须通过 DispatchMigrationBatch -> BatchSubmit 进入统一的 group 级原子限流，勿新增生产直调。
     ErrorCode Submit(const std::string &trace_id, MigrationRequest request);
 
     // ---- copy 任务完成回调（监控线程驱动，亦可供测试直接调用） ----
@@ -171,7 +173,7 @@ public:
     size_t ActiveTaskCount() const;
     // 按任务提交时记录的 instance group 统计活跃 Copy，用于统一的 group 级硬限流。
     size_t ActiveTaskCountForGroup(const std::string &instance_group_name) const;
-    // F-03: 按 instance 集合过滤的活跃 copy task 数（group 级并发预算用）。
+    // F-03 遗留的诊断/测试 helper；生产 group 并发预算已统一使用 ActiveTaskCountForGroup。
     size_t ActiveTaskCountForInstances(const std::vector<std::string> &instance_ids) const;
     // F-12: 取指定 instance 的活跃 copy task block_key 列表（用于 drain 前 BatchCancel）。
     std::vector<int64_t> GetActiveBlockKeysForInstance(const std::string &instance_id) const;
@@ -229,7 +231,8 @@ public:
                                bool do_mark,
                                const std::vector<int64_t> &explicit_block_keys,
                                int64_t sample_count,
-                               std::size_t copy_max_concurrency);
+                               std::size_t copy_max_concurrency,
+                               int64_t mark_timeout_ms);
 
     // ---- 共享迁移分发（F-10 DRY：Admin MigrateCache 与 CacheReclaimer 两路共用）----
     // 对已准备好的 (batch, loc_maps) 执行：逐 block 准入(CheckCopyAdmission) + copy/mark 分类
@@ -337,7 +340,7 @@ private:
                               std::vector<DataStorageUri> &out_src_uris,
                               std::vector<DataStorageUri> &out_dst_uris);
 
-    // 提交目标 location 的删除任务（失败 / 取消时清理半成品）。
+    // 非阻塞提交目标 location 的精确删除任务（失败 / 取消时清理半成品）。返回不代表删除已完成。
     void SubmitTargetLocationDelete(const CopyTaskContext &ctx);
     // 提交源 location 的删除任务（delete_source retention）。
     void SubmitSourceLocationDelete(const CopyTaskContext &ctx);
