@@ -1375,8 +1375,8 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
         return policy->ExistsForWrite(m, *spec_names, check_loc_data_exist, out_prune_loc_ids);
     };
 
-    // Single pass: compute exists status for all blocks.
-    std::vector<bool> exists_flags(location_maps.size());
+    // Single pass: decide whether each block can skip this write.
+    std::vector<bool> skip_write_flags(location_maps.size());
     // 多层存储 Mark 消费：批量预取各 block 的冷层目标（一次元数据读，避免逐块往返）。
     // 命中（target 非空）时仅在目标冷 storage 尚无 SERVING/WRITING 副本时纳入待写集合，
     // 并记录其目标冷 storage，由 GenWriteLocation 按 block 路由到冷层。
@@ -1399,7 +1399,7 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
     }
     for (size_t i = 0; i < location_maps.size(); ++i) {
         std::vector<std::string> prune_loc_ids;
-        exists_flags[i] = existsForWrite(i, location_maps[i], prune_loc_ids);
+        skip_write_flags[i] = existsForWrite(i, location_maps[i], prune_loc_ids);
         if (!prune_loc_ids.empty()) {
             prune_keys.emplace_back(keys[i]);
             prune_loc_ids_vec.emplace_back(prune_loc_ids);
@@ -1409,7 +1409,7 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
             if (spec_names == nullptr && !all_spec_names.empty()) {
                 spec_names = &all_spec_names;
             }
-            exists_flags[i] =
+            skip_write_flags[i] =
                 spec_names == nullptr
                     ? HasServingOrWritingLocOnStorage(location_maps[i], tiered_target_per_key[i], {}, prune_loc_ids)
                     : HasServingOrWritingLocOnStorage(
@@ -1420,36 +1420,36 @@ ErrorCode CacheManager::FilterWriteCache(RequestContext *request_context,
         submit_del_req(prune_keys, prune_loc_ids_vec);
     }
 
-    // Analyze the flags: find prefix boundary and check pattern.
-    size_t first_empty_idx = location_maps.size();
-    bool only_prefix_not_empty = true;
+    // Find the first write and check whether all blocks that need writing form a suffix.
+    size_t first_write_idx = location_maps.size();
+    bool writes_form_suffix = true;
     for (size_t i = 0; i < location_maps.size(); ++i) {
-        if (!exists_flags[i]) {
-            if (first_empty_idx == location_maps.size()) {
-                first_empty_idx = i;
+        if (!skip_write_flags[i]) {
+            if (first_write_idx == location_maps.size()) {
+                first_write_idx = i;
             }
-        } else if (first_empty_idx != location_maps.size()) {
-            // Found an "exists" block after an "empty" block — not a clean prefix.
-            only_prefix_not_empty = false;
+        } else if (first_write_idx != location_maps.size()) {
+            // Found a skipped block after a block that needs writing, so writes do not form a suffix.
+            writes_form_suffix = false;
             break;
         }
     }
-    if (only_prefix_not_empty) {
-        block_mask = static_cast<BlockMaskOffset>(first_empty_idx);
-        new_keys.insert(new_keys.end(), keys.begin() + first_empty_idx, keys.end());
+    if (writes_form_suffix) {
+        block_mask = static_cast<BlockMaskOffset>(first_write_idx);
+        new_keys.insert(new_keys.end(), keys.begin() + first_write_idx, keys.end());
         new_keys_tiered_targets.insert(new_keys_tiered_targets.end(),
-                                       tiered_target_per_key.begin() + first_empty_idx,
+                                       tiered_target_per_key.begin() + first_write_idx,
                                        tiered_target_per_key.end());
         if (!location_spec_group_names.empty()) {
             new_location_spec_group_names.insert(new_location_spec_group_names.end(),
-                                                 location_spec_group_names.begin() + first_empty_idx,
+                                                 location_spec_group_names.begin() + first_write_idx,
                                                  location_spec_group_names.end());
         }
         return EC_OK;
     }
     block_mask = BlockMaskVector(location_maps.size(), false);
     for (size_t i = 0; i < location_maps.size(); ++i) {
-        if (exists_flags[i]) {
+        if (skip_write_flags[i]) {
             std::get<BlockMaskVector>(block_mask)[i] = true;
         } else {
             new_keys.push_back(keys[i]);
@@ -1518,7 +1518,7 @@ ErrorCode CacheManager::FilterWriteCacheWithMinReplica(RequestContext *request_c
         return policy->ExistsForWrite(m, *spec_names, check_loc_data_exist, out_prune_loc_ids);
     };
 
-    std::vector<bool> exists_flags(location_maps.size());
+    std::vector<bool> skip_write_flags(location_maps.size());
     std::vector<std::string> tiered_target_per_key(location_maps.size());
     std::vector<std::string> tiered_target_to_write(location_maps.size());
     if (tiered_migration_enabled) {
@@ -1539,7 +1539,7 @@ ErrorCode CacheManager::FilterWriteCacheWithMinReplica(RequestContext *request_c
     }
     for (size_t i = 0; i < location_maps.size(); ++i) {
         std::vector<std::string> prune_loc_ids;
-        exists_flags[i] = existsForWrite(i, location_maps[i], prune_loc_ids);
+        skip_write_flags[i] = existsForWrite(i, location_maps[i], prune_loc_ids);
         if (!prune_loc_ids.empty()) {
             prune_keys.emplace_back(keys[i]);
             // 复制而非 move：下方 tiered 检查还要用 prune_loc_ids 排除 stale 目标副本(F-21)。
@@ -1567,7 +1567,7 @@ ErrorCode CacheManager::FilterWriteCacheWithMinReplica(RequestContext *request_c
                     : HasServingOrWritingLocOnStorage(
                           location_maps[i], tiered_target_per_key[i], *spec_names, prune_loc_ids);
             if (!target_satisfied) {
-                exists_flags[i] = false;
+                skip_write_flags[i] = false;
                 tiered_target_to_write[i] = tiered_target_per_key[i];
             }
         }
@@ -1576,34 +1576,34 @@ ErrorCode CacheManager::FilterWriteCacheWithMinReplica(RequestContext *request_c
         submit_del_req(prune_keys, prune_loc_ids_vec);
     }
 
-    size_t first_empty_idx = location_maps.size();
-    bool only_prefix_not_empty = true;
+    size_t first_write_idx = location_maps.size();
+    bool writes_form_suffix = true;
     for (size_t i = 0; i < location_maps.size(); ++i) {
-        if (!exists_flags[i]) {
-            if (first_empty_idx == location_maps.size()) {
-                first_empty_idx = i;
+        if (!skip_write_flags[i]) {
+            if (first_write_idx == location_maps.size()) {
+                first_write_idx = i;
             }
-        } else if (first_empty_idx != location_maps.size()) {
-            only_prefix_not_empty = false;
+        } else if (first_write_idx != location_maps.size()) {
+            writes_form_suffix = false;
             break;
         }
     }
-    if (only_prefix_not_empty) {
-        block_mask = static_cast<BlockMaskOffset>(first_empty_idx);
-        new_keys.insert(new_keys.end(), keys.begin() + first_empty_idx, keys.end());
+    if (writes_form_suffix) {
+        block_mask = static_cast<BlockMaskOffset>(first_write_idx);
+        new_keys.insert(new_keys.end(), keys.begin() + first_write_idx, keys.end());
         new_keys_tiered_targets.insert(new_keys_tiered_targets.end(),
-                                       tiered_target_to_write.begin() + first_empty_idx,
+                                       tiered_target_to_write.begin() + first_write_idx,
                                        tiered_target_to_write.end());
         if (!location_spec_group_names.empty()) {
             new_location_spec_group_names.insert(new_location_spec_group_names.end(),
-                                                 location_spec_group_names.begin() + first_empty_idx,
+                                                 location_spec_group_names.begin() + first_write_idx,
                                                  location_spec_group_names.end());
         }
         return EC_OK;
     }
     block_mask = BlockMaskVector(location_maps.size(), false);
     for (size_t i = 0; i < location_maps.size(); ++i) {
-        if (exists_flags[i]) {
+        if (skip_write_flags[i]) {
             std::get<BlockMaskVector>(block_mask)[i] = true;
         } else {
             new_keys.push_back(keys[i]);
