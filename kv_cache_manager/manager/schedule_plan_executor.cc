@@ -96,6 +96,9 @@ void SchedulePlanExecutor::Stop() {
     KVCM_LOG_DEBUG("Stopping SchedulePlanExecutor...");
     std::vector<std::function<void()>> cancel_tasks;
     {
+        // The stop predicate and both condition-variable waits are synchronized by
+        // queue_mutex_. This prevents a worker from observing stop_ == false and
+        // going to sleep after the shutdown notification has already been sent.
         std::lock_guard<std::mutex> lock(queue_mutex_);
         stop_ = true;
         cancel_tasks.reserve(tasks_.size());
@@ -130,12 +133,15 @@ void SchedulePlanExecutor::Stop() {
 SchedulePlanExecutor::~SchedulePlanExecutor() { Stop(); }
 
 void SchedulePlanExecutor::WorkerRoutine() {
-    while (!stop_) {
+    while (true) {
         std::function<void()> task;
 
         {
             auto wait_until_time = std::chrono::steady_clock::time_point::max();
             std::unique_lock<std::mutex> lock(queue_mutex_);
+            if (stop_) {
+                return;
+            }
 
             // 检查是否有可执行的任务
             if (!tasks_.empty()) {
